@@ -1077,12 +1077,6 @@ def solve_w(V_q, chi0_q, meta, mesh_xy, *, dyson_solver=None,
         return solve_fn(V_q, chi0_q, pref)
 
 
-def _chi_face_kwargs(wfns) -> dict:
-    """Return the canonical face shape arguments from the wavefunction carrier."""
-    from .wavefunction_bundle import face_kernel_kwargs
-    return face_kernel_kwargs(wfns)
-
-
 def _chi_parent_face_kwargs(wfns) -> dict:
     """Return Green-function shape and typed raw-parent transport arguments."""
     from .wavefunction_bundle import green_face_kernel_kwargs
@@ -1151,14 +1145,18 @@ def _minimax_chi_operands(wfns, eref, vmax, cmin, t, alpha):
     )
 
 
-def _run_minimax_chi(wfns, meta, mesh_xy, args, *, kwargs, n_out=1,
+def _run_minimax_chi(wfns, meta, mesh_xy, args, *, n_out=1,
                      complex_contour=False, compile_only=False):
-    """Execute, or only lower and compile, the gapped response kernel on ``args``."""
+    """Execute, or only lower and compile, the gapped response kernel on ``args``.
+
+    The kernel is sized from the carrier ``_chi_layout_operands`` hands it:
+    the raw parents with their unfold plan when present, else the full-k faces.
+    """
     ensure_jax_compile_cache()
     kgrid = (int(meta.nkx), int(meta.nky), int(meta.nkz))
     kernel = _get_chi_minimax_kernel(
         mesh_xy, kgrid, n_out=n_out, complex_contour=complex_contour,
-        **kwargs)
+        **_chi_parent_face_kwargs(wfns))
     if compile_only:
         kernel.lower(*args).compile()
         return None
@@ -1190,8 +1188,7 @@ def compute_chi0(wfns, quad, meta, mesh_xy, *, energy_reference=0.0):
     """Compute χ₀(q) from a wavefunction bundle and minimax quadrature; see docs/architecture/four_current_wiring.md."""
     args, _ = _laplace_chi_args(
         wfns, quad.tau, np.asarray(quad.alpha)[None, :], energy_reference)
-    return _run_minimax_chi(
-        wfns, meta, mesh_xy, args, kwargs=_chi_parent_face_kwargs(wfns))
+    return _run_minimax_chi(wfns, meta, mesh_xy, args)
 
 
 def precompile_chi0(wfns, quad, meta, mesh_xy, *, energy_reference=None):
@@ -1200,8 +1197,7 @@ def precompile_chi0(wfns, quad, meta, mesh_xy, *, energy_reference=None):
         return  # compute_chi0 falls through to a static-zeros path — nothing to compile
     args, _ = _laplace_chi_args(
         wfns, quad.tau, np.asarray(quad.alpha)[None, :], energy_reference)
-    _run_minimax_chi(wfns, meta, mesh_xy, args,
-                     kwargs=_chi_parent_face_kwargs(wfns), compile_only=True)
+    _run_minimax_chi(wfns, meta, mesh_xy, args, compile_only=True)
 
 
 def compute_chi0_multi(wfns, tau, alpha_rows, meta, mesh_xy, *,
@@ -1210,8 +1206,7 @@ def compute_chi0_multi(wfns, tau, alpha_rows, meta, mesh_xy, *,
     ``_get_chi_minimax_kernel(n_out>=2)``.  Returns an ``n_out``-tuple of
     flat-q (nq, μ, μ) arrays, one per row of ``alpha_rows``."""
     args, n_out = _laplace_chi_args(wfns, tau, alpha_rows, energy_reference)
-    return _run_minimax_chi(wfns, meta, mesh_xy, args, n_out=n_out,
-                            kwargs=_chi_parent_face_kwargs(wfns))
+    return _run_minimax_chi(wfns, meta, mesh_xy, args, n_out=n_out)
 
 
 def precompile_chi0_multi(wfns, tau, alpha_rows, meta, mesh_xy, *,
@@ -1221,8 +1216,7 @@ def precompile_chi0_multi(wfns, tau, alpha_rows, meta, mesh_xy, *,
     if len(np.asarray(tau)) == 0:
         return
     args, n_out = _laplace_chi_args(wfns, tau, alpha_rows, energy_reference)
-    _run_minimax_chi(wfns, meta, mesh_xy, args, n_out=n_out,
-                     kwargs=_chi_parent_face_kwargs(wfns), compile_only=True)
+    _run_minimax_chi(wfns, meta, mesh_xy, args, n_out=n_out, compile_only=True)
 
 
 def _chi0_imag_ordered_kernel_args(wfns, quad, energy_reference):
@@ -1257,8 +1251,7 @@ def compute_chi0_imag_ordered(wfns, quad, meta, mesh_xy, *, q_neg_index,
                               energy_reference=0.0):
     """χ₀(q; iω_p) with BOTH particle-hole orientations carrying their own frequency weight — the route for a deck whose measured time-reversal verdict is false; see docs/architecture/four_current_wiring.md."""
     args = _chi0_imag_ordered_kernel_args(wfns, quad, energy_reference)
-    F_q = _run_minimax_chi(wfns, meta, mesh_xy, args, complex_contour=True,
-                           kwargs=_chi_face_kwargs(wfns))
+    F_q = _run_minimax_chi(wfns, meta, mesh_xy, args, complex_contour=True)
     # On the imaginary axis -conj(z) = z: the partner is the same sweep.
     q_neg = _q_negation_operand(
         q_neg_index, F_q.shape[0], caller="compute_chi0_imag_ordered")
@@ -1272,8 +1265,7 @@ def precompile_chi0_imag_ordered(wfns, quad, meta, mesh_xy, *,
     if len(np.asarray(quad.tau)) == 0:
         return
     args = _chi0_imag_ordered_kernel_args(wfns, quad, energy_reference)
-    _run_minimax_chi(wfns, meta, mesh_xy, args, complex_contour=True,
-                     kwargs=_chi_face_kwargs(wfns), compile_only=True)
+    _run_minimax_chi(wfns, meta, mesh_xy, args, complex_contour=True, compile_only=True)
 
 
 def _q_negation_operand(q_neg_index, nq, *, caller):
@@ -1334,8 +1326,7 @@ def compute_chi0_contour(wfns, tau, weight_rows, frequency_sign, z_values,
     args, n_out = _chi0_contour_kernel_args(
         wfns, tau, weight_rows, frequency_sign, z_values, energy_reference)
     return _run_minimax_chi(wfns, meta, mesh_xy, args, n_out=n_out,
-                            complex_contour=True,
-                            kwargs=_chi_parent_face_kwargs(wfns))
+                            complex_contour=True)
 
 
 def compute_chi0_contour_ordered(
@@ -1385,8 +1376,7 @@ def compute_chi0_contour_ordered(
     args, n_out = _chi0_contour_kernel_args(
         wfns, tau, weight_rows, signs, z_sweep, energy_reference)
     orientations = _run_minimax_chi(wfns, meta, mesh_xy, args, n_out=n_out,
-                                    complex_contour=True,
-                                    kwargs=_chi_face_kwargs(wfns))
+                                    complex_contour=True)
     if not isinstance(orientations, tuple):  # n_out == 2*n_z >= 2
         orientations = (orientations,)
 

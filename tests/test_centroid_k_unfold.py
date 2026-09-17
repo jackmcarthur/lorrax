@@ -173,8 +173,8 @@ def _local_gemm_plan(_mesh, **_kwargs):
     return gemm
 
 
-def test_parent_carrier_matches_full_k_minimax_response(monkeypatch):
-    """Parent contraction + transport equals the established full-k path."""
+def _parent_and_full_minimax_bundles(monkeypatch):
+    """One 3-k fixture as a full-k face bundle and as its raw-parent bundle."""
     import common.fft_helpers as fft_helpers
     import distrib_la
     from gw import w_isdf
@@ -228,16 +228,24 @@ def test_parent_carrier_matches_full_k_minimax_response(monkeypatch):
         NamedSharding(mesh, P(None, 'x', None, None)))
     wfns_parent = attach_parent_green_carrier(
         wfns_full, parent_y, parent_x, plan=plan, mesh_xy=mesh)
+    return mesh, wfns_full, wfns_parent
 
+
+def test_parent_carrier_matches_full_k_minimax_response(monkeypatch):
+    """Parent contraction + transport equals the established full-k path."""
+    from gw import w_isdf
+
+    mesh, wfns_full, wfns_parent = _parent_and_full_minimax_bundles(
+        monkeypatch)
     assert green_face_kernel_kwargs(wfns_parent)["face_shape"][0] == 2
+    from gw.wavefunction_bundle import face_kernel_kwargs
     from gw.w_isdf import (
         MinimaxNodes,
-        _chi_face_kwargs,
         _chi_layout_operands,
         _chi_parent_face_kwargs,
         _get_chi_minimax_kernel,
     )
-    assert _chi_face_kwargs(wfns_parent)["face_shape"][0] == 3
+    assert face_kernel_kwargs(wfns_parent)["face_shape"][0] == 3
     assert _chi_parent_face_kwargs(wfns_parent)["face_shape"][0] == 2
     resident = bundle_bytes_per_rank(wfns_parent)
     assert resident["green_parent.psi_nmu"] > 0
@@ -271,6 +279,37 @@ def test_parent_carrier_matches_full_k_minimax_response(monkeypatch):
     assert "all-gather(" not in hlo
     assert "all-to-all(" not in hlo
 
+    w_isdf._chi_minimax_kernel_cache.clear()
+
+
+def test_parent_carrier_matches_full_k_ordered_minimax_routes(monkeypatch):
+    """The two time-reversal-broken insulator routes run on raw parents.
+
+    Production bundles are parents-only, so the ordered imaginary-axis and
+    contour routes must size the kernel from the parent carrier, exactly as
+    compute_chi0 does; both must reproduce the full-k bundle's response.
+    """
+    from gw import w_isdf
+    from symmetry_maps import q_negation_index
+
+    mesh, wfns_full, wfns_parent = _parent_and_full_minimax_bundles(
+        monkeypatch)
+    meta = SimpleNamespace(nkx=3, nky=1, nkz=1, nk_tot=3)
+    q_neg = q_negation_index((3, 1, 1))
+    quad = SimpleNamespace(tau=np.asarray([0.05, 0.37]),
+                           alpha=np.asarray([0.6, 0.4]),
+                           alpha_odd=np.asarray([0.3, -0.2]))
+    for route in (
+        lambda w: w_isdf.compute_chi0_imag_ordered(
+            w, quad, meta, mesh, q_neg_index=q_neg),
+        lambda w: w_isdf.compute_chi0_contour_ordered(
+            w, np.asarray([0.2, 0.9]), np.asarray([0.5, 0.25]),
+            np.asarray([0.1 + 0.4j]), meta, mesh, q_neg_index=q_neg),
+    ):
+        got_full = np.asarray(jax.device_get(route(wfns_full)))
+        got_parent = np.asarray(jax.device_get(route(wfns_parent)))
+        np.testing.assert_allclose(
+            got_parent, got_full, rtol=3e-12, atol=3e-12)
     w_isdf._chi_minimax_kernel_cache.clear()
 
 
