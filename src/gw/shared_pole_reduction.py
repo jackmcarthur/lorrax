@@ -295,7 +295,7 @@ def reduce_ordered_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, g
     metric_r = hermitian_part(matmul(y, matmul(h_r, y), transa="C")) + null_r
     # The restricted sources are released before the second metric correction.
     del null_r, h_r
-    correction_r, metric_r_ok, _ = _metric_inverse_root(
+    correction_r, metric_r_ok, paired_metric_diagnostics = _metric_inverse_root(
         metric_r, matmul=matmul, tolerance=gates["retained_subspace_moments"]["threshold"])
     del metric_r
     y = matmul(y, correction_r) * keep_r[:, None, :]
@@ -322,6 +322,13 @@ def reduce_ordered_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, g
         "gram_valid": gram_ok,
         "gram_min_relative": ratio,
         "paired_min_relative": ratio_r,
+        "gram_largest": largest,
+        "gram_spectrum_finite": jnp.all(jnp.isfinite(gamma), axis=-1),
+        "paired_largest": top_r,
+        "paired_spectrum_finite": jnp.all(jnp.isfinite(gamma_r), axis=-1),
+        "gram_metric_positive": metric_ok,
+        "paired_metric_positive": metric_r_ok,
+        **{"paired_" + key: value for key, value in paired_metric_diagnostics.items()},
         "paired_rank": count_r,
         "gram_spectrum_relative": gamma / jnp.where(largest > 0, largest, 1)[:, None],
         "retained_rank": count,

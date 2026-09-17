@@ -215,6 +215,18 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
                     raise ValueError(ORIENTATION_PAIR_REFUSAL + f" (q={q})")
                 for name in ("gram_diagonal_positive", "gram_valid", "retained_metric_positive"):
                     if not round_reduction[name][slot]:
+                        if ordered:
+                            # All scalar constituents, including both metric corrections,
+                            # must travel with a refusal; the first Gram can pass while H_r fails.
+                            values = {key: value[slot].item() for key, value in round_reduction.items()
+                                      if value.ndim == 1}
+                            raise ValueError(
+                                f"GATE shared_pole_{name}: got: failed at q={q}, ordered diagnostics={values}; "
+                                f"want: gram_largest > 0, gram_spectrum_finite and paired_spectrum_finite, "
+                                f"gram_min_relative and paired_min_relative >= {gates['normalized_gram_validity']['threshold']}, "
+                                "gram_diagonal_positive, orientation_paired, gram_metric_positive and paired_metric_positive; "
+                                f"metric infinity norms < 1 and inverse-root residuals <= {gates['retained_subspace_moments']['threshold']}; "
+                                "why: no PSD repair")
                         raise ValueError(
                             f"GATE shared_pole_{name}: got: failed at q={q}, "
                             f"Gram min/max={round_reduction['gram_min_relative'][slot]}, "
