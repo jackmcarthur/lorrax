@@ -468,45 +468,53 @@ _NA_WIDTH_RY = 0.01
 _NA_BROADENING_EV = 0.13605693122994
 
 
-def test_disagreeing_width_keys_refuse_by_name_with_the_conversion(tmp_path):
-    """The factor-of-two trap: someone types the QE degauss into the Ry key.
+@pytest.mark.parametrize(
+    "width_ry", ("0.02", "_NA_WIDTH_RY"))
+def test_a_metal_width_beside_the_smeared_head_dial_refuses_by_name(
+        tmp_path, width_ry):
+    """Owner ruling 2026-09-17: the velocity SC head is disabled on metals.
 
-    ``_METAL_KEYS`` carries ``occ_smearing_width_ry = 0.02``, which is the
-    sodium deck's QE ``degauss``; beside it ``occ_broadening =
-    0.13605693122994`` eV is the same deck's half-width, 0.01 Ry.  Exactly
-    2x apart, and only one of them can be the width the MP1 solve takes.
+    ``occ_broadening > 0`` exists only to request that head, so beside a
+    metal's Fermi-Dirac width it refuses at parse whether the two values
+    agree (the staged sodium pair) or differ by the degauss factor of two.
     """
-    with pytest.raises(ValueError, match="occ_smearing_width_ry") as excinfo:
+    width = str(_NA_WIDTH_RY) if width_ry == "_NA_WIDTH_RY" else width_ry
+    with pytest.raises(ValueError) as excinfo:
         _config(
             tmp_path,
-            _METAL_KEYS + _SC_KEYS
+            _METAL_KEYS.replace(
+                "occ_smearing_width_ry = 0.02",
+                f"occ_smearing_width_ry = {width}")
+            + _SC_KEYS
             + f"occ_broadening = {_NA_BROADENING_EV}\n")
     message = str(excinfo.value)
-    # The refusal has to carry the conversion, or it just says "no".
-    assert "occ_broadening" in message
-    assert "degauss" in message
-    assert "(E-mu)/(2*width)" in message
+    assert message.startswith("GATE metal_sc_head_update_disabled:")
+    assert "owner ruling 2026-09-17" in message
+    assert "replacement head model" in message
 
 
-def test_agreeing_width_keys_parse_and_the_ry_key_is_the_exact_one(tmp_path):
-    """The staged sodium deck's own pair, and what the solve then consumes."""
+@pytest.mark.parametrize("mode", ("parallel_transport", "dft_velocity"))
+def test_a_metal_refuses_the_velocity_head_update_at_the_material_door(
+        tmp_path, mode):
+    """Disabled, not deleted: the same deck validates as an insulator."""
     config = _config(
         tmp_path,
-        _METAL_KEYS.replace(
-            "occ_smearing_width_ry = 0.02",
-            f"occ_smearing_width_ry = {_NA_WIDTH_RY}")
-        + _SC_KEYS
-        + f"occ_broadening = {_NA_BROADENING_EV}\n")
-    # The two keys agree to 3.6e-7 relative -- not exactly, because the deck's
-    # eV value was written with CODATA 13.605693122994 while the code converts
-    # with common.units.RYD_TO_EV.  That is the whole reason the tolerance is
-    # relative and the Ry key wins: it is the one that made no round trip.
-    from common.units import RYD_TO_EV
-
-    round_trip = config.screening.occ_broadening_ev / RYD_TO_EV
-    assert abs(round_trip - _NA_WIDTH_RY) < 1.0e-6 * _NA_WIDTH_RY
-    assert round_trip != _NA_WIDTH_RY
-    assert config.occ_broadening_ry == _NA_WIDTH_RY
+        _METAL_KEYS
+        + _SC_KEYS.replace("sc_head_update = parallel_transport",
+                           f"sc_head_update = {mode}"))
+    with pytest.raises(ValueError) as excinfo:
+        validate_material_inputs(config, "metal")
+    message = str(excinfo.value)
+    assert message.startswith("GATE metal_sc_head_update_disabled:")
+    assert f"sc_head_update = {mode}" in message
+    assert "owner ruling 2026-09-17" in message
+    assert "sc_head_update = off" in message
+    off = _config(tmp_path, _METAL_KEYS + _SC_KEYS.replace(
+        "sc_head_update = parallel_transport", "sc_head_update = off"))
+    validate_material_inputs(off, "metal")
+    insulator = _config(tmp_path, _SC_KEYS.replace(
+        "sc_head_update = parallel_transport", f"sc_head_update = {mode}"))
+    validate_material_inputs(insulator, "insulator")
 
 
 def test_the_width_the_solve_consumes_comes_from_the_new_key(tmp_path):
@@ -519,7 +527,7 @@ def test_the_width_the_solve_consumes_comes_from_the_new_key(tmp_path):
     assert config.occ_broadening_ry == 0.02
     assert 2.0 * config.occ_broadening_ry == 0.04    # the QE degauss
 
-    # Break the tie the parse-time refusal normally forbids: the property
+    # Set both widths, which the parse-time refusal forbids: the property
     # must read the Ry key, not the eV one.  (Constructed, not parsed --
     # a deck like this cannot exist.)
     moved = dataclasses.replace(config, occ_smearing_width_ry=0.031)

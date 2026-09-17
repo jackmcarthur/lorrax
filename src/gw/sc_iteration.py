@@ -5398,6 +5398,12 @@ def load_head_velocity_source(
 ):
     """Resolve ``sc_head_update`` to the head's velocity source, or None.
 
+    DISABLED ON METALS (owner ruling 2026-09-17): both modes refuse at
+    ``gw_config.validate_material_inputs`` (``GATE
+    metal_sc_head_update_disabled``) pending the owner's replacement head
+    model, so on a metal this resolver is only ever called with ``off``.
+    The code below is kept for insulators and for that replacement.
+
     The ONE place the mode string turns into an object.  Both metal modes
     read the artifact ``get_dipole_mtxels --parallel-transport`` writes;
     they differ in how much of it they need:

@@ -4359,16 +4359,6 @@ class BSEConfig:
     wfn_fi_q_chunk: int   # 0 = N_q_co (prod(kgrid_co)); see compute_wfns_fi
 
 
-#: Relative tolerance on the ``occ_smearing_width_ry`` / ``occ_broadening``
-#: agreement.  Loose enough that the eV<->Ry round trip cannot trip it (a
-#: deck written with CODATA 13.605693122994 eV/Ry and read back through
-#: ``common.units.RYD_TO_EV`` = 13.6056980659 differs by 3.6e-7 relative),
-#: tight enough that a CONVENTION error — the factor of two between the QE
-#: degauss and BerkeleyGW's half-width — is three orders of magnitude clear
-#: of it.
-_OCC_WIDTH_RTOL = 1.0e-4
-
-
 def _validate_occupation_smearing(screening, width_ry):
     """Validate the metal occupation width without classifying the WFN; see docs/architecture/decisions.md."""
     if width_ry is not None and not (np.isfinite(width_ry) and width_ry > 0.0):
@@ -4376,28 +4366,23 @@ def _validate_occupation_smearing(screening, width_ry):
             "occ_smearing_width_ry (Fermi-Dirac kBT, Ry) must be > 0 for a "
             f"metal; got {width_ry!r}")
 
-    # Cross-key width agreement, checked last so the class-level off-dial
-    # refusals above own their own messages.  ``occ_broadening = 0`` is the
-    # documented "step occupations" dial, not a width, so it is never a
-    # disagreement — the b24/b40 step-occupation control arms deliberately
-    # set exactly that beside a live smearing pair.
+    # A metal's width is its Fermi-Dirac kBT.  ``occ_broadening > 0`` is the
+    # MP1 smeared-head dial, and its only metal consumer was the velocity
+    # SC head update, disabled on metals (owner ruling 2026-09-17).
+    # ``occ_broadening = 0`` is the "step occupations" dial, not a width, so
+    # it may stand beside a metal width (the b24/b40 step-occupation arms).
     broadening_ev = float(screening.occ_broadening_ev)
     if width_ry is not None and broadening_ev > 0.0:
-        broadening_ry = broadening_ev / RYD_TO_EV
-        if abs(width_ry - broadening_ry) > _OCC_WIDTH_RTOL * abs(broadening_ry):
-            raise ValueError(
-                "occ_smearing_width_ry and occ_broadening are the SAME "
-                "width in different units, and this deck's two values "
-                f"disagree: occ_smearing_width_ry = {width_ry!r} Ry vs "
-                f"occ_broadening = {broadening_ev!r} eV = "
-                f"{broadening_ry:.12g} Ry (RYD_TO_EV = {RYD_TO_EV}). "
-                "Both are BerkeleyGW's occ_broadening, whose MP1 argument "
-                "is (E-mu)/(2*width); the QE degauss is TWICE either of "
-                f"them, so this deck implies degauss = {2.0 * width_ry:.12g}"
-                f" Ry from the first key and {2.0 * broadening_ry:.12g} Ry "
-                "from the second. Set occ_smearing_width_ry = degauss/2 "
-                "and occ_broadening = occ_smearing_width_ry * "
-                f"{RYD_TO_EV} eV/Ry, or remove one of them.")
+        raise ValueError(
+            "GATE metal_sc_head_update_disabled: occ_smearing_width_ry = "
+            f"{width_ry!r} Ry declares a metal's Fermi-Dirac kBT, and "
+            f"occ_broadening = {broadening_ev!r} eV > 0 requests the MP1 "
+            "smeared QSGW head (sc_head_update = parallel_transport or "
+            "dft_velocity), which is DISABLED on metals pending the owner's "
+            "replacement head model (owner ruling 2026-09-17). Remove "
+            "occ_broadening; occ_smearing_width_ry is the metal's one width. "
+            "doc: docs/self_consistency.md, 'Metals: velocity head updates "
+            "are disabled'.")
 
 
 def infer_material_class(occupations) -> str:
@@ -4434,6 +4419,24 @@ def validate_material_inputs(config, material_class):
                 "GATE fractional_occupations_require_mpa: WFN occupations "
                 f"identify a metal, but compute_mode={config.compute_mode.value}; "
                 "use compute_mode=mpa, the occupation-aware path.")
+        if config.sc.head_update in METAL_HEAD_UPDATES:
+            raise ValueError(
+                "GATE metal_sc_head_update_disabled: WFN occupations identify "
+                f"a metal, and sc_head_update = {config.sc.head_update} is "
+                "DISABLED on metals pending the owner's replacement head "
+                "model (owner ruling 2026-09-17).\n"
+                "  got:  a per-map velocity head rebuild (QP velocity, "
+                "tetrahedron Fermi-surface weights, Drude term, Thomas-Fermi "
+                "static head)\n"
+                "  want: sc_head_update = off, which keeps the existing MPA "
+                "head model: the fixed DFT direct response folded through "
+                "each map's W and fitted as one scalar MPA head\n"
+                "  why:  on a metal every velocity head update and every "
+                "nontrivial head correction outside that MPA model is "
+                "disabled until the owner replaces the head model; the code "
+                "is kept, not deleted\n"
+                "  doc:  docs/self_consistency.md, 'Metals: velocity head "
+                "updates are disabled'")
         if width_ry is None:
             raise ValueError(
                 "metallic WFN occupations require occ_smearing_width_ry="
@@ -4663,7 +4666,9 @@ class LorraxConfig:
                 "occ_broadening > 0 currently updates only the QSGW head; "
                 "set sc_head_update to one of "
                 + ", ".join(METAL_HEAD_UPDATES)
-                + ".")
+                + ". Both are refused on a metal (GATE "
+                "metal_sc_head_update_disabled, owner ruling 2026-09-17); a "
+                "metal takes its width from occ_smearing_width_ry alone.")
         # rCROP is legal on metallic decks since the ENTRY-solve rule
         # (2026-08-15): gw_iteration_map solves its MP1 occupation state
         # from the spectrum of the H it is handed, every call, so F(H) is
