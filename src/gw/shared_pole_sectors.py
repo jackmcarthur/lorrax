@@ -10,6 +10,82 @@ neither move an operator to the host nor prescribe a processor mesh.
 import jax.numpy as jnp
 
 
+def read_sector_round(io, meta, bank, header, ids, endpoints, *, sample_span=None,
+                      fields=('Wc','dWc_ds'), retained=()):
+    """Read one bounded photon sample at a time into a sector's packed basis.
+
+    The canonical photon store is mesh-interleaved; each selected family is
+    converted to the existing MuBasis order before the constructor sees it.
+    ``endpoints`` names C=0 or T=1 on each side. Returned TT/CT rows are
+    mu-major, Cartesian-component-minor. Parents remain at P(('x','y')).
+    Full photon sample stacks are never allocated. The store owns all I/O,
+    authentication and transport; this function only selects sector rows.
+    """
+    import jax
+    import numpy as np
+    from common.shard_map import shard_map
+    from jax.sharding import PartitionSpec as P
+    from file_io.shared_pole_store import read_shared_pole_bank
+
+    layout=bank['photon_layout']
+    indices=[];masks=[]
+    for family in endpoints:
+        basis=bank['mu_bases'][family]
+        mu=basis.pack_host(np.arange(basis.n_canonical,dtype=np.int32),axis=0)
+        components=3 if family else 1
+        width=layout.carrier_extent(family)//layout.mesh_side
+        local=layout.packed_extent//layout.mesh_side
+        offset=layout.local_offset(family)
+        index=(mu[:,None]//width*local+offset+np.arange(components)[None]*width+mu[:,None]%width)
+        indices.append(index.reshape(-1))
+        masks.append(np.repeat(basis.active_mask,components))
+    spec=P(('x','y'))
+    def select(a):
+        a=jnp.take(jnp.take(a,jnp.asarray(indices[0]),axis=-2),jnp.asarray(indices[1]),axis=-1)
+        return jnp.where(jnp.asarray(masks[0])[:,None]&jnp.asarray(masks[1])[None,:],a,0)
+    select=jax.jit(shard_map(select,mesh=io.mesh,in_specs=spec,out_specs=spec,check_vma=False))
+    join=jax.jit(shard_map(lambda *a:jnp.concatenate(a,axis=1),mesh=io.mesh,
+                          in_specs=spec,out_specs=spec,check_vma=False))
+    ledger=meta.shared_pole_capacity
+    ambient=ledger.live_stages
+    keep=list(retained)
+    out={}
+    try:
+        for field in fields:
+            sample=field in ('Wc','dWc_ds')
+            if sample and (sample_span is None or sample_span[1] <= sample_span[0]):
+                raise ValueError('sector sample reads require a nonempty bounded sample_span')
+            spans=([(i,i+1) for i in range(*sample_span)] if sample else [None])
+            parts=[]
+            for span in spans:
+                size=sum(a.size*a.dtype.itemsize//io.mesh.size for a in keep)
+                row=ledger.reserve(f'sector.read.retained.{len(ledger.entries)}',
+                    resident_bytes_per_rank=size,workspace_bytes_per_rank=0,concurrent_with=ambient)
+                ledger.live_stages=(*ambient,row['stage'])
+                value=read_shared_pole_bank(io,meta=meta,header=header,q_ids=ids,
+                    sample_span=span,fields=(field,),partition_spec=spec)[field]
+                # Reserve the selected output alongside the bounded input.
+                output=value.shape[0]*(1 if not sample else value.shape[1])*len(indices[0])*len(indices[1])*value.dtype.itemsize//io.mesh.size
+                workspace=value.shape[0]*(1 if not sample else value.shape[1])*len(indices[0])*value.shape[-1]*value.dtype.itemsize//io.mesh.size
+                ledger.reserve(f'sector.read.select.{len(ledger.entries)}',
+                    resident_bytes_per_rank=value.size*value.dtype.itemsize//io.mesh.size+output,
+                    workspace_bytes_per_rank=workspace,concurrent_with=ledger.live_stages)
+                selected=select(value)
+                selected.block_until_ready()
+                del value
+                parts.append(selected);keep.append(selected)
+            if len(parts)>1:
+                ledger.reserve(f'sector.read.join.{len(ledger.entries)}',
+                    resident_bytes_per_rank=sum(a.size*a.dtype.itemsize//io.mesh.size for a in keep+parts),
+                    workspace_bytes_per_rank=0,concurrent_with=ambient)
+            out[field]=join(*parts) if len(parts)>1 else parts[0]
+            out[field].block_until_ready()
+            keep=list(retained)+list(out.values())
+    finally:
+        ledger.live_stages=ambient
+    return out
+
+
 def construct_diagonal_sector_round(samples, moments, meta, config, geometry, *, mesh_xy,
                                      retained=()):
     """Run the production selection/reduction program for CC or TT.

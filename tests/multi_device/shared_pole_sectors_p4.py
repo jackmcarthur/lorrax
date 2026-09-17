@@ -195,8 +195,8 @@ def main():
     rows=run_checks(mesh)
     rows.extend(run_store_checks(mesh,args.output.parent))
     rows.extend(run_sigma_checks(mesh))
-    assert len(rows)==20
-    result=dict(status='PASS',checks=rows,expected_checks=20,
+    assert len(rows)==24
+    result=dict(status='PASS',checks=rows,expected_checks=24,
                 job=os.environ.get('SLURM_JOB_ID'),step=os.environ.get('SLURM_STEP_ID'),
                 source_commit=subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip(),
                 scope='P4 sector algebra, bitwise storage and direct band-sum tau Sigma; no frequency integration or production deck')
@@ -342,6 +342,8 @@ def run_current_partner_checks(mesh):
 
 def run_store_checks(mesh,root):
     import importlib.util
+    import jax
+    import jax.numpy as jnp
     import numpy as np
     from jax.sharding import PartitionSpec as P
     from gw.shared_pole_recipe import CapacityLedger
@@ -370,6 +372,43 @@ def run_store_checks(mesh,root):
     qt=tables['qirr']
     current_tables=dict(tables,qirr=QirrTables(irr_idx_q=qt.irr_idx_q,sym_idx_q=qt.sym_idx_q,
         q_irr_frac=qt.q_irr_frac,sym_perm=perm,L_table=wraps,n_sym_spatial=qt.n_sym_spatial))
+    from gw.photon_layout import PhotonBasisLayout
+    from gw.shared_pole_sectors import read_sector_round
+    layout=PhotonBasisLayout.from_centroid_extents(meta.mu_basis.n_logical,current_basis.n_logical,mesh)
+    bank_recipe=dict(recipe,role_codes=dict(line=0,imaginary=1,infinity=2,held_line=3,held_imaginary=4),
+        z_ry=np.array([.3+.2j,.7+.4j]),role=np.array([0,3],np.int8),
+        distinct_id=np.array([0,1],np.int64),held=np.array([False,True]),
+        support_pair=np.array([[-1,-1],[0,1]],np.int64),
+        fit_ids=np.array([0],np.int64),held_ids=np.array([1],np.int64))
+    path=root/f'photon_{suffix}.h5'
+    bank=dict(photon_layout=layout,mu_bases=(meta.mu_basis,current_basis))
+    header=store.initialize_shared_pole_bank(path,meta=meta,tables=tables,recipe=bank_recipe,
+        identity=identity,mesh_xy=mesh,photon_layout=layout,mu_bases=bank['mu_bases'])
+    nq=header['bank_shape']['nq'];n=layout.packed_extent
+    raw=np.arange(nq*2*n*n).reshape(nq,2,n,n).astype(complex)*(1+.2j)
+    device=fixture._device(raw,mesh,P(None,None,'x','y'))
+    moment=fixture._device(raw[:,0],mesh,P(None,'x','y'))
+    header=store.write_shared_pole_bank(path,q_span=(0,nq),sample_span=(0,2),Wc=device,dWc_ds=2*device,
+        M0=moment,M1=moment,M2=moment,M3=moment,constant=moment,
+        meta=meta,expected_identity=identity,mesh_xy=mesh)
+    for endpoints in ((0,0),(1,1),(0,1),(1,0)):
+        with SlabIO(path,mode='r',mesh=mesh) as io:
+            got=read_sector_round(io,meta,bank,header,[0,1,2,2],endpoints,sample_span=(0,2))
+        endpoint_indices=[];endpoint_valid=[]
+        for family in endpoints:
+            basis=bank['mu_bases'][family]
+            index=[];valid=[]
+            for canonical_mu,active in zip(basis.pack_host(np.arange(basis.n_canonical),axis=0),basis.active_mask):
+                for component in (range(1,4) if family else (0,)):
+                    width=layout.carrier_extent(component)//layout.mesh_side
+                    index.append(int(canonical_mu)//width*(n//layout.mesh_side)+layout.local_offset(component)+int(canonical_mu)%width)
+                    valid.append(active)
+            endpoint_indices.append(index);endpoint_valid.append(valid)
+        expected=raw[[0,1,2,2]][:,:,endpoint_indices[0]][:,:,:,endpoint_indices[1]]
+        expected=np.where(np.array(endpoint_valid[0])[:,None]&np.array(endpoint_valid[1])[None,:],expected,0)
+        expected=fixture._device(expected,mesh,P(('x','y')))
+        assert bool(jnp.all(got['Wc']==expected)) and bool(jnp.all(got['dWc_ds']==2*expected))
+        rows.append(dict(name=f'photon_sector_read_{endpoints[0]}_{endpoints[1]}',bitwise=True))
     headers={}
     for sector in ('CC','TT','CT_C','CT_T'):
         components=3 if sector in ('TT','CT_T') else 1
