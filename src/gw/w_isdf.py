@@ -1191,20 +1191,29 @@ def compute_chi0_imag_ordered(wfns, quad, meta, mesh_xy, *, q_neg_index,
         mesh_xy, kgrid, n_out=1, complex_contour=True,
         **_chi_face_kwargs(wfns))
     F_q = kernel(*args)
+    # On the imaginary axis -conj(z) = z: the partner is the same sweep.
+    q_neg = _q_negation_operand(
+        q_neg_index, F_q.shape[0], caller="compute_chi0_imag_ordered")
+    return _complete_ordered(F_q, F_q, q_neg)
+
+
+def _q_negation_operand(q_neg_index, nq, *, caller):
+    """Authenticate the full flat-q negation involution and place it as int32."""
     q_neg = np.asarray(q_neg_index)
-    nq = int(F_q.shape[0])
+    nq = int(nq)
     if (q_neg.shape != (nq,)
+            or np.any(q_neg < 0) or np.any(q_neg >= nq)
             or not np.array_equal(q_neg[q_neg], np.arange(nq))):
         raise ValueError(
-            "compute_chi0_imag_ordered: q_neg_index must be an involution "
-            f"over the full flat-q axis [0, {nq}); got shape {q_neg.shape}.")
-    return _complete_imag_ordered(F_q, jnp.asarray(q_neg, dtype=jnp.int32))
+            f"{caller}: q_neg_index must be an involution over the full "
+            f"flat-q axis [0, {nq}); got shape {q_neg.shape}.")
+    return jnp.asarray(q_neg, dtype=jnp.int32)
 
 
 @jax.jit
-def _complete_imag_ordered(F_q, q_neg):
-    """``F_q + conj(F_{-q})`` — a leading-axis gather, sharding-preserving."""
-    return F_q + jnp.conj(jnp.take(F_q, q_neg, axis=0))
+def _complete_ordered(F_q_z, F_q_reflected, q_neg):
+    """``F_q(z) + conj(F_{-q}(-conj(z)))``; a leading-axis gather, sharding-preserving."""
+    return F_q_z + jnp.conj(jnp.take(F_q_reflected, q_neg, axis=0))
 
 
 def precompile_chi0_imag_ordered(wfns, quad, meta, mesh_xy, *,
@@ -2067,18 +2076,11 @@ def compute_chi0_contour_ordered(
     if not isinstance(orientations, tuple):  # n_out == 2*n_z >= 2
         orientations = (orientations,)
 
-    q_neg = np.asarray(q_neg_index)
-    nq = int(orientations[0].shape[0])
-    if (q_neg.shape != (nq,)
-            or np.any(q_neg < 0) or np.any(q_neg >= nq)
-            or not np.array_equal(q_neg[q_neg], np.arange(nq))):
-        raise ValueError(
-            "compute_chi0_contour_ordered: q_neg_index must be an "
-            f"involution over the full flat-q axis [0, {nq}); got shape "
-            f"{q_neg.shape}.")
-    q_neg_jax = jnp.asarray(q_neg, dtype=jnp.int32)
+    q_neg_jax = _q_negation_operand(
+        q_neg_index, orientations[0].shape[0],
+        caller="compute_chi0_contour_ordered")
     completed = tuple(
-        _complete_contour_ordered(
+        _complete_ordered(
             orientations[i], orientations[z.size + i], q_neg_jax)
         for i in range(z.size)
     )
@@ -2086,18 +2088,12 @@ def compute_chi0_contour_ordered(
     if not return_reflected:
         return primary
     reflected = tuple(
-        _complete_contour_ordered(
+        _complete_ordered(
             orientations[z.size + i], orientations[i], q_neg_jax)
         for i in range(z.size)
     )
     reflected = reflected[0] if z.size == 1 else reflected
     return primary, reflected
-
-
-@jax.jit
-def _complete_contour_ordered(F_q_z, F_q_reflected, q_neg):
-    """``F_q(z) + conj(F_{-q}(-conj(z)))``; sharding-preserving."""
-    return F_q_z + jnp.conj(jnp.take(F_q_reflected, q_neg, axis=0))
 
 
 def _occupation_support_slices(
