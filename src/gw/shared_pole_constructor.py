@@ -129,6 +129,21 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
         # Odd z-moments M0/M2 certify the ordered infinity block; a finite-state
         # ordered bank builds without it and records the moments NOT_MEASURED.
         odd_moments = ordered and bool(header.get("odd_moments", False))
+        if ordered:
+            # The mirror of parent p reads the -q parent p' through a unitary row s,
+            # S_s q(p') = -q(p) (symmetry service; antiunitary-only routes refuse there).
+            from symmetry_maps import minus_q_parent_partners
+            qt, operations = header["qirr"], header["operations"]
+            partner_parent, partner_row = minus_q_parent_partners(
+                header["q_irr_full_idx"], qt["irr_idx_q"], qt["sym_idx_q"], kgrid=header["grid"],
+                sym_mats_k=np.asarray(operations["rotation"]),
+                antiunitary=np.asarray(operations["antiunitary"], dtype=bool),
+                authorized_rows=operations["authorized_rows"])
+            source, wraps = np.asarray(qt["sym_perm"]), np.asarray(qt["L_table"])
+            realized = [p for p, row in enumerate(partner_row)
+                        if not np.array_equal(source[row], np.arange(source.shape[1])) or np.any(wraps[row])]
+            if realized:
+                raise ValueError(f"GATE minus_q_partner: got: parents {realized} reach -q through rows {partner_row[realized].tolist()} with a centroid permutation or umklapp wrap; want: -q read as a raw parent; why: this constructor reads the partner's raw samples, and the realized partner R_s[W_q(p')] is not implemented here")
 
         budget.plan(0)
         logical_n = int(meta.n_rmu)
@@ -191,10 +206,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
 
                 read_mirror = None
                 if ordered:
-                    from symmetry_maps import q_negation_index
-                    parents_full = [int(v) for v in header["q_irr_full_idx"]]
-                    minus_full = q_negation_index(tuple(int(v) for v in header["grid"]))
-                    partner = parents_full.index(int(minus_full[parents_full[q_start]]))
+                    partner = int(partner_parent[q_start])
 
                     def read_mirror(sample_id):
                         # W_q(-conj z) = conj W_-q(z), and dW/ds likewise: one sample of the -q parent.

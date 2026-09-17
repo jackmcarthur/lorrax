@@ -84,10 +84,99 @@ __all__ = [
     "build_qgrid_trs_policy",
     "little_group_covariance_residual",
     "project_little_group_operator",
+    "minus_q_parent_partners",
     "self_negative_q_mask",
     "trs_pair_coherent_unfold_sym_idx",
     "trs_project_self_negative_q_rows",
 ]
+
+
+def minus_q_parent_partners(q_irr_full_idx, irr_idx_q, sym_idx_q, *, kgrid,
+                            sym_mats_k, antiunitary, authorized_rows):
+    """The raw parent and unitary operation that carry each parent's −q.
+
+    For every raw parent ``p`` (``q_irr_full_idx[p]`` in canonical C order on
+    the unshifted ``kgrid``) return ``p'`` and an operation row ``s`` with
+
+        S_s · q(p') ≡ −q(p)   (mod the grid),   ``S_s = sym_mats_k[s]``,
+
+    so ``W_{−q(p)} = R_s[W_{q(p')}]`` with the unfold's centroid permutation
+    and umklapp phase of row ``s`` (``unfold_operator_local``). ``p'`` is the
+    table's representative of −q, ``irr_idx_q[neg]``; ``s`` is the table's row
+    ``sym_idx_q[neg]`` when that row is authorized and unitary, otherwise the
+    lowest authorized unitary row with the same image. A self-negative parent
+    (q ≡ −q) returns itself with its own table row (the identity).
+
+    The integer q action ``S_s · q_int mod grid`` is the convention of
+    ``find_irreducible_bz_points``; it is AUTHENTICATED against the whole
+    table first (every full q must be ``S_{sym_idx_q[q]}`` applied to its
+    parent), so a table built with another convention refuses here instead
+    of pairing the wrong operation.
+
+    REFUSES BY NAME when −q of a parent is reachable only through an
+    antiunitary row: an antiunitary operation maps a sample at z to −z̄,
+    which a bank of fixed supports does not hold, so there is no partner to
+    realize (``GATE minus_q_partner``).
+
+    Returns ``(partner_parent, partner_row)``, int32 arrays of length
+    ``len(q_irr_full_idx)``.
+    """
+    from .maps import q_negation_index
+
+    grid = np.asarray(tuple(int(v) for v in kgrid), dtype=np.int64)
+    n_full = int(np.prod(grid))
+    full = np.asarray(q_irr_full_idx, dtype=np.int64).reshape(-1)
+    irr = np.asarray(irr_idx_q, dtype=np.int64).reshape(-1)
+    sym = np.asarray(sym_idx_q, dtype=np.int64).reshape(-1)
+    mats = np.asarray(sym_mats_k, dtype=np.int64)
+    anti = np.asarray(antiunitary, dtype=bool).reshape(-1)
+    allowed = np.zeros(mats.shape[0], dtype=bool)
+    rows = np.asarray(authorized_rows, dtype=np.int64).reshape(-1)
+    if (grid.shape != (3,) or irr.shape != (n_full,) or sym.shape != (n_full,)
+            or mats.ndim != 3 or mats.shape[1:] != (3, 3) or anti.shape != (mats.shape[0],)
+            or np.any(rows < 0) or np.any(rows >= mats.shape[0])
+            or np.any(sym < 0) or np.any(sym >= mats.shape[0])
+            or np.any(full < 0) or np.any(full >= n_full)
+            or not np.array_equal(irr[full], np.arange(full.size))):
+        raise ValueError(
+            "GATE minus_q_partner: got: tables grid="
+            f"{grid.tolist()}, irr_idx_q={irr.shape}, sym_idx_q={sym.shape}, "
+            f"sym_mats_k={mats.shape}, antiunitary={anti.shape}, "
+            f"q_irr_full_idx={full.shape}; want: full-grid tables whose parents "
+            "are their own representatives; why: the −q partner is read from them.")
+    allowed[rows] = True
+    coords = np.stack(np.unravel_index(np.arange(n_full), tuple(grid)), axis=1)
+    images = np.einsum("qij,qj->qi", mats[sym], coords[full[irr]]) % grid
+    bad = np.flatnonzero(np.any(images != coords, axis=1))
+    if bad.size:
+        q = int(bad[0])
+        raise ValueError(
+            "GATE minus_q_partner: got: full q "
+            f"{coords[q].tolist()} (index {q}) is not sym_mats_k[{int(sym[q])}] "
+            f"applied to its parent {coords[full[irr[q]]].tolist()} "
+            f"({bad.size} of {n_full} rows disagree); want: S_s·q_int mod grid "
+            "on every row; why: the partner search uses the table's own q action.")
+    neg = np.asarray(q_negation_index(tuple(grid)), dtype=np.int64)
+    partner_parent = np.empty(full.size, dtype=np.int32)
+    partner_row = np.empty(full.size, dtype=np.int32)
+    for p, q in enumerate(full):
+        target = int(neg[q])
+        parent = int(irr[target])
+        row = int(sym[target])
+        if not allowed[row] or anti[row]:
+            hits = np.flatnonzero(allowed & ~anti & np.all(
+                (mats @ coords[full[parent]]) % grid == coords[target], axis=1))
+            if not hits.size:
+                raise ValueError(
+                    "GATE minus_q_partner: got: parent "
+                    f"{p} q={coords[q].tolist()} has −q={coords[target].tolist()} "
+                    f"only through antiunitary row {row} from parent {parent}; "
+                    "want: an authorized unitary operation S with "
+                    "S·q(parent) ≡ −q; why: an antiunitary row maps a sample at "
+                    "z to −conj(z), which the bank does not hold.")
+            row = int(hits[0])
+        partner_parent[p], partner_row[p] = parent, row
+    return partner_parent, partner_row
 
 
 def self_negative_q_mask(q_full_idx, *, kgrid) -> np.ndarray:

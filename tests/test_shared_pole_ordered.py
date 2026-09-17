@@ -396,6 +396,10 @@ def test_generic_q_positive_halves_assemble_the_galerkin_model():
     for z in ZS:
         stored = np.asarray(ordered_shared_pole_value(model_q, model_m, z, matmul=mm)[0])
         assert rel(stored, _signed_value(signed_q, z)) < 1e-12
+    # RED TWIN: the identity partner (q's own model in the -q slot) is not the Galerkin model.
+    worst = max(rel(np.asarray(ordered_shared_pole_value(model_q, model_q, z, matmul=mm)[0]),
+                    _signed_value(signed_q, z)) for z in ZS)
+    assert worst > 1e-2, worst
 
 
 def test_sigma_orientations_are_lehmann_sums_of_complex_residues():
