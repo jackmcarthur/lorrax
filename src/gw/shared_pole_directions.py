@@ -73,7 +73,7 @@ def _round_kernels(mesh):
         return program(body, (batch, batch, rep, batch, rep), (batch, batch))
 
     @lru_cache(maxsize=None)
-    def exchange(flags, perm):
+    def exchange(flags, perm, components=1):
         """Mirror products with the partner rank's samples, R_s realized on the panels.
 
         ``xs`` [P, k, n, r]: the states of one sample, ``flags[k]`` True for a
@@ -81,8 +81,12 @@ def _round_kernels(mesh):
         W^T y (original) or conj(W) y (conjugate) and the same for dW; slot r
         applies Phi^* Pi: (R_s W)^T x and conj(R_s W) x, R_s W = Phi Pi W Pi^T Phi^*.
         """
-        def body(w, dw, xs, alpha, inverse, phase, j, scales):
+        def body(w, dw, xs, alpha, inverse, phase, j, scales, rotation=None):
             y = jnp.take_along_axis(phase[:, None, :, None] * xs, inverse[:, None, :, None], axis=-2)
+            if components != 1:
+                shape = y.shape
+                y = jnp.einsum('bij,bkmir->bkmjr', rotation,
+                               y.reshape(*shape[:-2], shape[-2] // components, components, shape[-1])).reshape(shape)
             y = jax.lax.ppermute(y, BATCH_AXES, perm)
             a, d = sample(w, j), sample(dw, j)
             outs = []
@@ -92,8 +96,13 @@ def _round_kernels(mesh):
                 outs += [op_a @ y[:, k], op_d @ y[:, k]]
             back = jax.lax.ppermute(jnp.stack(outs, axis=1), BATCH_AXES, perm)
             back = jnp.conj(phase)[:, None, :, None] * jnp.take_along_axis(back, alpha[:, None, :, None], axis=-2)
+            if components != 1:
+                shape = back.shape
+                back = jnp.einsum('bij,bkmjr->bkmir', rotation,
+                                  back.reshape(*shape[:-2], shape[-2] // components, components, shape[-1])).reshape(shape)
             return tuple(back[:, i] * (scales[i // 2] if i % 2 else 1) for i in range(2 * len(flags)))
-        return program(body, (batch,) * 6 + (rep, rep), (batch,) * (2 * len(flags)))
+        return program(body, (batch,) * 6 + (rep, rep) + ((batch,) if components != 1 else ()),
+                       (batch,) * (2 * len(flags)))
 
     def dedupe(q, o):
         # O W-output of the direction set Q: the part of O outside span(Q), and O O^H for its scale.
@@ -113,7 +122,8 @@ BATCH_AXES = ('x', 'y')
 
 
 def select_round_states(samples, recipe, *, sample_lo, real, mesh_xy, eigh_plan, svd_plan,
-                        column_extent, logical_n, ordered=False, exchange=None):
+                        column_extent, logical_n, ordered=False, exchange=None,
+                        current_rotation=None):
     """Directions, outputs and actions of one round of parents, batched per role (SP 3, SP 13).
 
     ``samples`` holds ``Wc``/``dWc_ds`` [P, S, n, n] in batch layout (rank r owns
@@ -216,10 +226,12 @@ def select_round_states(samples, recipe, *, sample_lo, real, mesh_xy, eigh_plan,
             else:
                 slots, alpha, inverse, phase = exchange
                 program = k.exchange(tuple(flags[index] for index in span),
-                                     tuple((int(r), int(slots[r])) for r in range(ranks)))
+                                     tuple((int(r), int(slots[r])) for r in range(ranks)),
+                                     1 if current_rotation is None else 3)
                 xs = jnp.stack([states[index][1] for index in span], axis=1)
                 flat = program(W, dW, xs, alpha, inverse, phase, j,
-                               put(np.asarray([-2 * states[index][0] for index in span], np.complex128)))
+                               put(np.asarray([-2 * states[index][0] for index in span], np.complex128)),
+                               *((current_rotation,) if current_rotation is not None else ()))
                 results = [(flat[2 * i], flat[2 * i + 1]) for i in range(len(span))]
                 del xs
             for index, (output, action) in zip(span, results):

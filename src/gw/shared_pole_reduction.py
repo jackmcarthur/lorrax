@@ -192,7 +192,8 @@ def _restricted_block(ww, wv, vv):
         (jnp.concatenate((ww, wv), axis=-1), jnp.concatenate((_adjoint(wv), vv), axis=-1)), axis=-2))
 
 
-def reduce_ordered_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, gates, keep_budget=None):
+def reduce_ordered_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, gates, keep_budget=None,
+                                     retain_span=False):
     """Paired-basis Ritz reduction of the particle-hole pencil.
 
     ``pencil=(G,H,O,z)`` from ``assemble_ordered_shared_pole_pencil`` over paired
@@ -217,6 +218,9 @@ def reduce_ordered_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, g
 
     Returns (b [b,n,R], poles2 [b,R], active [b,R]), the signed model
     (c [b,n,R], mu [b,R], retained [b,R]) and device diagnostics.
+    With ``retain_span``, also return the original-pencil coefficient map
+    Y [b,R,R], with O Y = c and Y.H H Y = diag(retained), for the CT
+    joint projection. This map stays inside the parent-local round.
     """
     g, h, output, points = pencil
     side, finite = int(g.shape[-1]), int(points.shape[-1])
@@ -283,6 +287,8 @@ def reduce_ordered_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, g
     g_r = on_face(_restricted_block, face, project(z, g_ww), project(z, g_wv), project(z, g_vv))
     del g_ww, g_wv, g_vv
     o_r = join_columns(matmul(o_w, z), matmul(o_v, z))
+    if retain_span:
+        paired_span = scale[:, :, None] * z
     del o_w, o_v, z
     gamma_r, u_r = eigh(h_r)
     top_r = gamma_r[:, -1]
@@ -303,6 +309,16 @@ def reduce_ordered_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, g
     mu, rotation = eigh(hermitian_part(matmul(y, matmul(g_r, y), transa="C")))
     del g_r
     c = matmul(o_r, matmul(y, rotation))
+    if retain_span:
+        ritz = matmul(y, rotation)
+        span_w = matmul(paired_span, ritz[:, :half + n_inf])
+        span_v = matmul(paired_span, ritz[:, half + n_inf:])
+        # Undo w=(X(z)+X(-z))/2, v=(X(z)-X(-z))/(2z),
+        # w_inf=k1 and v_inf=k0 (report equation 5.6).
+        coefficients = jnp.concatenate((
+            .5 * span_w[:, :half] + inverse[:, :, None] * span_v[:, :half],
+            .5 * span_w[:, :half] - inverse[:, :, None] * span_v[:, :half],
+            span_v[:, half:], span_w[:, half:]), axis=-2)
     del o_r, y, rotation
     cut = gates["normalized_gram_keep"]["threshold"] * jnp.max(jnp.abs(mu), axis=-1)
     retained = jnp.abs(mu) > cut[:, None]
@@ -341,4 +357,7 @@ def reduce_ordered_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, g
         "infinite_weight_ok": infinite <= budget,
         "orientation_paired": jnp.broadcast_to(paired, count.shape),
     }
-    return (b, poles2, positive), (c, mu, retained), diagnostics
+    result = (b, poles2, positive), (c, mu, retained), diagnostics
+    if retain_span:
+        return (*result, coefficients * retained[:, None, :])
+    return result

@@ -132,7 +132,7 @@ def synthesize_shared_pole_parents(
     b_X, b_Y : jax.Array
         Complex128 physical factors ``[parent,mu,spin,column]`` with
         ``P(None,'x',None,'y')`` / ``P(None,'y',None,'x')`` layouts.
-        Only spin=1 is currently supported; endpoints merge in the service.
+        The component axis is 1 for charge and 3 for current endpoints.
     poles2 : jax.Array
         Replicated float64 ``[parent,column]`` squared frequencies in Ry².
     intervals : jax.Array
@@ -154,8 +154,8 @@ def synthesize_shared_pole_parents(
     """
     if b_X.ndim != 4 or b_Y.ndim != 4:
         raise ValueError("shared-pole faces require [parent,mu,spin,column]")
-    if b_X.shape[2] != 1 or b_Y.shape[2] != 1:
-        raise ValueError("GATE shared_pole_scalar: shared-pole Sigma requires spin=1")
+    if b_X.shape[2] not in (1, 3) or b_Y.shape[2] not in (1, 3):
+        raise ValueError("GATE shared_pole_components: expected charge=1 or current=3")
     weights = _shared_pole_weights(poles2, intervals, E_ref_B, t_node)
     plus = _shared_pole_contract(b_X, b_Y, weights, gemm=gemm)
     # Both faces store the same physical b. Thus (b d b†)^T = b* d b^T
@@ -175,6 +175,11 @@ def _shared_pole_contract(b_X, b_Y, weights, *, gemm):
     """
     from gw.greens_function_kernel import build_G
 
+    # Components are operator-port labels, not Green-function spinors.
+    # Merge them with their own centroid axis before entering build_G;
+    # CT then has different row extents but the same unit spin axis.
+    b_X = b_X.reshape(b_X.shape[0], b_X.shape[1] * b_X.shape[2], 1, b_X.shape[3])
+    b_Y = b_Y.reshape(b_Y.shape[0], b_Y.shape[1] * b_Y.shape[2], 1, b_Y.shape[3])
     value = build_G(jnp.transpose(b_X, (0, 2, 1, 3)),
                     jnp.transpose(b_Y, (0, 3, 2, 1)),
                     phases=weights, layout="face", gemm=gemm)

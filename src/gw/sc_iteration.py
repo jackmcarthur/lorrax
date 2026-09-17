@@ -3065,20 +3065,36 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             f"(n={tail_fit.n_fit_c}, w={tail_fit.w_fit_c:.0f}, "
             f"policy={inputs.config.sc.tail_fit})")
 
+    # Same-run metal threading: the ENTRY-solved state feeds chi, the head
+    # and Sigma — one mu per map call, from this call's spectrum.
+    metal_occ_state = (entry_occ_state
+                       if inputs.material_class == "metal" else None)
+
+    # ONE OCCUPATION OWNER PER MAP CALL.  On a metal both rotated bundles (and
+    # their parent carriers) carry the entry-solved state as ``occ``, so no
+    # consumer of either bundle can read a step occupation by band index or
+    # at a midgap reference.  A step through a degenerate multiplet at E_F
+    # splits it in Sigma and breaks inversion times time reversal of the
+    # next map (SCMETAL 2026-09-17).  Insulators keep the midgap step.
+    bundle_efermi = None if metal_occ_state is not None else float(efermi_ry)
+    bundle_occupations = (None if metal_occ_state is None
+                          else metal_occ_state.f_kn)
     wfns_qp = rotate_wavefunctions(
         inputs.wfns_dft, U_full,
         enk_active_new=E_full, enk_base=enk_base,
-        efermi=float(efermi_ry),
+        efermi=bundle_efermi,
         mesh_xy=inputs.mesh_xy,
         active_slice=inputs.band_slices.sigma,
+        occupations=bundle_occupations,
     )
 
     wfns_transverse_qp = None
     if inputs.wfns_transverse is not None:
         wfns_transverse_qp = rotate_wavefunctions(
             inputs.wfns_transverse, U_full,
-            enk_active_new=E_full, enk_base=enk_base, efermi=float(efermi_ry),
-            mesh_xy=inputs.mesh_xy, active_slice=inputs.band_slices.sigma)
+            enk_active_new=E_full, enk_base=enk_base, efermi=bundle_efermi,
+            mesh_xy=inputs.mesh_xy, active_slice=inputs.band_slices.sigma,
+            occupations=bundle_occupations)
 
     # (``entry_occ_state`` was solved above, before the tail scissor that
     # feeds ``enk_base`` — see the block after ``E_full``.)
@@ -3107,11 +3123,6 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             f"{' + transverse' if exact_hartree_dft.transverse_dft is not None else ''} "
             f"Hartree from iteration {state.iteration} orbitals "
             f"(E_F = {exact_hartree_dft.efermi_ry:.6f} Ry)")
-
-    # Same-run metal threading: the ENTRY-solved state feeds chi, the head
-    # and Sigma — one mu per map call, from this call's spectrum.
-    metal_occ_state = (entry_occ_state
-                       if inputs.material_class == "metal" else None)
 
     if inputs.config.sigma.w_model == "shared_pole":
         from .shared_pole_recipe import (
@@ -3143,7 +3154,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         used_producer = (inputs.screening_model_fn
                          if producer is None else producer)
         used_quad = inputs.quad if quad_override is None else quad_override
-        return used_producer(
+        produced = used_producer(
             inputs.config.compute_mode, wfns_qp, inputs.V_q,
             quad=used_quad, e_ref=inputs.e_ref, sym=inputs.sym,
             centroid_indices=inputs.centroid_indices, config=inputs.config,
@@ -3160,7 +3171,21 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             iteration_head_response=iteration_head_response,
             occupation_state=metal_occ_state,
             material_class=inputs.material_class,
+            **(dict(wfns_transverse=wfns_transverse_qp,
+                    bispinor_v_q_path=inputs.bispinor_v_q_path,
+                    mu_bases=inputs.mu_bases,
+                    photon_static_reference=(None if inputs.screening_seed_cache is None else
+                        inputs.screening_seed_cache.get('photon_static_reference')))
+               if inputs.config.sigma.w_model == "shared_pole"
+               and wfns_transverse_qp is not None else {}),
             print_fn=inputs.print_fn)
+        if (inputs.screening_seed_cache is not None and isinstance(produced, dict)
+                and produced.get('photon_static_reference') is not None):
+            # Only the immutable initial contact survives. Current samples,
+            # moments and all three pole models belong to this map.
+            inputs.screening_seed_cache.setdefault(
+                'photon_static_reference', produced['photon_static_reference'])
+        return produced
 
     # Per-mode screening plan.  The q->0 head uses this exact frequency/role
     # table so a Schur-folded probe can never drift from the body W it folds.
@@ -3301,8 +3326,24 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
                 inputs.wfns_dft, np.asarray(head_omegas, dtype=np.complex128),
                 input_dir=inputs.input_dir, mesh=inputs.mesh_xy, wfn=inputs.wfn,
                 meta=inputs.meta, config=inputs.config)
-        head_occ_kn = np.asarray(
-            iteration_head_response.sigma_occupations, dtype=np.float64)
+        # The frozen response is the DFT direct response; its Sigma-side
+        # ladder (energies, occupations, reference) is the DFT one, a step by
+        # band index.  On a metal every head consumer (the static terms here,
+        # the dynamic head of MPA and finalized samples) must see THIS map's
+        # ladder and its one occupation state instead.
+        if metal_occ_state is not None:
+            nb_sigma_head = int(inputs.meta.nb_sigma)
+            iteration_head_response = replace(
+                iteration_head_response,
+                sigma_energies_ry=np.asarray(
+                    wfns_qp.enk[:, :nb_sigma_head], dtype=np.float64),
+                sigma_occupations=np.asarray(
+                    wfns_qp.occ[:, :nb_sigma_head], dtype=np.float64),
+                efermi_ry=float(metal_occ_state.mu_ry))
+        # The static head is diagonal in THIS map's band basis, so its
+        # occupations are this map's bundle table (the entry state on a
+        # metal), never the frozen DFT response's step by band index.
+        head_occ_kn = np.asarray(wfns_qp.occ, dtype=np.float64)
         if tuple(iteration_head_response.omegas) != tuple(head_omegas):
             raise ValueError(
                 "fixed DFT head response does not match the current "
@@ -3374,6 +3415,22 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
                 cell_volume=float(inputs.meta.cell_volume),
                 nk_tot=int(inputs.meta.nk_tot),
             )
+
+    # The head enters Sigma band-diagonally, so its occupations must be one
+    # value per exactly degenerate multiplet of the ladder Sigma is diagonal
+    # in; otherwise this map's H breaks the little group and inversion times
+    # time reversal, and the next map's screening loses reciprocity.
+    if iteration_head is not None:
+        from .head_correction import refuse_split_multiplet_head_occupations
+        refuse_split_multiplet_head_occupations(
+            iteration_head.sigma_energies_ry, iteration_head.sigma_occupations,
+            where=f"SC map {int(state.iteration)} dynamic head")
+        if head_occ_kn is not None and bool(inputs.config.do_G0):
+            nb_sigma = int(inputs.meta.nb_sigma)
+            refuse_split_multiplet_head_occupations(
+                np.asarray(wfns_qp.enk[:, :nb_sigma]),
+                np.asarray(head_occ_kn)[:, :nb_sigma],
+                where=f"SC map {int(state.iteration)} static head")
 
     # Under mpa_material_class = metal the finite-q body above went through
     # build_mpa_fit(occupation_state=...) — fractional contour lines and the

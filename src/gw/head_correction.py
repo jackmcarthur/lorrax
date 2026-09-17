@@ -1710,6 +1710,59 @@ def compute_static_head_terms_from_sample(head: HeadSample, *,
                                      nk_tot=nk_tot, source=head.source)
 
 
+#: Two ladder energies closer than this (Ry) are one exactly degenerate multiplet.
+HEAD_MULTIPLET_DEGENERACY_RY = 1.0e-9
+#: Largest occupation difference admitted inside such a multiplet.  Fermi-Dirac
+#: gives at most |dE|/(4 kT) = 2.5e-8 at the degeneracy tolerance and kT = 0.01 Ry;
+#: a step occupation cut through the multiplet gives 1.
+HEAD_MULTIPLET_OCCUPATION_TOL = 1.0e-6
+
+
+def refuse_split_multiplet_head_occupations(energies_ry, occupations, *, where: str):
+    """Refuse head occupations that differ inside an exactly degenerate multiplet.
+
+    The q->0 head enters Sigma as a band-diagonal term ``d_n(k) = h(f_n)`` in
+    the basis whose energies are ``energies_ry`` (``(nk, nb)``, Ry).  Such a
+    term commutes with the little group of k and with inversion times time
+    reversal only when it is constant on every exactly degenerate multiplet of
+    that ladder.  A step occupation by band index on a metal is not: it gives
+    f = 1 and f = 0 to two states of one multiplet whenever the index cut runs
+    through it.  The resulting Sigma splits the multiplet, the next map's G
+    loses G_-k = G_k^T, and the shared-pole bank loses reciprocity (lane
+    SCMETAL 2026-09-17: Na bcc Fermi-Dirac, 1.3207 eV splits at three k, bank
+    reciprocity 1e-13 -> 1e-4 in one map, ``shared_pole_gram_valid`` refused).
+    """
+    energies = np.asarray(energies_ry, dtype=np.float64)
+    occ = np.asarray(occupations, dtype=np.float64)
+    if energies.ndim != 2 or occ.shape != energies.shape:
+        raise ValueError(
+            "GATE head_occupations_split_multiplet: got energy table "
+            f"{energies.shape} and occupation table {occ.shape} ({where}); want "
+            "matching (nk, nb) tables on the Sigma band basis; why: the head "
+            "occupations must be read on the ladder the head is diagonal in.")
+    order = np.argsort(energies, axis=1, kind="stable")
+    e_sorted = np.take_along_axis(energies, order, axis=1)
+    f_sorted = np.take_along_axis(occ, order, axis=1)
+    split = ((np.diff(e_sorted, axis=1) <= HEAD_MULTIPLET_DEGENERACY_RY)
+             & (np.abs(np.diff(f_sorted, axis=1)) > HEAD_MULTIPLET_OCCUPATION_TOL))
+    if not split.any():
+        return
+    k, j = (int(v) for v in np.argwhere(split)[0])
+    a, b = int(order[k, j]), int(order[k, j + 1])
+    raise ValueError(
+        "GATE head_occupations_split_multiplet: got: "
+        f"{int(split.sum())} split pair(s) ({where}); first at k={k}, bands "
+        f"{a + 1} and {b + 1} degenerate within "
+        f"{abs(energies[k, b] - energies[k, a]):.1e} Ry carry occupations "
+        f"{occ[k, a]:.6g} and {occ[k, b]:.6g}; want: one occupation per exactly "
+        f"degenerate multiplet (|dE| <= {HEAD_MULTIPLET_DEGENERACY_RY:g} Ry, "
+        f"|df| <= {HEAD_MULTIPLET_OCCUPATION_TOL:g}); why: a band-diagonal head "
+        "term that differs inside a multiplet breaks the little group and "
+        "inversion times time reversal, so the next map's screening loses "
+        "reciprocity; fix: take the head occupations from the map's occupation "
+        "state, not a step by band index.")
+
+
 def format_static_head_diagnostics(head: StaticHeadTerms) -> str:
     """Return a concise summary of the exact static COHSEX head terms."""
 
