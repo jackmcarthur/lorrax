@@ -12,13 +12,14 @@ import jax.numpy as jnp
 
 def read_sector_round(io, meta, bank, header, ids, endpoints, *, sample_span=None,
                       fields=('Wc','dWc_ds'), retained=()):
-    """Read one bounded photon sample at a time into a sector's packed basis.
+    """Read one bounded sector sample at a time into its packed endpoint bases.
 
     The canonical photon store is mesh-interleaved; each selected family is
     converted to the existing MuBasis order before the constructor sees it.
     ``endpoints`` names C=0 or T=1 on each side. Returned TT/CT rows are
     mu-major, Cartesian-component-minor. Parents remain at P(('x','y')).
-    Full photon sample stacks are never allocated. The store owns all I/O,
+    The store selects native sector hyperslabs, never full photon panels.
+    It owns all I/O,
     authentication and transport; this function only selects sector rows.
     """
     import jax
@@ -34,9 +35,8 @@ def read_sector_round(io, meta, bank, header, ids, endpoints, *, sample_span=Non
         mu=basis.pack_host(np.arange(basis.n_canonical,dtype=np.int32),axis=0)
         components=3 if family else 1
         width=layout.carrier_extent(family)//layout.mesh_side
-        local=layout.packed_extent//layout.mesh_side
-        offset=layout.local_offset(family)
-        index=(mu[:,None]//width*local+offset+np.arange(components)[None]*width+mu[:,None]%width)
+        local=components*width
+        index=(mu[:,None]//width*local+np.arange(components)[None]*width+mu[:,None]%width)
         indices.append(index.reshape(-1))
         masks.append(np.repeat(basis.active_mask,components))
     spec=P(('x','y'))
@@ -63,7 +63,8 @@ def read_sector_round(io, meta, bank, header, ids, endpoints, *, sample_span=Non
                     resident_bytes_per_rank=size,workspace_bytes_per_rank=0,concurrent_with=ambient)
                 ledger.live_stages=(*ambient,row['stage'])
                 value=read_shared_pole_bank(io,meta=meta,header=header,q_ids=ids,
-                    sample_span=span,fields=(field,),partition_spec=spec)[field]
+                    sample_span=span,fields=(field,),partition_spec=spec,
+                    sector=tuple('T' if family else 'C' for family in endpoints))[field]
                 # Reserve the selected output alongside the bounded input.
                 output=value.shape[0]*(1 if not sample else value.shape[1])*len(indices[0])*len(indices[1])*value.dtype.itemsize//io.mesh.size
                 workspace=value.shape[0]*(1 if not sample else value.shape[1])*len(indices[0])*value.shape[-1]*value.dtype.itemsize//io.mesh.size
