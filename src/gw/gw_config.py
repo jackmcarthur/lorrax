@@ -1338,13 +1338,11 @@ _DEFAULTS = {
     # New input files should set ``compute_mode`` explicitly:
     #   "x_only" | "cohsex" | "gn_ppm" | "hl_ppm" | "mpa".
     #
-    # ``mpa`` — the multipole-W ansatz, the owner's "FF" — PARSES TODAY AND
-    # REFUSES TO RUN TODAY.  Its Σ stage has not landed, so the driver
-    # stops at entry naming the mode rather than falling through to a
-    # plasmon-pole run; ``auto`` never infers it, and no legacy flag
-    # combination reaches it.  See ``UNIMPLEMENTED_MODES`` beside the enum
-    # for why the value ships ahead of the kernels, and the ``ComputeMode``
-    # docstring for why it is spelled ``mpa`` rather than ``full_freq``.
+    # ``mpa`` is the supported multipole-W dynamic Sigma route.  ``auto``
+    # never infers it from legacy flags; a new deck selects it explicitly.
+    # ``sigma_w_model`` independently chooses the incumbent elementwise MPA
+    # body or the opt-in shared-pole body.  See ``ComputeMode`` for why the
+    # mode is spelled ``mpa`` rather than ``full_freq``.
     "compute_mode": "auto",
     # ``qp_solver`` is the orthogonal axis describing how QP energies are
     # extracted from Σ (see the ``QPSolver`` enum).  ``"auto"`` resolves
@@ -1619,8 +1617,11 @@ _DEFAULTS = {
     # ``gw.coulomb.base.minibz_average``: the q→0 3D head gains the analytic
     # Baldereschi-Tosatti sphere term (seed-independent), the Voronoi fold
     # widens (nmax 1→3), and the BSE arbitrary-Q ``eval_vq`` head becomes the
-    # mini-BZ CELL AVERAGE ``<v_LR(Q+G*)>_mBZ`` (fixes the 4-13% near-Γ /
-    # zone-boundary point-vs-cell-average error, arbitrary_q_bse.md §16.4).
+    # mini-BZ CELL AVERAGE.  In BSE exchange the opt-in head is assembled
+    # from the transition-dipole second moment when a sampled Gamma point
+    # represents its cell.  A finite-Q path already has a pointwise form
+    # factor; the cell average is not a universal accuracy improvement
+    # (docs/theory/lt-exchange-head.md §2-3).
     # The winding (2D e^{-i2θ}) is unaffected — only the head magnitude is
     # averaged; the phase-factored ζ̃ rank-1 structure carries the direction.
     "head_minibz_average": False,

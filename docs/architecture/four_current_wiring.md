@@ -21,6 +21,14 @@ disagree with this one, they win — this page owns the *wiring* only.
 > Use the named function as the durable locator; historical line numbers
 > are not a claim about the current source position.
 
+> **2026-09-17 release boundary.** On `origin/main@2df9814e` plus ordered-head
+> commits `748311ed` and `791677d3`, the table and stage map below still
+> describe the live GW driver. Those commits add callable ordered TT response
+> and Sigma functions, listed under [Stage 4](#stage-4--self-energy), without
+> changing `gw_jax` or `sigma_dispatch`. The separate dynamic-Hall Faraday
+> lane is not in this release line. See the [theory status](../theory/four-current-head-corrections.md#four-current-phase-status)
+> for the physics boundary.
+
 ## The routes
 
 `bispinor_gw` has two values on one four-spinor carrier. It selects which
@@ -551,6 +559,24 @@ four-current layer still reaches a dynamic Σ through `sig_x` and the
 transverse Hartree and nowhere else — what changed is which owner computes
 the `sig_x` transverse part, not how many owners there are.
 
+**Ordered TT head library boundary (2026-09-17).** The two new commits add
+four independent functions; no call from the driver dispatches into them.
+
+| function | input and result | release use |
+|---|---|---|
+| `qsgw_head.uniform_current_response_sharded` | Full-BZ $\langle m|J_a|n\rangle$ array `(nk,3,nb,nb)`, energies, exact binary occupations and explicit complex-Ry frequency vector; returns Ward-completed $(n_z,3,3)$ $K_{TT}(z)$ and $(3,3)$ $K_{TT}(\infty)$, each normalized once by $C/(\Omega N_k)$. Band axes remain sharded on the two-dimensional mesh. | Callable and tested; insulating only. Its chosen current operator must be recorded. |
+| `photon_sigma.photon_head_alpha_operator` | Four-spinor sweep operator for the production $\alpha_a$ endpoint, excluding the nonlocal ICL part of the uniform-gauge current. | Callable and tested; no driver-created head endpoint bank. |
+| `photon_sigma.contract_ordered_tt_head_sigma`; `contract_instantaneous_tt_head_exchange` | Alpha vertices `(nk,3,n_external,n_intermediate)` plus ordered contour factors `(nk,n_external,n_intermediate,3,3)` or an instantaneous $(3,3)$ cell moment; return diagonal $(nk,n_external)$ Sigma, dividing the raw cell moment by $\Omega N_k$ once. | Callable and tested; no driver feed of completed dynamic $W_{TT}$, $F_\pm$, contact term, or intermediate-state mask. |
+
+The response-to-Sigma bridge would also need the instantaneous Dyson
+completion, its nonzero $W_{TT}(\infty)$ split, the ordered positive-half
+contour, and a matched alpha response/endpoint convention. The current
+research calculation supplies these for a restricted leading-$q$ CrI3 TT
+model in an external harness; it does not establish production wiring for a
+full dynamic four-current head. The live GN/HL current block remains at
+$\omega=0$. The distinct Faraday lane's $q$-linear CT/TC Hall producer and
+GN consumer are not supplied by either ordered-head commit.
+
 **The transverse Hartree is on both routes.** Its gate is
 `include_transverse = bool(config.bispinor)` (`sigma_dispatch.py:311`), not
 `bispinor_gw`, so every bispinor mode and every compute mode gets it unless
@@ -698,7 +724,7 @@ uphold when editing, not as something the tree checks for you.
 | bispinor tile symmetry contracts, and why 4-component rotation does not exist | [Symmetry register](symmetry_register.md) |
 | the transverse current Hartree | [Direct Hartree field](../theory/hartree.md) |
 | Γ-cell quadrature ownership and the remaining scalar-versus-packed insertion distinction | [Four-current heads and frequency](../theory/four-current-head-corrections.md) §3.6 — both routes use the Wigner–Seitz polygon cubature; insertion is still route-specific |
-| what freezing the current blocks at ω = 0 inside a dynamic run costs (1.2 × 10⁻⁸ eV on MoS2 3×3, and it bounds the neglected frequency dependence from above) | [Four-current heads and frequency](../theory/four-current-head-corrections.md) §2.2 |
+| the measured static screened-versus-bare current difference on MoS2 3×3 (1.2 × 10⁻⁸ eV); it is not a bound on omitted dynamic current screening | [Four-current heads and frequency](../theory/four-current-head-corrections.md) §2.2 and §4.6 |
 | the narrative introduction, for a reader rather than an editor | `manual/08_bispinor/` (repo only, not in this site) |
 
 ### Raw-parent photon body (2026-09-05)
