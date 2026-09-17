@@ -201,8 +201,6 @@ def test_gapped_imaginary_time_producer_refuses_overlapping_bands(monkeypatch):
     calls = (
         lambda: w_isdf.compute_chi0(bad, quad, meta, mesh),
         lambda: w_isdf.precompile_chi0(bad, quad, meta, mesh),
-        lambda: w_isdf.compute_chi0_multi(
-            bad, quad.tau, np.stack([quad.alpha, quad.alpha]), meta, mesh),
         lambda: w_isdf.compute_chi0_imag_ordered(
             bad, quad, meta, mesh, q_neg_index=np.asarray([0, 1])),
         lambda: w_isdf.compute_chi0_contour(

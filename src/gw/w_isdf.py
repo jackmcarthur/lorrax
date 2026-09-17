@@ -1139,60 +1139,31 @@ def _run_minimax_chi(wfns, meta, mesh_xy, args, *, n_out=1,
     return kernel(*args)
 
 
-def _laplace_chi_args(wfns, tau, alpha_rows, energy_reference):
-    """Real-node operands with the one-orientation prefold in every weight row; see docs/architecture/four_current_wiring.md."""
+def _laplace_chi_args(wfns, quad, energy_reference):
+    """Real-node operands with the one-orientation prefold in the weights; see docs/architecture/four_current_wiring.md."""
     eref, vmax, cmin = _gap_edges(wfns, energy_reference)
     E_gap = cmin - vmax
-    tau = np.asarray(tau, dtype=np.float64)
-    alpha_rows = np.asarray(alpha_rows, dtype=np.float64)
-    if alpha_rows.ndim != 2 or alpha_rows.shape[1] != tau.shape[0]:
-        raise ValueError(
-            f"chi0 Laplace: alpha_rows shape {alpha_rows.shape} does not "
-            f"match tau nodes ({tau.shape[0]},) — every row must be a "
-            f"weight vector on quad.tau.")
+    tau = np.asarray(quad.tau, dtype=np.float64)
     # Fold the one-orientation prefactor (-exp(-τ·E_gap)) into α.  The
     # kernel adds A_R + conj(A_R), the two ordered particle-hole
     # orientations, before this weight is applied.
-    alpha_chi = -1.0 * alpha_rows * np.exp(-tau * E_gap)[None, :]
-    n_out = alpha_chi.shape[0]
-    return _minimax_chi_operands(
-        wfns, eref, vmax, cmin, tau,
-        alpha_chi[0] if n_out == 1 else alpha_chi), n_out
+    alpha_chi = -1.0 * np.asarray(quad.alpha, dtype=np.float64) * np.exp(-tau * E_gap)
+    return _minimax_chi_operands(wfns, eref, vmax, cmin, tau, alpha_chi)
 
 
 def compute_chi0(wfns, quad, meta, mesh_xy, *, energy_reference=0.0):
     """Compute χ₀(q) from a wavefunction bundle and minimax quadrature; see docs/architecture/four_current_wiring.md."""
-    args, _ = _laplace_chi_args(
-        wfns, quad.tau, np.asarray(quad.alpha)[None, :], energy_reference)
-    return _run_minimax_chi(wfns, meta, mesh_xy, args)
+    return _run_minimax_chi(
+        wfns, meta, mesh_xy, _laplace_chi_args(wfns, quad, energy_reference))
 
 
 def precompile_chi0(wfns, quad, meta, mesh_xy, *, energy_reference=None):
     """AOT lower+compile of the χ₀ minimax kernel at the real input shapes/shardings — warms the JAX in-process cache so the first ``compute_chi0`` call is execution-only; see docs/architecture/four_current_wiring.md."""
     if len(np.asarray(quad.tau)) == 0:
         return  # compute_chi0 falls through to a static-zeros path — nothing to compile
-    args, _ = _laplace_chi_args(
-        wfns, quad.tau, np.asarray(quad.alpha)[None, :], energy_reference)
-    _run_minimax_chi(wfns, meta, mesh_xy, args, compile_only=True)
-
-
-def compute_chi0_multi(wfns, tau, alpha_rows, meta, mesh_xy, *,
-                       energy_reference=0.0):
-    """χ₀ at several weight vectors over ONE τ sweep — see
-    ``_get_chi_minimax_kernel(n_out>=2)``.  Returns an ``n_out``-tuple of
-    flat-q (nq, μ, μ) arrays, one per row of ``alpha_rows``."""
-    args, n_out = _laplace_chi_args(wfns, tau, alpha_rows, energy_reference)
-    return _run_minimax_chi(wfns, meta, mesh_xy, args, n_out=n_out)
-
-
-def precompile_chi0_multi(wfns, tau, alpha_rows, meta, mesh_xy, *,
-                          energy_reference=None):
-    """AOT lower+compile sibling of :func:`precompile_chi0` for the
-    multi-output kernel."""
-    if len(np.asarray(tau)) == 0:
-        return
-    args, n_out = _laplace_chi_args(wfns, tau, alpha_rows, energy_reference)
-    _run_minimax_chi(wfns, meta, mesh_xy, args, n_out=n_out, compile_only=True)
+    _run_minimax_chi(wfns, meta, mesh_xy,
+                     _laplace_chi_args(wfns, quad, energy_reference),
+                     compile_only=True)
 
 
 def _chi0_imag_ordered_kernel_args(wfns, quad, energy_reference):

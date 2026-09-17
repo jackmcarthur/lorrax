@@ -258,6 +258,8 @@ def test_static_gamma_override_accepts_the_chi_carrier_not_logical_prefix(
 
     monkeypatch.setattr(w_isdf, "solve_w", _capture_solve)
     chi = jnp.zeros((1, 4, 4), dtype=jnp.complex128)
+    monkeypatch.setattr(w_isdf, "precompile_chi0", lambda *_a, **_k: None)
+    monkeypatch.setattr(w_isdf, "compute_chi0", lambda *_a, **_k: chi)
     gamma = jnp.arange(16, dtype=jnp.float64).reshape(1, 4, 4)
     meta = SimpleNamespace(
         nk_tot=1, n_rmu=3, kgrid=(1, 1, 1), fft_grid=(4, 1, 1))
@@ -265,11 +267,11 @@ def test_static_gamma_override_accepts_the_chi_carrier_not_logical_prefix(
         w_dyson_solver="distributed",
         distrib_la_batched_route="batch_reshard"))
     result = screening.compute_static_w(
-        None, jnp.zeros_like(chi), None, e_ref=0.0,
+        None, jnp.zeros_like(chi), SimpleNamespace(tau=np.asarray([0.1])),
+        e_ref=0.0,
         sym=SimpleNamespace(q_irr_full_idx=None), centroid_indices=None,
         config=config, meta=meta, mesh_xy=SimpleNamespace(),
-        force_full_bz=True, chi0_override=chi,
-        gamma_chi_override=gamma)
+        force_full_bz=True, gamma_chi_override=gamma)
     result.block_until_ready()
     np.testing.assert_array_equal(captured["chi"][0], np.asarray(gamma[0]))
 

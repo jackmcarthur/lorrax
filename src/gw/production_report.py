@@ -413,11 +413,10 @@ class GWProductionReport:
                 + chi0_orientation_route(
                     material_class, trs_allowed=allowed))
         elif mode == "gn_ppm":
-            reuse = str(getattr(config.ppm, "probe_chi_reuse", "off"))
             route = (
                 "ordered orientations with the TR-odd channel"
                 if not allowed else "incumbent symmetric completion")
-            self.emit(f"GN probe route  : {route}; ppm_probe_chi_reuse={reuse}")
+            self.emit(f"GN probe route  : {route}; dedicated probe pass")
         elif mode == "hl_ppm":
             self.emit(
                 "HL probe route  : incumbent real-axis completion"

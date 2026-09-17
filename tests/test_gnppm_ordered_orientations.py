@@ -38,7 +38,7 @@ from gw import w_isdf  # noqa: E402
 from gw.mpa import evaluator as mpa_evaluator  # noqa: E402
 from gw.mpa import pade_fit as mpa_pade_fit  # noqa: E402
 from gw.ppm_sigma import _residue_for_space  # noqa: E402
-from gw.screening import assert_probe_chi_reuse_supported  # noqa: E402
+from gw.screening import refuse_retired_probe_chi_reuse  # noqa: E402
 from gw.wavefunction_bundle import (  # noqa: E402
     BandSlices,
     PSI_MUN_SPEC,
@@ -853,11 +853,12 @@ def test_scalar_head_annihilates_the_odd_part_of_the_head_tensor():
 #  8. Refusals and the odd-kernel rule.
 # ---------------------------------------------------------------------------
 
-def test_probe_chi_reuse_refuses_by_name_on_a_magnet():
-    with pytest.raises(RuntimeError, match="gn_probe_chi_reuse_tr_broken"):
-        assert_probe_chi_reuse_supported("auto", tr_odd=True)
-    assert_probe_chi_reuse_supported("off", tr_odd=True)
-    assert_probe_chi_reuse_supported("auto", tr_odd=False)
+def test_retired_probe_chi_reuse_refuses_by_name():
+    """The fused probe path is gone on every deck; only the default passes."""
+    with pytest.raises(ValueError, match="ppm_probe_chi_reuse_retired"):
+        refuse_retired_probe_chi_reuse("auto")
+    refuse_retired_probe_chi_reuse("off")
+    refuse_retired_probe_chi_reuse(" OFF ")
 
 
 @pytest.mark.parametrize("x_min,x_max", [(0.12, 6.0), (0.0687, 8.0), (0.04, 10.0)])

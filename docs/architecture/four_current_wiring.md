@@ -1935,18 +1935,12 @@ diagonal model as the unnamed case.  Any nonzero component still refuses.
 
 ### `src/gw/w_isdf.py` — `_laplace_chi_args`
 
-Real-node operands for :func:`compute_chi0`, :func:`compute_chi0_multi`
-and their precompile siblings (one row is squeezed to the single-output
-kernel's 1-D weights).
+Real-node operands for :func:`compute_chi0` and :func:`precompile_chi0`.
 
-``tau``: (L,) node vector (the fused static∪extra union on the probe-
-reuse path).  ``alpha_rows``: (n_out, L) RAW quadrature weights, one
-row per output, all on ``tau``.  Row 0 is normally the static weights
-(zero-padded onto any extra nodes — zero-weight nodes add exact
-zeros); further rows are probe representations on the same nodes.
-The one-orientation prefactor ``-exp(-τ·E_gap)`` folds into every row;
+``quad.tau``: (L,) nodes; ``quad.alpha``: (L,) RAW quadrature weights.
+The one-orientation prefactor ``-exp(-τ·E_gap)`` folds into the weights;
 the kernel adds the reverse ordered transition through the shared
-R-space orientation combiner exactly as the single-output path does.
+R-space orientation combiner.
 
 ### `src/gw/w_isdf.py` — `_chi0_contour_alpha_rows`
 
