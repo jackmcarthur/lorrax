@@ -295,7 +295,7 @@ def test_round_program_pairs_mirrors_on_parents_of_different_sides():
     assert tables["own"][0] != tables["own"][1]
     run = lambda t: reduce_round(states, infinity, t, real=2, mesh_xy=mesh, native_eigh=ep.native_fn,
                                  ordered=True, odd_moments=True, keep_budget=None)
-    _, signed, (diag, _, _, _) = run(tables)
+    _, signed, _, (diag, _, _, _) = run(tables)
     diag = jax.tree.map(np.asarray, diag)
     assert diag["orientation_paired"][:2].all() and diag["gram_valid"][:2].all()
     c, mu, kept = (np.asarray(a) for a in signed)
@@ -305,7 +305,7 @@ def test_round_program_pairs_mirrors_on_parents_of_different_sides():
             assert rel((cs / (zz * ms - 1)) @ adj(cs), plant.F(zz)) < 1e-10
     points = tables["points"].copy()
     points[:, points.shape[1] // 2:] = points[:, :points.shape[1] // 2]
-    _, _, (bad, _, _, _) = run(dict(tables, points=points))
+    _, _, _, (bad, _, _, _) = run(dict(tables, points=points))
     assert not np.asarray(bad["orientation_paired"])[:2].any()
 
 
@@ -333,7 +333,7 @@ def test_dedupe_drops_duplicate_partners_and_equals_even_on_symmetric_data():
         infinity = _round_infinity(mesh, [plant] * 4, range(4) if ordered else (1, 3))
         tables = round_tables(counts, [st[1].shape[-1] for st in states], [st[0] for st in states], [2] * 4, 2,
                               column_extent=extent, ordered=ordered, odd_moments=True)
-        model, _, (diag, zero, _, _) = reduce_round(states, infinity, tables, real=4, mesh_xy=mesh,
+        model, _, _, (diag, zero, _, _) = reduce_round(states, infinity, tables, real=4, mesh_xy=mesh,
                                                     native_eigh=ep.native_fn, ordered=ordered, odd_moments=True,
                                                     keep_budget=None)
         assert bool(np.asarray(zero["zero_policy"]).all())

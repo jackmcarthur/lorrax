@@ -173,7 +173,9 @@ equal rank.
 **Layout.** The constructor reduces one round of parents at a time, one parent per rank (batch layout
 `P(('x','y'), ...)`): `gw.shared_pole_local.round_program` packs each parent's panels to the round extent
 (`round_tables`; ordered originals and mirrors as two halves of one extent), assembles and reduces its pencil with
-local dense kernels, and sorts its poles, all on that rank; synthetic slots are skipped. A round refuses before it
+local dense kernels, and sorts its poles, all on that rank; synthetic slots are skipped. The model checks (passivity,
+held `W` and `dW/ds`, moments) run the same way (`round_checks`), and the store receives one write of every parent in
+canonical order (`canonical_factors`). A round refuses before it
 runs if eight `[R, R]` blocks and the eigh workspace do not fit one device (`distrib_la.fits_local`). Receipts report
 each parent at its own extent: the round padding's zeros are dropped from the Gram spectrum
 (`own_extent_receipts`). Called on face stacks instead, the same blocks are assembled and symmetrized through

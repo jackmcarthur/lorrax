@@ -12,17 +12,10 @@ there is no local vendor or alternative eigensolver in this physics owner.
 
 from __future__ import annotations
 
-from functools import partial
-
 import jax
-import jax.numpy as jnp
 from common import timing
 from gw.shared_pole_capacity import ConstructorCapacity
-from gw.shared_pole_directions import (_model_diagnostics, _public_factor_kernel,
-                                       _round_kernels, _sample_point, select_round_states)
-from gw.shared_pole_gates import (shared_pole_passivity,
-                                  shared_pole_reciprocity,
-                                  signed_shared_pole_passivity)
+from gw.shared_pole_directions import _round_kernels, _sample_point, select_round_states
 from gw.shared_pole_reduction import ORIENTATION_PAIR_REFUSAL
 
 
@@ -67,8 +60,10 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
             read_shared_pole_bank, write_shared_pole_model,
         )
         from gw.gw_config import linalg_resolution
-        from gw.shared_pole_local import (batch_to_face, face_rows, own_extent_receipts, parent_rounds,
-                                          partner_realization, reduce_round, round_tables)
+        from common.staged_reshard import face_to_batch_reshard
+        from gw.shared_pole_local import (batch_to_face, canonical_factors, check_round, face_rows,
+                                          own_extent_receipts, parent_rounds, partner_realization,
+                                          reduce_round, round_tables)
         from gw.shared_pole_recipe import (
             build_construction_row, construction_receipt,
             shared_real_pole_gates_v1_r3b as gates,
@@ -136,15 +131,13 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
         column_extent = lambda width: padded_axis(
             width, mesh_xy, name="shared_pole_port",
             specs=((P("x", "y"), 0), (P("x", "y"), 1))).carrier
-        mm = budget.matmul
         eig, svd = budget.eigenplan(n), budget.eigenplan(2*n)
-        # Bind once for this construction, outside both parent and support
-        # loops. The GEMM seam owns native workspace accounting; keeping
-        # this jit local also avoids retaining the map's capacity ledger in
-        # a global callable cache across self-consistent reconstructions.
-        model_diagnostics = jax.jit(partial(_model_diagnostics, matmul=mm))
-        receipts = []
+        receipts, factors, store_poles, store_counts, placed = {}, [], [], [], []
         receipt_entry_start = 0
+        held_ids = [int(i) for i in recipe["held_ids"]]
+        if not held_ids:
+            raise ValueError("GATE shared_pole_held: got: no held samples; want: at least one held support; why: the model checks compare W and dW/ds there")
+        held_lo, held_hi = min(held_ids), max(held_ids) + 1
         nq = int(header["bank_shape"]["nq"])
         # A round of parents runs one parent per rank (batch layout) from its sample read to
         # its sorted model; ordered rounds are partner-closed so the mirror exchange stays inside.
@@ -153,7 +146,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
         rounds = parent_rounds(nq, ranks, partner_parent if ordered else None)
         batch_spec = P(("x", "y"))
         kernels = _round_kernels(mesh_xy)
-        to_face = batch_to_face(mesh_xy)
+        to_face, to_batch = batch_to_face(mesh_xy), face_to_batch_reshard(mesh_xy)
         fit_lo = min(int(i) for i in recipe["fit_ids"])
         fit_hi = max(int(i) for i in recipe["fit_ids"]) + 1
     for ids, real, slots in rounds:
@@ -200,21 +193,22 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
                                   column_extent=column_extent, ordered=ordered, odd_moments=odd_moments)
             side = int(tables["active"].shape[-1])
             # A pencil reduces on one device: its eight [side, side] blocks and the native eigh workspace.
-            local_eigh = distrib_la.plan("eigh", mesh_xy, n=side, backend="off", batched_route="batch_reshard")
+            local_eigh = budget.eigenplan(side)
             if not distrib_la.fits_local(local_eigh, "eigh", ((1, side, side),) * 8, np.complex128,
                                          ledger.device_budget_bytes_per_rank):
                 raise ValueError(f"GATE shared_pole_round_capacity: got: pencil side {side} at parents {ids[:real]}; want: eight [side, side] complex blocks and the eigh workspace within {ledger.device_budget_bytes_per_rank} bytes on one device; why: every parent reduces on its own rank")
             budget.retained_panels = (*infinity, *(v for st in round_states for v in st[1:]))
             budget.batch_width = ranks
-            price = budget.plan(side, phase="reduction")
+            budget.plan(side, phase="reduction")
         with timing.fenced_section("spole.gram_reduction"):
-            round_model, round_signed, round_diagnostics = reduce_round(
+            round_model, round_signed, vectors, round_diagnostics = reduce_round(
                 round_states, infinity, tables, real=real, mesh_xy=mesh_xy, native_eigh=local_eigh.native_fn,
                 ordered=ordered, odd_moments=odd_moments, keep_budget=recipe.get("pole_budget"))
-            round_qi = to_face(infinity[0])
+            qi = infinity[0]
             del round_states, infinity
             round_reduction, round_zero, round_retained, round_permutation = jax.tree.map(np.asarray, round_diagnostics)
-            budget.retained_panels = (*round_model, *round_signed, round_qi)
+            poles, active = (np.asarray(a) for a in vectors)
+            budget.retained_panels = (*round_model, *round_signed, qi, *factors)
         with timing.fenced_section("spole.gates"):
             for slot, q in enumerate(ids[:real]):
                 if ordered and not round_reduction["orientation_paired"][slot]:
@@ -239,122 +233,106 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
                                            for value in round_retained.values()):
                     raise ValueError(f"GATE shared_pole_retained_moments: got: failed at q={q}; want: projected latent moment identity <=1e-10; why: corrected Ritz algebra")
             reductions = own_extent_receipts(round_reduction, tables["own"][:real])
-            vectors = jax.tree.map(np.asarray, (round_model[1:], round_signed[1:]))
-        replicated = NamedSharding(mesh_xy, P())
-        for slot, q in enumerate(ids[:real]):
-            span = (q, q + 1)
-            take = face_rows(mesh_xy, (slot,))
-            model_vectors, signed_vectors = jax.tree.map(
-                lambda a: jax.device_put(a[slot:slot + 1], replicated), vectors)
-            model = (take(round_model[0]), *model_vectors)
-            if ordered:
-                signed = (take(round_signed[0]), *signed_vectors)
-            qi = take(round_qi)
-            reduction, roles = reductions[slot], round_roles[slot]
-            zero = {key: value[slot:slot + 1] for key, value in round_zero.items()}
-            retained = {key: value[slot:slot + 1] for key, value in round_retained.items()}
-            permutation = round_permutation[slot:slot + 1]
-            r = model[0].shape[-1]
-            budget.batch_width = 1
-            budget.plan(r, phase="model")
-            with timing.fenced_section("spole.coulomb"):
-                budget.query_workspace("gemm", ((1, n, n), (1, n, n)))
-                budget.plan()
-                budget.live((*model, qi))
-                coulomb_sqrt, inverse_sqrt, coulomb_receipt = response_coulomb_powers(
-                    meta, config, mesh_xy=mesh_xy, bank_io=bank, q_span=span)
-            with timing.fenced_section("spole.passivity"):
-                passive = (signed_shared_pole_passivity(
-                               signed, inverse_sqrt, eta_ry=recipe["eta_ev"] / RYD_TO_EV,
-                               matmul=mm, eigh=eig.batched, gates=gates) if ordered else
-                           shared_pole_passivity(model, inverse_sqrt,
-                                               eta_ry=recipe["eta_ev"] / RYD_TO_EV,
-                                               matmul=mm, eigh=eig.batched, gates=gates))
-                del coulomb_sqrt, inverse_sqrt
-            with timing.fenced_section("spole.gates"):
-                if not bool(jnp.all(passive["passivity"])):
-                    raise ValueError(f"GATE shared_pole_passivity: got: failed at q={q}; want: 0 <= V-whitened -W(i eta) <= I; why: passive screening")
-                budget.live((*model, qi))
-            with timing.fenced_section("spole.moment_read"):
-                with SlabIO(moments["path"], mode="r", mesh=mesh_xy) as moment_io:
-                    exact = read_shared_pole_bank(moment_io, span, meta=meta,
-                                                  header=moment_header, fields=("M1", "M3"))
-            with timing.fenced_section("spole.moment_diagnostics"):
-                if ordered:
-                    # Signed model moments: M1 = sum c c^H mu^-2 / 2, M3 = sum c c^H mu^-4 / 2.
-                    c_signed, mu_signed, kept = signed
-                    inverse = jnp.where(kept, 1 / jnp.where(kept, jnp.abs(mu_signed), 1), 0)
-                    moment_defects = model_diagnostics(
-                        (c_signed * inverse[:, None, :], inverse**2, kept), exact, qi)
-                    del c_signed, mu_signed, kept, inverse
+        with timing.fenced_section("spole.coulomb"):
+            budget.batch_width = ranks
+            budget.plan(side, phase="model", sample_batch=len(held_ids))
+            budget.live((*round_model, *round_signed, qi))
+            # V^-1/2 of the round's parents: one owner call per contiguous run of ids, rows in slot order.
+            runs = []
+            for q in sorted(ids[:real]):
+                if runs and q == runs[-1][1]:
+                    runs[-1][1] += 1
                 else:
-                    moment_defects = model_diagnostics(model, exact, qi)
-                del exact, qi
-            with timing.fenced_section("spole.held"):
-                held = []
-                reciprocity = []
-                with SlabIO(bank["path"], mode="r", mesh=mesh_xy) as bank_io:
-                    for sample_id in recipe["held_ids"]:
-                        budget.live(model)
-                        samples = read_shared_pole_bank(bank_io, span, meta=meta, header=header,
-                                                       sample_span=(int(sample_id), int(sample_id)+1),
-                                                       fields=("Wc", "dWc_ds"))
-                        b, poles, mask = model
-                        s = _sample_point(recipe, int(sample_id)) ** 2
-                        weights = jnp.where(mask, 1 / (s-poles), 0)
-                        if ordered:
-                            # Signed particle-hole model at z; dW/ds = (dW/dz)/(2z).
-                            b, mu_signed, mask = signed
-                            z = _sample_point(recipe, int(sample_id))
-                            weights = jnp.where(mask, 1 / (z * mu_signed - 1), 0)
-                            derivative = jnp.where(mask, -mu_signed / (z * mu_signed - 1)**2 / (2 * z), 0)
-                        diagnostic = {"sample_id": int(sample_id)}
-                        for field, weight in (("Wc", weights), ("dWc_ds", derivative if ordered else -weights**2)):
-                            sample = samples[field][:, 0]
-                            value = mm(b * weight[:, None, :], b, transb="C")
-                            diagnostic[field] = float(jnp.linalg.norm(value-sample) /
-                                                      jnp.maximum(jnp.linalg.norm(sample), jnp.finfo(jnp.float64).tiny))
-                            if not ordered:
-                                reciprocity.append(shared_pole_reciprocity(value, sample, gates=gates))
-                        held.append(diagnostic)
-                        del samples, sample, value
-                reciprocity = ({key: np.asarray([row[key] for row in reciprocity]).tolist()
-                                for key in reciprocity[0]} if not ordered else {})
-                if not ordered and not np.all(reciprocity["passed"]):
-                    raise ValueError(f"GATE shared_pole_model_reciprocity: got: {reciprocity} at q={q}; want: model preserves transpose symmetry of symmetric held data; why: conjugate-port closure must survive reduction")
-            with timing.fenced_section("spole.receipts"):
-                if ordered:
-                    del signed
-                b, poles, mask = model
-                counts = jnp.sum(mask, axis=-1, dtype=jnp.int64)
-                # All scalar reductions precede rank-selective store formatting.
-                price = budget.plan(r)
+                    runs.append([q, q + 1])
+            parts, coulomb = [], {}
+            for lo, hi in runs:
+                coulomb_sqrt, part, receipt = response_coulomb_powers(
+                    meta, config, mesh_xy=mesh_xy, bank_io=bank, q_span=(lo, hi))
+                del coulomb_sqrt
+                parts.append(part)
+                coulomb.update({q: dict(receipt, support_ranks=receipt["support_ranks"][q - lo:q - lo + 1])
+                                for q in range(lo, hi)})
+            inverse_sqrt = to_batch(face_rows(mesh_xy, tuple(sorted(ids[:real]).index(q) for q in ids))(*parts))
+            del parts
+        with timing.fenced_section("spole.sample_batch_read"):
+            with SlabIO(bank["path"], mode="r", mesh=mesh_xy) as bank_io:
+                held = read_shared_pole_bank(bank_io, meta=meta, header=header, q_ids=ids, partition_spec=batch_spec,
+                                             sample_span=(held_lo, held_hi), fields=("Wc", "dWc_ds"))
+            pick = kernels.take(tuple(i - held_lo for i in held_ids))
+            held = tuple(pick(held[name]) for name in ("Wc", "dWc_ds"))
+        with timing.fenced_section("spole.moment_read"):
+            with SlabIO(moments["path"], mode="r", mesh=mesh_xy) as moment_io:
+                exact = read_shared_pole_bank(moment_io, meta=meta, header=moment_header, q_ids=ids,
+                                              partition_spec=batch_spec, fields=("M1", "M3"))
+        with timing.fenced_section("spole.passivity_held"):
+            passive, held_errors, reciprocity, moment_defects = check_round(
+                round_model, round_signed, inverse_sqrt, held, (exact["M1"], exact["M3"]), qi,
+                real=real, nodes=[_sample_point(recipe, i) for i in held_ids], eta_ry=recipe["eta_ev"] / RYD_TO_EV,
+                mesh_xy=mesh_xy, native_eigh=local_eigh.native_fn, ordered=ordered)
+            del inverse_sqrt, held, exact
+        with timing.fenced_section("spole.gates"):
+            for slot, q in enumerate(ids[:real]):
+                if not passive["passivity"][slot]:
+                    raise ValueError(f"GATE shared_pole_passivity: got: failed at q={q}; want: 0 <= V-whitened -W(i eta) <= I; why: passive screening")
+                if not ordered and not np.all(reciprocity["passed"][slot]):
+                    raise ValueError(f"GATE shared_pole_model_reciprocity: got: { {k: v[slot].tolist() for k, v in reciprocity.items()} } at q={q}; want: model preserves transpose symmetry of symmetric held data; why: conjugate-port closure must survive reduction")
+        with timing.fenced_section("spole.receipts"):
+            price = budget.plan(side)
+            counts = active.sum(axis=-1, dtype=np.int64)
+            for slot, q in enumerate(ids[:real]):
+                row_of = lambda tree: {key: value[slot:slot + 1] for key, value in tree.items()}
                 row, measurements = build_construction_row(
-                    model, counts,
-                    dict(reduction=reduction, zero=zero, passive=passive,
-                         retained=retained, moment_defects=moment_defects,
-                         held=held, reciprocity=reciprocity, permutation=permutation),
-                    span=span, roles=roles, price=price, coulomb=coulomb_receipt,
+                    (None, poles[slot:slot + 1], active[slot:slot + 1]), counts[slot:slot + 1],
+                    dict(reduction=reductions[slot], zero=row_of(round_zero), passive=row_of(passive),
+                         retained=row_of(round_retained),
+                         moment_defects={name: row_of(value) for name, value in moment_defects.items()},
+                         held=[{"sample_id": sample_id, "Wc": float(held_errors[slot, 0, i]),
+                                "dWc_ds": float(held_errors[slot, 1, i])} for i, sample_id in enumerate(held_ids)],
+                         # Preserve the receipt's sample-major W,dW rows, each with one parent.
+                         reciprocity={key: value[slot].T.reshape(-1, 1).tolist()
+                                      for key, value in reciprocity.items()},
+                         permutation=round_permutation[slot:slot + 1]),
+                    span=(q, q + 1), roles=round_roles[slot], price=price, coulomb=coulomb[q],
                     native_queries=budget.native_queries, identity=identity,
                     gates=gates, nspinor=int(meta.nspinor), logical_n=logical_n,
                     ordered=ordered, odd_moments=odd_moments)
                 receipt = construction_receipt(
                     measurements, capacity=ledger,
                     capacity_entry_start=receipt_entry_start, ordered=ordered)
-                receipt_entry_start = len(ledger.entries)
                 receipt.update(identity=identity, constructor=row)
-                receipts.append(receipt)
-            with timing.fenced_section("spole.writer"):
-                store_header = write_shared_pole_model(
-                    output, _public_factor_kernel(mesh_xy)(b), poles, counts, q_span=span, meta=meta,
-                    tables=bank["tables"], recipe=recipe,
-                    receipts={"identity": identity, "q_receipts": [receipt]}, ordered=ordered)
-                del model, b, poles, mask, counts
-        with timing.fenced_section("spole.cleanup"):
+                receipts[q] = receipt
+            receipt_entry_start = len(ledger.entries)
+        with timing.fenced_section("spole.export_prepare"):
+            # The sorted model is an active prefix: keep the round's widest K, then restore to the face.
+            width = column_extent(int(counts[:real].max()))
+            factors.append(face_rows(mesh_xy, tuple(range(real)), width)(to_face(round_model[0])))
+            store_poles.append(poles[:real, :width])
+            store_counts.append(counts[:real])
+            placed += list(ids[:real])
+            del round_model, round_signed, qi, reductions, vectors
             ledger.live_stages = upstream
-            del round_model, round_signed, round_qi, reductions, vectors
-            budget.retained_panels = ()
+            budget.retained_panels = tuple(factors)
+    with timing.fenced_section("spole.writer_stack"):
+        if sorted(placed) != list(range(nq)):
+            raise ValueError(f"GATE shared_pole_rounds: got: parents {sorted(placed)}; want: each of {nq} parents once; why: one canonical store")
+        order = np.argsort(placed)
+        width = max(block.shape[-1] for block in factors)
+        public_b = canonical_factors(mesh_xy, tuple(int(i) for i in order))(*factors)
+        store_poles = np.concatenate([np.pad(block, ((0, 0), (0, width - block.shape[-1])), constant_values=1.0)
+                                      for block in store_poles])[order]
+        budget.batch_width = nq
+        budget.retained_panels = ()
+        budget.plan(width, phase="model")
+        budget.live((public_b,))
+        del factors
+    with timing.fenced_section("spole.writer"):
+        store_header = write_shared_pole_model(
+            output, public_b, jax.device_put(store_poles, NamedSharding(mesh_xy, P())),
+            np.concatenate(store_counts)[order], q_span=(0, nq), meta=meta, tables=bank["tables"], recipe=recipe,
+            receipts={"identity": identity, "q_receipts": [receipts[q] for q in range(nq)]}, ordered=ordered)
+        ledger.live_stages = upstream
+        del public_b
     with timing.fenced_section("spole.return"):
-        return {"q_receipts": receipts, "model_header": store_header,
+        return {"q_receipts": [receipts[q] for q in range(nq)], "model_header": store_header,
                 "capacity": ledger.receipt(),
                 "identity": identity, "status": "CONSTRUCTED"}

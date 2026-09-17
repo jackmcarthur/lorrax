@@ -7,7 +7,8 @@ CPU (pytest, 2x2 host mesh) and P4 (``python test_shared_pole_callable_reuse.py 
   without odd moments; ``own`` is the spectrum length at the slot's own extent;
 * ``own_extent_receipts`` drops exactly the round padding's zeros;
 * ``round_program``: a round with new supports, panels and counts at the same extents runs the same
-  executable; the public-factor and retained-column kernels are reused.
+  executable; the retained-column kernel is reused;
+* ``canonical_factors`` pads round blocks to the widest and places parents in canonical order.
 """
 from pathlib import Path
 import json
@@ -58,8 +59,7 @@ def check_reuse(mesh):
     import jax.numpy as jnp
     from jax.sharding import NamedSharding, PartitionSpec as P
     import distrib_la as D
-    from gw.shared_pole_directions import _public_factor_kernel
-    from gw.shared_pole_local import _batch_put, reduce_round, round_program, round_tables
+    from gw.shared_pole_local import _batch_put, canonical_factors, reduce_round, round_program, round_tables
     from distrib_la.polar import _retained_column_kernel
     ranks, n = 4, 8
     rng = np.random.default_rng(88)
@@ -92,7 +92,15 @@ def check_reuse(mesh):
     jax.block_until_ready(second)
     assert program._cache_size() == compiled
     assert float(jnp.max(jnp.abs(second[0][1] - first[0][1]))) > 0
-    assert _public_factor_kernel(mesh) is _public_factor_kernel(mesh)
+    blocks = [np.arange(2 * 8 * 2).reshape(2, 8, 2) + 1j, np.arange(8 * 4).reshape(1, 8, 4) + 100.]
+    face = NamedSharding(mesh, P(None, 'x', 'y'))
+    placed = canonical_factors(mesh, (2, 0, 1))(*(jax.make_array_from_callback(b.shape, face, lambda i, b=b: b[i])
+                                                 for b in blocks))
+    want = np.concatenate([np.pad(blocks[0], ((0, 0), (0, 0), (0, 2))), blocks[1]])[[2, 0, 1]][:, :, None, :]
+    from jax.experimental import multihost_utils
+    host = np.asarray(multihost_utils.process_allgather(placed, tiled=True))
+    assert placed.sharding.spec == P(None, 'x', None, 'y') and np.array_equal(host, want)
+    assert canonical_factors(mesh, (2, 0, 1)) is canonical_factors(mesh, (2, 0, 1))
     host = np.stack([np.full((8, 8), k + 1, complex) for k in range(3)])
     panels = jax.make_array_from_callback(host.shape, NamedSharding(mesh, P(None, 'x', 'y')), lambda i: host[i])
     select = _retained_column_kernel(mesh, True, 4)
@@ -107,7 +115,7 @@ def check_reuse(mesh):
         assert float(jnp.max(jnp.abs(changed[i, :, :count] - (i + 1)))) == 0
         if count < 4:
             assert float(jnp.max(jnp.abs(changed[i, :, count:]))) == 0
-    return dict(status='PASS', scope='round tables by hand; round executable, public-factor and retained-column reuse',
+    return dict(status='PASS', scope='round tables by hand; round executable and retained-column reuse; canonical factor placement',
                 round_specializations=compiled, selection_specializations=selection_specializations)
 
 

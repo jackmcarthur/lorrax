@@ -39,13 +39,6 @@ def _fit_roles(recipe):
 
 
 @lru_cache(maxsize=None)
-def _public_factor_kernel(mesh):
-    """Insert the scalar-spin axis without recreating the executable."""
-    return jax.jit(lambda value: value[:, :, None, :],
-                   out_shardings=NamedSharding(mesh, P(None, 'x', None, 'y')))
-
-
-@lru_cache(maxsize=None)
 def _round_kernels(mesh):
     """Rank-local programs on batch-layout round stacks [P, ...] (one parent per rank).
 

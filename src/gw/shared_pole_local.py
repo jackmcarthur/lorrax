@@ -79,13 +79,37 @@ def batch_to_face(mesh_xy):
 
 
 @lru_cache(maxsize=None)
-def face_rows(mesh_xy, rows):
-    """Select parent rows of a face stack [B, m_X, r_Y] on its replicated leading axis."""
+def face_rows(mesh_xy, rows, width=None):
+    """Select parent rows of face stacks [B, m_X, r_Y] on their replicated leading axis.
+
+    Several stacks are joined along that axis first; ``width`` keeps the leading
+    columns. Rows move nothing between ranks.
+    """
     import jax
     import jax.numpy as jnp
     from jax.sharding import NamedSharding, PartitionSpec as P
     index = tuple(int(r) for r in rows)
-    return jax.jit(lambda a: a[jnp.asarray(index)], out_shardings=NamedSharding(mesh_xy, P(None, 'x', 'y')))
+    return jax.jit(lambda *parts: jnp.concatenate(parts)[jnp.asarray(index)][..., :width],
+                   out_shardings=NamedSharding(mesh_xy, P(None, 'x', 'y')))
+
+
+@lru_cache(maxsize=None)
+def canonical_factors(mesh_xy, order):
+    """The store's handoff [nq, mu_X, 1, K_Y] from round factor blocks [real_r, mu_X, W_r_Y].
+
+    Blocks are padded with zero columns to the widest, joined in round order and
+    placed in canonical parent order (``order[i]`` is the joined row of parent i).
+    """
+    import jax
+    import jax.numpy as jnp
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    index = tuple(int(i) for i in order)
+
+    def stack(*parts):
+        width = max(part.shape[-1] for part in parts)
+        whole = jnp.concatenate([jnp.pad(part, ((0, 0), (0, 0), (0, width - part.shape[-1]))) for part in parts])
+        return whole[jnp.asarray(index)][:, :, None, :]
+    return jax.jit(stack, out_shardings=NamedSharding(mesh_xy, P(None, 'x', None, 'y')))
 
 
 def partner_realization(meta, header, ids, partner_parent, partner_row, *, mesh_xy):
@@ -209,14 +233,14 @@ def round_program(mesh_xy, native_eigh, ordered, odd_moments, keep_budget):
     local eigensolver ``native_eigh``, applies the zero policy, forms the
     retained (even) or original-infinity (ordered, odd moments) moment identity
     and sorts the poles. A synthetic slot (``live`` False) skips all of it through
-    ``lax.cond``. No array crosses ranks until the end: the factors return to the
-    face through the two all_to_alls of ``batch_to_face``, the vectors
-    replicated.
+    ``lax.cond``. No array crosses ranks: the models stay in batch layout for
+    ``round_checks``; only vectors are gathered.
 
     Arguments ``(live [P], points, order, active, Qs, WQs, dWQs, infinity)``, all
-    in batch layout. Returns ``(model, signed, (reduction, zero, retained,
-    permutation))`` in round order: model (b face [P, n, side], poles2, active),
-    signed (c face, mu, retained) on the ordered route else ``()``.
+    in batch layout. Returns ``(model, signed, vectors, (reduction, zero,
+    retained, permutation))`` in round order: model (b [P, n, side], poles2,
+    active) and signed (c, mu, retained; ordered route, else ``()``) in batch
+    layout, ``vectors`` = (poles2, active) and the diagnostics replicated.
     """
     import jax
     import jax.numpy as jnp
@@ -230,35 +254,26 @@ def round_program(mesh_xy, native_eigh, ordered, odd_moments, keep_budget):
 
     gates = shared_real_pole_gates_ordered_v1 if ordered else shared_real_pole_gates_v1_r3b
     batch, replicated = P(BATCH), NamedSharding(mesh_xy, P())
-    to_face = batch_to_face(mesh_xy)
-
-    def mm(a, b, *, transa='N', transb='N'):
-        def op(value, trans):
-            if trans == 'N':
-                return value
-            value = jnp.swapaxes(value, -1, -2)
-            return jnp.conj(value) if trans == 'C' else value
-        return jnp.matmul(op(a, transa), op(b, transb))
 
     def solve(points, q, o, d, infinity, active):
         finite = [(points, q, o, d)]
         if ordered:
-            pencil = assemble_ordered_shared_pole_pencil(finite, infinity if odd_moments else None, matmul=mm)
+            pencil = assemble_ordered_shared_pole_pencil(finite, infinity if odd_moments else None, matmul=_mm)
             model, signed, reduction = reduce_ordered_shared_pole_pencil(
-                pencil, active, eigh=native_eigh, matmul=mm, gates=gates, keep_budget=keep_budget)
-            retained = ordered_moment_identity(signed, infinity, matmul=mm) if odd_moments else {}
+                pencil, active, eigh=native_eigh, matmul=_mm, gates=gates, keep_budget=keep_budget)
+            retained = ordered_moment_identity(signed, infinity, matmul=_mm) if odd_moments else {}
             model, zero = apply_shared_pole_zero_policy(model, gates=gates)
             zero["zero_policy"] = zero["zero_policy"] & reduction["infinite_weight_ok"]
         else:
-            pencil = assemble_shared_pole_pencil(finite, infinity, matmul=mm)
+            pencil = assemble_shared_pole_pencil(finite, infinity, matmul=_mm)
             model, reduction, coefficients = reduce_shared_pole_pencil(
-                pencil, active, eigh=native_eigh, matmul=mm, gates=gates, keep_budget=keep_budget)
+                pencil, active, eigh=native_eigh, matmul=_mm, gates=gates, keep_budget=keep_budget)
             model, zero = apply_shared_pole_zero_policy(model, gates=gates)
             # E selects the infinity block, the last columns of X.
             side, width = pencil[0].shape[-1], infinity[0].shape[-1]
             selector = (jnp.arange(side)[:, None] == jnp.arange(side - width, side)[None, :])[None]
             retained = retained_moment_identity(pencil, coefficients, model, selector.astype(jnp.complex128),
-                                                matmul=mm)
+                                                matmul=_mm)
             signed = ()
         model, permutation = sort_shared_pole_columns(model)
         return model, signed, (reduction, zero, retained, permutation)
@@ -277,74 +292,108 @@ def round_program(mesh_xy, native_eigh, ordered, odd_moments, keep_budget):
     @jax.jit
     def execute(live, points, order, active, qs, os, ds, infinity):
         model, signed, diagnostics = mapped(live, points, order, active, qs, os, ds, infinity)
-        gather = lambda tree: jax.tree.map(lambda a: jax.lax.with_sharding_constraint(a, replicated), tree)
-        model = (to_face(model[0]), *gather(model[1:]))
-        signed = (to_face(signed[0]), *gather(signed[1:])) if ordered else ()
-        return model, signed, gather(diagnostics)
+        return model, signed, _gather(replicated, model[1:]), _gather(replicated, diagnostics)
     return execute
 
 
-@lru_cache(maxsize=None)
-def local_model_checks(mesh_xy, native_eigh):
-    """Check held W/dW and V-whitened passivity with independent local parents.
+def _gather(replicated, tree):
+    import jax
+    return jax.tree.map(lambda a: jax.lax.with_sharding_constraint(a, replicated), tree)
 
-    Model faces are [b,n,K], inverse Coulomb faces [b,n,n], held samples
-    [b,s,n,n], and squared Ry supports [s]. Complete parents move once to
-    ranks; all held-point products stay inside the local mapped body. Only
-    small diagnostic arrays return replicated. Callers admit padded batches.
+
+def _mm(a, b, *, transa='N', transb='N'):
+    """The rank-local GEMM of the round programs, with the service's transa/transb flags."""
+    import jax.numpy as jnp
+
+    def op(value, trans):
+        if trans == 'N':
+            return value
+        value = jnp.swapaxes(value, -1, -2)
+        return jnp.conj(value) if trans == 'C' else value
+    return jnp.matmul(op(a, transa), op(b, transb))
+
+
+def check_round(model, signed, inverse_coulomb_sqrt, held, moments, infinity_directions, *, real, nodes, eta_ry,
+                mesh_xy, native_eigh, ordered):
+    """Run ``round_checks`` on one round: host arguments placed, replicated host results out."""
+    import jax
+    import numpy as np
+    from jax.sharding import NamedSharding, PartitionSpec as P
+
+    replicated = NamedSharding(mesh_xy, P())
+    program = round_checks(mesh_xy, native_eigh, bool(ordered))
+    live = _batch_put(mesh_xy, np.arange(int(model[0].shape[0])) < int(real))
+    out = program(live, model, signed, inverse_coulomb_sqrt, *held,
+                  jax.device_put(np.asarray(nodes, np.complex128), replicated),
+                  jax.device_put(np.float64(eta_ry), replicated), *moments, infinity_directions)
+    return jax.tree.map(np.asarray, out)
+
+
+@lru_cache(maxsize=None)
+def round_checks(mesh_xy, native_eigh, ordered):
+    """Passivity, held W and dW/ds, and moment defects of a round's models, each parent on its own rank.
+
+    Arguments ``(live [P], model, signed, V^-1/2 [P, n, n], Wc and dWc/ds [P, S, n, n]
+    at the held nodes z [S], eta, M1, M3 [P, n, n], Q_inf [P, n, r])``, all in
+    batch layout except z and eta (replicated). The ordered route checks the
+    signed model: -Wc(i eta) = sum c c^H/(1 - i eta mu), Wc(z) = c diag(1/(z mu - 1)) c^H,
+    dWc/ds = c diag(-mu/(z mu - 1)^2/(2z)) c^H, moments of (c/|mu|, mu^-2). The
+    even route checks W(s) = b (s - Lambda)^-1 b^H, dW/ds = -b (s - Lambda)^-2 b^H at
+    s = z^2 and its reciprocity. Held samples are compared one at a time.
+    Returns replicated ``(passive, held [P, 2, S], reciprocity [P, 2, S] rows,
+    moment_defects)``; rows 0 and 1 of the held axis are W and dW/ds. A synthetic
+    slot is skipped.
     """
     import jax
     import jax.numpy as jnp
     from jax.sharding import NamedSharding, PartitionSpec as P
     from common.shard_map import shard_map
-    from common.staged_reshard import face_to_batch_reshard
-    from gw.shared_pole_gates import shared_pole_passivity, shared_pole_reciprocity
-    from gw.shared_pole_recipe import shared_real_pole_gates_v1_r3b as gates
+    from gw.shared_pole_directions import _model_diagnostics
+    from gw.shared_pole_gates import shared_pole_passivity, shared_pole_reciprocity, signed_shared_pole_passivity
+    from gw.shared_pole_recipe import shared_real_pole_gates_ordered_v1, shared_real_pole_gates_v1_r3b
 
-    to_batch = face_to_batch_reshard(mesh_xy)
-    qspec = P(('x', 'y'))
-    def mm(a, b, *, transb='N'):
-        return a @ (jnp.conj(jnp.swapaxes(b, -1, -2)) if transb == 'C' else b)
+    gates = shared_real_pole_gates_ordered_v1 if ordered else shared_real_pole_gates_v1_r3b
+    batch, rep = P(BATCH), P()
 
-    def one(args, supports, eta):
-        b, poles, mask, inverse, wc, dw = args
-        model = (b[None], poles[None], mask[None])
-        passive = shared_pole_passivity(model, inverse[None], eta_ry=eta,
-                                        matmul=mm, eigh=native_eigh, gates=gates)
-        # W(s)=b(s-Lambda)^-1 b.H; dW/ds=-b(s-Lambda)^-2 b.H.
-        weights = jnp.where(mask[None], 1/(supports[:, None]-poles[None]), 0)
-        factors = b[None] * jnp.stack((weights, -weights**2))[:, :, None, :]
-        values = factors @ jnp.conj(b.T)
-        exact = jnp.stack((wc, dw))
-        errors = jnp.linalg.norm(values-exact, axis=(-2, -1)) / jnp.maximum(
-            jnp.linalg.norm(exact, axis=(-2, -1)), jnp.finfo(jnp.float64).tiny)
-        reciprocity = shared_pole_reciprocity(values, exact, gates=gates)
-        return jax.tree.map(lambda a: a[0], passive), errors, reciprocity
+    def check(model, signed, inverse, wc, dw, z, eta, m1, m3, qi):
+        if ordered:
+            factor, mu, kept = signed
+            passive = signed_shared_pole_passivity(signed, inverse, eta_ry=eta, matmul=_mm, eigh=native_eigh,
+                                                   gates=gates)
+            node = z[:, None]
+            weights = jnp.where(kept, 1 / (node * mu - 1), 0)
+            slopes = jnp.where(kept, -mu / (node * mu - 1) ** 2 / (2 * node), 0)
+            scale = jnp.where(kept, 1 / jnp.where(kept, jnp.abs(mu), 1), 0)
+            moment_model = (factor * scale[:, None, :], scale ** 2, kept)
+        else:
+            factor, poles, active = model
+            passive = shared_pole_passivity(model, inverse, eta_ry=eta, matmul=_mm, eigh=native_eigh, gates=gates)
+            weights = jnp.where(active, 1 / ((z ** 2)[:, None] - poles), 0)
+            slopes = -weights ** 2
+            moment_model = model
 
-    mapped = shard_map(
-        lambda b, p, m, inv, w, dw, s, eta: jax.lax.map(
-            lambda row: one(row, s, eta), (b, p, m, inv, w, dw)),
-        mesh=mesh_xy, in_specs=(qspec,)*6+(P(), P()),
-        out_specs=(qspec, qspec, qspec), check_vma=False)
+        def sample(args):
+            weight, slope, w, d = args
+            errors, reciprocity = [], []
+            for k, exact in ((weight, w), (slope, d)):
+                value = _mm(factor * k[None, None, :], factor, transb='C')[0]
+                errors.append(jnp.linalg.norm(value - exact)
+                              / jnp.maximum(jnp.linalg.norm(exact), jnp.finfo(jnp.float64).tiny))
+                reciprocity.append({} if ordered else shared_pole_reciprocity(value, exact, gates=gates))
+            return jnp.stack(errors), jax.tree.map(lambda *v: jnp.stack(v), *reciprocity)
+        errors, reciprocity = jax.lax.map(sample, (weights, slopes, wc[0], dw[0]))
+        rows = lambda a: jnp.swapaxes(a, 0, 1)[None]
+        defects = _model_diagnostics(moment_model, {"M1": m1, "M3": m3}, qi, matmul=_mm)
+        return passive, rows(errors), jax.tree.map(rows, reciprocity), defects
 
-    @jax.jit
-    def execute(model, inverse, wc, dw, supports, eta):
-        b, poles, mask = model
-        batch = b.shape[0]
-        def pad(a):
-            return jnp.concatenate((a, jnp.repeat(a[-1:], batch-a.shape[0], axis=0)), axis=0)
-        def sample_move(a):
-            a = pad(a)
-            b, s, n, _ = a.shape
-            # Keep spatial x tiles contiguous while folding the replicated
-            # sample axis into M for the canonical volume-preserving move.
-            face = jnp.transpose(a, (0, 2, 1, 3)).reshape(b, n*s, n)
-            local = to_batch(face).reshape(b, n, s, n)
-            return jnp.transpose(local, (0, 2, 1, 3))
-        scalar = NamedSharding(mesh_xy, qspec)
-        out = mapped(to_batch(b), jax.lax.with_sharding_constraint(poles, scalar),
-                     jax.lax.with_sharding_constraint(mask, scalar),
-                     to_batch(pad(inverse)), sample_move(wc), sample_move(dw), supports, eta)
-        return jax.tree.map(lambda a: jax.lax.with_sharding_constraint(
-            a, NamedSharding(mesh_xy, P())), out)
-    return execute
+    def body(live, model, signed, inverse, wc, dw, z, eta, m1, m3, qi):
+        args = (model, signed, inverse, wc, dw, z, eta, m1, m3, qi)
+
+        def skip(args):
+            return jax.tree.map(lambda a: jnp.zeros(a.shape, a.dtype), jax.eval_shape(check, *args))
+        return jax.lax.cond(live[0], lambda args: check(*args), skip, args)
+
+    mapped = shard_map(body, mesh=mesh_xy, in_specs=(batch,) * 6 + (rep, rep) + (batch,) * 3, out_specs=batch,
+                       check_vma=False)
+    replicated = NamedSharding(mesh_xy, rep)
+    return jax.jit(lambda *args: _gather(replicated, mapped(*args)))

@@ -54,7 +54,7 @@ def check(mesh):
         infinity = tuple(put(a) for a in (qi, m1 @ qi, m3 @ qi))
         tables = round_tables(counts, [st[1].shape[-1] for st in round_], [st[0] for st in round_],
                               [2] * ranks, 2, column_extent=extent, ordered=False, odd_moments=False)
-        model, _, (diagnostics, zero, retained, _) = reduce_round(
+        model, _, vectors, (diagnostics, zero, retained, _) = reduce_round(
             round_, tuple(_batch_put(mesh, np.broadcast_to(a, (ranks,) + a.shape).copy())
                           for a in (qi, m1 @ qi, m3 @ qi)),
             tables, real=ranks, mesh_xy=mesh, native_eigh=ep.native_fn, ordered=False, odd_moments=False,
@@ -62,7 +62,7 @@ def check(mesh):
         to_face, first = batch_to_face(mesh), face_rows(mesh, (0,))
         states = [(st[0], *(first(to_face(a)) for a in st[1:])) for st in round_]
         counts = counts[:1]
-        b, t, active = first(model[0]), model[1][:1], model[2][:1]
+        b, t, active = first(to_face(model[0])), vectors[0][:1], vectors[1][:1]
         got = mm(b*jnp.where(active, 1/(-.37-t), 0)[:, None, :], b, transb='C')
         reference = put(sample(-.37)[0])
         green = shared_pole_reciprocity(got, reference, gates=gates)

@@ -2,7 +2,7 @@
 
 The constructor's physics is the Hermite/Ritz chain in
 ``gw.shared_pole_constructor``. Everything that prices it -- the carrier byte
-model, the native eigh/GEMM workspace queries, the map ledger reservations and
+model, the native eigh workspace queries, the map ledger reservations and
 the panels that stay live across a stage -- is here, so the driver reads as the
 equations and this file reads as the budget.
 
@@ -71,7 +71,7 @@ class ConstructorCapacity:
         Current packed centroid basis; supplies ``n_rmu_padded`` to the byte
         model and to the eigh extents.
     resolution : LinalgResolution
-        The once-resolved dense policy (layout, eigh backend, batched route).
+        The once-resolved dense policy; its layout prices the dense temporaries.
     mesh_xy : Mesh
         The run's named x/y mesh, never reconstructed here.
     ledger : CapacityLedger
@@ -98,7 +98,7 @@ class ConstructorCapacity:
         self._n = int(meta.n_rmu_padded)
         self._plans = {}
         self.native_queries = {}
-        self._native_maxima = {"eigh": 0, "gemm": 0}
+        self._native_maxima = {"eigh": 0}
         self._workspace = 0
         self._side = 0
         self._phase = "selection"
@@ -106,36 +106,32 @@ class ConstructorCapacity:
         self.batch_width = 1
 
     def eigenplan(self, side):
-        """The resolved eigh plan for one side, built once per side."""
+        """The rank-local eigh plan for one side, built once per side.
+
+        Every eigensolve of the construction runs on whole parents in batch
+        layout, one per rank, whatever the deck's linalg dial resolves.
+        """
         import distrib_la
 
         if side not in self._plans:
-            self._plans[side] = distrib_la.plan(
-                "eigh", self._mesh_xy, n=side, backend=self._resolution.eigh_backend,
-                batched_route=self._resolution.batched_route)
+            self._plans[side] = distrib_la.plan("eigh", self._mesh_xy, n=side, backend="off",
+                                                batched_route="batch_reshard")
         return self._plans[side]
 
-    def query_workspace(self, op, shapes, plan=None):
+    def query_workspace(self, op, shapes, plan):
         """Native workspace bytes per rank for one op at one shape, cached."""
         import distrib_la
 
         key = (op, shapes)
         if key not in self.native_queries:
-            self.native_queries[key] = (
-                distrib_la.matmul_workspace_bytes_per_rank(
-                    self._mesh_xy, shapes, np.complex128, backend="auto",
-                    batched_route=self._resolution.batched_route) if op == "gemm" else
-                distrib_la.workspace_bytes_per_rank(plan, op, shapes, np.complex128))
-        if op == "gemm":
-            self._native_maxima[op] = max(self._native_maxima[op], self.native_queries[key])
-            self._workspace = sum(self._native_maxima.values())
+            self.native_queries[key] = distrib_la.workspace_bytes_per_rank(plan, op, shapes, np.complex128)
         return self.native_queries[key]
 
-    def plan(self, side=None, *, phase=None, sample_batch=1, transpose_staging=0):
+    def plan(self, side=None, *, phase=None, sample_batch=1):
         """Admit this phase's actual live set before allocating it.
 
         ``side`` is the pencil side this price is for; omit it to reprice the
-        side already in hand, as a mid-GEMM staging charge does.
+        side already in hand.
         """
         if phase is not None:
             self._phase = phase
@@ -146,7 +142,6 @@ class ConstructorCapacity:
         extents = {n, 2*n} if self._phase == "selection" else (
             {side} if self._phase == "reduction" else {n})
         # Eigh scratch is transient: replace it at each phase boundary.
-        # Only the actually used GEMM context workspace persists.
         self._native_maxima["eigh"] = max(self.query_workspace(
             "eigh", ((self.batch_width, extent, extent),), self.eigenplan(extent))
             for extent in sorted(extents))
@@ -160,8 +155,7 @@ class ConstructorCapacity:
         extra = sum(_shard_bytes(a)
                     for a in {id(a): a for a in self.retained_panels}.values())
         price["terms_bytes_per_rank"]["retained_parent_panels"] = extra
-        price["terms_bytes_per_rank"]["gemm_transpose_staging"] = transpose_staging
-        price["resident_bytes_per_rank"] += extra + transpose_staging
+        price["resident_bytes_per_rank"] += extra
         row = self._reserve("constructor.plan", price["resident_bytes_per_rank"])
         return dict(row, price=price, native_workspace=dict(self._native_maxima))
 
@@ -174,28 +168,6 @@ class ConstructorCapacity:
         row = self._reserve("constructor.live",
                             sum(_shard_bytes(a) for a in unique.values()))
         self._ledger.live_stages = (*self._upstream, row["stage"])
-
-    def matmul(self, a, b, **kwargs):
-        """The resolved service GEMM, with its native workspace charged first."""
-        import distrib_la
-
-        # Workspace belongs to the matmul route, not the eigh backend.
-        # Its query excludes operand-sized endpoint transpose staging;
-        # charge those transient faces separately before execution.
-        shapes = tuple(value.shape[:-2] + (value.shape[-2:][::-1]
-                       if kwargs.get(trans, "N") != "N" else value.shape[-2:])
-                       for value, trans in ((a, "transa"), (b, "transb")))
-        previous = self._workspace
-        self.query_workspace("gemm", shapes)
-        staging = (sum(int(np.prod(value.shape)) * value.dtype.itemsize
-                       // int(self._mesh_xy.size)
-                       for value, trans in ((a, "transa"), (b, "transb"))
-                       if kwargs.get(trans, "N") != "N")
-                   if self._resolution.batched_route != "batch_reshard" else 0)
-        if self._workspace != previous or staging:
-            self.plan(transpose_staging=staging)
-        return distrib_la.matmul(a, b, mesh=self._mesh_xy, backend="auto",
-                                 batched_route=self._resolution.batched_route, **kwargs)
 
     def _reserve(self, kind, resident_bytes_per_rank):
         return self._ledger.reserve(
