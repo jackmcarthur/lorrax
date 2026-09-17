@@ -952,6 +952,16 @@ _BANK_MOMENT_FIELDS = ("M1", "M3")
 _BANK_ODD_MOMENT_FIELDS = ("M0", "M2")
 
 
+def _bank_sample_fields(header):
+    """Authenticated finite fields; legacy banks remain readable as references."""
+    mode = header.get("mirror_mode")
+    if mode is None:
+        return _BANK_SAMPLE_FIELDS
+    if mode != "literal_same_operator_v1" or "photon_layout" not in header:
+        _refuse("scratch bank unsupported mirror contract")
+    return _BANK_SAMPLE_FIELDS + ("Wc_mirror", "dWc_mirror_ds")
+
+
 def _bank_moment_fields(header):
     """Moment datasets of one bank: M1/M3, plus M0/M2 when it carries odd moments."""
     return (_BANK_MOMENT_FIELDS + (_BANK_ODD_MOMENT_FIELDS if header.get("odd_moments") else ())
@@ -1069,6 +1079,16 @@ def initialize_shared_pole_bank(path, *, meta, tables, recipe, identity,
     if odd:
         # One source of truth for the infinity block: the ordered bank itself.
         header["odd_moments"] = True
+    if photon_layout is not None:
+        from symmetry_maps.maps import q_negation_index
+        neg = np.asarray(q_negation_index(tuple(header["grid"])), dtype=np.int64)
+        header.update(mirror_mode="literal_same_operator_v1",
+            mirror_contract=dict(frequency="-conj(z_ry)", derivative="d/d((-conj(z_ry))^2)",
+                bare_response="conj(chi_exact_minus_q(z_ry))",
+                operator="same original parent V and frozen contact as Wc and M0..M3",
+                q_full_idx=header["q_irr_full_idx"],
+                minus_q_full_idx=neg[np.asarray(header["q_irr_full_idx"], dtype=np.int64)].tolist()))
+    sample_fields = _bank_sample_fields(header)
     fields = _bank_moment_fields(header)
     parents = (tables["q_irr_full_idx"] if isinstance(tables, dict)
                else tables.q_irr_full_idx)
@@ -1079,18 +1099,18 @@ def initialize_shared_pole_bank(path, *, meta, tables, recipe, identity,
         schema=BANK_SCHEMA, bank_shape={"nq": nq, "nsample": nsample, "d": d},
         bank_sample_plan=plan,
         bank_plan_digest=hashlib.sha256(_json(plan).encode()).hexdigest(),
-        sample_written=np.zeros((nq, nsample, 2), dtype=bool).tolist(),
+        sample_written=np.zeros((nq, nsample, len(sample_fields)), dtype=bool).tolist(),
         moment_written=np.zeros((nq, len(fields)), dtype=bool).tolist(),
         complete=False, final_commit=None,
         units={"Wc": "Ry", "dWc_ds": "Ry^-1", "M1": "Ry^3", "M3": "Ry^5",
                **({"M0": "Ry^2", "M2": "Ry^4"} if odd else {}),
-               **({"constant": "Ry"} if photon_layout is not None else {})},
+               **({"constant": "Ry", "Wc_mirror": "Ry", "dWc_mirror_ds": "Ry^-1"} if photon_layout is not None else {})},
         derivative_variable="s=z_Ry^2",
         moment_convention=("S_m = 2 M_(2m+1); physical M1 and M3; odd M0 (1/z) and M2 (1/z^3), M_k = C_(k+1)/2"
                            if odd else "S_m = 2 M_(2m+1); physical M1 and M3 only"),
-        payload_bytes=16 * nq * (2 * nsample + len(fields)) * d * d)
+        payload_bytes=16 * nq * (len(sample_fields) * nsample + len(fields)) * d * d)
     with SlabIO(path, mode="w", mesh=mesh_xy) as io:
-        for field in _BANK_SAMPLE_FIELDS:
+        for field in sample_fields:
             io.create_dataset(field, shape=(nq, nsample, d, d), dtype=np.complex128)
         for field in fields:
             io.create_dataset(field, shape=(nq, d, d), dtype=np.complex128)
@@ -1124,12 +1144,23 @@ def validate_shared_pole_bank(path, *, expected_identity, mesh_xy,
         _refuse("scratch bank sample plan digest mismatch")
     if _json(plan) != _json(_bank_plan(header["recipe"])):
         _refuse("scratch bank stale recipe/roles/held map")
+    if header.get("mirror_mode") is not None:
+        from symmetry_maps.maps import q_negation_index
+        _bank_sample_fields(header)
+        contract = header.get("mirror_contract", {})
+        q = np.asarray(header["q_irr_full_idx"], dtype=np.int64)
+        neg = np.asarray(q_negation_index(tuple(header["grid"])), dtype=np.int64)
+        if (contract.get("q_full_idx") != q.tolist()
+                or contract.get("minus_q_full_idx") != neg[q].tolist()
+                or contract.get("frequency") != "-conj(z_ry)"
+                or contract.get("derivative") != "d/d((-conj(z_ry))^2)"):
+            _refuse("scratch bank mirror q/frequency contract mismatch")
     shape = header["bank_shape"]
     nq, nsample = int(shape["nq"]), int(shape["nsample"])
     samples = np.asarray(header["sample_written"], dtype=bool)
     moments = np.asarray(header["moment_written"], dtype=bool)
     moment_fields = _bank_moment_fields(header)
-    if samples.shape != (nq, nsample, 2) or moments.shape != (nq, len(moment_fields)):
+    if samples.shape != (nq, nsample, len(_bank_sample_fields(header))) or moments.shape != (nq, len(moment_fields)):
         _refuse("scratch bank malformed written masks")
     if (nq != header["n_q_irr"] or nsample != _bank_nsample(plan)
             or shape["d"] != header["n_mu_logical"]
@@ -1137,6 +1168,9 @@ def validate_shared_pole_bank(path, *, expected_identity, mesh_xy,
         _refuse("scratch bank geometry/representation mismatch")
     # Geometry only: never load a matrix through the metadata handle.
     with h5py.File(path, "r") as file:
+        if header.get("mirror_mode") is None and any(
+                name in file for name in ("Wc_mirror", "dWc_mirror_ds")):
+            _refuse("scratch bank mirror payload lacks authenticated contract")
         # Boolean HDF5 enums are metadata, outside phdf5's numeric ABI.
         if not np.array_equal(file["sample_written"][()], samples):
             _refuse("scratch bank sample transaction mismatch")
@@ -1149,8 +1183,8 @@ def validate_shared_pole_bank(path, *, expected_identity, mesh_xy,
                 _refuse(f"scratch bank typed plan {name} digest mismatch")
         if file["role_codes_json"][()].decode() != _json(plan["role_codes"]):
             _refuse("scratch bank role code table mismatch")
-        for name in _BANK_SAMPLE_FIELDS + moment_fields:
-            expected = ((nq, nsample) if name in _BANK_SAMPLE_FIELDS else (nq,)) + (shape["d"],) * 2
+        for name in _bank_sample_fields(header) + moment_fields:
+            expected = ((nq, nsample) if name in _bank_sample_fields(header) else (nq,)) + (shape["d"],) * 2
             if (name not in file or file[name].shape != expected
                     or file[name].dtype != np.dtype(np.complex128)
                     or file[name].chunks is not None):
@@ -1168,7 +1202,8 @@ def validate_shared_pole_bank(path, *, expected_identity, mesh_xy,
 
 
 def write_shared_pole_bank(path, *, q_span, sample_span=None, Wc=None,
-                           dWc_ds=None, M1=None, M3=None, M0=None, M2=None, constant=None, meta,
+                           dWc_ds=None, Wc_mirror=None, dWc_mirror_ds=None,
+                           M1=None, M3=None, M0=None, M2=None, constant=None, meta,
                            expected_identity, mesh_xy):
     """Write one bounded q/sample batch and commit masks after collective close.
 
@@ -1187,10 +1222,11 @@ def write_shared_pole_bank(path, *, q_span, sample_span=None, Wc=None,
         _refuse("completed scratch bank is immutable")
     if not (np.asarray(header["sample_written"], dtype=bool).all()
             and np.asarray(header["moment_written"], dtype=bool).all()
-            and all(value is None for value in (Wc, dWc_ds, M1, M3, M0, M2, constant))):
+            and all(value is None for value in (Wc, dWc_ds, Wc_mirror, dWc_mirror_ds, M1, M3, M0, M2, constant))):
         prepared = _prepare_bank_write(header, q_span=q_span,
             sample_span=sample_span, meta=meta, mesh_xy=mesh_xy,
-            Wc=Wc, dWc_ds=dWc_ds, M1=M1, M3=M3, M0=M0, M2=M2, constant=constant)
+            Wc=Wc, dWc_ds=dWc_ds, Wc_mirror=Wc_mirror,
+            dWc_mirror_ds=dWc_mirror_ds, M1=M1, M3=M3, M0=M0, M2=M2, constant=constant)
         with SlabIO(path, mode="a", mesh=mesh_xy) as io:
             _write_bank_payload(io, header, meta, prepared)
             _write_bank_masks(io, header)
@@ -1216,7 +1252,7 @@ def _complete_bank(path, header):
 
 def _prepare_bank_write(header, *, q_span, meta, mesh_xy,
                         sample_span=None, Wc=None, dWc_ds=None,
-                        M1=None, M3=None, M0=None, M2=None, constant=None):
+                        Wc_mirror=None, dWc_mirror_ds=None, M1=None, M3=None, M0=None, M2=None, constant=None):
     """Validate/admit a packed span before opening or mutating a bank."""
     _check_basis(meta, header)
     if mesh_xy is not meta.mu_basis.mesh_xy:
@@ -1225,7 +1261,7 @@ def _prepare_bank_write(header, *, q_span, meta, mesh_xy,
         _refuse("completed scratch bank is immutable")
     shape = header["bank_shape"]
     q0, q1 = _span(q_span, shape["nq"], "q_span")
-    has_samples = Wc is not None or dWc_ds is not None
+    has_samples = any(v is not None for v in (Wc, dWc_ds, Wc_mirror, dWc_mirror_ds))
     if has_samples and sample_span is None:
         _refuse("scratch sample write requires explicit sample_span")
     if not has_samples and sample_span is not None:
@@ -1233,7 +1269,8 @@ def _prepare_bank_write(header, *, q_span, meta, mesh_xy,
     a0, a1 = (_span(sample_span, shape["nsample"], "sample_span")
               if has_samples else (0, 0))
     pending = [(name, value) for name, value in
-               (("Wc", Wc), ("dWc_ds", dWc_ds), ("M1", M1), ("M3", M3),
+               (("Wc", Wc), ("dWc_ds", dWc_ds),
+                ("Wc_mirror", Wc_mirror), ("dWc_mirror_ds", dWc_mirror_ds), ("M1", M1), ("M3", M3),
                 ("M0", M0), ("M2", M2), ("constant", constant))
                if value is not None]
     if not pending:
@@ -1248,8 +1285,8 @@ def _prepare_bank_write(header, *, q_span, meta, mesh_xy,
     # Validate every argument before opening the writer: a bad second field
     # must not leave an otherwise legal first field queued in the same call.
     for name, array in pending:
-        sample = name in _BANK_SAMPLE_FIELDS
-        fields = _BANK_SAMPLE_FIELDS if sample else _bank_moment_fields(header)
+        sample = name in _bank_sample_fields(header)
+        fields = _bank_sample_fields(header) if sample else _bank_moment_fields(header)
         if name not in fields:
             _refuse(f"scratch bank has no {name} field (odd moments belong to an ordered bank)")
         marked = (sample_mask[q0:q1, a0:a1, fields.index(name)] if sample
@@ -1285,7 +1322,7 @@ def _write_bank_payload(io, header, meta, prepared):
     q0, q1, a0, a1, pending, sample_mask, moment_mask = prepared
     shape, basis = header["bank_shape"], meta.mu_basis
     for name, array in pending:
-        sample = name in _BANK_SAMPLE_FIELDS
+        sample = name in _bank_sample_fields(header)
         spec = P(None, None, 'x', 'y') if sample else P(None, 'x', 'y')
         disk_shape = ((shape["nq"], shape["nsample"]) if sample
                       else (shape["nq"],)) + (shape["d"], shape["d"])
@@ -1298,7 +1335,7 @@ def _write_bank_payload(io, header, meta, prepared):
         io.sync_writes()
         del canonical
         if sample:
-            sample_mask[q0:q1, a0:a1, _BANK_SAMPLE_FIELDS.index(name)] = True
+            sample_mask[q0:q1, a0:a1, _bank_sample_fields(header).index(name)] = True
         else:
             moment_mask[q0:q1, _bank_moment_fields(header).index(name)] = True
     header["sample_written"] = sample_mask.tolist()
@@ -1407,7 +1444,7 @@ def read_shared_pole_bank(io, q_span=None, *, meta, header, sample_span=None,
         _refuse("reader mesh differs from packed basis mesh")
     fields = tuple(fields)
     if not fields or len(set(fields)) != len(fields) or any(
-            f not in _BANK_SAMPLE_FIELDS + _bank_moment_fields(header) for f in fields):
+            f not in _bank_sample_fields(header) + _bank_moment_fields(header) for f in fields):
         _refuse("scratch bank fields must be distinct Wc/dWc_ds/M1/M3 names "
                 "(M0/M2 on a bank with odd moments)")
     shape = header["bank_shape"]
@@ -1430,7 +1467,7 @@ def read_shared_pole_bank(io, q_span=None, *, meta, header, sample_span=None,
     ranks = int(mesh.shape["x"]) * int(mesh.shape["y"])
     if layout == "batch" and len(ids) % ranks:
         _refuse(f"batch-layout bank read needs a multiple of {ranks} parents, got {len(ids)}")
-    need_samples = any(name in _BANK_SAMPLE_FIELDS for name in fields)
+    need_samples = any(name in _bank_sample_fields(header) for name in fields)
     if need_samples and sample_span is None:
         _refuse("scratch sample read requires explicit sample_span")
     a0, a1 = (_span(sample_span, shape["nsample"], "sample_span")
@@ -1444,15 +1481,15 @@ def read_shared_pole_bank(io, q_span=None, *, meta, header, sample_span=None,
     moment_mask = np.asarray(header["moment_written"], dtype=bool)
     unique = sorted(set(ids))
     for name in fields:
-        marked = (sample_mask[unique, a0:a1, _BANK_SAMPLE_FIELDS.index(name)]
-                  if name in _BANK_SAMPLE_FIELDS
+        marked = (sample_mask[unique, a0:a1, _bank_sample_fields(header).index(name)]
+                  if name in _bank_sample_fields(header)
                   else moment_mask[unique, _bank_moment_fields(header).index(name)])
         if not marked.all():
             _refuse(f"scratch bank {name} requested span is incomplete")
     out = {}
     retained = 0
     for name in fields:
-        sample = name in _BANK_SAMPLE_FIELDS
+        sample = name in _bank_sample_fields(header)
         face = P(None, None, 'x', 'y') if sample else P(None, 'x', 'y')
         spec = face if layout == "face" or not contiguous else (
             P(_BATCH_LAYOUT, None, None, None) if sample else P(_BATCH_LAYOUT, None, None))
@@ -1704,8 +1741,8 @@ def export_shared_pole_outputs(handle, *, meta, config, mesh_xy, source_wfn,
         with SlabIO(bank_source, mode="r", mesh=mesh_xy) as io, \
                 SlabIO(path, mode="a", mesh=mesh_xy) as output_io:
             for q in range(bank_header["bank_shape"]["nq"]):
-                for field in _BANK_SAMPLE_FIELDS + _bank_moment_fields(bank_header):
-                    sample = field in _BANK_SAMPLE_FIELDS
+                for field in _bank_sample_fields(bank_header) + _bank_moment_fields(bank_header):
+                    sample = field in _bank_sample_fields(bank_header)
                     for i in range(bank_header["bank_shape"]["nsample"] if sample else 1):
                         span = (i, i+1) if sample else None
                         values = read_shared_pole_bank(io, (q, q+1), meta=meta,
