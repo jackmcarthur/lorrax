@@ -919,13 +919,10 @@ def _interband_degenerate_weight(
     numerator (``f_diff -> -f'(E_mid) * dE`` as the two energies coalesce),
     ``f_diff / dE -> 0.5*(s_bra + s_ket)``, where ``s = -f'`` is the
     caller's own MP1 Fermi-surface weight (:func:`gw.efermi.
-    mp1_negative_derivative`) -- the SAME divided-difference-to-derivative
-    limit :func:`gw.w_isdf.compute_chi0_direct_fractional`'s
-    ``_fractional_pair_scan_face`` already takes for its own ``z=0`` diagonal
-    limit (``w_isdf.py`` ``diagonal_limit = -0.5*(sa+sb)``; the sign here
-    is ``+`` rather than ``-`` because this module's ``f_diff`` is built
-    ket-minus-bra where that scan's ``df`` is a-minus-b -- same physical
-    limit, opposite index convention).  The ``z``-dependence keeps its
+    mp1_negative_derivative`) -- the divided-difference-to-derivative limit
+    that the static chi0 body reaches through its Fermi-Dirac tau factors
+    (:func:`gw.w_isdf.compute_chi0_matsubara` at ``n = 0``).  The
+    ``z``-dependence keeps its
     finite-``z`` form throughout: only ``dE`` is taken to a limit, never
     ``z`` -- a resonance (``z`` near ``dE`` at a NON-degenerate pair) is a
     different singularity and is untouched by this branch.

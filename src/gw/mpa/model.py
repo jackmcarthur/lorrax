@@ -924,8 +924,8 @@ def build_mpa_fit(
     difference the store records is the provenance stamp below.
     """
     # The former blanket metal gate (mpa_metal_evaluator_unavailable) is
-    # discharged: occupation-weighted chi (fractional contour + finite-q
-    # divided difference) and the weighted Sigma branches landed in Wave 1.
+    # discharged: occupation-weighted chi (fractional contour + the finite-q
+    # ordered-pair origin sample) and the weighted Sigma branches landed in Wave 1.
     # A metal plan still refuses without an OccupationState — here, before
     # any inode exists, and again at the _evaluate_samples seam — and that
     # refusal is now the only gate on the deck path: the driver-level
