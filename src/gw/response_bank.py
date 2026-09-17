@@ -1,8 +1,9 @@
 """Physical response-bank algebra (DESIGN §3.1, DBANK D5–D6).
 
-Operators have packed centroid-major endpoints ``mu * nspinor + spin``.
-The public bank supports scalar representations; disk conversion belongs to
-the scratch writer. Dense products and solves enter through ``distrib_la``.
+Charge operators have packed centroid-major endpoints ``mu * nspinor + spin``.
+Photon operators use ``PhotonBasisLayout`` for charge and current endpoints.
+Disk conversion belongs to the scratch writer. Dense products and solves
+enter through ``distrib_la``.
 """
 from functools import partial
 from functools import lru_cache
@@ -299,7 +300,7 @@ def photon_static_contact(wfns, meta, *, mesh_xy, layout, vertex,
         kernel, fixed = response_stream(wfns, meta, mesh_xy=mesh_xy,
             q_ids=(0,), n_outputs=1, pair_mode="laplace_ordered", vertex=vertex)
         projections = np.stack((-quad.alpha*np.exp(-gap*quad.tau), np.zeros_like(quad.tau)))
-        raw = execute(kernel, (jnp.asarray(quad.tau), jnp.asarray(projections), *fixed,
+        raw = execute(kernel, (jnp.asarray(quad.tau), jnp.asarray(projections, dtype=jnp.complex128), *fixed,
             jnp.asarray(np.stack((f, np.zeros_like(f)))),
             jnp.asarray(np.stack((u, np.zeros_like(u)))), jnp.asarray([lo, hi])), "static_reference")
         drude = jax.jit(lambda: jnp.zeros((1, layout.packed_extent, layout.packed_extent), complex),
