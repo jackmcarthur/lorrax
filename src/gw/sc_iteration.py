@@ -2773,7 +2773,12 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             state.H_qp_dft, kind=eigh_kind, mesh_xy=inputs.mesh_xy,
             config=inputs.config)
 
-        if bool(getattr(inputs.config, "density_self_consistent", False)):
+        if inputs.material_class == "metal":
+            # The full current ladder below owns the fixed-N FD solve.  A
+            # preliminary zero-temperature solve can refuse an admissible
+            # partially filled multiplet before that solver is reached.
+            efermi_ry = None
+        elif bool(getattr(inputs.config, "density_self_consistent", False)):
             from gw.efermi import fermi_level_step
 
             from .scissor import k_star_weights
@@ -2850,6 +2855,8 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             NamedSharding(inputs.mesh_xy, P(None, None)))
     entry_occ_state, entry_surface_weight_kn = _solve_head_occupations(
         inputs, enk_entry)
+    if inputs.material_class == "metal" and entry_occ_state is not None:
+        efermi_ry = float(entry_occ_state.mu_ry)
 
     # ------------------------------------------------------------------
     # RE-ANCHOR THE WINDOW ON THIS ITERATION'S FERMI LEVEL.

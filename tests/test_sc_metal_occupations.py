@@ -101,3 +101,55 @@ def test_head_off_mpa_metal_has_no_surface_table():
 def test_headless_insulator_keeps_the_step_occupation_path():
     state = _solve_occupation_state(_inputs("insulator"), _energies())
     assert state is None
+
+
+def test_updated_density_sc_metal_reaches_fd_at_a_partial_multiplet(monkeypatch):
+    """Map 1 must reach FD even where the T=0 reference correctly refuses.
+
+    Exercise the production map through its occupation boundary.  The
+    expensive eigensolve is supplied a planted spectrum; screening and
+    Sigma are outside this control-flow regression's scope.
+    """
+    import jax
+    import jax.numpy as jnp
+    import pytest
+    from jax.sharding import Mesh
+    from gw import efermi, sc_iteration, scissor
+
+    energies = np.broadcast_to([-1.0, 0.0, 0.0, 1.0], (4, 4)).copy()
+    with pytest.raises(ValueError, match="degenerate manifold"):
+        efermi.fermi_level_step(energies, np.full(4, 0.25), 2.0)
+
+    side = int(np.sqrt(jax.device_count()))
+    mesh = Mesh(np.asarray(jax.devices()).reshape(side, side), ("x", "y"))
+    inputs = _inputs("metal")
+    inputs.mesh_xy = mesh
+    inputs.meta = SimpleNamespace(nelec=2)
+    inputs.config.density_self_consistent = True
+    inputs.config.sc = SimpleNamespace(eigh="auto")
+    inputs.band_slices.sigma = slice(0, 4)
+    inputs.wfns_dft = SimpleNamespace(enk=jnp.asarray(energies))
+    inputs.print_fn = lambda *args: None
+    state = SimpleNamespace(iteration=1, H_qp_dft=jnp.zeros((4, 4, 4)))
+    monkeypatch.setattr(sc_iteration, "_resolve_sc_eigh", lambda *a, **kw: "local")
+    monkeypatch.setattr(sc_iteration, "_sc_eigh_bands", lambda *a, **kw: (
+        jnp.asarray(energies), jnp.broadcast_to(jnp.eye(4), (4, 4, 4))))
+    monkeypatch.setattr(sc_iteration, "_kstar", lambda _: SimpleNamespace(is_identity=True))
+    monkeypatch.setattr(scissor, "k_star_weights", lambda _: np.ones(4))
+
+    class OccupationsChecked(Exception):
+        pass
+
+    def check_current_state(current_inputs, current_energies):
+        np.testing.assert_array_equal(np.asarray(current_energies), energies)
+        occupation, surface = _solve_head_occupations(current_inputs, current_energies)
+        assert surface is None
+        assert occupation.smearing_family == "fd"
+        f = np.asarray(occupation.f_kn)
+        np.testing.assert_allclose(f[:, 1:3], 0.5, rtol=0, atol=1e-12)
+        np.testing.assert_allclose(f.sum(axis=1), 2.0, rtol=0, atol=1e-12)
+        raise OccupationsChecked
+
+    monkeypatch.setattr(sc_iteration, "_solve_head_occupations", check_current_state)
+    with pytest.raises(OccupationsChecked):
+        sc_iteration.gw_iteration_map(state, inputs)
