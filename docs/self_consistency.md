@@ -30,6 +30,14 @@ writer path. At the map boundary one named seam selects the complete retained
 result and its defining U together; diagnostics and writers consume that
 selection and never select or broadcast an individual Sigma table again.
 
+For density self-consistency, the charge and current fields use the same
+full-band occupation table as the rotated wavefunction bundle. The active QP
+rotation is embedded as the identity on physical sum bands outside the QP
+window; loader padding has zero occupation. The Hartree matrix-element sweep
+then projects onto the active QP window. Its mesh-padded matrix carrier is
+stripped at the SC producer seam, so each scalar and transverse Hartree
+matrix has the logical width of the retained Hamiltonian.
+
 | class | diagonal of H' | off-diagonals |
 |---|---|---|
 | protected (inside the Σ(ω) grid) | full Σ at the QP energy | kept, protected×protected only |
