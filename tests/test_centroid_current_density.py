@@ -175,6 +175,66 @@ def test_parent_stream_partitions_across_ranks_and_keeps_union(monkeypatch):
         partials[0] + partials[1], serial, rtol=3e-14, atol=3e-14)
 
 
+def test_unequal_stars_issue_the_same_device_programs_on_every_rank(
+        monkeypatch):
+    """INVARIANTS 21 on an IBZ WFN whose parent stars differ in size.
+
+    Stars 1/6/2 over four ranks (the symmetric CrI3 3x3 shape): parents are
+    dealt one per rank and rank 3 holds only the excluded filler parent.
+    Every rank must issue the same jitted kernels with the same operand
+    shapes in the same order, or the cross-rank compile agreement refuses
+    (JID 58454563.5).  The rank partials must still add to the P1 metric.
+    """
+    import centroid.sampling_metric as M
+    import common.collectives as C
+    import common.wfn_transforms as T
+
+    psi = _current_psi(3, 2)
+    parents = [0, 1, 1, 1, 1, 1, 1, 2, 2]
+    rows = [0, 0, 1, 2, 3, 4, 5, 0, 1]
+    weights = [1.0, 6.0, 2.0]
+    monkeypatch.setattr(T, "to_rbox", lambda values, *a, **k: values)
+    monkeypatch.setattr(C, "psum_replicate", lambda x, mesh: np.asarray(x))
+
+    programs = []
+    for name in ("_accumulate_subspace_density_matrices",
+                 "_transverse_metric_diagonal", "_accumulate_grid_pullback"):
+        kernel = getattr(M, name)
+
+        def record(*args, _kernel=kernel, _name=name):
+            programs.append((_name, tuple(
+                tuple(np.shape(a)) for a in args)))
+            return _kernel(*args)
+
+        monkeypatch.setattr(M, name, record)
+
+    monkeypatch.setattr(C, "process_rank_world", lambda: (0, 1))
+    serial = build_feature_metric_diagonal(
+        _fake_loader(psi, weights, raw_nspinor=2, bispinor=True),
+        _Star(parents, rows), (0, 1), (0, 2),
+        gamma_mode="transverse", verbose=False)
+
+    sequences, partials = [], []
+    for rank in range(4):
+        programs.clear()
+        monkeypatch.setattr(
+            C, "process_rank_world", lambda rank=rank: (rank, 4))
+        partials.append(build_feature_metric_diagonal(
+            _fake_loader(psi, weights, raw_nspinor=2, bispinor=True),
+            _Star(parents, rows), (0, 1), (0, 2),
+            gamma_mode="transverse", dist_mesh=object(), verbose=False))
+        sequences.append(list(programs))
+    for rank in range(1, 4):
+        assert sequences[rank] == sequences[0], (
+            f"rank {rank} issued a different device-program sequence "
+            f"({len(sequences[rank])} calls) from rank 0 "
+            f"({len(sequences[0])} calls)")
+    assert sum(name == "_accumulate_grid_pullback"
+               for name, _ in sequences[0]) == 6
+    np.testing.assert_allclose(
+        sum(partials), serial, rtol=3e-14, atol=3e-14)
+
+
 def test_nonuniform_parent_weights_are_divided_over_unequal_stars(monkeypatch):
     import common.collectives as C
     import common.wfn_transforms as T

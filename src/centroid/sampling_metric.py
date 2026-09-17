@@ -384,6 +384,14 @@ def build_feature_metric_diagonal(
         (int(parent), True) for parent in parents_used[rank::world]]
     while len(parents_local) < n_rounds:
         parents_local.append((int(parents_used[0]), False))
+    # Every rank issues the same device programs in the same order
+    # (INVARIANTS 21): round r pulls back as many rows as the largest star
+    # dealt to any rank in that round.  Shorter stars and the excluded filler
+    # parent pad with zero-weight rows, which leave the accumulator unchanged.
+    round_rows = [
+        max(int(star_plan[int(parent)][0].size)
+            for parent in parents_used[r * world:(r + 1) * world])
+        for r in range(n_rounds)]
     if rank == 0:
         print(
             f"  {mode} metric plan: {len(parents_used)} parent(s) over "
@@ -399,7 +407,7 @@ def build_feature_metric_diagonal(
     metric_local = jnp.zeros(n_grid, dtype=jnp.float64)
     real_parents_done = 0
     pullback_rows_done = 0
-    for parent, include_parent in parents_local:
+    for round_index, (parent, include_parent) in enumerate(parents_local):
         k_spec = IBZRows((parent,))
         box_index = wfn.box_index(k=k_spec)
         zero = jnp.zeros((ns, ns) + fft_grid, dtype=jnp.complex128)
@@ -432,11 +440,19 @@ def build_feature_metric_diagonal(
         else:
             parent_metric = _transverse_metric_diagonal(
                 density_left, density_right, wavefunction_scale)
-        if include_parent:
-            # Weights come from _quadrature_tables, which is the one place
-            # that knows whether this WFN stores the IBZ or the full BZ.
-            star_sym_rows, star_weights = star_plan[parent]
-            for row, member_weight in zip(star_sym_rows, star_weights):
+        # Weights come from _quadrature_tables, which is the one place
+        # that knows whether this WFN stores the IBZ or the full BZ.
+        star_sym_rows, star_weights = star_plan[parent]
+        n_rows = round_rows[round_index]
+        n_pad = max(0, n_rows - int(star_sym_rows.size))
+        rows = np.concatenate(
+            [star_sym_rows, np.repeat(star_sym_rows[-1:], n_pad)])[:n_rows]
+        weights = np.concatenate(
+            [star_weights if include_parent else np.zeros_like(star_weights),
+             np.zeros(n_pad)])[:n_rows]
+        pullback_row = pullback_dev = None
+        for row, member_weight in zip(rows, weights):
+            if row != pullback_row:
                 pullback = sym.fft_grid_pullback(
                     np.asarray([int(row)], dtype=np.int32),
                     fft_grid, validate=True)
@@ -444,16 +460,17 @@ def build_feature_metric_diagonal(
                     raise ValueError(
                         "symmetry-service FFT-grid pullback has the wrong "
                         f"shape: {pullback.shape} != {(1, n_grid)}")
+                pullback_row = row
                 pullback_dev = jnp.asarray(pullback[0], dtype=jnp.int32)
-                metric_local = _accumulate_grid_pullback(
-                    metric_local, parent_metric, pullback_dev,
-                    jnp.asarray(float(member_weight), dtype=jnp.float64))
-                metric_local.block_until_ready()
-                pullback_rows_done += 1
-                del pullback, pullback_dev
+                del pullback
+            metric_local = _accumulate_grid_pullback(
+                metric_local, parent_metric, pullback_dev,
+                jnp.asarray(float(member_weight), dtype=jnp.float64))
+            metric_local.block_until_ready()
+        del pullback_dev
+        if include_parent:
+            pullback_rows_done += int(star_sym_rows.size)
             real_parents_done += 1
-        else:
-            parent_metric.block_until_ready()
         del density_left, density_right, parent_metric
         if verbose and time.perf_counter() - last_log > 5.0:
             last_log = time.perf_counter()
