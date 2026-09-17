@@ -195,6 +195,8 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
             # node. The transaction owner broadcasts any refusal to every rank.
             import h5py
             model = root / "model.h5"
+            if photon and (root/'sectors.json').exists():
+                raise ValueError(f'GATE shared_pole_output: immutable sector manifest exists at {root}; use a fresh run directory')
             complete = False
             if model.exists():
                 try:
@@ -270,9 +272,10 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
             mesh_xy=mesh_xy, output=str(root / "model.h5"))
     with timing.fenced_section("spole.screening_finalize"):
         record("constructor", result)
-        header = result["model_header"]
-        handle = dict(path=str(root / "model.h5"), identity=identity,
-                      digest=header["digest"], K=list(header["K"]))
+        header = None if photon else result["model_header"]
+        handle = (result['handle'] if photon else
+                  dict(path=str(root / "model.h5"), identity=identity,
+                       digest=header["digest"], K=list(header["K"])))
         ledger.live_stages = ()
         result = dict(shared_pole=handle)
         if photon:
@@ -286,13 +289,13 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
                 plan=mpa_plan, material_class=material_class, occupation_state=occupation_state)
             result.update(mpa_head=head, iteration_head=iteration_head)
             record("head", head)
-        if config.debug.write_w or config.write_poles:
+        if (config.debug.write_w or config.write_poles) and not photon:
             from file_io.shared_pole_store import export_shared_pole_outputs
             with timing.fenced_section("spole.outputs"):
                 receipts["outputs"] = export_shared_pole_outputs(handle, meta=meta,
                     config=config, mesh_xy=mesh_xy, source_wfn=source_wfn,
                     run_dir=run_dir, label=label, tables=tables, print_fn=print_fn)
-        if tensors_filename is not None and not sc_scratch:
+        if tensors_filename is not None and not sc_scratch and not photon:
             receipts["restart_member"] = register_shared_pole_restart_member(
                 tensors_filename, handle["path"], expected_identity=identity,
                 mesh_xy=mesh_xy, capacity=ledger)
