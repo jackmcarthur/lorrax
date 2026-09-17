@@ -35,6 +35,7 @@ def check_tables():
     assert finite[2].tolist() == [True] * 3 + [False] + [True] * 3 + [False] * 5 and not finite[3].any()
     assert t["active"][:, 12:].sum(axis=1).tolist() == [3, 4, 3, 0]
     assert t["own"].tolist() == [16, 16, 12, 0]
+    assert t["extents"].tolist() == [[12, 4], [12, 4], [8, 4], [0, 0]]
     paired = np.column_stack((counts, counts))
     for odd, blocks in ((True, 2), (False, 0)):
         o = round_tables(paired, (8,) * 4, (1j, 2j, -1j, -2j), [3, 4, 3, 0], 4, column_extent=_extent,
@@ -47,7 +48,7 @@ def check_tables():
         if odd:
             assert np.array_equal(o["active"][:, 24:28], o["active"][:, 28:])
         assert o["own"].tolist() == ([16, 16, 12, 0] if odd else [12, 12, 8, 0])
-    row, = own_extent_receipts({"gram_spectrum_relative": np.array([[-1e-9, 0, 0, 0, .5, 1]]),
+    row, = own_extent_receipts({"gram_spectrum_relative": np.array([[-1e-9, 0, .5, 1, 0, 0]]),
                                 "metric_inverse_root_residual_fro": np.array([2.0])}, [4])
     assert row["gram_spectrum_relative"].tolist() == [[-1e-9, 0, .5, 1]]
     assert row["gram_min_relative"].tolist() == [-1e-9]
@@ -69,7 +70,12 @@ def check_reuse(mesh):
     qi = np.linalg.eigh(m1)[1][:, -2:]
     infinity = tuple(_batch_put(mesh, np.broadcast_to(a, (ranks,) + a.shape).astype(complex))
                      for a in (qi, m1 @ qi, m3 @ qi))
-    native = D.plan("eigh", mesh, n=n, backend="off", batched_route="batch_reshard").native_fn
+    base_native = D.plan("eigh", mesh, n=n, backend="off", batched_route="batch_reshard").native_fn
+    solved_sides = set()
+
+    def native(a):
+        solved_sides.add(a.shape[-1])
+        return base_native(a)
 
     def round_(nodes, counts, seed):
         local = np.random.default_rng(seed)
@@ -84,10 +90,12 @@ def check_reuse(mesh):
         return reduce_round(states, infinity, tables, real=ranks, mesh_xy=mesh, native_eigh=native,
                             ordered=False, odd_moments=False, keep_budget=None)
 
-    program = round_program(mesh, native, False, False, None)
+    program = round_program(mesh, native, False, False, None, ((8, 2), (12, 2), (16, 2)))
     first = round_((-.3 + .2j, -.9 + .1j), np.array([[3, 7], [7, 3], [3, 3], [7, 7]]), 1)
     jax.block_until_ready(first)
     compiled = program._cache_size()
+    assert compiled > 0
+    assert solved_sides == {10, 14, 18}, solved_sides
     second = round_((-.4 + .3j, -1.1 + .2j), np.array([[7, 3], [3, 7], [3, 3], [8, 7]]), 2)
     jax.block_until_ready(second)
     assert program._cache_size() == compiled

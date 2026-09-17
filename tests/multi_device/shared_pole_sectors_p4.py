@@ -195,8 +195,14 @@ def main():
     rows=run_checks(mesh)
     rows.extend(run_store_checks(mesh,args.output.parent))
     rows.extend(run_sigma_checks(mesh))
-    assert len(rows)==24
-    result=dict(status='PASS',checks=rows,expected_checks=24,
+    rows.extend(run_signed_contact_checks(mesh))
+    rows.extend(run_extent_span_checks(mesh))
+    if jax.process_index()==0:
+        print(json.dumps(dict(status="ALGEBRA_PASS",checks=rows[-2:])),flush=True)
+    from shared_pole_sector_constructor_p4 import check_sector_constructor
+    rows.append(check_sector_constructor(mesh,args.output.parent))
+    assert len(rows)==27
+    result=dict(status='PASS',checks=rows,expected_checks=27,
                 job=os.environ.get('SLURM_JOB_ID'),step=os.environ.get('SLURM_STEP_ID'),
                 source_commit=subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip(),
                 scope='P4 sector algebra, bitwise storage and direct band-sum tau Sigma; no frequency integration or production deck')
@@ -204,6 +210,97 @@ def main():
         args.output.write_text(json.dumps(result,indent=2)+'\n')
         print(json.dumps(result),flush=True)
     finalize_process()
+
+
+def run_signed_contact_checks(mesh):
+    """Signed contact Dyson versus an independent stable transition pencil.
+
+    This is a tiny physical-operator plant, not a finite-material stability
+    certificate. Fractional occupation differences enter before Dyson.
+    """
+    from types import SimpleNamespace
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+    import distrib_la
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    from common.shard_map import shard_map
+    from gw.response_bank import response_algebra
+    from gw.shared_pole_sectors import reduce_sector_pencil
+    from gw.shared_pole_local import _mm
+    from gw.shared_pole_recipe import shared_real_pole_gates_v1_r3b as gates
+
+    def put(a, spec):
+        a = np.broadcast_to(np.asarray(a, dtype=np.complex128), (mesh.size,) + np.shape(a)).copy()
+        return jax.make_array_from_callback(a.shape, NamedSharding(mesh, spec), lambda ix: a[ix])
+    face, batch = P(None, 'x', 'y'), P(('x', 'y'))
+    meta = SimpleNamespace(nk_tot=1, nspin=1, nspinor_wfnfile=2, cell_volume=2.)
+    sample, moment, _ = response_algebra(meta, {'linalg':'local'},
+                                        mesh_xy=mesh, n=4, ordered=True, photon=True)
+    v = np.diag([1.2, -.8, -.3, -.4]).astype(complex)
+    d = np.diag([0., .25, .1, .1])
+    f_difference = np.array([.7, .4])
+    vertex = np.array([[.08, .1+.05j], [.55, .02j], [0., .08], [0., .03j]])
+    plus = vertex * np.sqrt(f_difference)[None, :]
+    c = np.concatenate((plus, plus.conj()), axis=1)
+    j = np.diag([1., 1., -1., -1.])
+    h0 = np.diag([1., 1.7, 1., 1.7])
+    u = np.linalg.solve(np.eye(4)+v@d, v)
+    h = h0 + c.conj().T@u@c
+    output = u@c
+    minimum = float(np.linalg.eigvalsh(h).min())
+    assert minimum > .1
+    assert np.linalg.eigvalsh(u).min() < 0 < np.linalg.eigvalsh(u).max()
+    native = distrib_la.plan('eigh', mesh, n=4, backend='off').native_fn
+    reduce = jax.jit(shard_map(lambda h,j,o: reduce_sector_pencil((h,j,o,o),
+        eigh=native, matmul=_mm, gates=gates), mesh=mesh,
+        in_specs=(batch,)*3, out_specs=(batch,batch), check_vma=False))
+    factors, diagnostics = reduce(put(h,batch),put(j,batch),put(output,batch))
+    assert bool(jnp.all(diagnostics['gram_valid']))
+    assert bool(jnp.all(diagnostics['retained_metric_positive']))
+    cc, tt, mu, active = factors
+    assert bool(jnp.all(active & jnp.isfinite(mu) & (mu != 0)))
+    evaluate = jax.jit(shard_map(lambda a,b,m,z:(a/(z*m-1)[:,None,:]) @
+        jnp.swapaxes(b.conj(),-1,-2), mesh=mesh,
+        in_specs=(batch,batch,batch,P()),out_specs=batch,check_vma=False))
+    errors=[]
+    for z in (.3+.8j, -.4+.5j, 1.9+.2j):
+        resolvent = np.linalg.inv(z*j-h0)
+        chi = c@resolvent@c.conj().T
+        derivative = -c@resolvent@j@resolvent@c.conj().T/(2*z)
+        wc, dw = sample(put(v,face),put(chi,face),put(derivative,face),put(d/meta.cell_volume,face))
+        direct = np.linalg.solve(np.eye(4)-v@(chi-d),v)
+        pencil = output@np.linalg.solve(z*j-h,output.conj().T)
+        np.testing.assert_allclose(pencil,direct-u,rtol=2e-13,atol=2e-14)
+        assert float(jnp.max(jnp.abs(wc-put(direct-v,face)))) < 1e-12
+        assert float(jnp.max(jnp.abs(dw-put(direct@derivative@direct,face)))) < 1e-12
+        got=evaluate(cc,tt,mu,jax.device_put(z,NamedSharding(mesh,P())))
+        error=float(jnp.max(jnp.abs(got-put(direct-u,batch))))
+        assert error < 1e-12
+        errors.append(error)
+    bare=[c@np.linalg.matrix_power(j@h0,k)@j@c.conj().T for k in range(4)]
+    constant,*moments=moment(put(v,face),put(bare[1],face),put(bare[3],face),
+        put(bare[0],face),put(bare[2],face),put(d/meta.cell_volume,face))
+    assert float(jnp.max(jnp.abs(constant-put(u-v,face)))) < 1e-13
+    for k,m in enumerate(moments):
+        exact=output@np.linalg.matrix_power(j@h,k)@j@output.conj().T/2
+        assert float(jnp.max(jnp.abs(m-put(exact,face)))) < 1e-12
+    # An indefinite H can have entirely real poles; it must still fail the
+    # positive stable-realization admission. No eigenvalue is repaired.
+    unstable=np.diag([1.,1.7,-.4,1.7]).astype(complex)
+    assert np.max(np.abs(np.linalg.eigvals(j@unstable).imag)) == 0
+    _,bad=reduce(put(unstable,batch),put(j,batch),put(output,batch))
+    assert not bool(jnp.any(bad['gram_valid']))
+    # Scalar transverse stable example: V=-.8, D=.25, U=-1, two
+    # particle/hole amplitudes .6, H0=I. H eigenvalues .28 and 1 are
+    # positive, but -F(i*.1)/abs(V) exceeds the scalar upper bound 1.
+    scalar_ratio=(2*.6**2/(.1**2+1-2*.6**2))/.8
+    assert scalar_ratio > 3
+    return [dict(name='signed_contact_stable_pencil',minimum_h=minimum,
+                 complex_z_errors=errors,nonzero_constant=float(np.linalg.norm(u-v)),
+                 fractional_occupation_differences=f_difference.tolist(),
+                 real_spectrum_indefinite_h_refused=True,
+                 scalar_upper_bound_counterexample=scalar_ratio)]
 
 
 def run_span_checks(mesh):
@@ -295,6 +392,71 @@ def run_span_checks(mesh):
     assert ct_error<1e-10,ct_error
     return [dict(name='ordered_retained_span_and_cross_infinity',cross_absolute_error=cross_error,
                  output_metric_ritz_errors=errors,joint_round_held_error=ct_error)]
+
+
+
+def run_extent_span_checks(mesh):
+    """Unequal finite/infinity extents retain their original round-pencil rows."""
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+    import distrib_la
+    from common.shard_map import shard_map
+    from jax.sharding import PartitionSpec as P
+    from gw.shared_pole_local import _batch_put, _mm, reduce_round, round_tables
+    rng=np.random.default_rng(480)
+    plus=rng.normal(size=(2,2))+.2j*rng.normal(size=(2,2))
+    c=np.concatenate((plus,plus.conj()),axis=1)
+    j=np.diag([1.,1.,-1.,-1.]); h=np.diag([.6,1.4,.6,1.4])
+    counts=np.array([[1,1],[2,2],[1,1],[2,2]])
+    ni=np.array([1,2,2,1]); nodes=(.7+.4j,-.7-.4j)
+    tables=round_tables(counts,(2,2),nodes,ni,2,column_extent=lambda n:n,
+                        ordered=True,odd_moments=True)
+    put=lambda a:_batch_put(mesh,np.asarray(a))
+    states=[]; latent=[]
+    for a,z in enumerate(nodes):
+        qs=[];outs=[];ders=[];xs=[]
+        for r in range(mesh.size):
+            q=np.eye(2,dtype=complex);q[:,counts[r,a]:]=0
+            x=np.linalg.solve(z*j-h,c.conj().T@q)
+            qs.append(q);outs.append(c@x);ders.append(-c@np.linalg.solve(z*j-h,j@x));xs.append(x)
+        states.append((z,put(qs),put(outs),put(ders)));latent.append(np.array(xs))
+    qs=[];ks=[]
+    for r in range(mesh.size):
+        q=np.eye(2,dtype=complex);q[:,ni[r]:]=0
+        qs.append(q);ks.append(j@c.conj().T@q)
+    ks=np.array(ks);full=np.concatenate((*latent,ks,j@h@ks),axis=-1)
+    power=j@c.conj().T;infinity=[put(qs)]
+    for _ in range(4):
+        infinity.append(put(np.array([(c@power/2)@q for q in qs])))
+        power=j@h@power
+    native=distrib_la.plan('eigh',mesh,n=8,backend='off').native_fn
+    model,signed,vectors,diag,y=reduce_round(tuple(states),tuple(infinity),tables,real=4,
+        mesh_xy=mesh,native_eigh=native,ordered=True,odd_moments=True,keep_budget=None,retain_span=True)
+    assert np.all(np.asarray(diag[0]['gram_valid']))
+    assert np.all(np.asarray(diag[0]['retained_metric_positive']))
+    adj=lambda a:np.swapaxes(a.conj(),-1,-2)
+    pencil=tuple(put(a) for a in (adj(full)@j@full,adj(full)@h@full,c@full))
+    def check(p,y,s):
+        factor,mu,active=s;eye=jnp.eye(y.shape[-1])[None]
+        return jnp.stack((jnp.max(jnp.abs(_mm(p[2],y)-factor*active[:,None,:]),axis=(-2,-1)),
+            jnp.max(jnp.abs(_mm(y,_mm(p[1],y),transa='C')-eye*active[:,None,:]),axis=(-2,-1)),
+            jnp.max(jnp.abs(_mm(y,_mm(p[0],y),transa='C')-eye*(mu*active)[:,None,:]),axis=(-2,-1))),axis=-1)
+    check=jax.jit(shard_map(check,mesh=mesh,in_specs=(P(('x','y')),)*3,
+                            out_specs=P(('x','y')),check_vma=False))
+    errors=float(jnp.max(check(pencil,y,signed)))
+    assert errors<1e-9,errors
+    # A trailing-only embedding moves the second finite half and both
+    # infinity blocks for parent zero. It must fail the same identities.
+    def wrong(y):
+        indices=jnp.array([0,2,4,6,1,3,5,7])
+        return jnp.take(y,indices,axis=-2)
+    wrong=jax.jit(shard_map(wrong,mesh=mesh,in_specs=P(('x','y')),
+                            out_specs=P(('x','y')),check_vma=False))
+    red=float(jnp.max(check(pencil,wrong(y),signed)))
+    assert red>1e-3,red
+    return [dict(name='own_extent_retained_span_rows',maximum_identity_error=errors,
+                 wrong_row_embedding_error=red,extents=tables['extents'].tolist())]
 
 
 def run_current_partner_checks(mesh):
