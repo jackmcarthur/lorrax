@@ -14,10 +14,11 @@ KMS response has ``matsubara_response_rule``. The GN-PPM odd kernel shares
 its even rule's times through ``augment_odd_laplace``. MPA's damped line and
 rectangle time rules are built through the four ``damped_*_rule`` names.
 
-Three experimental analytic reciprocal constructors cover only their stated
+Three analytic reciprocal constructors cover only their stated
 one-dimensional domains: positive real intervals, the gapped odd real axis,
-and a normalized fixed-height line. Their validity does not transfer to a
-different regularized kernel or to a complex box by matching bandwidth alone.
+and a normalized fixed-height line. Sigma PPM requests the line for crossing
+windows with real poles. Their validity does not transfer to a different
+regularized kernel or to a complex box by matching bandwidth alone.
 See ``docs/services/minimax.md`` for units, error currencies and certificates.
 """
 
@@ -160,7 +161,7 @@ _LEVELLED_NAMES = ("noncrossing_levelled", "certify_noncrossing")
 
 # Experimental constructors remain lazy: catalog lookup stays NumPy-only.
 _ANALYTIC_NAMES = ("positive_reciprocal", "odd_reciprocal",
-                   "damped_line_reciprocal")
+                   "damped_line_reciprocal", "analytic_line_box_rule")
 _ODD_LAPLACE_NAMES = ("augment_odd_laplace",)
 _DAMPED_RULE_NAMES = (
     "DEFAULT_DAMPED_REL_TOL", "DEFAULT_WAVELENGTHS_PER_PANEL",

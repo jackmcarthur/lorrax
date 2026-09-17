@@ -1482,6 +1482,7 @@ def compute_sigma_c_mpa_omega_grid(
     band_counts=None,
     fixed_quadrature_session=None,
     sigma_w_model="mpa",
+    analytic_line=False,
     print_fn=print,
 ):
     """Read a fitted MPA store, derive its windows, and compute Sigma_c.
@@ -1506,6 +1507,8 @@ def compute_sigma_c_mpa_omega_grid(
     while sharing this planner and executor exactly.  ``band_brackets`` and
     ``band_counts`` similarly carry the optional disjoint band-convergence
     partition.  They change neither pole interpretation nor window planning.
+    ``analytic_line`` is the PPM request for its real-pole crossing windows;
+    the planner validates the pole and denominator geometry before using it.
     """
     if sigma_w_model not in ("mpa", "shared_pole"):
         raise ValueError(f"sigma_w_model must be mpa or shared_pole; got {sigma_w_model!r}")
@@ -1615,7 +1618,8 @@ def compute_sigma_c_mpa_omega_grid(
                     eps=quadrature_eps,
                     cache_dir=quadrature_cache_dir,
                     print_fn=print_fn, edge_factor=edge_factor,
-                    fixed_rule_session=fixed_quadrature_session)
+                    fixed_rule_session=fixed_quadrature_session,
+                    analytic_line=bool(analytic_line))
         quadrature_log.record_sigma_plan(geometry)
         if plan_mode == "panes":
             print_fn(

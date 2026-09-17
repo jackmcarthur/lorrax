@@ -37,6 +37,7 @@ from gw.mpa.sigma_windows import SharedSigmaWindow
 from gw.ppm_windows import _SigmaWindow
 from gw.scissor import sc_state_pad_ev
 from minimax import (
+    analytic_line_box_rule,
     UniformRule,
     boundary_samples,
     build_uniform_rule,
@@ -500,29 +501,39 @@ def _fit_rule(spec, eps, cache_dir, eta, *, cache_build_widen=True):
     relative = requested_box[0] > 0.0 or requested_box[1] < 0.0
     noise_budget = _RUNTIME_NOISE_SAFETY * eps
     noise_amplification_cap = noise_budget / _RUNTIME_NOISE_EPSILON
-    cached, cache_lookup_warnings = _rule_cache_lookup(
-        cache_dir, requested_box, eps, relative,
-        noise_amplification_cap=noise_amplification_cap)
-    if cached is not None:
-        rule, cache_name = cached
-        cache_status = f"hit:{cache_name}"
+    analytic_line = (bool(spec.get("analytic_line")) and not relative
+                     and requested_box[2] == requested_box[3]
+                     and spec["pole_extent"][2:] == (0.0, 0.0))
+    if analytic_line:
+        # PPM's real poles make Im(d)=eta exactly.  Ask the analytic service
+        # for that line; a cached rectangle rule cannot silently preempt it.
+        rule = analytic_line_box_rule(requested_box, eps)
+        cached, cache_lookup_warnings = rule, ()
+        cache_status = "analytic-line"
     else:
-        build_box = (_cache_build_box(requested_box, eta)
-                     if cache_dir is not None and cache_build_widen
-                     else requested_box)
-        build_kwargs = {}
-        if relative:
-            # For a sign-definite rule the service's kappa is
-            # sum|term|/|Q|, while Sigma's noise amplification is
-            # |d|*sum|term|.  The certified relative sup error gives
-            # |d Q(d)| <= 1 + eps, so this cap is sufficient for the
-            # executor's stricter, eps-scaled noise condition.  Crossing
-            # rules use peak-relative term mass instead and retain the
-            # service's ordinary cancellation cap.
-            build_kwargs["kappa_cap"] = (
-                noise_amplification_cap / (1.0 + eps))
-        rule = build_uniform_rule(build_box, eps, **build_kwargs)
-        cache_status = "miss" if cache_dir is not None else "off"
+        cached, cache_lookup_warnings = _rule_cache_lookup(
+            cache_dir, requested_box, eps, relative,
+            noise_amplification_cap=noise_amplification_cap)
+        if cached is not None:
+            rule, cache_name = cached
+            cache_status = f"hit:{cache_name}"
+        else:
+            build_box = (_cache_build_box(requested_box, eta)
+                         if cache_dir is not None and cache_build_widen
+                         else requested_box)
+            build_kwargs = {}
+            if relative:
+                # For a sign-definite rule the service's kappa is
+                # sum|term|/|Q|, while Sigma's noise amplification is
+                # |d|*sum|term|.  The certified relative sup error gives
+                # |d Q(d)| <= 1 + eps, so this cap is sufficient for the
+                # executor's stricter, eps-scaled noise condition.  Crossing
+                # rules use peak-relative term mass instead and retain the
+                # service's ordinary cancellation cap.
+                build_kwargs["kappa_cap"] = (
+                    noise_amplification_cap / (1.0 + eps))
+            rule = build_uniform_rule(build_box, eps, **build_kwargs)
+            cache_status = "miss" if cache_dir is not None else "off"
         # There is no retry.  The builder takes no clock and no pass count,
         # so a second call with the same inputs returns the same rule; the
         # old 5x-budget retry existed only because the first attempt could
@@ -601,7 +612,9 @@ def _fit_rule(spec, eps, cache_dir, eta, *, cache_build_widen=True):
         "node_digest": node_digest,
         "cache_write_warning": cache_write_warning,
         "cache_lookup_warnings": cache_lookup_warnings,
-        "one_line": rule.one_line(),
+        "one_line": (f"analytic line: {rule.node_count} nodes, "
+                     f"sup {rule.sup_error:.2e} (eps {eps:g})"
+                     if analytic_line else rule.one_line()),
     }
 
 
@@ -933,8 +946,13 @@ def plan_sigma_windows(
     print_fn=print,
     edge_factor=1.5,
     fixed_rule_session=None,
+    analytic_line=False,
 ):
     """Build the complete MPA Sigma quadrature from raw support boxes.
+
+    ``analytic_line`` asks the service for its fixed-height rule only when
+    the box crosses zero and all poles are real. PPM supplies that request;
+    generic MPA and shared-pole W keep their box-rule contracts.
 
     Parameters
     ----------
@@ -1038,6 +1056,7 @@ def plan_sigma_windows(
                 name=f"{branch.tag}:{name}", frequencies=frequencies,
                 states=states, pole_stats=pole_stats,
                 pole_sign=pole_sign, eta_ry=eta)
+            spec["analytic_line"] = bool(analytic_line)
             if fixed_rule_session is not None and "external_support_ev" in fixed_rule_session:
                 support = np.asarray(fixed_rule_session["external_support_ev"]) / RYD_TO_EV
                 spec["sc_support_frequencies"] = (

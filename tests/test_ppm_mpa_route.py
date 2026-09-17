@@ -102,6 +102,7 @@ def test_ppm_fit_is_persisted_then_consumed_by_the_mpa_route(monkeypatch):
     assert mpa_path == path
     assert mpa_kw["quadrature_eps"] == 3.0e-5
     assert mpa_kw["quadrature_cache_dir"] == "/tmp/rule-cache"
+    assert mpa_kw["analytic_line"] is True
     assert mpa_kw["pole_batch_size"] == 4
     assert mpa_kw["band_brackets"] == plan.bounds
     assert mpa_kw["band_counts"] == plan.counts
