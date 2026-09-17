@@ -146,7 +146,18 @@ The linear particle–hole pencil `(z σ₃ − M)` has the same resolvent-ident
 $$ \mathcal G = X^\dagger \sigma_3 X,\qquad \mathcal H = X^\dagger M X, \tag{SP 11} $$
 
 with nodes `{z, z̄, −z̄, −z}` and `∂W/∂z = 2z ∂W/∂s`. Every state `X(z)` on `Q` is followed, after all originals, by
-its mirror `X(−z)` on the same `Q`; `W_q(−z̄) = conj W_{−q}(z)`, so the mirror is one sample of parent `−q`. Poles
+its mirror `X(−z)` on the same `Q`; for an exactly covariant representation,
+`W_q(−z̄) = conj W_{−q}(z)` gives that mirror from parent `−q`. An approximate
+ISDF photon operator need not obey this identity closely enough for the
+finite Gram. A photon bank therefore stores `Wc_mirror` and
+`dWc_mirror_ds` at `−conj(z)` from the same physical state, with the original
+parent's V and contact. The constructor takes the stored value directly for
+the conjugate mirror state and its adjoint for the original mirror state;
+both derivatives acquire the actual mirror node's `2z` factor. CC, TT, CT
+and TC use those same authenticated fields. M0..M3 are computed from the
+original q operator, V and contact and still feed the unchanged infinity
+block; finite-sample mirror positivity alone does not certify that block.
+Poles
 `ℋ ≻ 0` on the retained span is sufficient for Hermitian whitening, real
 finite poles `1/μ`, and residues with the sign of the pole. A stable RPA
 (`M ≻ 0`) guarantees this condition. Reality alone is insufficient to infer

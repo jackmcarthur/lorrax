@@ -551,11 +551,13 @@ def run_store_checks(mesh,root):
     device=fixture._device(raw,mesh,P(None,None,'x','y'))
     moment=fixture._device(raw[:,0],mesh,P(None,'x','y'))
     header=store.write_shared_pole_bank(path,q_span=(0,nq),sample_span=(0,2),Wc=device,dWc_ds=2*device,
+        Wc_mirror=3*device,dWc_mirror_ds=4*device,
         M0=moment,M1=moment,M2=moment,M3=moment,constant=moment,
         meta=meta,expected_identity=identity,mesh_xy=mesh)
     for endpoints in ((0,0),(1,1),(0,1),(1,0)):
         with SlabIO(path,mode='r',mesh=mesh) as io:
-            got=read_sector_round(io,meta,bank,header,[0,1,2,2],endpoints,sample_span=(0,2))
+            got=read_sector_round(io,meta,bank,header,[0,1,2,2],endpoints,
+                sample_span=(0,2),fields=('Wc','dWc_ds','Wc_mirror','dWc_mirror_ds'))
         endpoint_indices=[];endpoint_valid=[]
         for family in endpoints:
             basis=bank['mu_bases'][family]
@@ -569,7 +571,9 @@ def run_store_checks(mesh,root):
         expected=raw[[0,1,2,2]][:,:,endpoint_indices[0]][:,:,:,endpoint_indices[1]]
         expected=np.where(np.array(endpoint_valid[0])[:,None]&np.array(endpoint_valid[1])[None,:],expected,0)
         expected=fixture._device(expected,mesh,P(('x','y')))
-        assert bool(jnp.all(got['Wc']==expected)) and bool(jnp.all(got['dWc_ds']==2*expected))
+        assert (bool(jnp.all(got['Wc']==expected)) and bool(jnp.all(got['dWc_ds']==2*expected))
+                and bool(jnp.all(got['Wc_mirror']==3*expected))
+                and bool(jnp.all(got['dWc_mirror_ds']==4*expected)))
         rows.append(dict(name=f'photon_sector_read_{endpoints[0]}_{endpoints[1]}',bitwise=True))
     headers={}
     for sector in ('CC','TT','CT_C','CT_T'):
