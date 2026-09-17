@@ -11,8 +11,9 @@ psi_{-k} = conj(psi_k) and E(-k) = E(k).  The following are then known-zero
 for any band weights that are equal at k and -k, including the complex phases
 exp(-t (E - E_ref)):
 
-    parent   ||G_p - G_p^T|| / ||G_p||           TRIM raw parents (build_G, no unfold)
-             ||Im G_p|| / ||G_p||                 same, at a real t (real weights)
+    parent   ||G_p - G_p^T|| / ||G_p||           TRIM parents, read at their own
+             ||Im G_p|| / ||G_p||                 identity rows of the unfolded tile
+                                                  (Im at the real t only)
     unfold   max_k ||X_k^T - X_-k|| / max_k ||X_k||   after the k-unfold (build_G_tau)
     fft      max_R ||X_R^T - X_-R|| / max_R ||X_R||   after the flat-k FFT
     chi      ||chi_q - chi_q^T|| / ||chi_q||      every TRIM q, through the
@@ -49,10 +50,18 @@ are built), these quantities contain physics and have no known-zero target.
 The gate refuses there and measures nothing.  It also refuses spinor decks
 and a centroid set that is not orbit-closed.
 
-Exit codes: 0 PASS, 1 FAIL, 3 REFUSED.  Run on a compute node, one rank per
-GPU, square mesh (Si 4x4x4 scalar at P4 is the certified geometry)::
+Cost.  A cold P1 run takes about 5 s of gate wall: 1.8 s runtime startup
+and 3 s body.  About 2.3 s of the body is compile and provider setup that
+belongs to the production stack itself (the centroid loader, the GEMM
+provider, the kernel's GEMM warmup, the kernel).  The gate's own programs
+compile in about 0.5 s.  ``phase_seconds`` in the receipt has the split
+(TAUGATE FAST, 2026-09-17).  Any square P works.  P4 also covers the sharded
+unfold, and costs about 11 s.
 
-    lx run --jid $JID -N 1 -G 4 -n 4 python3 -u \
+Exit codes: 0 PASS, 1 FAIL, 3 REFUSED.  Run on a compute node, one rank per
+GPU (Si 4x4x4 scalar is certified at P1 and P4)::
+
+    lx run --jid $JID -N 1 -G 1 -n 1 python3 -u \
       tests/multi_device/nonzero_tau_trs_gate.py \
       --wfn .../qe/WFN.h5 --centroids .../qe/centroids_frac_368.txt \
       --nval 4 --ncond 30 --nband 34 --out <evidence dir> [--plant ...]
@@ -68,7 +77,8 @@ import time
 from functools import partial
 from pathlib import Path
 
-from runtime import initialize_communicator_stack, finalize_process
+_T0 = time.monotonic()
+from runtime import initialize_communicator_stack, finalize_process  # noqa: E402
 
 THRESHOLD = 1.0e-6
 #: Nonzero t on the Green stages: the retarded node t = -1.0i, one generic
@@ -122,8 +132,19 @@ def main(argv=None):
                     help="doublet_cut: first band index removed from the u weight")
     args = ap.parse_args(argv)
 
-    started = time.monotonic()
+    started = _T0
+    phases, last = {}, [_T0]
+
+    def stamp(name, *arrays):
+        """Wall seconds since the previous stamp; ``arrays`` are synchronized first."""
+        if arrays:
+            jax.block_until_ready(arrays)
+        now = time.monotonic()
+        phases[name] = round(now - last[0], 3)
+        last[0] = now
+
     runtime = initialize_communicator_stack(platform="gpu")
+    stamp("runtime_startup")
     import jax
     import jax.numpy as jnp
     import numpy as np
@@ -146,6 +167,7 @@ def main(argv=None):
     from symmetry_maps import q_negation_index, self_negative_q_mask
     from wfn_loader import WfnLoader
 
+    stamp("imports")
     mesh = runtime.mesh
     root = jax.process_index() == 0
     say = print if root else (lambda *a, **k: None)
@@ -160,11 +182,14 @@ def main(argv=None):
         rows=[])
 
     def finish(verdict, rc, reason=""):
-        receipt.update(verdict=verdict, reason=reason,
+        stamp("report")
+        receipt.update(verdict=verdict, reason=reason, phase_seconds=phases,
                        seconds=round(time.monotonic() - started, 2))
         if root:
             out.mkdir(parents=True, exist_ok=True)
             (out / f"{arm}.json").write_text(json.dumps(receipt, indent=1) + "\n")
+            print("[taugate] phase seconds: "
+                  + " ".join(f"{k}={v}" for k, v in phases.items()), flush=True)
             print(f"[taugate] arm={arm} VERDICT {verdict} rc={rc} "
                   f"seconds={receipt['seconds']} {reason}", flush=True)
         return rc
@@ -178,6 +203,7 @@ def main(argv=None):
         wfn = WfnLoader(args.wfn, mesh=mesh)
         receipt["trs_holds"] = wfn.trs_holds
         receipt["nspinor"] = int(wfn.nspinor)
+        stamp("wfn_loader")
         if wfn.trs_holds is not True:
             _refuse("time_reversal",
                     f"WfnLoader.trs_holds = {wfn.trs_holds} (the SymMaps.trs_allowed verdict)",
@@ -191,6 +217,7 @@ def main(argv=None):
                     "spinor form needs the Kramers operator and is not built here")
         sym = wfn.symmetry()
         receipt["trs_allowed"] = bool(sym.trs_allowed)
+        stamp("symmetry")
         centroids = load_centroid_basis(args.centroids, wfn.fft_grid, sym=sym)
         if not centroids.orbit_closed:
             _refuse("centroids", "a centroid set that is not orbit-closed",
@@ -209,11 +236,13 @@ def main(argv=None):
         plan = build_centroid_k_unfold_plan(
             sym, idx, meta.fft_grid, mesh, nspinor=1,
             parent_k_frac=wfn.kvecs(k=sym.parent_k_domain), layout=basis.layout)
+        stamp("centroids_basis_meta_plan")
         parent_y, parent_x = load_centroids_band_chunked(
             wfn, sym, meta, idx, False, mesh, band_range=slices.full_range,
             k_domain=sym.parent_k_domain, bispinor_lift="raw")
         psi_nmu, psi_mun = parent_faces(parent_y, parent_x, mesh_xy=mesh, layout="face")
         del parent_y, parent_x
+        stamp("load_centroid_faces", psi_nmu, psi_mun)
         enk_full, _ = get_enk_bandrange(wfn, sym, slices.full_range,
                                         (slices.b1, slices.b3), nspinor=1)
         wfns = wavefunctions_face_from_restart(
@@ -279,23 +308,27 @@ def main(argv=None):
         carrier = wfns.green_parent
         w_f = stream_weights(wfns, f, mesh)
         w_u = stream_weights(wfns, u, mesh)
+        stamp("weights_and_carrier", w_f, w_u)
 
         # ---- Green stages: parent, unfold, FFT ----------------------------
         n_mu = int(plan.n_centroid_packed)
         nb = int(slices.nb_full)
+        # warmup=False: this plan is only called inside the one jit below, so
+        # its standalone warm executables would be compiled for nothing.
         g_plan = gemm_plan(mesh, m=n_mu, k=nb, n=n_mu, nq=int(plan.n_parent),
-                           dtype=jnp.complex128, layout="face")
+                           dtype=jnp.complex128, layout="face", warmup=False)
         G_fftn = make_flat_k_fftn(mesh, grid, G_FFT7D_SPEC, norm="ortho")
         G_shard = NamedSharding(mesh, G_FLATK_SPEC)
-        neg_dev = jnp.asarray(neg)
-        trim_dev = jnp.asarray(np.asarray(trim_parents, dtype=np.int32))
-
-        def pair_defect(X):
-            Xt = jnp.transpose(X, (0, 3, 4, 1, 2))
-            num = jnp.sqrt(jnp.sum(jnp.abs(Xt - jnp.take(X, neg_dev, axis=0)) ** 2,
-                                   axis=(1, 2, 3, 4)))
-            den = jnp.sqrt(jnp.sum(jnp.abs(X) ** 2, axis=(1, 2, 3, 4)))
-            return jnp.max(num) / jnp.max(den)
+        # Rows k of the unfolded tile followed by rows R of its FFT; both
+        # negate on the same grid.
+        neg_both = jnp.asarray(np.concatenate([neg, neg + nk]).astype(np.int32))
+        # The TRIM parents' own full-k rows (SymMaps.kirr_fullids) carry the
+        # identity operation, so the unfolded tile there IS the parent tile,
+        # and at k = -k the pair defect there IS ||G_p - G_p^T||: one Green
+        # build serves the parent and the unfold stages.
+        trim_rows = parent_rows[trim_parents]
+        receipt["trim_parent_rows_identity"] = bool(
+            np.all(np.asarray(plan.sym_idx)[trim_rows] == 0))
 
         rep0, rep2 = NamedSharding(mesh, P()), NamedSharding(mesh, P(None, None))
         nmu_spec, mun_spec = psi_specs("face")
@@ -303,19 +336,22 @@ def main(argv=None):
         @partial(jax.jit, in_shardings=(NamedSharding(mesh, mun_spec),
                                         NamedSharding(mesh, nmu_spec), rep2, rep2, rep0, rep0))
         def green_stages(psi_mun_p, psi_nmu_p, enk_p, weight, t, ref):
-            parent = build_G_tau(psi_mun_p, psi_nmu_p, enk_p, t, e_ref=ref,
-                                 band_weight=weight, layout="face", gemm=g_plan)
-            gp = jnp.take(parent, trim_dev, axis=0)
-            gp_norm = jnp.sqrt(jnp.sum(jnp.abs(gp) ** 2, axis=(1, 2, 3, 4)))
-            gp_t = jnp.sqrt(jnp.sum(jnp.abs(gp - jnp.transpose(gp, (0, 3, 4, 1, 2))) ** 2,
-                                    axis=(1, 2, 3, 4))) / gp_norm
-            gp_im = jnp.sqrt(jnp.sum(jnp.imag(gp) ** 2, axis=(1, 2, 3, 4))) / gp_norm
+            """Per-row squared norms of X^T - X_-, X and Im X, for the unfold then the FFT.
+
+            One reduction body over both tiles, written as re^2 + im^2: the
+            same numbers as ``abs(.)**2`` on each tile separately, at a
+            third of the compile time (TAUGATE FAST profile).
+            """
             full = jax.lax.with_sharding_constraint(
                 build_G_tau(psi_mun_p, psi_nmu_p, enk_p, t, e_ref=ref,
                             band_weight=weight, layout="face", gemm=g_plan,
                             k_unfold_plan=plan), G_shard)
-            real_space = G_fftn(full)
-            return gp_t, gp_im, pair_defect(full), pair_defect(real_space)
+            both = jnp.concatenate([full, G_fftn(full)], axis=0)
+            diff = jnp.transpose(both, (0, 3, 4, 1, 2)) - jnp.take(both, neg_both, axis=0)
+            axes = (1, 2, 3, 4)
+            return jnp.stack([jnp.sum(diff.real ** 2 + diff.imag ** 2, axis=axes),
+                              jnp.sum(both.real ** 2 + both.imag ** 2, axis=axes),
+                              jnp.sum(both.imag ** 2, axis=axes)])
 
         def host(x):
             return np.asarray(gather_to_host(x))
@@ -332,11 +368,12 @@ def main(argv=None):
         for t in GREEN_NODES:
             node = f"t={t.real + 0.0:+.2f}{t.imag:+.2f}i"
             for leg, weight in (("f", w_f), ("u", w_u)):
-                gp_t, gp_im, unfold, fft = green_stages(
+                num, den, imag = np.sqrt(host(green_stages(
                     carrier.psi_mun, carrier.psi_nmu, carrier.enk, weight,
-                    jnp.asarray(t, dtype=jnp.complex128), jnp.asarray(reference))
-                gp_t, gp_im = host(gp_t), host(gp_im)
-                unfold, fft = float(host(unfold)), float(host(fft))
+                    jnp.asarray(t, dtype=jnp.complex128), jnp.asarray(reference))))
+                gp_t, gp_im = num[trim_rows] / den[trim_rows], imag[trim_rows] / den[trim_rows]
+                unfold = num[:nk].max() / den[:nk].max()
+                fft = num[nk:].max() / den[nk:].max()
                 for slot, value in zip(trim_parents, gp_t):
                     add("parent", node, leg, f"||G_p - G_p^T||/||G_p|| slot {slot}", value)
                 if t.imag == 0.0:
@@ -344,28 +381,34 @@ def main(argv=None):
                         add("parent", node, leg, f"||Im G_p||/||G_p|| slot {slot}", value)
                 add("unfold", node, leg, "max_k||X_k^T - X_-k||/max_k||X_k||", unfold)
                 add("fft", node, leg, "max_R||X_R^T - X_-R||/max_R||X_R||", fft)
+                if "green_first_call" not in phases:
+                    stamp("green_first_call")
+        stamp("green_other_calls")
 
         # ---- chi at TRIM q through the bank's own retarded stream ---------
         kernel, fixed = response_stream(wfns, meta, mesh_xy=mesh, q_ids=trim_q, n_outputs=1)
-
-        @jax.jit
-        def chi_defect(chi):
-            chi = chi[:, 0]
-            norm = jnp.sqrt(jnp.sum(jnp.abs(chi) ** 2, axis=(1, 2)))
-            diff = jnp.sqrt(jnp.sum(jnp.abs(chi - jnp.swapaxes(chi, 1, 2)) ** 2, axis=(1, 2)))
-            return diff / norm, norm
+        stamp("chi_kernel_build")
 
         for time_node in CHI_TIMES:
-            chi = kernel(jnp.asarray([time_node]), jnp.asarray([[1.0 + 0.0j]]), *fixed,
-                         w_f, w_u, jnp.asarray(reference))
-            defect, norm = (host(v) for v in chi_defect(chi))
-            del chi
+            # One program: the production kernel and the two reductions.
+            @jax.jit
+            def chi_stage(psi_mun_p, psi_nmu_p, enk_p, weight_f, weight_u):
+                chi = kernel(jnp.asarray([time_node]), jnp.asarray([[1.0 + 0.0j]]),
+                             psi_mun_p, psi_nmu_p, enk_p, weight_f, weight_u,
+                             jnp.asarray(reference))[:, 0]
+                diff = chi - jnp.swapaxes(chi, 1, 2)
+                return jnp.stack([jnp.sum(diff.real ** 2 + diff.imag ** 2, axis=(1, 2)),
+                                  jnp.sum(chi.real ** 2 + chi.imag ** 2, axis=(1, 2))])
+
+            diff2, norm2 = host(chi_stage(*fixed, w_f, w_u))
+            defect, norm = np.sqrt(diff2 / norm2), np.sqrt(norm2)
             node = f"t={0.0:+.2f}{-time_node:+.2f}i"
             for q, value, size in zip(trim_q, defect, norm):
                 add("chi", node, "fu", f"||chi_q - chi_q^T||/||chi_q|| q {q}", value)
                 add("chi", node, "fu", f"||chi_q|| q {q} (denominator)", size, gated=False)
                 if not (np.isfinite(size) and size > 0.0):
                     receipt["rows"][-2]["status"] = "FAIL"
+            stamp(f"chi_call_time_{time_node}")
 
         failed = [r for r in receipt["rows"] if r["status"] == "FAIL"]
         worst = {}

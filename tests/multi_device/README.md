@@ -11,7 +11,7 @@ addressable shard and requires exact-zero padding.
       <launcher> -n 4 python3 tests/multi_device/mpa_fit_stream_gate.py
 
 Nonzero-tau time-reversal gate: `nonzero_tau_trs_gate.py`, any square P,
-certified on Si 4x4x4 scalar at P4. Every other chi0-family symmetry check
+certified on Si 4x4x4 scalar at P1 (about 5 s cold) and P4 (about 11 s). Every other chi0-family symmetry check
 runs at t = 0, where the assembly cancels a tau-dependent defect. This gate
 measures `||X_k^T - X_-k||` after the k-unfold and after the flat-k FFT, the
 TRIM-parent `||G_p - G_p^T||` and `||Im G_p||`, and `||chi_q - chi_q^T||` at
@@ -22,7 +22,7 @@ both must be red. It refuses a deck where time reversal is broken, because
 those quantities contain physics there. Exit codes: 0 PASS, 1 FAIL,
 3 REFUSED. The module docstring has the metrics, the margins and the run line.
 
-    <launcher> -n 4 python3 -u tests/multi_device/nonzero_tau_trs_gate.py \
+    <launcher> -n 1 python3 -u tests/multi_device/nonzero_tau_trs_gate.py \
       --wfn WFN.h5 --centroids centroids_frac_368.txt \
       --nval 4 --ncond 30 --nband 34 --out <evidence> [--plant conj_wrap|doublet_cut]
 
