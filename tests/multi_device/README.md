@@ -10,6 +10,22 @@ addressable shard and requires exact-zero padding.
     MPA_STREAM_GATE_DIR=/path/to/evidence \
       <launcher> -n 4 python3 tests/multi_device/mpa_fit_stream_gate.py
 
+Nonzero-tau time-reversal gate: `nonzero_tau_trs_gate.py`, any square P,
+certified on Si 4x4x4 scalar at P4. Every other chi0-family symmetry check
+runs at t = 0, where the assembly cancels a tau-dependent defect. This gate
+measures `||X_k^T - X_-k||` after the k-unfold and after the flat-k FFT, the
+TRIM-parent `||G_p - G_p^T||` and `||Im G_p||`, and `||chi_q - chi_q^T||` at
+every TRIM q through the bank's retarded stream. It measures at t = -1.0i,
+0.5 - 1.0i and 1.0, with one bar of 1e-6. It is a detector only and changes
+no tile. `--plant conj_wrap` and `--plant doublet_cut` are the twins, and
+both must be red. It refuses a deck where time reversal is broken, because
+those quantities contain physics there. Exit codes: 0 PASS, 1 FAIL,
+3 REFUSED. The module docstring has the metrics, the margins and the run line.
+
+    <launcher> -n 4 python3 -u tests/multi_device/nonzero_tau_trs_gate.py \
+      --wfn WFN.h5 --centroids centroids_frac_368.txt \
+      --nval 4 --ncond 30 --nband 34 --out <evidence> [--plant conj_wrap|doublet_cut]
+
 Tier-2 device-count-invariance gate: runs the gnppm + bispinor e2e fixtures at
 P=1 (1 GPU) and P=4 (4 GPUs, one process per device) and compares ζ / Σ_X /
 minimax node counts / invalid census / off-pole eqp against the tolerances
