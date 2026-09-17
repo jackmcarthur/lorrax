@@ -167,14 +167,6 @@ class _SigmaPhysicsState(NamedTuple):
     n_invalid: jax.Array       # scalar int64
 
 
-#: Env escape hatch for :func:`assert_gapped_occupations_for_ppm`.  It is an
-#: ENV knob and not a deck key for the same reason ``LORRAX_BAND_DEGENERACY``
-#: is: it is a debugging escape for a deck you are looking at, not a property
-#: of a calculation anyone would want recorded in an input file.
-#: ``AGENT_PREAMBLE``: never set it to make a gate pass.
-_PPM_METAL_ENV = "LORRAX_PPM_ALLOW_CROSSING_BANDS"
-
-
 def assert_gapped_occupations_for_ppm(occ_full, *, print_fn=print) -> int:
     """Refuse a GN/HL-PPM Σ whose occupation table has a Fermi-crossing band.
 
@@ -182,13 +174,13 @@ def assert_gapped_occupations_for_ppm(occ_full, *, print_fn=print) -> int:
     a caller or a test reads a NUMBER rather than the absence of an
     exception.
 
-    WHAT IS MEASURED, AND WHY THE DECK KEY CANNOT ANSWER IT.
-    ``gw_config._validate_metal_compute_mode`` already refuses
-    ``mpa_material_class = metal`` outside ``compute_mode = mpa``.  But
-    ``insulator`` is the DEFAULT, so a metallic system run without the key
-    reaches this driver with nothing objecting — and the deck key is a
-    DECLARATION, while this is a property of the spectrum.  So the
-    measurement is on the occupation table:
+    WHAT IS MEASURED, AND WHY THE MATERIAL DOOR DOES NOT ANSWER IT.
+    ``gw_config.validate_material_inputs`` already refuses GN-PPM on a WFN
+    whose occupations are fractional (``GATE gn_ppm_refuses_metals``, owner
+    ruling 2026-09-17: GN-PPM is never allowed for metals).  A WFN written
+    with integer occupations can still carry a band that crosses the Fermi
+    level of the step table, and that is a property of the spectrum.  So the
+    measurement here is on the occupation table:
 
         band n crosses E_F  <=>  occ[:, n] > 0.5 is not constant over k.
 
@@ -228,15 +220,9 @@ def assert_gapped_occupations_for_ppm(occ_full, *, print_fn=print) -> int:
     crossing = np.flatnonzero(filled.any(axis=0) & ~filled.all(axis=0))
     if crossing.size == 0:
         return 0
-    if os.environ.get(_PPM_METAL_ENV, "").strip().lower() in ("1", "true", "on"):
-        print_fn(
-            f"  *** {_PPM_METAL_ENV} is set: running GN/HL-PPM Sigma on a "
-            f"spectrum with {crossing.size} Fermi-crossing band(s) "
-            f"{crossing.tolist()[:12]}.  The band split below is a 0/1 step "
-            f"at a pseudo-Fermi level that is not in any gap, and E_cond/H_val "
-            f"are clipped at zero, so wrong-side states are unrepresentable. "
-            f"This is a debugging override, not a supported configuration. ***")
-        return int(crossing.size)
+    # No override: GN-PPM is not allowed for metals (owner ruling
+    # 2026-09-17), and the former crossing-bands environment debugging
+    # hatch was the one way to run it on a Fermi-crossing spectrum.
     raise ValueError(
         f"GATE ppm_sigma_gapped_occupations: this spectrum has "
         f"{crossing.size} Fermi-crossing band(s) — occupied at some k and "
@@ -247,15 +233,15 @@ def assert_gapped_occupations_for_ppm(occ_full, *, print_fn=print) -> int:
         f"Sigma driver, whose band split is a hard occ > 0.5 step\n"
         f"  want: a gapped spectrum, i.e. every band uniformly occupied or "
         f"uniformly empty over k\n"
-        f"  fix:  run this system with compute_mode = mpa and "
-        f"mpa_material_class = metal, which carries the iteration's fixed-N "
-        f"MP1 occupation state; or narrow the band window so no band "
-        f"crosses E_F\n"
+        f"  fix:  GN/HL-PPM is not allowed for metals (owner ruling "
+        f"2026-09-17): run this system with compute_mode = mpa and "
+        f"sigma_w_model = shared_pole on a WFN with its fractional "
+        f"occupations and occ_smearing_width_ry; or narrow the band window "
+        f"so no band crosses E_F\n"
         f"  why:  with a crossing band, vbm > cbm, so the 'midgap' Fermi "
         f"reference this driver derives is not in any gap, and E_cond/H_val "
         f"are clipped at zero so a wrong-side band cannot be represented.  "
         f"Nothing about that changes an array shape or the exit code.\n"
-        f"  override: {_PPM_METAL_ENV}=1 (debugging only)\n"
         f"  doc:  docs/theory/metallic-mpa-screening.md")
 
 
