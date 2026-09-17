@@ -274,6 +274,8 @@ def _metadata(meta, tables, recipe, identity, ordered=None, *, basis=None, secto
         _refuse("missing resolved recipe and gate versions")
     centroid_hash = hashlib.sha256(np.asarray(
         basis.canonical_indices, dtype="<i4").tobytes()).hexdigest()
+    if sector is not None:
+        recipe = dict(recipe, operator_realization="raw-sector-endpoint-v1")
     header = {
         "schema": SCHEMA, "identity": identity, "recipe": recipe,
         "recipe_hash": hashlib.sha256(_json(recipe).encode()).hexdigest(),
@@ -695,7 +697,9 @@ def write_shared_pole_sector_manifest(path, *, models, bank, identity, receipts,
     handles={}
     for sector,(filename,header) in models.items():
         _check_identity(header['identity'],identity)
-        if not header.get('finalized') or header.get('sector')!=sector or not header.get('digest'):
+        if (not header.get('finalized') or header.get('sector')!=sector or not header.get('digest')
+                or not header.get('ordered')
+                or header['recipe'].get('operator_realization')!='raw-sector-endpoint-v1'):
             _refuse(f'unfinalized or mistyped sector {sector}')
         handles[sector]=dict(path=str(Path(filename).resolve()),identity=identity,
                              digest=header['digest'],K=header['K'])
@@ -706,6 +710,7 @@ def write_shared_pole_sector_manifest(path, *, models, bank, identity, receipts,
     validate_shared_pole_bank(bank['path'],expected_identity=identity,
                               mesh_xy=mesh_xy,require_complete=True)
     content=dict(schema=SECTOR_SCHEMA,representation='sector-ordered-ph',identity=identity,
+        operator_realization='raw-sector-endpoint-v1',
         sectors=handles,constant=dict(path=str(Path(bank['path']).resolve()),
             identity=identity,field='constant'),construction=receipts)
     digest=hashlib.sha256(_json(content).encode()).hexdigest()
@@ -730,7 +735,8 @@ def validate_shared_pole_sector_manifest(path, *, expected_identity, mesh_xy, ca
         error=exc
     agree_io_refusal(error,path=path,stage='shared_pole.sector_manifest.read')
     _check_identity(header.get('identity'),expected_identity)
-    if header.get('schema')!=SECTOR_SCHEMA or header.get('representation')!='sector-ordered-ph':
+    if (header.get('schema')!=SECTOR_SCHEMA or header.get('representation')!='sector-ordered-ph'
+            or header.get('operator_realization')!='raw-sector-endpoint-v1'):
         _refuse('unsupported sector manifest')
     content={k:v for k,v in header.items() if k!='digest'}
     if hashlib.sha256(_json(content).encode()).hexdigest()!=header.get('digest'):
@@ -742,7 +748,9 @@ def validate_shared_pole_sector_manifest(path, *, expected_identity, mesh_xy, ca
         _check_identity(handle['identity'],expected_identity)
         model=validate_shared_pole_model(handle['path'],expected_identity=expected_identity,
                                         mesh_xy=mesh_xy,capacity=capacity)
-        if (model.get('sector')!=sector or model['digest']!=handle['digest']
+        if (model.get('sector')!=sector or not model.get('ordered')
+                or model['recipe'].get('operator_realization')!='raw-sector-endpoint-v1'
+                or model['digest']!=handle['digest']
                 or model['K']!=handle['K']):
             _refuse(f'sector manifest binding mismatch: {sector}')
         model_headers[sector]=model
