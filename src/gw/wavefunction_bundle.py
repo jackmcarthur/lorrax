@@ -675,12 +675,12 @@ def _face_embed_active_U(U_active, *, nb_full: int, a_lo: int, mesh_xy: Mesh):
     """
     U_active = jnp.asarray(U_active, dtype=jnp.complex128)
     nk = int(U_active.shape[0])
-    eye = jnp.broadcast_to(
+    sharding = NamedSharding(mesh_xy, P(None, 'x', 'y'))
+    eye = jax.lax.with_sharding_constraint(jnp.broadcast_to(
         jnp.eye(nb_full, dtype=jnp.complex128)[None, :, :],
-        (nk, nb_full, nb_full))
+        (nk, nb_full, nb_full)), sharding)
     U_full = jax.lax.dynamic_update_slice(eye, U_active, (0, a_lo, a_lo))
-    return jax.lax.with_sharding_constraint(
-        U_full, NamedSharding(mesh_xy, P(None, 'x', 'y')))
+    return jax.lax.with_sharding_constraint(U_full, sharding)
 
 
 def _face_rotate_kernel(mesh: Mesh, a_lo: int, nb_active: int, nb_full: int,
