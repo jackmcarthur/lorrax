@@ -219,6 +219,10 @@ _LEVELLED_NAMES = ("noncrossing_levelled", "certify_noncrossing")
 
 _RESPONSE_RULE_NAMES = ("response_bank_rule", "response_laplace_rule")
 
+# Finite-temperature bosonic Matsubara rules (KMS-bounded tau correlations).
+# SciPy (pivoted QR), so lazy.
+_MATSUBARA_RULE_NAMES = ("matsubara_response_rule",)
+
 
 def __getattr__(name: str):
     """PEP 562 lazy door for the solver half.
@@ -229,6 +233,9 @@ def __getattr__(name: str):
     if name in _RESPONSE_RULE_NAMES:
         from minimax import response_rules as _response
         return getattr(_response, name)
+    if name in _MATSUBARA_RULE_NAMES:
+        from minimax import matsubara_rules as _matsubara   # noqa: PLC0415
+        return getattr(_matsubara, name)
     if name in _SOLVER_NAMES:
         from minimax import solver as _solver          # noqa: PLC0415
         return getattr(_solver, name)
@@ -248,7 +255,8 @@ def __dir__():
     return sorted(set(globals()) | set(_SOLVER_NAMES)
                   | set(_FREQUENCY_FIT_NAMES)
                   | set(_UNIFORM_RULE_NAMES)
-                  | set(_LEVELLED_NAMES) | set(_RESPONSE_RULE_NAMES))
+                  | set(_LEVELLED_NAMES) | set(_RESPONSE_RULE_NAMES)
+                  | set(_MATSUBARA_RULE_NAMES))
 
 
 __all__ = [
@@ -280,4 +288,5 @@ __all__ = [
     # --- the offline solvers (lazy; scipy) ---------------------------------
     *_SOLVER_NAMES,
     *_RESPONSE_RULE_NAMES,
+    *_MATSUBARA_RULE_NAMES,
 ]

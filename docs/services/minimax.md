@@ -100,3 +100,18 @@ Frequencies and transition intervals are in Ry, times in inverse Ry, derivatives
 
 Neither rule sees band masks, occupations or response arrays. `tests/test_response_rules.py` checks analytic
 kernels, the missing `1/(2z)` derivative red twin, positivity and refusals.
+
+### Finite-temperature Matsubara rules
+
+`matsubara_response_rule(beta_ry_inv, delta_max_ry, n_indices, rel_tol=...)` returns nodes `t` in
+`(0, beta/2]` and complex weights `W[k, l]` for bosonic `nu_k = 2 pi k / beta`, used as
+`sum_l W h(t_l) + conj(W) h(beta - t_l)` on any imaginary-time correlation whose terms are
+`f_m (1-f_n) exp(-(e_n - e_m) tau)` (Fermi-Dirac, KMS-bounded by 1). Pairs of either sign are covered: KMS
+maps a negative transition onto the mirrored node. The certificate is the sup over `y` in `[0, delta_max]` of
+the even target `y(1-e^{-beta y})/(y^2+nu^2)` and odd target `nu(1-e^{-beta y})/(y^2+nu^2)` errors, each
+relative to its own sup, on a dense grid with the largest samples refined locally; an amplification above
+`0.1 rel_tol / eps_machine` refuses. The node set solves Kaltak and Kresse's finite-temperature problem
+(PRB 101, 205145 (2020)) by pivoted-QR compression of a graded Gauss-Legendre pool with least-squares
+weights, not by their nonlinear minimax optimization. `tests/test_matsubara_rules.py` checks the Lindhard
+weight `(f_m - f_n)/(x - i nu)` pair by pair (including `-df/de` at `nu_0`) with one-particle factors in log
+form, a wrong-frequency red twin, and refusals.
