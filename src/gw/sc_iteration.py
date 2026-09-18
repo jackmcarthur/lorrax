@@ -2220,13 +2220,13 @@ def rebuild_hartree_dft_basis(inputs, U_qp, occupations_full,
         spec=band_sphere_spec(), axis=1)
     authenticate_axis(psi_G, full_band_axis, axis=1,
                       where='SC exact Hartree density band sphere')
-    # The rotated bundle records physical bands only.  rho_from_wfns owns
-    # the zero-occupation pad to the sphere carrier before its density scan.
-    if tuple(np.shape(occupations_full)) != (int(inputs.wfns_dft.enk.shape[0]),
-                                             nb_full_logical):
+    # The rotated bundle carries its face-mesh pad; rho_from_wfns owns the
+    # further zero-occupation pad to the sphere carrier before its scan.
+    bundle_shape = tuple(inputs.wfns_dft.enk.shape)
+    if tuple(np.shape(occupations_full)) != bundle_shape:
         raise ValueError(
-            'SC exact Hartree occupations must be the full logical rotated '
-            f'bundle {(int(inputs.wfns_dft.enk.shape[0]), nb_full_logical)}; '
+            'SC exact Hartree occupations must match the rotated bundle '
+            f'{bundle_shape}; '
             f'got {np.shape(occupations_full)}')
     from centroid.sampling_metric import full_k_quadrature_weights
     kweights = (full_k_quadrature_weights(inputs.wfn, inputs.wfn.symmetry())
