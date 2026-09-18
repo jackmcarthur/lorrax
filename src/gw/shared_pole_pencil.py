@@ -1,7 +1,7 @@
 """Resolvent-identity pencil columns for the shared-pole construction.
 
-The even pencil in s = z**2 (SP 9, SP 10) and the ordered particle-hole pencil
-(z sigma_3 - M) (SP 11, SP 12) of docs/architecture/shared_pole_model.md. Every
+The even pencil in s = z**2 (W 18, W 19) and the ordered particle-hole pencil
+(z sigma_3 - M) (W 25, W 26) of docs/theory/shared-pole-w-model.md. Every
 [b, R, R] block is assembled on the x/y face through distrib_la.blocks; eager
 concatenation and a + a^H of face-sharded operands come out replicated.
 """

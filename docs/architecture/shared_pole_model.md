@@ -1,277 +1,386 @@
-# The shared-pole screened interaction
+# The shared-pole screened interaction: implementation {#shared-pole-implementation}
 
-This page is the design of the shared-pole route for the correlation part of the screened interaction,
-`sigma_w_model = shared_pole`. It states the object, how the response bank samples it, how the constructor reduces
-the samples to one pole set per parent q, what the store holds, how Σ consumes it, and which gate or test certifies
-each step. Deck keys are in the [input reference](../input_reference.md). Equations are numbered `(SP n)`.
+This page owns **the code path** of the shared-pole route for the correlation
+part of the screened interaction (`sigma_w_model = shared_pole`): the modules
+and their one-line contracts, the carriers and shardings of every stage, the
+recipe and store schemas, the gate and test tables, the capacity accounting,
+and the refusals. The physics and mathematics — the object, the pencils, the
+quadrature and error theory, the time-reversal-broken construction, the
+self-energy routing, and the measured $N_\mu$ pole-count heuristic — are
+[the shared-pole theory page](../theory/shared-pole-w-model.md); equations
+are cited there as `(W k)` and are not restated here. Deck keys are in the
+[input reference](../input_reference.md); the surrounding self-consistent
+workflow is in
+[self-consistency](../self_consistency.md#shared-pole-w-with-retained-quadrature).
 
-Notation. All frequencies are in Ry. `q` is a raw parent (one irreducible q; `−q` is its own parent when time
-reversal is broken). `n` is the packed centroid count (`meta.mu_basis.n_packed`). `z` is a complex frequency and
-`s = z²`. `b` is the stored factor (dataset `factor`). `Ω_j > 0` are poles and `Λ = diag(Ω_j²)`. `R_±` are residues
-and `M_k` the physical high-frequency moments.
+Notation: `q` is a raw parent (one irreducible q; `−q` is its own parent when
+time reversal is broken), `n = meta.n_rmu_padded` is the packed centroid
+extent, `n_logical` its logical extent, `z` a complex frequency in Ry,
+`s = z²`, `b` the stored factor (`factor` dataset), `Ω_j > 0` the poles and
+`Λ = diag(Ω_j²)`.
 
-## 0 Where the code is
+## 0 What runs, and where the code is
 
-| section | owner |
+| stage | owner | contract |
+|---|---|---|
+| census, recipe, gates, receipts | `gw.shared_pole_recipe` | resolves the versioned recipe from current metadata; owns `shared_real_pole_v1_r3b`, the two gate tables and the capacity ledger |
+| response bank (stream, Laplace cells, moments, Dyson) | `gw.response_bank`, `gw.w_isdf`, `gw.shared_pole_screening` | samples `W_c` and `∂_sW_c` and the exact moments; never forms `W` at a real frequency |
+| direction selection and state panels | `gw.shared_pole_directions` | SVD/eigenvector directions, conjugates, mirrors and their dedupe |
+| pencils | `gw.shared_pole_pencil` | resolvent-identity blocks of the even and ordered pencils |
+| reduction | `gw.shared_pole_reduction` | equilibration, keep cut, Newton–Schulz metric correction, Ritz model |
+| rounds and layout | `gw.shared_pole_local` | parent rounds, per-round programs, canonical-order export |
+| model checks | `gw.shared_pole_gates` | passivity, moments, reciprocity, pole census |
+| chain | `gw.shared_pole_constructor` | the driver that calls the above per round and writes the store |
+| device accounting | `gw.shared_pole_capacity` | per-stage byte terms and the `CapacityLedger` |
+| scalar Γ head coupled to the body | `gw.shared_pole_head` | MPA head fit bound to the current body digest; refuses unsupported representations |
+| store | `file_io.shared_pole_store` | model and bank schemas, identity, commit masks, readers, export |
+| physical operator realization | `gw.qgrid_symmetry` | little-group projection of a packed tile; the raw stored model is not the physical operator |
+| Σ consumer | `gw.mpa.sigma`, `gw.ppm_tau_kernel` | τ synthesis from factors, hole routing, panel schedule, capacity |
+
+## 1 Data flow and carriers
+
+The chain is one pass per round of parents:
+
+```
+recipe → bank (per q: samples + moments) → directions → pencils → reduction
+      → model checks → store → operator realization → Σ
+```
+
+Every stage binds the **current** state. The bank and the model authenticate a
+small identity (wavefunctions, energies, occupations, recipe and gate hashes,
+centroid digest, q tables); a stale bank or model refuses, and a
+self-consistent map rebuilds samples, moments, directions, poles and ranks
+from the current wavefunctions and occupations rather than reusing a frozen
+model.
+
+| carrier | global axes and ownership | convention |
+|---|---|---|
+| response accumulator | `[sample,q,mu_X,nu_Y]` | q/sample panels replicated; both endpoints distribute each tile over all P ranks |
+| construction samples | `[parent_XY,sample,mu,nu]` | one whole parent per rank, including its sample stack |
+| directions/actions | `[parent_XY,mu,r]` | columns are directions; zero tails carry no physical state |
+| pencil | `[parent_XY,R,R]` | row is left state, column is right state |
+| local model | `[parent_XY,mu,K]` | real poles, sorted active prefix; synthetic parent slots skipped |
+| public model | `[parent,mu_X,1,K_Y]` | canonical parent order; unit charge axis; two factor orientations on read |
+| Σ W | `[q,mu_X,nu_Y]` | complete full-q tile before the spatial convolution |
+
+The dense construction is *whole parents per rank*: the batch layout
+`P(('x','y'),None,None,...)` gives rank `x·Py + y` one parent of a round, and
+its pencil is assembled and reduced with node-local dense kernels
+(`gw.shared_pole_local.round_program`). A round refuses before it runs when
+eight `[R,R]` blocks and the eigensolve workspace do not fit one device
+(`distrib_la.fits_local`). Called on face stacks instead, the same blocks are
+assembled through the `distrib_la` face service
+(`hermitian_block`, `hermitian_part`, `join_columns`, `on_face`); eager
+concatenation and `a + a†` of face-sharded operands would otherwise come out
+replicated on every rank. The response stream and Σ keep all-rank endpoint
+faces; whole Green's functions never become rank-local.
+
+## 2 Recipe resolution
+
+`gw.shared_pole_recipe.resolve_shared_pole_recipe` turns current metadata into
+a flat plan and prints every resolved field with its rule. It refuses when
+the census is absent or its energy hash is stale, when `η` is not finite and
+positive, when the imaginary interval is empty (`u_min ≥ u_max`), or when a
+deck names a shared-pole key under a different body model.
+
+**Production tier (`shared_real_pole_v1_r3b`, `production`).**
+
+| field | resolution |
 |---|---|
-| §2 the response bank | `gw.response_bank`, driven by `gw.shared_pole_screening` |
-| §3 directions | `gw.shared_pole_directions` |
-| §4, §5 the two pencils | `gw.shared_pole_pencil` |
-| §4, §6 reduction, paired basis and cut | `gw.shared_pole_reduction` |
-| §6 dedupe, §9 measured gates | `gw.shared_pole_gates` |
-| the chain that calls them, per round of parents | `gw.shared_pole_constructor` |
-| rounds, partner exchange tables, the round program | `gw.shared_pole_local` |
-| §10 the byte model and its ledger rows | `gw.shared_pole_capacity` |
-| §7 the store | `file_io.shared_pole_store` |
-| §8 the Σ consumer | `gw.mpa.sigma` |
-| the recipe, the gate tables and the receipt | `gw.shared_pole_recipe` |
+| fitted supports | 18, counted as line + imaginary; held supports and the `M₁/M₃` infinity block are extra |
+| line sites | `support_rule_line_sites`: quantiles of the delivery-weighted, η-broadened crossing density, power `support_density_power = 0.5`, on `[ω_lo, ω_reach]`; from band energies, occupations and η only |
+| height | `h = height_eta_factor · η = 4η` |
+| top | `L = ω_p + 3.5 eV`, `ω_p = 2√(4π N_active/V)` Ry from the census |
+| line reach | `ω_reach`: the largest measured crossing of the delivered states, from the same crossing census as the sites (it is at most `L`) |
+| imaginary ladder | log-spaced on `[u_min, u_max]`, `u_min = max(h, gap)`, `u_max = max(16 eV, L)`, count `max(2, round[ln(16κ²)ln(4/ε)/2π²])`, `ε = 10⁻³`, `κ = L/u_min` (equation (W 23) of the theory page) |
+| held supports | two line midpoints at 25 % and 65 % of the line interval, two imaginary geometric midpoints; never fitted |
+| direction cutoff | `1e-3` relative |
+| line direction cap | `ceil(n_logical/16)` right singular directions per line support, whole multiplets |
+| widths | imaginary `ceil(0.25 n)`, infinity `ceil(0.125 n)` |
+| pole budget | `ceil(1.8 n)` retained equilibrated-Gram directions per parent, largest first; `K` cannot exceed it |
+| zero policy | drop `λ ≤ 10⁻⁶` Ry² only within `10⁻⁶` factor-weight |
+| bank tolerance | `1e-8` remote-cell certificate |
+| Σ tolerance | `1e-4` |
 
-## 1 The object
+`relaxed` is the same geometry with no pole budget, coarser cutoffs and fixed
+small ladders; it is a comparison tier, not a production accelerator.
 
-Σ needs `W_c(q, z) = W(q, z) − v(q)` on the `n × n` centroid basis. With the RPA response `χ = χ⁰ + χ⁰ v χ`,
+The plan is flat native arrays — `z_ry` complex128, `role` int8, `distinct_id`
+int64, `held` bool, `support_pair` int64 `[N,2]`, plus `fit_ids`/`held_ids` —
+with a named `role_codes` table (`line`, `imaginary`, `infinity`, `held_line`,
+`held_imaginary`); `infinity` is a reserved moment role, never a bank call.
+Repeated physical points share a `distinct_id`; fitted and held IDs are
+disjoint by construction.
 
-$$ W_c(q,z) = v\,\chi(q,z)\,v . \tag{SP 1} $$
+Two consumers own adjacent state:
 
-The route represents it by one set of real poles per parent, shared by every matrix element:
+* `bind_shared_pole_census` binds current full-band occupations, k weights and
+  the active band top, and fills the `CapacityLedger` with `U` and the
+  inherited stream/Sigma lifetimes;
+* `bind_shared_pole_sc_identity` plus the support session retains the line
+  tuple and its envelope across self-consistent maps: an enclosed interval
+  keeps the same sampled geometry while the census, capacity ledger and
+  physical ranks are rebuilt; an expansion starts a new epoch, and a policy
+  or basis change starts a new session.
 
-$$ W_c(q,z) = \sum_{j} \frac{R_{+,j}(q)}{z-\Omega_j(q)} \;-\; \sum_{k} \frac{R_{+,k}(-q)^{\mathsf T}}{z+\Omega_k(-q)},
-\qquad R_{+,j} = c_j c_j^{\dagger} \succeq 0 . \tag{SP 2} $$
+`sigma_w_support_sites_ev` is the only sampling override. It replaces both
+ladders with explicit strictly increasing eV sites, folds the site text into
+`recipe_version`/`recipe_hash` (so a store built on a different ladder cannot
+authenticate), and leaves height, held fractions, widths, zero policy and
+every gate to the resolver.
 
-The minus sign and the transpose are the particle–hole pairing `R₋(q) = R₊(−q)ᵀ`, which holds without time
-reversal. Each parent stores only its positive poles; the hole side of `q` is read from parent `−q`.
+## 3 Response bank
 
-With time reversal `R₊(−q) = R₊(q)ᵀ`, so (SP 2) is even in `z`. With `b_j = √(2Ω_j) c_j`,
+`gw.shared_pole_screening.screen_shared_poles` drives the bank through
+`gw.response_bank` and `gw.w_isdf`.
 
-$$ W_c(q,s) = b\,(s-\Lambda)^{-1}\,b^{\dagger}, \qquad b \in \mathbb{C}^{n\times K} . \tag{SP 3} $$
+* **Stream.** `response_stream` accumulates the real-time retarded
+  correlation on a certified minimax time rule
+  (`minimax.response_bank_rule`) and returns `W_c` and `∂_sW_c` at every
+  fitted and held support. The stream conjugates in real space before the q
+  transform so the partner orientation `conj(F_{-q})` carries its own weight;
+  the ordered route (`ordered=True`, `pair_mode="laplace_ordered"`) builds
+  `F_q[χ]` and gathers rows at `−q`, which is the orientation equation (W 30)
+  of the theory page requires. The TRS route keeps the incumbent trace
+  bit-for-bit.
+* **Remote cells.** `response_windows` partitions each sample's transitions
+  into window and remote cells; `minimax.response_laplace_rule` supplies the
+  positive rule for `1/(d²+η²)^{n+1}` on the same time nodes. The even kernel
+  `d/(d²−z²)` weights `forward − reverse`; the odd kernel `z/(d²−z²)` weights
+  `forward + reverse` and is computed only for an ordered bank. The remote
+  cell edges are derived from the bank's own sample set: a cell stays remote
+  only while its Laplace Taylor ratio at those samples is
+  `≤ REMOTE_RHO_MAX = 0.3` (`gw.response_bank`), with the historical
+  `−35/+40 eV` edges as a floor; the tier's `bank_rule_tolerance`
+  (`1e-8` production, `1e-7` relaxed) is the separate certificate floor.
+* **Dyson.** Each sample solves `W = (I − vχ⁰)⁻¹v` through the bounded panel
+  GEMM (`distrib_la.panel_matmul`) and the resolved LU plan
+  (`w_isdf.response_coulomb_powers`, `sample_dyson`), storing `W_c` and
+  `∂_sW_c`.
+* **Moments.** `exact_bare_moments` and `compute_moment_bank` evaluate the
+  band-summed coefficients of `χ₀` and run the full Dyson series (equation
+  (W 12)); the bank stores `M₁`, `M₃` (physical, Ry³/Ry⁵) and, for an ordered
+  bank, the odd `M₀`, `M₂`. The odd-moment flag is what makes the ordered
+  infinity block measurable; a finite-state bank records it `NOT_MEASURED`.
 
-Units: `b` in Ry^(3/2), `Λ` in Ry². The time-domain weight `d_j(τ) = exp[−i(Ω_j − E_ref)τ]/(2Ω_j)` stays separate
-from `b`. When time reversal is broken and `q ≡ −q`, the odd part of (SP 2) is the imaginary part of the same
-residue, so the odd channel costs no storage:
+Bank layout: `Wc`, `dWc_ds` `[nq, nsample, d, d]` complex128; `M0`–`M3`
+`[nq, d, d]` complex128; a JSON header with the plan digest, per-field commit
+masks (`sample_written`, `moment_written`), units, and the same identity as
+the model store. `validate_shared_pole_bank` refuses a bank whose plan,
+identity, representation or commit masks do not match the current state; a
+model is never read from a partially written bank.
 
-$$ W_c(z) = \sum_j \mathrm{Re}(c_jc_j^\dagger)\frac{2\Omega_j}{z^2-\Omega_j^2}
- + i\,\mathrm{Im}(c_jc_j^\dagger)\frac{2z}{z^2-\Omega_j^2} . \tag{SP 4} $$
+## 4 Directions and state panels
 
-## 2 The response bank
+`select_round_states` batches the selection per role over the round's
+`[slot × sample]` stack; only spectra cross to the host.
 
-The bank (`gw.response_bank`) samples `W_c` and `∂W_c/∂s` at the recipe's support points and records the
-high-frequency moments. It never forms `W` at a real frequency.
+* Line supports select right singular vectors of `W_c(s)` above the relative
+  cutoff, capped at `ceil(n_logical/16)` and closed over multiplets.
+* Imaginary supports select the leading eigenvectors of
+  `−Herm W_c(iu)`, width `ceil(0.25 n)`.
+* Infinity supports select the leading eigenvectors of `M₁`, width
+  `ceil(0.125 n)`.
 
-Production uses 18 fitted supports (line plus imaginary), with held supports additional,
-and a retained-pole budget `ceil(1.8 N_mu)`. Line sites follow the band-structure support
-rule in report §IV.B: equal quantiles of the square root of the crossing density,
-broadened at the consumer's η. Delivered states within 5 eV of μ carry offsets from
-−5 to +5 eV in 0.25 eV steps; crossings include levels at every k. The implementation
-is `support_rule_line_sites`; this is distinct from the Si-only sparse n14 greedy search.
-The existing SC support session retains the line-site tuple while its interval stays
-enclosed and rebuilds it on an interval or policy change. Samples and the pole model
-are rebuilt from the current state on every map.
+Each fitted sample contributes its role state and, when its node is off the
+real `s` axis, its conjugate state on the partner direction set; the ordered
+route then appends the mirror `X(−z)` on the same directions after all
+originals, with `W_q(−z̄) = conj W_{−q}(z)` realized through the `−q` partner
+row (`partner_realization`; an antiunitary-only route refuses). A mirror of a
+`Re z = 0` sample uses its own sample. Per-slot role records
+(`sample_id`, `role`, `conjugate`, `mirror`, widths, carrier widths) travel
+into the receipt so a padding mode can never be mistaken for a physical one.
 
-**Real-time stream.** For occupied and unoccupied weights `f`, `u`, the selected-q retarded correlation is
-accumulated on a certified time rule `{t_a, w_a}` (`minimax.response_bank_rule`):
+## 5 Pencils, reduction and rounds
 
-$$ A(R,t) = \sum_{k} G_u(k+R,\,t)\,\overline{G_f(k,\,t)}, \qquad
-\chi^0(q,z) \approx \sum_a h_a(z)\,\mathcal F_q\!\left[-i\big(A(t_a) - \overline{A(t_a)}\big)\right], \tag{SP 5} $$
+`gw.shared_pole_pencil` assembles the even pencil in `s` and the ordered
+particle–hole pencil in `z` — equations (W 18)–(W 19) and (W 25)–(W 26) of
+the theory page — as Hermitian blocks on the x/y face. The confluent block is
+the only consumer of `∂_sW`; the infinity rows consume `M₁/M₃` (even) or
+`M₀…M₃` (ordered).
 
-with `h_a(z) = w_a e^{i z t_a}`. Conjugating in R space before the q transform gives `conj(F_{−q})`, the partner
-orientation with its own weight, so (SP 5) needs no time-reversal assumption.
+`gw.shared_pole_reduction` then
 
-**Orientation.** Σ's `G_{k−q} W_q` contraction is exact for
+1. equilibrates `G` (or the paired `v`-block) by `1/√diag`,
+2. keeps `γ > 10⁻⁸ γ_max` **and** the largest `pole_budget` entries,
+3. corrects the retained metric by coupled Newton–Schulz
+   (`_metric_inverse_root`, iteration count from the initial infinity norm,
+   never from an on-device convergence test),
+4. solves the Hermitian Ritz problem and writes `b`, `poles2`, `active` in the
+   parent-batch layout.
 
-$$ \mathcal F_q[f](\mu,\nu) = \sum_R f(r_\mu,\, r_\nu + R)\, e^{i q\cdot R}, \qquad W_q = \mathcal F_q[W] . \tag{SP 6} $$
+The ordered route first pairs the states (`w = ½[X(z)+X(−z)]`,
+`v = [X(z)−X(−z)]/2z`), cuts on the `v`-block, and reduces the restricted
+pencil `[[A,B],[B†,I]]` with a second relative cut; `|µ|` below the cut are
+infinite poles whose output weight is reported. Every model check runs in the
+same round layout (`check_round`, `round_checks`), and each parent's own
+extent — not the round padding — is what the receipts report
+(`own_extent_receipts`). `canonical_factors` writes the round's parents in
+canonical order, so the store never sees a partial or permuted round.
 
-The incumbent trace builds `conj(G(w, t)) = G(w̄, t̄)ᵀ` and gathers the forward transform at `q`, which returns
-`F_q[χᵀ]`. With time reversal the two orientations are equal and the TRS bank keeps that trace bit-for-bit. An
-ordered bank (`ordered=True`, and `pair_mode = "laplace_ordered"`) builds `G(w̄, t̄)` and gathers rows at `−q`,
-which is `F_q[χ]`. With the transposed orientation on a TR-broken deck each Green's-function branch would take the
-other branch's residues, `Σ[W^even] − Σ^odd`. Tests: `tests/test_shared_pole_stream_orientation.py` (ordered
-retarded and Laplace rows equal `F_q[χ]` to 1e-10 on a TR-broken lattice and miss `F_q[χᵀ]`).
+## 6 The model store
 
-**Remote Laplace cells.** Transitions far from the support region enter through a positive rule for
-`1/(d² + η²)^{n+1}` on the same `t` (`minimax.response_laplace_rule`). The even kernel `d/(d² − z²)` weights
-`forward − reverse`; the odd kernel `z/(d² − z²)` weights `forward + reverse`:
-
-$$ \chi^0_{\rm even} \leftarrow \sum_a \rho^{\rm even}_a(z)\,(F - B)(t_a),\qquad
-\chi^0_{\rm odd} \leftarrow \sum_a \rho^{\rm odd}_a(z)\,(F + B)(t_a), \tag{SP 7} $$
-
-where `F = f_lower u_upper` and `B = f_upper u_lower` are the two one-particle correlations. Odd rows are computed
-only for an ordered bank.
-
-**Dyson.** Each sample solves `W = (I − v χ⁰)⁻¹ v` through the bounded panel GEMM (`distrib_la.panel_matmul`) and
-the resolved LU plan, and stores `W_c` and `∂W_c/∂s`.
-
-**Moments.** With `W_c(z) = Σ_{k=0}^{3} 2 M_k z^{−(k+1)} + O(z^{−5})`,
-
-$$ M_0 = \tfrac12 m_0,\quad M_1 = \tfrac12 C_2,\quad M_2 = \tfrac12 m_2,\quad M_3 = \tfrac12 C_4, \tag{SP 8} $$
-
-where `m_0 = Σ_j (R₊ − R₋)` and `m_2 = Σ_j Ω_j² (R₊ − R₋)` are the odd coefficients and `C_2`, `C_4` the even
-coefficients of the full Dyson series. `M_0` and `M_2` vanish with time reversal and are written only to an
-ordered bank. All four are exact band sums of the correlations the stream uses; the Coulomb prefactor and the
-orthonormal FFT together scale them by `(1/√N_k)(1/√N_k) = 1/N_k`. Test:
-`tests/test_shared_pole_bank_moment_roundtrip.py` (planted `M_k = m_k/2` survive bank.h5 bitwise and reproduce
-`m_0..m_3` through the ordered infinity block).
-
-## 3 Directions
-
-For each fitted support the constructor selects a narrow direction set `Q` (`n × r`) from the sample, never the
-full matrix, through `distrib_la`:
-
-- line supports: right singular vectors of `W_c(s)` above `direction_cutoff` (relative);
-- imaginary supports: leading eigenvectors of `−Herm W_c(iy)`, width `imaginary_width`;
-- infinity: leading eigenvectors of `M_1`, width `infinity_width`.
-
-Each state is `(node, Q, O = W Q, D = W' Q)`. A line support also takes its conjugate partner: `W(s̄) = W(s)^†`,
-so the partner's directions are `O` itself and no extra selection is made.
-
-## 4 The even pencil (time reversal)
-
-For `X_b = (s_b − T)^{−1} b^† Q_b` the resolvent identity gives, without forming `X`,
-
-$$ G_{ab} = X_a^\dagger X_b = \frac{Q_a^\dagger O_b - O_a^\dagger Q_b}{s_b - \bar s_a},\qquad
-H_{ab} = X_a^\dagger T X_b = s_b\,G_{ab} - Q_a^\dagger O_b, \tag{SP 9} $$
-
-with the confluent limit `G_aa = −Q_a^† D_a`. The infinity rows use `M_1` and `M_3`:
-
-$$ G_{\infty b} = Q_\infty^\dagger O_b,\quad H_{\infty b} = s_b G_{\infty b} - 2 (M_1 Q_\infty)^\dagger Q_b,\quad
-G_{\infty\infty} = 2 Q_\infty^\dagger M_1 Q_\infty,\quad H_{\infty\infty} = 2 Q_\infty^\dagger M_3 Q_\infty . \tag{SP 10} $$
-
-**Reduction.** Equilibrate `G` by its diagonal, keep eigenvalues `γ > keep · γ_max` (`normalized_gram_keep`),
-correct the retained metric by coupled Newton–Schulz to `Z^† G Z = I`, and solve the Hermitian problem
-`Z^† H Z = U Λ U^†`. The model is `b = O Z U`, `Λ`. Poles below `lambda_cutoff_ry2` are dropped only within the
-factor-weight budget (`zero_ritz_policy`).
-
-## 5 The ordered pencil (time reversal broken)
-
-The linear particle–hole pencil `(z σ₃ − M)` has the same resolvent-identity columns in `z`:
-
-$$ \mathcal G = X^\dagger \sigma_3 X,\qquad \mathcal H = X^\dagger M X, \tag{SP 11} $$
-
-with nodes `{z, z̄, −z̄, −z}` and `∂W/∂z = 2z ∂W/∂s`. Every state `X(z)` on `Q` is followed, after all originals, by
-its mirror `X(−z)` on the same `Q`; `W_q(−z̄) = conj W_{−q}(z)`, so the mirror is one sample of parent `−q`. Poles
-`1/μ` are real iff the projected `ℋ ≻ 0`, which a stable RPA (`M ≻ 0`) guarantees.
-
-**Infinity block.** `k₀ = σ₃ C^† Q_∞` and `k₁ = σ₃ M σ₃ C^† Q_∞` need all four moments of (SP 8):
-
-$$ \mathcal G_{\infty\infty} = \begin{pmatrix} P_0 & P_1\\ P_1 & P_2 \end{pmatrix},\quad
-\mathcal H_{\infty\infty} = \begin{pmatrix} P_1 & P_2\\ P_2 & P_3 \end{pmatrix},\quad P_k = 2 Q_\infty^\dagger M_k Q_\infty . \tag{SP 12} $$
-
-A bank without `M_0`, `M_2` builds finite states only and records the block NOT_MEASURED.
-
-## 6 Paired basis, cut and dedupe
-
-**Paired basis.** The congruence
-
-$$ w_b = \tfrac12\big(X(z_b) + X(-z_b)\big),\qquad v_b = \frac{X(z_b) - X(-z_b)}{2 z_b},\qquad
-w_\infty = k_1,\quad v_\infty = k_0 \tag{SP 13} $$
-
-gives `ℋ' = [[H_ww, H_wv], [H_vw, H_vv]]` and `𝒢' = [[G_ww, G_wv], [G_vw, G_vv]]`. With time reversal
-`ℋ' = diag(H_s, G_s)` and `𝒢'` is off-diagonal, `(G_s, H_s)` being the even pencil of §4.
-
-**Cut.** Equilibration, the keep cut and the metric correction act on `H'_vv` alone, as the even route acts on
-`G_s`; the kept span `Z` is applied to both halves. The restricted pencil `H_r = [[A, B], [B^†, I]]` gets a second
-relative keep cut, `Ψ = L^{−†}` with `H_r = L L^†`, `μ = eig(Ψ^† 𝒢_r Ψ)` and `c = O_r Ψ rot`. The stored model is
-
-$$ b = \sqrt2\,c\,\mu^{-1} \ (\mu > 0),\qquad \Lambda = \mu^{-2}, \tag{SP 14} $$
-
-which equals the even model with time reversal. `|μ| ≤ keep · max|μ|` are poles at infinity; their output weight is
-reported (`infinite_weight_ok`).
-
-**Dedupe.** For an imaginary support, or a line support with `Re z = 0`, the conjugate partner brings no new tangent
-with time reversal: `W Q ∈ span(Q)`. Only the component of `O = W Q` orthogonal to `Q` above `direction_cutoff`
-survives, so a time-reversal-symmetric bank adds no partner columns and the ordered model equals the even one at
-equal rank.
-
-**Layout.** The constructor reduces one round of parents at a time, one parent per rank (batch layout
-`P(('x','y'), ...)`): `gw.shared_pole_local.round_program` packs each parent's panels to the round extent
-(`round_tables`; ordered originals and mirrors as two halves of one extent), assembles and reduces its pencil with
-local dense kernels, and sorts its poles, all on that rank; synthetic slots are skipped. The model checks (passivity,
-held `W` and `dW/ds`, moments) run the same way (`round_checks`), and the store receives one write of every parent in
-canonical order (`canonical_factors`). A round refuses before it
-runs if eight `[R, R]` blocks and the eigh workspace do not fit one device (`distrib_la.fits_local`). Receipts report
-each parent at its own extent: the round padding's zeros are dropped from the Gram spectrum
-(`own_extent_receipts`). Called on face stacks instead, the same blocks are assembled and symmetrized through
-`distrib_la` face blocks (`hermitian_block`, `hermitian_part`, `join_columns`, `on_face`): eager concatenation and
-`a + a^†` of face-sharded operands would come out replicated on every rank.
-
-## 7 Store schema
-
-`model.h5` (schema `lorrax.shared-real-pole.v1`) and `bank.h5` (schema `lorrax.shared-real-pole-bank.v1`) share one
-authenticated header (`file_io.shared_pole_store`):
+`model.h5` (schema `lorrax.shared-real-pole.v1`) and `bank.h5`
+(`lorrax.shared-real-pole-bank.v1`) share one authenticated header written by
+`file_io.shared_pole_store`.
 
 | field | meaning |
 |---|---|
-| `identity` | current-state hamiltonian, occupations, wavefunctions, recipe and gate hashes |
+| `identity` | current-state Hamiltonian, occupations, wavefunctions, recipe and gate hashes |
 | `recipe`, `recipe_hash` | the resolved recipe; restart and SC maps refuse a stale one |
-| `representation` | model: `scalar-trs-even-s` (SP 3) or `scalar-ordered-ph` (SP 2); ordered bank: `charge-ordered-z` |
-| `n_q_irr`, `q_irr_full_idx`, `qirr`, `operations` | raw parents and the authorized symmetry rows |
-| `n_mu_logical`, `nspinor`, `centroid_digest` | basis identity; the operator is the `μ × μ` charge response on scalar and two-component decks |
-| model: `factor [q, μ, 1, K]`, `poles2_ry2 [q, K]`, `K [q]` | (SP 3) per parent; inactive columns have `b = 0`, `Λ = 1 Ry²` |
-| bank: `Wc`, `dWc_ds [q, a, μ, μ]`, `M1`, `M3` (+ `M0`, `M2` when `odd_moments`) | samples and moments of §2 |
+| `representation` | `scalar-trs-even-s` (even model), `scalar-ordered-ph` (ordered model), `charge-ordered-z` (ordered bank) |
+| `normalization`, `units` | `Wc = b/(z_Ry²−Λ_Ry²)b†` (even) or the ordered positive-pole form; `factor` Ry^(3/2), `poles2_ry2` Ry² |
+| `n_q_irr`, `n_q_full`, `q_irr_full_idx`, `qirr`, `operations` | raw parents and the authorized symmetry rows |
+| `n_mu_logical`, `nspinor`, `centroid_digest` | basis identity; the operator is the `μ×μ` charge response on scalar and two-component decks |
+| model `factor [q, μ, 1, K]`, `poles2_ry2 [q, K]`, `K [q]` | per parent; inactive columns have `b = 0`, `Λ = 1 Ry²`, and `K` is the active prefix |
+| bank `Wc`, `dWc_ds [q, a, μ, μ]`, `M1`, `M3` (+ `M0`, `M2` when ordered) | samples and moments of Section 3 |
+
+`write_shared_pole_model` checks dtypes (`complex128`, `float64`, `int64`),
+shapes, sorted positive active poles, exact sentinels, and the inactive
+prefix; `finalize_shared_pole_model` refuses until every staged parent is
+committed (`written_q`), then builds the compact `factor`/`poles2_ry2`
+datasets and publishes a `final_commit` digest in a rank-0 transaction, so an
+interrupted run leaves an unfinalized file rather than a plausible model.
+Readers
+(`read_shared_pole_census`, `read_shared_pole_matrix`, `read_shared_pole_faces`)
+authenticate before any collective open; `export_shared_pole_outputs`
+publishes the map's compact members.
+
+## 7 Operator realization
+
+The stored factors describe the **raw latent Ritz model**. The physical
+operator is the little-group average of the packed tile,
+`Wc(q,s) = Π_Gq [Σ_k b(q,k)b(q,k)†/(s−Λ(q,k))]`, applied by
+`gw.qgrid_symmetry.shared_pole_operator_realizer` through
+`symmetry_maps.project_little_group_operator`, with the operation typing
+authenticated from the store header. The realization is versioned
+(`operator_realization = little-group-reynolds-v1`); a store without it
+refuses rather than silently acquiring a physical meaning.
+
+Two consequences are worth stating where the code is read:
+
+* the constructor's held/moment/passivity receipts certify the **raw** model;
+  they do not certify the projected operator's error, and a converged
+  comparison must measure the physical change;
+* the projection averages unitary (or conjugate-unitary) congruences of
+  positive residues, so it preserves residue positivity and real poles; at
+  complex frequency or time an antiunitary operation acts on the residue
+  endpoints, and the partner is the same-time transpose — conjugating the
+  whole value would conjugate the scalar resolvent weight.
+
+`shared_pole_packed_action` and `qgrid_trs_policy_from_shared_pole_store`
+adapt the same tables for the packed and TRS policies of Σ and the head.
 
 ## 8 The Σ consumer
 
-Σ contracts `G` with `W(τ)` synthesized from the factors in bounded parent and column panels
-(`gw.mpa.sigma._shared_pole_w_synthesis`):
+`gw.mpa.sigma.synthesize_shared_pole_parents` builds, for one τ node and one
+pole interval, the factor contractions `W_+(q,τ) = b d(τ) b†` and its
+transpose, with `d_j(τ) = e^{−i(Ω_j−E_ref)τ}/(2Ω_j)` (equation (W 15) of the
+theory page). The weights are built once per node; the physical factors keep
+their endpoint-face layouts `P(None,'x',None,'y')` / `P(None,'y',None,'x')`,
+and the contraction goes through the existing Green's-function face service.
 
-$$ W_{c,+}(q,\tau) = b\,\mathrm{diag}\big(d_j(\tau)\big)\,b^{\dagger}, \qquad
-d_j(\tau) = \frac{e^{-i(\Omega_j - E_{\rm ref})\tau}}{2\Omega_j} . \tag{SP 15} $$
-
-**Hole routing.** Conduction windows take `W₊(q)`. An ordered store routes valence windows to the particle–hole
-partner,
-
-$$ W_-(q,\tau) = W_+(-q,\tau)^{\mathsf T}, \tag{SP 16} $$
-
-gathered at `−q` on the replicated q axis and transposed on its faces (`shared_pole_hole_kernel`); time-reversal
-stores never take this branch. Tests: `tests/test_shared_pole_ordered.py` (the synthesized orientations are the
-positive- and negative-frequency Lehmann sums) and `tests/test_shared_pole_lattice_sigma.py`: on a TR-broken
-lattice the production τ kernel reproduces real-space `Σ = iGW` to 1e-10 relative, and the swapped routing misses
-by more than 1e-3.
-
-**Two-component decks.** `W` is spin-scalar; `G` carries the spinor axes, and the τ kernel broadcasts `W_q` over
-both (`ppm_tau_kernel` `prep_w`). The factor spin axis is 1 on every admitted deck.
-
-**Debug.** `LORRAX_DEBUG_SHARED_POLE_EVEN_PART` (debug only) feeds `[W₊(q) + W₊(−q)ᵀ]/2` to both branches of an
-ordered store, so `Σ^odd = Σ[W] − Σ[W^even]` can be measured; see `docs/dev/env_vars.md`.
+* **Hole routing.** Conduction windows take `W₊(q)`; an ordered store routes
+  valence windows to `W₋(q,τ) = W₊(−q,τ)ᵀ` through
+  `shared_pole_hole_kernel`, which gathers the already-built full-q tile at
+  `−q` on the replicated q axis and transposes its endpoint faces. No residue
+  contraction is repeated, and a TRS store never takes this branch.
+* **Panels.** `_shared_pole_panel_tables`, `_shared_pole_panel_unfold` and
+  `_shared_pole_routed_synthesis` select the q/pole panels; `_shared_pole_w_synthesis`
+  is the production executor; `_shared_pole_panel_cost` and
+  `_shared_pole_memory_schedule` size the schedule, and `_integrate_sigma_batches`
+  is the shared Σ executor for the store and MPA readers.
+* **Two-component decks.** `W` is spin-scalar; `G` carries the spinor axes and
+  the τ kernel broadcasts `W_q` over both (`gw.ppm_tau_kernel` `prep_w`). The
+  stored factor spin axis is 1 on every admitted deck.
+* **Diagnostics.** `LORRAX_DEBUG_SHARED_POLE_EVEN_PART` (`all` or `exclude_q0`)
+  feeds `[W₊(q)+W₊(−q)ᵀ]/2` to both branches of an ordered store so that
+  `Σ^odd = Σ[W] − Σ[W^even]` can be measured on the production contraction;
+  it refuses unknown values and TRS stores and prints a `WARNING -- DEBUG`
+  banner.
 
 ## 9 Gates and tests
 
-Every construction receipt row carries version, value, threshold and PASS/FAIL/WARN/NOT_MEASURED. The TRS table is
-`shared_real_pole_gates_v1_r3b`; `shared_real_pole_gates_ordered_v1` copies it and replaces the rows marked
-"ordered".
+Every construction receipt row carries a version, value, threshold and a
+PASS/FAIL/WARN/NOT_MEASURED verdict. The TRS table is
+`shared_real_pole_gates_v1_r3b`; `shared_real_pole_gates_ordered_v1` copies it
+and replaces the rows marked *ordered*.
 
 | gate | certifies | refuses? |
 |---|---|---|
 | `representation` | TRS: scalar and TRS allowed; ordered: TRS broken and an ordered bank | yes |
-| `normalized_gram_validity` | equilibrated Gram (or `H'_vv`) spectrum min/max above threshold | yes |
-| `normalized_gram_keep` | the retained rank at the recipe cut | diagnostic |
-| `retained_subspace_moments` | TRS: projected `M_1`, `M_3` identity; ordered: `m_0..m_3` on the infinity directions | TRS yes, ordered diagnostic |
+| `normalized_gram_validity` | equilibrated Gram (or `H'_vv`) min/max above threshold | yes |
+| `normalized_gram_keep` | the retained rank at the recipe cut and budget | diagnostic |
+| `retained_subspace_moments` | TRS: projected `M₁/M₃` identity; ordered: `m₀…m₃` on the infinity directions | TRS yes, ordered diagnostic |
 | `zero_ritz_policy` | dropped factor weight within budget; ordered also `infinite_weight_ok` | yes |
 | `finite_factors_poles` | finite `b`, positive finite active `Λ`, exact inert sentinels | yes |
-| `passivity` | V-whitened `−Herm W_c(iη)` in `[0, I]`; ordered: Hermitian part, the anti-Hermitian part is reported | yes |
-| `model_reciprocity` | TRS only: transpose symmetry of symmetric held samples | yes (TRS) |
+| `passivity` | V-whitened `−Herm W_c(iη)` in `[0, I]`; ordered reports the anti-Hermitian part | yes |
+| `model_reciprocity` | TRS only: transpose symmetry of symmetric held samples; `NOT_MEASURED` when nothing was evaluated | yes (TRS) |
 | `held_w` | held `W`, `∂W/∂s` relative errors | diagnostic |
 | `full_m1_defect`, `full_m3_defect` | full-matrix moment defects | WARN only |
 | `capacity`, `stream_peak`, `sigma_peak` | device admission within budget; inherited peaks recorded separately | capacity yes |
 | `rule_validity`, `sc_rebuild` | bank and Σ certificates cover the current domains; SC rebuilds from current bands | yes |
 
-Fast CPU tests (4 host devices where a mesh is needed):
+Fast CPU tests (four host devices where a mesh is needed):
 
 | test | pins |
 |---|---|
-| `test_shared_pole_ordered.py` | planted ordered oracle, projected moments per order, ordered = even on TRS data at equal rank, dedupe keeps no partner, generic-q assembly, Σ orientations, two-component routing against the Lehmann sum |
-| `test_shared_pole_stream_orientation.py` | the ordered stream stores `F_q[χ]` (SP 6) |
-| `test_shared_pole_lattice_sigma.py` | ordered Σ = real-space `iGW` on a TR-broken lattice; swapped routing fails (SP 16) |
-| `test_shared_pole_bank_moment_roundtrip.py` | bank → constructor moments, `M_k = m_k/2` (SP 8) |
+| `test_shared_pole_ordered.py` | planted ordered oracle; projected moments per order; ordered = even on TRS data at equal rank; dedupe keeps no partner; generic-q assembly; Σ orientations; two-component routing against the Lehmann sum |
+| `test_shared_pole_stream_orientation.py` | the ordered stream stores `F_q[χ]` |
+| `test_shared_pole_lattice_sigma.py` | ordered Σ = real-space `iGW` on a TR-broken lattice; swapped routing fails |
+| `test_shared_pole_bank_moment_roundtrip.py` | bank → constructor moments, `M_k = m_k/2` |
 | `test_shared_pole_pencil_faces.py` | pencil blocks come out `P(None,'x','y')` in both routes |
+| `test_shared_pole_outputs.py` | store finalization, readers and export |
 | `services/distrib_la/tests/test_eigh_keeps_operand.py` | the planned eigh does not overwrite its operand |
 | `test_slab_io_mode_required.py` | `SlabIO`/`open_file` refuse a missing `mode=` |
 
-## 10 Byte model
+## 10 Capacity and byte model
 
-Per rank on an `x × y` mesh with `P = Px Py` and pencil side `R`:
+Per rank on an `x × y` mesh with `P = Px Py` and pencil side `R`, the
+reduction admits
 
-$$ \text{reduction} \approx 16\,\big(14 R^2 + 12 n R\big)\,b/P + 16\cdot 3 n r\,b/P + \text{native eigh workspace}, \tag{SP 17} $$
+$$
+\text{reduction} \approx 16\,\big(14R^2+12nR\big)\,b/P
+   + 16\cdot3nr\,b/P + \text{native eigh workspace},
+\tag{I 1}
+$$
 
-(`shared_pole_capacity.shared_pole_byte_terms`; `ConstructorCapacity` beside it turns those terms into the map
-ledger's rows). A round has `b = P`: every rank holds one whole parent (§6). The native cuSOLVERMp eigh adds a
-private operand tile of `n²/P` next to its workspace, which `distrib_la.workspace_bytes_per_rank` includes; a byte
-model without that tile under-counts the measured CrI3 q=1 construction peak (2.140 against 2.907 GiB per rank).
+with a round width `b = P` (each rank holds one whole parent). The native
+cuSOLVERMp eigh adds a private operand tile of `n²/P` next to its workspace,
+which `distrib_la.workspace_bytes_per_rank` includes; a byte model without
+that tile under-counts the measured CrI₃ `q=1` construction peak (2.140
+against 2.907 GiB per rank). `gw.shared_pole_capacity` turns the terms into
+the map ledger's rows, and the constructor reserves every new object through
+the `CapacityLedger` before allocation; inherited bank and Σ objects and host
+staging are reported separately.
+
+## 11 Deck keys, restart, self-consistency, refusals
+
+| key | effect |
+|---|---|
+| `sigma_w_model = shared_pole` | selects the route; requires `compute_mode = mpa`; a scalar head stays MPA |
+| `sigma_w_accuracy = production \| relaxed` | selects the tier (pole budget, cutoffs, ladders); not a reuse switch |
+| `sigma_w_support_sites_ev` | support-study override; replaces both ladders and enters the identity |
+| `LORRAX_DEBUG_SHARED_POLE_EVEN_PART` | debug-only odd-channel diagnostic; refuses production misuse |
+
+Restart restores the invariant ISDF basis; the map-local W models are
+scratch and are never published as reusable ISDF members. A self-consistent
+map rebuilds the bank, moments, directions, poles and ranks from the current
+wavefunctions, energies and occupations; retained quadrature rules keep
+nodes and weights while recertifying masks, selectors, reference energies and
+`W(τ)` for the current domains. The full Γ head supports only the
+time-reversal-even, `N_spinor = 1` body and refuses an ordered or
+two-component deck at input resolution (`shared_pole_head.refuse_unsupported_shared_pole_head`);
+such a one-shot deck uses `head_correction = off`.
+
+## 12 Evidence
+
+The measured accuracy of the route — the pole-count/accuracy table, the
+certified Si/Na/CrI₃ self-energies, the odd-channel magnitudes, and the
+open items — is the
+[theory page's Sections 8 and 9](../theory/shared-pole-w-model.md#shared-pole-pole-count).
+Implementation performance measurements (batched construction, round programs,
+the face-block pencil, network timings) are owned by the campaign reports
+under `reports/shared_pole_model_2026-09-15/` and
+`runs/frequency_integration_sandbox/460_batchw_20260917/REPORT.md`; this page
+does not restate them.

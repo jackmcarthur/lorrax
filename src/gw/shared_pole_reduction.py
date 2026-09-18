@@ -1,8 +1,9 @@
 """Ritz reduction of the shared-pole pencils.
 
 Equilibration, the normalized-Gram keep cut, the coupled Newton-Schulz metric
-correction and the Hermitian Ritz step for the even route (SP 10), and the paired
-basis, its second cut and the signed model for the ordered route (SP 13, SP 14).
+correction and the Hermitian Ritz step for the even route (W 20 of
+docs/theory/shared-pole-w-model.md), and the paired basis, its second cut and
+the signed model for the ordered route (W 27).
 """
 
 from __future__ import annotations

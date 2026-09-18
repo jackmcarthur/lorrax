@@ -470,14 +470,16 @@ heuristic's condition ratio; it is not an interpolation-error certificate.
 
 ### Symmetry of the physical pole model
 
-The versioned physical realization is
-`Wc(q,s) = Pi_Gq [sum_k b(q,k) b(q,k)^dagger / (s - Lambda(q,k))]`,
-where `Pi_Gq` averages all authenticated magnetic little-group operations.
-The stored factors describe the raw latent Ritz model. Sigma time synthesis
-and the MPA Gamma body bind the same adapter in `gw/qgrid_symmetry.py`;
-the standalone symmetry service owns every phase, permutation and operation.
-The recipe's hashed `operator_realization` distinguishes these semantics
-from historical raw stores, which remain readable for analysis.
+The versioned physical realization — the little-group average of the packed
+tile, with the stored factors as the raw latent Ritz model — is owned by the
+[shared-pole theory page](theory/shared-pole-w-model.md) and restated where
+the code is read in the
+[implementation page](architecture/shared_pole_model.md#7-operator-realization).
+Sigma time synthesis and the MPA Gamma body bind the same adapter in
+`gw/qgrid_symmetry.py`; the standalone symmetry service owns every phase,
+permutation and operation, and the recipe's hashed `operator_realization`
+distinguishes these semantics from historical raw stores, which remain
+readable for analysis.
 
 Each transformed residue is a unitary or conjugate-unitary congruence of a
 positive residue, so averaging preserves residue positivity and real poles.
