@@ -106,7 +106,8 @@ class ConstructorCapacity:
         the parent batch the next price is for.
     """
 
-    def __init__(self, meta, resolution, *, mesh_xy, ledger, upstream):
+    def __init__(self, meta, resolution, *, mesh_xy, ledger, upstream, execution="local"):
+        self.execution = execution
         self._meta = meta
         self._resolution = resolution
         self._mesh_xy = mesh_xy
@@ -123,23 +124,21 @@ class ConstructorCapacity:
         self.batch_width = 1
 
     def eigenplan(self, side):
-        """The rank-local eigh plan for one side, built once per side.
-
-        Every eigensolve of the construction runs on whole parents in batch
-        layout, one per rank, whatever the deck's linalg dial resolves.
-        """
+        """One service plan per configured execution layout and actual side."""
         import distrib_la
 
-        if side not in self._plans:
-            self._plans[side] = distrib_la.plan("eigh", self._mesh_xy, n=side, backend="off",
-                                                batched_route="batch_reshard")
-        return self._plans[side]
+        key = self.execution, side
+        if key not in self._plans:
+            self._plans[key] = distrib_la.plan("eigh", self._mesh_xy, n=side,
+                backend="distributed" if self.execution == "face" else "off",
+                batched_route="auto" if self.execution == "face" else "batch_reshard")
+        return self._plans[key]
 
     def query_workspace(self, op, shapes, plan):
         """Native workspace bytes per rank for one op at one shape, cached."""
         import distrib_la
 
-        key = (op, shapes)
+        key = (self.execution, op, shapes)
         if key not in self.native_queries:
             self.native_queries[key] = distrib_la.workspace_bytes_per_rank(plan, op, shapes, np.complex128)
         return self.native_queries[key]
@@ -161,12 +160,23 @@ class ConstructorCapacity:
             {side} if self._phase == "reduction" else {n})
         # Eigh scratch is transient: replace it at each phase boundary.
         self._native_maxima["eigh"] = max(self.query_workspace(
-            "eigh", ((self.batch_width, extent, extent),), self.eigenplan(extent))
+            "eigh", ((1 if self.execution == "face" else self.batch_width, extent, extent),), self.eigenplan(extent))
             for extent in sorted(extents))
+        if self.execution == 'face':
+            extent=max(n,*extents)
+            import distrib_la
+            shapes=((1,extent,extent),(1,extent,extent))
+            key=('face','matmul',shapes)
+            if key not in self.native_queries:
+                self.native_queries[key]=distrib_la.matmul_workspace_bytes_per_rank(
+                    self._mesh_xy,shapes,np.complex128,backend='distributed',batched_route='auto')
+            self._native_maxima['gemm']=self.native_queries[key]
         self._workspace = sum(self._native_maxima.values())
+        from types import SimpleNamespace
+        pricing_resolution = SimpleNamespace(layout="distributed" if self.execution == "face" else "local")
         price = shared_pole_byte_terms(
-            self._meta, mesh_xy=self._mesh_xy, resolution=self._resolution,
-            pencil_side=side, parent_batch=self.batch_width,
+            self._meta, mesh_xy=self._mesh_xy, resolution=pricing_resolution,
+            pencil_side=side, parent_batch=1 if self.execution == "face" else self.batch_width,
             sample_batch=sample_batch, phase=self._phase,
             selection_faces=selection_faces)
         # Other parents' narrow inputs survive selection and each model's
@@ -176,6 +186,7 @@ class ConstructorCapacity:
         price["terms_bytes_per_rank"]["retained_parent_panels"] = extra
         price["resident_bytes_per_rank"] += extra
         row = self._reserve("constructor.plan", price["resident_bytes_per_rank"])
+        row['execution'] = self.execution
         return dict(row, price=price, native_workspace=dict(self._native_maxima))
 
     def live(self, arrays):

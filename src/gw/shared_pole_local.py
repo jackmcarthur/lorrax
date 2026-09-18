@@ -235,7 +235,7 @@ def reduce_round(states, infinity, tables, *, real, mesh_xy, native_eigh, ordere
 
 
 def solve_parent_pencil(points, q, o, d, infinity, active, *, eigh, matmul,
-                        gates, ordered, odd_moments, keep_budget, retain_span=False):
+                        gates, ordered, odd_moments, keep_budget, retain_span=False, matrix_sharding=None):
     """One equation owner for local and whole-mesh parent execution.
 
     Inputs carry one or more independent parents. Execution adapters supply
@@ -249,10 +249,11 @@ def solve_parent_pencil(points, q, o, d, infinity, active, *, eigh, matmul,
     from gw.shared_pole_reduction import reduce_ordered_shared_pole_pencil, reduce_shared_pole_pencil
     finite = [(points, q, o, d)]
     if ordered:
-        pencil = assemble_ordered_shared_pole_pencil(finite, infinity if odd_moments else None, matmul=matmul)
+        pencil = assemble_ordered_shared_pole_pencil(finite, infinity if odd_moments else None,
+                                                     matmul=matmul, matrix_sharding=matrix_sharding)
         reduced = reduce_ordered_shared_pole_pencil(
             pencil, active, eigh=eigh, matmul=matmul, gates=gates, keep_budget=keep_budget,
-            retain_span=retain_span)
+            retain_span=retain_span, matrix_sharding=matrix_sharding)
         model, signed, reduction = reduced[:3]
         if retain_span:
             coefficients = reduced[3]
@@ -302,10 +303,7 @@ def round_program(mesh_xy, native_eigh, ordered, odd_moments, keep_budget, sizes
     import jax.numpy as jnp
     from jax.sharding import NamedSharding, PartitionSpec as P
     from common.shard_map import shard_map
-    from gw.shared_pole_gates import (apply_shared_pole_zero_policy, ordered_moment_identity,
-                                      retained_moment_identity, sort_shared_pole_columns)
-    from gw.shared_pole_pencil import assemble_ordered_shared_pole_pencil, assemble_shared_pole_pencil
-    from gw.shared_pole_reduction import reduce_ordered_shared_pole_pencil, reduce_shared_pole_pencil
+    from gw.shared_pole_gates import sort_shared_pole_columns
     from gw.shared_pole_recipe import shared_real_pole_gates_ordered_v1, shared_real_pole_gates_v1_r3b
 
     gates = shared_real_pole_gates_ordered_v1 if ordered else shared_real_pole_gates_v1_r3b

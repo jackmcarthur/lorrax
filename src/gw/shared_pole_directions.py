@@ -39,7 +39,7 @@ def _fit_roles(recipe):
 
 
 @lru_cache(maxsize=None)
-def _round_kernels(mesh):
+def _round_kernels(mesh, layout="batch"):
     """Rank-local programs on batch-layout round stacks [P, ...] (one parent per rank).
 
     Every array argument carries its parent axis over ('x','y'); scalars are
@@ -49,10 +49,15 @@ def _round_kernels(mesh):
     from types import SimpleNamespace
     from common.shard_map import shard_map
 
+    from gw.shared_pole_execution import face_program, face_matmul
+    from gw.shared_pole_local import _mm as _local_product
     batch, rep = P(('x', 'y')), P()
+    mm = face_matmul(mesh) if layout == 'face' else lambda a,b,**kw: _local_product(a,b,**kw)
     adjoint = lambda a: jnp.conj(jnp.swapaxes(a, -1, -2))
 
     def program(fn, specs, out):
+        if layout == 'face':
+            return face_program(fn,mesh)
         return jax.jit(shard_map(fn, mesh=mesh, in_specs=specs, out_specs=out, check_vma=False))
 
     def sample(stack, j):
@@ -69,7 +74,7 @@ def _round_kernels(mesh):
             a, d = sample(w, j), sample(dw, j)
             if conjugate:
                 a, d = adjoint(a), adjoint(d)
-            return a @ x, (d @ x) * scale
+            return mm(a,x), mm(d,x) * scale
         return program(body, (batch, batch, rep, batch, rep), (batch, batch))
 
     @lru_cache(maxsize=None)
@@ -118,23 +123,24 @@ def _round_kernels(mesh):
             outputs = []
             for k, conjugate in enumerate(flags):
                 op_a, op_d = ((a, d) if conjugate else (adjoint(a), adjoint(d)))
-                outputs.extend((op_a @ xs[:, k], (op_d @ xs[:, k]) * scales[k]))
+                outputs.extend((mm(op_a,xs[:,k]), mm(op_d,xs[:,k]) * scales[k]))
             return tuple(outputs)
         return program(body, (batch, batch, batch, rep, rep),
                        (batch,) * (2 * len(flags)))
 
     def dedupe(q, o):
         # O W-output of the direction set Q: the part of O outside span(Q), and O O^H for its scale.
-        rest = o - q @ (adjoint(q) @ o)
+        rest = o - mm(q, mm(q,o,transa="C"))
         herm = lambda a: (a + adjoint(a)) / 2
-        return herm(o @ adjoint(o)), herm(rest @ adjoint(rest))
+        return herm(mm(o,o,transb="C")), herm(mm(rest,rest,transb="C"))
 
     column = program(lambda q, e: jax.lax.dynamic_index_in_dim(q, e, axis=1, keepdims=False), (batch, rep), batch)
-    apply = program(lambda m, q: m @ q, (batch, batch), batch)
+    apply = program(lambda m, q: mm(m,q), (batch, batch), batch)
     negative_hermitian = program(lambda a: -(a + adjoint(a)) / 2, (batch,), batch)
     return SimpleNamespace(
         take=take, column=column, negative_hermitian=negative_hermitian, exchange=exchange,
         literal_mirrors=literal_mirrors, act=act, apply=apply,
+        stack=program(lambda *a:jnp.stack(a,axis=1),batch,batch),
         dedupe=program(dedupe, (batch, batch), (batch, batch)))
 
 
@@ -164,7 +170,10 @@ def select_round_states(samples, recipe, *, sample_lo, real, mesh_xy, eigh_plan,
     """
     from gw.shared_pole_recipe import ROLE_CODES
 
-    k = _round_kernels(eigh_plan.mesh)
+    from gw.shared_pole_execution import is_face, face_program
+    face_layout = is_face(samples['Wc'])
+    k = _round_kernels(eigh_plan.mesh, 'face' if face_layout else 'batch')
+    spectral_rows = None if face_layout else real
     W, dW = samples["Wc"], samples["dWc_ds"]
     literal = "Wc_mirror" in samples or "dWc_mirror_ds" in samples
     if literal and not all(name in samples for name in ("Wc_mirror", "dWc_mirror_ds")):
@@ -189,13 +198,13 @@ def select_round_states(samples, recipe, *, sample_lo, real, mesh_xy, eigh_plan,
         stack = k.take(tuple(sid - sample_lo for sid, _ in kinds["line"]))(W)
         selected["line"] = distrib_la.right_singular_vectors(
             stack, recipe["direction_cutoff"], eigh_plan=svd_plan, column_extent=column_extent,
-            multiplet_tol=tol, real_rows=real, max_rank=recipe.get("line_direction_cap"))
+            multiplet_tol=tol, real_rows=spectral_rows, max_rank=recipe.get("line_direction_cap"))
         del stack
     if kinds["imaginary"]:
         stack = k.negative_hermitian(k.take(tuple(sid - sample_lo for sid, _ in kinds["imaginary"]))(W))
         width = min(logical_n, max(1, int(recipe["imaginary_width"])))
         selected["imaginary"] = distrib_la.leading_eigenvectors(
-            stack, width, eigh_plan=eigh_plan, column_extent=column_extent, multiplet_tol=tol, real_rows=real)
+            stack, width, eigh_plan=eigh_plan, column_extent=column_extent, multiplet_tol=tol, real_rows=spectral_rows)
         del stack
 
     def widths_of(values):
@@ -243,7 +252,8 @@ def select_round_states(samples, recipe, *, sample_lo, real, mesh_xy, eigh_plan,
             span = range(first, len(states))
             if literal and z.real != 0:
                 originals = list(span)
-                xs = jnp.stack([states[index][1] for index in originals], axis=1)
+                xs = (k.stack(*[states[index][1] for index in originals])
+                      if face_layout else jnp.stack([states[index][1] for index in originals], axis=1))
                 program = k.literal_mirrors(tuple(flags[index] for index in originals))
                 flat = program(samples["Wc_mirror"], samples["dWc_mirror_ds"], xs, j,
                                put(np.asarray([-2 * states[index][0] for index in originals], np.complex128)))
@@ -296,18 +306,20 @@ def _round_partner_directions(q, output, cutoff, *, real, kernels, eigh_plan, co
     odd channel. Each slot keeps its own count (0 allowed); only spectra cross the
     host. Returns (directions [P, n, r], widths) or (None, None) when no slot has any.
     """
+    from gw.shared_pole_execution import is_face
+    spectral_rows = None if is_face(q) else real
     top, perp = kernels.dedupe(q, output)
     m = int(perp.shape[-1])
     _, largest = distrib_la.leading_eigenvectors(top, 1, eigh_plan=eigh_plan, column_extent=column_extent,
-                                                 multiplet_tol=tol, real_rows=real)
+                                                 multiplet_tol=tol, real_rows=spectral_rows)
     _, spectrum = distrib_la.leading_eigenvectors(perp, m, eigh_plan=eigh_plan, column_extent=column_extent,
-                                                  multiplet_tol=tol, real_rows=real)
+                                                  multiplet_tol=tol, real_rows=spectral_rows)
     counts = tuple(int(np.sum(np.asarray(values) > float(cutoff) ** 2 * float(np.asarray(t)[0])))
                    if i < real else 0 for i, (values, t) in enumerate(zip(spectrum, largest)))
     if max(counts) == 0:
         return None, None
     directions, kept = distrib_la.leading_eigenvectors(perp, counts, eigh_plan=eigh_plan, column_extent=column_extent,
-                                                       multiplet_tol=tol, real_rows=real)
+                                                       multiplet_tol=tol, real_rows=spectral_rows)
     return directions, tuple(int(np.asarray(v).size) for v in kept)
 
 
