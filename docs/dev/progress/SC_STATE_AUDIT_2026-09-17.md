@@ -2,6 +2,37 @@
 
 Source inspected: main a559896f4, SCMETAL97cb2f026 and sector integration7ef88f39d. This audit accompanies874d6c044 on branch audit/shared-pole-takeover-2026-09-17; it is not a completed SC validation.
 
+## Integration update
+
+The original density audit below left a real defect open. Candidate
+`c17bb176`, integrated with placement follow-ups through `d6a204dc`, now
+uses the canonical full-band occupation table for density/current. On Fe,
+the full ladder is 35 physical bands (carrier 36), while the active QP
+Hamiltonian is 26 bands (sweep carrier 28). Density uses the full ladder
+and the active rotation embedded with an inactive identity; Hartree matrix
+elements are returned on the logical 26-band target. These are different
+physical spaces, not interchangeable band counts.
+
+Run477/36, P4 job `58489223.8`, completed all four sector Sigma sweeps
+and reached the later scissor-frontier refusal. Source control flow places
+the full-density Hartree rebuild and finite, logical-shape Hamiltonian
+addition before that refusal. This establishes passage through those
+boundaries, not independent Hartree accuracy or a completed SC map.
+The ±5 eV window excluded crossing bands 9–10 and 19–20. Fresh Run477/37,
+job `58496217.0`, uses ±12 eV and authenticates protected bands 9–20 at
+every k. Its multi-map outcome is pending; no convergence is claimed.
+
+Exact same-operator mirror samples have separately passed all 13 Fe CC
+parents (claim2454). The full CC/TT/CT stores and four production Sigma
+sweeps are established by claim2456. The next-map source review finds fresh
+occupations, rotated bundles, samples and models for each input Hamiltonian;
+only the prescribed initial photon contact is retained. Runtime receipts
+across completed maps remain necessary. Head-off is the authorized campaign
+diagnostic scope, not a production head or physical-convergence certificate.
+
+The following table records the earlier audit; its density and remaining
+implementation entries are superseded by this update.
+
 | Object | Current owner/lifetime | Audit result |
 |---|---|---|
 | QP eigensystem | sc_iteration.gw_iteration_map, every map call | Initial canonical DFT identity bypass is intentional; later H is diagonalized. U/E are unfolded through the one k-star owner. |
