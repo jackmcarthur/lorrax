@@ -592,7 +592,7 @@ def _get_chi_fractional_contour_kernel_face(
     if vertex:
         # Four photon faces stay x/y tiled; exchange only bounded band panels
         # for the singleton-spin Green product, whose result stays x/y tiled.
-        g_plan = partial(panel_matmul, mesh=mesh_xy, panel_bytes=16 << 20)
+        g_plan = partial(panel_matmul, mesh=mesh_xy, panel_bytes=32 << 20)
     else:
         g_plan = gemm_plan(mesh_xy, m=n_rmu * green_spin, k=nb_full, n=n_rmu * green_spin,
                            nq=nk_shape, dtype=jnp.complex128, layout=layout)
