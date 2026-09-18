@@ -308,9 +308,11 @@ def instantaneous_sector_sigma(handle, families, bases, meta, mesh_xy, *, occupa
         left,right=(families[i].green_parent for i in (a,b))
         q=left.plan.n_parent;m=left.plan.n_centroid_packed*left.plan.nspinor
         n=right.plan.n_centroid_packed*right.plan.nspinor;k=left.psi_nmu.shape[1]
-        bs=families[a].slices.nb_sigma
+        # The static face projector contracts O @ psi_right, then
+        # psi_left† @ T, both over the padded carrier (k), before the
+        # final logical-band slice. Query those actual GEMM shapes.
         native=_native_workspace(mesh_xy,(((q,m,k),(q,k,n)),
-            ((q,bs,m),(q,m,n)),((q,bs,n),(q,n,bs))))
+            ((q,m,n),(q,n,k)),((q,k,m),(q,m,k))))
         _admit_compiled(kernel,args,meta,f'sigma.sector.constant.{key}',
                         native=native,resident=amount)
     total=None
