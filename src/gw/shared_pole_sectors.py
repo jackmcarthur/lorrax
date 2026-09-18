@@ -489,7 +489,9 @@ def construct_cross_sector_round(sectors, samples, moments, meta, config, *,
         else:
             compact=jax.jit(shard_map(compact,mesh=mesh_xy,in_specs=(spec,spec),out_specs=(spec,spec),check_vma=False))
         y,signed=compact(sector['coefficients'],sector['signed'])
-        put=(lambda a:jax.device_put(a,NamedSharding(mesh_xy,P()))) if execution=='face' else (lambda a:_batch_put(mesh_xy,a))
+        # Host role coordinates/order are replicated metadata, not matrices.
+        put=(lambda a:jax.make_array_from_callback(a.shape,NamedSharding(mesh_xy,P()),
+                                                   lambda index:a[index])) if execution=='face' else (lambda a:_batch_put(mesh_xy,a))
         packed.append((put(sector['tables']['points']),
             put(sector['tables']['order']),
             (tuple(s[1] for s in sector['states']),tuple(s[2] for s in sector['states'])),
