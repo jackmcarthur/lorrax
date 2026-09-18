@@ -849,7 +849,8 @@ def read_shared_pole_matrix(io, q_span, *, meta, header):
             jnp.where(active, poles, 1.0), counts)
 
 
-def read_shared_pole_faces(io, q_span, *, meta, header, column_span=None, basis=None):
+def read_shared_pole_faces(io, q_span, *, meta, header, column_span=None, basis=None,
+                           orientations=("x", "y")):
     """Read canonical row faces and pack once at the I/O boundary.
 
     Returns b_X, b_Y, poles2, K with shapes (b,mu_p,spin,Kcap),
@@ -857,7 +858,14 @@ def read_shared_pole_faces(io, q_span, *, meta, header, column_span=None, basis=
     and P(None,'y',None,'x'); poles and int64 counts are replicated. K is
     the active count *within the returned column slice*, so every consumer
     can mask with arange(Kcap)<K even when column_span starts above zero.
+    ``orientations`` may select one face when an ordered endpoint consumer
+    needs only that orientation. The unrequested tuple slot is ``None``;
+    the default preserves the original two-face contract.
     """
+    orientations = tuple(orientations)
+    if not orientations or len(set(orientations)) != len(orientations) or any(
+            axis not in ("x", "y") for axis in orientations):
+        _refuse(f"face orientations must be a nonempty subset of ('x','y'); got {orientations}")
     if header.get("validation_receipt", {}).get("status") == "NOT_MEASURED":
         _refuse("metadata-only validation cannot authorize tensor reads")
     if header["schema"] != SCHEMA or not header["finalized"]:
@@ -872,40 +880,48 @@ def read_shared_pole_faces(io, q_span, *, meta, header, column_span=None, basis=
     if header["Kmax"] == 0 and column_span is None:
         _admit(ledger,"empty_faces",8*(hi-lo))
         shape = (hi-lo,basis.n_packed,components,0)
-        faces = [jax.jit(lambda: jnp.zeros(shape,jnp.complex128),
-                         out_shardings=NamedSharding(io.mesh,P(None,axis,None,"y" if axis == "x" else "x")))()
-                 for axis in ("x","y")]
-        return (*faces,jnp.ones((hi-lo,0),jnp.float64),jnp.zeros(hi-lo,jnp.int64))
+        faces = {axis: jax.jit(lambda: jnp.zeros(shape,jnp.complex128),
+                              out_shardings=NamedSharding(io.mesh,P(None,axis,None,"y" if axis == "x" else "x")))()
+                 for axis in orientations}
+        return (faces.get("x"), faces.get("y"), jnp.ones((hi-lo,0),jnp.float64),
+                jnp.zeros(hi-lo,jnp.int64))
     c0, c1 = _span(column_span or (0,header["Kmax"]), header["Kmax"], "column_span")
-    # Both orientations share one padded pole extent; counts exclude padding.
+    # Selected orientations share one padded pole extent; counts exclude padding.
     multiple = combined_divisor(io.mesh.shape["x"], io.mesh.shape["y"])
     width = round_up(c1-c0, multiple)
-    totals = []
-    for axis in ("x","y"):
+    totals = {}
+    for axis in orientations:
         shape = (hi-lo,basis.n_canonical,components,width)
-        totals.append(_conversion_bytes(basis,shape,P(None,axis,None,"y" if axis == "x" else "x"),unpack=False))
-    ax,fx,tx = totals[0]; ay,fy,ty = totals[1]
+        totals[axis] = _conversion_bytes(
+            basis,shape,P(None,axis,None,"y" if axis == "x" else "x"),unpack=False)
     metadata = 32*(hi-lo)*width+8*(hi-lo)
-    peak = max(ax+fx+tx, 2*fx, fx+ay+fy+ty, fx+2*fy)
-    _admit(ledger,"read_faces",fx+fy+metadata,max(0,peak-fx-fy),
-           device_panel=max(ax,ay,8*(hi-lo)*width),native_host=True,io=io)
+    resident = sum(totals[axis][1] for axis in orientations)
+    held = 0
+    peak = 0
+    for axis in orientations:
+        raw, packed, temporary = totals[axis]
+        peak = max(peak, held+raw+packed+temporary, held+2*packed)
+        held += packed
+    _admit(ledger,"read_faces",resident+metadata,max(0,peak-resident),
+           device_panel=max(*(totals[axis][0] for axis in orientations),
+                            8*(hi-lo)*width),native_host=True,io=io)
     counts = jnp.asarray(np.clip(np.asarray(header["K"][lo:hi])-c0,0,c1-c0), dtype=jnp.int64)
     active = jnp.arange(width)[None,:] < counts[:,None]
-    faces = []
-    for axis in ("x", "y"):
+    faces = {}
+    for axis in orientations:
         spec = P(None,axis,None,"y" if axis == "x" else "x")
         b = io.read_slab("factor", shape=(hi-lo,basis.n_canonical,components,width),
                          offset=(lo,0,0,c0), valid_shape=(hi-lo,basis.n_logical,components,c1-c0),
                          partition_spec=spec)
         b = basis.pack_axis(b, 1, spec=spec)
-        faces.append(jnp.where(active[:,None,None,:] & jnp.asarray(
-            basis.active_mask)[None,:,None,None], b, 0.0))
+        faces[axis] = jnp.where(active[:,None,None,:] & jnp.asarray(
+            basis.active_mask)[None,:,None,None], b, 0.0)
         # Complete masking before allocating the other face: Python reference
         # release alone does not end an asynchronously dispatched input lifetime.
-        faces[-1].block_until_ready()
+        faces[axis].block_until_ready()
         del b
     poles = io.read_slab("poles2_ry2", shape=(hi-lo,width), offset=(lo,c0), valid_shape=(hi-lo,c1-c0), partition_spec=P())
-    return (*faces, jnp.where(active,poles,1.0), counts)
+    return (faces.get("x"), faces.get("y"), jnp.where(active,poles,1.0), counts)
 
 
 def read_shared_pole_cross_faces(readers, q_span, *, meta, headers, bases,

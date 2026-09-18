@@ -41,6 +41,12 @@ parent/pole panels. Factor faces and every large Green or interaction matrix
 retain both processor axes. With centroid and pole ranks proportional to system
 size, the contractions remain cubic; there is no production state/pole-pair
 sum. Endpoint routing is bounded by its symmetry service cost receipt.
+The store's face selector reads each diagonal sector's two orientations once;
+an ordered mixed sector reads only its left-X and right-Y faces. Thus each
+active parent/pole panel makes two factor hyperslab reads instead of four,
+while CT/TC still compare the two independently stored pole arrays bitwise.
+The store admission prices the orientations actually requested. This changes
+factor I/O and its live face count, not the quadrature or contraction.
 
 The constant path retains a whole all-P photon bank, then its all-P packed
 replacement. Both copies and packing workspace are admitted together. Kernel

@@ -207,24 +207,38 @@ def sector_synthesis(readers, headers, bases, families, frequencies, meta, mesh_
                 stop=min(start+width,kmax)
                 selected=np.clip(intervals[parent:parent+1]-start,0,stop-start)
                 if not np.any(selected[:,1]>selected[:,0]):continue
-                faces=[]
-                for reader,h,b in zip(readers,headers,bases):
-                    faces.append(read_shared_pole_faces(reader,(parent,parent+1),meta=meta,
-                        header=h,basis=b,column_span=(start,stop)))
-                if not bool(jnp.all(faces[0][2]==faces[1][2])):
+                if readers[0] is readers[1] and headers[0] is headers[1]:
+                    # A diagonal sector owns one store and needs both
+                    # orientations of the same factor. Read it once.
+                    left_faces=read_shared_pole_faces(
+                        readers[0],(parent,parent+1),meta=meta,header=headers[0],
+                        basis=bases[0],column_span=(start,stop))
+                    right_faces=left_faces
+                else:
+                    # An ordered mixed sector consumes only left-X/right-Y.
+                    # The store owns face placement and admission; requesting
+                    # one orientation avoids an unused collective slab read.
+                    left_faces=read_shared_pole_faces(
+                        readers[0],(parent,parent+1),meta=meta,header=headers[0],
+                        basis=bases[0],column_span=(start,stop),orientations=('x',))
+                    right_faces=read_shared_pole_faces(
+                        readers[1],(parent,parent+1),meta=meta,header=headers[1],
+                        basis=bases[1],column_span=(start,stop),orientations=('y',))
+                if left_faces is not right_faces and not bool(
+                        jnp.all(left_faces[2]==right_faces[2])):
                     raise ValueError('GATE shared_pole_sector_census: unequal pole values')
                 # Reader may pad the final chunk more narrowly than the full
                 # panel. Pad through the common padding owner to fixed K.
-                x,y=faces[0][0],faces[1][1]
+                x,y=left_faces[0],right_faces[1]
                 # Every stored Kmax is mesh-padded; final width gets its own
                 # GEMM shape by selecting a fixed full-size padded face below.
                 x=jnp.pad(x,((0,0),(0,0),(0,0),(0,width-x.shape[-1])))
                 y=jnp.pad(y,((0,0),(0,0),(0,0),(0,width-y.shape[-1])))
-                poles=jnp.pad(faces[0][2],((0,0),(0,width-faces[0][2].shape[-1])),constant_values=1)
+                poles=jnp.pad(left_faces[2],((0,0),(0,width-left_faces[2].shape[-1])),constant_values=1)
                 value=kernel(x,y,poles,jnp.asarray(selected),ref,time,space=='val')
                 total=add(total,jnp.asarray(rows),value)
                 total.block_until_ready()
-                del faces,x,y,poles,value
+                del left_faces,right_faces,x,y,poles,value
         if space=='val':total=total[minus]
         # mu-major/component-minor -> one bounded stack of Lorentz tiles.
         return jnp.transpose(total.reshape(nk,m,nc,n,nt),(2,4,0,1,3)).reshape(nc*nt,nk,m,n)
