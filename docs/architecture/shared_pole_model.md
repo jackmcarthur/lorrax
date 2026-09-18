@@ -401,3 +401,31 @@ refuses before execution. Donated output/alias6,144B; relative output
 difference0. Optimized HLO Green[8,4,8,4,8] tiles global[8,4,16,4,16] onP4.
 This proves the bounded admission path and tile geometry, not the native
 custom-call interiors, endpoint preparation peak or a material peak decrease.
+
+### Photon spin-trace storage at the SC map boundary
+
+The photon contour producer (`w_isdf._get_chi_fractional_contour_kernel_face`)
+now evaluates its exact spin trace in a fixed scan over all `(a,b)` pairs.
+Each pair uses the existing `build_G_tau`, planned GEMM and FFT owners on
+singleton-spin endpoint slices; both centroid axes remain on the full XY
+mesh. The scalar-spin correlation is accumulated before the existing q
+transform and support projection. Retarded, ordered Laplace and static KMS
+use this same correlation owner. No spin component, support or occupation
+is dropped. Scalar response retains its existing full-spin path.
+
+Run477/41 job58496217.3 failed at map1's first exact-moment correlation,
+requesting13,087,015,424B: three full-spin Green tiles plus512B for Fe's
+nk64,ns4,nmu1032,P4. The repair removes that large single temporary arena.
+The precise ambient native/BFC residency at the failed map boundary has not
+been established; this is not a claim that a previous SC result leaked.
+
+Focused P4 acceptance58496217.5, sandbox claim2467, compares the same
+synthetic operands with frozen full-spin source7a97f104. Moment, retarded,
+Laplace and KMS agree within3.71e-16. On Fe-shaped geometry, compiled
+XLA temporaries fall13,087,033,616→1,223,784,712B; one warmed correlation
+cost rises0.2191→0.3416s. The fixed scan trades launch overhead for bounded
+storage. This one-correlation result does not certify full-bank runtime,
+whole-map peak or hidden native workspace. Optimized HLO shows component
+Green[64,1,516,1,516] per P4 rank, replacing[64,4,516,4,516]; native GEMM
+metadata retains global1032×1032 and local516×516. No new backend or
+runtime fallback is involved.
