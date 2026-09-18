@@ -1,7 +1,7 @@
 """Physical signed photon bank through the public sector constructor/store seam."""
 
 
-def check_sector_constructor(mesh, root):
+def check_sector_constructor(mesh, root, *, linalg="local", parents=16, return_observables=False):
     from types import SimpleNamespace
     import os
     import numpy as np
@@ -18,7 +18,7 @@ def check_sector_constructor(mesh, root):
     from file_io import shared_pole_store as store
     from file_io.slab_io import SlabIO
 
-    run=root/f"constructor_{os.environ['SLURM_STEP_ID']}"
+    run=root/f"constructor_{os.environ['SLURM_STEP_ID']}_{linalg}"
     rank0_transaction(run,stage='plant.directory',write=lambda:run.mkdir())
     rotation=np.eye(3,dtype=np.int32)[None]
     sym=SimpleNamespace(sym_matrices=rotation,translations=np.zeros((1,3)),
@@ -28,7 +28,7 @@ def check_sector_constructor(mesh, root):
                                     np.zeros((len(rows),3)),np.zeros(len(rows),bool))
     sym.spinor_action=lambda rows,nspinor:np.ones((len(rows),1,1),complex)
     sym.cartesian_action=lambda rows,axial,time_odd:np.repeat(rotation,len(rows),axis=0)
-    nc,nt,nq=32,4,16
+    nc,nt,nq=32,4,parents
     fft=(32,1,1)
     coordinates=np.column_stack((np.arange(nc),np.zeros((nc,2),int))).astype(np.int32)
     bases=tuple(PackedCentroidBasis.build(coordinates[:n],sym,fft,mesh) for n in (nc,nt))
@@ -108,7 +108,7 @@ def check_sector_constructor(mesh, root):
         dWc_mirror_ds=packed([a[1] for a in mirrors],True),
         constant=packed(u-v),**{f'M{k}':packed(m) for k,m in enumerate(moments)},
         meta=meta,expected_identity=identity,mesh_xy=mesh)
-    result=construct_sector_poles(bank,meta,SimpleNamespace(backend=SimpleNamespace(linalg='local')),
+    result=construct_sector_poles(bank,meta,SimpleNamespace(backend=SimpleNamespace(linalg=linalg)),
                                   mesh_xy=mesh,output=str(run/'model.h5'))
     handle=result['handle']
     manifest=store.validate_shared_pole_sector_manifest(handle['path'],expected_identity=identity,
@@ -121,7 +121,7 @@ def check_sector_constructor(mesh, root):
             b,_,poles,k=store.read_shared_pole_faces(io,(0,1),meta=meta,header=headers[sector],basis=bases[family])
         # Tiny oracle only: production never gathers a factor panel.
         factors[sector]=(gather_to_host(b)[0].reshape((-1,b.shape[-1])),np.asarray(poles)[0],int(np.asarray(k)[0]))
-    errors={}
+    errors={};observables={}
     for name,left,right,sl,sr in (('CC','CC','CC',slice(0,nc),slice(0,nc)),
             ('TT','TT','TT',slice(nc,None),slice(nc,None)),
             ('CT','CT_C','CT_T',slice(0,nc),slice(nc,None))):
@@ -131,6 +131,7 @@ def check_sector_constructor(mesh, root):
         got=(bl[:,:k]/(2*omega*(z-omega)))@br[:,:k].conj().T
         got-=(bl[:,:k].conj()/(2*omega*(z+omega)))@br[:,:k].T
         exact=value(z)[0][sl,sr]
+        observables[name]=got
         errors[name]=float(np.linalg.norm(got-exact)/np.linalg.norm(exact))
         assert errors[name]<1e-7,(name,errors[name])
     # Endpoint-weight asymmetry: one low pole violates only the current
@@ -145,8 +146,9 @@ def check_sector_constructor(mesh, root):
     assert not bool(jnp.any(zero['current']['zero_policy']))
     assert not bool(jnp.any(zero['zero_policy']))
     assert bool(jnp.all(pair[0][1]==pair[1][1])) and bool(jnp.all(pair[0][2]==pair[1][2]))
-    return dict(name='production_sector_constructor_manifest',held_W_relative=errors,
-                parents=nq,manifest=handle['path'],asymmetric_endpoint_loss_refused=True)
+    receipt=dict(name='production_sector_constructor_manifest',held_W_relative=errors,
+                 parents=nq,manifest=handle['path'],linalg=linalg,asymmetric_endpoint_loss_refused=True)
+    return (receipt,observables) if return_observables else receipt
 
 
 def main():
