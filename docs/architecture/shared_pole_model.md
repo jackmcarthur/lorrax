@@ -450,3 +450,11 @@ batch, n, nrhs, mesh/block geometry and dtype, summing both device workspaces
 and pivots and reporting host workspace separately. No alternate backend
 is needed. Until then the receipt must retain its native-workspace unknown
 status; FFT custom-call scratch likewise must not be inferred as zero.
+
+Scoped acceptance of the producer memory block: P4 job58495709.1,
+Run477/38, sourceae2cabe1, sandbox claim2457. Actual photon stream compiled
+temporaries476,768B plus arguments73,344B admit550,112B/rank; budget550,111B
+refuses before execution. Donated output/alias6,144B; relative output
+difference0. Optimized HLO Green[8,4,8,4,8] tiles global[8,4,16,4,16] onP4.
+This proves the bounded admission path and tile geometry, not the native
+custom-call interiors, endpoint preparation peak or a material peak decrease.
