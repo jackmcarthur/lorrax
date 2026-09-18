@@ -74,16 +74,21 @@ def check(mesh, root, layout):
     identity={key:'planted-'+key for key in store._IDENTITY_KEYS}
     recipe=dict(version='shared_real_pole_v1_r3b',gate_version='shared_real_pole_gates_v1_r3b')
     factors={}; poles={}; models={}
-    for name,which,om in (('CC',0,[1.0,1.4]),('TT',1,[1.2,1.6]),
-                         ('CT_C',0,[1.1,1.5]),('CT_T',1,[1.1,1.5])):
+    # CC tiles the 2x2 mesh; TT and CT deliberately have odd physical K.
+    for name,which,om in (('CC',0,[1.0,1.4]),('TT',1,[1.2,1.6,2.0]),
+                         ('CT_C',0,[1.1,1.5,1.9]),('CT_T',1,[1.1,1.5,1.9])):
         nc=3 if which else 1;mu=bases[which].n_logical
-        factor=.2*(rng.normal(size=(nk,mu,nc,2))+1j*rng.normal(size=(nk,mu,nc,2)))
+        count=len(om)
+        factor=.2*(rng.normal(size=(nk,mu,nc,count))+1j*rng.normal(size=(nk,mu,nc,count)))
         # q-specific pole offsets discriminate the ordered -q pole census.
-        p=np.broadcast_to(om,(nk,2))+np.arange(nk)[:,None]*.02
+        p=np.broadcast_to(om,(nk,count))+np.arange(nk)[:,None]*.02
+        carrier=(count+1)//2*2
+        stored_factor=np.pad(factor,((0,0),(0,0),(0,0),(0,carrier-count)))
+        stored_p=np.pad(p*p,((0,0),(0,carrier-count)),constant_values=1.0)
         path=root/f'{name}.h5'
         header=store.write_shared_pole_model(path,
-            put(bases[which].pack_host(factor,axis=1),P(None,'x',None,'y')),
-            put(p*p),np.full(nk,2,np.int64),q_span=(0,nk),meta=meta,
+            put(bases[which].pack_host(stored_factor,axis=1),P(None,'x',None,'y')),
+            put(stored_p),np.full(nk,count,np.int64),q_span=(0,nk),meta=meta,
             tables=tables[which],recipe=recipe,receipts=dict(identity=identity),
             sector=name,ordered=True,basis=bases[which])
         models[name]=(path,header);factors[name]=factor;poles[name]=p

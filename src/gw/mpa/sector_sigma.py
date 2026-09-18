@@ -18,7 +18,7 @@ import numpy as np
 from jax.sharding import NamedSharding, PartitionSpec as P
 
 from common.gamma_matrices import gamma_perm_phase
-from runtime.padding import pad_to_axis
+from runtime.padding import pad_to_axis, padded_axis
 from gw.ppm_tau_kernel import get_shared_sigma_tau_kernel
 from gw.wavefunction_bundle import parent_sigma_operands, sigma_face_kernel_kwargs
 
@@ -165,11 +165,16 @@ def sector_synthesis(readers, headers, bases, families, frequencies, meta, mesh_
         empty.ordered=True
         empty.close=lambda _result=None:None
         return empty
+    # The store reader pads physical Kmax for both endpoint face shardings.
+    # Keep that carrier through unfolding and GEMM; K and the interval bounds
+    # remain physical, so the padded pole columns have identically zero weight.
+    kcarrier=padded_axis(kmax,mesh_xy,name='sector_sigma_K',specs=(
+        (P(None,'x',None,'y'),3),(P(None,'y',None,'x'),3))).carrier
     rows=np.arange(nk,dtype=np.int32)
     routes=[];costs=[]
     for h,b,f,axis in zip(headers,bases,families,('x','y')):
         route,cost=_endpoint_route(h,b,f.green_parent.plan.sym,(0,nq),rows,
-                                   mesh_xy,axis,kmax)
+                                   mesh_xy,axis,kcarrier)
         routes.append(route);costs.append(cost)
     # A face input is required by the established symmetry route. After it
     # completes, keep only the configured GEMM input layout across all tau.
@@ -178,13 +183,13 @@ def sector_synthesis(readers, headers, bases, families, frequencies, meta, mesh_
     def place(value,spec):
         return jax.jit(lambda x:x,out_shardings=NamedSharding(mesh_xy,spec))(value)
     px,py=int(mesh_xy.shape['x']),int(mesh_xy.shape['y'])
-    face_bytes=16*nq*kmax*(m*nc+n*nt)//mesh_xy.size
+    face_bytes=16*nq*kcarrier*(m*nc+n*nt)//mesh_xy.size
     # Each factor has one centroid axis. Pole columns divide over the other
     # mesh axis only in low_mem_bands face layout.
-    resident_bytes=16*nk*((m//px)*nc*(kmax//py if layout=='face' else kmax)
-                          +(n//py)*nt*(kmax//px if layout=='face' else kmax))
-    resident_bytes+=8*nk*kmax+16*nk*m*nc*n*nt//mesh_xy.size
-    native=_native_workspace(mesh_xy,(((nk,m*nc,kmax),(nk,kmax,n*nt)),))
+    resident_bytes=16*nk*((m//px)*nc*(kcarrier//py if layout=='face' else kcarrier)
+                          +(n//py)*nt*(kcarrier//px if layout=='face' else kcarrier))
+    resident_bytes+=8*nk*kcarrier+16*nk*m*nc*n*nt//mesh_xy.size
+    native=_native_workspace(mesh_xy,(((nk,m*nc,kcarrier),(nk,kcarrier,n*nt)),))
     setup=f'sigma.sector.setup.{tag}'
     resident=f'sigma.sector.resident.{tag}'
     capacity.reserve(setup,resident_bytes_per_rank=resident_bytes+2*face_bytes,
@@ -221,7 +226,7 @@ def sector_synthesis(readers, headers, bases, families, frequencies, meta, mesh_
         capacity.live_stages=ambient
         raise
     try:
-        gemm=gemm_plan(mesh_xy,m=m*nc,n=n*nt,k=kmax,nq=nk,
+        gemm=gemm_plan(mesh_xy,m=m*nc,n=n*nt,k=kcarrier,nq=nk,
                        dtype=np.complex128,layout=layout)
         minus=jnp.asarray(q_negation_index(tuple(left['grid'])))
         @partial(jax.jit,static_argnums=(6,))
@@ -235,9 +240,9 @@ def sector_synthesis(readers, headers, bases, families, frequencies, meta, mesh_
             return _shared_pole_contract(x,y,weights,gemm=gemm,layout=layout)
         def abstract(shape,dtype,spec=P()):
             return jax.ShapeDtypeStruct(shape,dtype,sharding=NamedSharding(mesh_xy,spec))
-        args=(abstract((nk,m,nc,kmax),np.complex128,factor_spec[0]),
-              abstract((nk,n,nt,kmax),np.complex128,factor_spec[1]),
-              abstract((nk,kmax),np.float64),abstract((nk,2),np.int32),
+        args=(abstract((nk,m,nc,kcarrier),np.complex128,factor_spec[0]),
+              abstract((nk,n,nt,kcarrier),np.complex128,factor_spec[1]),
+              abstract((nk,kcarrier),np.float64),abstract((nk,2),np.int32),
               abstract((),np.float64),abstract((),np.complex128))
         for hole in (False,True):
             _admit_compiled(kernel,(*args,hole),meta,f'sigma.sector.compiled.{tag}.{hole}',native=native)
