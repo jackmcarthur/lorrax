@@ -53,8 +53,9 @@ def main():
         for case in cases:
             mode='retarded' if case in ('moment','retarded') else case
             times=np.array([0.]) if case=='moment' else np.array([.1,.3,.5])
-            nout=4 if case=='laplace_ordered' else 1
-            projection=np.arange(1,nout*len(times)+1,dtype=float).reshape(nout,-1)*(.1+.2j)
+            nout=2 if case=='laplace_ordered' else 1
+            projection_rows=2*nout if case=='laplace_ordered' else nout
+            projection=np.arange(1,projection_rows*len(times)+1,dtype=float).reshape(projection_rows,-1)*(.1+.2j)
             lower=f;upper=-1j*(1-f) if case=='moment' else 1-f
             ref=np.array(0.)
             if case=='laplace_ordered':
