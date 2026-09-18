@@ -11,10 +11,10 @@ import jax
 import jax.numpy as jnp
 from distrib_la import (diagonal_like, face_sharding, hermitian_part,
                         join_columns, on_face)
-from gw.shared_pole_pencil import _adjoint
+from gw.shared_pole_pencil import _adjoint, _matrix_layout
 
 
-def _metric_inverse_root(metric, *, matmul, tolerance):
+def _metric_inverse_root(metric, *, matmul, tolerance, matrix_sharding=None):
     """Correct a dimensionless Hermitian metric by coupled Newton–Schulz.
 
     ``metric`` is [b,R,R], complex128 in the caller's face layout. Products
@@ -25,7 +25,7 @@ def _metric_inverse_root(metric, *, matmul, tolerance):
     that initial bound, never from an on-device residual convergence test.
     The returned diagnostics include the measured ZAZ-I residual and guard.
     """
-    identity = diagonal_like(jnp.ones(metric.shape[:1] + metric.shape[-1:]), metric)
+    identity = _matrix_layout(diagonal_like(jnp.ones(metric.shape[:1] + metric.shape[-1:]), metric), matrix_sharding)
     radius = jnp.max(jnp.sum(jnp.abs(identity - metric), axis=-1), axis=-1)
     valid = jnp.isfinite(radius) & (radius < 1)
     if not isinstance(radius, jax.core.Tracer) and not bool(jnp.all(valid)):
@@ -193,7 +193,7 @@ def _restricted_block(ww, wv, vv):
 
 
 def reduce_ordered_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, gates, keep_budget=None,
-                                     retain_span=False):
+                                     retain_span=False, matrix_sharding=None):
     """Paired-basis Ritz reduction of the particle-hole pencil.
 
     ``pencil=(G,H,O,z)`` from ``assemble_ordered_shared_pole_pencil`` over paired
@@ -246,6 +246,9 @@ def reduce_ordered_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, g
     h_ww, h_wv, h_vv = on_face(_paired_member, members, h, inverse, **statics)
     o_w, o_v = on_face(_paired_output, None if output_face is None else (output_face,) * 2,
                        output, inverse, **statics)
+    g_ww, g_wv, g_vv, h_ww, h_wv, h_vv, o_w, o_v = (
+        _matrix_layout(a, matrix_sharding) for a in
+        (g_ww, g_wv, g_vv, h_ww, h_wv, h_vv, o_w, o_v))
     active = jnp.concatenate((live_f, active_columns[:, finite:finite + n_inf]), axis=-1)
     diagonal = jnp.real(jnp.diagonal(h_vv, axis1=-2, axis2=-1))
     diagonal_ok = jnp.all(jnp.where(active, jnp.isfinite(diagonal) & (diagonal > 0), diagonal == 0), axis=-1)
@@ -266,7 +269,7 @@ def reduce_ordered_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, g
     null_identity = diagonal_like(~keep, h_vv)
     correction, metric_ok, metric_diagnostics = _metric_inverse_root(
         hermitian_part(metric) + null_identity, matmul=matmul,
-        tolerance=gates["retained_subspace_moments"]["threshold"])
+        tolerance=gates["retained_subspace_moments"]["threshold"], matrix_sharding=matrix_sharding)
     del null_identity
     z = matmul(z, correction) * keep[:, None, :]
     del correction
@@ -282,11 +285,11 @@ def reduce_ordered_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, g
     # t_s the even route's Z^H H_s Z; once time reversal is broken the halves mix and a
     # w combination can lie in span(v), so a second relative keep cut on H_r removes
     # exactly those redundant combinations before the H-metric Ritz step.
-    h_r = on_face(_restricted_block, face, project(z, h_ww), project(z, h_wv), metric)
+    h_r = _matrix_layout(on_face(_restricted_block, face, project(z, h_ww), project(z, h_wv), metric), matrix_sharding)
     del h_ww, h_wv, metric
-    g_r = on_face(_restricted_block, face, project(z, g_ww), project(z, g_wv), project(z, g_vv))
+    g_r = _matrix_layout(on_face(_restricted_block, face, project(z, g_ww), project(z, g_wv), project(z, g_vv)), matrix_sharding)
     del g_ww, g_wv, g_vv
-    o_r = join_columns(matmul(o_w, z), matmul(o_v, z))
+    o_r = _matrix_layout(join_columns(matmul(o_w, z), matmul(o_v, z)), matrix_sharding)
     if retain_span:
         paired_span = scale[:, :, None] * z
     del o_w, o_v, z
@@ -302,7 +305,7 @@ def reduce_ordered_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, g
     # The restricted sources are released before the second metric correction.
     del null_r, h_r
     correction_r, metric_r_ok, paired_metric_diagnostics = _metric_inverse_root(
-        metric_r, matmul=matmul, tolerance=gates["retained_subspace_moments"]["threshold"])
+        metric_r, matmul=matmul, tolerance=gates["retained_subspace_moments"]["threshold"], matrix_sharding=matrix_sharding)
     del metric_r
     y = matmul(y, correction_r) * keep_r[:, None, :]
     del correction_r
@@ -319,6 +322,7 @@ def reduce_ordered_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, g
             .5 * span_w[:, :half] + inverse[:, :, None] * span_v[:, :half],
             .5 * span_w[:, :half] - inverse[:, :, None] * span_v[:, :half],
             span_v[:, half:], span_w[:, half:]), axis=-2)
+        coefficients = _matrix_layout(coefficients, matrix_sharding)
     del o_r, y, rotation
     cut = gates["normalized_gram_keep"]["threshold"] * jnp.max(jnp.abs(mu), axis=-1)
     retained = jnp.abs(mu) > cut[:, None]
