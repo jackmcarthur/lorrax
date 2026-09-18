@@ -2033,10 +2033,10 @@ def _rotate_to_dft_basis(O_qp: jax.Array, U: jax.Array, *,
 # meaningful.
 
 _PSI_G_CACHE: dict = {}
-_HARTREE_DENSITY_EMBED_CACHE: dict = {}
 
 
-def _hartree_density_rotation(U_active, *, nb_full: int, mesh_xy: Mesh):
+@_functools.lru_cache(maxsize=None)
+def _hartree_density_embed_kernel(mesh_xy: Mesh, nb_full: int):
     """Place blockdiag(active U, inactive I) directly on the full XY mesh.
 
     The canonical embedding helper builds an eye before its final sharding
@@ -2044,18 +2044,14 @@ def _hartree_density_rotation(U_active, *, nb_full: int, mesh_xy: Mesh):
     eye and the sharded output share one compiled placement boundary;
     there is no Python-eager eye array between them.
     """
-    key = (id(mesh_xy), int(nb_full))
-    kernel = _HARTREE_DENSITY_EMBED_CACHE.get(key)
-    if kernel is None:
-        from .wavefunction_bundle import _face_embed_active_U
+    from .wavefunction_bundle import _face_embed_active_U
 
-        @jax.jit(out_shardings=NamedSharding(mesh_xy, P(None, 'x', 'y')))
-        def kernel(active):
-            return _face_embed_active_U(
-                active, nb_full=nb_full, a_lo=0, mesh_xy=mesh_xy)
+    @jax.jit(out_shardings=NamedSharding(mesh_xy, P(None, 'x', 'y')))
+    def kernel(active):
+        return _face_embed_active_U(
+            active, nb_full=nb_full, a_lo=0, mesh_xy=mesh_xy)
 
-        _HARTREE_DENSITY_EMBED_CACHE[key] = kernel
-    return kernel(U_active)
+    return kernel
 
 
 def _dft_psi_sphere(inputs, *, full_density: bool = False):
@@ -2242,8 +2238,8 @@ def rebuild_hartree_dft_basis(inputs, U_qp, occupations_full,
         raise ValueError(
             f'SC exact Hartree active rotation must be {nb_logical} square; '
             f'got {U_qp.shape[-2:]}')
-    U_density = _hartree_density_rotation(
-        U_qp, nb_full=full_band_axis.carrier, mesh_xy=inputs.mesh_xy)
+    U_density = _hartree_density_embed_kernel(
+        inputs.mesh_xy, full_band_axis.carrier)(U_qp)
     inputs.print_fn(
         f'    V_H rebuild: current-map full-band occupations, '
         f'mu={float(efermi_ry) * RYD_TO_EV:.8f} eV')
