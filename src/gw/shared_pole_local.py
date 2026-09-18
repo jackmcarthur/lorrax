@@ -234,6 +234,48 @@ def reduce_round(states, infinity, tables, *, real, mesh_xy, native_eigh, ordere
                    tuple(st[3] for st in states), tuple(infinity))
 
 
+def solve_parent_pencil(points, q, o, d, infinity, active, *, eigh, matmul,
+                        gates, ordered, odd_moments, keep_budget, retain_span=False):
+    """One equation owner for local and whole-mesh parent execution.
+
+    Inputs carry one or more independent parents. Execution adapters supply
+    service/local products and eigensolve; this function owns the pencil,
+    reduction, zero policy and original/retained moment identities.
+    """
+    import jax.numpy as jnp
+    from gw.shared_pole_gates import (apply_shared_pole_zero_policy, ordered_moment_identity,
+                                     retained_moment_identity)
+    from gw.shared_pole_pencil import assemble_ordered_shared_pole_pencil, assemble_shared_pole_pencil
+    from gw.shared_pole_reduction import reduce_ordered_shared_pole_pencil, reduce_shared_pole_pencil
+    finite = [(points, q, o, d)]
+    if ordered:
+        pencil = assemble_ordered_shared_pole_pencil(finite, infinity if odd_moments else None, matmul=matmul)
+        reduced = reduce_ordered_shared_pole_pencil(
+            pencil, active, eigh=eigh, matmul=matmul, gates=gates, keep_budget=keep_budget,
+            retain_span=retain_span)
+        model, signed, reduction = reduced[:3]
+        if retain_span:
+            coefficients = reduced[3]
+        retained = ordered_moment_identity(signed, infinity, matmul=matmul) if odd_moments else {}
+        model, zero = apply_shared_pole_zero_policy(model, gates=gates)
+        zero["zero_policy"] = zero["zero_policy"] & reduction["infinite_weight_ok"]
+    else:
+        pencil = assemble_shared_pole_pencil(finite, infinity, matmul=matmul)
+        model, reduction, coefficients = reduce_shared_pole_pencil(
+            pencil, active, eigh=eigh, matmul=matmul, gates=gates, keep_budget=keep_budget)
+        model, zero = apply_shared_pole_zero_policy(model, gates=gates)
+        # E selects the infinity block, the last columns of X.
+        side, width = pencil[0].shape[-1], infinity[0].shape[-1]
+        selector = (jnp.arange(side)[:, None] == jnp.arange(side - width, side)[None, :])[None]
+        retained = retained_moment_identity(pencil, coefficients, model, selector.astype(jnp.complex128),
+                                            matmul=matmul)
+        signed = ()
+    result = model, signed, (reduction, zero, retained)
+    if retain_span:
+        return (*result, coefficients)
+    return result
+
+
 @lru_cache(maxsize=None)
 def round_program(mesh_xy, native_eigh, ordered, odd_moments, keep_budget, sizes, retain_span=False):
     """Pack, assemble, reduce, gate and sort a round of parents, each on its own rank.
@@ -270,33 +312,9 @@ def round_program(mesh_xy, native_eigh, ordered, odd_moments, keep_budget, sizes
     batch, replicated = P(BATCH), NamedSharding(mesh_xy, P())
 
     def solve(points, q, o, d, infinity, active):
-        finite = [(points, q, o, d)]
-        if ordered:
-            pencil = assemble_ordered_shared_pole_pencil(finite, infinity if odd_moments else None, matmul=_mm)
-            reduced = reduce_ordered_shared_pole_pencil(
-                pencil, active, eigh=native_eigh, matmul=_mm, gates=gates, keep_budget=keep_budget,
-                retain_span=retain_span)
-            model, signed, reduction = reduced[:3]
-            if retain_span:
-                coefficients = reduced[3]
-            retained = ordered_moment_identity(signed, infinity, matmul=_mm) if odd_moments else {}
-            model, zero = apply_shared_pole_zero_policy(model, gates=gates)
-            zero["zero_policy"] = zero["zero_policy"] & reduction["infinite_weight_ok"]
-        else:
-            pencil = assemble_shared_pole_pencil(finite, infinity, matmul=_mm)
-            model, reduction, coefficients = reduce_shared_pole_pencil(
-                pencil, active, eigh=native_eigh, matmul=_mm, gates=gates, keep_budget=keep_budget)
-            model, zero = apply_shared_pole_zero_policy(model, gates=gates)
-            # E selects the infinity block, the last columns of X.
-            side, width = pencil[0].shape[-1], infinity[0].shape[-1]
-            selector = (jnp.arange(side)[:, None] == jnp.arange(side - width, side)[None, :])[None]
-            retained = retained_moment_identity(pencil, coefficients, model, selector.astype(jnp.complex128),
-                                                matmul=_mm)
-            signed = ()
-        result = model, signed, (reduction, zero, retained)
-        if retain_span:
-            return (*result, coefficients)
-        return result
+        return solve_parent_pencil(points, q, o, d, infinity, active,
+            eigh=native_eigh, matmul=_mm, gates=gates, ordered=ordered,
+            odd_moments=odd_moments, keep_budget=keep_budget, retain_span=retain_span)
 
     def body(live, dispatch, points, order, active, qs, os, ds, infinity):
         def pack(panels):
