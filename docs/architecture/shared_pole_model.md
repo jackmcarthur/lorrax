@@ -335,3 +335,61 @@ $$ \text{reduction} \approx 16\,\big(14 R^2 + 12 n R\big)\,b/P + 16\cdot 3 n r\,
 ledger's rows). A round has `b = P`: every rank holds one whole parent (§6). The native cuSOLVERMp eigh adds a
 private operand tile of `n²/P` next to its workspace, which `distrib_la.workspace_bytes_per_rank` includes; a byte
 model without that tile under-counts the measured CrI3 q=1 construction peak (2.140 against 2.907 GiB per rank).
+
+
+### Photon bank residency audit (2026-09-17)
+
+This is a source audit of the literal-mirror producer, not a complete HLO or
+native-workspace proof. Let K be full k count, m the packed photon extent,
+s the spin count, B the band carrier, a the support count, q the admitted
+union of exact original and negative momentum rows, and P=Px Py. Complex
+arrays use 16 bytes per element. Run477/32 has K=64, m=1032, s=4, B=36,
+a=22, q=22 (13 original parents), P=4. Its recorded JAX high water is
+18,203,126,272 B/rank; the original panel admission was 5,209,765,972 B/rank.
+Those differently scoped numbers do not by subtraction measure a missing
+allocation. Native allocations are excluded from the JAX high water.
+
+| Object | Actual production call / layout | Shape | Full bytes | Per-rank bytes |
+|---|---|---|---|---|
+| Prepared endpoints, four carriers | `prepare_photon_carriers`; mun `[K,s,m_X,B_Y]`, nmu `[K,B_X,s,m_Y]` on face layout | four K s m B | 64 K s m B | 64 K s m B / P |
+| Bare photon V | `photon_bare_operator`, `[q_parent,m_X,m_Y]` | q_parent m² | 16 q_parent m² | 16 q_parent m²/P |
+| Contact/reference buffers | `photon_static_contact` / slab read, `[1,m_X,m_Y]` | m² each | 16 m² | 16 m²/P each |
+| Two live full-spin Green functions | `response_stream` / contour kernel, `[K,s,m_X,s,m_Y]` | 2 K s² m² | 32 K s² m² | 32 K s² m²/P |
+| FFT and Green contraction temporaries | inside the compiled stream; explicit face stream signatures, interior HLO still to audit | compiler dependent | not inferred | compiled temporary bytes; external FFT workspace separate |
+| Value/derivative response carry | `integrate_response_panel`, `[2a,q,m_X,m_Y]`; donated across stream calls | 2 a q m² | 32 a q m² | 32 a q m²/P |
+| Dyson arguments/results | `response_algebra`, `[a,m_X,m_Y]`; original and mirror run sequentially | bounded a m² panels | 16 a m² each | 16 a m²/P each, plus native LU work |
+| Ordered bare moments | `exact_bare_moments`, four `[q,m_X,m_Y]` arrays | 4 q m² | 64 q m² | 64 q m²/P |
+| Sector samples and moments | sector reader; four photon sample fields and four moment fields, `[q_XY,a,mu,mu]` | sector dependent | 16 times element count | batch divided over P, padded to whole-parent rounds |
+| Directions, Ritz pencil and factors | constructor local parent algebra; `[q_XY,mu,R]`, `[q_XY,R,R]` | b mu R and b R² | 16 b mu R; 16 b R² | 16 ceil(b/P) mu R; 16 ceil(b/P) R² |
+
+The response carry grows by 22/13 for this exact-mirror union. It does not
+create another Green stream. The four prepared face-layout endpoints alone
+occupy 152,174,592 B/rank on this geometry. Family unfolding, canonical
+unpacking, gamma action and photon packing have additional preparation
+intermediates; retained-endpoint pricing does not certify their peak.
+
+Face arrays remain constant per rank under m² proportional to P. Constructor
+whole-parent rounds have a strong-scaling ceiling: with b=P each rank retains
+a whole parent pencil and factor. Face/batch conversion uses explicit
+all-to-all exchanges, not a host/global matrix copy. Replicated poles and
+scalar diagnostics are small metadata. Legacy axis-layout wavefunctions
+have only one mesh axis in each carrier; this audit establishes face-layout
+residency only. It does not authorize a new layout or replicated bulk array.
+
+The producer must release ordered `o0/o1`, the per-parent operand tuple,
+result list and contact constant after their synchronous writes. Otherwise
+they survive into the next moment panel. Photon stream compiler temporaries
+must be admitted alongside the already priced carry and endpoint buffers;
+scalar streams retain their existing matched-reference admission route.
+Compiler outputs and aliases are recorded separately to avoid charging the
+donated carry twice. This is a pre-execution admission, not an automatic
+panel retry or a measured whole-process peak.
+
+Native LU remains a distinct gap: `batched_solve_lu_ffi.cc` allocates both
+Getrf and Getrs workspaces simultaneously plus batch pivots outside XLA.
+The existing `distrib_la.workspace` query supports GEMM/eigh only. A minimal
+extension is an LU query in that same service/provider, with the actual
+batch, n, nrhs, mesh/block geometry and dtype, summing both device workspaces
+and pivots and reporting host workspace separately. No alternate backend
+is needed. Until then the receipt must retain its native-workspace unknown
+status; FFT custom-call scratch likewise must not be inferred as zero.
