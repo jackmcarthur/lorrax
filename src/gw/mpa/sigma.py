@@ -166,7 +166,8 @@ def synthesize_shared_pole_parents(
     return plus, transposed
 
 
-def _shared_pole_contract(b_X, b_Y, weights, *, gemm, layout="face"):
+def _shared_pole_contract(b_X, b_Y, weights, *, gemm, layout="face",
+                          band_range=None):
     """W(τ) = b d b† through G's configured face or axis contraction.
 
     Factors [q,mu,spin,K] use G's face placement when low_mem_bands is
@@ -184,7 +185,8 @@ def _shared_pole_contract(b_X, b_Y, weights, *, gemm, layout="face"):
     b_Y = b_Y.reshape(b_Y.shape[0], b_Y.shape[1] * b_Y.shape[2], 1, b_Y.shape[3])
     value = build_G(jnp.transpose(b_X, (0, 2, 1, 3)),
                     jnp.transpose(b_Y, (0, 3, 2, 1)),
-                    phases=weights, layout=layout, gemm=gemm)
+                    phases=weights, layout=layout, gemm=gemm,
+                    band_range=band_range)
     return value[:, 0, :, 0, :]
 
 
