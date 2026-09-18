@@ -616,20 +616,17 @@ def run_store_checks(mesh,root):
             raise AssertionError('mismatched CT poles accepted')
     rows.append(dict(name='CT_endpoint_pair',bitwise=True,mismatched_census_refused=True))
     from types import SimpleNamespace
-    from gw.gw_config import (refuse_headless_shared_pole_self_consistency,
+    from gw.gw_config import (warn_headless_shared_pole_self_consistency,
                               QPSolver,HeadCorrection)
     config=SimpleNamespace(sigma=SimpleNamespace(w_model='shared_pole'),
         qp_solver=QPSolver.SELF_CONSISTENT,head=SimpleNamespace(correction=HeadCorrection.OFF),
         bispinor=True,occ_smearing_width_ry=.02)
-    refuse_headless_shared_pole_self_consistency(config)
+    warn_headless_shared_pole_self_consistency(config)
     config.bispinor=False
-    try:
-        refuse_headless_shared_pole_self_consistency(config)
-    except ValueError as error:
-        assert 'shared_pole_self_consistent_needs_a_head' in str(error)
-    else:
-        raise AssertionError('scalar headless SC refusal changed')
-    rows.append(dict(name='headless_bispinor_metal_scope',passed=True))
+    warning=[]
+    warn_headless_shared_pole_self_consistency(config,warning.append)
+    assert warning and 'config warning' in warning[0]
+    rows.append(dict(name='headless_shared_pole_sc_allowed',passed=True))
     return rows
 
 

@@ -529,8 +529,11 @@ an ordered (time-reversal-broken) or two-component deck refuses at input
 resolution (`GATE shared_pole_head_ordered`, `GATE shared_pole_head_nspinor`,
 `shared_pole_head.refuse_unsupported_shared_pole_head`), before any bank or
 constructor runs. A one-shot deck on such a system uses `head_correction = off`;
-a self-consistent shared-pole deck has no valid setting there until the signed
-Gamma head lands.
+a self-consistent shared-pole deck may also run headless as a brute-grid
+development mode (owner policy 2026-09-18). With `head_correction = full` the
+ordered head still refuses, so head off is the only valid setting there until
+the signed Gamma head lands. The measured scalar map-1 q=0 Gram risk is a
+warning, not a parse refusal; the `shared_pole_gram_valid` gate is unchanged.
 
 Validation on branch `investigate/shared-pole-sc-quadrature-2026-09-10`:
 P4 Si job58152308.12, using diagnostic Sigma integration and the historical
