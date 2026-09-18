@@ -530,7 +530,7 @@ def response_dense_workspace(mesh_xy, n, batch, layout, *, with_eigh):
     return dict(gemm=gemm,eigh=eig,total=gemm+eig,scope="actual-shape ISERV query; GEMM persistent plus concurrent eigh scratch")
 
 
-def _bank_execution(meta, mesh_xy, receipt, config):
+def _bank_execution(meta, mesh_xy, receipt, config, *, photon=False):
     """Compile and admit new dense work; stream outputs are reserved by batch."""
     def execute(kernel, args, stage):
         with timing.fenced_section('bank.compile.' + stage):
@@ -543,7 +543,15 @@ def _bank_execution(meta, mesh_xy, receipt, config):
             if memory is None:
                 raise ValueError("GATE response_capacity: compiled memory unavailable")
             stream = stage in ("real_time", "laplace", "moment_correlation", "static_reference")
-            if not stream:
+            if stream and photon:
+                # The caller already holds a reservation for the response
+                # carry/outputs and prepared endpoints. Photon streams have
+                # no scalar matched-reference peak: price their compiled
+                # Green/FFT temporaries before executing the program.
+                _, row = _reserve(meta, stage + "_temporaries", 0,
+                                  memory.temp_size_in_bytes)
+                receipt["memory"].append(row)
+            elif not stream:
                 layout = config.get("linalg", "local") if hasattr(config,"get") else config.backend.linalg
                 native = response_dense_workspace(mesh_xy,args[0].shape[-1],args[0].shape[0],layout,
                     with_eigh=stage=="coulomb_sqrt")
@@ -553,7 +561,10 @@ def _bank_execution(meta, mesh_xy, receipt, config):
                 receipt["memory"].append(row)
             receipt["compiled"].append(dict(stage=stage,
                 arguments=memory.argument_size_in_bytes, outputs=memory.output_size_in_bytes,
-                temporaries=memory.temp_size_in_bytes, inherited_stream=stream))
+                temporaries=memory.temp_size_in_bytes,
+                aliases=memory.alias_size_in_bytes,
+                inherited_stream=stream and not photon,
+                stream_temporaries_admitted=stream and photon))
         with timing.fenced_section('bank.execute.' + stage):
             started = time.monotonic()
             result = executable(*args)
@@ -847,7 +858,7 @@ def compute_moment_bank(wfns, meta, config, *, mesh_xy, sym, bank_io,
         # M1/M3 are the 1/s and 1/s^2 coefficients; the odd channel starts at
         # 1/z^3, so the same six correlations stay exact on an ordered bank.
         receipt["ordered"] = True
-    execute = _bank_execution(meta, mesh_xy, receipt, config)
+    execute = _bank_execution(meta, mesh_xy, receipt, config, photon=vertex is not None)
     ledger = meta.shared_pole_capacity
     ambient = ledger.live_stages
     started = time.monotonic()
@@ -903,7 +914,13 @@ def compute_moment_bank(wfns, meta, config, *, mesh_xy, sym, bank_io,
                 receipt["seconds"]["io"] = receipt["seconds"].get("io",0.)+time.monotonic()-io_started
                 receipt["batches"].append(dict(q_span=span,support_ranks=ranks))
                 del h,m1,m3,odd
+                if ordered:
+                    del operands,result
+                    if vertex is not None:
+                        del constant
             del a0,a1
+            if ordered:
+                del o0,o1
             receipt["correlation_count"] += 10 if ordered else 6
     ledger.live_stages = ambient
     receipt["completion"] = bool(np.asarray(header["moment_written"]).all())
@@ -1171,7 +1188,7 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
         if ordered:
             receipt["ordered"] = True
         started = time.monotonic()
-        execute = _bank_execution(meta, mesh_xy, receipt, config)
+        execute = _bank_execution(meta, mesh_xy, receipt, config, photon=vertex is not None)
         ledger = meta.shared_pole_capacity
         ambient = ledger.live_stages
     with timing.fenced_section('bank.stream_reference_compile'):
@@ -1397,15 +1414,28 @@ def compute_photon_bank(wfns, wfns_transverse, meta, config, *, mesh_xy, sym,
         sha256=resource_digest(bank["bispinor_v_q_path"]))
     census = response_weights(wfns, meta)[-1]
     receipt = _receipt("photon", census, bank)
-    execute = _bank_execution(meta, mesh_xy, receipt, config)
+    execute = _bank_execution(meta, mesh_xy, receipt, config, photon=True)
     ledger = meta.shared_pole_capacity
     ambient = ledger.live_stages
     nq, n = len(sym.q_irr_full_idx), layout.packed_extent
     # Packed V, contact/reference/D and one family-read envelope, all XY tiled.
     vbytes = 16*(nq+4)*n*n//mesh_xy.size
-    name, row = _reserve(meta, "photon_endpoints_and_V", vbytes)
+    from common.wfn_layout import psi_specs
+    nmu_spec, mun_spec = psi_specs(wfns.layout)
+    nk, nb = wfns.enk.shape
+    ns = wfns.green_parent.psi_mun.shape[1]
+    carrier_shapes = ((nk, ns, n, nb), (nk, nb, ns, n))
+    endpoint_bytes = 2 * sum(16 * int(np.prod(
+        NamedSharding(mesh_xy, spec).shard_shape(shape)))
+        for shape, spec in zip(carrier_shapes, (mun_spec, nmu_spec)))
+    name, row = _reserve(meta, "photon_endpoints_and_V", vbytes + endpoint_bytes)
     ledger.live_stages = ambient+(name,)
     receipt["memory"].append(row)
+    receipt["endpoint_memory"] = dict(
+        retained_bytes_per_rank=endpoint_bytes,
+        carrier_shapes=[list(shape) for shape in carrier_shapes],
+        copies_per_orientation=2, layout=wfns.layout,
+        scope="four prepared carriers; preparation intermediates and external native workspace not included")
     before = time.monotonic()
     if jax.process_index() == 0:
         print("photon bank: preparing shared vertex endpoints and bare V", flush=True)
