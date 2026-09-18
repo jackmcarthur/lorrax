@@ -1401,6 +1401,13 @@ def _bank_stack_rows(mesh, spec):
                    out_shardings=NamedSharding(mesh, spec))
 
 
+@lru_cache(maxsize=None)
+def _bank_concat_columns(mesh, spec):
+    """Retain the bank column join for each mesh and output layout."""
+    return jax.jit(lambda *values: jnp.concatenate(values, axis=-1),
+                   out_shardings=NamedSharding(mesh, spec))
+
+
 def _read_photon_bank_sector(io, name, prefix, offset, spec, header, sector, ledger, retained):
     """Read only C/T rectangles; never load the full photon panel to slice it.
 
@@ -1428,8 +1435,7 @@ def _read_photon_bank_sector(io, name, prefix, offset, spec, header, sector, led
             valid_shapes=np.asarray([shape]*side,np.int64),partition_spec=spec,
             window_axis=len(prefix),dtype=np.complex128)
         columns.append(array.reshape(prefix+(side*widths[0],widths[1])))
-    return jax.jit(lambda *values: jnp.concatenate(values,axis=-1),
-        out_shardings=NamedSharding(io.mesh,spec))(*columns)
+    return _bank_concat_columns(io.mesh, spec)(*columns)
 
 
 def read_shared_pole_bank(io, q_span=None, *, meta, header, sample_span=None,
