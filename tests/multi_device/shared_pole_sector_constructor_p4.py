@@ -110,6 +110,10 @@ def check_sector_constructor(mesh, root, *, linalg="local", parents=16, return_o
         meta=meta,expected_identity=identity,mesh_xy=mesh)
     result=construct_sector_poles(bank,meta,SimpleNamespace(backend=SimpleNamespace(linalg=linalg)),
                                   mesh_xy=mesh,output=str(run/'model.h5'))
+    rounds=[row for row in result['q_receipts'] if 'held' in row]
+    assert all(row['execution']==('face' if linalg=='distributed' else 'local') for row in rounds)
+    if linalg=='distributed':
+        assert len(rounds)==nq and all(len(row['parents'])==1 for row in rounds)
     handle=result['handle']
     manifest=store.validate_shared_pole_sector_manifest(handle['path'],expected_identity=identity,
         mesh_xy=mesh,capacity=meta.shared_pole_capacity)

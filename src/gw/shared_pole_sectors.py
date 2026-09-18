@@ -224,7 +224,8 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output):
             expected_infinity=(key=='cauchy_schwarz_squared') & np.isposinf(values)
             if not np.all(np.isfinite(values) | expected_infinity):
                 raise ValueError(f'GATE shared_pole_sector_nonfinite: spectral moment {key}')
-        row_receipt=dict(parents=ids[:real],held=held_rows,
+        row_receipt=dict(parents=ids[:real],execution=execution,
+            mesh_shape={axis:int(mesh_xy.shape[axis]) for axis in ("x","y")},held=held_rows,
             CT_gram_min_relative=np.asarray(cross['diagnostics']['gram_min_relative'])[:real].tolist(),
             CT_retained_metric_positive=np.asarray(cross['diagnostics']['retained_metric_positive'])[:real].tolist(),
             CT_zero_policy=np.asarray(cross['zero']['zero_policy'])[:real].tolist(),
