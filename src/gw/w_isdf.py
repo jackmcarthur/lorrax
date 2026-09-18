@@ -501,6 +501,8 @@ def _get_chi_fractional_contour_kernel_face(
     occupied Green uses bare carriers. Thus the same spin trace computes
     ``tr[J_A G^> J_B G^<]`` without another FFT or a second producer.
     Carriers must already be unfolded before applying current vertices.
+    Photon spin pairs are traced in a fixed scan of singleton-spin Greens:
+    this retains all components without storing two full spin Green tensors.
     """
     from common.fft_helpers import make_flat_k_fftn
     from distrib_la import gemm_plan
@@ -586,7 +588,8 @@ def _get_chi_fractional_contour_kernel_face(
     # ONE planned GEMM, built here (eagerly, once) and shared by every Gf
     # and Gu build this kernel ever does — mirrors
     # _get_chi_minimax_kernel_face's own g_plan.
-    g_plan = gemm_plan(mesh_xy, m=n_rmu * ns, k=nb_full, n=n_rmu * ns,
+    green_spin = 1 if vertex else ns
+    g_plan = gemm_plan(mesh_xy, m=n_rmu * green_spin, k=nb_full, n=n_rmu * green_spin,
                        nq=nk_shape, dtype=jnp.complex128, layout=layout)
     def _finish(value):
         value = chi_fftn(value)
@@ -634,9 +637,13 @@ def _get_chi_fractional_contour_kernel_face(
         if bank_carry:
             initial = carry[0]
 
-        def green_k(weight, t, ref, *, current=False):
+        def green_k(weight, t, ref, *, current=False, spin_pair=None):
             left = current_mun if current else bare_mun
             right = current_nmu if current else bare_nmu
+            if spin_pair is not None:
+                a, b = spin_pair // ns, spin_pair % ns
+                left = jax.lax.dynamic_slice_in_dim(left, a, 1, axis=1)
+                right = jax.lax.dynamic_slice_in_dim(right, b, 1, axis=2)
             # Incumbent: conj(G(w, t)) = G(conj w, conj t)^T. Physical: G(conj w, conj t).
             if physical:
                 g = build_G_tau(left, right, enk_full, jnp.conj(t), e_ref=ref,
@@ -648,19 +655,33 @@ def _get_chi_fractional_contour_kernel_face(
                                          gemm=g_plan, k_unfold_plan=k_unfold_plan))
             return jax.lax.with_sharding_constraint(g, G_shard)
 
+        def spin_correlation(lower_weight, lower_time, lower_ref,
+                             upper_weight, upper_time, upper_ref):
+            """Exact spin trace; photon components never form a full spin Green.
+
+            Each (a,b) component uses the common Green and FFT owners and
+            remains mu_X/nu_Y tiled on all P ranks. The fixed scan changes
+            storage and summation order only; every spin pair is included.
+            """
+            def component(pair):
+                gf = G_fftn(green_k(lower_weight, lower_time, lower_ref, spin_pair=pair))
+                gu = G_fftn(green_k(upper_weight, upper_time, upper_ref,
+                                   current=True, spin_pair=pair))
+                return jax.lax.with_sharding_constraint(
+                    jnp.einsum("Rambn,Rambn->Rmn", gu, gf.conj()), chi_R_shard)
+            if not vertex:
+                return component(None)
+            initial = jax.lax.with_sharding_constraint(
+                jnp.zeros((nk, n_mu, n_mu), jnp.complex128), chi_R_shard)
+            def add(total, pair):
+                return total + component(pair), None
+            result, _ = jax.lax.scan(add, initial, jnp.arange(ns * ns), unroll=1)
+            return result
+
         def retarded_correlation(time):
             tau = jnp.asarray(1j, dtype=jnp.complex128) * time
-            Gf_R = G_fftn(green_k(occ_f, -tau, energy_reference))
-            Gu_R = G_fftn(green_k(occ_u, -tau, energy_reference, current=True))
-            return jax.lax.with_sharding_constraint(
-                jnp.einsum(
-                    "Rambn,Rambn->Rmn",
-                    Gu_R,
-                    jnp.conj(Gf_R),
-                    optimize=True,
-                ),
-                chi_R_shard,
-            )
+            return spin_correlation(occ_f, -tau, energy_reference,
+                                    occ_u, -tau, energy_reference)
 
         def laplace_correlation(time, occ_f, occ_u, energy_reference):
             """Remote cell: even (forward - reverse) and odd (forward + reverse) rows.
@@ -671,9 +692,6 @@ def _get_chi_fractional_contour_kernel_face(
             energy, so it weights forward + reverse. Each side remains a
             one-particle correlation through the same Green/FFT owner.
             """
-            def green(weight, tau_value, ref, *, current=False):
-                return G_fftn(green_k(weight, tau_value, ref, current=current))
-
             # Accumulate the two occupation orientations sequentially. Four
             # simultaneously live full spin Green tensors exceed a P4 card on
             # the metallic photon bank. This loop performs the same four
@@ -682,13 +700,11 @@ def _get_chi_fractional_contour_kernel_face(
             initial = jax.lax.with_sharding_constraint(
                 jnp.zeros((nk, n_mu, n_mu), jnp.complex128), chi_R_shard)
             def orientation(carry, index):
-                lower = green(occ_f[index], -time, energy_reference[0])
-                upper = green(occ_u[index], time, energy_reference[1], current=True)
-                value = jax.lax.with_sharding_constraint(
-                    jnp.einsum("Rambn,Rambn->Rmn", upper, lower.conj()), chi_R_shard)
+                value = spin_correlation(occ_f[index], -time, energy_reference[0],
+                                         occ_u[index], time, energy_reference[1])
                 even, odd = carry
                 return (even + jnp.where(index == 0, value, -value), odd + value), None
-            result, _ = jax.lax.scan(orientation, (initial, initial), jnp.arange(2))
+            result, _ = jax.lax.scan(orientation, (initial, initial), jnp.arange(2), unroll=1)
             return result
 
 
@@ -702,10 +718,7 @@ def _get_chi_fractional_contour_kernel_face(
                 jnp.exp(eps*time-jnp.logaddexp(0., beta*eps)), 0.)
             upper = jnp.where(occ_u != 0,
                 jnp.exp(-eps*time-jnp.logaddexp(0., -beta*eps)), 0.)
-            gf = G_fftn(green_k(lower, 0., mu))
-            gu = G_fftn(green_k(upper, 0., mu, current=True))
-            return jax.lax.with_sharding_constraint(
-                jnp.einsum("Rambn,Rambn->Rmn", gu, gf.conj()), chi_R_shard)
+            return spin_correlation(lower, 0., mu, upper, 0., mu)
 
         def body(accumulators, node):
             time, projection = node
