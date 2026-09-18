@@ -36,17 +36,18 @@ map still requires the constructor to publish an accepted sector handle.
 
 ## Memory and scope
 
-One rectangular endpoint class is evaluated at a time. Factor reads use bounded
-parent/pole panels. Factor faces and every large Green or interaction matrix
-retain both processor axes. With centroid and pole ranks proportional to system
-size, the contractions remain cubic; there is no production state/pole-pair
-sum. Endpoint routing is bounded by its symmetry service cost receipt.
-The store's face selector reads each diagonal sector's two orientations once;
-an ordered mixed sector reads only its left-X and right-Y faces. Thus each
-active parent/pole panel makes two factor hyperslab reads instead of four,
-while CT/TC still compare the two independently stored pole arrays bitwise.
-The store admission prices the orientations actually requested. This changes
-factor I/O and its live face count, not the quadrature or contraction.
+One rectangular endpoint class is evaluated at a time. The store reads each
+sector's full parent/pole factor set once at setup; the symmetry service
+unfolds it once to full q. The current map retains only those transformed
+factors and replicated squared poles until that sector's frequency integration
+finishes. CC/TT each read two orientations from one store; CT/TC each read
+left-X and right-Y from their separate stores and compare pole arrays. The
+configured `low_mem_bands` layout selects the same factor contraction plan as
+the Green builder: face layout distributes centroid and pole axes, while axis
+layout replicates the pole axis and distributes each centroid endpoint over its
+own axis. Both form one all-P W(t) rectangle at a time. No W(t) history or
+state/pole-pair sum is retained. Setup routing, resident factors, and compiled
+contractions have capacity reservations with explicit sector lifetime.
 
 The constant path retains a whole all-P photon bank, then its all-P packed
 replacement. Both copies and packing workspace are admitted together. Kernel
@@ -61,3 +62,10 @@ entry with unequal charge/current centroid extents, distinct sector poles,
 nonreciprocal q dependence, fractional occupations and a nonzero constant. The
 explicit band/q/pole oracle exists only in that harness. Its receipt must be
 consulted before treating a run as passing.
+
+P4 synthetic job 58497206.3 exercises both configured layouts with the same
+direct oracle: maximum error is 2.046e-7 Ry in each, at a 0.008884 Ry reference
+scale. The matched face-layout control 58497206.0 made 588 store face reads and
+took 41.435 s for the complete consumer call; the resident route made six reads
+and took 17.130 s. This is a tiny synthetic consumer measurement, including
+setup and compilation, not a material speed or peak-memory claim.

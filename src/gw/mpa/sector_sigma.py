@@ -1,8 +1,9 @@
 """Ordered photon sectors in the common frequency-quadrature Sigma executor.
 
 A sector has two centroid families and Lorentz components, not a new
-frequency-integration algorithm. Factors and rectangular operators retain
-both processor axes; one endpoint class is consumed at a time.
+frequency-integration algorithm. Its configured factor layout follows the
+Green carrier; rectangular interaction operators retain both processor axes.
+One endpoint class is consumed at a time.
 """
 from __future__ import annotations
 
@@ -17,7 +18,7 @@ import numpy as np
 from jax.sharding import NamedSharding, PartitionSpec as P
 
 from common.gamma_matrices import gamma_perm_phase
-from runtime.padding import pad_to_axis, combined_divisor, round_up
+from runtime.padding import pad_to_axis
 from gw.ppm_tau_kernel import get_shared_sigma_tau_kernel
 from gw.wavefunction_bundle import parent_sigma_operands, sigma_face_kernel_kwargs
 
@@ -131,10 +132,11 @@ def _endpoint_route(header, basis, sym, span, rows, mesh_xy, axis, width):
 
 
 def sector_synthesis(readers, headers, bases, families, frequencies, meta, mesh_xy):
-    """Read bounded q/K panels and synthesize one full-q Lorentz class.
+    """Retain full-q endpoint factors and form one W(t) tile per tau.
 
-    Hole windows use conj(b_A(-q)) d(t) b_B(-q)^T, equivalently
-    W_BA,+(-q)^T. The scalar phase is never conjugated.
+    The store and symmetry services are called once at setup.  The same
+    configured wavefunction layout selects face or axis GEMM input placement.
+    Occupied windows use conj(B_A(-q)) d(t) B_B(-q)^T; d is never conjugated.
     """
     from distrib_la import gemm_plan
     from file_io.shared_pole_store import read_shared_pole_faces
@@ -142,118 +144,124 @@ def sector_synthesis(readers, headers, bases, families, frequencies, meta, mesh_
     from .sigma import _shared_pole_weights, _shared_pole_contract
     from .sigma_windows import shared_pole_intervals
 
-    left, right = headers
-    nc, nt = (int(h.get('factor_components',1)) for h in headers)
-    m, n = (b.n_packed for b in bases)
-    nq, nk = int(left['n_q_irr']),int(left['n_q_full'])
-    kmax = int(left['Kmax'])
-    if any(left[k] != right[k] for k in ('K','Kmax','q_irr_full_idx','identity')):
+    left,right=headers
+    nc,nt=(int(h.get('factor_components',1)) for h in headers)
+    m,n=(b.n_packed for b in bases)
+    nq,nk=int(left['n_q_irr']),int(left['n_q_full'])
+    kmax=int(left['Kmax'])
+    if any(left[k]!=right[k] for k in ('K','Kmax','q_irr_full_idx','identity')):
         raise ValueError('GATE shared_pole_sector_census: endpoint identities differ')
-    multiple=combined_divisor(mesh_xy.shape['x'],mesh_xy.shape['y'])
-    # Pole panels are bounded by one endpoint dimension, retaining cubic
-    # contraction and O(mu^2/P) transient storage even if K grows further.
-    width=max(multiple,round_up(min(max(1,kmax),max(m,n)),multiple))
+    layout=families[0].layout
+    if layout!=families[1].layout:
+        raise ValueError('GATE shared_pole_sectors: endpoint wavefunction layouts differ')
+    capacity=meta.shared_pole_capacity
+    ambient=capacity.live_stages
+    tag=f'{left.get("sector")}.{right.get("sector")}'
     shape=(nk,m*nc,n*nt)
     sharding=NamedSharding(mesh_xy,P(None,'x','y'))
-    zero=jax.jit(lambda:jnp.zeros(shape,jnp.complex128),out_shardings=sharding)
-    minus=jnp.asarray(q_negation_index(tuple(left['grid'])))
-    kernels=[]
-    for parent in range(nq):
-        rows=np.flatnonzero(np.asarray(left['qirr']['irr_idx_q'])==parent).astype(np.int32)
-        routes=[]; costs=[]
-        for h,b,f,axis in zip(headers,bases,families,('x','y')):
-            route,cost=_endpoint_route(h,b,f.green_parent.plan.sym,(parent,parent+1),rows,
-                                      mesh_xy,axis,width)
-            routes.append(route);costs.append(cost)
-        amount=16*nk*m*nc*n*nt//mesh_xy.size
-        native=_native_workspace(mesh_xy,(((len(rows),m*nc,width),(len(rows),width,n*nt)),))
-        meta.shared_pole_capacity.reserve(
-            f'sigma.sector.warm.{left.get("sector")}.{right.get("sector")}.{parent}',
-            resident_bytes_per_rank=amount,workspace_bytes_per_rank=native+
-                2*16*len(rows)*(m*nc*width+width*n*nt+m*nc*n*nt)//mesh_xy.size,
-            concurrent_with=meta.shared_pole_capacity.live_stages)
-        gemm=gemm_plan(mesh_xy,m=m*nc,n=n*nt,k=width,nq=len(rows),dtype=np.complex128)
-        meta.shared_pole_capacity.reserve(f'sigma.sector.panel.{left.get("sector")}.{right.get("sector")}.{parent}',
-            resident_bytes_per_rank=amount,
-            workspace_bytes_per_rank=(3*16*len(rows)*m*nc*n*nt//mesh_xy.size
-                +sum(c['estimated_live_bytes_per_rank'] for c in costs)),
-            concurrent_with=meta.shared_pole_capacity.live_stages)
+    if not kmax:
+        zero=jax.jit(lambda:jnp.zeros(shape,jnp.complex128),out_shardings=sharding)
+        def empty(*_args):return jnp.transpose(zero().reshape(nk,m,nc,n,nt),(2,4,0,1,3)).reshape(nc*nt,nk,m,n)
+        empty.ordered=True
+        empty.close=lambda _result=None:None
+        return empty
+    rows=np.arange(nk,dtype=np.int32)
+    routes=[];costs=[]
+    for h,b,f,axis in zip(headers,bases,families,('x','y')):
+        route,cost=_endpoint_route(h,b,f.green_parent.plan.sym,(0,nq),rows,
+                                   mesh_xy,axis,kmax)
+        routes.append(route);costs.append(cost)
+    # A face input is required by the established symmetry route. After it
+    # completes, keep only the configured GEMM input layout across all tau.
+    factor_spec=(P(None,'x',None,'y'),P(None,'y',None,'x')) if layout=='face' else (
+                 P(None,'x',None,None),P(None,'y',None,None))
+    def place(value,spec):
+        return jax.jit(lambda x:x,out_shardings=NamedSharding(mesh_xy,spec))(value)
+    px,py=int(mesh_xy.shape['x']),int(mesh_xy.shape['y'])
+    face_bytes=16*nq*kmax*(m*nc+n*nt)//mesh_xy.size
+    # Each factor has one centroid axis. Pole columns divide over the other
+    # mesh axis only in low_mem_bands face layout.
+    resident_bytes=16*nk*((m//px)*nc*(kmax//py if layout=='face' else kmax)
+                          +(n//py)*nt*(kmax//px if layout=='face' else kmax))
+    resident_bytes+=8*nk*kmax+16*nk*m*nc*n*nt//mesh_xy.size
+    native=_native_workspace(mesh_xy,(((nk,m*nc,kmax),(nk,kmax,n*nt)),))
+    setup=f'sigma.sector.setup.{tag}'
+    resident=f'sigma.sector.resident.{tag}'
+    capacity.reserve(setup,resident_bytes_per_rank=resident_bytes+2*face_bytes,
+        workspace_bytes_per_rank=sum(c['estimated_live_bytes_per_rank'] for c in costs)+native,
+        concurrent_with=ambient)
+    capacity.live_stages=(*ambient,setup)
+    try:
+        same=readers[0] is readers[1] and headers[0] is headers[1]
+        if same:
+            lhs=read_shared_pole_faces(readers[0],(0,nq),meta=meta,header=left,basis=bases[0])
+            rhs=lhs
+        else:
+            lhs=read_shared_pole_faces(readers[0],(0,nq),meta=meta,header=left,
+                                       basis=bases[0],orientations=('x',))
+            rhs=read_shared_pole_faces(readers[1],(0,nq),meta=meta,header=right,
+                                       basis=bases[1],orientations=('y',))
+            if not bool(jnp.all(lhs[2]==rhs[2])):
+                raise ValueError('GATE shared_pole_sector_census: unequal pole values')
+        b_x=place(routes[0](lhs[0]),factor_spec[0])
+        b_y=place(routes[1](rhs[1]),factor_spec[1])
+        parent=np.asarray(left['qirr']['irr_idx_q'],dtype=np.int32)
+        poles=jnp.take(lhs[2],parent,axis=0)
+        jax.block_until_ready((b_x,b_y,poles))
+        del lhs,rhs
+    except BaseException:
+        capacity.live_stages=ambient
+        raise
+    try:
+        capacity.reserve(resident,resident_bytes_per_rank=resident_bytes,
+                         workspace_bytes_per_rank=0,concurrent_with=ambient)
+        capacity.live_stages=(*ambient,resident)
+    except BaseException:
+        b_x=b_y=poles=None
+        capacity.live_stages=ambient
+        raise
+    try:
+        gemm=gemm_plan(mesh_xy,m=m*nc,n=n*nt,k=kmax,nq=nk,
+                       dtype=np.complex128,layout=layout)
+        minus=jnp.asarray(q_negation_index(tuple(left['grid'])))
         @partial(jax.jit,static_argnums=(6,))
-        def kernel(x,y,p,interval,ref,time,hole,routes=routes,gemm=gemm):
-            x,y=routes[0](x),routes[1](y)
-            if hole:x,y=jnp.conj(x),jnp.conj(y)
-            weights=_shared_pole_weights(p,interval,ref,time)
-            return _shared_pole_contract(x,y,jnp.broadcast_to(weights,(x.shape[0],weights.shape[1])),gemm=gemm)
+        def kernel(x,y,omega,interval,ref,time,hole):
+            if hole:
+                x=jnp.conj(jnp.take(x,minus,axis=0))
+                y=jnp.conj(jnp.take(y,minus,axis=0))
+                omega=jnp.take(omega,minus,axis=0)
+                interval=jnp.take(interval,minus,axis=0)
+            weights=_shared_pole_weights(omega,interval,ref,time)
+            return _shared_pole_contract(x,y,weights,gemm=gemm,layout=layout)
         def abstract(shape,dtype,spec=P()):
             return jax.ShapeDtypeStruct(shape,dtype,sharding=NamedSharding(mesh_xy,spec))
-        args=(abstract((1,m,nc,width),np.complex128,P(None,'x',None,'y')),
-              abstract((1,n,nt,width),np.complex128,P(None,'y',None,'x')),
-              abstract((1,width),np.float64),abstract((1,2),np.int32),
+        args=(abstract((nk,m,nc,kmax),np.complex128,factor_spec[0]),
+              abstract((nk,n,nt,kmax),np.complex128,factor_spec[1]),
+              abstract((nk,kmax),np.float64),abstract((nk,2),np.int32),
               abstract((),np.float64),abstract((),np.complex128))
         for hole in (False,True):
-            _admit_compiled(kernel,(*args,hole),meta,
-                f'sigma.sector.compiled.{left.get("sector")}.{right.get("sector")}.{parent}.{hole}',
-                native=native,resident=amount)
-        kernels.append((rows,kernel))
-
-    @partial(jax.jit,donate_argnums=(0,))
-    def add(total,rows,value):return total.at[rows].add(value,indices_are_sorted=True,unique_indices=True)
-
-    def evaluate(space,_omega,indices,bounds,_real,ref,time,_count=None):
+            _admit_compiled(kernel,(*args,hole),meta,f'sigma.sector.compiled.{tag}.{hole}',native=native)
+    except BaseException:
+        capacity.live_stages=ambient
+        b_x=b_y=poles=None
+        raise
+    def build(space,_omega,indices,bounds,_real,ref,time,_count=None):
         intervals=shared_pole_intervals(frequencies,np.asarray(indices),np.asarray(bounds))
-        total=zero()
-        for parent,(rows,kernel) in enumerate(kernels):
-            for start in range(0,kmax,width):
-                stop=min(start+width,kmax)
-                selected=np.clip(intervals[parent:parent+1]-start,0,stop-start)
-                if not np.any(selected[:,1]>selected[:,0]):continue
-                if readers[0] is readers[1] and headers[0] is headers[1]:
-                    # A diagonal sector owns one store and needs both
-                    # orientations of the same factor. Read it once.
-                    left_faces=read_shared_pole_faces(
-                        readers[0],(parent,parent+1),meta=meta,header=headers[0],
-                        basis=bases[0],column_span=(start,stop))
-                    right_faces=left_faces
-                else:
-                    # An ordered mixed sector consumes only left-X/right-Y.
-                    # The store owns face placement and admission; requesting
-                    # one orientation avoids an unused collective slab read.
-                    left_faces=read_shared_pole_faces(
-                        readers[0],(parent,parent+1),meta=meta,header=headers[0],
-                        basis=bases[0],column_span=(start,stop),orientations=('x',))
-                    right_faces=read_shared_pole_faces(
-                        readers[1],(parent,parent+1),meta=meta,header=headers[1],
-                        basis=bases[1],column_span=(start,stop),orientations=('y',))
-                if left_faces is not right_faces and not bool(
-                        jnp.all(left_faces[2]==right_faces[2])):
-                    raise ValueError('GATE shared_pole_sector_census: unequal pole values')
-                # Reader may pad the final chunk more narrowly than the full
-                # panel. Pad through the common padding owner to fixed K.
-                x,y=left_faces[0],right_faces[1]
-                # Every stored Kmax is mesh-padded; final width gets its own
-                # GEMM shape by selecting a fixed full-size padded face below.
-                x=jnp.pad(x,((0,0),(0,0),(0,0),(0,width-x.shape[-1])))
-                y=jnp.pad(y,((0,0),(0,0),(0,0),(0,width-y.shape[-1])))
-                poles=jnp.pad(left_faces[2],((0,0),(0,width-left_faces[2].shape[-1])),constant_values=1)
-                value=kernel(x,y,poles,jnp.asarray(selected),ref,time,space=='val')
-                total=add(total,jnp.asarray(rows),value)
-                total.block_until_ready()
-                del left_faces,right_faces,x,y,poles,value
-        if space=='val':total=total[minus]
-        # mu-major/component-minor -> one bounded stack of Lorentz tiles.
-        return jnp.transpose(total.reshape(nk,m,nc,n,nt),(2,4,0,1,3)).reshape(nc*nt,nk,m,n)
-    capacity=meta.shared_pole_capacity
-    live=f'sigma.sector.live.{left.get("sector")}.{right.get("sector")}'
-    capacity.reserve(live,resident_bytes_per_rank=
-        16*nk*m*nc*n*nt//mesh_xy.size+32*width*(m*nc+n*nt)//mesh_xy.size,
-        workspace_bytes_per_rank=0,concurrent_with=capacity.live_stages)
-    def build(*args):
-        ambient=capacity.live_stages
-        capacity.live_stages=(*ambient,live)
+        selected=jnp.asarray(intervals[parent])
+        value=kernel(b_x,b_y,poles,selected,ref,time,space=='val')
+        return jnp.transpose(value.reshape(nk,m,nc,n,nt),(2,4,0,1,3)).reshape(nc*nt,nk,m,n)
+    closed=False
+    def close(result=None):
+        nonlocal b_x,b_y,poles,closed
+        if closed:return
         try:
-            return evaluate(*args)
+            if result is not None:result.block_until_ready()
+            else:jax.block_until_ready((b_x,b_y,poles))
         finally:
+            b_x=b_y=poles=None
             capacity.live_stages=ambient
+            closed=True
+    build.close=close
     build.ordered=True
     return build
 
@@ -343,13 +351,17 @@ def compute_sector_sigma(handle, families, bases, meta, mesh_xy, **options):
         keys=tuple((A,B) for A in (range(1,4) if a else (0,))
                    for B in (range(1,4) if b else (0,)))
         with ExitStack() as stack:
+            bound=[]
             def synthesis(reader, _header, freq, _schedule):
                 # All serial metadata authentication precedes collective file
                 # opens. Diagonal sectors share the already-open first reader.
                 other=(reader if names[0]==names[1] else stack.enter_context(
                     SlabIO(sectors[names[1]]['path'],mode='r',mesh=mesh_xy)))
-                return sector_synthesis((reader,other),pair,(bases[a],bases[b]),
+                builder=sector_synthesis((reader,other),pair,(bases[a],bases[b]),
                     (families[a],families[b]),freq,meta,mesh_xy)
+                bound.append(builder)
+                stack.callback(builder.close)
+                return builder
             context=dict(schedule=lambda _header:dict(route='sector-panels'),
                 synthesis=synthesis,
                 tau_kernel=sector_tau_factory(families[a],families[b],keys,meta,mesh_xy))
@@ -359,6 +371,7 @@ def compute_sector_sigma(handle, families, bases, meta, mesh_xy, **options):
             value=compute_sigma_c_mpa_omega_grid(families[a],sectors[names[0]]['path'],meta,mesh_xy,
                 sigma_w_model='shared_pole',fit_identity=sectors[names[0]]['identity'],
                 fit_digest=sectors[names[0]]['digest'],sector_context=context,**opts)
+            for builder in bound:builder.close(value.sigma_c_kij)
             total=value if total is None else replace(total,sigma_c_kij=total.sigma_c_kij+value.sigma_c_kij)
     constant=instantaneous_sector_sigma(handle['constant'],families,bases,meta,mesh_xy,
                                       occupation_state=options.get('occupation_state'))

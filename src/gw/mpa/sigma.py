@@ -166,10 +166,12 @@ def synthesize_shared_pole_parents(
     return plus, transposed
 
 
-def _shared_pole_contract(b_X, b_Y, weights, *, gemm):
-    """W(τ) = b d b† through G's existing two-axis face contraction.
+def _shared_pole_contract(b_X, b_Y, weights, *, gemm, layout="face"):
+    """W(τ) = b d b† through G's configured face or axis contraction.
 
-    Factors [q,mu,spin,K] tile (mu,K) over (x,y)/(y,x).
+    Factors [q,mu,spin,K] use G's face placement when low_mem_bands is
+    enabled; the axis layout keeps K replicated and divides each centroid
+    endpoint over its assigned mesh axis.  The result always uses both axes.
     The causal weight [q,K] is separate and replicated. The permutations
     below are local axis views, giving exactly psi_mun and psi_nmu layouts.
     """
@@ -182,7 +184,7 @@ def _shared_pole_contract(b_X, b_Y, weights, *, gemm):
     b_Y = b_Y.reshape(b_Y.shape[0], b_Y.shape[1] * b_Y.shape[2], 1, b_Y.shape[3])
     value = build_G(jnp.transpose(b_X, (0, 2, 1, 3)),
                     jnp.transpose(b_Y, (0, 3, 2, 1)),
-                    phases=weights, layout="face", gemm=gemm)
+                    phases=weights, layout=layout, gemm=gemm)
     return value[:, 0, :, 0, :]
 
 

@@ -10,9 +10,10 @@ import argparse
 import json
 import os
 import sys
+import time
 
 
-def check(mesh, root):
+def check(mesh, root, layout):
     import jax
     import jax.numpy as jnp
     import numpy as np
@@ -20,7 +21,8 @@ def check(mesh, root):
     from common.centroid_basis import PackedCentroidBasis
     from common.units import RYD_TO_EV
     from gw.centroid_k_unfold import build_centroid_k_unfold_plan
-    from gw.wavefunction_bundle import BandSlices, Wavefunctions, ParentGreenCarrier, PSI_MUN_SPEC, PSI_NMU_SPEC
+    from gw.wavefunction_bundle import BandSlices, Wavefunctions, ParentGreenCarrier
+    from common.wfn_layout import psi_specs
     from gw.shared_pole_recipe import CapacityLedger
     from gw.photon_layout import PhotonBasisLayout, pack_photon_operator
     from gw.mpa.sector_sigma import compute_sector_sigma
@@ -31,6 +33,7 @@ def check(mesh, root):
     from symmetry_maps import SymMaps, QirrTables, centroid_source_map_and_wrap
     assert mesh.size == jax.process_count() == 4
     rng=np.random.default_rng(1717)
+    nmu_spec,mun_spec=psi_specs(layout)
     nk,nb,ns=4,4,4
     grid=(nk,1,1); fft=(8,1,1)
     k=np.array(list(np.ndindex(grid)))/np.array(grid)
@@ -52,9 +55,9 @@ def check(mesh, root):
         psi=.12*(rng.normal(size=(nk,nb,ns,mu))+1j*rng.normal(size=(nk,nb,ns,mu)))
         packed=basis.pack_host(psi,axis=3)
         en,oc=put(energy),put(f)
-        families.append(Wavefunctions(enk=en,occ=oc,slices=slices,layout='face',
-            green_parent=ParentGreenCarrier(put(packed,PSI_NMU_SPEC),
-                put(packed.transpose(0,2,3,1),PSI_MUN_SPEC),en,oc,plan)))
+        families.append(Wavefunctions(enk=en,occ=oc,slices=slices,layout=layout,
+            green_parent=ParentGreenCarrier(put(packed,nmu_spec),
+                put(packed.transpose(0,2,3,1),mun_spec),en,oc,plan)))
         perm,wraps=centroid_source_map_and_wrap(points,sym.sym_matrices,sym.translations,
                                               np.array(fft),extend_trs=True)
         qt=QirrTables(irr_idx_q=np.arange(nk,dtype=np.int32),sym_idx_q=np.zeros(nk,np.int32),
@@ -84,7 +87,7 @@ def check(mesh, root):
             tables=tables[which],recipe=recipe,receipts=dict(identity=identity),
             sector=name,ordered=True,basis=bases[which])
         models[name]=(path,header);factors[name]=factor;poles[name]=p
-    layout=PhotonBasisLayout.from_centroid_extents(4,8,mesh)
+    photon_layout=PhotonBasisLayout.from_centroid_extents(4,8,mesh)
     constant={}
     for A in range(4):
         for B in range(4):
@@ -95,24 +98,27 @@ def check(mesh, root):
         for B in range(A,4):
             value=(constant[A,B]+constant[B,A].conj().swapaxes(-1,-2))/2
             constant[A,B]=value;constant[B,A]=value.conj().swapaxes(-1,-2)
-    packed=pack_photon_operator(lambda A,B:put(constant[A,B],P(None,'x','y')),nk,layout,mesh)
+    packed=pack_photon_operator(lambda A,B:put(constant[A,B],P(None,'x','y')),nk,photon_layout,mesh)
     bank=root/'bank.h5'
     bank_recipe=dict(recipe,role_codes=dict(line=0,imaginary=1,infinity=2,held_line=3,held_imaginary=4),
         z_ry=np.array([.3+.2j,.7+.4j]),role=np.array([0,3],np.int8),
         distinct_id=np.array([0,1],np.int64),held=np.array([False,True]),
         support_pair=np.array([[-1,-1],[0,1]],np.int64),fit_ids=np.array([0],np.int64),held_ids=np.array([1],np.int64))
     store.initialize_shared_pole_bank(bank,meta=meta,tables=tables[0],recipe=bank_recipe,
-        identity=identity,mesh_xy=mesh,photon_layout=layout,mu_bases=tuple(bases))
+        identity=identity,mesh_xy=mesh,photon_layout=photon_layout,mu_bases=tuple(bases))
     zero=jnp.zeros_like(packed);samples=jnp.stack((zero,zero),axis=1)
     store.write_shared_pole_bank(bank,q_span=(0,nk),sample_span=(0,2),Wc=samples,dWc_ds=samples,
         M0=zero,M1=zero,M2=zero,M3=zero,constant=packed,meta=meta,expected_identity=identity,mesh_xy=mesh)
     handle=store.write_shared_pole_sector_manifest(root/'manifest.json',models=models,
         bank=dict(path=bank),identity=identity,receipts=dict(scope='synthetic oracle'),mesh_xy=mesh)
     omega=np.array([-.3,.0,.35])
+    started=time.perf_counter()
     result=compute_sector_sigma(handle,tuple(families),tuple(bases),meta,mesh,
         omega_grid_ry=omega,efermi_ry=occ.mu_ry,occupation_state=occ,
         regularization_width_ry=eta,quadrature_eps=1e-4,quadrature_cache_dir=str(root/'rules'),
         omega_grid_step_ry=.3,print_fn=print)
+    result.sigma_c_kij.block_until_ready()
+    consumer_wall_s=time.perf_counter()-started
     pauli=(np.array([[0,1],[1,0]]),np.array([[0,-1j],[1j,0]]),np.diag([1,-1]))
     gamma=[np.eye(4)]+[np.block([[np.zeros((2,2)),a],[a,np.zeros((2,2))]]) for a in pauli]
     expected=np.zeros((len(omega),nk,nb,nb),complex)
@@ -144,7 +150,8 @@ def check(mesh, root):
     error=float(np.max(abs(got-expected)))
     scale=float(np.max(abs(expected)))
     assert error < 3e-4*scale+1e-9,(error,scale)
-    return dict(status='PASS',max_absolute_error_ry=error,reference_max_ry=scale,
+    return dict(status='PASS',layout=layout,consumer_wall_s=consumer_wall_s,
+        max_absolute_error_ry=error,reference_max_ry=scale,
         constant_max_ry=float(abs(instantaneous).max()),
         frequency_half_max_ry=[float(abs(x).max()) for x in halves],
         capacity_estimates=[{key:row[key] for key in
@@ -154,14 +161,25 @@ def check(mesh, root):
 
 
 def main():
-    p=argparse.ArgumentParser();p.add_argument('--output',type=Path,required=True);args=p.parse_args()
+    p=argparse.ArgumentParser();p.add_argument('--output',type=Path,required=True)
+    p.add_argument('--layouts',choices=('face','axis','both'),default='face');args=p.parse_args()
     from runtime import initialize_communicator_stack,finalize_process
     initialize_communicator_stack()
     from common.collectives import resolve_mesh
     import jax
-    result=check(resolve_mesh(),args.output.parent)
-    result.update(job=os.environ.get('SLURM_JOB_ID'),step=os.environ.get('SLURM_STEP_ID'))
-    if jax.process_index()==0:args.output.write_text(json.dumps(result,indent=2)+'\n');print(json.dumps(result),flush=True)
+    mesh=resolve_mesh()
+    layouts=('face','axis') if args.layouts=='both' else (args.layouts,)
+    results={}
+    for layout in layouts:
+        root=args.output.parent/layout if len(layouts)>1 else args.output.parent
+        root.mkdir(parents=True,exist_ok=True)
+        results[layout]=check(mesh,root,layout)
+    result=dict(status='PASS',layouts=results,job=os.environ.get('SLURM_JOB_ID'),
+                step=os.environ.get('SLURM_STEP_ID'))
+    if jax.process_index()==0:
+        encoded=json.dumps(result,indent=2,default=str)+'\n'
+        args.output.write_text(encoded)
+        print(encoded,flush=True)
     finalize_process()
 
 if __name__=='__main__':main()
