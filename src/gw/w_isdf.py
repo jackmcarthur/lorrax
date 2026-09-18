@@ -505,7 +505,7 @@ def _get_chi_fractional_contour_kernel_face(
     this retains all components without storing two full spin Green tensors.
     """
     from common.fft_helpers import make_flat_k_fftn
-    from distrib_la import gemm_plan
+    from distrib_la import gemm_plan, panel_matmul
     from .greens_function_kernel import build_G_tau
     from .wavefunction_bundle import (
         G_FFT7D_SPEC,
@@ -585,12 +585,17 @@ def _get_chi_fractional_contour_kernel_face(
     mun_input = (psi_mun_shard, psi_mun_shard) if vertex else psi_mun_shard
     nmu_input = (psi_nmu_shard, psi_nmu_shard) if vertex else psi_nmu_shard
 
-    # ONE planned GEMM, built here (eagerly, once) and shared by every Gf
-    # and Gu build this kernel ever does — mirrors
-    # _get_chi_minimax_kernel_face's own g_plan.
+    # One fixed contraction route is shared by every Gf and Gu build.
+    # Photon bands are narrow enough that bounded native panels avoid
+    # the provider's distributed GEMM communication on every spin pair.
     green_spin = 1 if vertex else ns
-    g_plan = gemm_plan(mesh_xy, m=n_rmu * green_spin, k=nb_full, n=n_rmu * green_spin,
-                       nq=nk_shape, dtype=jnp.complex128, layout=layout)
+    if vertex:
+        # Four photon faces stay x/y tiled; exchange only bounded band panels
+        # for the singleton-spin Green product, whose result stays x/y tiled.
+        g_plan = partial(panel_matmul, mesh=mesh_xy, panel_bytes=16 << 20)
+    else:
+        g_plan = gemm_plan(mesh_xy, m=n_rmu * green_spin, k=nb_full, n=n_rmu * green_spin,
+                           nq=nk_shape, dtype=jnp.complex128, layout=layout)
     def _finish(value):
         value = chi_fftn(value)
         if negate_full_q is None:
