@@ -42,17 +42,19 @@ unfolds it once to full q. The current map retains only those transformed
 factors and replicated squared poles until that sector's frequency integration
 finishes. CC/TT each read two orientations from one store; CT/TC each read
 left-X and right-Y from their separate stores and compare pole arrays. The
-configured `low_mem_bands` layout selects the same factor contraction plan as
-the Green builder: face layout distributes centroid and pole axes, while axis
-layout replicates the pole axis and distributes each centroid endpoint over its
-own axis. Both form one all-P W(t) rectangle at a time. No W(t) history or
-state/pole-pair sum is retained. Setup routing, resident factors, and compiled
+configured `low_mem_bands` layout fixes both factor and Green placement: face
+layout distributes centroid and pole axes, while axis layout replicates the
+pole axis and distributes each centroid endpoint over its own axis. The face
+Green's narrow band contraction uses bounded panels; W(t) still uses its
+planned factor GEMM. Both form one all-P W(t) rectangle at a time. No W(t)
+history or state/pole-pair sum is retained. Setup routing, resident factors, and compiled
 contractions have capacity reservations with explicit sector lifetime.
 
 The constant path retains a whole all-P photon bank, then its all-P packed
 replacement. Both copies and packing workspace are admitted together. Kernel
-admission uses the compiler peak plus the runtime cuFFT query and distributed
-GEMM workspace query; these are capacity estimates, not measured runtime peaks
+admission uses the compiler peak plus the runtime cuFFT query and the native
+workspace query for the remaining distributed GEMMs; these are capacity
+estimates, not measured runtime peaks
 or a performance comparison. Full-frequency material validation remains
 separate from the focused synthetic gate.
 

@@ -24,7 +24,7 @@ from gw.wavefunction_bundle import parent_sigma_operands, sigma_face_kernel_kwar
 
 
 def _native_workspace(mesh_xy, shapes):
-    """Query distributed GEMM scratch for the actual three contraction shapes."""
+    """Query distributed GEMM scratch for the supplied contraction shapes."""
     from distrib_la import plan, workspace_bytes_per_rank
     context=plan('eigh',mesh_xy,n=max(max(a[-2:]+b[-2:]) for a,b in shapes),
                  backend='distributed',batched_route='auto')
@@ -51,7 +51,7 @@ def sector_tau_factory(left, right, keys, meta, mesh_xy):
     at-most-nine Lorentz blocks uses the existing FFT convolution owner.
     Only the small projected band operator survives the call.
     """
-    from distrib_la import gemm_plan
+    from distrib_la import gemm_plan, panel_matmul
     from common.contract_bands import contract_bands_block_reshard
     from gw.greens_function_kernel import build_G, _weighted_tau_phases
     from gw.cohsex_sigma import _make_static_convolution
@@ -61,14 +61,23 @@ def sector_tau_factory(left, right, keys, meta, mesh_xy):
     shapes = tuple((p.n_parent, c.psi_nmu.shape[1], p.n_centroid_packed, p.nspinor)
                    for c, p in zip((a, b), plans))
     q=shapes[0][0];m=shapes[0][2]*shapes[0][3];n=shapes[1][2]*shapes[1][3];k=shapes[0][1]
-    native=_native_workspace(mesh_xy,(((q,m,k),(q,k,n)),))
+    # The face Green has a narrow band contraction. Its persistent ψ and G
+    # remain two-axis tiled; only a bounded contraction panel is gathered.
+    face_green = a.layout == 'face'
+    green_panel_bytes = 32 << 20
+    native=(0 if face_green else
+            _native_workspace(mesh_xy,(((q,m,k),(q,k,n)),)))
     meta.shared_pole_capacity.reserve(f'sigma.sector.tau.warm.{keys[0]}',
         resident_bytes_per_rank=0,
-        workspace_bytes_per_rank=2*16*q*(m*k+k*n+m*n)//mesh_xy.size+native,
+        workspace_bytes_per_rank=(2*16*q*(m*k+k*n+m*n)//mesh_xy.size
+                                  +native+(green_panel_bytes if face_green else 0)),
         concurrent_with=meta.shared_pole_capacity.live_stages)
-    gemm = gemm_plan(mesh_xy, m=shapes[0][2]*shapes[0][3], k=shapes[0][1],
-                    n=shapes[1][2]*shapes[1][3], nq=shapes[0][0],
-                    dtype=jnp.complex128, layout=a.layout)
+    if face_green:
+        gemm = partial(panel_matmul, mesh=mesh_xy,
+                       panel_bytes=green_panel_bytes)
+    else:
+        gemm = gemm_plan(mesh_xy, m=m, k=k, n=n, nq=q,
+                         dtype=jnp.complex128, layout=a.layout)
     convolve = _make_static_convolution(mesh_xy, meta.kgrid, meta.nk_tot, lorentz=True)
     vertices = jax.tree.map(lambda *xs: jnp.stack(xs),
         *((gamma_perm_phase(A), gamma_perm_phase(B)) for A, B in keys))
@@ -97,8 +106,9 @@ def sector_tau_factory(left, right, keys, meta, mesh_xy):
             if admitted is None:
                 q=shapes[0][0]; m=shapes[0][2]*shapes[0][3]
                 n=shapes[1][2]*shapes[1][3]; k=shapes[0][1]; b=band_axis.padded
-                native=_native_workspace(mesh_xy,(((q,m,k),(q,k,n)),
-                    ((q,b,m),(q,m,n)),((q,b,n),(q,n,b))))
+                projector_shapes=(((q,b,m),(q,m,n)),((q,b,n),(q,n,b)))
+                native=_native_workspace(mesh_xy,projector_shapes if face_green
+                    else (((q,m,k),(q,k,n)),*projector_shapes))
                 admitted=_admit_compiled(kernel,args,meta,
                     f'sigma.sector.tau.{keys[0]}',native=native)
             return admitted(*args)
