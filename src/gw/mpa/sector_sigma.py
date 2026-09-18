@@ -237,8 +237,7 @@ def sector_synthesis(readers, headers, bases, families, frequencies, meta, mesh_
         raise
     try:
         gemm=gemm_plan(mesh_xy,m=m*nc,n=n*nt,k=kcarrier,nq=nk,
-                       dtype=np.complex128,layout=layout,
-                       enable_active_range=True)
+                       dtype=np.complex128,layout=layout)
         minus=jnp.asarray(q_negation_index(tuple(left['grid'])))
         @partial(jax.jit,static_argnums=(6,))
         def kernel(x,y,omega,interval,ref,time,hole):
@@ -248,8 +247,7 @@ def sector_synthesis(readers, headers, bases, families, frequencies, meta, mesh_
                 omega=jnp.take(omega,minus,axis=0)
                 interval=jnp.take(interval,minus,axis=0)
             weights=_shared_pole_weights(omega,interval,ref,time)
-            return _shared_pole_contract(x,y,weights,gemm=gemm,layout=layout,
-                                         band_range=(interval[:,0],interval[:,1]))
+            return _shared_pole_contract(x,y,weights,gemm=gemm,layout=layout)
         def abstract(shape,dtype,spec=P()):
             return jax.ShapeDtypeStruct(shape,dtype,sharding=NamedSharding(mesh_xy,spec))
         args=(abstract((nk,m,nc,kcarrier),np.complex128,factor_spec[0]),
