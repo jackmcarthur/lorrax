@@ -3713,7 +3713,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     if _frozen_active is not None:
         inputs.print_fn(
             f"    SC scissor: frozen from map 0 ({_frozen_active.summary()})")
-    H_qp_dft_new, scissor_fit, partition = _apply_scissor_partition_policy(
+    H_qp_dft_new, scissor_fit, promoted_partition = _apply_scissor_partition_policy(
         H_qp_dft_full, e_dft_act, val_mask, _partition_on_loop(partition, inputs), ks,
         efermi_dft_ry=float(inputs.efermi_dft_ry),
         n_occ=n_occ,
@@ -3724,6 +3724,14 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         scissor_fit=(_frozen_active if _frozen_active is not None else tail_fit),
         use_valence_fit=(inputs.config.sc.tail_fit == "buffer_edges"),
         label="SC", print_fn=inputs.print_fn)
+    # The policy sees the loop's k-set; the carried partition is full-BZ.
+    # Restore the promoted frontier masks before the next map re-selects them.
+    if ks.is_identity:
+        partition = promoted_partition
+    else:
+        partition = BandPartition(
+            protected_mask=ks.broadcast(promoted_partition.protected_mask),
+            in_range_mask=ks.broadcast(promoted_partition.in_range_mask))
     # THE STAR-SPREAD GATE, ON THE OBJECT THAT SHIPS.  It ran before the
     # partition until 2026-08-16, which certified a matrix the loop then
     # rewrote.  The partition is precisely the operation that could break the
