@@ -1486,6 +1486,7 @@ def compute_sigma_c_mpa_omega_grid(
     band_brackets=None,
     band_counts=None,
     fixed_quadrature_session=None,
+    material_class=None,
     sigma_w_model="mpa",
     analytic_line=False,
     sector_context=None,
@@ -1626,7 +1627,8 @@ def compute_sigma_c_mpa_omega_grid(
                     cache_dir=quadrature_cache_dir,
                     print_fn=print_fn, edge_factor=edge_factor,
                     fixed_rule_session=fixed_quadrature_session,
-                    analytic_line=bool(analytic_line))
+                    analytic_line=bool(analytic_line),
+                    material_class=material_class)
         quadrature_log.record_sigma_plan(geometry)
         if plan_mode == "panes":
             print_fn(
@@ -1643,20 +1645,28 @@ def compute_sigma_c_mpa_omega_grid(
                 f"{geometry['distinct_tau_count']} branch-distinct tau, "
                 f"cache={geometry['cache_dir'] or 'off'}")
             if geometry["sc_fixed_quadrature"]:
+                reasons = geometry.get("sc_fixed_recompute_reasons") or {}
                 print_fn(
                     "  SC fixed quadrature: "
                     f"iteration={geometry['sc_fixed_iteration']}, "
                     f"initialized={geometry['sc_fixed_initialized']}, "
+                    f"frozen={not reasons and geometry['sc_fixed_rebuilds_this_iteration'] == 0}, "
                     f"rebuilds_this_iteration="
                     f"{geometry['sc_fixed_rebuilds_this_iteration']}, "
                     f"rebuilds_total="
                     f"{geometry['sc_fixed_total_rebuild_count']}, "
+                    f"window_pad={geometry['sc_fixed_window_pad_ev']:.1f} eV, "
+                    f"material_class={geometry.get('sc_fixed_material_class')}, "
                     f"pair_cost={geometry['window_tau_pairs']}, "
                     f"initial_pair_cost="
                     f"{geometry['sc_fixed_initial_window_tau_pairs']}, "
                     f"max_state_pad={geometry['sc_state_edge_padding_ev']:.3f} eV (energy-proportional), "
                     f"pole_pad="
                     f"{100.0 * geometry['sc_pole_extent_padding_fraction']:.1f}%")
+                for name, reason in sorted(reasons.items()):
+                    print_fn(
+                        f"    SC fixed quadrature recompute: {name!r} "
+                        f"({reason})")
             for branch in geometry["branches"]:
                 for window in branch["windows"]:
                     prefix = (
