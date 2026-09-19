@@ -428,6 +428,41 @@ NOT part of the ruling: the active-window scissor law itself fitted with zero
 samples (`ScissorFit(val n=0 w=0; cond n=0 w=0)`, α=1, β=0), so scissored
 states sit at their DFT energies; that is a separate defect (claims/2486.md).
 
+### 20.1 Validated metal self-consistency defaults (2026-09-19)
+
+These are the settings and code behaviours that produced a *contracting* Fe
+4x4x4 charge-only headless shared-pole loop (`10p`, source `e0ab4c6e`, P16,
+window -12/+8 eV): accepted `max|dE|` 5.50 -> 0.90 -> 0.19 -> 0.10 -> 0.046 ->
+0.0098 -> 0.0030 eV with **zero** Gram refusals, against 32 refusals and a
+non-contracting 0.3-2.4 eV residual band on the same deck before them.
+
+* **Classify the protected identity set once and carry it frozen.** No band
+  may enter or leave the set mid-loop; every other band is scissored
+  (pitfall 20). A per-map promotion walks the set up the ladder by two bands
+  per map at ~5 eV per step.
+* **The crossing tolerance must be sized to the deck's tail.** Fermi-Dirac
+  needs `ln(1/tol)` widths to saturate; 1e-3 = 6.9 widths (about +-1.9 eV at
+  `kBT = 0.02 Ry`). `1e-8` needed 18.4 widths, marked the whole d manifold
+  crossing, emptied both scissor fit classes and silently degenerated the
+  active-window law to the identity.
+* **A zero-sample fit is not a law.** Fall back to the sum-band tail law
+  (which always has samples) and record which class was empty -- never let an
+  empty class be invisible.
+* **Keep the window around the complete Fermi-surface manifold with margin.**
+  On Fe the manifold is bands 13-18 and the frozen set is 9-20; if the manifold
+  approaches the set edge the scissor starts cutting the Fermi surface.
+* **`sc_max_iter` counts map calls, not iterates** (rCROP spends two per
+  accepted iterate). Size it for the measured 2.5x-per-pair contraction; the
+  default is now 30.
+* **mu is solved, not mixed.** One fixed-N solve per map from the map's own
+  input spectrum (`_solve_occupation_state`), used by the window
+  classification, the chi0/W weights and the shared-pole recipe; the scissor's
+  valence displacement is anchored to the partitioned-output Fermi level
+  (`E_F(QP) - E_F(DFT)`, a difference -- the DFT reference must never be
+  compared absolutely to a QP energy). Do not damp mu; if the Fermi level
+  oscillates, look for a *different* Fermi-level convention or a
+  non-smooth stage of the map, not for a mixing knob.
+
 ## Evidence
 
 Sandbox reports (paths under

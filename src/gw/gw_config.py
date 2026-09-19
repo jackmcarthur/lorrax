@@ -1386,7 +1386,15 @@ _DEFAULTS = {
     # Self-consistency loop knobs (read only when qp_solver=self_consistent).
     # Promoted from the LORRAX_SC_* env vars (2026-07-08); the envs are
     # still honored as deprecated overrides.
-    "sc_max_iter": 20,
+    # rCROP spends TWO map calls per accepted iterate (one trial, one
+    # accepted input map), so this number is a count of map calls, not of
+    # iterates.  MEASURED on Fe 4x4x4 charge-only headless shared-pole SC
+    # (10p, source e0ab4c6e): from a DFT start the accepted max|dE| falls
+    # 5.50 -> 0.90 -> 0.19 -> 0.10 -> 0.046 -> 0.0098 -> 0.0030 eV, i.e.
+    # about 2.5x per accepted pair, so reaching the 1e-4 eV criterion needs
+    # roughly 22 map calls on that deck -- a 20-call default truncates a run
+    # that is still contracting.
+    "sc_max_iter": 30,
     "sc_tol_ev": 1.0e-4,
     # rcrop is the ONLY supported value; `linear` refuses by name at
     # ``SCConfig.__post_init__`` (GATE sc_accelerator_rcrop_only).

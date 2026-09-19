@@ -3009,7 +3009,8 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     buffer_mask = _sc_buffer_mask(inputs)
     if buffer_mask.any():
         buffer_ids = np.flatnonzero(buffer_mask) + int(inputs.band_slices.b0) + 1
-        inputs.print_fn(
+        _record_sc(
+            inputs,
             f"    SC window buffer: mode={inputs.config.sc.buffer_mode}, "
             f"bands={_band_ranges(buffer_mask, band_offset=int(inputs.band_slices.b0))} "
             f"(n={buffer_ids.size}); named core="
@@ -3746,7 +3747,11 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     # exact rows selected above.
     _frozen_active, _frozen_tail_unused = _frozen_scissor_fits(state)
     if _frozen_active is not None:
-        inputs.print_fn(
+        # Same channel rule as the policy's diagnostics below: the log keeps
+        # what goes through ``_record_sc``, so a frozen-law decision must not
+        # be reported only on the unlogged printer.
+        _record_sc(
+            inputs,
             f"    SC scissor: frozen from map 0 ({_frozen_active.summary()})")
     H_qp_dft_new, scissor_fit, promoted_partition = _apply_scissor_partition_policy(
         H_qp_dft_full, e_dft_act, val_mask, _partition_on_loop(partition, inputs), ks,
