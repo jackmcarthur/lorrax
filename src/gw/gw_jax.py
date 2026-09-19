@@ -1338,6 +1338,44 @@ def _report_final_observables(
             tol_ev=config.eqp2.tol_ev)
 
 
+def _published_artifacts(rows, *, print_fn):
+    """Refuse to call a run completed while an artifact is unpublished.
+
+    A run that prints the completion line while an artifact is missing or
+    still inside a collective write transaction is not a usable run: on
+    2026-09-19 the converged Fe runs 10p/10q/10r each printed the line and
+    left ``sigma_mnk.h5`` at ``lorrax_io_committed = 0``.  Rows are
+    ``(label, path, required)``; a present file carrying the commit receipt
+    dataset must read 1.
+    """
+    import h5py
+
+    ok = True
+    print_fn("  published artifacts:")
+    for label, path, required in rows:
+        if path is None:
+            print_fn(f"    {label}: not requested")
+            continue
+        path = str(path)
+        if not os.path.exists(path):
+            print_fn(f"    {label}: {'MISSING' if required else 'absent'} ({path})")
+            ok = ok and not required
+            continue
+        state = "present"
+        try:
+            with h5py.File(path, "r") as h5:
+                if "lorrax_io_committed" in h5:
+                    committed = int(np.asarray(h5["lorrax_io_committed"])[0])
+                    state = f"committed={committed}"
+                    if committed != 1:
+                        ok = False
+        except Exception as exc:              # unreadable is not published
+            state = f"unreadable ({type(exc).__name__})"
+            ok = False
+        print_fn(f"    {label}: {state} ({path})")
+    return ok
+
+
 def _report_file_rows(args, config, input_dir, report, sigma_omega_h5_path, tensors_filename):
     """Produce the report rows for consumed and generated files."""
     _file_rows = [
@@ -1502,6 +1540,16 @@ def main(argv=None):
 	report.timings(timing.records(), wall=_wall)
 	report.warnings()
 	report.files(_file_rows)
+	if not _published_artifacts(
+	        (("Sigma matrix elements", sigma_omega_h5_path, True),
+	         ("restart tensors", tensors_filename, False)),
+	        print_fn=print0):
+	    raise RuntimeError(
+	        "GATE gw_artifacts_unpublished: got: a required artifact is "
+	        "missing or left uncommitted (manifest above); want: every "
+	        "listed artifact present and committed; why: a run that prints "
+	        "the completion line while a published artifact is missing or "
+	        "still inside its write transaction is not a usable run")
 	report.finish()
 	production_stdout.close()
 	return 0
