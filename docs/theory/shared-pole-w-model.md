@@ -380,8 +380,10 @@ H_{ab}=X_a^\dagger SX_b=s_b\,G_{ab}-Q_a^\dagger O_b,
 \tag{W 18}
 $$
 
-with the confluent limit $G_{aa'}=-Q_a^\dagger D_{a'}Q_{a'}$. The infinity
-state $X_\infty=BQ_\infty$ closes the pencil with the moments:
+with the confluent limit
+$G_{aa'}=-Q_a^\dagger\,\partial_sW(\bar s_a)Q_{a'}$, evaluated on the
+partner's node. The infinity state $X_\infty=BQ_\infty$ closes the pencil with
+the moments:
 
 $$
 G_{\infty b}=Q_\infty^\dagger O_b,\qquad
