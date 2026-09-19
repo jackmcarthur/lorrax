@@ -1229,6 +1229,7 @@ def _compute_mpa_sigma(
         fixed_quadrature_session=(
             None if fixed_quadrature_session is None else
             fixed_quadrature_session.setdefault(sigma_w_model, {})),
+        material_class=material_class,
         print_fn=print_fn)
     sector_handle = W_by_role.get("shared_pole", {})
     if sector_handle.get("representation") == "sector-ordered-ph":
