@@ -2954,18 +2954,42 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     _mu_ev = (float(entry_occ_state.mu_ry) * RYD_TO_EV
               if entry_occ_state is not None else
               float(inputs.wfn.efermi) * RYD_TO_EV)
-    partition = build_omega_band_partition(
-        energies_loop / RYD_TO_EV,
-        reference_full if ks.is_identity else np.asarray(ks.select(reference_full)),
-        band_offset=int(inputs.band_slices.b0),
-        omega_min_abs_ev=float(inputs.config.sigma.omega_min_ev) + _mu_ev,
-        omega_max_abs_ev=float(inputs.config.sigma.omega_max_ev) + _mu_ev,
-        previous_partition=(None if state.partition is None else
-                            _partition_on_loop(state.partition, inputs)),
-        mu_ev=_mu_ev, current_indices_kn=indices_loop,
-        degeneracy_tol_ev=float(inputs.config.sc.exact_degeneracy_tol_ev),
-        label=f"SC map {int(state.iteration)} (identity, mu-anchored)",
-        print_fn=lambda line: _record_sc(inputs, line))
+    # ONE CLASSIFICATION, THEN FROZEN (owner ruling 2026-09-19).  The
+    # protected identity set is decided once, on map 0, and every later map
+    # carries it unchanged; bands outside it are scissored for the whole run.
+    # The previous per-map reclassification let the frontier chase its own
+    # corrections: MEASURED on Fe 4x4x4 charge-only headless shared-pole SC
+    # (10l_frontier_trace3b, source 43ba1e1e) map 0 promoted identities
+    # 18/19 (bands 19/20) and map 1 promoted 20/21 (bands 21/22) at every k,
+    # each promotion switching a band from the scissor to the full Sigma
+    # correction (+4.7 to +4.9 eV here).  The accepted residual was that walk
+    # (5.503 -> 5.220 -> 5.080 -> 3.924 -> 4.797 -> 3.670 -> 4.699 -> 5.248
+    # -> 4.208 -> 5.129 -> 4.046 -> 5.187 -> 2.743 -> 5.435 -> 2.610 eV over
+    # 15 calls, map gain 2.05-3.42) while the protected manifold itself moved
+    # 0.03-0.25 eV.  ``partition`` from SCState is the map-0 decision.
+    _frozen_partition = (int(state.iteration) > 0 and state.partition is not None)
+    if _frozen_partition:
+        partition = _partition_on_loop(state.partition, inputs)
+        _record_sc(
+            inputs,
+            f"  SC map {int(state.iteration)} (identity, mu-anchored) partition: "
+            "FROZEN from map 0 (owner ruling 2026-09-19); protected at all k="
+            f"{_band_ranges(partition.protected_mask, band_offset=int(inputs.band_slices.b0))}, "
+            f"in_range={_band_ranges(partition.in_range_mask, band_offset=int(inputs.band_slices.b0))}; "
+            "no band enters or leaves the set for the rest of the loop.")
+    else:
+        partition = build_omega_band_partition(
+            energies_loop / RYD_TO_EV,
+            reference_full if ks.is_identity else np.asarray(ks.select(reference_full)),
+            band_offset=int(inputs.band_slices.b0),
+            omega_min_abs_ev=float(inputs.config.sigma.omega_min_ev) + _mu_ev,
+            omega_max_abs_ev=float(inputs.config.sigma.omega_max_ev) + _mu_ev,
+            previous_partition=(None if state.partition is None else
+                                _partition_on_loop(state.partition, inputs)),
+            mu_ev=_mu_ev, current_indices_kn=indices_loop,
+            degeneracy_tol_ev=float(inputs.config.sc.exact_degeneracy_tol_ev),
+            label=f"SC map {int(state.iteration)} (identity, mu-anchored)",
+            print_fn=lambda line: _record_sc(inputs, line))
     if not ks.is_identity:
         partition = BandPartition(
             protected_mask=ks.broadcast(partition.protected_mask),
@@ -3733,6 +3757,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         # rank-0.log, gwjax.out or the launcher log (jobs 58551752, 58550102),
         # which is why the residual could not be attributed from the artifacts.
         # Record the policy's own diagnostics on the log's channel.
+        allow_frontier_promotion=not _frozen_partition,
         label="SC", print_fn=lambda line: _record_sc(inputs, line))
     # The carry lives on the full BZ while this policy sees the loop's k-set
     # (the wedge here: 64 x 26 carried against 13 x 26 classified), so the
@@ -3979,6 +4004,7 @@ def _apply_scissor_partition_policy(
     band_classes=None,
     scissor_fit: ScissorFit | None = None,
     use_valence_fit: bool = False,
+    allow_frontier_promotion: bool = True,
     label: str = "SC",
     print_fn=print,
 ) -> tuple[jax.Array, ScissorFit | None, BandPartition]:
@@ -4009,7 +4035,14 @@ def _apply_scissor_partition_policy(
         retained_kn = np.broadcast_to(np.asarray(
             partition.protected_mask | partition.in_range_mask, dtype=bool),
             np.shape(e_dft_kn_ry))
-        if band_classes is not None and band_classes.n_crossing:
+        if not allow_frontier_promotion:
+            # Owner ruling 2026-09-19: the protected identity set is decided
+            # once and carried, so no later map may add a band -- not even a
+            # Fermi-crossing one.  The map-0 classification already retained
+            # that manifold (that is what the promotion there is for); a map
+            # that tries to promote again is chasing corrections it caused.
+            frontier_kn = np.zeros(retained_kn.shape, dtype=bool)
+        elif band_classes is not None and band_classes.n_crossing:
             _, frontier_kn = band_classes.masks(retained_kn.shape)
         else:
             # IDENTITY SPACE, AND ONLY A REAL CROSSING.  ``retained_kn`` is a

@@ -292,6 +292,34 @@ def test_frontier_manifold_is_promoted_instead_of_refused():
         energy[0, 1] / RYD_TO_EV)
 
 
+def test_frozen_partition_never_promotes_a_later_map():
+    """Owner ruling 2026-09-19: the protected set is decided once, on map 0.
+
+    Same crossing fixture as the promotion test, with the promotion switched
+    off the way ``gw_iteration_map`` switches it off for every map after the
+    first: the identity set must not grow, so the crossing band keeps the
+    scissor law for the whole loop.
+    """
+    from types import SimpleNamespace
+    from gw.sc_iteration import _apply_scissor_partition_policy
+    from gw.scissor import ScissorBandClasses
+
+    reference = np.array([[-1., 4., 8.]])
+    energy = np.array([[-1., 6., 10.]])
+    partition = _partition(energy, reference)
+    classes = ScissorBandClasses(valence_stop=1, conduction_start=2)
+    kstar = SimpleNamespace(irr_idx=np.array([0]), select=lambda a: a)
+    h = jnp.asarray(np.diag(energy[0] / RYD_TO_EV)[None])
+    _result, _fit, promoted = _apply_scissor_partition_policy(
+        h, reference / RYD_TO_EV, np.array([[True, False, False]]),
+        partition, kstar, efermi_dft_ry=0., n_occ=1,
+        candidate_efermi_fn=lambda _: 0., band_classes=classes,
+        allow_frontier_promotion=False, print_fn=lambda _: None)
+    np.testing.assert_array_equal(
+        np.asarray(promoted.protected_mask),
+        np.asarray(partition.protected_mask))
+
+
 def test_index_fallback_frontier_is_identity_space_and_crossing_only():
     """Without an occupation table the fallback frontier must still name a band.
 

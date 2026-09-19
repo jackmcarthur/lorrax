@@ -407,6 +407,27 @@ input: chi0, the body W and the final trusted-block H scale linearly
 (48.6, pole count changes), which names the head MPA refit as the first
 non-smooth stage of the map.
 
+**20. The protected identity set is decided once and is not re-chosen
+(owner ruling 2026-09-19).** Pitfall 16's per-map reclassification, its pad
+and the frontier promotion are retired as band *selectors*: map 0 classifies,
+map 0 retains the Fermi-crossing manifold so the anchor is never evaluated
+through the scissor, and every later map carries that identity set unchanged.
+Bands outside it follow the scissor law for the whole run. No map may add or
+drop a protected band. MEASURED before the ruling on Fe 4x4x4 charge-only
+headless shared-pole SC (`runs/Fe/04_symmetric_small_bispinor_2026-09-17/10l_frontier_trace3b`,
+source 43ba1e1e, pool 58550102): map 0 promoted identities 18/19 (bands 19/20)
+and map 1 promoted 20/21 (bands 21/22) at every k; each promotion switched a
+band from the scissor to the full Σ correction (+4.7 to +4.9 eV on that deck),
+so the accepted fixed-point residual was the walk itself (5.503 → 5.220 →
+5.080 → 3.924 → 4.797 → 3.670 → 4.699 → 5.248 → 4.208 → 5.129 → 4.046 →
+5.187 → 2.743 → 5.435 → 2.610 eV over 15 calls, map gain 2.05-3.42) while the
+protected manifold moved 0.03-0.25 eV per call. The 2026-09-18 pack of the
+frontier into the policy stays as the map-0 mechanism; `allow_frontier_promotion=False`
+is what the loop's later maps pass. One consequence remains on this deck and is
+NOT part of the ruling: the active-window scissor law itself fitted with zero
+samples (`ScissorFit(val n=0 w=0; cond n=0 w=0)`, α=1, β=0), so scissored
+states sit at their DFT energies; that is a separate defect (claims/2486.md).
+
 ## Evidence
 
 Sandbox reports (paths under
