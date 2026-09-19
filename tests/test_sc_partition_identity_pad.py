@@ -292,6 +292,45 @@ def test_frontier_manifold_is_promoted_instead_of_refused():
         energy[0, 1] / RYD_TO_EV)
 
 
+def test_index_fallback_frontier_is_identity_space_and_crossing_only():
+    """Without an occupation table the fallback frontier must still name a band.
+
+    ``retained_kn`` inside the policy is a ``(k, DFT identity)`` mask, so a
+    fallback that names sorted columns promotes whatever identity happens to
+    sit in that column on that map -- measured as the Fe 4x4x4 promotion
+    flipping 21 -> 22 -> 21 between calls and moving a band 3-5 eV against a
+    1e-4 eV cutoff.  Two statements pin the replacement: a far LUMO across a
+    vacuum gap is never promoted, and a near-Fermi LUMO that the window
+    scissored is promoted by identity.
+    """
+    from types import SimpleNamespace
+    from gw.band_partition import BandPartition
+    from gw.sc_iteration import _apply_scissor_partition_policy
+
+    kstar = SimpleNamespace(irr_idx=np.array([0]), select=lambda a: a)
+    retained = BandPartition(
+        protected_mask=jnp.asarray([[True, False, False]]),
+        in_range_mask=jnp.asarray([[True, False, False]]))
+
+    def promoted_for(reference_ev, fermi_ev):
+        energy = np.asarray(reference_ev, dtype=np.float64)
+        h = jnp.asarray(np.diag(energy[0] / RYD_TO_EV)[None])
+        _result, _fit, promoted = _apply_scissor_partition_policy(
+            h, energy / RYD_TO_EV, np.asarray([[True, False, False]]),
+            retained, kstar, efermi_dft_ry=fermi_ev / RYD_TO_EV, n_occ=2,
+            candidate_efermi_fn=lambda _: 0., print_fn=lambda _: None)
+        return np.asarray(promoted.protected_mask)
+
+    # 20 eV above the Fermi level: no crossing, nothing to protect.
+    vacuum = promoted_for(np.array([[-1.0, 20.0, 30.0]]), 0.5)
+    assert vacuum[0, 1] is np.bool_(False)
+    # 0.1 eV above the Fermi level, scissored by the window: promoted, and the
+    # identity that is promoted is the LUMO's, not a column index.
+    crossing = promoted_for(np.array([[-1.0, 0.6, 30.0]]), 0.5)
+    assert crossing[0, 1] is np.bool_(True)
+    assert crossing[0, 2] is np.bool_(False)
+
+
 def test_fermi_classes_follow_per_k_state_identities():
     from gw.scissor import ScissorBandClasses
 

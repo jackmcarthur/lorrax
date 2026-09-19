@@ -3979,11 +3979,45 @@ def _apply_scissor_partition_policy(
         if band_classes is not None and band_classes.n_crossing:
             _, frontier_kn = band_classes.masks(retained_kn.shape)
         else:
-            frontier = np.asarray(
-                [max(0, n_occ - 1), min(n_occ, retained_kn.shape[1] - 1)],
-                dtype=np.int64)
-            frontier_kn = np.zeros(retained_kn.shape, dtype=bool)
-            frontier_kn[:, frontier] = True
+            # IDENTITY SPACE, AND ONLY A REAL CROSSING.  ``retained_kn`` is a
+            # ``(k, DFT identity)`` mask -- the carry's own basis (pitfall 18
+            # of docs/self_consistency.md) -- so the frontier it is compared
+            # against must be one too.  The historical fallback named the two
+            # sorted COLUMNS ``[n_occ - 1, n_occ]``; a crossing changes which
+            # identity sits in a column, so the promoted identity followed the
+            # sorted QP order instead of the band.  MEASURED (Fe 4x4x4
+            # charge-only, source 727a1622, job 58551752): the promoted
+            # identity flipped 21 -> 22 -> 21 between consecutive calls and
+            # each flip moved a band by 3-5 eV against a 1e-4 eV cutoff, so
+            # the fixed-point residual WAS the flip (5.50 -> 2.61 eV over 15
+            # calls, map gain 2.33, no contraction) rather than any physical
+            # motion; the protected d manifold's own residual was 0.03-0.25
+            # eV.  Read the frontier once, in identity space, from the
+            # immutable reference ladder at the DFT Fermi level, and admit a
+            # band only inside the shared near-Fermi pad: a genuinely
+            # partially occupied manifold is still retained, while a vacuum
+            # gap (the same deck's 22 eV HOMO-LUMO gap at k=0) promotes
+            # nothing and a scissored state cannot re-enter as protected on
+            # one map and leave on the next.
+            from .scissor import sc_state_pad_ev
+
+            e_ref = np.asarray(e_dft_kn_ry, dtype=np.float64)
+            e_fermi_ry = float(efermi_dft_ry)
+            occupied = e_ref < e_fermi_ry
+            ncols = int(e_ref.shape[1])
+            frontier_kn = np.zeros(e_ref.shape, dtype=bool)
+            rows = np.arange(e_ref.shape[0])
+            have = occupied.any(axis=1)
+            top = np.where(
+                have, ncols - 1 - np.argmax(occupied[:, ::-1], axis=1), -1)
+            here = rows[have]
+            frontier_kn[here, top[have]] = True
+            nxt = np.minimum(top + 1, ncols - 1)
+            inside = np.zeros(e_ref.shape[0], dtype=bool)
+            near_ry = float(sc_state_pad_ev(0.0)) / RYD_TO_EV
+            inside[have] = (
+                e_ref[here, nxt[have]] - e_fermi_ry) <= near_ry
+            frontier_kn[rows[have & inside], nxt[have & inside]] = True
         bad_frontier = np.argwhere(frontier_kn & ~retained_kn)
         if bad_frontier.size:
             # The crossing manifold is an identity set, not an energy-window
