@@ -24,6 +24,7 @@ Each arrow has one detailed owner:
 | How are static and GN/HL-PPM frequency integrals separated? | [Minimax quadrature](minimax-quadrature.md) |
 | What fixes the HL plasmon pole? | [HL-GPP derivation](hl-gpp-derivation.md) |
 | How are MPA samples, poles, and Sigma windows constructed? | [Multipole frequency integration](THEORY_mpa_implementation.md) |
+| What is the shared-pole W model, and how many poles does it need? | [Shared-pole screened interaction](shared-pole-w-model.md) |
 | What is the long-wavelength response convention? | [S-tensor convention](s-tensor-convention.md) |
 | Why is the exchange head direction dependent? | [LT splitting and the exchange head](lt-exchange-head.md) |
 | How do the four-current (bispinor) channels treat q→0, and which carry frequency? | [Four-current heads and frequency](four-current-head-corrections.md) |
