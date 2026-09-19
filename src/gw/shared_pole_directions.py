@@ -143,6 +143,7 @@ BATCH_AXES = ('x', 'y')
 
 def select_round_states(samples, recipe, *, sample_lo, real, mesh_xy, eigh_plan, svd_plan,
                         column_extent, logical_n, ordered=False, exchange=None,
+                        current_rotation=None):
     """Directions, outputs and actions of one round of parents, batched per role (W 14, W 28).
     ``samples`` holds ``Wc``/``dWc_ds`` [P, S, n, n] in batch layout (rank r owns
     round slot r), sample ``sample_lo + j`` at index j; slots ``>= real`` are
