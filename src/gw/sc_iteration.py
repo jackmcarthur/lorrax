@@ -695,13 +695,20 @@ def _sc_output_tables_on_loop_kset(
             f"{np.shape(U_loop)[0]} rows, expected {kstar.nk_irr} on the "
             "loop k-set")
     if exact_loop is not None:
+        expected_bands = tuple(int(n) for n in np.shape(delta_h_qp)[-2:])
         for name in ("scalar_dft", "transverse_dft"):
             value = getattr(exact_loop, name)
-            if value is not None and int(np.shape(value)[0]) != int(
-                    kstar.nk_irr):
+            if value is None:
+                continue
+            if int(np.shape(value)[0]) != int(kstar.nk_irr):
                 raise ValueError(
                     f"SC output seam: exact Hartree {name} has "
                     f"{np.shape(value)[0]} rows, expected {kstar.nk_irr}")
+            if tuple(int(n) for n in np.shape(value)[-2:]) != expected_bands:
+                raise ValueError(
+                    f"SC output seam: exact Hartree {name} has band matrix "
+                    f"{np.shape(value)[-2:]}, expected logical SC matrix "
+                    f"{expected_bands}")
     return (
         sigma_loop, U_loop, exact_loop, delta_h_qp,
         delta_h_qp_unextrap)
@@ -1850,7 +1857,7 @@ def run_fixed_sigma_evsc(
         H_full = h0_dft + sigma_xc_dft
         H_full = 0.5 * (
             H_full + jnp.conj(jnp.swapaxes(H_full, -1, -2)))
-        H_out, _ = _apply_scissor_partition_policy(
+        H_out, _, _ = _apply_scissor_partition_policy(
             H_full, e_dft_ry, valence_mask_kn, partition, kstar,
             efermi_dft_ry=efermi_dft_scissor_ry,
             n_occ=n_occ,
@@ -2028,7 +2035,26 @@ def _rotate_to_dft_basis(O_qp: jax.Array, U: jax.Array, *,
 _PSI_G_CACHE: dict = {}
 
 
-def _dft_psi_sphere(inputs):
+@_functools.lru_cache(maxsize=None)
+def _hartree_density_embed_kernel(mesh_xy: Mesh, nb_full: int):
+    """Place blockdiag(active U, inactive I) directly on the full XY mesh.
+
+    The canonical embedding helper builds an eye before its final sharding
+    constraint. Keep that work inside one cached JIT so the O(nb_full²)
+    eye and the sharded output share one compiled placement boundary;
+    there is no Python-eager eye array between them.
+    """
+    from .wavefunction_bundle import _face_embed_active_U
+
+    @jax.jit(out_shardings=NamedSharding(mesh_xy, P(None, 'x', 'y')))
+    def kernel(active):
+        return _face_embed_active_U(
+            active, nb_full=nb_full, a_lo=0, mesh_xy=mesh_xy)
+
+    return kernel
+
+
+def _dft_psi_sphere(inputs, *, full_density: bool = False):
     """DFT ψ(G) on the SC k-set, loaded ONCE and cached.
 
     The SC bundle carries ψ at ISDF CENTROIDS, which cannot reconstruct
@@ -2060,6 +2086,8 @@ def _dft_psi_sphere(inputs):
             f"{b_hi - b_lo} bands but the SC carry is {nb_sigma} wide.  These "
             f"describe the same active subspace and a mismatch means one of "
             f"them is b0-relative where the other is global.")
+    if full_density:
+        b_hi = int(inputs.band_slices.b4_logical)
     # Key on the GLOBAL RANGE, not on its width: two windows of equal
     # extent at different b0 are different ψ and must not share a cache
     # entry.
@@ -2145,7 +2173,8 @@ def _kstar(inputs):
 # module docstrings worry about — it is the matrix-element sweep, which
 # alone exceeds this deck's whole chi0+W screening (5.51 s/iteration).
 @timing.timed("vh.rebuild")
-def rebuild_hartree_dft_basis(inputs, U_qp, E_qp_ry) -> SCExactHartree:
+def rebuild_hartree_dft_basis(inputs, U_qp, occupations_full,
+                              efermi_ry: float) -> SCExactHartree:
     """Exact direct Hartree in the DFT basis from iteration-i orbitals.
 
     The cycle this closes::
@@ -2167,8 +2196,7 @@ def rebuild_hartree_dft_basis(inputs, U_qp, E_qp_ry) -> SCExactHartree:
 
     No mixing: straight rho_out feedback, by owner ruling (2026-08-04).
     """
-    from gw.efermi import (fermi_level_step, occupied_band_count,
-                           step_occupations)
+    from gw.efermi import occupied_band_count
     from gw.qsgw_density import rho_from_wfns
     from common.four_current_model import resolve_four_current_representation
     from psp.get_DFT_mtxels import spin_degeneracy_factor
@@ -2179,8 +2207,27 @@ def rebuild_hartree_dft_basis(inputs, U_qp, E_qp_ry) -> SCExactHartree:
                                     sweep_matrix_elements)
     from psp.dft_operators import padded_gvectors
 
-    psi_G, bidx = _dft_psi_sphere(inputs)
-    nk, nb = int(psi_G.shape[0]), int(psi_G.shape[1])
+    psi_G, bidx = _dft_psi_sphere(inputs, full_density=True)
+    nk = int(psi_G.shape[0])
+    # Density uses the full logical loaded ladder, including physical bands
+    # above the QP window.  The loader returns its mesh-padded carrier.
+    nb_logical = int(inputs.band_slices.nb_sigma)
+    nb_full_logical = int(inputs.band_slices.nb_full_logical)
+    from common.wfn_layout import band_sphere_spec
+    from runtime.padding import authenticate_axis, padded_axis, strip_axis
+    full_band_axis = padded_axis(
+        nb_full_logical, inputs.mesh_xy, name='SC density band sphere',
+        spec=band_sphere_spec(), axis=1)
+    authenticate_axis(psi_G, full_band_axis, axis=1,
+                      where='SC exact Hartree density band sphere')
+    # The rotated bundle carries its face-mesh pad; rho_from_wfns owns the
+    # further zero-occupation pad to the sphere carrier before its scan.
+    bundle_shape = tuple(inputs.wfns_dft.enk.shape)
+    if tuple(np.shape(occupations_full)) != bundle_shape:
+        raise ValueError(
+            'SC exact Hartree occupations must match the rotated bundle '
+            f'{bundle_shape}; '
+            f'got {np.shape(occupations_full)}')
     from centroid.sampling_metric import full_k_quadrature_weights
     kweights = (full_k_quadrature_weights(inputs.wfn, inputs.wfn.symmetry())
                 if inputs.sym.parent_k_domain == "full_bz" else
@@ -2188,31 +2235,16 @@ def rebuild_hartree_dft_basis(inputs, U_qp, E_qp_ry) -> SCExactHartree:
     kweights = kweights / kweights.sum()
     rows = jnp.asarray(inputs.sym.kirr_fullids, dtype=jnp.int32)
     U_qp = jnp.take(U_qp, rows, axis=0)
-    E_qp_ry = jnp.take(E_qp_ry, rows, axis=0)
-
-    # E stays on the device: both are jit kernels over ``E`` (``gw.efermi``
-    # header) and only E_F and the degeneracy flag cross.
-    if inputs.material_class == "metal":
-        # Metal ρ: fixed-N occupations of the declared family (Fermi-Dirac
-        # on every metal, owner ruling 2026-09-17) solved on THIS iteration's
-        # QP spectrum (W3 update point), at the deck's ONE width.  The step
-        # path below cannot represent a metal (partial fill /
-        # degenerate-manifold refusal), and the constructor owns the fixed-N
-        # invariant.
-        occ_state = OccupationState.solve_smearing(
-            E_qp_ry, kweights, float(inputs.wfn.num_electrons),
-            inputs.config.occ_broadening_ry,
-            family=_declared_smearing_family(inputs.config),
-            state_capacity=float(spin_degeneracy_factor(inputs.wfn)),
-            clamp_tol=float(inputs.config.occupation_clamp_tol))
-        e_f = occ_state.mu_ry
-        occ = occ_state.f_kn
-        inputs.print_fn(
-            f"    V_H rebuild: metal {occ_state.smearing_family} occupations, "
-            f"mu={e_f * RYD_TO_EV:.8f} eV [occ_hash {occ_state.occ_hash}]")
-    else:
-        e_f = fermi_level_step(E_qp_ry, kweights, float(inputs.meta.nelec))
-        occ = step_occupations(E_qp_ry, e_f)
+    occ = jnp.take(jnp.asarray(occupations_full), rows, axis=0)
+    if int(U_qp.shape[1]) != nb_logical or int(U_qp.shape[2]) != nb_logical:
+        raise ValueError(
+            f'SC exact Hartree active rotation must be {nb_logical} square; '
+            f'got {U_qp.shape[-2:]}')
+    U_density = _hartree_density_embed_kernel(
+        inputs.mesh_xy, full_band_axis.carrier)(U_qp)
+    inputs.print_fn(
+        f'    V_H rebuild: current-map full-band occupations, '
+        f'mu={float(efermi_ry) * RYD_TO_EV:.8f} eV')
 
     f_spin = spin_degeneracy_factor(inputs.wfn)
     grid = tuple(int(v) for v in inputs.wfn.fft_grid)
@@ -2222,7 +2254,7 @@ def rebuild_hartree_dft_basis(inputs, U_qp, E_qp_ry) -> SCExactHartree:
     charge_ns = (int(psi_G.shape[2]) if representation.charge_bispinor
                  else int(inputs.wfn.nspinor))
     fields = rho_from_wfns(
-        psi_G, occ, kweights, U=U_qp, mesh=inputs.mesh_xy,
+        psi_G, occ, kweights, U=U_density, mesh=inputs.mesh_xy,
         box_index=bidx, fft_grid=grid,
         cell_volume=float(inputs.wfn.cell_volume),
         spin_degeneracy=f_spin,
@@ -2266,16 +2298,21 @@ def rebuild_hartree_dft_basis(inputs, U_qp, E_qp_ry) -> SCExactHartree:
                 tt_metric_sign=float(COULOMB_GAUGE_TT_SIGN))
 
     gtab = padded_gvectors(inputs.wfn, k=inputs.sym.parent_k_domain)
-    psi_charge = psi_G[:, :, :charge_ns, :]
     geom_matrix = SweepGeometry(
         mesh=inputs.mesh_xy, fft_grid=grid,
-        ngkmax=int(psi_G.shape[3]), nb=nb,
+        ngkmax=int(psi_G.shape[3]), nb=nb_logical,
         ns=(int(psi_G.shape[2]) if V_T_r is not None
-            else int(psi_charge.shape[2])), nk=nk,
+            else charge_ns), nk=nk,
         cell_volume=float(inputs.wfn.cell_volume))
+    # The sweep projects only the QP carry.  Keep its mesh-legal active
+    # carrier; the full density sphere above remains resident and sharded.
+    psi_matrix = psi_G[:, :geom_matrix.band_axis.carrier, :, :]
+    authenticate_axis(psi_matrix, geom_matrix.band_axis, axis=1,
+                      where='SC exact Hartree active band sphere')
+    psi_charge = psi_matrix[:, :, :charge_ns, :]
     if V_T_r is not None:
         H_pair = sweep_matrix_elements(
-            psi_G,
+            psi_matrix,
             operator=four_current_potential_operator(
                 geom_matrix, V_H_r, V_T_r,
                 charge_nspinor=charge_ns),
@@ -2297,10 +2334,24 @@ def rebuild_hartree_dft_basis(inputs, U_qp, E_qp_ry) -> SCExactHartree:
     if H_transverse is not None:
         H_transverse = unfold_file_wedge_band_operator(
             inputs.sym, H_transverse, trs_rule="conj")
+    # The sweep keeps its mesh-legal carrier by contract.  SCExactHartree
+    # crosses into the physical [b0,b3) carry, whose matrix axes are logical.
+    # Strip by the sweep's receipt on device after the symmetry unfold; both
+    # scalar and current pieces must enter every SC/output seam identically.
+    def physical_hartree(panel, name):
+        for axis in (-2, -1):
+            authenticate_axis(panel, geom_matrix.band_axis, axis=axis,
+                              where=f'SC exact Hartree {name}')
+        return strip_axis(strip_axis(panel, geom_matrix.band_axis, axis=-2),
+                          geom_matrix.band_axis, axis=-1)
+
+    H_scalar = physical_hartree(H_scalar, 'scalar')
+    if H_transverse is not None:
+        H_transverse = physical_hartree(H_transverse, 'transverse')
     return SCExactHartree(
         scalar_dft=H_scalar,
         transverse_dft=H_transverse,
-        efermi_ry=float(e_f))
+        efermi_ry=float(efermi_ry))
 
 
 def _residency_census(named, print_fn) -> None:
@@ -2605,8 +2656,19 @@ def _capture_frozen_scissor_fits(outputs):
     """The pair to carry forward, taken from the FIRST map's outputs."""
     if outputs is None:
         return None
-    return (getattr(outputs, "scissor_fit", None),
-            getattr(outputs, "tail_scissor_fit", None))
+    active = getattr(outputs, "scissor_fit", None)
+    # Only a real fit can be judged: a caller (or a test double) that hands in
+    # something else keeps its object untouched.
+    if (active is not None and hasattr(active, "n_fit_v")
+            and hasattr(active, "n_fit_c")
+            and int(active.n_fit_v) == 0 and int(active.n_fit_c) == 0):
+        # A zero-sample fit is the identity (alpha=1, beta=0), not a fitted
+        # law.  Freezing it would pin every out-of-block state at its DFT
+        # energy for the whole loop; leave it None so the caller's own
+        # ``else tail_fit`` fallback supplies the law that the sum-band side
+        # already uses (measured degenerate on Fe 4x4x4, claim 2486).
+        active = None
+    return (active, getattr(outputs, "tail_scissor_fit", None))
 
 
 def _state_partition(state: SCState, inputs: SCInputs) -> BandPartition:
@@ -2773,7 +2835,12 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             state.H_qp_dft, kind=eigh_kind, mesh_xy=inputs.mesh_xy,
             config=inputs.config)
 
-        if bool(getattr(inputs.config, "density_self_consistent", False)):
+        if inputs.material_class == "metal":
+            # The full current ladder below owns the fixed-N FD solve.  A
+            # preliminary zero-temperature solve can refuse an admissible
+            # partially filled multiplet before that solver is reached.
+            efermi_ry = None
+        elif bool(getattr(inputs.config, "density_self_consistent", False)):
             from gw.efermi import fermi_level_step
 
             from .scissor import k_star_weights
@@ -2850,6 +2917,8 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             NamedSharding(inputs.mesh_xy, P(None, None)))
     entry_occ_state, entry_surface_weight_kn = _solve_head_occupations(
         inputs, enk_entry)
+    if inputs.material_class == "metal" and entry_occ_state is not None:
+        efermi_ry = float(entry_occ_state.mu_ry)
 
     # ------------------------------------------------------------------
     # RE-ANCHOR THE WINDOW ON THIS ITERATION'S FERMI LEVEL.
@@ -2896,18 +2965,42 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     _mu_ev = (float(entry_occ_state.mu_ry) * RYD_TO_EV
               if entry_occ_state is not None else
               float(inputs.wfn.efermi) * RYD_TO_EV)
-    partition = build_omega_band_partition(
-        energies_loop / RYD_TO_EV,
-        reference_full if ks.is_identity else np.asarray(ks.select(reference_full)),
-        band_offset=int(inputs.band_slices.b0),
-        omega_min_abs_ev=float(inputs.config.sigma.omega_min_ev) + _mu_ev,
-        omega_max_abs_ev=float(inputs.config.sigma.omega_max_ev) + _mu_ev,
-        previous_partition=(None if state.partition is None else
-                            _partition_on_loop(state.partition, inputs)),
-        mu_ev=_mu_ev, current_indices_kn=indices_loop,
-        degeneracy_tol_ev=float(inputs.config.sc.exact_degeneracy_tol_ev),
-        label=f"SC map {int(state.iteration)} (identity, mu-anchored)",
-        print_fn=lambda line: _record_sc(inputs, line))
+    # ONE CLASSIFICATION, THEN FROZEN (owner ruling 2026-09-19).  The
+    # protected identity set is decided once, on map 0, and every later map
+    # carries it unchanged; bands outside it are scissored for the whole run.
+    # The previous per-map reclassification let the frontier chase its own
+    # corrections: MEASURED on Fe 4x4x4 charge-only headless shared-pole SC
+    # (10l_frontier_trace3b, source 43ba1e1e) map 0 promoted identities
+    # 18/19 (bands 19/20) and map 1 promoted 20/21 (bands 21/22) at every k,
+    # each promotion switching a band from the scissor to the full Sigma
+    # correction (+4.7 to +4.9 eV here).  The accepted residual was that walk
+    # (5.503 -> 5.220 -> 5.080 -> 3.924 -> 4.797 -> 3.670 -> 4.699 -> 5.248
+    # -> 4.208 -> 5.129 -> 4.046 -> 5.187 -> 2.743 -> 5.435 -> 2.610 eV over
+    # 15 calls, map gain 2.05-3.42) while the protected manifold itself moved
+    # 0.03-0.25 eV.  ``partition`` from SCState is the map-0 decision.
+    _frozen_partition = (int(state.iteration) > 0 and state.partition is not None)
+    if _frozen_partition:
+        partition = _partition_on_loop(state.partition, inputs)
+        _record_sc(
+            inputs,
+            f"  SC map {int(state.iteration)} (identity, mu-anchored) partition: "
+            "FROZEN from map 0 (owner ruling 2026-09-19); protected at all k="
+            f"{_band_ranges(partition.protected_mask, band_offset=int(inputs.band_slices.b0))}, "
+            f"in_range={_band_ranges(partition.in_range_mask, band_offset=int(inputs.band_slices.b0))}; "
+            "no band enters or leaves the set for the rest of the loop.")
+    else:
+        partition = build_omega_band_partition(
+            energies_loop / RYD_TO_EV,
+            reference_full if ks.is_identity else np.asarray(ks.select(reference_full)),
+            band_offset=int(inputs.band_slices.b0),
+            omega_min_abs_ev=float(inputs.config.sigma.omega_min_ev) + _mu_ev,
+            omega_max_abs_ev=float(inputs.config.sigma.omega_max_ev) + _mu_ev,
+            previous_partition=(None if state.partition is None else
+                                _partition_on_loop(state.partition, inputs)),
+            mu_ev=_mu_ev, current_indices_kn=indices_loop,
+            degeneracy_tol_ev=float(inputs.config.sc.exact_degeneracy_tol_ev),
+            label=f"SC map {int(state.iteration)} (identity, mu-anchored)",
+            print_fn=lambda line: _record_sc(inputs, line))
     if not ks.is_identity:
         partition = BandPartition(
             protected_mask=ks.broadcast(partition.protected_mask),
@@ -2916,7 +3009,8 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     buffer_mask = _sc_buffer_mask(inputs)
     if buffer_mask.any():
         buffer_ids = np.flatnonzero(buffer_mask) + int(inputs.band_slices.b0) + 1
-        inputs.print_fn(
+        _record_sc(
+            inputs,
             f"    SC window buffer: mode={inputs.config.sc.buffer_mode}, "
             f"bands={_band_ranges(buffer_mask, band_offset=int(inputs.band_slices.b0))} "
             f"(n={buffer_ids.size}); named core="
@@ -3065,20 +3159,36 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             f"(n={tail_fit.n_fit_c}, w={tail_fit.w_fit_c:.0f}, "
             f"policy={inputs.config.sc.tail_fit})")
 
+    # Same-run metal threading: the ENTRY-solved state feeds chi, the head
+    # and Sigma — one mu per map call, from this call's spectrum.
+    metal_occ_state = (entry_occ_state
+                       if inputs.material_class == "metal" else None)
+
+    # ONE OCCUPATION OWNER PER MAP CALL.  On a metal both rotated bundles (and
+    # their parent carriers) carry the entry-solved state as ``occ``, so no
+    # consumer of either bundle can read a step occupation by band index or
+    # at a midgap reference.  A step through a degenerate multiplet at E_F
+    # splits it in Sigma and breaks inversion times time reversal of the
+    # next map (SCMETAL 2026-09-17).  Insulators keep the midgap step.
+    bundle_efermi = None if metal_occ_state is not None else float(efermi_ry)
+    bundle_occupations = (None if metal_occ_state is None
+                          else metal_occ_state.f_kn)
     wfns_qp = rotate_wavefunctions(
         inputs.wfns_dft, U_full,
         enk_active_new=E_full, enk_base=enk_base,
-        efermi=float(efermi_ry),
+        efermi=bundle_efermi,
         mesh_xy=inputs.mesh_xy,
         active_slice=inputs.band_slices.sigma,
+        occupations=bundle_occupations,
     )
 
     wfns_transverse_qp = None
     if inputs.wfns_transverse is not None:
         wfns_transverse_qp = rotate_wavefunctions(
             inputs.wfns_transverse, U_full,
-            enk_active_new=E_full, enk_base=enk_base, efermi=float(efermi_ry),
-            mesh_xy=inputs.mesh_xy, active_slice=inputs.band_slices.sigma)
+            enk_active_new=E_full, enk_base=enk_base, efermi=bundle_efermi,
+            mesh_xy=inputs.mesh_xy, active_slice=inputs.band_slices.sigma,
+            occupations=bundle_occupations)
 
     # (``entry_occ_state`` was solved above, before the tail scissor that
     # feeds ``enk_base`` — see the block after ``E_full``.)
@@ -3093,7 +3203,9 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         # The density owner selects raw-parent U/E, averages the fields
         # by typed actions, and unfolds only the completed band matrices.
         exact_hartree_dft = rebuild_hartree_dft_basis(
-            inputs, U_full, E_full)
+            inputs, U_full, wfns_qp.occ,
+            (float(entry_occ_state.mu_ry) if entry_occ_state is not None
+             else float(efermi_ry)))
         from common import sanity as _sanity
         _sanity.check_finite(
             "V_H[SC] scalar", exact_hartree_dft.scalar_dft,
@@ -3107,11 +3219,6 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             f"{' + transverse' if exact_hartree_dft.transverse_dft is not None else ''} "
             f"Hartree from iteration {state.iteration} orbitals "
             f"(E_F = {exact_hartree_dft.efermi_ry:.6f} Ry)")
-
-    # Same-run metal threading: the ENTRY-solved state feeds chi, the head
-    # and Sigma — one mu per map call, from this call's spectrum.
-    metal_occ_state = (entry_occ_state
-                       if inputs.material_class == "metal" else None)
 
     if inputs.config.sigma.w_model == "shared_pole":
         from .shared_pole_recipe import (
@@ -3143,7 +3250,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         used_producer = (inputs.screening_model_fn
                          if producer is None else producer)
         used_quad = inputs.quad if quad_override is None else quad_override
-        return used_producer(
+        produced = used_producer(
             inputs.config.compute_mode, wfns_qp, inputs.V_q,
             quad=used_quad, e_ref=inputs.e_ref, sym=inputs.sym,
             centroid_indices=inputs.centroid_indices, config=inputs.config,
@@ -3160,7 +3267,21 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             iteration_head_response=iteration_head_response,
             occupation_state=metal_occ_state,
             material_class=inputs.material_class,
+            **(dict(wfns_transverse=wfns_transverse_qp,
+                    bispinor_v_q_path=inputs.bispinor_v_q_path,
+                    mu_bases=inputs.mu_bases,
+                    photon_static_reference=(None if inputs.screening_seed_cache is None else
+                        inputs.screening_seed_cache.get('photon_static_reference')))
+               if inputs.config.sigma.w_model == "shared_pole"
+               and wfns_transverse_qp is not None else {}),
             print_fn=inputs.print_fn)
+        if (inputs.screening_seed_cache is not None and isinstance(produced, dict)
+                and produced.get('photon_static_reference') is not None):
+            # Only the immutable initial contact survives. Current samples,
+            # moments and all three pole models belong to this map.
+            inputs.screening_seed_cache.setdefault(
+                'photon_static_reference', produced['photon_static_reference'])
+        return produced
 
     # Per-mode screening plan.  The q->0 head uses this exact frequency/role
     # table so a Schur-folded probe can never drift from the body W it folds.
@@ -3301,8 +3422,24 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
                 inputs.wfns_dft, np.asarray(head_omegas, dtype=np.complex128),
                 input_dir=inputs.input_dir, mesh=inputs.mesh_xy, wfn=inputs.wfn,
                 meta=inputs.meta, config=inputs.config)
-        head_occ_kn = np.asarray(
-            iteration_head_response.sigma_occupations, dtype=np.float64)
+        # The frozen response is the DFT direct response; its Sigma-side
+        # ladder (energies, occupations, reference) is the DFT one, a step by
+        # band index.  On a metal every head consumer (the static terms here,
+        # the dynamic head of MPA and finalized samples) must see THIS map's
+        # ladder and its one occupation state instead.
+        if metal_occ_state is not None:
+            nb_sigma_head = int(inputs.meta.nb_sigma)
+            iteration_head_response = replace(
+                iteration_head_response,
+                sigma_energies_ry=np.asarray(
+                    wfns_qp.enk[:, :nb_sigma_head], dtype=np.float64),
+                sigma_occupations=np.asarray(
+                    wfns_qp.occ[:, :nb_sigma_head], dtype=np.float64),
+                efermi_ry=float(metal_occ_state.mu_ry))
+        # The static head is diagonal in THIS map's band basis, so its
+        # occupations are this map's bundle table (the entry state on a
+        # metal), never the frozen DFT response's step by band index.
+        head_occ_kn = np.asarray(wfns_qp.occ, dtype=np.float64)
         if tuple(iteration_head_response.omegas) != tuple(head_omegas):
             raise ValueError(
                 "fixed DFT head response does not match the current "
@@ -3374,6 +3511,22 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
                 cell_volume=float(inputs.meta.cell_volume),
                 nk_tot=int(inputs.meta.nk_tot),
             )
+
+    # The head enters Sigma band-diagonally, so its occupations must be one
+    # value per exactly degenerate multiplet of the ladder Sigma is diagonal
+    # in; otherwise this map's H breaks the little group and inversion times
+    # time reversal, and the next map's screening loses reciprocity.
+    if iteration_head is not None:
+        from .head_correction import refuse_split_multiplet_head_occupations
+        refuse_split_multiplet_head_occupations(
+            iteration_head.sigma_energies_ry, iteration_head.sigma_occupations,
+            where=f"SC map {int(state.iteration)} dynamic head")
+        if head_occ_kn is not None and bool(inputs.config.do_G0):
+            nb_sigma = int(inputs.meta.nb_sigma)
+            refuse_split_multiplet_head_occupations(
+                np.asarray(wfns_qp.enk[:, :nb_sigma]),
+                np.asarray(head_occ_kn)[:, :nb_sigma],
+                where=f"SC map {int(state.iteration)} static head")
 
     # Under mpa_material_class = metal the finite-q body above went through
     # build_mpa_fit(occupation_state=...) — fractional contour lines and the
@@ -3594,9 +3747,13 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     # exact rows selected above.
     _frozen_active, _frozen_tail_unused = _frozen_scissor_fits(state)
     if _frozen_active is not None:
-        inputs.print_fn(
+        # Same channel rule as the policy's diagnostics below: the log keeps
+        # what goes through ``_record_sc``, so a frozen-law decision must not
+        # be reported only on the unlogged printer.
+        _record_sc(
+            inputs,
             f"    SC scissor: frozen from map 0 ({_frozen_active.summary()})")
-    H_qp_dft_new, scissor_fit = _apply_scissor_partition_policy(
+    H_qp_dft_new, scissor_fit, promoted_partition = _apply_scissor_partition_policy(
         H_qp_dft_full, e_dft_act, val_mask, _partition_on_loop(partition, inputs), ks,
         efermi_dft_ry=float(inputs.efermi_dft_ry),
         n_occ=n_occ,
@@ -3606,7 +3763,49 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         band_classes=scissor_classes,
         scissor_fit=(_frozen_active if _frozen_active is not None else tail_fit),
         use_valence_fit=(inputs.config.sc.tail_fit == "buffer_edges"),
-        label="SC", print_fn=inputs.print_fn)
+        # THE DIAGNOSTIC CHANNEL MATTERS.  ``inputs.print_fn`` output is not
+        # what the run log keeps -- every line of this map that a reader has
+        # actually seen (the per-k partition, the escapes, the sampled-support
+        # growth) arrives through ``_record_sc``.  A scissor/frontier decision
+        # that moves a band by eV between maps therefore left no trace at all:
+        # the Fe 4x4x4 charge-only loop grew its protected set from 9-20 to
+        # 9-22 between map 0 and map 1 with no promotion line anywhere in
+        # rank-0.log, gwjax.out or the launcher log (jobs 58551752, 58550102),
+        # which is why the residual could not be attributed from the artifacts.
+        # Record the policy's own diagnostics on the log's channel.
+        allow_frontier_promotion=not _frozen_partition,
+        label="SC", print_fn=lambda line: _record_sc(inputs, line))
+    # The carry lives on the full BZ while this policy sees the loop's k-set
+    # (the wedge here: 64 x 26 carried against 13 x 26 classified), so the
+    # comparison must run on the SELECTED input the policy actually received --
+    # the array it was handed, not the carried one.
+    _policy_input = _partition_on_loop(partition, inputs)
+    _after_policy = np.asarray(promoted_partition.protected_mask, dtype=bool)
+    _before_policy = np.asarray(_policy_input.protected_mask, dtype=bool)
+    if _before_policy.shape != _after_policy.shape:
+        _before_policy = np.broadcast_to(
+            _before_policy, _after_policy.shape) if (
+                _before_policy.ndim == 1) else None
+    _promoted_pairs = (
+        [[int(k), int(b)] for k, b in np.argwhere(
+            _after_policy & ~_before_policy)[:12]]
+        if _before_policy is not None else
+        f"shape mismatch carry={np.shape(np.asarray(partition.protected_mask, bool))} "
+        f"policy={_after_policy.shape}")
+    _record_sc(
+        inputs,
+        f"    SC policy: scissor_fit={'none' if scissor_fit is None else 'fitted'}, "
+        "protected at all k="
+        f"{_band_ranges(promoted_partition.protected_mask, band_offset=int(inputs.band_slices.sigma.start))}, "
+        f"promoted (k,index)={_promoted_pairs}")
+    # The policy sees the loop's k-set; the carried partition is full-BZ.
+    # Restore the promoted frontier masks before the next map re-selects them.
+    if ks.is_identity:
+        partition = promoted_partition
+    else:
+        partition = BandPartition(
+            protected_mask=ks.broadcast(promoted_partition.protected_mask),
+            in_range_mask=ks.broadcast(promoted_partition.in_range_mask))
     # THE STAR-SPREAD GATE, ON THE OBJECT THAT SHIPS.  It ran before the
     # partition until 2026-08-16, which certified a matrix the loop then
     # rewrote.  The partition is precisely the operation that could break the
@@ -3774,6 +3973,20 @@ def _scissor_E_qp_for_outofrange(
         valence_kn, crossing_kn = band_classes.masks(e_dft_np.shape)
         fit_mask_kn = retained_kn & ~crossing_kn
     fit = scissor_fit
+    if fit is not None and int(fit.n_fit_v) == 0 and int(fit.n_fit_c) == 0:
+        # A ZERO-SAMPLE FIT IS NOT A LAW.  ``ScissorFit`` returns alpha=1,
+        # beta=0 when its mask selected nothing, and this map then FROZE that
+        # object as the active-window law: MEASURED on Fe 4x4x4 charge-only
+        # (`10j_frontier_trace_onemap`, source 20861f29)
+        # ``ScissorFit(val n=0 w=0; cond n=0 w=0)``, so every state outside the
+        # retained block sat at its DFT energy while its in-block neighbour
+        # took the full Sigma correction (+4.7 to +4.9 eV on that deck) -- a
+        # multi-eV step at a boundary that has to be a knee.  The call site's
+        # ``... if _frozen_active is not None else tail_fit`` already says the
+        # sum-band law is the intended fallback; a fit with no samples must
+        # therefore be treated as absent and refitted from this map's own
+        # in-block samples below.
+        fit = None
     if fit is None:
         H_diag_np = np.real(np.asarray(jnp.diagonal(
             H_qp_dft_full, axis1=1, axis2=2)))
@@ -3789,6 +4002,23 @@ def _scissor_E_qp_for_outofrange(
         # k-set, ``w`` must not.
         print_fn(f"    SC scissor: {fit.summary()}; valence regression is "
                  "diagnostic only")
+        # AN EMPTY CLASS IS A LAW THAT WAS NEVER FIT.  ``fit_scissor`` falls
+        # back to the no-information identity (alpha=1, beta=0) when a class
+        # has no samples, and that fallback is exactly what silently scissored
+        # a ten-band window for fifteen maps on Fe 4x4x4: every out-of-block
+        # state sat at its DFT energy while its in-block neighbour took the
+        # full +4.7 to +4.9 eV Sigma correction, and the resulting block-edge
+        # step is what destabilised the q=0 pencil (claims 2486).  The
+        # tolerance now matches the deck's tail, so this is a report rather
+        # than a refusal -- but it must never be invisible again.
+        _empty = [name for name, n in (("valence", fit.n_fit_v),
+                                       ("conduction", fit.n_fit_c)) if int(n) == 0]
+        if _empty:
+            print_fn(
+                "    SC scissor: EMPTY " + ", ".join(_empty) + " fit class(es) "
+                "-> that class keeps E_DFT (no-information law). Check the "
+                "three-way classification against the deck's smearing tail "
+                "(Fermi-Dirac needs ln(1/tol) widths to saturate).")
     # The SAME boundary indices that split the fit split the application, so
     # a band cannot be fit as one class and extrapolated as another.  Crossing
     # bands stay at E_DFT.  In practice they are protected/in-range, but the
@@ -3821,9 +4051,10 @@ def _apply_scissor_partition_policy(
     band_classes=None,
     scissor_fit: ScissorFit | None = None,
     use_valence_fit: bool = False,
+    allow_frontier_promotion: bool = True,
     label: str = "SC",
     print_fn=print,
-) -> tuple[jax.Array, ScissorFit | None]:
+) -> tuple[jax.Array, ScissorFit | None, BandPartition]:
     """Apply the shared semicore/conduction policy to one full H map.
 
     In-range states keep their Sigma-derived Hamiltonian.  Out-of-range
@@ -3851,22 +4082,75 @@ def _apply_scissor_partition_policy(
         retained_kn = np.broadcast_to(np.asarray(
             partition.protected_mask | partition.in_range_mask, dtype=bool),
             np.shape(e_dft_kn_ry))
-        if band_classes is not None and band_classes.n_crossing:
+        if not allow_frontier_promotion:
+            # Owner ruling 2026-09-19: the protected identity set is decided
+            # once and carried, so no later map may add a band -- not even a
+            # Fermi-crossing one.  The map-0 classification already retained
+            # that manifold (that is what the promotion there is for); a map
+            # that tries to promote again is chasing corrections it caused.
+            frontier_kn = np.zeros(retained_kn.shape, dtype=bool)
+        elif band_classes is not None and band_classes.n_crossing:
             _, frontier_kn = band_classes.masks(retained_kn.shape)
         else:
-            frontier = np.asarray(
-                [max(0, n_occ - 1), min(n_occ, retained_kn.shape[1] - 1)],
-                dtype=np.int64)
-            frontier_kn = np.zeros(retained_kn.shape, dtype=bool)
-            frontier_kn[:, frontier] = True
+            # IDENTITY SPACE, AND ONLY A REAL CROSSING.  ``retained_kn`` is a
+            # ``(k, DFT identity)`` mask -- the carry's own basis (pitfall 18
+            # of docs/self_consistency.md) -- so the frontier it is compared
+            # against must be one too.  The historical fallback named the two
+            # sorted COLUMNS ``[n_occ - 1, n_occ]``; a crossing changes which
+            # identity sits in a column, so the promoted identity followed the
+            # sorted QP order instead of the band.  MEASURED (Fe 4x4x4
+            # charge-only, source 727a1622, job 58551752): the promoted
+            # identity flipped 21 -> 22 -> 21 between consecutive calls and
+            # each flip moved a band by 3-5 eV against a 1e-4 eV cutoff, so
+            # the fixed-point residual WAS the flip (5.50 -> 2.61 eV over 15
+            # calls, map gain 2.33, no contraction) rather than any physical
+            # motion; the protected d manifold's own residual was 0.03-0.25
+            # eV.  Read the frontier once, in identity space, from the
+            # immutable reference ladder at the DFT Fermi level, and admit a
+            # band only inside the shared near-Fermi pad: a genuinely
+            # partially occupied manifold is still retained, while a vacuum
+            # gap (the same deck's 22 eV HOMO-LUMO gap at k=0) promotes
+            # nothing and a scissored state cannot re-enter as protected on
+            # one map and leave on the next.
+            from .scissor import sc_state_pad_ev
+
+            e_ref = np.asarray(e_dft_kn_ry, dtype=np.float64)
+            e_fermi_ry = float(efermi_dft_ry)
+            occupied = e_ref < e_fermi_ry
+            ncols = int(e_ref.shape[1])
+            frontier_kn = np.zeros(e_ref.shape, dtype=bool)
+            rows = np.arange(e_ref.shape[0])
+            have = occupied.any(axis=1)
+            top = np.where(
+                have, ncols - 1 - np.argmax(occupied[:, ::-1], axis=1), -1)
+            here = rows[have]
+            frontier_kn[here, top[have]] = True
+            nxt = np.minimum(top + 1, ncols - 1)
+            inside = np.zeros(e_ref.shape[0], dtype=bool)
+            near_ry = float(sc_state_pad_ev(0.0)) / RYD_TO_EV
+            inside[have] = (
+                e_ref[here, nxt[have]] - e_fermi_ry) <= near_ry
+            frontier_kn[rows[have & inside], nxt[have & inside]] = True
         bad_frontier = np.argwhere(frontier_kn & ~retained_kn)
         if bad_frontier.size:
-            raise ValueError(
-                f"{label} low-valence Fermi anchor requires the complete "
-                "Fermi-crossing/frontier manifold to remain non-scissored; "
-                f"scissored (k, active band) pairs {bad_frontier.tolist()} would "
-                "make E_F(F(H)) depend on the scissor being anchored. Widen "
-                "sigma_omega_min/max_ev (and preserve whole multiplets).")
+            # The crossing manifold is an identity set, not an energy-window
+            # set.  Promote it into the protected mask so the Fermi anchor is
+            # not evaluated through the scissor; the energy window continues
+            # to control which *other* bands are in range.
+            protected = np.array(
+                np.asarray(partition.protected_mask), dtype=bool, copy=True)
+            protected[bad_frontier[:, 0], bad_frontier[:, 1]] = True
+            partition = BandPartition(
+                protected_mask=protected,
+                in_range_mask=partition.in_range_mask)
+            retained_kn = np.broadcast_to(np.asarray(
+                partition.protected_mask | partition.in_range_mask, dtype=bool),
+                np.shape(e_dft_kn_ry))
+            print_fn(
+                f"    {label} frontier promotion: promoted "
+                f"{bad_frontier.tolist()} to protected; the complete "
+                "Fermi-crossing manifold is retained and the bands outside "
+                "the requested window remain scissored.")
 
         H_fermi_probe = apply_band_partition(
             H_qp_dft_full,
@@ -3924,7 +4208,7 @@ def _apply_scissor_partition_policy(
                 f"{(final_efermi_ry - candidate_efermi_ry) * RYD_TO_EV:+.3e} "
                 "eV. A scissored tail entered the frontier; widen the Sigma "
                 "window rather than anchoring through it.")
-    return H_partitioned, scissor_fit
+    return H_partitioned, scissor_fit, partition
 
 
 def _refuse_empty_map_output(e_output_kn_ev: np.ndarray, *,

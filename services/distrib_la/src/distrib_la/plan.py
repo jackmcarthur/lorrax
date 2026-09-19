@@ -77,6 +77,7 @@ REPLICATED.  Eigenvectors are COLUMNS.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Any, Callable
 
 import jax
@@ -325,6 +326,17 @@ DONATES: dict[str, tuple[int, ...]] = {
 }
 
 
+@lru_cache(maxsize=None)
+def _native2d_trace_fn(impl: Callable, mesh: Mesh) -> Callable:
+    """Keep one trace-safe callable for equivalent native2d plans.
+
+    Only the implementation and mesh are captured; extent and numerical
+    operands remain traced. Reusing this callable lets outer cached kernels
+    retain their identity across newly resolved plans.
+    """
+    return lambda A, **kw: impl(A, mesh=mesh, **kw)
+
+
 @dataclass(frozen=True)
 class Plan:
     """A resolved linear-algebra call: backend + layout contract + call.
@@ -501,8 +513,7 @@ class Plan:
                 return fn
         elif self.backend == NATIVE2D:
             impl = getattr(self.module, _IMPL[(self.op, self.backend)]["many"])
-            mesh = self.mesh
-            return lambda A, **kw: impl(A, mesh=mesh, **kw)
+            return _native2d_trace_fn(impl, self.mesh)
         raise NotImplementedError(
             f"native_fn is defined for the pure-JAX backends only; this "
             f"plan is {self.op}/{self.backend}.  An FFI backend's wrapper "

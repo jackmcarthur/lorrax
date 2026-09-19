@@ -192,7 +192,7 @@ def _make_photon_class_restore(response, keys):
 
 
 def contract_lorentz_blocks(blocks, *, families, term, response, Gij, meta, mesh_xy,
-                            head_diagnostics=False):
+                            head_diagnostics=False, admit_kernel=None):
     """Yield one parent-band sum per endpoint class while retaining one resident Green."""
     from .cohsex_sigma import _occ_diag_full
     from .photon_layout import photon_q0_low_rank_block
@@ -223,8 +223,11 @@ def contract_lorentz_blocks(blocks, *, families, term, response, Gij, meta, mesh
                 for A, B in keys])
         kernel = _make_photon_static_class_kernel(mesh_xy, meta.kgrid, meta.nk_tot,
                                                   left, right, with_head=with_head)
-        value = kernel(left.green_parent, right.green_parent, weights, interactions,
-                       -0.5 if term == _TERM_COH else 1.0, vertices, head_blocks)
+        arguments = (left.green_parent, right.green_parent, weights, interactions,
+                     -0.5 if term == _TERM_COH else 1.0, vertices, head_blocks)
+        if admit_kernel is not None:
+            admit_kernel(kernel, arguments, keys[0])
+        value = kernel(*arguments)
         result, head = value if with_head else (value, None)
         yield keys[0], result, head
 

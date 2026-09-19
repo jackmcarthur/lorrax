@@ -73,7 +73,7 @@ def _round_kernels(mesh):
         return program(body, (batch, batch, rep, batch, rep), (batch, batch))
 
     @lru_cache(maxsize=None)
-    def exchange(flags, perm):
+    def exchange(flags, perm, components=1):
         """Mirror products with the partner rank's samples, R_s realized on the panels.
 
         ``xs`` [P, k, n, r]: the states of one sample, ``flags[k]`` True for a
@@ -81,8 +81,12 @@ def _round_kernels(mesh):
         W^T y (original) or conj(W) y (conjugate) and the same for dW; slot r
         applies Phi^* Pi: (R_s W)^T x and conj(R_s W) x, R_s W = Phi Pi W Pi^T Phi^*.
         """
-        def body(w, dw, xs, alpha, inverse, phase, j, scales):
+        def body(w, dw, xs, alpha, inverse, phase, j, scales, rotation=None):
             y = jnp.take_along_axis(phase[:, None, :, None] * xs, inverse[:, None, :, None], axis=-2)
+            if components != 1:
+                shape = y.shape
+                y = jnp.einsum('bij,bkmir->bkmjr', rotation,
+                               y.reshape(*shape[:-2], shape[-2] // components, components, shape[-1])).reshape(shape)
             y = jax.lax.ppermute(y, BATCH_AXES, perm)
             a, d = sample(w, j), sample(dw, j)
             outs = []
@@ -92,8 +96,32 @@ def _round_kernels(mesh):
                 outs += [op_a @ y[:, k], op_d @ y[:, k]]
             back = jax.lax.ppermute(jnp.stack(outs, axis=1), BATCH_AXES, perm)
             back = jnp.conj(phase)[:, None, :, None] * jnp.take_along_axis(back, alpha[:, None, :, None], axis=-2)
+            if components != 1:
+                shape = back.shape
+                back = jnp.einsum('bij,bkmjr->bkmir', rotation,
+                                  back.reshape(*shape[:-2], shape[-2] // components, components, shape[-1])).reshape(shape)
             return tuple(back[:, i] * (scales[i // 2] if i % 2 else 1) for i in range(2 * len(flags)))
-        return program(body, (batch,) * 6 + (rep, rep), (batch,) * (2 * len(flags)))
+        return program(body, (batch,) * 6 + (rep, rep) + ((batch,) if components != 1 else ()),
+                       (batch,) * (2 * len(flags)))
+
+    @lru_cache(maxsize=None)
+    def literal_mirrors(flags):
+        """Act with stored W_q(-conj z) on this parent's original directions.
+
+        The original state at z needs the adjoint to reach -z. Its conjugate
+        state at conj z needs the stored value directly at -conj z. Each
+        derivative is with respect to s at that mirror point; ``scales``
+        converts it to the derivative with respect to z there.
+        """
+        def body(w, dw, xs, j, scales):
+            a, d = sample(w, j), sample(dw, j)
+            outputs = []
+            for k, conjugate in enumerate(flags):
+                op_a, op_d = ((a, d) if conjugate else (adjoint(a), adjoint(d)))
+                outputs.extend((op_a @ xs[:, k], (op_d @ xs[:, k]) * scales[k]))
+            return tuple(outputs)
+        return program(body, (batch, batch, batch, rep, rep),
+                       (batch,) * (2 * len(flags)))
 
     def dedupe(q, o):
         # O W-output of the direction set Q: the part of O outside span(Q), and O O^H for its scale.
@@ -105,7 +133,8 @@ def _round_kernels(mesh):
     apply = program(lambda m, q: m @ q, (batch, batch), batch)
     negative_hermitian = program(lambda a: -(a + adjoint(a)) / 2, (batch,), batch)
     return SimpleNamespace(
-        take=take, column=column, negative_hermitian=negative_hermitian, exchange=exchange, act=act, apply=apply,
+        take=take, column=column, negative_hermitian=negative_hermitian, exchange=exchange,
+        literal_mirrors=literal_mirrors, act=act, apply=apply,
         dedupe=program(dedupe, (batch, batch), (batch, batch)))
 
 
@@ -113,7 +142,8 @@ BATCH_AXES = ('x', 'y')
 
 
 def select_round_states(samples, recipe, *, sample_lo, real, mesh_xy, eigh_plan, svd_plan,
-                        column_extent, logical_n, ordered=False, exchange=None):
+                        column_extent, logical_n, ordered=False, exchange=None,
+                        current_rotation=None):
     """Directions, outputs and actions of one round of parents, batched per role (SP 3, SP 13).
 
     ``samples`` holds ``Wc``/``dWc_ds`` [P, S, n, n] in batch layout (rank r owns
@@ -137,6 +167,11 @@ def select_round_states(samples, recipe, *, sample_lo, real, mesh_xy, eigh_plan,
 
     k = _round_kernels(eigh_plan.mesh)
     W, dW = samples["Wc"], samples["dWc_ds"]
+    literal = "Wc_mirror" in samples or "dWc_mirror_ds" in samples
+    if literal and not all(name in samples for name in ("Wc_mirror", "dWc_mirror_ds")):
+        raise ValueError("GATE shared_pole_literal_mirror: both Wc_mirror and dWc_mirror_ds are required")
+    if literal and not ordered:
+        raise ValueError("GATE shared_pole_literal_mirror: ordered representation required")
     ranks = int(W.shape[0])
     names = {code: name for name, code in ROLE_CODES.items()}
     fit_ids = [int(i) for i in recipe["fit_ids"]]
@@ -207,7 +242,24 @@ def select_round_states(samples, recipe, *, sample_lo, real, mesh_xy, eigh_plan,
             # W(-z) = W(-conj z)^H on Q; W(-conj z) on the partner's O. dW/dz at the
             # mirror node is -2 node dW/ds(-conj z).
             span = range(first, len(states))
-            if z.real == 0:
+            if literal and z.real != 0:
+                originals = list(span)
+                xs = jnp.stack([states[index][1] for index in originals], axis=1)
+                program = k.literal_mirrors(tuple(flags[index] for index in originals))
+                flat = program(samples["Wc_mirror"], samples["dWc_mirror_ds"], xs, j,
+                               put(np.asarray([-2 * states[index][0] for index in originals], np.complex128)))
+                results = [(flat[2 * i], flat[2 * i + 1]) for i in range(len(originals))]
+                del xs
+            elif literal:
+                # An imaginary support's optional partner direction can
+                # have a different carrier width, so act on each separately.
+                results = []
+                for index in span:
+                    node = states[index][0]
+                    results.append(k.act(not flags[index])(
+                        samples["Wc_mirror"], samples["dWc_mirror_ds"], j,
+                        states[index][1], put(np.complex128(-2 * node))))
+            elif z.real == 0:
                 results = []
                 for index in span:
                     node = states[index][0]
@@ -216,10 +268,12 @@ def select_round_states(samples, recipe, *, sample_lo, real, mesh_xy, eigh_plan,
             else:
                 slots, alpha, inverse, phase = exchange
                 program = k.exchange(tuple(flags[index] for index in span),
-                                     tuple((int(r), int(slots[r])) for r in range(ranks)))
+                                     tuple((int(r), int(slots[r])) for r in range(ranks)),
+                                     1 if current_rotation is None else 3)
                 xs = jnp.stack([states[index][1] for index in span], axis=1)
                 flat = program(W, dW, xs, alpha, inverse, phase, j,
-                               put(np.asarray([-2 * states[index][0] for index in span], np.complex128)))
+                               put(np.asarray([-2 * states[index][0] for index in span], np.complex128)),
+                               *((current_rotation,) if current_rotation is not None else ()))
                 results = [(flat[2 * i], flat[2 * i + 1]) for i in range(len(span))]
                 del xs
             for index, (output, action) in zip(span, results):

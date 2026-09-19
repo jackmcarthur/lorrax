@@ -462,11 +462,22 @@ def classify_bands_in_grid(
 #: * The classification must therefore be "which SIDE is this cell on, and
 #:   is it saturated there", which is what the two-sided tolerance says.
 #:
-#: 1e-8 is far outside float64 noise on a saturated erfc tail (which
-#: reaches exact 1.0/0.0 by |E − μ| ≈ 6 widths) and far inside any genuine
-#: partial occupation (the smallest one the Fermi surface produces is
-#: O(width) in energy, i.e. O(0.1) in f).
-FRACTIONAL_TOL = 1.0e-8
+#: THE TOLERANCE MUST MATCH THE TAIL THE DECK ACTUALLY USES.  1e-8 was sized
+#: for a saturated erfc tail, which reaches exactly 1.0/0.0 by about six
+#: widths.  Every metal deck in this sandbox declares FERMI-DIRAC (owner
+#: ruling 2026-09-17), whose tail is exponential: f = 1 - tol needs
+#: |E - mu| ~ ln(1/tol) widths, i.e. 18.4 widths at 1e-8.  At the Fe deck's
+#: kBT = 0.02 Ry that is +-5 eV, so EVERY band of the d manifold counted as
+#: Fermi-crossing, valence_stop fell below the whole retained window and
+#: conduction_start rose above it: both scissor fit classes came out EMPTY,
+#: fit_scissor returned the no-information identity (alpha=1, beta=0, n=0,
+#: w=0), and every out-of-block state sat at its DFT energy while its
+#: in-block neighbour took the full Sigma correction (+4.7 to +4.9 eV on that
+#: deck).  That step is what destabilised the q=0 shared-pole pencil
+#: (claim 2486).  1e-3 saturates at 6.9 widths -- +-1.9 eV at the same width,
+#: i.e. the intended "genuinely partial" manifold -- and is still far inside
+#: any real partial occupation (the docstring's O(0.1)).
+FRACTIONAL_TOL = 1.0e-3
 
 
 @dataclass(frozen=True)

@@ -10,6 +10,30 @@ separate question and is stated per entry — an approved ruling that has not
 landed is marked so, with the branch that carries it, because documenting an
 unlanded change as live is how a tuning table becomes a lie.
 
+## 2026-09-18 — Headless shared-pole SC is allowed for brute-grid development
+
+**Ruling (owner).** `sigma_w_model = shared_pole` with
+`qp_solver = self_consistent` and `head_correction = off` is allowed. The
+former parse-time refusal, `GATE shared_pole_self_consistent_needs_a_head`,
+is retired and replaced by a warning that names the measured scalar risk.
+The dense-k grid is the intended convergence limit: the missing head
+correction is a finite-grid term, so the headless map must be allowed to run
+and judged by its own convergence.
+
+**Consequences.** The Gram validity gate is unchanged; a headless run may
+still refuse numerically at `GATE shared_pole_gram_valid`. The warning
+records the 2026-09-11 AUNION result (map-1 q=0 minima
+`-2.29e-07/-2.01e-07` against `-1e-07`) so the failure is not misattributed
+to the constructor. The signed Gamma head remains the production path for
+ordered stores; on a TRS-broken WFN `head_correction = full` still refuses
+because the ordered head is not implemented. MPA remains the literature
+comparison route, not the active development route.
+
+Implemented in `gw_config.warn_headless_shared_pole_self_consistency` and
+`shared_pole_head._refuse_head_representation`; the focused tests are
+`tests/test_shared_pole_inputs.py::test_shared_pole_self_consistency_allows_a_headless_deck`
+and the scalar-headless row in `tests/multi_device/shared_pole_sectors_p4.py`.
+
 ## 2026-09-04 — One owner for every mesh-padded axis; producers pad and consumers strip
 
 `runtime.padding` owns every mesh-divisibility divisor, carrier extent, pad,

@@ -69,8 +69,10 @@ def refuse_unsupported_shared_pole_head(config, *, trs_allowed, nspinor):
 def _refuse_head_representation(*, trs_allowed, nspinor):
     """The one owner of what the full Gamma head evaluates: TRS-even, N_spinor = 1."""
     remedy = ("A one-shot deck runs with head_correction = off. A self-consistent "
-              "shared-pole deck requires the head (refuse_headless_shared_pole_self_consistency), "
-              "so it has no valid setting on this system until that head lands.")
+              "shared-pole deck may also run headless as a brute-grid development "
+              "mode (owner policy 2026-09-18); with head_correction = full this "
+              "ordered head is not implemented, so head off is the only valid "
+              "setting on this system until the signed head lands.")
     if not bool(trs_allowed):
         raise ValueError(
             "GATE shared_pole_head_ordered: got time-reversal-broken symmetry (an ordered "

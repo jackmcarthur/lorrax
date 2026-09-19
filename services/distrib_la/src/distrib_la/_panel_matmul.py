@@ -1,4 +1,4 @@
-"""Native face GEMM with bounded broadcasts and a shared-left sample axis."""
+"""Native face GEMM with bounded band panels and a shared-left sample axis."""
 from functools import lru_cache, partial
 from math import gcd
 
@@ -25,13 +25,16 @@ def panel_matmul(a, b, *, mesh, panel_bytes):
         Named x/y processor axes. Matrix extents are already mesh-padded.
     panel_bytes : int
         Caller-admitted bytes per rank for the two live operand panels.
-        Output and input faces are accounted for separately by the caller.
+        A complete contraction panel is exchanged once when it fits this
+        budget; otherwise smaller band panels are streamed. Output and
+        input faces are accounted for separately by the caller.
 
     Returns
     -------
     jax.Array
         a @ b, with b's batch/sample axes and an x/y output face. Units
-        multiply without any normalization. No full row/column is gathered.
+        multiply without any normalization. The output always stays x/y
+        tiled; exchanged input panels never exceed ``panel_bytes`` per rank.
     """
     px, py = int(mesh.shape['x']), int(mesh.shape['y'])
     if a.ndim != 3 or b.ndim not in (3, 4) or a.dtype != b.dtype:
@@ -46,11 +49,16 @@ def panel_matmul(a, b, *, mesh, panel_bytes):
     limit = int(panel_bytes) // per_column
     if limit < 1:
         raise MemoryError('panel_matmul panel budget cannot hold one contraction column')
-    common = gcd(k // px, k // py)
-    width = min(common, limit)
-    while common % width:
-        width -= 1
     sample_axis = b.ndim == 4
+    if not sample_axis and limit >= k:
+        # One bounded all-gather per operand gives the local GEMM its full K.
+        # This avoids p tiny-K GEMMs when the complete panel is already small.
+        width = k
+    else:
+        common = gcd(k // px, k // py)
+        width = min(common, limit)
+        while common % width:
+            width -= 1
     return _kernel(mesh, q, m, k, n, width, sample_axis)(a, b)
 
 
@@ -64,6 +72,10 @@ def _kernel(mesh, q, m, k, n, width, sample_axis):
              in_specs=(P(None, 'x', 'y'), spec), out_specs=spec,
              check_vma=False)
     def product(a, b):
+        if width == k and not sample_axis:
+            left = lax.all_gather(a, 'y', axis=2, tiled=True)
+            right = lax.all_gather(b, 'x', axis=1, tiled=True)
+            return left @ right
         if not sample_axis:
             b = b[:, None]
         ns = b.shape[1]

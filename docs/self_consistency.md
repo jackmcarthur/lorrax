@@ -30,6 +30,14 @@ writer path. At the map boundary one named seam selects the complete retained
 result and its defining U together; diagnostics and writers consume that
 selection and never select or broadcast an individual Sigma table again.
 
+For density self-consistency, the charge and current fields use the same
+full-band occupation table as the rotated wavefunction bundle. The active QP
+rotation is embedded as the identity on physical sum bands outside the QP
+window; loader padding has zero occupation. The Hartree matrix-element sweep
+then projects onto the active QP window. Its mesh-padded matrix carrier is
+stripped at the SC producer seam, so each scalar and transverse Hartree
+matrix has the logical width of the retained Hamiltonian.
+
 | class | diagonal of H' | off-diagonals |
 |---|---|---|
 | protected (inside the Σ(ω) grid) | full Σ at the QP energy | kept, protected×protected only |
@@ -399,6 +407,62 @@ input: chi0, the body W and the final trusted-block H scale linearly
 (48.6, pole count changes), which names the head MPA refit as the first
 non-smooth stage of the map.
 
+**20. The protected identity set is decided once and is not re-chosen
+(owner ruling 2026-09-19).** Pitfall 16's per-map reclassification, its pad
+and the frontier promotion are retired as band *selectors*: map 0 classifies,
+map 0 retains the Fermi-crossing manifold so the anchor is never evaluated
+through the scissor, and every later map carries that identity set unchanged.
+Bands outside it follow the scissor law for the whole run. No map may add or
+drop a protected band. MEASURED before the ruling on Fe 4x4x4 charge-only
+headless shared-pole SC (`runs/Fe/04_symmetric_small_bispinor_2026-09-17/10l_frontier_trace3b`,
+source 43ba1e1e, pool 58550102): map 0 promoted identities 18/19 (bands 19/20)
+and map 1 promoted 20/21 (bands 21/22) at every k; each promotion switched a
+band from the scissor to the full Σ correction (+4.7 to +4.9 eV on that deck),
+so the accepted fixed-point residual was the walk itself (5.503 → 5.220 →
+5.080 → 3.924 → 4.797 → 3.670 → 4.699 → 5.248 → 4.208 → 5.129 → 4.046 →
+5.187 → 2.743 → 5.435 → 2.610 eV over 15 calls, map gain 2.05-3.42) while the
+protected manifold moved 0.03-0.25 eV per call. The 2026-09-18 pack of the
+frontier into the policy stays as the map-0 mechanism; `allow_frontier_promotion=False`
+is what the loop's later maps pass. One consequence remains on this deck and is
+NOT part of the ruling: the active-window scissor law itself fitted with zero
+samples (`ScissorFit(val n=0 w=0; cond n=0 w=0)`, α=1, β=0), so scissored
+states sit at their DFT energies; that is a separate defect (claims/2486.md).
+
+### 20.1 Validated metal self-consistency defaults (2026-09-19)
+
+These are the settings and code behaviours that produced a *contracting* Fe
+4x4x4 charge-only headless shared-pole loop (`10p`, source `e0ab4c6e`, P16,
+window -12/+8 eV): accepted `max|dE|` 5.50 -> 0.90 -> 0.19 -> 0.10 -> 0.046 ->
+0.0098 -> 0.0030 eV with **zero** Gram refusals, against 32 refusals and a
+non-contracting 0.3-2.4 eV residual band on the same deck before them.
+
+* **Classify the protected identity set once and carry it frozen.** No band
+  may enter or leave the set mid-loop; every other band is scissored
+  (pitfall 20). A per-map promotion walks the set up the ladder by two bands
+  per map at ~5 eV per step.
+* **The crossing tolerance must be sized to the deck's tail.** Fermi-Dirac
+  needs `ln(1/tol)` widths to saturate; 1e-3 = 6.9 widths (about +-1.9 eV at
+  `kBT = 0.02 Ry`). `1e-8` needed 18.4 widths, marked the whole d manifold
+  crossing, emptied both scissor fit classes and silently degenerated the
+  active-window law to the identity.
+* **A zero-sample fit is not a law.** Fall back to the sum-band tail law
+  (which always has samples) and record which class was empty -- never let an
+  empty class be invisible.
+* **Keep the window around the complete Fermi-surface manifold with margin.**
+  On Fe the manifold is bands 13-18 and the frozen set is 9-20; if the manifold
+  approaches the set edge the scissor starts cutting the Fermi surface.
+* **`sc_max_iter` counts map calls, not iterates** (rCROP spends two per
+  accepted iterate). Size it for the measured 2.5x-per-pair contraction; the
+  default is now 30.
+* **mu is solved, not mixed.** One fixed-N solve per map from the map's own
+  input spectrum (`_solve_occupation_state`), used by the window
+  classification, the chi0/W weights and the shared-pole recipe; the scissor's
+  valence displacement is anchored to the partitioned-output Fermi level
+  (`E_F(QP) - E_F(DFT)`, a difference -- the DFT reference must never be
+  compared absolutely to a QP energy). Do not damp mu; if the Fermi level
+  oscillates, look for a *different* Fermi-level convention or a
+  non-smooth stage of the map, not for a mixing knob.
+
 ## Evidence
 
 Sandbox reports (paths under
@@ -521,8 +585,11 @@ an ordered (time-reversal-broken) or two-component deck refuses at input
 resolution (`GATE shared_pole_head_ordered`, `GATE shared_pole_head_nspinor`,
 `shared_pole_head.refuse_unsupported_shared_pole_head`), before any bank or
 constructor runs. A one-shot deck on such a system uses `head_correction = off`;
-a self-consistent shared-pole deck has no valid setting there until the signed
-Gamma head lands.
+a self-consistent shared-pole deck may also run headless as a brute-grid
+development mode (owner policy 2026-09-18). With `head_correction = full` the
+ordered head still refuses, so head off is the only valid setting there until
+the signed Gamma head lands. The measured scalar map-1 q=0 Gram risk is a
+warning, not a parse refusal; the `shared_pole_gram_valid` gate is unchanged.
 
 Validation on branch `investigate/shared-pole-sc-quadrature-2026-09-10`:
 P4 Si job58152308.12, using diagnostic Sigma integration and the historical

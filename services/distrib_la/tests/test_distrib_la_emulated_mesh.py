@@ -333,9 +333,9 @@ def test_native_eigh_recovers_a_padded_spectrum_on_a_2x2():
 
 def test_native_fn_is_traceable_and_matches_the_eager_call():
     """``Plan.native_fn`` is the pure closure a fusion-critical site puts
-    INSIDE its own jit.  Two claims: it traces at all (no
+    INSIDE its own jit.  It traces at all (no
     ``process_count``, no ``device_put``, no ``dlopen`` in the body), and
-    it computes what the eager call computes."""
+    equivalent plans reuse the same callable without merging placements."""
     import jax
     mesh = _mesh(2, 2)
     rng = np.random.default_rng(29)
@@ -343,11 +343,22 @@ def test_native_fn_is_traceable_and_matches_the_eager_call():
     p = D.plan(
         "cholesky", mesh, backend="native2d", n=16,
         batched_route="auto")
+    equivalent = D.plan(
+        "cholesky", _mesh(2, 2), backend="native2d", n=16,
+        batched_route="auto")
+    other_placement = D.plan(
+        "cholesky", _mesh(1, 4), backend="native2d", n=16,
+        batched_route="auto")
+    assert p.native_fn is equivalent.native_fn
+    assert p.native_fn is not other_placement.native_fn
     eager = np.asarray(p.batched(A))
     jitted = np.asarray(jax.jit(p.native_fn)(A))
     assert np.array_equal(eager, jitted), (
         f"native_fn under jit differs from the eager call by "
         f"{_rel(jitted, eager):.3e}")
+    changed = _put(_hpd(rng, 2, 16, "complex128"), mesh, (None, "x", "y"))
+    assert np.array_equal(np.asarray(jax.jit(p.native_fn)(changed)),
+                          np.asarray(p.batched(changed)))
 
 
 def test_an_ffi_backend_refuses_an_emulated_multi_device_mesh():

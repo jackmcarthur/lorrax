@@ -19,11 +19,14 @@ import numpy as np
 
 
 def shared_pole_byte_terms(meta, *, mesh_xy, resolution, pencil_side,
-                           parent_batch, sample_batch, phase="reduction"):
+                           parent_batch, sample_batch, phase="reduction",
+                           selection_faces=None):
     """Price constructor carriers; the map CapacityLedger owns admission.
 
     Selection holds samples, current narrow actions and the n/2n direction
-    solve; it has no R-by-R pencil. Reduction holds the actual selected
+    solve; it has no R-by-R pencil. ``selection_faces`` is an internal count
+    of the caller's already resident sample and moment faces when that count
+    differs from the ordered scalar default. Reduction holds the actual selected
     pencil. Model checks hold factors and bounded samples, with no pencil.
     Native workspace is separately supplied by the service. No threshold
     or independent capacity policy lives in this constructor helper.
@@ -37,11 +40,24 @@ def shared_pole_byte_terms(meta, *, mesh_xy, resolution, pencil_side,
     dense_copies = math.ceil(b / p) if resolution.layout == "local" else b / p
     if phase == "selection":
         dense = 24 * packed**2
-        sample_faces = max(2*a, 2)
+        # Ordered scalar selection keeps its historical two sample faces.
+        # A sector caller can supply the number of resident sample AND
+        # moment faces from the actual read dictionaries; this prices the
+        # four-field photon bank without introducing a user capacity dial.
+        sample_faces = (max(2*a, 2) if selection_faces is None
+                        else int(selection_faces))
+        if sample_faces < 2*a:
+            raise ValueError(
+                'GATE shared_pole_capacity: selection_faces underprices '
+                f'the {2*a} base sample faces; got {sample_faces}')
     elif phase == "reduction":
+        if selection_faces is not None:
+            raise ValueError('selection_faces applies only to selection')
         dense = 14 * r*r + 12 * packed * r
         sample_faces = 0
     elif phase == "model":
+        if selection_faces is not None:
+            raise ValueError('selection_faces applies only to selection')
         dense = 8 * packed**2 + 4 * packed * r
         sample_faces = max(2*a, 2)
     else:
@@ -55,7 +71,8 @@ def shared_pole_byte_terms(meta, *, mesh_xy, resolution, pencil_side,
     return {"terms_bytes_per_rank": terms,
             "resident_bytes_per_rank": sum(terms.values()),
             "layout": resolution.layout, "phase": phase, "pencil_side": r,
-            "parent_batch": b, "sample_batch": a}
+            "parent_batch": b, "sample_batch": a,
+            "sample_face_count": sample_faces}
 
 
 def _shard_bytes(array):
@@ -127,7 +144,8 @@ class ConstructorCapacity:
             self.native_queries[key] = distrib_la.workspace_bytes_per_rank(plan, op, shapes, np.complex128)
         return self.native_queries[key]
 
-    def plan(self, side=None, *, phase=None, sample_batch=1):
+    def plan(self, side=None, *, phase=None, sample_batch=1,
+             selection_faces=None):
         """Admit this phase's actual live set before allocating it.
 
         ``side`` is the pencil side this price is for; omit it to reprice the
@@ -149,7 +167,8 @@ class ConstructorCapacity:
         price = shared_pole_byte_terms(
             self._meta, mesh_xy=self._mesh_xy, resolution=self._resolution,
             pencil_side=side, parent_batch=self.batch_width,
-            sample_batch=sample_batch, phase=self._phase)
+            sample_batch=sample_batch, phase=self._phase,
+            selection_faces=selection_faces)
         # Other parents' narrow inputs survive selection and each model's
         # checks; they are additional live storage, never hidden in a limit.
         extra = sum(_shard_bytes(a)

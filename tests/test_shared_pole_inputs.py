@@ -16,11 +16,13 @@ from gw.shared_pole_recipe import (
 BASE = '[cohsex]\nnval=2\nncond=2\nnumber_bands=10\n'
 
 
-def parse(tmp_path, extra, *, head='off'):
+def parse(tmp_path, extra, *, head='off', print_fn=None):
     path = tmp_path / 'deck.in'
     path.write_text(BASE + ('' if head is None else f'head_correction={head}\n') + extra)
     return LorraxConfig.from_input_file(str(path), resolve_hardware=False,
-                                       runtime_platform='cpu', print_fn=lambda *_: None)
+                                       runtime_platform='cpu',
+                                       print_fn=(lambda *_: None)
+                                       if print_fn is None else print_fn)
 
 
 @pytest.mark.parametrize('model', ['', 'sigma_w_model=mpa\n'])
@@ -70,29 +72,23 @@ def test_write_w_is_a_debug_key_announced_at_parse_time(tmp_path, capsys):
     assert 'NOT needed for BSE' in report and 'write_poles' in report
 
 
-def test_shared_pole_self_consistency_refuses_a_headless_deck(tmp_path):
-    """MEASURED (claim 2189): shared-pole SC with the head off dies at map 1.
+def test_shared_pole_self_consistency_allows_a_headless_deck(tmp_path):
+    """Owner policy 2026-09-18: headless shared-pole SC is allowed.
 
-    Both halves matter.  The refusal fires at PARSE, because the failure it
-    replaces costs a whole SC map (~160 s on the smallest reference deck)
-    and then reports a numerical Gram gate at q=0 that says nothing about
-    the head.  And it is SCOPED to self-consistency: a headless one-shot
-    shared-pole run is not covered by that evidence and must still parse.
+    The measured scalar map-1 q=0 Gram failure remains a warning, not a
+    parse refusal.  The headless one-shot path stays untouched.
     """
     sc = ('compute_mode=mpa\nsigma_w_model=shared_pole\n'
           'qp_solver=self_consistent\n')
-    with pytest.raises(ValueError) as caught:
-        parse(tmp_path, sc, head='off')
-    message = str(caught.value)
-    assert 'GATE shared_pole_self_consistent_needs_a_head' in message
-    # The three keys that together select the refused configuration, so a
-    # deck author can see which one to change.
-    for key in ('sigma_w_model = shared_pole', 'qp_solver = self_consistent',
-                'head_correction = off'):
-        assert key in message, key
-    # The way out the owner ruled for, and the measured reason.
-    assert 'head_correction = full' in message
-    assert 'q = 0' in message and 'map 1' in message
+    lines = []
+    headless = parse(tmp_path, sc, head='off', print_fn=lines.append)
+    assert headless.sigma.w_model == 'shared_pole'
+    assert headless.qp_solver.value == 'self_consistent'
+    assert headless.head.correction.value == 'off'
+    report = '\n'.join(str(line) for line in lines)
+    assert 'config warning' in report
+    assert 'GATE shared_pole_gram_valid' in report
+    assert 'dense-k' in report
 
     # The same deck with a head parses.
     with_head = parse(tmp_path, sc + 'mpa_n_poles=6\n', head='full')

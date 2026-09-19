@@ -1386,7 +1386,15 @@ _DEFAULTS = {
     # Self-consistency loop knobs (read only when qp_solver=self_consistent).
     # Promoted from the LORRAX_SC_* env vars (2026-07-08); the envs are
     # still honored as deprecated overrides.
-    "sc_max_iter": 20,
+    # rCROP spends TWO map calls per accepted iterate (one trial, one
+    # accepted input map), so this number is a count of map calls, not of
+    # iterates.  MEASURED on Fe 4x4x4 charge-only headless shared-pole SC
+    # (10p, source e0ab4c6e): from a DFT start the accepted max|dE| falls
+    # 5.50 -> 0.90 -> 0.19 -> 0.10 -> 0.046 -> 0.0098 -> 0.0030 eV, i.e.
+    # about 2.5x per accepted pair, so reaching the 1e-4 eV criterion needs
+    # roughly 22 map calls on that deck -- a 20-call default truncates a run
+    # that is still contracting.
+    "sc_max_iter": 30,
     "sc_tol_ev": 1.0e-4,
     # rcrop is the ONLY supported value; `linear` refuses by name at
     # ``SCConfig.__post_init__`` (GATE sc_accelerator_rcrop_only).
@@ -2954,7 +2962,7 @@ def _apply_input_envelope(
     refuse_unsupported_bgw_metal_q0_treatment(resolved)
     refuse_unsupported_screening_diagrams(resolved)
     refuse_unsupported_bispinor_gw(resolved)
-    refuse_headless_shared_pole_self_consistency(resolved)
+    warn_headless_shared_pole_self_consistency(resolved, print_fn=print_fn)
     announce_legacy_sigma_axis_keys(
         _named_keys, resolved.compute_mode, resolved.qp_solver,
         print_fn=print_fn)
@@ -3568,8 +3576,8 @@ def incumbent_bispinor_head_record(config) -> tuple[str, str]:
         "<D_TT> and this deck is outside its envelope")
 
 
-def refuse_headless_shared_pole_self_consistency(config) -> None:
-    """Refuse shared-pole SC with the head off, at PARSE time.
+def warn_headless_shared_pole_self_consistency(config, print_fn=print) -> None:
+    """Allow shared-pole SC with the head off, with the measured risk recorded.
 
     MEASURED, 2026-09-11 (AUNION, claim 2189).  ``sigma_w_model =
     shared_pole`` with ``qp_solver = self_consistent`` and
@@ -3582,13 +3590,17 @@ def refuse_headless_shared_pole_self_consistency(config) -> None:
     material past map 1 and map 2 with ``head_correction = full``
     (job 58216796), so this is a property of the deck, not of the source.
 
-    Two reasons it is a REFUSAL rather than a warning.  It is not a
-    production configuration -- headless modes are debug-only by owner
-    ruling 2026-09-01, and the owner's 2026-09-11 preference is an MPA head
-    correction at every iteration.  And discovering it costs a whole map:
-    ~160 s on the smallest reference deck, proportionally more on anything
-    real, after which the run dies with a numerical gate message that says
-    nothing about the head.
+    OWNER POLICY, 2026-09-18.  Head off is allowed for shared-pole
+    self-consistency as a brute-grid/development mode.  The dense-k limit
+    is the intended convergence limit, so the former parse-time refusal is
+    retired and the measured failure is retained here as a warning instead.
+    This does not loosen the Gram gate: a headless run may still refuse
+    numerically at ``GATE shared_pole_gram_valid``, and the signed Gamma
+    head remains the production path for ordered stores.
+
+    The 2026-09-17 bispinor-metal proof permits heads off while its head
+    model is pending. This exception uses the existing bispinor and FD
+    settings; it does not bypass any bank or Gram validity gate.
 
     SCOPED TO SELF-CONSISTENCY ON PURPOSE.  A headless shared-pole
     ONE-SHOT run is not covered by this evidence and is not refused here;
@@ -3598,24 +3610,18 @@ def refuse_headless_shared_pole_self_consistency(config) -> None:
             or config.qp_solver is not QPSolver.SELF_CONSISTENT
             or config.head.correction is not HeadCorrection.OFF):
         return
-    raise ValueError(
-        "GATE shared_pole_self_consistent_needs_a_head: "
-        "shared-pole self-consistency requires a head correction.\n"
-        "  got:  sigma_w_model = shared_pole, qp_solver = self_consistent, "
-        "head_correction = off\n"
-        "  want: head_correction = full (an MPA head correction at every "
-        "iteration -- owner ruling 2026-09-11), or qp_solver = one_shot_dft "
-        "if a headless shared-pole run is what you meant\n"
-        "  why:  MEASURED.  This combination completes map 0 and then dies "
-        "inside map 1 on GATE shared_pole_gram_valid at q = 0, the parent "
-        "where the head correction acts.  Measured on three independent "
-        "sources (Gram min/max -2.29e-07, -2.01e-07 against a -1e-07 gate); "
-        "the same source runs past map 1 and map 2 with head_correction = "
-        "full.  Refused here rather than one map in, because the failure "
-        "costs a full map and its message names numerics, not the head.  A "
-        "headless one-shot shared-pole run is NOT refused.\n"
-        "  doc:  docs/input_reference.md, head_correction / sigma_w_model; "
-        "KNOWN_LORRAX_ISSUES.md; claim 2189.")
+    if (bool(getattr(config, "bispinor", False))
+            and getattr(config, "occ_smearing_width_ry", None) is not None):
+        return
+    print_fn(
+        "  [config warning] shared-pole SC with head_correction = off is "
+        "allowed as a brute-grid/development mode (owner policy 2026-09-18). "
+        "The scalar route has measured a map-1 q = 0 Gram failure "
+        "(GATE shared_pole_gram_valid, -2.29e-07/-2.01e-07 against -1e-07); "
+        "the Gram gate is unchanged and the run may still refuse "
+        "numerically.  The dense-k limit is the intended convergence limit; "
+        "the signed Gamma head remains the production path for ordered "
+        "stores.  See docs/input_reference.md and KNOWN_LORRAX_ISSUES.md.")
 
 
 def refuse_unsupported_bispinor_gw(config) -> None:

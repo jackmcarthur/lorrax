@@ -171,9 +171,14 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
         with timing.fenced_section("spole.sample_batch_read"):
             budget.live(infinity)
             with SlabIO(bank["path"], mode="r", mesh=mesh_xy) as bank_io:
+                sample_fields = (
+                    ("Wc", "dWc_ds", "Wc_mirror", "dWc_mirror_ds")
+                    if header.get("mirror_mode") is not None
+                    else ("Wc", "dWc_ds"))
                 samples = read_shared_pole_bank(
-                    bank_io, meta=meta, header=header, q_ids=ids, partition_spec=batch_spec,
-                    sample_span=(fit_lo, fit_hi))
+                    bank_io, meta=meta, header=header, q_ids=ids,
+                    partition_spec=batch_spec, sample_span=(fit_lo, fit_hi),
+                    fields=sample_fields)
             # The store admits this complete bounded scratch batch before
             # allocation. Charge it while directions/actions are selected;
             # release it before admitting the dense pencil.

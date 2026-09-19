@@ -146,8 +146,68 @@ The linear particle–hole pencil `(z σ₃ − M)` has the same resolvent-ident
 $$ \mathcal G = X^\dagger \sigma_3 X,\qquad \mathcal H = X^\dagger M X, \tag{SP 11} $$
 
 with nodes `{z, z̄, −z̄, −z}` and `∂W/∂z = 2z ∂W/∂s`. Every state `X(z)` on `Q` is followed, after all originals, by
-its mirror `X(−z)` on the same `Q`; `W_q(−z̄) = conj W_{−q}(z)`, so the mirror is one sample of parent `−q`. Poles
-`1/μ` are real iff the projected `ℋ ≻ 0`, which a stable RPA (`M ≻ 0`) guarantees.
+its mirror `X(−z)` on the same `Q`; for an exactly covariant representation,
+`W_q(−z̄) = conj W_{−q}(z)` gives that mirror from parent `−q`. An approximate
+ISDF photon operator need not obey this identity closely enough for the
+finite Gram. A photon bank therefore stores `Wc_mirror` and
+`dWc_mirror_ds` at `−conj(z)` from the same physical state, with the original
+parent's V and contact. The constructor takes the stored value directly for
+the conjugate mirror state and its adjoint for the original mirror state;
+both derivatives acquire the actual mirror node's `2z` factor. CC, TT, CT
+and TC use those same authenticated fields. M0..M3 are computed from the
+original q operator, V and contact and still feed the unchanged infinity
+block; finite-sample mirror positivity alone does not certify that block.
+Poles
+`ℋ ≻ 0` on the retained span is sufficient for Hermitian whitening, real
+finite poles `1/μ`, and residues with the sign of the pole. A stable RPA
+(`M ≻ 0`) guarantees this condition. Reality alone is insufficient to infer
+stability: `G = I`, `H = diag(1,-1)` has real generalized eigenvalues despite
+indefinite H. The constructor admits the positive retained metric; it does
+not certify stability of discarded or unprobed physical states.
+
+### Signed photon interaction and contact
+
+The photon bank uses the physical paramagnetic response
+`χp(z) = C (z J − H0)^−1 C†`, with particle/hole signature J and positive
+transition energies in H0. The columns of C include the square roots of
+positive occupation differences and the physical response prefactor; the
+ordered negative-frequency residues have the opposite sign. Cartesian
+current vertices stay in C, with their physical complex phases.
+
+In `response_bank.response_algebra`, `χ = χp − D`, where
+`D = cell_volume * TT_contact`, and `W = (I − V χ)^−1 V`.
+The bare photon V is Hermitian and signed. If the contact solve exists,
+`U = W∞ = (I + V D)^−1 V` is Hermitian. The resolvent identity gives
+
+$$ W(z)-U = U C [z J-(H_0+C^\dagger U C)]^{-1} C^\dagger U. $$
+
+Thus positivity of `H0 + C† U C` is a sufficient stable-realization
+condition even for indefinite U. With this condition and Hermitian U,
+the ordered residue at Ω has sign(Ω) times a positive semidefinite
+matrix; a diagonal TT block inherits this property. Neither an indefinite
+U alone nor a real spectrum proves the condition. Positive and negative
+frequency sides must retain their ordered partner convention.
+
+The scalar positive-V bound on the V-whitened `−Herm Wc(iη)` in `[0,I]`
+does not apply to signed V. Its absence does not remove the retained-H
+stability, finite-factor, zero-weight, partner or moment checks. Cross-sector
+Cauchy–Schwarz applies to a positive spectral metric, not an arbitrary
+complex-frequency W block. The separate constant `U−V` contributes to
+Sigma independently of the pole model of `W−U`.
+
+Sector stores stamp their actual realization as `raw-sector-endpoint-v1`
+in the authenticated model recipe and sector manifest. This names raw
+physical charge/current endpoints with their own centroid bases, followed
+by the stored symmetry endpoint action. It performs no scalar little-group
+averaging. CC and TT have independent poles; CT_C and CT_T share one
+retained mask and pole ordering, with each endpoint passing its own lost
+weight check. The manifest binds all four stores and the current-map
+`W∞−V` bank constant.
+Positive retained `H` certifies each projected realization. Since CC, TT
+and CT are fitted independently, this does not certify positive spectral
+residues of the assembled photon matrix: a CT-only pole can have a nonzero
+cross residue while its CC and TT diagonal residues vanish. Assess the
+assembled model through sector and integrated-Sigma accuracy receipts.
 
 **Infinity block.** `k₀ = σ₃ C^† Q_∞` and `k₁ = σ₃ M σ₃ C^† Q_∞` need all four moments of (SP 8):
 
@@ -275,3 +335,69 @@ $$ \text{reduction} \approx 16\,\big(14 R^2 + 12 n R\big)\,b/P + 16\cdot 3 n r\,
 ledger's rows). A round has `b = P`: every rank holds one whole parent (§6). The native cuSOLVERMp eigh adds a
 private operand tile of `n²/P` next to its workspace, which `distrib_la.workspace_bytes_per_rank` includes; a byte
 model without that tile under-counts the measured CrI3 q=1 construction peak (2.140 against 2.907 GiB per rank).
+
+
+### Photon bank residency audit (2026-09-17)
+
+This is a source audit of the literal-mirror producer, not a complete HLO or
+native-workspace proof. Let K be full k count, m the packed photon extent,
+s the spin count, B the band carrier, a the support count, q the admitted
+union of exact original and negative momentum rows, and P=Px Py. Complex
+arrays use 16 bytes per element. Run477/32 has K=64, m=1032, s=4, B=36,
+a=22, q=22 (13 original parents), P=4. Its recorded JAX high water is
+18,203,126,272 B/rank; the original panel admission was 5,209,765,972 B/rank.
+Those differently scoped numbers do not by subtraction measure a missing
+allocation. Native allocations are excluded from the JAX high water.
+
+| Object | Actual production call / layout | Shape | Full bytes | Per-rank bytes |
+|---|---|---|---|---|
+| Prepared endpoints, four carriers | `prepare_photon_carriers`; mun `[K,s,m_X,B_Y]`, nmu `[K,B_X,s,m_Y]` on face layout | four K s m B | 64 K s m B | 64 K s m B / P |
+| Bare photon V | `photon_bare_operator`, `[q_parent,m_X,m_Y]` | q_parent m² | 16 q_parent m² | 16 q_parent m²/P |
+| Contact/reference buffers | `photon_static_contact` / slab read, `[1,m_X,m_Y]` | m² each | 16 m² | 16 m²/P each |
+| Two live full-spin Green functions | `response_stream` / contour kernel, `[K,s,m_X,s,m_Y]` | 2 K s² m² | 32 K s² m² | 32 K s² m²/P |
+| FFT and Green contraction temporaries | inside the compiled stream; explicit face stream signatures, interior HLO still to audit | compiler dependent | not inferred | compiled temporary bytes; external FFT workspace separate |
+| Value/derivative response carry | `integrate_response_panel`, `[2a,q,m_X,m_Y]`; donated across stream calls | 2 a q m² | 32 a q m² | 32 a q m²/P |
+| Dyson arguments/results | `response_algebra`, `[a,m_X,m_Y]`; original and mirror run sequentially | bounded a m² panels | 16 a m² each | 16 a m²/P each, plus native LU work |
+| Ordered bare moments | `exact_bare_moments`, four `[q,m_X,m_Y]` arrays | 4 q m² | 64 q m² | 64 q m²/P |
+| Sector samples and moments | sector reader; four photon sample fields and four moment fields, `[q_XY,a,mu,mu]` | sector dependent | 16 times element count | batch divided over P, padded to whole-parent rounds |
+| Directions, Ritz pencil and factors | constructor local parent algebra; `[q_XY,mu,R]`, `[q_XY,R,R]` | b mu R and b R² | 16 b mu R; 16 b R² | 16 ceil(b/P) mu R; 16 ceil(b/P) R² |
+
+The response carry grows by 22/13 for this exact-mirror union. It does not
+create another Green stream. The four prepared face-layout endpoints alone
+occupy 152,174,592 B/rank on this geometry. Family unfolding, canonical
+unpacking, gamma action and photon packing have additional preparation
+intermediates; retained-endpoint pricing does not certify their peak.
+
+Face arrays remain constant per rank under m² proportional to P. Constructor
+whole-parent rounds have a strong-scaling ceiling: with b=P each rank retains
+a whole parent pencil and factor. Face/batch conversion uses explicit
+all-to-all exchanges, not a host/global matrix copy. Replicated poles and
+scalar diagnostics are small metadata. Legacy axis-layout wavefunctions
+have only one mesh axis in each carrier; this audit establishes face-layout
+residency only. It does not authorize a new layout or replicated bulk array.
+
+The producer must release ordered `o0/o1`, the per-parent operand tuple,
+result list and contact constant after their synchronous writes. Otherwise
+they survive into the next moment panel. Photon stream compiler temporaries
+must be admitted alongside the already priced carry and endpoint buffers;
+scalar streams retain their existing matched-reference admission route.
+Compiler outputs and aliases are recorded separately to avoid charging the
+donated carry twice. This is a pre-execution admission, not an automatic
+panel retry or a measured whole-process peak.
+
+Native LU remains a distinct gap: `batched_solve_lu_ffi.cc` allocates both
+Getrf and Getrs workspaces simultaneously plus batch pivots outside XLA.
+The existing `distrib_la.workspace` query supports GEMM/eigh only. A minimal
+extension is an LU query in that same service/provider, with the actual
+batch, n, nrhs, mesh/block geometry and dtype, summing both device workspaces
+and pivots and reporting host workspace separately. No alternate backend
+is needed. Until then the receipt must retain its native-workspace unknown
+status; FFT custom-call scratch likewise must not be inferred as zero.
+
+Scoped acceptance of the producer memory block: P4 job58495709.1,
+Run477/38, sourceae2cabe1, sandbox claim2457. Actual photon stream compiled
+temporaries476,768B plus arguments73,344B admit550,112B/rank; budget550,111B
+refuses before execution. Donated output/alias6,144B; relative output
+difference0. Optimized HLO Green[8,4,8,4,8] tiles global[8,4,16,4,16] onP4.
+This proves the bounded admission path and tile geometry, not the native
+custom-call interiors, endpoint preparation peak or a material peak decrease.

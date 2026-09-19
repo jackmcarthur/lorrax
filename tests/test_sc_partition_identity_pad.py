@@ -254,7 +254,7 @@ def test_hysteresis_retained_state_remains_a_scissor_fit_sample():
     assert not retained.in_range_mask[0, 1]
     kstar = SimpleNamespace(irr_idx=np.array([0]), select=lambda a: a)
     h = jnp.asarray(np.diag(energy[0] / RYD_TO_EV)[None])
-    result, fit = _apply_scissor_partition_policy(
+    result, fit, promoted = _apply_scissor_partition_policy(
         h, reference / RYD_TO_EV, np.array([[True, False, False]]),
         retained, kstar, efermi_dft_ry=0., n_occ=1,
         candidate_efermi_fn=lambda _: 0., print_fn=lambda _: None)
@@ -265,6 +265,98 @@ def test_hysteresis_retained_state_remains_a_scissor_fit_sample():
     # the excluded DFT 8 eV state to 10 eV instead of leaving it at DFT.
     np.testing.assert_allclose(np.diagonal(result, axis1=1, axis2=2) * RYD_TO_EV,
                                [[-1., 6., 10.]])
+
+
+def test_frontier_manifold_is_promoted_instead_of_refused():
+    """A crossing band outside the energy window is protected by identity."""
+    from types import SimpleNamespace
+    from gw.sc_iteration import _apply_scissor_partition_policy
+    from gw.scissor import ScissorBandClasses
+
+    reference = np.array([[-1., 4., 8.]])
+    energy = np.array([[-1., 6., 10.]])
+    partition = _partition(energy, reference)
+    assert not np.asarray(partition.protected_mask)[0, 1]
+    assert not np.asarray(partition.in_range_mask)[0, 1]
+    classes = ScissorBandClasses(valence_stop=1, conduction_start=2)
+    kstar = SimpleNamespace(irr_idx=np.array([0]), select=lambda a: a)
+    h = jnp.asarray(np.diag(energy[0] / RYD_TO_EV)[None])
+    result, _fit, promoted = _apply_scissor_partition_policy(
+        h, reference / RYD_TO_EV, np.array([[True, False, False]]),
+        partition, kstar, efermi_dft_ry=0., n_occ=1,
+        candidate_efermi_fn=lambda _: 0., band_classes=classes,
+        print_fn=lambda _: None)
+    assert np.asarray(promoted.protected_mask)[0, 1]
+    # The promoted crossing band keeps its full candidate diagonal.
+    assert np.diag(np.asarray(result)[0])[1] == pytest.approx(
+        energy[0, 1] / RYD_TO_EV)
+
+
+def test_frozen_partition_never_promotes_a_later_map():
+    """Owner ruling 2026-09-19: the protected set is decided once, on map 0.
+
+    Same crossing fixture as the promotion test, with the promotion switched
+    off the way ``gw_iteration_map`` switches it off for every map after the
+    first: the identity set must not grow, so the crossing band keeps the
+    scissor law for the whole loop.
+    """
+    from types import SimpleNamespace
+    from gw.sc_iteration import _apply_scissor_partition_policy
+    from gw.scissor import ScissorBandClasses
+
+    reference = np.array([[-1., 4., 8.]])
+    energy = np.array([[-1., 6., 10.]])
+    partition = _partition(energy, reference)
+    classes = ScissorBandClasses(valence_stop=1, conduction_start=2)
+    kstar = SimpleNamespace(irr_idx=np.array([0]), select=lambda a: a)
+    h = jnp.asarray(np.diag(energy[0] / RYD_TO_EV)[None])
+    _result, _fit, promoted = _apply_scissor_partition_policy(
+        h, reference / RYD_TO_EV, np.array([[True, False, False]]),
+        partition, kstar, efermi_dft_ry=0., n_occ=1,
+        candidate_efermi_fn=lambda _: 0., band_classes=classes,
+        allow_frontier_promotion=False, print_fn=lambda _: None)
+    np.testing.assert_array_equal(
+        np.asarray(promoted.protected_mask),
+        np.asarray(partition.protected_mask))
+
+
+def test_index_fallback_frontier_is_identity_space_and_crossing_only():
+    """Without an occupation table the fallback frontier must still name a band.
+
+    ``retained_kn`` inside the policy is a ``(k, DFT identity)`` mask, so a
+    fallback that names sorted columns promotes whatever identity happens to
+    sit in that column on that map -- measured as the Fe 4x4x4 promotion
+    flipping 21 -> 22 -> 21 between calls and moving a band 3-5 eV against a
+    1e-4 eV cutoff.  Two statements pin the replacement: a far LUMO across a
+    vacuum gap is never promoted, and a near-Fermi LUMO that the window
+    scissored is promoted by identity.
+    """
+    from types import SimpleNamespace
+    from gw.band_partition import BandPartition
+    from gw.sc_iteration import _apply_scissor_partition_policy
+
+    kstar = SimpleNamespace(irr_idx=np.array([0]), select=lambda a: a)
+    retained = BandPartition(
+        protected_mask=jnp.asarray([[True, False, False]]),
+        in_range_mask=jnp.asarray([[True, False, False]]))
+
+    def promoted_for(reference_ev, fermi_ev):
+        energy = np.asarray(reference_ev, dtype=np.float64)
+        h = jnp.asarray(np.diag(energy[0] / RYD_TO_EV)[None])
+        _result, _fit, promoted = _apply_scissor_partition_policy(
+            h, energy / RYD_TO_EV, np.asarray([[True, False, False]]),
+            retained, kstar, efermi_dft_ry=fermi_ev / RYD_TO_EV, n_occ=2,
+            candidate_efermi_fn=lambda _: 0., print_fn=lambda _: None)
+        return np.asarray(promoted.protected_mask)
+
+    # 20 eV above the Fermi level: no crossing, nothing to protect.
+    vacuum = promoted_for(np.array([[-1.0, 20.0, 30.0]]), 0.5)
+    assert vacuum[0, 1] is np.bool_(False)
+    # 0.1 eV above the Fermi level, scissored by the window: promoted, and the
+    # identity that is promoted is the LUMO's, not a column index.
+    crossing = promoted_for(np.array([[-1.0, 0.6, 30.0]]), 0.5)
+    assert crossing[0, 1] is np.bool_(True)
+    assert crossing[0, 2] is np.bool_(False)
 
 
 def test_fermi_classes_follow_per_k_state_identities():
