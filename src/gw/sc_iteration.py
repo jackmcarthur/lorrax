@@ -3723,7 +3723,30 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         band_classes=scissor_classes,
         scissor_fit=(_frozen_active if _frozen_active is not None else tail_fit),
         use_valence_fit=(inputs.config.sc.tail_fit == "buffer_edges"),
-        label="SC", print_fn=inputs.print_fn)
+        # THE DIAGNOSTIC CHANNEL MATTERS.  ``inputs.print_fn`` output is not
+        # what the run log keeps -- every line of this map that a reader has
+        # actually seen (the per-k partition, the escapes, the sampled-support
+        # growth) arrives through ``_record_sc``.  A scissor/frontier decision
+        # that moves a band by eV between maps therefore left no trace at all:
+        # the Fe 4x4x4 charge-only loop grew its protected set from 9-20 to
+        # 9-22 between map 0 and map 1 with no promotion line anywhere in
+        # rank-0.log, gwjax.out or the launcher log (jobs 58551752, 58550102),
+        # which is why the residual could not be attributed from the artifacts.
+        # Record the policy's own diagnostics on the log's channel.
+        label="SC", print_fn=lambda line: _record_sc(inputs, line))
+    _before_policy = np.broadcast_to(
+        np.asarray(partition.protected_mask, dtype=bool),
+        np.shape(np.asarray(promoted_partition.protected_mask, dtype=bool)))
+    _after_policy = np.asarray(promoted_partition.protected_mask, dtype=bool)
+    _promoted_pairs = [
+        [int(k), int(b)] for k, b in np.argwhere(
+            _after_policy & ~_before_policy)[:12]]
+    _record_sc(
+        inputs,
+        f"    SC policy: scissor_fit={'none' if scissor_fit is None else 'fitted'}, "
+        "protected at all k="
+        f"{_band_ranges(promoted_partition.protected_mask, band_offset=int(inputs.band_slices.sigma.start))}, "
+        f"promoted (k,index)={_promoted_pairs}")
     # The policy sees the loop's k-set; the carried partition is full-BZ.
     # Restore the promoted frontier masks before the next map re-selects them.
     if ks.is_identity:
