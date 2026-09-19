@@ -2656,8 +2656,16 @@ def _capture_frozen_scissor_fits(outputs):
     """The pair to carry forward, taken from the FIRST map's outputs."""
     if outputs is None:
         return None
-    return (getattr(outputs, "scissor_fit", None),
-            getattr(outputs, "tail_scissor_fit", None))
+    active = getattr(outputs, "scissor_fit", None)
+    if (active is not None and int(getattr(active, "n_fit_v", 0)) == 0
+            and int(getattr(active, "n_fit_c", 0)) == 0):
+        # A zero-sample fit is the identity (alpha=1, beta=0), not a fitted
+        # law.  Freezing it would pin every out-of-block state at its DFT
+        # energy for the whole loop; leave it None so the caller's own
+        # ``else tail_fit`` fallback supplies the law that the sum-band side
+        # already uses (measured degenerate on Fe 4x4x4, claim 2486).
+        active = None
+    return (active, getattr(outputs, "tail_scissor_fit", None))
 
 
 def _state_partition(state: SCState, inputs: SCInputs) -> BandPartition:
@@ -3957,6 +3965,20 @@ def _scissor_E_qp_for_outofrange(
         valence_kn, crossing_kn = band_classes.masks(e_dft_np.shape)
         fit_mask_kn = retained_kn & ~crossing_kn
     fit = scissor_fit
+    if fit is not None and int(fit.n_fit_v) == 0 and int(fit.n_fit_c) == 0:
+        # A ZERO-SAMPLE FIT IS NOT A LAW.  ``ScissorFit`` returns alpha=1,
+        # beta=0 when its mask selected nothing, and this map then FROZE that
+        # object as the active-window law: MEASURED on Fe 4x4x4 charge-only
+        # (`10j_frontier_trace_onemap`, source 20861f29)
+        # ``ScissorFit(val n=0 w=0; cond n=0 w=0)``, so every state outside the
+        # retained block sat at its DFT energy while its in-block neighbour
+        # took the full Sigma correction (+4.7 to +4.9 eV on that deck) -- a
+        # multi-eV step at a boundary that has to be a knee.  The call site's
+        # ``... if _frozen_active is not None else tail_fit`` already says the
+        # sum-band law is the intended fallback; a fit with no samples must
+        # therefore be treated as absent and refitted from this map's own
+        # in-block samples below.
+        fit = None
     if fit is None:
         H_diag_np = np.real(np.asarray(jnp.diagonal(
             H_qp_dft_full, axis1=1, axis2=2)))
