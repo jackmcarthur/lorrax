@@ -253,7 +253,7 @@ def test_sc_fixed_session_reuses_identical_nodes_without_refitting(monkeypatch):
     assert first_geometry["sc_fixed_initial_window_tau_pairs"] == 6
 
 
-def test_sc_fixed_session_rebuilds_an_escaped_window_and_counts_it(monkeypatch):
+def test_sc_fixed_session_refuses_an_escaped_window(monkeypatch):
     calls = []
 
     def counted(box, eps, **kwargs):
@@ -270,28 +270,13 @@ def test_sc_fixed_session_rebuilds_an_escaped_window_and_counts_it(monkeypatch):
         _summaries(), [_branch_at((0.1, 3.0))],
         np.asarray([0.2, 0.5]), 0.1, **args)
     calls.clear()
-    _second, geometry = plan_sigma_windows(
-        _summaries(), [_branch_at((0.1, 8.0))],
-        np.asarray([0.2, 0.5]), 0.1, **args)
-    # Only the escaped window(s) are refitted; the rest reuse their nodes.
-    rebuilt = geometry["sc_fixed_rebuilds_this_iteration"]
-    assert 1 <= rebuilt <= 3
-    assert len(calls) == rebuilt
-    assert geometry["sc_fixed_total_rebuild_count"] == rebuilt
-    assert len(geometry["sc_fixed_rebuilt_windows"]) == rebuilt
-    statuses = [row["cache_status"]
-                for row in geometry["branches"][0]["windows"]]
-    assert statuses.count("rebuild:sc-fixed") == rebuilt
-    assert all(status in ("rebuild:sc-fixed", "hit:sc-fixed")
-               for status in statuses)
-    # The rebuilt certificate holds on the next map without another fit.
-    calls.clear()
-    _third, geometry = plan_sigma_windows(
-        _summaries(), [_branch_at((0.1, 8.0))],
-        np.asarray([0.2, 0.5]), 0.1, **args)
+    # The frozen map is never silently re-keyed: a box that escapes the
+    # +2 eV certificate is a named refusal, not a rebuild.
+    with pytest.raises(RuntimeError, match="sc_fixed_quadrature_escape"):
+        plan_sigma_windows(
+            _summaries(), [_branch_at((0.1, 8.0))],
+            np.asarray([0.2, 0.5]), 0.1, **args)
     assert calls == []
-    assert geometry["sc_fixed_rebuilds_this_iteration"] == 0
-    assert geometry["sc_fixed_total_rebuild_count"] == rebuilt
 
 
 def test_sc_fixed_session_keeps_receipt_for_temporarily_empty_window(
@@ -340,7 +325,7 @@ def test_sc_fixed_session_keeps_receipt_for_temporarily_empty_window(
         row["node_digest"] for row in first]
 
 
-def test_sc_fixed_session_rebuilds_a_window_absent_from_iteration_one(
+def test_sc_fixed_session_refuses_a_window_absent_from_iteration_one(
         monkeypatch):
     calls = []
 
@@ -354,20 +339,62 @@ def test_sc_fixed_session_rebuilds_a_window_absent_from_iteration_one(
         eps=1.0e-4, cache_dir=None,
         fixed_rule_session=session,
         print_fn=lambda *_args, **_kwargs: None)
-    _first, first_geometry = plan_sigma_windows(
+    plan_sigma_windows(
         _summaries(), [_branch_at((0.1, 0.2))],
         np.asarray([0.2, 0.5]), 0.1, **args)
-    n_first = len(first_geometry["branches"][0]["windows"])
     calls.clear()
-    _second, geometry = plan_sigma_windows(
+    with pytest.raises(RuntimeError, match="sc_fixed_quadrature_map"):
+        plan_sigma_windows(
+            _summaries(), [_branch_at((0.1, 3.0))],
+            np.asarray([0.2, 0.5]), 0.1, **args)
+    assert calls == []
+
+
+def test_sc_fixed_session_refits_only_on_material_class_flip(monkeypatch):
+    calls = []
+
+    def counted(box, eps, **kwargs):
+        calls.append(tuple(box))
+        return _fake_rule(box, eps, **kwargs)
+
+    monkeypatch.setattr("gw.sigma_box_plan.build_uniform_rule", counted)
+    session = {}
+    args = dict(
+        eps=1.0e-4, cache_dir=None,
+        fixed_rule_session=session,
+        print_fn=lambda *_args, **_kwargs: None)
+    _, first = plan_sigma_windows(
         _summaries(), [_branch_at((0.1, 3.0))],
-        np.asarray([0.2, 0.5]), 0.1, **args)
-    n_second = len(geometry["branches"][0]["windows"])
-    assert n_second > n_first
-    rebuilt = geometry["sc_fixed_rebuilds_this_iteration"]
-    assert rebuilt >= n_second - n_first
-    assert len(calls) == rebuilt
-    assert geometry["sc_fixed_total_rebuild_count"] == rebuilt
+        np.asarray([0.2, 0.5]), 0.1, material_class="metal", **args)
+    assert first["sc_fixed_material_class"] == "metal"
+    calls.clear()
+    _, second = plan_sigma_windows(
+        _summaries(), [_branch_at((0.11, 3.01))],
+        np.asarray([0.2, 0.5]), 0.1, material_class="metal", **args)
+    assert calls == []
+    assert second["sc_fixed_rebuilds_this_iteration"] == 0
+    _, flipped = plan_sigma_windows(
+        _summaries(), [_branch_at((0.11, 3.01))],
+        np.asarray([0.2, 0.5]), 0.1, material_class="insulator", **args)
+    assert len(calls) == 3
+    assert flipped["sc_fixed_initialized"]
+    assert flipped["sc_fixed_material_class"] == "insulator"
+    assert flipped["sc_fixed_class_flip"] == "metal->insulator"
+
+
+def test_sc_fixed_padding_adds_two_ev_per_real_edge():
+    from gw.sigma_box_plan import _SC_WINDOW_PAD_EV, _sc_padded_box_spec
+    eta = 0.1
+    spec = make_sigma_box_spec(
+        name="crossing", frequencies=(-2.0, 2.0), states=(-0.2, 0.2),
+        pole_stats=((1.0, 2.0, 0.5, 1.0),), pole_sign=1.0,
+        eta_ry=eta)
+    padded = _sc_padded_box_spec(spec, eta)
+    assert _SC_WINDOW_PAD_EV == 2.0
+    assert padded["sc_flat_pad_ev"] == 2.0
+    pad = 2.0 / RYD_TO_EV
+    assert padded["box"][0] <= spec["box"][0] - pad
+    assert padded["box"][1] >= spec["box"][1] + pad
 
 
 def test_sc_rule_padding_scales_with_state_energy_and_ten_percent_on_poles():
@@ -383,14 +410,16 @@ def test_sc_rule_padding_scales_with_state_energy_and_ten_percent_on_poles():
         spec["frequencies"], spec["states"], expanded_poles,
         spec["pole_sign"], eta)
     pad_ev = 0.5 + 0.10 * (0.2 * RYD_TO_EV)
+    flat_pad_ry = 2.0 / RYD_TO_EV
     expected = (
-        min(spec["box"][0], pole_box[0]) - pad_ev / RYD_TO_EV,
-        max(spec["box"][1], pole_box[1]) + pad_ev / RYD_TO_EV,
+        min(spec["box"][0], pole_box[0]) - pad_ev / RYD_TO_EV - flat_pad_ry,
+        max(spec["box"][1], pole_box[1]) + pad_ev / RYD_TO_EV + flat_pad_ry,
         min(spec["box"][2], pole_box[2]),
         max(spec["box"][3], pole_box[3]),
     )
     np.testing.assert_allclose(padded["box"], expected, rtol=0.0, atol=0.0)
     assert padded["sc_state_pad_ev"] == pad_ev
+    assert padded["sc_flat_pad_ev"] == 2.0
     assert padded["sc_pole_pad_fraction"] == 0.10
 
 
