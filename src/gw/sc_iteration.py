@@ -3997,6 +3997,23 @@ def _scissor_E_qp_for_outofrange(
         # k-set, ``w`` must not.
         print_fn(f"    SC scissor: {fit.summary()}; valence regression is "
                  "diagnostic only")
+        # AN EMPTY CLASS IS A LAW THAT WAS NEVER FIT.  ``fit_scissor`` falls
+        # back to the no-information identity (alpha=1, beta=0) when a class
+        # has no samples, and that fallback is exactly what silently scissored
+        # a ten-band window for fifteen maps on Fe 4x4x4: every out-of-block
+        # state sat at its DFT energy while its in-block neighbour took the
+        # full +4.7 to +4.9 eV Sigma correction, and the resulting block-edge
+        # step is what destabilised the q=0 pencil (claims 2486).  The
+        # tolerance now matches the deck's tail, so this is a report rather
+        # than a refusal -- but it must never be invisible again.
+        _empty = [name for name, n in (("valence", fit.n_fit_v),
+                                       ("conduction", fit.n_fit_c)) if int(n) == 0]
+        if _empty:
+            print_fn(
+                "    SC scissor: EMPTY " + ", ".join(_empty) + " fit class(es) "
+                "-> that class keeps E_DFT (no-information law). Check the "
+                "three-way classification against the deck's smearing tail "
+                "(Fermi-Dirac needs ln(1/tol) widths to saturate).")
     # The SAME boundary indices that split the fit split the application, so
     # a band cannot be fit as one class and extrapolated as another.  Crossing
     # bands stay at E_DFT.  In practice they are protected/in-range, but the
