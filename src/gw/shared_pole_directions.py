@@ -1,7 +1,7 @@
 """Direction selection and the per-parent state panels the pencil consumes.
 
-Line, imaginary and infinity supports (SP, section 3), the ordered partner
-directions and their dedupe (SP 13), the retained per-parent callables, and the
+Line, imaginary and infinity supports (W 14), the ordered partner
+directions and their dedupe (W 29), the retained per-parent callables, and the
 model diagnostics evaluated against the bank moments.
 """
 
@@ -143,9 +143,7 @@ BATCH_AXES = ('x', 'y')
 
 def select_round_states(samples, recipe, *, sample_lo, real, mesh_xy, eigh_plan, svd_plan,
                         column_extent, logical_n, ordered=False, exchange=None,
-                        current_rotation=None):
-    """Directions, outputs and actions of one round of parents, batched per role (SP 3, SP 13).
-
+    """Directions, outputs and actions of one round of parents, batched per role (W 14, W 28).
     ``samples`` holds ``Wc``/``dWc_ds`` [P, S, n, n] in batch layout (rank r owns
     round slot r), sample ``sample_lo + j`` at index j; slots ``>= real`` are
     synthetic. Line supports select right singular vectors (cutoff, per-support

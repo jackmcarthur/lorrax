@@ -1,4 +1,4 @@
-"""Device-byte accounting for one shared-pole construction (SP 17).
+"""Device-byte accounting for one shared-pole construction (I 1).
 
 The constructor's physics is the Hermite/Ritz chain in
 ``gw.shared_pole_constructor``. Everything that prices it -- the carrier byte
