@@ -3758,20 +3758,6 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         band_classes=scissor_classes,
         scissor_fit=(_frozen_active if _frozen_active is not None else tail_fit),
         use_valence_fit=(inputs.config.sc.tail_fit == "buffer_edges"),
-        # ONE FERMI LEVEL PER MAP.  The map is a function of the H it is
-        # handed, so the Fermi level of that H -- solved at map entry from its
-        # own spectrum at fixed N -- is the single anchor every consumer inside
-        # the map must use: this scissor, the window/classification above, and
-        # the chi0/W occupation weights.  What happened before is that the
-        # scissor anchored its valence shift to a Fermi level solved from the
-        # partitioned OUTPUT H while screening used the ENTRY occupations, so
-        # two different mu lived inside one map.  MEASURED on Fe 4x4x4
-        # charge-only: E_F(F(H)) wandered 22.776 .. 23.052 eV, i.e. +-250 meV
-        # against a 270 meV Fermi-Dirac width, so a scissored state's
-        # occupation could swing from ~0.5 to ~0.95 from mu drift alone.  The
-        # output probe stays a reported diagnostic.
-        fermi_anchor_ry=(None if entry_occ_state is None
-                         else float(entry_occ_state.mu_ry)),
         # THE DIAGNOSTIC CHANNEL MATTERS.  ``inputs.print_fn`` output is not
         # what the run log keeps -- every line of this map that a reader has
         # actually seen (the per-k partition, the escapes, the sampled-support
@@ -4043,7 +4029,6 @@ def _apply_scissor_partition_policy(
     band_classes=None,
     scissor_fit: ScissorFit | None = None,
     use_valence_fit: bool = False,
-    fermi_anchor_ry: float | None = None,
     allow_frontier_promotion: bool = True,
     label: str = "SC",
     print_fn=print,
@@ -4151,20 +4136,7 @@ def _apply_scissor_partition_policy(
             in_range_mask=partition.in_range_mask,
             scissor_E_qp_kn=scissor_provisional_ry,
         )
-        probe_efermi_ry = float(candidate_efermi_fn(H_fermi_probe))
-        candidate_efermi_ry = (
-            probe_efermi_ry if fermi_anchor_ry is None
-            else float(fermi_anchor_ry))
-        if fermi_anchor_ry is not None:
-            # The anchor is the ENTRY Fermi level by construction, so the
-            # probe is a diagnostic, not a circle: it reports how far this
-            # map's partitioned output moves E_F, which is exactly the
-            # quantity the loop must converge.  The refusal below (probe vs
-            # final) is kept for the self-anchored path only.
-            print_fn(
-                f"    {label} Fermi anchor: E_F(entry)={candidate_efermi_ry * RYD_TO_EV:+.6f} eV, "
-                f"E_F(partitioned output)={probe_efermi_ry * RYD_TO_EV:+.6f} eV, "
-                f"dE_F={ (probe_efermi_ry - candidate_efermi_ry) * RYD_TO_EV:+.6f} eV")
+        candidate_efermi_ry = float(candidate_efermi_fn(H_fermi_probe))
         fermi_displacement_ry = (
             candidate_efermi_ry - float(efermi_dft_ry))
 
@@ -4200,7 +4172,7 @@ def _apply_scissor_partition_policy(
         in_range_mask=partition.in_range_mask,
         scissor_E_qp_kn=scissor_E_qp_kn_ry,
     )
-    if scissor_fit is not None and fermi_anchor_ry is None:
+    if scissor_fit is not None:
         final_efermi_ry = float(candidate_efermi_fn(H_partitioned))
         if not np.isclose(
             final_efermi_ry, candidate_efermi_ry,
