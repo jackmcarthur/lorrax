@@ -3734,13 +3734,23 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         # which is why the residual could not be attributed from the artifacts.
         # Record the policy's own diagnostics on the log's channel.
         label="SC", print_fn=lambda line: _record_sc(inputs, line))
-    _before_policy = np.broadcast_to(
-        np.asarray(partition.protected_mask, dtype=bool),
-        np.shape(np.asarray(promoted_partition.protected_mask, dtype=bool)))
+    # The carry lives on the full BZ while this policy sees the loop's k-set
+    # (the wedge here: 64 x 26 carried against 13 x 26 classified), so the
+    # comparison must run on the SELECTED input the policy actually received --
+    # the array it was handed, not the carried one.
+    _policy_input = _partition_on_loop(partition, inputs)
     _after_policy = np.asarray(promoted_partition.protected_mask, dtype=bool)
-    _promoted_pairs = [
-        [int(k), int(b)] for k, b in np.argwhere(
+    _before_policy = np.asarray(_policy_input.protected_mask, dtype=bool)
+    if _before_policy.shape != _after_policy.shape:
+        _before_policy = np.broadcast_to(
+            _before_policy, _after_policy.shape) if (
+                _before_policy.ndim == 1) else None
+    _promoted_pairs = (
+        [[int(k), int(b)] for k, b in np.argwhere(
             _after_policy & ~_before_policy)[:12]]
+        if _before_policy is not None else
+        f"shape mismatch carry={np.shape(np.asarray(partition.protected_mask, bool))} "
+        f"policy={_after_policy.shape}")
     _record_sc(
         inputs,
         f"    SC policy: scissor_fit={'none' if scissor_fit is None else 'fitted'}, "
