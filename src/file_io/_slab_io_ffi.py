@@ -1165,6 +1165,25 @@ def _replicated_sharding(mesh: Mesh, ndim: int) -> NamedSharding:
     return NamedSharding(mesh, P(*([None] * ndim)))
 
 
+def _same_device_order(left: Mesh, right: Mesh) -> bool:
+    """Whether two meshes describe the same block layout on the same devices.
+
+    Identity is the wrong test and equivalence is the right one: an operand
+    that arrives on a second mesh object built from the same devices, in the
+    same order, with the same axis names is already in the writer's layout.
+    Re-placing it (to a replicated sharding, over the same devices) takes
+    JAX's ``_different_device_order_reshard`` path, which asserted with an
+    empty message on the final ``sigma_mnk.h5`` write of the converged 10p
+    run.  Any mesh disagreement that survives this test is still re-placed,
+    and the caller sees the shardings rather than a bare assertion.
+    """
+    try:
+        return (tuple(left.axis_names) == tuple(right.axis_names)
+                and tuple(left.devices.flat) == tuple(right.devices.flat))
+    except Exception:            # a mesh-like stand-in in a test double
+        return False
+
+
 def _replicated_i64_vector(values: Sequence[int], mesh: Mesh) -> jax.Array:
     """Small int64 control buffer, explicitly replicated on ``mesh``.
 
@@ -2275,7 +2294,22 @@ class _FfiBackend(_DatasetGeometry):
         # A replicated write requires rank-identical A anyway (the
         # collective writer dedups replicas); LORRAX_CHECK_REPLICA=1
         # re-arms the assertion.
-        if not isinstance(A.sharding, NamedSharding) or A.sharding.mesh is not self.mesh:
+        # MESH IDENTITY IS NOT MESH EQUIVALENCE.  ``self.mesh is not A's
+        # mesh`` used to force a re-place as REPLICATED whenever the array
+        # arrived on an equivalent-but-distinct mesh object -- and
+        # ``device_put`` from a sharded operand to a replicated sharding over
+        # the same devices takes JAX's ``_different_device_order_reshard``
+        # path, whose internal assertion fired as a bare ``AssertionError``
+        # at the very last write of a converged SC run (10p, 2026-09-19:
+        # ``sigma_mnk.h5`` left with ``lorrax_io_committed = 0`` and a
+        # (81, 13, 26, 26) payload).  Two meshes that own the same devices in
+        # the same order with the same axis names describe the same block
+        # layout, so the operand may be written as it stands.
+        if not isinstance(A.sharding, NamedSharding):
+            A = device_put_process_local(
+                A, _replicated_sharding(self.mesh, A.ndim))
+        elif (A.sharding.mesh is not self.mesh
+              and not _same_device_order(A.sharding.mesh, self.mesh)):
             A = device_put_process_local(
                 A, _replicated_sharding(self.mesh, A.ndim))
 
