@@ -118,6 +118,15 @@ def test_shared_pole_metadata_from_production_meta_without_kgrid():
     check_metadata_without_kgrid(_test_mesh())
 
 
+def test_ordered_bank_admits_literal_mirror_fields():
+    """Broken TRS is not photon-only: scalar ordered banks carry exact mirrors."""
+    header = {"mirror_mode": "literal_same_operator_v1", "ordered": True}
+    assert store._bank_sample_fields(header) == (
+        "Wc", "dWc_ds", "Wc_mirror", "dWc_mirror_ds")
+    with pytest.raises(ValueError, match="unsupported mirror contract"):
+        store._bank_sample_fields({"mirror_mode": "literal_same_operator_v1"})
+
+
 def _device(host,mesh,spec):
     # Tiny independent planted oracle; production payloads use SlabIO.
     return jax.make_array_from_callback(host.shape,NamedSharding(mesh,spec),lambda idx:host[idx])

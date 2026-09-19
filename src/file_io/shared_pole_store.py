@@ -973,7 +973,7 @@ def _bank_sample_fields(header):
     mode = header.get("mirror_mode")
     if mode is None:
         return _BANK_SAMPLE_FIELDS
-    if mode != "literal_same_operator_v1" or "photon_layout" not in header:
+    if mode != "literal_same_operator_v1" or not header.get("ordered"):
         _refuse("scratch bank unsupported mirror contract")
     return _BANK_SAMPLE_FIELDS + ("Wc_mirror", "dWc_mirror_ds")
 
@@ -1095,13 +1095,17 @@ def initialize_shared_pole_bank(path, *, meta, tables, recipe, identity,
     if odd:
         # One source of truth for the infinity block: the ordered bank itself.
         header["odd_moments"] = True
-    if photon_layout is not None:
+    if bank and odd:
         from symmetry_maps import q_negation_index
         neg = np.asarray(q_negation_index(tuple(header["grid"])), dtype=np.int64)
+        bare_response = ("conj(chi_exact_minus_q(z_ry))" if photon_layout is not None
+                         else "exact W_q(-conj z_ry) sample")
+        operator = ("same original parent V and frozen contact as Wc and M0..M3"
+                    if photon_layout is not None
+                    else "same original parent V and moment operator as Wc and M0..M3")
         header.update(mirror_mode="literal_same_operator_v1",
             mirror_contract=dict(frequency="-conj(z_ry)", derivative="d/d((-conj(z_ry))^2)",
-                bare_response="conj(chi_exact_minus_q(z_ry))",
-                operator="same original parent V and frozen contact as Wc and M0..M3",
+                bare_response=bare_response, operator=operator,
                 q_full_idx=header["q_irr_full_idx"],
                 minus_q_full_idx=neg[np.asarray(header["q_irr_full_idx"], dtype=np.int64)].tolist()))
     sample_fields = _bank_sample_fields(header)
@@ -1120,7 +1124,8 @@ def initialize_shared_pole_bank(path, *, meta, tables, recipe, identity,
         complete=False, final_commit=None,
         units={"Wc": "Ry", "dWc_ds": "Ry^-1", "M1": "Ry^3", "M3": "Ry^5",
                **({"M0": "Ry^2", "M2": "Ry^4"} if odd else {}),
-               **({"constant": "Ry", "Wc_mirror": "Ry", "dWc_mirror_ds": "Ry^-1"} if photon_layout is not None else {})},
+               **({"constant": "Ry"} if photon_layout is not None else {}),
+               **({"Wc_mirror": "Ry", "dWc_mirror_ds": "Ry^-1"} if bank and odd else {})},
         derivative_variable="s=z_Ry^2",
         moment_convention=("S_m = 2 M_(2m+1); physical M1 and M3; odd M0 (1/z) and M2 (1/z^3), M_k = C_(k+1)/2"
                            if odd else "S_m = 2 M_(2m+1); physical M1 and M3 only"),

@@ -1163,16 +1163,22 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
         # conj in R space (the -q orientation); remote cells add the odd kernel.
         # ordered=True stores the physical orientation W_q = FT_q[W].
         ordered = vertex is not None or not bool(sym.trs_allowed)
-        literal_mirrors = vertex is not None
+        literal_mirrors = ordered
         if literal_mirrors and header.get("mirror_mode") != "literal_same_operator_v1":
-            raise ValueError("GATE response_mirror_contract: photon production requires a new literal-mirror bank")
+            raise ValueError("GATE response_mirror_contract: ordered production requires a literal-mirror bank")
         if literal_mirrors:
             from symmetry_maps import q_negation_index
             negative = np.asarray(q_negation_index((int(meta.nkx), int(meta.nky), int(meta.nkz))), dtype=np.int64)
             mirror_qids = negative[qids]
+            mirror_provenance = bank_io.get("mirror_operator_provenance")
+            if mirror_provenance is None:
+                mirror_provenance = dict(
+                    coulomb=bank_io["coulomb"],
+                    state_identity=bank_io["identity"],
+                    operator="same original parent V and moment operator as Wc and M0..M3")
             receipt["mirror_contract"] = dict(header["mirror_contract"],
                 mode=header["mirror_mode"], support_count=len(z),
-                operator_provenance=bank_io["mirror_operator_provenance"],
+                operator_provenance=mirror_provenance,
                 original_parent_count=len(qids),
                 full_q_rows=len(set(qids.tolist()+mirror_qids.tolist())),
                 green_stream="union of exact q and minus-q output rows in the same response panel",
