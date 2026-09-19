@@ -254,7 +254,7 @@ def test_hysteresis_retained_state_remains_a_scissor_fit_sample():
     assert not retained.in_range_mask[0, 1]
     kstar = SimpleNamespace(irr_idx=np.array([0]), select=lambda a: a)
     h = jnp.asarray(np.diag(energy[0] / RYD_TO_EV)[None])
-    result, fit = _apply_scissor_partition_policy(
+    result, fit, promoted = _apply_scissor_partition_policy(
         h, reference / RYD_TO_EV, np.array([[True, False, False]]),
         retained, kstar, efermi_dft_ry=0., n_occ=1,
         candidate_efermi_fn=lambda _: 0., print_fn=lambda _: None)
@@ -265,6 +265,31 @@ def test_hysteresis_retained_state_remains_a_scissor_fit_sample():
     # the excluded DFT 8 eV state to 10 eV instead of leaving it at DFT.
     np.testing.assert_allclose(np.diagonal(result, axis1=1, axis2=2) * RYD_TO_EV,
                                [[-1., 6., 10.]])
+
+
+def test_frontier_manifold_is_promoted_instead_of_refused():
+    """A crossing band outside the energy window is protected by identity."""
+    from types import SimpleNamespace
+    from gw.sc_iteration import _apply_scissor_partition_policy
+    from gw.scissor import ScissorBandClasses
+
+    reference = np.array([[-1., 4., 8.]])
+    energy = np.array([[-1., 6., 10.]])
+    partition = _partition(energy, reference)
+    assert not np.asarray(partition.protected_mask)[0, 1]
+    assert not np.asarray(partition.in_range_mask)[0, 1]
+    classes = ScissorBandClasses(valence_stop=1, conduction_start=2)
+    kstar = SimpleNamespace(irr_idx=np.array([0]), select=lambda a: a)
+    h = jnp.asarray(np.diag(energy[0] / RYD_TO_EV)[None])
+    result, _fit, promoted = _apply_scissor_partition_policy(
+        h, reference / RYD_TO_EV, np.array([[True, False, False]]),
+        partition, kstar, efermi_dft_ry=0., n_occ=1,
+        candidate_efermi_fn=lambda _: 0., band_classes=classes,
+        print_fn=lambda _: None)
+    assert np.asarray(promoted.protected_mask)[0, 1]
+    # The promoted crossing band keeps its full candidate diagonal.
+    assert np.diag(np.asarray(result)[0])[1] == pytest.approx(
+        energy[0, 1] / RYD_TO_EV)
 
 
 def test_fermi_classes_follow_per_k_state_identities():

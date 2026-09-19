@@ -1095,7 +1095,7 @@ def initialize_shared_pole_bank(path, *, meta, tables, recipe, identity,
     if odd:
         # One source of truth for the infinity block: the ordered bank itself.
         header["odd_moments"] = True
-    if bank and odd:
+    if odd:
         from symmetry_maps import q_negation_index
         neg = np.asarray(q_negation_index(tuple(header["grid"])), dtype=np.int64)
         bare_response = ("conj(chi_exact_minus_q(z_ry))" if photon_layout is not None
@@ -1125,7 +1125,7 @@ def initialize_shared_pole_bank(path, *, meta, tables, recipe, identity,
         units={"Wc": "Ry", "dWc_ds": "Ry^-1", "M1": "Ry^3", "M3": "Ry^5",
                **({"M0": "Ry^2", "M2": "Ry^4"} if odd else {}),
                **({"constant": "Ry"} if photon_layout is not None else {}),
-               **({"Wc_mirror": "Ry", "dWc_mirror_ds": "Ry^-1"} if bank and odd else {})},
+               **({"Wc_mirror": "Ry", "dWc_mirror_ds": "Ry^-1"} if odd else {})},
         derivative_variable="s=z_Ry^2",
         moment_convention=("S_m = 2 M_(2m+1); physical M1 and M3; odd M0 (1/z) and M2 (1/z^3), M_k = C_(k+1)/2"
                            if odd else "S_m = 2 M_(2m+1); physical M1 and M3 only"),

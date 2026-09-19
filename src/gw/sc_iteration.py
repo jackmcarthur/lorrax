@@ -1857,7 +1857,7 @@ def run_fixed_sigma_evsc(
         H_full = h0_dft + sigma_xc_dft
         H_full = 0.5 * (
             H_full + jnp.conj(jnp.swapaxes(H_full, -1, -2)))
-        H_out, _ = _apply_scissor_partition_policy(
+        H_out, _, _ = _apply_scissor_partition_policy(
             H_full, e_dft_ry, valence_mask_kn, partition, kstar,
             efermi_dft_ry=efermi_dft_scissor_ry,
             n_occ=n_occ,
@@ -3713,7 +3713,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     if _frozen_active is not None:
         inputs.print_fn(
             f"    SC scissor: frozen from map 0 ({_frozen_active.summary()})")
-    H_qp_dft_new, scissor_fit = _apply_scissor_partition_policy(
+    H_qp_dft_new, scissor_fit, partition = _apply_scissor_partition_policy(
         H_qp_dft_full, e_dft_act, val_mask, _partition_on_loop(partition, inputs), ks,
         efermi_dft_ry=float(inputs.efermi_dft_ry),
         n_occ=n_occ,
@@ -3940,7 +3940,7 @@ def _apply_scissor_partition_policy(
     use_valence_fit: bool = False,
     label: str = "SC",
     print_fn=print,
-) -> tuple[jax.Array, ScissorFit | None]:
+) -> tuple[jax.Array, ScissorFit | None, BandPartition]:
     """Apply the shared semicore/conduction policy to one full H map.
 
     In-range states keep their Sigma-derived Hamiltonian.  Out-of-range
@@ -3978,12 +3978,24 @@ def _apply_scissor_partition_policy(
             frontier_kn[:, frontier] = True
         bad_frontier = np.argwhere(frontier_kn & ~retained_kn)
         if bad_frontier.size:
-            raise ValueError(
-                f"{label} low-valence Fermi anchor requires the complete "
-                "Fermi-crossing/frontier manifold to remain non-scissored; "
-                f"scissored (k, active band) pairs {bad_frontier.tolist()} would "
-                "make E_F(F(H)) depend on the scissor being anchored. Widen "
-                "sigma_omega_min/max_ev (and preserve whole multiplets).")
+            # The crossing manifold is an identity set, not an energy-window
+            # set.  Promote it into the protected mask so the Fermi anchor is
+            # not evaluated through the scissor; the energy window continues
+            # to control which *other* bands are in range.
+            protected = np.array(
+                np.asarray(partition.protected_mask), dtype=bool, copy=True)
+            protected[bad_frontier[:, 0], bad_frontier[:, 1]] = True
+            partition = BandPartition(
+                protected_mask=protected,
+                in_range_mask=partition.in_range_mask)
+            retained_kn = np.broadcast_to(np.asarray(
+                partition.protected_mask | partition.in_range_mask, dtype=bool),
+                np.shape(e_dft_kn_ry))
+            print_fn(
+                f"    {label} frontier promotion: promoted "
+                f"{bad_frontier.tolist()} to protected; the complete "
+                "Fermi-crossing manifold is retained and the bands outside "
+                "the requested window remain scissored.")
 
         H_fermi_probe = apply_band_partition(
             H_qp_dft_full,
@@ -4041,7 +4053,7 @@ def _apply_scissor_partition_policy(
                 f"{(final_efermi_ry - candidate_efermi_ry) * RYD_TO_EV:+.3e} "
                 "eV. A scissored tail entered the frontier; widen the Sigma "
                 "window rather than anchoring through it.")
-    return H_partitioned, scissor_fit
+    return H_partitioned, scissor_fit, partition
 
 
 def _refuse_empty_map_output(e_output_kn_ev: np.ndarray, *,

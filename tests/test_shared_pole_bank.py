@@ -119,32 +119,6 @@ def test_bank_stale_identity_and_invalid_spans(tmp_path):
     stale = dict(identity, iteration_id="another-iteration")
     with pytest.raises(ValueError, match="stale"):
         validate_shared_pole_bank(path, expected_identity=stale, mesh_xy=mesh)
-
-
-def test_ordered_scalar_bank_roundtrips_literal_mirrors(tmp_path):
-    """A scalar broken-TRS bank stores exact -conj(z) mirror samples."""
-    mesh, meta, tables, recipe, identity = _bank_fixture()
-    tables["sym"].trs_allowed = False
-    path = tmp_path / "ordered_scalar_bank.h5"
-    header = initialize_shared_pole_bank(
-        path, meta=meta, tables=tables, recipe=recipe,
-        identity=identity, mesh_xy=mesh)
-    assert header["ordered"] is True
-    assert header["mirror_mode"] == "literal_same_operator_v1"
-    fields = store._bank_sample_fields(header)
-    assert "Wc_mirror" in fields and "dWc_mirror_ds" in fields
-    W = _matrix(meta, mesh, samples=True, value=3)
-    D = _matrix(meta, mesh, samples=True, value=-5)
-    write_shared_pole_bank(
-        path, q_span=(0, 1), sample_span=(0, 1), Wc=W, dWc_ds=D,
-        Wc_mirror=W, dWc_mirror_ds=D,
-        meta=meta, expected_identity=identity, mesh_xy=mesh)
-    with SlabIO(path, mode="r", mesh=mesh) as io:
-        got = read_shared_pole_bank(
-            io, (0, 1), meta=meta, header=header, sample_span=(0, 1),
-            fields=("Wc_mirror", "dWc_mirror_ds"))
-    assert bool(jnp.all(got["Wc_mirror"] == W))
-    assert bool(jnp.all(got["dWc_mirror_ds"] == D))
     W = _matrix(meta, mesh, samples=True, value=2)
     with pytest.raises(ValueError, match="explicit sample_span"):
         write_shared_pole_bank(
@@ -165,6 +139,32 @@ def test_ordered_scalar_bank_roundtrips_literal_mirrors(tmp_path):
     rank0_transaction(path, stage="test.bank_role_corruption", write=corrupt_role)
     with pytest.raises(ValueError, match="typed plan role"):
         validate_shared_pole_bank(path, expected_identity=identity, mesh_xy=mesh)
+
+
+def test_ordered_scalar_bank_roundtrips_literal_mirrors(tmp_path):
+    """A scalar broken-TRS bank stores exact -conj(z) mirror samples."""
+    mesh, meta, tables, recipe, identity = _bank_fixture()
+    tables["sym"].trs_allowed = False
+    path = tmp_path / "ordered_scalar_bank.h5"
+    header = initialize_shared_pole_bank(
+        path, meta=meta, tables=tables, recipe=recipe,
+        identity=identity, mesh_xy=mesh)
+    assert header["ordered"] is True
+    assert header["mirror_mode"] == "literal_same_operator_v1"
+    fields = store._bank_sample_fields(header)
+    assert "Wc_mirror" in fields and "dWc_mirror_ds" in fields
+    W = _matrix(meta, mesh, samples=True, value=3)
+    D = _matrix(meta, mesh, samples=True, value=-5)
+    header = write_shared_pole_bank(
+        path, q_span=(0, 1), sample_span=(0, 1), Wc=W, dWc_ds=D,
+        Wc_mirror=W, dWc_mirror_ds=D,
+        meta=meta, expected_identity=identity, mesh_xy=mesh)
+    with SlabIO(path, mode="r", mesh=mesh) as io:
+        got = read_shared_pole_bank(
+            io, (0, 1), meta=meta, header=header, sample_span=(0, 1),
+            fields=("Wc_mirror", "dWc_mirror_ds"))
+    assert bool(jnp.all(got["Wc_mirror"] == W))
+    assert bool(jnp.all(got["dWc_mirror_ds"] == D))
 
 
 def check_bank_roundtrip(mesh, path):

@@ -551,8 +551,8 @@ def test_sc_map_wires_the_same_map_candidate_fermi_not_the_entry_fermi():
     assert "scissor_E_qp_kn=scissor_provisional_ry" in block
     assert "scissor_fit," in block
     assert "solve_mp1_occupations(" not in block
-    assert "requires the complete " in block
-    assert "Fermi-crossing/frontier manifold to remain non-scissored" in block
+    assert "frontier promotion" in block
+    assert "protected[bad_frontier" in block
 
     # The final H is independently re-anchored and refused if the tail moved
     # E_F, so the provisional non-circularity argument is executable.
