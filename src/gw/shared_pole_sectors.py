@@ -104,7 +104,7 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output):
     import numpy as np
     from pathlib import Path
     from common import timing
-    from common.collectives import rank0_transaction
+    from common.collectives import device_put_process_local, rank0_transaction
     from file_io.slab_io import SlabIO
     from file_io.shared_pole_store import (validate_shared_pole_bank, _metadata,
         write_shared_pole_model,write_shared_pole_sector_manifest)
@@ -218,7 +218,7 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output):
         # Stage each canonical parent once. One round of face factors is live;
         # no all-parent factor stack or full photon operator is materialized.
         for name,family,model in zip(('CC','TT','CT_C','CT_T'),(0,1,0,1),models):
-            poles,active=jax.tree.map(lambda a:np.asarray(jax.device_put(a,NamedSharding(mesh_xy,P()))),model[1:])
+            poles,active=jax.tree.map(lambda a:np.asarray(device_put_process_local(a,NamedSharding(mesh_xy,P()))),model[1:])
             counts=active.sum(axis=-1,dtype=np.int64)
             width=padded_axis(int(counts[:real].max()),mesh_xy,name='shared_pole_port',
                 specs=((P('x','y'),0),(P('x','y'),1))).carrier
@@ -227,7 +227,7 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output):
                 public=canonical_factors(mesh_xy,(slot,),components=3 if family else 1)(factor)
                 filename=root/(name+'.h5')
                 store_header=write_shared_pole_model(filename,public,
-                    jax.device_put(poles[slot:slot+1,:width],NamedSharding(mesh_xy,P())),
+                    device_put_process_local(poles[slot:slot+1,:width],NamedSharding(mesh_xy,P())),
                     counts[slot:slot+1],q_span=(q,q+1),meta=meta,tables=bank['sector_tables'][family],
                     recipe=recipe,receipts=dict(identity=bank['identity'],constructor=row_receipt),
                     ordered=True,basis=bank['mu_bases'][family],sector=name)
@@ -255,6 +255,7 @@ def sector_held_errors(signed, samples, z, *, mesh_xy):
     """
     import jax
     from common.shard_map import shard_map
+    from common.collectives import device_put_process_local
     from jax.sharding import NamedSharding,PartitionSpec as P
     from gw.shared_pole_local import _mm
     def body(left,right,mu,active,w,d):
@@ -270,13 +271,14 @@ def sector_held_errors(signed, samples, z, *, mesh_xy):
     spec=P(('x','y'))
     value=jax.jit(shard_map(body,mesh=mesh_xy,in_specs=(spec,)*6,
                             out_specs=spec,check_vma=False))(*signed,samples['Wc'],samples['dWc_ds'])
-    return jax.device_put(value,NamedSharding(mesh_xy,P()))
+    return device_put_process_local(value,NamedSharding(mesh_xy,P()))
 
 
 def sector_moment_cauchy(metrics, sectors, *, mesh_xy):
     """Report the Cauchy–Schwarz diagnostic of the common physical M1 metric."""
     import jax
     from common.shard_map import shard_map
+    from common.collectives import device_put_process_local
     from jax.sharding import NamedSharding,PartitionSpec as P
     from gw.shared_pole_local import _mm
     from gw.shared_pole_recipe import shared_real_pole_gates_ordered_v1 as gates
@@ -286,7 +288,7 @@ def sector_moment_cauchy(metrics, sectors, *, mesh_xy):
     spec=P(('x','y'))
     result=jax.jit(shard_map(body,mesh=mesh_xy,in_specs=(spec,)*3,
                              out_specs=spec,check_vma=False))(*metrics)
-    return jax.tree.map(lambda a:jax.device_put(a,NamedSharding(mesh_xy,P())),result)
+    return jax.tree.map(lambda a:device_put_process_local(a,NamedSharding(mesh_xy,P())),result)
 
 
 def construct_diagonal_sector_round(samples, moments, meta, config, geometry, *, mesh_xy,
@@ -395,6 +397,7 @@ def construct_cross_sector_round(sectors, samples, moments, meta, config, *,
     import jax
     import numpy as np
     from common.shard_map import shard_map
+    from common.collectives import device_put_process_local
     from jax.sharding import NamedSharding,PartitionSpec as P
     from gw.gw_config import linalg_resolution
     from gw.shared_pole_capacity import ConstructorCapacity
@@ -462,8 +465,8 @@ def construct_cross_sector_round(sectors, samples, moments, meta, config, *,
     budget.retained_panels=tuple(retained)
     replicated=NamedSharding(mesh_xy,P())
     return dict(models=models,signed=signed,
-                diagnostics=jax.tree.map(lambda a:jax.device_put(a,replicated),diagnostics),
-                zero=jax.tree.map(lambda a:jax.device_put(a,replicated),zero),budget=budget)
+                diagnostics=jax.tree.map(lambda a:device_put_process_local(a,replicated),diagnostics),
+                zero=jax.tree.map(lambda a:device_put_process_local(a,replicated),zero),budget=budget)
 
 
 def positive_cross_models(signed, *, mesh_xy, gates):
