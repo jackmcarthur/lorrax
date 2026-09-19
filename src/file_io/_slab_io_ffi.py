@@ -2305,13 +2305,23 @@ class _FfiBackend(_DatasetGeometry):
         # (81, 13, 26, 26) payload).  Two meshes that own the same devices in
         # the same order with the same axis names describe the same block
         # layout, so the operand may be written as it stands.
+        # THE SERVICE OWNS THE HOST BOUNDARY, NOT JAX'S RESHARD.  Handing a
+        # globally sharded operand to ``jax.device_put(..., replicated)`` asks
+        # JAX to perform a cross-process, different-device-order reshard, and
+        # that path asserted with an empty message on the final sigma_mnk.h5
+        # write of the converged runs 10p/10q (payload written, receipt left
+        # ``lorrax_io_committed = 0``).  Resolve the distribution HERE instead:
+        # one deliberate host gather of this operand, then the existing
+        # host-staging placement, which never reshards between device orders.
+        # The operand is a per-map artifact (11 MB for the Fe Sigma cube), so
+        # the gather is nothing beside the 32-33 s tau sweep of the same map.
         if not isinstance(A.sharding, NamedSharding):
             A = device_put_process_local(
-                A, _replicated_sharding(self.mesh, A.ndim))
+                np.asarray(A), _replicated_sharding(self.mesh, A.ndim))
         elif (A.sharding.mesh is not self.mesh
               and not _same_device_order(A.sharding.mesh, self.mesh)):
             A = device_put_process_local(
-                A, _replicated_sharding(self.mesh, A.ndim))
+                np.asarray(A), _replicated_sharding(self.mesh, A.ndim))
 
         axis_count_per_dim, axis_flat = _sharding_to_axis_info(
             A.sharding, A.ndim)
