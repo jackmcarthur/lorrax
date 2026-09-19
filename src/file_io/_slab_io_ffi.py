@@ -42,7 +42,8 @@ import numpy as np
 from common.shard_map import shard_map
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
-from common.collectives import barrier as _barrier, device_put_process_local
+from common.collectives import (barrier as _barrier, device_put_process_local,
+                                gather_to_host)
 from runtime import debug_print_enabled
 from runtime.padding import authenticate_padded_axis, padded_axis
 
@@ -2281,11 +2282,16 @@ class _FfiBackend(_DatasetGeometry):
         # final sigma_mnk.h5 write of the converged 10p/10q runs (payload
         # written, receipt left uncommitted).  One host gather of this per-map
         # artifact, then the existing host-staging placement, which never
-        # reshards between device orders.
+        # reshards between device orders.  The gather itself is the service's
+        # ``gather_to_host``, not a bare ``np.asarray``: the operand arrives on
+        # a DIFFERENT mesh, so it spans devices this process cannot address and
+        # a bare host fetch refuses (measured, 10r, 2026-09-19: "Fetching value
+        # for `jax.Array` that spans non-addressable ... devices").
         if (not isinstance(A.sharding, NamedSharding)
                 or A.sharding.mesh is not self.mesh):
             A = device_put_process_local(
-                np.asarray(A), _replicated_sharding(self.mesh, A.ndim))
+                gather_to_host(A),
+                _replicated_sharding(self.mesh, A.ndim))
         axis_count_per_dim, axis_flat = _sharding_to_axis_info(
             A.sharding, A.ndim)
         off, slab_shape, req_gshape = _normalize_slab_request(
