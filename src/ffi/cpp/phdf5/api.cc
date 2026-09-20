@@ -42,6 +42,8 @@ namespace lorrax_ffi::phdf5 {
     void     read_whole(PhdfCtx* ctx, const std::string& ds_name,
                         int dtype_tag, void* out, int64_t out_nelem);
     void     ensure_mpi_initialized();
+    bool     staging_totals(const PhdfCtx* ctx, size_t* n_live,
+                            size_t* pinned_bytes);
 }
 
 extern "C" {
@@ -79,6 +81,23 @@ void LRX_C_ENTRY(lrx_phdf5_close)(int64_t ctx_handle) {
 // off the first-open critical path.
 void LRX_C_ENTRY(lrx_phdf5_init_mpi)(void) {
     lorrax_ffi::phdf5::ensure_mpi_initialized();
+}
+
+// Per-process pinned/read staging totals over every live ctx.  Collective-
+// free and side-effect-free: the handle is not dereferenced, so a caller
+// with no open file passes 0.  Returns 0 always; a library built before
+// 2026-09-20 lacks the symbol and ffi_loader falls back to procfs-only
+// receipt fields (hasattr-guarded, like the metadata half above).
+int LRX_C_ENTRY(lrx_phdf5_staging_totals)(
+    int64_t ctx_handle, int64_t* n_live_out, int64_t* pinned_bytes_out)
+{
+    size_t n_live = 0, pinned = 0;
+    lorrax_ffi::phdf5::staging_totals(
+        reinterpret_cast<const lorrax_ffi::phdf5::PhdfCtx*>(ctx_handle),
+        &n_live, &pinned);
+    if (n_live_out) *n_live_out = static_cast<int64_t>(n_live);
+    if (pinned_bytes_out) *pinned_bytes_out = static_cast<int64_t>(pinned);
+    return 0;
 }
 
 // Collective H5Dcreate/H5Dopen.  All ranks must call concurrently.

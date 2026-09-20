@@ -382,6 +382,7 @@ _SHARED_C_ENTRY_POINTS = (
     # ``file_io._slab_io_ffi`` announces the degraded introspect route.
     "lrx_phdf5_dataset_geometry",
     "lrx_phdf5_read_whole",
+    "lrx_phdf5_staging_totals",
     "lrx_slate_context_create",
     "lrx_slate_subrow_context_create",
     "lrx_slate_context_destroy",
@@ -540,6 +541,13 @@ def _declare_phdf5(lib: ctypes.CDLL) -> None:
             ctypes.c_char_p, ctypes.c_int,       # err_out, err_cap
         ]
         lib.lrx_phdf5_read_whole.restype = ctypes.c_int
+    if hasattr(lib, "lrx_phdf5_staging_totals"):
+        lib.lrx_phdf5_staging_totals.argtypes = [
+            ctypes.c_int64,                      # ctx_handle (unused; 0 is fine)
+            ctypes.POINTER(ctypes.c_int64),      # live ctx count
+            ctypes.POINTER(ctypes.c_int64),      # pinned + read staging bytes
+        ]
+        lib.lrx_phdf5_staging_totals.restype = ctypes.c_int
 
 
 def _declare_slate(lib: ctypes.CDLL) -> None:
@@ -1078,6 +1086,26 @@ def phdf5_init_mpi(platform: Optional[str] = None) -> None:
     across all ranks; idempotent after first call.
     """
     get_lib(platform).lrx_phdf5_init_mpi()
+
+
+def phdf5_staging_totals(ctx_handle: int = 0,
+                         platform: Optional[str] = None):
+    """``(live_ctxs, staging_bytes)`` for THIS process, or None when the
+    loaded library predates the symbol (2026-09-20).
+
+    Non-collective and never touches a file: it reads the in-process ctx
+    registry.  Pinned host memory is invisible to /proc (``cudaMallocHost``
+    is driver-managed, not ``mlock``), so this is the only direct measure of
+    the staging budget the SC loop's memory receipt reports.
+    """
+    lib = get_lib(platform or platform_from_env("CUDA"))
+    fn = getattr(lib, "lrx_phdf5_staging_totals", None)
+    if fn is None:
+        return None
+    n_live = ctypes.c_int64(0)
+    staged = ctypes.c_int64(0)
+    fn(int(ctx_handle), ctypes.byref(n_live), ctypes.byref(staged))
+    return int(n_live.value), int(staged.value)
 
 
 # Mapping from numpy/jax dtype to the integer tag matching xla::ffi::DataType.

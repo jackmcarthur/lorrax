@@ -35,6 +35,7 @@ from .common.ffi_loader import get_lib
 __all__ = [
     # lifecycle (was phdf5/context.py)
     "open_file", "close_file", "platform_for_handle", "validate_mesh_2d",
+    "staging_totals",
     # readers (was phdf5/read.py)
     "handle_vector",
     "ffi_read_call", "ffi_read_kchunk_call", "ffi_read_kchunk_union_call",
@@ -67,6 +68,19 @@ _LOCK = threading.Lock()
 # only the open by mesh platform while close/ensure_dataset followed the
 # JAX default backend was exactly that bug (audit fix/zq 2026-07-28).
 _FILE_CTXS: Dict[str, Tuple[int, str, str]] = {}
+
+
+def staging_totals(platform: Optional[str] = None):
+    """``(live_ctxs, staging_bytes)`` held by this process's parallel-HDF5
+    contexts, or None on a library built before 2026-09-20.
+
+    Pinned host memory is invisible to /proc (``cudaMallocHost`` is
+    driver-managed, not ``mlock``), so this is the direct measure behind the
+    SC loop's per-map memory receipt: a rising ctx count is a ctx-lifetime
+    leak, a flat count with rising bytes is grow-only staging.
+    ``ffi_loader.phdf5_staging_totals`` owns the call.
+    """
+    return ffi_loader.phdf5_staging_totals(platform=platform)
 
 
 def validate_mesh_2d(mesh: Mesh) -> tuple[int, int]:
