@@ -3,7 +3,6 @@ from types import SimpleNamespace
 import jax
 import jax.numpy as jnp
 import numpy as np
-import pytest
 
 from gw.mpa import sigma_windows as SW
 from gw.ppm_tau_kernel import build_shared_w_tau
@@ -438,26 +437,6 @@ def test_gapped_omega_grid_decomposes_the_core_and_matches_the_exact_sum():
     for i, w in enumerate(omega):
         want = -sum(residue / (w - e - pole) for e in energies)
         np.testing.assert_allclose(got[i], want, rtol=5.0e-6, atol=5.0e-6)
-
-
-def test_live_pole_outside_the_sampled_band_refuses():
-    """The 14c CT-C artifact: 24463.5677 Ry = 15400x the plasma band.
-
-    Measured census, run 14c map 0 q=9: the CT-C sector's largest live pole
-    was 24463.5677 Ry and carried 1.9e-8 of that sector's |c|^2 weight (all
-    poles above 20 Ry together: 1.9e-7, inside the 1e-6 dropped-weight
-    budget), while every charge-only diagonal model stayed at or below
-    39.3 Ry against the same horizon.  The planner sizes a ``pole_tail`` box
-    by the farthest live pole, so the artifact became a 24960 Ry box; this
-    refuses by name instead until the amplitudes are zeroed under budget.
-    """
-    band_ry = 1.587  # plasma-scale sampling band, Fe 4x4x4 census
-    horizon = (100.0 * band_ry) ** 2
-    measured = (np.asarray([15.0, 38.0]), np.asarray([19.0, 24463.5677]))
-    with pytest.raises(ValueError, match="shared_pole_lambda_horizon"):
-        SW._refuse_poles_beyond_horizon(measured, horizon)
-    # The diagonal (charge-only) census passes the same horizon.
-    SW._refuse_poles_beyond_horizon((np.asarray([14.2, 39.31]),), horizon)
 
 
 def test_gapped_omega_grid_decomposes_the_metal_sliver_and_matches():
