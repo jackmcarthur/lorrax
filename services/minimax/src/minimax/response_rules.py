@@ -290,7 +290,9 @@ def _certify_rows(t, rows, anchor, ratio, row_tol, numerator_power=1):
     """Continuum row certificates with adaptive interval refinement."""
     errors, rounding = [], []
     for n, w in enumerate(rows):
-        for intervals in (4096, 8192, 16384, 32768, 65536):
+        # The interpolation enclosure is O(h**2).  One final bisection can
+        # certify high Taylor rows without changing the fitted time nodes.
+        for intervals in (4096, 8192, 16384, 32768, 65536, 131072):
             error, rnd = _row_certificate(t, w, n, anchor, ratio, intervals,
                                           numerator_power)
             if error <= row_tol:
