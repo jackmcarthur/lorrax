@@ -74,6 +74,67 @@ def test_sc_driver_publishes_small_artifact_outside_full_wfn_guard():
     assert "write_wfn_h5" in {keyword.arg for keyword in call.keywords}
 
 
+def test_metal_qp_wfn_occupations_follow_the_final_full_ladder(
+        tmp_path, monkeypatch):
+    """A k-dependent Fermi crossing must survive final WFN publication."""
+    from gw.efermi import OccupationState, assert_fixed_n
+    import symmetry_maps
+
+    energies = np.array([
+        [-1.0, -0.9, -0.8, 1.0],
+        [-1.0, 0.1, 0.2, 0.3],
+    ], dtype=np.float64)
+    rotations = np.broadcast_to(np.eye(4), (2, 4, 4)).copy()
+    h = np.array([np.diag(row) for row in energies], dtype=np.complex128)
+    carried = OccupationState(
+        f_kn=np.array([[1.0, 1.0, 0.0, 0.0],
+                       [1.0, 1.0, 0.0, 0.0]]),
+        mu_ry=0.0, smearing_family="fd", smearing_width_ry=0.02,
+        n_electrons=4.0)
+    state = SimpleNamespace(
+        H_qp_dft=h, occupation_state=carried, outputs=None)
+    points = np.zeros((2, 3))
+    sym = SimpleNamespace(
+        unfolded_kpts=points, kirr_fullids=np.array([0, 1]),
+        irr_idx_k=np.array([0, 1]), sym_idx_k=np.array([0, 0]),
+        sym_mats_k=np.stack([np.eye(3), -np.eye(3)]))
+    wfn = SimpleNamespace(
+        energies=np.array([energies]), kpoints=points,
+        kweights=np.array([0.5, 0.5]),
+        nelec=2, num_electrons=4.0, nspinor=1, nbands=4, nkpts=2,
+        path=None, occupation_state_capacity=2.0, symmetry=lambda: sym)
+
+    monkeypatch.setattr(
+        sc_iteration, "_diagonalize_and_get_efermi",
+        lambda *_args: (energies, rotations, 0.0))
+    monkeypatch.setattr(
+        symmetry_maps, "unfold_file_wedge_to_full_bz",
+        lambda _sym, table: np.asarray(table))
+    monkeypatch.setattr(
+        symmetry_maps, "reduce_full_bz_to_file_wedge",
+        lambda _sym, table: np.asarray(table))
+    calls = []
+    monkeypatch.setattr(
+        qp_wfn, "write_qp_wfn_h5",
+        lambda _path, **kwargs: calls.append(kwargs))
+
+    _, _, mu_ry, _ = sc_iteration.dump_qp_wfn_artifacts(
+        state, n_occ=2, mesh_xy=None, wfn=wfn, sym=sym,
+        band_slices=SimpleNamespace(b0=0, b3=4),
+        logical_band_stop=4, kgrid=(2, 1, 1), output_dir=str(tmp_path),
+        write_wfn_h5=True, print_fn=lambda *_a: None)
+
+    occupations = calls[0]["occupations_kn"]
+    final_state = calls[0]["occupation_state"]
+    assert occupations[0, 2] > 0.99  # three occupied states at the first k
+    assert occupations[1, 1] < 0.01  # one occupied state at the second k
+    assert not np.array_equal(
+        occupations, np.array([[1, 1, 0, 0], [1, 1, 0, 0]]))
+    assert mu_ry == final_state.mu_ry
+    assert final_state.occ_hash != carried.occ_hash
+    assert_fixed_n(final_state, np.array([0.5, 0.5]), state_capacity=2.0)
+
+
 def test_driver_gap_uses_the_accepted_sc_spectrum(tmp_path):
     """Execute the actual report call with deliberately different H spectra."""
     from pathlib import Path
