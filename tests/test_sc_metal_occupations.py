@@ -29,7 +29,7 @@ def _inputs(material_class: str):
         material_class=material_class,
         parallel_transport=None,
         # Four logical bands on a carrier that callers may pad to the mesh.
-        band_slices=SimpleNamespace(b0=0, b4_logical=4),
+        band_slices=SimpleNamespace(b0=0, b4_logical=4, sigma=slice(0, 4)),
         wfn=SimpleNamespace(
             num_electrons=2.0,
             occupation_state_capacity=1.0,
@@ -153,3 +153,24 @@ def test_updated_density_sc_metal_reaches_fd_at_a_partial_multiplet(monkeypatch)
     monkeypatch.setattr(sc_iteration, "_solve_head_occupations", check_current_state)
     with pytest.raises(OccupationsChecked):
         sc_iteration.gw_iteration_map(state, inputs)
+
+
+def test_empty_scissor_tail_preserves_mu_and_refuses_a_crossing():
+    """Moving an empty tail must not change fixed N or the active state."""
+    import pytest
+    from gw.sc_iteration import _assert_empty_scissor_tail
+    inputs = _inputs("metal")
+    inputs.band_slices.b4_logical = 6
+    initial = np.column_stack((_energies(), np.full((3, 2), 2.0)))
+    shifted = initial.copy()
+    shifted[:, 4:] = [0.5, 3.0]
+    before = _solve_occupation_state(inputs, initial)
+    after = _solve_occupation_state(inputs, shifted)
+    np.testing.assert_array_equal(before.f_kn, after.f_kn)
+    assert float(before.mu_ry) == float(after.mu_ry)
+    assert np.all(np.asarray(after.f_kn)[:, 4:] == 0.0)
+    assert np.mean(np.sum(np.asarray(after.f_kn), axis=1)) == pytest.approx(2.0)
+    _assert_empty_scissor_tail(shifted, after, 4, 6)
+    shifted[0, 4] = float(after.mu_ry)
+    with pytest.raises(ValueError, match="GATE sc_empty_tail"):
+        _assert_empty_scissor_tail(shifted, after, 4, 6)
