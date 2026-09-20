@@ -4559,11 +4559,26 @@ def _process_memory_receipt() -> str:
                 key, _, rest = line.partition(":")
                 if key in ("VmLck", "VmRSS", "VmHWM", "VmSize"):
                     fields[key] = rest.strip()
-        nfd = len(os.listdir("/proc/self/fd"))
+        fds = os.listdir("/proc/self/fd")
+        nfd = len(fds)
+        # Live HDF5 handles = live phdf5 ctxs (each holds the pinned staging
+        # buffers).  VmLck cannot see cudaMallocHost memory -- it counts
+        # mlock(2) only and reads 0 kB on a process that certainly pins -- so
+        # the ctx count is the leak discriminator here: flat handles with
+        # rising VmRSS/VmHWM is fragmentation inside a bounded ctx set, a
+        # rising handle count is a ctx (and therefore pinned) leak.
+        nh5 = 0
+        for fd in fds:
+            try:
+                target = os.readlink(f"/proc/self/fd/{fd}")
+            except OSError:
+                continue
+            if target.endswith(".h5") or ".h5" in target:
+                nh5 += 1
     except OSError:
         return "unavailable (no procfs)"
     return (f"VmLck={fields.get('VmLck', '?')} VmRSS={fields.get('VmRSS', '?')} "
-            f"VmHWM={fields.get('VmHWM', '?')} open_fds={nfd}")
+            f"VmHWM={fields.get('VmHWM', '?')} open_fds={nfd} open_h5={nh5}")
 
 
 def _sc_map_wall_gate(*, watchdog_floor_s: float = 1800.0,
