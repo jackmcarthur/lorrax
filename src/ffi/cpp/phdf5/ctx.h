@@ -168,9 +168,9 @@ struct LORRAX_PHDF_CTX_TYPE {
     // registered in KNOWN_LORRAX_ISSUES.md.  The host build, which is the
     // platform LORRAX certifies, does not have it.
     void*        pinned_buf          = nullptr;
-    size_t       pinned_capacity     = 0;
+    std::atomic<size_t> pinned_capacity{0};
     void*        read_buf            = nullptr;
-    size_t       read_capacity       = 0;
+    std::atomic<size_t> read_capacity{0};
     // std::hash of ``writer_thread``'s id, published by the thread itself
     // before it runs any task.  A plain integer rather than a
     // std::atomic<std::thread::id> so the guard needs nothing exotic; a hash
@@ -298,9 +298,9 @@ bool ctx_is_live(const PhdfCtx* ctx, size_t* n_live);
 // rule the registry above exists for — and is otherwise unused, so a
 // caller with no open file may pass nullptr.
 //
-// Deliberately racy: the capacities are plain size_t fields the writer
-// thread may be growing under ``ensure_pinned`` while a reader samples
-// them.  A diagnostic readout may see a torn value; nothing refuses on it.
+// Capacity growth publishes with release semantics and this diagnostic
+// samples with acquire semantics.  The registry lock separately keeps every
+// context alive for the duration of the walk.
 bool staging_totals(const PhdfCtx* ctx, size_t* n_live, size_t* pinned_bytes);
 
 }  // namespace lorrax_ffi::phdf5
