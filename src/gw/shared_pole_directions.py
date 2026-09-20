@@ -7,6 +7,7 @@ model diagnostics evaluated against the bank moments.
 
 from __future__ import annotations
 
+import operator
 from functools import lru_cache
 
 import distrib_la
@@ -61,6 +62,17 @@ def _round_kernels(mesh):
     @lru_cache(maxsize=None)
     def take(indices):
         return program(lambda w: jnp.take(w, jnp.asarray(indices), axis=1), (batch,), batch)
+
+    @lru_cache(maxsize=None)
+    def retain(extent):
+        """Trim descending direction columns and zero each slot's inactive tail."""
+        tile = NamedSharding(mesh, batch)
+
+        @jax.jit(out_shardings=tile)
+        def select(q, counts):
+            active = jnp.arange(extent) < counts[:, None]
+            return jnp.where(active[:, None, :], q[..., :extent], 0)
+        return select
 
     @lru_cache(maxsize=None)
     def act(conjugate):
@@ -133,7 +145,7 @@ def _round_kernels(mesh):
     apply = program(lambda m, q: m @ q, (batch, batch), batch)
     negative_hermitian = program(lambda a: -(a + adjoint(a)) / 2, (batch,), batch)
     return SimpleNamespace(
-        take=take, column=column, negative_hermitian=negative_hermitian, exchange=exchange,
+        take=take, retain=retain, column=column, negative_hermitian=negative_hermitian, exchange=exchange,
         literal_mirrors=literal_mirrors, act=act, apply=apply,
         dedupe=program(dedupe, (batch, batch), (batch, batch)))
 
@@ -301,15 +313,34 @@ def _round_partner_directions(q, output, cutoff, *, real, kernels, eigh_plan, co
     m = int(perp.shape[-1])
     _, largest = distrib_la.leading_eigenvectors(top, 1, eigh_plan=eigh_plan, column_extent=column_extent,
                                                  multiplet_tol=tol, real_rows=real)
-    _, spectrum = distrib_la.leading_eigenvectors(perp, m, eigh_plan=eigh_plan, column_extent=column_extent,
-                                                  multiplet_tol=tol, real_rows=real)
+    directions, spectrum = distrib_la.leading_eigenvectors(
+        perp, m, eigh_plan=eigh_plan, column_extent=column_extent,
+        multiplet_tol=tol, real_rows=real)
     counts = tuple(int(np.sum(np.asarray(values) > float(cutoff) ** 2 * float(np.asarray(t)[0])))
                    if i < real else 0 for i, (values, t) in enumerate(zip(spectrum, largest)))
+
+    # ``directions`` already holds the full descending eigensystem whose
+    # spectrum set the cut. Preserve leading_eigenvectors' multiplet closure
+    # before slicing that result instead of solving the same ``perp`` again.
+    def close(values, count):
+        while 0 < count < len(values):
+            a, b = values[count - 1:count + 1]
+            if abs(a - b) > tol * max(abs(a), abs(b)):
+                break
+            count += 1
+        return count
+
+    counts = tuple(close(np.asarray(values), count) if i < real else 0
+                   for i, (values, count) in enumerate(zip(spectrum, counts)))
     if max(counts) == 0:
         return None, None
-    directions, kept = distrib_la.leading_eigenvectors(perp, counts, eigh_plan=eigh_plan, column_extent=column_extent,
-                                                       multiplet_tol=tol, real_rows=real)
-    return directions, tuple(int(np.asarray(v).size) for v in kept)
+    largest_count = max(counts)
+    extent = operator.index(column_extent(largest_count))
+    if extent < largest_count or extent < 1 or extent % int(eigh_plan.mesh.shape['y']):
+        raise ValueError("column_extent must cover the rank and tile mesh y")
+    counts_device = jax.device_put(np.asarray(counts, dtype=np.int64),
+                                   NamedSharding(eigh_plan.mesh, P()))
+    return kernels.retain(extent)(directions, counts_device), counts
 
 
 def _model_diagnostics(model, moments, infinity_directions, *, matmul):
