@@ -3196,7 +3196,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     bundle_occupations = (None if metal_occ_state is None
                           else metal_occ_state.f_kn)
     _assert_empty_scissor_tail(
-        enk_entry if enk_base is None else enk_base,
+        enk_entry if enk_base is None else enk_base_ev / RYD_TO_EV,
         metal_occ_state, tail_start, logical_stop)
     wfns_qp = rotate_wavefunctions(
         inputs.wfns_dft, U_full,
