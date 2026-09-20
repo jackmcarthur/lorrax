@@ -199,9 +199,10 @@ static void staging_free(void* p) {
 // (page-locked, for fast async H2D) on the CUDA build vs a plain aligned host
 // malloc on the host build, where the staging tail is a std::memcpy and
 // page-locking would be pointless.
-static bool ensure_staging(void** slot, size_t* capacity, size_t need_bytes,
+static bool ensure_staging(void** slot, std::atomic<size_t>* capacity,
+                           size_t need_bytes,
                            const char* who) {
-    if (*capacity >= need_bytes) return true;
+    if (capacity->load(std::memory_order_acquire) >= need_bytes) return true;
     // Round up to a multiple of 2 MiB to reduce re-allocation churn across
     // transfers of slightly varying sizes.  The round-up is where an absurd
     // request stops being absurd and starts being SMALL: need_bytes near
@@ -217,7 +218,7 @@ static bool ensure_staging(void** slot, size_t* capacity, size_t need_bytes,
     }
     staging_free(*slot);
     *slot = nullptr;
-    *capacity = 0;
+    capacity->store(0, std::memory_order_release);
     const size_t rounded = ((need_bytes + kChunk - 1) / kChunk) * kChunk;
 #ifdef LORRAX_FFI_NO_CUDA
     // 64-byte aligned so the H5Dread lands on a cache-line boundary
@@ -231,7 +232,7 @@ static bool ensure_staging(void** slot, size_t* capacity, size_t need_bytes,
         return false;
     }
 #endif
-    *capacity = rounded;
+    capacity->store(rounded, std::memory_order_release);
     return true;
 }
 
@@ -336,15 +337,16 @@ bool staging_totals(const PhdfCtx* /*ctx*/, size_t* n_live,
     // Holding the registry lock is what makes this safe to walk: close_ctx
     // erases at the TOP of teardown, before any buffer is freed, so no ctx
     // in the set can be destroyed while the lock is held.  Only the
-    // capacities themselves can move (the writer thread growing
-    // pinned_buf); see the header comment for why that race is accepted.
+    // capacities themselves can move while their owning threads grow the
+    // buffers, so they are sampled through their atomic publication.
     std::lock_guard<std::mutex> lk(live_ctx_mu());
     const auto& s = live_ctx_set();
     if (n_live) *n_live = s.size();
     if (pinned_bytes) {
         size_t total = 0;
         for (const PhdfCtx* live : s) {
-            total += live->pinned_capacity + live->read_capacity;
+            total += live->pinned_capacity.load(std::memory_order_acquire)
+                   + live->read_capacity.load(std::memory_order_acquire);
         }
         *pinned_bytes = total;
     }
@@ -1238,10 +1240,10 @@ void close_ctx(PhdfCtx* ctx) {
 
     staging_free(ctx->pinned_buf);
     ctx->pinned_buf = nullptr;
-    ctx->pinned_capacity = 0;
+    ctx->pinned_capacity.store(0, std::memory_order_release);
     staging_free(ctx->read_buf);
     ctx->read_buf = nullptr;
-    ctx->read_capacity = 0;
+    ctx->read_capacity.store(0, std::memory_order_release);
 #ifndef LORRAX_FFI_NO_CUDA
     if (ctx->d2h_event) cudaEventDestroy(ctx->d2h_event);
     if (ctx->h2d_event) cudaEventDestroy(ctx->h2d_event);
