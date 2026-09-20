@@ -1058,14 +1058,25 @@ def read_qp_rotations_artifact(h5_path: str) -> dict:
     cannot define which identity scheme was used.
     """
     from .qp_wfn import (
+        QP_ROT_OCCUPATIONS_DATASET,
         QP_ROT_METADATA_DATASETS,
         QP_ROT_WFN_FINGERPRINT_ATTR,
         QP_ROT_WFN_FINGERPRINT_SCHEME_ATTR,
+        QP_WFN_OCC_FAMILY_ATTR,
+        QP_WFN_OCC_HASH_ATTR,
+        QP_WFN_OCC_MU_RY_ATTR,
+        QP_WFN_OCC_NELEC_ATTR,
+        QP_WFN_OCC_WIDTH_RY_ATTR,
         _require_wfn_fingerprint,
     )
     path = os.fspath(h5_path)
+    with h5py.File(path, "r") as h5:
+        has_occupations = QP_ROT_OCCUPATIONS_DATASET in h5
     arrays = read_qp_rotations_full_bz(
         path, datasets=("U_mnk", "E_qp_nk_rydberg"))
+    if has_occupations:
+        arrays.update(read_qp_rotations_full_bz(
+            path, datasets=(QP_ROT_OCCUPATIONS_DATASET,)))
     missing = [name for name in ("U_mnk", "E_qp_nk_rydberg")
                if name not in arrays]
     with h5py.File(path, "r") as h5:
@@ -1084,6 +1095,62 @@ def read_qp_rotations_artifact(h5_path: str) -> dict:
         if "kirr_to_kfull" not in h5:
             raise ValueError(_REGENERATE)
         arrays["kirr_to_kfull"] = np.asarray(h5["kirr_to_kfull"][()], dtype=np.int64)
+        def _text(value):
+            return value.decode("ascii") if isinstance(value, bytes) \
+                else str(value)
+
+        occupation_attrs = {
+            "occ_hash": QP_WFN_OCC_HASH_ATTR,
+            "mu_ry": QP_WFN_OCC_MU_RY_ATTR,
+            "smearing_family": QP_WFN_OCC_FAMILY_ATTR,
+            "smearing_width_ry": QP_WFN_OCC_WIDTH_RY_ATTR,
+            "n_electrons": QP_WFN_OCC_NELEC_ATTR,
+        }
+        occupation_present = {
+            key: name in h5.attrs for key, name in occupation_attrs.items()}
+        if has_occupations != all(occupation_present.values()) \
+                or (any(occupation_present.values())
+                    and not all(occupation_present.values())):
+            present = sorted(k for k, yes in occupation_present.items() if yes)
+            missing_occ = sorted(k for k, yes in occupation_present.items()
+                                 if not yes)
+            raise ValueError(
+                f"{os.path.basename(path)} has incomplete final occupation "
+                f"provenance: table={has_occupations}, attrs={present}, "
+                f"missing attrs={missing_occ}.")
+        if has_occupations:
+            occupations = np.asarray(
+                arrays[QP_ROT_OCCUPATIONS_DATASET], dtype=np.float64)
+            band_stop = int(np.asarray(h5["band_range"])[1])
+            if (occupations.ndim != 2
+                    or occupations.shape[0] != arrays["U_mnk"].shape[0]
+                    or occupations.shape[1] < band_stop
+                    or not np.all(np.isfinite(occupations))):
+                raise ValueError(
+                    f"{os.path.basename(path)} has invalid final occupation "
+                    f"table shape {occupations.shape} for U shape "
+                    f"{arrays['U_mnk'].shape} and band_stop={band_stop}.")
+            provenance = {
+                "occ_hash": _text(h5.attrs[QP_WFN_OCC_HASH_ATTR]),
+                "mu_ry": float(h5.attrs[QP_WFN_OCC_MU_RY_ATTR]),
+                "smearing_family": _text(
+                    h5.attrs[QP_WFN_OCC_FAMILY_ATTR]),
+                "smearing_width_ry": float(
+                    h5.attrs[QP_WFN_OCC_WIDTH_RY_ATTR]),
+                "n_electrons": float(h5.attrs[QP_WFN_OCC_NELEC_ATTR]),
+            }
+            if (not provenance["occ_hash"]
+                    or provenance["smearing_family"] not in
+                    ("mp1", "fd", "fixed")
+                    or not all(np.isfinite(provenance[key]) for key in
+                               ("mu_ry", "smearing_width_ry", "n_electrons"))):
+                raise ValueError(
+                    f"{os.path.basename(path)} has invalid final occupation "
+                    "provenance values.")
+            arrays["occupation_provenance"] = provenance
+        else:
+            arrays["occupation_provenance"] = None
+
         has_scheme = QP_ROT_WFN_FINGERPRINT_SCHEME_ATTR in h5.attrs
         has_fingerprint = QP_ROT_WFN_FINGERPRINT_ATTR in h5.attrs
         if has_scheme != has_fingerprint:
@@ -1092,9 +1159,6 @@ def read_qp_rotations_artifact(h5_path: str) -> dict:
                 "identity: fingerprint and scheme attributes must appear "
                 "together.")
         if has_fingerprint:
-            def _text(value):
-                return value.decode("ascii") if isinstance(value, bytes) \
-                    else str(value)
             scheme = _text(h5.attrs[QP_ROT_WFN_FINGERPRINT_SCHEME_ATTR])
             fingerprint = _text(h5.attrs[QP_ROT_WFN_FINGERPRINT_ATTR])
             fingerprint = _require_wfn_fingerprint(
