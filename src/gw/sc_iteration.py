@@ -6490,9 +6490,10 @@ def final_qp_eigenstates(
     what made the WFN writer fail on an IBZ loop
     (ibz_self_consistency_scaffold.md §7 row 3).
 
-    ``efermi_ry`` is k-set independent: every full-BZ k shares its star's
-    eigenvalues, so the midgap over the IBZ and over the full BZ are the
-    same number.
+    ``efermi_ry`` is k-set independent.  For a metal it is the accepted
+    map's fixed-N reference; :func:`dump_qp_wfn_artifacts` replaces it with
+    the final solve on the complete published logical ladder after assembling
+    that ladder's active and scissored-tail energies.
 
     Returned arrays are host-side numpy (not jax.Array) since the
     typical consumers (WFN_qp.h5 writer, eqp.dat tooling) operate on
@@ -6514,45 +6515,20 @@ def final_qp_eigenstates(
     -------
     enk_qp_ry : (nk, nb_active) float64
     U_kmn     : (nk, nb_active, nb_active) complex128, ``U[k, m, n] = ⟨DFT_m | QP_n⟩``
-    efermi_ry : float, midgap of the converged eigenvalues
+    efermi_ry : float
+        Insulating midgap, or the accepted map's fixed-N metal reference.
+        The artifact publisher performs the authoritative final metal solve
+        after it has assembled the complete logical energy ladder.
     """
     E_ry, U, efermi_ry = _diagonalize_and_get_efermi(
         state.H_qp_dft, n_occ, mesh_xy)
-    # ONE omega reference, fifth site (the final writers): the midgap rule
-    # is the insulating convention. A metallic run's eqp/sigma writers
-    # evaluated Sigma_c at midgap — 2.66 eV above the loop's fixed-N mu on
-    # sodium — distorting eqp0/eqp1.dat non-rigidly while the converged
-    # iterates were right (claim 0202 §2). The metallic reference is the
-    # fixed-N MP1 mu solved on THESE converged eigenvalues, same solver,
-    # width and capacity as the loop; uniform weights on the state's own
-    # k-set, the _solve_head_occupations convention.
+    # The full published metal ladder includes the inactive scissored tail,
+    # which this active-space diagonalisation cannot see.  Carry the exact
+    # accepted-map reference to the publishing seam; that seam assembles the
+    # complete ladder and performs the one final fixed-N solve below.
     if (state.occupation_state is not None
             and str(state.occupation_state.smearing_family) in ("mp1", "fd")):
-        if state_capacity is None:
-            raise ValueError(
-                "final_qp_eigenstates: a metallic occupation_state needs "
-                "state_capacity (spin_degeneracy_factor(wfn)) to place the "
-                "final mu; got None. The caller has the WFN in scope.")
-        from .efermi import solve_smearing_occupations
-        _E_np = np.asarray(E_ry, dtype=np.float64)
-        _st = state.occupation_state
-        # The STATE carries its own family; re-solving mu in a different one
-        # is the shadow accounting this module exists to avoid.
-        _mu_ry, _ = solve_smearing_occupations(
-            _E_np,
-            np.full(_E_np.shape[0], 1.0 / _E_np.shape[0]),
-            float(_st.n_electrons),
-            float(_st.smearing_width_ry),
-            family=str(_st.smearing_family),
-            state_capacity=float(state_capacity),
-            # SAME clamp as the loop's solve, for the same reason
-            # ``state_capacity`` is a kwarg here: ``SCState`` carries the
-            # occupation TABLE, not the solver settings that made it, and
-            # two mu's from two differently-parameterised solves is the
-            # shadow-accounting failure this module exists to avoid.
-            clamp_tol=float(clamp_tol),
-        )
-        efermi_ry = float(_mu_ry)
+        efermi_ry = float(state.occupation_state.mu_ry)
     return (
         np.asarray(E_ry, dtype=np.float64),
         np.asarray(U, dtype=np.complex128),
@@ -6801,7 +6777,8 @@ def dump_qp_wfn_artifacts(
     """
     from ffi import _services
     _services.ensure_on_path()
-    from symmetry_maps import reduce_full_bz_to_file_wedge
+    from symmetry_maps import (
+        reduce_full_bz_to_file_wedge, unfold_file_wedge_to_full_bz)
 
     from file_io.qp_wfn import write_qp_rotations_h5, write_qp_wfn_h5
 
@@ -6837,6 +6814,7 @@ def dump_qp_wfn_artifacts(
              f"{' (star wedge)' if state_on_ibz else ' (full BZ)'}")
     qp_wfn_path = os.path.join(output_dir, "WFN_qp.h5")
     qp_rot_path = os.path.join(output_dir, "qp_wfn_rotations.h5")
+    dft_file_ry = np.asarray(wfn.energies[0], dtype=np.float64)
     enk_full_base_ry = None
     tail_fit = (state.outputs.tail_scissor_fit
                 if state.outputs is not None else None)
@@ -6845,19 +6823,69 @@ def dump_qp_wfn_artifacts(
             raise ValueError(
                 "dump_qp_wfn_artifacts: logical_band_stop is required "
                 "when the final SC map used a tail scissor.")
-        base_ev = np.asarray(
-            wfn.energies[0], dtype=np.float64) * RYD_TO_EV
         enk_full_base_ry = apply_conduction_scissor_to_tail(
-            base_ev, tail_fit,
+            dft_file_ry * RYD_TO_EV, tail_fit,
             tail_start=int(band_slices.b3),
             logical_stop=int(logical_band_stop),
         ) / RYD_TO_EV
+
+    final_occ_state = None
+    occupations_wfn = None
+    if (state.occupation_state is not None
+            and str(state.occupation_state.smearing_family) in ("mp1", "fd")):
+        if logical_band_stop is None:
+            raise ValueError(
+                "dump_qp_wfn_artifacts: a metallic final occupation solve "
+                "requires logical_band_stop.")
+        enk_full_base_full_ry = np.asarray(
+            unfold_file_wedge_to_full_bz(
+                wfn.symmetry(),
+                dft_file_ry if enk_full_base_ry is None else enk_full_base_ry),
+            dtype=np.float64)
+        final_energies_full_ry = enk_full_base_full_ry.copy()
+        final_energies_full_ry[:, int(band_slices.b0):int(band_slices.b3)] = (
+            np.asarray(enk_full_ry, dtype=np.float64))
+        from .efermi import assert_fixed_n, solve_smearing_occupations
+        st = state.occupation_state
+        nk_occ = int(final_energies_full_ry.shape[0])
+        weights_full = np.full(nk_occ, 1.0 / float(nk_occ), dtype=np.float64)
+        mu_final_ry, occupations_full = solve_smearing_occupations(
+            final_energies_full_ry,
+            weights_full,
+            float(st.n_electrons),
+            float(st.smearing_width_ry),
+            family=str(st.smearing_family),
+            state_capacity=float(spin_degeneracy_factor(wfn)),
+            logical_nband=int(logical_band_stop),
+            clamp_tol=float(clamp_tol),
+        )
+        final_occ_state = OccupationState(
+            f_kn=occupations_full,
+            mu_ry=float(mu_final_ry),
+            smearing_family=str(st.smearing_family),
+            smearing_width_ry=float(st.smearing_width_ry),
+            n_electrons=float(st.n_electrons),
+        )
+        assert_fixed_n(
+            final_occ_state, weights_full,
+            state_capacity=float(spin_degeneracy_factor(wfn)))
+        occupations_wfn = np.asarray(reduce_full_bz_to_file_wedge(
+            wfn.symmetry(), np.asarray(final_occ_state.f_kn)),
+            dtype=np.float64)
+        efermi_ry = float(final_occ_state.mu_ry)
+        print_fn(
+            "  Final occupations: fixed-N "
+            f"{final_occ_state.smearing_family}, "
+            f"mu={efermi_ry * RYD_TO_EV:.6f} eV, "
+            f"hash={final_occ_state.occ_hash}")
     def _write_qp_wfn():
         write_qp_wfn_h5(
             qp_wfn_path, wfn=wfn,
             U_kmn=U_wfn, enk_active_qp_ry=enk_wfn_ry,
             band_start=band_slices.b0, band_stop=band_slices.b3,
             enk_full_base_ry=enk_full_base_ry,
+            occupations_kn=occupations_wfn,
+            occupation_state=final_occ_state,
         )
     from common.collectives import rank0_transaction
     if write_wfn_h5:

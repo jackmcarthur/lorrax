@@ -64,6 +64,9 @@ class WFNWriter:
     kgrid : (nkx, nky, nkz)
     nbands : number of bands
     gvecs_per_k : list of (ngk_i, 3) int arrays
+    occupations : optional ``(nk, nbands)`` or ``(nspin, nk, nbands)`` table
+        Stored verbatim.  When absent, retain the historical index-step
+        occupations derived from the nominal electron count.
     nosym : write identity-only symmetries (QE nosym convention)
     shift : MP grid shift
     """
@@ -78,6 +81,7 @@ class WFNWriter:
         nbands: int,
         gvecs_per_k: list[np.ndarray],
         *,
+        occupations: np.ndarray | None = None,
         nosym: bool = False,
         shift: tuple[float, float, float] = (0.0, 0.0, 0.0),
     ):
@@ -106,7 +110,20 @@ class WFNWriter:
         self._n_occ = int(round(float(
             getattr(crystal, "num_electrons", crystal.nelec))
             * self.nspin * self.nspinor / 2.0))
-        self._occ[0, :, :self._n_occ] = 1.0
+        if occupations is None:
+            self._occ[0, :, :self._n_occ] = 1.0
+        else:
+            occ = np.asarray(occupations, dtype=np.float64)
+            if occ.shape == (self.nk, self.nbands) and self.nspin == 1:
+                occ = occ[None, ...]
+            expected = (self.nspin, self.nk, self.nbands)
+            if occ.shape != expected:
+                raise ValueError(
+                    f"WFNWriter occupations have shape {occ.shape}, "
+                    f"expected {expected}.")
+            if not np.all(np.isfinite(occ)):
+                raise ValueError("WFNWriter occupations must be finite.")
+            self._occ[...] = occ
 
         # Open file, write header, pre-allocate coeffs
         self._f = h5py.File(path, "w")
@@ -250,7 +267,8 @@ def write_wfn_h5(
     """
     nbands = eigenvalues.shape[1]
     with WFNWriter(path, crystal, kpoints, weights, kgrid, nbands,
-                   gvecs_per_k, nosym=nosym, shift=shift) as w:
+                   gvecs_per_k, occupations=occupations,
+                   nosym=nosym, shift=shift) as w:
         for ik in range(kpoints.shape[0]):
             c = coeffs_per_k[ik] if coeffs_per_k is not None else None
             w.write_k(ik, eigenvalues[ik], c)

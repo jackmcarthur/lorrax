@@ -153,6 +153,15 @@ QP_WFN_SCHEME = "lorrax-qp-wfn-v1"
 QP_SOLVER_ATTR = "qp_solver"
 QP_ENERGY_DEFINITION_ATTR = "qp_energy_definition"
 
+#: Additive occupation provenance for a matched QP WFN.  These names mirror
+#: the canonical occupation record's fields while keeping the QP-WFN format
+#: prefix distinct from the MPA store's ``mpa_*`` attributes.
+QP_WFN_OCC_HASH_ATTR = "qp_wfn_occ_hash"
+QP_WFN_OCC_MU_RY_ATTR = "qp_wfn_occ_mu_ry"
+QP_WFN_OCC_FAMILY_ATTR = "qp_wfn_occ_smearing_family"
+QP_WFN_OCC_WIDTH_RY_ATTR = "qp_wfn_occ_smearing_width_ry"
+QP_WFN_OCC_NELEC_ATTR = "qp_wfn_occ_nelec"
+
 
 def _qp_provenance_attrs(*, qp_solver=None, qp_energy_definition=None,
                          sigma_eval_provenance=None) -> dict[str, str]:
@@ -170,6 +179,20 @@ def _qp_provenance_attrs(*, qp_solver=None, qp_energy_definition=None,
             f"{present}, missing {missing}.")
     return ({name: str(value) for name, value in values.items()}
             if present else {})
+
+
+def _qp_occupation_attrs(occupation_state) -> dict[str, object]:
+    """Return the final occupation state's all-or-none QP-WFN stamps."""
+    if occupation_state is None:
+        return {}
+    return {
+        QP_WFN_OCC_HASH_ATTR: str(occupation_state.occ_hash),
+        QP_WFN_OCC_MU_RY_ATTR: float(occupation_state.mu_ry),
+        QP_WFN_OCC_FAMILY_ATTR: str(occupation_state.smearing_family),
+        QP_WFN_OCC_WIDTH_RY_ATTR: float(
+            occupation_state.smearing_width_ry),
+        QP_WFN_OCC_NELEC_ATTR: float(occupation_state.n_electrons),
+    }
 
 #: Small top-level dataset carried by a restart bundle to say which WFN
 #: supplied its matched ``psi_parent_y`` / ``enk_full`` state.  The payload is
@@ -526,6 +549,8 @@ def write_qp_wfn_h5(
     band_stop: int,
     *,
     enk_full_base_ry: np.ndarray | None = None,
+    occupations_kn: np.ndarray | None = None,
+    occupation_state=None,
     qp_solver=None,
     qp_energy_definition=None,
     sigma_eval_provenance=None,
@@ -557,20 +582,22 @@ def write_qp_wfn_h5(
     Spinors: handled identically per (k, s) — the rotation is in band
     space and does not mix spinor components.
 
-    Occupations: ``ifmin`` / ``ifmax`` are inherited from the source
-    WFN via :class:`WFNWriter` (which sets ``ifmax = nelec`` on every
-    k).  Safe whenever the SC iteration preserves the overall
-    valence/conduction band ordering — which holds for insulators with
-    QP shifts smaller than the gap.  For metals or near-gap-closure
-    systems, an SC update can permute occupied vs. empty bands; the
-    output ``occ`` array would then be wrong and would need to be
-    recomputed from the QP energies + a fresh midgap E_F before
-    handing the file to a downstream consumer that trusts ``occ``.
+    Occupations: an SC caller supplies ``occupations_kn`` together with the
+    exact ``occupation_state`` that produced it.  The table is written on the
+    file wedge while the state's mesh-invariant hash, fixed-N chemical
+    potential, smearing family/width and electron target are stamped at the
+    root.  Callers which supply neither retain the historical index-step
+    table; supplying only one is refused.
     """
     provenance = _qp_provenance_attrs(
         qp_solver=qp_solver,
         qp_energy_definition=qp_energy_definition,
         sigma_eval_provenance=sigma_eval_provenance)
+    if (occupations_kn is None) != (occupation_state is None):
+        raise ValueError(
+            "write_qp_wfn_h5: occupations_kn and occupation_state must be "
+            "supplied together.")
+    occupation_provenance = _qp_occupation_attrs(occupation_state)
 
     from .wfn_writer import WFNWriter
 
@@ -584,6 +611,27 @@ def write_qp_wfn_h5(
             f"write_qp_wfn_h5: enk_active_qp_ry shape "
             f"{enk_active_qp_ry.shape} inconsistent with "
             f"(nk={wfn.nkpts}, nb_active={nb_active}).")
+    occupations = None
+    if occupations_kn is not None:
+        occupations = np.asarray(occupations_kn, dtype=np.float64)
+        expected = (int(wfn.nkpts), int(wfn.nbands))
+        if occupations.shape != expected:
+            raise ValueError(
+                "write_qp_wfn_h5: occupations_kn shape "
+                f"{occupations.shape} inconsistent with {expected}.")
+        if not np.all(np.isfinite(occupations)):
+            raise ValueError(
+                "write_qp_wfn_h5: occupations_kn must be finite.")
+        weights = np.asarray(wfn.kweights, dtype=np.float64)
+        weights = weights / float(np.sum(weights))
+        capacity = float(wfn.occupation_state_capacity)
+        realized = capacity * float(np.einsum(
+            "k,kn->", weights, occupations, optimize=True))
+        target = float(occupation_state.n_electrons)
+        if not np.isclose(realized, target, rtol=0.0, atol=1.0e-10):
+            raise ValueError(
+                "write_qp_wfn_h5: file-wedge occupations violate fixed N: "
+                f"realised {realized:.12f}, target {target:.12f}.")
 
     # All-band IBZ coefficients + per-k G-vectors via the unified loader.
     # The output writer is already k-streamed, so the input must be too:
@@ -626,6 +674,7 @@ def write_qp_wfn_h5(
             kgrid=tuple(int(x) for x in wfn.kgrid),
             nbands=int(wfn.nbands),
             gvecs_per_k=gvecs_per_k,
+            occupations=occupations,
             nosym=False,
             shift=tuple(float(x) for x in wfn.shift),
         ) as writer:
@@ -657,6 +706,8 @@ def write_qp_wfn_h5(
         h5.attrs["qp_wfn_band_stop"] = int(band_stop)
         h5.attrs["qp_wfn_source"] = str(getattr(wfn, "path", "") or "")
         for name, value in provenance.items():
+            h5.attrs[name] = value
+        for name, value in occupation_provenance.items():
             h5.attrs[name] = value
 
 
