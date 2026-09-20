@@ -6796,6 +6796,7 @@ def dump_qp_wfn_artifacts(
             logical_stop=int(logical_band_stop),
         ) / RYD_TO_EV
 
+    final_energies_full_ry = None
     final_occ_state = None
     occupations_wfn = None
     if (state.occupation_state is not None
@@ -6882,6 +6883,7 @@ def dump_qp_wfn_artifacts(
             occupations_kn=(None if final_occ_state is None else
                             np.asarray(final_occ_state.f_kn)),
             occupation_state=final_occ_state,
+            enk_full_nk_ry=final_energies_full_ry,
         )
     rank0_transaction(qp_rot_path, stage="qp_rotations_h5_write",
                       write=_write_qp_rotations)

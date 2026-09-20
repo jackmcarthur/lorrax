@@ -20,13 +20,17 @@ import numpy as np
 from file_io.restart_bundle import read_kirr_to_kfull
 
 
-def _stored_occupation_args(artifact, kirr_to_kfull):
-    """Select a companion's accepted table onto the source WFN wedge."""
+def _stored_final_state_args(artifact, kirr_to_kfull):
+    """Select a companion's complete final E/f state onto the WFN wedge."""
+    result = {}
+    if "E_full_nk_rydberg" in artifact:
+        result["enk_full_base_ry"] = np.asarray(
+            artifact["E_full_nk_rydberg"][kirr_to_kfull], dtype=np.float64)
     provenance = artifact["occupation_provenance"]
     if provenance is None:
-        return {}
+        return result
     occupations_full = np.asarray(artifact["occupations_kn"], dtype=np.float64)
-    return {
+    result.update({
         "occupations_kn": np.asarray(
             occupations_full[kirr_to_kfull], dtype=np.float64),
         # ``write_qp_wfn_h5`` intentionally accepts this record by protocol:
@@ -34,8 +38,8 @@ def _stored_occupation_args(artifact, kirr_to_kfull):
         # a completed solve's provenance.
         "occupation_state": SimpleNamespace(
             f_kn=occupations_full, **provenance),
-    }
-
+    })
+    return result
 
 
 def rotate_wfn_coefficients(wfn_file, rot_file, output_file, verbose=True):
@@ -71,7 +75,7 @@ def rotate_wfn_coefficients(wfn_file, rot_file, output_file, verbose=True):
             artifact["U_mnk"][kirr_to_kfull], dtype=np.complex128)
         E_wedge_ry = np.asarray(
             artifact["E_qp_nk_rydberg"][kirr_to_kfull], dtype=np.float64)
-        occupation_kwargs = _stored_occupation_args(
+        final_state_kwargs = _stored_final_state_args(
             artifact, kirr_to_kfull)
         if verbose:
             print(f"Rotation file: {rot_file}")
@@ -79,9 +83,11 @@ def rotate_wfn_coefficients(wfn_file, rot_file, output_file, verbose=True):
             print(f"  WFN wedge rows: {len(kirr_to_kfull)}")
             print(f"  Band range: [{band_start}, {band_stop})")
             print(f"  K-grid: {artifact_kgrid.tolist()}")
-            if occupation_kwargs:
+            if artifact["occupation_provenance"] is not None:
                 print("  Occupations: stored final fixed-N table "
                       f"({artifact['occupation_provenance']['occ_hash']})")
+            if "E_full_nk_rydberg" in artifact:
+                print("  Energies: stored complete final ladder")
 
         write_qp_wfn_h5(
             output_file,
@@ -90,7 +96,7 @@ def rotate_wfn_coefficients(wfn_file, rot_file, output_file, verbose=True):
             enk_active_qp_ry=E_wedge_ry,
             band_start=band_start,
             band_stop=band_stop,
-            **occupation_kwargs,
+            **final_state_kwargs,
         )
 
     if verbose:
