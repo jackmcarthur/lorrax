@@ -86,6 +86,21 @@ _GATE_ROWS = {
     "rule_validity": ("bank and Sigma certificates cover current domains at resolved tolerances", True),
     "sc_rebuild": ("physical samples, directions, poles and ranks rebuilt at current bands and occupations; reused quadrature certified for current domains", True),
 }
+
+#: A live pole beyond this multiple of the model's own sampling band is a
+#: pencil artifact, never physics.  The band is the plasma-frequency ladder
+#: (``top`` in :func:`resolve_shared_pole_recipe`), the highest frequency the
+#: bank samples; the factor is the reciprocal of the fit's relative accuracy
+#: scale, so a pole this far outside the band cannot be resolved by a model
+#: whose validation tolerance is 1e-4.
+#:
+#: MEASURED 2026-09-20, run 14c (Fe bispinor, first bispinor SC map): the
+#: CT-C sector's largest live pole sat at 24463 Ry = 15400x the band and
+#: carried 47.5% of that sector's factor weight; the position wandered
+#: 241..24463 Ry over six maps, the Sigma planner spanned 24960 Ry boxes,
+#: and the loop diverged.  Every pole of every measured charge-only
+#: (diagonal) model stayed within 25x the band.
+_POLE_HORIZON_PLASMA_FACTOR = 100.0
 shared_real_pole_gates_v1_r3b = {
     name: {"name": name, "predicate": predicate, "threshold": threshold,
            "version": GATE_VERSION}
@@ -1006,6 +1021,11 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
     plasma_ry = 2.0 * math.sqrt(4.0 * math.pi * census['active_electrons']
                                / census['cell_volume_bohr3'])
     top = plasma_ry * RYD_TO_EV + recipe['plasma_margin_ev']
+    # The Sigma census check (gw.mpa.sigma_windows) refuses a live pole
+    # beyond this horizon.  Publish it here because this function owns the
+    # sampling band; the planner must not re-derive the plasma scale.
+    meta.shared_pole_horizon_ry2 = (
+        plasma_ry * _POLE_HORIZON_PLASMA_FACTOR) ** 2
     umin, umax = max(height, census['gap_ev']), max(recipe['imaginary_floor_max_ev'], top)
     if umin >= umax:
         raise ValueError(f"GATE shared_pole_interval: got: u_min={umin} >= u_max={umax} eV; want: u_min < u_max; why: imaginary support interval is unresolved")

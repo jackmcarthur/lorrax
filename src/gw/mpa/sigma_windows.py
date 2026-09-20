@@ -264,9 +264,50 @@ def shared_pole_intervals(frequencies, pole_indices, bounds):
     return intervals
 
 
+def _refuse_poles_beyond_horizon(frequencies, horizon_ry2):
+    """Refuse a live Ritz pole outside the band the model actually sampled.
+
+    WHY THIS IS A REFUSAL AND NOT A CLAMP.  The Sigma planner sizes a
+    ``pole_tail`` box by the FARTHEST live pole
+    (``sigma_box_plan._box_for_window``), so a single numerically infinite
+    Ritz value turns an eV-scale window into a keV-scale quadrature — and
+    then the box moves between SC maps as the artifact wanders.
+
+    MEASURED 2026-09-20, run 14c (first bispinor SC, Fe): the CT-C sector's
+    largest live pole sat at 24463 Ry = 333 keV = 15400x the model's
+    sampling band and carried 47.5% of that sector's factor weight, while
+    its position wandered 241..24463 Ry over six maps.  ``pole_tail`` boxes
+    reached 339548 eV / 24960 Ry, the frozen-map policy rebuilt 7 windows
+    per map, and the loop never converged.  Every pole in every measured
+    charge-only (diagonal-sector) model stayed within 25x the band, so this
+    bound separates the two without clamping either.
+    """
+    if horizon_ry2 is None:
+        return
+    horizon = float(horizon_ry2)
+    parent, worst = -1, 0.0
+    for index, values in enumerate(frequencies):
+        if values.size and float(values[-1]) > worst:
+            parent, worst = index, float(values[-1])
+    if not (horizon > 0.0) or worst * worst <= horizon:
+        return
+    horizon_ry = horizon ** 0.5
+    raise ValueError(
+        "GATE shared_pole_lambda_horizon: got: live pole "
+        f"Omega={worst:.6g} Ry ({worst * 13.605693:.6g} eV) at q={parent}, "
+        f"{worst / horizon_ry:.6g}x the model's sampling horizon "
+        f"Omega_max={horizon_ry:.6g} Ry; want: every live pole inside the band "
+        "the bank sampled; why: a Ritz value beyond that band is a pencil "
+        "artifact, and the Sigma planner spans a quadrature box to the "
+        "farthest live pole -- measured 2026-09-20 the artifact drove "
+        "24960 Ry boxes in the diverging bispinor SC while carrying 47.5% "
+        "of its sector's factor weight")
+
+
 def summarize_shared_poles(
     poles2_ry2, counts, branches, *, regularization_width_ry, edge_factor,
     occupation_window_threshold=OCCUPATION_WINDOW_THRESHOLD_DEFAULT,
+    horizon_ry2=None,
 ):
     """Feed real, ragged parent extrema to the existing Σ window planner.
 
@@ -276,6 +317,7 @@ def summarize_shared_poles(
     call it again with the current bands, occupations and model each SC map.
     """
     frequencies = shared_pole_frequencies(poles2_ry2, counts)
+    _refuse_poles_beyond_horizon(frequencies, horizon_ry2)
     _, _, _, selectors = _geometry(
         branches, regularization_width_ry, edge_factor,
         _weight_floor(occupation_window_threshold))
