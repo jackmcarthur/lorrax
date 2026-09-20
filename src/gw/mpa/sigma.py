@@ -1586,8 +1586,7 @@ def compute_sigma_c_mpa_omega_grid(
                     poles2, counts, branches,
                     regularization_width_ry=regularization_width_ry,
                     edge_factor=edge_factor,
-                    occupation_window_threshold=occupation_window_threshold,
-                    horizon_ry2=getattr(meta, "shared_pole_horizon_ry2", None))
+                    occupation_window_threshold=occupation_window_threshold)
         for lo in (() if shared_pole else range(0, n_poles, int(pole_batch_size))):
             hi = min(lo + int(pole_batch_size), n_poles)
             Omega, B, B_odd = reader.read(
