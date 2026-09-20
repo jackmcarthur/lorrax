@@ -1052,12 +1052,15 @@ def read_qp_rotations_artifact(h5_path: str) -> dict:
 
     Returns ``U_mnk`` and ``E_qp_nk_rydberg`` on the full BZ together with
     ``band_range``, ``kpoints_crys``, ``kgrid`` and the optional legacy/source
-    WFN fingerprint pair.  A partial artifact is refused: a rotation without
-    its matched eigenvalues, band labels or k-set cannot define
-    ``H_QP = U diag(E_QP) U^H``; one fingerprint attribute without the other
-    cannot define which identity scheme was used.
+    WFN fingerprint pair. SC artifacts may also carry the complete final
+    energy ladder and fixed-N occupation state on that same full-BZ axis. A
+    partial artifact is refused: a rotation without its matched eigenvalues,
+    band labels or k-set cannot define ``H_QP = U diag(E_QP) U^H``; one
+    fingerprint attribute without the other cannot define which identity
+    scheme was used.
     """
     from .qp_wfn import (
+        QP_ROT_FULL_ENERGIES_DATASET,
         QP_ROT_OCCUPATIONS_DATASET,
         QP_ROT_METADATA_DATASETS,
         QP_ROT_WFN_FINGERPRINT_ATTR,
@@ -1071,12 +1074,16 @@ def read_qp_rotations_artifact(h5_path: str) -> dict:
     )
     path = os.fspath(h5_path)
     with h5py.File(path, "r") as h5:
+        has_full_energies = QP_ROT_FULL_ENERGIES_DATASET in h5
         has_occupations = QP_ROT_OCCUPATIONS_DATASET in h5
     arrays = read_qp_rotations_full_bz(
         path, datasets=("U_mnk", "E_qp_nk_rydberg"))
     if has_occupations:
         arrays.update(read_qp_rotations_full_bz(
             path, datasets=(QP_ROT_OCCUPATIONS_DATASET,)))
+    if has_full_energies:
+        arrays.update(read_qp_rotations_full_bz(
+            path, datasets=(QP_ROT_FULL_ENERGIES_DATASET,)))
     missing = [name for name in ("U_mnk", "E_qp_nk_rydberg")
                if name not in arrays]
     with h5py.File(path, "r") as h5:
@@ -1092,6 +1099,25 @@ def read_qp_rotations_artifact(h5_path: str) -> dict:
                 h5["kpoints_crys"][()], dtype=np.float64),
             "kgrid": np.asarray(h5["kgrid"][()], dtype=np.int64),
         })
+        if has_full_energies:
+            full_energies = np.asarray(
+                arrays[QP_ROT_FULL_ENERGIES_DATASET], dtype=np.float64)
+            band_start, band_stop = (
+                int(x) for x in arrays["band_range"].tolist())
+            if (full_energies.ndim != 2
+                    or full_energies.shape[0] != arrays["U_mnk"].shape[0]
+                    or full_energies.shape[1] < band_stop
+                    or not np.all(np.isfinite(full_energies))):
+                raise ValueError(
+                    f"{os.path.basename(path)} has invalid complete final "
+                    f"energy ladder shape {full_energies.shape} for U shape "
+                    f"{arrays['U_mnk'].shape} and band_stop={band_stop}.")
+            if not np.array_equal(
+                    full_energies[:, band_start:band_stop],
+                    np.asarray(arrays["E_qp_nk_rydberg"], dtype=np.float64)):
+                raise ValueError(
+                    f"{os.path.basename(path)} has a complete final energy "
+                    "ladder whose active slice differs from E_qp_nk_rydberg.")
         if "kirr_to_kfull" not in h5:
             raise ValueError(_REGENERATE)
         arrays["kirr_to_kfull"] = np.asarray(h5["kirr_to_kfull"][()], dtype=np.int64)

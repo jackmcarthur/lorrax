@@ -88,6 +88,14 @@ QP_ROT_K_DATASETS = ("U_mnk", "E_qp_nk_hartree", "E_qp_nk_rydberg")
 #: ladder.  Legacy and one-shot companions legitimately omit it.
 QP_ROT_OCCUPATIONS_DATASET = "occupations_kn"
 
+#: Optional complete final energy ladder carried by an SC companion.  The
+#: active slice must equal ``E_qp_nk_rydberg``; columns outside that slice
+#: preserve the exact base energies (including the final sum-band scissor)
+#: that the direct QP-WFN writer consumed.  A postprocessor can therefore
+#: reproduce one matched E/f state without reconstructing the tail from the
+#: mean-field WFN.
+QP_ROT_FULL_ENERGIES_DATASET = "E_full_nk_rydberg"
+
 #: ``kpoints_crys`` and ``kirr_to_kfull`` STAY ON THE FULL BZ, always, and
 #: that is not an oversight.
 #:
@@ -264,6 +272,7 @@ def write_qp_rotations_h5(
     qp_solver=None,
     qp_energy_definition=None,
     sigma_eval_provenance=None,
+    enk_full_nk_ry: np.ndarray = None,
     occupations_kn: np.ndarray = None,
     occupation_state=None,
 ):
@@ -299,6 +308,11 @@ def write_qp_rotations_h5(
         qp_solver, qp_energy_definition, sigma_eval_provenance: optional,
                all-or-none run provenance for the stored E/U pair.  Legacy
                callers may omit all three; absence means unverifiable.
+        enk_full_nk_ry: optional complete final full-BZ energy ladder in Ry.
+               Its active slice must exactly equal ``2 * E_qp_nk``.  SC
+               supplies it so a reconstructed WFN uses the same inactive
+               tail as the direct writer; legacy and one-shot callers may
+               omit it.
         occupations_kn, occupation_state: optional, all-or-none final SC
                occupations on the full BZ and the accepted state that owns
                their fixed-N provenance.  This reuses the caller's completed
@@ -312,7 +326,8 @@ def write_qp_rotations_h5(
         4. Write rotated coefficients back to WFN_qp.h5
 
     WHAT MOVES AND WHAT DOES NOT.  :data:`QP_ROT_K_DATASETS` and the
-    optional occupation table are reduced.  :data:`QP_ROT_FULL_BZ_DATASETS`
+    optional full energy ladder and occupation table are reduced.
+    :data:`QP_ROT_FULL_BZ_DATASETS`
     — ``kpoints_crys`` and
     ``kirr_to_kfull`` — stay on the full BZ and keep their exact old
     values and meaning, because the unfold is a GATHER and k is the one
@@ -353,6 +368,25 @@ def write_qp_rotations_h5(
         "E_qp_nk_hartree": np.asarray(E_qp_nk),
         "E_qp_nk_rydberg": np.asarray(E_qp_nk) * 2.0,
     }
+    if enk_full_nk_ry is not None:
+        full_energies = np.asarray(enk_full_nk_ry, dtype=np.float64)
+        if (full_energies.ndim != 2
+                or full_energies.shape[0] != U_mnk.shape[0]
+                or full_energies.shape[1] < int(band_stop)):
+            raise ValueError(
+                "write_qp_rotations_h5: enk_full_nk_ry must have shape "
+                f"(nk={U_mnk.shape[0]}, nb>={band_stop}), got "
+                f"{full_energies.shape}.")
+        if not np.all(np.isfinite(full_energies)):
+            raise ValueError(
+                "write_qp_rotations_h5: enk_full_nk_ry must be finite.")
+        if not np.array_equal(
+                full_energies[:, int(band_start):int(band_stop)],
+                payload["E_qp_nk_rydberg"]):
+            raise ValueError(
+                "write_qp_rotations_h5: enk_full_nk_ry active slice is not "
+                "the exact E_qp_nk_rydberg stored beside it.")
+        payload[QP_ROT_FULL_ENERGIES_DATASET] = full_energies
     if occupations_kn is not None:
         occupations = np.asarray(occupations_kn, dtype=np.float64)
         if occupations.ndim != 2 or occupations.shape[0] != U_mnk.shape[0]:
@@ -451,6 +485,10 @@ def write_qp_rotations_h5(
         f.create_dataset('U_mnk', data=payload["U_mnk"], dtype=np.complex128)
         f.create_dataset('E_qp_nk_hartree', data=payload["E_qp_nk_hartree"], dtype=np.float64)
         f.create_dataset('E_qp_nk_rydberg', data=payload["E_qp_nk_rydberg"], dtype=np.float64)  # Also save in Ry
+        if QP_ROT_FULL_ENERGIES_DATASET in payload:
+            f.create_dataset(
+                QP_ROT_FULL_ENERGIES_DATASET,
+                data=payload[QP_ROT_FULL_ENERGIES_DATASET], dtype=np.float64)
         if QP_ROT_OCCUPATIONS_DATASET in payload:
             f.create_dataset(
                 QP_ROT_OCCUPATIONS_DATASET,
@@ -478,6 +516,8 @@ def write_qp_rotations_h5(
             f.create_dataset(SYM_IDX_DATASET,
                              data=np.asarray(sym_idx_k, dtype=np.int32))
             moved = tuple(QP_ROT_K_DATASETS)
+            if QP_ROT_FULL_ENERGIES_DATASET in payload:
+                moved += (QP_ROT_FULL_ENERGIES_DATASET,)
             if QP_ROT_OCCUPATIONS_DATASET in payload:
                 moved += (QP_ROT_OCCUPATIONS_DATASET,)
             for name in moved:
