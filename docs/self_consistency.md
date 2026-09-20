@@ -49,6 +49,25 @@ Z-factor enters the iteration; `eqp1` is written as the BerkeleyGW-style
 linearized output only. After convergence `eqp1` and `eqp0` agree to about
 1 meV, which is a cheap check that the fixed point is real.
 
+### Final QP artifacts and occupations
+
+After the accepted final map, `dump_qp_wfn_artifacts` assembles the complete
+published energy ladder: the diagonalised active block plus any energy-only
+scissored tail.  A metallic run performs one final fixed-N solve on that
+ladder.  The resulting occupation table, chemical potential, smearing
+family/width, electron target and table hash are written into both the
+optional `WFN_qp.h5` and the always-written `qp_wfn_rotations.h5` companion.
+Reconstructing a QP WFN through `postprocess.rotate_wfn_to_qp` selects this
+stored table onto the source WFN file wedge and passes it to the same WFN
+writer; it does not solve the occupations again.  Legacy, insulating, and
+one-shot rotation companions can omit the table and retain their historical
+band-index occupation behavior.
+
+These terminal files are output artifacts, not map checkpoints.  The small
+per-map `eqp0_iterNNNN.dat`, `eqp1_iterNNNN.dat`, and rotation snapshots do
+not contain the full accelerator state, response, or accepted occupation
+record needed to resume a self-consistent iteration.
+
 ## Production requirements (owner rulings, 2026-09-03 evening)
 
 The deck below is the *diagnostic* deck the convergence study used. It is

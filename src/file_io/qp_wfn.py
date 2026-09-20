@@ -83,6 +83,11 @@ QP_ROTATIONS_K_STORAGE = ("auto", "full", "ibz")
 #: a star holds the same matrix (or the same energies) as its parent.
 QP_ROT_K_DATASETS = ("U_mnk", "E_qp_nk_hartree", "E_qp_nk_rydberg")
 
+#: Optional final fixed-N occupation table carried by an SC companion.  It
+#: has the same full-BZ k axis as U/E but spans the complete logical band
+#: ladder.  Legacy and one-shot companions legitimately omit it.
+QP_ROT_OCCUPATIONS_DATASET = "occupations_kn"
+
 #: ``kpoints_crys`` and ``kirr_to_kfull`` STAY ON THE FULL BZ, always, and
 #: that is not an oversight.
 #:
@@ -259,6 +264,8 @@ def write_qp_rotations_h5(
     qp_solver=None,
     qp_energy_definition=None,
     sigma_eval_provenance=None,
+    occupations_kn: np.ndarray = None,
+    occupation_state=None,
 ):
     """Write QP rotation matrices and eigenvalues to HDF5 file.
     
@@ -292,6 +299,10 @@ def write_qp_rotations_h5(
         qp_solver, qp_energy_definition, sigma_eval_provenance: optional,
                all-or-none run provenance for the stored E/U pair.  Legacy
                callers may omit all three; absence means unverifiable.
+        occupations_kn, occupation_state: optional, all-or-none final SC
+               occupations on the full BZ and the accepted state that owns
+               their fixed-N provenance.  This reuses the caller's completed
+               solve; the artifact writer never derives occupations.
 
     For postprocessing WFN.h5 → WFN_qp.h5:
         1. Load WFN.h5 coefficients for bands [band_start:band_stop]
@@ -300,8 +311,9 @@ def write_qp_rotations_h5(
         3. Replace eigenvalues with E_qp_nk (convert to Rydberg if needed)
         4. Write rotated coefficients back to WFN_qp.h5
 
-    WHAT MOVES AND WHAT DOES NOT.  Only :data:`QP_ROT_K_DATASETS` is
-    reduced.  :data:`QP_ROT_FULL_BZ_DATASETS` — ``kpoints_crys`` and
+    WHAT MOVES AND WHAT DOES NOT.  :data:`QP_ROT_K_DATASETS` and the
+    optional occupation table are reduced.  :data:`QP_ROT_FULL_BZ_DATASETS`
+    — ``kpoints_crys`` and
     ``kirr_to_kfull`` — stay on the full BZ and keep their exact old
     values and meaning, because the unfold is a GATHER and k is the one
     quantity in this file the symmetry operation changes.  So a consumer
@@ -312,6 +324,11 @@ def write_qp_rotations_h5(
         qp_solver=qp_solver,
         qp_energy_definition=qp_energy_definition,
         sigma_eval_provenance=sigma_eval_provenance)
+    if (occupations_kn is None) != (occupation_state is None):
+        raise ValueError(
+            "write_qp_rotations_h5: occupations_kn and occupation_state "
+            "must be supplied together.")
+    occupation_provenance = _qp_occupation_attrs(occupation_state)
     if k_storage not in QP_ROTATIONS_K_STORAGE:
         raise ValueError(
             f"write_qp_rotations_h5: k_storage={k_storage!r} is none of "
@@ -336,6 +353,25 @@ def write_qp_rotations_h5(
         "E_qp_nk_hartree": np.asarray(E_qp_nk),
         "E_qp_nk_rydberg": np.asarray(E_qp_nk) * 2.0,
     }
+    if occupations_kn is not None:
+        occupations = np.asarray(occupations_kn, dtype=np.float64)
+        if occupations.ndim != 2 or occupations.shape[0] != U_mnk.shape[0]:
+            raise ValueError(
+                "write_qp_rotations_h5: occupations_kn must have shape "
+                f"(nk={U_mnk.shape[0]}, nb), got {occupations.shape}.")
+        if occupations.shape[1] < int(band_stop):
+            raise ValueError(
+                "write_qp_rotations_h5: occupations_kn does not cover the "
+                f"stored band range [0, {band_stop}); got {occupations.shape}.")
+        if not np.all(np.isfinite(occupations)):
+            raise ValueError(
+                "write_qp_rotations_h5: occupations_kn must be finite.")
+        state_table = np.asarray(occupation_state.f_kn, dtype=np.float64)
+        if not np.array_equal(occupations, state_table):
+            raise ValueError(
+                "write_qp_rotations_h5: occupations_kn is not the exact "
+                "table bound by occupation_state.")
+        payload[QP_ROT_OCCUPATIONS_DATASET] = occupations
     stored = K_STORAGE_FULL
     kirr_full_bz = (None if kirr_to_kfull is None
                     else np.asarray(kirr_to_kfull, dtype=np.int32))
@@ -415,6 +451,10 @@ def write_qp_rotations_h5(
         f.create_dataset('U_mnk', data=payload["U_mnk"], dtype=np.complex128)
         f.create_dataset('E_qp_nk_hartree', data=payload["E_qp_nk_hartree"], dtype=np.float64)
         f.create_dataset('E_qp_nk_rydberg', data=payload["E_qp_nk_rydberg"], dtype=np.float64)  # Also save in Ry
+        if QP_ROT_OCCUPATIONS_DATASET in payload:
+            f.create_dataset(
+                QP_ROT_OCCUPATIONS_DATASET,
+                data=payload[QP_ROT_OCCUPATIONS_DATASET], dtype=np.float64)
 
         # Metadata
         f.create_dataset('band_range', data=np.array([band_start, band_stop], dtype=np.int32))
@@ -437,7 +477,10 @@ def write_qp_rotations_h5(
                              data=np.asarray(irr_idx_k, dtype=np.int32))
             f.create_dataset(SYM_IDX_DATASET,
                              data=np.asarray(sym_idx_k, dtype=np.int32))
-            for name in QP_ROT_K_DATASETS:
+            moved = tuple(QP_ROT_K_DATASETS)
+            if QP_ROT_OCCUPATIONS_DATASET in payload:
+                moved += (QP_ROT_OCCUPATIONS_DATASET,)
+            for name in moved:
                 d = f[name]
                 d.attrs[K_STORAGE_ATTR] = K_STORAGE_IBZ
                 d.attrs[K_STORAGE_VERSION_ATTR] = K_STORAGE_VERSION
@@ -453,6 +496,8 @@ def write_qp_rotations_h5(
         f.attrs['energy_units'] = 'E_qp_nk_hartree in Hartree, E_qp_nk_rydberg in Rydberg'
         f.attrs['band_convention'] = '0-based indexing; bands [band_start, band_stop) were computed'
         for name, value in provenance.items():
+            f.attrs[name] = value
+        for name, value in occupation_provenance.items():
             f.attrs[name] = value
         f.attrs[QP_ROT_WFN_FINGERPRINT_SCHEME_ATTR] = source_wfn_scheme
         f.attrs[QP_ROT_WFN_FINGERPRINT_ATTR] = source_wfn_fingerprint
