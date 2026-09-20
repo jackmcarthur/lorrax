@@ -23,6 +23,7 @@ def test_small_qp_artifact_preserves_accepted_hamiltonian(
     points = np.zeros((1, 3))
     sym = SimpleNamespace(
         unfolded_kpts=points, kirr_fullids=np.array([0]),
+        nk_red=1,
         irr_idx_k=np.array([0]), sym_idx_k=np.array([0]),
         sym_mats_k=np.stack([np.eye(3), -np.eye(3)]))
     wfn = SimpleNamespace(
@@ -76,37 +77,49 @@ def test_sc_driver_publishes_small_artifact_outside_full_wfn_guard():
 
 def test_metal_qp_wfn_occupations_follow_the_final_full_ladder(
         tmp_path, monkeypatch):
-    """A k-dependent Fermi crossing must survive final WFN publication."""
+    """Direct and compact publication must carry one full E/f state."""
     from gw.efermi import OccupationState, assert_fixed_n
+    from gw.scissor import ScissorFit
     import symmetry_maps
 
-    energies = np.array([
+    active_energies = np.array([
+        [-1.0, -0.9, -0.8],
+        [-1.0, 0.1, 0.2],
+    ], dtype=np.float64)
+    dft_energies = np.array([
         [-1.0, -0.9, -0.8, 1.0],
         [-1.0, 0.1, 0.2, 0.3],
     ], dtype=np.float64)
-    rotations = np.broadcast_to(np.eye(4), (2, 4, 4)).copy()
-    h = np.array([np.diag(row) for row in energies], dtype=np.complex128)
+    rotations = np.broadcast_to(np.eye(3), (2, 3, 3)).copy()
+    h = np.array(
+        [np.diag(row) for row in active_energies], dtype=np.complex128)
     carried = OccupationState(
         f_kn=np.array([[1.0, 1.0, 0.0, 0.0],
                        [1.0, 1.0, 0.0, 0.0]]),
         mu_ry=0.0, smearing_family="fd", smearing_width_ry=0.02,
         n_electrons=4.0)
+    tail_fit = ScissorFit(
+        alpha_v=-9.0, beta_v_ev=123.0,
+        alpha_c=1.0, beta_c_ev=0.75,
+        n_fit_v=2, n_fit_c=2, rmse_v_ev=0.0, rmse_c_ev=0.0,
+        w_fit_v=2.0, w_fit_c=2.0)
     state = SimpleNamespace(
-        H_qp_dft=h, occupation_state=carried, outputs=None)
+        H_qp_dft=h, occupation_state=carried,
+        outputs=SimpleNamespace(tail_scissor_fit=tail_fit))
     points = np.zeros((2, 3))
     sym = SimpleNamespace(
         unfolded_kpts=points, kirr_fullids=np.array([0, 1]),
         irr_idx_k=np.array([0, 1]), sym_idx_k=np.array([0, 0]),
         sym_mats_k=np.stack([np.eye(3), -np.eye(3)]))
     wfn = SimpleNamespace(
-        energies=np.array([energies]), kpoints=points,
+        energies=np.array([dft_energies]), kpoints=points,
         kweights=np.array([0.5, 0.5]),
         nelec=2, num_electrons=4.0, nspinor=1, nbands=4, nkpts=2,
         path=None, occupation_state_capacity=2.0, symmetry=lambda: sym)
 
     monkeypatch.setattr(
         sc_iteration, "_diagonalize_and_get_efermi",
-        lambda *_args: (energies, rotations, 0.0))
+        lambda *_args: (active_energies, rotations, 0.0))
     monkeypatch.setattr(
         symmetry_maps, "unfold_file_wedge_to_full_bz",
         lambda _sym, table: np.asarray(table))
@@ -120,7 +133,7 @@ def test_metal_qp_wfn_occupations_follow_the_final_full_ladder(
 
     _, qp_path, mu_ry, _ = sc_iteration.dump_qp_wfn_artifacts(
         state, n_occ=2, mesh_xy=None, wfn=wfn, sym=sym,
-        band_slices=SimpleNamespace(b0=0, b3=4),
+        band_slices=SimpleNamespace(b0=0, b3=3),
         logical_band_stop=4, kgrid=(2, 1, 1), output_dir=str(tmp_path),
         write_wfn_h5=True, print_fn=lambda *_a: None)
 
@@ -135,6 +148,12 @@ def test_metal_qp_wfn_occupations_follow_the_final_full_ladder(
     assert_fixed_n(final_state, np.array([0.5, 0.5]), state_capacity=2.0)
 
     artifact = restart_bundle.read_qp_rotations_artifact(qp_path)
+    direct_final_energies = np.asarray(calls[0]["enk_full_base_ry"]).copy()
+    direct_final_energies[:, :3] = calls[0]["enk_active_qp_ry"]
+    assert not np.array_equal(direct_final_energies[:, 3:],
+                              dft_energies[:, 3:])
+    np.testing.assert_array_equal(
+        artifact["E_full_nk_rydberg"], direct_final_energies)
     np.testing.assert_array_equal(
         artifact["occupations_kn"], np.asarray(final_state.f_kn))
     assert artifact["occupation_provenance"] == {
@@ -145,8 +164,13 @@ def test_metal_qp_wfn_occupations_follow_the_final_full_ladder(
         "n_electrons": final_state.n_electrons,
     }
 
-    from postprocess.rotate_wfn_to_qp import _stored_occupation_args
-    rebuilt = _stored_occupation_args(artifact, np.array([1, 0]))
+    from postprocess.rotate_wfn_to_qp import _stored_final_state_args
+    rebuilt = _stored_final_state_args(artifact, np.array([1, 0]))
+    companion_final_energies = rebuilt["enk_full_base_ry"].copy()
+    companion_final_energies[:, :3] = artifact[
+        "E_qp_nk_rydberg"][[1, 0]]
+    np.testing.assert_array_equal(
+        companion_final_energies, direct_final_energies[[1, 0]])
     np.testing.assert_array_equal(
         rebuilt["occupations_kn"], np.asarray(final_state.f_kn)[[1, 0]])
     assert rebuilt["occupation_state"].occ_hash == final_state.occ_hash

@@ -57,11 +57,12 @@ scissored tail.  A metallic run performs one final fixed-N solve on that
 ladder.  The resulting occupation table, chemical potential, smearing
 family/width, electron target and table hash are written into both the
 optional `WFN_qp.h5` and the always-written `qp_wfn_rotations.h5` companion.
-Reconstructing a QP WFN through `postprocess.rotate_wfn_to_qp` selects this
-stored table onto the source WFN file wedge and passes it to the same WFN
-writer; it does not solve the occupations again.  Legacy, insulating, and
-one-shot rotation companions can omit the table and retain their historical
-band-index occupation behavior.
+The companion also stores that complete final energy ladder, including the
+inactive scissored tail. Reconstructing a QP WFN through
+`postprocess.rotate_wfn_to_qp` selects the stored ladder and table onto the
+source WFN file wedge and passes both to the same WFN writer; it neither
+rebuilds the tail from DFT nor solves the occupations again. Legacy rotation
+companions can omit both additions and retain their historical behavior.
 
 These terminal files are output artifacts, not map checkpoints.  The small
 per-map `eqp0_iterNNNN.dat`, `eqp1_iterNNNN.dat`, and rotation snapshots do
