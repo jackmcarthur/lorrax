@@ -251,7 +251,7 @@ def _ns_with(base, **over):
     return SimpleNamespace(**{**vars(base), **over})
 
 
-def _written_ifmax_and_occ(tmp_path, crystal, fname):
+def _written_ifmax_and_occ(tmp_path, crystal, fname, *, occupations=None):
     """Write a header-only Γ WFN through the writer; return (ifmax, occ[k=0])."""
     import h5py
 
@@ -261,7 +261,7 @@ def _written_ifmax_and_occ(tmp_path, crystal, fname):
     gk = select_gvecs_for_k(kpoints[0], G_master, crystal.bdot,
                             crystal.ecutwfc)[0]
     w = WFNWriter(str(path), crystal, kpoints, np.ones(1), (1, 1, 1),
-                  NBANDS, [gk], nosym=True)
+                  NBANDS, [gk], occupations=occupations, nosym=True)
     w.close()
     with h5py.File(str(path), "r") as f:
         return (int(f["mf_header/kpoints/ifmax"][0, 0]),
@@ -280,6 +280,16 @@ def test_crystal_shaped_nelec_keeps_todays_ifmax_at_both_spinor_counts(tmp_path)
         assert np.array_equal(
             occ, [1.0] * want + [0.0] * (NBANDS - want)), (
             f"nspinor={nspinor}: occ row disagrees with ifmax={want}")
+
+
+def test_explicit_fractional_occupations_survive_the_wfn_format_owner(tmp_path):
+    """A metallic QP WFN must not be replaced by the nominal ifmax step."""
+    crystal = _cubic_crystal()
+    occupations = np.array([[1.0, 0.82, 0.18, 0.0]], dtype=np.float64)
+    ifmax, written = _written_ifmax_and_occ(
+        tmp_path, crystal, "WFN_fractional.h5", occupations=occupations)
+    assert ifmax == 2  # nominal band boundary remains header provenance
+    np.testing.assert_array_equal(written, occupations[0])
 
 
 def test_loader_shaped_input_is_not_double_halved_at_nspinor1(tmp_path):
