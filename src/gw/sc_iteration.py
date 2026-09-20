@@ -4536,6 +4536,62 @@ def _sc_map_gain_for_call(
     return diagnostic, current
 
 
+_SC_MAP_WALLS: list[float] = []
+
+
+def _process_memory_receipt() -> str:
+    """Per-map host-memory receipt for the SC loop.
+
+    ``VmLck`` is the process's locked (pinned) page total — every
+    ``cudaMallocHost`` staging buffer in the phdf5 FFI is locked, so a ctx
+    leak or a grow-only staging buffer shows up here as a per-map rise;
+    ``VmRSS``/``VmHWM`` catch ordinary heap growth, and the open-descriptor
+    count catches an HDF5 handle that a map never closed.  Reads
+    /proc/self/status, so it costs nothing on any platform with procfs
+    (pinned-memory audit 2026-09-20: a 2 MiB ``cudaMallocHost`` failed on map
+    6 of 14c while RSS was 10.4 GiB — pinned-pool exhaustion, not host RAM).
+    """
+    import os
+    fields = {}
+    try:
+        with open("/proc/self/status", "r") as handle:
+            for line in handle:
+                key, _, rest = line.partition(":")
+                if key in ("VmLck", "VmRSS", "VmHWM", "VmSize"):
+                    fields[key] = rest.strip()
+        nfd = len(os.listdir("/proc/self/fd"))
+    except OSError:
+        return "unavailable (no procfs)"
+    return (f"VmLck={fields.get('VmLck', '?')} VmRSS={fields.get('VmRSS', '?')} "
+            f"VmHWM={fields.get('VmHWM', '?')} open_fds={nfd}")
+
+
+def _sc_map_wall_gate(*, watchdog_floor_s: float = 1800.0,
+                      factor: float = 4.0) -> str | None:
+    """Name a stalled map instead of letting it eat the allocation wall.
+
+    Returns a GATE string when this map's wall exceeds ``factor`` times the
+    median wall of the completed maps (and the floor), else None.  Measured
+    failure this guards: 14c ran maps 0-5 every 15.8 min, then map 6 produced
+    no artifact for 6 h 23 m until the 8-hour allocation wall.
+    """
+    import time
+    _SC_MAP_WALLS.append(time.monotonic())
+    if len(_SC_MAP_WALLS) < 4:
+        return None
+    prior = _SC_MAP_WALLS[1:-1]
+    if not prior:
+        return None
+    median = (prior[-1] - _SC_MAP_WALLS[0]) / max(1, len(prior))
+    this = _SC_MAP_WALLS[-1] - _SC_MAP_WALLS[-2]
+    if median > 0 and this > max(watchdog_floor_s, factor * median):
+        return (f"GATE sc_map_wall_watchdog: map wall {this:.0f} s exceeds "
+                f"{factor:.1f} x the {median:.0f} s median of the completed "
+                "maps; a stalled map no longer consumes the allocation wall "
+                "(pinned-memory/ctx-lifetime audit 2026-09-20)")
+    return None
+
+
 def _write_sc_eqp_snapshot(
     inputs: SCInputs,
     state_out: SCState,
@@ -4811,6 +4867,11 @@ def _write_sc_eqp_snapshot(
         f"active={band_offset + 1}-{band_offset + e_output.shape[1]} "
         f"protected={_band_ranges(protected, band_offset=band_offset)} "
         f"in_range={_band_ranges(in_range, band_offset=band_offset)}")
+    _record_sc(inputs, f"    SC memory: {_process_memory_receipt()}")
+    _wall_gate = _sc_map_wall_gate()
+    if _wall_gate is not None:
+        _record_sc(inputs, "  " + _wall_gate)
+        raise RuntimeError(_wall_gate)
     return path
 
 
