@@ -15,8 +15,26 @@ Usage:
 
 import argparse
 import os
+from types import SimpleNamespace
 import numpy as np
 from file_io.restart_bundle import read_kirr_to_kfull
+
+
+def _stored_occupation_args(artifact, kirr_to_kfull):
+    """Select a companion's accepted table onto the source WFN wedge."""
+    provenance = artifact["occupation_provenance"]
+    if provenance is None:
+        return {}
+    occupations_full = np.asarray(artifact["occupations_kn"], dtype=np.float64)
+    return {
+        "occupations_kn": np.asarray(
+            occupations_full[kirr_to_kfull], dtype=np.float64),
+        # ``write_qp_wfn_h5`` intentionally accepts this record by protocol:
+        # file_io must not import the GW occupation solver merely to transport
+        # a completed solve's provenance.
+        "occupation_state": SimpleNamespace(
+            f_kn=occupations_full, **provenance),
+    }
 
 
 
@@ -53,12 +71,17 @@ def rotate_wfn_coefficients(wfn_file, rot_file, output_file, verbose=True):
             artifact["U_mnk"][kirr_to_kfull], dtype=np.complex128)
         E_wedge_ry = np.asarray(
             artifact["E_qp_nk_rydberg"][kirr_to_kfull], dtype=np.float64)
+        occupation_kwargs = _stored_occupation_args(
+            artifact, kirr_to_kfull)
         if verbose:
             print(f"Rotation file: {rot_file}")
             print(f"  Full-BZ U shape: {artifact['U_mnk'].shape}")
             print(f"  WFN wedge rows: {len(kirr_to_kfull)}")
             print(f"  Band range: [{band_start}, {band_stop})")
             print(f"  K-grid: {artifact_kgrid.tolist()}")
+            if occupation_kwargs:
+                print("  Occupations: stored final fixed-N table "
+                      f"({artifact['occupation_provenance']['occ_hash']})")
 
         write_qp_wfn_h5(
             output_file,
@@ -67,6 +90,7 @@ def rotate_wfn_coefficients(wfn_file, rot_file, output_file, verbose=True):
             enk_active_qp_ry=E_wedge_ry,
             band_start=band_start,
             band_stop=band_stop,
+            **occupation_kwargs,
         )
 
     if verbose:

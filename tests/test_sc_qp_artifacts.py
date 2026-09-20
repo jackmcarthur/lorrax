@@ -118,7 +118,7 @@ def test_metal_qp_wfn_occupations_follow_the_final_full_ladder(
         qp_wfn, "write_qp_wfn_h5",
         lambda _path, **kwargs: calls.append(kwargs))
 
-    _, _, mu_ry, _ = sc_iteration.dump_qp_wfn_artifacts(
+    _, qp_path, mu_ry, _ = sc_iteration.dump_qp_wfn_artifacts(
         state, n_occ=2, mesh_xy=None, wfn=wfn, sym=sym,
         band_slices=SimpleNamespace(b0=0, b3=4),
         logical_band_stop=4, kgrid=(2, 1, 1), output_dir=str(tmp_path),
@@ -133,6 +133,30 @@ def test_metal_qp_wfn_occupations_follow_the_final_full_ladder(
     assert mu_ry == final_state.mu_ry
     assert final_state.occ_hash != carried.occ_hash
     assert_fixed_n(final_state, np.array([0.5, 0.5]), state_capacity=2.0)
+
+    artifact = restart_bundle.read_qp_rotations_artifact(qp_path)
+    np.testing.assert_array_equal(
+        artifact["occupations_kn"], np.asarray(final_state.f_kn))
+    assert artifact["occupation_provenance"] == {
+        "occ_hash": final_state.occ_hash,
+        "mu_ry": final_state.mu_ry,
+        "smearing_family": final_state.smearing_family,
+        "smearing_width_ry": final_state.smearing_width_ry,
+        "n_electrons": final_state.n_electrons,
+    }
+
+    from postprocess.rotate_wfn_to_qp import _stored_occupation_args
+    rebuilt = _stored_occupation_args(artifact, np.array([1, 0]))
+    np.testing.assert_array_equal(
+        rebuilt["occupations_kn"], np.asarray(final_state.f_kn)[[1, 0]])
+    assert rebuilt["occupation_state"].occ_hash == final_state.occ_hash
+
+    h5py = pytest.importorskip("h5py")
+    from file_io.qp_wfn import QP_WFN_OCC_HASH_ATTR
+    with h5py.File(qp_path, "a") as h5:
+        del h5.attrs[QP_WFN_OCC_HASH_ATTR]
+    with pytest.raises(ValueError, match="incomplete final occupation"):
+        restart_bundle.read_qp_rotations_artifact(qp_path)
 
 
 def test_driver_gap_uses_the_accepted_sc_spectrum(tmp_path):
