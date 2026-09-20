@@ -4542,14 +4542,18 @@ _SC_MAP_WALLS: list[float] = []
 def _process_memory_receipt() -> str:
     """Per-map host-memory receipt for the SC loop.
 
-    ``VmLck`` is the process's locked (pinned) page total — every
-    ``cudaMallocHost`` staging buffer in the phdf5 FFI is locked, so a ctx
-    leak or a grow-only staging buffer shows up here as a per-map rise;
-    ``VmRSS``/``VmHWM`` catch ordinary heap growth, and the open-descriptor
-    count catches an HDF5 handle that a map never closed.  Reads
-    /proc/self/status, so it costs nothing on any platform with procfs
-    (pinned-memory audit 2026-09-20: a 2 MiB ``cudaMallocHost`` failed on map
-    6 of 14c while RSS was 10.4 GiB — pinned-pool exhaustion, not host RAM).
+    The pinned evidence is the FFI's own accounting
+    (``live_ctxs``/``staging_kB`` from ``ffi.io.staging_totals``): a rising
+    ctx count is a ctx-lifetime leak, a flat count with rising bytes is
+    grow-only staging (the writer staging buffer reaches ~270 MB).  ``VmLck``
+    cannot serve that role — it counts mlock(2), and CUDA pinned
+    ``cudaMallocHost`` memory is driver-managed and reads 0 kB even in a
+    process certainly holding staging buffers (measured 2026-09-20), so it
+    stays only as a cross-check.  ``VmRSS``/``VmHWM`` bound ordinary heap
+    growth and the descriptor counts catch an HDF5 handle a map never
+    closed.  The measured failure this exists for: map 6 of run 14c failed a
+    2 MiB ``cudaMallocHost`` read-staging allocation while RSS was 10.4 GiB
+    of a 256 GiB node.
     """
     import os
     fields = {}
@@ -4577,8 +4581,18 @@ def _process_memory_receipt() -> str:
                 nh5 += 1
     except OSError:
         return "unavailable (no procfs)"
+    staged = "staging=unavailable"
+    try:
+        from ffi.io import staging_totals
+        totals = staging_totals()
+        if totals is not None:
+            staged = (f"live_ctxs={totals[0]} "
+                      f"staging_kB={totals[1] / 1024.0:.0f}")
+    except Exception as exc:  # a partial FFI build must not break the receipt
+        staged = f"staging=error:{type(exc).__name__}"
     return (f"VmLck={fields.get('VmLck', '?')} VmRSS={fields.get('VmRSS', '?')} "
-            f"VmHWM={fields.get('VmHWM', '?')} open_fds={nfd} open_h5={nh5}")
+            f"VmHWM={fields.get('VmHWM', '?')} open_fds={nfd} open_h5={nh5} "
+            f"{staged}")
 
 
 def _sc_map_wall_gate(*, watchdog_floor_s: float = 1800.0,

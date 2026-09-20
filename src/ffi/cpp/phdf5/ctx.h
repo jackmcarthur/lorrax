@@ -280,4 +280,27 @@ void register_live_ctx(PhdfCtx* ctx);
 bool unregister_live_ctx(PhdfCtx* ctx);
 bool ctx_is_live(const PhdfCtx* ctx, size_t* n_live);
 
+// Per-process staging totals over every live ctx: how many contexts are
+// open, and the bytes their ``cudaMallocHost`` buffers (writer staging +
+// synchronous-reader staging) currently hold.
+//
+// WHY THIS EXISTS.  Pinned host memory never appears in
+// /proc/self/status's VmLck — that field counts mlock(2) — so the per-map
+// memory receipt in the SC loop cannot see a pinned leak from procfs.
+// Measured 2026-09-20, map 6 of run 14c: ``cudaMallocHost`` failed for a
+// 2 MiB read-staging buffer while RSS was 10.4 GiB of a 256 GiB node and
+// VmLck read 0 kB.  These two numbers are the discriminator.  A rising ctx
+// count is a ctx-lifecycle leak; a flat count with rising bytes is
+// grow-only staging (the writer staging buffer reaches ~270 MB per
+// write_ffi.cc).
+//
+// The PhdfCtx* argument selects this leg's mangled name — the ABI-identity
+// rule the registry above exists for — and is otherwise unused, so a
+// caller with no open file may pass nullptr.
+//
+// Deliberately racy: the capacities are plain size_t fields the writer
+// thread may be growing under ``ensure_pinned`` while a reader samples
+// them.  A diagnostic readout may see a torn value; nothing refuses on it.
+bool staging_totals(const PhdfCtx* ctx, size_t* n_live, size_t* pinned_bytes);
+
 }  // namespace lorrax_ffi::phdf5

@@ -331,6 +331,26 @@ bool ctx_is_live(const PhdfCtx* ctx, size_t* n_live) {
     return ctx && s.count(ctx) != 0;
 }
 
+bool staging_totals(const PhdfCtx* /*ctx*/, size_t* n_live,
+                    size_t* pinned_bytes) {
+    // Holding the registry lock is what makes this safe to walk: close_ctx
+    // erases at the TOP of teardown, before any buffer is freed, so no ctx
+    // in the set can be destroyed while the lock is held.  Only the
+    // capacities themselves can move (the writer thread growing
+    // pinned_buf); see the header comment for why that race is accepted.
+    std::lock_guard<std::mutex> lk(live_ctx_mu());
+    const auto& s = live_ctx_set();
+    if (n_live) *n_live = s.size();
+    if (pinned_bytes) {
+        size_t total = 0;
+        for (const PhdfCtx* live : s) {
+            total += live->pinned_capacity + live->read_capacity;
+        }
+        *pinned_bytes = total;
+    }
+    return true;
+}
+
 // Undo a PARTIALLY built ctx.
 //
 // ``open_ctx`` allocates a PhdfCtx and then creates, in order, an MPI_Info,
