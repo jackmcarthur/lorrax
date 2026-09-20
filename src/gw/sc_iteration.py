@@ -918,8 +918,12 @@ def _solve_occupation_state(
                 "occ_smearing_width_ry (gw_config.validate_material_inputs); "
                 "why: a metal is never solved with the MP1 fallback.")
         family = "mp1"
+    # The energy-only conduction tail is an empty scissor subspace.
+    # Only the active ladder contributes to the fixed-N thermal solve.
+    nb_thermal = (min(nb_logical, int(inputs.band_slices.sigma.stop))
+                  if metal else nb_logical)
     mu_ry, occ_logical = solve_smearing_occupations(
-        energies[:, :nb_logical],
+        energies[:, :nb_thermal],
         kweights,
         target_electrons,
         width_ry,
@@ -929,7 +933,7 @@ def _solve_occupation_state(
     )
     occ_kn = jnp.pad(
         occ_logical,
-        ((0, 0), (0, nb_storage - nb_logical)),
+        ((0, 0), (0, nb_storage - nb_thermal)),
         mode="constant",
         constant_values=0.0,
     )
@@ -944,6 +948,28 @@ def _solve_occupation_state(
     # fixed-N invariant the logical solve does.
     assert_fixed_n(occ_state, kweights, state_capacity=capacity)
     return occ_state
+
+
+def _assert_empty_scissor_tail(energies, occupation_state, start, stop):
+    """Require the fixed-empty conduction tail to remain FD-saturated.
+
+    The tail contributes exactly zero electrons; its energies still enter G
+    and response denominators.  Moving it into the fractional manifold is
+    outside this approximation and must not silently promote protected bands.
+    """
+    if (occupation_state is None or occupation_state.smearing_family != "fd"
+            or start >= stop):
+        return
+    from .scissor import FRACTIONAL_TOL
+    tail = np.asarray(energies, dtype=np.float64)[:, start:stop]
+    lower = float(occupation_state.mu_ry) + float(
+        occupation_state.smearing_width_ry) * np.log(
+            (1.0 - FRACTIONAL_TOL) / FRACTIONAL_TOL)
+    if not np.all(np.isfinite(tail)) or float(np.min(tail)) < lower:
+        raise ValueError(
+            "GATE sc_empty_tail: scissored conduction states enter the "
+            "fractional-occupation manifold; enlarge the explicit QP space "
+            "in a new calculation. Protected identities are not promoted.")
 
 
 def _certified_seed_occupation_state(
@@ -988,9 +1014,11 @@ def _certified_seed_occupation_state(
             "certified MPA occupation replay needs the complete logical "
             f"energy ladder ({nb_logical} bands); got {tuple(energies.shape)}")
     if family == "fd":
-        occ_kn = fd_occupations(
-            energies[:, :nb_logical], float(stamps["mu_ry"]),
-            float(stamps["smearing_width_ry"]))
+        nb_thermal = min(nb_logical, int(inputs.band_slices.sigma.stop))
+        occ_kn = jnp.pad(fd_occupations(
+            energies[:, :nb_thermal], float(stamps["mu_ry"]),
+            float(stamps["smearing_width_ry"])),
+            ((0, 0), (0, nb_logical - nb_thermal)))
     else:
         occ_kn = mp1_occupations(
             energies[:, :nb_logical], float(stamps["mu_ry"]),
@@ -1037,6 +1065,8 @@ def _solve_head_occupations(
         # and therefore no Drude surface table to construct.
         return occ_state, None
     nb_logical = int(pt.nb_logical)
+    if inputs.material_class == "metal":
+        nb_logical = min(nb_logical, int(inputs.band_slices.sigma.stop))
     nb_storage = int(pt.velocity_dft_cart.shape[-1])
     nk = int(energies.shape[0])
     mu_ry = float(occ_state.mu_ry)
@@ -2892,19 +2922,11 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     # coincide, so the converged answer is unchanged.  Insulating decks
     # (occ_broadening = 0) return (None, None): bit-identical path.
     #
-    # SOLVED HERE, ABOVE THE TAIL SCISSOR, so that ONE occupation state
-    # serves the whole map call — including BOTH scissor fits, which now
-    # classify their val/cond/crossing bands from it.  The ladder handed
-    # over is the same one ``rotate_wavefunctions`` assembles for
-    # ``wfns_qp.enk`` (``wavefunction_bundle.py:616-619``): the DFT ladder
-    # with the active block replaced by this iteration's eigenvalues.  The
-    # only columns that can differ from the old spelling
-    # (``_solve_head_occupations(inputs, wfns_qp.enk)``, called after the
-    # rotation) are the sum-band tail ``[b3, b4_user)`` on iterations that
-    # ran the tail scissor — bands hundreds of eV above mu, where f is
-    # exactly 0 under either ladder.  Reading them from the tail scissor
-    # was also the circular half: the tail scissor's own band classes now
-    # come from this state.
+    # Solve before classifying the active bands for the tail fit.  The
+    # energy-only conduction tail has fixed zero occupation (owner ruling
+    # 2026-09-20), so its later scissor cannot change the electron count or
+    # mu.  The scissored ladder must still satisfy the empty-tail assumption
+    # before any physical consumer runs; no protected identity is promoted.
     # Replicated, like the bundle's own enk (``rotate_wavefunctions``
     # constrains it to ``P(None, None)`` right after the same update), so
     # the host-side MP1 solve cannot meet an array that spans
@@ -3173,6 +3195,9 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     bundle_efermi = None if metal_occ_state is not None else float(efermi_ry)
     bundle_occupations = (None if metal_occ_state is None
                           else metal_occ_state.f_kn)
+    _assert_empty_scissor_tail(
+        enk_entry if enk_base is None else enk_base,
+        metal_occ_state, tail_start, logical_stop)
     wfns_qp = rotate_wavefunctions(
         inputs.wfns_dft, U_full,
         enk_active_new=E_full, enk_base=enk_base,
@@ -6856,7 +6881,8 @@ def dump_qp_wfn_artifacts(
             float(st.smearing_width_ry),
             family=str(st.smearing_family),
             state_capacity=float(spin_degeneracy_factor(wfn)),
-            logical_nband=int(logical_band_stop),
+            logical_nband=(int(band_slices.b3) if str(st.smearing_family) == "fd"
+                           else int(logical_band_stop)),
             clamp_tol=float(clamp_tol),
         )
         final_occ_state = OccupationState(
@@ -6866,6 +6892,9 @@ def dump_qp_wfn_artifacts(
             smearing_width_ry=float(st.smearing_width_ry),
             n_electrons=float(st.n_electrons),
         )
+        _assert_empty_scissor_tail(
+            final_energies_full_ry, final_occ_state,
+            int(band_slices.b3), int(logical_band_stop))
         assert_fixed_n(
             final_occ_state, weights_full,
             state_capacity=float(spin_degeneracy_factor(wfn)))

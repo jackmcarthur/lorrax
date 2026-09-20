@@ -644,3 +644,16 @@ projector change. `shared_pole_conjugate_directions.py` and
 `shared_pole_support_gauge.py` are planted algebra probes for conjugate-port
 closure and support-basis covariance, respectively. They are diagnostic
 counterexamples, not GW accuracy or convergence certificates.
+
+### Empty energy-only conduction tail (owner ruling 2026-09-20)
+
+On metallic SC maps, bands above the explicit QP matrix and below the logical
+sum-band top have exact-zero occupations. They still contribute as empty
+states to G and response with their current scissored energies. The active
+ladder alone determines the fixed-N chemical potential; the same rule is used
+for final artifacts. Active protected and scissored bands retain their existing
+Fermi-Dirac occupations and identity policy. Before response construction, the
+energy-only tail must remain empty at the existing `FRACTIONAL_TOL` criterion;
+entry into the fractional manifold refuses without promoting protected bands.
+This is an explicit empty-tail approximation, not a claim of exact thermal
+occupations on all stored bands.
