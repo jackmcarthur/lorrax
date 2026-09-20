@@ -275,12 +275,20 @@ def _refuse_poles_beyond_horizon(frequencies, horizon_ry2):
 
     MEASURED 2026-09-20, run 14c (first bispinor SC, Fe): the CT-C sector's
     largest live pole sat at 24463 Ry = 333 keV = 15400x the model's
-    sampling band and carried 47.5% of that sector's factor weight, while
-    its position wandered 241..24463 Ry over six maps.  ``pole_tail`` boxes
-    reached 339548 eV / 24960 Ry, the frozen-map policy rebuilt 7 windows
-    per map, and the loop never converged.  Every pole in every measured
-    charge-only (diagonal-sector) model stayed within 25x the band, so this
-    bound separates the two without clamping either.
+    sampling band, while its position wandered 241..24463 Ry over six maps.
+    ``pole_tail`` boxes reached 339548 eV / 24960 Ry, the frozen-map policy
+    rebuilt 7 windows per map, and the loop never converged.  Every pole in
+    every measured charge-only (diagonal-sector) model stayed within 25x the
+    band, so this bound separates the two without clamping either.
+
+    THE ARTIFACT'S PHYSICAL WEIGHT IS NEGLIGIBLE — MEASURED, NOT ASSUMED:
+    in the model's own currency (|c|^2, the one the dropped-weight budget
+    counts) the 24463 Ry pole carries 1.9e-8 of its sector at q=9, and every
+    pole above 20 Ry together carries 1.9e-7 — inside the existing
+    ``max_dropped_weight_fraction`` = 1e-6 budget.  So the model-side repair
+    is to zero those amplitudes under that budget, not to clamp physics; this
+    gate is the invariant that catches a route which would instead size a
+    quadrature box by them.
     """
     if horizon_ry2 is None:
         return

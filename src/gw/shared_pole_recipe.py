@@ -95,11 +95,15 @@ _GATE_ROWS = {
 #: whose validation tolerance is 1e-4.
 #:
 #: MEASURED 2026-09-20, run 14c (Fe bispinor, first bispinor SC map): the
-#: CT-C sector's largest live pole sat at 24463 Ry = 15400x the band and
-#: carried 47.5% of that sector's factor weight; the position wandered
-#: 241..24463 Ry over six maps, the Sigma planner spanned 24960 Ry boxes,
-#: and the loop diverged.  Every pole of every measured charge-only
-#: (diagonal) model stayed within 25x the band.
+#: CT-C sector's largest live pole sat at 24463 Ry = 15400x the band, its
+#: position wandered 241..24463 Ry over six maps, the Sigma planner spanned
+#: 24960 Ry boxes, and the loop diverged.  In the model's own currency
+#: (|c|^2) that pole carries 1.9e-8 of its sector and everything above 20 Ry
+#: carries 1.9e-7, inside the 1e-6 dropped-weight budget -- so the repair is
+#: to zero those amplitudes under that budget, and this horizon is the
+#: invariant that refuses a route which would size a box by them instead.
+#: Every pole of every measured charge-only (diagonal) model stayed within
+#: 25x the band.
 _POLE_HORIZON_PLASMA_FACTOR = 100.0
 shared_real_pole_gates_v1_r3b = {
     name: {"name": name, "predicate": predicate, "threshold": threshold,

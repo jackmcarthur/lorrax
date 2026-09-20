@@ -444,11 +444,12 @@ def test_live_pole_outside_the_sampled_band_refuses():
     """The 14c CT-C artifact: 24463.5677 Ry = 15400x the plasma band.
 
     Measured census, run 14c map 0 q=9: the CT-C sector's largest live pole
-    was 24463.5677 Ry and carried 47.5% of that sector's factor weight,
-    while every charge-only diagonal model stayed at or below 39.3 Ry
-    against the same horizon.  The planner sizes a ``pole_tail`` box by the
-    farthest live pole, so the artifact became a 24960 Ry box; this refuses
-    by name instead.
+    was 24463.5677 Ry and carried 1.9e-8 of that sector's |c|^2 weight (all
+    poles above 20 Ry together: 1.9e-7, inside the 1e-6 dropped-weight
+    budget), while every charge-only diagonal model stayed at or below
+    39.3 Ry against the same horizon.  The planner sizes a ``pole_tail`` box
+    by the farthest live pole, so the artifact became a 24960 Ry box; this
+    refuses by name instead until the amplitudes are zeroed under budget.
     """
     band_ry = 1.587  # plasma-scale sampling band, Fe 4x4x4 census
     horizon = (100.0 * band_ry) ** 2
