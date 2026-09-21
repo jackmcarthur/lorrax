@@ -3544,6 +3544,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             wfn=inputs.wfn,
             meta=inputs.meta,
             config=inputs.config,
+            trs_allowed=bool(inputs.sym.trs_allowed),
             # Y and Z are built directly from the two centroid-sharded
             # wavefunction copies.  Their band-pair tiles are distributed
             # over the full Px*Py mesh and frequency-blocked in each ring.
@@ -3590,7 +3591,8 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             iteration_head_response = build_dft_head_response(
                 inputs.wfns_dft, np.asarray(head_omegas, dtype=np.complex128),
                 input_dir=inputs.input_dir, mesh=inputs.mesh_xy, wfn=inputs.wfn,
-                meta=inputs.meta, config=inputs.config)
+                meta=inputs.meta, config=inputs.config,
+                trs_allowed=bool(inputs.sym.trs_allowed))
         # The frozen response is the DFT direct response; its Sigma-side
         # ladder (energies, occupations, reference) is the DFT one, a step by
         # band index.  On a metal every head consumer (the static terms here,
@@ -6289,7 +6291,7 @@ def run_sc_driver(
         fixed_dft_head_response = build_dft_head_response(
             wfns, np.asarray(fixed_head_omegas, dtype=np.complex128),
             input_dir=input_dir, mesh=mesh_xy, wfn=wfn, meta=meta,
-            config=config)
+            config=config, trs_allowed=bool(sym.trs_allowed))
         print_fn(
             "  SC head: cached fixed DFT direct response and wings for "
             f"{len(fixed_head_omegas)} frequency sample(s); each map folds "

@@ -966,7 +966,7 @@ def _interband_degenerate_weight(
 
 
 def _head_wing_interband_weight(
-    dE, f_diff, z, prefactor, transition,
+    dE, f_diff, z, prefactor, transition, *, ordered=False,
 ):
     r"""Adler--Wiser mixed head/body weight in the ``P=-dE*D`` basis.
 
@@ -976,7 +976,29 @@ def _head_wing_interband_weight(
     intraband surface term is not a ``D -> P`` substitution and remains the
     separate positive ``pref_surface*surface_weight/z`` contribution in the
     two kernels.
+
+    ``ordered=False`` is the time-reversal-even form: energy-ordered pairs
+    ``dE > 0`` with weight ``-prefactor (f_j - f_i)/(z^2 - dE^2)``.  It is
+    exact when the full-BZ sum pairs ``k`` with ``-k`` (``psi_{-k} = T psi_k``
+    gives ``X_ij(-k) = -conj X_ij(k)`` for the vertex
+    ``X = conj(v_ij) rho_ij``), which cancels the magnetisation-odd part
+    ``sum_k Re X``.  ``ordered=True`` is the form for a measured broken time
+    reversal: the complete Lehmann sum over ordered pairs of BOTH signs of
+    ``dE`` with the resonant weight ``-(prefactor/2) (f_j - f_i)/(dE (z - dE))``.
+    Pairing ``(i, j)`` with ``(j, i)`` at one ``k`` gives
+    ``-(prefactor/2)(f_j - f_i)[(z/dE) 2 Re X + 2i Im X]/(z^2 - dE^2)``: the
+    even form applies weight 1 where ``z/dE`` belongs, so it is wrong exactly
+    on the odd channel that survives without time reversal.  With time
+    reversal the two forms agree to rounding
+    (``tests/test_shared_pole_head_ordered.py``).
     """
+    if ordered:
+        denom = dE * (z - dE)
+        return jnp.where(
+            transition & (jnp.abs(denom) > 1.0e-16),
+            -0.5 * prefactor * f_diff / denom,
+            jnp.asarray(0.0 + 0.0j, dtype=jnp.complex128),
+        )
     denom = z * z - dE * dE
     return jnp.where(
         transition & (jnp.abs(denom) > 1.0e-16),
@@ -1099,12 +1121,14 @@ def _head_wing_kernel(
     nb_logical: int,
     include_surface: bool,
     layout: str = "face",
+    ordered: bool = False,
 ) -> Callable:
     """Build the canonical face head-wing kernel with bounded centroid tiles."""
     if layout not in ("face", "axis"):
         raise ValueError(f"_head_wing_kernel requires face or axis layout, got {layout!r}")
     return _head_wing_kernel_face(
-        mesh, nb_logical=int(nb_logical), include_surface=bool(include_surface), layout=layout)
+        mesh, nb_logical=int(nb_logical), include_surface=bool(include_surface), layout=layout,
+        ordered=bool(ordered))
 
 
 def _head_wing_kernel_face(
@@ -1113,9 +1137,16 @@ def _head_wing_kernel_face(
     nb_logical: int,
     include_surface: bool,
     layout="face",
+    ordered: bool = False,
 ) -> Callable:
-    """Contract velocity and density vertices in bounded centroid and frequency tiles."""
-    key = ("head_wings_face", id(mesh), int(nb_logical), bool(include_surface), layout)
+    """Contract velocity and density vertices in bounded centroid and frequency tiles.
+
+    ``ordered`` selects the complete signed Lehmann sum of
+    :func:`_head_wing_interband_weight` (both signs of ``dE``) for a
+    measured broken time reversal.
+    """
+    key = ("head_wings_face", id(mesh), int(nb_logical), bool(include_surface), layout,
+           bool(ordered))
     hit = _KERNEL_CACHE.get(key)
     if hit is not None:
         return hit
@@ -1155,7 +1186,7 @@ def _head_wing_kernel_face(
         logical2d = (logical1d[:, None] & logical1d[None, :])[None, :, :]
         dE = energies[:, :, None] - energies[:, None, :]
         f_diff = occupations[:, None, :] - occupations[:, :, None]
-        transition = logical2d & (dE > 0.0)
+        transition = logical2d & ((dE != 0.0) if ordered else (dE > 0.0))
         if include_surface:
             diagonal = logical2d & (idx[:, None] == idx[None, :])[None, :, :]
             surface_pair = jnp.where(diagonal, surface_weight[:, :, None], 0.0)
@@ -1189,7 +1220,7 @@ def _head_wing_kernel_face(
                 weight = _head_wing_interband_weight(
                     dE[None], f_diff[None],
                     z_block[:, None, None, None], pref_inter,
-                    transition[None],
+                    transition[None], ordered=ordered,
                 )
                 if include_surface:
                     weight = weight + (
@@ -1375,15 +1406,23 @@ def head_wings_sharded(
     surface_weight_kn=None,
     body_bra_wfns=None,
     body_ket_wfns=None,
+    trs_allowed: bool = True,
 ):
-    """Contract energy-scaled velocity jets with centroid vertices on canonical faces or parents."""
+    """Contract energy-scaled velocity jets with centroid vertices on canonical faces or parents.
+
+    ``trs_allowed`` is the measured ``SymMaps.trs_allowed`` verdict the
+    finite-q response follows: ``True`` keeps the time-reversal-even pair
+    sum bit for bit, ``False`` selects the complete signed Lehmann sum
+    (:func:`_head_wing_interband_weight`, ``ordered=True``).
+    """
     if getattr(wfns, "layout", None) not in ("face", "axis"):
         raise ValueError("head_wings_sharded requires a canonical face or axis layout")
     return _head_wings_sharded_face(
         velocity_cart, wfns, energies_kn_ry, occupations_kn, omegas_ry,
         mesh=mesh, nb_logical=nb_logical, nk_tot=nk_tot, nspin=nspin,
         nspinor=nspinor, eta_ry=eta_ry, surface_weight_kn=surface_weight_kn,
-        body_bra_wfns=body_bra_wfns, body_ket_wfns=body_ket_wfns)
+        body_bra_wfns=body_bra_wfns, body_ket_wfns=body_ket_wfns,
+        trs_allowed=trs_allowed)
 
 
 def _head_wings_sharded_face(
@@ -1402,6 +1441,7 @@ def _head_wings_sharded_face(
     surface_weight_kn=None,
     body_bra_wfns=None,
     body_ket_wfns=None,
+    trs_allowed: bool = True,
 ):
     """Batch parent children and pad response tables to the canonical face band extent."""
     if (getattr(wfns, "layout", None) in ("face", "axis") and wfns.psi_mun is None
@@ -1428,7 +1468,8 @@ def _head_wings_sharded_face(
                 nb_logical=nb_logical, nk_tot=nk_tot, nspin=nspin,
                 nspinor=nspinor, eta_ry=eta_ry,
                 surface_weight_kn=(None if s_all is None
-                                   else jnp.take(s_all, r, axis=0)))
+                                   else jnp.take(s_all, r, axis=0)),
+                trs_allowed=trs_allowed)
             Y_x = y if Y_x is None else Y_x + y
             Z_y = z if Z_y is None else Z_y + z
         return Y_x, Z_y
@@ -1520,7 +1561,8 @@ def _head_wings_sharded_face(
     pref_surface = 2.0 / (float(nk_tot) * spin_denominator)
     return _head_wing_kernel(
         mesh, nb_logical=int(nb_logical),
-        include_surface=bool(include_surface), layout=wfns.layout)(
+        include_surface=bool(include_surface), layout=wfns.layout,
+        ordered=not bool(trs_allowed))(
             v, bra_wfns.psi_mun, ket_wfns.psi_mun,
             bra_wfns.psi_nmu, ket_wfns.psi_nmu,
             e, f, surface, omega,
@@ -2256,6 +2298,9 @@ class IterationHeadResponse:
     sigma_energies_ry: np.ndarray
     sigma_occupations: np.ndarray
     efermi_ry: float
+    #: The measured time-reversal verdict the wings were built under:
+    #: ``False`` means the complete signed Lehmann wings of an ordered store.
+    trs_allowed: bool = True
 
 
 @dataclass(frozen=True)
@@ -2614,8 +2659,15 @@ def build_iteration_head_response(
     wfns_qp=None,
     eta_ry: float | None = None,
     occupation_state=None,
+    trs_allowed: bool | None = None,
 ) -> IterationHeadResponse:
     """Build current-basis direct head and, when requested, its wings.
+
+    ``trs_allowed`` is the final measured ``SymMaps.trs_allowed`` the finite-q
+    response and store follow; ``None`` reads the WFN's own verdict.  The
+    direct head ``S`` needs no time-reversal assumption (its ``(i, j)`` and
+    ``(j, i)`` Lehmann terms combine at one ``k``); the wings do
+    (:func:`head_wings_sharded`).
 
     ``forward_links=None`` is ``sc_head_update = dft_velocity``: no link
     manifold is resident, so the covariant ``DΔH`` correction is dropped
@@ -2650,6 +2702,8 @@ def build_iteration_head_response(
     # Physical state multiplicity belongs to the source WFN.  A
     # kinetic-balance lift changes only the stored spinor representation.
     normalization_nspinor = int(meta.nspinor_wfnfile)
+    trs = (bool(wfn.symmetry().trs_allowed) if trs_allowed is None
+           else bool(trs_allowed))
     S = head_s_tensor_sharded(
         v_qp,
         energies_qp_kn_ry,
@@ -2680,6 +2734,7 @@ def build_iteration_head_response(
             nspinor=normalization_nspinor,
             eta_ry=resolved_eta_ry,
             surface_weight_kn=surface_weight_qp_kn,
+            trs_allowed=trs,
         )
     omegas = tuple(complex(z) for z in np.asarray(omegas_ry).reshape(-1))
     if (
@@ -2736,6 +2791,7 @@ def build_iteration_head_response(
             :, : np.shape(sigma_energies_ry)[1]
         ],
         efermi_ry=float(efermi_ry),
+        trs_allowed=trs,
     )
 
 
@@ -2800,8 +2856,13 @@ def build_dft_head_response(
     meta,
     config,
     wfn_fingerprint_binding=None,
+    trs_allowed: bool | None = None,
 ) -> IterationHeadResponse:
     """Build the one-shot DFT head on exactly the chi0 band manifold.
+
+    ``trs_allowed`` is the final measured ``SymMaps.trs_allowed`` (the
+    driver's, after any ``trivial_view``); ``None`` reads the WFN's own
+    verdict.  It selects the wing form (:func:`head_wings_sharded`).
 
     This is the non-self-consistent entry to the same sharded direct-head and
     wing kernels used by QSGW.  In particular, both ``S_direct`` and ``Y/Z``
@@ -2835,6 +2896,8 @@ def build_dft_head_response(
     # ``meta.nspinor`` is four for the bispinor representation, whereas
     # response normalization counts the source-WFN states.
     normalization_nspinor = int(meta.nspinor_wfnfile)
+    trs = (bool(wfn.symmetry().trs_allowed) if trs_allowed is None
+           else bool(trs_allowed))
     S = head_s_tensor_sharded(
         jnp.asarray(velocity_cart), energies, occupations, z,
         mesh=mesh, nb_logical=nb_logical,
@@ -2845,7 +2908,7 @@ def build_dft_head_response(
         jnp.asarray(velocity_cart), wfns, energies, occupations, z,
         mesh=mesh, nb_logical=nb_logical, nk_tot=int(meta.nk_tot),
         nspin=int(wfn.nspin), nspinor=normalization_nspinor,
-        eta_ry=float(config.head.wcoul0_eta))
+        eta_ry=float(config.head.wcoul0_eta), trs_allowed=trs)
     # Hard lifetime boundary: this module previously had zero
     # ``block_until_ready`` calls (unlike ``screening.py``'s per-stage
     # discipline), so the direct head/wings built here stayed queued,
@@ -2868,6 +2931,7 @@ def build_dft_head_response(
         S_direct=S, Y_x=Y_x, Z_y=Z_y,
         static_kappa2_bohr2=None,
         static_Y_x=None, static_Z_y=None, static_chi_body_gamma=None,
+        trs_allowed=trs,
         sigma_energies_ry=e_host[:, :int(meta.nb_sigma)],
         sigma_occupations=np.asarray(occupations)[:, :int(meta.nb_sigma)],
         efermi_ry=efermi)

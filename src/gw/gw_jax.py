@@ -358,10 +358,10 @@ def _load_system_inputs(config, input_dir, mesh_xy, report, print0, _config_prov
                "parent route. Generate orbit-closed centroids with kmeans to restore reduction.")
         sym = sym.trivial_view()
     # Before any basis, bank or constructor: the full shared-pole head refuses
-    # an ordered or N_spinor != 1 store here, on the final symmetry verdict.
+    # a store outside the charge representation here, on the final symmetry
+    # verdict (ordered and even stores are both evaluated).
     from .shared_pole_head import refuse_unsupported_shared_pole_head
-    refuse_unsupported_shared_pole_head(
-        config, trs_allowed=sym.trs_allowed, nspinor=wfn.nspinor)
+    refuse_unsupported_shared_pole_head(config, nspinor=wfn.nspinor)
     centroid_indices = centroid_basis.centroid_indices
     n_rmu = centroid_basis.n_rmu
     tmp_dir = os.path.join(input_dir, "tmp")
@@ -575,7 +575,8 @@ def _prepare_oneshot_response(
             oneshot_head_response = build_dft_head_response(
                 wfns_sigma, oneshot_omegas,
                 input_dir=input_dir, mesh=mesh_xy,
-                wfn=wfn, meta=meta, config=config)
+                wfn=wfn, meta=meta, config=config,
+                trs_allowed=bool(sym.trs_allowed))
             print0(
                 "  head_correction=full: built direct DFT response and "
                 "head/body wings on the chi0 transition manifold; finalizing "
