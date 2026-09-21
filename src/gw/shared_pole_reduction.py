@@ -217,7 +217,8 @@ def _restricted_block(ww, wv, vv):
         (jnp.concatenate((ww, wv), axis=-1), jnp.concatenate((_adjoint(wv), vv), axis=-1)), axis=-2))
 
 
-def prepare_ordered_shared_pole_reduction(pencil, active_columns, *, matrix_sharding=None):
+def prepare_ordered_shared_pole_reduction(pencil, active_columns, *, matrix_sharding=None,
+                                          return_raw=False):
     """Put an ordered pencil in the normalized paired basis.
 
     This is the common first equation phase for the fused local reducer and
@@ -256,10 +257,14 @@ def prepare_ordered_shared_pole_reduction(pencil, active_columns, *, matrix_shar
         active, jnp.isfinite(diagonal) & (diagonal > 0), diagonal == 0), axis=-1)
     scale = jnp.where(active, 1 / jnp.sqrt(jnp.where(diagonal > 0, diagonal, 1)), 0)
     sandwich = lambda a: scale[:, :, None] * a * scale[:, None, :]
+    raw_h_vv = h_vv
     matrices = tuple(sandwich(a) for a in
                      (g_ww, g_wv, g_vv, h_ww, h_wv, h_vv))
     matrices += (o_w * scale[:, None, :], o_v * scale[:, None, :])
-    return matrices, (active, inverse, scale, diagonal_ok, paired)
+    result = matrices, (active, inverse, scale, diagonal_ok, paired)
+    # Temporary diagnostic seam: preserve the canonical pre-normalization
+    # H and H_vv without changing the normal caller's output contract.
+    return (*result, (h, raw_h_vv)) if return_raw else result
 
 
 def restrict_ordered_shared_pole_reduction(prepared, spectrum, *, matmul, gates,

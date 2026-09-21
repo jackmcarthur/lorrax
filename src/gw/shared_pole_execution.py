@@ -160,6 +160,9 @@ def face_program(fn, mesh, *, outputs='matrices'):
                 out=(matrix(shapes[0]),model(shapes[1]))
             elif outputs == 'mixed':
                 out=(jax.tree.map(matrix,shapes[0]),scalar_tree(shapes[1]))
+            elif outputs == 'probe':
+                out=(jax.tree.map(matrix,shapes[0]),scalar_tree(shapes[1]),
+                     jax.tree.map(matrix,shapes[2]))
             else:
                 raise ValueError('unknown explicit constructor output contract '+outputs)
             compiled[signature]=jax.jit(fn,out_shardings=out)
@@ -209,6 +212,30 @@ def face_ordered_prepare_program(mesh, odd_moments):
             pencil, active, matrix_sharding=matrix_sharding)
 
     return face_program(body, mesh, outputs='mixed')
+
+
+@lru_cache(maxsize=None)
+def face_ordered_probe_program(mesh, odd_moments):
+    """Diagnostic canonical prepare retaining its raw H and H_vv."""
+    from gw.shared_pole_pencil import assemble_ordered_shared_pole_pencil
+    from gw.shared_pole_reduction import prepare_ordered_shared_pole_reduction
+
+    matrix_sharding = NamedSharding(mesh, P(None, 'x', 'y'))
+    mm = face_matmul(mesh)
+
+    def body(points, order, active, qs, os, ds, infinity):
+        def pack(parts):
+            return jax.lax.with_sharding_constraint(
+                jnp.take(jnp.concatenate(parts, axis=-1), order[0], axis=-1,
+                         mode='fill', fill_value=0), matrix_sharding)
+        pencil = assemble_ordered_shared_pole_pencil(
+            [(points, pack(qs), pack(os), pack(ds))],
+            infinity if odd_moments else None, matmul=mm,
+            matrix_sharding=matrix_sharding)
+        return prepare_ordered_shared_pole_reduction(
+            pencil, active, matrix_sharding=matrix_sharding, return_raw=True)
+
+    return face_program(body, mesh, outputs='probe')
 
 
 @lru_cache(maxsize=None)
@@ -264,16 +291,218 @@ def face_ordered_finish_program(mesh, odd_moments, retain_span):
     return face_program(body, mesh, outputs='parent')
 
 
+@lru_cache(maxsize=None)
+def _probe_vectors(mesh):
+    """Replicate the tiny raw-H_vv diagonal used to choose probe columns."""
+    return face_program(
+        lambda h_vv: jnp.real(jnp.diagonal(h_vv, axis1=-2, axis2=-1)),
+        mesh, outputs='scalars')
+
+
+@lru_cache(maxsize=None)
+def _probe_principal(mesh, original, paired):
+    """Gather only bounded principal submatrices from all-P raw matrices."""
+    original = jnp.asarray(original, dtype=jnp.int32)
+    paired = jnp.asarray(paired, dtype=jnp.int32)
+
+    def body(h, h_vv):
+        h = jnp.take(jnp.take(h, original, axis=-2), original, axis=-1)
+        h_vv = jnp.take(jnp.take(h_vv, paired, axis=-2), paired, axis=-1)
+        return h, h_vv
+
+    return face_program(body, mesh, outputs='scalars')
+
+
+@lru_cache(maxsize=None)
+def _probe_panels(mesh, finite_indices, infinity_indices):
+    """Replicate selected Q/O/D columns; the full panels remain all-P."""
+    finite_indices = jnp.asarray(finite_indices, dtype=jnp.int32)
+    infinity_indices = jnp.asarray(infinity_indices, dtype=jnp.int32)
+
+    def body(points, order, active, qs, os, ds, infinity):
+        half = points.shape[-1] // 2
+        finite = points.shape[-1]
+        n_inf = (active.shape[-1] - finite) // 2
+        finite_columns = jnp.concatenate((finite_indices,
+                                          half + finite_indices))
+
+        def pack(parts):
+            packed = jnp.take(jnp.concatenate(parts, axis=-1), order[0],
+                              axis=-1, mode='fill', fill_value=0)
+            return jnp.take(packed, finite_columns, axis=-1)
+
+        small_points = jnp.take(points, finite_columns, axis=-1)
+        small_active = jnp.concatenate((
+            jnp.take(active[:, :finite], finite_columns, axis=-1),
+            jnp.take(active[:, finite:finite + n_inf], infinity_indices, axis=-1),
+            jnp.take(active[:, finite + n_inf:], infinity_indices, axis=-1)), axis=-1)
+        small_infinity = tuple(jnp.take(a, infinity_indices, axis=-1)
+                               for a in infinity)
+        return (small_points, small_active, pack(qs), pack(os), pack(ds),
+                small_infinity)
+
+    return face_program(body, mesh, outputs='scalars')
+
+
+@lru_cache(maxsize=None)
+def _probe_small_native(mesh, odd_moments):
+    """Run the canonical equations on the bounded subset through face GEMM."""
+    from gw.shared_pole_pencil import assemble_ordered_shared_pole_pencil
+    from gw.shared_pole_reduction import prepare_ordered_shared_pole_reduction
+
+    matrix_sharding = NamedSharding(mesh, P(None, 'x', 'y'))
+
+    def body(points, active, q, o, d, infinity):
+        pencil = assemble_ordered_shared_pole_pencil(
+            [(points, q, o, d)], infinity if odd_moments else None,
+            matmul=face_matmul(mesh), matrix_sharding=matrix_sharding)
+        return prepare_ordered_shared_pole_reduction(
+            pencil, active, matrix_sharding=matrix_sharding, return_raw=True)
+
+    return face_program(body, mesh, outputs='probe')
+
+
+def _probe_small_reference(points, active, q, o, d, infinity, odd_moments):
+    """Canonical bounded equations with replicated JAX matmul as reference."""
+    from gw.shared_pole_pencil import assemble_ordered_shared_pole_pencil
+    from gw.shared_pole_reduction import prepare_ordered_shared_pole_reduction
+
+    def mm(a, b, transa='N', transb='N'):
+        def op(x, trans):
+            if trans == 'N':
+                return x
+            x = jnp.swapaxes(x, -1, -2)
+            return jnp.conj(x) if trans == 'C' else x
+        return jnp.matmul(op(a, transa), op(b, transb))
+
+    pencil = assemble_ordered_shared_pole_pencil(
+        [(points, q, o, d)], infinity if odd_moments else None, matmul=mm)
+    return prepare_ordered_shared_pole_reduction(
+        pencil, active, return_raw=True)
+
+
+def _choose_probe_indices(diagonal, active, count=8):
+    """Choose worst live/padding and healthy controls, then fill deterministically."""
+    diagonal, active = np.asarray(diagonal), np.asarray(active, bool)
+    chosen = []
+
+    def add(indices):
+        for index in indices:
+            index = int(index)
+            if index not in chosen and len(chosen) < count:
+                chosen.append(index)
+
+    bad = np.flatnonzero(active & (~np.isfinite(diagonal) | (diagonal <= 0)))
+    add(bad[:3])
+    padding = np.flatnonzero(~active)
+    add(padding[np.argsort(np.abs(diagonal[padding]))[::-1][:2]])
+    live = np.flatnonzero(active & np.isfinite(diagonal))
+    add(live[np.argsort(diagonal[live])[:2]])
+    add(live[np.argsort(diagonal[live])[::-1]])
+    add(np.arange(diagonal.size))
+    if len(chosen) != count:
+        raise ValueError(f'raw-Hvv probe requires {count} columns, got {len(chosen)}')
+    return tuple(chosen)
+
+
+def _run_ordered_raw_hvv_probe(points, order, active, qs, os, ds, infinity,
+                                raw, *, mesh, odd_moments):
+    """Print a bounded native/reference receipt and deliberately stop before eig."""
+    raw_h, raw_h_vv = raw
+    diagonal = np.asarray(_probe_vectors(mesh)(raw_h_vv))[0]
+    active_host = np.asarray(active, bool)[0]
+    points_host = np.asarray(points)[0]
+    finite = int(points.shape[-1])
+    half, n_inf = finite // 2, (int(active.shape[-1]) - finite) // 2
+    paired_active = np.concatenate((active_host[:half],
+                                    active_host[finite:finite + n_inf]))
+    finite_indices = _choose_probe_indices(diagonal[:half], paired_active[:half])
+    infinity_indices = _choose_probe_indices(diagonal[half:], paired_active[half:])
+    original = (*finite_indices, *(half + np.asarray(finite_indices)),
+                *(finite + np.asarray(infinity_indices)),
+                *(finite + n_inf + np.asarray(infinity_indices)))
+    paired = (*finite_indices, *(half + np.asarray(infinity_indices)),)
+    full_h, full_h_vv = _probe_principal(mesh, tuple(original), tuple(paired))(
+        raw_h, raw_h_vv)
+    small = _probe_panels(mesh, finite_indices, infinity_indices)(
+        points, order, active, qs, os, ds, infinity)
+    small_points, small_active, q, o, d, small_infinity = small
+    native = _probe_small_native(mesh, odd_moments)(
+        small_points, small_active, q, o, d, small_infinity)
+    # Complete every native product before dispatching the reference path;
+    # this probe must not recreate the native/XLA overlap under diagnosis.
+    jax.block_until_ready(native)
+    native_h, native_h_vv = _probe_principal(
+        mesh, tuple(range(32)), tuple(range(16)))(*native[2])
+    reference = _probe_small_reference(
+        small_points, small_active, q, o, d, small_infinity, odd_moments)
+
+    full_h, full_h_vv = np.asarray(full_h)[0], np.asarray(full_h_vv)[0]
+    native_h, native_h_vv = np.asarray(native_h)[0], np.asarray(native_h_vv)[0]
+    reference_h, reference_h_vv = (np.asarray(a)[0] for a in reference[2])
+    q_host = np.asarray(q)[0]
+
+    def error(a, b):
+        absolute = float(np.max(np.abs(a - b)))
+        relative = absolute / max(float(np.max(np.abs(b))), np.finfo(float).tiny)
+        return absolute, relative
+
+    if jax.process_index() == 0:
+        print('shared-pole raw Hvv diagnostic: parent=0 paired=16 finite=8 infinity=8', flush=True)
+        print('role index active z q_norm_plus q_norm_minus raw_diag Hpp Hpm Hmp Hmm diagonal_sum cross_sum reconstructed', flush=True)
+        f = len(finite_indices)
+        for local, index in enumerate(finite_indices):
+            z = points_host[index]
+            hpp, hpm = full_h[local, local], full_h[local, f + local]
+            hmp, hmm = full_h[f + local, local], full_h[f + local, f + local]
+            diagonal_sum, cross_sum = hpp + hmm, -(hpm + hmp)
+            reconstructed = ('PAD0' if not paired_active[index] else
+                             ((diagonal_sum + cross_sum) / (4 * abs(z) ** 2)
+                              if abs(z) else 'NA'))
+            print(f'finite {index} {int(paired_active[index])} {z!r} '
+                  f'{np.linalg.norm(q_host[:, local]):.17e} '
+                  f'{np.linalg.norm(q_host[:, f + local]):.17e} '
+                  f'{full_h_vv[local, local]!r} '
+                  f'{hpp!r} {hpm!r} {hmp!r} {hmm!r} '
+                  f'{diagonal_sum!r} {cross_sum!r} '
+                  f'{reconstructed!r}', flush=True)
+        print('role index active z q_norm raw_diag infinity_H_k0k0', flush=True)
+        for local, index in enumerate(infinity_indices):
+            paired_local = f + local
+            original_local = 2 * f + local
+            print(f'infinity {index} {int(paired_active[half + index])} 0j '
+                  f'{np.linalg.norm(np.asarray(small_infinity[0])[0, :, local]):.17e} '
+                  f'{full_h_vv[paired_local, paired_local]!r} '
+                  f'{full_h[original_local, original_local]!r}', flush=True)
+        print('shared-pole raw Hvv comparison '
+              f'full_native_vs_small_jax_H={error(full_h, reference_h)} '
+              f'full_native_vs_small_native_H={error(full_h, native_h)} '
+              f'small_native_vs_small_jax_H={error(native_h, reference_h)} '
+              f'full_native_vs_small_jax_Hvv={error(full_h_vv, reference_h_vv)} '
+              f'full_native_vs_small_native_Hvv={error(full_h_vv, native_h_vv)} '
+              f'small_native_vs_small_jax_Hvv={error(native_h_vv, reference_h_vv)} '
+              f'active_nonpositive={int(np.sum(paired_active & (diagonal <= 0)))} '
+              f'active_nonfinite={int(np.sum(paired_active & ~np.isfinite(diagonal)))} '
+              f'inactive_nonzero={int(np.sum(~paired_active & (diagonal != 0)))} '
+              f'active_raw_min={np.nanmin(diagonal[paired_active])!r} '
+              f'inactive_abs_max={np.max(np.abs(diagonal[~paired_active]), initial=0)!r}',
+              flush=True)
+    raise RuntimeError('DIAGNOSTIC COMPLETE: stopped before shared-pole eigensolves')
+
+
 def face_ordered_parent(points, order, active, qs, os, ds, infinity, *, mesh,
                         odd_moments, keep_budget, retain_span):
     """Run the three ordered eig equations with explicit eager boundaries."""
-    prepare = face_ordered_prepare_program(mesh, odd_moments)
+    prepare = face_ordered_probe_program(mesh, odd_moments)
     with timing.section(
             'spole.ordered.prepare', announce=True,
             label=f'shared-pole ordered prepare pencil={active.shape[-1]}') as section:
         prepared_face = prepare(points, order, active, qs, os, ds, infinity)
         section.watch(prepared_face)
-    prepared = prepared_face
+    prepared = prepared_face[:2]
+    _run_ordered_raw_hvv_probe(
+        points, order, active, qs, os, ds, infinity, prepared_face[2], mesh=mesh,
+        odd_moments=odd_moments)
     with timing.section(
             'spole.ordered.eigh1_input', announce=True,
             label='shared-pole ordered Hvv Hermitian projection') as section:
