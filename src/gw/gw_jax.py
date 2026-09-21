@@ -545,8 +545,15 @@ def _prepare_oneshot_response(
     oneshot_head_response = None
     oneshot_head_requests = None
     oneshot_mpa_plan = None
+    # The shared-pole route takes its direct head from the same sharded
+    # response as the full one, with the wings skipped and the fold never
+    # evaluated (``gw.shared_pole_head`` docstring): the head an ordered
+    # store carries.
+    direct_only_shared_pole = (
+        config.head.correction is HeadCorrection.NO_LOCAL_FIELDS
+        and config.sigma.w_model == "shared_pole")
     if (do_screened
-            and config.head.correction is HeadCorrection.FULL
+            and (config.head.correction is HeadCorrection.FULL or direct_only_shared_pole)
             and config.screening.diagrams is ScreeningDiagrams.W_RPA
             and not packed_photon_replaces_charge_sigma(config)
             and qp_solver is not QPSolver.SELF_CONSISTENT):
@@ -575,8 +582,12 @@ def _prepare_oneshot_response(
             oneshot_head_response = build_dft_head_response(
                 wfns_sigma, oneshot_omegas,
                 input_dir=input_dir, mesh=mesh_xy,
-                wfn=wfn, meta=meta, config=config)
+                wfn=wfn, meta=meta, config=config,
+                wings=not direct_only_shared_pole)
             print0(
+                "  head_correction=no_local_fields: built the direct DFT "
+                "response on the chi0 transition manifold; no wings, no "
+                "fold (direct head only)." if direct_only_shared_pole else
                 "  head_correction=full: built direct DFT response and "
                 "head/body wings on the chi0 transition manifold; finalizing "
                 "once against the resident W(Gamma).")

@@ -14,6 +14,29 @@ Nothing crosses the body, so the fold ``S + Y W Z / Omega`` is one contraction
 on both stores. Certified by ``tests/test_shared_pole_head_two_component.py``
 (a spin-doubled two-component store reproduces the scalar head; a global SU(2)
 rotation leaves it invariant).
+
+An ordered store (measured broken time reversal, ``scalar-ordered-ph``)
+carries the DIRECT frequency-dependent head only, ``head_correction =
+no_local_fields``: the Cartesian tensor ``S_ab(z)`` of
+``gw.qsgw_head.head_s_tensor_sharded`` needs no time-reversal assumption.
+Its two Lehmann terms for one unordered pair combine at the same ``k``,
+
+    (f_j - f_i)/D^2 [conj(T_ab)/(z - D) - T_ab/(z + D)]
+        = 2 (f_j - f_i) [Re T_ab - i z Im T_ab / D] / (D (z^2 - D^2)),
+    T_ab = conj(v^a_ij) v^b_ij,  D = e_i - e_j > 0,
+
+so the signed occupation difference, the energy-ordered pair sum, the
+conjugation and the denominator ``D [(z + i eta)^2 - D^2]`` all survive;
+what time reversal removed was only the antisymmetric ``Im T_ab`` part
+(nonzero on a magnet, odd in ``z``), which the mini-BZ quadratic form
+``q.S.q`` annihilates whatever weight it carries.  The k sum runs over the
+full zone unfolded by the measured magnetic group.  The wing/body fold of a
+signed store is NOT implemented (owner scope 2026-09-21), so
+``head_correction = full`` refuses on an ordered store by name; the
+delivered ordered head is direct-term-only and on the one-shot and
+``sc_head_update = off`` routes carries no intraband Drude/Thomas-Fermi
+piece (KNOWN_LORRAX_ISSUES, one-shot metal head).  Certified by
+``tests/test_head_direct_ordered.py``.
 """
 from types import SimpleNamespace
 from functools import lru_cache
@@ -89,19 +112,20 @@ def _refuse_head_representation(*, trs_allowed, nspinor):
     layout; its Gamma completion is the packed photon head, not this scalar
     charge head.
     """
-    remedy = ("A one-shot deck runs with head_correction = off. A self-consistent "
-              "shared-pole deck may also run headless as a brute-grid development "
-              "mode (owner policy 2026-09-18); with head_correction = full this "
-              "ordered head is not implemented, so head off is the only valid "
-              "setting on this system until the signed head lands.")
+    remedy = ("On this store head_correction = no_local_fields delivers the direct "
+              "frequency-dependent head (exact without time reversal; the k sum runs over "
+              "the full zone under the measured magnetic group), which is the ordered head "
+              "the owner asked for (2026-09-21); head_correction = off is the headless "
+              "brute-grid development mode (owner policy 2026-09-18).")
     if not bool(trs_allowed):
         raise ValueError(
             "GATE shared_pole_head_ordered: got time-reversal-broken symmetry (an ordered "
-            "store, representation scalar-ordered-ph); want scalar-trs-even-s; why: the Gamma "
-            "body evaluates the time-reversal-even form b (s - Lambda)^-1 b^dagger, which is "
-            "not the signed particle-hole model an ordered store declares, so an ordered head "
-            "would be silently wrong on the dominant Sigma term. The signed Gamma head is "
-            "pending. " + remedy)
+            "store, representation scalar-ordered-ph) with head_correction = full; want "
+            "scalar-trs-even-s for full; why: full folds the wings through the Gamma body, "
+            "and the body evaluator is the time-reversal-even form b (s - Lambda)^-1 b^dagger, "
+            "not the signed particle-hole model an ordered store declares; the signed "
+            "wing/body fold is not implemented (owner scope 2026-09-21, wings and body "
+            "fold deferred). " + remedy)
     if int(nspinor) not in (1, 2):
         raise ValueError(
             f"GATE shared_pole_head_nspinor: got N_spinor = {int(nspinor)}; want 1 or 2 (the "
