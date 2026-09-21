@@ -419,7 +419,8 @@ def select_active_eigenpairs(eigenvalues: jax.Array,
                              active_character: jax.Array,
                              n_active: int,
                              *, n_physical: int | None = None,
-                             n_return: int | None = None):
+                             n_return: int | None = None,
+                             return_vectors: bool = False):
     """Select the transformed eigenpairs with maximum active-subspace weight.
 
     ``eigenvectors[..., :, j]`` is eigenvector ``j`` of the already-built
@@ -429,8 +430,9 @@ def select_active_eigenpairs(eigenvalues: jax.Array,
 
     The returned values are ordered by energy.  Selection itself is by
     ``<u_j|P_A|u_j>`` with stable energy/index tie-breaking.  Eigenvector phase
-    cancels in this expectation value and no eigenvector leaves standalone
-    htransform, so there is deliberately no phase-fixing/output API here.
+    cancels in this expectation value.  ``return_vectors=True`` returns the
+    selected columns in the identical energy order for an observable that must
+    use the driver's published states; no phase fixing is applied.
 
     ``n_physical`` excludes fH's rank-minus-state null carrier *before*
     character ranking.  Away from a coarse node the independently
@@ -447,7 +449,7 @@ def select_active_eigenpairs(eigenvalues: jax.Array,
     Returns
     -------
     values, scores, score_gap, score_tol, cluster_values, cluster_mask,
-    min_nonreturned_value
+    min_nonreturned_value[, selected_vectors]
         Batched arrays.  ``cluster_values`` and ``cluster_mask`` describe the
         complete score-tied cluster crossing the selection boundary, not just
         the last selected and first rejected neighbours.  ``score_tol`` is a
@@ -493,6 +495,7 @@ def select_active_eigenpairs(eigenvalues: jax.Array,
         selected_values, by_energy, axis=-1)
     selected_scores = jnp.take_along_axis(
         selected_scores, by_energy, axis=-1)
+    selected_idx = jnp.take_along_axis(selected_idx, by_energy, axis=-1)
     rejected_values = jnp.take_along_axis(
         eigenvalues, rejected_idx, axis=-1)
     nonreturned_values = jnp.concatenate(
@@ -527,8 +530,16 @@ def select_active_eigenpairs(eigenvalues: jax.Array,
     cluster_mask = (jnp.concatenate(
         (left_connected, right_connected), axis=-1)
         & boundary_link[..., None])
-    return (selected_values, selected_scores, score_gap, score_tol,
-            character_values, cluster_mask, min_nonreturned_value)
+    out = (selected_values, selected_scores, score_gap, score_tol,
+           character_values, cluster_mask, min_nonreturned_value)
+    if return_vectors:
+        vector_idx = jnp.broadcast_to(
+            selected_idx[..., None, :],
+            eigenvectors.shape[:-1] + (selected_idx.shape[-1],))
+        selected_vectors = jnp.take_along_axis(
+            eigenvectors, vector_idx, axis=-1)[..., :n_return]
+        return out + (selected_vectors,)
+    return out
 
 
 def build_fH_R(ctilde: jax.Array, enk_sigma: jax.Array,
@@ -1378,7 +1389,8 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
                 a_band_index: int | None = None,
                 band_start: int = 0, n_return_bands: int | None = None,
                 qp_corrected_band_range: tuple[int, int] | None = None,
-                progress_fn=None, quality_record_fn=None, sym=None):
+                progress_fn=None, quality_record_fn=None, sym=None,
+                return_coeffs: bool = False):
     from time import perf_counter as _perf   # instrument:
     nk = int(meta.nkx * meta.nky * meta.nkz)
     states = ctilde.shape[1]
@@ -1511,7 +1523,7 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
         mat = jax.lax.with_sharding_constraint(mat, batch_mat_shard)
         return mat + jnp.swapaxes(mat, 1, 2).conj()
 
-    if not use_active:
+    if not use_active and not return_coeffs:
         @partial(jax.jit, out_shardings=batch_eig_shard)
         def _kpath_batch(batch_k, fH_R):
             # batch_k: (bs, 3) replicated; fH_R is face-sharded.  The R-only
@@ -1519,6 +1531,18 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
             # device a whole matrix for the native eigensolver.
             mat = _fourier_matrix(batch_k, fH_R)
             return jax.vmap(jnp.linalg.eigvalsh)(mat)
+    elif not use_active:
+        batch_vec_shard = NamedSharding(
+            mesh_xy, P(('x', 'y'), None, None))
+
+        @partial(
+            jax.jit,
+            out_shardings=(batch_eig_shard, batch_vec_shard))
+        def _kpath_batch(batch_k, fH_R):
+            """Return the same ordered eigenvectors used by the path bands."""
+            mat = _fourier_matrix(batch_k, fH_R)
+            values, vectors = jax.vmap(jnp.linalg.eigh)(mat)
+            return values, vectors
     else:
         batch_vec_shard = NamedSharding(
             mesh_xy, P(('x', 'y'), None, None))
@@ -1532,22 +1556,22 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
             values, vectors = jax.vmap(jnp.linalg.eigh)(mat)
             return values[:, :states], vectors[:, :, :states]
 
-        @partial(
-            jax.jit,
-            out_shardings=(batch_eig_shard, batch_eig_shard,
-                           batch_scalar_shard, batch_scalar_shard,
-                           batch_eig_shard, batch_eig_shard,
-                           batch_scalar_shard))
+        _active_out_shardings = (
+            batch_eig_shard, batch_eig_shard,
+            batch_scalar_shard, batch_scalar_shard,
+            batch_eig_shard, batch_eig_shard,
+            batch_scalar_shard)
+        if return_coeffs:
+            _active_out_shardings += (batch_vec_shard,)
+
+        @partial(jax.jit, out_shardings=_active_out_shardings)
         def _active_kpath_batch(batch_k, values, vectors, active_R):
             """Score retained fH eigenspaces after restoring only P_A(R)."""
             active_mat = _fourier_matrix(batch_k, active_R)
-            (selected_values, selected_scores, score_gap, score_tol,
-             cluster_values, cluster_mask,
-             min_nonreturned_value) = select_active_eigenpairs(
-                 values, vectors, active_mat, n_qp_corrected,
-                 n_physical=states, n_return=nb_keep)
-            return (selected_values, selected_scores, score_gap, score_tol,
-                    cluster_values, cluster_mask, min_nonreturned_value)
+            return select_active_eigenpairs(
+                values, vectors, active_mat, n_qp_corrected,
+                n_physical=states, n_return=nb_keep,
+                return_vectors=return_coeffs)
 
     fermi_energy = float(wfn.efermi)
     kpath_frac, x_path, node_indices, node_labels, gamma_positions = kpath_data
@@ -1560,6 +1584,7 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
     coincident_exact = None
     coincident_max_abs_ry = None
     coincident_rms_ry = None
+    coeffs_on_path = None
 
     if kpath_frac is not None:
         # Wrap + pad in ONE jit.  Eagerly this was five single-primitive
@@ -1618,6 +1643,7 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
         lambda_q_list = []
         active_selection_list = []
         physical_eigenpairs = []
+        path_coeff_chunks = []
         from common.progress import LoopProgress
         _n_batches = int(nq_padded // batch_size)
         _path_progress = LoopProgress(
@@ -1627,9 +1653,15 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
             enabled=progress_fn is not None).start()
         for i in range(0, nq_padded, batch_size):
             if not use_active:
-                batch_eigs = _kpath_batch(wrapped_k[i:i+batch_size], fH_R)
-                lambda_q_list.append(batch_eigs)
-                jax.block_until_ready(batch_eigs)
+                batch_result = _kpath_batch(
+                    wrapped_k[i:i+batch_size], fH_R)
+                if return_coeffs:
+                    lambda_q_list.append(batch_result[0])
+                    path_coeff_chunks.append(
+                        batch_result[1][:, :, :nb_keep])
+                else:
+                    lambda_q_list.append(batch_result)
+                jax.block_until_ready(batch_result)
             else:
                 batch_eigenpairs = _fH_kpath_batch(
                     wrapped_k[i:i+batch_size], fH_R)
@@ -1655,12 +1687,18 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
                 batch_result = _active_kpath_batch(
                     wrapped_k[i:i+batch_size], values, vectors, active_R)
                 lambda_q_list.append(batch_result[0])
-                active_selection_list.append(batch_result[1:])
+                if return_coeffs:
+                    active_selection_list.append(batch_result[1:-1])
+                    path_coeff_chunks.append(batch_result[-1])
+                else:
+                    active_selection_list.append(batch_result[1:])
                 jax.block_until_ready(batch_result)
             active_R.delete()
             del active_R
         timing.record("ht.kpath_loop", _perf() - _t0,      # instrument:
                       count=len(lambda_q_list))            # instrument:
+        coeffs_on_path = (jnp.concatenate(path_coeff_chunks, axis=0)[:nq]
+                          if return_coeffs else None)
 
         # Bundle concat + physical-state slice + newton_inv + sort into ONE
         # jit so the post-loop processing emits one compile rather than 4
@@ -1978,6 +2016,7 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
         "coincident_exact": coincident_exact,
         "coincident_max_abs_ry": coincident_max_abs_ry,
         "coincident_rms_ry": coincident_rms_ry,
+        "coeffs_on_path": coeffs_on_path,
         "kpath_data": (kpath_frac, x_path, node_indices, node_labels, gamma_positions),
     }
 

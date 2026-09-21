@@ -258,6 +258,37 @@ Invoke: `python -m bandstructure.htransform -i ht.in [--qp-rotations qp_wfn_rota
 
 **Whole-state memory gate.** `isdf.galerkin` owns one bounded, zeta-style outer-r/inner-band stream for the randomized sketch, exact selected-state Gram, and physical projection. Its canonical `PsiGStore` supplies full-Bloch G-flat→r chunks; no full-r basis or second WFN/FFT route exists. The precompile ledger prices each alternative stage, including compiled WFN transform workspace, candidate/sketch faces, selected-state rows, factor, and coefficients; it reduces the WFN band carrier and then the r carrier before refusing against the worst-rank allocator budget. `LORRAX_GALERKIN_CHUNK_GIB` controls the stream tile only and never changes candidates, pivots, or delivered rank.
 
+**Spin observables in the interpolated states.**
+`isdf.galerkin.project_galerkin_spin_operator` projects a spatially uniform
+Hermitian spin matrix through those same full-grid basis slabs.  It returns the
+operator `O_ab = <phi_a|O|phi_b>` and overlap
+`M_ab = <phi_a|phi_b>` on the all-mesh rank face; it does not substitute the
+unweighted values at the ISDF centroids for either spatial integral.
+`project_galerkin_spin_z` fixes the two-component Pauli convention to
+`O = sigma_z/2`, so its dimensionless expectation is in units of hbar and lies
+in `[-1/2,1/2]` for a normalized state.  The magnetic moment is a separate
+quantity with the electron sign and g factor and is not returned by this API.
+`rotate_galerkin_operator` consumes the exact coefficient carrier from the
+state-producing solve and evaluates `c^H O c / c^H M c`; the two coefficient
+views are rank-sharded and only the small `(nq,nband)` result is replicated.
+For a standalone path, `h_transform(..., return_coeffs=True)` exposes the
+coefficients after the same energy or active-character selection that publishes
+the bands.  `compute_wfns_fi(..., return_coeffs=True).coeffs_fi` remains the
+matching carrier for its BSE interpolation window.  Exact-null mesh padding is
+retained in both matrices and removed algebraically by the metric denominator.
+
+The returned diagonal is invariant to an eigenvector phase.  Inside an exact
+or unresolved near-degenerate multiplet it depends on the eigensolver's chosen
+basis: only the trace over the complete multiplet and the eigenvalues of its
+projected operator are gauge invariant.  A plot may therefore color individual
+bands only in the eigenvector gauge returned by the same htransform solve; it
+must not attach a coarse-grid scalar by band index.  In particular,
+`compute_wfns_fi`'s eigenvalue slice matches the standalone driver's ordinary
+energy-ordered route.  A full-QP run that activates the driver's corrected
+subspace character selector must use `h_transform`'s returned coefficients;
+plain `compute_wfns_fi` coefficients do not reproduce that alternate state
+selection.
+
 The optional restart stores only logical-rank fitted payloads and reconstructs exact-null carrier padding for the reader mesh; stream chunks and padding are scheduling metadata, not persisted physics. `--basis-input` accepts only the current immutable Galerkin format. Besides the source-WFN/centroid/window/QRCP provenance, that format stamps the versioned full-Bloch transform convention owned by `common.wfn_transforms`. This distinguishes a basis built with loader-paired k/G representatives from an older basis whose independently reconstructed modular k table selected a different reciprocal-lattice image; equal WFN bytes and array shapes do not make those bases compatible.
 
 `K_POINTS {crystal_b}` block format, required by this driver and by `bse.exciton_bands` and specified in no other page: the header line, then a count of path corners, then one line per corner giving three fractional (crystal) reciprocal coordinates and the number of points to the **next** corner, with `#label` comments optional. The last corner takes a count of 1. A Γ→X→M path on a 4×4×4 grid, used for the 2026-08-10 exciton-band run:

@@ -17,15 +17,20 @@ import pytest
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from isdf.galerkin import (
+    GalerkinOperatorProjection,
     _make_basis_solve_kernel,
     _make_physical_project_kernel,
+    _make_spin_operator_fold_kernel,
+    rotate_galerkin_operator,
 )
 
 
-def _mesh() -> Mesh:
+def _mesh(count: int = 4) -> Mesh:
     devices = jax.devices()
-    if len(devices) >= 4:
-        return Mesh(np.asarray(devices[:4]).reshape(2, 2), ("x", "y"))
+    if len(devices) >= count:
+        side = int(np.sqrt(count))
+        return Mesh(
+            np.asarray(devices[:count]).reshape(side, side), ("x", "y"))
     return Mesh(np.asarray(devices[:1]).reshape(1, 1), ("x", "y"))
 
 
@@ -115,3 +120,66 @@ def test_physical_solve_and_projection_are_local_r_blocks_with_exact_parity():
     np.testing.assert_allclose(
         np.asarray(jax.device_get(actual)), expected,
         rtol=2e-13, atol=2e-13)
+
+
+@pytest.mark.mesh(16)
+def test_full_grid_spin_operator_stays_on_rank_face_and_rotates_coefficients():
+    mesh = _mesh(16)
+    rank, ns, r_extent = 8, 2, 32
+    nq, nb = 5, 3
+    row = NamedSharding(mesh, P(None, None, ("y", "x")))
+    face = NamedSharding(mesh, P("x", "y"))
+    rep = NamedSharding(mesh, P())
+
+    rng = np.random.default_rng(23)
+    basis_np = (
+        rng.normal(size=(rank, ns, r_extent))
+        + 1j * rng.normal(size=(rank, ns, r_extent))).astype(np.complex128)
+    spin_np = np.asarray([[0.5, 0.0], [0.0, -0.5]], dtype=np.complex128)
+    basis = _put_global(basis_np, row)
+    spin = jax.device_put(spin_np, rep)
+    zero_operator = _put_global(
+        np.zeros((rank, rank), dtype=np.complex128), face)
+    zero_metric = _put_global(
+        np.zeros((rank, rank), dtype=np.complex128), face)
+
+    fold = _make_spin_operator_fold_kernel(
+        rank=rank, nspinor=ns, r_carrier=r_extent,
+        mesh=mesh, basis_layout=row, face_layout=face)
+    compiled = fold.lower(
+        basis, spin, zero_operator, zero_metric).compile()
+    hlo = compiled.as_text().lower()
+    assert "all-gather" not in hlo and "all_gather" not in hlo
+    if int(mesh.size) > 1:
+        assert "reduce-scatter" in hlo or "reduce_scatter" in hlo
+
+    operator, metric = fold(basis, spin, zero_operator, zero_metric)
+    expected_operator = np.einsum(
+        "asr,st,btr->ab", np.conj(basis_np), spin_np, basis_np,
+        optimize=True)
+    expected_metric = np.einsum(
+        "asr,bsr->ab", np.conj(basis_np), basis_np, optimize=True)
+    np.testing.assert_allclose(
+        _host(operator), expected_operator, rtol=2e-13, atol=2e-13)
+    np.testing.assert_allclose(
+        _host(metric), expected_metric, rtol=2e-13, atol=2e-13)
+
+    coeff_np = (
+        rng.normal(size=(nq, rank, nb))
+        + 1j * rng.normal(size=(nq, rank, nb))).astype(np.complex128)
+    result = rotate_galerkin_operator(
+        jax.device_put(coeff_np, rep),
+        GalerkinOperatorProjection(operator=operator, metric=metric), mesh)
+    expected_num = np.einsum(
+        "qan,ab,qbn->qn", np.conj(coeff_np), expected_operator, coeff_np,
+        optimize=True)
+    expected_norm = np.einsum(
+        "qan,ab,qbn->qn", np.conj(coeff_np), expected_metric, coeff_np,
+        optimize=True)
+    np.testing.assert_allclose(
+        _host(result.numerator), expected_num, rtol=3e-13, atol=3e-13)
+    np.testing.assert_allclose(
+        _host(result.norm), expected_norm, rtol=3e-13, atol=3e-13)
+    np.testing.assert_allclose(
+        _host(result.value), expected_num.real / expected_norm.real,
+        rtol=3e-13, atol=3e-13)
