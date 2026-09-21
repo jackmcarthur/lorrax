@@ -195,11 +195,6 @@ hang documented at the top applies to the dilation extent 2n as well.
 | `fits_local(plan, op, shapes, dtype, budget_bytes) -> bool` | The fit-on-one-device question: the caller's per-rank live set of whole matrices plus the local kernel's workspace (cuSolverDn query on CUDA, the LAPACK `?heevd` formula on hosts, the compiled local GEMM temporary) against a budget. It decides the capacity route. |
 | `right_singular_vectors` / `leading_eigenvectors` on a batch-layout stack `P(('x','y'),None,...)` | A stack whose rows already live whole on their ranks is solved rank-locally, one matrix at a time, with no movement, whatever the plan's route. Q returns in batch layout; `real_rows` marks trailing synthetic slots of the first axis, which are never solved and retain no column. Row for row equal to the face route's local solve. |
 
-`leading_eigenvectors(..., rcond=...)` additionally bounds each requested width
-by eigenvalues above `rcond * max(abs(spectrum))`, then closes the boundary
-multiplet. The default `None` preserves fixed-width selection; the caller owns
-the cutoff. Spectra and input matrices are unchanged, and only the existing
-small spectra cross the host.
 | `Plan.batched_route`, `BATCHED_ROUTES`, `BATCHED_ROUTE_CHOICES`, `BATCHED_SCAN_UNROLL` | HOW a stack runs: a `lax.scan` over the single-matrix op, the backend's stacked entry, or staged batch-axis movement around a local native kernel. **The one place that decides.** Public selection is `auto|batch_reshard`; `scan`/`backend_batched` remain internal resolutions. |
 | `Plan.native_fn` | A pure closure for a fusion-critical site that needs the math inside its own `jit`. Native backends only. |
 | `factor(op, A, mesh, *, backend, ...) -> FactorToken` | Factor once. |
@@ -214,6 +209,12 @@ small spectra cross the host.
 | `matmul(A, B, C=None, *, mesh, alpha=1, beta=0, transa='N', transb='N', backend='auto', batched_route='batch_reshard')` | Top-level distributed GEMM. Rank 2 uses `P('x','y')`; rank 3 uses `P(None,'x','y')`. The default stages complete local matrices; explicit `auto` uses the distributed provider chosen by `backend`. |
 | `resolve_matmul_backend(requested, mesh, *, batched_route='batch_reshard') -> str`, `MATMUL_BACKEND_CHOICES` | Raising GEMM-provider probe and its public vocabulary. `cusolvermp` is an accepted alias for `cublasmp`; `off` is legal only for the provider-free staged route. |
 | `gemm_plan(mesh, *, m, k, n, nq, dtype, backend='auto', alpha=1, beta=0, layout='face', enable_active_range=False) -> GemmPlan` | Resolve, probe, warm and COMPILE one N,N GEMM shape ONCE — the `matmul` analogue of `plan_polar_factor`. `GemmPlan(A, B, C=None, *, out=None)` is trace-safe. Opt-in `GemmPlan.active_range(A, B, lo, hi, C=None, *, out=None, weights=None)` contracts exact dynamic intervals without changing operand allocation shapes; optional weights have shape `(nq,K)`. `GemmPlan.prepare_active_range(lo, hi)` captures eager bounds and returns the same operand interface without runtime bound operands. |
+
+`leading_eigenvectors(..., rcond=...)` additionally bounds each requested width
+by eigenvalues above `rcond * max(abs(spectrum))`, then closes the boundary
+multiplet. The default `None` preserves fixed-width selection; the caller owns
+the cutoff. Spectra and input matrices are unchanged, and only the existing
+small spectra cross the host.
 
 Two phases and they stay two: only platform and handler guards can fire at
 resolve time — operand dtype, rank and extent are trace-time facts — so a
