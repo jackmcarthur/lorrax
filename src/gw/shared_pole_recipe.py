@@ -119,6 +119,10 @@ GATE_HASH = table_hash(shared_real_pole_gates_v1_r3b)
 ORDERED_GATE_VERSION = "shared_real_pole_gates_ordered_v1"
 shared_real_pole_gates_ordered_v1 = {
     name: dict(row) for name, row in shared_real_pole_gates_v1_r3b.items()}
+# CC/TT spans are normalized separately before the CT projection. Resolve
+# their two Gram cuts more conservatively than the joint/inverse-pole cut.
+shared_real_pole_gates_ordered_v1["normalized_gram_keep"].update(
+    sector_threshold=1.0e-5)
 for _name, (_predicate, _threshold) in {
     "representation": ("charge operator from N_spinor in (1, 2), authenticated TRS broken, ordered bank: positive poles per parent, hole side from the parent of -q transposed",
                        {"nspinor": (1, 2), "trs_allowed": False, "ordered": True}),

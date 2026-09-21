@@ -258,10 +258,12 @@ def reduce_ordered_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, g
     g_ww, g_wv, g_vv, h_ww, h_wv, h_vv = (sandwich(a) for a in (g_ww, g_wv, g_vv, h_ww, h_wv, h_vv))
     o_w, o_v = o_w * scale[:, None, :], o_v * scale[:, None, :]
     validity = gates["normalized_gram_validity"]["threshold"]
+    keep_cut = gates["normalized_gram_keep"][
+        "sector_threshold" if retain_span else "threshold"]
     gamma, u = eigh(hermitian_part(h_vv))
     largest = gamma[:, -1]
     ratio = gamma[:, 0] / jnp.where(largest > 0, largest, 1)
-    keep = ((gamma > gates["normalized_gram_keep"]["threshold"] * largest[:, None]) & (largest[:, None] > 0)
+    keep = ((gamma > keep_cut * largest[:, None]) & (largest[:, None] > 0)
             & _within_budget(gamma, keep_budget))
     count = jnp.sum(keep, axis=-1, dtype=jnp.int64)
     z = u * (keep / jnp.sqrt(jnp.where(keep, gamma, 1)))[:, None, :]
@@ -297,7 +299,7 @@ def reduce_ordered_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, g
     gamma_r, u_r = eigh(h_r)
     top_r = gamma_r[:, -1]
     ratio_r = gamma_r[:, 0] / jnp.where(top_r > 0, top_r, 1)
-    keep_r = (gamma_r > gates["normalized_gram_keep"]["threshold"] * top_r[:, None]) & (top_r[:, None] > 0)
+    keep_r = (gamma_r > keep_cut * top_r[:, None]) & (top_r[:, None] > 0)
     count_r = jnp.sum(keep_r, axis=-1, dtype=jnp.int64)
     y = u_r * (keep_r / jnp.sqrt(jnp.where(keep_r, gamma_r, 1)))[:, None, :]
     del u_r

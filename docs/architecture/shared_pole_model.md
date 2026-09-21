@@ -242,6 +242,15 @@ $$ b = \sqrt2\,c\,\mu^{-1} \ (\mu > 0),\qquad \Lambda = \mu^{-2}, \tag{SP 14} $$
 which equals the even model with time reversal. `|μ| ≤ keep · max|μ|` are poles at infinity; their output weight is
 reported (`infinite_weight_ok`).
 
+CC/TT spans retained for CT use `normalized_gram_keep.sector_threshold`
+from the ordered gate table in both paired Gram cuts. Separately normalizing
+nearly dependent sector directions can amplify their cross-block errors;
+these cuts remove weak Gram directions before that normalization. The
+ordinary ordered reduction, joint CT cut and inverse-pole filter still use
+`normalized_gram_keep.threshold`. The negative-Gram validity threshold is
+unchanged. Rank truncation must also be assessed through held-response and
+integrated-Sigma errors; passing the Gram gate alone certifies neither.
+
 **Dedupe.** For an imaginary support, or a line support with `Re z = 0`, the conjugate partner brings no new tangent
 with time reversal: `W Q ∈ span(Q)`. Only the component of `O = W Q` orthogonal to `Q` above `direction_cutoff`
 survives, so a time-reversal-symmetric bank adds no partner columns and the ordered model equals the even one at
