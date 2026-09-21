@@ -264,16 +264,26 @@ Hermitian spin matrix through those same full-grid basis slabs.  It returns the
 operator `O_ab = <phi_a|O|phi_b>` and overlap
 `M_ab = <phi_a|phi_b>` on the all-mesh rank face; it does not substitute the
 unweighted values at the ISDF centroids for either spatial integral.
+The projection planner charges both bounded rank panels after their
+orthogonal-axis r gathers against the supplied Q-tile budget.  Each fold
+creates only its local `P('x','y')` result tile; no rank-by-rank matrix is
+materialized on one rank.
 `project_galerkin_spin_z` fixes the two-component Pauli convention to
 `O = sigma_z/2`, so its dimensionless expectation is in units of hbar and lies
 in `[-1/2,1/2]` for a normalized state.  The magnetic moment is a separate
 quantity with the electron sign and g factor and is not returned by this API.
 `rotate_galerkin_operator` consumes the exact coefficient carrier from the
-state-producing solve and evaluates `c^H O c / c^H M c`; the two coefficient
-views are rank-sharded and only the small `(nq,nband)` result is replicated.
+state-producing solve and evaluates `c^H O c / c^H M c`.  The full carrier
+remains q-sharded over all P ranks.  One P-row q batch at a time is converted
+to the two rank-sharded views, and only the small logical `(nq,nband)` result
+is replicated.
 For a standalone path, `h_transform(..., return_coeffs=True)` exposes the
 coefficients after the same energy or active-character selection that publishes
-the bands.  `compute_wfns_fi(..., return_coeffs=True).coeffs_fi` remains the
+the bands.  `coeffs_on_path` retains zero q padding for legal all-P placement;
+`coeffs_on_path_count` is its logical path length.  The driver's one stable
+post-Newton energy permutation orders both the published energies and these
+coefficient columns before truncation.  `compute_wfns_fi(...,
+return_coeffs=True).coeffs_fi` remains the
 matching carrier for its BSE interpolation window.  Exact-null mesh padding is
 retained in both matrices and removed algebraically by the metric denominator.
 

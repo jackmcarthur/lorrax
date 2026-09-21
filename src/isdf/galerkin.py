@@ -51,6 +51,7 @@ __all__ = [
     "galerkin_rank_record",
     "iter_galerkin_rchunks",
     "plan_galerkin_stream",
+    "plan_galerkin_operator_stream",
     "project_galerkin_spin_operator",
     "project_galerkin_spin_z",
     "read_galerkin_basis",
@@ -1636,10 +1637,11 @@ def iter_galerkin_rchunks(
 
 def _make_spin_operator_fold_kernel(
         *, rank: int, nspinor: int, r_carrier: int,
-        mesh: Mesh, basis_layout, face_layout):
+        mesh: Mesh, basis_left_layout, basis_right_layout, face_layout):
     """Fold one local-r basis slab into distributed operator and metric faces."""
     key = (id(mesh), int(rank), int(nspinor), int(r_carrier),
-           tuple(basis_layout.spec), tuple(face_layout.spec))
+           tuple(basis_left_layout.spec), tuple(basis_right_layout.spec),
+           tuple(face_layout.spec))
     fn = _SPIN_OPERATOR_FOLD_KERNELS.get(key)
     if fn is not None:
         return fn
@@ -1648,33 +1650,39 @@ def _make_spin_operator_fold_kernel(
     @partial(
         shard_map,
         mesh=mesh,
-        in_specs=(basis_layout.spec, P(), P('x', 'y'), P('x', 'y')),
+        in_specs=(basis_left_layout.spec, basis_right_layout.spec,
+                  P(), P('x', 'y'), P('x', 'y')),
         out_specs=(P('x', 'y'), P('x', 'y')),
         check_vma=False,
     )
-    def _fold_local(basis_local, spin_operator, operator_local, metric_local):
+    def _fold_local(basis_left, basis_right, spin_operator,
+                    operator_local, metric_local):
+        # Each operand carries only one output-rank panel and one r shard.
+        # Gather r within the orthogonal mesh axis, leaving rank/a on x and
+        # rank/b on y.  The contraction therefore creates exactly the local
+        # output face tile; no rank-by-rank intermediate exists on any device.
+        basis_left = jax.lax.all_gather(
+            basis_left, 'y', axis=2, tiled=True)
+        basis_right = jax.lax.all_gather(
+            basis_right, 'x', axis=2, tiled=True)
         # B[a,s,r] is the ket value phi_a,s(r).  Keep this bra/ket order
         # explicit because the selected-state Gram builder uses the transposed
         # row-Gram convention, which is harmless for I but wrong for a complex
         # operator matrix.
         metric_partial = jnp.einsum(
-            'asr,bsr->ab', jnp.conj(basis_local), basis_local,
+            'asr,bsr->ab', jnp.conj(basis_left), basis_right,
             optimize=True)
         operator_partial = jnp.einsum(
-            'asr,st,btr->ab', jnp.conj(basis_local), spin_operator,
-            basis_local, optimize=True)
-        for axis, dimension in (('x', 0), ('y', 1)):
-            metric_partial = jax.lax.psum_scatter(
-                metric_partial, axis, scatter_dimension=dimension, tiled=True)
-            operator_partial = jax.lax.psum_scatter(
-                operator_partial, axis, scatter_dimension=dimension, tiled=True)
+            'asr,st,btr->ab', jnp.conj(basis_left), spin_operator,
+            basis_right, optimize=True)
         return (operator_local + operator_partial,
                 metric_local + metric_partial)
 
     fn = jax.jit(
         _fold_local,
-        donate_argnums=(2, 3),
-        in_shardings=(basis_layout, rep, face_layout, face_layout),
+        donate_argnums=(3, 4),
+        in_shardings=(basis_left_layout, basis_right_layout,
+                      rep, face_layout, face_layout),
         out_shardings=(face_layout, face_layout),
     )
     _SPIN_OPERATOR_FOLD_KERNELS[key] = fn
@@ -1683,7 +1691,7 @@ def _make_spin_operator_fold_kernel(
 
 def project_galerkin_spin_operator(
         source, basis: GalerkinBasis, meta, mesh_xy: Mesh, *,
-        spin_operator, r_chunk_ranges) -> GalerkinOperatorProjection:
+        spin_operator, q_tile_budget: int) -> GalerkinOperatorProjection:
     """Project a uniform Hermitian spin operator through the full-grid basis.
 
     The operator acts only on the spinor index and is constant in real space.
@@ -1707,7 +1715,11 @@ def project_galerkin_spin_operator(
             "project_galerkin_spin_operator: spin_operator must be Hermitian")
 
     rank = int(basis.rank_carrier)
-    row_layout = NamedSharding(mesh_xy, P(None, None, ('y', 'x')))
+    plan = plan_galerkin_operator_stream(
+        rank=rank, nspinor=ns, n_rtot=int(meta.n_rtot),
+        mesh_xy=mesh_xy, q_tile_budget=int(q_tile_budget))
+    basis_left_layout = NamedSharding(mesh_xy, P('x', None, 'y'))
+    basis_right_layout = NamedSharding(mesh_xy, P('y', None, 'x'))
     face_layout = NamedSharding(mesh_xy, P('x', 'y'))
     rep = NamedSharding(mesh_xy, P())
     op = jax.device_put(op_np, rep)
@@ -1721,22 +1733,26 @@ def project_galerkin_spin_operator(
     operator, metric = _zeros()
     for _, _, basis_chunk, retained in iter_galerkin_rchunks(
             source, basis, meta, mesh_xy,
-            r_chunk_ranges=r_chunk_ranges, retained_band_range=None):
+            r_chunk_ranges=plan.r_chunk_ranges, retained_band_range=None):
         if retained:
             raise RuntimeError(
                 "operator-only Galerkin stream unexpectedly retained WFN rows")
         fold = _make_spin_operator_fold_kernel(
             rank=rank, nspinor=ns, r_carrier=int(basis_chunk.shape[2]),
-            mesh=mesh_xy, basis_layout=row_layout, face_layout=face_layout)
-        operator, metric = fold(basis_chunk, op, operator, metric)
+            mesh=mesh_xy, basis_left_layout=basis_left_layout,
+            basis_right_layout=basis_right_layout, face_layout=face_layout)
+        basis_left = jax.device_put(basis_chunk, basis_left_layout)
+        basis_right = jax.device_put(basis_chunk, basis_right_layout)
+        operator, metric = fold(
+            basis_left, basis_right, op, operator, metric)
         jax.block_until_ready((operator, metric))
-        del basis_chunk
+        del basis_chunk, basis_left, basis_right
     return GalerkinOperatorProjection(operator=operator, metric=metric)
 
 
 def project_galerkin_spin_z(
         source, basis: GalerkinBasis, meta, mesh_xy: Mesh, *,
-        r_chunk_ranges) -> GalerkinOperatorProjection:
+        q_tile_budget: int) -> GalerkinOperatorProjection:
     """Project ``S_z/hbar = sigma_z/2`` for a two-component Pauli basis."""
     if int(meta.nspinor) != 2:
         raise ValueError(
@@ -1745,27 +1761,35 @@ def project_galerkin_spin_z(
     from common.gamma_matrices import sigma_z
     return project_galerkin_spin_operator(
         source, basis, meta, mesh_xy,
-        spin_operator=0.5 * sigma_z, r_chunk_ranges=r_chunk_ranges)
+        spin_operator=0.5 * sigma_z, q_tile_budget=q_tile_budget)
 
 
 def rotate_galerkin_operator(
         coefficients, projection: GalerkinOperatorProjection,
-        mesh_xy: Mesh) -> GalerkinStateExpectation:
+        mesh_xy: Mesh, *,
+        logical_q_count: int | None = None) -> GalerkinStateExpectation:
     """Evaluate ``c^H O c / c^H M c`` for selected htransform states.
 
-    ``coefficients`` has shape ``(nq, rank_carrier, nband)`` and must come from
+    ``coefficients`` has shape ``(q_carrier, rank_carrier, nband)`` and must
+    come from
     the solve whose states are being published: ``h_transform(return_coeffs=True)``
     for a standalone path, including its active/guard selection, or
     ``compute_wfns_fi(return_coeffs=True).coeffs_fi`` for that consumer's
-    energy-ordered window.  Its two rank-sharded views meet the face-sharded
-    operator without gathering either rank axis; only the small ``(nq, nband)``
-    contractions are replicated.
+    energy-ordered window.  ``logical_q_count`` removes inert q padding from
+    the returned small arrays.  One all-mesh q batch at a time is reshaped
+    into the two rank-sharded views that meet the face-sharded operator; the
+    full path coefficient carrier never exists in either replicated view.
     """
     if coefficients.ndim != 3:
         raise ValueError(
             "rotate_galerkin_operator: coefficients must have shape "
             f"(nq,rank,nband); got {tuple(coefficients.shape)}")
-    nq, rank, nb = (int(v) for v in coefficients.shape)
+    q_input, rank, nb = (int(v) for v in coefficients.shape)
+    nq = q_input if logical_q_count is None else int(logical_q_count)
+    if not (0 < nq <= q_input):
+        raise ValueError(
+            "rotate_galerkin_operator: logical_q_count must lie in "
+            f"[1,{q_input}]; got {nq}")
     expected = (rank, rank)
     if tuple(projection.operator.shape) != expected:
         raise ValueError(
@@ -1776,11 +1800,23 @@ def rotate_galerkin_operator(
             "rotate_galerkin_operator: metric shape "
             f"{tuple(projection.metric.shape)} != {expected}")
 
+    q_layout = NamedSharding(mesh_xy, P(('x', 'y'), None, None))
     coeff_x = NamedSharding(mesh_xy, P(None, 'x', None))
     coeff_y = NamedSharding(mesh_xy, P(None, 'y', None))
     face = NamedSharding(mesh_xy, P('x', 'y'))
     rep = NamedSharding(mesh_xy, P())
-    key = (id(mesh_xy), nq, rank, nb)
+    from runtime.padding import padded_axis
+    q_batch = padded_axis(
+        1, mesh_xy, name="Galerkin operator q batch",
+        spec=q_layout.spec, axis=0).carrier
+    q_carrier = padded_axis(
+        q_input, q_batch, name="Galerkin operator q carrier").carrier
+    if q_carrier != q_input:
+        coefficients = jnp.pad(
+            coefficients, ((0, q_carrier - q_input), (0, 0), (0, 0)))
+    coefficients = jax.device_put(coefficients, q_layout)
+
+    key = (id(mesh_xy), q_batch, rank, nb)
     fn = _OPERATOR_ROTATION_KERNELS.get(key)
     if fn is None:
         @partial(
@@ -1811,12 +1847,24 @@ def rotate_galerkin_operator(
             out_shardings=(rep, rep, rep),
         )
         _OPERATOR_ROTATION_KERNELS[key] = fn
-    c_left = jax.device_put(coefficients, coeff_x)
-    c_right = jax.device_put(c_left, coeff_y)
-    value, numerator, norm = fn(
-        c_left, projection.operator, c_right, projection.metric)
+    values = []
+    numerators = []
+    norms = []
+    for q0 in range(0, q_carrier, q_batch):
+        q_chunk = coefficients[q0:q0 + q_batch]
+        c_left = jax.device_put(q_chunk, coeff_x)
+        c_right = jax.device_put(q_chunk, coeff_y)
+        value, numerator, norm = fn(
+            c_left, projection.operator, c_right, projection.metric)
+        jax.block_until_ready((value, numerator, norm))
+        values.append(value)
+        numerators.append(numerator)
+        norms.append(norm)
+        del q_chunk, c_left, c_right
     return GalerkinStateExpectation(
-        value=value, numerator=numerator, norm=norm)
+        value=jnp.concatenate(values, axis=0)[:nq],
+        numerator=jnp.concatenate(numerators, axis=0)[:nq],
+        norm=jnp.concatenate(norms, axis=0)[:nq])
 
 
 def _make_physical_project_kernel(
@@ -2024,4 +2072,42 @@ def plan_galerkin_stream(*, rank: int, nspinor: int, n_rtot: int,
         max_r_logical=max_r_logical,
         max_r_carrier=max_r_carrier,
         q_tile_local_bytes=q_tile_local_bytes,
+    )
+
+
+def plan_galerkin_operator_stream(
+        *, rank: int, nspinor: int, n_rtot: int, mesh_xy: Mesh,
+        q_tile_budget: int) -> GalerkinStreamPlan:
+    """Bound the two operator-projection rank panels by one tile budget.
+
+    The canonical basis stream initially splits r over all P ranks.  The
+    operator fold reshards that tile into an x-rank/y-r left panel and the
+    transposed y-rank/x-r right panel, then gathers r only within the panel's
+    orthogonal mesh axis.  Relative to the product-r source tile those two
+    live panels cost ``mesh_y + mesh_x`` times as much.  Price that expansion
+    here while retaining product-mesh alignment for the source transform.
+    """
+    axis_sizes = {
+        str(name): int(size)
+        for name, size in zip(mesh_xy.axis_names, mesh_xy.devices.shape)
+    }
+    if "x" not in axis_sizes or "y" not in axis_sizes:
+        raise ValueError(
+            "plan_galerkin_operator_stream requires mesh axes ('x','y')")
+    expansion = axis_sizes["x"] + axis_sizes["y"]
+    budget = int(q_tile_budget)
+    source_budget = budget // expansion
+    if source_budget <= 0:
+        raise ValueError(
+            "plan_galerkin_operator_stream: q_tile_budget is too small for "
+            f"the two rank panels on a {axis_sizes['x']}x{axis_sizes['y']} "
+            "mesh")
+    plan = plan_galerkin_stream(
+        rank=int(rank), nspinor=int(nspinor), n_rtot=int(n_rtot),
+        r_mesh_divisor=int(mesh_xy.size), q_tile_budget=source_budget)
+    return GalerkinStreamPlan(
+        r_chunk_ranges=plan.r_chunk_ranges,
+        max_r_logical=plan.max_r_logical,
+        max_r_carrier=plan.max_r_carrier,
+        q_tile_local_bytes=plan.q_tile_local_bytes * expansion,
     )
