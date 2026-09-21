@@ -359,6 +359,12 @@ $Q_a\in\mathbb C^{n\times r_a}$ from the sample itself:
   $-\operatorname{Herm}W_c(iu)$;
 * infinity: the leading eigenvectors of $M_1$.
 
+The imaginary and infinity widths are upper bounds: directions below the
+dense eigensystem's $N\epsilon_{64}$ relative spectral resolution are excluded
+before forming the pencil. A numerical null direction carries no resolved
+response and must not be amplified by diagonal Gram equilibration; the Gram
+positivity and pole gates are unchanged.
+
 The only sample data that reach the pencil are the actions
 $O_a=W_c(z_a)Q_a$ and $D_a=\partial_sW_c(z_a)Q_a$. A line support's conjugate
 partner is not a new sample: $W(\bar s)=W(s)^\dagger$ gives the partner's

@@ -190,14 +190,16 @@ def _retained_columns(
     return select(Q, counts), jax.device_put(retained, NamedSharding(mesh, P()))
 
 
-def _leading_counts(values, r, *, multiplet_tol, real_rows, batched):
+def _leading_counts(values, r, *, multiplet_tol, real_rows, batched, rcond=None):
     """Close requested leading widths with the sole multiplet-cut policy."""
     rows = (tuple(np.asarray(row) for row in values) if batched
             else (np.asarray(values),))
     if any(row.ndim != 1 or not np.all(np.isfinite(row)) for row in rows):
         raise ValueError("leading eigenvalue spectra must be finite rank-1 rows")
-    close = lambda row, width: _close_spectral_cut(
-        row, width, multiplet_tol)
+    def close(row, width):
+        if rcond is not None:
+            width = min(width, int(np.count_nonzero(row > rcond * np.max(np.abs(row)))))
+        return _close_spectral_cut(row, width, multiplet_tol)
     if not batched:
         return close(rows[0], r)
     if isinstance(r, tuple):
@@ -356,7 +358,7 @@ def right_singular_vectors(W, tau, *, eigh_plan, column_extent,
 
 
 def leading_eigenvectors(W, r, *, eigh_plan, column_extent,
-                         multiplet_tol=1e-6, real_rows=None):
+                         multiplet_tol=1e-6, real_rows=None, rcond=None):
     """Return leading Hermitian eigenvectors, including the cut multiplet.
 
     W[m,m], W[b,m,m] or W[b0,...,bk,m,m] is Hermitian on its x/y faces or in
@@ -364,9 +366,12 @@ def leading_eigenvectors(W, r, *, eigh_plan, column_extent,
     batch is independent. eigh_plan is resolved for m, and column_extent,
     multiplet_tol, real_rows and the (Q,values) output follow
     right_singular_vectors. Values retain W's units. No Hermitian projection
-    is applied to repair an invalid input.
+    is applied to repair an invalid input. With explicit ``rcond``, the width
+    is also bounded by the positive spectrum above ``rcond * max(abs(values))``
+    before multiplet closure; eigenvalues themselves are never changed.
     """
     layout = _direction_input(W, eigh_plan)
+    rcond = _as_rcond(rcond)
     if isinstance(r, (tuple, list, np.ndarray)):
         # One width per row of the flattened batch; 0 retains nothing for that row.
         r = tuple(operator.index(v) for v in np.asarray(r).reshape(-1))
@@ -381,7 +386,7 @@ def leading_eigenvectors(W, r, *, eigh_plan, column_extent,
     if W.ndim > 3:
         return _over_leading_axes(lambda w, rows: leading_eigenvectors(
             w, r, eigh_plan=eigh_plan, column_extent=column_extent,
-            multiplet_tol=multiplet_tol, real_rows=rows), W, eigh_plan.mesh, layout, real_rows)
+            multiplet_tol=multiplet_tol, real_rows=rows, rcond=rcond), W, eigh_plan.mesh, layout, real_rows)
     if layout == 'batch':
         from distrib_la._batch_reshard import batch_layout_eigh_call
         s, q = batch_layout_eigh_call("checked_eigh", eigh_plan.mesh, W, real_rows=real_rows)
@@ -406,7 +411,7 @@ def leading_eigenvectors(W, r, *, eigh_plan, column_extent,
     values = np.asarray(s)[..., ::-1].copy()
     count = _leading_counts(
         values, r, multiplet_tol=multiplet_tol, real_rows=real_rows,
-        batched=values.ndim > 1)
+        batched=values.ndim > 1, rcond=rcond)
     return _retained_columns(q, values, count, mesh=eigh_plan.mesh,
                              column_extent=column_extent, layout=layout)
 

@@ -15,7 +15,7 @@ from __future__ import annotations
 import jax
 from common import timing
 from gw.shared_pole_capacity import ConstructorCapacity
-from gw.shared_pole_directions import _round_kernels, _sample_point, select_round_states
+from gw.shared_pole_directions import _round_kernels, _sample_point, select_round_states, leading_response_directions
 from gw.shared_pole_reduction import ORIENTATION_PAIR_REFUSAL
 
 
@@ -161,7 +161,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
                                               fields=("M0", "M1", "M2", "M3") if odd_moments else ("M1", "M3"))
         with timing.fenced_section("spole.infinity_selection"):
             width = min(logical_n, max(1, int(recipe["infinity_width"])))
-            qi, round_infinity_values = distrib_la.leading_eigenvectors(
+            qi, round_infinity_values = leading_response_directions(
                 exact["M1"], width, eigh_plan=eig, column_extent=column_extent,
                 multiplet_tol=recipe["multiplet_relative_tolerance"], real_rows=real)
             budget.plan(qi.shape[-1], phase="selection")

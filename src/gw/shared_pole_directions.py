@@ -141,6 +141,17 @@ def _round_kernels(mesh):
 BATCH_AXES = ('x', 'y')
 
 
+def leading_response_directions(matrix, width, **kwargs):
+    """Select within the PSD response's resolved support before Gram equilibration.
+
+    A requested width can exceed the response rank. Exclude eigenvalues below
+    the dense eigensystem's n*eps relative resolution, not weak Gram modes or
+    negative poles; all downstream physical gates remain unchanged.
+    """
+    return distrib_la.leading_eigenvectors(
+        matrix, width, rcond=matrix.shape[-1] * np.finfo(np.float64).eps, **kwargs)
+
+
 def select_round_states(samples, recipe, *, sample_lo, real, mesh_xy, eigh_plan, svd_plan,
                         column_extent, logical_n, ordered=False, exchange=None,
                         current_rotation=None):
@@ -194,7 +205,7 @@ def select_round_states(samples, recipe, *, sample_lo, real, mesh_xy, eigh_plan,
     if kinds["imaginary"]:
         stack = k.negative_hermitian(k.take(tuple(sid - sample_lo for sid, _ in kinds["imaginary"]))(W))
         width = min(logical_n, max(1, int(recipe["imaginary_width"])))
-        selected["imaginary"] = distrib_la.leading_eigenvectors(
+        selected["imaginary"] = leading_response_directions(
             stack, width, eigh_plan=eigh_plan, column_extent=column_extent, multiplet_tol=tol, real_rows=real)
         del stack
 

@@ -109,6 +109,52 @@ def test_direction_batches():
     check_direction_batches(mesh, arms=(_LOCAL_ARM,))
 
 
+def check_numerical_support(mesh):
+    """Fixed widths must not turn response nulls into Gram directions."""
+    import jax
+    import jax.numpy as jnp
+    import distrib_la as D
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    from gw.shared_pole_directions import leading_response_directions
+
+    n, parents = 16, int(mesh.size)
+    rng = np.random.default_rng(2540)
+    u = np.linalg.qr(rng.normal(size=(n, n)) + 1j*rng.normal(size=(n, n)))[0]
+    spectra = np.full((parents, 2, n), 1e-16)
+    spectra[:, 0, :3] = [4, 2, 2]
+    spectra[:, 1, :5] = [4, 2, 2, .1, 1e-7]
+    matrix = (u * spectra[..., None, :]) @ u.conj().T
+    spec = NamedSharding(mesh, P(('x', 'y')))
+    put = lambda a: jax.make_array_from_callback(a.shape, spec, lambda i: a[i])
+    extent = lambda r: max(int(mesh.shape['y']), int(mesh.shape['y'])*((r+int(mesh.shape['y'])-1)//int(mesh.shape['y'])))
+    options = dict(eigh_plan=D.plan('eigh', mesh, n=n, backend='off',
+                                    batched_route='batch_reshard'),
+                   column_extent=extent, real_rows=parents-1)
+    a = put(matrix)
+    q, values = leading_response_directions(a, 8, **options)
+    counts = [[len(v) for v in row] for row in values]
+    assert counts == [[3, 5]]*(parents-1) + [[0, 0]], counts
+    expected = np.zeros_like(matrix)
+    expected[:-1, 0] = u[:, :3] @ u[:, :3].conj().T
+    expected[:-1, 1] = u[:, :5] @ u[:, :5].conj().T
+    error = float(jnp.max(jnp.abs(q @ q.conj().swapaxes(-1, -2) - put(expected))))
+    assert error < 2e-8, error  # weakest retained eigenvalue is 1e-7
+    _, unbounded = D.leading_eigenvectors(a, 8, **options)
+    assert all(len(v) == 8 for row in unbounded[:-1] for v in row)
+    _, degenerate = leading_response_directions(a, 2, **options)
+    assert all(len(v) == 3 for row in degenerate[:-1] for v in row)
+    return dict(status='PASS', counts=counts, projector_error=error,
+                scope='nested batch, numerical null exclusion, weak nonzero retention, multiplet closure, synthetic rows')
+
+
+def test_numerical_support():
+    import jax
+    from jax.sharding import Mesh
+    from lxkit.testing import require_devices
+    require_devices(4, 'cpu')
+    check_numerical_support(Mesh(np.asarray(jax.devices('cpu')[:4]).reshape(2, 2), ('x', 'y')))
+
+
 if __name__ == '__main__':
     from runtime import initialize_communicator_stack, run_main_and_finalize
     initialize_communicator_stack(platform='gpu')

@@ -378,7 +378,7 @@ def construct_diagonal_sector_round(samples, moments, meta, config, geometry, *,
     from jax.sharding import PartitionSpec as P
     from gw.gw_config import linalg_resolution
     from gw.shared_pole_capacity import ConstructorCapacity
-    from gw.shared_pole_directions import _round_kernels,select_round_states
+    from gw.shared_pole_directions import _round_kernels,select_round_states,leading_response_directions
     from gw.shared_pole_local import partner_realization,round_tables,reduce_round,_batch_put
     from gw.shared_pole_recipe import shared_real_pole_v1_r3b
 
@@ -409,7 +409,7 @@ def construct_diagonal_sector_round(samples, moments, meta, config, geometry, *,
     svd=budget.eigenplan(2*local_meta.n_rmu_padded)
     extent=lambda width:padded_axis(width,mesh_xy,name='shared_pole_port',
         specs=((P('x','y'),0),(P('x','y'),1))).carrier
-    qi,values=distrib_la.leading_eigenvectors(moments['M1'],min(n,recipe['infinity_width']),
+    qi,values=leading_response_directions(moments['M1'],min(n,recipe['infinity_width']),
         eigh_plan=eig,column_extent=extent,multiplet_tol=recipe['multiplet_relative_tolerance'],
         real_rows=geometry['real'])
     kernels=_round_kernels(mesh_xy)
