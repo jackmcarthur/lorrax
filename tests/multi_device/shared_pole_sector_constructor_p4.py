@@ -50,6 +50,10 @@ def check_sector_constructor(mesh, root):
         held=np.array([False,False,True,True]),
         support_pair=np.array([[-1,-1],[-1,-1],[0,1],[0,1]],np.int64),
         fit_ids=np.array([0,1],np.int64),held_ids=np.array([2,3],np.int64))
+    recipe['sector_pole_treatment']=dict(
+        version='sector_twice_map_span_v1', status='initialized_map0',
+        ceiling_ry=1.0e6, source_response_span_ry=5.0e5,
+        scope='numerical treatment; not a physical pole bound')
     meta.shared_pole_recipe=recipe
     # The production ledger receives a resolved per-device budget. For this
     # tiny synthetic bank, use the live GPU limit instead of its 3U fallback;
@@ -114,6 +118,14 @@ def check_sector_constructor(mesh, root):
     manifest=store.validate_shared_pole_sector_manifest(handle['path'],expected_identity=identity,
         mesh_xy=mesh,capacity=meta.shared_pole_capacity)
     assert manifest['digest']==handle['digest']
+    treatment_rows=[row for row in result['q_receipts']
+                    if row.get('pole_treatment') is not None]
+    assert treatment_rows
+    assert all(set(row['pole_treatment']['sectors'])=={'CC','TT','CT'}
+               for row in treatment_rows)
+    assert all(all(sector['common_census'])
+               for row in treatment_rows
+               for sector in row['pole_treatment']['sectors'].values())
     headers=manifest['model_headers']
     factors={}
     for sector,family in (('CC',0),('TT',1),('CT_C',0),('CT_T',1)):

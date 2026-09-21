@@ -104,7 +104,8 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output):
     import numpy as np
     from pathlib import Path
     from common import timing
-    from common.collectives import device_put_process_local, rank0_transaction
+    from common.collectives import (device_put_process_local, gather_to_host,
+                                    rank0_transaction)
     from file_io.slab_io import SlabIO
     from file_io.shared_pole_store import (validate_shared_pole_bank, _metadata,
         write_shared_pole_model,write_shared_pole_sector_manifest)
@@ -236,7 +237,7 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output):
                 policy=dict(treatment_policy),
                 scope='stored positive-pole models; held rows below score the pre-treatment signed fit',
                 sigma_accuracy='NOT_MEASURED_BY_CONSTRUCTOR',
-                sectors={name:{key:np.asarray(value)[:real].tolist()
+                sectors={name:{key:np.asarray(gather_to_host(value))[:real].tolist()
                     for key,value in values.items()}
                     for name,values in treatment.items()})
         row_receipt=dict(parents=ids[:real],held=held_rows,
