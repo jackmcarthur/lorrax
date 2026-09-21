@@ -324,7 +324,7 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
             mesh_xy=mesh_xy, output=str(root / "model.h5"))
     else:
         from runpy import run_path
-        run_path("/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Fe/07_bcc_fm_capacity312_charge300_2026-09-20/16_charge_exact_dyson_boundary/diagnose.py")["diagnose"](
+        run_path("/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Fe/07_bcc_fm_capacity312_charge300_2026-09-20/17_charge_batch_storage_boundary/diagnose.py")["diagnose"](
             wfns, V_q, meta, config, mesh_xy=mesh_xy, bank=bank, identity=identity,
             occupation_state=occupation_state, output=root / "dyson_action.json")
         result = construct_shared_poles(bank, bank, meta, config,
