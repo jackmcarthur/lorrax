@@ -19,7 +19,8 @@ current density `ψ†α^iψ`).
 
 ## 1. Status in one table {#four-current-phase-status}
 
-> **Integration status at `34228021` (2026-09-02).** Phase 1 is complete
+> **Driver integration status on `origin/main@2df9814e` plus the two ordered
+> head commits (2026-09-17).** Phase 1 is complete
 > inside the slab one-shot static-COHSEX envelope. Phase 2 is implemented;
 > the magnetic GN-PPM response and two-residue fit are W-level gated on CrI3,
 > but there is no Sigma-level CrI3 number. Phase 3 is minimally implemented:
@@ -39,8 +40,18 @@ current density `ψ†α^iψ`).
 | bare transverse exchange `Σ^B` (TT) | none: instantaneous (bare Breit) | **inside the packed envelope**: `⟨D_TT⟩` from the Γ-cell completion, always on. **Outside it**: none — the `−⟨v P^T⟩_mBZ` tensor slot overlay (§2.1) survives as library code with no deck route | inside: `bispinor_gw = bare_transverse` + the §2 envelope. Outside: no deck key since 2026-09-01 | completion implemented and always on; the overlay is unreachable from a deck and **refused** on either packed route |
 | screened TT/CT/TC (packed 4×4) | **static only** (`compute_mode = cohsex`) | charge CC `q²` + the charge wings + **optional** Hall CT/TC `q¹` (§4), **always on**; `head_correction = off` is a DEBUG skip behind a loud banner | `bispinor_gw = full_static_cohsex` | experimental, insulating slab, one shot |
 | *unscreened* TT via the same packed operator | current block evaluated once at `ω = 0`, in static COHSEX and packed GN/HL-PPM | the same Γ-cell completion, charge-only `R(q)`, returning `diag(W^{00}_h, ⟨D_TT⟩)`; Hall **refused** (§4) | `bispinor_gw = bare_transverse` inside the packed envelope | experimental, slab, one shot; body byte-identical to the incumbent route when compared without its head |
-| the packed operator on a **dynamic** Σ | **CC dynamic, current blocks static**: `W_00(ω)` follows the PPM model while the other fifteen packed blocks are evaluated at `ω = 0` | CC: the dynamic model's own head (§3.3) for `Σ_c` plus the scalar band-diagonal `⟨v⟩` head for `Σ_X`; TT and CT/TC: the packed Γ-cell completion of §4.2 | either `bispinor_gw` value with `compute_mode` in {`gn_ppm`, `hl_ppm`} inside the packed envelope; `mpa` stays on the incumbent route | experimental, slab, one shot; the current blocks' `ω`-dependence is neglected and bounded as in §2.2 |
-| retarded / dynamic photon `D^{IJ}(ω)` — the current blocks' own frequency dependence | — | — | none | **does not exist**; bounded from above in §2.2 |
+| the packed operator on a **dynamic** Σ | **CC dynamic, current blocks static**: `W_00(ω)` follows the PPM model while the other fifteen packed blocks are evaluated at `ω = 0` | CC: the dynamic model's own head (§3.3) for `Σ_c` plus the scalar band-diagonal `⟨v⟩` head for `Σ_X`; TT and CT/TC: the packed Γ-cell completion of §4.2 | either `bispinor_gw` value with `compute_mode` in {`gn_ppm`, `hl_ppm`} inside the packed envelope; `mpa` stays on the incumbent route | experimental, slab, one shot; current-frequency dependence is omitted without a general error bound (§2.2) |
+| retarded / dynamic photon `D^{IJ}(ω)` — the current blocks' own frequency dependence | — | — | none | **does not exist**; the bare photon is instantaneous |
+
+The two ordered-head commits add a finite-band, full-frequency **uniform TT
+response** and a diagonal **TT self-energy contraction** as callable library
+functions. They do not connect either function to `gw_jax` or `sigma_dispatch`.
+The table therefore describes the live deck behavior, including its static
+current blocks. The new functions' narrower model and the missing handoff are
+spelled out in [§4.6](#ordered-transverse-head-library). The separate
+Faraday branch `lane/bisp-dynamic-hall-head-2026-09-02` is not part of these
+two commits: its frequency-even, magnetisation-odd Hall coefficient and
+GN-PPM CT/TC consumer must not be inferred from this table.
 
 Binding rule ([decisions, 2026-09-01](../architecture/decisions.md)): COHSEX
 with bispinors always carries the Γ-cell head; `head_correction = off` is a
@@ -53,16 +64,16 @@ reach a different head.
 
 Two facts follow from the table and are easy to miss:
 
-* The photon sector's **current** blocks have no frequency dependence
-  anywhere. `Σ^B` uses the instantaneous Coulomb-gauge propagator, and the
+* The live driver's photon-sector **current** blocks have no frequency
+  dependence. `Σ^B` uses the instantaneous Coulomb-gauge propagator, and the
   packed screened current response is built once at `ω = 0`. The minimal
   dynamic route changes only the **charge** block: on that route
   `W_00(ω)` carries the run's plasmon-pole model while `W_TT` and `W_CT`
   stay at `ω = 0`, and `Σ^B` is the TT block of that one operator rather
   than a separately added bare-exchange term. `mpa` still screens the
   charge channel only and adds `Σ^B` through the incumbent owner.
-* The only time-reversal-odd term in the screened photon head is the
-  static Hall (Chern–Simons) response. For a gapped system that
+* Within the live static screened-head model, the only time-reversal-odd
+  term is the static Hall (Chern–Simons) response. For a gapped system that
   coefficient is topologically quantized (§4.4), so for a Chern-trivial
   insulator it is exactly zero, so the packed mode's head reduces to the
   charge-only head of §3 — its Hall term is zero both by default (an absent
@@ -195,8 +206,9 @@ the incumbent route moves quasiparticle energies by **0.115 meV MAE /
 ### 2.2 Freezing the current blocks inside a dynamic run
 
 The packed dynamic route evaluates the charge block at every
-frequency and the twelve current blocks once, at `ω = 0`. That is an
-approximation, and it is bounded rather than asserted.
+frequency and the twelve current blocks once, at $\omega = 0$. That is an
+approximation; the numerical comparison below does not bound its dynamic
+error.
 
 Write the packed screened propagator as
 
@@ -204,32 +216,21 @@ $$
 W_{AB}(\omega) = D_{AB} + \sum_{CD} D_{AC}\,\chi_{CD}(\omega)\,W_{DB}(\omega),
 $$
 
-with `A, B ∈ {C, T1, T2, T3}`. Every current vertex carries one factor of
-`α_FS/2`, so `χ_TT` and `χ_CT` enter `W` at `α_FS²` and `α_FS` × (a
-transverse-charge overlap that vanishes in the Coulomb gauge at `q → 0`)
-respectively. The neglected quantity is therefore
-`W_AB(ω) − W_AB(0)` for `AB ≠ CC`, which is second order in the fine
-structure constant to begin with.
-
-It is bounded above by the **static** current-screening contribution,
-`W_AB(0) − D_AB`, which the code can evaluate directly: the Ward-subtracted
-no-pair current response is a positive-weight spectral integral sampled on
-the imaginary axis, so `|χ_TT(iω)| ≤ |χ_TT(0)|` for every `ω`, and the
-screened-minus-bare current correction at any frequency is no larger in
-magnitude than its value at `ω = 0`. That value is exactly the difference
-between `bispinor_gw = bare_transverse` (`χ_TT = χ_CT = 0`) and
-`bispinor_gw = full_static_cohsex` (the sixteen-block `ω = 0` Dyson solve)
-on the same tip and the same deck.
+with $A,B\in\{C,T_1,T_2,T_3\}$. The omitted interaction is
+$W_{AB}(\omega)-W_{AB}(0)$ for blocks with a current index. A small static
+screened-versus-bare result alone cannot bound it: the insulating uniform
+current response satisfies $K_{TT}(0)=0$ by the Ward subtraction while its
+frequency-dependent symmetric and magnetic antisymmetric pieces can remain
+nonzero. The coupled charge/current Dyson inverse also prevents carrying a
+scalar response bound over to every matrix element of $W$. See [§4.6](#ordered-transverse-head-library).
 
 **Measured on MoS2 3×3, both heads on, 270 quasiparticle states:**
 `max|ΔE_qp| = 0.012 µeV = 1.2 × 10⁻⁸ eV` in the static COHSEX mode
 (GATE D, claim 581), with the same pair re-measured on the dynamic route
 (`reports/bisp_n_dynamic_packed_2026-09-01/report.md`). Current
-screening is worth ~10⁻⁸ eV on this deck, six orders of magnitude below the
-0.1 meV scale at which the transverse Γ-cell head matters, so freezing its
-frequency dependence is not the leading error in any bispinor number this
-code currently produces. SCOPE: one system, one grid; this is a measurement
-on MoS2 3×3, not a general statement about current screening.
+screening is worth ~10⁻⁸ eV in this static comparison. It is not a bound on
+full-frequency current screening, a CrI3 magnetic estimate, or a convergence
+test for a dynamic four-current self-energy.
 
 ## 3. The charge head: `S(ω)`, local fields, and the three frequency models
 
@@ -608,9 +609,10 @@ response, and the code's ladder screening (`w_bse`) is charge-only.
 
 The time-reversal-odd photon physics that is *not* quantized, the
 finite-frequency Hall/Kerr response `σ_{xy}(ω)` and the antisymmetric part of
-the TT response, lives at `ω ≠ 0` and at `O(q²)`. Neither is present in the
-static packed head, and no dynamic photon propagator exists to hold the
-former.
+the TT response, lives at $\omega\ne0$ and in distinct long-wavelength
+coefficients. Neither is present in the live static packed head. The bare
+photon remains instantaneous; a frequency-dependent **electronic** response
+can nevertheless screen it, as in the standalone TT model of §4.6.
 
 ### 4.5 Audited seams and remaining limitation
 
@@ -635,6 +637,65 @@ routes already share one slab quadrature.
   added unconditionally wherever it was built (`:1045-1066`). Every bispinor
   mode and every compute mode carries it unless `omit_v_h` (density
   self-consistency, which rebuilds both fields itself).
+
+### 4.6 Ordered transverse head library {#ordered-transverse-head-library}
+
+The two ordered-head commits add `qsgw_head.uniform_current_response_sharded`
+and `photon_sigma.contract_ordered_tt_head_sigma` plus
+`contract_instantaneous_tt_head_exchange`. These are library boundaries for
+an insulating, finite positive-energy manifold. They have focused unit tests,
+but no production caller constructs their response bank, completed
+frequency-dependent $W_{TT}$, contour factors, or alpha endpoint sweep in a
+GW run. The direct CrI3 result in the sandbox evidence file
+`reports/cri3_head_sectors_2026-09-14/tt_consumer.md` is a separate research
+calculation of the leading-$q$ TT model.
+
+For energy-ordered occupied-to-empty pairs, put
+$\Delta_{mn}=\epsilon_m-\epsilon_n>0$ and
+$A_{ab}^{mn}=\langle n|J_a|m\rangle\langle m|J_b|n\rangle$. The finite-manifold
+Ward completion is $K_{TT}(z)=\Pi_{TT}(z)-\Pi_{TT}(0)$, with the single response
+normalization $2/(n_{\rm spin}n_{\rm spinor}\Omega N_k)$. Its symmetric part is
+even in $z$ and its magnetic antisymmetric part is odd in $z$:
+
+$$
+K^S_{ab}(z)=-\frac{2C}{\Omega N_k}\sum_{knm}
+\frac{(f_n-f_m)z^2\operatorname{Re}A_{ab}^{mn}}
+{\Delta_{mn}(\Delta_{mn}^2-z^2)},\qquad
+K^A_{ab}(z)=-\frac{2iC}{\Omega N_k}\sum_{knm}
+\frac{(f_n-f_m)z\operatorname{Im}A_{ab}^{mn}}
+{\Delta_{mn}^2-z^2},\quad
+C=\frac{2}{n_{\rm spin}n_{\rm spinor}}.
+$$
+
+Thus $K_{TT}(0)=0$ does not delete the magnetic $K^A_{TT}(z)$ for $z\ne0$.
+Its nonzero real symmetric limit
+$K_{TT}(\infty)=-\Pi_{TT}(0)$ gives
+$W_{TT}(\infty)\ne D_{TT}$ after the instantaneous-photon Dyson solve. The
+decaying contour operand is $H_{TT}(z)=W_{TT}(z)-W_{TT}(\infty)$; bare TT
+exchange and the $W_{TT}(\infty)-D_{TT}$ contact change are separate occupied
+contractions. The ordered contour supplies $F_+$ to empty intermediate states
+and $F_-$ to occupied ones, with a final factor $1/(\Omega N_k)$ applied once.
+The response producer accepts exact binary insulating occupations and refuses
+differently occupied degeneracies; it does not supply a metallic Drude term.
+
+The response current $J_a$ must name its operator. The production photon
+endpoint is $\langle n|\alpha_a|m\rangle$ on kinetic-balance four-spinors;
+the uniform-gauge $\Gamma_a=(\alpha_{\rm FS}/2)\partial_{k_a}H$ includes the
+nonlocal ICL contribution and is a different operator. The CrI3 comparison
+found a $0.518609$ relative response difference on its alpha scale; mixing
+the two endpoints has no physical interpretation. The research TT result used
+matched alpha response and alpha external vertices. It excludes current
+wings and body, spatial $q^2$ terms, complement-space closure, and retarded
+photons, so it is not a full dynamic four-current head.
+
+The dynamic Hall coefficient in the separate Faraday lane is **even** in
+frequency, **odd** under magnetisation reversal, and enters the $q$-linear
+CT/TC response. On an inversion-symmetric mini-BZ, its first-order
+$q$-odd zeroth head moment cancels, while two Hall insertions yield a
+$q$-even, magnetisation-even CC/TT feedback. The latter is not a direct
+TR-odd self-energy. The frequency-odd antisymmetric TT tensor above is a
+different response coefficient. None of these parity statements makes the
+ordinary dynamic density head an odd scalar: $q_aS^A_{ab}q_b=0$.
 
 ## 5. Lineage of the screened four-current solve
 

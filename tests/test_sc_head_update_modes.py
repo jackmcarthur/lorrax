@@ -2,9 +2,8 @@
 
 Three questions, one per section:
 
-1. **Config** — is ``dft_velocity`` a legal value, does the mandatory rule
-   for a fractionally occupied deck accept EITHER metal head mode, and is
-   the refusal that catches a metal deck with no head mode intact?
+1. **Config** — is ``dft_velocity`` a legal value for the insulating MP1
+   head, and does a WFN-classified metal refuse both velocity-head modes?
 2. **Dispatch** — does the ``dft_velocity`` route reach the
    parallel-transport loader?  It must not: this mode deliberately reads only
    the velocity stage and has no finite-link DeltaH derivative.  Pinned by
@@ -38,7 +37,9 @@ from jax.sharding import Mesh
 
 from common.parallel_transport import build_forward_neighbor_table
 from gw import qsgw_head
-from gw.gw_config import METAL_HEAD_UPDATES, LorraxConfig
+from gw.gw_config import (
+    METAL_HEAD_UPDATES, LorraxConfig, validate_material_inputs,
+)
 from gw.qsgw_head import (
     build_iteration_head_response,
     head_s_tensor_sharded,
@@ -59,7 +60,7 @@ def _mesh():
 
 
 # ---------------------------------------------------------------------------
-# 1. Config: the vocabulary and the widened mandatory rule
+# 1. Config: insulating MP1 head modes and the metallic refusal
 # ---------------------------------------------------------------------------
 
 _BASE = """\
@@ -70,12 +71,11 @@ nband = 10
 memory_per_device_gb = 4.0
 """
 
-# The three keys the fractional-occupation rule already required before
-# this mode existed; only the head-mode value is under test below.  rcrop is
-# the only accelerator a deck may name (GATE sc_accelerator_rcrop_only), and
-# it is legal on a metal since the entry-solve rule -- see
-# ``test_rcrop_is_legal_on_a_metallic_deck`` below.
-_FRACTIONAL = (
+# ``occ_broadening`` is the insulating MP1 smeared-head dial.  It does not
+# classify the WFN as a metal; that happens after WFN loading.  Metal runs
+# instead require the Fermi-Dirac ``occ_smearing_width_ry`` and keep the
+# velocity head update off (owner ruling 2026-09-17).
+_MP1_HEAD = (
     "qp_solver = self_consistent\n"
     "sc_accelerator = rcrop\n"
     "occ_broadening = 0.13605693122994\n"
@@ -89,21 +89,47 @@ def _config(tmp_path, extra: str = "", name: str = "head_mode.in"):
         str(path), print_fn=lambda *a, **k: None)
 
 
-def test_the_metal_head_vocabulary_is_exactly_the_two_modes():
+def test_velocity_head_vocabulary_is_exactly_the_two_modes():
     # One tuple owns the pair; a consumer that spells it out again is the
     # drift this constant exists to prevent.
     assert METAL_HEAD_UPDATES == ("parallel_transport", "dft_velocity")
 
 
 @pytest.mark.parametrize("mode", METAL_HEAD_UPDATES)
-def test_a_fractional_deck_accepts_either_metal_head_mode(tmp_path, mode):
-    cfg = _config(tmp_path, _FRACTIONAL + f"sc_head_update = {mode}\n")
+def test_an_insulating_mp1_deck_accepts_either_head_mode(tmp_path, mode):
+    cfg = _config(tmp_path, _MP1_HEAD + f"sc_head_update = {mode}\n")
     assert cfg.sc.head_update == mode
     assert cfg.screening.occ_broadening_ev > 0.0
+    validate_material_inputs(cfg, "insulator")
+
+
+@pytest.mark.parametrize("mode", METAL_HEAD_UPDATES)
+def test_a_metal_refuses_both_velocity_head_modes(tmp_path, mode):
+    cfg = _config(
+        tmp_path,
+        "compute_mode = mpa\n"
+        "qp_solver = self_consistent\n"
+        "occ_smearing_width_ry = 0.01\n"
+        f"sc_head_update = {mode}\n",
+    )
+    with pytest.raises(ValueError, match="GATE metal_sc_head_update_disabled"):
+        validate_material_inputs(cfg, "metal")
+
+
+def test_a_metal_refuses_an_mp1_width_beside_fermi_dirac_width(tmp_path):
+    with pytest.raises(ValueError, match="GATE metal_sc_head_update_disabled"):
+        _config(
+            tmp_path,
+            "compute_mode = mpa\n"
+            "qp_solver = self_consistent\n"
+            "occ_smearing_width_ry = 0.01\n"
+            "occ_broadening = 0.13605693122994\n"
+            "sc_head_update = dft_velocity\n",
+        )
 
 
 def test_dft_velocity_parses_on_an_insulating_deck_too(tmp_path):
-    # The head mode is not itself the metal switch; occ_broadening is.
+    # The head mode is not itself a metal declaration.
     cfg = _config(tmp_path, "sc_head_update = dft_velocity\n")
     assert cfg.sc.head_update == "dft_velocity"
     assert cfg.screening.occ_broadening_ev == 0.0
@@ -118,21 +144,19 @@ def test_a_head_update_cannot_override_head_correction_off(tmp_path):
             "sc_head_update = dft_velocity\n")
 
 
-def test_a_fractional_deck_with_the_head_off_is_still_refused(tmp_path):
-    # UNCHANGED behaviour: widening the rule to two values must not turn it
-    # into no rule at all.
+def test_an_mp1_head_deck_with_the_head_off_is_refused(tmp_path):
     with pytest.raises(ValueError, match="sc_head_update"):
-        _config(tmp_path, _FRACTIONAL + "sc_head_update = off\n")
+        _config(tmp_path, _MP1_HEAD + "sc_head_update = off\n")
 
 
-def test_a_fractional_deck_defaulting_the_head_key_is_still_refused(tmp_path):
+def test_an_mp1_head_deck_defaulting_the_head_key_is_refused(tmp_path):
     # ...including when the deck simply omits the key (default "off").
     with pytest.raises(ValueError, match="occ_broadening"):
-        _config(tmp_path, _FRACTIONAL)
+        _config(tmp_path, _MP1_HEAD)
 
 
 @pytest.mark.parametrize("mode", METAL_HEAD_UPDATES)
-def test_the_other_two_fractional_preconditions_are_unchanged(tmp_path, mode):
+def test_the_other_mp1_head_preconditions_are_unchanged(tmp_path, mode):
     # A legal head mode does not excuse the solver.
     with pytest.raises(ValueError, match="self_consistent"):
         _config(
@@ -142,9 +166,9 @@ def test_the_other_two_fractional_preconditions_are_unchanged(tmp_path, mode):
 
 
 @pytest.mark.parametrize("mode", METAL_HEAD_UPDATES)
-def test_rcrop_is_legal_on_a_metallic_deck(tmp_path, mode):
+def test_rcrop_is_legal_on_an_insulating_mp1_deck(tmp_path, mode):
     """The entry-solve rule (2026-08-15) makes F(H) a self-map of H alone,
-    so the accelerator refusal is gone: a metallic rCROP deck parses."""
+    so the accelerator refusal is gone: an insulating MP1 rCROP deck parses."""
     cfg = _config(
         tmp_path,
         "qp_solver = self_consistent\n"
