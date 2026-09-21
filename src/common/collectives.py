@@ -1456,7 +1456,7 @@ def agree_io_error(error, *, path, stage):
     _raise_io_receipts(receipts, path=path, stage=stage)
 
 
-def rank0_transaction(path, *, stage, write, validate=None):
+def rank0_transaction(path, *, stage, write, validate=None, return_value=False):
     """Validate on all ranks, perform serial I/O, then broadcast its verdict.
 
     Parameters
@@ -1470,6 +1470,10 @@ def rank0_transaction(path, *, stage, write, validate=None):
     validate : callable, optional
         Preflight called on every rank before mutation. Materialize replicated
         JAX metadata here, never inside ``write``. No tensor is gathered here.
+    return_value : bool, optional
+        Broadcast and return a JSON scalar produced by ``write``. This is for
+        small control decisions such as an authenticated resume verdict, never
+        artifact metadata or tensor payloads.
     """
     if validate is not None:
         error = None
@@ -1479,9 +1483,10 @@ def rank0_transaction(path, *, stage, write, validate=None):
             error = exc
         agree_io_error(error, path=path, stage=f'{stage}/preflight')
     error = None
+    value = None
     if process_rank() == 0:
         try:
-            write()
+            value = write()
         except BaseException as exc:
             error = exc
     receipt = _io_error_receipt(error)
@@ -1489,6 +1494,20 @@ def rank0_transaction(path, *, stage, write, validate=None):
         from jax.experimental import multihost_utils as mh
         receipt = mh.broadcast_one_to_all(receipt, is_source=process_rank() == 0)
     _raise_io_receipts([receipt], path=path, stage=stage)
+    if return_value:
+        import json
+        import numpy as np
+
+        data = np.zeros(4096, dtype=np.uint8)
+        if process_rank() == 0:
+            encoded = json.dumps(value, ensure_ascii=True, allow_nan=False).encode('ascii')
+            if len(encoded) > data.size:
+                raise ValueError('rank0_transaction control value exceeds 4096 bytes')
+            data[:len(encoded)] = np.frombuffer(encoded, dtype=np.uint8)
+        if process_count() > 1:
+            from jax.experimental import multihost_utils as mh
+            data = mh.broadcast_one_to_all(data, is_source=process_rank() == 0)
+        return json.loads(bytes(np.asarray(data)).rstrip(b'\0'))
 
 
 def rank0_atomic_file_transaction(

@@ -58,6 +58,27 @@ class CapacityTests(unittest.TestCase):
         self.assertEqual(row['status'],'FAIL')
         self.assertEqual(row['aggregate_bytes_per_rank'],769)
         self.assertEqual(row['max_mesh_ranks_at_fixed_bytes'],3)
+        self.assertNotIn('want Px*Py', row['reason'])
+
+    def test_preview_does_not_record_a_failed_route_quote(self):
+        ledger=self.ledger()
+        row=ledger.preview(resident_bytes_per_rank=769,
+                           workspace_bytes_per_rank=0)
+        self.assertEqual(row['device_budget_status'],'FAIL')
+        self.assertEqual(ledger.entries,[])
+
+    def test_ordered_production_side_bound_covers_all_role_multiplicities(self):
+        import numpy as np
+        from gw.shared_pole_execution import constructor_side_upper_bound
+        from gw.shared_pole_recipe import ROLE_CODES
+        recipe=dict(
+            role=np.asarray([ROLE_CODES['line']]*14+
+                            [ROLE_CODES['imaginary']]*4+
+                            [ROLE_CODES['held_line']]*4),
+            held=np.asarray([False]*18+[True]*4),
+            line_direction_cap=198,imaginary_width=791,infinity_width=396)
+        self.assertEqual(constructor_side_upper_bound(
+            recipe,ordered=True,odd_moments=True,logical_n=3164),24536)
 
     def test_sequential_not_accumulated(self):
         ledger=self.ledger()

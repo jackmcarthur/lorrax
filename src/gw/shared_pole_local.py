@@ -411,6 +411,17 @@ def check_round(model, signed, inverse_coulomb_sqrt, held, moments, infinity_dir
     import numpy as np
     from jax.sharding import NamedSharding, PartitionSpec as P
 
+    from gw.shared_pole_execution import is_face
+    if is_face(model[0]):
+        if real != 1:
+            raise ValueError('whole-mesh shared-pole checks require one physical parent')
+        from gw.shared_pole_execution import face_round_check_program
+        out = face_round_check_program(mesh_xy, bool(ordered))(
+            model, signed, inverse_coulomb_sqrt, *held,
+            np.asarray(nodes, np.complex128), np.float64(eta_ry),
+            *moments, infinity_directions)
+        return jax.tree.map(np.asarray, out)
+
     replicated = NamedSharding(mesh_xy, P())
     program = round_checks(mesh_xy, native_eigh, bool(ordered))
     live = _batch_put(mesh_xy, np.arange(int(model[0].shape[0])) < int(real))
@@ -418,6 +429,52 @@ def check_round(model, signed, inverse_coulomb_sqrt, held, moments, infinity_dir
                   jax.device_put(np.asarray(nodes, np.complex128), replicated),
                   jax.device_put(np.float64(eta_ry), replicated), *moments, infinity_directions)
     return jax.tree.map(np.asarray, out)
+
+
+def _round_check_equations(model, signed, inverse, wc, dw, z, eta, m1, m3, qi,
+                           *, matmul, eigh, gates, ordered):
+    """Shared scalar gate equations for local-parent and whole-mesh adapters."""
+    import jax
+    import jax.numpy as jnp
+    from gw.shared_pole_directions import _model_diagnostics
+    from gw.shared_pole_gates import (shared_pole_passivity,
+                                      shared_pole_reciprocity,
+                                      signed_shared_pole_passivity)
+
+    factor, poles, active = model
+    if ordered:
+        factor, mu, kept = signed
+        passive = signed_shared_pole_passivity(
+            signed, inverse, eta_ry=eta, matmul=matmul, eigh=eigh, gates=gates)
+        node = z[:, None]
+        weights = jnp.where(kept, 1 / (node * mu - 1), 0)
+        slopes = jnp.where(kept, -mu / (node * mu - 1) ** 2 / (2 * node), 0)
+        scale = jnp.where(kept, 1 / jnp.where(kept, jnp.abs(mu), 1), 0)
+        moment_model = (factor * scale[:, None, :], scale ** 2, kept)
+    else:
+        passive = shared_pole_passivity(
+            model, inverse, eta_ry=eta, matmul=matmul, eigh=eigh, gates=gates)
+        weights = jnp.where(active, 1 / ((z ** 2)[:, None] - poles), 0)
+        slopes = -weights ** 2
+        moment_model = model
+
+    def sample(args):
+        weight, slope, w, d = args
+        errors, reciprocity = [], []
+        for coefficient, exact in ((weight, w), (slope, d)):
+            value = matmul(factor * coefficient[None, None, :],
+                           factor, transb='C')[0]
+            errors.append(jnp.linalg.norm(value - exact)
+                          / jnp.maximum(jnp.linalg.norm(exact),
+                                        jnp.finfo(jnp.float64).tiny))
+            reciprocity.append({} if ordered else
+                shared_pole_reciprocity(value, exact, gates=gates))
+        return jnp.stack(errors), jax.tree.map(lambda *v: jnp.stack(v), *reciprocity)
+    errors, reciprocity = jax.lax.map(sample, (weights, slopes, wc[0], dw[0]))
+    rows = lambda a: jnp.swapaxes(a, 0, 1)[None]
+    defects = _model_diagnostics(moment_model, {'M1': m1, 'M3': m3}, qi,
+                                 matmul=matmul)
+    return passive, rows(errors), jax.tree.map(rows, reciprocity), defects
 
 
 @lru_cache(maxsize=None)
@@ -439,43 +496,15 @@ def round_checks(mesh_xy, native_eigh, ordered):
     import jax.numpy as jnp
     from jax.sharding import NamedSharding, PartitionSpec as P
     from common.shard_map import shard_map
-    from gw.shared_pole_directions import _model_diagnostics
-    from gw.shared_pole_gates import shared_pole_passivity, shared_pole_reciprocity, signed_shared_pole_passivity
     from gw.shared_pole_recipe import shared_real_pole_gates_ordered_v1, shared_real_pole_gates_v1_r3b
 
     gates = shared_real_pole_gates_ordered_v1 if ordered else shared_real_pole_gates_v1_r3b
     batch, rep = P(BATCH), P()
 
     def check(model, signed, inverse, wc, dw, z, eta, m1, m3, qi):
-        if ordered:
-            factor, mu, kept = signed
-            passive = signed_shared_pole_passivity(signed, inverse, eta_ry=eta, matmul=_mm, eigh=native_eigh,
-                                                   gates=gates)
-            node = z[:, None]
-            weights = jnp.where(kept, 1 / (node * mu - 1), 0)
-            slopes = jnp.where(kept, -mu / (node * mu - 1) ** 2 / (2 * node), 0)
-            scale = jnp.where(kept, 1 / jnp.where(kept, jnp.abs(mu), 1), 0)
-            moment_model = (factor * scale[:, None, :], scale ** 2, kept)
-        else:
-            factor, poles, active = model
-            passive = shared_pole_passivity(model, inverse, eta_ry=eta, matmul=_mm, eigh=native_eigh, gates=gates)
-            weights = jnp.where(active, 1 / ((z ** 2)[:, None] - poles), 0)
-            slopes = -weights ** 2
-            moment_model = model
-
-        def sample(args):
-            weight, slope, w, d = args
-            errors, reciprocity = [], []
-            for k, exact in ((weight, w), (slope, d)):
-                value = _mm(factor * k[None, None, :], factor, transb='C')[0]
-                errors.append(jnp.linalg.norm(value - exact)
-                              / jnp.maximum(jnp.linalg.norm(exact), jnp.finfo(jnp.float64).tiny))
-                reciprocity.append({} if ordered else shared_pole_reciprocity(value, exact, gates=gates))
-            return jnp.stack(errors), jax.tree.map(lambda *v: jnp.stack(v), *reciprocity)
-        errors, reciprocity = jax.lax.map(sample, (weights, slopes, wc[0], dw[0]))
-        rows = lambda a: jnp.swapaxes(a, 0, 1)[None]
-        defects = _model_diagnostics(moment_model, {"M1": m1, "M3": m3}, qi, matmul=_mm)
-        return passive, rows(errors), jax.tree.map(rows, reciprocity), defects
+        return _round_check_equations(
+            model, signed, inverse, wc, dw, z, eta, m1, m3, qi,
+            matmul=_mm, eigh=native_eigh, gates=gates, ordered=ordered)
 
     def body(live, model, signed, inverse, wc, dw, z, eta, m1, m3, qi):
         args = (model, signed, inverse, wc, dw, z, eta, m1, m3, qi)

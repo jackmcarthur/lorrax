@@ -89,6 +89,12 @@ def test_atomic_file_transaction_failure_preserves_prior_file(
     assert list(tmp_path.glob(".artifact.h5.*.tmp")) == []
 
 
+def test_rank0_transaction_can_return_bounded_control_value():
+    value = collectives.rank0_transaction(
+        '/tmp/bank.h5', stage='resume', write=lambda: True, return_value=True)
+    assert value is True
+
+
 def test_incomplete_restart_refuses_even_with_stale_ready_flag(tmp_path):
     from file_io.restart_bundle import read_metadata
     path = tmp_path / 'restart.h5'

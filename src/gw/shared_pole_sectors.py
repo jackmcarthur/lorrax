@@ -153,8 +153,36 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output):
     to_face=batch_to_face(mesh_xy)
     ledger=meta.shared_pole_capacity
     upstream=ledger.live_stages
-    from gw.shared_pole_execution import sector_round_schedule,is_face
-    for ids,real,slots,execution in sector_round_schedule(bank,header,meta,config,mesh_xy,partner):
+    import copy, math
+    from gw.gw_config import linalg_resolution
+    from gw.shared_pole_execution import (constructor_execution,
+                                           sector_round_schedule,is_face)
+    from gw.shared_pole_recipe import shared_real_pole_v1_r3b
+    execution_rows=[]
+    for family,basis in enumerate(bank['mu_bases']):
+        components=3 if family else 1
+        local_meta=copy.copy(meta)
+        local_meta.mu_basis=basis
+        local_meta.n_rmu=components*basis.n_logical
+        local_meta.n_rmu_padded=components*basis.n_packed
+        local_recipe=dict(recipe,n=local_meta.n_rmu)
+        policy=shared_real_pole_v1_r3b[recipe['accuracy']]
+        for field in ('imaginary_width','infinity_width','line_direction_cap','pole_budget'):
+            fraction=policy.get(field+'_fraction')
+            local_recipe[field]=(None if fraction is None else
+                                 math.ceil(local_meta.n_rmu*fraction))
+        extent=lambda width:padded_axis(width,mesh_xy,name='shared_pole_port',
+            specs=((P('x','y'),0),(P('x','y'),1))).carrier
+        mode,route=constructor_execution(
+            local_meta,linalg_resolution({'linalg':config.backend.linalg}),local_recipe,
+            mesh=mesh_xy,ledger=ledger,upstream=upstream,ordered=True,
+            odd_moments=True,sample_fields=4,moment_fields=4,
+            column_extent=extent)
+        execution_rows.append(dict(sector=('CC','TT')[family],mode=mode,**route))
+    resolved_execution=('face' if any(row['mode']=='face' for row in execution_rows)
+                        else 'local')
+    for ids,real,slots,execution in sector_round_schedule(
+            bank,header,meta,config,mesh_xy,partner,execution=resolved_execution):
         sectors=[];retained=[]
         for family,name in enumerate(('CC','TT')):
             with timing.fenced_section('spole.sector.'+name):
@@ -264,7 +292,8 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output):
         identity=bank['identity'],receipts=dict(rounds=receipts,status='CONSTRUCTED',
             acceptance='signed-retained-H-v1',sigma_accuracy='NOT_MEASURED'),mesh_xy=mesh_xy)
     return dict(handle=handle,identity=bank['identity'],status='CONSTRUCTED',
-                q_receipts=receipts,capacity=ledger.receipt())
+                q_receipts=receipts,capacity=ledger.receipt(),
+                execution=execution_rows)
 
 
 def sector_held_errors(signed, samples, z, *, mesh_xy):
@@ -402,8 +431,10 @@ def construct_diagonal_sector_round(samples, moments, meta, config, geometry, *,
     tables=round_tables(counts,[s[1].shape[-1] for s in states],[s[0] for s in states],
         [v.shape[-1] for v in values],qi.shape[-1],column_extent=extent,ordered=True,odd_moments=True)
     side=tables['active'].shape[-1]
-    budget.retained_panels=(*retained,*infinity,*(v for s in states for v in s[1:]),
-                            *samples.values(),*moments.values())
+    # The reduction envelope already includes current Q/O/dO and infinity
+    # panels. Full sample/moment stacks remain caller-live through this call,
+    # so those and earlier-sector outputs are the only additional arrays.
+    budget.retained_panels=(*retained,*samples.values(),*moments.values())
     if execution == 'face':
         reduced=face_reduce_round(states,infinity,tables,real=geometry['real'],mesh=mesh_xy,
             budget=budget,ordered=True,odd_moments=True,keep_budget=recipe['pole_budget'],retain_span=True)

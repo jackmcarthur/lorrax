@@ -155,9 +155,20 @@ class ConstructorCapacity:
         if side is None:
             side = self._side
         self._side = side
+        price, native = self.quote(side, phase=self._phase,
+                                   sample_batch=sample_batch,
+                                   selection_faces=selection_faces)
+        self._workspace = sum(native.values())
+        row = self._reserve("constructor.plan", price["resident_bytes_per_rank"])
+        row['execution'] = self.execution
+        return dict(row, price=price, native_workspace=dict(native))
+
+    def quote(self, side, *, phase, sample_batch=1, selection_faces=None):
+        """Return an unrecorded phase price for route selection/preflight."""
+        side = int(side)
         n = self._n
-        extents = {n, 2*n} if self._phase == "selection" else (
-            {side} if self._phase == "reduction" else {n})
+        extents = {n, 2*n} if phase == "selection" else (
+            {side} if phase == "reduction" else {n})
         # Eigh scratch is transient: replace it at each phase boundary.
         self._native_maxima["eigh"] = max(self.query_workspace(
             "eigh", ((1 if self.execution == "face" else self.batch_width, extent, extent),), self.eigenplan(extent))
@@ -177,7 +188,7 @@ class ConstructorCapacity:
         price = shared_pole_byte_terms(
             self._meta, mesh_xy=self._mesh_xy, resolution=pricing_resolution,
             pencil_side=side, parent_batch=1 if self.execution == "face" else self.batch_width,
-            sample_batch=sample_batch, phase=self._phase,
+            sample_batch=sample_batch, phase=phase,
             selection_faces=selection_faces)
         # Other parents' narrow inputs survive selection and each model's
         # checks; they are additional live storage, never hidden in a limit.
@@ -185,9 +196,16 @@ class ConstructorCapacity:
                     for a in {id(a): a for a in self.retained_panels}.values())
         price["terms_bytes_per_rank"]["retained_parent_panels"] = extra
         price["resident_bytes_per_rank"] += extra
-        row = self._reserve("constructor.plan", price["resident_bytes_per_rank"])
-        row['execution'] = self.execution
-        return dict(row, price=price, native_workspace=dict(self._native_maxima))
+        return price, dict(self._native_maxima)
+
+    def preview(self, side, *, phase, sample_batch=1, selection_faces=None):
+        """Preview device admission without appending a ledger row."""
+        price, native = self.quote(side, phase=phase, sample_batch=sample_batch,
+                                   selection_faces=selection_faces)
+        return self._ledger.preview(
+            resident_bytes_per_rank=price['resident_bytes_per_rank'],
+            workspace_bytes_per_rank=sum(native.values()),
+            concurrent_with=self._upstream)
 
     def live(self, arrays):
         """Bind the ledger's ambient lifetimes to exactly these live arrays."""

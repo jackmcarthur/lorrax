@@ -89,8 +89,6 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
         # Every device byte this construction admits is priced here; the driver
         # below keeps only `budget.retained_panels` and `budget.batch_width`
         # current as it moves from selection to reduction to the model checks.
-        budget = ConstructorCapacity(meta, resolution, mesh_xy=mesh_xy,
-                                     ledger=ledger, upstream=upstream)
         header = validate_shared_pole_bank(bank["path"], expected_identity=identity,
                                            mesh_xy=mesh_xy, require_complete=True)
         moment_header = validate_shared_pole_bank(moments["path"], expected_identity=identity,
@@ -125,12 +123,38 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
                 sym_mats_k=np.asarray(operations["rotation"]),
                 antiunitary=np.asarray(operations["antiunitary"], dtype=bool),
                 authorized_rows=operations["authorized_rows"])
+        else:
+            partner_parent = partner_row = None
 
-        budget.plan(0)
         logical_n = int(meta.n_rmu)
         column_extent = lambda width: padded_axis(
             width, mesh_xy, name="shared_pole_port",
             specs=((P("x", "y"), 0), (P("x", "y"), 1))).carrier
+        from gw.shared_pole_execution import (constructor_execution,
+                                               constructor_side_upper_bound)
+        sample_fields = (
+            ("Wc", "dWc_ds", "Wc_mirror", "dWc_mirror_ds")
+            if header.get("mirror_mode") is not None else ("Wc", "dWc_ds"))
+        moment_fields = (("M0", "M1", "M2", "M3")
+                         if odd_moments else ("M1", "M3"))
+        execution, execution_receipt = constructor_execution(
+            meta, resolution, recipe, mesh=mesh_xy, ledger=ledger,
+            upstream=upstream, ordered=ordered, odd_moments=odd_moments,
+            sample_fields=len(sample_fields), moment_fields=len(moment_fields),
+            parent_count=int(header['bank_shape']['nq']),
+            column_extent=column_extent)
+        if execution == 'face' and ordered and header.get('mirror_mode') is None:
+            raise ValueError('GATE shared_pole_constructor_execution: ordered whole-mesh parents require authenticated literal mirror fields')
+        budget = ConstructorCapacity(meta, resolution, mesh_xy=mesh_xy,
+                                     ledger=ledger, upstream=upstream,
+                                     execution=execution)
+        # A face constructor keeps the Coulomb eigensolve on the same complete
+        # mesh even when the deck's default dense policy is local.
+        coulomb_config = ({'linalg': 'distributed'}
+                          if execution == 'face' else config)
+        conservative_side = constructor_side_upper_bound(
+            recipe, ordered=ordered, odd_moments=odd_moments,
+            logical_n=logical_n, column_extent=column_extent)
         eig, svd = budget.eigenplan(n), budget.eigenplan(2*n)
         receipts, factors, store_poles, store_counts, placed = {}, [], [], [], []
         receipt_entry_start = 0
@@ -143,49 +167,53 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
         # its sorted model; ordered rounds are partner-closed so the mirror exchange stays inside.
         # A parent reduces on its own rank whatever the linalg dial says (capacity refuses below).
         ranks = mesh_divisor(mesh_xy)
-        rounds = parent_rounds(nq, ranks, partner_parent if ordered else None)
+        rounds = (parent_rounds(nq, ranks, partner_parent if ordered else None)
+                  if execution == 'local' else
+                  [([q], 1, np.asarray([0], np.int64)) for q in range(nq)])
         batch_spec = P(("x", "y"))
-        kernels = _round_kernels(mesh_xy)
+        read_spec = batch_spec if execution == 'local' else None
+        kernels = _round_kernels(mesh_xy, 'batch' if execution == 'local' else 'face')
         to_face, to_batch = batch_to_face(mesh_xy), face_to_batch_reshard(mesh_xy)
         fit_lo = min(int(i) for i in recipe["fit_ids"])
         fit_hi = max(int(i) for i in recipe["fit_ids"]) + 1
     for ids, real, slots in rounds:
         with timing.fenced_section("spole.batch_admission"):
-            budget.batch_width = ranks
-            budget.plan(0, phase="selection")
+            budget.batch_width = ranks if execution == 'local' else 1
+            budget.retained_panels = tuple(factors)
+            budget.plan(
+                conservative_side, phase="selection",
+                sample_batch=(fit_hi-fit_lo),
+                selection_faces=((fit_hi-fit_lo) * len(sample_fields)
+                                 + len(moment_fields)))
             budget.live(())
         with timing.fenced_section("spole.scratch_read"):
             with SlabIO(moments["path"], mode="r", mesh=mesh_xy) as moment_io:
                 exact = read_shared_pole_bank(moment_io, meta=meta, header=moment_header,
-                                              q_ids=ids, partition_spec=batch_spec,
-                                              fields=("M0", "M1", "M2", "M3") if odd_moments else ("M1", "M3"))
+                                              q_ids=ids, partition_spec=read_spec,
+                                              fields=moment_fields)
         with timing.fenced_section("spole.infinity_selection"):
             width = min(logical_n, max(1, int(recipe["infinity_width"])))
             qi, round_infinity_values = distrib_la.leading_eigenvectors(
                 exact["M1"], width, eigh_plan=eig, column_extent=column_extent,
                 multiplet_tol=recipe["multiplet_relative_tolerance"], real_rows=real)
-            budget.plan(qi.shape[-1], phase="selection")
             infinity = (qi, *(kernels.apply(exact[name], qi)
-                              for name in (("M0", "M1", "M2", "M3") if odd_moments else ("M1", "M3"))))
+                              for name in moment_fields))
             del exact
         with timing.fenced_section("spole.sample_batch_read"):
             budget.live(infinity)
             with SlabIO(bank["path"], mode="r", mesh=mesh_xy) as bank_io:
-                sample_fields = (
-                    ("Wc", "dWc_ds", "Wc_mirror", "dWc_mirror_ds")
-                    if header.get("mirror_mode") is not None
-                    else ("Wc", "dWc_ds"))
                 samples = read_shared_pole_bank(
                     bank_io, meta=meta, header=header, q_ids=ids,
-                    partition_spec=batch_spec, sample_span=(fit_lo, fit_hi),
+                    partition_spec=read_spec, sample_span=(fit_lo, fit_hi),
                     fields=sample_fields)
             # The store admits this complete bounded scratch batch before
             # allocation. Charge it while directions/actions are selected;
             # release it before admitting the dense pencil.
-            budget.retained_panels = tuple(samples.values())
         with timing.fenced_section("spole.direction_selection"):
             exchange = ((slots, *partner_realization(meta, header, ids, partner_parent, partner_row,
-                                                      mesh_xy=mesh_xy)) if ordered else None)
+                                                      mesh_xy=mesh_xy))
+                        if ordered and execution == 'local' else
+                        ((slots, None, None, None) if ordered else None))
             round_states, round_counts, round_roles = select_round_states(
                 samples, recipe, sample_lo=fit_lo, real=real, mesh_xy=mesh_xy, eigh_plan=eig,
                 svd_plan=svd, column_extent=column_extent, logical_n=logical_n, ordered=ordered,
@@ -199,21 +227,33 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
             side = int(tables["active"].shape[-1])
             # A pencil reduces on one device: its eight [side, side] blocks and the native eigh workspace.
             local_eigh = budget.eigenplan(side)
-            if not distrib_la.fits_local(local_eigh, "eigh", ((1, side, side),) * 8, np.complex128,
-                                         ledger.device_budget_bytes_per_rank):
+            if execution == 'local' and not distrib_la.fits_local(
+                    local_eigh, "eigh", ((1, side, side),) * 8,
+                    np.complex128, ledger.device_budget_bytes_per_rank):
                 raise ValueError(f"GATE shared_pole_round_capacity: got: pencil side {side} at parents {ids[:real]}; want: eight [side, side] complex blocks and the eigh workspace within {ledger.device_budget_bytes_per_rank} bytes on one device; why: every parent reduces on its own rank")
-            budget.retained_panels = (*infinity, *(v for st in round_states for v in st[1:]))
-            budget.batch_width = ranks
+            # The reduction envelope already includes this parent's Q/O/dO,
+            # infinity actions, result arrays and sort scratch. Only completed
+            # earlier parents are additional retained storage.
+            budget.retained_panels = tuple(factors)
+            budget.batch_width = ranks if execution == 'local' else 1
             budget.plan(side, phase="reduction")
         with timing.fenced_section("spole.gram_reduction"):
-            round_model, round_signed, vectors, round_diagnostics = reduce_round(
-                round_states, infinity, tables, real=real, mesh_xy=mesh_xy, native_eigh=local_eigh.native_fn,
-                ordered=ordered, odd_moments=odd_moments, keep_budget=recipe.get("pole_budget"))
+            if execution == 'face':
+                from gw.shared_pole_execution import face_reduce_round
+                round_model, round_signed, vectors, round_diagnostics = face_reduce_round(
+                    round_states, infinity, tables, real=real, mesh=mesh_xy,
+                    budget=budget, ordered=ordered, odd_moments=odd_moments,
+                    keep_budget=recipe.get("pole_budget"), admit=False)
+            else:
+                round_model, round_signed, vectors, round_diagnostics = reduce_round(
+                    round_states, infinity, tables, real=real, mesh_xy=mesh_xy,
+                    native_eigh=local_eigh.native_fn, ordered=ordered,
+                    odd_moments=odd_moments, keep_budget=recipe.get("pole_budget"))
             qi = infinity[0]
             del round_states, infinity
             round_reduction, round_zero, round_retained, round_permutation = jax.tree.map(np.asarray, round_diagnostics)
             poles, active = (np.asarray(a) for a in vectors)
-            budget.retained_panels = (*round_model, *round_signed, qi, *factors)
+            budget.retained_panels = tuple(factors)
         with timing.fenced_section("spole.gates"):
             for slot, q in enumerate(ids[:real]):
                 if ordered and not round_reduction["orientation_paired"][slot]:
@@ -239,7 +279,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
                     raise ValueError(f"GATE shared_pole_retained_moments: got: failed at q={q}; want: projected latent moment identity <=1e-10; why: corrected Ritz algebra")
             reductions = own_extent_receipts(round_reduction, tables["own"][:real])
         with timing.fenced_section("spole.coulomb"):
-            budget.batch_width = ranks
+            budget.batch_width = ranks if execution == 'local' else 1
             budget.plan(side, phase="model", sample_batch=len(held_ids))
             budget.live((*round_model, *round_signed, qi))
             # V^-1/2 of the round's parents: one owner call per contiguous run of ids, rows in slot order.
@@ -252,23 +292,25 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
             parts, coulomb = [], {}
             for lo, hi in runs:
                 coulomb_sqrt, part, receipt = response_coulomb_powers(
-                    meta, config, mesh_xy=mesh_xy, bank_io=bank, q_span=(lo, hi))
+                    meta, coulomb_config, mesh_xy=mesh_xy, bank_io=bank,
+                    q_span=(lo, hi))
                 del coulomb_sqrt
                 parts.append(part)
                 coulomb.update({q: dict(receipt, support_ranks=receipt["support_ranks"][q - lo:q - lo + 1])
                                 for q in range(lo, hi)})
-            inverse_sqrt = to_batch(face_rows(mesh_xy, tuple(sorted(ids[:real]).index(q) for q in ids))(*parts))
+            inverse_sqrt = (parts[0] if execution == 'face' else
+                            to_batch(face_rows(mesh_xy, tuple(sorted(ids[:real]).index(q) for q in ids))(*parts)))
             del parts
         with timing.fenced_section("spole.sample_batch_read"):
             with SlabIO(bank["path"], mode="r", mesh=mesh_xy) as bank_io:
-                held = read_shared_pole_bank(bank_io, meta=meta, header=header, q_ids=ids, partition_spec=batch_spec,
+                held = read_shared_pole_bank(bank_io, meta=meta, header=header, q_ids=ids, partition_spec=read_spec,
                                              sample_span=(held_lo, held_hi), fields=("Wc", "dWc_ds"))
             pick = kernels.take(tuple(i - held_lo for i in held_ids))
             held = tuple(pick(held[name]) for name in ("Wc", "dWc_ds"))
         with timing.fenced_section("spole.moment_read"):
             with SlabIO(moments["path"], mode="r", mesh=mesh_xy) as moment_io:
                 exact = read_shared_pole_bank(moment_io, meta=meta, header=moment_header, q_ids=ids,
-                                              partition_spec=batch_spec, fields=("M1", "M3"))
+                                              partition_spec=read_spec, fields=("M1", "M3"))
         with timing.fenced_section("spole.passivity_held"):
             passive, held_errors, reciprocity, moment_defects = check_round(
                 round_model, round_signed, inverse_sqrt, held, (exact["M1"], exact["M3"]), qi,
@@ -310,7 +352,8 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
         with timing.fenced_section("spole.export_prepare"):
             # The sorted model is an active prefix: keep the round's widest K, then restore to the face.
             width = column_extent(int(counts[:real].max()))
-            factors.append(face_rows(mesh_xy, tuple(range(real)), width)(to_face(round_model[0])))
+            factors.append(face_rows(mesh_xy, (0,), width)(round_model[0]) if execution == 'face' else
+                           face_rows(mesh_xy, tuple(range(real)), width)(to_face(round_model[0])))
             store_poles.append(poles[:real, :width])
             store_counts.append(counts[:real])
             placed += list(ids[:real])
@@ -340,4 +383,5 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
     with timing.fenced_section("spole.return"):
         return {"q_receipts": [receipts[q] for q in range(nq)], "model_header": store_header,
                 "capacity": ledger.receipt(),
-                "identity": identity, "status": "CONSTRUCTED"}
+                "identity": identity, "status": "CONSTRUCTED",
+                "execution": dict(mode=execution, **execution_receipt)}
