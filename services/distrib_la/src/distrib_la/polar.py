@@ -22,7 +22,8 @@ from distrib_la.plan import Plan, plan, ROUTE_BATCH_RESHARD
 from distrib_la.resolve import mesh_key
 
 __all__ = ["PolarPlan", "plan_polar_factor", "polar_factor",
-           "right_singular_vectors", "leading_eigenvectors"]
+           "right_singular_vectors", "leading_eigenvectors",
+           "retain_leading_eigenvectors"]
 
 
 _SUPPORTED_DTYPES = (jnp.dtype(jnp.float64), jnp.dtype(jnp.complex128))
@@ -96,6 +97,20 @@ def _direction_input(W, eig, dilation=False):
                      "P(('x','y'),None,...)")
 
 
+def _direction_output_layout(Q, mesh):
+    """Layout of an already selected rank-2 or rank-3 direction carrier."""
+    if isinstance(Q, jax.core.Tracer) or Q.ndim not in (2, 3):
+        raise ValueError("retained eigenvectors require an eager rank-2 or rank-3 carrier")
+    _validate_dtype(Q.dtype)
+    if Q.sharding.is_equivalent_to(
+            NamedSharding(mesh, _layout_spec('face', Q.ndim)), Q.ndim):
+        return 'face'
+    if Q.ndim == 3 and Q.sharding.is_equivalent_to(
+            NamedSharding(mesh, _layout_spec('batch', Q.ndim)), Q.ndim):
+        return 'batch'
+    raise ValueError("retained eigenvectors require Q in a spectral direction layout")
+
+
 @lru_cache(maxsize=32)
 def _leading_axes_kernel(mesh, leading, layout='face'):
     """Reshape the leading batch axes of a stack; each rank keeps its own tile or rows.
@@ -141,13 +156,15 @@ def _real_row_counts(values, cut, real_rows):
 
 
 @lru_cache(maxsize=128)
-def _retained_column_kernel(mesh, batched, extent, layout='face'):
+def _retained_column_kernel(
+    mesh, batched, extent, layout='face', descending=False,
+):
     """Select padded columns; current per-row counts are runtime mask inputs."""
     tile = NamedSharding(mesh, _layout_spec(layout, 3) if batched else P('x', 'y'))
     @jax.jit(out_shardings=tile)
     def select(q, count):
         width = min(extent, q.shape[-1])
-        selected = q[..., ::-1][..., :width]
+        selected = q[..., :width] if descending else q[..., ::-1][..., :width]
         selected = jnp.pad(selected, ((0, 0),) * (q.ndim - 1)
                            + ((0, extent - width),))
         active = jnp.arange(extent) < count[..., None]
@@ -155,17 +172,80 @@ def _retained_column_kernel(mesh, batched, extent, layout='face'):
     return select
 
 
-def _retained_columns(Q, values, count, *, mesh, column_extent, layout='face'):
+def _retained_columns(
+    Q, values, count, *, mesh, column_extent, layout='face', descending=False,
+):
     """Select per-row physical columns; return their unpadded spectra."""
     largest = max(count) if isinstance(count, tuple) else count
     extent = operator.index(column_extent(largest))
     if extent < largest or extent < 1 or extent % int(mesh.shape['y']):
         raise ValueError("column_extent must cover the rank and tile mesh y")
-    select = _retained_column_kernel(mesh, isinstance(count, tuple), extent, layout)
+    if descending and int(Q.shape[-1]) < largest:
+        raise ValueError("leading direction carrier does not cover the retained rank")
+    select = _retained_column_kernel(
+        mesh, isinstance(count, tuple), extent, layout, descending)
     retained = (tuple(row[:n] for row, n in zip(values, count))
                 if isinstance(count, tuple) else values[:count])
     counts = jax.device_put(np.asarray(count, dtype=np.int64), NamedSharding(mesh, P()))
     return select(Q, counts), jax.device_put(retained, NamedSharding(mesh, P()))
+
+
+def _leading_counts(values, r, *, multiplet_tol, real_rows, batched):
+    """Close requested leading widths with the sole multiplet-cut policy."""
+    rows = (tuple(np.asarray(row) for row in values) if batched
+            else (np.asarray(values),))
+    if any(row.ndim != 1 or not np.all(np.isfinite(row)) for row in rows):
+        raise ValueError("leading eigenvalue spectra must be finite rank-1 rows")
+    close = lambda row, width: _close_spectral_cut(
+        row, width, multiplet_tol)
+    if not batched:
+        return close(rows[0], r)
+    if isinstance(r, tuple):
+        return tuple(close(row, width)
+                     if width and (real_rows is None or i < real_rows) else 0
+                     for i, (row, width) in enumerate(zip(rows, r)))
+    return _real_row_counts(rows, lambda row: close(row, r), real_rows)
+
+
+def retain_leading_eigenvectors(
+    Q, values, r, *, mesh, column_extent, multiplet_tol=1e-6,
+    real_rows=None,
+):
+    """Retain a narrower cut from a descending leading eigensystem.
+
+    ``Q, values`` are the output of :func:`leading_eigenvectors`. This eager
+    selection performs no eigensolve. It applies the same multiplet closure,
+    synthetic-row rule, caller padding and exact zero-tail mask as the
+    original selection.
+    """
+    layout = _direction_output_layout(Q, mesh)
+    if real_rows is not None and layout != 'batch':
+        raise ValueError("real_rows applies to a batch-layout stack only")
+    batched = Q.ndim == 3
+    rows = (tuple(np.asarray(row) for row in values) if batched
+            else (np.asarray(values),))
+    expected_rows = int(Q.shape[0]) if batched else 1
+    if len(rows) != expected_rows or any(
+            len(row) > int(Q.shape[-1]) for row in rows):
+        raise ValueError(
+            "leading spectra must match the carrier rows and column extent")
+    if isinstance(r, (tuple, list, np.ndarray)):
+        r = tuple(operator.index(v) for v in np.asarray(r).reshape(-1))
+        if (not batched or len(r) != len(rows)
+                or not all(0 <= width <= len(row)
+                           for width, row in zip(r, rows)) or max(r) < 1):
+            raise ValueError("per-row r must fit every spectrum")
+    else:
+        r = operator.index(r)
+        if not 1 <= r <= min((len(row) for row in rows), default=0):
+            raise ValueError("r must lie within every eigenvalue spectrum")
+    values = rows if batched else rows[0]
+    count = _leading_counts(
+        values, r, multiplet_tol=multiplet_tol,
+        real_rows=real_rows, batched=batched)
+    return _retained_columns(
+        Q, values, count, mesh=mesh, column_extent=column_extent,
+        layout=layout, descending=True)
 
 
 @lru_cache(maxsize=16)
@@ -324,15 +404,9 @@ def leading_eigenvectors(W, r, *, eigh_plan, column_extent,
         else:
             s, q = eigh_plan.batched(W)
     values = np.asarray(s)[..., ::-1].copy()
-    if not np.all(np.isfinite(values)):
-        raise ValueError("leading_eigenvectors requires finite Hermitian W and a finite eigenvalue spectrum")
-    if isinstance(r, tuple):
-        count = tuple(_close_spectral_cut(row, width, multiplet_tol)
-                      if width and (real_rows is None or i < real_rows) else 0
-                      for i, (row, width) in enumerate(zip(values, r)))
-    else:
-        count = (_close_spectral_cut(values, r, multiplet_tol) if values.ndim == 1
-                 else _real_row_counts(values, lambda row: _close_spectral_cut(row, r, multiplet_tol), real_rows))
+    count = _leading_counts(
+        values, r, multiplet_tol=multiplet_tol, real_rows=real_rows,
+        batched=values.ndim > 1)
     return _retained_columns(q, values, count, mesh=eigh_plan.mesh,
                              column_extent=column_extent, layout=layout)
 
