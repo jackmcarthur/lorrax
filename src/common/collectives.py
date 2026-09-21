@@ -78,6 +78,7 @@ second chi0/W implementation or a disk round-trip.
 """
 from __future__ import annotations
 
+import threading
 from typing import Any, Callable, NamedTuple
 
 from ffi import _services
@@ -1440,6 +1441,43 @@ def _raise_io_receipts(receipts, *, path, stage):
                 "and rebuild in a new run directory.")
 
 
+_IO_CONTROL_OCCURRENCE = 0
+_IO_CONTROL_LOCK = threading.Lock()
+
+
+def _io_control_key(path, stage):
+    """Stable per-occurrence key for one all-rank host control exchange."""
+    import hashlib
+
+    global _IO_CONTROL_OCCURRENCE
+    with _IO_CONTROL_LOCK:
+        occurrence = _IO_CONTROL_OCCURRENCE
+        _IO_CONTROL_OCCURRENCE += 1
+    digest = hashlib.sha256(
+        (str(path) + "\0" + str(stage)).encode("utf-8")).hexdigest()[:24]
+    return f"lorrax/io-control/v1/{digest}/{occurrence}"
+
+
+def _reduce_io_control(data, *, path, stage, reduce):
+    from ffi.common.broadcast import reduce_bytes_to_all
+
+    return reduce_bytes_to_all(
+        data, key=_io_control_key(path, stage), reduce=reduce,
+        max_bytes=4096)
+
+
+def _first_io_error(receipts):
+    """Select the lowest-rank failure, or rank zero's success receipt."""
+    import json
+
+    for receipt in receipts:
+        failed, _rank, _kind, _message = json.loads(
+            bytes(receipt).rstrip(b'\0'))
+        if failed:
+            return receipt
+    return receipts[0]
+
+
 def agree_io_error(error, *, path, stage):
     """Raise the same bounded I/O failure on every rank after local teardown.
 
@@ -1452,8 +1490,13 @@ def agree_io_error(error, *, path, stage):
     stage : str
         Replicated action name. The lowest failing rank supplies the error.
     """
-    receipts = all_gather_processes(_io_error_receipt(error))
-    _raise_io_receipts(receipts, path=path, stage=stage)
+    # Error agreement must still work when a device collective is failed or
+    # busy.  Route this bounded receipt through the distributed host control
+    # store rather than compiling/launching a GPU process_allgather.
+    receipt = _reduce_io_control(
+        _io_error_receipt(error), path=path, stage=stage,
+        reduce=_first_io_error)
+    _raise_io_receipts([receipt], path=path, stage=stage)
 
 
 def rank0_transaction(path, *, stage, write, validate=None, return_value=False):
@@ -1489,25 +1532,29 @@ def rank0_transaction(path, *, stage, write, validate=None, return_value=False):
             value = write()
         except BaseException as exc:
             error = exc
-    receipt = _io_error_receipt(error)
-    if process_count() > 1:
-        from jax.experimental import multihost_utils as mh
-        receipt = mh.broadcast_one_to_all(receipt, is_source=process_rank() == 0)
-    _raise_io_receipts([receipt], path=path, stage=stage)
+    agree_io_error(error, path=path, stage=stage)
     if return_value:
         import json
         import numpy as np
 
         data = np.zeros(4096, dtype=np.uint8)
+        value_error = None
         if process_rank() == 0:
-            encoded = json.dumps(value, ensure_ascii=True, allow_nan=False).encode('ascii')
-            if len(encoded) > data.size:
-                raise ValueError('rank0_transaction control value exceeds 4096 bytes')
-            data[:len(encoded)] = np.frombuffer(encoded, dtype=np.uint8)
-        if process_count() > 1:
-            from jax.experimental import multihost_utils as mh
-            data = mh.broadcast_one_to_all(data, is_source=process_rank() == 0)
-        return json.loads(bytes(np.asarray(data)).rstrip(b'\0'))
+            try:
+                encoded = json.dumps(
+                    value, ensure_ascii=True, allow_nan=False).encode('ascii')
+                if len(encoded) > data.size:
+                    raise ValueError(
+                        'rank0_transaction control value exceeds 4096 bytes')
+                data[:len(encoded)] = np.frombuffer(encoded, dtype=np.uint8)
+            except BaseException as exc:
+                value_error = exc
+        agree_io_error(value_error, path=path,
+                       stage=f'{stage}/return_value')
+        returned = _reduce_io_control(
+            data, path=path, stage=f'{stage}/return_value_payload',
+            reduce=lambda records: records[0])
+        return json.loads(bytes(returned).rstrip(b'\0'))
 
 
 def rank0_atomic_file_transaction(

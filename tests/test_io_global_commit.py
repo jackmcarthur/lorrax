@@ -14,8 +14,9 @@ def test_remote_data_error_refuses_with_same_receipt(monkeypatch):
     monkeypatch.setattr(collectives, 'process_rank', lambda: 2)
     remote = collectives._io_error_receipt(OSError('write failed'))
     good = collectives._io_error_receipt(None)
-    monkeypatch.setattr(collectives, 'all_gather_processes',
-                        lambda x: np.stack([good, good, remote, good]))
+    monkeypatch.setattr(
+        collectives, '_reduce_io_control',
+        lambda x, **kwargs: kwargs['reduce']([good, good, remote, good]))
     with pytest.raises(RuntimeError, match='failing rank=2; OSError: write failed'):
         collectives.agree_io_error(None, path='/private/restart.h5', stage='data_close')
 

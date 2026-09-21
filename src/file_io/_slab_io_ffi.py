@@ -2697,7 +2697,17 @@ class _FfiBackend(_DatasetGeometry):
         # until every process has completed data teardown successfully.
         attrs, ds_attrs = self._deferred_attrs, self._deferred_ds_attrs
         self._deferred_attrs, self._deferred_ds_attrs = [], []
+        if self.mode == "r" and (attrs or ds_attrs) and _worker_error is None:
+            _worker_error = RuntimeError(
+                "SlabIO mode='r' acquired deferred write metadata; reopen "
+                "the artifact with mode='a' before mutating it")
         agree_io_error(_worker_error, path=self.path, stage="SlabIO.data_close")
+        # A successful read has no metadata to publish and no completion bit
+        # to mutate.  ``mode`` is replicated; rank-local deferred metadata is
+        # first turned into the all-rank error above, so this branch cannot
+        # make ranks take different collective sequences.
+        if self.mode == "r":
+            return
         deferred_hosts = []
         dataset_attr_hosts = []
 
