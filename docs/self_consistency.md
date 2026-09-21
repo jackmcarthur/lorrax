@@ -92,9 +92,12 @@ map's output spectrum. Those two arrays are not a paired eigensystem.
 
 `sc_initial_qp_rotations_file` imports an authenticated eigensystem as the
 initial Hamiltonian `H = U diag(E) U^H` in the original DFT basis. Keep the
-original mean-field WFN and reference operators in the new run; the initializer
-solves its own occupations and classifies its frozen identity masks before
-rCROP starts. Its quadrature session and accelerator history start empty.
+original mean-field WFN and reference operators in the new run. Current SC
+companions also preserve the full-zone protected/in-range identity masks and
+frozen active-scissor law, including an explicit absence of a fitted law;
+these apply from the first new map. Legacy companions without that policy
+classify their masks and initialize their law anew. Occupations and the
+sum-band tail are recomputed; quadrature and accelerator history start empty.
 This seeds a new run; it does not resume the previous nonlinear history.
 The [input reference](input_reference.md) owns the key and validation contract.
 
