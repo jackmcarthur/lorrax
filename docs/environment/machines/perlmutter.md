@@ -337,3 +337,15 @@ The PMI diagnosis and controls are allocation 57261316: no preload crashes in
 (`lx-Xg1-203924-2089729-3659`).  Full mechanism and machine split:
 [collective transports](../transports.md) and
 [`docs/dev/mpi_collectives.md`](../../dev/mpi_collectives.md).
+
+## Homogeneous GPU targets
+
+A JAX job must use one GPU model **and memory class** across its ranks.
+Use `-C 'gpu&hbm40g'` or `-C 'gpu&hbm80g'` for a multi-node allocation;
+`-C gpu` alone can mix A10040GB and A10080GB nodes. The runtime refuses a
+mixed target before preparing the mesh. Agreeing the minimum memory budget
+is necessary for common tile shapes but does not make independently compiled
+XLA programs identical: DEV498 (sandbox claim2534) reproduces swapped
+same-shape all-to-all exchanges and incorrect Dyson matrices on a mixed pool,
+while the identical program agrees with single-sample results on a homogeneous
+pool. No physics workaround or compiler-option override is used.

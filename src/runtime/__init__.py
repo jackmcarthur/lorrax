@@ -1393,6 +1393,27 @@ def init_jax_distributed() -> None:
         f"local_device_ids={init_kwargs.get('local_device_ids')}")
 
 
+def _enforce_homogeneous_gpu_targets() -> None:
+    """Independent XLA compilations must use the same GPU target on all ranks."""
+    import hashlib
+    import jax
+    import numpy as np
+    from common.collectives import all_gather_processes
+
+    # Remote JAX device descriptors report this client's model, so exchange
+    # measured local targets rather than trusting jax.devices() metadata.
+    kinds = sorted({device.device_kind for device in jax.local_devices()
+                    if device.platform in ("gpu", "cuda", "rocm")})
+    digest = hashlib.sha256(repr(kinds).encode()).digest()
+    targets = all_gather_processes(np.frombuffer(digest, dtype=np.uint8))
+    if len(kinds) > 1 or np.any(targets != targets[0]):
+        raise RuntimeError(
+            "GATE heterogeneous_gpu_targets: mixed GPU models can compile "
+            "incompatible collective schedules and silently corrupt results; "
+            f"local models={kinds}. Allocate one GPU model and memory class "
+            "for the job.")
+
+
 def nccl_warmup(mesh_xy) -> None:
     """Pre-initialise every NCCL communicator we'll need later.
 
@@ -1821,6 +1842,7 @@ def initialize_communicator_stack(*, platform: str = "gpu",
     _enforce_supported_jax(say)
     # -- 5c -----------------------------------------------------------------
     _enforce_cpu_mpi_thread_multiple(say)
+    _enforce_homogeneous_gpu_targets()
     # -- 5d -----------------------------------------------------------------
     from common.jax_compile_cache import install_compile_agreement
     install_compile_agreement()
