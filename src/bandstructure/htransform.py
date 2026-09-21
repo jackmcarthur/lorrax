@@ -1734,12 +1734,12 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
         # compute.
         # Gate: ``tests/test_htransform_kpath_gates.py``.
         if not use_active:
-            _post_out_shardings = ((rep, rep, batch_eig_shard)
+            _post_out_shardings = ((rep, rep, batch_vec_shard)
                                    if return_coeffs else (rep, rep))
 
             @partial(jax.jit, static_argnames=('nq', 'nb_keep'),
                      out_shardings=_post_out_shardings)
-            def _post_kpath(batches, nq, nb_keep):
+            def _post_kpath(batches, coefficient_batches, nq, nb_keep):
                 # With no wider fitted guard window, the archived lowest-state
                 # selection remains the complete physical output contract.
                 lambda_carrier = jnp.concatenate(
@@ -1752,19 +1752,28 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
                     order = jnp.argsort(energies, axis=1, stable=True)
                     energies_sorted = jnp.take_along_axis(
                         energies[:nq], order[:nq], axis=1)[:, :nb_keep]
-                    return energies_sorted, inverse_residual, order
+                    coefficients = jnp.concatenate(
+                        coefficient_batches, axis=0)
+                    gather_index = jnp.broadcast_to(
+                        order[:, None, :], coefficients.shape)
+                    ordered_coefficients = jnp.take_along_axis(
+                        coefficients, gather_index, axis=2
+                    )[:, :, :nb_keep]
+                    return (energies_sorted, inverse_residual,
+                            ordered_coefficients)
                 energies, inverse_residual = newton_inv(
                     a_f, n_f, shift, lambda_carrier[:nq].real)
                 energies_sorted = jnp.sort(energies, axis=1)[:, :nb_keep]
                 return energies_sorted, inverse_residual
         else:
             _post_active_out_shardings = (
-                (rep, rep, rep, batch_eig_shard) if return_coeffs
+                (rep, rep, rep, batch_vec_shard) if return_coeffs
                 else (rep, rep, rep))
 
             @partial(jax.jit, static_argnames=('nq',),
                      out_shardings=_post_active_out_shardings)
-            def _post_active_kpath(batches, selection, nq):
+            def _post_active_kpath(
+                    batches, selection, coefficient_batches, nq):
                 lambda_q_carrier = jnp.concatenate(batches, axis=0)
                 lambda_q = lambda_q_carrier[:nq]
                 selected_scores = jnp.concatenate(
@@ -1834,21 +1843,30 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
                            outside_inverse_residual),
                        diagnostics)
                 if return_coeffs:
-                    return out + (order,)
+                    coefficients = jnp.concatenate(
+                        coefficient_batches, axis=0)
+                    gather_index = jnp.broadcast_to(
+                        order[:, None, :], coefficients.shape)
+                    ordered_coefficients = jnp.take_along_axis(
+                        coefficients, gather_index, axis=2
+                    )[:, :, :nb_keep]
+                    return out + (ordered_coefficients,)
                 return out
 
         _t0 = _perf()                                      # instrument:
         if not use_active:
             post_result = _post_kpath(
-                tuple(lambda_q_list), int(nq), int(nb_keep))
+                tuple(lambda_q_list), tuple(path_coeff_chunks),
+                int(nq), int(nb_keep))
             energies_sorted_jax, inverse_residual = post_result[:2]
-            path_order = post_result[2] if return_coeffs else None
+            coeffs_on_path = post_result[2] if return_coeffs else None
         else:
             post_result = _post_active_kpath(
-                tuple(lambda_q_list), tuple(active_selection_list), int(nq))
+                tuple(lambda_q_list), tuple(active_selection_list),
+                tuple(path_coeff_chunks), int(nq))
             (energies_sorted_jax, inverse_residual,
              selection_diagnostics) = post_result[:3]
-            path_order = post_result[3] if return_coeffs else None
+            coeffs_on_path = post_result[3] if return_coeffs else None
             (min_score_gap, max_score_tol, min_selected_character,
              max_rejected_character, n_ambiguous, n_degenerate_safe,
              max_unsafe_energy_span,
@@ -1891,21 +1909,7 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
                     "Ry.  Produce canonical QP U/E for a wider corrected "
                     "block or return fewer bands; do not track branches "
                     "along this plotting path.")
-        if return_coeffs:
-            # The q carrier stays split over all P ranks.  Apply the exact
-            # post-Newton order used above and truncate only here.  Padding is
-            # retained so an observable consumer never gathers a
-            # path-by-rank coefficient array to one rank.
-            @partial(jax.jit, out_shardings=batch_vec_shard)
-            def _order_path_coeffs(chunks, order):
-                coefficients = jnp.concatenate(chunks, axis=0)
-                gather_index = jnp.broadcast_to(
-                    order[:, None, :], coefficients.shape)
-                return jnp.take_along_axis(
-                    coefficients, gather_index, axis=2)[:, :, :nb_keep]
-
-            coeffs_on_path = _order_path_coeffs(
-                tuple(path_coeff_chunks), path_order)
+        if coeffs_on_path is not None:
             jax.block_until_ready(coeffs_on_path)
         energies_on_path = energies_sorted_jax
         require_newton_converged(
