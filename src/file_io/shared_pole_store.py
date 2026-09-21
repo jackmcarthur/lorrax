@@ -199,6 +199,18 @@ def _write_header(io, header):
     io.write_attr("header_json", np.bytes_(_json(header)))
 
 
+def _read_staging_header(path):
+    """Close every serial reader before any rank can reopen the staged writer."""
+    header = error = None
+    try:
+        if Path(path).exists():
+            header = _read_header(path)
+    except BaseException as exc:
+        error = exc
+    agree_io_refusal(error, path=path, stage="shared_pole.staging_header")
+    return header
+
+
 def _stamp_header(path, header, stage):
     # Only metadata, after every collective handle has closed.
     def publish():
@@ -418,8 +430,8 @@ def write_shared_pole_model(path, b, poles2, K, *, q_span, meta, tables,
         lo, hi = _span(q_span, header["n_q_irr"], "q_span")
         if hi - lo != b.shape[0]:
             _refuse("q_span does not match factor batch")
-        if Path(path).exists():
-            previous = _read_header(path)
+        previous = _read_staging_header(path)
+        if previous is not None:
             if previous["finalized"]:
                 _refuse("finalized models are immutable")
             for key in header:
@@ -436,7 +448,7 @@ def write_shared_pole_model(path, b, poles2, K, *, q_span, meta, tables,
     with timing.section("canonical_basis_conversion_and_packing"):
         canonical = basis.unpack_axis(b, 1)
         canonical.block_until_ready()
-    if not Path(path).exists():
+    if previous is None:
         with SlabIO(path, mode="w", mesh=mesh) as io:
             _write_metadata(io, header)
             _write_header(io, header)
@@ -474,7 +486,9 @@ def finalize_shared_pole_model(path, *, meta, expected_identity, basis=None):
     A native write failure retains the global incomplete marker and refuses;
     this retries the recoverable boundary after all staged batches closed.
     """
-    header = _read_header(path)
+    header = _read_staging_header(path)
+    if header is None:
+        _refuse("missing staged model")
     _check_identity(header["identity"], expected_identity)
     basis = _check_basis(meta, header, basis)
     if header["schema"] != SCHEMA or not all(header["written_q"]):
