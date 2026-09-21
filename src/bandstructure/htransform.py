@@ -1733,6 +1733,18 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
         # Values are untouched: ``out_shardings`` moves data, it does not
         # compute.
         # Gate: ``tests/test_htransform_kpath_gates.py``.
+        def _order_path_state_carriers(energies, coefficient_batches, nq):
+            """Apply one stable band permutation to energies and vectors."""
+            order = jnp.argsort(energies, axis=1, stable=True)
+            ordered_energies = jnp.take_along_axis(
+                energies[:nq], order[:nq], axis=1)[:, :nb_keep]
+            coefficients = jnp.concatenate(coefficient_batches, axis=0)
+            gather_index = jnp.broadcast_to(
+                order[:, None, :], coefficients.shape)
+            ordered_coefficients = jnp.take_along_axis(
+                coefficients, gather_index, axis=2)[:, :, :nb_keep]
+            return ordered_energies, ordered_coefficients
+
         if not use_active:
             _post_out_shardings = ((rep, rep, batch_vec_shard)
                                    if return_coeffs else (rep, rep))
@@ -1749,16 +1761,9 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
                     # carrier.  Only the logical rows feed published energies.
                     energies, inverse_residual = newton_inv(
                         a_f, n_f, shift, lambda_carrier.real)
-                    order = jnp.argsort(energies, axis=1, stable=True)
-                    energies_sorted = jnp.take_along_axis(
-                        energies[:nq], order[:nq], axis=1)[:, :nb_keep]
-                    coefficients = jnp.concatenate(
-                        coefficient_batches, axis=0)
-                    gather_index = jnp.broadcast_to(
-                        order[:, None, :], coefficients.shape)
-                    ordered_coefficients = jnp.take_along_axis(
-                        coefficients, gather_index, axis=2
-                    )[:, :, :nb_keep]
+                    (energies_sorted,
+                     ordered_coefficients) = _order_path_state_carriers(
+                         energies, coefficient_batches, nq)
                     return (energies_sorted, inverse_residual,
                             ordered_coefficients)
                 energies, inverse_residual = newton_inv(
@@ -1801,11 +1806,9 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
                 min_nonreturned_energy, outside_inverse_residual = newton_inv(
                     a_f, n_f, shift, min_nonreturned_lambda.real)
                 if return_coeffs:
-                    order = jnp.argsort(
-                        carrier_energies, axis=1, stable=True)
-                    returned_energies = jnp.take_along_axis(
-                        carrier_energies[:nq], order[:nq], axis=1
-                    )[:, :nb_keep]
+                    (returned_energies,
+                     ordered_coefficients) = _order_path_state_carriers(
+                         carrier_energies, coefficient_batches, nq)
                 else:
                     returned_energies = jnp.sort(
                         energies, axis=1)[:, :nb_keep]
@@ -1843,13 +1846,6 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
                            outside_inverse_residual),
                        diagnostics)
                 if return_coeffs:
-                    coefficients = jnp.concatenate(
-                        coefficient_batches, axis=0)
-                    gather_index = jnp.broadcast_to(
-                        order[:, None, :], coefficients.shape)
-                    ordered_coefficients = jnp.take_along_axis(
-                        coefficients, gather_index, axis=2
-                    )[:, :, :nb_keep]
                     return out + (ordered_coefficients,)
                 return out
 
