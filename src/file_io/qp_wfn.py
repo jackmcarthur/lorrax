@@ -799,6 +799,141 @@ def write_qp_wfn_h5(
 
 
 
+def validate_qp_wfn_h5(
+        path: str, *, wfn, expected_energies_ry: np.ndarray,
+        band_start: int, band_stop: int,
+        occupations_kn: np.ndarray | None = None,
+        occupation_state=None) -> None:
+    """Reopen and validate one closed canonical QP-WFN staging file.
+
+    This is the publication check paired with :func:`write_qp_wfn_h5`.
+    It reads the small header tables and checks the large coefficient
+    dataset's shape without materialising its payload.  A writer exception
+    is already fatal; this second pass establishes that the closed HDF5 file
+    carries the exact final energy/occupation state and the positive QP stamp
+    before an atomic rename makes it visible.
+    """
+    energies = np.asarray(expected_energies_ry, dtype=np.float64)
+    expected_energy_shape = (int(wfn.nkpts), int(wfn.nbands))
+    if energies.shape != expected_energy_shape:
+        raise ValueError(
+            "validate_qp_wfn_h5: expected_energies_ry has shape "
+            f"{energies.shape}, expected {expected_energy_shape}.")
+    if not np.all(np.isfinite(energies)):
+        raise ValueError(
+            "validate_qp_wfn_h5: expected energies must be finite.")
+    if (occupations_kn is None) != (occupation_state is None):
+        raise ValueError(
+            "validate_qp_wfn_h5: occupations_kn and occupation_state must "
+            "be supplied together.")
+
+    required = (
+        "mf_header/kpoints/nrk", "mf_header/kpoints/mnband",
+        "mf_header/kpoints/nspin", "mf_header/kpoints/nspinor",
+        "mf_header/kpoints/ngk", "mf_header/kpoints/el",
+        "mf_header/kpoints/occ", "mf_header/kpoints/rk",
+        "wfns/gvecs", "wfns/coeffs",
+    )
+    with h5py.File(os.fspath(path), "r") as h5:
+        missing = [name for name in required if name not in h5]
+        if missing:
+            raise ValueError(
+                f"{os.path.basename(os.fspath(path))} is not a complete "
+                f"QP WFN; missing {missing}.")
+        header_values = {
+            "nrk": int(np.asarray(h5["mf_header/kpoints/nrk"])),
+            "mnband": int(np.asarray(h5["mf_header/kpoints/mnband"])),
+            "nspin": int(np.asarray(h5["mf_header/kpoints/nspin"])),
+            "nspinor": int(np.asarray(h5["mf_header/kpoints/nspinor"])),
+        }
+        expected_header = {
+            "nrk": int(wfn.nkpts), "mnband": int(wfn.nbands),
+            "nspin": int(wfn.nspin), "nspinor": int(wfn.nspinor),
+        }
+        if header_values != expected_header:
+            raise ValueError(
+                "validate_qp_wfn_h5: closed header differs from its source "
+                f"WFN: got {header_values}, expected {expected_header}.")
+
+        nk, nb = expected_energy_shape
+        nspin = expected_header["nspin"]
+        nspinor = expected_header["nspinor"]
+        ngk = np.asarray(h5["mf_header/kpoints/ngk"], dtype=np.int64)
+        if ngk.shape != (nk,) or np.any(ngk < 0):
+            raise ValueError(
+                "validate_qp_wfn_h5: invalid closed ngk table "
+                f"shape/value {ngk.shape}.")
+        ngktot = int(np.sum(ngk, dtype=np.int64))
+        shapes = {
+            "el": tuple(h5["mf_header/kpoints/el"].shape),
+            "occ": tuple(h5["mf_header/kpoints/occ"].shape),
+            "rk": tuple(h5["mf_header/kpoints/rk"].shape),
+            "gvecs": tuple(h5["wfns/gvecs"].shape),
+            "coeffs": tuple(h5["wfns/coeffs"].shape),
+        }
+        expected_shapes = {
+            "el": (nspin, nk, nb), "occ": (nspin, nk, nb),
+            "rk": (nk, 3), "gvecs": (ngktot, 3),
+            "coeffs": (nb, nspinor, ngktot, 2),
+        }
+        if shapes != expected_shapes:
+            raise ValueError(
+                "validate_qp_wfn_h5: closed dataset shapes differ from "
+                f"the canonical WFN layout: got {shapes}, expected "
+                f"{expected_shapes}.")
+        stored_energies = np.asarray(
+            h5["mf_header/kpoints/el"], dtype=np.float64)
+        if not np.array_equal(stored_energies[0], energies):
+            raise ValueError(
+                "validate_qp_wfn_h5: closed final energies differ from "
+                "the state handed to the writer.")
+
+        stamp = {
+            "scheme": h5.attrs.get(QP_WFN_ATTR),
+            "band_start": h5.attrs.get("qp_wfn_band_start"),
+            "band_stop": h5.attrs.get("qp_wfn_band_stop"),
+            "source": h5.attrs.get("qp_wfn_source", ""),
+        }
+        stamp = {
+            key: (value.decode() if isinstance(value, bytes) else value)
+            for key, value in stamp.items()
+        }
+        expected_stamp = {
+            "scheme": QP_WFN_SCHEME, "band_start": int(band_start),
+            "band_stop": int(band_stop),
+            "source": str(getattr(wfn, "path", "") or ""),
+        }
+        if stamp != expected_stamp:
+            raise ValueError(
+                "validate_qp_wfn_h5: closed QP stamp differs from the "
+                f"writer request: got {stamp}, expected {expected_stamp}.")
+
+        stored_occupations = np.asarray(
+            h5["mf_header/kpoints/occ"], dtype=np.float64)
+        if not np.all(np.isfinite(stored_occupations)):
+            raise ValueError(
+                "validate_qp_wfn_h5: closed occupations are non-finite.")
+        if occupations_kn is not None:
+            occupations = np.asarray(occupations_kn, dtype=np.float64)
+            if occupations.shape == (nk, nb) and nspin == 1:
+                occupations = occupations[None, ...]
+            if not np.array_equal(stored_occupations, occupations):
+                raise ValueError(
+                    "validate_qp_wfn_h5: closed occupations differ from "
+                    "the final fixed-N table handed to the writer.")
+            expected_occ_attrs = _qp_occupation_attrs(occupation_state)
+            stored_occ_attrs = {
+                name: h5.attrs.get(name) for name in expected_occ_attrs}
+            stored_occ_attrs = {
+                key: (value.decode() if isinstance(value, bytes) else value)
+                for key, value in stored_occ_attrs.items()
+            }
+            if stored_occ_attrs != expected_occ_attrs:
+                raise ValueError(
+                    "validate_qp_wfn_h5: closed occupation provenance "
+                    "differs from the final occupation state.")
+
+
 def _validate_qp_state_source(record, *, path: str) -> dict:
     """Return one canonical restart source-state record or refuse it."""
     from common.parallel_transport import WFN_FINGERPRINT_SCHEME

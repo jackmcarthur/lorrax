@@ -1540,10 +1540,23 @@ def main(argv=None):
 	report.timings(timing.records(), wall=_wall)
 	report.warnings()
 	report.files(_file_rows)
+	_completion_artifacts = [
+	    ("Sigma matrix elements", sigma_omega_h5_path, True),
+	    ("restart tensors", tensors_filename, False),
+	]
+	if sc_result is not None:
+	    # The SC writer validates each private sibling before atomic replace.
+	    # Requiring both final names in the existing completion manifest makes
+	    # the report's terminal status the bundle receipt: a process killed
+	    # between the two replacements leaves no completed-run claim.
+	    _completion_artifacts.append((
+	        "SC QP rotations",
+	        os.path.join(input_dir, "qp_wfn_rotations.h5"), True))
+	    if bool(config.debug.write_wfn_h5):
+	        _completion_artifacts.append((
+	            "SC QP WFN", os.path.join(input_dir, "WFN_qp.h5"), True))
 	if not _published_artifacts(
-	        (("Sigma matrix elements", sigma_omega_h5_path, True),
-	         ("restart tensors", tensors_filename, False)),
-	        print_fn=print0):
+	        tuple(_completion_artifacts), print_fn=print0):
 	    raise RuntimeError(
 	        "GATE gw_artifacts_unpublished: got: a required artifact is "
 	        "missing or left uncommitted (manifest above); want: every "
