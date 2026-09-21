@@ -414,6 +414,8 @@ For the motion readout, the first map output supplies a fixed QP reference
 labelled by its overlap with whole DFT multiplets. Later input and output
 columns are assigned to those reference multiplets over all active candidates;
 their block means define the identity criterion even if a multiplet splits.
+A warm seed uses the original DFT basis for that first assignment: its sorted
+input columns may already cross the protected/scissored identity boundary.
 `SC_identity` comments describe eqp0 motion in both eqp0 and eqp1 files and
 use the file's k-block index (the first integer in a body row is spin).
 

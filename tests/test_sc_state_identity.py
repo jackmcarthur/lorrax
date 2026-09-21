@@ -168,6 +168,39 @@ def test_map0_labels_follow_dft_overlap_across_a_scissored_crossing(monkeypatch)
     np.testing.assert_array_equal(updated.outputs.identity['motion_ev'][0, :2], [0., 0.])
 
 
+def test_warm_map0_labels_start_from_dft_identities_across_seed_crossing(monkeypatch):
+    from dataclasses import replace
+    from types import SimpleNamespace
+
+    from common.units import RYD_TO_EV
+
+    # DFT bands 0,1 are protected.  In the external seed, scissored DFT band
+    # 2 crosses below protected band 1, so sorted seed column 1 is not DFT
+    # identity 1.  Only the actual protected state changes in the map.
+    e_dft = np.array([[0., 2., 3., 4.]])
+    order = [0, 2, 1, 3]
+    u_warm = np.eye(4)[None].astype(complex)[:, :, order]
+    e_warm = np.array([[0., 1., 2., 4.]])
+    e_out = np.array([[0., 1., 2.5, 4.]])
+    sc, inputs, state, _ = _identity_call_fixture(monkeypatch, e_out, u_warm)
+    inputs.initial_state_role = 'external_qp_seed'
+    inputs.e_dft_active_kn_ry = e_dft / RYD_TO_EV
+    inputs.kstar = SimpleNamespace(is_identity=True)
+    state = replace(
+        state,
+        outputs=replace(state.outputs, sigma_basis_U=u_warm),
+    )
+
+    verdict, updated = sc._sc_identity_for_call(
+        inputs, state, e_warm, e_out, {}, cutoff_ev=.1)
+    ident = updated.outputs.identity
+    np.testing.assert_array_equal(ident['input_indices'][0], [0, 2, -1, -1])
+    np.testing.assert_array_equal(ident['output_indices'][0], [0, 2, -1, -1])
+    np.testing.assert_allclose(ident['residual_ev'][0, :2], [0., .5])
+    assert np.isnan(ident['residual_ev'][0, 2:]).all()
+    assert not verdict.converged and verdict.max_abs_ev == .5
+
+
 def test_map0_dft_multiplet_cut_by_the_band_mask_still_refuses(monkeypatch):
     e_dft = np.array([[0., 1., 1., 3.]])  # trusted 0,1 cuts the DFT doublet 1,2
     e_out = np.array([[0., 1., 1., 3.]])

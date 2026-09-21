@@ -4528,8 +4528,8 @@ def _sc_identity_for_call(inputs, state_out, e_input_ev, e_output_ev,
 
     The reference is the first map OUTPUT. Its labels are the trusted DFT
     bands: at map 0 each trusted DFT band is assigned (by multiplet
-    overlap through the map's own input rotation) to the output column
-    that carries it, and later maps are matched to THOSE columns. Sorted
+    overlap from the DFT basis, including for a reordered warm seed) to the
+    output column that carries it, and later maps are matched to THOSE columns. Sorted
     position is not identity: on Na (+15 eV top) the scissored Gamma
     triplet 11-13 lands below the protected doublet at sorted 9-11, so a
     sorted-band mask cut an exact multiplet and the readout refused
@@ -4562,14 +4562,23 @@ def _sc_identity_for_call(inputs, state_out, e_input_ev, e_output_ev,
     u_out = u_out[:, :nb, :nb]
     kw = dict(degeneracy_tol_ev=float(inputs.config.sc.exact_degeneracy_tol_ev))
     if not history:
+        reference_u, reference_e = u_in, e_input_ev
+        if getattr(inputs, 'initial_state_role', 'dft_seed') == 'external_qp_seed':
+            # A warm seed may already reorder the protected DFT identities.
+            # Its sorted columns cannot label the frozen partition.
+            ks = _kstar(inputs)
+            reference_e = np.asarray(inputs.e_dft_active_kn_ry) * RYD_TO_EV
+            if not ks.is_identity:
+                reference_e = np.asarray(ks.select(reference_e))
+            reference_u = np.broadcast_to(np.eye(nb), u_in.shape)
         # DFT band -> map-0 output column, whole DFT multiplets (the
         # partition promotes to whole multiplets, so the trusted band mask
         # never cuts one in the input spectrum).
         # Validate whole trusted reference multiplets using the established
         # readout, then fill the rest without changing those assignments.
-        assign_qp_identity(u_in, e_input_ev, u_out, e_output_ev, mask, **kw)
+        assign_qp_identity(reference_u, reference_e, u_out, e_output_ev, mask, **kw)
         slot, _, blocks0, _ = assign_qp_identity(
-            u_in, e_input_ev, u_out, e_output_ev,
+            reference_u, reference_e, u_out, e_output_ev,
             np.ones(mask.shape, dtype=bool), priority_mask=mask, **kw)
         labels = np.zeros(slot.shape, dtype=bool)
         labels[np.nonzero(mask)[0], slot[mask]] = True
