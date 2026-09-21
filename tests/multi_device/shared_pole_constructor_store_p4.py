@@ -121,11 +121,19 @@ def run_checks(mesh, directory):
                                   result['q_receipts'][q]['constructor']['retained_moment_relative']['M3']))
         assert max(errors) < 1e-10
         assert all(row['status'] != 'FAIL' for receipt in result['q_receipts'] for row in receipt['gates'])
+        execution = result['execution']['mode']
+        if layout == 'distributed':
+            assert execution == 'face'
+        expected_ops = {'eigh', 'gemm'} if execution == 'face' else {'eigh'}
         for receipt in result['q_receipts']:
             queries = receipt['constructor']['native_workspace_queries']
-            assert {row['op'] for row in queries} == {'eigh', 'gemm'}
+            assert {row['op'] for row in queries} == expected_ops
             maxima = receipt['constructor']['capacity']['native_workspace']
-            assert maxima['gemm'] == max(row['bytes_per_rank'] for row in queries if row['op'] == 'gemm')
+            if execution == 'face':
+                assert maxima['gemm'] == max(
+                    row['bytes_per_rank'] for row in queries if row['op'] == 'gemm')
+            else:
+                assert 'gemm' not in maxima
             assert receipt['constructor']['capacity']['price']['phase'] == 'model'
             current_eigh = [row['bytes_per_rank'] for row in queries
                             if row['op'] == 'eigh' and row['shapes'][0][-1] == meta.n_rmu_padded]
