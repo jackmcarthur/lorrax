@@ -43,6 +43,12 @@ def test_rank0_filesystem_error_names_action_and_path():
         collectives.rank0_transaction('/private/qp.h5', stage='QP', write=write)
 
 
+def test_rank0_transaction_can_return_bounded_control_value():
+    value = collectives.rank0_transaction(
+        '/tmp/bank.h5', stage='resume', write=lambda: True, return_value=True)
+    assert value is True
+
+
 def test_incomplete_restart_refuses_even_with_stale_ready_flag(tmp_path):
     from file_io.restart_bundle import read_metadata
     path = tmp_path / 'restart.h5'

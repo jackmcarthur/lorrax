@@ -12,6 +12,94 @@ import numpy as np
 from jax.sharding import NamedSharding, PartitionSpec as P
 
 
+def constructor_side_upper_bound(recipe, *, ordered, odd_moments,
+                                 logical_n=None,
+                                 column_extent=lambda width: width):
+    """Conservative recipe-only pencil side before any bank array is read.
+
+    Line supports can contribute conjugate states, and an ordered bank adds a
+    mirrored half. Pure-imaginary ordered supports can also contribute the
+    independently selected partner direction. Multiplet closure is carried by
+    ``column_extent``. This is an admission bound, never a retained-rank rule.
+    """
+    from gw.shared_pole_recipe import ROLE_CODES
+
+    held = np.asarray(recipe['held'], dtype=bool)
+    roles = np.asarray(recipe['role'], dtype=np.int64)
+    line = int(np.sum((roles == ROLE_CODES['line']) & ~held))
+    imaginary = int(np.sum((roles == ROLE_CODES['imaginary']) & ~held))
+    line_cap = recipe.get('line_direction_cap')
+    if line_cap is None:
+        if logical_n is None:
+            raise ValueError('constructor side bound needs logical_n when the line cap is unset')
+        line_cap = logical_n
+    line_width = column_extent(max(1, int(line_cap)))
+    imaginary_width = column_extent(max(1, int(recipe['imaginary_width'])))
+    infinity_width = column_extent(max(1, int(recipe['infinity_width'])))
+    if ordered:
+        finite = 4 * (line * line_width + imaginary * imaginary_width)
+        infinity = 2 * infinity_width if odd_moments else 0
+    else:
+        finite = 2 * line * line_width + imaginary * imaginary_width
+        infinity = infinity_width
+    return int(finite + infinity)
+
+
+def constructor_execution(meta, resolution, recipe, *, mesh, ledger, upstream,
+                          ordered, odd_moments, sample_fields, moment_fields,
+                          parent_count=1, retained_output_families=1,
+                          column_extent=lambda width: width):
+    """Resolve local or whole-mesh execution once, before a constructor read.
+
+    Explicit distributed service policy selects the face. Otherwise the local
+    parent route remains the fast path only when both the complete selection
+    stack and the conservative recipe pencil fit the current device budget.
+    """
+    from gw.shared_pole_capacity import ConstructorCapacity
+
+    side = constructor_side_upper_bound(
+        recipe, ordered=ordered, odd_moments=odd_moments,
+        logical_n=int(meta.n_rmu),
+        column_extent=column_extent)
+    fit_ids = [int(i) for i in recipe['fit_ids']]
+    fit = max(fit_ids) - min(fit_ids) + 1
+    selection_faces = fit * int(sample_fields) + int(moment_fields)
+    if resolution.layout == 'distributed':
+        return 'face', dict(reason='configured distributed service',
+                            conservative_pencil_side=side,
+                            selection_face_count=selection_faces)
+    if resolution.layout != 'local':
+        raise ValueError('unsupported resolved constructor linalg layout')
+    local = ConstructorCapacity(meta, resolution, mesh_xy=mesh, ledger=ledger,
+                                upstream=upstream, execution='local')
+    local.batch_width = int(mesh.size)
+    pole_budget = recipe.get('pole_budget')
+    if pole_budget is None:
+        pole_budget = int(meta.n_rmu)
+    output_width = column_extent(max(1, int(pole_budget)))
+    retained_outputs = int(np.ceil(
+        16 * int(parent_count) * int(retained_output_families)
+        * int(meta.n_rmu_padded) * output_width / int(mesh.size)))
+    def preview(phase, **kwargs):
+        price,native=local.quote(side,phase=phase,**kwargs)
+        row=ledger.preview(
+            resident_bytes_per_rank=price['resident_bytes_per_rank']+retained_outputs,
+            workspace_bytes_per_rank=sum(native.values()),concurrent_with=upstream)
+        row['retained_output_upper_bound_bytes_per_rank']=retained_outputs
+        return row
+    selection = preview('selection',sample_batch=fit,
+                        selection_faces=selection_faces)
+    reduction = preview('reduction')
+    admitted = all(row['device_budget_status'] == 'PASS'
+                   for row in (selection, reduction))
+    return ('local' if admitted else 'face'), dict(
+        reason=('capacity-admitted local parent' if admitted else
+                'local parent exceeds current device budget'),
+        conservative_pencil_side=side, selection_face_count=selection_faces,
+        retained_output_upper_bound_bytes_per_rank=retained_outputs,
+        local_selection=selection, local_reduction=reduction)
+
+
 def is_face(array):
     spec = tuple(array.sharding.spec)
     return len(spec) == array.ndim and spec[-2:] == ('x', 'y')
@@ -97,12 +185,13 @@ def face_parent_program(mesh,ordered,odd_moments,keep_budget,retain_span):
 
 
 def face_reduce_round(states,infinity,tables,*,real,mesh,budget,ordered,odd_moments,
-                      keep_budget,retain_span=False):
+                      keep_budget,retain_span=False,admit=True):
     """One physical parent, all ranks, with no artificial round zero tails."""
     if real != 1 or len(tables['own']) != 1:
         raise ValueError('distributed constructor requires one physical parent per full-mesh program')
     side=tables['active'].shape[-1]
-    budget.plan(side,phase='reduction')
+    if admit:
+        budget.plan(side,phase='reduction')
     program=face_parent_program(mesh,ordered,odd_moments,keep_budget,retain_span)
     result=program(jnp.asarray(tables['points']),jnp.asarray(tables['order']),
         jnp.asarray(tables['active']),tuple(s[1] for s in states),
@@ -112,14 +201,30 @@ def face_reduce_round(states,infinity,tables,*,real,mesh,budget,ordered,odd_mome
     return (*output,result[3]) if retain_span else output
 
 
-def sector_round_schedule(bank,header,meta,config,mesh,partner):
-    """Use the existing explicit linalg mode, resolved once before bank reads."""
+@lru_cache(maxsize=None)
+def face_round_check_program(mesh, ordered):
+    """Whole-mesh adapter for the scalar model's existing gate equations."""
+    from gw.shared_pole_local import _round_check_equations
+    from gw.shared_pole_recipe import (shared_real_pole_gates_ordered_v1,
+                                       shared_real_pole_gates_v1_r3b)
+    gates = (shared_real_pole_gates_ordered_v1 if ordered else
+             shared_real_pole_gates_v1_r3b)
+    def eigh(a):
+        return face_eigh(mesh, a.shape[-1]).batched(a)
+    return face_program(partial(_round_check_equations, matmul=face_matmul(mesh),
+                                eigh=eigh, gates=gates, ordered=ordered),
+                        mesh, outputs='scalars')
+
+
+def sector_round_schedule(bank,header,meta,config,mesh,partner,*,execution=None):
+    """Schedule capacity-resolved local rounds or one full-mesh parent."""
     from gw.shared_pole_local import parent_rounds
     from gw.gw_config import linalg_resolution
     resolution=linalg_resolution({'linalg':config.backend.linalg})
-    if resolution.layout == 'local':
+    execution = resolution.layout if execution is None else execution
+    if execution == 'local':
         return [(*row,'local') for row in parent_rounds(header['n_q_irr'],mesh.size,partner)]
-    if resolution.layout != 'distributed':
+    if execution not in ('distributed', 'face'):
         raise ValueError('unsupported resolved constructor linalg layout')
     # Literal mirrors already contain the same operator; face parents need
     # neither simultaneous partner parents nor artificial rank padding.
