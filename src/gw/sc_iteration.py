@@ -840,7 +840,10 @@ def _solve_occupation_state(
     inputs: SCInputs,
     energies_kn_ry,
 ) -> OccupationState | None:
-    """Solve the canonical per-iteration fixed-N MP1 occupation state.
+    """Solve the canonical per-iteration fixed-N occupation state.
+
+    Metals use the declared Fermi-Dirac family; broadened insulators without
+    a declared family retain MP1.
 
     The state's ``f_kn`` is full-BZ because the parallel-transport velocity
     and head contraction are full-BZ, padded to the PT storage width; padding
@@ -2721,11 +2724,12 @@ def _partition_on_loop(partition, inputs):
 def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     """One self-consistent QSGW step in the DFT basis.
 
-    Pure function — no side effects on ``inputs.wfns_dft``.  All
-    derived quantities (E_qp, U_qp, efermi) are recomputed each call.  The
-    carried state is ``H_qp_dft`` plus the preceding protected-band decision;
-    the latter supplies only edge hysteresis and never freezes the Fermi
-    anchor or current-spectrum classification.
+    Pure function — no side effects on ``inputs.wfns_dft``.  The current
+    eigensystem, occupations and chemical potential are recomputed on every
+    call.  The carried state is ``H_qp_dft`` plus the map-0 band partition:
+    its protected identities and in-range mask remain frozen after
+    initialization while their current energies and sorted columns continue
+    to move.
 
     Screening is mode-orthogonal: each iteration asks
     :func:`gw.screening.compute_screening_model` for the configured Σ

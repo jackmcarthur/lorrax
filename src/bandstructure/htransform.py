@@ -1615,6 +1615,12 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
                 return_vectors=return_coeffs)
 
     fermi_energy = float(wfn.efermi)
+    # Exact scalar subtracted from every reported path energy below.  Keep it
+    # even though the historical ``fermi_energy`` return remains zero after
+    # shifting, so downstream plots can reference the same spectrum to a
+    # separately authenticated physical chemical potential without trying to
+    # reconstruct this offset from an approximate path/coarse coincidence.
+    energy_reference_ry = None
     kpath_frac, x_path, node_indices, node_labels, gamma_positions = kpath_data
     energies_on_path = None
     energies_sorted = None
@@ -1972,6 +1978,7 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
         # absolute electron count here silently selected a conduction level
         # whenever the window started above band zero.
         fermi_energy = float(np.max(energies_sorted[:, fermi_band_idx]))
+        energy_reference_ry = fermi_energy
         _k_np = np.asarray(jax.device_get(wrapped_k))[:nq]
         if not np.all(np.isfinite(_k_np)):
             raise ValueError(
@@ -2093,6 +2100,9 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
         "nb_fit": int(states),
         "band_start": int(band_start),
         "n_guard_bands": n_guard_bands,
+        # Ry.  The exact pre-shift path VBM subtracted from every returned
+        # path-energy carrier, or None when no path was requested.
+        "energy_reference_ry": energy_reference_ry,
         "fermi_energy": fermi_energy,
         "energies_on_path": energies_on_path,
         "energies_sorted": energies_sorted,
