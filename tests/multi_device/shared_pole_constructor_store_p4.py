@@ -121,18 +121,24 @@ def run_checks(mesh, directory):
             queries = receipt['constructor']['native_workspace_queries']
             assert {row['op'] for row in queries} == expected_ops
             assert receipt['constructor']['capacity']['execution'] == execution
-            maxima = receipt['constructor']['capacity']['native_workspace']
+            # The query list is cumulative across selection, reduction and
+            # model phases. ``native_workspace`` is the current phase's live
+            # workspace: earlier solve/product scratch is transient and has
+            # already been released.
+            workspace = receipt['constructor']['capacity']['native_workspace']
             if execution == 'face':
-                assert maxima['gemm'] == max(
-                    row['bytes_per_rank'] for row in queries if row['op'] == 'gemm')
+                current_gemm = [row['bytes_per_rank'] for row in queries
+                    if row['op'] == 'gemm'
+                    and row['shapes'][0][-1] == meta.n_rmu_padded]
+                assert workspace['gemm'] == current_gemm[0]
             else:
-                assert 'gemm' not in maxima
+                assert 'gemm' not in workspace
             assert receipt['constructor']['capacity']['price']['phase'] == 'model'
             current_eigh = [row['bytes_per_rank'] for row in queries
                             if row['op'] == 'eigh' and row['shapes'][0][-1] == meta.n_rmu_padded]
-            assert maxima['eigh'] == current_eigh[0]
-            assert maxima['eigh'] > 0
-            assert receipt['constructor']['capacity']['workspace_bytes_per_rank'] == sum(maxima.values())
+            assert workspace['eigh'] == current_eigh[0]
+            assert workspace['eigh'] > 0
+            assert receipt['constructor']['capacity']['workspace_bytes_per_rank'] == sum(workspace.values())
         # A changed resolved coordinate must refuse before a model write.
         old_z = recipe['z_ry'].copy()
         recipe['z_ry'][2] += .01
