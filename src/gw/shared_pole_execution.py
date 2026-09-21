@@ -80,6 +80,15 @@ def constructor_execution(meta, resolution, recipe, *, mesh, ledger, upstream,
     retained_outputs = int(np.ceil(
         16 * int(parent_count) * int(retained_output_families)
         * int(meta.n_rmu_padded) * output_width / int(mesh.size)))
+    def resident_preview(phase, **kwargs):
+        price = local.resident_quote(side, phase=phase, **kwargs)
+        row = ledger.preview(
+            resident_bytes_per_rank=(price['resident_bytes_per_rank']
+                                     + retained_outputs),
+            workspace_bytes_per_rank=0, concurrent_with=upstream)
+        row['retained_output_upper_bound_bytes_per_rank'] = retained_outputs
+        row['native_workspace_query'] = 'NOT_NEEDED_FOR_RESIDENT_LOWER_BOUND'
+        return row
     def preview(phase, **kwargs):
         price,native=local.quote(side,phase=phase,**kwargs)
         row=ledger.preview(
@@ -87,8 +96,19 @@ def constructor_execution(meta, resolution, recipe, *, mesh, ledger, upstream,
             workspace_bytes_per_rank=sum(native.values()),concurrent_with=upstream)
         row['retained_output_upper_bound_bytes_per_rank']=retained_outputs
         return row
-    selection = preview('selection',sample_batch=fit,
-                        selection_faces=selection_faces)
+    selection_args = dict(sample_batch=fit, selection_faces=selection_faces)
+    resident_selection = resident_preview('selection', **selection_args)
+    resident_reduction = resident_preview('reduction')
+    if any(row['device_budget_status'] != 'PASS'
+           for row in (resident_selection, resident_reduction)):
+        return 'face', dict(
+            reason='local resident lower bound exceeds current device budget',
+            conservative_pencil_side=side,
+            selection_face_count=selection_faces,
+            retained_output_upper_bound_bytes_per_rank=retained_outputs,
+            local_selection=resident_selection,
+            local_reduction=resident_reduction)
+    selection = preview('selection', **selection_args)
     reduction = preview('reduction')
     admitted = all(row['device_budget_status'] == 'PASS'
                    for row in (selection, reduction))

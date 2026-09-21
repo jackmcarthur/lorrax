@@ -170,6 +170,9 @@ class ConstructorCapacity:
         """Return an unrecorded phase price for route selection/preflight."""
         side = int(side)
         n = self._n
+        price = self.resident_quote(
+            side, phase=phase, sample_batch=sample_batch,
+            selection_faces=selection_faces)
         extents = {n, 2*n} if phase == "selection" else (
             {side} if phase == "reduction" else {n})
         # Eigh scratch is transient: replace it at each phase boundary.
@@ -188,6 +191,19 @@ class ConstructorCapacity:
                     self._mesh_xy,shapes,np.complex128,backend='distributed',batched_route='auto')
             self._native_maxima['gemm']=self.native_queries[key]
         self._workspace = sum(self._native_maxima.values())
+
+        return price, dict(self._native_maxima)
+
+    def resident_quote(self, side, *, phase, sample_batch=1,
+                       selection_faces=None):
+        """Price the live arrays without invoking a native workspace query.
+
+        This is an optimistic admission bound. Route selection uses it first
+        because a local provider need not support an extent whose resident
+        arrays already exceed the device budget; any native workspace can only
+        make that route larger.
+        """
+        side = int(side)
         from types import SimpleNamespace
         pricing_resolution = SimpleNamespace(layout="distributed" if self.execution == "face" else "local")
         price = shared_pole_byte_terms(
@@ -201,7 +217,7 @@ class ConstructorCapacity:
                     for a in {id(a): a for a in self.retained_panels}.values())
         price["terms_bytes_per_rank"]["retained_parent_panels"] = extra
         price["resident_bytes_per_rank"] += extra
-        return price, dict(self._native_maxima)
+        return price
 
     def preview(self, side, *, phase, sample_batch=1, selection_faces=None):
         """Preview device admission without appending a ledger row."""
