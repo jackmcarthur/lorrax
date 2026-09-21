@@ -24,7 +24,7 @@ from common.units import RYD_TO_EV
 import common.timing as timing
 from common.collectives import device_put_process_local
 from runtime.padding import (authenticate_axis, authenticate_padded_axis,
-    mesh_divisor, pad_to_axis, padded_axis, padded_mu_axis, padded_mu_extent,
+    mesh_divisor, padded_axis, padded_mu_axis, padded_mu_extent,
     pad_axis)
 from .tagged_arrays import (BAND_WINDOW_SCHEMA_DATASET, BAND_WINDOW_SCHEMA_VERSION,
     BAND_WINDOW_CARRIER_DATASET, CHARGE_ZETA_IDENTITY_DATASET,
@@ -59,6 +59,45 @@ def _munu_slab_request(ds_shape, n_rmu_pad):
         raise ValueError(_REGENERATE)
     shape = tuple(ds_shape[:-2]) + (int(n_rmu_pad),) * 2
     return (0,) * len(shape), shape, P(*([None] * (len(shape)-2)), "x", "y")
+
+
+def _pad_restart_host_axis(A, tag, *, axis=-1, fill=0.0):
+    """Pad one serial-HDF5 metadata array without entering JAX.
+
+    ``G0_mu_nu`` and ``enk_full`` are read as host NumPy arrays and are
+    immediately placed process-locally below.  Sending them through the
+    general JAX padding helper first creates a device result only to fetch it
+    straight back with ``np.asarray``.  Besides being wasted traffic, that
+    fetch becomes a synchronization point for unrelated queued GPU work.
+    Keep this reader-owned host boundary on the host until its one intended
+    placement.
+    """
+    arr = np.asarray(A)
+    ax = int(axis) % int(arr.ndim)
+    source = int(arr.shape[ax])
+    if source < int(tag.logical):
+        raise ValueError(
+            f"{tag.name}: logical extent {tag.logical} exceeds source "
+            f"carrier extent {source} on axis {ax}")
+
+    if source > int(tag.carrier):
+        index = [slice(None)] * arr.ndim
+        index[ax] = slice(0, int(tag.carrier))
+        arr = arr[tuple(index)]
+    elif source < int(tag.carrier):
+        widths = [(0, 0)] * arr.ndim
+        widths[ax] = (0, int(tag.carrier) - source)
+        arr = np.pad(arr, widths, mode="constant", constant_values=fill)
+
+    if bool(tag.pad):
+        # A reusable wider source may carry poison in its tagged tail.  Match
+        # ``runtime.padding.pad_to_axis`` by overwriting that tail even when
+        # no extent change was required.
+        arr = np.array(arr, copy=True)
+        tail = [slice(None)] * arr.ndim
+        tail[ax] = slice(int(tag.logical), int(tag.carrier))
+        arr[tuple(tail)] = fill
+    return arr
 
 def read_coulomb_policy_from_h5(filename) -> dict | None:
     """Read the stamp off a restart file with serial h5py; ``None`` if absent.
@@ -483,39 +522,53 @@ def read_restart_state_from_h5(filename, mesh_xy, *, low_mem_bands=False,
     # G0 is the canonical one-dimensional head vector. Pad and shard
     # it on the same centroid extent as the restored tensors.
     if G0_mu_nu is not None:
-        if G0_mu_nu.ndim != 1:
-            raise ValueError(_REGENERATE)
-        G0_mu_nu = np.asarray(pad_to_axis(
-            G0_mu_nu, mu_axis, axis=-1))
-        # ``device_put_process_local``, NOT ``jax.device_put`` (AA.1):
-        # G0 is host numpy read identically on every rank, and a plain
-        # device_put onto a multi-process NamedSharding fires a hidden
-        # assert_equal all-gather to prove exactly that.  The old reader
-        # used ``with_sharding_constraint`` here, which was only ever
-        # exercised at P=1 because the reader was refused above it -- so
-        # there was no proven multi-process spelling to inherit.
-        G0_mu_nu = device_put_process_local(
-            np.ascontiguousarray(G0_mu_nu),
-            NamedSharding(mesh_xy, P("y")))
+        with timing.section(
+                "gw_jax.restart.host_place.G0_mu_nu", announce=True,
+                label="restart host pad/place G0_mu_nu"):
+            if G0_mu_nu.ndim != 1:
+                raise ValueError(_REGENERATE)
+            G0_mu_nu = _pad_restart_host_axis(
+                G0_mu_nu, mu_axis, axis=-1)
+            # ``device_put_process_local``, NOT ``jax.device_put`` (AA.1):
+            # G0 is host numpy read identically on every rank, and a plain
+            # device_put onto a multi-process NamedSharding fires a hidden
+            # assert_equal all-gather to prove exactly that.  The old reader
+            # used ``with_sharding_constraint`` here, which was only ever
+            # exercised at P=1 because the reader was refused above it -- so
+            # there was no proven multi-process spelling to inherit.
+            G0_mu_nu = device_put_process_local(
+                np.ascontiguousarray(G0_mu_nu),
+                NamedSharding(mesh_xy, P("y")))
+            jax.block_until_ready(G0_mu_nu)
+            authenticate_axis(
+                G0_mu_nu, mu_axis, axis=-1,
+                where="read_restart_state_from_h5 G0_mu_nu")
     if enk_full is not None:
-        n_disk_band = int(enk_full.shape[-1])
-        band_tag = (band_receipt if band_receipt is not None else
-                    _loaded_band_axis(n_disk_band, mesh_xy))
-        if n_band_carrier is not None:
-            band_tag = authenticate_padded_axis(
-                band_tag.logical, int(n_band_carrier), band_tag.divisor,
-                name=band_tag.name)
-        if band_tag.pad:
-            if enk_full.size == 0:
-                raise ValueError(
-                    "Restart enk_full is empty and cannot define the finite "
-                    "energy sentinel needed for band-carrier padding.")
-            sentinel = float(np.max(enk_full)) + 1.0
-            enk_full = np.asarray(pad_to_axis(
-                enk_full, band_tag, axis=-1, fill=sentinel))
-        enk_full = device_put_process_local(
-            np.ascontiguousarray(enk_full),
-            NamedSharding(mesh_xy, P(None, None)))
+        with timing.section(
+                "gw_jax.restart.host_place.enk_full", announce=True,
+                label="restart host pad/place enk_full"):
+            n_disk_band = int(enk_full.shape[-1])
+            band_tag = (band_receipt if band_receipt is not None else
+                        _loaded_band_axis(n_disk_band, mesh_xy))
+            if n_band_carrier is not None:
+                band_tag = authenticate_padded_axis(
+                    band_tag.logical, int(n_band_carrier), band_tag.divisor,
+                    name=band_tag.name)
+            if band_tag.pad:
+                if enk_full.size == 0:
+                    raise ValueError(
+                        "Restart enk_full is empty and cannot define the finite "
+                        "energy sentinel needed for band-carrier padding.")
+                sentinel = float(np.max(enk_full)) + 1.0
+                enk_full = _pad_restart_host_axis(
+                    enk_full, band_tag, axis=-1, fill=sentinel)
+            enk_full = device_put_process_local(
+                np.ascontiguousarray(enk_full),
+                NamedSharding(mesh_xy, P(None, None)))
+            jax.block_until_ready(enk_full)
+            authenticate_axis(
+                enk_full, band_tag, axis=-1,
+                where="read_restart_state_from_h5 enk_full")
 
     del nspinor  # gated above; the extent itself rides on the arrays
     return SimpleNamespace(
