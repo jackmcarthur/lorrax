@@ -4,10 +4,38 @@ from __future__ import annotations
 
 import threading
 import time
+from contextlib import contextmanager
 
 import pytest
 
 from common import timing
+
+
+def test_fenced_section_forwards_announcement_to_fence_and_body(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(
+        timing, "fence",
+        lambda name, **kwargs: calls.append(("fence", name, kwargs)))
+
+    @contextmanager
+    def fake_section(name, **kwargs):
+        calls.append(("section", name, kwargs))
+        yield object()
+
+    monkeypatch.setattr(timing, "section", fake_section)
+    with timing.fenced_section(
+            "spole.gram", sync_ranks=False, announce=True,
+            label="parent=3 side=11392"):
+        pass
+
+    expected = dict(sync_ranks=False, announce=True,
+                    label="parent=3 side=11392")
+    assert calls == [
+        ("fence", "spole.gram", expected),
+        ("section", "spole.gram",
+         dict(announce=True, label="parent=3 side=11392")),
+    ]
 
 
 def _capture_trace(monkeypatch):

@@ -588,34 +588,44 @@ def report(
 	_GLOBAL_COLLECTOR.report(print_fn=print_fn, title=title, min_percent=min_percent, max_depth=max_depth, wall=wall)
 
 
-def fence(name: str, *, sync_ranks: bool = True) -> None:
+def fence(name: str, *, sync_ranks: bool = True, announce: bool = False,
+          label: str | None = None) -> None:
     """Drain earlier device/effect work before a host band, then align ranks.
 
     Wait rows name the next consumer, not the producer of the pending work.
     Rank-local CPU work must use ``sync_ranks=False``: independent workers
     execute different numbers of bands and cannot enter matched collectives.
     No array is gathered or copied. This is a timing boundary, not a kernel.
+    ``announce`` and ``label`` use the section cadence for both device and
+    rank waits, so a long synchronization remains distinguishable from the
+    body it precedes.
     """
     import jax
     from common.collectives import barrier
     prefix, _, band = name.partition(".")
-    with section(prefix + ".device_wait." + band):
+    display = label if label else name
+    with section(prefix + ".device_wait." + band, announce=announce,
+                 label=f"{display}: device wait" if announce else None):
         jax.block_until_ready(jax.live_arrays())
         jax.effects_barrier()
     if sync_ranks:
-        with section(prefix + ".rank_wait." + band):
+        with section(prefix + ".rank_wait." + band, announce=announce,
+                     label=f"{display}: rank wait" if announce else None):
             barrier("timing-" + name)
 
 
 @contextmanager
-def fenced_section(name: str, *, sync_ranks: bool = True):
+def fenced_section(name: str, *, sync_ranks: bool = True,
+                   announce: bool = False, label: str | None = None):
     """``fence(name)`` and then ``section(name)``, so the name is written once.
 
     A fully profiled stage is a sequence of these: the fence attributes the
     device and rank waits to the band that is about to start, and the section
     then times the band itself.  Spelling the pair by hand let the two names
     drift apart, which silently files a band's waits under a different band.
+    Announcement options apply to the waits and body through the one section
+    cadence service.
     """
-    fence(name, sync_ranks=sync_ranks)
-    with section(name) as node:
+    fence(name, sync_ranks=sync_ranks, announce=announce, label=label)
+    with section(name, announce=announce, label=label) as node:
         yield node

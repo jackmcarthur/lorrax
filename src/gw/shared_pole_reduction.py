@@ -65,6 +65,30 @@ def _within_budget(gamma, budget):
     return jnp.arange(gamma.shape[-1])[None, :] >= gamma.shape[-1] - int(budget)
 
 
+def _budget_carrier(width, budget, matrix_sharding):
+    """Static mesh-legal carrier for the only columns a budget can retain.
+
+    ``_within_budget`` keeps an ascending spectrum's final ``budget``
+    columns.  Every earlier eigenvector is therefore multiplied by exact
+    zero before it enters the metric and restricted pencils.  Keep only the
+    suffix which can contribute, rounded up for both axes of a distributed
+    square face.  The rounded extra columns retain their existing false mask
+    and remain exact zero.
+    """
+    width = int(width)
+    if budget is None:
+        return width
+    logical = min(width, int(budget))
+    if matrix_sharding is None:
+        return logical
+    from runtime.padding import padded_axis
+
+    return min(width, padded_axis(
+        logical, matrix_sharding.mesh, name="shared_pole_budget_carrier",
+        specs=((matrix_sharding.spec, -2),
+               (matrix_sharding.spec, -1))).carrier)
+
+
 def reduce_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, gates, keep_budget=None):
     """Equilibrate the Gram matrix and compute its corrected Ritz model.
 
@@ -264,18 +288,29 @@ def reduce_ordered_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, g
     keep = ((gamma > gates["normalized_gram_keep"]["threshold"] * largest[:, None]) & (largest[:, None] > 0)
             & _within_budget(gamma, keep_budget))
     count = jnp.sum(keep, axis=-1, dtype=jnp.int64)
-    z = u * (keep / jnp.sqrt(jnp.where(keep, gamma, 1)))[:, None, :]
+    # The budget mask makes every column before this suffix exact zero.  Do
+    # not carry those zeros through two metric corrections, the doubled
+    # restricted pencil and two further eigensolves.  ``gamma`` and ``keep``
+    # themselves stay full width below so the public diagnostics retain the
+    # incumbent shape and values.
+    retained_extent = _budget_carrier(
+        gamma.shape[-1], keep_budget, matrix_sharding)
+    retained_slice = slice(gamma.shape[-1] - retained_extent, None)
+    gamma_work = gamma[:, retained_slice]
+    keep_work = keep[:, retained_slice]
+    z = u[:, :, retained_slice] * (
+        keep_work / jnp.sqrt(jnp.where(keep_work, gamma_work, 1)))[:, None, :]
     del u
     metric = matmul(z, matmul(h_vv, z), transa="C")
-    null_identity = diagonal_like(~keep, h_vv)
+    null_identity = diagonal_like(~keep_work, metric)
     correction, metric_ok, metric_diagnostics = _metric_inverse_root(
         hermitian_part(metric) + null_identity, matmul=matmul,
         tolerance=gates["retained_subspace_moments"]["threshold"], matrix_sharding=matrix_sharding)
     del null_identity
-    z = matmul(z, correction) * keep[:, None, :]
+    z = matmul(z, correction) * keep_work[:, None, :]
     del correction
     metric = matmul(z, matmul(h_vv, z), transa="C")
-    wanted_metric = diagonal_like(keep, h_vv)
+    wanted_metric = diagonal_like(keep_work, metric)
     metric_relative = (jnp.linalg.norm(metric - wanted_metric, axis=(-2, -1))
                        / jnp.sqrt(jnp.maximum(count, 1)))
     del wanted_metric, h_vv
@@ -293,10 +328,16 @@ def reduce_ordered_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, g
     o_r = _matrix_layout(join_columns(matmul(o_w, z), matmul(o_v, z)), matrix_sharding)
     if retain_span:
         paired_span = scale[:, :, None] * z
+        retained_side = int(z.shape[-1])
     del o_w, o_v, z
     gamma_r, u_r = eigh(h_r)
     top_r = gamma_r[:, -1]
-    ratio_r = gamma_r[:, 0] / jnp.where(top_r > 0, top_r, 1)
+    # Preserve the old full-width minimum: the removed restricted rows were
+    # exact-zero blocks.  Physics below stays on the compact spectrum.
+    removed_r = 2 * int(active.shape[-1]) - int(gamma_r.shape[-1])
+    bottom_r = (jnp.minimum(gamma_r[:, 0], 0)
+                if removed_r else gamma_r[:, 0])
+    ratio_r = bottom_r / jnp.where(top_r > 0, top_r, 1)
     keep_r = (gamma_r > gates["normalized_gram_keep"]["threshold"] * top_r[:, None]) & (top_r[:, None] > 0)
     count_r = jnp.sum(keep_r, axis=-1, dtype=jnp.int64)
     y = u_r * (keep_r / jnp.sqrt(jnp.where(keep_r, gamma_r, 1)))[:, None, :]
@@ -315,8 +356,8 @@ def reduce_ordered_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, g
     c = matmul(o_r, matmul(y, rotation))
     if retain_span:
         ritz = matmul(y, rotation)
-        span_w = matmul(paired_span, ritz[:, :half + n_inf])
-        span_v = matmul(paired_span, ritz[:, half + n_inf:])
+        span_w = matmul(paired_span, ritz[:, :retained_side])
+        span_v = matmul(paired_span, ritz[:, retained_side:])
         # Undo w=(X(z)+X(-z))/2, v=(X(z)-X(-z))/(2z),
         # w_inf=k1 and v_inf=k0 (report equation 5.6).
         coefficients = jnp.concatenate((

@@ -3,8 +3,9 @@
 * ``right_singular_vectors(max_rank=)`` keeps the largest singular values above the cutoff, at most
   ``max_rank`` of them, and never splits a degenerate multiplet at the boundary.
 * ``keep_budget`` in both reducers: K <= budget, every structural gate still passes, and a budget at or
-  above the natural rank returns the unbudgeted model bit for bit. RED TWIN: a budget below the natural
-  rank changes the model.
+  above the natural rank returns the unbudgeted model bit for bit. The ordered route removes the exact-zero
+  carrier outside a binding budget without changing its projected response. RED TWIN: a budget below the
+  natural rank changes the model.
 """
 import numpy as np
 
@@ -61,6 +62,22 @@ def _ordered_budget(plant, points, budget):
     return reduce_ordered_shared_pole_pencil(pencil, active, eigh=eigh, matmul=mm, gates=gates, keep_budget=budget)
 
 
+def _ordered_budget_with_span(plant, points, budget):
+    import jax.numpy as jnp
+    from gw.shared_pole_pencil import assemble_ordered_shared_pole_pencil
+    from gw.shared_pole_reduction import reduce_ordered_shared_pole_pencil
+    from gw.shared_pole_recipe import shared_real_pole_gates_ordered_v1 as gates
+    mm, eigh = _ops()
+    qi = np.linalg.eigh(plant.moment(1))[1][:, -1:]
+    infinity = tuple(_put(a) for a in (qi, *(plant.moment(k) / 2 @ qi for k in range(4))))
+    pencil = assemble_ordered_shared_pole_pencil(_states(plant, points), infinity, matmul=mm)
+    active = jnp.ones((1, pencil[0].shape[-1]), bool)
+    reduced = reduce_ordered_shared_pole_pencil(
+        pencil, active, eigh=eigh, matmul=mm, gates=gates,
+        keep_budget=budget, retain_span=True)
+    return reduced, pencil
+
+
 def test_pole_budget_caps_K_on_both_routes_and_is_inert_above_the_natural_rank():
     points = (.9 + .35j, 1.7 + .35j)
     # Even route on time-reversal-symmetric data.
@@ -98,3 +115,33 @@ def test_pole_budget_caps_K_on_both_routes_and_is_inert_above_the_natural_rank()
     assert bool(np.asarray(diag_c["gram_valid"]).all()) and bool(np.asarray(diag_c["retained_metric_positive"]).all())
     assert np.isrealobj(np.asarray(signed_c[1])) or np.all(np.asarray(signed_c[1]).imag == 0)
     assert max(rel(_signed_value(signed_c, z), _signed_value(signed, z)) for z in ZS) > 1e-6
+
+
+def test_ordered_budget_removes_only_the_exact_zero_carrier(monkeypatch):
+    import gw.shared_pole_reduction as reduction
+
+    plant = _trim(np.random.default_rng(33), 12, 4, eps=.4)
+    points = (.9 + .35j, 1.7 + .35j)
+    budget = 8
+    compact_extent = reduction._budget_carrier
+    monkeypatch.setattr(
+        reduction, "_budget_carrier",
+        lambda width, keep_budget, matrix_sharding: int(width))
+    reference, _ = _ordered_budget_with_span(plant, points, budget)
+    monkeypatch.setattr(reduction, "_budget_carrier", compact_extent)
+    compact, pencil = _ordered_budget_with_span(plant, points, budget)
+
+    _, reference_signed, _, reference_span = reference
+    _, compact_signed, compact_diagnostics, compact_span = compact
+    assert compact_signed[1].shape[-1] == 2 * budget
+    assert reference_signed[1].shape[-1] > compact_signed[1].shape[-1]
+    assert compact_span.shape == (1, pencil[0].shape[-1], 2 * budget)
+    assert int(np.asarray(compact_diagnostics["retained_rank"])[0]) == budget
+    for z in ZS:
+        assert rel(_signed_value(compact_signed, z),
+                   _signed_value(reference_signed, z)) < 2e-11
+    np.testing.assert_allclose(
+        np.asarray(pencil[2]) @ np.asarray(compact_span),
+        np.asarray(compact_signed[0])
+        * np.asarray(compact_signed[2])[:, None, :],
+        rtol=2e-11, atol=2e-11)

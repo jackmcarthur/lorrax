@@ -336,9 +336,9 @@ def round_program(mesh_xy, native_eigh, ordered, odd_moments, keep_budget, sizes
                 reduced = solve(finite(points), finite(q), finite(o), finite(d),
                                 tuple(a[..., :ni] for a in infinity), mask)
                 model, signed, diagnostics = reduced[:3]
-                pad = side - (halves * nf + blocks * ni)
                 def padded(model, sentinel):
                     b, poles, kept = model
+                    pad = side - poles.shape[-1]
                     return (jnp.pad(b, ((0, 0), (0, 0), (0, pad))),
                             jnp.pad(poles, ((0, 0), (0, pad)), constant_values=sentinel),
                             jnp.pad(kept, ((0, 0), (0, pad))))
@@ -356,9 +356,9 @@ def round_program(mesh_xy, native_eigh, ordered, odd_moments, keep_budget, sizes
                     rows = ([k*finite_width+i for k in range(halves) for i in range(nf)]
                             + [halves*finite_width+k*infinity_width+i
                                for k in range(blocks) for i in range(ni)])
-                    own_side = len(rows)
+                    retained_side = reduced[3].shape[-1]
                     coefficients = jnp.zeros((1,side,side),reduced[3].dtype)
-                    coefficients = coefficients.at[:,jnp.asarray(rows),:own_side].set(reduced[3])
+                    coefficients = coefficients.at[:,jnp.asarray(rows),:retained_side].set(reduced[3])
                     return (*result,coefficients)
                 return result
             return run

@@ -191,8 +191,12 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
                 exact = read_shared_pole_bank(moment_io, meta=meta, header=moment_header,
                                               q_ids=ids, partition_spec=read_spec,
                                               fields=moment_fields)
-        with timing.fenced_section("spole.infinity_selection"):
-            width = min(logical_n, max(1, int(recipe["infinity_width"])))
+        parent_label = ",".join(str(q) for q in ids[:real])
+        width = min(logical_n, max(1, int(recipe["infinity_width"])))
+        with timing.fenced_section(
+                "spole.infinity_selection", announce=True,
+                label=(f"shared-pole infinity selection parents={parent_label} "
+                       f"matrix={n} vectors={width}")):
             qi, round_infinity_values = distrib_la.leading_eigenvectors(
                 exact["M1"], width, eigh_plan=eig, column_extent=column_extent,
                 multiplet_tol=recipe["multiplet_relative_tolerance"],
@@ -210,7 +214,10 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
             # The store admits this complete bounded scratch batch before
             # allocation. Charge it while directions/actions are selected;
             # release it before admitting the dense pencil.
-        with timing.fenced_section("spole.direction_selection"):
+        with timing.fenced_section(
+                "spole.direction_selection", announce=True,
+                label=(f"shared-pole direction selection parents={parent_label} "
+                       f"matrix={n} supports={fit_hi-fit_lo}")):
             exchange = ((slots, *partner_realization(meta, header, ids, partner_parent, partner_row,
                                                       mesh_xy=mesh_xy))
                         if ordered and execution == 'local' else
@@ -240,7 +247,15 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
             budget.retained_panels = tuple(factors)
             budget.batch_width = ranks if execution == 'local' else 1
             budget.plan(side, phase="reduction")
-        with timing.fenced_section("spole.gram_reduction"):
+        pole_budget = recipe.get("pole_budget")
+        retained_half = (side // 2 if not ordered or pole_budget is None else
+                         min(side // 2, column_extent(int(pole_budget))))
+        restricted_side = side if not ordered else 2 * retained_half
+        with timing.fenced_section(
+                "spole.gram_reduction", announce=True,
+                label=(f"shared-pole Gram reduction parents={parent_label} "
+                       f"pencil={side} restricted={restricted_side} "
+                       f"budget={pole_budget}")):
             if execution == 'face':
                 from gw.shared_pole_execution import face_reduce_round
                 round_model, round_signed, vectors, round_diagnostics = face_reduce_round(
@@ -320,7 +335,11 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
                                               partition_spec=read_spec, fields=("M1", "M3"))
             budget.live((*round_model, *round_signed, qi, inverse_sqrt, *held,
                          *exact.values()))
-        with timing.fenced_section("spole.passivity_held"):
+        with timing.fenced_section(
+                "spole.passivity_held", announce=True,
+                label=(f"shared-pole held checks parents={parent_label} "
+                       f"matrix={n} model={round_model[1].shape[-1]} "
+                       f"samples={len(held_ids)}")):
             passive, held_errors, reciprocity, moment_defects = check_round(
                 round_model, round_signed, inverse_sqrt, held, (exact["M1"], exact["M3"]), qi,
                 real=real, nodes=[_sample_point(recipe, i) for i in held_ids], eta_ry=recipe["eta_ev"] / RYD_TO_EV,
