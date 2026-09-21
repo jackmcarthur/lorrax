@@ -421,9 +421,9 @@ class SCInputs:
     wfn_fingerprint_binding: object | None = None
     charge_zeta_identity: dict | None = None
     tensors_filename: str | None = None
-    #: Human-readable origin of the initial Hamiltonian carry.  This changes
-    #: snapshot provenance only; the map always solves its own occupations
-    #: and partition from the carry it receives.
+    #: Origin of the initial Hamiltonian carry.  This labels snapshot
+    #: provenance and tells map 0 whether the supplied partition was already
+    #: classified from that carry; every map still solves its own occupations.
     initial_state_role: str = "dft_seed"
     print_fn: Callable = print
     # Selected ladder/iteration/verdict lines go to the driver's production
@@ -878,9 +878,12 @@ def make_initial_state_from_qp_rotations(
             jnp.asarray(E_full, dtype=inputs.wfns_dft.enk.dtype))
     occ_state, head_surface_weight_kn = _solve_head_occupations(
         inputs, seed_enk)
+    seed_mu_ry = (
+        float(occ_state.mu_ry) if occ_state is not None else
+        float(_midgap_efermi(jnp.asarray(E_full), int(inputs.meta.nelec))))
     partition, _, _, _ = _classify_sc_partition(
         E_loop, U_loop, occ_state, previous_partition=None, iteration=0,
-        inputs=inputs)
+        inputs=inputs, current_mu_ry=seed_mu_ry)
     _record_sc(
         inputs,
         "  SC initial Hamiltonian: external compact QP seed "
@@ -2802,6 +2805,7 @@ def _classify_sc_partition(
     previous_partition,
     iteration: int,
     inputs: SCInputs,
+    current_mu_ry: float | None = None,
 ) -> tuple[BandPartition, np.ndarray, np.ndarray, float]:
     """Assign DFT identities and resolve the one SC partition policy.
 
@@ -2829,9 +2833,18 @@ def _classify_sc_partition(
         np.ones(nb_identity, dtype=bool),
         degeneracy_tol_ev=float(inputs.config.sc.exact_degeneracy_tol_ev))
     energies_loop = np.take_along_axis(e_current_loop, indices_loop, axis=1)
-    mu_ev = (float(occupation_state.mu_ry) * RYD_TO_EV
-             if occupation_state is not None else
-             float(inputs.wfn.efermi) * RYD_TO_EV)
+    if occupation_state is not None:
+        mu_ry = float(occupation_state.mu_ry)
+    elif current_mu_ry is not None:
+        mu_ry = float(current_mu_ry)
+        if not np.isfinite(mu_ry):
+            raise ValueError("SC partition chemical potential must be finite")
+    else:
+        # Preserve the cold DFT-seed convention.  An external seed passes its
+        # current midgap explicitly because the source WFN's DFT midgap need
+        # not lie in the seeded spectrum's gap.
+        mu_ry = float(inputs.wfn.efermi)
+    mu_ev = mu_ry * RYD_TO_EV
 
     seed_partition_current = (
         int(iteration) == 0

@@ -19,10 +19,12 @@ def test_qp_seed_reconstruction_partition_enters_real_rcrop_seam(
     nk, nb = 2, 4
     rotations = []
     for _ in range(nk):
-        raw = rng.normal(size=(nb, nb)) + 1j * rng.normal(size=(nb, nb))
+        raw = np.eye(nb) + 1.0e-2 * (
+            rng.normal(size=(nb, nb)) + 1j * rng.normal(size=(nb, nb)))
         rotations.append(np.linalg.qr(raw)[0])
     U = np.asarray(rotations)
-    E = np.sort(rng.normal(size=(nk, nb)), axis=1)
+    E = np.broadcast_to(
+        np.asarray([-1.0, -0.2, 0.4, 1.0]), (nk, nb)).copy()
     kpoints = np.asarray([[0.0, 0.0, 0.0], [0.5, 0.0, 0.0]])
     artifact = {
         "U_mnk": U,
@@ -63,17 +65,26 @@ def test_qp_seed_reconstruction_partition_enters_real_rcrop_seam(
         sc=SimpleNamespace(
             exact_degeneracy_tol_ev=1.0e-4, buffer_nbands=0,
             dump_dir=None),
-        sigma=SimpleNamespace(omega_min_ev=-50.0, omega_max_ev=50.0),
+        sigma=SimpleNamespace(omega_min_ev=-5.0, omega_max_ev=5.0),
+        screening=SimpleNamespace(occ_broadening_ev=0.0),
     )
     full_reference = np.zeros((nk, 3 + nb), dtype=np.float64)
     full_reference[:, :3] = np.asarray([-4.0, -3.0, -2.0])
     full_reference[:, 3:] = E
     inputs = SimpleNamespace(
-        sym=object(),
-        wfn=SimpleNamespace(energies=full_reference[None, ...], efermi=0.0),
+        sym=SimpleNamespace(unfolded_kpts=kpoints),
+        wfn=SimpleNamespace(
+            energies=full_reference[None, ...], efermi=10.0,
+            kgrid=(2, 1, 1)),
+        wfns_dft=SimpleNamespace(enk=jnp.asarray(E)),
         e_dft_active_kn_ry=E,
         config=cfg,
-        band_slices=SimpleNamespace(b0=3, sigma=slice(0, nb)),
+        band_slices=SimpleNamespace(
+            b0=3, b3=3 + nb, sigma=slice(0, nb),
+            sigma_range=(3, 3 + nb)),
+        meta=SimpleNamespace(nelec=2),
+        material_class="insulator",
+        parallel_transport=None,
         kstar=SimpleNamespace(is_identity=True),
         initial_state_role="external_qp_seed",
         partition=SimpleNamespace(
@@ -81,15 +92,28 @@ def test_qp_seed_reconstruction_partition_enters_real_rcrop_seam(
             in_range_mask=np.zeros(nb, dtype=bool)),
         mesh_xy=mesh,
         input_dir=str(tmp_path),
+        wfn_fingerprint_binding=None,
         print_fn=lambda *_args: None,
         record_fn=None,
     )
     monkeypatch.setattr(
         "symmetry_maps.unfold_file_wedge_to_full_bz",
         lambda _sym, values: np.asarray(values))
-    partition, _, _, _ = sc._classify_sc_partition(
-        E, U, None, previous_partition=None, iteration=0, inputs=inputs)
-    assert np.all(np.asarray(partition.protected_mask))
+    monkeypatch.setattr(
+        "file_io.restart_bundle.read_qp_rotations_artifact",
+        lambda _path: artifact)
+    monkeypatch.setattr(
+        "file_io.qp_wfn.authenticate_qp_rotations_source_wfn",
+        lambda *_args, **_kwargs: "mock-source-fingerprint")
+    state = sc.make_initial_state_from_qp_rotations(
+        inputs, "qp_wfn_rotations.h5")
+    np.testing.assert_allclose(
+        np.asarray(state.H_qp_dft), direct, rtol=0.0, atol=2.0e-15)
+    partition = state.partition
+    expected_protected = np.broadcast_to(
+        np.asarray([False, True, True, False]), (nk, nb))
+    np.testing.assert_array_equal(
+        np.asarray(partition.protected_mask), expected_protected)
 
     payload = SimpleNamespace(scissor_fit=None, tail_scissor_fit=None)
     seen = []
@@ -128,8 +152,6 @@ def test_qp_seed_reconstruction_partition_enters_real_rcrop_seam(
             iterations=1, converged=False)
 
     monkeypatch.setattr(acceleration, "rcrop_nojit", fake_rcrop)
-    state = sc.SCState(
-        H_qp_dft=jnp.asarray(H), iteration=0, partition=partition)
     final, _ = sc.run_self_consistency(
         state, inputs, max_iter=2, accelerator="rcrop", history_depth=1)
     assert seen and seen[0] is partition
