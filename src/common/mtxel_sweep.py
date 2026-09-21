@@ -294,6 +294,7 @@ __all__ = [
     "four_current_potential_operator",
     "vnl_operator",
     "dipole_operator",
+    "dirac_current_operator",
     "uniform_gauge_operator",
     "sum_operators",
     "sweep_matrix_elements",
@@ -808,6 +809,25 @@ def require_vnl_velocity_sign(value) -> float:
             "arm and that no BerkeleyGW comparison characterizes\n"
             "  doc:  docs/input_reference.md, vnl_velocity_sign.")
     return sign
+
+
+def dirac_current_operator(geom: SweepGeometry) -> Operator:
+    """Uniform paramagnetic c alpha on the actual four-component carrier.
+
+    The existing sweep owns band sharding, masks and bra contraction. This
+    operator includes neither a nonlocal potential derivative nor a QP
+    correction; consumers combine those explicitly in band space.
+    """
+    from common.bispinor_init import apply_dirac_velocity_to_ket
+    if geom.ns != 4:
+        raise ValueError('Dirac current sweep requires four-component wavefunctions')
+
+    def op(psi_n, gvec, gmask, bidx, kvec):
+        velocity = apply_dirac_velocity_to_ket(_ket(psi_n, gmask))
+        return jnp.moveaxis(velocity, 0, -1)[None]
+
+    return Operator(apply=op, post=1.0, ncomp=3, consts=(),
+                    key=('dirac_current', geom.ngkmax, geom.ns))
 
 
 def dipole_operator(geom: SweepGeometry, *, bvec, blat,
