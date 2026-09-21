@@ -44,6 +44,7 @@ def test_small_qp_artifact_preserves_accepted_hamiltonian(
         assert write_full_wfn, "full orbital write must stay optional"
 
     monkeypatch.setattr(qp_wfn, "write_qp_wfn_h5", full_wfn_writer)
+    monkeypatch.setattr(qp_wfn, "validate_qp_wfn_h5", lambda *_a, **_k: None)
     wfn_path, qp_path, _, reported_energies = sc_iteration.dump_qp_wfn_artifacts(
         state, n_occ=1, mesh_xy=None, wfn=wfn, sym=sym,
         band_slices=SimpleNamespace(b0=0, b3=3), kgrid=(1, 1, 1),
@@ -130,6 +131,8 @@ def test_metal_qp_wfn_occupations_follow_the_final_full_ladder(
     monkeypatch.setattr(
         qp_wfn, "write_qp_wfn_h5",
         lambda _path, **kwargs: calls.append(kwargs))
+    monkeypatch.setattr(
+        qp_wfn, "validate_qp_wfn_h5", lambda *_a, **_k: None)
 
     _, qp_path, mu_ry, _ = sc_iteration.dump_qp_wfn_artifacts(
         state, n_occ=2, mesh_xy=None, wfn=wfn, sym=sym,

@@ -30,7 +30,9 @@ the refusal would be indistinguishable from a blanket ban on ``--eqp``.
 from __future__ import annotations
 
 import os
+from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 h5py = pytest.importorskip("h5py")
@@ -191,6 +193,43 @@ def test_the_writer_stamps_what_the_reader_reads():
     for extra in ("qp_wfn_band_start", "qp_wfn_band_stop",
                   "_qp_provenance_attrs"):
         assert extra in body, extra
+
+
+def test_closed_qp_wfn_validator_binds_final_state(tmp_path):
+    """Publication accepts one closed state and detects a torn energy row."""
+    from file_io.qp_wfn import (
+        QP_WFN_ATTR, QP_WFN_SCHEME, validate_qp_wfn_h5)
+
+    path = tmp_path / "WFN_qp.h5.tmp"
+    energies = np.array([[-0.5, 0.25]], dtype=np.float64)
+    wfn = SimpleNamespace(
+        nkpts=1, nbands=2, nspin=1, nspinor=1, path="WFN.h5")
+    with h5py.File(path, "w") as h5:
+        kp = h5.require_group("mf_header/kpoints")
+        kp.create_dataset("nrk", data=1)
+        kp.create_dataset("mnband", data=2)
+        kp.create_dataset("nspin", data=1)
+        kp.create_dataset("nspinor", data=1)
+        kp.create_dataset("ngk", data=np.array([3], dtype=np.int32))
+        kp.create_dataset("el", data=energies[None, ...])
+        kp.create_dataset("occ", data=np.array([[[1.0, 0.0]]]))
+        kp.create_dataset("rk", data=np.zeros((1, 3)))
+        h5.create_dataset("wfns/gvecs", data=np.zeros((3, 3), dtype=np.int32))
+        h5.create_dataset("wfns/coeffs", data=np.zeros((2, 1, 3, 2)))
+        h5.attrs[QP_WFN_ATTR] = QP_WFN_SCHEME
+        h5.attrs["qp_wfn_band_start"] = 0
+        h5.attrs["qp_wfn_band_stop"] = 2
+        h5.attrs["qp_wfn_source"] = "WFN.h5"
+
+    validate_qp_wfn_h5(
+        path, wfn=wfn, expected_energies_ry=energies,
+        band_start=0, band_stop=2)
+    with h5py.File(path, "a") as h5:
+        h5["mf_header/kpoints/el"][0, 0, 1] += 1.0
+    with pytest.raises(ValueError, match="closed final energies differ"):
+        validate_qp_wfn_h5(
+            path, wfn=wfn, expected_energies_ry=energies,
+            band_start=0, band_stop=2)
 
 
 def test_postprocess_adapter_uses_the_canonical_qp_wfn_writer():

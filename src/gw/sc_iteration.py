@@ -6758,9 +6758,11 @@ def dump_qp_wfn_artifacts(
     ``write_wfn_h5`` controls only the full wavefunction artifact. The small
     canonical U/E file always carries the accepted, partitioned SC state.
 
-    Both files are rank-0-only writes (h5py is single-writer). Each write
-    broadcasts its verdict: every rank returns after both files finish,
-    or raises the same named failure before the next write.
+    Both files are rank-0-only writes (h5py is single-writer). Each is first
+    written to a same-directory private path, reopened through its format
+    owner, and atomically replaces the final path only after validation.
+    Every rank returns after both publications finish, or raises the same
+    named failure while any prior final file remains untouched.
 
     Returns ``(qp_wfn_path, qp_rotations_path, efermi_ry, enk_loop_ry)``.
     The first path is ``None`` when the full wavefunction file was not
@@ -6772,7 +6774,9 @@ def dump_qp_wfn_artifacts(
     from symmetry_maps import (
         reduce_full_bz_to_file_wedge, unfold_file_wedge_to_full_bz)
 
-    from file_io.qp_wfn import write_qp_rotations_h5, write_qp_wfn_h5
+    from file_io.qp_wfn import (
+        validate_qp_wfn_h5, write_qp_rotations_h5, write_qp_wfn_h5)
+    from file_io.restart_bundle import read_qp_rotations_artifact
 
     from psp.get_DFT_mtxels import spin_degeneracy_factor
     enk_loop_ry, U_loop, efermi_ry = final_qp_eigenstates(
@@ -6875,20 +6879,37 @@ def dump_qp_wfn_artifacts(
             f"{final_occ_state.smearing_family}, "
             f"mu={efermi_ry * RYD_TO_EV:.6f} eV, "
             f"hash={final_occ_state.occ_hash}")
-    def _write_qp_wfn():
+    expected_wfn_energies_ry = np.array(
+        dft_file_ry if enk_full_base_ry is None else enk_full_base_ry,
+        dtype=np.float64, copy=True)
+    expected_wfn_energies_ry[:, int(band_slices.b0):int(band_slices.b3)] = (
+        np.asarray(enk_wfn_ry, dtype=np.float64))
+
+    def _write_qp_wfn(staging_path):
         write_qp_wfn_h5(
-            qp_wfn_path, wfn=wfn,
+            staging_path, wfn=wfn,
             U_kmn=U_wfn, enk_active_qp_ry=enk_wfn_ry,
             band_start=band_slices.b0, band_stop=band_slices.b3,
             enk_full_base_ry=enk_full_base_ry,
             occupations_kn=occupations_wfn,
             occupation_state=final_occ_state,
         )
-    from common.collectives import rank0_transaction
-    if write_wfn_h5:
-        rank0_transaction(qp_wfn_path, stage="qp_wfn_h5_write", write=_write_qp_wfn)
 
-    def _write_qp_rotations():
+    def _validate_qp_wfn(staging_path):
+        validate_qp_wfn_h5(
+            staging_path, wfn=wfn,
+            expected_energies_ry=expected_wfn_energies_ry,
+            band_start=band_slices.b0, band_stop=band_slices.b3,
+            occupations_kn=occupations_wfn,
+            occupation_state=final_occ_state)
+
+    from common.collectives import rank0_atomic_file_transaction
+    if write_wfn_h5:
+        rank0_atomic_file_transaction(
+            qp_wfn_path, stage="qp_wfn_h5_write",
+            write=_write_qp_wfn, validate_file=_validate_qp_wfn)
+
+    def _write_qp_rotations(staging_path):
         # The tables come from the SERVICE's own accessor, never re-spelled
         # here: ``n_sym_spatial`` is derived from ``sym_mats_k`` rather than
         # from the WFN header, and that derivation is the one the unfold
@@ -6897,7 +6918,7 @@ def dump_qp_wfn_artifacts(
         _svc.ensure_on_path()
         import symmetry_maps as _sm
         write_qp_rotations_h5(
-            qp_rot_path,
+            staging_path,
             U_mnk=U_full,
             E_qp_nk=enk_full_ry * 0.5,                     # Ry → Hartree
             band_start=band_slices.b0, band_stop=band_slices.b3,
@@ -6914,8 +6935,62 @@ def dump_qp_wfn_artifacts(
             occupation_state=final_occ_state,
             enk_full_nk_ry=final_energies_full_ry,
         )
-    rank0_transaction(qp_rot_path, stage="qp_rotations_h5_write",
-                      write=_write_qp_rotations)
+
+    def _validate_qp_rotations(staging_path):
+        artifact = read_qp_rotations_artifact(staging_path)
+        expected = {
+            "U_mnk": np.asarray(U_full),
+            "E_qp_nk_rydberg": np.asarray(enk_full_ry, dtype=np.float64),
+            "band_range": np.asarray(
+                [band_slices.b0, band_slices.b3], dtype=np.int64),
+            "kpoints_crys": np.asarray(sym.unfolded_kpts, dtype=np.float64),
+            "kgrid": np.asarray(kgrid, dtype=np.int64),
+        }
+        optional = {
+            "E_full_nk_rydberg": final_energies_full_ry,
+            "occupations_kn": (
+                None if final_occ_state is None
+                else np.asarray(final_occ_state.f_kn)),
+        }
+        for name, want in expected.items():
+            if not np.array_equal(np.asarray(artifact[name]), want):
+                raise ValueError(
+                    "QP rotations staging validation: closed dataset "
+                    f"{name!r} differs from the final state handed to the "
+                    "writer.")
+        for name, want in optional.items():
+            present = name in artifact
+            if present != (want is not None):
+                raise ValueError(
+                    "QP rotations staging validation: optional dataset "
+                    f"{name!r} presence differs from the final state.")
+            if present and not np.array_equal(
+                    np.asarray(artifact[name]), np.asarray(want)):
+                raise ValueError(
+                    "QP rotations staging validation: closed dataset "
+                    f"{name!r} differs from the final state handed to the "
+                    "writer.")
+        if artifact["source_wfn_fingerprint"] is None:
+            raise ValueError(
+                "QP rotations staging validation: closed artifact has no "
+                "source-WFN fingerprint.")
+        expected_occ_provenance = (
+            None if final_occ_state is None else {
+                "occ_hash": final_occ_state.occ_hash,
+                "mu_ry": float(final_occ_state.mu_ry),
+                "smearing_family": str(final_occ_state.smearing_family),
+                "smearing_width_ry": float(
+                    final_occ_state.smearing_width_ry),
+                "n_electrons": float(final_occ_state.n_electrons),
+            })
+        if artifact["occupation_provenance"] != expected_occ_provenance:
+            raise ValueError(
+                "QP rotations staging validation: closed occupation "
+                "provenance differs from the final occupation state.")
+
+    rank0_atomic_file_transaction(
+        qp_rot_path, stage="qp_rotations_h5_write",
+        write=_write_qp_rotations, validate_file=_validate_qp_rotations)
     if write_wfn_h5:
         print_fn(f"  QP WFN:       {qp_wfn_path}")
     print_fn(f"  QP rotations: {qp_rot_path}")

@@ -96,6 +96,7 @@ __all__ = [
     "barrier",
     "agree_io_error",
     "rank0_transaction",
+    "rank0_atomic_file_transaction",
     # mesh construction (and the warm-up that must accompany it)
     "resolve_mesh",
     "single_device_mesh",
@@ -1488,3 +1489,63 @@ def rank0_transaction(path, *, stage, write, validate=None):
         from jax.experimental import multihost_utils as mh
         receipt = mh.broadcast_one_to_all(receipt, is_source=process_rank() == 0)
     _raise_io_receipts([receipt], path=path, stage=stage)
+
+
+def rank0_atomic_file_transaction(
+        path, *, stage, write, validate_file, validate=None):
+    """Publish one rank-0 file only after its closed staging file validates.
+
+    ``write(staging_path)`` and ``validate_file(staging_path)`` run on rank 0
+    inside :func:`rank0_transaction`.  The staging file is created in the
+    destination directory, so ``os.replace`` is one-filesystem atomic.  A
+    write or validation failure removes only the staging file and leaves any
+    previous destination untouched.  ``validate`` retains the all-rank
+    preflight meaning of :func:`rank0_transaction`.
+
+    The writer must close its file before returning.  The validator must
+    reopen that path through the format owner's reader and return normally
+    only for a complete artifact.
+    """
+    import os
+    import secrets
+
+    destination = os.fspath(path)
+    directory = os.path.dirname(os.path.abspath(destination))
+    basename = os.path.basename(destination)
+
+    def _publish():
+        temporary = None
+        try:
+            # O_EXCL gives the writer a private sibling path while the mode
+            # follows the process umask, like a direct h5py ``"w"`` open.
+            # The file remains present: both final-artifact writers truncate
+            # an existing path and therefore retain exclusive ownership.
+            for _ in range(16):
+                candidate = os.path.join(
+                    directory,
+                    f".{basename}.{os.getpid()}.{secrets.token_hex(8)}.tmp")
+                try:
+                    fd = os.open(
+                        candidate, os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                        0o666)
+                except FileExistsError:
+                    continue
+                os.close(fd)
+                temporary = candidate
+                break
+            if temporary is None:
+                raise FileExistsError(
+                    f"could not reserve a private staging path for {destination}")
+            write(temporary)
+            validate_file(temporary)
+            os.replace(temporary, destination)
+            temporary = None
+        finally:
+            if temporary is not None:
+                try:
+                    os.unlink(temporary)
+                except FileNotFoundError:
+                    pass
+
+    rank0_transaction(
+        destination, stage=stage, write=_publish, validate=validate)

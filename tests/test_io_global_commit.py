@@ -43,6 +43,52 @@ def test_rank0_filesystem_error_names_action_and_path():
         collectives.rank0_transaction('/private/qp.h5', stage='QP', write=write)
 
 
+def test_atomic_file_transaction_validates_then_replaces(tmp_path):
+    final = tmp_path / "artifact.h5"
+    final.write_bytes(b"old")
+    seen = []
+
+    def write(staging):
+        staging = type(final)(staging)
+        assert staging.parent == final.parent
+        assert staging != final
+        staging.write_bytes(b"new")
+
+    def validate(staging):
+        staging = type(final)(staging)
+        seen.append(staging.read_bytes())
+
+    collectives.rank0_atomic_file_transaction(
+        final, stage="artifact", write=write, validate_file=validate)
+    assert seen == [b"new"]
+    assert final.read_bytes() == b"new"
+    assert list(tmp_path.glob(".artifact.h5.*.tmp")) == []
+
+
+@pytest.mark.parametrize("failure", ["write", "validate"])
+def test_atomic_file_transaction_failure_preserves_prior_file(
+        tmp_path, failure):
+    final = tmp_path / "artifact.h5"
+    final.write_bytes(b"accepted")
+
+    def write(staging):
+        staging = type(final)(staging)
+        staging.write_bytes(b"partial")
+        if failure == "write":
+            raise OSError("injected write failure")
+
+    def validate(_staging):
+        if failure == "validate":
+            raise ValueError("injected validation failure")
+
+    failure_text = "validation" if failure == "validate" else "write"
+    with pytest.raises(RuntimeError, match=f"injected {failure_text} failure"):
+        collectives.rank0_atomic_file_transaction(
+            final, stage="artifact", write=write, validate_file=validate)
+    assert final.read_bytes() == b"accepted"
+    assert list(tmp_path.glob(".artifact.h5.*.tmp")) == []
+
+
 def test_incomplete_restart_refuses_even_with_stale_ready_flag(tmp_path):
     from file_io.restart_bundle import read_metadata
     path = tmp_path / 'restart.h5'

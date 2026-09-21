@@ -64,6 +64,15 @@ source WFN file wedge and passes both to the same WFN writer; it neither
 rebuilds the tail from DFT nor solves the occupations again. Legacy rotation
 companions can omit both additions and retain their historical behavior.
 
+Each terminal file is written to a private sibling in the output directory,
+reopened through its format owner, and made visible with `os.replace` only
+after the closed energy, occupation, identity, and layout state validates.
+A failed write or validation removes the sibling and leaves any prior final
+file untouched. The two renames are independent, so their existence alone is
+not a bundle transaction: the existing run-completion manifest requires both
+requested final names before it records a completed SC run. A process killed
+between the renames can leave a mixed pair without that completion receipt.
+
 These terminal files are output artifacts, not map checkpoints.  The small
 per-map `eqp0_iterNNNN.dat`, `eqp1_iterNNNN.dat`, and rotation snapshots do
 not contain the full accelerator state, response, or accepted occupation
