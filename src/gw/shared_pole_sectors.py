@@ -10,7 +10,7 @@ neither move an operator to the host nor prescribe a processor mesh.
 from functools import lru_cache
 
 import jax.numpy as jnp
-from gw.shared_pole_pencil import _matrix_layout
+from gw.shared_pole_pencil import _matrix_layout, _matrix_take_columns, _matrix_concat
 
 
 @lru_cache(maxsize=None)
@@ -20,7 +20,13 @@ def _sector_read_programs(mesh,indices,masks,execution):
     from jax.sharding import PartitionSpec as P
     from gw.shared_pole_execution import face_program
     def select(a):
-        a=jnp.take(jnp.take(a,jnp.asarray(indices[0]),axis=-2),jnp.asarray(indices[1]),axis=-1)
+        if execution == 'face':
+            from common.staged_reshard import permute_sharded_axis
+            face = P(*([None]*(a.ndim-2)), 'x', 'y')
+            for axis,index in zip((-2,-1),indices):
+                a=permute_sharded_axis(a,axis,index,mesh,face)
+        else:
+            a=jnp.take(jnp.take(a,jnp.asarray(indices[0]),axis=-2),jnp.asarray(indices[1]),axis=-1)
         return jnp.where(jnp.asarray(masks[0])[:,None]&jnp.asarray(masks[1])[None,:],a,0)
     if execution=='face':
         return face_program(select,mesh),face_program(lambda *a:jnp.concatenate(a,axis=1),mesh)
@@ -181,7 +187,8 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output):
             odd_moments=True,sample_fields=4,moment_fields=4,
             column_extent=extent)
         execution_rows.append(dict(sector=('CC','TT')[family],mode=mode,
-                                   packed_extent=local_meta.n_rmu_padded,**route))
+                                   packed_extent=local_meta.n_rmu_padded,
+                                   signed_side_bound=extent(2*local_recipe['pole_budget']) if local_recipe['pole_budget'] is not None else route['conservative_pencil_side'],**route))
     resolved_execution=('face' if any(row['mode']=='face' for row in execution_rows)
                         else 'local')
     batch_width = int(mesh_xy.size)
@@ -575,7 +582,13 @@ def construct_cross_sector_round(sectors, samples, moments, meta, config, *,
     # Cross assembly still has the original rectangular pencil. The sum
     # prices its envelope even when the retained joint pair is much smaller.
     original_side = sum(s['coefficients'].shape[-2] for s in sectors)
-    budget.plan(original_side,phase='reduction')
+    widths = [int(jnp.max(jnp.sum(s['signed'][2],axis=-1))) for s in sectors]
+    if execution == 'face':
+        from runtime.padding import padded_axis
+        widths = [padded_axis(width,mesh_xy,name='shared_pole_port',
+            specs=((P('x','y'),0),(P('x','y'),1))).carrier for width in widths]
+    side = sum(widths)
+    budget.plan(original_side,phase='reduction',eigen_side=side)
     actions=[]
     for source, forward, reverse, left, right in (
             (charge,tc,ct,transverse,charge),
@@ -590,14 +603,9 @@ def construct_cross_sector_round(sectors, samples, moments, meta, config, *,
 
     spec=P(('x','y'))
     packed=[]
-    for sector in sectors:
+    for sector,width in zip(sectors,widths):
         # Drop only exactly inactive carrier columns. This is a storage
         # compaction of the retained span, not a second physical rank cut.
-        width=int(jnp.max(jnp.sum(sector['signed'][2],axis=-1)))
-        if execution == 'face':
-            from runtime.padding import padded_axis
-            width=padded_axis(width,mesh_xy,name='shared_pole_port',
-                specs=((P('x','y'),0),(P('x','y'),1))).carrier
         from functools import partial
         compact=partial(_compact_sector_equations,width=width)
         if execution=='face':
@@ -615,14 +623,16 @@ def construct_cross_sector_round(sectors, samples, moments, meta, config, *,
             sector['infinity'],y,signed))
     side=sum(s[4].shape[-1] for s in packed)
     budget.retained_panels=(*budget.retained_panels,*jax.tree.leaves((actions,packed)))
-    budget.plan(max(side,original_side),phase='reduction')
+    budget.plan(max(side,original_side),phase='reduction',eigen_side=side)
     cross_eigh=budget.eigenplan(side)
     signed,diagnostics=reduce_cross_round(*packed,tuple(actions),
         tuple(moments[f'M{i}'] for i in range(4)),mesh_xy=mesh_xy,
         eigh_plan=cross_eigh,gates=gates)
     for name in ('gram_valid','retained_metric_positive'):
         if not bool(jnp.all(diagnostics[name][:real])):
-            raise ValueError(f'GATE shared_pole_sector_{name}: sector=CT; no repair')
+            raise ValueError(f'GATE shared_pole_sector_{name}: sector=CT; '
+                f"Gram min/max={float(jnp.min(diagnostics['gram_min_relative'][:real])):.9e}; "
+                f"threshold={gates['normalized_gram_validity']['threshold']}; no repair")
     models,zero=positive_cross_models(signed,mesh_xy=mesh_xy,gates=gates)
     if not bool(jnp.all(zero['zero_policy'][:real])):
         raise ValueError('GATE shared_pole_sector_zero_ritz: sector=CT')
@@ -633,11 +643,11 @@ def construct_cross_sector_round(sectors, samples, moments, meta, config, *,
                 zero=jax.tree.map(lambda a:device_put_process_local(a,replicated),zero),budget=budget)
 
 
-def _compact_sector_equations(y,signed,*,width):
+def _compact_sector_equations(y,signed,*,width,matrix_sharding=None):
     c,mu,active=signed
     order=jnp.argsort(~active,axis=-1,stable=True)[:,:width]
-    return (jnp.take_along_axis(y,order[:,None,:],axis=-1),
-        (jnp.take_along_axis(c,order[:,None,:],axis=-1),
+    return (_matrix_take_columns(y,order,matrix_sharding),
+        (_matrix_take_columns(c,order,matrix_sharding),
          jnp.take_along_axis(mu,order,axis=-1),
          jnp.take_along_axis(active,order,axis=-1)))
 
@@ -665,7 +675,7 @@ def positive_cross_models(signed, *, mesh_xy, gates):
                               out_specs=(spec,spec),check_vma=False))(*signed)
 
 
-def _positive_cross_equations(left,right,mu,active,*,gates):
+def _positive_cross_equations(left,right,mu,active,*,gates,matrix_sharding=None):
     from gw.shared_pole_gates import apply_shared_pole_zero_policy,sort_shared_pole_columns
     cut=gates['normalized_gram_keep']['threshold']*jnp.max(jnp.abs(jnp.where(active,mu,0)),axis=-1)
     retained=active & (jnp.abs(mu)>cut[:,None])
@@ -686,8 +696,8 @@ def _positive_cross_equations(left,right,mu,active,*,gates):
     # weight. Admit only if BOTH endpoint loss budgets pass, then use one
     # permutation for the two files, including degenerate poles.
     same=jnp.all(models[0][2]==models[1][2],axis=-1)
-    charge,order=sort_shared_pole_columns(models[0])
-    current=(jnp.take_along_axis(models[1][0],order[:,None,:],axis=-1),charge[1],charge[2])
+    charge,order=sort_shared_pole_columns(models[0],matrix_sharding=matrix_sharding)
+    current=(_matrix_take_columns(models[1][0],order,matrix_sharding),charge[1],charge[2])
     return (charge,current),dict(zero_policy=same & checks[0]['zero_policy'] & checks[1]['zero_policy'],
                               charge=checks[0],current=checks[1])
 
@@ -832,9 +842,11 @@ def reduce_cross_round(charge, transverse, cross, moments, *, mesh_xy, eigh_plan
 
 
 def _cross_reduce_equations(charge,transverse,cross,moments,*,mm,eigh,gates,matrix_sharding=None):
+    join = lambda arrays, axis: _matrix_concat(arrays, axis, matrix_sharding)
     def pack(panels,order):
-        values=jnp.concatenate((*panels,jnp.zeros_like(panels[0][...,:1])),axis=-1)
-        return _matrix_layout(jnp.take_along_axis(values,order[:,None,:],axis=-1),matrix_sharding)
+        pad=1 if matrix_sharding is None else int(matrix_sharding.mesh.shape['y'])
+        values=join((*panels,jnp.zeros_like(panels[0][...,:pad])),axis=-1)
+        return _matrix_take_columns(values,order,matrix_sharding)
     def unpack(sector,actions):
         points,order,states,infinity,y,signed=sector
         return points,pack(states[0],order),infinity[0],pack(tuple(a[0] for a in actions),order),pack(tuple(a[1] for a in actions),order)
@@ -846,7 +858,7 @@ def _cross_reduce_equations(charge,transverse,cross,moments,*,mm,eigh,gates,matr
     def diagonal(sector):
         _,order,states,infinity,y,signed=sector
         own=pack(states[1],order)
-        return _matrix_layout(jnp.concatenate((own,2*infinity[1],2*infinity[2]),axis=-1), matrix_sharding)
+        return _matrix_layout(join((own,2*infinity[1],2*infinity[2]),axis=-1), matrix_sharding)
     cc=(charge[4],charge[5][1],diagonal(charge),otc)
     tt=(transverse[4],transverse[5][1],diagonal(transverse),oct)
     return reduce_sector_pencil(joint_sector_pencil(cc,tt,(h,g),matmul=mm,matrix_sharding=matrix_sharding),
@@ -869,6 +881,7 @@ def ordered_cross_pencil(charge, transverse, cross_actions, cross_moments, *, ma
     """
     from gw.shared_pole_pencil import _finite_column_g
 
+    join = lambda arrays, axis: _matrix_concat(arrays, axis, matrix_sharding)
     zc, qc, ic = charge
     zt, qt, it = transverse
     tc, ct, derivative = cross_actions
@@ -887,15 +900,15 @@ def ordered_cross_pencil(charge, transverse, cross_actions, cross_moments, *, ma
     top1 = jnp.conj(zc)[:, :, None] * top0 - matmul(qc, mt[0], transa="C")
     top2 = jnp.conj(zc)[:, :, None] * top1 - matmul(qc, mt[1], transa="C")
     p = tuple(matmul(ic, m, transa="C") for m in mt)
-    block = lambda a, b, c, d: jnp.concatenate((
-        jnp.concatenate((a, b), axis=-1), jnp.concatenate((c, d), axis=-1)), axis=-2)
-    g = block(g, jnp.concatenate((top0, top1), axis=-1),
-              jnp.concatenate((bottom0, bottom1), axis=-2), block(p[0], p[1], p[1], p[2]))
-    h = block(h, jnp.concatenate((top1, top2), axis=-1),
-              jnp.concatenate((bottom1, bottom2), axis=-2), block(p[1], p[2], p[2], p[3]))
+    block = lambda a, b, c, d: join((
+        join((a, b), axis=-1), join((c, d), axis=-1)), axis=-2)
+    g = block(g, join((top0, top1), axis=-1),
+              join((bottom0, bottom1), axis=-2), block(p[0], p[1], p[1], p[2]))
+    h = block(h, join((top1, top2), axis=-1),
+              join((bottom1, bottom2), axis=-2), block(p[1], p[2], p[2], p[3]))
     return tuple(_matrix_layout(a, matrix_sharding) for a in
-                 (g, h, jnp.concatenate((tc, mc[0], mc[1]), axis=-1),
-                  jnp.concatenate((ct, mt[0], mt[1]), axis=-1)))
+                 (g, h, join((tc, mc[0], mc[1]), axis=-1),
+                  join((ct, mt[0], mt[1]), axis=-1)))
 
 
 def cross_pencil_block(left, right, samples, *, matmul):
@@ -957,22 +970,23 @@ def joint_sector_pencil(charge, transverse, cross, *, matmul, matrix_sharding=No
         Joint definite member, value member, and the two full output
         panels. No Hermitization, clipping or Gram repair is performed.
     """
+    join = lambda arrays, axis: _matrix_concat(arrays, axis, matrix_sharding)
     yc, vc, oc, tc = charge
     yt, vt, ot, ct = transverse
     project = lambda a: matmul(yc, matmul(a, yt), transa="C")
     metric, value = map(project, cross)
     adj = lambda a: jnp.conj(jnp.swapaxes(a, -1, -2))
-    block = lambda a, b, d: jnp.concatenate((
-        jnp.concatenate((a, b), axis=-1),
-        jnp.concatenate((adj(b), d), axis=-1)), axis=-2)
+    block = lambda a, b, d: join((
+        join((a, b), axis=-1),
+        join((adj(b), d), axis=-1)), axis=-2)
     # Inactive columns of a batched retained span are exactly zero. Their
     # metric is zero too; assigning them an identity invents latent states.
     ic = jnp.eye(vc.shape[-1], dtype=metric.dtype)[None] * jnp.any(yc != 0, axis=-2)[:, None, :]
     it = jnp.eye(vt.shape[-1], dtype=metric.dtype)[None] * jnp.any(yt != 0, axis=-2)[:, None, :]
     return tuple(_matrix_layout(a, matrix_sharding) for a in (block(ic, metric, it),
             block(ic * vc[:, None, :], value, it * vt[:, None, :]),
-            jnp.concatenate((matmul(oc, yc), matmul(ct, yt)), axis=-1),
-            jnp.concatenate((matmul(tc, yc), matmul(ot, yt)), axis=-1)))
+            join((matmul(oc, yc), matmul(ct, yt)), axis=-1),
+            join((matmul(tc, yc), matmul(ot, yt)), axis=-1)))
 
 
 def reduce_sector_pencil(pencil, *, eigh, matmul, gates, matrix_sharding=None):

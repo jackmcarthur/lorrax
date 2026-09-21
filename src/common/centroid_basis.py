@@ -26,67 +26,14 @@ import jax.numpy as jnp
 import numpy as np
 from jax.sharding import Mesh, PartitionSpec as P
 
+from common.staged_reshard import permute_sharded_axis as _permute_sharded_axis
+
 from common.grouped_layout import (
     SquareGroupedShardLayout,
     build_square_grouped_shard_layout,
     identity_square_grouped_shard_layout,
 )
 from runtime.padding import PaddedAxis, padded_mu_extent, spec_divisor
-
-
-def _permute_sharded_axis(arr, axis, source_map, mesh, spec, *, pad_to=None,
-                          crop_to=None):
-    """Permute one mesh-sharded axis by a global destination→source map
-    without replicating it.  ``pad_to``/``crop_to`` are LOCAL extents applied
-    inside the shard before/after the permutation."""
-    from common.shard_map import shard_map
-    arr = jnp.asarray(arr)
-    ndim = int(arr.ndim)
-    axis = int(axis) % ndim
-    source = np.asarray(source_map, dtype=np.int32)
-
-    def _pad(x, ax, target):
-        widths = [(0, 0)] * ndim
-        widths[ax] = (0, int(target) - int(x.shape[ax]))
-        return jnp.pad(x, widths)
-
-    names = spec[axis] if axis < len(spec) else None
-    if names is None:
-        # Replicated axis (single-device meshes, replicated operands): the
-        # permutation is rank-local and needs no collective.
-        x = _pad(arr, axis, pad_to) if pad_to is not None else arr
-        x = jnp.take(x, jnp.asarray(source), axis=axis)
-        return x if crop_to is None else jax.lax.slice_in_dim(
-            x, 0, int(crop_to), axis=axis)
-    names = (names,) if isinstance(names, str) else tuple(names)
-    n_shards = int(np.prod([int(mesh.shape[n]) for n in names]))
-    axis_name = names[0] if len(names) == 1 else names
-    local = [int(arr.shape[i]) // int(spec_divisor(mesh, spec, i))
-             for i in range(ndim)]
-    if ndim < 2:
-        raise ValueError("centroid basis: sharded conversion needs a second axis")
-    split = max((i for i in range(ndim) if i != axis), key=lambda i: local[i])
-
-    def body(x):
-        if pad_to is not None:
-            x = _pad(x, axis, pad_to)
-        n_split = int(x.shape[split])
-        n_split_pad = -(-n_split // n_shards) * n_shards
-        if n_split_pad != n_split:
-            x = _pad(x, split, n_split_pad)
-        x = jax.lax.all_to_all(x, axis_name, split_axis=split,
-                               concat_axis=axis, tiled=True)
-        x = jnp.take(x, jnp.asarray(source), axis=axis)
-        x = jax.lax.all_to_all(x, axis_name, split_axis=axis,
-                               concat_axis=split, tiled=True)
-        if n_split_pad != n_split:
-            x = jax.lax.slice_in_dim(x, 0, n_split, axis=split)
-        if crop_to is not None:
-            x = jax.lax.slice_in_dim(x, 0, int(crop_to), axis=axis)
-        return x
-
-    return shard_map(body, mesh=mesh, in_specs=spec, out_specs=spec,
-                     check_vma=False)(arr)
 
 
 @dataclass(frozen=True, eq=False)

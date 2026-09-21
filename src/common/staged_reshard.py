@@ -188,6 +188,7 @@ ROUTES = ("split_b_first", "flatten_m_first")
 DEFAULT_ROUTE = "split_b_first"
 
 __all__ = [
+    "permute_sharded_axis",
     "band_to_product_r_reshard",
     "face_to_batch_reshard",
     "face_to_batch_reshard_supported",
@@ -648,3 +649,92 @@ def face_to_batch_reshard(mesh: Mesh, *,
     warm_mesh_cliques(mesh)
 
     return _reshard
+
+
+def permute_sharded_axis(arr, axis, source_map, mesh, spec, *, pad_to=None,
+                         crop_to=None):
+    """Permute a global axis without replication; maps are [k] or [b,k].
+
+    ``pad_to``/``crop_to`` are LOCAL extents before/after permutation.
+    """
+    return _reindex_sharded_axis((arr,), axis, source_map, mesh, spec,
+                                pad_to=pad_to, crop_to=crop_to)
+
+
+def concatenate_sharded_axis(arrays, axis, mesh, spec):
+    """Join unequal blocks while keeping every matrix split over all ranks."""
+    return _reindex_sharded_axis(tuple(arrays), axis, None, mesh, spec)
+
+
+def _reindex_sharded_axis(arrays, axis, source_map, mesh, spec, *,
+                          pad_to=None, crop_to=None):
+    """Exchange to all-P slabs, join/select locally, and restore the face.
+
+    This is the centroid permutation's two-all-to-all algorithm. Joining
+    blocks in its temporary slab layout also avoids GSPMD's one-axis
+    gathers when unequal face blocks are concatenated.
+    """
+    from common.shard_map import shard_map
+    arrays = tuple(jnp.asarray(a) for a in arrays)
+    arr = arrays[0]
+    ndim = int(arr.ndim)
+    axis = int(axis) % ndim
+    source = jnp.asarray(() if source_map is None else source_map, dtype=jnp.int32)
+    per_parent = source.ndim == 2
+    if source.ndim not in (1, 2) or (per_parent and (ndim != 3 or axis not in (1, 2))):
+        raise ValueError("sharded permutation needs a vector or per-parent matrix indices")
+    if any(a.ndim != ndim or any(a.shape[i] != arr.shape[i]
+           for i in range(ndim) if i != axis) for a in arrays):
+        raise ValueError("sharded join requires matching non-joined dimensions")
+
+    def reindex(xs, indices):
+        x = xs[0] if len(xs) == 1 else jnp.concatenate(xs, axis=axis)
+        if source_map is None:
+            return x
+        if not per_parent:
+            return jnp.take(x, indices, axis=axis)
+        indices = indices[:, None, :] if axis == 2 else indices[:, :, None]
+        return jnp.take_along_axis(x, indices, axis=axis)
+
+    def _pad(x, ax, target):
+        widths = [(0, 0)] * ndim
+        widths[ax] = (0, int(target) - int(x.shape[ax]))
+        return jnp.pad(x, widths)
+
+    names = spec[axis] if axis < len(spec) else None
+    if names is None:
+        xs = tuple(_pad(a, axis, pad_to) for a in arrays) if pad_to is not None else arrays
+        x = reindex(xs, source)
+        return x if crop_to is None else jax.lax.slice_in_dim(
+            x, 0, int(crop_to), axis=axis)
+    names = (names,) if isinstance(names, str) else tuple(names)
+    n_shards = int(np.prod([int(mesh.shape[n]) for n in names]))
+    axis_name = names[0] if len(names) == 1 else names
+    local = [int(arr.shape[i]) // int(spec_divisor(mesh, spec, i))
+             for i in range(ndim)]
+    if ndim < 2:
+        raise ValueError("sharded conversion needs a second axis")
+    split = (3 - axis) if per_parent else max(
+        (i for i in range(ndim) if i != axis), key=lambda i: local[i])
+
+    def body(xs, indices):
+        n_split = int(xs[0].shape[split])
+        n_split_pad = -(-n_split // n_shards) * n_shards
+        def exchange(x):
+            if pad_to is not None:
+                x = _pad(x, axis, pad_to)
+            if n_split_pad != n_split:
+                x = _pad(x, split, n_split_pad)
+            return jax.lax.all_to_all(x, axis_name, split_axis=split,
+                                     concat_axis=axis, tiled=True)
+        x = reindex(tuple(exchange(a) for a in xs), indices)
+        x = jax.lax.all_to_all(x, axis_name, split_axis=axis,
+                               concat_axis=split, tiled=True)
+        if n_split_pad != n_split:
+            x = jax.lax.slice_in_dim(x, 0, n_split, axis=split)
+        if crop_to is not None:
+            x = jax.lax.slice_in_dim(x, 0, int(crop_to), axis=axis)
+        return x
+
+    return shard_map(body, mesh=mesh, in_specs=((spec,) * len(arrays), P()),
+                     out_specs=spec, check_vma=False)(arrays, source)

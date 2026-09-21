@@ -441,42 +441,50 @@ difference0. Optimized HLO Green[8,4,8,4,8] tiles global[8,4,16,4,16] onP4.
 This proves the bounded admission path and tile geometry, not the native
 custom-call interiors, endpoint preparation peak or a material peak decrease.
 
-### Explicit whole-mesh photon constructor (development branch)
+### Whole-mesh photon constructor
 
-`construct_sector_poles` follows the existing `linalg` setting. `local`
-retains parent rounds and the local reducer. `distributed` schedules one
-physical parent on the full supplied XY mesh from its first bank read.
-It does not promote a local stage, retry after a refusal, choose a submesh,
-or introduce a new input option. Direct sector hyperslab reads return
-`[1,s,n_X,n_Y]` faces. The four samples and four moments, direction actions,
-original-pencil coefficient spans, joint CT pencil and output factors stay
-in that execution layout. Scalar ordered construction is outside this
-photon-sector extension and retains its existing implementation.
+`construct_sector_poles` resolves execution before reading a bank. The
+`distributed` setting uses the complete supplied XY mesh; `local` uses
+parent-local algebra when its existing capacity preflight admits it.
+There is no retry or change of execution within a constructor stage.
+Distributed rounds batch physical q parents at a width admitted before
+reads, with `[b,s,n_X,n_Y]` sample faces. All samples, moments, direction
+actions, original-pencil coefficient spans, joint CT pencils and factors
+keep both matrix axes distributed. Scalar spectra and role metadata
+replicate. No new input option or submesh is introduced.
 
 Both paths call the same parent equation owner in `shared_pole_local` and
-same CT equation owners in `shared_pole_sectors`. Execution adapters supply
-`distrib_la` GEMM/eigh and explicit matrix sharding; local tracing passes
-no face constraint. The distributed plans use the existing explicit
-`distributed` backend with `auto` provider batching and no capacity budget
-on the plan: service `route_for` therefore cannot choose local resharding.
-Only spectra, masks, role tables and scalar diagnostics are replicated.
+CT equation owners in `shared_pole_sectors`. Execution adapters supply
+`distrib_la` GEMM/eigh and explicit matrix sharding. Local tracing passes
+no face constraint. Distributed plans use the explicit `distributed`
+backend with service `auto` batching and no plan-level capacity fallback.
 Known matrix outputs have explicit schemas; no dtype heuristic classifies
-results. Cached builders retain Mesh and static role/layout information;
-frequency nodes and numerical state are operands.
+results. Cached builders retain mesh and static role/layout information;
+frequency nodes and numerical state remain operands.
 
-Admission precedes each stage. With one distributed parent, matrix storage
-scales as `16*n*n/P`, rather than one whole matrix per rank. The selection
-price includes `4*S+4` photon sample/moment faces plus its existing dense
-selection envelope. Reduction uses actual closed direction width R and
-prices `16*(14*R*R+12*n*R)/P`, actions and live retained panels separately.
-CT admits its actual original and joint spans independently. All eigen and
-compact coefficient carrier widths tile both mesh axes. Eigh and GEMM
-workspace are queried from their actual service routes. The unchanged map
-ledger refuses an oversized stage; it never changes execution mode.
+Matrix selection, factor sorting and unequal CT block assembly use
+`common.staged_reshard`'s shared bounded reindexing operation. This is the
+centroid pack/unpack algorithm: exchange to slabs split over all ranks,
+select or concatenate locally, then exchange back to the face. Per-parent
+column maps preserve each parent's retained-direction order. Merely
+constraining the result of a global take or concatenate is insufficient:
+GSPMD can otherwise gather a large operand onto just one mesh axis.
 
-Verification is pending: the integrated P4 fixture will compare configured
-local and distributed CC/TT/CT stored observables with the same independent
-signed plant. Optimized HLO must establish interior matrix residency,
-including endpoint/column permutations; face outputs alone do not prove
-absence of a one-axis gather. This branch has no large-parent memory or
-hundreds-GPU scaling measurement.
+Admission precedes each stage. For batch b, a complex matrix costs
+`16*b*n*n/P`. Selection includes the live photon sample/moment faces and
+its dense selection envelope. Reduction prices the actual closed direction
+width, actions and live retained panels. CT original-pencil residency and
+retained joint eigensolve have distinct extents: native eigh workspace is
+queried at the latter, without reducing the original matrix residency
+charge. Every native workspace query carries the actual batch width and
+service route. Eigenvector carriers tile both mesh axes. The unchanged map
+ledger refuses an oversized stage.
+
+The P16 integrated fixture compares configured local/distributed CC, TT
+and CT observables and committed stores against an independent signed
+plant, including unequal parent ranks and asymmetric endpoint-loss refusal.
+It is an algebra/store check, not an 18-support material accuracy or
+hundreds-GPU scaling measurement. Interior compiled layouts must also be
+checked at material sizes; output face specs alone do not establish memory
+scaling. Sandbox report `reports/bispinor_pole_distributed_20260921/report.md`
+owns the job receipts and material replay status.

@@ -189,16 +189,15 @@ def face_parent_program(mesh,ordered,odd_moments,keep_budget,retain_span,side):
     eigh_plan=face_eigh(mesh,side)
     def body(points,order,active,qs,os,ds,infinity):
         def pack(parts):
-            panels = jnp.concatenate((*parts, jnp.zeros_like(parts[0][..., :1])), axis=-1)
-            return jax.lax.with_sharding_constraint(
-                jnp.take_along_axis(panels, order[:, None, :], axis=-1),
-                NamedSharding(mesh,P(None,'x','y')))
+            panels = jnp.concatenate((*parts, jnp.zeros_like(parts[0][..., :int(mesh.shape["y"])])), axis=-1)
+            from gw.shared_pole_pencil import _matrix_take_columns
+            return _matrix_take_columns(panels, order, NamedSharding(mesh,P(None,"x","y")))
         reduced=solve_parent_pencil(points,pack(qs),pack(os),pack(ds),infinity,active,
             eigh=eigh_plan.batched,matmul=mm,gates=gates,ordered=ordered,odd_moments=odd_moments,
             keep_budget=keep_budget,retain_span=retain_span,
             matrix_sharding=NamedSharding(mesh,P(None,"x","y")))
         model,signed,diagnostics=reduced[:3]
-        model,permutation=sort_shared_pole_columns(model)
+        model,permutation=sort_shared_pole_columns(model, matrix_sharding=NamedSharding(mesh,P(None,"x","y")))
         result=model,signed,(*diagnostics,permutation)
         return (*result,reduced[3]) if retain_span else result
     return face_program(body,mesh,outputs='parent')
@@ -267,6 +266,11 @@ def sector_batch_width(meta, resolution, recipe, routes, *, mesh, ledger, nq):
     joint = copy.copy(meta)
     joint.n_rmu_padded = sum(row['packed_extent'] for row in routes)
     side = sum(row['conservative_pencil_side'] for row in routes)
+    # CT diagonalizes the retained joint span, never the unreduced
+    # rectangular C/T pencil. Diagonal sectors still solve their own side.
+    eigen_side = max(max(row['conservative_pencil_side'] for row in routes),
+                     sum(min(row['signed_side_bound'],row['conservative_pencil_side'])
+                         for row in routes))
     fit_ids = recipe['fit_ids']
     fit = int(max(fit_ids) - min(fit_ids) + 1)
     budget = ConstructorCapacity(joint, resolution, mesh_xy=mesh, ledger=ledger,
@@ -283,7 +287,7 @@ def sector_batch_width(meta, resolution, recipe, routes, *, mesh, ledger, nq):
             workspace_bytes_per_rank=0, concurrent_with=ledger.live_stages)
         if preview['device_budget_status'] != 'PASS':
             continue
-        price, native = budget.quote(side, phase='reduction')
+        price, native = budget.quote(side, phase='reduction',eigen_side=eigen_side)
         preview = ledger.preview(
             resident_bytes_per_rank=price['resident_bytes_per_rank'] + sample_bytes,
             workspace_bytes_per_rank=sum(native.values()),
@@ -291,7 +295,7 @@ def sector_batch_width(meta, resolution, recipe, routes, *, mesh, ledger, nq):
         if preview['device_budget_status'] == 'PASS':
             return width, preview
     raise MemoryError('GATE shared_pole_capacity: distributed sector batch of one '
-                      'parent exceeds the shared device budget before bank read')
+                      f'parent exceeds the shared device budget before bank read; last price: {preview}')
 
 
 
@@ -316,7 +320,8 @@ def cross_action_program(mesh,sample,mirror,conjugate):
 def positive_cross_program(mesh):
     from gw.shared_pole_sectors import _positive_cross_equations
     from gw.shared_pole_recipe import shared_real_pole_gates_ordered_v1 as gates
-    return face_program(partial(_positive_cross_equations,gates=gates),mesh,outputs='positive_cross')
+    return face_program(partial(_positive_cross_equations,gates=gates,
+        matrix_sharding=NamedSharding(mesh,P(None,"x","y"))),mesh,outputs='positive_cross')
 
 
 @lru_cache(maxsize=None)
@@ -328,7 +333,8 @@ def held_program(mesh):
 @lru_cache(maxsize=None)
 def compact_program(mesh,width):
     from gw.shared_pole_sectors import _compact_sector_equations
-    return face_program(partial(_compact_sector_equations,width=width),mesh,outputs='compact')
+    return face_program(partial(_compact_sector_equations,width=width,
+        matrix_sharding=NamedSharding(mesh,P(None,"x","y"))),mesh,outputs='compact')
 
 
 @lru_cache(maxsize=None)

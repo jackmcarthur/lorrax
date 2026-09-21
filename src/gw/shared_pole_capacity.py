@@ -147,7 +147,7 @@ class ConstructorCapacity:
         return self.native_queries[key]
 
     def plan(self, side=None, *, phase=None, sample_batch=1,
-             selection_faces=None):
+             selection_faces=None, eigen_side=None):
         """Admit this phase's actual live set before allocating it.
 
         ``side`` is the pencil side this price is for; omit it to reprice the
@@ -160,13 +160,13 @@ class ConstructorCapacity:
         self._side = side
         price, native = self.quote(side, phase=self._phase,
                                    sample_batch=sample_batch,
-                                   selection_faces=selection_faces)
+                                   selection_faces=selection_faces, eigen_side=eigen_side)
         self._workspace = sum(native.values())
         row = self._reserve("constructor.plan", price["resident_bytes_per_rank"])
         row['execution'] = self.execution
         return dict(row, price=price, native_workspace=dict(native))
 
-    def quote(self, side, *, phase, sample_batch=1, selection_faces=None):
+    def quote(self, side, *, phase, sample_batch=1, selection_faces=None, eigen_side=None):
         """Return an unrecorded phase price for route selection/preflight."""
         side = int(side)
         n = self._n
@@ -174,13 +174,13 @@ class ConstructorCapacity:
             side, phase=phase, sample_batch=sample_batch,
             selection_faces=selection_faces)
         extents = {n, 2*n} if phase == "selection" else (
-            {side} if phase == "reduction" else {n})
+            {side if eigen_side is None else int(eigen_side)} if phase == "reduction" else {n})
         # Eigh scratch is transient: replace it at each phase boundary.
         self._native_maxima["eigh"] = max(self.query_workspace(
             "eigh", ((self.batch_width, extent, extent),), self.eigenplan(extent))
             for extent in sorted(extents))
         if self.execution == 'face':
-            extent=max(n,*extents)
+            extent=max(n,side,*extents)
             import distrib_la
             shapes=((self.batch_width,extent,extent),(self.batch_width,extent,extent))
             # Receipts use the public workspace operation name, matching

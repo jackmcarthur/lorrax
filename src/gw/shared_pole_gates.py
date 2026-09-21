@@ -144,7 +144,7 @@ def apply_shared_pole_zero_policy(model, *, gates):
     }
 
 
-def sort_shared_pole_columns(model):
+def sort_shared_pole_columns(model, *, matrix_sharding=None):
     """Sort joint active b/Lambda columns, retaining ties and safe padding.
 
     Returns the same three model arrays and the [b,Kp] permutation. Active
@@ -155,7 +155,8 @@ def sort_shared_pole_columns(model):
     """
     b, poles, active = model
     order = jnp.argsort(jnp.where(active, poles, jnp.inf), axis=-1, stable=True)
-    b = jnp.take_along_axis(b, order[:, None, :], axis=-1)
+    from gw.shared_pole_pencil import _matrix_take_columns
+    b = _matrix_take_columns(b, order, matrix_sharding)
     poles = jnp.take_along_axis(poles, order, axis=-1)
     active = jnp.take_along_axis(active, order, axis=-1)
     return (jnp.where(active[:, None, :], b, 0), jnp.where(active, poles, 1), active), order
