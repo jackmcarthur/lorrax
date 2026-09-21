@@ -16,7 +16,6 @@ def run_checks(mesh, directory):
     import jax.numpy as jnp
     import numpy as np
     from jax.sharding import NamedSharding, PartitionSpec as P
-    from symmetry_maps import QirrTables
     from file_io import shared_pole_store as store
     from file_io.slab_io import SlabIO
     from gw.shared_pole_constructor import construct_shared_poles
@@ -25,17 +24,9 @@ def run_checks(mesh, directory):
     from test_shared_pole_store import _fixture
 
     meta, tables, recipe, identity = _fixture(mesh)
-    # A synthetic 64^3 parent map supplies the declared capacity geometry,
-    # including the provider's fixed workspace cost for tiny GPU matrices.
-    # It tests the algebra/storage contract, not crystallographic unfolding.
-    qt = tables["qirr"]
-    tables["qirr"] = QirrTables(
-        irr_idx_q=np.arange(64**3, dtype=np.int32) % 3,
-        sym_idx_q=np.zeros(64**3, np.int32), q_irr_frac=qt.q_irr_frac,
-        sym_perm=qt.sym_perm, L_table=qt.L_table, n_sym_spatial=qt.n_sym_spatial)
-    meta.kgrid = (64, 64, 64)
-    meta.nkx, meta.nky, meta.nkz = meta.kgrid
-    meta.nk_tot, meta.n_rmu = 64**3, meta.mu_basis.n_logical
+    # Keep the fixture's physical three-parent 3x3x3 geometry. The explicit
+    # budget admits fixed native workspace for these tiny GPU matrices without
+    # inflating q metadata seen by later Coulomb and store owners.
     meta.n_rmu_padded = meta.mu_basis.n_packed
     recipe.update(recipe_hash=RECIPE_HASH, gate_hash=GATE_HASH,
                   role_codes=ROLE_CODES, fit_ids=[0, 1], held_ids=[2],
@@ -48,7 +39,8 @@ def run_checks(mesh, directory):
                   imaginary_width=2, infinity_width=1,
                   multiplet_relative_tolerance=1e-6, eta_ev=.25)
     meta.shared_pole_recipe = recipe
-    meta.shared_pole_capacity = CapacityLedger(meta, mesh_xy=mesh)
+    meta.shared_pole_capacity = CapacityLedger(
+        meta, mesh_xy=mesh, device_budget_bytes=1 << 30)
     meta.shared_pole_capacity.reserve('fixture_bank_inputs',
         resident_bytes_per_rank=4096, workspace_bytes_per_rank=0)
     meta.shared_pole_capacity.live_stages = ('fixture_bank_inputs',)
