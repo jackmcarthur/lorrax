@@ -138,7 +138,10 @@ class ConstructorCapacity:
         """Native workspace bytes per rank for one op at one shape, cached."""
         import distrib_la
 
-        key = (self.execution, op, shapes)
+        # Receipt schema owns a stable ``(op, shapes)`` key. Execution is
+        # recorded on every capacity row and one ConstructorCapacity never
+        # mixes layouts, so it does not belong in this map key.
+        key = (op, shapes)
         if key not in self.native_queries:
             self.native_queries[key] = distrib_la.workspace_bytes_per_rank(plan, op, shapes, np.complex128)
         return self.native_queries[key]
@@ -177,7 +180,7 @@ class ConstructorCapacity:
             extent=max(n,*extents)
             import distrib_la
             shapes=((1,extent,extent),(1,extent,extent))
-            key=('face','matmul',shapes)
+            key=('matmul',shapes)
             if key not in self.native_queries:
                 self.native_queries[key]=distrib_la.matmul_workspace_bytes_per_rank(
                     self._mesh_xy,shapes,np.complex128,backend='distributed',batched_route='auto')
