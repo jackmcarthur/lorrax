@@ -299,6 +299,7 @@ def test_htransform_active_window_beats_lower_guard_on_the_path():
     np.testing.assert_allclose(
         result["energies_sorted"], [[-1.0, 0.0, 3.0]] * 2,
         rtol=0.0, atol=2.0e-11)
+    assert result["energy_reference_ry"] == pytest.approx(-2.0)
     np.testing.assert_array_equal(result["coincident_path_indices"], [0])
     np.testing.assert_array_equal(result["coincident_coarse_indices"], [0])
     np.testing.assert_allclose(
