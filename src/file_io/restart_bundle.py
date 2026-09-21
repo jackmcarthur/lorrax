@@ -1062,6 +1062,11 @@ def read_qp_rotations_artifact(h5_path: str) -> dict:
     from .qp_wfn import (
         QP_ROT_FULL_ENERGIES_DATASET,
         QP_ROT_OCCUPATIONS_DATASET,
+        QP_ROT_SC_POLICY_GROUP,
+        QP_ROT_SC_POLICY_SCHEMA,
+        QP_ROT_SC_PROTECTED_DATASET,
+        QP_ROT_SC_IN_RANGE_DATASET,
+        QP_ROT_SCISSOR_FIELDS,
         QP_ROT_METADATA_DATASETS,
         QP_ROT_WFN_FINGERPRINT_ATTR,
         QP_ROT_WFN_FINGERPRINT_SCHEME_ATTR,
@@ -1071,6 +1076,7 @@ def read_qp_rotations_artifact(h5_path: str) -> dict:
         QP_WFN_OCC_NELEC_ATTR,
         QP_WFN_OCC_WIDTH_RY_ATTR,
         _require_wfn_fingerprint,
+        normalize_qp_sc_seed_policy,
     )
     path = os.fspath(h5_path)
     with h5py.File(path, "r") as h5:
@@ -1177,6 +1183,53 @@ def read_qp_rotations_artifact(h5_path: str) -> dict:
         else:
             arrays["occupation_provenance"] = None
 
+        if QP_ROT_SC_POLICY_GROUP in h5:
+            group = h5[QP_ROT_SC_POLICY_GROUP]
+            schema = group.attrs.get("schema", None)
+            if isinstance(schema, bytes):
+                schema = schema.decode("ascii")
+            required_policy = {
+                QP_ROT_SC_PROTECTED_DATASET, QP_ROT_SC_IN_RANGE_DATASET}
+            missing_policy = sorted(required_policy.difference(group.keys()))
+            if str(schema) != QP_ROT_SC_POLICY_SCHEMA or missing_policy:
+                raise ValueError(
+                    f"{os.path.basename(path)} has an invalid SC seed policy: "
+                    f"schema={schema!r}, missing={missing_policy}.")
+            if "has_active_scissor" not in group.attrs:
+                raise ValueError(
+                    f"{os.path.basename(path)} SC seed policy does not say "
+                    "whether an active scissor is present.")
+            raw_has_fit = group.attrs["has_active_scissor"]
+            if raw_has_fit not in (False, True, 0, 1):
+                raise ValueError(
+                    f"{os.path.basename(path)} SC seed policy has invalid "
+                    f"has_active_scissor={raw_has_fit!r}.")
+            has_fit = bool(raw_has_fit)
+            present_fit = {name for name in QP_ROT_SCISSOR_FIELDS
+                           if name in group.attrs}
+            if present_fit != (set(QP_ROT_SCISSOR_FIELDS) if has_fit else set()):
+                raise ValueError(
+                    f"{os.path.basename(path)} has incomplete SC active "
+                    f"scissor fields: has_active_scissor={has_fit}, "
+                    f"present={sorted(present_fit)}.")
+            fit = ({name: group.attrs[name]
+                    for name in QP_ROT_SCISSOR_FIELDS} if has_fit else None)
+            band_start, band_stop = (
+                int(x) for x in arrays["band_range"].tolist())
+            arrays["sc_seed_policy"] = normalize_qp_sc_seed_policy(
+                {
+                    "protected_mask": np.asarray(
+                        group[QP_ROT_SC_PROTECTED_DATASET][()]),
+                    "in_range_mask": np.asarray(
+                        group[QP_ROT_SC_IN_RANGE_DATASET][()]),
+                    "active_scissor": fit,
+                },
+                nk=int(arrays["U_mnk"].shape[0]),
+                nb=band_stop - band_start,
+            )
+        else:
+            arrays["sc_seed_policy"] = None
+
         has_scheme = QP_ROT_WFN_FINGERPRINT_SCHEME_ATTR in h5.attrs
         has_fingerprint = QP_ROT_WFN_FINGERPRINT_ATTR in h5.attrs
         if has_scheme != has_fingerprint:
@@ -1275,7 +1328,7 @@ def validate_qp_rotations_frame(
 def validate_qp_rotations_artifact(
         path, *, U_mnk, E_qp_nk_rydberg, band_range, kpoints_crys, kgrid,
         enk_full_nk_ry=None, occupations_kn=None,
-        occupation_state=None) -> None:
+        occupation_state=None, sc_seed_policy=None) -> None:
     """Require a closed companion file to equal its publication inputs."""
     if (occupations_kn is None) != (occupation_state is None):
         raise ValueError(
@@ -1326,6 +1379,25 @@ def validate_qp_rotations_artifact(
         raise ValueError(
             "QP rotations staging validation: closed occupation provenance "
             "differs from the state handed to the writer.")
+    from .qp_wfn import normalize_qp_sc_seed_policy
+    expected_policy = normalize_qp_sc_seed_policy(
+        sc_seed_policy, nk=int(np.shape(U_mnk)[0]),
+        nb=int(band_range[1]) - int(band_range[0]))
+    got_policy = artifact["sc_seed_policy"]
+    if (got_policy is None) != (expected_policy is None):
+        raise ValueError(
+            "QP rotations staging validation: SC seed policy presence "
+            "differs from the writer request.")
+    if got_policy is not None:
+        for name in ("protected_mask", "in_range_mask"):
+            if not np.array_equal(got_policy[name], expected_policy[name]):
+                raise ValueError(
+                    "QP rotations staging validation: SC seed policy "
+                    f"{name} differs from the state handed to the writer.")
+        if got_policy["active_scissor"] != expected_policy["active_scissor"]:
+            raise ValueError(
+                "QP rotations staging validation: SC seed active scissor "
+                "differs from the state handed to the writer.")
 
 
 

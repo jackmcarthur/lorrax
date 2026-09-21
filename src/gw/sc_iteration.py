@@ -62,7 +62,7 @@ from __future__ import annotations
 import functools as _functools
 import math as _math
 import os
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from typing import Callable
 
 import numpy as np
@@ -637,8 +637,9 @@ class SCState:
     outputs: SCOutputs | None = None
     convergence_verdict: ConvergenceVerdict | None = None
     # (active_window_fit, sum_band_tail_fit) from map 0, carried on every
-    # later map input so the tail law is fixed for the loop; see
-    # _frozen_scissor_fits.  None on map 0 and on the one-shot path.
+    # later map input so the active law is fixed for the loop; see
+    # _frozen_scissor_fits. An authenticated external SC seed may supply it
+    # on map 0; ordinary cold and one-shot paths start with None.
     frozen_scissor_fits: tuple | None = None
 
 
@@ -831,11 +832,12 @@ def make_initial_state_from_qp_rotations(
 ) -> SCState:
     """Seed a new SC run from a compact QP eigensystem in the DFT basis.
 
-    This is deliberately narrower than nonlinear restart.  Only the active
-    Hamiltonian ``U diag(E) U^H`` is imported.  The selected mean-field WFN,
-    pristine kinetic/ionic operator, DFT tail, current occupation solve,
-    protected-identity classification, fixed quadrature session and rCROP
-    history all remain owned by the new run.
+    This is deliberately narrower than nonlinear restart.  The active
+    Hamiltonian ``U diag(E) U^H`` is imported; an SC companion also continues
+    its accepted protected identities and frozen active scissor law.  The
+    selected mean-field WFN, pristine kinetic/ionic operator, current
+    occupation solve, sum-band-tail refit, fixed quadrature session and rCROP
+    history remain owned by the new run.
     """
     from file_io.qp_wfn import authenticate_qp_rotations_source_wfn
     from file_io.restart_bundle import (
@@ -881,22 +883,38 @@ def make_initial_state_from_qp_rotations(
     seed_mu_ry = (
         float(occ_state.mu_ry) if occ_state is not None else
         float(_midgap_efermi(jnp.asarray(E_full), int(inputs.meta.nelec))))
-    partition, _, _, _, _ = _classify_sc_partition(
-        E_loop, U_loop, occ_state, previous_partition=None, iteration=0,
-        inputs=inputs, current_mu_ry=seed_mu_ry)
+    seed_policy = artifact.get("sc_seed_policy")
+    frozen_scissor_fits = None
+    if seed_policy is None:
+        partition, _, _, _, _ = _classify_sc_partition(
+            E_loop, U_loop, occ_state, previous_partition=None, iteration=0,
+            inputs=inputs, current_mu_ry=seed_mu_ry)
+    else:
+        protected = np.asarray(seed_policy["protected_mask"], dtype=bool)
+        in_range = np.asarray(seed_policy["in_range_mask"], dtype=bool)
+        partition = BandPartition(
+            protected_mask=protected, in_range_mask=in_range)
+        fit_record = seed_policy["active_scissor"]
+        if fit_record is not None:
+            frozen_scissor_fits = (ScissorFit(**fit_record), None)
     _record_sc(
         inputs,
         "  SC initial Hamiltonian: external compact QP seed "
         f"{artifact_path}; authenticated original DFT basis; "
-        "seed-only U diag(E) U^H. Occupations, DFT tail, protected "
-        "identities, reference operators, quadrature and rCROP history "
-        "belong to this new run.")
+        "seed-only U diag(E) U^H. Occupations, DFT tail, reference "
+        "operators, quadrature and rCROP history belong to this new run; "
+        + ("protected identities and frozen active scissor continue from "
+           "the authenticated companion."
+           if seed_policy is not None else
+           "protected identities and active scissor are initialized by this "
+           "new run."))
     return SCState(
         H_qp_dft=device_put_process_local(H_loop, rep3),
         iteration=0,
         partition=partition,
         occupation_state=occ_state,
         head_surface_weight_kn=head_surface_weight_kn,
+        frozen_scissor_fits=frozen_scissor_fits,
     )
 
 
@@ -2742,7 +2760,7 @@ def _sc_head_frequency_plan(
 
 
 def _frozen_scissor_fits(state):
-    """The map-0 scissor laws, reused by every later map.
+    """The map-0 or authenticated seed scissor laws reused by the SC loop.
 
     Refitting the affine tail law from the trusted block's shifts every map
     moved the 96 eV Na states by up to 17.7 eV in one map (arm D map 3,
@@ -2756,8 +2774,6 @@ def _frozen_scissor_fits(state):
     Returns (active_window_fit, sum_band_tail_fit); the second element is
     carried for the record and not consumed.
     """
-    if int(getattr(state, "iteration", 0)) <= 0:
-        return None, None
     fits = getattr(state, "frozen_scissor_fits", None)
     if fits is None:
         return None, None
@@ -5228,6 +5244,7 @@ def _run_linear_mixing(
             occupation_state=state_map.occupation_state,
             head_surface_weight_kn=state_map.head_surface_weight_kn,
             outputs=state_map.outputs,
+            frozen_scissor_fits=_frozen_fits,
         )
         if mixing != 1.0:
             H_next = (
@@ -5591,7 +5608,8 @@ def _run_rcrop(
                         occupation_state=state_out.occupation_state,
                         head_surface_weight_kn=state_out.head_surface_weight_kn,
                         outputs=state_out.outputs,
-                        convergence_verdict=_verdict),
+                        convergence_verdict=_verdict,
+                        frozen_scissor_fits=_frozen_fits[0]),
                 _verdict)
         return _to_entry(state_out.H_qp_dft - H)
 
@@ -5723,6 +5741,7 @@ def _run_rcrop(
         head_surface_weight_kn=_head_surface_weight[0],
         outputs=_last_outputs[0],
         convergence_verdict=_last_verdict[0],
+        frozen_scissor_fits=_frozen_fits[0],
     )
     _maybe_dump_e_history(dump_dir, _e_history, print_fn)
     return state_final, rms_history
@@ -7031,6 +7050,26 @@ def dump_qp_wfn_artifacts(
     expected_wfn_energies_ry[:, int(band_slices.b0):int(band_slices.b3)] = (
         np.asarray(enk_wfn_ry, dtype=np.float64))
 
+    sc_seed_policy = None
+    if getattr(state, "partition", None) is not None:
+        mask_shape = (int(U_full.shape[0]), int(U_full.shape[-1]))
+        protected_full = np.broadcast_to(
+            np.asarray(state.partition.protected_mask, dtype=bool), mask_shape)
+        in_range_full = np.broadcast_to(
+            np.asarray(state.partition.in_range_mask, dtype=bool), mask_shape)
+        frozen_fits = getattr(state, "frozen_scissor_fits", None)
+        if frozen_fits is not None:
+            active_fit = frozen_fits[0]
+        else:
+            active_fit = (
+                None if state.outputs is None else state.outputs.scissor_fit)
+        sc_seed_policy = {
+            "protected_mask": np.asarray(protected_full, dtype=bool),
+            "in_range_mask": np.asarray(in_range_full, dtype=bool),
+            "active_scissor": (
+                None if active_fit is None else asdict(active_fit)),
+        }
+
     def _write_qp_wfn(staging_path):
         write_qp_wfn_h5(
             staging_path, wfn=wfn,
@@ -7080,6 +7119,7 @@ def dump_qp_wfn_artifacts(
                             np.asarray(final_occ_state.f_kn)),
             occupation_state=final_occ_state,
             enk_full_nk_ry=final_energies_full_ry,
+            sc_seed_policy=sc_seed_policy,
         )
 
     def _validate_qp_rotations(staging_path):
@@ -7091,7 +7131,8 @@ def dump_qp_wfn_artifacts(
             enk_full_nk_ry=final_energies_full_ry,
             occupations_kn=(None if final_occ_state is None
                             else final_occ_state.f_kn),
-            occupation_state=final_occ_state)
+            occupation_state=final_occ_state,
+            sc_seed_policy=sc_seed_policy)
 
     rank0_atomic_file_transaction(
         qp_rot_path, stage="qp_rotations_h5_write",

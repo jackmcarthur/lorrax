@@ -96,6 +96,73 @@ QP_ROT_OCCUPATIONS_DATASET = "occupations_kn"
 #: mean-field WFN.
 QP_ROT_FULL_ENERGIES_DATASET = "E_full_nk_rydberg"
 
+#: Optional SC continuation policy carried by the compact companion.  The
+#: masks remain on the full BZ even when U/E reduce to the file wedge: they are
+#: tiny, DFT-identity-labelled state, and the warm initializer selects them
+#: onto its own loop k-set only after source-WFN/frame authentication.
+QP_ROT_SC_POLICY_GROUP = "sc_seed_policy"
+QP_ROT_SC_POLICY_SCHEMA = "lorrax.sc-seed-policy.v1"
+QP_ROT_SC_PROTECTED_DATASET = "protected_mask_kn"
+QP_ROT_SC_IN_RANGE_DATASET = "in_range_mask_kn"
+QP_ROT_SCISSOR_FIELDS = (
+    "alpha_v", "beta_v_ev", "alpha_c", "beta_c_ev",
+    "n_fit_v", "n_fit_c", "rmse_v_ev", "rmse_c_ev",
+    "w_fit_v", "w_fit_c",
+)
+_QP_ROT_SCISSOR_INT_FIELDS = ("n_fit_v", "n_fit_c")
+
+
+def normalize_qp_sc_seed_policy(policy, *, nk: int, nb: int):
+    """Validate the optional SC partition/frozen-active-law payload."""
+    if policy is None:
+        return None
+    if set(policy) != {"protected_mask", "in_range_mask", "active_scissor"}:
+        raise ValueError(
+            "SC seed policy must contain exactly protected_mask, "
+            "in_range_mask and active_scissor.")
+    out = {}
+    for key in ("protected_mask", "in_range_mask"):
+        value = np.asarray(policy[key])
+        if value.shape != (int(nk), int(nb)):
+            raise ValueError(
+                f"SC seed policy {key} has shape {value.shape}; expected "
+                f"{(int(nk), int(nb))}.")
+        if value.dtype != np.bool_ and not np.all((value == 0) | (value == 1)):
+            raise ValueError(f"SC seed policy {key} is not boolean.")
+        out[key] = np.asarray(value, dtype=bool)
+    fit = policy["active_scissor"]
+    if fit is None:
+        out["active_scissor"] = None
+        return out
+    if set(fit) != set(QP_ROT_SCISSOR_FIELDS):
+        raise ValueError(
+            "SC seed active_scissor fields differ from the ScissorFit "
+            f"contract: got {sorted(fit)}, want {sorted(QP_ROT_SCISSOR_FIELDS)}.")
+    normalized_fit = {}
+    for name in QP_ROT_SCISSOR_FIELDS:
+        value = fit[name]
+        if name in _QP_ROT_SCISSOR_INT_FIELDS:
+            number = int(value)
+            if number != value or number < 0:
+                raise ValueError(
+                    f"SC seed active_scissor {name} must be a nonnegative "
+                    f"integer; got {value!r}.")
+            normalized_fit[name] = number
+        else:
+            number = float(value)
+            if not np.isfinite(number):
+                raise ValueError(
+                    f"SC seed active_scissor {name} must be finite; "
+                    f"got {value!r}.")
+            if name.startswith("rmse_") or name.startswith("w_fit_"):
+                if number < 0.0:
+                    raise ValueError(
+                        f"SC seed active_scissor {name} must be nonnegative; "
+                        f"got {number!r}.")
+            normalized_fit[name] = number
+    out["active_scissor"] = normalized_fit
+    return out
+
 #: ``kpoints_crys`` and ``kirr_to_kfull`` STAY ON THE FULL BZ, always, and
 #: that is not an oversight.
 #:
@@ -283,6 +350,7 @@ def write_qp_rotations_h5(
     enk_full_nk_ry: np.ndarray = None,
     occupations_kn: np.ndarray = None,
     occupation_state=None,
+    sc_seed_policy: dict = None,
 ):
     """Write QP rotation matrices and eigenvalues to HDF5 file.
     
@@ -325,6 +393,10 @@ def write_qp_rotations_h5(
                occupations on the full BZ and the accepted state that owns
                their fixed-N provenance.  This reuses the caller's completed
                solve; the artifact writer never derives occupations.
+        sc_seed_policy: optional accepted SC partition and frozen active
+               scissor law. The partition is required when this mapping is
+               present; ``active_scissor=None`` explicitly records that the
+               source run had no frozen fitted law.
 
     For postprocessing WFN.h5 → WFN_qp.h5:
         1. Load WFN.h5 coefficients for bands [band_start:band_stop]
@@ -352,6 +424,9 @@ def write_qp_rotations_h5(
             "write_qp_rotations_h5: occupations_kn and occupation_state "
             "must be supplied together.")
     occupation_provenance = _qp_occupation_attrs(occupation_state)
+    sc_seed_policy = normalize_qp_sc_seed_policy(
+        sc_seed_policy, nk=int(np.shape(U_mnk)[0]),
+        nb=int(band_stop) - int(band_start))
     if k_storage not in QP_ROTATIONS_K_STORAGE:
         raise ValueError(
             f"write_qp_rotations_h5: k_storage={k_storage!r} is none of "
@@ -501,6 +576,20 @@ def write_qp_rotations_h5(
             f.create_dataset(
                 QP_ROT_OCCUPATIONS_DATASET,
                 data=payload[QP_ROT_OCCUPATIONS_DATASET], dtype=np.float64)
+        if sc_seed_policy is not None:
+            group = f.create_group(QP_ROT_SC_POLICY_GROUP)
+            group.attrs["schema"] = QP_ROT_SC_POLICY_SCHEMA
+            group.create_dataset(
+                QP_ROT_SC_PROTECTED_DATASET,
+                data=sc_seed_policy["protected_mask"], dtype=np.bool_)
+            group.create_dataset(
+                QP_ROT_SC_IN_RANGE_DATASET,
+                data=sc_seed_policy["in_range_mask"], dtype=np.bool_)
+            fit = sc_seed_policy["active_scissor"]
+            group.attrs["has_active_scissor"] = bool(fit is not None)
+            if fit is not None:
+                for name in QP_ROT_SCISSOR_FIELDS:
+                    group.attrs[name] = fit[name]
 
         # Metadata
         f.create_dataset('band_range', data=np.array([band_start, band_stop], dtype=np.int32))

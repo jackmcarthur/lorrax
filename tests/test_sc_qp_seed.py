@@ -8,15 +8,18 @@ import numpy as np
 import pytest
 from jax.sharding import Mesh
 
-from file_io.restart_bundle import validate_qp_rotations_frame
+from file_io.qp_wfn import write_qp_rotations_h5
+from file_io.restart_bundle import (
+    read_qp_rotations_artifact, validate_qp_rotations_frame)
 from gw import sc_iteration as sc
+from gw.scissor import ScissorFit
 
 
 def test_qp_seed_reconstruction_partition_enters_real_rcrop_seam(
     monkeypatch, tmp_path,
 ):
     rng = np.random.default_rng(20260920)
-    nk, nb = 2, 4
+    nk, nk_loop, nb = 64, 13, 4
     rotations = []
     for _ in range(nk):
         raw = np.eye(nb) + 1.0e-2 * (
@@ -25,17 +28,18 @@ def test_qp_seed_reconstruction_partition_enters_real_rcrop_seam(
     U = np.asarray(rotations)
     E = np.broadcast_to(
         np.asarray([-1.0, -0.2, 0.4, 1.0]), (nk, nb)).copy()
-    kpoints = np.asarray([[0.0, 0.0, 0.0], [0.5, 0.0, 0.0]])
+    kpoints = np.zeros((nk, 3), dtype=np.float64)
+    kpoints[:, 0] = np.arange(nk) / nk
     artifact = {
         "U_mnk": U,
         "E_qp_nk_rydberg": E,
         "band_range": np.asarray([3, 3 + nb]),
-        "kgrid": np.asarray([2, 1, 1]),
+        "kgrid": np.asarray([4, 4, 4]),
         "kpoints_crys": kpoints,
     }
 
     returned_U, returned_E, band_range = validate_qp_rotations_frame(
-        artifact, kgrid=(2, 1, 1), kpoints_crys=kpoints,
+        artifact, kgrid=(4, 4, 4), kpoints_crys=kpoints,
         artifact_path="qp_wfn_rotations.h5")
     H = np.einsum(
         "kmn,kn,kln->kml", returned_U, returned_E,
@@ -53,11 +57,11 @@ def test_qp_seed_reconstruction_partition_enters_real_rcrop_seam(
     broken["U_mnk"][0, 0, 0] += 1.0e-5
     with pytest.raises(ValueError, match="not unitary"):
         validate_qp_rotations_frame(
-            broken, kgrid=(2, 1, 1), kpoints_crys=kpoints,
+            broken, kgrid=(4, 4, 4), kpoints_crys=kpoints,
             artifact_path="qp_wfn_rotations.h5")
 
-    # The initializer's partition is classified from this seed eigensystem,
-    # then handed through run_self_consistency into the real rCROP driver.
+    # The companion's accepted partition and active law round-trip through the
+    # format owner, then enter run_self_consistency through the real rCROP seam.
     # The map and accelerator arithmetic are cheap doubles; rCROP's startup
     # metric construction is real, which pins the pre-map partition seam.
     mesh = Mesh(np.asarray(jax.devices()[:1]).reshape(1, 1), ("x", "y"))
@@ -71,11 +75,45 @@ def test_qp_seed_reconstruction_partition_enters_real_rcrop_seam(
     full_reference = np.zeros((nk, 3 + nb), dtype=np.float64)
     full_reference[:, :3] = np.asarray([-4.0, -3.0, -2.0])
     full_reference[:, 3:] = E
+    wfn = SimpleNamespace(
+        energies=full_reference[None, ...], kpoints=kpoints,
+        efermi=10.0, kgrid=(4, 4, 4), nelec=2, nspinor=1,
+        nbands=3 + nb, path=None)
+    protected = np.broadcast_to(
+        np.asarray([False, True, True, False]), (nk, nb)).copy()
+    protected[-1] = [True, False, True, False]
+    in_range = np.broadcast_to(
+        np.asarray([False, True, False, False]), (nk, nb)).copy()
+    fit = ScissorFit(
+        alpha_v=1.0, beta_v_ev=0.0,
+        alpha_c=0.75, beta_c_ev=9.5,
+        n_fit_v=39, n_fit_c=0,
+        rmse_v_ev=0.0, rmse_c_ev=0.0,
+        w_fit_v=192.0, w_fit_c=0.0)
+    policy = {
+        "protected_mask": protected,
+        "in_range_mask": in_range,
+        "active_scissor": vars(fit),
+    }
+    artifact_path = str(tmp_path / "qp_wfn_rotations.h5")
+    write_qp_rotations_h5(
+        artifact_path, U_mnk=U, E_qp_nk=E * 0.5,
+        band_start=3, band_stop=3 + nb, kpoints_crys=kpoints,
+        nkx=4, nky=4, nkz=4, kirr_to_kfull=np.arange(nk_loop),
+        source_wfn=wfn, sc_seed_policy=policy)
+    stored = read_qp_rotations_artifact(artifact_path)["sc_seed_policy"]
+    np.testing.assert_array_equal(stored["protected_mask"], protected)
+    np.testing.assert_array_equal(stored["in_range_mask"], in_range)
+    assert stored["active_scissor"] == vars(fit)
+
+    kstar = SimpleNamespace(
+        is_identity=False,
+        select=lambda values: np.asarray(values)[:nk_loop],
+        broadcast=lambda values: np.broadcast_to(
+            np.asarray(values)[0], (nk,) + np.asarray(values).shape[1:]))
     inputs = SimpleNamespace(
         sym=SimpleNamespace(unfolded_kpts=kpoints),
-        wfn=SimpleNamespace(
-            energies=full_reference[None, ...], efermi=10.0,
-            kgrid=(2, 1, 1)),
+        wfn=wfn,
         wfns_dft=SimpleNamespace(enk=jnp.asarray(E)),
         e_dft_active_kn_ry=E,
         config=cfg,
@@ -85,7 +123,7 @@ def test_qp_seed_reconstruction_partition_enters_real_rcrop_seam(
         meta=SimpleNamespace(nelec=2),
         material_class="insulator",
         parallel_transport=None,
-        kstar=SimpleNamespace(is_identity=True),
+        kstar=kstar,
         initial_state_role="external_qp_seed",
         partition=SimpleNamespace(
             protected_mask=np.zeros(nb, dtype=bool),
@@ -96,39 +134,41 @@ def test_qp_seed_reconstruction_partition_enters_real_rcrop_seam(
         print_fn=lambda *_args: None,
         record_fn=None,
     )
-    monkeypatch.setattr(
-        "symmetry_maps.unfold_file_wedge_to_full_bz",
-        lambda _sym, values: np.asarray(values))
-    monkeypatch.setattr(
-        "file_io.restart_bundle.read_qp_rotations_artifact",
-        lambda _path: artifact)
-    monkeypatch.setattr(
-        "file_io.qp_wfn.authenticate_qp_rotations_source_wfn",
-        lambda *_args, **_kwargs: "mock-source-fingerprint")
     state = sc.make_initial_state_from_qp_rotations(
-        inputs, "qp_wfn_rotations.h5")
+        inputs, artifact_path)
     np.testing.assert_allclose(
-        np.asarray(state.H_qp_dft), direct, rtol=0.0, atol=2.0e-15)
+        np.asarray(state.H_qp_dft), direct[:nk_loop], rtol=0.0, atol=2.0e-15)
     partition = state.partition
-    expected_protected = np.broadcast_to(
+    np.testing.assert_array_equal(partition.protected_mask, protected)
+    np.testing.assert_array_equal(partition.in_range_mask, in_range)
+    assert sc._frozen_scissor_fits(state) == (fit, None)
+
+    # A legacy U/E-only companion keeps the established seed classification
+    # and starts without a frozen law; absence must not manufacture identity.
+    with monkeypatch.context() as legacy:
+        legacy.setattr(
+            "file_io.restart_bundle.read_qp_rotations_artifact",
+            lambda _path: artifact)
+        legacy.setattr(
+            "file_io.qp_wfn.authenticate_qp_rotations_source_wfn",
+            lambda *_args, **_kwargs: "mock-source-fingerprint")
+        legacy.setattr(
+            "symmetry_maps.unfold_file_wedge_to_full_bz",
+            lambda _sym, values: np.asarray(values))
+        legacy_state = sc.make_initial_state_from_qp_rotations(
+            inputs, "legacy_qp_wfn_rotations.h5")
+    expected_legacy = np.broadcast_to(
         np.asarray([False, True, True, False]), (nk, nb))
     np.testing.assert_array_equal(
-        np.asarray(partition.protected_mask), expected_protected)
-
-    # The seeded map must carry the same freeze decision through its output
-    # scissor step, which may otherwise promote new frontier identities.
-    classified, _, _, _, frozen = sc._classify_sc_partition(
-        E, U, None, previous_partition=partition, iteration=0,
-        inputs=inputs, current_mu_ry=0.1)
-    assert frozen
-    np.testing.assert_array_equal(
-        classified.protected_mask, partition.protected_mask)
+        legacy_state.partition.protected_mask, expected_legacy)
+    assert legacy_state.frozen_scissor_fits is None
 
     payload = SimpleNamespace(scissor_fit=None, tail_scissor_fit=None)
     seen = []
 
     def fake_map(state, _inputs):
         seen.append(state.partition)
+        assert sc._frozen_scissor_fits(state) == (fit, None)
         return sc.SCState(
             H_qp_dft=state.H_qp_dft + 1.0e-3,
             iteration=state.iteration + 1,
@@ -165,3 +205,4 @@ def test_qp_seed_reconstruction_partition_enters_real_rcrop_seam(
         state, inputs, max_iter=2, accelerator="rcrop", history_depth=1)
     assert seen and seen[0] is partition
     assert final.partition is partition
+    assert final.frozen_scissor_fits == (fit, None)
