@@ -194,7 +194,7 @@ def _restricted_block(ww, wv, vv):
 
 
 def reduce_ordered_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, gates, keep_budget=None,
-                                     retain_span=False, matrix_sharding=None):
+                                     retain_span=False, matrix_sharding=None, gram_keep=None):
     """Paired-basis Ritz reduction of the particle-hole pencil.
 
     ``pencil=(G,H,O,z)`` from ``assemble_ordered_shared_pole_pencil`` over paired
@@ -258,8 +258,7 @@ def reduce_ordered_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, g
     g_ww, g_wv, g_vv, h_ww, h_wv, h_vv = (sandwich(a) for a in (g_ww, g_wv, g_vv, h_ww, h_wv, h_vv))
     o_w, o_v = o_w * scale[:, None, :], o_v * scale[:, None, :]
     validity = gates["normalized_gram_validity"]["threshold"]
-    keep_cut = gates["normalized_gram_keep"][
-        "sector_threshold" if retain_span else "threshold"]
+    keep_cut = gates["normalized_gram_keep"]["threshold"] if gram_keep is None else gram_keep
     gamma, u = eigh(hermitian_part(h_vv))
     largest = gamma[:, -1]
     ratio = gamma[:, 0] / jnp.where(largest > 0, largest, 1)

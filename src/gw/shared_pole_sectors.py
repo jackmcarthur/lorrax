@@ -521,14 +521,17 @@ def construct_diagonal_sector_round(samples, moments, meta, config, geometry, *,
     # panels. Full sample/moment stacks remain caller-live through this call,
     # so those and earlier-sector outputs are the only additional arrays.
     budget.retained_panels=(*retained,*samples.values(),*moments.values())
+    from gw.shared_pole_recipe import shared_real_pole_gates_ordered_v1
+    gram_keep = shared_real_pole_gates_ordered_v1['normalized_gram_keep']['sector_threshold']
     if execution == 'face':
         reduced=face_reduce_round(states,infinity,tables,real=geometry['real'],mesh=mesh_xy,
-            budget=budget,ordered=True,odd_moments=True,keep_budget=recipe['pole_budget'],retain_span=True)
+            budget=budget,ordered=True,odd_moments=True,keep_budget=recipe['pole_budget'],retain_span=True,
+            gram_keep=gram_keep)
     else:
         budget.plan(side,phase='reduction')
         reduced=reduce_round(states,infinity,tables,real=geometry['real'],mesh_xy=mesh_xy,
             native_eigh=budget.eigenplan(side).native_fn,ordered=True,odd_moments=True,
-            keep_budget=recipe['pole_budget'],retain_span=True)
+            keep_budget=recipe['pole_budget'],retain_span=True,gram_keep=gram_keep)
     model,signed,vectors,diagnostics,y=reduced
     reduction,zero,_,_=jax.tree.map(np.asarray,diagnostics)
     for name in ('orientation_paired','gram_diagonal_positive','gram_valid','retained_metric_positive'):

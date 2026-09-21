@@ -179,7 +179,7 @@ def face_eigh(mesh, n):
 
 
 @lru_cache(maxsize=None)
-def face_parent_program(mesh,ordered,odd_moments,keep_budget,retain_span,side):
+def face_parent_program(mesh,ordered,odd_moments,keep_budget,retain_span,side,gram_keep=None):
     """Retained static-layout executable builder; all state values are operands."""
     from gw.shared_pole_local import solve_parent_pencil
     from gw.shared_pole_gates import sort_shared_pole_columns
@@ -194,7 +194,7 @@ def face_parent_program(mesh,ordered,odd_moments,keep_budget,retain_span,side):
             return _matrix_take_columns(panels, order, NamedSharding(mesh,P(None,"x","y")))
         reduced=solve_parent_pencil(points,pack(qs),pack(os),pack(ds),infinity,active,
             eigh=eigh_plan.batched,matmul=mm,gates=gates,ordered=ordered,odd_moments=odd_moments,
-            keep_budget=keep_budget,retain_span=retain_span,
+            keep_budget=keep_budget,retain_span=retain_span,gram_keep=gram_keep,
             matrix_sharding=NamedSharding(mesh,P(None,"x","y")))
         model,signed,diagnostics=reduced[:3]
         model,permutation=sort_shared_pole_columns(model, matrix_sharding=NamedSharding(mesh,P(None,"x","y")))
@@ -204,14 +204,14 @@ def face_parent_program(mesh,ordered,odd_moments,keep_budget,retain_span,side):
 
 
 def face_reduce_round(states,infinity,tables,*,real,mesh,budget,ordered,odd_moments,
-                      keep_budget,retain_span=False,admit=True):
+                      keep_budget,retain_span=False,admit=True,gram_keep=None):
     """A batch of physical parents with every matrix tiled over all ranks."""
     if real != len(tables['own']):
         raise ValueError('distributed constructor batches contain physical parents only')
     side=tables['active'].shape[-1]
     if admit:
         budget.plan(side,phase='reduction')
-    program=face_parent_program(mesh,ordered,odd_moments,keep_budget,retain_span,side)
+    program=face_parent_program(mesh,ordered,odd_moments,keep_budget,retain_span,side,gram_keep)
     result=program(jnp.asarray(tables['points']),jnp.asarray(tables['order']),
         jnp.asarray(tables['active']),tuple(s[1] for s in states),
         tuple(s[2] for s in states),tuple(s[3] for s in states),tuple(infinity))

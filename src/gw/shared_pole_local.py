@@ -217,7 +217,7 @@ def _batch_put(mesh_xy, a):
 
 
 def reduce_round(states, infinity, tables, *, real, mesh_xy, native_eigh, ordered, odd_moments, keep_budget,
-                 retain_span=False):
+                 retain_span=False, gram_keep=None):
     """Run ``round_program`` on one round: host tables in, round-order results out."""
     import numpy as np
 
@@ -225,7 +225,7 @@ def reduce_round(states, infinity, tables, *, real, mesh_xy, native_eigh, ordere
     extents = [tuple(int(v) for v in row) for row in tables["extents"][:real]]
     sizes = tuple(sorted(set(extents)))
     program = round_program(mesh_xy, native_eigh, bool(ordered), bool(odd_moments),
-                            None if keep_budget is None else int(keep_budget), sizes, bool(retain_span))
+                            None if keep_budget is None else int(keep_budget), sizes, bool(retain_span), gram_keep)
     live = np.arange(len(tables["own"])) < int(real)
     dispatch = np.zeros(len(live), np.int32)
     dispatch[:real] = [sizes.index(size) for size in extents]
@@ -235,7 +235,8 @@ def reduce_round(states, infinity, tables, *, real, mesh_xy, native_eigh, ordere
 
 
 def solve_parent_pencil(points, q, o, d, infinity, active, *, eigh, matmul,
-                        gates, ordered, odd_moments, keep_budget, retain_span=False, matrix_sharding=None):
+                        gates, ordered, odd_moments, keep_budget, retain_span=False, matrix_sharding=None,
+                        gram_keep=None):
     """One equation owner for local and whole-mesh parent execution.
 
     Inputs carry one or more independent parents. Execution adapters supply
@@ -253,7 +254,7 @@ def solve_parent_pencil(points, q, o, d, infinity, active, *, eigh, matmul,
                                                      matmul=matmul, matrix_sharding=matrix_sharding)
         reduced = reduce_ordered_shared_pole_pencil(
             pencil, active, eigh=eigh, matmul=matmul, gates=gates, keep_budget=keep_budget,
-            retain_span=retain_span, matrix_sharding=matrix_sharding)
+            retain_span=retain_span, matrix_sharding=matrix_sharding, gram_keep=gram_keep)
         model, signed, reduction = reduced[:3]
         if retain_span:
             coefficients = reduced[3]
@@ -278,7 +279,8 @@ def solve_parent_pencil(points, q, o, d, infinity, active, *, eigh, matmul,
 
 
 @lru_cache(maxsize=None)
-def round_program(mesh_xy, native_eigh, ordered, odd_moments, keep_budget, sizes, retain_span=False):
+def round_program(mesh_xy, native_eigh, ordered, odd_moments, keep_budget, sizes, retain_span=False,
+                  gram_keep=None):
     """Pack, assemble, reduce, gate and sort a round of parents, each on its own rank.
 
     One program over batch layout: rank r packs slot r's Q, WQ, dWQ panels by
@@ -312,7 +314,7 @@ def round_program(mesh_xy, native_eigh, ordered, odd_moments, keep_budget, sizes
     def solve(points, q, o, d, infinity, active):
         return solve_parent_pencil(points, q, o, d, infinity, active,
             eigh=native_eigh, matmul=_mm, gates=gates, ordered=ordered,
-            odd_moments=odd_moments, keep_budget=keep_budget, retain_span=retain_span)
+            odd_moments=odd_moments, keep_budget=keep_budget, retain_span=retain_span, gram_keep=gram_keep)
 
     def body(live, dispatch, points, order, active, qs, os, ds, infinity):
         def pack(panels):
