@@ -263,7 +263,11 @@ canonicalized away at the static-gauge boundary.
 
 Local fields enter through the two Γ wings `Y^a_μ`, `Z^b_ν` (one velocity
 leg, one centroid leg; `gw.qsgw_head.head_wings_sharded`) and the headless
-body `W_{μν}(Γ,ω)`:
+body `W_{μν}(Γ,ω)`. On a two-component store the centroid leg is the
+spin-traced pair density `ρ_ij(μ) = Σ_s ψ̄_{i,s}(μ) ψ_{j,s}(μ)`, `v_ij` the
+spinor-traced matrix element, and `n_spinor = 2` the capacity; the body is the
+spin-traced charge operator, so the fold below is one contraction on both
+stores (`tests/test_shared_pole_head_two_component.py`):
 
 $$
 S^{\rm eff}_{ab}(\omega)=S_{ab}(\omega)+\frac1\Omega\,Y^a(\omega)\,W_{\rm body}(\Gamma,\omega)\,Z^b(\omega)

@@ -321,7 +321,10 @@ lattice the production τ kernel reproduces real-space `Σ = iGW` to 1e-10 relat
 by more than 1e-3.
 
 **Two-component decks.** `W` is spin-scalar; `G` carries the spinor axes, and the τ kernel broadcasts `W_q` over
-both (`ppm_tau_kernel` `prep_w`). The factor spin axis is 1 on every admitted deck.
+both (`ppm_tau_kernel` `prep_w`). The factor spin axis is 1 on every admitted deck. The full Gamma head
+(`gw.shared_pole_head`) is the same charge head on both stores: its wings trace the spinor index inside each
+vertex, its capacity is `2/(n_spin n_spinor)` states per band, and the fold runs on the `n_mu × n_mu` body; the
+head's capacity identity carries the store's `nspinor` because the ledger unit is `16 Q (N_spinor N_mu)² / P`.
 
 **Debug.** `LORRAX_DEBUG_SHARED_POLE_EVEN_PART` (debug only) feeds `[W₊(q) + W₊(−q)ᵀ]/2` to both branches of an
 ordered store, so `Σ^odd = Σ[W] − Σ[W^even]` can be measured; see `docs/dev/env_vars.md`.
@@ -357,6 +360,8 @@ Fast CPU tests (4 host devices where a mesh is needed):
 | `test_shared_pole_lattice_sigma.py` | ordered Σ = real-space `iGW` on a TR-broken lattice; swapped routing fails (SP 16) |
 | `test_shared_pole_bank_moment_roundtrip.py` | bank → constructor moments, `M_k = m_k/2` (SP 8) |
 | `test_shared_pole_pencil_faces.py` | pencil blocks come out `P(None,'x','y')` in both routes |
+| `test_shared_pole_head_two_component.py` | a spin-doubled two-component store reproduces the scalar `S`, `Y`/`Z`, static wings and folded `S_eff`; a global SU(2) rotation leaves them invariant |
+| `test_shared_pole_head_capacity.py` | the head door admits N_spinor 1 and 2, refuses ordered stores and the N_spinor = 4 lift by name, and refuses a store whose spin geometry differs from the map's |
 | `services/distrib_la/tests/test_eigh_keeps_operand.py` | the planned eigh does not overwrite its operand |
 | `test_slab_io_mode_required.py` | `SlabIO`/`open_file` refuse a missing `mode=` |
 

@@ -2,6 +2,18 @@
 
 Only Gamma is evaluated, one frequency at a time. The common head owner
 folds its wings and the common MPA owner fits the resulting scalar samples.
+
+The head is the charge head on scalar (N_spinor = 1) and two-component
+(N_spinor = 2) stores alike: the Coulomb kernel couples the charge density
+only, so every vertex is the spin-traced pair density
+``rho_ij(mu) = sum_s conj(psi_is(mu)) psi_js(mu)`` (traced inside
+``gw.qsgw_head.head_wings_sharded``), the velocity is the spinor-traced matrix
+element, the capacity is ``2/(n_spin n_spinor)`` states per band, and the body
+is the spin-traced charge operator on ``n_mu x n_mu`` (factor spin axis 1).
+Nothing crosses the body, so the fold ``S + Y W Z / Omega`` is one contraction
+on both stores. Certified by ``tests/test_shared_pole_head_two_component.py``
+(a spin-doubled two-component store reproduces the scalar head; a global SU(2)
+rotation leaves it invariant).
 """
 from types import SimpleNamespace
 from functools import lru_cache
@@ -57,7 +69,8 @@ def refuse_unsupported_shared_pole_head(config, *, trs_allowed, nspinor):
     the bank, moments and constructor had run and ``model.h5`` was committed,
     so a rerun in that directory then refused on the committed model (Q0HEAD
     2026-09-16).  ``trs_allowed`` is the final ``SymMaps.trs_allowed`` the
-    store's representation follows; ``nspinor`` is the WFN's.
+    store's representation follows; ``nspinor`` is the WFN's, 1 or 2 for the
+    charge representation this head evaluates.
     """
     from .gw_config import HeadCorrection
     if (config.sigma.w_model != "shared_pole"
@@ -67,7 +80,15 @@ def refuse_unsupported_shared_pole_head(config, *, trs_allowed, nspinor):
 
 
 def _refuse_head_representation(*, trs_allowed, nspinor):
-    """The one owner of what the full Gamma head evaluates: TRS-even, N_spinor = 1."""
+    """The one owner of what the full Gamma head evaluates: the TRS-even charge body.
+
+    ``nspinor`` 1 or 2 is the charge representation (module docstring): the
+    two-component store holds the same spin-traced charge operator and its
+    head vertices trace the spinor index, so both evaluate identically.  An
+    N_spinor = 4 store is the kinetic-balance bispinor lift with a photon
+    layout; its Gamma completion is the packed photon head, not this scalar
+    charge head.
+    """
     remedy = ("A one-shot deck runs with head_correction = off. A self-consistent "
               "shared-pole deck may also run headless as a brute-grid development "
               "mode (owner policy 2026-09-18); with head_correction = full this "
@@ -81,11 +102,13 @@ def _refuse_head_representation(*, trs_allowed, nspinor):
             "not the signed particle-hole model an ordered store declares, so an ordered head "
             "would be silently wrong on the dominant Sigma term. The signed Gamma head is "
             "pending. " + remedy)
-    if int(nspinor) != 1:
+    if int(nspinor) not in (1, 2):
         raise ValueError(
-            f"GATE shared_pole_head_nspinor: got N_spinor = {int(nspinor)}; want 1; why: the "
-            "full Gamma head has been run only on N_spinor = 1 stores, and the two-component "
-            "store's spin-traced charge head has no validated evaluation yet. " + remedy)
+            f"GATE shared_pole_head_nspinor: got N_spinor = {int(nspinor)}; want 1 or 2 (the "
+            "charge representation); why: this scalar charge head evaluates the spin-traced "
+            "charge body, and an N_spinor = 4 store is the bispinor lift whose Gamma "
+            "completion is the packed photon head (gw.photon_sigma), not this one. A one-shot "
+            "deck runs with head_correction = off.")
 
 
 def shared_pole_head_plan(config, recipe, *, material_class):
@@ -146,15 +169,20 @@ def build_shared_pole_head(handle, header, V_q, wfns, meta, config, *,
         # The hardware ledger can admit a scaling WARN above 3U. That
         # does not waive the individual matrix bound for the new projector.
         # Refuse before reading factors or compiling its numerical work.
-        unit = (16*int(header["n_q_full"])*int(header["n_mu_logical"])**2
-                / mesh_xy.size)
+        # The ledger's unit is U = 16 Q (N_spinor N_mu)^2 / P, so the store's
+        # (Q, N_spinor, N_mu) must reproduce it; the body matrix the
+        # projector bounds is the spin-traced n_mu x n_mu charge operator on
+        # every admitted store, hence the spin-free logical bound.
+        logical = (16*int(header["n_q_full"])*int(header["n_mu_logical"])**2
+                   / mesh_xy.size)
+        unit = int(header["nspinor"])**2 * logical
         projection_bytes = 16*meta.mu_basis.n_packed**2 // mesh_xy.size
         if ledger.U_bytes_per_rank != unit:
             raise ValueError("GATE shared_pole_head_capacity: store/current-map geometry mismatch")
-        if projection_bytes > unit:
+        if projection_bytes > logical:
             raise ValueError(
                 "GATE shared_pole_head_capacity: Gamma projection exceeds the all-P "
-                f"logical matrix bound ({projection_bytes} > {unit} bytes per rank)")
+                f"logical matrix bound ({projection_bytes} > {logical} bytes per rank)")
         iq = int(parents[0])
         realize = shared_pole_operator_realizer(meta, header,
             q_full_idx=np.asarray([0]), mesh_xy=mesh_xy)

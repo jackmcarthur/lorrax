@@ -638,11 +638,16 @@ head wings through total W. The head fit is bound to that map's body digest.
 recomputed at the current head frequencies and folded through current W. MPA
 sampling keys configure this scalar head; elementwise-body fit/reuse keys have
 no shared-pole consumer. The shifted finite-q BGW metal head remains unsupported.
-The full head evaluates only the time-reversal-even, N_spinor = 1 Gamma body:
-an ordered (time-reversal-broken) or two-component deck refuses at input
-resolution (`GATE shared_pole_head_ordered`, `GATE shared_pole_head_nspinor`,
+The full head evaluates only the time-reversal-even charge Gamma body, on
+scalar and two-component (N_spinor = 2) stores alike — the vertices trace the
+spinor index and the body is the spin-traced charge operator
+([shared-pole model §8](architecture/shared_pole_model.md#8-the-σ-consumer)).
+An ordered (time-reversal-broken) deck refuses at input resolution
+(`GATE shared_pole_head_ordered`,
 `shared_pole_head.refuse_unsupported_shared_pole_head`), before any bank or
-constructor runs. A one-shot deck on such a system uses `head_correction = off`;
+constructor runs; an N_spinor = 4 bispinor-lift store refuses by name
+(`GATE shared_pole_head_nspinor`) because its Gamma completion is the packed
+photon head. A one-shot deck on an ordered system uses `head_correction = off`;
 a self-consistent shared-pole deck may also run headless as a brute-grid
 development mode (owner policy 2026-09-18). With `head_correction = full` the
 ordered head still refuses, so head off is the only valid setting there until
