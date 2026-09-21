@@ -74,7 +74,7 @@ if TYPE_CHECKING:                                                   # pragma: no
     from wfn_loader import WfnLoader
 from common import timing
 from common.collectives import device_put_process_local, process_rank
-from common.gpu_utils import worst_process_resident_bytes
+from common.gpu_utils import minimum_process_budget_gb, worst_process_resident_bytes
 from common.pivoted_cholesky import (
     make_sharded_group_block_pivoted_cholesky_select as _make_sharded_block_select,
     make_sharded_pivoted_cholesky_select as _make_sharded_select,
@@ -1563,7 +1563,7 @@ def build_gram_q0_via_loadwfns(
             memory_per_device_gb = float(get_device_memory_gb())
         except Exception:
             memory_per_device_gb = 0.0  # falls back to the 36 GB default
-    setattr(meta, "memory_per_device_gb", float(memory_per_device_gb))
+    meta.memory_per_device_gb = minimum_process_budget_gb(memory_per_device_gb)
 
     # Prune must not retain the full-k G-flat WFN beside both final centroid
     # faces.  A one-k fixed tile is the hard memory bound; the shared
@@ -1742,7 +1742,7 @@ def build_gram_q0_via_loadwfns(
 
         def _compiled_live_set(tile_width):
             tile_width = int(tile_width)
-            scan_increment = (
+            scan_increment = worst_process_resident_bytes(
                 gram_q0_tiled_from_psi_aot_resident_increment_bytes(
                     mesh_xy=mesh_xy, nk=nk_, n_points=M_cols,
                     nb_l=nb_left, nb_r=nb_right, nspinor=ns_,

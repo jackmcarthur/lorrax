@@ -73,6 +73,21 @@ def worst_process_resident_bytes(local_bytes: int) -> int:
     return int(np.max(gathered))
 
 
+def minimum_process_budget_gb(local_gb: float) -> float:
+    """Agree the smallest device budget before choosing collective shapes.
+
+    An allocation may contain different GPU memory capacities; even a fixed
+    allocator limit is then rank-local. Every process must enter this call.
+    """
+    import numpy as np
+    from common.collectives import all_gather_processes
+
+    budgets = np.asarray(all_gather_processes(np.asarray(local_gb, dtype=np.float64)))
+    if budgets.size == 0 or not np.all(np.isfinite(budgets) & (budgets >= 0)):
+        raise ValueError("process memory budgets must be finite and nonnegative")
+    return float(np.min(budgets))
+
+
 def _query_nvidia_smi_memory(field: str) -> float | None:
     """Query this rank's visible GPU memory field, returned in GiB."""
     try:
