@@ -37,7 +37,8 @@ def read_sector_round(io, meta, bank, header, ids, endpoints, *, sample_span=Non
     The canonical photon store is mesh-interleaved; each selected family is
     converted to the existing MuBasis order before the constructor sees it.
     ``endpoints`` names C=0 or T=1 on each side. Returned TT/CT rows are
-    mu-major, Cartesian-component-minor. Parents remain at P(('x','y')).
+    mu-major, Cartesian-component-minor. Local rounds keep parents at
+    P(('x','y')); a face round keeps one parent at P(None,'x','y').
     The store selects native sector hyperslabs, never full photon panels.
     It owns all I/O,
     authentication and transport; this function only selects sector rows.
@@ -342,17 +343,19 @@ def sector_moment_cauchy(metrics, sectors, *, mesh_xy):
     from jax.sharding import NamedSharding,PartitionSpec as P
     from gw.shared_pole_local import _mm
     from gw.shared_pole_recipe import shared_real_pole_gates_ordered_v1 as gates
-    from gw.shared_pole_execution import is_face,face_program,face_matmul,face_eigh
+    from gw.shared_pole_execution import is_face
     face=is_face(metrics[0])
-    mm=face_matmul(mesh_xy) if face else _mm
-    plans=[(lambda a:face_eigh(mesh_xy,a.shape[-1]).batched(a)) if face else s['budget'].eigenplan(m.shape[-1]).native_fn
-           for s,m in zip(sectors,(metrics[0],metrics[2]))]
-    def body(c,ct,t):
-        return sector_cauchy_schwarz((c,ct,t),eigh_charge=plans[0],eigh_current=plans[1],matmul=mm,gates=gates)
     spec=P(('x','y'))
     from gw.shared_pole_execution import cauchy_program
     if face:
-        return cauchy_program(mesh_xy)(*metrics)
+        return cauchy_program(
+            mesh_xy, metrics[0].shape[-1], metrics[2].shape[-1])(*metrics)
+    mm=_mm
+    plans=[s['budget'].eigenplan(m.shape[-1]).native_fn
+           for s,m in zip(sectors,(metrics[0],metrics[2]))]
+    def body(c,ct,t):
+        return sector_cauchy_schwarz((c,ct,t),eigh_charge=plans[0],
+                                     eigh_current=plans[1],matmul=mm,gates=gates)
     program=jax.jit(shard_map(body,mesh=mesh_xy,in_specs=(spec,)*3,
                               out_specs=spec,check_vma=False))
     result=program(*metrics)
@@ -402,7 +405,9 @@ def construct_diagonal_sector_round(samples, moments, meta, config, geometry, *,
         fraction=policy.get(field+'_fraction')
         recipe[field]=None if fraction is None else math.ceil(n*fraction)
     budget=ConstructorCapacity(local_meta,linalg_resolution({'linalg':config.backend.linalg}),
-                               mesh_xy=mesh_xy,ledger=meta.shared_pole_capacity,upstream=(),execution=execution)
+                               mesh_xy=mesh_xy,ledger=meta.shared_pole_capacity,
+                               upstream=meta.shared_pole_capacity.live_stages,
+                               execution=execution)
     budget.batch_width=len(geometry['ids'])
     budget.retained_panels=tuple(retained)
     # Four photon sample fields at every fit support and four moment fields
@@ -489,7 +494,8 @@ def construct_cross_sector_round(sectors, samples, moments, meta, config, *,
     local_meta = copy.copy(meta)
     local_meta.n_rmu_padded = sum(s['model'][0].shape[-2] for s in sectors)
     budget = ConstructorCapacity(local_meta,linalg_resolution({'linalg':config.backend.linalg}),
-        mesh_xy=mesh_xy,ledger=meta.shared_pole_capacity,upstream=(),execution=execution)
+        mesh_xy=mesh_xy,ledger=meta.shared_pole_capacity,
+        upstream=meta.shared_pole_capacity.live_stages,execution=execution)
     budget.batch_width = charge['model'][0].shape[0]
     budget.retained_panels = (*retained,*ct.values(),*tc.values(),*moments.values())
     # Cross assembly still has the original rectangular pencil. The sum
@@ -536,9 +542,10 @@ def construct_cross_sector_round(sectors, samples, moments, meta, config, *,
     side=sum(s[4].shape[-1] for s in packed)
     budget.retained_panels=(*budget.retained_panels,*jax.tree.leaves((actions,packed)))
     budget.plan(max(side,original_side),phase='reduction')
+    cross_eigh=budget.eigenplan(side)
     signed,diagnostics=reduce_cross_round(*packed,tuple(actions),
         tuple(moments[f'M{i}'] for i in range(4)),mesh_xy=mesh_xy,
-        native_eigh=None if execution=="face" else budget.eigenplan(side).native_fn,gates=gates)
+        eigh_plan=cross_eigh,gates=gates)
     for name in ('gram_valid','retained_metric_positive'):
         if not bool(jnp.all(diagnostics[name][:real])):
             raise ValueError(f'GATE shared_pole_sector_{name}: sector=CT; no repair')
@@ -718,32 +725,35 @@ def cross_round_actions(samples, states, roles, recipe, *, sample_lo, mesh_xy,
     return tuple(outputs)
 
 
-def reduce_cross_round(charge, transverse, cross, moments, *, mesh_xy, native_eigh, gates):
-    """Construct CT on the two retained original-pencil spans, one parent per rank.
+def reduce_cross_round(charge, transverse, cross, moments, *, mesh_xy, eigh_plan, gates):
+    """Construct CT on the two retained original-pencil spans.
 
     Each sector tuple contains (points, order, states, infinity, Y, signed),
     where ``states`` is (Q tuple, WQ tuple), ``signed`` is (c,mu,active),
     and all operands carry the round's leading parent sharding. ``cross``
     contains the TC-on-C and CT-on-T (output, derivative) panel tuples;
     ``moments`` is M0_CT..M3_CT. No full operator leaves the admitted
-    parent-local program. Returns two signed CT endpoint factors, inverse
-    poles, active columns and the unchanged joint-metric diagnostics.
+    local rounds remain parent-local; a face round keeps one physical parent
+    over the complete mesh. ``eigh_plan`` is the already-resolved public
+    service plan matching that layout. Returns two signed CT endpoint factors,
+    inverse poles, active columns and the unchanged joint-metric diagnostics.
     """
     import jax
     from common.shard_map import shard_map
     from jax.sharding import PartitionSpec as P
     from gw.shared_pole_local import _mm
 
-    from gw.shared_pole_execution import is_face,face_program,face_matmul,face_eigh
+    from gw.shared_pole_execution import is_face
     face=is_face(charge[4])
-    mm=face_matmul(mesh_xy) if face else _mm
-    eigh=(lambda a:face_eigh(mesh_xy,a.shape[-1]).batched(a)) if face else native_eigh
-    from functools import partial
-    body=partial(_cross_reduce_equations,mm=mm,eigh=eigh,gates=gates)
     spec=P(('x','y'))
     from gw.shared_pole_execution import cross_parent_program
-    program=cross_parent_program(mesh_xy) if face else jax.jit(shard_map(body,mesh=mesh_xy,in_specs=(spec,)*4,
-                            out_specs=(spec,spec),check_vma=False))
+    if face:
+        side=charge[4].shape[-1]+transverse[4].shape[-1]
+        return cross_parent_program(mesh_xy,side)(charge,transverse,cross,moments)
+    from functools import partial
+    body=partial(_cross_reduce_equations,mm=_mm,eigh=eigh_plan.native_fn,gates=gates)
+    program=jax.jit(shard_map(body,mesh=mesh_xy,in_specs=(spec,)*4,
+                              out_specs=(spec,spec),check_vma=False))
     return program(charge,transverse,cross,moments)
 
 

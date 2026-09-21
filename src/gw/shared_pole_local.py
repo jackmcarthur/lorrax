@@ -405,8 +405,8 @@ def _mm(a, b, *, transa='N', transb='N'):
 
 
 def check_round(model, signed, inverse_coulomb_sqrt, held, moments, infinity_directions, *, real, nodes, eta_ry,
-                mesh_xy, native_eigh, ordered):
-    """Run ``round_checks`` on one round: host arguments placed, replicated host results out."""
+                mesh_xy, eigh_plan, ordered):
+    """Run ``round_checks`` through the plan matching the arrays' layout."""
     import jax
     import numpy as np
     from jax.sharding import NamedSharding, PartitionSpec as P
@@ -416,14 +416,17 @@ def check_round(model, signed, inverse_coulomb_sqrt, held, moments, infinity_dir
         if real != 1:
             raise ValueError('whole-mesh shared-pole checks require one physical parent')
         from gw.shared_pole_execution import face_round_check_program
-        out = face_round_check_program(mesh_xy, bool(ordered))(
+        out = face_round_check_program(mesh_xy, bool(ordered), model[0].shape[-2])(
             model, signed, inverse_coulomb_sqrt, *held,
             np.asarray(nodes, np.complex128), np.float64(eta_ry),
             *moments, infinity_directions)
         return jax.tree.map(np.asarray, out)
 
     replicated = NamedSharding(mesh_xy, P())
-    program = round_checks(mesh_xy, native_eigh, bool(ordered))
+    # Batch-layout equations run inside shard_map and therefore require the
+    # plan's public trace-safe native callable. Face arrays were dispatched
+    # above and use the plan's eager ``batched`` surface in their own program.
+    program = round_checks(mesh_xy, eigh_plan.native_fn, bool(ordered))
     live = _batch_put(mesh_xy, np.arange(int(model[0].shape[0])) < int(real))
     out = program(live, model, signed, inverse_coulomb_sqrt, *held,
                   jax.device_put(np.asarray(nodes, np.complex128), replicated),
