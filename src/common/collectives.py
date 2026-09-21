@@ -1533,3 +1533,88 @@ def rank0_transaction(path, *, stage, write, validate=None, return_value=False):
         except BaseException as exc:
             error = exc
     agree_io_error(error, path=path, stage=stage)
+    if return_value:
+        import json
+        import numpy as np
+
+        data = np.zeros(4096, dtype=np.uint8)
+        value_error = None
+        if process_rank() == 0:
+            try:
+                encoded = json.dumps(
+                    value, ensure_ascii=True, allow_nan=False).encode('ascii')
+                if len(encoded) > data.size:
+                    raise ValueError(
+                        'rank0_transaction control value exceeds 4096 bytes')
+                data[:len(encoded)] = np.frombuffer(encoded, dtype=np.uint8)
+            except BaseException as exc:
+                value_error = exc
+        agree_io_error(value_error, path=path,
+                       stage=f'{stage}/return_value')
+        returned = _reduce_io_control(
+            data, path=path, stage=f'{stage}/return_value_payload',
+            reduce=lambda records: records[0])
+        return json.loads(bytes(returned).rstrip(b'\0'))
+
+
+def rank0_atomic_file_transaction(
+        path, *, stage, write, validate_file, validate=None):
+    """Publish one rank-0 file only after its closed staging file validates.
+
+    ``write(staging_path)`` and ``validate_file(staging_path)`` run on rank 0
+    inside :func:`rank0_transaction`.  The staging file is created in the
+    destination directory, so ``os.replace`` is one-filesystem atomic.  A
+    write or validation failure removes only the staging file and leaves any
+    previous destination untouched.  ``validate`` retains the all-rank
+    preflight meaning of :func:`rank0_transaction`.
+
+    The writer must close its file before returning.  The validator must
+    reopen that path through the format owner's reader and return normally
+    only for a complete artifact.
+    """
+    import os
+    import secrets
+
+    destination = os.fspath(path)
+    directory = os.path.dirname(os.path.abspath(destination))
+    basename = os.path.basename(destination)
+
+    def _publish():
+        temporary = None
+        try:
+            # O_EXCL gives the writer a private sibling path while 0666
+            # follows the process umask, like a direct h5py ``"w"`` open.
+            # tempfile.mkstemp hard-codes 0600, which would silently change
+            # the established group-accessible artifact mode (0660 under the
+            # production 0007 umask).  The file remains present: both final
+            # artifact writers truncate an existing path and therefore retain
+            # exclusive ownership.
+            for _ in range(16):
+                candidate = os.path.join(
+                    directory,
+                    f".{basename}.{os.getpid()}.{secrets.token_hex(8)}.tmp")
+                try:
+                    fd = os.open(
+                        candidate, os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                        0o666)
+                except FileExistsError:
+                    continue
+                os.close(fd)
+                temporary = candidate
+                break
+            if temporary is None:
+                raise FileExistsError(
+                    f"could not reserve a private staging path for {destination}")
+            write(temporary)
+            validate_file(temporary)
+            os.replace(temporary, destination)
+            temporary = None
+        finally:
+            if temporary is not None:
+                try:
+                    os.unlink(temporary)
+                except FileNotFoundError:
+                    pass
+
+    rank0_transaction(
+        destination, stage=stage, write=_publish, validate=validate)

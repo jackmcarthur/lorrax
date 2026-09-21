@@ -5,19 +5,19 @@ def main():
     import json
     import os
     from pathlib import Path
-    import numpy as np
     from runtime import initialize_communicator_stack, finalize_process
     parser=argparse.ArgumentParser()
     parser.add_argument('--output',type=Path,required=True)
     args=parser.parse_args()
     initialize_communicator_stack()
+    import numpy as np
     import jax
     from common.collectives import resolve_mesh
     from shared_pole_sector_constructor_p4 import check_sector_constructor
     mesh=resolve_mesh()
     assert mesh.size in (4,16)
     rows=[];values=[]
-    for mode in ('local','distributed'):
+    for mode in ('distributed','local'):
         receipt,observables=check_sector_constructor(mesh,args.output.parent,
             linalg=mode,parents=5,return_observables=True)
         rows.append(receipt);values.append(observables)
