@@ -111,6 +111,8 @@ class CapacityTests(unittest.TestCase):
         self.assertIn('resident lower bound', receipt['reason'])
         self.assertEqual(receipt['local_reduction']['device_budget_status'],
                          'FAIL')
+        self.assertEqual(receipt['local_reduction']['aggregate_bytes_per_rank'],
+                         155288711168)
         self.assertEqual(receipt['local_reduction']['native_workspace_query'],
                          'NOT_NEEDED_FOR_RESIDENT_LOWER_BOUND')
         self.assertEqual(ledger.entries, [])
