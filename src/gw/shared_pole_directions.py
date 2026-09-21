@@ -301,14 +301,18 @@ def _round_partner_directions(q, output, cutoff, *, real, kernels, eigh_plan, co
     m = int(perp.shape[-1])
     _, largest = distrib_la.leading_eigenvectors(top, 1, eigh_plan=eigh_plan, column_extent=column_extent,
                                                  multiplet_tol=tol, real_rows=real)
-    _, spectrum = distrib_la.leading_eigenvectors(perp, m, eigh_plan=eigh_plan, column_extent=column_extent,
-                                                  multiplet_tol=tol, real_rows=real)
+    directions, spectrum = distrib_la.leading_eigenvectors(
+        perp, m, eigh_plan=eigh_plan, column_extent=column_extent,
+        multiplet_tol=tol, real_rows=real)
     counts = tuple(int(np.sum(np.asarray(values) > float(cutoff) ** 2 * float(np.asarray(t)[0])))
                    if i < real else 0 for i, (values, t) in enumerate(zip(spectrum, largest)))
+
     if max(counts) == 0:
         return None, None
-    directions, kept = distrib_la.leading_eigenvectors(perp, counts, eigh_plan=eigh_plan, column_extent=column_extent,
-                                                       multiplet_tol=tol, real_rows=real)
+    directions, kept = distrib_la.retain_eigenvectors(
+        directions, spectrum, counts, mesh=eigh_plan.mesh,
+        column_extent=column_extent, multiplet_tol=tol,
+        real_rows=real, order="descending")
     return directions, tuple(int(np.asarray(v).size) for v in kept)
 
 

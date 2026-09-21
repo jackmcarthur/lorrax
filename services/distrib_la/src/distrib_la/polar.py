@@ -22,7 +22,8 @@ from distrib_la.plan import Plan, plan, ROUTE_BATCH_RESHARD
 from distrib_la.resolve import mesh_key
 
 __all__ = ["PolarPlan", "plan_polar_factor", "polar_factor",
-           "right_singular_vectors", "leading_eigenvectors"]
+           "right_singular_vectors", "leading_eigenvectors",
+           "retain_eigenvectors"]
 
 
 _SUPPORTED_DTYPES = (jnp.dtype(jnp.float64), jnp.dtype(jnp.complex128))
@@ -96,6 +97,22 @@ def _direction_input(W, eig, dilation=False):
                      "P(('x','y'),None,...)")
 
 
+def _vector_layout(Q, mesh):
+    """Validate retained-vector storage; return its face or batch layout."""
+    if isinstance(Q, jax.core.Tracer):
+        raise ValueError("spectral direction selection is an eager construction stage")
+    if Q.ndim not in (2, 3):
+        raise ValueError("retain_eigenvectors requires a rank-2 matrix or rank-3 stack")
+    _validate_dtype(Q.dtype)
+    if Q.sharding.is_equivalent_to(NamedSharding(mesh, _layout_spec('face', Q.ndim)), Q.ndim):
+        return 'face'
+    if Q.ndim == 3 and Q.sharding.is_equivalent_to(
+            NamedSharding(mesh, _layout_spec('batch', Q.ndim)), Q.ndim):
+        return 'batch'
+    raise ValueError("retain_eigenvectors requires vectors face-tiled over x/y or in batch layout "
+                     "P(('x','y'),None,None)")
+
+
 @lru_cache(maxsize=32)
 def _leading_axes_kernel(mesh, leading, layout='face'):
     """Reshape the leading batch axes of a stack; each rank keeps its own tile or rows.
@@ -141,13 +158,14 @@ def _real_row_counts(values, cut, real_rows):
 
 
 @lru_cache(maxsize=128)
-def _retained_column_kernel(mesh, batched, extent, layout='face'):
+def _retained_column_kernel(mesh, batched, extent, layout='face', reverse=True):
     """Select padded columns; current per-row counts are runtime mask inputs."""
     tile = NamedSharding(mesh, _layout_spec(layout, 3) if batched else P('x', 'y'))
     @jax.jit(out_shardings=tile)
     def select(q, count):
         width = min(extent, q.shape[-1])
-        selected = q[..., ::-1][..., :width]
+        ordered = q[..., ::-1] if reverse else q
+        selected = ordered[..., :width]
         selected = jnp.pad(selected, ((0, 0),) * (q.ndim - 1)
                            + ((0, extent - width),))
         active = jnp.arange(extent) < count[..., None]
@@ -155,17 +173,80 @@ def _retained_column_kernel(mesh, batched, extent, layout='face'):
     return select
 
 
-def _retained_columns(Q, values, count, *, mesh, column_extent, layout='face'):
+def _retained_columns(Q, values, count, *, mesh, column_extent, layout='face', reverse=True):
     """Select per-row physical columns; return their unpadded spectra."""
     largest = max(count) if isinstance(count, tuple) else count
     extent = operator.index(column_extent(largest))
     if extent < largest or extent < 1 or extent % int(mesh.shape['y']):
         raise ValueError("column_extent must cover the rank and tile mesh y")
-    select = _retained_column_kernel(mesh, isinstance(count, tuple), extent, layout)
+    select = _retained_column_kernel(mesh, isinstance(count, tuple), extent, layout, reverse)
     retained = (tuple(row[:n] for row, n in zip(values, count))
                 if isinstance(count, tuple) else values[:count])
     counts = jax.device_put(np.asarray(count, dtype=np.int64), NamedSharding(mesh, P()))
     return select(Q, counts), jax.device_put(retained, NamedSharding(mesh, P()))
+
+
+def retain_eigenvectors(vectors, eigenvalues, widths, *, mesh, column_extent,
+                        multiplet_tol=1e-6, real_rows=None, order="ascending"):
+    """Retain leading columns from an existing Hermitian eigensystem.
+
+    ``vectors`` is a face-tiled matrix ``[m,c]`` or independent face/batch
+    stack ``[b,m,c]``. ``eigenvalues`` has the corresponding physical columns
+    in ``order``; a previously returned padded leading basis therefore uses
+    ``order="descending"``. ``widths`` is one requested physical width or one
+    width per batch row. The boundary multiplet, caller-owned padded extent,
+    exact zero tails, synthetic ``real_rows`` and descending returned values
+    have the same contract as :func:`leading_eigenvectors`.
+    """
+    layout = _vector_layout(vectors, mesh)
+    if order not in ("ascending", "descending"):
+        raise ValueError("order must be 'ascending' or 'descending'")
+    if real_rows is not None and layout != 'batch':
+        raise ValueError("real_rows applies to a batch-layout stack only")
+
+    if vectors.ndim == 2:
+        values = np.asarray(eigenvalues)
+        if values.ndim != 1 or not 1 <= values.size <= vectors.shape[-1]:
+            raise ValueError("one eigensystem needs one nonempty eigenvalue row matching its columns")
+        width = operator.index(widths)
+        if not 1 <= width <= values.size:
+            raise ValueError("widths must lie in [1,m]")
+        values = values[::-1].copy() if order == "ascending" else values.copy()
+        if not np.all(np.isfinite(values)):
+            raise ValueError("retain_eigenvectors requires a finite eigenvalue spectrum")
+        count = _close_spectral_cut(values, width, multiplet_tol)
+    else:
+        if isinstance(eigenvalues, (tuple, list)):
+            rows = tuple(np.asarray(row) for row in eigenvalues)
+        else:
+            array = np.asarray(eigenvalues)
+            if array.ndim != 2:
+                raise ValueError("a vector stack needs one eigenvalue row per matrix")
+            rows = tuple(array)
+        if len(rows) != vectors.shape[0] or any(row.ndim != 1 for row in rows):
+            raise ValueError("a vector stack needs one eigenvalue row per matrix")
+        values = tuple(row[::-1].copy() if order == "ascending" else row.copy()
+                       for row in rows)
+        if any(row.size > vectors.shape[-1] or not np.all(np.isfinite(row)) for row in values):
+            raise ValueError("retain_eigenvectors requires finite eigenvalue rows matching vector columns")
+        if isinstance(widths, (tuple, list, np.ndarray)):
+            requested = tuple(operator.index(v) for v in np.asarray(widths).reshape(-1))
+            if len(requested) != len(values):
+                raise ValueError("per-row widths need one entry per eigensystem")
+        else:
+            requested = (operator.index(widths),) * len(values)
+        real = len(values) if real_rows is None else operator.index(real_rows)
+        if not 0 <= real <= len(values):
+            raise ValueError("real_rows must lie within the vector stack")
+        if (not all(0 <= width <= len(row) for width, row in zip(requested, values))
+                or max(requested, default=0) < 1):
+            raise ValueError("per-row widths need values in [0,m], at least one positive")
+        count = tuple(_close_spectral_cut(row, width, multiplet_tol)
+                      if width and i < real else 0
+                      for i, (row, width) in enumerate(zip(values, requested)))
+    return _retained_columns(
+        vectors, values, count, mesh=mesh, column_extent=column_extent,
+        layout=layout, reverse=(order == "ascending"))
 
 
 @lru_cache(maxsize=16)
@@ -323,18 +404,12 @@ def leading_eigenvectors(W, r, *, eigh_plan, column_extent,
             s, q = s[0], q[0]
         else:
             s, q = eigh_plan.batched(W)
-    values = np.asarray(s)[..., ::-1].copy()
-    if not np.all(np.isfinite(values)):
+    if not np.all(np.isfinite(np.asarray(s))):
         raise ValueError("leading_eigenvectors requires finite Hermitian W and a finite eigenvalue spectrum")
-    if isinstance(r, tuple):
-        count = tuple(_close_spectral_cut(row, width, multiplet_tol)
-                      if width and (real_rows is None or i < real_rows) else 0
-                      for i, (row, width) in enumerate(zip(values, r)))
-    else:
-        count = (_close_spectral_cut(values, r, multiplet_tol) if values.ndim == 1
-                 else _real_row_counts(values, lambda row: _close_spectral_cut(row, r, multiplet_tol), real_rows))
-    return _retained_columns(q, values, count, mesh=eigh_plan.mesh,
-                             column_extent=column_extent, layout=layout)
+    return retain_eigenvectors(
+        q, s, r, mesh=eigh_plan.mesh, column_extent=column_extent,
+        multiplet_tol=multiplet_tol, real_rows=real_rows,
+        order="ascending")
 
 
 def _as_extent(n) -> int:

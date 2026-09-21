@@ -136,8 +136,9 @@ from distrib_la.plan import (
     ensure_sharding,
     plan,
 )
-from distrib_la.polar import (PolarPlan, plan_polar_factor, polar_factor,
-                             right_singular_vectors, leading_eigenvectors)
+from distrib_la.polar import (PolarPlan, leading_eigenvectors,
+                             plan_polar_factor, polar_factor,
+                             retain_eigenvectors, right_singular_vectors)
 from distrib_la.resolve import (
     BACKEND_CHOICES,
     CHOLESKY_BACKENDS,
@@ -165,7 +166,7 @@ __all__ = [
     "workspace_bytes_per_rank", "matmul_workspace_bytes_per_rank", "fits_local",
     # polar / SVD
     "PolarPlan", "plan_polar_factor", "polar_factor",
-    "right_singular_vectors", "leading_eigenvectors",
+    "right_singular_vectors", "leading_eigenvectors", "retain_eigenvectors",
     # distributed matrix multiplication
     "matmul", "resolve_matmul_backend", "MATMUL_BACKEND_CHOICES", "contract_faces",
     # planned N,N GEMM (trace-safe, for hot loops)

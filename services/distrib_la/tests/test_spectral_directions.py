@@ -138,6 +138,53 @@ def test_leading_axes_select_like_the_flattened_batch():
                 assert float(jnp.max(jnp.abs(q4[i, j, :, counts[i][j]:]))) == 0 if counts[i][j] < q4.shape[-1] else True
 
 
+def test_retain_eigenvectors_reuses_a_descending_padded_basis():
+    """Raw and already-returned eigensystems share closure, padding and masks."""
+    import jax
+    import jax.numpy as jnp
+    from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+    from lxkit.testing import require_devices
+    import distrib_la as D
+
+    require_devices(4, 'cpu')
+    mesh = Mesh(np.asarray(jax.devices('cpu')[:4]).reshape(2, 2), ('x', 'y'))
+    rng = np.random.default_rng(1912)
+    n = 8
+    descending = np.array([
+        [9, 5, 5 * (1 - 4e-7), 2, 1, .5, .2, .1],
+        [8, 4, 3, 2, 1, .5, .2, .1],
+        [7, 6, 5, 4, 3, 2, 1, .5],
+        [6, 5, 4, 3, 2, 1, .5, .2],
+    ], dtype=np.float64)
+    leading = np.stack([
+        np.linalg.qr(rng.normal(size=(n, n)) + 1j * rng.normal(size=(n, n)))[0]
+        for _ in range(4)])
+    raw_vectors = leading[..., ::-1]
+    batch = NamedSharding(mesh, P(('x', 'y'), None, None))
+    put = lambda a: jax.make_array_from_callback(a.shape, batch, lambda index: a[index])
+    extent = lambda width: 2 * ((width + 1) // 2)
+
+    full_q, full_values = D.retain_eigenvectors(
+        put(raw_vectors), descending[:, ::-1], (n, n, n, 0),
+        mesh=mesh, column_extent=extent, real_rows=3, order='ascending')
+    direct_q, direct_values = D.retain_eigenvectors(
+        put(raw_vectors), descending[:, ::-1], (2, 1, 4, 0),
+        mesh=mesh, column_extent=extent, real_rows=3, order='ascending')
+    reused_q, reused_values = D.retain_eigenvectors(
+        full_q, full_values, (2, 1, 4, 0), mesh=mesh,
+        column_extent=extent, real_rows=3, order='descending')
+
+    assert direct_q.sharding.is_equivalent_to(batch, 3)
+    np.testing.assert_array_equal(np.asarray(reused_q), np.asarray(direct_q))
+    assert [np.asarray(v).size for v in reused_values] == [3, 1, 4, 0]
+    assert all(np.array_equal(np.asarray(a), np.asarray(b))
+               for a, b in zip(reused_values, direct_values))
+    assert direct_q.shape[-1] == 4
+    assert float(jnp.max(jnp.abs(direct_q[0, :, 3:]))) == 0
+    assert float(jnp.max(jnp.abs(direct_q[1, :, 1:]))) == 0
+    assert float(jnp.max(jnp.abs(direct_q[3]))) == 0
+
+
 def check_directions_and_gemm(mesh):
     import jax
     import jax.numpy as jnp
