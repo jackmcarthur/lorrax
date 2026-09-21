@@ -180,7 +180,9 @@ class ConstructorCapacity:
             extent=max(n,*extents)
             import distrib_la
             shapes=((1,extent,extent),(1,extent,extent))
-            key=('matmul',shapes)
+            # Receipts use the public workspace operation name, matching
+            # the capacity maximum and the distrib_la service vocabulary.
+            key=('gemm',shapes)
             if key not in self.native_queries:
                 self.native_queries[key]=distrib_la.matmul_workspace_bytes_per_rank(
                     self._mesh_xy,shapes,np.complex128,backend='distributed',batched_route='auto')
