@@ -1,5 +1,6 @@
 """Scalar plan-time capacity checks; no device, HDF5 or dense allocations."""
 import unittest
+from unittest.mock import patch
 from types import SimpleNamespace as NS
 
 from gw.shared_pole_recipe import CapacityLedger, construction_receipt
@@ -58,6 +59,63 @@ class CapacityTests(unittest.TestCase):
         self.assertEqual(row['status'],'FAIL')
         self.assertEqual(row['aggregate_bytes_per_rank'],769)
         self.assertEqual(row['max_mesh_ranks_at_fixed_bytes'],3)
+        self.assertNotIn('want Px*Py', row['reason'])
+
+    def test_preview_does_not_record_a_failed_route_quote(self):
+        ledger=self.ledger()
+        row=ledger.preview(resident_bytes_per_rank=769,
+                           workspace_bytes_per_rank=0)
+        self.assertEqual(row['device_budget_status'],'FAIL')
+        self.assertEqual(ledger.entries,[])
+
+    def test_ordered_production_side_bound_covers_all_role_multiplicities(self):
+        import numpy as np
+        from gw.shared_pole_execution import constructor_side_upper_bound
+        from gw.shared_pole_recipe import ROLE_CODES
+        recipe=dict(
+            role=np.asarray([ROLE_CODES['line']]*14+
+                            [ROLE_CODES['imaginary']]*4+
+                            [ROLE_CODES['held_line']]*4),
+            held=np.asarray([False]*18+[True]*4),
+            line_direction_cap=198,imaginary_width=791,infinity_width=396)
+        self.assertEqual(constructor_side_upper_bound(
+            recipe,ordered=True,odd_moments=True,logical_n=3164),24536)
+
+    def test_oversized_local_route_refuses_before_native_workspace_query(self):
+        import numpy as np
+        from gw.shared_pole_capacity import ConstructorCapacity
+        from gw.shared_pole_execution import constructor_execution
+        from gw.shared_pole_recipe import ROLE_CODES
+
+        mesh = NS(shape={'x': 4, 'y': 4}, size=16)
+        meta = NS(nk_tot=64, nspinor=2, n_rmu=3164, n_rmu_padded=3168)
+        ledger = CapacityLedger(meta, mesh_xy=mesh,
+                                device_budget_bytes=27 * 2**30)
+        recipe = dict(
+            role=np.asarray([ROLE_CODES['line']] * 14
+                            + [ROLE_CODES['imaginary']] * 4
+                            + [ROLE_CODES['held_line']] * 4),
+            held=np.asarray([False] * 18 + [True] * 4),
+            fit_ids=np.arange(18, dtype=np.int64),
+            line_direction_cap=198, imaginary_width=791,
+            infinity_width=396, pole_budget=5696)
+        with patch.object(ConstructorCapacity, 'query_workspace',
+                          side_effect=AssertionError('native query must be skipped')):
+            execution, receipt = constructor_execution(
+                meta, NS(layout='local'), recipe, mesh=mesh, ledger=ledger,
+                upstream=(), ordered=True, odd_moments=True,
+                sample_fields=4, moment_fields=4, parent_count=13,
+                column_extent=lambda width: 4 * ((width + 3) // 4))
+        self.assertEqual(execution, 'face')
+        self.assertEqual(receipt['conservative_pencil_side'], 24664)
+        self.assertIn('resident lower bound', receipt['reason'])
+        self.assertEqual(receipt['local_reduction']['device_budget_status'],
+                         'FAIL')
+        self.assertEqual(receipt['local_reduction']['aggregate_bytes_per_rank'],
+                         155288711168)
+        self.assertEqual(receipt['local_reduction']['native_workspace_query'],
+                         'NOT_NEEDED_FOR_RESIDENT_LOWER_BOUND')
+        self.assertEqual(ledger.entries, [])
 
     def test_sequential_not_accumulated(self):
         ledger=self.ledger()

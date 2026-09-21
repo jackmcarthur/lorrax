@@ -106,7 +106,8 @@ class ConstructorCapacity:
         the parent batch the next price is for.
     """
 
-    def __init__(self, meta, resolution, *, mesh_xy, ledger, upstream):
+    def __init__(self, meta, resolution, *, mesh_xy, ledger, upstream, execution="local"):
+        self.execution = execution
         self._meta = meta
         self._resolution = resolution
         self._mesh_xy = mesh_xy
@@ -123,22 +124,23 @@ class ConstructorCapacity:
         self.batch_width = 1
 
     def eigenplan(self, side):
-        """The rank-local eigh plan for one side, built once per side.
-
-        Every eigensolve of the construction runs on whole parents in batch
-        layout, one per rank, whatever the deck's linalg dial resolves.
-        """
+        """One service plan per configured execution layout and actual side."""
         import distrib_la
 
-        if side not in self._plans:
-            self._plans[side] = distrib_la.plan("eigh", self._mesh_xy, n=side, backend="off",
-                                                batched_route="batch_reshard")
-        return self._plans[side]
+        key = self.execution, side
+        if key not in self._plans:
+            self._plans[key] = distrib_la.plan("eigh", self._mesh_xy, n=side,
+                backend="distributed" if self.execution == "face" else "off",
+                batched_route="auto" if self.execution == "face" else "batch_reshard")
+        return self._plans[key]
 
     def query_workspace(self, op, shapes, plan):
         """Native workspace bytes per rank for one op at one shape, cached."""
         import distrib_la
 
+        # Receipt schema owns a stable ``(op, shapes)`` key. Execution is
+        # recorded on every capacity row and one ConstructorCapacity never
+        # mixes layouts, so it does not belong in this map key.
         key = (op, shapes)
         if key not in self.native_queries:
             self.native_queries[key] = distrib_la.workspace_bytes_per_rank(plan, op, shapes, np.complex128)
@@ -156,18 +158,58 @@ class ConstructorCapacity:
         if side is None:
             side = self._side
         self._side = side
+        price, native = self.quote(side, phase=self._phase,
+                                   sample_batch=sample_batch,
+                                   selection_faces=selection_faces)
+        self._workspace = sum(native.values())
+        row = self._reserve("constructor.plan", price["resident_bytes_per_rank"])
+        row['execution'] = self.execution
+        return dict(row, price=price, native_workspace=dict(native))
+
+    def quote(self, side, *, phase, sample_batch=1, selection_faces=None):
+        """Return an unrecorded phase price for route selection/preflight."""
+        side = int(side)
         n = self._n
-        extents = {n, 2*n} if self._phase == "selection" else (
-            {side} if self._phase == "reduction" else {n})
+        price = self.resident_quote(
+            side, phase=phase, sample_batch=sample_batch,
+            selection_faces=selection_faces)
+        extents = {n, 2*n} if phase == "selection" else (
+            {side} if phase == "reduction" else {n})
         # Eigh scratch is transient: replace it at each phase boundary.
         self._native_maxima["eigh"] = max(self.query_workspace(
             "eigh", ((self.batch_width, extent, extent),), self.eigenplan(extent))
             for extent in sorted(extents))
+        if self.execution == 'face':
+            extent=max(n,*extents)
+            import distrib_la
+            shapes=((self.batch_width,extent,extent),(self.batch_width,extent,extent))
+            # Receipts use the public workspace operation name, matching
+            # the capacity maximum and the distrib_la service vocabulary.
+            key=('gemm',shapes)
+            if key not in self.native_queries:
+                self.native_queries[key]=distrib_la.matmul_workspace_bytes_per_rank(
+                    self._mesh_xy,shapes,np.complex128,backend='distributed',batched_route='auto')
+            self._native_maxima['gemm']=self.native_queries[key]
         self._workspace = sum(self._native_maxima.values())
+
+        return price, dict(self._native_maxima)
+
+    def resident_quote(self, side, *, phase, sample_batch=1,
+                       selection_faces=None):
+        """Price the live arrays without invoking a native workspace query.
+
+        This is an optimistic admission bound. Route selection uses it first
+        because a local provider need not support an extent whose resident
+        arrays already exceed the device budget; any native workspace can only
+        make that route larger.
+        """
+        side = int(side)
+        from types import SimpleNamespace
+        pricing_resolution = SimpleNamespace(layout="distributed" if self.execution == "face" else "local")
         price = shared_pole_byte_terms(
-            self._meta, mesh_xy=self._mesh_xy, resolution=self._resolution,
+            self._meta, mesh_xy=self._mesh_xy, resolution=pricing_resolution,
             pencil_side=side, parent_batch=self.batch_width,
-            sample_batch=sample_batch, phase=self._phase,
+            sample_batch=sample_batch, phase=phase,
             selection_faces=selection_faces)
         # Other parents' narrow inputs survive selection and each model's
         # checks; they are additional live storage, never hidden in a limit.
@@ -175,8 +217,16 @@ class ConstructorCapacity:
                     for a in {id(a): a for a in self.retained_panels}.values())
         price["terms_bytes_per_rank"]["retained_parent_panels"] = extra
         price["resident_bytes_per_rank"] += extra
-        row = self._reserve("constructor.plan", price["resident_bytes_per_rank"])
-        return dict(row, price=price, native_workspace=dict(self._native_maxima))
+        return price
+
+    def preview(self, side, *, phase, sample_batch=1, selection_faces=None):
+        """Preview device admission without appending a ledger row."""
+        price, native = self.quote(side, phase=phase, sample_batch=sample_batch,
+                                   selection_faces=selection_faces)
+        return self._ledger.preview(
+            resident_bytes_per_rank=price['resident_bytes_per_rank'],
+            workspace_bytes_per_rank=sum(native.values()),
+            concurrent_with=self._upstream)
 
     def live(self, arrays):
         """Bind the ledger's ambient lifetimes to exactly these live arrays."""

@@ -30,6 +30,41 @@ def _json(value):
     return json.dumps(value, default=encode, sort_keys=True, allow_nan=False)
 
 
+def _authenticated_constructor_resume(root, identity, recipe):
+    """Authenticate a complete scalar producer bank before preserving it.
+
+    This is deliberately narrower than restart: it resumes only the missing
+    constructor after both producer receipts and the store validator bind the
+    exact current map identity, resolved recipe, response convention and final
+    commit. Any other partial directory follows the existing remove-and-rebuild
+    path.
+    """
+    from file_io.shared_pole_store import validate_shared_pole_bank
+
+    receipt_paths = (root / 'bank_receipt.json', root / 'moments_receipt.json')
+    bank_path = root / 'bank.h5'
+    coulomb_path = root / 'coulomb.h5'
+    if not all(path.is_file() for path in (*receipt_paths, bank_path, coulomb_path)):
+        return False
+    bank_receipt, moments_receipt = (
+        json.loads(path.read_text()) for path in receipt_paths)
+    if (bank_receipt.get('identity') != identity
+            or moments_receipt.get('identity') != identity
+            or bank_receipt.get('completion') is not True
+            or moments_receipt.get('completion') is not True
+            or moments_receipt.get('bank_complete') is not True):
+        return False
+    if bank_receipt.get('coulomb_identity') != moments_receipt.get('coulomb_identity'):
+        return False
+    try:
+        validate_shared_pole_bank(
+            bank_path, expected_identity=identity, mesh_xy=None,
+            require_complete=True, expected_recipe=recipe)
+    except (KeyError, OSError, TypeError, ValueError):
+        return False
+    return True
+
+
 def shared_pole_identity(wfns, meta, *, label, wfn, binding, centroid_indices):
     """Bind logical current energies/occupations and their wavefunction source.
 
@@ -208,18 +243,29 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
             if complete:
                 print_fn(f"shared-pole output: complete model retained at {model}; refusing rebuild")
                 raise ValueError(f"GATE shared_pole_output: complete model {model}; use its compatible restart member or a fresh run directory")
+            if not photon and _authenticated_constructor_resume(root, identity, recipe):
+                print_fn(f"shared-pole output: authenticated complete bank retained at {root}; resuming constructor")
+                return True
             if root.exists():
                 print_fn(f"shared-pole output: removing partial directory {root} and rebuilding")
                 shutil.rmtree(root)
             else:
                 print_fn(f"shared-pole output: creating new directory {root}")
             root.mkdir(parents=True)
+            return False
 
-        rank0_transaction(root, stage="shared_pole.prepare_output", write=prepare_output)
+        resume_constructor = rank0_transaction(
+            root, stage="shared_pole.prepare_output", write=prepare_output,
+            return_value=True)
         tables = _shared_pole_tables(meta, sym, centroid_indices)
     with timing.fenced_section("spole.coulomb_staging"):
-        coulomb = (None if photon else
-                   _coulomb_resource(V_q, meta, sym, mesh_xy, root / "coulomb.h5"))
+        if resume_constructor:
+            saved_bank_receipt = json.loads((root / 'bank_receipt.json').read_text())
+            coulomb = dict(saved_bank_receipt['coulomb_identity'],
+                           path=str(root / 'coulomb.h5'))
+        else:
+            coulomb = (None if photon else
+                       _coulomb_resource(V_q, meta, sym, mesh_xy, root / "coulomb.h5"))
     with timing.fenced_section("spole.bank_setup"):
         bank = dict(path=str(root / "bank.h5"), identity=identity,
                     tables=tables, coulomb=coulomb)
@@ -229,10 +275,17 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
                         bispinor_v_q_path=bispinor_v_q_path,
                         sector_tables=(tables, _shared_pole_tables(
                             meta, sym, mu_bases[1].canonical_indices)))
-        initialize_shared_pole_bank(bank["path"], meta=meta, tables=tables,
-            recipe=recipe, identity=identity, mesh_xy=mesh_xy,
-            **(dict(photon_layout=photon_layout, mu_bases=mu_bases) if photon else {}))
+        if not resume_constructor:
+            initialize_shared_pole_bank(bank["path"], meta=meta, tables=tables,
+                recipe=recipe, identity=identity, mesh_xy=mesh_xy,
+                **(dict(photon_layout=photon_layout, mu_bases=mu_bases) if photon else {}))
         receipts = dict(identity=identity)
+        if resume_constructor:
+            receipts.update(
+                bank=json.loads((root / 'bank_receipt.json').read_text()),
+                moments=json.loads((root / 'moments_receipt.json').read_text()),
+                constructor_resume=dict(status='AUTHENTICATED_COMPLETE_BANK',
+                                        source=str(root / 'bank.h5')))
         def record(stage, receipt):
             # EVERY RANK LEAVES THIS CALL THE SAME WAY.  A bare
             # ``process_index() == 0`` write raises on rank 0 alone (quota,
@@ -248,7 +301,9 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
             print_fn(f"shared-pole {stage}: completion={receipt.get('completion', receipt.get('status'))}; "
                      f"seconds={receipt.get('seconds', {})}")
     with timing.fenced_section("spole.bank"):
-        if photon:
+        if resume_constructor:
+            print_fn('shared-pole bank: authenticated complete producer artifact reused')
+        elif photon:
             from .response_bank import compute_photon_bank
             record("bank", compute_photon_bank(wfns, wfns_transverse, meta, config,
                 mesh_xy=mesh_xy, sym=sym, mu_bases=mu_bases, layout=photon_layout,
@@ -256,7 +311,7 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
         else:
             record("bank", produce_w_bank(wfns, meta, config, mesh_xy=mesh_xy,
                 sym=sym, sample_plan=recipe, bank_io=bank))
-    if not photon:
+    if not photon and not resume_constructor:
         with timing.fenced_section("spole.moments"):
             record("moments", compute_response_moments(wfns, meta, config,
                 mesh_xy=mesh_xy, sym=sym, bank_io=bank))

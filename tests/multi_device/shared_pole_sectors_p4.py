@@ -352,7 +352,8 @@ def run_span_checks(mesh):
     cross_error=max(float(jnp.max(jnp.abs(a-put(b)))) for a,b in zip(got,expected))
     assert cross_error<1e-11,cross_error
     pencil=(put(adj(fullc)@signature@fullc),put(adj(fullc)@m@fullc),put(c@fullc),put(z))
-    native=distrib_la.plan('eigh',mesh,n=fullc.shape[-1],backend='off').native_fn
+    eig_plan=distrib_la.plan('eigh',mesh,n=fullc.shape[-1],backend='off')
+    native=eig_plan.native_fn
     def reduce(p,a):
         return reduce_ordered_shared_pole_pencil(p,a,eigh=native,matmul=_mm,gates=gates,retain_span=True)
     run=jax.jit(shard_map(reduce,mesh=mesh,in_specs=(spec,spec),out_specs=spec,check_vma=False))
@@ -381,7 +382,7 @@ def run_span_checks(mesh):
         return (put(z),put(np.arange(len(z),dtype=np.int32)),((put(q),),(put(a@x),)),tuple(infinity),y,signed)
     ct,ctdiag=reduce_cross_round(sector(c,qc,ic,xc,y,signed),sector(t,qt,it,xt,yt,signed_t),
         (((put(t@xc),put(np.zeros_like(t@xc))),),((put(c@xt),put(derivative)),)),
-        tuple(put(v) for v in moments),mesh_xy=mesh,native_eigh=native,gates=gates)
+        tuple(put(v) for v in moments),mesh_xy=mesh,eigh_plan=eig_plan,gates=gates)
     assert bool(jnp.all(ctdiag['gram_valid'])) and bool(jnp.all(ctdiag['retained_metric_positive']))
     cc,tt,mu,active=ct
     def evaluate(a,b,mu,active):

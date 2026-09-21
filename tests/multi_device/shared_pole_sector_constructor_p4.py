@@ -1,7 +1,7 @@
 """Physical signed photon bank through the public sector constructor/store seam."""
 
 
-def check_sector_constructor(mesh, root):
+def check_sector_constructor(mesh, root, *, linalg="local", parents=16, return_observables=False):
     from types import SimpleNamespace
     import os
     import numpy as np
@@ -18,7 +18,7 @@ def check_sector_constructor(mesh, root):
     from file_io import shared_pole_store as store
     from file_io.slab_io import SlabIO
 
-    run=root/f"constructor_{os.environ['SLURM_STEP_ID']}"
+    run=root/f"constructor_{os.environ['SLURM_STEP_ID']}_{linalg}"
     rank0_transaction(run,stage='plant.directory',write=lambda:run.mkdir())
     rotation=np.eye(3,dtype=np.int32)[None]
     sym=SimpleNamespace(sym_matrices=rotation,translations=np.zeros((1,3)),
@@ -28,7 +28,7 @@ def check_sector_constructor(mesh, root):
                                     np.zeros((len(rows),3)),np.zeros(len(rows),bool))
     sym.spinor_action=lambda rows,nspinor:np.ones((len(rows),1,1),complex)
     sym.cartesian_action=lambda rows,axial,time_odd:np.repeat(rotation,len(rows),axis=0)
-    nc,nt,nq=32,4,16
+    nc,nt,nq=32,4,parents
     fft=(32,1,1)
     coordinates=np.column_stack((np.arange(nc),np.zeros((nc,2),int))).astype(np.int32)
     bases=tuple(PackedCentroidBasis.build(coordinates[:n],sym,fft,mesh) for n in (nc,nt))
@@ -79,18 +79,23 @@ def check_sector_constructor(mesh, root):
     npositive=10
     positive=.025*(rng.normal(size=(nc+3*nt,npositive))+1j*rng.normal(size=(nc+3*nt,npositive)))
     positive*=np.sqrt(np.linspace(.4,.9,npositive))[None]
-    c=np.concatenate((positive,positive.conj()),axis=1)
+    # Different ranks and amplitudes per q, paired under q -> -q, expose
+    # accidental reuse of the first parent's column packing in face batches.
+    amplitudes=np.stack([positive * (1 + .07 * min(q,nq-q)) *
+        (np.arange(npositive) < npositive-min(q,nq-q)%3)[None,:] for q in range(nq)])
+    c=np.concatenate((amplitudes,amplitudes.conj()),axis=-1)
     j=np.diag([1.]*npositive+[-1.]*npositive)
     v=np.diag([1.2]*nc+[-.3]*(3*nt))
     d=np.diag([0.]*nc+[.05]*(3*nt))
     u=np.linalg.solve(np.eye(len(v))+v@d,v)
     energies=np.linspace(.5,1.8,npositive)
-    h=np.diag(np.tile(energies,2))+c.conj().T@u@c
+    adj=lambda a:np.swapaxes(a.conj(),-1,-2)
+    h=np.diag(np.tile(energies,2))+adj(c)@u@c
     out=u@c
     assert np.linalg.eigvalsh(h).min()>.45
     def value(z):
         resolvent=np.linalg.inv(z*j-h)
-        return out@resolvent@out.conj().T,-out@resolvent@j@resolvent@out.conj().T/(2*z)
+        return out@resolvent@adj(out),-out@resolvent@j@resolvent@adj(out)/(2*z)
     # Native photon layout is mesh-major/channel-major; the exact model above
     # uses charge rows followed by mu-major Cartesian current rows.
     index=[]
@@ -100,20 +105,24 @@ def check_sector_constructor(mesh, root):
             index.extend(nc+3*mu+component for mu in range(owner*(nt//layout.mesh_side),(owner+1)*(nt//layout.mesh_side)))
     def packed(a,samples=False):
         a=np.asarray(a,dtype=np.complex128)[...,index,:][...,index]
-        a=np.broadcast_to(a,(nq,)+a.shape).copy()
+        if a.ndim==2:a=np.broadcast_to(a,(nq,)+a.shape).copy()
         spec=P(None,None,'x','y') if samples else P(None,'x','y')
         return jax.make_array_from_callback(a.shape,NamedSharding(mesh,spec),lambda ix:a[ix])
     values=[value(z) for z in recipe['z_ry']]
     mirrors=[value(-z.conjugate()) for z in recipe['z_ry']]
-    moments=[out@np.linalg.matrix_power(j@h,k)@j@out.conj().T/2 for k in range(4)]
+    moments=[out@np.linalg.matrix_power(j@h,k)@j@adj(out)/2 for k in range(4)]
     store.write_shared_pole_bank(path,q_span=(0,nq),sample_span=(0,4),
-        Wc=packed([a[0] for a in values],True),dWc_ds=packed([a[1] for a in values],True),
-        Wc_mirror=packed([a[0] for a in mirrors],True),
-        dWc_mirror_ds=packed([a[1] for a in mirrors],True),
+        Wc=packed(np.stack([a[0] for a in values],axis=1),True),dWc_ds=packed(np.stack([a[1] for a in values],axis=1),True),
+        Wc_mirror=packed(np.stack([a[0] for a in mirrors],axis=1),True),
+        dWc_mirror_ds=packed(np.stack([a[1] for a in mirrors],axis=1),True),
         constant=packed(u-v),**{f'M{k}':packed(m) for k,m in enumerate(moments)},
         meta=meta,expected_identity=identity,mesh_xy=mesh)
-    result=construct_sector_poles(bank,meta,SimpleNamespace(backend=SimpleNamespace(linalg='local')),
+    result=construct_sector_poles(bank,meta,SimpleNamespace(backend=SimpleNamespace(linalg=linalg)),
                                   mesh_xy=mesh,output=str(run/'model.h5'))
+    rounds=[row for row in result['q_receipts'] if 'held' in row]
+    assert all(row['execution']==('face' if linalg=='distributed' else 'local') for row in rounds)
+    if linalg=='distributed':
+        assert len(rounds)==1 and len(rounds[0]['parents'])==nq
     handle=result['handle']
     manifest=store.validate_shared_pole_sector_manifest(handle['path'],expected_identity=identity,
         mesh_xy=mesh,capacity=meta.shared_pole_capacity)
@@ -130,19 +139,22 @@ def check_sector_constructor(mesh, root):
     factors={}
     for sector,family in (('CC',0),('TT',1),('CT_C',0),('CT_T',1)):
         with SlabIO(handle['sectors'][sector]['path'],mode='r',mesh=mesh) as io:
-            b,_,poles,k=store.read_shared_pole_faces(io,(0,1),meta=meta,header=headers[sector],basis=bases[family])
+            b,_,poles,k=store.read_shared_pole_faces(io,(0,nq),meta=meta,header=headers[sector],basis=bases[family])
         # Tiny oracle only: production never gathers a factor panel.
-        factors[sector]=(gather_to_host(b)[0].reshape((-1,b.shape[-1])),np.asarray(poles)[0],int(np.asarray(k)[0]))
-    errors={}
+        factors[sector]=(gather_to_host(b).reshape((nq,-1,b.shape[-1])),np.asarray(poles),np.asarray(k))
+    errors={};observables={}
     for name,left,right,sl,sr in (('CC','CC','CC',slice(0,nc),slice(0,nc)),
             ('TT','TT','TT',slice(nc,None),slice(nc,None)),
             ('CT','CT_C','CT_T',slice(0,nc),slice(nc,None))):
         bl,poles,k=factors[left];br,other,kr=factors[right]
-        np.testing.assert_array_equal(poles,other);assert k==kr
-        z=.9+.31j;omega=np.sqrt(poles[:k])
-        got=(bl[:,:k]/(2*omega*(z-omega)))@br[:,:k].conj().T
-        got-=(bl[:,:k].conj()/(2*omega*(z+omega)))@br[:,:k].T
-        exact=value(z)[0][sl,sr]
+        np.testing.assert_array_equal(poles,other);np.testing.assert_array_equal(k,kr)
+        z=.9+.31j;omega=np.sqrt(poles)
+        active=np.arange(poles.shape[-1])[None,:]<k[:,None]
+        bl=bl*active[:,None,:];br=br*active[:,None,:]
+        got=(bl/(2*omega*(z-omega))[:,None,:])@adj(br)
+        got-=(bl.conj()/(2*omega*(z+omega))[:,None,:])@np.swapaxes(br,-1,-2)
+        exact=value(z)[0][:,sl,sr]
+        observables[name]=got
         errors[name]=float(np.linalg.norm(got-exact)/np.linalg.norm(exact))
         assert errors[name]<1e-7,(name,errors[name])
     # Endpoint-weight asymmetry: one low pole violates only the current
@@ -157,8 +169,9 @@ def check_sector_constructor(mesh, root):
     assert not bool(jnp.any(zero['current']['zero_policy']))
     assert not bool(jnp.any(zero['zero_policy']))
     assert bool(jnp.all(pair[0][1]==pair[1][1])) and bool(jnp.all(pair[0][2]==pair[1][2]))
-    return dict(name='production_sector_constructor_manifest',held_W_relative=errors,
-                parents=nq,manifest=handle['path'],asymmetric_endpoint_loss_refused=True)
+    receipt=dict(name='production_sector_constructor_manifest',held_W_relative=errors,
+                 parents=nq,manifest=handle['path'],linalg=linalg,asymmetric_endpoint_loss_refused=True)
+    return (receipt,observables) if return_observables else receipt
 
 
 def main():

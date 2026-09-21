@@ -38,8 +38,12 @@ def _fixture(mesh):
         sym_perm=perm,L_table=wraps,n_sym_spatial=2)
     meta=SimpleNamespace(mu_basis=basis,nspinor=1,nkx=3,nky=3,nkz=3,fft_grid=(4,4,1),nk_tot=27,n_rmu=7)
     from gw.shared_pole_recipe import CapacityLedger
+    # The storage fixture runs on P4 and P16 acceptance meshes. Keep a real
+    # nonzero inherited reservation without letting this synthetic sentinel
+    # exceed the mesh-dependent default device budget before the test begins.
     meta.shared_pole_capacity=CapacityLedger(meta,mesh_xy=mesh)
-    meta.shared_pole_capacity.reserve("fixture_live_bound",resident_bytes_per_rank=4096,workspace_bytes_per_rank=0)
+    fixture_bytes=min(4096,meta.shared_pole_capacity.device_budget_bytes_per_rank-1)
+    meta.shared_pole_capacity.reserve("fixture_live_bound",resident_bytes_per_rank=fixture_bytes,workspace_bytes_per_rank=0)
     meta.shared_pole_capacity.live_stages=("fixture_live_bound",)
     tables={"qirr":qt,"q_irr_full_idx":np.arange(3,dtype=np.int64),"sym":sym}
     recipe={"version":"shared_real_pole_v1_r3b","gate_version":"shared_real_pole_gates_v1_r3b"}

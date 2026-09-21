@@ -440,3 +440,43 @@ refuses before execution. Donated output/alias6,144B; relative output
 difference0. Optimized HLO Green[8,4,8,4,8] tiles global[8,4,16,4,16] onP4.
 This proves the bounded admission path and tile geometry, not the native
 custom-call interiors, endpoint preparation peak or a material peak decrease.
+
+### Explicit whole-mesh photon constructor (development branch)
+
+`construct_sector_poles` follows the existing `linalg` setting. `local`
+retains parent rounds and the local reducer. `distributed` schedules one
+physical parent on the full supplied XY mesh from its first bank read.
+It does not promote a local stage, retry after a refusal, choose a submesh,
+or introduce a new input option. Direct sector hyperslab reads return
+`[1,s,n_X,n_Y]` faces. The four samples and four moments, direction actions,
+original-pencil coefficient spans, joint CT pencil and output factors stay
+in that execution layout. Scalar ordered construction is outside this
+photon-sector extension and retains its existing implementation.
+
+Both paths call the same parent equation owner in `shared_pole_local` and
+same CT equation owners in `shared_pole_sectors`. Execution adapters supply
+`distrib_la` GEMM/eigh and explicit matrix sharding; local tracing passes
+no face constraint. The distributed plans use the existing explicit
+`distributed` backend with `auto` provider batching and no capacity budget
+on the plan: service `route_for` therefore cannot choose local resharding.
+Only spectra, masks, role tables and scalar diagnostics are replicated.
+Known matrix outputs have explicit schemas; no dtype heuristic classifies
+results. Cached builders retain Mesh and static role/layout information;
+frequency nodes and numerical state are operands.
+
+Admission precedes each stage. With one distributed parent, matrix storage
+scales as `16*n*n/P`, rather than one whole matrix per rank. The selection
+price includes `4*S+4` photon sample/moment faces plus its existing dense
+selection envelope. Reduction uses actual closed direction width R and
+prices `16*(14*R*R+12*n*R)/P`, actions and live retained panels separately.
+CT admits its actual original and joint spans independently. All eigen and
+compact coefficient carrier widths tile both mesh axes. Eigh and GEMM
+workspace are queried from their actual service routes. The unchanged map
+ledger refuses an oversized stage; it never changes execution mode.
+
+Verification is pending: the integrated P4 fixture will compare configured
+local and distributed CC/TT/CT stored observables with the same independent
+signed plant. Optimized HLO must establish interior matrix residency,
+including endpoint/column permutations; face outputs alone do not prove
+absence of a one-axis gather. This branch has no large-parent memory or
+hundreds-GPU scaling measurement.

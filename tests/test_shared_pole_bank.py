@@ -96,8 +96,15 @@ def test_bank_partial_resume_and_immutable_completion(tmp_path):
             path, q_span=(q, q+1), M1=M, M3=2*M,
             meta=meta, expected_identity=identity, mesh_xy=mesh)
     header = validate_shared_pole_bank(
-        path, expected_identity=identity, mesh_xy=mesh, require_complete=True)
+        path, expected_identity=identity, mesh_xy=mesh, require_complete=True,
+        expected_recipe=recipe)
     assert header["complete"] and header["final_commit"]
+    stale_recipe = deepcopy(recipe)
+    stale_recipe["eta_ev"] = 0.3
+    with pytest.raises(ValueError, match="current resolved recipe"):
+        validate_shared_pole_bank(
+            path, expected_identity=identity, mesh_xy=mesh,
+            require_complete=True, expected_recipe=stale_recipe)
     with SlabIO(path, mode="r", mesh=mesh) as io:
         actual = read_shared_pole_bank(
             io, (0, 1), meta=meta, header=header, sample_span=(0, 1),

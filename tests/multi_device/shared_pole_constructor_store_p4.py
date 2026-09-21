@@ -16,7 +16,6 @@ def run_checks(mesh, directory):
     import jax.numpy as jnp
     import numpy as np
     from jax.sharding import NamedSharding, PartitionSpec as P
-    from symmetry_maps import QirrTables
     from file_io import shared_pole_store as store
     from file_io.slab_io import SlabIO
     from gw.shared_pole_constructor import construct_shared_poles
@@ -25,17 +24,9 @@ def run_checks(mesh, directory):
     from test_shared_pole_store import _fixture
 
     meta, tables, recipe, identity = _fixture(mesh)
-    # A synthetic 64^3 parent map supplies the declared capacity geometry,
-    # including the provider's fixed workspace cost for tiny GPU matrices.
-    # It tests the algebra/storage contract, not crystallographic unfolding.
-    qt = tables["qirr"]
-    tables["qirr"] = QirrTables(
-        irr_idx_q=np.arange(64**3, dtype=np.int32) % 3,
-        sym_idx_q=np.zeros(64**3, np.int32), q_irr_frac=qt.q_irr_frac,
-        sym_perm=qt.sym_perm, L_table=qt.L_table, n_sym_spatial=qt.n_sym_spatial)
-    meta.kgrid = (64, 64, 64)
-    meta.nkx, meta.nky, meta.nkz = meta.kgrid
-    meta.nk_tot, meta.n_rmu = 64**3, meta.mu_basis.n_logical
+    # Keep the fixture's physical three-parent 3x3x3 geometry. The explicit
+    # budget admits fixed native workspace for these tiny GPU matrices without
+    # inflating q metadata seen by later Coulomb and store owners.
     meta.n_rmu_padded = meta.mu_basis.n_packed
     recipe.update(recipe_hash=RECIPE_HASH, gate_hash=GATE_HASH,
                   role_codes=ROLE_CODES, fit_ids=[0, 1], held_ids=[2],
@@ -48,7 +39,8 @@ def run_checks(mesh, directory):
                   imaginary_width=2, infinity_width=1,
                   multiplet_relative_tolerance=1e-6, eta_ev=.25)
     meta.shared_pole_recipe = recipe
-    meta.shared_pole_capacity = CapacityLedger(meta, mesh_xy=mesh)
+    meta.shared_pole_capacity = CapacityLedger(
+        meta, mesh_xy=mesh, device_budget_bytes=1 << 30)
     meta.shared_pole_capacity.reserve('fixture_bank_inputs',
         resident_bytes_per_rank=4096, workspace_bytes_per_rank=0)
     meta.shared_pole_capacity.live_stages = ('fixture_bank_inputs',)
@@ -121,17 +113,32 @@ def run_checks(mesh, directory):
                                   result['q_receipts'][q]['constructor']['retained_moment_relative']['M3']))
         assert max(errors) < 1e-10
         assert all(row['status'] != 'FAIL' for receipt in result['q_receipts'] for row in receipt['gates'])
+        execution = result['execution']['mode']
+        if layout == 'distributed':
+            assert execution == 'face'
+        expected_ops = {'eigh', 'gemm'} if execution == 'face' else {'eigh'}
         for receipt in result['q_receipts']:
             queries = receipt['constructor']['native_workspace_queries']
-            assert {row['op'] for row in queries} == {'eigh', 'gemm'}
-            maxima = receipt['constructor']['capacity']['native_workspace']
-            assert maxima['gemm'] == max(row['bytes_per_rank'] for row in queries if row['op'] == 'gemm')
+            assert {row['op'] for row in queries} == expected_ops
+            assert receipt['constructor']['capacity']['execution'] == execution
+            # The query list is cumulative across selection, reduction and
+            # model phases. ``native_workspace`` is the current phase's live
+            # workspace: earlier solve/product scratch is transient and has
+            # already been released.
+            workspace = receipt['constructor']['capacity']['native_workspace']
+            if execution == 'face':
+                current_gemm = [row['bytes_per_rank'] for row in queries
+                    if row['op'] == 'gemm'
+                    and row['shapes'][0][-1] == meta.n_rmu_padded]
+                assert workspace['gemm'] == current_gemm[0]
+            else:
+                assert 'gemm' not in workspace
             assert receipt['constructor']['capacity']['price']['phase'] == 'model'
             current_eigh = [row['bytes_per_rank'] for row in queries
                             if row['op'] == 'eigh' and row['shapes'][0][-1] == meta.n_rmu_padded]
-            assert maxima['eigh'] == current_eigh[0]
-            assert maxima['eigh'] > 0
-            assert receipt['constructor']['capacity']['workspace_bytes_per_rank'] == sum(maxima.values())
+            assert workspace['eigh'] == current_eigh[0]
+            assert workspace['eigh'] > 0
+            assert receipt['constructor']['capacity']['workspace_bytes_per_rank'] == sum(workspace.values())
         # A changed resolved coordinate must refuse before a model write.
         old_z = recipe['z_ry'].copy()
         recipe['z_ry'][2] += .01
@@ -178,11 +185,13 @@ def main():
     initialize_communicator_stack()
     import jax
     from common.collectives import resolve_mesh
-    rows = run_checks(resolve_mesh(), args.output.parent)
+    mesh = resolve_mesh()
+    rows = run_checks(mesh, args.output.parent)
     if jax.process_index() == 0:
         args.output.write_text(json.dumps(dict(status='PASS', checks=rows,
             expected_checks=4, jobid=os.environ['SLURM_JOB_ID'], stepid=os.environ['SLURM_STEP_ID'],
-            scope='P4 constructor and actual scratch/model store plus authenticated response Coulomb accessor; planted positive measure and native workspace queries; device peaks NOT_MEASURED'),
+            mesh={axis: int(mesh.shape[axis]) for axis in ('x', 'y')},
+            scope='square-mesh constructor and actual scratch/model store plus authenticated response Coulomb accessor; planted positive measure and native workspace queries; device peaks NOT_MEASURED'),
             indent=2, allow_nan=False)+'\n')
     finalize_process()
 

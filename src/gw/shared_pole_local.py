@@ -234,6 +234,49 @@ def reduce_round(states, infinity, tables, *, real, mesh_xy, native_eigh, ordere
                    tuple(st[3] for st in states), tuple(infinity))
 
 
+def solve_parent_pencil(points, q, o, d, infinity, active, *, eigh, matmul,
+                        gates, ordered, odd_moments, keep_budget, retain_span=False, matrix_sharding=None):
+    """One equation owner for local and whole-mesh parent execution.
+
+    Inputs carry one or more independent parents. Execution adapters supply
+    service/local products and eigensolve; this function owns the pencil,
+    reduction, zero policy and original/retained moment identities.
+    """
+    import jax.numpy as jnp
+    from gw.shared_pole_gates import (apply_shared_pole_zero_policy, ordered_moment_identity,
+                                     retained_moment_identity)
+    from gw.shared_pole_pencil import assemble_ordered_shared_pole_pencil, assemble_shared_pole_pencil
+    from gw.shared_pole_reduction import reduce_ordered_shared_pole_pencil, reduce_shared_pole_pencil
+    finite = [(points, q, o, d)]
+    if ordered:
+        pencil = assemble_ordered_shared_pole_pencil(finite, infinity if odd_moments else None,
+                                                     matmul=matmul, matrix_sharding=matrix_sharding)
+        reduced = reduce_ordered_shared_pole_pencil(
+            pencil, active, eigh=eigh, matmul=matmul, gates=gates, keep_budget=keep_budget,
+            retain_span=retain_span, matrix_sharding=matrix_sharding)
+        model, signed, reduction = reduced[:3]
+        if retain_span:
+            coefficients = reduced[3]
+        retained = ordered_moment_identity(signed, infinity, matmul=matmul) if odd_moments else {}
+        model, zero = apply_shared_pole_zero_policy(model, gates=gates)
+        zero["zero_policy"] = zero["zero_policy"] & reduction["infinite_weight_ok"]
+    else:
+        pencil = assemble_shared_pole_pencil(finite, infinity, matmul=matmul)
+        model, reduction, coefficients = reduce_shared_pole_pencil(
+            pencil, active, eigh=eigh, matmul=matmul, gates=gates, keep_budget=keep_budget)
+        model, zero = apply_shared_pole_zero_policy(model, gates=gates)
+        # E selects the infinity block, the last columns of X.
+        side, width = pencil[0].shape[-1], infinity[0].shape[-1]
+        selector = (jnp.arange(side)[:, None] == jnp.arange(side - width, side)[None, :])[None]
+        retained = retained_moment_identity(pencil, coefficients, model, selector.astype(jnp.complex128),
+                                            matmul=matmul)
+        signed = ()
+    result = model, signed, (reduction, zero, retained)
+    if retain_span:
+        return (*result, coefficients)
+    return result
+
+
 @lru_cache(maxsize=None)
 def round_program(mesh_xy, native_eigh, ordered, odd_moments, keep_budget, sizes, retain_span=False):
     """Pack, assemble, reduce, gate and sort a round of parents, each on its own rank.
@@ -260,43 +303,16 @@ def round_program(mesh_xy, native_eigh, ordered, odd_moments, keep_budget, sizes
     import jax.numpy as jnp
     from jax.sharding import NamedSharding, PartitionSpec as P
     from common.shard_map import shard_map
-    from gw.shared_pole_gates import (apply_shared_pole_zero_policy, ordered_moment_identity,
-                                      retained_moment_identity, sort_shared_pole_columns)
-    from gw.shared_pole_pencil import assemble_ordered_shared_pole_pencil, assemble_shared_pole_pencil
-    from gw.shared_pole_reduction import reduce_ordered_shared_pole_pencil, reduce_shared_pole_pencil
+    from gw.shared_pole_gates import sort_shared_pole_columns
     from gw.shared_pole_recipe import shared_real_pole_gates_ordered_v1, shared_real_pole_gates_v1_r3b
 
     gates = shared_real_pole_gates_ordered_v1 if ordered else shared_real_pole_gates_v1_r3b
     batch, replicated = P(BATCH), NamedSharding(mesh_xy, P())
 
     def solve(points, q, o, d, infinity, active):
-        finite = [(points, q, o, d)]
-        if ordered:
-            pencil = assemble_ordered_shared_pole_pencil(finite, infinity if odd_moments else None, matmul=_mm)
-            reduced = reduce_ordered_shared_pole_pencil(
-                pencil, active, eigh=native_eigh, matmul=_mm, gates=gates, keep_budget=keep_budget,
-                retain_span=retain_span)
-            model, signed, reduction = reduced[:3]
-            if retain_span:
-                coefficients = reduced[3]
-            retained = ordered_moment_identity(signed, infinity, matmul=_mm) if odd_moments else {}
-            model, zero = apply_shared_pole_zero_policy(model, gates=gates)
-            zero["zero_policy"] = zero["zero_policy"] & reduction["infinite_weight_ok"]
-        else:
-            pencil = assemble_shared_pole_pencil(finite, infinity, matmul=_mm)
-            model, reduction, coefficients = reduce_shared_pole_pencil(
-                pencil, active, eigh=native_eigh, matmul=_mm, gates=gates, keep_budget=keep_budget)
-            model, zero = apply_shared_pole_zero_policy(model, gates=gates)
-            # E selects the infinity block, the last columns of X.
-            side, width = pencil[0].shape[-1], infinity[0].shape[-1]
-            selector = (jnp.arange(side)[:, None] == jnp.arange(side - width, side)[None, :])[None]
-            retained = retained_moment_identity(pencil, coefficients, model, selector.astype(jnp.complex128),
-                                                matmul=_mm)
-            signed = ()
-        result = model, signed, (reduction, zero, retained)
-        if retain_span:
-            return (*result, coefficients)
-        return result
+        return solve_parent_pencil(points, q, o, d, infinity, active,
+            eigh=native_eigh, matmul=_mm, gates=gates, ordered=ordered,
+            odd_moments=odd_moments, keep_budget=keep_budget, retain_span=retain_span)
 
     def body(live, dispatch, points, order, active, qs, os, ds, infinity):
         def pack(panels):
@@ -389,19 +405,79 @@ def _mm(a, b, *, transa='N', transb='N'):
 
 
 def check_round(model, signed, inverse_coulomb_sqrt, held, moments, infinity_directions, *, real, nodes, eta_ry,
-                mesh_xy, native_eigh, ordered):
-    """Run ``round_checks`` on one round: host arguments placed, replicated host results out."""
+                mesh_xy, eigh_plan, ordered):
+    """Run ``round_checks`` through the plan matching the arrays' layout."""
     import jax
     import numpy as np
     from jax.sharding import NamedSharding, PartitionSpec as P
 
+    from gw.shared_pole_execution import is_face
+    if is_face(model[0]):
+        if real != 1:
+            raise ValueError('whole-mesh shared-pole checks require one physical parent')
+        from gw.shared_pole_execution import face_round_check_program
+        out = face_round_check_program(mesh_xy, bool(ordered), model[0].shape[-2])(
+            model, signed, inverse_coulomb_sqrt, *held,
+            np.asarray(nodes, np.complex128), np.float64(eta_ry),
+            *moments, infinity_directions)
+        return jax.tree.map(np.asarray, out)
+
     replicated = NamedSharding(mesh_xy, P())
-    program = round_checks(mesh_xy, native_eigh, bool(ordered))
+    # Batch-layout equations run inside shard_map and therefore require the
+    # plan's public trace-safe native callable. Face arrays were dispatched
+    # above and use the plan's eager ``batched`` surface in their own program.
+    program = round_checks(mesh_xy, eigh_plan.native_fn, bool(ordered))
     live = _batch_put(mesh_xy, np.arange(int(model[0].shape[0])) < int(real))
     out = program(live, model, signed, inverse_coulomb_sqrt, *held,
                   jax.device_put(np.asarray(nodes, np.complex128), replicated),
                   jax.device_put(np.float64(eta_ry), replicated), *moments, infinity_directions)
     return jax.tree.map(np.asarray, out)
+
+
+def _round_check_equations(model, signed, inverse, wc, dw, z, eta, m1, m3, qi,
+                           *, matmul, eigh, gates, ordered):
+    """Shared scalar gate equations for local-parent and whole-mesh adapters."""
+    import jax
+    import jax.numpy as jnp
+    from gw.shared_pole_directions import _model_diagnostics
+    from gw.shared_pole_gates import (shared_pole_passivity,
+                                      shared_pole_reciprocity,
+                                      signed_shared_pole_passivity)
+
+    factor, poles, active = model
+    if ordered:
+        factor, mu, kept = signed
+        passive = signed_shared_pole_passivity(
+            signed, inverse, eta_ry=eta, matmul=matmul, eigh=eigh, gates=gates)
+        node = z[:, None]
+        weights = jnp.where(kept, 1 / (node * mu - 1), 0)
+        slopes = jnp.where(kept, -mu / (node * mu - 1) ** 2 / (2 * node), 0)
+        scale = jnp.where(kept, 1 / jnp.where(kept, jnp.abs(mu), 1), 0)
+        moment_model = (factor * scale[:, None, :], scale ** 2, kept)
+    else:
+        passive = shared_pole_passivity(
+            model, inverse, eta_ry=eta, matmul=matmul, eigh=eigh, gates=gates)
+        weights = jnp.where(active, 1 / ((z ** 2)[:, None] - poles), 0)
+        slopes = -weights ** 2
+        moment_model = model
+
+    def sample(args):
+        weight, slope, w, d = args
+        errors, reciprocity = [], []
+        for coefficient, exact in ((weight, w), (slope, d)):
+            value = matmul(factor * coefficient[None, None, :],
+                           factor, transb='C')[0]
+            errors.append(jnp.linalg.norm(value - exact)
+                          / jnp.maximum(jnp.linalg.norm(exact),
+                                        jnp.finfo(jnp.float64).tiny))
+            reciprocity.append({} if ordered else
+                shared_pole_reciprocity(value, exact, gates=gates))
+        return jnp.stack(errors), jax.tree.map(lambda *v: jnp.stack(v), *reciprocity)
+    errors, reciprocity = jax.lax.map(sample, (weights, slopes, wc[0], dw[0]))
+    rows = lambda a: jnp.swapaxes(a, 0, 1)[None]
+    defects = _model_diagnostics(moment_model, {'M1': m1, 'M3': m3}, qi,
+                                 matmul=matmul)
+    return passive, rows(errors), jax.tree.map(rows, reciprocity), defects
 
 
 @lru_cache(maxsize=None)
@@ -423,43 +499,15 @@ def round_checks(mesh_xy, native_eigh, ordered):
     import jax.numpy as jnp
     from jax.sharding import NamedSharding, PartitionSpec as P
     from common.shard_map import shard_map
-    from gw.shared_pole_directions import _model_diagnostics
-    from gw.shared_pole_gates import shared_pole_passivity, shared_pole_reciprocity, signed_shared_pole_passivity
     from gw.shared_pole_recipe import shared_real_pole_gates_ordered_v1, shared_real_pole_gates_v1_r3b
 
     gates = shared_real_pole_gates_ordered_v1 if ordered else shared_real_pole_gates_v1_r3b
     batch, rep = P(BATCH), P()
 
     def check(model, signed, inverse, wc, dw, z, eta, m1, m3, qi):
-        if ordered:
-            factor, mu, kept = signed
-            passive = signed_shared_pole_passivity(signed, inverse, eta_ry=eta, matmul=_mm, eigh=native_eigh,
-                                                   gates=gates)
-            node = z[:, None]
-            weights = jnp.where(kept, 1 / (node * mu - 1), 0)
-            slopes = jnp.where(kept, -mu / (node * mu - 1) ** 2 / (2 * node), 0)
-            scale = jnp.where(kept, 1 / jnp.where(kept, jnp.abs(mu), 1), 0)
-            moment_model = (factor * scale[:, None, :], scale ** 2, kept)
-        else:
-            factor, poles, active = model
-            passive = shared_pole_passivity(model, inverse, eta_ry=eta, matmul=_mm, eigh=native_eigh, gates=gates)
-            weights = jnp.where(active, 1 / ((z ** 2)[:, None] - poles), 0)
-            slopes = -weights ** 2
-            moment_model = model
-
-        def sample(args):
-            weight, slope, w, d = args
-            errors, reciprocity = [], []
-            for k, exact in ((weight, w), (slope, d)):
-                value = _mm(factor * k[None, None, :], factor, transb='C')[0]
-                errors.append(jnp.linalg.norm(value - exact)
-                              / jnp.maximum(jnp.linalg.norm(exact), jnp.finfo(jnp.float64).tiny))
-                reciprocity.append({} if ordered else shared_pole_reciprocity(value, exact, gates=gates))
-            return jnp.stack(errors), jax.tree.map(lambda *v: jnp.stack(v), *reciprocity)
-        errors, reciprocity = jax.lax.map(sample, (weights, slopes, wc[0], dw[0]))
-        rows = lambda a: jnp.swapaxes(a, 0, 1)[None]
-        defects = _model_diagnostics(moment_model, {"M1": m1, "M3": m3}, qi, matmul=_mm)
-        return passive, rows(errors), jax.tree.map(rows, reciprocity), defects
+        return _round_check_equations(
+            model, signed, inverse, wc, dw, z, eta, m1, m3, qi,
+            matmul=_mm, eigh=native_eigh, gates=gates, ordered=ordered)
 
     def body(live, model, signed, inverse, wc, dw, z, eta, m1, m3, qi):
         args = (model, signed, inverse, wc, dw, z, eta, m1, m3, qi)

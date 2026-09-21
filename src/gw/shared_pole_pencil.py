@@ -8,9 +8,19 @@ concatenation and a + a^H of face-sharded operands come out replicated.
 
 from __future__ import annotations
 
+import jax
 import jax.numpy as jnp
 from distrib_la import (face_sharding, hermitian_block, hermitian_part,
                         join_columns, on_face)
+
+
+def _matrix_layout(a, matrix_sharding):
+    """Pin a known matrix intermediate only for an explicit execution layout.
+
+    Local shard_map equations pass None. Distributed callers pass the full
+    XY matrix layout; no array dtype or metadata heuristic selects it.
+    """
+    return a if matrix_sharding is None else jax.lax.with_sharding_constraint(a, matrix_sharding)
 
 
 def _adjoint(a):
@@ -25,7 +35,7 @@ def _subtract(x, y):
     return x - y
 
 
-def finite_pencil_column(left, right, *, matmul):
+def finite_pencil_column(left, right, *, matmul, matrix_sharding=None):
     """Form one block column of the resolvent-identity pencil.
 
     Parameters
@@ -60,8 +70,8 @@ def finite_pencil_column(left, right, *, matmul):
     # stay per-rank tiles; eager broadcasting of the replicated supports and
     # a - a^H would replicate them. Multiply and subtract stay separate programs.
     face = face_sharding(a)
-    g = on_face(_finite_column_g, face, a, b, derivative, sa, sb)
-    return g, on_face(_subtract, face, on_face(_scale_rows, face, sb, g), a)
+    g = _matrix_layout(on_face(_finite_column_g, face, a, b, derivative, sa, sb), matrix_sharding)
+    return g, _matrix_layout(on_face(_subtract, face, on_face(_scale_rows, face, sb, g), a), matrix_sharding)
 
 
 def _finite_column_g(a, b, derivative, sa, sb):
@@ -122,7 +132,7 @@ def assemble_shared_pole_pencil(states, infinity, *, matmul):
     return hermitian_part(g), hermitian_part(h), join_columns(output, oi)
 
 
-def ordered_infinity_pencil_column(finite, infinity, *, matmul):
+def ordered_infinity_pencil_column(finite, infinity, *, matmul, matrix_sharding=None):
     """Infinity rows of the linear particle-hole pencil (z s3 - M).
 
     ``finite=(z,Q,O)`` carries complex z in Ry ([R] or [b,R]) and [b,n,R]
@@ -145,10 +155,11 @@ def ordered_infinity_pencil_column(finite, infinity, *, matmul):
                            jnp.concatenate((p1, p2), axis=-1)), axis=-2)
     hii = jnp.concatenate((jnp.concatenate((p1, p2), axis=-1),
                            jnp.concatenate((p2, p3), axis=-1)), axis=-2)
-    return g, h, gii, hii, 2 * jnp.concatenate((m0qi, m1qi), axis=-1)
+    return tuple(_matrix_layout(a, matrix_sharding) for a in
+                 (g, h, gii, hii, 2 * jnp.concatenate((m0qi, m1qi), axis=-1)))
 
 
-def assemble_ordered_shared_pole_pencil(states, infinity, *, matmul):
+def assemble_ordered_shared_pole_pencil(states, infinity, *, matmul, matrix_sharding=None):
     """Assemble G=X^H s3 X, H=X^H M X and O=C X for time-reversal-broken data.
 
     ``states`` holds ``(z,Q,WQ,dW/dz Q)`` with complex z in Ry, not s=z**2,
@@ -166,14 +177,16 @@ def assemble_ordered_shared_pole_pencil(states, infinity, *, matmul):
     z = jnp.concatenate([jnp.broadcast_to(jnp.asarray(state[0], jnp.complex128),
                          (state[1].shape[0], state[1].shape[-1]))
                          for state in states], axis=-1)
+    q, output, derivative = (_matrix_layout(a, matrix_sharding) for a in (q, output, derivative))
     finite = (z, q, output)
-    g, h = finite_pencil_column(finite, (z, q, output, derivative), matmul=matmul)
+    g, h = finite_pencil_column(finite, (z, q, output, derivative), matmul=matmul, matrix_sharding=matrix_sharding)
     del derivative
     # Pinned to the face: eager concatenation with the adjoint (y/x) infinity rows and
     # eager a + a^H return a replicated [b,side,side] G and H resident on every rank.
     if infinity is not None:
-        gi, hi, gii, hii, oi = ordered_infinity_pencil_column(finite, infinity, matmul=matmul)
+        gi, hi, gii, hii, oi = ordered_infinity_pencil_column(finite, infinity, matmul=matmul, matrix_sharding=matrix_sharding)
         g, h = hermitian_block(g, gi, gii), hermitian_block(h, hi, hii)
         del gi, hi, gii, hii
         output = join_columns(output, oi)
-    return hermitian_part(g), hermitian_part(h), output, z
+    return (*(_matrix_layout(a, matrix_sharding) for a in
+              (hermitian_part(g), hermitian_part(h), output)), z)

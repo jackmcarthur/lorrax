@@ -350,6 +350,28 @@ class CapacityLedger:
         """
         if not isinstance(stage, str) or not stage.strip() or stage in self._accepted:
             raise ValueError(f"capacity stage must be a new nonempty name; got {stage!r}")
+        row = self.preview(resident_bytes_per_rank=resident_bytes_per_rank,
+                           workspace_bytes_per_rank=workspace_bytes_per_rank,
+                           concurrent_with=concurrent_with)
+        passed = row['device_budget_status'] == 'PASS'
+        reason = row['reason']
+        row['stage'] = stage
+        row['live_stages'] = sorted(set(row['concurrent_with']) | {stage})
+        self.entries.append(row)
+        if not passed:
+            raise MemoryError(f"GATE shared_pole_capacity: stage={stage}; got: {reason}; "
+                              "why: aggregate live allocation must not exceed the remaining device budget")
+        self._accepted[stage] = row
+        return copy.deepcopy(row)
+
+    def preview(self, *, resident_bytes_per_rank,
+                workspace_bytes_per_rank, concurrent_with=()):
+        """Price one reservation without recording it or making refusal fatal.
+
+        Constructor execution uses this before any bank read to choose one
+        complete-mesh route for an oversized parent. The subsequent actual
+        phase still calls :meth:`reserve` and creates the evidence row.
+        """
         if isinstance(concurrent_with, str):
             raise ValueError("concurrent_with must contain stage names, not a string")
         live = set()
@@ -375,15 +397,16 @@ class CapacityLedger:
         reason = ('actual-batch analytical admission; peak not measured' if passed else
                   f"aggregate {total} B/rank exceeds available device budget {available} B/rank; "
                   f"geometry Q={g['nq']}, spin={g['nspinor']}, mu={g['nmu']}, "
-                  f"Px={g['px']}, Py={g['py']}; at these fixed reservation bytes "
-                  f"want Px*Py <= {max_ranks}; reprice actual batches/workspaces "
+                  f"Px={g['px']}, Py={g['py']}; the 3U scaling target corresponds to "
+                  f"{max_ranks} ranks at this fixed byte envelope, which is not a "
+                  "device-fit recommendation; reprice actual batches/workspaces "
                   "for any changed geometry, or reduce concurrent live bytes")
         row = gate_receipt('capacity', total / self.U_bytes_per_rank,
                            passed=scaling_passed, reason=reason)
         row['status'] = 'FAIL' if not passed else ('PASS' if scaling_passed else 'WARN')
         if passed and not scaling_passed:
             row['reason'] = 'above 3U scaling target; admitted within device budget (coordinator ruling24); peak not measured'
-        row.update(stage=stage, resident_bytes_per_rank=resident,
+        row.update(resident_bytes_per_rank=resident,
                    workspace_bytes_per_rank=workspace,
                    aggregate_bytes_per_rank=total,
                    limit_bytes_per_rank=self.limit_bytes_per_rank,
@@ -391,13 +414,8 @@ class CapacityLedger:
                    inherited_peak_bytes_per_rank=inherited,
                    available_device_bytes_per_rank=available,
                    device_budget_status='PASS' if passed else 'FAIL',
-                   concurrent_with=sorted(live), live_stages=sorted(live | {stage}),
+                   concurrent_with=sorted(live), live_stages=sorted(live),
                    geometry=dict(g), max_mesh_ranks_at_fixed_bytes=max_ranks)
-        self.entries.append(row)
-        if not passed:
-            raise MemoryError(f"GATE shared_pole_capacity: stage={stage}; got: {reason}; "
-                              "why: aggregate live allocation must not exceed the remaining device budget")
-        self._accepted[stage] = row
         return copy.deepcopy(row)
 
     def record_measured_peak(self, bytes_per_rank, *, reason):
