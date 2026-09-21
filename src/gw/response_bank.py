@@ -43,7 +43,6 @@ def response_algebra(meta, config, *, mesh_xy, n, ordered=False, photon=False):
         bare-response expansion coefficients and returns M1/M3 (Ry^3/Ry^5).
         Neither routine Hermitizes its inputs or outputs.
     """
-    from distrib_la import matmul, plan
     from .gw_config import linalg_resolution
     from .w_isdf import _w_solve_pref_scalar
 
@@ -51,10 +50,39 @@ def response_algebra(meta, config, *, mesh_xy, n, ordered=False, photon=False):
         config if hasattr(config, "get") else {"linalg": config.backend.linalg})
     route = resolution.batched_route
     backend = "off" if resolution.layout == "local" else "distributed"
+    pref = _w_solve_pref_scalar(meta)
+    samples, moments, lu = _response_programs(
+        mesh_xy, n, backend, route, pref, ordered,
+        float(meta.cell_volume) if photon else None)
+    algebra = {
+        "linalg": resolution.layout,
+        "solve": lu.describe(),
+        "batched_route": route,
+        "prefactor": pref,
+        "prefactor_q_count": int(meta.nk_tot),
+        "moment_convention": "S_m = 2 M_(2m+1) in physical coordinates",
+        "units": {"Wc": "Ry", "dWc_ds": "Ry^-1",
+                  "M1": "Ry^3", "M3": "Ry^5"},
+    }
+    if ordered:
+        algebra["moment_convention"] += "; odd M0 (1/z) and M2 (1/z^3), M_k = C_(k+1)/2"
+        algebra["units"].update(M0="Ry^2", M2="Ry^4")
+    if photon:
+        algebra["representation"] = "signed packed photon"
+        algebra["constant"] = "W_infinity-V, retained separately from M0..M3"
+        algebra["moment_convention"] = "M_k=C_(k+1)/2 about W_infinity"
+        algebra["units"].update(M0="Ry^2", M2="Ry^4", constant="Ry")
+    return samples, moments, algebra
+
+
+@lru_cache(maxsize=None)
+def _response_programs(mesh_xy, n, backend, route, pref, ordered, volume):
+    """Reuse compiled algebra across SC maps without retaining state arrays."""
+    from distrib_la import matmul, plan
+
     lu = plan("solve_lu", mesh_xy, backend=backend, n=n,
               batched_route=route)
     face = NamedSharding(mesh_xy, P(None, "x", "y"))
-    pref = _w_solve_pref_scalar(meta)
 
     def mm(a, b):
         return matmul(a, b, mesh=mesh_xy, backend=backend,
@@ -104,21 +132,7 @@ def response_algebra(meta, config, *, mesh_xy, n, ordered=False, photon=False):
             return (0.5 * congruence(h, x1), 0.5 * congruence(h, c2),
                     0.5 * congruence(h, c3), 0.5 * congruence(h, c4))
 
-    algebra = {
-        "linalg": resolution.layout,
-        "solve": lu.describe(),
-        "batched_route": route,
-        "prefactor": pref,
-        "prefactor_q_count": int(meta.nk_tot),
-        "moment_convention": "S_m = 2 M_(2m+1) in physical coordinates",
-        "units": {"Wc": "Ry", "dWc_ds": "Ry^-1",
-                  "M1": "Ry^3", "M3": "Ry^5"},
-    }
-    if ordered:
-        algebra["moment_convention"] += "; odd M0 (1/z) and M2 (1/z^3), M_k = C_(k+1)/2"
-        algebra["units"].update(M0="Ry^2", M2="Ry^4")
-    if photon:
-        volume = float(meta.cell_volume)
+    if volume is not None:
         @partial(jax.jit, in_shardings=(face, face), out_shardings=face)
         def infinity(v, contact):
             # chi(z)=chi_param(z)-contact, so W_inf=(I+V contact)^-1 V.
@@ -151,11 +165,7 @@ def response_algebra(meta, config, *, mesh_xy, n, ordered=False, photon=False):
                 result.append(mm(winf, rhs))
             return (winf - v, *(0.5 * c for c in result))
 
-        algebra["representation"] = "signed packed photon"
-        algebra["constant"] = "W_infinity-V, retained separately from M0..M3"
-        algebra["moment_convention"] = "M_k=C_(k+1)/2 about W_infinity"
-        algebra["units"].update(M0="Ry^2", M2="Ry^4", constant="Ry")
-    return samples, moments, algebra
+    return samples, moments, lu
 
 
 def response_weights(wfns, meta):
