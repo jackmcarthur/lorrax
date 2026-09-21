@@ -159,22 +159,21 @@ def face_eigh(mesh, n):
 
 
 @lru_cache(maxsize=None)
-def face_parent_program(mesh,ordered,odd_moments,keep_budget,retain_span):
+def face_parent_program(mesh,ordered,odd_moments,keep_budget,retain_span,side):
     """Retained static-layout executable builder; all state values are operands."""
     from gw.shared_pole_local import solve_parent_pencil
     from gw.shared_pole_gates import sort_shared_pole_columns
     from gw.shared_pole_recipe import shared_real_pole_gates_ordered_v1, shared_real_pole_gates_v1_r3b
     gates=shared_real_pole_gates_ordered_v1 if ordered else shared_real_pole_gates_v1_r3b
     mm=face_matmul(mesh)
-    def eigh(a):
-        return face_eigh(mesh,a.shape[-1]).batched(a)
+    eigh_plan=face_eigh(mesh,side)
     def body(points,order,active,qs,os,ds,infinity):
         def pack(parts):
             return jax.lax.with_sharding_constraint(
                 jnp.take(jnp.concatenate(parts,axis=-1),order[0],axis=-1,mode='fill',fill_value=0),
                 NamedSharding(mesh,P(None,'x','y')))
         reduced=solve_parent_pencil(points,pack(qs),pack(os),pack(ds),infinity,active,
-            eigh=eigh,matmul=mm,gates=gates,ordered=ordered,odd_moments=odd_moments,
+            eigh=eigh_plan.batched,matmul=mm,gates=gates,ordered=ordered,odd_moments=odd_moments,
             keep_budget=keep_budget,retain_span=retain_span,
             matrix_sharding=NamedSharding(mesh,P(None,"x","y")))
         model,signed,diagnostics=reduced[:3]
@@ -192,7 +191,7 @@ def face_reduce_round(states,infinity,tables,*,real,mesh,budget,ordered,odd_mome
     side=tables['active'].shape[-1]
     if admit:
         budget.plan(side,phase='reduction')
-    program=face_parent_program(mesh,ordered,odd_moments,keep_budget,retain_span)
+    program=face_parent_program(mesh,ordered,odd_moments,keep_budget,retain_span,side)
     result=program(jnp.asarray(tables['points']),jnp.asarray(tables['order']),
         jnp.asarray(tables['active']),tuple(s[1] for s in states),
         tuple(s[2] for s in states),tuple(s[3] for s in states),tuple(infinity))
@@ -202,17 +201,16 @@ def face_reduce_round(states,infinity,tables,*,real,mesh,budget,ordered,odd_mome
 
 
 @lru_cache(maxsize=None)
-def face_round_check_program(mesh, ordered):
+def face_round_check_program(mesh, ordered, n):
     """Whole-mesh adapter for the scalar model's existing gate equations."""
     from gw.shared_pole_local import _round_check_equations
     from gw.shared_pole_recipe import (shared_real_pole_gates_ordered_v1,
                                        shared_real_pole_gates_v1_r3b)
     gates = (shared_real_pole_gates_ordered_v1 if ordered else
              shared_real_pole_gates_v1_r3b)
-    def eigh(a):
-        return face_eigh(mesh, a.shape[-1]).batched(a)
+    eigh_plan = face_eigh(mesh, n)
     return face_program(partial(_round_check_equations, matmul=face_matmul(mesh),
-                                eigh=eigh, gates=gates, ordered=ordered),
+                                eigh=eigh_plan.batched, gates=gates, ordered=ordered),
                         mesh, outputs='scalars')
 
 
@@ -233,12 +231,11 @@ def sector_round_schedule(bank,header,meta,config,mesh,partner,*,execution=None)
 
 
 @lru_cache(maxsize=None)
-def cross_parent_program(mesh):
+def cross_parent_program(mesh, side):
     from gw.shared_pole_sectors import _cross_reduce_equations
     from gw.shared_pole_recipe import shared_real_pole_gates_ordered_v1 as gates
-    def eigh(a):
-        return face_eigh(mesh,a.shape[-1]).batched(a)
-    return face_program(partial(_cross_reduce_equations,mm=face_matmul(mesh),eigh=eigh,gates=gates,
+    eigh_plan = face_eigh(mesh, side)
+    return face_program(partial(_cross_reduce_equations,mm=face_matmul(mesh),eigh=eigh_plan.batched,gates=gates,
                                 matrix_sharding=NamedSharding(mesh,P(None,"x","y"))),
                         mesh,outputs='cross')
 
@@ -270,12 +267,13 @@ def compact_program(mesh,width):
 
 
 @lru_cache(maxsize=None)
-def cauchy_program(mesh):
+def cauchy_program(mesh, charge_n, current_n):
     from gw.shared_pole_sectors import sector_cauchy_schwarz
     from gw.shared_pole_recipe import shared_real_pole_gates_ordered_v1 as gates
-    def eigh(a):
-        return face_eigh(mesh,a.shape[-1]).batched(a)
+    charge_eigh = face_eigh(mesh, charge_n)
+    current_eigh = face_eigh(mesh, current_n)
     def body(c,ct,t):
-        return sector_cauchy_schwarz((c,ct,t),eigh_charge=eigh,eigh_current=eigh,
+        return sector_cauchy_schwarz((c,ct,t),eigh_charge=charge_eigh.batched,
+                                    eigh_current=current_eigh.batched,
                                     matmul=face_matmul(mesh),gates=gates)
     return face_program(body,mesh,outputs='scalars')

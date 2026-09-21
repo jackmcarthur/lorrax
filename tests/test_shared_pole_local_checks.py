@@ -27,7 +27,7 @@ def check(mesh):
     eta = .25
     qi = _batch_put(mesh, np.linalg.qr(rng.normal(size=(ranks, n, 3)))[0].astype(complex))
     inverse = _batch_put(mesh, np.broadcast_to(np.eye(n, dtype=complex), (ranks, n, n)).copy())
-    native = distrib_la.plan('eigh', mesh, n=n, backend='off', batched_route='batch_reshard').native_fn
+    eig = distrib_la.plan('eigh', mesh, n=n, backend='off', batched_route='batch_reshard')
     adj = lambda a: np.conj(np.swapaxes(a, -1, -2))
     rows = {}
     for ordered in (False, True):
@@ -56,7 +56,7 @@ def check(mesh):
         response = (c * passive[:, None]) @ adj(c)
         expected = np.linalg.eigvalsh((response + adj(response)) / 2)[:, -1]
         run = lambda w: check_round(model, signed, inverse, tuple(_batch_put(mesh, a) for a in (w, dw)), moments, qi,
-                                    real=3, nodes=nodes, eta_ry=eta, mesh_xy=mesh, native_eigh=native,
+                                    real=3, nodes=nodes, eta_ry=eta, mesh_xy=mesh, eigh_plan=eig,
                                     ordered=ordered)
         passed, held, reciprocity, defects = run(wc)
         assert held.shape == (ranks, 2, 2) and float(np.max(held[:3])) < 1e-12, held

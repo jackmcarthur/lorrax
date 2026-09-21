@@ -120,6 +120,7 @@ def run_checks(mesh, directory):
         for receipt in result['q_receipts']:
             queries = receipt['constructor']['native_workspace_queries']
             assert {row['op'] for row in queries} == expected_ops
+            assert receipt['constructor']['capacity']['execution'] == execution
             maxima = receipt['constructor']['capacity']['native_workspace']
             if execution == 'face':
                 assert maxima['gemm'] == max(
@@ -178,11 +179,13 @@ def main():
     initialize_communicator_stack()
     import jax
     from common.collectives import resolve_mesh
-    rows = run_checks(resolve_mesh(), args.output.parent)
+    mesh = resolve_mesh()
+    rows = run_checks(mesh, args.output.parent)
     if jax.process_index() == 0:
         args.output.write_text(json.dumps(dict(status='PASS', checks=rows,
             expected_checks=4, jobid=os.environ['SLURM_JOB_ID'], stepid=os.environ['SLURM_STEP_ID'],
-            scope='P4 constructor and actual scratch/model store plus authenticated response Coulomb accessor; planted positive measure and native workspace queries; device peaks NOT_MEASURED'),
+            mesh={axis: int(mesh.shape[axis]) for axis in ('x', 'y')},
+            scope='square-mesh constructor and actual scratch/model store plus authenticated response Coulomb accessor; planted positive measure and native workspace queries; device peaks NOT_MEASURED'),
             indent=2, allow_nan=False)+'\n')
     finalize_process()
 

@@ -40,11 +40,12 @@ def _fit_roles(recipe):
 
 @lru_cache(maxsize=None)
 def _round_kernels(mesh, layout="batch"):
-    """Rank-local programs on batch-layout round stacks [P, ...] (one parent per rank).
+    """Selection programs for batch or whole-mesh face round stacks.
 
-    Every array argument carries its parent axis over ('x','y'); scalars are
-    replicated. No program moves a whole matrix between ranks; the mirror
-    exchange moves only [n, r] panels between partner ranks.
+    Batch arrays carry their parent axis over ('x','y'). Face arrays carry one
+    physical parent at P(None,'x','y'). Scalars are replicated. Batch mirror
+    exchange moves only [n,r] panels between partner ranks; authenticated
+    literal mirrors remove that exchange from face execution.
     """
     from types import SimpleNamespace
     from common.shard_map import shard_map
@@ -150,10 +151,11 @@ BATCH_AXES = ('x', 'y')
 def select_round_states(samples, recipe, *, sample_lo, real, mesh_xy, eigh_plan, svd_plan,
                         column_extent, logical_n, ordered=False, exchange=None,
                         current_rotation=None):
-    """Directions, outputs and actions of one round of parents, batched per role (W 14, W 28).
-    ``samples`` holds ``Wc``/``dWc_ds`` [P, S, n, n] in batch layout (rank r owns
-    round slot r), sample ``sample_lo + j`` at index j; slots ``>= real`` are
-    synthetic. Line supports select right singular vectors (cutoff, per-support
+    """Directions, outputs and actions of one round of parents, batched per role (SP 3, SP 13).
+
+    ``samples`` holds ``Wc``/``dWc_ds`` as [P,S,n,n] in local batch layout
+    (rank r owns round slot r), or [1,S,n_X,n_Y] in face layout. Local slots
+    ``>= real`` are synthetic. Line supports select right singular vectors (cutoff, per-support
     cap), imaginary supports leading eigenvectors of -Herm W, each role in ONE
     batched call over the round's [slot x sample] stack; only spectra cross the
     host. States follow the per-sample order of the paired layout: per sample
@@ -165,8 +167,9 @@ def select_round_states(samples, recipe, *, sample_lo, real, mesh_xy, eigh_plan,
     sample through ``exchange = (slots, alpha, inverse, phase)``
     (``shared_pole_local.partner_realization``): W_q(-conj z) = conj(R_s[W_q(p')](z)).
 
-    Returns ``(states, counts, roles)``: panels [P, n, r] in batch layout, counts
-    int [P, A], and per-slot role records.
+    Returns ``(states, counts, roles)``: panels [P,n,r] in local batch layout
+    or [1,n_X,r_Y] in face layout, replicated counts int [P,A], and per-slot
+    role records.
     """
     from gw.shared_pole_recipe import ROLE_CODES
 

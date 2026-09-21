@@ -163,9 +163,9 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
             raise ValueError("GATE shared_pole_held: got: no held samples; want: at least one held support; why: the model checks compare W and dW/ds there")
         held_lo, held_hi = min(held_ids), max(held_ids) + 1
         nq = int(header["bank_shape"]["nq"])
-        # A round of parents runs one parent per rank (batch layout) from its sample read to
-        # its sorted model; ordered rounds are partner-closed so the mirror exchange stays inside.
-        # A parent reduces on its own rank whatever the linalg dial says (capacity refuses below).
+        # A local round runs one parent per rank from its sample read to its
+        # sorted model. A face round runs one physical parent over all ranks.
+        # Ordered local rounds remain partner-closed for their mirror exchange.
         ranks = mesh_divisor(mesh_xy)
         rounds = (parent_rounds(nq, ranks, partner_parent if ordered else None)
                   if execution == 'local' else
@@ -226,7 +226,9 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
                                   [st[0] for st in round_states], infinity_counts, infinity[0].shape[-1],
                                   column_extent=column_extent, ordered=ordered, odd_moments=odd_moments)
             side = int(tables["active"].shape[-1])
-            # A pencil reduces on one device: its eight [side, side] blocks and the native eigh workspace.
+            # Resolve before either reduction program is traced. Local mode
+            # uses the plan's pure trace-safe native closure; face mode uses
+            # the public eager plan through the whole-mesh adapter.
             local_eigh = budget.eigenplan(side)
             if execution == 'local' and not distrib_la.fits_local(
                     local_eigh, "eigh", ((1, side, side),) * 8,
@@ -302,23 +304,27 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
             inverse_sqrt = (parts[0] if execution == 'face' else
                             to_batch(face_rows(mesh_xy, tuple(sorted(ids[:real]).index(q) for q in ids))(*parts)))
             del parts
+            # Callee I/O admission needs the actual arrays that survive the
+            # Coulomb call, not the earlier pre-call live set.
+            budget.live((*round_model, *round_signed, qi, inverse_sqrt))
         with timing.fenced_section("spole.sample_batch_read"):
             with SlabIO(bank["path"], mode="r", mesh=mesh_xy) as bank_io:
                 held = read_shared_pole_bank(bank_io, meta=meta, header=header, q_ids=ids, partition_spec=read_spec,
                                              sample_span=(held_lo, held_hi), fields=("Wc", "dWc_ds"))
             pick = kernels.take(tuple(i - held_lo for i in held_ids))
             held = tuple(pick(held[name]) for name in ("Wc", "dWc_ds"))
+            budget.live((*round_model, *round_signed, qi, inverse_sqrt, *held))
         with timing.fenced_section("spole.moment_read"):
             with SlabIO(moments["path"], mode="r", mesh=mesh_xy) as moment_io:
                 exact = read_shared_pole_bank(moment_io, meta=meta, header=moment_header, q_ids=ids,
                                               partition_spec=read_spec, fields=("M1", "M3"))
+            budget.live((*round_model, *round_signed, qi, inverse_sqrt, *held,
+                         *exact.values()))
         with timing.fenced_section("spole.passivity_held"):
             passive, held_errors, reciprocity, moment_defects = check_round(
                 round_model, round_signed, inverse_sqrt, held, (exact["M1"], exact["M3"]), qi,
                 real=real, nodes=[_sample_point(recipe, i) for i in held_ids], eta_ry=recipe["eta_ev"] / RYD_TO_EV,
-                mesh_xy=mesh_xy,
-                native_eigh=local_eigh.native_fn if execution == 'local' else None,
-                ordered=ordered)
+                mesh_xy=mesh_xy, eigh_plan=local_eigh, ordered=ordered)
             del inverse_sqrt, held, exact
         with timing.fenced_section("spole.gates"):
             for slot, q in enumerate(ids[:real]):
