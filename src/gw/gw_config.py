@@ -1632,8 +1632,11 @@ _DEFAULTS = {
     # ``gw.coulomb.base.minibz_average``: the q→0 3D head gains the analytic
     # Baldereschi-Tosatti sphere term (seed-independent), the Voronoi fold
     # widens (nmax 1→3), and the BSE arbitrary-Q ``eval_vq`` head becomes the
-    # mini-BZ CELL AVERAGE ``<v_LR(Q+G*)>_mBZ`` (fixes the 4-13% near-Γ /
-    # zone-boundary point-vs-cell-average error, arbitrary_q_bse.md §16.4).
+    # mini-BZ CELL AVERAGE.  In BSE exchange the opt-in head is assembled
+    # from the transition-dipole second moment when a sampled Gamma point
+    # represents its cell.  A finite-Q path already has a pointwise form
+    # factor; the cell average is not a universal accuracy improvement
+    # (docs/theory/lt-exchange-head.md §2-3).
     # The winding (2D e^{-i2θ}) is unaffected — only the head magnitude is
     # averaged; the phase-factored ζ̃ rank-1 structure carries the direction.
     "head_minibz_average": False,
