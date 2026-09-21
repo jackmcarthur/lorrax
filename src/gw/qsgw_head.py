@@ -68,7 +68,13 @@ _KERNEL_CACHE: dict[tuple, Callable] = {}
 # Bound the only frequency-by-band-pair temporary in the direct wing kernel.
 # The full Y/Z outputs are much smaller (three Cartesian rows/columns), and a
 # ring step visits every frequency block before circulating its band tile.
-_HEAD_WING_FREQUENCY_BLOCK = 8
+# 8 -> 2 (2026-09-21, TaAs 8x8x8 head OOM): the block's (block, nk, nb, nb)
+# complex128 weight temporaries are the largest live values of the wing
+# kernel once the contraction is bounded (14.4 GB each at block 8, nb 468,
+# nk 512; a compiled temp region of 43.9 GiB at the TaAs tile).  Each
+# frequency is independent, so the block is a pure memory/throughput dial
+# with no effect on values.
+_HEAD_WING_FREQUENCY_BLOCK = 2
 
 # Bound the face-layout wing kernel's per-step psi gather (obstacle #3/#5 of
 # the low_mem_bands audit, report §"Full q->0 head/body wings").  psi_mun/
@@ -1228,12 +1234,25 @@ def _head_wing_kernel_face(
             ket_full = gather_mun(ket_tile)
 
             def _contract_left(weight):
-                return jnp.einsum(
-                    "akij,wkij,ksmi,ksmj->wam",
-                    jnp.conj(v_full), weight,
-                    jnp.conj(bra_full), ket_full,
-                    optimize=True,
-                )
+                # Y[w,a,m] = sum_{k,s,i,j} conj(v)[a,k,i,j] W[w,k,i,j]
+                #                          conj(bra)[k,s,m,i] ket[k,s,m,j],
+                # contracted in a fixed order: per frequency and per
+                # vertex, T = conj(v[a]) * W[w]  (nk, nb, nb), then i
+                # against the bra endpoint (nk, ns, m, nb), then k, s, j
+                # against the ket endpoint.  The former four-operand
+                # ``optimize=True`` einsum let opt_einsum form the
+                # (nk, ns, mu_block, nb, nb) pair-density outer product,
+                # 214 GiB on TaAs 8x8x8 at nb = 468 (2026-09-21 OOM);
+                # the largest value here is T at nk * nb^2.
+                def _one_frequency(_carry, weight_w):
+                    rows = []
+                    for a in range(int(v_full.shape[0])):
+                        t = jnp.conj(v_full[a]) * weight_w
+                        u = jnp.einsum("ksmi,kij->ksmj", jnp.conj(bra_full), t)
+                        rows.append(jnp.einsum("ksmj,ksmj->m", u, ket_full))
+                    return _carry, jnp.stack(rows, axis=0)
+                _, y = jax.lax.scan(_one_frequency, None, weight, unroll=1)
+                return y
             blocks = _weighted_stack(_contract_left)
             return _carry, blocks.reshape(
                 n_omega_padded, int(v_full.shape[0]), mu_x_block)
@@ -1274,11 +1293,18 @@ def _head_wing_kernel_face(
             ket_full = jnp.transpose(ket_gathered, (0, 2, 3, 1))
 
             def _contract_right(weight):
-                return jnp.einsum(
-                    "ksmi,ksmj,wkij,bkij->wmb",
-                    bra_full, jnp.conj(ket_full), weight, v_full,
-                    optimize=True,
-                )
+                # Z[w,m,b] = sum_{k,s,i,j} bra[k,s,m,i] conj(ket)[k,s,m,j]
+                #                          W[w,k,i,j] v[b,k,i,j]; same fixed
+                # order as _contract_left (see there).
+                def _one_frequency(_carry, weight_w):
+                    cols = []
+                    for b in range(int(v_full.shape[0])):
+                        t = weight_w * v_full[b]
+                        u = jnp.einsum("ksmi,kij->ksmj", bra_full, t)
+                        cols.append(jnp.einsum("ksmj,ksmj->m", u, jnp.conj(ket_full)))
+                    return _carry, jnp.stack(cols, axis=1)
+                _, z = jax.lax.scan(_one_frequency, None, weight, unroll=1)
+                return z
             blocks = _weighted_stack(_contract_right)
             return _carry, blocks.reshape(
                 n_omega_padded, mu_y_block, n_vertex)
