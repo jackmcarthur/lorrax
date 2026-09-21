@@ -257,9 +257,11 @@ $$
 $$
 
 This is a numerical treatment policy, not a bound on collective modes. The
-first shared-pole SC map freezes the ceiling. A later map whose current chi
-transition span exceeds the frozen source span refuses before construction;
-the ceiling never widens after map 0. The initial fixed Sigma rules certify
+first shared-pole SC map freezes the ceiling. A later map reports twice its
+current chi transition span as the ceiling a fresh map would choose, but that
+diagnostic does not change or invalidate the frozen treatment. The constructor
+applies the same frozen mask to every current model, and the ceiling never
+widens after map 0. The initial fixed Sigma rules certify
 the intersection of `[0, Omega_treat]` with each existing pole selector, in
 addition to the normal state and endpoint padding, so a retained pole may
 move anywhere within that declared range without re-keying the nodes. Modes with
@@ -337,7 +339,7 @@ Every construction receipt row carries version, value, threshold and PASS/FAIL/W
 | `normalized_gram_keep` | the retained rank at the recipe cut | diagnostic |
 | `retained_subspace_moments` | TRS: projected `M_1`, `M_3` identity; ordered: `m_0..m_3` on the infinity directions | TRS yes, ordered diagnostic |
 | `zero_ritz_policy` | dropped factor weight within budget; ordered also `infinite_weight_ok` | yes |
-| `sector_pole_treatment` | bispinor-only map-0 ceiling and complete CC/TT/common-CT masks of (SP 14a); reports counts and extrema, not accuracy | later span escape and invalid mask yes |
+| `sector_pole_treatment` | bispinor-only map-0 ceiling and complete CC/TT/common-CT masks of (SP 14a); reports the current fresh-map candidate, counts and extrema, not accuracy | invalid mask yes |
 | `finite_factors_poles` | finite `b`, positive finite active `Λ`, exact inert sentinels | yes |
 | `passivity` | V-whitened `−Herm W_c(iη)` in `[0, I]`; ordered: Hermitian part, the anti-Hermitian part is reported | yes |
 | `model_reciprocity` | TRS only: transpose symmetry of symmetric held samples | yes (TRS) |

@@ -77,7 +77,9 @@ def test_gap_growth_keeps_points_roles_but_rebinds_current_state():
     assert session["line_ev"] == tuple(first["line_ev"])
 
 
-def test_sector_treatment_ceiling_freezes_map0_and_refuses_span_growth():
+def test_sector_treatment_ceiling_freezes_map0_and_masks_after_span_growth():
+    from gw.shared_pole_gates import shared_pole_treatment_mask
+
     session = {}
     first = _sector_treatment_ceiling(4.0, session)
     assert first['status'] == 'initialized_map0'
@@ -85,8 +87,14 @@ def test_sector_treatment_ceiling_freezes_map0_and_refuses_span_growth():
     current = _sector_treatment_ceiling(3.5, session)
     assert current['status'] == 'reused_map0'
     assert current['ceiling_ry'] == 8.0
-    with pytest.raises(ValueError, match='treatment_span_escape'):
-        _sector_treatment_ceiling(4.1, session)
+    expanded = _sector_treatment_ceiling(4.1, session)
+    assert expanded['ceiling_ry'] == 8.0
+    assert expanded['current_candidate_ceiling_ry'] == 8.2
+    mask, row = shared_pole_treatment_mask(
+        np.array([[4.0 ** 2, 9.0 ** 2]]), np.array([[True, True]]),
+        ceiling_ry=expanded['ceiling_ry'])
+    assert np.asarray(mask).tolist() == [[True, False]]
+    assert np.asarray(row['retained_omega_max_ry']).tolist() == [4.0]
 
 
 def test_gap_shrink_expands_once_then_growth_stays_enclosed():

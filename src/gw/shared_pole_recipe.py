@@ -845,8 +845,9 @@ def _sector_treatment_ceiling(response_span_ry, session):
 
     Twice the current chi transition span is an explicit approximation
     policy. It is not a collective-mode bound. A fixed-SC session retains the
-    map-0 value and refuses a later response span that would invalidate that
-    provenance; it never widens the model or Sigma domain after map 0.
+    map-0 value; later maps report the ceiling a fresh map would choose, but
+    never widen the model or Sigma domain after map 0. The constructor applies
+    the frozen ceiling to every current model, independently of span motion.
     """
     required = 2.0 * float(response_span_ry)
     if not math.isfinite(required) or required <= 0.0:
@@ -857,25 +858,21 @@ def _sector_treatment_ceiling(response_span_ry, session):
         return dict(version="sector_twice_map_span_v1", status="current_map",
                     ceiling_ry=required,
                     source_response_span_ry=float(response_span_ry),
+                    current_response_span_ry=float(response_span_ry),
+                    current_candidate_ceiling_ry=required,
                     scope="numerical treatment; not a physical pole bound")
     previous = session.get("sector_treatment_ceiling_ry")
     if previous is None:
         session["sector_treatment_ceiling_ry"] = required
         status = "initialized_map0"
     else:
-        previous = float(previous)
-        tolerance = 32.0 * np.finfo(np.float64).eps * max(1.0, abs(previous))
-        if required > previous + tolerance:
-            raise ValueError(
-                "GATE shared_pole_treatment_span_escape: current twice-response-span "
-                f"{required:.17g} Ry exceeds the frozen map-0 ceiling "
-                f"{previous:.17g} Ry; fixed treatment cannot widen after map 0")
         status = "reused_map0"
     return dict(version="sector_twice_map_span_v1", status=status,
                 ceiling_ry=float(session["sector_treatment_ceiling_ry"]),
                 source_response_span_ry=(
                     0.5 * float(session["sector_treatment_ceiling_ry"])),
                 current_response_span_ry=float(response_span_ry),
+                current_candidate_ceiling_ry=required,
                 scope="numerical treatment; not a physical pole bound")
 
 
