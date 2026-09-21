@@ -895,8 +895,8 @@ def make_initial_state_from_qp_rotations(
         partition = BandPartition(
             protected_mask=protected, in_range_mask=in_range)
         fit_record = seed_policy["active_scissor"]
-        if fit_record is not None:
-            frozen_scissor_fits = (ScissorFit(**fit_record), None)
+        frozen_scissor_fits = (
+            None if fit_record is None else ScissorFit(**fit_record), None)
     _record_sc(
         inputs,
         "  SC initial Hamiltonian: external compact QP seed "

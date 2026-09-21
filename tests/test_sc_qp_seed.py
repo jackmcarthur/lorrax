@@ -143,6 +143,25 @@ def test_qp_seed_reconstruction_partition_enters_real_rcrop_seam(
     np.testing.assert_array_equal(partition.in_range_mask, in_range)
     assert sc._frozen_scissor_fits(state) == (fit, None)
 
+    # A present policy with no active fit is an established ``None`` law,
+    # distinct from a legacy artifact that has no policy.  Preserve the tuple
+    # so rCROP does not recapture a newly fitted active law on map 0.
+    none_policy_path = str(tmp_path / "qp_wfn_rotations_none_policy.h5")
+    write_qp_rotations_h5(
+        none_policy_path, U_mnk=U, E_qp_nk=E * 0.5,
+        band_start=3, band_stop=3 + nb, kpoints_crys=kpoints,
+        nkx=4, nky=4, nkz=4, kirr_to_kfull=np.arange(nk_loop),
+        source_wfn=wfn,
+        sc_seed_policy={
+            "protected_mask": protected,
+            "in_range_mask": in_range,
+            "active_scissor": None,
+        })
+    none_policy_state = sc.make_initial_state_from_qp_rotations(
+        inputs, none_policy_path)
+    assert none_policy_state.frozen_scissor_fits == (None, None)
+    assert sc._frozen_scissor_fits(none_policy_state) == (None, None)
+
     # A legacy U/E-only companion keeps the established seed classification
     # and starts without a frozen law; absence must not manufacture identity.
     with monkeypatch.context() as legacy:
