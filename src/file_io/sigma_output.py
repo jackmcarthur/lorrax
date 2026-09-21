@@ -148,6 +148,7 @@ DIRECT_FIELD_SUM_RULE_ATTR = "direct_field_sum_rule"
 DIRECT_FIELD_SUM_RULE = (
 	"hartree_kij_ev=hartree_scalar_kij_ev+hartree_transverse_kij_ev")
 DIRECT_FIELD_SUM_FULL_BZ_ATTR = "direct_field_sum_verified_full_bz"
+DIRECT_FIELD_SUM_STAR_WEDGE_ATTR = "direct_field_sum_verified_star_wedge_input"
 DIRECT_FIELD_SUM_FILE_WEDGE_ATTR = "direct_field_sum_verified_file_wedge"
 
 #: Meaning of the four operator cubes above.  They are deliberately the
@@ -1499,6 +1500,7 @@ def write_sigma_omega_h5(
 		attrs["direct_field_semantics"] = semantics
 		attrs[DIRECT_FIELD_SUM_RULE_ATTR] = DIRECT_FIELD_SUM_RULE
 		attrs[DIRECT_FIELD_SUM_FULL_BZ_ATTR] = not star_already_selected
+		attrs[DIRECT_FIELD_SUM_STAR_WEDGE_ATTR] = bool(star_already_selected)
 		attrs[DIRECT_FIELD_SUM_FILE_WEDGE_ATTR] = True
 		return attrs
 
@@ -1681,10 +1683,12 @@ def _validate_raw_direct_component_contract(h5, *, required):
 		attrs = h5[name].attrs
 		if (_text(attrs.get(DIRECT_FIELD_SUM_RULE_ATTR, "missing"))
 				!= DIRECT_FIELD_SUM_RULE
-				or not bool(attrs.get(DIRECT_FIELD_SUM_FULL_BZ_ATTR, False))
+				or not (bool(attrs.get(DIRECT_FIELD_SUM_FULL_BZ_ATTR, False))
+					or (bool(attrs.get(DIRECT_FIELD_SUM_STAR_WEDGE_ATTR, False))
+						and _text(attrs.get(K_STORAGE_ATTR, "")) == K_STORAGE_IBZ))
 				or not bool(attrs.get(DIRECT_FIELD_SUM_FILE_WEDGE_ATTR, False))):
 			raise ValueError(
-				f"{name} lacks the authenticated full-BZ/file-wedge "
+				f"{name} lacks the authenticated input/file-wedge "
 				f"{DIRECT_FIELD_SUM_RULE!r} contract.")
 	return True
 

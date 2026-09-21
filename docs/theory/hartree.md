@@ -57,5 +57,10 @@ and field from the current orbitals at every iteration, then contracts the
 field in the DFT basis. Screening is a separate GW stage. Hartree always uses
 the WFN FFT grid: there is no stored, folded, or ISDF Hartree selector.
 
+The final Sigma writer verifies $H^{\mathrm{dir}}=V_H+H_T$ on its input
+k-set and stored rows. SC supplies already selected star rows, so its receipt
+authenticates that retained input rather than claiming a full-BZ check.
+The shared receipt reader requires the verified input scope and file-row sum.
+
 API ownership, schedules, and evidence scope:
 `docs/dev/rho_vh_2d_design.md` (repository only).
