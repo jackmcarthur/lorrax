@@ -21,6 +21,7 @@ from isdf.galerkin import (
     _make_basis_solve_kernel,
     _make_physical_project_kernel,
     _make_spin_operator_fold_kernel,
+    plan_galerkin_operator_stream,
     rotate_galerkin_operator,
 )
 
@@ -127,16 +128,25 @@ def test_full_grid_spin_operator_stays_on_rank_face_and_rotates_coefficients():
     mesh = _mesh(16)
     rank, ns, r_extent = 8, 2, 32
     nq, nb = 5, 3
-    row = NamedSharding(mesh, P(None, None, ("y", "x")))
+    left = NamedSharding(mesh, P("x", None, "y"))
+    right = NamedSharding(mesh, P("y", None, "x"))
     face = NamedSharding(mesh, P("x", "y"))
     rep = NamedSharding(mesh, P())
+
+    panel_budget = 64 * 1024
+    plan = plan_galerkin_operator_stream(
+        rank=rank, nspinor=ns, n_rtot=97, mesh_xy=mesh,
+        q_tile_budget=panel_budget)
+    assert plan.q_tile_local_bytes <= panel_budget
+    assert plan.max_r_carrier % int(mesh.size) == 0
 
     rng = np.random.default_rng(23)
     basis_np = (
         rng.normal(size=(rank, ns, r_extent))
         + 1j * rng.normal(size=(rank, ns, r_extent))).astype(np.complex128)
     spin_np = np.asarray([[0.5, 0.0], [0.0, -0.5]], dtype=np.complex128)
-    basis = _put_global(basis_np, row)
+    basis_left = _put_global(basis_np, left)
+    basis_right = _put_global(basis_np, right)
     spin = jax.device_put(spin_np, rep)
     zero_operator = _put_global(
         np.zeros((rank, rank), dtype=np.complex128), face)
@@ -145,15 +155,18 @@ def test_full_grid_spin_operator_stays_on_rank_face_and_rotates_coefficients():
 
     fold = _make_spin_operator_fold_kernel(
         rank=rank, nspinor=ns, r_carrier=r_extent,
-        mesh=mesh, basis_layout=row, face_layout=face)
+        mesh=mesh, basis_left_layout=left, basis_right_layout=right,
+        face_layout=face)
     compiled = fold.lower(
-        basis, spin, zero_operator, zero_metric).compile()
+        basis_left, basis_right, spin, zero_operator, zero_metric).compile()
     hlo = compiled.as_text().lower()
-    assert "all-gather" not in hlo and "all_gather" not in hlo
     if int(mesh.size) > 1:
-        assert "reduce-scatter" in hlo or "reduce_scatter" in hlo
+        assert "all-gather" in hlo or "all_gather" in hlo
+        assert "reduce-scatter" not in hlo and "reduce_scatter" not in hlo
+        assert "all-reduce" not in hlo and "all_reduce" not in hlo
 
-    operator, metric = fold(basis, spin, zero_operator, zero_metric)
+    operator, metric = fold(
+        basis_left, basis_right, spin, zero_operator, zero_metric)
     expected_operator = np.einsum(
         "asr,st,btr->ab", np.conj(basis_np), spin_np, basis_np,
         optimize=True)
@@ -169,7 +182,8 @@ def test_full_grid_spin_operator_stays_on_rank_face_and_rotates_coefficients():
         + 1j * rng.normal(size=(nq, rank, nb))).astype(np.complex128)
     result = rotate_galerkin_operator(
         jax.device_put(coeff_np, rep),
-        GalerkinOperatorProjection(operator=operator, metric=metric), mesh)
+        GalerkinOperatorProjection(operator=operator, metric=metric), mesh,
+        logical_q_count=nq)
     expected_num = np.einsum(
         "qan,ab,qbn->qn", np.conj(coeff_np), expected_operator, coeff_np,
         optimize=True)
