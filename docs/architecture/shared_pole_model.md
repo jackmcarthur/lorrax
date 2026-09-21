@@ -407,9 +407,13 @@ Face arrays remain constant per rank under m² proportional to P. Constructor
 whole-parent rounds have a strong-scaling ceiling: with b=P each rank retains
 a whole parent pencil and factor. Face/batch conversion uses explicit
 all-to-all exchanges, not a host/global matrix copy. Replicated poles and
-scalar diagnostics are small metadata. Legacy axis-layout wavefunctions
+scalar diagnostics are small metadata. High-memory (`axis`) wavefunctions
 have only one mesh axis in each carrier; this audit establishes face-layout
-residency only. It does not authorize a new layout or replicated bulk array.
+residency only. Both existing band-storage layouts bind the same charge and
+photon Green/FFT kernels through the carrier's layout; response outputs stay
+sharded on both endpoint axes. `tests/multi_device/response_bank_layouts.py`
+checks complex ordered charge-stream parity and the all-P output placement.
+This does not authorize a new layout or replicated bulk array.
 
 The producer must release ordered `o0/o1`, the per-parent operand tuple,
 result list and contact constant after their synchronous writes. Otherwise

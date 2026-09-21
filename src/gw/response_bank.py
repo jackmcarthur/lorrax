@@ -346,10 +346,10 @@ def response_stream(wfns, meta, *, mesh_xy, q_ids, n_outputs,
             layout=wfns.layout, selected_q=tuple(q_ids), pair_mode=pair_mode,
             bank_carry=bank_carry, ordered=True, vertex=True)
         return kernel, vertex
-    if wfns.layout != "face" or not charge_representation(meta):
-        raise ValueError("GATE response_representation: got bispinor or legacy "
-                         "wavefunctions; want scalar or two-component charge face "
-                         "carrier; why: bank requires explicit endpoint shardings")
+    if not charge_representation(meta):
+        raise ValueError("GATE response_representation: want scalar or "
+                         "two-component charge endpoints; use the photon vertex "
+                         "for bispinor response")
     carrier = wfns.green_parent
     source = wfns if carrier is None else carrier
     parent = None if carrier is None else carrier.plan
@@ -358,8 +358,8 @@ def response_stream(wfns, meta, *, mesh_xy, q_ids, n_outputs,
     kernel = _get_chi_fractional_contour_kernel_face(
         mesh_xy, (meta.nkx, meta.nky, meta.nkz), n_outputs,
         (nk, int(wfns.slices.nb_full), n, int(meta.nspinor)),
-        k_unfold_plan=parent, selected_q=tuple(q_ids), pair_mode=pair_mode,
-        bank_carry=bank_carry, ordered=ordered)
+        k_unfold_plan=parent, layout=wfns.layout, selected_q=tuple(q_ids),
+        pair_mode=pair_mode, bank_carry=bank_carry, ordered=ordered)
     return kernel, (source.psi_mun, source.psi_nmu, source.enk)
 
 
@@ -823,7 +823,7 @@ def _stream_comparison(wfns, meta, mesh_xy, qids, receipt):
     old = _get_chi_fractional_contour_kernel_face(mesh_xy,
         (meta.nkx,meta.nky,meta.nkz), 2,
         (nk,wfns.slices.nb_full,meta.mu_basis.n_packed,meta.nspinor),
-        k_unfold_plan=None if parent is None else parent.plan)
+        k_unfold_plan=None if parent is None else parent.plan, layout=wfns.layout)
     sizes = []
     for name, item in (("bank", kernel),("incumbent",old)):
         executable = item.lower(*args).compile()
