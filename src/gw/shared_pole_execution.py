@@ -381,6 +381,82 @@ def _probe_small_reference(points, active, q, o, d, infinity, odd_moments):
         pencil, active, return_raw=True)
 
 
+@lru_cache(maxsize=None)
+def _probe_bank_action(mesh, adjoint, width):
+    """Independent all-P JAX panel action of one authenticated bank sample."""
+    from distrib_la import panel_matmul
+
+    matrix_sharding = NamedSharding(mesh, P(None, 'x', 'y'))
+
+    def body(stack, sample, q):
+        operator = jax.lax.dynamic_index_in_dim(
+            stack, sample, axis=1, keepdims=False)
+        if adjoint:
+            operator = jnp.conj(jnp.swapaxes(operator, -1, -2))
+        operator = jax.lax.with_sharding_constraint(operator, matrix_sharding)
+        q = jax.lax.with_sharding_constraint(q, matrix_sharding)
+        return panel_matmul(operator, q, mesh=mesh, panel_bytes=32 << 20)
+
+    return face_program(body, mesh, outputs='matrices')
+
+
+@lru_cache(maxsize=None)
+def _probe_gather_panel(mesh, width):
+    """Replicate one bounded action panel after its all-P product completes."""
+    return face_program(lambda a: a[..., :width], mesh, outputs='scalars')
+
+
+def _probe_direct_actions(mesh, samples, sample_points, points, active, q):
+    """Reapply bank W/dW to the selected Q through independent panel GEMM."""
+    points = np.asarray(points)[0]
+    active = np.asarray(active, bool)[0, :points.size]
+    sample_points = np.asarray(sample_points, np.complex128)
+    q_host = np.asarray(q)[0]
+    output = np.zeros_like(q_host)
+    derivative = np.zeros_like(q_host)
+    groups = {}
+    for column, point in enumerate(points):
+        if not active[column]:
+            continue
+        matches = []
+        for sample, z in enumerate(sample_points):
+            # The packed first half is selected at z/conj(z) from Wc. The
+            # matching second half is the literal stored mirror action at
+            # -z/-conj(z), even when z is pure imaginary and nodes coincide.
+            candidates = (((z, 'Wc', False), (np.conj(z), 'Wc', True))
+                          if column < points.size // 2 else
+                          ((-z, 'Wc_mirror', True),
+                           (-np.conj(z), 'Wc_mirror', False)))
+            for node, field, adjoint in candidates:
+                if point == node and field in samples:
+                    matches.append((sample, field, adjoint))
+        if len(matches) != 1:
+            raise ValueError(f'raw-Hvv probe cannot bind selected node {point!r} to a bank sample')
+        key = matches[0]
+        groups.setdefault(key, []).append(column)
+
+    q_device = q
+    for (sample, field, adjoint), columns in groups.items():
+        padded = ((len(columns) + int(mesh.shape['y']) - 1)
+                  // int(mesh.shape['y']) * int(mesh.shape['y']))
+        selected = jnp.take(q_device, jnp.asarray(columns), axis=-1)
+        selected = jnp.pad(selected, ((0, 0), (0, 0), (0, padded - len(columns))))
+        sample_id = jnp.asarray(sample, jnp.int32)
+        w = _probe_bank_action(mesh, adjoint, padded)(
+            samples[field], sample_id, selected)
+        derivative_field = ('dWc_mirror_ds' if field == 'Wc_mirror'
+                            else 'dWc_ds')
+        dw = _probe_bank_action(mesh, adjoint, padded)(
+            samples[derivative_field], sample_id, selected)
+        jax.block_until_ready((w, dw))
+        w = np.asarray(_probe_gather_panel(mesh, len(columns))(w))[0]
+        dw = np.asarray(_probe_gather_panel(mesh, len(columns))(dw))[0]
+        for local, column in enumerate(columns):
+            output[:, column] = w[:, local]
+            derivative[:, column] = dw[:, local] * (2 * points[column])
+    return output, derivative
+
+
 def _choose_probe_indices(diagonal, active, count=8):
     """Choose worst live/padding and healthy controls, then fill deterministically."""
     diagonal, active = np.asarray(diagonal), np.asarray(active, bool)
@@ -406,7 +482,7 @@ def _choose_probe_indices(diagonal, active, count=8):
 
 
 def _run_ordered_raw_hvv_probe(points, order, active, qs, os, ds, infinity,
-                                raw, *, mesh, odd_moments):
+                                raw, *, mesh, odd_moments, probe_samples):
     """Print a bounded native/reference receipt and deliberately stop before eig."""
     raw_h, raw_h_vv = raw
     diagonal = np.asarray(_probe_vectors(mesh)(raw_h_vv))[0]
@@ -427,6 +503,9 @@ def _run_ordered_raw_hvv_probe(points, order, active, qs, os, ds, infinity,
     small = _probe_panels(mesh, finite_indices, infinity_indices)(
         points, order, active, qs, os, ds, infinity)
     small_points, small_active, q, o, d, small_infinity = small
+    samples, sample_points = probe_samples
+    action_o, action_d = _probe_direct_actions(
+        mesh, samples, sample_points, small_points, small_active, q)
     native = _probe_small_native(mesh, odd_moments)(
         small_points, small_active, q, o, d, small_infinity)
     # Complete every native product before dispatching the reference path;
@@ -440,12 +519,17 @@ def _run_ordered_raw_hvv_probe(points, order, active, qs, os, ds, infinity,
     full_h, full_h_vv = np.asarray(full_h)[0], np.asarray(full_h_vv)[0]
     native_h, native_h_vv = np.asarray(native_h)[0], np.asarray(native_h_vv)[0]
     reference_h, reference_h_vv = (np.asarray(a)[0] for a in reference[2])
-    q_host = np.asarray(q)[0]
+    q_host, o_host, d_host = (np.asarray(a)[0] for a in (q, o, d))
+    small_active_host = np.asarray(small_active)[0]
 
     def error(a, b):
         absolute = float(np.max(np.abs(a - b)))
         relative = absolute / max(float(np.max(np.abs(b))), np.finfo(float).tiny)
         return absolute, relative
+
+    bad_finite = np.asarray([
+        local for local, index in enumerate(finite_indices)
+        if paired_active[index] and diagonal[index] <= 0], np.int64)
 
     if jax.process_index() == 0:
         print('shared-pole raw Hvv diagnostic: parent=0 paired=16 finite=8 infinity=8', flush=True)
@@ -466,6 +550,10 @@ def _run_ordered_raw_hvv_probe(points, order, active, qs, os, ds, infinity,
                   f'{hpp!r} {hpm!r} {hmp!r} {hmm!r} '
                   f'{diagonal_sum!r} {cross_sum!r} '
                   f'{reconstructed!r}', flush=True)
+            print('finite_row_error '
+                  f'{index} full_vs_jax={error(full_h_vv[local:local + 1, local:local + 1], reference_h_vv[local:local + 1, local:local + 1])} '
+                  f'full_vs_native={error(full_h_vv[local:local + 1, local:local + 1], native_h_vv[local:local + 1, local:local + 1])}',
+                  flush=True)
         print('role index active z q_norm raw_diag infinity_H_k0k0', flush=True)
         for local, index in enumerate(infinity_indices):
             paired_local = f + local
@@ -474,6 +562,21 @@ def _run_ordered_raw_hvv_probe(points, order, active, qs, os, ds, infinity,
                   f'{np.linalg.norm(np.asarray(small_infinity[0])[0, :, local]):.17e} '
                   f'{full_h_vv[paired_local, paired_local]!r} '
                   f'{full_h[original_local, original_local]!r}', flush=True)
+            print('infinity_row_error '
+                  f'{index} full_vs_jax={error(full_h_vv[paired_local:paired_local + 1, paired_local:paired_local + 1], reference_h_vv[paired_local:paired_local + 1, paired_local:paired_local + 1])} '
+                  f'full_vs_native={error(full_h_vv[paired_local:paired_local + 1, paired_local:paired_local + 1], native_h_vv[paired_local:paired_local + 1, paired_local:paired_local + 1])}',
+                  flush=True)
+        for column, point in enumerate(np.asarray(small_points)[0]):
+            prod_o, ref_o = o_host[:, column], action_o[:, column]
+            prod_d, ref_d = d_host[:, column], action_d[:, column]
+            direct = ('NA' if (not small_active_host[column] or not point
+                               or np.real(point) != 0) else
+                      -float(np.real(np.vdot(q_host[:, column],
+                                              prod_d / (2 * point)))))
+            print('bank_action '
+                  f'column={column} node={point!r} active={int(small_active_host[column])} '
+                  f'O={error(prod_o, ref_o)} D={error(prod_d, ref_d)} '
+                  f'pureimag_direct={direct!r}', flush=True)
         print('shared-pole raw Hvv comparison '
               f'full_native_vs_small_jax_H={error(full_h, reference_h)} '
               f'full_native_vs_small_native_H={error(full_h, native_h)} '
@@ -481,17 +584,36 @@ def _run_ordered_raw_hvv_probe(points, order, active, qs, os, ds, infinity,
               f'full_native_vs_small_jax_Hvv={error(full_h_vv, reference_h_vv)} '
               f'full_native_vs_small_native_Hvv={error(full_h_vv, native_h_vv)} '
               f'small_native_vs_small_jax_Hvv={error(native_h_vv, reference_h_vv)} '
+              f'bad_finite_full_vs_small_jax_Hvv={error(full_h_vv[np.ix_(bad_finite, bad_finite)], reference_h_vv[np.ix_(bad_finite, bad_finite)])} '
+              f'bad_finite_full_vs_small_native_Hvv={error(full_h_vv[np.ix_(bad_finite, bad_finite)], native_h_vv[np.ix_(bad_finite, bad_finite)])} '
               f'active_nonpositive={int(np.sum(paired_active & (diagonal <= 0)))} '
               f'active_nonfinite={int(np.sum(paired_active & ~np.isfinite(diagonal)))} '
               f'inactive_nonzero={int(np.sum(~paired_active & (diagonal != 0)))} '
               f'active_raw_min={np.nanmin(diagonal[paired_active])!r} '
               f'inactive_abs_max={np.max(np.abs(diagonal[~paired_active]), initial=0)!r}',
               flush=True)
+    from common.collectives import rank0_transaction
+    artifact = 'shared_pole_raw_hvv_probe.npz'
+
+    def write_artifact():
+        np.savez(
+            artifact,
+            finite_indices=np.asarray(finite_indices),
+            infinity_indices=np.asarray(infinity_indices),
+            points=np.asarray(small_points), active=np.asarray(small_active),
+            q=q_host, o=o_host, d=d_host,
+            reference_o=action_o, reference_d=action_d,
+            full_h=full_h, full_h_vv=full_h_vv,
+            native_h=native_h, native_h_vv=native_h_vv,
+            reference_h=reference_h, reference_h_vv=reference_h_vv)
+    rank0_transaction(artifact, stage='shared_pole.raw_hvv_probe',
+                      write=write_artifact)
     raise RuntimeError('DIAGNOSTIC COMPLETE: stopped before shared-pole eigensolves')
 
 
 def face_ordered_parent(points, order, active, qs, os, ds, infinity, *, mesh,
-                        odd_moments, keep_budget, retain_span):
+                        odd_moments, keep_budget, retain_span,
+                        probe_samples=None):
     """Run the three ordered eig equations with explicit eager boundaries."""
     prepare = face_ordered_probe_program(mesh, odd_moments)
     with timing.section(
@@ -502,7 +624,7 @@ def face_ordered_parent(points, order, active, qs, os, ds, infinity, *, mesh,
     prepared = prepared_face[:2]
     _run_ordered_raw_hvv_probe(
         points, order, active, qs, os, ds, infinity, prepared_face[2], mesh=mesh,
-        odd_moments=odd_moments)
+        odd_moments=odd_moments, probe_samples=probe_samples)
     with timing.section(
             'spole.ordered.eigh1_input', announce=True,
             label='shared-pole ordered Hvv Hermitian projection') as section:
@@ -580,7 +702,7 @@ def face_parent_program(mesh,ordered,odd_moments,keep_budget,retain_span,side):
 
 
 def face_reduce_round(states,infinity,tables,*,real,mesh,budget,ordered,odd_moments,
-                      keep_budget,retain_span=False,admit=True):
+                      keep_budget,retain_span=False,admit=True,probe_samples=None):
     """One physical parent, all ranks, with no artificial round zero tails."""
     if real != 1 or len(tables['own']) != 1:
         raise ValueError('distributed constructor requires one physical parent per full-mesh program')
@@ -593,7 +715,7 @@ def face_reduce_round(states,infinity,tables,*,real,mesh,budget,ordered,odd_mome
     if ordered:
         result=face_ordered_parent(
             *args,mesh=mesh,odd_moments=odd_moments,keep_budget=keep_budget,
-            retain_span=retain_span)
+            retain_span=retain_span,probe_samples=probe_samples)
     else:
         program=face_parent_program(mesh,ordered,odd_moments,keep_budget,retain_span,side)
         result=program(*args)

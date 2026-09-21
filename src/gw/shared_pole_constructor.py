@@ -226,7 +226,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
                 samples, recipe, sample_lo=fit_lo, real=real, mesh_xy=mesh_xy, eigh_plan=eig,
                 svd_plan=svd, column_extent=column_extent, logical_n=logical_n, ordered=ordered,
                 exchange=exchange)
-            del samples, exchange, qi
+            del exchange, qi
         with timing.fenced_section("spole.reduction_admission"):
             infinity_counts = [int(v.shape[-1]) for v in round_infinity_values]
             tables = round_tables(round_counts, [st[1].shape[-1] for st in round_states],
@@ -261,14 +261,16 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
                 round_model, round_signed, vectors, round_diagnostics = face_reduce_round(
                     round_states, infinity, tables, real=real, mesh=mesh_xy,
                     budget=budget, ordered=ordered, odd_moments=odd_moments,
-                    keep_budget=recipe.get("pole_budget"), admit=False)
+                    keep_budget=recipe.get("pole_budget"), admit=False,
+                    probe_samples=(samples, tuple(_sample_point(recipe, i)
+                                                  for i in range(fit_lo, fit_hi))))
             else:
                 round_model, round_signed, vectors, round_diagnostics = reduce_round(
                     round_states, infinity, tables, real=real, mesh_xy=mesh_xy,
                     native_eigh=local_eigh.native_fn, ordered=ordered,
                     odd_moments=odd_moments, keep_budget=recipe.get("pole_budget"))
             qi = infinity[0]
-            del round_states, infinity
+            del round_states, infinity, samples
             round_reduction, round_zero, round_retained, round_permutation = jax.tree.map(np.asarray, round_diagnostics)
             poles, active = (np.asarray(a) for a in vectors)
             budget.retained_panels = tuple(factors)
