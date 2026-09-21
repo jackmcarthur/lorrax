@@ -28,8 +28,8 @@ def check_sector_constructor(mesh, root, *, linalg="local", parents=16, return_o
                                     np.zeros((len(rows),3)),np.zeros(len(rows),bool))
     sym.spinor_action=lambda rows,nspinor:np.ones((len(rows),1,1),complex)
     sym.cartesian_action=lambda rows,axial,time_odd:np.repeat(rotation,len(rows),axis=0)
-    nc,nt,nq=32,4,parents
-    fft=(32,1,1)
+    nc,nt,nq=48,16,parents
+    fft=(48,1,1)
     coordinates=np.column_stack((np.arange(nc),np.zeros((nc,2),int))).astype(np.int32)
     bases=tuple(PackedCentroidBasis.build(coordinates[:n],sym,fft,mesh) for n in (nc,nt))
     tables=[]
