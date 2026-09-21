@@ -705,7 +705,7 @@ def _positive_cross_equations(left,right,mu,active,*,gates,matrix_sharding=None)
                               charge=checks[0],current=checks[1])
 
 
-def _literal_cross_products(panels,q,node,*,sample,mirror,conjugate,mm):
+def _literal_cross_products(panels,q,node,sample,*,mirror,conjugate,mm):
     """One literal same-operator CT action for both execution layouts."""
     w,wr,d,dr,wm,wrm,dwm,dwrm=panels
     if mirror:
@@ -775,8 +775,8 @@ def cross_round_actions(samples, states, roles, recipe, *, sample_lo, mesh_xy,
             if not literal:
                 raise ValueError('distributed photon CT requires authenticated literal mirrors')
             from gw.shared_pole_execution import cross_action_program
-            outputs.append(cross_action_program(mesh_xy,sid-sample_lo,mirror,conjugate)(
-                samples,state[1],jnp.asarray(node)))
+            outputs.append(cross_action_program(mesh_xy,mirror,conjugate)(
+                samples,state[1],jnp.asarray(node),jnp.asarray(sid-sample_lo,jnp.int32)))
             continue
 
         def apply(*args):

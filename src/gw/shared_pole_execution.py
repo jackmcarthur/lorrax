@@ -310,9 +310,9 @@ def cross_parent_program(mesh, side):
 
 
 @lru_cache(maxsize=None)
-def cross_action_program(mesh,sample,mirror,conjugate):
+def cross_action_program(mesh,mirror,conjugate):
     from gw.shared_pole_sectors import _literal_cross_products
-    return face_program(partial(_literal_cross_products,sample=sample,mirror=mirror,
+    return face_program(partial(_literal_cross_products,mirror=mirror,
         conjugate=conjugate,mm=face_matmul(mesh)),mesh)
 
 
