@@ -30,17 +30,16 @@ def _json(value):
     return json.dumps(value, default=encode, sort_keys=True, allow_nan=False)
 
 
-def _authenticated_constructor_resume(root, identity):
+def _authenticated_constructor_resume(root, identity, recipe):
     """Authenticate a complete scalar producer bank before preserving it.
 
     This is deliberately narrower than restart: it resumes only the missing
-    constructor after both producer receipts and the bank's final commit bind
-    the exact current map identity. Any other partial directory follows the
-    existing remove-and-rebuild path.
+    constructor after both producer receipts and the store validator bind the
+    exact current map identity, resolved recipe, response convention and final
+    commit. Any other partial directory follows the existing remove-and-rebuild
+    path.
     """
-    import h5py
-    from file_io.commit_state import assert_committed
-    from file_io.shared_pole_store import _json as store_json
+    from file_io.shared_pole_store import validate_shared_pole_bank
 
     receipt_paths = (root / 'bank_receipt.json', root / 'moments_receipt.json')
     bank_path = root / 'bank.h5'
@@ -57,14 +56,11 @@ def _authenticated_constructor_resume(root, identity):
         return False
     if bank_receipt.get('coulomb_identity') != moments_receipt.get('coulomb_identity'):
         return False
-    with h5py.File(bank_path, 'r') as h5:
-        assert_committed(h5, path=bank_path)
-        header = json.loads(bytes(h5['header_json'][()]).decode())
-    final = header.get('final_commit')
-    precommit = dict(header, final_commit=None)
-    if (header.get('identity') != identity or header.get('complete') is not True
-            or not final
-            or hashlib.sha256(store_json(precommit).encode()).hexdigest() != final):
+    try:
+        validate_shared_pole_bank(
+            bank_path, expected_identity=identity, mesh_xy=None,
+            require_complete=True, expected_recipe=recipe)
+    except (KeyError, OSError, TypeError, ValueError):
         return False
     return True
 
@@ -247,7 +243,7 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
             if complete:
                 print_fn(f"shared-pole output: complete model retained at {model}; refusing rebuild")
                 raise ValueError(f"GATE shared_pole_output: complete model {model}; use its compatible restart member or a fresh run directory")
-            if not photon and _authenticated_constructor_resume(root, identity):
+            if not photon and _authenticated_constructor_resume(root, identity, recipe):
                 print_fn(f"shared-pole output: authenticated complete bank retained at {root}; resuming constructor")
                 return True
             if root.exists():

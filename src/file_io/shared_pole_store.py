@@ -1146,12 +1146,14 @@ def initialize_shared_pole_bank(path, *, meta, tables, recipe, identity,
 
 
 def validate_shared_pole_bank(path, *, expected_identity, mesh_xy,
-                              require_complete=False):
+                              require_complete=False, expected_recipe=None):
     """Authenticate the scratch plan and per-field commit masks before replay.
 
     Only small metadata is read. Partial files are resumable, but a consumer
     cannot read a field whose q/sample mask is absent. Finalization follows
-    the collective close; a completed bank is immutable.
+    the collective close; a completed bank is immutable. ``expected_recipe``
+    additionally binds a preserved producer to the current resolved supports,
+    eta, widths and conventions before constructor-only resume.
     """
     header = _read_header(path)
     if header.get("schema") != BANK_SCHEMA:
@@ -1159,6 +1161,9 @@ def validate_shared_pole_bank(path, *, expected_identity, mesh_xy,
     _check_identity(header["identity"], expected_identity)
     if hashlib.sha256(_json(header["recipe"]).encode()).hexdigest() != header["recipe_hash"]:
         _refuse("scratch bank recipe digest mismatch")
+    if (expected_recipe is not None
+            and _json(header["recipe"]) != _json(expected_recipe)):
+        _refuse("scratch bank does not match the current resolved recipe")
     plan = _bank_plan(header["bank_sample_plan"])
     digest = hashlib.sha256(_json(plan).encode()).hexdigest()
     if digest != header.get("bank_plan_digest"):
@@ -1181,6 +1186,14 @@ def validate_shared_pole_bank(path, *, expected_identity, mesh_xy,
     samples = np.asarray(header["sample_written"], dtype=bool)
     moments = np.asarray(header["moment_written"], dtype=bool)
     moment_fields = _bank_moment_fields(header)
+    units = {"Wc": "Ry", "dWc_ds": "Ry^-1", "M1": "Ry^3", "M3": "Ry^5",
+             "M0": "Ry^2", "M2": "Ry^4", "constant": "Ry",
+             "Wc_mirror": "Ry", "dWc_mirror_ds": "Ry^-1"}
+    fields = _bank_sample_fields(header) + moment_fields
+    if (header.get("derivative_variable") != "s=z_Ry^2"
+            or any(header.get("units", {}).get(name) != units[name]
+                   for name in fields)):
+        _refuse("scratch bank response/derivative convention mismatch")
     if samples.shape != (nq, nsample, len(_bank_sample_fields(header))) or moments.shape != (nq, len(moment_fields)):
         _refuse("scratch bank malformed written masks")
     if (nq != header["n_q_irr"] or nsample != _bank_nsample(plan)
@@ -1204,7 +1217,7 @@ def validate_shared_pole_bank(path, *, expected_identity, mesh_xy,
                 _refuse(f"scratch bank typed plan {name} digest mismatch")
         if file["role_codes_json"][()].decode() != _json(plan["role_codes"]):
             _refuse("scratch bank role code table mismatch")
-        for name in _bank_sample_fields(header) + moment_fields:
+        for name in fields:
             expected = ((nq, nsample) if name in _bank_sample_fields(header) else (nq,)) + (shape["d"],) * 2
             if (name not in file or file[name].shape != expected
                     or file[name].dtype != np.dtype(np.complex128)

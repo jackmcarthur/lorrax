@@ -1,12 +1,7 @@
 """Authenticated constructor-only resume does not accept a partial producer."""
-import hashlib
 import json
 
-import h5py
-import numpy as np
-
-from file_io.commit_state import set_commit_state
-from file_io.shared_pole_store import _json as store_json
+from file_io import shared_pole_store as store
 from gw.shared_pole_screening import _authenticated_constructor_resume
 
 
@@ -19,21 +14,27 @@ def _plant(root, identity):
             identity=identity, completion=True, coulomb_identity=coulomb,
             **extra)))
     (root/'coulomb.h5').write_bytes(b'coulomb')
-    header=dict(identity=identity, complete=True, final_commit=None)
-    header['final_commit']=hashlib.sha256(store_json(header).encode()).hexdigest()
-    with h5py.File(root/'bank.h5','w') as h5:
-        h5.create_dataset('header_json',data=np.bytes_(store_json(header)))
-        set_commit_state(h5,True)
+    (root/'bank.h5').write_bytes(b'validated by the store service')
 
 
-def test_constructor_resume_requires_exact_identity_and_complete_receipts(tmp_path):
+def test_constructor_resume_requires_exact_identity_recipe_and_complete_receipts(tmp_path,
+                                                                                  monkeypatch):
     identity={'iteration_id':'sc_0000','hamiltonian':'map:abc'}
+    recipe={'eta_ev': 0.2, 'z_ry': [0.1j]}
     root=tmp_path/'sc_0000_shared_pole'
     _plant(root,identity)
-    assert _authenticated_constructor_resume(root,identity)
+    def validate(path, *, expected_identity, mesh_xy, require_complete,
+                 expected_recipe):
+        assert path == root/'bank.h5' and mesh_xy is None and require_complete
+        if expected_recipe != recipe:
+            raise ValueError('stale recipe')
+        return {'identity': expected_identity}
+    monkeypatch.setattr(store, 'validate_shared_pole_bank', validate)
+    assert _authenticated_constructor_resume(root,identity,recipe)
     assert not _authenticated_constructor_resume(
-        root,dict(identity,hamiltonian='map:other'))
+        root,dict(identity,hamiltonian='map:other'),recipe)
+    assert not _authenticated_constructor_resume(root,identity,{'eta_ev': 0.3})
     receipt=json.loads((root/'moments_receipt.json').read_text())
     receipt['bank_complete']=False
     (root/'moments_receipt.json').write_text(json.dumps(receipt))
-    assert not _authenticated_constructor_resume(root,identity)
+    assert not _authenticated_constructor_resume(root,identity,recipe)
