@@ -18,10 +18,10 @@ pairs.  All other off-diagonals are zeroed each iteration so the
 non-protected / out-of-range bands never mix into the protected
 subspace's eigenproblem.
 
-Masks follow DFT reference identities at each k. The classification is rebuilt
-from identity-aligned energies each map, with the same energy-dependent pad
-that supports the fixed quadrature windows. Sorted QP columns are a readout
-of these identities, not coordinates of the Hamiltonian carry.
+Masks follow DFT reference identities at each k. SC initializes this partition
+once and carries its masks unchanged; current energies and their sorted-column
+assignments still update each map. Quadrature coverage follows those energies
+independently. Sorted QP columns are not coordinates of the Hamiltonian carry.
 """
 
 from __future__ import annotations
@@ -51,9 +51,9 @@ class BandPartition:
         True for bands that get full off-diagonal Σ corrections in
         ``H_qp_dft`` and participate in the basis rotation.
     in_range_mask : (nk, nb_active) or (nb_active,) bool
-        True for identities whose current assigned energy lies inside
-        ``[ω_min, ω_max]`` at every k.  Used to decide between Σ_diag (in-range) and scissor
-        (out-of-range) for the *non-protected* bands' diagonal.
+        True for identities classified inside ``[ω_min, ω_max]`` at every k
+        during initialization; SC keeps this mask fixed. Decides between
+        Σ_diag and scissor for the *non-protected* bands' diagonal.
     """
 
     protected_mask: jax.Array

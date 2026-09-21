@@ -225,13 +225,12 @@ carry about 1e-12 of the residue mass and are not the cause. Resolution
 inner loop (branch `feat/qsgw-two-level-2026-09-03`, not on main) removes it
 structurally.
 
-**3. The Σ(ω) grid must contain every protected band at every k, and must not
-be wider than it needs to be.** The default grid is ±5 eV around E_F; a
-protected window of 8 valence bands on Si reaches −12 eV. A protected band
-outside the grid triggers the all-caps warning from
-`BandPartition.warn_if_protected_outside_grid`, and its off-diagonals then mix
-edge-clamped Σ values into the eigenproblem. Set the grid to the window plus a
-margin (2 eV is enough for the frozen rules, pitfall 12). Do not chase
+**3. The Σ(ω) support must cover every retained band's current energy.** The
+requested grid selects the initial partition; a window of 8 valence bands on
+Si reaches −12 eV. Later motion of retained identities grows the outer sampled
+endpoints before Σ evaluation, without changing membership (pitfall 16).
+Quadrature certificates must cover that support; a classification warning
+alone is not a coverage certificate. Do not chase
 semicore states by widening: the node count of the crossing rules grows like
 bandwidth × ln(10/ε)/(π η), and a [−90, +20] eV CrI3 grid at η = 0.25 eV cost
 80 min per Σ evaluation on 16 GPUs. Keep the grid within ±15 eV and let deeper
@@ -352,19 +351,18 @@ a support that really crosses later is a box escape and rebuilds), and the
 disk cache never returns a certificate above eps. Do not loosen eps to admit
 a rule.
 
-**16. One energy-dependent pad supports classification and quadrature.**
-A DFT-labelled band enters the protected set when its current all-k energy
-range lies entirely inside the requested, mu-anchored window. Previously
-protected members remain protected while their range lies within that window
-padded by `pad(E) = 0.5 eV + 0.10 |E - mu|`. The pad is 0.5 eV at mu,
-1.5 eV at 10 eV and 2.5 eV at 20 eV. This replaces the inward 2 eV edge
-margin and frozen sorted-index set: near-mu motion is small, while Na's
-spectrum stretches by about ten percent and the upper states moved 1.2–2.2 eV.
-Classification runs on every map, including rCROP trials. An escape prints
-the band identity, k, energy and pad; the state is reclassified and the
-quadrature planner retains its existing rebuild-on-box-escape behavior.
-The quadrature state support uses the same pad; pole padding and certified
-acceptance are unchanged. The sampled omega grid is the REQUESTED grid at
+**16. Initialize identity masks once; update energy coverage independently.**
+At initialization a DFT-labelled band enters when its all-k energy range lies
+inside the requested, mu-anchored window, with local reference-multiplet and
+initial Fermi-frontier closure. An authenticated SC warm seed can supply the
+existing masks. After initialization, both protected and in-range masks stay
+fixed on every map, including rCROP trials; energy motion never promotes or
+demotes another identity. `_classify_sc_partition` owns this policy.
+
+Current energies, identity-to-column assignments and fixed-N occupations still
+update. The energy-dependent pad `0.5 eV + 0.10 |E - mu|` supports sampled-grid
+growth and quadrature coverage; it does not trigger later reclassification.
+The sampled omega grid is the REQUESTED grid at
 map 0 for every state, so SC iteration 1 equals the one-shot and a state
 outside the requested window keeps the one-shot treatment (pre-padding the
 grid re-evaluated such states and moved the GN-PPM invariance fixture by
@@ -399,10 +397,11 @@ meV at map 6.
 
 **18. Partition identities are per k, and Hamiltonian masks use the carry's
 basis.** Overlap assignment against reference DFT multiplets finds the sorted
-QP columns carrying each identity on every map. Classification uses those raw
-assigned energies. Whole reference multiplets are protected locally at each
-k; promotion at one k does not transitively promote the same label at every
-other k. The Hamiltonian and rCROP carry are in the DFT basis, so their masks
+QP columns carrying each identity on every map. Initial classification uses
+those assigned energies and closes whole reference multiplets locally at each
+k; initial closure at one k does not transitively promote the label at every
+other k. The resulting masks stay fixed. The Hamiltonian and rCROP carry are
+in the DFT basis, so their masks
 are `(k, DFT identity)`, with sorted-column correspondence printed explicitly.
 Applying sorted-column masks directly to that carry would protect the wrong
 states at a crossing. Scissor fits preserve paired DFT/QP identity columns,
@@ -439,8 +438,8 @@ its absolute position moves 41 meV when bands 11-13 join the set (bands
 5 alone and 5-10 agree to 2.5 meV). Bands 5-10 converge to about 1 meV per
 map by accepted map 22 and reach a 2 meV rCROP residual at map 28; 5-13 is
 still at 5-9 meV per map on bands 12-13 at map 26. Those measurements used `sigma_omega_max_ev = 21` to select 5-10.
-Under the all-k entry rule in pitfall 16 the same +21 eV request admits
-5-12 and promotes 13, because the inward margin has been removed; that run
+In the historical per-map reclassification run, the same +21 eV request admitted
+5-12 and promoted 13 after removal of the inward margin; that run
 then paces like the old +24 arm (bands 11-13 at 240-440 meV per accepted
 pair at map 10). A window value no longer implies the old membership: on
 Na, `sigma_omega_max_ev = 19` gives trusted 5-10 (band 11 tops out at
