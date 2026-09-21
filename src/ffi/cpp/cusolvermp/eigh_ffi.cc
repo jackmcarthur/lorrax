@@ -21,6 +21,7 @@
 //   - NCCL scratch in the CAL→NCCL shim (lives outside any FFI call)
 
 #include <complex>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -169,6 +170,34 @@ static ffi::Error EighImpl(
 
     // d_info is never read (mp_st already indicates success); skip the
     // per-call memset.  cuSOLVERMp writes into d_info in Syevd.
+
+    // Profiled calls split input readiness from the vendor's synchronous
+    // MatrixView/communicator setup.  cuBLASMp and cuSOLVERMp share this
+    // context stream, so this fence drains the input copy and any preceding
+    // service work before cusolverMpSyevd enters that setup.  The opt-in
+    // marker is also durable when the vendor call never returns.
+    if (prof) {
+        if (ctx->rank == 0) {
+            std::fprintf(stderr,
+                "[lorrax.ffi.prof] eigh pre-syevd-drain begin "
+                "n=%ld mb=%ld nb=%ld\n",
+                (long)n, (long)mb, (long)nb);
+            std::fflush(stderr);
+        }
+        const auto drain_start = std::chrono::steady_clock::now();
+        LORRAX_CUDA_CHECK(cudaStreamSynchronize(ctx->stream));
+        const auto drain_end = std::chrono::steady_clock::now();
+        if (ctx->rank == 0) {
+            const double drain_ms =
+                std::chrono::duration<double, std::milli>(
+                    drain_end - drain_start).count();
+            std::fprintf(stderr,
+                "[lorrax.ffi.prof] eigh pre-syevd-drain end "
+                "n=%ld mb=%ld nb=%ld elapsed=%.2f ms\n",
+                (long)n, (long)mb, (long)nb, drain_ms);
+            std::fflush(stderr);
+        }
+    }
 
     // The public eigh operation does not donate A. cuSOLVERMp overwrites its
     // operand during tridiagonalisation, so only the private tile may be passed.
