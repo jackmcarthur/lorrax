@@ -3470,9 +3470,16 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     iteration_static_head_terms = inputs.static_head_terms
     head_occ_kn = None
     pt = getattr(inputs, "parallel_transport", None)
+    # The shared-pole route also carries the direct-only head
+    # (no_local_fields) through this frozen DFT response, with the wings
+    # skipped and the fold never evaluated (``gw.shared_pole_head``).
+    direct_only_shared_pole = (
+        inputs.config.head.correction is HeadCorrection.NO_LOCAL_FIELDS
+        and inputs.config.sigma.w_model == "shared_pole")
     fixed_dft_full_head = (inputs.fixed_dft_head_response is not None or
-        (pt is None and inputs.config.head.correction is HeadCorrection.FULL
-         and inputs.config.sigma.w_model == "shared_pole"))
+        (pt is None and inputs.config.sigma.w_model == "shared_pole"
+         and (inputs.config.head.correction is HeadCorrection.FULL
+              or direct_only_shared_pole)))
     if pt is not None or fixed_dft_full_head:
         from .head_correction import compute_static_head_terms_from_sample
         from .qsgw_head import finalize_iteration_head_samples
@@ -3590,7 +3597,8 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             iteration_head_response = build_dft_head_response(
                 inputs.wfns_dft, np.asarray(head_omegas, dtype=np.complex128),
                 input_dir=inputs.input_dir, mesh=inputs.mesh_xy, wfn=inputs.wfn,
-                meta=inputs.meta, config=inputs.config)
+                meta=inputs.meta, config=inputs.config,
+                wings=not direct_only_shared_pole)
         # The frozen response is the DFT direct response; its Sigma-side
         # ladder (energies, occupations, reference) is the DFT one, a step by
         # band index.  On a metal every head consumer (the static terms here,
@@ -3614,6 +3622,10 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
                 "fixed DFT head response does not match the current "
                 "screening frequency plan")
         inputs.print_fn(
+            "    SC head: fixed DFT direct response on the current screening "
+            "frequency plan; direct head only, no wings, no fold "
+            "(head_correction=no_local_fields, sc_head_update=off)"
+            if direct_only_shared_pole else
             "    SC head: fixed DFT direct response plus matching wings "
             "on the current screening frequency plan; local fields fold "
             "once through this iteration's W (sc_head_update=off)")

@@ -335,6 +335,12 @@ both (`ppm_tau_kernel` `prep_w`). The factor spin axis is 1 on every admitted de
 vertex, its capacity is `2/(n_spin n_spinor)` states per band, and the fold runs on the `n_mu × n_mu` body; the
 head's capacity identity carries the store's `nspinor` because the ledger unit is `16 Q (N_spinor N_mu)² / P`.
 
+**Ordered stores.** `head_correction = full` refuses (`GATE shared_pole_head_ordered`): the Gamma body evaluator is
+the even form `b (s − Λ)⁻¹ b†`, not the signed model (SP 2), and the signed wing/body fold is deferred (owner scope
+2026-09-21). The head an ordered store carries is `head_correction = no_local_fields`, the direct tensor `S(ω)`
+finalized with no Gamma body; it needs no time-reversal assumption
+([four-current heads §3.5](../theory/four-current-head-corrections.md), `tests/test_head_direct_ordered.py`).
+
 **Debug.** `LORRAX_DEBUG_SHARED_POLE_EVEN_PART` (debug only) feeds `[W₊(q) + W₊(−q)ᵀ]/2` to both branches of an
 ordered store, so `Σ^odd = Σ[W] − Σ[W^even]` can be measured; see `docs/dev/env_vars.md`.
 

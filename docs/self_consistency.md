@@ -642,16 +642,22 @@ The full head evaluates only the time-reversal-even charge Gamma body, on
 scalar and two-component (N_spinor = 2) stores alike — the vertices trace the
 spinor index and the body is the spin-traced charge operator
 ([shared-pole model §8](architecture/shared_pole_model.md#8-the-σ-consumer)).
-An ordered (time-reversal-broken) deck refuses at input resolution
-(`GATE shared_pole_head_ordered`,
+An ordered (time-reversal-broken) deck with `head_correction = full` refuses
+at input resolution (`GATE shared_pole_head_ordered`,
 `shared_pole_head.refuse_unsupported_shared_pole_head`), before any bank or
-constructor runs; an N_spinor = 4 bispinor-lift store refuses by name
+constructor runs: the wing/body fold of a signed store is not implemented
+(owner scope 2026-09-21). The head an ordered store carries is the **direct
+frequency-dependent head**, `head_correction = no_local_fields`: the
+shared-pole route builds the same sharded direct response as the full head
+(wings skipped) and finalizes it with no Gamma body, so nothing folds; the
+direct tensor `S(ω)` needs no time-reversal assumption (the
+`gw.shared_pole_head` docstring states the identity, `tests/test_head_direct_ordered.py`
+pins it). On the one-shot and `sc_head_update = off` routes this head has no
+intraband Drude/Thomas–Fermi piece on a metal (KNOWN_LORRAX_ISSUES, one-shot
+metal head). An N_spinor = 4 bispinor-lift store refuses by name
 (`GATE shared_pole_head_nspinor`) because its Gamma completion is the packed
-photon head. A one-shot deck on an ordered system uses `head_correction = off`;
-a self-consistent shared-pole deck may also run headless as a brute-grid
-development mode (owner policy 2026-09-18). With `head_correction = full` the
-ordered head still refuses, so head off is the only valid setting there until
-the signed Gamma head lands. The measured scalar map-1 q=0 Gram risk is a
+photon head. `head_correction = off` remains the headless brute-grid
+development mode (owner policy 2026-09-18). The measured scalar map-1 q=0 Gram risk is a
 warning, not a parse refusal; the `shared_pole_gram_valid` gate is unchanged.
 
 Validation on branch `investigate/shared-pole-sc-quadrature-2026-09-10`:

@@ -2800,6 +2800,7 @@ def build_dft_head_response(
     meta,
     config,
     wfn_fingerprint_binding=None,
+    wings: bool = True,
 ) -> IterationHeadResponse:
     """Build the one-shot DFT head on exactly the chi0 band manifold.
 
@@ -2808,6 +2809,12 @@ def build_dft_head_response(
     use ``[b0,b4_chi)``; constructing the scalar from every band in a larger
     dipole file while the body uses ``number_bands_chi`` is refused by shape
     and slicing here rather than silently mixing transition manifolds.
+
+    ``wings=False`` builds the direct head alone (``Y_x = Z_y = None``): the
+    ``head_correction = no_local_fields`` response, whose consumer
+    (:func:`finalize_iteration_head_sample`) never folds.  ``S_direct``
+    needs no time-reversal assumption (``gw.shared_pole_head`` docstring), so
+    this is the head an ordered store carries.
     """
     import os
 
@@ -2841,11 +2848,13 @@ def build_dft_head_response(
         cell_volume=float(meta.cell_volume), nk_tot=int(meta.nk_tot),
         nspin=int(wfn.nspin), nspinor=normalization_nspinor,
         eta_ry=float(config.head.wcoul0_eta))
-    Y_x, Z_y = head_wings_sharded(
-        jnp.asarray(velocity_cart), wfns, energies, occupations, z,
-        mesh=mesh, nb_logical=nb_logical, nk_tot=int(meta.nk_tot),
-        nspin=int(wfn.nspin), nspinor=normalization_nspinor,
-        eta_ry=float(config.head.wcoul0_eta))
+    Y_x = Z_y = None
+    if wings:
+        Y_x, Z_y = head_wings_sharded(
+            jnp.asarray(velocity_cart), wfns, energies, occupations, z,
+            mesh=mesh, nb_logical=nb_logical, nk_tot=int(meta.nk_tot),
+            nspin=int(wfn.nspin), nspinor=normalization_nspinor,
+            eta_ry=float(config.head.wcoul0_eta))
     # Hard lifetime boundary: this module previously had zero
     # ``block_until_ready`` calls (unlike ``screening.py``'s per-stage
     # discipline), so the direct head/wings built here stayed queued,

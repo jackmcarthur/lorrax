@@ -369,7 +369,17 @@ Facts at `34228021`, with the derivation and branch assignment owned by
 * The scalar charge head loses no magnetic component: its antisymmetric
   Cartesian response is annihilated by `q_a S_ab q_b`, so its odd residue is
   exactly zero. HL-PPM's real probe cannot determine an odd residue and keeps
-  the single-residue fit.
+  the single-residue fit. Stated as an identity (2026-09-21): combining the
+  two Lehmann terms of one unordered pair at one `k` gives
+  `(f_j−f_i)/Δ² [T̄_ab/(z−Δ) − T_ab/(z+Δ)] = 2(f_j−f_i)[Re T_ab − i z Im T_ab/Δ]/(Δ(z²−Δ²))`,
+  `T_ab = v̄^a_ij v^b_ij`, so the `(f_j−f_i)` weight, the energy-ordered pair
+  sum, the conjugation and the denominator `Δ[(ω+iη)²−Δ²]` of §3.1 hold
+  without time reversal; only the antisymmetric `Im T_ab` (the Hall-like
+  part, nonzero on a magnet) differs in weight, and `q·S·q` kills it. The k
+  sum runs over the full zone unfolded by the measured magnetic group. On the
+  shared-pole route an ordered store carries this direct head alone
+  (`head_correction = no_local_fields`); its wing/body fold is deferred
+  (owner scope 2026-09-21). `tests/test_head_direct_ordered.py`.
 * MPA is **not** a magnetic fallback at this tip. Its complex-contour kernel
   applies both resolvent rows to one orientation and completes with the
   time-reversal-symmetric conjugate, so it also deletes the odd channel.
