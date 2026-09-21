@@ -207,6 +207,14 @@ def _qp_occupation_attrs(occupation_state) -> dict[str, object]:
         QP_WFN_OCC_NELEC_ATTR: float(occupation_state.n_electrons),
     }
 
+
+def _h5_attr_scalars(attrs) -> dict:
+    """Return HDF5 scalar attributes with byte strings decoded."""
+    return {
+        key: (value.decode() if isinstance(value, bytes) else value)
+        for key, value in attrs.items()
+    }
+
 #: Small top-level dataset carried by a restart bundle to say which WFN
 #: supplied its matched ``psi_parent_y`` / ``enk_full`` state.  The payload is
 #: JSON owned and parsed in this module; restart I/O only transports the
@@ -894,10 +902,7 @@ def validate_qp_wfn_h5(
             "band_stop": h5.attrs.get("qp_wfn_band_stop"),
             "source": h5.attrs.get("qp_wfn_source", ""),
         }
-        stamp = {
-            key: (value.decode() if isinstance(value, bytes) else value)
-            for key, value in stamp.items()
-        }
+        stamp = _h5_attr_scalars(stamp)
         expected_stamp = {
             "scheme": QP_WFN_SCHEME, "band_start": int(band_start),
             "band_stop": int(band_stop),
@@ -924,10 +929,7 @@ def validate_qp_wfn_h5(
             expected_occ_attrs = _qp_occupation_attrs(occupation_state)
             stored_occ_attrs = {
                 name: h5.attrs.get(name) for name in expected_occ_attrs}
-            stored_occ_attrs = {
-                key: (value.decode() if isinstance(value, bytes) else value)
-                for key, value in stored_occ_attrs.items()
-            }
+            stored_occ_attrs = _h5_attr_scalars(stored_occ_attrs)
             if stored_occ_attrs != expected_occ_attrs:
                 raise ValueError(
                     "validate_qp_wfn_h5: closed occupation provenance "
