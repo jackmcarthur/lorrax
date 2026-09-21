@@ -4564,18 +4564,19 @@ def _sc_map_gain_for_call(
 def _process_memory_receipt() -> str:
     """Per-map host-memory receipt for the SC loop.
 
-    The pinned evidence is the FFI's own accounting
-    (``live_ctxs``/``staging_kB`` from ``ffi.io.staging_totals``): a rising
-    ctx count is a ctx-lifetime leak, a flat count with rising bytes is
-    grow-only staging (the writer staging buffer reaches ~270 MB).  ``VmLck``
-    cannot serve that role — it counts mlock(2), and CUDA pinned
+    The FFI reports this process's instantaneous live context count and the
+    sum of those contexts' staging capacities as ``live_ctxs`` and
+    ``staging_kB``.  A sequence of samples can locate a trend but does not by
+    itself identify a leak or its allocator.  ``VmLck`` cannot measure CUDA
+    pinned staging — it counts mlock(2), and CUDA pinned
     ``cudaMallocHost`` memory is driver-managed and reads 0 kB even in a
     process certainly holding staging buffers (measured 2026-09-20), so it
-    stays only as a cross-check.  ``VmRSS``/``VmHWM`` bound ordinary heap
-    growth and the descriptor counts catch an HDF5 handle a map never
-    closed.  The measured failure this exists for: map 6 of run 14c failed a
-    2 MiB ``cudaMallocHost`` read-staging allocation while RSS was 10.4 GiB
-    of a 256 GiB node.
+    stays only as a separate process snapshot.  ``VmRSS``/``VmHWM`` and the
+    descriptor counts are likewise process-level observations: an ``.h5``
+    descriptor is not a phdf5 context, and flat descriptors beside rising RSS
+    do not establish fragmentation.  The measured failure this exists for:
+    map 6 of run 14c failed a 2 MiB ``cudaMallocHost`` read-staging allocation
+    while RSS was 10.4 GiB of a 256 GiB node.
     """
     import os
     fields = {}
@@ -4587,12 +4588,9 @@ def _process_memory_receipt() -> str:
                     fields[key] = rest.strip()
         fds = os.listdir("/proc/self/fd")
         nfd = len(fds)
-        # Live HDF5 handles = live phdf5 ctxs (each holds the pinned staging
-        # buffers).  VmLck cannot see cudaMallocHost memory -- it counts
-        # mlock(2) only and reads 0 kB on a process that certainly pins -- so
-        # the ctx count is the leak discriminator here: flat handles with
-        # rising VmRSS/VmHWM is fragmentation inside a bounded ctx set, a
-        # rising handle count is a ctx (and therefore pinned) leak.
+        # Count this process's descriptors whose resolved target names an HDF5
+        # file.  This includes owners other than phdf5 and is deliberately
+        # reported separately from the native registry's exact live_ctxs.
         nh5 = 0
         for fd in fds:
             try:
@@ -6776,7 +6774,7 @@ def dump_qp_wfn_artifacts(
 
     from file_io.qp_wfn import (
         validate_qp_wfn_h5, write_qp_rotations_h5, write_qp_wfn_h5)
-    from file_io.restart_bundle import read_qp_rotations_artifact
+    from file_io.restart_bundle import validate_qp_rotations_artifact
 
     from psp.get_DFT_mtxels import spin_degeneracy_factor
     enk_loop_ry, U_loop, efermi_ry = final_qp_eigenstates(
@@ -6937,56 +6935,15 @@ def dump_qp_wfn_artifacts(
         )
 
     def _validate_qp_rotations(staging_path):
-        artifact = read_qp_rotations_artifact(staging_path)
-        expected = {
-            "U_mnk": np.asarray(U_full),
-            "E_qp_nk_rydberg": np.asarray(enk_full_ry, dtype=np.float64),
-            "band_range": np.asarray(
-                [band_slices.b0, band_slices.b3], dtype=np.int64),
-            "kpoints_crys": np.asarray(sym.unfolded_kpts, dtype=np.float64),
-            "kgrid": np.asarray(kgrid, dtype=np.int64),
-        }
-        optional = {
-            "E_full_nk_rydberg": final_energies_full_ry,
-            "occupations_kn": (
-                None if final_occ_state is None
-                else np.asarray(final_occ_state.f_kn)),
-        }
-        for name, want in expected.items():
-            if not np.array_equal(np.asarray(artifact[name]), want):
-                raise ValueError(
-                    "QP rotations staging validation: closed dataset "
-                    f"{name!r} differs from the final state handed to the "
-                    "writer.")
-        for name, want in optional.items():
-            present = name in artifact
-            if present != (want is not None):
-                raise ValueError(
-                    "QP rotations staging validation: optional dataset "
-                    f"{name!r} presence differs from the final state.")
-            if present and not np.array_equal(
-                    np.asarray(artifact[name]), np.asarray(want)):
-                raise ValueError(
-                    "QP rotations staging validation: closed dataset "
-                    f"{name!r} differs from the final state handed to the "
-                    "writer.")
-        if artifact["source_wfn_fingerprint"] is None:
-            raise ValueError(
-                "QP rotations staging validation: closed artifact has no "
-                "source-WFN fingerprint.")
-        expected_occ_provenance = (
-            None if final_occ_state is None else {
-                "occ_hash": final_occ_state.occ_hash,
-                "mu_ry": float(final_occ_state.mu_ry),
-                "smearing_family": str(final_occ_state.smearing_family),
-                "smearing_width_ry": float(
-                    final_occ_state.smearing_width_ry),
-                "n_electrons": float(final_occ_state.n_electrons),
-            })
-        if artifact["occupation_provenance"] != expected_occ_provenance:
-            raise ValueError(
-                "QP rotations staging validation: closed occupation "
-                "provenance differs from the final occupation state.")
+        validate_qp_rotations_artifact(
+            staging_path,
+            U_mnk=U_full, E_qp_nk_rydberg=enk_full_ry,
+            band_range=(band_slices.b0, band_slices.b3),
+            kpoints_crys=sym.unfolded_kpts, kgrid=kgrid,
+            enk_full_nk_ry=final_energies_full_ry,
+            occupations_kn=(None if final_occ_state is None
+                            else final_occ_state.f_kn),
+            occupation_state=final_occ_state)
 
     rank0_atomic_file_transaction(
         qp_rot_path, stage="qp_rotations_h5_write",

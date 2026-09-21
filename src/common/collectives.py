@@ -1516,10 +1516,13 @@ def rank0_atomic_file_transaction(
     def _publish():
         temporary = None
         try:
-            # O_EXCL gives the writer a private sibling path while the mode
+            # O_EXCL gives the writer a private sibling path while 0666
             # follows the process umask, like a direct h5py ``"w"`` open.
-            # The file remains present: both final-artifact writers truncate
-            # an existing path and therefore retain exclusive ownership.
+            # tempfile.mkstemp hard-codes 0600, which would silently change
+            # the established group-accessible artifact mode (0660 under the
+            # production 0007 umask).  The file remains present: both final
+            # artifact writers truncate an existing path and therefore retain
+            # exclusive ownership.
             for _ in range(16):
                 candidate = os.path.join(
                     directory,

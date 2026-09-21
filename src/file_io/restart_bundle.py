@@ -1197,6 +1197,62 @@ def read_qp_rotations_artifact(h5_path: str) -> dict:
     return arrays
 
 
+def validate_qp_rotations_artifact(
+        path, *, U_mnk, E_qp_nk_rydberg, band_range, kpoints_crys, kgrid,
+        enk_full_nk_ry=None, occupations_kn=None,
+        occupation_state=None) -> None:
+    """Require a closed companion file to equal its publication inputs."""
+    if (occupations_kn is None) != (occupation_state is None):
+        raise ValueError(
+            "QP rotations validation needs occupations_kn and "
+            "occupation_state together.")
+    artifact = read_qp_rotations_artifact(path)
+    required = {
+        "U_mnk": np.asarray(U_mnk),
+        "E_qp_nk_rydberg": np.asarray(E_qp_nk_rydberg, dtype=np.float64),
+        "band_range": np.asarray(band_range, dtype=np.int64),
+        "kpoints_crys": np.asarray(kpoints_crys, dtype=np.float64),
+        "kgrid": np.asarray(kgrid, dtype=np.int64),
+    }
+    optional = {
+        "E_full_nk_rydberg": enk_full_nk_ry,
+        "occupations_kn": occupations_kn,
+    }
+    for name, expected in required.items():
+        if not np.array_equal(np.asarray(artifact[name]), expected):
+            raise ValueError(
+                "QP rotations staging validation: closed dataset "
+                f"{name!r} differs from the state handed to the writer.")
+    for name, expected in optional.items():
+        present = name in artifact
+        if present != (expected is not None):
+            raise ValueError(
+                "QP rotations staging validation: optional dataset "
+                f"{name!r} presence differs from the writer request.")
+        if present and not np.array_equal(
+                np.asarray(artifact[name]), np.asarray(expected)):
+            raise ValueError(
+                "QP rotations staging validation: closed dataset "
+                f"{name!r} differs from the state handed to the writer.")
+    if artifact["source_wfn_fingerprint"] is None:
+        raise ValueError(
+            "QP rotations staging validation: closed artifact has no "
+            "source-WFN fingerprint.")
+    expected_provenance = (
+        None if occupation_state is None else {
+            "occ_hash": occupation_state.occ_hash,
+            "mu_ry": float(occupation_state.mu_ry),
+            "smearing_family": str(occupation_state.smearing_family),
+            "smearing_width_ry": float(
+                occupation_state.smearing_width_ry),
+            "n_electrons": float(occupation_state.n_electrons),
+        })
+    if artifact["occupation_provenance"] != expected_provenance:
+        raise ValueError(
+            "QP rotations staging validation: closed occupation provenance "
+            "differs from the state handed to the writer.")
+
+
 
 def read_qp_rotations_full_bz(h5_path: str, datasets=None) -> dict:
     """``qp_wfn_rotations.h5``'s k-indexed arrays, ON THE FULL BZ.
