@@ -2492,10 +2492,10 @@ def _fractional_pair_scan_face(
         if right_vectors.ndim != 2 or left_vectors.ndim != 2:
             raise ValueError("fractional pair projection vectors must be matrices")
         right_local = jax.lax.dynamic_slice(
-            right_vectors, (y_idx * nmu_y_loc, 0),
+            right_vectors, (y_idx * nmu_y_loc, jnp.int32(0)),
             (nmu_y_loc, right_vectors.shape[1]))
         left_local = jax.lax.dynamic_slice(
-            left_vectors, (x_idx * nmu_x_loc, 0),
+            left_vectors, (x_idx * nmu_x_loc, jnp.int32(0)),
             (nmu_x_loc, left_vectors.shape[1]))
 
     def _gather_mun(psi_mun_local, g_lo):
