@@ -87,37 +87,83 @@ def test_head_projection_logical_bound_precedes_tensor_reads(monkeypatch, q_coun
     assert reached == (["realizer", "tensor_read"] if allowed else [])
 
 
-def test_two_component_store_refuses_by_its_own_name_not_as_capacity(monkeypatch):
-    """N_spinor != 1 was folded into the capacity-geometry message; it is its own rule."""
+def _two_component_geometry(monkeypatch, *, map_nspinor, store_nspinor):
+    """A 368-centroid Gamma parent whose map and store may disagree on N_spinor."""
     from file_io import slab_io
+    from gw import qgrid_symmetry
     from gw.gw_config import HeadCorrection
     from gw.mpa import sample_plan
-    from gw.shared_pole_head import build_shared_pole_head
     from gw.shared_pole_recipe import CapacityLedger
 
     mesh = NS(size=4, shape={"x": 2, "y": 2})
-    meta = NS(nk_tot=1, nspinor=2, n_rmu=368, mu_basis=NS(n_packed=368, n_logical=368))
+    meta = NS(nk_tot=1, nspinor=map_nspinor, n_rmu=368,
+              mu_basis=NS(n_packed=368, n_logical=368))
     meta.shared_pole_capacity = CapacityLedger(meta, mesh_xy=mesh, device_budget_bytes=1 << 30)
     meta.shared_pole_capacity.live_stages = ()
-    header = dict(q_irr_full_idx=[0], n_q_full=1, n_mu_logical=368, nspinor=2,
+    header = dict(q_irr_full_idx=[0], n_q_full=1, n_mu_logical=368, nspinor=store_nspinor,
                   representation="scalar-trs-even-s")
     config = NS(head=NS(uses_bgw_metal_q0shift=False, correction=HeadCorrection.FULL))
     monkeypatch.setattr(sample_plan, "plan_z", lambda _plan: np.array([1+.5j]))
+    reached = []
+    monkeypatch.setattr(qgrid_symmetry, "shared_pole_operator_realizer",
+        lambda *_args, **_kwargs: reached.append("realizer"))
+
+    class TensorReadReached(Exception):
+        pass
 
     def tensor_read(*_args, **_kwargs):
-        raise AssertionError("factors read before N_spinor was checked")
+        reached.append("tensor_read")
+        raise TensorReadReached
 
     monkeypatch.setattr(slab_io, "SlabIO", tensor_read)
+    return meta, header, config, mesh, reached, TensorReadReached
+
+
+def _build(meta, header, config, mesh):
+    from gw.shared_pole_head import build_shared_pole_head
+    return build_shared_pole_head(dict(path="not-opened.h5"), header, None, None, meta, config,
+        mesh_xy=mesh, wfn=None, response=NS(omegas=(1+.5j,)),
+        head_resolver=None, plan=object(), material_class="semiconductor",
+        occupation_state=None)
+
+
+def test_two_component_store_reaches_the_gamma_body_with_its_spin_geometry(monkeypatch):
+    """The two-component store holds the same spin-traced charge operator (its factor
+    spin axis is 1, the head vertices trace the spinor index), so the head evaluates it
+    like a scalar store.  The ledger's unit is U = 16 Q (N_spinor N_mu)^2 / P; the head's
+    geometry identity must carry the store's N_spinor or every two-component store would
+    refuse as a geometry mismatch the moment the representation door admitted it."""
+    meta, header, config, mesh, reached, TensorReadReached = _two_component_geometry(
+        monkeypatch, map_nspinor=2, store_nspinor=2)
+    with pytest.raises(TensorReadReached):
+        _build(meta, header, config, mesh)
+    assert reached == ["realizer", "tensor_read"]
+
+
+@pytest.mark.parametrize("map_nspinor,store_nspinor", [(1, 2), (2, 1)])
+def test_store_and_map_must_agree_on_spin_geometry(monkeypatch, map_nspinor, store_nspinor):
+    """A store built for another spin geometry is a geometry mismatch, not a spin rule."""
+    meta, header, config, mesh, reached, _ = _two_component_geometry(
+        monkeypatch, map_nspinor=map_nspinor, store_nspinor=store_nspinor)
+    with pytest.raises(ValueError, match="store/current-map geometry mismatch"):
+        _build(meta, header, config, mesh)
+    assert reached == []
+
+
+def test_bispinor_lift_store_refuses_the_scalar_charge_head_by_name(monkeypatch):
+    """N_spinor = 4 is the kinetic-balance lift; its Gamma completion is the packed
+    photon head, so the scalar charge head refuses it by its own name before any read."""
+    meta, header, config, mesh, reached, _ = _two_component_geometry(
+        monkeypatch, map_nspinor=4, store_nspinor=4)
     with pytest.raises(ValueError, match="GATE shared_pole_head_nspinor"):
-        build_shared_pole_head(dict(path="not-opened.h5"), header, None, None, meta, config,
-            mesh_xy=mesh, wfn=None, response=NS(omegas=(1+.5j,)),
-            head_resolver=None, plan=object(), material_class="semiconductor",
-            occupation_state=None)
+        _build(meta, header, config, mesh)
+    assert reached == []
 
 
 @pytest.mark.parametrize("model,correction,trs,nspinor,rule", [
     ("shared_pole", "full", False, 1, "GATE shared_pole_head_ordered"),
-    ("shared_pole", "full", True, 2, "GATE shared_pole_head_nspinor"),
+    ("shared_pole", "full", True, 2, None),
+    ("shared_pole", "full", True, 4, "GATE shared_pole_head_nspinor"),
     ("shared_pole", "full", True, 1, None),
     ("shared_pole", "off", False, 2, None),
     ("shared_pole", "no_local_fields", False, 2, None),
