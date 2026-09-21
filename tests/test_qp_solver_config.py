@@ -303,6 +303,21 @@ def test_sc_input_keys(tmp_path):
                 "buffer_edges", 3, "one_sided")
 
 
+def test_sc_qp_seed_file_is_explicit_and_sc_only(tmp_path):
+    cfg = _config(
+        tmp_path,
+        "qp_solver = self_consistent\n"
+        "sc_initial_qp_rotations_file = charge/qp_wfn_rotations.h5\n")
+    assert cfg.sc.initial_qp_rotations_file == (
+        "charge/qp_wfn_rotations.h5")
+
+    with pytest.raises(ValueError, match="requires qp_solver=self_consistent"):
+        _config(
+            tmp_path,
+            "qp_solver = one_shot_dft\n"
+            "sc_initial_qp_rotations_file = charge/qp_wfn_rotations.h5\n")
+
+
 def test_sc_exact_degeneracy_tolerance_refuses_mev_pair_averaging(tmp_path):
     with pytest.raises(ValueError, match="sc_exact_degeneracy_tol_ev"):
         _config(tmp_path, "sc_exact_degeneracy_tol_ev = 0.0017\n")

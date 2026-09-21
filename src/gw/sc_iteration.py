@@ -421,6 +421,10 @@ class SCInputs:
     wfn_fingerprint_binding: object | None = None
     charge_zeta_identity: dict | None = None
     tensors_filename: str | None = None
+    #: Human-readable origin of the initial Hamiltonian carry.  This changes
+    #: snapshot provenance only; the map always solves its own occupations
+    #: and partition from the carry it receives.
+    initial_state_role: str = "dft_seed"
     print_fn: Callable = print
     # Selected ladder/iteration/verdict lines go to the driver's production
     # record.  Component chatter remains on ``print_fn`` and can still be
@@ -816,6 +820,78 @@ def make_initial_state_from_dft(inputs: SCInputs) -> SCState:
         H_qp_dft=device_put_process_local(H0, rep),
         iteration=0,
         partition=inputs.partition,
+        occupation_state=occ_state,
+        head_surface_weight_kn=head_surface_weight_kn,
+    )
+
+
+def make_initial_state_from_qp_rotations(
+    inputs: SCInputs,
+    artifact_path: str,
+) -> SCState:
+    """Seed a new SC run from a compact QP eigensystem in the DFT basis.
+
+    This is deliberately narrower than nonlinear restart.  Only the active
+    Hamiltonian ``U diag(E) U^H`` is imported.  The selected mean-field WFN,
+    pristine kinetic/ionic operator, DFT tail, current occupation solve,
+    protected-identity classification, fixed quadrature session and rCROP
+    history all remain owned by the new run.
+    """
+    from file_io.qp_wfn import authenticate_qp_rotations_source_wfn
+    from file_io.restart_bundle import (
+        read_qp_rotations_artifact, validate_qp_rotations_frame)
+
+    artifact = read_qp_rotations_artifact(artifact_path)
+    authenticate_qp_rotations_source_wfn(
+        artifact, inputs.wfn, artifact_path=artifact_path,
+        wfn_fingerprint_binding=inputs.wfn_fingerprint_binding)
+    U_full, E_full, artifact_range = validate_qp_rotations_frame(
+        artifact,
+        kgrid=tuple(int(x) for x in inputs.wfn.kgrid),
+        kpoints_crys=np.asarray(inputs.sym.unfolded_kpts, dtype=np.float64),
+        artifact_path=artifact_path,
+    )
+    expected_range = tuple(int(x) for x in inputs.band_slices.sigma_range)
+    if artifact_range != expected_range:
+        raise ValueError(
+            "SC QP seed band range differs from this run: "
+            f"artifact={artifact_range}, run={expected_range}.")
+    H_full = np.einsum(
+        "kmn,kn,kln->kml", U_full, E_full, np.conj(U_full), optimize=True)
+
+    H_loop = H_full
+    U_loop = U_full
+    E_loop = E_full
+    ks = getattr(inputs, "kstar", None)
+    if ks is not None and not ks.is_identity:
+        H_loop = np.asarray(ks.select(H_full), dtype=np.complex128)
+        U_loop = np.asarray(ks.select(U_full), dtype=np.complex128)
+        E_loop = np.asarray(ks.select(E_full), dtype=np.float64)
+    rep3 = NamedSharding(inputs.mesh_xy, P(None, None, None))
+
+    # Seed the SAME occupation owner the first map calls, on the new run's
+    # active spectrum plus its original DFT tail.  The table is diagnostic
+    # initial state only; gw_iteration_map re-solves it from its own entry
+    # ladder before G/chi/W/Sigma consume anything.
+    seed_enk = jnp.asarray(inputs.wfns_dft.enk).at[
+        :, inputs.band_slices.sigma].set(
+            jnp.asarray(E_full, dtype=inputs.wfns_dft.enk.dtype))
+    occ_state, head_surface_weight_kn = _solve_head_occupations(
+        inputs, seed_enk)
+    partition, _, _, _ = _classify_sc_partition(
+        E_loop, U_loop, occ_state, previous_partition=None, iteration=0,
+        inputs=inputs)
+    _record_sc(
+        inputs,
+        "  SC initial Hamiltonian: external compact QP seed "
+        f"{artifact_path}; authenticated original DFT basis; "
+        "seed-only U diag(E) U^H. Occupations, DFT tail, protected "
+        "identities, reference operators, quadrature and rCROP history "
+        "belong to this new run.")
+    return SCState(
+        H_qp_dft=device_put_process_local(H_loop, rep3),
+        iteration=0,
+        partition=partition,
         occupation_state=occ_state,
         head_surface_weight_kn=head_surface_weight_kn,
     )
@@ -2718,6 +2794,87 @@ def _partition_on_loop(partition, inputs):
         in_range_mask=ks.select(partition.in_range_mask))
 
 
+def _classify_sc_partition(
+    E_qp_ry,
+    U_qp,
+    occupation_state,
+    *,
+    previous_partition,
+    iteration: int,
+    inputs: SCInputs,
+) -> tuple[BandPartition, np.ndarray, np.ndarray, float]:
+    """Assign DFT identities and resolve the one SC partition policy.
+
+    The external-Hamiltonian seed calls this before rCROP constructs its
+    metric. Map 0 then reuses that current decision; the diagonal DFT seed
+    retains its historical map-0 rebuild with DFT hysteresis.
+    """
+    from common.collectives import gather_to_host
+    from .sc_state_identity import assign_qp_identity
+    from symmetry_maps import unfold_file_wedge_to_full_bz
+
+    ks = _kstar(inputs)
+    reference_full = np.asarray(unfold_file_wedge_to_full_bz(
+        inputs.sym, np.asarray(inputs.wfn.energies[0], dtype=np.float64)))
+    e_reference = np.asarray(inputs.e_dft_active_kn_ry) * RYD_TO_EV
+    e_reference_loop = (
+        e_reference if ks.is_identity else np.asarray(ks.select(e_reference)))
+    e_current_loop = np.asarray(E_qp_ry) * RYD_TO_EV
+    nb_identity = e_current_loop.shape[1]
+    reference_u = np.broadcast_to(
+        np.eye(nb_identity), e_current_loop.shape + (nb_identity,))
+    indices_loop, _, _, _ = assign_qp_identity(
+        reference_u, e_reference_loop,
+        np.asarray(gather_to_host(U_qp)), e_current_loop,
+        np.ones(nb_identity, dtype=bool),
+        degeneracy_tol_ev=float(inputs.config.sc.exact_degeneracy_tol_ev))
+    energies_loop = np.take_along_axis(e_current_loop, indices_loop, axis=1)
+    mu_ev = (float(occupation_state.mu_ry) * RYD_TO_EV
+             if occupation_state is not None else
+             float(inputs.wfn.efermi) * RYD_TO_EV)
+
+    seed_partition_current = (
+        int(iteration) == 0
+        and getattr(inputs, "initial_state_role", "dft_seed")
+        == "external_qp_seed"
+        and previous_partition is not None)
+    frozen_partition = (
+        previous_partition is not None
+        and (int(iteration) > 0 or seed_partition_current))
+    if frozen_partition:
+        partition = _partition_on_loop(previous_partition, inputs)
+        origin = ("external seed classification" if seed_partition_current
+                  else "map 0")
+        _record_sc(
+            inputs,
+            f"  SC map {int(iteration)} (identity, mu-anchored) partition: "
+            f"FROZEN from {origin}; protected at all k="
+            f"{_band_ranges(partition.protected_mask, band_offset=int(inputs.band_slices.b0))}, "
+            f"in_range={_band_ranges(partition.in_range_mask, band_offset=int(inputs.band_slices.b0))}; "
+            "no band enters or leaves the set for the rest of the loop.")
+    else:
+        partition = build_omega_band_partition(
+            energies_loop / RYD_TO_EV,
+            (reference_full if ks.is_identity else
+             np.asarray(ks.select(reference_full))),
+            band_offset=int(inputs.band_slices.b0),
+            omega_min_abs_ev=float(inputs.config.sigma.omega_min_ev) + mu_ev,
+            omega_max_abs_ev=float(inputs.config.sigma.omega_max_ev) + mu_ev,
+            previous_partition=(
+                None if previous_partition is None else
+                _partition_on_loop(previous_partition, inputs)),
+            mu_ev=mu_ev, current_indices_kn=indices_loop,
+            degeneracy_tol_ev=float(inputs.config.sc.exact_degeneracy_tol_ev),
+            label=f"SC map {int(iteration)} (identity, mu-anchored)",
+            print_fn=lambda line: _record_sc(inputs, line))
+    if not ks.is_identity:
+        partition = BandPartition(
+            protected_mask=ks.broadcast(partition.protected_mask),
+            in_range_mask=ks.broadcast(partition.in_range_mask))
+    partition = _apply_sc_buffer_partition(partition, inputs)
+    return partition, indices_loop, energies_loop, mu_ev
+
+
 def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     """One self-consistent QSGW step in the DFT basis.
 
@@ -2963,30 +3120,6 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     # On the first map the spectrum IS the DFT spectrum and mu IS the DFT
     # mu. Later maps follow reference identities through sorted crossings.
     # ------------------------------------------------------------------
-    # Classify energies by DFT-state identity, never by sorted eigenvalue
-    # position. The small loop-k overlap assignment is broadcast as an
-    # energy/index table; the full-BZ rotation stays band-sharded.
-    from common.collectives import gather_to_host
-    from .sc_state_identity import assign_qp_identity
-    from symmetry_maps import unfold_file_wedge_to_full_bz
-
-    reference_full = np.asarray(unfold_file_wedge_to_full_bz(
-        inputs.sym, np.asarray(inputs.wfn.energies[0], dtype=np.float64)))
-    e_reference = np.asarray(inputs.e_dft_active_kn_ry) * RYD_TO_EV
-    e_reference_loop = e_reference if ks.is_identity else np.asarray(ks.select(e_reference))
-    e_current_loop = np.asarray(E_qp_ry) * RYD_TO_EV
-    nb_identity = e_current_loop.shape[1]
-    reference_u = np.broadcast_to(np.eye(nb_identity),
-                                 e_current_loop.shape + (nb_identity,))
-    indices_loop, energies_loop, _, _ = assign_qp_identity(
-        reference_u, e_reference_loop,
-        np.asarray(gather_to_host(U_qp)), e_current_loop,
-        np.ones(nb_identity, dtype=bool),
-        degeneracy_tol_ev=float(inputs.config.sc.exact_degeneracy_tol_ev))
-    energies_loop = np.take_along_axis(e_current_loop, indices_loop, axis=1)
-    _mu_ev = (float(entry_occ_state.mu_ry) * RYD_TO_EV
-              if entry_occ_state is not None else
-              float(inputs.wfn.efermi) * RYD_TO_EV)
     # ONE CLASSIFICATION, THEN FROZEN (owner ruling 2026-09-19).  The
     # protected identity set is decided once, on map 0, and every later map
     # carries it unchanged; bands outside it are scissored for the whole run.
@@ -3000,34 +3133,10 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     # -> 4.208 -> 5.129 -> 4.046 -> 5.187 -> 2.743 -> 5.435 -> 2.610 eV over
     # 15 calls, map gain 2.05-3.42) while the protected manifold itself moved
     # 0.03-0.25 eV.  ``partition`` from SCState is the map-0 decision.
-    _frozen_partition = (int(state.iteration) > 0 and state.partition is not None)
-    if _frozen_partition:
-        partition = _partition_on_loop(state.partition, inputs)
-        _record_sc(
-            inputs,
-            f"  SC map {int(state.iteration)} (identity, mu-anchored) partition: "
-            "FROZEN from map 0 (owner ruling 2026-09-19); protected at all k="
-            f"{_band_ranges(partition.protected_mask, band_offset=int(inputs.band_slices.b0))}, "
-            f"in_range={_band_ranges(partition.in_range_mask, band_offset=int(inputs.band_slices.b0))}; "
-            "no band enters or leaves the set for the rest of the loop.")
-    else:
-        partition = build_omega_band_partition(
-            energies_loop / RYD_TO_EV,
-            reference_full if ks.is_identity else np.asarray(ks.select(reference_full)),
-            band_offset=int(inputs.band_slices.b0),
-            omega_min_abs_ev=float(inputs.config.sigma.omega_min_ev) + _mu_ev,
-            omega_max_abs_ev=float(inputs.config.sigma.omega_max_ev) + _mu_ev,
-            previous_partition=(None if state.partition is None else
-                                _partition_on_loop(state.partition, inputs)),
-            mu_ev=_mu_ev, current_indices_kn=indices_loop,
-            degeneracy_tol_ev=float(inputs.config.sc.exact_degeneracy_tol_ev),
-            label=f"SC map {int(state.iteration)} (identity, mu-anchored)",
-            print_fn=lambda line: _record_sc(inputs, line))
-    if not ks.is_identity:
-        partition = BandPartition(
-            protected_mask=ks.broadcast(partition.protected_mask),
-            in_range_mask=ks.broadcast(partition.in_range_mask))
-    partition = _apply_sc_buffer_partition(partition, inputs)
+    partition, indices_loop, energies_loop, _mu_ev = _classify_sc_partition(
+        E_qp_ry, U_qp, entry_occ_state,
+        previous_partition=state.partition, iteration=int(state.iteration),
+        inputs=inputs)
     buffer_mask = _sc_buffer_mask(inputs)
     if buffer_mask.any():
         buffer_ids = np.flatnonzero(buffer_mask) + int(inputs.band_slices.b0) + 1
@@ -4998,9 +5107,10 @@ def run_self_consistency(
             call_index=0, role="one_shot", rms_ev=rms,
             rms2_ev=float("nan"),
             # There is no previous map call; the "previous output" the RMS
-            # is against is the DFT seed spectrum, and saying so is what
+            # is against is the named initial seed spectrum, and saying so
             # stops it being read as a convergence residual.
-            prev_output_role="dft_seed",
+            prev_output_role=getattr(
+                inputs, "initial_state_role", "dft_seed"),
             verdict=verdict,
             map_gain=None,
         )
@@ -5145,7 +5255,9 @@ def _run_linear_mixing(
             inputs, state_map, E_candidate_ev,
             call_index=it, role="linear",
             rms_ev=cand_rms, rms2_ev=cand_rms2,
-            prev_output_role=("dft_seed" if it == 0 else "linear"),
+            prev_output_role=(
+                getattr(inputs, "initial_state_role", "dft_seed")
+                if it == 0 else "linear"),
             verdict=verdict,
             map_gain=map_gain,
         )
@@ -5431,8 +5543,9 @@ def _run_rcrop(
             # construction, so this pair understates the accepted-iterate
             # residual (measured ~19x on the 2026-08-14 MPA QSGW run).  The
             # criterion is stamped beside it from ``_verdict``.
-            prev_output_role=("dft_seed" if call_index == 0
-                              else _role_of(call_index - 1)),
+            prev_output_role=(
+                getattr(inputs, "initial_state_role", "dft_seed")
+                if call_index == 0 else _role_of(call_index - 1)),
             verdict=_verdict,
             map_gain=map_gain,
         )
@@ -6135,6 +6248,9 @@ def run_sc_driver(
             f"{len(fixed_head_omegas)} frequency sample(s); each map folds "
             "them once through its resident W.")
 
+    seed_path = config.sc.initial_qp_rotations_file
+    if seed_path is not None and not os.path.isabs(seed_path):
+        seed_path = os.path.join(input_dir, seed_path)
     inputs = SCInputs(
         wfns_dft=wfns, V_q=V_q, kin_ion_dft=kin_ion,
         wfns_transverse=wfns_transverse, bispinor_v_q_path=bispinor_v_q_path,
@@ -6163,10 +6279,14 @@ def run_sc_driver(
         wfn_fingerprint_binding=wfn_fingerprint_binding,
         charge_zeta_identity=charge_zeta_identity,
         tensors_filename=tensors_filename,
+        initial_state_role=("external_qp_seed" if seed_path is not None
+                            else "dft_seed"),
         print_fn=print_fn,
         record_fn=record_fn,
     )
-    state_init = make_initial_state_from_dft(inputs)
+    state_init = (
+        make_initial_state_from_qp_rotations(inputs, seed_path)
+        if seed_path is not None else make_initial_state_from_dft(inputs))
     # Loop knobs from ``config.sc`` (the LORRAX_SC_* env vars are
     # deprecated overrides, applied at config construction).
     sc = config.sc
@@ -6968,6 +7088,7 @@ __all__ = [
     "gw_iteration_map",
     "load_head_velocity_source",
     "make_initial_state_from_dft",
+    "make_initial_state_from_qp_rotations",
     "measure_sc_map_gain",
     "run_self_consistency",
     "run_sc_driver",

@@ -1009,25 +1009,14 @@ def resolve_qp_hamiltonian_state(
         raise FileNotFoundError(f"QP rotation artifact does not exist: {path}")
 
     from file_io.qp_wfn import (authenticate_qp_rotations_source_wfn)
-    from file_io.restart_bundle import (read_qp_rotations_artifact)
+    from file_io.restart_bundle import (
+        read_qp_rotations_artifact, validate_qp_rotations_frame)
     artifact = read_qp_rotations_artifact(path)
     authenticate_qp_rotations_source_wfn(
         artifact, wfn, artifact_path=path)
-    U = np.asarray(artifact["U_mnk"])
-    E = np.asarray(artifact["E_qp_nk_rydberg"], dtype=np.float64)
-    rot_range = np.asarray(artifact["band_range"], dtype=np.int64)
-    rot_grid = np.asarray(artifact["kgrid"], dtype=np.int64)
-    rot_kpts = np.asarray(artifact["kpoints_crys"], dtype=np.float64)
-
-    if rot_range.shape != (2,):
-        raise ValueError(
-            f"{os.path.basename(path)} band_range has shape "
-            f"{rot_range.shape}, expected (2,).")
-    q0, q1 = (int(rot_range[0]), int(rot_range[1]))
-    if q1 <= q0:
-        raise ValueError(
-            f"{os.path.basename(path)} has empty/reversed QP band range "
-            f"[{q0},{q1}).")
+    U, E, (q0, q1) = validate_qp_rotations_frame(
+        artifact, kgrid=meta.kgrid, kpoints_crys=sym.unfolded_kpts,
+        artifact_path=path)
     nb_qp = q1 - q0
     fit0, fit1 = (int(v) for v in basis.band_range)
     ctilde = basis.ctilde
@@ -1044,41 +1033,15 @@ def resolve_qp_hamiltonian_state(
             "no QP correction, while any partial overlap/cut-through would "
             "slice U_mnk and destroy the unitary state transformation.  "
             "Fit a window containing the complete QP block.")
-    if U.shape != (nk, nb_qp, nb_qp):
+    if int(U.shape[0]) != nk:
         raise ValueError(
-            f"{os.path.basename(path)} U_mnk has shape {U.shape}, expected "
-            f"({nk},{nb_qp},{nb_qp}) from the full k-set and band_range.")
-    if E.shape != (nk, nb_qp):
-        raise ValueError(
-            f"{os.path.basename(path)} E_qp_nk_rydberg has shape {E.shape}, "
-            f"expected ({nk},{nb_qp}).")
+            f"{os.path.basename(path)} has {U.shape[0]} full-zone QP rows, "
+            f"but the Galerkin compact state has {nk} rows.")
     expected_enk = (nb_fit, nk)
     if tuple(enk_sigma.shape) != expected_enk:
         raise ValueError(
             f"enk_sigma has shape {tuple(enk_sigma.shape)}, expected "
             f"{expected_enk} from the Galerkin state table.")
-
-    expected_grid = np.asarray(meta.kgrid, dtype=np.int64)
-    if rot_grid.shape != (3,) or not np.array_equal(rot_grid, expected_grid):
-        raise ValueError(
-            f"{os.path.basename(path)} kgrid {rot_grid.tolist()} does not "
-            f"match the WFN/symmetry kgrid {expected_grid.tolist()}.")
-    expected_kpts = np.asarray(sym.unfolded_kpts, dtype=np.float64)
-    if rot_kpts.shape != expected_kpts.shape:
-        raise ValueError(
-            f"{os.path.basename(path)} kpoints_crys has shape "
-            f"{rot_kpts.shape}, expected {expected_kpts.shape} from the "
-            "WFN symmetry service.")
-    dk = rot_kpts - expected_kpts
-    dk -= np.rint(dk)
-    worst_k = float(np.max(np.abs(dk))) if dk.size else 0.0
-    if worst_k > 1.0e-6:
-        bad = int(np.argmax(np.max(np.abs(dk), axis=1)))
-        raise ValueError(
-            f"{os.path.basename(path)} full-BZ k-point {bad} is "
-            f"{rot_kpts[bad].tolist()}, but the WFN symmetry service has "
-            f"{expected_kpts[bad].tolist()} (periodic max|Delta k|="
-            f"{worst_k:.3e}).")
 
     # The Galerkin owner defines the compact state's global placement.  The
     # energy table and both QP companions arrive as identical host arrays on

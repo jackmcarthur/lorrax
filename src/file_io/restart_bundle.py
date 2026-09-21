@@ -1197,6 +1197,81 @@ def read_qp_rotations_artifact(h5_path: str) -> dict:
     return arrays
 
 
+def validate_qp_rotations_frame(
+        artifact: dict, *, kgrid, kpoints_crys, artifact_path) -> tuple[
+            np.ndarray, np.ndarray, tuple[int, int]]:
+    """Validate a compact QP eigensystem in one mean-field k frame.
+
+    Source-WFN fingerprint authentication is a separate, stronger identity
+    check owned by :func:`file_io.qp_wfn.authenticate_qp_rotations_source_wfn`.
+    This service owns the remaining numerical and coordinate contract shared
+    by compact-state and Hamiltonian consumers.  A caller still decides
+    whether the artifact's complete band range must equal or be contained in
+    its own active range.
+    """
+    name = os.path.basename(os.fspath(artifact_path))
+    band_range = np.asarray(artifact["band_range"], dtype=np.int64)
+    if band_range.shape != (2,):
+        raise ValueError(
+            f"{name} band_range has shape {band_range.shape}, expected (2,).")
+    q0, q1 = (int(value) for value in band_range)
+    if q1 <= q0:
+        raise ValueError(
+            f"{name} has empty/reversed QP band range [{q0},{q1}).")
+
+    expected_kpts = np.asarray(kpoints_crys, dtype=np.float64)
+    rot_kpts = np.asarray(artifact["kpoints_crys"], dtype=np.float64)
+    if rot_kpts.shape != expected_kpts.shape:
+        raise ValueError(
+            f"{name} kpoints_crys has shape {rot_kpts.shape}, expected "
+            f"{expected_kpts.shape} from the WFN symmetry service.")
+    if not np.all(np.isfinite(rot_kpts)) or not np.all(
+            np.isfinite(expected_kpts)):
+        raise ValueError(f"{name} kpoints_crys contains non-finite values.")
+
+    expected_grid = np.asarray(kgrid, dtype=np.int64)
+    rot_grid = np.asarray(artifact["kgrid"], dtype=np.int64)
+    if (rot_grid.shape != (3,) or expected_grid.shape != (3,)
+            or not np.array_equal(rot_grid, expected_grid)):
+        raise ValueError(
+            f"{name} kgrid {rot_grid.tolist()} does not match the "
+            f"WFN/symmetry kgrid {expected_grid.tolist()}.")
+
+    dk = rot_kpts - expected_kpts
+    dk -= np.rint(dk)
+    worst_k = float(np.max(np.abs(dk))) if dk.size else 0.0
+    if worst_k > 1.0e-6:
+        bad = int(np.argmax(np.max(np.abs(dk), axis=1)))
+        raise ValueError(
+            f"{name} full-BZ k-point {bad} is {rot_kpts[bad].tolist()}, "
+            f"but the WFN symmetry service has {expected_kpts[bad].tolist()} "
+            f"(periodic max|Delta k|={worst_k:.3e}).")
+
+    U = np.asarray(artifact["U_mnk"], dtype=np.complex128)
+    E = np.asarray(artifact["E_qp_nk_rydberg"], dtype=np.float64)
+    nk = int(expected_kpts.shape[0])
+    nb = q1 - q0
+    if U.shape != (nk, nb, nb):
+        raise ValueError(
+            f"{name} U_mnk has shape {U.shape}, expected ({nk},{nb},{nb}) "
+            "from the full k-set and band_range.")
+    if E.shape != (nk, nb):
+        raise ValueError(
+            f"{name} E_qp_nk_rydberg has shape {E.shape}, expected "
+            f"({nk},{nb}).")
+    if not np.all(np.isfinite(U)) or not np.all(np.isfinite(E)):
+        raise ValueError(
+            f"{name} U_mnk/E_qp_nk_rydberg contains non-finite values.")
+    identity = np.eye(nb, dtype=np.complex128)[None, :, :]
+    residual = float(np.max(np.abs(
+        np.swapaxes(np.conj(U), -1, -2) @ U - identity)))
+    if residual > 1.0e-10:
+        raise ValueError(
+            f"{name} U_mnk is not unitary: "
+            f"max|U^H U-I|={residual:.3e} > 1e-10.")
+    return U, E, (q0, q1)
+
+
 def validate_qp_rotations_artifact(
         path, *, U_mnk, E_qp_nk_rydberg, band_range, kpoints_crys, kgrid,
         enk_full_nk_ry=None, occupations_kn=None,
