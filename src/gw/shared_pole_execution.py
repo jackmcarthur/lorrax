@@ -9,6 +9,7 @@ from functools import lru_cache, partial
 import jax
 import jax.numpy as jnp
 import numpy as np
+from common import timing
 from jax.sharding import NamedSharding, PartitionSpec as P
 
 
@@ -157,6 +158,8 @@ def face_program(fn, mesh, *, outputs='matrices'):
                 out=(tuple(model(m) for m in shapes[0]),scalar_tree(shapes[1]))
             elif outputs == 'compact':
                 out=(matrix(shapes[0]),model(shapes[1]))
+            elif outputs == 'mixed':
+                out=(jax.tree.map(matrix,shapes[0]),scalar_tree(shapes[1]))
             else:
                 raise ValueError('unknown explicit constructor output contract '+outputs)
             compiled[signature]=jax.jit(fn,out_shardings=out)
@@ -176,6 +179,150 @@ def face_eigh(mesh, n):
     # Explicit auto selects the whole-mesh provider; no capacity-driven local
     # reshard or submesh is allowed inside an oversized parent operation.
     return plan('eigh',mesh,n=int(n),backend='distributed',batched_route='auto')
+
+
+@lru_cache(maxsize=None)
+def face_hermitian_program(mesh):
+    from distrib_la import hermitian_part
+    return face_program(hermitian_part, mesh)
+
+
+@lru_cache(maxsize=None)
+def face_ordered_prepare_program(mesh, odd_moments):
+    """Pack, assemble and normalize one ordered parent on the complete mesh."""
+    from gw.shared_pole_pencil import assemble_ordered_shared_pole_pencil
+    from gw.shared_pole_reduction import prepare_ordered_shared_pole_reduction
+
+    matrix_sharding = NamedSharding(mesh, P(None, 'x', 'y'))
+    mm = face_matmul(mesh)
+
+    def body(points, order, active, qs, os, ds, infinity):
+        def pack(parts):
+            return jax.lax.with_sharding_constraint(
+                jnp.take(jnp.concatenate(parts, axis=-1), order[0], axis=-1,
+                         mode='fill', fill_value=0), matrix_sharding)
+        finite = [(points, pack(qs), pack(os), pack(ds))]
+        pencil = assemble_ordered_shared_pole_pencil(
+            finite, infinity if odd_moments else None, matmul=mm,
+            matrix_sharding=matrix_sharding)
+        return prepare_ordered_shared_pole_reduction(
+            pencil, active, matrix_sharding=matrix_sharding)
+
+    return face_program(body, mesh, outputs='mixed')
+
+
+@lru_cache(maxsize=None)
+def face_ordered_restrict_program(mesh, keep_budget, retain_span):
+    """First metric correction through the restricted H/G/O pencil."""
+    from gw.shared_pole_recipe import shared_real_pole_gates_ordered_v1 as gates
+    from gw.shared_pole_reduction import restrict_ordered_shared_pole_reduction
+
+    matrix_sharding = NamedSharding(mesh, P(None, 'x', 'y'))
+    fn = partial(restrict_ordered_shared_pole_reduction,
+                 matmul=face_matmul(mesh), gates=gates,
+                 keep_budget=keep_budget, retain_span=retain_span,
+                 matrix_sharding=matrix_sharding)
+    return face_program(fn, mesh, outputs='mixed')
+
+
+@lru_cache(maxsize=None)
+def face_ordered_ritz_program(mesh, retain_span):
+    """Second metric correction through the final signed Ritz matrix."""
+    from gw.shared_pole_recipe import shared_real_pole_gates_ordered_v1 as gates
+    from gw.shared_pole_reduction import ritz_ordered_shared_pole_reduction
+
+    matrix_sharding = NamedSharding(mesh, P(None, 'x', 'y'))
+    fn = partial(ritz_ordered_shared_pole_reduction,
+                 matmul=face_matmul(mesh), gates=gates,
+                 retain_span=retain_span, matrix_sharding=matrix_sharding)
+    return face_program(fn, mesh, outputs='mixed')
+
+
+@lru_cache(maxsize=None)
+def face_ordered_finish_program(mesh, odd_moments, retain_span):
+    """Finish the signed model, ordered identities, zero policy and sort."""
+    from gw.shared_pole_gates import sort_shared_pole_columns
+    from gw.shared_pole_local import finalize_ordered_parent_pencil
+    from gw.shared_pole_recipe import shared_real_pole_gates_ordered_v1 as gates
+    from gw.shared_pole_reduction import finish_ordered_shared_pole_reduction
+
+    matrix_sharding = NamedSharding(mesh, P(None, 'x', 'y'))
+    mm = face_matmul(mesh)
+
+    def body(ritz, mu, rotation, infinity):
+        reduced = finish_ordered_shared_pole_reduction(
+            ritz, (mu, rotation), matmul=mm, gates=gates,
+            retain_span=retain_span, matrix_sharding=matrix_sharding)
+        finalized = finalize_ordered_parent_pencil(
+            reduced, infinity, matmul=mm, gates=gates,
+            odd_moments=odd_moments, retain_span=retain_span)
+        model, signed, diagnostics = finalized[:3]
+        model, permutation = sort_shared_pole_columns(model)
+        result = model, signed, (*diagnostics, permutation)
+        return (*result, finalized[3]) if retain_span else result
+
+    return face_program(body, mesh, outputs='parent')
+
+
+def face_ordered_parent(points, order, active, qs, os, ds, infinity, *, mesh,
+                        odd_moments, keep_budget, retain_span):
+    """Run the three ordered eig equations with explicit eager boundaries."""
+    prepare = face_ordered_prepare_program(mesh, odd_moments)
+    with timing.section(
+            'spole.ordered.prepare', announce=True,
+            label=f'shared-pole ordered prepare pencil={active.shape[-1]}') as section:
+        prepared_face = prepare(points, order, active, qs, os, ds, infinity)
+        section.watch(prepared_face)
+    prepared = prepared_face
+    with timing.section(
+            'spole.ordered.eigh1_input', announce=True,
+            label='shared-pole ordered Hvv Hermitian projection') as section:
+        eig_input = face_hermitian_program(mesh)(prepared[0][5])
+        section.watch(eig_input)
+    first_side = int(eig_input.shape[-1])
+    with timing.section(
+            'spole.ordered.eigh1', announce=True,
+            label=f'shared-pole ordered Hvv eig matrix={first_side}') as section:
+        gamma, u = face_eigh(mesh, first_side).batched(eig_input)
+        section.watch(gamma, u)
+    with timing.section(
+            'spole.ordered.restrict', announce=True,
+            label=f'shared-pole ordered restricted build matrix={first_side}') as section:
+        restricted = face_ordered_restrict_program(
+            mesh, keep_budget, retain_span)(prepared, (gamma, u))
+        section.watch(restricted)
+    del prepared_face, prepared, eig_input, gamma, u
+
+    second_input = restricted[0][0]
+    second_side = int(second_input.shape[-1])
+    with timing.section(
+            'spole.ordered.eigh2', announce=True,
+            label=f'shared-pole ordered Hr eig matrix={second_side}') as section:
+        gamma_r, u_r = face_eigh(mesh, second_side).batched(second_input)
+        section.watch(gamma_r, u_r)
+    with timing.section(
+            'spole.ordered.ritz', announce=True,
+            label=f'shared-pole ordered Ritz build matrix={second_side}') as section:
+        ritz = face_ordered_ritz_program(mesh, retain_span)(
+            restricted, (gamma_r, u_r))
+        section.watch(ritz)
+    del restricted, second_input, gamma_r, u_r
+
+    third_input = ritz[0][0]
+    third_side = int(third_input.shape[-1])
+    with timing.section(
+            'spole.ordered.eigh3', announce=True,
+            label=f'shared-pole ordered signed eig matrix={third_side}') as section:
+        mu, rotation = face_eigh(mesh, third_side).batched(third_input)
+        section.watch(mu, rotation)
+    with timing.section(
+            'spole.ordered.finish', announce=True,
+            label=f'shared-pole ordered finish matrix={third_side}') as section:
+        result = face_ordered_finish_program(
+            mesh, odd_moments, retain_span)(ritz, mu, rotation, infinity)
+        section.watch(result)
+    del ritz, third_input, mu, rotation
+    return result
 
 
 @lru_cache(maxsize=None)
@@ -211,10 +358,16 @@ def face_reduce_round(states,infinity,tables,*,real,mesh,budget,ordered,odd_mome
     side=tables['active'].shape[-1]
     if admit:
         budget.plan(side,phase='reduction')
-    program=face_parent_program(mesh,ordered,odd_moments,keep_budget,retain_span,side)
-    result=program(jnp.asarray(tables['points']),jnp.asarray(tables['order']),
-        jnp.asarray(tables['active']),tuple(s[1] for s in states),
-        tuple(s[2] for s in states),tuple(s[3] for s in states),tuple(infinity))
+    args=(jnp.asarray(tables['points']),jnp.asarray(tables['order']),
+          jnp.asarray(tables['active']),tuple(s[1] for s in states),
+          tuple(s[2] for s in states),tuple(s[3] for s in states),tuple(infinity))
+    if ordered:
+        result=face_ordered_parent(
+            *args,mesh=mesh,odd_moments=odd_moments,keep_budget=keep_budget,
+            retain_span=retain_span)
+    else:
+        program=face_parent_program(mesh,ordered,odd_moments,keep_budget,retain_span,side)
+        result=program(*args)
     model,signed,diagnostics=result[:3]
     output=model,signed,model[1:],diagnostics
     return (*output,result[3]) if retain_span else output
