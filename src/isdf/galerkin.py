@@ -2084,8 +2084,10 @@ def plan_galerkin_operator_stream(
     operator fold reshards that tile into an x-rank/y-r left panel and the
     transposed y-rank/x-r right panel, then gathers r only within the panel's
     orthogonal mesh axis.  Relative to the product-r source tile those two
-    live panels cost ``mesh_y + mesh_x`` times as much.  Price that expansion
-    here while retaining product-mesh alignment for the source transform.
+    live panels cost ``mesh_y + mesh_x`` times as much, while the original
+    product-r basis tile remains live through both reshard dependencies.  Price
+    the conservative ``1 + mesh_y + mesh_x`` live set here while retaining
+    product-mesh alignment for the source transform.
     """
     axis_sizes = {
         str(name): int(size)
@@ -2094,7 +2096,7 @@ def plan_galerkin_operator_stream(
     if "x" not in axis_sizes or "y" not in axis_sizes:
         raise ValueError(
             "plan_galerkin_operator_stream requires mesh axes ('x','y')")
-    expansion = axis_sizes["x"] + axis_sizes["y"]
+    expansion = 1 + axis_sizes["x"] + axis_sizes["y"]
     budget = int(q_tile_budget)
     source_budget = budget // expansion
     if source_budget <= 0:

@@ -264,8 +264,9 @@ Hermitian spin matrix through those same full-grid basis slabs.  It returns the
 operator `O_ab = <phi_a|O|phi_b>` and overlap
 `M_ab = <phi_a|phi_b>` on the all-mesh rank face; it does not substitute the
 unweighted values at the ISDF centroids for either spatial integral.
-The projection planner charges both bounded rank panels after their
-orthogonal-axis r gathers against the supplied Q-tile budget.  Each fold
+The projection planner charges the original streamed basis tile plus both
+bounded rank panels after their orthogonal-axis r gathers against the supplied
+Q-tile budget.  Each fold
 creates only its local `P('x','y')` result tile; no rank-by-rank matrix is
 materialized on one rank.
 `project_galerkin_spin_z` fixes the two-component Pauli convention to
