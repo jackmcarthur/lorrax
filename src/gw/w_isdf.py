@@ -2433,7 +2433,7 @@ def _fractional_pair_scan_face(
     psi_mun_a, psi_nmu_a, psi_mun_b, psi_nmu_b, energy_a, energy_b,
     occ_a, occ_b, z_values, *,
     nb_full, nb_logical, tile, unfold_x=None, unfold_y=None, roll_b=None,
-    k_unfold_plan=None, ordered=False,
+    k_unfold_plan=None, ordered=False, right_vectors=None, left_vectors=None,
 ):
     """Stream ordered band-pair tiles ``(f_a - f_b) / (e_a - e_b + z)`` at nonzero z from canonical faces with optional typed parent transport.
 
@@ -2460,6 +2460,11 @@ def _fractional_pair_scan_face(
     # sliced to this rank's μ slab -- so the tile, not a face, is the
     # largest full-k ψ object that ever exists.  ``roll_b`` is the k−q map
     # applied to the "b" role AFTER the unfold (full-k rows).
+    if (right_vectors is None) != (left_vectors is None):
+        raise ValueError("fractional pair projection requires both left and right vectors")
+    projected = right_vectors is not None
+    if projected and not ordered:
+        raise ValueError("fractional pair projection is defined for the ordered response")
     nk = energy_a.shape[0]
     ns = psi_mun_a.shape[1]
     nmu_x_loc = psi_mun_a.shape[2]
@@ -2483,6 +2488,15 @@ def _fractional_pair_scan_face(
     shard_w_x = psi_nmu_a.shape[1]   # psi_nmu's own 'x'-shard width (bands)
     y_idx = jax.lax.axis_index('y')
     x_idx = jax.lax.axis_index('x')
+    if projected:
+        if right_vectors.ndim != 2 or left_vectors.ndim != 2:
+            raise ValueError("fractional pair projection vectors must be matrices")
+        right_local = jax.lax.dynamic_slice(
+            right_vectors, (y_idx * nmu_y_loc, 0),
+            (nmu_y_loc, right_vectors.shape[1]))
+        left_local = jax.lax.dynamic_slice(
+            left_vectors, (x_idx * nmu_x_loc, 0),
+            (nmu_x_loc, left_vectors.shape[1]))
 
     def _gather_mun(psi_mun_local, g_lo):
         """(nk, s, mu_X_loc, tile) un-conjugated, present on every rank — masked-gather + psum('y') from psi_mun's local shard (bands on 'y'); see docs/architecture/four_current_wiring.md."""
@@ -2544,6 +2558,28 @@ def _fractional_pair_scan_face(
             "ksma,ksmb->kmab", pa_x, jnp.conj(pb_x), optimize=True)
         density_y = jnp.einsum(
             "ksna,ksnb->knab", pa_y, jnp.conj(pb_y), optimize=True)
+        if projected:
+            # The ordered q=0 response is
+            #   chi = sum w_ab conj(rho_ab) rho_ab^T.
+            # Contract the bounded trial vectors before retaining an endpoint:
+            # no n_mu x n_mu reference is formed on any rank.
+            amp_r = jax.lax.psum(jnp.einsum(
+                "knab,nr->kabr", density_y, right_local, optimize=True), 'y')
+            amp_l = jax.lax.psum(jnp.einsum(
+                "kmab,ml->kabl", density_x, left_local, optimize=True), 'x')
+            action = jnp.einsum(
+                "zkab,kmab,kabr->zmr", weights, jnp.conj(density_x),
+                amp_r, optimize=True)
+            derivative_weights = (
+                -df[None, :, :, :]
+                / (de[None, :, :, :] + z[:, None, None, None]) ** 2
+                / (2 * z[:, None, None, None]))
+            derivative_weights = jnp.where(
+                logical[None, :, :, :], derivative_weights, 0.0)
+            derivative_projection = jnp.einsum(
+                "zkab,kabl,kabr->zlr", derivative_weights,
+                jnp.conj(amp_l), amp_r, optimize=True)
+            return action, derivative_projection
         if ordered:
             # Physical orientation: rows at -q (b rolled to k+q by the
             # caller) with the conjugation on the mu density; see docstring.
@@ -2554,7 +2590,11 @@ def _fractional_pair_scan_face(
             "zkab,kmab,knab->zmn", weights, density_x, jnp.conj(density_y),
             optimize=True)
 
-    zero = jnp.zeros((z.size, nmu_x_loc, nmu_y_loc), dtype=jnp.complex128)
+    zero = (jnp.zeros((z.size, nmu_x_loc, right_vectors.shape[1]),
+                      dtype=jnp.complex128),
+            jnp.zeros((z.size, left_vectors.shape[1], right_vectors.shape[1]),
+                      dtype=jnp.complex128)) if projected else jnp.zeros(
+                          (z.size, nmu_x_loc, nmu_y_loc), dtype=jnp.complex128)
 
     def _outer(acc, ia_step):
         ia = ia_step * tile
@@ -2573,14 +2613,24 @@ def _fractional_pair_scan_face(
             fb = jax.lax.dynamic_slice(fb_full, (0, ib), (nk, tile))
             contribution = _pair_contribution(
                 a_x, b_x, a_y, b_y, ea, eb, fa, fb, ga, gb)
+            if projected:
+                return tuple(a + b for a, b in zip(acc_inner, contribution)), None
             return acc_inner + contribution, None
 
         acc_inner, _ = jax.lax.scan(
-            _inner, jnp.zeros_like(acc), jnp.arange(ntiles), unroll=1)
+            _inner,
+            (tuple(jnp.zeros_like(a) for a in acc)
+             if projected else jnp.zeros_like(acc)),
+            jnp.arange(ntiles), unroll=1)
+        if projected:
+            return tuple(a + b for a, b in zip(acc, acc_inner)), None
         return acc + acc_inner, None
 
     chi, _ = jax.lax.scan(_outer, zero, jnp.arange(ntiles), unroll=1)
-    return chi / jnp.sqrt(jnp.asarray(nk, jnp.float64))
+    scale = jnp.sqrt(jnp.asarray(nk, jnp.float64))
+    if projected:
+        return tuple(value / scale for value in chi)
+    return chi / scale
 
 
 _PARENT_UNFOLD_OPERANDS = {}
@@ -2749,6 +2799,64 @@ def _get_chi_fractional_q_kernel_face(
         out_specs=P(None, "x", "y"),
         check_vma=False,
     ))
+    _chi_minimax_kernel_cache[key] = kernel
+    return kernel
+
+
+def _get_chi_fractional_q0_action_kernel_face(
+    mesh_xy: Mesh, *, nb_full: int, nb_logical: int, pair_tile: int,
+    n_z: int, n_left: int, n_right: int, k_unfold_plan=None,
+    layout="face",
+):
+    """Exact ordered q=0 pair sum on bounded left/right trial vectors.
+
+    This is the action form of :func:`_get_chi_fractional_q_kernel_face`:
+    it reuses the same pair scan and density convention while returning only
+    ``chi(z) @ right`` and ``left.H @ dchi/ds @ right``.  The large endpoint
+    remains distributed; the trial block is deliberately replicated because
+    it is bounded by the caller.
+    """
+    from common.shard_map import shard_map
+    from common.wfn_layout import psi_specs
+    PSI_NMU_SPEC, PSI_MUN_SPEC = psi_specs(layout)
+    tile = int(pair_tile)
+    key = ("direct_fractional_q0_action", _mesh_key(mesh_xy), int(nb_full),
+           int(nb_logical), tile, int(n_z), int(n_left), int(n_right),
+           id(k_unfold_plan), layout)
+    hit = _chi_minimax_kernel_cache.get(key)
+    if hit is not None:
+        return hit
+
+    if k_unfold_plan is None:
+        def _local(psi_mun, psi_nmu, energies, occupations, z_values,
+                   right, left):
+            return _fractional_pair_scan_face(
+                psi_mun, psi_nmu, psi_mun, psi_nmu, energies, energies,
+                occupations, occupations, z_values,
+                nb_full=nb_full, nb_logical=nb_logical, tile=tile,
+                ordered=True, right_vectors=right, left_vectors=left)
+        in_specs = (PSI_MUN_SPEC, PSI_NMU_SPEC, P(None, None), P(None, None),
+                    P(None), P(), P())
+    else:
+        n_sym_spatial = int(k_unfold_plan.n_sym_spatial)
+
+        def _local(psi_mun, psi_nmu, energies, occupations, z_values,
+                   right, left, *tables):
+            unfold_x, unfold_y = _unfold_tables_from_operands(
+                *tables, n_sym_spatial=n_sym_spatial)
+            return _fractional_pair_scan_face(
+                psi_mun, psi_nmu, psi_mun, psi_nmu, energies, energies,
+                occupations, occupations, z_values,
+                nb_full=nb_full, nb_logical=nb_logical, tile=tile,
+                unfold_x=unfold_x, unfold_y=unfold_y,
+                k_unfold_plan=k_unfold_plan, ordered=True,
+                right_vectors=right, left_vectors=left)
+        in_specs = ((PSI_MUN_SPEC, PSI_NMU_SPEC, P(None, None), P(None, None),
+                     P(None), P(), P()) + _PARENT_UNFOLD_SPECS)
+
+    kernel = jax.jit(shard_map(
+        _local, mesh=mesh_xy, in_specs=in_specs,
+        out_specs=(P(None, "x", None), P()), check_vma=False))
     _chi_minimax_kernel_cache[key] = kernel
     return kernel
 
