@@ -195,7 +195,8 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
             width = min(logical_n, max(1, int(recipe["infinity_width"])))
             qi, round_infinity_values = distrib_la.leading_eigenvectors(
                 exact["M1"], width, eigh_plan=eig, column_extent=column_extent,
-                multiplet_tol=recipe["multiplet_relative_tolerance"], real_rows=real)
+                multiplet_tol=recipe["multiplet_relative_tolerance"],
+                real_rows=real if execution == 'local' else None)
             infinity = (qi, *(kernels.apply(exact[name], qi)
                               for name in moment_fields))
             del exact
