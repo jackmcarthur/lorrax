@@ -6751,14 +6751,25 @@ def dump_sigma_omega_h5_final(
         # field was contracted directly in DFT basis, so rotate its two
         # components INTO that QP basis once for this file rather than
         # mixing bases or repeating the rotation on every SC iteration.
-        U = _place(sigma_basis_U, mesh_xy, _band_rotation_spec())
+        # Use the cube's carrier before placing uneven logical band axes.
+        from runtime.padding import pad_square
+        band_axis = sigma_result.sigma_band_axis
+        U = sigma_basis_U
+        scalar_dft = exact_hartree_dft.scalar_dft
+        transverse_dft = exact_hartree_dft.transverse_dft
+        if band_axis is not None:
+            U = pad_square(U, band_axis, pad_diagonal=1.0)
+            scalar_dft = pad_square(scalar_dft, band_axis)
+            if transverse_dft is not None:
+                transverse_dft = pad_square(transverse_dft, band_axis)
+        U = _place(U, mesh_xy, _band_rotation_spec())
         scalar_qp = _rotate_fixed_matrix(
-            exact_hartree_dft.scalar_dft, U, mesh=mesh_xy, to_qp=True)
+            scalar_dft, U, mesh=mesh_xy, to_qp=True)
         transverse_qp = (
             _rotate_fixed_matrix(
-                exact_hartree_dft.transverse_dft, U,
+                transverse_dft, U,
                 mesh=mesh_xy, to_qp=True)
-            if exact_hartree_dft.transverse_dft is not None else None)
+            if transverse_dft is not None else None)
         total_qp = (scalar_qp if transverse_qp is None
                     else scalar_qp + transverse_qp)
         import dataclasses

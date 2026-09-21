@@ -188,6 +188,60 @@ def test_exact_hartree_basis_rotation_retains_two_axis_band_sharding():
     assert np.max(np.abs(np.asarray(got) - want)) < 2.0e-12 * scale
 
 
+@pytest.mark.parametrize("transverse", [False, True])
+def test_final_hartree_writer_uses_sigma_band_carrier(monkeypatch, transverse):
+    """Uneven physical bands retain U† V U and zero padding on P16."""
+    from types import SimpleNamespace
+    from jax.sharding import PartitionSpec as P
+    from gw import dynamic_sigma, qsgw_utils
+    from gw.sc_iteration import SCExactHartree, dump_sigma_omega_h5_final
+    from gw.sigma_dispatch import SigmaResult
+    from runtime.padding import padded_axis
+
+    mesh = resolve_mesh()
+    rng = np.random.default_rng(20260921)
+    nk, nb = 2, 26
+    tag = padded_axis(nb, mesh, name="Sigma bands")
+    U = np.stack([_haar(rng, nb) for _ in range(nk)])
+    raw = rng.normal(size=(nk, nb, nb)) + 1j * rng.normal(size=(nk, nb, nb))
+    scalar = raw + raw.conj().swapaxes(-1, -2)
+    current = 0.17 * scalar if transverse else None
+    replicated = P(None, None, None)
+    exact = SCExactHartree(_put(scalar, mesh, replicated),
+        None if current is None else _put(current, mesh, replicated), 0.0)
+    sigma = SigmaResult(v_h_kij_ry=jnp.asarray(0.0),
+        sigma_x_kij_ry=jnp.asarray(0.0), sigma_xc_kij_ry=jnp.asarray(0.0),
+        sigma_c_omega_kij_ry=jnp.asarray(0.0),
+        omega_grid_ev=np.array([-1.0, 1.0]), sigma_band_axis=tag)
+    config = dataclasses.make_dataclass("Config", [("sc_omega_grid_ev", tuple)])(())
+    captured = {}
+    def write(_cube, **kwargs):
+        captured.update(kwargs)
+        return "unused.h5"
+    monkeypatch.setattr(dynamic_sigma, "write_sigma_omega", write)
+    monkeypatch.setattr(qsgw_utils, "write_qsgw_sigma_cube", lambda *a, **kw: None)
+    with mesh:
+        dump_sigma_omega_h5_final(
+            SimpleNamespace(outputs=SimpleNamespace(sigma_result=sigma)),
+            config=config, meta=None, mesh_xy=mesh, input_dir="unused",
+            exact_hartree_dft=exact, sigma_basis_U=_put(U, mesh, replicated),
+            print_fn=lambda *_: None)
+    expected = np.zeros((nk, tag.carrier, tag.carrier), dtype=np.complex128)
+    expected[:, :nb, :nb] = np.einsum("kmi,kmn,knj->kij", U.conj(), scalar, U)
+    for name, factor in (("v_h_scalar", 1.0), ("sig_h", 1.17 if transverse else 1.0)):
+        got = captured[name]
+        assert got.sharding.spec == band_rotation_spec()
+        for shard in got.addressable_shards:
+            np.testing.assert_allclose(shard.data, factor * expected[shard.index],
+                                       rtol=2e-12, atol=2e-12)
+    if transverse:
+        for shard in captured["h_transverse"].addressable_shards:
+            np.testing.assert_allclose(shard.data, 0.17 * expected[shard.index],
+                                       rtol=2e-12, atol=2e-12)
+    else:
+        assert captured["h_transverse"] is None
+
+
 def test_density_sc_suppresses_both_frozen_direct_components():
     """The caller-owned four-current cannot coexist with frozen H_T."""
     path = ROOT / "src" / "gw" / "sigma_dispatch.py"
