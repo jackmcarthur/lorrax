@@ -316,7 +316,9 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
             passive, held_errors, reciprocity, moment_defects = check_round(
                 round_model, round_signed, inverse_sqrt, held, (exact["M1"], exact["M3"]), qi,
                 real=real, nodes=[_sample_point(recipe, i) for i in held_ids], eta_ry=recipe["eta_ev"] / RYD_TO_EV,
-                mesh_xy=mesh_xy, native_eigh=local_eigh.native_fn, ordered=ordered)
+                mesh_xy=mesh_xy,
+                native_eigh=local_eigh.native_fn if execution == 'local' else None,
+                ordered=ordered)
             del inverse_sqrt, held, exact
         with timing.fenced_section("spole.gates"):
             for slot, q in enumerate(ids[:real]):
