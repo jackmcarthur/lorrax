@@ -219,6 +219,24 @@ def test_padded_axis_tag_owns_extent_mask_pad_strip_and_authentication():
     assert np.array_equal(np.asarray(normalized), np.asarray(carrier))
 
 
+def test_pad_to_axis_keeps_numpy_inputs_on_host(monkeypatch):
+    """Serial metadata padding must not stage a device round trip."""
+    from runtime.padding import pad_to_axis, padded_axis
+
+    def _jax_forbidden(*_args, **_kwargs):
+        raise AssertionError("NumPy pad_to_axis input entered jax.numpy")
+
+    for name in ("pad", "arange", "where", "asarray"):
+        monkeypatch.setattr(jnp, name, _jax_forbidden)
+
+    tag = padded_axis(5, 4, name="restart host metadata")
+    source = np.arange(7, dtype=np.float64)
+    got = pad_to_axis(source, tag, fill=-4.0)
+    assert isinstance(got, np.ndarray)
+    np.testing.assert_array_equal(got[:5], source[:5])
+    np.testing.assert_array_equal(got[5:], np.full(3, -4.0))
+
+
 def test_padded_axis_spec_derives_product_divisor_inside_owner():
     from runtime.padding import padded_axis
 

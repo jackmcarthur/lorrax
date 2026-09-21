@@ -253,6 +253,9 @@ def pad_to_axis(A, tag: PaddedAxis, *, axis: int = -1, fill: float = 0.0):
     intermediate when the source and destination are both legal carriers.
     """
     import jax.numpy as jnp
+    import numpy as np
+
+    xp = np if isinstance(A, np.ndarray) else jnp
 
     ax = int(axis) % int(A.ndim)
     source = int(A.shape[ax])
@@ -265,13 +268,13 @@ def pad_to_axis(A, tag: PaddedAxis, *, axis: int = -1, fill: float = 0.0):
     elif source < tag.carrier:
         widths = [(0, 0)] * A.ndim
         widths[ax] = (0, tag.carrier - source)
-        A = jnp.pad(A, widths, mode="constant", constant_values=fill)
+        A = xp.pad(A, widths, mode="constant", constant_values=fill)
     if not tag.pad:
         return A
     shape = [1] * A.ndim
     shape[ax] = tag.carrier
-    mask = axis_mask(tag).reshape(shape)
-    return jnp.where(mask, A, jnp.asarray(fill, dtype=A.dtype))
+    mask = (xp.arange(tag.carrier) < tag.logical).reshape(shape)
+    return xp.where(mask, A, xp.asarray(fill, dtype=A.dtype))
 
 
 def pad_square(
