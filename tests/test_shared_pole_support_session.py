@@ -6,6 +6,7 @@ import pytest
 
 from common.units import RYD_TO_EV
 from gw.shared_pole_recipe import bind_shared_pole_census, resolve_shared_pole_recipe
+from gw.shared_pole_recipe import _sector_treatment_ceiling
 
 
 def inputs(gap=.7, *, eta=.25, tier="production", top=20.):
@@ -14,7 +15,7 @@ def inputs(gap=.7, *, eta=.25, tier="production", top=20.):
     wfns = NS(enk=np.array([[-20., -gap/2, gap/2, 999.]]*2)/RYD_TO_EV,
               occ=np.array([[1., 1., 0., 0.]]*2),
               slices=NS(b0=0, b4_logical=3, val=slice(0, 2),
-                        cond_all_logical=slice(2, 3)))
+                        cond=slice(2, 3), cond_all_logical=slice(2, 3)))
     volume = 4*np.pi*2 / (((top-3.5)/RYD_TO_EV/2)**2)
     meta = NS(nspin=1, nspinor=1, n_rmu=17, nk_tot=2, cell_volume=volume)
     rebind(wfns, meta)
@@ -74,6 +75,18 @@ def test_gap_growth_keeps_points_roles_but_rebinds_current_state():
     assert set(session) == {"reference_complete", "key", "envelope", "epoch", "line_ev"}
     assert all(isinstance(v, float) for v in session["envelope"].values())
     assert session["line_ev"] == tuple(first["line_ev"])
+
+
+def test_sector_treatment_ceiling_freezes_map0_and_refuses_span_growth():
+    session = {}
+    first = _sector_treatment_ceiling(4.0, session)
+    assert first['status'] == 'initialized_map0'
+    assert first['ceiling_ry'] == 8.0
+    current = _sector_treatment_ceiling(3.5, session)
+    assert current['status'] == 'reused_map0'
+    assert current['ceiling_ry'] == 8.0
+    with pytest.raises(ValueError, match='treatment_span_escape'):
+        _sector_treatment_ceiling(4.1, session)
 
 
 def test_gap_shrink_expands_once_then_growth_stays_enclosed():

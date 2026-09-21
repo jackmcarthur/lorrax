@@ -248,6 +248,41 @@ def test_sc_fixed_session_reuses_identical_nodes_without_refitting(monkeypatch):
     for left, right in zip(first, second):
         np.testing.assert_array_equal(left.window.nodes.t,
                                       right.window.nodes.t)
+
+
+def test_sc_fixed_rule_covers_the_declared_pole_support(monkeypatch):
+    calls = []
+
+    def counted(box, eps, **kwargs):
+        calls.append(tuple(box))
+        return _fake_rule(box, eps, **kwargs)
+
+    monkeypatch.setattr("gw.sigma_box_plan.build_uniform_rule", counted)
+    session = {}
+    args = dict(
+        eps=1.0e-4, cache_dir=None, fixed_rule_session=session,
+        fixed_pole_support_ry=5.0,
+        print_fn=lambda *_args, **_kwargs: None)
+    first, first_geometry = plan_sigma_windows(
+        _summaries(), [_branch_at((0.1, 3.0))],
+        np.asarray([0.2, 0.5]), 0.1, **args)
+    calls.clear()
+    moved = (
+        (0, {"all": (0.3, 0.3, 0.05, 0.05),
+             "shallow": (0.3, 0.3, 0.05, 0.05), "deep": None}),
+        (1, {"all": (4.5, 4.5, 0.08, 0.08),
+             "shallow": None, "deep": (4.5, 4.5, 0.08, 0.08)}),
+    )
+    second, second_geometry = plan_sigma_windows(
+        moved, [_branch_at((0.1, 3.0))],
+        np.asarray([0.2, 0.5]), 0.1, **args)
+    assert calls == []
+    assert session["pole_support_ry"] == 5.0
+    assert first_geometry["sc_fixed_pole_support_ry"] == 5.0
+    assert [row["node_digest"] for row in first_geometry["branches"][0]["windows"]] == [
+        row["node_digest"] for row in second_geometry["branches"][0]["windows"]]
+    for left, right in zip(first, second):
+        np.testing.assert_array_equal(left.window.nodes.t, right.window.nodes.t)
         np.testing.assert_array_equal(
             left.window.nodes.alpha, right.window.nodes.alpha)
     assert first_geometry["sc_fixed_initial_window_tau_pairs"] == 6

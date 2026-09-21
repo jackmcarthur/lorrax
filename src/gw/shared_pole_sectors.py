@@ -183,10 +183,35 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output):
             del c1,t1
             del ct,tc,cm
         models=(sectors[0]['model'],sectors[1]['model'],*cross['models'])
+        treatment_policy=recipe.get('sector_pole_treatment')
+        treatment=None
+        treatment_masks=(models[0][2],models[1][2],models[2][2],models[3][2])
+        if treatment_policy is not None:
+            from gw.shared_pole_gates import shared_pole_treatment_mask
+            cc_mask,cc_row=shared_pole_treatment_mask(
+                models[0][1],models[0][2],ceiling_ry=treatment_policy['ceiling_ry'])
+            tt_mask,tt_row=shared_pole_treatment_mask(
+                models[1][1],models[1][2],ceiling_ry=treatment_policy['ceiling_ry'])
+            ct_common=(jnp.all(models[2][1]==models[3][1],axis=-1)
+                       &jnp.all(models[2][2]==models[3][2],axis=-1))
+            ct_mask,ct_row=shared_pole_treatment_mask(
+                models[2][1],models[2][2],ceiling_ry=treatment_policy['ceiling_ry'])
+            treatment=dict(CC=dict(cc_row,common_census=jnp.ones_like(ct_common)),
+                           TT=dict(tt_row,common_census=jnp.ones_like(ct_common)),
+                           CT=dict(ct_row,common_census=ct_common))
+            treatment_masks=(cc_mask,tt_mask,ct_mask,ct_mask)
+            for name in treatment:
+                if not bool(jnp.all(treatment[name]['common_census'][:real])):
+                    raise ValueError(f'GATE shared_pole_sector_treatment_census: sector={name}')
+                if not bool(jnp.all(treatment[name]['active_prefix'][:real])):
+                    raise ValueError(f'GATE shared_pole_sector_treatment_order: sector={name}')
+                if not bool(jnp.all(treatment[name]['retained_nonempty'][:real])):
+                    raise ValueError(
+                        f'GATE shared_pole_sector_treatment_empty: sector={name}')
         signed=(tuple((s['signed'][0],s['signed'][0],*s['signed'][1:]) for s in sectors)
                 +(cross['signed'],))
         budget=cross['budget']
-        budget.retained_panels=tuple(jax.tree.leaves((models,signed)))
+        budget.retained_panels=tuple(jax.tree.leaves((models,signed,treatment_masks)))
         budget.live(())
         # Each held tile is read, scored, and released before the next support.
         held_rows={name:[] for name in ('CC','TT','CT')}
@@ -205,7 +230,18 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output):
             expected_infinity=(key=='cauchy_schwarz_squared') & np.isposinf(values)
             if not np.all(np.isfinite(values) | expected_infinity):
                 raise ValueError(f'GATE shared_pole_sector_nonfinite: spectral moment {key}')
+        treatment_receipt=None
+        if treatment is not None:
+            treatment_receipt=dict(
+                policy=dict(treatment_policy),
+                scope='stored positive-pole models; held rows below score the pre-treatment signed fit',
+                sigma_accuracy='NOT_MEASURED_BY_CONSTRUCTOR',
+                sectors={name:{key:np.asarray(value)[:real].tolist()
+                    for key,value in values.items()}
+                    for name,values in treatment.items()})
         row_receipt=dict(parents=ids[:real],held=held_rows,
+            held_scope='pre-treatment signed fit; not stored-model or Sigma accuracy',
+            pole_treatment=treatment_receipt,
             CT_gram_min_relative=np.asarray(cross['diagnostics']['gram_min_relative'])[:real].tolist(),
             CT_retained_metric_positive=np.asarray(cross['diagnostics']['retained_metric_positive'])[:real].tolist(),
             CT_zero_policy=np.asarray(cross['zero']['zero_policy'])[:real].tolist(),
@@ -217,23 +253,49 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output):
         receipts.append(row_receipt)
         # Stage each canonical parent once. One round of face factors is live;
         # no all-parent factor stack or full photon operator is materialized.
-        for name,family,model in zip(('CC','TT','CT_C','CT_T'),(0,1,0,1),models):
-            poles,active=jax.tree.map(lambda a:np.asarray(device_put_process_local(a,NamedSharding(mesh_xy,P()))),model[1:])
-            counts=active.sum(axis=-1,dtype=np.int64)
-            width=padded_axis(int(counts[:real].max()),mesh_xy,name='shared_pole_port',
-                specs=((P('x','y'),0),(P('x','y'),1))).carrier
-            factor=face_rows(mesh_xy,tuple(range(real)),width)(to_face(model[0]))
-            for slot,q in enumerate(ids[:real]):
-                public=canonical_factors(mesh_xy,(slot,),components=3 if family else 1)(factor)
-                filename=root/(name+'.h5')
-                store_header=write_shared_pole_model(filename,public,
-                    device_put_process_local(poles[slot:slot+1,:width],NamedSharding(mesh_xy,P())),
-                    counts[slot:slot+1],q_span=(q,q+1),meta=meta,tables=bank['sector_tables'][family],
-                    recipe=recipe,receipts=dict(identity=bank['identity'],constructor=row_receipt),
-                    ordered=True,basis=bank['mu_bases'][family],sector=name)
-                stores[name]=(str(filename),store_header)
-                del public
-            del factor
+        for name,family,model,active_mask in zip(
+                ('CC','TT','CT_C','CT_T'),(0,1,0,1),models,treatment_masks):
+            ambient=ledger.live_stages
+            if treatment_policy is None:
+                treated_factor,treated_poles=model[:2]
+            else:
+                local_factor_bytes=model[0].size*model[0].dtype.itemsize//mesh_xy.size
+                local_pole_bytes=model[1].size*model[1].dtype.itemsize//mesh_xy.size
+                treatment_stage=ledger.reserve(
+                    f'sector.treatment.{name}.{ids[0]}',
+                    resident_bytes_per_rank=local_factor_bytes+local_pole_bytes,
+                    workspace_bytes_per_rank=local_factor_bytes+local_pole_bytes,
+                    concurrent_with=ambient)
+                ledger.live_stages=(*ambient,treatment_stage['stage'])
+                try:
+                    treated_factor=jnp.where(active_mask[:,None,:],model[0],0)
+                    treated_poles=jnp.where(active_mask,model[1],1)
+                    treated_factor.block_until_ready();treated_poles.block_until_ready()
+                except Exception:
+                    ledger.live_stages=ambient
+                    raise
+            try:
+                poles,active=jax.tree.map(
+                    lambda a:np.asarray(device_put_process_local(
+                        a,NamedSharding(mesh_xy,P()))),(treated_poles,active_mask))
+                counts=active.sum(axis=-1,dtype=np.int64)
+                width=padded_axis(int(counts[:real].max()),mesh_xy,name='shared_pole_port',
+                    specs=((P('x','y'),0),(P('x','y'),1))).carrier
+                factor=face_rows(mesh_xy,tuple(range(real)),width)(to_face(treated_factor))
+                for slot,q in enumerate(ids[:real]):
+                    public=canonical_factors(mesh_xy,(slot,),components=3 if family else 1)(factor)
+                    filename=root/(name+'.h5')
+                    store_header=write_shared_pole_model(filename,public,
+                        device_put_process_local(poles[slot:slot+1,:width],NamedSharding(mesh_xy,P())),
+                        counts[slot:slot+1],q_span=(q,q+1),meta=meta,tables=bank['sector_tables'][family],
+                        recipe=recipe,receipts=dict(identity=bank['identity'],constructor=row_receipt),
+                        ordered=True,basis=bank['mu_bases'][family],sector=name)
+                    stores[name]=(str(filename),store_header)
+                    del public
+                del factor,treated_factor,treated_poles
+            finally:
+                if treatment_policy is not None:
+                    ledger.live_stages=ambient
         placed.extend(ids[:real])
         budget.retained_panels=()
         ledger.live_stages=upstream

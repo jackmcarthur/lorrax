@@ -721,12 +721,17 @@ def _sc_padded_box_spec(spec, eta):
     """
     a_lo, a_hi, gamma_lo, gamma_hi = spec["pole_extent"]
     frac = _SC_POLE_PAD_FRACTION
-    padded_poles = ((
+    padded_poles = [(
         a_lo - frac * abs(a_lo),
         a_hi + frac * abs(a_hi),
         max(0.0, gamma_lo - frac * abs(gamma_lo)),
         gamma_hi + frac * abs(gamma_hi),
-    ),)
+    )]
+    # A treatment ceiling is a fixed-domain contract, not a live pole. Keep
+    # its declared support separate from the current pole statistics and
+    # factor references, and use it only to size the iteration-1 certificate.
+    if "sc_support_pole_extent" in spec:
+        padded_poles.append(tuple(spec["sc_support_pole_extent"]))
     support_frequencies = spec.get("sc_support_frequencies", spec["frequencies"])
     pole_box, _, _ = _box_for_window(
         support_frequencies, spec["states"], padded_poles,
@@ -991,6 +996,7 @@ def plan_sigma_windows(
     fixed_rule_session=None,
     analytic_line=False,
     material_class=None,
+    fixed_pole_support_ry=None,
 ):
     """Build the complete MPA Sigma quadrature from raw support boxes.
 
@@ -1024,6 +1030,11 @@ def plan_sigma_windows(
         Iteration 1 certifies boxes padded by the fixed SC policy; every
         later map reuses the exact same nodes by containment.  ``None``
         preserves the ordinary one-shot planner byte-for-byte.
+    fixed_pole_support_ry
+        Optional positive real-pole endpoint that the iteration-1 fixed rule
+        must cover. The declared ``[0, endpoint]`` interval is intersected
+        with each existing pole selector only for the SC certificate; live
+        pole statistics, references and executor intervals remain unchanged.
 
     Returns
     -------
@@ -1064,6 +1075,20 @@ def plan_sigma_windows(
         raise ValueError("sigma_quadrature_eps must lie in (0, 1)")
     if not np.isfinite(edge) or edge < 0.0:
         raise ValueError("sigma_window_edge_factor must be nonnegative")
+    fixed_pole_support = None
+    if fixed_pole_support_ry is not None:
+        fixed_pole_support = float(fixed_pole_support_ry)
+        if (fixed_rule_session is None or not np.isfinite(fixed_pole_support)
+                or fixed_pole_support <= 0.0):
+            raise ValueError(
+                "fixed_pole_support_ry requires a fixed SC session and a "
+                "finite positive endpoint")
+        previous = fixed_rule_session.setdefault(
+            "pole_support_ry", fixed_pole_support)
+        if float(previous) != fixed_pole_support:
+            raise ValueError(
+                "fixed SC pole support changed after initialization: "
+                f"{previous!r}->{fixed_pole_support!r} Ry")
     branch_rows = list(branches)
     summaries = tuple(pole_summaries)
     if not summaries:
@@ -1101,6 +1126,12 @@ def plan_sigma_windows(
                 states=states, pole_stats=pole_stats,
                 pole_sign=pole_sign, eta_ry=eta)
             spec["analytic_line"] = bool(analytic_line)
+            if fixed_pole_support is not None:
+                support_lo = max(0.0, float(pole_lo))
+                support_hi = min(fixed_pole_support, float(pole_hi))
+                if support_hi > support_lo:
+                    spec["sc_support_pole_extent"] = (
+                        support_lo, support_hi, 0.0, 0.0)
             if fixed_rule_session is not None and "external_support_ev" in fixed_rule_session:
                 support = np.asarray(fixed_rule_session["external_support_ev"]) / RYD_TO_EV
                 spec["sc_support_frequencies"] = (
@@ -1245,6 +1276,7 @@ def plan_sigma_windows(
                 (float(np.max(sc_state_pad_ev(spec["states"] * RYD_TO_EV)))
                  for spec in specs), default=0.0),
             "sc_pole_extent_padding_fraction": _SC_POLE_PAD_FRACTION,
+            "sc_fixed_pole_support_ry": fixed_pole_support,
         })
     else:
         geometry["sc_fixed_quadrature"] = False

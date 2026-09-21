@@ -66,6 +66,13 @@ The existing SC support session retains the line-site tuple while its interval s
 enclosed and rebuilds it on an interval or policy change. Samples and the pole model
 are rebuilt from the current state on every map.
 
+The imaginary support top is set by the active-charge plasma scale plus the
+recipe margin; it does not grow with the full input-band energy span. The 18
+supports therefore target the consumer's low-energy and collective-mode
+range. They are not a uniform approximation guarantee for arbitrary band
+energy ranges. The response-bank time rule, the finite rational reduction,
+and the projected Sigma error have separate certificates.
+
 **Real-time stream.** For occupied and unoccupied weights `f`, `u`, the selected-q retarded correlation is
 accumulated on a certified time rule `{t_a, w_a}` (`minimax.response_bank_rule`):
 
@@ -240,6 +247,31 @@ with time reversal: `W Q ∈ span(Q)`. Only the component of `O = W Q` orthogona
 survives, so a time-reversal-symmetric bank adds no partner columns and the ordered model equals the even one at
 equal rank.
 
+**Ordered-sector numerical treatment.** Bispinor sector models use the
+explicit ceiling
+
+$$
+ \Omega_{\mathrm{treat}} = 2\left[
+ \max E_{\mathrm{cond},\chi}-\min E_{\mathrm{val}}
+ \right]. \tag{SP 14a}
+$$
+
+This is a numerical treatment policy, not a bound on collective modes. The
+first shared-pole SC map freezes the ceiling. A later map whose current chi
+transition span exceeds the frozen source span refuses before construction;
+the ceiling never widens after map 0. The initial fixed Sigma rules certify
+the intersection of `[0, Omega_treat]` with each existing pole selector, in
+addition to the normal state and endpoint padding, so a retained pole may
+move anywhere within that declared range without re-keying the nodes. Modes with
+`Omega > Omega_treat` are inactive in the published model: both factor
+endpoints are zero and their pole slots use the normal inactive sentinel.
+CC and TT use independent masks. CT_C and CT_T use one common mask and pole
+census, preserving the two ordered endpoint products. Constructor held rows
+continue to score the untreated signed fit and do not certify this treatment;
+accuracy requires a projected Sigma comparison at fixed state, occupations,
+vertices, eta, and q weights. A measured result applies only to the states and
+consumer window in that comparison.
+
 **Layout.** The constructor reduces one round of parents at a time, one parent per rank (batch layout
 `P(('x','y'), ...)`): `gw.shared_pole_local.round_program` packs each parent's panels to the round extent
 (`round_tables`; ordered originals and mirrors as two halves of one extent), assembles and reduces its pencil with
@@ -305,6 +337,7 @@ Every construction receipt row carries version, value, threshold and PASS/FAIL/W
 | `normalized_gram_keep` | the retained rank at the recipe cut | diagnostic |
 | `retained_subspace_moments` | TRS: projected `M_1`, `M_3` identity; ordered: `m_0..m_3` on the infinity directions | TRS yes, ordered diagnostic |
 | `zero_ritz_policy` | dropped factor weight within budget; ordered also `infinite_weight_ok` | yes |
+| `sector_pole_treatment` | bispinor-only map-0 ceiling and complete CC/TT/common-CT masks of (SP 14a); reports counts and extrema, not accuracy | later span escape and invalid mask yes |
 | `finite_factors_poles` | finite `b`, positive finite active `Λ`, exact inert sentinels | yes |
 | `passivity` | V-whitened `−Herm W_c(iη)` in `[0, I]`; ordered: Hermitian part, the anti-Hermitian part is reported | yes |
 | `model_reciprocity` | TRS only: transpose symmetry of symmetric held samples | yes (TRS) |

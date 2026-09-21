@@ -761,7 +761,8 @@ def bind_shared_pole_census(wfns, meta, *, occupation_state, trs_allowed, state_
         raise ValueError("GATE shared_pole_census: got: state capacity times Nspinor other than 2; want: authenticated spin-restricted capacity; why: charge normalization")
     val = energies[:, wfns.slices.val]
     cond = energies[:, wfns.slices.cond_all_logical]
-    if not val.size or not cond.size:
+    response_cond = energies[:, wfns.slices.cond]
+    if not val.size or not cond.size or not response_cond.size:
         raise ValueError("GATE shared_pole_gap: got: empty logical valence/conduction window; want: both nonempty; why: support geometry needs a physical gap")
     vbm, cbm = float(np.max(val)), float(np.min(cond))
     mu = (0.5 * (vbm + cbm) if occupation_state is None
@@ -789,6 +790,7 @@ def bind_shared_pole_census(wfns, meta, *, occupation_state, trs_allowed, state_
     meta.shared_pole_census = {
         "mu_ry": mu, "gap_ev": gap_ev, "partial_at_mu": partial_at_mu,
         "energy_span_ry": float(energies.max()-energies.min()),
+        "response_transition_span_ry": float(response_cond.max()-val.min()),
         "active_electrons": electrons, "cell_volume_bohr3": volume,
         "state_capacity": capacity, "k_weights": weights.tolist(),
         "k_weight_sum": float(weights.sum()), "k_weight_rule": "authenticated full-BZ quadrature weights",
@@ -836,6 +838,45 @@ def _support_envelope(required, key, session):
     return dict(version=version, status=status,
                 epoch=epoch, required=dict(required), retained=dict(envelope),
                 scope=scope)
+
+
+def _sector_treatment_ceiling(response_span_ry, session):
+    """Freeze the bispinor pole treatment ceiling before the first SC map.
+
+    Twice the current chi transition span is an explicit approximation
+    policy. It is not a collective-mode bound. A fixed-SC session retains the
+    map-0 value and refuses a later response span that would invalidate that
+    provenance; it never widens the model or Sigma domain after map 0.
+    """
+    required = 2.0 * float(response_span_ry)
+    if not math.isfinite(required) or required <= 0.0:
+        raise ValueError(
+            "GATE shared_pole_treatment_ceiling: current response span must be "
+            f"finite and positive, got {response_span_ry!r}")
+    if session is None:
+        return dict(version="sector_twice_map_span_v1", status="current_map",
+                    ceiling_ry=required,
+                    source_response_span_ry=float(response_span_ry),
+                    scope="numerical treatment; not a physical pole bound")
+    previous = session.get("sector_treatment_ceiling_ry")
+    if previous is None:
+        session["sector_treatment_ceiling_ry"] = required
+        status = "initialized_map0"
+    else:
+        previous = float(previous)
+        tolerance = 32.0 * np.finfo(np.float64).eps * max(1.0, abs(previous))
+        if required > previous + tolerance:
+            raise ValueError(
+                "GATE shared_pole_treatment_span_escape: current twice-response-span "
+                f"{required:.17g} Ry exceeds the frozen map-0 ceiling "
+                f"{previous:.17g} Ry; fixed treatment cannot widen after map 0")
+        status = "reused_map0"
+    return dict(version="sector_twice_map_span_v1", status=status,
+                ceiling_ry=float(session["sector_treatment_ceiling_ry"]),
+                source_response_span_ry=(
+                    0.5 * float(session["sector_treatment_ceiling_ry"])),
+                current_response_span_ry=float(response_span_ry),
+                scope="numerical treatment; not a physical pole bound")
 
 
 def parse_support_sites(text):
@@ -1054,6 +1095,10 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
                   for fraction in recipe['held_line_fractions']]
     held_line = mids[held_pairs]
     held_imag = np.sqrt(imaginary[[0, -2]] * imaginary[[1, -1]])
+    sector_treatment = None
+    if int(meta.nspinor) == 4:
+        sector_treatment = _sector_treatment_ceiling(
+            census['response_transition_span_ry'], support_session)
     points, role_z, role_codes, distinct_ids, held_flags, support_pairs = [], [], [], [], [], []
     def add(real, imag, role, held, pair=None):
         z = complex(real, imag) / RYD_TO_EV
@@ -1090,6 +1135,13 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
         version = RECIPE_VERSION + '+support_sites'
         table = hashlib.sha256(
             (RECIPE_HASH + '|' + override['text']).encode()).hexdigest()
+    if sector_treatment is not None:
+        version += '+sector_treatment'
+        treatment_identity = {key: sector_treatment[key] for key in (
+            'version','ceiling_ry','source_response_span_ry','scope')}
+        table = hashlib.sha256((table + '|' + json.dumps(
+            treatment_identity, sort_keys=True,
+            separators=(',', ':'))).encode()).hexdigest()
     result = {
         'role_codes': dict(ROLE_CODES),
         'recipe_version': version, 'recipe_hash': table,
@@ -1130,6 +1182,8 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
     }
     if support_receipt is not None:
         result['support_envelope'] = support_receipt
+    if sector_treatment is not None:
+        result['sector_pole_treatment'] = sector_treatment
     result['metadata_array_bytes'] = sum(v.nbytes for v in result.values()
                                          if isinstance(v, np.ndarray))
     rules = {
@@ -1149,6 +1203,7 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
         'bank': 'fixed Hermite certificate tolerance 1e-8',
         'sigma': 'tier Sigma tolerance production1e-4/relaxed1e-3',
         'census': 'current full-band occupations, authenticated k weights/capacity; active band top >= mu-15 eV',
+        'sector_pole_treatment': 'bispinor-only numerical treatment at twice the map-0 chi transition span; not a physical pole bound',
         'U_bytes': '16*nk_full*(nspinor*nmu)^2/(Px*Py), logical bytes/rank',
         'metadata': 'sum of replicated metadata array nbytes',
     }

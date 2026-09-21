@@ -1520,6 +1520,7 @@ def compute_sigma_c_mpa_omega_grid(
     if sigma_w_model not in ("mpa", "shared_pole"):
         raise ValueError(f"sigma_w_model must be mpa or shared_pole; got {sigma_w_model!r}")
     shared_pole = sigma_w_model == "shared_pole"
+    fixed_pole_support_ry = None
     if shared_pole:
         from file_io.shared_pole_store import validate_shared_pole_model
         from file_io.slab_io import SlabIO
@@ -1534,6 +1535,9 @@ def compute_sigma_c_mpa_omega_grid(
                           recipe["eta_ev"], rtol=0, atol=1e-12):
             raise ValueError("GATE shared_pole_eta: Sigma and current recipe eta differ")
         quadrature_eps = float(recipe["sigma_tolerance"])
+        if fixed_quadrature_session is not None:
+            fixed_pole_support_ry = (
+                recipe.get("sector_pole_treatment") or {}).get("ceiling_ry")
         n_poles = int(ledger["n_q_irr"])
         ordered_residues = False
         with timing.section("sigma.capacity"):
@@ -1628,7 +1632,8 @@ def compute_sigma_c_mpa_omega_grid(
                     print_fn=print_fn, edge_factor=edge_factor,
                     fixed_rule_session=fixed_quadrature_session,
                     analytic_line=bool(analytic_line),
-                    material_class=material_class)
+                    material_class=material_class,
+                    fixed_pole_support_ry=fixed_pole_support_ry)
         quadrature_log.record_sigma_plan(geometry)
         if plan_mode == "panes":
             print_fn(

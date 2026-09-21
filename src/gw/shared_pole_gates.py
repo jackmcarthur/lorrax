@@ -7,6 +7,7 @@ rows these feed are listed in docs/architecture/shared_pole_model.md section 9.
 from __future__ import annotations
 
 import jax.numpy as jnp
+import numpy as np
 from distrib_la import hermitian_part
 from gw.shared_pole_pencil import _adjoint
 
@@ -158,6 +159,31 @@ def sort_shared_pole_columns(model):
     poles = jnp.take_along_axis(poles, order, axis=-1)
     active = jnp.take_along_axis(active, order, axis=-1)
     return (jnp.where(active[:, None, :], b, 0), jnp.where(active, poles, 1), active), order
+
+
+def shared_pole_treatment_mask(poles, active, *, ceiling_ry):
+    """Return the complete-column mask for a numerical frequency ceiling.
+
+    The input model already has an ascending active prefix. The ceiling is a
+    treatment policy, not a spectral bound; diagnostics therefore report only
+    counts and extrema and assign no accuracy to the dropped contribution.
+    Cross-sector callers must call this once for their common pole census and
+    apply the returned mask to both endpoint factors.
+    """
+    ceiling_ry = float(ceiling_ry)
+    if not np.isfinite(ceiling_ry) or ceiling_ry <= 0.0:
+        raise ValueError("shared-pole treatment ceiling must be positive")
+    keep = active & (poles <= ceiling_ry ** 2)
+    omega = jnp.sqrt(jnp.where(active, poles, 0))
+    retained_omega = jnp.sqrt(jnp.where(keep, poles, 0))
+    return keep, {
+        "active_prefix": ~jnp.any((~keep[:, :-1]) & keep[:, 1:], axis=-1),
+        "retained_nonempty": jnp.any(keep, axis=-1),
+        "dropped_count": jnp.sum(active & ~keep, axis=-1, dtype=jnp.int64),
+        "original_count": jnp.sum(active, axis=-1, dtype=jnp.int64),
+        "original_omega_max_ry": jnp.max(omega, axis=-1),
+        "retained_omega_max_ry": jnp.max(retained_omega, axis=-1),
+    }
 
 
 def shared_pole_passivity(model, inverse_coulomb_sqrt, *, eta_ry, matmul, eigh, gates):

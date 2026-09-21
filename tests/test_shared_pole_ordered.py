@@ -218,6 +218,29 @@ def test_ordered_equals_even_at_an_active_keep_cut_on_time_reversal_symmetric_da
         assert rel(ordered, even) < 1e-10
 
 
+def test_frequency_treatment_uses_one_complete_cross_endpoint_mask():
+    import jax.numpy as jnp
+    import pytest
+    from gw.shared_pole_gates import shared_pole_treatment_mask
+
+    poles = jnp.asarray([[1.0, 9.0, 25.0, 1.0]])
+    active = jnp.asarray([[True, True, True, False]])
+    left = jnp.asarray([[[1.0, 2.0, 3.0, 0.0],
+                         [4.0, 5.0, 6.0, 0.0]]])
+    right = 10.0 * left
+    mask, row = shared_pole_treatment_mask(poles, active, ceiling_ry=3.0)
+    mask = np.asarray(mask)
+    left_out = np.where(mask[:, None, :], left, 0)
+    right_out = np.where(mask[:, None, :], right, 0)
+    assert np.asarray(row['dropped_count']).tolist() == [1]
+    assert bool(np.asarray(row['active_prefix']).all())
+    assert mask.tolist() == [[True, True, False, False]]
+    assert np.array_equal(right_out, 10.0 * left_out)
+    assert np.count_nonzero(left_out[..., 2:]) == 0
+    with pytest.raises(ValueError, match='ceiling must be positive'):
+        shared_pole_treatment_mask(poles, active, ceiling_ry=np.inf)
+
+
 def test_ordered_equals_even_construction_on_time_reversal_symmetric_data():
     import jax.numpy as jnp
     from gw.shared_pole_pencil import assemble_shared_pole_pencil

@@ -186,7 +186,8 @@ def fixture(*, metal=False, eta=.25, tier='production', top=20.):
     if not metal:
         energies[:, 1] = -1 / RYD_TO_EV
     occ = np.array([[1., .75 if metal else 1., 0., 1.], [1., .25 if metal else 1., 0., 1.]])
-    wf = NS(enk=energies, occ=occ, slices=NS(b0=0,b4_logical=3,val=slice(0,2),cond_all_logical=slice(2,3)))
+    wf = NS(enk=energies, occ=occ, slices=NS(b0=0,b4_logical=3,val=slice(0,2),
+            cond=slice(2,3),cond_all_logical=slice(2,3)))
     state = NS(f_kn=occ,mu_ry=0.,smearing_family='fixed') if metal else None
     # Set volume so the known active electron count yields the desired top.
     electrons = 1. if metal else 2.
@@ -221,6 +222,19 @@ def test_geometry_padding_charge_and_holds():
     assert r['accuracy_status']=='NOT_MEASURED'
     args[1].enk[:,-1] *= 10
     np.testing.assert_array_equal(resolve(args)['line_ev'],r['line_ev'])
+
+
+def test_treatment_span_uses_the_chi_response_extent_on_a_split_deck():
+    _, wf, meta = fixture()
+    wf.slices.b4_logical = 4
+    wf.slices.cond_all_logical = slice(2, 4)
+    wf.slices.cond = slice(2, 3)
+    bind_shared_pole_census(
+        wf, meta, occupation_state=None, trs_allowed=True,
+        state_capacity=2., kweights=[.5, .5])
+    expected = wf.enk[:, wf.slices.cond].max() - wf.enk[:, wf.slices.val].min()
+    assert meta.shared_pole_census['response_transition_span_ry'] == expected
+    assert meta.shared_pole_census['energy_span_ry'] > expected
 
 
 def test_metal_and_eta_scaling():
