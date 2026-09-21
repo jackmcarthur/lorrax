@@ -1,7 +1,7 @@
 # Self-consistent GW (QSGW) in LORRAX — safe parameters and pitfalls
 
-**Status as of 2026-09-03.** `qp_solver = self_consistent` is the shipped
-quasiparticle self-consistent loop. It converged in 13–15 maps to 0.07 meV on
+**Historical convergence evidence as of 2026-09-03.**
+`qp_solver = self_consistent` is the shipped quasiparticle self-consistent loop. It converged in 13–15 maps to 0.07 meV on
 Si (4×4×4, 80 bands, 504 centroids) for both `compute_mode = mpa` and
 `gn_ppm`, and in 13 maps on monolayer MoS2 (GN-PPM). Every statement below
 carries the run it was measured on; the sandbox reports are named in
@@ -18,7 +18,9 @@ One map is `H → rotate ψ → χ₀ → W → screening model (poles) → Σ(�
 The map is iterated with rCROP (`sc_accelerator = rcrop`, history 5, the only
 supported accelerator — see the key's row in
 [input_reference.md](input_reference.md)) until
-every non-scissored band moves by less than `sc_tol_ev`. Within the active
+the identity-aligned input-to-output energy residual of every non-scissored
+band is below `sc_tol_ev` on an accepted input. A small change between mixed
+iterates or a trial-map residual is not the stopping criterion. Within the active
 subspace (`nval + ncond` bands around E_F) each band is in one of three
 classes (`gw/band_partition.py`):
 
@@ -40,9 +42,15 @@ matrix has the logical width of the retained Hamiltonian.
 
 | class | diagonal of H' | off-diagonals |
 |---|---|---|
-| protected (inside the Σ(ω) grid) | full Σ at the QP energy | kept, protected×protected only |
-| non-protected, inside the grid | Σ at the band's own energy | zeroed |
-| outside the grid | α·E_DFT + β, refit every map from the in-range corrections (`sc_tail_fit = frontier`) | zeroed |
+| protected identities | full Σ at the QP energy | kept, protected×protected only |
+| other identities classified in range at initialization | Σ at the band's own energy | zeroed |
+| remaining active identities | active-window scissor law (pitfall 17) | zeroed |
+
+The protected and in-range identity masks are classified once and carried
+unchanged through the loop; energy sorting and occupations still update each
+map. Crossing a window edge does not promote another identity. The distinct
+energy-only sum-band tail uses its current tail fit and the
+[fixed-empty occupation contract](#empty-energy-only-conduction-tail-owner-ruling-2026-09-20).
 
 The loop is driven by `eqp0` (the Σ evaluated at the current energies). No
 Z-factor enters the iteration; `eqp1` is written as the BerkeleyGW-style
@@ -53,9 +61,10 @@ linearized output only. After convergence `eqp1` and `eqp0` agree to about
 
 After the accepted final map, `dump_qp_wfn_artifacts` assembles the complete
 published energy ladder: the diagonalised active block plus any energy-only
-scissored tail.  A metallic run performs one final fixed-N solve on that
-ladder.  The resulting occupation table, chemical potential, smearing
-family/width, electron target and table hash are written into both the
+scissored tail. A Fermi-Dirac metallic run performs the final fixed-N solve on
+its active QP ladder and appends exact-zero occupations for the energy-only tail,
+following the same empty-tail contract as the maps. The resulting occupation
+table, chemical potential, smearing family/width, electron target and table hash are written into both the
 optional `WFN_qp.h5` and the always-written `qp_wfn_rotations.h5` companion.
 The companion also stores that complete final energy ladder, including the
 inactive scissored tail. Reconstructing a QP WFN through
@@ -75,8 +84,19 @@ between the renames can leave a mixed pair without that completion receipt.
 
 These terminal files are output artifacts, not map checkpoints.  The small
 per-map `eqp0_iterNNNN.dat`, `eqp1_iterNNNN.dat`, and rotation snapshots do
-not contain the full accelerator state, response, or accepted occupation
-record needed to resume a self-consistent iteration.
+not contain the state needed for an exact nonlinear restart. A rotation dump
+is the input `sigma_basis_U` consumed by that map; the eqp0 QP column is the
+map's output spectrum. Those two arrays are not a paired eigensystem.
+
+### Starting from a previous QP solution
+
+`sc_initial_qp_rotations_file` imports an authenticated eigensystem as the
+initial Hamiltonian `H = U diag(E) U^H` in the original DFT basis. Keep the
+original mean-field WFN and reference operators in the new run; the initializer
+solves its own occupations and classifies its frozen identity masks before
+rCROP starts. Its quadrature session and accelerator history start empty.
+This seeds a new run; it does not resume the previous nonlinear history.
+The [input reference](input_reference.md) owns the key and validation contract.
 
 ## Production requirements (owner rulings, 2026-09-03 evening)
 
@@ -94,7 +114,7 @@ interpretable. A production self-consistent run must satisfy:
   ceiling refuses, the owner decides `zeta_rcond`, the run does not drop to a
   smaller basis;
 - `use_band_extrapolation = true` (the default), named explicitly;
-- on metals the MPA route only (GN-PPM refuses metals by name, `GATE gn_ppm_refuses_metals`, owner rulings 2026-09-03 and 2026-09-17), with Fermi-Dirac occupations and `sc_head_update = off` (next section); the two-level (frozen-W inner) loop is discontinued and stays a diagnostic branch;
+- on metals use `compute_mode = mpa` with `sigma_w_model = shared_pole`; the mode name selects the frequency-dependent route, while plain MPA is a literature-comparison model. GN-PPM refuses metals (`GATE gn_ppm_refuses_metals`). Use Fermi-Dirac occupations and `sc_head_update = off`; `head_correction = off` is allowed for SC. The two-level frozen-W inner loop is discontinued;
 - band-structure interpolation (htransform) fitting the whole WFN band set and
   returning at least **16 corrected conduction bands**, guard bands ≥ 8. A
   band-structure workflow must request its own dense uniform NSCF/WFN for
@@ -265,8 +285,8 @@ sweep" 6 s (the actual contraction, 700 τ nodes), "Sigma other" 9 s
 after map 1 is rebuilding rules; check `sc_fixed_rebuilds_this_iteration`.
 
 **10. Convergence is judged on the non-scissored bands only**
-(`protected_band_convergence`). Scissored bands are α·E_DFT + β with the
-coefficients refit each map, so including them would re-count in-range drift.
+(`protected_band_convergence`). The active scissored complement follows the
+closure in pitfall 17; it is not independently evaluated by this criterion.
 `max|dE|` in the log is over that set; a "converged" loop says nothing about
 the tail's own Σ.
 
@@ -359,7 +379,8 @@ nodes remain frozen while their certified boxes cover the map.
 **17. The active-window scissor law stays frozen at map 0.** States inside
 the active Sigma band window but outside the retained self-consistent block
 follow the affine law fitted at map 0 (`SC scissor: frozen from map 0
-(...)`). Measured against a per-map refit at convergence, with the pad and
+(...)`). A zero-sample active fit is absent, not a fitted identity law;
+that case uses the current sum-band tail fit. Measured against a per-map refit at convergence, with the pad and
 per-k identity partition of pitfalls 16 and 18 (Na eta=0.5, +19 eV, trusted
 5-10, three arms to accepted map 16, sandbox claim 946): the refitted law
 drifts from alpha 1.051 to 1.140 and beta -1.23 to -1.72 eV over the loop,
