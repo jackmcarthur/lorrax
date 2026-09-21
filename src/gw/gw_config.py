@@ -1406,6 +1406,11 @@ _DEFAULTS = {
     # direct callers (tests) rather than removed out from under them.
     "sc_mixing": 1.0,
     "sc_dump_dir": "",           # E/U-history npy dump dir ("" = off)
+    # Optional seed-only QP rotation artifact for a NEW SC run.  The reader
+    # reconstructs U diag(E) U^H in the selected mean-field WFN's original
+    # DFT basis.  It does not import a rotated WFN, occupations, a protected
+    # partition or accelerator history from the source run.
+    "sc_initial_qp_rotations_file": "",
     # Symmetric correction averaging is legal only for accidental/exact
     # degeneracies.  This 0.1 meV owner-set ceiling is deliberately more
     # than an order below MoS2's physical 1.7--3.6 meV SOC-split K pair.
@@ -2745,6 +2750,8 @@ def _input_iteration(
         buffer_mode=str(params["sc_buffer_mode"]).strip().lower(),
         eigh=_linalg.sc_eigh,
         head_update=str(params["sc_head_update"]).strip().lower(),
+        initial_qp_rotations_file=(
+            str(params["sc_initial_qp_rotations_file"]).strip() or None),
     )
     eqp2 = EQP2Config(
         enabled=bool(params["write_eqp2"]),
@@ -4197,6 +4204,9 @@ class SCConfig:
     #: velocity alone.  ``METAL_HEAD_UPDATES`` is the vocabulary consumers
     #: test against; do not spell the pair out a second time.
     head_update: str = "off"
+    #: Explicit seed-only ``qp_wfn_rotations.h5`` for a new SC run.  Empty
+    #: means the canonical diagonal DFT seed.  This is not nonlinear restart.
+    initial_qp_rotations_file: str | None = None
 
     def __post_init__(self):
         if self.max_iter < 1:
@@ -4599,6 +4609,11 @@ class LorraxConfig:
 
     def __post_init__(self):
         """Refuse head settings outside their landed scope."""
+        if (self.sc.initial_qp_rotations_file is not None
+                and self.qp_solver is not QPSolver.SELF_CONSISTENT):
+            raise ValueError(
+                "sc_initial_qp_rotations_file seeds a new self-consistent "
+                "Hamiltonian run and requires qp_solver=self_consistent.")
         if self.mpa.fit_reuse_file is not None:
             if self.compute_mode is not ComputeMode.MPA:
                 raise ValueError(
