@@ -382,7 +382,7 @@ def run_span_checks(mesh):
         return (put(z),put(np.arange(len(z),dtype=np.int32)),((put(q),),(put(a@x),)),tuple(infinity),y,signed)
     ct,ctdiag=reduce_cross_round(sector(c,qc,ic,xc,y,signed),sector(t,qt,it,xt,yt,signed_t),
         (((put(t@xc),put(np.zeros_like(t@xc))),),((put(c@xt),put(derivative)),)),
-        tuple(put(v) for v in moments),mesh_xy=mesh,eigh_plan=eig_plan,gates=gates)
+        tuple(put(v) for v in moments),mesh_xy=mesh,eigh_plan=eig_plan)
     assert bool(jnp.all(ctdiag['gram_valid'])) and bool(jnp.all(ctdiag['retained_metric_positive']))
     cc,tt,mu,active=ct
     def evaluate(a,b,mu,active):

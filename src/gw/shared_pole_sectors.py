@@ -384,24 +384,25 @@ def sector_held_errors(signed, samples, z, *, mesh_xy):
     Signed endpoints are (C_L,C_R,mu,active), parent-sharded; sample tiles
     have one support. Only the resulting two scalars per parent replicate.
     """
-    import jax
-    from common.shard_map import shard_map
     from common.collectives import device_put_process_local
     from jax.sharding import NamedSharding,PartitionSpec as P
-    from gw.shared_pole_local import _mm
-    from gw.shared_pole_execution import is_face,face_program,face_matmul
-    face=is_face(signed[0])
-    mm=face_matmul(mesh_xy) if face else _mm
-    from functools import partial
-    body=partial(_sector_held_equations,z=z,mm=mm)
-    spec=P(('x','y'))
-    if face:
-        from gw.shared_pole_execution import held_program
+    from gw.shared_pole_execution import is_face,held_program
+    if is_face(signed[0]):
         return held_program(mesh_xy)(*signed,samples['Wc'],samples['dWc_ds'],jnp.asarray(z))
-    program=jax.jit(shard_map(body,mesh=mesh_xy,in_specs=(spec,)*6,
-                              out_specs=spec,check_vma=False))
-    value=program(*signed,samples['Wc'],samples['dWc_ds'])
+    value=_local_held_program(mesh_xy)(*signed,samples['Wc'],samples['dWc_ds'],jnp.asarray(z))
     return device_put_process_local(value,NamedSharding(mesh_xy,P()))
+
+
+@lru_cache(maxsize=None)
+def _local_held_program(mesh):
+    from functools import partial
+    import jax
+    from common.shard_map import shard_map
+    from jax.sharding import PartitionSpec as P
+    from gw.shared_pole_local import _mm
+    spec=P(('x','y'))
+    return jax.jit(shard_map(partial(_sector_held_equations,mm=_mm),mesh=mesh,
+        in_specs=(spec,)*6+(P(),),out_specs=spec,check_vma=False))
 
 
 def _sector_held_equations(left,right,mu,active,w,d,z,*,mm):
@@ -419,28 +420,31 @@ def _sector_held_equations(left,right,mu,active,w,d,z,*,mm):
 def sector_moment_cauchy(metrics, sectors, *, mesh_xy):
     """Report the Cauchy–Schwarz diagnostic of the common physical M1 metric."""
     import jax
-    from common.shard_map import shard_map
     from common.collectives import device_put_process_local
     from jax.sharding import NamedSharding,PartitionSpec as P
-    from gw.shared_pole_local import _mm
-    from gw.shared_pole_recipe import shared_real_pole_gates_ordered_v1 as gates
-    from gw.shared_pole_execution import is_face
-    face=is_face(metrics[0])
-    spec=P(('x','y'))
-    from gw.shared_pole_execution import cauchy_program
-    if face:
+    from gw.shared_pole_execution import is_face,cauchy_program
+    if is_face(metrics[0]):
         return cauchy_program(
             mesh_xy, metrics[0].shape[-1], metrics[2].shape[-1])(*metrics)
-    mm=_mm
     plans=[s['budget'].eigenplan(m.shape[-1]).native_fn
            for s,m in zip(sectors,(metrics[0],metrics[2]))]
-    def body(c,ct,t):
-        return sector_cauchy_schwarz((c,ct,t),eigh_charge=plans[0],
-                                     eigh_current=plans[1],matmul=mm,gates=gates)
-    program=jax.jit(shard_map(body,mesh=mesh_xy,in_specs=(spec,)*3,
-                              out_specs=spec,check_vma=False))
-    result=program(*metrics)
+    result=_local_cauchy_program(mesh_xy,*plans)(*metrics)
     return jax.tree.map(lambda a:device_put_process_local(a,NamedSharding(mesh_xy,P())),result)
+
+
+@lru_cache(maxsize=None)
+def _local_cauchy_program(mesh,charge_eigh,current_eigh):
+    import jax
+    from common.shard_map import shard_map
+    from jax.sharding import PartitionSpec as P
+    from gw.shared_pole_local import _mm
+    from gw.shared_pole_recipe import shared_real_pole_gates_ordered_v1 as gates
+    def body(c,ct,t):
+        return sector_cauchy_schwarz((c,ct,t),eigh_charge=charge_eigh,
+                                     eigh_current=current_eigh,matmul=_mm,gates=gates)
+    spec=P(('x','y'))
+    return jax.jit(shard_map(body,mesh=mesh,in_specs=(spec,)*3,
+                            out_specs=spec,check_vma=False))
 
 
 def construct_diagonal_sector_round(samples, moments, meta, config, geometry, *, mesh_xy,
@@ -561,7 +565,6 @@ def construct_cross_sector_round(sectors, samples, moments, meta, config, *,
     import copy
     import jax
     import numpy as np
-    from common.shard_map import shard_map
     from common.collectives import device_put_process_local
     from jax.sharding import NamedSharding,PartitionSpec as P
     from gw.gw_config import linalg_resolution
@@ -569,7 +572,7 @@ def construct_cross_sector_round(sectors, samples, moments, meta, config, *,
     from gw.shared_pole_local import _batch_put
     from gw.shared_pole_recipe import shared_real_pole_gates_ordered_v1 as gates
 
-    from gw.shared_pole_execution import is_face,face_program
+    from gw.shared_pole_execution import is_face
     execution="face" if is_face(samples[0]["Wc"]) else "local"
     charge, transverse = sectors
     ct, tc = samples
@@ -609,13 +612,11 @@ def construct_cross_sector_round(sectors, samples, moments, meta, config, *,
     for sector,width in zip(sectors,widths):
         # Drop only exactly inactive carrier columns. This is a storage
         # compaction of the retained span, not a second physical rank cut.
-        from functools import partial
-        compact=partial(_compact_sector_equations,width=width)
         if execution=='face':
             from gw.shared_pole_execution import compact_program
             compact=compact_program(mesh_xy,width)
         else:
-            compact=jax.jit(shard_map(compact,mesh=mesh_xy,in_specs=(spec,spec),out_specs=(spec,spec),check_vma=False))
+            compact=_local_compact_program(mesh_xy,width)
         y,signed=compact(sector['coefficients'],sector['signed'])
         # Host role coordinates/order are replicated metadata, not matrices.
         put=(lambda a:jax.make_array_from_callback(a.shape,NamedSharding(mesh_xy,P()),
@@ -630,13 +631,13 @@ def construct_cross_sector_round(sectors, samples, moments, meta, config, *,
     cross_eigh=budget.eigenplan(side)
     signed,diagnostics=reduce_cross_round(*packed,tuple(actions),
         tuple(moments[f'M{i}'] for i in range(4)),mesh_xy=mesh_xy,
-        eigh_plan=cross_eigh,gates=gates)
+        eigh_plan=cross_eigh)
     for name in ('gram_valid','retained_metric_positive'):
         if not bool(jnp.all(diagnostics[name][:real])):
             raise ValueError(f'GATE shared_pole_sector_{name}: sector=CT; '
                 f"Gram min/max={float(jnp.min(diagnostics['gram_min_relative'][:real])):.9e}; "
                 f"threshold={gates['normalized_gram_validity']['threshold']}; no repair")
-    models,zero=positive_cross_models(signed,mesh_xy=mesh_xy,gates=gates)
+    models,zero=positive_cross_models(signed,mesh_xy=mesh_xy)
     if not bool(jnp.all(zero['zero_policy'][:real])):
         raise ValueError('GATE shared_pole_sector_zero_ritz: sector=CT')
     budget.retained_panels=tuple(retained)
@@ -644,6 +645,17 @@ def construct_cross_sector_round(sectors, samples, moments, meta, config, *,
     return dict(models=models,signed=signed,
                 diagnostics=jax.tree.map(lambda a:device_put_process_local(a,replicated),diagnostics),
                 zero=jax.tree.map(lambda a:device_put_process_local(a,replicated),zero),budget=budget)
+
+
+@lru_cache(maxsize=None)
+def _local_compact_program(mesh,width):
+    from functools import partial
+    import jax
+    from common.shard_map import shard_map
+    from jax.sharding import PartitionSpec as P
+    spec=P(('x','y'))
+    return jax.jit(shard_map(partial(_compact_sector_equations,width=width),mesh=mesh,
+        in_specs=(spec,spec),out_specs=(spec,spec),check_vma=False))
 
 
 def _compact_sector_equations(y,signed,*,width,matrix_sharding=None):
@@ -655,27 +667,29 @@ def _compact_sector_equations(y,signed,*,width,matrix_sharding=None):
          jnp.take_along_axis(active,order,axis=-1)))
 
 
-def positive_cross_models(signed, *, mesh_xy, gates):
+def positive_cross_models(signed, *, mesh_xy):
     """Positive-pole CT endpoint models with the same ordering and zero mask.
 
     Finite/infinite and low-pole dropped weight are checked independently
     on each physical endpoint; a large charge norm cannot hide a lost current
     factor. The signed model remains available for held-frequency checks.
     """
+    from gw.shared_pole_execution import is_face,positive_cross_program
+    if is_face(signed[0]):
+        return positive_cross_program(mesh_xy)(*signed)
+    return _local_positive_cross_program(mesh_xy)(*signed)
+
+
+@lru_cache(maxsize=None)
+def _local_positive_cross_program(mesh):
+    from functools import partial
     import jax
     from common.shard_map import shard_map
     from jax.sharding import PartitionSpec as P
-    from gw.shared_pole_gates import apply_shared_pole_zero_policy,sort_shared_pole_columns
-
-    from functools import partial
-    body=partial(_positive_cross_equations,gates=gates)
-    from gw.shared_pole_execution import is_face,face_program
-    if is_face(signed[0]):
-        from gw.shared_pole_execution import positive_cross_program
-        return positive_cross_program(mesh_xy)(*signed)
+    from gw.shared_pole_recipe import shared_real_pole_gates_ordered_v1 as gates
     spec=P(('x','y'))
-    return jax.jit(shard_map(body,mesh=mesh_xy,in_specs=(spec,)*4,
-                              out_specs=(spec,spec),check_vma=False))(*signed)
+    return jax.jit(shard_map(partial(_positive_cross_equations,gates=gates),mesh=mesh,
+        in_specs=(spec,)*4,out_specs=(spec,spec),check_vma=False))
 
 
 def _positive_cross_equations(left,right,mu,active,*,gates,matrix_sharding=None):
@@ -737,22 +751,38 @@ def cross_round_actions(samples, states, roles, recipe, *, sample_lo, mesh_xy,
     partner permutation. Outputs follow the paired state order and the
     derivative is d/dz, report equation 5.3.
     """
-    import jax
-    from common.shard_map import shard_map
-    from jax.sharding import PartitionSpec as P
     from gw.shared_pole_directions import _sample_point
-
-    from gw.shared_pole_execution import is_face,face_program,face_matmul
-    from gw.shared_pole_local import _mm
+    from gw.shared_pole_execution import is_face,cross_action_program
     face=is_face(samples[0])
-    mm=face_matmul(mesh_xy) if face else _mm
-    batch=P(('x','y'))
     literal=len(samples)==8
     if len(samples) not in (4,8):
         raise ValueError('GATE shared_pole_sector_mirror: expected four direct or eight direct/mirror panels')
-    perm=tuple((i,int(p)) for i,p in enumerate(partner_slots))
-    left,right=endpoint_actions
+    if face and not literal:
+        raise ValueError('distributed photon CT requires authenticated literal mirrors')
+    outputs=[]
+    for state,role in zip(states,roles[0]):
+        sid=int(role['sample_id'])
+        conjugate=bool(role.get('conjugate',False))
+        mirror=bool(role.get('mirror',False))
+        node=jnp.asarray(state[0])
+        sample=jnp.asarray(sid-sample_lo,jnp.int32)
+        if face:
+            outputs.append(cross_action_program(mesh_xy,mirror,conjugate)(samples,state[1],node,sample))
+        else:
+            exchange=mirror and _sample_point(recipe,sid).real!=0 and not literal
+            perm=tuple((i,int(p)) for i,p in enumerate(partner_slots)) if exchange else ()
+            program=_local_cross_action_program(mesh_xy,literal,mirror,conjugate,exchange,perm)
+            outputs.append(program(samples,state[1],*endpoint_actions,node,sample))
+    return tuple(outputs)
 
+
+@lru_cache(maxsize=None)
+def _local_cross_action_program(mesh,literal,mirror,conjugate,exchange,perm):
+    import jax
+    from common.shard_map import shard_map
+    from jax.sharding import PartitionSpec as P
+    from gw.shared_pole_local import _mm
+    use_adjoint=not conjugate if mirror and not exchange else conjugate
     def rotate(panel, rotation, transpose):
         if rotation is None:
             return panel
@@ -760,59 +790,37 @@ def cross_round_actions(samples, states, roles, recipe, *, sample_lo, mesh_xy,
         panel=panel.reshape(shape[0],shape[1]//3,3,shape[-1])
         return jnp.einsum('bij,bmir->bmjr' if transpose else 'bij,bmjr->bmir',
                           rotation,panel).reshape(shape)
-
-    outputs=[]
-    for state,role in zip(states,roles[0]):
-        sid=int(role['sample_id'])
-        z=_sample_point(recipe,sid)
-        conjugate=bool(role.get('conjugate',False))
-        mirror=bool(role.get('mirror',False))
-        exchange=mirror and z.real!=0 and not literal
-        use_adjoint=not conjugate if mirror and not exchange else conjugate
-        node=state[0]
-
-        if face:
-            if not literal:
-                raise ValueError('distributed photon CT requires authenticated literal mirrors')
-            from gw.shared_pole_execution import cross_action_program
-            outputs.append(cross_action_program(mesh_xy,mirror,conjugate)(
-                samples,state[1],jnp.asarray(node),jnp.asarray(sid-sample_lo,jnp.int32)))
-            continue
-
-        def apply(*args):
-            *panels,q,left,right=args
-            if literal:
-                return _literal_cross_products(panels,q,node,sample=sid-sample_lo,
-                    mirror=mirror,conjugate=conjugate,mm=mm)
-            w,wr,d,dr=panels[:4]
-            a,b=w[:,sid-sample_lo],wr[:,sid-sample_lo]
-            da,db=d[:,sid-sample_lo],dr[:,sid-sample_lo]
-            if exchange:
-                alpha,inverse,phase,rotation=right
-                q=rotate(jnp.take_along_axis(phase[:,:,None]*q,inverse[:,:,None],axis=1),rotation,True)
-                q=jax.lax.ppermute(q,('x','y'),perm)
-                if conjugate:
-                    a,da=jnp.conj(a),jnp.conj(da)
-                else:
-                    a,da=jnp.swapaxes(b,-1,-2),jnp.swapaxes(db,-1,-2)
-            elif use_adjoint:
-                a,da=jnp.swapaxes(jnp.conj(b),-1,-2),jnp.swapaxes(jnp.conj(db),-1,-2)
-            o,d_o=mm(a,q),mm(da,q)*(2*node)
-            if exchange:
-                alpha,inverse,phase,rotation=left
-                def back(x):
-                    x=jax.lax.ppermute(x,('x','y'),perm)
-                    return rotate(jnp.conj(phase)[:,:,None]*jnp.take_along_axis(x,alpha[:,:,None],axis=1),rotation,False)
-                o,d_o=back(o),back(d_o)
-            return o,d_o
-
-        program=jax.jit(shard_map(apply,mesh=mesh_xy,
-            in_specs=(batch,)*(len(samples)+3),out_specs=(batch,batch),check_vma=False))
-        outputs.append(program(*samples,state[1],left,right))
-    return tuple(outputs)
+    def apply(panels,q,left,right,node,sample):
+        if literal:
+            return _literal_cross_products(panels,q,node,sample,
+                mirror=mirror,conjugate=conjugate,mm=_mm)
+        w,wr,d,dr=panels
+        a,b=w[:,sample],wr[:,sample]
+        da,db=d[:,sample],dr[:,sample]
+        if exchange:
+            alpha,inverse,phase,rotation=right
+            q=rotate(jnp.take_along_axis(phase[:,:,None]*q,inverse[:,:,None],axis=1),rotation,True)
+            q=jax.lax.ppermute(q,('x','y'),perm)
+            if conjugate:
+                a,da=jnp.conj(a),jnp.conj(da)
+            else:
+                a,da=jnp.swapaxes(b,-1,-2),jnp.swapaxes(db,-1,-2)
+        elif use_adjoint:
+            a,da=jnp.swapaxes(jnp.conj(b),-1,-2),jnp.swapaxes(jnp.conj(db),-1,-2)
+        o,d_o=_mm(a,q),_mm(da,q)*(2*node)
+        if exchange:
+            alpha,inverse,phase,rotation=left
+            def back(x):
+                x=jax.lax.ppermute(x,('x','y'),perm)
+                return rotate(jnp.conj(phase)[:,:,None]*jnp.take_along_axis(x,alpha[:,:,None],axis=1),rotation,False)
+            o,d_o=back(o),back(d_o)
+        return o,d_o
+    batch=P(('x','y'))
+    return jax.jit(shard_map(apply,mesh=mesh,in_specs=(batch,)*4+(P(),P()),
+                            out_specs=(batch,batch),check_vma=False))
 
 
-def reduce_cross_round(charge, transverse, cross, moments, *, mesh_xy, eigh_plan, gates):
+def reduce_cross_round(charge, transverse, cross, moments, *, mesh_xy, eigh_plan):
     """Construct CT on the two retained original-pencil spans.
 
     Each sector tuple contains (points, order, states, infinity, Y, signed),
@@ -825,23 +833,25 @@ def reduce_cross_round(charge, transverse, cross, moments, *, mesh_xy, eigh_plan
     service plan matching that layout. Returns two signed CT endpoint factors,
     inverse poles, active columns and the unchanged joint-metric diagnostics.
     """
+    from gw.shared_pole_execution import is_face,cross_parent_program
+    if is_face(charge[4]):
+        side=charge[4].shape[-1]+transverse[4].shape[-1]
+        return cross_parent_program(mesh_xy,side)(charge,transverse,cross,moments)
+    return _local_cross_parent_program(mesh_xy,eigh_plan.native_fn)(charge,transverse,cross,moments)
+
+
+@lru_cache(maxsize=None)
+def _local_cross_parent_program(mesh,native_eigh):
+    from functools import partial
     import jax
     from common.shard_map import shard_map
     from jax.sharding import PartitionSpec as P
     from gw.shared_pole_local import _mm
-
-    from gw.shared_pole_execution import is_face
-    face=is_face(charge[4])
+    from gw.shared_pole_recipe import shared_real_pole_gates_ordered_v1 as gates
     spec=P(('x','y'))
-    from gw.shared_pole_execution import cross_parent_program
-    if face:
-        side=charge[4].shape[-1]+transverse[4].shape[-1]
-        return cross_parent_program(mesh_xy,side)(charge,transverse,cross,moments)
-    from functools import partial
-    body=partial(_cross_reduce_equations,mm=_mm,eigh=eigh_plan.native_fn,gates=gates)
-    program=jax.jit(shard_map(body,mesh=mesh_xy,in_specs=(spec,)*4,
-                              out_specs=(spec,spec),check_vma=False))
-    return program(charge,transverse,cross,moments)
+    body=partial(_cross_reduce_equations,mm=_mm,eigh=native_eigh,gates=gates)
+    return jax.jit(shard_map(body,mesh=mesh,in_specs=(spec,)*4,
+                            out_specs=(spec,spec),check_vma=False))
 
 
 def _cross_reduce_equations(charge,transverse,cross,moments,*,mm,eigh,gates,matrix_sharding=None):

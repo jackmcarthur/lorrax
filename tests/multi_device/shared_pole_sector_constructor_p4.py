@@ -14,7 +14,6 @@ def check_sector_constructor(mesh, root, *, linalg="local", parents=16, return_o
     from gw.photon_layout import PhotonBasisLayout
     from gw.shared_pole_recipe import CapacityLedger, ROLE_CODES
     from gw.shared_pole_sectors import construct_sector_poles, positive_cross_models
-    from gw.shared_pole_recipe import shared_real_pole_gates_ordered_v1 as gates
     from file_io import shared_pole_store as store
     from file_io.slab_io import SlabIO
 
@@ -164,7 +163,7 @@ def check_sector_constructor(mesh, root, *, linalg="local", parents=16, return_o
         return jax.make_array_from_callback(a.shape,NamedSharding(mesh,P(('x','y'))),lambda ix:a[ix])
     signed=(batch(np.array([[1.,1e-12]],complex)),batch(np.array([[1.,10.]],complex)),
             batch(np.array([1.,2000.])),batch(np.ones(2,bool)))
-    pair,zero=positive_cross_models(signed,mesh_xy=mesh,gates=gates)
+    pair,zero=positive_cross_models(signed,mesh_xy=mesh)
     assert bool(jnp.all(zero['charge']['zero_policy']))
     assert not bool(jnp.any(zero['current']['zero_policy']))
     assert not bool(jnp.any(zero['zero_policy']))
