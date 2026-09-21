@@ -114,6 +114,24 @@ def _ordered_pair_normal_equations(normal_eq, q_neg_idx):
 	return normal_eq + jnp.conj(jnp.take(normal_eq, q_neg_idx, axis=0))
 
 
+def _ordered_pair_normal_equations_sharded(normal_eq, q_neg_idx, sharding):
+	"""The same sum on a carrier whose leading q axis is replicated: rank-local.
+
+	``q_neg_idx`` permutes the replicated axis, so every rank completes its own
+	``(mu_X, nu_Y)`` tile from its own rows; the elementwise conjugate keeps
+	the tile in place.  No cross-rank value is formed (2026-09-21).
+	"""
+	spec = sharding.spec
+
+	def _local(c, idx):
+		return c + jnp.conj(jnp.take(c, idx, axis=0))
+
+	kernel = jax.jit(shard_map(
+		_local, mesh=sharding.mesh, in_specs=(spec, P()),
+		out_specs=spec, check_vma=False), donate_argnums=(0,))
+	return kernel(normal_eq, q_neg_idx)
+
+
 def complete_ordered_pair_normal_equations(normal_eq, q_neg_idx):
 	"""Complete an LR normal equation to the conjugation-closed LR+RL set; see docs/architecture/zeta_fit_face_psi_cct.md."""
 	if getattr(normal_eq, "ndim", 0) < 1:
@@ -132,6 +150,12 @@ def complete_ordered_pair_normal_equations(normal_eq, q_neg_idx):
 		raise ValueError(
 			"complete_ordered_pair_normal_equations: q_neg_idx must be an "
 			"involutive permutation of the full q axis.")
+	sharding = getattr(normal_eq, "sharding", None)
+	if (isinstance(sharding, NamedSharding) and len(sharding.spec) >= 1
+			and sharding.spec[0] is None
+			and any(axis is not None for axis in sharding.spec[1:])):
+		return _ordered_pair_normal_equations_sharded(
+			normal_eq, jnp.asarray(neg), sharding)
 	return _ordered_pair_normal_equations(normal_eq, jnp.asarray(neg))
 
 

@@ -174,6 +174,51 @@ def _collect_fit_setup_garbage():
     gc.collect()
 
 
+def add_pad_diagonal_sharded(C, active_mask, n_logical, *, mesh_xy):
+    """``C + (tr C / n_logical) diag(~active_mask)`` with every operand a rank-local tile.
+
+    ``C`` is ``(nq, n, n)`` at ``P(None, 'x', 'y')``.  Each rank sums the
+    global-diagonal entries that fall inside its own ``(mu_X, nu_Y)`` tile
+    (a tile touches the diagonal only where its row and column ranges
+    overlap), ``psum`` gives ``tr C`` per q, and the pad diagonal is the
+    same row-equals-column test masked by the pad rows of the tile.  The
+    values equal the former replicated ``trace``/``diag`` expression; only
+    the summation order of the trace differs (per-rank partials, then the
+    mesh reduction).  No ``(n, n)`` or ``(nq, n, n)`` value is formed
+    outside the rank's tile.
+    """
+    from jax.sharding import PartitionSpec as P
+    from common.shard_map import shard_map
+    nq, n, n2 = (int(v) for v in C.shape)
+    px, py = int(mesh_xy.shape['x']), int(mesh_xy.shape['y'])
+    if n != n2 or n % px or n % py:
+        raise ValueError(
+            "add_pad_diagonal_sharded: C must be a square (nq, n, n) carrier "
+            f"with n divisible by the mesh; got {tuple(C.shape)} on {px}x{py}")
+    mu_loc, nu_loc = n // px, n // py
+    pad = jnp.asarray(~np.asarray(active_mask, dtype=bool))
+    if pad.shape != (n,):
+        raise ValueError(
+            f"add_pad_diagonal_sharded: active_mask has shape {pad.shape}, want ({n},)")
+    inv_n = 1.0 / float(n_logical)
+
+    def _local(c, pad_rows_full):
+        rows = jax.lax.axis_index('x') * mu_loc + jnp.arange(mu_loc)
+        cols = jax.lax.axis_index('y') * nu_loc + jnp.arange(nu_loc)
+        on_diag = rows[:, None] == cols[None, :]
+        local_trace = jnp.sum(jnp.where(on_diag[None], c, 0), axis=(-2, -1))
+        trace = jax.lax.psum(local_trace, ('x', 'y'))
+        scale = (trace.real * inv_n).astype(c.dtype)
+        pad_here = jnp.take(pad_rows_full, rows)
+        mask = (on_diag & pad_here[:, None]).astype(c.dtype)
+        return c + scale[:, None, None] * mask[None]
+
+    kernel = jax.jit(shard_map(
+        _local, mesh=mesh_xy, in_specs=(P(None, 'x', 'y'), P()),
+        out_specs=P(None, 'x', 'y'), check_vma=False))
+    return kernel(C, pad)
+
+
 def fit_zeta_to_h5(
     wfn,
     sym,
@@ -440,13 +485,15 @@ def fit_zeta_to_h5(
             # spectrum -- a unit pad would BE lambda_max when C's scale is
             # small and the rank-truncation cut rcond*lambda_max would then
             # drop real modes (Si leg 20 attempt 1: 39 meV).
-            _pad_scale = (jnp.trace(C_q_flat, axis1=-2, axis2=-1).real
-                          / float(n_rmu)).astype(C_q_flat.dtype)
-            _pad_diag = jnp.diag(jnp.asarray(
-                ~mu_basis.active_mask, dtype=C_q_flat.dtype))
-            C_q_flat = jax.lax.with_sharding_constraint(
-                C_q_flat + _pad_scale[:, None, None] * _pad_diag[None],
-                flat_shard)
+            # Rank-local by construction (2026-09-21, Fe3GeTe2 P36/P16 OOM):
+            # the former eager ``_pad_scale[:, None, None] * _pad_diag[None]``
+            # multiplied two REPLICATED operands and so materialised the
+            # whole (nq, n_pad, n_pad) product on every device
+            # (128 x 6876^2 x 16 B = 96.8 GB) before the sharded add.  The
+            # trace and the pad mask are now formed on each rank's own
+            # (mu_X, nu_Y) tile; nothing larger than that tile exists.
+            C_q_flat = add_pad_diagonal_sharded(
+                C_q_flat, mu_basis.active_mask, float(n_rmu), mesh_xy=mesh_xy)
         if _q_neg_idx is not None:
             C_q_flat = complete_ordered_pair_normal_equations(
                 C_q_flat, _q_neg_idx)
