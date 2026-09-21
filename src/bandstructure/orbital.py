@@ -12,6 +12,7 @@ import numpy as np
 from jax.sharding import NamedSharding, PartitionSpec as P
 
 from common.fft_helpers import make_flat_k_ifftn
+from common.staged_reshard import face_to_batch_reshard
 from gw.qsgw_head import rotate_velocity_to_qp
 from runtime.padding import pad_axis
 
@@ -54,13 +55,16 @@ def interpolate_band_operator(operator_cart, source_coefficients,
     q_matrix = NamedSharding(mesh, P(('x', 'y'), None, None, None))
     q_coeff = NamedSharding(mesh, P(('x', 'y'), None, None))
     step = int(mesh.size)
+    exchange = face_to_batch_reshard(mesh)
 
     @partial(jax.jit, out_shardings=q_matrix)
     def rotate(q, c, lattice_operator):
         phase = jnp.exp(-2j * jnp.pi * (q @ R.T))
         value = jnp.einsum('qk,kamn->qamn', phase, lattice_operator)
         value = jax.lax.with_sharding_constraint(value, face)
-        value = jax.lax.with_sharding_constraint(value, q_matrix)
+        # Use the existing two all-to-all transfer; a generic face -> q
+        # constraint can make XLA replicate this rank-squared buffer.
+        value = exchange(value.reshape((-1, rank, rank))).reshape(value.shape)
         value = 0.5 * (value + value.swapaxes(-1, -2).conj())
         c = jax.lax.with_sharding_constraint(c, q_coeff)
         return jnp.einsum('qmi,qamn,qnj->qaij', c.conj(), value, c,

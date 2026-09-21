@@ -11,7 +11,7 @@ from bandstructure.orbital import interpolate_band_operator
 def test_complex_operator_recovered_on_source_grid():
     mesh = initialize_communicator_stack().mesh
     rng = np.random.default_rng(35)
-    nk, nb, rank = 8, 4, 8
+    nk, nb, rank = 8, 4, 20
     c = np.stack([np.linalg.qr(rng.normal(size=(rank,nb))
                   +1j*rng.normal(size=(rank,nb)))[0].T for _ in range(nk)])
     v = rng.normal(size=(3,nk,nb,nb))+1j*rng.normal(size=(3,nk,nb,nb))

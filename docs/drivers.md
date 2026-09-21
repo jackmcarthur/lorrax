@@ -214,6 +214,18 @@ Does NOT apply to plasmon-pole or multipole reductions: `B_q` is a residue and w
 
 ## htransform — `bandstructure.htransform`
 
+For orbital observables, `bandstructure.orbital.interpolate_band_operator`
+projects an explicitly supplied band operator into the same Galerkin basis,
+Fourier-interpolates it, and rotates it with the published path coefficients.
+It uses the existing staged face-to-batch redistribution; rank-squared
+operators are never intentionally replicated. `psp.orbital_response` owns
+the orbital moment, Berry curvature and finite-temperature contraction;
+its [theory note](../src/psp/orbital_magnetization_THEORY.md) defines signs,
+units and degeneracy scope. The caller must identify its velocity: frozen
+DFT velocity omits the covariant QP correction and is an approximation.
+The raw four-component current is available through the existing matrix
+element sweep's `dirac_current_operator`, with no implicit nonlocal term.
+
 Hamiltonian-transformation bandstructure interpolation to an arbitrary k-path from coarse-grid data. `isdf.galerkin` selects the published shared whole-state basis from stacked full-Bloch states with deterministic randomized QRCP, factors the selected physical states exactly, and projects all states into that one alpha gauge. The canonical `PsiGStore` and WFN transforms stream the G-flat→real-space work; centroids are only registered evaluation points for the fitted basis. The driver forms `fH_k = Σ_n f(ε_nk)c_nk c_nkᴴ`, applies the canonical flat-k IFFT to obtain `fH_R`, and recovers path energies with the existing batched eigensolver plus the archived Newton inverse. `--qp-rotations qp_wfn_rotations.h5` is the full quasiparticle-Hamiltonian path: it consumes the matched `U_mnk,E_qp` artifact through `file_io.qp_wfn` and rotates only the compact Galerkin state rows, so the unchanged builder represents `f(H_QP)=U f(E_QP) Uᴴ`. `--eqp-file` is deliberately the cheaper diagonal approximation: it changes energies in the current WFN band labels and cannot represent off-diagonal QP mixing.
 
 When the fitted window contains outer DFT guards, the authenticated QP block
