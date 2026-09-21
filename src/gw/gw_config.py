@@ -2475,8 +2475,10 @@ def _resolve_input_memory(
     """Produce the runtime memory budget and chunk utilization."""
     memory_per_device_gb = float(params.get("memory_per_device_gb", 0.0))
     if memory_per_device_gb <= 0 and resolve_hardware:
-        from common.gpu_utils import get_device_memory_gb
-        memory_per_device_gb = get_device_memory_gb()
+        from common.gpu_utils import get_device_memory_gb, minimum_process_budget_gb
+        # Hardware resolution is collective: heterogeneous HBM must not select
+        # different static ISDF/G/Sigma tile shapes on different processes.
+        memory_per_device_gb = minimum_process_budget_gb(get_device_memory_gb())
         print_fn(
             f"  Auto-detected memory budget: {memory_per_device_gb:.2f} GB/device"
         )
