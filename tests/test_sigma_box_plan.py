@@ -210,6 +210,42 @@ def test_containment_cache_reuses_rules_without_a_builder_call(
         "window_tau_pairs"]
 
 
+@pytest.mark.parametrize("space,negative", [("cond", False), ("val", True)])
+def test_sc_fixed_tail_covers_a_state_crossing_the_product_edge(
+        monkeypatch, space, negative):
+    calls = []
+
+    def counted(box, eps, **kwargs):
+        calls.append(tuple(box))
+        return _fake_rule(box, eps, **kwargs)
+
+    monkeypatch.setattr("gw.sigma_box_plan.build_uniform_rule", counted)
+    session = {}
+    omega_abs = np.asarray([0.2, 0.5])
+    omega = -omega_abs if negative else omega_abs
+
+    def plan(moving_energy):
+        branch = _SigmaBranch(
+            tag="tail crossing", space=space, neg_omega_half=negative,
+            E_A=jnp.asarray([[0.1, moving_energy, 3.0]]),
+            base_mask_A=jnp.asarray([[True, True, True]]),
+            omega_abs=omega_abs, omega_idx=np.arange(2))
+        return plan_sigma_windows(
+            _summaries(), [branch], omega, 0.1, eps=1.e-4,
+            cache_dir=None, fixed_rule_session=session,
+            fixed_pole_support_ry=5.0, print_fn=lambda *_a, **_k: None)
+
+    # The selector boundary is .65 Ry. A .02 Ry motion introduces a new
+    # nearest tail state; its old member at 3 Ry must not set the certificate.
+    _, initial = plan(0.64)
+    calls.clear()
+    _, current = plan(0.66)
+    assert not calls
+    assert current["sc_fixed_total_rebuild_count"] == 0
+    assert [w["node_digest"] for w in initial["branches"][0]["windows"]] == [
+        w["node_digest"] for w in current["branches"][0]["windows"]]
+
+
 def test_sc_fixed_session_reuses_identical_nodes_without_refitting(monkeypatch):
     calls = []
 

@@ -49,6 +49,7 @@ _FACTOR_GROWTH_CAP = 30.0
 _RUNTIME_NOISE_EPSILON = 6.0e-8
 _RUNTIME_NOISE_SAFETY = 0.05
 _SC_POLE_PAD_FRACTION = 0.10
+_BOX_SIGN_FRACTION = 0.7
 #: Flat real-axis coverage pad on every SC product window (owner ruling
 #: 2026-09-19). One tau node map must hold for the whole self-consistency
 #: loop, so the iteration-1 certificate pays a full +2 eV at each real end
@@ -240,9 +241,9 @@ def _box(real_lo, real_hi, gamma_lo, gamma_hi, eta):
     """Pad real support by 2%, without changing its sign topology."""
     pad = 0.02 * max(real_hi - real_lo, eta)
     lo = real_lo - pad if real_lo <= 0.0 else max(real_lo - pad,
-                                                   0.7 * real_lo)
+                                                   _BOX_SIGN_FRACTION * real_lo)
     hi = real_hi + pad if real_hi >= 0.0 else min(real_hi + pad,
-                                                   0.7 * real_hi)
+                                                   _BOX_SIGN_FRACTION * real_hi)
     return (float(lo), float(hi),
             float(gamma_lo + eta), float(gamma_hi + eta))
 
@@ -772,6 +773,15 @@ def _sc_padded_box_spec(spec, eta):
     if spec["kind"] == "sign_definite_positive" and support_box[0] > 0.0:
         box[0] = max(box[0], 0.5 * spec["box"][0])
         box[0] = min(box[0], support_box[0])
+    # Membership can change without appreciable state motion: a state just
+    # outside a tail at map 0 can enter it at map 1. Cover the selector's
+    # guaranteed sign gap, not the accidental nearest initial sample.
+    if "sc_selector_gap_ry" in spec:
+        gap = float(spec["sc_selector_gap_ry"])
+        if spec["kind"] == "sign_definite_negative":
+            box[1] = max(box[1], -gap)
+        elif spec["kind"] == "sign_definite_positive":
+            box[0] = min(box[0], gap)
     padded = dict(spec)
     padded["box"] = tuple(float(value) for value in box)
     padded["kind"] = (
@@ -1132,6 +1142,14 @@ def plan_sigma_windows(
                 if support_hi > support_lo:
                     spec["sc_support_pole_extent"] = (
                         support_lo, support_hi, 0.0, 0.0)
+                if (name in ("bulk", "state_tail", "pole_tail")
+                        and geometry["state_edge_ry"] > 0.0):
+                    # Positive real poles and the Cartesian selectors imply
+                    # |raw denominator| >= state_edge: the pole edge includes
+                    # omega_max plus the entire negative state excursion.
+                    # _box preserves at least this fraction of that gap.
+                    spec["sc_selector_gap_ry"] = (
+                        _BOX_SIGN_FRACTION * geometry["state_edge_ry"])
             if fixed_rule_session is not None and "external_support_ev" in fixed_rule_session:
                 support = np.asarray(fixed_rule_session["external_support_ev"]) / RYD_TO_EV
                 spec["sc_support_frequencies"] = (

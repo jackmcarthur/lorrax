@@ -101,6 +101,17 @@ relative tail rule reduced it to about 0.1 meV without extra asymptotic cost.
 Conversely, relative error on a crossing box over-resolves harmless far edges
 and added about 50% more nodes in the measured Na case.
 
+For a frozen SC rule with positive real shared poles, the initial tail
+certificate also covers the selector boundary. Write `a = edge_factor*eta`
+and `x = max(0,-min E)`; the pole split is `omega_max+a+x`.
+Thus state tails, pole tails and opposite-half bulk products satisfy
+`|Re d| >= a`, independently of which states or poles occupy the product.
+The direct box's 30% padding preserves `|Re d| >= 0.7*a`. This supplies the
+toward-zero edge of the initial fixed certificate when `a>0`; using only the
+nearest map-0 sample would exclude a state newly entering the same tail.
+The far edge retains the SC drift padding and its containment check. This
+does not freeze product membership or permit per-map node refitting.
+
 The planner rechecks the rule's own sup certificate, the float32-runtime noise
 allowance
 
