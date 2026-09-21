@@ -115,6 +115,15 @@ def test_qp_seed_reconstruction_partition_enters_real_rcrop_seam(
     np.testing.assert_array_equal(
         np.asarray(partition.protected_mask), expected_protected)
 
+    # The seeded map must carry the same freeze decision through its output
+    # scissor step, which may otherwise promote new frontier identities.
+    classified, _, _, _, frozen = sc._classify_sc_partition(
+        E, U, None, previous_partition=partition, iteration=0,
+        inputs=inputs, current_mu_ry=0.1)
+    assert frozen
+    np.testing.assert_array_equal(
+        classified.protected_mask, partition.protected_mask)
+
     payload = SimpleNamespace(scissor_fit=None, tail_scissor_fit=None)
     seen = []
 

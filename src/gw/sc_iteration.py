@@ -881,7 +881,7 @@ def make_initial_state_from_qp_rotations(
     seed_mu_ry = (
         float(occ_state.mu_ry) if occ_state is not None else
         float(_midgap_efermi(jnp.asarray(E_full), int(inputs.meta.nelec))))
-    partition, _, _, _ = _classify_sc_partition(
+    partition, _, _, _, _ = _classify_sc_partition(
         E_loop, U_loop, occ_state, previous_partition=None, iteration=0,
         inputs=inputs, current_mu_ry=seed_mu_ry)
     _record_sc(
@@ -2809,12 +2809,13 @@ def _classify_sc_partition(
     iteration: int,
     inputs: SCInputs,
     current_mu_ry: float | None = None,
-) -> tuple[BandPartition, np.ndarray, np.ndarray, float]:
+) -> tuple[BandPartition, np.ndarray, np.ndarray, float, bool]:
     """Assign DFT identities and resolve the one SC partition policy.
 
     The external-Hamiltonian seed calls this before rCROP constructs its
     metric. Map 0 then reuses that current decision; the diagonal DFT seed
-    retains its historical map-0 rebuild with DFT hysteresis.
+    retains its historical map-0 rebuild with DFT hysteresis. The returned
+    frozen flag also owns whether the output scissor may promote a frontier.
     """
     from common.collectives import gather_to_host
     from .sc_state_identity import assign_qp_identity
@@ -2888,7 +2889,7 @@ def _classify_sc_partition(
             protected_mask=ks.broadcast(partition.protected_mask),
             in_range_mask=ks.broadcast(partition.in_range_mask))
     partition = _apply_sc_buffer_partition(partition, inputs)
-    return partition, indices_loop, energies_loop, mu_ev
+    return partition, indices_loop, energies_loop, mu_ev, frozen_partition
 
 
 def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
@@ -3150,7 +3151,8 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     # -> 4.208 -> 5.129 -> 4.046 -> 5.187 -> 2.743 -> 5.435 -> 2.610 eV over
     # 15 calls, map gain 2.05-3.42) while the protected manifold itself moved
     # 0.03-0.25 eV.  ``partition`` from SCState is the map-0 decision.
-    partition, indices_loop, energies_loop, _mu_ev = _classify_sc_partition(
+    (partition, indices_loop, energies_loop, _mu_ev,
+     _frozen_partition) = _classify_sc_partition(
         E_qp_ry, U_qp, entry_occ_state,
         previous_partition=state.partition, iteration=int(state.iteration),
         inputs=inputs)
