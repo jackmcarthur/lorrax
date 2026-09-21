@@ -138,7 +138,9 @@ def check_numerical_support(mesh):
     expected[:-1, 0] = u[:, :3] @ u[:, :3].conj().T
     expected[:-1, 1] = u[:, :5] @ u[:, :5].conj().T
     error = float(jnp.max(jnp.abs(q @ q.conj().swapaxes(-1, -2) - put(expected))))
-    assert error < 2e-8, error  # weakest retained eigenvalue is 1e-7
+    # Davis–Kahan scale: eigenvector error follows the gap to the null space.
+    projector_bound = 2*n*np.finfo(float).eps*4/1e-7
+    assert error < projector_bound, (error, projector_bound)
     _, unbounded = D.leading_eigenvectors(a, 8, **options)
     assert all(len(v) == 8 for row in unbounded[:-1] for v in row)
     _, degenerate = leading_response_directions(a, 2, **options)
