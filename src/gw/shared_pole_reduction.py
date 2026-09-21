@@ -265,18 +265,23 @@ def reduce_ordered_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, g
     keep = ((gamma > keep_cut * largest[:, None]) & (largest[:, None] > 0)
             & _within_budget(gamma, keep_budget))
     count = jnp.sum(keep, axis=-1, dtype=jnp.int64)
-    z = u * (keep / jnp.sqrt(jnp.where(keep, gamma, 1)))[:, None, :]
+    # Budget-excluded columns are exactly zero; omit them from local dense work.
+    width = gamma.shape[-1]
+    if matrix_sharding is None and face is None and keep_budget is not None:
+        width = min(width, max(1, int(keep_budget)))
+    kept, values = keep[:, -width:], gamma[:, -width:]
+    z = u[..., -width:] * (kept / jnp.sqrt(jnp.where(kept, values, 1)))[:, None, :]
     del u
     metric = matmul(z, matmul(h_vv, z), transa="C")
-    null_identity = diagonal_like(~keep, h_vv)
+    null_identity = diagonal_like(~kept, metric)
     correction, metric_ok, metric_diagnostics = _metric_inverse_root(
         hermitian_part(metric) + null_identity, matmul=matmul,
         tolerance=gates["retained_subspace_moments"]["threshold"], matrix_sharding=matrix_sharding)
     del null_identity
-    z = matmul(z, correction) * keep[:, None, :]
+    z = matmul(z, correction) * kept[:, None, :]
     del correction
     metric = matmul(z, matmul(h_vv, z), transa="C")
-    wanted_metric = diagonal_like(keep, h_vv)
+    wanted_metric = diagonal_like(kept, metric)
     metric_relative = (jnp.linalg.norm(metric - wanted_metric, axis=(-2, -1))
                        / jnp.sqrt(jnp.maximum(count, 1)))
     del wanted_metric, h_vv
@@ -316,8 +321,8 @@ def reduce_ordered_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, g
     c = matmul(o_r, matmul(y, rotation))
     if retain_span:
         ritz = matmul(y, rotation)
-        span_w = matmul(paired_span, ritz[:, :half + n_inf])
-        span_v = matmul(paired_span, ritz[:, half + n_inf:])
+        span_w = matmul(paired_span, ritz[:, :width])
+        span_v = matmul(paired_span, ritz[:, width:])
         # Undo w=(X(z)+X(-z))/2, v=(X(z)-X(-z))/(2z),
         # w_inf=k1 and v_inf=k0 (report equation 5.6).
         coefficients = jnp.concatenate((
@@ -356,7 +361,13 @@ def reduce_ordered_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, g
         "infinite_weight_ok": infinite <= budget,
         "orientation_paired": jnp.broadcast_to(paired, count.shape),
     }
+    if retain_span:
+        coefficients = coefficients * retained[:, None, :]
+    pad = side - mu.shape[-1]
+    b, c = (jnp.pad(a, ((0, 0), (0, 0), (0, pad))) for a in (b, c))
+    poles2 = jnp.pad(poles2, ((0, 0), (0, pad)), constant_values=1)
+    mu, positive, retained = (jnp.pad(a, ((0, 0), (0, pad))) for a in (mu, positive, retained))
     result = (b, poles2, positive), (c, mu, retained), diagnostics
     if retain_span:
-        return (*result, coefficients * retained[:, None, :])
+        return (*result, jnp.pad(coefficients, ((0, 0), (0, 0), (0, pad))))
     return result
