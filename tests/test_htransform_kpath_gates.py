@@ -292,7 +292,7 @@ def test_htransform_active_window_beats_lower_guard_on_the_path():
         result = h_transform(
             meta, jnp.asarray(ctilde), jnp.asarray(energies), wfn,
             kpath_data, lines.append, mesh,
-            n_return_bands=3, sym=sym)
+            n_return_bands=3, sym=sym, return_coeffs=True)
 
     # VBM is active row 1 at -2 Ry, so the raised active state appears at +3
     # Ry.  The old energy truncation published the lower guard at +1 Ry.
@@ -307,6 +307,11 @@ def test_htransform_active_window_beats_lower_guard_on_the_path():
     assert result["coincident_max_abs_ry"] < 2.0e-11
     np.testing.assert_allclose(
         result["gamma_exact"], [-1.0, 0.0, 3.0],
+        rtol=0.0, atol=2.0e-11)
+    expected_coeffs = np.broadcast_to(
+        np.eye(rank, 3, dtype=np.complex128), (2, rank, 3))
+    np.testing.assert_allclose(
+        np.asarray(result["coeffs_on_path"]), expected_coeffs,
         rtol=0.0, atol=2.0e-11)
     banner = " ".join(lines)
     assert "process-local active_R host spill" in banner
