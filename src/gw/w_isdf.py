@@ -586,10 +586,10 @@ def _get_chi_fractional_contour_kernel_face(
     nmu_input = (psi_nmu_shard, psi_nmu_shard) if vertex else psi_nmu_shard
 
     # One fixed contraction route is shared by every Gf and Gu build.
-    # Photon bands are narrow enough that bounded native panels avoid
-    # the provider's distributed GEMM communication on every spin pair.
+    # Face photon carriers exchange bounded band panels; axis carriers
+    # already replicate bands and use the service's local contraction.
     green_spin = 1 if vertex else ns
-    if vertex:
+    if vertex and layout == "face":
         # Four photon faces stay x/y tiled; exchange only bounded band panels
         # for the singleton-spin Green product, whose result stays x/y tiled.
         g_plan = partial(panel_matmul, mesh=mesh_xy, panel_bytes=32 << 20)
