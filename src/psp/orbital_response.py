@@ -69,7 +69,8 @@ def orbital_magnetization(velocity, energies, *, mu_ry, width_ry,
         f = (e < mu_ry).astype(e.dtype)
         grand = jnp.maximum(mu_ry - e, 0)
     else:
+        from gw.efermi import fd_occupations
         x = (mu_ry - e) / width_ry
         grand = width_ry * jnp.logaddexp(0, x)
-        f = jnp.exp(-jnp.logaddexp(0, -x))
+        f = fd_occupations(e, mu_ry, width_ry)
     return jnp.sum(moment * f[..., None, :] + berry * grand[..., None, :], axis=-1)
