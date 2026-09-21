@@ -211,8 +211,9 @@ def test_containment_cache_reuses_rules_without_a_builder_call(
 
 
 @pytest.mark.parametrize("space,negative", [("cond", False), ("val", True)])
+@pytest.mark.parametrize("pole_support", [None, 5.0])
 def test_sc_fixed_tail_covers_a_state_crossing_the_product_edge(
-        monkeypatch, space, negative):
+        monkeypatch, space, negative, pole_support):
     calls = []
 
     def counted(box, eps, **kwargs):
@@ -223,6 +224,9 @@ def test_sc_fixed_tail_covers_a_state_crossing_the_product_edge(
     session = {}
     omega_abs = np.asarray([0.2, 0.5])
     omega = -omega_abs if negative else omega_abs
+    summaries = tuple((index, {
+        key: None if row is None else (*row[:2], 0.0, 0.0)
+        for key, row in groups.items()}) for index, groups in _summaries())
 
     def plan(moving_energy):
         branch = _SigmaBranch(
@@ -231,9 +235,9 @@ def test_sc_fixed_tail_covers_a_state_crossing_the_product_edge(
             base_mask_A=jnp.asarray([[True, True, True]]),
             omega_abs=omega_abs, omega_idx=np.arange(2))
         return plan_sigma_windows(
-            _summaries(), [branch], omega, 0.1, eps=1.e-4,
+            summaries, [branch], omega, 0.1, eps=1.e-4,
             cache_dir=None, fixed_rule_session=session,
-            fixed_pole_support_ry=5.0, print_fn=lambda *_a, **_k: None)
+            fixed_pole_support_ry=pole_support, print_fn=lambda *_a, **_k: None)
 
     # The selector boundary is .65 Ry. A .02 Ry motion introduces a new
     # nearest tail state; its old member at 3 Ry must not set the certificate.

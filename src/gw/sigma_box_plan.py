@@ -1142,14 +1142,17 @@ def plan_sigma_windows(
                 if support_hi > support_lo:
                     spec["sc_support_pole_extent"] = (
                         support_lo, support_hi, 0.0, 0.0)
-                if (name in ("bulk", "state_tail", "pole_tail")
-                        and geometry["state_edge_ry"] > 0.0):
-                    # Positive real poles and the Cartesian selectors imply
-                    # |raw denominator| >= state_edge: the pole edge includes
-                    # omega_max plus the entire negative state excursion.
-                    # _box preserves at least this fraction of that gap.
-                    spec["sc_selector_gap_ry"] = (
-                        _BOX_SIGN_FRACTION * geometry["state_edge_ry"])
+            if (fixed_rule_session is not None
+                    and name in ("bulk", "state_tail", "pole_tail")
+                    and geometry["state_edge_ry"] > 0.0
+                    and (fixed_pole_support is not None or all(
+                        lo >= 0.0 and gamma_lo == gamma_hi == 0.0
+                        for lo, _, gamma_lo, gamma_hi in pole_stats))):
+                # The selectors guarantee this gap for positive real poles,
+                # including scalar W without a sector treatment ceiling.
+                # Cover future selector members, not only initial samples.
+                spec["sc_selector_gap_ry"] = (
+                    _BOX_SIGN_FRACTION * geometry["state_edge_ry"])
             if fixed_rule_session is not None and "external_support_ev" in fixed_rule_session:
                 support = np.asarray(fixed_rule_session["external_support_ev"]) / RYD_TO_EV
                 spec["sc_support_frequencies"] = (

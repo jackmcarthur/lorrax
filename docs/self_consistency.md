@@ -562,8 +562,12 @@ The run-local fixed-quadrature session holds mathematical integration rules.
 Sigma uses its existing 2 eV state and 10% pole margins, retaining identical
 nodes and weights while recomputing current masks, pole selectors, reference
 energies and W(time). Containment, error currency and separated-factor growth
-are checked at every map; a failed check rebuilds the affected rule. Eta and
-epsilon remain fixed for a session. Disk model identity is not relaxed.
+are checked at every map. Initial tail certificates cover the selector's
+minimum separation for both scalar and sector shared-pole models, so states
+entering an existing tail retain the same nodes. A containment escape refuses;
+only a material-class change or separated-factor growth failure can rebuild
+rules. Eta and epsilon remain fixed for a session. Disk model identity is not
+relaxed.
 
 Chi rules pad transition endpoints by up to 4 eV, corresponding to 2 eV on
 each one-particle endpoint. The physical band selection and occupations are
