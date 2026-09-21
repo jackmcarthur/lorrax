@@ -32,16 +32,20 @@ volume — is the gauge-invariant Brillouin-zone integral
 
 ```
         e          ⌠  dᵈk
-M = − ─────  Im  Σ  ⎮ ─────  f_nk  ⟨∂_k u_nk| × (H_k + ε_nk − 2μ) |∂_k u_nk⟩
+M = + ─────  Im  Σ  ⎮ ─────  f_nk  ⟨∂_k u_nk| × (H_k + ε_nk − 2μ) |∂_k u_nk⟩
        2ħ       n  ⌡ (2π)ᵈ
 ```
 
 (SI; in Gaussian-cgs replace `e/2ħ → e/2ħc`). Here `u_nk` is the cell-periodic
 Bloch state, `H_k = e^{−ik·r} H e^{ik·r}` the k-dependent Hamiltonian whose
 eigenvalue is `ε_nk`, `f_nk` the occupation, and `μ` the chemical potential.
-The **leading minus** is the electron charge `q = −e` (`e > 0`): an electron's
-orbital magnetic moment is *antiparallel* to its mechanical angular momentum,
-`m = −(e/2mₑ) L = −μ_B L/ħ`. The Bohr magneton is `μ_B = eħ/2mₑ > 0`.
+The prefactor is **positive** for this bra/ket order and electron charge
+`q=-e`. In the local-circulation term `H-epsilon_n`, the energy numerator
+is `epsilon_m-epsilon_n`, so the velocity sum carries a **negative** sign:
+`m_n/mu_B = -1/2 Im sum_m (v_nm cross v_mn)/(epsilon_n-epsilon_m)`.
+Using `v_nm=i(epsilon_n-epsilon_m)r_nm` recovers `m=-mu_B L/hbar`.
+The previous additional leading minus reversed that physical atomic limit.
+
 
 ### Local / itinerant decomposition
 
@@ -79,7 +83,7 @@ Taking the antisymmetric (cross-product) combination `ε_{γab}` gives the final
 
 ```
         e                                v^a_nm v^b_mn (ε_m + ε_n − 2μ)
-M_γ = − ── Im Σ ∫ dᵈk/(2π)ᵈ f_n Σ   ε_γab ──────────────────────────────
+M_γ = + ── Im Σ ∫ dᵈk/(2π)ᵈ f_n Σ   ε_γab ──────────────────────────────
        2ħ      n               m≠n                  (ε_n − ε_m)²
 ```
 
@@ -101,16 +105,15 @@ velocity** `v = dH/dk` (Ry·Bohr) directly:
 
 ```
                        1
-m_γ / μ_B = (−1) · ─────  Σ_k w_k  Im Σ      Σ    ε_γab v^a_nm v^b_mn (ε_m+ε_n−2μ)/(ε_n−ε_m)²
+m_γ / μ_B = (+1) · ─────  Σ_k w_k  Im Σ      Σ    ε_γab v^a_nm v^b_mn (ε_m+ε_n−2μ)/(ε_n−ε_m)²
                        2             n occ  m≠n
 ```
 
-> **Prefactor = −½.** The magnitude ½ is `mₑ/ħ²` in Ry·a₀² and is confirmed
-> three independent ways (direct, momentum cross-check `v = 2p`, and SI
-> dimensional analysis). The **sign** is the electron-charge minus
-> (`m = −μ_B L/ħ`); LORRAX's assembled operator is the velocity (not the
-> momentum), so no extra factor of 2 is applied. There is **no spin-degeneracy
-> factor of 2** — each 2-component spinor band is counted once.
+> **Master-formula prefactor = +½**, with `v[a,n,m]=<n|v_a|m>`.
+> The local moment still has the electron's negative gyromagnetic sign,
+> as the bound-state commutator check above shows. There is no extra spin
+> degeneracy factor: each spinor band is counted once.
+
 
 For an out-of-plane easy-axis monolayer (CrI₃) the physical moment is `m_z`
 (γ = z, ab = xy): `cross_z = v^x_nm v^y_mn − v^y_nm v^x_mn`. In code,
@@ -197,3 +200,25 @@ computed sign is reported, not assumed. The expected magnitude for CrI₃ is
    014435 (2012). https://doi.org/10.1103/PhysRevB.85.014435
 6. D. Vanderbilt, *Berry Phases in Electronic Structure Theory* (Cambridge,
    2018), Ch. 5–6.
+
+## Metallic occupations, band colors, and the Dirac comparison (2026-09-21)
+
+`psp.orbital_response` owns the shared velocity contractions. Band colors use
+wavepacket moments before occupation weighting. Exactly degenerate individual
+bands have no gauge-independent color; the returned flags identify these
+multiplets, whose trace against external states remains meaningful.
+For finite-T Fermi-Dirac metals, the thermodynamic moment is
+`sum_kn w_k [f_n m_n + Omega_n T log(1+exp((mu-epsilon_n)/T))]`
+in Ry/Bohr units with the conversion to mu_B already included. Use the
+self-consistent fixed-N chemical potential and width, not a midgap estimate.
+The legacy CLI's integer-nocc/Sternheimer routes remain insulator routines.
+
+`common.bispinor_init.apply_dirac_velocity_to_ket` applies `c alpha_i` to
+already lifted four-component kets; `c=2/alpha_fs` in Ry units. For the raw
+lift `[psi; (alpha_fs/2) sigma.p psi]`, its same-k band matrix is exactly
+`<psi|2 p_i|psi>`, by the Pauli anticommutator. Isometric normalization changes
+that equality. Neither a bare Dirac current nor bare DFT velocity supplies
+the nonlocal QP velocity correction. The existing covariant-link derivative
+owns that correction; omitting it must be reported as an approximation.
+A full relativistic magnetic moment also includes spin magnetization and
+cannot be relabelled as a purely orbital moment from the current alone.

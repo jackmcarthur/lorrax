@@ -13,16 +13,15 @@ of the group velocity).
 Physics (Rydberg atomic units: hbar=1, 2 m_e = 1, energies in Ry, lengths
 in Bohr).  Per-cell orbital moment, component gamma, in Bohr magnetons:
 
-    m_gamma / mu_B = (-1/2) * sum_k w_k * Im sum_{n occ} sum_{m != n}
+    m_gamma / mu_B = (+1/2) * sum_k w_k * Im sum_{n occ} sum_{m != n}
                        eps_{gamma a b} v^a_nm v^b_mn (eps_m + eps_n - 2 mu)
                                                      / (eps_n - eps_m)^2
 
 with v^a_nm = <u_nk| dH_k/dk_a |u_mk> the velocity matrix element (Ry*Bohr,
 assembled from ``dft_operators.apply_kinetic_velocity_to_ket`` and the
 canonical ``vnl_ops.vnl_velocity_matrix`` derivative), w_k the k-point
-weights (sum to 1), and the leading -1/2 the electron-charge gyromagnetic
-prefactor m_e/hbar^2 = 1/(2 Ry a0^2) carrying the orbital moment = -mu_B L/hbar
-sign.  See ``orbital_magnetization_THEORY.md`` for the full derivation,
+weights (sum to 1), and the +1/2 master-formula prefactor yields the electron
+orbital moment -mu_B L/hbar (the local term contains H-epsilon).  See ``orbital_magnetization_THEORY.md`` for the full derivation,
 sources, and the absolute-sign discussion.
 
 The script also computes the spin moment <sigma_z> from the same WFN as an
@@ -144,21 +143,16 @@ def orbital_pieces_at_k(v, eps, nocc, deps_tol):
 
     so ANY mu, the per-band breakdown (sum over m), and the band-ceiling
     convergence (cumsum over m) all follow from one pass — no recomputation.
-    The (-1/2) prefactor and Im[.] are applied by the caller.  Degenerate /
+    The (+1/2) prefactor and Im[.] are applied by the caller.  Degenerate /
     diagonal denominators (|eps_n-eps_m| <= deps_tol) are masked to 0.
     """
-    nb = v.shape[1]
-    vt = np.swapaxes(v, 1, 2)                        # vt[a, n, m] = v[a, m, n]
-    cross = np.stack([v[1] * vt[2] - v[2] * vt[1],   # x  (eps_xab, ab=yz)
-                      v[2] * vt[0] - v[0] * vt[2],   # y  (ab=zx)
-                      v[0] * vt[1] - v[1] * vt[0]])   # z  (ab=xy)   (3,nb,nb)
-    deps = eps[:, None] - eps[None, :]               # eps_n - eps_m
-    mask = np.abs(deps) > deps_tol
-    inv2 = np.where(mask, 1.0 / np.where(mask, deps, 1.0) ** 2, 0.0)  # 1/Delta^2
-    occ = np.zeros((nb, 1)); occ[:nocc, 0] = 1.0     # outer sum over occupied n
-    Wa = occ * ((eps[:, None] + eps[None, :]) * inv2)
-    Wb = occ * inv2
-    return cross * Wa[None], cross * Wb[None]         # PA, PB : (3, nb, nb)
+    from psp.orbital_response import orbital_velocity_products
+    cross, inverse, _ = orbital_velocity_products(v, eps, deps_tol)
+    cross, inv2 = np.asarray(cross), np.asarray(inverse) ** 2
+    occ = (np.arange(len(eps)) < nocc)[:, None]
+    return (cross * (occ * (eps[:, None] + eps[None, :]) * inv2)[None],
+            cross * (occ * inv2)[None])
+
 
 
 def run_ibz(wfn, sym, meta, vnl_setup, nbnd, nocc, deps_tol, m_axis, sign):
@@ -650,7 +644,7 @@ def main(argv=None):
     print(f"\n[orbmag] spin moment  sum_occ <sigma_z> = {-m_spin_z:+.4f}  -> "
           f"|m_spin| = {abs(m_spin_z):.3f} mu_B  (expect ~6 for CrI3)")
 
-    m_orb = -MU_B_PREFACTOR * C_of_mu(mu).imag       # (3,) mu_B, file frame
+    m_orb = MU_B_PREFACTOR * C_of_mu(mu).imag       # (3,) mu_B, file frame
     frame = 1.0 if m_spin_z >= 0 else -1.0
     m_orb_par = float(frame * m_orb[2])              # along spin-moment axis
 
@@ -675,7 +669,7 @@ def main(argv=None):
         print("\n[orbmag] mu-scan (m_z, mu_B):")
         for label, m in [("VBM", VBM), ("midgap", 0.5 * (VBM + CBM)), ("CBM", CBM)]:
             print(f"   mu={m*RY2EV:8.4f} eV ({label:6s}):  "
-                  f"m_z = {-MU_B_PREFACTOR*float(C_of_mu(m)[2].imag):+.5f}")
+                  f"m_z = {MU_B_PREFACTOR*float(C_of_mu(m)[2].imag):+.5f}")
 
     if args.method == "sternheimer" and (args.convergence or args.per_band):
         print("\n[orbmag] (--convergence/--per-band N/A for sternheimer: the "
@@ -687,11 +681,11 @@ def main(argv=None):
         col_z = (PA_band_z - 2.0 * mu * PB_band_z).sum(axis=0)  # sum over occupied n
         cum = np.cumsum(col_z)                                  # partial sums over m
         for mc in sorted(set([int(0.5*nbnd), int(0.7*nbnd), int(0.85*nbnd), nbnd])):
-            print(f"   mceil={mc:4d}:  m_z = {-MU_B_PREFACTOR*float(cum[mc-1].imag):+.5f}")
+            print(f"   mceil={mc:4d}:  m_z = {MU_B_PREFACTOR*float(cum[mc-1].imag):+.5f}")
 
     if args.per_band and args.method != "sternheimer":
         band_z = (PA_band_z - 2.0 * mu * PB_band_z).sum(axis=1)  # per outer-n
-        m_par_band = frame * (-MU_B_PREFACTOR) * band_z.imag
+        m_par_band = frame * (MU_B_PREFACTOR) * band_z.imag
         print("\n[orbmag] per-occupied-band m_z (along spin axis, mu_B):")
         order = np.argsort(np.abs(m_par_band[:nocc]))[::-1]
         for n in order[:12]:

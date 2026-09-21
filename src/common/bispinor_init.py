@@ -57,6 +57,22 @@ def kinetic_balance_lift_provenance(representation: str) -> str:
         f"{ISOMETRIC_KINETIC_BALANCE_LIFT!r}")
 
 
+def apply_dirac_velocity_to_ket(psi):
+    """Apply c alpha_i to (...,band,4,G) kets, in Ry Bohr.
+
+    Returns (3,...,band,4,G). This is the paramagnetic Dirac velocity;
+    nonlocal-potential and QP corrections belong to their existing owners.
+    c=2/alpha_fs in Rydberg units. The input must already carry the selected
+    kinetic-balance representation; no normalization or second lift occurs.
+    """
+    from common.gamma_matrices import gamma1, gamma2, gamma3
+    if psi.ndim < 3 or psi.shape[-2] != 4:
+        raise ValueError('Dirac velocity requires (...,band,4,G) wavefunctions')
+    return (2.0 / ALPHA_FS) * jnp.stack(tuple(
+        jnp.einsum('st,...ntg->...nsg', alpha, psi)
+        for alpha in (gamma1, gamma2, gamma3)))
+
+
 def _isometric_kinetic_balance_factor(K_cart_bohr_inv):
     """The sole pointwise ``(I + X^dagger X)^(-1/2)`` spelling."""
     K = jnp.asarray(K_cart_bohr_inv)
