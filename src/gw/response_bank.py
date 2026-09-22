@@ -1156,9 +1156,6 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                                 _reciprocity_census(receipt,value[part],z[sample:sample+1],int(qids[iq]),iq,meta)
                                 if ordered and _self_negative(int(qids[iq]),meta):
                                     _tr_odd_census(receipt,solve_value,h[part],chi[part],value[part],z[sample:sample+1],int(qids[iq]))
-                        wait_started = time.monotonic()
-                        value.block_until_ready()
-                        receipt["seconds"]["sample_value_wait"] = receipt["seconds"].get("sample_value_wait",0.)+time.monotonic()-wait_started
                         io_started = time.monotonic()
                         write(q_span=span, sample_span=(sample,sample+1), **{fields[mirror][0]: value[:,None]})
                         receipt["seconds"]["io"] = receipt["seconds"].get("io",0.)+time.monotonic()-io_started
@@ -1176,9 +1173,6 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                             chi = jnp.conj(chi)
                         w = value if vertex is None else value+constant
                         slope = execute(solve_slope, (h, w, chi), "sample_slope")
-                        wait_started = time.monotonic()
-                        slope.block_until_ready()
-                        receipt["seconds"]["sample_slope_wait"] = receipt["seconds"].get("sample_slope_wait",0.)+time.monotonic()-wait_started
                         io_started = time.monotonic()
                         write(q_span=span, sample_span=(sample,sample+1), **{fields[mirror][1]: slope[:,None]})
                         receipt["seconds"]["io"] = receipt["seconds"].get("io",0.)+time.monotonic()-io_started
@@ -1197,7 +1191,7 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
     ledger.live_stages = caller_live
     receipt["stream_passes"] = len(receipt["batches"])
     receipt["batch_reason"] = "one frequency per stream; value and derivative share both Green/FFT products"
-    receipt["io_scope"] = "I/O envelope includes packing and device finite checks; sample waits are timed separately"
+    receipt["io_scope"] = "I/O envelope includes device readiness, packing, and finite checks; not pure storage time"
     receipt["completion"] = bool(np.asarray(header["sample_written"]).all())
     return _finish_receipt(receipt,meta,header,started)
 
