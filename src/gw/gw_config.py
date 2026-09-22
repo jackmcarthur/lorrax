@@ -3573,8 +3573,10 @@ def incumbent_bispinor_head_record(config) -> tuple[str, str]:
             "  ==========================================================\n",
             "DEBUG: no Gamma-cell head at all (head_correction=off on the "
             "incumbent route); NOT a production calculation")
-    # head_correction = full here (no_local_fields is refused on every
-    # bispinor deck).  The CHARGE head is the scalar band-diagonal one and
+    if config.head.correction is HeadCorrection.NO_LOCAL_FIELDS:
+        return "", ("shared-pole direct charge head only; no wing/body fold, "
+                    "intraband Drude term, or transverse Gamma-cell head")
+    # With head_correction = full, the CHARGE head is band-diagonal and
     # there is NO transverse q=Gamma head on this route now that the overlay
     # has no deck key -- say so rather than let a bulk number look complete.
     return (
@@ -3637,8 +3639,14 @@ def refuse_unsupported_bispinor_gw(config) -> None:
     """Validate four-current modes and require live direct fields for QSGW; see docs/architecture/decisions.md."""
     mode = coerce_bispinor_gw_mode(
         getattr(config, "bispinor_gw", BispinorGWMode.BARE_TRANSVERSE))
+    shared_pole_direct = (
+        config.compute_mode is ComputeMode.MPA
+        and config.sigma.w_model == "shared_pole"
+        and config.screening.diagrams is ScreeningDiagrams.W_RPA
+        and mode is BispinorGWMode.BARE_TRANSVERSE)
     if (bool(config.bispinor)
-            and config.head.correction is HeadCorrection.NO_LOCAL_FIELDS):
+            and config.head.correction is HeadCorrection.NO_LOCAL_FIELDS
+            and not shared_pole_direct):
         raise ValueError(
             "GATE bispinor_head_correction_no_local_fields_unavailable: "
             "head_correction = no_local_fields is refused with "

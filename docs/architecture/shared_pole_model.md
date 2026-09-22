@@ -516,3 +516,15 @@ hundreds-GPU scaling measurement. Interior compiled layouts must also be
 checked at material sizes; output face specs alone do not establish memory
 scaling. Sandbox report `reports/bispinor_pole_distributed_20260921/report.md`
 owns the job receipts and material replay status.
+
+The shared-pole MPA/W_RPA bispinor route also accepts `no_local_fields`:
+its charge head uses the same direct response and authenticated dipole owner,
+with the raw kinetic-balance charge representation and source-WFN state
+capacity. This does not add a transverse Gamma-cell head, a wing/body fold,
+or the disabled metallic velocity-head update. Packed static photon modes
+retain their separate coupled-head contract.
+
+The sampler computes the frequency-independent Coulomb roots once for all
+irreducible q using the existing local/distributed batched solver, retaining
+`H[q,mu_X,nu_Y]` throughout the frequency loop. Photon V already has this
+lifetime. No full-zone Green replication or additional response field results.

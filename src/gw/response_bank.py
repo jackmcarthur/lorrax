@@ -1112,6 +1112,17 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
     response_rows = panel_rows(0, len(qids))
     row_index = {q: i for i, q in enumerate(response_rows)}
     face_bytes = 16*n*n//mesh_xy.size
+    caller_live = ambient
+    if vertex is None:
+        # V is frequency independent. Its all-P root bank is small compared
+        # with either full-zone Green and reuses the existing batched solver.
+        roots, inverse, _ = _coulomb_batch(meta, config, bank_io, mesh_xy,
+                                         (0, len(qids)), execute)
+        del inverse
+        root_stage, _ = _reserve(meta, "coulomb_roots", len(qids)*face_bytes)
+        ambient += (root_stage,)
+    else:
+        roots = bank_io["photon_v"]
     # The sole response accumulator is all-P sharded. Dense work and slab I/O
     # remain bounded to one parent and one frequency, with their own admission.
     fields = (("Wc", "dWc_ds"), ("Wc_mirror", "dWc_mirror_ds"))
@@ -1141,8 +1152,7 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                     if all(marked[i] for i in field_indices):
                         continue
                     span = (iq, iq+1)
-                    h, hinv, ranks = _coulomb_batch(meta,config,bank_io,mesh_xy,span,execute)
-                    del hinv
+                    h = roots[iq:iq+1]
                     constant = 0.
                     if vertex is not None:
                         constant = read_shared_pole_bank(bank_handle, span, meta=meta, header=header,
@@ -1184,7 +1194,8 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
     if jax.process_index() == 0:
         print("Response quadrature: seconds " + " ".join(
             f"{key}={value:.3f}" for key, value in receipt["seconds"].items()), flush=True)
-    ledger.live_stages = ambient
+    del roots
+    ledger.live_stages = caller_live
     receipt["stream_passes"] = len(receipt["batches"])
     receipt["batch_reason"] = "one frequency/field per stream; forward and backward products share the carry"
     receipt["completion"] = bool(np.asarray(header["sample_written"]).all())
