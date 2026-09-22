@@ -1,9 +1,7 @@
 """Scalar response-bank quadratures; Ry frequencies and d/ds, s=z**2.
 
-Hermite panel construction ports Run212 (rho/bound and derivative tail) and
-Run307 (early panels for unequal decays). Remote positive NNLS rows port
-Run183, with adaptive order and an interval certificate instead of its fixed
-Na gate. No campaign modules or GW implementation are imported.
+Real-time and noncrossing Laplace rules share Gaussian ellipse bounds and
+analytic derivative/tail control. No GW implementation is imported.
 """
 from functools import lru_cache
 import hashlib
@@ -67,7 +65,7 @@ def _panel_bounds(n, left, right, z, delta_max):
 def _node_digest(rule):
     """Identify the integration arrays independently of current projections."""
     digest = hashlib.sha256()
-    for key in ("t", "h", "coefficient_rows"):
+    for key in ("t", "h"):
         if key in rule:
             array = np.ascontiguousarray(rule[key], dtype="<f8")
             digest.update(key.encode())
@@ -199,147 +197,57 @@ def response_bank_rule(z_ry, delta_max_ry, *, rel_tol=1e-8,
                 reuse_reason=reason)
 
 
-def _row_certificate(t, weights, n, anchor, hi, intervals, numerator_power=1):
-    """Continuum relative-error bound using linear interpolation of ratio.
+def _remote_scaled_bounds(z, lo, hi, value, time_value, ordered):
+    """Propagate bounds for 1/(delta +/- z) and its squared reciprocal."""
+    v = value.reshape(2, -1).sum(axis=0)/2
+    d = time_value.reshape(2, -1).sum(axis=0)/(4*np.abs(z))
+    ends = np.asarray([lo, hi])[:, None]
+    denom = ends**2 + np.abs(z)**2
+    bounds = [v/np.min(ends/denom, axis=0),
+              d/np.min(ends/denom**2, axis=0)]
+    if ordered:
+        # Certify K=1/(delta^2-z^2) and dK/ds separately: d(z*K)/ds
+        # can vanish on the imaginary axis, so relative error there is undefined.
+        bounds += [v/np.abs(z)*(hi*hi+np.abs(z)**2),
+                   (d/np.abs(z)+v/(2*np.abs(z)**3))*(hi*hi+np.abs(z)**2)**2]
+    return np.asarray(bounds)
 
-    At interval midpoints evaluate ratio second derivatives. Bound their
-    variation by an absolute third-derivative bound on each positive term;
-    linear interpolation then contributes h**2/8 * sup|ratio''|.
-    All variables here are dimensionless, delta/delta_lo. The target is
-    delta**p/(delta**2+anchor**2)**(n+1): p=1 is the even response row, p=0
-    the ordered (odd) row; the third-derivative bounds below hold for both.
+
+def _remote_bounds(z, lo, hi, edges, orders, ordered, *, tail=True):
+    """Continuum relative bounds, enclosing each decay scale separately.
+
+    These scalar geometric cells share ONE time rule/Green stream. Keeping
+    their envelopes and response scales together avoids charging a fast
+    high-energy decay the error of the slowest low-energy decay.
     """
-    edges = np.geomspace(1., hi, intervals+1) if hi > 1 else np.array([1., 1.])
-    maximum = 0.
-    roundoff = 0.
-    for start in range(0, len(edges)-1, 256):
-        lo, high = edges[start:start+256], edges[start+1:start+257]
-        mid, half = (lo+high)/2, (high-lo)/2
-        def terms(x):
-            logtarget = numerator_power*np.log(x)-(n+1)*np.log(x*x+anchor*anchor)
-            return np.exp(-x[:, None]*t[None, :]-logtarget[:, None])*weights
-        gl, gh, gm = terms(lo), terms(high), terms(mid)
-        endpoint = np.maximum(np.abs(gl.sum(1)-1), np.abs(gh.sum(1)-1))
-        l1 = -t[None, :]+(2*(n+1)*mid/(mid*mid+anchor*anchor)-numerator_power/mid)[:, None]
-        l2 = (2*(n+1)*(anchor*anchor-mid*mid)/(mid*mid+anchor*anchor)**2+numerator_power/mid**2)
-        second = np.abs(np.sum(gm*(l1*l1+l2[:, None]), axis=1))
-        b1 = t[None, :]+((2*(n+1)+1)/lo)[:, None]
-        b2 = (2*(n+1)+1)/lo**2
-        b3 = (12*(n+1)+2)/lo**3
-        gmax = gm*np.exp(b1*half[:, None])
-        third = np.sum(gmax*(b1**3+3*b1*b2[:, None]+b3[:, None]), axis=1)
-        rounding = 64*np.finfo(float).eps*len(t)*np.maximum(1., gmax.sum(1))
-        bound = endpoint+(high-lo)**2/8*(second+half*third)+rounding
-        maximum = max(maximum, float(bound.max()))
-        roundoff = max(roundoff, float(rounding.max()))
-    return maximum, roundoff
-
-
-def _reuse_laplace_rule(previous, lo, hi, z, rel_tol):
-    """Reuse certified inverse-moment rows; update the Taylor projections."""
-    cert = previous["certificate"]
-    if _node_digest(previous) != previous.get("node_digest"):
-        raise ValueError("response rule node digest mismatch")
-    a, b = cert["delta_ry"]
-    if cert["rel_tol"] != rel_tol:
-        return None, "tolerance changed"
-    if lo < a or hi > b:
-        return None, "transition interval escaped"
-    order, anchor = cert["order"], cert["eta_ry"]
-    x = (z*z+anchor*anchor)/(a*a)
-    rho = np.abs(x)/(1+(anchor/a)**2)
-    if np.any(rho >= 1):
-        return None, "current Taylor domain does not converge"
-    vr, dr = rho**(order+1), rho**order*((order+1)+order*rho)
-    amp = (1+rho)/(1-rho)
-    vb = vr+amp*max(cert["row_relative_bounds"])
-    db = dr+amp**2*max(cert["row_relative_bounds"])
-    if max(vb.max(), db.max()) > rel_tol:
-        return None, "current frequency certificate failed"
-    powers = (z*z+anchor*anchor)[:, None]**np.arange(order+1)
-    dpowers = np.zeros_like(powers)
-    dpowers[:, 1:] = np.arange(1, order+1)*(z*z+anchor*anchor)[:, None]**np.arange(order)
-    rows = previous["coefficient_rows"]
-    result = dict(previous, projection_value=powers@rows,
-                  projection_derivative=dpowers@rows)
-    result["certificate"] = dict(cert, z_ry=[[v.real, v.imag] for v in z],
-        rho=rho.tolist(), value_taylor_bounds=vr.tolist(),
-        derivative_taylor_bounds=dr.tolist(), value_bound=vb.tolist(),
-        derivative_bound=db.tolist())
-    return result, "current domain and frequency certificates pass"
-
-
-def _fit_rows(basis, targets, node_count):
-    """Positive relative NNLS rows, one per target, on one fixed time basis."""
-    from scipy.optimize import nnls
-    rows = []
-    fit_errors = []
-    for target in targets:
-        matrix = basis/target[:, None]
-        scale = np.maximum(np.linalg.norm(matrix, axis=0), np.finfo(float).tiny)
-        try:
-            w = nnls(matrix/scale, np.ones(basis.shape[0]), maxiter=100*node_count)[0]/scale
-        except RuntimeError:
-            break
-        rows.append(w)
-        fit_errors.append(float(np.max(np.abs(matrix@w-1))))
-    return rows, fit_errors
-
-
-def _certify_rows(t, rows, anchor, ratio, row_tol, numerator_power=1):
-    """Continuum row certificates with adaptive interval refinement."""
-    errors, rounding = [], []
-    for n, w in enumerate(rows):
-        # The interpolation enclosure is O(h**2).  One final bisection can
-        # certify high Taylor rows without changing the fitted time nodes.
-        for intervals in (4096, 8192, 16384, 32768, 65536, 131072):
-            error, rnd = _row_certificate(t, w, n, anchor, ratio, intervals,
-                                          numerator_power)
-            if error <= row_tol:
-                break
-        errors.append(error)
-        rounding.append(rnd)
-    return errors, rounding
+    reach = float(np.abs(z.real).max())
+    count = max(1, math.ceil(math.log2((hi-reach)/(lo-reach))))
+    delta = reach+np.geomspace(lo-reach, hi-reach, count+1)
+    points = 1j*(delta[:-1, None, None]+np.array([-1, 1])[None, :, None]*z)
+    span = np.broadcast_to(np.diff(delta)[:, None, None], points.shape)
+    rate = points.imag
+    stop = edges[-1]
+    value = np.exp(-rate*stop)/rate if tail else np.zeros_like(rate)
+    time_value = value*(stop+1/rate)
+    for left, right, n in zip(edges[:-1], edges[1:], orders):
+        v, d = _panel_bounds(n, left, right, points.ravel(), span.ravel())
+        value += v.reshape(points.shape)
+        time_value += (d*np.abs(points.ravel())).reshape(points.shape)
+    return np.max([_remote_scaled_bounds(z, a, b, v, d, ordered)
+                   for a, b, v, d in zip(delta[:-1], delta[1:], value, time_value)], axis=0)
 
 
 def response_laplace_rule(delta_lo_ry, delta_hi_ry, z_ry, *, rel_tol=1e-8,
-                          previous=None, domain_pad_ry=0.0, ordered=False):
-    """Positive NNLS inverse-moment rows and remote response projections.
+                          previous=None, domain_pad_ry=0.0, ordered=False,
+                          reference_ry=None):
+    """Direct positive-time quadrature of the noncrossing response.
 
-    The rule expands 1/(delta**2-z**2) in x = z**2+eta**2 about
-    delta**2+eta**2, eta = min(Im z), with Taylor ratio
-    rho = |x|/(delta_lo**2+eta**2) evaluated at every supplied z. It refuses
-    rho >= 1, takes the order where rho**(N+1) <= rel_tol/4 and amplifies row
-    errors by (1+rho)/(1-rho). Domain contract: the bank owner
-    (``gw.response_bank.response_windows``) repartitions so that every remote
-    cell it requests has rho <= ``REMOTE_RHO_MAX`` (0.3) at the bank's own
-    samples, moving the nearer remote states into its real-time stream.
-
-    Parameters
-    ----------
-    delta_lo_ry, delta_hi_ry : float
-        Positive remote transition interval in Ry.
-    z_ry : complex ndarray, shape (sample,)
-        Current upper-half-plane evaluation points in Ry.
-    rel_tol : float
-        Relative tolerance for delta/(delta**2-z**2) and its s derivative.
-    ordered : bool
-        Also return ``odd_projection_value`` and ``odd_projection_derivative``
-        for z/(delta**2-z**2) and its s derivative on the SAME ``t``, from
-        positive rows fitted to 1/(delta**2+eta**2)**(n+1). A bank whose
-        particle-hole orientations carry independent weights (time reversal
-        measured broken) needs this odd kernel for its antisymmetric part.
-        Ordered rules are rebuilt on every call; ``previous`` is not reused.
-
-    Returns
-    -------
-    dict
-        Shared positive ``t`` [1/Ry], nonnegative coefficient rows,
-        ``projection_value`` and ``projection_derivative`` [sample,time].
-        Bank multiplies projections by -exp(-gap*t); paired-stream factor
-        two belongs to the bank. Certificate includes continuum NNLS row
-        bounds and value/derivative Taylor remainders for every supplied z.
-        Refuses a nonconvergent Taylor domain or an unmet NNLS certificate.
+    For delta > |Re(z)|, integrate exp(-delta*t) cosh(z*t) (even) and
+    exp(-delta*t) sinh(z*t) (odd), with analytic d/ds, s=z**2. Projections
+    include exp(-reference_ry*t); the consumer supplies exp(-(delta-ref)*t).
+    The default reference is delta_lo, keeping both exponential branches
+    bounded. Panel/tail certificates use the same Gaussian owner as the
+    real-time rule; no Taylor expansion or fitted inverse-moment rows.
     """
     z = _inputs(z_ry, rel_tol)
     lo, hi = float(delta_lo_ry), float(delta_hi_ry)
@@ -347,111 +255,77 @@ def response_laplace_rule(delta_lo_ry, delta_hi_ry, z_ry, *, rel_tol=1e-8,
         raise ValueError('remote Laplace interval must be finite and positive')
     if not np.isfinite(domain_pad_ry) or domain_pad_ry < 0:
         raise ValueError('domain_pad_ry must be finite and nonnegative')
+    reach = float(np.abs(z.real).max())
+    if lo <= reach:
+        raise ValueError('remote Laplace integral does not converge; repartition in bank owner')
+    ref = lo if reference_ry is None else float(reference_ry)
+    if not np.isfinite(ref) or not reach < ref <= lo:
+        raise ValueError('remote reference must lie above |Re(z)| and at or below delta_lo')
     reason = "initial rule"
-    if previous is not None and not ordered:
-        reused, reason = _reuse_laplace_rule(previous, lo, hi, z, rel_tol)
-        if reused is not None:
-            return dict(reused, reuse_status="hit", reuse_reason=reason)
-    elif previous is not None:
-        reason = "ordered rule rebuilt; odd rows are never reused"
-    eta = float(z.imag.min())
-    padded_lo = max(lo-domain_pad_ry, lo/2)
-    # Padding must not move a valid remote cell across its Taylor boundary.
-    # Keeping the physical lower edge still admits later gap increases.
-    if np.all(np.abs(z*z+eta*eta) < padded_lo*padded_lo+eta*eta):
-        lo = padded_lo
-    hi += domain_pad_ry
-    anchor = eta/lo
-    a0 = 1+anchor*anchor
-    x = (z/lo)**2+anchor*anchor
-    rho = np.abs(x)/a0
-    if np.any(rho >= 1):
-        raise ValueError('remote Taylor domain does not converge; repartition in bank owner '
-                         '(gw.response_bank.response_windows, rho <= REMOTE_RHO_MAX)')
-    # N+1 powers for value; derivative remainder is the differentiated
-    # geometric remainder, bounded relative to the exact squared resolvent.
-    for order in range(1, 65):
-        vr = rho**(order+1)
-        dr = rho**order*((order+1)+order*rho)
-        if max(vr.max(), dr.max()) <= rel_tol/4:
-            break
-    else:
-        raise RuntimeError('remote Taylor order budget exceeded')
-    # Propagate positive row-relative errors through complex Taylor powers.
-    amp_v = (1+rho)/(1-rho)
-    amp_d = ((1+rho)/(1-rho))**2
-    row_tol = rel_tol/(4*float(max(amp_v.max(), amp_d.max())))
-    train = np.geomspace(1., hi/lo, 4096)
-    targets = [train/(train*train+anchor*anchor)**(n+1) for n in range(order+1)]
-    odd_targets = ([1/(train*train+anchor*anchor)**(n+1) for n in range(order+1)]
-                   if ordered else [])
-    last = None
-    even_node_count = None
-    for node_count in (48, 96, 192):
-        stop = max(np.log(2e12), 4*(order+1)-np.log(row_tol))
-        gx, _ = _legendre(node_count)
-        t = stop*(gx+1)/2
-        basis = np.exp(-train[:, None]*t)
-        rows, fit_errors = _fit_rows(basis, targets, node_count)
-        if len(rows) != order+1 or max(fit_errors) > row_tol/2:
-            last = dict(nodes=node_count, fit_errors=fit_errors)
-            continue
-        errors, rounding = _certify_rows(t, rows, anchor, hi/lo, row_tol)
-        if max(errors) <= row_tol:
-            if not ordered:
-                break
-            # The even rows pass here; the ordered rule keeps one shared t.
-            even_node_count = even_node_count or node_count
-            odd_rows, odd_fit = _fit_rows(basis, odd_targets, node_count)
-            if len(odd_rows) == order+1 and max(odd_fit) <= row_tol/2:
-                odd_errors, _ = _certify_rows(t, odd_rows, anchor, hi/lo,
-                                              row_tol, numerator_power=0)
-                if max(odd_errors) <= row_tol:
+    reused = False
+    if previous is not None:
+        if _node_digest(previous) != previous.get("node_digest"):
+            raise ValueError("response rule node digest mismatch")
+        cert = previous["certificate"]
+        low, high = cert["delta_ry"]
+        reason = "domain or current frequency certificate changed"
+        if (cert["rel_tol"] == rel_tol and low <= lo <= hi <= high
+                and low > reach):
+            bounds = _remote_bounds(z, low, high, cert["panel_edges"],
+                                    cert["orders"], ordered)
+            if bounds.max() <= rel_tol:
+                lo, hi = low, high
+                t, h = previous["t"], previous["h"]
+                edges, orders = cert["panel_edges"], cert["orders"]
+                reused, reason = True, "current domain and frequency certificates pass"
+    if not reused:
+        padded_lo = max(lo-domain_pad_ry, lo/2)
+        if padded_lo > reach:
+            lo = padded_lo
+        hi += domain_pad_ry
+        rate = lo-reach
+        stop = _tail_x(rel_tol)/rate
+        while _remote_bounds(z, lo, hi, [stop], [], ordered).max() > rel_tol/8:
+            stop *= 2
+        edges = [0.]
+        edge = 1/(hi+float(np.abs(z).max()))
+        while edge < stop:
+            edges.append(edge)
+            edge *= 2
+        edges.append(stop)
+        nodes, weights, orders = [], [], []
+        for left, right in zip(edges[:-1], edges[1:]):
+            for n in range(2, 257):
+                bound = _remote_bounds(z, lo, hi, [left, right], [n], ordered, tail=False)
+                if bound.max() <= rel_tol/(4*(len(edges)-1)):
                     break
-                last = dict(nodes=node_count, odd_interval_errors=odd_errors)
             else:
-                last = dict(nodes=node_count, odd_fit_errors=odd_fit)
-            continue
-        last = dict(nodes=node_count, interval_errors=errors)
-    else:
-        raise RuntimeError(f'remote NNLS certificate failed: {last}')
-    rows = np.asarray(rows)
-    powers = x[:, None]**np.arange(order+1)
-    dpowers = np.zeros_like(powers)
-    dpowers[:, 1:] = np.arange(1, order+1)*x[:, None]**np.arange(order)
-    value, derivative = (powers@rows)/lo, (dpowers@rows)/lo**3
-    vb = vr+amp_v*max(errors)
-    db = dr+amp_d*max(errors)
-    if max(vb.max(), db.max()) > rel_tol:
-        raise RuntimeError('remote combined certificate failed')
-    result = dict(t=t/lo, coefficient_rows=rows/lo**(2*np.arange(order+1)[:, None]+1),
-                projection_value=value, projection_derivative=derivative,
-                certificate=dict(status='PASS', scope='continuum delta interval; all supplied z',
-                    norm='relative value and ds', delta_ry=[lo, hi],
-                    z_ry=[[v.real, v.imag] for v in z], eta_ry=eta,
-                    rel_tol=rel_tol, order=order, rho=rho.tolist(),
-                    row_relative_bounds=errors, row_roundoff_allowance=rounding,
-                    value_taylor_bounds=vr.tolist(), derivative_taylor_bounds=dr.tolist(),
-                    value_bound=vb.tolist(), derivative_bound=db.tolist(),
-                    owner='Run183 positive NNLS inverse-moment rows'))
+                raise RuntimeError('remote Gaussian order budget exceeded')
+            x, w = _legendre(n)
+            nodes.append(left+(right-left)*(x+1)/2)
+            weights.append((right-left)*w/2)
+            orders.append(n)
+        t, h = np.concatenate(nodes), np.concatenate(weights)
+        bounds = _remote_bounds(z, lo, hi, edges, orders, ordered)
+    if bounds.max() > rel_tol:
+        raise RuntimeError('remote Gaussian certificate failed')
+    plus = np.exp(-(ref-z[:, None])*t)
+    minus = np.exp(-(ref+z[:, None])*t)
+    even, odd = h*(plus+minus)/2, h*(plus-minus)/2
+    result = dict(t=t, h=h, reference_ry=ref, projection_value=even,
+                  projection_derivative=odd*t/(2*z[:, None]),
+                  certificate=dict(status='PASS', scope='continuum delta interval; all supplied z',
+                      norm='relative even value and ds; relative odd K and dK/ds',
+                      delta_ry=[lo, hi], z_ry=[[v.real, v.imag] for v in z],
+                      rel_tol=rel_tol, value_bound=bounds[0].tolist(),
+                      derivative_bound=bounds[1].tolist(),
+                      panel_edges=list(edges), orders=list(orders), ordered=ordered,
+                      owner='direct Laplace / shared Gaussian ellipse bounds'))
     if ordered:
-        # K1 = 1/(delta**2-z**2) = sum_n x**n/(delta'**2+a**2)**(n+1) / lo**2.
-        # Odd kernel z*K1; d/ds(z*K1) = K1/(2z) + z*dK1/ds with dx/ds = 1/lo**2.
-        odd_rows = np.asarray(odd_rows)
-        kernel = (powers@odd_rows)/lo**2
-        dkernel = (dpowers@odd_rows)/lo**4
-        odd_vb = vr+amp_v*max(odd_errors)
-        odd_db = dr+amp_d*max(odd_errors)
-        if max(odd_vb.max(), odd_db.max()) > rel_tol:
-            raise RuntimeError('remote ordered combined certificate failed')
-        result.update(odd_projection_value=z[:, None]*kernel,
-                      odd_projection_derivative=kernel/(2*z[:, None])+z[:, None]*dkernel)
-        result["certificate"].update(
-            ordered=True, odd_kernel='z/(delta**2-z**2) from rows 1/(delta**2+eta**2)**(n+1)',
-            odd_bound_scope='relative bounds on 1/(delta**2-z**2) and its s derivative',
-            even_node_count=int(even_node_count), node_count=int(len(t)),
-            odd_row_relative_bounds=odd_errors, odd_value_bound=odd_vb.tolist(),
-            odd_derivative_bound=odd_db.tolist())
+        result.update(odd_projection_value=odd,
+                      odd_projection_derivative=even*t/(2*z[:, None]))
+        result['certificate'].update(odd_value_bound=bounds[2].tolist(),
+                                     odd_derivative_bound=bounds[3].tolist())
     return dict(result, node_digest=_node_digest(result),
-                reuse_status="build" if previous is None else "rebuild",
+                reuse_status='hit' if reused else ('build' if previous is None else 'rebuild'),
                 reuse_reason=reason)

@@ -26,7 +26,7 @@ production node selection calls `minimax` directly.
 | `family_for_character(...)`, `TARGETS`, `FAMILIES` | Define the accepted target and family vocabulary as data. |
 | `Quadrature`, `Provenance` | Return nodes, weights, measured error, certification state, source, and artifact identity. |
 | `build_uniform_rule(box, eps)` | Builds and certifies one denominator-box rule for `1/d` on `[re_lo, re_hi] x [im_lo, im_hi]`. A production surface, not a lookup: it takes no clock and no pass count, and returns when its own boundary certificate is met, so the same box and tolerance give the same rule on any machine. `gw.sigma_box_plan` is the consumer. |
-| `response_bank_rule(...)` / `response_laplace_rule(...)` | Build the shared-pole W time rule and remote inverse-moment rows, with separate value and derivative contracts. `gw.response_bank` is the consumer. |
+| `response_bank_rule(...)` / `response_laplace_rule(...)` | Build the shared-pole W crossing and noncrossing time rules, with separate value and derivative contracts. `gw.response_bank` is the consumer. |
 | `matsubara_response_rule(...)` | Builds a finite-temperature KMS-paired imaginary-time rule. |
 | `augment_odd_laplace(...)` | Adds the odd GN-PPM resolvent channel on the existing even rule's time nodes, refusing a missed sampled gate. |
 | `damped_line_rule(...)` / `damped_rectangle_rule(...)` / `damped_rectangle_gauss_rule(...)` / `damped_rectangle_positive_rule(...)` | Build MPA's positive-time line and rectangle rules. The rectangle constructors retain their respective geometric and error contracts; GW passes scalar bounds and receives time nodes and weights. |
@@ -139,14 +139,14 @@ while solver-generation tests may require it.
 domain_pad_ry=0)` returns positive real-time nodes and weights, value and
 s-derivative projections, a node digest, and continuum panel/tail bounds.
 `response_laplace_rule(delta_lo_ry, delta_hi_ry, z_ry, ...)` returns positive
-Laplace nodes and inverse-moment coefficient rows, with continuum row bounds
-and current-frequency Taylor bounds. Both accept the previous in-memory result.
+Laplace nodes and weights with direct even/odd projections and continuum
+Gaussian panel/tail bounds. Both accept the previous in-memory result.
 A hit retains its integration arrays exactly and regenerates projections for
 all supplied frequencies. The bank norm is eta-scaled absolute value/derivative
 error; the remote norm is relative error. Neither certifies W or Sigma accuracy.
 
 `domain_pad_ry` enlarges a newly built transition domain. Remote lower padding
-stops at positivity and cannot cross the Taylor convergence boundary. Reuse
+stops at positivity and cannot cross `delta_lo > max|Re(z)|`. Reuse
 requires current-domain containment, the same tolerance, an intact node digest
 and passing current-frequency bounds. Otherwise the owner builds a new rule;
 corrupt integration arrays refuse. Receipts report `reuse_status`,
@@ -161,11 +161,17 @@ Frequencies and transition intervals are in Ry, times in inverse Ry, derivatives
   row `h e^{izt}·it/(2z)`. The currency is peak-scaled absolute error (`η·|value|`, `η³·|derivative|`,
   `η = min Im z`); the certificate bounds the full signed transition interval and both exponential branches,
   tail and panel budgets included. It does not certify relative W or Σ accuracy.
-- `response_laplace_rule` (remote cells): a nonnegative NNLS fit of `δ/(δ²+η²)^{n+1}` on a positive time
-  dictionary, refined until the interval certificate passes (endpoint errors plus a second-derivative bound
-  from the log-derivatives of each positive term, never the training grid alone). With
-  `q = (s+η²)/(δ²+η²)` the value Taylor remainder is bounded by `ρ^{N+1}` and the derivative remainder by
-  `ρ^N((N+1)+Nρ)`, `ρ = sup|q|`; a nonconvergent Taylor domain refuses and must be repartitioned by the bank.
+- `response_laplace_rule` (remote cells): positive `(t,h)` for the direct Laplace identities
+  `delta/(delta²-z²) = integral exp(-delta*t) cosh(z*t) dt` and
+  `z/(delta²-z²) = integral exp(-delta*t) sinh(z*t) dt`, valid when `delta > |Re(z)|`.
+  Their `s` derivatives multiply the opposite hyperbolic function by `t/(2z)`.
+  Projections include `exp(-reference_ry*t)`, evaluated as bounded exponential branches;
+  the consumer supplies `exp(-(delta-reference_ry)*t)`. The reference defaults to the
+  current lower transition bound. The certificate bounds relative even value/derivative
+  errors and, for ordered responses, relative errors in `K=1/(delta²-z²)` and `dK/ds`;
+  relative error in `d(z*K)/ds` is undefined at its zeros. Geometric transition enclosures
+  share one time rule, bounding fast decays at their own energy scale. Both ordered and
+  even rules can reuse fixed nodes after the same current-domain/frequency check.
 
 Neither rule sees band masks, occupations or response arrays. `tests/test_response_rules.py` checks analytic
 kernels, the missing `1/(2z)` derivative red twin, positivity and refusals.

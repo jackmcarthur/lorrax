@@ -679,14 +679,6 @@ def bank_points(sample_plan):
     return np.asarray(points, dtype=np.complex128)
 
 
-#: Largest Taylor ratio a remote Laplace cell may carry (response_windows).
-#: At rho <= 0.3 ``minimax.response_laplace_rule`` stops at order <= 20 for the
-#: production tolerance 1e-8 and amplifies row errors by (1+rho)/(1-rho) <= 1.86
-#: (value), <= 3.45 (s derivative), so its rows need only ~tol/14; Fe's semicore
-#: cell at rho = 0.72 needs order 76 (budget 64) and rows at ~tol/151.
-REMOTE_RHO_MAX = 0.3
-
-
 def _window_cells(energy, ft, ut, masks):
     """Laplace cells (lower, upper) between the partitioned windows."""
     cells = []
@@ -702,87 +694,48 @@ def _window_cells(energy, ft, ut, masks):
                 active += int(low.size * high.size)
         if not bounds:
             continue
-        lo = energy[masks[lower] & ((ft != 0) | (ut != 0))]
-        hi = energy[masks[upper] & ((ft != 0) | (ut != 0))]
-        refs = (float(lo.max()), float(hi.min()))
+        refs = (max(v[0] for v in partner), min(v[1] for v in partner))
         if refs[1] <= refs[0]:
             raise ValueError("GATE response_remote_cell: unordered energy windows")
         cells.append(dict(lower=lower, upper=upper,
             delta_min_ry=min(v[0] for v in bounds),
             delta_max_ry=max(v[1] for v in bounds),
-            references_ry=refs, active_global_pairs=active,
-            nearest_partner_ry=(max(v[0] for v in partner),
-                                min(v[1] for v in partner))))
+            references_ry=refs, active_global_pairs=active))
     return cells
 
 
 def response_windows(energy, f, u, *, chemical_potential_ry, z_ry):
-    """Partition the Run183/188 windowed response into one stream and cells.
+    """One crossing state window and three noncrossing product cells.
 
-    States split by energy relative to the current chemical potential into
-    lower remote | real-time stream | upper remote windows. The sample-only
-    activity floor is 1e-14. Exact moments do not call this routine. Bounds
-    are extrema over all k/band pairings, so they cover every q without
-    constructing a transition table.
-
-    Edges derive from the bank's own samples ``z_ry`` [sample] (Ry). A cell
-    with transition floor delta_lo is remote only if the Taylor ratio of
-    ``minimax.response_laplace_rule`` at these samples and their smallest
-    eta, rho = max|z**2+eta**2|/(delta_lo**2+eta**2), is at most
-    ``REMOTE_RHO_MAX``; otherwise the remote states nearest the cell's
-    partner window join the real-time stream (the lower remote side for
-    cells (0,1) and (0,2), the upper for (1,2)) and the cells are rebuilt,
-    worst cell first, until every cell passes. This is the repartition the
-    Laplace rule's refusal names. The campaign edges [-35,40] eV are a floor:
-    the stream never narrows below them, so a deck whose cells already pass
-    is partitioned exactly as before.
+    Include all occupation tails and transitions that can resonate at the
+    actual Re(z), with the same 1.5*eta separation used by Sigma's geometry.
+    Imaginary-axis supports do not widen the crossing window. Bounds use
+    all k/band extrema, so no transition table or q-specific partition is needed.
+    The sample-only 1e-14 activity floor does not affect exact moments.
     """
     ft = np.where(np.abs(f) >= 1e-14, f, 0.0)
     ut = np.where(np.abs(u) >= 1e-14, u, 0.0)
     physical = (f != 0) | (u != 0)
-    ev = (energy - chemical_potential_ry) * RYD_TO_EV
     z = np.asarray(z_ry, dtype=np.complex128)
-    eta = float(z.imag.min())
-    reach = float(np.abs(z*z + eta*eta).max())
-    floor = (-35.0, 40.0)
-    edges = list(floor)
-    while True:
-        masks = [physical & (ev < edges[0]),
-                 physical & (ev >= edges[0]) & (ev <= edges[1]),
-                 physical & (ev > edges[1])]
-        # A remote diagonal with both sectors occupied cannot be discarded.
-        # Merge it into the resonant stream before constructing any cells.
-        for idx in (0, 2):
-            if np.any(ft * masks[idx]) and np.any(ut * masks[idx]):
-                masks[1] |= masks[idx]
-                masks[idx] = np.zeros_like(masks[idx])
-        cells = _window_cells(energy, ft, ut, masks)
-        for cell in cells:
-            cell["taylor_rho"] = reach/(cell["delta_min_ry"]**2 + eta*eta)
-        failing = [c for c in cells if c["taylor_rho"] > REMOTE_RHO_MAX]
-        if not failing:
-            break
-        cell = min(failing, key=lambda c: c["delta_min_ry"])
-        delta = np.sqrt(reach/REMOTE_RHO_MAX - eta*eta)
-        side = 0 if cell["lower"] == 0 else 2
-        remote = masks[side] & ((ft != 0) | (ut != 0))
-        if side == 0:
-            move = remote & (energy > cell["nearest_partner_ry"][1] - delta)
-            move |= remote & (energy == energy[remote].max())
-            edges[0] = float(ev[move].min())
-        else:
-            move = remote & (energy < cell["nearest_partner_ry"][0] + delta)
-            move |= remote & (energy == energy[remote].min())
-            edges[1] = float(ev[move].max())
-    receipt = dict(window_ev_relative_mu=[float(v) for v in edges],
+    reach = float(np.abs(z.real).max())
+    margin = 1.5*float(z.imag.min())
+    occupied, empty = energy[ft != 0], energy[ut != 0]
+    if not occupied.size or not empty.size:
+        raise ValueError("GATE response_windows: no active occupied or empty states")
+    # Include both occupation extrema even for gaps larger than the sample range.
+    lower = min(float(empty.min())-reach-margin, float(occupied.max()))
+    upper = max(float(occupied.max())+reach+margin, float(empty.min()))
+    masks = [physical & (energy < lower),
+             physical & (energy >= lower) & (energy <= upper),
+             physical & (energy > upper)]
+    cells = _window_cells(energy, ft, ut, masks)
+    receipt = dict(window_ev_relative_mu=[
+        (v-chemical_potential_ry)*RYD_TO_EV for v in (lower, upper)],
         occupation_activity_floor=1e-14,
         discarded_f_mass=float(np.sum(np.abs(f-ft))),
         discarded_u_mass=float(np.sum(np.abs(u-ut))),
         bound_scope="all active k/band extrema, safe for every q",
-        edge_rule=dict(floor_ev_relative_mu=list(floor), rho_max=REMOTE_RHO_MAX,
-            eta_ry=eta, sample_reach_ry2=reach,
-            derived_edge_binds=[float(v) for v in edges] != list(floor),
-            cell_taylor_rho=[c["taylor_rho"] for c in cells]))
+        edge_rule=dict(max_real_z_ry=reach, noncrossing_margin_ry=margin))
     return masks, ft, ut, cells, receipt
 
 
@@ -1091,14 +1044,23 @@ def response_quadrature(wfns, meta, sample_plan, receipt, *, ordered=False):
         rr = laplace_rule(cell["delta_min_ry"],cell["delta_max_ry"],z,
             rel_tol=sample_plan["bank_rule_tolerance"],
             previous=None if session is None else session.get(key),
-            domain_pad_ry=pad,**({"ordered": True} if ordered else {}))
+            domain_pad_ry=pad, ordered=ordered,
+            reference_ry=cell["references_ry"][1]-cell["references_ry"][0])
         if session is not None:
             session[key] = rr
         remote.append((cell,rr))
     receipt["laplace_cells"] = [{**cell,**{k:v for k,v in rr.items()
-        if k not in ("t","projection_value","projection_derivative","coefficient_rows",
+        if k not in ("t","h","projection_value","projection_derivative",
                      "odd_projection_value","odd_projection_derivative")}}
         for cell,rr in remote]
+    if jax.process_index() == 0:
+        print(f"  Response quadrature: crossing {delta*RYD_TO_EV:.3f} eV, "
+              f"{len(t)} nodes ({rule['reuse_status']})", flush=True)
+        for cell, rr in remote:
+            print(f"    noncrossing {cell['lower']}:{cell['upper']} "
+                  f"{cell['delta_min_ry']*RYD_TO_EV:.3f}.."
+                  f"{cell['delta_max_ry']*RYD_TO_EV:.3f} eV, "
+                  f"{len(rr['t'])} nodes ({rr['reuse_status']})", flush=True)
     return dict(t=t, phase=phase, derivative=derivative, remote=remote,
                 masks=masks, ft=ft, ut=ut, reference=reference)
 
@@ -1139,11 +1101,11 @@ def integrate_response_panel(wfns, meta, mesh_xy, rules, *, q_ids, sample_span,
             lower,upper = cell["lower"],cell["upper"]
             refs = np.asarray(cell["references_ry"])
             tau = np.asarray(rr["t"])
-            projections = -np.vstack((rr["projection_value"][lo:hi],rr["projection_derivative"][lo:hi]))*np.exp(-(refs[1]-refs[0])*tau)[None,:]
+            projections = -np.vstack((rr["projection_value"][lo:hi],rr["projection_derivative"][lo:hi]))
             if ordered:
                 # Rows [even value, even ds, odd value, odd ds].
                 projections = np.vstack((projections,
-                    -np.vstack((rr["odd_projection_value"][lo:hi],rr["odd_projection_derivative"][lo:hi]))*np.exp(-(refs[1]-refs[0])*tau)[None,:]))
+                    -np.vstack((rr["odd_projection_value"][lo:hi],rr["odd_projection_derivative"][lo:hi]))))
             lw = np.stack([ft*masks[lower],ut*masks[lower]])
             uw = np.stack([ut*masks[upper],ft*masks[upper]])
             # Parent selection applies to the k axis, separately for each role.

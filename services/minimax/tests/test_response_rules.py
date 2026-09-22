@@ -38,15 +38,16 @@ def test_hermite_current_points(height, top, imag, delta_max):
 @pytest.mark.parametrize('lo,hi,z_ev', [
     (35., 90., [1j, 2+1j, 5.5+1j, 4j, 16j]),
     (45., 120., [1j, 7+1j, 15+1j, 1.5j, 16j]),
+    (12., 400., [1j, 9.91+1j, 34j, 100j]),
 ])
 def test_remote_current_points(lo, hi, z_ev):
     z = np.asarray(z_ev)/RY_EV
     rule = minimax.response_laplace_rule(lo/RY_EV, hi/RY_EV, z)
-    assert np.all(rule['t'] > 0) and np.all(rule['coefficient_rows'] >= 0)
+    assert np.all(rule['t'] > 0) and np.all(rule['h'] >= 0)
     cert = rule['certificate']
     assert cert['status'] == 'PASS'
     delta = np.geomspace(lo/RY_EV, hi/RY_EV, 3007)
-    basis = np.exp(-delta[:, None]*rule['t'])
+    basis = np.exp(-(delta[:, None]-rule['reference_ry'])*rule['t'])
     value = basis@rule['projection_value'].T
     derivative = basis@rule['projection_derivative'].T
     truth = delta[:, None]/(delta[:, None]**2-z[None, :]**2)
@@ -97,30 +98,31 @@ def test_fixed_stream_nodes_update_projections_and_check_current_points():
     assert lower['reuse_status'] == 'rebuild'
 
 
-def test_fixed_remote_rows_update_current_taylor_projection():
+@pytest.mark.parametrize('ordered', [False, True])
+def test_fixed_remote_nodes_update_current_projection(ordered):
     z = np.array([1j, 2+1j, 5+1j])/RY_EV
     rule = minimax.response_laplace_rule(45/RY_EV, 90/RY_EV, z,
-                                        domain_pad_ry=4/RY_EV)
+                                        domain_pad_ry=4/RY_EV, ordered=ordered)
     current = z + np.array([.04j, .03, -.05])/RY_EV
-    reused = minimax.response_laplace_rule(44/RY_EV, 92/RY_EV, current, previous=rule)
+    reused = minimax.response_laplace_rule(44/RY_EV, 92/RY_EV, current, previous=rule, ordered=ordered)
     assert reused['reuse_status'] == 'hit'
-    np.testing.assert_array_equal(rule['coefficient_rows'], reused['coefficient_rows'])
+    np.testing.assert_array_equal(rule['h'], reused['h'])
     delta = np.geomspace(44/RY_EV, 92/RY_EV, 503)
-    basis = np.exp(-delta[:, None]*reused['t'])
+    basis = np.exp(-(delta[:, None]-reused['reference_ry'])*reused['t'])
     truth = delta[:, None]/(delta[:, None]**2-current[None, :]**2)
     ds = delta[:, None]/(delta[:, None]**2-current[None, :]**2)**2
     assert np.max(abs(basis@reused['projection_value'].T/truth-1)) < 1e-8
     assert np.max(abs(basis@reused['projection_derivative'].T/ds-1)) < 1e-8
-    assert np.max(abs(basis@rule['projection_value'].T/truth-1)) > 1e-6
+    assert np.max(abs(np.exp(-(delta[:, None]-rule['reference_ry'])*rule['t'])@rule['projection_value'].T/truth-1)) > 1e-6
 
 
-def test_remote_padding_does_not_cross_taylor_boundary():
+def test_remote_padding_does_not_cross_denominator_boundary():
     z = np.array([1.4+.1j])
     rule = minimax.response_laplace_rule(2., 3., z, rel_tol=1e-6, domain_pad_ry=1.)
     assert rule['certificate']['delta_ry'] == [2., 4.]
     delta = np.geomspace(2., 3., 101)
     truth = delta/(delta**2-z[0]**2)
-    got = np.exp(-delta[:, None]*rule['t'])@rule['projection_value'][0]
+    got = np.exp(-(delta[:, None]-rule['reference_ry'])*rule['t'])@rule['projection_value'][0]
     assert np.max(abs(got/truth-1)) < 1e-6
 
 
@@ -133,7 +135,7 @@ def test_ordered_remote_rows_carry_the_odd_kernel():
         for key in ("t", "projection_value", "projection_derivative"):
             np.testing.assert_array_equal(rule[key], even[key])
     d = np.geomspace(*rule["certificate"]["delta_ry"], 257)[:, None]
-    basis = np.exp(-d*rule["t"][None, :])
+    basis = np.exp(-(d-rule["reference_ry"])*rule["t"][None, :])
     zz = z[None, :]
     odd = zz/(d*d-zz*zz)
     np.testing.assert_allclose(basis@rule["odd_projection_value"].T, odd, rtol=1e-7)

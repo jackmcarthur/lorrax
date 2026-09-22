@@ -93,8 +93,19 @@ which is `F_q[χ]`. With the transposed orientation on a TR-broken deck each Gre
 other branch's residues, `Σ[W^even] − Σ^odd`. Tests: `tests/test_shared_pole_stream_orientation.py` (ordered
 retarded and Laplace rows equal `F_q[χ]` to 1e-10 on a TR-broken lattice and miss `F_q[χᵀ]`).
 
-**Remote Laplace cells.** Transitions far from the support region enter through a positive rule for
-`1/(d² + η²)^{n+1}` on the same `t` (`minimax.response_laplace_rule`). The even kernel `d/(d² − z²)` weights
+**Window partition.** Let `E_f,max` and `E_u,min` be the extrema of the current active occupied
+and empty weights, including fractional tails (sample-only activity floor `1e-14`). With
+`omega=max|Re(z)|` and margin `1.5 min Im(z)`, the central state window contains
+`[E_u,min-omega-margin, E_f,max+omega+margin]` and both occupation frontiers.
+Its diagonal product uses real time; the lower/central, lower/upper, and central/upper
+products use Laplace time. The remote diagonal products have zero active occupation
+weight. Thus every active transition has one owner, and imaginary-axis support height
+does not force deep states into the crossing window. Exact moments remain untruncated.
+
+**Remote Laplace cells.** For `d > |Re(z)|`, the existing stream integrates
+`exp(-d*t) cosh(z*t)` and `exp(-d*t) sinh(z*t)` directly on shared positive nodes
+(`minimax.response_laplace_rule`; certificate contract in [minimax](../services/minimax.md#response-rule-currencies-and-certificates)).
+No Taylor expansion in `z²` is required. The even kernel `d/(d² − z²)` weights
 `forward − reverse`; the odd kernel `z/(d² − z²)` weights `forward + reverse`:
 
 $$ \chi^0_{\rm even} \leftarrow \sum_a \rho^{\rm even}_a(z)\,(F - B)(t_a),\qquad
