@@ -1761,7 +1761,7 @@ use the service's ``_spin_rotation`` kernel: one thread owns each
 and writes through an input/output alias. There is no loop over k, global
 spin intermediate, or communication. A still-live input is preserved by
 XLA's alias handling. The selected native provider must export
-``SpinRotateCudaFfi``; a missing handler refuses rather than silently
+``SpinRotateCentroidCudaFfi``; a missing handler refuses rather than silently
 changing the workspace requirement. Spatial permutation, phases, and the
 antiunitary endpoint rule remain in :func:`unfold_isdf_operator`.
 

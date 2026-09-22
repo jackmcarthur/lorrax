@@ -18,7 +18,7 @@ __global__ void spin_rotate(const cuDoubleComplex* input,
         #pragma unroll
         for (int b = 0; b < S; ++b) {
             u[a][b] = spin[(k * S + a) * S + b];
-            g[a][b] = input[(((k * S + a) * mu + m) * S + b) * nu + n];
+            g[a][b] = input[(((k * mu + m) * S + a) * nu + n) * S + b];
         }
     }
     #pragma unroll
@@ -41,7 +41,7 @@ __global__ void spin_rotate(const cuDoubleComplex* input,
             #pragma unroll
             for (int d = 0; d < S; ++d)
                 v = cuCadd(v, cuCmul(left[a][d], cuConj(u[b][d])));
-            output[(((k * S + a) * mu + m) * S + b) * nu + n] = v;
+            output[(((k * mu + m) * S + a) * nu + n) * S + b] = v;
         }
     }
 }

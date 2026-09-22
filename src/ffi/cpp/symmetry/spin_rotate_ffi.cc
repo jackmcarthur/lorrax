@@ -16,10 +16,10 @@ static ffi::Error rotate(cudaStream_t stream, ffi::AnyBuffer g,
         g.dimensions().size() != 5 || u.dimensions().size() != 3 ||
         out->dimensions().size() != 5)
         return ffi::Error(ffi::ErrorCode::kInvalidArgument,
-                         "spin rotation requires complex128 G[k,s,mu,s,nu], U[k,s,s]");
+                         "spin rotation requires complex128 G[k,mu,s,nu,s], U[k,s,s]");
     const auto d = g.dimensions();
-    const int64_t nk = d[0], s = d[1], mu = d[2], nu = d[4];
-    if ((s != 2 && s != 4) || d[3] != s || nk < 1 || mu < 1 || nu < 1 ||
+    const int64_t nk = d[0], s = d[2], mu = d[1], nu = d[3];
+    if ((s != 2 && s != 4) || d[4] != s || nk < 1 || mu < 1 || nu < 1 ||
         u.dimensions()[0] != nk || u.dimensions()[1] != s || u.dimensions()[2] != s ||
         g.element_count() / (s * s) > 128ULL * 2147483647)
         return ffi::Error(ffi::ErrorCode::kInvalidArgument, "invalid spin rotation dimensions");
@@ -33,7 +33,7 @@ static ffi::Error rotate(cudaStream_t stream, ffi::AnyBuffer g,
 }
 }  // namespace lorrax_ffi::symmetry
 
-XLA_FFI_DEFINE_HANDLER_SYMBOL(SpinRotateCudaFfi, lorrax_ffi::symmetry::rotate,
+XLA_FFI_DEFINE_HANDLER_SYMBOL(SpinRotateCentroidCudaFfi, lorrax_ffi::symmetry::rotate,
     xla::ffi::Ffi::Bind().Ctx<xla::ffi::PlatformStream<cudaStream_t>>()
         .Arg<xla::ffi::AnyBuffer>().Arg<xla::ffi::AnyBuffer>()
         .Ret<xla::ffi::AnyBuffer>());

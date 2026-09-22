@@ -8,11 +8,11 @@ from lxkit import native_provider
 
 from ._shard_map import shard_map
 
-_TARGET = "lorrax_symmetry_spin_rotate"
+_TARGET = "lorrax_symmetry_spin_rotate_centroid"
 _ABI = 3  # src/ffi/cpp/common/lorrax_ffi_abi.h
 _SPECS = {
     "CUDA": dict(env="LORRAX_FFI_SO", so_name="liblorrax_ffi.so",
-                 build_hint="build the LORRAX CUDA provider with SpinRotateCudaFfi"),
+                 build_hint="build the LORRAX CUDA provider with SpinRotateCentroidCudaFfi"),
     "cpu": dict(env="LORRAX_FFI_HOST_SO", so_name="liblorrax_ffi_host.so",
                 build_hint="build the LORRAX host provider"),
 }
@@ -26,10 +26,10 @@ def _register():
         path, platform="CUDA", expected_abi=_ABI,
         abi_symbols={"CUDA": "lorrax_ffi_cuda_abi_version"},
         build_hint=_SPECS["CUDA"]["build_hint"])
-    if not hasattr(lib, "SpinRotateCudaFfi"):
-        raise RuntimeError(f"{path} lacks SpinRotateCudaFfi; rebuild the CUDA provider")
+    if not hasattr(lib, "SpinRotateCentroidCudaFfi"):
+        raise RuntimeError(f"{path} lacks SpinRotateCentroidCudaFfi; rebuild the CUDA provider")
     jax.ffi.register_ffi_target(
-        _TARGET, jax.ffi.pycapsule(lib.SpinRotateCudaFfi), platform="CUDA")
+        _TARGET, jax.ffi.pycapsule(lib.SpinRotateCentroidCudaFfi), platform="CUDA")
     return lib  # Retain the provider for the registered handler's lifetime.
 
 
@@ -37,8 +37,8 @@ def _register():
 def _kernel(mesh):
     _register()
 
-    @partial(shard_map, mesh=mesh, in_specs=(P(None, None, 'x', None, 'y'), P()),
-               out_specs=P(None, None, 'x', None, 'y'), check_vma=False)
+    @partial(shard_map, mesh=mesh, in_specs=(P(None, 'x', None, 'y', None), P()),
+               out_specs=P(None, 'x', None, 'y', None), check_vma=False)
     def rotate(g, u):
         return jax.ffi.ffi_call(
             _TARGET, jax.ShapeDtypeStruct(g.shape, g.dtype),
