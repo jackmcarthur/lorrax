@@ -1118,7 +1118,7 @@ def _w_residual_report(V_flat, chi_scaled, W, n_ext, n_check: int = 4):
               f"{vals}  max={r.max():.3e}", flush=True)
 
 
-def produce_w_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_io):
+def produce_w_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_io, print_fn=print):
     """Produce physical Wc/dWc_ds in the current-map scratch transaction.
 
     ``sample_plan`` is the resolved flat point/role plan. ``bank_io`` names the
@@ -1129,7 +1129,7 @@ def produce_w_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_io):
     """
     from .response_bank import produce_sample_bank
     return produce_sample_bank(wfns, meta, config, mesh_xy=mesh_xy, sym=sym,
-                               sample_plan=sample_plan, bank_io=bank_io)
+                               sample_plan=sample_plan, bank_io=bank_io, print_fn=print_fn)
 
 
 def compute_response_moments(wfns, meta, config, *, mesh_xy, sym, bank_io):

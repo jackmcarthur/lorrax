@@ -972,7 +972,7 @@ def _tr_odd_census(receipt, solve_value, h, chi, value, z, q_full):
             print("TRBANK tr_odd_census " + " ".join(f"{k}={row[k]}" for k in row), flush=True)
 
 
-def response_quadrature(wfns, meta, sample_plan, receipt, *, ordered=False):
+def response_quadrature(wfns, meta, sample_plan, receipt, *, ordered=False, print_fn=print):
     """Plan independent frequency sums across hosts; broadcast only scalars."""
     import minimax
     from jax.experimental import multihost_utils
@@ -995,7 +995,7 @@ def response_quadrature(wfns, meta, sample_plan, receipt, *, ordered=False):
             value=np.zeros((len(z), 2, minimax.RESPONSE_RULE_CAPACITY), complex),
             derivative=np.zeros((len(z), 2, minimax.RESPONSE_RULE_CAPACITY), complex),
             sampled_error=np.zeros((len(z), 2, 2)), counts=np.zeros((len(z), 2), np.int64))
-        progress = LoopProgress(len(z), print, title="response rule construction",
+        progress = LoopProgress(len(z), print_fn, title="response rule construction",
                                 item_name="frequency", max_updates=len(z)).start()
         rank, workers = jax.process_index(), jax.process_count()
         for start in range(0, len(z), workers):
@@ -1031,10 +1031,10 @@ def response_quadrature(wfns, meta, sample_plan, receipt, *, ordered=False):
         reused=reuse)
     receipt["nodes"] = int(plan["counts"].sum())
     if jax.process_index() == 0:
-        print("Response quadrature: z(eV)   forward backward  sampled value/ds error; "
+        print_fn("Response quadrature: z(eV)   forward backward  sampled value/ds error; "
               + ("reused" if reuse else "constructed"), flush=True)
         for point, counts, errors in zip(z, plan["counts"], plan["sampled_error"]):
-            print(f"Response quadrature: {point*RYD_TO_EV:20.8g} {counts[0]:4d} {counts[1]:4d}  "
+            print_fn(f"Response quadrature: {point*RYD_TO_EV:20.8g} {counts[0]:4d} {counts[1]:4d}  "
                   f"{errors[:,0].max():.2e} {errors[:,1].max():.2e}", flush=True)
     return dict(plan=plan, f=f, u=u, refs=refs)
 
@@ -1064,7 +1064,7 @@ def integrate_response_field(wfns, meta, mesh_xy, rules, *, q_ids, sample,
 
 
 def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_io,
-                        vertex=None, contact=None):
+                        vertex=None, contact=None, print_fn=print):
     """Stage A: consume each frequency value before producing its derivative."""
     with timing.fenced_section('bank.setup', announce=True):
         header,qids,census = _bank_context(wfns,meta,sym,bank_io,mesh_xy)
@@ -1115,7 +1115,7 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                               label="shared-pole frequency rule construction"):
         solve_value, solve_slope, _, receipt["algebra"] = response_algebra(meta,config,
             mesh_xy=mesh_xy,n=n,photon=vertex is not None)
-        rules = response_quadrature(wfns, meta, sample_plan, receipt, ordered=ordered)
+        rules = response_quadrature(wfns, meta, sample_plan, receipt, ordered=ordered, print_fn=print_fn)
     response_rows = panel_rows(0, len(qids))
     row_index = {q: i for i, q in enumerate(response_rows)}
     face_bytes = 16*n*n//mesh_xy.size
@@ -1133,7 +1133,7 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
     # The sole response accumulator is all-P sharded. Dense work and slab I/O
     # remain bounded to one parent and one frequency, with their own admission.
     fields = (("Wc", "dWc_ds"), ("Wc_mirror", "dWc_mirror_ds"))
-    progress = LoopProgress(2*len(z), print, title="response frequency integration",
+    progress = LoopProgress(2*len(z), print_fn, title="response frequency integration",
                             item_name="value/slope", max_updates=len(z)).start()
     for sample, point in enumerate(z):
         if np.asarray(header["sample_written"])[:,sample].all():
@@ -1199,7 +1199,7 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
         receipt["seconds"]["io"] += time.monotonic()-io_started
     progress.finish()
     if jax.process_index() == 0:
-        print("Response quadrature: seconds " + " ".join(
+        print_fn("Response quadrature: seconds " + " ".join(
             f"{key}={value:.3f}" for key, value in receipt["seconds"].items()), flush=True)
     del roots
     ledger.live_stages = caller_live
@@ -1252,7 +1252,7 @@ def photon_bare_operator(wfns, wfns_transverse, meta, *, path, mu_bases, layout,
 
 
 def compute_photon_bank(wfns, wfns_transverse, meta, config, *, mesh_xy, sym,
-                        mu_bases, layout, occupation_state, sample_plan, bank_io):
+                        mu_bases, layout, occupation_state, sample_plan, bank_io, print_fn=print):
     """Build a full photon bank through the existing sample/moment stages.
 
     ``bank_io`` names the initialized scratch path, current identity and
@@ -1355,7 +1355,7 @@ def compute_photon_bank(wfns, wfns_transverse, meta, config, *, mesh_xy, sym,
     if jax.process_index() == 0:
         print("photon bank: ordered samples and derivatives", flush=True)
     receipt["samples"] = produce_sample_bank(wfns, meta, config, mesh_xy=mesh_xy,
-        sym=sym, sample_plan=sample_plan, bank_io=bank, vertex=vertex, contact=contact)
+        sym=sym, sample_plan=sample_plan, bank_io=bank, vertex=vertex, contact=contact, print_fn=print_fn)
     receipt["seconds"]["samples"] = time.monotonic()-before
     header = validate_shared_pole_bank(bank["path"], expected_identity=bank["identity"],
                                        mesh_xy=mesh_xy, require_complete=True)

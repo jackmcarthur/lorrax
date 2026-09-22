@@ -307,10 +307,10 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
             from .response_bank import compute_photon_bank
             record("bank", compute_photon_bank(wfns, wfns_transverse, meta, config,
                 mesh_xy=mesh_xy, sym=sym, mu_bases=mu_bases, layout=photon_layout,
-                occupation_state=occupation_state, sample_plan=recipe, bank_io=bank))
+                occupation_state=occupation_state, sample_plan=recipe, bank_io=bank, print_fn=print_fn))
         else:
             record("bank", produce_w_bank(wfns, meta, config, mesh_xy=mesh_xy,
-                sym=sym, sample_plan=recipe, bank_io=bank))
+                sym=sym, sample_plan=recipe, bank_io=bank, print_fn=print_fn))
     if not photon and not resume_constructor:
         with timing.fenced_section("spole.moments"):
             record("moments", compute_response_moments(wfns, meta, config,

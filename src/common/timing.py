@@ -107,8 +107,21 @@ def _trace_enabled(depth: int) -> bool:
     return _rank0()
 
 
+_TRACE_SINK = None
+
+
+def set_trace_sink(sink=None) -> None:
+    """Route stage cadence through the active driver's scientific report."""
+    global _TRACE_SINK
+    _TRACE_SINK = sink
+
+
 def _trace(msg: str) -> None:
-    print(f"[stage {time.strftime('%H:%M:%S')}] {msg}", flush=True)
+    text = f"[stage {time.strftime('%H:%M:%S')}] {msg}"
+    if _TRACE_SINK is None:
+        print(text, flush=True)
+    else:
+        _TRACE_SINK(text)
 
 
 def _safe_trace(msg: str) -> None:

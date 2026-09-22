@@ -282,6 +282,7 @@ def _open_production_report(args):
     report.stdout = (rank0_print if debug_print_enabled()
                      else production_stdout.emit)
     print0 = report.legacy_print
+    timing.set_trace_sink(report.progress)
     report.begin(input_file=args.input, config=config)
     refuse_unimplemented_compute_mode(mode, context="the LORRAX GW driver")
     do_screened = mode.needs_screening
@@ -1574,6 +1575,7 @@ def main(argv=None):
 	        "listed artifact present and committed; why: a run that prints "
 	        "the completion line while a published artifact is missing or "
 	        "still inside its write transaction is not a usable run")
+	timing.set_trace_sink()
 	report.finish()
 	production_stdout.close()
 	return 0
