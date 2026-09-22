@@ -739,15 +739,16 @@ def _get_chi_fractional_contour_kernel_face(
         def window_body(accumulators, node):
             time, projection, window = node
             lower, upper, refs = occ_f[window], occ_u[window], energy_reference[window]
+            # Build one Green pair outside the contour branch. Forward/reverse
+            # Laplace orientations are separate nodes, with signed projections.
+            value = spin_correlation(lower, time[0], refs[0], upper, time[1], refs[1])
 
             def crossing(_):
-                value = retarded_correlation(time, lower[0], upper[0], refs[0])
                 return accumulate_selected(accumulators,
                     selected(-1j * (value - jnp.conj(value))), projection[:n_out])
 
             def remote(_):
-                even, odd = laplace_correlation(time, lower, upper, refs)
-                return add_laplace(accumulators, even, odd, projection)
+                return add_laplace(accumulators, value, value, projection)
 
             return jax.lax.cond(window == 0, crossing, remote, None), None
 

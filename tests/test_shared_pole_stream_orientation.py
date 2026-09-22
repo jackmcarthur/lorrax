@@ -171,8 +171,22 @@ def test_windowed_stream_matches_separate_contours(stream, ordered):
         expected += np.asarray(s.kernel('laplace_ordered' if ordered else 'laplace', n_out=2)(
             s.put(times[i]), s.put(rows[i]), *fixed,
             s.put(lower[i]), s.put(upper[i]), s.put(refs[i])))
-    window_ids = np.concatenate([np.full(len(t), i, np.int32) for i, t in enumerate(times)])
+    node_times = [np.column_stack((-1j*times[0], -1j*times[0]))]
+    node_rows, node_ids = [rows[0]], [np.zeros(len(times[0]), np.int32)]
+    lower_rows, upper_rows, ref_rows = [lower[0, 0]], [upper[0, 0]], [refs[0]]
+    for i in (1, 2):
+        for orientation in (0, 1):
+            node_times.append(np.column_stack((-times[i], times[i])).astype(complex))
+            signed = rows[i].copy()
+            if orientation:
+                signed[:2] *= -1
+            node_rows.append(signed)
+            node_ids.append(np.full(len(times[i]), len(ref_rows), np.int32))
+            lower_rows.append(lower[i, orientation])
+            upper_rows.append(upper[i, orientation])
+            ref_rows.append(refs[i])
     got = np.asarray(s.kernel('windowed', n_out=2, ordered=ordered)(
-        (s.put(np.concatenate(times)), s.put(window_ids)), s.put(np.concatenate(rows, axis=1)),
-        *fixed, s.put(lower), s.put(upper), s.put(refs)))
+        (s.put(np.concatenate(node_times)), s.put(np.concatenate(node_ids))),
+        s.put(np.concatenate(node_rows, axis=1)), *fixed,
+        s.put(lower_rows), s.put(upper_rows), s.put(ref_rows)))
     np.testing.assert_allclose(got, expected, rtol=2e-12, atol=2e-12)

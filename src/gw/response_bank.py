@@ -1066,28 +1066,32 @@ def integrate_response_panel(wfns, meta, mesh_xy, rules, *, q_ids, sample_span,
         rules[k] for k in ("t", "phase", "derivative", "remote", "masks", "ft", "ut", "reference"))
     # One concatenated node stream, one donated carry. Only small window
     # weights/references are indexed by node; no Green history is materialized.
-    times, rows, windows = [t], [np.vstack((phase[lo:hi], derivative[lo:hi]))], [np.zeros(len(t), np.int32)]
+    times = [np.column_stack((-1j*t, -1j*t))]
+    rows, windows = [np.vstack((phase[lo:hi], derivative[lo:hi]))], [np.zeros(len(t), np.int32)]
     if ordered:
         rows[0] = np.vstack((rows[0], np.zeros_like(rows[0])))
-    lower_weights = [np.stack((ft*masks[1], ft*masks[1]))]
-    upper_weights = [np.stack((ut*masks[1], ut*masks[1]))]
+    lower_weights = [ft*masks[1]]
+    upper_weights = [ut*masks[1]]
     references = [[reference, reference]]
-    for index, (cell, rr) in enumerate(remote, start=1):
+    for cell, rr in remote:
         lower, upper = cell["lower"], cell["upper"]
-        times.append(np.asarray(rr["t"]))
+        tau = np.asarray(rr["t"])
         projections = -np.vstack((rr["projection_value"][lo:hi], rr["projection_derivative"][lo:hi]))
         if ordered:
             projections = np.vstack((projections,
                 -np.vstack((rr["odd_projection_value"][lo:hi], rr["odd_projection_derivative"][lo:hi]))))
-        rows.append(projections)
-        windows.append(np.full(len(times[-1]), index, np.int32))
-        lower_weights.append(np.stack((ft*masks[lower], ut*masks[lower])))
-        upper_weights.append(np.stack((ut*masks[upper], ft*masks[upper])))
-        references.append(cell["references_ry"])
-    # Parent restriction acts on k independently for each window/orientation.
+        for orientation, (lw, uw) in enumerate(((ft, ut), (ut, ft))):
+            times.append(np.column_stack((-tau, tau)).astype(np.complex128))
+            signed = projections.copy()
+            if orientation:
+                signed[:2*a] *= -1
+            rows.append(signed)
+            windows.append(np.full(len(tau), len(references), np.int32))
+            lower_weights.append(lw*masks[lower])
+            upper_weights.append(uw*masks[upper])
+            references.append(cell["references_ry"])
     def place(table):
-        return jnp.stack([jnp.stack([weights(wfns, row, mesh_xy) for row in window])
-                          for window in table])
+        return jnp.stack([weights(wfns, row, mesh_xy) for row in table])
     kernel, fixed = response_stream(wfns, meta, mesh_xy=mesh_xy,
         q_ids=qids, n_outputs=2*a, pair_mode="windowed", bank_carry=True,
         ordered=ordered, vertex=vertex)
