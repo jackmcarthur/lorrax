@@ -155,6 +155,8 @@ The cuSolverMp response-direction dilation solve uses the equivalent positive ma
 (unit scale for zero A). This avoids a reproduced cuSolverMp STEDC convergence
 failure on a saved response matrix without changing eigenvectors,
 rank cutoffs, or the physical operator; only the scalar norm is reduced.
+Before eager direction-rank selection, the small host spectrum is broadcast
+from one process so roundoff tails cannot produce inconsistent rank decisions.
 
 The physical input is exactly one rank-2 square float64 or complex128 array at
 P('x','y') on the supplied mesh.  The service refuses rank, shape, dtype,
