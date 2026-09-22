@@ -98,8 +98,8 @@ other branch's residues, `Σ[W^even] − Σ^odd`. Tests: `tests/test_shared_pole
 retarded and Laplace rows equal `F_q[χ]` to 1e-10 on a TR-broken lattice and miss `F_q[χᵀ]`).
 
 **Domain and derivative.** The domain spans every nonzero occupied/empty-weight
-pair, including negative transition energies and signed metallic weights; there
-is no sample-only occupation threshold. Scalar plans receive 2 eV padding per
+pair after the existing sample-only 1e-14 activity floor, including negative
+transition energies and signed metallic weights; exact moments are untruncated. Scalar plans receive 2 eV padding per
 one-particle endpoint for SC reuse, without changing occupations or energies.
 
 $$ \frac{\partial F}{\partial s}=\frac1{2z(d-z)^2},\qquad

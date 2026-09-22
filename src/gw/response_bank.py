@@ -714,6 +714,15 @@ def _window_cells(energy, ft, ut, masks):
     return cells
 
 
+def response_sample_weights(f, u):
+    """Existing sample-only activity floor; exact moments retain every weight."""
+    ft = np.where(np.abs(f) >= 1e-14, f, 0.0)
+    ut = np.where(np.abs(u) >= 1e-14, u, 0.0)
+    return ft, ut, dict(occupation_activity_floor=1e-14,
+        discarded_f_mass=float(np.sum(np.abs(f-ft))),
+        discarded_u_mass=float(np.sum(np.abs(u-ut))))
+
+
 def response_windows(energy, f, u, *, chemical_potential_ry, z_ry):
     """One crossing state window and three noncrossing product cells.
 
@@ -723,8 +732,7 @@ def response_windows(energy, f, u, *, chemical_potential_ry, z_ry):
     all k/band extrema, so no transition table or q-specific partition is needed.
     The sample-only 1e-14 activity floor does not affect exact moments.
     """
-    ft = np.where(np.abs(f) >= 1e-14, f, 0.0)
-    ut = np.where(np.abs(u) >= 1e-14, u, 0.0)
+    ft, ut, activity = response_sample_weights(f, u)
     physical = (f != 0) | (u != 0)
     z = np.asarray(z_ry, dtype=np.complex128)
     reach = float(np.abs(z.real).max())
@@ -741,9 +749,7 @@ def response_windows(energy, f, u, *, chemical_potential_ry, z_ry):
     cells = _window_cells(energy, ft, ut, masks)
     receipt = dict(window_ev_relative_mu=[
         (v-chemical_potential_ry)*RYD_TO_EV for v in (lower, upper)],
-        occupation_activity_floor=1e-14,
-        discarded_f_mass=float(np.sum(np.abs(f-ft))),
-        discarded_u_mass=float(np.sum(np.abs(u-ut))),
+        **activity,
         bound_scope="all active k/band extrema, safe for every q",
         edge_rule=dict(max_real_z_ry=reach, noncrossing_margin_ry=margin))
     return masks, ft, ut, cells, receipt
@@ -970,22 +976,25 @@ def response_quadrature(wfns, meta, sample_plan, receipt, *, ordered=False):
     from jax.experimental import multihost_utils
     z = bank_points(sample_plan)
     energy, f, u, _, _ = response_weights(wfns, meta)
+    f, u, receipt["sample_activity"] = response_sample_weights(f, u)
     refs = np.array([energy[f != 0].max(), energy[u != 0].min()])
     lo, hi = refs[1]-refs[0], float(energy[u != 0].max()-energy[f != 0].min())
     session = getattr(meta, "shared_pole_response_rules", None)
     old = None if session is None else session.get("frequency")
-    reuse = old is not None and old["lo"] <= lo and hi <= old["hi"] and np.array_equal(old["z"], z)
+    metallic = sample_plan["census"]["partial_at_mu"]
+    reuse = (old is not None and old["lo"] <= lo and hi <= old["hi"]
+             and old["metallic"] == metallic and np.array_equal(old["z"], z))
     if reuse:
         plan = old
     else:
         pad = 4./RYD_TO_EV if session is not None else 0.
-        plan = dict(lo=lo-pad, hi=hi+pad, z=z,
+        plan = dict(lo=lo-pad, hi=hi+pad, z=z, metallic=metallic,
             t=np.zeros((len(z), 2, 128), complex),
             value=np.zeros((len(z), 2, 128), complex),
             derivative=np.zeros((len(z), 2, 128), complex),
             sampled_error=np.zeros((len(z), 2, 2)), counts=np.zeros((len(z), 2), np.int64))
         for i, point in enumerate(z):
-            status = np.zeros(1, np.int32)
+            status = np.zeros(1024, np.uint8)
             if jax.process_index() == 0:
                 try:
                     rule = minimax.response_frequency_rule(plan["lo"], plan["hi"], point,
@@ -994,10 +1003,11 @@ def response_quadrature(wfns, meta, sample_plan, receipt, *, ordered=False):
                     for key in ("t", "value", "derivative", "sampled_error", "counts"):
                         plan[key][i] = rule[key]
                 except Exception as error:
-                    print(f"Response rule failed at z={point}: {error}", flush=True)
-                    status[0] = 1
-            if np.asarray(multihost_utils.broadcast_one_to_all(status))[0]:
-                raise ValueError(f"response frequency rule construction failed at z={point}")
+                    message = str(error).encode()[:1023]
+                    status[:len(message)] = np.frombuffer(message, dtype=np.uint8)
+            status = np.asarray(multihost_utils.broadcast_one_to_all(status))
+            if status.any():
+                raise ValueError(bytes(status).rstrip(b"\0").decode(errors="replace"))
             for key in ("t", "value", "derivative", "sampled_error", "counts"):
                 plan[key][i] = np.asarray(multihost_utils.broadcast_one_to_all(plan[key][i]))
         if session is not None:
