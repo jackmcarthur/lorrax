@@ -1042,23 +1042,23 @@ def response_quadrature(wfns, meta, sample_plan, receipt, *, ordered=False, prin
     return dict(plan=plan, f=f, u=u, refs=refs, band_ranges=band_ranges)
 
 
-def integrate_response_field(wfns, meta, mesh_xy, rules, *, q_ids, sample,
-                             derivative, execute, receipt, ordered=False, vertex=None):
-    """One donated [1,q,mu_X,nu_Y] field; both physical products in one scan."""
+def integrate_response_frequency(wfns, meta, mesh_xy, rules, *, q_ids, sample,
+                                 execute, receipt, ordered=False, vertex=None):
+    """Donated [value/ds,q,mu_X,nu_Y]; one Green/FFT scan per frequency."""
     plan, refs = rules["plan"], rules["refs"]
     times = plan["t"][sample]
     # Move the padded scalar-domain origin to the physical endpoint references.
-    coefficients = -plan["derivative" if derivative else "value"][sample] * np.exp(
+    coefficients = -np.stack((plan["value"][sample], plan["derivative"][sample])) * np.exp(
         -(refs[1]-refs[0]-plan["lo"])*times)
     n = meta.mu_basis.n_packed if vertex is None else vertex[0][0].shape[2]
     kernel, fixed = response_stream(wfns, meta, mesh_xy=mesh_xy,
-        q_ids=q_ids, n_outputs=1, pair_mode="direct", bank_carry=True,
+        q_ids=q_ids, n_outputs=2, pair_mode="direct", bank_carry=True,
         ordered=ordered, vertex=vertex, band_ranges=rules["band_ranges"])
-    raw = jax.jit(lambda: jnp.zeros((1,len(q_ids),n,n),jnp.complex128),
+    raw = jax.jit(lambda: jnp.zeros((2,len(q_ids),n,n),jnp.complex128),
         out_shardings=NamedSharding(mesh_xy,P(None,None,"x","y")))()
     weights = partial(stream_weights, parents=vertex is None)
     args = ((jnp.asarray(times.reshape(-1)), jnp.repeat(jnp.array([False, True]), times.shape[1])),
-        jnp.asarray(coefficients.reshape(1,-1)), *fixed,
+        jnp.asarray(coefficients.reshape(2,-1)), *fixed,
         weights(wfns, rules["f"], mesh_xy), weights(wfns, rules["u"], mesh_xy),
         jnp.asarray(refs), raw)
     raw = execute(kernel, args, "direct")
@@ -1068,7 +1068,7 @@ def integrate_response_field(wfns, meta, mesh_xy, rules, *, q_ids, sample,
 
 def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_io,
                         vertex=None, contact=None, print_fn=print):
-    """Stage A: consume each frequency value before producing its derivative."""
+    """Stage A: integrate value and derivative together, one frequency at a time."""
     with timing.fenced_section('bank.setup', announce=True):
         header,qids,census = _bank_context(wfns,meta,sym,bank_io,mesh_xy)
         authenticate_sample_plan(sample_plan,header)
@@ -1133,30 +1133,29 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
         ambient += (root_stage,)
     else:
         roots = bank_io["photon_v"]
-    # The sole response accumulator is all-P sharded. Dense work and slab I/O
+    # The paired response accumulator is all-P sharded. Dense work and slab I/O
     # batch the irreducible parents of one frequency, with their own admission.
     fields = (("Wc", "dWc_ds"), ("Wc_mirror", "dWc_mirror_ds"))
-    progress = LoopProgress(2*len(z), print_fn, title="response frequency integration",
-                            item_name="value/slope", max_updates=len(z)).start()
+    progress = LoopProgress(len(z), print_fn, title="response frequency integration",
+                            item_name="frequency", max_updates=len(z)).start()
     for sample, point in enumerate(z):
         if np.asarray(header["sample_written"])[:,sample].all():
-            progress.step(); progress.step()
+            progress.step()
             continue
         io_started = time.monotonic()
         with shared_pole_bank_writer(bank_io["path"], meta=meta,
                 expected_identity=bank_io["identity"], mesh_xy=mesh_xy) as (bank_handle, header, write):
             receipt["seconds"]["io"] = receipt["seconds"].get("io",0.)+time.monotonic()-io_started
+            ledger.live_stages = ambient
+            name, _ = _reserve(meta, "bank_outputs", 2*len(response_rows)*face_bytes)
+            ledger.live_stages = ambient+(name,)
+            raw = integrate_response_frequency(wfns, meta, mesh_xy, rules,
+                q_ids=response_rows, sample=sample, execute=execute,
+                receipt=receipt, ordered=ordered, vertex=vertex)
             for derivative in (False, True):
                 field_indices = [2*m+int(derivative) for m in range(2 if literal_mirrors else 1)]
                 if np.asarray(header["sample_written"])[:,sample,field_indices].all():
-                    progress.step()
                     continue
-                ledger.live_stages = ambient
-                name, _ = _reserve(meta, "bank_outputs", len(response_rows)*face_bytes)
-                ledger.live_stages = ambient+(name,)
-                raw = integrate_response_field(wfns, meta, mesh_xy, rules,
-                    q_ids=response_rows, sample=sample, derivative=derivative, execute=execute,
-                    receipt=receipt, ordered=ordered, vertex=vertex)
                 for mirror in range(2 if literal_mirrors else 1):
                     field = fields[mirror][int(derivative)]
                     pending = ~np.asarray(header["sample_written"], bool)[:,sample,2*mirror+int(derivative)]
@@ -1167,7 +1166,7 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                         span = (int(q0), int(q1))
                         selected = (mirror_qids if mirror else qids)[q0:q1]
                         rows = np.asarray([row_index[int(q)] for q in selected])
-                        chi = raw[0,rows]
+                        chi = raw[int(derivative),rows]
                         if mirror:
                             chi = jnp.conj(chi)
                         h = roots[q0:q1]
@@ -1196,9 +1195,9 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                         write(q_span=span, sample_span=(sample,sample+1), **{field: value[:,None]})
                         receipt["seconds"]["io"] = receipt["seconds"].get("io",0.)+time.monotonic()-io_started
                         del chi, value, h, constant
-                receipt["batches"].append(dict(sample=sample,derivative=derivative))
-                del raw
-                progress.step()
+            receipt["batches"].append(dict(sample=sample))
+            del raw
+            progress.step()
             io_started = time.monotonic()
         receipt["seconds"]["io"] += time.monotonic()-io_started
     progress.finish()
@@ -1208,7 +1207,7 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
     del roots
     ledger.live_stages = caller_live
     receipt["stream_passes"] = len(receipt["batches"])
-    receipt["batch_reason"] = "one frequency/field per stream; forward and backward products share the carry"
+    receipt["batch_reason"] = "one frequency per stream; value and derivative share both Green/FFT products"
     receipt["completion"] = bool(np.asarray(header["sample_written"]).all())
     return _finish_receipt(receipt,meta,header,started)
 

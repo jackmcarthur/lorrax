@@ -105,12 +105,12 @@ one-particle endpoint for SC reuse, without changing occupations or energies.
 $$ \frac{\partial F}{\partial s}=\frac1{2z(d-z)^2},\qquad
 \frac{\partial B}{\partial s}=-\frac1{2z(d+z)^2},\quad s=z^2. \tag{SP 7} $$
 
-**Dyson and storage.** A single donated `[1,q,mu_X,nu_Y]` accumulator holds one
-frequency and one field. One collective bank transaction stores both fields for
-all irreducible-q parents, draining bounded slices before publishing its masks.
-The value pass solves Dyson per parent and commits W;
-then the accumulator is released and reused for the derivative pass. Bounded
-reads recover full W, and `dW/ds = W (dchi/ds) W` uses no second solve or adjoint.
+**Dyson and storage.** A donated `[2,q,mu_X,nu_Y]` accumulator holds the value
+and derivative at one frequency. Both coefficient rows consume the same
+Green/FFT products in one scan. One collective bank transaction stores both
+fields for all irreducible-q parents, draining bounded slices before publishing
+its masks. Dyson commits W first; bounded reads recover full W for
+`dW/ds = W (dchi/ds) W`, without a second solve or adjoint.
 Charge storage is W−V; photon storage is W−W_infinity with its separate constant.
 The existing per-field write masks allow a value commit before its derivative.
 
@@ -425,7 +425,7 @@ allocation. Native allocations are excluded from the JAX high water.
 | Contact/reference buffers | `photon_static_contact` / slab read, `[1,m_X,m_Y]` | m² each | 16 m² | 16 m²/P each |
 | Two live full-spin Green functions | `response_stream` / contour kernel, `[K,s,m_X,s,m_Y]` | 2 K s² m² | 32 K s² m² | 32 K s² m²/P |
 | FFT and Green contraction temporaries | inside the compiled stream; explicit face stream signatures, interior HLO still to audit | compiler dependent | not inferred | compiled temporary bytes; external FFT workspace separate |
-| Response carry | `integrate_response_field`, `[1,q,m_X,m_Y]`; one frequency/field | q m² | 16 q m² | 16 q m²/P |
+| Response carry | `integrate_response_frequency`, `[2,q,m_X,m_Y]`; one frequency, value + ds | 2 q m² | 32 q m² | 32 q m²/P |
 | Dyson arguments/results | `response_algebra`, `[a,m_X,m_Y]`; original and mirror run sequentially | bounded a m² panels | 16 a m² each | 16 a m²/P each, plus native LU work |
 | Ordered bare moments | `exact_bare_moments`, four `[q,m_X,m_Y]` arrays | 4 q m² | 64 q m² | 64 q m²/P |
 | Sector samples and moments | sector reader; four photon sample fields and four moment fields, `[q_XY,a,mu,mu]` | sector dependent | 16 times element count | batch divided over P, padded to whole-parent rounds |

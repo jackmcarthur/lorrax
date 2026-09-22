@@ -29,23 +29,23 @@ f[:,:2] = 1.
 f[:,6:] = 0.
 refs = np.array([2.,-1.])
 t = np.array([.13+.27j, .41-.11j, 0.])
-c = np.array([[.3+.2j,-.7+.1j,0.]])
+c = np.array([[.3+.2j,-.7+.1j,0.], [-.2+.4j,.1-.3j,0.]])
 reverse = np.array([False,True,False])
 for ns in (2,4):
     bare = (rng.normal(size=(nk,ns,n,nb))+1j*rng.normal(size=(nk,ns,n,nb)))/8
     current = bare if ns == 2 else bare[:,::-1].copy()*np.array([1,1j,-1,-1j])[None,:,None,None]
     br, cr = bare.transpose(0,3,1,2), current.transpose(0,3,1,2)
-    expected=np.zeros((1,nk,n,n),complex)
+    expected=np.zeros((2,nk,n,n),complex)
     def fft(a):
         return np.fft.fftn(a.reshape((2,2,2)+a.shape[1:]),axes=(0,1,2),norm='ortho').reshape(a.shape)
     def green(psi,weight,tau,ref):
         return np.einsum('kamj,kj,kbnj->kmanb',psi,weight*np.exp(-(energy-ref)*tau),psi.conj())
-    for time,coef,rev in zip(t,c[0],reverse):
+    for time,coef,rev in zip(t,c.T,reverse):
         tau=time.conjugate() if rev else time
         upper=fft(green(current,1-f,tau,refs[1]))
         lower=fft(green(bare,f,-tau.conjugate(),refs[0]))
         product=np.einsum('kmanb,kmanb->kmn',upper,lower.conj())
-        expected[0]+=coef*fft(product.conj() if rev else product)
+        expected+=coef[:,None,None,None]*fft(product.conj() if rev else product)[None]
     # Every q is its own negative on this 2x2x2 oracle grid.
     for layout,bounds in [('face',None),('axis',None),('axis',((0,6),(2,8)))]:
         sn, sm = psi_specs(layout)
@@ -53,7 +53,7 @@ for ns in (2,4):
             put(bare,sm) if ns==2 else (put(bare,sm),put(current,sm)),
             put(br,sn) if ns==2 else (put(br,sn),put(cr,sn)),
             put(energy),put(f),put(1-f),put(refs))
-        kernel = _get_chi_fractional_contour_kernel_face(mesh,(2,2,2),1,(nk,nb,n,ns),
+        kernel = _get_chi_fractional_contour_kernel_face(mesh,(2,2,2),2,(nk,nb,n,ns),
             selected_q=tuple(range(nk)),pair_mode='direct',ordered=True,vertex=ns==4,
             bank_carry=True,layout=layout,band_ranges=bounds)
         carry=put(np.zeros_like(expected),P(None,None,'x','y'))
