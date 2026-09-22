@@ -52,8 +52,8 @@ def constructor_execution(meta, resolution, recipe, *, mesh, ledger, upstream,
     """Resolve local or whole-mesh execution once, before a constructor read.
 
     Explicit distributed service policy selects the face. Otherwise the local
-    parent route remains the fast path only when both the complete selection
-    stack and the conservative recipe pencil fit the current device budget.
+    parent route requires the complete selection stack to fit. Reduction is
+    admitted later at its measured pencil extent, before allocating that pencil.
     """
     from gw.shared_pole_capacity import ConstructorCapacity
 
@@ -98,26 +98,21 @@ def constructor_execution(meta, resolution, recipe, *, mesh, ledger, upstream,
         return row
     selection_args = dict(sample_batch=fit, selection_faces=selection_faces)
     resident_selection = resident_preview('selection', **selection_args)
-    resident_reduction = resident_preview('reduction')
-    if any(row['device_budget_status'] != 'PASS'
-           for row in (resident_selection, resident_reduction)):
+    if resident_selection['device_budget_status'] != 'PASS':
         return 'face', dict(
             reason='local resident lower bound exceeds current device budget',
             conservative_pencil_side=side,
             selection_face_count=selection_faces,
             retained_output_upper_bound_bytes_per_rank=retained_outputs,
-            local_selection=resident_selection,
-            local_reduction=resident_reduction)
+            local_selection=resident_selection)
     selection = preview('selection', **selection_args)
-    reduction = preview('reduction')
-    admitted = all(row['device_budget_status'] == 'PASS'
-                   for row in (selection, reduction))
+    admitted = selection['device_budget_status'] == 'PASS'
     return ('local' if admitted else 'face'), dict(
         reason=('capacity-admitted local parent' if admitted else
                 'local parent exceeds current device budget'),
         conservative_pencil_side=side, selection_face_count=selection_faces,
         retained_output_upper_bound_bytes_per_rank=retained_outputs,
-        local_selection=selection, local_reduction=reduction)
+        local_selection=selection, reduction_admission='actual selected pencil')
 
 
 def is_face(array):
