@@ -11,10 +11,11 @@ import jax.numpy as jnp
 import numpy as np
 from jax.sharding import NamedSharding, PartitionSpec as P
 
+from common import timing
 from common.fft_helpers import make_flat_k_ifftn
-from common.staged_reshard import face_to_batch_reshard
+from common.staged_reshard import concatenate_sharded_axis, face_to_batch_reshard
 from gw.qsgw_head import rotate_velocity_to_qp
-from runtime.padding import pad_axis
+from runtime.padding import pad_axis, padded_axis
 
 
 def interpolate_band_operator(operator_cart, source_coefficients,
@@ -27,7 +28,6 @@ def interpolate_band_operator(operator_cart, source_coefficients,
     Galerkin operators have both rank axes distributed; one P-point q batch
     is reshaped onto the composite mesh before the local band rotation.
     """
-    from bandstructure.htransform import build_R_grid_np
     nk, nb, rank = source_coefficients.shape
     if (operator_cart.ndim != 4 or operator_cart.shape[1] != nk
             or operator_cart.shape[-1] != operator_cart.shape[-2]
@@ -38,6 +38,30 @@ def interpolate_band_operator(operator_cart, source_coefficients,
     nq = len(kpath)
     if nq > path_coefficients.shape[0]:
         raise ValueError('Path coefficients do not cover the requested k path')
+    # q slices are local in a band-sharded carrier; slicing the global
+    # q-sharded result directly can all-gather the entire dense-grid table.
+    n_return = int(path_coefficients.shape[-1])
+    carrier = padded_axis(n_return, mesh, name="orbital path bands",
+                          spec=P(None, None, ('x', 'y')), axis=2).carrier
+    path_coefficients = jax.jit(
+        lambda c: pad_axis(c, carrier, axis=2).array,
+        out_shardings=NamedSharding(mesh, P(None, None, ('x', 'y'))))(
+            path_coefficients)
+    parts = []
+    for a in range(operator_cart.shape[0]):
+        with timing.fenced_section(f"orbital component {a}", announce=True):
+            part = _interpolate_component(
+                operator_cart[a:a+1], source_coefficients,
+                path_coefficients, kpath, kgrid, mesh, n_return)
+            parts.append(jax.block_until_ready(part))
+    return jnp.concatenate(parts, axis=1)
+
+
+def _interpolate_component(operator_cart, source_coefficients,
+                           path_coefficients, kpath, kgrid, mesh, n_return):
+    from bandstructure.htransform import build_R_grid_np
+    nk, nb, rank = source_coefficients.shape
+    nq = len(kpath)
     coefficients = pad_axis(
         source_coefficients, operator_cart.shape[-1], axis=1).array
     # The shared two-sided distributed contraction is U^H O U. Here
@@ -66,7 +90,7 @@ def interpolate_band_operator(operator_cart, source_coefficients,
         # constraint can make XLA replicate this rank-squared buffer.
         value = exchange(value.reshape((-1, rank, rank))).reshape(value.shape)
         value = 0.5 * (value + value.swapaxes(-1, -2).conj())
-        c = jax.lax.with_sharding_constraint(c, q_coeff)
+        c = jax.lax.with_sharding_constraint(c, q_coeff)[:, :, :n_return]
         return jnp.einsum('qmi,qamn,qnj->qaij', c.conj(), value, c,
                           optimize=True)
 
@@ -78,4 +102,4 @@ def interpolate_band_operator(operator_cart, source_coefficients,
         q = pad_axis(q, step, axis=0).array
         c = pad_axis(c, step, axis=0).array
         out.append(rotate(q, c, operator_R))
-    return jnp.concatenate(out, axis=0)
+    return concatenate_sharded_axis(out, 0, mesh, q_matrix.spec)
