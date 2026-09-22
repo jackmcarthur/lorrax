@@ -1665,7 +1665,6 @@ def _sigma_c_at_dft_diag_from_dft_cube(
     from .qsgw_utils import (
         extract_sigma_diag_replicated,
         interp_along_omega,
-        resolve_out_of_range_policy,
     )
 
     if (sigma_result.omega_grid_ev is None
@@ -1683,7 +1682,6 @@ def _sigma_c_at_dft_diag_from_dft_cube(
         diagonal_ev,
         np.asarray(sigma_result.omega_grid_ev, dtype=np.float64),
         np.asarray(sigma_result.omega_dft_rel_ev, dtype=np.float64),
-        out_of_range=resolve_out_of_range_policy(),
         context="DFT-basis Sigma_c at E_DFT after SC finalize",
         print_fn=print_fn,
     )
@@ -1922,19 +1920,12 @@ def run_fixed_sigma_evsc(
         covered, n_out, _ = omega_coverage(omega_ev, e_rel_ev)
         required_out = required_kn & ~covered
         n_required_out = int(np.count_nonzero(required_out))
-        if n_required_out:
-            bad = e_rel_ev[required_out]
-            worst = float(bad.flat[int(np.argmax(np.abs(bad)))])
-            raise ValueError(
-                "GATE eqp2_omega_coverage: fixed-Sigma eigenvalue "
-                f"self-consistency requested Sigma at {n_required_out}/"
-                f"{int(np.count_nonzero(required_kn))} protected/non-scissored "
-                "energies outside the sampled "
-                f"grid [{omega_ev[0]:+.3f}, {omega_ev[-1]:+.3f}] eV "
-                f"(worst {worst:+.3f} eV).  An endpoint clamp would not be "
-                "Sigma(E), so eqp2 is refused.  Widen "
-                "sigma_omega_min_ev / sigma_omega_max_ev or add a "
-                "sigma_omega_patches_ev patch.")
+        if n_required_out and call_index == 0:
+            # Owner rule 2026-09-22: off-grid energies evaluate Sigma(omega=0)
+            # (build_qsgw_sigma_xc); counted, not refused.
+            print_fn(
+                f"    EQP2: {n_required_out}/{int(np.count_nonzero(required_kn))} protected "
+                f"energies outside [{omega_ev[0]:+.3f}, {omega_ev[-1]:+.3f}] eV use Sigma(omega=0)")
         assert_omega_grid_covers(
             e_rel_ev / RYD_TO_EV, required_kn & covered, omega_ry,
             context=f"eqp2 map call {call_index + 1}")
@@ -2876,20 +2867,18 @@ def _classify_sc_partition(
             f"in_range={_band_ranges(partition.in_range_mask, band_offset=int(inputs.band_slices.b0))}; "
             "no band enters or leaves the set for the rest of the loop.")
     else:
-        partition = build_omega_band_partition(
-            energies_loop / RYD_TO_EV,
-            (reference_full if ks.is_identity else
-             np.asarray(ks.select(reference_full))),
-            band_offset=int(inputs.band_slices.b0),
-            omega_min_abs_ev=float(inputs.config.sigma.omega_min_ev) + mu_ev,
-            omega_max_abs_ev=float(inputs.config.sigma.omega_max_ev) + mu_ev,
-            previous_partition=(
-                None if previous_partition is None else
-                _partition_on_loop(previous_partition, inputs)),
-            mu_ev=mu_ev, current_indices_kn=indices_loop,
-            degeneracy_tol_ev=float(inputs.config.sc.exact_degeneracy_tol_ev),
-            label=f"SC map {int(iteration)} (identity, mu-anchored)",
-            print_fn=lambda line: _record_sc(inputs, line))
+        # Owner rule 2026-09-22: every band of the QP window keeps its full
+        # QSGW Sigma; an energy outside the omega grid evaluates Sigma_mn at
+        # omega = 0 (qsgw_utils.build_qsgw_sigma_xc). No band is scissored
+        # for leaving the grid, so there is nothing to classify.
+        ones = np.ones(energies_loop.shape, dtype=bool)
+        partition = BandPartition(protected_mask=jnp.asarray(ones), in_range_mask=jnp.asarray(ones))
+        _record_sc(
+            inputs,
+            f"  SC map {int(iteration)} (identity, mu-anchored) partition: all "
+            f"{energies_loop.shape[1]} QP-window identities protected; energies "
+            f"outside [{float(inputs.config.sigma.omega_min_ev):+.2f}, "
+            f"{float(inputs.config.sigma.omega_max_ev):+.2f}] eV use Sigma(omega=0).")
     if not ks.is_identity:
         partition = BandPartition(
             protected_mask=ks.broadcast(partition.protected_mask),

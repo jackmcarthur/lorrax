@@ -958,7 +958,6 @@ def write_freq_debug(
                     head_sigma_diag_w_kn_ry,
                     omega_grid_ry,
                     _eval_ry,
-                    out_of_range="clamp",
                 ) * RYD_TO_EV,
             ))
     else:

@@ -1108,12 +1108,10 @@ def _sigma_diagnostic_fields(
                 charge_head = np.broadcast_to(
                     charge_head, np.asarray(enk_dft).shape)
         if mode.is_dynamic and head_sigma_diag_w_kn_ry is not None:
-            from .qsgw_utils import (interp_along_omega,
-                                     resolve_out_of_range_policy)
+            from .qsgw_utils import interp_along_omega
             charge_corr = interp_along_omega(
                 np.asarray(head_sigma_diag_w_kn_ry),
                 np.asarray(omega_grid_ev), np.asarray(omega_dft_rel_ev),
-                out_of_range=resolve_out_of_range_policy(),
                 context="charge-head Sigma_c at E_DFT",
                 print_fn=lambda *args, **kwargs: None)
             charge_head = (charge_corr if charge_head is None

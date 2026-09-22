@@ -378,8 +378,7 @@ def _report_band_extrapolation(
         # ones through the same least squares.  The count is reported once
         # at the output path, on the same grid and the same eval energies.
         points.append(interp_along_omega(
-            diag_w_kn * RYD_TO_EV, omega_grid_ev, omega_eval_ev,
-            out_of_range="clamp"))
+            diag_w_kn * RYD_TO_EV, omega_grid_ev, omega_eval_ev))
     s_at_counts = np.stack(points)
 
     # ── WHICH ESTIMATOR ─────────────────────────────────────────────────
