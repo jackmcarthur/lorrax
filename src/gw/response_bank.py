@@ -984,32 +984,6 @@ def _tr_odd_census(receipt, samples, h, chi, dchi, value, z, q_full):
             print("TRBANK tr_odd_census " + " ".join(f"{k}={row[k]}" for k in row), flush=True)
 
 
-def _ordered_cost_probe(wfns, meta, mesh_xy, qid, tau, projections, lw, uw, refs, n_out):
-    """Warm seconds per remote Laplace node, even versus ordered kernel.
-
-    Same deck, geometry, q parent, band weights and first nodes; each kernel
-    runs once to compile and once timed. The difference is the ordered
-    per-node work (one more chi FFT, q gather and accumulation); node counts
-    come from the rule certificate. Receipt-only; nothing is written.
-    """
-    nodes = min(4, len(tau))
-    seconds = {}
-    for mode, rows in (("laplace", projections[:n_out]), ("laplace_ordered", projections)):
-        kernel, fixed = response_stream(wfns, meta, mesh_xy=mesh_xy, q_ids=(qid,),
-                                        n_outputs=n_out, pair_mode=mode)
-        args = (jnp.asarray(tau[:nodes]), jnp.asarray(rows[:, :nodes]), *fixed,
-                lw, uw, jnp.asarray(refs))
-        jax.block_until_ready(kernel(*args))
-        timing.fence('bank.ordered_cost_probe', sync_ranks=True)
-        started = time.monotonic()
-        jax.block_until_ready(kernel(*args))
-        seconds[mode] = (time.monotonic() - started)/nodes
-    return dict(q_full=qid, nodes=nodes, seconds_per_node_even=seconds["laplace"],
-                seconds_per_node_ordered=seconds["laplace_ordered"],
-                ratio=seconds["laplace_ordered"]/seconds["laplace"],
-                scope="warm rank-0 wall seconds per remote Laplace node, one q parent, after a synchronized fence")
-
-
 def response_quadrature(wfns, meta, sample_plan, receipt, *, ordered=False):
     """Plan the same windowed real-time/Laplace rules for charge or photon panels.
 
@@ -1111,9 +1085,6 @@ def integrate_response_panel(wfns, meta, mesh_xy, rules, *, q_ids, sample_span,
             # Parent selection applies to the k axis, separately for each role.
             lw = jnp.stack([weights(wfns,x,mesh_xy) for x in lw])
             uw = jnp.stack([weights(wfns,x,mesh_xy) for x in uw])
-        if ordered and vertex is None and "ordered_cost_probe" not in receipt:
-            receipt["ordered_cost_probe"] = _ordered_cost_probe(
-                wfns,meta,mesh_xy,int(qids[0]),tau,projections,lw,uw,refs,2*a)
         raw = execute(lk,(jnp.asarray(tau),jnp.asarray(projections),
             *lfixed,lw,uw,jnp.asarray(refs),raw),"laplace")
         del lw,uw
