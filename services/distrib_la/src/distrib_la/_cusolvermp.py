@@ -321,8 +321,13 @@ def distributed_eigh(
                  out_specs=(P(), P("x", "y")),
                  check_vma=False)
         def _call(local_A):
-            return jax.ffi.ffi_call(
+            values, vectors = jax.ffi.ffi_call(
                 _EIGH_TARGET, (W_local, Q_local))(local_A, **attrs)
+            # Publish one spectrum: vendor replicas can differ in roundoff,
+            # but P() promises identical values on every process.
+            source = (jax.lax.axis_index('x') == 0) & (jax.lax.axis_index('y') == 0)
+            values = jax.lax.psum(jnp.where(source, values, 0), ('x', 'y'))
+            return values, vectors
 
         # NO donate_argnums / input_output_aliases, deliberately: this
         # wrapper never donated its operand and distrib_la.plan.DONATES
