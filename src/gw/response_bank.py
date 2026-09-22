@@ -142,7 +142,7 @@ def _response_programs(mesh_xy, n, backend, route, pref, ordered, volume):
         def infinity(v, contact):
             # chi(z)=chi_param(z)-contact, so W_inf=(I+V contact)^-1 V.
             identity = jnp.broadcast_to(jnp.eye(n, dtype=v.dtype), v.shape)
-            return lu.batched(identity + mm(v, volume * contact), v.copy())
+            return lu.batched(identity + mm(v, jnp.broadcast_to(volume * contact, v.shape)), v.copy())
 
         @partial(jax.jit, in_shardings=(face, face, face), out_shardings=face)
         def value(v, chi_raw, contact):
@@ -836,41 +836,35 @@ def compute_moment_bank(wfns, meta, config, *, mesh_xy, sym, bank_io,
             else:
                 a0, a1, _ = exact_bare_moments(wfns, meta, mesh_xy=mesh_xy,
                                           q_ids=tuple(qids[q0:q1]), execute=execute)
-            for iq in range(q0,q1):
-                marked = header["moment_written"][iq]
-                if all(marked):
+            h, hi, ranks = _coulomb_batch(meta, config, bank_io, mesh_xy, (q0,q1), execute)
+            del hi
+            operands = (h,a0,a1,o0,o1) if ordered else (h,a0,a1)
+            result = execute(moments, operands + (() if vertex is None else (contact,)),
+                             "moment_dyson")
+            names = (("constant", "M0", "M1", "M2", "M3") if vertex is not None else
+                     (("M0", "M1", "M2", "M3") if ordered else ("M1", "M3")))
+            values = dict(zip(names,result))
+            if ordered:
+                for iq in range(q0,q1):
+                    part = slice(iq-q0,iq-q0+1)
+                    _record_odd_moments(iq, *(values[name][part] for name in
+                        ("M0", "M1", "M2", "M3")), receipt)
+            # One write for a fresh batch; partial restarts group identical
+            # commit masks so no already committed field is overwritten.
+            marked = np.asarray(header["moment_written"], bool)[q0:q1]
+            edges = np.r_[0, 1+np.flatnonzero(np.any(marked[1:] != marked[:-1],axis=1)), q1-q0]
+            fields = ("M1", "M3", "M0", "M2", "constant")[:marked.shape[1]]
+            for lo,hi in zip(edges[:-1],edges[1:]):
+                if marked[lo].all():
                     continue
-                span = (iq,iq+1)
-                h, hi, ranks = _coulomb_batch(meta, config, bank_io, mesh_xy, span, execute)
-                del hi
-                odd = {}
-                if ordered:
-                    part = slice(iq-q0, iq-q0+1)
-                    operands = (h,a0[part],a1[part],o0[part],o1[part])
-                    result = execute(moments, operands + (() if vertex is None else (contact,)), "moment_dyson")
-                    if vertex is not None:
-                        constant, *result = result
-                    M0, m1, M2, m3 = result
-                    _record_odd_moments(iq, M0, m1, M2, m3, receipt)
-                    # The ordered bank's moment masks are (M1, M3, M0, M2).
-                    odd = dict(M0=None if marked[2] else M0, M2=None if marked[3] else M2)
-                    if vertex is not None:
-                        odd["constant"] = None if marked[4] else constant
-                    del M0, M2
-                else:
-                    m1, m3 = execute(moments, (h,a0[iq-q0:iq-q0+1],a1[iq-q0:iq-q0+1]), "moment_dyson")
+                span = (int(q0+lo),int(q0+hi))
                 io_started = time.monotonic()
                 header = write_shared_pole_bank(bank_io["path"], q_span=span,
-                    M1=None if marked[0] else m1, M3=None if marked[1] else m3, **odd,
+                    **{name: values[name][lo:hi] for i,name in enumerate(fields) if not marked[lo,i]},
                     meta=meta, expected_identity=bank_io["identity"], mesh_xy=mesh_xy)
                 receipt["seconds"]["io"] = receipt["seconds"].get("io",0.)+time.monotonic()-io_started
-                receipt["batches"].append(dict(q_span=span,support_ranks=ranks))
-                del h,m1,m3,odd
-                if ordered:
-                    del operands,result
-                    if vertex is not None:
-                        del constant
-            del a0,a1
+                receipt["batches"].append(dict(q_span=span,support_ranks=ranks[lo:hi]))
+            del h,a0,a1,operands,result,values
             if ordered:
                 del o0,o1
             receipt["correlation_count"] += 10 if ordered else 6
