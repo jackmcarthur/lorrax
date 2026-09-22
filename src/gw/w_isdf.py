@@ -501,8 +501,8 @@ def _get_chi_fractional_contour_kernel_face(
     occupied Green uses bare carriers. Thus the same spin trace computes
     ``tr[J_A G^> J_B G^<]`` without another FFT or a second producer.
     Carriers must already be unfolded before applying current vertices.
-    Spin pairs share a fixed scan of singleton-spin FFTs. Raw-parent spin
-    rotation precedes selection; photon endpoints are already unfolded.
+    Photon spin pairs are traced in a fixed scan of singleton-spin Greens:
+    this retains all components without storing two full spin Green tensors.
     """
     from common.fft_helpers import make_flat_k_fftn
     from distrib_la import gemm_plan, panel_matmul
@@ -588,7 +588,7 @@ def _get_chi_fractional_contour_kernel_face(
     # One fixed contraction route is shared by every Gf and Gu build.
     # Face photon carriers exchange bounded band panels; axis carriers
     # already replicate bands and use the service's local contraction.
-    green_spin = ns if k_unfold_plan is not None else 1
+    green_spin = 1 if vertex else ns
     if vertex and layout == "face":
         # Four photon faces stay x/y tiled; exchange only bounded band panels
         # for the singleton-spin Green product, whose result stays x/y tiled.
@@ -645,7 +645,7 @@ def _get_chi_fractional_contour_kernel_face(
         def green_k(weight, t, ref, *, current=False, spin_pair=None):
             left = current_mun if current else bare_mun
             right = current_nmu if current else bare_nmu
-            if spin_pair is not None and k_unfold_plan is None:
+            if spin_pair is not None:
                 a, b = spin_pair // ns, spin_pair % ns
                 left = jax.lax.dynamic_slice_in_dim(left, a, 1, axis=1)
                 right = jax.lax.dynamic_slice_in_dim(right, b, 1, axis=2)
@@ -658,16 +658,11 @@ def _get_chi_fractional_contour_kernel_face(
                 g = jnp.conj(build_G_tau(left, right, enk_full, t, e_ref=ref,
                                          band_weight=weight, layout=layout,
                                          gemm=g_plan, k_unfold_plan=k_unfold_plan))
-            if spin_pair is not None and k_unfold_plan is not None:
-                # Rotate/unfold all parent spin components before selecting a
-                # child component: spatial symmetry can mix spin. FFTs see one.
-                g = jax.lax.dynamic_slice_in_dim(g, spin_pair // ns, 1, axis=1)
-                g = jax.lax.dynamic_slice_in_dim(g, spin_pair % ns, 1, axis=3)
             return jax.lax.with_sharding_constraint(g, G_shard)
 
         def spin_correlation(lower_weight, lower_time, lower_ref,
                              upper_weight, upper_time, upper_ref):
-            """Exact spin trace with one FFT component live at a time.
+            """Exact spin trace; photon components never form a full spin Green.
 
             Each (a,b) component uses the common Green and FFT owners and
             remains mu_X/nu_Y tiled on all P ranks. The fixed scan changes
@@ -679,7 +674,7 @@ def _get_chi_fractional_contour_kernel_face(
                                    current=True, spin_pair=pair))
                 return jax.lax.with_sharding_constraint(
                     jnp.einsum("Rambn,Rambn->Rmn", gu, gf.conj()), chi_R_shard)
-            if ns == 1:
+            if not vertex:
                 return component(None)
             initial = jax.lax.with_sharding_constraint(
                 jnp.zeros((nk, n_mu, n_mu), jnp.complex128), chi_R_shard)
