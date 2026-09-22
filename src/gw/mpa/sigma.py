@@ -123,15 +123,15 @@ def _shared_pole_weights(poles2, intervals, E_ref_B, t_node):
 
 
 def synthesize_shared_pole_parents(
-    b_X, b_Y, poles2, intervals, E_ref_B, t_node, *, mesh_xy, gemm,
+    b_X, b_Y, poles2, intervals, E_ref_B, t_node, *, mesh_xy, gemm, layout="face",
 ):
-    """Synthesize both raw-parent orientations through the face service.
+    """Synthesize both raw-parent orientations through the configured G service.
 
     Parameters
     ----------
     b_X, b_Y : jax.Array
         Complex128 physical factors ``[parent,mu,spin,column]`` with
-        ``P(None,'x',None,'y')`` / ``P(None,'y',None,'x')`` layouts.
+        face layouts, or replicated columns for the configured axis layout.
         The component axis is 1 for charge and 3 for current endpoints.
     poles2 : jax.Array
         Replicated float64 ``[parent,column]`` squared frequencies in Ry².
@@ -157,13 +157,19 @@ def synthesize_shared_pole_parents(
     if b_X.shape[2] not in (1, 3) or b_Y.shape[2] not in (1, 3):
         raise ValueError("GATE shared_pole_components: expected charge=1 or current=3")
     weights = _shared_pole_weights(poles2, intervals, E_ref_B, t_node)
-    plus = _shared_pole_contract(b_X, b_Y, weights, gemm=gemm)
+    plus = _shared_pole_contract(b_X, b_Y, weights, gemm=gemm, layout=layout)
     # Both faces store the same physical b. Thus (b d b†)^T = b* d b^T
     # even for complex d: transpose the all-mesh operator, never conjugate
     # its causal phase or contract the same pole columns a second time.
     transposed = jax.lax.with_sharding_constraint(
         jnp.swapaxes(plus, -1, -2), NamedSharding(mesh_xy, P(None, "x", "y")))
     return plus, transposed
+
+
+def _shared_pole_factor_specs(layout):
+    return ((P(None, "x", None, "y"), P(None, "y", None, "x"))
+            if layout == "face" else
+            (P(None, "x", None, None), P(None, "y", None, None)))
 
 
 def _shared_pole_contract(b_X, b_Y, weights, *, gemm, layout="face"):
@@ -323,7 +329,7 @@ def _shared_pole_panel_unfold(meta, header, q_span, *, mesh_xy, tables=None):
 
 def _shared_pole_routed_synthesis(
     b_X, b_Y, poles2, intervals, E_ref_B, t_node, *, meta, header, tables,
-    endpoint_budgets, realize, mesh_xy, gemm,
+    endpoint_budgets, realize, mesh_xy, gemm, layout="face",
 ):
     """Synthesize W after bounded child-factor routing, DESIGN §3.4 fallback.
 
@@ -361,9 +367,9 @@ def _shared_pole_routed_synthesis(
         children.append(child)
     weights = _shared_pole_weights(poles2, intervals, E_ref_B, t_node)
     child_weights = weights[tables["parent_rows"]]
-    plus = _shared_pole_contract(*children, child_weights, gemm=gemm)
+    plus = _shared_pole_contract(*children, child_weights, gemm=gemm, layout=layout)
     if partners:
-        transposed = _shared_pole_contract(*partners, child_weights, gemm=gemm)
+        transposed = _shared_pole_contract(*partners, child_weights, gemm=gemm, layout=layout)
         plus, _ = policy.project_fixed_q(
             plus, child_ids, transposed_partner=transposed, measure=False)
     # Conjugacy of stabilizers makes child-space averaging equivalent to
@@ -375,7 +381,7 @@ def _shared_pole_routed_synthesis(
     return realize(plus, transposed)[0]
 
 
-def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy):
+def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy, layout="face"):
     """Resolve bounded face reads → parent synthesis → complete full-q W.
 
     ``schedule`` is the capacity planner's admitted parent/column capacities
@@ -388,6 +394,15 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
     with timing.section('tau.synthesis_plan'):
         from functools import partial
         from file_io.shared_pole_store import read_shared_pole_faces
+
+        factor_specs = _shared_pole_factor_specs(layout)
+        place_factors = tuple(jax.jit(lambda a: a, out_shardings=NamedSharding(mesh_xy, spec))
+                              for spec in factor_specs)
+        def read_factors(span, column_span=None):
+            x, y, poles, counts = read_shared_pole_faces(
+                io, span, meta=meta, header=header, column_span=column_span)
+            x, y = (place(a) for place, a in zip(place_factors, (x, y)))
+            return x, y, poles, counts
 
         if schedule["status"] != "PASS":
             raise ValueError("GATE shared_pole_capacity: an admitted schedule is required")
@@ -443,7 +458,9 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
                 schedule["native_gemm_workspace_bytes_per_rank"] = native_workspace
                 # Include both asynchronous eager warm calls and their
                 # throwaway A/B/C operands before the actual factor read.
-                warm_bytes = 16*count*(2*m*width+m*m)//int(mesh_xy.size)
+                factor_bytes = (2*m*width/int(mesh_xy.size) if layout == "face" else
+                                m*width*(1/mesh_xy.shape["x"]+1/mesh_xy.shape["y"]))
+                warm_bytes = int(16*count*(factor_bytes+m*m/int(mesh_xy.size)))
                 if "capacity_receipt" in schedule:
                     # Span-qualified like its sigma.synthesis.compiled
                     # sibling below: a ledger stage is an identity, and two
@@ -454,17 +471,17 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
                         workspace_bytes_per_rank=2*warm_bytes+native_workspace,
                         concurrent_with=tuple(schedule["capacity_receipt"]["concurrent_with"]))
                 gemm = gemm_plan(mesh_xy, m=m, k=width, n=m, nq=count,
-                                 dtype=np.complex128)
+                                 dtype=np.complex128, layout=layout)
                 if local:
                     def body(b_X,b_Y,poles2,ranges,e,t):
                         plus,transposed = synthesize_shared_pole_parents(
-                            b_X,b_Y,poles2,ranges,e,t,mesh_xy=mesh_xy,gemm=gemm)
+                            b_X,b_Y,poles2,ranges,e,t,mesh_xy=mesh_xy,gemm=gemm,layout=layout)
                         return unfold(plus,transposed)
                 else:
                     body = partial(
                         _shared_pole_routed_synthesis, meta=meta, header=header,
                         tables=tables, endpoint_budgets=schedule["endpoint_budgets"],
-                        realize=realize, mesh_xy=mesh_xy, gemm=gemm)
+                        realize=realize, mesh_xy=mesh_xy, gemm=gemm, layout=layout)
                 return jax.jit(body)
 
             kernels = {}
@@ -480,8 +497,8 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
                 # factor spin axis is 1 on scalar and two-component decks.
                 shape = (hi-lo,meta.mu_basis.n_packed,1,width)
                 compiled = kernel.lower(
-                    abstract(shape,np.complex128,P(None,"x",None,"y")),
-                    abstract(shape,np.complex128,P(None,"y",None,"x")),
+                    abstract(shape,np.complex128,factor_specs[0]),
+                    abstract(shape,np.complex128,factor_specs[1]),
                     abstract((hi-lo,width),np.float64,P()),
                     abstract((hi-lo,2),np.int32,P()),
                     abstract((),np.float64,P()),abstract((),np.complex128,P())).compile()
@@ -506,7 +523,7 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
     with timing.section('tau.factor_read'):
         resident = None
         if bcap >= nq and ccap >= kmax:
-            resident = read_shared_pole_faces(io, (0, nq), meta=meta, header=header)
+            resident = read_factors((0, nq))
     shape = (int(header["n_q_full"]), meta.mu_basis.n_packed, meta.mu_basis.n_packed)
     sharding = NamedSharding(mesh_xy, P(None, "x", "y"))
     zeros = jax.jit(lambda: jnp.zeros(shape, jnp.complex128), out_shardings=sharding)
@@ -549,8 +566,8 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
                     selected = np.clip(intervals[lo:hi] - c0, 0, c1 - c0)
                     if not np.any(selected[:, 1] > selected[:, 0]):
                         continue
-                    faces = resident if resident is not None else read_shared_pole_faces(
-                        io, (lo, hi), meta=meta, header=header, column_span=(c0, c1))
+                    faces = resident if resident is not None else read_factors(
+                        (lo, hi), column_span=(c0, c1))
                     b_X, b_Y, poles2, _counts = faces
                     ranges = device_put_process_local(selected, NamedSharding(mesh_xy, P()))
                     # Preserve the admitted K tiling for the entire panel.
@@ -590,7 +607,7 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
     return build
 
 
-def _shared_pole_panel_cost(meta, header, b, c, *, mesh_xy, local):
+def _shared_pole_panel_cost(meta, header, b, c, *, mesh_xy, local, layout="face"):
     """Price actual new E buffers; the incumbent's one full W is inherited.
 
     Coordinator ruling12 separates unchanged spatial/ψ/Σ peak regression
@@ -630,13 +647,19 @@ def _shared_pole_panel_cost(meta, header, b, c, *, mesh_xy, local):
         # scratch. Extra weighted child faces and child W coexist at GEMM.
         peak = (sum(endpoint_budgets.values()) + 5*children*tile
                 + 16*children*spin*m*c/(px*py) + 64*(b+children)*c)
+    if layout == "axis":
+        axis_faces = 16*b*spin*m*c*(1/px+1/py)
+        # Retained axis factors, the reader's face carrier, and weighted
+        # GEMM operands coexist; nonlocal routes also keep their child faces.
+        peak += axis_faces + 16*(b if local else children)*spin*m*c*(1/px+1/py)
+        faces = axis_faces
     return dict(resident_bytes_per_rank=int(np.ceil(faces)),
                 workspace_bytes_per_rank=int(np.ceil(peak-faces)),
                 endpoint_budgets=endpoint_budgets,
                 routed_bytes_per_panel_per_rank=int(traffic), children=children)
 
 
-def _shared_pole_memory_schedule(meta, header, *, mesh_xy):
+def _shared_pole_memory_schedule(meta, header, *, mesh_xy, layout="face"):
     """Choose bounded panels, then admit through the canonical map ledger.
 
     Caller-bound live_stages charge other NEW shared-pole objects. Per
@@ -683,7 +706,7 @@ def _shared_pole_memory_schedule(meta, header, *, mesh_xy):
         # Byte counts are affine in the column width. Price through the
         # SAME routine used for the admitted row, including routed scratch.
         multiple = combined_divisor(px,py)
-        one = _shared_pole_panel_cost(meta,header,b,multiple,mesh_xy=mesh_xy,local=local)
+        one = _shared_pole_panel_cost(meta,header,b,multiple,mesh_xy=mesh_xy,local=local,layout=layout)
         projection_rows = b if local else one["children"]
         # The physical logical-U bound applies to every NEW projector
         # matrix, even when orbit packing pads the endpoint carrier. The
@@ -691,7 +714,7 @@ def _shared_pole_memory_schedule(meta, header, *, mesh_xy):
         projection_bytes = 16*projection_rows*meta.mu_basis.n_packed**2/(px*py)
         if projection_bytes > U:
             continue
-        two = _shared_pole_panel_cost(meta,header,b,2*multiple,mesh_xy=mesh_xy,local=local)
+        two = _shared_pole_panel_cost(meta,header,b,2*multiple,mesh_xy=mesh_xy,local=local,layout=layout)
         keys = ("resident_bytes_per_rank", "workspace_bytes_per_rank")
         p1, p2 = sum(one[k] for k in keys), sum(two[k] for k in keys)
         # price(j column multiples) = intercept + j*slope. Both ends are
@@ -710,7 +733,7 @@ def _shared_pole_memory_schedule(meta, header, *, mesh_xy):
         if best is None or candidate[:2] < best[:2]:
             best = candidate
     b,c = (1,1) if best is None else best[2:]
-    footprint = _shared_pole_panel_cost(meta,header,b,c,mesh_xy=mesh_xy,local=local)
+    footprint = _shared_pole_panel_cost(meta,header,b,c,mesh_xy=mesh_xy,local=local,layout=layout)
     projection_rows = b if local else footprint["children"]
     projection_bytes = 16*projection_rows*meta.mu_basis.n_packed**2/(px*py)
     if projection_bytes > U:
@@ -1542,7 +1565,7 @@ def compute_sigma_c_mpa_omega_grid(
         n_poles = int(ledger["n_q_irr"])
         ordered_residues = False
         with timing.section("sigma.capacity"):
-            schedule = (_shared_pole_memory_schedule(meta, ledger, mesh_xy=mesh_xy)
+            schedule = (_shared_pole_memory_schedule(meta, ledger, mesh_xy=mesh_xy, layout=wfns.layout)
                         if sector_context is None else sector_context["schedule"](ledger))
         print_fn(f"  shared-pole Sigma capacity: {schedule}")
     else:
@@ -1704,7 +1727,7 @@ def compute_sigma_c_mpa_omega_grid(
                 _band_fence('tau.synthesis_setup', sync_ranks=True)
                 with timing.section('tau.synthesis_setup'):
                     synthesis = (_shared_pole_w_synthesis(
-                        reader, meta, ledger, frequencies, schedule, mesh_xy=mesh_xy)
+                        reader, meta, ledger, frequencies, schedule, mesh_xy=mesh_xy, layout=wfns.layout)
                         if sector_context is None else sector_context["synthesis"](
                             reader, ledger, frequencies, schedule))
                 total = _integrate_sigma_batches(

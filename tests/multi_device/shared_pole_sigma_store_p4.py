@@ -63,11 +63,11 @@ def main(runtime):
     oracle = put(expected, P(None, 'x', 'y'))
     results = []
     with SlabIO(path, mode='r', mesh=mesh) as io:
-        for b, c in ((3, 5), (1, 2), (2, 3), (3, 1)):
+        for layout, b, c in (("face", 3, 5), ("axis", 3, 5), ("axis", 1, 2), ("axis", 2, 3), ("axis", 3, 1)):
             schedule = dict(status="PASS", parent_capacity=b, column_capacity=c)
             build = _shared_pole_w_synthesis(
                 io, meta, header, frequencies,
-                schedule, mesh_xy=mesh)
+                schedule, mesh_xy=mesh, layout=layout)
             got = build(None, None, indices, bounds, phase, e, t)
             error = float(jax.numpy.max(jax.numpy.abs(got-oracle)))
             assert error < 1e-10, (b, c, error)
@@ -79,7 +79,7 @@ def main(runtime):
             again = build(None, None, indices, bounds, phase, e, t)
             repeat = float(jax.numpy.max(jax.numpy.abs(again-oracle)))
             assert repeat < 1e-10
-            results.append(dict(parent_capacity=b, column_capacity=c,
+            results.append(dict(layout=layout, parent_capacity=b, column_capacity=c,
                                 dense_error=error, restored_window_error=repeat,
                                 q_pair_rewired=policy.n_pair_rewired))
             del build, got, zero, again

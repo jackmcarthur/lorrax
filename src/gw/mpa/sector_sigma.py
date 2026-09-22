@@ -151,7 +151,7 @@ def sector_synthesis(readers, headers, bases, families, frequencies, meta, mesh_
     from distrib_la import gemm_plan
     from file_io.shared_pole_store import read_shared_pole_faces
     from symmetry_maps import q_negation_index
-    from .sigma import _shared_pole_weights, _shared_pole_contract
+    from .sigma import _shared_pole_weights, _shared_pole_contract, _shared_pole_factor_specs
     from .sigma_windows import shared_pole_intervals
 
     left,right=headers
@@ -188,8 +188,7 @@ def sector_synthesis(readers, headers, bases, families, frequencies, meta, mesh_
         routes.append(route);costs.append(cost)
     # A face input is required by the established symmetry route. After it
     # completes, keep only the configured GEMM input layout across all tau.
-    factor_spec=(P(None,'x',None,'y'),P(None,'y',None,'x')) if layout=='face' else (
-                 P(None,'x',None,None),P(None,'y',None,None))
+    factor_spec=_shared_pole_factor_specs(layout)
     def place(value,spec):
         return jax.jit(lambda x:x,out_shardings=NamedSharding(mesh_xy,spec))(value)
     px,py=int(mesh_xy.shape['x']),int(mesh_xy.shape['y'])

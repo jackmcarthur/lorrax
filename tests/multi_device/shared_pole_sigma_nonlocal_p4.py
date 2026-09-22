@@ -41,7 +41,7 @@ def main(rt):
     assert np.array_equal(_shared_pole_fixed_q_policy(header).unfold_sym_idx,ops)
     assert not plan['certificates']['x']['is_local'] and not plan['certificates']['y']['is_local']
     b,c=1,2
-    cost=_shared_pole_panel_cost(meta,header,b,c,mesh_xy=mesh,local=False)
+    cost=_shared_pole_panel_cost(meta,header,b,c,mesh_xy=mesh,local=False,layout="axis")
     forced=dict(status='PASS',parent_capacity=b,column_capacity=c,endpoint_budgets=cost['endpoint_budgets'])
     omega=np.sqrt(poles);selected=(omega>1)&(omega<=4)&(np.arange(4)[None,:]<counts[:,None])
     weights=np.where(selected,np.exp(-1j*(omega-.6)*(.7+.2j))/(2*omega),0)
@@ -52,7 +52,7 @@ def main(rt):
           put(np.tile([1,4,-np.inf,-np.inf,np.inf,np.inf],(3,1)),P()),
           put(np.ones(3),P()),put(np.asarray(.6),P()),put(np.asarray(.7+.2j),P()))
     with SlabIO(path,mode='r',mesh=mesh) as io:
-        build=_shared_pole_w_synthesis(io,meta,header,shared_pole_frequencies(poles,counts),forced,mesh_xy=mesh)
+        build=_shared_pole_w_synthesis(io,meta,header,shared_pole_frequencies(poles,counts),forced,mesh_xy=mesh,layout="axis")
         got=build(*args)
         error=float(jax.numpy.max(jax.numpy.abs(got-put(expected,P(None,'x','y')))))
         assert error<1e-10,error

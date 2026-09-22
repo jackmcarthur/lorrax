@@ -326,6 +326,12 @@ authenticated header (`file_io.shared_pole_store`):
 $$ W_{c,+}(q,\tau) = b\,\mathrm{diag}\big(d_j(\tau)\big)\,b^{\dagger}, \qquad
 d_j(\tau) = \frac{e^{-i(\Omega_j - E_{\rm ref})\tau}}{2\Omega_j} . \tag{SP 15} $$
 
+Charge and CC/CT/TT synthesis use the existing Green-function GEMM with the
+wavefunction layout: `low_mem_bands=true` keeps pole columns face-sharded;
+`false` retains axis factors with replicated columns. Admission prices those
+configured factors before reading them; the synthesized W always uses both
+mesh axes. A resident factor set is read and placed once per Sigma call.
+
 **Hole routing.** Conduction windows take `W₊(q)`. An ordered store routes valence windows to the particle–hole
 partner,
 
