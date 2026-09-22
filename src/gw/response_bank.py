@@ -973,7 +973,7 @@ def _tr_odd_census(receipt, solve_value, h, chi, value, z, q_full):
 
 
 def response_quadrature(wfns, meta, sample_plan, receipt, *, ordered=False):
-    """Plan small frequency-specific sums on one host; broadcast only scalars."""
+    """Plan independent frequency sums across hosts; broadcast only scalars."""
     import minimax
     from jax.experimental import multihost_utils
     z = bank_points(sample_plan)
@@ -991,30 +991,37 @@ def response_quadrature(wfns, meta, sample_plan, receipt, *, ordered=False):
     else:
         pad = 4./RYD_TO_EV if session is not None else 0.
         plan = dict(lo=lo-pad, hi=hi+pad, z=z, metallic=metallic,
-            t=np.zeros((len(z), 2, 128), complex),
-            value=np.zeros((len(z), 2, 128), complex),
-            derivative=np.zeros((len(z), 2, 128), complex),
+            t=np.zeros((len(z), 2, minimax.RESPONSE_RULE_CAPACITY), complex),
+            value=np.zeros((len(z), 2, minimax.RESPONSE_RULE_CAPACITY), complex),
+            derivative=np.zeros((len(z), 2, minimax.RESPONSE_RULE_CAPACITY), complex),
             sampled_error=np.zeros((len(z), 2, 2)), counts=np.zeros((len(z), 2), np.int64))
         progress = LoopProgress(len(z), print, title="response rule construction",
                                 item_name="frequency", max_updates=len(z)).start()
-        for i, point in enumerate(z):
+        rank, workers = jax.process_index(), jax.process_count()
+        for start in range(0, len(z), workers):
+            assigned = start + rank
             status = np.zeros(1024, np.uint8)
-            if jax.process_index() == 0:
+            rule = None
+            if assigned < len(z):
                 try:
-                    rule = minimax.response_frequency_rule(plan["lo"], plan["hi"], point,
+                    rule = minimax.response_frequency_rule(
+                        plan["lo"], plan["hi"], z[assigned],
                         rel_tol=sample_plan["bank_rule_tolerance"],
-                        previous=None if old is None else old["t"][i])
-                    for key in ("t", "value", "derivative", "sampled_error", "counts"):
-                        plan[key][i] = rule[key]
+                        previous=None if old is None else old["t"][assigned])
                 except Exception as error:
                     message = str(error).encode()[:1023]
                     status[:len(message)] = np.frombuffer(message, dtype=np.uint8)
-            status = np.asarray(multihost_utils.broadcast_one_to_all(status))
-            if status.any():
-                raise ValueError(bytes(status).rstrip(b"\0").decode(errors="replace"))
-            for key in ("t", "value", "derivative", "sampled_error", "counts"):
-                plan[key][i] = np.asarray(multihost_utils.broadcast_one_to_all(plan[key][i]))
-            progress.step()
+            for i in range(start, min(start + workers, len(z))):
+                owner = i == assigned
+                error = np.asarray(multihost_utils.broadcast_one_to_all(
+                    status, is_source=owner))
+                if error.any():
+                    raise ValueError(bytes(error).rstrip(b"\0").decode(errors="replace"))
+                for key in ("t", "value", "derivative", "sampled_error", "counts"):
+                    payload = rule[key] if owner else plan[key][i]
+                    plan[key][i] = np.asarray(multihost_utils.broadcast_one_to_all(
+                        payload, is_source=owner))
+                progress.step()
         progress.finish()
         if session is not None:
             session["frequency"] = plan
@@ -1047,7 +1054,7 @@ def integrate_response_field(wfns, meta, mesh_xy, rules, *, q_ids, sample,
     raw = jax.jit(lambda: jnp.zeros((1,len(q_ids),n,n),jnp.complex128),
         out_shardings=NamedSharding(mesh_xy,P(None,None,"x","y")))()
     weights = partial(stream_weights, parents=vertex is None)
-    args = ((jnp.asarray(times.reshape(-1)), jnp.repeat(jnp.array([False, True]), 128)),
+    args = ((jnp.asarray(times.reshape(-1)), jnp.repeat(jnp.array([False, True]), times.shape[1])),
         jnp.asarray(coefficients.reshape(1,-1)), *fixed,
         weights(wfns, rules["f"], mesh_xy), weights(wfns, rules["u"], mesh_xy),
         jnp.asarray(refs), raw)

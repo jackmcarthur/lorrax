@@ -7,6 +7,8 @@ certificate is claimed. Energies are Ry, times Ry^-1, slopes are d/d(z^2).
 import numpy as np
 from scipy import linalg as la
 
+RESPONSE_RULE_CAPACITY = 192
+
 
 def _project(lo, hi, pole, times):
     eta = abs(pole.imag)
@@ -37,8 +39,13 @@ def _primitive(lo, hi, pole, tol, previous=None):
         t, c, error = _primitive(lo, hi, pole.conjugate(), tol,
                                  None if previous is None else previous.conj())
         return t.conj(), c.conj(), error
-    eta, size = pole.imag, 800
+    eta = pole.imag
     span, zp = (hi-lo)/eta, (pole-lo)/eta
+    geometry = max(span, 8*max(zp.real, 0.))
+    # Resolve the reciprocal and its square before taking the shift pencil:
+    # principal-log modes stop at pi/step; their tails decay as t*exp(-t).
+    horizon = -np.log(tol) + np.log(-np.log(tol)) + 6.
+    size = max(800, int(np.ceil((geometry + 16.)*horizon/(2*np.pi))))
     best = [float("inf"), None]
     def accept(t):
         fit = _project(lo, hi, pole, t)
@@ -54,11 +61,11 @@ def _primitive(lo, hi, pole, tol, previous=None):
     for padding, flatten in ((0., 1.), (2., .9), (4., .9), (8., 1.), (10., 1.), (16., .9)):
         # A short interval ending near the resonance gives growing modes.
         # Extend only the proposal geometry; fit/check the physical interval.
-        step = (max(span, 8*max(zp.real, 0.))+padding)/(2*size)
+        step = (geometry+padding)/(2*size)
         center = -padding+(ids[:, None]+ids[None, :])*step-zp
         u, s, vh = la.svd(1/center, full_matrices=False, check_finite=False)
-        shift = u[:, :128].conj().T@(1/(center+step))@vh[:128].conj().T
-        for n in range(8, 129, 4):
+        shift = u[:, :RESPONSE_RULE_CAPACITY].conj().T@(1/(center+step))@vh[:RESPONSE_RULE_CAPACITY].conj().T
+        for n in range(8, RESPONSE_RULE_CAPACITY + 1, 4):
             roots = la.eigvals(shift[:n, :n]/np.sqrt(s[:n, None]*s[None, :n]),
                               check_finite=False)
             with np.errstate(divide='ignore', invalid='ignore'):
@@ -74,13 +81,13 @@ def _primitive(lo, hi, pole, tol, previous=None):
 def response_frequency_rule(lo_ry, hi_ry, z_ry, *, rel_tol=1e-8, previous=None):
     """Return independent forward/backward nodes and value/ds coefficients.
 
-    Arrays have fixed capacity [2,128]; zero coefficient entries do no spatial
+    Arrays have fixed capacity [2,RESPONSE_RULE_CAPACITY]; zero coefficient entries do no spatial
     work. Each exponential is exp[-(d-lo_ry)*t]. Bounds are sampled, not proven.
     """
     lo, hi, z = float(lo_ry), float(hi_ry), complex(z_ry)
     if not np.isfinite([lo, hi, z.real, z.imag, rel_tol]).all() or hi <= lo or z.imag <= 0 or not 1e-13 <= rel_tol < .1:
         raise ValueError('invalid response frequency/domain/tolerance')
-    times = np.zeros((2, 128), complex)
+    times = np.zeros((2, RESPONSE_RULE_CAPACITY), complex)
     value, derivative = np.zeros_like(times), np.zeros_like(times)
     errors, counts = [], []
     for i, pole in enumerate((z, -z)):
