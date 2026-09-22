@@ -43,7 +43,7 @@ def test_hermite_current_points(height, top, imag, delta_max):
 def test_remote_current_points(lo, hi, z_ev):
     z = np.asarray(z_ev)/RY_EV
     rule = minimax.response_laplace_rule(lo/RY_EV, hi/RY_EV, z)
-    assert np.all(rule['t'] > 0) and np.all(rule['h'] >= 0)
+    assert np.all(rule['t'] > 0) and np.isrealobj(rule['t'])
     cert = rule['certificate']
     assert cert['status'] == 'PASS'
     delta = np.geomspace(lo/RY_EV, hi/RY_EV, 3007)
@@ -106,7 +106,8 @@ def test_fixed_remote_nodes_update_current_projection(ordered):
     current = z + np.array([.04j, .03, -.05])/RY_EV
     reused = minimax.response_laplace_rule(44/RY_EV, 92/RY_EV, current, previous=rule, ordered=ordered)
     assert reused['reuse_status'] == 'hit'
-    np.testing.assert_array_equal(rule['h'], reused['h'])
+    np.testing.assert_array_equal(rule['t'], reused['t'])
+    assert rule['node_digest'] == reused['node_digest']
     delta = np.geomspace(44/RY_EV, 92/RY_EV, 503)
     basis = np.exp(-(delta[:, None]-reused['reference_ry'])*reused['t'])
     truth = delta[:, None]/(delta[:, None]**2-current[None, :]**2)
@@ -143,3 +144,35 @@ def test_ordered_remote_rows_carry_the_odd_kernel():
                                1/(2*zz)/(d*d-zz*zz)+zz/(d*d-zz*zz)**2, rtol=1e-7)
     # Red twin: the even rows do not represent the odd kernel.
     assert np.max(np.abs(basis@rule["projection_value"].T-odd)/np.abs(odd)) > 1e-2
+
+
+def test_ritz_laguerre_limit_and_units():
+    from minimax.laplace_ritz import place_times
+    expected, _ = np.polynomial.laguerre.laggauss(8)
+    np.testing.assert_allclose(place_times(2., 2., 0., 8), expected/2, rtol=1e-12)
+    z = np.array([1j, -5+1j, 8+1j, 34j])
+    ev = minimax.response_laplace_rule(35., 90., z, ordered=True)
+    ry = minimax.response_laplace_rule(35/RY_EV, 90/RY_EV, z/RY_EV, ordered=True)
+    np.testing.assert_allclose(ry['t'], ev['t']*RY_EV, rtol=1e-11)
+    d = np.linspace(35., 90., 107)
+    be = np.exp(-(d[:, None]-ev['reference_ry'])*ev['t'])
+    br = np.exp(-(d[:, None]/RY_EV-ry['reference_ry'])*ry['t'])
+    for key, factor in [('projection_value', RY_EV),
+                        ('projection_derivative', RY_EV**3),
+                        ('odd_projection_value', RY_EV),
+                        ('odd_projection_derivative', RY_EV**3)]:
+        np.testing.assert_allclose(br@ry[key].T, factor*be@ev[key].T, rtol=1e-8)
+    corrupted = dict(ev, t=ev['t']*1.01)
+    with pytest.raises(ValueError, match='digest mismatch'):
+        minimax.response_laplace_rule(35., 90., z, previous=corrupted, ordered=True)
+
+
+def test_remote_derivative_certificate_detects_wrong_rows():
+    from minimax.laplace_ritz import _certificate
+    z = np.array([.4+.2j, 3j])
+    r = minimax.response_laplace_rule(2., 6., z)
+    shift = np.exp(r['reference_ry']*r['t']-2*r['t'])
+    bad = np.concatenate([r['projection_value'], np.zeros_like(r['projection_derivative'])]).T*shift[:, None]
+    cert = _certificate(r['t'], bad, 2., 6., z, 1e-8, False)
+    assert cert['status'] == 'FAIL'
+    assert min(cert['derivative_bound']) > .99

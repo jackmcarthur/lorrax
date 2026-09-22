@@ -102,10 +102,12 @@ products use Laplace time. The remote diagonal products have zero active occupat
 weight. Thus every active transition has one owner, and imaginary-axis support height
 does not force deep states into the crossing window. Exact moments remain untruncated.
 
-**Remote Laplace cells.** For `d > |Re(z)|`, the existing stream integrates
-`exp(-d*t) cosh(z*t)` and `exp(-d*t) sinh(z*t)` directly on shared positive nodes
+**Remote Laplace cells.** For `d > |Re(z)|`, the exact even/odd kernels are the
+integrals of `exp(-d*t) cosh(z*t)` and `exp(-d*t) sinh(z*t)`
 (`minimax.response_laplace_rule`; certificate contract in [minimax](../services/minimax.md#response-rule-currencies-and-certificates)).
-No Taylor expansion in `z²` is required. The even kernel `d/(d² − z²)` weights
+The scalar coefficients approximate these rational kernels directly on prescribed
+positive real times; the stream need not resolve the hyperbolic integral weights
+([construction](../theory/response-laplace.md)). No Taylor expansion in `z²` is required. The even kernel `d/(d² − z²)` weights
 `forward − reverse`; the odd kernel `z/(d² − z²)` weights `forward + reverse`:
 
 $$ \chi^0_{\rm even} \leftarrow \sum_a \rho^{\rm even}_a(z)\,(F - B)(t_a),\qquad

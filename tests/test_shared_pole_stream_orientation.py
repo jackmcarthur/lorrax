@@ -55,12 +55,12 @@ def stream(monkeypatch):
         return sum(weight[k, n] * phase(e[k, n]) * np.outer(psi[k, n], psi[k, n].conj())
                    for k in range(nk) for n in range(nb) if weight[k, n])
 
-    def kernel(pair_mode, **options):
+    def kernel(pair_mode, *, n_out=len(TIMES), **options):
         return w_isdf._get_chi_fractional_contour_kernel_face(
-            mesh, (lat.n1, lat.n2, 1), len(TIMES), (nk, nb, lat.ns, 1),
+            mesh, (lat.n1, lat.n2, 1), n_out, (nk, nb, lat.ns, 1),
             selected_q=tuple(range(nk)), pair_mode=pair_mode, **options)
 
-    return SimpleNamespace(lat=lat, e=e, f=f, u=1.0 - f, put=put, g=g_supercell, kernel=kernel,
+    return SimpleNamespace(lat=lat, e=e, psi=psi, f=f, u=1.0 - f, put=put, g=g_supercell, kernel=kernel,
                            psi_mun=put(cell.transpose(0, 2, 1)[:, None, :, :]),
                            psi_nmu=put(cell[:, :, None, :]))
 
@@ -106,3 +106,44 @@ def test_ordered_laplace_rows_are_the_physical_orientation(stream):
     assert _resid(got[:, :n_t], _stack(s.lat, even, sign=-1))[0] >= 1e-3
     assert _resid(got[:, n_t:], _stack(s.lat, odd), scale)[0] <= 1e-10
     assert _resid(got[:, n_t:], _stack(s.lat, odd, transpose=True), scale)[0] >= 1e-3
+
+
+def test_compact_rule_through_ordered_stream_matches_exact_denominators(stream):
+    import minimax
+    s = stream
+    # Choose occupied/empty windows with a positive global gap in this lattice.
+    ef, eu = s.e[s.f != 0], s.e[s.u != 0]
+    refs = np.array([ef.max(), eu.min()])
+    gap = refs[1]-refs[0]
+    assert gap > 0
+    z = gap*np.array([.2+.1j, 1.7j])
+    rule = minimax.response_laplace_rule(gap, eu.max()-ef.min(), z, ordered=True,
+                                        reference_ry=gap)
+    rows = -np.concatenate([rule[k] for k in (
+        'projection_value', 'projection_derivative',
+        'odd_projection_value', 'odd_projection_derivative')])
+    lower = np.stack([s.f, np.zeros_like(s.f)]).astype(complex)
+    upper = np.stack([s.u, np.zeros_like(s.u)]).astype(complex)
+    got = np.asarray(s.kernel('laplace_ordered', n_out=2*len(z))(
+        s.put(rule['t']), s.put(rows), s.psi_mun, s.psi_nmu,
+        s.put(s.e), s.put(lower), s.put(upper), s.put(refs)))
+    matrices = np.zeros((2*len(z), s.psi.shape[-1], s.psi.shape[-1]), complex)
+    for i in zip(*np.nonzero(s.f)):
+        for a in zip(*np.nonzero(s.u)):
+            d = s.e[a]-s.e[i]
+            density = s.psi[a]*s.psi[i].conj()
+            forward = np.outer(density, density.conj())
+            matrices[:len(z)] += (forward/(z-d)[:, None, None]
+                                    - forward.conj()/(z+d)[:, None, None])
+            matrices[len(z):] += (-forward/(2*z*(z-d)**2)[:, None, None]
+                                    + forward.conj()/(2*z*(z+d)**2)[:, None, None])
+    exact = _stack(s.lat, matrices)
+    # Each orthonormal Green FFT is sqrt(nk) times the normalized supercell
+    # Green; their product and the final orthonormal FFT leave sqrt(nk).
+    np.testing.assert_allclose(got, np.sqrt(s.lat.nk)*exact, rtol=1e-7, atol=1e-9)
+    wrong = rows.copy()
+    wrong[2*len(z):] = 0
+    even_only = np.asarray(s.kernel('laplace_ordered', n_out=2*len(z))(
+        s.put(rule['t']), s.put(wrong), s.psi_mun, s.psi_nmu,
+        s.put(s.e), s.put(lower), s.put(upper), s.put(refs)))
+    assert np.max(abs(even_only-got)) > 1e-3

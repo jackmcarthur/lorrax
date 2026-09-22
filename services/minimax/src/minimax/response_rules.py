@@ -1,7 +1,7 @@
 """Scalar response-bank quadratures; Ry frequencies and d/ds, s=z**2.
 
-Real-time and noncrossing Laplace rules share Gaussian ellipse bounds and
-analytic derivative/tail control. No GW implementation is imported.
+Real-time Gaussian panels and compact noncrossing exponential sums certify
+current-frequency values and analytic ds targets separately. No GW implementation is imported.
 """
 from functools import lru_cache
 import hashlib
@@ -197,58 +197,19 @@ def response_bank_rule(z_ry, delta_max_ry, *, rel_tol=1e-8,
                 reuse_reason=reason)
 
 
-def _remote_scaled_bounds(z, lo, hi, value, time_value, ordered):
-    """Propagate bounds for 1/(delta +/- z) and its squared reciprocal."""
-    v = value.reshape(2, -1).sum(axis=0)/2
-    d = time_value.reshape(2, -1).sum(axis=0)/(4*np.abs(z))
-    ends = np.asarray([lo, hi])[:, None]
-    denom = ends**2 + np.abs(z)**2
-    bounds = [v/np.min(ends/denom, axis=0),
-              d/np.min(ends/denom**2, axis=0)]
-    if ordered:
-        # Certify K=1/(delta^2-z^2) and dK/ds separately: d(z*K)/ds
-        # can vanish on the imaginary axis, so relative error there is undefined.
-        bounds += [v/np.abs(z)*(hi*hi+np.abs(z)**2),
-                   (d/np.abs(z)+v/(2*np.abs(z)**3))*(hi*hi+np.abs(z)**2)**2]
-    return np.asarray(bounds)
-
-
-def _remote_bounds(z, lo, hi, edges, orders, ordered, *, tail=True):
-    """Continuum relative bounds, enclosing each decay scale separately.
-
-    These scalar geometric cells share ONE time rule/Green stream. Keeping
-    their envelopes and response scales together avoids charging a fast
-    high-energy decay the error of the slowest low-energy decay.
-    """
-    reach = float(np.abs(z.real).max())
-    count = max(1, math.ceil(math.log2((hi-reach)/(lo-reach))))
-    delta = reach+np.geomspace(lo-reach, hi-reach, count+1)
-    points = 1j*(delta[:-1, None, None]+np.array([-1, 1])[None, :, None]*z)
-    span = np.broadcast_to(np.diff(delta)[:, None, None], points.shape)
-    rate = points.imag
-    stop = edges[-1]
-    value = np.exp(-rate*stop)/rate if tail else np.zeros_like(rate)
-    time_value = value*(stop+1/rate)
-    for left, right, n in zip(edges[:-1], edges[1:], orders):
-        v, d = _panel_bounds(n, left, right, points.ravel(), span.ravel())
-        value += v.reshape(points.shape)
-        time_value += (d*np.abs(points.ravel())).reshape(points.shape)
-    return np.max([_remote_scaled_bounds(z, a, b, v, d, ordered)
-                   for a, b, v, d in zip(delta[:-1], delta[1:], value, time_value)], axis=0)
-
-
 def response_laplace_rule(delta_lo_ry, delta_hi_ry, z_ry, *, rel_tol=1e-8,
                           previous=None, domain_pad_ry=0.0, ordered=False,
                           reference_ry=None):
-    """Direct positive-time quadrature of the noncrossing response.
+    """Compact noncrossing response rule on positive real time nodes.
 
-    For delta > |Re(z)|, integrate exp(-delta*t) cosh(z*t) (even) and
-    exp(-delta*t) sinh(z*t) (odd), with analytic d/ds, s=z**2. Projections
-    include exp(-reference_ry*t); the consumer supplies exp(-(delta-ref)*t).
-    The default reference is delta_lo, keeping both exponential branches
-    bounded. Panel/tail certificates use the same Gaussian owner as the
-    real-time rule; no Taylor expansion or fitted inverse-moment rows.
+    Elliptic decay scales and a time-moment Ritz solve prescribe the nodes;
+    linear projection fits exact value and ds targets on those same nodes.
+    A continuum residual certificate covers the rounded returned arrays.
+    Projections include exp(-reference_ry*t); the consumer supplies the
+    remaining exp(-(delta-reference_ry)*t). See docs/theory/response-laplace.md.
     """
+    from .laplace_ritz import place_times, project_response
+
     z = _inputs(z_ry, rel_tol)
     lo, hi = float(delta_lo_ry), float(delta_hi_ry)
     if not np.isfinite(lo+hi) or not 0 < lo <= hi:
@@ -262,70 +223,32 @@ def response_laplace_rule(delta_lo_ry, delta_hi_ry, z_ry, *, rel_tol=1e-8,
     if not np.isfinite(ref) or not reach < ref <= lo:
         raise ValueError('remote reference must lie above |Re(z)| and at or below delta_lo')
     reason = "initial rule"
-    reused = False
     if previous is not None:
         if _node_digest(previous) != previous.get("node_digest"):
             raise ValueError("response rule node digest mismatch")
-        cert = previous["certificate"]
-        low, high = cert["delta_ry"]
-        reason = "domain or current frequency certificate changed"
-        if (cert["rel_tol"] == rel_tol and low <= lo <= hi <= high
-                and low > reach):
-            bounds = _remote_bounds(z, low, high, cert["panel_edges"],
-                                    cert["orders"], ordered)
-            if bounds.max() <= rel_tol:
-                lo, hi = low, high
-                t, h = previous["t"], previous["h"]
-                edges, orders = cert["panel_edges"], cert["orders"]
-                reused, reason = True, "current domain and frequency certificates pass"
-    if not reused:
-        padded_lo = max(lo-domain_pad_ry, lo/2)
-        if padded_lo > reach:
-            lo = padded_lo
-        hi += domain_pad_ry
-        rate = lo-reach
-        stop = _tail_x(rel_tol)/rate
-        while _remote_bounds(z, lo, hi, [stop], [], ordered).max() > rel_tol/8:
-            stop *= 2
-        edges = [0.]
-        edge = 1/(hi+float(np.abs(z).max()))
-        while edge < stop:
-            edges.append(edge)
-            edge *= 2
-        edges.append(stop)
-        nodes, weights, orders = [], [], []
-        for left, right in zip(edges[:-1], edges[1:]):
-            for n in range(2, 257):
-                bound = _remote_bounds(z, lo, hi, [left, right], [n], ordered, tail=False)
-                if bound.max() <= rel_tol/(4*(len(edges)-1)):
-                    break
-            else:
-                raise RuntimeError('remote Gaussian order budget exceeded')
-            x, w = _legendre(n)
-            nodes.append(left+(right-left)*(x+1)/2)
-            weights.append((right-left)*w/2)
-            orders.append(n)
-        t, h = np.concatenate(nodes), np.concatenate(weights)
-        bounds = _remote_bounds(z, lo, hi, edges, orders, ordered)
-    if bounds.max() > rel_tol:
-        raise RuntimeError('remote Gaussian certificate failed')
-    plus = np.exp(-(ref-z[:, None])*t)
-    minus = np.exp(-(ref+z[:, None])*t)
-    even, odd = h*(plus+minus)/2, h*(plus-minus)/2
-    result = dict(t=t, h=h, reference_ry=ref, projection_value=even,
-                  projection_derivative=odd*t/(2*z[:, None]),
-                  certificate=dict(status='PASS', scope='continuum delta interval; all supplied z',
-                      norm='relative even value and ds; relative odd K and dK/ds',
-                      delta_ry=[lo, hi], z_ry=[[v.real, v.imag] for v in z],
-                      rel_tol=rel_tol, value_bound=bounds[0].tolist(),
-                      derivative_bound=bounds[1].tolist(),
-                      panel_edges=list(edges), orders=list(orders), ordered=ordered,
-                      owner='direct Laplace / shared Gaussian ellipse bounds'))
-    if ordered:
-        result.update(odd_projection_value=odd,
-                      odd_projection_derivative=even*t/(2*z[:, None]))
-        result['certificate'].update(odd_value_bound=bounds[2].tolist(),
-                                     odd_derivative_bound=bounds[3].tolist())
-    return dict(result, node_digest=_node_digest(result),
-                reuse_status='hit' if reused else ('build' if previous is None else 'rebuild'),
-                reuse_reason=reason)
+        low, high = previous['certificate']['delta_ry']
+        reason = "transition interval escaped"
+        if reach < low <= lo <= hi <= high:
+            result = project_response(previous['t'], low, high, z, ref, rel_tol, ordered)
+            reason = "current frequency certificate failed"
+            if result['certificate']['status'] == 'PASS':
+                return dict(result, node_digest=_node_digest(result), reuse_status='hit',
+                            reuse_reason="current domain and frequency certificates pass")
+    padded_lo = max(lo-domain_pad_ry, lo/2)
+    if padded_lo > reach:
+        lo = padded_lo
+    hi += domain_pad_ry
+    # Work-saving starting degree only; acceptance always uses the certificate.
+    ratio = (hi+reach)/(lo-reach)
+    first = min(64, max(4, math.ceil(math.log(16*ratio)*math.log(1/rel_tol)/math.pi**2)))
+    best = math.inf
+    for degree in range(first, 65):
+        t = place_times(lo, hi, reach, degree)
+        result = project_response(t, lo, hi, z, ref, rel_tol, ordered)
+        cert = result['certificate']
+        best = min(best, cert['maximum_bound'])
+        if cert['status'] == 'PASS':
+            return dict(result, node_digest=_node_digest(result),
+                        reuse_status='build' if previous is None else 'rebuild', reuse_reason=reason)
+    raise RuntimeError(f'remote Ritz certificate failed through 64 nodes: '
+                       f'best bound {best:.3e}, tolerance {rel_tol:.3e}')

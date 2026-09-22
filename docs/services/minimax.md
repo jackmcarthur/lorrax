@@ -121,7 +121,7 @@ csc correction, whose complete certificate has not been derived. The
 comparison and its exact source pin are in the sandbox report
 `reports/analytic_quadrature_2026-09-16/report.md`.
 
-`import minimax` remains NumPy-only. Calling the positive or sine constructor
+`import minimax` remains NumPy-only. Calling the response Laplace, positive or sine constructor
 loads optional SciPy, and positive construction also needs mpmath (the `solve`
 extra). The positive and sine rules remain exploratory, not catalog entries; the catalog's
 provenance and production selection promises remain unchanged.
@@ -139,16 +139,17 @@ while solver-generation tests may require it.
 domain_pad_ry=0)` returns positive real-time nodes and weights, value and
 s-derivative projections, a node digest, and continuum panel/tail bounds.
 `response_laplace_rule(delta_lo_ry, delta_hi_ry, z_ry, ...)` returns positive
-Laplace nodes and weights with direct even/odd projections and continuum
-Gaussian panel/tail bounds. Both accept the previous in-memory result.
+Laplace nodes with even/odd value and derivative projections, certified by
+continuum polynomial-denominator residual bounds. Both accept the previous in-memory result.
 A hit retains its integration arrays exactly and regenerates projections for
 all supplied frequencies. The bank norm is eta-scaled absolute value/derivative
 error; the remote norm is relative error. Neither certifies W or Sigma accuracy.
 
 `domain_pad_ry` enlarges a newly built transition domain. Remote lower padding
 stops at positivity and cannot cross `delta_lo > max|Re(z)|`. Reuse
-requires current-domain containment, the same tolerance, an intact node digest
-and passing current-frequency bounds. Otherwise the owner builds a new rule;
+requires current-domain containment, an intact node digest and passing
+current-frequency bounds at the requested tolerance (the real-time rule also
+requires an unchanged tolerance). Otherwise the owner builds a new rule;
 corrupt integration arrays refuse. Receipts report `reuse_status`,
 `reuse_reason`, `node_digest` and the actual certified domain. No wavefunctions,
 response matrices, physical samples or W models live in this session.
@@ -161,17 +162,16 @@ Frequencies and transition intervals are in Ry, times in inverse Ry, derivatives
   row `h e^{izt}·it/(2z)`. The currency is peak-scaled absolute error (`η·|value|`, `η³·|derivative|`,
   `η = min Im z`); the certificate bounds the full signed transition interval and both exponential branches,
   tail and panel budgets included. It does not certify relative W or Σ accuracy.
-- `response_laplace_rule` (remote cells): positive `(t,h)` for the direct Laplace identities
-  `delta/(delta²-z²) = integral exp(-delta*t) cosh(z*t) dt` and
-  `z/(delta²-z²) = integral exp(-delta*t) sinh(z*t) dt`, valid when `delta > |Re(z)|`.
-  Their `s` derivatives multiply the opposite hyperbolic function by `t/(2z)`.
-  Projections include `exp(-reference_ry*t)`, evaluated as bounded exponential branches;
-  the consumer supplies `exp(-(delta-reference_ry)*t)`. The reference defaults to the
-  current lower transition bound. The certificate bounds relative even value/derivative
-  errors and, for ordered responses, relative errors in `K=1/(delta²-z²)` and `dK/ds`;
-  relative error in `d(z*K)/ds` is undefined at its zeros. Geometric transition enclosures
-  share one time rule, bounding fast decays at their own energy scale. Both ordered and
-  even rules can reuse fixed nodes after the same current-domain/frequency check.
+- `response_laplace_rule` (remote cells): geometry-only elliptic decay rates, a small
+  Lyapunov solve and a symmetric time-moment eigensolve prescribe positive real nodes.
+  Linear projection fits exact even value/ds and ordered K/dsK targets on those same
+  nodes. Projections already include `exp(-reference_ry*t)`; the consumer supplies
+  `exp(-(delta-reference_ry)*t)`. A continuum polynomial/exponential residual bound
+  certifies the rounded returned arrays, including the squared-denominator derivative
+  targets and primitive orientation sums. Degree increases until that certificate passes;
+  no nonlinear optimizer, precomputed nodes, or universal node-count guarantee is used.
+  Both ordered and even rules reuse fixed nodes after current-domain/frequency checks.
+  [Derivation and accuracy scope](../theory/response-laplace.md).
 
 Neither rule sees band masks, occupations or response arrays. `tests/test_response_rules.py` checks analytic
 kernels, the missing `1/(2z)` derivative red twin, positivity and refusals.
