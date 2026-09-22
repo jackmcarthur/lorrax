@@ -14,6 +14,7 @@ import time
 
 import jax
 from common import timing
+from common.progress import LoopProgress
 from common.units import RYD_TO_EV
 import jax.numpy as jnp
 import numpy as np
@@ -585,7 +586,7 @@ def _bank_execution(meta, mesh_xy, receipt, config, *, photon=False):
                 aliases=memory.alias_size_in_bytes,
                 inherited_stream=False,
                 stream_temporaries_admitted=stream))
-        with timing.fenced_section('bank.execute.' + stage, announce=True,
+        with timing.fenced_section('bank.execute.' + stage, announce=stream,
                                   label=f"shared-pole bank {stage} execute"):
             started = time.monotonic()
             result = executable(*args)
@@ -994,6 +995,8 @@ def response_quadrature(wfns, meta, sample_plan, receipt, *, ordered=False):
             value=np.zeros((len(z), 2, 128), complex),
             derivative=np.zeros((len(z), 2, 128), complex),
             sampled_error=np.zeros((len(z), 2, 2)), counts=np.zeros((len(z), 2), np.int64))
+        progress = LoopProgress(len(z), print, title="response rule construction",
+                                item_name="frequency", max_updates=len(z)).start()
         for i, point in enumerate(z):
             status = np.zeros(1024, np.uint8)
             if jax.process_index() == 0:
@@ -1011,6 +1014,8 @@ def response_quadrature(wfns, meta, sample_plan, receipt, *, ordered=False):
                 raise ValueError(bytes(status).rstrip(b"\0").decode(errors="replace"))
             for key in ("t", "value", "derivative", "sampled_error", "counts"):
                 plan[key][i] = np.asarray(multihost_utils.broadcast_one_to_all(plan[key][i]))
+            progress.step()
+        progress.finish()
         if session is not None:
             session["frequency"] = plan
     receipt["rule_provider"] = "minimax frequency-specific complex times; sampled accuracy"
@@ -1019,10 +1024,10 @@ def response_quadrature(wfns, meta, sample_plan, receipt, *, ordered=False):
         reused=reuse)
     receipt["nodes"] = int(plan["counts"].sum())
     if jax.process_index() == 0:
-        print("  Response rules: z(eV)       forward backward  sampled value/ds error; "
+        print("Response quadrature: z(eV)   forward backward  sampled value/ds error; "
               + ("reused" if reuse else "constructed"), flush=True)
         for point, counts, errors in zip(z, plan["counts"], plan["sampled_error"]):
-            print(f"    {point*RYD_TO_EV:20.8g} {counts[0]:4d} {counts[1]:4d}  "
+            print(f"Response quadrature: {point*RYD_TO_EV:20.8g} {counts[0]:4d} {counts[1]:4d}  "
                   f"{errors[:,0].max():.2e} {errors[:,1].max():.2e}", flush=True)
     return dict(plan=plan, f=f, u=u, refs=refs)
 
@@ -1055,7 +1060,6 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                         vertex=None, contact=None):
     """Stage A: consume each frequency value before producing its derivative."""
     with timing.fenced_section('bank.setup'):
-        from file_io.shared_pole_store import write_shared_pole_bank
         header,qids,census = _bank_context(wfns,meta,sym,bank_io,mesh_xy)
         authenticate_sample_plan(sample_plan,header)
         z = bank_points(sample_plan)
@@ -1099,8 +1103,7 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
         execute = _bank_execution(meta, mesh_xy, receipt, config, photon=vertex is not None)
         ledger = meta.shared_pole_capacity
         ambient = ledger.live_stages
-    from file_io.shared_pole_store import read_shared_pole_bank
-    from file_io.slab_io import SlabIO
+    from file_io.shared_pole_store import read_shared_pole_bank, shared_pole_bank_writer
     with timing.fenced_section('bank.window_geometry', announce=True,
                               label="shared-pole frequency rule construction"):
         solve_value, solve_slope, _, receipt["algebra"] = response_algebra(meta,config,
@@ -1112,64 +1115,75 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
     # The sole response accumulator is all-P sharded. Dense work and slab I/O
     # remain bounded to one parent and one frequency, with their own admission.
     fields = (("Wc", "dWc_ds"), ("Wc_mirror", "dWc_mirror_ds"))
+    progress = LoopProgress(2*len(z), print, title="response frequency integration",
+                            item_name="value/slope", max_updates=len(z)).start()
     for sample, point in enumerate(z):
-        for derivative in (False, True):
-            field_indices = [2*m+int(derivative) for m in range(2 if literal_mirrors else 1)]
-            if np.asarray(header["sample_written"])[:,sample,field_indices].all():
-                continue
-            ledger.live_stages = ambient
-            name, _ = _reserve(meta, "bank_outputs", len(response_rows)*face_bytes)
-            ledger.live_stages = ambient+(name,)
-            raw = integrate_response_field(wfns, meta, mesh_xy, rules,
-                q_ids=response_rows, sample=sample, derivative=derivative, execute=execute,
-                receipt=receipt, ordered=ordered, vertex=vertex)
-            for iq in range(len(qids)):
-                marked = header["sample_written"][iq][sample]
-                if all(marked[i] for i in field_indices):
+        if np.asarray(header["sample_written"])[:,sample].all():
+            progress.step(); progress.step()
+            continue
+        io_started = time.monotonic()
+        with shared_pole_bank_writer(bank_io["path"], meta=meta,
+                expected_identity=bank_io["identity"], mesh_xy=mesh_xy) as (bank_handle, header, write):
+            receipt["seconds"]["io"] = receipt["seconds"].get("io",0.)+time.monotonic()-io_started
+            for derivative in (False, True):
+                field_indices = [2*m+int(derivative) for m in range(2 if literal_mirrors else 1)]
+                if np.asarray(header["sample_written"])[:,sample,field_indices].all():
+                    progress.step()
                     continue
-                span = (iq, iq+1)
-                h, hinv, ranks = _coulomb_batch(meta,config,bank_io,mesh_xy,span,execute)
-                del hinv
-                constant = 0.
-                if vertex is not None:
-                    with SlabIO(bank_io["path"], mode="r", mesh=mesh_xy) as io:
-                        constant = read_shared_pole_bank(io, span, meta=meta, header=header,
-                                                       fields=("constant",))["constant"]
-                for mirror in range(2 if literal_mirrors else 1):
-                    if marked[2*mirror+int(derivative)]:
+                ledger.live_stages = ambient
+                name, _ = _reserve(meta, "bank_outputs", len(response_rows)*face_bytes)
+                ledger.live_stages = ambient+(name,)
+                raw = integrate_response_field(wfns, meta, mesh_xy, rules,
+                    q_ids=response_rows, sample=sample, derivative=derivative, execute=execute,
+                    receipt=receipt, ordered=ordered, vertex=vertex)
+                for iq in range(len(qids)):
+                    marked = header["sample_written"][iq][sample]
+                    if all(marked[i] for i in field_indices):
                         continue
-                    row = row_index[int(mirror_qids[iq] if mirror else qids[iq])]
-                    chi = raw[:,row]
-                    if mirror:
-                        chi = jnp.conj(chi)
-                    field = fields[mirror][int(derivative)]
-                    if derivative:
-                        with SlabIO(bank_io["path"], mode="r", mesh=mesh_xy) as io:
-                            saved = read_shared_pole_bank(io, span, meta=meta, header=header,
+                    span = (iq, iq+1)
+                    h, hinv, ranks = _coulomb_batch(meta,config,bank_io,mesh_xy,span,execute)
+                    del hinv
+                    constant = 0.
+                    if vertex is not None:
+                        constant = read_shared_pole_bank(bank_handle, span, meta=meta, header=header,
+                                                        fields=("constant",))["constant"]
+                    for mirror in range(2 if literal_mirrors else 1):
+                        if marked[2*mirror+int(derivative)]:
+                            continue
+                        row = row_index[int(mirror_qids[iq] if mirror else qids[iq])]
+                        chi = raw[:,row]
+                        if mirror:
+                            chi = jnp.conj(chi)
+                        field = fields[mirror][int(derivative)]
+                        if derivative:
+                            saved = read_shared_pole_bank(bank_handle, span, meta=meta, header=header,
                                 sample_span=(sample,sample+1), fields=(fields[mirror][0],))
-                        w = saved[fields[mirror][0]][0] + constant
-                        value = execute(solve_slope, (h, w, chi), "sample_slope")
-                        del saved, w
-                    else:
-                        value = execute(solve_value, (h,chi)+(() if vertex is None else (contact,)),
-                                        "sample_dyson") - constant
-                        if vertex is not None and not mirror:
-                            _photon_sample_norms(receipt,value,iq,sample,bank_io["photon_layout"],mesh_xy)
-                        elif vertex is None:
-                            _reciprocity_census(receipt,value,z[sample:sample+1],int(qids[iq]),iq,meta)
-                            if ordered and _self_negative(int(qids[iq]),meta):
-                                _tr_odd_census(receipt,solve_value,h,chi,value,z[sample:sample+1],int(qids[iq]))
-                    io_started = time.monotonic()
-                    header = write_shared_pole_bank(bank_io["path"], q_span=span,
-                        sample_span=(sample,sample+1), **{field: value[None]}, meta=meta,
-                        expected_identity=bank_io["identity"], mesh_xy=mesh_xy)
-                    receipt["seconds"]["io"] = receipt["seconds"].get("io",0.)+time.monotonic()-io_started
-                    del chi, value
-                del h, constant
-            receipt["batches"].append(dict(sample=sample,derivative=derivative))
-            del raw
-        if jax.process_index() == 0:
-            print(f"  Response frequency {sample+1}/{len(z)} committed: z={point*RYD_TO_EV:.8g} eV", flush=True)
+                            w = saved[fields[mirror][0]][0] + constant
+                            value = execute(solve_slope, (h, w, chi), "sample_slope")
+                            del saved, w
+                        else:
+                            value = execute(solve_value, (h,chi)+(() if vertex is None else (contact,)),
+                                            "sample_dyson") - constant
+                            if vertex is not None and not mirror:
+                                _photon_sample_norms(receipt,value,iq,sample,bank_io["photon_layout"],mesh_xy)
+                            elif vertex is None:
+                                _reciprocity_census(receipt,value,z[sample:sample+1],int(qids[iq]),iq,meta)
+                                if ordered and _self_negative(int(qids[iq]),meta):
+                                    _tr_odd_census(receipt,solve_value,h,chi,value,z[sample:sample+1],int(qids[iq]))
+                        io_started = time.monotonic()
+                        write(q_span=span, sample_span=(sample,sample+1), **{field: value[None]})
+                        receipt["seconds"]["io"] = receipt["seconds"].get("io",0.)+time.monotonic()-io_started
+                        del chi, value
+                    del h, constant
+                receipt["batches"].append(dict(sample=sample,derivative=derivative))
+                del raw
+                progress.step()
+            io_started = time.monotonic()
+        receipt["seconds"]["io"] += time.monotonic()-io_started
+    progress.finish()
+    if jax.process_index() == 0:
+        print("Response quadrature: seconds " + " ".join(
+            f"{key}={value:.3f}" for key, value in receipt["seconds"].items()), flush=True)
     ledger.live_stages = ambient
     receipt["stream_passes"] = len(receipt["batches"])
     receipt["batch_reason"] = "one frequency/field per stream; forward and backward products share the carry"

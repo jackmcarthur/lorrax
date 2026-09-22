@@ -141,7 +141,7 @@ returns `[2,128]` complex times and coefficients for the independent
 `1/(d-z)` and `1/(d+z)` primitives. Zero coefficients mark inactive slots.
 A Hankel shift pencil proposes nodes; scaled linear least squares fits both
 reciprocals and their squares on the same nodes. Non-growing finite modes,
-sampled value/ds error and coefficient mass are checked. This interface does
+sampled value/ds error and finite coefficients are checked. This interface does
 **not** claim continuum certification or a W/Sigma error bound.
 The bank plans on one host, broadcasts small arrays, and reuses them while
 frequencies and the padded transition interval remain valid. It retains no

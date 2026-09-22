@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 from functools import lru_cache
+from contextlib import contextmanager
 import json
 from pathlib import Path
 
@@ -1261,25 +1262,38 @@ def write_shared_pole_bank(path, *, q_span, sample_span=None, Wc=None,
     go through ``meta.mu_basis``; no off-axis Hermitization or rescaling.
     Already committed fields refuse overwrite, including in partial files.
     """
-    header = validate_shared_pole_bank(
-        path, expected_identity=expected_identity, mesh_xy=mesh_xy)
+    with shared_pole_bank_writer(path, meta=meta, expected_identity=expected_identity,
+                                 mesh_xy=mesh_xy) as (_, header, write):
+        if not (np.asarray(header["sample_written"], dtype=bool).all()
+                and np.asarray(header["moment_written"], dtype=bool).all()
+                and all(value is None for value in (Wc, dWc_ds, Wc_mirror, dWc_mirror_ds, M1, M3, M0, M2, constant))):
+            write(q_span=q_span, sample_span=sample_span, Wc=Wc, dWc_ds=dWc_ds,
+                  Wc_mirror=Wc_mirror, dWc_mirror_ds=dWc_mirror_ds,
+                  M1=M1, M3=M3, M0=M0, M2=M2, constant=constant)
+    return header
+
+
+@contextmanager
+def shared_pole_bank_writer(path, *, meta, expected_identity, mesh_xy):
+    """One collective transaction for bounded slices of one frequency.
+
+    Yield the existing read handle, authenticated header and slice writer.
+    Every slice drains before releasing its staging array. Masks publish only
+    after a successful transaction; final completion still follows close.
+    """
+    header = validate_shared_pole_bank(path, expected_identity=expected_identity, mesh_xy=mesh_xy)
     _check_basis(meta, header)
     if mesh_xy is not meta.mu_basis.mesh_xy:
         _refuse("writer mesh differs from packed basis mesh")
     if header.get("complete"):
         _refuse("completed scratch bank is immutable")
-    if not (np.asarray(header["sample_written"], dtype=bool).all()
-            and np.asarray(header["moment_written"], dtype=bool).all()
-            and all(value is None for value in (Wc, dWc_ds, Wc_mirror, dWc_mirror_ds, M1, M3, M0, M2, constant))):
-        prepared = _prepare_bank_write(header, q_span=q_span,
-            sample_span=sample_span, meta=meta, mesh_xy=mesh_xy,
-            Wc=Wc, dWc_ds=dWc_ds, Wc_mirror=Wc_mirror,
-            dWc_mirror_ds=dWc_mirror_ds, M1=M1, M3=M3, M0=M0, M2=M2, constant=constant)
-        with SlabIO(path, mode="a", mesh=mesh_xy) as io:
+    with SlabIO(path, mode="a", mesh=mesh_xy) as io:
+        def write(**fields):
+            prepared = _prepare_bank_write(header, meta=meta, mesh_xy=mesh_xy, **fields)
             _write_bank_payload(io, header, meta, prepared)
-            _write_bank_masks(io, header)
+        yield io, header, write
+        _write_bank_masks(io, header)
     _complete_bank(path, header)
-    return header
 
 
 def _write_bank_masks(io, header):
@@ -1301,7 +1315,7 @@ def _complete_bank(path, header):
 def _prepare_bank_write(header, *, q_span, meta, mesh_xy,
                         sample_span=None, Wc=None, dWc_ds=None,
                         Wc_mirror=None, dWc_mirror_ds=None, M1=None, M3=None, M0=None, M2=None, constant=None):
-    """Validate/admit a packed span before opening or mutating a bank."""
+    """Validate/admit a packed span before mutating a bank."""
     _check_basis(meta, header)
     if mesh_xy is not meta.mu_basis.mesh_xy:
         _refuse("writer mesh differs from packed basis mesh")

@@ -106,7 +106,9 @@ $$ \frac{\partial F}{\partial s}=\frac1{2z(d-z)^2},\qquad
 \frac{\partial B}{\partial s}=-\frac1{2z(d+z)^2},\quad s=z^2. \tag{SP 7} $$
 
 **Dyson and storage.** A single donated `[1,q,mu_X,nu_Y]` accumulator holds one
-frequency and one field. The value pass solves Dyson per parent and commits W;
+frequency and one field. One collective bank transaction stores both fields for
+all irreducible-q parents, draining bounded slices before publishing its masks.
+The value pass solves Dyson per parent and commits W;
 then the accumulator is released and reused for the derivative pass. Bounded
 reads recover full W, and `dW/ds = W (dchi/ds) W` uses no second solve or adjoint.
 Charge storage is W−V; photon storage is W−W_infinity with its separate constant.
