@@ -1037,7 +1037,8 @@ def response_quadrature(wfns, meta, sample_plan, receipt, *, ordered=False, prin
         # Enclose every parent's exact weight support. Fixed bounds share one
         # batched GEMM and remain safe when a complex-time phase underflows.
         band_ranges = tuple((int(lo.min()), int(hi.max())) for lo, hi in zip(lo_band, hi_band))
-        print_fn(f"Response occupied/empty band intervals: {band_ranges} of {f.shape[-1]}")
+        if jax.process_index() == 0:
+            print_fn(f"Response occupied/empty band intervals: {band_ranges} of {f.shape[-1]}")
     return dict(plan=plan, f=f, u=u, refs=refs, band_ranges=band_ranges)
 
 
