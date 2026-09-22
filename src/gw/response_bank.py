@@ -1333,10 +1333,20 @@ def compute_photon_bank(wfns, wfns_transverse, meta, config, *, mesh_xy, sym,
     bank["photon_v"] = photon_bare_operator(wfns, wfns_transverse, meta,
         path=bank["bispinor_v_q_path"], mu_bases=mu_bases, layout=layout, mesh_xy=mesh_xy)
     from .gw_config import uses_direct_bispinor_shared_pole_head
+    direct_gamma = None
     if uses_direct_bispinor_shared_pole_head(config):
         from .photon_direct_head import subtract_bare_tt_from_bank
+        if photon_g0_vectors is None or len(photon_g0_vectors) != 4:
+            raise ValueError("GATE photon_direct_gamma_vectors: expected four authenticated G=0 vectors")
+        # V tiles cross from orbit-packed centroids into PhotonBasisLayout's
+        # canonical family carriers above. Make the same basis conversion for
+        # their G=0 vectors at this bank boundary, using its shared owner.
+        direct_gamma = tuple(
+            basis.unpack_axis(vector, -1)
+            for basis, vector in zip((mu_bases[0],) + (mu_bases[1],) * 3,
+                                     photon_g0_vectors))
         bank["photon_v"] = subtract_bare_tt_from_bank(
-            bank["photon_v"], photon_g0_vectors,
+            bank["photon_v"], direct_gamma,
             layout=layout, mesh=mesh_xy, wfn=wfn, meta=meta)
     receipt["seconds"]["endpoints_and_V"] = time.monotonic()-before
     before = time.monotonic()
@@ -1395,11 +1405,11 @@ def compute_photon_bank(wfns, wfns_transverse, meta, config, *, mesh_xy, sym,
                 velocity, photon_head_rotation, mesh=mesh_xy)
         direct_head = build_direct_photon_head(
             velocity, wfns, occupation_state, contact_packed=contact,
-            photon_g0_vectors=photon_g0_vectors, layout=layout,
+            photon_g0_vectors=direct_gamma, layout=layout,
             mesh=mesh_xy, meta=meta, wfn=wfn,
             frequencies_ry=bank_points(sample_plan), print_fn=print_fn)
         direct_head["gamma_vectors"] = packed_gamma_vectors(
-            photon_g0_vectors, layout, mesh_xy)
+            direct_gamma, layout, mesh_xy)
         receipt["direct_gamma"] = dict(
             approximation="first_order_dipole_current_fd",
             sectors="CC_CT_TC_TT", local_fields=False,
