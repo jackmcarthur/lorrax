@@ -86,7 +86,7 @@ def test_plan_packs_raw_parent_faces_and_unfolds_their_operator():
     psi_mun = jnp.asarray(plan.layout.axis.pack_host(psi_mun_np, axis=2))
     with mesh:
         parent_op = jnp.einsum(
-            'ksmn,kntv->ksmtv', psi_mun, jnp.conj(psi_nmu),
+            'ksmn,kntv->kmsvt', psi_mun, jnp.conj(psi_nmu),
             optimize=True)
         full_op = plan.unfold_operator(parent_op)
 
@@ -95,8 +95,8 @@ def test_plan_packs_raw_parent_faces_and_unfolds_their_operator():
     for child, (parent_row, sym_row) in enumerate(
             zip(plan.irr_idx, plan.sym_idx)):
         perm = plan.sym_perm[int(sym_row)]
-        transported = np.take(parent[int(parent_row)], perm, axis=1)
-        expected[child] = np.take(transported, perm, axis=3)
+        transported = np.take(parent[int(parent_row)], perm, axis=0)
+        expected[child] = np.take(transported, perm, axis=2)
     np.testing.assert_allclose(np.asarray(full_op), expected, rtol=2e-13,
                                atol=2e-13)
 
@@ -110,9 +110,9 @@ def test_square_antiunitary_operator_uses_itself_as_transpose_partner():
         sym, np.asarray([[0, 0, 0], [1, 0, 0], [0, 1, 0], [1, 1, 0]]),
         (2, 2, 1), mesh, nspinor=2)
     rng = np.random.default_rng(20260906)
-    shape = (plan.n_parent, 2, plan.n_centroid_packed, 2, plan.n_centroid_packed)
+    shape = (plan.n_parent, plan.n_centroid_packed, 2, plan.n_centroid_packed, 2)
     op = jax.device_put(rng.normal(size=shape) + 1j * rng.normal(size=shape),
-                       NamedSharding(mesh, P(None, None, 'x', None, 'y')))
+                       NamedSharding(mesh, P(None, 'x', None, 'y', None)))
     with mesh:
         actual = plan.unfold_operator(op)
         expected = plan.unfold_operator(
@@ -329,8 +329,8 @@ def test_symmetry_kernel_caches_do_not_capture_outer_jit_tracers():
                                   [0.5, 0.0, 0.0]]))
     n_pk = plan.n_centroid_packed
     operand = jax.device_put(
-        jnp.ones((2, 1, n_pk, 1, n_pk), dtype=jnp.complex128),
-        NamedSharding(mesh, P(None, None, 'x', None, 'y')))
+        jnp.ones((2, n_pk, 1, n_pk, 1), dtype=jnp.complex128),
+        NamedSharding(mesh, P(None, 'x', None, 'y', None)))
 
     # The first outer jit creates the service cache.  The second consumes the
     # cached inner executable from a distinct trace; a captured tracer used to
@@ -338,8 +338,8 @@ def test_symmetry_kernel_caches_do_not_capture_outer_jit_tracers():
     packed = jax.jit(plan.unfold_operator)(operand)
     packed2 = jax.jit(lambda o: plan.unfold_operator(o) * 2.0)(operand)
     jax.block_until_ready((packed, packed2))
-    assert packed.shape == (3, 1, n_pk, 1, n_pk)
-    assert packed2.shape == (3, 1, n_pk, 1, n_pk)
+    assert packed.shape == (3, n_pk, 1, n_pk, 1)
+    assert packed2.shape == (3, n_pk, 1, n_pk, 1)
 
 
 def test_sigma_spatial_cache_owns_plan_and_selects_each_plans_parent_rows(monkeypatch):
@@ -394,10 +394,13 @@ def test_sigma_spatial_cache_owns_plan_and_selects_each_plans_parent_rows(monkey
 
     second = factory(bundle([1, 2]))
     assert second is not kernel
+    # A Green-shaped stand-in (nk, mu, s, nu, s'): the conv owner re-lays
+    # its operand into the handler's order before the stubbed convolution.
+    rows = jnp.asarray([10., 20., 30.]).reshape(3, 1, 1, 1, 1)
     np.testing.assert_array_equal(np.asarray(kernel.conv_project(
-        None, None, jnp.asarray([10., 20., 30.]), None)), [10., 30.])
+        None, None, rows, None))[:, 0, 0, 0, 0], [10., 30.])
     np.testing.assert_array_equal(np.asarray(second.conv_project(
-        None, None, jnp.asarray([10., 20., 30.]), None)), [20., 30.])
+        None, None, rows, None))[:, 0, 0, 0, 0], [20., 30.])
 
 
 def test_four_spinor_face_vertex_follows_unfold_without_collectives():

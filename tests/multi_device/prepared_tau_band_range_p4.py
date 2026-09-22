@@ -113,7 +113,7 @@ def run_gate(mesh):
         float(np.max(np.abs(np.asarray(shard.data)), initial=0.0))
         for shard in dynamic.addressable_shards)
     assert error <= 2.0e-13 * max(scale, 1.0), (error, scale)
-    assert prepared.sharding.spec == P(None, None, "x", None, "y")
+    assert prepared.sharding.spec == P(None, "x", None, "y", None)
 
     return {
         "schema": "lorrax.prepared_tau_band_range.p4.v1",

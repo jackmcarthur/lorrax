@@ -1178,18 +1178,22 @@ def _get_unfold_isdf_operator_jit(
 
 
 def _rotate_open_spin_centroid_operator(spatial, spin):
-    """Apply the typed spin action with two local contractions over resident spin axes."""
+    """Apply the typed spin action with two local contractions over resident spin axes.
+
+    ``spatial`` is centroid-major ``(k, mu, s, nu, s')``: the spin axes are
+    2 and 4, each minor to its centroid axis, exactly as the GEMM merges them.
+    """
     U = jnp.asarray(spin)
-    ns = int(spatial.shape[1])
-    if spatial.shape[3] != ns or U.shape[1:] != (ns, ns):
+    ns = int(spatial.shape[2])
+    if spatial.shape[4] != ns or U.shape[1:] != (ns, ns):
         raise ValueError("Operator spin axes and typed spin action disagree.")
-    left = jnp.stack([sum(U[:, a, c, None, None, None] * spatial[:, c]
+    left = jnp.stack([sum(U[:, a, c, None, None, None] * spatial[:, :, c]
                          for c in range(ns) if np.any(spin[:, a, c] != 0))
-                      for a in range(ns)], axis=1)
-    return jnp.stack([sum(left[:, :, :, d, :] *
+                      for a in range(ns)], axis=2)
+    return jnp.stack([sum(left[..., d] *
                          jnp.conj(U[:, b, d])[:, None, None, None]
                          for d in range(ns) if np.any(spin[:, b, d] != 0))
-                      for b in range(ns)], axis=3)
+                      for b in range(ns)], axis=4)
 
 
 def unfold_spin_centroid_operator(
@@ -1211,13 +1215,16 @@ def unfold_spin_centroid_operator(
 ):
     r"""Unfold an open-spin centroid operator from k parents to full k.
 
-    ``operator_ibz`` has shape ``(nk_parent,s,mu,s,nu)`` and sharding
-    ``P(None,None,'x',None,'y')``.  The two endpoint pairs are merged in
-    centroid-major order, transported by :func:`unfold_isdf_operator`, then
-    rotated by the canonical spin representation::
+    ``operator_ibz`` has shape ``(nk_parent,mu,s,nu,s)`` and sharding
+    ``P(None,'x',None,'y',None)``: centroid-major, the order a GEMM over the
+    merged endpoint ``mu*ns + s`` produces.  Each endpoint pair merges into
+    :func:`unfold_isdf_operator`'s ``(nk, mu*ns, nu*ns)`` by a reshape, the
+    transported operator splits back by a reshape, and the result is returned
+    in the same order -- no layout copy on either side of the transport --
+    then rotated by the canonical spin representation::
 
-        O_k[a,mu,b,nu] = U_k[a,c]
-            O_parent[c,alpha(mu),d,alpha(nu)] U_k[b,d]^* .
+        O_k[mu,a,nu,b] = U_k[a,c]
+            O_parent[alpha(mu),c,alpha(nu),d] U_k[b,d]^* .
 
     On an antiunitary row the parent operator is transposed in the complete
     ``(spin,centroid)`` endpoint space, not merely conjugated.  This matters
@@ -1236,11 +1243,11 @@ def unfold_spin_centroid_operator(
     collective-free local-gather kernel.
     """
     shape = tuple(int(v) for v in operator_ibz.shape)
-    if len(shape) != 5 or shape[1] != shape[3]:
+    if len(shape) != 5 or shape[2] != shape[4]:
         raise ValueError(
             "unfold_spin_centroid_operator: operator_ibz must have shape "
-            f"(nk,s,mu,s,nu); got {shape}.")
-    nk_parent, ns, n_left, _, n_right = shape
+            f"(nk,mu,s,nu,s); got {shape}.")
+    nk_parent, n_left, ns, n_right, _ = shape
     spin = np.asarray(spin_action_full, dtype=np.complex128)
     n_full = int(np.asarray(irr_idx).shape[0])
     if spin.shape != (n_full, ns, ns):
@@ -1280,11 +1287,11 @@ def unfold_spin_centroid_operator(
             f"inside (0,{n_left}]; got {logical_mu}.")
 
     flat_sh = NamedSharding(mesh_xy, P(None, 'x', 'y'))
-    out_sh = NamedSharding(mesh_xy, P(None, None, 'x', None, 'y'))
+    out_sh = NamedSharding(mesh_xy, P(None, 'x', None, 'y', None))
+    # Centroid-major storage makes the merged endpoint ``mu*ns + s`` a pure
+    # reshape of the operator: no layout copy on either side of the transport.
     flat = jax.lax.with_sharding_constraint(
-        jnp.transpose(operator_ibz, (0, 2, 1, 4, 3)).reshape(
-            nk_parent, n_left * ns, n_right * ns),
-        flat_sh)
+        operator_ibz.reshape(nk_parent, n_left * ns, n_right * ns), flat_sh)
     local_perm = None
     if bool(axis_local):
         px = int(mesh_xy.shape['x'])
@@ -1304,9 +1311,7 @@ def unfold_spin_centroid_operator(
     if operator_transpose is not None:
         if operator_transpose.shape != operator_ibz.shape:
             raise ValueError("operator_transpose must match the parent shape")
-        transposed_flat = jnp.transpose(
-            operator_transpose, (0, 2, 1, 4, 3)).reshape(flat.shape)
-        pair = jnp.swapaxes(transposed_flat, -2, -1)
+        pair = jnp.swapaxes(operator_transpose.reshape(flat.shape), -2, -1)
     flat_full = unfold_isdf_operator(
         flat,
         irr_idx=irr_idx,
@@ -1325,9 +1330,7 @@ def unfold_spin_centroid_operator(
         right_L_table=None if right_L_table is None else right_wraps_ms,
         right_axis_local_sym_perm=right_local_perm,
     )
-    spatial = jnp.transpose(
-        flat_full.reshape(n_full, n_left, ns, n_right, ns),
-        (0, 2, 1, 4, 3))
+    spatial = flat_full.reshape(n_full, n_left, ns, n_right, ns)
     # Keep the irregular centroid gather and the small dense spin action as
     # two device kernels.  Fusing them makes each gathered value feed four
     # output blocks and was 1.58x slower on the real P4 Si operator, whereas

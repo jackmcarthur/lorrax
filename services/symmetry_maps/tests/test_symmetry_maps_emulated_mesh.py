@@ -371,7 +371,7 @@ def test_open_spin_green_unfold_uses_transpose_not_conjugation_for_tr():
            + 1j * rng.standard_normal((3, nb, ns, n_rmu)))
     weight = np.exp(-1j * rng.uniform(0.2, 1.1, size=(3, nb)))
     parent = np.einsum(
-        'pnsm,pn,pntv->psmtv', psi, weight, np.conj(psi), optimize=True)
+        'pnsm,pn,pntv->pmsvt', psi, weight, np.conj(psi), optimize=True)
 
     U_spatial = np.asarray([
         np.eye(2, dtype=np.complex128),
@@ -379,7 +379,7 @@ def test_open_spin_green_unfold_uses_transpose_not_conjugation_for_tr():
     ])
     U_full = spinor_rotation_for_sym_row(
         U_spatial, _SYM, _NTRAN, nspinor=2)
-    direct = np.empty((len(_IRR), ns, n_rmu, ns, n_rmu),
+    direct = np.empty((len(_IRR), n_rmu, ns, n_rmu, ns),
                       dtype=np.complex128)
     for k, (p, row) in enumerate(zip(_IRR, _SYM)):
         p, row = int(p), int(row)
@@ -393,7 +393,7 @@ def test_open_spin_green_unfold_uses_transpose_not_conjugation_for_tr():
             'ac,ncm->nam', U_full[k], gathered, optimize=True)
         child = child * phase[None, None, :]
         direct[k] = np.einsum(
-            'nsm,n,ntv->smtv', child, weight[p], np.conj(child),
+            'nsm,n,ntv->msvt', child, weight[p], np.conj(child),
             optimize=True)
 
     got = np.asarray(unfold_spin_centroid_operator(
@@ -418,15 +418,15 @@ def test_two_spin_operator_rotation_is_explicit_and_matches_dense_reference():
     from symmetry_maps.maps import _rotate_open_spin_centroid_operator
 
     rng = np.random.default_rng(2026090104)
-    spatial = (rng.standard_normal((5, 2, 7, 2, 9))
-               + 1j * rng.standard_normal((5, 2, 7, 2, 9)))
+    spatial = (rng.standard_normal((5, 7, 2, 9, 2))
+               + 1j * rng.standard_normal((5, 7, 2, 9, 2)))
     raw = (rng.standard_normal((5, 2, 2))
            + 1j * rng.standard_normal((5, 2, 2)))
     U = np.empty_like(raw)
     for k in range(raw.shape[0]):
         U[k], _ = np.linalg.qr(raw[k])
     expected = np.einsum(
-        'kac,kcmdn,kbd->kambn', U, spatial, np.conj(U), optimize=True)
+        'kac,kmcnd,kbd->kmanb', U, spatial, np.conj(U), optimize=True)
     got = _rotate_open_spin_centroid_operator(
         jnp.asarray(spatial), np.asarray(U))
     np.testing.assert_allclose(
@@ -446,12 +446,12 @@ def test_scalar_operator_rotation_is_explicit_and_matches_dense_reference():
     from symmetry_maps.maps import _rotate_open_spin_centroid_operator
 
     rng = np.random.default_rng(2026090201)
-    spatial = (rng.standard_normal((5, 1, 7, 1, 9))
-               + 1j * rng.standard_normal((5, 1, 7, 1, 9)))
+    spatial = (rng.standard_normal((5, 7, 1, 9, 1))
+               + 1j * rng.standard_normal((5, 7, 1, 9, 1)))
     angle = rng.uniform(-np.pi, np.pi, size=5)
     U = np.exp(1j * angle)[:, None, None]
     expected = np.einsum(
-        'kac,kcmdn,kbd->kambn', U, spatial, np.conj(U), optimize=True)
+        'kac,kmcnd,kbd->kmanb', U, spatial, np.conj(U), optimize=True)
     got = _rotate_open_spin_centroid_operator(
         jnp.asarray(spatial), np.asarray(U))
     np.testing.assert_allclose(

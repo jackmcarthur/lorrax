@@ -1771,13 +1771,16 @@ the antiunitary endpoint rule remain in :func:`unfold_isdf_operator`.
 
 Unfold an open-spin centroid operator from k parents to full k.
 
-``operator_ibz`` has shape ``(nk_parent,s,mu,s,nu)`` and sharding
-``P(None,None,'x',None,'y')``.  The two endpoint pairs are merged in
-centroid-major order, transported by :func:`unfold_isdf_operator`, then
-rotated by the canonical spin representation::
+``operator_ibz`` has shape ``(nk_parent,mu,s,nu,s)`` and sharding
+``P(None,'x',None,'y',None)``: centroid-major, the order a GEMM over the
+merged endpoint ``mu*ns + s`` produces.  Each endpoint pair merges into
+:func:`unfold_isdf_operator`'s ``(nk, mu*ns, nu*ns)`` by a reshape, the
+transported operator splits back by a reshape, and the result is returned
+in the same order -- no layout copy on either side of the transport --
+then rotated by the canonical spin representation::
 
-    O_k[a,mu,b,nu] = U_k[a,c]
-        O_parent[c,alpha(mu),d,alpha(nu)] U_k[b,d]^* .
+    O_k[mu,a,nu,b] = U_k[a,c]
+        O_parent[alpha(mu),c,alpha(nu),d] U_k[b,d]^* .
 
 On an antiunitary row the parent operator is transposed in the complete
 ``(spin,centroid)`` endpoint space, not merely conjugated.  This matters

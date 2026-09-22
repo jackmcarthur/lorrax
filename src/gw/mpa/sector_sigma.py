@@ -47,7 +47,7 @@ def _admit_compiled(kernel,args,meta,stage,*,native=0,resident=0):
 def sector_tau_factory(left, right, keys, meta, mesh_xy):
     """Bind Gamma_A G_AB(t) Gamma_B to the established tau executor.
 
-    G[k,s,mu_X,s',nu_Y] has rectangular centroid endpoints. Each of the
+    G[k,mu_X,s,nu_Y,s'] has rectangular centroid endpoints. Each of the
     at-most-nine Lorentz blocks uses the existing FFT convolution owner.
     Only the small projected band operator survives the call.
     """

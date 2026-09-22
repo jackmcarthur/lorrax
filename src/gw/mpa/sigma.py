@@ -185,7 +185,8 @@ def _shared_pole_contract(b_X, b_Y, weights, *, gemm, layout="face"):
     value = build_G(jnp.transpose(b_X, (0, 2, 1, 3)),
                     jnp.transpose(b_Y, (0, 3, 2, 1)),
                     phases=weights, layout=layout, gemm=gemm)
-    return value[:, 0, :, 0, :]
+    # build_G is centroid-major (q, mu, s, nu, s'); the unit spin axes are 2, 4.
+    return value[:, :, 0, :, 0]
 
 
 def shared_pole_hole_kernel(mesh_xy):

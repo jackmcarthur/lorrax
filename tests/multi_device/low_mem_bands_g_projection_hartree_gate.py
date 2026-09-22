@@ -96,10 +96,10 @@ def check_g_weighted(mesh, dtype="complex128", *, ns=2, mu=8, nb=6, nk=2,
     G_face = build_G(psi_mun, psi_nmu, phases=w, layout="face", gemm=plan)
 
     if weighted:
-        want = np.einsum("ksxn,kn,knty->ksxty", psi_xn_np, w_np,
+        want = np.einsum("ksxn,kn,knty->kxsyt", psi_xn_np, w_np,
                          np.conj(psi_np), optimize=True)
     else:
-        want = np.einsum("ksxn,knty->ksxty", psi_xn_np, np.conj(psi_np),
+        want = np.einsum("ksxn,knty->kxsyt", psi_xn_np, np.conj(psi_np),
                          optimize=True)
 
     r_face = _rel(_gather(G_face), want)
@@ -139,7 +139,7 @@ def check_g_hostile_pad(mesh, dtype="complex128", *, ns=2, mu=8, nb_full=8,
 
     phase_full = np.exp(-t * (enk_np - e_ref))
     phase_win = np.where(mask_np, phase_full, 0.0)
-    want = np.einsum("ksxn,kn,knty->ksxty", psi_xn_np, phase_win,
+    want = np.einsum("ksxn,kn,knty->kxsyt", psi_xn_np, phase_win,
                      np.conj(psi_np), optimize=True)
 
     r_face = _rel(_gather(G_face), want)

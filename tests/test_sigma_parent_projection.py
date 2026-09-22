@@ -75,6 +75,7 @@ def _worker() -> int:
     from common.contract_bands import contract_bands_block_reshard
     from gw.centroid_k_unfold import build_centroid_k_unfold_plan
     from gw.greens_function_kernel import build_G
+    from gw.wavefunction_bundle import sigma_conv_operand
     from gw.ppm_tau_kernel import _make_project_ri_reduce_scatter
     from symmetry_maps import (
         centroid_source_map_and_wrap, spinor_rotation_for_sym_row,
@@ -184,14 +185,18 @@ def _worker() -> int:
     g_rel = float(np.max(np.abs(G_par - G_full))) / float(np.max(np.abs(G_full)))
 
     # ---- a full-k operator that transforms like a Green function --------
-    O_parent = _crand(rng, n_parent, ns, plan.n_centroid_packed, ns,
-                      plan.n_centroid_packed)
+    O_parent = _crand(rng, n_parent, plan.n_centroid_packed, ns,
+                      plan.n_centroid_packed, ns)
     O_parent = jax.device_put(
         jnp.asarray(O_parent),
-        NamedSharding(mesh, P(None, None, "x", None, "y")))
+        NamedSharding(mesh, P(None, "x", None, "y", None)))
     with mesh:
         sigma_full = jax.block_until_ready(plan.unfold_operator(O_parent))
-    assert sigma_full.shape == (nk, ns, n_pk, ns, n_pk)
+    assert sigma_full.shape == (nk, n_pk, ns, n_pk, ns)
+    # The projector's O contract is the convolution operand order
+    # (nk, s, mu, s', nu): a Green-shaped operator enters it through the same
+    # layout adapter the Σ convolution owners use.
+    sigma_full = sigma_conv_operand(sigma_full)
 
     full_project = contract_bands_block_reshard(
         mesh, layout="face", face_shape=(nk, nb, n_pk, ns))
