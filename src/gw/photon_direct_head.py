@@ -293,9 +293,7 @@ def _direct_gamma_chunk(q, bare, weight, interband, slopes, coefficients,
     def one(_, operands):
         z, tensor, derivative = operands
         pi = (project_first_order_photon_response(tensor, q)
-              + metal_intraband_photon_response(q, z[None], drude, dos)[0]
-              - contact)
-        W, lhs = _solve_photon_head(bare, pi)
+              + metal_intraband_photon_response(q, z[None], drude, dos)[0])
         dpi = project_first_order_photon_response(derivative, q)
         safe = jnp.where(z == 0, 1.0 + 0.0j, z)
         dpi = dpi.at[:, 0, 0].add(-qDq / safe**4)
@@ -303,18 +301,32 @@ def _direct_gamma_chunk(q, bare, weight, interband, slopes, coefficients,
         dpi = dpi.at[:, 1:, 0].add(
             -HALFALPHA * (drude @ q.T).T / (2 * safe**3))
         dpi = jnp.where(z == 0, 0.0, dpi)
-        slope = W @ dpi @ W
-        value_sum = jnp.einsum("q,qab->ab", weight, W - winf)
-        slope_sum = jnp.einsum("q,qab->ab", weight, slope)
-        residual = lhs @ W - bare
-        error = jnp.max(jnp.where(weight > 0,
-            jnp.linalg.norm(residual, axis=(-2,-1)) /
-            jnp.maximum(jnp.linalg.norm(bare, axis=(-2,-1)), 1e-300), 0.0))
-        return None, (value_sum, slope_sum, error)
+        def solve(response, derivative):
+            W, lhs = _solve_photon_head(bare, response - contact)
+            value = jnp.einsum("q,qab->ab", weight, W - winf)
+            slope = jnp.einsum("q,qab->ab", weight, W @ derivative @ W)
+            residual = lhs @ W - bare
+            error = jnp.max(jnp.where(weight > 0,
+                jnp.linalg.norm(residual, axis=(-2,-1)) /
+                jnp.maximum(jnp.linalg.norm(bare, axis=(-2,-1)), 1e-300), 0.0))
+            return value, slope, error
 
-    _, (value, slope, errors) = jax.lax.scan(
+        value, slope, error = solve(pi, dpi)
+        # The ordered mirror conjugates the response at -q, then uses the
+        # *same* V and contact. q reversal flips CT/TC, while the bare
+        # transverse projector is even. Conjugating screened W would also
+        # conjugate the Hall contact and break its shared moments.
+        parity = jnp.diag(jnp.array((1, -1, -1, -1), dtype=pi.dtype))
+        mirror_value, mirror_slope, mirror_error = solve(
+            jnp.conj(parity @ pi @ parity),
+            jnp.conj(parity @ dpi @ parity))
+        return None, (value, slope, mirror_value, mirror_slope,
+                      jnp.maximum(error, mirror_error))
+
+    _, (value, slope, mirror_value, mirror_slope, errors) = jax.lax.scan(
         one, None, (frequencies, interband, slopes))
-    return value, slope, constant_sum, moment_sum, bare_sum, jnp.max(errors)
+    return (value, slope, mirror_value, mirror_slope, constant_sum,
+            moment_sum, bare_sum, jnp.max(errors))
 
 
 def _bulk_sphere_rule(geometry, kgrid, analytic_bare, chunk_size):
@@ -397,7 +409,8 @@ def build_direct_photon_head(velocity_cart, wfns, occupation_state, *,
     samples = iter_minibz_photon_samples(get_kernel(3), geometry,
         kgrid, nsamples=2**17,
         qmc_reps=4, chunk_size=chunk_size, analytic_sphere=True)
-    fields = ((len(z),4,4), (len(z),4,4), (4,4), (4,4,4), (4,4))
+    fields = ((len(z),4,4), (len(z),4,4), (len(z),4,4),
+              (len(z),4,4), (4,4), (4,4,4), (4,4))
     total = [jnp.zeros(shape, dtype=jnp.complex128) for shape in fields]
     replicate = [jnp.zeros(shape, dtype=jnp.complex128) for shape in fields]
     spreads = []
@@ -431,9 +444,9 @@ def build_direct_photon_head(velocity_cart, wfns, occupation_state, *,
             device_put_process_local(weight, replicated),
             tensors[0], tensors[1], tensors[2], points_device,
             drude, dos, contact)
-        for i in range(5):
+        for i in range(len(fields)):
             replicate[i] = replicate[i] + result[i]
-        max_error = jnp.maximum(max_error, result[5])
+        max_error = jnp.maximum(max_error, result[-1])
         count += int(valid)
     finish_rep()
     if len(spreads) != 4:
@@ -447,9 +460,9 @@ def build_direct_photon_head(velocity_cart, wfns, occupation_state, *,
         device_put_process_local(sw, replicated),
         tensors[0], tensors[1], tensors[2], points_device,
         drude, dos, contact)
-    max_error = jnp.maximum(max_error, sphere[5])
+    max_error = jnp.maximum(max_error, sphere[-1])
     fields_mean = [(np.asarray(total[i]) / len(spreads) + np.asarray(sphere[i]))
-                   / float(meta.cell_volume) for i in range(5)]
+                   / float(meta.cell_volume) for i in range(len(fields))]
     spread_rows = np.asarray(jnp.stack(spreads))
     spread = float(np.max(np.abs(spread_rows - np.mean(spread_rows, axis=0)))) / float(meta.cell_volume)
     if not all(np.all(np.isfinite(value)) for value in fields_mean):
@@ -459,5 +472,6 @@ def build_direct_photon_head(velocity_cart, wfns, occupation_state, *,
                  "4×131072 Sobol exterior + 8×12×24 screened sphere; "
                  f"max replicate spread={spread:.3e} Ry, "
                  f"Dyson residual={float(max_error):.3e}", flush=True)
-    return dict(zip(("Wc", "dWc_ds", "constant", "moments", "bare"),
+    return dict(zip(("Wc", "dWc_ds", "Wc_mirror", "dWc_mirror_ds",
+                     "constant", "moments", "bare"),
                     fields_mean))

@@ -1155,7 +1155,7 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                     if direct_head is not None and q0 == 0:
                         from .photon_direct_head import add_direct_gamma_field
                         head_update = direct_head["constant"] + (
-                            jnp.conj(direct_head["Wc"][sample]) if mirror
+                            direct_head["Wc_mirror"][sample] if mirror
                             else direct_head["Wc"][sample])
                         def gamma_add(packed, coefficient):
                             return add_direct_gamma_field(packed, coefficient,
@@ -1183,7 +1183,7 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                         w = value if vertex is None else value+constant
                         slope = execute(solve_slope, (h, w, chi), "sample_slope")
                         if head_update is not None:
-                            coefficient = (jnp.conj(direct_head["dWc_ds"][sample])
+                            coefficient = (direct_head["dWc_mirror_ds"][sample]
                                            if mirror else direct_head["dWc_ds"][sample])
                             slope = gamma_add(slope, coefficient)
                         io_started = time.monotonic()
