@@ -833,7 +833,6 @@ def _run_oneshot_sigma(
                 input_dir=input_dir,
                 wfns_transverse=wfns_transverse,
                 bispinor_v_q_path=bispinor_v_q_path, mu_bases=isdf.mu_bases,
-                photon_g0_vectors=isdf.photon_g0_vectors,
                 photon_response=photon_response,
                 occupation_state=oneshot_occupation_state,
                 material_class=material_class,
