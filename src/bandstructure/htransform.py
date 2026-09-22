@@ -1000,9 +1000,10 @@ def resolve_qp_hamiltonian_state(
     ``f(H_QP) = U f(E_QP) U^H`` without a second Hamiltonian, WFN or FFT
     implementation.  A wider fitted window is supported exactly as the
     canonical QP-WFN writer supports it: the complete QP block is replaced,
-    while rows outside it remain the original DFT states and energies (an
-    implicit block-identity extension).  Cutting through the QP block is
-    refused because a sliced eigenvector matrix is not unitary.
+    while rows outside it retain their DFT orbitals and use the complete SC
+    energy ladder when the artifact supplies it (otherwise DFT energies).
+    Cutting through the QP block is refused because a sliced eigenvector
+    matrix is not unitary.
 
     Scaling is ``O(nk * nb_qp^2 * rank)`` work.  Persistent output has the
     same shape as ``basis.ctilde``; the only additional inputs are the
@@ -1058,6 +1059,14 @@ def resolve_qp_hamiltonian_state(
             f"enk_sigma has shape {tuple(enk_sigma.shape)}, expected "
             f"{expected_enk} from the Galerkin state table.")
 
+    corrected_range = (q0, q1)
+    full_energies = artifact.get("E_full_nk_rydberg")
+    if full_energies is not None:
+        if full_energies.shape[0] != nk or full_energies.shape[1] < fit1:
+            raise ValueError("SC energy ladder does not cover the fitted Galerkin window")
+        enk_sigma = np.asarray(full_energies[:, fit0:fit1]).T
+        corrected_range = (fit0, fit1)
+
     # The Galerkin owner defines the compact state's global placement.  The
     # energy table and both QP companions arrive as identical host arrays on
     # every process, so place each process's incumbent shards without JAX's
@@ -1076,8 +1085,9 @@ def resolve_qp_hamiltonian_state(
         ctilde, enk_dev, U_dev, E_dev, band_offset=q0 - fit0)
     say(
         f"  [QP state] {os.path.basename(path)}: full "
-        f"H_QP=U diag(E_QP) U^H on bands [{q0},{q1}); DFT block-identity "
-        f"rows retained outside it in fitted window [{fit0},{fit1}); "
+        f"H_QP=U diag(E_QP) U^H on bands [{q0},{q1}); "
+        f"{'SC' if full_energies is not None else 'DFT'} tail energies, "
+        f"DFT tail orbitals in fitted window [{fit0},{fit1}); "
         f"compact rotation O({nk}*{nb_qp}^2*{int(ctilde.shape[2])}), no "
         "WFN/FFT rebuild")
     say(
@@ -1088,7 +1098,7 @@ def resolve_qp_hamiltonian_state(
     # This exact range comes from the authenticated artifact metadata above;
     # the standalone driver carries it to the active/projected output seam.
     # Do not reconstruct it later from a deck count or an array shape.
-    return ctilde_qp, enk_qp, (q0, q1)
+    return ctilde_qp, enk_qp, corrected_range
 
 
 def setup_wfn_and_sym(wfn_file: str, mesh_xy: Mesh | None = None):

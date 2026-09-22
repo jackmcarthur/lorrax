@@ -25,7 +25,7 @@ def _source_wfn(*, energies=None):
 
 
 def _write_rotations(path, U, E_ry, band_range, *, kgrid=(2, 1, 1),
-                     kpoints=None, source_wfn=True):
+                     kpoints=None, source_wfn=True, full_energies=None):
     from file_io.qp_wfn import write_qp_rotations_h5
 
     if kpoints is None:
@@ -35,7 +35,8 @@ def _write_rotations(path, U, E_ry, band_range, *, kgrid=(2, 1, 1),
         int(band_range[0]), int(band_range[1]), np.asarray(kpoints),
         *kgrid, k_storage="full",
         kirr_to_kfull=np.arange(len(kpoints)),
-        source_wfn=(_source_wfn() if source_wfn is True else source_wfn))
+        source_wfn=(_source_wfn() if source_wfn is True else source_wfn),
+        enk_full_nk_ry=full_energies)
 
 
 def _state(ctilde, enk, *, band_range=(10, 15), kgrid=(2, 1, 1),
@@ -89,7 +90,8 @@ def test_first_principles_u_f_u_dagger_identity():
         from_rotated_states, direct, rtol=3e-13, atol=3e-13)
 
 
-def test_compact_rotation_is_u_f_u_dagger_and_keeps_dft_guards(tmp_path):
+@pytest.mark.parametrize("sc_tail", [False, True])
+def test_compact_rotation_is_u_f_u_dagger_and_keeps_dft_guards(tmp_path, sc_tail):
     """C_QP=U.T C makes the existing diagonal fH builder equal f(H_QP)."""
     pytest.importorskip("jax")
     from bandstructure.htransform import resolve_qp_hamiltonian_state
@@ -103,14 +105,17 @@ def test_compact_rotation_is_u_f_u_dagger_and_keeps_dft_guards(tmp_path):
     U = _unitaries(rng, nk, nb_qp)
     E = rng.normal(size=(nk, nb_qp))
     path = tmp_path / "qp_wfn_rotations.h5"
-    _write_rotations(path, U, E, qp_range)
+    full = rng.normal(size=(nk, 32)) if sc_tail else None
+    if full is not None:
+        full[:, 11:14] = E
+    _write_rotations(path, U, E, qp_range, full_energies=full)
 
     C_qp_dev, enk_qp_dev, authenticated_range = resolve_qp_hamiltonian_state(
         **_state(C, enk, band_range=fit_range),
         qp_rotations_file=str(path))
     C_qp = np.asarray(C_qp_dev)
     enk_qp = np.asarray(enk_qp_dev)
-    assert authenticated_range == qp_range
+    assert authenticated_range == (fit_range if sc_tail else qp_range)
 
     # The canonical QP-WFN convention has no conjugation on U here.
     C_block = C[:, 1:4]
@@ -133,8 +138,8 @@ def test_compact_rotation_is_u_f_u_dagger_and_keeps_dft_guards(tmp_path):
     # The fully containing htransform window is a block-identity extension.
     np.testing.assert_array_equal(C_qp[:, 0], C[:, 0])
     np.testing.assert_array_equal(C_qp[:, 4], C[:, 4])
-    np.testing.assert_array_equal(enk_qp[0], enk[0])
-    np.testing.assert_array_equal(enk_qp[4], enk[4])
+    np.testing.assert_array_equal(enk_qp[0], full[:, 10] if sc_tail else enk[0])
+    np.testing.assert_array_equal(enk_qp[4], full[:, 14] if sc_tail else enk[4])
     np.testing.assert_allclose(enk_qp[1:4], E.T, rtol=0.0, atol=0.0)
 
 
