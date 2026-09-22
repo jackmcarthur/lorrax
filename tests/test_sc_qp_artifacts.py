@@ -61,6 +61,20 @@ def test_small_qp_artifact_preserves_accepted_hamiltonian(
     assert len(full_wfn_calls) == int(write_full_wfn)
     assert (wfn_path is not None) == write_full_wfn
 
+    if not write_full_wfn:
+        inputs = SimpleNamespace(
+            input_dir=str(tmp_path), meta=SimpleNamespace(nelec=1, kgrid=(1,1,1), b_id_4_user=3),
+            mesh_xy=None, kstar=None, wfn=wfn, sym=sym,
+            band_slices=SimpleNamespace(b0=0, b3=3),
+            config=SimpleNamespace(qp_rotations_k_storage="auto", occupation_clamp_tol=1e-3),
+            print_fn=lambda *_a: None)
+        sc_iteration._write_sc_seed(inputs, state)
+        seed = restart_bundle.read_qp_rotations_artifact(
+            str(tmp_path / "sc_seed" / "qp_wfn_rotations.h5"))
+        np.testing.assert_array_equal(seed["E_qp_nk_rydberg"], e)
+        np.testing.assert_array_equal(seed["U_mnk"], u)
+        assert not (tmp_path / "sc_seed" / "WFN_qp.h5").exists()
+
 
 def test_sc_driver_publishes_small_artifact_outside_full_wfn_guard():
     """A conditional caller recreates the measured wrong-H publication."""

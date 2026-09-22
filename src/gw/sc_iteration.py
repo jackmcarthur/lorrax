@@ -39,22 +39,12 @@ Robustness assumptions for the active-space partition:
 - **Active block aligned with kin_ion file**: validated by the shape
   match ``kin_ion.shape[1:] == (nb_sigma, nb_sigma)`` at iteration
   init time.
-- **Metals or near-gap-closure systems**: NOT robust — rotation may
-  push an active "valence" band above the active "conduction" band's
-  energy, or above an inactive band's energy.  ``occ`` is rebuilt
-  per-band-vs-efermi so it stays correct, but downstream consumers
-  (chi0's slices.val/cond split) assume a strict val/cond ordering.
-  Add a re-sort + re-occupy step here if/when metals are supported.
+- **Metallic occupations and band-window policy** follow the current-state
+  rules in ``docs/self_consistency.md``; DFT band identity is not sorted
+  eigenvalue position.
 - **Carry over multiple iterations**: ``U_qp`` is recomputed from the
   carry each iteration, so there's no accumulated U-product drift.
 
-TODO (per design discussion 2026-05-08): inactive bands above ``b3``
-that are themselves entirely within the Σ_c(ω) grid bounds at every k
-should receive a *diagonal* Σ correction at each SC iteration (no
-off-diagonals — they're never mixed with active bands).  Bands fully
-outside the ω-grid keep the scissor extrapolation.  The "best
-determined Σ for an inactive band that straddles the ω-grid edge after
-SC updates" is undecided; flagged for a separate design pass.
 """
 
 from __future__ import annotations
@@ -4878,6 +4868,9 @@ def _write_sc_eqp_snapshot(
     rotation_path = _dump_sc_rotation(
         inputs, state_out, call_index=call_index)
 
+    if role != "trial" and not verdict.converged:
+        _write_sc_seed(inputs, state_out)
+
     if process_rank() != 0:
         return None
 
@@ -5057,6 +5050,24 @@ def _write_sc_eqp_snapshot(
         f"in_range={_band_ranges(in_range, band_offset=band_offset)}")
     _record_sc(inputs, f"    SC memory: {_process_memory_receipt()}")
     return path
+
+
+def _write_sc_seed(inputs, state):
+    """Publish a compact warm seed; accelerator history is deliberately absent."""
+    from common.collectives import rank0_transaction
+    path = os.path.join(inputs.input_dir, "sc_seed")
+    rank0_transaction(path, stage="sc_seed_directory",
+                      write=lambda: os.makedirs(path, exist_ok=True))
+    dump_qp_wfn_artifacts(
+        state, n_occ=int(inputs.meta.nelec), mesh_xy=inputs.mesh_xy,
+        kstar=inputs.kstar, state_on_ibz=inputs.kstar is not None,
+        wfn=inputs.wfn, sym=inputs.sym, band_slices=inputs.band_slices,
+        kgrid=inputs.meta.kgrid, logical_band_stop=int(inputs.meta.b_id_4_user),
+        output_dir=path, qp_rotations_k_storage=inputs.config.qp_rotations_k_storage,
+        write_wfn_h5=False, print_fn=inputs.print_fn,
+        clamp_tol=float(inputs.config.occupation_clamp_tol))
+    _record_sc(inputs, f"  SC warm seed: {path}/qp_wfn_rotations.h5; "
+               "map output, not a convergence receipt or accelerator checkpoint")
 
 
 def _clear_sc_eqp_snapshots(input_dir: str, *, print_fn=print) -> None:
@@ -6878,7 +6889,7 @@ def dump_qp_wfn_artifacts(
 ) -> tuple[str | None, str, float, np.ndarray]:
     """Write canonical SC U/E and optionally the full ``WFN_qp.h5``.
 
-    Diagonalises the converged ``state.H_qp_dft`` once, then writes:
+    Diagonalises ``state.H_qp_dft`` once, then writes:
 
     * ``WFN_qp.h5`` — full BGW-format wavefunction file with active-block
       ψ rotated by ``U`` and active-block energies replaced by ``E_qp``;
@@ -7063,7 +7074,7 @@ def dump_qp_wfn_artifacts(
             dtype=np.float64)
         efermi_ry = float(final_occ_state.mu_ry)
         print_fn(
-            "  Final occupations: fixed-N "
+            "  State occupations: fixed-N "
             f"{final_occ_state.smearing_family}, "
             f"mu={efermi_ry * RYD_TO_EV:.6f} eV, "
             f"hash={final_occ_state.occ_hash}")
@@ -7166,7 +7177,7 @@ def dump_qp_wfn_artifacts(
     _ref_kind = ("fixed-N mu" if (state.occupation_state is not None
                  and str(state.occupation_state.smearing_family) in ("mp1", "fd"))
                  else "midgap")
-    print_fn(f"  Final E_F ({_ref_kind}, eV): {efermi_ry * RYD_TO_EV:.6f}")
+    print_fn(f"  State E_F ({_ref_kind}, eV): {efermi_ry * RYD_TO_EV:.6f}")
     return (qp_wfn_path if write_wfn_h5 else None, qp_rot_path, efermi_ry,
             enk_loop_ry)
 

@@ -679,6 +679,18 @@ validation. Detailed evidence: sandbox
 `runs/Si_scalar/35_shared_pole_sc_live_20260910/49_old_head_warmup_sc/report.md`.
 <!-- The optional diagnostic below does not change the production restart contract. -->
 
+### Continuing after an interrupted calculation
+
+Each completed non-trial, unconverged map atomically publishes
+`sc_seed/qp_wfn_rotations.h5` through the canonical QP writer. This small
+artifact carries the Hamiltonian, complete scissored energies, fixed-N
+occupations and frozen band policy; it does not write wavefunctions or
+accelerator history. In a new run directory, set
+`sc_initial_qp_rotations_file` to this artifact and reuse the invariant ISDF
+inputs with `restart=true`. This starts a fresh acceleration history from a
+completed map output; it is not an exact continuation of rCROP or proof of
+convergence. Final artifacts remain separate in the run directory.
+
 ### Inspecting an SC state before shared-pole construction
 
 `tests/bench/shared_pole_sc_invariants.py -i RUN/cohsex.in --output RUN/diagnostics`
