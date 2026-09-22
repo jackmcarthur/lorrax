@@ -506,6 +506,8 @@ def test_a_cohsex_first_ladder_stays_runnable_with_an_EXPLICIT_key():
                 and "use_band_extrapolation" in str(exc.value)), (
         "a COHSEX stage inside a ladder that contains a PPM stage must not "
         "refuse the run")
+    from gw.sigma_dispatch import validate_band_extrapolation
+    validate_band_extrapolation(_cfg([CM.COHSEX, CM.GN_PPM], explicit=True), CM.COHSEX)
     blob = "\n".join(said)
     assert "AUTO-DISABLED" in blob
     assert "gn_ppm" in blob, "the note must name the stage that WILL consume it"
@@ -525,6 +527,10 @@ def test_a_run_with_no_consuming_stage_still_REFUSES_an_explicit_key():
     assert "cohsex" in msg and "x_only" in msg, (
         "the refusal must show the ladder it inspected, or the operator "
         "cannot tell which stage list was consulted")
+
+    from gw.sigma_dispatch import validate_band_extrapolation
+    with pytest.raises(NotImplementedError, match="NO stage of this run consumes"):
+        validate_band_extrapolation(_cfg([CM.MPA], explicit=True), CM.MPA)
 
 
 def test_an_mpa_stage_now_REACHES_the_guard_and_gets_the_dynamic_reason():

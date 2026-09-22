@@ -111,7 +111,7 @@ from .screening import (
 	compute_screening_model, driver_persists_w0, screening_requests_for)
 from .sigma_dispatch import (
 	SIGMA_KSET_FULL_BZ, SIGMA_KSET_STAR_WEDGE, compute_sigma_xc,
-	sigma_result_on_kset)
+	sigma_result_on_kset, validate_band_extrapolation)
 from .qsgw_utils import solve_qp
 from .dynamic_sigma import extract_sigma_diag_logical
 from .degen_average import (
@@ -285,6 +285,7 @@ def _open_production_report(args):
     timing.set_trace_sink(report.progress)
     report.begin(input_file=args.input, config=config)
     refuse_unimplemented_compute_mode(mode, context="the LORRAX GW driver")
+    validate_band_extrapolation(config, mode)
     do_screened = mode.needs_screening
     return (config, input_dir, qp_solver, mode, report, production_stdout, print0, _config_provenance, do_screened)
 

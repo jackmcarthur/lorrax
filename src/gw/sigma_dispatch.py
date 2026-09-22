@@ -821,6 +821,11 @@ def _validate_sigma_stage(
     """Validate the Sigma stage; see docs/architecture/four_current_wiring.md."""
     refuse_unimplemented_compute_mode(mode, context="compute_sigma_xc")
     refuse_explicit_gij_under_low_mem_bands(config, Gij)
+    validate_band_extrapolation(config, mode, print_fn=print_fn)
+
+
+def validate_band_extrapolation(config, mode, *, print_fn=None):
+    """Refuse unsupported explicit requests before screening; report at Sigma."""
     # AUTO-DISABLED, LOUDLY: non-PPM stages keep the ordinary full-band sum.
     if bool(config.sigma.band_extrapolation) and mode.ppm_model is None:
         explicit_switch = bool(getattr(
@@ -860,6 +865,8 @@ def _validate_sigma_stage(
                 f"ladder containing ANY gn_ppm / hl_ppm stage also does not "
                 f"refuse — the non-PPM stages in it disable themselves and the "
                 f"run continues.)")
+        if print_fn is None:
+            return
         if explicit:
             why = (f"this deck NAMES the key and a PPM stage in this run's "
                    f"ladder [{ladder}] will consume it — this stage is not "
