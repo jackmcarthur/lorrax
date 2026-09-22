@@ -156,7 +156,9 @@ The cuSolverMp response-direction dilation solve uses the equivalent positive ma
 failure on a saved response matrix without changing eigenvectors,
 rank cutoffs, or the physical operator; only the scalar norm is reduced.
 Before eager direction-rank selection, the small host spectrum is broadcast
-from one process so roundoff tails cannot produce inconsistent rank decisions.
+as integer bit patterns from one process before rank decisions, then placed
+with the shared `device_put_process_local` owner. This publishes the canonical
+small table without a redundant global placement collective.
 
 The physical input is exactly one rank-2 square float64 or complex128 array at
 P('x','y') on the supplied mesh.  The service refuses rank, shape, dtype,

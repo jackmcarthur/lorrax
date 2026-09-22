@@ -79,7 +79,10 @@ interval-arithmetic implementation of the exponential function.
 ## Streaming the windows
 
 The response bank concatenates crossing and noncrossing times, projection
-rows and window indices into one JIT scan per admitted q/sample panel. Small
+rows and window indices into one JIT scan per admitted q/sample panel.
+Forward/reverse remote orientations are separate signed-projection entries
+on those same quadrature nodes, so one Green pair is built before contour
+selection and no nested orientation carries remain. Small
 occupation/reference tables select each node's window; the existing Green,
 symmetry and FFT owners build one node at a time. A single donated response
 carry stays at `P(None,None,"x","y")`, and no Green history is stored. Like
