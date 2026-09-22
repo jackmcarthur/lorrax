@@ -610,6 +610,8 @@ set(LORRAX_FFI_SOURCES
     cublas/local_active_gemm_ffi.cc
     common/contour_accumulate.cu
     common/contour_accumulate_ffi.cc
+    symmetry/spin_rotate.cu
+    symmetry/spin_rotate_ffi.cc
     cusolvermp/context.cc
     cusolvermp/eigh_ffi.cc
     cusolvermp/batched_potrf_ffi.cc

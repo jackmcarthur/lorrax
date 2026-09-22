@@ -1333,7 +1333,12 @@ def unfold_spin_centroid_operator(
     # output blocks and was 1.58x slower on the real P4 Si operator, whereas
     # this barrier measures at the sum of the independent bandwidth kernels.
     spatial = jax.lax.optimization_barrier(spatial)
-    rotated = _rotate_open_spin_centroid_operator(spatial, spin)
+    if (mesh_xy.devices.flat[0].platform == "gpu" and ns in (2, 4)
+            and spatial.dtype == jnp.complex128):
+        from ._spin_rotation import rotate_spin
+        rotated = rotate_spin(spatial, spin, mesh_xy)
+    else:
+        rotated = _rotate_open_spin_centroid_operator(spatial, spin)
     return jax.lax.with_sharding_constraint(rotated, out_sh)
 
 
