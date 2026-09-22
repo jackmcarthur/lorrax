@@ -5,12 +5,16 @@ import jax
 import numpy as np
 import jax.numpy as jnp
 
-from common.contract_bands import merge_spin_centroid, split_spin_centroid
+from common.contract_bands import merge_spin_centroid
 
 
 def _build_G_face(psi_mun, psi_nmu, *, gemm, Gij=None, phases=None, mesh=None,
                   band_range=None, prepared_active_gemm=None):
-    """Contract band-replicated faces locally or band-distributed faces with their GEMM plan."""
+    """Contract band-replicated faces locally or band-distributed faces with their GEMM plan.
+
+    Returns the Green ``(nk, mu_X, s, nu_Y, s')``: centroid-major, the
+    GEMM's own merged endpoint order split by a reshape.
+    """
     if Gij is not None:
         raise NotImplementedError("Green faces support diagonal band weights, not dense Gij.")
     nk_, s_, mu_l_, n_ = psi_mun.shape
@@ -44,16 +48,22 @@ def _build_G_face(psi_mun, psi_nmu, *, gemm, Gij=None, phases=None, mesh=None,
     else:
         G_flat = (gemm(A, B) if band_range is None
                   else gemm.active_range(A, B, *band_range, weights=phases))
-    # (nk, mu*s, mu*s), distributed over both centroid axes.
-    G = split_spin_centroid(G_flat, 1, s_, mu_l_)
-    G = split_spin_centroid(G, 3, s_, mu_r_)
-    return G
+    # (nk, mu*s, nu*s), distributed over both centroid axes.  The merged
+    # endpoint order is centroid-major (``mu*ns + s``, merge_spin_centroid's
+    # own collective-free direction), so the split is a pure reshape: the
+    # Green is stored ``(nk, mu_X, s, nu_Y, s')`` and is never transposed to
+    # a spin-major order.  The parent-k unfold transports this order as-is.
+    return G_flat.reshape(nk_, mu_l_, s_, mu_r_, s_)
 
 
 def build_G(psi_xn, psi_yr, *, Gij=None, phases=None, layout='face',
            gemm=None, k_unfold_plan=None, right_k_unfold_plan=None, real_weights=None,
            band_range=None, prepared_active_gemm=None):
-    """Build parent operators and transport both typed endpoints without processor exchange."""
+    """Build parent operators and transport both typed endpoints without processor exchange.
+
+    The Green is centroid-major ``(nk, mu, s, nu, s')`` on parents and on
+    full k alike; see :func:`_build_G_face`.
+    """
     if layout not in ('face', 'axis'):
         raise ValueError("build_G requires canonical faces with layout=face or axis.")
     if gemm is None:

@@ -128,14 +128,14 @@ def test_local_body_matches_the_top_level_rectangular_unfold():
 
 
 def test_open_spin_block_coefficient_is_one_block_of_the_rotation():
-    """sum_{c,d} coef[a,b][c,d] O[c,:,d,:] == (U O U†)[a,:,b,:], rectangular."""
+    """sum_{c,d} coef[a,b][c,d] O[:,c,:,d] == (U O U†)[:,a,:,b], rectangular (centroid-major)."""
     import jax.numpy as jnp
     from symmetry_maps.maps import _rotate_open_spin_centroid_operator
 
     rng = np.random.default_rng(20260905)
     nk, ns, m, n = 5, 2, 6, 9
-    spatial = (rng.standard_normal((nk, ns, m, ns, n))
-               + 1j * rng.standard_normal((nk, ns, m, ns, n)))
+    spatial = (rng.standard_normal((nk, m, ns, n, ns))
+               + 1j * rng.standard_normal((nk, m, ns, n, ns)))
     U = np.empty((nk, ns, ns), dtype=np.complex128)
     for k in range(nk):
         U[k], _ = np.linalg.qr(
@@ -147,10 +147,10 @@ def test_open_spin_block_coefficient_is_one_block_of_the_rotation():
             coef = np.asarray(open_spin_block_coefficient(U, a, b))
             assert coef.shape == (nk, ns, ns)
             block = sum(
-                coef[:, c, d][:, None, None] * spatial[:, c, :, d, :]
+                coef[:, c, d][:, None, None] * spatial[:, :, c, :, d]
                 for c in range(ns) for d in range(ns))
             np.testing.assert_allclose(
-                block, rotated[:, a, :, b, :], rtol=2.0e-13, atol=2.0e-13)
+                block, rotated[:, :, a, :, b], rtol=2.0e-13, atol=2.0e-13)
 
 
 @pytest.mark.parametrize("tnp", [

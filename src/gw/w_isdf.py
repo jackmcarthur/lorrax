@@ -140,12 +140,16 @@ def _contract_chi_vertices(Gv_R, Gc_R, operands, identities, complex_contour):
 
 
 def _contract_chi_orientations(Gv_R, Gc_R, operands, identities):
-    """Return the forward contraction and, for non-identity vertices, the reverse one (else ``None``)."""
+    """Return the forward contraction and, for non-identity vertices, the reverse one (else ``None``).
+
+    The Greens are centroid-major ``(R, mu, a, nu, b)``; the spin trace is
+    elementwise in ``mu, nu``, so it reads that order directly (spin axes 2, 4).
+    """
     from common.gamma_matrices import gamma_double_contract
     left_identity, right_identity = identities
     reverse = None
     if operands is None or (left_identity and right_identity):
-        forward = jnp.einsum('Rambn,Rambn->Rmn', Gc_R, jnp.conj(Gv_R), optimize=True)
+        forward = jnp.einsum('Rmanb,Rmanb->Rmn', Gc_R, jnp.conj(Gv_R), optimize=True)
     else:
         perm_l, phase_l, perm_r, phase_r = operands
         forward = gamma_double_contract(
@@ -154,7 +158,9 @@ def _contract_chi_orientations(Gv_R, Gc_R, operands, identities):
             phase_L=None if left_identity else phase_l,
             perm_R=None if right_identity else perm_r,
             phase_R=None if right_identity else jnp.conj(phase_r),
-            spin_axes=(1, 3))
+            spin_axes=(2, 4))
+        # Swap the two endpoint pairs (mu, a) <-> (nu, b); the same
+        # permutation as in the spin-major order.
         Gv_R_ba = jnp.transpose(Gv_R, (0, 3, 4, 1, 2))
         Gc_R_ba = jnp.transpose(Gc_R, (0, 3, 4, 1, 2))
         reverse = gamma_double_contract(
@@ -163,7 +169,7 @@ def _contract_chi_orientations(Gv_R, Gc_R, operands, identities):
             phase_L=None if right_identity else jnp.conj(phase_r),
             perm_R=None if left_identity else perm_l,
             phase_R=None if left_identity else phase_l,
-            spin_axes=(1, 3))
+            spin_axes=(2, 4))
     return forward, reverse
 
 
@@ -672,8 +678,10 @@ def _get_chi_fractional_contour_kernel_face(
                 gf = G_fftn(green_k(lower_weight, lower_time, lower_ref, spin_pair=pair))
                 gu = G_fftn(green_k(upper_weight, upper_time, upper_ref,
                                    current=True, spin_pair=pair))
+                # Centroid-major Greens (R, mu, a, nu, b): trace the spin
+                # pairs elementwise in mu, nu.
                 return jax.lax.with_sharding_constraint(
-                    jnp.einsum("Rambn,Rambn->Rmn", gu, gf.conj()), chi_R_shard)
+                    jnp.einsum("Rmanb,Rmanb->Rmn", gu, gf.conj()), chi_R_shard)
             if not vertex:
                 return component(None)
             initial = jax.lax.with_sharding_constraint(

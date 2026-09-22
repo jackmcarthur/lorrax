@@ -185,11 +185,15 @@ class BandSlices:
 # module sees the same canonical layout and a reshard-mismatch is caught
 # at import time rather than at HLO compile.
 # ---------------------------------------------------------------------------
-# G(k) in 7-D FFT-box form, used by chi0's build_G and sigma's Gij
-# construction.  (nkx, nky, nkz, s, μ_X, spinor, μ_Y) with μ on the
-# (x, y) mesh.  The s-axis and spinor-axis are replicated because they
-# sum contiguously in downstream einsums.
-G_FFT7D_SPEC = P(None, None, None, None, 'x', None, 'y')
+# G(k) in 7-D FFT-box form: the Green as build_G produces it and the
+# parent-k unfold transports it.  (nkx, nky, nkz, μ_X, s, μ_Y, s') with μ
+# on the (x, y) mesh -- CENTROID-MAJOR, the GEMM's own merged (μ·ns + s)
+# order split by a reshape, so no consumer ever pays a full-zone layout
+# copy to read it (the spin-major twin cost 19.9 GB/rank per Green on the
+# TaAs 8x8x8 P36 deck, module_0208.jit_integrate).  The two spin axes are
+# replicated and sit minor to their centroid axis; every spin trace is
+# elementwise in μ, ν, so the order is free to read.
+G_FFT7D_SPEC = P(None, None, None, 'x', None, 'y', None)
 
 # V_q / W_q in 5-D k-space form: (nkx, nky, nkz, μ_X, μ_Y) both μ-axes
 # sharded.  Used by compute_vcoul, w_isdf's V_q factory, and the W_q
@@ -202,9 +206,32 @@ V_FFT5D_SPEC = P(None, None, None, 'x', 'y')
 CHI_Q_SPEC = P(None, None, None, 'x', 'y')
 
 # G(k) in 5-D flat-k form — the output of make_flat_k_fftn when the
-# upstream op operates on a 3-D k-grid view.  (nk_flat, s, μ_X, spinor,
-# μ_Y).
-G_FLATK_SPEC = P(None, None, 'x', None, 'y')
+# upstream op operates on a 3-D k-grid view.  (nk_flat, μ_X, s, μ_Y, s'),
+# the same centroid-major order.
+G_FLATK_SPEC = P(None, 'x', None, 'y', None)
+
+# The fused Σ convolution's OPERAND order -- NOT the Green's.  The certified
+# ``gw_conv`` handler (``src/ffi/cpp/cufft/fft_flat_k_cuda_ffi.cc`` and its
+# mklfft host twin) takes ``G (nk, a, mx, b, my)`` with ``W (nk, mx, my)``
+# broadcast over the two spin axes a, b; that index arithmetic is compiled
+# into the shared device library.  The two Σ convolution owners
+# (``ppm_tau_kernel.get_sigma_spatial_kernel``,
+# ``cohsex_sigma._make_static_convolution``) put the Green into this order
+# at their entry with :func:`sigma_conv_operand`; Σ_k leaves every
+# convolution branch in it, which is the ``contract_bands`` face projector's
+# O contract ``(nk, s, μ, s', ν)``.
+SIGMA_CONV_G7D_SPEC = P(None, None, None, None, 'x', None, 'y')
+
+
+def sigma_conv_operand(G):
+    """The Green ``(nk, mu, s, nu, s')`` in the fused convolution's operand order ``(nk, s, mu, s', nu)``.
+
+    One full-zone layout copy per Green per node -- the copy the handler's
+    ABI requires (``SIGMA_CONV_G7D_SPEC``).  The parent-k unfold no longer
+    makes one, so the Σ chain's copy count is unchanged and χ's is one lower.
+    A handler that reads the Green's own order deletes this call.
+    """
+    return jnp.transpose(G, (0, 2, 1, 4, 3))
 
 # chi / W in R-space, flat-k form, used by the chi0-to-W pipeline post
 # iFFT: (nk_flat, μ_X, μ_Y).

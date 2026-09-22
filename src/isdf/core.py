@@ -35,7 +35,7 @@ from common.wfn_transforms import take_rchunk_padded, to_rchunk_inner
 # Face-layout CCT (low_mem_bands=True): the (s,mu) GEMM-seam merge/split the
 # two-face carrier and the face G-build already use.  ``common/`` layer,
 # same as everything else this module imports -- no ``gw`` dependency.
-from common.contract_bands import merge_spin_centroid, split_spin_centroid
+from common.contract_bands import merge_spin_centroid
 from ffi import _services      # noqa: F401  (path bootstrap; dies with the
                                  # owner's workspace fix -- see _services.py)
 
@@ -1169,7 +1169,10 @@ def c_q_from_psi_sm(
 	                                      None, gemm.in_sharding_b.spec[2]))
 	w_rep = NamedSharding(mesh_xy, P(None))
 	out_C = NamedSharding(mesh_xy, P(None, 'x', 'y'))
-	pair_spec = P(None, None, 'x', None, 'y')
+	# The native kparent handler's logical operand order is (p, s, mu, s', nu);
+	# the plan's unfold transports the centroid-major (p, mu, s, nu, s') Green.
+	pair_spec = (P(None, None, 'x', None, 'y') if pair_kernel is not None
+	             else P(None, 'x', None, 'y', None))
 
 	cache_key = ('c_q_face_parent', mesh_xy, plan, gemm, tuple(kgrid),
 	             tuple(psi_mun_parent.shape), tuple(psi_nmu_parent.shape),
@@ -1187,14 +1190,20 @@ def c_q_from_psi_sm(
 				A = A * w[None, None, :].astype(A.dtype)
 				B = merge_spin_centroid(jnp.conj(psi_nmu_), 2, 3)  # (p, nb, nu*s)
 				D = gemm(A, B)                                      # (p, mu*s, nu*s)
-				D = split_spin_centroid(D, 1, s_, mu_pk)
-				return split_spin_centroid(D, 3, s_, mu_pk)         # (p, s, mu, s, nu)
+				# Centroid-major, the merged order itself: the Green layout the
+				# plan's unfold transports without a layout copy.
+				return D.reshape(D.shape[0], mu_pk, s_, mu_pk, s_)  # (p, mu, s, nu, s')
 
 			# Parent contraction; native loads apply the typed transport inside the convolution.
 			D_l, D_r = _projector(w_l), _projector(w_r)
 			if pair_kernel is None:
 				D_l = plan.unfold_operator(D_l)
 				D_r = plan.unfold_operator(D_r)
+			else:
+				# Parent-sized copies into the handler's logical order; XLA folds
+				# them into the input layout the handler already asks for.
+				D_l = jnp.transpose(D_l, (0, 2, 1, 4, 3))
+				D_r = jnp.transpose(D_r, (0, 2, 1, 4, 3))
 
 			@partial(shard_map, mesh=mesh_xy, in_specs=(pair_spec, pair_spec),
 			         out_specs=P(None, 'x', 'y'), check_vma=False)
@@ -1205,16 +1214,16 @@ def c_q_from_psi_sm(
 					return pair_kernel(D_l_, D_r_, _parent_conv_vertices(tables, vertex_l, vertex_r))
 				# The incumbent ISDF tail is written for P = conj(D).
 				P_l_3d = jnp.conj(D_l_).reshape(
-					nkx, nky, nkz, s_, mu_loc, s_, col_loc)
+					nkx, nky, nkz, mu_loc, s_, col_loc, s_)
 				P_r_3d = jnp.conj(D_r_).reshape(
-					nkx, nky, nkz, s_, mu_loc, s_, col_loc)
+					nkx, nky, nkz, mu_loc, s_, col_loc, s_)
 				P_l_R = local_ifftn3(P_l_3d, axes=(0, 1, 2), norm='forward')
 				P_l_R_conj = jnp.conj(P_l_R)
 				del P_l_3d, P_l_R
 				P_r_R = local_ifftn3(P_r_3d, axes=(0, 1, 2), norm='forward')
 				del P_r_3d
 				C_R = gamma_double_contract(
-					P_l_R_conj, P_r_R, *vertex_l, *vertex_r, spin_axes=(3, 5))
+					P_l_R_conj, P_r_R, *vertex_l, *vertex_r, spin_axes=(4, 6))
 				del P_l_R_conj, P_r_R
 				C_q_3d = local_fftn3(C_R, axes=(0, 1, 2), norm='forward')
 				return C_q_3d.reshape(nk, mu_loc, col_loc)

@@ -165,6 +165,10 @@ class SpatialKernel(NamedTuple):
     ``conv_project(psi_xr, psi_yn, G_k, W_prep) -> Sigma``
         The G-dependent remainder: the G transform, the R-space multiply,
         the forward transform and the ψ projection.  Paid ONCE PER G(τ).
+        ``G_k`` arrives in the Green's own centroid-major order and is put
+        into the fused handler's operand order here
+        (``wavefunction_bundle.sigma_conv_operand``); Σ_k leaves in that
+        order, the face projector's contract.
 
     Composed back to back this is exactly the single callable this factory
     used to return; the split exists so the caller can place the loop
@@ -195,8 +199,9 @@ def get_sigma_spatial_kernel(
            k_unfold_plan)
     if key in _sigma_spatial_kernel_cache:
         return _sigma_spatial_kernel_cache[key]
-    from .wavefunction_bundle import (G_FFT7D_SPEC as _G_spec,
-                                      V_FFT5D_SPEC as _V_spec)
+    from .wavefunction_bundle import (SIGMA_CONV_G7D_SPEC as _G_spec,
+                                      V_FFT5D_SPEC as _V_spec,
+                                      sigma_conv_operand)
     ensure_jax_compile_cache()
     inv_sqrt_nk = -1.0 / np.sqrt(float(nk_tot))
     use_fused_ffi = _fft_ffi_fused_enabled()
@@ -227,6 +232,10 @@ def get_sigma_spatial_kernel(
 
     @partial(jax.jit, donate_argnums=(2,))
     def conv_project(psi_proj_xr, psi_proj_yn, G_k, W_prep):
+        # The Green's own order is centroid-major; the handler's operand
+        # order is fixed (SIGMA_CONV_G7D_SPEC).  One copy, replacing the
+        # one the parent-k unfold used to make.
+        G_k = sigma_conv_operand(G_k)
         if use_fused_ffi:
             sigma_k = _gw_conv(G_k, W_prep)
         else:
@@ -237,9 +246,11 @@ def get_sigma_spatial_kernel(
         _sigma_spatial_kernel_cache[key] = pair
         return pair
     if use_fused_ffi:
-        _conv_j = jax.jit(_gw_conv, donate_argnums=(0,))
+        _conv_j = jax.jit(lambda G_k, W_prep: _gw_conv(sigma_conv_operand(G_k), W_prep),
+                          donate_argnums=(0,))
     else:
-        _G_ifft_j = jax.jit(_G_ifftn, donate_argnums=(0,))
+        _G_ifft_j = jax.jit(lambda G_k: _G_ifftn(sigma_conv_operand(G_k)),
+                            donate_argnums=(0,))
         _V_ifft_j = jax.jit(lambda W_q: _V_ifftn(W_q)[:, None, :, None, :],
                             donate_argnums=(0,))
         _mult_fft_j = jax.jit(lambda G_R, V_R: _G_fftn(G_R * V_R * inv_sqrt_nk),

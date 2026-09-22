@@ -11,7 +11,7 @@ jax.config.update("jax_enable_x64", True)
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P  # noqa: E402
 
 from gw.cohsex_sigma import (  # noqa: E402
-    G_FFT7D_SPEC, V_FFT5D_SPEC, _face_kwargs, _make_cohsex_kernels,
+    SIGMA_CONV_G7D_SPEC, V_FFT5D_SPEC, _face_kwargs, _make_cohsex_kernels,
     _make_static_convolution)
 from gw.wavefunction_bundle import (  # noqa: E402
     BandSlices, build_wavefunctions_face)
@@ -93,15 +93,15 @@ def test_static_convolution_uses_certified_fused_owner(monkeypatch):
         "common.fft_helpers.make_flat_k_gw_conv", fake_factory)
     conv = _make_static_convolution(mesh, (1, 1, 2), 2)
 
-    G = _put(np.ones((2, 1, 2, 1, 2), np.complex128),
-             mesh, P(None, None, "x", None, "y"))
+    G = _put(np.ones((2, 2, 1, 2, 1), np.complex128),
+             mesh, P(None, "x", None, "y", None))
     V = _put(2.0 * np.ones((2, 2, 2), np.complex128),
              mesh, P(None, "x", "y"))
     got = np.asarray(conv(G, V, 2.5))
 
     assert called["mesh"] is mesh
     assert called["kgrid"] == (1, 1, 2)
-    assert called["g_spec"] == G_FFT7D_SPEC
+    assert called["g_spec"] == SIGMA_CONV_G7D_SPEC
     assert called["v_spec"] == V_FFT5D_SPEC
     assert called["norm"] == "ortho"
     assert called["mult"] == pytest.approx(-1.0 / np.sqrt(2.0))

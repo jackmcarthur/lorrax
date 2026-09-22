@@ -110,7 +110,7 @@ def check_vertex_build_g(mesh, dtype="complex128", *, mu_L, nu_L, ns=4,
                                optimize=True)          # (nk,s,mu,n)
     psi_conj_ref = np.einsum("ab,knbx->knax", Gam_nu, psi_np,
                              optimize=True)             # (nk,n,s,mu)
-    want = np.einsum("ksxn,knty->ksxty", psi_direct_ref,
+    want = np.einsum("ksxn,knty->kxsyt", psi_direct_ref,
                      np.conj(psi_conj_ref), optimize=True)
 
     r_face = _rel(_gather(G_face), want)

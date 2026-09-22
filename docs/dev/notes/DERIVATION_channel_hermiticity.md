@@ -436,7 +436,9 @@ random $\psi$; $B_q \leftarrow \tfrac12(M_q + M_q^\dagger)$, $\Omega_q \leftarro
 $|{\rm sym}|$ real, masks all-true. Import the *actual* building blocks —
 `gw.greens_function_kernel.build_G_tau`,
 `common.fft_helpers.make_flat_k_{i,f}fftn` with
-`wavefunction_bundle.G_FFT7D_SPEC / V_FFT5D_SPEC`, and the 3-line
+`wavefunction_bundle.SIGMA_CONV_G7D_SPEC / V_FFT5D_SPEC` (the convolution
+operand order; the Green itself is centroid-major, `G_FFT7D_SPEC`, and enters
+through `sigma_conv_operand`), and the 3-line
 $W^\tau$ phase build mirroring `_build_W_t_q` — and assemble
 $\sigma^\tau_k$ exactly as `_sigma_kij_kernel` does (`G_R * V_R * (-1/\sqrt{N_k})`,
 then `_G_fftn`). Evaluate one Laplace slice ($t=-0.37i$) and one crossing slice

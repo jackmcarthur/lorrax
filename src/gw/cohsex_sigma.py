@@ -14,7 +14,8 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from .greens_function_kernel import build_G
 from .head_correction import static_head_terms_to_kij
 from .wavefunction_bundle import project as _project
-from .wavefunction_bundle import G_FFT7D_SPEC, V_FFT5D_SPEC
+from .wavefunction_bundle import (SIGMA_CONV_G7D_SPEC, V_FFT5D_SPEC,
+                                  sigma_conv_operand)
 
 
 # ---------------------------------------------------------------------------
@@ -204,7 +205,12 @@ _static_convolution_cache: dict[tuple[object, ...], object] = {}
 
 def _make_static_convolution(mesh_xy: Mesh, kgrid: tuple[int, int, int],
                              nk_tot: int, *, q0_only=False, lorentz=False):
-    """Own the normalized flat-k convolution for scalar and streamed Lorentz sums."""
+    """Own the normalized flat-k convolution for scalar and streamed Lorentz sums.
+
+    Every branch takes the Green in its own centroid-major order and puts it
+    into the fused handler's operand order first (``sigma_conv_operand``), so
+    Σ_k leaves every branch in the face projector's ``(nk, s, mu, s', nu)``.
+    """
     from ffi import ffi_dial_key
     from ffi.mklfft import fused_fft_ffi_enabled
     from common.fft_helpers import make_flat_k_gw_conv
@@ -217,23 +223,25 @@ def _make_static_convolution(mesh_xy: Mesh, kgrid: tuple[int, int, int],
     elif q0_only:
         @jax.jit
         def convolve(G_k, interaction, prefactor):
-            return prefactor * G_k * interaction[0][None, None, :, None, :] * scale
+            return (prefactor * sigma_conv_operand(G_k)
+                    * interaction[0][None, None, :, None, :] * scale)
     elif fused_fft_ffi_enabled():
         # The fused owner bounds the exposed Green lifetime on large scalar decks.
-        fused = make_flat_k_gw_conv(mesh_xy, kgrid, G_FFT7D_SPEC, V_FFT5D_SPEC,
+        fused = make_flat_k_gw_conv(mesh_xy, kgrid, SIGMA_CONV_G7D_SPEC, V_FFT5D_SPEC,
                                     norm='ortho', mult=scale)
         @jax.jit
         def convolve(G_k, interaction, prefactor):
-            return prefactor * fused(G_k, interaction)
+            return prefactor * fused(sigma_conv_operand(G_k), interaction)
     else:
         from common.fft_helpers import make_flat_k_fftn, make_flat_k_ifftn
-        inverse_g = make_flat_k_ifftn(mesh_xy, kgrid, G_FFT7D_SPEC, norm='ortho')
-        forward_g = make_flat_k_fftn(mesh_xy, kgrid, G_FFT7D_SPEC, norm='ortho')
+        inverse_g = make_flat_k_ifftn(mesh_xy, kgrid, SIGMA_CONV_G7D_SPEC, norm='ortho')
+        forward_g = make_flat_k_fftn(mesh_xy, kgrid, SIGMA_CONV_G7D_SPEC, norm='ortho')
         inverse_v = make_flat_k_ifftn(mesh_xy, kgrid, V_FFT5D_SPEC, norm='ortho')
         @jax.jit
         def convolve(G_k, interaction, prefactor):
             return prefactor * forward_g(
-                inverse_g(G_k) * inverse_v(interaction)[:, None, :, None, :] * scale)
+                inverse_g(sigma_conv_operand(G_k))
+                * inverse_v(interaction)[:, None, :, None, :] * scale)
     _static_convolution_cache[key] = convolve
     return convolve
 
@@ -243,12 +251,13 @@ def _make_lorentz_convolution(mesh_xy, kgrid, scale, q0_only):
     from common.gamma_matrices import gamma_apply
     from common.fft_helpers import make_flat_k_fftn, make_flat_k_ifftn
     if not q0_only:
-        inverse_g = make_flat_k_ifftn(mesh_xy, kgrid, G_FFT7D_SPEC, norm='ortho')
-        forward_g = make_flat_k_fftn(mesh_xy, kgrid, G_FFT7D_SPEC, norm='ortho')
+        inverse_g = make_flat_k_ifftn(mesh_xy, kgrid, SIGMA_CONV_G7D_SPEC, norm='ortho')
+        forward_g = make_flat_k_fftn(mesh_xy, kgrid, SIGMA_CONV_G7D_SPEC, norm='ortho')
         inverse_v = make_flat_k_ifftn(mesh_xy, kgrid, V_FFT5D_SPEC, norm='ortho')
 
     @jax.jit
     def convolve(G_k, interactions, prefactor, vertices):
+        G_k = sigma_conv_operand(G_k)
         green = G_k if q0_only else inverse_g(G_k)
 
         def add(total, block):

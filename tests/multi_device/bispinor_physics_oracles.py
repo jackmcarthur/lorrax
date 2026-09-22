@@ -827,11 +827,11 @@ def test_complex_time_parent_green_keeps_time_under_antiunitary_action(monkeypat
         band_weight=jnp.asarray(signed),mask=jnp.asarray(mask),
         gemm=distrib_la.gemm_plan(mesh),k_unfold_plan=plan)
     child = _literal_children(raw,plan)
-    expected = np.einsum('knam,kn,knbv->kambv',child,phase[plan.irr_idx],child.conj())
+    expected = np.einsum('knam,kn,knbv->kmavb',child,phase[plan.irr_idx],child.conj())
     np.testing.assert_allclose(actual,expected,rtol=3e-13,atol=3e-13)
     wrong_phase = phase[plan.irr_idx].copy()
     wrong_phase[anti] = wrong_phase[anti].conj()
-    wrong = np.einsum('knam,kn,knbv->kambv',child,wrong_phase,child.conj())
+    wrong = np.einsum('knam,kn,knbv->kmavb',child,wrong_phase,child.conj())
     assert np.max(np.abs(expected[anti]-wrong[anti])) > .1
 
 
