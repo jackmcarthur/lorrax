@@ -770,16 +770,22 @@ def _get_chi_fractional_contour_kernel_face(
             return jax.lax.cond(window == 0, crossing, remote, None), None
 
         def direct_body(accumulators, node):
-            time, projection, reverse = node
+            time, projection, reverse, *window = node
+            lower, upper, refs = (occ_f[window[0]], occ_u[window[0]], energy_reference[window[0]]) if window else (occ_f, occ_u, energy_reference)
             def add(acc):
                 # A(t)=Gu(t) conj(Gf(conj(t))); the reverse product is
                 # conj(A(conj(t))), not conj(A(t)). green_k owns its own
                 # physical/incumbent conjugation convention.
-                tau = jnp.where(reverse, jnp.conj(time), time)
-                value = spin_correlation(occ_f, -tau, energy_reference[0],
-                    occ_u, jnp.conj(tau), energy_reference[1])
-                value = jnp.where(reverse, jnp.conj(value), value)
-                return accumulate_selected(acc, selected(value), projection)
+                tau = jnp.where(reverse == 1, jnp.conj(time), time)
+                value = spin_correlation(lower, -tau, refs[0], upper, jnp.conj(tau), refs[1])
+                value = jnp.where(reverse == 1, jnp.conj(value), value)
+                result = accumulate_selected(acc, selected(value), projection[:n_out])
+                if window:
+                    # Real Laplace times share the same Green pair for both orientations.
+                    result = jax.lax.cond(reverse == 2,
+                        lambda a: accumulate_selected(a, selected(jnp.conj(value)), projection[n_out:]),
+                        lambda a: a, result)
+                return result
             return jax.lax.cond(jnp.any(projection != 0), add, lambda acc: acc,
                                 accumulators), None
 
@@ -807,6 +813,8 @@ def _get_chi_fractional_contour_kernel_face(
 
         nodes = ((time_nodes[0], projection_rows.T, time_nodes[1])
                  if pair_mode in ("windowed", "direct") else (time_nodes, projection_rows.T))
+        if pair_mode == "direct" and len(time_nodes) == 3:
+            nodes = (*nodes, time_nodes[2])
         final_R, _ = jax.lax.scan(
             (direct_body if pair_mode == "direct" else window_body)
             if pair_mode in ("windowed", "direct") else body, initial, nodes, unroll=1)

@@ -239,7 +239,7 @@ def test_treatment_span_uses_the_chi_response_extent_on_a_split_deck():
 
 def test_metal_and_eta_scaling():
     r=resolve(fixture(metal=True,eta=.1,top=10))
-    assert r['height_ev']==.4
+    assert r['height_ev']==2.6
     assert r['census']['partial_at_mu']
     # The farthest crossing is E = 2 + 5 eV against the level at 1 eV.
     assert r['line_ev'][-1]==pytest.approx(6.0,abs=.011) and r['line_ev'][0]>=r['height_ev']

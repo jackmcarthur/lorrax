@@ -80,13 +80,15 @@ interval-arithmetic implementation of the exponential function.
 
 The response bank concatenates crossing and noncrossing times, projection
 rows and window indices into one JIT scan per admitted q/sample panel.
-Forward/reverse remote orientations are separate signed-projection entries
-on those same quadrature nodes, so one Green pair is built before contour
-selection and no nested orientation carries remain. Small
+The crossing cell uses independent forward/backward complex-time rules;
+reverse products use `conj(A(conj(t)))`. Remote cells use real Laplace times,
+so `A(t)` and its conjugate share one Green pair. Small
 occupation/reference tables select each node's window; the existing Green,
 symmetry and FFT owners build one node at a time. A single donated response
 carry stays at `P(None,None,"x","y")`, and no Green history is stored. Like
 the Sigma tau consumer, kernels are reused while energies, weights and
 references are dynamic inputs; the bounded program cache retains no state
 wavefunctions or response arrays. Both response values and ds rows share
-the node's Green contractions, including ordered photon response.
+the node's Green contractions, including ordered photon response. The carry
+holds value and derivative for one frequency only. High-energy states enlarge
+the remote intervals, not the crossing fit; all window nodes share one scan.

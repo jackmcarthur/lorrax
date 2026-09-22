@@ -392,7 +392,7 @@ def stream_weights(wfns, weights, mesh_xy, *, parents=True):
 
     result = replicate_to_mesh(np.asarray(weights), mesh_xy)
     if parents and wfns.green_parent is not None:
-        result = wfns.green_parent.plan.parent_rows(result)
+        result = wfns.green_parent.plan.parent_rows(result, axis=result.ndim-2)
     return result
 
 
@@ -972,64 +972,86 @@ def response_quadrature(wfns, meta, sample_plan, receipt, *, ordered=False, prin
     from jax.experimental import multihost_utils
     z = bank_points(sample_plan)
     energy, f, u, _, _ = response_weights(wfns, meta)
-    f, u, receipt["sample_activity"] = response_sample_weights(f, u)
-    refs = np.array([energy[f != 0].max(), energy[u != 0].min()])
-    lo, hi = refs[1]-refs[0], float(energy[u != 0].max()-energy[f != 0].min())
+    masks, f, u, cells, receipt["windows"] = response_windows(
+        energy, f, u, chemical_potential_ry=sample_plan["census"]["mu_ry"], z_ry=z)
+    pairs = [(1, 1)] + [(c["lower"], c["upper"]) for c in cells]
+    f = np.stack([np.where(masks[i], f, 0.) for i, _ in pairs])
+    u = np.stack([np.where(masks[j], u, 0.) for _, j in pairs])
+    refs = np.array([(energy[fw != 0].max(), energy[uw != 0].min())
+                     for fw, uw in zip(f, u)])
+    domains = np.array([(r[1]-r[0], energy[uw != 0].max()-energy[fw != 0].min())
+                        for fw, uw, r in zip(f, u, refs)])
     session = getattr(meta, "shared_pole_response_rules", None)
-    old = None if session is None else session.get("frequency")
+    old = None if session is None else session.get("windowed_frequency")
     metallic = sample_plan["census"]["partial_at_mu"]
-    reuse = (old is not None and old["lo"] <= lo and hi <= old["hi"]
+    reuse = (old is not None and old["domains"].shape == domains.shape
+             and np.all(old["domains"][:,0] <= domains[:,0])
+             and np.all(domains[:,1] <= old["domains"][:,1])
              and old["metallic"] == metallic and np.array_equal(old["z"], z))
+    capacity = 2*minimax.RESPONSE_RULE_CAPACITY
+    windows = len(pairs)
     if reuse:
         plan = old
     else:
-        pad = 4./RYD_TO_EV if session is not None else 0.
-        plan = dict(lo=lo-pad, hi=hi+pad, z=z, metallic=metallic,
-            t=np.zeros((len(z), 2, minimax.RESPONSE_RULE_CAPACITY), complex),
-            value=np.zeros((len(z), 2, minimax.RESPONSE_RULE_CAPACITY), complex),
-            derivative=np.zeros((len(z), 2, minimax.RESPONSE_RULE_CAPACITY), complex),
-            sampled_error=np.zeros((len(z), 2, 2)), counts=np.zeros((len(z), 2), np.int64))
+        # Pad only the crossing fit; remote rules own their safe positive margin.
+        domains = domains.copy()
+        domains[0] += np.array([-4.,4.])/RYD_TO_EV if session is not None else 0.
+        plan = dict(domains=domains, z=z, metallic=metallic,
+            t=np.zeros((len(z),windows,capacity), complex),
+            coefficients=np.zeros((len(z),4,windows,capacity), complex),
+            orientation=np.zeros((len(z),windows,capacity), np.int32),
+            counts=np.zeros((len(z),windows), np.int64))
         progress = LoopProgress(len(z), print_fn, title="response rule construction",
                                 item_name="frequency", max_updates=len(z)).start()
         rank, workers = jax.process_index(), jax.process_count()
-        for start in range(0, len(z), workers):
-            assigned = start + rank
-            status = np.zeros(1024, np.uint8)
-            rule = None
+        for start in range(0,len(z),workers):
+            assigned = start+rank
+            status = np.zeros(1024,np.uint8)
             if assigned < len(z):
                 try:
-                    rule = minimax.response_frequency_rule(
-                        plan["lo"], plan["hi"], z[assigned],
-                        rel_tol=sample_plan["bank_rule_tolerance"],
-                        previous=None if old is None else old["t"][assigned])
+                    for window,(lo,hi) in enumerate(domains):
+                        tol = sample_plan["bank_rule_tolerance"]/windows
+                        if window == 0:
+                            rule = minimax.response_frequency_rule(lo,hi,z[assigned],rel_tol=tol)
+                            plan["t"][assigned,window] = rule["t"].reshape(-1)
+                            plan["coefficients"][assigned,:2,window] = -np.stack(
+                                (rule["value"],rule["derivative"])).reshape(2,-1)
+                            plan["orientation"][assigned,window] = np.repeat([0,1],capacity//2)
+                            plan["counts"][assigned,window] = rule["counts"].sum()
+                        else:
+                            rule = minimax.response_laplace_rule(lo,hi,z[assigned:assigned+1],
+                                rel_tol=tol,ordered=True,reference_ry=lo)
+                            count = len(rule["t"])
+                            plan["t"][assigned,window,:count] = rule["t"]
+                            even = np.stack((rule["projection_value"][0],rule["projection_derivative"][0]))
+                            odd = np.stack((rule["odd_projection_value"][0],rule["odd_projection_derivative"][0]))
+                            plan["coefficients"][assigned,:,window,:count] = -np.concatenate((even+odd,even-odd))
+                            plan["orientation"][assigned,window] = 2
+                            plan["counts"][assigned,window] = count
                 except Exception as error:
                     message = str(error).encode()[:1023]
-                    status[:len(message)] = np.frombuffer(message, dtype=np.uint8)
-            for i in range(start, min(start + workers, len(z))):
+                    status[:len(message)] = np.frombuffer(message,dtype=np.uint8)
+            for i in range(start,min(start+workers,len(z))):
                 owner = i == assigned
-                error = np.asarray(multihost_utils.broadcast_one_to_all(
-                    status, is_source=owner))
+                error = np.asarray(multihost_utils.broadcast_one_to_all(status,is_source=owner))
                 if error.any():
                     raise ValueError(bytes(error).rstrip(b"\0").decode(errors="replace"))
-                for key in ("t", "value", "derivative", "sampled_error", "counts"):
-                    payload = rule[key] if owner else plan[key][i]
-                    plan[key][i] = np.asarray(multihost_utils.broadcast_one_to_all(
-                        payload, is_source=owner))
+                for key in ("t","coefficients","orientation","counts"):
+                    plan[key][i] = np.asarray(multihost_utils.broadcast_one_to_all(plan[key][i],is_source=owner))
                 progress.step()
         progress.finish()
         if session is not None:
-            session["frequency"] = plan
-    receipt["rule_provider"] = "minimax frequency-specific complex times; sampled accuracy"
-    receipt["rule"] = dict(interval_ry=[plan["lo"], plan["hi"]],
-        counts=plan["counts"].tolist(), sampled_error=plan["sampled_error"].tolist(),
-        reused=reuse)
+            session["windowed_frequency"] = plan
+    receipt["rule_provider"] = "minimax crossing complex times + noncrossing Laplace windows"
+    receipt["rule"] = dict(intervals_ry=plan["domains"].tolist(),counts=plan["counts"].tolist(),reused=reuse)
     receipt["nodes"] = int(plan["counts"].sum())
     if jax.process_index() == 0:
-        print_fn("Response quadrature: z(eV)   forward backward  sampled value/ds error; "
-              + ("reused" if reuse else "constructed"), flush=True)
-        for point, counts, errors in zip(z, plan["counts"], plan["sampled_error"]):
-            print_fn(f"Response quadrature: {point*RYD_TO_EV:20.8g} {counts[0]:4d} {counts[1]:4d}  "
-                  f"{errors[:,0].max():.2e} {errors[:,1].max():.2e}", flush=True)
+        print_fn("Response quadrature: z(eV) crossing / remote time-product counts; "
+                 + ("reused" if reuse else "constructed"),flush=True)
+        for point,counts in zip(z,plan["counts"]):
+            print_fn(f"Response quadrature: {point*RYD_TO_EV:20.8g} "
+                     + " / ".join(str(v) for v in counts),flush=True)
+        print_fn(f"Response quadrature: {receipt['nodes']} total Green-pair evaluations (value + derivative)",flush=True)
     band_ranges = None
     if wfns.layout == "axis":
         from .greens_function_kernel import _phase_band_interval
@@ -1047,9 +1069,9 @@ def integrate_response_frequency(wfns, meta, mesh_xy, rules, *, q_ids, sample,
     """Donated [value/ds,q,mu_X,nu_Y]; one Green/FFT scan per frequency."""
     plan, refs = rules["plan"], rules["refs"]
     times = plan["t"][sample]
-    # Move the padded scalar-domain origin to the physical endpoint references.
-    coefficients = -np.stack((plan["value"][sample], plan["derivative"][sample])) * np.exp(
-        -(refs[1]-refs[0]-plan["lo"])*times)
+    # Every window is expressed relative to its own transition lower bound.
+    shift = refs[:,1]-refs[:,0]-plan["domains"][:,0]
+    coefficients = plan["coefficients"][sample]*np.exp(-shift[:,None]*times)[None]
     n = meta.mu_basis.n_packed if vertex is None else vertex[0][0].shape[2]
     kernel, fixed = response_stream(wfns, meta, mesh_xy=mesh_xy,
         q_ids=q_ids, n_outputs=2, pair_mode="direct", bank_carry=True,
@@ -1057,8 +1079,9 @@ def integrate_response_frequency(wfns, meta, mesh_xy, rules, *, q_ids, sample,
     raw = jax.jit(lambda: jnp.zeros((2,len(q_ids),n,n),jnp.complex128),
         out_shardings=NamedSharding(mesh_xy,P(None,None,"x","y")))()
     weights = partial(stream_weights, parents=vertex is None)
-    args = ((jnp.asarray(times.reshape(-1)), jnp.repeat(jnp.array([False, True]), times.shape[1])),
-        jnp.asarray(coefficients.reshape(2,-1)), *fixed,
+    args = ((jnp.asarray(times.reshape(-1)), jnp.asarray(plan["orientation"][sample].reshape(-1)),
+             jnp.repeat(jnp.arange(len(refs)),times.shape[1])),
+        jnp.asarray(coefficients.reshape(4,-1)), *fixed,
         weights(wfns, rules["f"], mesh_xy), weights(wfns, rules["u"], mesh_xy),
         jnp.asarray(refs), raw)
     raw = execute(kernel, args, "direct")

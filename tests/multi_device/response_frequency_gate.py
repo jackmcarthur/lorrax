@@ -28,9 +28,13 @@ f = 1/(1+np.exp(energy/.3))
 f[:,:2] = 1.
 f[:,6:] = 0.
 refs = np.array([2.,-1.])
-t = np.array([.13+.27j, .41-.11j, 0.])
-c = np.array([[.3+.2j,-.7+.1j,0.], [-.2+.4j,.1-.3j,0.]])
-reverse = np.array([False,True,False])
+t = np.array([.13+.27j, .41-.11j, .23])
+c = np.array([[.3+.2j,-.7+.1j,.2], [-.2+.4j,.1-.3j,.3j], [0.,0.,-.4j], [0.,0.,.1]])
+reverse = np.array([0,1,2])
+window = np.array([0,0,1])
+fw = np.stack((f,f*(np.arange(nb)<4)))
+uw = np.stack((1-f,(1-f)*(np.arange(nb)>=4)))
+refs = np.stack((refs, [1.5,-.5]))
 for ns in (2,4):
     bare = (rng.normal(size=(nk,ns,n,nb))+1j*rng.normal(size=(nk,ns,n,nb)))/8
     current = bare if ns == 2 else bare[:,::-1].copy()*np.array([1,1j,-1,-1j])[None,:,None,None]
@@ -40,19 +44,21 @@ for ns in (2,4):
         return np.fft.fftn(a.reshape((2,2,2)+a.shape[1:]),axes=(0,1,2),norm='ortho').reshape(a.shape)
     def green(psi,weight,tau,ref):
         return np.einsum('kamj,kj,kbnj->kmanb',psi,weight*np.exp(-(energy-ref)*tau),psi.conj())
-    for time,coef,rev in zip(t,c.T,reverse):
-        tau=time.conjugate() if rev else time
-        upper=fft(green(current,1-f,tau,refs[1]))
-        lower=fft(green(bare,f,-tau.conjugate(),refs[0]))
+    for time,coef,rev,win in zip(t,c.T,reverse,window):
+        tau=time.conjugate() if rev==1 else time
+        upper=fft(green(current,uw[win],tau,refs[win,1]))
+        lower=fft(green(bare,fw[win],-tau.conjugate(),refs[win,0]))
         product=np.einsum('kmanb,kmanb->kmn',upper,lower.conj())
-        expected+=coef[:,None,None,None]*fft(product.conj() if rev else product)[None]
+        expected+=coef[:2,None,None,None]*fft(product.conj() if rev==1 else product)[None]
+        if rev==2:
+            expected+=coef[2:,None,None,None]*fft(product.conj())[None]
     # Every q is its own negative on this 2x2x2 oracle grid.
     for layout,bounds in [('face',None),('axis',None),('axis',((0,6),(2,8)))]:
         sn, sm = psi_specs(layout)
-        args = ((put(t),put(reverse)),put(c),
+        args = ((put(t),put(reverse),put(window)),put(c),
             put(bare,sm) if ns==2 else (put(bare,sm),put(current,sm)),
             put(br,sn) if ns==2 else (put(br,sn),put(cr,sn)),
-            put(energy),put(f),put(1-f),put(refs))
+            put(energy),put(fw),put(uw),put(refs))
         kernel = _get_chi_fractional_contour_kernel_face(mesh,(2,2,2),2,(nk,nb,n,ns),
             selected_q=tuple(range(nk)),pair_mode='direct',ordered=True,vertex=ns==4,
             bank_carry=True,layout=layout,band_ranges=bounds)
@@ -65,10 +71,10 @@ for ns in (2,4):
 # A scalar fit on a metallic interval checks values and analytic ds independently.
 if stack.process_index == 0:
     z=.7+.2j
-    rule=minimax.response_frequency_rule(-3.,3.,z)
-    d=np.linspace(-3.,3.,10001)
+    rule=minimax.response_frequency_rule(-.2,1.,z)
+    d=np.linspace(-.2,1.,10001)
     for i,pole in enumerate((z,-z)):
-        basis=np.exp(-(d[:,None]+3)*rule['t'][i])
+        basis=np.exp(-(d[:,None]+.2)*rule['t'][i])
         err=np.max(abs(basis@rule['value'][i]-1/(d-pole)))*z.imag
         ds=(1 if i==0 else -1)/(2*z*(d-pole)**2)
         derr=np.max(abs(basis@rule['derivative'][i]-ds))*z.imag**3

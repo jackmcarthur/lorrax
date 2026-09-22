@@ -335,10 +335,11 @@ frequencies":
 
 * **Imaginary ladder.** $m$ points log-spaced on
   $[u_{\min},u_{\max}]$ with
-  $u_{\min}=\max(h,\text{gap})$, $u_{\max}=\max(16\ \mathrm{eV},L)$,
+  $u_{\min}=\max(4\eta,\text{gap})$, $u_{\max}=\max(16\ \mathrm{eV},L)$,
   $L=\omega_p+3.5\ \mathrm{eV}$ and $\kappa=L/u_{\min}$. The count is the
   Zolotarev rate of Section 5.4, equation (W 23).
-* **Line ladder.** the line sits at height $h=4\eta$ and its sites are the
+* **Line ladder.** the line sits at height $h=\max(2.6\ \mathrm{eV},4\eta)$,
+  independently of the imaginary ladder and Sigma broadening, and its sites are the
   quantiles of the **band-structure crossing density** raised to a power
   $\alpha$ (production $\alpha=\tfrac12$), where the crossing density is the
   $\eta$-broadened density of the pole differences $|E-\epsilon_{mk}|$ that

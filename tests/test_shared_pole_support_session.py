@@ -140,8 +140,8 @@ def test_policy_or_basis_change_starts_a_new_envelope(changed):
     assert current["support_envelope"]["epoch"] == 1
     assert_same_geometry(current, resolve(args))
     if changed == "eta":
-        assert current["height_ev"] == 2*first["height_ev"]
-        assert current["u_min_ev"] >= current["height_ev"]
+        assert current["height_ev"] == first["height_ev"] == 2.6
+        assert current["u_min_ev"] == 2*first["u_min_ev"]
 
 
 def test_current_census_is_required_even_with_an_existing_envelope():

@@ -8,6 +8,7 @@ import numpy as np
 from scipy import linalg as la
 
 RESPONSE_RULE_CAPACITY = 192
+_RESPONSE_MAX_KAPPA = 5000.
 
 
 def _project(lo, hi, pole, times):
@@ -51,10 +52,12 @@ def _primitive(lo, hi, pole, tol, previous=None):
         fit = _project(lo, hi, pole, t)
         if fit is not None and np.max(fit[1]) < best[0]:
             best[:] = [float(np.max(fit[1])), (len(t), fit[1], fit[2])]
-        if fit is not None and np.max(fit[1]) <= tol and np.isfinite(fit[2]).all():
-            return t, fit[0], fit[1]
+        accurate = fit is not None and np.max(fit[1]) <= tol and np.isfinite(fit[2]).all()
+        if accurate and fit[2][0] <= _RESPONSE_MAX_KAPPA:
+            return (t, fit[0], fit[1]), False
+        return None, accurate
     if previous is not None:
-        got = accept(previous)
+        got, _ = accept(previous)
         if got is not None:
             return got
     ids = np.arange(size)
@@ -72,9 +75,11 @@ def _primitive(lo, hi, pole, tol, previous=None):
                 t = -np.log(roots)/step
             if not np.isfinite(t).all() or np.any(t.real < 0):
                 continue
-            got = accept((flatten*t.real+1j*t.imag)/eta)
+            got, mass_rejected = accept((flatten*t.real+1j*t.imag)/eta)
             if got is not None:
                 return got
+            if mass_rejected:
+                break  # Try the next padding/flattening geometry, not more cancelling terms.
     raise ValueError(f'response exponential fit failed: interval={lo, hi}, pole={pole}, tolerance={tol}, best={best}')
 
 

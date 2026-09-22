@@ -23,6 +23,7 @@ ROLE_CODES = {"line": 0, "imaginary": 1, "infinity": 2, "held_line": 3, "held_im
 shared_real_pole_v1_r3b = {
     "version": RECIPE_VERSION,
     "height_eta_factor": 4.0,
+    "height_floor_ev": 2.6,
     "active_depth_ev": 15.0,
     "borderline_depth_ev": 25.0,
     "plasma_margin_ev": 3.5,
@@ -1061,12 +1062,13 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
     eta = float(config.sigma.regularization_ev)
     if not math.isfinite(eta) or eta <= 0:
         raise ValueError("GATE shared_pole_eta: got: invalid eta; want: finite positive sigma_regularization_ev; why: causal sampling height")
-    height = recipe['height_eta_factor'] * eta
+    height = max(recipe['height_floor_ev'], recipe['height_eta_factor'] * eta)
     override = parse_support_sites(getattr(config.sigma, 'w_support_sites_ev', ''))
     plasma_ry = 2.0 * math.sqrt(4.0 * math.pi * census['active_electrons']
                                / census['cell_volume_bohr3'])
     top = plasma_ry * RYD_TO_EV + recipe['plasma_margin_ev']
-    umin, umax = max(height, census['gap_ev']), max(recipe['imaginary_floor_max_ev'], top)
+    umin = max(recipe['height_eta_factor'] * eta, census['gap_ev'])
+    umax = max(recipe['imaginary_floor_max_ev'], top)
     if umin >= umax:
         raise ValueError(f"GATE shared_pole_interval: got: u_min={umin} >= u_max={umax} eV; want: u_min < u_max; why: imaginary support interval is unresolved")
     support_receipt = None
