@@ -55,9 +55,15 @@ def _dilation_vectors(Q, n):
 
 def _dilation_svd(A, eigh):
     """Extract ascending singular triplets from [[0,A],[A.H,0]]."""
-    evals, Q = eigh(_hermitian_dilation(A))
+    # The equivalent positive dilation avoids STEDC convergence failures
+    # around the signed spectrum's zero cluster; eigenvectors are unchanged.
+    scale = jnp.linalg.norm(A, axis=(-2, -1))
+    scale = jnp.where(scale > 0, scale, 1)
+    h = _hermitian_dilation(A / scale[..., None, None])
+    evals, Q = eigh(h + jnp.eye(h.shape[-1], dtype=h.dtype))
     u, v = _dilation_vectors(Q, A.shape[-1])
-    return jnp.maximum(evals[..., A.shape[-1]:], 0), u, v
+    s = (evals[..., A.shape[-1]:] - 1) * scale[..., None]
+    return jnp.maximum(s, 0), u, v
 
 
 def _close_spectral_cut(values, count, tolerance):
