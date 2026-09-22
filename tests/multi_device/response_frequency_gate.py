@@ -25,6 +25,8 @@ def check(a, b):
 n, nk, nb = 8, 8, 8
 energy = np.broadcast_to(np.linspace(-1.,2.,nb),(nk,nb)).copy()
 f = 1/(1+np.exp(energy/.3))
+f[:,:2] = 1.
+f[:,6:] = 0.
 refs = np.array([2.,-1.])
 t = np.array([.13+.27j, .41-.11j, 0.])
 c = np.array([[.3+.2j,-.7+.1j,0.]])
@@ -33,13 +35,6 @@ for ns in (2,4):
     bare = (rng.normal(size=(nk,ns,n,nb))+1j*rng.normal(size=(nk,ns,n,nb)))/8
     current = bare if ns == 2 else bare[:,::-1].copy()*np.array([1,1j,-1,-1j])[None,:,None,None]
     br, cr = bare.transpose(0,3,1,2), current.transpose(0,3,1,2)
-    sn, sm = psi_specs('face')
-    args = ((put(t),put(reverse)),put(c),
-        put(bare,sm) if ns==2 else (put(bare,sm),put(current,sm)),
-        put(br,sn) if ns==2 else (put(br,sn),put(cr,sn)),
-        put(energy),put(f),put(1-f),put(refs))
-    kernel = _get_chi_fractional_contour_kernel_face(mesh,(2,2,2),1,(nk,nb,n,ns),
-        selected_q=tuple(range(nk)),pair_mode='direct',ordered=True,vertex=ns==4,bank_carry=True)
     expected=np.zeros((1,nk,n,n),complex)
     def fft(a):
         return np.fft.fftn(a.reshape((2,2,2)+a.shape[1:]),axes=(0,1,2),norm='ortho').reshape(a.shape)
@@ -52,12 +47,21 @@ for ns in (2,4):
         product=np.einsum('kmanb,kmanb->kmn',upper,lower.conj())
         expected[0]+=coef*fft(product.conj() if rev else product)
     # Every q is its own negative on this 2x2x2 oracle grid.
-    carry=put(np.zeros_like(expected),P(None,None,'x','y'))
-    executable=kernel.lower(*args,carry).compile()
-    error=check(executable(*args,carry),expected)
-    assert executable.memory_analysis().alias_size_in_bytes > 0
-    if stack.process_index == 0:
-        print(f'PASS complex-time ns={ns} max_error={error:.3e} memory={executable.memory_analysis()}',flush=True)
+    for layout,bounds in [('face',None),('axis',None),('axis',((0,6),(2,8)))]:
+        sn, sm = psi_specs(layout)
+        args = ((put(t),put(reverse)),put(c),
+            put(bare,sm) if ns==2 else (put(bare,sm),put(current,sm)),
+            put(br,sn) if ns==2 else (put(br,sn),put(cr,sn)),
+            put(energy),put(f),put(1-f),put(refs))
+        kernel = _get_chi_fractional_contour_kernel_face(mesh,(2,2,2),1,(nk,nb,n,ns),
+            selected_q=tuple(range(nk)),pair_mode='direct',ordered=True,vertex=ns==4,
+            bank_carry=True,layout=layout,band_ranges=bounds)
+        carry=put(np.zeros_like(expected),P(None,None,'x','y'))
+        executable=kernel.lower(*args,carry).compile()
+        error=check(executable(*args,carry),expected)
+        assert executable.memory_analysis().alias_size_in_bytes > 0
+        if stack.process_index == 0:
+            print(f'PASS complex-time ns={ns} {layout=} {bounds=} max_error={error:.3e} memory={executable.memory_analysis()}',flush=True)
 # A scalar fit on a metallic interval checks values and analytic ds independently.
 if stack.process_index == 0:
     z=.7+.2j

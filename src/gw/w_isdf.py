@@ -483,7 +483,7 @@ def _get_chi_fractional_contour_kernel(
 def _get_chi_fractional_contour_kernel_face(
     mesh_xy: Mesh, kgrid: tuple[int, int, int], n_out: int, face_shape,
     *, k_unfold_plan=None, layout="face", selected_q=None, pair_mode="retarded",
-    bank_carry=False, ordered=False, vertex=False,
+    bank_carry=False, ordered=False, vertex=False, band_ranges=None,
 ):
     """Integrate the retarded response using final occupied and unoccupied band weights.
 
@@ -595,13 +595,18 @@ def _get_chi_fractional_contour_kernel_face(
     # Face photon carriers exchange bounded band panels; axis carriers
     # already replicate bands and use the service's local contraction.
     green_spin = 1 if vertex else ns
+    if band_ranges is not None and (layout != "axis" or pair_mode != "direct"):
+        raise ValueError("prepared response band ranges require the axis direct stream")
     if vertex and layout == "face":
         # Four photon faces stay x/y tiled; exchange only bounded band panels
         # for the singleton-spin Green product, whose result stays x/y tiled.
         g_plan = partial(panel_matmul, mesh=mesh_xy, panel_bytes=32 << 20)
     else:
         g_plan = gemm_plan(mesh_xy, m=n_rmu * green_spin, k=nb_full, n=n_rmu * green_spin,
-                           nq=nk_shape, dtype=jnp.complex128, layout=layout)
+                           nq=nk_shape, dtype=jnp.complex128, layout=layout,
+                           enable_active_range=band_ranges is not None)
+    active_gemms = (tuple(g_plan.prepare_active_range(*bounds) for bounds in band_ranges)
+                   if band_ranges is not None else (None, None))
     def _finish(value):
         value = chi_fftn(value)
         if negate_full_q is None:
@@ -659,11 +664,13 @@ def _get_chi_fractional_contour_kernel_face(
             if physical:
                 g = build_G_tau(left, right, enk_full, jnp.conj(t), e_ref=ref,
                                 band_weight=jnp.conj(weight), layout=layout,
-                                gemm=g_plan, k_unfold_plan=k_unfold_plan)
+                                gemm=g_plan, k_unfold_plan=k_unfold_plan,
+                                prepared_active_gemm=active_gemms[int(current)])
             else:
                 g = jnp.conj(build_G_tau(left, right, enk_full, t, e_ref=ref,
                                          band_weight=weight, layout=layout,
-                                         gemm=g_plan, k_unfold_plan=k_unfold_plan))
+                                         gemm=g_plan, k_unfold_plan=k_unfold_plan,
+                                         prepared_active_gemm=active_gemms[int(current)]))
             return jax.lax.with_sharding_constraint(g, G_shard)
 
         def spin_correlation(lower_weight, lower_time, lower_ref,

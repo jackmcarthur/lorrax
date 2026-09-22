@@ -449,6 +449,12 @@ sharded on both endpoint axes. `tests/multi_device/response_bank_layouts.py`
 checks complex ordered charge-stream parity and the all-P output placement.
 This does not authorize a new layout or replicated bulk array.
 
+Axis-layout frequency streams use the Green builder's prepared active-band
+GEMM for both charge and photon vertices. Bounds enclose every parent's exact
+occupied/empty weight support, are shared across frequencies, and are rebuilt
+from the current SC occupations. Zero tails are skipped without changing any
+weight or time node; underflow inside the enclosing interval remains harmless.
+
 The producer must release ordered `o0/o1`, the per-parent operand tuple,
 result list and contact constant after their synchronous writes. Otherwise
 they survive into the next moment panel. Photon stream compiler temporaries

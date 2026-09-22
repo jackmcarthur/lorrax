@@ -346,7 +346,7 @@ def _response_stream_kernel(mesh_xy, kgrid, n_outputs, shape, *, _ffi_key, **opt
 
 def response_stream(wfns, meta, *, mesh_xy, q_ids, n_outputs,
                     pair_mode="retarded", bank_carry=False, ordered=False,
-                    vertex=None):
+                    vertex=None, band_ranges=None):
     """Bind the existing one-particle Green/FFT primitive to a q batch.
 
     Returns a jitted kernel and its fixed ψ/energy arguments. Caller supplies
@@ -367,7 +367,7 @@ def response_stream(wfns, meta, *, mesh_xy, q_ids, n_outputs,
             mesh_xy, (meta.nkx, meta.nky, meta.nkz), n_outputs,
             (int(meta.nk_tot), int(wfns.slices.nb_full), n, 4),
             _ffi_key=ffi_dial_key(), layout=wfns.layout, selected_q=tuple(q_ids), pair_mode=pair_mode,
-            bank_carry=bank_carry, ordered=True, vertex=True)
+            bank_carry=bank_carry, ordered=True, vertex=True, band_ranges=band_ranges)
         return kernel, vertex
     if not charge_representation(meta):
         raise ValueError("GATE response_representation: want scalar or "
@@ -382,7 +382,7 @@ def response_stream(wfns, meta, *, mesh_xy, q_ids, n_outputs,
         mesh_xy, (meta.nkx, meta.nky, meta.nkz), n_outputs,
         (nk, int(wfns.slices.nb_full), n, int(meta.nspinor)),
         k_unfold_plan=parent, _ffi_key=ffi_dial_key(), layout=wfns.layout, selected_q=tuple(q_ids),
-        pair_mode=pair_mode, bank_carry=bank_carry, ordered=ordered)
+        pair_mode=pair_mode, bank_carry=bank_carry, ordered=ordered, band_ranges=band_ranges)
     return kernel, (source.psi_mun, source.psi_nmu, source.enk)
 
 
@@ -1030,7 +1030,15 @@ def response_quadrature(wfns, meta, sample_plan, receipt, *, ordered=False, prin
         for point, counts, errors in zip(z, plan["counts"], plan["sampled_error"]):
             print_fn(f"Response quadrature: {point*RYD_TO_EV:20.8g} {counts[0]:4d} {counts[1]:4d}  "
                   f"{errors[:,0].max():.2e} {errors[:,1].max():.2e}", flush=True)
-    return dict(plan=plan, f=f, u=u, refs=refs)
+    band_ranges = None
+    if wfns.layout == "axis":
+        from .greens_function_kernel import _phase_band_interval
+        lo_band, hi_band = jax.device_get(_phase_band_interval(jnp.asarray(np.stack((f, u)))))
+        # Enclose every parent's exact weight support. Fixed bounds share one
+        # batched GEMM and remain safe when a complex-time phase underflows.
+        band_ranges = tuple((int(lo.min()), int(hi.max())) for lo, hi in zip(lo_band, hi_band))
+        print_fn(f"Response occupied/empty band intervals: {band_ranges} of {f.shape[-1]}")
+    return dict(plan=plan, f=f, u=u, refs=refs, band_ranges=band_ranges)
 
 
 def integrate_response_field(wfns, meta, mesh_xy, rules, *, q_ids, sample,
@@ -1044,7 +1052,7 @@ def integrate_response_field(wfns, meta, mesh_xy, rules, *, q_ids, sample,
     n = meta.mu_basis.n_packed if vertex is None else vertex[0][0].shape[2]
     kernel, fixed = response_stream(wfns, meta, mesh_xy=mesh_xy,
         q_ids=q_ids, n_outputs=1, pair_mode="direct", bank_carry=True,
-        ordered=ordered, vertex=vertex)
+        ordered=ordered, vertex=vertex, band_ranges=rules["band_ranges"])
     raw = jax.jit(lambda: jnp.zeros((1,len(q_ids),n,n),jnp.complex128),
         out_shardings=NamedSharding(mesh_xy,P(None,None,"x","y")))()
     weights = partial(stream_weights, parents=vertex is None)
