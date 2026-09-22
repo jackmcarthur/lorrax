@@ -132,6 +132,11 @@ def _cpu_algebra(monkeypatch):
     def gemm(mesh, **kwargs):
         def contract(x, y):
             return x @ y
+        def active(x, y, lo, hi, *, weights):
+            bands = jnp.arange(x.shape[-1])
+            mask = (bands >= lo[:, None]) & (bands < hi[:, None])
+            return (x * jnp.where(mask, weights, 0)[:, None, :]) @ y
+        contract.active_range = active
         contract.mesh = mesh
         contract.in_sharding_a = NamedSharding(mesh, P(None, "x", "y"))
         contract.in_sharding_b = contract.in_sharding_a

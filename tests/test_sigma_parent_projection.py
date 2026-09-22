@@ -55,6 +55,8 @@ def _crand(rng, *shape):
 
 
 def _worker() -> int:
+    from runtime.source_closure import ensure_source_closure
+    ensure_source_closure(print_fn=lambda _: None)
     import numpy as np
     import jax
     import jax.numpy as jnp
