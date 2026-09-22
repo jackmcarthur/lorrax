@@ -262,7 +262,8 @@ def test_character_tie_cluster_includes_every_boundary_member():
     assert float(tied.max() - tied.min()) > 1.0e-3
 
 
-def test_htransform_active_window_beats_lower_guard_on_the_path():
+@pytest.mark.parametrize("full_qp", [False, True])
+def test_htransform_active_window_beats_lower_guard_on_the_path(full_qp):
     """Drive the real fH/FFT/Newton path through the crossing red twin."""
     pytest.importorskip("jax")
     import jax.numpy as jnp
@@ -292,32 +293,35 @@ def test_htransform_active_window_beats_lower_guard_on_the_path():
         result = h_transform(
             meta, jnp.asarray(ctilde), jnp.asarray(energies), wfn,
             kpath_data, lines.append, mesh,
-            n_return_bands=3, sym=sym, return_coeffs=True)
+            n_return_bands=3, sym=sym, return_coeffs=True,
+            qp_corrected_band_range=(0, states) if full_qp else None)
 
+    expected = [-1.0, 0.0, 1.0 if full_qp else 3.0]
     # VBM is active row 1 at -2 Ry, so the raised active state appears at +3
     # Ry.  The old energy truncation published the lower guard at +1 Ry.
     np.testing.assert_allclose(
-        result["energies_sorted"], [[-1.0, 0.0, 3.0]] * 2,
+        result["energies_sorted"], [expected] * 2,
         rtol=0.0, atol=2.0e-11)
     assert result["energy_reference_ry"] == pytest.approx(-2.0)
     np.testing.assert_array_equal(result["coincident_path_indices"], [0])
     np.testing.assert_array_equal(result["coincident_coarse_indices"], [0])
     np.testing.assert_allclose(
-        result["coincident_exact"], [[-1.0, 0.0, 3.0]],
+        result["coincident_exact"], [expected],
         rtol=0.0, atol=2.0e-11)
     assert result["coincident_max_abs_ry"] < 2.0e-11
     np.testing.assert_allclose(
-        result["gamma_exact"], [-1.0, 0.0, 3.0],
+        result["gamma_exact"], expected,
         rtol=0.0, atol=2.0e-11)
     expected_coeffs = np.broadcast_to(
-        np.eye(rank, 3, dtype=np.complex128), (2, rank, 3))
+        np.eye(rank, dtype=np.complex128)[:, [0, 1, 3 if full_qp else 2]], (2, rank, 3))
     np.testing.assert_allclose(
         np.asarray(result["coeffs_on_path"]), expected_coeffs,
         rtol=0.0, atol=2.0e-11)
     banner = " ".join(lines)
-    assert "process-local active_R host spill" in banner
-    assert "released fH_R before active_R restore" in banner
-    assert "active/guard character selection" in banner
+    if not full_qp:
+        assert "process-local active_R host spill" in banner
+        assert "released fH_R before active_R restore" in banner
+        assert "active/guard character selection" in banner
     assert "path/coarse coincidences: 1 path row" in banner
 
 

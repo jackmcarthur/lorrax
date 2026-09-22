@@ -1559,7 +1559,7 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
             """Return the same ordered eigenvectors used by the path bands."""
             mat = _fourier_matrix(batch_k, fH_R)
             values, vectors = jax.vmap(jnp.linalg.eigh)(mat)
-            return values, vectors
+            return values[:, :states], vectors[:, :, :states]
     else:
         batch_vec_shard = NamedSharding(
             mesh_xy, P(('x', 'y'), None, None))
