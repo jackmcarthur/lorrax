@@ -1123,49 +1123,67 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
             raw = integrate_response_frequency(wfns, meta, mesh_xy, rules,
                 q_ids=response_rows, sample=sample, execute=execute,
                 receipt=receipt, ordered=ordered, vertex=vertex)
-            for derivative in (False, True):
-                field_indices = [2*m+int(derivative) for m in range(2 if literal_mirrors else 1)]
-                if np.asarray(header["sample_written"])[:,sample,field_indices].all():
-                    continue
-                for mirror in range(2 if literal_mirrors else 1):
-                    field = fields[mirror][int(derivative)]
-                    pending = ~np.asarray(header["sample_written"], bool)[:,sample,2*mirror+int(derivative)]
-                    # A fresh frequency is one q_irr slab. Preserve legacy partial
-                    # masks by batching each contiguous unfinished span.
-                    edges = np.flatnonzero(np.diff(np.r_[False,pending,False].astype(np.int8)))
-                    for q0, q1 in edges.reshape(-1,2):
-                        span = (int(q0), int(q1))
-                        selected = (mirror_qids if mirror else qids)[q0:q1]
-                        rows = np.asarray([row_index[int(q)] for q in selected])
-                        chi = raw[int(derivative),rows]
+            for mirror in range(2 if literal_mirrors else 1):
+                marked = np.asarray(header["sample_written"], bool)[:,sample,2*mirror:2*mirror+2]
+                # A fresh frequency is one q_irr slab. Partial restarts keep
+                # contiguous rows with identical value/slope masks together.
+                edges = np.r_[0, 1+np.flatnonzero(np.any(marked[1:] != marked[:-1], axis=1)), len(qids)]
+                for q0, q1 in zip(edges[:-1], edges[1:]):
+                    need_value, need_slope = ~marked[q0]
+                    if not (need_value or need_slope):
+                        continue
+                    span = (int(q0), int(q1))
+                    selected = (mirror_qids if mirror else qids)[q0:q1]
+                    rows = np.asarray([row_index[int(q)] for q in selected])
+                    h = roots[q0:q1]
+                    constant = 0.
+                    if vertex is not None:
+                        io_started = time.monotonic()
+                        constant = read_shared_pole_bank(bank_handle, span, meta=meta, header=header,
+                                                        fields=("constant",))["constant"]
+                        receipt["seconds"]["io"] = receipt["seconds"].get("io",0.)+time.monotonic()-io_started
+                    if need_value:
+                        chi = raw[0,rows]
                         if mirror:
                             chi = jnp.conj(chi)
-                        h = roots[q0:q1]
-                        constant = 0.
-                        if vertex is not None:
-                            constant = read_shared_pole_bank(bank_handle, span, meta=meta, header=header,
-                                                            fields=("constant",))["constant"]
-                        if derivative:
-                            saved = read_shared_pole_bank(bank_handle, span, meta=meta, header=header,
-                                sample_span=(sample,sample+1), fields=(fields[mirror][0],))
-                            w = saved[fields[mirror][0]][:,0] + constant
-                            value = execute(solve_slope, (h, w, chi), "sample_slope")
-                            del saved, w
-                        else:
-                            value = execute(solve_value, (h,chi)+(() if vertex is None else (contact,)),
-                                            "sample_dyson") - constant
-                            if vertex is not None and not mirror:
-                                _photon_sample_norms(receipt,value,q0,sample,bank_io["photon_layout"],mesh_xy)
-                            for iq in range(q0,q1):
-                                part = slice(iq-q0,iq-q0+1)
-                                if vertex is None:
-                                    _reciprocity_census(receipt,value[part],z[sample:sample+1],int(qids[iq]),iq,meta)
-                                    if ordered and _self_negative(int(qids[iq]),meta):
-                                        _tr_odd_census(receipt,solve_value,h[part],chi[part],value[part],z[sample:sample+1],int(qids[iq]))
+                        value = execute(solve_value, (h,chi)+(() if vertex is None else (contact,)),
+                                        "sample_dyson") - constant
+                        if vertex is not None and not mirror:
+                            _photon_sample_norms(receipt,value,q0,sample,bank_io["photon_layout"],mesh_xy)
+                        for iq in range(q0,q1):
+                            part = slice(iq-q0,iq-q0+1)
+                            if vertex is None:
+                                _reciprocity_census(receipt,value[part],z[sample:sample+1],int(qids[iq]),iq,meta)
+                                if ordered and _self_negative(int(qids[iq]),meta):
+                                    _tr_odd_census(receipt,solve_value,h[part],chi[part],value[part],z[sample:sample+1],int(qids[iq]))
+                        wait_started = time.monotonic()
+                        value.block_until_ready()
+                        receipt["seconds"]["sample_value_wait"] = receipt["seconds"].get("sample_value_wait",0.)+time.monotonic()-wait_started
                         io_started = time.monotonic()
-                        write(q_span=span, sample_span=(sample,sample+1), **{field: value[:,None]})
+                        write(q_span=span, sample_span=(sample,sample+1), **{fields[mirror][0]: value[:,None]})
                         receipt["seconds"]["io"] = receipt["seconds"].get("io",0.)+time.monotonic()-io_started
-                        del chi, value, h, constant
+                        del chi
+                    else:
+                        io_started = time.monotonic()
+                        saved = read_shared_pole_bank(bank_handle, span, meta=meta, header=header,
+                            sample_span=(sample,sample+1), fields=(fields[mirror][0],))
+                        receipt["seconds"]["io"] = receipt["seconds"].get("io",0.)+time.monotonic()-io_started
+                        value = saved[fields[mirror][0]][:,0]
+                        del saved
+                    if need_slope:
+                        chi = raw[1,rows]
+                        if mirror:
+                            chi = jnp.conj(chi)
+                        w = value if vertex is None else value+constant
+                        slope = execute(solve_slope, (h, w, chi), "sample_slope")
+                        wait_started = time.monotonic()
+                        slope.block_until_ready()
+                        receipt["seconds"]["sample_slope_wait"] = receipt["seconds"].get("sample_slope_wait",0.)+time.monotonic()-wait_started
+                        io_started = time.monotonic()
+                        write(q_span=span, sample_span=(sample,sample+1), **{fields[mirror][1]: slope[:,None]})
+                        receipt["seconds"]["io"] = receipt["seconds"].get("io",0.)+time.monotonic()-io_started
+                        del chi, w, slope
+                    del value, h, constant
             receipt["batches"].append(dict(sample=sample))
             del raw
             progress.step()
@@ -1179,6 +1197,7 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
     ledger.live_stages = caller_live
     receipt["stream_passes"] = len(receipt["batches"])
     receipt["batch_reason"] = "one frequency per stream; value and derivative share both Green/FFT products"
+    receipt["io_scope"] = "I/O envelope includes packing and device finite checks; sample waits are timed separately"
     receipt["completion"] = bool(np.asarray(header["sample_written"]).all())
     return _finish_receipt(receipt,meta,header,started)
 
