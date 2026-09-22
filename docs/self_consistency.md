@@ -738,3 +738,6 @@ energy-only tail must remain empty at the existing `FRACTIONAL_TOL` criterion;
 entry into the fractional manifold refuses without promoting protected bands.
 This is an explicit empty-tail approximation, not a claim of exact thermal
 occupations on all stored bands.
+The `frontier` tail law requires a fully admitted conduction band across k.
+If none exists, the conduction fit is absent and tail energies remain at DFT;
+isolated eligible k cells must not trigger an unrestricted affine extrapolation.

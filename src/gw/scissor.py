@@ -867,6 +867,10 @@ def fit_scissor(
                 np.sum(w_frontier * correction) / np.sum(w_frontier))
             mask_c = frontier_mask
             w_c = w_frontier
+        else:
+            # No complete frontier: no tail law, never the affine fallback.
+            mask_c = np.zeros_like(mask_c)
+            w_c = w_kn[mask_c]
     # No-information laws.  _wls_line returns (0, 0) on an empty class and
     # (0, y0) on a single sample; as an E_QP = α·E + β scissor those
     # extrapolate every band to ZERO / to a constant — on the metallic

@@ -415,3 +415,17 @@ def test_scissor_fit_fields_are_all_named():
                    n_fit_v=1, n_fit_c=1, rmse_v_ev=0.0, rmse_c_ev=0.0,
                    w_fit_v=1.0, w_fit_c=1.0)
     assert f.w_fit_v == 1.0
+
+
+def test_frontier_without_complete_band_has_no_fitted_tail():
+    e = np.array([[0., 20., 30.], [1., 20.1, 31.], [2., 20.2, 32.], [3.,21.,33.]])
+    q = e.copy()
+    q[:3,1] += [.7,.3,.2]
+    mask = np.zeros_like(e, dtype=bool)
+    mask[:3,1] = True
+    valence = np.zeros_like(mask)
+    affine = fit_scissor(e,q,valence,mask,k_weights=np.ones(4))
+    assert affine.alpha_c < 0  # sparse samples cannot define the global tail
+    frontier = fit_scissor(e,q,valence,mask,k_weights=np.ones(4),
+                           conduction_frontier_tol_ev=1e-4)
+    assert (frontier.alpha_c,frontier.beta_c_ev,frontier.n_fit_c) == (1.,0.,0)
