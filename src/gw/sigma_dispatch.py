@@ -796,10 +796,15 @@ def _mpa_sigma_model_resources(W_by_role, sigma_w_model, head_correction=None):
         handle = W_by_role["shared_pole"]
         fit_path = handle["path"]
         fit_identity, fit_digest = handle["identity"], handle["digest"]
-        if (handle.get("representation") == "sector-ordered-ph"
-                and getattr(head_correction, "value", head_correction) != "off"):
-            raise NotImplementedError(
-                "GATE shared_pole_sector_head: the ordered sector consumer requires head_correction=off")
+        if handle.get("representation") == "sector-ordered-ph":
+            policy = getattr(head_correction, "value", head_correction)
+            if policy == "no_local_fields":
+                if handle.get("direct_photon_head") != "first_order_cc_ct_tc_tt":
+                    raise ValueError("GATE shared_pole_sector_head: direct four-current Γ is absent from the sector bank")
+            elif policy != "off":
+                raise NotImplementedError(
+                    "GATE shared_pole_sector_head: full photon Γ with local fields is unavailable")
+            return fit_path, None, fit_identity, fit_digest
         if getattr(head_correction, "value", head_correction) != "off":
             head_fit_path = W_by_role.get("mpa_head")
             if (head_fit_path is None or head_fit_path.get("identity") != fit_identity
@@ -1199,9 +1204,13 @@ def _compute_mpa_sigma(
     from .sigma_box_plan import resolve_sigma_box_cache_dir
     quadrature_cache_dir = resolve_sigma_box_cache_dir(
         config.sigma.quadrature_cache_dir, input_dir)
+    sector_handle = W_by_role.get("shared_pole", {})
     head = None
     if head_fit_path is None:
-        print_fn("  shared-pole scalar head: OFF by explicit head_correction policy")
+        if sector_handle.get("direct_photon_head") == "first_order_cc_ct_tc_tt":
+            print_fn("  shared-pole photon Γ: first-order direct CC/CT/TC/TT included in sector poles")
+        else:
+            print_fn("  shared-pole scalar head: OFF by explicit head_correction policy")
     else:
         head = (head_fit_path if isinstance(head_fit_path, dict) else
                 _bundle_reader.read_head_fit_collective(
@@ -1238,7 +1247,6 @@ def _compute_mpa_sigma(
             fixed_quadrature_session.setdefault(sigma_w_model, {})),
         material_class=material_class,
         print_fn=print_fn)
-    sector_handle = W_by_role.get("shared_pole", {})
     if sector_handle.get("representation") == "sector-ordered-ph":
         from .mpa.sector_sigma import compute_sector_sigma
         body = compute_sector_sigma(

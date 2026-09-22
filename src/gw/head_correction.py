@@ -710,6 +710,12 @@ def small_head_wing_halves_sharded(
         Y_x, W_body_xy, Z_y, mesh_xy=mesh_xy)
 
 
+def _solve_photon_head(D, R):
+    lhs = jnp.eye(4, dtype=jnp.complex128)[None] - jnp.einsum(
+        "sik,skj->sij", D, R, optimize=True)
+    return jnp.linalg.solve(lhs, D), lhs
+
+
 @jax.jit
 def _static_slab_photon_head_moment_chunk(
     q_cart: jax.Array,
@@ -729,9 +735,7 @@ def _static_slab_photon_head_moment_chunk(
         jnp.einsum("sa,aij->sij", qxy, H, optimize=True)
         + jnp.einsum("sa,sb,abij->sij", qxy, qxy, S, optimize=True)
     )
-    identity = jnp.eye(4, dtype=jnp.complex128)[None, :, :]
-    lhs = identity - jnp.einsum("sik,skj->sij", D, R, optimize=True)
-    W_head = jnp.linalg.solve(lhs, D)
+    W_head, lhs = _solve_photon_head(D, R)
 
     valid = jnp.arange(q.shape[0], dtype=jnp.int32) < valid_count
     weight = jnp.where(

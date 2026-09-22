@@ -106,6 +106,7 @@ __all__ = [
     "slab_minibz_photon_cubature",
     "validate_slab_minibz_photon_receipt",
     "iter_minibz_photon_samples",
+    "bulk_photon_D_raw",
     "build_miniBZ_dq_cart",
     "build_v_head_miniBZ_fn_3d",
 ]
@@ -783,6 +784,11 @@ def _photon_D_raw(q_cart, *, kind, zc):
     D_raw[:, 1:, 1:] = (
         COULOMB_GAUGE_TT_SIGN * v[:, None, None] * transverse)
     return D_raw, q2
+
+
+def bulk_photon_D_raw(q_cart):
+    """Bare bulk C⊕T kernel on nonzero Cartesian mini-BZ points."""
+    return _photon_D_raw(q_cart, kind="bulk_3d", zc=None)
 
 
 def _slab_minibz_receipt_digest(receipt) -> str:

@@ -388,6 +388,7 @@ class SCInputs:
     wfns_transverse: Wavefunctions | None = None
     bispinor_v_q_path: str | None = None
     mu_bases: tuple | None = None
+    photon_g0_vectors: tuple | None = None
     #: Validated, device-resident nearest-neighbour links + exact DFT
     #: velocity.  None preserves the historical fixed-DFT head path exactly.
     parallel_transport: object | None = None
@@ -3403,6 +3404,20 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             None if inputs.fixed_quadrature_session is None else
             inputs.fixed_quadrature_session.setdefault("chi", {}))
 
+    from .gw_config import uses_direct_bispinor_shared_pole_head
+    if uses_direct_bispinor_shared_pole_head(inputs.config):
+        sigma = inputs.band_slices.sigma
+        if (sigma.start != 0 or entry_occ_state is None
+                or U_full.shape != (wfns_qp.enk.shape[0], sigma.stop, sigma.stop)
+                or not bool(jnp.array_equal(wfns_qp.enk[:, sigma], E_full))
+                or not bool(jnp.array_equal(wfns_qp.occ, entry_occ_state.f_kn))):
+            raise ValueError("GATE photon_direct_map_state: Γ E, f, and U "
+                             "must be the same map-entry QP state")
+        inputs.print_fn(f"    direct photon Γ map state: iteration={state.iteration}, "
+                        f"active=[{inputs.band_slices.b0},{inputs.band_slices.b3}), "
+                        f"occupations={entry_occ_state.occ_hash}; "
+                        "inactive velocity rotation=identity")
+
     def _screening(mpa_plan, iteration_head_response, *, producer=None,
                    quad_override=None):
         """Call the driver-owned producer/reuse provider at one map seam."""
@@ -3429,6 +3444,9 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             **(dict(wfns_transverse=wfns_transverse_qp,
                     bispinor_v_q_path=inputs.bispinor_v_q_path,
                     mu_bases=inputs.mu_bases,
+                    photon_g0_vectors=inputs.photon_g0_vectors,
+                    photon_head_cache=inputs.screening_seed_cache,
+                    photon_head_rotation=U_full,
                     photon_static_reference=(None if inputs.screening_seed_cache is None else
                         inputs.screening_seed_cache.get('photon_static_reference')))
                if inputs.config.sigma.w_model == "shared_pole"
@@ -3465,7 +3483,8 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     # skipped and the fold never evaluated (``gw.shared_pole_head``).
     direct_only_shared_pole = (
         inputs.config.head.correction is HeadCorrection.NO_LOCAL_FIELDS
-        and inputs.config.sigma.w_model == "shared_pole")
+        and inputs.config.sigma.w_model == "shared_pole"
+        and int(inputs.meta.nspinor) != 4)
     fixed_dft_full_head = (inputs.fixed_dft_head_response is not None or
         (pt is None and inputs.config.sigma.w_model == "shared_pole"
          and (inputs.config.head.correction is HeadCorrection.FULL
@@ -6113,6 +6132,7 @@ def run_sc_driver(
     wfns_transverse=None,
     bispinor_v_q_path=None,
     mu_bases=None,
+    photon_g0_vectors=None,
     wfn_fingerprint_binding=None,
     charge_zeta_identity=None,
     quad,
@@ -6325,6 +6345,7 @@ def run_sc_driver(
         wfns_dft=wfns, V_q=V_q, kin_ion_dft=kin_ion,
         wfns_transverse=wfns_transverse, bispinor_v_q_path=bispinor_v_q_path,
         mu_bases=mu_bases,
+        photon_g0_vectors=photon_g0_vectors,
         head_channel=head_channel,
         quad=quad, e_ref=e_ref,
         static_head_terms=static_head_terms,

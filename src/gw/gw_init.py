@@ -49,6 +49,7 @@ from .gw_config import (
 	refuse_unsupported_bispinor_gw,
 	resolve_xla_gpu_memory_env,
 	uses_coupled_photon_head,
+	uses_direct_bispinor_shared_pole_head,
 )
 
 # ── The ζ file's DOOR ────────────────────────────────────────────────────
@@ -2663,8 +2664,8 @@ def _compute_photon_vq(
                     centroid_C_idx=_cent_C_idx_for_orchestrator,
                     centroid_T_idx=_cent_T_idx_for_orchestrator,
                     use_ibz=True,
-                    tt_head_correction=bool(
-                        cfg.head.bispinor_tt_head_correction),
+                    tt_head_correction=(bool(cfg.head.bispinor_tt_head_correction)
+                        or uses_direct_bispinor_shared_pole_head(cfg)),
                     bispinor_gw_mode=None,
                     charge_representation=None,
                     spatial_current_representation=None,
@@ -2674,7 +2675,8 @@ def _compute_photon_vq(
     # Both views stay on the canonical file carrier, as on the scalar route:
     # ``_finalize_vq_views`` is the one packing owner.
     G0_all = photon_g0_vectors[0]
-    if not uses_coupled_photon_head(cfg):
+    if not (uses_coupled_photon_head(cfg)
+            or uses_direct_bispinor_shared_pole_head(cfg)):
         photon_g0_vectors = None
     head_channel = None
     if str(getattr(cfg.head, 'mc_average_placement', 'off')) != 'off':
@@ -3349,7 +3351,8 @@ def _restart_current_carrier(
 def _restart_gamma_vectors(
         _to_run_order, basis_T, cfg, mesh_xy, meta, photon_g0_vectors, tmp_dir):
     """Produce canonical Gamma vectors from the stored one-leg factors."""
-    if uses_coupled_photon_head(cfg):
+    if (uses_coupled_photon_head(cfg)
+            or uses_direct_bispinor_shared_pole_head(cfg)):
         from file_io.restart_bundle import read_photon_gamma
         bases = (meta.mu_basis, basis_T, basis_T, basis_T)
         photon_g0_vectors = tuple(

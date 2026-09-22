@@ -691,6 +691,9 @@ def compute_screening_model(
     bispinor_v_q_path=None,
     mu_bases=None,
     photon_static_reference=None,
+    photon_g0_vectors=None,
+    photon_head_cache=None,
+    photon_head_rotation=None,
     head_resolver=None,
     head_channel=None,
     mpa_plan=None,
@@ -754,7 +757,10 @@ def compute_screening_model(
                 iteration_head_response=iteration_head_response,
                 material_class=material_class, wfns_transverse=wfns_transverse,
                 photon_static_reference=photon_static_reference,
-                bispinor_v_q_path=bispinor_v_q_path, mu_bases=mu_bases)
+                bispinor_v_q_path=bispinor_v_q_path, mu_bases=mu_bases,
+                photon_g0_vectors=photon_g0_vectors,
+                photon_head_cache=photon_head_cache,
+                photon_head_rotation=photon_head_rotation)
         reuse_path = getattr(config.mpa, "fit_reuse_file", None)
         if reuse_path is not None:
             if mpa_plan is None:

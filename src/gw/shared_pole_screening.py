@@ -146,7 +146,9 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
                         head_resolver=None, mpa_plan=None, iteration_head_response=None,
                         material_class=None, wfns_transverse=None,
                         bispinor_v_q_path=None, mu_bases=None,
-                        photon_static_reference=None):
+                        photon_static_reference=None,
+                        photon_g0_vectors=None, photon_head_cache=None,
+                        photon_head_rotation=None):
     """Build current W; only one-shot models may use ISDF restart membership.
 
     SC labels own separate map scratch. ``restart`` may restore the invariant
@@ -306,7 +308,11 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
             from .response_bank import compute_photon_bank
             record("bank", compute_photon_bank(wfns, wfns_transverse, meta, config,
                 mesh_xy=mesh_xy, sym=sym, mu_bases=mu_bases, layout=photon_layout,
-                occupation_state=occupation_state, sample_plan=recipe, bank_io=bank, print_fn=print_fn))
+                occupation_state=occupation_state, sample_plan=recipe, bank_io=bank,
+                wfn=wfn, photon_g0_vectors=photon_g0_vectors,
+                wfn_fingerprint_binding=wfn_fingerprint_binding,
+                photon_head_cache=photon_head_cache,
+                photon_head_rotation=photon_head_rotation, print_fn=print_fn))
         else:
             record("bank", produce_w_bank(wfns, meta, config, mesh_xy=mesh_xy,
                 sym=sym, sample_plan=recipe, bank_io=bank, print_fn=print_fn))
@@ -336,13 +342,19 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
             result['photon_static_reference'] = receipts['bank']['static_reference']
         from .gw_config import HeadCorrection
         if config.head.correction is not HeadCorrection.OFF:
-            from .shared_pole_head import build_shared_pole_head
-            head, iteration_head = build_shared_pole_head(
-                handle, header, V_q, wfns, meta, config, mesh_xy=mesh_xy, wfn=wfn,
-                response=iteration_head_response, head_resolver=head_resolver,
-                plan=mpa_plan, material_class=material_class, occupation_state=occupation_state)
-            result.update(mpa_head=head, iteration_head=iteration_head)
-            record("head", head)
+            if photon:
+                from .gw_config import uses_direct_bispinor_shared_pole_head
+                if not uses_direct_bispinor_shared_pole_head(config):
+                    raise ValueError("GATE shared_pole_photon_head: unsupported photon Γ policy")
+                handle["direct_photon_head"] = "first_order_cc_ct_tc_tt"
+            else:
+                from .shared_pole_head import build_shared_pole_head
+                head, iteration_head = build_shared_pole_head(
+                    handle, header, V_q, wfns, meta, config, mesh_xy=mesh_xy, wfn=wfn,
+                    response=iteration_head_response, head_resolver=head_resolver,
+                    plan=mpa_plan, material_class=material_class, occupation_state=occupation_state)
+                result.update(mpa_head=head, iteration_head=iteration_head)
+                record("head", head)
         if (config.debug.write_w or config.write_poles) and not photon:
             from file_io.shared_pole_store import export_shared_pole_outputs
             with timing.section("spole.outputs"):

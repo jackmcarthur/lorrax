@@ -761,7 +761,7 @@ def _finish_receipt(receipt, meta, header, started):
 
 
 def compute_moment_bank(wfns, meta, config, *, mesh_xy, sym, bank_io,
-                        vertex=None, contact=None):
+                        vertex=None, contact=None, direct_head=None):
     """Stage B: six exact correlations, physical recurrence, scratch write."""
     from file_io.shared_pole_store import write_shared_pole_bank
     header, qids, census = _bank_context(wfns, meta, sym, bank_io, mesh_xy)
@@ -802,6 +802,15 @@ def compute_moment_bank(wfns, meta, config, *, mesh_xy, sym, bank_io,
             names = (("constant", "M0", "M1", "M2", "M3") if vertex is not None else
                      (("M0", "M1", "M2", "M3") if ordered else ("M1", "M3")))
             values = dict(zip(names,result))
+            if direct_head is not None and q0 == 0:
+                if int(qids[0]) != 0:
+                    raise ValueError("GATE photon_direct_gamma_parent: Γ is not the first q parent")
+                from .photon_direct_head import add_direct_gamma_field
+                for name, coefficient in (("constant", direct_head["constant"]),
+                        *((f"M{i}", direct_head["moments"][i]) for i in range(4))):
+                    values[name] = add_direct_gamma_field(values[name], coefficient,
+                        gamma_vectors=direct_head["gamma_vectors"],
+                        layout=bank_io["photon_layout"], mesh=mesh_xy)
             if ordered:
                 for iq in range(q0,q1):
                     part = slice(iq-q0,iq-q0+1)
@@ -1038,7 +1047,7 @@ def integrate_response_frequency(wfns, meta, mesh_xy, rules, *, q_ids, sample,
 
 
 def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_io,
-                        vertex=None, contact=None, print_fn=print):
+                        vertex=None, contact=None, direct_head=None, print_fn=print):
     """Stage A: integrate value and derivative together, one frequency at a time."""
     with timing.section('bank.setup', announce=True):
         header,qids,census = _bank_context(wfns,meta,sym,bank_io,mesh_xy)
@@ -1142,24 +1151,22 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                         constant = read_shared_pole_bank(bank_handle, span, meta=meta, header=header,
                                                         fields=("constant",))["constant"]
                         receipt["seconds"]["io"] = receipt["seconds"].get("io",0.)+time.monotonic()-io_started
+                    head_update = None
+                    if direct_head is not None and q0 == 0:
+                        from .photon_direct_head import add_direct_gamma_field
+                        head_update = direct_head["constant"] + (
+                            jnp.conj(direct_head["Wc"][sample]) if mirror
+                            else direct_head["Wc"][sample])
+                        def gamma_add(packed, coefficient):
+                            return add_direct_gamma_field(packed, coefficient,
+                                gamma_vectors=direct_head["gamma_vectors"],
+                                layout=bank_io["photon_layout"], mesh=mesh_xy)
                     if need_value:
-                        chi = raw[0,rows]
+                        chi_value = raw[0,rows]
                         if mirror:
-                            chi = jnp.conj(chi)
-                        value = execute(solve_value, (h,chi)+(() if vertex is None else (contact,)),
+                            chi_value = jnp.conj(chi_value)
+                        value = execute(solve_value, (h,chi_value)+(() if vertex is None else (contact,)),
                                         "sample_dyson") - constant
-                        if vertex is not None and not mirror:
-                            _photon_sample_norms(receipt,value,q0,sample,bank_io["photon_layout"],mesh_xy)
-                        for iq in range(q0,q1):
-                            part = slice(iq-q0,iq-q0+1)
-                            if vertex is None:
-                                _reciprocity_census(receipt,value[part],z[sample:sample+1],int(qids[iq]),iq,meta)
-                                if ordered and _self_negative(int(qids[iq]),meta):
-                                    _tr_odd_census(receipt,solve_value,h[part],chi[part],value[part],z[sample:sample+1],int(qids[iq]))
-                        io_started = time.monotonic()
-                        write(q_span=span, sample_span=(sample,sample+1), **{fields[mirror][0]: value[:,None]})
-                        receipt["seconds"]["io"] = receipt["seconds"].get("io",0.)+time.monotonic()-io_started
-                        del chi
                     else:
                         io_started = time.monotonic()
                         saved = read_shared_pole_bank(bank_handle, span, meta=meta, header=header,
@@ -1167,16 +1174,37 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                         receipt["seconds"]["io"] = receipt["seconds"].get("io",0.)+time.monotonic()-io_started
                         value = saved[fields[mirror][0]][:,0]
                         del saved
+                        if head_update is not None:
+                            value = gamma_add(value, -head_update)
                     if need_slope:
                         chi = raw[1,rows]
                         if mirror:
                             chi = jnp.conj(chi)
                         w = value if vertex is None else value+constant
                         slope = execute(solve_slope, (h, w, chi), "sample_slope")
+                        if head_update is not None:
+                            coefficient = (jnp.conj(direct_head["dWc_ds"][sample])
+                                           if mirror else direct_head["dWc_ds"][sample])
+                            slope = gamma_add(slope, coefficient)
                         io_started = time.monotonic()
                         write(q_span=span, sample_span=(sample,sample+1), **{fields[mirror][1]: slope[:,None]})
                         receipt["seconds"]["io"] = receipt["seconds"].get("io",0.)+time.monotonic()-io_started
                         del chi, w, slope
+                    if need_value:
+                        if head_update is not None:
+                            value = gamma_add(value, head_update)
+                        if vertex is not None and not mirror:
+                            _photon_sample_norms(receipt,value,q0,sample,bank_io["photon_layout"],mesh_xy)
+                        for iq in range(q0,q1):
+                            part = slice(iq-q0,iq-q0+1)
+                            if vertex is None:
+                                _reciprocity_census(receipt,value[part],z[sample:sample+1],int(qids[iq]),iq,meta)
+                                if ordered and _self_negative(int(qids[iq]),meta):
+                                    _tr_odd_census(receipt,solve_value,h[part],chi_value[part],value[part],z[sample:sample+1],int(qids[iq]))
+                        io_started = time.monotonic()
+                        write(q_span=span, sample_span=(sample,sample+1), **{fields[mirror][0]: value[:,None]})
+                        receipt["seconds"]["io"] = receipt["seconds"].get("io",0.)+time.monotonic()-io_started
+                        del chi_value
                     del value, h, constant
             receipt["batches"].append(dict(sample=sample))
             del raw
@@ -1242,7 +1270,11 @@ def photon_bare_operator(wfns, wfns_transverse, meta, *, path, mu_bases, layout,
 
 
 def compute_photon_bank(wfns, wfns_transverse, meta, config, *, mesh_xy, sym,
-                        mu_bases, layout, occupation_state, sample_plan, bank_io, print_fn=print):
+                        mu_bases, layout, occupation_state, sample_plan, bank_io,
+                        wfn=None, photon_g0_vectors=None,
+                        wfn_fingerprint_binding=None, photon_head_cache=None,
+                        photon_head_rotation=None,
+                        print_fn=print):
     """Build a full photon bank through the existing sample/moment stages.
 
     ``bank_io`` names the initialized scratch path, current identity and
@@ -1300,6 +1332,12 @@ def compute_photon_bank(wfns, wfns_transverse, meta, config, *, mesh_xy, sym,
                                      mesh_xy=mesh_xy, layout=layout)
     bank["photon_v"] = photon_bare_operator(wfns, wfns_transverse, meta,
         path=bank["bispinor_v_q_path"], mu_bases=mu_bases, layout=layout, mesh_xy=mesh_xy)
+    from .gw_config import uses_direct_bispinor_shared_pole_head
+    if uses_direct_bispinor_shared_pole_head(config):
+        from .photon_direct_head import subtract_bare_tt_from_bank
+        bank["photon_v"] = subtract_bare_tt_from_bank(
+            bank["photon_v"], photon_g0_vectors,
+            layout=layout, mesh=mesh_xy, wfn=wfn, meta=meta)
     receipt["seconds"]["endpoints_and_V"] = time.monotonic()-before
     before = time.monotonic()
     if jax.process_index() == 0:
@@ -1334,17 +1372,52 @@ def compute_photon_bank(wfns, wfns_transverse, meta, config, *, mesh_xy, sym,
             io.sync_writes()
     receipt["seconds"]["static_contact"] = time.monotonic()-before
     del grid, drude
+    direct_head = None
+    if uses_direct_bispinor_shared_pole_head(config):
+        from .qsgw_head import read_authenticated_dipole_velocity, _pad_head_band_manifold
+        from .photon_direct_head import build_direct_photon_head, packed_gamma_vectors
+        cache = photon_head_cache if photon_head_cache is not None else {}
+        velocity = cache.get("direct_photon_velocity")
+        if velocity is None:
+            host = read_authenticated_dipole_velocity(
+                os.path.join(config.input_dir, "dipole.h5"), wfn=wfn,
+                meta=meta, config=config,
+                wfn_fingerprint_binding=wfn_fingerprint_binding)
+            nk, nb = int(host.shape[1]), int(host.shape[-1])
+            empty = np.zeros((nk, nb), np.float64)
+            velocity, _, _, _ = _pad_head_band_manifold(
+                host, empty, empty, empty, mesh=mesh_xy)
+            cache["direct_photon_velocity"] = velocity
+            del host
+        if photon_head_rotation is not None:
+            from .qsgw_head import rotate_velocity_active_to_qp
+            velocity = rotate_velocity_active_to_qp(
+                velocity, photon_head_rotation, mesh=mesh_xy)
+        direct_head = build_direct_photon_head(
+            velocity, wfns, occupation_state, contact_packed=contact,
+            photon_g0_vectors=photon_g0_vectors, layout=layout,
+            mesh=mesh_xy, meta=meta, wfn=wfn,
+            frequencies_ry=bank_points(sample_plan), print_fn=print_fn)
+        direct_head["gamma_vectors"] = packed_gamma_vectors(
+            photon_g0_vectors, layout, mesh_xy)
+        receipt["direct_gamma"] = dict(
+            approximation="first_order_dipole_current_fd",
+            sectors="CC_CT_TC_TT", local_fields=False,
+            samples="4x131072 Sobol exterior plus screened sphere",
+            static_limit="Thomas-Fermi at z=0; dynamic Drude for Im(z)>0")
     before = time.monotonic()
     if jax.process_index() == 0:
         print("photon bank: exact moments and W_infinity", flush=True)
     receipt["moments"] = compute_moment_bank(wfns, meta, config, mesh_xy=mesh_xy,
-        sym=sym, bank_io=bank, vertex=vertex, contact=contact)
+        sym=sym, bank_io=bank, vertex=vertex, contact=contact,
+        direct_head=direct_head)
     receipt["seconds"]["moments"] = time.monotonic()-before
     before = time.monotonic()
     if jax.process_index() == 0:
         print("photon bank: ordered samples and derivatives", flush=True)
     receipt["samples"] = produce_sample_bank(wfns, meta, config, mesh_xy=mesh_xy,
-        sym=sym, sample_plan=sample_plan, bank_io=bank, vertex=vertex, contact=contact, print_fn=print_fn)
+        sym=sym, sample_plan=sample_plan, bank_io=bank, vertex=vertex,
+        contact=contact, direct_head=direct_head, print_fn=print_fn)
     receipt["seconds"]["samples"] = time.monotonic()-before
     header = validate_shared_pole_bank(bank["path"], expected_identity=bank["identity"],
                                        mesh_xy=mesh_xy, require_complete=True)

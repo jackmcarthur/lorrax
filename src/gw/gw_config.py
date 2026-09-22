@@ -3559,6 +3559,17 @@ def uses_coupled_photon_head(config) -> bool:
             and config.head.correction is HeadCorrection.FULL)
 
 
+def uses_direct_bispinor_shared_pole_head(config) -> bool:
+    """First-order direct Γ completion of the ordered four-current bank."""
+    return (bool(config.bispinor)
+            and config.compute_mode is ComputeMode.MPA
+            and config.sigma.w_model == "shared_pole"
+            and config.screening.diagrams is ScreeningDiagrams.W_RPA
+            and coerce_bispinor_gw_mode(config.bispinor_gw)
+                is BispinorGWMode.BARE_TRANSVERSE
+            and config.head.correction is HeadCorrection.NO_LOCAL_FIELDS)
+
+
 def incumbent_bispinor_head_record(config) -> tuple[str, str]:
     """``(banner, run_record_line)`` for a bispinor deck on the INCUMBENT route; see docs/architecture/decisions.md."""
     if config.head.correction is HeadCorrection.OFF:
@@ -3639,11 +3650,7 @@ def refuse_unsupported_bispinor_gw(config) -> None:
     """Validate four-current modes and require live direct fields for QSGW; see docs/architecture/decisions.md."""
     mode = coerce_bispinor_gw_mode(
         getattr(config, "bispinor_gw", BispinorGWMode.BARE_TRANSVERSE))
-    shared_pole_direct = (
-        config.compute_mode is ComputeMode.MPA
-        and config.sigma.w_model == "shared_pole"
-        and config.screening.diagrams is ScreeningDiagrams.W_RPA
-        and mode is BispinorGWMode.BARE_TRANSVERSE)
+    shared_pole_direct = uses_direct_bispinor_shared_pole_head(config)
     if (bool(config.bispinor)
             and config.head.correction is HeadCorrection.NO_LOCAL_FIELDS
             and not shared_pole_direct):
