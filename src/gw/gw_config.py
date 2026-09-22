@@ -3585,8 +3585,12 @@ def incumbent_bispinor_head_record(config) -> tuple[str, str]:
             "DEBUG: no Gamma-cell head at all (head_correction=off on the "
             "incumbent route); NOT a production calculation")
     if config.head.correction is HeadCorrection.NO_LOCAL_FIELDS:
-        return "", ("shared-pole direct charge head only; no wing/body fold, "
-                    "intraband Drude term, or transverse Gamma-cell head")
+        if uses_direct_bispinor_shared_pole_head(config):
+            return "", ("first-order direct bulk CC/CT/TC/TT Gamma-cell head "
+                        "in ordered shared-pole sectors; FD metal Drude and "
+                        "screened sphere; no wing/body fold; spatial current "
+                        "uses the dipole-velocity approximation")
+        return "", "no-local-fields head outside the direct four-current route"
     # With head_correction = full, the CHARGE head is band-diagonal and
     # there is NO transverse q=Gamma head on this route now that the overlay
     # has no deck key -- say so rather than let a bulk number look complete.

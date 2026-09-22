@@ -98,6 +98,7 @@ from .gw_config import (
 	packed_bare_transverse_route,
 	packed_photon_replaces_charge_sigma, packed_photon_screens_current,
 	refuse_unimplemented_compute_mode, uses_dynamic_packed_photon_route,
+	uses_direct_bispinor_shared_pole_head,
 	uses_four_spinor_finite_q_charge, uses_static_photon_response,
 	infer_material_class, resolve_mpa_sampling_alpha,
 	validate_material_inputs)
@@ -292,13 +293,16 @@ def _open_production_report(args):
 
 def _report_head_and_photon_policy(config, print0, report):
     """Report the resolved head and photon policies."""
+    direct_photon = uses_direct_bispinor_shared_pole_head(config)
     print0(
         f"  Head policy: head_correction={config.head.correction.value}; "
         f"screening_diagrams={config.screening.diagrams.value}; "
         f"direct diagnostic source={config.head.wcoul0_source}. "
         + ({
             HeadCorrection.FULL: "macroscopic W, local fields exactly once",
-            HeadCorrection.NO_LOCAL_FIELDS: "diagnostic epsilon head",
+            HeadCorrection.NO_LOCAL_FIELDS: (
+                "first-order direct four-current Gamma head" if direct_photon
+                else "diagnostic epsilon head"),
             HeadCorrection.OFF: "no special Gamma-cell contribution",
         }[config.head.correction]))
     if config.bispinor:
@@ -315,7 +319,11 @@ def _report_head_and_photon_policy(config, print0, report):
             f"  Bispinor GW policy: bispinor_gw={config.bispinor_gw.value}"
             f"{_bispinor_note}")
         _bare_taken, _bare_reason = packed_bare_transverse_route(config)
-        if config.bispinor_gw.value == "full_static_cohsex":
+        if direct_photon:
+            report.progress(
+                "Photon route   : ordered shared-pole CC/CT/TC/TT bank "
+                "and common sector Sigma consumer")
+        elif config.bispinor_gw.value == "full_static_cohsex":
             report.progress(
                 "Photon route   : packed screened static photon operator "
                 "(sixteen response and Sigma blocks; coupled 4x4 Dyson solve; "
