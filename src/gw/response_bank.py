@@ -35,11 +35,11 @@ def response_algebra(meta, config, *, mesh_xy, n, ordered=False, photon=False):
 
     Returns
     -------
-    samples, moments, receipt
+    value, slope, moments, receipt
         Jitted functions accepting complex128 ``[b,n,n]`` operators at
         ``P(None,'x','y')``, and the resolved backend/prefactor description.
-        ``samples(H, chi_raw, dchi_raw)`` returns physical Wc (Ry) and its
-        s derivative (Ry^-1). ``moments(H, A0, A1)`` takes already scaled
+        ``value(H, chi_raw)`` returns Wc (Ry); ``slope(H, Wc, dchi_raw)``
+        returns its s derivative (Ry^-1), restoring the bare operator internally (photon input is W-V). ``moments(H, A0, A1)`` takes already scaled
         bare-response expansion coefficients and returns M1/M3 (Ry^3/Ry^5).
         Neither routine Hermitizes its inputs or outputs.
     """
@@ -51,7 +51,7 @@ def response_algebra(meta, config, *, mesh_xy, n, ordered=False, photon=False):
     route = resolution.batched_route
     backend = "off" if resolution.layout == "local" else "distributed"
     pref = _w_solve_pref_scalar(meta)
-    samples, moments, lu = _response_programs(
+    value, slope, moments, lu = _response_programs(
         mesh_xy, n, backend, route, pref, ordered,
         float(meta.cell_volume) if photon else None)
     algebra = {
@@ -72,7 +72,7 @@ def response_algebra(meta, config, *, mesh_xy, n, ordered=False, photon=False):
         algebra["constant"] = "W_infinity-V, retained separately from M0..M3"
         algebra["moment_convention"] = "M_k=C_(k+1)/2 about W_infinity"
         algebra["units"].update(M0="Ry^2", M2="Ry^4", constant="Ry")
-    return samples, moments, algebra
+    return value, slope, moments, algebra
 
 
 @lru_cache(maxsize=None)
@@ -91,16 +91,20 @@ def _response_programs(mesh_xy, n, backend, route, pref, ordered, volume):
     def congruence(h, a):
         return mm(mm(h, a), h)
 
-    @partial(jax.jit, in_shardings=(face, face, face),
-             out_shardings=(face, face))
-    def samples(h, chi_raw, dchi_raw):
-        # X=p0 H chi_raw H; Wc=H X (I-X)^-1 H.  The derivative
-        # uses E on BOTH sides, never E† (off-axis E is not Hermitian).
+    @partial(jax.jit, in_shardings=(face, face), out_shardings=face)
+    def value(h, chi_raw):
         x = pref * congruence(h, chi_raw)
-        xd = pref * congruence(h, dchi_raw)
         identity = jnp.broadcast_to(jnp.eye(n, dtype=h.dtype), x.shape)
         e = lu.batched(identity - x, identity.copy())
-        return congruence(h, mm(x, e)), congruence(h, mm(mm(e, xd), e))
+        return congruence(h, mm(x, e))
+
+    def derivative(w, dchi_raw):
+        # Full W on BOTH sides; no adjoint at complex frequency.
+        return mm(mm(w, pref * dchi_raw), w)
+
+    @partial(jax.jit, in_shardings=(face, face, face), out_shardings=face)
+    def slope(h, wc, dchi_raw):
+        return derivative(wc + mm(h, h), dchi_raw)
 
     @partial(jax.jit, in_shardings=(face, face, face),
              out_shardings=(face, face))
@@ -139,15 +143,15 @@ def _response_programs(mesh_xy, n, backend, route, pref, ordered, volume):
             identity = jnp.broadcast_to(jnp.eye(n, dtype=v.dtype), v.shape)
             return lu.batched(identity + mm(v, volume * contact), v.copy())
 
-        @partial(jax.jit, in_shardings=(face, face, face, face),
-                 out_shardings=(face, face))
-        def samples(v, chi_raw, dchi_raw, contact):
-            # Signed photon Dyson: W=(I-V chi)^-1 V. No square root of V_TT.
-            # dW/ds=W (dchi/ds) W, with no adjoint at complex frequency.
+        @partial(jax.jit, in_shardings=(face, face, face), out_shardings=face)
+        def value(v, chi_raw, contact):
             chi = pref * chi_raw - volume * contact
             identity = jnp.broadcast_to(jnp.eye(n, dtype=v.dtype), chi.shape)
-            w = lu.batched(identity - mm(v, chi), v.copy())
-            return w - v, mm(mm(w, pref * dchi_raw), w)
+            return lu.batched(identity - mm(v, chi), v.copy()) - v
+
+        @partial(jax.jit, in_shardings=(face, face, face), out_shardings=face)
+        def slope(v, wc, dchi_raw):
+            return derivative(wc + v, dchi_raw)
 
         @partial(jax.jit, in_shardings=(face,) * 6,
                  out_shardings=(face,) * 5)
@@ -165,7 +169,7 @@ def _response_programs(mesh_xy, n, backend, route, pref, ordered, volume):
                 result.append(mm(winf, rhs))
             return (winf - v, *(0.5 * c for c in result))
 
-    return samples, moments, lu
+    return value, slope, moments, lu
 
 
 def response_weights(wfns, meta):
@@ -300,12 +304,12 @@ def photon_static_contact(wfns, meta, *, mesh_xy, layout, vertex,
         if np.any((f != 0) & (f != 1)):
             raise ValueError("GATE photon_contact_state: fractional bank needs its FD state")
         from .minimax_screening import solve_laplace_minimax_interval
-        lo, hi = float(energy[f > 0].max()), float(energy[u > 0].min())
+        lo, hi = float(energy[f != 0].max()), float(energy[u != 0].min())
         gap = hi-lo
         if gap <= 0:
             raise ValueError("GATE photon_contact_state: gapless state needs FD occupations")
         quad = solve_laplace_minimax_interval(gap,
-            float(energy[u > 0].max()-energy[f > 0].min()),
+            float(energy[u != 0].max()-energy[f != 0].min()),
             target_error=sample_plan["bank_rule_tolerance"])
         kernel, fixed = response_stream(wfns, meta, mesh_xy=mesh_xy,
             q_ids=(0,), n_outputs=1, pair_mode="laplace_ordered", vertex=vertex)
@@ -560,12 +564,10 @@ def _bank_execution(meta, mesh_xy, receipt, config, *, photon=False):
             memory = executable.memory_analysis()
             if memory is None:
                 raise ValueError("GATE response_capacity: compiled memory unavailable")
-            stream = stage in ("real_time", "laplace", "windowed", "moment_correlation", "static_reference")
-            if stream and photon:
-                # The caller already holds a reservation for the response
-                # carry/outputs and prepared endpoints. Photon streams have
-                # no scalar matched-reference peak: price their compiled
-                # Green/FFT temporaries before executing the program.
+            stream = stage in ("real_time", "laplace", "windowed", "direct", "moment_correlation", "static_reference")
+            if stream:
+                # The caller reserves the sole carry; admit the actual
+                # Green/FFT workspace, without compiling a legacy comparator.
                 _, row = _reserve(meta, stage + "_temporaries", 0,
                                   memory.temp_size_in_bytes)
                 receipt["memory"].append(row)
@@ -581,8 +583,8 @@ def _bank_execution(meta, mesh_xy, receipt, config, *, photon=False):
                 arguments=memory.argument_size_in_bytes, outputs=memory.output_size_in_bytes,
                 temporaries=memory.temp_size_in_bytes,
                 aliases=memory.alias_size_in_bytes,
-                inherited_stream=stream and not photon,
-                stream_temporaries_admitted=stream and photon))
+                inherited_stream=False,
+                stream_temporaries_admitted=stream))
         with timing.fenced_section('bank.execute.' + stage):
             started = time.monotonic()
             result = executable(*args)
@@ -778,33 +780,6 @@ def _receipt(stage, census, bank_io):
         units={"Wc": "Ry", "dWc_ds": "Ry^-1", "M1": "Ry^3", "M3": "Ry^5"})
 
 
-def _stream_comparison(wfns, meta, mesh_xy, qids, receipt):
-    """Record ruling9's matched two-output compile bound on this geometry."""
-    ledger = meta.shared_pole_capacity
-    if ledger.stream_peak["status"] != "NOT_MEASURED":
-        return
-    from .w_isdf import _get_chi_fractional_contour_kernel_face
-    kernel, fixed = response_stream(wfns, meta, mesh_xy=mesh_xy,
-                                    q_ids=(int(qids[0]),), n_outputs=2)
-    _, f, u, ref, _ = response_weights(wfns, meta)
-    args = (jnp.zeros(1000), jnp.ones((2,1000), dtype=jnp.complex128), *fixed,
-            stream_weights(wfns, f, mesh_xy), stream_weights(wfns, u, mesh_xy), jnp.asarray(ref))
-    parent = wfns.green_parent
-    nk = meta.nk_tot if parent is None else parent.plan.n_parent
-    old = _get_chi_fractional_contour_kernel_face(mesh_xy,
-        (meta.nkx,meta.nky,meta.nkz), 2,
-        (nk,wfns.slices.nb_full,meta.mu_basis.n_packed,meta.nspinor),
-        k_unfold_plan=None if parent is None else parent.plan, layout=wfns.layout)
-    sizes = []
-    for name, item in (("bank", kernel),("incumbent",old)):
-        executable = item.lower(*args).compile()
-        m = executable.memory_analysis()
-        sizes.append(m.argument_size_in_bytes+m.output_size_in_bytes+m.temp_size_in_bytes-m.alias_size_in_bytes)
-        receipt.setdefault("stream_comparison", {})[name] = str(m)
-    ledger.record_stream_peak(*sizes,
-        reason=f"matched two-output/1000-node raw-parent compiled lower bounds; job.step {receipt['job']}.{receipt['step']}; same method as58108302.15; native workspace omitted equally")
-
-
 def _finish_receipt(receipt, meta, header, started):
     receipt["seconds"]["total"] = time.monotonic()-started
     receipt["bank_complete"] = bool(header["complete"])
@@ -833,13 +808,11 @@ def compute_moment_bank(wfns, meta, config, *, mesh_xy, sym, bank_io,
     ledger = meta.shared_pole_capacity
     ambient = ledger.live_stages
     started = time.monotonic()
-    if vertex is None:
-        _stream_comparison(wfns, meta, mesh_xy, qids, receipt)
     n = meta.mu_basis.n_packed if vertex is None else vertex[0][0].shape[2]
     face_bytes = 16*n**2 // mesh_xy.size
     # Two totals, next correlation, arithmetic temporaries and bounded H/solve.
     ordered = vertex is not None or not bool(sym.trs_allowed)
-    _, moments, receipt["algebra"] = response_algebra(meta, config,
+    _, _, moments, receipt["algebra"] = response_algebra(meta, config,
         mesh_xy=mesh_xy, n=n, ordered=ordered, photon=vertex is not None)
     per_q = 12 if ordered else 8
     qwidth = max(1,min(len(qids),int((.75*ledger.U_bytes_per_rank/face_bytes-16)/per_q)))
@@ -961,7 +934,7 @@ def _reciprocity_census(receipt, value, z_batch, q_full, parent, meta):
         for i in rows)
 
 
-def _tr_odd_census(receipt, samples, h, chi, dchi, value, z, q_full):
+def _tr_odd_census(receipt, solve_value, h, chi, value, z, q_full):
     """Measure the time-reversal-odd channel of an ordered bank at q = -q.
 
     At a self-negative q an imaginary-axis chi0 is real, and its transpose-
@@ -978,12 +951,11 @@ def _tr_odd_census(receipt, samples, h, chi, dchi, value, z, q_full):
     names = ("chi_odd_max_rel", "chi_odd_fro_rel", "chi_hermiticity_rel",
              "w_hermiticity_rel", "w_even_route_hermiticity_rel", "w_transpose_rel")
     # The Dyson owner requires face-sharded [1,n,n] operands.
-    symmetric = jax.jit(lambda c, dc: (0.5*(c + jnp.swapaxes(c, -1, -2)),
-                                       0.5*(dc + jnp.swapaxes(dc, -1, -2))),
-                        out_shardings=(h.sharding, h.sharding))
+    symmetric = jax.jit(lambda c: 0.5*(c + jnp.swapaxes(c, -1, -2)),
+                        out_shardings=h.sharding)
     for s in imaginary.tolist():
-        sym, dsym = symmetric(chi[s:s+1], dchi[s:s+1])
-        w_even = v + samples(h, sym, dsym)[0][0]
+        sym = symmetric(chi[s:s+1])
+        w_even = v + solve_value(h, sym)[0]
         values = np.asarray(_census_scalars(chi[s], v + value[s], w_even), dtype=np.float64)
         row = dict(q_full=q_full, z_ry=[float(z[s].real), float(z[s].imag)],
                    **{k: float(x) for k, x in zip(names, values)})
@@ -993,121 +965,84 @@ def _tr_odd_census(receipt, samples, h, chi, dchi, value, z, q_full):
 
 
 def response_quadrature(wfns, meta, sample_plan, receipt, *, ordered=False):
-    """Plan the same windowed real-time/Laplace rules for charge or photon panels.
-
-    ``sample_plan`` is the existing authenticated support plan. The returned
-    plain dictionary holds only band tables and quadrature rows, no operators.
-    """
-    z = bank_points(sample_plan)
-    energy,f,u,reference,_ = response_weights(wfns,meta)
-    masks,ft,ut,cells,receipt["windows"] = response_windows(energy,f,u,
-        chemical_potential_ry=sample_plan["census"]["mu_ry"],z_ry=z)
+    """Plan small frequency-specific sums on one host; broadcast only scalars."""
     import minimax
-    bank_rule,laplace_rule = minimax.response_bank_rule,minimax.response_laplace_rule
-    receipt["rule_provider"] = "minimax"
-    middle = energy[masks[1]]
-    delta = float(middle.max()-middle.min())
+    from jax.experimental import multihost_utils
+    z = bank_points(sample_plan)
+    energy, f, u, _, _ = response_weights(wfns, meta)
+    refs = np.array([energy[f != 0].max(), energy[u != 0].min()])
+    lo, hi = refs[1]-refs[0], float(energy[u != 0].max()-energy[f != 0].min())
     session = getattr(meta, "shared_pole_response_rules", None)
-    # Each one-particle endpoint gets 2 eV: a transition edge gets 4 eV.
-    pad = 4.0/RYD_TO_EV if session is not None else 0.0
-    rule = bank_rule(z,delta,rel_tol=sample_plan["bank_rule_tolerance"],
-        previous=None if session is None else session.get("stream"),
-        domain_pad_ry=pad)
-    if session is not None:
-        session["stream"] = rule
-    t,weights = np.asarray(rule["t"]),np.asarray(rule["h"])
-    phase = np.asarray(rule["projection_value"])
-    derivative = np.asarray(rule["projection_derivative"])
-    receipt["rule"] = {k:v for k,v in rule.items() if k not in ("t","h","projection_value","projection_derivative")}
-    receipt["nodes"] = len(t)
-    remote = []
-    for cell in cells:
-        key = (cell["lower"], cell["upper"])
-        rr = laplace_rule(cell["delta_min_ry"],cell["delta_max_ry"],z,
-            rel_tol=sample_plan["bank_rule_tolerance"],
-            previous=None if session is None else session.get(key),
-            domain_pad_ry=pad, ordered=ordered,
-            reference_ry=cell["references_ry"][1]-cell["references_ry"][0])
+    old = None if session is None else session.get("frequency")
+    reuse = old is not None and old["lo"] <= lo and hi <= old["hi"] and np.array_equal(old["z"], z)
+    if reuse:
+        plan = old
+    else:
+        pad = 4./RYD_TO_EV if session is not None else 0.
+        plan = dict(lo=lo-pad, hi=hi+pad, z=z,
+            t=np.zeros((len(z), 2, 128), complex),
+            value=np.zeros((len(z), 2, 128), complex),
+            derivative=np.zeros((len(z), 2, 128), complex),
+            sampled_error=np.zeros((len(z), 2, 2)), counts=np.zeros((len(z), 2), np.int64))
+        for i, point in enumerate(z):
+            status = np.zeros(1, np.int32)
+            if jax.process_index() == 0:
+                try:
+                    rule = minimax.response_frequency_rule(plan["lo"], plan["hi"], point,
+                        rel_tol=sample_plan["bank_rule_tolerance"],
+                        previous=None if old is None else old["t"][i])
+                    for key in ("t", "value", "derivative", "sampled_error", "counts"):
+                        plan[key][i] = rule[key]
+                except Exception as error:
+                    print(f"Response rule failed at z={point}: {error}", flush=True)
+                    status[0] = 1
+            if np.asarray(multihost_utils.broadcast_one_to_all(status))[0]:
+                raise ValueError(f"response frequency rule construction failed at z={point}")
+            for key in ("t", "value", "derivative", "sampled_error", "counts"):
+                plan[key][i] = np.asarray(multihost_utils.broadcast_one_to_all(plan[key][i]))
         if session is not None:
-            session[key] = rr
-        remote.append((cell,rr))
-    receipt["laplace_cells"] = [{**cell,**{k:v for k,v in rr.items()
-        if k not in ("t","h","projection_value","projection_derivative",
-                     "odd_projection_value","odd_projection_derivative")}}
-        for cell,rr in remote]
+            session["frequency"] = plan
+    receipt["rule_provider"] = "minimax frequency-specific complex times; sampled accuracy"
+    receipt["rule"] = dict(interval_ry=[plan["lo"], plan["hi"]],
+        counts=plan["counts"].tolist(), sampled_error=plan["sampled_error"].tolist(),
+        reused=reuse)
+    receipt["nodes"] = int(plan["counts"].sum())
     if jax.process_index() == 0:
-        print(f"  Response quadrature: crossing {delta*RYD_TO_EV:.3f} eV, "
-              f"{len(t)} nodes ({rule['reuse_status']})", flush=True)
-        for cell, rr in remote:
-            print(f"    noncrossing {cell['lower']}:{cell['upper']} "
-                  f"{cell['delta_min_ry']*RYD_TO_EV:.3f}.."
-                  f"{cell['delta_max_ry']*RYD_TO_EV:.3f} eV, "
-                  f"{len(rr['t'])} nodes ({rr['reuse_status']})", flush=True)
-    return dict(t=t, phase=phase, derivative=derivative, remote=remote,
-                masks=masks, ft=ft, ut=ut, reference=reference)
+        print("  Response rules: z(eV)       forward backward  sampled value/ds error; "
+              + ("reused" if reuse else "constructed"), flush=True)
+        for point, counts, errors in zip(z, plan["counts"], plan["sampled_error"]):
+            print(f"    {point*RYD_TO_EV:20.8g} {counts[0]:4d} {counts[1]:4d}  "
+                  f"{errors[:,0].max():.2e} {errors[:,1].max():.2e}", flush=True)
+    return dict(plan=plan, f=f, u=u, refs=refs)
 
 
-def integrate_response_panel(wfns, meta, mesh_xy, rules, *, q_ids, sample_span,
-                             execute, receipt, ordered=False, vertex=None):
-    """Integrate an admitted panel through the single Green/FFT stream.
-
-    Returns ``[2*n_sample,n_q,n_mu,n_mu]`` at P(None,None,x,y), value rows
-    followed by d/ds rows. Photon endpoints are prepared once by
-    ``prepare_photon_carriers``. The caller's ``execute`` admits the compiled
-    memory before execution, as in the charge bank.
-    """
-    qids = tuple(q_ids)
-    lo, hi = sample_span
-    a = hi-lo
-    ordered = ordered or vertex is not None
+def integrate_response_field(wfns, meta, mesh_xy, rules, *, q_ids, sample,
+                             derivative, execute, receipt, ordered=False, vertex=None):
+    """One donated [1,q,mu_X,nu_Y] field; both physical products in one scan."""
+    plan, refs = rules["plan"], rules["refs"]
+    times = plan["t"][sample]
+    # Move the padded scalar-domain origin to the physical endpoint references.
+    coefficients = -plan["derivative" if derivative else "value"][sample] * np.exp(
+        -(refs[1]-refs[0]-plan["lo"])*times)
     n = meta.mu_basis.n_packed if vertex is None else vertex[0][0].shape[2]
-    weights = partial(stream_weights, parents=vertex is None)
-    t, phase, derivative, remote, masks, ft, ut, reference = (
-        rules[k] for k in ("t", "phase", "derivative", "remote", "masks", "ft", "ut", "reference"))
-    # One concatenated node stream, one donated carry. Only small window
-    # weights/references are indexed by node; no Green history is materialized.
-    times = [np.column_stack((-1j*t, -1j*t))]
-    rows, windows = [np.vstack((phase[lo:hi], derivative[lo:hi]))], [np.zeros(len(t), np.int32)]
-    if ordered:
-        rows[0] = np.vstack((rows[0], np.zeros_like(rows[0])))
-    lower_weights = [ft*masks[1]]
-    upper_weights = [ut*masks[1]]
-    references = [[reference, reference]]
-    for cell, rr in remote:
-        lower, upper = cell["lower"], cell["upper"]
-        tau = np.asarray(rr["t"])
-        projections = -np.vstack((rr["projection_value"][lo:hi], rr["projection_derivative"][lo:hi]))
-        if ordered:
-            projections = np.vstack((projections,
-                -np.vstack((rr["odd_projection_value"][lo:hi], rr["odd_projection_derivative"][lo:hi]))))
-        for orientation, (lw, uw) in enumerate(((ft, ut), (ut, ft))):
-            times.append(np.column_stack((-tau, tau)).astype(np.complex128))
-            signed = projections.copy()
-            if orientation:
-                signed[:2*a] *= -1
-            rows.append(signed)
-            windows.append(np.full(len(tau), len(references), np.int32))
-            lower_weights.append(lw*masks[lower])
-            upper_weights.append(uw*masks[upper])
-            references.append(cell["references_ry"])
-    def place(table):
-        return jnp.stack([weights(wfns, row, mesh_xy) for row in table])
     kernel, fixed = response_stream(wfns, meta, mesh_xy=mesh_xy,
-        q_ids=qids, n_outputs=2*a, pair_mode="windowed", bank_carry=True,
+        q_ids=q_ids, n_outputs=1, pair_mode="direct", bank_carry=True,
         ordered=ordered, vertex=vertex)
-    raw = jax.jit(lambda: jnp.zeros((2*a,len(qids),n,n),jnp.complex128),
+    raw = jax.jit(lambda: jnp.zeros((1,len(q_ids),n,n),jnp.complex128),
         out_shardings=NamedSharding(mesh_xy,P(None,None,"x","y")))()
-    raw = execute(kernel, ((jnp.asarray(np.concatenate(times)), jnp.asarray(np.concatenate(windows))),
-        jnp.asarray(np.concatenate(rows, axis=1)), *fixed,
-        place(lower_weights), place(upper_weights), jnp.asarray(references), raw), "windowed")
-    receipt["correlation_count"] += len(t) + 2*sum(len(rr["t"]) for _, rr in remote)
-
+    weights = partial(stream_weights, parents=vertex is None)
+    args = ((jnp.asarray(times.reshape(-1)), jnp.repeat(jnp.array([False, True]), 128)),
+        jnp.asarray(coefficients.reshape(1,-1)), *fixed,
+        weights(wfns, rules["f"], mesh_xy), weights(wfns, rules["u"], mesh_xy),
+        jnp.asarray(refs), raw)
+    raw = execute(kernel, args, "direct")
+    receipt["correlation_count"] += int(plan["counts"][sample].sum())
     return raw
 
 
 def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_io,
                         vertex=None, contact=None):
-    """Stage A: one windowed stream per admitted sample batch, all parent faces."""
+    """Stage A: consume each frequency value before producing its derivative."""
     with timing.fenced_section('bank.setup'):
         from file_io.shared_pole_store import write_shared_pole_bank
         header,qids,census = _bank_context(wfns,meta,sym,bank_io,mesh_xy)
@@ -1153,155 +1088,81 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
         execute = _bank_execution(meta, mesh_xy, receipt, config, photon=vertex is not None)
         ledger = meta.shared_pole_capacity
         ambient = ledger.live_stages
-    with timing.fenced_section('bank.stream_reference_compile'):
-        if vertex is None:
-            _stream_comparison(wfns,meta,mesh_xy,qids,receipt)
+    from file_io.shared_pole_store import read_shared_pole_bank
+    from file_io.slab_io import SlabIO
     with timing.fenced_section('bank.window_geometry'):
-        samples,_,receipt["algebra"] = response_algebra(meta,config,
+        solve_value, solve_slope, _, receipt["algebra"] = response_algebra(meta,config,
             mesh_xy=mesh_xy,n=n,photon=vertex is not None)
         rules = response_quadrature(wfns, meta, sample_plan, receipt, ordered=ordered)
-        phase, derivative = rules["phase"], rules["derivative"]
-    with timing.fenced_section('bank.capacity_planning_compile'):
-        face_bytes = 16*n**2//mesh_xy.size
-        # One donated internal [output,q,x,y] carry spans every window. Public
-        # writer slices are [q,output,x,y]; only that bounded slice is transposed.
-        # Reserve output plus a dense/transport headroom, and batch only when the
-        # common ledger's admitted panel budget cannot hold the full point plan.
-        layout = config.get("linalg","local") if hasattr(config,"get") else config.backend.linalg
-        native = response_dense_workspace(mesh_xy,n,len(z),layout,with_eigh=vertex is None)
-        headroom = 16*face_bytes + native["gemm"] + int(phase.nbytes+derivative.nbytes)
-        # Ask the ledger owner for R24's remaining device budget. The zero-byte
-        # planning row includes ambient live reservations but allocates nothing.
-        _, budget = _reserve(meta,"bank_planning",0)
-        live_bytes = budget["aggregate_bytes_per_rank"]
-        device_available = budget["available_device_bytes_per_rank"]
-        scaling_target = budget["limit_bytes_per_rank"]
-
-        @lru_cache(maxsize=None)
-        def dense_bytes(width):
-            abstract = jax.ShapeDtypeStruct((width,n,n),
-                jnp.complex128,sharding=NamedSharding(mesh_xy,P(None,"x","y")))
-            stats = samples.lower(*((abstract,)* (3 if vertex is None else 4))).compile().memory_analysis()
-            if stats is None:
-                raise ValueError("GATE response_capacity: sample solve planning memory unavailable")
-            dense = stats.argument_size_in_bytes+stats.output_size_in_bytes+stats.temp_size_in_bytes
-            # Preserve the existing dense/native and writer conversion envelopes.
-            return max(dense+native["total"],4*width*face_bytes+native["total"])
-
-        minimum = headroom+live_bytes+2*max(len(panel_rows(i,i+1)) for i in range(len(qids)))*face_bytes+dense_bytes(1)
-        # R24 makes 3U a reported scaling target, not the device admission limit.
-        # Replaying a Green/FFT stream to meet that preference repeats every time
-        # node even when the complete output panel fits. Use the ledger's remaining
-        # device budget, including the inherited stream and ambient/native costs;
-        # larger systems still split q/sample panels before any allocation.
-        planning_limit = device_available
-        available = planning_limit-headroom-live_bytes
-        qwidth = min(len(qids),int((available-dense_bytes(1))//(2*face_bytes)))
-        while qwidth > 0 and any(2*len(panel_rows(i,min(i+qwidth,len(qids))))*face_bytes+dense_bytes(1) > available
-                                  for i in range(0,len(qids),qwidth)):
-            qwidth -= 1
-        receipt["panel_budget"] = dict(
-            scaling_target_bytes_per_rank=scaling_target,
-            device_budget_bytes_per_rank=budget["device_budget_bytes_per_rank"],
-            inherited_peak_bytes_per_rank=budget["inherited_peak_bytes_per_rank"],
-            available_device_bytes_per_rank=device_available,
-            ambient_live_bytes_per_rank=live_bytes,headroom_bytes_per_rank=headroom,
-            native_workspace=native,planning_limit_bytes_per_rank=planning_limit,
-            minimum_panel_bytes_per_rank=minimum,
-            policy="minimize stream replays within remaining device budget; report 3U scaling target (ruling24)")
-        if qwidth < 1:
-            raise ValueError(f"GATE response_capacity: one q/sample panel needs {minimum} B/rank "
-                             f"including live/native costs; remaining device budget is {device_available} B/rank "
-                             f"(3U scaling target {scaling_target} B/rank)")
-    for q0 in range(0,len(qids),qwidth):
-        with timing.fenced_section('bank.panel_admission'):
-            q1 = min(q0+qwidth,len(qids))
-            response_rows = panel_rows(q0,q1)
-            row_index = {q: i for i,q in enumerate(response_rows)}
-            width = len(z)
-            while 2*width*len(response_rows)*face_bytes+dense_bytes(width) > available:
-                width -= 1
-            planned_bytes = headroom+live_bytes+2*width*len(response_rows)*face_bytes+dense_bytes(width)
-            receipt.setdefault("panel_plans",[]).append(dict(q_span=(q0,q1),sample_width=width, response_q_full_idx=response_rows,
-                aggregate_bytes_per_rank=planned_bytes,
-                scaling_status="PASS" if planned_bytes <= scaling_target else "WARN",
-                device_budget_status="PASS",scaling_target_bytes_per_rank=scaling_target,
-                available_device_bytes_per_rank=device_available))
-        for lo in range(0,len(z),width):
-            with timing.fenced_section('bank.stream_arguments'):
-                hi = min(lo+width,len(z));a = hi-lo
-                ledger.live_stages = ambient
-                name,_ = _reserve(meta,"bank_outputs",2*a*len(response_rows)*face_bytes + headroom)
-                ledger.live_stages = ambient+(name,)
-            raw = integrate_response_panel(wfns, meta, mesh_xy, rules,
-                q_ids=response_rows, sample_span=(lo, hi), execute=execute,
+    response_rows = panel_rows(0, len(qids))
+    row_index = {q: i for i, q in enumerate(response_rows)}
+    face_bytes = 16*n*n//mesh_xy.size
+    # The sole response accumulator is all-P sharded. Dense work and slab I/O
+    # remain bounded to one parent and one frequency, with their own admission.
+    fields = (("Wc", "dWc_ds"), ("Wc_mirror", "dWc_mirror_ds"))
+    for sample, point in enumerate(z):
+        for derivative in (False, True):
+            field_indices = [2*m+int(derivative) for m in range(2 if literal_mirrors else 1)]
+            if np.asarray(header["sample_written"])[:,sample,field_indices].all():
+                continue
+            ledger.live_stages = ambient
+            name, _ = _reserve(meta, "bank_outputs", len(response_rows)*face_bytes)
+            ledger.live_stages = ambient+(name,)
+            raw = integrate_response_field(wfns, meta, mesh_xy, rules,
+                q_ids=response_rows, sample=sample, derivative=derivative, execute=execute,
                 receipt=receipt, ordered=ordered, vertex=vertex)
-            for iq in range(q0,q1):
-                span = (iq,iq+1)
-                if np.asarray(header["sample_written"])[iq,lo:hi].all():
+            for iq in range(len(qids)):
+                marked = header["sample_written"][iq][sample]
+                if all(marked[i] for i in field_indices):
                     continue
-                h,hinv,ranks = _coulomb_batch(meta,config,bank_io,mesh_xy,span,execute)
+                span = (iq, iq+1)
+                h, hinv, ranks = _coulomb_batch(meta,config,bank_io,mesh_xy,span,execute)
                 del hinv
+                constant = 0.
                 if vertex is not None:
-                    from file_io.shared_pole_store import read_shared_pole_bank
-                    from file_io.slab_io import SlabIO
                     with SlabIO(bank_io["path"], mode="r", mesh=mesh_xy) as io:
                         constant = read_shared_pole_bank(io, span, meta=meta, header=header,
                                                        fields=("constant",))["constant"]
-                ia = lo
-                while ia < hi:
-                    marked = tuple(header["sample_written"][iq][ia])
-                    stop = ia+1
-                    while stop < hi and tuple(header["sample_written"][iq][stop]) == marked:
-                        stop += 1
-                    if all(marked):
-                        ia = stop
+                for mirror in range(2 if literal_mirrors else 1):
+                    if marked[2*mirror+int(derivative)]:
                         continue
-                    # Exact PH partners are formed at the bare-response level.
-                    # Dyson always uses this original parent's V and contact;
-                    # no spatial reconstruction of a screened operator enters.
-                    for mirror in range(2 if literal_mirrors else 1):
-                        field0 = 2*mirror
-                        if marked[field0] and marked[field0+1]:
-                            continue
-                        row = row_index[int(mirror_qids[iq] if mirror else qids[iq])]
-                        chi = raw[ia-lo:stop-lo,row]
-                        dchi = raw[a+ia-lo:a+stop-lo,row]
-                        if mirror:
-                            chi, dchi = jnp.conj(chi), jnp.conj(dchi)
-                        hbatch = jnp.broadcast_to(h,chi.shape)
-                        operands = (hbatch,chi,dchi) + (() if vertex is None else
-                            (jnp.broadcast_to(contact,chi.shape),))
-                        value,ds = execute(samples,operands,"mirror_dyson" if mirror else "sample_dyson")
-                        if vertex is not None:
-                            value = value - constant
-                            if not mirror:
-                                _photon_sample_norms(receipt, value, iq, ia, bank_io["photon_layout"], mesh_xy)
-                        else:
-                            _reciprocity_census(receipt,value,z[ia:stop],int(qids[iq]),iq,meta)
-                        if vertex is None and ordered and _self_negative(int(qids[iq]),meta):
-                            _tr_odd_census(receipt,samples,h,chi,dchi,value,z[ia:stop],int(qids[iq]))
-                        value = None if marked[field0] else value[None]
-                        ds = None if marked[field0+1] else ds[None]
-                        payload = (dict(Wc_mirror=value,dWc_mirror_ds=ds) if mirror
-                                   else dict(Wc=value,dWc_ds=ds))
-                        with timing.fenced_section('bank.write'):
-                            io_started = time.monotonic()
-                            header = write_shared_pole_bank(bank_io["path"],q_span=span,
-                                sample_span=(ia,stop),**payload,meta=meta,
-                                expected_identity=bank_io["identity"],mesh_xy=mesh_xy)
-                            receipt["seconds"]["io"] = receipt["seconds"].get("io",0.)+time.monotonic()-io_started
-                        del value,ds,chi,dchi,hbatch,operands,payload
-                    ia = stop
-                del h
-            receipt["batches"].append(dict(q_span=(q0,q1),sample_span=(lo,hi)))
+                    row = row_index[int(mirror_qids[iq] if mirror else qids[iq])]
+                    chi = raw[:,row]
+                    if mirror:
+                        chi = jnp.conj(chi)
+                    field = fields[mirror][int(derivative)]
+                    if derivative:
+                        with SlabIO(bank_io["path"], mode="r", mesh=mesh_xy) as io:
+                            saved = read_shared_pole_bank(io, span, meta=meta, header=header,
+                                sample_span=(sample,sample+1), fields=(fields[mirror][0],))
+                        w = saved[fields[mirror][0]][0] + constant
+                        value = execute(solve_slope, (h, w, chi), "sample_slope")
+                        del saved, w
+                    else:
+                        value = execute(solve_value, (h,chi)+(() if vertex is None else (contact,)),
+                                        "sample_dyson") - constant
+                        if vertex is not None and not mirror:
+                            _photon_sample_norms(receipt,value,iq,sample,bank_io["photon_layout"],mesh_xy)
+                        elif vertex is None:
+                            _reciprocity_census(receipt,value,z[sample:sample+1],int(qids[iq]),iq,meta)
+                            if ordered and _self_negative(int(qids[iq]),meta):
+                                _tr_odd_census(receipt,solve_value,h,chi,value,z[sample:sample+1],int(qids[iq]))
+                    io_started = time.monotonic()
+                    header = write_shared_pole_bank(bank_io["path"], q_span=span,
+                        sample_span=(sample,sample+1), **{field: value[None]}, meta=meta,
+                        expected_identity=bank_io["identity"], mesh_xy=mesh_xy)
+                    receipt["seconds"]["io"] = receipt["seconds"].get("io",0.)+time.monotonic()-io_started
+                    del chi, value
+                del h, constant
+            receipt["batches"].append(dict(sample=sample,derivative=derivative))
             del raw
-    with timing.fenced_section('bank.finalize'):
-        ledger.live_stages = ambient
-        receipt["stream_passes"] = len(receipt["batches"])
-        receipt["batch_reason"] = "full plan admitted" if len(receipt["batches"]) == 1 else "remaining device-budget panels require bounded replays; see panel_budget and panel_plans"
-        receipt["completion"] = bool(np.asarray(header["sample_written"]).all())
-        return _finish_receipt(receipt,meta,header,started)
+        if jax.process_index() == 0:
+            print(f"  Response frequency {sample+1}/{len(z)} committed: z={point*RYD_TO_EV:.8g} eV", flush=True)
+    ledger.live_stages = ambient
+    receipt["stream_passes"] = len(receipt["batches"])
+    receipt["batch_reason"] = "one frequency/field per stream; forward and backward products share the carry"
+    receipt["completion"] = bool(np.asarray(header["sample_written"]).all())
+    return _finish_receipt(receipt,meta,header,started)
 
 
 def _photon_sample_norms(receipt, value, parent, first, layout, mesh_xy):

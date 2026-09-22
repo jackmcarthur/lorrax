@@ -26,7 +26,8 @@ production node selection calls `minimax` directly.
 | `family_for_character(...)`, `TARGETS`, `FAMILIES` | Define the accepted target and family vocabulary as data. |
 | `Quadrature`, `Provenance` | Return nodes, weights, measured error, certification state, source, and artifact identity. |
 | `build_uniform_rule(box, eps)` | Builds and certifies one denominator-box rule for `1/d` on `[re_lo, re_hi] x [im_lo, im_hi]`. A production surface, not a lookup: it takes no clock and no pass count, and returns when its own boundary certificate is met, so the same box and tolerance give the same rule on any machine. `gw.sigma_box_plan` is the consumer. |
-| `response_bank_rule(...)` / `response_laplace_rule(...)` | Build the shared-pole W crossing and noncrossing time rules, with separate value and derivative contracts. `gw.response_bank` is the consumer. |
+| `response_frequency_rule(lo_ry, hi_ry, z_ry, ...)` | Complex-time exponential sums for one shared-pole frequency; independent value/ds fits, sampled accuracy. |
+| `response_bank_rule(...)` / `response_laplace_rule(...)` | Retained real-time and noncrossing scalar rules with continuum bounds. |
 | `matsubara_response_rule(...)` | Builds a finite-temperature KMS-paired imaginary-time rule. |
 | `augment_odd_laplace(...)` | Adds the odd GN-PPM resolvent channel on the existing even rule's time nodes, refusing a missed sampled gate. |
 | `damped_line_rule(...)` / `damped_rectangle_rule(...)` / `damped_rectangle_gauss_rule(...)` / `damped_rectangle_positive_rule(...)` | Build MPA's positive-time line and rectangle rules. The rectangle constructors retain their respective geometric and error contracts; GW passes scalar bounds and receives time nodes and weights. |
@@ -133,7 +134,20 @@ layering test enforces the top-level door. Lookup tests must run without SciPy,
 while solver-generation tests may require it.
 
 
-## Response-bank rule sessions
+## Frequency-specific response rule
+
+`response_frequency_rule(lo_ry, hi_ry, z_ry, rel_tol=..., previous=None)`
+returns `[2,128]` complex times and coefficients for the independent
+`1/(d-z)` and `1/(d+z)` primitives. Zero coefficients mark inactive slots.
+A Hankel shift pencil proposes nodes; scaled linear least squares fits both
+reciprocals and their squares on the same nodes. Non-growing finite modes,
+sampled value/ds error and coefficient mass are checked. This interface does
+**not** claim continuum certification or a W/Sigma error bound.
+The bank plans on one host, broadcasts small arrays, and reuses them while
+frequencies and the padded transition interval remain valid. It retains no
+spatial fields in the scalar cache. Complex times use complex128 identities.
+
+## Retained real-time/noncrossing scalar rules
 
 `response_bank_rule(z_ry, delta_max_ry, rel_tol=..., previous=None,
 domain_pad_ry=0)` returns positive real-time nodes and weights, value and

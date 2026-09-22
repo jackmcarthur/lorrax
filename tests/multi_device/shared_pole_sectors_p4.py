@@ -235,8 +235,11 @@ def run_signed_contact_checks(mesh):
         return jax.make_array_from_callback(a.shape, NamedSharding(mesh, spec), lambda ix: a[ix])
     face, batch = P(None, 'x', 'y'), P(('x', 'y'))
     meta = SimpleNamespace(nk_tot=1, nspin=1, nspinor_wfnfile=2, cell_volume=2.)
-    sample, moment, _ = response_algebra(meta, {'linalg':'local'},
+    value, slope, moment, _ = response_algebra(meta, {'linalg':'local'},
                                         mesh_xy=mesh, n=4, ordered=True, photon=True)
+    def sample(v, chi, dchi, contact):
+        wc = value(v, chi, contact)
+        return wc, slope(v, wc, dchi)
     v = np.diag([1.2, -.8, -.3, -.4]).astype(complex)
     d = np.diag([0., .25, .1, .1])
     f_difference = np.array([.7, .4])

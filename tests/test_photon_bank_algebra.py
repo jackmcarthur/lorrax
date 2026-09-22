@@ -57,8 +57,11 @@ def test_signed_photon_dyson_derivative_and_moments(monkeypatch):
     put = lambda a: jax.device_put(np.asarray(a, complex)[None],
                                    NamedSharding(mesh, P(None, "x", "y")))
     meta = SimpleNamespace(nk_tot=1, nspin=1, nspinor_wfnfile=2, cell_volume=2.)
-    samples, moments, receipt = response_algebra(
+    value, slope, moments, receipt = response_algebra(
         meta, {"linalg": "local"}, mesh_xy=mesh, n=4, photon=True)
+    def samples(v, chi, dchi, contact):
+        wc = value(v, chi, contact)
+        return wc, slope(v, wc, dchi)
     v = np.diag([1.2, -0.3, -0.2, -0.4]).astype(complex)
     contact = np.diag([0., 0.1, 0.07, 0.05])
     b = np.array([0.5, 0.1j, 0.2+0.1j, -0.3j])

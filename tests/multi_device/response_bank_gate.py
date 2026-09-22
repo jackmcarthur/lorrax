@@ -65,8 +65,12 @@ def main():
     m3 = v @ c @ t @ adj @ v / 2
     results = {}
     for layout in ("local", "distributed"):
-        samples, moments, receipt = response_algebra(
+        value, slope, moments, receipt = response_algebra(
             meta, {"linalg": layout}, mesh_xy=mesh, n=n)
+        @jax.jit
+        def samples(h, chi, dchi):
+            wc = value(h, chi)
+            return wc, slope(h, wc, dchi)
         pref = receipt["prefactor"]
         operands = (put(h), put(a / pref), put(ad / pref))
         executable = samples.lower(*operands).compile()

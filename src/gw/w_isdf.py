@@ -524,7 +524,7 @@ def _get_chi_fractional_contour_kernel_face(
 
     from common.wfn_layout import psi_specs
     PSI_NMU_SPEC, PSI_MUN_SPEC = psi_specs(layout)
-    if pair_mode not in ("retarded", "laplace", "laplace_ordered", "kms_static", "windowed"):
+    if pair_mode not in ("retarded", "laplace", "laplace_ordered", "kms_static", "windowed", "direct"):
         raise ValueError(f"unknown response pair mode: {pair_mode}")
     if bank_carry and selected_q is None:
         raise ValueError("bank carry requires selected q rows")
@@ -762,6 +762,20 @@ def _get_chi_fractional_contour_kernel_face(
 
             return jax.lax.cond(window == 0, crossing, remote, None), None
 
+        def direct_body(accumulators, node):
+            time, projection, reverse = node
+            def add(acc):
+                # A(t)=Gu(t) conj(Gf(conj(t))); the reverse product is
+                # conj(A(conj(t))), not conj(A(t)). green_k owns its own
+                # physical/incumbent conjugation convention.
+                tau = jnp.where(reverse, jnp.conj(time), time)
+                value = spin_correlation(occ_f, -tau, energy_reference[0],
+                    occ_u, jnp.conj(tau), energy_reference[1])
+                value = jnp.where(reverse, jnp.conj(value), value)
+                return accumulate_selected(acc, selected(value), projection)
+            return jax.lax.cond(jnp.any(projection != 0), add, lambda acc: acc,
+                                accumulators), None
+
         def body(accumulators, node):
             time, projection = node
             if pair_mode == "retarded":
@@ -785,9 +799,10 @@ def _get_chi_fractional_contour_kernel_face(
             return updated, None
 
         nodes = ((time_nodes[0], projection_rows.T, time_nodes[1])
-                 if pair_mode == "windowed" else (time_nodes, projection_rows.T))
+                 if pair_mode in ("windowed", "direct") else (time_nodes, projection_rows.T))
         final_R, _ = jax.lax.scan(
-            window_body if pair_mode == "windowed" else body, initial, nodes, unroll=1)
+            (direct_body if pair_mode == "direct" else window_body)
+            if pair_mode in ("windowed", "direct") else body, initial, nodes, unroll=1)
         if selected_q is None:
             return tuple(_finish(value) for value in final_R)
         if bank_carry:

@@ -9,6 +9,7 @@ import math
 
 import numpy as np
 from numpy.polynomial.legendre import leggauss
+from .complex_response import response_frequency_rule
 
 
 @lru_cache(maxsize=256)
@@ -67,7 +68,7 @@ def _node_digest(rule):
     digest = hashlib.sha256()
     for key in ("t", "h"):
         if key in rule:
-            array = np.ascontiguousarray(rule[key], dtype="<f8")
+            array = np.ascontiguousarray(rule[key], dtype="<c16" if np.iscomplexobj(rule[key]) else "<f8")
             digest.update(key.encode())
             digest.update(str(array.shape).encode())
             digest.update(array.tobytes())

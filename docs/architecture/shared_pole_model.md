@@ -73,14 +73,18 @@ range. They are not a uniform approximation guarantee for arbitrary band
 energy ranges. The response-bank time rule, the finite rational reduction,
 and the projected Sigma error have separate certificates.
 
-**Real-time stream.** For occupied and unoccupied weights `f`, `u`, the selected-q retarded correlation is
-accumulated on a certified time rule `{t_a, w_a}` (`minimax.response_bank_rule`):
+**Frequency-specific stream.** The scalar service fits each primitive independently:
 
-$$ A(R,t) = \sum_{k} G_u(k+R,\,t)\,\overline{G_f(k,\,t)}, \qquad
-\chi^0(q,z) \approx \sum_a h_a(z)\,\mathcal F_q\!\left[-i\big(A(t_a) - \overline{A(t_a)}\big)\right], \tag{SP 5} $$
+$$ F(d,z)=\frac1{d-z}\simeq\sum_j c^F_j e^{-(d-L)t^F_j},\qquad
+B(d,z)=\frac1{d+z}\simeq\sum_j c^B_j e^{-(d-L)t^B_j}. \tag{SP 5} $$
 
-with `h_a(z) = w_a e^{i z t_a}`. Conjugating in R space before the q transform gives `conj(F_{−q})`, the partner
-orientation with its own weight, so (SP 5) needs no time-reversal assumption.
+Times are complex with nonnegative real part. For nonnegative endpoint offsets,
+the forward product is `Gu(t) conj(Gf(conj(t)))`; its reverse is formed as
+`conj(A(conj(t)))`, preserving the same damping and reversing the orbital product.
+It is **not** `conj(A(t))`. Both primitives contribute with a minus sign.
+`minimax.response_frequency_rule` fits values and squared-denominator derivative
+targets on the same nodes; its reported errors are sampled errors, not continuum
+certificates. A matched QP-energy comparison is the observable acceptance check.
 
 **Orientation.** Σ's `G_{k−q} W_q` contraction is exact for
 
@@ -93,31 +97,20 @@ which is `F_q[χ]`. With the transposed orientation on a TR-broken deck each Gre
 other branch's residues, `Σ[W^even] − Σ^odd`. Tests: `tests/test_shared_pole_stream_orientation.py` (ordered
 retarded and Laplace rows equal `F_q[χ]` to 1e-10 on a TR-broken lattice and miss `F_q[χᵀ]`).
 
-**Window partition.** Let `E_f,max` and `E_u,min` be the extrema of the current active occupied
-and empty weights, including fractional tails (sample-only activity floor `1e-14`). With
-`omega=max|Re(z)|` and margin `1.5 min Im(z)`, the central state window contains
-`[E_u,min-omega-margin, E_f,max+omega+margin]` and both occupation frontiers.
-Its diagonal product uses real time; the lower/central, lower/upper, and central/upper
-products use Laplace time. The remote diagonal products have zero active occupation
-weight. Thus every active transition has one owner, and imaginary-axis support height
-does not force deep states into the crossing window. Exact moments remain untruncated.
+**Domain and derivative.** The domain spans every nonzero occupied/empty-weight
+pair, including negative transition energies and signed metallic weights; there
+is no sample-only occupation threshold. Scalar plans receive 2 eV padding per
+one-particle endpoint for SC reuse, without changing occupations or energies.
 
-**Remote Laplace cells.** For `d > |Re(z)|`, the exact even/odd kernels are the
-integrals of `exp(-d*t) cosh(z*t)` and `exp(-d*t) sinh(z*t)`
-(`minimax.response_laplace_rule`; certificate contract in [minimax](../services/minimax.md#response-rule-currencies-and-certificates)).
-The scalar coefficients approximate these rational kernels directly on prescribed
-positive real times; the stream need not resolve the hyperbolic integral weights
-([construction](../theory/response-laplace.md)). No Taylor expansion in `z²` is required. The even kernel `d/(d² − z²)` weights
-`forward − reverse`; the odd kernel `z/(d² − z²)` weights `forward + reverse`:
+$$ \frac{\partial F}{\partial s}=\frac1{2z(d-z)^2},\qquad
+\frac{\partial B}{\partial s}=-\frac1{2z(d+z)^2},\quad s=z^2. \tag{SP 7} $$
 
-$$ \chi^0_{\rm even} \leftarrow \sum_a \rho^{\rm even}_a(z)\,(F - B)(t_a),\qquad
-\chi^0_{\rm odd} \leftarrow \sum_a \rho^{\rm odd}_a(z)\,(F + B)(t_a), \tag{SP 7} $$
-
-where `F = f_lower u_upper` and `B = f_upper u_lower` are the two one-particle correlations. Odd rows are computed
-only for an ordered bank.
-
-**Dyson.** Each sample solves `W = (I − v χ⁰)⁻¹ v` through the bounded panel GEMM (`distrib_la.panel_matmul`) and
-the resolved LU plan, and stores `W_c` and `∂W_c/∂s`.
+**Dyson and storage.** A single donated `[1,q,mu_X,nu_Y]` accumulator holds one
+frequency and one field. The value pass solves Dyson per parent and commits W;
+then the accumulator is released and reused for the derivative pass. Bounded
+reads recover full W, and `dW/ds = W (dchi/ds) W` uses no second solve or adjoint.
+Charge storage is W−V; photon storage is W−W_infinity with its separate constant.
+The existing per-field write masks allow a value commit before its derivative.
 
 **Moments.** With `W_c(z) = Σ_{k=0}^{3} 2 M_k z^{−(k+1)} + O(z^{−5})`,
 
@@ -424,7 +417,7 @@ allocation. Native allocations are excluded from the JAX high water.
 | Contact/reference buffers | `photon_static_contact` / slab read, `[1,m_X,m_Y]` | m² each | 16 m² | 16 m²/P each |
 | Two live full-spin Green functions | `response_stream` / contour kernel, `[K,s,m_X,s,m_Y]` | 2 K s² m² | 32 K s² m² | 32 K s² m²/P |
 | FFT and Green contraction temporaries | inside the compiled stream; explicit face stream signatures, interior HLO still to audit | compiler dependent | not inferred | compiled temporary bytes; external FFT workspace separate |
-| Value/derivative response carry | `integrate_response_panel`, `[2a,q,m_X,m_Y]`; donated across stream calls | 2 a q m² | 32 a q m² | 32 a q m²/P |
+| Response carry | `integrate_response_field`, `[1,q,m_X,m_Y]`; one frequency/field | q m² | 16 q m² | 16 q m²/P |
 | Dyson arguments/results | `response_algebra`, `[a,m_X,m_Y]`; original and mirror run sequentially | bounded a m² panels | 16 a m² each | 16 a m²/P each, plus native LU work |
 | Ordered bare moments | `exact_bare_moments`, four `[q,m_X,m_Y]` arrays | 4 q m² | 64 q m² | 64 q m²/P |
 | Sector samples and moments | sector reader; four photon sample fields and four moment fields, `[q_XY,a,mu,mu]` | sector dependent | 16 times element count | batch divided over P, padded to whole-parent rounds |
