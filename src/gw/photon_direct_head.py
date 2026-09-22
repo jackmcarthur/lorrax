@@ -36,11 +36,12 @@ def packed_gamma_vectors(photon_g0_vectors, layout, mesh):
 def subtract_bare_tt_from_bank(packed_v, photon_g0_vectors, *, layout,
                                 mesh, wfn, meta):
     """Keep the direct Γ bare TT exchange in V, outside the body W Dyson."""
+    from vcoul import CoulombGeometry
     from gw.photon_layout import add_photon_q0_low_rank
     from gw.v_q_bispinor import _tt_head_tensor
 
     x, y = packed_gamma_vectors(photon_g0_vectors, layout, mesh)
-    tensor = _tt_head_tensor(bvec=np.asarray(wfn.bvec),
+    tensor = _tt_head_tensor(bvec=CoulombGeometry.from_wfn(wfn).bvec,
         cell_volume=float(meta.cell_volume), sys_dim=int(meta.sys_dim),
         kgrid=tuple(meta.kgrid))
     # V artifact already includes D_TT=-<v P_T>/Omega.  Subtract exactly
