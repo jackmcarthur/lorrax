@@ -75,10 +75,10 @@ multihost_utils.sync_global_devices('scalar_complete')
 for photon in (False,True):
     meta=SimpleNamespace(nk_tot=8,nspin=1,nspinor_wfnfile=2,cell_volume=2.)
     value,slope,_,receipt=response_algebra(meta,{'linalg':'local'},mesh_xy=mesh,n=n,photon=photon)
-    h=np.diag(np.linspace(.4,1.,n)).astype(complex)[None]
+    h=np.broadcast_to(np.diag(np.linspace(.4,1.,n)).astype(complex),(5,n,n)).copy()
     if photon:
         h[:,n//2:,n//2:]*=-1
-    chi=(rng.normal(size=(1,n,n))+1j*rng.normal(size=(1,n,n)))*.02
+    chi=(rng.normal(size=(5,n,n))+1j*rng.normal(size=(5,n,n)))*.02
     dc=chi*.3j
     contact=np.eye(n)[None]*.01
     face=P(None,'x','y')

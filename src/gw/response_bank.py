@@ -1131,7 +1131,7 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
     else:
         roots = bank_io["photon_v"]
     # The sole response accumulator is all-P sharded. Dense work and slab I/O
-    # remain bounded to one parent and one frequency, with their own admission.
+    # batch the irreducible parents of one frequency, with their own admission.
     fields = (("Wc", "dWc_ds"), ("Wc_mirror", "dWc_mirror_ds"))
     progress = LoopProgress(2*len(z), print_fn, title="response frequency integration",
                             item_name="value/slope", max_updates=len(z)).start()
@@ -1154,44 +1154,45 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                 raw = integrate_response_field(wfns, meta, mesh_xy, rules,
                     q_ids=response_rows, sample=sample, derivative=derivative, execute=execute,
                     receipt=receipt, ordered=ordered, vertex=vertex)
-                for iq in range(len(qids)):
-                    marked = header["sample_written"][iq][sample]
-                    if all(marked[i] for i in field_indices):
-                        continue
-                    span = (iq, iq+1)
-                    h = roots[iq:iq+1]
-                    constant = 0.
-                    if vertex is not None:
-                        constant = read_shared_pole_bank(bank_handle, span, meta=meta, header=header,
-                                                        fields=("constant",))["constant"]
-                    for mirror in range(2 if literal_mirrors else 1):
-                        if marked[2*mirror+int(derivative)]:
-                            continue
-                        row = row_index[int(mirror_qids[iq] if mirror else qids[iq])]
-                        chi = raw[:,row]
+                for mirror in range(2 if literal_mirrors else 1):
+                    field = fields[mirror][int(derivative)]
+                    pending = ~np.asarray(header["sample_written"], bool)[:,sample,2*mirror+int(derivative)]
+                    # A fresh frequency is one q_irr slab. Preserve legacy partial
+                    # masks by batching each contiguous unfinished span.
+                    edges = np.flatnonzero(np.diff(np.r_[False,pending,False].astype(np.int8)))
+                    for q0, q1 in edges.reshape(-1,2):
+                        span = (int(q0), int(q1))
+                        selected = (mirror_qids if mirror else qids)[q0:q1]
+                        rows = np.asarray([row_index[int(q)] for q in selected])
+                        chi = raw[0,rows]
                         if mirror:
                             chi = jnp.conj(chi)
-                        field = fields[mirror][int(derivative)]
+                        h = roots[q0:q1]
+                        constant = 0.
+                        if vertex is not None:
+                            constant = read_shared_pole_bank(bank_handle, span, meta=meta, header=header,
+                                                            fields=("constant",))["constant"]
                         if derivative:
                             saved = read_shared_pole_bank(bank_handle, span, meta=meta, header=header,
                                 sample_span=(sample,sample+1), fields=(fields[mirror][0],))
-                            w = saved[fields[mirror][0]][0] + constant
+                            w = saved[fields[mirror][0]][:,0] + constant
                             value = execute(solve_slope, (h, w, chi), "sample_slope")
                             del saved, w
                         else:
                             value = execute(solve_value, (h,chi)+(() if vertex is None else (contact,)),
                                             "sample_dyson") - constant
-                            if vertex is not None and not mirror:
-                                _photon_sample_norms(receipt,value,iq,sample,bank_io["photon_layout"],mesh_xy)
-                            elif vertex is None:
-                                _reciprocity_census(receipt,value,z[sample:sample+1],int(qids[iq]),iq,meta)
-                                if ordered and _self_negative(int(qids[iq]),meta):
-                                    _tr_odd_census(receipt,solve_value,h,chi,value,z[sample:sample+1],int(qids[iq]))
+                            for iq in range(q0,q1):
+                                part = slice(iq-q0,iq-q0+1)
+                                if vertex is not None and not mirror:
+                                    _photon_sample_norms(receipt,value[part],iq,sample,bank_io["photon_layout"],mesh_xy)
+                                elif vertex is None:
+                                    _reciprocity_census(receipt,value[part],z[sample:sample+1],int(qids[iq]),iq,meta)
+                                    if ordered and _self_negative(int(qids[iq]),meta):
+                                        _tr_odd_census(receipt,solve_value,h[part],chi[part],value[part],z[sample:sample+1],int(qids[iq]))
                         io_started = time.monotonic()
-                        write(q_span=span, sample_span=(sample,sample+1), **{field: value[None]})
+                        write(q_span=span, sample_span=(sample,sample+1), **{field: value[:,None]})
                         receipt["seconds"]["io"] = receipt["seconds"].get("io",0.)+time.monotonic()-io_started
-                        del chi, value
-                    del h, constant
+                        del chi, value, h, constant
                 receipt["batches"].append(dict(sample=sample,derivative=derivative))
                 del raw
                 progress.step()
