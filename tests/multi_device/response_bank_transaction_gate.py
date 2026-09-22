@@ -5,6 +5,7 @@ from pathlib import Path
 import sys
 import time
 import numpy as np
+import jax
 import jax.numpy as jnp
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from test_shared_pole_store import _fixture
@@ -13,6 +14,15 @@ from file_io.shared_pole_store import (
     initialize_shared_pole_bank, validate_shared_pole_bank,
     shared_pole_bank_writer, read_shared_pole_bank, write_shared_pole_bank,
 )
+
+# A slow metadata reader must not race a faster rank opening the writer.
+import file_io.shared_pole_store as store
+read_header = store._read_header
+def delayed_header(path):
+    if stack.process_index == jax.process_count() - 1:
+        time.sleep(.1)
+    return read_header(path)
+store._read_header = delayed_header
 
 mesh = stack.mesh
 meta, tables, recipe, identity = _fixture(mesh)

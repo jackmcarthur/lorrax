@@ -1281,12 +1281,18 @@ def shared_pole_bank_writer(path, *, meta, expected_identity, mesh_xy):
     Every slice drains before releasing its staging array. Masks publish only
     after a successful transaction; final completion still follows close.
     """
-    header = validate_shared_pole_bank(path, expected_identity=expected_identity, mesh_xy=mesh_xy)
-    _check_basis(meta, header)
-    if mesh_xy is not meta.mu_basis.mesh_xy:
-        _refuse("writer mesh differs from packed basis mesh")
-    if header.get("complete"):
-        _refuse("completed scratch bank is immutable")
+    error = None
+    try:
+        header = validate_shared_pole_bank(path, expected_identity=expected_identity, mesh_xy=mesh_xy)
+        _check_basis(meta, header)
+        if mesh_xy is not meta.mu_basis.mesh_xy:
+            _refuse("writer mesh differs from packed basis mesh")
+        if header.get("complete"):
+            _refuse("completed scratch bank is immutable")
+    except Exception as exc:
+        error = exc
+    # Every serial metadata reader must close before any collective writer opens.
+    agree_io_refusal(error, path=path, stage="shared_pole.bank_writer")
     with SlabIO(path, mode="a", mesh=mesh_xy) as io:
         def write(**fields):
             prepared = _prepare_bank_write(header, meta=meta, mesh_xy=mesh_xy, **fields)
