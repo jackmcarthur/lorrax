@@ -3702,6 +3702,19 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
                 nk_tot=int(inputs.meta.nk_tot),
             )
 
+    if uses_direct_bispinor_shared_pole_head(inputs.config) and inputs.config.do_G0:
+        # The scalar static owner still supplies the *bare* CC exchange slot;
+        # its one-shot DFT step mask is not this map's metallic occupation.
+        from .head_correction import compute_static_head_terms
+        seed = inputs.static_head_terms
+        if seed is None:
+            raise ValueError("GATE photon_direct_bare_exchange: missing bare CC head")
+        iteration_static_head_terms = compute_static_head_terms(
+            vc0=seed.vc0, wcoul0_static=seed.wcoul0,
+            occ=wfns_qp.occ[:, :inputs.meta.nb_sigma],
+            cell_volume=float(inputs.meta.cell_volume),
+            nk_tot=int(inputs.meta.nk_tot), source=seed.source)
+
     # The head enters Sigma band-diagonally, so its occupations must be one
     # value per exactly degenerate multiplet of the ladder Sigma is diagonal
     # in; otherwise this map's H breaks the little group and inversion times
