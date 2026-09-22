@@ -583,7 +583,9 @@ def _bank_execution(meta, mesh_xy, receipt, config, *, photon=False):
                 aliases=memory.alias_size_in_bytes,
                 inherited_stream=stream and not photon,
                 stream_temporaries_admitted=stream and photon))
-        with timing.fenced_section('bank.execute.' + stage):
+        with timing.fenced_section(
+                'bank.execute.' + stage, announce=True,
+                label=f"shared-pole bank {stage} execute"):
             started = time.monotonic()
             result = executable(*args)
             jax.block_until_ready(result)
@@ -1214,8 +1216,10 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                              f"including live/native costs; remaining device budget is {device_available} B/rank "
                              f"(3U scaling target {scaling_target} B/rank)")
     for q0 in range(0,len(qids),qwidth):
-        with timing.fenced_section('bank.panel_admission'):
-            q1 = min(q0+qwidth,len(qids))
+        q1 = min(q0+qwidth,len(qids))
+        with timing.fenced_section(
+                'bank.panel_admission', announce=True,
+                label=f"shared-pole bank panel q {q0}:{q1} of {len(qids)}"):
             response_rows = panel_rows(q0,q1)
             row_index = {q: i for i,q in enumerate(response_rows)}
             width = len(z)
