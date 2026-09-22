@@ -9,7 +9,7 @@ from jax.experimental import multihost_utils
 from common.collectives import gather_to_host
 from gw.w_isdf import _get_chi_fractional_contour_kernel_face
 from common.wfn_layout import psi_specs
-from gw.response_bank import response_algebra
+from gw.response_bank import response_algebra, response_occupation_envelope
 from types import SimpleNamespace
 import minimax
 
@@ -80,6 +80,25 @@ if stack.process_index == 0:
         derr=np.max(abs(basis@rule['derivative'][i]-ds))*z.imag**3
         assert max(err,derr)<1e-8,(err,derr)
         print(f'PASS scalar primitive={i} nodes={rule["counts"][i]} value={err:.3e} ds={derr:.3e}',flush=True)
+    # Physical occupation products, including negative differences, against
+    # exact denominators; no small occupations are removed for this check.
+    eps=np.linspace(-.5,.5,32)
+    occ=1/(1+np.exp(40*eps))
+    beta,amp=response_occupation_envelope(eps,occ,1-occ,0.)
+    delta=eps[None,:]-eps[:,None]
+    weight=occ[:,None]*(1-occ)[None,:]
+    assert np.all(weight <= amp*np.exp(np.minimum(beta*delta,0.))*(1+1e-14))
+    z=.3+.19j
+    rule=minimax.response_frequency_rule(-1.,1.,z,decay_rate=beta)
+    for i,pole in enumerate((z,-z)):
+        t=rule['t'][i]
+        basis=np.exp(-delta[...,None]*t)*weight[...,None]
+        error=np.max(abs(basis@rule['value'][i]-weight/(delta-pole)))*z.imag
+        exact=weight*(1 if i==0 else -1)/(2*z*(delta-pole)**2)
+        slope=np.max(abs(basis@rule['derivative'][i]-exact))*z.imag**3
+        assert max(error,slope)<1e-8,(error,slope)
+        assert np.all((t.real>=0)&(t.real<=beta))
+        print(f'PASS weighted scalar primitive={i} nodes={rule["counts"][i]} value={error:.3e} ds={slope:.3e}',flush=True)
 multihost_utils.sync_global_devices('scalar_complete')
 # Split Dyson: independent dense complex solve, signed photon contact included.
 for photon in (False,True):

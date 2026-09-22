@@ -75,8 +75,11 @@ and the projected Sigma error have separate certificates.
 
 **Frequency-specific stream.** The scalar service fits each primitive independently:
 
-$$ F(d,z)=\frac1{d-z}\simeq\sum_j c^F_j e^{-(d-L)t^F_j},\qquad
-B(d,z)=\frac1{d+z}\simeq\sum_j c^B_j e^{-(d-L)t^B_j}. \tag{SP 5} $$
+$$ F(d,z)=\frac1{d-z}\simeq\sum_j c^F_j e^{-(d-r)t^F_j},\qquad
+B(d,z)=\frac1{d+z}\simeq\sum_j c^B_j e^{-(d-r)t^B_j}. \tag{SP 5} $$
+
+Here r is the scalar reference: L for a uniform fit, zero for the
+occupation-weighted fit described below.
 
 Times are complex with nonnegative real part. For nonnegative endpoint offsets,
 the forward product is `Gu(t) conj(Gf(conj(t)))`; its reverse is formed as
@@ -101,6 +104,19 @@ retarded and Laplace rows equal `F_q[χ]` to 1e-10 on a TR-broken lattice and mi
 pair after the existing sample-only 1e-14 activity floor, including negative
 transition energies and signed metallic weights; exact moments are untruncated. Scalar plans receive 2 eV padding per
 one-particle endpoint for SC reuse, without changing occupations or energies.
+
+The crossing fit uses the current occupation envelope
+`|f_n u_m| <= A_f A_u min(1,exp(beta*d))`, where `d=E_m-E_n` and
+`A_f=max(1,max|f|)`, `A_u=max(1,max|u|)`. The bank obtains beta from the
+minimum one-sided log slopes of `|f|/A_f` above mu and `|u|/A_u` below mu;
+no Fermi–Dirac assumption or additional occupation cutoff is made. Sampled
+value and derivative errors use that envelope, with tolerance divided by
+`A_f A_u`. For beta>0 the scalar reference is zero and both Green references
+are mu; `0<=Re(t)<=beta` bounds the occupation-weighted Green factors.
+Zero beta retains the uniform fit. SC reuse requires a current beta at least
+as large and a current amplitude no larger than those used for construction.
+This is an occupation-weighted approximation on the signed interval, not an
+explicit triangular projection onto positive/negative transition energies.
 
 $$ \frac{\partial F}{\partial s}=\frac1{2z(d-z)^2},\qquad
 \frac{\partial B}{\partial s}=-\frac1{2z(d+z)^2},\quad s=z^2. \tag{SP 7} $$

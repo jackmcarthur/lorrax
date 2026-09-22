@@ -725,6 +725,18 @@ def response_sample_weights(f, u):
         discarded_u_mass=float(np.sum(np.abs(u-ut))))
 
 
+def response_occupation_envelope(energy, f, u, mu):
+    """Bound |f_n u_m| by amplitude*min(1, exp(beta*(E_m-E_n)))."""
+    bounds, amplitude = [], 1.
+    for weight, offset in ((np.abs(f), energy-mu), (np.abs(u), mu-energy)):
+        maximum = max(1., float(weight.max()))
+        amplitude *= maximum
+        tails = (offset > 0) & (weight != 0)
+        if np.any(tails):
+            bounds.append(float(np.min(np.log(maximum/weight[tails])/offset[tails])))
+    return min(bounds) if bounds else 0., amplitude
+
+
 def response_windows(energy, f, u, *, chemical_potential_ry, z_ry):
     """One crossing state window and three noncrossing product cells.
 
@@ -981,12 +993,16 @@ def response_quadrature(wfns, meta, sample_plan, receipt, *, ordered=False, prin
                      for fw, uw in zip(f, u)])
     domains = np.array([(r[1]-r[0], energy[uw != 0].max()-energy[fw != 0].min())
                         for fw, uw, r in zip(f, u, refs)])
+    mu = sample_plan["census"]["mu_ry"]
+    decay_rate, amplitude = response_occupation_envelope(energy, f[0], u[0], mu)
     session = getattr(meta, "shared_pole_response_rules", None)
     old = None if session is None else session.get("windowed_frequency")
     metallic = sample_plan["census"]["partial_at_mu"]
     reuse = (old is not None and old["domains"].shape == domains.shape
              and np.all(old["domains"][:,0] <= domains[:,0])
              and np.all(domains[:,1] <= old["domains"][:,1])
+             and old.get("decay_rate", 0.) <= decay_rate
+             and old.get("amplitude", 0.) >= amplitude
              and old["metallic"] == metallic and np.array_equal(old["z"], z))
     capacity = 2*minimax.RESPONSE_RULE_CAPACITY
     windows = len(pairs)
@@ -997,6 +1013,7 @@ def response_quadrature(wfns, meta, sample_plan, receipt, *, ordered=False, prin
         domains = domains.copy()
         domains[0] += np.array([-4.,4.])/RYD_TO_EV if session is not None else 0.
         plan = dict(domains=domains, z=z, metallic=metallic,
+            decay_rate=decay_rate, amplitude=amplitude, reference=domains[:,0].copy(),
             t=np.zeros((len(z),windows,capacity), complex),
             coefficients=np.zeros((len(z),4,windows,capacity), complex),
             orientation=np.zeros((len(z),windows,capacity), np.int32),
@@ -1012,7 +1029,9 @@ def response_quadrature(wfns, meta, sample_plan, receipt, *, ordered=False, prin
                     for window,(lo,hi) in enumerate(domains):
                         tol = sample_plan["bank_rule_tolerance"]/windows
                         if window == 0:
-                            rule = minimax.response_frequency_rule(lo,hi,z[assigned],rel_tol=tol)
+                            rule = minimax.response_frequency_rule(lo,hi,z[assigned],
+                                rel_tol=tol/amplitude, decay_rate=decay_rate)
+                            plan["reference"][window] = rule["reference_ry"]
                             plan["t"][assigned,window] = rule["t"].reshape(-1)
                             plan["coefficients"][assigned,:2,window] = -np.stack(
                                 (rule["value"],rule["derivative"])).reshape(2,-1)
@@ -1042,8 +1061,13 @@ def response_quadrature(wfns, meta, sample_plan, receipt, *, ordered=False, prin
         progress.finish()
         if session is not None:
             session["windowed_frequency"] = plan
-    receipt["rule_provider"] = "minimax crossing complex times + noncrossing Laplace windows"
-    receipt["rule"] = dict(intervals_ry=plan["domains"].tolist(),counts=plan["counts"].tolist(),reused=reuse)
+    # All ranks share this scalar gauge, including ranks without an assigned frequency.
+    plan["reference"][0] = 0. if plan["decay_rate"] else plan["domains"][0,0]
+    if plan["decay_rate"]:
+        refs[0] = mu  # Both weighted Green factors remain bounded for Re(t)<=beta.
+    receipt["rule_provider"] = "minimax occupation-weighted unsplit crossing (sampled scalar error) + noncrossing Laplace windows"
+    receipt["rule"] = dict(intervals_ry=plan["domains"].tolist(),counts=plan["counts"].tolist(),
+        decay_rate_ry_inv=plan["decay_rate"], occupation_amplitude=plan["amplitude"], reused=reuse)
     receipt["nodes"] = int(plan["counts"].sum())
     if jax.process_index() == 0:
         print_fn("Response quadrature: z(eV) crossing / remote time-product counts; "
@@ -1069,8 +1093,8 @@ def integrate_response_frequency(wfns, meta, mesh_xy, rules, *, q_ids, sample,
     """Donated [value/ds,q,mu_X,nu_Y]; one Green/FFT scan per frequency."""
     plan, refs = rules["plan"], rules["refs"]
     times = plan["t"][sample]
-    # Every window is expressed relative to its own transition lower bound.
-    shift = refs[:,1]-refs[:,0]-plan["domains"][:,0]
+    # Translate each scalar reference to the two physical Green references.
+    shift = refs[:,1]-refs[:,0]-plan["reference"]
     coefficients = plan["coefficients"][sample]*np.exp(-shift[:,None]*times)[None]
     n = meta.mu_basis.n_packed if vertex is None else vertex[0][0].shape[2]
     kernel, fixed = response_stream(wfns, meta, mesh_xy=mesh_xy,
