@@ -58,6 +58,7 @@ from common.fft_helpers import (
     make_local_flat_k_fftn,
 )
 from common.shard_map import shard_map
+from common.staged_reshard import concatenate_sharded_axis, face_to_batch_reshard
 # Q's free r axis is zero-padded through ``runtime.padding`` and split over
 # the full mesh product.  ``common.staged_reshard`` owns the exact
 # product-band → product-r exchange used to put streamed wavefunctions there.
@@ -1528,13 +1529,15 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
     batch_scalar_shard = NamedSharding(mesh_xy, P(('x', 'y'),))
     face_ij_shard = NamedSharding(mesh_xy, P(None, 'x', 'y'))
 
+    exchange_face_to_q = face_to_batch_reshard(mesh_xy)
+
     def _fourier_matrix(batch_k, operator_R):
         """The one path-q contraction for both fH and active character."""
         phase = jnp.exp(-2j * jnp.pi * (batch_k @ R_grid.T))
         mat = 0.5 * jnp.einsum(
             'bk,kij->bij', phase, operator_R, optimize=True)
         mat = jax.lax.with_sharding_constraint(mat, face_ij_shard)
-        mat = jax.lax.with_sharding_constraint(mat, batch_mat_shard)
+        mat = exchange_face_to_q(mat)
         return mat + jnp.swapaxes(mat, 1, 2).conj()
 
     if not use_active and not return_coeffs:
@@ -1751,10 +1754,12 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
         # Gate: ``tests/test_htransform_kpath_gates.py``.
         def _order_path_state_carriers(energies, coefficient_batches, nq):
             """Apply one stable band permutation to energies and vectors."""
-            order = jnp.argsort(energies, axis=1, stable=True)
+            order = jax.lax.with_sharding_constraint(
+                jnp.argsort(energies, axis=1, stable=True), batch_eig_shard)
             ordered_energies = jnp.take_along_axis(
                 energies[:nq], order[:nq], axis=1)[:, :nb_keep]
-            coefficients = jnp.concatenate(coefficient_batches, axis=0)
+            coefficients = concatenate_sharded_axis(
+                coefficient_batches, 0, mesh_xy, batch_vec_shard.spec)
             gather_index = jnp.broadcast_to(
                 order[:, None, :], coefficients.shape)
             ordered_coefficients = jnp.take_along_axis(
