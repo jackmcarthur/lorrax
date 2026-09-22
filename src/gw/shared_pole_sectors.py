@@ -96,7 +96,6 @@ def read_sector_round(io, meta, bank, header, ids, endpoints, *, sample_span=Non
                     resident_bytes_per_rank=value.size*value.dtype.itemsize//io.mesh.size+output,
                     workspace_bytes_per_rank=workspace,concurrent_with=ledger.live_stages)
                 selected=select(value)
-                selected.block_until_ready()
                 del value
                 parts.append(selected);keep.append(selected)
             if len(parts)>1:
@@ -104,7 +103,6 @@ def read_sector_round(io, meta, bank, header, ids, endpoints, *, sample_span=Non
                     resident_bytes_per_rank=sum(a.size*a.dtype.itemsize//io.mesh.size for a in keep+parts),
                     workspace_bytes_per_rank=0,concurrent_with=ambient)
             out[field]=join(*parts) if len(parts)>1 else parts[0]
-            out[field].block_until_ready()
             keep=list(retained)+list(out.values())
     finally:
         ledger.live_stages=ambient
@@ -205,7 +203,7 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output):
             batch_width=batch_width):
         sectors=[];retained=[]
         for family,name in enumerate(('CC','TT')):
-            with timing.fenced_section('spole.sector.'+name, announce=True):
+            with timing.section('spole.sector.'+name, announce=True):
                 with SlabIO(bank['path'],mode='r',mesh=mesh_xy) as io:
                     exact=read_sector_round(io,meta,bank,header,ids,(family,family),
                         fields=('M0','M1','M2','M3'),retained=retained,execution=execution)
@@ -231,7 +229,7 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output):
                 rank0_transaction(path,stage='sector.diagonal_receipt',
                     write=lambda:path.write_text(_json(dict(identity=bank['identity'],
                         status='DIAGONAL_SPANS_ONLY',rounds=receipts))+'\n'))
-        with timing.fenced_section('spole.sector.CT', announce=True):
+        with timing.section('spole.sector.CT', announce=True):
             with SlabIO(bank['path'],mode='r',mesh=mesh_xy) as io:
                 ct=read_sector_round(io,meta,bank,header,ids,(0,1),sample_span=fit_span,
                                       fields=sample_fields,retained=retained,execution=execution)
@@ -338,7 +336,6 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output):
                 try:
                     treated_factor=jnp.where(active_mask[:,None,:],model[0],0)
                     treated_poles=jnp.where(active_mask,model[1],1)
-                    treated_factor.block_until_ready();treated_poles.block_until_ready()
                 except Exception:
                     ledger.live_stages=ambient
                     raise

@@ -79,36 +79,47 @@ def response_algebra(meta, config, *, mesh_xy, n, ordered=False, photon=False):
 @lru_cache(maxsize=None)
 def _response_programs(mesh_xy, n, backend, route, pref, ordered, volume):
     """Reuse compiled algebra across SC maps without retaining state arrays."""
-    from distrib_la import matmul, plan
+    from distrib_la import local_batch, matmul, plan
 
     lu = plan("solve_lu", mesh_xy, backend=backend, n=n,
               batched_route=route)
     face = NamedSharding(mesh_xy, P(None, "x", "y"))
 
+    def program(inputs, outputs=1):
+        def wrap(fn):
+            if backend == "off":
+                return local_batch(fn, mesh_xy)
+            return jax.jit(fn, in_shardings=(face,) * inputs,
+                out_shardings=face if outputs == 1 else (face,) * outputs)
+        return wrap
+
+    solve = jnp.linalg.solve if backend == "off" else lu.batched
+
     def mm(a, b):
+        if backend == "off":
+            return a @ b
         return matmul(a, b, mesh=mesh_xy, backend=backend,
                       batched_route=route)
 
     def congruence(h, a):
         return mm(mm(h, a), h)
 
-    @partial(jax.jit, in_shardings=(face, face), out_shardings=face)
+    @program(2)
     def value(h, chi_raw):
         x = pref * congruence(h, chi_raw)
         identity = jnp.broadcast_to(jnp.eye(n, dtype=h.dtype), x.shape)
-        e = lu.batched(identity - x, identity.copy())
+        e = solve(identity - x, identity.copy())
         return congruence(h, mm(x, e))
 
     def derivative(w, dchi_raw):
         # Full W on BOTH sides; no adjoint at complex frequency.
         return mm(mm(w, pref * dchi_raw), w)
 
-    @partial(jax.jit, in_shardings=(face, face, face), out_shardings=face)
+    @program(3)
     def slope(h, wc, dchi_raw):
         return derivative(wc + mm(h, h), dchi_raw)
 
-    @partial(jax.jit, in_shardings=(face, face, face),
-             out_shardings=(face, face))
+    @program(3, 2)
     def moments(h, a0, a1):
         # chi_scaled=A0/s+A1/s²; whitened Dyson coefficients are
         # B0=H A0 H, B1=H A1 H, S0=B0, S1=B1+B0².
@@ -118,8 +129,7 @@ def _response_programs(mesh_xy, n, backend, route, pref, ordered, volume):
                 0.5 * congruence(h, b1 + mm(b0, b0)))
 
     if ordered:
-        @partial(jax.jit, in_shardings=(face, face, face, face, face),
-                 out_shardings=(face, face, face, face))
+        @program(5, 4)
         def moments(h, a0, a1, o0, o1):
             # chi_scaled = o0/z + a0/z^2 + o1/z^3 + a1/z^4 with no time-
             # reversal or reality assumption; X_k = H chi_k H and
@@ -138,24 +148,22 @@ def _response_programs(mesh_xy, n, backend, route, pref, ordered, volume):
                     0.5 * congruence(h, c3), 0.5 * congruence(h, c4))
 
     if volume is not None:
-        @partial(jax.jit, in_shardings=(face, face), out_shardings=face)
         def infinity(v, contact):
             # chi(z)=chi_param(z)-contact, so W_inf=(I+V contact)^-1 V.
             identity = jnp.broadcast_to(jnp.eye(n, dtype=v.dtype), v.shape)
-            return lu.batched(identity + mm(v, jnp.broadcast_to(volume * contact, v.shape)), v.copy())
+            return solve(identity + mm(v, jnp.broadcast_to(volume * contact, v.shape)), v.copy())
 
-        @partial(jax.jit, in_shardings=(face, face, face), out_shardings=face)
+        @program(3)
         def value(v, chi_raw, contact):
             chi = pref * chi_raw - volume * contact
             identity = jnp.broadcast_to(jnp.eye(n, dtype=v.dtype), chi.shape)
-            return lu.batched(identity - mm(v, chi), v.copy()) - v
+            return solve(identity - mm(v, chi), v.copy()) - v
 
-        @partial(jax.jit, in_shardings=(face, face, face), out_shardings=face)
+        @program(3)
         def slope(v, wc, dchi_raw):
             return derivative(wc + v, dchi_raw)
 
-        @partial(jax.jit, in_shardings=(face,) * 6,
-                 out_shardings=(face,) * 5)
+        @program(6, 5)
         def moments(v, a0, a1, o0, o1, contact):
             # W=W_inf + sum C_k/z^k. Dyson recurrence
             # C_k=W_inf [chi_k W_inf + sum_{i=1}^{k-1} chi_i C_(k-i)].
@@ -329,7 +337,6 @@ def photon_static_contact(wfns, meta, *, mesh_xy, layout, vertex,
     pi_fd = jax.jit(tt_only)(raw[:, 0] * (_w_solve_pref_scalar(meta)/float(meta.cell_volume)))
     pi_grid = pi_fd + drude
     contact = pi_grid + drude
-    jax.block_until_ready((pi_grid, drude, contact))
     receipt["correlation_count"] += count
     receipt["contact"] = dict(equation="Pi_grid(0,0)+D", diagonal_reference="Pi_FD=Pi_grid-D",
         units="physical response density, 1/Omega", scope="built once for this bank state")
@@ -429,7 +436,6 @@ def exact_bare_moments(wfns, meta, *, mesh_xy, q_ids, execute, ordered=False,
             raw = execute(kernel, args, "moment_correlation")[:, 0]
             term = (_w_solve_pref_scalar(meta) * coefficient) * raw
             total = term if total is None else total + term
-            total.block_until_ready()
         totals.append(total)
     if not ordered:
         return (*totals, census)
@@ -447,7 +453,6 @@ def exact_bare_moments(wfns, meta, *, mesh_xy, q_ids, execute, ordered=False,
             raw = execute(kernel, args, "moment_correlation")[:, 0]
             term = (1j * _w_solve_pref_scalar(meta) * coefficient) * raw
             total = term if total is None else total + term
-            total.block_until_ready()
         totals.append(total)
     return (*totals, census)
 
@@ -556,12 +561,12 @@ def response_dense_workspace(mesh_xy, n, batch, layout, *, with_eigh):
 def _bank_execution(meta, mesh_xy, receipt, config, *, photon=False):
     """Compile and admit new dense work; stream outputs are reserved by batch."""
     def execute(kernel, args, stage):
-        with timing.fenced_section('bank.compile.' + stage, announce=True):
+        with timing.section('bank.compile.' + stage, announce=True):
             started = time.monotonic()
             executable = kernel.lower(*args).compile()
             receipt["seconds"]["compilation"] = (receipt["seconds"].get("compilation", 0.)
                 + time.monotonic() - started)
-        with timing.fenced_section('bank.admission.' + stage, announce=True):
+        with timing.section('bank.admission.' + stage, announce=True):
             memory = executable.memory_analysis()
             if memory is None:
                 raise ValueError("GATE response_capacity: compiled memory unavailable")
@@ -586,12 +591,11 @@ def _bank_execution(meta, mesh_xy, receipt, config, *, photon=False):
                 aliases=memory.alias_size_in_bytes,
                 inherited_stream=False,
                 stream_temporaries_admitted=stream))
-        with timing.fenced_section('bank.execute.' + stage, announce=stream,
-                                  label=f"shared-pole bank {stage} execute"):
+        with timing.section('bank.dispatch.' + stage, announce=stream,
+                            label=f"shared-pole bank {stage} dispatch"):
             started = time.monotonic()
             result = executable(*args)
-            jax.block_until_ready(result)
-            receipt["seconds"][stage] = receipt["seconds"].get(stage, 0.) + time.monotonic()-started
+            receipt["seconds"][stage+"_dispatch"] = receipt["seconds"].get(stage+"_dispatch", 0.) + time.monotonic()-started
         return result
     return execute
 
@@ -650,7 +654,6 @@ def _coulomb_batch(meta, config, bank_io, mesh_xy, q_span, execute):
         canonical = io.read_slab(resource["dataset"], shape=shape,
             offset=(q_span[0], 0, 0), partition_spec=spec)
         v = compiled(canonical)
-        v.block_until_ready()
     del canonical
     layout = config.get("linalg", "local") if hasattr(config, "get") else config.backend.linalg
     kernel = _coulomb_algebra(mesh_xy, basis.n_packed, basis.n_logical, layout)
@@ -1037,7 +1040,7 @@ def integrate_response_frequency(wfns, meta, mesh_xy, rules, *, q_ids, sample,
 def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_io,
                         vertex=None, contact=None, print_fn=print):
     """Stage A: integrate value and derivative together, one frequency at a time."""
-    with timing.fenced_section('bank.setup', announce=True):
+    with timing.section('bank.setup', announce=True):
         header,qids,census = _bank_context(wfns,meta,sym,bank_io,mesh_xy)
         authenticate_sample_plan(sample_plan,header)
         z = bank_points(sample_plan)
@@ -1082,7 +1085,7 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
         ledger = meta.shared_pole_capacity
         ambient = ledger.live_stages
     from file_io.shared_pole_store import read_shared_pole_bank, shared_pole_bank_writer
-    with timing.fenced_section('bank.window_geometry', announce=True,
+    with timing.section('bank.window_geometry', announce=True,
                               label="shared-pole frequency rule construction"):
         solve_value, solve_slope, _, receipt["algebra"] = response_algebra(meta,config,
             mesh_xy=mesh_xy,n=n,photon=vertex is not None)
@@ -1151,11 +1154,11 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                         else:
                             value = execute(solve_value, (h,chi)+(() if vertex is None else (contact,)),
                                             "sample_dyson") - constant
+                            if vertex is not None and not mirror:
+                                _photon_sample_norms(receipt,value,q0,sample,bank_io["photon_layout"],mesh_xy)
                             for iq in range(q0,q1):
                                 part = slice(iq-q0,iq-q0+1)
-                                if vertex is not None and not mirror:
-                                    _photon_sample_norms(receipt,value[part],iq,sample,bank_io["photon_layout"],mesh_xy)
-                                elif vertex is None:
+                                if vertex is None:
                                     _reciprocity_census(receipt,value[part],z[sample:sample+1],int(qids[iq]),iq,meta)
                                     if ordered and _self_negative(int(qids[iq]),meta):
                                         _tr_odd_census(receipt,solve_value,h[part],chi[part],value[part],z[sample:sample+1],int(qids[iq]))
@@ -1183,16 +1186,19 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
 def _photon_sample_norms(receipt, value, parent, first, layout, mesh_xy):
     """Record Frobenius norms of CC/CT/TC/TT without gathering operators."""
     from .photon_layout import photon_block_view
-    norms = {}
+    norms = []
     for sector, pairs in (("CC", ((0, 0),)),
                           ("CT", tuple((0, b) for b in range(1, 4))),
                           ("TC", tuple((a, 0) for a in range(1, 4))),
                           ("TT", tuple((a, b) for a in range(1, 4) for b in range(1, 4)))):
         squared = sum(jnp.sum(jnp.abs(photon_block_view(value, layout, a, b, mesh_xy))**2,
                               axis=(-2, -1)) for a, b in pairs)
-        norms[sector] = np.asarray(jnp.sqrt(squared)).tolist()
-    receipt.setdefault("sector_sample_norms", []).append(
-        dict(parent=int(parent), first_sample=int(first), **norms))
+        norms.append(jnp.sqrt(squared))
+    values = np.asarray(jnp.stack(norms, axis=-1))
+    receipt.setdefault("sector_sample_norms", []).extend(
+        dict(parent=int(parent)+i, first_sample=int(first),
+             **{name: [float(v)] for name, v in zip(("CC","CT","TC","TT"), row)})
+        for i, row in enumerate(values))
 
 
 def photon_bare_operator(wfns, wfns_transverse, meta, *, path, mu_bases, layout, mesh_xy):
@@ -1281,7 +1287,6 @@ def compute_photon_bank(wfns, wfns_transverse, meta, config, *, mesh_xy, sym,
                                      mesh_xy=mesh_xy, layout=layout)
     bank["photon_v"] = photon_bare_operator(wfns, wfns_transverse, meta,
         path=bank["bispinor_v_q_path"], mu_bases=mu_bases, layout=layout, mesh_xy=mesh_xy)
-    jax.block_until_ready((vertex, bank["photon_v"]))
     receipt["seconds"]["endpoints_and_V"] = time.monotonic()-before
     before = time.monotonic()
     if jax.process_index() == 0:

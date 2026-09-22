@@ -29,6 +29,7 @@ batch.
 from __future__ import annotations
 
 from typing import Sequence
+from functools import partial
 
 import jax
 import jax.numpy as jnp
@@ -242,16 +243,48 @@ def _real_rows(kernel, operands, *, nbatch: int, py: int):
     row = lambda i: tuple(None if x is None else jax.lax.dynamic_slice_in_dim(x, i, 1, axis=0)
                           for x in operands)
     template = jax.eval_shape(kernel, *row(0))
-    out0 = jnp.zeros((local_nb,) + tuple(template.shape[1:]), dtype=template.dtype)
+    out0 = jax.tree.map(lambda x: jnp.zeros((local_nb,) + tuple(x.shape[1:]), x.dtype), template)
 
     def _one(i, out):
         value = jax.lax.cond(first_q + i < nbatch,
                              lambda ops: kernel(*ops),
-                             lambda ops: jnp.zeros(template.shape, template.dtype),
+                             lambda ops: jax.tree.map(lambda x: jnp.zeros(x.shape, x.dtype), template),
                              row(i))
-        return jax.lax.dynamic_update_slice(out, value, (i,) + (0,) * (out.ndim - 1))
+        return jax.tree.map(lambda a, v: jax.lax.dynamic_update_slice(
+            a, v, (i,) + (0,) * (a.ndim - 1)), out, value)
 
     return jax.lax.fori_loop(0, local_nb, _one, out0)
+
+
+def local_batch(kernel, mesh):
+    """Run a composition of dense equations q-locally with one exchange each way.
+
+    Inputs/outputs are face-sharded matrix batches (outputs may be a pytree).
+    A singleton input batch is broadcast; padded q rows never enter the kernel.
+    Reuses the same movement and real-row schedule as the individual plans.
+    """
+    px, py = int(mesh.shape['x']), int(mesh.shape['y'])
+    face = P(None, 'x', 'y')
+
+    @jax.jit
+    def run(*operands):
+        nb = max(a.shape[0] for a in operands)
+        if any(a.ndim != 3 or a.shape[0] not in (1, nb)
+               or a.shape[1] % px or a.shape[2] % py for a in operands):
+            raise ValueError('local_batch requires matching matrix batches tiling the mesh')
+        pad = (-nb) % (px * py)
+        inputs = tuple(_pad_leading(jnp.broadcast_to(a, (nb, *a.shape[1:])), pad)
+                       for a in operands)
+
+        @partial(shard_map, mesh=mesh, in_specs=(face,) * len(inputs),
+                   out_specs=face, check_vma=False)
+        def work(*tiles):
+            local = tuple(_face_to_batch(a, px=px, py=py) for a in tiles)
+            result = _real_rows(kernel, local, nbatch=nb, py=py)
+            return jax.tree.map(lambda a: _batch_to_face(a, px=px, py=py), result)
+
+        return jax.tree.map(lambda a: a[:nb], work(*inputs))
+    return run
 
 
 def _replicate_batch_vector(v, *, px: int, py: int):

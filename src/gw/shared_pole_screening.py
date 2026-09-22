@@ -117,7 +117,6 @@ def _coulomb_resource(value, meta, sym, mesh_xy, path):
     with SlabIO(path, mode="w", mesh=mesh_xy) as io:
         for iq, q in enumerate(qids):
             canonical = executable(value[int(q):int(q)+1])
-            canonical.block_until_ready()
             io.write_slab("V_canonical_qwedge", canonical, offset=(iq, 0, 0),
                           global_shape=(len(qids), basis.n_canonical, basis.n_canonical),
                           valid_shape=(1, basis.n_logical, basis.n_logical))
@@ -174,7 +173,7 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
     if material_class == "metal" and not bool(getattr(sym, "trs_allowed", True)):
         print_fn("  shared-pole screening: time-reversal-broken METAL; ordered bank "
                  "(both orientations, odd channel) with fractional occupations")
-    with timing.fenced_section("spole.screening_setup"):
+    with timing.section("spole.screening_setup"):
         from file_io.shared_pole_store import initialize_shared_pole_bank
         from file_io.tagged_arrays import register_shared_pole_restart_member
         from .shared_pole_recipe import shared_pole_restart_handle
@@ -215,7 +214,7 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
                 # this branch is unreachable (``sc_scratch`` skips restart).
                 if config.debug.write_w or config.write_poles:
                     from file_io.shared_pole_store import export_shared_pole_outputs
-                    with timing.fenced_section("spole.outputs"):
+                    with timing.section("spole.outputs"):
                         export_shared_pole_outputs(handle, meta=meta, config=config,
                             mesh_xy=mesh_xy, source_wfn=source_wfn,
                             run_dir=run_dir, label=label, print_fn=print_fn,
@@ -258,7 +257,7 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
             root, stage="shared_pole.prepare_output", write=prepare_output,
             return_value=True)
         tables = _shared_pole_tables(meta, sym, centroid_indices)
-    with timing.fenced_section("spole.coulomb_staging"):
+    with timing.section("spole.coulomb_staging"):
         if resume_constructor:
             saved_bank_receipt = json.loads((root / 'bank_receipt.json').read_text())
             coulomb = dict(saved_bank_receipt['coulomb_identity'],
@@ -266,7 +265,7 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
         else:
             coulomb = (None if photon else
                        _coulomb_resource(V_q, meta, sym, mesh_xy, root / "coulomb.h5"))
-    with timing.fenced_section("spole.bank_setup"):
+    with timing.section("spole.bank_setup"):
         bank = dict(path=str(root / "bank.h5"), identity=identity,
                     tables=tables, coulomb=coulomb)
         if photon:
@@ -290,7 +289,7 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
             # EVERY RANK LEAVES THIS CALL THE SAME WAY.  A bare
             # ``process_index() == 0`` write raises on rank 0 alone (quota,
             # EIO on purge-eligible scratch) while ranks 1..P-1 walk into
-            # the next ``timing.fence`` and hang to walltime (INVARIANTS 21).
+            # the next collective and hang to walltime (INVARIANTS 21).
             # ``rank0_transaction`` does the same serial write and
             # broadcasts its verdict, exactly as the sibling write above.
             receipts[stage] = receipt
@@ -300,7 +299,7 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
                 write=lambda: path.write_text(_json(receipt) + "\n"))
             print_fn(f"shared-pole {stage}: completion={receipt.get('completion', receipt.get('status'))}; "
                      f"seconds={receipt.get('seconds', {})}")
-    with timing.fenced_section("spole.bank"):
+    with timing.section("spole.bank"):
         if resume_constructor:
             print_fn('shared-pole bank: authenticated complete producer artifact reused')
         elif photon:
@@ -312,7 +311,7 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
             record("bank", produce_w_bank(wfns, meta, config, mesh_xy=mesh_xy,
                 sym=sym, sample_plan=recipe, bank_io=bank, print_fn=print_fn))
     if not photon and not resume_constructor:
-        with timing.fenced_section("spole.moments"):
+        with timing.section("spole.moments"):
             record("moments", compute_response_moments(wfns, meta, config,
                 mesh_xy=mesh_xy, sym=sym, bank_io=bank))
     # The constructor owns scratch reads, actual pencil planning and the
@@ -325,7 +324,7 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
     else:
         result = construct_shared_poles(bank, bank, meta, config,
             mesh_xy=mesh_xy, output=str(root / "model.h5"))
-    with timing.fenced_section("spole.screening_finalize"):
+    with timing.section("spole.screening_finalize"):
         record("constructor", result)
         header = None if photon else result["model_header"]
         handle = (result['handle'] if photon else
@@ -346,7 +345,7 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
             record("head", head)
         if (config.debug.write_w or config.write_poles) and not photon:
             from file_io.shared_pole_store import export_shared_pole_outputs
-            with timing.fenced_section("spole.outputs"):
+            with timing.section("spole.outputs"):
                 receipts["outputs"] = export_shared_pole_outputs(handle, meta=meta,
                     config=config, mesh_xy=mesh_xy, source_wfn=source_wfn,
                     run_dir=run_dir, label=label, tables=tables, print_fn=print_fn)

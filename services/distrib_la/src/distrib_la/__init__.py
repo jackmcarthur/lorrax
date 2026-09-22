@@ -154,7 +154,10 @@ from distrib_la.resolve import (
     resolve_backend,
 )
 
+from ._batch_reshard import local_batch
+
 __all__ = [
+    "local_batch",
     "LocalSubspacePlan", "plan_local_subspace", "plan_subspace",
     "plan_orthogonalization",
     # face-pinned block glue for stacked [b, R, R] operators

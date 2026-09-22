@@ -448,7 +448,6 @@ def write_shared_pole_model(path, b, poles2, K, *, q_span, meta, tables,
         name = f"staging/q{lo}_{hi}"
     with timing.section("canonical_basis_conversion_and_packing"):
         canonical = basis.unpack_axis(b, 1)
-        canonical.block_until_ready()
     if previous is None:
         with SlabIO(path, mode="w", mesh=mesh) as io:
             _write_metadata(io, header)
@@ -931,9 +930,6 @@ def read_shared_pole_faces(io, q_span, *, meta, header, column_span=None, basis=
         b = basis.pack_axis(b, 1, spec=spec)
         faces[axis] = jnp.where(active[:,None,None,:] & jnp.asarray(
             basis.active_mask)[None,:,None,None], b, 0.0)
-        # Complete masking before allocating the other face: Python reference
-        # release alone does not end an asynchronously dispatched input lifetime.
-        faces[axis].block_until_ready()
         del b
     poles = io.read_slab("poles2_ry2", shape=(hi-lo,width), offset=(lo,c0), valid_shape=(hi-lo,c1-c0), partition_spec=P())
     return (faces.get("x"), faces.get("y"), jnp.where(active,poles,1.0), counts)
@@ -1592,7 +1588,6 @@ def read_shared_pole_bank(io, q_span=None, *, meta, header, sample_span=None,
                 valid_shape=prefix + (logical,logical),
                 offset=offset, dtype=np.complex128, partition_spec=spec)
             row = canonical if "photon_layout" in header else basis.pack_operator(canonical, spec=spec)
-            row.block_until_ready()
             retained += output
             del canonical
             rows.append(row)
@@ -1600,7 +1595,6 @@ def read_shared_pole_bank(io, q_span=None, *, meta, header, sample_span=None,
         del rows
         if layout == "batch" and not contiguous:
             value = _bank_face_to_batch(mesh, value.ndim)(value)
-        value.block_until_ready()
         out[name] = value
     return out
 

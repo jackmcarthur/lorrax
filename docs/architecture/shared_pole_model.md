@@ -567,3 +567,19 @@ The sampler computes the frequency-independent Coulomb roots once for all
 irreducible q using the existing local/distributed batched solver, retaining
 `H[q,mu_X,nu_Y]` throughout the frequency loop. Photon V already has this
 lifetime. No full-zone Green replication or additional response field results.
+
+### Asynchronous execution and q-local algebra
+
+Production bank, constructor, and sector stages use ordinary timing sections;
+no timing boundary drains live arrays or aligns ranks. Dispatch durations are
+labelled `_dispatch`; frequency progress follows committed I/O, which includes
+completion. Numerical scalar gates and SlabIO's bounded write/read transactions
+still synchronize where a host decision or committed payload requires it.
+
+With `linalg=local`, `distrib_la.local_batch` exchanges face operands
+`P(None,"x","y")` into q-local matrices once, executes the complete charge or
+photon Dyson/derivative/moment equations, and restores their face outputs once.
+It reuses the service's staged exchanges and real-row loop, skipping padded q
+slots; no complete-q replicated matrix stack exists. The pole constructor uses
+its existing one-parent-per-GPU rounds when admitted by the capacity planner;
+its receipt records any memory-driven fallback to the distributed face path.
