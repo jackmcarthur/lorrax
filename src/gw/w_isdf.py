@@ -518,8 +518,8 @@ def _get_chi_fractional_contour_kernel_face(
 
     from common.wfn_layout import psi_specs
     PSI_NMU_SPEC, PSI_MUN_SPEC = psi_specs(layout)
-    if pair_mode not in ("retarded", "laplace", "laplace_ordered", "kms_static"):
-        raise ValueError("pair_mode must be retarded, laplace, laplace_ordered or kms_static")
+    if pair_mode not in ("retarded", "laplace", "laplace_ordered", "kms_static", "windowed"):
+        raise ValueError(f"unknown response pair mode: {pair_mode}")
     if bank_carry and selected_q is None:
         raise ValueError("bank carry requires selected q rows")
     if pair_mode != "retarded" and selected_q is None:
@@ -683,10 +683,9 @@ def _get_chi_fractional_contour_kernel_face(
             result, _ = jax.lax.scan(add, initial, jnp.arange(ns * ns), unroll=1)
             return result
 
-        def retarded_correlation(time):
+        def retarded_correlation(time, lower=occ_f, upper=occ_u, reference=energy_reference):
             tau = jnp.asarray(1j, dtype=jnp.complex128) * time
-            return spin_correlation(occ_f, -tau, energy_reference,
-                                    occ_u, -tau, energy_reference)
+            return spin_correlation(lower, -tau, reference, upper, -tau, reference)
 
         def laplace_correlation(time, occ_f, occ_u, energy_reference):
             """Remote cell: even (forward - reverse) and odd (forward + reverse) rows.
@@ -725,6 +724,33 @@ def _get_chi_fractional_contour_kernel_face(
                 jnp.exp(-eps*time-jnp.logaddexp(0., -beta*eps)), 0.)
             return spin_correlation(lower, 0., mu, upper, 0., mu)
 
+        def selected(value):
+            return jnp.take(chi_fftn(value), jnp.asarray(gather_q), axis=0)
+
+        def add_laplace(accumulators, even, odd, projection):
+            contribution = selected(even + jnp.conj(even))
+            if pair_mode == "laplace_ordered" or (pair_mode == "windowed" and physical):
+                half = projection.shape[0] // 2
+                return accumulate_selected(
+                    accumulate_selected(accumulators, contribution, projection[:half]),
+                    selected(odd - jnp.conj(odd)), projection[half:])
+            return accumulate_selected(accumulators, contribution, projection)
+
+        def window_body(accumulators, node):
+            time, projection, window = node
+            lower, upper, refs = occ_f[window], occ_u[window], energy_reference[window]
+
+            def crossing(_):
+                value = retarded_correlation(time, lower[0], upper[0], refs[0])
+                return accumulate_selected(accumulators,
+                    selected(-1j * (value - jnp.conj(value))), projection[:n_out])
+
+            def remote(_):
+                even, odd = laplace_correlation(time, lower, upper, refs)
+                return add_laplace(accumulators, even, odd, projection)
+
+            return jax.lax.cond(window == 0, crossing, remote, None), None
+
         def body(accumulators, node):
             time, projection = node
             if pair_mode == "retarded":
@@ -732,30 +758,12 @@ def _get_chi_fractional_contour_kernel_face(
             elif pair_mode == "kms_static":
                 A_R = kms_static_correlation(time)
             else:
-                A_R, A_odd_R = laplace_correlation(time, occ_f, occ_u, energy_reference)
+                even, odd = laplace_correlation(time, occ_f, occ_u, energy_reference)
+                return add_laplace(accumulators, even, odd, projection), None
             if selected_q is not None:
-                # Linearity permits ONE completed q FFT per node before
-                # retaining the admitted parent/output batch.
-                contribution = jnp.take(
-                    chi_fftn(-1j * (A_R - jnp.conj(A_R))
-                             if pair_mode == "retarded"
-                             else -(A_R + jnp.conj(A_R)) if pair_mode == "kms_static"
-                             else A_R + jnp.conj(A_R)),
-                    jnp.asarray(gather_q), axis=0)
-                if pair_mode != "laplace_ordered":
-                    return accumulate_selected(accumulators, contribution, projection), None
-                # Both orientations with independent weights.  The partner
-                # orientation is conj in R space BEFORE the q transform
-                # (conj(A)(R) -> conj(A_{-q})), exactly as the retarded stream
-                # forms it; the -q gather is the physical orientation (see the
-                # docstring), not a partner.  Rows are [even outputs; odd
-                # outputs] on one shared node.
-                half = projection.shape[0] // 2
-                odd = jnp.take(chi_fftn(A_odd_R - jnp.conj(A_odd_R)),
-                               jnp.asarray(gather_q), axis=0)
-                return accumulate_selected(
-                    accumulate_selected(accumulators, contribution, projection[:half]),
-                    odd, projection[half:]), None
+                contribution = selected(-1j * (A_R - jnp.conj(A_R))
+                    if pair_mode == "retarded" else -(A_R + jnp.conj(A_R)))
+                return accumulate_selected(accumulators, contribution, projection), None
             reverse_R = jnp.conj(A_R)
             updated = tuple(
                 accumulators[i]
@@ -765,12 +773,10 @@ def _get_chi_fractional_contour_kernel_face(
             )
             return updated, None
 
+        nodes = ((time_nodes[0], projection_rows.T, time_nodes[1])
+                 if pair_mode == "windowed" else (time_nodes, projection_rows.T))
         final_R, _ = jax.lax.scan(
-            body,
-            initial,
-            (time_nodes, jnp.transpose(projection_rows)),
-            unroll=1,
-        )
+            window_body if pair_mode == "windowed" else body, initial, nodes, unroll=1)
         if selected_q is None:
             return tuple(_finish(value) for value in final_R)
         if bank_carry:

@@ -331,6 +331,14 @@ def photon_static_contact(wfns, meta, *, mesh_xy, layout, vertex,
     return pi_grid, drude, contact
 
 
+@lru_cache(maxsize=16)
+def _response_stream_kernel(mesh_xy, kgrid, n_outputs, shape, *, _ffi_key, **options):
+    """Cache programs, never state arrays; window data remain dynamic inputs."""
+    from .w_isdf import _get_chi_fractional_contour_kernel_face
+    return _get_chi_fractional_contour_kernel_face(
+        mesh_xy, kgrid, n_outputs, shape, **options)
+
+
 def response_stream(wfns, meta, *, mesh_xy, q_ids, n_outputs,
                     pair_mode="retarded", bank_carry=False, ordered=False,
                     vertex=None):
@@ -342,7 +350,7 @@ def response_stream(wfns, meta, *, mesh_xy, q_ids, n_outputs,
     ``ordered`` (time reversal measured broken) returns the physical
     orientation ``chi_q = FT_q[chi]`` that Sigma's contraction assumes.
     """
-    from .w_isdf import _get_chi_fractional_contour_kernel_face
+    from ffi import ffi_dial_key
 
     from file_io.shared_pole_store import charge_representation
 
@@ -350,10 +358,10 @@ def response_stream(wfns, meta, *, mesh_xy, q_ids, n_outputs,
         if pair_mode == "laplace":
             raise ValueError("GATE response_vertex: photon Laplace cells must retain odd rows")
         n = int(vertex[0][0].shape[2])
-        kernel = _get_chi_fractional_contour_kernel_face(
+        kernel = _response_stream_kernel(
             mesh_xy, (meta.nkx, meta.nky, meta.nkz), n_outputs,
             (int(meta.nk_tot), int(wfns.slices.nb_full), n, 4),
-            layout=wfns.layout, selected_q=tuple(q_ids), pair_mode=pair_mode,
+            _ffi_key=ffi_dial_key(), layout=wfns.layout, selected_q=tuple(q_ids), pair_mode=pair_mode,
             bank_carry=bank_carry, ordered=True, vertex=True)
         return kernel, vertex
     if not charge_representation(meta):
@@ -365,10 +373,10 @@ def response_stream(wfns, meta, *, mesh_xy, q_ids, n_outputs,
     parent = None if carrier is None else carrier.plan
     nk = int(meta.nk_tot) if parent is None else int(parent.n_parent)
     n = int(meta.mu_basis.n_packed)
-    kernel = _get_chi_fractional_contour_kernel_face(
+    kernel = _response_stream_kernel(
         mesh_xy, (meta.nkx, meta.nky, meta.nkz), n_outputs,
         (nk, int(wfns.slices.nb_full), n, int(meta.nspinor)),
-        k_unfold_plan=parent, layout=wfns.layout, selected_q=tuple(q_ids),
+        k_unfold_plan=parent, _ffi_key=ffi_dial_key(), layout=wfns.layout, selected_q=tuple(q_ids),
         pair_mode=pair_mode, bank_carry=bank_carry, ordered=ordered)
     return kernel, (source.psi_mun, source.psi_nmu, source.enk)
 
@@ -552,7 +560,7 @@ def _bank_execution(meta, mesh_xy, receipt, config, *, photon=False):
             memory = executable.memory_analysis()
             if memory is None:
                 raise ValueError("GATE response_capacity: compiled memory unavailable")
-            stream = stage in ("real_time", "laplace", "moment_correlation", "static_reference")
+            stream = stage in ("real_time", "laplace", "windowed", "moment_correlation", "static_reference")
             if stream and photon:
                 # The caller already holds a reservation for the response
                 # carry/outputs and prepared endpoints. Photon streams have
@@ -1056,39 +1064,40 @@ def integrate_response_panel(wfns, meta, mesh_xy, rules, *, q_ids, sample_span,
     weights = partial(stream_weights, parents=vertex is None)
     t, phase, derivative, remote, masks, ft, ut, reference = (
         rules[k] for k in ("t", "phase", "derivative", "remote", "masks", "ft", "ut", "reference"))
-    kernel,fixed = response_stream(wfns,meta,mesh_xy=mesh_xy,
-        q_ids=tuple(qids),n_outputs=2*a,bank_carry=True,ordered=ordered,vertex=vertex)
+    # One concatenated node stream, one donated carry. Only small window
+    # weights/references are indexed by node; no Green history is materialized.
+    times, rows, windows = [t], [np.vstack((phase[lo:hi], derivative[lo:hi]))], [np.zeros(len(t), np.int32)]
+    if ordered:
+        rows[0] = np.vstack((rows[0], np.zeros_like(rows[0])))
+    lower_weights = [np.stack((ft*masks[1], ft*masks[1]))]
+    upper_weights = [np.stack((ut*masks[1], ut*masks[1]))]
+    references = [[reference, reference]]
+    for index, (cell, rr) in enumerate(remote, start=1):
+        lower, upper = cell["lower"], cell["upper"]
+        times.append(np.asarray(rr["t"]))
+        projections = -np.vstack((rr["projection_value"][lo:hi], rr["projection_derivative"][lo:hi]))
+        if ordered:
+            projections = np.vstack((projections,
+                -np.vstack((rr["odd_projection_value"][lo:hi], rr["odd_projection_derivative"][lo:hi]))))
+        rows.append(projections)
+        windows.append(np.full(len(times[-1]), index, np.int32))
+        lower_weights.append(np.stack((ft*masks[lower], ut*masks[lower])))
+        upper_weights.append(np.stack((ut*masks[upper], ft*masks[upper])))
+        references.append(cell["references_ry"])
+    # Parent restriction acts on k independently for each window/orientation.
+    def place(table):
+        return jnp.stack([jnp.stack([weights(wfns, row, mesh_xy) for row in window])
+                          for window in table])
+    kernel, fixed = response_stream(wfns, meta, mesh_xy=mesh_xy,
+        q_ids=qids, n_outputs=2*a, pair_mode="windowed", bank_carry=True,
+        ordered=ordered, vertex=vertex)
     raw = jax.jit(lambda: jnp.zeros((2*a,len(qids),n,n),jnp.complex128),
         out_shardings=NamedSharding(mesh_xy,P(None,None,"x","y")))()
-    raw = execute(kernel,(jnp.asarray(t),jnp.asarray(np.vstack((phase[lo:hi],derivative[lo:hi]))),
-        *fixed,weights(wfns,ft*masks[1],mesh_xy),
-        weights(wfns,ut*masks[1],mesh_xy),jnp.asarray(reference),raw),"real_time")
-    receipt["correlation_count"] += len(t)
-    # Cell data are dynamic arguments; reuse one compiled owner for
-    # equal-shaped Laplace cells instead of retracing each closure.
-    if remote:
-        lk,lfixed = response_stream(wfns,meta,mesh_xy=mesh_xy,
-            q_ids=tuple(qids),n_outputs=2*a,
-            pair_mode="laplace_ordered" if ordered else "laplace",bank_carry=True,vertex=vertex)
-    for cell,rr in remote:
-        with timing.fenced_section('bank.laplace_arguments'):
-            lower,upper = cell["lower"],cell["upper"]
-            refs = np.asarray(cell["references_ry"])
-            tau = np.asarray(rr["t"])
-            projections = -np.vstack((rr["projection_value"][lo:hi],rr["projection_derivative"][lo:hi]))
-            if ordered:
-                # Rows [even value, even ds, odd value, odd ds].
-                projections = np.vstack((projections,
-                    -np.vstack((rr["odd_projection_value"][lo:hi],rr["odd_projection_derivative"][lo:hi]))))
-            lw = np.stack([ft*masks[lower],ut*masks[lower]])
-            uw = np.stack([ut*masks[upper],ft*masks[upper]])
-            # Parent selection applies to the k axis, separately for each role.
-            lw = jnp.stack([weights(wfns,x,mesh_xy) for x in lw])
-            uw = jnp.stack([weights(wfns,x,mesh_xy) for x in uw])
-        raw = execute(lk,(jnp.asarray(tau),jnp.asarray(projections),
-            *lfixed,lw,uw,jnp.asarray(refs),raw),"laplace")
-        del lw,uw
-        receipt["correlation_count"] += 2*len(tau)
+    raw = execute(kernel, ((jnp.asarray(np.concatenate(times)), jnp.asarray(np.concatenate(windows))),
+        jnp.asarray(np.concatenate(rows, axis=1)), *fixed,
+        place(lower_weights), place(upper_weights), jnp.asarray(references), raw), "windowed")
+    receipt["correlation_count"] += len(t) + 2*sum(len(rr["t"]) for _, rr in remote)
+
     return raw
 
 

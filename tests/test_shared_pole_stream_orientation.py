@@ -147,3 +147,32 @@ def test_compact_rule_through_ordered_stream_matches_exact_denominators(stream):
         s.put(rule['t']), s.put(wrong), s.psi_mun, s.psi_nmu,
         s.put(s.e), s.put(lower), s.put(upper), s.put(refs)))
     assert np.max(abs(even_only-got)) > 1e-3
+
+
+@pytest.mark.parametrize('ordered', [False, True])
+def test_windowed_stream_matches_separate_contours(stream, ordered):
+    """Unequal node counts, changing references and both occupation orientations."""
+    s = stream
+    rng = np.random.default_rng(419)
+    times = [TIMES, TIMES[:1], TIMES[:2]]
+    rows = [rng.normal(size=(4 if ordered else 2, len(t))).astype(complex) for t in times]
+    if ordered:
+        rows[0][2:] = 0
+    lower = np.stack([np.stack([s.f, s.u]), np.stack([s.f, .2*s.u]),
+                      np.stack([.7*s.f, .1*s.u])]).astype(complex)
+    upper = np.stack([np.stack([s.u, s.f]), np.stack([s.u, .3*s.f]),
+                      np.stack([.6*s.u, .4*s.f])]).astype(complex)
+    refs = np.array([[.21, .21], [0., .3], [-.2, .4]])
+    fixed = (s.psi_mun, s.psi_nmu, s.put(s.e))
+    expected = np.array(s.kernel('retarded', n_out=2, ordered=ordered)(
+        s.put(times[0]), s.put(rows[0][:2]), *fixed,
+        s.put(lower[0, 0]), s.put(upper[0, 0]), s.put(refs[0, 0])))
+    for i in (1, 2):
+        expected += np.asarray(s.kernel('laplace_ordered' if ordered else 'laplace', n_out=2)(
+            s.put(times[i]), s.put(rows[i]), *fixed,
+            s.put(lower[i]), s.put(upper[i]), s.put(refs[i])))
+    window_ids = np.concatenate([np.full(len(t), i, np.int32) for i, t in enumerate(times)])
+    got = np.asarray(s.kernel('windowed', n_out=2, ordered=ordered)(
+        (s.put(np.concatenate(times)), s.put(window_ids)), s.put(np.concatenate(rows, axis=1)),
+        *fixed, s.put(lower), s.put(upper), s.put(refs)))
+    np.testing.assert_allclose(got, expected, rtol=2e-12, atol=2e-12)

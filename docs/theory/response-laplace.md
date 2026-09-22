@@ -75,3 +75,15 @@ at its zeros; the certificate instead bounds K and its derivative separately.
 There is no omitted infinite-time tail: the finite sum is compared to the full
 rational target. Arithmetic guards assume ordinary libm accuracy, not an
 interval-arithmetic implementation of the exponential function.
+
+## Streaming the windows
+
+The response bank concatenates crossing and noncrossing times, projection
+rows and window indices into one JIT scan per admitted q/sample panel. Small
+occupation/reference tables select each node's window; the existing Green,
+symmetry and FFT owners build one node at a time. A single donated response
+carry stays at `P(None,None,"x","y")`, and no Green history is stored. Like
+the Sigma tau consumer, kernels are reused while energies, weights and
+references are dynamic inputs; the bounded program cache retains no state
+wavefunctions or response arrays. Both response values and ds rows share
+the node's Green contractions, including ordered photon response.
