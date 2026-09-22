@@ -1,5 +1,5 @@
 """Local complex128 spin rotation; spatial symmetry stays in maps.py."""
-from functools import lru_cache
+from functools import lru_cache, partial
 
 import jax
 import jax.numpy as jnp
@@ -37,13 +37,11 @@ def _register():
 def _kernel(mesh):
     _register()
 
-    @shard_map(mesh=mesh, in_specs=(P(None, None, 'x', None, 'y'), P()),
-               out_specs=P(None, None, 'x', None, 'y'), check_rep=False)
+    @partial(shard_map, mesh=mesh, in_specs=(P(None, None, 'x', None, 'y'), P()),
+               out_specs=P(None, None, 'x', None, 'y'), check_vma=False)
     def rotate(g, u):
         return jax.ffi.ffi_call(
             _TARGET, jax.ShapeDtypeStruct(g.shape, g.dtype),
-            input_layouts=[(0, 1, 2, 3, 4), (0, 1, 2)],
-            output_layouts=[(0, 1, 2, 3, 4)],
             input_output_aliases={0: 0})(g, u)
 
     return jax.jit(rotate)

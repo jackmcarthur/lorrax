@@ -1754,18 +1754,16 @@ per-invocation argument marshalling.
 
 ### `services/symmetry_maps/src/symmetry_maps/maps.py` — `_rotate_open_spin_centroid_operator`
 
-Apply ``U O U†`` without routing the fixed 2c case through GEMM.
-
-The generic two-sided einsum is mathematically compact, but on CUDA XLA
-lowers its two length-two contractions to two enormous skinny cuBLAS
-GEMMs with a complete operator transpose on each side.  For ``ns=2``
-the contraction is a fixed four-scalar block action.  Writing that block
-explicitly keeps it in one elementwise fusion and avoids all four
-full-operator layout moves used by a valence/conduction Green pair.
-
-Other spin extents retain the generic expression.  This helper owns only
-the spin representation; centroid permutation, nonsymmorphic phases and
-the antiunitary endpoint rule remain in :func:`unfold_isdf_operator`.
+The portable JAX implementation applies ``U O U†`` through two local spin
+contractions. CUDA complex128 operators with two or four spin components
+use the service's ``_spin_rotation`` kernel: one thread owns each
+``(k,mu_X,nu_Y)`` spin matrix, computes both contractions in registers,
+and writes through an input/output alias. There is no loop over k, global
+spin intermediate, or communication. A still-live input is preserved by
+XLA's alias handling. The selected native provider must export
+``SpinRotateCudaFfi``; a missing handler refuses rather than silently
+changing the workspace requirement. Spatial permutation, phases, and the
+antiunitary endpoint rule remain in :func:`unfold_isdf_operator`.
 
 ### `services/symmetry_maps/src/symmetry_maps/maps.py` — `unfold_spin_centroid_operator`
 
