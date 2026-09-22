@@ -469,6 +469,12 @@ difference0. Optimized HLO Green[8,4,8,4,8] tiles global[8,4,16,4,16] onP4.
 This proves the bounded admission path and tile geometry, not the native
 custom-call interiors, endpoint preparation peak or a material peak decrease.
 
+The charge constructor releases its sample matrices before reduction. Its local
+route admits selection first, then prices the actual selected pencil before
+allocating it; an oversized actual pencil still refuses at the existing capacity
+gate. Coupled photon sectors retain samples for CT and retain the conservative
+pre-read reduction check. Neither route relaxes the device budget.
+
 ### Whole-mesh photon constructor
 
 `construct_sector_poles` resolves execution before reading a bank. The

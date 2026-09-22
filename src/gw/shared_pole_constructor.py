@@ -141,7 +141,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
             meta, resolution, recipe, mesh=mesh_xy, ledger=ledger,
             upstream=upstream, ordered=ordered, odd_moments=odd_moments,
             sample_fields=len(sample_fields), moment_fields=len(moment_fields),
-            parent_count=int(header['bank_shape']['nq']),
+            parent_count=int(header['bank_shape']['nq']), defer_reduction=True,
             column_extent=column_extent)
         if execution == 'face' and ordered and header.get('mirror_mode') is None:
             raise ValueError('GATE shared_pole_constructor_execution: ordered whole-mesh parents require authenticated literal mirror fields')

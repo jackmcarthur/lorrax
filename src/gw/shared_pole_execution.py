@@ -47,13 +47,14 @@ def constructor_side_upper_bound(recipe, *, ordered, odd_moments,
 
 def constructor_execution(meta, resolution, recipe, *, mesh, ledger, upstream,
                           ordered, odd_moments, sample_fields, moment_fields,
-                          parent_count=1, retained_output_families=1,
+                          parent_count=1, retained_output_families=1, defer_reduction=False,
                           column_extent=lambda width: width):
     """Resolve local or whole-mesh execution once, before a constructor read.
 
     Explicit distributed service policy selects the face. Otherwise the local
-    parent route requires the complete selection stack to fit. Reduction is
-    admitted later at its measured pencil extent, before allocating that pencil.
+    parent route requires the complete selection stack to fit. A caller that
+    releases samples before reduction may defer that admission to its measured
+    pencil extent; coupled sectors retain the conservative joint-lifetime check.
     """
     from gw.shared_pole_capacity import ConstructorCapacity
 
@@ -98,21 +99,27 @@ def constructor_execution(meta, resolution, recipe, *, mesh, ledger, upstream,
         return row
     selection_args = dict(sample_batch=fit, selection_faces=selection_faces)
     resident_selection = resident_preview('selection', **selection_args)
-    if resident_selection['device_budget_status'] != 'PASS':
+    resident_reduction = (None if defer_reduction else resident_preview('reduction'))
+    if any(row['device_budget_status'] != 'PASS'
+           for row in (resident_selection, resident_reduction) if row is not None):
         return 'face', dict(
             reason='local resident lower bound exceeds current device budget',
             conservative_pencil_side=side,
             selection_face_count=selection_faces,
             retained_output_upper_bound_bytes_per_rank=retained_outputs,
-            local_selection=resident_selection)
+            local_selection=resident_selection, local_reduction=resident_reduction)
     selection = preview('selection', **selection_args)
-    admitted = selection['device_budget_status'] == 'PASS'
+    reduction = None if defer_reduction else preview('reduction')
+    admitted = all(row['device_budget_status'] == 'PASS'
+                   for row in (selection, reduction) if row is not None)
     return ('local' if admitted else 'face'), dict(
         reason=('capacity-admitted local parent' if admitted else
                 'local parent exceeds current device budget'),
         conservative_pencil_side=side, selection_face_count=selection_faces,
         retained_output_upper_bound_bytes_per_rank=retained_outputs,
-        local_selection=selection, reduction_admission='actual selected pencil')
+        local_selection=selection, local_reduction=reduction,
+        reduction_admission=('actual selected pencil' if defer_reduction else
+                             'conservative recipe bound'))
 
 
 def is_face(array):

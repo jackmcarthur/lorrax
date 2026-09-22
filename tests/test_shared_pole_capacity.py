@@ -98,7 +98,8 @@ class CapacityTests(unittest.TestCase):
             fit_ids=np.arange(18, dtype=np.int64),
             line_direction_cap=198, imaginary_width=791,
             infinity_width=396, pole_budget=5696)
-        for gib, expected in ((12, 'face'), (27, 'local')):
+        for gib, deferred, expected in ((12, True, 'face'),
+                                        (27, True, 'local'), (27, False, 'face')):
             ledger = CapacityLedger(meta, mesh_xy=mesh,
                                     device_budget_bytes=gib * 2**30)
             with patch.object(ConstructorCapacity, 'eigenplan', return_value=None), \
@@ -107,6 +108,7 @@ class CapacityTests(unittest.TestCase):
                     meta, resolution, recipe, mesh=mesh, ledger=ledger,
                     upstream=(), ordered=True, odd_moments=True,
                     sample_fields=4, moment_fields=4, parent_count=13,
+                    defer_reduction=deferred,
                     column_extent=lambda width: 4 * ((width + 3) // 4))
             self.assertEqual(execution, expected)
             self.assertEqual(receipt['conservative_pencil_side'], 24664)
