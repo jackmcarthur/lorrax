@@ -6688,12 +6688,16 @@ def run_sc_driver(
         config, input_dir, mesh=mesh_xy, sym=sym, wfn=wfn, meta=meta,
         material_class=material_class, print_fn=print_fn)
     fixed_dft_head_response = None
-    if (parallel_transport is None
-            and config.head.correction is HeadCorrection.FULL
-            and config.sigma.w_model != "shared_pole"):
+    fixed_dft_head = (
+        (config.head.correction is HeadCorrection.FULL
+         and config.sigma.w_model != "shared_pole")
+        or (config.head.correction is HeadCorrection.NO_LOCAL_FIELDS
+            and config.sigma.w_model == "shared_pole"
+            and int(meta.nspinor) != 4))
+    if parallel_transport is None and fixed_dft_head:
         # ``sc_head_update=off`` freezes this direct DFT response.  Build it
-        # once, on the same single-sourced frequency plan every map consumes,
-        # then fold it through each iteration's resident W exactly once.
+        # once on the same frequency plan every map consumes.  Full heads
+        # include wings; shared-pole direct heads do not.
         from .qsgw_head import build_dft_head_response
         _, _, fixed_head_omegas = _sc_head_frequency_plan(
             config, quad, material_class=material_class,
@@ -6701,11 +6705,13 @@ def run_sc_driver(
         fixed_dft_head_response = build_dft_head_response(
             wfns, np.asarray(fixed_head_omegas, dtype=np.complex128),
             input_dir=input_dir, mesh=mesh_xy, wfn=wfn, meta=meta,
-            config=config)
+            config=config,
+            wings=config.head.correction is HeadCorrection.FULL)
         print_fn(
-            "  SC head: cached fixed DFT direct response and wings for "
-            f"{len(fixed_head_omegas)} frequency sample(s); each map folds "
-            "them once through its resident W.")
+            "  SC head: cached fixed DFT direct response"
+            + (" and wings" if config.head.correction is HeadCorrection.FULL
+               else "")
+            + f" for {len(fixed_head_omegas)} frequency sample(s).")
 
     seed_path = config.sc.initial_qp_rotations_file
     if seed_path is not None and not os.path.isabs(seed_path):
