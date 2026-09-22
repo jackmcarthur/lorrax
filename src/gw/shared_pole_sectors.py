@@ -205,7 +205,7 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output):
             batch_width=batch_width):
         sectors=[];retained=[]
         for family,name in enumerate(('CC','TT')):
-            with timing.fenced_section('spole.sector.'+name):
+            with timing.fenced_section('spole.sector.'+name, announce=True):
                 with SlabIO(bank['path'],mode='r',mesh=mesh_xy) as io:
                     exact=read_sector_round(io,meta,bank,header,ids,(family,family),
                         fields=('M0','M1','M2','M3'),retained=retained,execution=execution)
@@ -231,7 +231,7 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output):
                 rank0_transaction(path,stage='sector.diagonal_receipt',
                     write=lambda:path.write_text(_json(dict(identity=bank['identity'],
                         status='DIAGONAL_SPANS_ONLY',rounds=receipts))+'\n'))
-        with timing.fenced_section('spole.sector.CT'):
+        with timing.fenced_section('spole.sector.CT', announce=True):
             with SlabIO(bank['path'],mode='r',mesh=mesh_xy) as io:
                 ct=read_sector_round(io,meta,bank,header,ids,(0,1),sample_span=fit_span,
                                       fields=sample_fields,retained=retained,execution=execution)

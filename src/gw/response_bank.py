@@ -556,12 +556,12 @@ def response_dense_workspace(mesh_xy, n, batch, layout, *, with_eigh):
 def _bank_execution(meta, mesh_xy, receipt, config, *, photon=False):
     """Compile and admit new dense work; stream outputs are reserved by batch."""
     def execute(kernel, args, stage):
-        with timing.fenced_section('bank.compile.' + stage):
+        with timing.fenced_section('bank.compile.' + stage, announce=True):
             started = time.monotonic()
             executable = kernel.lower(*args).compile()
             receipt["seconds"]["compilation"] = (receipt["seconds"].get("compilation", 0.)
                 + time.monotonic() - started)
-        with timing.fenced_section('bank.admission.' + stage):
+        with timing.fenced_section('bank.admission.' + stage, announce=True):
             memory = executable.memory_analysis()
             if memory is None:
                 raise ValueError("GATE response_capacity: compiled memory unavailable")
@@ -1059,7 +1059,7 @@ def integrate_response_field(wfns, meta, mesh_xy, rules, *, q_ids, sample,
 def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_io,
                         vertex=None, contact=None):
     """Stage A: consume each frequency value before producing its derivative."""
-    with timing.fenced_section('bank.setup'):
+    with timing.fenced_section('bank.setup', announce=True):
         header,qids,census = _bank_context(wfns,meta,sym,bank_io,mesh_xy)
         authenticate_sample_plan(sample_plan,header)
         z = bank_points(sample_plan)
