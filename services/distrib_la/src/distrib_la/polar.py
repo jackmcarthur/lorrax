@@ -181,7 +181,9 @@ def _retained_column_kernel(
 def _host_spectrum(s):
     """One O(n) spectrum for all eager rank cuts, including roundoff tails."""
     from jax.experimental.multihost_utils import broadcast_one_to_all
-    return broadcast_one_to_all(np.asarray(s))[..., ::-1].copy()
+    values = np.asarray(s)
+    bits = broadcast_one_to_all(values.view(np.uint64))
+    return bits.view(values.dtype)[..., ::-1].copy()
 
 
 def _retained_columns(
