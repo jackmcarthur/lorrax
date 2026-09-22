@@ -585,7 +585,8 @@ def _bank_execution(meta, mesh_xy, receipt, config, *, photon=False):
                 aliases=memory.alias_size_in_bytes,
                 inherited_stream=False,
                 stream_temporaries_admitted=stream))
-        with timing.fenced_section('bank.execute.' + stage):
+        with timing.fenced_section('bank.execute.' + stage, announce=True,
+                                  label=f"shared-pole bank {stage} execute"):
             started = time.monotonic()
             result = executable(*args)
             jax.block_until_ready(result)
@@ -1100,7 +1101,8 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
         ambient = ledger.live_stages
     from file_io.shared_pole_store import read_shared_pole_bank
     from file_io.slab_io import SlabIO
-    with timing.fenced_section('bank.window_geometry'):
+    with timing.fenced_section('bank.window_geometry', announce=True,
+                              label="shared-pole frequency rule construction"):
         solve_value, solve_slope, _, receipt["algebra"] = response_algebra(meta,config,
             mesh_xy=mesh_xy,n=n,photon=vertex is not None)
         rules = response_quadrature(wfns, meta, sample_plan, receipt, ordered=ordered)

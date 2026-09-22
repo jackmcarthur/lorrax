@@ -275,3 +275,32 @@ def test_stage_exit_line_names_the_exception(capsys):
     assert tm._exc_text(RuntimeError("rank 3 did not arrive\nmore")) == \
         "RuntimeError: rank 3 did not arrive"
     assert tm._exc_text(KeyError()) == "KeyError"
+
+
+def test_fenced_section_forwards_announce_and_label():
+    """A fenced stage can carry the heartbeat; the shared-pole path needs it.
+
+    Every caller in gw/response_bank.py and gw/shared_pole_sectors.py reaches
+    for the fence, so before this forwarding existed none of them could
+    announce whatever they passed -- a 40-minute shared-pole bank stage was
+    indistinguishable from a hang.
+    """
+    import inspect
+    from common import timing
+    params = inspect.signature(timing.fenced_section).parameters
+    assert "announce" in params and params["announce"].default is False
+    assert "label" in params and params["label"].default is None
+    with timing.fenced_section("t.plain", sync_ranks=False):
+        pass
+    with timing.fenced_section("t.announced", sync_ranks=False,
+                               announce=True, label="t label"):
+        pass
+
+
+def test_shared_pole_long_stages_announce():
+    """The two long shared-pole stages must stay announced."""
+    import pathlib
+    src = pathlib.Path(__file__).resolve().parents[1] / "src/gw/response_bank.py"
+    text = src.read_text()
+    assert "'bank.execute.' + stage, announce=True" in text
+    assert "'bank.panel_admission', announce=True" in text

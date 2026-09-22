@@ -608,14 +608,20 @@ def fence(name: str, *, sync_ranks: bool = True) -> None:
 
 
 @contextmanager
-def fenced_section(name: str, *, sync_ranks: bool = True):
+def fenced_section(name: str, *, sync_ranks: bool = True,
+                   announce: bool = False, label: str | None = None):
     """``fence(name)`` and then ``section(name)``, so the name is written once.
 
     A fully profiled stage is a sequence of these: the fence attributes the
     device and rank waits to the band that is about to start, and the section
     then times the band itself.  Spelling the pair by hand let the two names
     drift apart, which silently files a band's waits under a different band.
+
+    ``announce``/``label`` forward to :func:`section` so a fenced stage can
+    carry the 60 s heartbeat.  Without that forwarding every caller reaching
+    for the fence -- which is the entire shared-pole path -- was structurally
+    unable to announce, whatever it passed.
     """
     fence(name, sync_ranks=sync_ranks)
-    with section(name) as node:
+    with section(name, announce=announce, label=label) as node:
         yield node
