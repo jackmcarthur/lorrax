@@ -691,31 +691,6 @@ def bank_points(sample_plan):
     return np.asarray(points, dtype=np.complex128)
 
 
-def _window_cells(energy, ft, ut, masks):
-    """Laplace cells (lower, upper) between the partitioned windows."""
-    cells = []
-    for lower, upper in ((0, 1), (0, 2), (1, 2)):
-        bounds, active, partner = [], 0, []
-        for lw, uw in ((ft, ut), (ut, ft)):
-            low = energy[masks[lower] & (lw != 0)]
-            high = energy[masks[upper] & (uw != 0)]
-            if low.size and high.size:
-                bounds.append((float(high.min()-low.max()),
-                               float(high.max()-low.min())))
-                partner.append((float(low.max()), float(high.min())))
-                active += int(low.size * high.size)
-        if not bounds:
-            continue
-        refs = (max(v[0] for v in partner), min(v[1] for v in partner))
-        if refs[1] <= refs[0]:
-            raise ValueError("GATE response_remote_cell: unordered energy windows")
-        cells.append(dict(lower=lower, upper=upper,
-            delta_min_ry=min(v[0] for v in bounds),
-            delta_max_ry=max(v[1] for v in bounds),
-            references_ry=refs, active_global_pairs=active))
-    return cells
-
-
 def response_sample_weights(f, u):
     """Existing sample-only activity floor; exact moments retain every weight."""
     ft = np.where(np.abs(f) >= 1e-14, f, 0.0)
@@ -735,38 +710,6 @@ def response_occupation_envelope(energy, f, u, mu):
         if np.any(tails):
             bounds.append(float(np.min(np.log(maximum/weight[tails])/offset[tails])))
     return min(bounds) if bounds else 0., amplitude
-
-
-def response_windows(energy, f, u, *, chemical_potential_ry, z_ry):
-    """One crossing state window and three noncrossing product cells.
-
-    Include all occupation tails and transitions that can resonate at the
-    actual Re(z), with the same 1.5*eta separation used by Sigma's geometry.
-    Imaginary-axis supports do not widen the crossing window. Bounds use
-    all k/band extrema, so no transition table or q-specific partition is needed.
-    The sample-only 1e-14 activity floor does not affect exact moments.
-    """
-    ft, ut, activity = response_sample_weights(f, u)
-    physical = (f != 0) | (u != 0)
-    z = np.asarray(z_ry, dtype=np.complex128)
-    reach = float(np.abs(z.real).max())
-    margin = 1.5*float(z.imag.min())
-    occupied, empty = energy[ft != 0], energy[ut != 0]
-    if not occupied.size or not empty.size:
-        raise ValueError("GATE response_windows: no active occupied or empty states")
-    # Include both occupation extrema even for gaps larger than the sample range.
-    lower = min(float(empty.min())-reach-margin, float(occupied.max()))
-    upper = max(float(occupied.max())+reach+margin, float(empty.min()))
-    masks = [physical & (energy < lower),
-             physical & (energy >= lower) & (energy <= upper),
-             physical & (energy > upper)]
-    cells = _window_cells(energy, ft, ut, masks)
-    receipt = dict(window_ev_relative_mu=[
-        (v-chemical_potential_ry)*RYD_TO_EV for v in (lower, upper)],
-        **activity,
-        bound_scope="all active k/band extrema, safe for every q",
-        edge_rule=dict(max_real_z_ry=reach, noncrossing_margin_ry=margin))
-    return masks, ft, ut, cells, receipt
 
 
 def authenticate_sample_plan(sample_plan, header):
@@ -984,98 +927,77 @@ def response_quadrature(wfns, meta, sample_plan, receipt, *, ordered=False, prin
     from jax.experimental import multihost_utils
     z = bank_points(sample_plan)
     energy, f, u, _, _ = response_weights(wfns, meta)
-    masks, f, u, cells, receipt["windows"] = response_windows(
-        energy, f, u, chemical_potential_ry=sample_plan["census"]["mu_ry"], z_ry=z)
-    pairs = [(1, 1)] + [(c["lower"], c["upper"]) for c in cells]
-    f = np.stack([np.where(masks[i], f, 0.) for i, _ in pairs])
-    u = np.stack([np.where(masks[j], u, 0.) for _, j in pairs])
-    refs = np.array([(energy[fw != 0].max(), energy[uw != 0].min())
-                     for fw, uw in zip(f, u)])
-    domains = np.array([(r[1]-r[0], energy[uw != 0].max()-energy[fw != 0].min())
-                        for fw, uw, r in zip(f, u, refs)])
+    f, u, receipt["sample_activity"] = response_sample_weights(f, u)
+    refs = np.array([energy[f != 0].max(), energy[u != 0].min()])
+    lo, hi = refs[1]-refs[0], float(energy[u != 0].max()-energy[f != 0].min())
     mu = sample_plan["census"]["mu_ry"]
-    decay_rate, amplitude = response_occupation_envelope(energy, f[0], u[0], mu)
+    decay_rate, amplitude = response_occupation_envelope(energy, f, u, mu)
     session = getattr(meta, "shared_pole_response_rules", None)
-    old = None if session is None else session.get("windowed_frequency")
+    old = None if session is None else session.get("frequency")
     metallic = sample_plan["census"]["partial_at_mu"]
-    reuse = (old is not None and old["domains"].shape == domains.shape
-             and np.all(old["domains"][:,0] <= domains[:,0])
-             and np.all(domains[:,1] <= old["domains"][:,1])
+    reuse = (old is not None and old["lo"] <= lo and hi <= old["hi"]
              and old.get("decay_rate", 0.) <= decay_rate
              and old.get("amplitude", 0.) >= amplitude
              and old["metallic"] == metallic and np.array_equal(old["z"], z))
-    capacity = 2*minimax.RESPONSE_RULE_CAPACITY
-    windows = len(pairs)
     if reuse:
         plan = old
     else:
-        # Pad only the crossing fit; remote rules own their safe positive margin.
-        domains = domains.copy()
-        domains[0] += np.array([-4.,4.])/RYD_TO_EV if session is not None else 0.
-        plan = dict(domains=domains, z=z, metallic=metallic,
-            decay_rate=decay_rate, amplitude=amplitude, reference=domains[:,0].copy(),
-            t=np.zeros((len(z),windows,capacity), complex),
-            coefficients=np.zeros((len(z),4,windows,capacity), complex),
-            orientation=np.zeros((len(z),windows,capacity), np.int32),
-            counts=np.zeros((len(z),windows), np.int64))
+        pad = 4./RYD_TO_EV if session is not None else 0.
+        plan = dict(lo=lo-pad, hi=hi+pad, z=z, metallic=metallic,
+            decay_rate=decay_rate, amplitude=amplitude,
+            reference=0. if decay_rate else lo-pad,
+            t=np.zeros((len(z), 2, minimax.RESPONSE_RULE_CAPACITY), complex),
+            value=np.zeros((len(z), 2, minimax.RESPONSE_RULE_CAPACITY), complex),
+            derivative=np.zeros((len(z), 2, minimax.RESPONSE_RULE_CAPACITY), complex),
+            sampled_error=np.zeros((len(z), 2, 2)), coefficient_mass=np.zeros((len(z), 2, 2)),
+            counts=np.zeros((len(z), 2), np.int64))
         progress = LoopProgress(len(z), print_fn, title="response rule construction",
                                 item_name="frequency", max_updates=len(z)).start()
         rank, workers = jax.process_index(), jax.process_count()
-        for start in range(0,len(z),workers):
-            assigned = start+rank
-            status = np.zeros(1024,np.uint8)
+        for start in range(0, len(z), workers):
+            assigned = start + rank
+            status = np.zeros(1024, np.uint8)
+            rule = None
             if assigned < len(z):
                 try:
-                    for window,(lo,hi) in enumerate(domains):
-                        tol = sample_plan["bank_rule_tolerance"]/windows
-                        if window == 0:
-                            rule = minimax.response_frequency_rule(lo,hi,z[assigned],
-                                rel_tol=tol/amplitude, decay_rate=decay_rate)
-                            plan["reference"][window] = rule["reference_ry"]
-                            plan["t"][assigned,window] = rule["t"].reshape(-1)
-                            plan["coefficients"][assigned,:2,window] = -np.stack(
-                                (rule["value"],rule["derivative"])).reshape(2,-1)
-                            plan["orientation"][assigned,window] = np.repeat([0,1],capacity//2)
-                            plan["counts"][assigned,window] = rule["counts"].sum()
-                        else:
-                            rule = minimax.response_laplace_rule(lo,hi,z[assigned:assigned+1],
-                                rel_tol=tol,ordered=True,reference_ry=lo)
-                            count = len(rule["t"])
-                            plan["t"][assigned,window,:count] = rule["t"]
-                            even = np.stack((rule["projection_value"][0],rule["projection_derivative"][0]))
-                            odd = np.stack((rule["odd_projection_value"][0],rule["odd_projection_derivative"][0]))
-                            plan["coefficients"][assigned,:,window,:count] = -np.concatenate((even+odd,even-odd))
-                            plan["orientation"][assigned,window] = 2
-                            plan["counts"][assigned,window] = count
+                    rule = minimax.response_frequency_rule(
+                        plan["lo"], plan["hi"], z[assigned],
+                        rel_tol=sample_plan["bank_rule_tolerance"]/amplitude,
+                        decay_rate=decay_rate,
+                        previous=None if old is None or assigned >= len(old["t"]) else old["t"][assigned])
                 except Exception as error:
                     message = str(error).encode()[:1023]
-                    status[:len(message)] = np.frombuffer(message,dtype=np.uint8)
-            for i in range(start,min(start+workers,len(z))):
+                    status[:len(message)] = np.frombuffer(message, dtype=np.uint8)
+            for i in range(start, min(start + workers, len(z))):
                 owner = i == assigned
-                error = np.asarray(multihost_utils.broadcast_one_to_all(status,is_source=owner))
+                error = np.asarray(multihost_utils.broadcast_one_to_all(
+                    status, is_source=owner))
                 if error.any():
                     raise ValueError(bytes(error).rstrip(b"\0").decode(errors="replace"))
-                for key in ("t","coefficients","orientation","counts"):
-                    plan[key][i] = np.asarray(multihost_utils.broadcast_one_to_all(plan[key][i],is_source=owner))
+                for key in ("t", "value", "derivative", "sampled_error", "coefficient_mass", "counts"):
+                    payload = rule[key] if owner else plan[key][i]
+                    plan[key][i] = np.asarray(multihost_utils.broadcast_one_to_all(
+                        payload, is_source=owner))
                 progress.step()
         progress.finish()
         if session is not None:
-            session["windowed_frequency"] = plan
-    # All ranks share this scalar gauge, including ranks without an assigned frequency.
-    plan["reference"][0] = 0. if plan["decay_rate"] else plan["domains"][0,0]
+            session["frequency"] = plan
     if plan["decay_rate"]:
-        refs[0] = mu  # Both weighted Green factors remain bounded for Re(t)<=beta.
-    receipt["rule_provider"] = "minimax occupation-weighted unsplit crossing (sampled scalar error) + noncrossing Laplace windows"
-    receipt["rule"] = dict(intervals_ry=plan["domains"].tolist(),counts=plan["counts"].tolist(),
+        refs[:] = mu
+    receipt["rule_provider"] = "minimax occupation-weighted frequency fit; sampled scalar accuracy"
+    receipt["rule"] = dict(interval_ry=[plan["lo"], plan["hi"]],
+        counts=plan["counts"].tolist(), sampled_error=plan["sampled_error"].tolist(),
+        coefficient_mass=plan["coefficient_mass"].tolist(),
         decay_rate_ry_inv=plan["decay_rate"], occupation_amplitude=plan["amplitude"], reused=reuse)
     receipt["nodes"] = int(plan["counts"].sum())
     if jax.process_index() == 0:
-        print_fn("Response quadrature: z(eV) crossing / remote time-product counts; "
-                 + ("reused" if reuse else "constructed"),flush=True)
-        for point,counts in zip(z,plan["counts"]):
-            print_fn(f"Response quadrature: {point*RYD_TO_EV:20.8g} "
-                     + " / ".join(str(v) for v in counts),flush=True)
-        print_fn(f"Response quadrature: {receipt['nodes']} total Green-pair evaluations (value + derivative)",flush=True)
+        print_fn(f"Response interval (eV): [{plan['lo']*RYD_TO_EV:.8g}, {plan['hi']*RYD_TO_EV:.8g}]", flush=True)
+        print_fn("Response quadrature: z(eV)   forward backward executed  sampled value/ds error  kappa(value/ds); "
+              + ("reused" if reuse else "constructed"), flush=True)
+        for point, counts, errors, mass in zip(z, plan["counts"], plan["sampled_error"], plan["coefficient_mass"]):
+            print_fn(f"Response quadrature: {point*RYD_TO_EV:20.8g} {counts[0]:4d} {counts[1]:4d} {counts.sum():4d}  "
+                  f"{errors[:,0].max():.2e} {errors[:,1].max():.2e}  {mass[:,0].max():.2e} {mass[:,1].max():.2e}", flush=True)
+        print_fn(f"Response quadrature: {receipt['nodes']} total Green-pair evaluations (value + derivative)", flush=True)
     band_ranges = None
     if wfns.layout == "axis":
         from .greens_function_kernel import _phase_band_interval
@@ -1093,9 +1015,9 @@ def integrate_response_frequency(wfns, meta, mesh_xy, rules, *, q_ids, sample,
     """Donated [value/ds,q,mu_X,nu_Y]; one Green/FFT scan per frequency."""
     plan, refs = rules["plan"], rules["refs"]
     times = plan["t"][sample]
-    # Translate each scalar reference to the two physical Green references.
-    shift = refs[:,1]-refs[:,0]-plan["reference"]
-    coefficients = plan["coefficients"][sample]*np.exp(-shift[:,None]*times)[None]
+    # Translate the scalar gauge to the physical endpoint references.
+    coefficients = -np.stack((plan["value"][sample], plan["derivative"][sample])) * np.exp(
+        -(refs[1]-refs[0]-plan["reference"])*times)
     n = meta.mu_basis.n_packed if vertex is None else vertex[0][0].shape[2]
     kernel, fixed = response_stream(wfns, meta, mesh_xy=mesh_xy,
         q_ids=q_ids, n_outputs=2, pair_mode="direct", bank_carry=True,
@@ -1103,9 +1025,8 @@ def integrate_response_frequency(wfns, meta, mesh_xy, rules, *, q_ids, sample,
     raw = jax.jit(lambda: jnp.zeros((2,len(q_ids),n,n),jnp.complex128),
         out_shardings=NamedSharding(mesh_xy,P(None,None,"x","y")))()
     weights = partial(stream_weights, parents=vertex is None)
-    args = ((jnp.asarray(times.reshape(-1)), jnp.asarray(plan["orientation"][sample].reshape(-1)),
-             jnp.repeat(jnp.arange(len(refs)),times.shape[1])),
-        jnp.asarray(coefficients.reshape(4,-1)), *fixed,
+    args = ((jnp.asarray(times.reshape(-1)), jnp.repeat(jnp.array([False, True]), times.shape[1])),
+        jnp.asarray(coefficients.reshape(2,-1)), *fixed,
         weights(wfns, rules["f"], mesh_xy), weights(wfns, rules["u"], mesh_xy),
         jnp.asarray(refs), raw)
     raw = execute(kernel, args, "direct")

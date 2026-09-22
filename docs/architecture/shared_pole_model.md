@@ -105,7 +105,7 @@ pair after the existing sample-only 1e-14 activity floor, including negative
 transition energies and signed metallic weights; exact moments are untruncated. Scalar plans receive 2 eV padding per
 one-particle endpoint for SC reuse, without changing occupations or energies.
 
-The crossing fit uses the current occupation envelope
+The single full-interval fit uses the current occupation envelope
 `|f_n u_m| <= A_f A_u min(1,exp(beta*d))`, where `d=E_m-E_n` and
 `A_f=max(1,max|f|)`, `A_u=max(1,max|u|)`. The bank obtains beta from the
 minimum one-sided log slopes of `|f|/A_f` above mu and `|u|/A_u` below mu;
@@ -115,7 +115,12 @@ value and derivative errors use that envelope, with tolerance divided by
 are mu; `0<=Re(t)<=beta` bounds the occupation-weighted Green factors.
 Zero beta retains the uniform fit. SC reuse requires a current beta at least
 as large and a current amplitude no larger than those used for construction.
-This is an occupation-weighted approximation on the signed interval, not an
+Separate remote-cell sweeps are unnecessary: the same rule covers high-energy
+bands. The log reports the full interval and independent forward, backward,
+and executed counts for each frequency. Acceptance uses eta-scaled value error
+and eta-cubed-scaled d/ds error, matching the reported metrics; coefficient
+masses for both are logged. This is an occupation-weighted approximation on
+the signed interval, not an
 explicit triangular projection onto positive/negative transition energies.
 
 $$ \frac{\partial F}{\partial s}=\frac1{2z(d-z)^2},\qquad

@@ -62,9 +62,10 @@ def _primitive(lo, hi, pole, tol, previous=None, decay_rate=0.):
         if decay_rate and np.any(t.real > decay_rate):
             return None, False
         fit = _project(lo, hi, pole, t, decay_rate)
-        if fit is not None and np.max(fit[1]) < best[0]:
-            best[:] = [float(np.max(fit[1])), (len(t), fit[1], fit[2])]
-        accurate = fit is not None and np.max(fit[1]) <= tol and np.isfinite(fit[2]).all()
+        error = np.inf if fit is None else np.max(fit[1]*[1., eta/(2*abs(pole))])
+        if error < best[0]:
+            best[:] = [float(error), (len(t), fit[1], fit[2])]
+        accurate = error <= tol and np.isfinite(fit[2]).all()
         if accurate and fit[2][0] <= _RESPONSE_MAX_KAPPA:
             return (t, fit[0], fit[1]), False
         return None, accurate
@@ -127,4 +128,6 @@ def response_frequency_rule(lo_ry, hi_ry, z_ry, *, rel_tol=1e-8, previous=None,
         errors.append([err[0], err[1]*abs(z.imag/(2*z))])
     return dict(t=times, value=value, derivative=derivative,
                 reference_ry=0. if decay_rate else lo,
+                coefficient_mass=np.column_stack((z.imag*np.sum(abs(value),axis=1),
+                    z.imag**3*np.sum(abs(derivative),axis=1))),
                 counts=np.asarray(counts), sampled_error=np.asarray(errors))

@@ -3,7 +3,7 @@
 `minimax.response_laplace_rule` is the service door; `laplace_ritz.py` owns
 placement, projection and the continuum residual certificate. Energies use one
 unit (Ry in GW), times its inverse, and derivatives are with respect to `s=z²`.
-The consumer supplies a positive transition interval `[L,H]` with
+The service accepts a positive transition interval `[L,H]` with
 `L > max|Re z|`, plus a physical reference gap `r`. The
 [service contract](../services/minimax.md#response-bank-rule-sessions) owns
 padding and reuse; the [bank](../architecture/shared_pole_model.md) owns state
@@ -76,19 +76,10 @@ There is no omitted infinite-time tail: the finite sum is compared to the full
 rational target. Arithmetic guards assume ordinary libm accuracy, not an
 interval-arithmetic implementation of the exponential function.
 
-## Streaming the windows
+## Production response bank
 
-The response bank concatenates crossing and noncrossing times, projection
-rows and window indices into one JIT scan per admitted q/sample panel.
-The crossing cell uses independent forward/backward complex-time rules;
-reverse products use `conj(A(conj(t)))`. Remote cells use real Laplace times,
-so `A(t)` and its conjugate share one Green pair. Small
-occupation/reference tables select each node's window; the existing Green,
-symmetry and FFT owners build one node at a time. A single donated response
-carry stays at `P(None,None,"x","y")`, and no Green history is stored. Like
-the Sigma tau consumer, kernels are reused while energies, weights and
-references are dynamic inputs; the bounded program cache retains no state
-wavefunctions or response arrays. Both response values and ds rows share
-the node's Green contractions, including ordered photon response. The carry
-holds value and derivative for one frequency only. High-energy states enlarge
-the remote intervals, not the crossing fit; all window nodes share one scan.
+The bank now uses one occupation-weighted frequency rule over the full active
+transition interval, eliminating separate remote-cell Green sweeps.
+The [shared-pole architecture](../architecture/shared_pole_model.md) owns that
+stream and its error convention. This page documents the standalone
+noncrossing Laplace service and its stronger continuum certificate.
