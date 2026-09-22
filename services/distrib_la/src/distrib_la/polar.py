@@ -20,6 +20,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from distrib_la.plan import Plan, plan, ROUTE_BATCH_RESHARD
 from distrib_la.resolve import mesh_key
+from distrib_la._collectives import device_put_process_local
 
 __all__ = ["PolarPlan", "plan_polar_factor", "polar_factor",
            "right_singular_vectors", "leading_eigenvectors",
@@ -200,8 +201,10 @@ def _retained_columns(
         mesh, isinstance(count, tuple), extent, layout, descending)
     retained = (tuple(row[:n] for row, n in zip(values, count))
                 if isinstance(count, tuple) else values[:count])
-    counts = jax.device_put(np.asarray(count, dtype=np.int64), NamedSharding(mesh, P()))
-    return select(Q, counts), jax.device_put(retained, NamedSharding(mesh, P()))
+    replicated = NamedSharding(mesh, P())
+    counts = device_put_process_local(np.asarray(count, dtype=np.int64), replicated)
+    spectra = jax.tree.map(lambda row: device_put_process_local(row, replicated), retained)
+    return select(Q, counts), spectra
 
 
 def _leading_counts(values, r, *, multiplet_tol, real_rows, batched, rcond=None):
