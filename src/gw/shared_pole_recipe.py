@@ -122,8 +122,10 @@ shared_real_pole_gates_ordered_v1 = {
     name: dict(row) for name, row in shared_real_pole_gates_v1_r3b.items()}
 # CC/TT spans are normalized separately before the CT projection. Resolve
 # their two Gram cuts more conservatively than the joint/inverse-pole cut.
+# The ordered Fe 8^3 bank needs a 1e-7 joint cut: at 1e-8 the weak span
+# produces a negative projected pencil despite a positive retained metric.
 shared_real_pole_gates_ordered_v1["normalized_gram_keep"].update(
-    sector_threshold=1.0e-5)
+    threshold=1.0e-7, sector_threshold=1.0e-5)
 for _name, (_predicate, _threshold) in {
     "representation": ("charge operator from N_spinor in (1, 2), authenticated TRS broken, ordered bank: positive poles per parent, hole side from the parent of -q transposed",
                        {"nspinor": (1, 2), "trs_allowed": False, "ordered": True}),

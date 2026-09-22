@@ -574,7 +574,10 @@ Then $\mathcal H' = \operatorname{diag}(H_s,G_s)$ and $\mathcal G'$ is
 off-diagonal, with $(G_s,H_s)$ the even pencil of (W 18); eliminating
 $v=zw$ gives $(z^2G_s-H_s)w=0$, the even problem in $s$ (Appendix B). **The
 rule** is to pair the states, cut on the $v$-block, and apply that span to
-both halves. Cutting instead on $\operatorname{diag}(H_s,G_s)$ keeps a
+both halves. The ordered Gram keep ratio is $10^{-7}$: the Fe $8^3$ response
+bank retained weak directions at $10^{-8}$ that made the projected paired
+pencil indefinite, while the tighter cut preserved the held $W$ checks.
+Cutting instead on $\operatorname{diag}(H_s,G_s)$ keeps a
 different span and is measurably worse (2–5× larger held error on TRS data,
 and spurious poles at 100–1000 Ry). At imaginary supports, or line supports
 with $\operatorname{Re}z=0$, the conjugate partner brings no new tangent when
