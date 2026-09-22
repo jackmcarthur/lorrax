@@ -53,16 +53,16 @@ def _dilation_vectors(Q, n):
     return root2 * positive[..., :n, :], root2 * positive[..., n:, :]
 
 
-def _dilation_svd(A, eigh):
+def _dilation_svd(A, eigh, *, shifted=False):
     """Extract ascending singular triplets from [[0,A],[A.H,0]]."""
-    # The equivalent positive dilation avoids STEDC convergence failures
-    # around the signed spectrum's zero cluster; eigenvectors are unchanged.
-    scale = jnp.linalg.norm(A, axis=(-2, -1))
+    # The positive dilation avoids the measured cuSolverMp STEDC failure;
+    # its eigenvectors and the caller's relative singular cutoff are unchanged.
+    scale = jnp.linalg.norm(A, axis=(-2, -1)) if shifted else jnp.ones(A.shape[:-2])
     scale = jnp.where(scale > 0, scale, 1)
     h = _hermitian_dilation(A / scale[..., None, None])
-    evals, Q = eigh(h + jnp.eye(h.shape[-1], dtype=h.dtype))
+    evals, Q = eigh(h + int(shifted) * jnp.eye(h.shape[-1], dtype=h.dtype))
     u, v = _dilation_vectors(Q, A.shape[-1])
-    s = (evals[..., A.shape[-1]:] - 1) * scale[..., None]
+    s = (evals[..., A.shape[-1]:] - int(shifted)) * scale[..., None]
     return jnp.maximum(s, 0), u, v
 
 
@@ -178,6 +178,12 @@ def _retained_column_kernel(
     return select
 
 
+def _host_spectrum(s):
+    """One O(n) spectrum for all eager rank cuts, including roundoff tails."""
+    from jax.experimental.multihost_utils import broadcast_one_to_all
+    return broadcast_one_to_all(np.asarray(s))[..., ::-1].copy()
+
+
 def _retained_columns(
     Q, values, count, *, mesh, column_extent, layout='face', descending=False,
 ):
@@ -279,7 +285,7 @@ def _direction_svd_kernel(eigh_plan, ndim):
             if w.ndim == 2:
                 evals, v = evals[0], v[0]
             return jnp.maximum(evals[..., w.shape[-1]:], 0), v
-        s, _, v = _dilation_svd(w, eigh)
+        s, _, v = _dilation_svd(w, eigh, shifted=eigh_plan.backend == "cusolvermp")
         return s, v
 
     return extract
@@ -348,7 +354,7 @@ def right_singular_vectors(W, tau, *, eigh_plan, column_extent,
         s = np.maximum(np.asarray(s)[..., W.shape[-1]:], 0)
     else:
         s, v = _direction_svd_kernel(eigh_plan, W.ndim)(W)
-    values = np.asarray(s)[..., ::-1].copy()
+    values = _host_spectrum(s)
     if not np.all(np.isfinite(values)):
         raise ValueError("nonfinite singular spectrum")
     if max_rank is not None and operator.index(max_rank) < 1:
@@ -414,7 +420,7 @@ def leading_eigenvectors(W, r, *, eigh_plan, column_extent,
             s, q = s[0], q[0]
         else:
             s, q = eigh_plan.batched(W)
-    values = np.asarray(s)[..., ::-1].copy()
+    values = _host_spectrum(s)
     count = _leading_counts(
         values, r, multiplet_tol=multiplet_tol, real_rows=real_rows,
         batched=values.ndim > 1, rcond=rcond)

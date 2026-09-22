@@ -150,10 +150,10 @@ condition number and loses precisely the small overlap singular values needed
 as the manifold-quality diagnostic.  Singular values are non-negative and
 descending, matching NumPy SVD order.
 
-The planned dilation solve uses the equivalent positive matrix
+The cuSolverMp response-direction dilation solve uses the equivalent positive matrix
 `I + H / ||A||_F` and converts eigenvalues back by `(lambda - 1) * ||A||_F`
 (unit scale for zero A). This avoids a reproduced cuSolverMp STEDC convergence
-failure at the signed dilation's zero cluster without changing eigenvectors,
+failure on a saved response matrix without changing eigenvectors,
 rank cutoffs, or the physical operator; only the scalar norm is reduced.
 
 The physical input is exactly one rank-2 square float64 or complex128 array at
