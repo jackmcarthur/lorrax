@@ -903,6 +903,7 @@ def _solve_qp_stage(
                 wfns_sigma, V_q, kin_ion,
                 wfns_transverse=wfns_transverse,
                 bispinor_v_q_path=bispinor_v_q_path, mu_bases=isdf.mu_bases,
+                photon_g0_vectors=isdf.photon_g0_vectors,
                 head_channel=getattr(isdf, 'head_channel', None),
                 wfn_fingerprint_binding=isdf.wfn_fingerprint_binding,
                 charge_zeta_identity=isdf.charge_zeta_identity,
