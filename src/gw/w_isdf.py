@@ -676,7 +676,9 @@ def _get_chi_fractional_contour_kernel_face(
             """
             def component(pair):
                 gf = G_fftn(green_k(lower_weight, lower_time, lower_ref, spin_pair=pair))
-                gu = G_fftn(green_k(upper_weight, upper_time, upper_ref,
+                # Finish the lower Green before building upper parent buffers.
+                gf, next_weight = jax.lax.optimization_barrier((gf, upper_weight))
+                gu = G_fftn(green_k(next_weight, upper_time, upper_ref,
                                    current=True, spin_pair=pair))
                 # Centroid-major Greens (R, mu, a, nu, b): trace the spin
                 # pairs elementwise in mu, nu.
