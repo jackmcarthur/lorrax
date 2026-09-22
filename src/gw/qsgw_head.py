@@ -258,14 +258,7 @@ class DftVelocityHeadData:
 
 
 def _ascii_stamp(io, path: str, name: str) -> str:
-    """A ``uint8`` provenance stamp, read through SlabIO, as ``str``.
-
-    ``write_attr`` publishes these as ``uint8`` datasets.  The phdf5
-    transport's dtype table has no unsigned type, so the read asks for
-    ``int32`` and HDF5 widens — the same route
-    ``file_io.parallel_transport._decode_i32_text`` already takes for the
-    W-av stamps, and the reason it takes it.
-    """
+    """Read the byte-valued int32 provenance stamp through SlabIO."""
     raw = np.asarray(io.read_small(name, dtype=np.int32), dtype=np.int32)
     if raw.ndim != 1 or np.any(raw < 0) or np.any(raw > 255):
         raise ValueError(
