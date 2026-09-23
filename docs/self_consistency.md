@@ -654,9 +654,10 @@ direct tensor `S(ω)` needs no time-reversal assumption (the
 `gw.shared_pole_head` docstring states the identity, `tests/test_head_direct_ordered.py`
 pins it). On the one-shot and `sc_head_update = off` routes this head has no
 intraband Drude/Thomas–Fermi piece on a metal (KNOWN_LORRAX_ISSUES, one-shot
-metal head). An N_spinor = 4 bispinor-lift store refuses by name
-(`GATE shared_pole_head_nspinor`) because its Gamma completion is the packed
-photon head. `head_correction = off` remains the headless brute-grid
+metal head). The four-component hybrid charge store refuses `full` by name
+(`GATE shared_pole_head_nspinor`) until its wing/body fold is certified; its
+direct `no_local_fields` head is admitted. The full-sector photon store uses
+its own Gamma completion. `head_correction = off` remains the headless brute-grid
 development mode (owner policy 2026-09-18). The measured scalar map-1 q=0 Gram risk is a
 warning, not a parse refusal; the `shared_pole_gram_valid` gate is unchanged.
 
