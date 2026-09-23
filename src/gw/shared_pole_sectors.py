@@ -360,6 +360,11 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output):
                 counts=active.sum(axis=-1,dtype=np.int64)
                 width=padded_axis(int(counts[:real].max()),mesh_xy,name='shared_pole_port',
                     specs=((P('x','y'),0),(P('x','y'),1))).carrier
+                # batch_to_face pads a nonaligned factor carrier before its
+                # all_to_all. The store requires the matching pole capacity;
+                # exactly inactive columns carry the public 1.0 sentinel.
+                if poles.shape[-1] < width:
+                    poles=np.pad(poles,((0,0),(0,width-poles.shape[-1])),constant_values=1.0)
                 factor=face_rows(mesh_xy,tuple(range(real)),width)(treated_factor if is_face(treated_factor) else to_face(treated_factor))
                 for slot,q in enumerate(ids[:real]):
                     public=canonical_factors(mesh_xy,(slot,),components=3 if family else 1)(factor)
