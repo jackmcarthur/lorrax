@@ -6524,6 +6524,18 @@ def run_sc_driver(
     # fires the hidden replica ``assert_equal`` all-gather.  ``_place``
     # routes each kind correctly; only the spec changed.
     U = state_final.outputs.sigma_basis_U
+    # Static bare exchange has no dynamic-Sigma band carrier receipt.  Its
+    # terminal rotation still needs the same mesh-legal square carrier as
+    # every other band-sharded rotation (26 logical bands on a 4x4 mesh).
+    from runtime.padding import pad_square, padded_axis, strip_axis
+    final_static_axis = None
+    if sigma_result.sigma_band_axis is None:
+        spec = _band_rotation_spec()
+        final_static_axis = padded_axis(
+            int(U.shape[-1]), mesh_xy, name="static Sigma final rotation",
+            specs=((spec, 1), (spec, 2)))
+        if final_static_axis.pad:
+            U = pad_square(U, final_static_axis, pad_diagonal=1.0)
     # An eigh-stripped logical device rotation can have uneven band axes.
     # Keep its existing placement until the Sigma receipt pads it below;
     # the logical-only contractions constrain their temporaries inside jit.
@@ -6531,6 +6543,14 @@ def run_sc_driver(
             and sigma_result.sigma_band_axis is not None
             and sigma_result.sigma_band_axis.pad > 0):
         U = _place(U, mesh_xy, _band_rotation_spec())
+    def _rotate_final(O):
+        if final_static_axis is not None and final_static_axis.pad:
+            O = pad_square(O, final_static_axis)
+        result = _rotate_to_dft_basis(O, U, mesh=mesh_xy)
+        if final_static_axis is not None and final_static_axis.pad:
+            result = strip_axis(strip_axis(
+                result, final_static_axis, axis=-1), final_static_axis, axis=-2)
+        return result
     U_sigma = U
     if sigma_result.sigma_band_axis is not None:
         from runtime.padding import pad_square
@@ -6564,13 +6584,10 @@ def run_sc_driver(
                 weight_dft_qp=head_weight_dft_qp)
     exact_hartree_dft = state_final.outputs.exact_hartree_dft
     if exact_hartree_dft is None:
-        sig_h = _rotate_to_dft_basis(
-            sigma_result.v_h_kij_ry, U, mesh=mesh_xy)
-        v_h_scalar = _rotate_to_dft_basis(
-            sigma_result.v_h_scalar_kij_ry, U, mesh=mesh_xy)
+        sig_h = _rotate_final(sigma_result.v_h_kij_ry)
+        v_h_scalar = _rotate_final(sigma_result.v_h_scalar_kij_ry)
         h_transverse = (
-            _rotate_to_dft_basis(
-                sigma_result.h_transverse_kij_ry, U, mesh=mesh_xy)
+            _rotate_final(sigma_result.h_transverse_kij_ry)
             if sigma_result.h_transverse_kij_ry is not None else None)
     else:
         # Already contracted with the unrotated DFT orbitals.  Rotating this
@@ -6578,9 +6595,8 @@ def run_sc_driver(
         v_h_scalar = exact_hartree_dft.scalar_dft
         h_transverse = exact_hartree_dft.transverse_dft
         sig_h = exact_hartree_dft.total
-    sig_x = _rotate_to_dft_basis(sigma_result.sigma_x_kij_ry, U, mesh=mesh_xy)
-    sigma_xc_dft = _rotate_to_dft_basis(
-        sigma_result.sigma_xc_kij_ry, U, mesh=mesh_xy)
+    sig_x = _rotate_final(sigma_result.sigma_x_kij_ry)
+    sigma_xc_dft = _rotate_final(sigma_result.sigma_xc_kij_ry)
     sigma_total = sigma_xc_dft + sig_h
     sigma_result_dft = dataclasses.replace(
         sigma_result,
@@ -6593,16 +6609,14 @@ def run_sc_driver(
         sigma_c_omega_kij_ry=sigma_c_omega_dft,
         sigma_c_at_dft_diag_ev=sigma_c_at_dft_dft,
         sigma_sx_kij_ry=(
-            _rotate_to_dft_basis(sigma_result.sigma_sx_kij_ry, U, mesh=mesh_xy)
+            _rotate_final(sigma_result.sigma_sx_kij_ry)
             if sigma_result.sigma_sx_kij_ry is not None else None),
         sigma_coh_kij_ry=(
-            _rotate_to_dft_basis(sigma_result.sigma_coh_kij_ry, U, mesh=mesh_xy)
+            _rotate_final(sigma_result.sigma_coh_kij_ry)
             if sigma_result.sigma_coh_kij_ry is not None else None),
         sigma_lorentz_skij_ry=(
             jnp.stack([
-                _rotate_to_dft_basis(
-                    sigma_result.sigma_lorentz_skij_ry[sector], U,
-                    mesh=mesh_xy)
+                _rotate_final(sigma_result.sigma_lorentz_skij_ry[sector])
                 for sector in range(3)
             ]) if sigma_result.sigma_lorentz_skij_ry is not None else None),
         # The un-extrapolated N₃ twin travels with its partner or not at all.
@@ -6612,8 +6626,7 @@ def run_sc_driver(
         # prevent — and it would show up as a "band-extrapolation correction"
         # that was mostly the basis difference.
         sigma_xc_kij_ry_unextrap=(
-            _rotate_to_dft_basis(
-                sigma_result.sigma_xc_kij_ry_unextrap, U, mesh=mesh_xy)
+            _rotate_final(sigma_result.sigma_xc_kij_ry_unextrap)
             if sigma_result.sigma_xc_kij_ry_unextrap is not None else None),
         sigma_omega_h5_path=sigma_omega_h5_path,
         # ONE omega reference, fifth site, ACTUALLY ON THE WRITER'S PATH.
