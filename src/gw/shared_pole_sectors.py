@@ -310,15 +310,15 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output):
         # Each held tile is read, scored, and released before the next support.
         held_rows={name:[] for name in ('CC','TT','CT')}
         for name,endpoint_pair,model in zip(held_rows,((0,0),(1,1),(0,1)),signed):
-            for sample_id in recipe['held_ids']:
-                sample_id=int(sample_id)
-                with SlabIO(bank['path'],mode='r',mesh=mesh_xy) as io:
+            with SlabIO(bank['path'],mode='r',mesh=mesh_xy) as io:
+                for sample_id in recipe['held_ids']:
+                    sample_id=int(sample_id)
                     held=read_sector_round(io,meta,bank,header,ids,endpoint_pair,
                                            sample_span=(sample_id,sample_id+1),execution="face" if is_face(model[0]) else "local")
-                errors=sector_held_errors(model,held,_sample_point(recipe,sample_id),mesh_xy=mesh_xy)
-                held_rows[name].append(dict(sample_id=sample_id,
-                    Wc=np.asarray(errors)[:real,0].tolist(),dWc_ds=np.asarray(errors)[:real,1].tolist()))
-                del held
+                    errors=sector_held_errors(model,held,_sample_point(recipe,sample_id),mesh_xy=mesh_xy)
+                    held_rows[name].append(dict(sample_id=sample_id,
+                        Wc=np.asarray(errors)[:real,0].tolist(),dWc_ds=np.asarray(errors)[:real,1].tolist()))
+                    del held
         for key,value in cauchy.items():
             values=np.asarray(value)[:real]
             expected_infinity=(key=='cauchy_schwarz_squared') & np.isposinf(values)
