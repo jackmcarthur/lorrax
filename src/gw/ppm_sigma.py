@@ -1009,6 +1009,9 @@ def compute_sigma_c_ppm_omega_grid(
         # 320 vs 178 (val:resonant) nodes on comparable zero-damping boxes
         # (CrI3 16x16 GN-PPM 824 tau nodes vs TaAs MPA).
         analytic_line=False,
+        # ppm_pipeline computes the D=0 reference itself (sigma.exec.odd_reference);
+        # the MPA executor's own twin would be a third sweep per map, unread.
+        odd_reference=False,
         print_fn=print_fn)
     sigma_c_kij = result.sigma_c_kij
     if sigma_static_host is not None:

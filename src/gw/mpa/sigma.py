@@ -1312,15 +1312,9 @@ def _integrate_sigma_batches(
 
     fence('tau.finalize', sync_ranks=True)
     with timing.section('tau.finalize'):
-        sigma = accumulator.finalize()
-        from symmetry_maps import unfold_file_wedge_band_operator
-        k_axis = 2 if bracketed else 1
-        # Transpose is complex-linear, so transport follows the complete omega
-        # fold without conjugating quadrature coefficients or storing tau tiles.
-        sigma = jax.jit(lambda value: jnp.moveaxis(
-            unfold_file_wedge_band_operator(
-                k_unfold_plan.sym, jnp.moveaxis(value, k_axis, 0),
-                trs_rule="transpose"), 0, k_axis))(sigma)
+        sigma = _unfold_sigma_cube(
+            accumulator.finalize(), k_unfold_plan.sym,
+            k_axis=2 if bracketed else 1, sharding=output_sharding)
         if bracketed:
             sigma = jax.jit(
                 lambda values: jnp.cumsum(values, axis=0),
@@ -1354,6 +1348,23 @@ def _integrate_sigma_batches(
             band_axis=sigma_axis,
             band_counts=(() if band_counts is None else tuple(band_counts)),
             odd_even_residue_ratio=ratio)
+
+
+def _unfold_sigma_cube(sigma, sym, *, k_axis, sharding):
+    """FILE wedge -> full BZ on the k axis of the Sigma(omega) cube, band axes kept sharded.
+
+    Transpose is complex-linear, so transport follows the complete omega fold
+    without conjugating quadrature coefficients or storing tau tiles.  The
+    output sharding is PINNED: unpinned, XLA replicated the full-BZ cube on
+    every rank (CrI3 16x16, 3 x 65 x 256 x 184^2 c128 = 27 GB/rank plus a
+    57 GB temp at P64 -- the map-0 OOM; KNOWN_LORRAX_ISSUES 2026-09-23).
+    """
+    from symmetry_maps import unfold_file_wedge_band_operator
+    return jax.jit(lambda value: jnp.moveaxis(
+        unfold_file_wedge_band_operator(
+            sym, jnp.moveaxis(value, k_axis, 0),
+            trs_rule="transpose"), 0, k_axis),
+        out_shardings=sharding)(sigma)
 
 
 def _attach_ordered_odd_sigma(total, even):
@@ -1514,6 +1525,7 @@ def compute_sigma_c_mpa_omega_grid(
     sigma_w_model="mpa",
     analytic_line=False,
     sector_context=None,
+    odd_reference=True,
     print_fn=print,
 ):
     """Read a fitted MPA store, derive its windows, and compute Sigma_c.
@@ -1744,7 +1756,10 @@ def compute_sigma_c_mpa_omega_grid(
                     pole_batch_size=pole_batch_size, brackets=band_brackets,
                     band_counts=band_counts, odd_residue_off=odd_residue_off,
                     print_fn=print_fn)
-        if not ordered_residues:
+        # odd_reference=False: the caller builds its own D=0 reference (the GN
+        # arm does, in ppm_pipeline), so a second twin here would be a whole
+        # extra sweep whose sigma_c_odd_kij nobody reads.
+        if not ordered_residues or not odd_reference:
             return total
         # Exact observability twin, shared in algebra with the GN arm in
         # ppm_pipeline: Sigma is linear in the fitted residues, so the same
