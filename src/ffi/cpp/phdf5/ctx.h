@@ -11,6 +11,7 @@
 #include <cctype>
 #include <condition_variable>
 #include <cstddef>
+#include <cstdint>
 #include <cstdlib>
 #include <deque>
 #include <functional>
@@ -79,7 +80,7 @@ inline bool env_flag(const char* name, bool default_value) {
 //
 // Naming the two layouts differently makes that CATEGORY of failure
 // unconstructible rather than merely unlikely: `open_ctx` mangles to
-// `...PhdfCtxCudaV1...` in one library and `...PhdfCtxHostV1...` in the other,
+// `...PhdfCtxCudaV2...` in one library and `...PhdfCtxHostV2...` in the other,
 // so the two symbols cannot collide even if some future build drops the
 // visibility control in `exports_{cuda,host}.map`.  Belt AND braces, in that
 // order — the version scripts are the belt, this is the braces.
@@ -87,13 +88,13 @@ inline bool env_flag(const char* name, bool default_value) {
 // `using PhdfCtx = ...` below keeps every call site, every forward
 // declaration and every `reinterpret_cast` in the four phdf5 TUs written the
 // way they already were.  The alias is the source-level name; the struct tag
-// is the ABI name.  Bump the V1 only if a layout changes in a way that a
+// is the ABI name.  Bump the version when a layout changes in a way that a
 // stale .so could be handed — the version is an ABI generation, not a
 // release number.
 #ifdef LORRAX_FFI_NO_CUDA
-#  define LORRAX_PHDF_CTX_TYPE PhdfCtxHostV1
+#  define LORRAX_PHDF_CTX_TYPE PhdfCtxHostV2
 #else
-#  define LORRAX_PHDF_CTX_TYPE PhdfCtxCudaV1
+#  define LORRAX_PHDF_CTX_TYPE PhdfCtxCudaV2
 #endif
 
 struct LORRAX_PHDF_CTX_TYPE {
@@ -102,6 +103,13 @@ struct LORRAX_PHDF_CTX_TYPE {
     int world_size = 0;
     int p = 0, q = 0;                            // 2-D mesh shape
     std::string path;
+
+    // Optional per-file native H5D call totals.  Timed at the actual
+    // collective call, including time waiting for peer ranks; the Python
+    // SlabIO service emits the report after close has drained the worker.
+    bool timing_enabled = false;
+    std::atomic<uint64_t> read_calls{0}, read_bytes{0}, read_ns{0};
+    std::atomic<uint64_t> write_calls{0}, write_bytes{0}, write_ns{0};
 
     // Owned MPI + HDF5 resources (created at open, destroyed at close).
     MPI_Comm comm            = MPI_COMM_NULL;

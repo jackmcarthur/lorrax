@@ -130,6 +130,32 @@ def test_slab_io_selects_the_serial_tier_on_an_emulated_mesh(tmp_path):
 
 
 @pytest.mark.mesh(4)
+def test_optional_slab_io_timing_records_real_round_trip(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("LORRAX_SLAB_IO_TIMING", "1")
+    mesh = _mesh(2, 2)
+    host = np.arange(16, dtype=np.float64).reshape(4, 4)
+    with SlabIO(tmp_path / "timed.h5", mode="w", mesh=mesh) as io:
+        io.create_dataset("A", shape=host.shape, dtype=host.dtype)
+        io.write_slab("A", _sharded(host, mesh, P("x", "y")))
+        got = np.asarray(jax.device_get(
+            io.read_slab("A", partition_spec=P("x", "y"))))
+    assert np.array_equal(got, host)
+
+    log = (tmp_path / "slab_io_timing.rank000.log").read_text()
+    assert "op=write_slab_sync ds=A" in log
+    assert "op=read_slab_sync ds=A" in log
+    assert "op=close ds=-" in log
+    assert "native_H5Dread" not in log  # serial emulation has no PHDF5 calls
+
+    monkeypatch.setenv("LORRAX_SLAB_IO_TIMING", "0")
+    size = (tmp_path / "slab_io_timing.rank000.log").stat().st_size
+    with SlabIO(tmp_path / "untimed.h5", mode="w", mesh=mesh):
+        pass
+    assert (tmp_path / "slab_io_timing.rank000.log").stat().st_size == size
+
+
+@pytest.mark.mesh(4)
 def test_the_tier_announces_itself_in_the_log(tmp_path, capsys):
     """The transport line, observed in stdout rather than assumed.
 

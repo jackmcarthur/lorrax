@@ -32,7 +32,7 @@ namespace lorrax_ffi::phdf5 {
     // Implemented in cpp/phdf5/context.cc
     PhdfCtx* open_ctx(const std::string& path, int p, int q,
                       int rank, int world_size, int mode_flag);
-    void     close_ctx(PhdfCtx* ctx);
+    void     close_ctx(PhdfCtx* ctx, int64_t* timing_out = nullptr);
     hid_t    ensure_dataset(PhdfCtx* ctx, const std::string& ds_name,
                             const int64_t* shape, int ndim, int dtype_tag);
     hid_t    open_dataset_ro(PhdfCtx* ctx, const std::string& ds_name);
@@ -74,6 +74,15 @@ int LRX_C_ENTRY(lrx_phdf5_open)(
 void LRX_C_ENTRY(lrx_phdf5_close)(int64_t ctx_handle) {
     lorrax_ffi::phdf5::close_ctx(
         reinterpret_cast<lorrax_ffi::phdf5::PhdfCtx*>(ctx_handle));
+}
+
+// The normal close already joins the native writer/union-read worker.
+// Copy counters at that point, before the context is deleted; no extra
+// collective, synchronization, or second traversal of the task queue.
+void LRX_C_ENTRY(lrx_phdf5_close_timed)(int64_t ctx_handle,
+                                       int64_t* timing_out) {
+    lorrax_ffi::phdf5::close_ctx(
+        reinterpret_cast<lorrax_ffi::phdf5::PhdfCtx*>(ctx_handle), timing_out);
 }
 
 // Eager MPI init.  Safe to call multiple times.  Use at program

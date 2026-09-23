@@ -114,6 +114,7 @@ import jax
 from common.collectives import mesh_is_emulated
 
 from . import h5_journal as _journal
+from .io_timing import DISABLED, SlabIOTiming, enabled as _timing_enabled, timed
 from ._slab_io_ffi import (_FfiBackend, assert_available, mesh_divisible_shape,
                            probe_availability, probe_read_availability)
 
@@ -196,6 +197,8 @@ class SlabIO:
                 "collective over the device mesh the slabs are sharded on.  "
                 "Pass the run's mesh (drivers hold it as `mesh_xy`).")
         self.mesh = mesh
+        self._timing = (SlabIOTiming(self.path, mode)
+                        if _timing_enabled() else DISABLED)
         # The COMPLETION line for this open: it is the only one that can
         # carry the ctx handle, because the handle does not exist until
         # ``_FfiBackend`` returns.  The issue-time line is written inside
@@ -222,9 +225,11 @@ class SlabIO:
             backend_cls = _FfiBackend
         self._stack = backend_cls.journal_stack
         try:
-            self._backend = backend_cls(self.path, mesh=mesh, mode=mode)
+            with self._timing.measure("open"):
+                self._backend = backend_cls(self.path, mesh=mesh, mode=mode)
         except BaseException as exc:
             _journal.fail("open", self.path, exc, stack=self._stack, mode=mode)
+            self._timing.finish()
             raise
         _journal.record("open", self.path, stack=self._stack, mode=mode,
                         handle=self._handle())
@@ -278,11 +283,17 @@ class SlabIO:
         at the wrong offsets, so the corruption is DETECTED here and
         CREATED somewhere earlier — do not start reading at this method.
         """
-        with _journal.op_scope("close", self.path, stack=self._stack,
-                               mode=self.mode, handle=self._handle()):
-            self._backend.close()
+        native = None
+        try:
+            with self._timing.measure("close"):
+                with _journal.op_scope("close", self.path, stack=self._stack,
+                                       mode=self.mode, handle=self._handle()):
+                    native = self._backend.close()
+        finally:
+            self._timing.finish(native)
 
     # ------------------------------------------------------------------
+    @timed("create_including_prior_write_wait")
     def create_dataset(
         self,
         name: str,
@@ -328,6 +339,7 @@ class SlabIO:
             self._backend.create_dataset(
                 name, shape=shape, dtype=dtype, attrs=attrs)
 
+    @timed("attr_enqueue")
     def write_attr(self, name: str, value) -> None:
         """QUEUE a small replicated dataset (e.g. ``omega_ev``) for close.
 
@@ -355,6 +367,7 @@ class SlabIO:
                                mode=self.mode, handle=self._handle()):
             self._backend.write_attr(name, value)
 
+    @timed("attr_stamp_enqueue")
     def stamp_dataset_attrs(self, name: str, attrs: dict) -> None:
         """Stamp H5 attributes onto a dataset this handle did not create.
 
@@ -373,6 +386,7 @@ class SlabIO:
                         handle=self._handle())
         self._backend._deferred_ds_attrs.append((str(name), dict(attrs)))
 
+    @timed("write_wait")
     def sync_writes(self) -> None:
         """Wait for queued writes without closing the collective handle.
 
@@ -388,6 +402,7 @@ class SlabIO:
         self._backend._drain_pending()
 
     # ------------------------------------------------------------------
+    @timed("write_enqueue")
     def write_slab(
         self,
         name: str,
@@ -438,6 +453,7 @@ class SlabIO:
             )
 
     # ------------------------------------------------------------------
+    @timed("read_slab_sync")
     def read_slab(
         self,
         name: str,
@@ -516,6 +532,7 @@ class SlabIO:
         return arr
 
     # ------------------------------------------------------------------
+    @timed("read_small_sync")
     def read_small(self, name: str, *, dtype=None) -> np.ndarray:
         """Read a WHOLE small dataset into a host ``np.ndarray``, every rank.
 
@@ -549,6 +566,7 @@ class SlabIO:
             return self._backend.read_whole(name, dtype=dtype)
 
     # ------------------------------------------------------------------
+    @timed("read_union_dispatch")
     def read_slabs(
         self,
         name: str,

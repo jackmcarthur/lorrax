@@ -373,6 +373,7 @@ def _locate_so(platform: str) -> Path:
 _SHARED_C_ENTRY_POINTS = (
     "lrx_phdf5_open",
     "lrx_phdf5_close",
+    "lrx_phdf5_close_timed",  # optional; _bind_c_abi skips absent symbols
     "lrx_phdf5_init_mpi",
     "lrx_phdf5_ensure_dataset",
     "lrx_phdf5_open_dataset_ro",
@@ -548,6 +549,10 @@ def _declare_phdf5(lib: ctypes.CDLL) -> None:
             ctypes.POINTER(ctypes.c_int64),      # pinned + read staging bytes
         ]
         lib.lrx_phdf5_staging_totals.restype = ctypes.c_int
+    if hasattr(lib, "lrx_phdf5_close_timed"):
+        lib.lrx_phdf5_close_timed.argtypes = [
+            ctypes.c_int64, ctypes.POINTER(ctypes.c_int64)]
+        lib.lrx_phdf5_close_timed.restype = None
 
 
 def _declare_slate(lib: ctypes.CDLL) -> None:
@@ -810,7 +815,7 @@ def has_phdf5_write(platform: str) -> bool:
 #     hidden (this module dlsyms them), so the HOST leg's carry a ``_host``
 #     suffix.  ``_bind_c_abi`` above binds them under the plain Python name.
 #   * ``cpp/phdf5/ctx.h`` -- ``PhdfCtx``'s struct TAG is now per-leg
-#     (``PhdfCtxCudaV1`` / ``PhdfCtxHostV1``), so the cross-layout aliasing
+#     (``PhdfCtxCudaV2`` / ``PhdfCtxHostV2``), so the cross-layout aliasing
 #     is unconstructible even without the version scripts.
 #
 # MEASURED AFTER, same two commands: 234 shared names, **0 of them LORRAX's
@@ -1076,8 +1081,18 @@ def phdf5_open(path: str, p: int, q: int, rank: int, world_size: int,
     return int(ctx_out.value)
 
 
-def phdf5_close(ctx_handle: int, platform: Optional[str] = None) -> None:
-    get_lib(platform).lrx_phdf5_close(int(ctx_handle))
+def phdf5_close(ctx_handle: int, platform: Optional[str] = None,
+                *, timing: bool = False):
+    lib = get_lib(platform)
+    if timing:
+        values = (ctypes.c_int64 * 6)()
+        lib.lrx_phdf5_close_timed(int(ctx_handle), values)
+        return tuple(values)
+    lib.lrx_phdf5_close(int(ctx_handle))
+
+
+def has_phdf5_timing(platform: Optional[str] = None) -> bool:
+    return hasattr(get_lib(platform), "lrx_phdf5_close_timed")
 
 
 def phdf5_init_mpi(platform: Optional[str] = None) -> None:

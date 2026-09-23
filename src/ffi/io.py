@@ -182,7 +182,7 @@ def platform_for_handle(ctx_handle: int) -> Optional[str]:
     return None
 
 
-def close_file(path_or_handle) -> None:
+def close_file(path_or_handle, *, timing: bool = False):
     """Collective close.  Accepts either a path (the original open_file
     argument) or the int handle returned from open_file.
 
@@ -217,7 +217,8 @@ def close_file(path_or_handle) -> None:
             # platform=None (unknown handle) follows the JAX default
             # backend inside ffi_loader — hardcoding "CUDA" would fail on
             # a CPU node where only the host lib exists.
-            ffi_loader.phdf5_close(int(ctx), platform=platform)
+            return ffi_loader.phdf5_close(int(ctx), platform=platform,
+                                          timing=timing)
 
 
 def _atexit_close_all() -> None:
