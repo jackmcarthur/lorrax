@@ -1581,16 +1581,9 @@ def compute_sigma_c_mpa_omega_grid(
                         if sector_context is None else sector_context["schedule"](ledger))
         print_fn(f"  shared-pole Sigma capacity: {schedule}")
     else:
-        def _validate():
-            return validate_fit_store(
-                fit_src, expected_identity=fit_identity,
-                expected_screening_diagrams=expected_screening_diagrams)
-        if isinstance(fit_src, (str, bytes, os.PathLike)):
-            from file_io.mpa_store import rank0_read_broadcast
-            ledger = rank0_read_broadcast(
-                _validate, path=fit_src, stage="validate_fit_store")
-        else:
-            ledger = _validate()
+        ledger = validate_fit_store(
+            fit_src, expected_identity=fit_identity,
+            expected_screening_diagrams=expected_screening_diagrams)
         n_poles = int(ledger["n_p"])
         ordered_residues = bool(ledger["ordered_residues"])
     odd_residue_off = _resolve_mpa_odd_residue_debug(

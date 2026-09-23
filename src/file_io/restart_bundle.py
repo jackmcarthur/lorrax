@@ -2838,18 +2838,11 @@ class PoleReader:
         self.mesh_xy = mesh_xy
         # h5py FIRST, and completely, and closed — before any collective
         # handle exists.  Both reads are small and neither is repeated.
-        def _read():
-            with _h5(src, mode) as grp:
-                ledger = fit_completion_ledger(grp)
-                _refuse_unfinalized(grp, ledger, allow_partial, "PoleReader")
-            return ledger, (read_fit_unfold_tables(src)
-                            if ledger["q_storage"] == "ibz" else None)
-        if isinstance(src, (str, bytes, os.PathLike)):
-            from file_io.mpa_store import rank0_read_broadcast
-            self.ledger, self.tables = rank0_read_broadcast(
-                _read, path=src, stage="pole_reader")
-        else:
-            self.ledger, self.tables = _read()
+        with _h5(src, mode) as grp:
+            self.ledger = fit_completion_ledger(grp)
+            _refuse_unfinalized(grp, self.ledger, allow_partial, "PoleReader")
+        self.tables = (read_fit_unfold_tables(src)
+                       if self.ledger["q_storage"] == "ibz" else None)
         self.n_poles = int(self.ledger["n_p"])
         from file_io.slab_io import SlabIO
         self._io = SlabIO(src, mode="r", mesh=mesh_xy)
