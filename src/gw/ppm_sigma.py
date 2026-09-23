@@ -1004,9 +1004,11 @@ def compute_sigma_c_ppm_omega_grid(
         band_brackets=plan.bounds,
         band_counts=plan.counts,
         fixed_quadrature_session=fixed_quadrature_session,
-        # Real PPM poles give a fixed-height denominator line on crossing
-        # windows. The shared planner still keeps its relative tail rules.
-        analytic_line=True,
+        # The same fitted box rules as full frequency (owner 2026-09-22): the
+        # analytic fixed-height line rule needed 416 vs 206 (cond:resonant) and
+        # 320 vs 178 (val:resonant) nodes on comparable zero-damping boxes
+        # (CrI3 16x16 GN-PPM 824 tau nodes vs TaAs MPA).
+        analytic_line=False,
         print_fn=print_fn)
     sigma_c_kij = result.sigma_c_kij
     if sigma_static_host is not None:
