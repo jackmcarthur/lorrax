@@ -187,7 +187,8 @@ def _setup_runtime() -> None:
 
 
 def _compute_static_head(
-		head_resolver, meta, do_screened, print0, *, require_screened=True):
+		head_resolver, meta, do_screened, print0, *,
+		require_screened=True, occupation_state=None):
 	"""Resolve the q→0 head sample and its exact band-diagonal Σ terms.
 
 	Used by every mode: the bare-X head piece applies to static and
@@ -196,9 +197,9 @@ def _compute_static_head(
 	head = (head_resolver.at(0.0 + 0.0j) if require_screened
 	        else head_resolver.direct_at(0.0 + 0.0j))
 	print0(format_head_sample_diagnostics(head, include_screened=do_screened))
-	# TODO(metal-sigma): this one-shot static Sigma head still uses the
-	# ifmax band boundary.  Port it with the rest of metallic Sigma.
-	occ_mask = np.arange(meta.nb_sigma, dtype=np.int32) < meta.nelec
+	occ_mask = (np.arange(meta.nb_sigma, dtype=np.int32) < meta.nelec
+	            if occupation_state is None else
+	            np.asarray(occupation_state.f_kn)[:, :meta.nb_sigma])
 	terms = compute_static_head_terms_from_sample(
 		head, occ=occ_mask, cell_volume=meta.cell_volume, nk_tot=meta.nk_tot)
 	print0(format_static_head_diagnostics(terms))
@@ -207,7 +208,7 @@ def _compute_static_head(
 
 def _oneshot_mpa_occupation_state(config, wfn, wfns, material_class,
                                   mesh_xy=None, print_fn=print):
-	"""Solve the fixed-N MP1 state consumed by one-shot metallic MPA.
+	"""Solve the fixed-N MP1 state consumed by one-shot metallic exchange and MPA.
 
 	The self-consistent driver already solves this state at map entry.  A
 	non-SC driver must solve it once from the DFT spectrum and thread that same
@@ -231,7 +232,7 @@ def _oneshot_mpa_occupation_state(config, wfn, wfns, material_class,
 	energies = np.asarray(wfns.enk, dtype=np.float64)
 	if energies.ndim != 2 or min(energies.shape) < 1:
 		raise ValueError(
-			"one-shot metallic MPA occupation energies must be nonempty "
+			"one-shot metallic occupation energies must be nonempty "
 			f"(nk,nb), got {energies.shape}")
 	nk = int(energies.shape[0])
 	kweights = np.full(nk, 1.0 / float(nk), dtype=np.float64)
@@ -297,7 +298,9 @@ def _report_head_and_photon_policy(config, print0, report):
         f"screening_diagrams={config.screening.diagrams.value}; "
         f"direct diagnostic source={config.head.wcoul0_source}. "
         + ({
-            HeadCorrection.FULL: "macroscopic W, local fields exactly once",
+            HeadCorrection.FULL: (
+                "bare Coulomb head" if config.compute_mode is ComputeMode.X_ONLY
+                else "macroscopic W, local fields exactly once"),
             HeadCorrection.NO_LOCAL_FIELDS: "diagnostic epsilon head",
             HeadCorrection.OFF: "no special Gamma-cell contribution",
         }[config.head.correction]))
@@ -323,7 +326,10 @@ def _report_head_and_photon_policy(config, print0, report):
         else:
             report.progress(
                 "Photon route   : "
-                + ("packed static photon operator (chi_TT = chi_CT = 0; scalar "
+                + ("bare CC + TT exchange only (Coulomb-gauge V_CT=0; "
+                   "no chi0, W, Dyson solve or frequency pole model)"
+                   if config.compute_mode is ComputeMode.X_ONLY else
+                   "packed static photon operator (chi_TT = chi_CT = 0; scalar "
                    "Dyson on CC, W_packed = diag(W_00, D_TT); the Gamma-cell "
                    "completion carries both the charge head and the bare "
                    f"<D_TT>) -- {_bare_reason}"
@@ -487,7 +493,7 @@ def _prepare_isdf_carriers(
         _oneshot_mpa_occupation_state(
             config, wfn, wfns, material_class, mesh_xy=mesh_xy, print_fn=print0)
         if (qp_solver is not QPSolver.SELF_CONSISTENT
-            and mode.value == "mpa") else None)
+            and mode.value in ("mpa", "x_only")) else None)
     if oneshot_occupation_state is not None:
         print0(
             f"  one-shot occupations: fixed-N {oneshot_occupation_state.smearing_family} state, "
@@ -792,7 +798,8 @@ def _persist_screening(
                 print_fn=print0)
 
 
-def _prepare_static_head(config, do_screened, head_resolver, meta, mode, print0, qp_solver):
+def _prepare_static_head(config, do_screened, head_resolver, meta, mode, print0,
+                         qp_solver, occupation_state):
     """Produce the static head terms required by the selected QP solver."""
     static_head_terms = None
     if (config.do_G0
@@ -804,8 +811,9 @@ def _prepare_static_head(config, do_screened, head_resolver, meta, mode, print0,
             with timing.section("gw_jax.static_head"):
                 static_head_terms = _compute_static_head(
                     head_resolver, meta, do_screened, print0,
-                    require_screened=(mode.value != "mpa" and
-                                      qp_solver is not QPSolver.SELF_CONSISTENT))
+                    require_screened=(do_screened and mode.value != "mpa" and
+                                      qp_solver is not QPSolver.SELF_CONSISTENT),
+                    occupation_state=occupation_state)
     return (static_head_terms)
 
 
@@ -1494,7 +1502,8 @@ def main(argv=None):
 	    qp_solver, sym, tensors_filename, photon_response=photon_response)
 	(
 	    static_head_terms) = _prepare_static_head(
-	    config, do_screened, head_resolver, meta, mode, print0, qp_solver)
+	    config, do_screened, head_resolver, meta, mode, print0, qp_solver,
+	    oneshot_occupation_state)
 	(
 	    sigma_result, W_by_role, photon_response) = _run_oneshot_sigma(
 	    V_q, W_by_role, band_slices, bispinor_v_q_path, config, enk_dft, head_resolver,

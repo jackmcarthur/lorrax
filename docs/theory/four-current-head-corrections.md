@@ -155,9 +155,10 @@ count.
 > incumbent non-packed configuration; it is reachable only from a
 > hand-built config. **Consequence: a bispinor deck outside the packed
 > envelope — for example bulk, restart, self-consistent, MPA,
-> `x_only`/resolvent, or explicit-local — carries NO transverse
-> q→0 head at all**, and its run record now says so on the `Photon head`
-> line. The section is kept because the identities below are the gates the
+> resolvent, or explicit-local — carries NO transverse
+> q→0 head at all**, except fresh, full-head `x_only` bare exchange, which
+> installs the existing transverse tensor average in V. The section is kept
+> because the identities below are the gates the
 > packed completion's `⟨D_TT⟩` is checked against.
 
 In a hand-built config, setting the field replaces the `q = Γ, G = 0` slot

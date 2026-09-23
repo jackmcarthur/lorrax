@@ -3586,6 +3586,9 @@ def incumbent_bispinor_head_record(config) -> tuple[str, str]:
     if config.head.correction is HeadCorrection.NO_LOCAL_FIELDS:
         return "", ("shared-pole direct charge head only; no wing/body fold, "
                     "intraband Drude term, or transverse Gamma-cell head")
+    if uses_bare_tt_gamma_head(config):
+        return "", ("bare charge <v> head and bare TT <D_TT> cell average "
+                    "in the fresh four-current V; no screened W")
     # With head_correction = full, the CHARGE head is band-diagonal and
     # there is NO transverse q=Gamma head on this route now that the overlay
     # has no deck key -- say so rather than let a bulk number look complete.

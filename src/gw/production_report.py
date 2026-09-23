@@ -298,7 +298,8 @@ class GWProductionReport:
         self.emit(f"Self-energy    : {mode_text}; {solver_text}")
         self.emit(
             f"QP consistency  : {solver} | other options: fixed_point "
-            "(diagonal on-shell), self_consistent (rebuild G/W/Sigma)")
+            "(diagonal on-shell), self_consistent (rebuild G/"
+            + ("Sigma" if mode == "x_only" else "W/Sigma") + ")")
         eqp2 = getattr(config, "eqp2", None)
         if bool(getattr(eqp2, "enabled", False)):
             self.emit(
@@ -315,8 +316,10 @@ class GWProductionReport:
             self.emit(
                 "EQP2 treatment  : off (set write_eqp2=true for fixed-Sigma "
                 "eigenvalue self-consistency)")
-        self.emit(f"Screening      : {diagram_text}; "
-                  f"{getattr(screening, 'method', '-')} imaginary-axis quadrature")
+        self.emit(
+            "Screening      : none (bare exchange)" if mode == "x_only" else
+            f"Screening      : {diagram_text}; "
+            f"{getattr(screening, 'method', '-')} imaginary-axis quadrature")
         self.emit(f"Long wavelength: head={head_mode}; source={head_source}")
         self.emit(f"Coulomb system : {geometry}; Hartree=live G-space")
         self.emit("Spin channels  : " + (

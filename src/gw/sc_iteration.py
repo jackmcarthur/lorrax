@@ -6440,7 +6440,7 @@ def run_sc_driver(
     from .restart_q_storage import take_pre_unfold
     from .screening import driver_persists_w0
     try:
-        if bool(config.do_screened) and driver_persists_w0(
+        if config.compute_mode.needs_screening and driver_persists_w0(
                 config.compute_mode, config):
             if screening.static_w is None:
                 raise RuntimeError(
