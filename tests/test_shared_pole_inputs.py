@@ -326,14 +326,21 @@ def test_weight_refusal(weights):
                                state_capacity=2.,kweights=weights)
 
 
-@pytest.mark.parametrize('nspinor,wfn_nspinor,nspin',[(4,2,1),(2,1,1),(1,1,2)])
+@pytest.mark.parametrize('nspinor,wfn_nspinor,nspin',[(4,1,1),(2,1,1),(1,1,2)])
 def test_representation_refusal(nspinor,wfn_nspinor,nspin):
-    # Bispinor lift, a two-component operator without a two-component
-    # source, and collinear spin all stay refused.
+    # Bispinor/Pauli operators without a two-component source and collinear
+    # spin stay refused.
     c,w,m=fixture();m.nspinor=nspinor;m.nspinor_wfnfile=wfn_nspinor;m.nspin=nspin
     with pytest.raises(ValueError,match='GATE shared_pole_representation'):
         bind_shared_pole_census(w,m,occupation_state=None,trs_allowed=True,
                                state_capacity=2.,kweights=[.5,.5])
+
+
+def test_four_component_charge_census_uses_physical_source_capacity():
+    c,w,m=fixture();m.nspinor=4;m.nspinor_wfnfile=2
+    bind_shared_pole_census(w,m,occupation_state=None,trs_allowed=False,
+                           state_capacity=1.,kweights=[.5,.5])
+    assert m.shared_pole_census['trs_allowed'] is False
 
 
 def test_two_component_time_reversal_broken_census_binds():

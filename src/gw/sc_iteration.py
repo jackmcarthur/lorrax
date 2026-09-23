@@ -3404,7 +3404,8 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             None if inputs.fixed_quadrature_session is None else
             inputs.fixed_quadrature_session.setdefault("chi", {}))
 
-    from .gw_config import uses_direct_bispinor_shared_pole_head
+    from .gw_config import (uses_bare_transverse_shared_pole,
+                            uses_direct_bispinor_shared_pole_head)
     if uses_direct_bispinor_shared_pole_head(inputs.config):
         sigma = inputs.band_slices.sigma
         if (sigma.start != 0 or entry_occ_state is None
@@ -3484,7 +3485,8 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     direct_only_shared_pole = (
         inputs.config.head.correction is HeadCorrection.NO_LOCAL_FIELDS
         and inputs.config.sigma.w_model == "shared_pole"
-        and int(inputs.meta.nspinor) != 4)
+        and (int(inputs.meta.nspinor) != 4
+             or uses_bare_transverse_shared_pole(inputs.config)))
     fixed_dft_full_head = (inputs.fixed_dft_head_response is not None or
         (pt is None and inputs.config.sigma.w_model == "shared_pole"
          and (inputs.config.head.correction is HeadCorrection.FULL

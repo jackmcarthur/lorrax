@@ -65,7 +65,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
                                           own_extent_receipts, parent_rounds, partner_realization,
                                           reduce_round, round_tables)
         from gw.shared_pole_recipe import (
-            build_construction_row, construction_receipt,
+            build_construction_row, charge4_gates, construction_receipt,
             shared_real_pole_gates_v1_r3b as gates,
             shared_real_pole_gates_ordered_v1,
         )
@@ -76,11 +76,19 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
         recipe = meta.shared_pole_recipe
         # Time-reversal-broken scalar states take the ordered particle-hole route.
         ordered = not bool(bank["tables"]["sym"].trs_allowed)
-        # Scalar and two-component decks share one mu x mu charge operator.
+        # Every charge carrier contracts to one mu x mu CC operator.
         if not charge_representation(meta):
-            raise ValueError("GATE shared_pole_representation: got: bispinor or unsupported state; want: scalar or two-component charge operator (TRS-broken states take the ordered route); why: both-endpoint spin action is not yet supported")
-        if ordered:
+            raise ValueError("GATE shared_pole_representation: expected an authenticated charge carrier")
+        charge4 = recipe.get("charge_operator") == "four-component-spin-traced-v1"
+        if (int(meta.nspinor) == 4) != charge4:
+            raise ValueError("GATE shared_pole_representation: charge4 recipe and carrier disagree")
+        if charge4:
+            gates = charge4_gates(ordered)
+        elif ordered:
             gates = shared_real_pole_gates_ordered_v1
+        from gw.shared_pole_recipe import table_hash
+        if recipe["gate_hash"] != table_hash(gates):
+            raise ValueError("GATE shared_pole_representation: recipe gate table differs from charge carrier")
         resolution = linalg_resolution({"linalg": config.backend.linalg})
         identity = bank["identity"]
         ledger = meta.shared_pole_capacity
@@ -354,7 +362,8 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
                     ordered=ordered, odd_moments=odd_moments)
                 receipt = construction_receipt(
                     measurements, capacity=ledger,
-                    capacity_entry_start=receipt_entry_start, ordered=ordered)
+                    capacity_entry_start=receipt_entry_start, ordered=ordered,
+                    charge4=charge4)
                 receipt.update(identity=identity, constructor=row)
                 receipts[q] = receipt
             receipt_entry_start = len(ledger.entries)

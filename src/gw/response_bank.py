@@ -377,9 +377,8 @@ def response_stream(wfns, meta, *, mesh_xy, q_ids, n_outputs,
             bank_carry=bank_carry, ordered=True, vertex=True, band_ranges=band_ranges)
         return kernel, vertex
     if not charge_representation(meta):
-        raise ValueError("GATE response_representation: want scalar or "
-                         "two-component charge endpoints; use the photon vertex "
-                         "for bispinor response")
+        raise ValueError("GATE response_representation: want an authenticated "
+                         "scalar, two-component, or four-component charge carrier")
     carrier = wfns.green_parent
     source = wfns if carrier is None else carrier
     parent = None if carrier is None else carrier.plan
@@ -482,8 +481,8 @@ def _bank_context(wfns, meta, sym, bank_io, mesh_xy):
     # The measured time-reversal verdict selects the orientation (callers
     # read sym.trs_allowed); only the operator representation refuses here.
     if not charge_representation(meta) and "photon_v" not in bank_io:
-        raise ValueError("GATE response_representation: want scalar or "
-                         "two-component charge operator; bispinor bank is unsupported")
+        raise ValueError("GATE response_representation: want an authenticated "
+                         "scalar, two-component, or four-component charge carrier")
     header = validate_shared_pole_bank(bank_io["path"],
         expected_identity=bank_io["identity"], mesh_xy=mesh_xy)
     qids = np.asarray(sym.q_irr_full_idx, dtype=np.int64)
