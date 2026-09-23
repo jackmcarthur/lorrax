@@ -13,7 +13,8 @@ def check_sector_constructor(mesh, root, *, linalg="local", parents=16, return_o
     from symmetry_maps import QirrTables, centroid_source_map_and_wrap
     from gw.photon_layout import PhotonBasisLayout
     from gw.shared_pole_recipe import CapacityLedger, ROLE_CODES
-    from gw.shared_pole_sectors import construct_sector_poles, positive_cross_models
+    from gw.shared_pole_sectors import (construct_sector_poles,
+        positive_cross_models, _contiguous_q_spans)
     from file_io import shared_pole_store as store
     from file_io.slab_io import SlabIO
 
@@ -118,6 +119,7 @@ def check_sector_constructor(mesh, root, *, linalg="local", parents=16, return_o
         meta=meta,expected_identity=identity,mesh_xy=mesh)
     result=construct_sector_poles(bank,meta,SimpleNamespace(backend=SimpleNamespace(linalg=linalg)),
                                   mesh_xy=mesh,output=str(run/'model.h5'))
+    assert _contiguous_q_spans([4,1,3,2,9,9],5)==((1,5,(1,3,2,0)),(9,10,(4,)))
     rounds=[row for row in result['q_receipts'] if 'held' in row]
     assert all(row['execution']==('face' if linalg=='distributed' else 'local') for row in rounds)
     if linalg=='distributed':
@@ -135,6 +137,9 @@ def check_sector_constructor(mesh, root, *, linalg="local", parents=16, return_o
                for row in treatment_rows
                for sector in row['pole_treatment']['sectors'].values())
     headers=manifest['model_headers']
+    if linalg=='local' and parents>=4:
+        assert all(any(batch['hi']-batch['lo']>1 for batch in headers[sector]['batches'])
+                   for sector in ('CC','TT','CT_C','CT_T'))
     factors={}
     for sector,family in (('CC',0),('TT',1),('CT_C',0),('CT_T',1)):
         with SlabIO(handle['sectors'][sector]['path'],mode='r',mesh=mesh) as io:
