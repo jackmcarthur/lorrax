@@ -514,6 +514,43 @@ def _h5(target, mode, *, where=None):
             note_close(path, token)
 
 
+def rank0_read_broadcast(read, *, path, stage, timeout_ms=900_000):
+    """Rank 0 runs ``read()``; every rank returns its result.  COLLECTIVE.
+
+    The other ranks never open ``path`` with h5py.  On a store phdf5 wrote,
+    the cleared superblock status_flags bit can still read as set on another
+    node (see _superblock_flag_diagnosis; CrI3 16x16 P64 58783428.4, 47 of 64
+    ranks).  Rank 0 reads what it wrote and the result travels through the
+    JAX distributed KV store, pickled and zlib-compressed.  A refusal raised
+    on rank 0 is re-raised on every rank, so the collective stays uniform.
+    ponytail: KV keys are never deleted -- a few per store per SC map.
+    """
+    import pickle
+    import zlib
+    from common.collectives import _io_control_key, process_count, process_rank
+
+    if process_count() == 1:
+        return read()
+    from jax._src.distributed import global_state
+
+    client = global_state.client
+    key = _io_control_key(os.fspath(path), "rank0_read/" + stage)
+    if process_rank() == 0:
+        try:
+            payload = (True, read())
+        except Exception as exc:                    # re-raised on every rank
+            payload = (False, (type(exc).__name__, str(exc)))
+        client.key_value_set(key, zlib.compress(pickle.dumps(payload)).hex())
+    ok, value = pickle.loads(zlib.decompress(bytes.fromhex(
+        client.blocking_key_value_get(key, timeout_ms))))
+    if not ok:
+        kind, message = value
+        raise (ValueError if kind == "ValueError" else RuntimeError)(
+            f"{message}\n  [rank-0 read of {os.fspath(path)} at {stage}; "
+            f"rank 0 raised {kind}]")
+    return value
+
+
 #: The exact HDF5 phrase.  It is the SUPERBLOCK's ``status_flags``
 #: write-open bit, not a POSIX lock, which is why
 #: ``HDF5_USE_FILE_LOCKING=FALSE`` does not touch it and why the runs that
@@ -1931,7 +1968,8 @@ def allocate_fit_store_collective(
                 occupation_state=occupation_state,
                 ordered_residues=ordered_residues)
     barrier("mpa_fit_metadata_allocated")
-    return fit_completion_ledger(dest)
+    return rank0_read_broadcast(
+        lambda: fit_completion_ledger(dest), path=dest, stage="allocate")
 
 
 def write_complete_pole_store_collective(
@@ -2096,7 +2134,8 @@ def write_complete_pole_store_collective(
             _commit_fit_blocks(_open_fit(grp), records)
         finalize_fit_store(dest, certification=certification)
     barrier("mpa_complete_poles_finalized")
-    return fit_completion_ledger(dest)
+    return rank0_read_broadcast(
+        lambda: fit_completion_ledger(dest), path=dest, stage="write_complete")
 
 
 def _utc_now():
