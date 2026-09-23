@@ -3565,7 +3565,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             # Y and Z are built directly from the two centroid-sharded
             # wavefunction copies.  Their band-pair tiles are distributed
             # over the full Px*Py mesh and frequency-blocked in each ring.
-            wfns_qp=wfns_qp,
+            wfns_qp=(None if direct_only_shared_pole else wfns_qp),
             eta_ry=(0.0 if mpa_mode else None),
             occupation_state=entry_occ_state,
         )
@@ -3586,6 +3586,11 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
                 f"ISDF wings on the exact MPA z grid ({velocity_kind}, "
                 f"nb={pt.nb_logical}, "
                 f"fit samples={len(_sample_plan.plan_z(mpa_plan))})")
+        elif direct_only_shared_pole:
+            inputs.print_fn(
+                f"    SC head: {velocity_kind} + live Fermi-surface Drude "
+                f"and static Thomas-Fermi direct head "
+                f"(nb={pt.nb_logical}, samples={len(head_omegas)}; no wings)")
         else:
             inputs.print_fn(
                 f"    SC head: {velocity_kind} + current-basis wings "
@@ -6013,15 +6018,14 @@ def load_head_velocity_source(
     sym,
     wfn,
     meta,
+    material_class,
     print_fn=print,
 ):
     """Resolve ``sc_head_update`` to the head's velocity source, or None.
 
-    DISABLED ON METALS (owner ruling 2026-09-17): both modes refuse at
-    ``gw_config.validate_material_inputs`` (``GATE
-    metal_sc_head_update_disabled``) pending the owner's replacement head
-    model, so on a metal this resolver is only ever called with ``off``.
-    The code below is kept for insulators and for that replacement.
+    On an ordered shared-pole metal, ``dft_velocity`` uses the authenticated
+    dipole for the direct-only head. Other metal velocity-head routes retain
+    the named refusal in ``gw_config.validate_material_inputs``.
 
     The ONE place the mode string turns into an object.  Both metal modes
     read the artifact ``get_dipole_mtxels --parallel-transport`` writes;
@@ -6034,9 +6038,9 @@ def load_head_velocity_source(
 
     ``dft_velocity``
         the exact DFT p-matrix velocity stage ONLY, through
-        ``load_dft_velocity_head``.  ``load_parallel_transport_head`` is
-        not called, not imported, and not reachable on this path; the mode
-        therefore has no finite-link derivative of Delta H.
+        ``load_dft_velocity_head`` on insulators. The admitted metallic
+        shared-pole direct head reads the same authenticated operator from
+        ``dipole.h5``. Neither route has a finite-link derivative of Delta H.
 
     Returns None for ``off``, which preserves the fixed-DFT head exactly.
 
@@ -6073,6 +6077,17 @@ def load_head_velocity_source(
         where=f"sc_head_update={mode}", trs_measured=trs_measured)
 
     from file_io.paths import resolve_input_path
+
+    from gw.gw_config import uses_metal_direct_drude_head
+    if material_class == "metal" and uses_metal_direct_drude_head(config):
+        from .qsgw_head import load_dft_dipole_head
+        source = load_dft_dipole_head(
+            input_dir, mesh=mesh, wfn=wfn, meta=meta, config=config)
+        print_fn(
+            "  SC head: authenticated DFT dipole velocity, rotated into "
+            "this map's QP basis; live Fermi-surface Drude and static "
+            "Thomas-Fermi direct head, without wings")
+        return source
 
     pt_path = resolve_input_path(
         input_dir, config.paths.parallel_transport_file)
@@ -6362,7 +6377,7 @@ def run_sc_driver(
 
     parallel_transport = load_head_velocity_source(
         config, input_dir, mesh=mesh_xy, sym=sym, wfn=wfn, meta=meta,
-        print_fn=print_fn)
+        material_class=material_class, print_fn=print_fn)
     fixed_dft_head_response = None
     if (parallel_transport is None
             and config.head.correction is HeadCorrection.FULL

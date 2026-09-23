@@ -34,9 +34,11 @@ full zone unfolded by the measured magnetic group.  The wing/body fold of a
 signed store is NOT implemented (owner scope 2026-09-21), so
 ``head_correction = full`` refuses on an ordered store by name; the
 delivered ordered head is direct-term-only and on the one-shot and
-``sc_head_update = off`` routes carries no intraband Drude/Thomas-Fermi
-piece (KNOWN_LORRAX_ISSUES, one-shot metal head).  Certified by
-``tests/test_head_direct_ordered.py``.
+``sc_head_update = off`` routes carry no intraband Drude/Thomas-Fermi
+piece. The direct-only SC route may instead select ``dft_velocity``: it
+rotates the authenticated DFT dipole into each map's QP basis and uses that
+map's Fermi-surface weights in the common Drude/Thomas-Fermi kernels. The
+ordered interband tensor is checked in ``tests/test_head_direct_ordered.py``.
 """
 from types import SimpleNamespace
 from functools import lru_cache

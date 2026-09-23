@@ -149,24 +149,27 @@ interpretable. A production self-consistent run must satisfy:
   interpolation limitation outside the publication window, not a state-label
   or f-transform-scale correction.
 
-## Metals: velocity head updates are disabled (owner ruling 2026-09-17)
+## Metals: direct Drude head
 
-On a metal the self-consistent loop runs with the existing MPA head model
-only. Every velocity head update and every other nontrivial metal head
-correction outside that model is **disabled by named refusal** pending the
-owner's replacement head model. The code is kept, not deleted. The metal
-test is the one owner, `gw_config.infer_material_class` on the WFN
-occupations, and the refusal fires at `validate_material_inputs` before
-anything is built.
+The default `sc_head_update = off` retains the fixed DFT direct response
+without an intraband term. For an ordered shared-pole metal with
+`head_correction = no_local_fields`, `sc_head_update = dft_velocity` instead
+uses the authenticated `dipole.h5` velocity rotated into each map's QP basis,
+the current fixed-N Fermi level and tetrahedron surface weights. The common
+head kernel adds the dynamic Drude tensor at nonzero frequency and substitutes
+the Thomas–Fermi static limit at zero frequency. Charge and screened-charge
+plus bare-transverse runs use this same direct-head route. It does not build
+wings or fold through the body W. The 2026-09-17 refusal remains for other
+metal velocity-head configurations.
 
 | Status on a metal | What | Where |
 |---|---|---|
-| **kept** | fixed DFT direct response (dipole.h5 velocity, S/Y/Z wings, no surface weights, no Thomas-Fermi value), folded through each map's W and fitted as one scalar MPA head | `qsgw_head.build_dft_head_response`; `mpa.model.fit_head_samples`; `shared_pole_head.build_shared_pole_head`; closed-form Sigma head in `head_correction` |
-| disabled | `sc_head_update = parallel_transport` (finite-link covariant velocity, ΔH manifold) and `dft_velocity` (DFT p-matrix velocity rotated per map) | `sc_iteration.load_head_velocity_source`, `qsgw_head.build_iteration_head_response` |
-| disabled (reached only through the above) | Drude tensor added as D/(ω+iη)²; tetrahedron Fermi-surface weights; the near-degenerate interband branch on those weights; Thomas-Fermi static head and its wing fold | `qsgw_head.head_drude_tensor_sharded`, `sc_iteration._solve_head_occupations`, `qsgw_head._interband_degenerate_weight`, `qsgw_head._fold_static_kappa2` |
+| default | fixed DFT direct response, no surface weights or Thomas–Fermi value | `qsgw_head.build_dft_head_response`; `shared_pole_head.build_shared_pole_head` |
+| admitted for shared-pole `no_local_fields` | `dft_velocity`: current-map QP rotation and occupation, tetrahedron weights, dynamic Drude and static Thomas–Fermi direct head | `qsgw_head.build_iteration_head_response`; `sc_iteration._solve_head_occupations` |
+| refused | `parallel_transport` on metals and `dft_velocity` with full local-field folding | `gw_config.validate_material_inputs` |
 | disabled | `occ_broadening > 0` beside a metal width (the MP1 smeared-head dial) | parse, `gw_config._validate_occupation_smearing` |
 
-Both refusals carry `GATE metal_sc_head_update_disabled`. Metallic
+The remaining refusals carry `GATE metal_sc_head_update_disabled`. Metallic
 occupations are Fermi-Dirac only (`occ_smearing_width_ry` is kBT; the family
 key is removed), and every metal occupation solve in the map (entry state,
 WFN startup gate, density rebuild, certified-fit replay) uses that family.

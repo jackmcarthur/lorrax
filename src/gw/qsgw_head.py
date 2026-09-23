@@ -35,6 +35,7 @@ __all__ = [
     "finalize_iteration_head_sample",
     "finalize_iteration_head_samples",
     "load_dft_velocity_head",
+    "load_dft_dipole_head",
     "load_parallel_transport_head",
     "reduced_covector_to_cartesian",
     "rotate_velocity_active_to_qp",
@@ -581,6 +582,31 @@ def load_dft_velocity_head(
         velocity_dft_cart=velocity,
         nb_logical=nb,
         reciprocal_lattice_cart=reciprocal,
+    )
+
+
+def load_dft_dipole_head(input_dir, *, mesh: Mesh, wfn, meta, config):
+    """Use the authenticated charge dipole for a direct-only metallic head."""
+    import os
+    from runtime.padding import padded_axis
+
+    if int(meta.b_id_0) != 0:
+        raise ValueError("metal direct head requires a band manifold starting at 0")
+    velocity = read_authenticated_dipole_velocity(
+        os.path.join(input_dir, "dipole.h5"), wfn=wfn, meta=meta,
+        config=config)
+    nb = int(meta.b_id_4_chi_user)
+    axis = padded_axis(
+        nb, mesh, name="metal direct-head band carrier",
+        specs=((P(None, None, "x", None), 2),
+               (P(None, None, None, "y"), 3)))
+    velocity = np.pad(velocity,
+                      ((0, 0), (0, 0), (0, axis.pad), (0, axis.pad)))
+    return DftVelocityHeadData(
+        velocity_dft_cart=device_put_process_local(
+            velocity, NamedSharding(mesh, P(None, None, "x", "y"))),
+        nb_logical=nb,
+        reciprocal_lattice_cart=np.asarray(wfn.bvec) * float(wfn.blat),
     )
 
 
