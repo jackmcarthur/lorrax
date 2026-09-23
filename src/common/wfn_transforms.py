@@ -470,8 +470,37 @@ def to_rpoints_inner(
     *,
     norm: str = "backward",
     kvecs_frac: jax.Array | None = None,
+    k_tile: int | None = None,
 ) -> jax.Array:
-    """The arbitrary-point twin of :func:`to_rchunk_inner`; see docs/architecture/zeta_fit_face_psi_cct.md."""
+    """The arbitrary-point twin of :func:`to_rchunk_inner`; see docs/architecture/zeta_fit_face_psi_cct.md.
+
+    ``k_tile`` bounds the live FFT box to that many leading k rows: the rows
+    are transformed tile by tile in a ``lax.map`` and the gathered points
+    are stacked back in k order.  Every k row is an independent transform,
+    so the result is the untiled one.  The tile must divide the k extent
+    (``gw.gflat_memory_model.zeta_fft_k_tile`` picks such a divisor), so no
+    pad k row exists.
+    """
+    nk = int(psi.shape[0])
+    if k_tile is not None and int(k_tile) < nk:
+        kt = int(k_tile)
+        if kt <= 0 or nk % kt:
+            raise ValueError(
+                f"to_rpoints_inner: k_tile={kt} must be a positive divisor "
+                f"of the {nk} k rows")
+        n_t = nk // kt
+
+        def _tiles(x):
+            return x.reshape(n_t, kt, *x.shape[1:])
+
+        def _one_tile(args):
+            psi_t, g_t, kv_t = args
+            return to_rpoints_inner(
+                psi_t, g_t, fft_grid, r_flat_idx, norm=norm, kvecs_frac=kv_t)
+
+        kv = None if kvecs_frac is None else _tiles(kvecs_frac)
+        out = jax.lax.map(_one_tile, (_tiles(psi), _tiles(g_index), kv))
+        return out.reshape(nk, *out.shape[2:])
     ngkmax = int(psi.shape[-1])
     fft_grid_t = tuple(int(s) for s in fft_grid)
     nx, ny, nz = fft_grid_t

@@ -129,16 +129,18 @@ def test_run50_matched_deck_selects_bounded_y_cache_without_full_grid_cache():
     assert plan.budget_bytes == 60.0e9
     assert plan.target_utilization == 0.78
     assert plan.centroid_fft_bytes == 5_760_000_000
-    assert plan.zeta_transform_fft_bytes == 12_960_000_000
+    # Streamed: one 16-k tile of the 36 rows (no parent count given).
+    assert plan.zeta_k_chunk == 16
+    assert plan.zeta_transform_fft_bytes == 5_760_000_000
     assert plan.psi_layout_bytes == 176_947_200
     assert plan.persistent_bytes == 7_925_407_200
-    assert plan.p_min == 8
+    assert plan.p_min == 4
     assert plan.r_chunk == 46_220
     assert plan.n_r_chunks == 31
     assert plan.face_y_cache_bytes == 6_815_416_320
     assert plan.peak_breakdown["A_centroid_load"] == 13_685_407_200
     assert plan.peak_breakdown["C_fit_one_rchunk"] == 30_825_047_520
-    assert plan.peak_breakdown["C_face_y_cache_build"] == 28_769_833_440
+    assert plan.peak_breakdown["C_face_y_cache_build"] == 21_569_833_440
     assert "C_face_y_cache_build" in plan.peak_breakdown
 
 
@@ -153,11 +155,11 @@ def test_cri3_prices_bounded_centroid_and_full_k_zeta_ffts_separately():
     persistent = plan.persistent_bytes
     assert plan.peak_breakdown["A_centroid_load"] - persistent == 5_760_000_000
     assert plan.centroid_fft_bytes == 5_760_000_000
-    assert plan.zeta_transform_fft_bytes == 12_960_000_000
-    # Cache-free run50 executes the full-nk transform inside the separate
+    assert plan.zeta_transform_fft_bytes == 5_760_000_000
+    # Cache-free run50 executes one 16-k zeta tile inside the separate
     # current-r Y-cache build peak, never inside Stage A's centroid tile.
     assert plan.peak_breakdown["C_face_y_cache_build"] > (
-        persistent + 12_960_000_000)
+        persistent + 5_760_000_000)
 
     hoisted = _synthetic_plan(budget=80.0)
     assert hoisted.cache_psi_r
@@ -244,7 +246,7 @@ def test_run158_cliff_uses_two_41472_tiles_and_prices_compact_redistribution():
     assert (tiled.peak_breakdown["C_face_y_cache_build"]
             - full.peak_breakdown["C_face_y_cache_build"]
             == completed_z_tile)
-    assert tiled.peak_breakdown["C_face_y_cache_build"] == 23_699_800_800
+    assert tiled.peak_breakdown["C_face_y_cache_build"] == 16_499_800_800
     assert tiled.peak_breakdown["C_face_tile_concat"] == 7_310_858_976
     assert tiled.hwm_bytes == 28_990_135_008
 

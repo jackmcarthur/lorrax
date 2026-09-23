@@ -1436,6 +1436,11 @@ def _z_q_face_parent(
 			f"band_chunk_carrier={bpd_max_global}, local width={bpd_max}, "
 			f"world_size={P_total}")
 	n_bc = len(bcr)
+	# The streamed source transforms the store's k rows one planner-priced
+	# tile at a time (``zeta_fft_k_tile``: the rule the memory plan prices).
+	from gw.gflat_memory_model import zeta_fft_k_tile
+	zeta_k_tile = zeta_fft_k_tile(
+		n_k_rows=n_parent, band_chunk=bpd_max_global, p_band=P_total)
 	_y_compact_idx_np, _y_compact_identity = _band_chunk_compaction(
 		bcr, bpd_max, P_total)
 	_b_lo_rel_np = np.asarray([lo - _bfs for (lo, _hi) in bcr], dtype=np.int32)
@@ -1482,6 +1487,7 @@ def _z_q_face_parent(
 		use_psi_r_cache, bool(gamma_L), bool(gamma_R), bool(coupled_mu123),
 		(None if psi_r_cache is None
 		 else tuple(int(s) for s in psi_r_cache.shape)),
+		(None if use_psi_r_cache else int(zeta_k_tile)),
 	)
 	if cache_key not in _pair_pipeline_sm_cache:
 
@@ -1513,7 +1519,8 @@ def _z_q_face_parent(
 						x_idx, y_idx, bc_idx, ordered=False)
 					slab = to_rpoints_inner(
 						psi_G_bc, g_index_dev, fft_grid, r_index_,
-						kvecs_frac=kvecs_frac_dev, norm="ortho")
+						kvecs_frac=kvecs_frac_dev, norm="ortho",
+						k_tile=zeta_k_tile)
 				slab = jnp.where(active[None, None, None, :], slab, 0)
 				col = jax.lax.all_to_all(
 					slab, 'y', split_axis=3, concat_axis=1, tiled=True)
