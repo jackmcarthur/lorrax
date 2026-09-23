@@ -48,7 +48,7 @@ def charge_representation(meta):
     two-component source WFN identity; it does not add current vertices here.
     """
     nspinor = int(meta.nspinor)
-    source_spinor = int(meta.nspinor_wfnfile)
+    source_spinor = int(getattr(meta, "nspinor_wfnfile", nspinor))
     return (nspinor == 1 or (nspinor == 2 and source_spinor == 2)
             or (nspinor == 4 and source_spinor == 2))
 
