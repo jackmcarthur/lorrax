@@ -230,7 +230,7 @@ def test_compute_screening_spills_an_earlier_role_before_a_later_roles_build(
     monkeypatch.setattr(screening, "compute_static_w", _fake_compute_static_w)
     monkeypatch.setattr(screening, "_gate_w", lambda *a, **k: None)
     monkeypatch.setattr(
-        "gw.minimax_screening.build_imag_quadrature",
+        "gw.minimax_screening.build_imag_probe_response_rule",
         lambda *a, **k: "unused-quad-stand-in")
 
     requests = [ScreeningRequest(0.0 + 0.0j, "static"),

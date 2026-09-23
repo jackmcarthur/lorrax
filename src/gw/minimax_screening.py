@@ -1341,6 +1341,67 @@ def build_imag_quadrature(quad, omega_p, minimax_config, *, print_fn=None,
     return quad_imag
 
 
+def build_imag_probe_response_rule(quad, omega_p, minimax_config, *,
+                                   print_fn=None, with_odd_kernel=False):
+    """GN-PPM χ₀(iω_p) quadrature from the analytic response rule.
+
+    The same ``minimax.response_laplace_rule`` the shared-pole bank samples
+    χ₀ with (elliptic decay rates, Ritz times, continuum residual
+    certificate; ``docs/theory/response-laplace.md``) places the times here,
+    on the static window ``[quad.x_min, quad.x_max]`` at the single sample
+    ``z = iω_p``.  Its even target ``d/(d²-z²) = x/(x²+ω_p²)`` is the kernel
+    :func:`build_imag_quadrature` fits by runtime minimax; its ordered target
+    ``z/(d²-z²) = iω_p/(x²+ω_p²)`` is ``i`` times that function's odd kernel,
+    on the SAME times, so no greedy augmentation is needed.  The rule's
+    coefficients multiply ``exp(-(x - x_min) t)`` (reference = ``x_min``), so
+    ``alpha = c * exp(x_min t)`` restores this module's ``exp(-tau x)`` form.
+    ``minimax_target_error`` is used as the rule's relative tolerance; the
+    returned ``max_error`` / ``max_error_odd`` are absolute, measured on a
+    dense log grid of the window, for the incumbent log line and gates.
+    """
+    x_min, x_max = float(quad.x_min), float(quad.x_max)
+    omega_p = float(omega_p)
+    tol = float(minimax_config.target_error)
+    rule = _mm.response_laplace_rule(
+        x_min, x_max, np.asarray([1j * omega_p]), rel_tol=tol,
+        ordered=bool(with_odd_kernel), reference_ry=x_min)
+    tau = np.asarray(rule["t"], dtype=np.float64)
+    shift = np.exp(x_min * tau)
+    even = np.asarray(rule["projection_value"])[0]
+    if np.max(np.abs(even.imag)) > 1e-10 * max(np.max(np.abs(even.real)), 1e-300):
+        raise ValueError("GATE gn_ppm_analytic_probe_real: even coefficients of "
+                         f"x/(x^2+w^2) are not real (max |Im| {np.max(np.abs(even.imag)):.3e})")
+    alpha = even.real * shift
+    x = np.geomspace(x_min, x_max, 4001)
+    basis = np.exp(-np.outer(x, tau))
+    err = float(np.max(np.abs(basis @ alpha - x / (x * x + omega_p * omega_p))))
+    alpha_odd, err_odd = None, float("nan")
+    if with_odd_kernel:
+        odd = np.asarray(rule["odd_projection_value"])[0] / 1j
+        if np.max(np.abs(odd.imag)) > 1e-10 * max(np.max(np.abs(odd.real)), 1e-300):
+            raise ValueError("GATE gn_ppm_analytic_probe_real: odd coefficients of "
+                             f"w/(x^2+w^2) are not real (max |Im| {np.max(np.abs(odd.imag)):.3e})")
+        alpha_odd = odd.real * shift
+        err_odd = float(np.max(np.abs(basis @ alpha_odd - omega_p / (x * x + omega_p * omega_p))))
+    cert = rule["certificate"]
+    provenance = (f"analytic response_laplace_rule, certificate {cert['status']} "
+                  f"bound {float(cert['maximum_bound']):.2e} (rel_tol {tol:.1e}), "
+                  f"digest {str(rule['node_digest'])[:12]}")
+    out = LaplaceMinimaxQuadrature(
+        x_min=x_min, x_max=x_max, tau=tau, alpha=alpha, max_error=err,
+        provenance=provenance, alpha_odd=alpha_odd, max_error_odd=err_odd,
+        n_odd_extra=0)
+    if print_fn is not None:
+        print_fn(
+            f"  PPM imag-freq quadrature (ωp={omega_p:.4f} Ry): R={x_max / x_min:.1f}, "
+            f"nodes={out.node_count}, err~{err:.1e}  [{provenance}]")
+        if alpha_odd is not None:
+            print_fn(
+                "  PPM imag-freq ODD kernel ωp/(x²+ωp²) (ordered orientations, TR-odd "
+                f"channel): same {out.node_count} times, err~{err_odd:.1e}")
+    return out
+
+
 def build_real_quadrature(quad, Omega, minimax_config, *, print_fn=None):
     """Build real-frequency (HL-PPM) χ₀(Ω) quadrature without a new minimax kernel.
 
