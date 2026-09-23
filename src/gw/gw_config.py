@@ -1426,6 +1426,10 @@ _DEFAULTS = {
     # Zero preserves the historical window exactly.  Nonzero values are
     # interpreted only by qp_solver=self_consistent.
     "sc_buffer_nbands": 0,
+    # Owner 2026-09-23: the lowest N bands (1-based 1..N; semicore) are held
+    # at their DFT Hamiltonian block in every QSGW map -- still in the Sigma_x
+    # and chi0 sums, never updated.  0 updates every QP-window band.
+    "sc_frozen_core_bands": 0,
     "sc_buffer_mode": "diagonal",  # diagonal | one_sided | carry
     # Optional fourth text output beside the ordinary one-shot eqp0/eqp1
     # pair.  This iterates ONLY the eigenvalues/eigenvectors against the
@@ -2752,6 +2756,7 @@ def _input_iteration(
             params["sc_exact_degeneracy_tol_ev"]),
         tail_fit=str(params["sc_tail_fit"]).strip().lower(),
         buffer_nbands=int(params["sc_buffer_nbands"]),
+        frozen_core_bands=int(params["sc_frozen_core_bands"]),
         buffer_mode=str(params["sc_buffer_mode"]).strip().lower(),
         eigh=_linalg.sc_eigh,
         head_update=str(params["sc_head_update"]).strip().lower(),
@@ -4257,6 +4262,7 @@ class SCConfig:
     exact_degeneracy_tol_ev: float = 1.0e-4
     tail_fit: str = "conduction_mean"
     buffer_nbands: int = 0
+    frozen_core_bands: int = 0
     buffer_mode: str = "diagonal"
     eigh: str = "auto"    # "auto" | "native" | "distributed"
     #: "off" | "parallel_transport" | "dft_velocity".  The two non-off
@@ -4307,6 +4313,8 @@ class SCConfig:
                 f"got {self.tail_fit!r}.")
         if self.buffer_nbands < 0:
             raise ValueError("sc_buffer_nbands must be >= 0.")
+        if self.frozen_core_bands < 0:
+            raise ValueError("sc_frozen_core_bands must be >= 0.")
         if self.buffer_mode not in ("diagonal", "one_sided", "carry"):
             raise ValueError(
                 "sc_buffer_mode must be 'diagonal', 'one_sided' or 'carry'; "

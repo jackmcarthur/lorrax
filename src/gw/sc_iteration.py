@@ -474,6 +474,24 @@ def _apply_sc_buffer_partition(
         in_range_mask=partition.in_range_mask)
 
 
+def _freeze_core_block_to_dft(H, e_dft_kn_ry, n_frozen):
+    """Hold bands ``[0, n_frozen)`` at the DFT Hamiltonian block.
+
+    In the DFT basis that block is ``diag(E_DFT)`` with no coupling to the
+    other bands, so the frozen states keep their DFT energies and orbitals
+    exactly.  Only the logical ``[:n_frozen]`` energies are read; padded
+    carrier columns are untouched.
+    """
+    nb = H.shape[-1]
+    idx = jnp.arange(nb)
+    frozen = idx < int(n_frozen)
+    either = frozen[:, None] | frozen[None, :]
+    H = jnp.where(either[None], jnp.zeros((), H.dtype), H)
+    e = jnp.asarray(e_dft_kn_ry)[:, :int(n_frozen)].astype(H.dtype)
+    diag = jnp.diagonal(H, axis1=-2, axis2=-1).at[:, :int(n_frozen)].set(e)
+    return H.at[:, idx, idx].set(diag)
+
+
 @jax.jit
 def _carry_sc_buffer_diagonal(H_new, H_input, buffer_mask):
     """Replace buffer diagonals by the preceding map input's references."""
@@ -3887,6 +3905,19 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     # block and can create symmetry breaking in the next SC state. BGW
     # diagonal averaging belongs to the one-shot/output convention.
     H_qp_dft_full = inputs.kin_ion_dft + delta_h_dft
+    n_frozen_core = int(inputs.config.sc.frozen_core_bands)
+    if n_frozen_core > 0:
+        # Owner 2026-09-23 (CrI3): semicore off the Sigma grid is not updated
+        # at all -- neither Sigma(omega=0) nor a scissor -- but stays in every
+        # band sum.  H is on the loop's k-set; take the same rows of E_DFT.
+        _e_frz = inputs.e_dft_active_kn_ry
+        if not ks.is_identity:
+            _e_frz = ks.select(_e_frz)
+        H_qp_dft_full = _freeze_core_block_to_dft(
+            H_qp_dft_full, _e_frz, n_frozen_core)
+        if int(state.iteration) == 0:
+            _record_sc(inputs, f"    SC frozen core: bands 1-{n_frozen_core} "
+                               "held at their DFT block (not updated)")
     if (buffer_mask.any()
             and inputs.config.sc.buffer_mode == "carry"
             and int(state.iteration) > 0):
