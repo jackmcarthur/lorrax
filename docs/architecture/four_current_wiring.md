@@ -23,7 +23,7 @@ disagree with this one, they win — this page owns the *wiring* only.
 
 ## The routes
 
-`bispinor_gw` has two values on one four-spinor carrier. It selects which
+`bispinor_gw` has three values on one four-spinor carrier. It selects which
 Lorentz blocks are screened and which Sigma owner contracts them; it does not
 select a carrier.
 
@@ -115,8 +115,8 @@ The three predicates, all in `src/gw/gw_config.py`:
 `uses_coupled_photon_head` (`:3873`) adds `head.correction is FULL` on top and
 decides **only** whether `gw_init` keeps the four literal-Γ channel vectors.
 
-**`BispinorGWMode` has TWO members** (`:289`), `bare_transverse` and
-`full_static_cohsex`, and they resolve to the SAME carrier — the axis picks
+**`BispinorGWMode` has three members**: `bare_transverse`,
+`full_static_cohsex`, and `full_shared_pole`. They resolve to the SAME carrier — the axis picks
 which Lorentz blocks are screened, never which four-spinor represents them.
 Three retired spellings refuse by name from ONE table,
 `_RETIRED_BISPINOR_GW_MODES` (`:324`, read by `coerce_bispinor_gw_mode`
@@ -224,7 +224,7 @@ object each key ends up on and who reads it.
 | key | default (`gw_config.py`) | lands on | route |
 |---|---|---|---|
 | `bispinor` | `False` (`:1690`, parse `:5947`) | `config.bispinor` (`:5050`) — the master switch | both |
-| `bispinor_gw` | `bare_transverse` (parse via `coerce_bispinor_gw_mode` `:353`; enum `:289`, **two** members; three retired spellings in `_RETIRED_BISPINOR_GW_MODES` `:324`; config construction `:5948`) | `config.bispinor_gw` | both |
+| `bispinor_gw` | `bare_transverse` (parse via `coerce_bispinor_gw_mode`; three members; retired spellings in `_RETIRED_BISPINOR_GW_MODES`) | `config.bispinor_gw` | all routes |
 | `centroids_file_current` | `""` (`:1514`, parse `:5435-5443`) | `config.paths.centroids_file_current` (`:3274`) | both |
 | `head_correction` | `full` (`:2011`, coerced `:548`, read `:5451`, built into `HeadConfig` `:5474`) | `config.head.correction` (`:5064`) | both |
 | ~~`bispinor_tt_head_correction`~~ | **REMOVED as a deck key 2026-09-01**; the field is wired to `False` (`gw_config.py:5495`) for the incumbent V-tile builder | `config.head.bispinor_tt_head_correction` | **B only**, and now only from a hand-built config |

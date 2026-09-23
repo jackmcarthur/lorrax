@@ -11,7 +11,7 @@ place that turns a model name into those carrier decisions
 ISDF fits, the exact Hartree, the scalar head producer and the Sigma
 dispatch never derive the representation split on their own.
 
-Models -- BOTH of them (the deck grammar has two values since 2026-09-01;
+Models -- all three of them (the deck grammar added `full_shared_pole` in 2026-09;
 the two carrier-comparison spellings were retired, ``gw_config``'s
 ``_RETIRED_BISPINOR_GW_MODES``):
 
@@ -68,7 +68,7 @@ def resolve_four_current_representation(
 ) -> FourCurrentRepresentation:
     """Resolve all carrier decisions without importing the GW driver.
 
-    ``model`` is accepted and ignored: both shipped ``bispinor_gw`` values
+    ``model`` is accepted and ignored: all shipped ``bispinor_gw`` values
     ride the raw kinetic-balance carrier.  The parameter stays so the call
     sites keep naming the mode they resolved -- when a phase-3 mode needs a
     different carrier, this is the one function that has to learn about it.

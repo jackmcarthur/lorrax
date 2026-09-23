@@ -216,8 +216,8 @@ _RETIRED_BISPINOR_GW_MODES: dict[str, tuple[str, str, str]] = {
         "this was a carrier-comparison mode, not a physics mode: it kept "
         "the normalized QE Pauli two-spinor for charge/CC while the "
         "current vertices stayed raw kinetic balance, and it could never "
-        "restart or write restart tensors.  The shipped grammar has two "
-        "values, both on the raw kinetic-balance carrier; a carrier study "
+        "restart or write restart tensors.  All shipped modes use the raw "
+        "kinetic-balance carrier; a carrier study "
         "belongs in a branch, not in the deck grammar (lane J section 2)"),
     "isometric_kinetic_balance_bare_transverse": (
         "bispinor_gw_isometric_kinetic_balance_retired",

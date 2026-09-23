@@ -1480,7 +1480,7 @@ def _resolve_zeta_fit_contract(
 
 	representation = resolve_four_current_representation(
 		cfg.bispinor, cfg.bispinor_gw)
-	# One carrier for both shipped bispinor_gw values (the raw kinetic
+	# One carrier for all shipped bispinor_gw values (the raw kinetic
 	# balance lift), so the zeta provenance names no alternate lift.  The
 	# two comparison carriers that did were retired from the deck grammar
 	# on 2026-09-01 (gw_config._RETIRED_BISPINOR_GW_MODES).
