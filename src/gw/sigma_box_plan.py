@@ -57,8 +57,8 @@ _BOX_SIGN_FRACTION = 0.7
 #: metal<->insulator flip or a genuine rule-validity failure.
 _SC_WINDOW_PAD_EV = 2.0
 #: Pad toward zero for a sign-definite SC window: 0.5 of its distance escaped by 1.6% on TaAs 8^3
-#: map 1 (semimetal valence state approaching E_F; owner 2026-09-22 asked to get the run through).
-_SC_ZERO_SIDE_CAP = 0.25
+#: map 1 and 0.25 again at map 2 (semimetal valence state 30 -> 15 -> 6 meV from E_F); 0.05 floors it below 1 meV.
+_SC_ZERO_SIDE_CAP = 0.05
 _RULE_CACHE_SCHEMA = "sigma-box-ry-v4"
 
 
