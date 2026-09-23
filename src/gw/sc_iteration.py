@@ -3620,7 +3620,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             # Y and Z are built directly from the two centroid-sharded
             # wavefunction copies.  Their band-pair tiles are distributed
             # over the full Px*Py mesh and frequency-blocked in each ring.
-            wfns_qp=wfns_qp,
+            wfns_qp=(None if direct_only_shared_pole else wfns_qp),
             eta_ry=(0.0 if mpa_mode else None),
             occupation_state=entry_occ_state,
         )
@@ -3641,6 +3641,11 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
                 f"ISDF wings on the exact MPA z grid ({velocity_kind}, "
                 f"nb={pt.nb_logical}, "
                 f"fit samples={len(_sample_plan.plan_z(mpa_plan))})")
+        elif direct_only_shared_pole:
+            inputs.print_fn(
+                f"    SC head: {velocity_kind} + live Fermi-surface Drude "
+                f"and static Thomas-Fermi direct head "
+                f"(nb={pt.nb_logical}, samples={len(head_omegas)}; no wings)")
         else:
             inputs.print_fn(
                 f"    SC head: {velocity_kind} + current-basis wings "
@@ -4629,6 +4634,32 @@ def _dump_sc_rotation(
     return path
 
 
+def _dump_sc_sigma_lorentz(inputs: SCInputs, state_out: SCState,
+                           *, call_index: int, role: str) -> None:
+    """Persist the small sector matrices with their defining QP rotation."""
+    if not inputs.config.debug.sigma_lorentz_debug_output:
+        return
+    result = state_out.outputs.sigma_result
+    if result.sigma_lorentz_skij_ry is None:
+        return
+    from common.collectives import gather_to_host
+    from file_io.sigma_output import write_sc_sigma_lorentz_h5
+
+    parts = np.asarray(gather_to_host(result.sigma_lorentz_skij_ry)) * RYD_TO_EV
+    rotation = np.asarray(gather_to_host(state_out.outputs.sigma_basis_U))
+    kpoints = np.asarray(inputs.sym.unfolded_kpts)
+    if inputs.kstar is not None and not inputs.kstar.is_identity:
+        kpoints = np.asarray(gather_to_host(
+            inputs.kstar.select(jnp.asarray(kpoints))))
+    path = os.path.join(
+        inputs.input_dir, f"sigma_lorentz_iter{int(call_index):04d}.h5")
+    write_sc_sigma_lorentz_h5(
+        path, parts, rotation, kpoints, call_index=call_index, role=role,
+        kset=result.kset, band_start_1based=int(inputs.band_slices.b0) + 1)
+    _record_sc(inputs, f"  SC Lorentz matrices: {path} "
+               "(CC, CT+TC, TT; input QP basis, eV)")
+
+
 def _band_ranges(mask, *, band_offset: int) -> str:
     """Format bands selected at every k as compact 1-based ranges."""
     mask = np.asarray(mask, dtype=bool)
@@ -4982,6 +5013,8 @@ def _write_sc_eqp_snapshot(
 
     rotation_path = _dump_sc_rotation(
         inputs, state_out, call_index=call_index)
+    _dump_sc_sigma_lorentz(
+        inputs, state_out, call_index=call_index, role=role)
 
     if role != "trial" and not verdict.converged:
         _write_sc_seed(inputs, state_out)
@@ -5186,14 +5219,16 @@ def _write_sc_seed(inputs, state):
 
 
 def _clear_sc_eqp_snapshots(input_dir: str, *, print_fn=print) -> None:
-    """Remove only managed per-map text snapshots from an earlier run."""
+    """Remove managed EQP and Lorentz map snapshots from an earlier run."""
     from .qsgw_utils import remove_managed
 
     removed = remove_managed(
-        input_dir, r"(?:eqp0|eqp1|z_factor)_iter[0-9]{4}\.dat\Z",
+        input_dir,
+        r"(?:(?:eqp0|eqp1|z_factor)_iter[0-9]{4}\.dat|"
+        r"sigma_lorentz_iter[0-9]{4}\.h5)\Z",
         barrier_tag="sc.eqp_snapshots.clear", print_fn=print_fn)
     if removed:
-        print_fn(f"  SC map energies: cleared {len(removed)} stale snapshots")
+        print_fn(f"  SC map diagnostics: cleared {len(removed)} stale snapshots")
 
 
 def _clear_sc_rotation_snapshots(
@@ -6064,15 +6099,14 @@ def load_head_velocity_source(
     sym,
     wfn,
     meta,
+    material_class,
     print_fn=print,
 ):
     """Resolve ``sc_head_update`` to the head's velocity source, or None.
 
-    DISABLED ON METALS (owner ruling 2026-09-17): both modes refuse at
-    ``gw_config.validate_material_inputs`` (``GATE
-    metal_sc_head_update_disabled``) pending the owner's replacement head
-    model, so on a metal this resolver is only ever called with ``off``.
-    The code below is kept for insulators and for that replacement.
+    On an ordered shared-pole metal, ``dft_velocity`` uses the authenticated
+    dipole for the direct-only head. Other metal velocity-head routes retain
+    the named refusal in ``gw_config.validate_material_inputs``.
 
     The ONE place the mode string turns into an object.  Both metal modes
     read the artifact ``get_dipole_mtxels --parallel-transport`` writes;
@@ -6085,9 +6119,9 @@ def load_head_velocity_source(
 
     ``dft_velocity``
         the exact DFT p-matrix velocity stage ONLY, through
-        ``load_dft_velocity_head``.  ``load_parallel_transport_head`` is
-        not called, not imported, and not reachable on this path; the mode
-        therefore has no finite-link derivative of Delta H.
+        ``load_dft_velocity_head`` on insulators. The admitted metallic
+        shared-pole direct head reads the same authenticated operator from
+        ``dipole.h5``. Neither route has a finite-link derivative of Delta H.
 
     Returns None for ``off``, which preserves the fixed-DFT head exactly.
 
@@ -6124,6 +6158,17 @@ def load_head_velocity_source(
         where=f"sc_head_update={mode}", trs_measured=trs_measured)
 
     from file_io.paths import resolve_input_path
+
+    from gw.gw_config import uses_metal_direct_drude_head
+    if material_class == "metal" and uses_metal_direct_drude_head(config):
+        from .qsgw_head import load_dft_dipole_head
+        source = load_dft_dipole_head(
+            input_dir, mesh=mesh, wfn=wfn, meta=meta, config=config)
+        print_fn(
+            "  SC head: authenticated DFT dipole velocity, rotated into "
+            "this map's QP basis; live Fermi-surface Drude and static "
+            "Thomas-Fermi direct head, without wings")
+        return source
 
     pt_path = resolve_input_path(
         input_dir, config.paths.parallel_transport_file)
@@ -6413,7 +6458,7 @@ def run_sc_driver(
 
     parallel_transport = load_head_velocity_source(
         config, input_dir, mesh=mesh_xy, sym=sym, wfn=wfn, meta=meta,
-        print_fn=print_fn)
+        material_class=material_class, print_fn=print_fn)
     fixed_dft_head_response = None
     if (parallel_transport is None
             and config.head.correction is HeadCorrection.FULL

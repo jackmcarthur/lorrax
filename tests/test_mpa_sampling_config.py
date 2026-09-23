@@ -507,7 +507,7 @@ def test_a_metal_refuses_the_velocity_head_update_at_the_material_door(
     message = str(excinfo.value)
     assert message.startswith("GATE metal_sc_head_update_disabled:")
     assert f"sc_head_update = {mode}" in message
-    assert "owner ruling 2026-09-17" in message
+    assert "direct Drude head" in message
     assert "sc_head_update = off" in message
     off = _config(tmp_path, _METAL_KEYS + _SC_KEYS.replace(
         "sc_head_update = parallel_transport", "sc_head_update = off"))
@@ -515,6 +515,19 @@ def test_a_metal_refuses_the_velocity_head_update_at_the_material_door(
     insulator = _config(tmp_path, _SC_KEYS.replace(
         "sc_head_update = parallel_transport", f"sc_head_update = {mode}"))
     validate_material_inputs(insulator, "insulator")
+
+
+def test_ordered_shared_pole_direct_head_admits_live_dft_drude(tmp_path):
+    base = (_METAL_KEYS + _SC_KEYS.replace(
+        "sc_head_update = parallel_transport", "sc_head_update = dft_velocity")
+        + "sigma_w_model = shared_pole\n"
+        + "head_correction = no_local_fields\n")
+    charge = _config(tmp_path / "charge", base)
+    validate_material_inputs(charge, "metal")
+    hybrid = _config(tmp_path / "hybrid", base +
+                     "bispinor = true\n"
+                     "bispinor_gw = bare_transverse\n")
+    validate_material_inputs(hybrid, "metal")
 
 
 def test_the_width_the_solve_consumes_comes_from_the_new_key(tmp_path):

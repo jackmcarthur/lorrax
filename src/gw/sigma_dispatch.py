@@ -498,6 +498,20 @@ def _compute_live_hartree(config, meta, band_slices, mesh_xy, *, wfn, sym,
 # Dynamic-Sigma finalization (shared by every frequency ansatz)
 # ---------------------------------------------------------------------------
 
+def _qsgw_one_sided_core_mask(config, band_slices, meta):
+    """Use the same QSGW window-edge policy for total and sector readouts."""
+    sc_cfg = getattr(config, "sc", None)
+    if (sc_cfg is None or int(sc_cfg.buffer_nbands) <= 0
+            or sc_cfg.buffer_mode != "one_sided"
+            or getattr(config.qp_solver, "value", config.qp_solver)
+            != "self_consistent"):
+        return None
+    band_ids = np.arange(int(band_slices.b0), int(band_slices.b3),
+                         dtype=np.int64)
+    return ((band_ids >= int(meta.nelec) - int(config.nval))
+            & (band_ids < int(meta.nelec) + int(config.ncond)))
+
+
 def finalize_dynamic_sigma(
     sigma_c_body_omega: jax.Array,
     head_sigma_diag_w_kn_ry: np.ndarray | None,
@@ -659,18 +673,8 @@ def finalize_dynamic_sigma(
         host_rss_diag("finalize: Sigma_c(E_DFT) evaluated")
         sig_x_rep = device_put_process_local(
             sig_x, NamedSharding(mesh_xy, P(None, None, None)))
-        one_sided_core_mask = None
-        sc_cfg = getattr(config, "sc", None)
-        if (sc_cfg is not None
-                and int(sc_cfg.buffer_nbands) > 0
-                and sc_cfg.buffer_mode == "one_sided"
-                and getattr(config.qp_solver, "value", config.qp_solver)
-                == "self_consistent"):
-            band_ids = np.arange(
-                int(band_slices.b0), int(band_slices.b3), dtype=np.int64)
-            one_sided_core_mask = (
-                (band_ids >= int(meta.nelec) - int(config.nval))
-                & (band_ids < int(meta.nelec) + int(config.ncond)))
+        one_sided_core_mask = _qsgw_one_sided_core_mask(
+            config, band_slices, meta)
         qsgw_edge_kwargs = ({"one_sided_core_mask": one_sided_core_mask}
                              if one_sided_core_mask is not None else {})
         sigma_xc_qsgw, qsgw_diag = build_qsgw_sigma_xc(
@@ -1085,6 +1089,8 @@ def _static_sigma_channels(
     else:
         _bispinor_sigma = (
             wfns_transverse is not None and bispinor_v_q_path is not None)
+        retain_lorentz = _bispinor_sigma and (
+            mode is not ComputeMode.MPA or config.debug.sigma_lorentz_debug_output)
         # Charge pending input work to its boundary, not to exchange.
         with timing.section("sigma.input_wait"):
             jax.block_until_ready((wfns, wfns_transverse, V_q, Gij))
@@ -1096,10 +1102,10 @@ def _static_sigma_channels(
                 wfns_transverse=wfns_transverse,
                 bispinor_v_q_path=bispinor_v_q_path, mu_bases=mu_bases,
                 occupation_state=occupation_state,
-                return_transverse=_bispinor_sigma,
+                return_transverse=retain_lorentz,
             )
             sec.watch(sigma_x_result)
-        if _bispinor_sigma:
+        if retain_lorentz:
             sig_x, sig_x_b = sigma_x_result
             sigma_lorentz = jnp.stack((
                 sig_x - sig_x_b,
@@ -1250,14 +1256,38 @@ def _compute_mpa_sigma(
             fixed_quadrature_session.setdefault(sigma_w_model, {})),
         material_class=material_class,
         print_fn=print_fn)
+    lorentz_output = bool(config.debug.sigma_lorentz_debug_output)
+    if not lorentz_output:
+        sigma_lorentz = None
     if sector_handle.get("representation") == "sector-ordered-ph":
         from .mpa.sector_sigma import compute_sector_sigma
-        body = compute_sector_sigma(
+        on_shell = None
+        if lorentz_output:
+            from .qsgw_utils import build_qsgw_sigma_xc
+            e_qp_rel_ev = (np.asarray(e_qp_ev, dtype=np.float64)
+                           - sigma_efermi_ry * RYD_TO_EV)
+            core_mask = _qsgw_one_sided_core_mask(config, band_slices, meta)
+            edge_kwargs = ({"one_sided_core_mask": core_mask}
+                           if core_mask is not None else {})
+            zero_x = jnp.zeros_like(sig_x)
+
+            def on_shell(value):
+                shell, _ = build_qsgw_sigma_xc(
+                    value.sigma_c_kij, zero_x, config.omega_grid_ev,
+                    e_qp_rel_ev, mesh_xy, band_axis=value.band_axis,
+                    **edge_kwargs)
+                return shell
+
+        sector_result = compute_sector_sigma(
             sector_handle, (wfns, wfns_transverse), mu_bases, meta, mesh_xy,
-            **body_options)
-        # Static-only diagnostics cannot label a frequency-dependent sector
-        # result. The complete dynamic operator is retained by the finalizer.
-        sigma_lorentz = None
+            on_shell=on_shell, **body_options)
+        if lorentz_output:
+            body, (ct_shell, tt_shell) = sector_result
+            # The finalizer assigns CC as the exact residual of the total
+            # QSGW matrix after the mixed and transverse parts.
+            sigma_lorentz = sigma_lorentz.at[1].add(ct_shell).at[2].add(tt_shell)
+        else:
+            body = sector_result
     else:
         body = compute_sigma_c_mpa_omega_grid(
             wfns, fit_path, meta, mesh_xy, sigma_w_model=sigma_w_model,

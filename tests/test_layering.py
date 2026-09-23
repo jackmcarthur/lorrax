@@ -171,6 +171,7 @@ _L3_MODULES = frozenset({
     "file_io.slab_io", "file_io._slab_io_ffi",
     "file_io.commit_state", "file_io._slab_io_serial",
     "file_io.paths", "file_io.hdf5_owner", "file_io.h5_journal",
+    "file_io.io_timing",
 })
 #: Whole packages at L3.  Two of the three services are here for the same
 #: reason ``ffi`` is: their entire subject is devices, meshes, processes,

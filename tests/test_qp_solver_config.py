@@ -54,6 +54,12 @@ def test_default_is_one_shot_dft(tmp_path):
     assert cfg.qp_solver is QPSolver.ONE_SHOT_DFT
 
 
+def test_lorentz_matrix_output_is_opt_in(tmp_path):
+    assert not _config(tmp_path).debug.sigma_lorentz_debug_output
+    assert _config(tmp_path, "sigma_lorentz_debug_output = true\n",
+                   name="lorentz_debug.in").debug.sigma_lorentz_debug_output
+
+
 def test_one_shot_semantics_name_the_full_matrix_not_textbook_g0w0():
     semantics = qp_solver_semantics(QPSolver.ONE_SHOT_DFT)
     assert "one-shot full-matrix effective Hamiltonian" in semantics.description

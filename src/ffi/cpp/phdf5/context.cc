@@ -30,6 +30,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <chrono>
 #include <mutex>
 #include <sstream>
 #include <stdexcept>
@@ -415,6 +416,7 @@ static PhdfCtx* open_ctx_impl(const std::string& path, int p, int q,
     ctx->q = q;
     ctx->rank = rank;
     ctx->world_size = world_size;
+    ctx->timing_enabled = env_flag("LORRAX_SLAB_IO_TIMING", false);
 
     // Env-driven tuning.  Defaults (see ctx.h): reads collective, writes
     // COLLECTIVE (default flipped 2026-07-27 to match the Python
@@ -1162,13 +1164,28 @@ void read_whole(PhdfCtx* ctx, const std::string& ds_name, int dtype_tag,
     // is served by exactly the same call as a 1-D one.  That is the whole
     // reason this entry point exists — the sharded read handler needs a
     // hyperslab and a scalar dataspace has none.
-    if (H5Dread(dset, native, H5S_ALL, H5S_ALL, ctx->dxpl_indep, out) < 0) {
+    const auto native_t0 = ctx->timing_enabled
+        ? std::chrono::steady_clock::now()
+        : std::chrono::steady_clock::time_point{};
+    const auto st = H5Dread(dset, native, H5S_ALL, H5S_ALL,
+                            ctx->dxpl_indep, out);
+    if (ctx->timing_enabled && st >= 0) {
+        ctx->read_calls.fetch_add(1, std::memory_order_relaxed);
+        ctx->read_bytes.fetch_add(static_cast<uint64_t>(npoints) *
+                                  H5Tget_size(native),
+                                  std::memory_order_relaxed);
+        ctx->read_ns.fetch_add(static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - native_t0).count()),
+            std::memory_order_relaxed);
+    }
+    if (st < 0) {
         throw std::runtime_error(
             "phdf5 read_whole: H5Dread failed for '" + ds_name + "'");
     }
 }
 
-void close_ctx(PhdfCtx* ctx) {
+void close_ctx(PhdfCtx* ctx, int64_t* timing_out) {
     if (!ctx) return;
 
     // FIRST, before a single resource is torn down (audit B2): a handle whose
@@ -1206,6 +1223,15 @@ void close_ctx(PhdfCtx* ctx) {
         }
         ctx->queue_cv.notify_all();
         ctx->writer_thread.join();
+    }
+
+    if (timing_out) {
+        timing_out[0] = static_cast<int64_t>(ctx->read_calls.load());
+        timing_out[1] = static_cast<int64_t>(ctx->read_bytes.load());
+        timing_out[2] = static_cast<int64_t>(ctx->read_ns.load());
+        timing_out[3] = static_cast<int64_t>(ctx->write_calls.load());
+        timing_out[4] = static_cast<int64_t>(ctx->write_bytes.load());
+        timing_out[5] = static_cast<int64_t>(ctx->write_ns.load());
     }
 
     // Close cached datasets first (so their metadata flushes into file).

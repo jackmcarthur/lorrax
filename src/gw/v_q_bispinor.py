@@ -276,6 +276,7 @@ def _make_per_q_v_builder_for_tile(
     eps_K2: float = 1e-30,
     kgrid=None,
     tt_head_correction: bool = False,
+    tt_head_tensor: np.ndarray | None = None,
 ):
     """Return ``builder(q_irr_frac, gvec_components) → (n_q, ngkmax) c128``.
 
@@ -343,8 +344,11 @@ def _make_per_q_v_builder_for_tile(
                 "_make_per_q_v_builder_for_tile: tt_head_correction=True "
                 "needs kgrid (the mini-BZ Voronoi cell is defined by the "
                 "q-grid).")
-        T = _tt_head_tensor(
-            bvec=bvec_f, cell_volume=cell_volume, sys_dim=sys_dim, kgrid=kgrid)
+        T = (np.asarray(tt_head_tensor) if tt_head_tensor is not None else
+             _tt_head_tensor(
+                 bvec=bvec_f, cell_volume=cell_volume, sys_dim=sys_dim, kgrid=kgrid))
+        if T.shape != (3, 3):
+            raise ValueError(f"TT head tensor must be 3x3, got {T.shape}")
         # Bare (T) -> the same "v(q+G)/Ω_cell already applied" convention
         # compute_v_q_per_G's output carries (vcoul.base.CoulombKernel's
         # own Protocol docstring) — divide by cell_volume ONCE, here, not
@@ -491,6 +495,9 @@ def compute_V_q_bispinor_g_flat_to_h5(
 
     tt_g0 = None
     g0_by_channel: list[jax.Array | None] = [None, None, None, None]
+    tt_head_tensor = (_tt_head_tensor(
+        bvec=bvec, cell_volume=cell_volume, sys_dim=sys_dim, kgrid=kgrid)
+        if tt_head_correction else None)
 
     for tile_idx, (mu_L, nu_L) in enumerate(UNIQUE_TILES):
         same_zeta = (mu_L == nu_L)
@@ -519,6 +526,7 @@ def compute_V_q_bispinor_g_flat_to_h5(
             bvec=bvec, cell_volume=cell_volume, sys_dim=sys_dim,
             vcoul_cutoff_ry=bare_coulomb_cutoff_ry, bdot=bdot,
             kgrid=kgrid, tt_head_correction=tt_head_correction,
+            tt_head_tensor=tt_head_tensor,
         )
         # BGW vcoul overlay only meaningful on the CC tile; transverse
         # tiles are pure projector applications.  Wrap the builder.

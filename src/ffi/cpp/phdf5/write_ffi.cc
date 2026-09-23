@@ -356,6 +356,16 @@ static void async_worker(
                          src_buf);
     if (st < 0 && debug) H5Eprint2(H5E_DEFAULT, stderr);
     auto t_write = now();
+    if (ctx->timing_enabled && st >= 0) {
+        const auto selected = H5Sget_select_npoints(filespace);
+        ctx->write_calls.fetch_add(1, std::memory_order_relaxed);
+        ctx->write_bytes.fetch_add(static_cast<uint64_t>(selected) *
+                                   H5Tget_size(native_type),
+                                   std::memory_order_relaxed);
+        ctx->write_ns.fetch_add(static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                t_write - t_select).count()), std::memory_order_relaxed);
+    }
 
     H5Sclose(memspace);
     H5Sclose(filespace);

@@ -216,8 +216,8 @@ _RETIRED_BISPINOR_GW_MODES: dict[str, tuple[str, str, str]] = {
         "this was a carrier-comparison mode, not a physics mode: it kept "
         "the normalized QE Pauli two-spinor for charge/CC while the "
         "current vertices stayed raw kinetic balance, and it could never "
-        "restart or write restart tensors.  The shipped grammar has two "
-        "values, both on the raw kinetic-balance carrier; a carrier study "
+        "restart or write restart tensors.  All shipped modes use the raw "
+        "kinetic-balance carrier; a carrier study "
         "belongs in a branch, not in the deck grammar (lane J section 2)"),
     "isometric_kinetic_balance_bare_transverse": (
         "bispinor_gw_isometric_kinetic_balance_retired",
@@ -1934,6 +1934,7 @@ _DEFAULTS = {
     # Debug
     "sigma_freq_debug_output": False,
     "sigma_freq_debug_file": "sigma_freq_debug.dat",
+    "sigma_lorentz_debug_output": False,
     # QP wavefunction file dump.  Default True: end-of-run write of
     # ``WFN_qp.h5`` (BGW format, ψ rotated by the final U, energies
     # replaced by E_QP).  Fires for both one-shot and SC; set False to
@@ -2860,6 +2861,7 @@ def _input_storage(
     debug = DebugConfig(
         sigma_freq_debug_output=bool(params["sigma_freq_debug_output"]),
         sigma_freq_debug_file=str(params["sigma_freq_debug_file"]),
+        sigma_lorentz_debug_output=bool(params["sigma_lorentz_debug_output"]),
         write_wfn_h5=bool(params["write_wfn_h5"]),
         write_w=bool(params["write_w"]),
     )
@@ -4244,10 +4246,21 @@ class MPAConfig:
 
 
 #: The ``sc_head_update`` values that rebuild the q->0 head every QSGW
-#: iteration, i.e. the ones a fractionally occupied deck may choose.  One
+#: iteration. The metal direct-only exception is narrowed below. One
 #: tuple, so the vocabulary, the mandatory-metal rule and the driver's
 #: dispatch cannot disagree about what "a metal head mode" is.
 METAL_HEAD_UPDATES = ("parallel_transport", "dft_velocity")
+
+
+def uses_metal_direct_drude_head(config) -> bool:
+    """Admit the live direct charge head on an ordered shared-pole metal."""
+    return (
+        config.qp_solver is QPSolver.SELF_CONSISTENT
+        and config.sc.head_update == "dft_velocity"
+        and config.head.correction is HeadCorrection.NO_LOCAL_FIELDS
+        and config.sigma.w_model == "shared_pole"
+        and (not config.bispinor or uses_bare_transverse_shared_pole(config))
+    )
 
 
 @dataclass(frozen=True)
@@ -4265,14 +4278,9 @@ class SCConfig:
     frozen_core_bands: int = 0
     buffer_mode: str = "diagonal"
     eigh: str = "auto"    # "auto" | "native" | "distributed"
-    #: "off" | "parallel_transport" | "dft_velocity".  The two non-off
-    #: values are the METAL head modes: both run the per-iteration head
-    #: chain, and they differ only in the velocity operator they feed it —
-    #: ``parallel_transport`` adds the fourth-order finite-link covariant DΔH
-    #: correction from saved neighbour overlaps, ``dft_velocity`` uses the
-    #: exact DFT p-matrix
-    #: velocity alone.  ``METAL_HEAD_UPDATES`` is the vocabulary consumers
-    #: test against; do not spell the pair out a second time.
+    #: "off" | "parallel_transport" | "dft_velocity".  Both non-off modes
+    #: rebuild the head. Only ``dft_velocity`` with an ordered shared-pole
+    #: direct head is admitted on a metal; see ``uses_metal_direct_drude_head``.
     head_update: str = "off"
     #: Explicit seed-only ``qp_wfn_rotations.h5`` for a new SC run.  Empty
     #: means the canonical diagonal DFT seed.  This is not nonlinear restart.
@@ -4397,6 +4405,7 @@ class DebugConfig:
     """Debug-only flags + auxiliary output filenames."""
     sigma_freq_debug_output: bool
     sigma_freq_debug_file: str
+    sigma_lorentz_debug_output: bool
     write_wfn_h5: bool
     #: Dump the WHOLE shared-pole Wc frequency sample bank (every fixed
     #: sample, plus ``dWc_ds``/M1/M3) to ``<map>_w.h5``.  Debugging only.
@@ -4426,7 +4435,8 @@ def _validate_occupation_smearing(screening, width_ry):
 
     # A metal's width is its Fermi-Dirac kBT.  ``occ_broadening > 0`` is the
     # MP1 smeared-head dial, and its only metal consumer was the velocity
-    # SC head update, disabled on metals (owner ruling 2026-09-17).
+    # Metallic velocity-head routes are resolved below; only the direct
+    # shared-pole Drude route is admitted.
     # ``occ_broadening = 0`` is the "step occupations" dial, not a width, so
     # it may stand beside a metal width (the b24/b40 step-occupation arms).
     broadening_ev = float(screening.occ_broadening_ev)
@@ -4477,24 +4487,20 @@ def validate_material_inputs(config, material_class):
                 "GATE fractional_occupations_require_mpa: WFN occupations "
                 f"identify a metal, but compute_mode={config.compute_mode.value}; "
                 "use compute_mode=mpa, the occupation-aware path.")
-        if config.sc.head_update in METAL_HEAD_UPDATES:
+        if (config.sc.head_update in METAL_HEAD_UPDATES
+                and not uses_metal_direct_drude_head(config)):
             raise ValueError(
                 "GATE metal_sc_head_update_disabled: WFN occupations identify "
                 f"a metal, and sc_head_update = {config.sc.head_update} is "
-                "DISABLED on metals pending the owner's replacement head "
-                "model (owner ruling 2026-09-17).\n"
+                "unsupported for this metallic head policy.\n"
                 "  got:  a per-map velocity head rebuild (QP velocity, "
                 "tetrahedron Fermi-surface weights, Drude term, Thomas-Fermi "
                 "static head)\n"
-                "  want: sc_head_update = off, which keeps the existing MPA "
-                "head model: the fixed DFT direct response folded through "
-                "each map's W and fitted as one scalar MPA head\n"
-                "  why:  on a metal every velocity head update and every "
-                "nontrivial head correction outside that MPA model is "
-                "disabled until the owner replaces the head model; the code "
-                "is kept, not deleted\n"
-                "  doc:  docs/self_consistency.md, 'Metals: velocity head "
-                "updates are disabled'")
+                "  want: sc_head_update = off, or dft_velocity with "
+                "shared_pole + no_local_fields for a direct Drude head\n"
+                "  why:  wings and full local-field folding lack a certified "
+                "ordered metallic Drude completion\n"
+                "  doc:  docs/self_consistency.md, 'Metals: direct Drude head'")
         if width_ry is None:
             raise ValueError(
                 "metallic WFN occupations require occ_smearing_width_ry="
@@ -4729,9 +4735,8 @@ class LorraxConfig:
                 "occ_broadening > 0 currently updates only the QSGW head; "
                 "set sc_head_update to one of "
                 + ", ".join(METAL_HEAD_UPDATES)
-                + ". Both are refused on a metal (GATE "
-                "metal_sc_head_update_disabled, owner ruling 2026-09-17); a "
-                "metal takes its width from occ_smearing_width_ry alone.")
+                + ". A metal takes its width from "
+                "occ_smearing_width_ry alone.")
         # rCROP is legal on metallic decks since the ENTRY-solve rule
         # (2026-08-15): gw_iteration_map solves its MP1 occupation state
         # from the spectrum of the H it is handed, every call, so F(H) is

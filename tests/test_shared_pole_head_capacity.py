@@ -237,6 +237,24 @@ def test_the_head_refusal_fires_at_input_resolution(model, correction, trs, nspi
     assert "head_correction = off" in str(caught.value)
 
 
+def test_four_component_charge_full_head_refuses_before_the_bank():
+    """The source WFN has two components but the hybrid CC model stores four."""
+    from gw.gw_config import (BispinorGWMode, ComputeMode, HeadCorrection,
+                              ScreeningDiagrams)
+    from gw.shared_pole_head import refuse_unsupported_shared_pole_head
+
+    config = NS(bispinor=True, bispinor_gw=BispinorGWMode.BARE_TRANSVERSE,
+                compute_mode=ComputeMode.MPA,
+                screening=NS(diagrams=ScreeningDiagrams.W_RPA),
+                sigma=NS(w_model="shared_pole"),
+                head=NS(correction=HeadCorrection.FULL))
+    with pytest.raises(ValueError, match="GATE shared_pole_head_nspinor"):
+        refuse_unsupported_shared_pole_head(
+            config, trs_allowed=True, nspinor=2)
+    config.head.correction = HeadCorrection.NO_LOCAL_FIELDS
+    refuse_unsupported_shared_pole_head(config, trs_allowed=True, nspinor=2)
+
+
 def test_the_driver_calls_the_head_door_on_the_final_symmetry_before_any_build():
     """Read from disk: importing gw.gw_jax initializes the communicator stack."""
     import ast
