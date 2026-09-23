@@ -325,13 +325,14 @@ def test_htransform_active_window_beats_lower_guard_on_the_path(full_qp):
     assert "path/coarse coincidences: 1 path row" in banner
 
 
-@pytest.mark.parametrize(("first_dft_guard", "must_refuse"), (
+@pytest.mark.parametrize(("first_dft_guard", "interleaves"), (
     (2.0, False),
     (-1.5, True),
 ))
-def test_authenticated_qp_corrected_margin_protects_returned_interior(
-        first_dft_guard, must_refuse):
-    """A wider authenticated QP block is required and its energy margin gates."""
+def test_authenticated_qp_returned_bands_need_no_global_gap(
+        first_dft_guard, interleaves):
+    """Returned QP bands are selected by active character; an interleaving DFT
+    guard neither refuses nor displaces them (owner 2026-09-23)."""
     pytest.importorskip("jax")
     import jax.numpy as jnp
     from types import SimpleNamespace
@@ -363,12 +364,9 @@ def test_authenticated_qp_corrected_margin_protects_returned_interior(
                 band_start=0, n_return_bands=3,
                 qp_corrected_band_range=(0, 4))
 
-    if must_refuse:
-        with pytest.raises(ValueError, match="protect the returned interior"):
-            run()
-    else:
-        result = run()
-        np.testing.assert_allclose(
-            result["energies_sorted"], [[-1.0, 0.0, 1.0]] * 2,
-            rtol=0.0, atol=2.0e-11)
-        assert "corrected interior margin" in " ".join(lines)
+    result = run()
+    np.testing.assert_allclose(
+        result["energies_sorted"], [[-1.0, 0.0, 1.0]] * 2,
+        rtol=0.0, atol=2.0e-11)
+    assert "corrected interior margin" in " ".join(lines)
+    assert ("interleave in energy" in " ".join(lines)) == interleaves
