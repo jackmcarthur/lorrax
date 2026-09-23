@@ -13,11 +13,18 @@ import subprocess
 _PERLMUTTER_PLUGIN = (
     '/global/common/software/nersc9/nccl/2.29.2-cu13/plugin/lib/libnccl-net.so'
 )
+# The site module's full setting list (module show nccl/2.29.2-cu13); every
+# NERSC NCCL module since 2.18 sets FI_CXI_RDZV_THRESHOLD=0.  Without it, CXI
+# sends small messages eagerly, and cross-node NCCL send/recv (the
+# all_to_all and collective_permute ops, first used in sc.eigh) deadlocked on
+# every P16 no_vni leg; ring/tree all-reduce and all-gather did not
+# (runs/runtime/nccl_ofi_hang_20260923, pool 58795920).
 _PERLMUTTER_DEFAULTS = {
     'NCCL_NET': 'AWS Libfabric',
     'NCCL_NET_PLUGIN': _PERLMUTTER_PLUGIN,
     'NCCL_NET_GDR_LEVEL': 'PHB',
     'FI_CXI_DISABLE_HOST_REGISTER': '1',
+    'FI_CXI_RDZV_THRESHOLD': '0',
     'NCCL_CROSS_NIC': '2',
     'NCCL_SOCKET_IFNAME': 'hsn',
 }
