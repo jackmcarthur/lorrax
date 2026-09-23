@@ -341,6 +341,7 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output):
         receipts.append(row_receipt)
         # Stage each canonical parent once. One round of face factors is live;
         # no all-parent factor stack or full photon operator is materialized.
+        ct_host_census=None
         for name,family,model,active_mask in zip(
                 ('CC','TT','CT_C','CT_T'),(0,1,0,1),models,treatment_masks):
             ambient=ledger.live_stages
@@ -362,17 +363,14 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output):
                     ledger.live_stages=ambient
                     raise
             try:
-                poles,active=jax.tree.map(
-                    lambda a:np.asarray(device_put_process_local(
-                        a,NamedSharding(mesh_xy,P()))),(treated_poles,active_mask))
-                counts=active.sum(axis=-1,dtype=np.int64)
-                width=padded_axis(int(counts[:real].max()),mesh_xy,name='shared_pole_port',
-                    specs=((P('x','y'),0),(P('x','y'),1))).carrier
-                # batch_to_face pads a nonaligned factor carrier before its
-                # all_to_all. The store requires the matching pole capacity;
-                # exactly inactive columns carry the public 1.0 sentinel.
-                if poles.shape[-1] < width:
-                    poles=np.pad(poles,((0,0),(0,width-poles.shape[-1])),constant_values=1.0)
+                # CT_C and CT_T have one physical eigenproblem. Reuse the
+                # exact host pole bytes and mask at the writer boundary;
+                # their endpoint factors still travel independently.
+                census=_host_sector_census(treated_poles,active_mask,mesh_xy,real,
+                    common=ct_host_census if name=='CT_T' else None)
+                if name=='CT_C':
+                    ct_host_census=census
+                poles,active,counts,width=census
                 factor=face_rows(mesh_xy,tuple(range(real)),width)(treated_factor if is_face(treated_factor) else to_face(treated_factor))
                 for slot,q in enumerate(ids[:real]):
                     public=canonical_factors(mesh_xy,(slot,),components=3 if family else 1)(factor)
@@ -400,6 +398,27 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output):
     return dict(handle=handle,identity=bank['identity'],status='CONSTRUCTED',
                 q_receipts=receipts,capacity=ledger.receipt(),
                 execution=execution_rows)
+
+
+def _host_sector_census(poles,mask,mesh_xy,real,*,common=None):
+    """Materialize one writer census, or reuse the CT_C bytes for CT_T."""
+    if common is not None:
+        return common
+    import jax
+    import numpy as np
+    from common.collectives import device_put_process_local
+    from jax.sharding import NamedSharding,PartitionSpec as P
+    from runtime.padding import padded_axis
+
+    poles,active=jax.tree.map(lambda a:np.asarray(device_put_process_local(
+        a,NamedSharding(mesh_xy,P()))),(poles,mask))
+    counts=active.sum(axis=-1,dtype=np.int64)
+    width=padded_axis(int(counts[:real].max()),mesh_xy,name='shared_pole_port',
+        specs=((P('x','y'),0),(P('x','y'),1))).carrier
+    # The factor carrier is Py aligned; only inactive pole columns are added.
+    if poles.shape[-1] < width:
+        poles=np.pad(poles,((0,0),(0,width-poles.shape[-1])),constant_values=1.0)
+    return poles,active,counts,width
 
 
 def sector_held_errors(signed, samples, z, *, mesh_xy):
