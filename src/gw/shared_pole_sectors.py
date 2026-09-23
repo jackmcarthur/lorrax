@@ -164,6 +164,16 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output):
     from gw.shared_pole_execution import (constructor_execution,
                                            sector_round_schedule,is_face)
     from gw.shared_pole_recipe import shared_real_pole_v1_r3b
+    policy=shared_real_pole_v1_r3b[recipe['accuracy']]
+    def sector_recipe(n):
+        result=dict(recipe,n=n)
+        for field in ('imaginary_width','infinity_width','line_direction_cap','pole_budget'):
+            fraction=policy.get(field+'_fraction')
+            result[field]=None if fraction is None else math.ceil(n*fraction)
+        return result
+
+    extent=lambda width:padded_axis(width,mesh_xy,name='shared_pole_port',
+        specs=((P('x','y'),0),(P('x','y'),1))).carrier
     execution_rows=[]
     for family,basis in enumerate(bank['mu_bases']):
         components=3 if family else 1
@@ -171,14 +181,7 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output):
         local_meta.mu_basis=basis
         local_meta.n_rmu=components*basis.n_logical
         local_meta.n_rmu_padded=components*basis.n_packed
-        local_recipe=dict(recipe,n=local_meta.n_rmu)
-        policy=shared_real_pole_v1_r3b[recipe['accuracy']]
-        for field in ('imaginary_width','infinity_width','line_direction_cap','pole_budget'):
-            fraction=policy.get(field+'_fraction')
-            local_recipe[field]=(None if fraction is None else
-                                 math.ceil(local_meta.n_rmu*fraction))
-        extent=lambda width:padded_axis(width,mesh_xy,name='shared_pole_port',
-            specs=((P('x','y'),0),(P('x','y'),1))).carrier
+        local_recipe=sector_recipe(local_meta.n_rmu)
         mode,route=constructor_execution(
             local_meta,linalg_resolution({'linalg':config.backend.linalg}),local_recipe,
             mesh=mesh_xy,ledger=ledger,upstream=upstream,ordered=True,
@@ -187,7 +190,22 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output):
         execution_rows.append(dict(sector=('CC','TT')[family],mode=mode,
                                    packed_extent=local_meta.n_rmu_padded,
                                    signed_side_bound=extent(2*local_recipe['pole_budget']) if local_recipe['pole_budget'] is not None else route['conservative_pencil_side'],**route))
-    resolved_execution=('face' if any(row['mode']=='face' for row in execution_rows)
+    # CT retains both diagonal spans and both rectangular sample stacks. The
+    # CC/TT admission alone cannot promise that their joint pencil fits one
+    # rank. Resolve its conservative route before opening the bank so the
+    # complete round uses one layout and the face batch can be priced below.
+    joint_meta=copy.copy(meta)
+    joint_meta.n_rmu=sum((3 if family else 1)*basis.n_logical
+                         for family,basis in enumerate(bank['mu_bases']))
+    joint_meta.n_rmu_padded=sum(row['packed_extent'] for row in execution_rows)
+    joint_mode,joint_route=constructor_execution(
+        joint_meta,linalg_resolution({'linalg':config.backend.linalg}),
+        sector_recipe(joint_meta.n_rmu),mesh=mesh_xy,ledger=ledger,
+        upstream=upstream,ordered=True,odd_moments=True,
+        sample_fields=8,moment_fields=4,parent_count=header['n_q_irr'],
+        retained_output_families=2,column_extent=extent)
+    resolved_execution=('face' if joint_mode=='face' or
+                        any(row['mode']=='face' for row in execution_rows)
                         else 'local')
     batch_width = int(mesh_xy.size)
     if resolved_execution == 'face':
