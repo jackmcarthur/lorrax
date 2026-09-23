@@ -6,6 +6,55 @@ import h5py
 from common.provenance import provenance_header
 from .hdf5_owner import STACK_H5PY, open_scope
 
+
+def read_sc_sigma_lorentz_h5(path):
+	"""Read one committed SC-map Lorentz split in its input QP basis."""
+	from .commit_state import assert_committed
+
+	with h5py.File(path, "r") as h5:
+		assert_committed(h5, path=path)
+		parts = np.asarray(h5["sigma_lorentz_skij_ev"])
+		rotation = np.asarray(h5["U_dft_to_qp_kij"])
+		kpoints = np.asarray(h5["kpoints_crys"])
+		if (parts.ndim != 4 or parts.shape[0] != 3
+				or parts.shape[1:] != rotation.shape
+				or kpoints.shape != (parts.shape[1], 3)):
+			raise ValueError(f"invalid SC Lorentz map shape in {path}")
+		return parts, rotation, kpoints
+
+
+def write_sc_sigma_lorentz_h5(path, components_skij_ev, rotation_kij,
+							 kpoints_crys, *, call_index, role, kset,
+							 band_start_1based):
+	"""Atomically publish CC, CT+TC and TT matrices from one SC map."""
+	from common.collectives import rank0_atomic_file_transaction
+	from .commit_state import set_commit_state
+
+	parts = np.asarray(components_skij_ev, dtype=np.complex128)
+	rotation = np.asarray(rotation_kij, dtype=np.complex128)
+	kpoints = np.asarray(kpoints_crys, dtype=np.float64)
+	if (parts.ndim != 4 or parts.shape[0] != 3
+			or parts.shape[1:] != rotation.shape
+			or kpoints.shape != (parts.shape[1], 3)):
+		raise ValueError("SC Lorentz matrices, rotation and k points disagree")
+
+	def _write(staging):
+		with h5py.File(staging, "w") as h5:
+			h5.create_dataset("sigma_lorentz_skij_ev", data=parts)
+			h5.create_dataset("U_dft_to_qp_kij", data=rotation)
+			h5.create_dataset("kpoints_crys", data=kpoints)
+			h5.attrs["sectors"] = ("CC", "CT+TC", "TT")
+			h5.attrs["basis"] = "input_qp"
+			h5.attrs["kset"] = kset
+			h5.attrs["role"] = role
+			h5.attrs["call_index"] = int(call_index)
+			h5.attrs["band_start_1based"] = int(band_start_1based)
+			set_commit_state(h5, True)
+
+	rank0_atomic_file_transaction(
+		path, stage=f"sc.sigma_lorentz.{int(call_index):04d}",
+		write=_write, validate_file=read_sc_sigma_lorentz_h5)
+
 # THE STAMP CONTRACT IS ``kin_ion``'s, IMPORTED RATHER THAN RESTATED.
 # ``sigma_mnk.h5`` and ``kin_ion.h5`` now both store a k axis that may be
 # the irreducible wedge, and they must mean the SAME thing by that or a
