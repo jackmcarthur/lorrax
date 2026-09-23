@@ -485,6 +485,7 @@ def fit_gn_ppm_from_wc_pair(
              omega_min, omega_max, pair_rel_min,
              a_odd) = _gn_ppm_fit_kernel_ordered(
                 Wc0_qmunu, Wc_probe_qmunu, _z, _fb, n_log, _mask)
+            a_odd = _match_layout(a_odd, omega_vals)
         else:
             # Whole thing fits: the historical single-shot call, untouched.
             (omega_vals, B_vals, good, n_good, n_modes,
@@ -504,7 +505,7 @@ def fit_gn_ppm_from_wc_pair(
                  _omin, _omax, _rmin, _a) = _gn_ppm_fit_kernel_ordered(
                      Wc0_qmunu[_q0:_q1], Wc_probe_qmunu[_q0:_q1],
                      _z, _fb, n_log, _mask)
-                _aod.append(_a)
+                _aod.append(_match_layout(_a, _o))
             else:
                 (_o, _b, _g, _ng, _nm,
                  _omin, _omax, _rmin) = _gn_ppm_fit_kernel(
@@ -944,6 +945,23 @@ def _gn_ppm_fit_kernel(Wc0_qmunu, Wc_probe_qmunu, z_probe, fallback, n_log,
         omega_vals, B_vals, good, n_good, n_modes,
         omega_min, omega_max, pair_rel_min,
     )
+
+
+def _match_layout(x, like):
+    """Reshard ``x`` onto ``like``'s layout now, one q block at a time.
+
+    The ordered kernel's anti-Hermitian half comes out of an X<->Y transpose
+    and may carry the transposed layout.  Left alone, the first elementwise
+    use against ``Omega`` (``_gn_ppm_odd_residue``) reshards the whole
+    ``(nq, mu, mu)`` array at once: on CrI3 16x16 P64 (mu 3998 -> 4032) that
+    was a 4161798144-byte temporary (256 x 1008 x 1008 c128) and map 0 ran
+    out of memory (pool 58750500 steps .79-.84).  Per block it is one small
+    permute.  Values are untouched.
+    """
+    target = getattr(like, "sharding", None)
+    if target is None or getattr(x, "sharding", None) == target:
+        return x
+    return jax.device_put(x, target)
 
 
 @partial(jax.jit, static_argnums=(4,))

@@ -363,8 +363,33 @@ def fit_ppm(
     z = complex(probe_omega)
     t0 = _t.perf_counter()
 
+    _mem_diag = os.environ.get("LORRAX_PPM_MEM_DIAG", "0").strip() in ("1", "true", "on")
+
+    def _mem(label, *arrays):
+        # Env-gated: block on the named arrays, then print this device's allocator state,
+        # so an OOM is attributed to the stage that dispatched it (async dispatch otherwise
+        # surfaces it at the next host read).
+        if not _mem_diag:
+            return
+        for a in arrays:
+            if a is not None:
+                jax.block_until_ready(a)
+        st = jax.local_devices()[0].memory_stats() or {}
+        specs = ", ".join(
+            f"{getattr(getattr(a, 'sharding', None), 'spec', None)} {tuple(a.shape)}"
+            for a in arrays if a is not None)
+        if jax.process_index() == 0:
+            import sys as _sys
+            _sys.stderr.write(
+                f"  [ppm mem] {label}: in_use {st.get('bytes_in_use', 0) / 2**30:.2f} GiB, "
+                f"peak {st.get('peak_bytes_in_use', 0) / 2**30:.2f} GiB, "
+                f"limit {st.get('bytes_limit', 0) / 2**30:.2f} GiB; {specs}\n")
+            _sys.stderr.flush()
+
+    _mem("fit_ppm entry (W0, Wprobe, V live)", W0_q, Wprobe_q, V_q)
     Wc0_q = W0_q - V_q
     Wci_q = Wprobe_q - V_q
+    _mem("Wc0/Wci formed", Wc0_q, Wci_q)
     fit = fit_gn_ppm_from_wc_pair(
          Wc0_q, Wci_q, z, fallback_omega=float(fallback_omega),
          n_mu_logical=int(n_mu_logical),
@@ -374,6 +399,8 @@ def fit_ppm(
          ordered_orientations=bool(ordered_orientations),
          print_fn=print_fn if print_fn is not None else print)
 
+    _mem("GN fit returned (before reshard)", fit.omega_qmunu, fit.B_qmunu,
+         fit.B_odd_qmunu, fit.valid_qmunu)
     q_shard = NamedSharding(mesh_xy, P(None, 'x', 'y'))
     Omega = jax.lax.with_sharding_constraint(
         jnp.asarray(fit.omega_qmunu), q_shard)
@@ -384,6 +411,7 @@ def fit_ppm(
     valid_mask = jax.lax.with_sharding_constraint(
         jnp.asarray(fit.valid_qmunu), q_shard)
     Wc0_q = jax.lax.with_sharding_constraint(Wc0_q, q_shard)
+    _mem("GN fit done + outputs resharded", Omega, B, B_odd, valid_mask, Wc0_q)
     t1 = _t.perf_counter()
 
     probe_hermiticity_residual = None
