@@ -3279,14 +3279,16 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             valence_mask_kn=valence_kn,
             fit_mask_kn=fit_mask_kn,
             k_weights=k_star_weights(ks),
-            # The sum-band tail is not part of the rotated QP subspace. Its
-            # update is a rigid edge scissor defined by the lowest accidental-
-            # degeneracy manifold, not by a user-expanded near-degenerate/SOC
-            # scale.  A resolved 1.7 meV pair is physics and remains two
-            # distinct samples; only <=0.1 meV may be grouped here.
+            # The sum-band tail is not part of the rotated QP subspace; its
+            # update is one rigid scissor.  conduction_mean (default) takes
+            # the mean correction of every trusted conduction state in the
+            # window; frontier takes the lowest accidental-degeneracy
+            # manifold only (grouping <=0.1 meV, never resolved SOC pairs).
             conduction_frontier_tol_ev=(
                 float(inputs.config.sc.exact_degeneracy_tol_ev)
                 if inputs.config.sc.tail_fit == "frontier" else None),
+            conduction_rigid_mean=(
+                inputs.config.sc.tail_fit == "conduction_mean"),
         )
         enk_base_ev = apply_conduction_scissor_to_tail(
             np.asarray(inputs.wfns_dft.enk, dtype=np.float64) * RYD_TO_EV,
@@ -3297,7 +3299,10 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         enk_base = device_put_process_local(
             enk_base_ev / RYD_TO_EV,
             NamedSharding(inputs.mesh_xy, P(None, None)))
-        inputs.print_fn(
+        # _record_sc, not print_fn: the production log drops print_fn, and
+        # this law feeds chi0/W and the Sigma band sum every map.
+        _record_sc(
+            inputs,
             f"    SC sum-band tail: scissored [{tail_start}, "
             f"{logical_stop}) with conduction "
             f"alpha={tail_fit.alpha_c:+.4f}, "
@@ -3603,8 +3608,13 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         # ladder (energies, occupations, reference) is the DFT one, a step by
         # band index.  On a metal every head consumer (the static terms here,
         # the dynamic head of MPA and finalized samples) must see THIS map's
-        # ladder and its one occupation state instead.
-        if metal_occ_state is not None:
+        # ladder and its one occupation state instead.  The GN/HL-PPM head is
+        # band-diagonal in this map's basis too, so it takes this map's ladder
+        # on an insulator as well; its omega reference is then the PPM body's
+        # own (ppm_pipeline passes sigma_omega.efermi_ry).  CrI3 16x16 SC
+        # evaluated the head at DFT energies ~4-7 eV off the QP ones (audit
+        # 2026-09-23 item 5).  The MPA insulator head is unchanged here.
+        if metal_occ_state is not None or not mpa_mode:
             nb_sigma_head = int(inputs.meta.nb_sigma)
             iteration_head_response = replace(
                 iteration_head_response,
@@ -3612,7 +3622,9 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
                     wfns_qp.enk[:, :nb_sigma_head], dtype=np.float64),
                 sigma_occupations=np.asarray(
                     wfns_qp.occ[:, :nb_sigma_head], dtype=np.float64),
-                efermi_ry=float(metal_occ_state.mu_ry))
+                efermi_ry=(float(metal_occ_state.mu_ry)
+                           if metal_occ_state is not None
+                           else iteration_head_response.efermi_ry))
         # The static head is diagonal in THIS map's band basis, so its
         # occupations are this map's bundle table (the entry state on a
         # metal), never the frozen DFT response's step by band index.

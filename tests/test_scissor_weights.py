@@ -135,6 +135,37 @@ def test_frontier_scissor_is_rigid_and_ignores_higher_conduction_samples():
     assert fit_wide.rmse_c_ev == fit_narrow.rmse_c_ev
 
 
+def test_conduction_mean_scissor_is_the_weighted_mean_of_every_conduction_state():
+    """Owner rule 2026-09-23: one rigid shift, the k-weighted mean over all
+    trusted conduction samples -- not the lowest multiplet alone."""
+    e_dft = np.array([
+        [-2.0, -1.0, 1.000, 1.002, 3.0],
+        [-2.2, -0.8, 1.100, 1.100, 3.2],
+    ])
+    shift = np.array([
+        [0.1, 0.1, 0.5, 0.7, 2.0],
+        [0.1, 0.1, 0.6, 0.8, 3.0],
+    ])
+    valence = np.broadcast_to(
+        np.array([True, True, False, False, False]), e_dft.shape)
+    trusted = np.ones_like(valence)
+    trusted[:, 4] = [True, False]        # one untrusted conduction sample
+    weights = np.array([1.0, 2.0])
+
+    fit = fit_scissor(e_dft, e_dft + shift, valence, trusted,
+                      k_weights=weights, conduction_rigid_mean=True)
+    want = (1.0 * (0.5 + 0.7 + 2.0) + 2.0 * (0.6 + 0.8)) / (3 * 1.0 + 2 * 2.0)
+    assert fit.alpha_c == 1.0
+    np.testing.assert_allclose(fit.beta_c_ev, want, rtol=0, atol=1e-14)
+    assert fit.n_fit_c == 5
+    frontier = fit_scissor(e_dft, e_dft + shift, valence, trusted,
+                           k_weights=weights, conduction_frontier_tol_ev=0.003)
+    assert frontier.beta_c_ev != fit.beta_c_ev
+    with pytest.raises(ValueError, match="two different conduction laws"):
+        fit_scissor(e_dft, e_dft + shift, valence, trusted, k_weights=weights,
+                    conduction_rigid_mean=True, conduction_frontier_tol_ev=0.003)
+
+
 def test_frontier_scissor_refuses_an_invalid_tolerance():
     e = np.array([[-1.0, 1.0]])
     valence = np.array([[True, False]])

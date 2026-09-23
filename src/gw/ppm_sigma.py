@@ -143,6 +143,12 @@ class SigmaOmegaResult:
     #: Measured fit-level ``max|D|/max|B|`` for an ordered MPA store.  Kept
     #: here so the shared driver report does not re-read or re-fit poles.
     odd_even_residue_ratio: float | None = None
+    #: The energy (Ry) the omega axis of THIS body is measured from: the
+    #: current bundle's VBM or midgap (``_prepare_sigma_state``).  The
+    #: finalizer must read Sigma back in this frame; without it the lookup
+    #: fell back to ``wfn.efermi`` (the DFT midgap), off by 0.5-1.1 eV on
+    #: CrI3 16x16 SC (audit 2026-09-23 item 2).  None on non-PPM results.
+    efermi_ry: float | None = None
 
 
 
@@ -1031,4 +1037,5 @@ def compute_sigma_c_ppm_omega_grid(
         sigma_c_odd_kij=result.sigma_c_odd_kij,
         band_counts=result.band_counts,
         static_coh_at_counts=static_coh_at_counts,
-        odd_even_residue_ratio=ppm.odd_even_residue_ratio)
+        odd_even_residue_ratio=ppm.odd_even_residue_ratio,
+        efermi_ry=float(jax.device_get(state.efermi)))

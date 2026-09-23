@@ -1416,10 +1416,12 @@ _DEFAULTS = {
     # degeneracies.  This 0.1 meV owner-set ceiling is deliberately more
     # than an order below MoS2's physical 1.7--3.6 meV SOC-split K pair.
     "sc_exact_degeneracy_tol_ev": 1.0e-4,
-    # The frontier law is the production window-stable tail update.  The
-    # all_conduction spelling retains the historical affine-fit control for
-    # diagnosing window-edge cycles; it never changes degeneracy treatment.
-    "sc_tail_fit": "frontier",   # frontier | all_conduction | buffer_edges
+    # conduction_mean (owner 2026-09-23): one rigid shift, the k-weighted mean
+    # QP correction over every trusted conduction state in the QP window.
+    # frontier copied the lowest multiplet alone, which on CrI3 was one
+    # localized Cr-d band (+7.0 eV vs the window mean +3.5 eV) and fed the gap.
+    # all_conduction retains the historical affine fit as a diagnostic.
+    "sc_tail_fit": "conduction_mean",   # conduction_mean | frontier | all_conduction | buffer_edges
     # Optional symmetric diagonal buffer around the named nval/ncond window.
     # Zero preserves the historical window exactly.  Nonzero values are
     # interpreted only by qp_solver=self_consistent.
@@ -4253,7 +4255,7 @@ class SCConfig:
     mixing: float
     dump_dir: str | None
     exact_degeneracy_tol_ev: float = 1.0e-4
-    tail_fit: str = "frontier"
+    tail_fit: str = "conduction_mean"
     buffer_nbands: int = 0
     buffer_mode: str = "diagonal"
     eigh: str = "auto"    # "auto" | "native" | "distributed"
@@ -4297,10 +4299,11 @@ class SCConfig:
                 "sc_exact_degeneracy_tol_ev must be in (0, 1e-4] eV. "
                 "The 0.1 meV ceiling separates accidental degeneracy from "
                 "resolved physical splittings; it is not an SC damping knob.")
-        if self.tail_fit not in ("frontier", "all_conduction", "buffer_edges"):
+        if self.tail_fit not in ("conduction_mean", "frontier",
+                                 "all_conduction", "buffer_edges"):
             raise ValueError(
-                "sc_tail_fit must be 'frontier', 'all_conduction' or "
-                "'buffer_edges'; "
+                "sc_tail_fit must be 'conduction_mean', 'frontier', "
+                "'all_conduction' or 'buffer_edges'; "
                 f"got {self.tail_fit!r}.")
         if self.buffer_nbands < 0:
             raise ValueError("sc_buffer_nbands must be >= 0.")

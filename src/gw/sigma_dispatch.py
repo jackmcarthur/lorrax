@@ -1359,6 +1359,12 @@ def _compute_ppm_sigma(
             ppm_outputs.probe_hermiticity_residual),
         ppm_odd_even_residue_ratio=ppm_outputs.odd_even_residue_ratio,
         print_fn=print_fn,
+        # Read Sigma in the frame the PPM body was built in (its current
+        # VBM/midgap), not wfn.efermi -- audit 2026-09-23 item 2.
+        efermi_ry=ppm_outputs.efermi_ry,
+        efermi_provenance=(
+            None if ppm_outputs.efermi_ry is None else
+            str(config.sigma.fermi_reference).strip().lower()),
     )
 
 

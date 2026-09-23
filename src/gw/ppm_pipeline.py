@@ -82,6 +82,8 @@ class PPMOutputs:
     sigma_c_body_omega_unextrap: jax.Array | None = None
     probe_hermiticity_residual: float | None = None
     odd_even_residue_ratio: float | None = None
+    #: The body's omega reference (Ry), from ``SigmaOmegaResult.efermi_ry``.
+    efermi_ry: float | None = None
 
 
 def _fit_head_correction(
@@ -147,8 +149,13 @@ def _compute_analytic_head_diag(
     wfn, sym, meta,
     print_fn,
     iteration_head=None,
+    body_efermi_ry=None,
 ) -> np.ndarray:
     """Compute the analytic q→0, G=G'=0 PPM head diagonal.
+
+    ``body_efermi_ry`` is the omega reference of the Sigma body this head is
+    added to (``SigmaOmegaResult.efermi_ry``).  The head Sigma(omega) lives
+    on the same omega grid, so it must be measured from the same energy.
 
     A head-less Σ_c is a silent wrong answer (Bug B,
     reports/sigma_ppm_tighten_2026-07-04).  Injection is deliberately left
@@ -179,6 +186,8 @@ def _compute_analytic_head_diag(
                 f"{expected}, got {enk_full_np.shape}.")
         occupations = np.asarray(
             iteration_head.sigma_occupations, dtype=np.float64)
+    if body_efermi_ry is not None:
+        efermi_ry = float(body_efermi_ry)
     n_occ = min(meta.nelec, enk_full_np.shape[1])
 
     # The head is band-diagonal; compute that lossless (nω, nk, nb)
@@ -365,7 +374,8 @@ def _report_band_extrapolation(
         wfn, sym, band_slices.sigma_range, band_slices.sigma_range,
         nspinor=meta.nspinor)
     enk_ev = np.asarray(enk_dft) * RYD_TO_EV
-    omega_eval_ev = enk_ev - float(wfn.efermi) * RYD_TO_EV
+    omega_eval_ev = enk_ev - (float(wfn.efermi) if sigma_omega.efermi_ry is None
+                              else float(sigma_omega.efermi_ry)) * RYD_TO_EV
     omega_grid_ev = np.asarray(config.omega_grid_ev, dtype=np.float64)
     head = (None if head_sigma_diag_w_kn_ry is None
             else np.asarray(head_sigma_diag_w_kn_ry))
@@ -719,6 +729,7 @@ def compute_ppm_sigma_pipeline(
             config=config, band_slices=band_slices,
             wfn=wfn, sym=sym, meta=meta,
             iteration_head=iteration_head,
+            body_efermi_ry=sigma_omega.efermi_ry,
             print_fn=print_fn,
         )
 
@@ -755,4 +766,5 @@ def compute_ppm_sigma_pipeline(
         sigma_c_body_omega_unextrap=sigma_c_body_omega_unextrap,
         probe_hermiticity_residual=ppm.probe_hermiticity_residual,
         odd_even_residue_ratio=ppm.odd_even_residue_ratio,
+        efermi_ry=sigma_omega.efermi_ry,
     )

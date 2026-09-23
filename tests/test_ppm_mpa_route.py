@@ -107,3 +107,15 @@ def test_ppm_fit_is_handed_in_memory_to_the_mpa_route(monkeypatch):
     assert len(mpa_kw["sigma_branches"]) == 4
     assert result.band_counts == plan.counts
     assert result.sigma_c_kij.shape == (1, 2, 1, 2, 2)
+    # The body's omega frame travels with the result (midgap of -0.4/0.6).
+    assert mpa_kw["efermi_ry"] == result.efermi_ry
+    np.testing.assert_allclose(result.efermi_ry, 0.1, rtol=0, atol=1e-15)
+
+
+def test_ppm_finalize_reads_sigma_in_the_body_frame():
+    """Audit 2026-09-23 item 2: the PPM finalizer used wfn.efermi (DFT midgap)
+    while the body was measured from the current VBM."""
+    import inspect
+    from gw import sigma_dispatch
+    src = inspect.getsource(sigma_dispatch._compute_ppm_sigma)
+    assert "efermi_ry=ppm_outputs.efermi_ry" in src

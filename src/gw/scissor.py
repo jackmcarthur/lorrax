@@ -728,6 +728,7 @@ def fit_scissor(
     *,
     k_weights: np.ndarray,
     conduction_frontier_tol_ev: float | None = None,
+    conduction_rigid_mean: bool = False,
 ) -> ScissorFit:
     """Fit valence / conduction scissor lines to (E_DFT, ΔE) samples.
 
@@ -774,6 +775,11 @@ def fit_scissor(
         It makes the energy-only sum-band tail independent of how many higher
         conduction bands happen to lie inside the active QP matrix. ``None``
         preserves the general all-conduction affine fit.
+    conduction_rigid_mean : bool, optional
+        Replace the conduction affine regression by ONE rigid shift: the
+        k-weighted mean of ``E_QP - E_DFT`` over every trusted conduction
+        sample (``fit_mask_kn`` and not valence).  Exclusive with
+        ``conduction_frontier_tol_ev``.
     """
     E_dft = np.asarray(E_dft_kn_ev, dtype=np.float64)
     E_qp = np.real(np.asarray(E_qp_kn_ev, dtype=np.complex128))
@@ -831,6 +837,14 @@ def fit_scissor(
     alpha_c, beta_c, _ = _wls_line(
         E_dft_sorted[mask_c], E_qp_sorted[mask_c], w_c)
 
+    if conduction_rigid_mean and conduction_frontier_tol_ev is not None:
+        raise ValueError(
+            "fit_scissor: conduction_rigid_mean and conduction_frontier_tol_ev "
+            "are two different conduction laws; pass one.")
+    if conduction_rigid_mean and np.any(mask_c):
+        alpha_c = 1.0
+        beta_c = float(np.sum(w_c * (E_qp_sorted - E_dft_sorted)[mask_c])
+                       / np.sum(w_c))
     if conduction_frontier_tol_ev is not None and np.any(mask_c):
         tol_ev = float(conduction_frontier_tol_ev)
         if not np.isfinite(tol_ev) or tol_ev < 0.0:
