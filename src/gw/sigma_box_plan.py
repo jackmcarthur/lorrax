@@ -854,6 +854,20 @@ def _fit_fixed_sc_rules(
             session["material_class"] = named_class
             session.pop("rules", None)
             session["class_flip"] = f"{previous_class}->{named_class}"
+    # Owner 2026-09-22 (TaAs semimetal SC): a window that escapes its frozen box, or a new
+    # window, rebuilds the rule set for this map instead of refusing; each rebuild is counted.
+    if "rules" in session:
+        stale = [spec["name"] for spec in rows if spec["name"] not in session["rules"]]
+        for spec in rows:
+            entry = session["rules"].get(spec["name"])
+            if entry is not None and (
+                    _box_escape_reasons(entry["fit"]["rule_box"], spec["box"])
+                    or bool(entry["fit"]["relative"]) != (spec["kind"] != "crossing")):
+                stale.append(spec["name"])
+        if stale:
+            session.pop("rules")
+            session["rebuild_count"] = int(session.get("rebuild_count", 0)) + 1
+            session["class_flip"] = f"escape rebuild {session['rebuild_count']}: {sorted(set(stale))}"
     if "rules" not in session:
         session["eta_ry"] = float(eta)
         session["eps"] = float(eps)
