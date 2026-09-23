@@ -188,7 +188,7 @@ def test_default_bispinor_self_consistency_uses_live_four_current(tmp_path):
     assert cfg.qp_solver is QPSolver.SELF_CONSISTENT
     assert cfg.density_self_consistent
     assert "density_self_consistent" not in cfg.raw_input_keys
-    assert any("required live (rho, J) Hartree rebuild" in line
+    assert any("live (rho, J) Hartree rebuild" in line
                for line in lines)
 
 
@@ -215,10 +215,22 @@ def test_bispinor_accepts_live_four_current_self_consistency(tmp_path):
     assert cfg.density_self_consistent
 
 
-def test_scalar_self_consistency_keeps_fixed_density_default(tmp_path):
+def test_scalar_self_consistency_defaults_to_live_density(tmp_path):
     cfg = _config(tmp_path, "qp_solver = self_consistent\n")
     assert cfg.qp_solver is QPSolver.SELF_CONSISTENT
+    assert cfg.density_self_consistent
+
+
+def test_scalar_explicit_fixed_density_is_kept_and_announced(tmp_path):
+    lines: list[str] = []
+    path = tmp_path / "cohsex_fixed_density.in"
+    path.write_text(BASE_INPUT + "qp_solver = self_consistent\n"
+                    "density_self_consistent = false\n")
+    cfg = LorraxConfig.from_input_file(
+        str(path), print_fn=lambda *a, **k: lines.append(" ".join(map(str, a))))
     assert not cfg.density_self_consistent
+    assert any("WARNING density_self_consistent = false" in line
+               for line in lines)
 
 
 def test_legacy_bispinor_self_consistency_gets_same_live_default(tmp_path):
