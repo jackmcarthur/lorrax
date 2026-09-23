@@ -92,14 +92,17 @@ def refuse_unsupported_shared_pole_head(config, *, trs_allowed, nspinor):
     the bank, moments and constructor had run and ``model.h5`` was committed,
     so a rerun in that directory then refused on the committed model (Q0HEAD
     2026-09-16).  ``trs_allowed`` is the final ``SymMaps.trs_allowed`` the
-    store's representation follows; ``nspinor`` is the WFN's, 1 or 2 for the
-    charge representation this head evaluates.
+    store's representation follows; ``nspinor`` is the source WFN's. The
+    bare-transverse shared-pole route stores its charge operator on the
+    four-component carrier, so its preflight must use that store extent.
     """
-    from .gw_config import HeadCorrection
+    from .gw_config import HeadCorrection, uses_bare_transverse_shared_pole
     if (config.sigma.w_model != "shared_pole"
             or config.head.correction is not HeadCorrection.FULL):
         return
-    _refuse_head_representation(trs_allowed=trs_allowed, nspinor=nspinor)
+    store_nspinor = (4 if (bool(getattr(config, "bispinor", False))
+                          and uses_bare_transverse_shared_pole(config)) else nspinor)
+    _refuse_head_representation(trs_allowed=trs_allowed, nspinor=store_nspinor)
 
 
 def _refuse_head_representation(*, trs_allowed, nspinor):
@@ -107,10 +110,9 @@ def _refuse_head_representation(*, trs_allowed, nspinor):
 
     ``nspinor`` 1 or 2 is the charge representation (module docstring): the
     two-component store holds the same spin-traced charge operator and its
-    head vertices trace the spinor index, so both evaluate identically.  An
-    N_spinor = 4 store is the kinetic-balance bispinor lift with a photon
-    layout; its Gamma completion is the packed photon head, not this scalar
-    charge head.
+    head vertices trace the spinor index, so both evaluate identically. The
+    four-component charge carrier has no certified scalar wing/body fold.
+    The full photon layout has a separate Gamma completion.
     """
     remedy = ("On this store head_correction = no_local_fields delivers the direct "
               "frequency-dependent head (exact without time reversal; the k sum runs over "
@@ -129,10 +131,10 @@ def _refuse_head_representation(*, trs_allowed, nspinor):
     if int(nspinor) not in (1, 2):
         raise ValueError(
             f"GATE shared_pole_head_nspinor: got N_spinor = {int(nspinor)}; want 1 or 2 (the "
-            "charge representation); why: this scalar charge head evaluates the spin-traced "
-            "charge body, and an N_spinor = 4 store is the bispinor lift whose Gamma "
-            "completion is the packed photon head (gw.photon_sigma), not this one. A one-shot "
-            "deck runs with head_correction = off.")
+            "certified full-head representations); why: the four-component charge "
+            "carrier has no certified scalar wing/body fold. Use head_correction = "
+            "no_local_fields for its direct Gamma head, or head_correction = off "
+            "for a headless development deck.")
 
 
 def shared_pole_head_plan(config, recipe, *, material_class):
