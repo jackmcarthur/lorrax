@@ -58,8 +58,12 @@ def shared_pole_byte_terms(meta, *, mesh_xy, resolution, pencil_side,
             raise ValueError('cross reduction original sides must be positive')
         # The original CT pencils are rectangular C-by-T. They are projected
         # on the two retained diagonal spans before the joint square is made.
-        # Charge both live stages at once, including their overlap.
-        dense = 14 * (c*t + r*r) + 12 * packed * (c+t)
+        # The original assembly's largest rectangular live set has five
+        # finite blocks, three top, three bottom and four corner blocks,
+        # plus at most four whole-rectangle concatenation/output buffers:
+        # at most nine C-by-T equivalents. Allow one more for overlap with
+        # projection, and keep the full fourteen-copy joint-square envelope.
+        dense = 10 * c*t + 14 * r*r + 12 * packed * (c+t)
         sample_faces = 0
     elif phase == "reduction":
         if selection_faces is not None:
