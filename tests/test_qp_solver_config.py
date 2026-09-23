@@ -127,13 +127,13 @@ def test_kij_stream_refused_even_in_static_modes(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# bispinor_gw: TWO values, and the retired spellings refuse BY NAME
+# bispinor_gw: explicit modes, and the retired spellings refuse BY NAME
 # (owner ruling 2026-09-01; lane J architecture review section 2)
 # ---------------------------------------------------------------------------
 
-def test_bispinor_gw_grammar_is_exactly_two_values():
+def test_bispinor_gw_grammar_names_the_full_frequency_sector_mode():
     assert [m.value for m in BispinorGWMode] == [
-        "bare_transverse", "full_static_cohsex"]
+        "bare_transverse", "full_shared_pole", "full_static_cohsex"]
 
 
 @pytest.mark.parametrize("spelling,gate,replacement", [
@@ -160,11 +160,11 @@ def test_retired_bispinor_gw_spellings_refuse_and_name_the_replacement(
     assert "docs/input_reference.md" in text
 
 
-def test_both_shipped_modes_ride_the_one_raw_carrier():
+def test_all_shipped_modes_ride_the_one_raw_carrier():
     """``bispinor_gw`` picks which Lorentz blocks are screened, not a lift."""
     reps = [resolve_four_current_representation(True, mode)
-            for mode in ("bare_transverse", "full_static_cohsex")]
-    assert reps[0] == reps[1]
+            for mode in BispinorGWMode]
+    assert reps[0] == reps[1] == reps[2]
     assert reps[0].charge_lift == reps[0].current_lift == "raw"
     assert reps[0].scalar_head_bispinor
     assert uses_four_spinor_finite_q_charge(True, "full_static_cohsex")
