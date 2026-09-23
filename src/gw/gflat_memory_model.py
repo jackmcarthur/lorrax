@@ -875,8 +875,17 @@ def plan_gflat_chunks(
             face_nb, pp, name="face bands at candidate rank").carrier
         if band_chunk_override and band_chunk_override > 0:
             floor_bc = int(band_chunk_override)
-        else:
+        elif cache_psi_r:
             floor_bc = fit_nb
+        else:
+            # Streamed (cache-free) route: the band chunk is chosen below by
+            # ``_band_candidate_fits`` and may be as small as one band per
+            # rank, so the un-chunkable floor is priced at that smallest legal
+            # chunk.  Pricing it at the whole fit window made the FFT box and
+            # the face pair accumulator look un-chunkable and refused CrI3
+            # 16x16 / 501 bands / 5030 centroids at P36 with P_min = 60
+            # (pool 58781114 step .17) although Phase 2 picks smaller chunks.
+            floor_bc = pp
         floor_bc = max(pp, padded_axis(
             floor_bc, pp, name="fit-band chunk at candidate rank").carrier)
         fit_padded = max(pp, padded_axis(
