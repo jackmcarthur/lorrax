@@ -25,6 +25,7 @@ import numpy as np
 from common.units import RYD_TO_EV
 from common.wfn_transforms import get_enk_bandrange
 import common.timing as timing
+from runtime.padding import strip_axis
 
 from .band_extrapolation import (
     BAND_EXTRAPOLATION_ESTIMATOR_DEFAULT,
@@ -313,6 +314,16 @@ def _extrapolated_point(cube, weights):
         raise ValueError(
             f"_extrapolated_point: weights must be (3,) [band_index_only] or "
             f"(3, nk, nb) [spectral_shell], got shape {w.shape}")
+    if w.ndim == 3 and w.shape[-1] != int(cube.shape[-1]):
+        # Per-state weights are fitted on the LOGICAL bands; the cube keeps
+        # its padded band carrier, whose extra rows/columns are zero.  Zero
+        # weights there keep them zero without stripping the cube.
+        carrier = int(cube.shape[-1])
+        if w.shape[-1] > carrier:
+            raise ValueError(
+                f"_extrapolated_point: {w.shape[-1]} logical bands exceed the "
+                f"cube's band carrier {carrier}")
+        w = np.pad(w, ((0, 0), (0, 0), (0, carrier - w.shape[-1])))
 
     sharding = getattr(cube, "sharding", None)
     if not isinstance(sharding, NamedSharding):
@@ -363,8 +374,13 @@ def _report_band_extrapolation(
 
     points = []
     for i in range(cube.shape[0]):
+        # The cube lives on the padded band carrier; the head, the DFT
+        # energies and the fit are logical.  Strip at this consumer boundary.
         diag_w_kn = np.asarray(
             extract_sigma_diag_replicated(_band_count_point(cube, i), mesh_xy))
+        if sigma_omega.band_axis is not None:
+            diag_w_kn = np.asarray(strip_axis(
+                diag_w_kn, sigma_omega.band_axis, axis=-1))
         if head is not None:
             diag_w_kn = diag_w_kn + head
         # Ry -> eV here, exactly where ``eval_sigma_c_at_dft_energies`` does
