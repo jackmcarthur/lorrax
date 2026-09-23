@@ -88,8 +88,8 @@ def shared_pole_operator_realizer(meta, header, *, q_full_idx, mesh_xy):
             f"expected {expected!r}, rebuild this model with the current recipe")
     if (header.get("representation") not in ("scalar-trs-even-s", "scalar-ordered-ph")
             # nspinor records the source; the stored operator is the
-            # spin-traced charge response on scalar and two-component decks.
-            or header.get("nspinor") not in (1, 2)
+            # spin-traced charge response, including four-component sources.
+            or header.get("nspinor") not in (1, 2, 4)
             or header.get("q_order") != "canonical-full-flat"
             or not np.array_equal(header.get("q_shift"), np.zeros(3))):
         raise ValueError("GATE shared_pole_realization: unsupported scalar q-grid representation")
