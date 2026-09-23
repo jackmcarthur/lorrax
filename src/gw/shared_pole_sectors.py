@@ -13,6 +13,21 @@ import jax.numpy as jnp
 from gw.shared_pole_pencil import _matrix_layout, _matrix_take_columns, _matrix_concat
 
 
+def _contiguous_q_spans(ids, real, limit=4):
+    """Canonical q spans from a possibly partner-permuted constructor round.
+
+    The small limit bounds the extra public factor and store conversion panel;
+    the store still admits each panel against the current map capacity ledger.
+    """
+    ordered=sorted(range(real),key=lambda slot:ids[slot])
+    spans=[]
+    for slot in ordered:
+        if not spans or len(spans[-1])==limit or ids[slot]!=ids[spans[-1][-1]]+1:
+            spans.append([])
+        spans[-1].append(slot)
+    return tuple((ids[slots[0]],ids[slots[-1]]+1,tuple(slots)) for slots in spans)
+
+
 @lru_cache(maxsize=None)
 def _sector_read_programs(mesh,indices,masks,execution):
     import jax
@@ -366,12 +381,12 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output):
                 if poles.shape[-1] < width:
                     poles=np.pad(poles,((0,0),(0,width-poles.shape[-1])),constant_values=1.0)
                 factor=face_rows(mesh_xy,tuple(range(real)),width)(treated_factor if is_face(treated_factor) else to_face(treated_factor))
-                for slot,q in enumerate(ids[:real]):
-                    public=canonical_factors(mesh_xy,(slot,),components=3 if family else 1)(factor)
+                for q0,q1,slots in _contiguous_q_spans(ids,real):
+                    public=canonical_factors(mesh_xy,slots,components=3 if family else 1)(factor)
                     filename=root/(name+'.h5')
                     store_header=write_shared_pole_model(filename,public,
-                        device_put_process_local(poles[slot:slot+1,:width],NamedSharding(mesh_xy,P())),
-                        counts[slot:slot+1],q_span=(q,q+1),meta=meta,tables=bank['sector_tables'][family],
+                        device_put_process_local(poles[list(slots),:width],NamedSharding(mesh_xy,P())),
+                        counts[list(slots)],q_span=(q0,q1),meta=meta,tables=bank['sector_tables'][family],
                         recipe=recipe,receipts=dict(identity=bank['identity'],constructor=row_receipt),
                         ordered=True,basis=bank['mu_bases'][family],sector=name)
                     stores[name]=(str(filename),store_header)
