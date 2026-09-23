@@ -88,6 +88,13 @@ not contain the state needed for an exact nonlinear restart. A rotation dump
 is the input `sigma_basis_U` consumed by that map; the eqp0 QP column is the
 map's output spectrum. Those two arrays are not a paired eigensystem.
 
+Four-current maps also write `sigma_lorentz_iterNNNN.h5`: complex
+`sigma_lorentz_skij_ev` with sectors `(CC, CT+TC, TT)`, in the map's **input
+QP basis**, alongside `U_dft_to_qp_kij`, crystal k points, k-set and absolute
+band start. This small committed file permits a direct CT+TC matrix-element
+readout even when the run stops before terminal Sigma output. It is a
+diagnostic, not a restart state.
+
 ### Starting from a previous QP solution
 
 `sc_initial_qp_rotations_file` imports an authenticated eigensystem as the
