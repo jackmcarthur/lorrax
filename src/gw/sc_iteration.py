@@ -2184,13 +2184,25 @@ def _hartree_density_embed_kernel(mesh_xy: Mesh, nb_full: int):
     return kernel
 
 
-def _dft_psi_sphere(inputs, *, full_density: bool = False):
-    """DFT ψ(G) on the SC k-set, loaded ONCE and cached.
+def _dft_psi_sphere(inputs):
+    """DFT ψ(G) on the SC k-set over the QP window, loaded ONCE and cached.
 
     The SC bundle carries ψ at ISDF CENTROIDS, which cannot reconstruct
     ρ on the FFT grid, so the density rebuild needs the G-sphere.  ψ_DFT
     is constant across iterations — only U moves — so this is one read per
     run, not one per iteration.
+
+    ONE WINDOW, READ AT ITS OWN CARRIER, NEVER SLICED.  The density and the
+    matrix sweep both consume exactly ``[b0, b3)``; the loader shards that
+    window over the whole mesh as it reads it (``band_sphere_spec``), which
+    is already the sweep's carrier.  Reading a wider ladder and slicing the
+    band axis afterwards is the defect this replaced: an eager slice of the
+    ``('x','y')``-sharded band axis lowers to a dynamic slice that the
+    partitioner resolves by replicating, and on VI3 12x12 at P100 that was
+    the whole ``(144, 200, 4, 72541)`` c128 window, 124.52 GiB on EVERY
+    rank (``runs/VI3/09_*/11_gnppm_sc_bispinor_ferroU6/gwjax.log``).  Why
+    the tail above ``b3`` may be left out of ρ is argued, and enforced, at
+    :func:`_density_window_occupations`.
 
     THE BAND RANGE IS GLOBAL, THE CARRY'S EXTENT IS b0-RELATIVE.
     ``WfnLoader.load`` indexes the file's bands, ``[0, wfn.nbands)``
@@ -2216,8 +2228,6 @@ def _dft_psi_sphere(inputs, *, full_density: bool = False):
             f"{b_hi - b_lo} bands but the SC carry is {nb_sigma} wide.  These "
             f"describe the same active subspace and a mismatch means one of "
             f"them is b0-relative where the other is global.")
-    if full_density:
-        b_hi = int(inputs.band_slices.b4_logical)
     # Key on the GLOBAL RANGE, not on its width: two windows of equal
     # extent at different b0 are different ψ and must not share a cache
     # entry.
@@ -2270,6 +2280,55 @@ def _kstar(inputs):
     if ks is not None:
         return ks
     return KStarMap.identity(int(inputs.kin_ion_dft.shape[0]))
+
+
+#: Electrons per cell the SC density may leave out above the QP window.
+#: The bound it is compared with is exact (see the function below), so this
+#: is the whole numerical budget of the band cut: fixed/step occupations
+#: give exactly 0, and the bcc Fe FD decks ~1e-16 (E_25 - mu = 10.2 eV at
+#: kBT = 0.02 Ry, ``runs/Fe/19_*/qe/WFN.h5``).  A deck that needs more has
+#: occupied states outside its QP window and must widen the window.
+_DENSITY_TAIL_ELECTRON_TOL = 1.0e-12
+
+
+def _density_window_occupations(occ, kweights, nb_window: int,
+                                f_spin: float):
+    """The QP-window occupations the density uses, after refusing a tail.
+
+    WHY THE WINDOW IS ENOUGH.  ``rho = f_spin sum_k w_k sum_n f_nk
+    |psi~_nk|^2`` with ``psi~ = psi . blockdiag(U_qp, 1)``.  ``U_qp`` mixes
+    only inside ``[b0, b3)`` (``b0 = 0``, :func:`run_sc_driver`), so every
+    band at or above ``b3`` is its own unrotated DFT state and enters only
+    through its own weight ``f_nk``.  Leaving those bands out moves rho by
+    ``f_spin sum_k w_k sum_{n>=b3} f_nk |psi_nk|^2``, whose integral of
+    ``|.|`` is at most ``D = f_spin sum_k w_k sum_{n>=b3} |f_nk|``
+    electrons (each ``|psi|^2`` integrates to one and the star average is an
+    average).  The Dirac current carries the same per-state weights and
+    ``|J| <= rho`` state by state (J = j/c), so D bounds it too.  ``D == 0``
+    makes the cut exact, not approximate; the check is on D itself.
+
+    ``occ`` is the rotated bundle's table on the density's k rows: tiny and
+    replicated ``P(None, None)`` (``rotate_wavefunctions``), so the slice
+    below cannot re-replicate anything.  Returns ``(occ_window, D)``.
+    """
+    from gw.efermi import occupied_band_count
+
+    nb_window = int(nb_window)
+    if int(occ.shape[1]) < nb_window:
+        raise ValueError(
+            f"SC density occupations have {int(occ.shape[1])} bands, fewer "
+            f"than the {nb_window}-band QP window")
+    dropped = float(f_spin) * occupied_band_count(
+        jnp.abs(occ[:, nb_window:]), kweights)
+    if not np.isfinite(dropped) or dropped > _DENSITY_TAIL_ELECTRON_TOL:
+        raise ValueError(
+            "GATE sc_density_band_cut: bands at or above the QP window "
+            f"[0, {nb_window}) carry {dropped:.3e} electrons per cell "
+            f"(budget {_DENSITY_TAIL_ELECTRON_TOL:.0e}).  The density is "
+            "built from the QP window only, because the QP rotation mixes "
+            "nothing above it; an occupied state there would be silently "
+            "dropped.  Widen the QP window (ncond) in a new calculation.")
+    return occ[:, :nb_window], dropped
 
 
 # THE DENSITY-SC ROW, AND ITS CHILDREN.  ``vh.rebuild`` is the whole
@@ -2337,19 +2396,19 @@ def rebuild_hartree_dft_basis(inputs, U_qp, occupations_full,
                                     sweep_matrix_elements)
     from psp.dft_operators import padded_gvectors
 
-    psi_G, bidx = _dft_psi_sphere(inputs, full_density=True)
+    # ONE resident ψ(G) serves the density AND the sweep: the QP window
+    # [b0, b3), read by the loader directly at its band-sharded carrier.
+    # Nothing below slices its band axis (_dft_psi_sphere says why).
+    psi_G, bidx = _dft_psi_sphere(inputs)
     nk = int(psi_G.shape[0])
-    # Density uses the full logical loaded ladder, including physical bands
-    # above the QP window.  The loader returns its mesh-padded carrier.
     nb_logical = int(inputs.band_slices.nb_sigma)
-    nb_full_logical = int(inputs.band_slices.nb_full_logical)
     from common.wfn_layout import band_sphere_spec
     from runtime.padding import authenticate_axis, padded_axis, strip_axis
-    full_band_axis = padded_axis(
-        nb_full_logical, inputs.mesh_xy, name='SC density band sphere',
+    band_axis = padded_axis(
+        nb_logical, inputs.mesh_xy, name='SC Hartree band sphere',
         spec=band_sphere_spec(), axis=1)
-    authenticate_axis(psi_G, full_band_axis, axis=1,
-                      where='SC exact Hartree density band sphere')
+    authenticate_axis(psi_G, band_axis, axis=1,
+                      where='SC exact Hartree band sphere')
     # The rotated bundle carries its face-mesh pad; rho_from_wfns owns the
     # further zero-occupation pad to the sphere carrier before its scan.
     bundle_shape = tuple(inputs.wfns_dft.enk.shape)
@@ -2370,13 +2429,16 @@ def rebuild_hartree_dft_basis(inputs, U_qp, occupations_full,
         raise ValueError(
             f'SC exact Hartree active rotation must be {nb_logical} square; '
             f'got {U_qp.shape[-2:]}')
+    f_spin = spin_degeneracy_factor(inputs.wfn)
+    occ, dropped = _density_window_occupations(
+        occ, kweights, nb_logical, f_spin)
     U_density = _hartree_density_embed_kernel(
-        inputs.mesh_xy, full_band_axis.carrier)(U_qp)
+        inputs.mesh_xy, band_axis.carrier)(U_qp)
     inputs.print_fn(
-        f'    V_H rebuild: current-map full-band occupations, '
+        f'    V_H rebuild: current-map occupations on the QP window '
+        f'[0, {nb_logical}) (tail above it: {dropped:.1e} e), '
         f'mu={float(efermi_ry) * RYD_TO_EV:.8f} eV')
 
-    f_spin = spin_degeneracy_factor(inputs.wfn)
     grid = tuple(int(v) for v in inputs.wfn.fft_grid)
     representation = resolve_four_current_representation(
         bool(inputs.config.bispinor), inputs.config.bispinor_gw)
@@ -2428,21 +2490,24 @@ def rebuild_hartree_dft_basis(inputs, U_qp, occupations_full,
                 tt_metric_sign=float(COULOMB_GAUGE_TT_SIGN))
 
     gtab = padded_gvectors(inputs.wfn, k=inputs.sym.parent_k_domain)
+    # Both branches sweep the resident sphere itself.  The four-current
+    # operator takes the charge block by ``charge_nspinor``; without a
+    # current the loader read no bispinor, so the charge IS every loaded
+    # component and a spinor slice would only be a second copy of ψ.
+    if V_T_r is None and charge_ns != int(psi_G.shape[2]):
+        raise ValueError(
+            f'SC exact Hartree: scalar sweep needs charge nspinor '
+            f'{charge_ns} == loaded nspinor {int(psi_G.shape[2])}')
     geom_matrix = SweepGeometry(
         mesh=inputs.mesh_xy, fft_grid=grid,
         ngkmax=int(psi_G.shape[3]), nb=nb_logical,
-        ns=(int(psi_G.shape[2]) if V_T_r is not None
-            else charge_ns), nk=nk,
+        ns=int(psi_G.shape[2]), nk=nk,
         cell_volume=float(inputs.wfn.cell_volume))
-    # The sweep projects only the QP carry.  Keep its mesh-legal active
-    # carrier; the full density sphere above remains resident and sharded.
-    psi_matrix = psi_G[:, :geom_matrix.band_axis.carrier, :, :]
-    authenticate_axis(psi_matrix, geom_matrix.band_axis, axis=1,
-                      where='SC exact Hartree active band sphere')
-    psi_charge = psi_matrix[:, :, :charge_ns, :]
+    authenticate_axis(psi_G, geom_matrix.band_axis, axis=1,
+                      where='SC exact Hartree matrix band sphere')
     if V_T_r is not None:
         H_pair = sweep_matrix_elements(
-            psi_matrix,
+            psi_G,
             operator=four_current_potential_operator(
                 geom_matrix, V_H_r, V_T_r,
                 charge_nspinor=charge_ns),
@@ -2453,7 +2518,7 @@ def rebuild_hartree_dft_basis(inputs, U_qp, occupations_full,
         del H_pair
     else:
         H_scalar = sweep_matrix_elements(
-            psi_charge,
+            psi_G,
             operator=local_potential_operator(geom_matrix, V_H_r),
             geom=geom_matrix,
             gvecs=gtab.gvecs, gmask=gtab.mask, box_index=bidx,

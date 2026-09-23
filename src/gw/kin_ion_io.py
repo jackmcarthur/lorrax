@@ -988,7 +988,11 @@ def compute_hartree_matrix(wfn, sym, meta, *, truncation_2d: bool,
         bands=(0, nb), k=k_spec, sharding=band_sphere_spec(),
         bispinor=(int(meta.nspinor) == 4),
         bispinor_lift=bispinor_lift)
-    psi_charge = psi_G if charge_ns == int(psi_G.shape[2]) \
+    # The four-current operator takes its charge block by charge_nspinor
+    # from psi_G itself, so a spinor slice is needed only by the scalar
+    # sweep; in transverse mode it was a dead second copy of the sphere.
+    psi_charge = psi_G if (with_transverse
+                           or charge_ns == int(psi_G.shape[2])) \
         else psi_G[:, :, :charge_ns, :]
     geom_matrix = SweepGeometry(
         mesh=mesh, fft_grid=meta.fft_grid,

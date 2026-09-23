@@ -1554,7 +1554,8 @@ def sweep_matrix_elements(
     band window is a windowed ψ plus a geometry built at the window's
     ``nb``::
 
-        sweep_matrix_elements(psi_G[:, lo:hi], geom=SweepGeometry(
+        psi_win = wfn.load(bands=(lo, hi), sharding=band_sphere_spec(), ...)
+        sweep_matrix_elements(psi_win, geom=SweepGeometry(
             ..., nb=hi - lo), ...)      ->  (nk, hi-lo, hi-lo)
 
     and the block comes back at WINDOW indices.  Everything else keys off
@@ -1562,9 +1563,14 @@ def sweep_matrix_elements(
     A ``band_window=`` argument would be a second way to say the same thing
     and one more thing for every call site to get right — the mistake the
     2026-08-04 SlabIO padding ruling names — so there deliberately is none.
-    The one cost is that slicing a ``('x','y')``-sharded ψ on the SHARDED
-    axis is an eager reshard; it is paid once, outside the scan, against a
-    scan whose every stage is then ``nb/(hi-lo)`` times smaller.
+
+    READ THE WINDOW; DO NOT SLICE A RESIDENT ψ TO IT.  An eager
+    ``psi_G[:, lo:hi]`` on the ``('x','y')``-sharded band axis lowers to a
+    dynamic slice with a runtime start, and the partitioner resolves that by
+    REPLICATING the result: the whole window on every rank.  That was
+    124.52 GiB per rank on VI3 12x12 at P100 (``gw.sc_iteration.
+    _dft_psi_sphere`` has the evidence).  The loader shards a window as it
+    reads it, at exactly this sweep's carrier.
     """
     mesh = geom.mesh
     nk = geom.nk
