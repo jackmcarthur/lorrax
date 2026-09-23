@@ -1372,7 +1372,8 @@ def initialize_kpath(wfn, params):
     kpath_frac, node_indices, node_labels = info
     bvec = np.asarray(wfn.bvec, dtype=float)
     blat = float(wfn.blat)
-    k_cart = np.asarray(kpath_frac) @ bvec * blat * (2.0 * np.pi)
+    # WFN blat already carries 2π/alat; bvec is dimensionless.
+    k_cart = np.asarray(kpath_frac) @ bvec * blat
     seg_len = np.linalg.norm(np.diff(k_cart, axis=0), axis=1)
     x_path = np.concatenate([[0.0], np.cumsum(seg_len)])
     # Compare against the CANONICAL label ``_clean_label`` emits (the real
