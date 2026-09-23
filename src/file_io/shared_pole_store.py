@@ -43,12 +43,14 @@ def _refuse(message):
 def charge_representation(meta):
     """True when the bank operator is the spin-traced charge response.
 
-    Scalar and two-component (noncollinear) decks both give one ``[q, mu, mu]``
-    charge operator: the response stream traces both spinor endpoints. A
-    kinetic-balance bispinor lift (``nspinor = 4``) is a different operator.
+    The response stream traces both spinor endpoints into one ``[q, mu, mu]``
+    charge operator. A four-component kinetic-balance carrier retains the
+    two-component source WFN identity; it does not add current vertices here.
     """
     nspinor = int(meta.nspinor)
-    return nspinor == 1 or nspinor == 2 == int(meta.nspinor_wfnfile)
+    source_spinor = int(meta.nspinor_wfnfile)
+    return (nspinor == 1 or (nspinor == 2 and source_spinor == 2)
+            or (nspinor == 4 and source_spinor == 2))
 
 
 def _capacity(meta):
@@ -1209,7 +1211,7 @@ def validate_shared_pole_bank(path, *, expected_identity, mesh_xy,
         _refuse("scratch bank malformed written masks")
     if (nq != header["n_q_irr"] or nsample != _bank_nsample(plan)
             or shape["d"] != header["n_mu_logical"]
-            or header["nspinor"] not in ((4,) if "photon_layout" in header else (1, 2))):
+            or header["nspinor"] not in ((4,) if "photon_layout" in header else (1, 2, 4))):
         _refuse("scratch bank geometry/representation mismatch")
     # Geometry only: never load a matrix through the metadata handle.
     with h5py.File(path, "r") as file:

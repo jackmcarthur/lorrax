@@ -151,6 +151,32 @@ shared_real_pole_gates_ordered_v1["retained_subspace_moments"].update({
 
 ORDERED_GATE_HASH = table_hash(shared_real_pole_gates_ordered_v1)
 
+# A four-component charge carrier is a new representation of the same scalar
+# CC operator. Keep the scalar and full photon gate hashes unchanged, so an
+# existing artifact cannot silently acquire the charge4 interpretation.
+CHARGE4_GATE_VERSION = "shared_real_pole_charge4_v1"
+shared_real_pole_gates_charge4_trs_v1 = copy.deepcopy(shared_real_pole_gates_v1_r3b)
+shared_real_pole_gates_charge4_ordered_v1 = copy.deepcopy(shared_real_pole_gates_ordered_v1)
+for _ordered, _table in ((False, shared_real_pole_gates_charge4_trs_v1),
+                         (True, shared_real_pole_gates_charge4_ordered_v1)):
+    _table["representation"] = {
+        "name": "representation",
+        "predicate": ("four-component spin-traced charge operator; "
+                      "ordered particle-hole bank" if _ordered else
+                      "four-component spin-traced charge operator; TRS-even bank"),
+        "threshold": {"nspinor": 4, "trs_allowed": not _ordered,
+                      **({"ordered": True} if _ordered else {})},
+        "version": CHARGE4_GATE_VERSION,
+    }
+CHARGE4_TRS_GATE_HASH = table_hash(shared_real_pole_gates_charge4_trs_v1)
+CHARGE4_ORDERED_GATE_HASH = table_hash(shared_real_pole_gates_charge4_ordered_v1)
+
+
+def charge4_gates(ordered):
+    """The charge4 receipt table, separate from photon and older charge banks."""
+    return (shared_real_pole_gates_charge4_ordered_v1 if ordered
+            else shared_real_pole_gates_charge4_trs_v1)
+
 
 def representation_row_passed(measured, threshold):
     """True when every measured representation field matches its threshold.
@@ -507,21 +533,24 @@ class CapacityLedger:
 
 
 def construction_receipt(measurements=None, *, capacity=None, capacity_entry_start=None,
-                         ordered=False):
+                         ordered=False, charge4=False):
     """Complete receipt skeleton, explicitly marking every absent gate unmeasured.
 
     ``measurements`` maps names to ``gate_receipt`` keyword dictionaries. Dense
     consumers supply measurements; creating this skeleton certifies no physics.
     """
     measurements = {} if measurements is None else measurements
-    table = shared_real_pole_gates_ordered_v1 if ordered else shared_real_pole_gates_v1_r3b
+    table = (charge4_gates(ordered) if charge4 else
+             shared_real_pole_gates_ordered_v1 if ordered else shared_real_pole_gates_v1_r3b)
     unknown = set(measurements) - set(table)
     if unknown:
         raise ValueError(f"unknown shared-pole receipt predicates: {sorted(unknown)}")
     result = {"schema": RECEIPT_SCHEMA, "recipe_version": RECIPE_VERSION,
             "recipe_hash": RECIPE_HASH,
-            "gate_version": ORDERED_GATE_VERSION if ordered else GATE_VERSION,
-            "gate_hash": ORDERED_GATE_HASH if ordered else GATE_HASH,
+            "gate_version": (CHARGE4_GATE_VERSION if charge4 else
+                             ORDERED_GATE_VERSION if ordered else GATE_VERSION),
+            "gate_hash": (table_hash(table) if charge4 else
+                          ORDERED_GATE_HASH if ordered else GATE_HASH),
             "gates": [gate_receipt(name, table=table, **measurements.get(
                 name, {"reason": "measurement not supplied"}))
                 for name in table]}
@@ -777,11 +806,11 @@ def bind_shared_pole_census(wfns, meta, *, occupation_state, trs_allowed, state_
     from file_io.shared_pole_store import charge_representation
     # trs_allowed is recorded, not gated: a measured break selects the ordered
     # bank and model, and consumers that need the even form refuse by name.
-    photon = int(meta.nspinor) == 4 and int(meta.nspinor_wfnfile) == 2
-    if (not charge_representation(meta) and not photon) or int(meta.nspin) != 1:
+    bispinor = int(meta.nspinor) == 4 and int(meta.nspinor_wfnfile) == 2
+    if not charge_representation(meta) or int(meta.nspin) != 1:
         raise ValueError("GATE shared_pole_representation: want one scalar, spinor or authenticated bispinor state")
     capacity = float(state_capacity)
-    physical_spinor = int(meta.nspinor_wfnfile) if photon else int(meta.nspinor)
+    physical_spinor = int(meta.nspinor_wfnfile) if bispinor else int(meta.nspinor)
     if capacity * physical_spinor != 2.0:
         raise ValueError("GATE shared_pole_census: got: state capacity times Nspinor other than 2; want: authenticated spin-restricted capacity; why: charge normalization")
     val = energies[:, wfns.slices.val]
@@ -1045,9 +1074,16 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
     All ranks execute the metadata work; only ``print_fn`` may filter by rank.
     """
     from common.units import RYD_TO_EV
+    from .gw_config import (uses_bare_transverse_shared_pole,
+                            uses_full_bispinor_shared_pole)
 
     if config.sigma.w_model != "shared_pole":
         return None
+    charge4 = uses_bare_transverse_shared_pole(config)
+    photon = uses_full_bispinor_shared_pole(config)
+    if int(meta.nspinor) == 4 and not (charge4 or photon):
+        raise ValueError("GATE shared_pole_representation: four-component shared-pole "
+                         "response needs an explicit charge or full photon route")
     census = getattr(meta, "shared_pole_census", None)
     if census is None:
         raise ValueError("GATE shared_pole_census: got: absent current census; want: bind_shared_pole_census after current occupations; why: no guessed plasma charge or frozen recipe")
@@ -1119,7 +1155,7 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
     held_line = mids[held_pairs]
     held_imag = np.sqrt(imaginary[[0, -2]] * imaginary[[1, -1]])
     sector_treatment = None
-    if int(meta.nspinor) == 4:
+    if photon:
         sector_treatment = _sector_treatment_ceiling(
             census['response_transition_span_ry'], support_session)
     points, role_z, role_codes, distinct_ids, held_flags, support_pairs = [], [], [], [], [], []
@@ -1165,12 +1201,19 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
         table = hashlib.sha256((table + '|' + json.dumps(
             treatment_identity, sort_keys=True,
             separators=(',', ':'))).encode()).hexdigest()
+    if charge4:
+        version += '+charge4'
+        table = hashlib.sha256((table + '|four-component-spin-traced-v1').encode()).hexdigest()
+    gate_table = (charge4_gates(not census['trs_allowed']) if charge4 else
+                  shared_real_pole_gates_v1_r3b if census['trs_allowed'] else
+                  shared_real_pole_gates_ordered_v1)
     result = {
         'role_codes': dict(ROLE_CODES),
         'recipe_version': version, 'recipe_hash': table,
         'support_sites_override': '' if override is None else override['text'],
-        'gate_version': GATE_VERSION if census['trs_allowed'] else ORDERED_GATE_VERSION,
-        'gate_hash': GATE_HASH if census['trs_allowed'] else ORDERED_GATE_HASH,
+        'gate_version': (CHARGE4_GATE_VERSION if charge4 else
+                         GATE_VERSION if census['trs_allowed'] else ORDERED_GATE_VERSION),
+        'gate_hash': table_hash(gate_table),
         'accuracy': tier, 'accuracy_status': 'NOT_MEASURED',
         'accuracy_reason': 'resolved geometry has no authenticated matching campaign receipt',
         'eta_ev': eta, 'height_ev': height, 'height_ry': height / RYD_TO_EV,
@@ -1203,6 +1246,8 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
         'operator_realization': recipe['operator_realization'],
         'U_bytes_per_rank': meta.shared_pole_capacity.U_bytes_per_rank,
     }
+    if charge4:
+        result['charge_operator'] = 'four-component-spin-traced-v1'
     if support_receipt is not None:
         result['support_envelope'] = support_receipt
     if sector_treatment is not None:
