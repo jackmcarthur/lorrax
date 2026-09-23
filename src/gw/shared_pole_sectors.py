@@ -195,7 +195,11 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output):
         sector_recipe(joint_meta.n_rmu),mesh=mesh_xy,ledger=ledger,
         upstream=upstream,ordered=True,odd_moments=True,
         sample_fields=8,moment_fields=4,parent_count=header['n_q_irr'],
-        retained_output_families=2,column_extent=extent)
+        retained_output_families=2,column_extent=extent,
+        defer_reduction=True,
+        cross_original_sides=tuple(row['conservative_pencil_side'] for row in execution_rows),
+        cross_retained_side=sum(min(row['signed_side_bound'],row['conservative_pencil_side'])
+                                for row in execution_rows))
     resolved_execution=('face' if joint_mode=='face' or
                         any(row['mode']=='face' for row in execution_rows)
                         else 'local')
@@ -592,16 +596,16 @@ def construct_cross_sector_round(sectors, samples, moments, meta, config, *,
         upstream=meta.shared_pole_capacity.live_stages,execution=execution)
     budget.batch_width = charge['model'][0].shape[0]
     budget.retained_panels = (*retained,*ct.values(),*tc.values(),*moments.values())
-    # Cross assembly still has the original rectangular pencil. The sum
-    # prices its envelope even when the retained joint pair is much smaller.
-    original_side = sum(s['coefficients'].shape[-2] for s in sectors)
+    # Cross assembly has rectangular original pencils; only the projected
+    # retained pair is square. Keep those two extents distinct in the ledger.
+    original_sides = tuple(s['coefficients'].shape[-2] for s in sectors)
     widths = [int(jnp.max(jnp.sum(s['signed'][2],axis=-1))) for s in sectors]
     if execution == 'face':
         from runtime.padding import padded_axis
         widths = [padded_axis(width,mesh_xy,name='shared_pole_port',
             specs=((P('x','y'),0),(P('x','y'),1))).carrier for width in widths]
     side = sum(widths)
-    budget.plan(original_side,phase='reduction',eigen_side=side)
+    budget.plan(side,phase='cross_reduction',cross_original_sides=original_sides)
     actions=[]
     for source, forward, reverse, left, right in (
             (charge,tc,ct,transverse,charge),
@@ -634,7 +638,7 @@ def construct_cross_sector_round(sectors, samples, moments, meta, config, *,
             sector['infinity'],y,signed))
     side=sum(s[4].shape[-1] for s in packed)
     budget.retained_panels=(*budget.retained_panels,*jax.tree.leaves((actions,packed)))
-    budget.plan(max(side,original_side),phase='reduction',eigen_side=side)
+    budget.plan(side,phase='cross_reduction',cross_original_sides=original_sides)
     cross_eigh=budget.eigenplan(side)
     signed,diagnostics=reduce_cross_round(*packed,tuple(actions),
         tuple(moments[f'M{i}'] for i in range(4)),mesh_xy=mesh_xy,

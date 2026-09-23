@@ -20,7 +20,7 @@ import numpy as np
 
 def shared_pole_byte_terms(meta, *, mesh_xy, resolution, pencil_side,
                            parent_batch, sample_batch, phase="reduction",
-                           selection_faces=None):
+                           selection_faces=None, cross_original_sides=None):
     """Price constructor carriers; the map CapacityLedger owns admission.
 
     Selection holds samples, current narrow actions and the n/2n direction
@@ -50,6 +50,17 @@ def shared_pole_byte_terms(meta, *, mesh_xy, resolution, pencil_side,
             raise ValueError(
                 'GATE shared_pole_capacity: selection_faces underprices '
                 f'the {2*a} base sample faces; got {sample_faces}')
+    elif phase == "cross_reduction":
+        if selection_faces is not None or cross_original_sides is None or len(cross_original_sides) != 2:
+            raise ValueError('cross reduction requires two original sides and no selection faces')
+        c, t = map(int, cross_original_sides)
+        if min(c, t) <= 0:
+            raise ValueError('cross reduction original sides must be positive')
+        # The original CT pencils are rectangular C-by-T. They are projected
+        # on the two retained diagonal spans before the joint square is made.
+        # Charge both live stages at once, including their overlap.
+        dense = 14 * (c*t + r*r) + 12 * packed * (c+t)
+        sample_faces = 0
     elif phase == "reduction":
         if selection_faces is not None:
             raise ValueError('selection_faces applies only to selection')
@@ -62,10 +73,11 @@ def shared_pole_byte_terms(meta, *, mesh_xy, resolution, pencil_side,
         sample_faces = max(2*a, 2)
     else:
         raise ValueError(f"unknown shared-pole capacity phase: {phase}")
+    action_side = sum(map(int, cross_original_sides)) if phase == 'cross_reduction' else r
     terms = {
         "sample_or_moment_batch": math.ceil(16*b*sample_faces*packed**2/p),
-        "narrow_actions": math.ceil(16*b*3*packed*r/p),
-        "replicated_scalars": 8*b*(12*r+4*packed),
+        "narrow_actions": math.ceil(16*b*3*packed*action_side/p),
+        "replicated_scalars": 8*b*(12*action_side+4*packed),
         "phase_dense_temporaries": math.ceil(16*dense_copies*dense),
     }
     return {"terms_bytes_per_rank": terms,
@@ -147,7 +159,7 @@ class ConstructorCapacity:
         return self.native_queries[key]
 
     def plan(self, side=None, *, phase=None, sample_batch=1,
-             selection_faces=None, eigen_side=None):
+             selection_faces=None, eigen_side=None, cross_original_sides=None):
         """Admit this phase's actual live set before allocating it.
 
         ``side`` is the pencil side this price is for; omit it to reprice the
@@ -160,21 +172,23 @@ class ConstructorCapacity:
         self._side = side
         price, native = self.quote(side, phase=self._phase,
                                    sample_batch=sample_batch,
-                                   selection_faces=selection_faces, eigen_side=eigen_side)
+                                   selection_faces=selection_faces, eigen_side=eigen_side,
+                                   cross_original_sides=cross_original_sides)
         self._workspace = sum(native.values())
         row = self._reserve("constructor.plan", price["resident_bytes_per_rank"])
         row['execution'] = self.execution
         return dict(row, price=price, native_workspace=dict(native))
 
-    def quote(self, side, *, phase, sample_batch=1, selection_faces=None, eigen_side=None):
+    def quote(self, side, *, phase, sample_batch=1, selection_faces=None, eigen_side=None,
+              cross_original_sides=None):
         """Return an unrecorded phase price for route selection/preflight."""
         side = int(side)
         n = self._n
         price = self.resident_quote(
             side, phase=phase, sample_batch=sample_batch,
-            selection_faces=selection_faces)
+            selection_faces=selection_faces, cross_original_sides=cross_original_sides)
         extents = {n, 2*n} if phase == "selection" else (
-            {side if eigen_side is None else int(eigen_side)} if phase == "reduction" else {n})
+            {side if eigen_side is None else int(eigen_side)} if phase in ("reduction", "cross_reduction") else {n})
         # Eigh scratch is transient: replace it at each phase boundary.
         self._native_maxima["eigh"] = max(self.query_workspace(
             "eigh", ((self.batch_width, extent, extent),), self.eigenplan(extent))
@@ -195,7 +209,7 @@ class ConstructorCapacity:
         return price, dict(self._native_maxima)
 
     def resident_quote(self, side, *, phase, sample_batch=1,
-                       selection_faces=None):
+                       selection_faces=None, cross_original_sides=None):
         """Price the live arrays without invoking a native workspace query.
 
         This is an optimistic admission bound. Route selection uses it first
@@ -210,7 +224,8 @@ class ConstructorCapacity:
             self._meta, mesh_xy=self._mesh_xy, resolution=pricing_resolution,
             pencil_side=side, parent_batch=self.batch_width,
             sample_batch=sample_batch, phase=phase,
-            selection_faces=selection_faces)
+            selection_faces=selection_faces,
+            cross_original_sides=cross_original_sides)
         # Other parents' narrow inputs survive selection and each model's
         # checks; they are additional live storage, never hidden in a limit.
         extra = sum(_shard_bytes(a)

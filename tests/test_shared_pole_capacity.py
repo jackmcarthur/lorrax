@@ -49,6 +49,31 @@ class CapacityTests(unittest.TestCase):
         self.assertEqual(ledger.reserve('fit',resident_bytes_per_rank=512,
                          workspace_bytes_per_rank=256)['status'],'PASS')
 
+    def test_cross_rectangular_quote_keeps_retained_square_and_refusal(self):
+        from gw.shared_pole_capacity import shared_pole_byte_terms
+
+        meta = NS(nk_tot=512, nspinor=4, n_rmu=2624, n_rmu_padded=2624)
+        mesh = NS(shape={'x': 8, 'y': 8})
+        args = dict(meta=meta, mesh_xy=mesh, resolution=NS(layout='local'),
+                    parent_batch=64, sample_batch=1)
+        c, t, k = 7000, 7000, 5500
+        cross = shared_pole_byte_terms(**args, pencil_side=k,
+            phase='cross_reduction', cross_original_sides=(c, t))
+        self.assertEqual(cross['terms_bytes_per_rank']['phase_dense_temporaries'],
+                         16 * (14 * (c*t + k*k) + 12 * 2624 * (c+t)))
+        self.assertEqual(cross['terms_bytes_per_rank']['narrow_actions'],
+                         16 * 3 * 2624 * (c+t))
+        legacy = shared_pole_byte_terms(**args, pencil_side=c+t, phase='reduction')
+        ledger = CapacityLedger(meta, mesh_xy=mesh, device_budget_bytes=30 * 2**30)
+        self.assertEqual(ledger.preview(resident_bytes_per_rank=cross['resident_bytes_per_rank'],
+                                        workspace_bytes_per_rank=2**30)['device_budget_status'], 'PASS')
+        self.assertEqual(ledger.preview(resident_bytes_per_rank=legacy['resident_bytes_per_rank'],
+                                        workspace_bytes_per_rank=2**30)['device_budget_status'], 'FAIL')
+        too_wide = shared_pole_byte_terms(**args, pencil_side=14000,
+            phase='cross_reduction', cross_original_sides=(c, t))
+        self.assertEqual(ledger.preview(resident_bytes_per_rank=too_wide['resident_bytes_per_rank'],
+                                        workspace_bytes_per_rank=2**30)['device_budget_status'], 'FAIL')
+
     def test_workspace_and_concurrent_refusal(self):
         ledger=self.ledger()
         ledger.reserve('inputs',resident_bytes_per_rank=512,workspace_bytes_per_rank=0)

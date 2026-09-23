@@ -48,6 +48,7 @@ def constructor_side_upper_bound(recipe, *, ordered, odd_moments,
 def constructor_execution(meta, resolution, recipe, *, mesh, ledger, upstream,
                           ordered, odd_moments, sample_fields, moment_fields,
                           parent_count=1, retained_output_families=1, defer_reduction=False,
+                          cross_original_sides=None, cross_retained_side=None,
                           column_extent=lambda width: width):
     """Resolve local or whole-mesh execution once, before a constructor read.
 
@@ -58,10 +59,12 @@ def constructor_execution(meta, resolution, recipe, *, mesh, ledger, upstream,
     """
     from gw.shared_pole_capacity import ConstructorCapacity
 
-    side = constructor_side_upper_bound(
-        recipe, ordered=ordered, odd_moments=odd_moments,
-        logical_n=int(meta.n_rmu),
-        column_extent=column_extent)
+    if (cross_original_sides is None) != (cross_retained_side is None):
+        raise ValueError('cross route requires both original sides and retained side')
+    side = (sum(map(int, cross_original_sides)) if cross_original_sides is not None
+            else constructor_side_upper_bound(
+                recipe, ordered=ordered, odd_moments=odd_moments,
+                logical_n=int(meta.n_rmu), column_extent=column_extent))
     fit_ids = [int(i) for i in recipe['fit_ids']]
     fit = max(fit_ids) - min(fit_ids) + 1
     selection_faces = fit * int(sample_fields) + int(moment_fields)
@@ -82,7 +85,9 @@ def constructor_execution(meta, resolution, recipe, *, mesh, ledger, upstream,
         16 * int(parent_count) * int(retained_output_families)
         * int(meta.n_rmu_padded) * output_width / int(mesh.size)))
     def resident_preview(phase, **kwargs):
-        price = local.resident_quote(side, phase=phase, **kwargs)
+        price = local.resident_quote(
+            int(cross_retained_side) if phase == 'cross_reduction' else side,
+            phase=phase, **kwargs)
         row = ledger.preview(
             resident_bytes_per_rank=(price['resident_bytes_per_rank']
                                      + retained_outputs),
@@ -91,15 +96,20 @@ def constructor_execution(meta, resolution, recipe, *, mesh, ledger, upstream,
         row['native_workspace_query'] = 'NOT_NEEDED_FOR_RESIDENT_LOWER_BOUND'
         return row
     def preview(phase, **kwargs):
-        price,native=local.quote(side,phase=phase,**kwargs)
+        price,native=local.quote(
+            int(cross_retained_side) if phase == 'cross_reduction' else side,
+            phase=phase,**kwargs)
         row=ledger.preview(
             resident_bytes_per_rank=price['resident_bytes_per_rank']+retained_outputs,
             workspace_bytes_per_rank=sum(native.values()),concurrent_with=upstream)
         row['retained_output_upper_bound_bytes_per_rank']=retained_outputs
         return row
     selection_args = dict(sample_batch=fit, selection_faces=selection_faces)
+    reduction_phase = 'cross_reduction' if cross_original_sides is not None else 'reduction'
+    reduction_args = (dict(cross_original_sides=cross_original_sides)
+                      if cross_original_sides is not None else {})
     resident_selection = resident_preview('selection', **selection_args)
-    resident_reduction = (None if defer_reduction else resident_preview('reduction'))
+    resident_reduction = (None if defer_reduction else resident_preview(reduction_phase, **reduction_args))
     if any(row['device_budget_status'] != 'PASS'
            for row in (resident_selection, resident_reduction) if row is not None):
         return 'face', dict(
@@ -109,7 +119,7 @@ def constructor_execution(meta, resolution, recipe, *, mesh, ledger, upstream,
             retained_output_upper_bound_bytes_per_rank=retained_outputs,
             local_selection=resident_selection, local_reduction=resident_reduction)
     selection = preview('selection', **selection_args)
-    reduction = None if defer_reduction else preview('reduction')
+    reduction = None if defer_reduction else preview(reduction_phase, **reduction_args)
     admitted = all(row['device_budget_status'] == 'PASS'
                    for row in (selection, reduction) if row is not None)
     return ('local' if admitted else 'face'), dict(
