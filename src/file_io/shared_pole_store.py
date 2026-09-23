@@ -1503,9 +1503,10 @@ def read_shared_pole_bank(io, q_span=None, *, meta, header, sample_span=None,
     ``x*Py + y`` owns rows ``[r*q/P, (r+1)*q/P)``), for which the number of
     parents must be a multiple of P. A contiguous ascending run is one
     collective read in the requested layout: in batch layout each rank reads
-    only its own whole rows. Any other id list is one face read per parent
-    (``[1, ...]``) stacked in order, then moved to batch layout by the staged
-    x-then-y exchange; values are identical either way.
+    only its own whole rows. A permuted complete interval is read once in face
+    layout, reordered, then moved to batch layout by the staged x-then-y
+    exchange. Sparse lists use one face read per parent. Values are identical
+    either way.
     """
     if header.get("schema") != BANK_SCHEMA:
         _refuse("scratch bank reader schema mismatch")
@@ -1533,6 +1534,12 @@ def read_shared_pole_bank(io, q_span=None, *, meta, header, sample_span=None,
                 not 0 <= v < shape["nq"] for v in ids):
             _refuse(f"q_ids out of bounds or empty: {list(q_ids)}, extent {shape['nq']}")
     contiguous = ids == list(range(ids[0], ids[0] + len(ids)))
+    # Ordered parent rounds can permute a complete interval and pad it with
+    # repeated parents. Read that interval once, then restore the round order
+    # on the already sharded face before the existing face-to-batch exchange.
+    # The interval has no more rows than the old per-parent read stack.
+    interval = (layout == "batch" and not contiguous
+                and len(set(ids)) == max(ids) - min(ids) + 1)
     mesh = meta.mu_basis.mesh_xy
     ranks = int(mesh.shape["x"]) * int(mesh.shape["y"])
     if layout == "batch" and len(ids) % ranks:
@@ -1563,7 +1570,12 @@ def read_shared_pole_bank(io, q_span=None, *, meta, header, sample_span=None,
         face = P(None, None, 'x', 'y') if sample else P(None, 'x', 'y')
         spec = face if layout == "face" or not contiguous else (
             P(_BATCH_LAYOUT, None, None, None) if sample else P(_BATCH_LAYOUT, None, None))
-        runs = [(ids[0], len(ids))] if contiguous else [(q, 1) for q in ids]
+        if contiguous:
+            runs = [(ids[0], len(ids))]
+        elif interval:
+            runs = [(min(ids), max(ids)-min(ids)+1)]
+        else:
+            runs = [(q, 1) for q in ids]
         rows = []
         for q, count in runs:
             prefix = (count, a1-a0) if sample else (count,)
@@ -1594,6 +1606,8 @@ def read_shared_pole_bank(io, q_span=None, *, meta, header, sample_span=None,
         value = rows[0] if len(rows) == 1 else _bank_stack_rows(mesh, spec)(tuple(rows))
         del rows
         if layout == "batch" and not contiguous:
+            if interval:
+                value = jnp.take(value, np.asarray(ids)-min(ids), axis=0)
             value = _bank_face_to_batch(mesh, value.ndim)(value)
         out[name] = value
     return out

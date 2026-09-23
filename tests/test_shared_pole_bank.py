@@ -240,8 +240,9 @@ def test_bank_reads_parent_lists_in_face_and_batch_layout(tmp_path):
     """Parents by id list, in either layout, carry each parent's own committed values.
 
     Four parents with distinct values. A contiguous run in batch layout is one read in which
-    each rank reads its own whole rows; a non-contiguous list with repeats (a round's synthetic
-    slots) is one face read per parent stacked in order and moved by the staged exchange.
+    each rank reads its own whole rows; a permuted complete interval is one
+    face read, while a sparse list uses one face read per parent. Both are moved
+    by the staged exchange.
     Every leading row must equal that parent's single-parent face read bit for bit, in
     P(('x','y'), None, ...) or P(None, ..., 'x', 'y') as asked. RED TWIN: the list read in
     sorted order differs from the requested order.
@@ -277,6 +278,7 @@ def test_bank_reads_parent_lists_in_face_and_batch_layout(tmp_path):
                                         fields=fields) for q in range(nq)]
         cases = {"span_face": dict(q_span=(0, 4)), "ids_face": dict(q_ids=[3, 1, 1, 0]),
                  "run_batch": dict(q_ids=[0, 1, 2, 3], partition_spec=batch),
+                 "interval_batch": dict(q_ids=[2, 0, 1, 3], partition_spec=batch),
                  "ids_batch": dict(q_ids=[2, 0, 3, 3], partition_spec=batch)}
         for label, request in cases.items():
             got = read_shared_pole_bank(io, meta=meta, header=header, sample_span=(0, 2), fields=fields, **request)
@@ -287,13 +289,12 @@ def test_bank_reads_parent_lists_in_face_and_batch_layout(tmp_path):
                     assert tuple(spec[0]) == ('x', 'y') and all(e is None for e in tuple(spec)[1:]), (label, spec)
                 else:
                     assert tuple(spec)[-2:] == ('x', 'y'), (label, spec)
-                value = np.asarray(got[name])
                 for row, q in enumerate(ids):
-                    assert np.array_equal(value[row], np.asarray(single[q][name])[0]), (label, name, row)
+                    assert bool(jnp.all(got[name][row] == single[q][name][0])), (label, name, row)
             if label == "ids_batch":
                 ordered = read_shared_pole_bank(io, meta=meta, header=header, sample_span=(0, 2), fields=("M1",),
                                                 q_ids=sorted(ids), partition_spec=batch)
-                assert not np.array_equal(np.asarray(ordered["M1"]), np.asarray(got["M1"]))
+                assert not bool(jnp.all(ordered["M1"] == got["M1"]))
         with pytest.raises(ValueError, match="multiple of 4"):
             read_shared_pole_bank(io, meta=meta, header=header, fields=("M1",), q_ids=[0, 1, 2],
                                   partition_spec=batch)

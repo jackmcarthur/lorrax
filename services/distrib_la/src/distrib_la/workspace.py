@@ -77,7 +77,7 @@ def _workspace_details(plan, op, shapes, dtype):
         n = shapes[0][-1]
         if plan.n is not None and plan.n != n:
             raise ValueError('eigh shape differs from the planned n')
-        if n % px or n % py:
+        if not local and (n % px or n % py):
             raise ValueError('eigh shape must tile the plan mesh')
         if not local and plan.backend != 'cusolvermp':
             raise ValueError('distributed eigh workspace query supports cusolvermp only')
