@@ -280,7 +280,8 @@ def sector_synthesis(readers, headers, bases, families, frequencies, meta, mesh_
     return build
 
 
-def instantaneous_sector_sigma(handle, families, bases, meta, mesh_xy, *, occupation_state):
+def instantaneous_sector_sigma(handle, families, bases, meta, mesh_xy, *,
+                               occupation_state, return_components=False):
     """Exchange-like equal-time contraction of W_infinity-V, exactly once."""
     from file_io.slab_io import SlabIO
     from file_io.shared_pole_store import validate_shared_pole_bank, read_shared_pole_bank
@@ -325,9 +326,14 @@ def instantaneous_sector_sigma(handle, families, bases, meta, mesh_xy, *, occupa
         _admit_compiled(kernel,args,meta,f'sigma.sector.constant.{key}',
                         native=native,resident=amount)
     total=None
-    for _,value,_ in contract_lorentz_blocks(keys,families=families,term=_TERM_X,
+    currents=[None,None]
+    for key,value,_ in contract_lorentz_blocks(keys,families=families,term=_TERM_X,
             response=response,Gij=gij,meta=meta,mesh_xy=mesh_xy,admit_kernel=admit):
         total=value if total is None else total+value
+        if return_components and key != (0,0):
+            channel=int(key[0] != 0 and key[1] != 0)  # 0: CT+TC, 1: TT
+            currents[channel]=(value if currents[channel] is None
+                               else currents[channel]+value)
     from gw.cohsex_sigma import _replicate_band_sigma
     nb=families[0].slices.nb_sigma
     @jax.jit
@@ -335,10 +341,13 @@ def instantaneous_sector_sigma(handle, families, bases, meta, mesh_xy, *, occupa
         parent=_replicate_band_sigma(value,mesh_xy)[:,:nb,:nb]
         return unfold_file_wedge_band_operator(families[0].green_parent.plan.sym,
                                                parent,trs_rule='transpose')
+    if return_components:
+        return finish(total), finish(currents[0]), finish(currents[1])
     return finish(total)
 
 
-def compute_sector_sigma(handle, families, bases, meta, mesh_xy, **options):
+def compute_sector_sigma(handle, families, bases, meta, mesh_xy, *,
+                         on_shell=None, **options):
     """Integrate CC, TT and both ordered mixed endpoints on their own pole sets.
 
     ``options`` is the common MPA/shared-pole quadrature contract; its live
@@ -360,6 +369,7 @@ def compute_sector_sigma(handle, families, bases, meta, mesh_xy, **options):
     sectors=manifest['sectors']
     headers=manifest['model_headers']
     total=None
+    currents=[None,None]
     for names,endpoints in ((('CC','CC'),(0,0)),(('TT','TT'),(1,1)),
                             (('CT_C','CT_T'),(0,1)),(('CT_T','CT_C'),(1,0))):
         a,b=endpoints
@@ -388,10 +398,23 @@ def compute_sector_sigma(handle, families, bases, meta, mesh_xy, **options):
                 sigma_w_model='shared_pole',fit_identity=sectors[names[0]]['identity'],
                 fit_digest=sectors[names[0]]['digest'],sector_context=context,**opts)
             for builder in bound:builder.close(value.sigma_c_kij)
+            if on_shell is not None and (a or b):
+                channel=int(bool(a and b))  # 0: CT+TC, 1: TT
+                shell=on_shell(value)
+                currents[channel]=(shell if currents[channel] is None
+                                   else currents[channel]+shell)
             total=value if total is None else replace(total,sigma_c_kij=total.sigma_c_kij+value.sigma_c_kij)
     constant=instantaneous_sector_sigma(handle['constant'],families,bases,meta,mesh_xy,
-                                      occupation_state=options.get('occupation_state'))
+        occupation_state=options.get('occupation_state'),
+        return_components=on_shell is not None)
+    if on_shell is not None:
+        constant, ct_constant, tt_constant=constant
+        for channel, part in enumerate((ct_constant, tt_constant)):
+            # QSGW Hermitises the total constant after interpolation.
+            hermitian=0.5*(part+jnp.swapaxes(part.conj(),-1,-2))
+            currents[channel]=currents[channel]+hermitian
     # Static band axes use the same carrier as dynamic Sigma; pad only through
     # the existing semantic band-axis owner before broadcasting in omega.
     constant=pad_to_axis(pad_to_axis(constant,total.band_axis,axis=1),total.band_axis,axis=2)
-    return replace(total,sigma_c_kij=total.sigma_c_kij+constant[None])
+    result=replace(total,sigma_c_kij=total.sigma_c_kij+constant[None])
+    return (result, tuple(currents)) if on_shell is not None else result
