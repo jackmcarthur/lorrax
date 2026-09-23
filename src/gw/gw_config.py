@@ -1450,10 +1450,10 @@ _DEFAULTS = {
     # at runtime when its planner picks a smaller value, but cohsex.in
     # > 0 wins over the planner.
     "gflat_chunk_size": 0,
-    # V_q inner G-axis GEMM chunk size.  Bounds the per-q ``lax.scan``
-    # working set inside the per-q V_q kernel.
-    # 0 (default) = auto (``_pick_g_chunk(ngkmax)`` → largest divisor
-    # of ngkmax ≤ 4096).
+    # V_q G-panel width: the columns gathered per step of the V_q kernel's
+    # G scan.  Any positive value (a G tail it does not divide is masked).
+    # 0 (default) = auto (``v_q_g_flat._plan_vq_tiles``: ≤ 4096, capped by
+    # LORRAX_COLLECTIVE_CHUNK_MB and the V_q memory budget).
     "vq_g_chunk_size": 0,
     # The only deck selector for dense-LA placement.  ``resolve_linalg``
     # expands it once into the established whole-matrix or provider profile;
@@ -4361,7 +4361,7 @@ class MemoryConfig:
     band_chunk_size: int
     r_chunk_override: int         # 0 = auto
     gflat_chunk_size: int         # 0 = planner-picked
-    vq_g_chunk_size: int          # 0 = auto _pick_g_chunk(ngkmax)
+    vq_g_chunk_size: int          # 0 = auto v_q_g_flat._plan_vq_tiles
     low_mem_bands: bool           # parent ψ layout: face=True, axis=False
     low_mem_bands_provenance: str  # deck | default | derived for packed mode
 

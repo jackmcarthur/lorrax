@@ -1345,6 +1345,103 @@ def unfold_spin_centroid_operator(
     return jax.lax.with_sharding_constraint(rotated, out_sh)
 
 
+def _unimodular_inverse(S_full, s):
+    """Integer inverse of one reciprocal symmetry row, refusing a non-unimodular row."""
+    S_inv = np.rint(np.linalg.inv(S_full)).astype(np.int64)
+    if not np.array_equal(S_full @ S_inv, np.eye(3, dtype=np.int64)):
+        raise ValueError(
+            f"unfold_isdf_one_leg: symmetry row {s} is not unimodular.")
+    return S_inv
+
+
+def _one_leg_star_rows(*, sym, sym_idx, q_irr_frac, kgrid, n_q_parent):
+    """Validated full-q star rows shared by the one-leg relabel and action."""
+    q_full_int = np.asarray(sym.kvecs_asints, dtype=np.int64)
+    grid = np.asarray(kgrid, dtype=np.int64).reshape(3)
+    q_parent_int = np.asarray(sym.q_irr_kgrid_int, dtype=np.int64)
+    n_q_full = int(np.prod(grid))
+    if q_full_int.shape != (n_q_full, 3):
+        raise ValueError(
+            "unfold_isdf_one_leg: SymMaps.kvecs_asints disagrees with its "
+            f"kgrid {tuple(grid)}; got {q_full_int.shape}.")
+    idx = np.asarray(sym.irr_idx_q, dtype=np.int32)
+    rows = np.asarray(sym_idx, dtype=np.int32)
+    if idx.shape != (n_q_full,) or rows.shape != (n_q_full,):
+        raise ValueError(
+            "unfold_isdf_one_leg: SymMaps.irr_idx_q and policy sym_idx must "
+            f"both have shape ({n_q_full},); got {idx.shape}, {rows.shape}.")
+    if int(q_parent_int.shape[0]) != int(n_q_parent):
+        raise ValueError(
+            "unfold_isdf_one_leg: zeta q extent does not match the SymMaps "
+            f"q-IBZ ({int(n_q_parent)} != {int(q_parent_int.shape[0])}).")
+
+    q_parent = np.asarray(q_irr_frac, dtype=np.float64)
+    q_parent_expected = bgw_integer_q_to_fractional(q_parent_int, grid)
+    if q_parent.shape != q_parent_expected.shape or not np.allclose(
+            q_parent, q_parent_expected, rtol=0.0, atol=1e-12):
+        raise ValueError(
+            "unfold_isdf_one_leg: q_irr_frac is not the BGW-wrapped "
+            "SymMaps.q_irr_kgrid_int table; the zeta G labels and the star "
+            "map would describe different parent momenta.")
+    q_full = bgw_integer_q_to_fractional(q_full_int, grid)
+
+    S_all = np.asarray(sym.sym_mats_k, dtype=np.int64)
+    n_spatial = int(np.asarray(sym.sym_matrices).shape[0])
+    if S_all.shape[0] != 2 * n_spatial:
+        raise ValueError(
+            "unfold_isdf_one_leg: SymMaps.sym_mats_k must contain spatial "
+            "and TRS-augmented halves.")
+    if np.any(rows < 0) or np.any(rows >= S_all.shape[0]):
+        raise ValueError(
+            "unfold_isdf_one_leg: policy sym_idx contains a row outside "
+            f"[0,{S_all.shape[0]}).")
+    return q_full, q_parent, idx, rows, S_all, n_spatial
+
+
+def isdf_one_leg_source_slots(gvec_components, *, sym, sym_idx, q_irr_frac,
+                              kgrid):
+    """Parent G-sphere slot of every full-q literal-G=0 one-leg coefficient; see docs/architecture/symmetry_register.md."""
+    gvec = np.asarray(gvec_components, dtype=np.int32)
+    if gvec.ndim != 3 or gvec.shape[1] != 3:
+        raise ValueError(
+            "isdf_one_leg_source_slots: gvec_components must have shape "
+            f"(n_q_ibz, 3, n_G); got {gvec.shape}.")
+    q_full, q_parent, idx, rows, S_all, _ = _one_leg_star_rows(
+        sym=sym, sym_idx=sym_idx, q_irr_frac=q_irr_frac, kgrid=kgrid,
+        n_q_parent=gvec.shape[0])
+    source_slot = np.empty(int(idx.shape[0]), dtype=np.int32)
+    for iq in range(int(idx.shape[0])):
+        s = int(rows[iq])
+        p = int(idx[iq])
+        S_full = S_all[s]
+        S_inv = _unimodular_inverse(S_full, s)
+        K_parent = S_inv @ q_full[iq]
+        G_parent_f = K_parent - q_parent[p]
+        G_parent = np.rint(G_parent_f).astype(np.int32)
+        if not np.allclose(G_parent_f, G_parent, rtol=0.0, atol=1e-12):
+            raise ValueError(
+                "unfold_isdf_one_leg: exact q/G relabel failed at full q "
+                f"{iq}: parent={p}, sym={s}, "
+                f"G_parent={G_parent_f.tolist()}.")
+        if not np.allclose(S_full @ (q_parent[p] + G_parent), q_full[iq],
+                           rtol=0.0, atol=1e-12):
+            raise ValueError(
+                "unfold_isdf_one_leg: reconstructed parent q+G does not "
+                f"map to literal full-zone G=0 at q {iq}.")
+        hits = np.flatnonzero(np.all(
+            gvec[p].T == G_parent[None, :], axis=1))
+        if hits.size != 1:
+            raise ValueError(
+                "GATE isdf_one_leg_parent_g: literal full-zone G=0 at "
+                f"q={iq} requires parent q={p}, G={G_parent.tolist()}, "
+                f"but the stored zeta sphere contains {int(hits.size)} "
+                "exact matches.  Increase zeta_cutoff_ry if it is "
+                "missing; a one-leg coefficient cannot be reconstructed "
+                "from parent G=0 alone.")
+        source_slot[iq] = int(hits[0])
+    return source_slot
+
+
 def unfold_isdf_one_leg(
     zeta_ibz,
     *,
@@ -1410,45 +1507,10 @@ def unfold_isdf_one_leg(
         source_gvec = None
         n_mu = zshape[1]
 
-    q_full_int = np.asarray(sym.kvecs_asints, dtype=np.int64)
-    grid = np.asarray(kgrid, dtype=np.int64).reshape(3)
-    q_parent_int = np.asarray(sym.q_irr_kgrid_int, dtype=np.int64)
-    n_q_full = int(np.prod(grid))
-    if q_full_int.shape != (n_q_full, 3):
-        raise ValueError(
-            "unfold_isdf_one_leg: SymMaps.kvecs_asints disagrees with its "
-            f"kgrid {tuple(grid)}; got {q_full_int.shape}.")
-    idx = np.asarray(sym.irr_idx_q, dtype=np.int32)
-    rows = np.asarray(sym_idx, dtype=np.int32)
-    if idx.shape != (n_q_full,) or rows.shape != (n_q_full,):
-        raise ValueError(
-            "unfold_isdf_one_leg: SymMaps.irr_idx_q and policy sym_idx must "
-            f"both have shape ({n_q_full},); got {idx.shape}, {rows.shape}.")
-    if int(q_parent_int.shape[0]) != zshape[0]:
-        raise ValueError(
-            "unfold_isdf_one_leg: zeta q extent does not match the SymMaps "
-            f"q-IBZ ({zshape[0]} != {int(q_parent_int.shape[0])}).")
-
-    q_parent = np.asarray(q_irr_frac, dtype=np.float64)
-    q_parent_expected = bgw_integer_q_to_fractional(q_parent_int, grid)
-    if q_parent.shape != q_parent_expected.shape or not np.allclose(
-            q_parent, q_parent_expected, rtol=0.0, atol=1e-12):
-        raise ValueError(
-            "unfold_isdf_one_leg: q_irr_frac is not the BGW-wrapped "
-            "SymMaps.q_irr_kgrid_int table; the zeta G labels and the star "
-            "map would describe different parent momenta.")
-    q_full = bgw_integer_q_to_fractional(q_full_int, grid)
-
-    S_all = np.asarray(sym.sym_mats_k, dtype=np.int64)
-    n_spatial = int(np.asarray(sym.sym_matrices).shape[0])
-    if S_all.shape[0] != 2 * n_spatial:
-        raise ValueError(
-            "unfold_isdf_one_leg: SymMaps.sym_mats_k must contain spatial "
-            "and TRS-augmented halves.")
-    if np.any(rows < 0) or np.any(rows >= S_all.shape[0]):
-        raise ValueError(
-            "unfold_isdf_one_leg: policy sym_idx contains a row outside "
-            f"[0,{S_all.shape[0]}).")
+    q_full, q_parent, idx, rows, S_all, n_spatial = _one_leg_star_rows(
+        sym=sym, sym_idx=sym_idx, q_irr_frac=q_irr_frac, kgrid=kgrid,
+        n_q_parent=zshape[0])
+    n_q_full = int(idx.shape[0])
 
     perm = np.asarray(sym_perm, dtype=np.int32)
     wraps = np.asarray(L_table, dtype=np.float64)
@@ -1468,26 +1530,20 @@ def unfold_isdf_one_leg(
     # Literal target G=0 may be a nonzero parent G.  Build that exact
     # relabel once on the host from the service-owned star rows, then make
     # the device operation a pair of gathers plus phases.
-    source_slot = np.empty(n_q_full, dtype=np.int32)
-    tau_spatial = np.empty(n_q_full, dtype=np.complex128)
-    translations = np.asarray(sym.translations, dtype=np.float64)
-    for iq in range(n_q_full):
-        s = int(rows[iq])
-        p = int(idx[iq])
-        S_full = S_all[s]
-        S_inv = np.rint(np.linalg.inv(S_full)).astype(np.int64)
-        if not np.array_equal(S_full @ S_inv, np.eye(3, dtype=np.int64)):
-            raise ValueError(
-                f"unfold_isdf_one_leg: symmetry row {s} is not unimodular.")
-        if preselected:
-            G_parent = source_gvec[p]
-            source_slot[iq] = 0
+    if preselected:
+        source_slot = np.zeros(n_q_full, dtype=np.int32)
+        G_parent_rows = source_gvec[idx]
+        for iq in range(n_q_full):
+            s = int(rows[iq])
+            p = int(idx[iq])
+            S_full = S_all[s]
+            _unimodular_inverse(S_full, s)
             # A preselected carrier need not land at literal target G=0
             # (the tied Coulomb-head columns are an unordered invariant
             # set), but it must still land on an integer reciprocal label
             # at this target q.  Refuse a carrier/table mismatch rather than
             # silently attaching the transformed column to the wrong q row.
-            G_target_f = S_full @ (q_parent[p] + G_parent) - q_full[iq]
+            G_target_f = S_full @ (q_parent[p] + G_parent_rows[iq]) - q_full[iq]
             G_target = np.rint(G_target_f).astype(np.int32)
             if not np.allclose(
                     G_target_f, G_target, rtol=0.0, atol=1e-12):
@@ -1495,40 +1551,21 @@ def unfold_isdf_one_leg(
                     "unfold_isdf_one_leg: preselected parent q+G does not "
                     f"map to an integer target G at full q {iq}: "
                     f"parent={p}, sym={s}, G_target={G_target_f.tolist()}.")
-        else:
-            K_parent = S_inv @ q_full[iq]
-            G_parent_f = K_parent - q_parent[p]
-            G_parent = np.rint(G_parent_f).astype(np.int32)
-            if not np.allclose(G_parent_f, G_parent, rtol=0.0, atol=1e-12):
-                raise ValueError(
-                    "unfold_isdf_one_leg: exact q/G relabel failed at full q "
-                    f"{iq}: parent={p}, sym={s}, "
-                    f"G_parent={G_parent_f.tolist()}.")
-            if not np.allclose(S_full @ (q_parent[p] + G_parent), q_full[iq],
-                               rtol=0.0, atol=1e-12):
-                raise ValueError(
-                    "unfold_isdf_one_leg: reconstructed parent q+G does not "
-                    f"map to literal full-zone G=0 at q {iq}.")
-            hits = np.flatnonzero(np.all(
-                gvec[p].T == G_parent[None, :], axis=1))
-            if hits.size != 1:
-                raise ValueError(
-                    "GATE isdf_one_leg_parent_g: literal full-zone G=0 at "
-                    f"q={iq} requires parent q={p}, G={G_parent.tolist()}, "
-                    f"but the stored zeta sphere contains {int(hits.size)} "
-                    "exact matches.  Increase zeta_cutoff_ry if it is "
-                    "missing; a one-leg coefficient cannot be reconstructed "
-                    "from parent G=0 alone.")
-            source_slot[iq] = int(hits[0])
+    else:
+        source_slot = isdf_one_leg_source_slots(
+            gvec, sym=sym, sym_idx=rows, q_irr_frac=q_parent, kgrid=kgrid)
+        G_parent_rows = gvec[idx, :, source_slot]
 
-        # Spatial tau phase first; the device conjugates this together with
-        # zeta and the L phase on antiunitary rows.  This is the same ordering
-        # as unfold_psi and makes exp[-i(S Kp).tnp] -> its conjugate there.
-        s_spatial = s % n_spatial
-        S_spatial = S_all[s_spatial]
+    # Spatial tau phase first; the device conjugates this together with
+    # zeta and the L phase on antiunitary rows.  This is the same ordering
+    # as unfold_psi and makes exp[-i(S Kp).tnp] -> its conjugate there.
+    tau_spatial = np.empty(n_q_full, dtype=np.complex128)
+    translations = np.asarray(sym.translations, dtype=np.float64)
+    for iq in range(n_q_full):
+        s_spatial = int(rows[iq]) % n_spatial
         phase = tau_phase_row(
-            S_spatial, translations[s_spatial],
-            (q_parent[p] + G_parent)[None, :])
+            S_all[s_spatial], translations[s_spatial],
+            (q_parent[int(idx[iq])] + G_parent_rows[iq])[None, :])
         tau_spatial[iq] = 1.0 if phase is None else phase[0]
 
     trs = rows >= n_spatial

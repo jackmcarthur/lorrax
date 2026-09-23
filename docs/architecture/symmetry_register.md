@@ -1871,6 +1871,25 @@ jax.Array
     contribution: ``(3, n_q_full, n_mu)`` under
     ``P(None,None,'x')``.
 
+### `services/symmetry_maps/src/symmetry_maps/maps.py` — `isdf_one_leg_source_slots`
+
+Parent G-sphere slot of every full-q literal-``G=0`` one-leg coefficient.
+
+This is the host relabel :func:`unfold_isdf_one_leg` performs on a rank-3
+G-sphere, exposed so a producer can keep only the parent columns the
+one-leg action will read.  For full q ``iq`` with parent
+``p = sym.irr_idx_q[iq]`` and row ``s = sym_idx[iq]`` it solves
+``S_s (q_p + G_p) = q_full[iq]`` exactly and returns the unique slot of
+``G_p`` in ``gvec_components[p]``; a missing or duplicated ``G_p`` refuses
+at ``GATE isdf_one_leg_parent_g``.
+
+Any sub-sphere that contains, for each parent, the slots this returns for
+that parent's star (each G appearing once) yields the same one-leg result as
+the whole sphere: the rank-3 path re-derives the same ``G_p`` and gathers
+the same coefficients.  ``gw.v_q_g_flat`` uses this to extract a
+``(n_q_ibz, n_mu, n_sub)`` carrier per ζ q-tile instead of keeping the
+whole ``(n_q_ibz, n_mu, ngkmax)`` slab resident for the one-leg unfold.
+
 ### `services/symmetry_maps/src/symmetry_maps/maps.py` — `_get_unfold_isdf_one_leg_jit`
 
 Content-keyed one-leg action shared by all streamed source legs.
