@@ -1,8 +1,6 @@
 """Bare transverse exchange through the shared parent Lorentz contraction."""
 from __future__ import annotations
 
-import jax.numpy as jnp
-
 
 def compute_sigma_x_bispinor(
     *, wfns_transverse, Gij, bispinor_v_q_path, meta, mesh_xy, mu_bases,
@@ -23,18 +21,16 @@ def compute_sigma_x_bispinor(
         n_sym_spatial=plan.n_sym_spatial, context="bare transverse Sigma")
     extent = plan.n_centroid_packed
     layout = PhotonBasisLayout.from_centroid_extents(extent, extent, mesh_xy)
+    tt_blocks = tuple((a,b) for a in (1,2,3) for b in (1,2,3))
     with BispinorVqReader(bispinor_v_q_path, mesh_xy, mu_bases=mu_bases,
                          family_plans=(None, plan)) as reader:
-        def tile(a,b):
-            if a and b:
-                return reader.get_tile(a,b)
-            return jnp.zeros_like(reader.get_tile(1,1))
-        packed = pack_photon_operator(tile, reader.n_q_total, layout, mesh_xy)
+        packed = pack_photon_operator(reader.get_tile, reader.n_q_total, layout,
+                                      mesh_xy, block_order=tt_blocks)
     response = StaticPhotonResponse(layout, packed, packed, "none", "bare_transverse",
         qgrid_policy=policy, family_plans=(plan,plan))
     sigma = None
     for key, value, _ in contract_lorentz_blocks(
-            [(a,b) for a in (1,2,3) for b in (1,2,3)],
+            tt_blocks,
             families=(wfns_transverse,wfns_transverse), term=_TERM_X,
             response=response, Gij=Gij, meta=meta, mesh_xy=mesh_xy):
         sigma = value if sigma is None else sigma + value
