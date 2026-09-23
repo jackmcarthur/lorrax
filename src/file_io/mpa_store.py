@@ -1934,6 +1934,41 @@ def allocate_fit_store_collective(
     return fit_completion_ledger(dest)
 
 
+def refuse_bad_pole_fields(Omega, residue, odd_residue=None, *, where):
+    """Refuse non-finite elements and live poles off the MPA causal half-plane.
+
+    A zero-residue element is an absent pole and may carry zero frequency;
+    every element must be finite, dormant ones included.
+    """
+    import jax
+    import jax.numpy as jnp
+
+    finite = (jnp.isfinite(jnp.real(Omega))
+              & jnp.isfinite(jnp.imag(Omega))
+              & jnp.isfinite(jnp.real(residue))
+              & jnp.isfinite(jnp.imag(residue)))
+    if odd_residue is None:
+        live = jnp.abs(residue) > 0.0
+    else:
+        finite = (finite
+                  & jnp.isfinite(jnp.real(odd_residue))
+                  & jnp.isfinite(jnp.imag(odd_residue)))
+        live = ((jnp.abs(residue + odd_residue) > 0.0)
+                | (jnp.abs(residue - odd_residue) > 0.0))
+    bad_causal = live & ((jnp.real(Omega) <= 0.0)
+                         | (jnp.imag(Omega) > 0.0))
+    n_nonfinite, n_bad_causal = map(
+        int, jax.device_get((jnp.sum(~finite, dtype=jnp.int64),
+                             jnp.sum(bad_causal, dtype=jnp.int64))))
+    if n_nonfinite:
+        raise ValueError(
+            f"{where} refuses {n_nonfinite} non-finite pole/residue elements")
+    if n_bad_causal:
+        raise ValueError(
+            f"{where} refuses {n_bad_causal} live poles with Re Omega <= 0 "
+            "or Im Omega > 0")
+
+
 def write_complete_pole_store_collective(
     dest,
     Omega_p,
@@ -2041,31 +2076,9 @@ def write_complete_pole_store_collective(
         raise ValueError(
             "write_complete_pole_store_collective got incompatible logical "
             f"extents: poles={tuple(Omega.shape)}, n_mu_logical={n_mu}")
-    finite = (jnp.isfinite(jnp.real(Omega))
-              & jnp.isfinite(jnp.imag(Omega))
-              & jnp.isfinite(jnp.real(residue))
-              & jnp.isfinite(jnp.imag(residue)))
-    if odd_residue is None:
-        live = jnp.abs(residue) > 0.0
-    else:
-        finite = (finite
-                  & jnp.isfinite(jnp.real(odd_residue))
-                  & jnp.isfinite(jnp.imag(odd_residue)))
-        live = ((jnp.abs(residue + odd_residue) > 0.0)
-                | (jnp.abs(residue - odd_residue) > 0.0))
-    bad_causal = live & ((jnp.real(Omega) <= 0.0)
-                         | (jnp.imag(Omega) > 0.0))
-    n_nonfinite, n_bad_causal = map(
-        int, jax.device_get((jnp.sum(~finite, dtype=jnp.int64),
-                             jnp.sum(bad_causal, dtype=jnp.int64))))
-    if n_nonfinite:
-        raise ValueError(
-            "write_complete_pole_store_collective refuses "
-            f"{n_nonfinite} non-finite pole/residue elements")
-    if n_bad_causal:
-        raise ValueError(
-            "write_complete_pole_store_collective refuses "
-            f"{n_bad_causal} live poles with Re Omega <= 0 or Im Omega > 0")
+    refuse_bad_pole_fields(
+        Omega, residue, odd_residue,
+        where="write_complete_pole_store_collective")
 
     allocate_fit_store_collective(
         dest, mesh_xy=mesh_xy, n_q=n_q, n_mu=n_mu, n_p=n_p,

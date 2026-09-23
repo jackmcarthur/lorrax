@@ -56,6 +56,9 @@ _BOX_SIGN_FRACTION = 0.7
 #: instead of re-fitting windows as states move. Recompute is reserved for a
 #: metal<->insulator flip or a genuine rule-validity failure.
 _SC_WINDOW_PAD_EV = 2.0
+#: Pad toward zero for a sign-definite SC window: 0.5 of its distance escaped by 1.6% on TaAs 8^3
+#: map 1 and 0.25 again at map 2 (semimetal valence state 30 -> 15 -> 6 meV from E_F); 0.05 floors it below 1 meV.
+_SC_ZERO_SIDE_CAP = 0.05
 _RULE_CACHE_SCHEMA = "sigma-box-ry-v4"
 
 
@@ -768,10 +771,10 @@ def _sc_padded_box_spec(spec, eta):
         support_frequencies, spec["states"], spec["pole_stats"],
         spec["pole_sign"], eta)
     if spec["kind"] == "sign_definite_negative" and support_box[1] < 0.0:
-        box[1] = min(box[1], 0.5 * spec["box"][1])
+        box[1] = min(box[1], _SC_ZERO_SIDE_CAP * spec["box"][1])
         box[1] = max(box[1], support_box[1])
     if spec["kind"] == "sign_definite_positive" and support_box[0] > 0.0:
-        box[0] = max(box[0], 0.5 * spec["box"][0])
+        box[0] = max(box[0], _SC_ZERO_SIDE_CAP * spec["box"][0])
         box[0] = min(box[0], support_box[0])
     # Membership can change without appreciable state motion: a state just
     # outside a tail at map 0 can enter it at map 1. Cover the selector's
@@ -851,6 +854,20 @@ def _fit_fixed_sc_rules(
             session["material_class"] = named_class
             session.pop("rules", None)
             session["class_flip"] = f"{previous_class}->{named_class}"
+    # Owner 2026-09-22 (TaAs semimetal SC): a window that escapes its frozen box, or a new
+    # window, rebuilds the rule set for this map instead of refusing; each rebuild is counted.
+    if "rules" in session:
+        stale = [spec["name"] for spec in rows if spec["name"] not in session["rules"]]
+        for spec in rows:
+            entry = session["rules"].get(spec["name"])
+            if entry is not None and (
+                    _box_escape_reasons(entry["fit"]["rule_box"], spec["box"])
+                    or bool(entry["fit"]["relative"]) != (spec["kind"] != "crossing")):
+                stale.append(spec["name"])
+        if stale:
+            session.pop("rules")
+            session["rebuild_count"] = int(session.get("rebuild_count", 0)) + 1
+            session["class_flip"] = f"escape rebuild {session['rebuild_count']}: {sorted(set(stale))}"
     if "rules" not in session:
         session["eta_ry"] = float(eta)
         session["eps"] = float(eps)

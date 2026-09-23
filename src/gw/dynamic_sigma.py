@@ -32,7 +32,7 @@ class OmegaCoverage:
     only trace was a ``QSGW: 10142 clipped (41.3%)`` line in the log.
 
     ``mask_kn`` is True where the state WAS sampled.  ``policy`` is the
-    resolved :data:`gw.qsgw_utils.OUT_OF_RANGE_POLICIES` value, so a reader
+    fixed value ``"static_omega0"`` (uncovered states use Sigma(omega=0)), so a reader
     knows whether the uncovered cells hold an endpoint value (``clamp``) or
     a non-finite marker (``mask``); ``refuse`` never reaches a consumer.
     """
@@ -191,25 +191,18 @@ def eval_sigma_c_at_dft_energies(
         f"({provenance}; VBM={vbm_ev:.6f}, CBM={cbm_ev:.6f})"
     )
 
-    from .qsgw_utils import (interp_along_omega, omega_coverage,
-                             resolve_out_of_range_policy)
+    from .qsgw_utils import interp_along_omega, omega_coverage
     sig_c_diag = extract_sigma_diag_logical(
         sigma_c_omega, mesh_xy, band_axis=band_axis)
     sig_c_diag = sig_c_diag * RYD_TO_EV
     grid_ev = np.asarray(config.omega_grid_ev, dtype=np.float64)
-    # THE OUTPUT PATH, so the policy is named and the count is REPORTED.
-    # Until 2026-08-22 this call clamped every uncovered state to the grid
-    # endpoint and said nothing, and the eqp0/eqp1 writer downstream wrote
-    # those endpoint values as if they were Sigma at the state's own energy
-    # (measured ~4 eV on the Na semicore deck; 41.3% of cells).  The SC
-    # Hamiltonian path has always counted and rerouted these cells; this is
-    # the output path catching up.
-    policy = resolve_out_of_range_policy()
+    # Uncovered states take Sigma(omega=0), counted and reported (owner rule 2026-09-22).
+    policy = "static_omega0"
     covered, n_uncovered, frac_uncovered = omega_coverage(
         grid_ev, omega_dft_rel_ev)
     sigma_c_at_dft_ev = interp_along_omega(
         sig_c_diag, grid_ev, omega_dft_rel_ev,
-        out_of_range=policy, context="Sigma_c at E_DFT (eqp0/eqp1)",
+        context="Sigma_c at E_DFT (eqp0/eqp1)",
         print_fn=print_fn)
 
     return (

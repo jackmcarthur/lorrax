@@ -363,8 +363,33 @@ def fit_ppm(
     z = complex(probe_omega)
     t0 = _t.perf_counter()
 
+    _mem_diag = os.environ.get("LORRAX_PPM_MEM_DIAG", "0").strip() in ("1", "true", "on")
+
+    def _mem(label, *arrays):
+        # Env-gated: block on the named arrays, then print this device's allocator state,
+        # so an OOM is attributed to the stage that dispatched it (async dispatch otherwise
+        # surfaces it at the next host read).
+        if not _mem_diag:
+            return
+        for a in arrays:
+            if a is not None:
+                jax.block_until_ready(a)
+        st = jax.local_devices()[0].memory_stats() or {}
+        specs = ", ".join(
+            f"{getattr(getattr(a, 'sharding', None), 'spec', None)} {tuple(a.shape)}"
+            for a in arrays if a is not None)
+        if jax.process_index() == 0:
+            import sys as _sys
+            _sys.stderr.write(
+                f"  [ppm mem] {label}: in_use {st.get('bytes_in_use', 0) / 2**30:.2f} GiB, "
+                f"peak {st.get('peak_bytes_in_use', 0) / 2**30:.2f} GiB, "
+                f"limit {st.get('bytes_limit', 0) / 2**30:.2f} GiB; {specs}\n")
+            _sys.stderr.flush()
+
+    _mem("fit_ppm entry (W0, Wprobe, V live)", W0_q, Wprobe_q, V_q)
     Wc0_q = W0_q - V_q
     Wci_q = Wprobe_q - V_q
+    _mem("Wc0/Wci formed", Wc0_q, Wci_q)
     fit = fit_gn_ppm_from_wc_pair(
          Wc0_q, Wci_q, z, fallback_omega=float(fallback_omega),
          n_mu_logical=int(n_mu_logical),
@@ -374,6 +399,8 @@ def fit_ppm(
          ordered_orientations=bool(ordered_orientations),
          print_fn=print_fn if print_fn is not None else print)
 
+    _mem("GN fit returned (before reshard)", fit.omega_qmunu, fit.B_qmunu,
+         fit.B_odd_qmunu, fit.valid_qmunu)
     q_shard = NamedSharding(mesh_xy, P(None, 'x', 'y'))
     Omega = jax.lax.with_sharding_constraint(
         jnp.asarray(fit.omega_qmunu), q_shard)
@@ -384,6 +411,7 @@ def fit_ppm(
     valid_mask = jax.lax.with_sharding_constraint(
         jnp.asarray(fit.valid_qmunu), q_shard)
     Wc0_q = jax.lax.with_sharding_constraint(Wc0_q, q_shard)
+    _mem("GN fit done + outputs resharded", Omega, B, B_odd, valid_mask, Wc0_q)
     t1 = _t.perf_counter()
 
     probe_hermiticity_residual = None
@@ -393,8 +421,12 @@ def fit_ppm(
         b_max = float(jax.device_get(jnp.max(jnp.abs(B))))
         odd_even_residue_ratio = d_max / b_max if b_max > 0.0 else d_max
         probe_scale = float(jax.device_get(jnp.max(jnp.abs(Wprobe_q))))
-        probe_anti = float(jax.device_get(jnp.max(jnp.abs(
-            Wprobe_q - jnp.conj(jnp.swapaxes(Wprobe_q, -1, -2))))))
+        # One q at a time: the whole-array W - W^H materialized a full
+        # (nq, mu, mu) transposed temporary and ran the CrI3 16x16 P64 map
+        # out of memory here (3.88 GiB, pool 58750500 step .79).
+        probe_anti = float(jax.device_get(jax.jit(lambda w: jnp.max(
+            jax.lax.map(lambda wq: jnp.max(jnp.abs(wq - jnp.conj(wq.T))),
+                        w)))(Wprobe_q)))
         probe_hermiticity_residual = (
             probe_anti / probe_scale if probe_scale > 0.0 else probe_anti)
         if print_fn is not None:
@@ -806,6 +838,22 @@ def _add_static_ppm_term(
         out_shardings=sigma_c_kij.sharding)(sigma_c_kij, static)
 
 
+def host_rss_diag(label):
+    """LORRAX_PPM_MEM_DIAG=1: rank 0 prints its host VmRSS / VmHWM (stderr) at ``label``."""
+    if os.environ.get("LORRAX_PPM_MEM_DIAG", "0").strip() not in ("1", "true", "on"):
+        return
+    if jax.process_index() != 0:
+        return
+    import sys as _sys
+    with open("/proc/self/status") as fh:
+        vm = {k: v.split()[0] for k, v in
+              (line.split(":", 1) for line in fh if line.startswith(("VmRSS", "VmHWM")))}
+    _sys.stderr.write(
+        f"  [host rss] {label}: VmRSS {int(vm.get('VmRSS', 0)) / 2**20:.2f} GiB, "
+        f"VmHWM {int(vm.get('VmHWM', 0)) / 2**20:.2f} GiB\n")
+    _sys.stderr.flush()
+
+
 def compute_sigma_c_ppm_omega_grid(
     wfns,
     ppm,
@@ -817,7 +865,6 @@ def compute_sigma_c_ppm_omega_grid(
     mpa_cfg,
     omega_grid_ry: np.ndarray,
     ansatz: str,
-    fit_store_path: str,
     screening_diagrams,
     quadrature_cache_dir: str | None = None,
     occupation_state=None,
@@ -828,8 +875,8 @@ def compute_sigma_c_ppm_omega_grid(
     """Compute GN/HL-PPM Sigma_c through the shared MPA dynamic route.
 
     The PPM fit remains the two-point algebra in :func:`fit_ppm`.  This stage
-    applies the established invalid-pole policy, writes that result as a
-    finalized one-pole MPA store, and then delegates window construction,
+    applies the established invalid-pole policy, hands that result to the
+    executor in memory as a one-pole source, and then delegates window construction,
     denominator-box rules, cache lookup, pole batching, the tau executor and
     omega accumulation to :func:`gw.mpa.sigma.compute_sigma_c_mpa_omega_grid`.
 
@@ -838,7 +885,7 @@ def compute_sigma_c_ppm_omega_grid(
     counts.  The optional static-COHSEX invalid-pole term remains separate
     from the dynamic store and is added exactly once to each cumulative count.
     """
-    from .mpa.sigma import compute_sigma_c_mpa_omega_grid
+    from .mpa.sigma import MemoryPoleSource, compute_sigma_c_mpa_omega_grid
 
     s = wfns.slices
     plan = _resolve_ppm_band_plan(
@@ -922,34 +969,25 @@ def compute_sigma_c_ppm_omega_grid(
                         meta.mu_basis.unpack_operator(B_p))
         if B_odd_p is not None:
             B_odd_p = meta.mu_basis.unpack_operator(B_odd_p)
-    from file_io.mpa_store import write_complete_pole_store_collective
-
     diagram_value = str(getattr(
         screening_diagrams, "value", screening_diagrams))
-    write_complete_pole_store_collective(
-        fit_store_path, Omega_p, B_p,
-        B_odd_p=B_odd_p,
-        mesh_xy=mesh_xy,
-        n_mu_logical=int(meta.n_rmu),
-        energy_unit="Ry",
+    # In memory, no store (owner 2026-09-23): the executor reads the same
+    # sharded fields a store round trip would have returned.
+    poles = MemoryPoleSource(
+        Omega_p, B_p, B_odd_p,
+        n_mu_logical=int(meta.n_rmu), mesh_xy=mesh_xy,
         provenance={
             "fit_protocol": "two_point_ppm",
             "pole_model": ansatz_name,
             "ppm_invalid_mode": invalid_mode,
             "screening_diagrams": diagram_value,
-            "certification_basis": "algebraic_no_linear_solve",
             "probe_frequency_ry": float(ppm.omega_p),
             "unfulfilled_fraction": float(ppm.unfulfilled_fraction),
-        },
-        certification={
-            "condition_max_allowed": 1.0,
-            "backward_error_max_allowed": 1.0,
-        },
-        occupation_state=occupation_state,
-    )
+        })
+    del Omega_p, B_p, B_odd_p
     print_fn(
-        f"  {ansatz_name} fit -> MPA store: one pole per ISDF pair at "
-        f"{fit_store_path}; invalid policy={invalid_mode}")
+        f"  {ansatz_name} fit -> in-memory one-pole source (no store); "
+        f"invalid policy={invalid_mode}")
 
     branches = branches_for_omega_grid(
         omega_req,
@@ -958,7 +996,7 @@ def compute_sigma_c_ppm_omega_grid(
         cond_mask=state.cond_mask,
         val_mask=state.val_mask)
     result = compute_sigma_c_mpa_omega_grid(
-        wfns, fit_store_path, meta, mesh_xy,
+        wfns, poles, meta, mesh_xy,
         omega_grid_ry=omega_req,
         efermi_ry=float(jax.device_get(state.efermi)),
         regularization_width_ry=regularization_width_ry,
@@ -972,9 +1010,14 @@ def compute_sigma_c_ppm_omega_grid(
         band_brackets=plan.bounds,
         band_counts=plan.counts,
         fixed_quadrature_session=fixed_quadrature_session,
-        # Real PPM poles give a fixed-height denominator line on crossing
-        # windows. The shared planner still keeps its relative tail rules.
-        analytic_line=True,
+        # The same fitted box rules as full frequency (owner 2026-09-22): the
+        # analytic fixed-height line rule needed 416 vs 206 (cond:resonant) and
+        # 320 vs 178 (val:resonant) nodes on comparable zero-damping boxes
+        # (CrI3 16x16 GN-PPM 824 tau nodes vs TaAs MPA).
+        analytic_line=False,
+        # No D=0 twin on the GN/HL route: the odd-reference Sigma was a
+        # diagnostic-only second sweep, removed by owner decision 2026-09-23.
+        odd_reference=False,
         print_fn=print_fn)
     sigma_c_kij = result.sigma_c_kij
     if sigma_static_host is not None:

@@ -326,14 +326,11 @@ def compute_z_factor_from_omega_grid(
 	# (dynamic_sigma.eval_sigma_c_at_dft_energies, which reports its count).
 	from .qsgw_utils import interp_along_omega
 	sigma_c_at_dft = interp_along_omega(
-		sigma_c_omega_diag_ev, omega_rel_ev, e_dft_rel_ev,
-		out_of_range="clamp")
+		sigma_c_omega_diag_ev, omega_rel_ev, e_dft_rel_ev)
 	sigma_c_plus = interp_along_omega(
-		sigma_c_omega_diag_ev, omega_rel_ev, e_dft_rel_ev + dE_ev,
-		out_of_range="clamp")
+		sigma_c_omega_diag_ev, omega_rel_ev, e_dft_rel_ev + dE_ev)
 	sigma_c_minus = interp_along_omega(
-		sigma_c_omega_diag_ev, omega_rel_ev, e_dft_rel_ev - dE_ev,
-		out_of_range="clamp")
+		sigma_c_omega_diag_ev, omega_rel_ev, e_dft_rel_ev - dE_ev)
 
 	# Central-difference dRe[Σ_c]/dω at the centre
 	dsigma_dE = (np.real(sigma_c_plus) - np.real(sigma_c_minus)) / (2.0 * dE_ev)
