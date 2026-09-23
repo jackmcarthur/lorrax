@@ -1558,6 +1558,13 @@ class SpectralShellExtrapolationFailed(BandExtrapolationRefused):
     """
 
 
+
+#: Bytes of one (n_terms, chunk) float64 block in BandLadder.log_moment, and
+#: its thread cap: each block has ~5 live temporaries, so the host peak is
+#: about 5 x 64 MiB x 8 = 2.5 GiB per rank.
+_LOG_MOMENT_CHUNK_BYTES = 64 * 2**20
+_LOG_MOMENT_THREADS = 8
+
 @dataclass(frozen=True)
 class BandLadder:
     """The DFT-only spectral ladder the shell moments are built on.
@@ -1631,18 +1638,46 @@ class BandLadder:
         """
         b = np.asarray(beta, dtype=np.float64)
         flat = b.ravel()
-        terms = []                      # each (n_terms, n_beta)
-        lo = int(lo)
-        hi = int(hi)
+        lo, hi = int(lo), int(hi)
+        # COLUMN CHUNKS.  Each state's max and sum run over its own column
+        # only, and numpy reduces axis 0 row by row, so any chunking is
+        # bit-identical.  Unchunked, the tail shell (a3, N_T) is dense
+        # (n_terms, n_states) float64: CrI3 16x16, N_T = 152912 and 46848
+        # states gave 119 GB host RSS per rank (58783428.7 oom_kill).
+        # Chunks run on threads (numpy releases the GIL in exp/log/sum).
+        n_terms = (max(0, min(hi, self.n_dft) - min(lo, self.n_dft))
+                   * int(self.e_dft_ev.shape[1])
+                   + max(0, max(hi, self.n_dft) - max(lo, self.n_dft)))
+        step = max(1, _LOG_MOMENT_CHUNK_BYTES // (8 * max(1, n_terms)))
+        if flat.size <= step:
+            return self._log_moment_columns(lo, hi, flat).reshape(b.shape)
+        from concurrent.futures import ThreadPoolExecutor
+        import os
+        chunks = [flat[i:i + step] for i in range(0, flat.size, step)]
+        workers = min(len(chunks), _LOG_MOMENT_THREADS,
+                      len(os.sched_getaffinity(0)))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            parts = list(pool.map(
+                lambda c: self._log_moment_columns(lo, hi, c), chunks))
+        return np.concatenate(parts).reshape(b.shape)
+
+    def _log_moment_columns(self, lo: int, hi: int, flat) -> np.ndarray:
+        """:meth:`log_moment` for a flat vector of β, one ROW per β.
+
+        Row-major (n_beta, n_terms): each β's max and sum run along its own
+        contiguous row, so the result does not depend on how many β share
+        the call -- the chunking in :meth:`log_moment` is bit-invariant.
+        """
+        terms = []                      # each (n_beta, n_terms)
 
         lo_d, hi_d = min(lo, self.n_dft), min(hi, self.n_dft)
         if hi_d > lo_d:
             x = (self.e_dft_ev[lo_d:hi_d] - self.e0_ev) / self.estar_ev
             ok = x > 0.0
             lg = np.where(ok, -np.log(np.where(ok, x, 1.0)), np.nan)
-            lg = lg.reshape(-1, 1) * flat[None, :]
+            lg = flat[:, None] * lg.reshape(1, -1)
             lgw = np.log(self.w_k)
-            lg = lg + np.tile(lgw, hi_d - lo_d)[:, None]
+            lg = lg + np.tile(lgw, hi_d - lo_d)[None, :]
             terms.append(np.where(np.isnan(lg), -np.inf, lg))
 
         lo_w, hi_w = max(lo, self.n_dft), max(hi, self.n_dft)
@@ -1653,19 +1688,20 @@ class BandLadder:
             lg = np.where(ok, -np.log(np.where(ok, x, 1.0)), np.nan)
             # The extended ladder is k-independent, so each extended band
             # carries the FULL k weight (which sums to 1) exactly once.
-            lg = lg.reshape(-1, 1) * flat[None, :]
+            lg = flat[:, None] * lg.reshape(1, -1)
             terms.append(np.where(np.isnan(lg), -np.inf, lg))
 
         if not terms:
-            return np.full(b.shape, -np.inf)
-        allt = np.concatenate(terms, axis=0)
-        m = np.max(allt, axis=0)
+            return np.full(flat.shape, -np.inf)
+        allt = np.concatenate(terms, axis=1)
+        m = np.max(allt, axis=1)
         out = np.where(
             np.isfinite(m),
-            m + np.log(np.sum(np.exp(allt - np.where(np.isfinite(m), m, 0.0)),
-                              axis=0)),
+            m + np.log(np.sum(
+                np.exp(allt - np.where(np.isfinite(m), m, 0.0)[:, None]),
+                axis=1)),
             -np.inf)
-        return out.reshape(b.shape)
+        return out
 
     def moment(self, lo: int, hi: int, beta) -> np.ndarray:
         """``I(β)`` over ABSOLUTE bands ``(lo, hi]``."""

@@ -838,6 +838,22 @@ def _add_static_ppm_term(
         out_shardings=sigma_c_kij.sharding)(sigma_c_kij, static)
 
 
+def host_rss_diag(label):
+    """LORRAX_PPM_MEM_DIAG=1: rank 0 prints its host VmRSS / VmHWM (stderr) at ``label``."""
+    if os.environ.get("LORRAX_PPM_MEM_DIAG", "0").strip() not in ("1", "true", "on"):
+        return
+    if jax.process_index() != 0:
+        return
+    import sys as _sys
+    with open("/proc/self/status") as fh:
+        vm = {k: v.split()[0] for k, v in
+              (line.split(":", 1) for line in fh if line.startswith(("VmRSS", "VmHWM")))}
+    _sys.stderr.write(
+        f"  [host rss] {label}: VmRSS {int(vm.get('VmRSS', 0)) / 2**20:.2f} GiB, "
+        f"VmHWM {int(vm.get('VmHWM', 0)) / 2**20:.2f} GiB\n")
+    _sys.stderr.flush()
+
+
 def compute_sigma_c_ppm_omega_grid(
     wfns,
     ppm,
@@ -999,8 +1015,8 @@ def compute_sigma_c_ppm_omega_grid(
         # 320 vs 178 (val:resonant) nodes on comparable zero-damping boxes
         # (CrI3 16x16 GN-PPM 824 tau nodes vs TaAs MPA).
         analytic_line=False,
-        # ppm_pipeline computes the D=0 reference itself (sigma.exec.odd_reference);
-        # the MPA executor's own twin would be a third sweep per map, unread.
+        # No D=0 twin on the GN/HL route: the odd-reference Sigma was a
+        # diagnostic-only second sweep, removed by owner decision 2026-09-23.
         odd_reference=False,
         print_fn=print_fn)
     sigma_c_kij = result.sigma_c_kij

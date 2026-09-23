@@ -726,7 +726,7 @@ def test_dynamic_dispatch_books_static_current_once_in_x(tmp_path, monkeypatch, 
         return bare,sx,coh,None,SimpleNamespace(components_skij_ry=sectors)
     monkeypatch.setattr(photon_sigma,'compute_static_photon_sigma',currents)
     fields = ('sigma_c_body_omega','head_sigma_diag_w_kn_ry','band_axis','band_extrapolation',
-        'sigma_c_body_omega_unextrap','sigma_c_odd_body_omega','probe_hermiticity_residual','odd_even_residue_ratio')
+        'sigma_c_body_omega_unextrap','probe_hermiticity_residual','odd_even_residue_ratio')
     monkeypatch.setattr(ppm_pipeline,'compute_ppm_sigma_pipeline',lambda **kw:SimpleNamespace(**dict.fromkeys(fields)))
     monkeypatch.setattr(dispatch,'finalize_dynamic_sigma',lambda *a,**kw:kw)
     got = dispatch.compute_sigma_xc(ComputeMode.GN_PPM,wfns=wfns,V_q=None,W_by_role={'probe':None},
