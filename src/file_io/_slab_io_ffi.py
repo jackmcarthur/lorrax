@@ -1802,6 +1802,12 @@ class _FfiBackend(_DatasetGeometry):
         # router that used to answer this question by picking a lesser
         # transport has no lesser transport left to pick.
         assert_available()
+        self._timing_enabled = _env_flag("LORRAX_SLAB_IO_TIMING", False)
+        if (self._timing_enabled
+                and not self._loader.has_phdf5_timing()):
+            raise RuntimeError(
+                "LORRAX_SLAB_IO_TIMING=1 requires a rebuilt PHDF5 provider "
+                "with lrx_phdf5_close_timed; no file was opened")
 
         self.path = path
         self.mesh = mesh
@@ -1991,18 +1997,9 @@ class _FfiBackend(_DatasetGeometry):
         # not in close() — and it used to be silent, which is why the
         # caller-side per-dataset timing in file_io.tagged_arrays
         # attributed one tensor's transfer to the next dataset in the
-        # file.  Report it where it happens.
-        import time as _time
-        _t0 = _time.perf_counter()
-        _flushed = self._drain_pending()
-        _dt = _time.perf_counter() - _t0
-        _log_level = _close_log_level()
-        if (_flushed and jax.process_index() == 0
-                and (_log_level >= 2 or _dt >= 1.0 or _flushed >= 1_000_000_000)):
-            print(f"  [SlabIO.flush] {os.path.basename(self.path)}: "
-                  f"{_flushed / 1e9:.2f} GB written in {_dt:.1f} s "
-                  f"({_flushed / 1e6 / max(_dt, 1e-9):.0f} MB/s) before "
-                  f"creating {name!r}", flush=True)
+        # file.  The optional service timer includes this wait in create's
+        # API duration and reports native H5Dwrite time separately.
+        self._drain_pending()
         # ``phdf5_ensure_dataset`` REFUSES (on every rank — it is
         # collective and its inputs are replicated) when the dataset
         # exists at a different shape or dtype, and reuses it when they
@@ -2593,9 +2590,10 @@ class _FfiBackend(_DatasetGeometry):
         return reader(offsets_dev, counts_dev)
 
     # ------------------------------------------------------------------
-    def close(self) -> None:
+    def close(self):
         if not self.fh:
             return
+        native_timing = None
         # Drain pending writes on the Python worker thread, then stop
         # the worker, THEN close the MPI-IO handle.  Order matters:
         # close_ctx() in C++ also drains its own task queue, but an
@@ -2667,7 +2665,10 @@ class _FfiBackend(_DatasetGeometry):
             try:
                 with _journal.op_scope("close", self.path, stack=_J_FFI,
                                        mode=self.mode, handle=self.fh):
-                    self._close_file(self.fh)
+                    if self._timing_enabled:
+                        native_timing = self._close_file(self.fh, timing=True)
+                    else:
+                        self._close_file(self.fh)
             except BaseException as exc:
                 if _worker_error is None:
                     _worker_error = exc
@@ -2707,7 +2708,7 @@ class _FfiBackend(_DatasetGeometry):
         # first turned into the all-rank error above, so this branch cannot
         # make ranks take different collective sequences.
         if self.mode == "r":
-            return
+            return native_timing
         deferred_hosts = []
         dataset_attr_hosts = []
 
@@ -2738,3 +2739,4 @@ class _FfiBackend(_DatasetGeometry):
 
         rank0_transaction(self.path, stage="SlabIO.metadata_commit",
                           validate=_materialize, write=_publish)
+        return native_timing

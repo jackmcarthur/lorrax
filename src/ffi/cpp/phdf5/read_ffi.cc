@@ -266,7 +266,21 @@ static ffi::Error ReadImpl(
     }
 
     hid_t dxpl = ctx->use_collective_read ? ctx->dxpl_coll : ctx->dxpl_indep;
+    const auto native_t0 = ctx->timing_enabled
+        ? std::chrono::steady_clock::now()
+        : std::chrono::steady_clock::time_point{};
+    const auto selected = ctx->timing_enabled
+        ? H5Sget_select_npoints(filespace) : 0;
     herr_t st = H5Dread(dset, native_type, memspace, filespace, dxpl, stage);
+    if (ctx->timing_enabled && st >= 0) {
+        ctx->read_calls.fetch_add(1, std::memory_order_relaxed);
+        ctx->read_bytes.fetch_add(static_cast<uint64_t>(selected) * sizeof(T),
+                                  std::memory_order_relaxed);
+        ctx->read_ns.fetch_add(static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - native_t0).count()),
+            std::memory_order_relaxed);
+    }
     H5Sclose(memspace);
     H5Sclose(filespace);
     if (st < 0) {
@@ -625,6 +639,14 @@ static ffi::Error ReadKchunkImpl(
         T* k_buf = static_cast<T*>(stage) + (size_t)k * per_k_elts;
         herr_t st = H5Dread(ds_id, native_type, memspace, filespace, dxpl, k_buf);
         auto tc = now();
+        if (ctx->timing_enabled && st >= 0) {
+            ctx->read_calls.fetch_add(1, std::memory_order_relaxed);
+            ctx->read_bytes.fetch_add(per_k_elts * sizeof(T),
+                                      std::memory_order_relaxed);
+            ctx->read_ns.fetch_add(static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(tc - tb).count()),
+                std::memory_order_relaxed);
+        }
         t_select_total += ms(ta, tb);
         t_read_total += ms(tb, tc);
         if (st < 0) {
@@ -1073,6 +1095,14 @@ static void async_read_kchunk_union_worker(
     herr_t st = H5Dread(ds_id, native_type, memspace, filespace, dxpl,
                         ctx->pinned_buf);
     auto t_read = now();
+    if (ctx->timing_enabled && st >= 0) {
+        ctx->read_calls.fetch_add(1, std::memory_order_relaxed);
+        ctx->read_bytes.fetch_add(static_cast<uint64_t>(npts_file) * element_size,
+                                  std::memory_order_relaxed);
+        ctx->read_ns.fetch_add(static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                t_read - t_select).count()), std::memory_order_relaxed);
+    }
     H5Sclose(memspace);
     H5Sclose(filespace);
     if (st < 0) {
