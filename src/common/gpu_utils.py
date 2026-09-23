@@ -175,6 +175,22 @@ def get_cpu_memory_total() -> float | None:
     return None
 
 
+def get_host_memory_available_gb() -> float | None:
+    """This node's ``MemAvailable`` in GB (1e9 B), or None if unreadable.
+
+    Whole-node, not per process: a caller whose processes share the node
+    divides it among them.
+    """
+    try:
+        with open('/proc/meminfo', 'r') as f:
+            for line in f:
+                if line.startswith('MemAvailable:'):
+                    return int(line.split()[1]) * 1024 / 1e9
+    except (FileNotFoundError, ValueError, IndexError):
+        pass
+    return None
+
+
 def get_device_memory_gb(n_devices: int | None = None) -> float:
     """Get per-device memory budget in GB for JAX computations.
 
@@ -286,6 +302,7 @@ def get_device_memory_info() -> dict:
 
 __all__ = ["bfc_fragmentation_target_utilization",
            "get_device_memory_gb", "get_device_memory_info",
+           "get_host_memory_available_gb",
            "get_gpu_memory_nvidia_smi",
            "get_gpu_used_memory_bytes_nvidia_smi", "get_cpu_memory_total",
            "worst_process_resident_bytes"]

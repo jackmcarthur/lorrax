@@ -365,11 +365,23 @@ peak     = resident + work + q_tile·per_q
 slots `symmetry_maps.isdf_one_leg_source_slots` names; 1 on a trivial star).
 Every term is ÷P except the replicated v row, which is per tile.
 
+The read also costs HOST memory: `host_per_q = 16·(μ_L [+ μ_R])·n_G/P` per
+q, staged in the phdf5 file context's `read_buf`, which stays at the largest
+read until the context closes.  The bispinor build holds four ζ loaders open
+across seven V tiles: with whole-slab reads VI3 12x12 at P16 retained
+33.4 + 3·11.7 = 68.5 GB/rank (274 GB on a 263 GB four-rank node) and the step
+was OOM-killed on the host
+(`runs/runtime/vq_summa_20260923/bisp_new_try2_hostoom.log`).  Each V tile
+therefore ends with `ZetaLoader.release_read_staging()` on its loaders, and
+its q-tile also fits a live host budget.
+
 `_plan_vq_tiles` picks, in order: `g` = `vq_g_chunk_size` if positive (any
 width; a tail it does not divide is masked), else the largest width
 ≤ 4096 whose widest panel all-gather fits `LORRAX_COLLECTIVE_CHUNK_MB` and
 whose panels take at most half of what one q leaves; then `q_tile` = every q
-that fits the budget, balanced across tiles.  All q fit whenever they do,
+that fits both the device budget and the host staging budget (0.9 of the
+node's live `MemAvailable` over the processes on the node, so other loaders'
+retained staging is already excluded), balanced across tiles.  All q fit whenever they do,
 which is the historical whole-slab read.  The budget is 0.9 of the live
 available device memory (`common.gpu_utils.get_device_memory_info`), agreed
 as the minimum across processes because the tile count fixes how many

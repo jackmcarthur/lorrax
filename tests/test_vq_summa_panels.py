@@ -34,7 +34,8 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 jax.config.update("jax_enable_x64", True)
 
 from gw.v_q_g_flat import (  # noqa: E402
-    _compute_V_q_g_flat_one_tile, _make_q_tile_kernel, _one_leg_columns)
+    _compute_V_q_g_flat_one_tile, _make_q_tile_kernel, _one_leg_columns,
+    _plan_vq_tiles, vq_tile_bytes)
 
 
 def _mesh22():
@@ -149,7 +150,7 @@ def test_panel_kernel_masks_an_indivisible_g_tail():
 
 
 class _ArrayZetaLoader:
-    """The three ``ZetaLoader`` members the V tile reads, over an in-memory ζ."""
+    """The ``ZetaLoader`` members the V tile uses, over an in-memory ζ."""
 
     zeta_layout = "G_flat"
 
@@ -157,6 +158,10 @@ class _ArrayZetaLoader:
         self._zeta, self.gvec_components, self._mesh = zeta, gvec, mesh
         self.n_rmu = zeta.shape[1]
         self.reads = []
+        self.releases = 0
+
+    def release_read_staging(self):
+        self.releases += 1
 
     def read_zeta_G_slab(self, *, q_offset, q_count, mu_offset, mu_count,
                          mesh=None):
@@ -185,6 +190,7 @@ def test_budget_tiles_the_zeta_read_and_leaves_v_unchanged():
             sym=None, centroid_indices=None, is_charge_cc=True,
             write_g0=True, one_leg_action="scalar", timing_label="test",
             verbose=True, budget_bytes=budget)
+        assert loader.releases == 1                   # staging freed per V tile
         return np.asarray(V), np.asarray(g0), loader.reads
 
     V1, g01, reads1 = run(1e12)
@@ -203,6 +209,24 @@ def test_budget_tiles_the_zeta_read_and_leaves_v_unchanged():
     assert not np.any(V1[:, n_mu:, :]) and not np.any(V1[:, :, n_mu:])
     with pytest.raises(ValueError, match="GATE vq_tile_budget"):
         run(8_000)                                    # < 1600 + 4608 + 1920
+
+
+@pytest.mark.mesh(4)
+def test_host_read_staging_bounds_the_q_tile():
+    """The phdf5 read keeps each open file's largest tile staged on the host,
+    so the q-tile also fits the host budget, whatever the device allows."""
+    mesh = _mesh22()
+    shape = dict(n_q=10, n_rmu_L=8, n_rmu_R=8, ngkmax=40, same_zeta=True,
+                 n_sub=0)
+    host_q = vq_tile_bytes(**shape, p_x=2, p_y=2, g_chunk=8)["host_per_q"]
+    assert host_q == 16 * 8 * 40 / 4
+    plan = dict(shape, mesh_xy=mesh, g_chunk=8, budget_bytes=1e12)
+    assert _plan_vq_tiles(**plan)[0] == 10                 # device-only: all q
+    q_tile, _, priced = _plan_vq_tiles(**plan, host_budget_bytes=3.5 * host_q)
+    assert q_tile == 3 and priced["n_tiles"] == 4          # 3,3,3,1 -> 3
+    assert priced["host_staged"] <= 3.5 * host_q
+    with pytest.raises(ValueError, match="GATE vq_tile_budget"):
+        _plan_vq_tiles(**plan, host_budget_bytes=0.5 * host_q)
 
 
 def _inversion_star(kgrid, n_mu, rng):

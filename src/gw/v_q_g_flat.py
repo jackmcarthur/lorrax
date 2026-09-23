@@ -352,6 +352,7 @@ def vq_tile_bytes(*, n_q: int, n_rmu_L: int, n_rmu_R: int, ngkmax: int,
         resident = V_acc 16·n_q·μ_L·μ_R/P + g0_acc 16·n_q·μ_L/p_x
                  + one-leg columns 16·n_q·μ_L·n_sub/P
         per_q    = ζ rows 16·(μ_L [+ μ_R])·n_G/P + v row 16·n_G (replicated)
+        host_per_q = ζ rows 16·(μ_L [+ μ_R])·n_G/P  (phdf5 host read staging)
         work     = faces 16·(μ_L + μ_R [+ μ_R])·n_G/P  (the sliced face(s)
                    and the ('y','x') permute of the R face)
                  + V_q carry 2·16·μ_L·μ_R/P
@@ -370,13 +371,15 @@ def vq_tile_bytes(*, n_q: int, n_rmu_L: int, n_rmu_R: int, ngkmax: int,
         resident=c * (n_q * n_rmu_L * n_rmu_R / p_all + n_q * n_rmu_L / p_x
                       + n_q * n_rmu_L * n_sub / p_all),
         per_q=c * (rows * ngkmax / p_all + ngkmax),
+        host_per_q=c * rows * ngkmax / p_all,
         fixed_work=fixed, panel_col=panel_col,
         work=fixed + panel_col * int(g_chunk))
 
 
 def _plan_vq_tiles(*, n_q: int, n_rmu_L: int, n_rmu_R: int, ngkmax: int,
                    same_zeta: bool, n_sub: int, mesh_xy: Mesh,
-                   g_chunk: int | None, budget_bytes: float):
+                   g_chunk: int | None, budget_bytes: float,
+                   host_budget_bytes: float = float('inf')):
     """Size the G panel and the ζ q-tile of one V tile from the V_q memory budget.
 
     Bytes are :func:`vq_tile_bytes`.  ``g`` (0/None = auto) is the largest
@@ -384,8 +387,10 @@ def _plan_vq_tiles(*, n_q: int, n_rmu_L: int, n_rmu_R: int, ngkmax: int,
     fits ``LORRAX_COLLECTIVE_CHUNK_MB`` and whose panels take at most half of
     what one q leaves free; an explicit ``g_chunk`` (deck
     ``vq_g_chunk_size``) is used as given.  The q-tile is then every q that
-    fits — all of them whenever they do, which is the whole-slab read —
-    balanced so the last tile is not a sliver.  Every input is
+    fits the device budget and whose read staging, ``host_per_q`` per q,
+    fits ``host_budget_bytes`` (``_vq_host_staging_bytes``) — all of them
+    whenever they do, which is the whole-slab read — balanced so the last
+    tile is not a sliver.  Every input is
     rank-invariant (the caller agrees the budget across processes), so every
     rank issues the same collective reads.
 
@@ -410,13 +415,17 @@ def _plan_vq_tiles(*, n_q: int, n_rmu_L: int, n_rmu_R: int, ngkmax: int,
         g = max(1, min(g, int(0.5 * free // b['panel_col'])))
     b = vq_tile_bytes(**shape, g_chunk=g)
     resident, per_q, work = b['resident'], b['per_q'], b['work']
-    q_fit = int((budget_bytes - resident - work) // per_q)
+    host_per_q = b['host_per_q']
+    q_fit = int(min((budget_bytes - resident - work) // per_q,
+                    host_budget_bytes // host_per_q, n_q))
     if q_fit < 1:
         raise ValueError(
             "GATE vq_tile_budget: "
             f"got V_acc/g0/one-leg {resident / 1e9:.2f} GB + one q "
             f"{per_q / 1e9:.2f} GB + faces/panels {work / 1e9:.2f} GB per rank; "
-            f"want <= the V_q budget {budget_bytes / 1e9:.2f} GB; "
+            f"want <= the V_q budget {budget_bytes / 1e9:.2f} GB, and one q's "
+            f"host read staging {host_per_q / 1e9:.2f} GB <= "
+            f"{host_budget_bytes / 1e9:.2f} GB; "
             "why: the output accumulator and one q's ζ face cannot both be "
             "resident, so no q-tile or G-panel choice can run this tile; "
             "fix: add ranks (every term above is ÷P) or free device memory "
@@ -426,11 +435,12 @@ def _plan_vq_tiles(*, n_q: int, n_rmu_L: int, n_rmu_R: int, ngkmax: int,
     q_tile = -(-int(n_q) // n_tiles)
     priced = resident + work + q_tile * per_q
     return q_tile, g, dict(resident=resident, per_q=per_q, work=work,
-                           priced=priced, n_tiles=n_tiles)
+                           priced=priced, n_tiles=n_tiles,
+                           host_staged=q_tile * host_per_q)
 
 
 def _vq_budget_bytes(budget_bytes: float | None) -> float:
-    """The per-rank V_q budget, agreed across processes (the minimum).
+    """The per-rank V_q device budget, agreed across processes (the minimum).
 
     ``None`` measures it live: ``common.gpu_utils.get_device_memory_info``
     ``budget_gb`` (0.9 of this device's currently available memory), the
@@ -444,6 +454,30 @@ def _vq_budget_bytes(budget_bytes: float | None) -> float:
     else:
         local_gb = float(budget_bytes) / 1e9
     return minimum_process_budget_gb(local_gb) * 1e9
+
+
+def _vq_host_staging_bytes() -> float:
+    """Per-rank host bytes one ζ q-tile read may stage, agreed across processes.
+
+    The phdf5 read stages each rank's slab in its file context's host
+    buffer (``ctx->read_buf``, ``src/ffi/cpp/phdf5/context.cc``), which is
+    kept at the largest read until the context closes; the V tile releases
+    it when done (``ZetaLoader.release_read_staging``), so what a tile may
+    stage is 0.9 of the node's live ``MemAvailable`` over the processes
+    sharing the node.
+    """
+    import socket
+    import zlib
+    from common.collectives import all_gather_processes
+    from common.gpu_utils import (get_host_memory_available_gb,
+                                  minimum_process_budget_gb)
+    avail_gb = get_host_memory_available_gb()
+    host = zlib.crc32(socket.gethostname().encode())
+    hosts = np.asarray(all_gather_processes(np.asarray(host, dtype=np.int64)))
+    per_node = max(1, int(np.sum(hosts == host)))
+    local_gb = (float('inf') if avail_gb is None
+                else 0.9 * avail_gb / per_node)
+    return minimum_process_budget_gb(min(local_gb, 1e12)) * 1e9
 
 
 def _make_read_q_tile(zeta_loader, n_rmu_padded: int, mesh_xy: Mesh):
@@ -641,10 +675,11 @@ def _compute_V_q_g_flat_one_tile(
 
     # ---- G panel and q-tile from the V_q budget ------------------------
     budget = _vq_budget_bytes(budget_bytes)
+    host_budget = _vq_host_staging_bytes()
     q_tile, g_chunk, priced = _plan_vq_tiles(
         n_q=n_q_ibz, n_rmu_L=n_rmu_L_padded, n_rmu_R=n_rmu_R_padded,
         ngkmax=ngkmax, same_zeta=same_zeta, n_sub=n_sub, mesh_xy=mesh_xy,
-        g_chunk=g_chunk, budget_bytes=budget)
+        g_chunk=g_chunk, budget_bytes=budget, host_budget_bytes=host_budget)
     n_chunks = -(-ngkmax // g_chunk)
     n_tiles = int(priced['n_tiles'])
     if verbose and jax.process_index() == 0:
@@ -658,7 +693,9 @@ def _compute_V_q_g_flat_one_tile(
               f"({n_tiles} tile(s)), priced {priced['priced'] / 1e9:.2f} GB/rank "
               f"= resident {priced['resident'] / 1e9:.2f} + "
               f"{q_tile}×{priced['per_q'] / 1e9:.3f} ζ/q + faces/panels "
-              f"{priced['work'] / 1e9:.2f}, budget {budget / 1e9:.2f} GB",
+              f"{priced['work'] / 1e9:.2f}, budget {budget / 1e9:.2f} GB; "
+              f"host read staging {priced['host_staged'] / 1e9:.2f} of "
+              f"{host_budget / 1e9:.2f} GB/rank",
               flush=True)
 
     # ---- Accumulators ---------------------------------------------------
@@ -737,6 +774,13 @@ def _compute_V_q_g_flat_one_tile(
                   f"(q {q0}..{q0 + qn - 1}): read={_t1 - _t0:.2f}s "
                   f"kernel={_t.perf_counter() - _t1:.2f}s "
                   f"({(_t.perf_counter() - _t1) / qn:.3f}s/q)", flush=True)
+    # The read contexts keep their largest tile staged on the host until the
+    # file closes, and the bispinor build holds four ζ loaders open across
+    # seven V tiles; without this their staging accumulates (VI3 12x12 P16:
+    # host OOM-kill at the fourth file).  Collective, like the reads.
+    zeta_L_loader.release_read_staging()
+    if not same_zeta:
+        zeta_R_loader.release_read_staging()
     if verbose and jax.process_index() == 0:
         print(f"    [{timing_label}] {n_q_ibz} IBZ q in {n_tiles} tile(s): "
               f"read={_read_total:.2f}s kernel={_kernel_total:.2f}s "
