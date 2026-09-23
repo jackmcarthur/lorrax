@@ -393,8 +393,12 @@ def fit_ppm(
         b_max = float(jax.device_get(jnp.max(jnp.abs(B))))
         odd_even_residue_ratio = d_max / b_max if b_max > 0.0 else d_max
         probe_scale = float(jax.device_get(jnp.max(jnp.abs(Wprobe_q))))
-        probe_anti = float(jax.device_get(jnp.max(jnp.abs(
-            Wprobe_q - jnp.conj(jnp.swapaxes(Wprobe_q, -1, -2))))))
+        # One q at a time: the whole-array W - W^H materialized a full
+        # (nq, mu, mu) transposed temporary and ran the CrI3 16x16 P64 map
+        # out of memory here (3.88 GiB, pool 58750500 step .79).
+        probe_anti = float(jax.device_get(jax.jit(lambda w: jnp.max(
+            jax.lax.map(lambda wq: jnp.max(jnp.abs(wq - jnp.conj(wq.T))),
+                        w)))(Wprobe_q)))
         probe_hermiticity_residual = (
             probe_anti / probe_scale if probe_scale > 0.0 else probe_anti)
         if print_fn is not None:
