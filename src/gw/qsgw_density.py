@@ -4,27 +4,44 @@ The SC map rebuilds scalar and current Hartree fields from the iteration
 orbitals on raw IBZ rows. File k weights and typed symmetry projection
 complete the density; full-BZ inputs remain available for numerical controls.
 
-STRUCTURE: ONE SCAN, U NEVER REPLICATED
----------------------------------------
-A single ``lax.scan`` over k.  Per k, in this order:
+STRUCTURE: ONE SCAN OVER k TILES, ONE REDUCTION AFTER IT
+--------------------------------------------------------
+:func:`rho_from_wfns` is one ``shard_map`` around one ``lax.scan`` over
+tiles of ``K`` k-points.  Every rank accumulates the density of ITS OWN
+rotated bands over the whole scan, and a single ``psum`` over ``('x','y')``
+after the scan makes it the crystal's density.  Per tile, three routes
+produce "my rotated bands" (:func:`plan_density_scan` picks one):
 
-    ψ_m^X   ← reshard ψ[k] so the CONTRACTED band index m lies on 'x'
-    ψ̃_n^Y  ← einsum('mn,msg->nsg', Z[k], ψ_m^X)     # Z is P('x','y')
-    ψ̃_n^XY ← reshard onto the whole mesh
-    box → ifft → ρ(r) += w_k · f_spin · Σ_n f_nk |ψ̃_nk(r)|²
+``g_split`` (the default whenever U is given)::
 
-``Z`` is sharded ``P(None, 'x', 'y')`` — m on 'x', n on 'y' — so no rank
-ever holds a full ``(nb, nb)``.  That is the NATIVE layout of both
-eigenvector producers (``distrib_la``'s ScaLAPACK ``batched_distributed_eigh``
-and a ``jnp.linalg.eigh`` constrained to it), and the contraction is
-written to consume it as-is: transposing Z to put n on 'x' would swap the
-sharding to ``P(None,'y','x')`` and cost an all-to-all on the largest
-object in the loop, for nothing.  At nb=640/P=64 each rank carries
-80×80×16 B = 102 kB per k against 6.5 MB replicated, and the replicated
-form is the ``(nk, nb, nb)`` W2-class object that reaches 9.2 GB at
-nb=2000/nk=144.  The contraction index m is on 'x' and the output index n
-on 'y', so the sum over m is a reduction along 'x' ALONE, not a global
-collective.
+    ψ[k]    (nb/P, s, G)   → all-to-all over the mesh → (nb, s, G/P)
+    ψ̃[k]  = U[k][:, :n_rot]ᵀ ψ[k]     local GEMM, U_k gathered (small)
+    ψ̃[k]  (n_rot, s, G/P) → all-to-all back       → (n_rot/P, s, G)
+
+``band_2d`` (the fallback when one replicated U tile is not small against
+the per-device budget: m on 'x', n on 'y', U never whole on a rank)::
+
+    ψ_m^X  = all-gather ψ[k] over 'y';   partial ψ̃_n^Y = Σ_{m∈x} U ψ_m
+    ψ̃     = reduce-scatter over 'x'     (nb/P, s, G)
+
+``local`` (``U=None``): ψ[k]'s own bands, no communication at all.
+
+then ``box → ifft → ρ_rank(r) += w_k f_spin Σ_{n∈rank} f_nk |ψ̃_nk(r)|²``.
+
+WHY THIS SHAPE.  The previous scan moved, per k, an all-gather of
+``ψ_k/p_x``, an all-reduce of ``ψ̃_k/p_y`` and an all-reduce of the whole
+band-summed field into the replicated carry — three serial collectives
+per k, 0.37 s/k on VI3 12x12 at P100 over OFI (``vh.rho`` 52.8 s for 144
+k, ``runs/VI3/09_*/11_gnppm_sc_bispinor_ferroU6/gwjax.log``).  ``g_split``
+moves ``2·ψ_k/P`` per k plus the U tile; the field reduction is paid once.
+
+``U`` arrives at ``P(None, 'x', 'y')`` — m on 'x', n on 'y' — the NATIVE
+layout of both eigenvector producers (``distrib_la``'s batched eigh and a
+``jnp.linalg.eigh`` constrained to it); the whole ``(nk, nb, nb)`` is never
+gathered.  ``g_split`` gathers ONE tile's ``(K, nb, nb)`` inside the scan,
+admitted only while that tile is below the same budget share that lets the
+SC eigh hold a whole tile on one device (:func:`band_tile_fits_one_device`);
+past it ``band_2d`` keeps U distributed.
 
 EIGENVECTORS ARE COLUMNS.  ``Z[k, m, n]`` is component m of eigenvector
 n: ``A[k] @ Z[k] == Z[k] @ diag(W[k])``.  That is ScaLAPACK's convention,
@@ -36,14 +53,9 @@ invariance, the electron count and the norm all survive it.  The gate
 therefore pins the convention against an explicit host-side rotation
 rather than relying on an invariance.
 
-The third step — resharding ψ̃ from ``P('x',…)`` back onto ``('x','y')``
-— is what makes the rest uniform.  Straight out of the rotation the bands
-are split over 'x' and REPLICATED over 'y', so an FFT there would do px-
-fold redundant work and the final reduction would have to know to sum over
-'x' only (double-counting by py if it did not).  One cheap sphere-space
-reshard buys: full-mesh FFT parallelism, and a reduction identical to the
-unrotated path, so there is one reduction rule in this file rather than
-two.
+Every route leaves each rank with WHOLE bands of full G, so the FFT runs
+on the whole mesh with no redundant copy and the reduction rule is the
+same one line for all three.
 
 **The rotation happens on the sphere, never in r.**  Rotating in real
 space would need every band of a k in the FFT box at once — the per-k
@@ -51,20 +63,19 @@ full-band box, 1.9 GB at nb=640 bispinor, which is the wall
 ``common.mtxel_sweep`` exists to avoid.  The sphere is ~200× smaller and
 the rotation is diagonal in G, so it costs a GEMM and no transform.
 
-WHY ALL BANDS ARE TRANSFORMED, NOT JUST THE OCCUPIED ONES
----------------------------------------------------------
-``occ`` enters as a per-state WEIGHT, so bands with f = 0 contribute
-exactly nothing and could be skipped.  They are not skipped, on purpose:
-
-* the scan needs shapes uniform across iterations, and the occupied count
-  varies per k in a metal;
-* fractional occupations, including the signed MP1 weights used for metallic
-  self-consistency, may make every band contribute, so a code that slices to
-  the occupied window would have to be rewritten rather than re-fed.
-
-The price is transforming ``nb`` bands instead of ``n_occ``.  Measure it
-before optimising it: at fixed occupations the fix is a mask to a fixed
-band window, which is a change of one slice, not of this structure.
+ONLY THE OCCUPIED ROTATED BANDS ARE TRANSFORMED (``g_split``)
+------------------------------------------------------------
+``occ`` is a per-state WEIGHT indexed by the rotated band.  The rotated
+bands ``n >= n_act`` are dropped, where ``n_act`` is the smallest count
+whose tail carries at most :data:`DENSITY_TAIL_ELECTRON_TOL` electrons,
+``f_spin Σ_k w_k Σ_{n>=n_act} |f_nk|`` — the same bound, and the same
+constant, as the SC window cut (``sc_iteration._density_window_occupations``).
+Step and fixed occupations drop exactly zero; signed MP1 and FD weights
+drop at most that bound, because each |ψ̃|² integrates to one.  The kept
+count is padded to the mesh band divisor (``runtime.padding``), and that
+padded count is the executable's only occupation-dependent shape: a metal
+whose count moves between maps recompiles once per distinct padded count
+it visits, never per map, and pad bands carry zero weight.
 
 THE CHEAP CORRECTNESS GATE
 --------------------------
@@ -85,10 +96,13 @@ mixing, and is small exactly when that mixing is.
 
 from __future__ import annotations
 
+from typing import NamedTuple
+
 import numpy as np
 
 import jax
 import jax.numpy as jnp
+from jax.experimental.layout import Layout, with_layout_constraint
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from common import timing
@@ -99,7 +113,10 @@ from runtime.padding import pad_axis, spec_divisor
 __all__ = ["rho_from_wfns", "rho_r_to_G", "band_rotation_spec",
            "distributed_eigh_bands", "symmetrise_density",
            "hartree_from_orbitals", "rotate_bands",
-           "rotate_band_axis", "rotate_band_matrix"]
+           "rotate_band_axis", "rotate_band_matrix",
+           "DENSITY_TAIL_ELECTRON_TOL", "density_tail_electrons",
+           "density_active_band_count", "BAND_TILE_BUDGET_FRACTION",
+           "band_tile_is_large", "DensityScanPlan", "plan_density_scan"]
 
 
 def _band_spec() -> P:
@@ -350,6 +367,263 @@ def symmetrise_density(rho_r, sym_perm):
     return (jnp.mean(flat[perm], axis=0)).reshape(grid)
 
 
+#: Electrons per cell the density may leave out of a band cut.  ONE budget
+#: for both cuts the SC density makes: the QP window (bands at or above b3,
+#: ``sc_iteration._density_window_occupations`` refuses beyond it) and the
+#: occupied cut inside the window (:func:`density_active_band_count`).  The
+#: bound it is compared with is exact — each |ψ|² integrates to one and the
+#: star average is an average — so this is the whole numerical budget of a
+#: cut: fixed/step occupations give exactly 0, and the bcc Fe FD decks ~1e-16
+#: (E_25 - mu = 10.2 eV at kBT = 0.02 Ry, ``runs/Fe/19_*/qe/WFN.h5``).
+DENSITY_TAIL_ELECTRON_TOL = 1.0e-12
+
+
+def density_tail_electrons(occ, kweights, spin_degeneracy: float) -> np.ndarray:
+    """``D[n] = f_spin Σ_k w_k Σ_{m>=n} |f_mk|`` for ``n = 0 .. nb``.
+
+    The electrons per cell that a band cut at ``n`` leaves out, bounded by
+    the absolute occupation because signed MP1 weights must not cancel in
+    the bound.  ``D[nb] == 0``.  A device table is reduced over k where it
+    lives and only the ``(nb,)`` per-band sum crosses to the host, through
+    ``common.collectives.gather_to_host`` (any sharding, every process).
+    """
+    w = np.asarray(kweights, dtype=np.float64)
+    if isinstance(occ, jax.Array):
+        from common.collectives import gather_to_host
+        per_band = np.asarray(gather_to_host(jnp.einsum(
+            "k,kn->n", jnp.asarray(w), jnp.abs(occ.astype(jnp.float64)))),
+            dtype=np.float64)
+    else:
+        a = np.abs(np.asarray(occ, dtype=np.float64))
+        per_band = (a * w[:, None]).sum(axis=0)
+    # Suffix sums from the top band down: the small tail values are added
+    # first, so D near the cut is not rounded against the occupied mass.
+    tail = np.cumsum(per_band[::-1])[::-1]
+    return float(spin_degeneracy) * np.concatenate([tail, [0.0]])
+
+
+def density_active_band_count(occ, kweights, spin_degeneracy: float) -> int:
+    """Smallest band count whose tail carries <= the density budget.
+
+    The rotated bands at and above it contribute at most
+    :data:`DENSITY_TAIL_ELECTRON_TOL` electrons to ρ and to every current
+    component (``|J| <= ρ`` state by state), so :func:`rho_from_wfns` does
+    not rotate or transform them.
+    """
+    tail = density_tail_electrons(occ, kweights, spin_degeneracy)
+    if not np.all(np.isfinite(tail)):
+        raise ValueError("density occupations must be finite")
+    return int(np.argmax(tail <= DENSITY_TAIL_ELECTRON_TOL))
+
+
+# The largest share of the per-device memory budget one (nb, nb) band tile
+# may take and still be held WHOLE on one device.  Two consumers ask the
+# same question and must agree: the SC eigh (``sc_iteration._resolve_sc_eigh``
+# keeps its native per-device eighs below it) and the density scan (its
+# ``g_split`` route gathers one U tile per scan step below it, and keeps U
+# distributed on ``band_2d`` above it).
+#
+# The native eigh path is a k-sharded BATCH: each device runs whole per-k
+# eighs, so it materialises the input tile, the eigenvector tile and
+# LAPACK's workspace — call it three tiles — on ONE device, on top of ψ,
+# the FFT boxes and the ω-cube.  Capping ONE tile at 1% of the budget
+# therefore caps the eigh's single-device footprint near 3%.
+#
+# Derived from bytes and the budget rather than from a band count, so it
+# tracks the device it runs on.  Where 1% puts the switch, against the
+# budgets ``gw_config`` actually resolves:
+#
+#   80 GB GPU   → budget 72 GB (0.9·bytes_limit)      → nb ≈ 6.7e3
+#   CLX node    → budget 169 GB (0.9·RAM / n_devices) → nb ≈ 1.0e4
+#   8 GB device → budget 7.2 GB                       → nb ≈ 2.2e3
+#
+# which is the band the owner ruling names — robustness at 1e4+ bands
+# over speed at 1e3, where the native batch solves ndev matrices at once
+# and wins by roughly ndev (``distrib_la.resolve``, eigh ``auto``
+# policy).  3% was the first choice and was wrong on the CPU arm: the
+# CPU budget is the whole node's RAM divided by the JAX device count, so
+# with several ranks per node it over-counts, and 3% of 169 GB puts the
+# switch past nb = 1.8e4 — it would not have fired on the nb = 1e4 case
+# the distributed eigh exists for.
+BAND_TILE_BUDGET_FRACTION = 0.01
+
+
+def band_tile_is_large(tile_bytes: float, budget_bytes) -> bool:
+    """Whether a band tile exceeds :data:`BAND_TILE_BUDGET_FRACTION`.
+
+    An unknown budget (``None`` or ``<= 0``) is never large — the SC eigh's
+    long-standing reading, kept so the two consumers cannot disagree.
+    """
+    budget = float(budget_bytes or 0.0)
+    return budget > 0.0 and float(tile_bytes) > BAND_TILE_BUDGET_FRACTION * budget
+
+
+class DensityScanPlan(NamedTuple):
+    """Static shape plan of one :func:`rho_from_wfns` executable.
+
+    route
+        ``"g_split"`` (U given, U tile small), ``"band_2d"`` (U given, U
+        tile large: U stays distributed) or ``"local"`` (``U=None``).
+    n_rot
+        Rotated bands transformed per k: the occupied count padded to the
+        mesh band divisor on ``g_split``, the whole band carrier otherwise.
+    k_tile
+        k-points per scan step; divides ``n_k``.
+    g_carrier
+        G extent the ``g_split`` all-to-all splits over the mesh; the
+        loader's ``ngkmax`` on the other routes.
+    """
+    route: str
+    n_rot: int
+    k_tile: int
+    g_carrier: int
+
+
+def plan_density_scan(*, mesh: Mesh, n_k: int, nb_carrier: int,
+                      n_active: int, ns: int, ngkmax: int, n_grid: int,
+                      have_U: bool, budget_bytes) -> DensityScanPlan:
+    """Choose the density-scan route and its static shapes.
+
+    ONE SIZE COMPARISON picks the rotation: the ``g_split`` route gathers a
+    ``(nb, nb)`` U tile on every rank, so it is taken exactly when that tile
+    is not large against the per-device budget (:func:`band_tile_is_large`,
+    the SC eigh's own threshold).  At 72 GB/device that is
+    ``nb_carrier <= 6.7e3``; above it ``band_2d`` keeps U at
+    ``P(None,'x','y')`` and pays the ψ_k/p_x gather instead.
+
+    THE k TILE IS BOUNDED BY THE SPHERE THE RANK ALREADY HOLDS.  One k of a
+    ``g_split`` step costs two complex FFT boxes of this rank's rotated
+    bands (the gathered box and ψ(r); measured 0.82 GiB per extra k at
+    VI3 12x12 P16, exactly two 0.44 GiB boxes) plus its sphere and U tile.
+    ``K`` is the largest divisor of ``n_k`` whose step fits in the resident
+    ψ(G) sphere of this rank, so the scan's transient is at most one more
+    copy of what the stage already holds and scales as 1/P like it.  The
+    measured gain is per-step overhead amortised (VI3 P16 four-current
+    2.67 s at K=1, 2.24 s at K=2, 2.24 s at K=4, slower again at K=8),
+    so ``K`` is a bounded regime, never the largest tile the device budget
+    would admit.  ``K = 1`` whenever one step already exceeds that sphere,
+    and always for a single k-point.
+    """
+    from common.wfn_layout import band_sphere_spec
+    from runtime.padding import bounded_partition_tile, padded_axis
+
+    n_k, nb_carrier = int(n_k), int(nb_carrier)
+    if not have_U:
+        return DensityScanPlan("local", nb_carrier, 1, int(ngkmax))
+    c128 = 16.0
+    if band_tile_is_large(float(nb_carrier) ** 2 * c128, budget_bytes):
+        return DensityScanPlan("band_2d", nb_carrier, 1, int(ngkmax))
+    n_rot = padded_axis(
+        max(int(n_active), 1), mesh, name="density occupied rotated bands",
+        spec=band_sphere_spec(), axis=1).carrier
+    g_carrier = padded_axis(
+        int(ngkmax), mesh, name="density G all-to-all",
+        spec=P(None, None, None, ("x", "y")), axis=3).carrier
+    n_ranks = int(mesh.devices.size)
+    nb_rank, n_loc = nb_carrier // n_ranks, n_rot // n_ranks
+    sphere = n_k * nb_rank * int(ns) * int(ngkmax) * c128
+    step = (2.0 * n_loc * int(ns) * int(n_grid) * c128
+            + (nb_rank + 2 * n_loc) * int(ns) * g_carrier * c128
+            + float(nb_carrier) ** 2 * c128)
+    k_cap = max(1, int(sphere // step))
+    k_tile = max(1, bounded_partition_tile(n_k, k_cap, 1))
+    return DensityScanPlan("g_split", n_rot, k_tile, g_carrier)
+
+
+def _density_scan_body(mesh: Mesh, plan: DensityScanPlan, *, n_k: int,
+                       nb_carrier: int, ns: int, ngkmax: int, grid, scale,
+                       f_spin, include_current, charge_ns,
+                       return_spin_matrix):
+    """The per-rank body: scan k tiles, accumulate MY bands, psum once.
+
+    Local operands: ψ ``(n_k, nb/P, ns, ngkmax)``; U ``(n_k, nb/p_x,
+    nb/p_y)`` (rotated routes); occ ``(n_k, nb)``, w ``(n_k,)`` and the box
+    index ``(n_k, nx, ny, nz)`` replicated.  Returns the replicated field.
+
+    Band ownership after each route (``r`` = linear rank over ('x','y'),
+    the band_sphere_spec block order):
+
+    * ``local``   : ψ's own block, bands ``r·nb/P + [0, nb/P)``.
+    * ``g_split`` : rotated bands ``r·n_rot/P + [0, n_rot/P)``.
+    * ``band_2d`` : rotated bands ``y·nb/p_y + x·nb/P + [0, nb/P)`` — the
+      reduce-scatter over 'x' splits the 'y' block U's columns put there.
+    """
+    from common.fft_helpers import local_ifftn3
+    from psp.get_DFT_mtxels import density_components_from_psi_r
+
+    band_axes = ("x", "y")
+    p_y = int(mesh.shape["y"])
+    n_ranks = int(mesh.shape["x"]) * p_y
+    K = int(plan.k_tile)
+    n_tiles = n_k // K
+    nb_rank = nb_carrier // n_ranks
+    n_loc = plan.n_rot // n_ranks if plan.route == "g_split" else nb_rank
+    field_shape = ((2, 2, *grid) if return_spin_matrix else
+                   ((4, *grid) if include_current else tuple(grid)))
+    field_dtype = jnp.complex128 if return_spin_matrix else jnp.float64
+
+    def my_bands(psi_t, U_t):
+        """This rank's rotated bands of one k tile, and the first index."""
+        if plan.route == "local":
+            return psi_t, jax.lax.axis_index(band_axes) * nb_rank
+        if plan.route == "band_2d":
+            # m on 'x': gather ψ's 'y' blocks, whose band order is x-major.
+            psi_m = jax.lax.all_gather(psi_t, "y", axis=1, tiled=True)
+            part = jnp.einsum("kmn,kmsg->knsg", U_t, psi_m, optimize=True)
+            phi = jax.lax.psum_scatter(part, "x", scatter_dimension=1,
+                                       tiled=True)
+            n0 = (jax.lax.axis_index("y") * (nb_carrier // p_y)
+                  + jax.lax.axis_index("x") * nb_rank)
+            return phi, n0
+        # g_split: bands whole, G split — rotate locally — bands split back.
+        # PIN THE TILE ROW-MAJOR.  The all-to-all wants its split axis (G)
+        # major; left free, layout assignment satisfies that on the scan's
+        # LOOP OPERAND and hoists a G-major copy of the whole resident ψ
+        # out of the loop (+ψ/P per rank: 4.98 GiB of an 11.61 GiB
+        # executable at VI3 12x12 P16).  Pinned, the transpose is one k
+        # tile wide and the executable is 6.63 GiB
+        # (``runs/runtime/density_scan_20260923``, legs b02/b05).
+        a = with_layout_constraint(psi_t, Layout(major_to_minor=(0, 1, 2, 3)))
+        a = jnp.pad(a, ((0, 0), (0, 0), (0, 0), (0, plan.g_carrier - ngkmax)))
+        a = jax.lax.all_to_all(a, band_axes, split_axis=3, concat_axis=1,
+                               tiled=True)
+        u = jax.lax.all_gather(U_t, "x", axis=1, tiled=True)
+        u = jax.lax.all_gather(u, "y", axis=2, tiled=True)[:, :, :plan.n_rot]
+        b = jnp.einsum("kmn,kmsg->knsg", u, a, optimize=True)
+        b = jax.lax.all_to_all(b, band_axes, split_axis=1, concat_axis=3,
+                               tiled=True)
+        return b[..., :ngkmax], jax.lax.axis_index(band_axes) * n_loc
+
+    def body(psi_l, U_l, occ, w, bidx):
+        def tiles(a):
+            return None if a is None else a.reshape(n_tiles, K, *a.shape[1:])
+
+        def step(acc, xs):
+            psi_t, U_t, occ_t, w_t, bidx_t = xs
+            phi, n0 = my_bands(psi_t, U_t)
+            f = jax.lax.dynamic_slice_in_dim(occ_t, n0, n_loc, axis=1)
+            f = f * (f_spin * w_t)[:, None]
+            box = _box_kernel(phi, bidx_t, ngkmax=ngkmax)
+            psi_r = local_ifftn3(box, axes=(-3, -2, -1), norm="ortho") * scale
+            dens = density_components_from_psi_r(
+                psi_r.reshape(K * n_loc, ns, *grid), f.reshape(K * n_loc),
+                include_dirac_current=include_current,
+                charge_nspinor=(None if return_spin_matrix else charge_ns),
+                return_spin_density_matrix=return_spin_matrix)
+            return acc + dens, None
+
+        acc0 = jnp.zeros(field_shape, dtype=field_dtype)
+        acc, _ = jax.lax.scan(
+            step, acc0, (tiles(psi_l), tiles(U_l), tiles(occ), tiles(w),
+                         tiles(bidx)), unroll=1)
+        # THE ONE REDUCTION.  Every rank holds the density of its own bands
+        # summed over every k; nothing crossed the mesh for the field before
+        # this line.
+        return jax.lax.psum(acc, band_axes)
+
+    return body
+
+
 # FORCED SYNC, AND IT COSTS NOTHING HERE.  ρ(r) is ``(nx, ny, nz)`` f64 —
 # 750 kB at 60×60×26 — and the very next statement in the only production
 # caller (:func:`hartree_from_orbitals` → ``build_hartree_potential``) is
@@ -362,7 +636,8 @@ def rho_from_wfns(psi_G, occ, kweights, *, mesh: Mesh, box_index,
                   fft_grid, cell_volume: float, spin_degeneracy: float,
                   U=None, sym_perm=None, sym=None, include_dirac_current: bool = False,
                   charge_nspinor: int | None = None,
-                  return_spin_density_matrix: bool = False):
+                  return_spin_density_matrix: bool = False,
+                  memory_budget_bytes: float | None = None, print_fn=None):
     """ρ(r) = Σ_k w_k f_spin Σ_{n,s} f_nk |ψ̃_nks(r)|², scanned over k.
 
     Parameters
@@ -372,7 +647,8 @@ def rho_from_wfns(psi_G, occ, kweights, *, mesh: Mesh, box_index,
         Per-state occupations — ``gw.efermi.step_occupations`` today, a
         Fermi–Dirac factor later.  A WEIGHT, not a mask: nothing here
         assumes it is 0 or 1.  Indexed by the ROTATED band n when ``U`` is
-        given, which is the band the eigenvalue E_nk belongs to.
+        given, which is the band the eigenvalue E_nk belongs to.  Rotated
+        bands past :func:`density_active_band_count` are not transformed.
     kweights : (n_k,) float64
         Weights of the SAME k-set as ``psi_G``.  On the IBZ these are
         ``WfnLoader.kweights`` and the result MUST be symmetrised over the
@@ -385,6 +661,13 @@ def rho_from_wfns(psi_G, occ, kweights, *, mesh: Mesh, box_index,
         ``sc_iteration`` already assumes; do not pass a transpose.
         ``None`` builds ρ from ``psi_G`` unrotated — the DFT density and
         the gate's baseline.
+    memory_budget_bytes : float, optional
+        The run's per-device budget (``config.memory.per_device_gb``).  It
+        decides one thing, :func:`plan_density_scan`'s route; unknown means
+        a band tile is small, the SC eigh's reading.
+    print_fn : callable, optional
+        Receives the plan receipt (route, rotated bands, k tile) once per
+        compiled executable.
 
     ``include_dirac_current=True`` requires four-component orbitals and
     returns ``(rho,Jx,Jy,Jz)`` from the SAME inverse FFT and the SAME signed
@@ -413,10 +696,12 @@ def rho_from_wfns(psi_G, occ, kweights, *, mesh: Mesh, box_index,
     valence_density_from_kpoint``: ψ_r = ifftn(box, 'ortho')·√(N/Ω), so
     ``ΔV · Σ_r ρ = f_spin · Σ_k w_k Σ_n f_nk``.
 
-    THE CARRY IS ρ(r) — ``(nx, ny, nz)`` f64, 750 kB at a 60×60×26 grid.
-    The scan carries something negligible and the band reduction is folded
-    into the accumulation, so there is ONE collective class for the whole
-    build rather than one materialised ψ̃ per k.
+    THE CARRY IS EACH RANK'S PARTIAL ρ(r) — the density of its own bands,
+    ``(nx, ny, nz)`` f64 (or the four-current / spin-matrix field).  The
+    field is reduced ONCE, after the scan; the consumers (the star average,
+    the host polar projection, ``build_hartree_potential``'s charge check
+    and Poisson solve) all read the whole grid, so the result is replicated
+    rather than reduce-scattered.
 
     SYMMETRISATION IS ENFORCED, NOT DOCUMENTED.  ``sym_perm`` (from
     ``symmetry_maps.fft_grid_pullback_perm``) makes the result the
@@ -433,8 +718,7 @@ def rho_from_wfns(psi_G, occ, kweights, *, mesh: Mesh, box_index,
     impossible; pass ``sym_perm`` whenever the k-set is reduced, uniform
     weights or not.
     """
-    from common.fft_helpers import make_sharded_ifftn_3d
-    from psp.get_DFT_mtxels import density_components_from_psi_r
+    from common.shard_map import shard_map
 
     grid = tuple(int(s) for s in fft_grid)
     ngrid = int(np.prod(grid))
@@ -477,10 +761,8 @@ def rho_from_wfns(psi_G, occ, kweights, *, mesh: Mesh, box_index,
             "sym_perm=None, then apply the canonical spinor/axial/TR "
             "symmetry action.")
     p_prod = spec_divisor(mesh, _band_spec(), 1)
-    _pad = pad_axis(psi, p_prod, axis=1)
-    psi, nb_logical = _pad.array, _pad.logical   # LOGICAL, by name
-    nb_pad = int(psi.shape[1])
-    ngkmax = int(psi.shape[3])
+    psi = pad_axis(psi, p_prod, axis=1).array
+    nk, nb_pad, _, ngkmax = (int(s) for s in psi.shape)
 
     occ_j = jnp.asarray(occ, dtype=jnp.float64)
     if int(occ_j.shape[1]) != nb_pad:
@@ -496,8 +778,6 @@ def rho_from_wfns(psi_G, occ, kweights, *, mesh: Mesh, box_index,
             U_j = jnp.pad(U_j, ((0, 0),
                                 (0, nb_pad - int(U_j.shape[1])),
                                 (0, nb_pad - int(U_j.shape[2]))))
-    else:
-        U_j = jnp.zeros((1, 1, 1), dtype=jnp.complex128)   # unused operand
 
     w_np = np.asarray(kweights, dtype=np.float64)
     if (not return_spin_matrix and sym_perm is None and w_np.size > 1
@@ -514,89 +794,50 @@ def rho_from_wfns(psi_G, occ, kweights, *, mesh: Mesh, box_index,
     w_j = jnp.asarray(kweights, dtype=jnp.float64)
     bidx_j = jnp.asarray(box_index, dtype=jnp.int32)
 
-    band_xy = NamedSharding(mesh, _band_spec())
-    m_on_x = NamedSharding(mesh, P(None, "x", None, None))
-    U_sh = NamedSharding(mesh, band_rotation_spec())
-    box_spec = P(None, ("x", "y"), None, None, None, None)
-    ifftn = make_sharded_ifftn_3d(mesh, box_spec, box_spec,
-                                  norm="ortho", axes=(-3, -2, -1))
-    field_shape = ((2, 2, *grid) if return_spin_matrix else
-                   ((4, *grid) if include_current else grid))
-    field_spec = (P(None, None, None, None, None) if return_spin_matrix else
-                  (P(None, None, None, None) if include_current
-                   else P(None, None, None)))
-    rho_sharding = NamedSharding(mesh, field_spec)
+    plan = plan_density_scan(
+        mesh=mesh, n_k=nk, nb_carrier=nb_pad,
+        n_active=(density_active_band_count(occ_j, w_np, f_spin)
+                  if have_U else nb_pad),
+        ns=ns, ngkmax=ngkmax, n_grid=ngrid, have_U=have_U,
+        budget_bytes=memory_budget_bytes)
+    rho_sharding = NamedSharding(mesh, P())
 
     def build():
+        if print_fn is not None:
+            print_fn(f"    density scan: route={plan.route} rotated bands "
+                     f"{plan.n_rot}/{nb_pad} k_tile={plan.k_tile} of {nk} "
+                     f"(G carrier {plan.g_carrier})")
+        body = _density_scan_body(
+            mesh, plan, n_k=nk, nb_carrier=nb_pad, ns=ns, ngkmax=ngkmax,
+            grid=grid, scale=scale, f_spin=f_spin,
+            include_current=include_current, charge_ns=charge_ns,
+            return_spin_matrix=return_spin_matrix)
+        rep = P()
+        per_rank = shard_map(
+            body if have_U else (lambda p, o, w, b: body(p, None, o, w, b)),
+            mesh=mesh,
+            in_specs=((_band_spec(), band_rotation_spec(), rep, rep, rep)
+                      if have_U else (_band_spec(), rep, rep, rep)),
+            out_specs=rep, check_vma=False)
+
         @jax.jit
-        def fn(psi_, U_, occ_, w_, bidx_, sp_):
-            # Keep the resident all-k sphere in its canonical two-axis band
-            # layout.  The rotation needs m on x only for the current k
-            # point, so reshard that singleton slice inside the scan instead
-            # of replicating the full psi array over y for the scan lifetime.
-            psi_s = jax.lax.with_sharding_constraint(psi_, band_xy)
-            if have_U:
-                U_x = jax.lax.with_sharding_constraint(U_, U_sh)
-
-            def body(rho, xs):
-                if have_U:
-                    psi_k, U_k, occ_k, w_k, bidx_k = xs
-                    # COLUMNS: psi~_n = sum_m Z[m,n] psi_m.  m is on 'x'
-                    # so the sum reduces along 'x' alone; n lands on 'y'.
-                    psi_k_x = jax.lax.with_sharding_constraint(
-                        psi_k[None], m_on_x)[0]
-                    psi_t = jnp.einsum('mn,msg->nsg', U_k, psi_k_x,
-                                       optimize=True)
-                    # Back onto the WHOLE mesh: straight out of the
-                    # rotation the bands sit on 'x' and are replicated on
-                    # 'y', which would make the FFT px-fold redundant and
-                    # the final reduction a different rule than the
-                    # unrotated path's.  One cheap sphere reshard fixes
-                    # both.
-                    # Same two-step as rotate_bands: land on 'y' (the
-                    # contraction's natural output) so the reduce is
-                    # (nb/py, ns, ngkmax), then slice to ('x','y') for
-                    # free.  One constraint straight to ('x','y')
-                    # all-reduces the whole global psi_tilde.
-                    psi_t = jax.lax.with_sharding_constraint(
-                        psi_t[None],
-                        NamedSharding(mesh, P(None, "y", None, None)))
-                    psi_t = jax.lax.with_sharding_constraint(
-                        psi_t, NamedSharding(mesh, _band_spec()))
-                else:
-                    psi_k, occ_k, w_k, bidx_k = xs
-                    psi_t = psi_k[None]
-                box = _box_kernel(psi_t, bidx_k[None], ngkmax=ngkmax)
-                psi_r = ifftn(box) * scale
-                dens = density_components_from_psi_r(
-                    psi_r[0], occ_k,
-                    include_dirac_current=include_current,
-                    charge_nspinor=(None if return_spin_matrix else charge_ns),
-                    return_spin_density_matrix=return_spin_matrix)
-                return rho + (w_k * f_spin) * dens, None
-
-            field_dtype = (jnp.complex128 if return_spin_matrix
-                           else jnp.float64)
-            rho0 = jnp.zeros(field_shape, dtype=field_dtype)
-            xs = ((psi_s, U_x, occ_, w_, bidx_) if have_U
-                  else (psi_s, occ_, w_, bidx_))
-            rho, _ = jax.lax.scan(body, rho0, xs, unroll=1)
-            rho = jax.lax.with_sharding_constraint(rho, rho_sharding)
+        def _density_scan(psi_, U_, occ_, w_, bidx_, sp_):
+            rho = per_rank(psi_, U_, occ_, w_, bidx_) if have_U else \
+                per_rank(psi_, occ_, w_, bidx_)
             if sym_perm is not None:
                 if include_current:
                     rho = rho.at[0].set(symmetrise_density(rho[0], sp_))
                 else:
                     rho = symmetrise_density(rho, sp_)
-                rho = jax.lax.with_sharding_constraint(rho, rho_sharding)
-            return rho
-        return fn
+            return jax.lax.with_sharding_constraint(rho, rho_sharding)
+        return _density_scan
 
     fn = _cached_jit(
-        "rho_from_wfns",
-        (psi.shape, tuple(np.shape(U_j)), grid, float(cell_volume), f_spin,
-         have_U, include_current, charge_ns, return_spin_matrix,
+        "rho_density_scan",
+        (psi.shape, grid, float(cell_volume), f_spin, have_U,
+         include_current, charge_ns, return_spin_matrix,
          None if sym_perm is None else tuple(np.shape(sym_perm)),
-         _sharding_key(psi)),
+         tuple(plan), mesh, _sharding_key(psi)[1]),
         build)
     # sym_perm is an OPERAND, not a closure.  The cache key can only carry
     # its SHAPE, so two different permutation tables of the same
@@ -607,7 +848,7 @@ def rho_from_wfns(psi_G, occ, kweights, *, mesh: Mesh, box_index,
     # Same class as V_r baked in as a jit constant (audit 2026-08-05).
     sp_j = (jnp.zeros((1, 1), dtype=jnp.int32) if sym_perm is None
             else jnp.asarray(sym_perm, dtype=jnp.int32))
-    result = fn(psi, U_j, occ_j, w_j, bidx_j, sp_j)
+    result = fn(psi, U_j if have_U else None, occ_j, w_j, bidx_j, sp_j)
     if include_current and sym is not None:
         from symmetry_maps import project_polar_fft_field
         projected = project_polar_fft_field(np.asarray(result[1:]), sym)

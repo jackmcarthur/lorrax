@@ -1393,32 +1393,9 @@ def _partitioned_candidate_efermi(
     return float(candidate_occ_state.mu_ry)
 
 
-# The largest share of the per-device memory budget one (nb, nb) tile is
-# allowed to take before the native eigh stops being acceptable.
-#
-# The native path is a k-sharded BATCH: each device runs whole per-k
-# eighs, so it materialises the input tile, the eigenvector tile and
-# LAPACK's workspace — call it three tiles — on ONE device, on top of ψ,
-# the FFT boxes and the ω-cube.  Capping ONE tile at 1% of the budget
-# therefore caps the eigh's single-device footprint near 3%.
-#
-# Derived from bytes and the budget rather than from a band count, so it
-# tracks the device it runs on.  Where 1% puts the switch, against the
-# budgets ``gw_config`` actually resolves:
-#
-#   80 GB GPU   → budget 72 GB (0.9·bytes_limit)      → nb ≈ 6.7e3
-#   CLX node    → budget 169 GB (0.9·RAM / n_devices) → nb ≈ 1.0e4
-#   8 GB device → budget 7.2 GB                       → nb ≈ 2.2e3
-#
-# which is the band the owner ruling names — robustness at 1e4+ bands
-# over speed at 1e3, where the native batch solves ndev matrices at once
-# and wins by roughly ndev (``distrib_la.resolve``, eigh ``auto``
-# policy).  3% was the first choice and was wrong on the CPU arm: the
-# CPU budget is the whole node's RAM divided by the JAX device count, so
-# with several ranks per node it over-counts, and 3% of 169 GB puts the
-# switch past nb = 1.8e4 — it would not have fired on the nb = 1e4 case
-# the distributed eigh exists for.
-_SC_EIGH_TILE_BUDGET_FRACTION = 0.01
+# The one-device band-tile threshold is owned by ``gw.qsgw_density``
+# (``BAND_TILE_BUDGET_FRACTION``, with its derivation); the density scan's
+# U-replication route asks the same question and must agree.
 
 
 def _resolve_sc_eigh(nb: int, mesh_xy: Mesh, config, *, print_fn) -> str:
@@ -1437,8 +1414,8 @@ def _resolve_sc_eigh(nb: int, mesh_xy: Mesh, config, *, print_fn) -> str:
 
     * the mesh has more than one device — on one device "distributed" is
       the same tile with an FFI call around it;
-    * one tile exceeds :data:`_SC_EIGH_TILE_BUDGET_FRACTION` of the
-      per-device budget.
+    * one tile exceeds ``qsgw_density.BAND_TILE_BUDGET_FRACTION`` of the
+      per-device budget (:func:`gw.qsgw_density.band_tile_is_large`).
 
     and then only if the distributed backend actually resolves on this
     mesh.  ``resolve_backend`` is the probe: it raises at RESOLVE time
@@ -1488,10 +1465,12 @@ def _resolve_sc_eigh(nb: int, mesh_xy: Mesh, config, *, print_fn) -> str:
     if requested == "distributed":
         return "distributed"
 
+    from .qsgw_density import BAND_TILE_BUDGET_FRACTION, band_tile_is_large
+
     tile_b = float(nb) * float(nb) * 16.0
     budget_b = float(getattr(getattr(config, "memory", None),
                              "per_device_gb", 0.0)) * 1e9
-    big = budget_b > 0.0 and tile_b > _SC_EIGH_TILE_BUDGET_FRACTION * budget_b
+    big = band_tile_is_large(tile_b, budget_b)
     if ndev <= 1 or not big:
         return "native"
 
@@ -1504,7 +1483,7 @@ def _resolve_sc_eigh(nb: int, mesh_xy: Mesh, config, *, print_fn) -> str:
         print_fn(
             f"  SC eigh: auto wanted the distributed eigh (one (nb, nb) tile "
             f"is {tile_b / 2**30:.3f} GiB, over "
-            f"{_SC_EIGH_TILE_BUDGET_FRACTION:.0%} of the "
+            f"{BAND_TILE_BUDGET_FRACTION:.0%} of the "
             f"{budget_b / 1e9:.1f} GB/device budget) but the backend refused "
             f"— {type(exc).__name__}: {exc}.  Falling back to the k-sharded "
             f"native batch, which puts that whole tile on ONE device.")
@@ -2282,13 +2261,9 @@ def _kstar(inputs):
     return KStarMap.identity(int(inputs.kin_ion_dft.shape[0]))
 
 
-#: Electrons per cell the SC density may leave out above the QP window.
-#: The bound it is compared with is exact (see the function below), so this
-#: is the whole numerical budget of the band cut: fixed/step occupations
-#: give exactly 0, and the bcc Fe FD decks ~1e-16 (E_25 - mu = 10.2 eV at
-#: kBT = 0.02 Ry, ``runs/Fe/19_*/qe/WFN.h5``).  A deck that needs more has
-#: occupied states outside its QP window and must widen the window.
-_DENSITY_TAIL_ELECTRON_TOL = 1.0e-12
+# The electrons the SC density may leave out of a band cut are budgeted
+# once, ``gw.qsgw_density.DENSITY_TAIL_ELECTRON_TOL``: the window cut
+# below and the occupied cut inside ``rho_from_wfns`` share it.
 
 
 def _density_window_occupations(occ, kweights, nb_window: int,
@@ -2311,20 +2286,20 @@ def _density_window_occupations(occ, kweights, nb_window: int,
     replicated ``P(None, None)`` (``rotate_wavefunctions``), so the slice
     below cannot re-replicate anything.  Returns ``(occ_window, D)``.
     """
-    from gw.efermi import occupied_band_count
+    from gw.qsgw_density import (DENSITY_TAIL_ELECTRON_TOL,
+                                 density_tail_electrons)
 
     nb_window = int(nb_window)
     if int(occ.shape[1]) < nb_window:
         raise ValueError(
             f"SC density occupations have {int(occ.shape[1])} bands, fewer "
             f"than the {nb_window}-band QP window")
-    dropped = float(f_spin) * occupied_band_count(
-        jnp.abs(occ[:, nb_window:]), kweights)
-    if not np.isfinite(dropped) or dropped > _DENSITY_TAIL_ELECTRON_TOL:
+    dropped = float(density_tail_electrons(occ, kweights, f_spin)[nb_window])
+    if not np.isfinite(dropped) or dropped > DENSITY_TAIL_ELECTRON_TOL:
         raise ValueError(
             "GATE sc_density_band_cut: bands at or above the QP window "
             f"[0, {nb_window}) carry {dropped:.3e} electrons per cell "
-            f"(budget {_DENSITY_TAIL_ELECTRON_TOL:.0e}).  The density is "
+            f"(budget {DENSITY_TAIL_ELECTRON_TOL:.0e}).  The density is "
             "built from the QP window only, because the QP rotation mixes "
             "nothing above it; an occupied state there would be silently "
             "dropped.  Widen the QP window (ncond) in a new calculation.")
@@ -2452,7 +2427,10 @@ def rebuild_hartree_dft_basis(inputs, U_qp, occupations_full,
         spin_degeneracy=f_spin,
         include_dirac_current=include_current,
         charge_nspinor=charge_ns, sym=inputs.sym,
-        sym_perm=inputs.sym.fft_grid_pullback(inputs.sym.active_symmetry_rows, grid))
+        sym_perm=inputs.sym.fft_grid_pullback(inputs.sym.active_symmetry_rows, grid),
+        memory_budget_bytes=float(getattr(getattr(inputs.config, "memory", None),
+                                          "per_device_gb", 0.0)) * 1e9,
+        print_fn=inputs.print_fn)
     rho_r = fields[0] if include_current else fields
     expected_electrons = f_spin * occupied_band_count(occ, kweights)
     with timing.section("vh.poisson"):
