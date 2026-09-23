@@ -48,6 +48,7 @@ from .gw_config import (
 	refuse_unsupported_bispinor_tt_head_correction,
 	refuse_unsupported_bispinor_gw,
 	resolve_xla_gpu_memory_env,
+	uses_bare_tt_gamma_head,
 	uses_coupled_photon_head,
 	uses_direct_bispinor_shared_pole_head,
 )
@@ -2664,7 +2665,8 @@ def _compute_photon_vq(
                     centroid_C_idx=_cent_C_idx_for_orchestrator,
                     centroid_T_idx=_cent_T_idx_for_orchestrator,
                     use_ibz=True,
-                    tt_head_correction=(bool(cfg.head.bispinor_tt_head_correction)
+                    tt_head_correction=(uses_bare_tt_gamma_head(cfg)
+                        or bool(cfg.head.bispinor_tt_head_correction)
                         or uses_direct_bispinor_shared_pole_head(cfg)),
                     bispinor_gw_mode=None,
                     charge_representation=None,

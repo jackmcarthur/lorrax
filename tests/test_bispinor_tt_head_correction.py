@@ -176,6 +176,46 @@ def test_tt_head_correction_cc_tile_is_a_no_op():
         np.asarray(b_on(q_irr_frac, gvec_components)))
 
 
+def test_hybrid_shared_pole_selects_one_bare_tt_gamma_without_ct(tmp_path, monkeypatch):
+    """The hybrid's charge head and bare TT tile have separate owners."""
+    import dataclasses
+    import inspect
+    from gw import gw_init, v_q_bispinor
+    from gw.gw_config import (
+        BispinorGWMode, HeadCorrection, uses_bare_tt_gamma_head,
+        uses_direct_bispinor_shared_pole_head, uses_static_photon_response)
+
+    cfg = _config(tmp_path, """\
+bispinor = true
+bispinor_gw = bare_transverse
+compute_mode = mpa
+sigma_w_model = shared_pole
+head_correction = no_local_fields
+""", name="hybrid_tt_gamma.in")
+    assert uses_bare_tt_gamma_head(cfg)
+    assert not uses_direct_bispinor_shared_pole_head(cfg)
+    assert not uses_static_photon_response(cfg)
+    assert not uses_bare_tt_gamma_head(dataclasses.replace(
+        cfg, head=dataclasses.replace(cfg.head, correction=HeadCorrection.OFF)))
+    assert not uses_bare_tt_gamma_head(dataclasses.replace(
+        cfg, bispinor_gw=BispinorGWMode.FULL_SHARED_POLE))
+    assert "tt_head_correction=(uses_bare_tt_gamma_head(cfg)" in inspect.getsource(
+        gw_init._compute_photon_vq)
+
+    # Coulomb-gauge CT/TC slots stay zero while exactly one TT Γ slot is
+    # replaced by the existing tensor owner.  A fixed tensor makes this a
+    # deterministic wiring check independent of the mini-BZ sampler.
+    assert v_q_bispinor.ZERO_TILES == frozenset(
+        [(0, i) for i in (1, 2, 3)] + [(i, 0) for i in (1, 2, 3)])
+    monkeypatch.setattr(v_q_bispinor, "_tt_head_tensor", lambda **_: np.diag([7., 8., 9.]))
+    q, g = _one_q_gamma_g0_table()
+    builder = v_q_bispinor._make_per_q_v_builder_for_tile(
+        mu_L=1, nu_L=1, bvec=_BVEC, cell_volume=_CELL_VOLUME,
+        sys_dim=_SYS_DIM, vcoul_cutoff_ry=None,
+        kgrid=_KGRID, tt_head_correction=uses_bare_tt_gamma_head(cfg))
+    assert np.asarray(builder(q, g))[0, 1] == -7. / _CELL_VOLUME
+
+
 def test_tt_head_tensor_refuses_box_truncation():
     from gw.v_q_bispinor import _tt_head_tensor
     with pytest.raises(ValueError, match="sys_dim"):
