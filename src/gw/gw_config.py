@@ -2962,15 +2962,24 @@ def _assemble_input_config(
 def _apply_input_envelope(
         _named_keys, print_fn, resolved):
     """Produce the final configuration after cross-key refusals and provenance."""
-    if (bool(resolved.bispinor)
-            and resolved.qp_solver is QPSolver.SELF_CONSISTENT
+    # Every QSGW map rebuilds V_H from its own orbitals unless the deck says
+    # otherwise (owner 2026-09-23).  A fixed DFT V_H is a comparison mode:
+    # on VI3 it moved the gap 2.657 -> 1.916 eV once V_H went live (claim 2637).
+    if (resolved.qp_solver is QPSolver.SELF_CONSISTENT
             and "density_self_consistent" not in _named_keys
             and not bool(resolved.density_self_consistent)):
         resolved = _dc_replace(resolved, density_self_consistent=True)
         print_fn(
-            "  [config provenance] bispinor qp_solver=self_consistent: "
-            "density_self_consistent was not named; enabling the "
-            "required live (rho, J) Hartree rebuild")
+            "  [config provenance] qp_solver=self_consistent: "
+            "density_self_consistent was not named; enabling the live "
+            + ("(rho, J)" if bool(resolved.bispinor) else "rho")
+            + " Hartree rebuild")
+    elif (resolved.qp_solver is QPSolver.SELF_CONSISTENT
+            and not bool(resolved.density_self_consistent)):
+        print_fn(
+            "  [config provenance] WARNING density_self_consistent = false: "
+            "V_H stays at the DFT density on every map (comparison mode, "
+            "not production QSGW)")
     if "restart" not in _named_keys:
         print_fn(
             "  [config provenance] restart was not named; using the "

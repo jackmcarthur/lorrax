@@ -1402,8 +1402,8 @@ def _resolve_sc_eigh(nb: int, mesh_xy: Mesh, config, *, print_fn) -> str:
     """``"native"`` or ``"distributed"`` for this iteration's eigh.
 
     A LAYOUT decision and nothing else.  It used to be a side effect of
-    ``density_self_consistent`` — a physics knob whose scalar-QSGW default
-    is False —
+    ``density_self_consistent`` — a physics knob that was then off by
+    default for scalar QSGW —
     so the only eigh that keeps no whole ``(nb, nb)`` tile on one rank
     was unreachable on the default path.  ``config.sc.eigh`` selects it
     now; the E_F rule stays where it was, with ``density_self_consistent``.
@@ -2134,10 +2134,9 @@ def _rotate_to_dft_basis(O_qp: jax.Array, U: jax.Array, *,
 # Density self-consistency: rebuild V_H from the CURRENT orbitals
 # ---------------------------------------------------------------------------
 #
-# OFF BY DEFAULT for scalar QSGW (``config.density_self_consistent``);
-# config resolution enables it whenever bispinor QSGW is requested without
-# an explicit setting.  With it off this module is byte-identical to before,
-# which is what keeps
+# ON BY DEFAULT for every QSGW deck (``config.density_self_consistent``;
+# config resolution promotes an omitted key, 2026-09-23).  With it off this
+# module is byte-identical to the fixed-density driver, which is what keeps
 # tests/test_invariance_gates.py::test_sc_iteration1_equals_one_shot
 # meaningful.
 
@@ -3053,8 +3052,8 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         # robustness at 1e4+ bands over speed at 1e3, where the native
         # batch wins by ~ndev).  Until
         # 2026-08-05 the distributed one was reachable ONLY by turning on
-        # ``density_self_consistent``, a physics knob defaulting to False for
-        # scalar QSGW,
+        # ``density_self_consistent``, a physics knob then defaulting to False
+        # for scalar QSGW,
         # so the default -- and only shipped -- configuration had no way
         # to ask for it.
         #
