@@ -38,7 +38,7 @@ def _sector_read_programs(mesh,indices,masks,execution):
 
 def read_sector_round(io, meta, bank, header, ids, endpoints, *, sample_span=None,
                       fields=('Wc','dWc_ds'), retained=(), execution='local'):
-    """Read one bounded sector sample at a time into its packed endpoint bases.
+    """Read a bounded sector span into its packed endpoint bases.
 
     The canonical photon store is mesh-interleaved; each selected family is
     converted to the existing MuBasis order before the constructor sees it.
@@ -79,30 +79,22 @@ def read_sector_round(io, meta, bank, header, ids, endpoints, *, sample_span=Non
             sample=field in ('Wc','dWc_ds','Wc_mirror','dWc_mirror_ds')
             if sample and (sample_span is None or sample_span[1] <= sample_span[0]):
                 raise ValueError('sector sample reads require a nonempty bounded sample_span')
-            spans=([(i,i+1) for i in range(*sample_span)] if sample else [None])
-            parts=[]
-            for span in spans:
-                size=sum(a.size*a.dtype.itemsize//io.mesh.size for a in keep)
-                row=ledger.reserve(f'sector.read.retained.{len(ledger.entries)}',
-                    resident_bytes_per_rank=size,workspace_bytes_per_rank=0,concurrent_with=ambient)
-                ledger.live_stages=(*ambient,row['stage'])
-                value=read_shared_pole_bank(io,meta=meta,header=header,q_ids=ids,
-                    sample_span=span,fields=(field,),partition_spec=None if execution == "face" else spec,
-                    sector=tuple('T' if family else 'C' for family in endpoints))[field]
-                # Reserve the selected output alongside the bounded input.
-                output=value.shape[0]*(1 if not sample else value.shape[1])*len(indices[0])*len(indices[1])*value.dtype.itemsize//io.mesh.size
-                workspace=value.shape[0]*(1 if not sample else value.shape[1])*len(indices[0])*value.shape[-1]*value.dtype.itemsize//io.mesh.size
-                ledger.reserve(f'sector.read.select.{len(ledger.entries)}',
-                    resident_bytes_per_rank=value.size*value.dtype.itemsize//io.mesh.size+output,
-                    workspace_bytes_per_rank=workspace,concurrent_with=ledger.live_stages)
-                selected=select(value)
-                del value
-                parts.append(selected);keep.append(selected)
-            if len(parts)>1:
-                ledger.reserve(f'sector.read.join.{len(ledger.entries)}',
-                    resident_bytes_per_rank=sum(a.size*a.dtype.itemsize//io.mesh.size for a in keep+parts),
-                    workspace_bytes_per_rank=0,concurrent_with=ambient)
-            out[field]=join(*parts) if len(parts)>1 else parts[0]
+            size=sum(a.size*a.dtype.itemsize//io.mesh.size for a in keep)
+            row=ledger.reserve(f'sector.read.retained.{len(ledger.entries)}',
+                resident_bytes_per_rank=size,workspace_bytes_per_rank=0,concurrent_with=ambient)
+            ledger.live_stages=(*ambient,row['stage'])
+            value=read_shared_pole_bank(io,meta=meta,header=header,q_ids=ids,
+                sample_span=sample_span if sample else None,fields=(field,),
+                partition_spec=None if execution == "face" else spec,
+                sector=tuple('T' if family else 'C' for family in endpoints))[field]
+            # Reserve the selected output alongside the bounded input.
+            output=value.shape[0]*(1 if not sample else value.shape[1])*len(indices[0])*len(indices[1])*value.dtype.itemsize//io.mesh.size
+            workspace=value.shape[0]*(1 if not sample else value.shape[1])*len(indices[0])*value.shape[-1]*value.dtype.itemsize//io.mesh.size
+            ledger.reserve(f'sector.read.select.{len(ledger.entries)}',
+                resident_bytes_per_rank=value.size*value.dtype.itemsize//io.mesh.size+output,
+                workspace_bytes_per_rank=workspace,concurrent_with=ledger.live_stages)
+            out[field]=select(value)
+            del value
             keep=list(retained)+list(out.values())
     finally:
         ledger.live_stages=ambient

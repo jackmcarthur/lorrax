@@ -508,6 +508,7 @@ def run_current_partner_checks(mesh):
 
 def run_store_checks(mesh,root):
     import importlib.util
+    from unittest.mock import patch
     import jax
     import jax.numpy as jnp
     import numpy as np
@@ -559,9 +560,17 @@ def run_store_checks(mesh,root):
         M0=moment,M1=moment,M2=moment,M3=moment,constant=moment,
         meta=meta,expected_identity=identity,mesh_xy=mesh)
     for endpoints in ((0,0),(1,1),(0,1),(1,0)):
-        with SlabIO(path,mode='r',mesh=mesh) as io:
-            got=read_sector_round(io,meta,bank,header,[0,1,2,2],endpoints,
-                sample_span=(0,2),fields=('Wc','dWc_ds','Wc_mirror','dWc_mirror_ds'))
+        native_reads=[]
+        original_read=SlabIO.read_slabs
+        def count_read(io,*args,**kwargs):
+            native_reads.append(tuple(kwargs['shape']))
+            return original_read(io,*args,**kwargs)
+        with patch.object(SlabIO,'read_slabs',count_read):
+            with SlabIO(path,mode='r',mesh=mesh) as io:
+                got=read_sector_round(io,meta,bank,header,[0,1,2,2],endpoints,
+                    sample_span=(0,2),fields=('Wc','dWc_ds','Wc_mirror','dWc_mirror_ds'))
+        assert len(native_reads)==4*layout.mesh_side,native_reads
+        assert all(shape[1]==2 for shape in native_reads),native_reads
         endpoint_indices=[];endpoint_valid=[]
         for family in endpoints:
             basis=bank['mu_bases'][family]
@@ -578,7 +587,8 @@ def run_store_checks(mesh,root):
         assert (bool(jnp.all(got['Wc']==expected)) and bool(jnp.all(got['dWc_ds']==2*expected))
                 and bool(jnp.all(got['Wc_mirror']==3*expected))
                 and bool(jnp.all(got['dWc_mirror_ds']==4*expected)))
-        rows.append(dict(name=f'photon_sector_read_{endpoints[0]}_{endpoints[1]}',bitwise=True))
+        rows.append(dict(name=f'photon_sector_read_{endpoints[0]}_{endpoints[1]}',
+                         bitwise=True,native_reads=len(native_reads),sample_span=2))
     headers={}
     for sector in ('CC','TT','CT_C','CT_T'):
         components=3 if sector in ('TT','CT_T') else 1
