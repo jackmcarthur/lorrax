@@ -1928,6 +1928,7 @@ _DEFAULTS = {
     # Debug
     "sigma_freq_debug_output": False,
     "sigma_freq_debug_file": "sigma_freq_debug.dat",
+    "sigma_lorentz_debug_output": False,
     # QP wavefunction file dump.  Default True: end-of-run write of
     # ``WFN_qp.h5`` (BGW format, ψ rotated by the final U, energies
     # replaced by E_QP).  Fires for both one-shot and SC; set False to
@@ -2853,6 +2854,7 @@ def _input_storage(
     debug = DebugConfig(
         sigma_freq_debug_output=bool(params["sigma_freq_debug_output"]),
         sigma_freq_debug_file=str(params["sigma_freq_debug_file"]),
+        sigma_lorentz_debug_output=bool(params["sigma_lorentz_debug_output"]),
         write_wfn_h5=bool(params["write_wfn_h5"]),
         write_w=bool(params["write_w"]),
     )
@@ -4386,6 +4388,7 @@ class DebugConfig:
     """Debug-only flags + auxiliary output filenames."""
     sigma_freq_debug_output: bool
     sigma_freq_debug_file: str
+    sigma_lorentz_debug_output: bool
     write_wfn_h5: bool
     #: Dump the WHOLE shared-pole Wc frequency sample bank (every fixed
     #: sample, plus ``dWc_ds``/M1/M3) to ``<map>_w.h5``.  Debugging only.

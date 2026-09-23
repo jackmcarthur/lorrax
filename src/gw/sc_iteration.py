@@ -4551,6 +4551,8 @@ def _dump_sc_rotation(
 def _dump_sc_sigma_lorentz(inputs: SCInputs, state_out: SCState,
                            *, call_index: int, role: str) -> None:
     """Persist the small sector matrices with their defining QP rotation."""
+    if not inputs.config.debug.sigma_lorentz_debug_output:
+        return
     result = state_out.outputs.sigma_result
     if result.sigma_lorentz_skij_ry is None:
         return

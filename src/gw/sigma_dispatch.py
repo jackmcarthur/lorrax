@@ -1251,29 +1251,38 @@ def _compute_mpa_sigma(
             fixed_quadrature_session.setdefault(sigma_w_model, {})),
         material_class=material_class,
         print_fn=print_fn)
+    lorentz_output = bool(config.debug.sigma_lorentz_debug_output)
+    if not lorentz_output:
+        sigma_lorentz = None
     if sector_handle.get("representation") == "sector-ordered-ph":
         from .mpa.sector_sigma import compute_sector_sigma
-        from .qsgw_utils import build_qsgw_sigma_xc
-        e_qp_rel_ev = (np.asarray(e_qp_ev, dtype=np.float64)
-                       - sigma_efermi_ry * RYD_TO_EV)
-        core_mask = _qsgw_one_sided_core_mask(config, band_slices, meta)
-        edge_kwargs = ({"one_sided_core_mask": core_mask}
-                       if core_mask is not None else {})
-        zero_x = jnp.zeros_like(sig_x)
+        on_shell = None
+        if lorentz_output:
+            from .qsgw_utils import build_qsgw_sigma_xc
+            e_qp_rel_ev = (np.asarray(e_qp_ev, dtype=np.float64)
+                           - sigma_efermi_ry * RYD_TO_EV)
+            core_mask = _qsgw_one_sided_core_mask(config, band_slices, meta)
+            edge_kwargs = ({"one_sided_core_mask": core_mask}
+                           if core_mask is not None else {})
+            zero_x = jnp.zeros_like(sig_x)
 
-        def on_shell(value):
-            shell, _ = build_qsgw_sigma_xc(
-                value.sigma_c_kij, zero_x, config.omega_grid_ev,
-                e_qp_rel_ev, mesh_xy, band_axis=value.band_axis,
-                **edge_kwargs)
-            return shell
+            def on_shell(value):
+                shell, _ = build_qsgw_sigma_xc(
+                    value.sigma_c_kij, zero_x, config.omega_grid_ev,
+                    e_qp_rel_ev, mesh_xy, band_axis=value.band_axis,
+                    **edge_kwargs)
+                return shell
 
-        body, (ct_shell, tt_shell) = compute_sector_sigma(
+        sector_result = compute_sector_sigma(
             sector_handle, (wfns, wfns_transverse), mu_bases, meta, mesh_xy,
             on_shell=on_shell, **body_options)
-        # The finalizer assigns CC as the exact residual of the total QSGW
-        # matrix after these separately evaluated mixed and transverse parts.
-        sigma_lorentz = sigma_lorentz.at[1].add(ct_shell).at[2].add(tt_shell)
+        if lorentz_output:
+            body, (ct_shell, tt_shell) = sector_result
+            # The finalizer assigns CC as the exact residual of the total
+            # QSGW matrix after the mixed and transverse parts.
+            sigma_lorentz = sigma_lorentz.at[1].add(ct_shell).at[2].add(tt_shell)
+        else:
+            body = sector_result
     else:
         body = compute_sigma_c_mpa_omega_grid(
             wfns, fit_path, meta, mesh_xy, sigma_w_model=sigma_w_model,

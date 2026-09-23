@@ -172,6 +172,7 @@ and refused by name; see the
 | `sigma_at_dft_energies` | false | **LEGACY spelling of the self-energy axis** -- alias for `qp_solver = one_shot_dft` (now the default). Honored with a deprecation note. |
 | `sigma_freq_debug_output` | false | Dump the per-branch Sigma(omega) debug table. |
 | `sigma_freq_debug_file` | `"sigma_freq_debug.dat"` | Path of the Sigma(omega) debug dump. |
+| `sigma_lorentz_debug_output` | false | Write each four-current SC map's on-shell `(CC, CT+TC, TT)` matrices to `sigma_lorentz_iterNNNN.h5`. For `full_shared_pole`, this also evaluates the mixed and transverse sectors on shell during their existing Sigma sweeps. |
 
 ## Output options / IO / restart
 
