@@ -3559,6 +3559,16 @@ def uses_coupled_photon_head(config) -> bool:
             and config.head.correction is HeadCorrection.FULL)
 
 
+def uses_bare_tt_gamma_head(config) -> bool:
+    """Bare-X four-current runs use the existing TT Coulomb cell average."""
+    return (bool(config.bispinor)
+            and coerce_bispinor_gw_mode(config.bispinor_gw)
+            is BispinorGWMode.BARE_TRANSVERSE
+            and config.compute_mode is ComputeMode.X_ONLY
+            and config.head.correction is HeadCorrection.FULL
+            and int(config.sys_dim) in (2, 3))
+
+
 def incumbent_bispinor_head_record(config) -> tuple[str, str]:
     """``(banner, run_record_line)`` for a bispinor deck on the INCUMBENT route; see docs/architecture/decisions.md."""
     if config.head.correction is HeadCorrection.OFF:
@@ -3639,6 +3649,12 @@ def refuse_unsupported_bispinor_gw(config) -> None:
     """Validate four-current modes and require live direct fields for QSGW; see docs/architecture/decisions.md."""
     mode = coerce_bispinor_gw_mode(
         getattr(config, "bispinor_gw", BispinorGWMode.BARE_TRANSVERSE))
+    if uses_bare_tt_gamma_head(config) and bool(config.restart):
+        raise ValueError(
+            "GATE bare_tt_gamma_restart_unstamped: x_only bispinor exchange "
+            "needs a fresh V_q_bispinor with its TT Gamma-cell average. "
+            "The existing restart V artifact does not stamp that choice; "
+            "set restart = false to rebuild it.")
     shared_pole_direct = (
         config.compute_mode is ComputeMode.MPA
         and config.sigma.w_model == "shared_pole"
@@ -4409,11 +4425,14 @@ def validate_material_inputs(config, material_class):
                 "splits bands by a 0/1 step at a derived Fermi level "
                 "(gw.ppm_sigma.assert_gapped_occupations_for_ppm)\n"
                 "  doc:  docs/input_reference.md, compute_mode")
-        if config.compute_mode is not ComputeMode.MPA:
+        # Bare exchange consumes the same fractional occupation state as MPA
+        # in both charge and transverse Green contractions, but builds no W.
+        if config.compute_mode not in (ComputeMode.MPA, ComputeMode.X_ONLY):
             raise ValueError(
                 "GATE fractional_occupations_require_mpa: WFN occupations "
                 f"identify a metal, but compute_mode={config.compute_mode.value}; "
-                "use compute_mode=mpa, the occupation-aware path.")
+                "use compute_mode=mpa for screened GW, or x_only for bare "
+                "fractional-occupation exchange.")
         if config.sc.head_update in METAL_HEAD_UPDATES:
             raise ValueError(
                 "GATE metal_sc_head_update_disabled: WFN occupations identify "

@@ -321,7 +321,7 @@ def test_gn_ppm_refuses_a_metal_by_name_citing_the_owner_ruling(tmp_path):
     validate_material_inputs(insulator, "insulator")
 
 
-@pytest.mark.parametrize("mode", ("x_only", "cohsex", "hl_ppm"))
+@pytest.mark.parametrize("mode", ("cohsex", "hl_ppm"))
 def test_a_metal_deck_refuses_every_mode_without_an_occupation_aware_head(
         tmp_path, mode):
     with pytest.raises(ValueError) as excinfo:
@@ -335,6 +335,12 @@ def test_a_metal_deck_refuses_every_mode_without_an_occupation_aware_head(
     assert "GATE fractional_occupations_require_mpa" in message
     assert f"compute_mode={mode}" in message
     assert "compute_mode=mpa" in message
+
+
+def test_a_metal_deck_admits_bare_fractional_exchange(tmp_path):
+    config = _config(
+        tmp_path, _METAL_KEYS.replace("compute_mode = mpa", "compute_mode = x_only"))
+    validate_material_inputs(config, "metal")
 
 
 def test_a_metal_deck_refuses_auto_after_naming_its_resolved_mode(tmp_path):
