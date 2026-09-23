@@ -194,6 +194,7 @@ class BispinorGWMode(str, enum.Enum):
     """How the four-current photon channels enter the GW self-energy; see docs/architecture/decisions.md."""
 
     BARE_TRANSVERSE = "bare_transverse"
+    FULL_SHARED_POLE = "full_shared_pole"
     FULL_STATIC_COHSEX = "full_static_cohsex"
 
 
@@ -3559,14 +3560,35 @@ def uses_coupled_photon_head(config) -> bool:
             and config.head.correction is HeadCorrection.FULL)
 
 
-def uses_direct_bispinor_shared_pole_head(config) -> bool:
-    """First-order direct Γ completion of the ordered four-current bank."""
+def uses_full_bispinor_shared_pole(config) -> bool:
+    """Select the CC/CT/TC/TT frequency-dependent photon sector bank."""
     return (bool(config.bispinor)
             and config.compute_mode is ComputeMode.MPA
             and config.sigma.w_model == "shared_pole"
             and config.screening.diagrams is ScreeningDiagrams.W_RPA
             and coerce_bispinor_gw_mode(config.bispinor_gw)
-                is BispinorGWMode.BARE_TRANSVERSE
+                is BispinorGWMode.FULL_SHARED_POLE)
+
+
+def uses_bare_transverse_shared_pole(config) -> bool:
+    """Select screened four-spinor CC and bare transverse exchange."""
+    return (bool(config.bispinor)
+            and config.compute_mode is ComputeMode.MPA
+            and config.sigma.w_model == "shared_pole"
+            and config.screening.diagrams is ScreeningDiagrams.W_RPA
+            and coerce_bispinor_gw_mode(config.bispinor_gw)
+                is BispinorGWMode.BARE_TRANSVERSE)
+
+
+def uses_bare_tt_gamma_head(config) -> bool:
+    """Insert the bare transverse Gamma average into hybrid TT V tiles."""
+    return (uses_bare_transverse_shared_pole(config)
+            and config.head.correction is not HeadCorrection.OFF)
+
+
+def uses_direct_bispinor_shared_pole_head(config) -> bool:
+    """First-order direct Γ completion of the ordered four-current bank."""
+    return (uses_full_bispinor_shared_pole(config)
             and config.head.correction is HeadCorrection.NO_LOCAL_FIELDS)
 
 
@@ -3590,6 +3612,10 @@ def incumbent_bispinor_head_record(config) -> tuple[str, str]:
                         "in ordered shared-pole sectors; FD metal Drude and "
                         "screened sphere; no wing/body fold; spatial current "
                         "uses the dipole-velocity approximation")
+        if uses_bare_transverse_shared_pole(config):
+            return "", ("direct frequency-dependent scalar CC Gamma head "
+                        "on the four-spinor charge carrier; no wing/body fold; "
+                        "bare transverse Gamma exchange")
         return "", "no-local-fields head outside the direct four-current route"
     # With head_correction = full, the CHARGE head is band-diagonal and
     # there is NO transverse q=Gamma head on this route now that the overlay
@@ -3654,7 +3680,9 @@ def refuse_unsupported_bispinor_gw(config) -> None:
     """Validate four-current modes and require live direct fields for QSGW; see docs/architecture/decisions.md."""
     mode = coerce_bispinor_gw_mode(
         getattr(config, "bispinor_gw", BispinorGWMode.BARE_TRANSVERSE))
-    shared_pole_direct = uses_direct_bispinor_shared_pole_head(config)
+    shared_pole_direct = (uses_direct_bispinor_shared_pole_head(config)
+                          or (uses_bare_transverse_shared_pole(config)
+                              and config.head.correction is HeadCorrection.NO_LOCAL_FIELDS))
     if (bool(config.bispinor)
             and config.head.correction is HeadCorrection.NO_LOCAL_FIELDS
             and not shared_pole_direct):
@@ -3721,6 +3749,19 @@ def refuse_unsupported_bispinor_gw(config) -> None:
                 "  doc:  docs/input_reference.md, "
                 "bispinor_tt_head_correction.")
     if mode is BispinorGWMode.BARE_TRANSVERSE:
+        return
+    if mode is BispinorGWMode.FULL_SHARED_POLE:
+        if not uses_full_bispinor_shared_pole(config):
+            raise ValueError(
+                "GATE full_shared_pole_envelope: bispinor_gw=full_shared_pole "
+                "requires bispinor=true, compute_mode=mpa, "
+                "sigma_w_model=shared_pole, and screening_diagrams=w_rpa")
+        if config.head.correction is HeadCorrection.FULL:
+            raise ValueError(
+                "GATE full_shared_pole_head: the ordered four-current sector "
+                "bank has a direct Gamma head under "
+                "head_correction=no_local_fields; full wing/body folding is "
+                "unavailable")
         return
     if not bool(config.bispinor):
         raise ValueError(

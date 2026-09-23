@@ -167,7 +167,10 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
     ISDF basis, but never skips the current response or W construction.
     """
     source_wfn = None
-    photon = int(meta.nspinor) == 4
+    from .gw_config import uses_full_bispinor_shared_pole
+    photon = uses_full_bispinor_shared_pole(config)
+    if photon and int(meta.nspinor) != 4:
+        raise ValueError("GATE shared_pole_sectors: full_shared_pole requires four-spinor metadata")
     photon_layout = None
     if photon:
         from .photon_layout import PhotonBasisLayout

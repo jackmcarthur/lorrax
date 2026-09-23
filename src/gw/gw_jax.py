@@ -99,6 +99,7 @@ from .gw_config import (
 	packed_photon_replaces_charge_sigma, packed_photon_screens_current,
 	refuse_unimplemented_compute_mode, uses_dynamic_packed_photon_route,
 	uses_direct_bispinor_shared_pole_head,
+	uses_full_bispinor_shared_pole, uses_bare_transverse_shared_pole,
 	uses_four_spinor_finite_q_charge, uses_static_photon_response,
 	infer_material_class, resolve_mpa_sampling_alpha,
 	validate_material_inputs)
@@ -319,10 +320,14 @@ def _report_head_and_photon_policy(config, print0, report):
             f"  Bispinor GW policy: bispinor_gw={config.bispinor_gw.value}"
             f"{_bispinor_note}")
         _bare_taken, _bare_reason = packed_bare_transverse_route(config)
-        if direct_photon:
+        if uses_full_bispinor_shared_pole(config):
             report.progress(
-                "Photon route   : ordered shared-pole CC/CT/TC/TT bank "
-                "and common sector Sigma consumer")
+                "Photon route   : FULL shared-pole CC/CT/TC/TT screening "
+                "and sector Sigma; four-current Dyson at each bank frequency")
+        elif uses_bare_transverse_shared_pole(config):
+            report.progress(
+                "Photon route   : four-spinor CC full-frequency shared-pole "
+                "screening plus bare TT exchange; no CT/TT Dyson solve")
         elif config.bispinor_gw.value == "full_static_cohsex":
             report.progress(
                 "Photon route   : packed screened static photon operator "
