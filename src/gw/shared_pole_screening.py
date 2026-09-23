@@ -30,39 +30,51 @@ def _json(value):
     return json.dumps(value, default=encode, sort_keys=True, allow_nan=False)
 
 
-def _authenticated_constructor_resume(root, identity, recipe):
-    """Authenticate a complete scalar producer bank before preserving it.
+def _authenticated_constructor_resume(root, identity, recipe, *, photon=False):
+    """Authenticate a complete producer bank before preserving it.
 
     This is deliberately narrower than restart: it resumes only the missing
-    constructor after both producer receipts and the store validator bind the
-    exact current map identity, resolved recipe, response convention and final
-    commit. Any other partial directory follows the existing remove-and-rebuild
-    path.
+    constructor after the producer receipts and store validator bind the exact
+    current map identity, resolved recipe, response convention and final commit.
+    Photon moments are in the bank receipt; scalar moments have a second receipt.
+    Any other partial directory follows the existing remove-and-rebuild path.
     """
     from file_io.shared_pole_store import validate_shared_pole_bank
 
-    receipt_paths = (root / 'bank_receipt.json', root / 'moments_receipt.json')
+    receipt_paths = ((root / 'bank_receipt.json',) if photon else
+                     (root / 'bank_receipt.json', root / 'moments_receipt.json'))
     bank_path = root / 'bank.h5'
     coulomb_path = root / 'coulomb.h5'
-    if not all(path.is_file() for path in (*receipt_paths, bank_path, coulomb_path)):
-        return False
-    bank_receipt, moments_receipt = (
-        json.loads(path.read_text()) for path in receipt_paths)
-    if (bank_receipt.get('identity') != identity
-            or moments_receipt.get('identity') != identity
-            or bank_receipt.get('completion') is not True
-            or moments_receipt.get('completion') is not True
-            or moments_receipt.get('bank_complete') is not True):
-        return False
-    if bank_receipt.get('coulomb_identity') != moments_receipt.get('coulomb_identity'):
+    required = (*receipt_paths, bank_path) if photon else (*receipt_paths, bank_path, coulomb_path)
+    if not all(path.is_file() for path in required):
         return False
     try:
-        validate_shared_pole_bank(
+        bank_receipt = json.loads(receipt_paths[0].read_text())
+        moments_receipt = None if photon else json.loads(receipt_paths[1].read_text())
+    except (OSError, ValueError):
+        return False
+    if bank_receipt.get('identity') != identity or bank_receipt.get('completion') is not True:
+        return False
+    if photon:
+        reference = bank_receipt.get('static_reference', {})
+        if (bank_receipt.get('stage') != 'photon'
+                or bank_receipt.get('bank_complete') is not True
+                or reference.get('identity') != identity
+                or not isinstance(reference.get('path'), str)
+                or Path(reference['path']).resolve() != bank_path.resolve()):
+            return False
+    elif (moments_receipt.get('identity') != identity
+          or moments_receipt.get('completion') is not True
+          or moments_receipt.get('bank_complete') is not True
+          or bank_receipt.get('coulomb_identity') != moments_receipt.get('coulomb_identity')):
+        return False
+    try:
+        header = validate_shared_pole_bank(
             bank_path, expected_identity=identity, mesh_xy=None,
             require_complete=True, expected_recipe=recipe)
     except (KeyError, OSError, TypeError, ValueError):
         return False
-    return True
+    return ('photon_layout' in header) == photon
 
 
 def shared_pole_identity(wfns, meta, *, label, wfn, binding, centroid_indices):
@@ -244,7 +256,7 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
             if complete:
                 print_fn(f"shared-pole output: complete model retained at {model}; refusing rebuild")
                 raise ValueError(f"GATE shared_pole_output: complete model {model}; use its compatible restart member or a fresh run directory")
-            if not photon and _authenticated_constructor_resume(root, identity, recipe):
+            if _authenticated_constructor_resume(root, identity, recipe, photon=photon):
                 print_fn(f"shared-pole output: authenticated complete bank retained at {root}; resuming constructor")
                 return True
             if root.exists():
@@ -262,8 +274,8 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
     with timing.section("spole.coulomb_staging"):
         if resume_constructor:
             saved_bank_receipt = json.loads((root / 'bank_receipt.json').read_text())
-            coulomb = dict(saved_bank_receipt['coulomb_identity'],
-                           path=str(root / 'coulomb.h5'))
+            coulomb = (None if photon else dict(saved_bank_receipt['coulomb_identity'],
+                           path=str(root / 'coulomb.h5')))
         else:
             coulomb = (None if photon else
                        _coulomb_resource(V_q, meta, sym, mesh_xy, root / "coulomb.h5"))
@@ -282,11 +294,11 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
                 **(dict(photon_layout=photon_layout, mu_bases=mu_bases) if photon else {}))
         receipts = dict(identity=identity)
         if resume_constructor:
-            receipts.update(
-                bank=json.loads((root / 'bank_receipt.json').read_text()),
-                moments=json.loads((root / 'moments_receipt.json').read_text()),
-                constructor_resume=dict(status='AUTHENTICATED_COMPLETE_BANK',
-                                        source=str(root / 'bank.h5')))
+            receipts['bank'] = json.loads((root / 'bank_receipt.json').read_text())
+            if not photon:
+                receipts['moments'] = json.loads((root / 'moments_receipt.json').read_text())
+            receipts['constructor_resume'] = dict(
+                status='AUTHENTICATED_COMPLETE_BANK', source=str(root / 'bank.h5'))
         def record(stage, receipt):
             # EVERY RANK LEAVES THIS CALL THE SAME WAY.  A bare
             # ``process_index() == 0`` write raises on rank 0 alone (quota,
