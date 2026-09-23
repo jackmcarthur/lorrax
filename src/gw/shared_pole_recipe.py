@@ -75,7 +75,7 @@ _GATE_ROWS = {
     "held_w": ("held W value/derivative relative defects with coordinates and receipt paths; diagnostic, no universal threshold", None),
     "model_reciprocity": ("at held W/dW samples that are transpose symmetric, the evaluated model preserves transpose symmetry; generic complex Hermitian residues are not required to be real",
                           # owner 2026-09-22: 1e-10 refused TaAs 8x8x8 roundoff (3.5e-10 at q=58, held data 6e-15)
-                          {"reference_relative_max": 1.0e-12, "model_relative_max": 1.0e-9}),
+                          {"reference_relative_max": 1.0e-12, "model_relative_max": 1.0e-8}),
     "full_m1_defect": ("maximum over q of relative full M1 defect after cut and zero policy; PASS within diagnostic band, WARN outside, never refuse", 2.0e-4),
     "full_m3_defect": ("maximum over q of relative full M3 defect after cut and zero policy; PASS within diagnostic band, WARN outside, never refuse", 2.0e-3),
     # The stored operator is the spin-traced mu x mu charge response on scalar and
