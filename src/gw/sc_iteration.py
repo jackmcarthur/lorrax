@@ -3715,6 +3715,12 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             support_partition.protected_mask | support_partition.in_range_mask,
             dtype=bool), energies_loop.shape)
         energy_relative_ev = energies_loop - _mu_ev
+        # Owner rule 2026-09-22: states outside the requested window (plus the
+        # SC pad) use Sigma(omega=0); only states inside it may grow the grid.
+        win_lo, win_hi = sc_padded_window_ev(
+            float(inputs.config.sigma.omega_min_ev),
+            float(inputs.config.sigma.omega_max_ev))
+        required_kn = required_kn & (energy_relative_ev >= win_lo) & (energy_relative_ev <= win_hi)
         expanded_grid = extend_sc_omega_grid_ev(
             sampled_grid, energy_relative_ev, required_kn,
             float(inputs.config.sigma.omega_step_ev))
