@@ -62,14 +62,22 @@ def parent_rounds(nq, ranks, partner=None):
 
 @lru_cache(maxsize=None)
 def batch_to_face(mesh_xy):
-    """[B, m, r] at P(('x','y'), None, None) -> the face P(None, 'x', 'y'): y then x all_to_all."""
+    """[B, m, r] at P(('x','y'), None, None) -> the face P(None, 'x', 'y'): y then x all_to_all.
+
+    The reduced factor width need not be divisible by Py. Zero-pad its
+    carrier before splitting; callers keep only their admitted active width.
+    """
     import jax
+    import jax.numpy as jnp
     from jax.sharding import PartitionSpec as P
     from common.shard_map import shard_map
     px, py = int(mesh_xy.shape['x']), int(mesh_xy.shape['y'])
 
     def restore(a):
         if py > 1:
+            pad = (-a.shape[2]) % py
+            if pad:
+                a = jnp.pad(a, ((0, 0), (0, 0), (0, pad)))
             a = jax.lax.all_to_all(a, 'y', split_axis=2, concat_axis=0, tiled=True)
         if px > 1:
             a = jax.lax.all_to_all(a, 'x', split_axis=1, concat_axis=0, tiled=True)
