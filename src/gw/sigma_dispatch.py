@@ -1086,6 +1086,8 @@ def _static_sigma_channels(
     else:
         _bispinor_sigma = (
             wfns_transverse is not None and bispinor_v_q_path is not None)
+        retain_lorentz = _bispinor_sigma and (
+            mode is not ComputeMode.MPA or config.debug.sigma_lorentz_debug_output)
         # Charge pending input work to its boundary, not to exchange.
         with timing.section("sigma.input_wait"):
             jax.block_until_ready((wfns, wfns_transverse, V_q, Gij))
@@ -1097,10 +1099,10 @@ def _static_sigma_channels(
                 wfns_transverse=wfns_transverse,
                 bispinor_v_q_path=bispinor_v_q_path, mu_bases=mu_bases,
                 occupation_state=occupation_state,
-                return_transverse=_bispinor_sigma,
+                return_transverse=retain_lorentz,
             )
             sec.watch(sigma_x_result)
-        if _bispinor_sigma:
+        if retain_lorentz:
             sig_x, sig_x_b = sigma_x_result
             sigma_lorentz = jnp.stack((
                 sig_x - sig_x_b,
