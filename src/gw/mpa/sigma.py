@@ -8,6 +8,7 @@ import os
 import sys
 import time
 from dataclasses import replace
+from functools import lru_cache
 
 import jax
 import jax.numpy as jnp
@@ -1389,6 +1390,78 @@ def _attach_ordered_odd_sigma(total, even):
         sigma_c_odd_kij=total.sigma_c_kij - even.sigma_c_kij)
 
 
+@lru_cache(maxsize=8)
+def _logical_mu_fn(sharding, n_mu):
+    """Zero both trailing (mu, nu) axes past the logical extent, in place of layout."""
+    def keep(x):
+        live = jnp.arange(x.shape[-1]) < n_mu
+        return jnp.where(live[:, None] & live[None, :], x, jnp.zeros((), x.dtype))
+    return jax.jit(keep, out_shardings=sharding)
+
+
+class MemoryPoleSource:
+    """Fitted poles handed to the Sigma executor in memory: PoleReader's batch interface, no store.
+
+    Fields are ``(n_p, n_q, n_mu_pad, n_mu_pad)`` in Ry on ``P(None, None,
+    'x', 'y')``, with the full-BZ q axis.  Entries past ``n_mu_logical`` are
+    zeroed once here; that is what the store round trip gave, since the
+    store keeps only the logical extent and its reads zero-fill the padding.
+    Batches are device slices of the resident fields.  Nothing is gathered,
+    copied to host, or written.
+    """
+
+    def __init__(self, Omega_p, B_p, B_odd_p=None, *, n_mu_logical, mesh_xy,
+                 provenance):
+        from runtime.padding import padded_mu_extent
+        shape = tuple(int(n) for n in Omega_p.shape)
+        n_mu = int(n_mu_logical)
+        if len(shape) != 4 or tuple(B_p.shape) != shape or (
+                B_odd_p is not None and tuple(B_odd_p.shape) != shape):
+            raise ValueError(
+                "MemoryPoleSource: Omega/B/B_odd must share one "
+                f"(n_p, n_q, mu, nu) shape; got {shape}, {tuple(B_p.shape)}, "
+                f"{None if B_odd_p is None else tuple(B_odd_p.shape)}")
+        n_pad = int(padded_mu_extent(n_mu, mesh_xy))
+        if shape[2:] != (n_pad, n_pad):
+            raise ValueError(
+                f"MemoryPoleSource: mu extent {shape[2:]} is not the store's "
+                f"read extent ({n_pad}, {n_pad}) for n_mu = {n_mu}")
+        keep = _logical_mu_fn(
+            NamedSharding(mesh_xy, P(None, None, "x", "y")), n_mu)
+        self.Omega, self.B = keep(Omega_p), keep(B_p)
+        self.B_odd = None if B_odd_p is None else keep(B_odd_p)
+        from file_io.mpa_store import refuse_bad_pole_fields
+        refuse_bad_pole_fields(
+            self.Omega, self.B, self.B_odd, where="MemoryPoleSource")
+        self.n_poles = shape[0]
+        self.ledger = {
+            "n_p": shape[0], "n_q": shape[1], "n_mu": n_mu,
+            "ordered_residues": B_odd_p is not None,
+            "q_storage": "full", "energy_unit": "Ry",
+            "provenance": dict(provenance),
+        }
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        return False
+
+    def read(self, pole_slice=None, *, unfold=False, return_sharded=False,
+             to_unit=None, include_odd=False):
+        from file_io.mpa_store import _pole_range
+        if not return_sharded or to_unit not in (None, "Ry"):
+            raise ValueError(
+                "MemoryPoleSource serves sharded Ry batches only; got "
+                f"return_sharded={return_sharded}, to_unit={to_unit!r}")
+        lo, hi = _pole_range(self.ledger, pole_slice, "MemoryPoleSource.read")
+        take = ((lambda x: x) if (lo, hi) == (0, self.n_poles)
+                else (lambda x: x[lo:hi]))
+        B_odd = (take(self.B_odd)
+                 if include_odd and self.B_odd is not None else None)
+        return take(self.Omega), take(self.B), B_odd
+
+
 def integrate_sigma_store(
     wfns,
     fit_src,
@@ -1438,7 +1511,7 @@ def integrate_sigma_store(
             band_counts=band_counts, odd_residue_off=odd_residue_off,
             print_fn=print_fn)
 
-    if isinstance(fit_src, PoleReader):
+    if isinstance(fit_src, (PoleReader, MemoryPoleSource)):
         return run(fit_src)
     with open_pole_reader(fit_src, mesh_xy=mesh_xy) as reader:
         return run(reader)
@@ -1580,6 +1653,19 @@ def compute_sigma_c_mpa_omega_grid(
             schedule = (_shared_pole_memory_schedule(meta, ledger, mesh_xy=mesh_xy, layout=wfns.layout)
                         if sector_context is None else sector_context["schedule"](ledger))
         print_fn(f"  shared-pole Sigma capacity: {schedule}")
+    elif isinstance(fit_src, MemoryPoleSource):
+        # In-memory GN/HL poles: no store, so no file identity to check.
+        ledger = fit_src.ledger
+        got = ledger["provenance"].get("screening_diagrams")
+        want = (None if expected_screening_diagrams is None else str(getattr(
+            expected_screening_diagrams, "value", expected_screening_diagrams)))
+        if fit_identity is not None or (want is not None and got != want):
+            raise ValueError(
+                "GATE memory_pole_source_identity: in-memory poles carry "
+                f"screening_diagrams={got!r} (want {want!r}) and no file "
+                f"identity (fit_identity={fit_identity!r} requested)")
+        n_poles = int(ledger["n_p"])
+        ordered_residues = bool(ledger["ordered_residues"])
     else:
         ledger = validate_fit_store(
             fit_src, expected_identity=fit_identity,
@@ -1607,6 +1693,7 @@ def compute_sigma_c_mpa_omega_grid(
     # release path: a refusal from the planner or the executor must still
     # close the handle on every rank.
     with (SlabIO(fit_src, mode="r", mesh=mesh_xy) if shared_pole else
+          fit_src if isinstance(fit_src, MemoryPoleSource) else
           open_pole_reader(fit_src, mesh_xy=mesh_xy)) as reader:
         # One bounded extrema census serves both routes.  In particular, the
         # production route does not read residues into a host histogram and

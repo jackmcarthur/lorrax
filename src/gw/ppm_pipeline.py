@@ -16,7 +16,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from functools import lru_cache
-import os
 
 import jax
 import jax.numpy as jnp
@@ -25,7 +24,6 @@ import numpy as np
 
 from common.units import RYD_TO_EV
 from common.wfn_transforms import get_enk_bandrange
-from common.collectives import barrier, process_rank
 import common.timing as timing
 
 from .band_extrapolation import (
@@ -656,11 +654,6 @@ def compute_ppm_sigma_pipeline(
         from .sigma_box_plan import resolve_sigma_box_cache_dir
         quadrature_cache_dir = resolve_sigma_box_cache_dir(
             config.sigma.quadrature_cache_dir, config.input_dir)
-        fit_dir = os.path.join(config.input_dir, "tmp", "mpa")
-        if process_rank() == 0:
-            os.makedirs(fit_dir, exist_ok=True)
-        barrier("ppm_mpa_fit_directory_ready")
-        fit_store_path = os.path.join(fit_dir, "mpa_fit_oneshot.h5")
         with timing.section("sigma.exec"):
             sigma_omega = compute_sigma_c_ppm_omega_grid(
                 wfns, ppm, meta, mesh_xy,
@@ -669,7 +662,6 @@ def compute_ppm_sigma_pipeline(
                 mpa_cfg=config.mpa,
                 omega_grid_ry=config.omega_grid_ry,
                 ansatz=config.compute_mode,
-                fit_store_path=fit_store_path,
                 screening_diagrams=config.screening.diagrams,
                 quadrature_cache_dir=quadrature_cache_dir,
                 occupation_state=occupation_state,
@@ -684,8 +676,6 @@ def compute_ppm_sigma_pipeline(
             # Sigma is linear in the fitted residue.  Reusing the identical
             # one-pole MPA route with D=0 gives the exact per-state odd
             # contribution by subtraction, preserving main's observable.
-            even_store_path = os.path.join(
-                fit_dir, "mpa_fit_oneshot_even.h5")
             with timing.section("sigma.exec.odd_reference"):
                 sigma_omega_even = compute_sigma_c_ppm_omega_grid(
                     wfns, replace(ppm, B_odd_q=None), meta, mesh_xy,
@@ -694,7 +684,6 @@ def compute_ppm_sigma_pipeline(
                     mpa_cfg=config.mpa,
                     omega_grid_ry=config.omega_grid_ry,
                     ansatz=config.compute_mode,
-                    fit_store_path=even_store_path,
                     screening_diagrams=config.screening.diagrams,
                     quadrature_cache_dir=quadrature_cache_dir,
                     occupation_state=occupation_state,

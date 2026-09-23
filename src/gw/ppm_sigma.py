@@ -849,7 +849,6 @@ def compute_sigma_c_ppm_omega_grid(
     mpa_cfg,
     omega_grid_ry: np.ndarray,
     ansatz: str,
-    fit_store_path: str,
     screening_diagrams,
     quadrature_cache_dir: str | None = None,
     occupation_state=None,
@@ -860,8 +859,8 @@ def compute_sigma_c_ppm_omega_grid(
     """Compute GN/HL-PPM Sigma_c through the shared MPA dynamic route.
 
     The PPM fit remains the two-point algebra in :func:`fit_ppm`.  This stage
-    applies the established invalid-pole policy, writes that result as a
-    finalized one-pole MPA store, and then delegates window construction,
+    applies the established invalid-pole policy, hands that result to the
+    executor in memory as a one-pole source, and then delegates window construction,
     denominator-box rules, cache lookup, pole batching, the tau executor and
     omega accumulation to :func:`gw.mpa.sigma.compute_sigma_c_mpa_omega_grid`.
 
@@ -870,7 +869,7 @@ def compute_sigma_c_ppm_omega_grid(
     counts.  The optional static-COHSEX invalid-pole term remains separate
     from the dynamic store and is added exactly once to each cumulative count.
     """
-    from .mpa.sigma import compute_sigma_c_mpa_omega_grid
+    from .mpa.sigma import MemoryPoleSource, compute_sigma_c_mpa_omega_grid
 
     s = wfns.slices
     plan = _resolve_ppm_band_plan(
@@ -954,34 +953,25 @@ def compute_sigma_c_ppm_omega_grid(
                         meta.mu_basis.unpack_operator(B_p))
         if B_odd_p is not None:
             B_odd_p = meta.mu_basis.unpack_operator(B_odd_p)
-    from file_io.mpa_store import write_complete_pole_store_collective
-
     diagram_value = str(getattr(
         screening_diagrams, "value", screening_diagrams))
-    write_complete_pole_store_collective(
-        fit_store_path, Omega_p, B_p,
-        B_odd_p=B_odd_p,
-        mesh_xy=mesh_xy,
-        n_mu_logical=int(meta.n_rmu),
-        energy_unit="Ry",
+    # In memory, no store (owner 2026-09-23): the executor reads the same
+    # sharded fields a store round trip would have returned.
+    poles = MemoryPoleSource(
+        Omega_p, B_p, B_odd_p,
+        n_mu_logical=int(meta.n_rmu), mesh_xy=mesh_xy,
         provenance={
             "fit_protocol": "two_point_ppm",
             "pole_model": ansatz_name,
             "ppm_invalid_mode": invalid_mode,
             "screening_diagrams": diagram_value,
-            "certification_basis": "algebraic_no_linear_solve",
             "probe_frequency_ry": float(ppm.omega_p),
             "unfulfilled_fraction": float(ppm.unfulfilled_fraction),
-        },
-        certification={
-            "condition_max_allowed": 1.0,
-            "backward_error_max_allowed": 1.0,
-        },
-        occupation_state=occupation_state,
-    )
+        })
+    del Omega_p, B_p, B_odd_p
     print_fn(
-        f"  {ansatz_name} fit -> MPA store: one pole per ISDF pair at "
-        f"{fit_store_path}; invalid policy={invalid_mode}")
+        f"  {ansatz_name} fit -> in-memory one-pole source (no store); "
+        f"invalid policy={invalid_mode}")
 
     branches = branches_for_omega_grid(
         omega_req,
@@ -990,7 +980,7 @@ def compute_sigma_c_ppm_omega_grid(
         cond_mask=state.cond_mask,
         val_mask=state.val_mask)
     result = compute_sigma_c_mpa_omega_grid(
-        wfns, fit_store_path, meta, mesh_xy,
+        wfns, poles, meta, mesh_xy,
         omega_grid_ry=omega_req,
         efermi_ry=float(jax.device_get(state.efermi)),
         regularization_width_ry=regularization_width_ry,
