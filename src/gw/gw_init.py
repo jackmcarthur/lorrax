@@ -1679,7 +1679,10 @@ def _plan_gflat_chunks_for_channel(
 			       f"operator asserted; the plan is still priced "
 			       f"over budget.")
 		else:
-			raise ValueError(_msg)
+			# The plan itself goes into the refusal: rank 0's print above
+			# is lost when a peer's FAIL-FAST kills the step first
+			# (CrI3 16x16 P36, pool 58781114 steps .15/.17/.20).
+			raise ValueError(_msg + "\n" + gflat_plan.format())
 	chunks = {
 		'band_chunk': int(gflat_plan.band_chunk),
 		'centroid_k_chunk': int(gflat_plan.centroid_k_chunk),

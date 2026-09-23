@@ -907,9 +907,20 @@ def plan_gflat_chunks(
                 slots=face_slots, p_x=px, p_y=py, p_xy=pp,
                 band_chunk=floor_bc,
                 n_band_chunks=math.ceil(fit_nb / floor_bc))
-            fft_floor = (_c128(
-                nk, floor_bc, ns, n_rtot, shard=pp)
-                * _FFT_CUFFT_FACTOR)
+            if pp == p_xy:
+                # At this mesh the production FFT box is MEASURED (compiled
+                # buffer peak + cuFFT plan), the same number Phase 2 prices
+                # the chosen chunk with.  The analytic 4x factor alone put
+                # the floor above a plan that fits: CrI3 16x16, 481 bands,
+                # 3998 centroids at P36 refused with P_min = 45 while its own
+                # HWM was 46.86 of 70.41 GB/dev (pool 58781114 step .23).
+                fft_floor = _fft_box_bytes(
+                    nk=nk, bc=floor_bc, ns=ns, fft_grid=fft_grid,
+                    mesh_xy=mesh_xy, p_xy=p_xy)
+            else:
+                fft_floor = (_c128(
+                    nk, floor_bc, ns, n_rtot, shard=pp)
+                    * _FFT_CUFFT_FACTOR)
             pair_floor = (
                 face_floor["constant"]
                 + face_floor["repeated_pair_slope"] * py
