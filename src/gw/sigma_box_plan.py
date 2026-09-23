@@ -56,6 +56,9 @@ _BOX_SIGN_FRACTION = 0.7
 #: instead of re-fitting windows as states move. Recompute is reserved for a
 #: metal<->insulator flip or a genuine rule-validity failure.
 _SC_WINDOW_PAD_EV = 2.0
+#: Pad toward zero for a sign-definite SC window: 0.5 of its distance escaped by 1.6% on TaAs 8^3
+#: map 1 (semimetal valence state approaching E_F; owner 2026-09-22 asked to get the run through).
+_SC_ZERO_SIDE_CAP = 0.25
 _RULE_CACHE_SCHEMA = "sigma-box-ry-v4"
 
 
@@ -768,10 +771,10 @@ def _sc_padded_box_spec(spec, eta):
         support_frequencies, spec["states"], spec["pole_stats"],
         spec["pole_sign"], eta)
     if spec["kind"] == "sign_definite_negative" and support_box[1] < 0.0:
-        box[1] = min(box[1], 0.5 * spec["box"][1])
+        box[1] = min(box[1], _SC_ZERO_SIDE_CAP * spec["box"][1])
         box[1] = max(box[1], support_box[1])
     if spec["kind"] == "sign_definite_positive" and support_box[0] > 0.0:
-        box[0] = max(box[0], 0.5 * spec["box"][0])
+        box[0] = max(box[0], _SC_ZERO_SIDE_CAP * spec["box"][0])
         box[0] = min(box[0], support_box[0])
     # Membership can change without appreciable state motion: a state just
     # outside a tail at map 0 can enter it at map 1. Cover the selector's
