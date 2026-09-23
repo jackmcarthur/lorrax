@@ -60,7 +60,7 @@ class CapacityTests(unittest.TestCase):
         cross = shared_pole_byte_terms(**args, pencil_side=k,
             phase='cross_reduction', cross_original_sides=(c, t))
         self.assertEqual(cross['terms_bytes_per_rank']['phase_dense_temporaries'],
-                         16 * (14 * (c*t + k*k) + 12 * 2624 * (c+t)))
+                         16 * (10 * c*t + 14 * k*k + 12 * 2624 * (c+t)))
         self.assertEqual(cross['terms_bytes_per_rank']['narrow_actions'],
                          16 * 3 * 2624 * (c+t))
         legacy = shared_pole_byte_terms(**args, pencil_side=c+t, phase='reduction')
