@@ -123,3 +123,28 @@ def test_apply_once_and_preserve_record_of_automatic_selection(monkeypatch):
     assert first == second == net.network_configuration()
     assert len(messages) == 1
     assert net.os.environ['NCCL_NET'] == 'AWS Libfabric'
+
+
+def test_ofi_selection_disables_cxi_eager_messages():
+    # Without it every P16 no_vni sc.eigh leg deadlocked in cross-node NCCL
+    # send/recv (runs/runtime/nccl_ofi_hang_20260923); an override still wins.
+    applied = net.plan_network_environment(environment(), is_file=lambda _: True)['applied']
+    assert applied['FI_CXI_RDZV_THRESHOLD'] == '0'
+    kept = net.plan_network_environment(environment(FI_CXI_RDZV_THRESHOLD='16384'),
+                                        is_file=lambda _: True)['applied']
+    assert 'FI_CXI_RDZV_THRESHOLD' not in kept
+
+
+_SITE_MODULE = '/opt/nersc/pe/modulefiles/nccl/2.29.2-cu13.lua'
+
+
+@pytest.mark.skipif(not __import__('os').path.isfile(_SITE_MODULE),
+                    reason='the NERSC nccl modulefile exists only on Perlmutter')
+def test_defaults_carry_every_network_setting_of_the_site_module():
+    import re
+    text = open(_SITE_MODULE).read()
+    settings = dict(re.findall(r'setenv\("([A-Z0-9_]+)",\s*"?([^")]*)"?\)', text))
+    network = {k: v for k, v in settings.items()
+               if k.startswith(('FI_', 'NCCL_')) and k not in ('NCCL_DIR', 'NCCL_HOME', 'NCCL_VERSION')}
+    assert network, 'no network settings parsed from the site module'
+    assert {k: net._PERLMUTTER_DEFAULTS.get(k) for k in network} == network
