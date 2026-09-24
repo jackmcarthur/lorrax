@@ -5,11 +5,11 @@ from pathlib import Path
 import pytest
 
 
-def test_default_is_off_and_grammar_is_three_mode(monkeypatch):
+def test_default_is_auto_and_grammar_is_three_mode(monkeypatch):
     from ffi.fft import CONV_KLEAD_GATE, conv_klead_mode
 
     monkeypatch.delenv("LORRAX_CONV_KLEAD_FFI", raising=False)
-    assert conv_klead_mode() == "off"
+    assert conv_klead_mode() == "auto"
     assert CONV_KLEAD_GATE.modes == ("off", "auto", "on")
     assert CONV_KLEAD_GATE.auto_capability
 
@@ -73,3 +73,21 @@ def test_dial_is_in_both_cross_rank_registries():
 
     assert "LORRAX_CONV_KLEAD_FFI" in FFI_DIAL_ENV
     assert "LORRAX_CONV_KLEAD_FFI" in RANK_FINGERPRINT_ENV
+
+
+def test_sigma_tau_kernel_asks_the_family_plan():
+    """The Sigma spatial kernel is the direct member's production caller."""
+    root = Path(__file__).resolve().parents[1]
+    text = (root / "src/gw/ppm_tau_kernel.py").read_text()
+    body = text.split("def get_sigma_spatial_kernel(", 1)[1].split(
+        "\ndef ", 1)[0]
+    assert "conv_klead_plan(mesh_xy, kgrid)" in body
+    assert "make_fused_conv_klead if use_direct_klead" in body
+
+
+def test_off_plan_keeps_gw_conv(monkeypatch):
+    from ffi.fft import conv_klead_plan
+
+    monkeypatch.setenv("LORRAX_CONV_KLEAD_FFI", "off")
+    use, why = conv_klead_plan(None, (12, 12, 1))
+    assert use is False and "off" in why

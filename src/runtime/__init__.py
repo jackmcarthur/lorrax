@@ -2355,8 +2355,8 @@ def _enforce_required_ffi(mesh, *, announce: bool = True) -> None:
     # platform/handler capability at startup while each caller resolves the
     # runtime shape through its plan helper.  `auto` never raises; `on`
     # refuses missing platform/handler capability by name; `off` announces
-    # the explicit opt-out.  The k-leading member defaults off and has no
-    # production consumer until its separately-reviewed Sigma seam lands.
+    # the explicit opt-out.  The k-leading member defaults to auto; its one
+    # consumer is the Sigma tau kernel (gw.ppm_tau_kernel).
     CONV_KMINOR_GATE.enforce(mesh, announce=announce)
     CONV_KLEAD_GATE.enforce(mesh, announce=announce)
     CONV_KPAIR_GATE.enforce(mesh, announce=announce)
@@ -2396,7 +2396,7 @@ def _ffi_dial_facts() -> list:
                         "ladder-W rung; accelerator)"),
                        (CONV_KLEAD_GATE,
                         "the direct fused k-LEADING IFFT(G)-IFFT(W)-FFT "
-                        "conv (Sigma; accelerator, default off)"),
+                        "conv (Sigma tau kernel; accelerator)"),
                        (CONV_KPAIR_GATE,
                         "the fused post-pair convolution used to form the "
                         "ISDF Coulomb operator"),

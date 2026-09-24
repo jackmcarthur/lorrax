@@ -559,15 +559,17 @@ def make_gw_conv_ffi(
 # rows itself and emits U k-leading without an output pack.
 # It transforms W inside the call because Sigma has no solve-wide W_R cache.
 #
-# Default OFF.  This is a callable candidate, but no production Sigma caller
-# exists until its separate seam lands.  `auto` is a safe capability choice;
-# `on` is the certification mode and never demotes.
+# Default AUTO (2026-09-23): the Sigma tau kernel
+# (``gw.ppm_tau_kernel.get_sigma_spatial_kernel``) asks ``conv_klead_plan``
+# for its fused-conv member, so the direct kernel serves every CUDA k-grid it
+# fits and gw_conv serves the rest.  `off` restores gw_conv everywhere; `on`
+# is the certification mode and never demotes.
 CONV_KLEAD_GATE = Gate(
     env="LORRAX_CONV_KLEAD_FFI",
     target=CONV_KLEAD_TARGET,
     platforms=("CUDA",),
     modes=("off", "auto", "on"),
-    default="off",
+    default="auto",
     off_label="the certified plan-based k-leading gw_conv handler",
     off_policy="fallback",
     auto_capability=(
@@ -575,21 +577,21 @@ CONV_KLEAD_GATE = Gate(
         "CufftConvKLeadCudaFfi; the per-call plan then checks runtime axes "
         "and the conservative shared-memory floor"),
     auto_on_msg=(
-        "[conv_klead] auto -> ON: k-leading fused-convolution candidate "
-        "({target}) available; no production Sigma caller yet.  Each direct "
+        "[conv_klead] auto -> ON: k-leading fused convolution "
+        "({target}) available for the Sigma tau kernel.  Each direct "
         "call still resolves its runtime k-grid axes and conservative "
         "row-residency floor."),
     auto_off_msg=(
-        "[conv_klead] auto -> OFF: k-leading fused-convolution candidate "
-        "unavailable; no production Sigma caller yet.  Reason: {reason}"),
+        "[conv_klead] auto -> OFF: k-leading fused convolution "
+        "unavailable; the Sigma tau kernel keeps gw_conv.  Reason: {reason}"),
     off_announce_msg=(
-        "[LORRAX_CONV_KLEAD_FFI] =0: k-leading fused-convolution candidate "
-        "disabled; no production Sigma caller yet."),
+        "[LORRAX_CONV_KLEAD_FFI] =0: k-leading fused convolution "
+        "disabled; the Sigma tau kernel keeps gw_conv."),
     label={"CUDA": "direct k-leading fused conv CUDA"},
     resolved_msg={
         "CUDA": (
-            "[conv_klead] k-leading fused-convolution candidate available; "
-            "no production Sigma caller yet.  Direct CUDA FFI handler "
+            "[conv_klead] k-leading fused convolution available for the "
+            "Sigma tau kernel.  Direct CUDA FFI handler "
             "({target}): one SMEM-resident traversal, "
             "runtime twiddle-ring extents, zero global transposes, "
             "k-leading store, c128 only."),
