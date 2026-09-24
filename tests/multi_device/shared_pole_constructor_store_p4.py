@@ -164,10 +164,12 @@ def run_checks(mesh, directory):
             # already been released.
             workspace = receipt['constructor']['capacity']['native_workspace']
             if execution == 'face':
+                # The model phase prices GEMM at max(n, round pencil side);
+                # a batched face round's side can exceed n.
                 current_gemm = [row['bytes_per_rank'] for row in queries
                     if row['op'] == 'gemm'
-                    and row['shapes'][0][-1] == meta.n_rmu_padded]
-                assert workspace['gemm'] == current_gemm[0]
+                    and row['shapes'][0][-1] >= meta.n_rmu_padded]
+                assert workspace['gemm'] in current_gemm
             else:
                 assert 'gemm' not in workspace
             assert receipt['constructor']['capacity']['price']['phase'] == 'model'
