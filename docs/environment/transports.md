@@ -23,16 +23,9 @@ Native MPI (phdf5, SLATE, ScaLAPACK) — the site MPI, linked directly
 
 ## 1. Why `impl=mpi`
 
-- **gloo's reduce-scatter corrupts silently.** `jax.lax.psum_scatter` over a
-  2-D CPU mesh intermittently returns wrong data with rc=0: about 5 % of
-  executions and 80 % of process lifetimes, always output segment 0, with an
-  error of order the answer, reproducible with no LORRAX imports. The
-  identical program under `impl=mpi` was clean in 504/504 executions while a
-  gloo control in the same allocations corrupted 4/4 lifetimes.
-- **gloo is also slower.** On 1.12 GB all-reduce / 2.24 GB all-gather /
-  1.12 GB reduce-scatter payloads: mpi 0.83 / 1.05 / 0.63 s, gloo 14.99 /
-  31.11 / 11.98 s; end to end, 1.18× at P=16.
-- **gloo in jaxlib 0.9.1 is TCP-only;** `GLOO_SOCKET_IFNAME` is inert.
+gloo's CPU reduce-scatter corrupts silently (rc=0), gloo is slower on every
+collective, and jaxlib 0.9.1's gloo is TCP-only. The measured verdict is owned
+by [MPI collectives § Why not gloo](../dev/mpi_collectives.md#why-not-gloo).
 
 ## 2. What `impl=mpi` requires
 
@@ -44,12 +37,9 @@ Native MPI (phdf5, SLATE, ScaLAPACK) — the site MPI, linked directly
 | `runtime.run_main_and_finalize()` at every driver boundary | interpreter teardown can call MPI after XLA finalized, turning a successful run into rc=1 |
 | a live `MPI_THREAD_MULTIPLE` grant | startup refuses before XLA builds its cliques; the native FFI aborts the MPI world before its first collective |
 
-The thread grant is machine-specific: Frontera's patched MPIwrapper upgrades
-the request; Perlmutter's `config/perlmutter/cpu_mpi_env.sh` sets
-`MPICH_ASYNC_PROGRESS=1` (which promotes XLA's FUNNELED request) and preloads
-`/opt/cray/pe/lib64/libpmi.so.0` so Cray PMI initializes before JAX's
-coordination threads exist. `MPITRAMPOLINE_LIB` has no default in `src/`: it
-names a site build artifact.
+How each machine obtains the MULTIPLE grant, and the adapter builds:
+[MPI collectives § The adapter](../dev/mpi_collectives.md#the-adapter).
+`MPITRAMPOLINE_LIB` has no default in `src/`: it names a site build artifact.
 
 ## 3. The Intel MPI provider layer (Frontera)
 

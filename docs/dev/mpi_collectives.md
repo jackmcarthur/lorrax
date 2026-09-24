@@ -132,7 +132,7 @@ export CPU_JAX_VENV=/path/to/jax-0.9.1-venv
 export LX_BASE_MODULE=lorrax_A
 export LORRAX_CPUS_PER_TASK=16
 export PYTHONPATH="$LORRAX_CHECKOUT/src${PYTHONPATH:+:$PYTHONPATH}"
-lx run --cpu -N 2 -n 4 -- bash -c '
+lx run --cpu --pool POOL -N 2 -n 4 -- bash -c '
   set -euo pipefail
   export PATH="$CPU_JAX_VENV/bin:$PATH"
   export LORRAX_CPU_SKIP_GPU_PLUGINS=1
