@@ -55,9 +55,11 @@ for each μ batch B (b centroids, b a multiple of P, serial):
         transport C_q was built with, `typed_child_G_tables`):
             D̃_k = (U⊗Ū)ᵀ D̃_k̄(perm μ, pslot G) e^{2πiL·k̄} conj(phase)
         cylinder gather + axis DFT onto ALL planes, once per k: the D cylinder
-        per group of n_pg planes: 2D FFT, Bloch phase → D(k, μ, r_plane);
+        per group of n_pg planes: 2D FFT → D(k, μ, r_plane) up to its Bloch phase;
             Z_q(μ, r) = Σ_k Σ_ab D^L_k conj D^R_{k+q}
-                        (isdf.core.parent_projector_kconv on the identity plan)
+                        (ffi.fft.make_fused_conv_kplane: the pair convolution on
+                         the identity plan, reading the FFT output in place and
+                         applying the Bloch phase and the L | R split on load)
             LR+RL completion; e^{-iq·r}; forward 2D FFT;
             one matmul onto the ζ-sphere cylinder (columns × axis values)
         gather the ζ slots → rows Z_q(μ_B, G), μ-owned

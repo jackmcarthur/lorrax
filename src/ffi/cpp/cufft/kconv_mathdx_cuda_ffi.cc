@@ -25,10 +25,18 @@
 //                  store emits X's layout (out_layout 0) or (d0,nk,d3,d1,d4,d2)
 //                  (out_layout 1): the BSE ladder-W rung.
 //   5 kminor fft   Y[r,k] = s * FFT^{+-}_k X[r,.] on a k-MINOR (rows, nk) tile.
+//   6 plane   the pair contraction of mode 0 read straight from the route-G
+//             D-plane transform output D (nk, g, ns, 2c, ns, p): the load
+//             applies the Bloch phase F[k,g,p] and takes L = slots [0,c) and
+//             R = slots [c,2c) of the 2c axis, so no transposed, phased or
+//             split copy is made; U is (nk, c, g*p).  The element product
+//             D*F is the one XLA formed before this mode existed (see
+//             lrx_mul_xla), so mode 6 equals the old moveaxis + mode 1 chain
+//             bit for bit.
 // A new mode adds (1) an entry under its LRX_MODE value in kSrc, (2) a mode
 // code and a handler below, (3) a router factory in ffi/fft.py.
 //
-// Residency: modes 0/1 keep three nk-long banks per row (one (col,mu) pair) in
+// Residency: modes 0/1/6 keep three nk-long banks per row (one (col,mu) pair) in
 // shared memory, modes 2-5 one; a k-grid whose row does not fit the device's
 // opt-in shared memory, or an axis above the fp64 thread-FFT limit (40), is
 // refused by name.  Modes 2/3/5 may run in place: every block reads all nk
@@ -82,7 +90,7 @@ namespace lorrax_ffi::kconv_mathdx {
 namespace ffi = ::xla::ffi;
 
 static constexpr int kAxisMax = 40;        // cuFFTDx fp64 thread-FFT limit
-static constexpr int kRowsMax = 16;        // modes 0/1 (three banks per row)
+static constexpr int kRowsMax = 16;        // modes 0/1/6 (three banks per row)
 static constexpr int kThreads = 256;
 static constexpr long long kSmemBudget = 100 * 1024;
 // Modes 2-5 keep ONE bank per row; ~48 KiB per block lets three blocks share
@@ -162,6 +170,12 @@ struct ParentTables {
     int mu, nu, centroid_major;
 };
 
+// Mode 6 operand geometry (the embedded source declares the same struct).
+struct PlaneTab {
+    const double* phase;      // F (nk, g, p) complex128
+    long long g, p, c;        // planes per group, points per plane, L/R slots
+};
+
 // Modes 2-5 row geometry (the embedded source declares the same struct).
 struct RowGeo {
     long long rows;           // independent k-rows in the tile
@@ -194,6 +208,10 @@ struct ParentTables {
     const double *L, *R, *q, *coef_l, *coef_r;
     int mu, nu, centroid_major;
 };
+struct PlaneTab {
+    const double* phase;
+    long long g, p, c;
+};
 struct RowGeo {
     long long rows;
     long long m0, m1, m2;
@@ -205,6 +223,15 @@ struct RowGeo {
 
 __device__ __forceinline__ lrx_c2 lrx_mul(lrx_c2 a, lrx_c2 b) {
     lrx_c2 z = {a.x*b.x - a.y*b.y, a.x*b.y + a.y*b.x};
+    return z;
+}
+// (a+bi)(c+di) exactly as XLA:GPU forms an HLO complex multiply: its
+// emitter writes (ac - bd, ad + bc) and its NVPTX target fuses each into one
+// FMA (AllowFPOpFusion=Fast).  Spelled with explicit fma so NVRTC's own
+// contraction cannot pick the other operand; checked bitwise against XLA in
+// tests/multi_device/kconv_router_p4.py (plane_case).
+__device__ __forceinline__ lrx_c2 lrx_mul_xla(lrx_c2 a, lrx_c2 b) {
+    lrx_c2 z = {fma(a.x, b.x, -(a.y*b.y)), fma(a.x, b.y, a.y*b.x)};
     return z;
 }
 __device__ __forceinline__ lrx_c2 lrx_phase(lrx_c2 z, int code) {
@@ -285,18 +312,35 @@ __device__ __forceinline__ void transform3(lrx_c2* bank) {
     axis_pass<NX, NY * NZ, Dir>(bank);
 }
 
-#if LRX_MODE < 2
-// Modes 0 (pair) and 1 (parent): the post-pair spin-contracted k-convolution.
+#if LRX_MODE < 2 || LRX_MODE == 6
+// Modes 0 (pair), 1 (parent) and 6 (plane): the post-pair spin-contracted
+// k-convolution; they differ only in the load.
 extern "C" __global__ void __launch_bounds__(256) lrx_kconv(
     const lrx_c2* __restrict__ ain, const lrx_c2* __restrict__ bin, lrx_c2* __restrict__ uout,
     long long rows, double scale, unsigned long long perm_l, unsigned long long phase_l,
-    unsigned long long perm_r, unsigned long long phase_r, ParentTables tables) {
+    unsigned long long perm_r, unsigned long long phase_r, ParentTables tables, PlaneTab plane) {
     extern __shared__ lrx_c2 sm[];
     lrx_c2* abank = sm;
     lrx_c2* bbank = sm + RB * SP;
     lrx_c2* accum = sm + 2 * RB * SP;
     const long long r0 = (long long)blockIdx.x * RB;
     using namespace cufftdx;
+#if LRX_MODE == 6
+    // Row j of the block is U row (m, g, p) = r0 + j: its offset in D (minus
+    // the k, a and b terms) and in F (minus k), computed once per block.
+    __shared__ long long d_off[RB];
+    __shared__ long long f_off[RB];
+    const long long sb_ = plane.p, sm_ = NS * sb_, sa_ = 2 * plane.c * sm_;
+    const long long sg_ = NS * sa_, sk_ = plane.g * sg_, fk_ = plane.g * plane.p;
+    const lrx_c2* __restrict__ fph = reinterpret_cast<const lrx_c2*>(plane.phase);
+    if (threadIdx.x < RB) {
+        const long long row = r0 + threadIdx.x, nu = plane.g * plane.p;
+        const long long m = row / nu, n = row - m * nu, g = n / plane.p, p = n - g * plane.p;
+        d_off[threadIdx.x] = g * sg_ + m * sm_ + p;
+        f_off[threadIdx.x] = g * plane.p + p;
+    }
+    __syncthreads();
+#endif
     for (int a = 0; a < NS; ++a) {
         const int ap = (perm_l >> (4*a)) & 15;
         const int pc_l = (phase_l >> (2*a)) & 3;
@@ -311,6 +355,15 @@ extern "C" __global__ void __launch_bounds__(256) lrx_kconv(
 #if LRX_MODE == 1
                     av = lrx_parent_load(ain, tables, k, a, b, row, NS, false);
                     bv = lrx_parent_load(bin, tables, k, ap, bp, row, NS, true);
+#elif LRX_MODE == 6
+                    // P^X = conj(F * D^X): the typed parent load of the
+                    // identity plan (mode 1 with every table trivial).
+                    const lrx_c2 f = fph[(long long)k * fk_ + f_off[j]];
+                    const long long o = (long long)k * sk_ + d_off[j];
+                    av = lrx_mul_xla(ain[o + a * sa_ + b * sb_], f);
+                    bv = lrx_mul_xla(ain[o + ap * sa_ + plane.c * sm_ + bp * sb_], f);
+                    av.y = -av.y;
+                    bv.y = -bv.y;
 #else
                     const long long base = (long long)k * NS * rows * NS;
                     av = ain[base + (long long)a * rows * NS + row * NS + b];
@@ -527,10 +580,11 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
     LRX_CUDA_CHECK(cudaDeviceGetAttribute(&smem_optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev),
                    "max opt-in shared memory");
     const int nk = nkx * nky * nkz, sp = nk | 1;
-    const int banks = mode < 2 ? 3 : 1;
-    const long long rows_max = mode < 2 ? kRowsMax : kRowsMax1;
+    const bool pair = mode < 2 || mode == 6;           // three banks per row
+    const int banks = pair ? 3 : 1;
+    const long long rows_max = pair ? kRowsMax : kRowsMax1;
     const long long row_bytes = static_cast<long long>(banks) * (f32 ? 8 : 16) * sp;
-    long long rb = std::min<long long>(rows_max, (mode < 2 ? kSmemBudget : kSmemBudget1) / row_bytes);
+    long long rb = std::min<long long>(rows_max, (pair ? kSmemBudget : kSmemBudget1) / row_bytes);
     if (rb < 1) rb = std::min<long long>(rows_max, smem_optin / row_bytes);
     if (rb < 1) {
         std::ostringstream os;
@@ -656,22 +710,39 @@ static ffi::Error Launch(cudaStream_t stream, int mode, ffi::AnyBuffer A, ffi::A
                          double scale, ffi::Span<const int64_t> perm_l, ffi::Span<const int64_t> phase_l,
                          ffi::Span<const int64_t> perm_r, ffi::Span<const int64_t> phase_r,
                          std::string_view mathdx_root, std::string_view cubin_dir,
-                         const ParentTables* parent) {
+                         const ParentTables* parent, PlaneTab* plane = nullptr) {
     if (A.element_type() != ffi::DataType::C128 || B.element_type() != ffi::DataType::C128 ||
         U->element_type() != ffi::DataType::C128)
         return fail("contract", "complex128 only", ffi::ErrorCode::kInvalidArgument);
     auto ad = A.dimensions(), bd = B.dimensions(), ud = U->dimensions();
-    const size_t rank = parent ? 5 : 7;
-    if (ad.size() != rank || bd.size() != rank || ud.size() != (parent ? 3 : 5))
-        return fail("contract", "operand ranks", ffi::ErrorCode::kInvalidArgument);
-    for (size_t i = 0; i < rank; ++i)
-        if (ad[i] != bd[i]) return fail("contract", "A/B shapes differ", ffi::ErrorCode::kInvalidArgument);
-    const int64_t ns = ad[parent ? 1 : 3], d0 = ad[parent ? 2 : 4], d1 = ad[parent ? 4 : 5];
-    const int64_t nk = nkx * nky * nkz, rows = d0 * d1;
-    const bool shape_ok = nkx >= 1 && nky >= 1 && nkz >= 1 && (parent
-        ? (ad[3] == ns && ud[0] == nk && ud[1] == d0 && ud[2] == d1)
-        : (ad[0] == nkx && ad[1] == nky && ad[2] == nkz && ad[6] == ns &&
-           ud[0] == nkx && ud[1] == nky && ud[2] == nkz && ud[3] == d0 && ud[4] == d1));
+    int64_t ns = 0, rows = 0;
+    const int64_t nk = nkx * nky * nkz;
+    bool shape_ok = nkx >= 1 && nky >= 1 && nkz >= 1;
+    if (plane) {                                      // D (nk,g,ns,2c,ns,p), F (nk,g,p), U (nk,c,g*p)
+        shape_ok = shape_ok && ad.size() == 6 && bd.size() == 3 && ud.size() == 3 &&
+                   ad[0] == nk && ad[3] % 2 == 0 && ad[4] == ad[2] && bd[0] == nk &&
+                   bd[1] == ad[1] && bd[2] == ad[5] && ud[0] == nk && ud[1] == ad[3] / 2 &&
+                   ud[2] == ad[1] * ad[5];
+        if (shape_ok) {
+            ns = ad[2];
+            plane->g = ad[1]; plane->c = ad[3] / 2; plane->p = ad[5];
+            plane->phase = static_cast<const double*>(B.untyped_data());
+            rows = plane->c * plane->g * plane->p;
+        }
+    } else {
+        const size_t rank = parent ? 5 : 7;
+        if (ad.size() != rank || bd.size() != rank || ud.size() != (parent ? 3 : 5))
+            return fail("contract", "operand ranks", ffi::ErrorCode::kInvalidArgument);
+        for (size_t i = 0; i < rank; ++i)
+            if (ad[i] != bd[i]) return fail("contract", "A/B shapes differ", ffi::ErrorCode::kInvalidArgument);
+        ns = ad[parent ? 1 : 3];
+        const int64_t d0 = ad[parent ? 2 : 4], d1 = ad[parent ? 4 : 5];
+        rows = d0 * d1;
+        shape_ok = shape_ok && (parent
+            ? (ad[3] == ns && ud[0] == nk && ud[1] == d0 && ud[2] == d1)
+            : (ad[0] == nkx && ad[1] == nky && ad[2] == nkz && ad[6] == ns &&
+               ud[0] == nkx && ud[1] == nky && ud[2] == nkz && ud[3] == d0 && ud[4] == d1));
+    }
     if (!shape_ok || ns < 1 || ns > 4)
         return fail("contract", "shape/attribute mismatch", ffi::ErrorCode::kInvalidArgument);
     if (nkx > kAxisMax || nky > kAxisMax || nkz > kAxisMax) {
@@ -695,7 +766,9 @@ static ffi::Error Launch(cudaStream_t stream, int mode, ffi::AnyBuffer A, ffi::A
     long long rr = rows; double sc = scale;
     ParentTables none{};
     ParentTables tab = parent ? *parent : none;
-    void* args[] = {(void*)&ap, (void*)&bp, (void*)&up, &rr, &sc, &pl, &hl, &pr, &hr, &tab};
+    PlaneTab flat{};
+    PlaneTab pt = plane ? *plane : flat;
+    void* args[] = {(void*)&ap, (void*)&bp, (void*)&up, &rr, &sc, &pl, &hl, &pr, &hr, &tab, &pt};
     const long long blocks = (rows + k->rb - 1) / k->rb;
     if (blocks > 2147483647LL) return fail("launch", "grid.x overflow", ffi::ErrorCode::kInvalidArgument);
     CUresult cr = driver_api().LaunchKernel(k->fn, static_cast<unsigned>(blocks), 1, 1, kThreads, 1, 1,
@@ -748,6 +821,19 @@ static ffi::Error ParentDispatch(
                    static_cast<int>(mu), static_cast<int>(nu), static_cast<int>(centroid_major)};
     return Launch(stream, 1, A, B, U, nkx, nky, nkz, scale, perm_l, phase_l, perm_r, phase_r,
                   mathdx_root, cubin_dir, &t);
+}
+
+// Mode 6: D (nk, g, ns, 2c, ns, p) as the route-G D-plane transform left it,
+// F (nk, g, p) its Bloch phase; U (nk, c, g*p).
+static ffi::Error PlaneDispatch(cudaStream_t stream, ffi::AnyBuffer D, ffi::AnyBuffer F,
+                                ffi::Result<ffi::AnyBuffer> U, int64_t nkx, int64_t nky, int64_t nkz,
+                                double scale, ffi::Span<const int64_t> perm_l,
+                                ffi::Span<const int64_t> phase_l, ffi::Span<const int64_t> perm_r,
+                                ffi::Span<const int64_t> phase_r, std::string_view mathdx_root,
+                                std::string_view cubin_dir) {
+    PlaneTab plane{};
+    return Launch(stream, 6, D, F, U, nkx, nky, nkz, scale, perm_l, phase_l, perm_r, phase_r,
+                  mathdx_root, cubin_dir, nullptr, &plane);
 }
 
 // Modes 2-5: one bank per row.  `mode` fixes the layout; shapes are checked
@@ -843,6 +929,24 @@ static ffi::Error KminorFft(cudaStream_t s, ffi::AnyBuffer X, ffi::Result<ffi::A
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
     KConvMathdxPairCudaFfi, lorrax_ffi::kconv_mathdx::PairDispatch,
+    xla::ffi::Ffi::Bind()
+        .Ctx<xla::ffi::PlatformStream<cudaStream_t>>()
+        .Arg<xla::ffi::AnyBuffer>()
+        .Arg<xla::ffi::AnyBuffer>()
+        .Ret<xla::ffi::AnyBuffer>()
+        .Attr<int64_t>("nkx")
+        .Attr<int64_t>("nky")
+        .Attr<int64_t>("nkz")
+        .Attr<double>("scale")
+        .Attr<xla::ffi::Span<const int64_t>>("perm_l")
+        .Attr<xla::ffi::Span<const int64_t>>("phase_l")
+        .Attr<xla::ffi::Span<const int64_t>>("perm_r")
+        .Attr<xla::ffi::Span<const int64_t>>("phase_r")
+        .Attr<std::string_view>("mathdx_root")
+        .Attr<std::string_view>("cubin_dir"));
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(
+    KConvMathdxPlaneCudaFfi, lorrax_ffi::kconv_mathdx::PlaneDispatch,
     xla::ffi::Ffi::Bind()
         .Ctx<xla::ffi::PlatformStream<cudaStream_t>>()
         .Arg<xla::ffi::AnyBuffer>()

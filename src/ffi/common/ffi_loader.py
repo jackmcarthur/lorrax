@@ -123,6 +123,7 @@ _CUDA_TARGET_SYMBOLS = {
     # flat-k transform (lorrax_mklfft_flat_k) is host-only now.
     "lorrax_mathdx_kconv_pair":     "KConvMathdxPairCudaFfi",
     "lorrax_mathdx_kconv_parent":   "KConvMathdxParentCudaFfi",
+    "lorrax_mathdx_kconv_plane":    "KConvMathdxPlaneCudaFfi",
     "lorrax_mathdx_kconv_klead":    "KConvMathdxKleadCudaFfi",
     "lorrax_mathdx_kfft_klead":     "KFftMathdxKleadCudaFfi",
     "lorrax_mathdx_kconv_kminor":   "KConvMathdxKminorCudaFfi",

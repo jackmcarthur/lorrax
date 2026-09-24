@@ -257,7 +257,7 @@ def parent_projector_kconv(
 	    μ batch: :func:`gw.centroid_k_unfold.orbit_mu_batches`).
 	right_perm, right_L : (2·n_sym, r_loc), (2·n_sym, r_loc, 3)
 	    The same for the r endpoint (r-chunk: the Y owner of a
-	    ``RealGridOrbitTiles`` tile; route G: the identity plan on a plane group).
+	    ``RealGridOrbitTiles`` tile).
 	kgrid : (nkx, nky, nkz); the full k axis is ``plan.irr_idx`` order, which
 	    must be the C-order grid.
 	vertex_l, vertex_r : (perm, phase) of the Lorentz vertex on the output
