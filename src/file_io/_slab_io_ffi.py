@@ -2005,6 +2005,11 @@ class _FfiBackend(_DatasetGeometry):
         # only place that can put a denominator under the flush is the
         # drain — see close().
         self._queued_bytes: int = 0
+        # Writes submitted on this handle, and how many of them every rank
+        # has agreed are error-free (``_drain_for_read``).  Both advance in
+        # program order on every rank, since every write is collective.
+        self._writes_submitted: int = 0
+        self._writes_agreed: int = 0
         if mode != "r":
             from .commit_state import COMMIT_STATE
             self.create_dataset(COMMIT_STATE, shape=(1,), dtype=np.int32)
@@ -2033,6 +2038,7 @@ class _FfiBackend(_DatasetGeometry):
             except BaseException:
                 self.close()
                 raise
+            self._writes_agreed = self._writes_submitted
 
     # ------------------------------------------------------------------
     def create_dataset(
@@ -2103,6 +2109,26 @@ class _FfiBackend(_DatasetGeometry):
         self._dispatcher.drain()
         nbytes, self._queued_bytes = self._queued_bytes, 0
         return nbytes
+
+    def _drain_for_read(self) -> None:
+        """Drain, then agree on the writer error before a read can see its bytes.
+
+        The drain never raises (see :meth:`_drain_pending`), so without this
+        a read of a dataset whose write failed on one rank returns the stale
+        or unwritten bytes silently until :meth:`close`, and a value derived
+        from them can land in another file that commits first.  Every rank
+        reaches this point in the same program order (reads are collective),
+        and ``_writes_submitted`` advances identically on every rank, so the
+        agreement is taken by all ranks or by none.  It is taken once per
+        batch of writes followed by a read, not once per read.
+        """
+        self._drain_pending()
+        if self.mode == "r" or self._writes_submitted == self._writes_agreed:
+            return
+        self._writes_agreed = self._writes_submitted
+        from common.collectives import agree_io_error
+        agree_io_error(self._dispatcher.error, path=self.path,
+                       stage="SlabIO.read_after_write")
 
     # ------------------------------------------------------------------
     def _introspect_dataset(self, name: str) -> tuple[tuple[int, ...], "np.dtype"]:
@@ -2226,7 +2252,7 @@ class _FfiBackend(_DatasetGeometry):
         writes first for the reasons :meth:`read_slab` lists — nothing
         here may enter HDF5 while the writer thread is inside it.
         """
-        self._drain_pending()
+        self._drain_for_read()
         shape, ds_dtype = self._dataset_geom(name)
         want = np.dtype(dtype) if dtype is not None else np.dtype(ds_dtype)
         if not self._loader.has_phdf5_metadata_api(self._platform()):
@@ -2471,6 +2497,7 @@ class _FfiBackend(_DatasetGeometry):
                 tok.block_until_ready()
 
         self._queued_bytes += int(A.nbytes)
+        self._writes_submitted += 1
         self._dispatcher.submit(_task)
 
     # ------------------------------------------------------------------
@@ -2485,7 +2512,7 @@ class _FfiBackend(_DatasetGeometry):
         the dataset geometry, which only the backend knows; the rounding
         rule itself is :func:`mesh_divisible_shape`, single-sourced.
         """
-        self._drain_pending()
+        self._drain_for_read()
         ds_shape, _ = self._dataset_geom(name)
         return mesh_divisible_shape(ds_shape, mesh, partition_spec)
 
@@ -2525,7 +2552,7 @@ class _FfiBackend(_DatasetGeometry):
         # name — a read of an ALREADY-cached dataset skipped every drain in
         # the method, and ``_introspect_dataset`` (serial h5py on the same
         # path) ran before even that.  One unconditional drain at the top.
-        self._drain_pending()
+        self._drain_for_read()
         ds_shape, ds_dtype = self._dataset_geom(name)
         if shape is None:
             # Symmetry with the allgather backend: callers that don't
@@ -2619,7 +2646,7 @@ class _FfiBackend(_DatasetGeometry):
         # ``ctx->pinned_buf``, and two threads inside HDF5/MPI-IO on one
         # file handle.  A multi-window read is one collective like any
         # other, so none of them get weaker.
-        self._drain_pending()
+        self._drain_for_read()
         ds_shape, ds_dtype = self._dataset_geom(name)
         slab_shape = tuple(int(s) for s in shape)
         if dtype is None:
