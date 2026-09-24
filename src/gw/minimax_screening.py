@@ -1391,13 +1391,31 @@ def build_imag_probe_response_rule(quad, omega_p, minimax_config, *,
     returned ``max_error`` / ``max_error_odd`` are absolute, measured on a
     dense log grid of the window, for the incumbent log line and gates.
     """
-    x_min, x_max = float(quad.x_min), float(quad.x_max)
-    omega_p = float(omega_p)
-    tol = float(minimax_config.target_error)
+    out = _imag_probe_response_rule(
+        float(quad.x_min), float(quad.x_max), float(omega_p),
+        float(minimax_config.target_error), bool(with_odd_kernel))
+    if print_fn is not None:
+        print_fn(
+            f"  PPM imag-freq quadrature (ωp={float(omega_p):.4f} Ry): "
+            f"R={out.x_max / out.x_min:.1f}, "
+            f"nodes={out.node_count}, err~{out.max_error:.1e}  [{out.provenance}]")
+        if out.alpha_odd is not None:
+            print_fn(
+                "  PPM imag-freq ODD kernel ωp/(x²+ωp²) (ordered orientations, TR-odd "
+                f"channel): same {out.node_count} times, err~{out.max_error_odd:.1e}")
+    return out
+
+
+@lru_cache(maxsize=8)
+def _imag_probe_response_rule(x_min, x_max, omega_p, tol, with_odd_kernel):
+    """The probe rule for one window; SC maps with a retained window reuse it.
+
+    Its arrays are read-only, because every caller shares the one instance.
+    """
     rule = _mm.response_laplace_rule(
         x_min, x_max, np.asarray([1j * omega_p]), rel_tol=tol,
         ordered=bool(with_odd_kernel), reference_ry=x_min)
-    tau = np.asarray(rule["t"], dtype=np.float64)
+    tau = np.array(rule["t"], dtype=np.float64)
     shift = np.exp(x_min * tau)
     even = np.asarray(rule["projection_value"])[0]
     if np.max(np.abs(even.imag)) > 1e-10 * max(np.max(np.abs(even.real)), 1e-300):
@@ -1419,19 +1437,13 @@ def build_imag_probe_response_rule(quad, omega_p, minimax_config, *,
     provenance = (f"analytic response_laplace_rule, certificate {cert['status']} "
                   f"bound {float(cert['maximum_bound']):.2e} (rel_tol {tol:.1e}), "
                   f"digest {str(rule['node_digest'])[:12]}")
-    out = LaplaceMinimaxQuadrature(
+    for array in (tau, alpha, alpha_odd):
+        if array is not None:
+            array.setflags(write=False)
+    return LaplaceMinimaxQuadrature(
         x_min=x_min, x_max=x_max, tau=tau, alpha=alpha, max_error=err,
         provenance=provenance, alpha_odd=alpha_odd, max_error_odd=err_odd,
         n_odd_extra=0)
-    if print_fn is not None:
-        print_fn(
-            f"  PPM imag-freq quadrature (ωp={omega_p:.4f} Ry): R={x_max / x_min:.1f}, "
-            f"nodes={out.node_count}, err~{err:.1e}  [{provenance}]")
-        if alpha_odd is not None:
-            print_fn(
-                "  PPM imag-freq ODD kernel ωp/(x²+ωp²) (ordered orientations, TR-odd "
-                f"channel): same {out.node_count} times, err~{err_odd:.1e}")
-    return out
 
 
 def build_real_quadrature(quad, Omega, minimax_config, *, print_fn=None):
