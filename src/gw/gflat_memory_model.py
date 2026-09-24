@@ -1601,7 +1601,8 @@ class MuBatchPlan:
             f"    μ batch       = {self.b}  ({self.n_batch} batches, "
             f"{self.collectives_per_batch} collectives each; modelled loop "
             f"{self.t_model_s:.0f} s; runner-up {self.runner_up})",
-            f"    r sub-block   = {self.r_sub} {'points' if self.route == 'cache' else 'plane(s)'}",
+            f"    r sub-block   = {self.r_sub} "
+            f"{'points' if self.route == 'cache' else 'planes per group' if self.route == 'G' else 'plane(s)'}",
             f"    FFT rows/step = {self.row_chunk}",
             f"    Z store       = {self.placement}, G-vector tile {self.g_tile}, "
             f"finalize {self.finalize_layout}-layout",
@@ -1621,6 +1622,124 @@ class MuBatchPlan:
         lines.append("    whole-fit volumes (GB/rank): " + ", ".join(
             f"{k} {v / 1e9:.1f}" for k, v in self.transfer.items()))
         return "\n".join(lines)
+
+
+def plan_zeta_route_g(*, meta, mesh_xy, n_q_selected: int, ngkmax: int,
+                      psi_ngkmax: int, fit_nb: int, n_col: int, n_s: int,
+                      zeta_tier: str, budget_gb: float,
+                      target_utilization: float | None = None,
+                      psi_face_bytes: float = 0.0) -> MuBatchPlan:
+    """Size the route-G μ-batch fit (docs/architecture/zeta_fit_mubatch.md).
+
+    Per rank: conj ψ(G) on its G slice (full zone), the batch's pair
+    projectors on the slice and after the one all-to-all, and on the owner
+    one plane group of ``D(k, μ, r)`` for its ``c = b/P`` centroids.  The
+    candidates are the plane-group width ``n_pg`` (each at its largest
+    batch); the modelled time counts the per-batch fixed cost and the
+    cylinder gathers (``∝ 1/n_pg``) -- the pair-projector all-to-all, the
+    X_B psum and the per-centroid arithmetic are the same for every
+    candidate.  Feasibility: the smallest configuration (``b = P``,
+    ``n_pg = 1``) must fit ``4·G_tile``.
+    """
+    from runtime.padding import mesh_divisor
+    P_ = int(mesh_divisor(mesh_xy))
+    nk, ns = int(meta.nk_tot), int(meta.nspinor)
+    mu = int(getattr(meta, "n_rmu_padded", None) or meta.n_rmu)
+    fft_grid = tuple(int(v) for v in meta.fft_grid)
+    n_rtot = int(math.prod(fft_grid))
+    n_a = max(fft_grid)
+    ps = n_rtot // n_a
+    Q, N_G = int(n_q_selected), int(ngkmax)
+    Q_pad = math.ceil(Q / P_) * P_
+    Q_loc = Q_pad // P_
+    Gp = math.ceil(int(psi_ngkmax) / P_)
+    nb = padded_axis(int(fit_nb), P_, name="route-G fit bands").carrier
+    if target_utilization is None:
+        target_utilization = bfc_fragmentation_target_utilization(ns)
+    budget = float(budget_gb) * 1e9
+    target = budget * float(target_utilization)
+    finalize_layout = 'q' if str(zeta_tier) == 'local' else 'g'
+    base = {
+        "C factor": (_c128(Q_loc, mu, mu) if finalize_layout == 'q'
+                     else _c128(Q, mu, mu)),
+        "centroid faces": float(psi_face_bytes),
+        "conj ψ(G) slice": _c128(nk, nb, ns, Gp),
+        "sphere tables": 12.0 * nk * Gp + 4.0 * nk * n_col * n_s + 8.0 * Q * N_G,
+    }
+    base_total = sum(base.values())
+
+    def ws(b, n_pg):
+        c, r_pl = b // P_, n_pg * ps
+        return {
+            "X_B": 2 * _c128(nk, nb, ns, b) + _c128(nk, Gp, b),
+            "pair projectors (G slice, all-to-all)": 4 * 2 * _c128(nk, ns, b, ns, Gp),
+            "plane group D(k, μ, r)": _c128(nk, ns, 2 * c, ns, r_pl),
+            "cylinder + planes": (_c128(ns, 2 * c, ns, n_col, n_s)
+                                  + 3 * _c128(ns, 2 * c, ns, r_pl)),
+            "k-conv + Z": 9 * _c128(nk, c, r_pl) + 3 * _c128(Q, c, r_pl),
+            "Z rows (accumulated, +1 lookahead)": 3 * _c128(Q, c, N_G),
+        }
+
+    def need(b, n_pg):
+        return base_total + sum(ws(b, n_pg).values())
+
+    green = _c128(nk, ns * ns, mu, mu, shard=P_)
+    need_min = need(P_, 1)
+    if need_min > target:
+        raise ValueError(
+            f"GATE zeta-mubatch-capacity: got {need_min / 1e9:.2f} GB/dev for the "
+            f"smallest route-G configuration (b = P = {P_}, one plane), want <= "
+            f"{target / 1e9:.2f} GB/dev; why: no batch fits.  Fix: more ranks or "
+            "more memory per device.")
+    b_top = math.ceil(mu / P_) * P_
+    cands = []
+    n_pg = 1
+    while True:
+        if need(P_, n_pg) <= target:
+            b = P_
+            while b + P_ <= b_top and need(b + P_, n_pg) <= target:
+                b += P_
+            n_b = math.ceil(mu / b)
+            b = math.ceil(math.ceil(mu / n_b) / P_) * P_         # balance
+            n_grp = math.ceil(n_a / n_pg)
+            # ponytail: constants from the VI3 P16 OFI measurement (per-batch
+            # dispatch + psum/all-to-all latency 20 ms, 5 µs per scan step,
+            # gathers at 1 TB/s); the comm-model service's comm_time replaces
+            # them.
+            t = (n_b * (0.02 + 5e-6 * n_grp * nk)
+                 + (mu / P_) * n_grp * nk * _c128(ns, 2, ns, n_col, n_s) / 1e12)
+            cands.append((t, n_pg, b))
+        if n_pg >= n_a:
+            break
+        n_pg = min(2 * n_pg, n_a)
+    cands.sort()
+    t_model, n_pg, b = cands[0]
+    ru = (f"n_pg={cands[1][1]} b={cands[1][2]}: {cands[1][0]:.0f} s"
+          if len(cands) > 1 else None)
+    n_batch = math.ceil(mu / b)
+    per_g = (6.0 * _c128(Q_pad, mu, 1, shard=P_)
+             + (_c128(Q, mu, mu) if finalize_layout == 'g' else 0.0) / max(N_G, 1))
+    g_tile = int(max(P_, (0.25 * target // max(per_g, 1.0)) // P_ * P_))
+    g_tile = min(g_tile, math.ceil(N_G / P_) * P_)
+    n_Gt = math.ceil(N_G / g_tile)
+    store = _c128(Q, n_batch * b, n_Gt * g_tile, shard=P_)
+    placement = 'host' if store <= _host_bytes_per_rank() else 'disk'
+    br = dict(base)
+    br.update(ws(b, n_pg))
+    store_total = Q * mu * N_G * 16.0
+    transfer = {
+        "pair-projector all-to-all": mu * 2 * _c128(nk, ns, 1, ns, Gp),
+        "X_B psum": mu * _c128(nk, nb, ns, 1),
+        "Z store write": store_total / P_, "Z store read": store_total / P_,
+    }
+    return MuBatchPlan(
+        green_tile_bytes=float(green), min_config_bytes=float(need_min),
+        collectives_per_batch=2, t_model_s=float(t_model), runner_up=ru,
+        route='G', source='resident', band_chunk=int(nb), k_chunk=int(nk),
+        b=int(b), n_batch=int(n_batch), r_sub=int(n_pg), row_chunk=0,
+        g_tile=int(g_tile), placement=placement, finalize_layout=finalize_layout,
+        hwm_bytes=float(sum(br.values())), budget_bytes=float(budget),
+        target_bytes=float(target), breakdown=br, transfer=transfer)
 
 
 def plan_zeta_mubatch(*, meta, mesh_xy, n_q_selected: int, ngkmax: int,

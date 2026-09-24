@@ -1103,7 +1103,9 @@ class ZetaG:
 
     @property
     def q_local(self) -> bool:
-        return self.store.rows == 'q'
+        """The solve tier decides the finalize layout: q-local reads each G
+        tile onto q owners (one all-to-all per tile from μ-owned rows)."""
+        return self.store.rows == 'q' or self.zeta_gather == 'local'
 
 
     # -- the one pass ---------------------------------------------------

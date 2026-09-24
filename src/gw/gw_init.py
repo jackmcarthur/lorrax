@@ -1720,7 +1720,7 @@ def _plan_gflat_chunks_for_channel(
 	if mubatch:
 		# The charge channel's μ-batch fit (docs/architecture/zeta_fit_mubatch.md):
 		# the same budget, its own inventory.
-		from gw.gflat_memory_model import plan_zeta_mubatch
+		from gw.gflat_memory_model import plan_zeta_route_g
 		from isdf.core import _resolve_zeta_gather
 		_tier = _resolve_zeta_gather(
 			str(cfg.backend.distributed_zeta_solve),
@@ -1730,19 +1730,16 @@ def _plan_gflat_chunks_for_channel(
 		_psi_ng = int(psi_ngkmax) if psi_ngkmax else _ngkmax
 		_r = (3.0 * _psi_ng / (4.0 * math.pi)) ** (1.0 / 3.0)
 		_n_a = max(int(v) for v in meta.fft_grid)
-		mubatch_plan = plan_zeta_mubatch(
+		mubatch_plan = plan_zeta_route_g(
 			meta=meta, mesh_xy=mesh_xy, n_q_selected=n_q_selected,
 			ngkmax=_ngkmax, psi_ngkmax=_psi_ng, fit_nb=_zeta_fit_nb,
-			face_nb=int(band_slices.b4 - band_slices.b0),
-			band_chunk=int(gflat_plan.band_chunk),
-			n_parent=int((parent_route or {}).get('n_parent', meta.nk_tot)),
 			zeta_tier=_tier, budget_gb=float(mem.per_device_gb),
 			target_utilization=(mem.chunk_target_utilization
 			                    if mem.chunk_target_utilization > 0 else None),
 			psi_face_bytes=float(gflat_plan.psi_layout_bytes),
-			n_col_psi=int(min(int(meta.n_rtot) // _n_a,
-			                  math.ceil(1.2 * math.pi * _r * _r))),
-			n_s_psi=int(min(_n_a, math.ceil(2.4 * _r) + 1)))
+			n_col=int(min(int(meta.n_rtot) // _n_a,
+			              math.ceil(1.2 * math.pi * _r * _r))),
+			n_s=int(min(_n_a, math.ceil(2.4 * _r) + 1)))
 		if jax.process_index() == 0:
 			print_fn(mubatch_plan.format())
 	chunks = {
