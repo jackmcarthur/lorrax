@@ -36,10 +36,7 @@ import jax.numpy as jnp
 from jax import lax
 from jax.sharding import Mesh, PartitionSpec as P
 
-from common.fft_helpers import (
-    make_sharded_fftn_3d,
-    make_sharded_ifftn_3d,
-)
+from common.fft_helpers import make_kconv_kminor
 from .bse_ring_comm import make_bse_shardings
 
 
@@ -63,21 +60,17 @@ def build_bse_simple_matvec(
     ``psi_c_X``/``psi_v_Y``; the V-term reads the hoisted M's).
 
     All collectives are XLA-generated from einsums + sharding hints.
-    The (kx, ky, kz) ifft/fft around the W contraction is wrapped with
-    ``make_sharded_*fftn_3d`` (single 3D cuFFT inside shard_map). A/B
-    benchmarks (custom_partitioning, fused_ifft_mul, fused_all) all
-    came in slower — cuFFT is a CustomCall and won't fuse with the
-    multiply, so the closure overhead is pure cost.
+    The k-convolution around the W contraction is ONE call of the
+    k-convolution router's k-minor door (``make_kconv_kminor``: nvidia-mathdx
+    on CUDA, the plan route on cpu).
     """
     sh = make_bse_shardings(mesh_xy)
     nk = nkx * nky * nkz
     sqrt_nk = jnp.sqrt(jnp.asarray(nk, dtype=jnp.float64))
 
-    _T_8d_spec = P(None, "x", "y", None, None, None, None, None)
-    _T_local_ifftn = make_sharded_ifftn_3d(
-        mesh_xy, _T_8d_spec, _T_8d_spec, axes=(5, 6, 7), norm='ortho')
-    _T_local_fftn = make_sharded_fftn_3d(
-        mesh_xy, _T_8d_spec, _T_8d_spec, axes=(5, 6, 7), norm='ortho')
+    _conv = make_kconv_kminor(mesh_xy, (nkx, nky, nkz),
+                              P(None, "x", "y", None, None, None), P("x", "y", None),
+                              norm='ortho')
 
     def _matvec(
         X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y,
@@ -147,17 +140,9 @@ def build_bse_simple_matvec(
         )
         T = lax.with_sharding_constraint(T, sh.T)
 
-        # FFT over (kx, ky, kz) — split nk into 3 axes.
-        T_k = T.reshape(T.shape[0], T.shape[1], T.shape[2],
-                        T.shape[3], T.shape[4], nkx, nky, nkz)
-        T_R = _T_local_ifftn(T_k)
-        # Pointwise W_R · T_R: W_R sharded P(x,y,None,None,None);
-        # T_R sharded P(None,x,y,None,None,None,None,None); the
-        # broadcast-multiply is local on every (x,y) tile.
-        U_R = W_R[None, :, :, None, None, :, :, :] * T_R
-        U_q = _T_local_fftn(U_R)
-        U = U_q.reshape(U_q.shape[0], U_q.shape[1], U_q.shape[2],
-                        U_q.shape[3], U_q.shape[4], nk)
+        # U = fftn_k(ifftn_k(T) · W_R), both 'ortho', one fused call; the
+        # (μ, ν) tiles of T and W_R share the (x, y) mesh axes, so it is local.
+        U = _conv(T, W_R.reshape(W_R.shape[0], W_R.shape[1], nk))
         U = lax.with_sharding_constraint(U, sh.U)
 
         # Back-contract: A[b, c, ν, s, k] = Σ_μ ψ_c_X*[k,c,t,μ] · U[b,μ,ν,t,s,k]
