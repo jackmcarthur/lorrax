@@ -402,6 +402,8 @@ def _fit_mubatch(
             pending = launch(beta + 1) if beta + 1 < n_go else None
             for store, r in zip(stores, rows):
                 store.write_batch(beta, r)
+                if len(stores) > 1:
+                    store.sync()          # one handle's collective writes at a time
             del rows
             t_batch += time.perf_counter() - t0
             n_run += 1
