@@ -17,10 +17,12 @@ a writable directory on a filesystem the compute nodes see:
 export LX_BASE_MODULE=lorrax_A
 export LORRAX_CHECKOUT=/path/to/lorrax       # the copy is outside the checkout
 QS=$(mktemp -d -p "$SCRATCH")
-cp -a "$LORRAX_CHECKOUT/tests/regression/cohsex_debug" "$QS/"
+mkdir -p "$QS/tests/regression"
+cp -a "$LORRAX_CHECKOUT/tests/regression/cohsex_debug" "$QS/tests/regression/"
 chmod -R u+w "$QS"
-cd "$QS/cohsex_debug"
-lx run --wait 900 -N 1 -G 1 -n 1 -- python3 -u -m gw.gw_jax -i cohsex_test.in
+cd "$QS"
+lx run --pool POOL --wait 900 -N 1 -G 1 -n 1 -- \
+  python -m gw.gw_jax -i tests/regression/cohsex_debug/cohsex_test.in
 ```
 
 On Frontera, build the host leg with `config/frontera/build_ffi_host.sh` and
@@ -28,10 +30,11 @@ launch as [Frontera](environment/machines/frontera.md) describes.
 
 ## 2. Check the answer
 
-The run writes `eqp_test.dat` beside the frozen `eqp_ref.dat`. Compare them
-without the first line, which is a generation timestamp:
+The run writes `eqp_test.dat` beside the deck and the frozen `eqp_ref.dat`.
+Compare them without the first line, which is a generation timestamp:
 
 ```bash
+cd "$QS/tests/regression/cohsex_debug"
 diff <(sed 1d eqp_test.dat) <(sed 1d eqp_ref.dat)
 ```
 
