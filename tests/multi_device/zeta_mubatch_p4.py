@@ -5,7 +5,9 @@ Four processes, one GPU each, 2x2 mesh, on the fixtures of
 antiunitary row, ns = 2; A-cubic, 48 operations, ns = 1) plus a ragged deck
 where no axis divides the mesh (one operation, box (5, 5, 7) so N_r = 175 and
 7 planes, 7 bands, 7 centroids, a 3x1x1 k grid with Q = 2 stored q, and a
-ζ sphere that fills no whole G tile).  conj ψ(G) of the full zone (the typed
+ζ sphere that fills no whole G tile), and the glide group at ns = 4 with the
+three current vertices γ̃^{1,2,3} in ONE kernel (the bispinor current fit:
+general U on the four-spinor, an antiunitary row, no LR+RL completion).  conj ψ(G) of the full zone (the typed
 children) is sharded over G slots; the kernel's Z_q(μ, G) -- G-space pair
 GEMM, one all-to-all to the μ owners, planes (cylinder, axis DFT, 2D FFT),
 the plane k-convolution (the identity plan, phase and L/R split on load), LR+RL completion, forward plane FFT
@@ -16,8 +18,12 @@ over the full-BZ children,
     Z_q(μ, G) = FFT_r[e^{-iq·r} (Z_q + conj Z_{-q})(μ, r)],
     Z_q(μ, r) = Σ_k Σ_ab D^L_{k,ab}(μ,r) conj D^R_{k+q,ab}(μ,r),
 
-at 1e-12 (max-abs relative).  Red twin (TASTE 21): the ζ-sphere axis index
-shifted by one must miss by more than 1e-3.
+at 1e-12 (max-abs relative), with γ̃^{μ_L} on both endpoints' output spins
+for a current channel.  Red twin (TASTE 21): the ζ-sphere axis index shifted
+by one must miss by more than 1e-3; for the currents, channel 1 compared
+against the γ̃^2 reference must miss too.  The transverse solve seam
+(``_logical_solve('lu')``: the sign-aware ridged LU of an indefinite C) is
+checked against a dense solve on both finalize layouts.
 Run: ``lx run -N 1 -G 4 -n 4 python3 -u tests/multi_device/zeta_mubatch_p4.py``.
 """
 from __future__ import annotations
@@ -72,7 +78,7 @@ def _ragged_fixture(mesh, rng):
                 b_target=4)
 
 
-def run_case(case, fx, mesh, scratch):
+def run_case(case, fx, mesh, scratch, vertices=(0,)):
     from isdf import zeta_mubatch as zmb
     from gw.centroid_k_unfold import orbit_mu_batches
     from common.collectives import device_put_process_local as put
@@ -96,14 +102,19 @@ def run_case(case, fx, mesh, scratch):
     ngk = max(s.size for s in sph)
     sphere = np.stack([np.r_[s, np.repeat(s[:1], ngk - s.size)] for s in sph]).astype(np.int32)
 
-    # Dense reference from the full-BZ children (no LORRAX kernel).
-    Z = _dense_pair_rhs(parity._children(fx), fx["cent_flat"], kgrid, w_l, w_r, 0)
-    Z = (Z + np.conj(Z[q_neg]))[q_sel]
+    # Dense reference from the full-BZ children (no LORRAX kernel).  The charge
+    # fit completes LR+RL; the currents train on LR alone.
+    charge = tuple(vertices) == (0,)
     x = parity._grid_points(fg) / np.asarray(fg, float)
-    Z = Z * np.exp(-2j * np.pi * qf @ x.T)[:, None, :]
-    Z = np.fft.fftn(Z.reshape(Z.shape[:2] + fg), axes=(-3, -2, -1)).reshape(Z.shape)
-    ref = plan.layout.axis.pack_host(
-        np.take_along_axis(Z, sphere[:, None, :], axis=2), axis=1)
+
+    def reference(v):
+        Z = _dense_pair_rhs(parity._children(fx), fx["cent_flat"], kgrid, w_l, w_r, v)
+        Z = (Z + np.conj(Z[q_neg]))[q_sel] if charge else Z[q_sel]
+        Z = Z * np.exp(-2j * np.pi * qf @ x.T)[:, None, :]
+        Z = np.fft.fftn(Z.reshape(Z.shape[:2] + fg), axes=(-3, -2, -1)).reshape(Z.shape)
+        return plan.layout.axis.pack_host(
+            np.take_along_axis(Z, sphere[:, None, :], axis=2), axis=1)
+    refs = [reference(v) for v in vertices]
 
     q_axis = padded_axis(len(q_sel), 4, name="stored q rows")
     g_axis = padded_axis(ngk, 8, name="ζ-sphere G tiles")
@@ -147,46 +158,59 @@ def run_case(case, fx, mesh, scratch):
     rank = NamedSharding(mesh, P(("x", "y")))
 
     def run_g(tabs, placement="host"):
+        """One store per channel; returns [{layout: Z}] in ``vertices`` order."""
         ob = zmb.owner_orbit_batches(plan, mu_pad, 4,
                                      c_target=max(1, int(fx["b_target"]) // 4))
         kern = zmb.make_route_g_kernel(
             mesh=mesh, kgrid=kgrid, fft_grid=fg, ns=ns, b=ob.b,
-            q_sel=q_sel, q_axis=q_axis, q_neg=q_neg, qvec_frac=qf,
+            q_sel=q_sel, q_axis=q_axis, q_neg=q_neg if charge else None, qvec_frac=qf,
             n_col=int(cyl[0].shape[1]), n_s=int(cyl[0].shape[2]), n_pg=2, axis=axis,
-            n_src=n_par)
-        zs = zmb.ZStore(mesh=mesh, q_axis=q_axis, mu_pad=mu_pad, g_axis=g_axis, b=ob.b,
-                        placement=placement, n_batch=ob.n_batch,
-                        packed_from_slot=ob.slot_of_packed,
-                        scratch_path=os.path.join(scratch, f"{case}_zstore.h5"))
+            n_src=n_par, vertices=vertices)
+        stores = [zmb.ZStore(mesh=mesh, q_axis=q_axis, mu_pad=mu_pad, g_axis=g_axis,
+                             b=ob.b, placement=placement, n_batch=ob.n_batch,
+                             packed_from_slot=ob.slot_of_packed,
+                             scratch_path=os.path.join(scratch, f"{case}_zstore{v}.h5"))
+                  for v in vertices]
         for beta in range(ob.n_batch):
             slots = ob.mu[beta]
             live = (slots >= 0).astype(np.float64)
             xmu = xg[fx["cent_flat"][canon[np.clip(slots, 0, None)]]] * live[:, None]
             lt = (parity._put(ob.left_perm[beta], rank), parity._put(ob.left_L[beta], rank))
-            zs.write_batch(beta, kern(cbar_d, *ops, g3_d, put_rep(xmu), put_rep(live),
-                                      *tabs, unf, lt))
-        out = {lay: np.concatenate([parity._host(zs.read_tile(i, layout=lay))
-                                    for i in range(zs.n_Gt)], axis=2)[:len(q_sel), :, :ngk]
-               for lay in ("q", "g")}
-        zs.close()
+            rows = kern(cbar_d, *ops, g3_d, put_rep(xmu), put_rep(live), *tabs, unf, lt)
+            for zs, r in zip(stores, rows):
+                zs.write_batch(beta, r)
+        out = [{lay: np.concatenate([parity._host(zs.read_tile(i, layout=lay))
+                                     for i in range(zs.n_Gt)], axis=2)[:len(q_sel), :, :ngk]
+                for lay in ("q", "g")} for zs in stores]
+        for zs in stores:
+            zs.close()
         return out
 
     for placement in ("host", "disk"):
-        for lay, got in run_g(tabs, placement).items():
-            e = parity._rel(got, ref)
-            worst = max(worst, e)
-            if jax.process_index() == 0:
-                print(f"{TAG} {case:<11s} store={placement:<5s} read={lay}  rel={e:.2e}",
-                      flush=True)
-            if not e <= TOL:
-                raise SystemExit(f"{TAG} FAIL {case} {placement}/{lay}: {e:.3e}")
+        for v, ref, got_v in zip(vertices, refs, run_g(tabs, placement)):
+            for lay, got in got_v.items():
+                e = parity._rel(got, ref)
+                worst = max(worst, e)
+                if jax.process_index() == 0:
+                    print(f"{TAG} {case:<11s} μ_L={v} store={placement:<5s} read={lay}  "
+                          f"rel={e:.2e}", flush=True)
+                if not e <= TOL:
+                    raise SystemExit(f"{TAG} FAIL {case} μ_L={v} {placement}/{lay}: {e:.3e}")
     bad = (tabs[0], (tabs[1][0], put_rep(zt[1] + 1), tabs[1][2]))   # axis index off by one
-    red_g = parity._rel(run_g(bad)["q"], ref)
+    red_g = parity._rel(run_g(bad)[0]["q"], refs[0])
     if jax.process_index() == 0:
         print(f"{TAG} {case} route G red twin (ζ axis index shifted by one): "
               f"rel={red_g:.2e}", flush=True)
     if not red_g > RED:
         raise SystemExit(f"{TAG} FAIL {case}: route G red twin did not fire ({red_g:.3e})")
+    if len(vertices) > 1:
+        # The vertex is load-bearing: channel 1's Z against channel 2's reference.
+        red_v = parity._rel(run_g(tabs)[0]["q"], refs[1])
+        if jax.process_index() == 0:
+            print(f"{TAG} {case} vertex red twin (μ_L={vertices[0]} vs the "
+                  f"μ_L={vertices[1]} reference): rel={red_v:.2e}", flush=True)
+        if not red_v > RED:
+            raise SystemExit(f"{TAG} FAIL {case}: vertex red twin did not fire ({red_v:.3e})")
 
     return worst
 
@@ -214,6 +238,70 @@ def _check_finish(mesh):
     return worst
 
 
+def _check_transverse_seam(mesh):
+    """Route G's current-channel solve, ζ = (C + δI)⁻¹ Z for an INDEFINITE C,
+    through the hoisted LU factor and ``zeta_mubatch._v_tile_kernel``'s
+    ``'lu'`` seam, on both finalize layouts, against a dense solve."""
+    from isdf import zeta_mubatch as zmb
+    from isdf.core import (_factor_c_q_transverse_lu, _transverse_lu_ridge,
+                           zeta_factor_resident)
+    from runtime.padding import padded_axis
+    rng = np.random.default_rng(11)
+    Q, mu, g = 3, 8, 8
+    A = rng.standard_normal((Q, mu, mu)) + 1j * rng.standard_normal((Q, mu, mu))
+    lam = np.linspace(-2.0, 3.0, mu)                    # both signs: indefinite
+    Qm = np.linalg.qr(A)[0]
+    C = np.einsum("qij,j,qkj->qik", Qm, lam, Qm.conj())
+    Z = rng.standard_normal((Q, mu, g)) + 1j * rng.standard_normal((Q, mu, g))
+    ridge = np.asarray(_transverse_lu_ridge(np.trace(C, axis1=1, axis2=2), mu))
+    want = np.linalg.solve(C + ridge[:, None, None] * np.eye(mu), Z)
+    LU, piv = _factor_c_q_transverse_lu(
+        parity._put(C, NamedSharding(mesh, P(None, "x", "y"))), mesh, mu)
+    worst = 0.0
+    for tier, layout in (("local", "q"), ("replicated", "g")):
+        F = zeta_factor_resident(LU, piv, mesh, zeta_gather=tier, solver_kind="lu")
+        if layout == "g":
+            F = tuple(jax.lax.with_sharding_constraint(a, NamedSharding(mesh, P()))
+                      for a in F)
+        q_axis = padded_axis(Q, 4, name="seam q rows")
+        if layout == "q":
+            Zt = parity._put(np.concatenate([Z, np.zeros((q_axis.carrier - Q, mu, g))]),
+                             NamedSharding(mesh, P(("x", "y"), None, None)))
+            ngk = np.r_[np.full(Q, g), np.zeros(q_axis.carrier - Q)].astype(np.int32)
+            ops = (parity._put(np.zeros((q_axis.carrier, g), complex),
+                               NamedSharding(mesh, P(("x", "y"), None))),
+                   parity._put(ngk, NamedSharding(mesh, P(("x", "y")))),
+                   parity._put(np.zeros((q_axis.carrier, 1), np.int32),
+                               NamedSharding(mesh, P(("x", "y"), None))))
+        else:
+            Zt = parity._put(Z, NamedSharding(mesh, P(None, None, ("x", "y"))))
+            rep = NamedSharding(mesh, P())
+            ops = (parity._put(np.zeros((Q, g), complex), rep),
+                   parity._put(np.full(Q, g, np.int32), rep),
+                   parity._put(np.zeros((Q, 1), np.int32), rep))
+        step = zmb._v_tile_kernel(mesh, layout, "lu", mu, g, debug_m=False, with_v=False)
+        acc = zmb._zero_accumulators(mesh, layout, q_axis.carrier, Q, mu, 1,
+                                     debug_m=False, with_v=False)
+        got = parity._host(step(F, Zt, *ops, jnp.int32(0), *acc)[3])[:Q]
+        e = parity._rel(got, want)
+        worst = max(worst, e)
+        if jax.process_index() == 0:
+            print(f"{TAG} transverse seam layout={layout}  rel={e:.2e}", flush=True)
+        if not e <= 1e-10:
+            raise SystemExit(f"{TAG} FAIL transverse seam {layout}: {e:.3e}")
+    # Red twin: the PSD seam (cplus) on the same indefinite C drops half of it.
+    from isdf import cplus
+    lam_c, V = np.linalg.eigh(C)
+    B = V * np.where(lam_c > 1e-8 * lam_c[:, -1:], 1 / np.sqrt(np.abs(lam_c)), 0)[:, None, :]
+    red = parity._rel(np.asarray(cplus.apply(jnp.asarray(B), jnp.asarray(Z))), want)
+    if jax.process_index() == 0:
+        print(f"{TAG} transverse seam red twin (PSD cut on the indefinite C): "
+              f"rel={red:.2e}", flush=True)
+    if not red > RED:
+        raise SystemExit(f"{TAG} FAIL transverse seam red twin did not fire ({red:.3e})")
+    return worst
+
+
 def main():
     if jax.process_count() != 4 or jax.device_count() != 4:
         raise SystemExit(f"{TAG} FAIL: needs 4 processes x 1 GPU")
@@ -225,13 +313,16 @@ def main():
     multihost_utils.sync_global_devices("zeta_mubatch_p4 scratch")
     worst = 0.0
     try:
-        for case in ("glide_ns2", "acubic_ns1", "ragged_ns2"):
+        for case in ("glide_ns2", "acubic_ns1", "ragged_ns2", "glide_ns4_T"):
             rng = np.random.default_rng(2026_09_23)
             fx = (parity._glide_fixture(mesh, rng, 2) if case == "glide_ns2"
+                  else parity._glide_fixture(mesh, rng, 4) if case == "glide_ns4_T"
                   else parity._acubic_fixture(mesh, rng) if case == "acubic_ns1"
                   else _ragged_fixture(mesh, rng))
-            worst = max(worst, run_case(case, fx, mesh, scratch))
+            worst = max(worst, run_case(case, fx, mesh, scratch,
+                                        vertices=(1, 2, 3) if case.endswith("_T") else (0,)))
         worst = max(worst, _check_finish(mesh))
+        worst = max(worst, _check_transverse_seam(mesh))
     finally:
         multihost_utils.sync_global_devices("zeta_mubatch_p4 done")
         if jax.process_index() == 0:
