@@ -36,7 +36,7 @@ def _synthetic_plan(*, ns=4, face_nb=256, fit_nb=250, budget=80.0,
         ngkmax=30_000, n_q_disk=36, budget_gb=budget,
         target_utilization=0.80, band_chunk_override=16,
         r_chunk_override=r_override,
-        distributed_zeta_solve="distributed", low_mem_bands=True,
+        distributed_zeta_solve="local", low_mem_bands=True,
         face_current_vertex=current_vertex)
 
 
@@ -48,7 +48,7 @@ def _run50_plan():
             per_device_gb=60.0, chunk_target_utilization=0.0,
             band_chunk_size=16, r_chunk_override=0,
             gflat_chunk_size=0, low_mem_bands=True),
-        backend=SimpleNamespace(distributed_zeta_solve="distributed"))
+        backend=SimpleNamespace(distributed_zeta_solve="local"))
     bands = BandSlices.from_band_edges(0, 0, 130, 190, 256)
     mesh = SimpleNamespace(
         shape={'x': 4, 'y': 4}, devices=np.empty(16, dtype=object))
@@ -67,7 +67,7 @@ def _profile_cliff_plan(r_chunk):
         ngkmax=76_551, n_q_disk=36, budget_gb=70.0,
         target_utilization=0.78, band_chunk_override=16,
         r_chunk_override=r_chunk,
-        distributed_zeta_solve="distributed", low_mem_bands=True,
+        distributed_zeta_solve="local", low_mem_bands=True,
         face_current_vertex=True)
 
 
@@ -133,14 +133,14 @@ def test_run50_matched_deck_selects_bounded_y_cache_without_full_grid_cache():
     assert plan.zeta_k_chunk == 16
     assert plan.zeta_transform_fft_bytes == 5_760_000_000
     assert plan.psi_layout_bytes == 176_947_200
-    assert plan.persistent_bytes == 7_925_407_200
+    assert plan.persistent_bytes == 11_035_807_200
     assert plan.p_min == 4
-    assert plan.r_chunk == 46_220
-    assert plan.n_r_chunks == 31
-    assert plan.face_y_cache_bytes == 6_815_416_320
-    assert plan.peak_breakdown["A_centroid_load"] == 13_685_407_200
-    assert plan.peak_breakdown["C_fit_one_rchunk"] == 30_825_047_520
-    assert plan.peak_breakdown["C_face_y_cache_build"] == 21_569_833_440
+    assert plan.r_chunk == 42_512
+    assert plan.n_r_chunks == 34
+    assert plan.face_y_cache_bytes == 6_268_649_472
+    assert plan.peak_breakdown["A_centroid_load"] == 16_795_807_200
+    assert plan.peak_breakdown["C_fit_one_rchunk"] == 32_107_195_872
+    assert plan.peak_breakdown["C_face_y_cache_build"] == 24_056_577_504
     assert "C_face_y_cache_build" in plan.peak_breakdown
 
 
@@ -246,9 +246,9 @@ def test_run158_cliff_uses_two_41472_tiles_and_prices_compact_redistribution():
     assert (tiled.peak_breakdown["C_face_y_cache_build"]
             - full.peak_breakdown["C_face_y_cache_build"]
             == completed_z_tile)
-    assert tiled.peak_breakdown["C_face_y_cache_build"] == 16_499_800_800
-    assert tiled.peak_breakdown["C_face_tile_concat"] == 7_310_858_976
-    assert tiled.hwm_bytes == 28_990_135_008
+    assert tiled.peak_breakdown["C_face_y_cache_build"] == 19_321_776_864
+    assert tiled.peak_breakdown["C_face_tile_concat"] == 10_132_835_040
+    assert tiled.hwm_bytes == 31_812_111_072
 
 
 def test_parent_open_spin_projectors_are_in_the_transverse_live_set():

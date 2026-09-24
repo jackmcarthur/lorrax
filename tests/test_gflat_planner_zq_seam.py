@@ -73,7 +73,7 @@ def test_budget_outranks_the_mu_floor_and_the_arena_is_placeable(monkeypatch):
         nb_total=608, fit_nb_total=608, ngkmax=1975, n_q_disk=nq,
         budget_gb=64.0, band_chunk_override=608,
         pair_density_slots=slots,
-        distributed_zeta_solve="distributed")
+        distributed_zeta_solve="local")
     p_xy = p_x * p_y
     target = 64.0e9 * plan.target_utilization
     headroom = target - plan.persistent_bytes
@@ -104,7 +104,7 @@ def test_only_an_unreserved_async_pool_lifts_the_single_arena_cap(monkeypatch):
         mesh_xy=_mesh_shim(4, 4),
         nb_total=608, fit_nb_total=608, ngkmax=1975, n_q_disk=64,
         budget_gb=64.0, band_chunk_override=608,
-        pair_density_slots=3, distributed_zeta_solve="distributed")
+        pair_density_slots=3, distributed_zeta_solve="local")
     monkeypatch.setenv("XLA_PYTHON_CLIENT_ALLOCATOR", "bfc")
     bfc = plan_gflat_chunks(**kw)
     monkeypatch.setenv("XLA_PYTHON_CLIENT_ALLOCATOR", "cuda_async")
@@ -161,7 +161,7 @@ def test_r_chunk_override_bypasses_every_cap():
         budget_gb=64.0, band_chunk_override=608,
         r_chunk_override=7888,
         pair_density_slots=3,
-        distributed_zeta_solve="distributed")
+        distributed_zeta_solve="local")
     assert plan.r_chunk == 7888  # already a p_xy multiple; untouched
 
 

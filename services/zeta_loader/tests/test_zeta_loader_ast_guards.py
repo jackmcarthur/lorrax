@@ -315,12 +315,11 @@ def test_the_striping_guard_refuses_a_source_without_its_target():
 # re-freezing a gate.  The VALUE is the owner's (§R19, confirm-not-tune);
 # the AGREEMENT is this suite's.
 
-#: The five signatures that used to carry their own literal.
+#: The signatures that used to carry their own literal.
 _MIRRORS = (
     ("gw.isdf_fitting", "fit_zeta_to_h5"),
     ("isdf.core", "_factor_c_q_replicated"),
     ("isdf.core", "_factor_c_q_replicated_qparallel"),
-    ("isdf.core", "_factor_c_q_distributed_rank_truncate"),
     ("isdf.core", "factor_c_q"),
 )
 
@@ -402,7 +401,7 @@ def test_no_function_carries_a_literal_zeta_rcond_default(path):
                        f"zeta_rcond default:\n  " + "\n  ".join(bad))
 
 
-@pytest.mark.parametrize("path,want", [(ISDF_CORE, 4), (ISDF_FITTING, 1)],
+@pytest.mark.parametrize("path,want", [(ISDF_CORE, 3), (ISDF_FITTING, 1)],
                          ids=["isdf.core", "gw.isdf_fitting"])
 def test_every_zeta_rcond_default_names_the_constant(path, want):
     """The positive half, and the census: FOUR in isdf.core, ONE in
@@ -514,7 +513,7 @@ def _import_mirrors():
     return out
 
 
-def test_the_five_zeta_rcond_defaults_agree_at_runtime():
+def test_the_zeta_rcond_defaults_agree_at_runtime():
     """``inspect.signature`` on all five — the survey's §4.5 recommendation.
 
     The AST half proves the SOURCE says ``ZETA_RCOND_DEFAULT``; this proves
@@ -530,7 +529,7 @@ def test_the_five_zeta_rcond_defaults_agree_at_runtime():
         params = inspect.signature(fn).parameters
         assert "zeta_rcond" in params, f"{label} lost its zeta_rcond parameter"
         seen[label] = params["zeta_rcond"].default
-    assert len(seen) == 5, seen
+    assert len(seen) == len(_MIRRORS), seen
     wrong = {k: v for k, v in seen.items() if v != ZETA_RCOND_DEFAULT}
     assert wrong == {}, (
         f"the zeta_rcond mirrors drifted from gw_config's "

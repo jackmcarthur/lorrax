@@ -1322,19 +1322,17 @@ def plan_gflat_chunks(
     # batch.  ``local`` (R4, 2026-09-23) keeps ceil(Q/P) whole factors
     # resident on each rank and exchanges the RHS: per rank it holds the
     # q-local RHS and solution, 2·ceil(Q/P)·μ·r·16 B, plus the batch
-    # layout's pad rows of the factor.  ``distributed`` keeps the factor 2-D
-    # sharded and also bypasses the replicated batch.  ``auto`` is priced as
+    # layout's pad rows of the factor.  ``auto`` is priced as
     # the tier the live resolver will pick, from the SAME function
     # (``isdf.core.zeta_auto_tier``) at the plan's (Q, μ, P).  Z_col and the donated
     # output accumulator are both live across the solve and therefore
     # contribute two full sharded RHS stacks independently of the factor
     # route.
     _solve_route_requested = str(distributed_zeta_solve).strip().lower()
-    if _solve_route_requested not in {
-            "auto", "replicated", "local", "distributed"}:
+    if _solve_route_requested not in {"auto", "replicated", "local"}:
         raise ValueError(
-            "distributed_zeta_solve must be auto, replicated, local, or "
-            f"distributed; got {distributed_zeta_solve!r}")
+            "distributed_zeta_solve must be auto, replicated, or local; "
+            f"got {distributed_zeta_solve!r}")
     # Face pair accumulation needs only Py alignment; every solve still sees
     # an all-P carrier.  Price that pad here without imposing it on the face
     # kernel or duplicating the runtime channel resolver.
@@ -1355,11 +1353,7 @@ def plan_gflat_chunks(
         from isdf.core import zeta_auto_tier
         _auto_tier = zeta_auto_tier(int(nq_disk), int(mu), int(p_xy))
         _solve_route_requested = _auto_tier
-    if _solve_route_requested == "distributed":
-        q_chunk = 1                    # ignored by the distributed route
-        solve_t = _rhs_stacks
-        _solve_memory_route = "distributed (2-D-sharded factor)"
-    elif _solve_route_requested == "local":
+    if _solve_route_requested == "local":
         q_chunk = 1                    # ignored; the q batch is the mesh
         solve_t = _local_t
         _solve_memory_route = "local (resident q-local factor)"
@@ -1611,6 +1605,7 @@ class MuBatchPlan:
     runner_up: str | None = None
     store_bytes: float = 0.0        # Z store per rank
     host_budget_bytes: float = 0.0  # host share per rank at plan time
+    zeta_tier: str = "local"        # whole-tile back-solve tier (route G's)
 
     def format(self) -> str:
         gt = max(self.green_tile_bytes, 1.0)
@@ -1626,6 +1621,8 @@ class MuBatchPlan:
             f"    r sub-block   = {self.r_sub} "
             f"{'points' if self.route == 'cache' else 'planes per group' if self.route == 'G' else 'plane(s)'}",
             f"    FFT rows/step = {self.row_chunk}",
+            f"    ζ tier        = {self.zeta_tier} (chosen by route G, which applies "
+            f"the whole-tile factor B on each G tile; `linalg` sets the other stages)",
             f"    Z store       = {self.placement} ({self.store_bytes / 1e9:.1f} GB/rank; "
             f"host share {self.host_budget_bytes / 1e9:.1f} GB/rank from MemAvailable), "
             f"G-vector tile {self.g_tile}, finalize {self.finalize_layout}-layout",
@@ -1681,14 +1678,6 @@ def plan_zeta_route_g(*, meta, mesh_xy, n_q_selected: int, ngkmax: int,
         target_utilization = bfc_fragmentation_target_utilization(ns)
     budget = float(budget_gb) * 1e9
     target = budget * float(target_utilization)
-    if str(zeta_tier) not in ('local', 'replicated'):
-        raise ValueError(
-            f"GATE zeta-mubatch-tier: got back-solve tier {zeta_tier!r}, want "
-            "'local' or 'replicated'; why: route G applies the rank-truncated "
-            "factor B (C⁺ = B·Bᴴ, isdf.cplus) on each G tile, and the "
-            "distributed tier hands over a 2D-sharded C⁺ it does not read.  "
-            "`linalg = distributed` selects that tier.  Fix: `linalg = "
-            "local` (docs/architecture/zeta_fit_mubatch.md, Regime guard).")
     finalize_layout = 'q' if str(zeta_tier) == 'local' else 'g'
     base = {
         "C factor": (_c128(Q_loc, mu, mu) if finalize_layout == 'q'
@@ -1806,6 +1795,7 @@ def plan_zeta_route_g(*, meta, mesh_xy, n_q_selected: int, ngkmax: int,
         green_tile_bytes=float(green), min_config_bytes=float(need_min),
         collectives_per_batch=2, t_model_s=float(t_model), runner_up=ru,
         store_bytes=float(store), host_budget_bytes=float(host_budget),
+        zeta_tier=str(zeta_tier),
         min_call_bytes=float(_c128(nk, nb, ns, b)),
         min_efficient_bytes=comm_model.min_efficient_payload(P_ - 1),
         route='G', source='resident', band_chunk=int(nb), k_chunk=int(nk),

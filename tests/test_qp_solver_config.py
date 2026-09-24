@@ -491,10 +491,9 @@ def test_distributed_linalg_lowers_to_gpu_libraries(tmp_path, monkeypatch):
     cfg = _config(tmp_path, "linalg = distributed\n")
     assert cfg.backend.linalg == "distributed"
     assert cfg.backend.distributed_lu == "cusolvermp"
-    # Distributed rank truncation owns the charge factor; selecting a
-    # Cholesky provider simultaneously would be contradictory.
     assert cfg.backend.distributed_cholesky == "auto"
-    assert cfg.backend.distributed_zeta_solve == "distributed"
+    # The ζ tier stays whole-tile: route G chooses it, not `linalg`.
+    assert cfg.backend.distributed_zeta_solve == "auto"
     assert cfg.backend.distrib_la_batched_route == "auto"
     assert cfg.backend.eigh_backend == "distributed"
 

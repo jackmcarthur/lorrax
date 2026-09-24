@@ -21,7 +21,8 @@ def _deck(tmp_path, body: str):
     "layout,w_solver,zeta,lu,eigh,sc_eigh",
     [
         ("local", "local", "auto", "auto", "auto", "auto"),
-        ("distributed", "distributed", "distributed", "distributed",
+        # ζ stays whole-tile under both layouts: route G owns its tier.
+        ("distributed", "distributed", "auto", "distributed",
          "distributed", "distributed"),
     ],
 )

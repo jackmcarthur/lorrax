@@ -911,7 +911,10 @@ def resolve_linalg(params) -> LinalgResolution:
         eigh_backend="distributed",
         sc_eigh="distributed",
         charge_zeta_solve="rank_truncate",
-        distributed_zeta_solve="distributed",
+        # ζ is a whole-tile solve on every layout: the charge channel's
+        # route G applies the factor B on each G tile, and the planner picks
+        # local/replicated (isdf.core.zeta_auto_tier).
+        distributed_zeta_solve="auto",
         transverse_zeta_solve="ridge",
     )
 
@@ -4457,7 +4460,7 @@ class BackendConfig:
     eigh_backend: str          # resolved internal distrib_la backend
     zeta_ridge: float          # charge-CCT Tikhonov ridge ε (rel. to tr/n)
     charge_zeta_solve: str     # "rank_truncate" | "cholesky"
-    distributed_zeta_solve: str  # "auto"|"replicated"|"per_q"|"distributed"
+    distributed_zeta_solve: str  # "auto"|"replicated"|"local"
     zeta_rcond: float          # rank-truncation cutoff (·λ_max)
     transverse_zeta_solve: str  # "ridge" | "rank_truncate" (bispinor ζ_T)
     transverse_zeta_rcond: float  # transverse cut τ (·|λ|_max)
