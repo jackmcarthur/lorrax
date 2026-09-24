@@ -129,13 +129,14 @@ class SpatialKernel(NamedTuple):
         the identity on the cpu handler, which transforms W itself).  Hoisting
         it is the saving available to a caller that contracts SEVERAL G(τ)
         against the same W(τ) (the band brackets).
-    ``conv_project(psi_xr, psi_yn, G_k, W_prep) -> Sigma``
-        The G-dependent remainder: the router's fused ``apply`` (G transform,
-        R-space multiply, forward transform, one pass) and the ψ projection.
-        Paid ONCE PER G(τ).  ``G_k`` arrives in the Green's own centroid-major
-        order and is put into the convolution's operand order here
-        (``wavefunction_bundle.sigma_conv_operand``); Σ_k leaves in that
-        order, the face projector's contract.
+    ``conv_project(psi_xr, psi_yn, G_parents, W_prep) -> Sigma``
+        The G-dependent remainder: the router's fused unfold convolution
+        (``make_kconv_klead_unfold``: the typed unfold of the raw-parent
+        Green, its spin action and the spin-major reorder on the load, then
+        the G transform, R-space multiply and forward transform, one pass)
+        and the ψ projection.  Paid ONCE PER G(τ).  ``G_parents`` is the
+        :class:`gw.greens_function_kernel.ParentGreen` pair; Σ_k leaves
+        spin-major, the face projector's contract.
     """
     prep_w: Callable[..., jax.Array]
     conv_project: Callable[..., jax.Array]
@@ -160,7 +161,7 @@ def get_sigma_spatial_kernel(
     """
     kgrid = tuple(int(x) for x in kgrid)
     nk_tot = kgrid[0] * kgrid[1] * kgrid[2]
-    from common.fft_helpers import make_kconv_klead
+    from common.fft_helpers import make_kconv_klead, make_kconv_klead_unfold
     from ffi import ffi_dial_key
     key = (id(mesh_xy), kgrid, _stage_timing_enabled(), ffi_dial_key(),
            bool(merged_x), layout, face_shape, face_band_extent,
@@ -168,11 +169,14 @@ def get_sigma_spatial_kernel(
     if key in _sigma_spatial_kernel_cache:
         return _sigma_spatial_kernel_cache[key]
     from .wavefunction_bundle import (SIGMA_CONV_G7D_SPEC as _G_spec,
-                                      V_FFT5D_SPEC as _V_spec,
-                                      sigma_conv_operand)
+                                      V_FFT5D_SPEC as _V_spec)
     ensure_jax_compile_cache()
     kconv = make_kconv_klead(mesh_xy, kgrid, _G_spec, _V_spec,
                              norm='ortho', mult=-1.0 / np.sqrt(float(nk_tot)))
+    if k_unfold_plan is None:
+        raise ValueError("Sigma spatial kernel requires the typed parent unfold plan.")
+    unfold_conv = make_kconv_klead_unfold(mesh_xy, kgrid, k_unfold_plan.unfold_load_tables(),
+                                          norm='ortho', mult=-1.0 / np.sqrt(float(nk_tot)))
     project = _make_project_ri_reduce_scatter(
         mesh_xy, merged_x=merged_x, layout=layout, face_shape=face_shape,
         face_band_extent=face_band_extent, k_unfold_plan=k_unfold_plan)
@@ -183,17 +187,16 @@ def get_sigma_spatial_kernel(
         return kconv.prep(W_q)
 
     @partial(jax.jit, donate_argnums=(2,))
-    def conv_project(psi_proj_xr, psi_proj_yn, G_k, W_prep):
-        # The Green's own order is centroid-major; the convolution's operand
-        # order is fixed (SIGMA_CONV_G7D_SPEC).  One copy, replacing the
-        # one the parent-k unfold used to make.
-        sigma_k = kconv.apply(sigma_conv_operand(G_k), W_prep)
+    def conv_project(psi_proj_xr, psi_proj_yn, G_parents, W_prep):
+        # Raw-parent Green in, spin-major full-k Σ_k out: the typed unfold,
+        # spin action and reorder are the convolution's load.
+        sigma_k = unfold_conv(G_parents.G, G_parents.transpose, W_prep)
         return project(psi_proj_xr, sigma_k, psi_proj_yn)
     if not _stage_timing_enabled():
         pair = SpatialKernel(prep_w=prep_w, conv_project=conv_project)
         _sigma_spatial_kernel_cache[key] = pair
         return pair
-    _conv_j = jax.jit(lambda G_k, W_prep: kconv.apply(sigma_conv_operand(G_k), W_prep),
+    _conv_j = jax.jit(lambda G_p, W_prep: unfold_conv(G_p.G, G_p.transpose, W_prep),
                       donate_argnums=(0,))
     _project_j = jax.jit(project, donate_argnums=(1,))
 
@@ -260,7 +263,7 @@ def _get_sigma_kij_kernel(
         """Apply boolean identity masks or signed occupation weights without clipping."""
         options = dict(e_ref=ref, layout=layout, gemm=g_plan,
                        k_unfold_plan=k_unfold_plan, band_range=band_range,
-                       trim_zero_bands=True)
+                       trim_zero_bands=True, unfold=False)
         options["mask" if sel.dtype == jnp.bool_ else "band_weight"] = sel
         if energy_windows:
             options.update(E_min=E_min, E_max=E_max)
