@@ -1892,17 +1892,13 @@ def _replicate_rank_truncate_ok(nq: int | None, n_rmu: int | None) -> bool:
 #: ``(q_batch, mu, mu)`` c128 eigh operand); only the escape routes differ.
 _RANK_TRUNCATE_CHANNEL_ADVICE = {
     'charge': (
-        "For large n_mu use distributed_zeta_solve='distributed' instead "
-        "(ScaLAPACK pzheevd, 236 s at the same size), or "
-        "charge_zeta_solve='cholesky' to accept the distributed factor "
-        "(NOT rank-conditioned — verify V_q)."),
+        "The charge channel's ζ is route G's, which needs this whole-tile "
+        "factor; there is no distributed charge factor."),
     'transverse': (
-        "For large n_mu_T use distributed_zeta_solve='distributed' instead "
-        "(its plan runs pzheevd at the PADDED extent with exactly-inert pad "
-        "modes, so any count fits any square mesh), or "
-        "transverse_zeta_solve='ridge' to accept the LU+ridge family (NOT "
-        "rank-conditioned — the transverse CCT is indefinite and near-null, "
-        "so verify the fit residual)."),
+        "For large n_mu_T use the LU+ridge family (transverse_zeta_solve="
+        "'ridge', the `linalg` default; NOT rank-conditioned — the "
+        "transverse CCT is indefinite and near-null, so verify the fit "
+        "residual)."),
 }
 
 
@@ -1980,7 +1976,6 @@ def _resolve_solver_kind_charge(
     mesh_xy: Mesh, override: str = "auto",
     n_rmu: int | None = None, nq: int | None = None,
     charge_zeta_solve: str = "cholesky",
-    replicated_factor_used: bool = True,
 ) -> str:
     """Pick the charge-channel ζ-fit solver: fully-replicated dense Cholesky (mesh-invariant, the default for fit-size tiles) vs the distributed cuSolverMp potrf+potrs vs the in-tree shard_map 2D-blocked Cholesky + per-q triangular solve; see docs/architecture/zeta_fit_face_psi_cct.md."""
     def _slate(px: int, py: int) -> str:
@@ -2025,19 +2020,6 @@ def _resolve_solver_kind_charge(
         if (charge_zeta_solve == 'rank_truncate'
                 and _replicate_rank_truncate_ok(nq, n_rmu)):
             return 'replicated_rank_truncate'
-        if charge_zeta_solve == 'rank_truncate' and not replicated_factor_used:
-            # CAPACITY FIX (size campaign 2026-07-29, ladder notes R15.1).
-            # ``distributed_zeta_solve='distributed'`` REPLACES this factor
-            # wholesale with ``_factor_c_q_distributed_rank_truncate``, whose
-            # layout contract never replicates an O(mu^2) object at all
-            # (C_q/C+/V all P(None,'x','y'); only lambda (nq,mu) is
-            # replicated).  The caller overrides ``_resolved_solver_kind`` to
-            # 'distributed_rank_truncate' on the very next statement.  So
-            # enforcing the REPLICATED capacity here refuses a run on the
-            # size of a buffer that is never allocated -- it was capping mu at
-            # sqrt(4 GiB / 16 B) = 16,384 for a route that does not use the
-            # buffer.  Return the nominal kind and let the caller override.
-            return 'replicated_rank_truncate'
         if charge_zeta_solve == 'rank_truncate':
             raise _rank_truncate_capacity_error(nq, n_rmu, channel='charge')
         return None
@@ -2055,43 +2037,23 @@ def _resolve_solver_kind_transverse(mesh_xy: Mesh, override: str = "auto",
                                     n_rmu_logical: int | None = None,
                                     transverse_zeta_solve: str = "ridge",
                                     nq: int | None = None,
-                                    replicated_factor_used: bool = True,
                                     ) -> str:
     """Pick the transverse-channel ζ-fit solver: cuSolverMp distributed getrf+getrs vs the in-tree per-q ``jnp.linalg.solve`` + ridge; see docs/architecture/zeta_fit_face_psi_cct.md."""
     fam = str(transverse_zeta_solve).strip().lower()
     if fam == 'rank_truncate':
         if override in ('on', 'cusolvermp', 'scalapack'):
-            raise ValueError(
+                raise ValueError(
                 f"transverse_zeta_solve='rank_truncate' selects the eigh "
-                f"pseudo-inverse family, whose distributed plan is chosen "
-                f"by distributed_zeta_solve='distributed' (pzheevd) — but "
-                f"distributed_lu={override!r} explicitly requests an LU "
+                f"pseudo-inverse family, which has no distributed plan — "
+                f"but distributed_lu={override!r} explicitly requests an LU "
                 f"backend the family does not run.  Leave distributed_lu "
                 f"at 'auto'/'off', or set transverse_zeta_solve='ridge' "
                 f"to use the LU family.")
-        # SAME CAPACITY GATE AS THE CHARGE BRANCH (2026-08-22).  This route
-        # is the LOCAL plan: a replicated whole-tile eigh over one
-        # ``(q_batch, mu_T, mu_T)`` c128 operand, which is bit-for-bit the
-        # same buffer ``_replicate_rank_truncate_ok`` was written for.  It
-        # was ungated here, so a transverse fit above mu_T ~ 16k resolved
-        # cleanly and then died on the allocation, AFTER the charge fit had
-        # been paid for.  Two conditions, both mirroring the charge branch:
-        #
-        #   nq is None   -> the caller does not know the q-batch (the
-        #                   gw_init pre-flight, which has only the centroid
-        #                   file).  Keep the legacy policy; the ζ-fit call
-        #                   site re-resolves with nq and refuses there.
-        #   replicated_factor_used is False -> distributed_zeta_solve =
-        #                   'distributed' REPLACES this factor with pzheevd
-        #                   and the caller overrides the kind to
-        #                   'distributed_transverse_rank_truncate' on the
-        #                   next statement, so the buffer is never
-        #                   allocated.  Enforcing capacity here would refuse
-        #                   a run on the size of a buffer it does not use --
-        #                   the exact defect the charge branch's own
-        #                   ``replicated_factor_used`` escape was added for.
+        # Same capacity gate as the charge branch: one replicated
+        # (q_batch, mu_T, mu_T) c128 eigh operand.  With nq unknown (the
+        # gw_init pre-flight has only the centroid file) the ζ-fit call site
+        # re-resolves with nq and refuses there.
         if (nq is not None and n_rmu_logical is not None
-                and replicated_factor_used
                 and not _replicate_rank_truncate_ok(nq, n_rmu_logical)):
             raise _rank_truncate_capacity_error(
                 nq, n_rmu_logical, channel='transverse')
@@ -2160,10 +2122,7 @@ def _resolve_solver_kind_transverse(mesh_xy: Mesh, override: str = "auto",
                     f"{px}x{py} mesh axes (block-cyclic descriptor rule); "
                     f"demoting to the per-q replicated LU "
                     f"(distributed_lu-equivalent 'off') so the solve runs "
-                    f"at the logical extent.  For a distributed transverse "
-                    f"plan at ANY count use transverse_zeta_solve = "
-                    f"rank_truncate + distributed_zeta_solve = distributed "
-                    f"(pzheevd at the padded extent).", flush=True)
+                    f"at the logical extent.", flush=True)
             return 'lu'
     return kind
 
@@ -2175,7 +2134,6 @@ def _resolve_solver_kind(
     n_rmu: int | None = None,
     nq: int | None = None,
     charge_zeta_solve: str = "cholesky",
-    replicated_factor_used: bool = True,
     transverse_zeta_solve: str = "ridge",
 ) -> str:
     """Single source of truth for the ``auto`` resolution; see docs/architecture/zeta_fit_face_psi_cct.md."""
@@ -2184,12 +2142,10 @@ def _resolve_solver_kind(
     if int(vertex_mu_L) != 0:
         return _resolve_solver_kind_transverse(
             mesh_xy, distributed_lu, n_rmu_logical=n_rmu,
-            transverse_zeta_solve=transverse_zeta_solve,
-            nq=nq, replicated_factor_used=replicated_factor_used)
+            transverse_zeta_solve=transverse_zeta_solve, nq=nq)
     return _resolve_solver_kind_charge(
         mesh_xy, distributed_cholesky, n_rmu=n_rmu, nq=nq,
-        charge_zeta_solve=charge_zeta_solve,
-        replicated_factor_used=replicated_factor_used)
+        charge_zeta_solve=charge_zeta_solve)
 
 
 # Budget for the ζ back-solve's replicated-factor ALL-GATHER, i.e. the
@@ -2277,64 +2233,20 @@ def _resolve_zeta_gather(
     nq: int | None = None,
     *,
     mesh_xy: Mesh | None = None,
-    vertex_mu_L: int = 0,
-    charge_zeta_solve: str = "cholesky",
-    transverse_zeta_solve: str = "ridge",
 ) -> str:
-    """Resolve the ζ back-solve TIER — the input key ``distributed_zeta_solve``; see docs/architecture/zeta_fit_face_psi_cct.md."""
+    """Resolve the whole-tile ζ back-solve tier: ``local`` or ``replicated``.
+
+    ``auto`` is :func:`zeta_auto_tier`.  Both tiers apply the same
+    whole-tile factor (bit-identical); the charge channel's route G reads
+    it on each G tile (docs/architecture/zeta_fit_mubatch.md).
+    """
     tier = str(override or "auto").strip().lower()
-    if tier == "distributed":
-        if int(vertex_mu_L) != 0:
-            if str(transverse_zeta_solve).strip().lower() == 'rank_truncate':
-                # The transverse rank_truncate family (2026-08-01) HAS a
-                # distributed plan: pzheevd at the padded extent, |λ|
-                # cut, 2D-sharded C⁺ — the same guard ladder as the
-                # charge tier (``n_rmu`` here is the PADDED extent, so
-                # the divisibility guard always holds by construction).
-                if mesh_xy is None:
-                    raise ValueError(
-                        "distributed_zeta_solve='distributed' needs the "
-                        "device mesh to resolve its eigh backend; the "
-                        "caller passed none.")
-                _resolve_linalg_backend('eigh', 'distributed', mesh_xy,
-                                        n=n_rmu)
-                return tier
-            # RIDGE family: ONE key drives both channels, so a bispinor
-            # run must not die in the transverse fit after the charge fit
-            # succeeded.  The transverse CCT is Hermitian INDEFINITE — no
-            # eigh-based rank truncation applies to the LU family; its
-            # distributed route is ``distributed_lu = scalapack``
-            # (pXgetrf/pXgetrs, already 2D-sharded end to end, see
-            # solve_zeta's 'scalapack_lu' branch), a different key.
-            # Resolve to the tightest tier this key CAN offer here; the
-            # caller's banner prints the request and the resolution side
-            # by side, so it is visible, not silent.
-            return "local"
-        if str(charge_zeta_solve) != 'rank_truncate':
-            raise ValueError(
-                "distributed_zeta_solve='distributed' requires "
-                f"charge_zeta_solve='rank_truncate'; got "
-                f"{charge_zeta_solve!r}.  The tier's whole content is a "
-                "DISTRIBUTED rank truncation: dropping the near-null "
-                "directions is the charge channel's conditioning cure, and "
-                "a plain distributed inverse without the spectral cut "
-                "silently destroys the physics (ADVICE §6a).")
-        if mesh_xy is None:
-            raise ValueError(
-                "distributed_zeta_solve='distributed' needs the device "
-                "mesh to resolve its eigh backend; the caller passed none.")
-        # Raises with the failed guard named (platform / compiled handler /
-        # process coverage / geometry / divisibility).
-        _resolve_linalg_backend('eigh', 'distributed', mesh_xy, n=n_rmu)
-        return tier
     if tier in ("replicated", "local"):
         return tier
     if tier != "auto":
-        # ``per_q`` (one replicated (mu, mu) tile gathered per q per r-chunk)
-        # was retired 2026-09-23 for ``local``, which never moves a factor.
         raise ValueError(
             f"distributed_zeta_solve={override!r} invalid; expected "
-            f"auto / replicated / local / distributed.")
+            f"auto / replicated / local.")
     if nq is None or n_rmu is None:
         return "replicated"
     return zeta_auto_tier(
@@ -2461,26 +2373,6 @@ def _certify_the_cut(spectrum, keep, *, where: str, kappa_certified,
         return 0
 
     jax.lax.cond(fired, _say, lambda _: 0, 0)
-
-
-def _close_the_cut_padded(lam, keep, *, n_log: int, n_pad: int, where: str):
-    """:func:`_close_the_cut` for the distributed tier's PADDED spectrum; see docs/architecture/zeta_fit_face_psi_cct.md."""
-    n_extra = int(n_pad) - int(n_log)
-    if n_extra <= 0:
-        return _close_the_cut(lam, keep, where=where)
-    spec_phys, pad = _withdraw_identity_pad(lam, n_log=n_log, n_pad=n_pad)
-    keep_phys = _close_the_cut(spec_phys, keep & ~pad, where=where)
-    return keep_phys | (keep & pad)
-
-
-def _withdraw_identity_pad(lam, *, n_log: int, n_pad: int):
-    """``(spectrum with the identity pad demoted to 0, pad mask)``; see docs/architecture/zeta_fit_face_psi_cct.md."""
-    n_extra = int(n_pad) - int(n_log)
-    if n_extra <= 0:
-        return lam, jnp.zeros(lam.shape, dtype=bool)
-    is_one = (lam == 1.0)
-    pad = is_one & (jnp.cumsum(is_one.astype(jnp.int32), axis=-1) <= n_extra)
-    return jnp.where(pad, 0.0, lam), pad
 
 
 def _charge_factor_math(C_log, *, mode: str, n_log: int,
@@ -2748,24 +2640,6 @@ def _qparallel_announce(nq: int, n_rmu: int, n_log: int,
           f"q-pad {q_axis.pad}); factors are "
           f"bit-identical to the all-ranks execution "
           f"(LORRAX_ZETA_QPARALLEL=0 restores it)", flush=True)
-    if ndev > int(nq):
-        # The fold SATURATES at P = nq: q is its only parallel axis, so
-        # every rank past nq idles for the whole factor stage (measured:
-        # 54/64 ranks idle for 53.7 s = 22.4% of GW wall at nq=10,
-        # b600/P=64, job 7885316).  Auto stays on this plan — the
-        # distributed tier is a different (equally valid) gauge and auto
-        # never silently crosses that line — but the operator gets the
-        # measured crossover: at P/nq = 6.4 the distributed tier ran the
-        # factor 1.64x faster and GW wall 0.83x (job 7885323).
-        print(f"  [zeta factor] NOTE: the q-parallel fold saturates at "
-              f"P = nq — {ndev - int(nq)} of {ndev} ranks idle for this "
-              f"stage (1 q/rank ceiling).  At this P/nq "
-              f"({ndev / int(nq):.1f}) consider "
-              f"distributed_zeta_solve = distributed (pzheevd, whole-mesh "
-              f"P-scaling; measured factor 1.64x faster / GW wall 0.83x "
-              f"at P/nq=6.4, jobs 7885316/7885323 — NOTE: a different "
-              f"gauge, ~kappa*eps vs this plan, not bit-identical).",
-              flush=True)
 
 
 def _factor_c_q_replicated_qparallel(
@@ -3107,23 +2981,12 @@ def _qparallel_announce_transverse(nq: int, n_rmu: int, n_log: int,
           f"factors are bit-identical to the all-ranks execution "
           f"(LORRAX_ZETA_QPARALLEL=0 restores it)", flush=True)
     if ndev > int(nq):
-        # Same P = nq saturation ceiling as the charge fold (q is the
-        # only parallel axis; the b600/P=64 measurement, job 7885316,
-        # applies shape-for-shape).  The distributed transverse routes:
-        # ridge family -> distributed_lu = scalapack (needs mu_T
-        # divisible by both mesh axes); rank_truncate family ->
-        # distributed_zeta_solve = distributed (pzheevd at the padded
-        # extent, any count).  Both are different gauges; auto never
-        # promotes.
         print(f"  [zeta transverse factor] NOTE: the q-parallel fold "
               f"saturates at P = nq — {ndev - int(nq)} of {ndev} ranks "
-              f"idle for this stage (1 q/rank ceiling; same shape as the "
-              f"charge fold's measured ceiling, job 7885316).  "
-              f"Distributed transverse plans: distributed_lu = scalapack "
-              f"(ridge family) or transverse_zeta_solve = rank_truncate "
-              f"+ distributed_zeta_solve = distributed (any centroid "
-              f"count); both are a different gauge, not bit-identical.",
-              flush=True)
+              f"idle for this stage (1 q/rank ceiling).  The distributed "
+              f"transverse plan is the LU family under `linalg = "
+              f"distributed` (needs mu_T divisible by both mesh axes); a "
+              f"different gauge, not bit-identical.", flush=True)
 
 
 def _factor_c_q_transverse_distributed_lu(
@@ -3162,39 +3025,6 @@ def _factor_c_q_transverse_distributed_lu(
     # the descriptor build.
     return linalg_factor('solve_lu', C_reg, mesh_xy,
                          backend=backend, n=n_log)
-
-
-# =============================================================================
-# The `distributed` ζ tier — 2D-sharded rank truncation and back-solve
-# =============================================================================
-#
-# LAYOUT CONTRACT for everything in this section (nothing here ever
-# replicates an O(μ²) object):
-#
-#     C_q, C⁺   (nq, μ, μ)  P(None, 'x', 'y')   rows on 'x', cols on 'y'
-#     V         (nq, μ, μ)  P(None, 'x', 'y')   eigenvectors as COLUMNS
-#     λ         (nq, μ)     replicated          ascending, IDENTICAL per rank
-#     Z, ζ      (nq, μ, r)  P(None, 'x', 'y')   μ on 'x', r on 'y'
-#
-# Z arriving on 'x'/'y' rather than columns-on-the-FLAT-mesh is the whole
-# reason this works.  Scorecard J.9 recorded the failure of the first
-# attempt: with Z at P(None, None, ('x','y')) the ranks sharing a `y` index
-# hold UNRELATED column blocks, so a psum over 'x' sums partial products
-# built from different columns — NaNs, silently (the gate caught them only
-# as float-count deficits in eqp).  A block-sharded (μ,μ) operator requires
-# the ranks that share a column block to cooperate on the μ contraction, so
-# this tier keeps Z in the layout it is BUILT in (P(None,'x','y')) and never
-# does the `_reshard_z` two-step all-to-all at all.  Net communication is
-# strictly LOWER than the replicated tier — see the accounting in
-# :func:`_distributed_pinv_apply`.
-
-_dist_factor_cache: dict = {}   # distributed rank-truncate factor kernel
-_dist_solve_cache: dict = {}    # distributed back-solve GEMM kernel
-
-
-def _distributed_q_batch(nq: int, per_q_bytes: int) -> int:
-    """q-batch size bounding the GEMM's gathered transient; see docs/architecture/zeta_fit_face_psi_cct.md."""
-    return max(1, min(int(nq), _ZETA_GATHER_MAX_BYTES // max(1, per_q_bytes)))
 
 
 # --------------------------------------------------------------------------
@@ -3320,275 +3150,6 @@ def _chunk_log(where: str, nq: int, qb: int, per_q_bytes: int) -> None:
           flush=True)
 
 
-def _factor_c_q_distributed_rank_truncate(
-    C_q: jax.Array, mesh_xy: Mesh, n_rmu_logical: int,
-    zeta_rcond: float = ZETA_RCOND_DEFAULT,
-    indefinite: bool = False,
-    distrib_la_batched_route: str = "batch_reshard",
-) -> jax.Array:
-    """Truncated pseudo-inverse ``C⁺``, formed and kept 2D-SHARDED; see docs/architecture/zeta_fit_face_psi_cct.md."""
-    nq, n_pad, _ = C_q.shape
-    n_log = int(n_rmu_logical)
-    if indefinite:
-        # The input arrives identity-padded (factor_c_q's entry pad).
-        # Restore exact-zero pad rows/cols INCLUDING the diagonal — a
-        # local elementwise mask, no collective.
-        rcond = float(zeta_rcond)   # transverse_zeta_rcond: no env twin
-        if n_pad > n_log:
-            xy_sh_in = NamedSharding(mesh_xy, P(None, 'x', 'y'))
-            _row_log = (jnp.arange(n_pad) < n_log)
-            C_q = jax.lax.with_sharding_constraint(
-                C_q * (_row_log[None, :, None] & _row_log[None, None, :]),
-                xy_sh_in)
-    else:
-        # DEPRECATED env form — the input key is the record (scorecard AV).
-        rcond = _deprecated_env_float(
-            "LORRAX_ZETA_RCOND", "zeta_rcond", zeta_rcond)
-    rank_log = True
-
-    # ONE resolved plan, then one call.  ``'distributed'`` (not a hard-coded
-    # 'scalapack') is deliberate and is the SAME name ``_resolve_zeta_gather``
-    # approved: the platform default (ScaLAPACK on cpu, cuSOLVERMp on CUDA,
-    # ``resolve._DISTRIBUTED_DEFAULT``) is then chosen in ONE place instead of
-    # two that can disagree — naming scalapack here made a CUDA mesh pass the
-    # tier's resolve guard and then hit the ScaLAPACK backend's host-only
-    # check at call time.  ``plan.batched`` uses ScaLAPACK's real batched entry point
-    # (one descriptor + one workspace for the whole (nq, μ, μ) stack) and
-    # falls back to a per-q loop for a backend that has none, so this call
-    # site does not encode which is which.
-    eigh_plan = linalg_plan(
-        'eigh', mesh_xy, backend='distributed', n=int(n_pad),
-        batched_route=distrib_la_batched_route)
-    W, V = eigh_plan.batched(C_q)
-
-    px = int(mesh_xy.shape['x'])
-    py = int(mesh_xy.shape['y'])
-    # The two collectives `_pinv_local` emits, per q:
-    #   all_gather('x')   (μ/Px, μ/Py) -> (μ, μ/Py)   = μ²/Py · 16 B
-    #   psum_scatter('y') (μ/Px, μ)    -> (μ/Px, μ/Py) = μ²/Px · 16 B
-    # The BIGGER of the two sets the q-block (see `_chunk_q`).
-    per_q_coll = max(n_pad * (n_pad // py), (n_pad // px) * n_pad) * 16
-    qb = _chunk_q(nq, per_q_coll)
-    _chunk_log('C+ formation (pinv)', nq, qb, per_q_coll)
-
-    key = ('dist_rank_trunc', _mesh_key(mesh_xy), int(nq), int(n_pad), n_log,
-           float(rcond), bool(rank_log), int(qb), bool(indefinite))
-    if key not in _dist_factor_cache:
-        out_sh = NamedSharding(mesh_xy, P(None, 'x', 'y'))
-
-        @partial(shard_map, mesh=mesh_xy,
-                 in_specs=(P(None, 'x', 'y'), P(None, None)),
-                 out_specs=P(None, 'x', 'y'), check_vma=False)
-        def _pinv_local(V_loc, inv_lam):
-            # C⁺[i, j] = Σ_k V[i,k]·inv_k·conj(V[j,k]).
-            #   V_loc     (nqb, μ/Px, μ/Py)  rows i on 'x', cols k on 'y'
-            #   inv_lam   (nqb, μ)           replicated
-            # My k-block is the 'y' slice of the replicated inv vector.
-            ncol = V_loc.shape[2]
-            y_i = jax.lax.axis_index('y')
-            inv_my = jax.lax.dynamic_slice_in_dim(
-                inv_lam, y_i * ncol, ncol, axis=1)          # (nqb, μ/Py)
-            Vs = V_loc * inv_my[:, None, :].astype(V_loc.dtype)
-            # The ONE transpose-class collective: rows j live on the mesh
-            # ROW indexed by their block, so getting "all j, my k-block"
-            # is an all-gather along 'x'.  μ²/Py per rank per q-batch.
-            V_all_rows = jax.lax.all_gather(
-                V_loc, 'x', axis=1, tiled=True)             # (nqb, μ, μ/Py)
-            partial_ij = jnp.einsum('qik,qjk->qij', Vs, jnp.conj(V_all_rows))
-            # Sum the k-blocks and land j on 'y' in one reduce-scatter —
-            # never materialising the (μ/Px, μ) full-row product globally.
-            return jax.lax.psum_scatter(
-                partial_ij, 'y', scatter_dimension=2, tiled=True)
-
-        @jax.jit
-        def _masks(lam):
-            if indefinite:
-                # TRANSVERSE mode: cut on |λ| (Hermitian indefinite).
-                # The pad modes are exactly 0 (zero-padded input), so
-                # they never set σ_max and are dropped for every τ > 0
-                # — no positional pad logic needed at all.
-                sig = jnp.abs(lam)
-                sig_max = jnp.max(sig, axis=-1, keepdims=True)
-                keep = sig > (rcond * sig_max)
-                keep = _close_the_cut(
-                    lam, keep,
-                    where="zeta transverse rank_truncate/distributed")
-                # Pad modes are exactly 0 here (zero-padded input), so they
-                # carry no weight and cannot move either finding; no pad
-                # withdrawal is needed on this branch.
-                _certify_the_cut(
-                    lam, keep,
-                    where="zeta transverse rank_truncate/distributed",
-                    kappa_certified=None, rcond=rcond)
-                inv = jnp.where(keep, 1.0 / jnp.where(keep, lam, 1.0), 0.0)
-                if rank_log:
-                    sig_keep_min = jnp.min(
-                        jnp.where(keep, sig, jnp.inf), axis=-1)
-                    n_keep = jnp.sum(keep, axis=-1)
-                    jax.debug.print(
-                        "[zeta transverse rank_truncate/distributed] "
-                        "n_pad={n} rcond={rc:.1e} n_keep/q={k} "
-                        "sig_max/q={mx} sig_min_kept/q={mn} kappa/q={kp} "
-                        "sdrop_hi/q={dh}",
-                        n=n_pad, rc=rcond, k=n_keep,
-                        mx=sig_max[..., 0], mn=sig_keep_min,
-                        kp=sig_max[..., 0] / sig_keep_min,
-                        dh=jnp.max(jnp.where(keep, -jnp.inf, sig), axis=-1),
-                        ordered=False)
-                return inv
-            # λ_max must be the LOGICAL block's, not the padded matrix's,
-            # or the cut moves with the device count.  The padded matrix is
-            # exactly block-diagonal [C_log 0; 0 I], so its spectrum is
-            # spec(C_log) ∪ {1}×(n_pad−n_log).  Ascending order then makes
-            # this exact: if λ_max > 1 the top mode belongs to C_log; if
-            # λ_max ≤ 1 the (n_pad−n_log) pad ones ARE the top modes, so
-            # C_log's largest sits at index n_log−1.  (n_pad == n_log makes
-            # both branches the same element.)
-            lam_max = jnp.where(lam[..., -1:] > 1.0,
-                                lam[..., -1:],
-                                lam[..., n_log - 1:n_log])
-            keep = lam > (rcond * lam_max)
-            keep = _close_the_cut_padded(
-                lam, keep, n_log=n_log, n_pad=n_pad,
-                where="zeta rank_truncate/distributed")
-            # THE GATE, on the PHYSICAL spectrum: the identity pad is
-            # withdrawn first (shared helper), or its (n_pad − n_log)
-            # exactly-1.0 modes would be counted as discarded directions and
-            # the finding would become a function of the DEVICE COUNT — the
-            # very defect this route's ``lam_max`` note exists to prevent.
-            _spec_phys, _pad_mask = _withdraw_identity_pad(
-                lam, n_log=n_log, n_pad=n_pad)
-            _certify_the_cut(
-                _spec_phys, keep,
-                where="zeta rank_truncate/distributed",
-                kappa_certified=rank_criterion.KAPPA_CERTIFIED_GRAM,
-                rcond=rcond, exclude=_pad_mask)
-            inv = jnp.where(keep, 1.0 / jnp.where(keep, lam, 1.0), 0.0)
-            if rank_log:
-                # Same conditioning signal the replicated route prints —
-                # n_keep/q is what tells you n_μ has over-completed the
-                # pair-density rank — plus the same three audit fields (see
-                # the replicated route's note and ``common/rank_criterion``):
-                # the achieved amplification κ_eff = λ_max/λ_min(kept), which
-                # the cut exists to bound at 1/rcond; the top of the discarded
-                # band; and the margin to the §R19 cliff.
-                # CAVEAT specific to this route: ``lam`` is the spectrum of
-                # the PADDED matrix [C_log 0; 0 I], so the (n_pad − n_log)
-                # eigenvalues exactly equal to 1 are pad, not physics.  They
-                # are dropped whenever rcond·λ_max > 1 (always, at production
-                # λ_max ~ 1e11 and rcond 1e-8), so n_keep is clean — but
-                # ldrop_hi can be the pad value 1.0 rather than a physical λ.
-                lam_keep_min = jnp.min(jnp.where(keep, lam, jnp.inf), axis=-1)
-                n_keep = jnp.sum(keep, axis=-1)
-                n_loose = jnp.sum(lam > (rcond * 1e-4 * lam_max), axis=-1)
-                jax.debug.print(
-                    "[zeta rank_truncate/distributed] n_pad={n} rcond={rc:.1e} "
-                    "n_keep/q={k} lam_max/q={mx} lam_min_kept/q={mn} "
-                    "kappa/q={kp} ldrop_hi/q={dh} margin/q={mg}",
-                    n=n_pad, rc=rcond, k=n_keep,
-                    mx=lam_max[..., 0], mn=lam_keep_min,
-                    kp=lam_max[..., 0] / lam_keep_min,
-                    dh=jnp.max(jnp.where(keep, -jnp.inf, lam), axis=-1),
-                    mg=(n_loose - n_keep) / jnp.maximum(n_keep, 1),
-                    ordered=False)
-            return inv
-
-        @partial(jax.jit, out_shardings=out_sh, donate_argnums=(2,))
-        def _block(V_blk, inv_blk, acc, q0):
-            return jax.lax.dynamic_update_slice(
-                acc, _pinv_local(V_blk, inv_blk), (q0, 0, 0))
-
-        # Zeros in the OUTPUT layout.  `V` already carries it, so this is a
-        # local fill on every rank — no collective, no host round-trip.
-        _zeros = jax.jit(jnp.zeros_like, out_shardings=out_sh)
-
-        _dist_factor_cache[key] = (_masks, _block, _zeros)
-
-    _masks, _block, _zeros = _dist_factor_cache[key]
-    inv = _masks(W)
-    C_pinv = _zeros(V)
-    # Host-level q-block loop: ONE XLA execution per block, so the emitted
-    # all_gather / psum_scatter payloads are bounded by construction and
-    # cannot be re-combined by a compiler pass (see the AF note above).
-    # At most two compiled shapes (full blocks + the remainder).
-    for q0 in range(0, nq, qb):
-        q1 = min(q0 + qb, nq)
-        C_pinv = _block(V[q0:q1], inv[q0:q1], C_pinv, q0)
-    return C_pinv
-
-
-def _distributed_pinv_apply(
-    C_pinv: jax.Array, Z_q: jax.Array, mesh_xy: Mesh, n_rmu_logical: int,
-) -> jax.Array:
-    """ζ = C⁺ Z as a stacked GEMM with BOTH operands 2D-sharded; see docs/architecture/zeta_fit_face_psi_cct.md."""
-    nq, n_pad, _ = C_pinv.shape
-    n_zcols = int(Z_q.shape[2])
-    px = int(mesh_xy.shape['x'])
-    py = int(mesh_xy.shape['y'])
-    xy_sh = NamedSharding(mesh_xy, P(None, 'x', 'y'))
-    n_log = int(n_rmu_logical)
-
-    per_q_bytes = (n_pad * (n_pad // px) + n_pad * (n_zcols // py)) * 16
-    # TWO bounds, and they answer different questions (scorecard AF):
-    #   `_distributed_q_batch`  — how much gathered data may be LIVE
-    #                             (LORRAX_ZETA_GATHER_CAP_GIB, 4 GiB).
-    #   `_chunk_q`              — how many bytes ONE collective instruction
-    #                             may hand to the transport in a single shot
-    #                             (LORRAX_COLLECTIVE_CHUNK_MB, 128 MB).
-    # The GEMM emits two gathers per q: C⁺'s row block over 'y'
-    # (μ·μ/Px·16) and Z's column block over 'x' (μ·r/Py·16).  The second is
-    # the larger at production r_chunk and is what sets the block.
-    per_q_coll = max(n_pad * (n_pad // px), n_pad * (n_zcols // py)) * 16
-    qb = min(_distributed_q_batch(nq, per_q_bytes),
-             _chunk_q(nq, per_q_coll))
-    _chunk_log('C+ back-solve (GEMM)', nq, qb, per_q_coll)
-
-    # NOTE on the eager ``C_pinv[q0:q1]`` / ``Z_q[q0:q1]`` slices below:
-    # the retired per_q tier sliced INSIDE its jit off a traced q, which
-    # gave one compiled shape for the whole loop.  Here the slices are
-    # eager, so a non-dividing ``nq`` gives a second compiled shape for the remainder block — bounded at two, and
-    # deliberate: the q-batch is chosen from a BYTE budget, so making the
-    # block shape uniform would mean padding nq and factoring q-blocks
-    # that do not exist.  Two compiles + two transient slices per r-chunk
-    # against ~nq of each on the traced-q form; at MoS2 12x12 (nq=144,
-    # qb=116) that is 2 blocks per r-chunk.
-    key = ('dist_pinv_apply', _mesh_key(mesh_xy), int(nq), int(n_pad), n_log,
-           n_zcols, int(qb))
-    if key not in _dist_solve_cache:
-        @partial(shard_map, mesh=mesh_xy,
-                 in_specs=(P(None, 'x', 'y'), P(None, 'x', 'y')),
-                 out_specs=P(None, 'x', 'y'), check_vma=False)
-        def _gemm(A_loc, B_loc):
-            A_row = jax.lax.all_gather(A_loc, 'y', axis=2, tiled=True)
-            B_col = jax.lax.all_gather(B_loc, 'x', axis=1, tiled=True)
-            return jnp.einsum('qik,qkj->qij', A_row, B_col)
-
-        # Pad rows of ζ must be exactly zero (the contract every other
-        # route gets from ``solve_at_logical``'s zero-refill).  Here they
-        # are only ~1e-16 noise from C⁺'s inter-block coupling, so mask
-        # them — a local elementwise op, no collective.
-        row_keep = (jnp.arange(n_pad) < n_log)
-
-        @partial(jax.jit, donate_argnums=(2,))
-        def _block(A_blk, B_blk, zeta_acc, q0):
-            out = _gemm(A_blk, B_blk)
-            out = jnp.where(row_keep[None, :, None], out, 0)
-            return jax.lax.dynamic_update_slice(zeta_acc, out, (q0, 0, 0))
-
-        _dist_solve_cache[key] = _block
-
-    apply_block = _dist_solve_cache[key]
-    Z_q = jax.lax.with_sharding_constraint(Z_q, xy_sh)
-    zeta = jnp.zeros_like(Z_q)
-    # Python loop, not lax.scan: a scan over a sharded accumulator makes
-    # SPMD replicate it (documented at solve_zeta's q-batch loop).  At most
-    # two compiled shapes (full blocks + the remainder).
-    for q0 in range(0, nq, qb):
-        q1 = min(q0 + qb, nq)
-        zeta = apply_block(C_pinv[q0:q1], Z_q[q0:q1], zeta, q0)
-    return zeta
-
-
 def factor_c_q(
     C_q: jax.Array,
     mesh_xy: Mesh,
@@ -3630,10 +3191,8 @@ def factor_c_q(
     #   'lu'           -> (LU embedded at padded extent, perm)  [local]
     #   'scalapack_lu' -> (FactorToken, None)   [the ipiv is INSIDE it]
     #   'cusolvermp_lu'-> (FactorToken, None)   [CUDA pivots INSIDE it]
-    #   'transverse_rank_truncate'             -> (C⁺ at padded extent
-    #                     via the replicated scaffolding, None)
-    #   'distributed_transverse_rank_truncate' -> (C⁺ kept 2D-sharded
-    #                     at padded extent, None)
+    #   'transverse_rank_truncate' -> (C⁺ at padded extent via the
+    #                     replicated scaffolding, None)
     # The piv SLOT survives for the local 'lu' plan, whose (LU, perm) is
     # jax's own ``lax.linalg.lu_solve`` pair and not a library handle at
     # all.  Every DISTRIBUTED factor now travels in the token instead, so
@@ -3652,15 +3211,6 @@ def factor_c_q(
                 C_q, mesh_xy, n_rmu_logical, zeta_ridge=0.0,
                 charge_zeta_solve='transverse_rank_truncate',
                 zeta_rcond=float(transverse_zeta_rcond)), None
-        if t_kind == 'distributed_transverse_rank_truncate':
-            # DISTRIBUTED plan: pzheevd at the PADDED extent with
-            # zeroed (exactly inert) pad modes — the charge distributed
-            # machinery in indefinite mode.
-            return _factor_c_q_distributed_rank_truncate(
-                C_q, mesh_xy, n_rmu_logical,
-                zeta_rcond=float(transverse_zeta_rcond),
-                indefinite=True,
-                distrib_la_batched_route=distrib_la_batched_route), None
         if t_kind in ('scalapack_lu', 'cusolvermp_lu'):
             # A block-cyclic token cannot enter distrib_la's face-to-batch
             # schedule.  Factor ONCE with the existing local-JAX kernel and
@@ -3715,17 +3265,6 @@ def factor_c_q(
 
     Pr = mesh_xy.shape['x']
     Pc = mesh_xy.shape['y']
-
-    # `distributed` ζ tier: distributed eigh -> local identical truncation
-    # -> 2D-sharded C⁺.  Checked FIRST because it is an explicit opt-in
-    # (``distributed_zeta_solve = distributed``) and must not be swallowed
-    # by the single-device / 1-D shortcut below — pzheevd runs on a 1×1
-    # mesh too, and the route must stay the one the caller asked for so the
-    # back-solve sees the operator it expects.
-    if solver_kind == 'distributed_rank_truncate':
-        return _factor_c_q_distributed_rank_truncate(
-            C_q, mesh_xy, n_rmu_logical, zeta_rcond=zeta_rcond,
-            distrib_la_batched_route=distrib_la_batched_route)
 
     # Replicated dense factor — the mesh-INVARIANT charge factor.  Fires for
     # the 'replicated_cholesky' / 'replicated_rank_truncate' auto picks
@@ -4485,21 +4024,6 @@ def solve_zeta(
                     f"jnp.linalg.solve path so the solve can run at the "
                     f"logical extent.", flush=True)
             solver_kind = 'lu'
-
-    if solver_kind in ('distributed_rank_truncate',
-                       'distributed_transverse_rank_truncate'):
-        # `distributed` tier: L_q IS the truncated pseudo-inverse C⁺, kept
-        # 2D-sharded.  ζ = C⁺Z is one stacked GEMM with BOTH operands at
-        # P(None,'x','y') — no factor gather, and no Z re-layout (Z is
-        # consumed in the layout z_q_from_psi_sm builds it in, which is
-        # exactly what scorecard J.9's flat-mesh column sharding made
-        # impossible).  The transverse spelling (2026-08-01) is the SAME
-        # back-solve on the transverse C⁺ (formed in indefinite mode);
-        # it runs at the padded extent by design, so it must NOT enter
-        # the logical-extent mu_pad guard above this dispatch.
-        return _distributed_backsolve(
-            Z_q, mesh_xy,
-            lambda Z: _distributed_pinv_apply(L_q, Z, mesh_xy, n_log))
 
     if solver_kind in ('cusolvermp_lu', 'scalapack_lu'):
         return _solve_zeta_fused_lu(

@@ -302,10 +302,7 @@ def _worker_resolver() -> int:
     import jax
     from jax.sharding import Mesh
 
-    from isdf.core import (
-        _resolve_solver_kind_transverse,
-        _resolve_zeta_gather,
-    )
+    from isdf.core import _resolve_solver_kind_transverse
 
     devs = jax.devices()
     if len(devs) < _NDEV:
@@ -341,12 +338,6 @@ def _worker_resolver() -> int:
         out["bad_family_raises"] = False
     except ValueError:
         out["bad_family_raises"] = True
-    # The back-solve tier key: 'distributed' on a RIDGE-family transverse
-    # channel still resolves to local (the documented one-key-two-
-    # channels demotion).
-    out["ridge_dist_tier"] = _resolve_zeta_gather(
-        "distributed", n_rmu=64, nq=4, mesh_xy=mesh22, vertex_mu_L=1,
-        charge_zeta_solve="rank_truncate", transverse_zeta_solve="ridge")
     print(json.dumps(out))
     return 0
 
@@ -428,7 +419,6 @@ def test_resolver_semantics():
         "explicit distributed_lu + rank_truncate must refuse")
     assert out["ridge_auto"] == "lu"
     assert out["bad_family_raises"]
-    assert out["ridge_dist_tier"] == "local"
 
 
 if __name__ == "__main__":

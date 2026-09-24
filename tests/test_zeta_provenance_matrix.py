@@ -183,12 +183,12 @@ def test_8b02c72_tier_exception_regression(stub_reader):
     new = _prov(_cfg(bispinor=False))
     path = stub_reader(_strip(new, ("distributed_zeta_solve",)))
     assert gw_init._zeta_reuse_ok(path, new, CENTS, print_fn=lambda *a: None)
-    # distributed rerun over the same legacy stamp: refit.
-    new_d = _prov(_cfg(bispinor=False, tier="distributed"))
-    path = stub_reader(_strip(new_d, ("distributed_zeta_solve",)))
+    # A stamp from the deleted distributed tier (a different gauge): refit.
+    old = json.loads(new)
+    old["distributed_zeta_solve"] = "distributed"
+    path = stub_reader(json.dumps(old, sort_keys=True))
     msgs = []
-    assert not gw_init._zeta_reuse_ok(path, new_d, CENTS,
-                                      print_fn=msgs.append)
+    assert not gw_init._zeta_reuse_ok(path, new, CENTS, print_fn=msgs.append)
     assert any("distributed_zeta_solve" in m for m in msgs)
 
 

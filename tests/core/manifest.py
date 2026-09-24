@@ -37,6 +37,8 @@ CORE_NODES = {
     "tests/test_slab_io_hostile_geometry.py::test_valid_shape_override_that_overruns_the_dataset_refuses",
     "tests/test_slab_io_hostile_geometry.py::test_nondivisible_sharded_extent_refuses_naming_the_padded_shape",
     "tests/test_slab_io_hostile_geometry.py::test_one_dim_sharded_by_both_mesh_axes_uses_the_axis_PRODUCT",
+    "tests/test_slab_io_read_after_write.py::test_a_read_after_a_failed_write_raises_the_writer_error",
+    "tests/test_slab_io_read_after_write.py::test_every_read_door_drains_through_the_agreement[read_slab]",
     # Strict deck vocabulary and routing.
     "tests/test_deck_dials.py::test_linalg_dial_resolves_one_complete_profile[local-local-auto-auto-auto-auto]",
     "tests/test_deck_dials.py::test_linalg_dial_resolves_one_complete_profile[distributed-distributed-distributed-distributed-distributed-distributed]",

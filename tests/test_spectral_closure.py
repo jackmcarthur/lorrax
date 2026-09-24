@@ -495,79 +495,6 @@ def test_the_jit_face_never_snaps_through_an_exactly_null_tail():
         f"device count, which is the defect this whole family exists to stop")
 
 
-def test_the_padded_distributed_helper_ignores_the_identity_pad():
-    """The distributed tier's ``[C_log 0; 0 I]`` pad must not join a block.
-
-    Its pad eigenvalues are exactly 1.0 and exactly degenerate with each
-    other, so a walk that reached them would move all ``n_pad - n_log`` of
-    them at once and the retained rank would become a function of the DEVICE
-    COUNT.  That is true in BOTH directions — ``keep_block`` would admit them
-    and ``drop_block`` would discard them — so the withdrawal in
-    ``_close_the_cut_padded`` is direction-independent and so is this gate.
-
-    SWEPT OVER FOUR PAD SIZES, and the sweep is the assertion: the physical
-    retained count must be the SAME number at every one.  A single-``n_pad``
-    check cannot see a device-count dependence at all.
-
-    THE FIRED CHECK IS NOT DECORATION.  Under ``drop_block`` the retained
-    count can only fall, so a bound of the form ``n_kept <= keep.sum() + 2``
-    — which is what this cell asserted before the direction flip — is
-    satisfied by arithmetic rather than by the guard, and would pass on a
-    completely broken withdrawal.  The gate therefore requires the guard to
-    have FIRED on every pad size before it believes the invariance.
-    """
-    jax = pytest.importorskip("jax")
-    jnp = jax.numpy
-    from isdf.core import _close_the_cut_padded
-
-    n_log = 7
-    # GEOMETRY MATTERS, and it is the opposite of what the keep direction
-    # needed.  ``drop_block`` walks UP from the cut, so the pad is only in
-    # danger when it lies ABOVE the cut and is degenerate with the values
-    # straddling it.  So: a 4-member block just below 1.0 (within rtol of it,
-    # hence linked to the pad), the pad's exact 1.0s sitting above the cut and
-    # RETAINED, and one large value above everything to stop the walk — this
-    # last so the case is a pad question rather than an ``empties`` one.
-    #
-    # A block planted anywhere else makes this gate pass with the withdrawal
-    # DELETED (verified by mutation), which is how this construction was
-    # arrived at rather than guessed.
-    block = np.array([1.0 * (1 - k * 1e-9) for k in (1, 2, 3, 4)])
-    phys = np.concatenate([np.array([50.0]), block, np.array([1e-2, 3e-4])])
-    assert len(phys) == n_log
-    rcond = (1 - 2.5e-9) / 50.0        # lam_max is 50.0; cut inside the block
-
-    kept_phys, kept_pad, fired = [], [], []
-    for n_pad in (12, 16, 24, 36):
-        n_extra = n_pad - n_log
-        lam = np.sort(np.concatenate([phys, np.ones(n_extra)]))
-        keep = lam > (rcond * lam.max())
-        pad_mask = (lam == 1.0)       # the pad exactly; no block member is
-        assert pad_mask.sum() == n_extra
-        out = jax.jit(lambda a, b, np_=n_pad: _close_the_cut_padded(
-            a, b, n_log=n_log, n_pad=np_, where="gate"))(
-                jnp.asarray(lam)[None, :], jnp.asarray(keep)[None, :])
-        o = np.asarray(out)[0]
-        fired.append(int((keep & ~pad_mask).sum()) != int((o & ~pad_mask).sum()))
-        kept_phys.append(int((o & ~pad_mask).sum()))
-        kept_pad.append(int((o & pad_mask).sum()) - int((keep & pad_mask).sum()))
-
-    assert all(fired), (
-        "the guard never fired on any pad size, so everything below is "
-        "vacuous — this construction no longer straddles a block")
-    assert kept_pad == [0, 0, 0, 0], (
-        f"the block walk reached the identity pad and changed its retained "
-        f"set by {kept_pad} at n_pad = 12/16/24/36.  Those directions are "
-        f"exactly 1.0 and exactly degenerate with each other, so whatever the "
-        f"walk does to one it does to all of them — and how many there are is "
-        f"the DEVICE COUNT.")
-    assert len(set(kept_phys)) == 1, (
-        f"the physical retained rank depends on the pad size: {kept_phys} "
-        f"for n_pad = 12/16/24/36.")
-
-
-# ---------------------------------------------------------------------------
-# 6. Deferred refusal, for the seams that fire inside a jit
 # ---------------------------------------------------------------------------
 
 def test_a_device_finding_is_refused_at_the_next_host_seam_under_strict():
@@ -882,7 +809,7 @@ def test_every_wired_site_imports_the_shared_guard():
     import pathlib
     root = pathlib.Path(__file__).resolve().parents[1] / "src"
     manifest = {
-        "isdf/core.py": ["_close_the_cut", "_close_the_cut_padded"],
+        "isdf/core.py": ["_close_the_cut"],
         "common/zeta_projection.py": ["close_keep_mask"],
         "gw/downfold.py": ["resolve_spectral_cut", "cluster_at_cut",
                            "star_stability"],

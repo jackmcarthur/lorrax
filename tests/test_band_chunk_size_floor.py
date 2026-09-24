@@ -284,15 +284,10 @@ def test_auto_solve_route_prices_the_tier_the_resolver_picks():
             == local.peak_breakdown["C_fit_one_rchunk"])
 
 
-def test_nonreplicated_solve_routes_do_not_advertise_a_fake_q_batch():
+def test_the_local_solve_route_does_not_advertise_a_fake_q_batch():
     local = _solve_route_plan("local")
-    distributed = _solve_route_plan("distributed")
-    assert local.q_chunk == distributed.q_chunk == 1
+    assert local.q_chunk == 1
     assert local.zeta_solve_memory_route.startswith("local")
-    assert distributed.zeta_solve_memory_route.startswith("distributed")
-    # The q-local RHS/solution residency is priced on top of the RHS stacks.
-    assert (local.peak_breakdown["C_fit_one_rchunk"]
-            >= distributed.peak_breakdown["C_fit_one_rchunk"])
 
 
 # ---------------------------------------------------------------------------
