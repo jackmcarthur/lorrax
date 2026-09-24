@@ -11,7 +11,8 @@ import jax.numpy as jnp
 import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
-from .greens_function_kernel import build_G
+from .greens_function_kernel import (build_G, spin_pair_rows, spin_pairs_needed,
+                                     unfold_parent_faces)
 from .head_correction import static_head_terms_to_kij
 from .wavefunction_bundle import project as _project
 from .wavefunction_bundle import (SIGMA_CONV_G7D_SPEC, V_FFT5D_SPEC,
@@ -375,6 +376,46 @@ def _make_cohsex_kernels_face(mesh_xy: Mesh, face_shape, _convolve,
         c = wfns.green_parent
         return c.psi_mun, c.psi_nmu, c
 
+    # Spin-pair streaming (A4) when the whole-spin G_occ, its unfold
+    # transient and Σ_k (~2 G_tile) exceed the device target: each (a, b)
+    # block is built at full k, convolved, and projected on the parents' a
+    # and b spinor rows; the band sum over pairs is the same Σ.
+    stream = (k_unfold_plan is not None and ns_g > 1 and spin_pairs_needed(
+        n_full=k_unfold_plan.n_full, n_rmu=n_rmu_g, ns=ns_g, mesh=mesh_xy,
+        live_green_tiles=2))
+    if stream:
+        pair_plan = gemm_plan(mesh_xy, m=n_rmu_g, k=nb_g, n=n_rmu_g,
+                              nq=k_unfold_plan.n_full, dtype=jnp.complex128,
+                              layout=layout)
+        pair_proj = contract_bands_block_reshard(
+            mesh_xy, layout=layout, face_shape=(nk_g, nb_g, n_rmu_g, 1))
+        _irr = np.asarray(k_unfold_plan.irr_idx, dtype=np.int32)
+
+    def _pair_sigma(wfns, phases_parent, interaction, prefactor):
+        """Σ = Σ_ab ψ*_a [G_ab · interaction] ψ_b on parent rows, one spin block at a time."""
+        from .wavefunction_bundle import parent_sigma_operands
+        carrier = wfns.green_parent
+        psi_mun, psi_nmu = unfold_parent_faces(
+            k_unfold_plan, carrier.psi_mun, carrier.psi_nmu, layout=layout)
+        phases = jnp.take(phases_parent, jnp.asarray(_irr), axis=0)
+        _, _, proj_nmu, proj_mun, _, _ = parent_sigma_operands(wfns)
+
+        def block(acc, index):
+            left, right = spin_pair_rows(psi_mun, psi_nmu, index, ns_g)
+            G_ab = build_G(left, right, phases=phases, layout=layout, gemm=pair_plan)
+            S_ab = jnp.take(_convolve(G_ab, interaction, prefactor),
+                            jnp.asarray(_k_rows), axis=0)
+            proj_left = jax.lax.dynamic_slice_in_dim(proj_nmu, index // ns_g, 1, axis=2)
+            proj_right = jax.lax.dynamic_slice_in_dim(proj_mun, index % ns_g, 1, axis=1)
+            return acc + _project(proj_left, proj_right, S_ab, layout=layout,
+                                  face_project_fn=pair_proj), None
+
+        acc = jax.lax.with_sharding_constraint(
+            jnp.zeros((nk_g, nb_g, nb_g), jnp.complex128),
+            NamedSharding(mesh_xy, P(None, 'x', 'y')))
+        acc, _ = jax.lax.scan(block, acc, jnp.arange(ns_g * ns_g), unroll=1)
+        return unfold_file_wedge_band_operator(_sym, acc, trs_rule="transpose")
+
     def _project_bands(wfns, sigma_k):
         if k_unfold_plan is None:
             return _project(wfns.psi_nmu, wfns.psi_mun, sigma_k,
@@ -399,6 +440,8 @@ def _make_cohsex_kernels_face(mesh_xy: Mesh, face_shape, _convolve,
         phases = _occ_diag_full(Gij, s.nb_sigma, nb_full)
         if k_unfold_plan is not None:
             phases = k_unfold_plan.parent_rows(phases)
+        if stream and wfns_g is None:
+            return _pair_sigma(wfns, phases, W_q, 1.0)
         G_occ = build_G(g_mun, g_nmu, phases=phases,
                         real_weights=not jnp.issubdtype(phases.dtype, jnp.complexfloating),
                         layout=layout, gemm=g_plan,
@@ -412,6 +455,8 @@ def _make_cohsex_kernels_face(mesh_xy: Mesh, face_shape, _convolve,
                  else slice(int(ri_bands[0]), int(ri_bands[1])))
         g_mun, g_nmu, owner = _g_operands(wfns)
         mask = owner.band_mask(bands)
+        if stream:
+            return _pair_sigma(wfns, mask, W_q - V_q, -0.5)
         G_ri = build_G(g_mun, g_nmu, phases=mask, real_weights=True,
                        layout=layout, gemm=g_plan,
                        k_unfold_plan=k_unfold_plan)
