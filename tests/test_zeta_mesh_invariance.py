@@ -47,7 +47,7 @@ def _per_q_solve(F, Z, *, kind, n_log):
     rank-truncate kernel is route G's charge seam (``cplus.apply``)."""
     import jax
     from isdf.core import _zeta_logical_solvers
-    _, _, tri_solve, pinv_matmul, _ = _zeta_logical_solvers(int(n_log))
+    _, _, tri_solve, pinv_matmul = _zeta_logical_solvers(int(n_log))
     fn = pinv_matmul if kind == 'replicated_rank_truncate' else tri_solve
     return jax.jit(jax.vmap(fn))(F, Z)
 
