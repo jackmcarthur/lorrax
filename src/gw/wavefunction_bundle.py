@@ -522,6 +522,76 @@ def attach_parent_green_carrier(
         wfns, psi_nmu, psi_mun, plan=plan, mesh_xy=mesh_xy)
 
 
+def band_complete_bytes(carrier: ParentGreenCarrier) -> int:
+    """Per-rank bytes of a carrier's two band-complete (``axis``) copies,
+    ``16·n_parent·ns·μ·N_b·(1/p_x + 1/p_y)``."""
+    n_par, nb, ns, mu = (int(v) for v in carrier.psi_nmu.shape)
+    mesh = carrier.psi_nmu.sharding.mesh
+    px, py = int(mesh.shape['x']), int(mesh.shape['y'])
+    item = carrier.psi_nmu.dtype.itemsize
+    return int(item * n_par * nb * ns * mu * (1.0 / px + 1.0 / py))
+
+
+def band_complete_gw_carriers(bundles, *, budget_bytes: float, print_fn=print):
+    """Give the GW stages band-complete ψ copies when the budget admits them.
+
+    ``low_mem_bands = true`` keeps the two face copies (``2·16·n_par·ns·μ·N_b/P``
+    per rank) through the ζ fit.  The GW stages (χ₀, W, Σ, exchange,
+    Hartree) contract bands on every τ node; on faces each contraction is a
+    distributed GEMM, on band-complete copies a local one with a single
+    reduction.  So once the fit is done the faces are all-gathered, once, to
+    the ``axis`` layout when the per-rank floor of those stages still fits:
+
+        4·G_tile + Σ_carriers 16·n_par·ns·μ·N_b·(1/p_x + 1/p_y) <= target,
+
+    ``G_tile = 16·N_k·ns²·μ²/P`` of the charge carrier (the owner's GW
+    feasibility floor, docs/architecture/memory-model.md) and ``target`` the
+    budget times the spinor's fragmentation utilization.  Otherwise the faces
+    stay, and every stage runs its face route.  Returns the bundles with each
+    distinct carrier converted at most once (``None`` entries pass through).
+    """
+    from common.gpu_utils import bfc_fragmentation_target_utilization
+
+    carriers = []
+    for bundle in bundles:
+        carrier = None if bundle is None else bundle.green_parent
+        if bundle is not None and (bundle.psi_nmu is not None or bundle.psi_mun is not None):
+            return tuple(bundles)   # full-k child faces: parents-only storage is the seam
+        if carrier is not None and carrier.layout == "face" and all(
+                carrier is not c for c in carriers):
+            carriers.append(carrier)
+    if not carriers:
+        return tuple(bundles)
+    n_par, nb, ns, mu = (int(v) for v in carriers[0].psi_nmu.shape)
+    mesh = carriers[0].psi_nmu.sharding.mesh
+    P_ = int(mesh.shape['x']) * int(mesh.shape['y'])
+    g_tile = 16.0 * int(carriers[0].plan.n_full) * ns * ns * mu * mu / P_
+    view = float(sum(band_complete_bytes(c) for c in carriers))
+    target = float(budget_bytes) * bfc_fragmentation_target_utilization(ns)
+    admitted = 4.0 * g_tile + view <= target
+    print_fn(
+        f"  GW ψ carriers: {'band-complete (axis) copies' if admitted else 'faces kept'} "
+        f"for the GW stages -- axis copies {view / 1e9:.3f} GB/rank, floor "
+        f"4·G_tile {4.0 * g_tile / 1e9:.2f} GB, target {target / 1e9:.2f} GB/rank "
+        "(docs/architecture/memory-model.md, low_mem_bands).")
+    if not admitted:
+        return tuple(bundles)
+    nmu_spec, mun_spec = psi_specs("axis")
+    converted = {}
+    for carrier in carriers:
+        converted[id(carrier)] = dataclasses.replace(
+            carrier,
+            psi_nmu=jax.device_put(carrier.psi_nmu, NamedSharding(mesh, nmu_spec)),
+            psi_mun=jax.device_put(carrier.psi_mun, NamedSharding(mesh, mun_spec)),
+            layout="axis")
+    return tuple(
+        None if bundle is None else
+        dataclasses.replace(bundle, layout="axis",
+                            green_parent=converted.get(id(bundle.green_parent),
+                                                       bundle.green_parent))
+        for bundle in bundles)
+
+
 def psi_field_names(layout: str) -> tuple[str, ...]:
     """Name the two canonical face orientations for residency accounting."""
     if layout not in _LAYOUTS:
