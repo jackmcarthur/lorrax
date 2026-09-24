@@ -231,13 +231,16 @@ _NO_BRACKETS = None
 
 
 def _sigma_spin_pair_stream(*, mesh_xy, kgrid, layout, face_shape,
-                            face_band_extent, k_unfold_plan):
+                            face_band_extent, k_unfold_plan, parent_gemm):
     """Σ_c(τ) on raw parents, one spin block of the Green at a time (A4).
 
         Σ_nm(k̄) = Σ_ab Σ_μν ψ*_{m,a}(μ) [G_ab(τ) ⋆_k W(τ)](k̄; μ, ν) ψ_{n,b}(ν)
 
-    ``G_ab`` is built at full k from the parents unfolded by their typed ψ
-    action (the full-k Green's own (a, b) block), convolved with the same
+    With symmetry and room for the parent Green and its partner
+    (``2·n_parent/N_k`` of a Green tile), ``G_ab`` is the typed unfold of its
+    nonzero parent source blocks (the parent GEMM is the whole-spin one);
+    otherwise it is built at full k from the parents unfolded by their typed ψ
+    action (the full-k Green's own (a, b) block).  It is convolved with the same
     prepared ``W`` by the k-convolution router, restricted to the parent
     rows and projected on the parents' ``a`` and ``b`` spinor rows.  No
     ``ns²`` Green or Σ_k exists; the live set is a few ``16·N_k·μ²/P``
@@ -248,8 +251,9 @@ def _sigma_spin_pair_stream(*, mesh_xy, kgrid, layout, face_shape,
     from common.fft_helpers import make_kconv_klead
     from distrib_la import gemm_plan
     from .greens_function_kernel import (
-        _phase_band_interval, _weighted_tau_phases, build_G, spin_pair_rows,
-        unfold_parent_faces)
+        _phase_band_interval, _weighted_tau_phases, build_G, build_G_tau,
+        spin_block_sources, spin_pair_rows, spin_pairs_needed,
+        unfold_parent_faces, unfold_parent_spin_block)
     from .wavefunction_bundle import (SIGMA_CONV_G7D_SPEC, V_FFT5D_SPEC,
                                       sigma_conv_operand)
 
@@ -265,10 +269,32 @@ def _sigma_spin_pair_stream(*, mesh_xy, kgrid, layout, face_shape,
         mesh_xy, merged_x=True, layout=layout, face_shape=(n_full, nb, mu, 1),
         face_band_extent=face_band_extent, k_unfold_plan=k_unfold_plan)
     irr = np.asarray(k_unfold_plan.irr_idx, dtype=np.int32)
+    parent_blocks = (k_unfold_plan.n_parent < n_full and not spin_pairs_needed(
+        n_full=n_full, n_rmu=mu, ns=ns, mesh=mesh_xy,
+        live_green_tiles=2.0 * k_unfold_plan.n_parent / n_full + 6.0 / ns ** 2))
+    tables = spin_block_sources(k_unfold_plan) if parent_blocks else None
 
     def stream(psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
                E_A, sel, E_min, E_max, E_ref_A, t_node, W_prep):
         weights = dict(mask=sel) if sel.dtype == jnp.bool_ else dict(band_weight=sel)
+        if parent_blocks:
+            pg = build_G_tau(psi_coh_xn, psi_coh_yr, E_A, 1j * t_node, e_ref=E_ref_A,
+                             E_min=E_min, E_max=E_max, layout=layout, gemm=parent_gemm,
+                             k_unfold_plan=k_unfold_plan, trim_zero_bands=True,
+                             unfold=False, **weights)
+
+            def parent_block(index):
+                G_ab = unfold_parent_spin_block(pg, k_unfold_plan, tables, index)
+                S_ab = kconv.apply(sigma_conv_operand(
+                    G_ab.reshape(n_full, mu, 1, mu, 1)), W_prep)
+                proj_left = jax.lax.dynamic_slice_in_dim(psi_proj_xr, index // ns, 1, axis=2)
+                proj_right = jax.lax.dynamic_slice_in_dim(psi_proj_yn, index % ns, 1, axis=1)
+                return project(proj_left, S_ab, proj_right)
+
+            first = parent_block(0)
+            total, _ = jax.lax.scan(lambda acc, index: (acc + parent_block(index), None),
+                                    first, jnp.arange(1, ns * ns), unroll=1)
+            return total
         phases = _weighted_tau_phases(E_A, 1j * t_node, e_ref=E_ref_A,
                                       E_min=E_min, E_max=E_max, **weights)
         phases = jnp.take(phases, jnp.asarray(irr), axis=0)
@@ -330,7 +356,8 @@ def _get_sigma_kij_kernel(
         n_full=k_unfold_plan.n_full, n_rmu=mu, ns=ns, mesh=mesh_xy,
         live_green_tiles=2) else _sigma_spin_pair_stream(
             mesh_xy=mesh_xy, kgrid=kgrid, layout=layout, face_shape=face_shape,
-            face_band_extent=face_band_extent, k_unfold_plan=k_unfold_plan))
+            face_band_extent=face_band_extent, k_unfold_plan=k_unfold_plan,
+            parent_gemm=g_plan))
 
     def _g_from_selector(xn, yr, E, sel, E_min, E_max, ref, t, band_range=None):
         """Apply boolean identity masks or signed occupation weights without clipping."""
