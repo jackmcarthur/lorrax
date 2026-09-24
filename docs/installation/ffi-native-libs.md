@@ -64,7 +64,7 @@ BLAS flavour (GATE 2).
   `pyproject.toml`. It is header-only and nothing is linked: kernels are
   compiled per k-grid with NVRTC at run time.
 
-## 4. Build `liblorrax_ffi.so` (non-Shifter)
+## 4. Build `liblorrax_ffi.so` with CMake
 
 Drive CMake on `src/ffi/cpp/` with the platform selector and explicit paths.
 `LORRAX_FFI_PLATFORM` is required; unset, CMake stops with an error naming both
