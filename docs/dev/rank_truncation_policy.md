@@ -128,7 +128,6 @@ that site; `—` means uncertified, and the site warns instead of refusing.
 | site | operator | rtol | ceiling | certified κ | gate |
 |---|---|---|---|---|---|
 | `isdf/core._charge_factor_math` `rank_truncate` | charge Gram `C_q`, PSD | `zeta_rcond` | `n_log` | 1e8 | refuse |
-| `isdf/core._charge_factor_math` `transverse_rank_truncate` | transverse CCT, indefinite | `transverse_zeta_rcond` | `n_log` | — | warn (not deck-selectable: `linalg` resolves the transverse factor to ridge) |
 | `isdf/core._transverse_lu_math` (ridge) | transverse CCT | no truncation | — | κ ≥ 1e12 refuses | refuse |
 | `common/zeta_projection.least_squares_transfer` | small-basis Gram `G_S` | caller `rcond` | `μ_S` | 1e8 | refuse (κ arm only: the route reduces over q before host, so it has no per-q trace for the weight arm) |
 | `centroid/pivoted_cholesky` select | candidate Gram, PSD | `√ε` relative | candidate count | — | reports; see below |
@@ -171,8 +170,6 @@ means the basis is over-complete and `rtol` must not be loosened.
 
 ## Scope
 
-* The transverse channel is uncertified (`—` above): no production deck
-  measures its rank-truncating factor.
 * htransform model order is not governed here: `isdf.galerkin`'s randomized
   QRCP uses `htransform_qr_eps` (default 1e-3) as its criterion and
   `htransform_rank_multiplier` (default 20) as its search ceiling, and reports

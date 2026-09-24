@@ -7,9 +7,8 @@
 > - Σ^B assembly lives in `src/gw/sigma_x_bispinor.py` (the planned
 >   `src/gw/breit_sigma.py` was never created); V_q^{μν} tiles in
 >   `src/gw/v_q_bispinor.py`.
-> - Transverse ζ uses the Hermitian-indefinite CCT path. The default ridge
->   family is pivoted LU; `transverse_zeta_solve=rank_truncate` is the explicit
->   indefinite pseudo-inverse alternative. Fresh μ=1,2,3 fits may share their
+> - Transverse ζ uses the Hermitian-indefinite CCT path: pivoted LU with a
+>   trace-scaled ridge. Fresh μ=1,2,3 fits may share their
 >   face transform while keeping separate ordered solves. See
 >   [the face ζ architecture](architecture/zeta_fit_face_psi_cct.md#coupled-current-schedule).
 > - File-map rows that no longer exist: `src/common/load_wfns.py`,
@@ -145,9 +144,8 @@ the current coupled solver schedule.
 The production fit uses the Schur CCT construction. Its charge member is
 positive semidefinite and defaults to the rank-revealing charge
 pseudo-inverse. Each transverse $\tilde\gamma^i$ member is Hermitian but
-indefinite. It therefore uses pivoted LU with the accepted trace-scaled ridge,
-or the explicit `transverse_zeta_solve=rank_truncate` indefinite
-pseudo-inverse. The old claim that all four channels share one Cholesky path
+indefinite. It therefore uses pivoted LU with the accepted trace-scaled ridge.
+The old claim that all four channels share one Cholesky path
 is false.
 
 The principal layouts are:

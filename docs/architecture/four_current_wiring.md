@@ -80,7 +80,7 @@ flowchart TD
   subgraph DECK["deck"]
     K1["bispinor · bispinor_gw · centroids_file_current"]
     K2["head_correction · static_gauge_hall_file"]
-    K3["linalg · transverse_zeta_rcond"]
+    K3["linalg"]
   end
   subgraph CFG["gw_config · common.four_current_model"]
     R["resolve_four_current_representation"]
@@ -140,7 +140,6 @@ flowchart TD
 | `head_correction` | `full` | `config.head.correction` | head producers, envelope |
 | `static_gauge_hall_file` | unset | `config.paths.static_gauge_hall_file` | P Γ completion. Unset means $\sigma_H=0$, announced; a named path is authenticated by the loader |
 | `linalg` | `local` | the parser-cached `LinalgResolution` | Dyson plan, transverse ζ solver |
-| `transverse_zeta_rcond` | `1e-10` | `config.backend.transverse_zeta_rcond` | transverse ζ fit |
 
 `bispinor_tt_head_correction` is a removed deck key. `read_lorrax_input`
 refuses it at any value. The field `config.head.bispinor_tt_head_correction`

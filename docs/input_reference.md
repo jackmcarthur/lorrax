@@ -59,7 +59,6 @@ The material class is inferred from the WFN occupations; no deck key selects it.
 | `centroids_file` | str | `centroids_frac.txt` | Charge-channel centroid table written by `centroid.kmeans_cli`. |
 | `centroids_file_current` | str | `""` | Bispinor transverse-channel centroid table, selected from the Dirac-current feature norm. |
 | `zeta_rcond` | float | `1e-8` | Rank-truncation cutoff of the charge CCT, relative to λ_max. A cut that discards directions while the achieved κ_eff exceeds the certified 1e8 refuses ([rank-truncation policy](dev/rank_truncation_policy.md)). |
-| `transverse_zeta_rcond` | float | `1e-10` | Transverse-channel cutoff, relative to \|λ\|_max. Its κ cap is 1e10 and is uncertified, so exceeding it warns. |
 | `zeta_ridge` | float | `0.0` | Tikhonov ridge on the charge CCT, as a fraction of the mean diagonal; `0` means no ridge. Only the `cholesky` charge family reads it; the `rank_truncate` factor that both `linalg` layouts resolve does not. |
 | `zeta_cutoff` | float | unset (= ecutwfc) | G-sphere cutoff (Ry) of the per-q ζ_q(G) writes. It must be ≥ `bare_coulomb_cutoff`. |
 | `low_mem_bands` | bool | `true` | Raw-parent ψ layout. `true`: two mesh-face copies with distributed band contractions. `false`: two single-axis centroid copies with complete bands and local band contractions, which use more memory. The Green's-function, screening and projection algorithms are the same for both. |
