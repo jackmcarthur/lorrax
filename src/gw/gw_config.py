@@ -4342,7 +4342,7 @@ class SCConfig:
                 "  why:  rCROP evaluated the GW map twice per iteration; the "
                 "second evaluation re-derives the residual its linear model "
                 "already predicts.  One-evaluation Anderson keeps the same "
-                "CROP/Anderson family at half the maps (claims 2677-2679).\n"
+                "CROP/Anderson family at fewer maps (CrI3 8x8: 13 vs 21; sandbox claims 2677, 2678, 2686).\n"
                 "  doc:  docs/self_consistency.md")
         if self.accelerator != "anderson":
             raise ValueError(
