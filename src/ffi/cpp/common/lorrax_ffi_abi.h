@@ -48,6 +48,10 @@
 // the number moved with the merge and every library built before it is refused
 // by name.  The table stops being something anyone has to maintain.
 //
+//   ABI 3 -> 4   (2026-09-24, feat/kconv-mathdx-stage2).  The nvidia-mathdx
+//                k-convolution handlers (KConvMathdxPair/Parent) gained a
+//                `cubin_dir` string Attr for the disk cubin cache.
+//
 // ---------------------------------------------------------------------------
 // THE RULE
 // ---------------------------------------------------------------------------
@@ -72,4 +76,4 @@
 // Python tree with a still-correct .so.  What has to match is the CONTRACT.
 #pragma once
 
-#define LORRAX_FFI_ABI_VERSION 3
+#define LORRAX_FFI_ABI_VERSION 4

@@ -84,7 +84,7 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 
-from common.fft_helpers import make_sharded_ifftn_3d
+from common.fft_helpers import make_kfft_kminor
 from common.gpu_utils import get_device_memory_info
 from .bse_ring_comm import build_bse_ring_matvec_full, make_bse_shardings
 
@@ -265,8 +265,8 @@ def _full_matvec_and_args(data, mesh_xy, sh, *, include_W, with_halves=False):
         matvec = build_bse_ring_matvec_full(
             mesh_xy, nkx, nky, nkz, include_W=include_W, screening=False)
     if include_W:
-        W_ifft = make_sharded_ifftn_3d(
-            mesh_xy, sh.W.spec, sh.W.spec, axes=(2, 3, 4), norm="ortho")
+        W_ifft = make_kfft_kminor(
+            mesh_xy, (nkx, nky, nkz), sh.W.spec, kind="ifftn", norm="ortho")
         # W_q is DONATED and the caller-side reference dropped, copied from
         # ``bse_lanczos``'s W_R build.  Same shape in and out at a real
         # top-level boundary, so XLA grants the alias and W_R becomes W_q's

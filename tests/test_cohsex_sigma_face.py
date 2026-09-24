@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import numpy as np
+from types import SimpleNamespace
 import pytest
 
 jax = pytest.importorskip("jax")
@@ -83,14 +84,13 @@ def test_static_convolution_uses_certified_fused_owner(monkeypatch):
         called.update(mesh=mesh_arg, kgrid=kgrid, g_spec=g_spec,
                       v_spec=v_spec, norm=norm, mult=float(mult))
 
-        def fake_fused(G_k, V_q):
+        def fake_apply(G_k, V_q):
             return mult * (G_k + V_q[:, None, :, None, :])
 
-        return fake_fused
+        return SimpleNamespace(prep=lambda V_q: V_q, apply=fake_apply)
 
-    monkeypatch.setattr("ffi.mklfft.fused_fft_ffi_enabled", lambda: True)
     monkeypatch.setattr(
-        "common.fft_helpers.make_flat_k_gw_conv", fake_factory)
+        "common.fft_helpers.make_kconv_klead", fake_factory)
     conv = _make_static_convolution(mesh, (1, 1, 2), 2)
 
     G = _put(np.ones((2, 2, 1, 2, 1), np.complex128),

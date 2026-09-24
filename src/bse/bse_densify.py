@@ -43,7 +43,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
-from common.fft_helpers import make_sharded_fftn_3d, make_sharded_ifftn_3d
+from common.fft_helpers import make_kfft_kminor
 
 from .bse_serial import compute_pair_amplitude
 from .bse_window import PAD_EPS_GUARD_RY
@@ -177,9 +177,9 @@ def make_w_densifier(
         densification stores, so each solver's own ``ifftn(W_q)``
         reproduces the padded ``W_R``.
 
-    SHARDING / SCALING ENVELOPE.  Both FFTs are the shard_map interior
-    kernels (:func:`make_sharded_ifftn_3d` / :func:`make_sharded_fftn_3d`)
-    and the R-axis zero-pad is traced INSIDE one ``jax.jit`` whose
+    SHARDING / SCALING ENVELOPE.  Both transforms are the k-convolution
+    router's sharded k-minor door (:func:`common.fft_helpers.make_kfft_kminor`:
+    nvidia-mathdx on CUDA, the plan route on cpu) and the R-axis zero-pad is traced INSIDE one ``jax.jit`` whose
     ``out_shardings`` pins ``w_spec``, so the (μ,ν) sharding survives end to
     end: per-rank peak stays at the local ``(μ_loc, ν_loc, nk_fine)`` tile.
     No step materializes a replicated N_μ²-class array — the eager
@@ -191,13 +191,12 @@ def make_w_densifier(
         raise ValueError(f"make_w_densifier: output must be 'k' or 'R', got {output!r}")
     fine_grid = tuple(int(s) for s in fine_grid)
     w_sh = NamedSharding(mesh_xy, w_spec)
-    _ifftn = make_sharded_ifftn_3d(mesh_xy, w_spec, w_spec,
-                                   axes=(2, 3, 4), norm="ortho")
-    _fftn = make_sharded_fftn_3d(mesh_xy, w_spec, w_spec,
-                                 axes=(2, 3, 4), norm="ortho")
+    _fftn = make_kfft_kminor(mesh_xy, fine_grid, w_spec, kind="fftn", norm="ortho")
 
     @partial(jax.jit, out_shardings=w_sh)
     def _densify(W_q_coarse):
+        coarse = tuple(int(n) for n in W_q_coarse.shape[-3:])
+        _ifftn = make_kfft_kminor(mesh_xy, coarse, w_spec, kind="ifftn", norm="ortho")
         W_R_fine = pad_W_R_to_grid(_ifftn(W_q_coarse), fine_grid)
         if output == "R":
             return W_R_fine

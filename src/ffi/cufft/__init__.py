@@ -4,10 +4,8 @@ This package has no ``shard_map``/``ffi_call`` wrapper of its own, and that
 is a deliberate design choice rather than a gap.  ``fft_flat_k_cuda_ffi.cc``
 registers the SAME XLA target STRINGS as the host MKL-DFTI handlers —
 
-    lorrax_mklfft_flat_k    CufftFlatKCudaFfi   (ffi_loader.py:105)
-                            MklFftFlatKHostFfi  (ffi_loader.py:142)
-    lorrax_mklfft_gw_conv   CufftGwConvCudaFfi  (ffi_loader.py:106)
-                            MklFftGwConvHostFfi (ffi_loader.py:143)
+    lorrax_mklfft_flat_k    CufftFlatKCudaFfi   (CUDA)
+                            MklFftFlatKHostFfi  (host)
 
 — so ONE platform-agnostic ``jax.ffi.ffi_call`` per site resolves the right
 handler from the LOWERING platform, exactly the way jaxlib splits its own
@@ -16,19 +14,12 @@ in-tree.  A ``ffi/cufft/flat_k.py`` mirroring ``ffi/fft.py`` would
 duplicate every line of it and force call sites to branch on a platform they
 are not supposed to know about.
 
-TWO TARGETS HERE ARE **NOT** MIRRORED, and their names say so:
-
-    lorrax_cufft_conv_kminor  CufftConvKMinorCudaFfi   (CUDA only)
-    lorrax_cufft_conv_klead   CufftConvKLeadCudaFfi    (CUDA only)
-
-These are the fused-conv family's certified k-MINOR member and Sigma's direct
-public-k-leading member (``cpp/cufft/conv_k{minor,lead}_cuda_ffi.cc``,
-2026-08-16).  They are hand-written CUDA kernels rather than vendor-library
-calls, so there is no host twin to register either string against — and
-borrowing the ``mklfft`` prefix would promise a cpu handler that does not
-exist, turning a cpu mesh's REFUSAL into a silent resolution failure.  Their
-Python still lives in ``ffi.fft`` beside the plan-based member, because all
-three are entries of one family and the choice is a measured caller policy.
+THE ``lorrax_mathdx_*`` TARGETS ARE **NOT** MIRRORED, and their names say so:
+they are the nvidia-mathdx k-convolution family
+(``cpp/cufft/kconv_mathdx_cuda_ffi.cc``), the CUDA leg of the ``ffi.fft``
+router, which never lowers them on a cpu mesh (it takes the plan route there).
+They replaced the cuFFT strided gw_conv handler and the hand-written direct-DFT
+conv_klead/conv_kminor kernels on 2026-09-24 (decisions.md).
 
 **The Python for both platforms lives in** ``ffi.fft`` (the target strings
 were coined by the CPU prototype and kept; the name is historical, the
@@ -42,8 +33,7 @@ What IS cuFFT-specific, and lives only in ``cpp/``:
   and a ``cudaDeviceSynchronize()`` before every growth (``:412``);
 * plan-cache / arena / enqueue serialized under one process mutex, with the
   single-compute-stream assumption stated honestly (``:72-78``, ``:519``);
-* NVRTC compilation of the fused multiply kernel (no nvcc at build time,
-  ``:46-55``);
+* NVRTC compilation of the norm-scale kernel (no nvcc at build time);
 * the MKL host handler's compact-chunk L2 staging is deliberately NOT
   mirrored here (``:20-23``: "the host engine's per-thread L2 buffer was a
   CLX cache artifact, not part of the contract") — the right call, and the
@@ -59,26 +49,31 @@ Multi-GPU / sharded meshes are UNMEASURED — every GPU log is
 ``[CudaDevice(id=0)]``.
 """
 
-#: The target strings this library registers.  The first two are identical to
-#: the host table; the remaining two are CUDA-only and named for it.
-CUDA_TARGETS = ("lorrax_mklfft_flat_k", "lorrax_mklfft_gw_conv",
-                "lorrax_cufft_conv_kminor", "lorrax_cufft_conv_klead")
+#: The target strings this library's cuFFT/mathdx TUs register.  The first is
+#: identical to the host table; the rest are the CUDA-only nvidia-mathdx
+#: k-convolution family (``ffi.fft`` router, decisions.md 2026-09-24).
+CUDA_TARGETS = ("lorrax_mklfft_flat_k",
+                "lorrax_mathdx_kconv_pair", "lorrax_mathdx_kconv_parent",
+                "lorrax_mathdx_kconv_klead", "lorrax_mathdx_kfft_klead",
+                "lorrax_mathdx_kconv_kminor", "lorrax_mathdx_kfft_kminor")
 
 #: target → the C++ symbol THIS library exports (host exports different
 #: symbols for the same targets; see ``ffi_loader._CUDA_TARGET_SYMBOLS``).
 CUDA_SYMBOLS = {
-    "lorrax_mklfft_flat_k":     "CufftFlatKCudaFfi",
-    "lorrax_mklfft_gw_conv":    "CufftGwConvCudaFfi",
-    "lorrax_cufft_conv_kminor": "CufftConvKMinorCudaFfi",
-    "lorrax_cufft_conv_klead":  "CufftConvKLeadCudaFfi",
+    "lorrax_mklfft_flat_k":       "CufftFlatKCudaFfi",
+    "lorrax_mathdx_kconv_pair":   "KConvMathdxPairCudaFfi",
+    "lorrax_mathdx_kconv_parent": "KConvMathdxParentCudaFfi",
+    "lorrax_mathdx_kconv_klead":  "KConvMathdxKleadCudaFfi",
+    "lorrax_mathdx_kfft_klead":   "KFftMathdxKleadCudaFfi",
+    "lorrax_mathdx_kconv_kminor": "KConvMathdxKminorCudaFfi",
+    "lorrax_mathdx_kfft_kminor":  "KFftMathdxKminorCudaFfi",
 }
 
 __all__ = ["CUDA_TARGETS", "CUDA_SYMBOLS"]
 
 _REDIRECT = frozenset({
-    "make_flat_k_fft_ffi", "make_gw_conv_ffi", "require_fft_ffi",
-    "fft_ffi_enabled", "fft_ffi_mode", "fused_fft_ffi_enabled",
-    "fused_fft_ffi_mode", "GATE", "FUSED_GATE", "flat_k",
+    "make_flat_k_fft_ffi", "require_fft_ffi",
+    "fft_ffi_enabled", "fft_ffi_mode", "GATE", "flat_k",
 })
 
 

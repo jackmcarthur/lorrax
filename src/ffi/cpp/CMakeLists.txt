@@ -73,9 +73,6 @@ option(LORRAX_FFI_HAVE_CUBLASMP "Build cuBLASMp fused-kernel FFIs (needs nvcc)" 
 # OFF.  Auto-downgrades to a loud skip if cufft.h / libcufft / nvrtc are
 # absent (LORRAX_FFT_FFI on CUDA then refuses at runtime via probe_target).
 option(LORRAX_FFI_HAVE_CUFFT "Build the cuFFT strided flat-k FFT handlers" ON)
-option(LORRAX_FFI_PREBUILD_SM80_KERNELS
-    "Embed sm_80 cubins for the direct convolution handlers when nvcc is available"
-    ON)
 
 # ----------------------------------------------------------------------------
 # CUDA language (for .cu kernel translation units compiled by nvcc).  We
@@ -90,10 +87,9 @@ if(LORRAX_FFI_HAVE_CUBLASMP)
     # probes nvcc and seeds its cache with the compiler's legacy default
     # (sm_52 in the current container), after which a post-enable
     # ``NOT DEFINED`` check is already too late.
-    if(LORRAX_FFI_PREBUILD_SM80_KERNELS AND
-            NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+    if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
         set(CMAKE_CUDA_ARCHITECTURES 80 CACHE STRING
-            "CUDA architectures for the Perlmutter sm_80-only AOT build")
+            "CUDA architectures for the Perlmutter A100 build")
     endif()
     if(NOT DEFINED CMAKE_CUDA_COMPILER)
         if(EXISTS "/usr/local/cuda/bin/nvcc")
@@ -103,93 +99,6 @@ if(LORRAX_FFI_HAVE_CUBLASMP)
     enable_language(CUDA)
     set(CMAKE_CUDA_STANDARD 17)
     set(CMAKE_CUDA_STANDARD_REQUIRED ON)
-endif()
-
-# ---------------------------------------------------------------------------
-# A100-only AOT images for the direct-convolution handlers.
-#
-# M5/single-source rule: CUDA text is authored only as kKernelSrc in each
-# handler.  The build extracts that literal verbatim, compiles it for sm_80,
-# and embeds the cubin.  The same literal remains the runtime NVRTC fallback.
-#
-# Keep this conditional on the CUDA language already required by cuBLASMp.
-# A cuFFT-only/eigh-only build must not acquire a new nvcc dependency (the M3
-# coupling noted in docs/dev/cuda_kernel_migration.md).  Such a build logs a
-# configure-time warning and retains the named runtime fallback.
-# ---------------------------------------------------------------------------
-set(LORRAX_PREBUILT_SM80_ON 0)
-set(LORRAX_PREBUILT_SM80_OBJECTS "")
-if(LORRAX_FFI_PREBUILD_SM80_KERNELS)
-    if(LORRAX_FFI_HAVE_CUBLASMP AND CMAKE_CUDA_COMPILER)
-        if(NOT "${CMAKE_CUDA_ARCHITECTURES}" STREQUAL "80")
-            message(FATAL_ERROR
-                "LORRAX_FFI_PREBUILD_SM80_KERNELS=ON is the Perlmutter "
-                "A100-only build and requires CMAKE_CUDA_ARCHITECTURES=80; "
-                "got '${CMAKE_CUDA_ARCHITECTURES}'.  A general architecture "
-                "list/fatbin is TODO, not silently accepted here.")
-        endif()
-        find_program(LORRAX_OBJCOPY NAMES objcopy llvm-objcopy REQUIRED)
-        set(_lrx_prebuilt_dir "${CMAKE_CURRENT_BINARY_DIR}/prebuilt_sm80")
-        file(MAKE_DIRECTORY "${_lrx_prebuilt_dir}")
-
-        function(lorrax_add_sm80_cubin stem handler_source)
-            set(_cu "${_lrx_prebuilt_dir}/${stem}_sm80.cu")
-            set(_cubin "${_lrx_prebuilt_dir}/${stem}_sm80.cubin")
-            set(_object "${_lrx_prebuilt_dir}/${stem}_sm80.o")
-            add_custom_command(
-                OUTPUT "${_cu}"
-                COMMAND "${CMAKE_COMMAND}"
-                    "-DINPUT=${CMAKE_CURRENT_SOURCE_DIR}/${handler_source}"
-                    "-DOUTPUT=${_cu}"
-                    -P "${CMAKE_CURRENT_SOURCE_DIR}/cufft/extract_nvrtc_kernel.cmake"
-                DEPENDS
-                    "${CMAKE_CURRENT_SOURCE_DIR}/${handler_source}"
-                    "${CMAKE_CURRENT_SOURCE_DIR}/cufft/extract_nvrtc_kernel.cmake"
-                VERBATIM)
-            add_custom_command(
-                OUTPUT "${_cubin}"
-                COMMAND "${CMAKE_CUDA_COMPILER}"
-                    --cubin --gpu-architecture=sm_80
-                    "${_cu}" -o "${_cubin}"
-                DEPENDS "${_cu}"
-                COMMENT "AOT compiling ${stem} for Perlmutter sm_80"
-                VERBATIM)
-            # Run from the generated directory so GNU objcopy gives the
-            # embedded image a stable _binary_<stem>_sm80_cubin_{start,end}
-            # symbol independent of the worktree/build path.
-            add_custom_command(
-                OUTPUT "${_object}"
-                COMMAND "${LORRAX_OBJCOPY}"
-                    --input-target=binary
-                    --output-target=elf64-x86-64
-                    --binary-architecture=i386:x86-64
-                    --rename-section .data=.rodata,alloc,load,readonly,data,contents
-                    "${stem}_sm80.cubin" "${stem}_sm80.o"
-                WORKING_DIRECTORY "${_lrx_prebuilt_dir}"
-                DEPENDS "${_cubin}"
-                COMMENT "Embedding ${stem} sm_80 cubin in liblorrax_ffi.so"
-                VERBATIM)
-            set_source_files_properties("${_object}" PROPERTIES
-                EXTERNAL_OBJECT TRUE GENERATED TRUE)
-            list(APPEND LORRAX_PREBUILT_SM80_OBJECTS "${_object}")
-            set(LORRAX_PREBUILT_SM80_OBJECTS
-                "${LORRAX_PREBUILT_SM80_OBJECTS}" PARENT_SCOPE)
-        endfunction()
-
-        lorrax_add_sm80_cubin(
-            lrx_conv_kminor cufft/conv_kminor_cuda_ffi.cc)
-        lorrax_add_sm80_cubin(
-            lrx_conv_klead cufft/conv_klead_cuda_ffi.cc)
-        set(LORRAX_PREBUILT_SM80_ON 1)
-        message(STATUS
-            "Direct-convolution AOT: embedding conv_kminor/klead sm_80 cubins")
-    else()
-        message(WARNING
-            "Direct-convolution AOT requested, but this build has no enabled "
-            "CUDA compiler.  No sm_80 images will be embedded; the handlers "
-            "will name and pay their runtime NVRTC fallback.  This preserves "
-            "the cuFFT-only build's existing no-nvcc contract.")
-    endif()
 endif()
 
 # ----------------------------------------------------------------------------
@@ -624,28 +533,6 @@ if(LORRAX_FFI_HAVE_CUBLASMP)
     )
 endif()
 if(LORRAX_CUFFT_ON)
-    list(APPEND LORRAX_FFI_SOURCES ${LORRAX_PREBUILT_SM80_OBJECTS})
-    # Isolated compile target for the Sigma k-leading direct convolution.
-    # `cmake --build <dir> --target build_conv_klead_cuda` recompiles this TU
-    # without relinking the full vendor stack; the production shared object
-    # consumes the exact same object, so the quick-iteration artifact cannot
-    # drift from the shipped one.
-    add_library(build_conv_klead_cuda OBJECT
-        cufft/conv_klead_cuda_ffi.cc)
-    set_target_properties(build_conv_klead_cuda PROPERTIES
-        POSITION_INDEPENDENT_CODE ON)
-    target_include_directories(build_conv_klead_cuda SYSTEM PRIVATE
-        "${JAX_FFI_INCLUDE_DIR}"
-        "${CUDA_TOOLKIT_ROOT}/include"
-        "${CUDA_TOOLKIT_ROOT}/targets/x86_64-linux/include"
-        "${NVRTC_INCLUDE_DIR}")
-    target_include_directories(build_conv_klead_cuda PRIVATE
-        "${CMAKE_CURRENT_SOURCE_DIR}"
-        "${CMAKE_CURRENT_SOURCE_DIR}/common")
-    target_compile_options(build_conv_klead_cuda PRIVATE
-        -Wall -Wextra)
-    target_compile_definitions(build_conv_klead_cuda PRIVATE
-        LORRAX_FFI_HAVE_PREBUILT_SM80=${LORRAX_PREBUILT_SM80_ON})
     # Isolated compile target for the NVIDIA k-convolution family on
     # nvidia-mathdx (decisions.md 2026-09-24).  Its kernels are NVRTC-built at
     # run time from the installed wheel's cuFFTDx headers, per k-grid: there
@@ -666,13 +553,6 @@ if(LORRAX_CUFFT_ON)
         -Wall -Wextra)
     list(APPEND LORRAX_FFI_SOURCES
         cufft/fft_flat_k_cuda_ffi.cc
-        # k-MINOR fused conv (BSE ladder-W rung, 2026-08-16).  Rides the same
-        # switch because it shares the leg's requirement — NVRTC + the driver
-        # API — but it links NO cuFFT: its transform is a direct per-axis DFT
-        # written in the kernel, sized by the call's attributes.  If the cuFFT
-        # probe is ever split from the nvrtc probe, this file follows nvrtc.
-        cufft/conv_kminor_cuda_ffi.cc
-        $<TARGET_OBJECTS:build_conv_klead_cuda>
         $<TARGET_OBJECTS:build_kconv_mathdx_cuda>
     )
 endif()
@@ -834,7 +714,6 @@ endif()
 target_compile_definitions(lorrax_ffi PRIVATE
     LORRAX_FFI_HAVE_CAL=$<BOOL:${LORRAX_FFI_HAVE_CAL}>
     LORRAX_FFI_HAVE_PHDF5=$<BOOL:${LORRAX_FFI_HAVE_PHDF5}>
-    LORRAX_FFI_HAVE_PREBUILT_SM80=${LORRAX_PREBUILT_SM80_ON}
 )
 
 # -Wno-unused-parameter/-Wno-unused-variable removed 2026-08-01 (seam-audit

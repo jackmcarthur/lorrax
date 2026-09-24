@@ -212,8 +212,7 @@ def _make_static_convolution(mesh_xy: Mesh, kgrid: tuple[int, int, int],
     Σ_k leaves every branch in the face projector's ``(nk, s, mu, s', nu)``.
     """
     from ffi import ffi_dial_key
-    from ffi.mklfft import fused_fft_ffi_enabled
-    from common.fft_helpers import make_flat_k_gw_conv
+    from common.fft_helpers import make_kconv_klead
     key = (_mesh_key(mesh_xy), tuple(kgrid), ffi_dial_key(), int(nk_tot), q0_only, lorentz)
     if key in _static_convolution_cache:
         return _static_convolution_cache[key]
@@ -225,23 +224,15 @@ def _make_static_convolution(mesh_xy: Mesh, kgrid: tuple[int, int, int],
         def convolve(G_k, interaction, prefactor):
             return (prefactor * sigma_conv_operand(G_k)
                     * interaction[0][None, None, :, None, :] * scale)
-    elif fused_fft_ffi_enabled():
-        # The fused owner bounds the exposed Green lifetime on large scalar decks.
-        fused = make_flat_k_gw_conv(mesh_xy, kgrid, SIGMA_CONV_G7D_SPEC, V_FFT5D_SPEC,
-                                    norm='ortho', mult=scale)
-        @jax.jit
-        def convolve(G_k, interaction, prefactor):
-            return prefactor * fused(sigma_conv_operand(G_k), interaction)
     else:
-        from common.fft_helpers import make_flat_k_fftn, make_flat_k_ifftn
-        inverse_g = make_flat_k_ifftn(mesh_xy, kgrid, SIGMA_CONV_G7D_SPEC, norm='ortho')
-        forward_g = make_flat_k_fftn(mesh_xy, kgrid, SIGMA_CONV_G7D_SPEC, norm='ortho')
-        inverse_v = make_flat_k_ifftn(mesh_xy, kgrid, V_FFT5D_SPEC, norm='ortho')
+        # Σ = scale · fftn(ifftn(G) · ifftn(V)): the k-convolution router
+        # (nvidia-mathdx on CUDA, the FFTW gw_conv handler on cpu), one fused
+        # pass that bounds the exposed Green lifetime on large scalar decks.
+        kconv = make_kconv_klead(mesh_xy, kgrid, SIGMA_CONV_G7D_SPEC, V_FFT5D_SPEC,
+                                 norm='ortho', mult=scale)
         @jax.jit
         def convolve(G_k, interaction, prefactor):
-            return prefactor * forward_g(
-                inverse_g(sigma_conv_operand(G_k))
-                * inverse_v(interaction)[:, None, :, None, :] * scale)
+            return prefactor * kconv.apply(sigma_conv_operand(G_k), kconv.prep(interaction))
     _static_convolution_cache[key] = convolve
     return convolve
 

@@ -297,44 +297,35 @@ def make_sharded_ifftn_3d(
 # change the OBJECT IDENTITY those call sites see, and identity is load-bearing
 # in this tree (``bse_feast._GMRES_SOLVER_CACHE`` keys on ``id(matvec)``).  A
 # new accessor changes nothing for anyone who does not call it.
-_DONATED_IFFTN_3D: dict[tuple, Callable] = {}
+_DONATED_KFFT_KMINOR: dict[tuple, Callable] = {}
 
 
-def get_donated_ifftn_3d(
+def get_donated_kfft_kminor(
     mesh: Mesh,
+    kgrid: tuple[int, int, int],
     spec: P,
     *,
-    axes: tuple[int, int, int] = (-3, -2, -1),
-    norm: str | None = None,
+    kind: str = "ifftn",
+    norm: str | None = "ortho",
 ) -> Callable:
-    """The sharded 3-D inverse FFT as a jitted, INPUT-DONATING program.
-
-    Returns the SAME jitted callable for the same ``(mesh, spec, axes, norm)``,
-    so the program is constructed once per process instead of once per call.
+    """The k-minor k-axis transform (``make_kfft_kminor``) as a jitted,
+    INPUT-DONATING program, memoised per ``(mesh, kgrid, spec, kind, norm)``.
 
     Donation is the point of the separate accessor.  The W-transform call sites
     want XLA to alias ``W_R`` onto ``W_q``'s buffer — at production
     ``mu = 10015 / P = 64`` the un-aliased form costs 2 x 404 MB per rank — and
     donation only works from a top-level dispatch boundary, which is what this
     is.  Callers must drop their own reference to the operand right after the
-    call; the returned array is the only live copy.
-
-    Parameters
-    ----------
-    mesh, spec : the device mesh and the operand's partition spec.  The
-        transformed ``axes`` must be REPLICATED in ``spec`` — the transform is
-        device-local inside a ``shard_map``.
-    axes, norm : forwarded to :func:`local_ifftn3`, and part of the memo key
-        because both change the emitted program.
+    call; the returned array is the only live copy.  Memoised so the program is
+    constructed once per process instead of once per call.
     """
-    key = (mesh, spec, tuple(axes), norm)
-    hit = _DONATED_IFFTN_3D.get(key)
+    key = (mesh, tuple(int(v) for v in kgrid), spec, kind, norm)
+    hit = _DONATED_KFFT_KMINOR.get(key)
     if hit is None:
-        hit = jax.jit(
-            make_sharded_ifftn_3d(mesh, spec, spec, axes=tuple(axes),
-                                  norm=norm),
-            donate_argnums=(0,))
-        _DONATED_IFFTN_3D[key] = hit
+        from ffi.fft import make_kfft_kminor as _kfft
+        hit = jax.jit(_kfft(mesh, key[1], spec, kind=kind, norm=norm),
+                      donate_argnums=(0,))
+        _DONATED_KFFT_KMINOR[key] = hit
     return hit
 
 
@@ -393,7 +384,6 @@ def make_sharded_fftn_3d(
 from ffi.mklfft import (  # noqa: E402  (re-export: see the block above)
     GATE,
     fft_ffi_enabled,
-    make_gw_conv_ffi as _make_gw_conv_ffi,
     make_flat_k_fft_ffi as _make_flat_k_fft_ffi,
 )
 from ffi.fft import (  # noqa: E402
@@ -403,112 +393,29 @@ from ffi.fft import (  # noqa: E402
 
 
 # ============================================================================
-# THE FUSED-CONV FAMILY at the factory seam
+# THE k-CONVOLUTION ROUTER at the factory seam (decisions.md 2026-09-24)
 # ============================================================================
-# Three entries, ONE contract:
+# The physics front doors for every k-axis convolution and every k-axis
+# transform of a k-MINOR tile.  Each is the ``ffi.fft`` router factory itself,
+# re-exported here so physics code imports its FFTs from one module; the
+# router picks nvidia-mathdx on CUDA and the plan route on cpu from the mesh,
+# so no caller branches on a backend and no environment variable picks one.
 #
-#     U = scale · FFT_k( IFFT_k(X) · K )
+#     make_kconv_klead        Σ / COHSEX: KConvStored(prep(W), apply(T, W_prep))
+#     make_kconv_kminor       BSE rung:   fn(X, K_R), out_layout 0 | 1
+#     make_kfft_kminor        sharded transform over the three trailing k axes
+#     make_local_kconv_kminor / make_local_kfft_kminor  the same inside a shard_map
 #
-# — both transforms, the broadcast multiply against a STORED kernel, and every
-# norm factor as a single constant, in ONE FFI call per rank, so the R-space
-# intermediate never materialises.  The members differ ONLY in where the
-# caller's tile already keeps its k axis, because that is what decides which
-# memory layout the one kernel has to read:
-#
-#     make_flat_k_gw_conv     k LEADING     lorrax_mklfft_gw_conv     cpu+CUDA
-#     make_fused_conv_klead   k LEADING     lorrax_cufft_conv_klead  CUDA
-#     make_fused_conv_kminor  k MINOR-most  lorrax_cufft_conv_kminor  CUDA
-#
-# Pick by resident layout; callers do not independently transpose to reach a
-# different member.  Public k-leading T/W/U remain k-leading: that handler
-# coalesces loads into resident rows and writes k-leading output, with no global
-# pack or transpose.  No production Sigma caller exists until its separate
-# seam lands.  The full family contract lives in ``ffi/fft.py``.
+# The contracts live in ``ffi/fft.py``.
 # ============================================================================
-
-
-def make_flat_k_gw_conv(
-    mesh: Mesh,
-    kgrid: tuple[int, int, int],
-    g_spec: P,
-    v_spec: P,
-    *,
-    norm: str | None = 'ortho',
-    mult: float = 1.0,
-) -> Callable:
-    """Fused conv, **k-LEADING** ``fn(G_flat, W_flat) -> sigma_flat``:
-
-        sigma = fftn( ifftn(G) * ifftn(W)[:, None, :, None, :] * mult )
-
-    with all three transforms + the broadcast multiply in ONE FFI call per
-    rank, so the R-space G tile never materializes.  Sigma-family layout
-    contract only; the plain helpers remain the entry point for everything
-    else.  Sibling: :func:`make_fused_conv_kminor`, same expression for a
-    caller whose k axis is already minor-most.  Implementation:
-    :func:`ffi.fft.make_gw_conv_ffi`.
-    """
-    return _make_gw_conv_ffi(mesh, kgrid, g_spec, v_spec,
-                             norm=norm, mult=mult)
-
-
-def make_fused_conv_kminor(
-    mesh: Mesh,
-    kgrid: tuple[int, int, int],
-    x_spec: P,
-    k_spec: P,
-    *,
-    norm: str | None = 'ortho',
-    mult: float = 1.0,
-    out_layout: int = 0,
-) -> Callable:
-    """Fused conv, **k-MINOR** ``fn(X, K) -> U``:
-
-        U = scale · fftn_k( ifftn_k(X) · K[None, :, :, None, None, :] )
-
-    ``X`` ``(d0,d1,d2,d3,d4,nk)``, ``K`` ``(d1,d2,nk)`` ALREADY in R space
-    (this member multiplies its stored kernel, it does not transform it — the
-    caller builds that once and reuses it; see ``ffi/fft.py``).  ONE FFI call:
-    both transforms, the broadcast multiply, both norm factors as a single
-    constant, and — at ``out_layout=1`` — a consumer's
-    ``(d0,nk,d3,d1,d4,d2)`` permutation emitted from the STORE, so a
-    downstream layout costs nothing extra.
-
-    CUDA only.  Default ``auto``: use the handler when the platform,
-    registered target, dtype, and conservative 48-KiB row-residency check
-    allow it; otherwise execute the caller's reference implementation.  ``on``
-    requires the handler and delegates the final device-specific residency
-    decision to C++.  Sibling: :func:`make_flat_k_gw_conv`.  Implementation:
-    :func:`ffi.fft.make_conv_kminor_ffi`.
-    """
-    from ffi.fft import make_conv_kminor_ffi as _impl
-    return _impl(mesh, kgrid, x_spec, k_spec,
-                 norm=norm, mult=mult, out_layout=out_layout)
-
-
-def make_fused_conv_klead(
-    mesh: Mesh,
-    kgrid: tuple[int, int, int],
-    g_spec: P,
-    v_spec: P,
-    *,
-    norm: str | None = 'ortho',
-    mult: float = 1.0,
-) -> Callable:
-    """Direct fused conv in Sigma's native **k-LEADING** layout.
-
-    Same public shapes as :func:`make_flat_k_gw_conv`.  The CUDA-only handler
-    keeps the public T/W/U arrays k-leading, coalesces the mu-nu-major global
-    loads into a bounded shared-memory transpose/residency bank, assembles T
-    and W row pairs, performs the two inverse transforms, multiply, and forward
-    transform in one traversal, and emits the result in Sigma's native
-    k-leading layout from its coalesced store.
-    It is an accelerator behind ``LORRAX_CONV_KLEAD_FFI``; callers retain the
-    plan-based member as the off/unsupported path.  No production Sigma caller
-    exists until its separate caller seam lands.
-    """
-    from ffi.fft import make_conv_klead_ffi as _impl
-    return _impl(mesh, kgrid, g_spec, v_spec, norm=norm, mult=mult)
-
+from ffi.fft import (  # noqa: E402,F401  (re-exported front doors)
+    KConvStored,
+    make_kconv_klead,
+    make_kconv_kminor,
+    make_kfft_kminor,
+    make_local_kconv_kminor,
+    make_local_kfft_kminor,
+)
 
 
 # ============================================================================

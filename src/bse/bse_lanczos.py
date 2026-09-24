@@ -17,7 +17,7 @@ import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from common.collectives import replicate_to_mesh
-from common.fft_helpers import get_donated_ifftn_3d
+from common.fft_helpers import get_donated_kfft_kminor
 
 from solvers.lanczos import (
     FULL_REORTH,
@@ -314,8 +314,9 @@ def solve_bse_sharded(
             # and named at §7.2).  Donation is unchanged: the accessor sets
             # ``donate_argnums=(0,)`` and the alias is gated in
             # tests/test_bse_w_ifft_hoist.py.
-            _W_ifft_donated = get_donated_ifftn_3d(
-                mesh_xy, sh.W.spec, axes=(2, 3, 4), norm='ortho')
+            _W_ifft_donated = get_donated_kfft_kminor(
+                mesh_xy, tuple(int(n) for n in data["W_q"].shape[-3:]), sh.W.spec,
+                kind="ifftn", norm='ortho')
             W_R = _W_ifft_donated(data["W_q"])
             data["W_q"] = None          # release the caller-side reference
             _sec_wifft.watch(W_R)

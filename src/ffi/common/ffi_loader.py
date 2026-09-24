@@ -114,25 +114,19 @@ _CUDA_TARGET_SYMBOLS = {
     # ffi_call per site and the lowering platform resolves the handler —
     # exactly the phdf5 same-target/different-symbol split.
     "lorrax_mklfft_flat_k":         "CufftFlatKCudaFfi",
-    "lorrax_mklfft_gw_conv":        "CufftGwConvCudaFfi",
-    # k-MINOR fused conv (cpp/cufft/conv_kminor_cuda_ffi.cc) — ifft·multiply·
-    # fft over a MINOR-most k axis, one kernel, no layout change on the
-    # caller's side.  CUDA-ONLY BY CONSTRUCTION and named accordingly: unlike
-    # the two rows above there is no host twin, so borrowing the "mklfft"
-    # target string would promise a cpu handler that does not exist.  A cpu
-    # mesh must refuse here, not resolve to nothing (ffi.fft.CONV_KMINOR_GATE).
-    "lorrax_cufft_conv_kminor":     "CufftConvKMinorCudaFfi",
-    # Direct k-leading candidate: public T/W/U remain k-leading; the handler
-    # coalesces loads into resident rows and writes k-leading output, with no
-    # global pack or transpose.  CUDA-only; no production Sigma caller exists
-    # until its separate seam lands.
-    "lorrax_cufft_conv_klead":      "CufftConvKLeadCudaFfi",
     # The NVIDIA k-convolution family on nvidia-mathdx (cpp/cufft/
     # kconv_mathdx_cuda_ffi.cc): cuFFTDx transforms, NVRTC-built per
-    # (mode, grid, ns, context).  CUDA-only; the ffi.fft router returns the
-    # MKL plan route on cpu and never this target (decisions.md 2026-09-24).
+    # (mode, grid, ns, context) and disk-cached.  CUDA-only; the ffi.fft router
+    # returns the MKL plan route on cpu and never these targets (decisions.md
+    # 2026-09-24).  The Sigma k-leading convolution, the BSE k-minor one and
+    # both transform-only modes replaced the cuFFT strided gw_conv and the
+    # direct-DFT conv_klead/conv_kminor handlers.
     "lorrax_mathdx_kconv_pair":     "KConvMathdxPairCudaFfi",
     "lorrax_mathdx_kconv_parent":   "KConvMathdxParentCudaFfi",
+    "lorrax_mathdx_kconv_klead":    "KConvMathdxKleadCudaFfi",
+    "lorrax_mathdx_kfft_klead":     "KFftMathdxKleadCudaFfi",
+    "lorrax_mathdx_kconv_kminor":   "KConvMathdxKminorCudaFfi",
+    "lorrax_mathdx_kfft_kminor":    "KFftMathdxKminorCudaFfi",
     "lorrax_phdf5_write":           "PhdfWriteFfi",
     "lorrax_phdf5_read":            "PhdfReadFfi",
     "lorrax_phdf5_read_kchunk":       "PhdfReadKchunkFfi",
@@ -275,7 +269,7 @@ class FfiLibraryNotBuilt(FileNotFoundError):
 #: this boundary is unavoidable; what IS avoidable is the mirror drifting
 #: silently, and ``tests/test_ffi_abi_stamp.py`` parses the header and fails if
 #: these two numbers disagree.
-LORRAX_FFI_ABI_VERSION = 3
+LORRAX_FFI_ABI_VERSION = 4
 
 #: platform -> the C entry point that reports the library's ABI.  Per leg on
 #: purpose: both libraries are dlopened RTLD_GLOBAL in a GPU process and

@@ -50,7 +50,7 @@ import numpy as np
 from jax import lax
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
-from common.fft_helpers import make_sharded_ifftn_3d
+from common.fft_helpers import make_kfft_kminor
 
 from .absorption_common import (RYD2EV, build_dipole_vector_bse, jdos_from_transitions, kramers_kronig_eps1, slice_dipole_to_bse_window, write_absorption_dat, write_absorption_h5)
 from file_io.restart_bundle import (load_dipole_h5)
@@ -213,8 +213,8 @@ def run_haydock(
             mesh_xy, nkx, nky, nkz, include_W=True,
             low_mem=(matvec_kind == "ring"))
 
-    _W_local_ifftn = make_sharded_ifftn_3d(
-        mesh_xy, sh.W.spec, sh.W.spec, axes=(2, 3, 4), norm="ortho")
+    _W_local_ifftn = make_kfft_kminor(
+        mesh_xy, (nkx, nky, nkz), sh.W.spec, kind="ifftn", norm="ortho")
     rep = NamedSharding(mesh_xy, P())
 
     @partial(

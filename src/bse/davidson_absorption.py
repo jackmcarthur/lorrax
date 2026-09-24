@@ -45,7 +45,7 @@ from file_io.restart_bundle import (_find_restart_file)
 from .bse_ring_comm import create_mesh_2d, make_bse_shardings
 from .bse_simple import build_bse_simple_matvec
 from common.collectives import gather_to_host
-from common.fft_helpers import make_sharded_ifftn_3d
+from common.fft_helpers import make_kfft_kminor
 
 
 def main(argv=None):
@@ -103,8 +103,8 @@ def main(argv=None):
 
     # ── Build matvec exactly like tests/bench/test_davidson_bse.py ─────────────────────
     matvec_simple = build_bse_simple_matvec(mesh_xy, nkx, nky, nkz, include_W=True)
-    _W_ifftn = make_sharded_ifftn_3d(
-        mesh_xy, sh.W.spec, sh.W.spec, axes=(2, 3, 4), norm="ortho")
+    _W_ifftn = make_kfft_kminor(
+        mesh_xy, (nkx, nky, nkz), sh.W.spec, kind="ifftn", norm="ortho")
     # W_q is DONATED, and the caller-side reference dropped — copied verbatim
     # from ``bse_lanczos``'s W_R build, which is the same transform at the same
     # kind of top-level boundary.  Same shape in and out, so XLA grants the

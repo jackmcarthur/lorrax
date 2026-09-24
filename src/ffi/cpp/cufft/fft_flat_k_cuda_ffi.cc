@@ -50,22 +50,14 @@
 //       by the Python helper to match jnp.fft's norm conventions EXACTLY
 //       (cuFFT scales neither direction, so the scale is applied by a tiny
 //       elementwise kernel; skipped when scale == 1).
-//   CufftGwConvCudaFfi (target lorrax_mklfft_gw_conv)
-//       G (nk, a, mx, b, my) c128, W (nk, mx, my) c128 -> S = shape(G):
-//           S = FFT[ IFFT[G] * IFFT[W][:,None,:,None,:] * mult ]
-//       three cuFFT execs + ONE fused broadcast-multiply kernel between the
-//       transforms (a plain CUDA kernel, NOT a cuFFT callback — owner
-//       instruction).  All three scale factors (scale_i on both inverse
-//       transforms, scale_f·mult on the forward) commute with the linear
-//       FFT and are folded into the multiply kernel as one factor
-//       scale_i²·scale_f — value-level identical to the decomposed
-//       sequence (same reassociation class as the host handler's
-//       scale-fold; gated at ~1e-15, never claimed bit-exact).
+//   (The fused Sigma convolution this TU used to carry as CufftGwConvCudaFfi
+//   moved to the k-convolution router's nvidia-mathdx family, 2026-09-24:
+//   cpp/cufft/kconv_mathdx_cuda_ffi.cc modes 2 and 3.)
 //
 // DEVICE CODE WITHOUT NVCC: this TU is compiled by g++ against the CUDA
 // headers — the Frontera pip toolchain ships ptxas but NO nvcc driver, and
 // the CUDA .so build deliberately has no CUDA-language step (house fact,
-// SPEEDUP_SCORECARD.md AE.4b).  The two kernels therefore live in an NVRTC
+// SPEEDUP_SCORECARD.md AE.4b).  The scale kernel therefore lives in an NVRTC
 // source string compiled ONCE per process at first use, for the compute
 // capability queried from the runtime device (also sidesteps the
 // CMAKE_CUDA_ARCHITECTURES=80 default vs rtx-dev sm_75 mismatch), loaded
@@ -81,9 +73,7 @@
 //
 // Memory policy (scaling target: no hidden N_mu^2 allocations): plans are
 // created with auto-allocation OFF and share ONE grow-only device workspace
-// arena sized to the largest cufftMakePlanMany64 request; the fused handler
-// stages IFFT[W] in a second grow-only arena of the sharded W tile's size
-// (nk·mx·my·16 B).  Both are cudaMalloc'd outside the XLA allocator — safe
+// arena sized to the largest cufftMakePlanMany64 request.  It is cudaMalloc'd outside the XLA allocator — safe
 // under the production env (ffi_env.sh: cuda_async allocator + preallocate
 // false) and logged under LORRAX_DEBUG_PRINT, same class as the host
 // handler's malloc'd V_R arena.  Arena growth cudaDeviceSynchronize()s
@@ -287,7 +277,7 @@ static std::string cu_err(CUresult r) {
 }
 
 // ---------------------------------------------------------------------------
-//  The two device kernels, NVRTC-compiled at first use (see file header for
+//  The device scale kernel, NVRTC-compiled at first use (see file header for
 //  why there is no nvcc).  Raw double indexing (2i / 2i+1) rather than
 //  double2 keeps the source free of any header dependency under NVRTC.
 //  Both use grid-stride loops so any launch size is correct.
@@ -301,35 +291,10 @@ void lrx_scale_c128(double* x, long long n2, double s)
     for (; i < n2; i += stride) x[i] *= s;
 }
 
-// S (nk, a, mx, b, my) *= V (nk, mx, my) broadcast over (a, b), times scale.
-// Flat index i = ((((k*a + ai)*mx + x)*b + bi)*my + y); the integer
-// divisions skip ai/bi (floor(t/b) == floor((t - t%b)/b)).
-extern "C" __global__
-void lrx_gw_mult_c128(double* s, const double* v, long long nk, long long a,
-                      long long mx, long long b, long long my, double scale)
-{
-    const long long total = nk * a * mx * b * my;
-    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-    const long long stride = (long long)gridDim.x * blockDim.x;
-    for (; i < total; i += stride) {
-        long long t = i;
-        const long long y = t % my; t /= my;
-        t /= b;
-        const long long x = t % mx; t /= mx;
-        t /= a;
-        const long long k = t;
-        const long long vj = 2 * ((k * mx + x) * my + y);
-        const double gr = s[2 * i], gi = s[2 * i + 1];
-        const double vr = v[vj], vi = v[vj + 1];
-        s[2 * i]     = (gr * vr - gi * vi) * scale;
-        s[2 * i + 1] = (gr * vi + gi * vr) * scale;
-    }
-}
 )__lrx__";
 
 struct KernelPack {
     CUfunction scale_fn = nullptr;
-    CUfunction mult_fn = nullptr;
 };
 
 // Compile + load the kernels for the CURRENT context (one per process in
@@ -442,9 +407,6 @@ static ffi::Error get_kernels(KernelPack** out) {
     }
     KernelPack pack;
     cr = api.ModuleGetFunction(&pack.scale_fn, mod, "lrx_scale_c128");
-    if (cr == CUDA_SUCCESS) {
-        cr = api.ModuleGetFunction(&pack.mult_fn, mod, "lrx_gw_mult_c128");
-    }
     if (cr != CUDA_SUCCESS) {
         // Unload before failing (P1.9): the module is unreachable after
         // this return — without the unload it leaked device memory on
@@ -503,8 +465,6 @@ static std::mutex g_mu;
 static std::map<PlanKey, PlanEntry> g_plans;
 static void* g_work = nullptr;      // shared cuFFT workspace arena
 static size_t g_work_cap = 0;
-static void* g_vr = nullptr;        // fused handler's IFFT[W] arena
-static size_t g_vr_cap = 0;
 
 // Grow-only device arena.  Synchronizes the DEVICE before releasing the old
 // block so no still-enqueued work can reference it (growth is a rare,
@@ -651,113 +611,10 @@ static ffi::Error FlatKDispatch(
     return ffi::Error::Success();
 }
 
-// ---------------------------------------------------------------------------
-//  Handler 2: fused Σ τ convolution (mirror of MklFftGwConvHostFfi):
-//      S = FFT[ IFFT[G] · IFFT[W](bcast) · mult ]
-//  IFFT[W] lands in the V_R arena; IFFT[G] lands DIRECTLY in S (out-of-place
-//  strided exec — or in place under the granted G->S alias), the fused
-//  kernel multiplies S by the broadcast V_R and the folded scale, and the
-//  forward exec runs in place on S.  No G-sized scratch anywhere.
-// ---------------------------------------------------------------------------
-static ffi::Error GwConvDispatch(
-    cudaStream_t stream,
-    ffi::AnyBuffer G, ffi::AnyBuffer W, ffi::Result<ffi::AnyBuffer> S,
-    int64_t nkx, int64_t nky, int64_t nkz, double scale_i, double scale_f)
-{
-    announce_inert_host_knobs();
-    if (G.element_type() != ffi::DataType::C128 ||
-        W.element_type() != ffi::DataType::C128 ||
-        S->element_type() != ffi::DataType::C128) {
-        return ffi::Error(ffi::ErrorCode::kInvalidArgument,
-                          "cufft.gw_conv: buffers must be complex128");
-    }
-    auto gd = G.dimensions();
-    auto wd = W.dimensions();
-    auto sd = S->dimensions();
-    if (gd.size() != 5 || wd.size() != 3 || sd.size() != 5 ||
-        !std::equal(gd.begin(), gd.end(), sd.begin())) {
-        return ffi::Error(
-            ffi::ErrorCode::kInvalidArgument,
-            "cufft.gw_conv: expected G/S (nk, a, mx, b, my) and W (nk, mx, my)");
-    }
-    const int64_t nk = gd[0], a = gd[1], mx = gd[2], b = gd[3], my = gd[4];
-    if (nkx < 1 || nky < 1 || nkz < 1 || nk != nkx * nky * nkz ||
-        wd[0] != nk || wd[1] != mx || wd[2] != my) {
-        std::ostringstream os;
-        os << "cufft.gw_conv: shape mismatch — G(nk=" << nk << ",a=" << a
-           << ",mx=" << mx << ",b=" << b << ",my=" << my << ") vs W("
-           << wd[0] << "," << wd[1] << "," << wd[2] << ") vs kgrid ("
-           << nkx << "," << nky << "," << nkz << ")";
-        return ffi::Error(ffi::ErrorCode::kInvalidArgument, os.str());
-    }
-    const int64_t Tg = a * mx * b * my;
-    const int64_t Tv = mx * my;
-    if (Tg == 0 || Tv == 0) return ffi::Error::Success();
-
-    const auto* g_in = static_cast<const C128*>(G.untyped_data());
-    const auto* w_in = static_cast<const C128*>(W.untyped_data());
-    auto* s_out = static_cast<C128*>(S->untyped_data());
-    const bool aliased = (static_cast<const void*>(g_in) ==
-                          static_cast<const void*>(s_out));
-
-    std::lock_guard<std::mutex> lock(g_mu);
-    if (log_enabled()) {
-        static std::atomic<bool> once{false};
-        if (!once.exchange(true)) {
-            std::fprintf(stderr,
-                         "[cufft_flat_k] gw_conv first call: nk=(%ld,%ld,%ld) "
-                         "G trail (a=%ld,mx=%ld,b=%ld,my=%ld) Tg=%ld Tv=%ld "
-                         "scale_i=%.6e scale_f=%.6e aliased=%d "
-                         "vr_arena=%.1f MB\n",
-                         (long)nkx, (long)nky, (long)nkz, (long)a, (long)mx,
-                         (long)b, (long)my, (long)Tg, (long)Tv, scale_i,
-                         scale_f, (int)aliased, nk * Tv * 16.0 / 1e6);
-        }
-    }
-
-    ffi::Error e = ensure_arena(&g_vr, &g_vr_cap,
-                                (size_t)nk * Tv * sizeof(C128), "V_R");
-    if (!e.success()) return e;
-    C128* vr = static_cast<C128*>(g_vr);
-
-    PlanEntry *plan_v = nullptr, *plan_g = nullptr;
-    e = get_plan(PlanKey{nkx, nky, nkz, Tv, Tv}, &plan_v);
-    if (!e.success()) return e;
-    e = get_plan(PlanKey{nkx, nky, nkz, Tg, Tg}, &plan_g);
-    if (!e.success()) return e;
-
-    // stage 1: V_R = unscaled IFFT[W] (scale folded into the kernel below).
-    e = exec(plan_v, stream, w_in, vr, CUFFT_INVERSE, "gw_conv W ifft");
-    if (!e.success()) return e;
-    // stage 2a: S = unscaled IFFT[G] (in place under the granted alias).
-    e = exec(plan_g, stream, g_in, s_out, CUFFT_INVERSE, "gw_conv G ifft");
-    if (!e.success()) return e;
-    // stage 2b: S *= V_R(bcast) · scale_i²·scale_f  (all three transform
-    // scales commute with the linear FFTs; one fused factor — the same
-    // value-level reassociation class as the host handler's scale-fold).
-    KernelPack* kp = nullptr;
-    e = get_kernels(&kp);
-    if (!e.success()) return e;
-    {
-        double* sd_ptr = reinterpret_cast<double*>(s_out);
-        const double* vd_ptr = reinterpret_cast<const double*>(vr);
-        long long nk_ll = nk, a_ll = a, mx_ll = mx, b_ll = b, my_ll = my;
-        double total_scale = scale_i * scale_i * scale_f;
-        void* args[] = {&sd_ptr, &vd_ptr, &nk_ll, &a_ll, &mx_ll, &b_ll,
-                        &my_ll, &total_scale};
-        e = launch(kp->mult_fn, stream, nk * Tg, args, "gw_conv mult kernel");
-        if (!e.success()) return e;
-    }
-    // stage 2c: S = FFT[S] in place, unscaled.
-    e = exec(plan_g, stream, s_out, s_out, CUFFT_FORWARD, "gw_conv S fft");
-    if (!e.success()) return e;
-    return ffi::Error::Success();
-}
-
 }  // namespace lorrax_ffi::cufft_flat_k
 
-// SAME target strings as the host handlers (lorrax_mklfft_flat_k /
-// lorrax_mklfft_gw_conv), DIFFERENT symbol names so both platform .so's can
+// SAME target string as the host handler (lorrax_mklfft_flat_k),
+// DIFFERENT symbol name so both platform .so's can
 // coexist under RTLD_GLOBAL — the phdf5 platform_seam.h registration split.
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
     CufftFlatKCudaFfi,
@@ -771,17 +628,3 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Attr<int64_t>("nkz")
         .Attr<int64_t>("forward")        // 0 = ifftn, 1 = fftn
         .Attr<double>("scale"));         // total jnp-convention norm scale
-
-XLA_FFI_DEFINE_HANDLER_SYMBOL(
-    CufftGwConvCudaFfi,
-    lorrax_ffi::cufft_flat_k::GwConvDispatch,
-    xla::ffi::Ffi::Bind()
-        .Ctx<xla::ffi::PlatformStream<cudaStream_t>>()
-        .Arg<xla::ffi::AnyBuffer>()      // G (nk, a, mx, b, my) c128
-        .Arg<xla::ffi::AnyBuffer>()      // W (nk, mx, my) c128
-        .Ret<xla::ffi::AnyBuffer>()      // S shape(G) (may alias G)
-        .Attr<int64_t>("nkx")
-        .Attr<int64_t>("nky")
-        .Attr<int64_t>("nkz")
-        .Attr<double>("scale_i")         // inverse-transform scale (both IFFTs)
-        .Attr<double>("scale_f"));       // forward scale × caller multiplier

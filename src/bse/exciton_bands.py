@@ -140,7 +140,7 @@ from solvers.lanczos import (alpha_herm_sink, block_lanczos_eig_jit,
 from common.band_degeneracy import (DEFAULT_MODE, DEGENERACY_TOL_RY, MODES,
                                     check_band_window)
 from common.collectives import device_put_process_local
-from common.fft_helpers import make_sharded_ifftn_3d
+from common.fft_helpers import make_kfft_kminor
 from common.preprocessing_output import ScientificProductionReport
 from common.progress import LoopProgress
 from common.provenance import lorrax_version, provenance_header
@@ -2347,11 +2347,11 @@ def main(argv=None):
         psi_cQ_Y = psi_cQ_Y[sel]
         eps_cQ = eps_cQ[sel]
 
-    # ── W_R once (the ONE sharded-FFT helper), then the single-compile scan ──
+    # ── W_R once (the k-convolution router's k-minor door), then the single-compile scan ──
     t0 = time.time()
     sh = make_bse_shardings(mesh_xy)
-    _ifftn = make_sharded_ifftn_3d(mesh_xy, sh.W.spec, sh.W.spec,
-                                   axes=(2, 3, 4), norm="ortho")
+    _ifftn = make_kfft_kminor(mesh_xy, (nkx, nky, nkz), sh.W.spec,
+                              kind="ifftn", norm="ortho")
     # W_q is DONATED on the two SAME-SHAPE paths, and the caller-side
     # reference dropped, copied from ``bse_lanczos``'s W_R build.  XLA grants
     # the alias only when the output shape matches the input, so W_R becomes

@@ -345,29 +345,22 @@ class GWProductionReport:
         self.emit(f"Wavefunctions  : {getattr(wfn, 'backend', 'unknown')} reader")
         self.emit(f"Dense linalg   : {config.backend.linalg} layout")
 
-        # Report only controls with a caller in this calculation.  In
-        # particular, the k-leading candidate has no production Sigma caller,
-        # and the k-minor member belongs only to ladder-W screening.
-        relevant = {"LORRAX_FFT_FFI", "LORRAX_FFT_FFI_FUSED",
-                    "LORRAX_BANDS_GEMM_FFI"}
-        if getattr(config.screening.diagrams, "value", "") == "w_bse":
-            relevant.add("LORRAX_CONV_KMINOR_FFI")
+        # Report only controls with a caller in this calculation.  The
+        # k-convolutions (Σ, ζ fit, ladder-W) have no dial: the router picks
+        # nvidia-mathdx on CUDA and the plan route on cpu (decisions.md
+        # 2026-09-24) and announces that choice at startup.
+        relevant = {"LORRAX_FFT_FFI", "LORRAX_BANDS_GEMM_FFI"}
         descriptions = {
-            "LORRAX_FFT_FFI": "flat-k FFTs for ISDF, chi0 and Sigma",
-            "LORRAX_FFT_FFI_FUSED": "fused tau-domain convolution",
+            "LORRAX_FFT_FFI": "flat-k FFTs for ISDF and chi0",
             "LORRAX_BANDS_GEMM_FFI": "right-GEMM contraction forming G(tau)",
-            "LORRAX_CONV_KMINOR_FFI": "fused convolution in ladder-W",
         }
         cuda_engines = {
             "LORRAX_FFT_FFI": "cuFFT flat-k FFI",
-            "LORRAX_FFT_FFI_FUSED": "cuFFT fused-convolution FFI",
-            "LORRAX_CONV_KMINOR_FFI": "cuFFT k-minor convolution FFI",
         }
         host_engines = {
             # The host FFT target resolves its linked FFTW3-ABI engine inside
             # the library; RuntimeFacts intentionally does not guess a vendor.
             "LORRAX_FFT_FFI": "host flat-k FFT FFI",
-            "LORRAX_FFT_FFI_FUSED": "host fused-convolution FFI",
         }
         for dial in f.get("ffi_dials", ()):
             name = str(dial.get("env", ""))
@@ -393,7 +386,7 @@ class GWProductionReport:
         kconv = {"CUDA": "nvidia-mathdx fused cuFFTDx kernels",
                  "cpu": "MKL flat-k plan route"}.get(platform, "no backend on this platform")
         self.emit(f"{'k-convolution router':<26} = {platform:<6} : "
-                  f"pair-density convolution forming V(q) ({kconv})")
+                  f"k-axis convolutions of the zeta fit and Sigma ({kconv})")
 
     def sampling(self, *, wfn, sym, centroids=None) -> None:
         self.heading("Crystal symmetry and Brillouin-zone sampling")

@@ -741,9 +741,8 @@ def _host_target_id() -> str:
 #:
 #: Everything else in :func:`_key_env_fingerprint` is about the cache KEY of
 #: the same module.  These are different and worse: they change the module
-#: ITSELF.  ``LORRAX_FFT_FFI_FUSED`` picks between a fused host-FFI
-#: ``ffi_call`` and a native three-FFT ``jnp`` chain inside
-#: ``gw.ppm_tau_kernel`` / ``gw.cohsex_sigma`` / ``gw.w_isdf``, so a rank
+#: ITSELF.  ``LORRAX_BANDS_GEMM_FFI`` picks between a vendor-GEMM
+#: ``ffi_call`` and a native ``dot`` inside the band contractions, so a rank
 #: launched with a different value emits different HLO, compiles a different
 #: program, and misses where its peers hit — ``jit__multi_slice``'s
 #: divergence (FIX_multislice_cachekey.md §6.1, sibling 5) arriving through
@@ -763,10 +762,7 @@ def _host_target_id() -> str:
 RANK_FINGERPRINT_ENV = (
     "LORRAX_SIGMA_PREPARED_BOUNDS",
     "LORRAX_FFT_FFI",
-    "LORRAX_FFT_FFI_FUSED",
     "LORRAX_BANDS_GEMM_FFI",
-    "LORRAX_CONV_KMINOR_FFI",
-    "LORRAX_CONV_KLEAD_FFI",
 )
 
 
@@ -1964,6 +1960,25 @@ def _resolve_cache_base_dir() -> tuple[str, str]:
     if explicit is not None:
         return explicit.strip(), "explicit"
     return "", "default cold"
+
+
+def kernel_cache_dir(name: str) -> str:
+    """Where a small device-kernel cache named ``name`` lives, or ``""`` (off).
+
+    For compile products this module does not manage itself — the
+    nvidia-mathdx k-convolution cubins (``ffi.fft``) — so they follow the same
+    one knob instead of inventing a second: ``ISDF_JAX_CACHE_DIR=<dir>`` puts
+    them in ``<dir>/<name>`` and ``ISDF_JAX_CACHE_DIR=""`` switches them off.
+    Unset, they use the runtime's per-user cache root ``~/.cache/lorrax``
+    (the minimax rule cache's).  Unlike the XLA cache they default ON: a
+    kernel image is a few hundred KB keyed by its full content hash and
+    re-verified on read, so reusing one across runs cannot change a result,
+    and recompiling it costs about 6 s per k-grid per process.
+    """
+    base, source = _resolve_cache_base_dir()
+    if source == "explicit":
+        return os.path.join(base, name) if base else ""
+    return os.path.join(os.path.expanduser("~"), ".cache", "lorrax", name)
 
 
 # ---------------------------------------------------------------------------

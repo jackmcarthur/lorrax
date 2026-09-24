@@ -2334,8 +2334,7 @@ def _enforce_required_ffi(mesh, *, announce: bool = True) -> None:
     first kernel factory mid-run; an explicit ``=0`` refuses (where the
     native duplicate was deleted — LORRAX_FFT_FFI) or announces the
     uncertified debug opt-out (where a native path is structurally
-    retained — LORRAX_BANDS_GEMM_FFI, LORRAX_FFT_FFI_FUSED's decomposed
-    FFI chain).  Out-of-scope platforms are skipped per each gate's
+    retained — LORRAX_BANDS_GEMM_FFI).  Out-of-scope platforms are skipped per each gate's
     declared policy (the platform's native lowering IS the required path
     there, e.g. cuBLAS dot on CUDA for the GEMM dial).
 
@@ -2345,20 +2344,11 @@ def _enforce_required_ffi(mesh, *, announce: bool = True) -> None:
     log.  An import failure of the gate modules themselves is a broken
     build and propagates for the same reason.
     """
-    from ffi.fft import (CONV_KLEAD_GATE, CONV_KMINOR_GATE,
-                         FUSED_GATE, GATE as _FFT_GATE, require_kconv)
+    from ffi.fft import GATE as _FFT_GATE, require_kconv
     from ffi.gemm import GATE as _GEMM_GATE
 
-    for gate in (_FFT_GATE, FUSED_GATE, _GEMM_GATE):
+    for gate in (_FFT_GATE, _GEMM_GATE):
         gate.enforce(mesh, announce=announce)
-    # The CONV_K* dials are ACCELERATOR gates, so enforce() reports their
-    # platform/handler capability at startup while each caller resolves the
-    # runtime shape through its plan helper.  `auto` never raises; `on`
-    # refuses missing platform/handler capability by name; `off` announces
-    # the explicit opt-out.  The k-leading member defaults off and has no
-    # production consumer until its separately-reviewed Sigma seam lands.
-    CONV_KMINOR_GATE.enforce(mesh, announce=announce)
-    CONV_KLEAD_GATE.enforce(mesh, announce=announce)
     # The k-convolution router has no dial: it resolves by platform and
     # refuses here, at startup, when its backend cannot be served (on CUDA a
     # missing nvidia-mathdx wheel; decisions.md 2026-09-24).
@@ -2380,22 +2370,14 @@ def _ffi_dial_facts() -> list:
     out = []
     try:
         from ffi.gemm import GATE as _GEMM_GATE
-        from ffi.fft import (CONV_KLEAD_GATE, CONV_KMINOR_GATE,
-                             GATE as _FFT_GATE, FUSED_GATE)
+        from ffi.fft import GATE as _FFT_GATE
     except Exception as exc:                                  # noqa: BLE001
         return [{"env": "<ffi dials>", "mode": None, "enabled": None,
                  "detail": f"the FFI gate modules could not be imported "
                            f"({type(exc).__name__}: {exc})"}]
     for gate, what in ((_GEMM_GATE, "the contract_bands right-GEMM "
                                     "contraction"),
-                       (_FFT_GATE, "the flat-k 3-D FFT helper path"),
-                       (FUSED_GATE, "the fused IFFT-multiply-FFT tau kernel"),
-                       (CONV_KMINOR_GATE,
-                        "the fused k-MINOR ifft-multiply-fft conv (the BSE "
-                        "ladder-W rung; accelerator)"),
-                       (CONV_KLEAD_GATE,
-                        "the direct fused k-LEADING IFFT(G)-IFFT(W)-FFT "
-                        "conv (Sigma; accelerator, default off)")):
+                       (_FFT_GATE, "the flat-k 3-D FFT helper path")):
         try:
             mode = gate.mode()
             enabled = gate.enabled()

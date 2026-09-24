@@ -16,17 +16,37 @@
 //             convolution": A/B are raw-parent (p,ns,mu,ns,nu) projectors and
 //             the load applies the umklapp phases, the antiunitary conjugation
 //             and the open-spin coefficients; U is (nk, mu, nu).
+//   2 klead conv   U[k,a,x,b,y] = s * FFT_k( IFFT_k T[.,a,x,b,y] * V[k,x,y] ),
+//                  T/U k-LEADING (nk, a, mx, b, my), V (nk, mx, my) ALREADY in
+//                  R space (mode 3 made it): the Sigma tau and COHSEX kernel.
+//   3 klead fft    Y[k,r] = s * FFT^{+-}_k X[.,r] on a k-LEADING (nk, rows) tile.
+//   4 kminor conv  U = s * FFT_k( IFFT_k X[r,.] * K[(r/(d3 d4)) % (d1 d2), k] ),
+//                  X (d0,d1,d2,d3,d4,nk) k-MINOR, K (d1,d2,nk) R space; the
+//                  store emits X's layout (out_layout 0) or (d0,nk,d3,d1,d4,d2)
+//                  (out_layout 1): the BSE ladder-W rung.
+//   5 kminor fft   Y[r,k] = s * FFT^{+-}_k X[r,.] on a k-MINOR (rows, nk) tile.
 // A new mode adds (1) an entry under its LRX_MODE value in kSrc, (2) a mode
 // code and a handler below, (3) a router factory in ffi/fft.py.
 //
-// Residency: every row (one (col,mu) pair) keeps three nk-long banks in shared
-// memory; a k-grid whose row does not fit the device's opt-in shared memory,
-// or an axis above the fp64 thread-FFT limit (40), is refused by name.
+// Residency: modes 0/1 keep three nk-long banks per row (one (col,mu) pair) in
+// shared memory, modes 2-5 one; a k-grid whose row does not fit the device's
+// opt-in shared memory, or an axis above the fp64 thread-FFT limit (40), is
+// refused by name.  Modes 2/3/5 may run in place: every block reads all nk
+// values of its own rows before it stores any of them.
 //
 // Headers: the Python router passes the installed wheel's nvidia/mathdx
 // directory as the string attribute `mathdx_root`; the CUDA toolkit include
-// (for libcu++, include/cccl) is derived from the loaded libnvrtc.  No
-// environment variable is read.
+// (for libcu++, include/cccl) is derived from the loaded libnvrtc.
+//
+// Disk cache: the router passes `cubin_dir` (common.jax_compile_cache.
+// kernel_cache_dir: ISDF_JAX_CACHE_DIR/kconv_mathdx, else ~/.cache/lorrax/
+// kconv_mathdx; "" = off).  A cubin is keyed
+// by FNV-1a over the embedded source, the NVRTC options (mode, grid, ns, rows
+// per block, sm), the cuFFTDx/commonDx version headers of the wheel and the
+// NVRTC version; it is written to a unique temporary and renamed (atomic on
+// one filesystem, so concurrent ranks cannot tear it) and re-hashed on read
+// (a torn or foreign file is recompiled and replaced).  No environment
+// variable is read here.
 
 #include <algorithm>
 #include <chrono>
@@ -41,7 +61,13 @@
 #include <vector>
 
 #include <dlfcn.h>
+#include <fcntl.h>
 #include <sys/stat.h>
+#include <unistd.h>
+
+#include <cerrno>
+#include <fstream>
+#include <random>
 
 #include "../common/mkl_thread_pin.h"
 
@@ -56,9 +82,13 @@ namespace lorrax_ffi::kconv_mathdx {
 namespace ffi = ::xla::ffi;
 
 static constexpr int kAxisMax = 40;        // cuFFTDx fp64 thread-FFT limit
-static constexpr int kRowsMax = 16;
+static constexpr int kRowsMax = 16;        // modes 0/1 (three banks per row)
 static constexpr int kThreads = 256;
 static constexpr long long kSmemBudget = 100 * 1024;
+// Modes 2-5 keep ONE bank per row; ~48 KiB per block lets three blocks share
+// an A100 SM.  ponytail: rows-per-block is a fixed heuristic, not tuned per grid.
+static constexpr int kRowsMax1 = 64;
+static constexpr long long kSmemBudget1 = 48 * 1024;
 
 static bool log_enabled() {
     static const bool on = [] { return mklpin::debug_print_here(); }();
@@ -132,6 +162,16 @@ struct ParentTables {
     int mu, nu, centroid_major;
 };
 
+// Modes 2-5 row geometry (the embedded source declares the same struct).
+struct RowGeo {
+    long long rows;           // independent k-rows in the tile
+    long long m0, m1, m2;     // mode 2: my, b*my, mx     mode 4: d1*d2, d3*d4, -
+    long long d1, d2, d3, d4; // mode 4 out_layout 1 store permutation
+    double scale;
+    int forward;              // modes 3/5: 1 forward (exp -i), 0 inverse
+    int out_layout;           // mode 4
+};
+
 // ---------------------------------------------------------------------------
 //  The embedded source.  Compile-time: LRX_MODE, LRX_NX/NY/NZ, LRX_NS, LRX_RB,
 //  LRX_SM.  The transforms are cuFFTDx thread FFTs; everything else (loads,
@@ -141,11 +181,26 @@ struct ParentTables {
 static const char* kSrc = R"__lrx__(
 #include <cufftdx.hpp>
 
+// LRX_F32: modes 2-5 also serve complex64 tiles (the fp32-GMRES BSE arm).
+#if LRX_F32
+typedef float lrx_real;
+struct __align__(8) lrx_c2 { float x, y; };
+#else
+typedef double lrx_real;
 struct __align__(16) lrx_c2 { double x, y; };
+#endif
 struct ParentTables {
     const int *irr, *sym, *left, *right, *trs;
     const double *L, *R, *q, *coef_l, *coef_r;
     int mu, nu, centroid_major;
+};
+struct RowGeo {
+    long long rows;
+    long long m0, m1, m2;
+    long long d1, d2, d3, d4;
+    double scale;
+    int forward;
+    int out_layout;
 };
 
 __device__ __forceinline__ lrx_c2 lrx_mul(lrx_c2 a, lrx_c2 b) {
@@ -159,6 +214,7 @@ __device__ __forceinline__ lrx_c2 lrx_phase(lrx_c2 z, int code) {
     return z;
 }
 
+#if LRX_MODE == 1
 // P = conj(sum_cd U_ac conj(U_bd) T[phase_L D_cd conj(phase_R)]) from owner-local maps.
 __device__ __forceinline__ lrx_c2 lrx_parent_load(
     const lrx_c2* d, ParentTables t, int k, int a, int b, long long row, int ns, bool right) {
@@ -190,12 +246,13 @@ __device__ __forceinline__ lrx_c2 lrx_parent_load(
     sum.y = -sum.y;
     return sum;
 }
+#endif
 
 constexpr int NX = LRX_NX, NY = LRX_NY, NZ = LRX_NZ, NS = LRX_NS, RB = LRX_RB;
 constexpr int NK = NX * NY * NZ, SP = NK | 1;
 
 template <int N, cufftdx::fft_direction Dir>
-using TFFT = decltype(cufftdx::Size<N>() + cufftdx::Precision<double>() +
+using TFFT = decltype(cufftdx::Size<N>() + cufftdx::Precision<lrx_real>() +
                       cufftdx::Type<cufftdx::fft_type::c2c>() + cufftdx::Direction<Dir>() +
                       cufftdx::Thread() + cufftdx::SM<LRX_SM>());
 
@@ -228,6 +285,7 @@ __device__ __forceinline__ void transform3(lrx_c2* bank) {
     axis_pass<NX, NY * NZ, Dir>(bank);
 }
 
+#if LRX_MODE < 2
 // Modes 0 (pair) and 1 (parent): the post-pair spin-contracted k-convolution.
 extern "C" __global__ void __launch_bounds__(256) lrx_kconv(
     const lrx_c2* __restrict__ ain, const lrx_c2* __restrict__ bin, lrx_c2* __restrict__ uout,
@@ -285,13 +343,76 @@ extern "C" __global__ void __launch_bounds__(256) lrx_kconv(
         }
     }
 }
+#else
+// Modes 2-5: one resident bank per row.  k-LEADING tiles (2, 3) hold element
+// (k, r) at k*rows + r, so a block's load walks its RB rows fastest (coalesced
+// over rows); k-MINOR tiles (4, 5) hold (r, k) at r*NK + k and walk k fastest.
+// x and y may alias (in place): every element a block stores is one it loaded.
+constexpr bool KLEAD = (LRX_MODE == 2 || LRX_MODE == 3);
+constexpr bool CONV = (LRX_MODE == 2 || LRX_MODE == 4);
+
+__device__ __forceinline__ long long lrx_elem(long long row, int k, long long rows) {
+    return KLEAD ? (long long)k * rows + row : row * NK + k;
+}
+
+extern "C" __global__ void __launch_bounds__(256) lrx_kconv(
+    const lrx_c2* x, const lrx_c2* __restrict__ kern, lrx_c2* y, RowGeo g) {
+    extern __shared__ lrx_c2 sm[];
+    const long long r0 = (long long)blockIdx.x * RB;
+    using namespace cufftdx;
+    for (int i = threadIdx.x; i < RB * NK; i += blockDim.x) {
+        const int k = KLEAD ? i / RB : i % NK, j = KLEAD ? i % RB : i / NK;
+        const long long row = r0 + j;
+        lrx_c2 v = {0.0, 0.0};
+        if (row < g.rows) v = x[lrx_elem(row, k, g.rows)];
+        sm[j * SP + k] = v;
+    }
+    __syncthreads();
+    if (CONV || !g.forward) transform3<fft_direction::inverse>(sm);
+    else transform3<fft_direction::forward>(sm);
+    if (CONV) {
+        for (int i = threadIdx.x; i < RB * NK; i += blockDim.x) {
+            const int k = KLEAD ? i / RB : i % NK, j = KLEAD ? i % RB : i / NK;
+            const long long row = r0 + j;
+            if (row < g.rows) {
+                const long long kidx = (LRX_MODE == 2)
+                    ? (long long)k * (g.m2 * g.m0) + ((row / g.m1) % g.m2) * g.m0 + row % g.m0
+                    : ((row / g.m1) % g.m0) * NK + k;
+                sm[j * SP + k] = lrx_mul(sm[j * SP + k], kern[kidx]);
+            }
+        }
+        __syncthreads();
+        transform3<fft_direction::forward>(sm);
+    }
+    for (int i = threadIdx.x; i < RB * NK; i += blockDim.x) {
+        const int k = KLEAD ? i / RB : i % NK, j = KLEAD ? i % RB : i / NK;
+        const long long row = r0 + j;
+        if (row < g.rows) {
+            const lrx_c2 v = sm[j * SP + k];
+            lrx_c2 w;
+            w.x = (lrx_real)(v.x * g.scale);
+            w.y = (lrx_real)(v.y * g.scale);
+            long long o = lrx_elem(row, k, g.rows);
+            if (LRX_MODE == 4 && g.out_layout == 1) {       // (d0,nk,d3,d1,d4,d2)
+                long long t = row;
+                const long long i4 = t % g.d4; t /= g.d4;
+                const long long i3 = t % g.d3; t /= g.d3;
+                const long long i2 = t % g.d2; t /= g.d2;
+                const long long i1 = t % g.d1; const long long i0 = t / g.d1;
+                o = ((((i0 * NK + k) * g.d3 + i3) * g.d1 + i1) * g.d4 + i4) * g.d2 + i2;
+            }
+            y[o] = w;
+        }
+    }
+}
+#endif
 )__lrx__";
 
 // ---------------------------------------------------------------------------
 //  Build and cache
 // ---------------------------------------------------------------------------
 struct Built { CUfunction fn = nullptr; int rb = 1; int smem = 0; double compile_ms = 0.0; };
-using Key = std::tuple<CUcontext, int, int, int, int, int>;       // ctx, mode, nkx, nky, nkz, ns
+using Key = std::tuple<CUcontext, int, int, int, int, int, int>;  // ctx, mode, nkx, nky, nkz, ns, f32
 static std::mutex g_mu;
 static std::map<Key, Built> g_cache;
 static std::map<Key, std::string> g_fail;
@@ -314,8 +435,72 @@ static std::string toolkit_include(std::string* why) {
     return "";
 }
 
-static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, std::string_view mathdx_root,
-                        const Built** out) {
+static std::string read_file(const std::string& path) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) return "";
+    std::ostringstream os; os << f.rdbuf();
+    return os.str();
+}
+
+static uint64_t fnv1a(std::string_view data, uint64_t h = 1469598103934665603ULL) {
+    for (unsigned char c : data) { h ^= c; h *= 1099511628211ULL; }
+    return h;
+}
+
+static std::string hex16(uint64_t v) {
+    char b[17]; std::snprintf(b, sizeof b, "%016llx", static_cast<unsigned long long>(v)); return b;
+}
+
+// mkdir -p; true when the directory exists afterwards.
+static bool make_dirs(const std::string& dir) {
+    if (dir.empty()) return false;
+    std::string cur;
+    std::stringstream ss(dir);
+    std::string part;
+    if (dir[0] == '/') cur = "/";
+    while (std::getline(ss, part, '/')) {
+        if (part.empty()) continue;
+        cur += part + "/";
+        if (mkdir(cur.c_str(), 0775) != 0 && errno != EEXIST) return false;
+    }
+    return exists(dir);
+}
+
+// On-disk image: "LRXKCONV1\n" + 16 hex key + 16 hex payload hash + '\n' + cubin.
+static constexpr std::string_view kMagic = "LRXKCONV1\n";
+
+static bool disk_load(const std::string& path, const std::string& key_hex, std::vector<char>* cubin) {
+    const std::string blob = read_file(path);
+    const size_t head = kMagic.size() + 33;
+    if (blob.size() <= head || blob.compare(0, kMagic.size(), kMagic) != 0) return false;
+    if (blob.compare(kMagic.size(), 16, key_hex) != 0) return false;
+    const std::string_view payload(blob.data() + head, blob.size() - head);
+    if (blob.compare(kMagic.size() + 16, 16, hex16(fnv1a(payload))) != 0) return false;
+    cubin->assign(payload.begin(), payload.end());
+    return true;
+}
+
+// Unique temporary + rename: concurrent ranks each publish a whole file.
+static bool disk_store(const std::string& dir, const std::string& path, const std::string& key_hex,
+                       const std::vector<char>& cubin) {
+    if (!make_dirs(dir)) return false;
+    std::random_device rd;
+    const std::string tmp = path + ".tmp." + std::to_string(getpid()) + "." + hex16(rd() ^ (uint64_t(rd()) << 32));
+    {
+        std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+        if (!f) return false;
+        const std::string_view payload(cubin.data(), cubin.size());
+        f.write(kMagic.data(), kMagic.size());
+        f << key_hex << hex16(fnv1a(payload)) << '\n';
+        f.write(cubin.data(), static_cast<std::streamsize>(cubin.size()));
+        if (!f.good()) { f.close(); unlink(tmp.c_str()); return false; }
+    }
+    if (rename(tmp.c_str(), path.c_str()) != 0) { unlink(tmp.c_str()); return false; }
+    return true;
+}
+
+static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
+                        std::string_view mathdx_root, std::string_view cubin_dir, const Built** out) {
     const DriverApi& api = driver_api();
     if (!api.ok) return fail("driver-api resolve", api.err);
     CUcontext ctx = nullptr;
@@ -325,7 +510,7 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, std::string
         cr = api.CtxGetCurrent(&ctx);
         if (cr != CUDA_SUCCESS || ctx == nullptr) return fail("cuCtxGetCurrent", cu_err(cr));
     }
-    const Key key{ctx, mode, nkx, nky, nkz, ns};
+    const Key key{ctx, mode, nkx, nky, nkz, ns, f32 ? 1 : 0};
     std::lock_guard<std::mutex> lock(g_mu);
     if (auto it = g_cache.find(key); it != g_cache.end()) { *out = &it->second; return ffi::Error::Success(); }
     if (auto it = g_fail.find(key); it != g_fail.end()) return fail("kernel build (cached failure)", it->second);
@@ -342,13 +527,15 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, std::string
     LRX_CUDA_CHECK(cudaDeviceGetAttribute(&smem_optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev),
                    "max opt-in shared memory");
     const int nk = nkx * nky * nkz, sp = nk | 1;
-    const long long row_bytes = 3LL * 16 * sp;
-    long long rb = std::min<long long>(kRowsMax, kSmemBudget / row_bytes);
-    if (rb < 1) rb = std::min<long long>(kRowsMax, smem_optin / row_bytes);
+    const int banks = mode < 2 ? 3 : 1;
+    const long long rows_max = mode < 2 ? kRowsMax : kRowsMax1;
+    const long long row_bytes = static_cast<long long>(banks) * (f32 ? 8 : 16) * sp;
+    long long rb = std::min<long long>(rows_max, (mode < 2 ? kSmemBudget : kSmemBudget1) / row_bytes);
+    if (rb < 1) rb = std::min<long long>(rows_max, smem_optin / row_bytes);
     if (rb < 1) {
         std::ostringstream os;
         os << "GATE mathdx-kconv-residency: got k-grid (" << nkx << "," << nky << "," << nkz
-           << ") whose resident row needs 3*16*(nk|1)=" << row_bytes << " B; want <= "
+           << ") whose resident row needs " << banks << "*" << (f32 ? 8 : 16) << "*(nk|1)=" << row_bytes << " B; want <= "
            << smem_optin << " B of opt-in shared memory on this device; why: the fused "
               "one-pass family keeps a k-row in shared memory; fix: a smaller k-grid (the "
               "family has no out-of-core arm)";
@@ -364,32 +551,62 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, std::string
                       "got no cufftdx.hpp under " + inc + "; want the nvidia-mathdx wheel; fix: "
                       "pip install nvidia-mathdx", ffi::ErrorCode::kFailedPrecondition);
     }
-    std::vector<std::string> o = {
+    // Options that decide the cubin (include paths do not: two installs of one
+    // wheel version compile the same image).
+    const std::vector<std::string> defs = {
         "--std=c++17", "--device-as-default-execution-space",
         "--gpu-architecture=sm_" + std::to_string(cc_major) + std::to_string(cc_minor),
-        "-I" + inc, "-I" + cutlass, "-I" + cuda_inc, "-I" + cuda_inc + "/cccl",
         "-DLRX_MODE=" + std::to_string(mode), "-DLRX_NX=" + std::to_string(nkx),
         "-DLRX_NY=" + std::to_string(nky), "-DLRX_NZ=" + std::to_string(nkz),
         "-DLRX_NS=" + std::to_string(ns), "-DLRX_RB=" + std::to_string(rb),
+        "-DLRX_F32=" + std::string(f32 ? "1" : "0"),
         "-DLRX_SM=" + std::to_string(cc_major * 100 + cc_minor * 10)};
-    std::vector<const char*> opts;
-    for (auto& s : o) opts.push_back(s.c_str());
+    std::vector<std::string> o = defs;
+    for (const std::string& d : {"-I" + inc, "-I" + cutlass, "-I" + cuda_inc, "-I" + cuda_inc + "/cccl"})
+        o.push_back(d);
+
+    // Disk cache key: source, deciding options, wheel version headers, NVRTC version.
+    int nv_major = 0, nv_minor = 0;
+    nvrtcVersion(&nv_major, &nv_minor);
+    uint64_t h = fnv1a(kSrc);
+    for (const auto& d : defs) h = fnv1a(d, fnv1a("\x1f", h));
+    h = fnv1a(read_file(inc + "/cufftdx/cufftdx_version.hpp"), h);
+    h = fnv1a(read_file(inc + "/commondx/commondx_version.hpp"), h);
+    h = fnv1a("nvrtc" + std::to_string(nv_major) + "." + std::to_string(nv_minor), h);
+    const std::string key_hex = hex16(h);
+    const std::string dir(cubin_dir);
+    std::string path;
+    if (!dir.empty()) {
+        std::ostringstream name;
+        name << dir << "/kconv_m" << mode << "_" << nkx << "x" << nky << "x" << nkz << "_ns" << ns
+             << (f32 ? "_c64" : "") << "_sm" << cc_major << cc_minor << "_" << key_hex << ".cubin";
+        path = name.str();
+    }
+
     const auto t0 = std::chrono::steady_clock::now();
-    nvrtcProgram prog = nullptr;
-    nvrtcResult nr = nvrtcCreateProgram(&prog, kSrc, "lrx_kconv_mathdx.cu", 0, nullptr, nullptr);
-    if (nr != NVRTC_SUCCESS) return sticky("nvrtcCreateProgram", nvrtcGetErrorString(nr));
-    nr = nvrtcCompileProgram(prog, static_cast<int>(opts.size()), opts.data());
-    if (nr != NVRTC_SUCCESS) {
-        size_t n = 0; std::string log;
-        if (nvrtcGetProgramLogSize(prog, &n) == NVRTC_SUCCESS && n > 1) { log.resize(n); nvrtcGetProgramLog(prog, &log[0]); }
-        nvrtcDestroyProgram(&prog);
-        return sticky("nvrtcCompileProgram", std::string(nvrtcGetErrorString(nr)) + " -- " + log.substr(0, 4000));
+    std::vector<char> cubin;
+    const bool from_disk = !path.empty() && disk_load(path, key_hex, &cubin);
+    bool stored = false;
+    if (!from_disk) {
+        std::vector<const char*> opts;
+        for (auto& x : o) opts.push_back(x.c_str());
+        nvrtcProgram prog = nullptr;
+        nvrtcResult nr = nvrtcCreateProgram(&prog, kSrc, "lrx_kconv_mathdx.cu", 0, nullptr, nullptr);
+        if (nr != NVRTC_SUCCESS) return sticky("nvrtcCreateProgram", nvrtcGetErrorString(nr));
+        nr = nvrtcCompileProgram(prog, static_cast<int>(opts.size()), opts.data());
+        if (nr != NVRTC_SUCCESS) {
+            size_t n = 0; std::string log;
+            if (nvrtcGetProgramLogSize(prog, &n) == NVRTC_SUCCESS && n > 1) { log.resize(n); nvrtcGetProgramLog(prog, &log[0]); }
+            nvrtcDestroyProgram(&prog);
+            return sticky("nvrtcCompileProgram", std::string(nvrtcGetErrorString(nr)) + " -- " + log.substr(0, 4000));
+        }
+        size_t n = 0;
+        if (nvrtcGetCUBINSize(prog, &n) != NVRTC_SUCCESS || n == 0) {
+            nvrtcDestroyProgram(&prog); return sticky("nvrtcGetCUBINSize", "empty cubin");
+        }
+        cubin.resize(n); nvrtcGetCUBIN(prog, cubin.data()); nvrtcDestroyProgram(&prog);
+        if (!path.empty()) stored = disk_store(dir, path, key_hex, cubin);
     }
-    size_t n = 0; std::vector<char> cubin;
-    if (nvrtcGetCUBINSize(prog, &n) != NVRTC_SUCCESS || n == 0) {
-        nvrtcDestroyProgram(&prog); return sticky("nvrtcGetCUBINSize", "empty cubin");
-    }
-    cubin.resize(n); nvrtcGetCUBIN(prog, cubin.data()); nvrtcDestroyProgram(&prog);
     const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     CUmodule module = nullptr;
     cr = api.ModuleLoadData(&module, cubin.data());
@@ -405,9 +622,12 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, std::string
         if (cr != CUDA_SUCCESS) return sticky("cuFuncSetAttribute", cu_err(cr));
     }
     if (mklpin::announce_here() || log_enabled()) {
-        std::fprintf(stderr, "[kconv_mathdx] NVRTC built mode=%d kgrid=(%d,%d,%d) ns=%d sm_%d%d in %.1f ms "
-                     "(rows/block=%d, smem=%d B)\n", mode, nkx, nky, nkz, ns, cc_major, cc_minor, ms,
-                     b.rb, b.smem);
+        std::fprintf(stderr, "[kconv_mathdx] %s mode=%d%s kgrid=(%d,%d,%d) ns=%d sm_%d%d in %.1f ms "
+                     "(rows/block=%d, smem=%d B, cubin %s)\n",
+                     from_disk ? "disk-cache hit" : "NVRTC built", mode, f32 ? " c64" : "", nkx, nky, nkz, ns,
+                     cc_major, cc_minor, ms, b.rb, b.smem,
+                     path.empty() ? "not cached (ISDF_JAX_CACHE_DIR=\"\")"
+                                  : (from_disk ? path.c_str() : (stored ? "stored" : "store FAILED")));
     }
     *out = &(g_cache[key] = b);
     return ffi::Error::Success();
@@ -435,7 +655,8 @@ static ffi::Error Launch(cudaStream_t stream, int mode, ffi::AnyBuffer A, ffi::A
                          ffi::Result<ffi::AnyBuffer> U, int64_t nkx, int64_t nky, int64_t nkz,
                          double scale, ffi::Span<const int64_t> perm_l, ffi::Span<const int64_t> phase_l,
                          ffi::Span<const int64_t> perm_r, ffi::Span<const int64_t> phase_r,
-                         std::string_view mathdx_root, const ParentTables* parent) {
+                         std::string_view mathdx_root, std::string_view cubin_dir,
+                         const ParentTables* parent) {
     if (A.element_type() != ffi::DataType::C128 || B.element_type() != ffi::DataType::C128 ||
         U->element_type() != ffi::DataType::C128)
         return fail("contract", "complex128 only", ffi::ErrorCode::kInvalidArgument);
@@ -466,7 +687,7 @@ static ffi::Error Launch(cudaStream_t stream, int mode, ffi::AnyBuffer A, ffi::A
     if (rows == 0) return ffi::Error::Success();
     const Built* k = nullptr;
     ffi::Error e = build(mode, static_cast<int>(nkx), static_cast<int>(nky), static_cast<int>(nkz),
-                         static_cast<int>(ns), mathdx_root, &k);
+                         static_cast<int>(ns), false, mathdx_root, cubin_dir, &k);
     if (!e.success()) return e;
     const auto* ap = static_cast<const double*>(A.untyped_data());
     const auto* bp = static_cast<const double*>(B.untyped_data());
@@ -488,9 +709,9 @@ static ffi::Error PairDispatch(cudaStream_t stream, ffi::AnyBuffer A, ffi::AnyBu
                                ffi::Result<ffi::AnyBuffer> U, int64_t nkx, int64_t nky, int64_t nkz,
                                double scale, ffi::Span<const int64_t> perm_l, ffi::Span<const int64_t> phase_l,
                                ffi::Span<const int64_t> perm_r, ffi::Span<const int64_t> phase_r,
-                               std::string_view mathdx_root) {
+                               std::string_view mathdx_root, std::string_view cubin_dir) {
     return Launch(stream, 0, A, B, U, nkx, nky, nkz, scale, perm_l, phase_l, perm_r, phase_r,
-                  mathdx_root, nullptr);
+                  mathdx_root, cubin_dir, nullptr);
 }
 
 static ffi::Error ParentDispatch(
@@ -499,7 +720,8 @@ static ffi::Error ParentDispatch(
     ffi::AnyBuffer trs, ffi::AnyBuffer coef_l, ffi::AnyBuffer coef_r, ffi::Result<ffi::AnyBuffer> U,
     int64_t nkx, int64_t nky, int64_t nkz, double scale, int64_t centroid_major,
     ffi::Span<const int64_t> perm_l, ffi::Span<const int64_t> phase_l,
-    ffi::Span<const int64_t> perm_r, ffi::Span<const int64_t> phase_r, std::string_view mathdx_root) {
+    ffi::Span<const int64_t> perm_r, ffi::Span<const int64_t> phase_r, std::string_view mathdx_root,
+    std::string_view cubin_dir) {
     const auto ad = A.dimensions();
     if (ad.size() != 5) return fail("parent contract", "D must have rank 5", ffi::ErrorCode::kInvalidArgument);
     const int64_t nk = nkx * nky * nkz, ns = ad[1], mu = ad[2], nu = ad[4];
@@ -525,7 +747,96 @@ static ffi::Error ParentDispatch(
                    static_cast<const double*>(coef_r.untyped_data()),
                    static_cast<int>(mu), static_cast<int>(nu), static_cast<int>(centroid_major)};
     return Launch(stream, 1, A, B, U, nkx, nky, nkz, scale, perm_l, phase_l, perm_r, phase_r,
-                  mathdx_root, &t);
+                  mathdx_root, cubin_dir, &t);
+}
+
+// Modes 2-5: one bank per row.  `mode` fixes the layout; shapes are checked
+// against it here, geometry derived from the operand dimensions.
+static ffi::Error LaunchRows(cudaStream_t stream, int mode, ffi::AnyBuffer X, const ffi::AnyBuffer* K,
+                             ffi::Result<ffi::AnyBuffer> Y, int64_t nkx, int64_t nky, int64_t nkz,
+                             double scale, int64_t forward, int64_t out_layout,
+                             std::string_view mathdx_root, std::string_view cubin_dir) {
+    const char* what[] = {"", "", "klead conv", "klead fft", "kminor conv", "kminor fft"};
+    auto bad = [&](const std::string& why) {
+        return fail(what[mode], why, ffi::ErrorCode::kInvalidArgument);
+    };
+    const ffi::DataType dt = X.element_type();
+    if ((dt != ffi::DataType::C128 && dt != ffi::DataType::C64) || Y->element_type() != dt ||
+        (K && K->element_type() != dt))
+        return bad("operands must all be complex128 or all complex64");
+    const bool f32 = dt == ffi::DataType::C64;
+    if (nkx < 1 || nky < 1 || nkz < 1) return bad("k-grid axes must be >= 1");
+    if (nkx > kAxisMax || nky > kAxisMax || nkz > kAxisMax) {
+        std::ostringstream os;
+        os << "GATE mathdx-kconv-axis: got k-grid (" << nkx << "," << nky << "," << nkz
+           << "); want every axis <= " << kAxisMax << " (the fp64 cuFFTDx thread-FFT limit)";
+        return bad(os.str());
+    }
+    const int64_t nk = nkx * nky * nkz;
+    auto xd = X.dimensions(), yd = Y->dimensions();
+    RowGeo g{};
+    g.scale = scale; g.forward = forward ? 1 : 0; g.out_layout = static_cast<int>(out_layout);
+    auto same = [](auto a, auto b) { return a.size() == b.size() && std::equal(a.begin(), a.end(), b.begin()); };
+    if (mode == 2) {                                   // T (nk,a,mx,b,my), V (nk,mx,my)
+        auto kd = K->dimensions();
+        if (xd.size() != 5 || kd.size() != 3 || !same(xd, yd) || xd[0] != nk || kd[0] != nk ||
+            kd[1] != xd[2] || kd[2] != xd[4])
+            return bad("want T=U (nk,a,mx,b,my) and V (nk,mx,my) with nk = nkx*nky*nkz");
+        g.rows = xd[1] * xd[2] * xd[3] * xd[4];
+        g.m0 = xd[4]; g.m1 = xd[3] * xd[4]; g.m2 = xd[2];
+    } else if (mode == 4) {                            // X (d0..d4,nk), K (d1,d2,nk)
+        auto kd = K->dimensions();
+        if (xd.size() != 6 || kd.size() != 3 || xd[5] != nk || kd[0] != xd[1] || kd[1] != xd[2] ||
+            kd[2] != nk || (out_layout != 0 && out_layout != 1))
+            return bad("want X (d0,d1,d2,d3,d4,nk), K (d1,d2,nk), out_layout 0|1");
+        const int64_t want1[6] = {xd[0], nk, xd[3], xd[1], xd[4], xd[2]};
+        if (yd.size() != 6 || !(out_layout == 0 ? same(xd, yd) : std::equal(yd.begin(), yd.end(), want1)))
+            return bad("output shape does not match out_layout");
+        g.rows = xd[0] * xd[1] * xd[2] * xd[3] * xd[4];
+        g.m0 = xd[1] * xd[2]; g.m1 = xd[3] * xd[4];
+        g.d1 = xd[1]; g.d2 = xd[2]; g.d3 = xd[3]; g.d4 = xd[4];
+    } else {                                           // 3: (nk, rows)   5: (rows, nk)
+        if (xd.size() != 2 || !same(xd, yd) || xd[mode == 3 ? 0 : 1] != nk)
+            return bad(mode == 3 ? "want X=Y (nk, rows)" : "want X=Y (rows, nk)");
+        g.rows = xd[mode == 3 ? 1 : 0];
+    }
+    if (g.rows == 0) return ffi::Error::Success();
+    const Built* k = nullptr;
+    ffi::Error e = build(mode, static_cast<int>(nkx), static_cast<int>(nky), static_cast<int>(nkz), 1,
+                         f32, mathdx_root, cubin_dir, &k);
+    if (!e.success()) return e;
+    const void* xp = X.untyped_data();
+    const void* kp = K ? K->untyped_data() : nullptr;
+    void* yp = Y->untyped_data();
+    void* args[] = {(void*)&xp, (void*)&kp, (void*)&yp, (void*)&g};
+    const long long blocks = (g.rows + k->rb - 1) / k->rb;
+    if (blocks > 2147483647LL) return bad("grid.x overflow");
+    CUresult cr = driver_api().LaunchKernel(k->fn, static_cast<unsigned>(blocks), 1, 1, kThreads, 1, 1,
+                                            static_cast<unsigned>(k->smem),
+                                            reinterpret_cast<CUstream>(stream), args, nullptr);
+    if (cr != CUDA_SUCCESS) return fail("cuLaunchKernel", cu_err(cr));
+    return ffi::Error::Success();
+}
+
+static ffi::Error KleadConv(cudaStream_t s, ffi::AnyBuffer T, ffi::AnyBuffer V, ffi::Result<ffi::AnyBuffer> U,
+                            int64_t nkx, int64_t nky, int64_t nkz, double scale,
+                            std::string_view mathdx_root, std::string_view cubin_dir) {
+    return LaunchRows(s, 2, T, &V, U, nkx, nky, nkz, scale, 0, 0, mathdx_root, cubin_dir);
+}
+static ffi::Error KleadFft(cudaStream_t s, ffi::AnyBuffer X, ffi::Result<ffi::AnyBuffer> Y,
+                           int64_t nkx, int64_t nky, int64_t nkz, double scale, int64_t forward,
+                           std::string_view mathdx_root, std::string_view cubin_dir) {
+    return LaunchRows(s, 3, X, nullptr, Y, nkx, nky, nkz, scale, forward, 0, mathdx_root, cubin_dir);
+}
+static ffi::Error KminorConv(cudaStream_t s, ffi::AnyBuffer X, ffi::AnyBuffer K, ffi::Result<ffi::AnyBuffer> U,
+                             int64_t nkx, int64_t nky, int64_t nkz, double scale, int64_t out_layout,
+                             std::string_view mathdx_root, std::string_view cubin_dir) {
+    return LaunchRows(s, 4, X, &K, U, nkx, nky, nkz, scale, 0, out_layout, mathdx_root, cubin_dir);
+}
+static ffi::Error KminorFft(cudaStream_t s, ffi::AnyBuffer X, ffi::Result<ffi::AnyBuffer> Y,
+                            int64_t nkx, int64_t nky, int64_t nkz, double scale, int64_t forward,
+                            std::string_view mathdx_root, std::string_view cubin_dir) {
+    return LaunchRows(s, 5, X, nullptr, Y, nkx, nky, nkz, scale, forward, 0, mathdx_root, cubin_dir);
 }
 
 }  // namespace lorrax_ffi::kconv_mathdx
@@ -545,7 +856,8 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Attr<xla::ffi::Span<const int64_t>>("phase_l")
         .Attr<xla::ffi::Span<const int64_t>>("perm_r")
         .Attr<xla::ffi::Span<const int64_t>>("phase_r")
-        .Attr<std::string_view>("mathdx_root"));
+        .Attr<std::string_view>("mathdx_root")
+        .Attr<std::string_view>("cubin_dir"));
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
     KConvMathdxParentCudaFfi, lorrax_ffi::kconv_mathdx::ParentDispatch,
@@ -573,4 +885,56 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Attr<xla::ffi::Span<const int64_t>>("phase_l")
         .Attr<xla::ffi::Span<const int64_t>>("perm_r")
         .Attr<xla::ffi::Span<const int64_t>>("phase_r")
-        .Attr<std::string_view>("mathdx_root"));
+        .Attr<std::string_view>("mathdx_root")
+        .Attr<std::string_view>("cubin_dir"));
+
+#define LRX_KCONV_GRID_ATTRS                     \
+    .Attr<int64_t>("nkx")                         \
+    .Attr<int64_t>("nky")                         \
+    .Attr<int64_t>("nkz")                         \
+    .Attr<double>("scale")
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(
+    KConvMathdxKleadCudaFfi, lorrax_ffi::kconv_mathdx::KleadConv,
+    xla::ffi::Ffi::Bind()
+        .Ctx<xla::ffi::PlatformStream<cudaStream_t>>()
+        .Arg<xla::ffi::AnyBuffer>()
+        .Arg<xla::ffi::AnyBuffer>()
+        .Ret<xla::ffi::AnyBuffer>()
+        LRX_KCONV_GRID_ATTRS
+        .Attr<std::string_view>("mathdx_root")
+        .Attr<std::string_view>("cubin_dir"));
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(
+    KFftMathdxKleadCudaFfi, lorrax_ffi::kconv_mathdx::KleadFft,
+    xla::ffi::Ffi::Bind()
+        .Ctx<xla::ffi::PlatformStream<cudaStream_t>>()
+        .Arg<xla::ffi::AnyBuffer>()
+        .Ret<xla::ffi::AnyBuffer>()
+        LRX_KCONV_GRID_ATTRS
+        .Attr<int64_t>("forward")
+        .Attr<std::string_view>("mathdx_root")
+        .Attr<std::string_view>("cubin_dir"));
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(
+    KConvMathdxKminorCudaFfi, lorrax_ffi::kconv_mathdx::KminorConv,
+    xla::ffi::Ffi::Bind()
+        .Ctx<xla::ffi::PlatformStream<cudaStream_t>>()
+        .Arg<xla::ffi::AnyBuffer>()
+        .Arg<xla::ffi::AnyBuffer>()
+        .Ret<xla::ffi::AnyBuffer>()
+        LRX_KCONV_GRID_ATTRS
+        .Attr<int64_t>("out_layout")
+        .Attr<std::string_view>("mathdx_root")
+        .Attr<std::string_view>("cubin_dir"));
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(
+    KFftMathdxKminorCudaFfi, lorrax_ffi::kconv_mathdx::KminorFft,
+    xla::ffi::Ffi::Bind()
+        .Ctx<xla::ffi::PlatformStream<cudaStream_t>>()
+        .Arg<xla::ffi::AnyBuffer>()
+        .Ret<xla::ffi::AnyBuffer>()
+        LRX_KCONV_GRID_ATTRS
+        .Attr<int64_t>("forward")
+        .Attr<std::string_view>("mathdx_root")
+        .Attr<std::string_view>("cubin_dir"));
