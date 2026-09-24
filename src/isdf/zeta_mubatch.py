@@ -49,6 +49,7 @@ from common.wfn_transforms import (
     apply_bloch_phase_at,
     to_rchunk_inner,
 )
+from runtime.padding import axis_mask, pad_to_axis, padded_axis, strip_axis
 
 _XY = ('x', 'y')
 _kernel_cache: dict = {}
@@ -255,9 +256,10 @@ def plane_cylinder(psi_G_store, rs: RSpec):
 
 def make_batch_kernel(*, mesh: Mesh, rs: RSpec, plan, kgrid, fft_grid, ns: int,
                       b: int, n_bc: int, bc_w: int, nb_face: int,
-                      q_sel, q_neg, sphere_idx, qvec_frac, row_chunk: int,
+                      q_sel, q_axis, q_neg, sphere_idx, qvec_frac, row_chunk: int,
                       source: str, rows: str = 'mu', psi_G_store=None,
-                      cylinder=None, vertex=None, stop_at: str | None = None):
+                      cylinder=None, vertex=None, stop_at: str | None = None,
+                      k_chunk: int | None = None):
     """Compile-once executable for one batch; see the module docstring.
 
     ``source``: ``'cache'`` (ψ block cache), ``'resident'`` (ψ(G) on
@@ -265,8 +267,13 @@ def make_batch_kernel(*, mesh: Mesh, rs: RSpec, plan, kgrid, fft_grid, ns: int,
     plane route).  ``plan`` is the fit's ``CentroidKUnfoldPlan`` (parents,
     actions, spin representation).  Returns ``fn(src, X_B, band_rel, w_l,
     w_r, kvecs, cyl, geo, batch) -> rows`` with ``geo = (points, r_perm,
-    r_wrap, planes, box_from_slot)`` (:func:`r_blocks`) and ``batch =
+    r_wrap, planes, box_from_slot, sphere)`` (:func:`r_blocks`; ``sphere`` the
+    ``sphere_idx`` table as an operand, not an HLO constant) and ``batch =
     (left_perm, left_L)`` of this batch (``gw.centroid_k_unfold.orbit_mu_batches``).
+
+    ``q_axis`` is the stored-q ``runtime.padding.PaddedAxis`` (logical Q,
+    carrier a multiple of P) the store shares; ``sphere_idx`` is already at
+    the store's G-tile carrier width (padded once, by the caller).
 
     ``rows`` names who owns a row after the transpose: ``'q'`` (the R4
     q-local tier: rank p gets whole stored q's, ``Q_pad/P`` of them, for
@@ -274,6 +281,10 @@ def make_batch_kernel(*, mesh: Mesh, rs: RSpec, plan, kgrid, fft_grid, ns: int,
     ``P(('x','y'), None, None)``) or ``'mu'`` (rank p gets the batch slots
     ``p·c + [0, c)`` for every q; output ``(Q, b, ngk)`` at
     ``P(None, ('x','y'), None)``).
+
+    ``k_chunk`` (plane route): parents regenerated per step, a divisor of
+    ``n_parent`` (the planner's; bounds the band→plane transient, which
+    holds P·b_p bands of every regenerated parent on the rank's planes).
 
     ``stop_at`` (debug split timers only: ``'psi'``, ``'gemm'``, ``'kconv'``,
     ``'transpose'``) builds the same kernel truncated after that stage,
@@ -284,18 +295,22 @@ def make_batch_kernel(*, mesh: Mesh, rs: RSpec, plan, kgrid, fft_grid, ns: int,
     P_ = rs.n_ranks
     nk_src = int(plan.n_parent)
     nk = int(np.prod(kgrid))
+    kc = nk_src if k_chunk is None else int(k_chunk)
+    if nk_src % kc:
+        raise ValueError(f"make_batch_kernel: k_chunk {kc} must divide n_parent {nk_src}")
+    n_kc = nk_src // kc
     if rows == 'mu' and b % P_:
         raise ValueError(f"make_batch_kernel: batch {b} must be a multiple of P={P_}")
     c = b // P_ if rows == 'mu' else 0
-    q_sel = (np.arange(nk, dtype=np.int32) if q_sel is None
-             else np.asarray(q_sel, dtype=np.int32))
-    Q = int(q_sel.size)
-    if rows not in ('q', 'mu'):
-        raise ValueError(f"make_batch_kernel: rows={rows!r}")
-    Q_pad = -(-Q // P_) * P_
-    Qloc = Q_pad // P_
-    q_take = np.r_[q_sel, np.full(Q_pad - Q, q_sel[0], np.int32)]
-    q_live = np.r_[np.ones(Q), np.zeros(Q_pad - Q)]
+    q_sel = np.asarray(q_sel, dtype=np.int32)
+    Q = int(q_axis.logical)
+    if rows not in ('q', 'mu') or q_sel.shape != (Q,) or q_axis.divisor != P_:
+        raise ValueError(f"make_batch_kernel: rows={rows!r}, q_sel {q_sel.shape} "
+                         f"vs {q_axis}")
+    Q_pad, Qloc = q_axis.carrier, q_axis.carrier // P_
+    # Pad q rows gather any stored q and are zeroed by the mask.
+    q_take = np.asarray(pad_to_axis(q_sel, q_axis, axis=0, fill=int(q_sel[0])))
+    q_live = np.asarray(axis_mask(q_axis, dtype=np.float64))
     q_neg = None if q_neg is None else np.asarray(q_neg, dtype=np.int32)
     sphere = np.asarray(sphere_idx, dtype=np.int32)
     ngkmax = int(sphere.shape[1])
@@ -305,14 +320,15 @@ def make_batch_kernel(*, mesh: Mesh, rs: RSpec, plan, kgrid, fft_grid, ns: int,
         vertex = (np.arange(ns), np.ones(ns, dtype=np.complex128))
     n_rows = Qloc * b if rows == 'q' else Q * c
     cs = max(1, min(int(row_chunk), n_rows))
-    n_fft = -(-n_rows // cs)
+    rows_ax = padded_axis(n_rows, cs, name="μ-batch row-FFT scan rows")
+    n_fft = rows_ax.carrier // cs
     key = ('batch', _mesh_id(mesh), rs, id(plan), tuple(kgrid), ns, b, n_bc, bc_w,
-           nb_face, hash(q_sel.tobytes()),
+           nb_face, hash(q_sel.tobytes()), q_axis,
            None if q_neg is None else hash(q_neg.tobytes()),
-           hash(sphere.tobytes()), hash(qv.tobytes()), cs, source, rows,
+           sphere.shape, hash(qv.tobytes()), cs, source, rows,
            None if psi_G_store is None else id(psi_G_store),
            tuple(int(v) for v in np.asarray(vertex[0])),
-           tuple(complex(v) for v in np.asarray(vertex[1])), stop_at)
+           tuple(complex(v) for v in np.asarray(vertex[1])), stop_at, kc)
     hit = _kernel_cache.get(key)
     if hit is not None:
         return hit
@@ -348,60 +364,80 @@ def make_batch_kernel(*, mesh: Mesh, rs: RSpec, plan, kgrid, fft_grid, ns: int,
                 else P(None, None, _XY, None, None) if source == 'resident'
                 else P())
     geo_spec = (P(), P(_XY, None, None, None), P(_XY, None, None, None, None),
-                P(), P())
+                P(), P(), P())
 
     @partial(shard_map, mesh=mesh,
              in_specs=(src_spec, P(), P(), P(), P(), P(), P(), geo_spec, P()),
              out_specs=(P(_XY, None, None) if rows == 'q'
                         else P(None, _XY, None)), check_vma=False)
     def _local(src, X_B, band_rel, w_l, w_r, kvecs, cyl, geo, batch):
-        points, r_perm, r_wrap, planes, box_from_slot = geo
+        points, r_perm, r_wrap, planes, box_from_slot, sph = geo
         l_perm, l_wrap = batch
         x_idx = jax.lax.axis_index('x')
         y_idx = jax.lax.axis_index('y')
         p = x_idx * int(mesh.shape['y']) + y_idx
 
-        def psi_at(bc, s):
-            """ψ(n_parent, bc_w, ns, r_s) of band chunk bc on sub-block s (plane route)."""
-            g = (src[bc] if source == 'resident' else _io_callback(
+        def g_tile(bc):
+            """This rank's ψ(G) band shard of chunk bc, (n_parent, b_p, ns, ngk)."""
+            return (src[bc] if source == 'resident' else _io_callback(
                 _host, host_sds, x_idx, y_idx, bc, ordered=False))
+
+        def psi_at(g, s, k0, upto=None):
+            """ψ(kc, bc_w, ns, r_s) of parents [k0, k0+kc) on sub-block s (plane route).
+
+            ``upto`` (debug split timers): a checksum after the cylinder
+            1D DFT ('psi_dft'), the band→plane all-to-all ('psi_a2a') or the
+            2D plane IFFTs ('psi_ifft')."""
+            g = jax.lax.dynamic_slice_in_dim(g, k0, kc, axis=0)
             ngk = int(g.shape[-1])
             gpad = jnp.concatenate(
                 [g, jnp.zeros(g.shape[:3] + (1,), g.dtype)], axis=-1)
             ci, cax, pfc = cyl
-            idx = jnp.clip(ci, 0, ngk).reshape(nk_src, 1, 1, -1)
+            ci = jax.lax.dynamic_slice_in_dim(ci, k0, kc, axis=0)
+            idx = jnp.clip(ci, 0, ngk).reshape(kc, 1, 1, -1)
             cyl_v = jnp.take_along_axis(gpad, idx, axis=-1).reshape(
-                nk_src, g.shape[1], ns, n_col, -1)       # (k, b_p, s, col, n_s)
+                kc, g.shape[1], ns, n_col, -1)           # (k, b_p, s, col, n_s)
             pl_all = planes[:, s, :].reshape(-1)          # every rank's planes
             ph = jnp.exp((2j * jnp.pi / n_a) * (
                 cax.astype(jnp.float64)[:, None]
                 * jnp.maximum(pl_all, 0).astype(jnp.float64)[None, :])) * a_scale
             ph = jnp.where((pl_all >= 0)[None, :], ph, 0)
             F = jnp.einsum('kbscj,jp->kbspc', cyl_v, ph)
+            if upto == 'psi_dft':
+                return jnp.sum(jnp.abs(F))
             F = jax.lax.all_to_all(F, _XY, split_axis=3, concat_axis=1,
                                    tiled=True)             # (k, bc_w, s, n_pl, col)
+            if upto == 'psi_a2a':
+                return jnp.sum(jnp.abs(F))
             F = jnp.concatenate(
                 [F, jnp.zeros(F.shape[:4] + (1,), F.dtype)], axis=-1)
             stack = jnp.take(F, pfc, axis=-1)              # (k, bc_w, s, n_pl, ps)
             r = local_ifftn3(stack.reshape(*stack.shape[:4], n_b, n_c),
                              axes=(-2, -1), norm=norm2)
-            r = r.reshape(nk_src, bc_w, ns, rs.n_pl * ps)
+            if upto == 'psi_ifft':
+                return jnp.sum(jnp.abs(r))
+            r = r.reshape(kc, bc_w, ns, rs.n_pl * ps)
             pts = points[p, s]
             slot, on = _tile_plane_slots(pts, planes[p, s], fft_grid, rs.plane_axis)
             r = jnp.take(r, jnp.clip(slot, 0, rs.n_pl * ps - 1), axis=-1)
             r = jnp.where(on[None, None, None, :], r, 0)
-            return apply_bloch_phase_at(r, kvecs, fft_grid, pts)
+            return apply_bloch_phase_at(
+                r, jax.lax.dynamic_slice_in_dim(kvecs, k0, kc, axis=0),
+                fft_grid, pts)
 
         def sub_body(carry, s):
             buf, chk = carry
-            if stop_at == 'psi':
+            if stop_at in ('psi', 'psi_dft', 'psi_a2a', 'psi_ifft'):
                 acc = chk
                 if source == 'cache':
                     acc = acc + jnp.sum(jnp.abs(jax.lax.dynamic_slice_in_dim(
                         src, s * rs.r_s, rs.r_s, axis=4)))
                 else:
                     for bc in range(n_bc):
-                        acc = acc + jnp.sum(jnp.abs(psi_at(bc, s)))
+                        g = g_tile(bc)
+                        for kci in range(n_kc):
+                            acc = acc + jnp.sum(jnp.abs(psi_at(
+                                g, s, kci * kc, upto=stop_at)))
                 return (buf, acc), None
             if source == 'cache':
                 # Every band is resident on this r block: one GEMM over all
@@ -410,28 +446,37 @@ def make_batch_kernel(*, mesh: Mesh, rs: RSpec, plan, kgrid, fft_grid, ns: int,
                     src, s * rs.r_s, rs.r_s, axis=4)   # (c, k, n, b, r)
                 rel = jnp.clip(band_rel.reshape(-1), 0, nb_face - 1)
                 x = jnp.take(X_B, rel, axis=3).reshape(nk_src, ns, b, n_bc, bc_w)
-                yc = jnp.conj(psi)
-                D_l = jnp.einsum('kamcn,cknbr->kambr',
-                                 x * w_l[None, None, None], yc)
-                D_r = jnp.einsum('kamcn,cknbr->kambr',
-                                 x * w_r[None, None, None], yc)
+                # One GEMM for both windows: [x·w_L | x·w_R] along μ.
+                xlr = jnp.concatenate([x * w_l[None, None, None],
+                                       x * w_r[None, None, None]], axis=2)
+                D = jnp.einsum('kamcn,cknbr->kambr', xlr, jnp.conj(psi))
+                D_l, D_r = D[:, :, :b], D[:, :, b:]
             else:
-                def band_body(carry, bc):
-                    D_l, D_r = carry
-                    psi = psi_at(bc, s)
+                def band_body(D, bc):
+                    g = g_tile(bc)
                     rel = band_rel[bc]
                     x = jnp.take(X_B, jnp.clip(rel, 0, nb_face - 1), axis=3)
-                    yc = jnp.conj(psi)
-                    D_l = D_l + jnp.einsum(
-                        'kamn,knbr->kambr', x * w_l[bc][None, None, None, :], yc)
-                    D_r = D_r + jnp.einsum(
-                        'kamn,knbr->kambr', x * w_r[bc][None, None, None, :], yc)
-                    return (D_l, D_r), None
+                    # One GEMM for both windows: [x·w_L | x·w_R] along μ.
+                    xlr = jnp.concatenate([x * w_l[bc][None, None, None, :],
+                                           x * w_r[bc][None, None, None, :]], axis=2)
 
-                z0 = jnp.zeros((nk_src, ns, b, ns, rs.r_s), dtype=jnp.complex128)
-                (D_l, D_r), _ = jax.lax.scan(
-                    band_body, (z0, z0), jnp.arange(n_bc, dtype=jnp.int32),
-                    unroll=1)
+                    def k_body(D, kci):
+                        k0 = kci * kc
+                        sl = lambda a: jax.lax.dynamic_slice_in_dim(a, k0, kc, axis=0)
+                        dD = jnp.einsum('kamn,knbr->kambr', sl(xlr),
+                                        jnp.conj(psi_at(g, s, k0)))
+                        return jax.lax.dynamic_update_slice_in_dim(
+                            D, sl(D) + dD, k0, axis=0), None
+
+                    D, _ = jax.lax.scan(
+                        k_body, D, jnp.arange(n_kc, dtype=jnp.int32), unroll=1)
+                    return D, None
+
+                D, _ = jax.lax.scan(
+                    band_body,
+                    jnp.zeros((nk_src, ns, 2 * b, ns, rs.r_s), dtype=jnp.complex128),
+                    jnp.arange(n_bc, dtype=jnp.int32), unroll=1)
+                D_l, D_r = D[:, :, :b], D[:, :, b:]
             if stop_at == 'gemm':
                 return (buf, chk + jnp.sum(jnp.abs(D_l)) + jnp.sum(jnp.abs(D_r))), None
             Z = parent_projector_kconv(
@@ -462,7 +507,7 @@ def make_batch_kernel(*, mesh: Mesh, rs: RSpec, plan, kgrid, fft_grid, ns: int,
         (buf, chk), _ = jax.lax.scan(
             sub_body, (buf, jnp.float64(0.0)),
             jnp.arange(rs.n_sub, dtype=jnp.int32), unroll=1)
-        if stop_at in ('psi', 'gemm', 'kconv'):
+        if stop_at in ('psi', 'psi_dft', 'psi_a2a', 'psi_ifft', 'gemm', 'kconv'):
             return jnp.zeros(lead + (ngkmax,), jnp.complex128) + chk
         if stop_at == 'transpose':
             return jnp.zeros(lead + (ngkmax,), jnp.complex128) + jnp.sum(
@@ -473,13 +518,10 @@ def make_batch_kernel(*, mesh: Mesh, rs: RSpec, plan, kgrid, fft_grid, ns: int,
                 p * Qloc + jnp.arange(n_rows, dtype=jnp.int32) // b, Q - 1)
         else:
             q_row_all = jnp.arange(n_rows, dtype=jnp.int32) // c
-        pad_rows = n_fft * cs - n_rows
-        if pad_rows:
-            buf = jnp.pad(buf, ((0, pad_rows), (0, 0)))
-            q_row_all = jnp.pad(q_row_all, (0, pad_rows))
+        buf = pad_to_axis(buf, rows_ax, axis=0)
+        q_row_all = pad_to_axis(q_row_all, rows_ax, axis=0)
         phx_d, phy_d, phz_d = (jnp.asarray(phx), jnp.asarray(phy),
                                jnp.asarray(phz))
-        sph = jnp.asarray(sphere)
 
         def fft_body(out, i):
             sub = jax.lax.dynamic_slice_in_dim(buf, i * cs, cs, axis=0)
@@ -497,7 +539,7 @@ def make_batch_kernel(*, mesh: Mesh, rs: RSpec, plan, kgrid, fft_grid, ns: int,
         out, _ = jax.lax.scan(
             fft_body, jnp.zeros((n_fft * cs, ngkmax), dtype=jnp.complex128),
             jnp.arange(n_fft, dtype=jnp.int32), unroll=1)
-        return out[:n_rows].reshape(*lead, ngkmax)
+        return strip_axis(out, rows_ax, axis=0).reshape(*lead, ngkmax)
 
     fn = jax.jit(_local)
     _kernel_cache[key] = fn
@@ -554,9 +596,11 @@ class ZStore:
     * ``'host'``: one numpy tile ``(n_Gt, Q, n_batch·c, G_tile)`` per
       addressable device (the ``PsiGStore`` pattern): each rank keeps the
       rows it computed.
-    * ``'device'``: the same rank-local tile on the GPU (the planner's
-      shortcut when it fits beside the batch working set at no cost in
-      batch size).
+
+    ponytail: the store never lives on the device (owner simplification,
+    2026-09-23).  A small deck whose whole store would fit beside the batch
+    (CrI3 8x8 P16: 1.1 GB/rank) pays one host round trip, ~1 s; the
+    upgrade path is a device placement here, priced by the planner.
 
     :meth:`read_tile` returns ``Z[:, :, tile]`` either q-local
     ``(Q_pad, μ_pad, G_tile)`` at ``P(('x','y'), None, None)`` or G-split
@@ -564,23 +608,30 @@ class ZStore:
     tiers reach that layout with one all-to-all per tile.
     """
 
-    def __init__(self, *, mesh: Mesh, Q: int, mu_pad: int, n_G: int, b: int,
-                 g_tile: int, placement: str, rows: str = 'mu',
+    def __init__(self, *, mesh: Mesh, q_axis, mu_pad: int, g_axis, b: int,
+                 placement: str, rows: str = 'mu',
                  scratch_path: str | None = None, packed_from_slot=None,
                  n_batch: int | None = None):
+        """``q_axis``: stored q rows (carrier a multiple of P); ``g_axis``: the
+        ζ sphere cut into whole G tiles (divisor = ``G_tile``).  Both are
+        ``runtime.padding.PaddedAxis`` records the kernel and the finalize share."""
         self.mesh = mesh
         self.P = _mesh_size(mesh)
-        self.Q, self.mu_pad, self.n_G = int(Q), int(mu_pad), int(n_G)
+        self.q_axis, self.g_axis = q_axis, g_axis
+        if q_axis.divisor != self.P:
+            raise ValueError(f"ZStore: {q_axis} must divide over P={self.P}")
+        self.Q, self.mu_pad, self.n_G = q_axis.logical, int(mu_pad), g_axis.carrier
+        self.rows = str(rows)
         self.b, self.c = int(b), int(b) // self.P
-        if self.b % self.P:
-            raise ValueError(f"ZStore: batch {b} must be a multiple of P={self.P}")
-        self.g_tile = int(g_tile)
-        self.n_Gt = -(-self.n_G // self.g_tile)
+        if self.rows == 'mu' and self.b % self.P:
+            raise ValueError(f"ZStore(rows='mu'): batch {b} must be a multiple "
+                             f"of P={self.P} (each rank owns b/P of its rows)")
+        self.g_tile = g_axis.divisor
+        self.n_Gt = g_axis.carrier // g_axis.divisor
         self.n_batch = (-(-self.mu_pad // self.b) if n_batch is None
                         else int(n_batch))
-        self.Q_pad = -(-self.Q // self.P) * self.P
+        self.Q_pad = q_axis.carrier
         self.placement = str(placement)
-        self.rows = str(rows)
         # The store's μ axis is batch-slot order (β·b + j); readers gather the
         # packed carrier from it.  Contiguous batches make this a prefix.
         pfs = (np.arange(self.mu_pad, dtype=np.int32) if packed_from_slot is None
@@ -596,12 +647,7 @@ class ZStore:
             self._init_q_owned(scratch_path)
             return
         local_shape = (self.n_Gt, self.Q, self.n_batch * self.c, self.g_tile)
-        if self.placement == 'device':
-            self._dev = jax.jit(
-                lambda: jnp.zeros((self.n_Gt, self.Q, self.P * self.n_batch
-                                   * self.c, self.g_tile), jnp.complex128),
-                out_shardings=NamedSharding(mesh, P(None, None, _XY, None)))()
-        elif self.placement == 'host':
+        if self.placement == 'host':
             self._host = {dev.id: np.zeros(local_shape, np.complex128)
                           for dev in mesh.local_devices}
         elif self.placement == 'disk':
@@ -623,12 +669,10 @@ class ZStore:
     def _init_q_owned(self, scratch_path):
         self.Qloc = self.Q_pad // self.P
         shape = (self.Q_pad, self.n_Gt, self.n_batch * self.b, self.g_tile)
-        if self.placement == 'device':
-            self._dev = jax.jit(lambda: jnp.zeros(shape, jnp.complex128),
-                                out_shardings=NamedSharding(
-                                    self.mesh, P(_XY, None, None, None)))()
-        elif self.placement == 'host':
-            self._host = {dev.id: np.zeros((self.Qloc,) + shape[1:], np.complex128)
+        if self.placement == 'host':
+            # Tile-major on the host: a G-tile read is one contiguous block.
+            self._host = {dev.id: np.zeros((self.n_Gt, self.Qloc) + shape[2:],
+                                           np.complex128)
                           for dev in self.mesh.local_devices}
         elif self.placement == 'disk':
             from file_io.slab_io import SlabIO
@@ -642,43 +686,27 @@ class ZStore:
 
     def _write_q(self, beta, rows):
         chunks = _q_chunks(self.mesh, self.b, self.n_Gt, self.g_tile)(rows)
-        if self.placement == 'device':
-            self._dev = _q_batch_update(self.mesh, self.b)(
-                self._dev, chunks, jnp.int32(beta))
-        elif self.placement == 'host':
+        if self.placement == 'host':
             lo = int(beta) * self.b
             for shard in chunks.addressable_shards:
-                self._host[shard.device.id][:, :, lo:lo + self.b, :] = np.asarray(
-                    shard.data)
+                self._host[shard.device.id][:, :, lo:lo + self.b, :] = np.moveaxis(
+                    np.asarray(shard.data), 1, 0)
         else:
             self._io.write_slab('Z', chunks, offset=(0, 0, int(beta) * self.b, 0))
         return chunks
 
     def _read_q(self, t):
         n_slot = self.n_batch * self.b
-        if self.placement == 'device':
-            return _q_take_tile(self.mesh, n_slot)(self._dev, jnp.int32(t))
         if self.placement == 'host':
             return _host_tile_to_device(
                 self.mesh, P(_XY, None, None), (self.Q_pad, n_slot, self.g_tile),
-                {dev: self._host[dev.id][:, t, :, :]
-                 for dev in self.mesh.local_devices})
+                {dev: self._host[dev.id][t] for dev in self.mesh.local_devices})
         self._io.sync_writes()
         raw = self._io.read_slab(
             'Z', shape=(self.Q_pad, 1, n_slot, self.g_tile),
             offset=(0, int(t), 0, 0), mesh=self.mesh,
             partition_spec=P(_XY, None, None, None))
         return _q_disk_tile(self.mesh, n_slot)(raw)
-
-    @property
-    def device_bytes_per_rank(self) -> int:
-        """Persistent device bytes this store holds (0 off device)."""
-        if self.placement != 'device':
-            return 0
-        if self.rows == 'q':
-            return (self.Qloc * self.n_Gt * self.n_batch * self.b
-                    * self.g_tile * 16)
-        return self.n_Gt * self.Q * self.n_batch * self.c * self.g_tile * 16
 
     # -- write ------------------------------------------------------------
     def write_batch(self, beta: int, rows: jax.Array) -> None:
@@ -691,10 +719,7 @@ class ZStore:
             self.t_write += time.perf_counter() - t0
             return
         tiled = _tile_rows(self.mesh, self.Q, self.b, self.n_Gt, self.g_tile)(rows)
-        if self.placement == 'device':
-            self._dev = _device_batch_update(self.mesh, self.c)(
-                self._dev, tiled, jnp.int32(beta))
-        elif self.placement == 'host':
+        if self.placement == 'host':
             lo = int(beta) * self.c
             for shard in tiled.addressable_shards:
                 self._host[shard.device.id][:, :, lo:lo + self.c, :] = np.asarray(
@@ -730,28 +755,22 @@ class ZStore:
                     partition_spec=P(None, None, None, _XY))
             out = _disk_tile(self.mesh, layout, self.n_batch * self.b)(raw)
         else:
-            if self.placement == 'device':
-                local = _device_take_tile(self.mesh)(self._dev, jnp.int32(t))
-            else:
-                local = _host_tile_to_device(
-                    self.mesh, P(None, _XY, None),
-                    (self.Q, self.P * self.n_batch * self.c, self.g_tile),
-                    {dev: self._host[dev.id][t]
-                     for dev in self.mesh.local_devices})
+            local = _host_tile_to_device(
+                self.mesh, P(None, _XY, None),
+                (self.Q, self.P * self.n_batch * self.c, self.g_tile),
+                {dev: self._host[dev.id][t] for dev in self.mesh.local_devices})
             out = _rows_to_layout(self.mesh, layout, self.P, self.n_batch,
-                                  self.c, self.n_batch * self.b, self.Q_pad)(local)
+                                  self.c, self.n_batch * self.b, self.q_axis)(local)
         # Store slot order → packed centroid order (a prefix for contiguous
         # batches, a gather for orbit batches).
         out = _slots_to_packed(self.mesh, layout)(out, jnp.asarray(self._pfs))
-        jax.block_until_ready(out)
+        # Not blocked: the caller prefetches tile t+1 behind tile t's work.
         self.bytes_read += self.Q * self.mu_pad * self.g_tile * 16
         self.t_read += time.perf_counter() - t0
         return out
 
     def close(self) -> None:
-        if self.placement == 'device':
-            self._dev = None
-        elif self.placement == 'host':
+        if self.placement == 'host':
             self._host.clear()
         else:
             self._io.close()
@@ -769,8 +788,7 @@ class ZStore:
                 f"{self.n_batch} batches of {self.b}; written "
                 f"{self.bytes_written / 1e9:.2f} GB in {self.t_write:.2f} s, "
                 f"read {self.bytes_read / 1e9:.2f} GB in {self.t_read:.2f} s "
-                f"(global volumes; device resident "
-                f"{self.device_bytes_per_rank / 1e9:.2f} GB/rank)")
+                f"(global volumes)")
 
 
 def _tile_rows(mesh, Q, b, n_Gt, g_tile):
@@ -788,38 +806,9 @@ def _tile_rows(mesh, Q, b, n_Gt, g_tile):
     return fn
 
 
-def _device_batch_update(mesh, c):
-    key = ('batch_update', _mesh_id(mesh), int(c))
-    fn = _kernel_cache.get(key)
-    if fn is None:
-        @partial(shard_map, mesh=mesh,
-                 in_specs=(P(None, None, _XY, None), P(None, None, _XY, None), P()),
-                 out_specs=P(None, None, _XY, None), check_vma=False)
-        def _upd(store, tiled, beta):
-            return jax.lax.dynamic_update_slice_in_dim(store, tiled, beta * c,
-                                                       axis=2)
-        fn = jax.jit(_upd, donate_argnums=(0,))
-        _kernel_cache[key] = fn
-    return fn
-
-
-def _device_take_tile(mesh):
-    key = ('take_tile', _mesh_id(mesh))
-    fn = _kernel_cache.get(key)
-    if fn is None:
-        @partial(shard_map, mesh=mesh,
-                 in_specs=(P(None, None, _XY, None), P()),
-                 out_specs=P(None, _XY, None), check_vma=False)
-        def _t(store, t):
-            return jax.lax.dynamic_index_in_dim(store, t, axis=0, keepdims=False)
-        fn = jax.jit(_t)
-        _kernel_cache[key] = fn
-    return fn
-
-
-def _rows_to_layout(mesh, layout, P_, n_batch, c, mu_pad, Q_pad):
+def _rows_to_layout(mesh, layout, P_, n_batch, c, mu_pad, q_axis):
     """Rank-local rows ``(Q, P·n_batch·c, g)`` (μ in rank-major order) → q-local or G-split."""
-    key = ('rows_to_layout', _mesh_id(mesh), layout, P_, n_batch, c, mu_pad, Q_pad)
+    key = ('rows_to_layout', _mesh_id(mesh), layout, P_, n_batch, c, mu_pad, q_axis)
     fn = _kernel_cache.get(key)
     if fn is None:
         out_spec = P(_XY, None, None) if layout == 'q' else P(None, None, _XY)
@@ -828,9 +817,7 @@ def _rows_to_layout(mesh, layout, P_, n_batch, c, mu_pad, Q_pad):
                  out_specs=out_spec, check_vma=False)
         def _f(x):                                        # (Q, n_batch·c, g)
             if layout == 'q':
-                Q = x.shape[0]
-                if Q_pad > Q:
-                    x = jnp.pad(x, ((0, Q_pad - Q), (0, 0), (0, 0)))
+                x = pad_to_axis(x, q_axis, axis=0)
                 x = jax.lax.all_to_all(x, _XY, split_axis=0, concat_axis=1,
                                        tiled=True)        # (Q_pad/P, P·n_b·c, g)
             else:
@@ -862,9 +849,6 @@ def _disk_tile(mesh, layout, mu_pad):
 # ---------------------------------------------------------------------------
 # ζ held as (Z store, C⁺): formed tile by tile, never materialized whole
 # ---------------------------------------------------------------------------
-
-_LOCAL_KINDS = ('replicated_rank_truncate', 'replicated_cholesky',
-                'sharded_cholesky')
 
 
 def zeta_shell_slots(gvec_components, ngk_per_q, q_frac, bvec, q_full_frac,
@@ -956,12 +940,12 @@ class ZetaG:
         """
         t0 = time.perf_counter()
         st = self.store
-        v = np.zeros((st.Q_pad, st.n_Gt * st.g_tile), dtype=np.complex128)
-        v[:st.Q, :self.ngkmax] = np.asarray(v_table, dtype=np.complex128)
-        ngk = np.zeros((st.Q_pad,), np.int32)
-        ngk[:st.Q] = self.ngk_per_q
-        sl = np.zeros((st.Q_pad, self.shell_slots.shape[1]), np.int32)
-        sl[:st.Q] = self.shell_slots
+        # Pad q rows and G-tile slots carry v = 0, ngk = 0: inert in V.
+        qa, ga = st.q_axis, st.g_axis
+        v = np.asarray(pad_to_axis(pad_to_axis(
+            jnp.asarray(v_table, dtype=jnp.complex128), qa, axis=0), ga, axis=1))
+        ngk = np.asarray(pad_to_axis(jnp.asarray(self.ngk_per_q, jnp.int32), qa, axis=0))
+        sl = np.asarray(pad_to_axis(jnp.asarray(self.shell_slots, jnp.int32), qa, axis=0))
         from common.collectives import device_put_process_local
         if self.q_local:
             layout = 'q'
@@ -974,9 +958,9 @@ class ZetaG:
         else:
             layout = 'g'
             rep = NamedSharding(self.mesh, P())
-            v_dev = device_put_process_local(v[:st.Q], rep)
-            ngk_dev = device_put_process_local(ngk[:st.Q], rep)
-            sl_dev = device_put_process_local(sl[:st.Q], rep)
+            v_dev = device_put_process_local(np.asarray(strip_axis(v, qa, axis=0)), rep)
+            ngk_dev = device_put_process_local(np.asarray(strip_axis(ngk, qa, axis=0)), rep)
+            sl_dev = device_put_process_local(np.asarray(strip_axis(sl, qa, axis=0)), rep)
         dbg = _debug_enabled()
         step = _v_tile_kernel(self.mesh, layout, self.solver_kind,
                               self.n_rmu_solve, st.g_tile, debug_m=dbg)
@@ -987,8 +971,11 @@ class ZetaG:
         if layout == 'g':
             L_arg = jax.lax.with_sharding_constraint(
                 self.L_q, NamedSharding(self.mesh, P()))
+        nxt = st.read_tile(0, layout=layout)
         for t in range(st.n_Gt):
-            Zt = st.read_tile(t, layout=layout)
+            # Tile t+1 is read while tile t is contracted.
+            Zt = nxt
+            nxt = st.read_tile(t + 1, layout=layout) if t + 1 < st.n_Gt else None
             V, M, shell, zt = step(L_arg, Zt, v_dev, ngk_dev, sl_dev,
                                    jnp.int32(t), V, M, shell)
             if zeta_io is not None:
@@ -1051,16 +1038,19 @@ class ZetaG:
 
 
 def check_mubatch_solve(rows: str, zeta_gather: str, solver_kind: str) -> None:
-    """The planned Z-row ownership must match the resolved solve tier."""
+    """The planned Z-row ownership must match the resolved solve tier.
+
+    The factor is always the rank-truncation ``B`` of :mod:`isdf.cplus`;
+    the tier says who holds it: q-local (q-owned rows) or replicated.
+    """
     want = 'local' if rows == 'q' else 'replicated'
-    if str(zeta_gather) != want or str(solver_kind) not in _LOCAL_KINDS:
+    if str(zeta_gather) != want or str(solver_kind) != 'replicated_rank_truncate':
         raise ValueError(
             f"GATE zeta-mubatch-solve-tier: got tier {zeta_gather!r} / kind "
-            f"{solver_kind!r} for {rows}-owned Z rows, want tier {want!r} with a "
-            f"whole-tile kind {_LOCAL_KINDS}; why: the streamed finalize applies "
-            "the per-q factor itself (q-local, or replicated for a small q "
-            "stack).  The distributed 2D factor application (regime A) is not "
-            "implemented.  Fix: distributed_zeta_solve = auto.")
+            f"{solver_kind!r} for {rows}-owned Z rows, want tier {want!r} with "
+            "the whole-tile rank-truncation factor; why: the streamed finalize "
+            "applies C⁺ (isdf.cplus) itself, q-local or replicated.  The "
+            "distributed 2D factor application (regime A) is not implemented.")
 
 
 def _debug_enabled() -> bool:
@@ -1069,16 +1059,10 @@ def _debug_enabled() -> bool:
 
 
 def _logical_solve(solver_kind: str, n_log: int):
-    from isdf.core import _zeta_logical_solvers
-    (_ridge, _lu, tri, pinv, _pinvT) = _zeta_logical_solvers(int(n_log))
-    if solver_kind == 'replicated_rank_truncate':
-        return pinv
-    if solver_kind in ('replicated_cholesky', 'sharded_cholesky'):
-        return tri
-    raise ValueError(
-        f"GATE zeta-mubatch-v-route: got solver kind {solver_kind!r}, want one "
-        f"of {_LOCAL_KINDS}; why: the streamed V applies the per-q whole-tile "
-        "factor itself.  Fix: the replicated/local charge tiers (the default).")
+    """ζ = C⁺Z at the logical μ extent through the conditioning seam."""
+    from isdf import cplus
+    from runtime.padding import solve_at_logical
+    return lambda B, Z: solve_at_logical(cplus.apply, int(n_log), (B,), Z)
 
 
 def _acc_specs(layout):
@@ -1212,36 +1196,6 @@ def _q_chunks(mesh, b, n_Gt, g_tile):
             q = r.shape[0]
             return jnp.transpose(r.reshape(q, b, n_Gt, g_tile), (0, 2, 1, 3))
         fn = jax.jit(_f)
-        _kernel_cache[key] = fn
-    return fn
-
-
-def _q_batch_update(mesh, b):
-    key = ('q_batch_update', _mesh_id(mesh), int(b))
-    fn = _kernel_cache.get(key)
-    if fn is None:
-        spec = P(_XY, None, None, None)
-
-        @partial(shard_map, mesh=mesh, in_specs=(spec, spec, P()),
-                 out_specs=spec, check_vma=False)
-        def _upd(store, chunks, beta):
-            return jax.lax.dynamic_update_slice_in_dim(store, chunks, beta * b,
-                                                       axis=2)
-        fn = jax.jit(_upd, donate_argnums=(0,))
-        _kernel_cache[key] = fn
-    return fn
-
-
-def _q_take_tile(mesh, mu_pad):
-    key = ('q_take_tile', _mesh_id(mesh), int(mu_pad))
-    fn = _kernel_cache.get(key)
-    if fn is None:
-        @partial(shard_map, mesh=mesh, in_specs=(P(_XY, None, None, None), P()),
-                 out_specs=P(_XY, None, None), check_vma=False)
-        def _t(store, t):
-            x = jax.lax.dynamic_index_in_dim(store, t, axis=1, keepdims=False)
-            return jax.lax.slice_in_dim(x, 0, mu_pad, axis=1)
-        fn = jax.jit(_t)
         _kernel_cache[key] = fn
     return fn
 

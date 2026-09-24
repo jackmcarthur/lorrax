@@ -1573,36 +1573,51 @@ class MuBatchPlan:
     route: str                 # 'cache' (flat r blocks) | 'planes'
     source: str                # 'cache' | 'resident' | 'host'
     band_chunk: int            # ψ band chunk (cache build / plane regeneration)
+    k_chunk: int               # parents regenerated per step (plane route)
     b: int                     # μ batch (multiple of P)
     n_batch: int
     r_sub: int                 # points (cache) or planes (planes) per sub-block
     row_chunk: int             # FFT rows per scan step
     g_tile: int                # G slots per store tile (multiple of P)
-    placement: str             # 'device' | 'host' | 'disk'
+    placement: str             # 'host' | 'disk' (never the device)
     finalize_layout: str       # 'q' (q-local solve) | 'g' (G-split)
     hwm_bytes: float
     budget_bytes: float
     target_bytes: float
     breakdown: dict
     transfer: dict
+    green_tile_bytes: float = 0.0   # nk·ns²·μ²·16/P: the GW run's unit
+    min_config_bytes: float = 0.0   # the smallest configuration's HWM
+    collectives_per_batch: int = 0
+    t_model_s: float = 0.0          # modelled loop time (ψ traffic + calls)
+    runner_up: str | None = None
 
     def format(self) -> str:
+        gt = max(self.green_tile_bytes, 1.0)
         lines = [
             "  ISDF μ-batch plan (one budget; docs/architecture/zeta_fit_mubatch.md)",
             f"    ψ(r) route    = {self.route} (source {self.source}, "
-            f"band chunk {self.band_chunk})",
-            f"    μ batch       = {self.b}  ({self.n_batch} batches)",
+            f"band chunk {self.band_chunk}, k chunk {self.k_chunk})",
+            f"    μ batch       = {self.b}  ({self.n_batch} batches, "
+            f"{self.collectives_per_batch} collectives each; modelled loop "
+            f"{self.t_model_s:.0f} s; runner-up {self.runner_up})",
             f"    r sub-block   = {self.r_sub} {'points' if self.route == 'cache' else 'plane(s)'}",
             f"    FFT rows/step = {self.row_chunk}",
-            f"    Z store       = {self.placement}, G tile {self.g_tile}, "
+            f"    Z store       = {self.placement}, G-vector tile {self.g_tile}, "
             f"finalize {self.finalize_layout}-layout",
+            f"    G_tile unit   = {gt / 1e9:.3f} GB/dev (nk·ns²·μ²·16/P); "
+            f"feasibility ceiling 4·G_tile = {4 * gt / 1e9:.2f}",
+            f"    minimum cfg   = {self.min_config_bytes / 1e9:.2f} GB/dev "
+            f"({self.min_config_bytes / gt:.2f} G_tile, "
+            f"{'within' if self.min_config_bytes <= 4 * gt else 'OVER'} the ceiling)",
             f"    target        = {self.target_bytes / 1e9:.2f} GB/dev of "
             f"{self.budget_bytes / 1e9:.2f}",
-            f"    HWM estimate  = {self.hwm_bytes / 1e9:.2f} GB/dev",
-            "    terms (GB/dev):",
+            f"    HWM estimate  = {self.hwm_bytes / 1e9:.2f} GB/dev "
+            f"({self.hwm_bytes / gt:.2f} G_tile)",
+            "    terms (GB/dev, G_tile):",
         ]
         for k, v in sorted(self.breakdown.items(), key=lambda kv: -kv[1]):
-            lines.append(f"      {k:.<22s} {v / 1e9:>8.3f}")
+            lines.append(f"      {k:.<22s} {v / 1e9:>8.3f}  {v / gt:>6.2f}")
         lines.append("    whole-fit volumes (GB/rank): " + ", ".join(
             f"{k} {v / 1e9:.1f}" for k, v in self.transfer.items()))
         return "\n".join(lines)
@@ -1613,7 +1628,7 @@ def plan_zeta_mubatch(*, meta, mesh_xy, n_q_selected: int, ngkmax: int,
                       band_chunk: int, n_parent: int, zeta_tier: str,
                       budget_gb: float, target_utilization: float | None = None,
                       psi_face_bytes: float = 0.0, n_col_psi: int | None = None,
-                      n_s_psi: int | None = None) -> MuBatchPlan:
+                      n_s_psi: int | None = None, n_sym_rows: int = 2) -> MuBatchPlan:
     """Size the μ-batch ζ fit; refuses by GATE when even the smallest batch fails.
 
     Order (doc "Per-rank memory model"): ψ route (the r-block cache when it
@@ -1630,7 +1645,7 @@ def plan_zeta_mubatch(*, meta, mesh_xy, n_q_selected: int, ngkmax: int,
     are priced at ``n_parent`` rows and the k-convolution at the full grid;
     its μ batches are unions of whole centroid orbits of at most ``b``.
     """
-    from runtime.padding import mesh_divisor
+    from runtime.padding import mesh_divisor, round_up
     P_ = int(mesh_divisor(mesh_xy))
     nk = int(meta.nk_tot)
     ns = int(meta.nspinor)
@@ -1655,11 +1670,18 @@ def plan_zeta_mubatch(*, meta, mesh_xy, n_q_selected: int, ngkmax: int,
     Q_pad = math.ceil(Q / P_) * P_
     finalize_layout = 'q' if str(zeta_tier) == 'local' else 'g'
 
+    Q_loc = Q_pad // P_
     base = {
-        "C factor": _c128(Q, mu, mu, shard=P_),
+        # q-local tier: a rank holds its own q's factors; replicated: all.
+        "C factor": (_c128(Q_loc, mu, mu) if finalize_layout == 'q'
+                     else _c128(Q, mu, mu)),
         "centroid faces": float(psi_face_bytes),
-        "orbit tables": (4.0 * n_rtot * (1 + 8 * 2) / P_ if parent else 0.0),
-        "loader tables": 4.0 * nk * n_rtot + _C128 * nk * N_Gpsi,
+        # the rank's r-block tables: local_perm + wraps (int32), all rows
+        "orbit tables": 16.0 * int(n_sym_rows) * R0,
+        # PsiGStore g_index (n_parent box) + kvec/G tables, the replicated
+        # points/box_from_slot pair and the sphere index operand
+        "loader tables": (4.0 * nk_src * n_rtot + _C128 * nk_src * N_Gpsi
+                          + 8.0 * n_rtot + 4.0 * Q * N_G),
     }
     base_total = sum(base.values())
     cache_bytes = _c128(nk_src, nb_slots, ns, R0)
@@ -1673,19 +1695,25 @@ def plan_zeta_mubatch(*, meta, mesh_xy, n_q_selected: int, ngkmax: int,
     n_col = int(n_col_psi) if n_col_psi else ps
     n_s = int(n_s_psi) if n_s_psi else n_a
 
-    def ws(route, b, r_s, cs, *, source, bc=None):
+    def ws(route, b, r_s, cs, *, source, bc=None, kc=None):
         bc = bc_now[0] if bc is None else int(bc)
+        kc = kc_now[0] if kc is None else int(kc)
         b_p = bc // P_
         c = b // P_
         R = R0 if route == 'cache' else math.ceil(n_a / P_) * ps
+        # Row owners after the transpose: q-owned rows are Q_pad/P whole q
+        # for all b; μ-owned rows are all Q for b/P centroids.
+        row_q, row_mu = (Q_loc, b) if finalize_layout == 'q' else (Q, c)
         t = {
             "X_B": _c128(nk_src, ns, b, face_nb) + 2 * _c128(nk_src, ns, b, bc),
             "pair projectors": 2 * ns * ns * _c128(nk_src, b, r_s),
             "k-conv + Z": ((9 if parent else 7) * _c128(nk, b, r_s)
-                           + 2 * _c128(Q, b, r_s)),
-            "rows (transposed)": _c128(Q, c, P_ * R),
+                           + 2 * _c128(Q_pad, b, r_s)),
+            "rows (transposed)": _c128(row_q, row_mu, P_ * R),
+            # the batch's output rows twice: batch β+1 is computed while β
+            # is written
             "row FFT": _c128(cs, n_rtot) * _FFT_CUFFT_FACTOR
-                       + 2 * _c128(Q, c, N_G),
+                       + 2 * _c128(row_q, row_mu, N_G),
         }
         if route == 'cache':
             t["ψ sub-block"] = 2 * _c128(nk_src, nb_slots if parent else bc,
@@ -1693,29 +1721,108 @@ def plan_zeta_mubatch(*, meta, mesh_xy, n_q_selected: int, ngkmax: int,
         else:
             n_pg = max(1, r_s // ps)
             t["ψ regeneration"] = (
-                _c128(nk_src, b_p, ns, n_col, n_s)
-                + 2 * _c128(nk_src, b_p, ns, P_ * n_pg, n_col)
-                + 3 * _c128(nk_src, bc, ns, r_s))
+                _c128(kc, b_p, ns, n_col, n_s)
+                + 2 * _c128(kc, b_p, ns, P_ * n_pg, n_col)
+                + 3 * _c128(kc, bc, ns, r_s))
             if source == 'host':
                 t["ψ(G) host tile"] = _c128(nk_src, b_p, ns, N_Gpsi)
         return t
 
     bc_now = [bc]
+    kc_now = [nk_src]
+    # Feasibility: the GW run's hard bottleneck is ~4 Green's-function
+    # tiles per rank (G_k,ab[μ,ν], nk·ns²·μ²·16/P), so the fit's SMALLEST
+    # configuration (plane route, smallest batch, ψ(G) from host, band chunk
+    # P, store off device) must fit 4·G_tile -- the fit never sets the node
+    # count.  The plan itself uses the device target for speed; the
+    # receipt shows both ratios.
+    step = P_ if finalize_layout == 'g' else 1   # μ-owned rows split b over P
+    green = _c128(nk, ns * ns, mu, mu, shard=P_)
+    if P_ <= n_a:
+        need_min = base_total + sum(
+            ws('planes', step, ps, 1, source='host', bc=P_, kc=1).values())
+    else:
+        need_min = base_total + cache_bytes + max(cache_build, sum(
+            ws('cache', step, min(R0, 4096), 1, source='cache').values()))
+
+    def src_bytes(source):
+        return (cache_bytes if source == 'cache' else
+                resident_bytes if source == 'resident' else 0.0)
 
     def fits(route, source, b, r_s, cs, extra=0.0):
-        src = (cache_bytes if source == 'cache' else
-               resident_bytes if source == 'resident' else 0.0)
-        return base_total + src + extra + sum(
+        return base_total + src_bytes(source) + extra + sum(
             ws(route, b, r_s, cs, source=source).values()) <= target
 
-    step = P_ if finalize_layout == 'g' else 1
     b_min = step
-    # 1. route and source
+    # 1. Candidates: (route, ψ source) that fit at the smallest batch, each
+    #    at its largest batch and at half of it, costed by the time model
+    #    below; the cheapest wins and the receipt names the runner-up.
     r_cache = min(R0, 4096)
+    cands = []                       # (T_model, route, source, b, bc, kc, r_s)
+
+    def b_largest(route, source, r_s):
+        b_top, b_ = math.ceil(mu / step) * step, b_min
+        while b_ + step <= b_top and fits(route, source, b_ + step, r_s, 1):
+            b_ += step
+        n_ = math.ceil(mu / b_)       # balance: same batch count, least width
+        return math.ceil(math.ceil(mu / n_) / step) * step
+
+    def model(route, source, b, bc_, kc_):
+        """Modelled fit loop time: per-batch ψ traffic and call latency.
+
+        ponytail: constants measured on VI3 P16 OFI (ψ all-to-all 7.6 GB/s
+        effective, H2D 20 GB/s, 1 ms per collective); swap for the
+        comm-model service's comm_time when it lands.  The per-centroid
+        pair GEMM / k-conv / FFT work is the same for every candidate and
+        is left out."""
+        n_b = math.ceil(mu / b)
+        n_sub = math.ceil(R0 / min(R0, 4096)) if route == 'cache' else math.ceil(n_a / P_)
+        n_bc_ = math.ceil(int(fit_nb) / bc_)
+        calls = n_sub * (1 + (0 if route == 'cache' else n_bc_ * (nk_src // kc_)))
+        t = calls * 1e-3
+        if route == 'planes':
+            t += _c128(nk_src, n_bc_ * bc_, ns, math.ceil(n_a / P_), n_col) / 7.6e9
+        if source == 'host':
+            t += _c128(nk_src, n_bc_ * bc_, ns, N_Gpsi, shard=P_) / 20e9
+        once = cache_bytes / 7.6e9 if route == 'cache' else 0.0
+        return n_b * t + once, calls
+
     if (fits('cache', 'cache', b_min, r_cache, 1)
             and base_total + cache_bytes + cache_build <= target):
-        route, source, r_s, r_sub = 'cache', 'cache', r_cache, r_cache
-    else:
+        bb = b_largest('cache', 'cache', r_cache)
+        for b_ in {bb, max(b_min, (bb // 2) // step * step)}:
+            cands.append((model('cache', 'cache', b_, bc, nk_src)[0], 'cache',
+                          'cache', b_, bc, nk_src, r_cache))
+    cache_bc = bc
+    if P_ <= n_a:
+        # Regeneration moves every band of kc parents to the plane owners in
+        # one all-to-all per (sub-block, band chunk, k chunk): the fewest
+        # calls (then the fewest pad bands) whose transient stays within a
+        # fifth of the target.  Chunks are balanced (n_bc equal widths, a
+        # multiple of P); kc divides n_parent.
+        full = max(P_, padded_axis(int(fit_nb), P_, name="μ-batch fit bands").carrier)
+        divs = [d for d in range(nk_src, 0, -1) if nk_src % d == 0]
+        best = None
+        for n_try in range(1, full // P_ + 1):
+            bc_try = round_up(math.ceil(int(fit_nb) / n_try), P_)
+            kc_ok = next((d for d in divs if ws(
+                'planes', b_min, ps, 1, source='resident', bc=bc_try,
+                kc=d)["ψ regeneration"] <= 0.2 * target), None)
+            if kc_ok is not None:
+                key = (n_try * (nk_src // kc_ok), n_try * bc_try)
+                if best is None or key < best[0]:
+                    best = (key, bc_try, kc_ok)
+        _, pbc, pkc = best if best is not None else (None, P_, 1)
+        bc_now[0], kc_now[0] = pbc, pkc
+        resident_bytes = _c128(nk_src, math.ceil(int(fit_nb) / pbc) * pbc, ns,
+                               N_Gpsi, shard=P_)
+        for source in ('resident', 'host'):
+            if fits('planes', source, b_min, ps, 1):
+                bb = b_largest('planes', source, ps)
+                for b_ in {bb, max(b_min, (bb // 2) // step * step)}:
+                    cands.append((model('planes', source, b_, pbc, pkc)[0],
+                                  'planes', source, b_, pbc, pkc, ps))
+    if not cands:
         if P_ > n_a:
             raise ValueError(
                 f"GATE zeta-mubatch-pencils: got P={P_} with the ψ(r) cache "
@@ -1724,40 +1831,25 @@ def plan_zeta_mubatch(*, meta, mesh_xy, n_q_selected: int, ngkmax: int,
                 f"route (largest box axis {axis} of {fft_grid}); why: the "
                 "pencil split is not implemented.  Fix: more memory per "
                 "device, or a rank count whose cache fits.")
-        route, r_s, r_sub = 'planes', ps, ps
-        # The plane route accumulates D over regenerated band chunks, so a
-        # wide chunk saves D round trips: the widest (a multiple of P) whose
-        # regeneration transient stays within a fifth of the target.
-        wide = max(P_, padded_axis(int(fit_nb), P_, name="μ-batch fit bands").carrier)
-        while wide > P_:
-            if ws('planes', b_min, r_s, 1, source='resident',
-                  bc=wide)["ψ regeneration"] <= 0.2 * target:
-                break
-            wide = max(P_, (wide // 2) // P_ * P_)
-        bc_now[0] = bc = wide
-        n_bc = math.ceil(int(fit_nb) / bc)
-        nb_slots = n_bc * bc
-        resident_bytes = _c128(nk, nb_slots, ns, N_Gpsi, shard=P_)
-        source = ('resident' if fits('planes', 'resident', b_min, r_s, 1)
-                  else 'host')
-        if not fits('planes', source, b_min, r_s, 1):
-            need = base_total + sum(ws('planes', source=source, b=b_min,
-                                       r_s=r_s, cs=1).values())
-            raise ValueError(
-                f"GATE zeta-mubatch-capacity: got {need / 1e9:.2f} GB/dev for "
-                f"the smallest μ batch (b = P = {P_}) on the plane route, want "
-                f"<= {target / 1e9:.2f} GB/dev; why: no batch width fits the "
-                "budget.  Fix: more ranks (every term but the loader tables "
-                "divides by P) or more memory per device.")
-    # 2. the largest batch with the store off the device
-    b_cap = math.ceil(mu / step) * step
-    b = b_min
-    while b + step <= b_cap and fits(route, source, b + step, r_s, 1):
-        b += step
-    # Balance the batches: the same batch count with the smallest width.
+        need = base_total + sum(ws('planes', source='host', b=b_min,
+                                   r_s=ps, cs=1).values())
+        raise ValueError(
+            f"GATE zeta-mubatch-capacity: got {need / 1e9:.2f} GB/dev for "
+            f"the smallest μ batch (b = {b_min}) on the plane route, want "
+            f"<= {target / 1e9:.2f} GB/dev; why: no batch width fits the "
+            "budget.  Fix: more ranks (every term but the loader tables "
+            "divides by P) or more memory per device.")
+    cands.sort(key=lambda c_: c_[0])
+    _, route, source, b, bc, kc_now[0], r_s = cands[0]
+    runner_up = cands[1] if len(cands) > 1 else None
+    bc_now[0] = bc if route == 'planes' else cache_bc
+    r_sub = r_s
+    n_bc = math.ceil(int(fit_nb) / bc)
+    nb_slots = n_bc * bc
+    if route == 'planes':
+        resident_bytes = _c128(nk_src, nb_slots, ns, N_Gpsi, shard=P_)
     n_batch = math.ceil(mu / b)
-    b = math.ceil(math.ceil(mu / n_batch) / step) * step
-    n_batch = math.ceil(mu / b)
+    t_model, calls = model(route, source, b, bc, kc_now[0])
     # 3. FFT rows per step from what is left.
     left = target - base_total - (
         cache_bytes if source == 'cache' else
@@ -1767,17 +1859,18 @@ def plan_zeta_mubatch(*, meta, mesh_xy, n_q_selected: int, ngkmax: int,
                  else Q * (b // P_))
     cs = max(1, min(cs_max, int(0.5 * max(left, 0.0)
                                 // (_c128(1, n_rtot) * _FFT_CUFFT_FACTOR)) + 1))
+    cs = max(d for d in range(1, cs + 1) if cs_max % d == 0)   # no pad rows
     # 4. G tile for the streamed finalize (multiple of P, ~quarter target).
     per_g = (6.0 * _c128(Q_pad, mu, 1, shard=P_)
              + (_c128(Q, mu, mu) if finalize_layout == 'g' else 0.0) / max(N_G, 1))
     g_tile = int(max(P_, (0.25 * target // max(per_g, 1.0)) // P_ * P_))
     g_tile = min(g_tile, math.ceil(N_G / P_) * P_)
     n_Gt = math.ceil(N_G / g_tile)
-    store_dev = _c128(Q, n_batch * b, n_Gt * g_tile, shard=P_)
-    # 5. placement
-    if fits(route, source, b, r_s, cs, extra=store_dev):
-        placement = 'device'
-    elif store_dev <= _host_bytes_per_rank():
+    store_dev = _c128(Q_pad if finalize_layout == 'q' else Q,
+                      n_batch * b, n_Gt * g_tile, shard=P_)
+    # 5. placement: host when the per-rank host share holds it, else disk.
+    # ponytail: never the device (see ZStore).
+    if store_dev <= _host_bytes_per_rank():
         placement = 'host'
     else:
         placement = 'disk'
@@ -1787,20 +1880,24 @@ def plan_zeta_mubatch(*, meta, mesh_xy, n_q_selected: int, ngkmax: int,
         br["ψ(r) block cache"] = cache_bytes
     elif source == 'resident':
         br["ψ(G) resident"] = resident_bytes
-    if placement == 'device':
-        br["Z store (device)"] = store_dev
     hwm = sum(br.values())
     store_total = Q * mu * N_G * 16.0
     transfer = {
         "Z transpose": Q * mu * n_rtot * 16.0 / P_,
-        "Z store write": 0.0 if placement == 'device' else store_total / P_,
-        "Z store read": 0.0 if placement == 'device' else store_total / P_,
+        "Z store write": store_total / P_,
+        "Z store read": store_total / P_,
         "ψ regeneration": (0.0 if route == 'cache' else
                            n_batch * _c128(nk_src, nb_slots, ns, n_col, n_a,
                                            shard=P_)),
     }
+    ru = (None if runner_up is None else
+          f"{runner_up[1]}/{runner_up[2]} b={runner_up[3]}: {runner_up[0]:.0f} s")
     return MuBatchPlan(
-        route=route, source=source, band_chunk=int(bc), b=int(b),
+        green_tile_bytes=float(green), min_config_bytes=float(need_min),
+        collectives_per_batch=int(calls), t_model_s=float(t_model),
+        runner_up=ru,
+        route=route, source=source, band_chunk=int(bc), k_chunk=int(kc_now[0]),
+        b=int(b),
         n_batch=int(n_batch),
         r_sub=int(r_sub), row_chunk=int(cs), g_tile=int(g_tile),
         placement=placement, finalize_layout=finalize_layout,

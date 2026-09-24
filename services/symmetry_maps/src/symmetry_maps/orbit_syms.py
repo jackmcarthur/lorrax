@@ -954,9 +954,10 @@ def centroid_source_map_and_wrap(
                 f"Regenerate centroids with orbit-aware kmeans or fall "
                 f"back to identity-only sym."
             )
-        # Each row should be a permutation.  Cheap O(n_sym · n_rmu) check.
+        # Each row should be a permutation.  O(n_sym · n_rmu): a bincount,
+        # not a hash-unique (the full FFT grid passes through here).
         for s in required:
-            if np.unique(sym_perm[s]).size != n_rmu:
+            if np.bincount(sym_perm[s], minlength=n_rmu).max(initial=0) > 1:
                 raise RuntimeError(
                     f"centroid_source_map_and_wrap: sym_perm[{s}] is not a "
                     f"permutation — two distinct centroids map to the "

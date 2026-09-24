@@ -1,6 +1,8 @@
 # ζ fit by μ-batches: Z(G) first, C⁺ once
 
-Status: design, branch `feat/zeta-mubatch-2026-09-23` (not on main).
+Status: implemented for the charge channel on branch
+`feat/zeta-mubatch-2026-09-23` (not on main): `isdf.zeta_mubatch`,
+`gw.isdf_fitting._fit_mubatch`, planner `gw.gflat_memory_model.plan_zeta_mubatch`.
 Evidence: `runs/runtime/zeta_mubatch_20260923/` in the sandbox.
 Owner design 2026-09-23, refined the same day (direction-agnostic
 transpose; ψ(r) cache when it fits, plane-regenerated ψ only when it does
@@ -50,9 +52,17 @@ for each μ batch B (b centroids, serial):
     ONE all-to-all per batch: rows (q, μ_B) × r-split  →  row-owned × full r
     each rank: e^{-iq·r}, local full-box FFT per row, gather the ζ sphere
     write the rows into the Z store (write-once; no accumulator)
-after all batches:  ζ = C⁺ Z (G-chunked, the existing solve) when a consumer
-                    needs ζ;  V_q = conj(C⁺) M conj(C⁺) otherwise
+after all batches:  stream the store by G tiles:  ζ_t = C⁺ Z_t,
+                    V_q += conj(ζ_t) diag(v_q) ζ_tᵀ,  keep the G≈0 shell;
+                    write ζ_t to zeta_q.h5 only when a consumer needs the file
 ```
+
+V_q is formed ζ-first, not as `conj(C⁺) M conj(C⁺)`: the two are the same
+operator in exact arithmetic, but the second loses `≈ ε·κ(C)²` because it
+applies the rank-truncated `C⁺` twice to an `M` that has already mixed
+scales.  Measured: 3.3e-14 on core fixture A, 1.7e-3 on CrI3 8×8
+(κ(C) = 1.0e8).  ζ-first costs the same `N_G·μ²` GEMM per tile plus one
+`μ²·G_tile` solve application, and only `V_q` (plus the shell) is resident.
 
 The transpose is direction-agnostic: `R_p` may be any equal split of the
 flat grid. No distributed FFT and no second redistribution exist: the
@@ -61,16 +71,24 @@ is local.
 
 ### Row ownership (the Z-store layout)
 
-The store is `(Q, μ_pad, N_G)` at `P(None, ('x','y'), None)`, the layout
-of the old accumulator, so the existing solve, writer and V_q contraction
-read it unchanged. Batches are strided over the μ shards: batch β takes
-`b/P` consecutive μ from every rank's μ block, so the all-to-all splits
-the batch's μ axis and every rank writes its own rows at local offset
-`β·b/P`. This is the "(q, μ_B) pairs" assignment and works for any Q,
-including Q = 1. The q-local variant (`P(('x','y'),None,None)`, split the
-q axis instead) is the same kernel with the other split axis; it is
-chosen when the q-local solve tier is (see R4) and is what lets V_q run
-with no communication.
+`ZStore` is one write-once resource; the planner places it on the device,
+in host memory (one numpy tile per addressable device) or in a slab_io
+scratch dataset.  SlabIO datasets are contiguous, so the owner's
+`(q, G_tile, μ_batch)` chunking lives in the dataset shape:
+
+- **q-owned** (the q-local solve tier, `Q ≥ P` and a q's factor plus a G
+  tile fit): `(Q_pad, n_Gt, n_batch·b, G_tile)` at `P(('x','y'), …)`.  The
+  all-to-all splits the q axis; rank p owns whole q rows, a batch write is
+  whole `(q, G_tile, μ_B)` chunks per writer, and a G-tile read is local
+  on host and device — V_q runs with no communication.
+- **μ-owned** (otherwise, any Q including Q = 1): `(n_Gt, Q, n_batch·c,
+  G_tile)` per rank, `c = b/P`; the all-to-all splits the batch's μ axis;
+  a G-tile read reaches the solve's layout with one all-to-all.
+
+The μ axis is stored in batch-slot order (`β·b + j`); `read_tile` gathers
+the packed carrier through `MuOrbitBatches.packed_to_slot` (−1: a layout
+pad centroid, an exact zero row).  The device holds only the batch being
+written unless the planner places the whole store there.
 
 ### ψ(r_local) source
 
@@ -96,7 +114,7 @@ carrier, `nb` fit bands (transport-padded), `N_r` grid, `N_G` ζ sphere
 | object | sharding | bytes/rank |
 |---|---|---|
 | C factor | `P(None,'x','y')` or q-local batch | `Q·μ²·16/P` |
-| Z store | `P(None,('x','y'),None)` | `Q·μ·N_G·16/P` (device, else host, else slab_io disk) |
+| Z store | q-owned or μ-owned tiles | `Q·μ·N_G·16/P` (device only when it fits at the same `b`, else host (0.6 of the node's MemTotal per task), else slab_io disk) |
 | ψ(r) cache (cache route) | r-block `R_p` | `nk·nb·ns·R·16` |
 | ψ(G) resident (regen route) | bands over `('x','y')` | `nk·nb·ns·N_Gψ·16/P` |
 | centroid face, full BZ | `μ_X × band_Y` | `nk·ns·μ·nb·16/P` (the parent faces serve C) |
@@ -200,20 +218,28 @@ direct sums, then ζ and V_q through one C⁺.
 
 ## ζ consumers
 
+The fit returns `ZetaG`, a lazy ζ over the store (`zeta_layout =
+'G_flat'`), in place of the file path when no consumer needs the file.
+
 | consumer | needs ζ on disk? | handled by |
 |---|---|---|
-| scalar V_q (`compute_all_V_q`) | no | `conj(C⁺) M conj(C⁺)` from the store |
-| g0 one-leg and the head channel | a few G columns | `C⁺ Z[:, :, G_sel]` |
-| ζ reuse on a later run, restart head channel | yes | write ζ (G-chunked solve) |
-| bispinor V_q, BSE `vq_interp`, downfold, exciton bands | yes | write ζ |
+| scalar V_q (`v_q_g_flat._compute_V_q_g_flat_one_tile`) | no | `ZetaG.contract_v`: streamed ζ-first V_q |
+| g0 one-leg unfold (non-IBZ) | the G≈0 shell | `ZetaG.shell` (`|q+G| ≤ max|q_full|`, pads at the FFT-box sentinel) |
+| head channel (`compute_head_channel_zeta`) | a few G columns | `ZetaG.head_columns(sel)` from the shell |
+| `write_restart_tensors = true`, restart | yes | the same streamed tiles are written (`contract_v(…, zeta_io=…)`) |
+| bispinor / transverse V_q, BSE `vq_interp`, downfold, exciton bands | yes | the file is written; consumers open `ZetaG.path` |
 
 ## Regime guard
 
-A single q's `(μ, N_G)` row set plus workspace must fit a rank for the
-q-local tier; the μ-strided layout needs only `μ·N_G·16/P` per q. The
-planner refuses with `GATE zeta-mubatch-capacity` naming the shortfall
-when even `b = P` does not fit. The G-chunked 2D factor application for
-μ ~ 1e5 supercells is future work.
+One planner rule picks the solve: q-local (q-owned store, R4) when
+`Q ≥ P` and one q's factor plus a G tile fit a rank, else the 2D
+distributed factor applied per G tile (μ-owned store; kept for huge
+`N_μ`).  `check_mubatch_solve` refuses (`GATE zeta-mubatch-solve-tier`)
+a store/tier pair that disagree.  The planner refuses with `GATE
+zeta-mubatch-capacity` naming the shortfall when even the smallest
+whole-orbit batch does not fit, and `GATE zeta-mubatch-pencils` when the
+plane route would need P above the largest box axis.  Nq = Nk = 1 runs
+the μ-owned layout (core fixture B).
 
 ## Scope
 

@@ -2672,91 +2672,8 @@ def _charge_factor_math(C_log, *, mode: str, n_log: int,
         Vs = V * inv[..., None, :].astype(V.dtype)
         return Vs @ jnp.conj(jnp.swapaxes(V, -1, -2))
     if mode == 'rank_truncate':
-        # WHY THIS FEATURE EXISTS: the charge CCT near-singularizes when
-        # n_μ over-completes the pair-density rank (κ~1e13); plain
-        # Cholesky then amplifies ULP/mesh/nband roundoff into O(1) V_q
-        # errors that GN-PPM magnifies to tens of eV.  Rank-truncation
-        # DROPS eigenvalues < zeta_rcond·λ_max (the near-null
-        # directions) → a conditioned, mesh-invariant ζ = C⁺Z.
-        lam, V = jnp.linalg.eigh(C_log)      # Hermitian-SPD, λ ascending
-        lam_max = lam[..., -1:]              # (nqb,1) largest λ per q
-        keep = lam > (rcond * lam_max)       # near-null cut
-        # …and the near-null cut is not allowed to stop mid-multiplet.  THIS
-        # IS THE SEAM the 6×6×6 saga's §6 conjectured about
-        # (tests/known_failures/2026-08-10-ibz-cascade-vs-full-bz-sigma-\
-        # 6x6x6.md): C_q commutes with the point group when the centroid set
-        # is orbit-closed and the band window degeneracy-closed, so a
-        # symmetry maps each C_q eigenspace onto itself and mixes a degenerate
-        # block's members freely.  Cut between blocks and ζ's retained span is
-        # invariant, so C_{Sq} = P C_q P† survives the truncation; cut THROUGH
-        # a block and the span is a round-off-chosen slice that differs
-        # between q and Sq, and the k-star identity fails for W and Σ_x alike.
-        # That deck turned out to be covariant by luck — 0 of 16 q-stars
-        # carried a non-constant n_keep, MEASURED after the fact, enforced by
-        # nothing.  This is the enforcement.
-        keep = _close_the_cut(lam, keep, where="zeta rank_truncate")
-        # …and a cut that lands in a gap can still be a cut nobody has
-        # certified.  THE GATE: when the criterion BINDS, the achieved
-        # amplification must not exceed the ceiling any measurement supports
-        # for a PSD overlap Gram (1e8 — R19's rcond ladder and the Si 4×4×4
-        # 1776-centroid run, both in ``common/rank_criterion``).  Until
-        # 2026-08-22 the ``rank_log`` block below announced exactly these
-        # numbers and gated on neither.
-        _certify_the_cut(lam, keep, where="zeta rank_truncate",
-                         kappa_certified=rank_criterion.KAPPA_CERTIFIED_GRAM,
-                         rcond=rcond)
-        # B = V·diag(1/√λ_kept) ⇒ B Bᴴ = Σ_{keep} vᵢvᵢᴴ/λᵢ = C⁺.
-        # Double-``where`` keeps rsqrt off the dropped (tiny/≤0) modes.
-        inv_sqrt = jnp.where(
-            keep, jax.lax.rsqrt(jnp.where(keep, lam, 1.0)), 0.0)
-        # OBSERVABILITY: the retained-mode count IS the conditioning
-        # signal for this route — it is what tells you whether n_μ has
-        # over-completed the pair-density rank (κ blow-up) and by how
-        # much.  It lives inside the jit, so print it from there.
-        # ``n_keep`` per q + the spectral span λ_max/λ_min(kept).
-        # Mandatory conditioning receipt; there is no silence knob.
-        #
-        # THE CRITERION, stated: ``keep`` above is NOT a search for a
-        # gap in λ — a real ISDF charge spectrum is smooth and has
-        # none.  It is a CAP on how much C⁺ may amplify round-off:
-        # κ_eff = λ_max/λ_min(kept) ≤ 1/zeta_rcond by construction.
-        # ``common/rank_criterion`` carries the derivation, the three
-        # standard alternatives (discrepancy principle / L-curve /
-        # GCV) and the measurement that refutes each of them here.
-        #
-        # The three extra fields below are the ones a run needs in
-        # order to be auditable without a sweep:
-        #   kappa/q     achieved amplification — the invariant
-        #   ldrop_hi/q  the LARGEST discarded λ, i.e. the top of the
-        #               discarded band (paired with lam_min_kept it
-        #               gives the whole cut, and shows there is no
-        #               plateau at the cut — there never is)
-        #   margin/q    fractional rank inflation from loosening
-        #               rcond by 1e-4.  §R19 measured +41 % of rank
-        #               costing 5000 eV, so a LARGE margin means the
-        #               basis is over-complete and rcond must NOT be
-        #               loosened on this run.
-        if rank_log:
-            lam_keep_min = jnp.min(
-                jnp.where(keep, lam, jnp.inf), axis=-1)
-            n_keep = jnp.sum(keep, axis=-1)
-            lam_drop_hi = jnp.max(
-                jnp.where(keep, -jnp.inf, lam), axis=-1)
-            n_loose = jnp.sum(lam > (rcond * 1e-4 * lam_max), axis=-1)
-            margin = (n_loose - n_keep) / jnp.maximum(n_keep, 1)
-            jax.debug.print(
-                "[zeta rank_truncate] n_log={n} rcond={rc:.1e} "
-                "n_keep/q={k} lam_max/q={mx} lam_min_kept/q={mn} "
-                "kappa/q={kp} ldrop_hi/q={dh} lam_min/q={lo} "
-                "margin/q={mg}",
-                n=n_log, rc=rcond,
-                k=n_keep,
-                mx=lam_max[..., 0], mn=lam_keep_min,
-                kp=lam_max[..., 0] / lam_keep_min,
-                dh=lam_drop_hi, lo=jnp.min(lam, axis=-1),
-                mg=margin,
-                ordered=False)
-        return V * inv_sqrt[..., None, :].astype(V.dtype)
+        from isdf import cplus
+        return cplus.factor(C_log, rcond=rcond, rank_log=rank_log, n_log=n_log)
     tr = jnp.abs(jnp.trace(C_log, axis1=-2, axis2=-1))
     # Floor (1e-14·|tr|, bit-identical to the historical path)
     # + opt-in conditioning term (ε·|tr|/n).  Per-q scalars.
@@ -2785,8 +2702,8 @@ def solve_zeta_charge_dense(C, Z, *, charge_zeta_solve: str,
         ridge_extra=float(zeta_ridge), rcond=float(zeta_rcond),
         rank_log=bool(rank_log))[0]
     if mode == 'rank_truncate':
-        # ζ = C⁺Z = B(BᴴZ) — B is the pseudo-inverse factor, B Bᴴ = C⁺.
-        return F @ (jnp.conj(F).T @ Z)
+        from isdf import cplus
+        return cplus.apply(F, Z)
     y = jax.scipy.linalg.solve_triangular(F, Z, lower=True)
     return jax.scipy.linalg.solve_triangular(jnp.conj(F).T, y, lower=False)
 
@@ -4111,9 +4028,8 @@ def _zeta_logical_solvers(
 
     def _pinv_matmul_logical(B: jax.Array, Z: jax.Array) -> jax.Array:
         """Charge rank-truncation back-solve at the LOGICAL μ extent: ζ = C⁺Z = B(BᴴZ), two matmuls (B is the pseudo-inverse factor, B Bᴴ = C⁺); see docs/architecture/zeta_fit_face_psi_cct.md."""
-        def _mm(B_log, Z_log):
-            return B_log @ (B_log.conj().T @ Z_log)
-        return solve_at_logical(_mm, n_log, (B,), Z)
+        from isdf import cplus
+        return solve_at_logical(cplus.apply, n_log, (B,), Z)
 
     def _pinv_apply_T_logical(Cp: jax.Array, Z: jax.Array) -> jax.Array:
         """Transverse rank-truncation back-solve at the LOGICAL μ extent: ζ = C⁺Z, ONE matmul (``Cp`` is the explicit truncated pseudo-inverse of the indefinite transverse CCT); see docs/architecture/zeta_fit_face_psi_cct.md."""
