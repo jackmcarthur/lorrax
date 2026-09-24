@@ -190,17 +190,15 @@ unique $\mathbf q=\Gamma$, $\mathbf G=0$ slot. The spatial-metric sign
 (`vcoul.COULOMB_GAUGE_TT_SIGN = -1`) is applied once on the way out; no
 vertex or Σ contraction compensates it.
 
-**ζ fits, by channel.** The charge channel takes the μ-batch fit
-([ζ μ-batch](zeta_fit_mubatch.md)). The three current channels take the
-orbit-closed real-space tile loop (`isdf.core.fit_one_rchunk`, tile width
-`r_chunk_size`, 0 = from the memory model). They share the raw-parent
-open-spin projector build and the transported left tail (`coupled_mu123`,
-one `[3, q, μ, r]` stack per orbit tile at `P(None,None,'x','y')`). Each
-channel keeps its own vertex, solve and canonical q-IBZ output file. The
-outer `gw_jax.zeta_fit_transverse` timer is the wall interval; overlapping
-worker intervals must not be summed.
-Data movement, the solver family and the conditioning are owned by
-[Parent ζ fitting](zeta_fit_face_psi_cct.md#current-channels).
+**ζ fits, by channel.** Every channel takes the μ-batch fit
+([ζ μ-batch](zeta_fit_mubatch.md)). The three current channels are one fit
+on their own centroids: one ψ(G) read, then per batch one X_B, pair GEMM,
+all-to-all and set of plane FFTs shared by all three, and one k-convolution
+(γ̃^{μ_L} on its load), accumulator and Z store per channel. Each channel
+keeps its own C_q^μ, its sign-aware ridged LU
+([the solve seam](zeta_fit_mubatch.md#the-solve-seam)) and its canonical
+q-IBZ output file `zeta_q_mu{μ_L}.h5`. `gw_jax.zeta_fit_transverse` times
+the fit.
 
 ## Stage 3: screening
 
