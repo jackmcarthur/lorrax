@@ -353,7 +353,7 @@ def test_nonpositive_eta_refuses():
 
 
 # ---------------------------------------------------------------------------
-#  Clustered decomposition (docs/dev/crossing-rule-cost-law.md)
+#  Clustered decomposition (docs/theory/THEORY_mpa_implementation.md §10.1)
 # ---------------------------------------------------------------------------
 
 def _oracle_total(plan, B, Omega, n_omega, shape):
