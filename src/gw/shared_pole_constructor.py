@@ -189,22 +189,32 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
             raise ValueError("GATE shared_pole_held: got: no held samples; want: at least one held support; why: the model checks compare W and dW/ds there")
         held_lo, held_hi = min(held_ids), max(held_ids) + 1
         nq = int(header["bank_shape"]["nq"])
+        fit_lo = min(int(i) for i in recipe["fit_ids"])
+        fit_hi = max(int(i) for i in recipe["fit_ids"]) + 1
         # A local round runs one parent per rank from its sample read to its
-        # sorted model. A face round runs one physical parent over all ranks.
+        # sorted model. A face round runs a budget-sized batch of physical
+        # parents over all ranks (one schedule owner for both constructors).
         # Ordered local rounds remain partner-closed for their mirror exchange.
         ranks = mesh_divisor(mesh_xy)
-        rounds = (parent_rounds(nq, ranks, partner_parent if ordered else None)
-                  if execution == 'local' else
-                  [([q], 1, np.asarray([0], np.int64)) for q in range(nq)])
+        face_batch = 1
+        if execution == 'face':
+            from gw.shared_pole_execution import face_batch_width
+            face_batch, execution_receipt['face_batch'] = face_batch_width(
+                meta, resolution, mesh=mesh_xy, ledger=ledger, upstream=upstream,
+                side=conservative_side, sample_batch=fit_hi - fit_lo,
+                selection_faces=((fit_hi - fit_lo) * len(sample_fields) + len(moment_fields)),
+                nq=nq)
+        from gw.shared_pole_execution import sector_round_schedule
+        rounds = [row[:3] for row in sector_round_schedule(
+            bank, header, meta, config, mesh_xy, partner_parent if ordered else None,
+            execution=execution, batch_width=face_batch)]
         batch_spec = P(("x", "y"))
         read_spec = batch_spec if execution == 'local' else None
         kernels = _round_kernels(mesh_xy, 'batch' if execution == 'local' else 'face')
         to_face, to_batch = batch_to_face(mesh_xy), face_to_batch_reshard(mesh_xy)
-        fit_lo = min(int(i) for i in recipe["fit_ids"])
-        fit_hi = max(int(i) for i in recipe["fit_ids"]) + 1
     for ids, real, slots in rounds:
         with timing.section("spole.batch_admission"):
-            budget.batch_width = ranks if execution == 'local' else 1
+            budget.batch_width = ranks if execution == 'local' else real
             budget.retained_panels = tuple(factors)
             budget.plan(
                 conservative_side, phase="selection",
@@ -264,7 +274,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
             # infinity actions, result arrays and sort scratch. Only completed
             # earlier parents are additional retained storage.
             budget.retained_panels = tuple(factors)
-            budget.batch_width = ranks if execution == 'local' else 1
+            budget.batch_width = ranks if execution == 'local' else real
             budget.plan(side, phase="reduction")
         with timing.section("spole.gram_reduction"):
             if execution == 'face':
@@ -308,7 +318,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
                     raise ValueError(f"GATE shared_pole_retained_moments: got: failed at q={q}; want: projected latent moment identity <=1e-10; why: corrected Ritz algebra")
             reductions = own_extent_receipts(round_reduction, tables["own"][:real])
         with timing.section("spole.coulomb"):
-            budget.batch_width = ranks if execution == 'local' else 1
+            budget.batch_width = ranks if execution == 'local' else real
             budget.plan(side, phase="model", sample_batch=len(held_ids))
             budget.live((*round_model, *round_signed, qi))
             # V^-1/2 of the round's parents: one owner call per contiguous run of ids, rows in slot order.
@@ -327,8 +337,9 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
                 parts.append(part)
                 coulomb.update({q: dict(receipt, support_ranks=receipt["support_ranks"][q - lo:q - lo + 1])
                                 for q in range(lo, hi)})
-            inverse_sqrt = (parts[0] if execution == 'face' else
-                            to_batch(face_rows(mesh_xy, tuple(sorted(ids[:real]).index(q) for q in ids))(*parts)))
+            inverse_sqrt = face_rows(mesh_xy, tuple(sorted(ids[:real]).index(q) for q in ids))(*parts)
+            if execution == 'local':
+                inverse_sqrt = to_batch(inverse_sqrt)
             del parts
             # Callee I/O admission needs the actual arrays that survive the
             # Coulomb call, not the earlier pre-call live set.
@@ -388,7 +399,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
         with timing.section("spole.export_prepare"):
             # The sorted model is an active prefix: keep the round's widest K, then restore to the face.
             width = column_extent(int(counts[:real].max()))
-            factors.append(face_rows(mesh_xy, (0,), width)(round_model[0]) if execution == 'face' else
+            factors.append(face_rows(mesh_xy, tuple(range(real)), width)(round_model[0]) if execution == 'face' else
                            face_rows(mesh_xy, tuple(range(real)), width)(to_face(round_model[0])))
             store_poles.append(poles[:real, :width])
             store_counts.append(counts[:real])
