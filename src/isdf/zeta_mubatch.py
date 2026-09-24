@@ -365,8 +365,10 @@ def make_route_g_kernel(*, mesh: Mesh, plan_id, kgrid, fft_grid, ns: int, b: int
             a0 = gi * n_pg + jnp.arange(n_pg)
             on = (a0 < n_a).astype(jnp.float64)
             F = jax.lax.dynamic_slice_in_dim(Fa, gi * n_pg, n_pg, axis=1)
-            F = jnp.concatenate([F, jnp.zeros(F.shape[:5] + (1,), F.dtype)], -1)
-            st = jnp.take(F, pfc, axis=-1).reshape(nk, n_pg, ns, 2 * c, ns, n_b, n_c)
+            # Empty plane cells carry the out-of-range column n_col: a zero
+            # fill in the gather itself, no padded copy of the cylinder.
+            st = jnp.take(F, pfc, axis=-1, mode='fill', fill_value=0).reshape(
+                nk, n_pg, ns, 2 * c, ns, n_b, n_c)
             d = local_fftn3(st, axes=(-2, -1), norm='backward')        # Σ e^{-iG·r}
             bl = jnp.exp(-2j * jnp.pi * (
                 kch[:, axis][:, None, None] * a0[None, :, None] / n_a
