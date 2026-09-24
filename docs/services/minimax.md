@@ -1,206 +1,174 @@
 # minimax — numerical quadrature service
 
 `services/minimax/` is an independently installable NumPy service. Consumers
-use `import minimax`; importing its submodules from LORRAX is a layering
-failure. Importing the package does not import JAX or SciPy. Constructors
-load their numerical dependencies only when called.
+write `import minimax` and use top-level names; importing a submodule from
+LORRAX is a layering failure. Importing the package loads neither JAX nor
+SciPy. Each constructor loads its numerical dependencies when called; SciPy
+and mpmath come from the `solve` extra.
 
-This is one **public namespace**, not one numerical algorithm: callers select
-the constructor matching their kernel, domain and error currency. The
-regularized screening rules, MPA causal rules, Sigma denominator boxes,
-shared-pole value/derivative rules and Matsubara response remain separate
-because their certificates answer different questions. The three analytic
-reciprocal constructors are eligible only for exact-match one-dimensional
-targets. Sigma PPM's real-pole crossing windows request the damped-line rule;
-its other windows retain their existing box rules.
-`gw.mpa.evaluator` keeps import-compatible aliases for old callers and tests;
-production node selection calls `minimax` directly.
+The namespace holds several distinct rule families, one per kernel, domain
+and error currency. A rule valid for one target is not valid for another with
+the same bandwidth, so callers select the constructor that matches their
+kernel. The disk cache and uniform-rule backend are controlled by
+`LORRAX_MINIMAX_CACHE_DIR`, `LORRAX_DISABLE_MINIMAX_DISK_CACHE` and
+`LORRAX_UNIFORM_RULE_BACKEND`, whose rules
+[`docs/dev/env_vars.md`](../dev/env_vars.md) owns. A cached rule always carries
+`source='cache'` and `certified=False`.
 
 ## Caller contract
 
-| Surface | Contract |
-|---|---|
-| `lookup(...)` | Searches shipped certified tables only and raises a named F1–F4 refusal on an invalid or uncovered request; it never solves. |
-| `serve(...)` | Computes and announces a screening rule in process. It does not consult shipped tables. The result carries achieved error and provenance. |
-| `catalog()` / `nearest_certified(...)` | Enumerate certified coverage and suggest nearby covered requests without solving. |
-| `family_for_character(...)`, `TARGETS`, `FAMILIES` | Define the accepted target and family vocabulary as data. |
-| `Quadrature`, `Provenance` | Return nodes, weights, measured error, certification state, source, and artifact identity. |
-| `build_uniform_rule(box, eps)` | Builds and certifies one denominator-box rule for `1/d` on `[re_lo, re_hi] x [im_lo, im_hi]`. A production surface, not a lookup: it takes no clock and no pass count, and returns when its own boundary certificate is met, so the same box and tolerance give the same rule on any machine. `gw.sigma_box_plan` is the consumer. |
-| `response_frequency_rule(lo_ry, hi_ry, z_ry, ...)` | Complex-time exponential sums for one shared-pole frequency; independent value/ds fits, sampled accuracy. |
-| `response_bank_rule(...)` / `response_laplace_rule(...)` | Retained real-time and noncrossing scalar rules with continuum bounds. |
-| `matsubara_response_rule(...)` | Builds a finite-temperature KMS-paired imaginary-time rule. |
-| `augment_odd_laplace(...)` | Adds the odd GN-PPM resolvent channel on the existing even rule's time nodes, refusing a missed sampled gate. |
-| `damped_line_rule(...)` / `damped_rectangle_rule(...)` / `damped_rectangle_gauss_rule(...)` / `damped_rectangle_positive_rule(...)` | Build MPA's positive-time line and rectangle rules. The rectangle constructors retain their respective geometric and error contracts; GW passes scalar bounds and receives time nodes and weights. |
-| `positive_reciprocal(...)` / `odd_reciprocal(...)` / `damped_line_reciprocal(...)` | Analytic constructions for three specific one-dimensional reciprocal domains; none is a general replacement for a production target with a different kernel or error currency. |
-| `analytic_line_box_rule(box, eps)` | Converts the normalized fixed-height line rule into Sigma's `sum w exp(i t d)` convention and checks peak-relative error. Accepts only a crossing box with one positive imaginary height. PPM requests it for zero-damping real poles. |
-| offline solver names | Lazily expose table-generation machinery; using them does not make the result a shipped certified rule. |
+| surface | contract | production consumer |
+|---|---|---|
+| `serve(*, family, target, range_value, error_bound, n_max, eps_q=None, omega_hat=None) -> Quadrature` | Solves a screening rule in process for families `noncrossing`, `noncrossing_imag` (needs `omega_hat`) and `crossing` (`eps_q`, target `hgl` or `fermi`). It never reads shipped tables and refuses any other selector keyword. | `gw.minimax_screening` |
+| `lookup(...)`, `catalog()`, `nearest_certified(...)` | Search, enumerate and suggest shipped certified tables. Never solve. | tests and generators |
+| `TARGETS`, `FAMILIES`, `CHARACTERS`, `family_for_character(...)` | Target and family vocabulary as data. | |
+| `Quadrature`, `Provenance` | Nodes, weights, `max_error`, κ₀, certification state, source and artifact identity. | |
+| `build_uniform_rule(box, eps, ...)` | Builds and certifies one rule for `1/d` on the denominator box `[re_lo, re_hi] × [im_lo, im_hi]`. It returns when its own boundary certificate is met, with no clock or pass-count input, so a given box and tolerance give the same rule on any machine. | `gw.sigma_box_plan` |
+| `analytic_line_box_rule(box, eps)` | Fixed-height line rule in Σ's `Σ w e^{itd}` convention, checked to peak-relative error. Crossing boxes with one positive imaginary height only. | `gw.sigma_box_plan`, PPM real-pole crossing windows |
+| `fit_damped_reciprocal(rectangles, *, target_error, ...)` | One positive rule `1/d ≈ Σ w e^{−d t}` for `1/(x − iγ)` over rectangles `(x_min, x_max, γ_min, γ_max)`, `x_min > 0`. | `gw.mpa.sigma_windows` |
+| `damped_line_rule`, `damped_rectangle_rule`, `damped_rectangle_gauss_rule`, `damped_rectangle_positive_rule` | MPA positive-time line and rectangle rules, § [Damped MPA rules](#damped-mpa-rules). | `gw.mpa.model` |
+| `augment_odd_laplace(times, x_min, x_max, omega, *, tolerance, max_extra=16)` | Odd GN-PPM channel on the even rule's times, § [Odd imaginary-axis channel](#odd-imaginary-axis-channel). | `gw.minimax_screening` |
+| `response_group_rules`, `response_laplace_rule`, `response_bank_rule` | Shared-pole response rules, § [Response-bank rule sessions](#response-bank-rule-sessions). | `gw.response_bank`, `gw.minimax_screening` |
+| `matsubara_response_rule(beta_ry_inv, delta_max_ry, n_indices, *, rel_tol=1e-8)` | Finite-temperature KMS-paired imaginary-time rule, § [Matsubara rules](#finite-temperature-matsubara-rules). | `gw.w_isdf` |
+| `positive_reciprocal`, `odd_reciprocal`, `damped_line_reciprocal` | Analytic constructions on three one-dimensional reciprocal domains, § [Analytic reciprocal constructors](#analytic-reciprocal-constructors). | none directly; `analytic_line_box_rule` wraps the line rule |
 
-There is no escape hatch and no shipped-table branch: `serve` computes every
-screening rule in process, announces it once naming the request, the achieved
-error, the measured sum of |w| and kappa_0, and certifies it with a de la
-Vallee Poussin alternation certificate. `LORRAX_MINIMAX_ALLOW_RUNTIME_SOLVE`
-retired with that branch on 2026-09-16 and is read nowhere; its row in the
-[environment-variable registry](../dev/env_vars.md) says so.
+`gw.mpa.evaluator` re-exports the four damped builders for import
+compatibility and keeps the scalar MPA kernel as a physics oracle, not a node
+selector.
 
-## One service, distinct target contracts
+**`serve`.** `noncrossing` is solved by `noncrossing_levelled` and bounded by a
+de la Vallée Poussin alternation certificate; `noncrossing_imag` and
+`crossing` return the smallest rule whose measured grid error meets the
+target. When `n_max` nodes do not reach `error_bound`, the `n_max` rule is
+returned with its larger `Quadrature.max_error`; the caller checks it. Every
+distinct request is announced once (`RuntimeWarning`) with node count,
+max error, Σ|w|, κ₀ and provenance. Node positions can differ in the last
+digits between hosts, because the solve goes through the local LAPACK, so
+compare rules by node count and error, not bytes.
 
-`lookup` remains available to inspect historical certified assets;
-production `serve` computes the screening rule in process. Sigma's
-deck-dependent denominator rectangles use `build_uniform_rule`, while the
-shared-pole W bank needs both response values and derivatives at its current
-complex frequencies. MPA's damped line and rectangle builders also live here;
-`gw.mpa.evaluator` retains only the exact scalar kernel and compatibility
-exports, and `gw.mpa.sigma_windows` calls the service directly. The three reciprocal constructors cover
-one-dimensional domains only. Keeping these targets distinct prevents an
-apparently shorter API from applying a valid rule to the wrong function.
+**`lookup` refusals** are `MinimaxRefusal` subclasses (`RuntimeError`):
+`NoCertifiedTable` (F1, outside the catalog), `AmplificationCap` (F2, κ₀ above
+the declared cap), `UnknownTarget` (F3, outside the vocabulary; also raised by
+`serve`), and `CatalogUnavailable` / `TableUnreadable` / `CatalogCorrupt`
+(F4a–c). A malformed or insufficient entry refuses; it is never a silent cache
+miss. Catalog entries bind family, target, range selector, error bound, node
+limit, payload hash, achieved error, amplification, generator provenance and
+backend; `beta_selector` and `damped_line_selector` are public modules because
+their clauses are part of selection.
 
-The damped builders accept physical frequencies and damping heights in one
-energy unit and return positive times in the inverse unit. Their default
-relative tolerance is `DEFAULT_DAMPED_REL_TOL`; the line builder also exposes
-`DEFAULT_WAVELENGTHS_PER_PANEL`. The common Legendre interval nodes are cached
-inside the service, so repeated panel widths do not redo the polynomial
-eigensolve. The scalar MPA kernel remains in `gw.mpa.evaluator` as a physics
-oracle, not a node selector.
+## Damped MPA rules
 
-## Catalog and selection
+The damped builders take physical frequencies and damping heights in one
+energy unit and return positive times in the inverse unit.
+`damped_line_rule(varpi, freq_max, *, rel_tol=DEFAULT_DAMPED_REL_TOL,
+wavelengths_per_panel=DEFAULT_WAVELENGTHS_PER_PANEL, max_order=256)` is a
+composite Gauss–Legendre quadrature of the causal positive-time integral. The
+rectangle constructors keep their own geometric and error contracts; GW passes
+scalar bounds and receives times and weights. Legendre interval nodes are
+cached inside the service, so repeated panel widths do not repeat the
+polynomial eigensolve.
 
-Catalog entries bind a family, target, range selector, error bound, node limit,
-payload hash, achieved error, amplification, generator provenance, and backend.
-Selectors such as `beta_selector` and `damped_line_selector` are public module
-objects at the package door because their clauses are part of catalog
-selection. An explicit malformed, missing, or insufficient entry refuses; it
-is not treated as a silent cache miss.
+## Odd imaginary-axis channel
 
-## Boundary with LORRAX's odd imaginary-axis kernel
+`augment_odd_laplace` keeps the served even nodes in order and greedily adds
+at most `max_extra = 16` nodes to fit ω/(x² + ω²) on `[x_min, x_max]` to the
+requested absolute error, reusing precomputed candidate exponential columns
+across weight-only Lawson fits. It returns
+`(times, odd_weights, added_count, sampled_max_error)` and raises if the
+sampled gate is missed. It is a sampled fit, not a continuum certificate.
+`gw.minimax_screening` converts units and appends zero even weights on the
+added nodes; `gw.w_isdf.compute_chi0_imag_ordered` consumes even and odd
+weights on one node axis. The derivation is in the
+[non-Hermitian GN-PPM memo](../dev/notes/DERIVATION_gnppm_nonhermitian.md).
 
-The magnetic GN-PPM odd channel is determined by
-`minimax.augment_odd_laplace`: it retains the served even nodes and greedily
-adds at most 16 nodes to fit `omega_p / (x**2 + omega_p**2)` to the requested
-absolute error. Candidate exponential columns are built once and reused
-across weight-only Lawson fits. `gw.minimax_screening` only converts physical
-units and appends zero even weights on the added nodes; the service refuses
-if the odd gate is missed. The augmentation is a sampled runtime fit, not a
-new continuum-certified table.
+## Response-bank rule sessions
 
-`gw.w_isdf.compute_chi0_imag_ordered` requires `alpha_odd` and consumes the
-even and odd weights on one node axis. The derivation and limiting identities
-are owned by the [non-Hermitian GN-PPM memo](../dev/notes/DERIVATION_gnppm_nonhermitian.md).
+Frequencies and transition intervals are in Ry, times in Ry⁻¹, and
+derivatives are with respect to s = z². No rule sees band masks, occupations
+or response arrays, and none certifies W or Σ accuracy.
+
+* **`response_group_rules(lo_ry, hi_ry, z_ry, *, rel_tol=1e-8, previous=None,
+  decay_rate=0)`** (the shared-pole bank). A stacked Hankel shift pencil
+  proposes complex Laplace times shared by every forward (z) and reverse
+  (−z̄) pole of a sample group; linear projection fits 1/(d − p) and
+  1/(d − p)² on those nodes. Each node is one Green-pair evaluation A(t):
+  forward rows use exp[−(d − reference)t], reverse rows use conj(A(t)). A
+  group whose shared fit fails is halved down to single samples. Each rule
+  has `members`, `t[RESPONSE_NODE_CAPACITY]` (384; one pencil holds
+  `RESPONSE_RULE_CAPACITY = 192`), `value`/`derivative` of shape
+  `[members, 2, 384]`, `count`, `sampled_error`, `coefficient_mass` and
+  `reference_ry`; zero coefficients mark inactive slots. Errors are sampled,
+  not proven. A positive `decay_rate` bounds occupation products by
+  min(1, e^{decay_rate·d}) and restricts 0 ≤ Re t ≤ decay_rate. `previous`
+  rules with matching members are tried first.
+* **`response_laplace_rule(delta_lo_ry, delta_hi_ry, z_ry, *, rel_tol=1e-8,
+  previous=None, domain_pad_ry=0, ordered=False, reference_ry=None)`** (remote
+  noncrossing cells). Elliptic decay rates, a small Lyapunov solve and a
+  symmetric time-moment eigensolve prescribe positive real nodes; linear
+  projection fits exact even value/ds (and, with `ordered`, K/dsK) targets on
+  them. Projections include e^{−reference·t}; the consumer supplies
+  e^{−(δ − reference)t}. A continuum polynomial/exponential residual bound
+  certifies the rounded returned arrays, and the degree grows until it passes.
+  The norm is relative error. [Derivation and accuracy
+  scope](../theory/response-laplace.md).
+* **`response_bank_rule(z_ry, delta_max_ry, *, rel_tol=1e-8, previous=None,
+  domain_pad_ry=0)`** (no production consumer). Positive real-time Hermite
+  panels `(t, h)` returning h e^{izt} and h e^{izt}·it/(2z). The currency is
+  peak-scaled absolute error (η|value|, η³|derivative|, η = min Im z), and
+  the certificate covers the full signed transition interval, both branches,
+  tail and panels.
+
+For the two real-time rules, `domain_pad_ry` enlarges a newly built domain
+(remote lower padding stops at positivity and cannot cross
+δ_lo > max|Re z|). Reuse of `previous` requires current-domain containment,
+an intact node digest and passing current-frequency bounds at the requested
+tolerance (the bank rule also needs an unchanged tolerance); otherwise a new
+rule is built, and corrupt integration arrays refuse. Results report
+`reuse_status`, `reuse_reason`, `node_digest` and the certified domain.
+`services/minimax/tests/test_response_rules.py` checks analytic kernels, the missing-1/(2z)
+derivative red twin, positivity and refusals.
+
+## Finite-temperature Matsubara rules
+
+`matsubara_response_rule(beta_ry_inv, delta_max_ry, n_indices, *,
+rel_tol=1e-8)` returns nodes t ∈ (0, β/2] and complex weights W[k, l] for
+bosonic ν_k = 2πk/β, applied as
+
+$$\chi(i\nu_k) \approx \sum_l W_{kl}\, h(t_l) + \overline{W_{kl}}\, h(\beta - t_l)$$
+
+to any imaginary-time correlation whose terms are
+f_m(1 − f_n) e^{−(ε_n − ε_m)τ} (Fermi–Dirac, KMS-bounded by 1). KMS maps
+negative transitions onto the mirrored node, so pairs of either sign are
+covered. The certificate is the sup over y ∈ [0, δ_max] of the even target
+y(1 − e^{−βy})/(y² + ν²) and odd target ν(1 − e^{−βy})/(y² + ν²) errors, each
+relative to its own sup, on a dense grid refined near the largest samples; an
+amplification above 0.1·rel_tol/ε_machine refuses. Nodes come from pivoted-QR
+compression of a graded Gauss–Legendre pool with least-squares weights (the
+Kaltak–Kresse finite-temperature problem, PRB 101, 205145 (2020), solved
+without their nonlinear minimax optimization).
+`services/minimax/tests/test_matsubara_rules.py` checks the Lindhard weight
+(f_m − f_n)/(x − iν) pair by pair, including −∂f/∂ε at ν₀, with a
+wrong-frequency red twin.
 
 ## Analytic reciprocal constructors
 
-The lazy package door exposes `positive_reciprocal(R, tolerance)`,
-`odd_reciprocal(A, tolerance)`, and
-`damped_line_reciprocal(bandwidth_over_broadening, tolerance)`. All three use dimensionless
-**absolute** error and return an object with `times` and `evaluate(x)`.
-The positive rule has positive `strengths` in the stable shifted convention
-`sum strengths * exp(-(x-1)*times)`; the old unshifted coefficients are
-`strengths * exp(times)`. The odd rule has `weights` in
-`sum weights * sin(x*times)`. The line rule has complex `weights` in
-`sum weights * exp(i*u*times)` for `1/(u+i)` on
-`|u|<=bandwidth_over_broadening`; damping is already in the coefficients.
-To approximate physical `1/(x+i*height)` to absolute error `eps`, construct
-with `(span/height, height*eps)` and call `rule.rescaled(height)`.
-Sigma PPM routes zero-damping crossing denominator lines through
-`analytic_line_box_rule`. The executor receives these times and weights through
-the same window object as the box rule. The service removes damping from the
-line rule's weights because `exp(i t d)` contains it; the Sigma window adapter
-then factors out the deck's `eta` once. Sign-definite tails and finite-height
-rectangles continue to request box rules. The positive and sine constructors
-have no production consumer: screening's regularized HGL/Fermi and
-imaginary-probe kernels are different targets.
+All three take a dimensionless **absolute** tolerance and return an object
+with `times` and `evaluate(x)`.
 
-The positive constructor prescribes elliptic interpolation abscissae, solves
-their moments in elevated precision, and optionally applies two measured
-error-envelope corrections. Its reported extremum is a numerical audit, not
-an interval certificate. The sine rule's pole-aware interpolation provides an
-exact-arithmetic bound equal to its reported core plus correction bounds.
-The line rule is a conservative composite Gauss-Legendre quadrature of the
-causal positive-time integral: its tail is `exp(-height*T)/height` and its
-panel bound follows the standard Gaussian `2n`-derivative remainder summed
-over panels. It does **not** implement the discussion's proposed one-sided
-csc correction, whose complete certificate has not been derived. The
-comparison and its exact source pin are in the sandbox report
-`reports/analytic_quadrature_2026-09-16/report.md`.
+| constructor | target | form | guarantee |
+|---|---|---|---|
+| `positive_reciprocal(R, tolerance)` | 1/x on 1 ≤ x ≤ R | Σ strengths·e^{−(x−1)t} (unshifted coefficients are strengths·e^{t}) | high-precision numerical extremum audit (mpmath), not an interval certificate |
+| `odd_reciprocal(A, tolerance)` | 1/x on [−A, −1] ∪ [1, A] | Σ weights·sin(xt) | exact-arithmetic bound: reported core plus correction bounds |
+| `damped_line_reciprocal(u_max, tolerance)` | 1/(u + i) on \|u\| ≤ u_max | Σ weights·e^{iut}, damping folded into the weights | composite Gauss–Legendre: tail e^{−T}, panel bound from the 2n-derivative remainder |
 
-`import minimax` remains NumPy-only. Calling the response Laplace, positive or sine constructor
-loads optional SciPy, and positive construction also needs mpmath (the `solve`
-extra). The positive and sine rules remain exploratory, not catalog entries; the catalog's
-provenance and production selection promises remain unchanged.
+To approximate the physical 1/(x + i·height) to absolute error ε, construct
+the line rule with `(span/height, height·ε)` and call
+`rule.rescaled(height)`. `analytic_line_box_rule` removes e^{−height·t} from
+the weights, because Σ's e^{itd} already carries that damping; it accepts only
+a real interval crossing zero at one positive height. Sign-definite tails and
+finite-height rectangles use `build_uniform_rule`.
 
 ## Verification
 
-The standalone package tests live in `services/minimax/tests/`; the monorepo
-layering test enforces the top-level door. Lookup tests must run without SciPy,
-while solver-generation tests may require it.
-
-
-## Frequency-specific response rule
-
-`response_frequency_rule(lo_ry, hi_ry, z_ry, rel_tol=..., previous=None)`
-returns `[2,128]` complex times and coefficients for the independent
-`1/(d-z)` and `1/(d+z)` primitives. Zero coefficients mark inactive slots.
-A Hankel shift pencil proposes nodes; scaled linear least squares fits both
-reciprocals and their squares on the same nodes. Non-growing finite modes,
-sampled value/ds error and finite coefficients are checked. This interface does
-**not** claim continuum certification or a W/Sigma error bound.
-The bank plans on one host, broadcasts small arrays, and reuses them while
-frequencies and the padded transition interval remain valid. It retains no
-spatial fields in the scalar cache. Complex times use complex128 identities.
-
-## Retained real-time/noncrossing scalar rules
-
-`response_bank_rule(z_ry, delta_max_ry, rel_tol=..., previous=None,
-domain_pad_ry=0)` returns positive real-time nodes and weights, value and
-s-derivative projections, a node digest, and continuum panel/tail bounds.
-`response_laplace_rule(delta_lo_ry, delta_hi_ry, z_ry, ...)` returns positive
-Laplace nodes with even/odd value and derivative projections, certified by
-continuum polynomial-denominator residual bounds. Both accept the previous in-memory result.
-A hit retains its integration arrays exactly and regenerates projections for
-all supplied frequencies. The bank norm is eta-scaled absolute value/derivative
-error; the remote norm is relative error. Neither certifies W or Sigma accuracy.
-
-`domain_pad_ry` enlarges a newly built transition domain. Remote lower padding
-stops at positivity and cannot cross `delta_lo > max|Re(z)|`. Reuse
-requires current-domain containment, an intact node digest and passing
-current-frequency bounds at the requested tolerance (the real-time rule also
-requires an unchanged tolerance). Otherwise the owner builds a new rule;
-corrupt integration arrays refuse. Receipts report `reuse_status`,
-`reuse_reason`, `node_digest` and the actual certified domain. No wavefunctions,
-response matrices, physical samples or W models live in this session.
-
-### Response-rule currencies and certificates
-
-Frequencies and transition intervals are in Ry, times in inverse Ry, derivatives with respect to `s = z²`.
-
-- `response_bank_rule` (real-time Hermite panels): positive `(t, h)` returning `h e^{izt}` and the derivative
-  row `h e^{izt}·it/(2z)`. The currency is peak-scaled absolute error (`η·|value|`, `η³·|derivative|`,
-  `η = min Im z`); the certificate bounds the full signed transition interval and both exponential branches,
-  tail and panel budgets included. It does not certify relative W or Σ accuracy.
-- `response_laplace_rule` (remote cells): geometry-only elliptic decay rates, a small
-  Lyapunov solve and a symmetric time-moment eigensolve prescribe positive real nodes.
-  Linear projection fits exact even value/ds and ordered K/dsK targets on those same
-  nodes. Projections already include `exp(-reference_ry*t)`; the consumer supplies
-  `exp(-(delta-reference_ry)*t)`. A continuum polynomial/exponential residual bound
-  certifies the rounded returned arrays, including the squared-denominator derivative
-  targets and primitive orientation sums. Degree increases until that certificate passes;
-  no nonlinear optimizer, precomputed nodes, or universal node-count guarantee is used.
-  Both ordered and even rules reuse fixed nodes after current-domain/frequency checks.
-  [Derivation and accuracy scope](../theory/response-laplace.md).
-
-Neither rule sees band masks, occupations or response arrays. `tests/test_response_rules.py` checks analytic
-kernels, the missing `1/(2z)` derivative red twin, positivity and refusals.
-
-### Finite-temperature Matsubara rules
-
-`matsubara_response_rule(beta_ry_inv, delta_max_ry, n_indices, rel_tol=...)` returns nodes `t` in
-`(0, beta/2]` and complex weights `W[k, l]` for bosonic `nu_k = 2 pi k / beta`, used as
-`sum_l W h(t_l) + conj(W) h(beta - t_l)` on any imaginary-time correlation whose terms are
-`f_m (1-f_n) exp(-(e_n - e_m) tau)` (Fermi-Dirac, KMS-bounded by 1). Pairs of either sign are covered: KMS
-maps a negative transition onto the mirrored node. The certificate is the sup over `y` in `[0, delta_max]` of
-the even target `y(1-e^{-beta y})/(y^2+nu^2)` and odd target `nu(1-e^{-beta y})/(y^2+nu^2)` errors, each
-relative to its own sup, on a dense grid with the largest samples refined locally; an amplification above
-`0.1 rel_tol / eps_machine` refuses. The node set solves Kaltak and Kresse's finite-temperature problem
-(PRB 101, 205145 (2020)) by pivoted-QR compression of a graded Gauss-Legendre pool with least-squares
-weights, not by their nonlinear minimax optimization. `tests/test_matsubara_rules.py` checks the Lindhard
-weight `(f_m - f_n)/(x - i nu)` pair by pair (including `-df/de` at `nu_0`) with one-particle factors in log
-form, a wrong-frequency red twin, and refusals.
+Package tests live in `services/minimax/tests/`; the monorepo layering test
+enforces the top-level door. Lookup tests must pass without SciPy.
