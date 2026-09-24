@@ -332,6 +332,7 @@ Read by `config/frontera/stage_runtime.sh`, `build_cpu_runtime_bundle.sh`,
 | `CUDA_VISIBLE_DEVICES` | Read to derive local device ids; `tests/conftest.py` rewrites it per xdist worker. |
 | `SLURM_NNODES` | Read by `gw/gw_init.py` for the ranks-per-node estimate of a local-backend capacity check (malformed → 1). |
 | `SLURM_JOB_ID`, `SLURM_STEP_ID` | Recorded in response-bank and Galerkin receipts. |
+| `JAX_EXPLAIN_CACHE_MISSES` | `0` (off): JAX's own switch; `1` prints JAX's per-trace cache-miss explanations. `LORRAX_DEBUG_PRINT` does not turn it on. |
 | `JAX_CPU_COLLECTIVES_IMPLEMENTATION` | Multi-process CPU runs require `mpi`; `runtime.announce_cpu_collectives()` refuses any other backend. Why: [`environment/transports.md`](../environment/transports.md). |
 | `MPITRAMPOLINE_LIB` | MPItrampoline's adapter, absolute, set before JAX import: Frontera's patched Intel-MPI build, Perlmutter's unmodified upstream build from `config/perlmutter/build_mpiwrapper.sh`. A vendor `libmpi.so` is not an adapter. Contract: [`mpi_collectives.md`](mpi_collectives.md). |
 | `LD_PRELOAD` | Perlmutter CPU-MPI: `config/perlmutter/cpu_mpi_env.sh` prepends `/opt/cray/pe/lib64/libpmi.so.0` and verifies it resolves under the Cray tree; foreign MPI, MPItrampoline/MPIwrapper and `libpmi2` entries refuse. The startup report records whether `libpmi.so.0` is preloaded. |
