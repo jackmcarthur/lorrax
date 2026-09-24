@@ -129,6 +129,15 @@ After 09-02, d7f556fc (Σ(ω=0) for states off the ±4 eV grid; owner rule
 reference header and in
 `tests/known_failures/2026-09-24-bispinor-and-core-fixture-refreeze.md`.
 
+## 2026-09-24 (P2-C) — Σ^B route unified to packed, owner 2026-09-24
+
+`linalg` no longer chooses the Σ^B route: the packed bare-transverse route
+solves no packed Dyson equation, so this `linalg = local` deck now takes it
+(headless under `head_correction = off`), and its Lorentz sums run on the
+fused mathdx mode 8. The reference was re-cut on that route: every data row is
+byte-identical to the previous cut (only the provenance header moved), since a
+headless packed SX_TT with W_TT = D_TT is the incumbent bare TT exchange.
+
 ## Files
 
 - `bispinor_test.in` — GN-PPM bispinor input (Tier-1 gate; the Tier-2
@@ -136,6 +145,6 @@ reference header and in
   restart round-trips in both layouts since 2026-08-23, see gw_init.py).
 - `centroids_frac_256.txt` / `centroids_frac_209_current.txt` — charge /
   transverse ISDF centroid sets (seed 42).
-- `sigma_diag_bispinor_ref.dat` — frozen reference (sigX/sigC/sigXC), re-cut 2026-09-24 at c52b2c42.
+- `sigma_diag_bispinor_ref.dat` — frozen reference (sigX/sigC/sigXC), re-cut 2026-09-24 at c52b2c42 and on the packed route (P2-C; values unchanged).
 - `WFN.h5` (34 bands), `kin_ion.h5` (regenerated 2026-09-02, stamped),
   `Mo.upf` / `S.upf` (added 2026-09-02; see above for which generation).

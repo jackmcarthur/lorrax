@@ -555,7 +555,8 @@ def test_gnppm_matches_reference(gnppm_session):
 def test_bispinor_gnppm_matches_reference(bispinor_session):
     """Bispinor GN-PPM frozen gate (Σ^B folded into sigX).
 
-    Frozen at P4 (2026-09-24, c52b2c42); compared at ``_XMACHINE_ATOL_EV``
+    Frozen at P4 (2026-09-24, c52b2c42; re-cut on the packed Σ^B route the
+    same day, data rows unchanged); compared at ``_XMACHINE_ATOL_EV``
     (owner ruling 2026-08-07 — read that constant before touching it).
     Runs only as four pytest ranks; see ``_NEEDS_P4_RANKS``.
     """

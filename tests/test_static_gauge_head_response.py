@@ -527,8 +527,10 @@ def test_the_route_and_the_refusal_read_the_same_envelope_table(tmp_path):
     both = [row[2] for row in gw_config.packed_static_envelope(
         _parse(tmp_path, _packed_deck()), screened=True)]
     assert both[:len(shared)] == shared
-    assert len(both) == len(shared) + 1      # scalar-head override is screened-only
-    assert "linalg = distributed" in shared
+    # The packed Dyson solve and the scalar-head overrides are screened-only:
+    # the bare route solves no packed Dyson, so `linalg` never chooses it.
+    assert len(both) == len(shared) + 2
+    assert "linalg = distributed" in both and "linalg = distributed" not in shared
 
 
 def test_material_class_is_owned_by_wfn_validation_not_the_envelope(tmp_path):
