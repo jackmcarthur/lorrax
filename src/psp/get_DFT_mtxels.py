@@ -574,6 +574,17 @@ def _rho_sym_perm(wfn, fft_grid: tuple[int, int, int]):
     return perm
 
 
+@jax.jit
+def _symmetrise_with_movement(rho, perm):
+    """Star average plus ``max|ρ|`` and ``max|ρ_sym − ρ|``: one executable.
+
+    Eager, these were a dozen single-op XLA compiles on every run.
+    """
+    from gw.qsgw_density import symmetrise_density
+    rho_sym = symmetrise_density(rho, perm)
+    return rho_sym, jnp.max(jnp.abs(rho)), jnp.max(jnp.abs(rho_sym - rho))
+
+
 def symmetrize_valence_density(rho_r, wfn, *, print_fn=None):
     """ρ(r) → (1/N_op) Σ_op ρ({S|τ}r) over the WFN file's space group.
 
@@ -596,15 +607,13 @@ def symmetrize_valence_density(rho_r, wfn, *, print_fn=None):
     if perm is None:
         return rho_r
 
-    from gw.qsgw_density import symmetrise_density
-    rho_j = jnp.asarray(rho_r, dtype=jnp.float64)
-    rho_sym = symmetrise_density(rho_j, perm)
+    rho_sym, scale, moved = _symmetrise_with_movement(
+        jnp.asarray(rho_r, dtype=jnp.float64), jnp.asarray(perm, jnp.int32))
     # How far ρ moved is the one number that says whether this was a
     # round-off cleanup or a change of physics, so it is always computed —
     # printed when there is somewhere to print it, escalated when it is
     # large enough to mean something other than accumulation error.
-    scale = float(jnp.max(jnp.abs(rho_j))) or 1.0
-    moved = float(jnp.max(jnp.abs(rho_sym - rho_j))) / scale
+    moved = float(moved) / (float(scale) or 1.0)
     if print_fn is not None:
         print_fn(f"    rho symmetrisation: {int(perm.shape[0])} space-group "
                  f"operations, max|Δρ|/max|ρ| = {moved:.3e}")
@@ -660,7 +669,11 @@ def build_hartree_potential(
     rho_r = symmetrize_valence_density(rho_r, wfn, print_fn=print_fn)
     volume = float(wfn.cell_volume)
     ngrid = int(np.prod(rho_r.shape))
-    charge = float(jnp.sum(rho_r)) * volume / ngrid
+    V_H_r, rho_sum, rho_v_sum = _hartree_potential_and_sums(
+        rho_r, jnp.asarray(wfn.bdot, dtype=jnp.float64),
+        jnp.asarray(wfn.bvec, dtype=jnp.float64),
+        blat=float(wfn.blat), truncation_2d=bool(truncation_2d))
+    charge = float(rho_sum) * volume / ngrid
     if expected_electrons is not None:
         rel = abs(charge - expected_electrons) / max(1.0, abs(expected_electrons))
         print_fn(
@@ -679,14 +692,7 @@ def build_hartree_potential(
     print_fn(
         f"    Hartree Coulomb: {'2D slab-truncated (Ismail-Beigi)' if truncation_2d else '3D periodic'}"
     )
-    V_H_r = compute_hartree_potential_real(
-        rho_r,
-        jnp.asarray(wfn.bdot, dtype=jnp.float64),
-        bvec=jnp.asarray(wfn.bvec, dtype=jnp.float64),
-        blat=float(wfn.blat),
-        truncation_2d=bool(truncation_2d),
-    )
-    hartree_energy = 0.5 * float(jnp.sum(rho_r * V_H_r)) * volume / ngrid
+    hartree_energy = 0.5 * float(rho_v_sum) * volume / ngrid
     print_fn(f"    Hartree energy (½∫ρV_H) = {hartree_energy:.6f} Ry")
     return V_H_r
 
@@ -822,6 +828,20 @@ def compute_core_density(atom_positions, atom_types, pseudos, meta):
     rho_core = jnp.zeros((nx, ny, nz), dtype=jnp.float64)
     
     return rho_core
+
+
+@partial(jax.jit, static_argnames=("blat", "truncation_2d"))
+def _hartree_potential_and_sums(rho_r, bdot, bvec, *, blat, truncation_2d):
+    """``(V_H(r), Σρ, Σρ·V_H)`` in one executable.
+
+    The Poisson geometry, both FFTs and the two diagnostics' sums were about
+    forty eager single-op XLA programs, each compiled on every run: 4.2 s of
+    the CrI3 8x8 Hartree stage's compile (P4 census,
+    ``runs/runtime/p2a_compile_20260924``).
+    """
+    V_H_r = compute_hartree_potential_real(
+        rho_r, bdot, bvec=bvec, blat=blat, truncation_2d=truncation_2d)
+    return V_H_r, jnp.sum(rho_r), jnp.sum(rho_r * V_H_r)
 
 
 def compute_hartree_potential_real(

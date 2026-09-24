@@ -171,6 +171,8 @@ def poisson_potential_from_rhoG(
     return jnp.real(local_ifftn3(V_G, axes=(-3, -2, -1), norm='ortho'))
 
 
+@functools.partial(jax.jit,
+                   static_argnames=("blat", "truncation_2d", "tt_metric_sign"))
 def transverse_potential_from_current(
     current_r: jnp.ndarray,
     bdot: jnp.ndarray,
