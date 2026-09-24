@@ -207,6 +207,22 @@ def zeta_plane_tables(gvec_components, ngk_per_q, fft_grid, axis, g_axis):
             np.asarray(pad_to_axis(flat.astype(np.int32), g_axis, axis=1)))
 
 
+def _spin_sandwich(U, d):
+    """``(U ⊗ Ū) d`` on the two spin axes (0 and 3) of ``d (s, x, m, s', j)``.
+
+    Written as ``ns²`` elementwise terms rather than an einsum: with a
+    contraction length of ``ns`` (2 or 4) XLA lowered the einsum to eight
+    tiny cuBLAS GEMMs per child k (157.5 ms per CrI3 batch, 5.3 s per fit,
+    sandbox runs/runtime/fft_gemm_budget_20260924), whereas the elementwise
+    form fuses into the surrounding gathers.
+    """
+    ns = int(d.shape[0])
+    Uc = jnp.conj(U)
+    left = jnp.stack([sum(U[a, c] * d[c] for c in range(ns)) for a in range(ns)])
+    return jnp.stack([sum(left[:, :, :, e] * Uc[b, e] for e in range(ns))
+                      for b in range(ns)], axis=3)
+
+
 def make_route_g_kernel(*, mesh: Mesh, plan_id, kgrid, fft_grid, ns: int, b: int,
                         q_sel, q_axis, q_neg, qvec_frac, n_col: int, n_s: int,
                         n_pg: int, axis: int, n_src: int, stop_at: str | None = None):
@@ -332,7 +348,7 @@ def make_route_g_kernel(*, mesh: Mesh, plan_id, kgrid, fft_grid, ns: int, b: int
             d = jnp.take(d, lperm[s_], axis=2) * wl[None, None, :, None, None]
             d = jnp.take(d, pslot[k], axis=-1) * jnp.conj(phase[k])
             d = jnp.where(anti[k], jnp.conj(d), d)
-            d = jnp.einsum('ac,bd,cxmdj->axmbj', U[k], jnp.conj(U[k]), d)
+            d = _spin_sandwich(U[k], d)
             d = jnp.concatenate([d.reshape(ns, 2 * c, ns, -1),
                                  jnp.zeros((ns, 2 * c, ns, 1), d.dtype)], -1)
             cy = jnp.take(d, jnp.clip(ci[k], 0, int(d.shape[-1]) - 1).reshape(-1), axis=-1)
