@@ -75,8 +75,8 @@ window and N_σ projected bands:
 | step | operation | cost |
 |---|---|---|
 | W synthesis | Σ_{p∈P_w} B_p e^{−iτ(Ω_p−E^ref_B)} over (q, μ, ν) | O(\|P_w\| N_k N_μ² / P) |
-| G build | one complex GEMM per parent, (N_μn_s × N_b^w)(N_b^w × N_μn_s), then the typed unfold to full k without processor exchange | 8 N_k^par (N_μn_s)² N_b^w / P flops |
-| k-convolution | inverse FFT of W (once per node), inverse FFT of G, product in R, forward FFT, for every centroid pair | O((N_μn_s)² N_k log N_k / P) |
+| G build | one complex GEMM per parent, (N_μn_s × N_b^w)(N_b^w × N_μn_s); a second on the conjugated faces when an antiunitary row meets complex weights. The Green stays on the parents | 8 N_k^par (N_μn_s)² N_b^w / P flops |
+| k-convolution | inverse FFT of W (once per node); then, per centroid pair, the typed unfold and spin action U G U† applied on the load of the parent Green, inverse FFT, product in R, forward FFT | O((N_μn_s)² N_k log N_k / P) |
 | projection | ψ† S ψ on parents, band-block reshard | O(N_k^par N_μn_s N_σ (N_μn_s + N_σ) / P) |
 | fold | the scalar above times S into each of the window's frequencies | O(N_ω^w N_k^par N_σ² / P) |
 
@@ -84,9 +84,11 @@ Only the fold sees the output frequencies. The sweep costs
 (Σ_w N_τ^w) × (one GEMM + one k-convolution + one projection), so the
 **(window, τ) pair count is the currency**: a plan is judged by its pairs
 first and its planning time second. Planning is host scalar work on boxes and
-never touches a spatial array. The live set per node is one full-k G tile and
-one W tile, N_k(N_μn_s)² and N_k N_μ² complex numbers over P; W never carries
-a pole axis.
+never touches a spatial array. The live set per node is the parent Green (and
+its partner on an antiunitary plan), one full-k convolution output of
+N_k(N_μn_s)² and one W tile of N_k N_μ² complex numbers, over P; the unfolded
+full-k Green is never written ([k-convolution router](../architecture/ffi_layout.md#k-convolution-router-and-the-mathdx-family),
+mode 7). W never carries a pole axis.
 
 On the resident-pole route (GN/HL one-pole store, elementwise MPA) poles are
 read in batches of `mpa_pole_batch_size` (1–8, default 4), and a window runs
