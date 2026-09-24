@@ -273,7 +273,8 @@ def _sigma_spin_pair_stream(*, mesh_xy, kgrid, layout, face_shape,
     irr = np.asarray(k_unfold_plan.irr_idx, dtype=np.int32)
     parent_blocks = (k_unfold_plan.n_parent < n_full and not spin_pairs_needed(
         n_full=n_full, n_rmu=mu, ns=ns, mesh=mesh_xy,
-        live_green_tiles=2.0 * k_unfold_plan.n_parent / n_full + 6.0 / ns ** 2))
+        live_green_tiles=2.0 * k_unfold_plan.n_parent / n_full + 6.0 / ns ** 2,
+        resident=True))
     tables = spin_block_sources(k_unfold_plan) if parent_blocks else None
 
     def stream(psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
