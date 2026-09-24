@@ -1,118 +1,77 @@
 # Collective transports
 
-*The three ways LORRAX moves collective data, with the measured verdicts
-that chose between them. Deep mechanism (the jaxlib thread guard, the
-MPIwrapper patch, the falsified alternatives):
-`docs/dev/mpi_collectives.md` — that page is the authority on the wrapper;
-this one is the map.*
+How LORRAX moves collective data on each platform, and why. The wrapper
+mechanism (the jaxlib thread guard, the MPIwrapper patch) is owned by
+[`docs/dev/mpi_collectives.md`](../dev/mpi_collectives.md).
 
 ## The map
 
 ```
 CPU collectives (JAX_CPU_COLLECTIVES_IMPLEMENTATION)
-├── gloo   (jaxlib default)  — TCP only in this jaxlib; RETIRED for
-│                              multi-process production (silent corruption)
-└── mpi    (LORRAX production) — via MPItrampoline → MPIwrapper ABI adapter
-                                 ├── Frontera: patched adapter → Intel MPI
-                                 │             → mlx (default) or tcp escape
-                                 └── Perlmutter: unmodified adapter → Cray MPICH
-                                                 → Slingshot
-GPU collectives — NCCL (XLA:GPU), plus Cray-MPICH GTL for the FFI
-                  libraries' own MPI on Perlmutter
+└── mpi   via MPItrampoline → MPIwrapper ABI adapter
+          ├── Frontera:   patched adapter → Intel MPI → libfabric mlx
+          └── Perlmutter: unmodified adapter → Cray MPICH → Slingshot
+GPU collectives — NCCL through XLA; cuSOLVERMp and cuBLASMp also use NCCL
+Native MPI (phdf5, SLATE, ScaLAPACK) — the site MPI, linked directly
 ```
 
-## 1. gloo vs `impl=mpi` — the measured verdict
+| run | collectives |
+|---|---|
+| single process | none |
+| multi-process CPU | `impl=mpi`; startup refuses gloo and an unset or missing `MPITRAMPOLINE_LIB` |
+| GPU | NCCL via XLA ([Perlmutter transport](machines/perlmutter.md#network-transport-at-startup)) |
 
-LORRAX ran on gloo through 2026-07-27. Three results moved it off, all
-recorded with their controls in `docs/dev/mpi_collectives.md`:
+## 1. Why `impl=mpi`
 
-1. **gloo's `reduce-scatter` silently corrupts.** Under gloo,
-   `jax.lax.psum_scatter` over a 2-D mesh intermittently returns wrong data
-   with no error and rc=0 — ~5 % of executions, ~80 % of process lifetimes,
-   always output segment 0, at a magnitude of order the correct answer.
-   Reproduces with no LORRAX imports. `impl=mpi` on the identical program:
-   clean in **504/504** executions, with a gloo positive control corrupting
-   4 of 4 process lifetimes in the same allocations.
-2. **The performance case evaporated.** `impl=mpi` is 1.18× end-to-end at
-   P=16 against gloo on its ib0 pin; collective-bound stages 1.4–8.2×. On
-   identical payloads (1.12 GB all-reduce / 2.24 GB all-gather / 1.12 GB
-   reduce-scatter): mpi 0.83 / 1.05 / 0.63 s, gloo 14.99 / 31.11 / 11.98 s.
-3. **gloo in jaxlib 0.9.1 has no non-TCP transport.** `GLOO_SOCKET_IFNAME`
-   is inert — the string appears in no shipped `.so` (scorecard AF.5).
-
-When each is used today:
-
-* **Single-process runs** — no collectives; the implementation is
-  irrelevant.
-* **Multi-process CPU** — `impl=mpi`, always. `runtime` warns at startup
-  when a multi-process CPU run is using gloo
-  (`announce_cpu_collectives`).
-* **GPU** — NCCL via XLA; none of this page's CPU machinery is involved
-  (see `runtime.nccl_warmup`).
+- **gloo's reduce-scatter corrupts silently.** `jax.lax.psum_scatter` over a
+  2-D CPU mesh intermittently returns wrong data with rc=0: about 5 % of
+  executions and 80 % of process lifetimes, always output segment 0, with an
+  error of order the answer, reproducible with no LORRAX imports. The
+  identical program under `impl=mpi` was clean in 504/504 executions while a
+  gloo control in the same allocations corrupted 4/4 lifetimes.
+- **gloo is also slower.** On 1.12 GB all-reduce / 2.24 GB all-gather /
+  1.12 GB reduce-scatter payloads: mpi 0.83 / 1.05 / 0.63 s, gloo 14.99 /
+  31.11 / 11.98 s; end to end, 1.18× at P=16.
+- **gloo in jaxlib 0.9.1 is TCP-only;** `GLOO_SOCKET_IFNAME` is inert.
 
 ## 2. What `impl=mpi` requires
 
-Three requirements are common to both CPU machines:
-
-| requirement | omit it and |
+| requirement | missing it |
 |---|---|
-| `JAX_CPU_COLLECTIVES_IMPLEMENTATION=mpi` | you are on gloo, i.e. on the corrupting reduce-scatter |
-| `MPITRAMPOLINE_LIB` → a wrapper built for the site MPI | MPItrampoline refuses loudly at startup; pointing it directly at vendor `libmpi.so` is invalid because MPItrampoline expects MPIwrapper ABI symbols |
-| a `warm_mesh_cliques()` call on every mesh (a **code call site**, owned by `collectives.prepare_mesh()` and the mesh factories) | any clique first created inside a real jit dies on every rank with jaxlib's communicator refusal — 32 refusals at P=16 killed the BSE TDA Lanczos (job 7879458 / gate 7881216) |
-| `runtime.run_main_and_finalize()` at every core-driver boundary | ordinary interpreter teardown can make an MPI call after XLA has finalized and turn a successful run into rc=1 |
+| `JAX_CPU_COLLECTIVES_IMPLEMENTATION=mpi` | gloo, refused at startup |
+| `MPITRAMPOLINE_LIB` = an MPIwrapper built for the site MPI | refused at startup; MPItrampoline cannot load a vendor `libmpi.so` directly (it expects MPIwrapper ABI symbols) |
+| `common.collectives.warm_mesh_cliques()` on every mesh (called by `collectives.prepare_mesh()` and the mesh factories) | a clique first created inside a jit dies on every rank with jaxlib's communicator refusal |
+| `runtime.run_main_and_finalize()` at every driver boundary | interpreter teardown can call MPI after XLA finalized, turning a successful run into rc=1 |
+| a live `MPI_THREAD_MULTIPLE` grant | startup refuses before XLA builds its cliques; the native FFI aborts the MPI world before its first collective |
 
-`MPITRAMPOLINE_LIB` is deliberately **not** auto-defaulted from `src/`:
-it names a build artifact outside the repo, and the hazardous-vs-good
-choice must stay visible in the harness.
-
-How `MPI_THREAD_MULTIPLE` is obtained is machine-specific.  Frontera's Intel
-MPI route still uses the always-on upgrade in its patched wrapper.  Perlmutter
-uses an unmodified upstream wrapper plus `MPICH_ASYNC_PROGRESS=1`, which
-Cray MPICH measured to promote XLA's explicit FUNNELED request to MULTIPLE.
-Perlmutter additionally requires the verified Cray
-`LD_PRELOAD=/opt/cray/pe/lib64/libpmi.so.0` before Python so
-Cray PMI is initialized before JAX coordination threads exist; `libpmi2.so.0`
-does not fix that crash.  Both exports are owned by
-`config/perlmutter/cpu_mpi_env.sh`.
-
-The `MPI_Is_thread_main` override (`LORRAX_MPI_FORCE_THREAD_MAIN`) is
-**superseded** everywhere by `common.collectives.warm_mesh_cliques()` — leave
-it unset; setting it only masks a missing warm-up call site. Mechanism,
-evidence and the machine-specific recipes: `docs/dev/mpi_collectives.md`.
+The thread grant is machine-specific: Frontera's patched MPIwrapper upgrades
+the request; Perlmutter's `config/perlmutter/cpu_mpi_env.sh` sets
+`MPICH_ASYNC_PROGRESS=1` (which promotes XLA's FUNNELED request) and preloads
+`/opt/cray/pe/lib64/libpmi.so.0` so Cray PMI initializes before JAX's
+coordination threads exist. `MPITRAMPOLINE_LIB` has no default in `src/`: it
+names a site build artifact.
 
 ## 3. The Intel MPI provider layer (Frontera)
 
-Under `impl=mpi` (and for phdf5 MPI-IO and mpi4py) the transport is Intel
-MPI's libfabric provider. The measured provider policy, recorded in
-`config/frontera/README.md`:
+`config/frontera/mpi_transport_env.sh` owns the PMI2 glue, fabrics and
+provider selection; source it, never copy its exports.
 
-* **Leave `FI_PROVIDER` unset** (`LORRAX_MPI_PROVIDER=auto`, the
-  `mpi_transport_env.sh` default). Intel MPI then auto-selects the native
-  **mlx** (UCX/RDMA) provider — measured 1.07 µs / 11.4 GB/s.
-* The old `FI_PROVIDER=tcp` seed measured 10.9 µs / 2.15 GB/s and was the
-  root cause of the 30-minute pzheevd era (n=2448 P=144: ~12 s/q under tcp
-  vs 0.5–0.9 s/q under mlx; scorecard AP, seed deleted by AU).
-* `LORRAX_MPI_PROVIDER=tcp` remains **only** as the rtx/mlx4 (ConnectX-3)
-  escape hatch.
-* Trust the `I_MPI_DEBUG≥4` `libfabric provider:` banner, never `fi_info`
-  (it false-negatives on mlx).
+| `LORRAX_MPI_PROVIDER` | provider | latency / bandwidth |
+|---|---|---|
+| `auto` (default; `FI_PROVIDER` unset) | Intel MPI selects mlx (UCX/RDMA) | 1.07 µs / 11.4 GB/s |
+| `tcp` | IPoIB via `ib0`; for ConnectX-3 nodes only | 10.9 µs / 2.15 GB/s |
 
-All PMI2 glue, fabrics, the provider case-block and the UCX setdefaults
-live in `config/frontera/mpi_transport_env.sh` — source it, never
-hand-copy exports.
+The provider decides distributed linear-algebra cost directly: `pzheevd` at
+n=2448, P=144 takes 0.5–0.9 s per q on mlx and about 12 s on tcp. Read the
+`I_MPI_DEBUG>=4` `libfabric provider:` banner; `fi_info` reports mlx as absent
+when it works.
 
-## 4. Coexistence with the FFI libraries' own MPI
+## 4. The FFI libraries' own MPI
 
-The native FFI libraries link the site MPI directly and do not route through
-MPItrampoline — they see no MPIwrapper override.
+The native libraries link the site MPI directly, not through MPItrampoline.
 `ffi/cpp/phdf5/context.cc` and `ffi/cpp/slate/context.cc` call
-`MPI_Init_thread(MULTIPLE)` only when nothing initialized MPI first, so
-they coexist with XLA's init by construction. They **abort the MPI world
-before their first family collective when the live grant is below MULTIPLE**.
-Multi-process CPU/MPI startup now queries the same live grant before XLA
-communicator-clique construction, so a bad grant normally refuses earlier.
-
-On Perlmutter GPU runs, GPU-aware Cray MPICH
-(`MPICH_GPU_SUPPORT_ENABLED=1` + `libmpi_gtl_cuda.so.0` preload) serves the
-FFI libraries' collectives. CPU runs use `MPICH_GPU_SUPPORT_ENABLED=0` and
-must not acquire the CUDA GTL ([Perlmutter](machines/perlmutter.md)).
+`MPI_Init_thread(MULTIPLE)` only when nothing initialized MPI first, so they
+coexist with XLA's initialization. On Perlmutter Cray MPICH GPU support is
+off (`MPICH_GPU_SUPPORT_ENABLED=0`, its GTL is built for CUDA 12): phdf5
+moves host buffers, and the GPU distributed libraries communicate through
+NCCL.
