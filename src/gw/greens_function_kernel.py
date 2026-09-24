@@ -9,7 +9,7 @@ import jax.numpy as jnp
 from common.contract_bands import merge_spin_centroid
 
 
-def _face_band_gather_product(A, B, mesh, phases, band_range):
+def _face_band_gather_product(A, B, mesh, phases, band_range, n_full=None):
     """``A·diag(w)·B`` on band-distributed faces by gathered band panels.
 
     ``A`` ``(nq, M, N_b)`` and ``B`` ``(nq, N_b, N)`` are both
@@ -17,8 +17,10 @@ def _face_band_gather_product(A, B, mesh, phases, band_range):
     ``band_range``.  ``distrib_la.panel_matmul`` all-gathers the band panels
     (A over y, B over x) and multiplies them locally into the rank's own
     output tile, so no reduction follows.  The gathered panels are bounded
-    by the output tile they build: ``16·nq·(M/p_x)·(N/p_y)`` bytes, one full
-    band gather whenever that holds the whole band extent, streamed chunks
+    by one full-k Green tile, ``16·N_k·(M/p_x)·(N/p_y)`` bytes (``N_k =
+    n_full``, the parents' full zone; ``nq`` when the faces are already at
+    full k), the unit the GW feasibility floor is counted in: one full band
+    gather whenever that holds the whole band extent, streamed chunks
     otherwise.
     """
     from distrib_la import panel_matmul
@@ -35,12 +37,12 @@ def _face_band_gather_product(A, B, mesh, phases, band_range):
     if weight is not None:
         A = A * weight[:, None, :]
     px, py = int(mesh.shape['x']), int(mesh.shape['y'])
-    out_bytes = A.dtype.itemsize * nq * (m // px) * (n // py)
-    return panel_matmul(A, B, mesh=mesh, panel_bytes=out_bytes)
+    tile_bytes = A.dtype.itemsize * int(n_full or nq) * (m // px) * (n // py)
+    return panel_matmul(A, B, mesh=mesh, panel_bytes=tile_bytes)
 
 
 def _build_G_face(psi_mun, psi_nmu, *, gemm, Gij=None, phases=None, mesh=None,
-                  band_range=None, prepared_active_gemm=None):
+                  band_range=None, prepared_active_gemm=None, n_full=None):
     """Contract band-replicated faces locally or band-distributed faces with their GEMM plan.
 
     Returns the Green ``(nk, mu_X, s, nu_Y, s')``: centroid-major, the
@@ -79,7 +81,8 @@ def _build_G_face(psi_mun, psi_nmu, *, gemm, Gij=None, phases=None, mesh=None,
     elif getattr(gemm, "backend", "local") != "local":
         # A already carries the phases when there is no band range (above).
         G_flat = _face_band_gather_product(
-            A, B, gemm.mesh, None if band_range is None else phases, band_range)
+            A, B, gemm.mesh, None if band_range is None else phases, band_range,
+            n_full=n_full)
     else:
         G_flat = (gemm(A, B) if band_range is None
                   else gemm.active_range(A, B, *band_range, weights=phases))
@@ -115,7 +118,8 @@ def build_G_parents(psi_xn, psi_yr, *, Gij=None, phases=None, layout='face', gem
     G = _build_G_face(psi_xn, psi_yr, gemm=gemm, Gij=Gij, phases=phases,
                       mesh=k_unfold_plan.mesh_xy,
                       band_range=band_range,
-                      prepared_active_gemm=prepared_active_gemm)
+                      prepared_active_gemm=prepared_active_gemm,
+                      n_full=k_unfold_plan.n_full)
     transposed = None
     if np.any(np.asarray(k_unfold_plan.sym_idx) >= k_unfold_plan.n_sym_spatial):
         if (real_weights is True or phases is None
@@ -128,7 +132,8 @@ def build_G_parents(psi_xn, psi_yr, *, Gij=None, phases=None, layout='face', gem
                 lambda _: _build_G_face(jnp.conj(psi_xn), jnp.conj(psi_yr),
                                         gemm=gemm, Gij=Gij, phases=phases, mesh=k_unfold_plan.mesh_xy,
                                         band_range=band_range,
-                                        prepared_active_gemm=prepared_active_gemm),
+                                        prepared_active_gemm=prepared_active_gemm,
+                                        n_full=k_unfold_plan.n_full),
                 lambda _: jnp.conj(G), operand=None)
     return ParentGreen(G, transposed)
 
