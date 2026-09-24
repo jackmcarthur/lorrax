@@ -1,30 +1,12 @@
-"""ONE replicated-eigh capacity gate, both ζ-fit channels.
+"""The replicated-eigh capacity gate of the charge ζ factor.
 
-Register row: "transverse resolver lacks the charge branch's capacity
-gate; OOMs late above mu_T~16k".  ``charge_zeta_solve='rank_truncate'``
-and ``transverse_zeta_solve='rank_truncate'`` allocate the SAME object —
-one replicated ``(q_batch, n_mu, n_mu)`` complex128 eigh operand — but
-only the charge resolver ever tested whether it fits.  A transverse fit
-above ``n_mu_T ~ 16k`` therefore resolved cleanly and died on the
-allocation hours later, after the charge fit had already been paid for.
+``charge_zeta_solve='rank_truncate'`` allocates one replicated
+``(q_batch, n_mu, n_mu)`` complex128 eigh operand.  The resolver refuses
+when one q-batch of it exceeds the per-batch cap, naming the ceiling
+``n_mu <= sqrt(cap/16)``.
 
-What is pinned here:
-
-1. **The predicate is shared, not copied.**  ``_replicate_rank_truncate_ok``
-   returns the same verdict for the same ``(nq, n_mu)`` regardless of
-   which channel asks — it is one function and this is the A/B that says
-   so.
-2. **The transverse resolver refuses where the charge resolver refuses**,
-   with the same arithmetic and the same ``n_mu <= ...`` ceiling.
-3. **The pre-flight escape survives.**  ``nq=None`` (the ``gw_init``
-   pre-flight, which has only the centroid file) keeps the route
-   reachable; the ζ-fit call site re-resolves with ``nq`` and refuses
-   there.
-
-Pure host: builds a 1x1 CPU mesh, no GPU, no FFI.  SCOPE: this is a
-RESOLVER contract test.  It does not run a ζ fit and says nothing about
-whether the eigh that is now admitted actually completes -- the refusal
-text says so too ("raising the cap makes this RESOLVE, not finish").
+Pure host: builds a 1x1 CPU mesh, no GPU, no FFI.  SCOPE: a RESOLVER
+contract test.  It does not run a ζ fit.
 """
 import math
 
@@ -38,7 +20,6 @@ import isdf.core as core
 from isdf.core import (
     _rank_truncate_capacity_error,
     _replicate_rank_truncate_ok,
-    _resolve_solver_kind_transverse,
     _resolve_solver_kind_charge,
 )
 
@@ -55,16 +36,14 @@ def _mu_ceiling() -> int:
     return int(math.isqrt(cap // 16))
 
 
-# A μ comfortably past the ceiling (16,384 at the shipped 4 GiB caps) and
-# one comfortably under it.  Derived from the caps, not hard-coded, so a
-# cap change moves the test instead of silently exempting it.
+# A μ comfortably past the ceiling and one comfortably under it, derived
+# from the caps so a cap change moves the test instead of exempting it.
 _MU_TOO_BIG = _mu_ceiling() * 2
 _MU_FINE = 512
 _NQ = 8
 
 
-def test_the_predicate_is_one_function_for_both_channels():
-    """A/B: same (nq, n_mu) -> same verdict.  There is no second criterion."""
+def test_the_predicate_decides_fit_or_refuse():
     assert _replicate_rank_truncate_ok(_NQ, _MU_FINE) is True
     assert _replicate_rank_truncate_ok(_NQ, _MU_TOO_BIG) is False
     # Unknown inputs are not "fits"; they are "do not decide here".
@@ -72,57 +51,21 @@ def test_the_predicate_is_one_function_for_both_channels():
     assert _replicate_rank_truncate_ok(_NQ, None) is False
 
 
-def test_transverse_rank_truncate_refuses_where_charge_refuses(mesh11,
-                                                               monkeypatch):
-    """The gate that was missing.  Same size, same verdict, both channels."""
+def test_the_charge_resolver_refuses_one_oversized_q_batch(mesh11,
+                                                          monkeypatch):
     monkeypatch.setattr(core, "_resolve_linalg_backend", lambda *a, **k: None)
-    with pytest.raises(ValueError) as ti:
-        _resolve_solver_kind_transverse(
-            mesh11, "auto", n_rmu_logical=_MU_TOO_BIG,
-            transverse_zeta_solve="rank_truncate", nq=_NQ)
     with pytest.raises(ValueError) as ch:
         _resolve_solver_kind_charge(
             mesh11, "auto", n_rmu=_MU_TOO_BIG, nq=_NQ,
             charge_zeta_solve="rank_truncate")
-    t_msg, c_msg = str(ti.value), str(ch.value)
-    # The message names the channel's OWN deck key and μ symbol...
-    assert "transverse_zeta_solve='rank_truncate'" in t_msg
-    assert "charge_zeta_solve='rank_truncate'" in c_msg
-    assert f"n_mu_T={_MU_TOO_BIG}" in t_msg
-    assert f"n_mu={_MU_TOO_BIG}" in c_msg
-    # ...and both carry the SAME per-batch arithmetic and the SAME ceiling,
-    # because it is the same buffer.
-    ceiling = _mu_ceiling()
-    assert f"n_mu_T <= {ceiling}" in t_msg
-    assert f"n_mu <= {ceiling}" in c_msg
-    assert "ONE q-batch, not the stack" in t_msg
-
-
-def test_transverse_rank_truncate_is_admitted_at_a_size_that_fits(mesh11,
-                                                                  monkeypatch):
-    """The gate is not a blanket refusal: a fit-size transverse solve runs."""
-    monkeypatch.setattr(core, "_resolve_linalg_backend", lambda *a, **k: None)
-    kind = _resolve_solver_kind_transverse(
-        mesh11, "auto", n_rmu_logical=_MU_FINE,
-        transverse_zeta_solve="rank_truncate", nq=_NQ)
-    assert kind == "transverse_rank_truncate"
-
-
-def test_unknown_nq_keeps_the_legacy_policy(mesh11, monkeypatch):
-    """gw_init's pre-flight has no nq; it must not refuse on a guess.
-
-    The ζ-fit call site re-resolves WITH nq and refuses there, so nothing
-    is lost -- but a pre-flight that refused every large-μ bispinor run
-    from a missing argument would be worse than the OOM it replaced.
-    """
-    monkeypatch.setattr(core, "_resolve_linalg_backend", lambda *a, **k: None)
-    kind = _resolve_solver_kind_transverse(
-        mesh11, "auto", n_rmu_logical=_MU_TOO_BIG,
-        transverse_zeta_solve="rank_truncate")
-    assert kind == "transverse_rank_truncate"
+    msg = str(ch.value)
+    assert "charge_zeta_solve='rank_truncate'" in msg
+    assert f"n_mu={_MU_TOO_BIG}" in msg
+    assert f"n_mu <= {_mu_ceiling()}" in msg
+    assert "ONE q-batch, not the stack" in msg
 
 
 def test_the_shared_error_refuses_an_unknown_channel():
-    """A new channel must add its own escape advice, not inherit charge's."""
+    """A new channel must add its own advice, not inherit charge's."""
     with pytest.raises(AssertionError):
         _rank_truncate_capacity_error(_NQ, _MU_TOO_BIG, channel="spin")

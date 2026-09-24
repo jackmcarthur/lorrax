@@ -264,8 +264,6 @@ def _prov(nspinor_wfnfile, monkeypatch):
              backend=NS(zeta_ridge=0.0, zeta_rcond=1e-8,
                         charge_zeta_solve="cholesky",
                         distributed_zeta_solve="auto",
-                        transverse_zeta_solve="ridge",
-                        transverse_zeta_rcond=1e-10,
                         gamma_contract_mode="auto"))
     wfn = NS(ecutwfc=25.0, ecutrho=100.0)
     meta = NS(n_rmu=16, fft_grid=(8, 8, 8),

@@ -158,7 +158,7 @@ def test_charge_cholesky_local_matches_replicated():
     assert _rel(_vq(loc), _vq(ref)) <= _TOL
 
 
-@pytest.mark.parametrize("kind", ["transverse_rank_truncate", "lu"])
+@pytest.mark.parametrize("kind", ["lu"])
 def test_transverse_local_matches_replicated(kind):
     from isdf import core
 
@@ -166,7 +166,7 @@ def test_transverse_local_matches_replicated(kind):
     C, Z = _operands(3, indefinite=True)
     Cd = jax.device_put(jnp.asarray(C), NamedSharding(mesh, P(None, "x", "y")))
     F, piv = core.factor_c_q(Cd, mesh, vertex_mu_L=1, n_rmu_logical=_NLOG,
-                             solver_kind=kind, transverse_zeta_rcond=1e-10)
+                             solver_kind=kind)
     assert (piv is None) == (kind != "lu")
     ref, loc, loc_face, _, _ = _solve_all(mesh, F, Z, kind=kind, vertex=1,
                                           piv=piv)

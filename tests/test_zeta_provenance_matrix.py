@@ -55,15 +55,12 @@ CENTS = np.arange(12, dtype=np.int32).reshape(4, 3)
 CENTS_T = np.arange(100, 118, dtype=np.int32).reshape(6, 3)
 
 
-def _cfg(bispinor=True, family="ridge", tau=1e-10, tier="auto",
-         distributed_lu="off"):
+def _cfg(bispinor=True, tier="auto", distributed_lu="off"):
     backend = SimpleNamespace(
         zeta_ridge=0.0, zeta_rcond=1e-8,
         charge_zeta_solve="rank_truncate",
         distributed_zeta_solve=tier,
         distributed_lu=distributed_lu,
-        transverse_zeta_solve=family,
-        transverse_zeta_rcond=tau,
         gamma_contract_mode="take",
     )
     return SimpleNamespace(bispinor=bispinor, backend=backend)
@@ -164,17 +161,19 @@ _ALL3 = ("distributed_zeta_solve", "transverse_zeta_solve",
 
 
 def test_legacy_stamp_reused_by_legacy_value_run(stub_reader):
-    new = _prov(_cfg(bispinor=True, family="ridge"))
+    new = _prov(_cfg(bispinor=True))
     path = stub_reader(_strip(new, _ALL3))
     assert gw_init._zeta_reuse_ok(path, new, CENTS, print_fn=lambda *a: None)
 
 
-def test_legacy_stamp_refits_for_rank_truncate_family(stub_reader):
-    new = _prov(_cfg(bispinor=True, family="rank_truncate", tau=1e-10))
-    path = stub_reader(_strip(new, _ALL3))
+def test_a_stamp_from_the_deleted_rank_truncate_family_refits(stub_reader):
+    new = _prov(_cfg(bispinor=True))
+    old = json.loads(new)
+    old["transverse_zeta_solve"] = "rank_truncate"
+    old["transverse_zeta_rcond"] = 1e-10
+    path = stub_reader(json.dumps(old, sort_keys=True))
     msgs = []
-    ok = gw_init._zeta_reuse_ok(path, new, CENTS, print_fn=msgs.append)
-    assert not ok
+    assert not gw_init._zeta_reuse_ok(path, new, CENTS, print_fn=msgs.append)
     assert any("transverse_zeta_solve" in m for m in msgs)
 
 
@@ -192,16 +191,8 @@ def test_8b02c72_tier_exception_regression(stub_reader):
     assert any("distributed_zeta_solve" in m for m in msgs)
 
 
-def test_tau_change_refits_within_family(stub_reader):
-    old = _prov(_cfg(bispinor=True, family="rank_truncate", tau=1e-10))
-    new = _prov(_cfg(bispinor=True, family="rank_truncate", tau=1e-8))
-    path = stub_reader(old)
-    assert not gw_init._zeta_reuse_ok(path, new, CENTS,
-                                      print_fn=lambda *a: None)
-
-
 def test_matching_stamp_reused(stub_reader):
-    new = _prov(_cfg(bispinor=True, family="rank_truncate", tau=1e-10))
+    new = _prov(_cfg(bispinor=True))
     path = stub_reader(new)
     assert gw_init._zeta_reuse_ok(path, new, CENTS, print_fn=lambda *a: None)
 
@@ -285,19 +276,11 @@ def test_refit_consumer_reads_each_schema_at_its_declared_range():
     assert _zeta_fit_window_of(schema1) == (0, 256)
 
 
-def test_provenance_collapse_nonbispinor_and_ridge_tau():
-    # Non-bispinor: transverse keys are inert — provenance identical.
-    a = _prov(_cfg(bispinor=False, family="ridge", tau=1e-10))
-    b = _prov(_cfg(bispinor=False, family="rank_truncate", tau=1e-6))
-    assert a == b
-    # Bispinor + ridge: tau collapses to None (not read by ridge).
-    c = json.loads(_prov(_cfg(bispinor=True, family="ridge", tau=1e-6)))
-    assert c["transverse_zeta_solve"] == "ridge"
-    assert c["transverse_zeta_rcond"] is None
-    # Bispinor + rank_truncate records the tau.
-    d = json.loads(_prov(_cfg(bispinor=True, family="rank_truncate",
-                              tau=1e-6)))
-    assert d["transverse_zeta_rcond"] == 1e-6
+def test_the_transverse_family_stamp_is_the_ridge_constant():
+    for bispinor in (False, True):
+        c = json.loads(_prov(_cfg(bispinor=bispinor)))
+        assert c["transverse_zeta_solve"] == "ridge"
+        assert c["transverse_zeta_rcond"] is None
 
 
 def test_pauli_charge_reuses_off_charge_stamp_but_raw4_tt_stays_pinned():
