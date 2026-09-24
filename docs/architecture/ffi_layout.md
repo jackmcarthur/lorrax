@@ -485,10 +485,10 @@ specialised per grid when NVRTC compiles the kernel.
 
 | Layer | What |
 |---|---|
-| 1 consumer | ζ fit: `isdf.core.c_q_downfold` (pair); `isdf.core.c_q_from_psi_sm`, `_z_q_face_parent`, `parent_projector_kconv` and `isdf.zeta_mubatch.make_route_g_kernel` (parent). Σ: `gw.ppm_tau_kernel.get_sigma_spatial_kernel`, `gw.cohsex_sigma._make_static_convolution`. BSE: `bse_stack_matvec._conv_decode`, `bse_ring_comm._make_ring_rung`, and the W_R transforms in `bse_densify.make_w_densifier`, `bse_lanczos`, `davidson_absorption`, `absorption_haydock`, `bse_nontda`, `exciton_bands`. Flat-k transform: `common.fft_helpers.make_flat_k_fft` and its `make_flat_k_ifftn` / `make_flat_k_fftn` / `make_local_flat_k_fftn` wrappers (`gw.w_isdf`, `gw.qsgw_head`, `gw.cohsex_sigma`, `gw.wavefunction_bundle`, `bandstructure.htransform`, `bandstructure.orbital`) |
-| 2 router | `ffi/fft.py`: `make_fused_conv_kpair`, `make_fused_conv_kparent`, `make_kconv_klead` (→ `KConvStored(prep, apply)`), `make_kconv_kminor` / `make_local_kconv_kminor`, `make_kfft_klead` / `make_local_kfft_klead`, `make_kfft_kminor` / `make_local_kfft_kminor`. `common.fft_helpers.get_donated_kfft_kminor` is `make_kfft_kminor` jitted with its input donated, memoised per `(mesh, kgrid, spec, kind, norm)`; the caller drops its own reference after the call |
-| 3 gate | `require_kconv`, called by `runtime.initialize_communicator_stack` after the FFT and GEMM gates. CUDA: the wheel's headers and all six `lorrax_mathdx_*` targets. cpu: `lorrax_mklfft_flat_k`. Each factory re-probes its own target; operand shapes and dtypes are checked at trace time |
-| 4 target | CUDA, in `liblorrax_ffi.so`: the six `lorrax_mathdx_*` names. cpu, in `liblorrax_ffi_host.so`: `lorrax_mklfft_flat_k`, `lorrax_mklfft_gw_conv` |
+| 1 consumer | ζ fit: `isdf.core.c_q_downfold` (pair); `isdf.core.c_q_from_psi_sm`, `_z_q_face_parent` and `parent_projector_kconv` (parent); `isdf.zeta_mubatch.make_route_g_kernel` (plane). Σ: `gw.ppm_tau_kernel.get_sigma_spatial_kernel` (τ sweep and static SX/RI: klead `prep` for W, klead unfold for G), `gw.cohsex_sigma._make_static_convolution` (klead). BSE: `bse_stack_matvec._conv_decode`, `bse_ring_comm._make_ring_rung`, and the W_R transforms in `bse_densify.make_w_densifier`, `bse_lanczos`, `davidson_absorption`, `absorption_haydock`, `bse_nontda`, `exciton_bands`. Flat-k transform: `common.fft_helpers.make_flat_k_fft` and its `make_flat_k_ifftn` / `make_flat_k_fftn` / `make_local_flat_k_fftn` wrappers (`gw.w_isdf`, `gw.qsgw_head`, `gw.cohsex_sigma`, `gw.wavefunction_bundle`, `bandstructure.htransform`, `bandstructure.orbital`) |
+| 2 router | `ffi/fft.py`: `make_fused_conv_kpair`, `make_fused_conv_kparent`, `make_fused_conv_kplane`, `make_kconv_klead` (→ `KConvStored(prep, apply)`), `make_kconv_klead_unfold`, `make_kconv_kminor` / `make_local_kconv_kminor`, `make_kfft_klead` / `make_local_kfft_klead`, `make_kfft_kminor` / `make_local_kfft_kminor`. `common.fft_helpers.get_donated_kfft_kminor` is `make_kfft_kminor` jitted with its input donated, memoised per `(mesh, kgrid, spec, kind, norm)`; the caller drops its own reference after the call |
+| 3 gate | `require_kconv`, called by `runtime.initialize_communicator_stack` after the FFT and GEMM gates. CUDA: the wheel's headers and all eight `lorrax_mathdx_*` targets. cpu: `lorrax_mklfft_flat_k`. Each factory re-probes its own target; operand shapes and dtypes are checked at trace time |
+| 4 target | CUDA, in `liblorrax_ffi.so`: the eight `lorrax_mathdx_*` names (`_kconv_pair`, `_kconv_parent`, `_kconv_plane`, `_kconv_klead`, `_kconv_klead_unfold`, `_kfft_klead`, `_kconv_kminor`, `_kfft_kminor`). cpu, in `liblorrax_ffi_host.so`: `lorrax_mklfft_flat_k`, `lorrax_mklfft_gw_conv` |
 | 5 handler | CUDA: `cpp/cufft/kconv_mathdx_cuda_ffi.cc`, one embedded cuFFTDx source compiled per (CUDA context, mode, `nkx`, `nky`, `nkz`, `ns`, precision) into an in-process cache, backed by the disk cubin cache below. cpu: `cpp/mklfft/fft_flat_k_ffi.cc` (`MklFftFlatKHostFfi`, `MklFftGwConvHostFfi`) |
 
 **Doors.** Pick the door whose k position matches the tile you hold. A caller
@@ -498,12 +498,14 @@ never transposes to reach another door.
 |---|---|---|---|
 | `make_fused_conv_kpair` | 3-D leading `(nkx, nky, nkz, …)` | 0 | two host flat-k inverse transforms, the spin contraction in XLA, one host forward transform |
 | `make_fused_conv_kparent` | parent tables | 1 | the typed parent load in XLA, which materialises `(N_k, ns, μ, ν, ns)` per side, then the pair tail |
+| `make_fused_conv_kplane` | route-G plane output `(N_k, g, ns, 2c, ns, p)` | 6 | the Bloch phase, split and transpose in XLA, then the pair tail |
 | `make_kconv_klead` | flat leading `(N_k, …)` | `prep` 3, `apply` 2 | `prep` is the identity; `apply` is `lorrax_mklfft_gw_conv`, which transforms W itself and holds the R-space T tile only in per-thread compact chunks |
+| `make_kconv_klead_unfold` | raw-parent Green `(n_parent, μ, ns, ν, ns)` | 7 (`prep` of `make_kconv_klead`) | `symmetry_maps.apply_unfold_load_tables_local` in XLA (a full-k copy), then the `make_kconv_klead` apply |
 | `make_kfft_klead` | flat leading `(N_k, …)` | 3 | `lorrax_mklfft_flat_k` |
 | `make_kconv_kminor` | flat trailing `(…, N_k)` | 4 | XLA moves k to the front, then host inverse transform, product, host forward transform, and k moves back |
 | `make_kfft_kminor` | 3-D trailing `(…, nkx, nky, nkz)` | 5 | the same transpose around one host transform |
 
-- **Sharding.** The pair, parent and `make_local_*` doors are rank-local
+- **Sharding.** The pair, parent, plane and `make_local_*` doors are rank-local
   callables for use inside the caller's `shard_map`; the others wrap their own
   `shard_map`. The k axes are replicated. Specs of the k-leading doors are
   given in the 3-D form, with the three leading axes `None`. For
@@ -532,9 +534,11 @@ The modes of the one kernel source:
 | 3 klead fft | `Y = s·FFT^±_k X` | `(N_k, rows)` | 1 |
 | 4 kminor conv | `U = s·FFT_k(IFFT_k X · K_R[None, :, :, None, None, :])`, `K_R` already in R space (the caller made it with mode 5) | `X` `(d0, d1, d2, d3, d4, N_k)`, `K_R` `(d1, d2, N_k)` → `U` in X's layout (`out_layout=0`) or `(d0, N_k, d3, d1, d4, d2)` (`out_layout=1`) | 1 |
 | 5 kminor fft | `Y = s·FFT^±_k X` | `(rows, N_k)` | 1 |
+| 6 plane | mode 0 on the identity plan, loaded from the route-G D-plane FFT output: `P^X = conj(F·D^X)` with the Bloch phase `F[k,g,p]`, L = slots `[0, c)` and R = slots `[c, 2c)` of the `2c` axis, split on load | `D` `(N_k, g, ns, 2c, ns, p)`, `F` `(N_k, g, p)` → `U` `(N_k, c, g·p)` | 3 |
+| 7 klead unfold conv | mode 2 read from the raw-parent Green through `symmetry_maps.unfold_load_tables`: per full k the parent row (the transposed partner `Gt` on an antiunitary row), both endpoint gathers and umklapp phases `(mph·G)·nph`, then `U_k G U_k†` in registers; spin-major store | `G`, `Gt` `(n_parent, μ·ns, ν·ns)`, `V_R` `(N_k, μ, ν)` → `U` `(N_k, ns, μ, ns, ν)` | 1 |
 
 - **Flat k** is C order, with `kz` fastest.
-- **Dtype.** Modes 0 and 1 are complex128 only. Modes 2–5 take all-complex128
+- **Dtype.** Modes 0, 1, 6 and 7 are complex128 only. Modes 2–5 take all-complex128
   or all-complex64 operands (the complex64 image serves the fp32-GMRES BSE
   arm) and never cast. The cpu host handlers are complex128 only, so a
   complex64 operand refuses at trace time on a cpu mesh.
@@ -544,11 +548,19 @@ The modes of the one kernel source:
   of them.
 - **Launch geometry.** One 256-thread block per `rb` rows; a row needs
   `banks·16·(N_k|1)` bytes of shared memory (8 per element for complex64).
-  Modes 0 and 1 take `rb ≤ 16` within 100 KiB, modes 2–5 `rb ≤ 64` within
-  48 KiB (three blocks per A100 SM); a row larger than the budget gets what
-  the device's opt-in maximum holds.
+  Modes 0, 1 and 6 take `rb ≤ 16` within 100 KiB, modes 2–5 and 7 `rb ≤ 64`
+  within 48 KiB (three blocks per A100 SM); a row larger than the budget gets
+  what the device's opt-in maximum holds. Mode 7 rounds `rb` down to whole
+  `ns²` spin groups when at least one fits, and then loads each pair's `ns²`
+  sources once for all its spin rows; below one group each bank loads its own
+  row with the same arithmetic.
 - **Cost.** Each transform is `O(rows·N_k log N_k)` flops. HBM traffic is one
-  read of each operand and one write of the result. The CUDA kernels allocate
+  read of each operand and one write of the result. Modes 6 and 7 read the
+  producer's own buffer (the plane FFT output; the parent Green, `n_parent/N_k`
+  of the full-k size), so the phased, split or unfolded copy the modes 1 and 2
+  operands would need is never written. Mode 7's tables (`lsrc`, `rsrc`
+  int32, `mph`, `nph` complex128, each `(N_k, μ·ns)`) are closed-over host
+  constants sliced per rank. The CUDA kernels allocate
   no device workspace beyond dynamic shared memory.
 - **Host workspace (cpu leg).** `gw_conv` stages `V_R = IFFT_k W` once per
   call in a reused host arena of `N_k·m_x·m_y·16` bytes, invisible to XLA.
@@ -561,7 +573,9 @@ The modes of the one kernel source:
 | `GATE mathdx-headers` | startup (`mathdx_root`); kernel build | no importable `nvidia.mathdx` with `include/cufftdx.hpp` | `pip install nvidia-mathdx`; the `cuda12`/`cuda13` extras of `pyproject.toml` pin it (`==25.6.0`) |
 | `GATE kconv-target` | startup, factory | the loaded library lacks the target the router selects | rebuild the library and point `LORRAX_FFI_SO` (CUDA) or `LORRAX_FFI_HOST_SO` (cpu) at it |
 | `GATE mathdx-kconv-axis` | factory; handler | a k-grid axis outside `[1, 40]` (`KCONV_AXIS_MAX`, the fp64 cuFFTDx thread-FFT limit). The klead, kminor and kfft factories check it on cpu meshes too; the pair and parent factories check it on CUDA only | a smaller k-grid |
-| `GATE mathdx-kconv-residency` | first call (kernel build) | one resident row, `banks·16·(N_k|1)` bytes (8 per element for complex64), exceeds the device's opt-in shared memory per block. On an A100 (166 912 B) that is `N_k > 3477` for modes 0/1 and `N_k > 10431` for modes 2–5 in complex128 | a smaller k-grid; the family has no out-of-core arm |
+| `GATE mathdx-kconv-residency` | first call (kernel build) | one resident row, `banks·16·(N_k|1)` bytes (8 per element for complex64), exceeds the device's opt-in shared memory per block. On an A100 (166 912 B) that is `N_k > 3477` for modes 0/1/6 and `N_k > 10431` for modes 2–5 and 7 in complex128 | a smaller k-grid; the family has no out-of-core arm |
+| `k-leading unfold conv: …` | factory; apply | tables cut for another mesh shape; `G` whose parent count or endpoint widths differ from the tables; `Gt=None` on a plan with antiunitary rows | build the tables from the same plan and mesh as `G` (`plan.unfold_load_tables()`); pass `ParentGreen.transpose` |
+| `k-conv plane expects …` | trace | `D` or `F` not complex128 `(N_k, g, ns, 2c, ns, p)` / `(N_k, g, p)` | pass the plane FFT output as laid out |
 | `LORRAX_FFT_FFI=0` | factory | the cpu leg refuses, and `make_flat_k_fft` refuses on both platforms | unset `LORRAX_FFT_FFI` |
 
 A kernel-build failure (NVRTC compile, missing toolkit headers, module load)
@@ -589,16 +603,19 @@ size, because an image depends on the device and the wheel, not on P.
 
 - **Key.** FNV-1a over the embedded source; the NVRTC options that decide the
   image (C++ standard, architecture, mode, grid, `ns`, rows per block,
-  precision, SM); the wheel's `cufftdx_version.hpp` and
-  `commondx_version.hpp`; and the NVRTC version. Include paths are not in the
-  key, so two installs of one wheel version share images. Editing the kernel
-  source invalidates every image.
+  precision, SM); the whole toolchain that can change an image: the
+  cuFFTDx, commonDx, CUTLASS and CCCL version headers, the nvidia-mathdx
+  wheel's dist-info name, and the NVRTC version with the loaded libnvrtc's
+  real path (its patch level). A version header that reads empty disables the
+  disk cache for that build rather than dropping out of the key. Editing the
+  kernel source invalidates every image.
 - **File.** `kconv_m<mode>_<nkx>x<nky>x<nkz>_ns<ns>[_c64]_sm<XY>_<key>.cubin`,
   with a `LRXKCONV1` header that carries the key and a hash of the payload.
 - **Writes and reads.** A write goes to a unique temporary and is `rename`d
   into place, which is atomic on one filesystem, so concurrent ranks each
-  publish a whole file. A read re-hashes the payload; a torn or foreign file
-  is recompiled and replaced.
+  publish a whole file. A read re-hashes the payload and checks for an ELF
+  image; a torn, foreign or non-ELF file, or one the driver refuses to load,
+  is deleted, recompiled once and replaced.
 - **Cost.** A cold NVRTC build takes 5–7 s per image per process; a disk hit
   takes 5–15 ms (sandbox CLAIMS 2673). Without the cache, a CrI3-class
   run pays about 18 s of NVRTC per process.
@@ -618,7 +635,14 @@ is never read on CUDA and is never a production route.
 covers every mode at P4, including an odd grid, 8×8×8 and the complex64
 k-minor image. The tolerance is 1e-13 against the cpu composition and 1e-12
 against dense sums or `np.fft`; every check has a red twin that must miss by
-more than 1e-3.
+more than 1e-3. Modes 6 and 7 must also equal the XLA chains they replace
+within 2 ulp of the largest value (bitwise today, reported): mode 6 forms
+`F·D` as an XLA:GPU complex multiply (no FMA), and mode 7 spells
+`(mph·G)·nph` and `U·G·U†` as the XLA unfold and the spin-rotate kernel
+round them. The mode-7 cases include a C3 plan with a general complex spin
+action and `q = n/3` phases (`ns` 2 and 4) and `N_k = 196` at `ns = 4`, the
+per-bank load. `tests/multi_device/kconv_cubin_cache_check.py` covers the
+disk cache's key and refusal paths.
 
 A new mode is added in four steps:
 
