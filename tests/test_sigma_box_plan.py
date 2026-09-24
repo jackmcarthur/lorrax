@@ -551,7 +551,7 @@ def test_sc_one_shot_maps_then_freeze_on_the_third_call(monkeypatch, tmp_path):
         cache_dir=str(tmp_path / "one_shot"), **quiet)
     session = {}
     receipts = []
-    for energies in ((0.1, 3.0), (0.2, 3.1), (0.2, 3.1), (0.21, 3.11)):
+    for energies in ((0.1, 3.0), (0.12, 3.05), (0.12, 3.05), (0.125, 3.06)):
         calls.clear()
         plan, geometry = plan_sigma_windows(
             _summaries(), [_branch_at(energies)], np.asarray([0.2, 0.5]),
@@ -680,15 +680,15 @@ def test_fixed_sc_refuses_a_rule_above_eps_without_retrying(monkeypatch):
 
 
 def test_sc_pad_keeps_a_sign_definite_support_sign_definite():
-    from gw.sigma_box_plan import _sc_padded_box_spec
-    spec = {"kind": "sign_definite_negative", "box": (-2.0, -0.3, 0.05, 0.4),
+    from gw.sigma_box_plan import _SC_ZERO_SIDE_CAP, _sc_padded_box_spec
+    spec = {"name": "tail", "kind": "sign_definite_negative",
+            "box": (-2.0, -0.3, 0.05, 0.4),
             "pole_extent": (-3.0, -0.05, 0.05, 0.4), "frequencies": np.asarray([0.0]),
             "states": np.asarray([0.0]), "pole_sign": 1}
-    try:
-        padded = _sc_padded_box_spec(spec, 0.02)
-    except Exception as exc:  # the pole-box helper needs richer specs
-        pytest.skip(f"pad helper needs the full spec: {exc}")
-    assert padded["box"][1] < 0.0 and padded["box"][1] <= 0.5 * spec["box"][1]
+    padded = _sc_padded_box_spec(spec, 0.02)
+    # The pads alone would cross zero here; the zero side stops at the cap.
+    assert padded["kind"] == "sign_definite_negative"
+    assert padded["box"][1] == _SC_ZERO_SIDE_CAP * spec["box"][1]
 
 
 def test_one_shot_preserves_the_historical_sup_error_refusal(monkeypatch):
