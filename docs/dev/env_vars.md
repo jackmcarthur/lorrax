@@ -39,7 +39,7 @@ Network startup machine facts and overrides (behavior is owned by
 | `NERSC_HOST` | unset | machine identity | Exact `perlmutter` selects the supported site profile when multi-node CUDA placement is established. |
 | `NCCL_NET`, `NCCL_NET_PLUGIN` | site defaults only for multi-node Perlmutter CUDA launched with `SLURM_NETWORK=no_vni` | transport override | Presence preserves the caller's configuration and bypasses automatic site selection, including empty values. Plugin may be an absolute library filename. |
 | `SLURM_NETWORK` | unchanged | launcher network allocation | Set `no_vni` before `lx run`/`srun` for automatic Perlmutter OFI. Without it runtime preserves existing transport. See the Perlmutter machine page; setting it inside Python is too late. |
-| `NCCL_NET_GDR_LEVEL`, `FI_CXI_DISABLE_HOST_REGISTER`, `NCCL_CROSS_NIC`, `NCCL_SOCKET_IFNAME` | site profile when selected | machine transport settings | Existing values are preserved verbatim; otherwise the supported site profile supplies defaults. |
+| `NCCL_NET_GDR_LEVEL`, `FI_CXI_DISABLE_HOST_REGISTER`, `FI_CXI_RDZV_THRESHOLD`, `NCCL_CROSS_NIC`, `NCCL_SOCKET_IFNAME` | site profile when selected | machine transport settings | Existing values are preserved verbatim; otherwise the supported site profile supplies defaults. |
 
 **This page owns four columns and nothing else: the SPELLING, the DEFAULT,
 the CLASS, and the PARSE GRAMMAR of every variable LORRAX reads.** Those four
