@@ -139,9 +139,12 @@ _ENCODE_TO_ROUTES = {
     "bse/bse_ring_comm.py::_ring_sum_B_encode": ("ring",),
     "bse/bse_ring_comm.py::build_bse_ring_matvec_full._encode_T_B_gather": (
         "gather",),
-    "bse/bse_stack_matvec.py::_encode_T_B": ("stack_fused", "stack_unfused"),
-    "bse/bse_stack_matvec.py::build_bse_stack_pair_matvec._w_pair": (
-        "stack_fused", "stack_unfused"),
+    # The stack pair applier's coupling encode left this map on 2026-09-24
+    # (survey_C §C1): it now runs NO collective -- the only transport in
+    # bse_stack_matvec is the trial block's all-gather and the decode
+    # partial's reduce-scatter, two helpers that take no psi, so no
+    # zeta-carrying partial can travel.  Its routes stay behaviourally gated
+    # below (COUPLING_ROUTES), which is what caught instance 2.
 }
 
 #: Encodes deliberately NOT behaviourally gated, each with the reason it cannot
@@ -255,11 +258,18 @@ def _pre_fix_stack_encode(Xb_b, psi_c_Y, psi_v_X):
     """RED TWIN for instance 2 -- the PRE-PORT bse_stack_matvec._encode_T_B.
 
     Gathers the partially contracted ``R`` along ``'y'``, the very axis ``R``'s
-    own ``nu`` shard lives on.
+    own ``nu`` shard lives on.  Since survey_C §C1 (2026-09-24) the shipped
+    encode receives the WHOLE trial block and runs no collective; the twin
+    re-creates the pre-port defect in that interface: contract only this
+    rank's v tile, then gather the nu-carrying partial over 'y'.
     """
     import jax.numpy as jnp
     from jax import lax
-    R = jnp.einsum("kcsN,cvk->vksN", jnp.conj(psi_c_Y), Xb_b)
+    py = lax.psum(1, "y")
+    v_loc = Xb_b.shape[1] // py
+    mine = lax.dynamic_slice_in_dim(Xb_b, lax.axis_index("y") * v_loc,
+                                    v_loc, axis=1)
+    R = jnp.einsum("kcsN,cvk->vksN", jnp.conj(psi_c_Y), mine)
     Rv = lax.all_gather(R, "y", axis=0, tiled=True)      # <- moves nu too
     return jnp.einsum("kvtM,vksN->MNtsk", psi_v_X, Rv)
 

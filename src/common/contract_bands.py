@@ -184,7 +184,76 @@ __all__ = [
     "bands_gemm_ffi_mode",
     "merge_spin_centroid",
     "split_spin_centroid",
+    "bands_to_contraction_slabs",
+    "reduce_scatter_to_band_block",
 ]
+
+
+# ---------------------------------------------------------------------------
+# THE SLAB-CONTRACTION PRIMITIVE (rules R1/R3,
+# reports/gwjax_scaling_levers_2026-09-23): when a band-pair output is small
+# against the axis it contracts (⟨m|O|n⟩ over G, Σ_mn over μν), split the
+# CONTRACTION axis over the whole mesh, contract each rank's slab locally,
+# and reduce the small (…, m, n) partial ONCE into the (m_x, n_y) block.
+# Both helpers run INSIDE a ``shard_map`` over ``axes``; the linear rank is
+# ``x·p_y + y`` (the ``band_sphere_spec`` block order), and every
+# collective here is one call per invocation however large the stack.
+# First consumer: ``common.mtxel_sweep.sweep_matrix_elements``.
+# ---------------------------------------------------------------------------
+
+def bands_to_contraction_slabs(a, *, band_axis: int, slab_axis: int,
+                               carrier: int, axes=("x", "y")):
+    """Band-split → contraction-split, one all-to-all over ``axes``.
+
+    ``a`` holds this rank's ``nb/P`` bands (block ``x·p_y + y``) with the
+    WHOLE contraction axis at ``slab_axis``; the result holds EVERY band in
+    global order with this rank's ``carrier/P`` slab of that axis.  The
+    contraction axis is zero-padded to ``carrier`` (a multiple of P, from
+    ``runtime.padding.padded_axis``) first, so pad columns are exact zeros.
+
+    The operand is pinned row-major: an all-to-all wants its split axis
+    major, and left free, layout assignment can satisfy that on a scan's
+    LOOP OPERAND and hoist a transposed copy of the whole resident array
+    out of the loop (+ψ/P per rank, ``runs/runtime/density_scan_20260923``
+    legs b02/b05).  Pinned, the transpose is one operand wide.
+    """
+    from jax.experimental.layout import Layout, with_layout_constraint
+
+    a = with_layout_constraint(a, Layout(major_to_minor=tuple(range(a.ndim))))
+    pad = [(0, 0)] * a.ndim
+    pad[slab_axis] = (0, int(carrier) - int(a.shape[slab_axis]))
+    return jax.lax.all_to_all(jnp.pad(a, pad), axes, split_axis=slab_axis,
+                              concat_axis=band_axis, tiled=True)
+
+
+def reduce_scatter_to_band_block(part, *, px: int, py: int,
+                                 axes=("x", "y"), row_axis: int = -2,
+                                 col_axis: int = -1):
+    """Σ over the mesh of a ``(…, m, …, n, …)`` partial → this rank's block.
+
+    Every rank holds a partial of the WHOLE ``(m, n)`` matrix (its slab's
+    share of the contraction); one reduce-scatter over ``axes`` sums them
+    and delivers rows ``x·m/p_x + [0, m/p_x)`` and columns
+    ``y·n/p_y + [0, n/p_y)`` — the block whose spec carries 'x' at
+    ``row_axis`` and 'y' at ``col_axis`` (default the trailing pair).  ``m``
+    and ``n`` must divide ``p_x`` and ``p_y``.
+
+    THE ONE REPLICATED OBJECT, priced: the partial is ``prod(lead)·m·n``
+    elements per rank.  Against a 2-D band split that gathers operand
+    panels of ``(1 + c)·N/√P`` per rank, it wins while ``nb·√P < N``, N the
+    contracted extent per band (``ns·N_G`` for a matrix element).
+    """
+    ra, ca = row_axis % part.ndim, col_axis % part.ndim
+    if not ra < ca:
+        raise ValueError("reduce_scatter_to_band_block: row_axis must "
+                         "precede col_axis")
+    m, n = int(part.shape[ra]), int(part.shape[ca])
+    shape = list(part.shape)
+    shape[ca:ca + 1] = [py, n // py]
+    shape[ra:ra + 1] = [px, m // px]        # ra < ca: split the later first
+    r = jnp.moveaxis(part.reshape(shape), (ra, ca + 1), (0, 1))
+    r = r.reshape(px * py, *r.shape[2:])
+    return jax.lax.psum_scatter(r, axes, scatter_dimension=0, tiled=False)
 
 
 # ---------------------------------------------------------------------------
