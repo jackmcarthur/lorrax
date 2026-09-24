@@ -1681,6 +1681,27 @@ def _get_read_sm(mesh, partition_spec, *,
     return jax.jit(sm_bare)
 
 
+#: AOT executables of ``_get_write_sm`` callables, keyed on the callable and
+#: the operands' (shape, dtype, sharding).  Same key space as that cache: a
+#: handful of write signatures per run.
+_COMPILED_WRITES: dict = {}
+
+
+def _compiled_write(sm, *args):
+    """The compiled write executable for these operands, built on THIS thread.
+
+    ``LORRAX_WRITE_NO_JIT=1`` hands back the bare shard_map, which has no
+    ``lower``; it is returned unchanged.
+    """
+    if not hasattr(sm, "lower"):
+        return sm
+    key = (sm, *((tuple(a.shape), a.dtype, a.sharding) for a in args))
+    compiled = _COMPILED_WRITES.get(key)
+    if compiled is None:
+        compiled = _COMPILED_WRITES[key] = sm.lower(*args).compile()
+    return compiled
+
+
 @functools.lru_cache(maxsize=None)
 def _get_write_sm(mesh, in_specs, *,
                   mesh_shape, axis_count_per_dim, axis_flat, no_jit):
@@ -2408,8 +2429,19 @@ class _FfiBackend(_DatasetGeometry):
         offset_arr = _replicated_i64_vector(off, self.mesh)
         valid_shape_arr = _replicated_i64_vector(vshape, self.mesh)
 
+        # COMPILE ON THE CALLING THREAD, dispatch on the worker.  The worker
+        # used to take the jit's first-call compile, so where that compile
+        # fell in the process's compile sequence depended on thread timing
+        # against the main thread's next compile; the cross-rank compile
+        # agreement (common.jax_compile_cache) then saw ranks present
+        # ``jit__per_rank`` and the main thread's module in different orders
+        # and refused (bispinor_debug at P4 under pytest,
+        # lx-Xg4-100442-970539-2773).  Compiling here puts it at a fixed
+        # point in program order on every rank.
+        call = _compiled_write(sm, A, handle_arr, offset_arr, valid_shape_arr)
+
         def _task():
-            tok = sm(A, handle_arr, offset_arr, valid_shape_arr)
+            tok = call(A, handle_arr, offset_arr, valid_shape_arr)
             tok.block_until_ready()
 
         self._queued_bytes += int(A.nbytes)
