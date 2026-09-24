@@ -1,261 +1,134 @@
-# ISDF-BSE: Bethe-Salpeter Equation with Interpolative Separable Density Fitting
-
-This module implements a high-performance BSE solver using ISDF for low-rank approximation of electron-hole interactions.
-
-## Algorithm Overview
-
-### BSE Hamiltonian (Tamm-Dancoff Approximation)
-
-The BSE Hamiltonian in TDA for **spinors** is:
-
-```
-H_BSE = D + V - W
-```
-
-where:
-- **D**: Diagonal term from QP energy differences: `D_{cvk} = ε_c(k) - ε_v(k)`
-- **V**: Direct (bare Coulomb) term at q=0 (repulsive)
-- **W**: Screened exchange term with k→k' momentum transfer (attractive)
-
-**Note on spin factors**: For spin-restricted singlet excitons the textbook form is `D + 2V - W`, where the factor of 2 comes from spin summation. For spinors (spin-orbit coupled wavefunctions), we use `D + V - W` because the Coulomb interaction is spin-independent and couples to the charge density at each vertex, which is already spin-traced in the pair amplitude `M = Σ_σ ψ*_{c,σ} ψ_{v,σ}`.
-
-### ISDF Representation
-
-The pair density is expanded in ISDF interpolation vectors:
-
-```
-ρ_cv(r,k) = ψ*_c(r,k) ψ_v(r,k) ≈ Σ_μ ζ_μ(r) M_cv(μ,k)
-```
-
-where:
-- `ζ_μ(r)`: ISDF interpolation vectors at centroids
-- `M_cv(μ,k) = Σ_s ψ*_{c,s}(μ,k) ψ_{v,s}(μ,k)`: **Spin-traced** pair amplitude (scalar)
-
-This reduces the 4-index electron-hole interaction to 2-index matrices `V_{μν}` and `W_{μν}(q)`.
-
-### Matrix-Vector Product
-
-For trial vector `X(c,v,k)`, the matvec `HX` is computed as:
-
-1. **Encode**:
-   - **V term**: project `X(c,v,k)` to μ-space via the **spin-traced** cv pair amplitude `M_cv`
-   - **W term**: build a **2×2 spin matrix** at each ISDF point pair (μ,ν) as in Henneke (2020) eq (4-6)
-   ```
-   S(ν,k) = Σ_{c',v'} M(k,c',v',ν) X(c',v',k)
-   ```
-
-2. **Apply interaction**:
-   - **V term** (q=0 only): `U_V(μ,k) = Σ_ν V_{μν} S(ν,k)`
-   - **W term** (FFT convolution, Henneke eq (4-6)):
-
-     Build the spin-matrix intermediate
-
-     \[
-     T_{ts}(μ,ν,k)=\sum_{c',v'} ψ_{c',t}(μ,k)\,ψ^{*}_{v',s}(ν,k)\,X(c',v',k)
-     \]
-
-     and apply the convolution in k for each \((μ,ν,t,s)\):
-
-     ```
-     T(μ,ν,t,s,R) = IFFT_k[T(μ,ν,t,s,k)]     # k → R
-     U(μ,ν,t,s,R) = W(μ,ν,R) * T(μ,ν,t,s,R)  # scalar W multiplies each spin component
-     U(μ,ν,t,s,k) = FFT_R[U(μ,ν,t,s,R)]      # R → k
-     ```
-
-     The BSE definition carries an overall **`1/Nk`** prefactor on the W term. We use
-     unitary FFTs (`norm='ortho'`), so the FFT-based convolution carries a natural
-     **`1/sqrt(Nk)`** scaling; we apply one additional **`1/sqrt(Nk)`** factor to recover
-     the physical **`1/Nk`** overall normalization.
-
-3. **Decode**:
-   - **V**: project back to (c,v) using `M*` as usual
-   - **W**: contract the spin matrix with the external (c,v) spinors:
-
-     \[
-     [WX](c,v,k)=\sum_{μ,ν,t,s} ψ^*_{c,t}(μ,k)\,U_{ts}(μ,ν,k)\,ψ_{v,s}(ν,k)
-     \]
-
-### Eigensolver: Lanczos Algorithm
-
-We use the Lanczos algorithm to find the lowest exciton eigenvalues without forming the full Hamiltonian matrix.
-
-Two implementations are provided:
-- **`lanczos_eig_jit`**: Fully JIT-compiled using `lax.fori_loop` (default, faster)
-- **`simple_lanczos_eig`**: Python-loop version (easier to debug)
-
-Key features:
-- Pre-allocated arrays for JIT compatibility
-- Selective reorthogonalization (configurable via `n_reorth`)
-- Tridiagonal solve via `jnp.linalg.eigh` (trivially fast for m×m where m~100)
-
----
-
-## Sharding Strategy (Multi-GPU)
-
-### Device Mesh
-
-We use a 2D mesh `(X, Y)` matching the COHSEX conventions in `load_wfns.py`:
-
-```python
-mesh = Mesh(devices.reshape(Px, Py), axis_names=('x', 'y'))
-```
-
-### Array Shardings
-
-| Array | Shape | Sharding | Memory/Device |
-|-------|-------|----------|---------------|
-| `X` (trial vec) | `(b, nc, nv, nk)` | `P(None, 'x', None, None)` | O(nc/Px × nv × nk) |
-| `W_q` | `(n_rmu, n_rmu, nk)` | `P('x', 'y', None)` | O(n_rmu²/P) |
-| `V_q0` | `(n_rmu, n_rmu)` | `P('x', 'y')` | O(n_rmu²/P) |
-| `psi_c` | `(nk, nc, ns, n_rmu)` | `P(None, None, None, 'x')` | O(nk × nc × ns × n_rmu/Px) |
-| `psi_v` | `(nk, nv, ns, n_rmu)` | `P(None, None, None, 'y')` | O(nk × nv × ns × n_rmu/Py) |
-
-### Communication Pattern
-
-Each matvec requires 3 collective operations:
-1. **`psum` over X-axis**: Complete c-sum in encoding
-2. **`psum` over Y-axis**: Complete ν-sum after W contraction
-3. **`reduce_scatter` over X-axis**: Distribute c in decoding
-
-This achieves O(n_rmu²/P²) memory per device for W, enabling large systems.
-
----
-
-## JIT Compilation
-
-### Static vs Dynamic Arguments
-
-```python
-@partial(jax.jit, static_argnames=("nkx", "nky", "nkz"))
-def apply_bse_hamiltonian(..., nkx: int, nky: int, nkz: int):
-```
-
-- **Static**: `nkx, nky, nkz` (k-grid dimensions) - triggers recompilation if changed
-- **Dynamic**: All arrays - can change without recompilation
-
-### Caching Behavior
-
-The matvec is JIT-compiled on first call. Subsequent calls reuse the compiled kernel.
-For Lanczos, the inner matvec is called ~50-100 times, so compilation cost is amortized.
-
-### Warm-up
-
-The test script includes warm-up iterations to separate JIT compilation time from execution time:
-```bash
-uv run python tests/bench/test_bse.py -i input.in --n-warmup 2 --n-bench 10
-```
-
----
-
-## Usage
-
-### Running the Test
-
-```bash
-cd /path/to/cohsex_prod
-uv run python tests/bench/test_bse.py -i cohsex_prod.in \
-  --n-val 4 --n-cond 4 \
-  --n-eig 10 --max-iter 50 \
-  --write-eigenvectors eigenvectors.h5
-```
-
-### Command-Line Options
-
-| Option | Default | Description |
-|--------|---------|-------------|
-| `-i, --input` | (required) | COHSEX input file (for directory context) |
-| `--n-val` | 4 | Number of valence bands |
-| `--n-cond` | 4 | Number of conduction bands |
-| `--n-eig` | 10 | Number of exciton eigenvalues |
-| `--max-iter` | 50 | Maximum Lanczos iterations |
-| `--n-warmup` | 2 | JIT warm-up iterations |
-| `--n-bench` | 10 | Benchmark iterations |
-| `--no-jit-lanczos` | False | Use Python-loop Lanczos instead of JIT |
-| `--write-eigenvectors` | None | Output HDF5 file for eigenvectors |
-
-### Profiling
-
-Enable JAX profiler tracing:
-```bash
-ISDF_JAX_PROFILE_DIR=./jax_traces uv run python tests/bench/test_bse.py -i input.in
-tensorboard --logdir=./jax_traces
-```
-
-Timing report is printed at the end of each run.
-
----
-
-## Output Format
-
-Eigenvectors are written to HDF5 following the BerkeleyGW `eigenvectors.h5` spec:
-
-```
-exciton_header/
-  params/
-    bse_hamiltonian_size, nevecs, ns, nc, nv, use_tda, spin_kernel
-  kpoints/
-    nk, kpts, nQ, exciton_Q_shifts
-exciton_data/
-  eigenvalues     # (n_eig,)
-  eigenvectors    # (nQ, nevecs, nk, nc, nv, ns, 2) for complex
-```
-
----
-
-## Performance Characteristics
-
-### Typical Timing (4 val × 4 cond × 9 k-points, 600 ISDF points, 1 GPU)
-
-| Operation | Time |
-|-----------|------|
-| Load data | 2.0s |
-| Matvec (JIT compile) | 1.0s |
-| Matvec (per call after JIT) | 6ms |
-| Lanczos (50 iters) | 2.5s |
-
-### Scaling Considerations
-
-For production calculations (50 val × 50 cond × 216 k-points, 2000 ISDF):
-- **W_q memory**: ~7 GB → requires sharding across multiple GPUs
-- **Lanczos vectors Q**: ~850 MB → fits on single GPU
-- **Tridiagonal T**: ~160 KB → trivially small
-
-The matvec cost dominates; Lanczos overhead (reorthogonalization, tridiagonal solve) is negligible.
-
----
-
-## Known Limitations
-
-1. **V as W placeholder**: Currently uses bare Coulomb V as stand-in for screened W. Real W loading from `eps0mat.h5` is TODO.
-
-2. **No finite-Q support**: Currently Q=0 only. The infrastructure supports nQ>1 but is not yet implemented.
-
-3. **TDA only**: Full BSE (beyond TDA) with coupling to de-excitation amplitudes is not implemented.
-
-4. **Numerical Hermiticity**: The BSE Hamiltonian has ~1e-4 non-Hermiticity due to small imaginary parts in V_qmunu from ISDF fitting. This is a numerical artifact, not a physics error.
-
----
-
-## Future TODO
-
-- [ ] Load actual screened W from `eps0mat.h5` or computed χ₀ inversion
-- [ ] Finite-Q momentum transfer for indirect excitons
-- [ ] Full BSE (beyond TDA) with B matrix coupling
-- [ ] Optical matrix elements and absorption spectrum calculation
-- [ ] Distributed Lanczos vectors for extremely large systems
-- [ ] Block Lanczos tuning for computing many eigenvalues efficiently
-- [ ] Integration with COHSEX restart workflow
-
----
-
-## Files
-
-| File | Description |
-|------|-------------|
-| `bse_jax.py` | Core BSE matvec and Lanczos implementations |
-| `tests/bench/test_bse.py` | Test script with timing and profiling (moved out of src/, 2026-07-31) |
-| `write_eigenvectors.py` | HDF5 output in BerkeleyGW format |
-| `eigenvectors.h5.spec` | Format specification for output |
-| `bse_isdf_instructions.md` | Original design notes |
-| `gpt5.2suggestion.md` | Alternative sharding proposals |
-
+# ISDF-BSE: Hamiltonian, matvec and data contract
+
+The BSE is solved matrix-free: $H$ is applied to trial vectors through the ISDF
+factorization and never formed. How to run the drivers is in
+[`docs/drivers.md`](../../../docs/drivers.md) (§bse, §exciton bands); module
+status in [`STATUS.md`](../STATUS.md); BerkeleyGW comparison conventions in
+[`BGW_COMPARE.md`](../BGW_COMPARE.md); finite-Q traps in
+[`EXCITON_BANDS.md`](../EXCITON_BANDS.md). The other files in this folder are
+design notes and paper excerpts, not contracts.
+
+## Hamiltonian
+
+In the transition basis $|vk \to ck\rangle$, with $X$ the resonant and $Y$ the
+antiresonant amplitudes,
+
+$$\begin{pmatrix} A & B \\ -B^* & -A^* \end{pmatrix}\begin{pmatrix} X \\ Y \end{pmatrix} = \Omega \begin{pmatrix} X \\ Y \end{pmatrix},\qquad
+A = D + w_x V - W,\qquad B = w_x V^B - W^B,$$
+
+$D_{cvk} = \varepsilon_{ck} - \varepsilon_{vk}$, $V$ the bare exchange at
+$q = 0$, $W$ the static screened direct term with momentum transfer $k - k'$.
+The Tamm–Dancoff approximation keeps $A$; the RPA kernel drops $W$ and $W^B$.
+
+### Note on spin factors
+
+$w_x = 2$ for a spin-restricted scalar run (`nspinor = 1`, singlet: $D + 2V - W$)
+and $w_x = 1$ for spinors ($D + V - W$), whose pair amplitude already sums both
+spinor components. `bse_preconditioner.exchange_spin_weight` owns the factor;
+every exchange encode applies it (stack TDA and pair matvecs, the head term,
+the ring encodes, the exact diagonal). Decodes do not.
+
+## ISDF representation
+
+With $\psi_{nk,s}(\mu) \equiv \psi_{nk,s}(r_\mu)$ at the $N_\mu$ centroids:
+
+- pair amplitude $M_{cv}(\mu,k) = \sum_s \psi^*_{ck,s}(\mu)\,\psi_{vk,s}(\mu)$
+  (`compute_pair_amplitude`, hoisted out of the solve);
+- exchange, dense in $(k,k')$:
+  $(VX)_{cvk} = \dfrac{w_x}{N_k} \sum_{\mu\nu} M_{cv}(\mu,k)\, V_{\mu\nu}
+  \sum_{c'v'k'} M^*_{c'v'}(\nu,k')\, X_{c'v'k'}$;
+- direct term through the spin matrix
+  $T_{ts}(\mu,\nu,k) = \sum_{cv} \psi_{ck,t}(\mu)\,\psi^*_{vk,s}(\nu)\,X_{cvk}$:
+  $$(WX)_{cvk} = \frac{1}{N_k}\sum_{\mu\nu ts} \psi^*_{ck,t}(\mu)\,\psi_{vk,s}(\nu) \sum_{k'} W_{\mu\nu}(k-k')\, T_{ts}(\mu,\nu,k').$$
+
+The $k'$ sum is a convolution on the k grid, evaluated as
+$U = \mathrm{fftn}_\text{ortho}\big(W_R \cdot \mathrm{ifftn}_\text{ortho}(T)\big)$
+by the k-convolution router (`common.fft_helpers.make_local_kconv_kminor`:
+nvidia-mathdx on CUDA, the plan route on CPU), with $W_R$ the screened tile
+already in R space. The cost is $O(N_k \log N_k)$ per $(\mu,\nu,t,s)$; a dense
+$N_k \times N_k$ contraction is forbidden because it inverts at large $N_k$.
+
+The optional nonanalytic exchange head (`head_minibz_average`) is a rank-3
+term over transitions,
+$K^\text{head} = \frac{1}{N_k}\, d^*_a\, M_{ab}\, d_b$ with $d$ the transition
+dipoles and $M_{ab} = \langle v(q)\, q_a q_b\rangle_\text{cell}$; it reuses the
+exchange encode/decode with $(D_\text{head}, M_\text{head})$ in place of
+$(M, V_{q0})$ ([LT head](../../../docs/theory/lt-exchange-head.md)).
+
+## Layouts
+
+Square mesh `('x','y')`; shardings from `bse_ring_comm.make_bse_shardings`.
+
+| array | shape | sharding |
+|---|---|---|
+| trial block `X` | `(n_trials, n_c, n_v, N_k)` | `P(None, 'x', 'y', None)` |
+| `psi_c_X` / `psi_v_Y` | `(N_k, n_c, n_s, N_μ)` / `(N_k, n_v, n_s, N_μ)` | μ on `'x'` / ν on `'y'` |
+| `M_X` / `M_Y` | `(N_k, n_c, n_v, N_μ)` | μ on `'x'` / ν on `'y'` |
+| `V_q0` | `(N_μ, N_μ)` | `P('x', 'y')` |
+| `W_R` | `(N_μ, N_μ, n_kx, n_ky, n_kz)` | `P('x', 'y', None, None, None)` |
+| `eps_c`, `eps_v` | `(N_k, n_c)`, `(N_k, n_v)` | replicated |
+
+$N_\mu$ is padded to the mesh divisor (`padded_mu_extent`); $n_c$ and $n_v$ are
+padded to $p_x$ and $p_y$ with zero ψ and a signed ε sentinel
+(`PAD_EPS_GUARD_RY`), so pad states decouple. ψ, $X$, $V$ and $W$ are
+complex128; ε is float64 in Ry.
+
+## The trial-stack matvec (`bse_stack_matvec`)
+
+`build_bse_stack_matvec(mesh, nkx, nky, nkz, kernel='bse'|'rpa')` is the one
+TDA/RPA matvec every sharded solver uses. Per trial block:
+
+1. one all-gather of the block over `'y'` then `'x'`, so every rank holds each
+   trial whole, $(n_c, n_v, N_k)$ ($16\,n_\text{trials} n_c n_v N_k$ bytes, the
+   only replicated operand);
+2. `lax.scan` over trials, no collective in the body: encode
+   $R = \sum_v \psi^*_v X$, $T = \sum_c \psi_c R$ into the rank's
+   $(\mu_\text{loc}, \nu_\text{loc}, n_s, n_s, N_k)$ tile, convolve, decode to
+   the rank's partial $(n_c, n_v, N_k)$;
+3. one reduce-scatter back to the `X` layout.
+
+Exchange runs outside the scan: a k-summed encode to $(n_\text{trials}, N_\mu)$,
+one GEMM with $V_{q0}$, a broadcast decode.
+
+Per device: one $T$ tile, $16\, n_s^2 N_\mu^2 N_k / P$ bytes, whatever the
+block width (the scan bounds it); $W_R$ at $16\, N_\mu^2 N_k / P$. Per trial
+vector the encode and decode cost $O(N_k\, n_c\, n_s^2 N_\mu^2 / P)$ flops
+plus $O(N_k\, n_c n_v n_s N_\mu / p_y)$, and the convolution
+$O(n_s^2 N_\mu^2 N_k \log N_k / P)$. The manual `shard_map` is kept because it
+fixes the decode collectives to reduce-scatters on every backend;
+`LORRAX_BSE_MATVEC_OPT=gspmd` runs the same scan without it as an audit route,
+and any other token refuses.
+
+Full BSE uses `build_bse_stack_pair_matvec`, the real-linear applier
+$\text{pair}(X, s) = AX + s\,B\bar X$ ($s = \pm1$ traced, Shao–da Jornada–Yang
+Algorithm 4). Because the $A$ and $B$ encodes produce tiles of the same shape
+and sharding (one ζ set serves both legs), their sum passes through one
+convolution and one decode. `bse_ring_comm.build_bse_ring_matvec_full` stays as
+the dense $(A, B)$ oracle for the equality gates.
+
+## Solvers
+
+| route | module | use |
+|---|---|---|
+| Lanczos / block Lanczos | `bse_lanczos.solve_bse_sharded` | spectrum shape; full reorthogonalization by default (CGS2) |
+| Davidson | `bse_davidson_helpers` | per-state convergence (oscillator strengths) |
+| thick-restart Lanczos | `solvers/thick_restart_lanczos.py` | bounded Krylov memory at large dimension |
+| FEAST | `bse_feast` | the driver's default without `--lanczos` |
+| full BSE | `bse_nontda` | structure-preserving solve of the non-TDA problem |
+| absorption | `absorption_haydock`, `absorption_eigvecs` | $\varepsilon_2(\omega)$ by continued fraction or sum over states |
+
+## Output: `eigenvectors.h5`
+
+Written by `bse_window.write_eigenvectors_stream`, rank 0 only, in the
+BerkeleyGW layout (`../eigenvectors.h5.spec`):
+
+- `exciton_data/eigenvalues` `(N,)` in **eV** (internal units are Ry);
+- `exciton_data/eigenvectors` `(nQ=1, N, N_k, n_c, n_v, ns=1, 2)` float64,
+  real/imag last; full BSE adds `eigenvectors_coupling` (Y) in the same shape;
+- the **valence axis is reversed** on write (BerkeleyGW `iv = 1` is the highest
+  valence band; internally `v = 0` is the lowest); conduction and k are not;
+- `exciton_header/params` carries `nc`, `nv`, `ns`, `nevecs`, `use_tda`.
+
+The writer refuses to trim nonzero amplitude when the declared window is
+narrower than the solved one: pass the loader's resolved counts, not the CLI
+request, because `--band-degeneracy snap` widens the window.
