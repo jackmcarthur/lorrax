@@ -1,273 +1,129 @@
-# JAX CPU collectives on MPI (`impl=mpi`) and the LORRAX MPIwrapper
+# JAX CPU collectives on MPI (`impl=mpi`) and the MPIwrapper adapter
 
-*How LORRAX runs `JAX_CPU_COLLECTIVES_IMPLEMENTATION=mpi`: the common JAX
-contract, the different Intel-MPI and Cray-MPICH thread-level mechanisms, and
-the two machine launch recipes.*
-
-## STATUS: thread-main override superseded; thread level is site-specific
-
-**A locally-patched MPI shim is not a portable dependency this project should
-spread to every machine.** The `MPI_Is_thread_main` override is no longer
-needed anywhere; ordinary Python in this repo replaces it. Frontera retains a
-small patch only to upgrade Intel MPI's thread-level request. Perlmutter uses
-unmodified upstream MPIwrapper and obtains the required thread level from
-Cray MPICH's supported async-progress control.
-
-### What replaced it: a main-thread mesh-clique warm-up
-
-`common.collectives.warm_mesh_cliques(mesh)` creates one MPI communicator per
-mesh axis, plus one over all axes, **from the Python main thread** at
-mesh-construction time — three 8-byte `psum`s, ~150 ms once per process,
-independent of `N_mu` / `N_k` / `N_q` / `P`.
-
-It works because jaxlib's guard fires only on communicator **creation**, and
-`xla::cpu::AcquireCommunicator` caches communicators in a process-global clique
-map keyed *only* by the participating-device set: it takes the map lock and
-calls `CreateCommunicator` only on a **miss**. Each warm-up `psum` is small
-enough (one 8-byte buffer, <= 8 thunks) that XLA takes
-`ThunkExecutor::ExecuteSequential` and runs the thunk inline on the caller, so
-`MPI_Is_thread_main` is true and the split succeeds. Every later collective —
-including the ones a pool worker issues inside the BSE Lanczos jit — is a cache
-hit and never reaches the guard.
-
-The caching is **per-clique**, which is the whole point and is the thing nobody
-had tested. Warming the world clique alone **fails**; `x` alone fails; `x + y`
-without the world fails; only `x + y + world` passes. An earlier helper warmed
-the world clique only — exactly the failing cell — which is why the old
-"world-collective-first contract" looked falsified. Warm-up always mattered; it
-was warming the wrong device sets.
-
-On the real 785c BSE deck at P=4 with the driver unmodified and the wrapper
-gate **unset**: no warm-up gives 8 refusals and death; warm-up gives rc=0 and
-eigenvalues `[1.30537661 1.3504201 1.42411254 1.50449023]`, character-identical
-to the wrapper-override run and to the gloo reference. A four-way agreement.
-
-It is also **safer** than the override. `MPI_Comm_split` is collective over
-`MPI_COMM_WORLD`. The override lets XLA call it from arbitrary pool workers;
-`AcquireCommunicator` serialises creation *within* a process but nothing
-serialises it *across* ranks, so two cliques becoming ready in different orders
-on different ranks is a latent deadlock. Creating them all from one thread in a
-program-defined order before any jit runs removes that exposure.
-
-And it changes no compiled HLO, so it cannot move the collective table or the
-allocation table.
-
-### What the wrapper is still for
-
-MPIwrapper is always required as the ABI adapter that JAX's bundled
-MPItrampoline loads.  It is not the MPI implementation.  The thread-level
-policy carried by that adapter is machine-specific:
-
-| machine | production composition |
-|---|---|
-| **Frontera / Intel MPI** | The locally patched adapter upgrades XLA's request to `MPI_THREAD_MULTIPLE`.  Its optional `MPI_Is_thread_main` override is **SUPERSEDED** by `warm_mesh_cliques`; production leaves `LORRAX_MPI_FORCE_THREAD_MAIN` unset. |
-| **Perlmutter / Cray MPICH** | The adapter is exact, unmodified upstream MPIwrapper. HPE's public `MPICH_ASYNC_PROGRESS=1` setting makes Cray MPICH grant MULTIPLE despite XLA requesting FUNNELED. No local MPIwrapper patch is used. |
-
-MULTIPLE remains required for the full application: XLA's collective
-operations can run on pool threads while native parallel-HDF5 or distributed
-linalg is using MPI.  The remaining upstream exit is jaxlib requesting
-`MPI_THREAD_MULTIPLE` itself (and checking `provided`), and/or relaxing its
-`MPI_Is_thread_main` communicator-creation guard.
-
-Full analysis of all four routes, including the falsified ones:
-`wk_REL/jax_threadmain_alternatives.md`.
+Multi-process CPU runs use `JAX_CPU_COLLECTIVES_IMPLEMENTATION=mpi`.
+[Collective transports](../environment/transports.md) is the map of which
+transport runs where; this page owns the mechanism: the jaxlib guard and the
+clique warm-up that satisfies it, the thread-level requirement, the
+MPIwrapper adapter per machine, and the launch compositions.
 
 ## Why not gloo
 
-The two CPU collectives backends jaxlib 0.9.1 offers are `gloo` (the default)
-and `mpi`. LORRAX ran on gloo through 2026-07-27. Three measured results moved
-it off:
+jaxlib 0.9.1 offers `gloo` (its default) and `mpi`.
 
-1. **gloo's `reduce-scatter` silently corrupts results.** Under
-   `JAX_CPU_COLLECTIVES_IMPLEMENTATION=gloo`, `jax.lax.psum_scatter` over a 2-D
-   mesh intermittently returns wrong data with no error, no warning and a zero
-   exit code — ~5% of executions, ~80% of process lifetimes, always output
-   segment 0, at a magnitude of order the correct answer (a ~24% error against
-   a 2.8e-14 association floor). It reproduces with no LORRAX imports at all.
-   `impl=mpi` on the identical program is clean in 504/504 executions with a
-   gloo positive control corrupting 4 of 4 process lifetimes in the same
-   allocations, and a negative control proving the MPI reduce-scatter is
-   genuinely on the critical path.
-2. **The performance case for gloo has evaporated.** `impl=mpi` is 1.18x
-   end-to-end at P=16 against gloo *on its ib0 pin*, with the collective-bound
-   stages 1.4-8.2x. On identical payloads (1.12 GB all-reduce / 2.24 GB
-   all-gather / 1.12 GB reduce-scatter) mpi takes 0.83 / 1.05 / 0.63 s where
-   gloo takes 14.99 / 31.11 / 11.98 s.
-3. **gloo in this jaxlib has no non-TCP transport**, so that gap is structural
-   rather than a tuning matter. `GLOO_SOCKET_IFNAME` is inert — the string
-   appears in no `.so` in jaxlib 0.9.1.
+* **gloo's reduce-scatter silently corrupts.** `lax.psum_scatter` over a 2-D
+  mesh returns wrong data with rc = 0 in about 5 % of executions (always
+  output segment 0, error of order the answer), reproducible with no LORRAX
+  imports. `impl=mpi` on the identical program is clean in 504/504
+  executions, with a gloo positive control corrupting 4 of 4 process
+  lifetimes in the same allocations.
+* **mpi is faster.** On identical payloads (1.12 GB all-reduce, 2.24 GB
+  all-gather, 1.12 GB reduce-scatter) mpi takes 0.83 / 1.05 / 0.63 s and gloo
+  14.99 / 31.11 / 11.98 s; collective-bound stages are 1.4–8.2× faster.
+* **gloo here has no non-TCP transport**; `GLOO_SOCKET_IFNAME` is inert.
 
-## What blocks `impl=mpi`, and why it is not an MPI thread level
+`runtime.announce_cpu_collectives()` prints the resolved implementation once
+from rank 0 and warns when a multi-process CPU run is on gloo.
 
-jaxlib's `xla::cpu::MpiCollectives::CreateCommunicators()` opens with
+## The jaxlib guard, and the warm-up that satisfies it
 
-```c
-int flag; MPI_Is_thread_main(&flag);
-if (!flag) return absl::UnknownError(
-    "MPI: Communicator requested from a thread that is not the one MPI was "
-    "initialized from. Multiple threads/devices per process are not yet "
-    "supported.");
-```
+`xla::cpu::MpiCollectives::CreateCommunicators()` refuses with
+"Communicator requested from a thread that is not the one MPI was initialized
+from" unless `MPI_Is_thread_main` is true, and only then calls
+`MPI_Comm_split(MPI_COMM_WORLD, …)`. Three properties decide the design:
 
-and only then calls `MPI_Comm_split(MPI_COMM_WORLD, color, key, &comm)`.
+* It is a thread-identity test, not a thread-level test: `MPI_Is_thread_main`
+  is false on every non-initialising thread even under `MPI_THREAD_MULTIPLE`.
+* It fires only on communicator **creation**. `xla::cpu::AcquireCommunicator`
+  caches communicators in a process-global map keyed only by the
+  participating-device set, and the collectives themselves carry no check.
+* Whether a program trips it depends on XLA:CPU's executor.
+  `ThunkExecutor::ExecuteSequential` runs thunks inline on the caller thread
+  (small programs pass); the parallel executor dispatches to intra-op pool
+  workers (real programs fail). No XLA flag forces the sequential executor.
 
-Three properties of that guard, all confirmed by disassembling
-`CreateCommunicators` in `jaxlib/libjax_common.so`:
+`common.collectives.warm_mesh_cliques(mesh)` therefore creates every clique
+the mesh will use (one per mesh axis **and** the world clique; any subset
+fails) from the main thread, inside a jit small enough (one 8-byte buffer,
+≤ 8 thunks) to run sequentially. Every later acquisition, including from a
+pool worker, is a cache hit. Cost: three 8-byte `psum`s once per process,
+independent of μ, k, q and P; it changes no compiled HLO. Creating all cliques
+from one thread in a fixed order also removes the cross-rank ordering hazard
+of calling the world-collective `MPI_Comm_split` from arbitrary pool workers.
 
-* **It is a `MPI_Is_thread_main` test, not a thread-LEVEL test.**
-  `MPI_Is_thread_main` is false on any non-initialising thread at *every*
-  level, including `MPI_THREAD_MULTIPLE`. No `MPI_THREAD_*` setting satisfies
-  it. A THREAD_MULTIPLE-patched wrapper alone does not help — that was fixing
-  the wrong layer.
-* **It fires only on communicator CREATION**, once per clique key.
-  `MpiCommunicator::AllReduce/ReduceScatter/AllGather/...` carry no such check.
-* **The discriminator is which XLA:CPU execution path the program takes**, not
-  the shape of the jaxpr. `ThunkExecutor::ExecuteSequential` runs thunks inline
-  on the caller (main) thread, so small graphs pass; the parallel
-  `ThunkExecutor::Execute<ReadyQueue>` path dispatches thunks to intra-op pool
-  workers, so real graphs fail. A clean-room probe of "collectives inside
-  `lax.scan` inside `shard_map` inside one jit" — the shape earlier docs named
-  as the discriminator — **passed** under `impl=mpi`, and so did a bare
-  subgroup `psum` with no warm-up. There is also no config knob: the complete
-  `set_xla_cpu_*` DebugOptions list in this jaxlib contains nothing that forces
-  sequential thunk execution, and `jax_cpu_enable_async_dispatch=0` is not the
-  lever.
+Contract: call `common.collectives.prepare_mesh()` (`resolve_mesh` +
+`warm_mesh_cliques` + `runtime.nccl_warmup`) once per mesh before any jit,
+synchronously on every rank. The two warm-ups are deliberately separate: the
+CPU one works because its program is small enough to run inline, and the NCCL
+one exists to force `ncclCommInitRank` topology discovery. Both are no-ops off
+their platform, at P = 1, and on an already-warmed mesh.
+`contract_bands_block_reshard` also warms its mesh at factory time.
 
-Consequently the *ordering* story ("a world collective must come first") is
-wrong — but **warm-up is still the answer**, just per-clique rather than
-ordered: create each mesh-axis communicator, and the world one, from the main
-thread before any real jit runs. See STATUS above. The earlier probes that
-appeared to falsify warm-up altogether were void: every cell in them was small
-enough to take the sequential executor and so passed with no warm-up at all.
+## Thread level: MULTIPLE is required
 
-`MPI_Is_thread_main` in `libjax_common.so` is an MPItrampoline stub
-(`jmpq *MPIABI_Is_thread_main`) resolved at `dlopen` from the MPIwrapper named
-by `MPITRAMPOLINE_LIB` — a library **we build**. On Frontera the adapter also
-carries the historical override; on Perlmutter the adapter is upstream and
-the guard is satisfied only by the in-tree clique warm-up.
+XLA's `MpiCollectives::Init()` requests `MPI_THREAD_FUNNELED` and never reads
+`provided`. XLA's collectives run on pool threads while native parallel HDF5
+and distributed linalg use MPI from other threads, which is undefined behaviour
+below `MPI_THREAD_MULTIPLE` (measured on Intel MPI: segfaults and hangs at the
+ζ-write/`V_q` boundary in 4 of 14 P = 16 runs, two threads of one rank inside
+`MPID_Progress_wait`). Two checks enforce it:
 
-## The wrapper
+* multi-process CPU/MPI startup queries the live grant through
+  `MPIABI_Query_thread` on `MPITRAMPOLINE_LIB` and refuses below MULTIPLE,
+  before any XLA clique exists;
+* `ffi/cpp/common/mpi_thread_guard.h` (phdf5, SLATE) calls
+  `MPI_Init_thread(MULTIPLE)` only when nothing initialised MPI first, and
+  `MPI_Abort`s the world before its first collective when the grant is below
+  MULTIPLE.
 
-*(Interim — see STATUS at the top.)*
+## The adapter
 
-The Frontera adapter is built by `config/frontera/build_mpiwrapper.sh` from upstream MPIwrapper
-v2.11.1 (`eschnett/MPIwrapper`, commit `966f4231…`) plus exactly one patch,
-`config/frontera/mpiwrapper/lorrax_thread.patch`. Upstream is external source
-under its own licence and is fetched, not vendored; only the patch is in the
-repo. The patch adds two overrides and nothing else.
+JAX's bundled MPItrampoline loads the library named by `MPITRAMPOLINE_LIB`,
+which must be an MPIwrapper built for the site MPI (not the vendor `libmpi`).
+Both machines pin upstream MPIwrapper v2.11.1 by commit SHA. How MULTIPLE is
+obtained differs:
 
-### Perlmutter: unmodified adapter plus Cray controls
+| machine | adapter | MULTIPLE comes from |
+|---|---|---|
+| Frontera / Intel MPI | `config/frontera/build_mpiwrapper.sh`: upstream plus `config/frontera/mpiwrapper/lorrax_thread.patch` | the patch forwards every `MPI_Init`/`MPI_Init_thread` to `PMPI_Init_thread(…, MPI_THREAD_MULTIPLE, …)`; requests are upgraded, never downgraded |
+| Perlmutter / Cray MPICH | `config/perlmutter/build_mpiwrapper.sh`: unmodified upstream, refuses a dirty checkout | `MPICH_ASYNC_PROGRESS=1`, which makes Cray MPICH grant MULTIPLE to XLA's explicit FUNNELED request (it adds a progress thread per rank) |
 
-`config/perlmutter/build_mpiwrapper.sh` builds the same pinned MPIwrapper
-commit with no patch and refuses a dirty upstream checkout.  The build uses
-Cray `cc`/`CC`/`ftn`, strips the GPU and Darshan modules, checks the required
-MPItrampoline ABI exports, rejects CUDA-GTL/Darshan dependencies, and runs the
-one-MPI dynamic-closure gate. Production adapter builds force that gate on,
-refuse an inherited opt-out, and include the gate script itself in recipe
-cleanliness and provenance.
+`I_MPI_THREAD_LEVEL_DEFAULT` and `MPIR_CVAR_DEFAULT_THREAD_LEVEL` do not work:
+MPICH grants the explicit request, not the default. mpi4py, h5py and the FFI
+host `.so` link the site `libmpi` directly and never see the adapter.
 
-Two Cray launch controls are load-bearing and are set by
-`config/perlmutter/cpu_mpi_env.sh`:
+The Frontera patch also carries an `MPI_Is_thread_main` override gated on
+`LORRAX_MPI_FORCE_THREAD_MAIN`; production leaves it unset (the Perlmutter
+prelude unsets it), because the warm-up satisfies the guard and setting it
+would only hide a missing warm-up call site.
 
-* `LD_PRELOAD=/opt/cray/pe/lib64/libpmi.so.0` must be in force before Python. Without it,
-  `jax.distributed.initialize()` starts coordination threads and the later MPI
-  initialization segfaults in `_pmi_spawn_init -> PMI2_Init`. Preloading
-  `libpmi2.so.0` does not fix it. The tracked prelude uses Cray's stable,
-  unversioned absolute symlink and verifies that it resolves under
-  `/opt/cray/pe`, so `LD_LIBRARY_PATH` cannot shadow it with a foreign PMI.
-* `MPICH_ASYNC_PROGRESS=1` makes Cray MPICH promote XLA's explicit
-  FUNNELED request to `MPI_THREAD_MULTIPLE`. The default-thread CVARs are
-  inert because XLA made an explicit request. Async progress creates a
-  progress thread; reserve a hardware thread per rank and benchmark its cost.
-
-Measured on allocation 57261316: the post-audit P=4 collective proof is step
-`lx-Xg1-221900-433833-3385`; the frozen-source P=16/four-node proof is
-`lx-Xg1-222848-493981-5730`. Both report
-`MPI_Query_thread=MULTIPLE`, warm all three mesh cliques, and produce exact
-allreduce/reduce-scatter results. Frozen P=4 GN-PPM step
-`lx-Xg1-222309-460416-9952` is exact in 2,484/2,484 reference cells and takes
-109.907 s driver wall. This certifies the collective/runtime layer at P=16
-and the full GW path at P=4; it is not a large-physics-run performance
-certificate.
-
-### Frontera override 1 — THREAD_MULTIPLE upgrade (always on)
-
-`MPI_Init` / `MPI_Init_thread` forward to
-`PMPI_Init_thread(..., MPI_THREAD_MULTIPLE, ...)`. Requests are upgraded,
-never downgraded; the init **order** is unchanged.
-
-XLA's `MpiCollectives::Init()` calls
-`MPI_Init_thread(NULL, NULL, MPI_THREAD_FUNNELED, &provided)` and never reads
-`provided`. With h5py/mpi4py collective MPI-IO on the Python main thread and
-XLA's collectives on an executor thread, a FUNNELED grant is undefined
-behaviour, and it was measured as such: **4 failures in 14 runs (~29%)** at
-P=16 x 8 nodes — 3 segfaults plus 1 hang, provider-independent, every one at
-the ζ-write / `V_q` boundary, with backtraces showing two threads of one rank
-simultaneously inside `MPID_Progress_wait`. Upgrading the grant to MULTIPLE
-makes Intel MPI's global lock serialize them. P=4 single-node never failed
-(shm netmod).
-
-Rejected alternatives on the Intel-MPI route, for the record:
-`I_MPI_THREAD_LEVEL_DEFAULT=MULTIPLE` and
-`MPIR_CVAR_DEFAULT_THREAD_LEVEL=multiple` are **inert** (MPICH grants the
-explicit request, not the default); an `LD_PRELOAD` interposer does not resolve
-through the trampoline's `dlopen`ed scope; `LORRAX_MPI_INIT_FIRST=mpi4py` does
-move the granted level but then hangs the trampoline on a pre-initialized MPI
-and is a documented DO-NOT-USE.
-
-### Frontera override 2 — `MPI_Is_thread_main`, gated on `LORRAX_MPI_FORCE_THREAD_MAIN`
-
-> **SUPERSEDED — do not enable in production.** `warm_mesh_cliques` (STATUS,
-> above) achieves the same thing in-repo, with no patched dependency, and
-> without exposing the cross-rank `MPI_Comm_split` ordering hazard described
-> below. This section is retained because the code path still exists as a
-> fallback and as the positive control in the gates.
-
-With the gate set, the wrapper reports "yes, thread-main" to every caller,
-which removes XLA's refusal and lets `MPI_Comm_split` run on the executor
-thread. **Default OFF**: unset, the wrapper's behaviour is byte-for-byte
-override 1 alone.
-
-Legality rests on two facts, both of which must stay true:
-
-* `MPI_Comm_split` from a pool worker is legal MPI **only** because override 1
-  has already made the grant `MPI_THREAD_MULTIPLE`. The two overrides are a
-  pair; the gate must never be used with an unpatched wrapper.
-* XLA creates cliques in a deterministic order that is identical on every
-  rank, so all ranks split in the same order.
-
-Blast radius is exactly XLA's CPU collectives. mpi4py, h5py and the FFI host
-`.so` all link Intel `libmpi.so.12` directly and never route through
-MPItrampoline, so they never see either override.
-
-### Building the adapters
+**Build verification.** A wrapper that grants FUNNELED loads exactly like a
+good one, so the Frontera build checks machine code: it disassembles
+`MPIABI_Init_thread` and asserts `required` is hard-set to 3, and checks that
+`MPIABI_Is_thread_main` falls through to `PMPI_Is_thread_main` when the gate is
+unset. `LORRAX_MPIWRAPPER_REFERENCE_SO` compares `.text` against a known-good
+build. The Perlmutter build uses Cray `cc`/`CC`/`ftn`, checks the MPItrampoline
+ABI exports, rejects CUDA-GTL and Darshan dependencies, and runs the one-MPI
+dynamic-closure gate; release names carry the adapter content hash and the
+recipe hashes.
 
 ```bash
 export LORRAX_ROOT=/path/to/lorrax
-config/frontera/build_mpiwrapper.sh --fresh      # Intel-MPI patched adapter
-config/perlmutter/build_mpiwrapper.sh --fresh    # Cray-MPICH upstream adapter
+config/frontera/build_mpiwrapper.sh --fresh      # Intel MPI, patched
+config/perlmutter/build_mpiwrapper.sh --fresh    # Cray MPICH, upstream
 ```
 
-The Frontera script compiles Fortran bindings outside its py312 container,
-applies the tracked patch, and verifies its overrides **in the machine code**
-rather than in the source: it disassembles `MPIABI_Init_thread` and asserts the `required`
-argument is hard-set to 3 (`MPI_THREAD_MULTIPLE`), and disassembles
-`MPIABI_Is_thread_main` and asserts it reads the gate and still falls through
-to `PMPI_Is_thread_main` when unset. A wrapper that silently grants FUNNELED
-looks and loads exactly like a good one, so a source-level check is not enough.
-
-Set `LORRAX_MPIWRAPPER_REFERENCE_SO` on Frontera to compare `.text` against a known-good
-build (whole-file equality is not achievable — the build CWD is embedded in
-`.note.gnu.build-id` and, on TACC, `.note.xalt.info`).
-
-## Launch recipes
+## Launch
 
 ### Perlmutter
 
-Build on a CPU compute node and source the prelude **inside every `lx` rank
-shell before Python**.  This is the canonical minimal launcher; it pins the
-JAX 0.9 module and source checkout and checks the live JAX generation before
-the driver starts:
+Build on a CPU compute node, and source `config/perlmutter/cpu_mpi_env.sh` in
+every rank shell before Python. The prelude validates the adapter's source pin,
+MPI ABI and SHA-256 manifest; rejects stale overlays and conflicting MPI/PMI
+preloads; forces CPU, one JAX device per rank and `impl=mpi`; sets
+`LD_PRELOAD=/opt/cray/pe/lib64/libpmi.so.0` (Cray PMI must initialise before
+JAX coordination threads exist, otherwise MPI init segfaults in
+`PMI2_Init`; `libpmi2.so.0` does not fix it) and `MPICH_ASYNC_PROGRESS=1`;
+disables Cray GPU support. It does not set an OpenMP team size.
 
 ```bash
 export LORRAX_CHECKOUT=/path/to/lorrax
@@ -287,87 +143,26 @@ lx run --cpu -N 2 -n 4 -- bash -c '
 '
 ```
 
-`LORRAX_CHECKOUT` declares the requested source to `lx`; it does not replace
-the explicit Python-path selection. For this non-container CPU launch the
-exported checkout `src` remains on the rank-shell path, while the explicit
-rank-shell `PATH` is the interpreter pin. The tracked metadata-only checker
-then refuses a JAX/JAXLIB series other than 0.9 without importing JAX, and the
-runtime attests the complete first-party source closure before JAX starts.
-
-The prelude validates the adapter's pinned source, MPI ABI and SHA256 manifest;
-rejects stale Frontera overlays and conflicting MPI/PMI preloads; forces CPU,
-one JAX device per rank and `impl=mpi`; sets PMI/async-progress controls;
-disables Cray GPU support; and unsets `LORRAX_MPI_FORCE_THREAD_MAIN`. It does
-not choose an OpenMP team size. The example requests room for progress, but
-that is not a certified progress/XLA-thread affinity policy: XLA workers do
-not obey `OMP_NUM_THREADS`, so production affinity still needs a thread-census
-and async-on/off performance measurement.
-
-Release names include the adapter content hash and the
-builder/prelude/site/one-MPI-gate recipe hashes, plus the complete manifest
-hash. Rebuilding identical adapter bytes after changing the recipe therefore
-cannot silently reuse an older provenance manifest.
+`tools/require_jax09.py` refuses a JAX/JAXLIB series other than 0.9 without
+importing JAX ([JAX support](jax_support.md)). XLA workers ignore
+`OMP_NUM_THREADS`; the progress-thread/XLA-thread affinity is not yet a
+certified policy.
 
 ### Frontera
 
-**Executable form: `config/frontera/templates/gw_dev.sbatch`** — the
-certified launch block, vendored; the fragments below are its anatomy.
+`config/frontera/templates/gw_dev.sbatch` is the executable launch block.
+Its load-bearing pieces:
 
-```bash
-# --- collectives ----------------------------------------------------------
-export JAX_CPU_COLLECTIVES_IMPLEMENTATION=mpi
-export MPITRAMPOLINE_LIB=$WORK/lorrax_mpiwrapper/install/lib64/libmpiwrapper.so
-export LORRAX_MPI_FINALIZE_FIX=skip_atexit
-# LORRAX_MPI_FORCE_THREAD_MAIN is deliberately NOT set: the in-repo
-# warm_mesh_cliques() replaces it.  Setting it would only mask a missing
-# warm-up call site.
-PYTHONPATH=$WORK/lorrax_env_mpi_overlay/site:$PYTHONPATH   # the sitecustomize
-# The overlay (mpi4py 4.1.2 + parallel h5py 3.16.0 + sitecustomize.py) is
-# now buildable from the repo: config/frontera/build_mpi_overlay.sh.
-
-# --- Intel-MPI transport --------------------------------------------------
-# The whole block (PMI2 glue, fabrics, provider case-block, UCX
-# setdefaults, I_MPI_DEBUG=4 banner) is config/frontera/mpi_transport_env.sh
-# — source it instead of hand-copying exports.  The PMI2 lib it points at
-# is staged once by config/frontera/stage_host_pmi.sh.
-. $LORRAX_ROOT/config/frontera/mpi_transport_env.sh
-export LORRAX_MPI_PROVIDER=auto   # auto => FI_PROVIDER unset => mlx (default)
-
-# --- container binds ------------------------------------------------------
-# NEVER bind anything under /dev.  RDMA userspace staging:
-#   --bind /usr/lib64:/hostlibs:ro,/usr/lib64/libibverbs,/etc/libibverbs.d
-# plus the staged-symlink block that APPENDS to LD_LIBRARY_PATH (a bare
-# /hostlibs on the path shadows container glibc).
-```
-
-The Frontera composition has these load-bearing pieces:
-
-| variable | omit it and |
+| piece | omit it and |
 |---|---|
-| `JAX_CPU_COLLECTIVES_IMPLEMENTATION=mpi` | you are on gloo, i.e. on the corrupting reduce-scatter |
-| `MPITRAMPOLINE_LIB` | MPItrampoline refuses loudly at startup |
-| a `warm_mesh_cliques()` call on every mesh | BSE (and any grouped clique first created inside a jit) dies on every rank with the communicator refusal. This is a code call site, not an env var — `common.collectives.warm_mesh_cliques`, invoked from the mesh factories and from `contract_bands_block_reshard` |
-| `LORRAX_MPI_FINALIZE_FIX=skip_atexit` + the overlay `sitecustomize` | **every run exits rc=1 after succeeding** — jax's atexit `collectives.Finalize` runs, then post-atexit C++ teardown makes one more MPI call and Intel MPI reports "Attempting to use an MPI routine after finalizing MPICH" |
+| `JAX_CPU_COLLECTIVES_IMPLEMENTATION=mpi` | the run is on gloo's corrupting reduce-scatter |
+| `MPITRAMPOLINE_LIB` → the patched adapter | MPItrampoline refuses at startup |
+| `. config/frontera/mpi_transport_env.sh` | PMI2 glue, fabrics and the provider block are missing; provider policy is in [transports](../environment/transports.md#3-the-intel-mpi-provider-layer-frontera) |
+| the overlay (`config/frontera/build_mpi_overlay.sh`: mpi4py, parallel h5py, `sitecustomize`) with `LORRAX_MPI_FINALIZE_FIX=skip_atexit` | post-atexit teardown makes an MPI call after finalize and a successful run exits rc = 1 |
 
-`MPITRAMPOLINE_LIB` is deliberately **not** auto-defaulted from `src/`: it is a
-machine fact naming a build artifact outside the repo, the hazardous-vs-good
-choice must stay visible in the harness, and MPItrampoline already refuses
-loudly when it is missing.
+`MPITRAMPOLINE_LIB` is never defaulted from `src/`: it names a build artifact
+outside the repo, and the choice must stay visible in the launcher.
 
-## Interaction with the rest of the stack
-
-* `common.collectives.warm_mesh_cliques(mesh)` must be called on every mesh
-  that will carry a grouped collective, synchronously on every rank. It is a
-  no-op off `impl=mpi`, in single-process runs, and on an already-warmed mesh.
-* `runtime.announce_cpu_collectives()`, called from `bootstrap()`, prints the
-  resolved implementation once from rank 0 and warns if a multi-process CPU
-  run has landed on gloo. It is the only place in `src/` that reads the
-  collectives implementation at all, and it changes nothing but the log.
-  The MPI transport itself is selected by the site launch recipe: Intel MPI's
-  `FI_PROVIDER`/`LORRAX_MPI_PROVIDER` on Frontera and Cray MPICH/Slingshot on
-  Perlmutter.
-* `ffi/cpp/phdf5/context.cc` and `ffi/cpp/slate/context.cc` only call
-  `MPI_Init_thread(MULTIPLE)` when nothing initialized MPI first, so they
-  coexist with XLA's init by construction. The phdf5 open warns when the
-  granted level is below MULTIPLE — that warning firing means the wrapper is
-  not on the path and the ~29% race regime is back.
+Every core driver's CLI boundary runs through `runtime.run_main_and_finalize`,
+which enters the ordered MPI/JAX/FFI shutdown on normal exit and, at P > 1,
+exits immediately without collective teardown on an unexpected exception.
