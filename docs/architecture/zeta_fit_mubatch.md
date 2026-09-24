@@ -71,9 +71,9 @@ is local.
 
 ### Row ownership (the Z-store layout)
 
-`ZStore` is one write-once resource; the planner places it on the device,
-in host memory (one numpy tile per addressable device) or in a slab_io
-scratch dataset.  SlabIO datasets are contiguous, so the owner's
+`ZStore` is one write-once resource, never on the device: the planner
+places it in host memory (one tile-major numpy block per addressable
+device) or in a slab_io scratch dataset.  SlabIO datasets are contiguous, so the owner's
 `(q, G_tile, μ_batch)` chunking lives in the dataset shape:
 
 - **q-owned** (the q-local solve tier, `Q ≥ P` and a q's factor plus a G
@@ -88,7 +88,7 @@ scratch dataset.  SlabIO datasets are contiguous, so the owner's
 The μ axis is stored in batch-slot order (`β·b + j`); `read_tile` gathers
 the packed carrier through `MuOrbitBatches.packed_to_slot` (−1: a layout
 pad centroid, an exact zero row).  The device holds only the batch being
-written unless the planner places the whole store there.
+written (and the next one, dispatched before the write).
 
 ### ψ(r_local) source
 
@@ -114,7 +114,7 @@ carrier, `nb` fit bands (transport-padded), `N_r` grid, `N_G` ζ sphere
 | object | sharding | bytes/rank |
 |---|---|---|
 | C factor | `P(None,'x','y')` or q-local batch | `Q·μ²·16/P` |
-| Z store | q-owned or μ-owned tiles | `Q·μ·N_G·16/P` (device only when it fits at the same `b`, else host (0.6 of the node's MemTotal per task), else slab_io disk) |
+| Z store | q-owned or μ-owned tiles | `Q·μ·N_G·16/P` off device: host (0.6 of the node's MemTotal per task), else slab_io disk |
 | ψ(r) cache (cache route) | r-block `R_p` | `nk·nb·ns·R·16` |
 | ψ(G) resident (regen route) | bands over `('x','y')` | `nk·nb·ns·N_Gψ·16/P` |
 | centroid face, full BZ | `μ_X × band_Y` | `nk·ns·μ·nb·16/P` (the parent faces serve C) |
@@ -215,6 +215,35 @@ twins), `tests/test_zeta_mubatch_sym_parity.py` (CPU 2×2) and
 `tests/multi_device/zeta_mubatch_sym_p4.py` (P4, native arm): the batch
 layout against the incumbent r-chunk kernel, the full-BZ children and
 direct sums, then ζ and V_q through one C⁺.
+
+### Planner rule and receipt
+
+Unit: the Green's-function tile `G_tile = nk·ns²·μ²·16/P` per rank; the GW
+run's bottleneck is about `4·G_tile`.  Feasibility: the smallest
+configuration (plane route, smallest batch, ψ(G) from host, band chunk P,
+k chunk 1, store off device) must fit `4·G_tile`, so the fit never sets the
+node count.  The plan then spends the device target where the time model
+says it removes the most time: candidates are (route × ψ source) at their
+largest batch and at half of it; the modelled loop time counts the ψ
+all-to-all bytes, the host ψ(G) uploads and the collective count per batch
+(constants measured on VI3 P16 OFI until the comm-model service lands).
+The receipt prints every object as a `G_tile` ratio, the minimum
+configuration's ratio, collectives per batch, the modelled time and the
+runner-up.  All sizes come from the planner; there is no knob.
+
+Padding goes through `runtime.padding` at named boundaries: the stored q
+rows (`Q → Q_pad`, a multiple of P) and the ζ sphere cut into whole G
+tiles are `PaddedAxis` records made once in `_fit_mubatch` and shared by
+the kernel, the store and the finalize; batch slots, r-block points and
+band slots carry their pads in their own tables (−1 / weight 0).
+
+### Simplifications taken
+
+| what | edge case that loses | cost |
+|---|---|---|
+| the Z store never lives on the device | a small deck whose whole store fits beside the batch | one host round trip; about 1 s on CrI3 8×8 P16 (1.1 GB/rank) |
+| one conditioning procedure (rank truncation, `isdf/cplus.py`); the charge Cholesky kinds are gone from this path | none measured; a well-conditioned C_q pays an eigh instead of a Cholesky | per-q factor time only |
+| batch β+1 dispatched before β is written, instead of a pipelined store | the device holds two batches' output rows | `2·Q_loc·b·N_G·16` bytes, priced |
 
 ## ζ consumers
 
