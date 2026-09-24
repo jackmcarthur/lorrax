@@ -82,13 +82,15 @@ nav:
       - Direct Hartree field: theory/hartree.md
       - ISDF / zeta-V(q): theory/isdf-zeta-vq.md
       - Minimax quadrature: theory/minimax-quadrature.md
+      - Space-time response (Laplace): theory/response-laplace.md
+      - The Sigma(omega) quadrature problem: theory/sigma-quadrature-problem.md
       - Symmetry: theory/symmetry.md
       - S-tensor convention: theory/s-tensor-convention.md
       - LT splitting and the exchange head: theory/lt-exchange-head.md
       - Four-current heads and frequency: theory/four-current-head-corrections.md
       - HL-GPP derivation: theory/hl-gpp-derivation.md
       - Shared-pole screened interaction: theory/shared-pole-w-model.md
-      - MPA compute mode (declared, not yet runnable): theory/THEORY_mpa_implementation.md
+      - Multipole frequency integration (MPA): theory/THEORY_mpa_implementation.md
       - Metallic MPA screening: theory/metallic-mpa-screening.md
   - Architecture:
       - Design decisions: architecture/decisions.md
@@ -99,6 +101,11 @@ nav:
       - The FFI layer: architecture/ffi_layout.md
       - SlabIO (sharded-slab HDF5): architecture/slab_io.md
       - Memory model: architecture/memory-model.md
+      - Symmetry register: architecture/symmetry_register.md
+      - Charge zeta fit (route G): architecture/zeta_fit_mubatch.md
+      - Face-psi zeta fitting: architecture/zeta_fit_face_psi_cct.md
+      - Mesh-padded axes: architecture/padding.md
+      - Fractional chi0 response face: architecture/fractional_chi0_response_face.md
       - Shared-pole W (implementation): architecture/shared_pole_model.md
   - Services:
       - distrib_la (distributed dense linalg): services/distrib_la.md
