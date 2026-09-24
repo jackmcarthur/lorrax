@@ -23,7 +23,7 @@ ROLE_CODES = {"line": 0, "imaginary": 1, "infinity": 2, "held_line": 3, "held_im
 shared_real_pole_v1_r3b = {
     "version": RECIPE_VERSION,
     "height_eta_factor": 4.0,
-    "height_floor_ev": 2.6,
+    "height_floor_ev": 2.0,
     "active_depth_ev": 15.0,
     "borderline_depth_ev": 25.0,
     "plasma_margin_ev": 3.5,
@@ -51,7 +51,7 @@ shared_real_pole_v1_r3b = {
     # support; at most 1.8 N_mu retained Gram directions, the pole count K per parent.
     "production": {"direction_cutoff": 1.0e-3, "imaginary_width_fraction": 0.25,
                    "infinity_width_fraction": 0.125, "sigma_tolerance": 1.0e-4,
-                   "bank_rule_tolerance": 1.0e-8, "fitted_support_count": 18,
+                   "bank_rule_tolerance": 1.0e-8, "fitted_support_count": 10,
                    "line_direction_cap_fraction": 0.0625, "pole_budget_fraction": 1.8},
     "relaxed": {"direction_cutoff": 1.0e-2, "imaginary_width_fraction": 0.125,
                 "infinity_width_fraction": 0.0625, "sigma_tolerance": 1.0e-3,
@@ -1127,9 +1127,10 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
     if tier == 'relaxed':
         line = np.linspace(0.0, top, policy['line_count'])
     else:
-        # The fitted budget less the imaginary ladder, placed by the support rule.
-        line = support_rule_line_sites(energies * RYD_TO_EV, census['mu_ry'] * RYD_TO_EV, eta, height, top,
-                                       policy['fitted_support_count'] - count)
+        # EXPERIMENT (owner sampling 2026-09-24): the fitted budget less the
+        # imaginary ladder, uniform from the line height to the plasma energy.
+        line = np.linspace(height, plasma_ry * RYD_TO_EV,
+                           policy['fitted_support_count'] - count)
         if support_receipt is not None and support_receipt['status'] != 'initial_reference':
             previous_line = support_session.get('line_ev')
             if support_receipt['status'] == 'hit' and previous_line is not None:
