@@ -32,9 +32,10 @@
 #              +0.004243 / 0.008389
 #     sigC     0140d997 certified box rules (837ed531 -> 8576f9f9)
 #              -0.001282 / 0.004073
-#     sigC     8576f9f9 -> main dd8ee0b5: in-grid <= 0.002150, out <= 0.005884
-#              not bisected; candidates 7571f402 (literal eta, owner ruling)
-#              and 89eaa9a3 (box-rule builder without time budget), both on main
+#     sigC     7571f402 (owner ruling 2026-09-02): eta is the literal 0.25 eV,
+#              not the old auto floor 2*4/(24-3) = 0.381 eV; 8576f9f9 -> main
+#              in-grid <= 0.002150, out <= 0.005884.  The landing tree rerun at
+#              eta 0.381 matches 8576f9f9 in-grid to 4.5e-5 (lx-Xg4-095128-876288-6061)
 #     sigC     d7f556fc (owner rule 2026-09-22): a state off the [-4, +4] eV
 #              grid takes Sigma(omega=0), not the endpoint clamp; out-of-grid
 #              cells only, -0.509273 / 0.860629; in-grid <= 1.5e-5

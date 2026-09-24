@@ -2,7 +2,7 @@
 
 **Date:** 2026-09-24
 **Branch:** `fix/physics-refs-2026-09-24`, cut from `land/overnight-2026-09-24@c52b2c42`.
-**Evidence:** sandbox `runs/MoS2/46_physics_refs_bispinor_20260924/` (legs L1–L4), `runs/runtime/overnight_20260924/logs/core_p4_land_c52b2c42.rank0.log`, and sandbox claims 635 and 2696.
+**Evidence:** sandbox `runs/MoS2/46_physics_refs_bispinor_20260924/` (legs L1, L2, L5, L6), `runs/runtime/overnight_20260924/logs/core_p4_land_c52b2c42.rank0.log`, and sandbox claims 635 and 2696. The gate-equivalent check is `scripts/gate_compare.py` (lx-Xg0-095029-873285-7572): the sealed bundle reproduces the new reference with 0 of 1620 cells differing, and the old reference fails it by 1.434 eV.
 **Supersedes:** the "NOT re-frozen" disposition of
 [2026-09-02](2026-09-02-bispinor-gnppm-fixture-runs-again-reference-not-refrozen.md).
 
@@ -18,8 +18,8 @@ The 2026-08-09 reference was stale by up to 1.434381 eV. Before re-freezing, eve
 | | sigC | 27f1e5c9: orbit-safe GN pole tail | −0.001734 / 0.013729 | claim 635 |
 | | sigX | 8f46b0de: Coulomb-gauge TT metric sign | +0.004243 / 0.008389 | claim 635 |
 | 09-02 | sigC | 0140d997: certified box rules (837ed531 → 8576f9f9) | −0.001282 / 0.004073 | claim 635 |
-| 09-02 → main dd8ee0b5 | sigC | not bisected; candidates 7571f402 (literal eta, owner ruling 09-02) and 89eaa9a3 (box-rule builder without a time budget), both on main | in-grid ≤ 0.002150, out ≤ 0.005884 | L2 vs claim-635 probe 8576f9f9; L3 |
-| main → c52b2c42 | sigC | d7f556fc (owner rule 2026-09-22): a state off the [−4, +4] eV grid takes Σ(ω=0) instead of the endpoint clamp | out-of-grid only: −0.509273 / 0.860629; in-grid ≤ 1.5e-5 | L1 vs L2; L4 cross-assembly |
+| 09-02 → main dd8ee0b5 | sigC | 7571f402 (owner ruling 2026-09-02): η is the literal 0.25 eV, not the retired auto floor 2·4/(24−3) = 0.381 eV | in-grid ≤ 0.002150, out ≤ 0.005884 | L2 vs claim-635 probe 8576f9f9. L6 reruns the landing tree at η = 0.381 and matches 8576f9f9 in-grid to 4.5e-5 (lx-Xg4-095128-876288-6061) |
+| main → c52b2c42 | sigC | d7f556fc (owner rule 2026-09-22): a state off the [−4, +4] eV grid takes Σ(ω=0) instead of the endpoint clamp | out-of-grid only: −0.509273 / 0.860629; in-grid ≤ 1.5e-5 | L1 vs L2; d7f556fc is the only landing-only commit on the one-shot Σ(E_DFT) path |
 
 Controls:
 - 835d9f3f (bare TT Γ average) changes nothing on this deck: kconv 61c8d018 and the landing tip agree to 0.000000.
