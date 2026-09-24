@@ -25,7 +25,7 @@ no shared library present. The FFI provider is a separate capability: the CUDA
 and host libraries are found through a sealed bundle or pinned by
 `LORRAX_FFI_SO` / `LORRAX_FFI_HOST_SO`, whose rules
 [`docs/dev/env_vars.md`](../dev/env_vars.md) owns. The loader expects handler
-ABI 4 (`loader.LORRAX_FFI_ABI_VERSION`). An absent `.so` does not break
+ABI 5 (`loader.LORRAX_FFI_ABI_VERSION`). An absent `.so` does not break
 import; an explicit pin that is missing, mis-stamped or ABI-incompatible
 refuses instead of falling through. The environment grants capability and
 never selects a backend: `distrib_la.resolve` reads no environment.
