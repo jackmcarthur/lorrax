@@ -37,9 +37,10 @@ def _mirror_version(path: Path) -> int:
     Importing ``distrib_la.loader`` needs jax and lxkit; importing
     ``ffi.common.ffi_loader`` needs jax too.  This cell's question is about
     three characters in three files and should not be able to fail because a
-    backend is missing.
+    backend is missing.  The symmetry service's spin-rotate registration
+    spells its mirror ``_ABI``.
     """
-    m = re.search(r"^LORRAX_FFI_ABI_VERSION\s*=\s*(\d+)", path.read_text(), re.M)
+    m = re.search(r"^(?:LORRAX_FFI_ABI_VERSION|_ABI)\s*=\s*(\d+)", path.read_text(), re.M)
     assert m, f"{path} does not define LORRAX_FFI_ABI_VERSION"
     return int(m.group(1))
 
@@ -51,6 +52,7 @@ def test_the_header_defines_a_version():
 @pytest.mark.parametrize("mirror", [
     "src/ffi/common/ffi_loader.py",
     "services/distrib_la/src/distrib_la/loader.py",
+    "services/symmetry_maps/src/symmetry_maps/_spin_rotation.py",
 ])
 def test_every_python_mirror_matches_the_header(mirror):
     """THE DRIFT DETECTOR.

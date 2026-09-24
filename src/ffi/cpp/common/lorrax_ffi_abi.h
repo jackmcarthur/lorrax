@@ -52,6 +52,15 @@
 //                k-convolution handlers (KConvMathdxPair/Parent) gained a
 //                `cubin_dir` string Attr for the disk cubin cache.
 //
+//   ABI 4 -> 5   (2026-09-24, perf/kconv-fused-load, concurrency audit item 8).
+//                No signature moved.  The phdf5 read path changed MEANING in
+//                3175fbbb: the >32 MiB synchronous read staging is retired
+//                after its H2D instead of held for the process.  An ABI-4
+//                provider built before that commit still loads and keeps the
+//                largest zeta tile pinned (the VI3 host OOM); the bump is the
+//                only way the loaders can refuse it.  The rule's "silent one"
+//                clause, applied after the fact.
+//
 // ---------------------------------------------------------------------------
 // THE RULE
 // ---------------------------------------------------------------------------
@@ -76,4 +85,4 @@
 // Python tree with a still-correct .so.  What has to match is the CONTRACT.
 #pragma once
 
-#define LORRAX_FFI_ABI_VERSION 4
+#define LORRAX_FFI_ABI_VERSION 5

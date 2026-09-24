@@ -9,7 +9,7 @@ from lxkit import native_provider
 from ._shard_map import shard_map
 
 _TARGET = "lorrax_symmetry_spin_rotate_centroid"
-_ABI = 4  # src/ffi/cpp/common/lorrax_ffi_abi.h
+_ABI = 5  # src/ffi/cpp/common/lorrax_ffi_abi.h (tests/test_ffi_abi_stamp.py)
 _SPECS = {
     "CUDA": dict(env="LORRAX_FFI_SO", so_name="liblorrax_ffi.so",
                  build_hint="build the LORRAX CUDA provider with SpinRotateCentroidCudaFfi"),
