@@ -5754,6 +5754,7 @@ def _run_rcrop(
     _gain_previous: list[tuple[np.ndarray, np.ndarray] | None] = [None]
     _identity_history = {}
     _frozen_fits: list = [getattr(state_init, "frozen_scissor_fits", None)]
+    _probe_line_ref: list = [None]   # DIAGNOSTIC (LORRAX_SC_STATE_PROBE_LINE)
 
     def residual_fn(H_in: jnp.ndarray) -> jnp.ndarray:
         # SHARDED IN, REPLICATED CARRY, SHARDED OUT.  The gather is one
@@ -5833,6 +5834,49 @@ def _run_rcrop(
                     after_twin={k: _sc_probe_digest(v)
                                 for k, v in _probe_state().items()})
                 _twin = None
+            _line_calls = {int(c) for c in os.environ.get(
+                "LORRAX_SC_STATE_PROBE_LINE", "").split(",") if c.strip().isdigit()}
+            from common.collectives import gather_to_host as _g
+            _ho = np.asarray(_g(state_out.H_qp_dft))
+            _hi = np.asarray(_g(H))
+            if _probe_line_ref[0] is not None:
+                # The previous call's line probe evaluated F at exactly this
+                # input (H + f of an accepted call): an independent re-run
+                # across a different call history.
+                _ref_in, _ref_out = _probe_line_ref[0]
+                if _ref_in.shape == _hi.shape:
+                    _rec["replay_vs_line_probe"] = dict(
+                        dH_in_max_meV=float(np.abs(_ref_in - _hi).max() * RYD_TO_EV * 1e3),
+                        dH_out_max_meV=float(np.abs(_ref_out - _ho).max() * RYD_TO_EV * 1e3))
+                _probe_line_ref[0] = None
+            if _iter_idx[0] in _line_calls:
+                _f = state_out.H_qp_dft - H
+                _outs = {}
+                for _t in (0.5, 1.0):
+                    _Ht = H + _t * _f
+                    _Ht = 0.5 * (_Ht + jnp.conj(jnp.swapaxes(_Ht, -1, -2)))
+                    _o = gw_iteration_map(SCState(
+                        H_qp_dft=_Ht, iteration=_iter_idx[0],
+                        partition=state_in.partition,
+                        occupation_state=state_in.occupation_state,
+                        head_surface_weight_kn=state_in.head_surface_weight_kn,
+                        frozen_scissor_fits=state_in.frozen_scissor_fits), inputs)
+                    _outs[_t] = (np.asarray(_g(_Ht)), np.asarray(_g(_o.H_qp_dft)),
+                                 np.asarray(eigvalsh_kshard(_o.H_qp_dft)) * RYD_TO_EV)
+                    _o = None
+                _e0 = np.asarray(eigvalsh_kshard(state_out.H_qp_dft)) * RYD_TO_EV
+                _d2 = _outs[1.0][1] - 2 * _outs[0.5][1] + _ho
+                _d1 = _outs[1.0][1] - _ho
+                _rec["line"] = dict(
+                    second_diff_fro_over_first=float(
+                        np.linalg.norm(_d2) / max(np.linalg.norm(_d1), 1e-300)),
+                    first_diff_fro_meV=float(np.linalg.norm(_d1) * RYD_TO_EV * 1e3),
+                    eig_second_diff_max_meV=float(np.abs(
+                        _outs[1.0][2] - 2 * _outs[0.5][2] + _e0).max() * 1e3),
+                    eig_first_diff_max_meV=float(np.abs(
+                        _outs[1.0][2] - _e0).max() * 1e3))
+                _probe_line_ref[0] = (_outs[1.0][0], _outs[1.0][1])
+                _outs = None
             if jax.process_index() == 0:
                 with open(os.path.join(inputs.input_dir,
                                        "sc_state_probe.jsonl"), "a") as _fh:
