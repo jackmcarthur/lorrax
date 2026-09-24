@@ -35,7 +35,7 @@ from gw.sigma_plan import resolve_sigma_plan
 from gw.wavefunction_bundle import (
     parent_sigma_operands, sigma_face_kernel_kwargs)
 from runtime.env_flags import env_bool
-from runtime.padding import combined_divisor, pad_to_axis, round_up
+from runtime.padding import combined_divisor, pad_to_axis, padded_axis
 
 from .sigma_windows import (OCCUPATION_WINDOW_THRESHOLD_DEFAULT,
                             CROSSING_NODE_FLOOR,
@@ -487,7 +487,7 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
 
             kernels = {}
             multiple = combined_divisor(mesh_xy.shape["x"],mesh_xy.shape["y"])
-            widths = sorted({round_up(min(ccap,kmax-c0),multiple)
+            widths = sorted({padded_axis(min(ccap,kmax-c0),multiple,name="shared_pole_K_chunk").carrier
                              for c0 in range(0,kmax,ccap)})
             for width in widths:
                 kernel = kernels[width] = make_kernel(width)
@@ -627,7 +627,7 @@ def _shared_pole_panel_cost(meta, header, b, c, *, mesh_xy, local, layout="face"
                    & (parents < min(lo+b, nq)))) for lo in range(0, nq, b))
     tile = 16 * (spin*m)**2 // (px*py)
     multiple = combined_divisor(px,py)
-    c = round_up(c,multiple)
+    c = padded_axis(c,multiple,name="shared_pole_K_chunk").carrier
     faces = 32 * b * spin*m*c / (px*py)
     endpoint_budgets = {}
     traffic = 0

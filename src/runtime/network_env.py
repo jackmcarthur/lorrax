@@ -3,6 +3,8 @@
 Topology comes from the current launch, never the enclosing allocation.
 No MPI or GPU library is imported here. Unknown sites/topologies preserve
 NCCL's existing policy; site-specific network settings stay in this owner.
+The Perlmutter profile alone refuses a multi-node CUDA step whose transport
+would resolve to TCP sockets; every other site keeps its transport untouched.
 """
 from __future__ import annotations
 
@@ -65,6 +67,18 @@ def launch_topology(env):
     return None, None, 'unknown'
 
 
+def _sockets_refusal(nodes, cause):
+    """Name why a Perlmutter multi-node step would use sockets, and the relaunch."""
+    placement = f'{nodes} nodes' if nodes is not None else 'multiple nodes'
+    return (
+        f'Refusing multi-node Perlmutter CUDA startup on {placement}: {cause}, '
+        'so NCCL would run over TCP sockets (measured 12x slower than OFI; '
+        'runs/runtime/nccl_transport_20260923). Relaunch with a current `lx run` '
+        '(it exports SLURM_NETWORK=no_vni for every multi-node GPU step), or '
+        'with `SLURM_NETWORK=no_vni srun ...`, and leave NCCL_NET unset or set '
+        'to an OFI provider.')
+
+
 def plan_network_environment(env, *, platform='gpu', is_file=None):
     """Resolve defaults without modifying the caller's environment."""
     nodes, multiple, topology_source = launch_topology(env)
@@ -74,21 +88,26 @@ def plan_network_environment(env, *, platform='gpu', is_file=None):
     if platform == 'cpu' or platforms[0] == 'cpu' or 'rocm' in platforms:
         result['policy'] = 'non-CUDA'
         return result
+    perlmutter_multi_node = (multiple is True
+                             and env.get('NERSC_HOST') == 'perlmutter')
     if 'NCCL_NET' in env or 'NCCL_NET_PLUGIN' in env:
+        if perlmutter_multi_node and env.get('NCCL_NET', '').strip().lower() == 'socket':
+            raise RuntimeError(_sockets_refusal(nodes, 'NCCL_NET=Socket is set'))
         result['policy'] = 'explicit transport'
         return result
-    if multiple is not True or env.get('NERSC_HOST') != 'perlmutter':
+    if not perlmutter_multi_node:
         return result
     # SLURM_NETWORK=no_vni must reach srun before it creates the step. Mixed
     # MPI I/O and OFI/NCCL initialization failed without this launch setting;
     # changing os.environ here cannot repair an existing Slingshot VNI
-    # allocation. Preserve the current transport unless the prerequisite is
-    # present. See docs/environment/machines/perlmutter.md for the launch recipe.
+    # allocation, so a step without it would run NCCL over TCP sockets.
+    # See docs/environment/machines/perlmutter.md for the launch recipe.
     network_options = {value.strip() for value in
                        env.get('SLURM_NETWORK', '').split(',')}
     if 'no_vni' not in network_options:
-        result['policy'] = 'unchanged (automatic OFI requires launch-time SLURM_NETWORK=no_vni)'
-        return result
+        raise RuntimeError(_sockets_refusal(
+            nodes, 'the step was created without SLURM_NETWORK=no_vni '
+            f"(SLURM_NETWORK={env.get('SLURM_NETWORK')!r})"))
     # An absolute plugin name avoids changing LD_LIBRARY_PATH after Python
     # has started, which cannot reliably change the loader's search path.
     exists = is_file or (lambda path: Path(path).is_file())

@@ -88,8 +88,8 @@ def minimum_process_budget_gb(local_gb: float) -> float:
     return float(np.min(budgets))
 
 
-def _query_nvidia_smi_memory(field: str) -> float | None:
-    """Query this rank's visible GPU memory field, returned in GiB."""
+def _query_nvidia_smi_memory(field: str) -> int | None:
+    """Query this rank's visible GPU memory field, returned in bytes."""
     try:
         visible = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
         gpu_id = visible.split(",", 1)[0].strip() if visible else "0"
@@ -100,15 +100,16 @@ def _query_nvidia_smi_memory(field: str) -> float | None:
         )
         if result.returncode == 0:
             value_mib = float(result.stdout.strip().split('\n')[0])
-            return value_mib / 1024.0  # MiB -> GiB
+            return int(value_mib * 2**20)  # nvidia-smi reports MiB
     except (FileNotFoundError, subprocess.TimeoutExpired, ValueError):
         pass
     return None
 
 
 def get_gpu_memory_nvidia_smi() -> float | None:
-    """Query currently free GPU memory via nvidia-smi (GB)."""
-    return _query_nvidia_smi_memory('memory.free')
+    """Query currently free GPU memory via nvidia-smi (GB = 1e9 B)."""
+    free = _query_nvidia_smi_memory('memory.free')
+    return None if free is None else free / 1e9
 
 
 def get_gpu_used_memory_bytes_nvidia_smi() -> int | None:
@@ -118,10 +119,7 @@ def get_gpu_used_memory_bytes_nvidia_smi() -> int | None:
     workspaces and any unrelated process sharing the device.  It is therefore
     an upper bound suitable for a capacity refusal, not an attribution tool.
     """
-    used_gib = _query_nvidia_smi_memory('memory.used')
-    if used_gib is None:
-        return None
-    return int(used_gib * 2**30)
+    return _query_nvidia_smi_memory('memory.used')
 
 
 def _get_jax_gpu_memory_bytes() -> tuple[float | None, float | None, float | None]:
@@ -152,6 +150,57 @@ def _get_jax_gpu_memory_bytes() -> tuple[float | None, float | None, float | Non
         return bytes_limit, bytes_in_use, bytes_available
     except Exception:
         return None, None, None
+
+
+#: XLA's ``GpuAllocatorConfig.memory_fraction`` when neither
+#: ``XLA_CLIENT_MEM_FRACTION`` nor ``XLA_PYTHON_CLIENT_MEM_FRACTION`` is set.
+_XLA_DEFAULT_MEM_FRACTION = 0.75
+
+
+def _derived_pool_bytes() -> tuple[int | None, int | None, str]:
+    """(limit, in_use, source) when the live client reports no ``bytes_limit``.
+
+    jaxlib 0.9's ``cuda_async`` client keeps no arena statistics, so
+    ``memory_stats()`` has no ``bytes_limit`` (``bytes_limit=None`` in the
+    2026-09-23 cuda_async logs, runs/runtime/zeta_mubatch_20260923 in the
+    sandbox).  XLA caps that pool at
+    memory_fraction x total device memory, so the limit is derived the same
+    way here, in bytes, honouring the fraction variable jaxlib reads
+    (:func:`runtime.xla_memory.resolve_xla_gpu_memory_env`).  ``in_use`` is
+    the bytes of this process's live arrays on its device.  It is not
+    nvidia-smi's used memory, because the async pool keeps freed blocks
+    reserved and nvidia-smi counts them as used.
+    """
+    from runtime.xla_memory import resolve_xla_gpu_memory_env
+
+    total = _query_nvidia_smi_memory('memory.total')
+    if total is None:
+        return None, None, 'nvidia-smi memory.total unavailable'
+    env = resolve_xla_gpu_memory_env()
+    fraction = (float(env.mem_fraction) if env.mem_fraction
+                else _XLA_DEFAULT_MEM_FRACTION)
+    in_use = _live_array_bytes()
+    source = (f"{env.mem_fraction_var or 'XLA default fraction'} {fraction:g} "
+              f"x nvidia-smi memory.total {total/1e9:.2f} GB "
+              f"(live arrays in_use={0.0 if in_use is None else in_use/1e9:.2f} GB)")
+    return int(fraction * total), in_use, source
+
+
+def _live_array_bytes() -> int | None:
+    """Bytes of this process's live JAX arrays on its first local device."""
+    try:
+        import math
+        import jax
+        device = jax.local_devices()[0]
+        total = 0
+        for array in jax.live_arrays():
+            if array.is_deleted() or device not in array.sharding.addressable_devices:
+                continue
+            total += (math.prod(array.sharding.shard_shape(array.shape))
+                      * array.dtype.itemsize)
+        return int(total)
+    except Exception:
+        return None
 
 
 def get_cpu_memory_total() -> float | None:
@@ -196,7 +245,10 @@ def get_device_memory_gb(n_devices: int | None = None) -> float:
 
     GPU policy: budget = 0.9 * bytes_limit from jax.memory_stats().
     Uses bytes_limit (pool size, constant across ranks) rather than
-    bytes_available (which can vary by rank due to JIT timing).
+    bytes_available (which can vary by rank due to JIT timing).  When the
+    client reports no limit (``cuda_async``, ``platform``), the limit is
+    MEM_FRACTION x total device memory (:func:`_derived_pool_bytes`).
+    GB means 1e9 bytes everywhere in this module.
     """
     try:
         import jax
@@ -210,15 +262,18 @@ def get_device_memory_gb(n_devices: int | None = None) -> float:
 
     if backend in ('gpu', 'cuda'):
         bytes_limit, _, _ = _get_jax_gpu_memory_bytes()
+        if bytes_limit is None:
+            bytes_limit, _, source = _derived_pool_bytes()
+            from runtime.aot_memory import announce_once
+            announce_once(
+                "gpu-budget-derived-limit",
+                "XLA client reports no bytes_limit; device limit "
+                + (f"{bytes_limit/1e9:.2f} GB = {source}" if bytes_limit
+                   else f"unknown ({source}), budget from nvidia-smi free"))
         if bytes_limit is not None and bytes_limit > 0:
             return max(0.1, 0.90 * bytes_limit / 1e9)
 
-        # Fallback to currently free memory if JAX stats are unavailable.
-        # WARNING: With PREALLOCATE=true, nvidia-smi free memory is AFTER the
-        # BFC pool allocation, so it's much smaller than the actual pool.
-        import sys
-        print(f"  [gpu_utils] WARNING: bytes_limit={bytes_limit}, falling back to nvidia-smi "
-              f"(pid={os.getpid()})", file=sys.stderr, flush=True)
+        # Last resort when not even the device total is readable.
         mem_free_gb = get_gpu_memory_nvidia_smi()
         if mem_free_gb is not None:
             return max(0.1, mem_free_gb * 0.90)
@@ -261,18 +316,23 @@ def get_device_memory_info() -> dict:
     if backend in ('gpu', 'cuda'):
         bytes_limit, bytes_in_use, bytes_available = _get_jax_gpu_memory_bytes()
         if bytes_limit is not None and bytes_available is not None:
+            source = f'jax.memory_stats (in_use={bytes_in_use/1e9:.2f} GB)'
+        else:
+            bytes_limit, bytes_in_use, source = _derived_pool_bytes()
+            bytes_available = (None if bytes_limit is None or bytes_in_use is None
+                               else max(0, bytes_limit - bytes_in_use))
+        if bytes_limit is not None and bytes_available is not None:
             total_gb = bytes_limit / 1e9
             available_gb = bytes_available / 1e9
             budget_gb = max(0.1, 0.90 * available_gb)
-            source = f'jax.memory_stats (in_use={bytes_in_use/1e9:.2f} GB)'
         else:
             mem_free_gb = get_gpu_memory_nvidia_smi()
-            mem_total_gb = _query_nvidia_smi_memory('memory.total')
+            mem_total = _query_nvidia_smi_memory('memory.total')
             if mem_free_gb is not None:
                 available_gb = mem_free_gb
                 budget_gb = max(0.1, mem_free_gb * 0.90)
-                if mem_total_gb is not None:
-                    total_gb = mem_total_gb
+                if mem_total is not None:
+                    total_gb = mem_total / 1e9
                 source = 'nvidia-smi memory.free'
     else:
         try:

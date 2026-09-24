@@ -13,15 +13,34 @@ def environment(**updates):
 
 
 @pytest.mark.parametrize('setting', [None, '', 'depth=64', 'not_no_vni'])
-def test_uncertified_launch_does_not_enable_ofi(setting):
+def test_multi_node_perlmutter_step_without_no_vni_is_refused(setting):
+    # Such a step runs NCCL over TCP sockets: 91 of 91 multi-node logs from
+    # 2026-09-15 to 09-23 did (KNOWN_SANDBOX_ERRORS 2026-09-23).
     env = environment()
     if setting is None:
         del env['SLURM_NETWORK']
     else:
         env['SLURM_NETWORK'] = setting
-    result = net.plan_network_environment(env, is_file=lambda _: pytest.fail())
-    assert result['applied'] == {}
-    assert 'requires launch-time' in result['policy']
+    with pytest.raises(RuntimeError, match=r'TCP sockets.*SLURM_NETWORK=no_vni'):
+        net.plan_network_environment(env, is_file=lambda _: pytest.fail())
+
+
+def test_forced_sockets_are_refused_on_multi_node_perlmutter():
+    with pytest.raises(RuntimeError, match=r'NCCL_NET=Socket.*Relaunch'):
+        net.plan_network_environment(environment(NCCL_NET='socket'),
+                                     is_file=lambda _: pytest.fail())
+
+
+@pytest.mark.parametrize('updates', [dict(NERSC_HOST='other-cluster'),
+                                     dict(SLURM_STEP_NUM_NODES='1')])
+def test_sockets_refusal_is_perlmutter_multi_node_only(updates):
+    env = environment()
+    env.update(updates)
+    del env['SLURM_NETWORK']
+    for extra in ({}, {'NCCL_NET': 'Socket'}):
+        result = net.plan_network_environment(dict(env, **extra),
+                                              is_file=lambda _: pytest.fail())
+        assert result['applied'] == {}
 
 
 def test_no_vni_token_can_accompany_other_network_options():
@@ -49,8 +68,7 @@ def test_multi_node_request_preserves_tuning_override():
     assert env == before
 
 
-@pytest.mark.parametrize('key,value', [('NCCL_NET', 'Socket'),
-                                      ('NCCL_NET', ''),
+@pytest.mark.parametrize('key,value', [('NCCL_NET', ''),
                                       ('NCCL_NET_PLUGIN', 'none'),
                                       ('NCCL_NET_PLUGIN', '/other/plugin.so')])
 def test_explicit_transport_wins_without_mixing_site_settings(key, value):

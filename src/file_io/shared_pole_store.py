@@ -20,7 +20,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax.sharding import NamedSharding, PartitionSpec as P
 
-from runtime.padding import combined_divisor, round_up
+from runtime.padding import padded_axis
 from common import timing
 from common.collectives import device_put_process_local, rank0_transaction, psum_replicate
 from file_io.slab_io import SlabIO, mesh_divisible_shape
@@ -910,8 +910,8 @@ def read_shared_pole_faces(io, q_span, *, meta, header, column_span=None, basis=
                 jnp.zeros(hi-lo,jnp.int64))
     c0, c1 = _span(column_span or (0,header["Kmax"]), header["Kmax"], "column_span")
     # Selected orientations share one padded pole extent; counts exclude padding.
-    multiple = combined_divisor(io.mesh.shape["x"], io.mesh.shape["y"])
-    width = round_up(c1-c0, multiple)
+    width = padded_axis(c1-c0, io.mesh, name="shared_pole_face_K",
+                        specs=((P(None,"x",None,"y"),3),(P(None,"y",None,"x"),3))).carrier
     totals = {}
     for axis in orientations:
         shape = (hi-lo,basis.n_canonical,components,width)
