@@ -215,7 +215,7 @@ $$
 \Sigma^{COH}_n=+\frac{W_h(0)-v_h}{2\,\Omega N_k}.
 $$
 
-### 3.3 GN-PPM and HL-PPM
+### 3.3 GN-PPM and HL-PPM {#ppm-head}
 
 One pole is fitted from the correlation part $W^c_h=W_h-v_h$ at two
 frequencies (`gw.head_correction.fit_head_ppm`):
@@ -349,7 +349,7 @@ bulk integrator is derived for this route. Cost: $O(n_{\rm nodes})$
 4×4 solves on replicated data, plus ten rank-4 local outer products per
 little-group row into the packed body; no sample-by-centroid array exists.
 
-### 4.3 What the response contains, by declaration
+### 4.3 What the response contains, by declaration {#response-content}
 
 The complete list is the module docstring of `gw.static_gauge_response`.
 Present: the charge $q^2$ head $S^{00}$, the charge wings $Y^0$/$Z^0$, and
