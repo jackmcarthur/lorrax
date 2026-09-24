@@ -177,7 +177,7 @@ from typing import Callable
 
 import jax
 import jax.numpy as jnp
-from jax.sharding import Mesh, PartitionSpec as P
+from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from common.collectives import warm_mesh_cliques
 
@@ -383,121 +383,42 @@ def _face_project_kernel(
     band_extent=None,
     layout="face",
 ):
-    """The face-layout Σ projector: TWO planned N,N GEMMs, no shard_map,
-    no psum_scatter — cuBLASMp's own distributed algorithm does the
-    reduction the legacy body does by hand.  See the module docstring's
-    face-layout section and reports/gwjax_low_mem_bands_audit_2026-08-22/
-    report.md §5 ("Sigma = conj(psi_nmu) @ (O @ psi_mun)").
+    """The face-layout Σ projector: reshard ψ, then the axis projector.
 
-        T[s,μ,n]     = Σ_{s',ν} O[s,μ,s',ν] · psi_mun[s',ν,n]      (GEMM 1)
-        Σ[m,n]       = Σ_{s,μ}  conj(psi_nmu)[m,s,μ] · T[s,μ,n]    (GEMM 2)
+        Σ[m,n] = Σ_{s,μ} conj(ψ_l)[m,s,μ] Σ_{s',ν} O[s,μ,s',ν] ψ_r[s',ν,n]
 
-    Both O's (s,μ) and (s',ν) pairs, and both ψ copies' (s,μ)/(s,ν) pairs,
-    go through :func:`merge_spin_centroid` — EVERY one of the four merges
-    needs the same measured majority-order fix (module docstring).  The
-    two GEMMs' operands land in their OWN natural specs with no further
-    reshard: O's own spec already places (s,μ) on 'x' and (s',ν) on 'y'
-    (this module's canonical O layout, layout-independent — Σ's operator
-    is not a ψ copy and does not change shape with ``layout``); psi_mun's
-    (s,ν) is already on 'x'; psi_nmu's (s,μ) is already on 'y'.  T comes
-    out of GEMM 1 already shaped like a ψ_mun-family operand (μ,s merged
-    on 'x', n on 'y'), which is exactly GEMM 2's required B operand.
-
-    ``channels="none"`` (default): the single merged-complex chain,
-    Σ = ψ†Oψ.  ``channels="split_reim"`` (2026-08-22, the dynamic PPM/MPA
-    Σ_c(τ) two-channel plan — see ``gw.ppm_tau_kernel.
-    _make_project_ri_reduce_scatter``'s identically-named legacy plan):
-    O is split into ``Re O``/``Im O`` BEFORE projection and EACH real
-    channel rides the SAME two-GEMM chain independently, returning
-    ``(S_R, S_I)`` — both complex (ψ is complex even though the channel
-    weight is real).  No f64-split de-promotion trick here: that lever
-    exists on the legacy XLA-einsum body to dodge XLA's real-operand
-    promotion inside a mixed-dtype ``jnp.dot``; a planned cuBLASMp GEMM
-    is typed ``complex128`` at construction regardless of the operand's
-    algebraic content, so there is nothing to de-promote — running the
-    SAME complex chain twice (once per channel) is already the minimal
-    form.  ``extra`` (BSE/Σ-channel stack axis) stays unsupported here —
-    see :func:`contract_bands_block_reshard`'s own guard; the dynamic
-    Σ_c(τ) band-bracket stack rides a Python loop over this kernel
-    instead (``ppm_tau_kernel._stack_channels``), not this axis.
+    Face ψ holds bands on one mesh axis and centroids on the other; the axis
+    projector (:func:`_axis_project_kernel`) wants every band with the
+    centroids on the operator's own axis, ``ψ_l`` at
+    ``P(None,None,None,'x')`` and ``ψ_r`` at ``P(None,None,'y',None)``.
+    Resharding the two band-extent ψ operands moves
+    ``16·nk·nb·ns·μ·(1/p_x + 1/p_y)`` bytes per rank; the μ-sized operator
+    ``O`` never moves, and the product ends in one ``nb²`` reduce-scatter.
+    Same arguments and results as the axis projector, including
+    ``channels="split_reim"`` and rectangular endpoints.
     """
     if layout == "axis":
         return _axis_project_kernel(
             mesh_xy, face_shape, axes, channels=channels,
             right_face_shape=right_face_shape, band_extent=band_extent)
 
-    from distrib_la import gemm_plan
-
+    # Faces: bring the two band-extent ψ operands to the axis orientation
+    # (bands complete, centroids on one mesh axis) and run the axis
+    # projector.  Only ψ moves; the μ-sized operator O stays on its tiles and
+    # one nb² reduce-scatter finishes the product.
+    axis_project = _axis_project_kernel(
+        mesh_xy, face_shape, axes, channels=channels,
+        right_face_shape=right_face_shape, band_extent=band_extent)
     ax_x, ax_y = axes
-    nk, nb_full, n_rmu_left, ns = (int(v) for v in face_shape)
-    nb_project = nb_full if band_extent is None else int(band_extent)
-    if right_face_shape is None:
-        right_face_shape = face_shape
-    nk_right, nb_right, n_rmu_right, ns_right = (
-        int(v) for v in right_face_shape)
-    if (nk_right, nb_right, ns_right) != (nk, nb_full, ns):
-        raise ValueError(
-            "contract_bands_block_reshard(layout='face'): left/right "
-            "face shapes must share (nk, nb_full, nspinor); got "
-            f"{face_shape} and {right_face_shape}")
-    mu_s_left = n_rmu_left * ns
-    mu_s_right = n_rmu_right * ns
-    plan1 = gemm_plan(mesh_xy, m=mu_s_left, k=mu_s_right, n=nb_project, nq=nk,
-                      dtype=jnp.complex128, layout=layout, reduction_axis="y")
-    plan2 = gemm_plan(mesh_xy, m=nb_project, k=mu_s_left, n=nb_project, nq=nk,
-                      dtype=jnp.complex128, layout=layout, reduction_axis="x")
+    to_axis = jax.jit(lambda left, right: (left, right), out_shardings=(
+        NamedSharding(mesh_xy, P(None, None, None, ax_x)),
+        NamedSharding(mesh_xy, P(None, None, ax_y, None))))
 
-    def _check(psi_nmu, O, psi_mun):
-        if psi_nmu.ndim != 4 or psi_mun.ndim != 4 or O.ndim != 5:
-            raise ValueError(
-                "contract_bands_block_reshard(layout='face'): expected "
-                "psi_nmu rank 4 (nk,n,s,mu), O rank 5 (nk,s,mu,s',nu), "
-                f"psi_mun rank 4 (nk,s,mu,n); got "
-                f"{tuple(psi_nmu.shape)}, {tuple(O.shape)}, "
-                f"{tuple(psi_mun.shape)}")
-        expected = (
-            (nk, nb_project, ns, n_rmu_left),
-            (nk, ns, n_rmu_left, ns, n_rmu_right),
-            (nk, ns, n_rmu_right, nb_project),
-        )
-        got = (tuple(psi_nmu.shape), tuple(O.shape), tuple(psi_mun.shape))
-        if got != expected:
-            raise ValueError(
-                "contract_bands_block_reshard(layout='face'): rectangular "
-                f"endpoint shapes {got} do not match planned {expected}")
+    def project(psi_nmu, O, psi_mun):
+        left, right = to_axis(psi_nmu, psi_mun)
+        return axis_project(left, O, right)
 
-    def _project_one(psi_nmu, O, psi_mun):
-        """``project(psi_left, O, psi_right)`` — SAME argument order as
-        the legacy closure (psi_left is the one conjugated inside): under
-        ``layout='face'`` that is ``(psi_nmu, O, psi_mun)``."""
-        O1 = merge_spin_centroid(O, 1, 2)             # (nk, M, s', nu)
-        O_flat = merge_spin_centroid(O1, 2, 3)         # (nk, M, K)
-        psi_mun_flat = merge_spin_centroid(psi_mun, 1, 2)  # (nk, K, n)
-        T = plan1(O_flat, psi_mun_flat)                # (nk, M, n)
-        psi_nmu_flat = merge_spin_centroid(psi_nmu, 2, 3)  # (nk, m, K)
-        A = jnp.conj(psi_nmu_flat)
-        return plan2(A, T)                             # (nk, m, n)
-
-    if channels == "none":
-        def project(psi_nmu, O, psi_mun):
-            _check(psi_nmu, O, psi_mun)
-            return _project_one(psi_nmu, O, psi_mun)
-        return project
-
-    if channels != "split_reim":
-        raise ValueError(
-            f"_face_project_kernel: channels must be 'none' or "
-            f"'split_reim', got {channels!r}")
-
-    def project_split(psi_nmu, O, psi_mun):
-        _check(psi_nmu, O, psi_mun)
-        O_re = jnp.real(O).astype(jnp.complex128)
-        O_im = jnp.imag(O).astype(jnp.complex128)
-        S_R = _project_one(psi_nmu, O_re, psi_mun)
-        S_I = _project_one(psi_nmu, O_im, psi_mun)
-        return (S_R, S_I)
-
-    return project_split
+    return project
 
 
 def _axis_project_kernel(mesh_xy: Mesh, face_shape, axes, *,
