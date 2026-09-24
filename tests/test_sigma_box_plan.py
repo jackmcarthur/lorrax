@@ -999,8 +999,13 @@ def test_quadrature_deck_defaults_and_retired_sector_key(tmp_path):
             LorraxConfig.from_input_file(
                 str(deck), print_fn=lambda *_args, **_kwargs: None)
 
-    deck.write_text(_DECK + "mpa_sigma_sector_target_error = 1e-4\n")
-    with pytest.raises(ValueError, match="retired.*sigma_quadrature_eps"):
+    for key in ("mpa_sigma_sector_target_error", "mpa_sigma_max_nodes"):
+        deck.write_text(_DECK + f"{key} = 1e-4\n")
+        with pytest.raises(ValueError, match=f"{key} is retired.*sigma_quadrature_eps"):
+            LorraxConfig.from_input_file(
+                str(deck), print_fn=lambda *_args, **_kwargs: None)
+    deck.write_text(_DECK + "sigma_regularization_floor_ev = 0.01\n")
+    with pytest.raises(ValueError, match="sigma_regularization_floor_ev is retired"):
         LorraxConfig.from_input_file(
             str(deck), print_fn=lambda *_args, **_kwargs: None)
 

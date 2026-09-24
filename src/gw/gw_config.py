@@ -1790,10 +1790,6 @@ _DEFAULTS = {
     # replacing a fully-ready sample store or a finalized/certified pole fit.
     # This key authorizes replacement; it does NOT enable partial-store resume.
     "mpa_overwrite_completed_artifacts": False,
-    # Retired parser tombstone.  It remains recognized so old decks receive
-    # the precise refusal in LorraxConfig.from_input_file instead of an
-    # unknown-key warning; the box rule has no sector apportionment.
-    "mpa_sigma_sector_target_error": 6.5e-4,
     # The MPA Sigma box rule owns one accuracy target and one reduction-wall
     # budget.  Its immutable rules are cached under the run's tmp directory
     # by default; "off" disables caching and any other spelling is a path
@@ -2005,6 +2001,9 @@ _LEGACY_DECK_KEYS = frozenset({
     # Removed with the PPM-specific dynamic-Sigma executor.  GN/HL stores use
     # the same three box-rule controls and pair ceiling as MPA.
     "ppm_sigma_target_error",
+    "mpa_sigma_sector_target_error",   # refused (one box rule, no sectors)
+    "mpa_sigma_max_nodes",             # refused (no pair ceiling)
+    "sigma_regularization_floor_ev",   # refused (sigma_regularization_ev)
     "ppm_sigma_max_nodes",
     # 2026-08-14: host-tile accumulation is the only Σ(ω) accumulation
     # mode, so the key steered nothing.  The removed ``kij_stream`` VALUE
@@ -2527,23 +2526,6 @@ def _resolve_input_metal_policy(
             f"sys_dim = {int(params['sys_dim'])}.")
     _named_keys = frozenset(params.get(_DECK_NAMED_KEYS, ()))
     _effective_named_keys = set(_named_keys)
-    if "mpa_sigma_sector_target_error" in _named_keys:
-        raise ValueError(
-            "mpa_sigma_sector_target_error is retired: MPA Sigma now "
-            "uses one uniform denominator-box rule per product window "
-            "and has no measured-sector error apportionment. Remove the "
-            "key and use sigma_quadrature_eps (default 1e-4).")
-    if "mpa_sigma_max_nodes" in _named_keys:
-        raise ValueError(
-            "mpa_sigma_max_nodes is retired (2026-09-02): the pair "
-            "ceiling is eliminated and the box plan never refuses on "
-            "count. Remove the key; sigma_quadrature_eps is the only "
-            "accuracy dial.")
-    if "sigma_regularization_floor_ev" in _named_keys:
-        raise ValueError(
-            "sigma_regularization_floor_ev is retired (2026-09-02): "
-            "sigma_regularization_ev is the broadening every ansatz "
-            "runs at and nothing raises it. Remove the key.")
     if _bgw_q0_mode == "exact":
         _effective_named_keys.discard("bgw_metal_q0_treatment")
         if _bgw_q0_vector == _parse_bgw_metal_q0_vector(
@@ -3172,6 +3154,20 @@ def _report_early_retired_keys(
                 "deck alone and no longer of how loaded the machine was.  "
                 "Remove the key; sigma_quadrature_eps still sets the accuracy."
             )
+    for legacy_key, message in (
+            ("mpa_sigma_sector_target_error",
+             "MPA Sigma uses one uniform denominator-box rule per product "
+             "window and has no measured-sector error apportionment. Remove "
+             "the key and use sigma_quadrature_eps (default 1e-4)."),
+            ("mpa_sigma_max_nodes",
+             "the pair ceiling is gone and the box plan never refuses on "
+             "count. Remove the key; sigma_quadrature_eps is the only "
+             "accuracy dial."),
+            ("sigma_regularization_floor_ev",
+             "sigma_regularization_ev is the broadening every ansatz runs "
+             "at and nothing raises it. Remove the key.")):
+        if section.get(legacy_key, fallback=None) is not None:
+            raise ValueError(f"{legacy_key} is retired: {message}")
     for legacy_key in ("ppm_sigma_target_error", "ppm_sigma_max_nodes"):
         if section.get(legacy_key, fallback=None) is not None:
             raise ValueError(
