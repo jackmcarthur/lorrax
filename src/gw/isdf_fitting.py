@@ -207,7 +207,7 @@ class ZetaChannel(NamedTuple):
     L_q: object              # the whole-tile factor (B, C⁺ or LU)
     lu_piv: object           # the LU pivots ('lu' seam), else None
     solver_kind: str
-    zeta_io: object          # open SlabIO on ``output_file``, or None
+    write: bool              # write ``zeta_q_G`` into ``output_file``
     output_file: str
 
 
@@ -225,8 +225,8 @@ def _fit_mubatch(
     :class:`gw.gflat_memory_model.MuBatchPlan`; ``channels`` the
     :class:`ZetaChannel` list.  The channels share every stage of a batch but
     the k-convolution and the accumulate; each has its own Z store.  Writes
-    ``zeta_q_G`` into each open ``zeta_io`` G tile by G tile and returns
-    ``({μ_L: ZetaG}, n_batches_run, n_batches)``.
+    ``zeta_q_G`` into each channel's file G tile by G tile, one file at a
+    time, and returns ``({μ_L: ZetaG}, n_batches_run, n_batches)``.
     """
     from isdf import zeta_mubatch as zmb
     from common.wfn_transforms import psi_cylinder_tables
@@ -444,10 +444,22 @@ def _fit_mubatch(
             n_rmu_solve=n_rmu_solve, n_rmu=int(meta.n_rmu), mu_basis=mu_basis,
             ngk_per_q=ngk_per_q, gvec_components=gvec_components,
             path=ch.output_file, print_fn=print_fn)
-        if ch.zeta_io is not None:
+        if ch.write:
+            # ONE ζ file open at a time: the SlabIO writer is asynchronous
+            # and its writes are collective MPI-IO, so two handles with
+            # queued writes can reach MPI in different orders on different
+            # ranks and deadlock (CrI3 6x6 bispinor, three files open at
+            # once: rc 137 after 25 min in H5Fclose).  Open, write, close.
+            from file_io.slab_io import SlabIO
             t_w = time.perf_counter()
             with timing.section("zeta_fit.mubatch.write_zeta"):
-                zeta_g.write_file(ch.zeta_io, print_fn=print_fn)
+                with SlabIO(ch.output_file, mode='a', mesh=mesh_xy) as zeta_io:
+                    zeta_io.create_dataset(
+                        'zeta_q_G', shape=(Q, int(meta.n_rmu), ngkmax),
+                        dtype=np.complex128)
+                    zeta_g.write_file(zeta_io, print_fn=print_fn)
+                jax.experimental.multihost_utils.sync_global_devices(
+                    "zeta_writes_complete")
             print_fn(f"  μ-batch ζ file (μ_L={ch.vertex}) written in "
                      f"{time.perf_counter() - t_w:.2f}s")
         print_fn(store.receipt())
@@ -754,9 +766,8 @@ def fit_zeta_to_h5(
         # the inode collectively so H5Fcreate applies the Lustre striping
         # hints (a rank-0 h5py create took the directory default: 1 stripe,
         # one ROMIO aggregator at P>1, measured 2026-08-07); rank 0 then
-        # appends both header groups with mode='a', and the ζ dataset is
-        # appended through one reused SlabIO handle.
-        zeta_io = None
+        # appends both header groups with mode='a'.  The ζ dataset is appended
+        # after the loop, one file at a time (_fit_mubatch).
         if _write_file:
             path = output_files[v]
             _isdf_hdr = IsdfHeader.build(
@@ -772,12 +783,7 @@ def fit_zeta_to_h5(
                     write_isdf_header(path, _isdf_hdr, mode='a')
                 jax.experimental.multihost_utils.sync_global_devices(
                     "zeta_fit_headers_written")
-            with timing.section("zeta_fit.open_file"):
-                # (n_q_disk, n_rmu, ngkmax): WFN.h5 coeffs style, one q contiguous.
-                zeta_io = SlabIO(path, mode='a', mesh=mesh_xy)
-                zeta_io.create_dataset('zeta_q_G', shape=(n_q_disk, n_rmu, _gflat_ngkmax),
-                                       dtype=np.complex128)
-        channels.append(ZetaChannel(v, L_q, lu_piv, _kind, zeta_io, output_files[v]))
+        channels.append(ZetaChannel(v, L_q, lu_piv, _kind, _write_file, output_files[v]))
     del _face_gemm
     gc.collect()
 
@@ -807,14 +813,7 @@ def fit_zeta_to_h5(
                  f"({n_run} of {n_total} μ batches); ζ is PARTIAL"
                  + (" and its files are NOT marked complete." if _write_file else "."))
     for ch in channels:
-        if ch.zeta_io is None:
-            continue
-        with timing.section("zeta_fit.close_io"):
-            ch.zeta_io.close()
-        with timing.section("zeta_fit.sync_global"):
-            jax.experimental.multihost_utils.sync_global_devices(
-                "zeta_writes_complete")
-        if not _trunc and jax.process_index() == 0:
+        if ch.write and not _trunc and jax.process_index() == 0:
             from file_io.isdf_header import mark_zeta_done
             mark_zeta_done(ch.output_file)
     _track_peak_mb = 0
