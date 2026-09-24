@@ -83,8 +83,9 @@ one numpy block `(n_Gt, Q, n_batch, c, G_tile)` per local device (exact
 bytes, `Q·n_batch·c·N_G·16` per rank), or a slab_io scratch dataset
 `(n_Gt, Q, n_batch·b, G_tile)` when the host share does not hold it.  The
 host share is `0.8·MemAvailable` at plan time over the processes on the
-node, the minimum over processes; the ψ read's phdf5 staging is released
-before the store fills (`WfnLoader.release_read_staging`).  A G-tile read
+node, the minimum over processes; the ψ union read's phdf5 staging
+(`ctx->pinned_buf`, which the context's own large-read retirement does not
+cover) is released before the store fills (`WfnLoader.release_read_staging`).  A G-tile read
 is one contiguous host block per device and reaches the finalize layout
 (q-local for the local solve tier, G-split for the replicated one) with
 one all-to-all.  The μ axis is batch-slot order; reads gather the packed

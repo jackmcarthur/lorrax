@@ -483,11 +483,11 @@ def _vq_host_staging_bytes() -> float:
     """Per-rank host bytes one ζ q-tile read may stage, agreed across processes.
 
     The phdf5 read stages each rank's slab in its file context's host
-    buffer (``ctx->read_buf``, ``src/ffi/cpp/phdf5/context.cc``), which is
-    kept at the largest read until the context closes; the V tile releases
-    it when done (``ZetaLoader.release_read_staging``), so what a tile may
-    stage is 0.9 of the node's live ``MemAvailable`` over the processes
-    sharing the node.
+    buffer (``ctx->read_buf``, ``src/ffi/cpp/phdf5/read_ffi.cc``); the
+    context retires a buffer above 32 MiB once its H2D has completed
+    (3175fbbb), so the staging is transient and what one tile may stage is
+    0.9 of the node's live ``MemAvailable`` over the processes sharing the
+    node.
     """
     import socket
     import zlib
@@ -845,12 +845,6 @@ def _compute_V_q_g_flat_tiles(
                       f"(q {q0}..{q0 + qn - 1}): read={_t1 - _t0:.2f}s "
                       f"kernel={_t.perf_counter() - _t1:.2f}s "
                       f"({(_t.perf_counter() - _t1) / qn:.3f}s/q)", flush=True)
-        # The read contexts keep their largest tile staged on the host until the
-        # file closes, and the bispinor build holds four ζ loaders open across
-        # its V tiles; without this their staging accumulates (VI3 12x12 P16:
-        # host OOM-kill at the fourth file).  Collective, like the reads.
-        for ld in loaders:
-            ld.release_read_staging()
         if verbose and jax.process_index() == 0:
             print(f"    [{label}] {n_q_ibz} IBZ q in {n_tiles} tile(s): "
                   f"read={_read_total:.2f}s kernel={_kernel_total:.2f}s "

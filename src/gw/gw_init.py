@@ -2966,9 +2966,10 @@ def _prepare_fresh_parent_faces(
     			k_domain=sym.parent_k_domain, print_fn=print0)
     		parent_y, parent_x = _parent_psi.faces
     		chunks['parent_psi'] = _parent_psi._replace(faces=None)
-    		# The read phase is over: free the phdf5 context's host staging
-    		# (~ψ(G)/P per rank) before the fit's host Z store fills (VI3 12x12
-    		# P16 OOM, p4v_vi3_p16_whole).  Collective.
+    		# The read phase is over: free the union reader's host staging
+    		# (ctx->pinned_buf, ~ψ(G)/P per rank; the context's own retirement
+    		# covers only the synchronous read_buf) before the fit's host Z
+    		# store fills (VI3 12x12 P16 OOM, p4v_vi3_p16_whole).  Collective.
     		wfn.release_read_staging()
     		del _parent_psi
     	else:

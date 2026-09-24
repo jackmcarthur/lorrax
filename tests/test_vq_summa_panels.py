@@ -158,10 +158,6 @@ class _ArrayZetaLoader:
         self._zeta, self.gvec_components, self._mesh = zeta, gvec, mesh
         self.n_rmu = zeta.shape[1]
         self.reads = []
-        self.releases = 0
-
-    def release_read_staging(self):
-        self.releases += 1
 
     def read_zeta_G_slab(self, *, q_offset, q_count, mu_offset, mu_count,
                          mesh=None):
@@ -190,7 +186,6 @@ def test_budget_tiles_the_zeta_read_and_leaves_v_unchanged():
             sym=None, centroid_indices=None, is_charge_cc=True,
             write_g0=True, one_leg_action="scalar", timing_label="test",
             verbose=True, budget_bytes=budget)
-        assert loader.releases == 1                   # staging freed per V tile
         return np.asarray(V), np.asarray(g0), loader.reads
 
     V1, g01, reads1 = run(1e12)

@@ -315,23 +315,6 @@ class ZetaLoader:
             self._local_ds = None
         self._closed = True
 
-    def release_read_staging(self) -> None:
-        """Reopen the collective SlabIO handle, freeing its host read staging.
-
-        The phdf5 file context keeps its host read buffer at the size of the
-        largest read until that file closes (``ctx->read_buf``,
-        ``src/ffi/cpp/phdf5/context.cc``), so a loader held open across
-        several large read phases keeps its biggest one resident on the
-        host.  A caller that has finished a phase calls this; the next read
-        opens a fresh context.  COLLECTIVE: every process calls it at the
-        same point.  A no-op on a header-only or closed loader.
-        """
-        if self._slab_io is None:
-            return
-        self._slab_io.close()
-        self._slab_io = _slab_io_class()(self._path, mode=self._mode,
-                                         mesh=self._mesh)
-
     def __enter__(self) -> "ZetaLoader":
         return self
 

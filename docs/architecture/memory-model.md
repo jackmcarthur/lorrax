@@ -375,14 +375,15 @@ slots `symmetry_maps.isdf_one_leg_source_slots` names; 1 on a trivial star).
 Every term is ÷P except the replicated v row, which is per tile.
 
 The read also costs HOST memory: `host_per_q = 16·(μ_L [+ μ_R])·n_G/P` per
-q, staged in the phdf5 file context's `read_buf`, which stays at the largest
-read until the context closes.  The bispinor build holds four ζ loaders open
+q, staged in the phdf5 file context's `read_buf`, which until 3175fbbb stayed
+at the largest read until the context closed.  The bispinor build holds four ζ loaders open
 across seven V tiles: with whole-slab reads VI3 12x12 at P16 retained
 33.4 + 3·11.7 = 68.5 GB/rank (274 GB on a 263 GB four-rank node) and the step
 was OOM-killed on the host
-(`runs/runtime/vq_summa_20260923/bisp_new_try2_hostoom.log`).  Each V tile
-therefore ends with `ZetaLoader.release_read_staging()` on its loaders, and
-its q-tile also fits a live host budget.
+(`runs/runtime/vq_summa_20260923/bisp_new_try2_hostoom.log`).  The phdf5
+context now retires a synchronous read buffer above 32 MiB once its H2D copy
+completes (3175fbbb), so the staging is one live tile, and the q-tile also
+fits a live host budget.
 
 `_plan_vq_tiles` picks, in order: `g` = `vq_g_chunk_size` if positive (any
 width; a tail it does not divide is masked), else the largest width

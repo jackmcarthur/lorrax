@@ -503,12 +503,14 @@ class WfnLoader:
     def release_read_staging(self) -> None:
         """Close the collective SlabIO read handle, freeing its host staging.
 
-        The phdf5 file context keeps its host read buffer at the size of the
-        largest read until the file closes (``ctx->read_buf``,
-        ``src/ffi/cpp/phdf5/context.cc``); after a large read phase (the ψ(G)
-        k-chunk union reads) that buffer is ~ψ(G)/P per rank.  The next read
-        reopens the handle lazily.  COLLECTIVE: every process calls it at the
-        same point.  A no-op when no handle is open.
+        The ψ(G) k-chunk UNION reads stage through the file context's
+        writer-thread buffer (``ctx->pinned_buf``, ``src/ffi/cpp/phdf5/
+        read_ffi.cc``), which stays at the largest read until the context
+        closes: after the parent ψ(G) read that is ~ψ(G)/P per rank.  The
+        context's own retirement (3175fbbb) covers only the synchronous
+        ``read_buf``, so this close is still the owner of the union
+        staging.  The next read reopens the handle lazily.  COLLECTIVE: every
+        process calls it at the same point.  A no-op when no handle is open.
         """
         handle, self._slab_io = self._slab_io, None
         if handle is not None:
