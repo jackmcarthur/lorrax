@@ -25,8 +25,8 @@ buffers complex128 (16 B).
 | stage | `linalg = local` | `linalg = distributed` |
 |---|---|---|
 | ζ CCT `C_q` build | always 2-D sharded, `P(None,'x','y')`: `Q·μ²/P` | same |
-| ζ charge factor (`rank_truncate`) | replicated whole-tile eigh pseudo-inverse, one q-batch at a time under `LORRAX_ZETA_REPLICATE_CAP_GIB`; q-parallel above `Q·μ³ ≥ 5e9`, compute `ceil(Q/P)·μ³` per rank | distributed eigensolver, truncation on the replicated spectrum, `C⁺` kept 2-D sharded: `Q·μ²/P` stored, compute `Q·μ³/P`-class |
-| ζ back-solve (per tile) | at or below `LORRAX_ZETA_GATHER_CAP_GIB` the small factor stack may be gathered (`Q·μ²·16` B per rank per tile); above it each factor stays on its q owner and only the RHS moves, `2·ceil(Q/P)·μ·R·16` B | one stacked GEMM `C⁺·Z` with both operands 2-D sharded; received bytes `Q·(μ²/P_x + μ·R/P_y)·16` per tile |
+| ζ charge factor (`rank_truncate`) | replicated whole-tile eigh pseudo-inverse, one q-batch at a time under `LORRAX_ZETA_REPLICATE_CAP_GIB`; q-parallel above `Q·μ³ ≥ 5e9`, compute `ceil(Q/P)·μ³` per rank | same: route G applies the whole-tile factor on each G tile |
+| ζ back-solve (per tile) | at or below `LORRAX_ZETA_GATHER_CAP_GIB` the small factor stack may be gathered (`Q·μ²·16` B per rank per tile); above it each factor stays on its q owner and only the RHS moves, `2·ceil(Q/P)·μ·R·16` B | same |
 | ζ transverse factor (ridge LU) | `lax.linalg.lu` once per q and channel, `lu_solve` per tile; or the batch-reshard route (below) | `distrib_la.factor('solve_lu')`: one batched `getrf` into a 2-D-sharded `FactorToken`, `solve(token, Z_q)` runs `getrs` per tile |
 | ζ `Z_q` build and G-flat write | always sharded; SlabIO collective hyperslab writes, no gather | same |
 | W Dyson solve (`gw/w_isdf`) | q-parallel per-q dense LU: `ceil(Q/P)` whole `(μ, μ)` tiles per rank | `plan('solve_lu', backend='distributed').batched`: `Q·μ²/P`, μ axes never leave `P(None,'x','y')` |
@@ -49,16 +49,13 @@ distributed) and the coupled μ1–3 live set are specified with their capacity
 equations in the [memory model](../architecture/memory-model.md#transverse-ridge-solve-routes);
 their schedule is in [Face-ψ ζ fitting](../architecture/zeta_fit_face_psi_cct.md#coupled-current-schedule).
 
-## Where the crossover is
+## Where the ζ factor saturates
 
-The local charge factor's only parallel axis is q, so it saturates at
-`P = Q`: every rank past `Q` idles for the whole factor stage, and the run
-announces this whenever `P > Q`. The wall-time crossover between the plans is
-therefore set by `P/Q`, not by μ alone. On MoS₂ 4×4 (μ ≈ 3000–4800, Q = 10) the
-distributed factor is 2.1× slower than the q-parallel local factor at
-`P/Q = 1.6` and 1.6× faster at `P/Q = 6.4`. The distributed plan relieves
-per-rank peak memory only when the replicated `(Q, μ, μ)` gather is the
-binding allocation; a memory claim for it must name the binder it removes.
+The charge factor's only parallel axis is q, so it saturates at `P = Q`:
+every rank past `Q` idles for the whole factor stage, and the run announces
+this whenever `P > Q`. There is no distributed charge factor; `linalg =
+distributed` distributes the W Dyson solve, the transverse LU and the
+eigensolves.
 
 ## Thresholds
 
@@ -67,7 +64,7 @@ binding allocation; a memory claim for it must name the binder it removes.
 | `_QPARALLEL_MIN_NQ_MU3` (module constant; `LORRAX_ZETA_QPARALLEL` overrides) | 5e9 | the replicated charge factor executes q-parallel above it; below, two staged reshards and one compile outweigh the saving |
 | `LORRAX_ZETA_GATHER_CAP_GIB` | 4 | the local back-solve's gather-versus-resident boundary (data movement only; numerically free) |
 | `LORRAX_ZETA_REPLICATE_CAP_GIB` | 4 | whether the rank-truncating factor may run replicated at all; per q-batch, so μ ≤ `sqrt(cap/16)` |
-| `LORRAX_COLLECTIVE_CHUNK_MB` | 128 | payload of one emitted collective in the distributed tier (host-level q-block loop XLA cannot re-fuse); a single q whose collective exceeds it is sent whole with a warning |
+| `LORRAX_COLLECTIVE_CHUNK_MB` | 128 | payload of one emitted collective in the distributed W Dyson A-build (host-level q-block loop XLA cannot re-fuse); a single q whose collective exceeds it is sent whole with a warning |
 
 Spellings and grammar: [env_vars.md](env_vars.md). The ScaLAPACK
 workspace and MKL-thread behaviour: [linalg_ffi.md](linalg_ffi.md#inside-the-scalapack-handlers).
