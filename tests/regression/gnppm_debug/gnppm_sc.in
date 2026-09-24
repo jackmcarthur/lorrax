@@ -30,7 +30,7 @@
 # leaves gnppm_debug, whose 399-centroid set IS orbit-closed.
 #
 # rCROP, BECAUSE IT IS THE ONLY ACCELERATOR A DECK MAY NAME (owner
-# 2026-09-16; GATE sc_accelerator_rcrop_only).  This deck ran
+# 2026-09-16; GATE sc_accelerator_rcrop_only, now sc_accelerator_anderson_only after rCROP was retired 2026-09-24).  This deck ran
 # `sc_accelerator = linear` with `sc_mixing = 1` until then, because that
 # makes the iteration exactly `x_{n+1} = F(x_n)` and F is k-set invariant,
 # so the `sc_on_ibz` on/off arms agreed to 1e-6 meV -- the `%15.9f` print
@@ -63,7 +63,7 @@ bispinor = false
 qp_solver = self_consistent
 sc_max_iter = 2
 sc_tol_ev = 1.0e-3
-sc_accelerator = rcrop
+sc_accelerator = anderson
 use_ppm_sigma = true
 screening_method = minimax
 ppm_omega_p = 2.0

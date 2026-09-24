@@ -315,13 +315,13 @@ def test_the_threshold_moves_with_the_device_budget():
 def test_a_bad_sc_eigh_value_is_refused_at_config_parse():
     from gw.gw_config import SCConfig
     with pytest.raises(ValueError, match="sc_eigh must be"):
-        SCConfig(max_iter=3, tol_ev=1e-4, accelerator="rcrop",
+        SCConfig(max_iter=3, tol_ev=1e-4, accelerator="anderson",
                  history_depth=5, mixing=1.0, dump_dir=None, eigh="nope")
 
 
 def test_sc_eigh_defaults_to_auto():
     from gw.gw_config import SCConfig
-    sc = SCConfig(max_iter=3, tol_ev=1e-4, accelerator="rcrop",
+    sc = SCConfig(max_iter=3, tol_ev=1e-4, accelerator="anderson",
                   history_depth=5, mixing=1.0, dump_dir=None)
     assert sc.eigh == "auto"
 

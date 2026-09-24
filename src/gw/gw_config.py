@@ -1404,10 +1404,15 @@ _DEFAULTS = {
     # that is still contracting.
     "sc_max_iter": 30,
     "sc_tol_ev": 1.0e-4,
-    # rcrop is the ONLY supported value; `linear` refuses by name at
-    # ``SCConfig.__post_init__`` (GATE sc_accelerator_rcrop_only).
-    "sc_accelerator": "rcrop",
-    "sc_history_depth": 5,       # rCROP history depth
+    # anderson is the ONLY supported value; `linear` and the retired
+    # `rcrop` refuse by name at ``SCConfig.__post_init__`` (GATE
+    # sc_accelerator_anderson_only).
+    "sc_accelerator": "anderson",
+    # Anderson history depth.  20, not BGW's 5: with fewer entries than the
+    # map has independent stiff directions Anderson stalls (claim 2679); the
+    # conditioning filter drops dependent columns, so depth costs only
+    # memory, 2(m+1) copies of the (nk, nb, nb) carry over the mesh.
+    "sc_history_depth": 20,
     # Linear-mixing α.  Read only by the diagnostic
     # ``sc_iteration._run_linear_mixing``, which no deck can now select, so
     # this key changes nothing in a deck; it is retained for that path's
@@ -4318,7 +4323,7 @@ class SCConfig:
     """Self-consistency loop knobs (read only when qp_solver=self_consistent); see docs/architecture/decisions.md."""
     max_iter: int
     tol_ev: float
-    accelerator: str      # "rcrop" — the only supported value
+    accelerator: str      # "anderson" — the only supported value
     history_depth: int
     mixing: float
     dump_dir: str | None
@@ -4341,17 +4346,30 @@ class SCConfig:
             raise ValueError("sc_max_iter must be >= 1.")
         if self.tol_ev <= 0.0:
             raise ValueError("sc_tol_ev must be > 0.")
-        if self.accelerator != "rcrop":
+        if self.accelerator == "rcrop":
             raise ValueError(
-                "GATE sc_accelerator_rcrop_only: rcrop is the only "
+                "GATE sc_accelerator_anderson_only: rCROP was retired on "
+                "2026-09-24.\n"
+                "  got:  sc_accelerator = 'rcrop'\n"
+                "  want: sc_accelerator = 'anderson' (the default)\n"
+                "  fix:  delete the key\n"
+                "  why:  rCROP evaluated the GW map twice per iteration; the "
+                "second evaluation re-derives the residual its linear model "
+                "already predicts.  One-evaluation Anderson keeps the same "
+                "CROP/Anderson family at fewer maps (CrI3 8x8: 13 vs 21; sandbox claims 2677, 2678, 2686).\n"
+                "  doc:  docs/self_consistency.md")
+        if self.accelerator != "anderson":
+            raise ValueError(
+                "GATE sc_accelerator_anderson_only: anderson is the only "
                 "supported self-consistency accelerator.\n"
                 f"  got:  sc_accelerator = {self.accelerator!r}\n"
-                "  want: sc_accelerator = 'rcrop' (the default)\n"
-                "  fix:  delete the key, or set it to 'rcrop'\n"
+                "  want: sc_accelerator = 'anderson' (the default)\n"
+                "  fix:  delete the key\n"
                 "  why:  undamped linear self-consistency amplifies the "
                 "input's ~4e-10 time-reversal-reality error 6-8x per map "
                 "and refuses at map 3 on scalar Si, damping makes it worse "
-                "(sc_mixing 0.5 refuses at map 2, 0.3 at map 1), and rCROP "
+                "(sc_mixing 0.5 refuses at map 2, 0.3 at map 1), and the "
+                "accelerated loop "
                 "holds that floor 450x lower over ten maps.\n"
                 "  doc:  docs/self_consistency.md; claim 2391")
         if self.history_depth < 1:

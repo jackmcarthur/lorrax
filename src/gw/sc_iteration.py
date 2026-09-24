@@ -103,6 +103,9 @@ class ConvergenceVerdict:
     worst_k: int
     worst_band: int
     cutoff_ev: float
+    #: The stall rule fired (label-free residual flat over two history
+    #: turnovers).  Always paired with converged=False.
+    stalled: bool = False
 
     def summary(self) -> str:
         """The log line.  Says which number is the test and which is not."""
@@ -113,7 +116,7 @@ class ConvergenceVerdict:
             f"RMS_nonscissored = {self.rms_protected_ev:.6f} eV, "
             f"RMS_all({self.n_total}) = {self.rms_all_ev:.6f} eV "
             f"(diagnostics, NOT the criterion) | "
-            f"{'CONVERGED' if self.converged else 'not converged'}")
+            f"{'CONVERGED' if self.converged else ('STALLED at floor, not converged' if self.stalled else 'not converged')}")
 
 
 @dataclass(frozen=True)
@@ -302,9 +305,9 @@ def protected_band_convergence(
 
 
 class _Converged(Exception):
-    """Internal: stop the rCROP solve because the criterion was met.
+    """Internal: stop the accelerated solve (criterion met, or stalled).
 
-    rCROP's loop has no convergence callback, and the criterion is an
+    The solver loop has no convergence callback, and the criterion is an
     L-infinity norm on EIGENVALUES (eV) rather than anything the solver
     can express, so it is signalled out of ``residual_fn``.  Carries the
     state so the caller need not reconstruct it.
@@ -2091,7 +2094,7 @@ def _rotate_to_dft_basis(O_qp: jax.Array, U: jax.Array, *,
     the (nk, nb, nb) intermediate is sharded too.
 
     ONLY THE RESULT IS PINNED REPLICATED, and it has to be: the SC carry
-    is ``kin_ion + this``, and ``_run_rcrop``, ``_run_linear_mixing`` and
+    is ``kin_ion + this``, and ``_run_anderson``, ``_run_linear_mixing`` and
     ``_scissor_E_qp_for_outofrange`` all read the carry back on the host,
     which raises the non-addressable-devices error on a sharded array at
     P>1.  ``O_qp`` arrives replicated from ``compute_sigma_xc`` for the
@@ -3142,7 +3145,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     # ENTRY-SOLVED metallic occupations: one MP1 state per map CALL, from
     # the spectrum of the H actually being mapped.  This makes the
     # iteration a genuine self-map F(H) = Sigma[H, occ(H)] — the contract
-    # _run_rcrop's own header states ("gw_iteration_map reads
+    # the SC driver's header states ("gw_iteration_map reads
     # state.iteration and state.H_qp_dft and nothing else") and the one
     # rCROP's trial/accept trajectory requires: every F(H) evaluation,
     # trial or accepted, gets occupations consistent with ITS H by
@@ -5066,8 +5069,7 @@ def _write_sc_eqp_snapshot(
     tail_fit = state_out.outputs.tail_scissor_fit
     comments = [
         f"SC map={int(call_index):04d} role={role}; columns are "
-        "E_DFT reference and eigvalsh(F(H_in)) map output; rCROP trial "
-        "outputs are not accepted iterates",
+        "E_DFT reference and eigvalsh(F(H_in)) map output",
         # THE CRITERION, FIRST, AND NAMED AS SUCH.  Output against this
         # call's OWN input, over the non-scissored set: the pair the driver
         # stops on.  It is stamped max-abs-first because max-abs is the
@@ -5252,8 +5254,8 @@ def run_self_consistency(
     *,
     max_iter: int = 1,
     tol_ev: float = 1.0e-4,
-    accelerator: str = "rcrop",
-    history_depth: int = 5,
+    accelerator: str = "anderson",
+    history_depth: int = 20,
     mixing: float = 1.0,
 ) -> tuple[SCState, list[float]]:
     """Iterate ``gw_iteration_map`` until ``max_iter`` or RMS ΔE < ``tol_ev``.
@@ -5266,11 +5268,12 @@ def run_self_consistency(
     Parameters
     ----------
     accelerator
-        ``"rcrop"`` (default, and the only value a DECK can select —
+        ``"anderson"`` (default, and the only value a DECK can select —
         ``gw_config.SCConfig`` refuses every other spelling through GATE
-        ``sc_accelerator_rcrop_only``) — Anderson-style restart-CROP
-        acceleration from :mod:`mixing.acceleration`.  Order
-        ``history_depth``.  Required for QSGW on dense band manifolds:
+        ``sc_accelerator_anderson_only``) — one-evaluation Anderson type II
+        (:func:`mixing.acceleration.anderson_nojit`, which replaced the
+        two-evaluation rCROP on 2026-09-24).  Order ``history_depth``.
+        Required for QSGW on dense band manifolds:
         the Jacobian's cycle-direction eigenvalue is typically ≲ −3 for
         systems with many bands near the gap (PPM ω-grid stiffness),
         which means a plain fixed-point hits a 2-cycle and even α=0.5
@@ -5281,8 +5284,10 @@ def run_self_consistency(
         undamped it amplifies the input's time-reversal-reality error
         6-8x per map (claim 2391), which is why no deck may ask for it.
     history_depth
-        rCROP history depth (only used when ``accelerator="rcrop"``).
-        ``m=5`` is BGW's QSGW default.
+        Anderson history depth (only used when ``accelerator="anderson"``).
+        20 by default: with fewer entries than the map has stiff
+        directions Anderson stalls, and the conditioning filter makes
+        depth cost memory only.
     mixing
         Linear damping coefficient when ``accelerator="linear"``.
 
@@ -5328,8 +5333,8 @@ def run_self_consistency(
         _record_sc(inputs, f"    SC convergence: {verdict.summary()}")
         return state_new, []
 
-    if accelerator == "rcrop":
-        return _run_rcrop(
+    if accelerator == "anderson":
+        return _run_anderson(
             state_init, inputs,
             max_iter=max_iter, tol_ev=tol_ev,
             history_depth=history_depth,
@@ -5347,7 +5352,7 @@ def run_self_consistency(
         )
     raise ValueError(
         f"run_self_consistency: unknown accelerator={accelerator!r} "
-        f"(expected 'rcrop' or 'linear').")
+        f"(expected 'anderson' or 'linear').")
 
 
 def _run_linear_mixing(
@@ -5380,7 +5385,7 @@ def _run_linear_mixing(
     last_evaluated: SCState | None = None
     for it in range(max_iter):
         # DROP ITERATION i-1's SigmaResult BEFORE BUILDING ITERATION i's.
-        # See the note in ``_run_rcrop.residual_fn``; the shape is the
+        # See the note in ``_run_anderson.residual_fn``; the shape is the
         # same here — ``state`` is both the loop carry and the argument
         # to the map, so without this rebind both generations of the
         # ω-cube are live for the whole of ``gw_iteration_map``.  The
@@ -5498,57 +5503,62 @@ def _run_linear_mixing(
     return last_evaluated, rms_history
 
 
-def _run_rcrop(
+def _run_anderson(
     state_init: SCState, inputs: SCInputs, *,
     max_iter: int, tol_ev: float, history_depth: int,
     eigvalsh_kshard, print_fn, dump_dir,
 ) -> tuple[SCState, list[float]]:
-    """rCROP (Anderson-style) accelerated fixed point.
+    """One-evaluation Anderson (Pulay) accelerated QSGW fixed point.
 
-    Wraps :func:`mixing.acceleration.rcrop_nojit` around the iteration
-    map.  rCROP makes **two** ``gw_iteration_map`` calls per
-    rCROP-iteration (one for the trial step, one for the
-    real-residual evaluation); ``max_iter`` here is the rCROP iteration
-    count, not the underlying pipeline call count.
+    Wraps :func:`mixing.acceleration.anderson_nojit` around the iteration
+    map: ONE ``gw_iteration_map`` call per iteration, at the extrapolated
+    point, and every evaluated (H, F(H) - H) pair enters the history.  This
+    replaced rCROP (2026-09-24), which evaluated the map twice per iteration
+    -- a probe at x + f and a real-residual re-evaluation at the optimal
+    point that, for an affine map, returns exactly the residual the linear
+    model already predicts (Wan & Miedlar 2024).  ``max_iter`` is the number
+    of accelerated evaluations after map 0.
 
-    Convergence tolerance is converted from per-band RMS ΔE (eV) to a
-    L2-norm-of-residual on H (Ry) the rCROP solver expects::
+    The map is a pure function of H (bitwise re-evaluation, claim 2678), so
+    every pair is valid secant data.  A discrete map event (a Sigma rule
+    rebuild or sampled-grid growth, read from
+    ``inputs.fixed_quadrature_session``) is logged but does not restart the
+    history: early maps grow the grid on every call, and restarting there
+    reduced the method to divergent Picard steps.
 
-        ‖H_new − H_old‖_2 / √(nk · nb²) ≈ RMS-per-element ≈ RMS ΔE / RYD_TO_EV
+    THE STOP RULES.  CONVERGED when the criterion (max|dE| over the
+    non-scissored identities, F(H) against H) is below ``tol_ev``.
+    STALLED -- never reported as converged -- when the label-free residual
+    max_k ||P f_k P||_2 (P = the metric block; it bounds every sorted
+    eigenvalue residual by Weyl and also sees eigenvector error) has not
+    improved by 10% over the last 2(m+1) evaluations, i.e. over two full
+    turnovers of the history, after which the accelerator holds no new
+    secant information.  Both counts are fixed, not deck keys.
 
-    RESIDENCY BUDGET, because it is the number that decides the deck size.
-    The solver holds 2·``history_depth`` copies of the carry plus a window
-    of 2·(m+1).  With m = 5, complex128, at the production shape nk=144,
-    nb=2000 (one copy = 9.22 GB)::
-
-        Xhist + Fhist   2·m·nk·nb²·16 B        92.2 GB  whole solve
-        Xw + Fw         2·(m+1)·nk·nb²·16 B   110.6 GB  per iteration
-
-    The history entries keep the carry's own (nk, nb, nb) shape at
-    ``qsgw_density.band_rotation_spec`` — bra band on 'x', ket band on 'y',
-    k replicated — stacked on a LEADING history axis that is never sharded.
-    Per rank that is the above over ``mesh.size``.  ``nk`` is the LOOP's
-    k-set, so under ``sc_on_ibz`` it is the IBZ: measured n = 163840
-    (nk=10) against 262144 (nk=16) on mos2_4x4, job 7889876.
+    RESIDENCY BUDGET.  The solver holds 2(m+1) copies of the carry (history
+    plus the newest pair) and a transient window of the same size.  One copy
+    is nk*nb^2*16 B: 21 MB on CrI3 8x8 (144 bands), 33 MB on VI3 12x12 (120
+    bands), 9.22 GB at nk=144, nb=2000, where m = 20 is 387 GB global,
+    3.9 GB per rank at P100.  Entries keep the
+    carry's (nk, nb, nb) shape at ``qsgw_density.band_rotation_spec`` --
+    bra band on 'x', ket band on 'y', k replicated -- stacked on a LEADING
+    history axis that is never sharded.  ``nk`` is the loop's k-set.
 
     The accelerator's only collective is one (m+1, m+1) Gram; the update is
-    an elementwise combination over the history axis.  What is NOT free is
-    the seam here: ``gw_iteration_map`` needs a REPLICATED carry (it adds a
-    replicated ``kin_ion_dft`` and, at iteration 0, reads the carry on the
-    host to test exact diagonality), so ``residual_fn`` gathers one
-    (nk, nb, nb) per call and reshards the residual back.  Distributing the
-    carry itself is a separate change and needs that iteration-0 readback
-    (:628) and ``kin_ion``'s replicated load to move first.
+    an elementwise combination over the history axis.  The seam here is
+    not free: ``gw_iteration_map`` needs a REPLICATED carry, so
+    ``residual_fn`` gathers one (nk, nb, nb) per call and reshards the
+    residual back.
     """
-    from mixing.acceleration import rcrop_nojit
+    from mixing.acceleration import anderson_nojit
 
     H0 = state_init.H_qp_dft
     nk, nb, _ = H0.shape
     n_elem = nk * nb * nb
     mesh = inputs.mesh_xy
     print_fn(
-        f"  SC rCROP: history_depth={history_depth}, "
-        f"max_iter={max_iter}, tol={tol_ev:.1e} eV/band-RMS")
+        f"  SC Anderson (one map per iteration): history_depth={history_depth}, "
+        f"max_iter={max_iter}, tol={tol_ev:.1e} eV")
     # PAD, DO NOT DEGRADE.  ``band_rotation_spec`` puts the two band axes
     # on the two mesh axes, so it needs px | nb and py | nb — the same
     # condition every other user of that spec is under.  What used to be
@@ -5631,7 +5641,7 @@ def _run_rcrop(
     # silent no-op.
     local_b = sum(sh.data.nbytes for sh in x0.addressable_shards)
     print_fn(
-        f"  SC rCROP residency: carry {tuple(H0.shape)} (nk={nk} on the "
+        f"  SC Anderson residency: carry {tuple(H0.shape)} (nk={nk} on the "
         f"loop's k-set), n={n_elem} logical, mesh {px}x{py}; bands "
         f"{nb}→{nb_pad} (band divisor {band_div}, "
         f"+{100.0 * ((float(nb_pad) / nb) ** 2 - 1.0):.2f}% elements); entry "
@@ -5665,6 +5675,25 @@ def _run_rcrop(
     _gain_previous: list[tuple[np.ndarray, np.ndarray] | None] = [None]
     _identity_history = {}
     _frozen_fits: list = [getattr(state_init, "frozen_scissor_fits", None)]
+    _map_event: list = [False]
+    _floor_history: list[float] = []
+
+    def _event_key():
+        """Discrete map-changing state: sampled grid, rule rebuild counts."""
+        sess = inputs.fixed_quadrature_session
+        if sess is None:
+            return None
+        counts = []
+
+        def walk(d):
+            for k in sorted(d, key=repr):
+                v = d[k]
+                if k in ("rebuild_count", "epoch", "material_class"):
+                    counts.append((k, repr(v)))
+                elif isinstance(v, dict):
+                    walk(v)
+        walk(sess)
+        return (tuple(sess.get("omega_grid_ev", ())), tuple(counts))
 
     def residual_fn(H_in: jnp.ndarray) -> jnp.ndarray:
         # SHARDED IN, REPLICATED CARRY, SHARDED OUT.  The gather is one
@@ -5672,7 +5701,7 @@ def _run_rcrop(
         # carry; the residual goes straight back to the entry layout, so the
         # history never holds a replicated copy.
         H = _to_carry(H_in)
-        # rCROP's mixing combinations don't preserve Hermitisation
+        # The mixing combinations don't preserve Hermitisation
         # exactly (numeric drift); re-Hermitise before feeding the
         # iteration map so eigh stays well-defined.
         H = 0.5 * (H + jnp.conj(jnp.swapaxes(H, -1, -2)))
@@ -5699,7 +5728,12 @@ def _run_rcrop(
             head_surface_weight_kn=_head_surface_weight[0],
             frozen_scissor_fits=_frozen_fits[0],
         )
+        _key_before = _event_key()
         state_out = gw_iteration_map(state_in, inputs)
+        _map_event[0] = (_iter_idx[0] > 0 and _event_key() != _key_before)
+        if _map_event[0]:
+            _record_sc(inputs, f"    SC map event at call {_iter_idx[0]}: "
+                               "sampled grid or Sigma rule set changed")
         _last_outputs[0] = state_out.outputs
         if _frozen_fits[0] is None:
             _frozen_fits[0] = _capture_frozen_scissor_fits(state_out.outputs)
@@ -5732,15 +5766,14 @@ def _run_rcrop(
             float(np.sqrt(np.mean((E_new - _e_history[-3]) ** 2)))
             if len(_e_history) >= 3 else float("nan"))
         print_fn(
-            f"  SC rCROP call {len(rms_history)}: "
+            f"  SC map call {len(rms_history)}: "
             f"RMS ΔE_{{k,k-1}} = {rms:.6f} eV, "
             f"ΔE_{{k,k-2}} = {rms2:.6f} eV"
         )
         call_index = _iter_idx[0]
 
         def _role_of(idx):
-            return ("initial" if idx == 0 else
-                    "trial" if idx % 2 else "accepted_input_map")
+            return "initial" if idx == 0 else "accepted_input_map"
 
         role = _role_of(call_index)
         map_gain, _gain_previous[0] = _sc_map_gain_for_call(
@@ -5762,12 +5795,39 @@ def _run_rcrop(
             map_gain=map_gain,
         )
         _record_sc(inputs, f"    SC convergence: {_verdict.summary()}")
+        # LABEL-FREE MATRIX RESIDUAL.  The per-k spectral norm bounds every
+        # sorted-eigenvalue residual (Weyl) and also sees eigenvector
+        # (off-diagonal) error, so identity relabelling of hybridized pairs
+        # cannot move it; Frobenius is what the accelerator's Gram
+        # minimizes.  Protected block = the metric mask.
+        from common.collectives import gather_to_host as _gth
+        _fh = (np.asarray(_gth(state_out.H_qp_dft))
+               - np.asarray(_gth(H))) * RYD_TO_EV * 1e3
+        _pm = _metric_np[:, :nb, :nb] > 0
+        _fp = np.where(_pm, _fh, 0.0)
+        _spec = np.abs(np.linalg.eigvalsh(
+            0.5 * (_fp + np.conj(np.swapaxes(_fp, -1, -2))))).max()
+        _record_sc(inputs, f"    SC matrix residual: call={call_index} "
+                           f"max_k ||f_k||_2 = {_spec:.6e} meV; ||f||_F = "
+                           f"{np.linalg.norm(_fp):.6e} meV (protected block)")
         _iter_idx[0] += 1
-        # Non-trial calls only: there the INPUT is the accepted iterate
-        # (rcrop_nojit's ``f_new = residual_fn(x_new)``), so this is the
-        # residual AT the iterate the loop would return.  A trial call's
-        # residual is the residual at a probe point -- a diagnostic.
-        if role != "trial" and _verdict.converged:
+        if call_index > 0:
+            _floor_history.append(float(_spec))
+        _stall_window = 2 * (history_depth + 1)
+        _stalled = (
+            not _verdict.converged
+            and len(_floor_history) > _stall_window
+            and min(_floor_history[-_stall_window:])
+            > 0.9 * min(_floor_history[:-_stall_window]))
+        if _stalled:
+            _verdict = replace(_verdict, stalled=True)
+            _last_verdict[0] = _verdict
+            _record_sc(inputs, f"    SC STALLED at floor: max_k ||P f_k P||_2 = "
+                               f"{min(_floor_history):.6e} meV has not improved by 10% in "
+                               f"{_stall_window} maps; NOT converged")
+        # Every call's input is an accelerated iterate, so this is the
+        # residual AT the iterate the loop would return.
+        if _verdict.converged or _stalled:
             raise _Converged(
                 SCState(H_qp_dft=H,
                         iteration=_iter_idx[0],
@@ -5780,7 +5840,7 @@ def _run_rcrop(
                 _verdict)
         return _to_entry(state_out.H_qp_dft - H)
 
-    # rCROP HAS NO STOPPING AUTHORITY.  ``tol=0.0`` below is not a
+    # THE SOLVER HAS NO STOPPING AUTHORITY.  ``tol=0.0`` below is not a
     # disarmed threshold; it is the statement that this solver's job is
     # to ACCELERATE and the caller's is to decide convergence, using the
     # exact L-infinity eigenvalue test.  That test is free: the map
@@ -5831,47 +5891,47 @@ def _run_rcrop(
         np.asarray(_init_partition.protected_mask, bool)
         | np.asarray(_init_partition.in_range_mask, bool), (int(x0.shape[0]), nb))
     _nbp = int(x0.shape[-1])
-    # rcrop_nojit consumes this caller-owned array at each weighting call.
+    # anderson_nojit consumes this caller-owned array at each weighting call.
     # Refresh it after classification; the same current identity block then
     # weights every history entry in that solve. Padded entries stay zero.
     _metric_np = np.zeros((int(x0.shape[0]), _nbp, _nbp), dtype=np.float64)
     _metric_np[:, :nb, :nb] = _fit_mask[:, :, None] * _fit_mask[:, None, :]
     print_fn(
-        "  SC rCROP metric: Gram over the per-k non-scissored DFT identity "
+        "  SC Anderson metric: Gram over the per-k non-scissored DFT identity "
         "block; masks refreshed after each map, scissored rows follow the map")
     try:
-        result = rcrop_nojit(
+        result = anderson_nojit(
             residual_fn,
             # THE CARRY ITSELF, not a flattened copy of it.
             x0,
             m=history_depth,
             maxit=max_iter,
-            tol=0.0,   # see above: rCROP does not decide convergence
-            print_fn=None,  # we print our own RMS-ΔE history above
+            tol=0.0,   # the driver's criterion decides convergence, not ||f||
+            print_fn=lambda line: _record_sc(inputs, line),
             entry_sharding=entry_sh,
             metric=_metric_np,
         )
     except _Converged as stop:
-        # The criterion fired inside the map.  Return the accepted
+        # The criterion (or the stall rule) fired inside the map.  Return the accepted
         # map INPUT that met it, NOT F(input) and not rCROP's stale internal
         # x: only this input was accepted and evaluated with the SCOutputs
         # retained for the writers.  The pad-inertness check below reads the
         # final x, which this path never reaches -- say so rather than
         # skip it silently.
         print_fn(
-            f"  SC rCROP stopped by the convergence criterion after "
-            f"{_iter_idx[0]} map calls: {stop.verdict.summary()}")
+            f"  SC {'STALLED' if stop.verdict.stalled else 'stopped by the convergence criterion'} "
+            f"after {_iter_idx[0]} map calls: {stop.verdict.summary()}")
         print_fn(
-            "  SC rCROP pad inertness: NOT CHECKED (early stop -- the "
+            "  SC pad inertness: NOT CHECKED (early stop -- the "
             "check reads the solver's final x, not reached on this path)")
         _maybe_dump_e_history(dump_dir, _e_history, print_fn)
         return stop.state, rms_history
 
     print_fn(
-        f"  SC rCROP done: {result.iterations} iterations WITHOUT meeting "
+        f"  SC Anderson done: {result.iterations} iterations WITHOUT meeting "
         f"the {tol_ev:.3e} eV criterion (budget exhausted), final "
         f"‖residual‖₂ = {float(result.residual_norms[-1]):.4e} Ry -- a "
-        f"DIAGNOSTIC: rCROP has no stopping rule of its own")
+        f"DIAGNOSTIC: the solver has no stopping rule of its own")
 
     # INERTNESS, CHECKED — a DIFFERENT claim from the parity one at the top
     # of this function, and this pair has been measured to come apart: the
@@ -5886,7 +5946,7 @@ def _run_rcrop(
             float(jnp.max(jnp.abs(result.x[:, nb:, :]))),
             float(jnp.max(jnp.abs(result.x[:, :, nb:]))))
         print_fn(
-            f"  SC rCROP pad inertness: {nb_pad - nb} pad bands per axis, "
+            f"  SC pad inertness: {nb_pad - nb} pad bands per axis, "
             f"max|H| over the pad zone = {pad_max:.3e} "
             f"(exactly 0.0: {pad_max == 0.0})")
 
@@ -5899,7 +5959,7 @@ def _run_rcrop(
     # the h5 writers) reads it back on the host.
     H_final = _last_input_H[0]
     if H_final is None or _last_verdict[0] is None:
-        raise RuntimeError("rCROP completed without an evaluated SC map")
+        raise RuntimeError("SC Anderson completed without an evaluated SC map")
     state_final = SCState(
         H_qp_dft=H_final,
         iteration=_iter_idx[0],
@@ -6523,7 +6583,7 @@ def run_sc_driver(
         f"exact_degeneracy_tol={sc.exact_degeneracy_tol_ev:.1e} eV, "
         f"tail_fit={sc.tail_fit}, buffer={sc.buffer_nbands}/edge, "
         f"buffer_mode={sc.buffer_mode}"
-        + (f", depth={sc.history_depth}" if sc.accelerator == "rcrop"
+        + (f", depth={sc.history_depth}" if sc.accelerator == "anderson"
            else f", α={sc.mixing:.2f}"))
     state_final, rms_history = run_self_consistency(
         state_init, inputs,
