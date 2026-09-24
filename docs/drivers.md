@@ -187,7 +187,7 @@ Invoke: `python -m gw.gw_jax -i gw.in`.
 | `qp_solver` | `auto` → `one_shot_dft` | `one_shot_dft`: full-matrix effective H with Σ at $E_\mathrm{DFT}$, Hermitian-symmetrized; `fixed_point`: on-shell diagonal solve (dynamic modes); `self_consistent`: the QSGW loop ([self-consistency](self_consistency.md)) |
 | `write_eqp2` | false | dynamic one-shot: iterate the fixed Σ(ω) matrix in the evolving QP basis and write `eqp2.dat`; screening and Σ are not rebuilt. Keys `eqp2_*` in the [input reference](input_reference.md) |
 | `restart` | false | `true` reuses `tmp/isdf_tensors_<N_mu>.h5` after authentication |
-| `linalg` | `local` | the one layout dial for dense solves: `local` whole-matrix per-q, `distributed` matrix-distributed ζ, W and eigensolves ([`distrib_la`](services/distrib_la.md)) |
+| `linalg` | `local` | the one layout dial for dense solves: `local` whole-matrix per-q, `distributed` matrix-distributed W Dyson solve, transverse LU and eigensolvers; the ζ back-solve is always a whole-tile factor ([`distrib_la`](services/distrib_la.md)) |
 | `low_mem_bands` | true | the two-face, 2-D-sharded wavefunction carrier |
 
 **Reuse.** Two caches, each refusing or refitting on mismatch, never reusing
