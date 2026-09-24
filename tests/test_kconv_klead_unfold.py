@@ -25,7 +25,7 @@ def unfold_case(mesh, fx, seed=0):
     from common.shard_map import shard_map
     from ffi import fft as F
     from gw.wavefunction_bundle import SIGMA_CONV_G7D_SPEC, V_FFT5D_SPEC, sigma_conv_operand
-    from symmetry_maps import apply_unfold_load_tables_local
+    from symmetry_maps import apply_unfold_load_tables_local, local_unfold_load_tables
     plan, kg = fx["plan"], tuple(fx["kgrid"])
     ns, mu, n_par, nk = int(plan.nspinor), int(plan.n_centroid_packed), int(plan.n_parent), int(plan.n_full)
     rng = np.random.default_rng(seed + 17 * ns)
@@ -44,16 +44,14 @@ def unfold_case(mesh, fx, seed=0):
     door = F.make_kconv_klead_unfold(mesh, kg, tables, norm="ortho", mult=mult)
     got = fixtures._host(door(Gd, Gtd if anti else None, Wp))
 
-    spin_host = np.asarray(jax.device_get(tables.spin))
-    t_specs = type(tables)(P(), P(), P(None, "x"), P(None, "y"), P(None, "x"), P(None, "y"), P())
-
-    @partial(shard_map, mesh=mesh, in_specs=(s5.spec, s5.spec, t_specs), out_specs=s5.spec,
+    @partial(shard_map, mesh=mesh, in_specs=(s5.spec, s5.spec), out_specs=s5.spec,
              check_vma=False)
-    def composed(g, gt, t):
+    def composed(g, gt):
         flat = lambda a: a.reshape(a.shape[0], a.shape[1] * ns, a.shape[3] * ns)
-        return apply_unfold_load_tables_local(flat(g), flat(gt if anti else g), t, spin_host)
-    O = fixtures._host(jax.jit(composed)(Gd, Gtd, tables))
-    red_tables = tables._replace(rsrc=jnp.roll(tables.rsrc, 1, axis=1))
+        return apply_unfold_load_tables_local(flat(g), flat(gt if anti else g),
+                                              local_unfold_load_tables(tables), tables.spin)
+    O = fixtures._host(jax.jit(composed)(Gd, Gtd))
+    red_tables = tables._replace(rsrc=np.roll(tables.rsrc, 1, axis=1))
     red_door = F.make_kconv_klead_unfold(mesh, kg, red_tables, norm="ortho", mult=mult)
     red = fixtures._host(red_door(Gd, Gtd if anti else None, Wp))
     return dict(ns=ns, nk=nk, n_parent=n_par, mu=mu, antiunitary=anti,
