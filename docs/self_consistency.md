@@ -179,8 +179,8 @@ state.
   (`rebuild:sc-fixed`; the `SC fixed quadrature:` line prints `escaped=k/n`).
   A change of material class re-initializes the set. Every path accepts a rule
   only if its certified sup error is at most `sigma_quadrature_eps`; otherwise
-  it refuses, naming the window, box, sup and node count. There is no retry
-  and no time budget. η and ε are fixed for the session.
+  it refuses, naming the window, box, sup and node count. There is no retry;
+  η and ε are fixed for the session.
 
 ## 5 Where the map is not smooth
 
