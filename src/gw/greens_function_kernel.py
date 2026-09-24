@@ -352,22 +352,28 @@ def spin_pair_rows(psi_mun, psi_nmu, index, ns):
             jax.lax.dynamic_slice_in_dim(psi_nmu, index % ns, 1, axis=2))
 
 
-def spin_pairs_needed(*, n_full, n_rmu, ns, mesh, live_green_tiles):
-    """True when a whole-spin stage's live Greens exceed the device target.
+def spin_pairs_needed(*, n_full, n_rmu, ns, mesh, live_green_tiles, resident=False):
+    """True when a stage's live Greens exceed the device target.
 
     ``live_green_tiles`` counts the stage's concurrent ``G_tile =
     16·N_k·ns²·μ²/P``; the target is the agreed minimum device budget times
-    the spinor's fragmentation utilization.  Every process must enter.
+    the spinor's fragmentation utilization.  ``resident=True`` also charges
+    the worst process's live arrays (a route that adds buffers beside the
+    stage's residents).  Every process must enter.
     """
     if int(ns) <= 1:
         return False
-    from common.gpu_utils import (bfc_fragmentation_target_utilization,
+    from common.gpu_utils import (_live_array_bytes,
+                                  bfc_fragmentation_target_utilization,
                                   get_device_memory_gb,
-                                  minimum_process_budget_gb)
+                                  minimum_process_budget_gb,
+                                  worst_process_resident_bytes)
     P_ = int(mesh.shape['x']) * int(mesh.shape['y'])
     g_tile = 16.0 * int(n_full) * int(ns) ** 2 * int(n_rmu) ** 2 / P_
     target = (minimum_process_budget_gb(get_device_memory_gb()) * 1e9
               * bfc_fragmentation_target_utilization(int(ns)))
+    if resident:
+        target -= worst_process_resident_bytes(int(_live_array_bytes() or 0))
     return float(live_green_tiles) * g_tile > target
 
 
