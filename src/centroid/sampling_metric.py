@@ -374,7 +374,7 @@ def build_feature_metric_diagonal(
     width = int(windows[0][1].shape[0])
     try:
         from common.gpu_utils import get_device_memory_gb
-        device_memory_bytes = int(float(get_device_memory_gb()) * 1024 ** 3)
+        device_memory_bytes = int(float(get_device_memory_gb()) * 1e9)
     except Exception:
         device_memory_bytes = None
     projector_bytes, projector_cap = _projector_memory_plan(
