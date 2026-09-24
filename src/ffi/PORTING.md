@@ -25,7 +25,8 @@ are tied to one implementation.
 | `slate` | `slate::` C++ templates (`slate::potrf`, `slate::trsm`, `slate::heev` over `slate::HermitianMatrix`) | **ICL SLATE only.** | **No** — a C++ template library has no ABI a second vendor could implement. |
 | `cusolvermp` | `cusolverMp*` — opaque handle + grid + descriptor objects, `int64_t` dimensions, caller-supplied device *and* host workspace, an NCCL communicator | **NVIDIA only.** | **No.** Despite solving the same problems, it shares no symbol with ScaLAPACK (`nm -D libcusolverMp.so.0` finds none of the eleven names above). It is a different API for the same operation, not a second ScaLAPACK. |
 | `cublasmp` | `cublasMp*` — same shape of API as cuSOLVERMp | **NVIDIA only.** | **No.** Likewise exports no PBLAS symbol (`pzgemm_`, `pztrsm_`). |
-| `cufft` | cuFFT plan API | **NVIDIA only.** | **No.** |
+| `cufft` | cuFFT plan API (the flat-k transform) | **NVIDIA only.** | **No.** |
+| `kconv_mathdx` | cuFFTDx (nvidia-mathdx) thread FFTs inside LORRAX's fused kernels, NVRTC-compiled at run time from the wheel's headers (`cpp/cufft/kconv_mathdx_cuda_ffi.cc`) — every k-axis convolution on NVIDIA | **NVIDIA only**, by ruling the only NVIDIA k-convolution backend (decisions.md 2026-09-24). | **No.** A non-NVIDIA GPU refuses (`GATE kconv-platform`); cpu takes the plan route. |
 
 ## 0b. SLATE's ScaLAPACK overlay — the portability question, measured
 
@@ -380,6 +381,7 @@ was skipped.
 | NVHPC SDK (cuSOLVERMp)  | 22.7    | 25.5 validated. Only the `libcusolverMp` + `libcal` subset is needed. |
 | Parallel HDF5           | 1.12    | Either Cray HDF5 (MPICH ABI) or a MPI-linked conda-forge build. |
 | SLATE (+ blaspp/lapackpp)| any     | Built from source against the target MPI + libsci/BLAS. |
+| nvidia-mathdx (Python wheel) | 25.6.0 | **Required on every NVIDIA GPU.** Header-only cuFFTDx; installed into the runtime's Python environment (`pip install --no-deps nvidia-mathdx==25.6.0`, or the `cuda12`/`cuda13` extra), found through its package spec, never an env var. Not a build dependency. NVRTC also needs the CUDA toolkit's `include/` and `include/cccl` beside the loaded `libnvrtc` (the NVHPC and cudatoolkit layouts both qualify). A missing wheel refuses at startup (`GATE mathdx-headers`). |
 
 MPI is required only for `ffi.phdf5` and `ffi.slate`; `ffi.cusolvermp`
 bootstraps via JAX's KV store + NCCL, no MPI.
@@ -417,6 +419,15 @@ SLATE itself is built from source; `stage_cray.sh` only copies the
 runtime libs SLATE links against.
 
 ## Runtime
+
+**The k-convolution kernels compile on first use.**  Each (mode, k-grid) costs
+5.9–7.5 s of NVRTC per process on an A100 the first time; the images are then
+cached on disk under `ISDF_JAX_CACHE_DIR/kconv_mathdx` (or
+`~/.cache/lorrax/kconv_mathdx` when that variable is unset; `""` disables the
+cache), and a hit costs about 10 ms.  On a new cluster point
+`ISDF_JAX_CACHE_DIR` at a rank-visible directory for production campaigns; the
+cache is content-hashed and rank-safe, so it never needs clearing for
+correctness.
 
 The installed module is a capability descriptor, not a launcher or a second
 copy of runtime policy. On Perlmutter, `lx` composes task placement,

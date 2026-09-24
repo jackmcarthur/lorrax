@@ -8,6 +8,14 @@ the two platform handlers behind them, written to the shape of
 Measurements: `wk_REL/sigma_perf_results.md`, `wk_REL/audit_gpu_fft.log`,
 `wk_REL/cufft_unit.log`, `wk_REL/audit_gpu_hlo.log` (job 7879378).*
 
+> **2026-09-24: the fused convolution moved to the k-convolution router.**
+> `make_gw_conv_ffi` / `LORRAX_FFT_FFI_FUSED` and the CUDA `gw_conv` handler
+> are deleted; the Σ and COHSEX convolutions go through
+> `ffi.fft.make_kconv_klead` (nvidia-mathdx on CUDA, the host FFTW
+> `gw_conv` handler on cpu — `docs/architecture/ffi_layout.md`, "k-convolution
+> router").  This page now documents the plain flat-k transform only;
+> everything below about the fused entry and its dial is history.
+
 > **REQUIRED, 2026-08-01** (`docs/architecture/decisions.md`).  This
 > service is the ONLY flat-k FFT: the gated XLA twin inside
 > `fft_helpers.make_flat_k_fft` was deleted under the FFI-required ruling.

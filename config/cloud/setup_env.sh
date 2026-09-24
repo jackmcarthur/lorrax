@@ -38,12 +38,13 @@ echo "[cloud setup] installing LORRAX and JAX $LORRAX_CLOUD_JAX_VERSION (full pi
     "jax[cuda13]==$LORRAX_CLOUD_JAX_VERSION" \
     nvidia-nvtx
 
-# The Mp libraries version independently of the toolkit; install exactly the
-# pinned pair and nothing else (their dependency closures are already
+# The Mp libraries (and the header-only nvidia-mathdx) version independently of
+# the toolkit; install exactly the pinned set and nothing else (their dependency closures are already
 # satisfied by the jax[cuda13] install above).
 "$UV" pip install --python "$LORRAX_CLOUD_ENV/bin/python" --no-deps \
     "nvidia-cusolvermp-cu13==$LORRAX_CLOUD_CUSOLVERMP_VERSION" \
-    "nvidia-cublasmp-cu13==$LORRAX_CLOUD_CUBLASMP_VERSION"
+    "nvidia-cublasmp-cu13==$LORRAX_CLOUD_CUBLASMP_VERSION" \
+    "nvidia-mathdx==$LORRAX_CLOUD_MATHDX_VERSION"
 
 SITE="$(lorrax_cloud_site_packages)"
 CU13="$(lorrax_cloud_cuda_root)"
@@ -51,6 +52,7 @@ CUSOLVERMP_ROOT="$SITE/nvidia/cu13"
 CUBLASMP_ROOT="$SITE/nvidia/cublasmp/cu13"
 for path in "$CU13/bin/nvcc" \
             "$CU13/include/cuda_runtime.h" \
+            "$SITE/nvidia/mathdx/include/cufftdx.hpp" \
             "$CUSOLVERMP_ROOT/include/cusolverMp.h" \
             "$CUSOLVERMP_ROOT/lib/libcusolverMp.so.0" \
             "$CUBLASMP_ROOT/include/cublasmp.h" \

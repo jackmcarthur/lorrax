@@ -184,6 +184,15 @@ container:
 | `phdf5` | parallel HDF5 via MPI-IO | sharded slab read/write |
 | `slate` | SLATE + libsci | distributed Cholesky, trsm, heev |
 
+Beside the native stacks the CUDA leg needs one Python package at run time:
+**`nvidia-mathdx`** (header-only cuFFTDx), the only NVIDIA backend of the
+k-convolution router (decisions.md 2026-09-24).  The `lorrax_A` runtime venv
+at `/global/common/software/m4598/jackm/lorrax_cuda13_runtime/.venv` carries
+`nvidia-mathdx==25.6.0` (installed 2026-09-24; pinned by the runtime
+`recipe/stack.sh`).  Nothing is linked or bind-mounted: the handler finds the
+headers through the package spec and compiles per k-grid with NVRTC, caching
+the images on disk (`docs/dev/env_vars.md`, `ISDF_JAX_CACHE_DIR`).
+
 Staged once per cluster (idempotent, each ends with a `readelf -d` check;
 staging is mandatory because Shifter cannot mount the vendor `/opt/*` trees
 directly):

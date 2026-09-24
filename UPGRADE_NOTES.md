@@ -3,6 +3,21 @@
 User-visible changes, newest first. Binding rulings behind the breaking
 changes live in `docs/architecture/decisions.md`.
 
+## 2026-09-24 — k-axis convolutions on nvidia-mathdx (branch, not yet main)
+
+- **NVIDIA GPUs now require the `nvidia-mathdx` wheel** (pinned in the
+  `cuda12`/`cuda13` extras; header-only).  Without it a CUDA run refuses at
+  startup with `GATE mathdx-headers` and the fix `pip install nvidia-mathdx`.
+- `LORRAX_FFT_FFI_FUSED`, `LORRAX_CONV_KMINOR_FFI` and `LORRAX_CONV_KLEAD_FFI`
+  are gone: Σ, COHSEX and the BSE ladder/stack convolutions have one route
+  per platform (nvidia-mathdx on CUDA, the host FFTW plans on cpu).  A leftover
+  setting is ignored.
+- The FFI handler ABI is 4; a `liblorrax_ffi.so` built before this change is
+  refused by name.
+- The kernels compile on first use (about 6 s per k-grid) and are cached in
+  `ISDF_JAX_CACHE_DIR/kconv_mathdx`, or `~/.cache/lorrax/kconv_mathdx` when
+  that variable is unset; `ISDF_JAX_CACHE_DIR=""` turns the cache off.
+
 ## 2026-08-28 — startup ownership, BSE mesh flags, emulated CPU meshes
 
 - The runtime owns `JAX_ENABLE_X64`: it applies the resolved value even when
@@ -61,9 +76,8 @@ library before running — `src/ffi/cpp/build_host.sh` (generic host) or
 - `LORRAX_FFT_FFI=0` **refuses**: the XLA flat-k twin inside
   `make_flat_k_fft` was deleted, there is nothing to opt out to (recover the
   arm from git history for a debugging build). Handlers are c128-only.
-- `LORRAX_FFT_FFI_FUSED=0` is a real, announced opt-out onto the decomposed
-  three-transform chain — itself FFI-served, so a structural choice between
-  two certified forms, not a native fallback.
+- `LORRAX_FFT_FFI_FUSED=0` was a real, announced opt-out onto the decomposed
+  three-transform chain (deleted 2026-09-24, see above).
 - `LORRAX_BANDS_GEMM_FFI=0` is an announced **UNCERTIFIED** opt-out onto the
   retained XLA einsum arm (retained because `extra="minor"` structurally
   cannot ride a batched GEMM and quietly keeps the XLA plan under every mode).

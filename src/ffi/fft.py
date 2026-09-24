@@ -518,7 +518,8 @@ def require_kconv(mesh: Mesh, *, announce: bool = True) -> str:
         for target in KCONV_TARGETS:
             _require_target(target, "CUDA")
         announce_once(("kconv", "backend", backend),
-                      f"[kconv] k-convolution router: CUDA -> nvidia-mathdx ({root})",
+                      f"[kconv] k-convolution router: CUDA -> nvidia-mathdx ({root}); "
+                      f"cubin cache {_cubin_cache_summary()}",
                       scope="rank0", emit=announce)
     else:
         _require_plan_route()
@@ -526,6 +527,20 @@ def require_kconv(mesh: Mesh, *, announce: bool = True) -> str:
                       "[kconv] k-convolution router: cpu -> MKL flat-k plan route",
                       scope="rank0", emit=announce)
     return backend
+
+
+def _cubin_cache_summary() -> str:
+    """``<dir>: N images, X MB`` for the startup line (one flat directory, no walk)."""
+    import os
+    d = _mathdx_common()["cubin_dir"]
+    if not d:
+        return "off (ISDF_JAX_CACHE_DIR=\"\")"
+    try:
+        sizes = [e.stat().st_size for e in os.scandir(d)
+                 if e.is_file() and e.name.endswith(".cubin")]
+    except FileNotFoundError:
+        sizes = []
+    return f"{d}: {len(sizes)} images, {sum(sizes) / 1e6:.1f} MB"
 
 
 def _require_target(target: str, platform: str) -> None:

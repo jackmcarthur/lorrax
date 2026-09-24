@@ -31,6 +31,9 @@ LORRAX_CLOUD_JAX_VERSION="${LORRAX_CLOUD_JAX_VERSION:-0.9.1}"
 # newest published cu13 wheel instead.  compat.h guards the API delta.
 LORRAX_CLOUD_CUSOLVERMP_VERSION="${LORRAX_CLOUD_CUSOLVERMP_VERSION:-0.9.1.9318.post1}"
 LORRAX_CLOUD_CUBLASMP_VERSION="${LORRAX_CLOUD_CUBLASMP_VERSION:-0.9.1.3056}"
+# nvidia-mathdx: header-only cuFFTDx, REQUIRED on NVIDIA GPUs (the k-convolution
+# router's only CUDA backend; docs/architecture/decisions.md 2026-09-24).
+LORRAX_CLOUD_MATHDX_VERSION="${LORRAX_CLOUD_MATHDX_VERSION:-25.6.0}"
 
 lorrax_cloud_site_packages() {
     "$LORRAX_CLOUD_ENV/bin/python" -c \

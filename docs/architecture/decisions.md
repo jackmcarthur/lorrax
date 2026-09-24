@@ -56,6 +56,23 @@ nvcc, and compilation costs 6.5–7.9 s per grid. See sandbox claims 2651 and
 **Status.** Approved. ζ-fit implementation on branch
 `feat/kconv-mathdx-2026-09-24` (not on main).
 
+**Stage 2 (branch `feat/kconv-mathdx-stage2-2026-09-24`, not on main).**
+Owner follow-up, verbatim: "it's big enough that after it's wired in for the
+zeta part we should have another agent go through and wire/rearchitect the
+other gpu fft convolution kernels to use it" and "it should be tasked with
+integrating this as a required nvidia gpu dependency/shipping the build
+correctly and such".
+* Σ (τ kernel, COHSEX) and BSE (stack matvec, ladder rung, W_R builds) now
+  go through the router's T·W, k-minor conv and transform modes.
+* Deleted: `conv_klead`, `conv_kminor`, the CUDA `gw_conv` handler,
+  `LORRAX_FFT_FFI_FUSED`, `LORRAX_CONV_KLEAD_FFI` and
+  `LORRAX_CONV_KMINOR_FFI`.
+* `nvidia-mathdx` is pinned in the `cuda12`/`cuda13` extras and in the
+  Perlmutter runtime recipe.
+* Compiled images are disk-cached (content-hashed, atomic, re-verified).
+* The flat-k transform stays on cuFFT plans until measured otherwise
+  ([`ffi_layout.md`](ffi_layout.md) §9).
+
 ## 2026-09-18 — Headless shared-pole SC is allowed for brute-grid development
 
 **Ruling (owner).** `sigma_w_model = shared_pole` with
