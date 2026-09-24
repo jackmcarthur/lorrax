@@ -912,10 +912,9 @@ def _fit_fixed_sc_rules(
     map is reused on every later map while it holds. Three events refit:
 
     * a window that escapes its certificate box, changes error currency, or
-      did not exist when the set froze refits the whole rule set for this map
-      (owner 2026-09-22, TaAs semimetal SC); the receipt names every refit
-      window and the escaped windows' reasons, and keeps the freezing map's pair
-      cost;
+      did not exist when the set froze is refit on this map, alone (owner
+      2026-09-22, TaAs semimetal SC); the receipt names each refit window
+      with its reason and keeps the freezing map's pair cost;
     * a metal<->insulator flip re-initializes the set under the new class;
     * a rule-validity failure during reuse (factored-log growth above the
       cap) refits that one window.
@@ -944,29 +943,11 @@ def _fit_fixed_sc_rules(
             rows, eta, eps=eps, cache_dir=cache_dir)
         return fits, fit_rows, {
             "iteration": iteration, "mode": "one-shot", "initialized": False,
-            "rebuilt": (), "recompute_reasons": (),
+            "rebuilt": (), "recompute_reasons": (), "escaped": 0,
             "rebuild_count_total": int(session.get("rebuild_count", 0)),
             "material_class": session.get("material_class"),
             "class_flip": session.pop("class_flip", None),
         }
-    # Owner 2026-09-22 (TaAs semimetal SC): a window that escapes its frozen
-    # box, or a new window, refits the rule set for this map instead of
-    # refusing.
-    escape_reasons = {}
-    if "rules" in session:
-        for spec in rows:
-            entry = session["rules"].get(spec["name"])
-            if entry is None:
-                escape_reasons[spec["name"]] = "absent when the rules froze"
-                continue
-            reasons = _box_escape_reasons(
-                entry["fit"]["rule_box"], spec["box"])
-            if bool(entry["fit"]["relative"]) != (spec["kind"] != "crossing"):
-                reasons.append("absolute/relative error currency changed")
-            if reasons:
-                escape_reasons[spec["name"]] = "escape: " + "; ".join(reasons)
-        if escape_reasons:
-            session.pop("rules")
     if "rules" not in session:
         session["eta_ry"] = float(eta)
         session["eps"] = float(eps)
@@ -974,49 +955,64 @@ def _fit_fixed_sc_rules(
         fits, fit_rows = fit_sigma_box_specs(
             padded, eta, eps=eps,
             cache_dir=cache_dir, cache_build_widen=False)
-        rebuild = bool(escape_reasons)
-        status = "rebuild:sc-fixed" if rebuild else "init"
-        rules = {}
-        for spec, padded_spec, fit in zip(rows, padded, fits):
-            frozen = dict(fit)
-            frozen["cache_status"] = f"{status}:{fit['cache_status']}"
-            rules[spec["name"]] = {
-                "fit": frozen,
+        session["rules"] = {
+            spec["name"]: {
+                "fit": dict(fit, cache_status=f"init:{fit['cache_status']}"),
                 "padded_box": tuple(padded_spec["box"]),
                 "initial_box": tuple(spec["box"]),
-            }
-        session["rules"] = rules
-        if rebuild:
-            # The freezing map's pair cost stays the reference the kept line
-            # compares against; every window of the set was refit.
-            session["rebuild_count"] = int(
-                session.get("rebuild_count", 0)) + len(rows)
-            rebuilt = tuple(spec["name"] for spec in rows)
-            reasons = tuple(sorted(
-                (name, escape_reasons.get(name, "refit with the rule set"))
-                for name in rebuilt))
-        else:
-            session["initial_window_tau_pairs"] = int(sum(
-                fit["node_count"] for fit in fits))
-            rebuilt, reasons = (), ()
-        return [dict(rules[spec["name"]]["fit"]) for spec in rows], fit_rows, {
-            "iteration": iteration, "mode": "frozen", "initialized": not rebuild,
-            "rebuilt": rebuilt, "recompute_reasons": reasons,
+            } for spec, padded_spec, fit in zip(rows, padded, fits)}
+        session["initial_window_tau_pairs"] = int(sum(
+            fit["node_count"] for fit in fits))
+        return [dict(session["rules"][spec["name"]]["fit"]) for spec in rows], fit_rows, {
+            "iteration": iteration, "mode": "frozen", "initialized": True,
+            "rebuilt": (), "recompute_reasons": (), "escaped": 0,
             "rebuild_count_total": int(session.get("rebuild_count", 0)),
             "material_class": session.get("material_class"),
             "class_flip": session.pop("class_flip", None),
         }
 
     rules = session["rules"]
+    # Owner 2026-09-22 (TaAs semimetal SC): a window that escapes its frozen
+    # box, or a new window, is refit on this map instead of refusing. Only
+    # those windows are refit; every other window keeps its frozen nodes
+    # (whole-set refits measured 9/9 windows per escape on the CrI3 8x8 SC
+    # gate, 2026-09-24).
+    escape_reasons = {}
+    for spec in rows:
+        entry = rules.get(spec["name"])
+        if entry is None:
+            escape_reasons[spec["name"]] = "absent when the rules froze"
+            continue
+        reasons = _box_escape_reasons(entry["fit"]["rule_box"], spec["box"])
+        if bool(entry["fit"]["relative"]) != (spec["kind"] != "crossing"):
+            reasons.append("absolute/relative error currency changed")
+        if reasons:
+            escape_reasons[spec["name"]] = "escape: " + "; ".join(reasons)
+    fit_rows = []
+    if escape_reasons:
+        escaped = [spec for spec in rows if spec["name"] in escape_reasons]
+        padded = [_sc_padded_box_spec(spec, eta) for spec in escaped]
+        new_fits, fit_rows = fit_sigma_box_specs(
+            padded, eta, eps=eps, cache_dir=cache_dir, cache_build_widen=False)
+        for spec, padded_spec, fit in zip(escaped, padded, new_fits):
+            rules[spec["name"]] = {
+                "fit": dict(fit, cache_status=f"rebuild:sc-fixed:{fit['cache_status']}"),
+                "padded_box": tuple(padded_spec["box"]),
+                "initial_box": tuple(spec["box"]),
+                "rebuilt_at_iteration": iteration,
+                "rebuild_reason": escape_reasons[spec["name"]],
+            }
     # A product window may temporarily have no live state/pole tuples.  Keep
     # its frozen receipt in ``rules`` and simply omit its zero
     # contribution from this map; if it reappears, the containment check
     # above applies to it again.
-    fit_rows = []
-    recomputed = {}
+    recomputed = dict(escape_reasons)
     fits = []
     for spec in rows:
         entry = rules[spec["name"]]
+        if spec["name"] in escape_reasons:
+            fits.append(dict(entry["fit"]))
+            continue
         try:
             fits.append(_fixed_fit_for_spec(entry, spec))
         except _RuleValidityFailure as exc:
@@ -1045,11 +1041,13 @@ def _fit_fixed_sc_rules(
                       f"rule for {name!r} ({reason})")
     return fits, fit_rows, {
         "iteration": iteration, "mode": "frozen", "initialized": False,
-        "rebuilt": tuple(recomputed),
+        "rebuilt": tuple(name for name in (spec["name"] for spec in rows)
+                         if name in recomputed),
         "recompute_reasons": tuple(sorted(recomputed.items())),
+        "escaped": len(escape_reasons),
         "rebuild_count_total": int(session.get("rebuild_count", 0)),
         "material_class": session.get("material_class"),
-        "class_flip": None,
+        "class_flip": session.pop("class_flip", None),
     }
 
 
@@ -1378,6 +1376,7 @@ def plan_sigma_windows(
             "sc_fixed_rebuilds_this_iteration": len(
                 fixed_receipt.get("rebuilt", ())),
             "sc_fixed_rebuilt_windows": list(fixed_receipt.get("rebuilt", ())),
+            "sc_fixed_escaped_windows": int(fixed_receipt.get("escaped", 0)),
             "sc_fixed_total_rebuild_count": int(
                 fixed_receipt.get("rebuild_count_total", 0)),
             "sc_fixed_initial_window_tau_pairs": fixed_rule_session.get(

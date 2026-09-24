@@ -408,26 +408,33 @@ def test_sc_fixed_session_rebuilds_an_escaped_window_and_says_so(monkeypatch):
         _summaries(), [_branch_at((0.1, 3.0))],
         np.asarray([0.2, 0.5]), 0.1, **args)
     calls.clear()
-    # A box that escapes the frozen certificate refits the rule set (owner
-    # 2026-09-22), and the receipt must say so: not initialized, every
-    # refit window named, the escaped one with its edge, iteration 1's
-    # pair cost kept.
+    # A box that escapes the frozen certificate refits THAT window (owner
+    # 2026-09-22; per window since 2026-09-24), and the receipt must say so:
+    # not initialized, each refit window named with its edge, the others'
+    # nodes unchanged, the freezing map's pair cost kept.
     _, escaped = plan_sigma_windows(
         _summaries(), [_branch_at((0.1, 8.0))],
         np.asarray([0.2, 0.5]), 0.1, **args)
     assert calls
-    names = [row["name"] for row in escaped["branches"][0]["windows"]]
-    assert not escaped["sc_fixed_initialized"]
-    assert escaped["sc_fixed_rebuilt_windows"] == names
-    assert escaped["sc_fixed_rebuilds_this_iteration"] == len(names)
-    assert escaped["sc_fixed_total_rebuild_count"] == len(names)
     reasons = escaped["sc_fixed_recompute_reasons"]
-    assert set(reasons) == set(names)
-    assert any(reason.startswith("escape: ") for reason in reasons.values())
+    rows = {row["name"]: row for row in escaped["branches"][0]["windows"]}
+    before = {row["name"]: row for row in first["branches"][0]["windows"]}
+    assert not escaped["sc_fixed_initialized"]
+    assert reasons and set(reasons) < set(rows)
+    assert all(reason.startswith("escape: ") for reason in reasons.values())
+    assert escaped["sc_fixed_rebuilt_windows"] == [
+        name for name in rows if name in reasons]
+    assert escaped["sc_fixed_escaped_windows"] == len(reasons)
+    assert escaped["sc_fixed_rebuilds_this_iteration"] == len(reasons)
+    assert escaped["sc_fixed_total_rebuild_count"] == len(reasons)
+    assert len(calls) == len(reasons)
+    for name, row in rows.items():
+        refit = name in reasons
+        assert row["cache_status"].startswith("rebuild:sc-fixed") == refit
+        if not refit:
+            assert row["node_digest"] == before[name]["node_digest"]
     assert (escaped["sc_fixed_initial_window_tau_pairs"]
             == first["sc_fixed_initial_window_tau_pairs"])
-    assert all(rule["fit"]["cache_status"].startswith("rebuild:sc-fixed")
-               for rule in session["rules"].values())
 
 
 def test_sc_fixed_session_keeps_receipt_for_temporarily_empty_window(

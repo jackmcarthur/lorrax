@@ -1794,6 +1794,8 @@ def compute_sigma_c_mpa_omega_grid(
                     f"rules={geometry['sc_rule_mode']}, "
                     f"initialized={geometry['sc_fixed_initialized']}, "
                     f"frozen={geometry['sc_rule_mode'] == 'frozen' and not reasons and geometry['sc_fixed_rebuilds_this_iteration'] == 0}, "
+                    f"escaped={geometry['sc_fixed_escaped_windows']}/"
+                    f"{geometry['n_windows']}, "
                     f"rebuilds_this_iteration="
                     f"{geometry['sc_fixed_rebuilds_this_iteration']}, "
                     f"rebuilds_total="

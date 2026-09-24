@@ -315,9 +315,9 @@ The next map certifies one rule per product window on the window's box padded
 by each state's own classification pad (each real edge moves by the pad of
 the state that sets it) and a 10% pole pad, with no flat pad;
 later maps reuse the rule (`cache=hit:sc-fixed`) and, when a state leaves its
-padded box or a window appears that the frozen set did not have, rebuild the
-set on the escaped boxes with the same padding (`rebuild:sc-fixed`, counted in
-the geometry receipt and printed per map). One-shot results are bit-identical
+padded box or a window appears that the frozen set did not have, refit only
+those windows with the same padding (`rebuild:sc-fixed`, counted in the
+geometry receipt and printed per map as `escaped=k/n`). One-shot results are bit-identical
 with and without the freeze. The eqp1 file is written from the converged map.
 
 **13. Map gain is a diagnostic, not a controller.** From map 2 onward the
@@ -579,10 +579,11 @@ energies and W(time). Containment, error currency and separated-factor growth
 are checked at every map. Initial tail certificates cover the selector's
 minimum separation for both scalar and sector shared-pole models, so states
 entering an existing tail retain the same nodes. A containment escape, or a
-window absent at iteration 1, refits the whole rule set for that map (owner
-2026-09-22, TaAs semimetal SC); the `SC fixed quadrature:` kept line then
-reports `initialized=False`, the refit windows and the escape reasons against
-iteration 1's `initial_pair_cost`. A material-class change re-initializes the
+window absent when the set froze, refits that window for that map (owner
+2026-09-22, TaAs semimetal SC; per window since 2026-09-24); the
+`SC fixed quadrature:` kept line then reports `initialized=False`,
+`escaped=k/n`, the refit windows and the escape reasons against the freezing
+map's `initial_pair_cost`. A material-class change re-initializes the
 set, and a separated-factor growth failure refits one window. Eta and epsilon
 remain fixed for a session. Disk model identity is not relaxed.
 
