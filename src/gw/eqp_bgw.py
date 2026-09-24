@@ -100,6 +100,11 @@ import h5py
 import numpy as np
 
 from common.units import RYD_TO_EV
+
+#: How far the WFN's E_DFT - E_F may sit from the live writer's persisted
+#: evaluation energies before make_eqp_bgw calls them different mean fields.
+#: Float-path noise is ~1e-13 eV; a printed eqp digit is 1e-9 eV.
+_E_DFT_RECEIPT_MATCH_EV = 1.0e-9
 from common.provenance import provenance_header
 
 
@@ -1025,6 +1030,27 @@ def make_eqp_bgw(
 		stamped_provenance = "midgap (unstamped file, insulating occupations)"
 	print(f"  omega reference = {efermi_ev:.6f} eV ({stamped_provenance})")
 	e_dft_rel_ev = e_dft_ev - efermi_ev
+	# THE LIVE WRITER'S OWN E_DFT − E_F, when the receipt stamps its
+	# evaluation energies at E_DFT.  The conditioned C(omega) curve was
+	# interpolated at exactly those numbers; the WFN energies re-derived
+	# above reach them by a different float path (measured <= 3.3e-13 eV,
+	# 113/270 cells, on tests/regression/bispinor_debug), which moves the
+	# re-derived C(E_DFT) by 2e-14 eV and fails the EXACT persisted-C check
+	# below.  So the persisted operand is used, after checking it is the
+	# same spectrum as this WFN to far below any printed digit.
+	from file_io.sigma_output import SIGMA_EVAL_AT_E_DFT
+	if _eval_rel_window is not None and str(_eval_prov) == SIGMA_EVAL_AT_E_DFT:
+		_persisted_rel = np.asarray(_eval_rel_window, dtype=np.float64)
+		_gap = (float(np.max(np.abs(_persisted_rel - e_dft_rel_ev)))
+		        if _persisted_rel.shape == e_dft_rel_ev.shape else np.inf)
+		if not _gap <= _E_DFT_RECEIPT_MATCH_EV:
+			raise ValueError(
+				f"{os.path.basename(sigma_mnk_path)}'s receipt stamps its "
+				f"evaluation energies at E_DFT, but they differ from "
+				f"{os.path.basename(wfn_path)}'s E_DFT - E_F by {_gap:.3e} eV "
+				f"(shape {_persisted_rel.shape} vs {e_dft_rel_ev.shape}; "
+				f"limit {_E_DFT_RECEIPT_MATCH_EV:.0e} eV): not the same mean field.")
+		e_dft_rel_ev = _persisted_rel
 
 	# The eqp1 linearization point, on the SAME reference — one subtraction
 	# with one ω zero, exactly as the line above.
@@ -1076,7 +1102,6 @@ def make_eqp_bgw(
 	# The format owner already selected this small stamp onto the exact
 	# requested file rows and Sigma band window alongside the payload route,
 	# so there is no second row remap here.
-	from file_io.sigma_output import SIGMA_EVAL_AT_E_DFT
 	if e_eval_rel_ev is None:
 		if _eval_rel_window is None:
 			print(f"  eqp1 linearization: {os.path.basename(sigma_mnk_path)} "
