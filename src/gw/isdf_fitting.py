@@ -1773,8 +1773,7 @@ def fit_zeta_to_h5(
             # ``(chunk_idx+1) >= 0`` fired on the very first chunk and
             # truncated the fit to one r-chunk.  A non-numeric value raised a
             # bare ``invalid literal for int()`` from inside the loop.  Both
-            # produce a PARTIAL ζ that the writer still marks complete, so
-            # they must refuse up front instead.
+            # produced a PARTIAL ζ by accident, so they refuse up front.
             _max_rchunks = os.environ.get("LORRAX_MAX_RCHUNKS")
             _max_rchunks = _max_rchunks.strip() if _max_rchunks else ""
             if _max_rchunks:

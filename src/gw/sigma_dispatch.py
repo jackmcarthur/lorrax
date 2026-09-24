@@ -1202,8 +1202,9 @@ def _compute_mpa_sigma(
     if material_class == "metal":
         if occupation_state is None:
             raise ValueError(
-                "MPA Sigma under mpa_material_class = metal requires "
-                "the iteration's occupation_state (fixed-N MP1 solve); "
+                "MPA Sigma on a metallic WFN (material class inferred from "
+                "its occupations) requires the iteration's occupation_state "
+                "(the fixed-N occupation solve); "
                 "got None. The QSGW driver passes it; a direct caller "
                 "must construct one from the current spectrum.")
     sigma_efermi_ry, sigma_efermi_provenance = resolve_sigma_efermi_ry(

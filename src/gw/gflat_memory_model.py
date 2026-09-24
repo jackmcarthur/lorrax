@@ -1611,7 +1611,7 @@ class MuBatchPlan:
         gt = max(self.green_tile_bytes, 1.0)
         lines = [
             "  ISDF μ-batch plan (one budget; docs/architecture/zeta_fit_mubatch.md)",
-            f"    ψ(r) route    = {self.route} (source {self.source}, "
+            f"    fit route     = {self.route} (source {self.source}, "
             f"band chunk {self.band_chunk}, k chunk {self.k_chunk})",
             f"    μ batch       = {self.b}  ({self.n_batch} batches, "
             f"{self.collectives_per_batch} collectives each, smallest "
@@ -1620,7 +1620,6 @@ class MuBatchPlan:
             f"{self.t_model_s:.0f} s; runner-up {self.runner_up})",
             f"    r sub-block   = {self.r_sub} "
             f"{'points' if self.route == 'cache' else 'planes per group' if self.route == 'G' else 'plane(s)'}",
-            f"    FFT rows/step = {self.row_chunk}",
             f"    ζ tier        = {self.zeta_tier} (chosen by route G, which applies "
             f"the whole-tile factor B on each G tile; `linalg` sets the other stages)",
             f"    Z store       = {self.placement} ({self.store_bytes / 1e9:.1f} GB/rank; "

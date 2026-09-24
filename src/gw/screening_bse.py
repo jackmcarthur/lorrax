@@ -60,16 +60,14 @@ special Gamma cell.  The separate finite-q ``mc_average_placement`` policy
 remains refused under w_bse; a non-None ``head_channel`` reaching here is a
 parse-gate bug, not a case to serve.
 
-INSULATORS ONLY, AND THE GATE IS IN TWO PLACES BECAUSE THE SIGNAL IS.
+INSULATORS ONLY.
 The ladder, its TRS-gauge machinery and every certification behind this
-feature assume integer occupations and a gapped D.  A deck that DECLARES a
-metal (``mpa_material_class = metal``) is refused at parse time
-(``gw_config._W_BSE_REFUSALS``, ``w_bse_insulators_only``); a metallic WFN
-on a deck that declares nothing is refused HERE, on the mean field's own
-occupations, before any compute (:func:`refuse_fractional_occupations`,
-same rule id).  Neither is redundant: no deck key describes the WFN's
-occupations, and no WFN read happens at parse time.  ``w_rpa_resolvent``
-carries the SAME two gates under its own rule id
+feature assume integer occupations and a gapped D.  No deck key declares a
+metal (the material class is inferred from the WFN occupations), so a
+metallic WFN is refused HERE, on the mean field's own occupations, before
+any compute (:func:`refuse_fractional_occupations`, rule id
+``w_bse_insulators_only``).  ``w_rpa_resolvent``
+carries the SAME gate under its own rule id
 (``w_rpa_resolvent_insulators_only``) — the pair basis is the identical
 band-index cut at ``nelec`` whether or not the rung is in the operator, so
 the argument survives even though the ladder's own TRS-gauge fix is not
@@ -252,12 +250,10 @@ def refuse_fractional_occupations(occs, *, band_lo, band_hi, source,
     and rung-free operator (see ``gw_config._W_RPA_RESOLVENT_REFUSALS``'
     own comment on its twin row for what does and does not transfer).
 
-    THE PARSE-TIME TWIN AND WHY BOTH EXIST.  ``mpa_material_class = metal``
-    is refused in ``gw_config._W_BSE_REFUSALS`` under this same rule id,
-    and it is the only deck key in the parser that declares a metallic
-    treatment.  A metallic WFN handed to a deck that declares nothing is
-    therefore invisible until something looks at the OCCUPATIONS, and this
-    is that look.  Same id on both so an operator greps once.
+    WHY THE OCCUPATIONS.  No deck key declares a metal: the material class
+    is inferred from the WFN occupations (``gw_config.infer_material_class``),
+    so a metallic WFN is invisible until something looks at the
+    OCCUPATIONS, and this is that look.
 
     WHY THE WFN'S OWN ``occ`` ARRAY AND NOT ``wfns.occ``.  The bundle's
     occupation array is BUILT here, by ``wavefunction_bundle._build_occ``,
@@ -320,10 +316,9 @@ def refuse_fractional_occupations(occs, *, band_lo, band_hi, source,
             f"never checked for it.  The metallic MPA screening/Sigma "
             f"pipeline remains available under screening_diagrams = w_rpa; "
             f"it does not confer fractional-occupation semantics on this "
-            f"distinct resolvent operator.  The deck-key twin of this "
-            f"refusal (mpa_material_class = metal) fires at PARSE time in "
-            f"gw_config.refuse_unsupported_screening_diagrams; this one "
-            f"catches the metallic WFN that no deck key declared.\n"
+            f"distinct resolvent operator.  No deck key declares a metal "
+            f"(gw_config.infer_material_class reads the WFN occupations), "
+            f"so this occupation check is the gate.\n"
             f"  doc:  docs/input_reference.md '## Screening', "
             f"screening_diagrams.")
     print_fn(

@@ -628,7 +628,7 @@ class SCState:
     fixed-N μ, family, width, hash) plus its derived tetrahedron
     Fermi-surface table: iteration i's first-half consumers read the values
     produced only at the END of iteration i-1.  They are deliberately not
-    installed in the wavefunction bundle: under mpa_material_class = metal
+    installed in the wavefunction bundle: on a metallic WFN
     the state is threaded explicitly into screening (build_mpa_fit) and
     Sigma (compute_sigma_xc); insulating decks pass None and keep the
     historical occupations bit-exactly.
@@ -3873,7 +3873,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
                 np.asarray(head_occ_kn)[:, :nb_sigma],
                 where=f"SC map {int(state.iteration)} static head")
 
-    # Under mpa_material_class = metal the finite-q body above went through
+    # On a metallic WFN the finite-q body above went through
     # build_mpa_fit(occupation_state=...) — fractional contour lines and the
     # ordered-pair shifted-origin rows.  Insulating decks keep the historical
     # valence/conduction cut (occupation_state=None).

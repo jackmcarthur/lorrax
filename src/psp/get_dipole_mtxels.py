@@ -675,11 +675,11 @@ def main(argv=None):
 		choices=[VNL_VELOCITY_SIGN_SHIPPED, VNL_VELOCITY_SIGN_FLIPPED],
 		default=None,
 		help="Relative sign of the i[r,V_NL] term in the assembled "
-		     "velocity: -1 is the shipped assembly and the default, +1 is "
-		     "the flipped arm.  Overrides the deck key `vnl_velocity_sign`; "
-		     "with neither given the shipped sign is used and every "
-		     "dipole.h5 in the tree is reproduced bit for bit.  The "
-		     "resolved value is stamped as `prov_vnl_velocity_sign`.",
+		     "velocity: -1 is the historical (shipped) assembly, +1 is "
+		     "the flipped arm (BerkeleyGW's q->0 head) and the default.  "
+		     "Overrides the deck key `vnl_velocity_sign`; with neither "
+		     "given +1 is used.  The resolved value is stamped as "
+		     "`prov_vnl_velocity_sign`.",
 	)
 	parser.add_argument(
 		"--out",
