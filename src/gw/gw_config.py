@@ -4415,8 +4415,9 @@ def _validate_occupation_smearing(screening, width_ry):
             "GATE metal_sc_head_update_disabled: occ_smearing_width_ry = "
             f"{width_ry!r} Ry declares a metal's Fermi-Dirac kBT, and "
             f"occ_broadening = {broadening_ev!r} eV > 0 requests the MP1 "
-            "smeared QSGW head, which is DISABLED on metals (owner ruling "
-            "2026-09-17). Remove occ_broadening; occ_smearing_width_ry is "
+            "smeared QSGW head, which is DISABLED on metals pending the "
+            "owner's replacement head model (owner ruling 2026-09-17). "
+            "Remove occ_broadening; occ_smearing_width_ry is "
             "the metal's one width. doc: docs/self_consistency.md, "
             "'Metals: direct Drude head'.")
 
