@@ -499,8 +499,10 @@ def main(argv=None):
         rank0_print(
             "[orbmag] Hellmann-Feynman check of the loaded velocity: RMS "
             f"|Re diag(v) - d eps/dk| = {hf['rms']:.4f} Ry*Bohr against RMS "
-            f"slope {hf['slope_rms']:.4f} ({hf['nsamples']} band/k samples; "
-            "blind to the nonlocal sign)")
+            f"slope {hf['slope_rms']:.4f} ({hf['nsamples']} band/k samples). "
+            "Diagnostic only: the central difference spans two grid steps "
+            "and follows band index, so crossings on a coarse or flat-band "
+            "grid inflate it, and it is blind to the nonlocal sign")
         PA = np.zeros((3, nbnd, nbnd), dtype=np.complex128)
         PB = np.zeros((3, nbnd, nbnd), dtype=np.complex128)
         for ik in range(nk):
