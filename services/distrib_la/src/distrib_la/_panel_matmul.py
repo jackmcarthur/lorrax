@@ -54,6 +54,15 @@ def panel_matmul(a, b, *, mesh, panel_bytes):
         # One bounded all-gather per operand gives the local GEMM its full K.
         # This avoids p tiny-K GEMMs when the complete panel is already small.
         width = k
+    elif not sample_axis and px == py:
+        # Interleaved chunks: every rank contributes `width` of its own K
+        # columns to each chunk, so a chunk is ONE all-gather per operand over
+        # the whole mesh axis (p times the columns of an owner panel).  Two
+        # chunks are live (the one multiplied and the one prefetched).
+        per_chunk = limit // (2 * px)
+        width = max(d for d in range(1, k // px + 1)
+                    if (k // px) % d == 0 and d <= max(per_chunk, 1))
+        return _interleaved_kernel(mesh, q, m, k, n, width)(a, b)
     else:
         common = gcd(k // px, k // py)
         width = min(common, limit)
@@ -104,3 +113,43 @@ def _kernel(mesh, q, m, k, n, width, sample_axis):
     face_a = NamedSharding(mesh, P(None, 'x', 'y'))
     face_b = NamedSharding(mesh, spec)
     return jax.jit(product, in_shardings=(face_a, face_b), out_shardings=face_b)
+
+
+@lru_cache(maxsize=64)
+def _interleaved_kernel(mesh, q, m, k, n, width):
+    """Stream K in interleaved chunks on a square mesh, prefetching the next.
+
+    Rank ``(x, y)`` holds the K block ``[y·K/p, (y+1)·K/p)`` of A and
+    ``[x·K/p, (x+1)·K/p)`` of B.  Chunk ``j`` takes local columns
+    ``[j·w, (j+1)·w)`` of every block: the all-gather of A over ``y`` and of
+    B over ``x`` then both hold the SAME global K set
+    ``{i·K/p + j·w + t}``, in the same order, so the local product of the two
+    gathered panels is that chunk's exact contribution to the rank's own
+    output tile.  No reduction follows.  Chunk ``j+1`` is gathered before
+    chunk ``j`` is multiplied, so the collective overlaps the GEMM.
+    """
+    p = int(mesh.shape['x'])
+    mx, ny, kl = m // p, n // p, k // p
+    n_chunk = kl // width
+
+    @partial(shard_map, mesh=mesh, in_specs=(P(None, 'x', 'y'),) * 2,
+             out_specs=P(None, 'x', 'y'), check_vma=False)
+    def product(a, b):
+        def gather(j):
+            left = lax.dynamic_slice_in_dim(a, j * width, width, axis=2)
+            right = lax.dynamic_slice_in_dim(b, j * width, width, axis=1)
+            return (lax.all_gather(left, 'y', axis=2, tiled=True),
+                    lax.all_gather(right, 'x', axis=1, tiled=True))
+
+        def step(carry, j):
+            c, (left, right) = carry
+            ahead = gather(j + 1)
+            return (c + left @ right, ahead), None
+
+        c = jnp.zeros((q, mx, ny), a.dtype)
+        (c, (left, right)), _ = lax.scan(
+            step, (c, gather(0)), jnp.arange(n_chunk - 1), unroll=1)
+        return c + left @ right
+
+    face = NamedSharding(mesh, P(None, 'x', 'y'))
+    return jax.jit(product, in_shardings=(face, face), out_shardings=face)
