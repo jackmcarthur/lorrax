@@ -9,7 +9,7 @@
 # should source the split pieces directly:
 #
 #   gpu_env.sh            — rtx CUDA env: FFI .so, nvidia wheel libs, the
-#                           cuda_async + sm_75 XLA_FLAGS pairing
+#                           sm_75 XLA_FLAGS for the runtime's cuda_async pool
 #   mpi_transport_env.sh  — Intel-MPI transport: PMI2 glue, fabrics,
 #                           LORRAX_MPI_PROVIDER case-block, UCX setdefaults.
 #                           Now applied UNCONDITIONALLY (it used to hide

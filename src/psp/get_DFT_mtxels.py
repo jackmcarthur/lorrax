@@ -25,22 +25,12 @@ os.environ.setdefault("JAX_ENABLE_X64", "1")
 # Respect user/project overrides; otherwise prefer GPU-capable platforms
 if "JAX_PLATFORMS" not in os.environ and "JAX_PLATFORM_NAME" not in os.environ:
     os.environ["JAX_PLATFORMS"] = "cuda,cpu"
-# Canonical value, single-sourced in runtime.set_default_env() — kept here
-# only because this module is also a standalone CLI that does not call
-# bootstrap().  See that function for the measurement (jobs 7882442/7882447).
-os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
-# REMOVED, both measured on 8 GPUs (job 7882442) rather than argued:
-#   XLA_PYTHON_CLIENT_ALLOCATOR=platform — `platform` is plain cudaMalloc, NOT
-#     cudaMallocAsync as the old comment here and three docs claimed.  Under it
-#     memory_stats() reports bytes_limit=0 and peak_bytes_in_use=0, so it
-#     silently zeroes gw_init's GPU high-water report and gw_output's XLA-pool
-#     banner.  Leaving it unset selects BFC, which keeps those readings.
-#   TF_GPU_ALLOCATOR=cuda_malloc_async — a TensorFlow variable, inert for JAX.
-#     A cell setting only this was identical to the unset cell on every metric,
-#     including an 11.805 GB BFC pool that cuda_async never has.
-# NOTE these two also only ever took effect when this module was imported
-# BEFORE the first jax.devices(); under gw/kin_ion_io.py they ran after it and
-# changed nothing but the strings in os.environ.
+# The GPU pool policy (allocator, reservation, fraction) is single-sourced in
+# runtime.set_default_gpu_pool(); called here only because this module is also
+# a standalone CLI that does not call bootstrap().  Under gw/kin_ion_io.py it
+# runs after the CUDA client exists and changes nothing.
+from runtime import set_default_gpu_pool
+set_default_gpu_pool()
 
 import numpy as np
 import jax

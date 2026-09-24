@@ -399,7 +399,7 @@ rest.
 |---|---|---|
 | `JAX_ENABLE_X64` | `1` | 64-bit precision (required for GW).  Runtime-owned: applied even when jax was imported first, and a resolved `False` refuses at startup (`LORRAX_ALLOW_X64_OFF=1` continues, announced uncertified) |
 | `JAX_PLATFORMS` | `cuda,cpu` (GPU) / `cpu` (CPU runs) | an explicit `cpu` also arms the CUDA-plugin-skip (below) |
-| `XLA_PYTHON_CLIENT_PREALLOCATE` | `false` | don't pre-grab a fixed XLA pool (set by `runtime.set_default_env()`) |
+| `XLA_PYTHON_CLIENT_ALLOCATOR` / `XLA_PYTHON_CLIENT_PREALLOCATE` / `XLA_CLIENT_MEM_FRACTION` | `cuda_async` / `true` / `0.85` on CUDA; untouched on CPU; ROCm keeps BFC with `PREALLOCATE=false` | the one GPU pool policy, `runtime.set_default_gpu_pool()` (§2.1).  A run script sets none of them |
 | `HDF5_USE_FILE_LOCKING` | `FALSE` | Lustre HDF5 compatibility |
 
 There is one repository-configured LORRAX compile-cache owner:
@@ -434,12 +434,54 @@ Measured on 8× Quadro RTX 5000 across 2 nodes (jobs 7882442 / 7882447 /
 pool — pre-grabbing 95 % into BFC (`MEM_FRACTION=0.95`) starves NCCL and
 surfaces as `cusolverMpSyevd: status=7`.
 
+**The policy: `cuda_async`, reserved, fraction 0.85** (`runtime.set_default_gpu_pool()`,
+every CUDA run; an explicit export wins and the startup report names it).
+What XLA does with it (jaxlib 0.9.1 source): PJRT allocates from the device's
+**default** mempool (`create_new_pool=false`), the same pool every FFI
+`cudaMallocAsync` uses.  The pool's release threshold equals the
+reservation: `PREALLOCATE=true` maps `fraction × total` once and keeps it;
+`false` sets the threshold to 0, so the pool unmaps every idle byte at each
+synchronize and the next launch maps it again (the per-executable 25–110 ms
+stall measured in `runs/runtime/sigma_tau_sweep_20260924`).  The fraction is
+**not a cap** under `cuda_async` — `AllocateRaw` never checks it; it sizes the
+reservation and the `bytes_limit` the planners budget 0.9× of.  Reserved
+memory XLA is not using is released by the driver to an unrelated
+allocation in the same process (raw `cudaMalloc`, `cuMemCreate`, NCCL), so
+the reservation takes nothing from the C++ libraries that an unreserved pool
+would have left them; XLA's live bytes are unavailable to them either way.
+Measured on A100-40GB, P4 on a 2×2 mesh, 2026-09-24 (sandbox
+`runs/runtime/gpu_pool_policy_20260924`, JID 58826377; `pool_mem.py` reads
+`total − free − default-pool reserved`, i.e. every byte outside the pool):
+
+| per rank | bytes outside the pool |
+|---|---|
+| CUDA context + modules at startup | 0.46 GB |
+| + three XLA NCCL cliques (x, y, xy) | 1.37 GB |
+| + cuSOLVERMp context, eigh n=8192 | 2.92 GB |
+| + cuSOLVERMp potrf n=8192 (context's grow-only `cudaMalloc` workspace) | 4.71 GB |
+| + jaxlib local eigh n=10000 (workspace is XLA's) | 4.72 GB |
+
+With the pool reserved at 0.85 (36.04 GB) and 5.0 GB free, a raw `cuMemAlloc`
+of 23.0 GB succeeded in 0.85 s (the driver trimmed the idle pool 36.0 → 4.0 GB),
+and so did `cuMemCreate`; at 0.95 (0.77 GB free) 20.9 GB succeeded too.  A
+4 GB allocate-sync-free loop costs 5.5 ms reserved and 68–151 ms unreserved.
+Memory freed by XLA whose stream-ordered free has not retired cannot be
+trimmed, reserved or not.  The trim does **not** cross processes: a second
+process on the same GPU gets only what lies outside the first one's pool,
+so one process per GPU is a requirement (the test harness's mesh child sets
+`ALLOCATOR=platform` for exactly this).  The full numbers, including the
+real-deck legs, are in the sandbox report
+`reports/overnight_2026-09-24/gpu_pool_policy.md`.
+
 Three standing corrections:
 
-* `runtime.set_default_env()` deliberately leaves the allocator **unset**
-  (= BFC). On sm_75 (Frontera rtx) `cuda_async` additionally needs the
-  command-buffer `XLA_FLAGS` restriction — `config/frontera/gpu_env.sh`
-  sets the **pair**; never promote one half alone.
+* The old default — allocator unset (BFC), preallocation off — existed for
+  a grow-only cuFFT `cudaMalloc` arena that is gone (the CUDA k-convolution is
+  nvidia-mathdx on XLA-owned buffers since 2026-09-24).  BFC's arena, unlike
+  the async pool, is never released to other allocations, which is why
+  pre-grabbing 95 % into BFC starved NCCL.  On sm_75 (Frontera rtx)
+  `cuda_async` needs the command-buffer `XLA_FLAGS` restriction that
+  `config/frontera/gpu_env.sh` sets.
 * An unrecognised allocator spelling is refused up front by
   `runtime._check_allocator_env()` — left to jaxlib it surfaces as
   `Backend 'cuda' is not in the list of known backends`, which reads as
@@ -495,7 +537,7 @@ the CUDA plugin cold load hiding inside the first `jax.devices()`.
 |---|---|
 | `No GPU/TPU found, falling back to CPU` | `nvidia-smi`; `CUDA_VISIBLE_DEVICES`; jaxlib must be the CUDA build |
 | `RESOURCE_EXHAUSTED: Out of memory` | check `memory_per_device_gb` and the A–F planner report; lower `band_chunk_size`, `r_chunk_size`, or `gflat_chunk_size` for Peaks A/C/D, and `vq_g_chunk_size` only for the Vq kernel's inner G workspace; zero selects the live auto policies documented in [memory-model](../architecture/memory-model.md) |
-| `cusolverMpSyevd: status=7` + NCCL error 1 | XLA pre-allocated the pool — confirm `XLA_PYTHON_CLIENT_PREALLOCATE=false` and no user `MEM_FRACTION` override (§2.1) |
+| `cusolverMpSyevd: status=7` + NCCL error 1 | memory outside XLA's pool could not be had: under BFC that is the pre-grabbed arena; under the `cuda_async` policy it means XLA's LIVE bytes plus the non-pool bytes exceed the card — check for a caller's `ALLOCATOR=bfc` or a `MEM_FRACTION` above 0.85 in the startup report (§2.1) |
 | a CPU/MPI run exits rc=1 **after** succeeding | its driver did not cross the shared `runtime.run_main_and_finalize()` boundary (the older Frontera overlay is a driver-specific fallback; [transports](transports.md)) |
 | HDF5 "file is already open" on Lustre | `HDF5_USE_FILE_LOCKING=FALSE` |
 | wrong data from `psum_scatter` on CPU, rc=0 | you are on gloo — see [transports](transports.md); this is the corruption that moved LORRAX to `impl=mpi` |

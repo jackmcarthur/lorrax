@@ -24,8 +24,9 @@ _ENV_KEYS = ("JAX_PROCESS_COUNT", "JAX_NUM_PROCESSES", "SLURM_NTASKS",
              # independent of BOTH test order and the ambient shell.  A
              # developer who has sourced config/frontera/ffi_env.sh has
              # XLA_PYTHON_CLIENT_ALLOCATOR exported, which would otherwise
-             # make the "stays unset" assertion fail for the wrong reason.
+             # make the policy assertions fail for the wrong reason.
              "XLA_PYTHON_CLIENT_PREALLOCATE", "XLA_PYTHON_CLIENT_ALLOCATOR",
+             "XLA_CLIENT_MEM_FRACTION", "XLA_PYTHON_CLIENT_MEM_FRACTION",
              "TF_GPU_ALLOCATOR", "XLA_FLAGS")
 
 
@@ -158,51 +159,56 @@ def test_forced_cpu_does_not_add_a_gpu_xla_flag(clean_env):
     assert receipt["value"] is None
 
 
-def test_set_default_env_disables_gpu_preallocation(clean_env):
-    """The canonical GPU allocator answer, pinned so it cannot drift back.
+def test_set_default_env_reserves_the_cuda_async_pool(clean_env):
+    """The one GPU pool policy (runtime.set_default_gpu_pool), pinned.
 
-    Left unset, jaxlib omits the ``preallocate`` option and the PJRT GPU
-    client preallocates 75% of the card.  LORRAX's FFI handlers allocate
-    OUTSIDE XLA (the cuFFT arena in ``ffi/cufft``), so that hoard is taken
-    straight out of their budget.  Measured on 8 Quadro RTX 5000 across 2
-    nodes (jobs 7882442 / 7882447): with 6 GiB of live XLA arrays on a
-    15.74 GB card, the largest cuFFT plan still creatable goes from 3.07 GB
-    (preallocate unset) to 7.16 GB (``false``).
-
-    This regression is exactly how the setting was lost once already: the
-    value used to live in the drivers, and removing it from one of them
-    silently changed GPU behaviour because nothing else supplied it.
+    cuda_async draws from the device's default mempool; unreserved, its
+    release threshold is 0 and it re-maps memory at every synchronize
+    (CrI3 8x8 P4, 2026-09-24: whole run 204.3 -> 175.0 s once reserved).
+    The fraction is the planners' budget, formerly typed per run.
     """
-    clean_env.delenv("XLA_PYTHON_CLIENT_PREALLOCATE", raising=False)
+    clean_env.setenv("JAX_PLATFORMS", "cuda,cpu")
     set_default_env()
-    assert os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] == "false"
-
-    # ALLOCATOR stays unset on purpose -> BFC, which is the only kind that
-    # keeps memory_stats() populated for gw_init/gw_output/aot_memory.
-    # `platform` reports bytes_limit=0 and peak_bytes_in_use=0 (job 7882447).
-    assert "XLA_PYTHON_CLIENT_ALLOCATOR" not in os.environ
+    assert os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] == "cuda_async"
+    assert os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] == "true"
+    assert os.environ["XLA_CLIENT_MEM_FRACTION"] == runtime.GPU_POOL_FRACTION
     # TF_GPU_ALLOCATOR is a TensorFlow variable and is inert for JAX.
     assert "TF_GPU_ALLOCATOR" not in os.environ
 
 
-def test_set_default_env_preallocate_override_wins(clean_env):
-    """A deployment script's explicit export must beat our setdefault.
-
-    ``config/frontera/ffi_env.sh`` exports the cuda_async pair together with
-    the sm_75 command-buffer XLA_FLAGS it requires; that combination has to
-    survive ``bootstrap()``.
-    """
-    clean_env.setenv("XLA_PYTHON_CLIENT_PREALLOCATE", "true")
+def test_an_explicit_fraction_or_allocator_wins(clean_env):
+    """Either fraction spelling suppresses the default; BFC stays unreserved."""
+    clean_env.setenv("JAX_PLATFORMS", "cuda,cpu")
+    clean_env.setenv("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.7")
+    clean_env.setenv("XLA_PYTHON_CLIENT_ALLOCATOR", "bfc")
     set_default_env()
-    assert os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] == "true"
+    assert "XLA_CLIENT_MEM_FRACTION" not in os.environ
+    assert os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] == "false"
+
+
+def test_rocm_keeps_the_unreserved_bfc_default(clean_env):
+    clean_env.setenv("JAX_PLATFORMS", "rocm,cpu")
+    set_default_env()
+    assert "XLA_PYTHON_CLIENT_ALLOCATOR" not in os.environ
+    assert os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] == "false"
+    assert "XLA_CLIENT_MEM_FRACTION" not in os.environ
+
+
+def test_set_default_env_preallocate_override_wins(clean_env):
+    """An explicit export beats the setdefault (and the report names it)."""
+    clean_env.setenv("JAX_PLATFORMS", "cuda,cpu")
+    clean_env.setenv("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+    set_default_env()
+    assert os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] == "false"
 
 
 def test_set_default_env_cpu_does_not_touch_gpu_allocator(clean_env):
     """A CPU-forced run has no GPU client, so it gets no GPU allocator env."""
-    clean_env.delenv("XLA_PYTHON_CLIENT_PREALLOCATE", raising=False)
     set_default_env(platform="cpu")
     assert os.environ["JAX_PLATFORMS"] == "cpu"
     assert "XLA_PYTHON_CLIENT_PREALLOCATE" not in os.environ
+    assert "XLA_PYTHON_CLIENT_ALLOCATOR" not in os.environ
+    assert "XLA_CLIENT_MEM_FRACTION" not in os.environ
     assert "XLA_FLAGS" not in os.environ
 
 

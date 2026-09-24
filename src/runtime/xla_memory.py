@@ -96,8 +96,8 @@ from . import _FALSY_TOKENS as _ENV_FALSE
 # faithful BFC peak.
 #
 # This function READS ONLY.  It never sets an allocator variable: which
-# values LORRAX ships is decided in ``runtime.set_default_env``
-# (PREALLOCATE=false, ALLOCATOR deliberately unset = BFC).  Everything here
+# values LORRAX ships is decided in ``runtime.set_default_gpu_pool``
+# (cuda_async, PREALLOCATE=true, fraction 0.85 on CUDA).  Everything here
 # must stay correct under every one of them, including unset.
 
 _XLA_ALLOCATORS = ("default", "platform", "bfc", "cuda_async")

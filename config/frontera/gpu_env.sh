@@ -5,9 +5,9 @@
 #
 # Split out of ffi_env.sh (2026-07-31, env audit P0.3): this file owns the
 # GPU-only half — the FFI .so path, the venv nvidia wheel LD_LIBRARY_PATH,
-# cuSOLVERMp/NCCL knobs, JAX numerics, and the cuda_async + sm_75 XLA_FLAGS
-# PAIRING (the two halves must travel together — see the allocator comment
-# below).  MPI transport hygiene lives in mpi_transport_env.sh; the phdf5
+# cuSOLVERMp/NCCL knobs, JAX numerics, and the sm_75 command-buffer XLA_FLAGS
+# that the runtime's cuda_async pool needs on Turing (see the allocator
+# comment below).  MPI transport hygiene lives in mpi_transport_env.sh; the phdf5
 # staging block lives in the back-compat ffi_env.sh shim.
 # ============================================================================
 : "${LORRAX_VENV:=$WORK/lorrax_env/.venv}"
@@ -26,34 +26,15 @@ export LD_LIBRARY_PATH="$LORRAX_FFI_STAGE/stage/lib:${_NV_LIBS}${LD_LIBRARY_PATH
 # use the CUDA async mempool so JAX and the solver share VRAM (avoids the
 # NCCL-starved-of-VRAM -> cusolverMpSyevd status=7 failure).
 export CUSOLVERMP_FORCE_NCCL=1
-# ---------------------------------------------------------------------------
-# WHY THIS FILE MAY SET A DIFFERENT ALLOCATOR THAN runtime.set_default_env()
-#
-# PREALLOCATE=false is NOT a difference -- it is the same canonical value the
-# runtime now sets for every driver, restated here because this file is also
-# sourced by bare FFI tests that never enter Python's bootstrap.
-#
-# ALLOCATOR=cuda_async IS a deliberate deployment-only override, and this is
-# the one file entitled to make it.  Measured on 8x Quadro RTX 5000 across 2
-# nodes (job 7882447, 6 GiB of live XLA arrays on a 15.74 GB card):
-#
-#     allocator            XLA overhead   largest cuFFT plan still creatable
-#     default (BFC)+false   2.13 GB        7.16 GB
-#     cuda_async    +false  0.19 GB        9.20 GB
-#
-# so cuda_async is worth ~2 GB per card to the out-of-XLA cuFFT arena, and
-# unlike `platform` it still reports peak_bytes_in_use.  It is not the
-# in-code default only because on Turing (sm_75) cudaMallocAsync REQUIRES the
-# command-buffer restriction set further down this same file (see the
-# XLA_FLAGS block below) -- and this file is the only place that sets both
-# halves together.  A run that sources this script gets the matched pair; a
-# run that does not gets the runtime's safe BFC default.
-#
-# Do NOT move cuda_async into runtime.set_default_env() without moving that
-# XLA_FLAGS mitigation with it.  `export` here (not setdefault) is correct:
-# it must beat the runtime's setdefault, which is written to yield.
-export XLA_PYTHON_CLIENT_ALLOCATOR=cuda_async
-export XLA_PYTHON_CLIENT_PREALLOCATE=false
+# The GPU memory pool is runtime policy: runtime.set_default_gpu_pool()
+# selects cuda_async with its pool reserved on every CUDA run (measured
+# rationale in that docstring; this file used to export ALLOCATOR=cuda_async
+# with PREALLOCATE=false, the unreserved pool that re-maps memory at every
+# synchronize).  What stays HERE is the one piece that is specific to this
+# machine: the sm_75 + driver-535 command-buffer XLA_FLAGS restriction below,
+# which cudaMallocAsync needs on Turing.  Every Frontera GPU run sources this
+# file (it is also where the FFI .so path comes from), so the pair still
+# travels together.
 
 # JAX numerics
 export JAX_ENABLE_X64=1
