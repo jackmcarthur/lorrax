@@ -883,20 +883,19 @@ def test_spinor_zero_fill_gate_can_fail(tmp_path):
     PASS.  This re-runs the same scan over a copy of an actual source file
     with the pre-change spelling restored, and requires it to go red.
     """
-    real = (Path(__file__).resolve().parents[1] / "src" / "gw" / "kin_ion_io.py")
+    real = (Path(__file__).resolve().parents[1] / "src" / "common" / "wfn_transforms.py")
     text = real.read_text()
     assert "_refuse_spinor_zero_fill" in text, "fixture file no longer relevant"
     injected = text.replace(
-        "        from common.wfn_transforms import _refuse_spinor_zero_fill\n"
         "        _refuse_spinor_zero_fill(int(meta.nspinor), ns_have,\n"
-        "                                 origin=\"kin_ion_io._load_rotated_occ_fftbox\")",
-        "        psi_g = jnp.pad(psi_g, ((0, 0), (0, 0),\n"
-        "                                (0, int(meta.nspinor) - ns_have), (0, 0)))")
+        "                                 origin=\"wfn_transforms.load_kpoint_fftbox_local\")",
+        "        psi = jnp.pad(psi, ((0, 0), (0, 0),\n"
+        "                            (0, int(meta.nspinor) - ns_have), (0, 0)))")
     assert injected != text, (
         "could not inject the canonical violation into a real file — the "
         "gate's failure case is unreachable and it must report UNFALSIFIABLE")
 
-    victim = tmp_path / "kin_ion_io.py"
+    victim = tmp_path / "wfn_transforms.py"
     victim.write_text(injected)
 
     offenders = []

@@ -652,7 +652,7 @@ def test_kin_ion_io_shim_if_present_forwards_and_does_not_copy():
     """
     from gw import kin_ion_io as K
 
-    for name in ("rho_work_items", "compute_hartree_matrix",
+    for name in ("compute_hartree_matrix",
                  "get_kin_ion_k", "build_argparser", "main"):
         assert hasattr(K, name), f"kin_ion_io stopped exporting {name}"
     service = {"sweep_local_k": C.sweep_local_k,

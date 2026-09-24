@@ -92,14 +92,11 @@ def test_cohsex_has_no_second_hartree_density_owner():
 def test_live_hartree_derives_f_spin_at_the_density_owner():
     """Pin the production call chain from exact Hartree to the quadrature."""
     source = (_REPO / "src" / "gw" / "kin_ion_io.py").read_text()
-    density_src = source[
-        source.index("def build_valence_density_distributed("):
-        source.index("class ExactHartreeMatrices")
-    ]
     hartree_src = source[source.index("def compute_hartree_matrix("):]
-    assert "f_spin = spin_degeneracy_factor(wfn)" in density_src
-    assert "spin_degeneracy=f_spin" in density_src
-    assert "build_valence_density_distributed(" in hartree_src
+    # One density builder: the SC loop's scan, fed the loader's f_spin.
+    assert "f_spin = spin_degeneracy_factor(wfn)" in hartree_src
+    assert "spin_degeneracy=f_spin" in hartree_src
+    assert "rho_from_wfns(" in hartree_src
 
 
 def test_spin_capacity_refuses_an_undeclared_spin_structure():

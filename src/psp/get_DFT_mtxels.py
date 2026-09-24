@@ -394,10 +394,10 @@ def valence_density_from_kpoint(
     current component inside this one IFFT transaction.
 
     Single source of truth for the per-k density quadrature: the same-grid
-    arm of all-k-resident :func:`compute_valence_density`, the chunked per-k
-    CLI and the k/band-partitioned distributed sweep
-    (``gw.kin_ion_io.build_valence_density_distributed``) all go
-    through this one function.  The arithmetic runs in ONE jitted module
+    arm of all-k-resident :func:`compute_valence_density` and the chunked
+    per-k CLI go through this one function (the exact GW Hartree density is
+    ``gw.qsgw_density.rho_from_wfns``, whose local contraction is shared
+    with it).  The arithmetic runs in ONE jitted module
     (:func:`_valence_density_kernel`; ``nocc`` static, scalars traced).
 
     ``include_dirac_current=True`` requires four-component bispinors and
@@ -748,9 +748,9 @@ def compute_valence_density(wfn_k, sym, wfn, *, k_source: str):
         raise ValueError(
             "compute_valence_density is the legacy resident all-k FFT-box "
             "path and may not materialize every band of a fractional WFN. "
-            "Use gw.kin_ion_io.build_valence_density_distributed for exact "
-            "band-streamed Hartree density, or the canonical QE density for "
-            "centroid selection.")
+            "Use gw.qsgw_density.rho_from_wfns (the one exact Hartree "
+            "density scan) or the canonical QE density for centroid "
+            "selection.")
     nocc_all = min(int(wfn.nelec), int(nb_all))
 
     gvecs_by_k = ngk_by_k = None
