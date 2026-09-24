@@ -134,8 +134,14 @@ def test_accumulate_planes_matches_full_box(axis):
 
     ref = run()
     got = run(planes=jnp.asarray(planes), plane_axis=axis)
-    print(f"[plane parity] zeta axis={axis} rel={_rel(got - acc0, ref - acc0):.3e}")
+    # V_q-shaped consumer: V_q(mu, nu) = sum_G zeta_q(mu, G) v_q(G) zeta_q(nu, G)*
+    # with a fixed positive v (the Coulomb contraction's shape).
+    v = np.random.default_rng(7).uniform(0.1, 2.0, (nq, ngkmax))
+    vq = lambda zg: np.einsum("qmg,qg,qng->qmn", zg - acc0, v, np.conj(zg - acc0))
+    print(f"[plane parity] zeta axis={axis} rel={_rel(got - acc0, ref - acc0):.3e} "
+          f"V_q rel={_rel(vq(got), vq(ref)):.3e}")
     assert _rel(got - acc0, ref - acc0) <= _TOL
+    assert _rel(vq(got), vq(ref)) <= _TOL
     bad = run(planes=jnp.asarray(np.array([planes[0], -1, -1], np.int32)),
               plane_axis=axis)
     assert _rel(bad - acc0, ref - acc0) > 1e-2

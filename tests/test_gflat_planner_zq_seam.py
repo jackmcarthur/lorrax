@@ -49,13 +49,18 @@ def _mesh_shim(p_x, p_y):
     return SimpleNamespace(shape={'x': p_x, 'y': p_y})
 
 
-def test_budget_outranks_the_mu_floor_and_the_arena_is_placeable():
+def test_budget_outranks_the_mu_floor_and_the_arena_is_placeable(monkeypatch):
     """The measured MoS2 8x8 full-BZ geometry: pre-fix the planner chose
     r_chunk=7888 (the mu floor did not bind, but the arena was 32.47 GiB
-    — over half the pool as one allocation).  Post-fix the single-arena
-    placement cap must bound the arena at _ARENA_PLACEMENT_FRAC of the
-    post-persistent headroom, which on this geometry also lands the
-    chosen r_chunk BELOW mu — the floor no longer outranks memory."""
+    — over half the pool as one allocation, refused by BFC).  The budget
+    must bound the chosen r_chunk BELOW mu — the floor no longer outranks
+    memory — and the certified HWM must fit.
+
+    Under the BFC allocator these failures were measured on, the single-
+    arena placement cap bounds the arena at ``_ARENA_PLACEMENT_FRAC`` of the
+    post-persistent headroom.  (Under cuda_async it is lifted — see the
+    next test.)"""
+    monkeypatch.setenv("XLA_PYTHON_CLIENT_ALLOCATOR", "bfc")
     nk = nq = 64
     ns = 2
     mu = 5360
@@ -85,6 +90,26 @@ def test_budget_outranks_the_mu_floor_and_the_arena_is_placeable():
         f"does not outrank the performance floor")
     # And the certified HWM actually fits the budget it certified against.
     assert plan.hwm_bytes <= plan.budget_bytes
+
+
+def test_cuda_async_lifts_the_single_arena_cap(monkeypatch):
+    """The same geometry under cuda_async: the arena cap does not bind
+    (VI3 12x12 P16 ran at the full sum cap, runs/runtime/zeta_fit_20260923/
+    08_*), so r_chunk is set by the sum budget alone and is strictly larger
+    than the BFC plan's, while the certified HWM still fits."""
+    kw = dict(
+        meta=_fake_meta(nk_tot=64, nspinor=2, n_rmu=5360, n_rtot=46080,
+                        ngkmax=1975),
+        mesh_xy=_mesh_shim(4, 4),
+        nb_total=608, fit_nb_total=608, ngkmax=1975, n_q_disk=64,
+        budget_gb=64.0, band_chunk_override=608,
+        pair_density_slots=3, distributed_zeta_solve="distributed")
+    monkeypatch.setenv("XLA_PYTHON_CLIENT_ALLOCATOR", "bfc")
+    bfc = plan_gflat_chunks(**kw)
+    monkeypatch.setenv("XLA_PYTHON_CLIENT_ALLOCATOR", "cuda_async")
+    asy = plan_gflat_chunks(**kw)
+    assert asy.r_chunk > bfc.r_chunk
+    assert asy.hwm_bytes <= asy.budget_bytes
 
 
 def test_zq_is_charged_live_across_the_solve_seam():

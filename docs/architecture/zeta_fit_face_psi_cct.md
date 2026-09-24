@@ -66,6 +66,21 @@ r-slot indices, local permutations and wraps as runtime operands. Parent
 centroids likewise keep each orbit on one owner. Thus both endpoint
 symmetry gathers stay local.
 
+Orbits are poured into tiles in PLANE order (2026-09-23) along the grid
+axis they cross least (`plane_axis_for_orbits`: fewest orbit–plane
+incidences, ties toward more planes — the stacking axis of a layered crystal,
+whose point group sends z to ±z), each whole orbit onto the least-loaded Y
+owner of the current tile.  A tile of W points therefore lies on about
+W/plane-size planes (`tile_planes`), and the two per-tile transforms run on
+those planes only (`common.wfn_transforms`, "Plane-restricted transforms"):
+ψ(G)→ψ(tile) as sphere → cylinder of occupied columns → partial IDFT along
+the axis → 2D IFFT, and ζ(tile)→ζ(G) as 2D FFT → partial DFT evaluated on
+the sphere.  Per row that costs n_planes·(plane FFT + sphere) instead of one
+full-box FFT; the former LPT packing dealt equal-size orbits round-robin, so
+every tile touched every plane.  VI3 12×12 P16: accumulate 3.31 s → 0.10 s
+and Z_q build 2.80 s → 1.93 s per 1280-point chunk
+(`runs/runtime/zeta_fit_20260923`).  The ψ(r)-cache route is unchanged.
+
 The Z kernel carries centroid axes in packed order and its r axis in tile
 slot order. The q-selected RHS enters the existing factor/solve owner;
 `accumulate_rchunk_to_gflat(r_indices=...)` scatters solved tile slots into

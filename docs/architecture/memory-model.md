@@ -652,6 +652,23 @@ shape; that's the slot count.  Update
 `reference_hlo_dump_workflow_lorrax.md` for
 the shifter-aware launcher.
 
+## ζ-fit Stage C calibration (2026-09-23)
+
+Measured on VI3 12×12 charge at P16 (A100-80GB, cuda_async, OFI;
+`runs/runtime/zeta_fit_20260923`), against the plan the banner printed:
+
+| term | planned | measured | fix |
+|---|---|---|---|
+| persistent (L_q + ζ(G) + ψ + loader) | 43.34 GB | 38.35 GB in use at r-chunk 0 | ζ(G) was priced with `ngkmax = 0.06·n_rtot` (82,944) because meta carries no ζ sphere; `gw_init.zeta_sphere_ngkmax` now runs the fit's own sphere function (72,541) → 38.52 GB |
+| r_chunk | 1281 (single-arena cap, 0.5× headroom) | the full sum cap ran | the single-arena cap (`_ARENA_PLACEMENT_FRAC`, calibrated on two BFC failures) now binds only under BFC-class allocators; under the mandated cuda_async the sum cap 3416 ran with a 52.95 GB peak against the 59.42 GB target.  Unmeasured under cuda_async: a ~32 GiB single arena (the MoS2 8×8 geometry) |
+| Stage-C slope | 5.59 MB per r point | 4.27 MB (peak − persistent at r = 3416) | left conservative (24 %) |
+
+Chunk count 1080 → 406; per-chunk 7.0 s (base) → 3.5 s (R4 + plane
+transforms at the larger chunk).  The planner's rank floor for this deck is
+now P_min = 12: below it the resident ζ(G) accumulator plus one minimal chunk
+does not fit, which is where a q-tiled or accumulator-free fit would be
+needed.
+
 ## Automatic Sizing Algorithm
 
 Run order in `gw_init.prepare_isdf_and_wavefunctions`:
