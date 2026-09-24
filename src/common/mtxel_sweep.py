@@ -58,6 +58,12 @@ projectors are built per slab (``R × G/P``), where the band-split plan built
 the whole ``(R, ngkmax)`` — and ``(3, R, ngkmax)`` for the dipole — on every
 rank for every k.
 
+Measured, VI3 12×12 window [0,120), 144 k, ns=2, P4 on one node, warm
+medians, band-split → G-split (``runs/runtime/mtxel_sweep_20260923``
+a10/a14): V_H 2.963 → 2.480 s, kinetic 0.675 → 0.144 s, dipole p
+0.900 → 0.275 s; executables 12.78 → 12.78, 9.93 → 9.74, 10.27 → 9.88 GiB;
+blocks equal to 1.4e-14 relative.  V_H gains least: its wall is the FFTs.
+
 WHERE THE CROSSOVER IS.  The one non-``1/P`` transient is the tile's
 ``(K, c, nb, nb)`` partial.  The G split beats the band split in both bytes
 and memory while ``nb·√P < ns·N_G``; with N_G/nb ≈ 200–1000 at production
@@ -447,7 +453,7 @@ def four_current_potential_operator(
     The returned two components are separate matrix elements, not their sum:
     component 0 is the scalar charge Hartree and component 1 is the spatial
     Dirac-current Hartree.  They share the sphere scatter, inverse FFT, ket
-    reshard and bra contraction.  The forward FFT is batched over the two
+    all-to-all and slab contraction.  The forward FFT is batched over the two
     outputs, preserving the decomposition required by ``sigma_mnk.h5``.
 
     ``charge_nspinor`` applies only to component 0.  This is load-bearing for
@@ -524,10 +530,8 @@ def _ket(psi_n, gmask):
     for the local plan and satisfies it the same way.
 
     The leading k axis is singleton, so dropping it moves the band axis
-    from 1 to 0 without moving any data; the sweep re-adds it before the
-    einsum.  No sharding constraint is issued here — XLA carries the band
-    sharding through a squeeze, and the one per-k collective is the
-    reshard in the sweep body, which this must not duplicate.
+    from 1 to 0 without moving any data.  It runs on this rank's own bands
+    inside the sweep's ``shard_map``; the sweep owns every collective.
     """
     psi = psi_n[0]
     return psi * gmask[None, None, :].astype(psi.dtype)
@@ -901,7 +905,7 @@ def uniform_gauge_operator(geom: SweepGeometry, *, bvec, blat,
     Kinetic contact comes from :mod:`psp.dft_operators`; the exact-origin,
     row/G-bounded VNL current and contact come from :mod:`psp.vnl_ops`.
     Everything is evaluated inside one :func:`sweep_matrix_elements` scan,
-    so the WFN bra reshard and projector coefficient pass are not paid by
+    so the ψ all-to-all and projector coefficient pass are not paid by
     separate current/contact drivers.
 
     ``kinetic_balance_lift`` names the representation already carried by
@@ -1225,7 +1229,7 @@ def sweep_uniform_current_matrix_elements(
 ) -> UniformGaugeCurrentMatrixElements:
     """Select only ``Gamma_raw`` from the canonical uniform-gauge sweep.
 
-    The operator closure, band reshard, VNL action and fingerprint owner
+    The operator closure, band-layout VNL action and fingerprint owner
     are :func:`_uniform_gauge_operator_identity` and its siblings; this is
     now their ONLY caller (the complete sweep that produced contact and
     transfer components was deleted on 2026-09-02, unreachable from any

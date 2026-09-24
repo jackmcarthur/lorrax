@@ -186,7 +186,11 @@ def _reference(case, psi, gv, gmask, bidx, kvecs, extra):
                 psi_m, gv[ik].astype(float), kvecs[ik], extra["B"],
                 None if case == "dipole_p" else extra["setup"],
                 -1.0 if case == "dipole_legacy" else 1.0))
-        elif case == "four_current":
+        elif case == "dirac_current":
+            from common.bispinor_init import apply_dirac_velocity_to_ket
+            ket = np.asarray(apply_dirac_velocity_to_ket(jnp.asarray(psi_m)))
+            out.append(np.einsum("msg,cnsg->cmn", np.conj(psi_m), ket))
+        elif case in ("four_current", "uniform_current"):
             # The band-layout operator's OWN ket at one k on one device:
             # this arm isolates the sweep's layout and collectives for a
             # component-carrying FFT ket, not the operator physics.
@@ -218,7 +222,9 @@ def _operator(case, geom, extra):
             geom, bvec=extra["B"], blat=1.0,
             vnl_setup=None if case == "dipole_p" else extra["setup"],
             vnl_velocity_sign=-1.0 if case == "dipole_legacy" else 1.0)
-    if case == "four_current":
+    if case == "dirac_current":
+        return mtxel_sweep.dirac_current_operator(geom)
+    if case in ("four_current", "uniform_current"):
         return extra["op"]
     raise ValueError(case)
 
@@ -235,6 +241,14 @@ def _run(case, ns, k_tile=None, use_scan=True, monkeypatch=None):
                              ns=ns, nk=NK, cell_volume=VOLUME)
         if case in ("vnl", "kin_ion", "dipole", "dipole_legacy"):
             extra["setup"] = _vnl_setup(ns if ns == 2 else 2)
+        if case == "uniform_current":
+            # The uniform-gauge kernel refuses a setup without coupled-row
+            # provenance; reuse the gauge-vertex test's canonical builder.
+            from tests.test_dft_gauge_vertices import _setup as gauge_setup
+            setup = gauge_setup(curved=False, natoms=2)
+            extra["op"] = mtxel_sweep.uniform_gauge_operator(
+                geom, bvec=np.asarray(setup.B), blat=1.0, vnl_setup=setup,
+                include_contact=False)
         if case == "four_current":
             extra["op"] = four_current_potential_operator(
                 geom, extra["V_r"], rng.standard_normal((3, *GRID)),
@@ -264,7 +278,8 @@ def _rel(got, ref):
 
 CASES = [("vh", 2), ("kinetic", 2), ("vnl", 2), ("kin_ion", 2),
          ("dipole", 2), ("dipole_legacy", 2), ("dipole_p", 2),
-         ("vnl", 4), ("four_current", 4)]
+         ("vnl", 4), ("four_current", 4), ("uniform_current", 4),
+         ("dirac_current", 4)]
 
 
 @pytest.mark.mesh(4)
