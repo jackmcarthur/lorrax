@@ -599,7 +599,8 @@ def _plan_rows_pass(geom: dict, *, rows: int, omega_rows: int,
                 f"per device: {_rows_pass_bytes(geom, rows=1, fft_rows=1, local_cols=1, omega_rows=omega_rows, resident=resident)/2**30:.2f}"
                 f" GiB/device against {capacity/2**30:.2f} GiB/device")
         groups *= 2
-    fft = _largest_fit(per, lambda f: _rows_pass_bytes(
+    fft = _largest_fit(per, lambda f: f * geom["row_cufft"] <= geom[
+        "reserve"] and _rows_pass_bytes(
         geom, rows=-(-per // f) * f, fft_rows=f, local_cols=cols,
         omega_rows=omega_rows, resident=resident) <= capacity)
     fft = max(1, fft)
@@ -645,11 +646,14 @@ def _plan_basis_passes(geom: dict, *, band_carrier: int, rank: int,
             f"its resident rows ({x_resident/2**30:.2f} GiB/device) against "
             f"{capacity/2**30:.2f} GiB/device")
     cols = x_cols
+    bpd = int(band_carrier) // p
     k_tile = max(d for d in range(1, nk + 1) if nk % d == 0 and (
-        d == 1 or _projection_bytes(
-            geom, band_carrier=band_carrier, rank=rank, local_cols=cols,
-            k_tile=d) <= capacity))
-    fft = max(1, _largest_fit(per, lambda f: _rows_pass_bytes(
+        d == 1 or (d * bpd * geom["row_cufft"] <= geom["reserve"]
+                   and _projection_bytes(
+                       geom, band_carrier=band_carrier, rank=rank,
+                       local_cols=cols, k_tile=d) <= capacity)))
+    fft = max(1, _largest_fit(per, lambda f: f * geom["row_cufft"] <= geom[
+        "reserve"] and _rows_pass_bytes(
         geom, rows=-(-per // f) * f, fft_rows=f, local_cols=cols,
         omega_rows=0, resident=x_resident) <= capacity))
     live = {
@@ -670,7 +674,9 @@ def _whole_state_geometry(*, meta, mesh_xy: Mesh, nk: int, nspinor: int,
 
     The one-row price is the compiled canonical G-flat -> full-grid program
     (gather, ``ifftn(norm='ortho')``, Bloch phase, output) including its
-    cuFFT workspace, so every FFT batch below is priced by measurement.
+    cuFFT workspace, so every FFT batch below is priced by measurement; a
+    batch's cuFFT workspace (rows x the one-row workspace) must also fit the
+    contiguous reserve outside the stage target.
     """
     n_rtot = int(meta.n_rtot)
     memory = gflat_to_rchunk_aot_memory(
@@ -682,13 +688,14 @@ def _whole_state_geometry(*, meta, mesh_xy: Mesh, nk: int, nspinor: int,
         p=int(mesh_xy.size), ns=int(nspinor), nk=int(nk),
         ngkmax=int(ngkmax), n_rtot=n_rtot,
         g_index=float(nk * n_rtot * np.dtype(np.int32).itemsize),
-        row_fft=float(memory.total),
+        row_fft=float(memory.total), row_cufft=float(memory.cufft_scratch),
+        reserve=math.inf,
         n_band_chunks=lambda carrier: -(-(b1 - b0) // int(carrier)))
     if device_pool_limit is None or device_pool_limit <= 0:
         return geom, math.inf, memory
     capacity = (float(device_pool_limit)
                 * bfc_fragmentation_target_utilization(nspinor))
-    reserve = float(device_pool_limit) - capacity
+    reserve = geom["reserve"] = float(device_pool_limit) - capacity
     if float(memory.cufft_scratch) > reserve:
         raise MemoryError(
             "fit_galerkin_basis: the canonical one-row full-grid transform "
