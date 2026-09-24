@@ -470,7 +470,10 @@ keys themselves are in the [input reference](../input_reference.md).
 
 - **`ComputeMode`** is the single axis naming the ansatz for W's frequency
   dependence: `x_only`, `cohsex`, `gn_ppm`, `hl_ppm`, `mpa`. The value names
-  the ansatz, not the numerics (`mpa` rather than a generic "full frequency").
+  the ansatz, not the numerics. `full_freq` was rejected. It names a family
+  (contour deformation, real-axis quadrature and MPA are all full-frequency),
+  so a deck would still need a second axis to pick one. It also reserves the
+  name for a future pole-free numerical Σ.
   `is_dynamic` means "this run has an ω axis" (GN/HL-PPM and MPA);
   `ppm_model` is `'gn'`/`'hl'` and None for MPA and the static modes, so a site
   that means "which two-point PPM fit" asks `ppm_model`, never `is_dynamic`.
