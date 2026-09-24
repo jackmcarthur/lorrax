@@ -33,12 +33,13 @@ from functools import partial
 
 import jax
 import jax.numpy as jnp
-from jax.sharding import Mesh, PartitionSpec as P
+from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from distrib_la._shard_map import shard_map
 from distrib_la.resolve import mesh_key
 
-__all__ = ["batch_layout_eigh_call", "batch_reshard_call", "validate_batch_reshard_operands"]
+__all__ = ["batch_layout", "batch_layout_eigh_call", "batch_reshard_call",
+           "is_batch_layout", "local_batch", "validate_batch_reshard_operands"]
 
 
 _JIT_CACHE: dict = {}
@@ -256,34 +257,136 @@ def _real_rows(kernel, operands, *, nbatch: int, py: int):
     return jax.lax.fori_loop(0, local_nb, _one, out0)
 
 
-def local_batch(kernel, mesh):
+def _batch_spec(ndim: int):
+    """The batch layout of a rank-``ndim`` stack: rows over ``('x','y')``."""
+    return P(("x", "y"), *([None] * (ndim - 1)))
+
+
+def is_batch_layout(a, mesh) -> bool:
+    """True when ``a`` is a concrete stack already in the batch layout on ``mesh``.
+
+    That is ``(Bp, ...)`` at ``P(('x','y'), None, ...)`` with ``Bp`` a
+    multiple of ``Px*Py``: rank ``x*Py + y`` owns rows
+    ``[rank*Bp/P, (rank+1)*Bp/P)`` as whole trailing blocks. A tracer, a host
+    array or any other sharding answers ``False``.
+    """
+    sharding = getattr(a, "sharding", None)
+    if not isinstance(sharding, NamedSharding) or sharding.mesh != mesh:
+        return False
+    ndev = int(mesh.shape["x"]) * int(mesh.shape["y"])
+    return (a.ndim >= 1 and int(a.shape[0]) % ndev == 0
+            and tuple(sharding.spec) + (None,) * (a.ndim - len(sharding.spec))
+            == tuple(_batch_spec(a.ndim)))
+
+
+def batch_layout(a, mesh):
+    """Place a batch in the batch layout ONCE, to stay resident across calls.
+
+    ``a`` is either a face stack ``(B, M, N)`` at ``P(None,'x','y')``, which
+    moves by the same two exchanges as every route-(c) call, or a fully
+    replicated ``(B, ...)`` array (a pivot table, say), which each rank slices
+    locally. The result is ``(Bp, ...)`` at ``P(('x','y'), None, ...)`` with
+    ``Bp = ceil(B/(Px*Py))*Px*Py``; the ``Bp - B`` padded rows are zeros and
+    never reach a :func:`local_batch` kernel. Per rank this holds
+    ``ceil(B/P)`` whole blocks, the same bytes the route-(c) exchange puts
+    there transiently on every call. Any other input layout refuses: an
+    implicit reshard of a sharded stack is where GSPMD replicates.
+    """
+    px, py = int(mesh.shape["x"]), int(mesh.shape["y"])
+    ndev = px * py
+    nb = int(a.shape[0])
+    pad = (-nb) % ndev
+    sharding = getattr(a, "sharding", None)
+    face_in = (a.ndim == 3 and isinstance(sharding, NamedSharding)
+               and tuple(sharding.spec) == (None, "x", "y"))
+    if not face_in and not getattr(sharding, "is_fully_replicated", False):
+        raise ValueError(
+            f"batch_layout: expected a (B,M,N) face stack at P(None,'x','y') or a "
+            f"fully replicated array; got shape {tuple(a.shape)} with sharding "
+            f"{sharding!r}. Place the operand in one of those layouts first.")
+    if face_in and (int(a.shape[1]) % px or int(a.shape[2]) % py):
+        raise ValueError(
+            f"batch_layout: the face {tuple(a.shape[1:])} must tile the {px}x{py} "
+            f"mesh exactly; pad the matrix extent before calling.")
+    key = ("batch_layout", mesh_key(mesh), tuple(int(s) for s in a.shape),
+           str(a.dtype), face_in)
+    fn = _JIT_CACHE.get(key)
+    if fn is None:
+        if face_in:
+            fn = jax.jit(shard_map(
+                lambda t: _face_to_batch(_pad_leading(t, pad), px=px, py=py),
+                mesh=mesh, in_specs=(P(None, "x", "y"),),
+                out_specs=_batch_spec(3), check_vma=False))
+        else:
+            widths = ((0, pad),) + ((0, 0),) * (a.ndim - 1)
+            fn = jax.jit(lambda t: jnp.pad(t, widths),
+                         out_shardings=NamedSharding(mesh, _batch_spec(a.ndim)))
+        _JIT_CACHE[key] = fn
+    return fn(a)
+
+
+def local_batch(kernel, mesh, *, resident=()):
     """Run a composition of dense equations q-locally with one exchange each way.
 
     Inputs/outputs are face-sharded matrix batches (outputs may be a pytree).
     A singleton input batch is broadcast; padded q rows never enter the kernel.
     Reuses the same movement and real-row schedule as the individual plans.
+
+    ``resident`` names operand positions that are already in the batch layout
+    (:func:`batch_layout`, padded to ``Bp`` rows): those are not exchanged.
+    A factor laid out once therefore serves every later right-hand side while
+    only the right-hand side moves (face -> batch -> face), i.e. per rank
+    ``2*ceil(B/P)`` RHS blocks cross the network per call instead of whole
+    matrices. A position declared resident whose operand is not in that
+    layout refuses before tracing, because the implicit reshard it would
+    otherwise get is exactly the per-call matrix movement this exists to
+    remove.
     """
     px, py = int(mesh.shape['x']), int(mesh.shape['y'])
     face = P(None, 'x', 'y')
+    resident = frozenset(int(i) for i in resident)
 
     @jax.jit
-    def run(*operands):
-        nb = max(a.shape[0] for a in operands)
+    def _run(*operands):
+        moving = [a for i, a in enumerate(operands) if i not in resident]
+        if not moving:
+            raise ValueError('local_batch needs at least one face operand to set the batch')
+        nb = max(a.shape[0] for a in moving)
         if any(a.ndim != 3 or a.shape[0] not in (1, nb)
-               or a.shape[1] % px or a.shape[2] % py for a in operands):
+               or a.shape[1] % px or a.shape[2] % py for a in moving):
             raise ValueError('local_batch requires matching matrix batches tiling the mesh')
         pad = (-nb) % (px * py)
-        inputs = tuple(_pad_leading(jnp.broadcast_to(a, (nb, *a.shape[1:])), pad)
-                       for a in operands)
+        for i in resident:
+            if int(operands[i].shape[0]) != nb + pad:
+                raise ValueError(
+                    f'local_batch: resident operand {i} has {operands[i].shape[0]} rows; '
+                    f'the batch layout of a {nb}-row batch carries {nb + pad}')
+        inputs = tuple(
+            a if i in resident
+            else _pad_leading(jnp.broadcast_to(a, (nb, *a.shape[1:])), pad)
+            for i, a in enumerate(operands))
+        in_specs = tuple(_batch_spec(a.ndim) if i in resident else face
+                         for i, a in enumerate(inputs))
 
-        @partial(shard_map, mesh=mesh, in_specs=(face,) * len(inputs),
+        @partial(shard_map, mesh=mesh, in_specs=in_specs,
                    out_specs=face, check_vma=False)
         def work(*tiles):
-            local = tuple(_face_to_batch(a, px=px, py=py) for a in tiles)
+            local = tuple(t if i in resident else _face_to_batch(t, px=px, py=py)
+                          for i, t in enumerate(tiles))
             result = _real_rows(kernel, local, nbatch=nb, py=py)
             return jax.tree.map(lambda a: _batch_to_face(a, px=px, py=py), result)
 
         return jax.tree.map(lambda a: a[:nb], work(*inputs))
+
+    def run(*operands):
+        for i in resident:
+            if not is_batch_layout(operands[i], mesh):
+                raise ValueError(
+                    f'local_batch: operand {i} was declared resident but is not in the '
+                    f'batch layout P((x,y),None,...) on this mesh; place it once with '
+                    f'distrib_la.batch_layout')
+        return _run(*operands)
+    run.lower = _run.lower          # HLO/collective census of the same executable
     return run
 
 

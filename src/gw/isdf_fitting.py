@@ -39,6 +39,7 @@ from isdf.core import (
     _z_q_face_parent,
     _resolve_solver_kind,
     _resolve_zeta_gather,
+    zeta_factor_resident,
 )
 # The opaque distributed factor.  Re-exported through isdf.core rather than
 # imported from the door here: this module never CALLS distrib_la, it only
@@ -572,7 +573,7 @@ def fit_zeta_to_h5(
             if int(vertex_mu_L) != 0:
                 # Transverse rank_truncate family (the ONLY way the
                 # transverse channel reaches this tier — the ridge
-                # family's resolver returns per_q above): replace the
+                # family's resolver returns local above): replace the
                 # local eigh factor with the pzheevd 2D-sharded C⁺.
                 if _resolved_solver_kind != 'transverse_rank_truncate':
                     raise ValueError(
@@ -630,17 +631,17 @@ def fit_zeta_to_h5(
             print_fn(f"  Computing transverse factor = {_how_t}  "
                      f"[γ̃^{vertex_mu_L} indefinite — "
                      f"path={_resolved_solver_kind}]")
-        _gather_gb = (int(C_q_flat.shape[0]) * int(n_rmu_padded) ** 2
-                      * 16 / 1e9)
-        # per-q tile: the two structural all_gathers inside ``_per_q_block``
-        # move μ²/p_y (row block) + μ² (full tile) — measured, not nominal.
-        _p_y = int(mesh_xy.shape['y'])
-        _tile_gb = (int(n_rmu_padded) ** 2 * 16 * (1.0 + 1.0 / _p_y)) / 1e9
+        _nq_f = int(C_q_flat.shape[0])
+        _ndev = int(mesh_xy.devices.size)
+        _gather_gb = _nq_f * int(n_rmu_padded) ** 2 * 16 / 1e9
+        _local_gb = (-(-_nq_f // _ndev)) * int(n_rmu_padded) ** 2 * 16 / 1e9
         print_fn(f"  Zeta back-solve tier: {_resolved_zeta_gather} "
                  f"(distributed_zeta_solve={distributed_zeta_solve})  "
-                 f"replicated (nq,μ,μ) gather would be {_gather_gb:.2f} GB/rank; "
-                 f"per-q tile {_tile_gb:.3f} GB (×nq executions/r-chunk); "
-                 f"distributed tier gathers NO (μ,μ) object")
+                 f"replicated re-gathers the (nq,μ,μ) stack, "
+                 f"{_gather_gb:.2f} GB/rank per r-chunk; local keeps "
+                 f"ceil(nq/P)={-(-_nq_f // _ndev)} whole factor(s), "
+                 f"{_local_gb:.3f} GB/rank, resident and moves only the RHS; "
+                 f"distributed gathers NO (μ,μ) object")
         _coupled_factor = bool(
             _coupled_mu123_coordinator is not None
             and _stack_coupled_solve_inputs
@@ -714,6 +715,16 @@ def fit_zeta_to_h5(
     _coupled_stacked_solve = _coupled_factor
     _coupled_solve_inputs = (
         (L_q, cct_trace_per_q) if _coupled_stacked_solve else None)
+
+    # R4 (2026-09-23): under the ``local`` tier the whole-tile factor is laid
+    # out ONCE on its q owners and read there by every r chunk; only each
+    # chunk's RHS moves.  A no-op for every other tier and for the raw Grams
+    # the coupled route stacks before factoring (see its ``factorize``).
+    with timing.section("zeta_fit.factor_residency"):
+        L_q, lu_piv = zeta_factor_resident(
+            L_q, lu_piv, mesh_xy, zeta_gather=_resolved_zeta_gather,
+            solver_kind=_resolved_solver_kind,
+            distrib_la_batched_route=distrib_la_batched_route)
 
     # Free C_q to reclaim GPU memory before z-chunk loop
     # (P_k_mumu was already deleted above)
@@ -1295,7 +1306,7 @@ def fit_zeta_to_h5(
                                     np.asarray(
                                         q_irr_full_idx, dtype=np.int32))]
                         def factorize(C, trace):
-                            return factor_c_q(
+                            L_s, piv_s = factor_c_q(
                                 C, mesh_xy, vertex_mu_L=1,
                                 n_rmu_logical=n_rmu_solve,
                                 solver_kind=_resolved_solver_kind,
@@ -1303,6 +1314,12 @@ def fit_zeta_to_h5(
                                 transverse_zeta_rcond=transverse_zeta_rcond,
                                 distrib_la_batched_route=distrib_la_batched_route,
                                 transverse_trace_per_q=trace)
+                            return zeta_factor_resident(
+                                L_s, piv_s, mesh_xy,
+                                zeta_gather=_resolved_zeta_gather,
+                                solver_kind=_resolved_solver_kind,
+                                distrib_la_batched_route=(
+                                    distrib_la_batched_route))
                         L_mu_q, piv_mu_q = (
                             _coupled_mu123_coordinator.
                             stacked_solve_inputs(factorize=factorize))

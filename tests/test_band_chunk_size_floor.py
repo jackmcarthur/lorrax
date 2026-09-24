@@ -264,21 +264,34 @@ def _solve_route_plan(route: str):
     )
 
 
-def test_auto_solve_route_conservatively_prices_replicated_factors():
-    plan = _solve_route_plan("auto")
-    assert plan.zeta_solve_memory_route == "replicated (auto-conservative)"
+def test_replicated_solve_route_prices_only_the_factors_that_fit():
+    plan = _solve_route_plan("replicated")
+    assert plan.zeta_solve_memory_route == "replicated"
     assert 1 <= plan.q_chunk < 4, (
         "the 55 MB budget cannot hold all four replicated 512x512 factors; "
         f"planner nevertheless chose q_chunk={plan.q_chunk}")
 
 
+def test_auto_solve_route_prices_the_tier_the_resolver_picks():
+    """The planner reads the runtime resolver's own auto function: nq=4 on a
+    1x1 mesh is within twice the even share, so both say local."""
+    from isdf.core import zeta_auto_tier
+
+    assert zeta_auto_tier(4, 512, 1) == "local"
+    auto, local = _solve_route_plan("auto"), _solve_route_plan("local")
+    assert auto.zeta_solve_memory_route == "auto -> local (resident q-local factor)"
+    assert (auto.peak_breakdown["C_fit_one_rchunk"]
+            == local.peak_breakdown["C_fit_one_rchunk"])
+
+
 def test_nonreplicated_solve_routes_do_not_advertise_a_fake_q_batch():
-    per_q = _solve_route_plan("per_q")
+    local = _solve_route_plan("local")
     distributed = _solve_route_plan("distributed")
-    assert per_q.q_chunk == distributed.q_chunk == 1
-    assert per_q.zeta_solve_memory_route.startswith("per_q")
+    assert local.q_chunk == distributed.q_chunk == 1
+    assert local.zeta_solve_memory_route.startswith("local")
     assert distributed.zeta_solve_memory_route.startswith("distributed")
-    assert (per_q.peak_breakdown["C_fit_one_rchunk"]
+    # The q-local RHS/solution residency is priced on top of the RHS stacks.
+    assert (local.peak_breakdown["C_fit_one_rchunk"]
             >= distributed.peak_breakdown["C_fit_one_rchunk"])
 
 

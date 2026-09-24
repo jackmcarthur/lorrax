@@ -522,7 +522,7 @@ Returns:
             # also pinned an incompatible factor route.
                 # Transverse rank_truncate family (the ONLY way the
                 # transverse channel reaches this tier — the ridge
-                # family's resolver returns per_q above): replace the
+                # family's resolver returns local above): replace the
                 # local eigh factor with the pzheevd 2D-sharded C⁺.
         # Preserve the fused path's exact ridge scalar for distributed LU.
         # Materializing this tiny (nq,) reduction before factor preparation
@@ -1442,21 +1442,29 @@ crash on ``LORRAX_ZETA_RCOND=""`` (``float('')``).
 Resolve the ζ back-solve TIER — the input key
 ``distributed_zeta_solve``.
 
-Returns ``'replicated'``, ``'per_q'`` or ``'distributed'``.
+Returns ``'replicated'``, ``'local'`` or ``'distributed'``.
 
-* ``replicated`` — today's path: the back-solve all-gathers the whole
-  ``(q_batch, μ, μ)`` factor onto every rank, ``nq·μ²·16`` B per rank
-  (18.9 GB at MoS2 12×12 / μ=1998 counting the logical-extent copies,
-  and it is re-gathered on EVERY r-chunk).
-* ``per_q`` — gather ONE ``(μ, μ)`` tile at a time and loop q inside
-  the r-chunk.  ``μ²·(1 + 1/p_y)·16`` B (75 MB at μ_pad=2048 on an 8×8
-  mesh, 1.8 GB at μ=10k).  Same per-q arithmetic as the batched
-  kernel; only the live gathered extent shrinks.  The slice is taken
-  INSIDE a ``shard_map`` (``_per_q_block``) — written as a
-  ``with_sharding_constraint`` on a traced-``q`` slice it read the
-  same way but COMPILED to the full ``(nq, μ, μ)`` gather plus a
-  dynamic_slice, which is worse than ``replicated`` and cost 12–40×
-  the back-solve wall (scorecard Y.2; do not regress it).
+* ``replicated`` — the back-solve all-gathers the whole ``(q_batch, μ, μ)``
+  factor onto every rank, ``nq·μ²·16`` B per rank, re-gathered on EVERY
+  r-chunk; the r columns are then split over all P, so the compute is
+  balanced.  Chosen only for a small stack spread over many more ranks than
+  q's.
+* ``local`` (R4, 2026-09-23; replaced ``per_q``) — each whole-tile factor is
+  laid out ONCE (``zeta_factor_resident`` → ``distrib_la.batch_layout``) on
+  the rank that owns its q: rank ``x·Py + y`` holds rows
+  ``[rank·Bp/P, (rank+1)·Bp/P)`` of the ``Bp = ceil(nq/P)·P`` padded stack,
+  the same map the q-parallel factor fold uses.  Every r-chunk then moves
+  only its RHS face → batch → face inside one ``shard_map``
+  (``distrib_la.local_batch(..., resident=(0,))``) and applies the same
+  per-q logical-extent kernel the replicated tier vmaps.  Per rank and chunk:
+  ``2·ceil(nq/P)·μ·r·16`` B of RHS, no factor.  The retired ``per_q`` tier
+  all-gathered one tile per q per chunk, ``nq·μ²·16·(1+1/Py)`` B — 29.5 GB
+  per rank per chunk at VI3 12×12 (nq 144, μ 3200) on P16.  Measured there,
+  over OFI: back-solve 994 ms → 210 ms per chunk, result bit-identical
+  (``runs/runtime/zeta_fit_20260923/b01_base_vi3shape_p16.log``).  A face
+  factor is also accepted (moved on every call), so residency is an
+  optimisation, never a precondition; a resident factor reaching any other
+  tier refuses.
 * ``distributed`` — the factor is NEVER gathered.  ``C_q`` is
   eigendecomposed distributed (ScaLAPACK ``pzheevd``), truncated on the
   replicated spectrum, and the truncated pseudo-inverse ``C⁺`` is kept
@@ -1469,11 +1477,16 @@ Returns ``'replicated'``, ``'per_q'`` or ``'distributed'``.
   EXPLICIT opt-in only: ``auto`` never picks it, because it changes the
   arithmetic (block-cyclic eigh ⇒ a different, equally valid gauge) and
   so is not bit-identical to the other two.
-* ``auto`` (default) — ``replicated`` while the gather fits under
-  :data:`_ZETA_GATHER_MAX_BYTES`, ``per_q`` above it.  At fixture scale
-  (nq=9, μ_pad=64 ⇒ 0.6 MB) that is ``replicated``, i.e. bit-identical
-  to the pre-feature path; at MoS2 12×12 / μ=2016 (9.4 GB) it is
-  ``per_q``.
+* ``auto`` (default) — ``local`` whenever the q-local batch holds at most
+  twice the even share per rank (``ceil(nq/P)·P <= 2·nq``, i.e. every
+  ``nq >= P/2``: memory stays O(total/P) and at most half the ranks idle in
+  the solve), and whenever the stack exceeds
+  :data:`_ZETA_GATHER_MAX_BYTES` (``LORRAX_ZETA_GATHER_CAP_GIB``, 4 GiB),
+  where ``local`` is the only whole-tile route; ``replicated`` otherwise (a
+  small stack over many more ranks than q's, e.g. a Γ-only deck, where the
+  bounded gather keeps compute and RHS balanced over all P).  The memory
+  planner prices ``auto`` as the larger of the two.  No mesh or no size
+  information keeps ``replicated``.
 
 ``distributed`` additionally REQUIRES (all checked here, at resolve
 time, so nothing fails minutes later inside an FFI call):
@@ -1488,7 +1501,7 @@ time, so nothing fails minutes later inside an FFI call):
   ladder and raises with the failed guard named).
 
 On the TRANSVERSE channels (``vertex_mu_L != 0``) ``distributed``
-resolves to ``per_q``: the transverse CCT is Hermitian INDEFINITE, so
+resolves to ``local``: the transverse CCT is Hermitian INDEFINITE, so
 no eigh-based rank truncation applies to it, and its distributed route
 is the already-2D-sharded ``pXgetrf``/``pXgetrs`` pair selected by a
 DIFFERENT key (``distributed_lu = scalapack``).  One key drives both
@@ -1873,9 +1886,9 @@ Returns ``(LU_q, perm_q)``:
 
 * ``LU_q`` ``(nq, n_rmu, n_rmu)`` at PADDED extent, sharded
   ``P(None, 'x', 'y')`` — the packed L/U factors in the logical
-  block, identity in the pad block.  Downstream gather tiers
-  (replicated / per_q) consume it exactly like the CCT passthrough
-  they used to gather: same shape, same sharding, same bytes moved.
+  block, identity in the pad block.  Downstream whole-tile tiers
+  (replicated / local) consume it exactly like the CCT passthrough
+  they used to read: same shape, same sharding.
 * ``perm_q`` ``(nq, n_log)`` int32, replicated — the LU permutation
   for ``lax.linalg.lu_solve``.
 
@@ -2019,7 +2032,7 @@ r = r_chunk, mesh Px×Py):
 
     this tier   nq·(μ²/Px + μ·r/Py)·16 B   received
     replicated  nq·μ²·16 B                 received (the whole factor)
-    per_q       nq·μ²·16 B                 received (same total, lower peak)
+    local       2·ceil(nq/P)·μ·r·16 B      moved (RHS only; factor resident)
 
 At MoS2 12×12 (nq=144, μ=2016, r_chunk=11664, 12×12 mesh) that is
 5.3 GB/rank/r-chunk here against 9.4 GB/rank/r-chunk for the other two
@@ -2164,8 +2177,9 @@ it are identical and used to be written out three times:
    = ``(q_, μ_X, r_Y)``; the downstream G-flat accumulator wants
    ``(q_, μ_XY, r_)`` so its FFT runs sharding-preserving.  That is
    ONE all-to-all on ``'y'`` (:func:`_reshard_zeta_mu_X_r_Y_to_mu_XY`)
-   — half of what the replicated/per_q tiers pay, because their
-   shard_map back-solve lands ζ column-sharded over the flat mesh.
+   — half of what the replicated tier pays, because its shard_map
+   back-solve lands ζ column-sharded over the flat mesh.  The ``local``
+   tier returns through the same ``P(None,'x','y')`` face as this one.
 3. **The trim** back to the caller's logical column count.
 
 Keeping them here is not only de-duplication: FFI-adjacent
@@ -2250,18 +2264,6 @@ Transverse rank-truncation back-solve at the LOGICAL μ
 extent: ζ = C⁺Z, ONE matmul (``Cp`` is the explicit truncated
 pseudo-inverse of the indefinite transverse CCT).  Same
 slice/zero-refill contract as the other whole-tile bodies.
-
-### `src/isdf/core.py` — `_zeta_per_q_kernel._solve_one_q_and_update`
-
-PER-Q tier: gather ONE ``(μ, μ)`` factor tile, solve that q,
-scatter into ``zeta_acc``.
-
-``q`` is a traced argument, so every iteration shares one
-trace, one compile and one executable, and ``Z_col`` is never
-sliced eagerly (an eager slice would materialise ``nq`` extra
-``(1, μ, r/P)`` device arrays per r-chunk).  ``donate_argnums``
-chains ``zeta_acc`` through the loop the same way
-``_solve_batch_and_update`` does.
 
 ### `src/isdf/core.py` — `_band_norms_slice`
 

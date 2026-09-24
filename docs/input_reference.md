@@ -229,7 +229,7 @@ and refused by name; see the
 The one dial expands once, at deck parsing, to the established implementation
 profile. `local` selects the current small-system route:
 `distrib_la_batched_route=batch_reshard`, local W Dyson, and the
-`distributed_zeta_solve=auto` replicated/per-q policy. `distributed` selects
+`distributed_zeta_solve=auto` replicated/local policy. `distributed` selects
 the provider route (`distrib_la_batched_route=auto`), distributed zeta and W,
 the distributed eigensolver layout (including self-consistency), and
 cuSolverMp/cuBLASMp on CUDA or ScaLAPACK on CPU for provider-owned solves. On

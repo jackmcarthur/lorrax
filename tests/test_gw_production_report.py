@@ -28,7 +28,7 @@ def _config():
             linalg="local",
             linalg_provenance="default",
             charge_zeta_solve="rank_truncate",
-            distributed_zeta_solve="per_q",
+            distributed_zeta_solve="local",
             w_dyson_solver="distributed",
             distributed_lu="cusolvermp",
             eigh_backend="native",

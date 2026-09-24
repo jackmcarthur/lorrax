@@ -282,7 +282,7 @@ is not (bug L-2) and is refused.
 ## The config surface
 
 The deck has one dense-linear-algebra control: `linalg = local | distributed`.
-`local` selects whole-matrix `batch_reshard` plus the auto replicated/per-q ζ
+`local` selects whole-matrix `batch_reshard` plus the auto replicated/local ζ
 tier. `distributed` selects the provider/native2d batch route, distributed ζ
 and W, and distributed eigensolves; CUDA transverse LU uses cuSolverMp. The
 charge Cholesky policy stays `auto` because distributed rank truncation owns
@@ -297,9 +297,9 @@ service implementation selected by that one public dial.
 | value | factor | back-solve | O(μ²)-per-q object ever replicated? |
 |---|---|---|---|
 | `replicated` | dense `eigh` per q, **redundantly on every rank** | gather the whole `(nq, μ, μ)` factor, then matmul | yes — `nq·μ²·16` B/rank, on EVERY r-chunk |
-| `per_q` | same | gather ONE `(μ, μ)` tile at a time | yes, but one tile (`μ²·16` B peak) |
+| `local` | same, q-parallel; the factor then STAYS on its q owner (`distrib_la.batch_layout`, once per channel) | move only the RHS face → q-local batch → face (`distrib_la.local_batch`, resident factor) and apply the same per-q kernel | no replica: `ceil(nq/P)` whole tiles per rank, resident; replaced `per_q` (one tile gathered per q per r-chunk) on 2026-09-23 |
 | `distributed` | ScaLAPACK `pzheevd` over the whole mesh, truncation on the replicated spectrum, `C⁺` kept 2D-sharded | stacked GEMM `C⁺ @ Z` with BOTH operands `P(None,'x','y')` | **no** |
-| `auto` (default) | — | `replicated` under `LORRAX_ZETA_GATHER_CAP_GIB` (4 GiB), `per_q` above | — |
+| `auto` (default) | — | `local` when `ceil(nq/P)·P <= 2·nq` or the stack exceeds `LORRAX_ZETA_GATHER_CAP_GIB` (4 GiB); `replicated` otherwise (few q, many ranks, small stack) | — |
 
 `distributed` is the only tier whose **factorisation** cost scales with P:
 the other two run one dense `eigh` per q on every rank, O(nq·μ³) with no
@@ -580,7 +580,7 @@ you to edit (`src/ffi/<name>/`, `ffi/linalg/resolve.py`,
 * **The flat-mesh column-sharding trap (scorecard J.9).** A block-sharded
   `(μ,μ)` operator can only be applied by ranks that share a column block
   cooperating on the μ contraction. ζ's `Z` is built at
-  `P(None,'x','y')` but the replicated/per_q back-solve reshards it to
+  `P(None,'x','y')` but the replicated back-solve reshards it to
   `P(None, None, ('x','y'))` — columns over the **flat** mesh — after
   which ranks sharing a `y` index hold UNRELATED column blocks. A 2-D
   SUMMA on that layout `psum`s partial products built from different

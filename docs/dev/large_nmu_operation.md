@@ -5,7 +5,7 @@ thousands of low-memory processes, where no `(n_mu·nspinor)²` tile fits on
 one rank.  Dense solves have two storage plans:
 
 * a **LOCAL** plan — whole per-q tiles, q-parallel scheduled over devices at
-  P>1.  The ordinary replicated/per_q schedule is the mesh-invariant control.
+  P>1.  The ordinary replicated/local schedule is the mesh-invariant control.
 * a **DISTRIBUTED** plan — 2-D block-cyclic factorization over the whole
   mesh (ScaLAPACK on a host mesh, cuSOLVERMp on CUDA, via the `distrib_la`
   facade).  The only plan whose factorization work AND memory divide by P.
@@ -32,8 +32,8 @@ full `Q=N_q^full`.
 |---|---|---|---|
 | zeta CCT build (`isdf/core.c_q_from_psi_sm`) | none (always sharded) | one 2-D-sharded shard_map; `C_q` at `P(None,'x','y')`: `nq·mu²/P` | same path (no second plan needed) |
 | zeta charge factor (`isdf/core.factor_c_q`) | `charge_zeta_solve = rank_truncate` (default) + `distributed_cholesky = auto` → replicated whole-tile eigh pseudo-inverse, q-parallel at P>1 (`LORRAX_ZETA_QPARALLEL`): transient ≤ one q-batch replicated (4 GiB cap), compute `ceil(nq/P)·mu³` | `distributed_zeta_solve = distributed` → distributed eigensolver (ScaLAPACK on CPU, cuSOLVERMp on CUDA), truncation on the replicated spectrum, C⁺ kept 2-D-sharded: `nq·mu²/P` stored, no O(mu²) replica anywhere; compute `nq·mu³/P`-class |
-| zeta charge back-solve (per r-chunk, `solve_zeta`) | `distributed_zeta_solve = auto`: `replicated` gathers the whole factor, `nq·mu²·16` B/rank/r-chunk; `per_q` gathers one `(mu,mu)` tile at a time, `mu²·(1+1/Py)·16` B live (same total traffic) | `distributed` (same key): one stacked GEMM `C⁺@Z`, both operands 2-D-sharded; received bytes `nq·(mu²/Px + mu·r/Py)·16` per r-chunk, no whole tile ever |
-| zeta transverse factor (bispinor μ1–3) | ridge/local: `lax.linalg.lu` is hoisted once per q and channel; replicated/per_q gather tiers apply `lu_solve`. Ridge/batch-reshard: face → q-batch → local `jnp.linalg.solve` → face, so LU is intentionally repeated per r-chunk. `rank_truncate`: local per-q eigh, explicit C⁺, one GEMM per r-chunk | ridge/distributed: `distrib_la.factor('solve_lu',...)` returns a 2-D-sharded token after one batched `getrf`; `solve(token,Z_q)` calls batched `getrs` per r-chunk. ScaLAPACK and cuSOLVERMp both implement the split, reusable token. `rank_truncate`: distributed eigensolver at the padded extent, inert pad modes removed, C⁺ stays 2-D-sharded |
+| zeta charge back-solve (per r-chunk, `solve_zeta`) | `distributed_zeta_solve = auto`: `replicated` gathers the whole factor, `nq·mu²·16` B/rank/r-chunk (small stacks spread over many more ranks than q's only); `local` keeps `ceil(nq/P)` whole factors resident on their q owners and moves only the RHS, `2·ceil(nq/P)·mu·r·16` B/rank/r-chunk and no factor (R4, 2026-09-23; replaced `per_q`, which gathered `nq·mu²·16·(1+1/Py)` B per r-chunk) | `distributed` (same key): one stacked GEMM `C⁺@Z`, both operands 2-D-sharded; received bytes `nq·(mu²/Px + mu·r/Py)·16` per r-chunk, no whole tile ever |
+| zeta transverse factor (bispinor μ1–3) | ridge/local: `lax.linalg.lu` is hoisted once per q and channel; the replicated/local tiers apply `lu_solve` (local: `(LU, piv)` resident on the q owners). Ridge/batch-reshard: face → q-batch → local `jnp.linalg.solve` → face, so LU is intentionally repeated per r-chunk. `rank_truncate`: local per-q eigh, explicit C⁺, one GEMM per r-chunk | ridge/distributed: `distrib_la.factor('solve_lu',...)` returns a 2-D-sharded token after one batched `getrf`; `solve(token,Z_q)` calls batched `getrs` per r-chunk. ScaLAPACK and cuSOLVERMp both implement the split, reusable token. `rank_truncate`: distributed eigensolver at the padded extent, inert pad modes removed, C⁺ stays 2-D-sharded |
 | zeta Z_q build (`z_q_from_psi_sm`) | none (always sharded) | streaming band-chunk scan inside one shard_map; carries `(nk, ns, r/Py, mu/Px, ns)` → `/P`; per-iter FFT box `nk·(band_chunk/P)·ns·n_rtot` | same path |
 | zeta h5 write (G-flat accumulator + SlabIO) | none (one transport) | accumulator `(nq_disk, mu/P, ngkmax)` → `/P`; SlabIO issues parallel-HDF5 collective hyperslab writes with no gather. The deleted h5py allgather path would have materialized the full tensor on rank 0, violating this tier's memory contract; there is no backend selector or demotion. | same |
 | W Dyson solve (`gw/w_isdf`) | `w_dyson_solver = auto` = `local`: q-parallel per-q dense LU, `ceil(nq/P)` whole `(mu,mu)` tiles per rank — a mu² tile per rank exists | `w_dyson_solver = distributed`: 2-D block-cyclic backsolve via `distrib_la` `solve_lu`, `nq·mu²/P`; refuses loudly, never downgrades |
@@ -130,7 +130,7 @@ plus the launch env of `config/frontera/templates/gw_dev.sbatch`
 | threshold | value | what it decides | calibration |
 |---|---|---|---|
 | `_QPARALLEL_MIN_NQ_MU3` | 5e9 (module constant; `LORRAX_ZETA_QPARALLEL` overrides) | replicated charge factor executes q-parallel above it | 105.1 s redundant factor at nq·mu³ = 2.6e11 (job 7884656) → ~4e-10 s/unit on a 28-thread CLX rank; 5e9 ≈ 2 s, below which the two staged reshards + one compile outweigh the saving.  Mini-deck (2.6e8) stays below by design.  The fold SATURATES at P = nq (ranks past nq idle; announced whenever P > nq — jobs 7885316/7885323, see the certified-examples ceiling note); the transverse folds share the identical shape |
-| `LORRAX_ZETA_GATHER_CAP_GIB` | 4 | `auto` back-solve tier: `replicated` under the cap, `per_q` above | live-bytes budget for the gathered factor; 12×12/mu=2016 stack (9.4 GB) lands on per_q |
+| `LORRAX_ZETA_GATHER_CAP_GIB` | 4 | `auto` back-solve tier: above the cap always `local`; at or below it `replicated` only when `ceil(nq/P)·P > 2·nq` (few q on many ranks) | live-bytes budget for the per-r-chunk replicated gather; 12×12/mu=2016 stack (9.4 GB) lands on local |
 | `LORRAX_ZETA_REPLICATE_CAP_GIB` | 4 | whether the charge factorization may run replicated at all (per-q-batch criterion for rank_truncate) | mu ceiling `sqrt(cap/16)` = 16384/batch; production 12×12 runs raise to 16 |
 | `LORRAX_COLLECTIVE_CHUNK_MB` | 128 | max payload of ONE emitted collective in the distributed tier (host-level q-block loop, cannot be re-fused by XLA) | 1.15 GB single-shot AllGather fatal at P=144; 0.104 GB healthy on the same 144 ranks; at P=16 impl=mpi the cap is indistinguishable from unbounded.  A per-instruction transport cap, orthogonal to the 4 GiB live-bytes cap.  Note: once ONE q's collective exceeds the budget the bound is abandoned with a loud warning (q is the only split axis) |
 | parallel-HDF5 availability | launcher PMI env, else a subprocess MPI_Init probe | FFI parallel-HDF5, or a refusal; there is no demotion | the bare-launch path asserts the refusal. At P>1 the FFI also compares `MPI_Comm_size(MPI_COMM_WORLD)` against `jax.process_count()` and refuses on a mismatch (`LORRAX_PHDF5_REQUIRE_MPI_WORLD`), because a PMI-flavour mismatch otherwise yields unsynchronised writers with rc=0 |
@@ -156,11 +156,13 @@ until fixed.  File:line references as of this page's commit.
    per-rank memory is `~1/sqrt(P)`, in the zeta fit (both transposes),
    htransform, and the BSE psi stacks (`bse/bse_ring_comm.py:156`,
    `bse/exciton_bands.py:241`).
-3. **zeta replicated/per_q back-solve gather** — `nq·mu²·16` B/rank per
-   r-chunk unless `distributed_zeta_solve = distributed`.
+3. **zeta replicated back-solve gather** — `nq·mu²·16` B/rank per
+   r-chunk, only for stacks under the 4 GiB gather cap with
+   `ceil(nq/P)·P > 2·nq`; every other whole-tile fit uses the `local`
+   tier, whose factor is resident on its q owners and never moves.
 4. **transverse LU factor tiles** — the LOCAL plan's hoisted `(LU, piv)`
-   stack is gathered per q-tile by the replicated/per_q tiers exactly
-   like the CCT it replaced (an `mu_T²` tile per gather).  The fully
+   stack is gathered by the replicated tier exactly like the CCT it
+   replaced, or kept resident on its q owners by the local tier.  The fully
    distributed ScaLAPACK and cuSOLVERMp plans keep reusable factors
    block-cyclic throughout.  The local batch-reshard route is the deliberate
    exception: it distributes complete q matrices across ranks and
@@ -209,7 +211,7 @@ All route boundaries use
 
 | route | factor/solve schedule | leading per-rank storage |
 |---|---|---|
-| local JAX | hoisted `lax.linalg.lu` once per q and channel; `lu_solve` per r-chunk through replicated/per_q gather tiers | sharded resident factor plus one whole `M_T²` gather tile |
+| local JAX | hoisted `lax.linalg.lu` once per q and channel; `lu_solve` per r-chunk through the replicated or local tier | local: `ceil(Q/P)` whole `M_T²` factors resident per rank, no gather; replicated: the whole stack per r-chunk |
 | local batch-reshard | face → `P(('x','y'),None,None)` by two `all_to_all`s; each rank solves `ceil(Q/P)` complete matrices; inverse exchanges restore the face | measured floor `3·16·ceil(Q/P)·M_T·(M_T+R)`; refactorization per r-chunk is intentional |
 | fully distributed | `distrib_la.factor('solve_lu',...)` runs batched `getrf` once per channel; `solve(FactorToken,Z_q)` runs batched `getrs` per r-chunk | factor `16·Q·M_T²/P`, each RHS/output `16·Q·M_T·R/P`, plus lower-order pivots |
 
