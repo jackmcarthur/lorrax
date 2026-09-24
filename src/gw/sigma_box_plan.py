@@ -746,14 +746,13 @@ def _sc_padded_box_spec(spec, eta):
     # factor references, and use it only to size the frozen certificate.
     if "sc_support_pole_extent" in spec:
         padded_poles.append(tuple(spec["sc_support_pole_extent"]))
-    support_frequencies = spec.get("sc_support_frequencies", spec["frequencies"])
     states = np.asarray(spec["states"], dtype=np.float64)
     pad_ry = sc_state_pad_ev(states * RYD_TO_EV) / RYD_TO_EV
     low, high = int(np.argmin(states - pad_ry)), int(np.argmax(states + pad_ry))
     padded_states = np.asarray(
         [states[low] - pad_ry[low], states[high] + pad_ry[high]])
     pole_box, _, _ = _box_for_window(
-        support_frequencies, padded_states, padded_poles,
+        spec["frequencies"], padded_states, padded_poles,
         spec["pole_sign"], eta)
     box = [
         min(spec["box"][0], pole_box[0]),
@@ -770,15 +769,10 @@ def _sc_padded_box_spec(spec, eta):
     # pad toward zero stops the zero-side edge at ``_SC_ZERO_SIDE_CAP`` of
     # its distance to zero; a support that really crosses later is a box
     # escape and rebuilds.
-    support_box, _, _ = _box_for_window(
-        support_frequencies, spec["states"], spec["pole_stats"],
-        spec["pole_sign"], eta)
-    if spec["kind"] == "sign_definite_negative" and support_box[1] < 0.0:
+    if spec["kind"] == "sign_definite_negative":
         box[1] = min(box[1], _SC_ZERO_SIDE_CAP * spec["box"][1])
-        box[1] = max(box[1], support_box[1])
-    if spec["kind"] == "sign_definite_positive" and support_box[0] > 0.0:
+    elif spec["kind"] == "sign_definite_positive":
         box[0] = max(box[0], _SC_ZERO_SIDE_CAP * spec["box"][0])
-        box[0] = min(box[0], support_box[0])
     # Membership can change without appreciable state motion: a state just
     # outside a tail at map 0 can enter it at map 1. Cover the selector's
     # guaranteed sign gap, not the accidental nearest initial sample.
@@ -1178,12 +1172,6 @@ def plan_sigma_windows(
                 # Cover future selector members, not only initial samples.
                 spec["sc_selector_gap_ry"] = (
                     _BOX_SIGN_FRACTION * geometry["state_edge_ry"])
-            if fixed_rule_session is not None and "external_support_ev" in fixed_rule_session:
-                support = np.asarray(fixed_rule_session["external_support_ev"]) / RYD_TO_EV
-                spec["sc_support_frequencies"] = (
-                    np.asarray([min(frequencies[0], support[0]), frequencies[-1]])
-                    if branch.neg_omega_half else
-                    np.asarray([frequencies[0], max(frequencies[-1], support[1])]))
             spec.update({
                 "branch": branch,
                 "state_indices": flat_indices[local],

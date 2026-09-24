@@ -385,11 +385,11 @@ grid re-evaluated such states and moved the GN-PPM invariance fixture by
 bounds, only the outer sampled endpoints grow, to the escaped energy plus
 its pad (`SC sampled-support growth: ...`); old samples remain unchanged and
 the quadrature session keeps the grown support on later maps and trials.
-Certificates reserve this prospective external-frequency extent, including
-the growth pad and grid rounding, without evaluating those samples at map 0.
-Padding intermediate states alone does not cover external-frequency growth.
-Changed product-window membership, state support or pole drift can still
-require a rebuild. Interior holes still require an explicit patch. Quadrature
+A grown external support that leaves a frozen Sigma certificate is a box
+escape and refits the rule set, as changed product-window membership, state
+support or pole drift do. (The prospective external-support certificate was
+deleted on 2026-09-24: it had never reached the planner, and wiring it would
+have widened the short side of every crossing box by the SC window pad.) Interior holes still require an explicit patch. Quadrature
 nodes remain frozen while their certified boxes cover the map.
 
 **17. The active-window scissor law stays frozen at map 0.** States inside

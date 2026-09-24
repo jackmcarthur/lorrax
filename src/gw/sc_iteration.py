@@ -3847,20 +3847,9 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
                 f"sampled [{sampled_grid[0]:+.6f}, {sampled_grid[-1]:+.6f}] -> "
                 f"[{expanded_grid[0]:+.6f}, {expanded_grid[-1]:+.6f}] eV")
         if session is not None:
+            # A grown grid that leaves a frozen Sigma certificate is a box
+            # escape and refits the rule set (sigma_box_plan).
             session["omega_grid_ev"] = tuple(float(x) for x in expanded_grid)
-            # Certify prospective external samples without evaluating them at
-            # map zero. Include the growth helper's pad and grid rounding;
-            # padding intermediate states alone does not cover omega growth.
-            requested = np.asarray(inputs.config.omega_grid_ev, dtype=np.float64)
-            retained_edges = sc_padded_window_ev(
-                float(inputs.config.sigma.omega_min_ev),
-                float(inputs.config.sigma.omega_max_ev))
-            certificate_grid = extend_sc_omega_grid_ev(
-                requested, np.asarray([retained_edges]), [[True, True]],
-                float(inputs.config.sigma.omega_step_ev))
-            session["external_support_ev"] = (
-                min(float(certificate_grid[0]), float(expanded_grid[0])),
-                max(float(certificate_grid[-1]), float(expanded_grid[-1])))
         sigma_config = replace(
             inputs.config, sc_omega_grid_ev=tuple(float(x) for x in expanded_grid))
     sigma_result = compute_sigma_xc(
