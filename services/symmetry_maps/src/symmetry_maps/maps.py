@@ -1132,10 +1132,16 @@ def _get_unfold_isdf_operator_jit(
         perm_right_q = fwd_perm_right_j[sym_j]
         # Gather q axis (replicated → local selection via idx_j).
         if pair_transpose:
-            forward_at_irr = V_ibz_local[idx_j]
-            partner_at_irr = operands[1][idx_j]
-            V_at_irr = jnp.where(
-                trs_mask_j[:, None, None], partner_at_irr, forward_at_irr)
+            # ONE source row per full-k row: the partner rows follow the
+            # forward rows, and an antiunitary k reads its parent's partner
+            # row.  A ``where`` over two gathered candidates is emitted
+            # elementwise and loads BOTH values for every output element;
+            # one row gather loads one (same values, pure data movement).
+            n_parent_rows = int(V_ibz_local.shape[0])
+            source_rows = np.where(
+                trs_mask_j, idx_j + n_parent_rows, idx_j).astype(np.int32)
+            V_at_irr = jnp.concatenate(
+                (V_ibz_local, operands[1]), axis=0)[source_rows]
         else:
             V_at_irr = V_ibz_local[idx_j]
 
