@@ -42,6 +42,20 @@ def test_both_branches_of_the_measured_fe_case_are_flagged():
     assert not amb[1, 0] and not amb[1, 1] and not amb[1, 5]
 
 
+def test_the_switch_sits_at_the_growth_window_when_it_reaches_past_the_grid():
+    omega, sig = _grid_and_sigma(nk=1)
+    e = np.array([[9.83, 11.70, 12.50, 5.00, -11.80, -12.70]])
+    # Fe +8 deck, padded window (-13.89, +9.44): at the top the window ends
+    # inside the grid, so the +10 grid edge stays the switch; at the bottom
+    # it reaches past -12, so -11.80 (2.09 eV from -13.89) is no longer flagged.
+    fe, _ = sigma_grid_edge_ambiguity(sig, omega, e, growth_window_ev=(-13.89, 9.44))
+    np.testing.assert_array_equal(fe, [[True, True, False, False, False, False]])
+    # A window to +12: +9.83 would grow the grid (2.17 eV from the switch,
+    # beyond the 1.87 jump); +11.70 and +12.50 sit within it.
+    amb, _ = sigma_grid_edge_ambiguity(sig, omega, e, growth_window_ev=(-12.0, 12.0))
+    assert not amb[0, 0] and amb[0, 1] and amb[0, 2]
+
+
 def test_an_inward_jump_leaves_the_inside_state_unique():
     omega = np.arange(-12.0, 10.0 + 1e-9, 0.25)
     sig = np.zeros((omega.size, 1, 2))

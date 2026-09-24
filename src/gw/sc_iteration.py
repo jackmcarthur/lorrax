@@ -4590,8 +4590,11 @@ def _sc_edge_ambiguity(inputs: SCInputs, state_out: SCState) -> tuple[int, str]:
         from runtime.padding import strip_axis
         diag = np.asarray(strip_axis(diag, sigma.sigma_band_axis, axis=-1))
     e_rel = np.asarray(sigma.e_eval_ev, dtype=np.float64) - float(sigma.efermi_dft_ev)
+    from .scissor import sc_padded_window_ev
+    window = sc_padded_window_ev(float(inputs.config.sigma.omega_min_ev),
+                                 float(inputs.config.sigma.omega_max_ev))
     ambiguous, jump = sigma_grid_edge_ambiguity(
-        diag, np.asarray(omega, dtype=np.float64), e_rel)
+        diag, np.asarray(omega, dtype=np.float64), e_rel, growth_window_ev=window)
     # Frozen-core bands are held at their DFT block (no Sigma enters them).
     ambiguous[:, :int(inputs.config.sc.frozen_core_bands)] = False
     n = int(np.count_nonzero(ambiguous))
@@ -4601,7 +4604,8 @@ def _sc_edge_ambiguity(inputs: SCInputs, state_out: SCState) -> tuple[int, str]:
                             jump.shape)
     return n, (f"largest jump {float(jump[k, b]):+.3f} eV at k={int(k)} sorted band "
                f"{int(b) + 1}, E-mu={float(e_rel[k, b]):+.3f} eV; grid "
-               f"[{float(omega[0]):+.2f}, {float(omega[-1]):+.2f}] eV")
+               f"[{float(omega[0]):+.2f}, {float(omega[-1]):+.2f}] eV, growth window "
+               f"[{window[0]:+.2f}, {window[1]:+.2f}] eV")
 
 
 def _sc_z_factors(
