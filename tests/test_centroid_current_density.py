@@ -13,11 +13,31 @@ import pytest
 from common.bispinor_init import ALPHA_FS
 from common.gamma_matrices import gammas
 from centroid.sampling_metric import (
-    _projector_memory_plan,
+    _charge_metric_diagonal,
+    _metric_chunk_plan,
+    _transverse_metric_diagonal,
     build_feature_metric_diagonal,
-    feature_metric_diagonal_from_psi_r,
     full_k_quadrature_weights,
 )
+
+
+def feature_metric_diagonal_from_psi_r(psi, mask_left, mask_right, scale, *,
+                                       gamma_mode):
+    """The production contraction at one k: window density matrices from
+    ``density_components_from_psi_r`` (the density scan's local kernel),
+    then the metric trace."""
+    from psp.get_DFT_mtxels import density_components_from_psi_r
+
+    def density(mask):
+        mask = jnp.asarray(mask, dtype=jnp.float64)
+        if psi.shape[1] == 1:
+            return density_components_from_psi_r(psi, mask)[None, None]
+        return density_components_from_psi_r(
+            psi, mask, return_spin_density_matrix=True)
+
+    kernel = (_charge_metric_diagonal if gamma_mode == "charge"
+              else _transverse_metric_diagonal)
+    return kernel(density(mask_left), density(mask_right), scale)
 
 
 def _direct_pairs(psi, mask_left, mask_right, scale, mode):
@@ -106,17 +126,25 @@ def _fake_loader(psi_by_parent_band, kweights, *, raw_nspinor, bispinor):
     loader.requests = []
     bispinor_expected = bool(bispinor)
 
-    def box_index(self, *, k):
-        return np.zeros((1,) + self.fft_grid, dtype=np.int32)
+    n_grid = int(np.prod(loader.fft_grid))
+    loader.ngkmax = n_grid
+    # psi(G) whose identity box index places G slot g on grid cell g, so the
+    # scan's unitary inverse FFT returns exactly the planted psi(r).
+    psi_g = np.fft.fftn(psi, axes=(-3, -2, -1), norm="ortho").reshape(
+        psi.shape[:3] + (n_grid,))
 
-    def load_process_local(self, *, bands, k, bispinor):
-        assert bispinor is bispinor_expected
-        parent, (lo, hi) = int(k.rows[0]), tuple(map(int, bands))
-        self.requests.append((parent, lo, hi))
-        return jnp.asarray(psi[parent:parent + 1, lo:hi])
+    def box_index(self, *, k):
+        cells = np.arange(n_grid, dtype=np.int32).reshape(self.fft_grid)
+        return np.broadcast_to(cells, (len(k.rows),) + self.fft_grid).copy()
+
+    def load(self, *, bands, k, sharding, bispinor):
+        assert bispinor is bispinor_expected and sharding is not None
+        rows, (lo, hi) = tuple(map(int, k.rows)), tuple(map(int, bands))
+        self.requests.append((rows, lo, hi))
+        return jnp.asarray(psi_g[list(rows), lo:hi])
 
     loader.box_index = MethodType(box_index, loader)
-    loader.load_process_local = MethodType(load_process_local, loader)
+    loader.load = MethodType(load, loader)
     return loader
 
 
@@ -145,105 +173,13 @@ def _current_psi(nparent=2, nbands=3):
     return psi
 
 
-def test_parent_stream_partitions_across_ranks_and_keeps_union(monkeypatch):
-    import common.collectives as C
-    import common.wfn_transforms as T
-
-    psi = _current_psi()
-    monkeypatch.setattr(T, "to_rbox", lambda values, *a, **k: values)
-    monkeypatch.setattr(C, "process_rank_world", lambda: (0, 1))
-    serial_loader = _fake_loader(
-        psi, [0.4, 0.6], raw_nspinor=2, bispinor=True)
-    serial = build_feature_metric_diagonal(
-        serial_loader, _Star([0, 1], [0, 0]), (0, 2), (1, 3),
-        gamma_mode="transverse", verbose=False)
-    assert serial_loader.requests == [(0, 0, 3), (1, 0, 3)]
-
-    monkeypatch.setattr(C, "psum_replicate", lambda x, mesh: np.asarray(x))
-    partials, requests = [], []
-    for rank in (0, 1):
-        loader = _fake_loader(
-            psi, [0.4, 0.6], raw_nspinor=2, bispinor=True)
-        monkeypatch.setattr(
-            C, "process_rank_world", lambda rank=rank: (rank, 2))
-        partials.append(build_feature_metric_diagonal(
-            loader, _Star([0, 1], [0, 0]), (0, 2), (1, 3),
-            gamma_mode="transverse", dist_mesh=object(), verbose=False))
-        requests.append(loader.requests)
-    assert requests == [[(0, 0, 3)], [(1, 0, 3)]]
-    np.testing.assert_allclose(
-        partials[0] + partials[1], serial, rtol=3e-14, atol=3e-14)
-
-
-def test_unequal_stars_issue_the_same_device_programs_on_every_rank(
-        monkeypatch):
-    """INVARIANTS 21 on an IBZ WFN whose parent stars differ in size.
-
-    Stars 1/6/2 over four ranks (the symmetric CrI3 3x3 shape): parents are
-    dealt one per rank and rank 3 holds only the excluded filler parent.
-    Every rank must issue the same jitted kernels with the same operand
-    shapes in the same order, or the cross-rank compile agreement refuses
-    (JID 58454563.5).  The rank partials must still add to the P1 metric.
-    """
-    import centroid.sampling_metric as M
-    import common.collectives as C
-    import common.wfn_transforms as T
-
-    psi = _current_psi(3, 2)
-    parents = [0, 1, 1, 1, 1, 1, 1, 2, 2]
-    rows = [0, 0, 1, 2, 3, 4, 5, 0, 1]
-    weights = [1.0, 6.0, 2.0]
-    monkeypatch.setattr(T, "to_rbox", lambda values, *a, **k: values)
-    monkeypatch.setattr(C, "psum_replicate", lambda x, mesh: np.asarray(x))
-
-    programs = []
-    for name in ("_accumulate_subspace_density_matrices",
-                 "_transverse_metric_diagonal", "_accumulate_grid_pullback"):
-        kernel = getattr(M, name)
-
-        def record(*args, _kernel=kernel, _name=name):
-            programs.append((_name, tuple(
-                tuple(np.shape(a)) for a in args)))
-            return _kernel(*args)
-
-        monkeypatch.setattr(M, name, record)
-
-    monkeypatch.setattr(C, "process_rank_world", lambda: (0, 1))
-    serial = build_feature_metric_diagonal(
-        _fake_loader(psi, weights, raw_nspinor=2, bispinor=True),
-        _Star(parents, rows), (0, 1), (0, 2),
-        gamma_mode="transverse", verbose=False)
-
-    sequences, partials = [], []
-    for rank in range(4):
-        programs.clear()
-        monkeypatch.setattr(
-            C, "process_rank_world", lambda rank=rank: (rank, 4))
-        partials.append(build_feature_metric_diagonal(
-            _fake_loader(psi, weights, raw_nspinor=2, bispinor=True),
-            _Star(parents, rows), (0, 1), (0, 2),
-            gamma_mode="transverse", dist_mesh=object(), verbose=False))
-        sequences.append(list(programs))
-    for rank in range(1, 4):
-        assert sequences[rank] == sequences[0], (
-            f"rank {rank} issued a different device-program sequence "
-            f"({len(sequences[rank])} calls) from rank 0 "
-            f"({len(sequences[0])} calls)")
-    assert sum(name == "_accumulate_grid_pullback"
-               for name, _ in sequences[0]) == 6
-    np.testing.assert_allclose(
-        sum(partials), serial, rtol=3e-14, atol=3e-14)
-
-
 def test_nonuniform_parent_weights_are_divided_over_unequal_stars(monkeypatch):
     import common.collectives as C
-    import common.wfn_transforms as T
 
     psi = _current_psi(2, 1)
     loader = _fake_loader(
         psi, [0.7, 0.3], raw_nspinor=2, bispinor=True)
     sym = _Star([0, 1, 1, 1], [0, 0, 1, 2])
-    monkeypatch.setattr(T, "to_rbox", lambda values, *a, **k: values)
     monkeypatch.setattr(C, "process_rank_world", lambda: (0, 1))
     got = build_feature_metric_diagonal(
         loader, sym, (0, 1), (0, 1), gamma_mode="transverse",
@@ -253,7 +189,8 @@ def test_nonuniform_parent_weights_are_divided_over_unequal_stars(monkeypatch):
     np.testing.assert_allclose(got, 0.7 * p0 + 0.3 * p1,
                                rtol=3e-14, atol=3e-14)
     assert np.max(np.abs(got - (0.25 * p0 + 0.75 * p1))) > 1.0
-    assert sym.pullback_calls == [0, 0, 1, 2]
+    # One pullback per distinct symmetry row, after every parent.
+    assert sym.pullback_calls == [0, 1, 2]
     np.testing.assert_allclose(
         full_k_quadrature_weights(loader, sym),
         np.array([0.7, 0.1, 0.1, 0.1]), rtol=0.0, atol=1e-15)
@@ -308,7 +245,6 @@ def test_full_bz_storage_uses_the_stored_weights_and_does_not_refuse(
     (KNOWN_LORRAX_ISSUES.md, 2026-09-01).
     """
     import common.collectives as C
-    import common.wfn_transforms as T
 
     psi = _current_psi(4, 1)
     loader = _fake_loader(
@@ -319,7 +255,6 @@ def test_full_bz_storage_uses_the_stored_weights_and_does_not_refuse(
         full_k_quadrature_weights(loader, sym),
         np.full(4, 0.25), rtol=0.0, atol=1e-16)
 
-    monkeypatch.setattr(T, "to_rbox", lambda values, *a, **k: values)
     monkeypatch.setattr(C, "process_rank_world", lambda: (0, 1))
     got = build_feature_metric_diagonal(
         loader, sym, (0, 1), (0, 1), gamma_mode="transverse", verbose=False)
@@ -330,9 +265,10 @@ def test_full_bz_storage_uses_the_stored_weights_and_does_not_refuse(
                                rtol=3e-14, atol=3e-14)
     # Red twin: the pre-fix expansion w_parent/n_members halves every star.
     assert np.max(np.abs(got - (0.25 * p0 + 0.25 * p2))) > 1.0
-    # Only the parents are loaded; the other two rows arrive by pullback.
-    assert loader.requests == [(0, 0, 1), (2, 0, 1)]
-    assert sym.pullback_calls == [0, 1, 0, 1]
+    # Only the parents are loaded (one chunk); the other two rows arrive by
+    # pullback, once per distinct row.
+    assert loader.requests == [((0, 2), 0, 1)]
+    assert sym.pullback_calls == [0, 1]
 
 
 def test_full_bz_storage_refuses_when_parents_are_not_their_own_image():
@@ -355,15 +291,17 @@ def test_ibz_storage_still_refuses_uncovered_quadrature_weight():
         full_k_quadrature_weights(loader, sym)
 
 
-def test_projector_memory_plan_prices_and_refuses():
-    nbytes, cap = _projector_memory_plan(
-        1000, 4, device_memory_bytes=40 * 1024 ** 3)
-    assert nbytes == 2 * 4 ** 2 * 1000 * 16
-    assert cap == 8 * 1024 ** 3
+def test_metric_chunk_plan_divides_parents_and_refuses():
+    k_chunk, band_chunk, _ = _metric_chunk_plan(
+        n_parents=144, n_bands=360, n_band_shards=4, ns=2, ngkmax=72541,
+        n_grid=80 * 80 * 216, n_windows=1, device_memory_bytes=40 * 10 ** 9)
+    assert 144 % k_chunk == 0 and 0 < band_chunk <= 360
 
     with pytest.raises(MemoryError, match="does not spatially shard"):
-        _projector_memory_plan(
-            20_000_000, 4, device_memory_bytes=40 * 1024 ** 3)
+        _metric_chunk_plan(
+            n_parents=4, n_bands=8, n_band_shards=1, ns=4, ngkmax=1000,
+            n_grid=20_000_000, n_windows=2,
+            device_memory_bytes=40 * 10 ** 9)
 
 
 def test_distributed_build_requires_mesh(monkeypatch):

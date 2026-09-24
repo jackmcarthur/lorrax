@@ -1297,10 +1297,11 @@ against a decision that has not been taken.
     Self-referential: the fabricated star then feeds the `star_spread`
     statistic at `:288`, i.e. the metric meant to DETECT a broken unfold is
     computed over a star the tolerance invented.  Offline tool.
-11. `src/psp/orbital_magnetization.py:384-401` — a hand-built
-    "which k is this" dict for finite-difference neighbours.  Full-BZ →
-    full-BZ, exact integer keys, so no aliasing; listed only because it
-    duplicates the grid lookup the service owns.  Diagnostic path.
+11. `src/psp/orbital_magnetization.py` `hf_group_velocity_check` — a
+    hand-built "which k is this" dict for finite-difference neighbours.
+    Full-BZ → full-BZ, exact integer keys, so no aliasing; listed only
+    because it duplicates the grid lookup the service owns.  Diagnostic
+    path (it now checks the loaded distributed velocity).
 12. ~~`src/file_io/epsreader.py:136` `unfold_eps_comps`~~ — **DELETED
     2026-08-16.**  Registered 2026-08-15, removed the next day; a tombstone
     at the site records why and points at the canonical rotation.  Kept in

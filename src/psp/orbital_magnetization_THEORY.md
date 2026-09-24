@@ -163,20 +163,24 @@ computed sign is reported, not assumed. The expected magnitude for CrI₃ is
 
 ## 7. Validation built into the script
 
-* **Hellmann–Feynman group velocity.** The diagonal `Re⟨n|dH/dk|n⟩` must equal
-  the band group velocity `∂ε_n/∂k` (finite-differenced on the k-mesh). This
-  validates the kinetic velocity magnitude/units. It is, however, *insensitive
-  to the nonlocal sign*: the nonlocal velocity `dV_NL/dk` is almost purely
-  off-diagonal (verified ~900× larger off-diagonal than on-diagonal for CrI₃),
-  so the diagonal slope test ties between `p±vNL`.
+* **Velocity source.** The script no longer assembles its own per-k velocity.
+  It reads the dipole producer's distributed q=0 DFT velocity
+  (`velocity_only.h5` beside the WFN, authenticated against the WFN
+  fingerprint, k grid, reciprocal lattice and band manifold) or runs the same
+  band-sharded sweep (`common.mtxel_sweep.dipole_operator`) itself. Both are
+  unfolded to the full BZ by the typed polar action.
+* **Hellmann–Feynman group velocity.** The diagonal `Re⟨n|dH/dk|n⟩` of the
+  loaded velocity is compared with the band group velocity `∂ε_n/∂k`
+  (finite-differenced on the k-mesh) and the RMS mismatch is printed. This
+  validates the kinetic magnitude, units and frame of a stored velocity. It
+  is *insensitive to the nonlocal sign*: `dV_NL/dk` is almost purely
+  off-diagonal (~900× on CrI₃), so the slope test ties between `p±vNL`.
 * **Nonlocal-velocity sign (definitive).** The sign of `dV_NL/dk` is fixed by a
   direct off-diagonal finite difference of `⟨m|V_NL(k)|n⟩` (ψ held fixed):
-  the analytic `compute_vnl_velocity_cart` equals `+dV_NL/dk` to ratio +1.000.
-  Hence the physical velocity is **`v = p + vNL`** (the canonical surviving
-  `vnl_ops` convention). The dipole driver's `p − vNL` flip is a
-  BerkeleyGW-matching convention for optical matrix elements, *not* the
-  physical velocity, and must not be used here — it would flip the orbital
-  moment's sign (CrI₃: `+0.026` → `−0.081 μ_B`).
+  the analytic derivative equals `+dV_NL/dk` to ratio +1.000. Hence the
+  physical velocity is **`v = p + vNL`**, the dipole producer's default arm
+  (`VNL_VELOCITY_SIGN_FLIPPED = +1` since 2026-08-09). The other arm would
+  flip the orbital moment's sign (CrI₃: `+0.026` → `−0.081 μ_B`).
 * **Symmetry.** `m_x, m_y ≈ 0` for an out-of-plane ferromagnet.
 * **Spin moment.** `|m_spin| ≈ 6 μ_B` cross-checks the wavefunction/occupations
   and pins the reporting axis.

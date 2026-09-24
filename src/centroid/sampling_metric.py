@@ -2,13 +2,15 @@
 
 For the same left/right band windows used by candidate pruning, this module
 builds the diagonal of the q=0 feature Gram and leaves the final square root
-to the driver.  Band pairs are never materialised: each k point is first
-contracted into two local spin-density matrices.
+to the driver.  Band pairs are never materialised: each k point is contracted
+into one band-summed spinor density matrix per window by the density scan of
+:func:`gw.qsgw_density.rho_from_wfns`, with unit weights over the window.
 """
 
 from __future__ import annotations
 
 import time
+from functools import partial
 
 import jax
 import jax.numpy as jnp
@@ -19,36 +21,6 @@ from common.gamma_matrices import gamma_apply, gamma_perm_phase
 
 
 _GAMMA_MODES = ("charge", "transverse")
-_PROJECTOR_BUDGET_BYTES = 8 * 1024 ** 3
-
-
-@jax.jit
-def _accumulate_subspace_density_matrices(
-    density_left,
-    density_right,
-    psi_r,
-    mask_left,
-    mask_right,
-):
-    """Stream bands into ``D_L(r)`` and ``D_R(r)`` with one spin outer."""
-    mask_left = jnp.asarray(mask_left, dtype=jnp.float64)
-    mask_right = jnp.asarray(mask_right, dtype=jnp.float64)
-
-    def add_state(carry, state_and_masks):
-        D_left, D_right = carry
-        psi_n, include_left, include_right = state_and_masks
-        outer = psi_n[:, None, ...] * jnp.conj(psi_n[None, :, ...])
-        return (
-            D_left + include_left * outer,
-            D_right + include_right * outer,
-        ), None
-
-    return jax.lax.scan(
-        add_state,
-        (density_left, density_right),
-        (psi_r, mask_left, mask_right),
-        unroll=1,
-    )[0]
 
 
 @jax.jit
@@ -79,57 +51,24 @@ def _transverse_metric_diagonal(
     return out * jnp.square(current_scale)
 
 
-def feature_metric_diagonal_from_psi_r(
-    psi_r,
-    mask_left,
-    mask_right,
-    wavefunction_scale,
-    *,
-    gamma_mode: str,
-):
-    """Evaluate a charge or transverse Gram diagonal from one k carrier.
+@partial(jax.jit, static_argnames=("mode",))
+def _accumulate_metric_rows(row_fields, density_left, density_right,
+                            row_weights, *, mode):
+    """``A_g += sum_k W[k, g] Tr(D_Lk Gamma D_Rk Gamma)`` for one k chunk.
 
-    Parameters
-    ----------
-    psi_r
-        ``(nb, ns, nx, ny, nz)`` complex wavefunctions. ``ns=4`` is
-        required for ``gamma_mode='transverse'``.
-    mask_left, mask_right
-        Unit/zero band-window masks of length ``nb``. They are fitting
-        selectors, never occupations.
-    wavefunction_scale
-        ``sqrt(N_grid / Omega)`` for the unitary-FFT wavefunctions.
-    gamma_mode
-        ``'charge'`` for the identity vertex or ``'transverse'`` for the
-        equally weighted three Dirac-current vertices.
+    ``density_*`` are ``(K, ns, ns, nx, ny, nz)`` per-k spinor density
+    matrices already in physical normalisation (scale 1 below);
+    ``row_weights`` is ``(K, n_rows)``, the full-BZ member weight of each
+    chunk parent under each distinct symmetry row; ``row_fields`` is
+    ``(n_rows, nx*ny*nz)``.
     """
-    mode = str(gamma_mode).strip().lower()
-    if mode not in _GAMMA_MODES:
-        raise ValueError(
-            f"gamma_mode must be one of {_GAMMA_MODES}; got {gamma_mode!r}")
-    if psi_r.ndim != 5:
-        raise ValueError(
-            "psi_r must have shape (nb,ns,nx,ny,nz); got "
-            f"{psi_r.shape}")
-    if mode == "transverse" and int(psi_r.shape[1]) != 4:
-        raise ValueError(
-            "gamma_mode='transverse' requires four-component bispinors; "
-            f"got ns={int(psi_r.shape[1])}")
-    left = jnp.asarray(mask_left, dtype=jnp.float64).reshape(-1)
-    right = jnp.asarray(mask_right, dtype=jnp.float64).reshape(-1)
-    if int(left.shape[0]) != int(psi_r.shape[0]) or left.shape != right.shape:
-        raise ValueError(
-            "left/right masks must have one entry per band; got "
-            f"{left.shape}, {right.shape} for nb={int(psi_r.shape[0])}")
-    ns = int(psi_r.shape[1])
-    zero = jnp.zeros((ns, ns) + tuple(psi_r.shape[-3:]), dtype=psi_r.dtype)
-    density_left, density_right = _accumulate_subspace_density_matrices(
-        zero, jnp.zeros_like(zero), psi_r, left, right)
-    if mode == "charge":
-        return _charge_metric_diagonal(
-            density_left, density_right, wavefunction_scale)
-    return _transverse_metric_diagonal(
-        density_left, density_right, wavefunction_scale)
+    kernel = (_charge_metric_diagonal if mode == "charge"
+              else _transverse_metric_diagonal)
+    fields = jax.vmap(lambda left, right: kernel(left, right, 1.0))(
+        density_left, density_right)
+    return row_fields + jnp.einsum(
+        "kg,kr->gr", row_weights,
+        fields.reshape(fields.shape[0], -1), optimize=True)
 
 
 @jax.jit
@@ -147,13 +86,6 @@ def _validated_range(band_range, nbands: int, name: str) -> tuple[int, int]:
             f"{name} must be a nonempty subset of [0,{int(nbands)}); "
             f"got {(lo, hi)}")
     return lo, hi
-
-
-def _window_mask(lo: int, canonical_mask, band_range) -> np.ndarray:
-    canonical = np.asarray(canonical_mask, dtype=np.float64)
-    bands = int(lo) + np.arange(canonical.size)
-    range_lo, range_hi = band_range
-    return canonical * ((bands >= range_lo) & (bands < range_hi))
 
 
 def _quadrature_tables(wfn, sym):
@@ -270,29 +202,50 @@ def full_k_quadrature_weights(wfn, sym) -> np.ndarray:
     return _quadrature_tables(wfn, sym)[2].copy()
 
 
-def _projector_memory_plan(
-    n_grid: int,
-    ns: int,
+def _metric_chunk_plan(
     *,
+    n_parents: int,
+    n_bands: int,
+    n_band_shards: int,
+    ns: int,
+    ngkmax: int,
+    n_grid: int,
+    n_windows: int,
     device_memory_bytes: int | None,
-) -> tuple[int, int]:
-    """Return projector bytes/cap, refusing before an unbounded HBM attempt."""
-    if min(n_grid, ns) <= 0:
-        raise ValueError("metric memory plan requires positive grid/spin sizes")
-    budget = _PROJECTOR_BUDGET_BYTES
-    if device_memory_bytes is not None and int(device_memory_bytes) > 0:
-        budget = min(budget, max(1024 ** 3, int(device_memory_bytes) // 4))
-    bytes_per_point = 2 * int(ns) ** 2 * np.dtype(np.complex128).itemsize
-    projector_bytes = bytes_per_point * int(n_grid)
-    if projector_bytes > budget:
+) -> tuple[int, int, int]:
+    """Return ``(k_chunk, band_chunk, budget_bytes)`` for the metric scan.
+
+    One quarter of the device is the budget, half for the scan's FFT box
+    transient and half for the resident k chunk.  The density scan transforms
+    every local band of one k at once, ``2 * nb/P * ns * N_grid`` complex
+    values, so the band chunk bounds that transient.  A k chunk holds its
+    ``psi(G)`` band shard plus the replicated per-k density matrices and their
+    psum buffer.  The k chunk divides the parent count, so one executable
+    serves every chunk.  A single k whose replicated matrices exceed the
+    budget refuses: this route does not spatially shard ``D_k(r)``.
+    """
+    from runtime.padding import bounded_partition_tile
+
+    c128 = np.dtype(np.complex128).itemsize
+    budget = int(device_memory_bytes or 0) // 4
+    if budget <= 0:
+        budget = 2 * 1024 ** 3
+    per_band = 2 * int(ns) * int(n_grid) * c128
+    local_bands = max(1, (budget // 2) // per_band)
+    band_chunk = int(min(int(n_bands), local_bands * int(n_band_shards)))
+    local_chunk = -(-band_chunk // int(n_band_shards))
+    per_k = (local_chunk * int(ns) * int(ngkmax) * c128
+             + 2 * int(n_windows) * int(ns) ** 2 * int(n_grid) * c128)
+    if per_k > budget // 2:
         raise MemoryError(
-            "centroid feature metric projector carrier exceeds its preflight "
-            f"cap: two {ns}x{ns} complex128 grids need "
-            f"{projector_bytes / 2**30:.2f} GiB/rank, cap is "
-            f"{budget / 2**30:.2f} GiB/rank. This path distributes IBZ "
-            "parents but does not spatially shard one projector; reduce the "
-            "FFT grid or use a future distributed-r-space metric backend.")
-    return projector_bytes, budget
+            "centroid feature metric: one k point's replicated "
+            f"{ns}x{ns} density matrices need {per_k / 2**30:.2f} GiB/rank, "
+            f"above the {budget / 2 / 2**30:.2f} GiB/rank chunk budget. "
+            "This route band-shards psi but does not spatially shard D_k(r); "
+            "reduce the FFT grid or add ranks.")
+    k_chunk = bounded_partition_tile(
+        int(n_parents), max(1, (budget // 2) // per_k), 1)
+    return max(1, k_chunk), band_chunk, budget
 
 
 def build_feature_metric_diagonal(
@@ -309,26 +262,31 @@ def build_feature_metric_diagonal(
 
     The returned field is
 
-    ``s(r)=sum_k w_k sum_{m in L,n in R}|Psi_m^dag Gamma Psi_n|^2``.
+    ``s(r)=sum_k w_k sum_{m in L,n in R}|Psi_m^dag Gamma Psi_n|^2
+          =sum_k w_k Tr(D_Lk(r) Gamma D_Rk(r) Gamma)``,
 
-    ``Gamma=I`` for charge. For transverse current the three
-    ``Gamma=alpha_i/alpha_fs`` channels are summed. The driver uses
-    ``sqrt(s)`` as the Lloyd mass. In the one-k, one-component,
-    equal-window limit this is exactly the historical band density; over
-    multiple k points it is the norm of the k-stacked feature row.
+    with ``D_Wk(r) = sum_{n in W} Psi_nk(r) Psi_nk(r)^dag`` the spinor
+    density matrix of window W at k.  ``Gamma=I`` for charge. For transverse
+    current the three ``Gamma=alpha_i/alpha_fs`` channels are summed and
+    ``D`` is the ``4x4`` bispinor matrix. The driver uses ``sqrt(s)`` as the
+    Lloyd mass. In the one-k, one-component, equal-window limit this is
+    exactly the historical band density; over multiple k points it is the
+    norm of the k-stacked feature row.
 
-    Bands stream into ``D_L`` and ``D_R`` together; neither an ``(n,m)``
-    transition carrier nor an ``O(Nsym*Ngrid)`` pullback cache is formed.
-    Parents are partitioned over processes and one final scalar-grid psum
-    combines the result.  The two full-grid projector carriers are explicitly
-    priced and capped at 8 GiB/rank (or one quarter of device memory); this
-    parent-distributed path refuses rather than pretending those grids are
-    spatially sharded.
+    ``D_Wk`` comes from :func:`gw.qsgw_density.rho_from_wfns` (the density
+    scan's local route, ``per_k``) with unit weights over the window: bands
+    are sharded over the whole mesh, every rank scans every stored parent,
+    and one psum per chunk returns band-complete matrices.  Equal windows
+    (every production deck) build one ``D`` and use it on both sides.  Each
+    distinct symmetry row accumulates its weighted parent fields, and the
+    FFT-grid pullback of that row is applied once at the end.
     """
-    from common.collectives import (process_rank_world, psum_replicate,
+    from common import timing
+    from common.collectives import (gather_to_host, process_rank_world,
                                     single_device_mesh)
-    from common.wfn_transforms import to_rbox
-    from wfn_loader import IBZRows, WfnLoader, uniform_band_windows
+    from common.wfn_layout import band_sphere_spec
+    from gw.qsgw_density import rho_from_wfns
+    from wfn_loader import IBZRows, WfnLoader
 
     if not isinstance(wfn, WfnLoader):
         raise TypeError(
@@ -353,7 +311,6 @@ def build_feature_metric_diagonal(
     if not np.isfinite(cell_volume) or cell_volume <= 0.0:
         raise ValueError(
             f"WFN cell volume must be finite and positive, got {cell_volume}")
-    wavefunction_scale = float(np.sqrt(n_grid / cell_volume))
     ns = 4 if mode == "transverse" else int(wfn.nspinor)
 
     parents_used, star_plan, _ = _quadrature_tables(wfn, sym)
@@ -364,125 +321,94 @@ def build_feature_metric_diagonal(
             "build_feature_metric_diagonal requires dist_mesh at P>1 so the "
             f"wavefunction sweep is partitioned rather than repeated on {world} "
             "processes")
+    mesh = single_device_mesh() if dist_mesh is None else dist_mesh
 
+    # Full-BZ member weight of each parent under each distinct symmetry row.
+    sym_rows = np.unique(np.concatenate(
+        [star_plan[int(p)][0] for p in parents_used]))
+    row_slot = {int(row): i for i, row in enumerate(sym_rows)}
+    row_weights = np.zeros((parents_used.size, sym_rows.size), np.float64)
+    for i, parent in enumerate(parents_used):
+        for row, weight in zip(*star_plan[int(parent)]):
+            row_weights[i, row_slot[int(row)]] += float(weight)
+
+    windows = ((left_range,) if left_range == right_range
+               else (left_range, right_range))
     union_lo = min(left_range[0], right_range[0])
     union_hi = max(left_range[1], right_range[1])
-    bytes_per_band = 3 * ns * n_grid * np.dtype(np.complex128).itemsize
-    chunk = max(1, min(
-        union_hi - union_lo, (4 * 1024 ** 3) // max(1, bytes_per_band)))
-    windows = uniform_band_windows(union_lo, union_hi, chunk)
-    width = int(windows[0][1].shape[0])
     try:
         from common.gpu_utils import get_device_memory_gb
-        device_memory_bytes = int(float(get_device_memory_gb()) * 1024 ** 3)
+        device_memory_bytes = int(float(get_device_memory_gb()) * 1e9)
     except Exception:
         device_memory_bytes = None
-    projector_bytes, projector_cap = _projector_memory_plan(
-        n_grid, ns, device_memory_bytes=device_memory_bytes)
-    n_rounds = -(-int(parents_used.size) // world)
-    parents_local = [
-        (int(parent), True) for parent in parents_used[rank::world]]
-    while len(parents_local) < n_rounds:
-        parents_local.append((int(parents_used[0]), False))
-    # Every rank issues the same device programs in the same order
-    # (INVARIANTS 21): round r pulls back as many rows as the largest star
-    # dealt to any rank in that round.  Shorter stars and the excluded filler
-    # parent pad with zero-weight rows, which leave the accumulator unchanged.
-    round_rows = [
-        max(int(star_plan[int(parent)][0].size)
-            for parent in parents_used[r * world:(r + 1) * world])
-        for r in range(n_rounds)]
+    k_chunk, band_chunk, budget = _metric_chunk_plan(
+        n_parents=int(parents_used.size), n_bands=union_hi - union_lo,
+        n_band_shards=int(mesh.devices.size), ns=ns,
+        ngkmax=int(wfn.ngkmax), n_grid=n_grid, n_windows=len(windows),
+        device_memory_bytes=device_memory_bytes)
     if rank == 0:
         print(
-            f"  {mode} metric plan: {len(parents_used)} parent(s) over "
-            f"{world} rank(s); two full-grid projectors "
-            f"{projector_bytes / 2**30:.2f} GiB/rank "
-            f"(cap {projector_cap / 2**30:.2f}), WFN chunk <= 4.00 GiB, "
-            "one scalar-grid psum",
+            f"  {mode} metric plan: {len(parents_used)} parent(s) in "
+            f"chunks of {k_chunk}, bands [{union_lo},{union_hi}) in chunks "
+            f"of {band_chunk} over {int(mesh.devices.size)} band shard(s); "
+            f"{len(windows)} density matrix window(s), "
+            f"{sym_rows.size} symmetry row(s); budget "
+            f"{budget / 2**30:.2f} GiB/rank",
             flush=True)
 
     t0 = time.perf_counter()
-    last_log = t0
-    mesh = single_device_mesh()
-    metric_local = jnp.zeros(n_grid, dtype=jnp.float64)
-    real_parents_done = 0
-    pullback_rows_done = 0
-    for round_index, (parent, include_parent) in enumerate(parents_local):
-        k_spec = IBZRows((parent,))
+    row_fields = jnp.zeros((sym_rows.size, n_grid), dtype=jnp.float64)
+    for c0 in range(0, parents_used.size, k_chunk):
+        chunk = tuple(int(p) for p in parents_used[c0:c0 + k_chunk])
+        k_spec = IBZRows(chunk)
         box_index = wfn.box_index(k=k_spec)
-        zero = jnp.zeros((ns, ns) + fft_grid, dtype=jnp.complex128)
-        density_left, density_right = zero, jnp.zeros_like(zero)
-        for lo, canonical_mask in windows:
-            left_mask = _window_mask(lo, canonical_mask, left_range)
-            right_mask = _window_mask(lo, canonical_mask, right_range)
-            if not include_parent:
-                left_mask = np.zeros_like(left_mask)
-                right_mask = np.zeros_like(right_mask)
-            psi_g = wfn.load_process_local(
-                bands=(lo, lo + width), k=k_spec,
-                bispinor=(mode == "transverse"))
-            psi_r = to_rbox(
-                psi_g, box_index, fft_grid, mesh=mesh, norm="ortho")
-            if int(psi_r.shape[0]) != 1 or int(psi_r.shape[2]) != ns:
-                raise ValueError(
-                    "one-parent WfnLoader request returned incompatible "
-                    f"shape {psi_r.shape}; expected k=1, ns={ns}")
-            density_left, density_right = _accumulate_subspace_density_matrices(
-                density_left, density_right, psi_r[0],
-                jnp.asarray(left_mask), jnp.asarray(right_mask))
-            density_left.block_until_ready()
-            density_right.block_until_ready()
-            del psi_g, psi_r
-
-        if mode == "charge":
-            parent_metric = _charge_metric_diagonal(
-                density_left, density_right, wavefunction_scale)
-        else:
-            parent_metric = _transverse_metric_diagonal(
-                density_left, density_right, wavefunction_scale)
-        # Weights come from _quadrature_tables, which is the one place
-        # that knows whether this WFN stores the IBZ or the full BZ.
-        star_sym_rows, star_weights = star_plan[parent]
-        n_rows = round_rows[round_index]
-        n_pad = max(0, n_rows - int(star_sym_rows.size))
-        rows = np.concatenate(
-            [star_sym_rows, np.repeat(star_sym_rows[-1:], n_pad)])[:n_rows]
-        weights = np.concatenate(
-            [star_weights if include_parent else np.zeros_like(star_weights),
-             np.zeros(n_pad)])[:n_rows]
-        pullback_row = pullback_dev = None
-        for row, member_weight in zip(rows, weights):
-            if row != pullback_row:
-                pullback = sym.fft_grid_pullback(
-                    np.asarray([int(row)], dtype=np.int32),
-                    fft_grid, validate=True)
-                if pullback.shape != (1, n_grid):
-                    raise ValueError(
-                        "symmetry-service FFT-grid pullback has the wrong "
-                        f"shape: {pullback.shape} != {(1, n_grid)}")
-                pullback_row = row
-                pullback_dev = jnp.asarray(pullback[0], dtype=jnp.int32)
-                del pullback
-            metric_local = _accumulate_grid_pullback(
-                metric_local, parent_metric, pullback_dev,
-                jnp.asarray(float(member_weight), dtype=jnp.float64))
-            metric_local.block_until_ready()
-        del pullback_dev
-        if include_parent:
-            pullback_rows_done += int(star_sym_rows.size)
-            real_parents_done += 1
-        del density_left, density_right, parent_metric
-        if verbose and time.perf_counter() - last_log > 5.0:
-            last_log = time.perf_counter()
+        density = [None] * len(windows)
+        for lo in range(union_lo, union_hi, band_chunk):
+            hi = min(lo + band_chunk, union_hi)
+            bands = np.arange(lo, hi)
+            with timing.section("metric.load"):
+                psi_g = wfn.load(bands=(lo, hi), k=k_spec,
+                                 sharding=band_sphere_spec(),
+                                 bispinor=(mode == "transverse"))
+                psi_g.block_until_ready()
+            for w, (w_lo, w_hi) in enumerate(windows):
+                unit = ((bands >= w_lo) & (bands < w_hi)).astype(np.float64)
+                if not unit.any():
+                    continue
+                part = rho_from_wfns(
+                    psi_g, np.broadcast_to(unit, (len(chunk), unit.size)),
+                    np.ones(len(chunk)), mesh=mesh, box_index=box_index,
+                    fft_grid=fft_grid, cell_volume=cell_volume,
+                    spin_degeneracy=1.0, return_spin_density_matrix=ns > 1,
+                    per_k=True, memory_budget_bytes=budget)
+                if ns == 1:                      # the 1x1 matrix is rho_k
+                    part = part[:, None, None].astype(jnp.complex128)
+                density[w] = part if density[w] is None else density[w] + part
+            del psi_g
+        row_fields = _accumulate_metric_rows(
+            row_fields, density[0], density[-1],
+            jnp.asarray(row_weights[c0:c0 + k_chunk]), mode=mode)
+        del density
+        if verbose:
             print(
-                f"    [{mode} metric] rank {rank}: "
-                f"{real_parents_done}/{len(parents_local)} local parents "
-                f"after {last_log - t0:.1f}s", flush=True)
+                f"    [{mode} metric] {c0 + len(chunk)}/{len(parents_used)} "
+                f"parents after {time.perf_counter() - t0:.1f}s", flush=True)
 
-    metric = np.asarray(metric_local, dtype=np.float64)
-    if world > 1:
-        metric = psum_replicate(metric, dist_mesh)
-    metric = np.asarray(metric, dtype=np.float64).reshape(fft_grid)
+    metric_dev = jnp.zeros(n_grid, dtype=jnp.float64)
+    for slot, row in enumerate(sym_rows):
+        pullback = sym.fft_grid_pullback(
+            np.asarray([int(row)], dtype=np.int32), fft_grid, validate=True)
+        if pullback.shape != (1, n_grid):
+            raise ValueError(
+                "symmetry-service FFT-grid pullback has the wrong "
+                f"shape: {pullback.shape} != {(1, n_grid)}")
+        metric_dev = _accumulate_grid_pullback(
+            metric_dev, row_fields[slot],
+            jnp.asarray(pullback[0], dtype=jnp.int32),
+            jnp.asarray(1.0, dtype=jnp.float64))
+        del pullback
+    metric = np.asarray(gather_to_host(metric_dev),
+                        dtype=np.float64).reshape(fft_grid)
     scale = float(np.max(np.abs(metric)))
     negative_tolerance = 256.0 * np.finfo(np.float64).eps * scale
     minimum = float(np.min(metric))
@@ -497,14 +423,13 @@ def build_feature_metric_diagonal(
         print(
             f"  {mode} feature-Gram diagonal ({model}, left={left_range}, "
             f"right={right_range}, unit band weights, {len(parents_used)} "
-            f"parents/{world} ranks, one psum) built with "
-            f"{pullback_rows_done} streamed local pullback row(s) in "
+            f"parents over {int(mesh.devices.size)} band shard(s), "
+            f"{sym_rows.size} pullback row(s)) built in "
             f"{time.perf_counter() - t0:.2f}s", flush=True)
     return metric
 
 
 __all__ = [
     "build_feature_metric_diagonal",
-    "feature_metric_diagonal_from_psi_r",
     "full_k_quadrature_weights",
 ]

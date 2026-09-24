@@ -178,14 +178,16 @@ def density_components_from_psi_r(
     per-band weight: MP1's small negative occupations therefore enter every
     four-current component through exactly the same arithmetic.
 
-    With ``return_spin_density_matrix=True``, exactly two spinor components
-    are required and the return shape is ``(2,2,nx,ny,nz)`` with axes
-    ``(a,b,x,y,z)`` and convention
-    ``rho_ab(r) = sum_n f_n psi_na(r) psi_nb(r)*``.  It has the same density
-    units as the scalar return after the caller's k/spin prefactor, and its
-    trace is the incumbent scalar charge density.  This raw local matrix has
-    no spatial-symmetry projection: spin is an axial vector and cannot use
-    the scalar charge pullback without a separately owned axial/TR action.
+    With ``return_spin_density_matrix=True`` the return shape is
+    ``(ns,ns,nx,ny,nz)`` with axes ``(a,b,x,y,z)`` and convention
+    ``rho_ab(r) = sum_n f_n psi_na(r) psi_nb(r)*``: the Pauli ``2x2``
+    spin-density matrix, or the ``4x4`` bispinor density matrix the
+    transverse centroid metric contracts with ``alpha_i``.
+    It has the same density units as the scalar return after the caller's
+    k/spin prefactor, and its trace is the incumbent scalar charge density.
+    This raw local matrix has no spatial-symmetry projection: spin is an
+    axial vector and cannot use the scalar charge pullback without a
+    separately owned axial/TR action.
 
     This is the single local four-current contraction used by both the
     streamed one-shot density and ``gw.qsgw_density``'s evolving-orbital
@@ -211,10 +213,10 @@ def density_components_from_psi_r(
         raise ValueError(
             "Dirac current requires four-component kinetic-balance "
             f"bispinors; got nspinor={ns}")
-    if return_spin_density_matrix and ns != 2:
+    if return_spin_density_matrix and ns not in (2, 4):
         raise ValueError(
-            "spin-density matrix requires exactly two-component Pauli "
-            f"spinors; got nspinor={ns}")
+            "spin-density matrix requires exactly two-component Pauli or "
+            f"four-component bispinor spinors; got nspinor={ns}")
     if return_spin_density_matrix and charge_nspinor is not None:
         raise ValueError(
             "charge_nspinor does not apply when returning the complete "
@@ -242,12 +244,19 @@ def density_components_from_psi_r(
             return jnp.sum(
                 terms if occ_grid is None else occ_grid * terms, axis=0)
 
-        rho_00 = weighted_sum(jnp.real(jnp.conj(psi[:, 0]) * psi[:, 0]))
-        rho_11 = weighted_sum(jnp.real(jnp.conj(psi[:, 1]) * psi[:, 1]))
-        rho_01 = weighted_sum(psi[:, 0] * jnp.conj(psi[:, 1]))
-        row_0 = jnp.stack((rho_00, rho_01))
-        row_1 = jnp.stack((jnp.conj(rho_01), rho_11))
-        return jnp.stack((row_0, row_1))
+        # Diagonal entries are real; the lower triangle is the conjugate of
+        # the upper one.  For ns=2 these are exactly the historical
+        # rho_00, rho_01, rho_11 contractions.
+        upper = {}
+        for a in range(ns):
+            upper[a, a] = weighted_sum(
+                jnp.real(jnp.conj(psi[:, a]) * psi[:, a]))
+            for b in range(a + 1, ns):
+                upper[a, b] = weighted_sum(psi[:, a] * jnp.conj(psi[:, b]))
+        return jnp.stack([
+            jnp.stack([upper[a, b] if a <= b else jnp.conj(upper[b, a])
+                       for b in range(ns)])
+            for a in range(ns)])
 
     occ = (None if occ_band is None
            else occ_band[:, None, None, None, None])
