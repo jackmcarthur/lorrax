@@ -19,6 +19,35 @@ from gw.shared_pole_directions import _round_kernels, _sample_point, select_roun
 from gw.shared_pole_reduction import ORIENTATION_PAIR_REFUSAL
 
 
+def constructor_route(meta, config, recipe, *, mesh_xy, ledger, upstream, ordered,
+                      odd_moments, mirrored, nq):
+    """Resolve local or whole-mesh parent execution for one map's bank.
+
+    The single admission the constructor applies before its first bank read,
+    also consulted by the map owner before the bank exists (bank residence).
+    Returns ``(execution, receipt, column_extent, sample_fields,
+    moment_fields)``; ``upstream`` names the accepted live reservations.
+    """
+    from jax.sharding import PartitionSpec as P
+    from runtime.padding import padded_axis
+    from gw.gw_config import linalg_resolution
+    from gw.shared_pole_execution import constructor_execution
+
+    column_extent = lambda width: padded_axis(
+        width, mesh_xy, name="shared_pole_port",
+        specs=((P("x", "y"), 0), (P("x", "y"), 1))).carrier
+    sample_fields = (("Wc", "dWc_ds", "Wc_mirror", "dWc_mirror_ds")
+                     if mirrored else ("Wc", "dWc_ds"))
+    moment_fields = ("M0", "M1", "M2", "M3") if odd_moments else ("M1", "M3")
+    execution, receipt = constructor_execution(
+        meta, linalg_resolution({"linalg": config.backend.linalg}), recipe,
+        mesh=mesh_xy, ledger=ledger, upstream=upstream, ordered=ordered,
+        odd_moments=odd_moments, sample_fields=len(sample_fields),
+        moment_fields=len(moment_fields), parent_count=int(nq),
+        defer_reduction=True, column_extent=column_extent)
+    return execution, receipt, column_extent, sample_fields, moment_fields
+
+
 def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
     """Construct and write a current-state, bounded-batch real-pole model.
 
@@ -53,10 +82,9 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
         import numpy as np
         from jax.sharding import NamedSharding, PartitionSpec as P
         import distrib_la
-        from runtime.padding import mesh_divisor, padded_axis
-        from file_io.slab_io import SlabIO
+        from runtime.padding import mesh_divisor
         from file_io.shared_pole_store import (
-            charge_representation, validate_shared_pole_bank,
+            charge_representation, validate_shared_pole_bank, open_shared_pole_bank,
             read_shared_pole_bank, write_shared_pole_model,
         )
         from gw.gw_config import linalg_resolution
@@ -135,22 +163,12 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
             partner_parent = partner_row = None
 
         logical_n = int(meta.n_rmu)
-        column_extent = lambda width: padded_axis(
-            width, mesh_xy, name="shared_pole_port",
-            specs=((P("x", "y"), 0), (P("x", "y"), 1))).carrier
-        from gw.shared_pole_execution import (constructor_execution,
-                                               constructor_side_upper_bound)
-        sample_fields = (
-            ("Wc", "dWc_ds", "Wc_mirror", "dWc_mirror_ds")
-            if header.get("mirror_mode") is not None else ("Wc", "dWc_ds"))
-        moment_fields = (("M0", "M1", "M2", "M3")
-                         if odd_moments else ("M1", "M3"))
-        execution, execution_receipt = constructor_execution(
-            meta, resolution, recipe, mesh=mesh_xy, ledger=ledger,
-            upstream=upstream, ordered=ordered, odd_moments=odd_moments,
-            sample_fields=len(sample_fields), moment_fields=len(moment_fields),
-            parent_count=int(header['bank_shape']['nq']), defer_reduction=True,
-            column_extent=column_extent)
+        from gw.shared_pole_execution import constructor_side_upper_bound
+        execution, execution_receipt, column_extent, sample_fields, moment_fields = constructor_route(
+            meta, config, recipe, mesh_xy=mesh_xy, ledger=ledger, upstream=upstream,
+            ordered=ordered, odd_moments=odd_moments,
+            mirrored=header.get("mirror_mode") is not None,
+            nq=int(header['bank_shape']['nq']))
         if execution == 'face' and ordered and header.get('mirror_mode') is None:
             raise ValueError('GATE shared_pole_constructor_execution: ordered whole-mesh parents require authenticated literal mirror fields')
         budget = ConstructorCapacity(meta, resolution, mesh_xy=mesh_xy,
@@ -195,7 +213,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
                                  + len(moment_fields)))
             budget.live(())
         with timing.section("spole.scratch_read"):
-            with SlabIO(moments["path"], mode="r", mesh=mesh_xy) as moment_io:
+            with open_shared_pole_bank(moments["path"], mesh_xy=mesh_xy) as moment_io:
                 exact = read_shared_pole_bank(moment_io, meta=meta, header=moment_header,
                                               q_ids=ids, partition_spec=read_spec,
                                               fields=moment_fields)
@@ -210,7 +228,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
             del exact
         with timing.section("spole.sample_batch_read"):
             budget.live(infinity)
-            with SlabIO(bank["path"], mode="r", mesh=mesh_xy) as bank_io:
+            with open_shared_pole_bank(bank["path"], mesh_xy=mesh_xy) as bank_io:
                 samples = read_shared_pole_bank(
                     bank_io, meta=meta, header=header, q_ids=ids,
                     partition_spec=read_spec, sample_span=(fit_lo, fit_hi),
@@ -316,14 +334,14 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
             # Coulomb call, not the earlier pre-call live set.
             budget.live((*round_model, *round_signed, qi, inverse_sqrt))
         with timing.section("spole.sample_batch_read"):
-            with SlabIO(bank["path"], mode="r", mesh=mesh_xy) as bank_io:
+            with open_shared_pole_bank(bank["path"], mesh_xy=mesh_xy) as bank_io:
                 held = read_shared_pole_bank(bank_io, meta=meta, header=header, q_ids=ids, partition_spec=read_spec,
                                              sample_span=(held_lo, held_hi), fields=("Wc", "dWc_ds"))
             pick = kernels.take(tuple(i - held_lo for i in held_ids))
             held = tuple(pick(held[name]) for name in ("Wc", "dWc_ds"))
             budget.live((*round_model, *round_signed, qi, inverse_sqrt, *held))
         with timing.section("spole.moment_read"):
-            with SlabIO(moments["path"], mode="r", mesh=mesh_xy) as moment_io:
+            with open_shared_pole_bank(moments["path"], mesh_xy=mesh_xy) as moment_io:
                 exact = read_shared_pole_bank(moment_io, meta=meta, header=moment_header, q_ids=ids,
                                               partition_spec=read_spec, fields=("M1", "M3"))
             budget.live((*round_model, *round_signed, qi, inverse_sqrt, *held,

@@ -181,6 +181,7 @@ def check_bank_roundtrip(mesh, path):
     Path(path).mkdir(parents=True, exist_ok=True)
     test_bank_partial_resume_and_immutable_completion(Path(path))
     test_bank_stale_identity_and_invalid_spans(Path(path))
+    test_resident_bank_reads_equal_file_reads(Path(path))
 
 
 def test_ordered_bank_carries_odd_moments(tmp_path):
@@ -300,3 +301,92 @@ def test_bank_reads_parent_lists_in_face_and_batch_layout(tmp_path):
                                   partition_spec=batch)
         with pytest.raises(ValueError, match="exactly one of q_span or q_ids"):
             read_shared_pole_bank(io, (0, 1), meta=meta, header=header, fields=("M1",), q_ids=[0])
+
+
+def test_resident_bank_reads_equal_file_reads(tmp_path):
+    """A device-resident bank returns the file bank's values bit for bit.
+
+    The same payload goes through the same writer into a scratch file and into
+    a ResidentBankPayload. Every reader route the constructor uses (contiguous
+    face, permuted/repeated face, contiguous batch, permuted interval batch,
+    sparse batch) must agree exactly, including the layout. The logical tail of
+    the canonical carrier is written NONZERO here, so a resident store that
+    kept it (the file cannot) fails. RED TWIN: the resident bank with one
+    parent's rows swapped must differ from the file read.
+    """
+    from symmetry_maps import QirrTables
+    mesh, meta, tables, recipe, identity = _bank_fixture()
+    qt = tables["qirr"]
+    tables = dict(tables, q_irr_full_idx=np.arange(4, dtype=np.int64),
+                  qirr=QirrTables(irr_idx_q=np.arange(27, dtype=np.int32) % 4, sym_idx_q=qt.sym_idx_q,
+                                  q_irr_frac=np.asarray([[0, 0, 0], [1/3, 0, 0], [2/3, 0, 0], [0, 1/3, 0]]),
+                                  sym_perm=qt.sym_perm, L_table=qt.L_table, n_sym_spatial=qt.n_sym_spatial))
+    basis = meta.mu_basis
+    resident = store.ResidentBankPayload(mesh, carrier=basis.n_canonical, label="test")
+    banks = {"file": tmp_path / "scratch_resident_twin.h5", "device": resident}
+
+    def payload(samples, value):
+        shape = ((1, 1) if samples else (1,)) + (basis.n_canonical,) * 2
+        data = (value + np.arange(np.prod(shape)).reshape(shape)
+                + 1j * np.arange(np.prod(shape)).reshape(shape)[..., ::-1]).astype(np.complex128)
+        spec = P(None, None, 'x', 'y') if samples else P(None, 'x', 'y')
+        array = jax.make_array_from_callback(shape, NamedSharding(mesh, spec), lambda index: data[index])
+        return basis.pack_operator(array, spec=spec)
+
+    headers = {}
+    for key, path in banks.items():
+        headers[key] = initialize_shared_pole_bank(
+            path, meta=meta, tables=tables, recipe=recipe, identity=identity, mesh_xy=mesh)
+        nq = headers[key]["bank_shape"]["nq"]
+        for q in range(nq):
+            for sample in range(2):
+                write_shared_pole_bank(
+                    path, q_span=(q, q+1), sample_span=(sample, sample+1),
+                    Wc=payload(True, 10*q + sample), dWc_ds=payload(True, -10*q - sample),
+                    meta=meta, expected_identity=identity, mesh_xy=mesh)
+            write_shared_pole_bank(
+                path, q_span=(q, q+1), M1=payload(False, 100+q), M3=payload(False, 200+q),
+                meta=meta, expected_identity=identity, mesh_xy=mesh)
+        headers[key] = validate_shared_pole_bank(path, expected_identity=identity, mesh_xy=mesh,
+                                                 require_complete=True)
+    assert headers["file"] == headers["device"]
+    assert resident.payload_bytes_per_rank() == store.shared_pole_bank_payload_bytes(
+        meta, recipe=recipe, ordered=False, nq=4, mesh_xy=mesh)
+    fields = ("Wc", "dWc_ds", "M1", "M3")
+    batch = P(('x', 'y'))
+    cases = {"span_face": dict(q_span=(0, 4)), "ids_face": dict(q_ids=[3, 1, 1, 0]),
+             "run_batch": dict(q_ids=[0, 1, 2, 3], partition_spec=batch),
+             "interval_batch": dict(q_ids=[2, 0, 1, 3], partition_spec=batch),
+             "ids_batch": dict(q_ids=[2, 0, 3, 3], partition_spec=batch)}
+    got = {}
+    for key, path in banks.items():
+        with store.open_shared_pole_bank(path, mesh_xy=mesh) as io:
+            got[key] = {label: read_shared_pole_bank(io, meta=meta, header=headers[key],
+                                                     sample_span=(0, 2), fields=fields, **request)
+                        for label, request in cases.items()}
+            got[key]["held"] = read_shared_pole_bank(io, meta=meta, header=headers[key], q_ids=[0, 1, 2, 3],
+                                                     partition_spec=batch, sample_span=(1, 2), fields=("Wc",))
+    for label in got["file"]:
+        for name, expected in got["file"][label].items():
+            actual = got["device"][label][name]
+            assert actual.shape == expected.shape, (label, name)
+            assert actual.sharding.is_equivalent_to(expected.sharding, actual.ndim), (label, name)
+            assert bool(jnp.all(actual == expected)), (label, name)
+    swapped = store.ResidentBankPayload(mesh, carrier=basis.n_canonical, label="red twin")
+    initialize_shared_pole_bank(swapped, meta=meta, tables=tables, recipe=recipe,
+                                identity=identity, mesh_xy=mesh)
+    for q in range(4):
+        source = {0: 1, 1: 0}.get(q, q)
+        for sample in range(2):
+            write_shared_pole_bank(swapped, q_span=(q, q+1), sample_span=(sample, sample+1),
+                                   Wc=payload(True, 10*source + sample), dWc_ds=payload(True, -10*q - sample),
+                                   meta=meta, expected_identity=identity, mesh_xy=mesh)
+        header = write_shared_pole_bank(swapped, q_span=(q, q+1), M1=payload(False, 100+q),
+                                        M3=payload(False, 200+q), meta=meta,
+                                        expected_identity=identity, mesh_xy=mesh)
+    red = read_shared_pole_bank(swapped, meta=meta, header=header, sample_span=(0, 2), fields=("Wc",),
+                                **cases["run_batch"])["Wc"]
+    assert not bool(jnp.all(red == got["file"]["run_batch"]["Wc"]))
+    resident.release()
+    with pytest.raises(ValueError, match="no committed header"):
+        validate_shared_pole_bank(resident, expected_identity=identity, mesh_xy=mesh)

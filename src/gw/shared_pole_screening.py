@@ -138,6 +138,57 @@ def _coulomb_resource(value, meta, sym, mesh_xy, path):
                 q_irr_full_idx=qids.tolist(), sha256=resource_digest(path))
 
 
+def _bank_residence(meta, config, *, mesh_xy, sym, root, label, photon):
+    """Keep this map's bank on the devices when it fits; else the scratch file.
+
+    The bank is written once and read back once by the constructor; the file
+    exists only because the producer is frequency-major and the constructor
+    parent-major. It stays resident when (1) the resident payload R and one
+    complete read copy fit in half of the available device budget (R4's
+    q-local margin), and (2) the constructor's own route admission, with R
+    live, still selects local parents, so residency never changes the route.
+    A photon bank, a W export (``write_w`` re-reads the bank after the
+    constructor) and a requested distributed layout keep the file.
+    Returns ``(payload or None, receipt)``; the payload's R is reserved and
+    the caller keeps it in ``ledger.live_stages`` until it is released.
+    """
+    from file_io.shared_pole_store import ResidentBankPayload, shared_pole_bank_payload_bytes
+    from .gw_config import linalg_resolution
+    from .shared_pole_constructor import constructor_route
+
+    ledger = meta.shared_pole_capacity
+    ordered = not bool(sym.trs_allowed)
+    nq = len(np.asarray(sym.q_irr_full_idx))
+    R = shared_pole_bank_payload_bytes(meta, recipe=meta.shared_pole_recipe,
+                                       ordered=ordered, nq=nq, mesh_xy=mesh_xy)
+    receipt = dict(residence="file", payload_bytes_per_rank=R,
+                   payload_bytes_total=R * int(mesh_xy.size))
+    if photon or config.debug.write_w or linalg_resolution(
+            {"linalg": config.backend.linalg}).layout != "local":
+        receipt["reason"] = "photon bank, write_w export or distributed layout"
+        return None, receipt
+    both = ledger.preview(resident_bytes_per_rank=2 * R, workspace_bytes_per_rank=0,
+                          concurrent_with=())
+    receipt["half_budget_bytes_per_rank"] = both["available_device_bytes_per_rank"] // 2
+    if both["aggregate_bytes_per_rank"] > receipt["half_budget_bytes_per_rank"]:
+        receipt["reason"] = "payload and one read copy exceed half the device budget"
+        return None, receipt
+    stage = f"bank_resident.{label}"
+    ledger.reserve(stage, resident_bytes_per_rank=R, workspace_bytes_per_rank=0,
+                   concurrent_with=())
+    execution = constructor_route(
+        meta, config, meta.shared_pole_recipe, mesh_xy=mesh_xy, ledger=ledger,
+        upstream=(stage,), ordered=ordered, odd_moments=ordered, mirrored=ordered,
+        nq=nq)[0]
+    if execution != "local":
+        receipt["reason"] = "constructor would leave local parents with the payload live"
+        return None, receipt
+    receipt.update(residence="device", stage=stage,
+                   reason="payload, one read copy and the local constructor fit")
+    return ResidentBankPayload(mesh_xy, carrier=meta.mu_basis.n_canonical,
+                               label=str(root / "bank.h5")), receipt
+
+
 def _shared_pole_tables(meta, sym, centroid_indices):
     """Build raw-parent tables through the canonical symmetry service."""
     from symmetry_maps import (QirrTables, centroid_source_map_and_wrap,
@@ -283,8 +334,19 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
             coulomb = (None if photon else
                        _coulomb_resource(V_q, meta, sym, mesh_xy, root / "coulomb.h5"))
     with timing.section("spole.bank_setup"):
-        bank = dict(path=str(root / "bank.h5"), identity=identity,
-                    tables=tables, coulomb=coulomb)
+        resident, residence = (None, dict(residence="file", reason="authenticated resume"))
+        if not resume_constructor:
+            resident, residence = _bank_residence(meta, config, mesh_xy=mesh_xy, sym=sym,
+                                                  root=root, label=label, photon=photon)
+        print_fn(f"shared-pole bank residence: {residence['residence']}; "
+                 f"{residence['payload_bytes_per_rank'] / 2**30:.3f} GiB/rank, "
+                 f"{residence['payload_bytes_total'] / 2**30:.2f} GiB total; {residence['reason']}"
+                 if 'payload_bytes_per_rank' in residence else
+                 f"shared-pole bank residence: file; {residence['reason']}")
+        if resident is not None:
+            ledger.live_stages = (residence["stage"],)
+        bank = dict(path=str(root / "bank.h5") if resident is None else resident,
+                    identity=identity, tables=tables, coulomb=coulomb)
         if photon:
             bank.update(photon_layout=photon_layout, mu_bases=mu_bases,
                         static_reference=photon_static_reference,
@@ -345,6 +407,11 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
     else:
         result = construct_shared_poles(bank, bank, meta, config,
             mesh_xy=mesh_xy, output=str(root / "model.h5"))
+    if resident is not None:
+        # The model is committed; the constructor was the bank's last reader.
+        resident.release()
+        ledger.live_stages = ()
+    receipts["bank_residence"] = residence
     with timing.section("spole.screening_finalize"):
         record("constructor", result)
         header = None if photon else result["model_header"]

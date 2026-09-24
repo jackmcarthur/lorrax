@@ -22,7 +22,7 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 
 from runtime.padding import combined_divisor, round_up
 from common import timing
-from common.collectives import rank0_transaction, psum_replicate
+from common.collectives import device_put_process_local, rank0_transaction, psum_replicate
 from file_io.slab_io import SlabIO, mesh_divisible_shape
 from file_io.commit_state import agree_io_refusal, assert_committed, set_commit_state
 from symmetry_maps import QirrTables, validate_qirr_tables
@@ -190,6 +190,10 @@ def _check_identity(actual, expected):
 
 
 def _read_header(path):
+    if isinstance(path, ResidentBankPayload):
+        if path.header_json is None:
+            _refuse("resident bank has no committed header")
+        return json.loads(path.header_json)
     with h5py.File(path, "r") as f:
         assert_committed(f, path=path)
         if "header_json" not in f:
@@ -216,6 +220,9 @@ def _read_staging_header(path):
 
 def _stamp_header(path, header, stage):
     # Only metadata, after every collective handle has closed.
+    if isinstance(path, ResidentBankPayload):
+        path.header_json = _json(header)
+        return
     def publish():
         with h5py.File(path, "a") as f:
             if "header_json" in f:
@@ -997,6 +1004,171 @@ def _bank_moment_fields(header):
             + (("constant",) if "photon_layout" in header else ()))
 
 
+class ResidentBankPayload:
+    """One map's construction scratch held on the devices instead of a file.
+
+    The bank is produced frequency-major (one Green/FFT stream per sample for
+    every parent) and consumed parent-major by the constructor, so the file
+    route writes and then re-reads the whole payload once. When that payload
+    fits (``gw.shared_pole_screening._bank_residence``) it stays here: each field is the
+    canonical-order array the file would hold, ``[nq, nsample, d_c, d_c]`` or
+    ``[nq, d_c, d_c]`` complex128 at ``P(None,[None,],'x','y')`` with exact
+    zeros past the logical extent, i.e. ``16 * payload / P`` bytes per rank.
+
+    It implements only the dataset subset of the ``SlabIO`` handle that the
+    bank writer and reader use (``create_dataset``, ``write_slab``,
+    ``read_slab``, ``sync_writes``, ``write_attr``), so the header, masks,
+    identity checks, admissions and canonical packing are the file route's
+    own code. The header is kept as the JSON text the file would store.
+    Reads return exactly the file read's values: one sliced face copy, moved
+    to batch layout by the same staged exchange as a permuted file read.
+    """
+
+    def __init__(self, mesh, *, carrier, label):
+        self.mesh = mesh
+        self.carrier = int(carrier)
+        self.label = str(label)
+        self.header_json = None
+        self._fields = {}
+        self._logical = {}
+
+    def __str__(self):
+        return f"device-resident shared-pole bank ({self.label})"
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        return False
+
+    def payload_bytes_per_rank(self):
+        return sum(_local_bytes(v.shape, v.dtype, self.mesh, v.sharding.spec)
+                   for v in self._fields.values())
+
+    def release(self):
+        """Drop every device payload; the handle cannot be read afterwards."""
+        self._fields.clear()
+        self.header_json = None
+
+    def _spec(self, ndim):
+        return P(*((None,) * (ndim - 2)), "x", "y")
+
+    def _lead(self, offset):
+        # Rank-identical host offsets, placed without a cross-process assertion.
+        return device_put_process_local(np.asarray(offset[:-2], np.int32),
+                                        NamedSharding(self.mesh, P()))
+
+    def create_dataset(self, name, *, shape, dtype):
+        shape = tuple(int(s) for s in shape)
+        if np.dtype(dtype) != np.dtype(np.complex128) or len(shape) not in (3, 4):
+            _refuse(f"resident bank {name} must be complex128 [nq,(nsample,),d,d]")
+        if name in self._fields:
+            if self._logical[name] != shape:
+                _refuse(f"resident bank {name} extent changed")
+            return
+        if max(shape[-2:]) > self.carrier:
+            _refuse(f"resident bank {name} logical extent exceeds canonical carrier")
+        stored = shape[:-2] + (self.carrier, self.carrier)
+        self._fields[name] = _resident_zeros(self.mesh, stored)()
+        self._logical[name] = shape
+
+    def write_attr(self, name, value):
+        # Masks and typed tables are authenticated by the JSON header alone.
+        if name == "header_json":
+            self.header_json = bytes(value).decode()
+
+    def sync_writes(self):
+        return None
+
+    def write_slab(self, name, A, *, offset):
+        if name not in self._fields:
+            _refuse(f"resident bank {name} was not created")
+        store = self._fields[name]
+        offset = tuple(int(v) for v in offset)
+        if (A.ndim != store.ndim or tuple(A.shape[-2:]) != tuple(store.shape[-2:])
+                or any(o != 0 for o in offset[-2:])
+                or any(o + s > n for o, s, n in zip(offset, A.shape, store.shape))
+                or not A.sharding.is_equivalent_to(NamedSharding(self.mesh, self._spec(A.ndim)), A.ndim)):
+            _refuse(f"resident bank {name} write must be a face-tiled full-carrier span")
+        logical = self._logical[name][-1]
+        self._fields[name] = _resident_update(self.mesh, store.ndim, logical)(
+            store, A, self._lead(offset))
+
+    def read_slab(self, name, *, shape, offset, dtype, partition_spec, valid_shape=None):
+        if name not in self._fields:
+            _refuse(f"resident bank {name} has no payload")
+        store = self._fields[name]
+        shape = tuple(int(s) for s in shape)
+        offset = tuple(int(v) for v in offset)
+        valid = shape if valid_shape is None else tuple(int(v) for v in valid_shape)
+        logical = self._logical[name]
+        if (np.dtype(dtype) != np.dtype(np.complex128) or len(shape) != store.ndim
+                or shape[-2:] != tuple(store.shape[-2:]) or any(o != 0 for o in offset[-2:])
+                or valid[:-2] != shape[:-2] or valid[-2:] != logical[-2:]
+                or any(o + s > n for o, s, n in zip(offset, shape, store.shape))):
+            _refuse(f"resident bank {name} read must request full-carrier spans")
+        face = self._spec(store.ndim)
+        value = _resident_slice(self.mesh, store.ndim, shape[:-2])(store, self._lead(offset))
+        layout = _bank_layout(None if tuple(partition_spec) == tuple(face) else partition_spec)
+        return value if layout == "face" else _bank_face_to_batch(self.mesh, value.ndim)(value)
+
+
+@lru_cache(maxsize=None)
+def _resident_zeros(mesh, shape):
+    spec = P(*((None,) * (len(shape) - 2)), "x", "y")
+    return jax.jit(lambda: jnp.zeros(shape, jnp.complex128),
+                   out_shardings=NamedSharding(mesh, spec))
+
+
+@lru_cache(maxsize=None)
+def _resident_update(mesh, ndim, logical):
+    """In-place span update; zero past the logical extent as the file stores it."""
+    spec = NamedSharding(mesh, P(*((None,) * (ndim - 2)), "x", "y"))
+
+    def update(store, value, lead):
+        rows = jnp.arange(value.shape[-2])[:, None] < logical
+        cols = jnp.arange(value.shape[-1])[None, :] < logical
+        value = jnp.where(rows & cols, value, jnp.zeros((), value.dtype))
+        zero = jnp.zeros((), lead.dtype)
+        start = tuple(lead[i] for i in range(ndim - 2)) + (zero, zero)
+        return jax.lax.dynamic_update_slice(store, value, start)
+    return jax.jit(update, donate_argnums=(0,), out_shardings=spec)
+
+
+@lru_cache(maxsize=None)
+def _resident_slice(mesh, ndim, lead_shape):
+    spec = NamedSharding(mesh, P(*((None,) * (ndim - 2)), "x", "y"))
+
+    def take(store, lead):
+        zero = jnp.zeros((), lead.dtype)
+        start = tuple(lead[i] for i in range(ndim - 2)) + (zero, zero)
+        return jax.lax.dynamic_slice(store, start, tuple(lead_shape) + tuple(store.shape[-2:]))
+    return jax.jit(take, out_shardings=spec)
+
+
+def _bank_io(path, mode, mesh):
+    """The bank's payload handle: the resident arrays or one SlabIO transaction."""
+    return path if isinstance(path, ResidentBankPayload) else SlabIO(path, mode=mode, mesh=mesh)
+
+
+def open_shared_pole_bank(path, *, mesh_xy):
+    """Read handle for an authenticated bank, file or device resident."""
+    return _bank_io(path, "r", mesh_xy)
+
+
+def shared_pole_bank_payload_bytes(meta, *, recipe, ordered, nq, mesh_xy):
+    """Per-rank bytes of the complete bank payload in its canonical carrier.
+
+    The same fields the scratch file holds: Wc, dWc/ds (plus both mirrors on
+    an ordered bank) at every distinct finite sample, M1, M3 (plus M0, M2).
+    """
+    plan = _bank_plan(recipe)
+    samples = (4 if ordered else 2) * _bank_nsample(plan)
+    moments = 4 if ordered else 2
+    carrier = int(meta.mu_basis.n_canonical)
+    return int(16 * int(nq) * (samples + moments) * carrier**2 // int(mesh_xy.size))
+
+
 def _bank_plan(recipe):
     """Validate the resolver's flat native typed point/role arrays.
 
@@ -1087,7 +1259,8 @@ def initialize_shared_pole_bank(path, *, meta, tables, recipe, identity,
         Header for the unfinalized scratch file. Wc is in Ry, dWc/ds in
         Ry**-1, M1 in Ry**3 and M3 in Ry**5, with s=z_Ry**2.
     """
-    if Path(path).exists():
+    if (path.header_json is not None if isinstance(path, ResidentBankPayload)
+            else Path(path).exists()):
         _refuse("scratch bank already exists; validate it before resuming")
     plan = _bank_plan(recipe)
     header = _metadata(meta, tables, recipe, identity, photon=photon_layout is not None)
@@ -1143,7 +1316,7 @@ def initialize_shared_pole_bank(path, *, meta, tables, recipe, identity,
         moment_convention=("S_m = 2 M_(2m+1); physical M1 and M3; odd M0 (1/z) and M2 (1/z^3), M_k = C_(k+1)/2"
                            if odd else "S_m = 2 M_(2m+1); physical M1 and M3 only"),
         payload_bytes=16 * nq * (len(sample_fields) * nsample + len(fields)) * d * d)
-    with SlabIO(path, mode="w", mesh=mesh_xy) as io:
+    with _bank_io(path, "w", mesh_xy) as io:
         for field in sample_fields:
             io.create_dataset(field, shape=(nq, nsample, d, d), dtype=np.complex128)
         for field in fields:
@@ -1213,29 +1386,31 @@ def validate_shared_pole_bank(path, *, expected_identity, mesh_xy,
             or shape["d"] != header["n_mu_logical"]
             or header["nspinor"] not in ((4,) if "photon_layout" in header else (1, 2, 4))):
         _refuse("scratch bank geometry/representation mismatch")
-    # Geometry only: never load a matrix through the metadata handle.
-    with h5py.File(path, "r") as file:
-        if header.get("mirror_mode") is None and any(
-                name in file for name in ("Wc_mirror", "dWc_mirror_ds")):
-            _refuse("scratch bank mirror payload lacks authenticated contract")
-        # Boolean HDF5 enums are metadata, outside phdf5's numeric ABI.
-        if not np.array_equal(file["sample_written"][()], samples):
-            _refuse("scratch bank sample transaction mismatch")
-        if not np.array_equal(file["moment_written"][()], moments):
-            _refuse("scratch bank moment transaction mismatch")
-        for name in ("z_ry", "role", "distinct_id", "held", "support_pair", "fit_ids", "held_ids"):
-            if (name not in file or file[name].shape != plan[name].shape
-                    or file[name].dtype != plan[name].dtype
-                    or not np.array_equal(file[name][()], plan[name], equal_nan=True)):
-                _refuse(f"scratch bank typed plan {name} digest mismatch")
-        if file["role_codes_json"][()].decode() != _json(plan["role_codes"]):
-            _refuse("scratch bank role code table mismatch")
-        for name in fields:
-            expected = ((nq, nsample) if name in _bank_sample_fields(header) else (nq,)) + (shape["d"],) * 2
-            if (name not in file or file[name].shape != expected
-                    or file[name].dtype != np.dtype(np.complex128)
-                    or file[name].chunks is not None):
-                _refuse(f"scratch bank {name} schema geometry/dtype/layout mismatch")
+    # Geometry only: never load a matrix through the metadata handle. A
+    # device-resident bank has no file; its masks live in the header above.
+    if not isinstance(path, ResidentBankPayload):
+        with h5py.File(path, "r") as file:
+            if header.get("mirror_mode") is None and any(
+                    name in file for name in ("Wc_mirror", "dWc_mirror_ds")):
+                _refuse("scratch bank mirror payload lacks authenticated contract")
+            # Boolean HDF5 enums are metadata, outside phdf5's numeric ABI.
+            if not np.array_equal(file["sample_written"][()], samples):
+                _refuse("scratch bank sample transaction mismatch")
+            if not np.array_equal(file["moment_written"][()], moments):
+                _refuse("scratch bank moment transaction mismatch")
+            for name in ("z_ry", "role", "distinct_id", "held", "support_pair", "fit_ids", "held_ids"):
+                if (name not in file or file[name].shape != plan[name].shape
+                        or file[name].dtype != plan[name].dtype
+                        or not np.array_equal(file[name][()], plan[name], equal_nan=True)):
+                    _refuse(f"scratch bank typed plan {name} digest mismatch")
+            if file["role_codes_json"][()].decode() != _json(plan["role_codes"]):
+                _refuse("scratch bank role code table mismatch")
+            for name in fields:
+                expected = ((nq, nsample) if name in _bank_sample_fields(header) else (nq,)) + (shape["d"],) * 2
+                if (name not in file or file[name].shape != expected
+                        or file[name].dtype != np.dtype(np.complex128)
+                        or file[name].chunks is not None):
+                    _refuse(f"scratch bank {name} schema geometry/dtype/layout mismatch")
     complete = bool(samples.all() and moments.all())
     if header.get("complete") and (not complete or not header.get("final_commit")):
         _refuse("scratch bank invalid completion transaction")
@@ -1290,8 +1465,8 @@ def shared_pole_bank_writer(path, *, meta, expected_identity, mesh_xy):
     except Exception as exc:
         error = exc
     # Every serial metadata reader must close before any collective writer opens.
-    agree_io_refusal(error, path=path, stage="shared_pole.bank_writer")
-    with SlabIO(path, mode="a", mesh=mesh_xy) as io:
+    agree_io_refusal(error, path=str(path), stage="shared_pole.bank_writer")
+    with _bank_io(path, "a", mesh_xy) as io:
         def write(**fields):
             prepared = _prepare_bank_write(header, meta=meta, mesh_xy=mesh_xy, **fields)
             _write_bank_payload(io, header, meta, prepared)
