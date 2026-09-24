@@ -313,7 +313,7 @@ def _fit_mubatch(
         n_pg=int(plan.r_sub), axis=axis)
     store = zmb.ZStore(
         mesh=mesh_xy, q_axis=q_axis, mu_pad=mu_pad, g_axis=g_axis, b=b,
-        placement=plan.placement, rows='mu',
+        placement=plan.placement,
         packed_from_slot=mb.packed_to_slot(mu_pad), n_batch=int(mb.n_batch),
         scratch_path=os.path.join(scratch_dir, "zeta_Z_store.scratch.h5"))
     canon = np.asarray(k_unfold_plan.layout.axis.packed_to_canonical)

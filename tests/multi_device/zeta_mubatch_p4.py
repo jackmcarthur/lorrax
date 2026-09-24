@@ -1,24 +1,23 @@
-"""P=4 gate for the μ-batch batch kernel and Z store (docs/architecture/zeta_fit_mubatch.md).
+"""P=4 gate for the route-G μ-batch kernel and Z store (docs/architecture/zeta_fit_mubatch.md).
 
 Four processes, one GPU each, 2x2 mesh, on the fixtures of
 ``tests/test_zeta_mubatch_sym_parity.py`` (glide group with spin mixing and an
 antiunitary row, ns = 2; A-cubic, 48 operations, ns = 1) plus a ragged deck
 where no axis divides the mesh (one operation, box (5, 5, 7) so N_r = 175 and
 7 planes, 7 bands, 7 centroids, a 3x1x1 k grid with Q = 2 stored q, and a
-ζ sphere that fills no whole G tile): every pad is exercised.
-For every ψ source (block cache; plane regeneration from resident or host
-ψ(G)), both row owners (q-owned chunks, μ-owned rows) and every store
-placement (device, host, slab_io disk) and read layout, the kernel's
-Z_q(μ, G) -- parent-k pair GEMM, typed unfold and k-convolution, LR+RL
-completion, the r->row transpose, local full-box FFTs, the sphere gather, the
-write-once store and the packed read-back -- must match the dense sum over
-the full-BZ children,
+ζ sphere that fills no whole G tile).  conj ψ(G) of the full zone (the typed
+children) is sharded over G slots; the kernel's Z_q(μ, G) -- G-space pair
+GEMM, one all-to-all to the μ owners, planes (cylinder, axis DFT, 2D FFT),
+the k-convolution on the identity plan, LR+RL completion, forward plane FFT
+and axis-phase accumulation -- goes through the write-once store (pinned host
+tiles and a slab_io file) and both read layouts, and must match the dense sum
+over the full-BZ children,
 
     Z_q(μ, G) = FFT_r[e^{-iq·r} (Z_q + conj Z_{-q})(μ, r)],
-    Z_q(μ, r) = Σ_k Σ_ab conj D^L_{k,ab}(μ,r) D^R_{k+q,ab}(μ,r),
+    Z_q(μ, r) = Σ_k Σ_ab D^L_{k,ab}(μ,r) conj D^R_{k+q,ab}(μ,r),
 
-at 1e-12 (max-abs relative).  Red twin (TASTE 21): a box_from_slot table
-rolled by one grid point must miss by more than 1e-3.
+at 1e-12 (max-abs relative).  Red twin (TASTE 21): the ζ-sphere axis index
+shifted by one must miss by more than 1e-3.
 Run: ``lx run -N 1 -G 4 -n 4 python3 -u tests/multi_device/zeta_mubatch_p4.py``.
 """
 from __future__ import annotations
@@ -70,50 +69,14 @@ def _ragged_fixture(mesh, rng):
     return dict(plan=plan, fft_grid=fg, kgrid=kgrid, cent_flat=cent_flat,
                 psi_parent=parity._crand(rng, 3, nb, ns, int(np.prod(fg))),
                 kfull=kfrac, ops=ops, tnp=np.zeros((1, 3)), left=(0, 5), right=(2, nb),
-                b_target=3, r_s_target=30)          # q-owned batches of 3 < P
-
-
-class _Store:
-    """The PsiGStore surface the kernels read: raw-parent ψ(G) on the whole box."""
-
-    def __init__(self, psi, plan, fg, bcr, mesh):
-        from common.collectives import device_put_process_local
-        from runtime.padding import round_up
-        n_parent, nb, ns, n_rtot = psi.shape
-        # PsiGStore's transport carrier: each chunk padded to a multiple of P
-        # with exact-zero bands (band_slot_tables drops them by index).
-        width = max(round_up(hi - lo, 4) for lo, hi in bcr)
-        psi = np.concatenate([psi, np.zeros((n_parent, bcr[-1][0] + width - nb, ns, n_rtot),
-                                            psi.dtype)], axis=1)
-        kv = np.asarray(plan.k_parent_frac)
-        x = parity._grid_points(fg) / np.asarray(fg, float)
-        u = psi * np.exp(-2j * np.pi * (x @ kv.T).T)[:, None, None, :]
-        self.psi_G = np.fft.fftn(u.reshape(*u.shape[:3], *fg), axes=(-3, -2, -1),
-                                 norm="ortho").reshape(u.shape)
-        self.band_chunk_ranges = tuple(bcr)
-        self._bpd_per_bc = tuple(round_up(hi - lo, 4) // 4 for lo, hi in bcr)
-        self.local_band_chunk_shape = (n_parent, max(self._bpd_per_bc), ns, n_rtot)
-        self.band_chunk_carrier = 4 * max(self._bpd_per_bc)
-        rep = NamedSharding(mesh, P())
-        self.g_index = device_put_process_local(np.ascontiguousarray(np.broadcast_to(
-            np.arange(n_rtot, dtype=np.int32).reshape(fg), (n_parent,) + tuple(fg))), rep)
-        self.kvecs_frac = device_put_process_local(kv, rep)
-
-    def read_local_band_chunk(self, x, y, bc):
-        p = int(x) * 2 + int(y)
-        lo, _ = self.band_chunk_ranges[int(bc)]
-        bpd = self._bpd_per_bc[int(bc)]
-        out = np.zeros(self.local_band_chunk_shape, complex)
-        out[:, :bpd] = self.psi_G[:, lo + p * bpd:lo + (p + 1) * bpd]
-        return out
+                b_target=4)
 
 
 def run_case(case, fx, mesh, scratch):
     from isdf import zeta_mubatch as zmb
-    from isdf.core import build_psi_G_resident_sm
     from gw.centroid_k_unfold import orbit_mu_batches
     from common.collectives import device_put_process_local as put
-    from runtime.padding import pad_axis, pad_to_axis, padded_axis
+    from runtime.padding import pad_to_axis, padded_axis
 
     plan, fg, kgrid = fx["plan"], tuple(fx["fft_grid"]), tuple(fx["kgrid"])
     psi = fx["psi_parent"]
@@ -142,77 +105,11 @@ def run_case(case, fx, mesh, scratch):
     ref = plan.layout.axis.pack_host(
         np.take_along_axis(Z, sphere[:, None, :], axis=2), axis=1)
 
-    bcr = ((0, 4), (4, nb))                   # the last chunk is short when nb < 8
-    store = _Store(psi, plan, fg, bcr, mesh)
-    rep = NamedSharding(mesh, P())
-    # The face band carrier is padded once, by name, as production's is.
-    face = pad_axis(plan.layout.axis.pack_host(
-        psi[:, :, :, fx["cent_flat"]].transpose(0, 2, 3, 1), axis=2), 4, axis=3,
-        name="centroid face bands")
-    nb_face = face.padded
-    w_pad = lambda w: pad_axis(w, 4, axis=0, name="face band weights").array
-    tables = tuple(put(np.asarray(a), rep) for a in zmb.band_slot_tables(
-        store, band_start=0, nb_face=nb_face, weight_l=w_pad(w_l), weight_r=w_pad(w_r)))
-    face = parity._put(face.array, NamedSharding(mesh, P(None, None, "x", "y")))
     q_axis = padded_axis(len(q_sel), 4, name="stored q rows")
     g_axis = padded_axis(ngk, 8, name="ζ-sphere G tiles")
-    sph_pad = np.asarray(pad_to_axis(sphere, g_axis, axis=1))
-    rank = NamedSharding(mesh, P(("x", "y")))
-
-    def run(route, source, rows, placements, roll=False):
-        mb = orbit_mu_batches(plan, mu_pad, 4 if rows == "mu" else 1,
-                              b_target=int(fx["b_target"]))
-        rs, pts, perm, wraps, planes = zmb.r_blocks(
-            plan, fg, 4, route=route, r_s_target=int(fx["r_s_target"]))
-        box = zmb.box_from_slots(pts, n_rtot)
-        geo = (put(pts, rep), parity._put(perm, rank), parity._put(wraps, rank),
-               put(planes, rep), put(np.roll(box, 1) if roll else box, rep),
-               put(sph_pad, rep))
-        cyl = None if source == "cache" else zmb.plane_cylinder(store, rs)
-        src = (zmb.build_psi_block_cache(store, mesh=mesh, rs=rs, points=pts)
-               if source == "cache" else build_psi_G_resident_sm(store, mesh_xy=mesh)
-               if source == "resident" else jnp.zeros((1,), jnp.complex128))
-        kern = zmb.make_batch_kernel(
-            mesh=mesh, rs=rs, plan=plan, kgrid=kgrid, fft_grid=fg, ns=ns, b=mb.b,
-            n_bc=len(bcr), bc_w=int(tables[0].shape[1]), nb_face=nb_face, q_sel=q_sel,
-            q_axis=q_axis,
-            q_neg=q_neg, sphere_idx=sph_pad, qvec_frac=qf, row_chunk=3,
-            source=source, rows=rows, psi_G_store=store, cylinder=cyl,
-            k_chunk=1 if source == "host" else None)
-        stores = {pl: zmb.ZStore(
-            mesh=mesh, q_axis=q_axis, mu_pad=mu_pad, g_axis=g_axis, b=mb.b,
-            placement=pl, rows=rows, n_batch=mb.n_batch,
-            packed_from_slot=mb.packed_to_slot(mu_pad),
-            scratch_path=os.path.join(scratch, f"{case}_{source}_{rows}.h5"))
-            for pl in placements}
-        cyl_ops = cyl if cyl is not None else tuple(jnp.zeros((1,), jnp.int32) for _ in range(3))
-        for beta in range(mb.n_batch):
-            X = zmb.gather_batch_centroids(face, mb.mu[beta], mesh=mesh)
-            out = kern(src, X, *tables, store.kvecs_frac, cyl_ops, geo,
-                       (put(mb.left_perm[beta], rep), put(mb.left_L[beta], rep)))
-            for zs in stores.values():
-                zs.write_batch(beta, out)
-        res = {}
-        for pl, zs in stores.items():
-            for layout in ("q",) if rows == "q" else ("q", "g"):
-                t = [parity._host(zs.read_tile(i, layout=layout)) for i in range(zs.n_Gt)]
-                res[pl, layout] = np.concatenate(t, axis=2)[:len(q_sel), :, :ngk]
-            zs.close()
-        return rs, mb, res
-
+    put_rep = lambda a: put(np.asarray(a), NamedSharding(mesh, P()))
     worst = 0.0
-    for route, source in (("cache", "cache"), ("planes", "resident"), ("planes", "host")):
-        for rows in ("q", "mu"):
-            rs, mb, res = run(route, source, rows, ("host", "disk"))
-            for (pl, layout), got in res.items():
-                e = parity._rel(got, ref)
-                worst = max(worst, e)
-                if jax.process_index() == 0:
-                    print(f"{TAG} {case:<11s} src={source:<8s} rows={rows:<2s} "
-                          f"store={pl:<6s} read={layout} n_sub={rs.n_sub} r_s={rs.r_s} "
-                          f"b={mb.b}x{mb.n_batch}  rel={e:.2e}", flush=True)
-                if not e <= TOL:
-                    raise SystemExit(f"{TAG} FAIL {case} {source}/{rows}/{pl}/{layout}: {e:.3e}")
+
     # Route G: conj ψ(G) of the full zone (the children) sharded over G slots;
     # the pair GEMM in G space, one all-to-all to the μ owners, planes there.
     from common.wfn_transforms import psi_cylinder_tables
@@ -235,23 +132,24 @@ def run_case(case, fx, mesh, scratch):
     canon = np.asarray(plan.layout.axis.packed_to_canonical)
     cbar_d = parity._put(cbar, NamedSharding(mesh, P(None, None, None, ("x", "y"))))
     g3_d = parity._put(g3, NamedSharding(mesh, P(None, ("x", "y"), None)))
-    ops = (put(w_l, rep), put(w_r, rep), put(kfull, rep))
-    tabs = (tuple(put(np.asarray(a), rep) for a in cyl), tuple(put(a, rep) for a in zt))
+    ops = (put_rep(w_l), put_rep(w_r), put_rep(kfull))
+    tabs = (tuple(put_rep(a) for a in cyl), tuple(put_rep(a) for a in zt))
 
-    def run_g(tabs):
+    def run_g(tabs, placement="host"):
         mb = orbit_mu_batches(plan, mu_pad, 4, b_target=int(fx["b_target"]))
         kern = zmb.make_route_g_kernel(
             mesh=mesh, plan_id=plan_id, kgrid=kgrid, fft_grid=fg, ns=ns, b=mb.b,
             q_sel=q_sel, q_axis=q_axis, q_neg=q_neg, qvec_frac=qf,
             n_col=int(cyl[0].shape[1]), n_s=int(cyl[0].shape[2]), n_pg=2, axis=axis)
         zs = zmb.ZStore(mesh=mesh, q_axis=q_axis, mu_pad=mu_pad, g_axis=g_axis, b=mb.b,
-                        placement="host", rows="mu", n_batch=mb.n_batch,
-                        packed_from_slot=mb.packed_to_slot(mu_pad))
+                        placement=placement, n_batch=mb.n_batch,
+                        packed_from_slot=mb.packed_to_slot(mu_pad),
+                        scratch_path=os.path.join(scratch, f"{case}_zstore.h5"))
         for beta in range(mb.n_batch):
             slots = mb.mu[beta]
             live = (slots >= 0).astype(np.float64)
             xmu = xg[fx["cent_flat"][canon[np.clip(slots, 0, None)]]] * live[:, None]
-            zs.write_batch(beta, kern(cbar_d, *ops, g3_d, put(xmu, rep), put(live, rep),
+            zs.write_batch(beta, kern(cbar_d, *ops, g3_d, put_rep(xmu), put_rep(live),
                                       *tabs))
         out = {lay: np.concatenate([parity._host(zs.read_tile(i, layout=lay))
                                     for i in range(zs.n_Gt)], axis=2)[:len(q_sel), :, :ngk]
@@ -259,15 +157,16 @@ def run_case(case, fx, mesh, scratch):
         zs.close()
         return out
 
-    for lay, got in run_g(tabs).items():
-        e = parity._rel(got, ref)
-        worst = max(worst, e)
-        if jax.process_index() == 0:
-            print(f"{TAG} {case:<11s} route G  rows=mu store=host   read={lay}  rel={e:.2e}",
-                  flush=True)
-        if not e <= TOL:
-            raise SystemExit(f"{TAG} FAIL {case} route G/{lay}: {e:.3e}")
-    bad = (tabs[0], (tabs[1][0], put(zt[1] + 1, rep)))       # axis Miller off by one
+    for placement in ("host", "disk"):
+        for lay, got in run_g(tabs, placement).items():
+            e = parity._rel(got, ref)
+            worst = max(worst, e)
+            if jax.process_index() == 0:
+                print(f"{TAG} {case:<11s} store={placement:<5s} read={lay}  rel={e:.2e}",
+                      flush=True)
+            if not e <= TOL:
+                raise SystemExit(f"{TAG} FAIL {case} {placement}/{lay}: {e:.3e}")
+    bad = (tabs[0], (tabs[1][0], put_rep(zt[1] + 1)))         # axis Miller off by one
     red_g = parity._rel(run_g(bad)["q"], ref)
     if jax.process_index() == 0:
         print(f"{TAG} {case} route G red twin (ζ axis index shifted by one): "
@@ -275,12 +174,6 @@ def run_case(case, fx, mesh, scratch):
     if not red_g > RED:
         raise SystemExit(f"{TAG} FAIL {case}: route G red twin did not fire ({red_g:.3e})")
 
-    _, _, res = run("cache", "cache", "q", ("host",), roll=True)
-    red = parity._rel(res["host", "q"], ref)
-    if jax.process_index() == 0:
-        print(f"{TAG} {case} red twin (box_from_slot rolled by one): rel={red:.2e}", flush=True)
-    if not red > RED:
-        raise SystemExit(f"{TAG} FAIL {case}: red twin did not fire ({red:.3e})")
     return worst
 
 
