@@ -294,7 +294,7 @@ def parent_projector_kconv(
 			phases = jnp.stack([v[1] for v in vertices])
 			def channel(carry, vertex):
 				return carry, pair_kernel(D_l, D_r, _parent_conv_vertices(tables, vertex, vertex))
-			return jax.lax.scan(channel, 0, (perms, phases))[1]
+			return jax.lax.scan(channel, 0, (perms, phases), unroll=1)[1]
 		return pair_kernel(D_l, D_r, _parent_conv_vertices(tables, vertex_l, vertex_r))
 
 	irr_idx_np = np.asarray(plan.irr_idx, dtype=np.int32)
