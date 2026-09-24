@@ -213,7 +213,6 @@ per rank host Z store.
 | refusal | condition | way out |
 |---|---|---|
 | `GATE zeta-mubatch-capacity` | ψ(G) plus the smallest batch exceed the device target (ψ(G) streaming is not implemented) | more ranks or more memory per device |
-| `GATE zeta-mubatch-tier` | the back-solve tier resolves to `distributed` (`linalg = distributed`) | `linalg = local` |
 | `GATE zeta-mubatch-shell` | a head consumer reads a ζ column that the V_q pass did not keep | name the slot in `_head_shell`'s lists |
 | `_fit_mubatch` | the loader's full-BZ rows are not the C-order k grid | none |
 | `typed_child_G_tables` | a child k is not an image of its parent, or needs a G outside the parent's sphere | none |
