@@ -102,6 +102,9 @@ class ConvergenceVerdict:
     worst_k: int
     worst_band: int
     cutoff_ev: float
+    #: The stall rule fired (label-free residual flat over two history
+    #: turnovers).  Always paired with converged=False.
+    stalled: bool = False
 
     def summary(self) -> str:
         """The log line.  Says which number is the test and which is not."""
@@ -112,7 +115,7 @@ class ConvergenceVerdict:
             f"RMS_nonscissored = {self.rms_protected_ev:.6f} eV, "
             f"RMS_all({self.n_total}) = {self.rms_all_ev:.6f} eV "
             f"(diagnostics, NOT the criterion) | "
-            f"{'CONVERGED' if self.converged else 'not converged'}")
+            f"{'CONVERGED' if self.converged else ('STALLED at floor, not converged' if self.stalled else 'not converged')}")
 
 
 @dataclass(frozen=True)
@@ -301,9 +304,9 @@ def protected_band_convergence(
 
 
 class _Converged(Exception):
-    """Internal: stop the rCROP solve because the criterion was met.
+    """Internal: stop the accelerated solve (criterion met, or stalled).
 
-    rCROP's loop has no convergence callback, and the criterion is an
+    The solver loop has no convergence callback, and the criterion is an
     L-infinity norm on EIGENVALUES (eV) rather than anything the solver
     can express, so it is signalled out of ``residual_fn``.  Carries the
     state so the caller need not reconstruct it.
@@ -2090,7 +2093,7 @@ def _rotate_to_dft_basis(O_qp: jax.Array, U: jax.Array, *,
     the (nk, nb, nb) intermediate is sharded too.
 
     ONLY THE RESULT IS PINNED REPLICATED, and it has to be: the SC carry
-    is ``kin_ion + this``, and ``_run_rcrop``, ``_run_linear_mixing`` and
+    is ``kin_ion + this``, and ``_run_anderson``, ``_run_linear_mixing`` and
     ``_scissor_E_qp_for_outofrange`` all read the carry back on the host,
     which raises the non-addressable-devices error on a sharded array at
     P>1.  ``O_qp`` arrives replicated from ``compute_sigma_xc`` for the
@@ -3141,7 +3144,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     # ENTRY-SOLVED metallic occupations: one MP1 state per map CALL, from
     # the spectrum of the H actually being mapped.  This makes the
     # iteration a genuine self-map F(H) = Sigma[H, occ(H)] — the contract
-    # _run_rcrop's own header states ("gw_iteration_map reads
+    # the SC driver's header states ("gw_iteration_map reads
     # state.iteration and state.H_qp_dft and nothing else") and the one
     # rCROP's trial/accept trajectory requires: every F(H) evaluation,
     # trial or accepted, gets occupations consistent with ITS H by
@@ -4565,172 +4568,6 @@ def _record_sc(inputs: SCInputs, line: str) -> None:
         fallback(line)
 
 
-def _sc_probe_digest(obj) -> str:
-    """DIAGNOSTIC (sc_accel 2026-09-24, not for landing): sha256[:12] of a state tree.
-
-    Every rank walks the same tree in the same order, so the collective
-    ``gather_to_host`` of a global array stays in lockstep.
-    """
-    import dataclasses
-    import hashlib
-    from common.collectives import gather_to_host
-    h = hashlib.sha256()
-
-    def feed(o, depth):
-        if depth > 8:
-            h.update(b"<deep>")
-            return
-        if o is None or isinstance(o, (bool, int, float, complex, str, bytes)):
-            h.update(repr(o).encode())
-        elif isinstance(o, jax.Array):
-            a = np.ascontiguousarray(np.asarray(gather_to_host(o)))
-            h.update(f"{a.dtype}{a.shape}".encode())
-            h.update(a.tobytes())
-        elif isinstance(o, np.ndarray):
-            a = np.ascontiguousarray(o)
-            h.update(f"{a.dtype}{a.shape}".encode())
-            h.update(a.tobytes() if a.dtype != object else repr(a).encode())
-        elif isinstance(o, dict):
-            for k in sorted(o, key=repr):
-                h.update(repr(k).encode())
-                feed(o[k], depth + 1)
-        elif isinstance(o, (list, tuple)):
-            h.update(f"{type(o).__name__}{len(o)}".encode())
-            for x in o:
-                feed(x, depth + 1)
-        elif dataclasses.is_dataclass(o):
-            h.update(type(o).__name__.encode())
-            for f in dataclasses.fields(o):
-                h.update(f.name.encode())
-                feed(getattr(o, f.name, None), depth + 1)
-        elif hasattr(o, "__dict__") and not callable(o):
-            h.update(type(o).__name__.encode())
-            feed({k: v for k, v in vars(o).items() if not k.startswith("__")},
-                 depth + 1)
-        else:
-            h.update(f"<{type(o).__name__}>".encode())
-
-    feed(obj, 0)
-    return h.hexdigest()[:12]
-
-
-def _sc_probe_residual_split(H_in, H_out, U_in, e_in_ev):
-    """DIAGNOSTIC: split f = F(H) - H in the input QP basis (meV).
-
-    diag = eigenvalue-shift part; off = eigenvector-rotation part, split into
-    near-degenerate pairs (|dE| < 10 meV) and the rest.
-    """
-    from common.collectives import gather_to_host
-    hi = np.asarray(gather_to_host(H_in))
-    ho = np.asarray(gather_to_host(H_out))
-    nb = hi.shape[-1]
-    u = np.asarray(gather_to_host(U_in))[:, :nb, :nb]
-    f = (ho - hi) * RYD_TO_EV * 1e3
-    fq = np.einsum("kim,kij,kjn->kmn", np.conj(u), f, u, optimize=True)
-    d = np.diagonal(fq, axis1=1, axis2=2)
-    off = fq - d[:, :, None] * np.eye(nb)[None]
-    de = np.abs(e_in_ev[:, :, None] - e_in_ev[:, None, :]) * 1e3
-    near = (de < 10.0) & ~np.eye(nb, dtype=bool)[None]
-    far = (de >= 10.0)
-    angle = np.where(far, np.abs(off) / np.maximum(de, 1e-30), 0.0)
-    return dict(
-        fro=float(np.linalg.norm(f)), diag_fro=float(np.linalg.norm(d)),
-        diag_max=float(np.abs(d).max()), off_fro=float(np.linalg.norm(off)),
-        off_near_max=float(np.abs(np.where(near, off, 0)).max()),
-        off_far_max=float(np.abs(np.where(far, off, 0)).max()),
-        rot_angle_max=float(angle.max()))
-
-
-def _sigma_onshell_slope(inputs, state_out):
-    """DIAGNOSTIC / A/B: on-shell Sigma_c slope and its segment, per state.
-
-    The map evaluates Sigma_c(E_n) by linear interpolation of its omega grid
-    (``qsgw_utils.interp_along_omega``), so the slope s_n of the segment E_n
-    sits on is the map's exact diagonal on-shell Jacobian dF_nn/dE_n.
-    Outside the grid the map uses Sigma(omega=0): slope 0.  Returns
-    (slope, e_rel, seg_lo, seg_hi), each (nk_loop, nb) in input QP order
-    (eV); None when the map has no dynamic Sigma.
-    """
-    from .qsgw_utils import extract_sigma_diag_replicated
-    sigma = state_out.outputs.sigma_result
-    cube, omega = sigma.sigma_c_omega_kij_ry, sigma.omega_grid_ev
-    if cube is None or omega is None:
-        return None
-    sig = np.asarray(extract_sigma_diag_replicated(cube, inputs.mesh_xy),
-                     dtype=np.complex128) * RYD_TO_EV
-    if sigma.sigma_band_axis is not None:
-        from runtime.padding import strip_axis
-        sig = np.asarray(strip_axis(sig, sigma.sigma_band_axis, axis=-1))
-    om = np.asarray(omega, dtype=np.float64)
-    e_rel = np.asarray(sigma.e_eval_ev, dtype=np.float64) - float(sigma.efermi_dft_ev)
-    inside = (e_rel >= om[0]) & (e_rel <= om[-1])
-    hi = np.clip(np.searchsorted(om, e_rel, side="left"), 1, om.size - 1)
-    lo = hi - 1
-    kk = np.arange(e_rel.shape[0])[:, None]
-    nn = np.arange(e_rel.shape[1])[None, :]
-    slope = np.real(sig[hi, kk, nn] - sig[lo, kk, nn]) / (om[hi] - om[lo])
-    seg_lo = np.where(inside, om[lo], -np.inf)
-    seg_hi = np.where(inside, om[hi], np.inf)
-    return np.where(inside, slope, 0.0), e_rel, seg_lo, seg_hi
-
-
-def _z_precondition_residual(inputs, state_out, H_in, e_in_ev, *, print_fn):
-    """A/B candidate: linearized-QSGW (Z) Newton step on f = F(H) - H.
-
-    With Sigma_c(omega) linear on the segment each E_n sits on, slope s_n,
-    the QSGW ansatz H_out = h + sum_mn |m><m| (Sigma(E_m)+Sigma(E_n))/2 |n><n|
-    responds to an input change dH (input QP basis) as
-    dH_out,mn = (s_m + s_n)/2 dH_mn.  The Newton step on the residual is
-    therefore f_mn / d_mn with d_mn = 1 - (s_m + s_n)/2 -- the per-state Z
-    of the eqp1 column on the diagonal, its pair mean off it.  No parameter;
-    the only guards are the model's own domain:
-
-    * 0 < Z <= 1 (damping an overshooting state or pair) is always taken;
-    * Z > 1 or Z < 0 (a slow or expansive state) is taken on the diagonal
-      only when the Newton target E_n + Z f_nn stays on the segment whose
-      slope defined it, where the diagonal model is exact; otherwise, and
-      always off the diagonal, the plain step (Z = 1) -- Anderson owns it.
-    """
-    from common.collectives import gather_to_host
-    f_dev = state_out.H_qp_dft - H_in
-    got = _sigma_onshell_slope(inputs, state_out)
-    if got is None:
-        return f_dev
-    slope, e_rel, seg_lo, seg_hi = got
-    f = np.asarray(gather_to_host(f_dev))
-    nb = f.shape[-1]
-    ns = min(nb, slope.shape[1])
-    s_n = np.zeros((f.shape[0], nb))
-    s_n[:, :ns] = slope[:, :ns]
-    u = np.asarray(gather_to_host(state_out.outputs.sigma_basis_U))[:, :nb, :nb]
-    fq = np.einsum("kim,kij,kjn->kmn", np.conj(u), f, u, optimize=True)
-    d = 1.0 - 0.5 * (s_n[:, :, None] + s_n[:, None, :])
-    with np.errstate(divide="ignore", invalid="ignore"):
-        z = np.where(d != 0.0, 1.0 / d, 1.0)
-    damp = (z > 0.0) & (z <= 1.0)
-    # Diagonal Newton beyond damping: only when the target stays on the segment.
-    fd = np.real(np.diagonal(fq, axis1=1, axis2=2)) * RYD_TO_EV
-    zd = np.diagonal(z, axis1=1, axis2=2)
-    tgt = np.full(fd.shape, np.nan)
-    tgt[:, :ns] = e_rel[:, :ns] + zd[:, :ns] * fd[:, :ns]
-    lo = np.full(fd.shape, -np.inf); hi = np.full(fd.shape, np.inf)
-    lo[:, :ns], hi[:, :ns] = seg_lo[:, :ns], seg_hi[:, :ns]
-    on_seg = np.isfinite(tgt) & (tgt >= lo) & (tgt <= hi) & np.isfinite(lo) & np.isfinite(hi)
-    zfinal = np.where(damp, z, 1.0)
-    idx = np.arange(nb)
-    diag_ok = np.diagonal(damp, axis1=1, axis2=2) | on_seg
-    zfinal[:, idx, idx] = np.where(diag_ok, zd, 1.0)
-    fq = fq * zfinal
-    f = np.einsum("kim,kmn,kjn->kij", u, fq, np.conj(u), optimize=True)
-    zdiag = zfinal[:, idx, idx]
-    print_fn(f"    SC Z-precondition: diagonal damped {int(np.diagonal(damp, axis1=1, axis2=2).sum())}, "
-             f"Newton beyond damping {int((on_seg & ~np.diagonal(damp, axis1=1, axis2=2)).sum())}, "
-             f"plain {int((~diag_ok).sum())} of {zdiag.size}; Z_diag in "
-             f"[{float(zdiag.min()):+.3f}, {float(zdiag.max()):+.3f}]; slope in "
-             f"[{float(slope.min()):+.3f}, {float(slope.max()):+.3f}]")
-    return _place(np.ascontiguousarray(f), inputs.mesh_xy)
-
-
 def _sc_z_factors(
     inputs: SCInputs,
     state_out: SCState,
@@ -5237,8 +5074,7 @@ def _write_sc_eqp_snapshot(
     tail_fit = state_out.outputs.tail_scissor_fit
     comments = [
         f"SC map={int(call_index):04d} role={role}; columns are "
-        "E_DFT reference and eigvalsh(F(H_in)) map output; rCROP trial "
-        "outputs are not accepted iterates",
+        "E_DFT reference and eigvalsh(F(H_in)) map output",
         # THE CRITERION, FIRST, AND NAMED AS SUCH.  Output against this
         # call's OWN input, over the non-scissored set: the pair the driver
         # stops on.  It is stamped max-abs-first because max-abs is the
@@ -5423,7 +5259,7 @@ def run_self_consistency(
     *,
     max_iter: int = 1,
     tol_ev: float = 1.0e-4,
-    accelerator: str = "rcrop",
+    accelerator: str = "anderson",
     history_depth: int = 5,
     mixing: float = 1.0,
 ) -> tuple[SCState, list[float]]:
@@ -5437,11 +5273,12 @@ def run_self_consistency(
     Parameters
     ----------
     accelerator
-        ``"rcrop"`` (default, and the only value a DECK can select —
+        ``"anderson"`` (default, and the only value a DECK can select —
         ``gw_config.SCConfig`` refuses every other spelling through GATE
-        ``sc_accelerator_rcrop_only``) — Anderson-style restart-CROP
-        acceleration from :mod:`mixing.acceleration`.  Order
-        ``history_depth``.  Required for QSGW on dense band manifolds:
+        ``sc_accelerator_anderson_only``) — one-evaluation Anderson type II
+        (:func:`mixing.acceleration.anderson_nojit`, which replaced the
+        two-evaluation rCROP on 2026-09-24).  Order ``history_depth``.
+        Required for QSGW on dense band manifolds:
         the Jacobian's cycle-direction eigenvalue is typically ≲ −3 for
         systems with many bands near the gap (PPM ω-grid stiffness),
         which means a plain fixed-point hits a 2-cycle and even α=0.5
@@ -5452,7 +5289,7 @@ def run_self_consistency(
         undamped it amplifies the input's time-reversal-reality error
         6-8x per map (claim 2391), which is why no deck may ask for it.
     history_depth
-        rCROP history depth (only used when ``accelerator="rcrop"``).
+        Anderson history depth (only used when ``accelerator="anderson"``).
         ``m=5`` is BGW's QSGW default.
     mixing
         Linear damping coefficient when ``accelerator="linear"``.
@@ -5499,8 +5336,8 @@ def run_self_consistency(
         _record_sc(inputs, f"    SC convergence: {verdict.summary()}")
         return state_new, []
 
-    if accelerator == "rcrop":
-        return _run_rcrop(
+    if accelerator == "anderson":
+        return _run_anderson(
             state_init, inputs,
             max_iter=max_iter, tol_ev=tol_ev,
             history_depth=history_depth,
@@ -5518,7 +5355,7 @@ def run_self_consistency(
         )
     raise ValueError(
         f"run_self_consistency: unknown accelerator={accelerator!r} "
-        f"(expected 'rcrop' or 'linear').")
+        f"(expected 'anderson' or 'linear').")
 
 
 def _run_linear_mixing(
@@ -5551,7 +5388,7 @@ def _run_linear_mixing(
     last_evaluated: SCState | None = None
     for it in range(max_iter):
         # DROP ITERATION i-1's SigmaResult BEFORE BUILDING ITERATION i's.
-        # See the note in ``_run_rcrop.residual_fn``; the shape is the
+        # See the note in ``_run_anderson.residual_fn``; the shape is the
         # same here — ``state`` is both the loop carry and the argument
         # to the map, so without this rebind both generations of the
         # ω-cube are live for the whole of ``gw_iteration_map``.  The
@@ -5669,67 +5506,59 @@ def _run_linear_mixing(
     return last_evaluated, rms_history
 
 
-def _run_rcrop(
+def _run_anderson(
     state_init: SCState, inputs: SCInputs, *,
     max_iter: int, tol_ev: float, history_depth: int,
     eigvalsh_kshard, print_fn, dump_dir,
 ) -> tuple[SCState, list[float]]:
-    """rCROP (Anderson-style) accelerated fixed point.
+    """One-evaluation Anderson (Pulay) accelerated QSGW fixed point.
 
-    Wraps :func:`mixing.acceleration.rcrop_nojit` around the iteration
-    map.  rCROP makes **two** ``gw_iteration_map`` calls per
-    rCROP-iteration (one for the trial step, one for the
-    real-residual evaluation); ``max_iter`` here is the rCROP iteration
-    count, not the underlying pipeline call count.
+    Wraps :func:`mixing.acceleration.anderson_nojit` around the iteration
+    map: ONE ``gw_iteration_map`` call per iteration, at the extrapolated
+    point, and every evaluated (H, F(H) - H) pair enters the history.  This
+    replaced rCROP (2026-09-24), which evaluated the map twice per iteration
+    -- a probe at x + f and a real-residual re-evaluation at the optimal
+    point that, for an affine map, returns exactly the residual the linear
+    model already predicts (Wan & Miedlar 2024).  ``max_iter`` is the number
+    of accelerated evaluations after map 0.
 
-    Convergence tolerance is converted from per-band RMS ΔE (eV) to a
-    L2-norm-of-residual on H (Ry) the rCROP solver expects::
+    The map is a pure function of H (bitwise re-evaluation, claim 2678), so
+    every pair is valid secant data; the history is restarted only when the
+    map itself changes discretely (a Sigma rule rebuild or sampled-grid
+    growth, read from ``inputs.fixed_quadrature_session``).
 
-        ‖H_new − H_old‖_2 / √(nk · nb²) ≈ RMS-per-element ≈ RMS ΔE / RYD_TO_EV
+    THE STOP RULES.  CONVERGED when the criterion (max|dE| over the
+    non-scissored identities, F(H) against H) is below ``tol_ev``.
+    STALLED -- never reported as converged -- when the label-free residual
+    max_k ||P f_k P||_2 (P = the metric block; it bounds every sorted
+    eigenvalue residual by Weyl and also sees eigenvector error) has not
+    improved by 10% over the last 2(m+1) evaluations, i.e. over two full
+    turnovers of the history, after which the accelerator holds no new
+    secant information.  Both counts are fixed, not deck keys.
 
-    RESIDENCY BUDGET, because it is the number that decides the deck size.
-    The solver holds 2·``history_depth`` copies of the carry plus a window
-    of 2·(m+1).  With m = 5, complex128, at the production shape nk=144,
-    nb=2000 (one copy = 9.22 GB)::
-
-        Xhist + Fhist   2·m·nk·nb²·16 B        92.2 GB  whole solve
-        Xw + Fw         2·(m+1)·nk·nb²·16 B   110.6 GB  per iteration
-
-    The history entries keep the carry's own (nk, nb, nb) shape at
-    ``qsgw_density.band_rotation_spec`` — bra band on 'x', ket band on 'y',
-    k replicated — stacked on a LEADING history axis that is never sharded.
-    Per rank that is the above over ``mesh.size``.  ``nk`` is the LOOP's
-    k-set, so under ``sc_on_ibz`` it is the IBZ: measured n = 163840
-    (nk=10) against 262144 (nk=16) on mos2_4x4, job 7889876.
+    RESIDENCY BUDGET.  The solver holds 2(m+1) copies of the carry (history
+    plus the newest pair) and a transient window of the same size.  With
+    m = 5, complex128, nk=144, nb=2000 (one copy = 9.22 GB) that is 110.6 GB
+    global for the history, over ``mesh.size`` per rank.  Entries keep the
+    carry's (nk, nb, nb) shape at ``qsgw_density.band_rotation_spec`` --
+    bra band on 'x', ket band on 'y', k replicated -- stacked on a LEADING
+    history axis that is never sharded.  ``nk`` is the loop's k-set.
 
     The accelerator's only collective is one (m+1, m+1) Gram; the update is
-    an elementwise combination over the history axis.  What is NOT free is
-    the seam here: ``gw_iteration_map`` needs a REPLICATED carry (it adds a
-    replicated ``kin_ion_dft`` and, at iteration 0, reads the carry on the
-    host to test exact diagonality), so ``residual_fn`` gathers one
-    (nk, nb, nb) per call and reshards the residual back.  Distributing the
-    carry itself is a separate change and needs that iteration-0 readback
-    (:628) and ``kin_ion``'s replicated load to move first.
+    an elementwise combination over the history axis.  The seam here is
+    not free: ``gw_iteration_map`` needs a REPLICATED carry, so
+    ``residual_fn`` gathers one (nk, nb, nb) per call and reshards the
+    residual back.
     """
-    from mixing.acceleration import pulay_nojit, rcrop_nojit
-
-    # A/B DIAGNOSTIC (sc_accel 2026-09-24, branch only): which accelerator.
-    # rcrop (default, two maps per iteration) | anderson | crop (one each).
-    # anderson_sg = + conditioning filter and nonmonotone fallback;
-    # anderson_z  = anderson_sg on the Z-preconditioned residual.
-    _accel = os.environ.get("LORRAX_SC_ACCEL_AB", "rcrop").strip() or "rcrop"
-    if _accel not in ("rcrop", "anderson", "anderson_sg", "anderson_z", "crop"):
-        raise ValueError(f"LORRAX_SC_ACCEL_AB={_accel!r}")
-    _two_eval = _accel == "rcrop"
-    print_fn(f"  SC accelerator (A/B): {_accel}")
+    from mixing.acceleration import anderson_nojit
 
     H0 = state_init.H_qp_dft
     nk, nb, _ = H0.shape
     n_elem = nk * nb * nb
     mesh = inputs.mesh_xy
     print_fn(
-        f"  SC rCROP: history_depth={history_depth}, "
-        f"max_iter={max_iter}, tol={tol_ev:.1e} eV/band-RMS")
+        f"  SC Anderson (one map per iteration): history_depth={history_depth}, "
+        f"max_iter={max_iter}, tol={tol_ev:.1e} eV")
     # PAD, DO NOT DEGRADE.  ``band_rotation_spec`` puts the two band axes
     # on the two mesh axes, so it needs px | nb and py | nb — the same
     # condition every other user of that spec is under.  What used to be
@@ -5812,7 +5641,7 @@ def _run_rcrop(
     # silent no-op.
     local_b = sum(sh.data.nbytes for sh in x0.addressable_shards)
     print_fn(
-        f"  SC rCROP residency: carry {tuple(H0.shape)} (nk={nk} on the "
+        f"  SC Anderson residency: carry {tuple(H0.shape)} (nk={nk} on the "
         f"loop's k-set), n={n_elem} logical, mesh {px}x{py}; bands "
         f"{nb}→{nb_pad} (band divisor {band_div}, "
         f"+{100.0 * ((float(nb_pad) / nb) ** 2 - 1.0):.2f}% elements); entry "
@@ -5846,8 +5675,8 @@ def _run_rcrop(
     _gain_previous: list[tuple[np.ndarray, np.ndarray] | None] = [None]
     _identity_history = {}
     _frozen_fits: list = [getattr(state_init, "frozen_scissor_fits", None)]
-    _probe_line_ref: list = [None]   # DIAGNOSTIC (LORRAX_SC_STATE_PROBE_LINE)
     _map_event: list = [False]
+    _floor_history: list[float] = []
 
     def _event_key():
         """Discrete map-changing state: sampled grid, rule rebuild counts."""
@@ -5872,7 +5701,7 @@ def _run_rcrop(
         # carry; the residual goes straight back to the entry layout, so the
         # history never holds a replicated copy.
         H = _to_carry(H_in)
-        # rCROP's mixing combinations don't preserve Hermitisation
+        # The mixing combinations don't preserve Hermitisation
         # exactly (numeric drift); re-Hermitise before feeding the
         # iteration map so eigh stays well-defined.
         H = 0.5 * (H + jnp.conj(jnp.swapaxes(H, -1, -2)))
@@ -5900,118 +5729,7 @@ def _run_rcrop(
             frozen_scissor_fits=_frozen_fits[0],
         )
         _key_before = _event_key()
-        _probe_env = os.environ.get("LORRAX_SC_STATE_PROBE", "").strip()
-        if _probe_env:
-            _probe_state = lambda: dict(  # noqa: E731
-                partition=_partition[0], occ=_occ_state[0],
-                head_w=_head_surface_weight[0], frozen=_frozen_fits[0],
-                session=inputs.fixed_quadrature_session,
-                seed_cache=inputs.screening_seed_cache,
-                meta=inputs.meta, metric=_metric_np)
-            _probe_before = {k: _sc_probe_digest(v)
-                             for k, v in _probe_state().items()}
-            _probe_before["H_in"] = _sc_probe_digest(H)
         state_out = gw_iteration_map(state_in, inputs)
-        if _probe_env:
-            import json as _json
-            _probe_after = {k: _sc_probe_digest(v)
-                            for k, v in _probe_state().items()}
-            _rec = dict(call=_iter_idx[0], before=_probe_before,
-                        after_map=_probe_after,
-                        mutated=sorted(k for k in _probe_after
-                                       if _probe_after[k] != _probe_before[k]))
-            _rec["split_meV"] = _sc_probe_residual_split(
-                H, state_out.H_qp_dft, state_out.outputs.sigma_basis_U, E_in)
-            _purity_calls = {int(c) for c in _probe_env.split(",")
-                             if c.strip().isdigit()}
-            if _iter_idx[0] in _purity_calls:
-                # Same carried inputs, evaluated again immediately: any
-                # difference is state the first evaluation left behind.
-                _twin = gw_iteration_map(SCState(
-                    H_qp_dft=H, iteration=_iter_idx[0],
-                    partition=state_in.partition,
-                    occupation_state=state_in.occupation_state,
-                    head_surface_weight_kn=state_in.head_surface_weight_kn,
-                    frozen_scissor_fits=state_in.frozen_scissor_fits), inputs)
-                from common.collectives import gather_to_host as _g
-                _d = (np.asarray(_g(_twin.H_qp_dft))
-                      - np.asarray(_g(state_out.H_qp_dft))) * RYD_TO_EV * 1e3
-                _e2 = np.asarray(eigvalsh_kshard(_twin.H_qp_dft)) * RYD_TO_EV
-                _e1 = np.asarray(eigvalsh_kshard(state_out.H_qp_dft)) * RYD_TO_EV
-                _rec["purity"] = dict(
-                    dH_max_meV=float(np.abs(_d).max()),
-                    dH_fro_meV=float(np.linalg.norm(_d)),
-                    dE_max_meV=float(np.abs(_e2 - _e1).max() * 1e3),
-                    after_twin={k: _sc_probe_digest(v)
-                                for k, v in _probe_state().items()})
-                _twin = None
-            _line_calls = {int(c) for c in os.environ.get(
-                "LORRAX_SC_STATE_PROBE_LINE", "").split(",") if c.strip().isdigit()}
-            from common.collectives import gather_to_host as _g
-            _ho = np.asarray(_g(state_out.H_qp_dft))
-            _hi = np.asarray(_g(H))
-            if _probe_line_ref[0] is not None:
-                # The previous call's line probe evaluated F at exactly this
-                # input (H + f of an accepted call): an independent re-run
-                # across a different call history.
-                _ref_in, _ref_out = _probe_line_ref[0]
-                if _ref_in.shape == _hi.shape:
-                    _rec["replay_vs_line_probe"] = dict(
-                        dH_in_max_meV=float(np.abs(_ref_in - _hi).max() * RYD_TO_EV * 1e3),
-                        dH_out_max_meV=float(np.abs(_ref_out - _ho).max() * RYD_TO_EV * 1e3))
-                _probe_line_ref[0] = None
-            if _iter_idx[0] in _line_calls:
-                _f = state_out.H_qp_dft - H
-                _outs = {}
-                for _t in (0.5, 1.0):
-                    _Ht = H + _t * _f
-                    _Ht = 0.5 * (_Ht + jnp.conj(jnp.swapaxes(_Ht, -1, -2)))
-                    _o = gw_iteration_map(SCState(
-                        H_qp_dft=_Ht, iteration=_iter_idx[0],
-                        partition=state_in.partition,
-                        occupation_state=state_in.occupation_state,
-                        head_surface_weight_kn=state_in.head_surface_weight_kn,
-                        frozen_scissor_fits=state_in.frozen_scissor_fits), inputs)
-                    _outs[_t] = (np.asarray(_g(_Ht)), np.asarray(_g(_o.H_qp_dft)),
-                                 np.asarray(eigvalsh_kshard(_o.H_qp_dft)) * RYD_TO_EV)
-                    _o = None
-                _e0 = np.asarray(eigvalsh_kshard(state_out.H_qp_dft)) * RYD_TO_EV
-                _d2 = _outs[1.0][1] - 2 * _outs[0.5][1] + _ho
-                _d1 = _outs[1.0][1] - _ho
-                _rec["line"] = dict(
-                    second_diff_fro_over_first=float(
-                        np.linalg.norm(_d2) / max(np.linalg.norm(_d1), 1e-300)),
-                    first_diff_fro_meV=float(np.linalg.norm(_d1) * RYD_TO_EV * 1e3),
-                    eig_second_diff_max_meV=float(np.abs(
-                        _outs[1.0][2] - 2 * _outs[0.5][2] + _e0).max() * 1e3),
-                    eig_first_diff_max_meV=float(np.abs(
-                        _outs[1.0][2] - _e0).max() * 1e3))
-                _sp = _sigma_onshell_slope(inputs, state_out)
-                _sp = None if _sp is None else _sp[0]
-                _din = (_e0 - E_in)            # t=1 input is H_out: sorted E_out(0) - E_in
-                _dout = _outs[1.0][2] - _e0
-                _ok = np.abs(_din) > 0.05e-3
-                if _sp is not None and _ok.any():
-                    _nbs = min(_sp.shape[1], _din.shape[1])
-                    _so = np.where(_ok, _dout / np.where(_ok, _din, 1.0), np.nan)[:, :_nbs]
-                    _pr = _sp[:, :_nbs]
-                    _m = ~np.isnan(_so)
-                    _rec["line"]["slope_obs_pct"] = [float(v) for v in np.percentile(_so[_m], [5, 25, 50, 75, 95])]
-                    _rec["line"]["slope_pred_pct"] = [float(v) for v in np.percentile(_pr[_m], [5, 25, 50, 75, 95])]
-                    _rec["line"]["slope_obs_pred_corr"] = float(np.corrcoef(_so[_m], _pr[_m])[0, 1]) if _m.sum() > 2 else None
-                    _rec["line"]["slope_absdiff_median"] = float(np.median(np.abs(_so[_m] - _pr[_m])))
-                    _rec["line"]["n_states"] = int(_m.sum())
-                    if jax.process_index() == 0:
-                        np.savez(os.path.join(inputs.input_dir, f"sc_line_probe_{_iter_idx[0]:04d}.npz"),
-                                 e_in=E_in, e_out0=_e0, e_out_half=_outs[0.5][2], e_out1=_outs[1.0][2],
-                                 slope_pred=_sp)
-                _probe_line_ref[0] = (_outs[1.0][0], _outs[1.0][1])
-                _outs = None
-            if jax.process_index() == 0:
-                with open(os.path.join(inputs.input_dir,
-                                       "sc_state_probe.jsonl"), "a") as _fh:
-                    _fh.write(_json.dumps(_rec) + "\n")
-            _record_sc(inputs, f"    SC STATE PROBE: {_json.dumps(_rec)}")
         _map_event[0] = (_iter_idx[0] > 0 and _event_key() != _key_before)
         if _map_event[0]:
             _record_sc(inputs, f"    SC map event at call {_iter_idx[0]}: "
@@ -6048,17 +5766,14 @@ def _run_rcrop(
             float(np.sqrt(np.mean((E_new - _e_history[-3]) ** 2)))
             if len(_e_history) >= 3 else float("nan"))
         print_fn(
-            f"  SC rCROP call {len(rms_history)}: "
+            f"  SC map call {len(rms_history)}: "
             f"RMS ΔE_{{k,k-1}} = {rms:.6f} eV, "
             f"ΔE_{{k,k-2}} = {rms2:.6f} eV"
         )
         call_index = _iter_idx[0]
 
         def _role_of(idx):
-            if not _two_eval:
-                return "initial" if idx == 0 else "accepted_input_map"
-            return ("initial" if idx == 0 else
-                    "trial" if idx % 2 else "accepted_input_map")
+            return "initial" if idx == 0 else "accepted_input_map"
 
         role = _role_of(call_index)
         map_gain, _gain_previous[0] = _sc_map_gain_for_call(
@@ -6080,10 +5795,11 @@ def _run_rcrop(
             map_gain=map_gain,
         )
         _record_sc(inputs, f"    SC convergence: {_verdict.summary()}")
-        # DIAGNOSTIC (sc_accel 2026-09-24): label-free matrix residual.  The
-        # per-k spectral norm bounds every sorted-eigenvalue residual (Weyl)
-        # and also sees eigenvector (off-diagonal) error; Frobenius is what
-        # the accelerator's Gram minimizes.  Protected block = metric mask.
+        # LABEL-FREE MATRIX RESIDUAL.  The per-k spectral norm bounds every
+        # sorted-eigenvalue residual (Weyl) and also sees eigenvector
+        # (off-diagonal) error, so identity relabelling of hybridized pairs
+        # cannot move it; Frobenius is what the accelerator's Gram
+        # minimizes.  Protected block = the metric mask.
         from common.collectives import gather_to_host as _gth
         _fh = (np.asarray(_gth(state_out.H_qp_dft))
                - np.asarray(_gth(H))) * RYD_TO_EV * 1e3
@@ -6095,11 +5811,23 @@ def _run_rcrop(
                            f"max_k ||f_k||_2 = {_spec:.6e} meV; ||f||_F = "
                            f"{np.linalg.norm(_fp):.6e} meV (protected block)")
         _iter_idx[0] += 1
-        # Non-trial calls only: there the INPUT is the accepted iterate
-        # (rcrop_nojit's ``f_new = residual_fn(x_new)``), so this is the
-        # residual AT the iterate the loop would return.  A trial call's
-        # residual is the residual at a probe point -- a diagnostic.
-        if role != "trial" and _verdict.converged:
+        if call_index > 0:
+            _floor_history.append(float(_spec))
+        _stall_window = 2 * (history_depth + 1)
+        _stalled = (
+            not _verdict.converged
+            and len(_floor_history) > _stall_window
+            and min(_floor_history[-_stall_window:])
+            > 0.9 * min(_floor_history[:-_stall_window]))
+        if _stalled:
+            _verdict = replace(_verdict, stalled=True)
+            _last_verdict[0] = _verdict
+            _record_sc(inputs, f"    SC STALLED at floor: max_k ||P f_k P||_2 = "
+                               f"{min(_floor_history):.6e} meV has not improved by 10% in "
+                               f"{_stall_window} maps; NOT converged")
+        # Every call's input is an accelerated iterate, so this is the
+        # residual AT the iterate the loop would return.
+        if _verdict.converged or _stalled:
             raise _Converged(
                 SCState(H_qp_dft=H,
                         iteration=_iter_idx[0],
@@ -6110,12 +5838,9 @@ def _run_rcrop(
                         convergence_verdict=_verdict,
                         frozen_scissor_fits=_frozen_fits[0]),
                 _verdict)
-        if _accel == "anderson_z":
-            return _to_entry(_z_precondition_residual(
-                inputs, state_out, H, E_in, print_fn=lambda l: _record_sc(inputs, l)))
         return _to_entry(state_out.H_qp_dft - H)
 
-    # rCROP HAS NO STOPPING AUTHORITY.  ``tol=0.0`` below is not a
+    # THE SOLVER HAS NO STOPPING AUTHORITY.  ``tol=0.0`` below is not a
     # disarmed threshold; it is the statement that this solver's job is
     # to ACCELERATE and the caller's is to decide convergence, using the
     # exact L-infinity eigenvalue test.  That test is free: the map
@@ -6166,59 +5891,48 @@ def _run_rcrop(
         np.asarray(_init_partition.protected_mask, bool)
         | np.asarray(_init_partition.in_range_mask, bool), (int(x0.shape[0]), nb))
     _nbp = int(x0.shape[-1])
-    # rcrop_nojit consumes this caller-owned array at each weighting call.
+    # anderson_nojit consumes this caller-owned array at each weighting call.
     # Refresh it after classification; the same current identity block then
     # weights every history entry in that solve. Padded entries stay zero.
     _metric_np = np.zeros((int(x0.shape[0]), _nbp, _nbp), dtype=np.float64)
     _metric_np[:, :nb, :nb] = _fit_mask[:, :, None] * _fit_mask[:, None, :]
     print_fn(
-        "  SC rCROP metric: Gram over the per-k non-scissored DFT identity "
+        "  SC Anderson metric: Gram over the per-k non-scissored DFT identity "
         "block; masks refreshed after each map, scissored rows follow the map")
     try:
-        if _two_eval:
-            result = rcrop_nojit(
-                residual_fn,
-                # THE CARRY ITSELF, not a flattened copy of it.
-                x0,
-                m=history_depth,
-                maxit=max_iter,
-                tol=0.0,   # see above: rCROP does not decide convergence
-                print_fn=None,  # we print our own RMS-ΔE history above
-                entry_sharding=entry_sh,
-                metric=_metric_np,
-            )
-        else:
-            # One map per iteration: twice the iterations for the same map
-            # budget as the two-map rCROP iteration count.
-            result = pulay_nojit(
-                residual_fn, x0, m=history_depth, maxit=2 * max_iter,
-                tol=0.0, print_fn=lambda l: _record_sc(inputs, l),
-                entry_sharding=entry_sh, metric=_metric_np,
-                history=("optimal" if _accel == "crop" else "evaluated"),
-                safeguard=_accel in ("anderson_sg", "anderson_z"),
-                restart_fn=((lambda: _map_event[0])
-                            if _accel in ("anderson_sg", "anderson_z") else None))
+        result = anderson_nojit(
+            residual_fn,
+            # THE CARRY ITSELF, not a flattened copy of it.
+            x0,
+            m=history_depth,
+            maxit=max_iter,
+            tol=0.0,   # the driver's criterion decides convergence, not ||f||
+            print_fn=lambda line: _record_sc(inputs, line),
+            entry_sharding=entry_sh,
+            metric=_metric_np,
+            restart_fn=lambda: _map_event[0],
+        )
     except _Converged as stop:
-        # The criterion fired inside the map.  Return the accepted
+        # The criterion (or the stall rule) fired inside the map.  Return the accepted
         # map INPUT that met it, NOT F(input) and not rCROP's stale internal
         # x: only this input was accepted and evaluated with the SCOutputs
         # retained for the writers.  The pad-inertness check below reads the
         # final x, which this path never reaches -- say so rather than
         # skip it silently.
         print_fn(
-            f"  SC rCROP stopped by the convergence criterion after "
-            f"{_iter_idx[0]} map calls: {stop.verdict.summary()}")
+            f"  SC {'STALLED' if stop.verdict.stalled else 'stopped by the convergence criterion'} "
+            f"after {_iter_idx[0]} map calls: {stop.verdict.summary()}")
         print_fn(
-            "  SC rCROP pad inertness: NOT CHECKED (early stop -- the "
+            "  SC pad inertness: NOT CHECKED (early stop -- the "
             "check reads the solver's final x, not reached on this path)")
         _maybe_dump_e_history(dump_dir, _e_history, print_fn)
         return stop.state, rms_history
 
     print_fn(
-        f"  SC rCROP done: {result.iterations} iterations WITHOUT meeting "
+        f"  SC Anderson done: {result.iterations} iterations WITHOUT meeting "
         f"the {tol_ev:.3e} eV criterion (budget exhausted), final "
         f"‖residual‖₂ = {float(result.residual_norms[-1]):.4e} Ry -- a "
-        f"DIAGNOSTIC: rCROP has no stopping rule of its own")
+        f"DIAGNOSTIC: the solver has no stopping rule of its own")
 
     # INERTNESS, CHECKED — a DIFFERENT claim from the parity one at the top
     # of this function, and this pair has been measured to come apart: the
@@ -6233,7 +5947,7 @@ def _run_rcrop(
             float(jnp.max(jnp.abs(result.x[:, nb:, :]))),
             float(jnp.max(jnp.abs(result.x[:, :, nb:]))))
         print_fn(
-            f"  SC rCROP pad inertness: {nb_pad - nb} pad bands per axis, "
+            f"  SC pad inertness: {nb_pad - nb} pad bands per axis, "
             f"max|H| over the pad zone = {pad_max:.3e} "
             f"(exactly 0.0: {pad_max == 0.0})")
 
@@ -6246,7 +5960,7 @@ def _run_rcrop(
     # the h5 writers) reads it back on the host.
     H_final = _last_input_H[0]
     if H_final is None or _last_verdict[0] is None:
-        raise RuntimeError("rCROP completed without an evaluated SC map")
+        raise RuntimeError("SC Anderson completed without an evaluated SC map")
     state_final = SCState(
         H_qp_dft=H_final,
         iteration=_iter_idx[0],
@@ -6870,7 +6584,7 @@ def run_sc_driver(
         f"exact_degeneracy_tol={sc.exact_degeneracy_tol_ev:.1e} eV, "
         f"tail_fit={sc.tail_fit}, buffer={sc.buffer_nbands}/edge, "
         f"buffer_mode={sc.buffer_mode}"
-        + (f", depth={sc.history_depth}" if sc.accelerator == "rcrop"
+        + (f", depth={sc.history_depth}" if sc.accelerator == "anderson"
            else f", α={sc.mixing:.2f}"))
     state_final, rms_history = run_self_consistency(
         state_init, inputs,

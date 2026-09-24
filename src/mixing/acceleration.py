@@ -1070,7 +1070,7 @@ def _solve_alpha_filtered(Fw: jnp.ndarray, cond_max: float = 1.0e12):
     return jnp.asarray(alpha, dtype=Fw.dtype), len(use)
 
 
-def pulay_nojit(
+def anderson_nojit(
     residual_fn: Callable[[jnp.ndarray], jnp.ndarray],
     x0: jnp.ndarray,
     m: int = 5,
@@ -1079,42 +1079,47 @@ def pulay_nojit(
     print_fn: Callable = None,
     entry_sharding=None,
     metric=None,
-    history: str = "evaluated",
-    safeguard: bool = False,
     restart_fn: Callable = None,
 ) -> AccelerationResult:
-    """One map evaluation per iteration: Anderson type II or CROP.
+    """Anderson type II (Pulay/DIIS): ONE map evaluation per iteration.
 
-    Both evaluate the residual only at the extrapolated point
+    Every evaluated pair (x_i, f_i = G(x_i) - x_i) enters a history of the
+    newest ``m + 1``; the next and only evaluation is at
 
-        x_{k+1} = Σ α_i (x_i + f_i),   α = argmin ‖Σ α_i f_i‖_metric, Σ α_i = 1
+        x_{k+1} = sum_i alpha_i (x_i + f_i),
+        alpha = argmin || sum_i alpha_i f_i ||_metric,  sum_i alpha_i = 1,
 
-    over a window of the newest pair plus ``m`` stored pairs (the same
-    m + 1 residuals rCROP's solve sees), with β = 1 and no damping.  They
-    differ only in what the window stores (Wan & Międlar, CROP-Anderson):
+    with beta = 1 (no damping).  This is CROP with real residuals (Wan &
+    Miedlar 2024, "CROP-Anderson"); rCROP (:func:`rcrop_nojit`) reaches the
+    same iterates on an affine map at two evaluations per iteration, the
+    second re-evaluating a residual the linear model already predicts.
 
-    * ``history="evaluated"`` — Anderson type II / Pulay: every EVALUATED
-      pair (x_k, f(x_k)) enters the history.  All stored residuals are real.
-    * ``history="optimal"`` — CROP (Ziółkowski et al. 2008): the stored pair
-      is the optimal combination (Σ α x, Σ α f), whose residual is the
-      linear-model (control) residual, not a re-evaluation.
+    Three safeguards, none costing a map evaluation and none with a tunable
+    constant (the thresholds are the literature's numerical defaults):
 
-    rCROP (:func:`rcrop_nojit`) is the second form plus a real-residual
-    evaluation at Σ α x, i.e. two evaluations per iteration.
+    * conditioning filter (Walker & Ni 2011; DFTK): the oldest differences
+      are dropped until the unit-column Gram has cond <= 1e12 (cond(R) <=
+      1e6), :func:`_solve_alpha_filtered`;
+    * nonmonotone fallback (after Ouyang et al. 2023): an evaluation worse
+      than every residual in the window means the multisecant model failed
+      there, so the next point is the two-point secant between the best
+      evaluated pair and the rejected one -- a free line search along the
+      failed step; never twice in a row; the rejected pair stays in the
+      history (it is valid secant data);
+    * restart on a discrete map event: ``restart_fn()`` true after an
+      evaluation (the caller's Sigma rule set or sampled grid changed) keeps
+      only that newest pair, because every stored difference straddling the
+      event carries the jump.
 
-    ``safeguard=True`` adds two dimensionless, literature-default guards
-    that cost no map evaluation: the Walker-Ni / DFTK conditioning filter
-    (drop the oldest differences until cond(R) <= 1e6) and a nonmonotone
-    fallback -- when an evaluation is worse than every residual in the
-    window, the next point is G(x_best) = x_best + f_best.
-
-    α is solved over the REAL numbers: the iterates are Hermitian matrices,
-    a real vector space, and the Gram of Hermitian residuals is real.  The
-    operand layout, the one (m+1, m+1) Gram collective, the metric and the
-    history's leading-axis stacking are those of :func:`rcrop_nojit`.
+    alpha is solved over the REAL numbers: the iterates are Hermitian
+    matrices, a real vector space, and the Gram of Hermitian residuals is
+    real.  THE ITERATE KEEPS ITS OWN SHAPE AND LAYOUT (see
+    :func:`rcrop_nojit`): the history is a stack on a leading, never-sharded
+    axis at ``P(None, *entry_sharding.spec)``, the only collective is one
+    (m+1, m+1) Gram plus a length-(m+1) reduction, and the update is an
+    elementwise combination over the history axis.  Residency: 2(m+1)
+    history entries, the same as rCROP's 2m history plus its trial pair.
     """
-    if history not in ("evaluated", "optimal"):
-        raise ValueError(f"pulay_nojit: history={history!r}")
     shape = x0.shape
     dtype = x0.dtype
 
@@ -1150,8 +1155,7 @@ def pulay_nojit(
         return AccelerationResult(x=x, residual_norms=jnp.array(res_history),
                                   iterations=0, converged=True)
     mask_shape = (m,) + (1,) * len(shape)
-    best = (x, f)
-    best_res = res_history[0]
+    best, best_res = (x, f), res_history[0]
     window_res = [res_history[0]]
     fallback = False
 
@@ -1164,30 +1168,18 @@ def pulay_nojit(
         F_ord = jnp.where(mask_cols, F_ord, 0.0 + 0.0j)
         Xw = jnp.concatenate([X_ord, x[None]], axis=0)
         Fw = jnp.concatenate([F_ord, f[None]], axis=0)
-        if safeguard:
-            alpha, n_used = _solve_alpha_filtered(_weighted(Fw))
-        else:
-            alpha = jnp.real(_solve_crop_alpha_stacked(_weighted(Fw))).astype(dtype)
+        alpha, n_used = _solve_alpha_filtered(_weighted(Fw))
         x_opt = jnp.tensordot(alpha, Xw, axes=(0, 0))
         f_opt = jnp.tensordot(alpha, Fw, axes=(0, 0))
-        if safeguard and fallback:
-            # Nonmonotone safeguard (after Ouyang et al. 2023; no extra map):
-            # the last evaluation did worse than every residual in the
-            # window, so the multisecant model failed there.  Take the
-            # two-point secant step between the best evaluated pair and the
-            # rejected one instead -- a line search along the failed step
-            # that costs nothing, has no damping constant, and cannot
-            # re-evaluate G(x_best).  The rejected pair stays in the history.
-            a2, _ = _solve_alpha_filtered(
-                _weighted(jnp.stack([best[1], f])))
+        if fallback:
+            a2, _ = _solve_alpha_filtered(_weighted(jnp.stack([best[1], f])))
             x_opt = a2[0] * best[0] + a2[1] * x
             f_opt = a2[0] * best[1] + a2[1] * f
-        if print_fn is not None and safeguard:
-            print_fn(f"  pulay step {it:02d}: window {n_used + 1}"
-                     f"{' FALLBACK to best' if fallback else ''}")
-        keep_x, keep_f = (x, f) if history == "evaluated" else (x_opt, f_opt)
-        Xhist = Xhist.at[head].set(_entry(keep_x))
-        Fhist = Fhist.at[head].set(_entry(keep_f))
+        if print_fn is not None:
+            print_fn(f"  Anderson step {it:02d}: window {n_used + 1}"
+                     f"{', secant fallback to the best pair' if fallback else ''}")
+        Xhist = Xhist.at[head].set(x)
+        Fhist = Fhist.at[head].set(f)
         head = (head + 1) % m
         filled = min(filled + 1, m)
         Xw = Fw = X_ord = F_ord = None
@@ -1197,26 +1189,17 @@ def pulay_nojit(
         res = _norm(f)
         res_history.append(res)
         if restart_fn is not None and restart_fn():
-            # The map itself changed discretely during this evaluation (a
-            # quadrature rebuild or sampled-grid growth): every stored
-            # difference straddling the event carries the jump, so keep only
-            # the newest pair.  No parameter.
             filled, head = 0, 0
             best, best_res = (x, f), res
             window_res = [res]
             fallback = False
             if print_fn is not None:
-                print_fn(f"  pulay step {it:02d}: map event, history restarted")
+                print_fn(f"  Anderson step {it:02d}: map event, history restarted")
             continue
-        if safeguard:
-            # Never two fallbacks in a row: the second would re-evaluate the
-            # same G(x_best).
-            fallback = (not fallback) and res > max(window_res)
-            window_res = (window_res + [res])[-(m + 1):]
-            if res < best_res:
-                best, best_res = (x, f), res
-        if print_fn is not None:
-            print_fn(f"  {history} iter {it:02d}: residual = {res:.6e}")
+        fallback = (not fallback) and res > max(window_res)
+        window_res = (window_res + [res])[-(m + 1):]
+        if res < best_res:
+            best, best_res = (x, f), res
         if res <= tol:
             return AccelerationResult(x=x, residual_norms=jnp.array(res_history),
                                       iterations=it + 1, converged=True)
