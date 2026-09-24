@@ -1517,6 +1517,55 @@ def _z_q_face_parent(
 	)
 	if cache_key not in _pair_pipeline_sm_cache:
 
+		def _y_block(bc_idx, x_idx, y_idx, r_index_, g_index_dev,
+		             kvecs_frac_dev, psi_r_cache_, planes_, cylinder_,
+		             use_planes):
+			"""ψ_kbar(r) at the tile's slots, all bands of one chunk, this
+			rank's Y slab: the incumbent transaction on parent rows with the
+			arbitrary-point gather in place of the slab slice."""
+			active = (r_index_ >= 0)
+			if use_psi_r_cache:
+				slab = jnp.take(psi_r_cache_[bc_idx],
+				                jnp.clip(r_index_, 0, n_rtot - 1), axis=-1)
+			else:
+				psi_G_bc = _io_callback(
+					_slicer_host, _slicer_out_sds,
+					x_idx, y_idx, bc_idx, ordered=False)
+				slab = to_rpoints_inner(
+					psi_G_bc, g_index_dev, fft_grid, r_index_,
+					kvecs_frac=kvecs_frac_dev, norm="ortho",
+					k_tile=zeta_k_tile,
+					**(dict(planes=planes_, plane_axis=int(plane_axis),
+					        cylinder=cylinder_) if use_planes else {}))
+			slab = jnp.where(active[None, None, None, :], slab, 0)
+			col = jax.lax.all_to_all(
+				slab, 'y', split_axis=3, concat_axis=1, tiled=True)
+			blk = jax.lax.all_gather(col, axis_name='x', axis=1, tiled=True)
+			if not _y_compact_identity:
+				blk = jnp.take(blk, jnp.asarray(_y_compact_idx_np)[bc_idx], axis=1)
+			return blk                       # (p, bc_global, s, r_loc)
+
+		def _psi_source_probe(use_planes):
+			"""Debug timer (a): the ψ(G)→ψ(tile) source and its transport alone."""
+			@partial(shard_map, mesh=mesh_xy,
+			         in_specs=(P(), P(), P(None, None), cache_spec, P(),
+			                   (P(), P(), P())),
+			         out_specs=P(), check_vma=False)
+			def _probe(r_index_, g_index_dev, kvecs_frac_dev, psi_r_cache_,
+			           planes_, cylinder_):
+				x_idx = jax.lax.axis_index('x')
+				y_idx = jax.lax.axis_index('y')
+
+				def body(acc, bc_idx):
+					blk = _y_block(bc_idx, x_idx, y_idx, r_index_, g_index_dev,
+					               kvecs_frac_dev, psi_r_cache_, planes_,
+					               cylinder_, use_planes)
+					return acc + jnp.sum(jnp.abs(blk)), None
+				tot, _ = jax.lax.scan(body, jnp.float64(0.0),
+				                      jnp.arange(n_bc, dtype=jnp.int32), unroll=1)
+				return jax.lax.psum(tot, ('x', 'y'))
+			return jax.jit(_probe)
+
 		@partial(shard_map, mesh=mesh_xy,
 		         in_specs=(mun_spec, w_spec, w_spec, P(), P(), P(None, None),
 		                   cache_spec, P(), (P(), P(), P())),
@@ -1528,34 +1577,11 @@ def _z_q_face_parent(
 			shard_w = psi_mun_.shape[3]
 			b_lo_rel_arr = jnp.asarray(_b_lo_rel_np)
 			b_hi_rel_arr = jnp.asarray(_b_hi_rel_np)
-			if not _y_compact_identity:
-				y_compact_idx = jnp.asarray(_y_compact_idx_np)
-			active = (r_index_ >= 0)
-			safe_r = jnp.clip(r_index_, 0, n_rtot - 1)
 
 			def load_y_block(bc_idx):
-				"""ψ_kbar(r) at the tile's slots, all bands of one chunk,
-				this rank's Y slab: the incumbent transaction on parent rows
-				with the arbitrary-point gather in place of the slab slice."""
-				if use_psi_r_cache:
-					slab = jnp.take(psi_r_cache_[bc_idx], safe_r, axis=-1)
-				else:
-					psi_G_bc = _io_callback(
-						_slicer_host, _slicer_out_sds,
-						x_idx, y_idx, bc_idx, ordered=False)
-					slab = to_rpoints_inner(
-						psi_G_bc, g_index_dev, fft_grid, r_index_,
-						kvecs_frac=kvecs_frac_dev, norm="ortho",
-						k_tile=zeta_k_tile,
-						**(dict(planes=planes_, plane_axis=int(plane_axis),
-						        cylinder=cylinder_) if planar else {}))
-				slab = jnp.where(active[None, None, None, :], slab, 0)
-				col = jax.lax.all_to_all(
-					slab, 'y', split_axis=3, concat_axis=1, tiled=True)
-				blk = jax.lax.all_gather(col, axis_name='x', axis=1, tiled=True)
-				if not _y_compact_identity:
-					blk = jnp.take(blk, y_compact_idx[bc_idx], axis=1)
-				return blk                       # (p, bc_global, s, r_loc)
+				return _y_block(bc_idx, x_idx, y_idx, r_index_, g_index_dev,
+				                kvecs_frac_dev, psi_r_cache_, planes_, cylinder_,
+				                planar)
 
 			def load_x_block(bc_idx):
 				"""ψ_kbar(r_mu) for one band chunk, un-conjugated (the
@@ -1709,6 +1735,15 @@ def _z_q_face_parent(
 				psi_r_cache_, planes_, cylinder_)
 			return _tile_tail(D_l, D_r, local_perm_r_, wraps_r_, vertex_l, vertex_r)
 
+		# Debug-only split executables (LORRAX_DEBUG_PRINT): the production
+		# path above stays one fused executable.
+		fn.projectors = jax.jit(_projectors)
+		fn.tail = jax.jit(_tile_tail)
+		# (a) probes: the source this route runs, plus the full-box source
+		# for comparison on the plane route (the cache route has no FFT).
+		fn.psi_probe = {bool(planar): _psi_source_probe(bool(planar))}
+		if planar:
+			fn.psi_probe[False] = _psi_source_probe(False)
 		_pair_pipeline_sm_cache[cache_key] = fn
 
 	if psi_r_cache is None:
@@ -1718,7 +1753,8 @@ def _z_q_face_parent(
 	        else _gamma_perm_phase_mu(gamma_L))
 	right = ((jnp.arange(ns), jnp.ones(ns)) if gamma_R == 0
 	         else _gamma_perm_phase_mu(gamma_R))
-	return _pair_pipeline_sm_cache[cache_key](
+	fn = _pair_pipeline_sm_cache[cache_key]
+	args = (
 		psi_mun_parent,
 		jnp.asarray(weight_l, dtype=jnp.float64),
 		jnp.asarray(weight_r, dtype=jnp.float64),
@@ -1729,6 +1765,47 @@ def _z_q_face_parent(
 		(jnp.asarray(tile_planes, dtype=jnp.int32) if planar
 		 else jnp.zeros((1,), jnp.int32)),
 		(cyl_index, cyl_axis, plane_from_col))
+	if (debug_print_enabled() and not coupled_mu123
+			and not isinstance(psi_mun_parent, jax.core.Tracer)):
+		return _z_q_split_timed(fn, args, planar=planar,
+		                        use_cache=use_psi_r_cache)
+	return fn(*args)
+
+
+def _z_q_split_timed(fn, args, *, planar: bool, use_cache: bool):
+	"""LORRAX_DEBUG_PRINT breakdown of one Z_q build; see docs/architecture/zeta_fit_face_psi_cct.md.
+
+	(a) the ψ(G)→ψ(tile) source + its y/x transport alone (plane path and,
+	for reference, the full-box path the incumbent ran), (b) the pair-density
+	GEMM = projector pass minus (a), (c) the k-convolution/spin tail.  The
+	probes re-run the source, so the enclosing ``z_q_build`` wall is inflated
+	in debug mode; ``prod`` is projectors + tail, the production work.
+	"""
+	(psi_mun, w_l, w_r, r_idx, perm, wraps, g_idx, kv, cache, left, right,
+	 planes, cyl) = args
+
+	def _t(f, *a):
+		t0 = time.perf_counter()
+		out = f(*a)
+		jax.block_until_ready(out)
+		return out, 1e3 * (time.perf_counter() - t0)
+
+	_, t_src = _t(fn.psi_probe[planar], r_idx, g_idx, kv, cache, planes, cyl)
+	t_full = None
+	if planar:
+		_, t_full = _t(fn.psi_probe[False], r_idx, g_idx, kv, cache, planes, cyl)
+	(D_l, D_r), t_proj = _t(fn.projectors, psi_mun, w_l, w_r, r_idx, g_idx,
+	                        kv, cache, planes, cyl)
+	out, t_tail = _t(fn.tail, D_l, D_r, perm, wraps, left, right)
+	if jax.process_index() == 0:
+		src = "cache gather" if use_cache else (
+			"plane path" if planar else "full box")
+		ref = (f" (full-box source {t_full:.0f}ms)" if t_full is not None else "")
+		print(f"[rchunk_dbg]   z_q split: psi_source[{src}]={t_src:.0f}ms{ref} "
+		      f"pair_gemm={t_proj - t_src:.0f}ms (projectors {t_proj:.0f}ms) "
+		      f"kconv_tail={t_tail:.0f}ms prod={t_proj + t_tail:.0f}ms",
+		      flush=True)
+	return out
 
 
 _psi_cylinder_cache: dict = {}
@@ -4292,6 +4369,37 @@ def _solve_zeta_local(L_q, Z_q, lu_piv, mesh_xy, n_log, solver_kind):
     return run(*ops)
 
 
+def _solve_zeta_local_timed(L_q, Z_q, lu_piv, mesh_xy, n_log, solver_kind):
+    """LORRAX_DEBUG_PRINT breakdown of one ``local`` solve (same result as ``_distributed_backsolve``).
+
+    Times the face→batch RHS exchange alone (``batch_layout`` of Z), the full
+    local batch (exchange in + per-q GEMMs + exchange out), and the output
+    reshard to ``P(None, ('x','y'), None)``.  The GEMM share is reported as
+    local_batch − 2·exchange (the two exchanges move the same bytes).
+    """
+    Py = int(mesh_xy.shape['y'])
+    _zpad = pad_last_axis_to(Z_q, Py)
+    Z_pad, n_cols = _zpad.array, _zpad.logical
+
+    def _t(f, *a):
+        t0 = time.perf_counter()
+        out = f(*a)
+        jax.block_until_ready(out)
+        return out, 1e3 * (time.perf_counter() - t0)
+
+    _, t_x = _t(linalg_batch_layout, Z_pad, mesh_xy)
+    X, t_b = _t(_solve_zeta_local, L_q, Z_pad, lu_piv, mesh_xy, n_log,
+                solver_kind)
+    out, t_r = _t(_reshard_zeta_mu_X_r_Y_to_mu_XY, X, mesh_xy)
+    if jax.process_index() == 0:
+        print(f"[rchunk_dbg]   solve split: rhs_exchange={t_x:.0f}ms "
+              f"local_batch={t_b:.0f}ms (gemm~{max(t_b - 2 * t_x, 0.0):.0f}ms) "
+              f"reshard_to_mu_xy={t_r:.0f}ms", flush=True)
+    if int(Z_pad.shape[-1]) != n_cols:
+        return out[:, :, :n_cols]
+    return out
+
+
 def _solve_zeta_token(
         L_q, Z_q, mesh_xy):
     """Produce zeta using the authenticated distributed factor token."""
@@ -4491,6 +4599,9 @@ def solve_zeta(
 
     if str(zeta_gather).strip().lower() == 'local':
         # R4: the factor stays on its q owner; only this chunk's RHS moves.
+        if debug_print_enabled() and not isinstance(Z_q, jax.core.Tracer):
+            return _solve_zeta_local_timed(
+                L_q, Z_q, lu_piv, mesh_xy, n_log, solver_kind)
         return _distributed_backsolve(
             Z_q, mesh_xy,
             lambda Z: _solve_zeta_local(L_q, Z, lu_piv, mesh_xy, n_log,
