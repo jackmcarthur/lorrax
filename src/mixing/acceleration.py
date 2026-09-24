@@ -48,6 +48,16 @@ class AccelerationResult(NamedTuple):
     converged: bool  # Whether tolerance was reached
 
 
+def _pin_entry(v, entry_sharding):
+    """Pin one history entry to the operand layout (identity if unsharded).
+
+    The one small device placement shared by rcrop_nojit and anderson_nojit:
+    an entry is carry-shaped (the SC Hamiltonian), already sharded like the
+    operand, so this is a layout pin, not a host payload transfer.
+    """
+    return v if entry_sharding is None else jax.device_put(v, entry_sharding)
+
+
 # -----------------------------------------------------------------------------
 # Least-squares solvers
 # -----------------------------------------------------------------------------
@@ -929,8 +939,7 @@ def rcrop_nojit(
             entry_sharding.mesh, P(None, *entry_sharding.spec))
 
     def _entry(v):
-        """Pin one entry to the operand layout (identity if unsharded)."""
-        return v if entry_sharding is None else jax.device_put(v, entry_sharding)
+        return _pin_entry(v, entry_sharding)
 
     def _zeros_hist():
         if stack_sharding is None:
@@ -1133,7 +1142,7 @@ def anderson_nojit(
             entry_sharding.mesh, P(None, *entry_sharding.spec))
 
     def _entry(v):
-        return v if entry_sharding is None else jax.device_put(v, entry_sharding)
+        return _pin_entry(v, entry_sharding)
 
     def _zeros_hist():
         if stack_sharding is None:
