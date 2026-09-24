@@ -188,18 +188,14 @@ def test_no_hubbard_is_the_pre_hubbard_operator_bitwise():
     op_u = dipole_operator(geom, bvec=bvec, blat=blat, vnl_setup=vset, vnl_velocity_sign=+1.0,
                            hubbard=_atwfc_setup())
     assert _operator_key(op_u) != _operator_key(op), "a Hubbard operator must not share the plain jit"
-    from psp.dft_operators import apply_kinetic_velocity_to_ket
-    for ik in range(NK):
-        args = (jnp.asarray(psi[ik])[None], jnp.asarray(gv[ik]), jnp.asarray(gmask[ik]),
-                jnp.asarray(bidx[ik])[None], jnp.asarray(kvecs[ik]))
-        got = np.asarray(op_none.apply(*args, *op_none.consts))
-        ket = jnp.asarray(psi[ik]) * jnp.asarray(gmask[ik])[None, None, :]
-        B = jnp.asarray(bvec * blat)
-        v = apply_kinetic_velocity_to_ket(ket, jnp.asarray(gv[ik]), jnp.asarray(kvecs[ik]), B)
-        kd = vnl_ops.build_vnl_kdata_traced(jnp.asarray(kvecs[ik]), jnp.asarray(gv[ik]), vset, compute_dZ=True)
-        v = v + vnl_ops.apply_vnl_velocity_to_ket(ket, kd.Z, kd.dZ, kd.E_super)
-        want = np.asarray(jnp.moveaxis(v, 0, -1)[None])
-        assert np.array_equal(got, want), "hubbard=None must execute the literal p + dV_NL ket"
+    # Since the G-split sweep (1b0ac621) p is a G-slab ket and dV_NL a
+    # separable block; V_U is the only band-layout ket, so hubbard=None
+    # must carry no band-layout slot at all (the p + dV_NL parity against
+    # the ket form is tests/test_mtxel_sweep_gsplit.py's).
+    assert op_none.apply is None and op.apply is None
+    assert op_none.apply_g is not None and op_none.coeffs is not None
+    assert op_u.apply is not None
+    assert op_u.apply_g is not None and op_u.coeffs is not None
 
 
 def test_legacy_vnl_sign_with_hubbard_refuses():

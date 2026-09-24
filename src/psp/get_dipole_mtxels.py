@@ -1429,9 +1429,8 @@ def main(argv=None):
 	# symmetry service apply antiunitary conjugation and the forward polar
 	# rotation.  Full-grid wavefunctions remain reserved for the finite-q,
 	# uniform-Hall and transport-link paths whose neighbour connectivity truly
-	# needs them.  The three Cartesian components ride ONE sweep, so the hoisted
-	# m-side reshard is paid once rather than three times; only the
-	# per-k reshard payload is 3x.
+	# needs them.  The three Cartesian components ride ONE sweep; p acts on
+	# each rank's G slab and V_NL is separable, so only ψ crosses the mesh.
 	pt_path = None
 	write_pt_remainder = None
 	debug_kindex = min(1, max(0, nk - 1))
@@ -1449,8 +1448,13 @@ def main(argv=None):
 			_dipole_block(debug_kindex)     # the table, nothing else
 		nk_file = int(sym.nk_red)
 		gtab_file = padded_gvectors(wfn, k="ibz")
-		psi_G = wfn.load(bands=(0, nb), k="ibz",
-		                 sharding=band_sphere_spec(), bispinor=bispinor)
+		# The sphere read is its own timed stage (~48 s of the q=0
+		# section at VI3 12x12 P16, runs/runtime/mtxel_sweep_20260923 c01);
+		# the sync keeps the device transfer out of the sweep's row.
+		with timing.section("load_psi_sphere"):
+			psi_G = wfn.load(bands=(0, nb), k="ibz",
+			                 sharding=band_sphere_spec(), bispinor=bispinor)
+			psi_G.block_until_ready()
 		geom = SweepGeometry(mesh=RUNTIME.mesh, fft_grid=meta.fft_grid,
 		                     ngkmax=int(psi_G.shape[3]), nb=nb,
 		                     ns=int(psi_G.shape[2]), nk=nk_file,
@@ -1486,6 +1490,8 @@ def main(argv=None):
 						hubbard_provenance=hubbard_stamp,
 						wfn_path=str(wfn_path),
 						wfn_fingerprint=wfn_fingerprint(wfn),
+						vnl_velocity_sign=vnl_velocity_sign,
+						vnl_included=not args.skip_vnl,
 						rcond=float(args.parallel_transport_rcond))
 				write_pt_remainder = write_parallel_transport_artifact
 				validate_pt_artifact = validate_parallel_transport_artifact
@@ -1655,6 +1661,7 @@ def main(argv=None):
 	wall = time.perf_counter() - _t_main
 	records = timing.records()
 	report.timings((
+		("psi(G) sphere read", timing_total(records, "load_psi_sphere")),
 		("q=0 velocity", timing_total(records, "dipole_sweep")),
 		("parallel gauge", timing_total(
 			records, "parallel_transport_velocity", "parallel_transport_links")),

@@ -30,11 +30,14 @@ dispatch — see this module's :func:`_face_project_kernel` for the
 mechanism.
 
 Current GW also passes ``layout="axis"`` for ``low_mem_bands=false``.
-Both face and axis use the same planned two-GEMM projection below. The
-linear-algebra service implements axis plans as local GEMMs followed by
-reduce-scatter, and face plans through the distributed native provider.
-The legacy body is not the current GW axis route. See
-``distrib_la.matmul_plan.local_gemm_plan`` for the axis collectives.
+Face uses the planned two-GEMM projection below (the distributed native
+provider).  Axis operands already carry every band, so each rank holds a
+whole ``(μ_x, ν_y)`` slab of the contraction: :func:`_axis_project_kernel`
+contracts it locally and reduces the ``(nb, nb)`` partial ONCE with the
+slab-contraction primitive (:func:`reduce_scatter_to_band_block`), where
+the two local-GEMM plans it replaced issued two psum_scatters, the first
+of the ``(μ/p_x, nb)`` intermediate.  The legacy body is not the current
+GW axis route.
 
 Structure (per rank, inside one shard_map)::
 
@@ -418,6 +421,11 @@ def _face_project_kernel(
     Σ_c(τ) band-bracket stack rides a Python loop over this kernel
     instead (``ppm_tau_kernel._stack_channels``), not this axis.
     """
+    if layout == "axis":
+        return _axis_project_kernel(
+            mesh_xy, face_shape, axes, channels=channels,
+            right_face_shape=right_face_shape, band_extent=band_extent)
+
     from distrib_la import gemm_plan
 
     ax_x, ax_y = axes
@@ -490,6 +498,102 @@ def _face_project_kernel(
         return (S_R, S_I)
 
     return project_split
+
+
+def _axis_project_kernel(mesh_xy: Mesh, face_shape, axes, *,
+                         channels: str = "none", right_face_shape=None,
+                         band_extent=None):
+    """The ``layout='axis'`` Σ projector: slab partial, ONE reduction.
+
+    ``axis`` operands carry EVERY band with the centroid axis split over one
+    mesh axis (``common.wfn_layout.psi_specs('axis')`` as oriented by
+    ``Wavefunctions.projection_faces``)::
+
+        psi_left   (nk, m, s, μ)     P(None, None, None, 'x')
+        O          (nk, s, μ, s', ν) P(None, None, 'x', None, 'y')
+        psi_right  (nk, s', ν, n)    P(None, None, 'y', None)
+
+    so each rank holds a complete ``(μ_x, ν_y)`` slab of the contraction.
+    It contracts that slab locally,
+
+        T[s,μ,n]  = Σ_{s',ν∈y} O[s,μ,s',ν] ψ_r[s',ν,n]
+        part[m,n] = Σ_{s,μ∈x}  conj(ψ_l[m,s,μ]) T[s,μ,n],
+
+    and :func:`reduce_scatter_to_band_block` sums the ``(nb, nb)`` partial
+    over the mesh into ``P(None, 'x', 'y')`` — one collective per call of
+    ``nb²`` per rank.  The two-plan chain this replaces (``distrib_la``
+    local GEMM plans with ``reduction_axis='y'`` then ``'x'``) issued two
+    psum_scatters, the first of the ``(μ/p_x, nb)`` intermediate; the price
+    here is the second contraction running over all ``nb`` columns instead
+    of ``nb/p_y`` (``nb·p_y/(ns·N_ν)`` of the first's flops).
+    ``channels='split_reim'`` projects ``Re O`` and ``Im O`` and stacks the
+    two partials into the same single reduction.
+    """
+    from common.shard_map import shard_map
+
+    ax_x, ax_y = axes
+    px, py = int(mesh_xy.shape[ax_x]), int(mesh_xy.shape[ax_y])
+    nk, nb_full, n_rmu_left, ns = (int(v) for v in face_shape)
+    nb_project = nb_full if band_extent is None else int(band_extent)
+    right_face_shape = face_shape if right_face_shape is None \
+        else right_face_shape
+    n_rmu_right = int(right_face_shape[2])
+    expected = ((nk, nb_project, ns, n_rmu_left),
+                (nk, ns, n_rmu_left, ns, n_rmu_right),
+                (nk, ns, n_rmu_right, nb_project))
+    if channels not in ("none", "split_reim"):
+        raise ValueError(
+            f"_axis_project_kernel: channels must be 'none' or "
+            f"'split_reim', got {channels!r}")
+    if nb_project % px or nb_project % py:
+        raise ValueError(
+            "contract_bands_block_reshard(layout='axis'): the projected band "
+            f"extent {nb_project} must tile the ({px}, {py}) mesh")
+
+    def body(psi_l, O, psi_r):
+        if channels == "none":
+            ops = (O,)
+        else:
+            ops = (jnp.real(O).astype(O.dtype), jnp.imag(O).astype(O.dtype))
+        parts = []
+        for o in ops:
+            T = jnp.einsum("ksmtn,ktnb->ksmb", o, psi_r, optimize=True)
+            parts.append(jnp.einsum("kasm,ksmb->kab", jnp.conj(psi_l), T,
+                                    optimize=True))
+        blk = reduce_scatter_to_band_block(
+            jnp.stack(parts), px=px, py=py, axes=axes)
+        return blk[0] if channels == "none" else (blk[0], blk[1])
+
+    out = P(None, ax_x, ax_y)
+    in_specs = (P(None, None, None, ax_x), P(None, None, ax_x, None, ax_y),
+                P(None, None, ax_y, None))
+    kernel = jax.jit(shard_map(
+        body, mesh=mesh_xy, in_specs=in_specs,
+        out_specs=out if channels == "none" else (out, out),
+        check_vma=False))
+
+    def project(psi_nmu, O, psi_mun):
+        got = (tuple(psi_nmu.shape), tuple(O.shape), tuple(psi_mun.shape))
+        if got != expected:
+            raise ValueError(
+                "contract_bands_block_reshard(layout='axis'): endpoint "
+                f"shapes {got} do not match planned {expected}")
+        # Same contract as the distrib_la plans this replaces: a concrete
+        # operand must already sit in its spec (a tracer's layout belongs
+        # to the enclosing jit), never an implicit (μ, n)-class reshard.
+        for name, x, spec in zip(("psi_left", "O", "psi_right"),
+                                 (psi_nmu, O, psi_mun), in_specs):
+            have = getattr(x, "sharding", None)
+            if (not isinstance(x, jax.core.Tracer) and have is not None
+                    and not have.is_equivalent_to(
+                        jax.sharding.NamedSharding(mesh_xy, spec), x.ndim)):
+                raise ValueError(
+                    f"contract_bands_block_reshard(layout='axis'): {name} "
+                    f"must already be sharded {spec}; refusing an implicit "
+                    f"reshard of a {tuple(x.shape)} array.  Got {have!r}.")
+        return kernel(psi_nmu, O, psi_mun)
+
+    return project
 
 
 def contract_bands_block_reshard(

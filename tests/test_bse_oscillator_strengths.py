@@ -375,7 +375,7 @@ def _both_arms_matrix_elements():
     fixtures drift into disagreeing about what they test.
     """
     from tests.test_dipole_vnl_velocity_sign import (
-        _apply_one_k, _fixture, _geom, _mesh, _mtxel, _vnl_setup)
+        _fixture, _geom, _matrix_one_k, _mesh, _vnl_setup)
     from common.mtxel_sweep import (VNL_VELOCITY_SIGN_FLIPPED,
                                     VNL_VELOCITY_SIGN_SHIPPED, dipole_operator)
 
@@ -390,9 +390,7 @@ def _both_arms_matrix_elements():
             op = dipole_operator(geom, bvec=bvec, blat=blat,
                                  vnl_setup=setup, vnl_velocity_sign=sign)
             arms[tag] = np.asarray([
-                _mtxel(_apply_one_k(op, psi[ik], gv[ik], gmask[ik],
-                                    bidx[ik], kvecs[ik]),
-                       psi[ik], gmask[ik])
+                _matrix_one_k(op, psi[ik], gv[ik], gmask[ik], kvecs[ik])
                 for ik in range(psi.shape[0])])
     return arms["shipped"], arms["flipped"]
 
@@ -431,7 +429,7 @@ def test_the_sensitivity_measurement_is_not_a_tautology():
     import jax.numpy as jnp
     from dataclasses import replace
     from tests.test_dipole_vnl_velocity_sign import (
-        _apply_one_k, _fixture, _geom, _mesh, _mtxel, _vnl_setup)
+        _fixture, _geom, _matrix_one_k, _mesh, _vnl_setup)
     from common.mtxel_sweep import (VNL_VELOCITY_SIGN_FLIPPED,
                                     VNL_VELOCITY_SIGN_SHIPPED, dipole_operator)
 
@@ -446,9 +444,7 @@ def test_the_sensitivity_measurement_is_not_a_tautology():
             op = dipole_operator(geom, bvec=bvec, blat=blat,
                                  vnl_setup=dead, vnl_velocity_sign=sign)
             got[tag] = np.asarray([
-                _mtxel(_apply_one_k(op, psi[ik], gv[ik], gmask[ik],
-                                    bidx[ik], kvecs[ik]),
-                       psi[ik], gmask[ik])
+                _matrix_one_k(op, psi[ik], gv[ik], gmask[ik], kvecs[ik])
                 for ik in range(psi.shape[0])])
     move = _median_relative_move(got["shipped"], got["flipped"])
     assert move < 1.0e-12, (

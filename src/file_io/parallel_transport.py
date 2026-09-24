@@ -403,10 +403,22 @@ def initialize_parallel_transport_artifact(
     velocity_dft_kmajor,
     wfn_path: str,
     wfn_fingerprint: str,
+    vnl_velocity_sign: float,
+    vnl_included: bool,
     rcond: float = 1.0e-10,
     hubbard_provenance: str | None = None,
 ) -> None:
     """Create the schema and write exact velocity before the WFN stream.
+
+    ``vnl_velocity_sign`` / ``vnl_included`` are the operator provenance of
+    the stored velocity ``p ± i[r, V_NL]``: the resolved relative sign of the
+    nonlocal term (``common.mtxel_sweep.require_vnl_velocity_sign`` — +1 is
+    the default arm, -1 the pre-2026-08-09 one) and whether V_NL is in it at
+    all.  Both are REQUIRED and written as scalar datasets
+    ``vnl_velocity_sign`` (f64) and ``vnl_included`` (i32), the same facts
+    ``dipole.h5`` stamps as ``prov_vnl_velocity_sign``/``prov_skip_vnl``,
+    so a consumer can refuse a velocity built under an arm it does not
+    implement instead of silently reading it.
 
     This is a separate transaction so the dipole producer can release its
     resident full-BZ wavefunctions and sharded velocity before loading the
@@ -432,6 +444,8 @@ def initialize_parallel_transport_artifact(
     CrI3 9x9x1 deck) refused HERE instead, before velocity -- the object
     that carries no stencil requirement at all -- was ever written.
     """
+    from common.mtxel_sweep import require_vnl_velocity_sign
+    vnl_sign = require_vnl_velocity_sign(vnl_velocity_sign)
     nb = int(nbands)
     kgrid = tuple(int(n) for n in np.asarray(wfn.kgrid).reshape(3))
     reduced = link_symmetry_reduction_applies(sym, kgrid)
@@ -511,6 +525,8 @@ def initialize_parallel_transport_artifact(
         io.write_attr("spin_channel", np.int32(0))
         io.write_attr("effective_nspinor", np.int32(effective_nspinor))
         io.write_attr("bispinor", np.int32(bool(bispinor)))
+        io.write_attr("vnl_velocity_sign", np.float64(vnl_sign))
+        io.write_attr("vnl_included", np.int32(bool(vnl_included)))
         io.write_attr("kgrid", np.asarray(wfn.kgrid, dtype=np.int32))
         io.write_attr("kgrid_shift", np.asarray(wfn.shift, dtype=np.float64))
         io.write_attr("reduced_spacing",

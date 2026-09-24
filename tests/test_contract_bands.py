@@ -691,6 +691,72 @@ def test_face_projector_rejects_bad_channels():
             mesh, layout="face", face_shape=face_shape, channels="bogus")
 
 
+def _axis_operands(mesh, mu_l=MU, mu_r=MU + 4, nb=MN, seed=11):
+    """Rectangular (μ_left != ν_right) axis-layout operands, ns = NS."""
+    rng = np.random.default_rng(seed)
+
+    def c(*shape):
+        return rng.standard_normal(shape) + 1j * rng.standard_normal(shape)
+    psi_l = c(NK, nb, NS, mu_l)
+    o = c(NK, NS, mu_l, NS, mu_r)
+    psi_r = c(NK, NS, mu_r, nb)
+    put = lambda a, spec: jax.device_put(jnp.asarray(a),     # noqa: E731
+                                         NamedSharding(mesh, spec))
+    dev = (put(psi_l, P(None, None, None, "x")),
+           put(o, P(None, None, "x", None, "y")),
+           put(psi_r, P(None, None, "y", None)))
+    ref = np.einsum("kasm,ksmtn,ktnb->kab", np.conj(psi_l), o, psi_r)
+    return dev, (psi_l, o, psi_r), ref
+
+
+def test_axis_projector_matches_reference_with_one_reduction():
+    """``layout='axis'``: slab partial + ONE reduce-scatter, exact to 1e-14.
+
+    The rectangular (μ_left != ν_right) case and both channel plans; the
+    compiled program carries exactly one reduce-scatter and no all-gather
+    (the two-plan chain it replaced carried two reduce-scatters).  Red
+    twin: the transposed block misses the same reference by O(1).
+    """
+    mesh = _mesh()
+    dev, (psi_l, o, psi_r), ref = _axis_operands(mesh)
+    face = (NK, MN, MU, NS)
+    right = (NK, MN, MU + 4, NS)
+    proj = contract_bands_block_reshard(
+        mesh, layout="axis", face_shape=face, right_face_shape=right)
+    got = np.asarray(proj(*dev))
+    scale = np.abs(ref).max()
+    assert np.abs(got - ref).max() <= TOL * 10 * scale
+    assert np.abs(np.swapaxes(got, -1, -2) - ref).max() > 1e-3 * scale
+    hlo = jax.jit(proj).lower(*dev).compile().as_text()
+    assert len(re.findall(r"reduce-scatter(-start)?\(", hlo)) == 1, hlo
+    assert "all-gather" not in hlo
+
+    split = contract_bands_block_reshard(
+        mesh, layout="axis", face_shape=face, right_face_shape=right,
+        channels="split_reim")
+    S_R, S_I = (np.asarray(x) for x in split(*dev))
+    ref_R = np.einsum("kasm,ksmtn,ktnb->kab", np.conj(psi_l), o.real, psi_r)
+    ref_I = np.einsum("kasm,ksmtn,ktnb->kab", np.conj(psi_l), o.imag, psi_r)
+    assert np.abs(S_R - ref_R).max() <= TOL * 10 * np.abs(ref_R).max()
+    assert np.abs(S_I - ref_I).max() <= TOL * 10 * np.abs(ref_I).max()
+    hlo2 = jax.jit(split).lower(*dev).compile().as_text()
+    assert len(re.findall(r"reduce-scatter(-start)?\(", hlo2)) == 1
+
+
+def test_axis_projector_refuses_untiled_bands_and_hidden_reshards():
+    mesh = _mesh()
+    with pytest.raises(ValueError, match="tile"):
+        contract_bands_block_reshard(
+            mesh, layout="axis", face_shape=(NK, MN + 1, MU, NS))
+    dev, _, _ = _axis_operands(mesh)
+    proj = contract_bands_block_reshard(
+        mesh, layout="axis", face_shape=(NK, MN, MU, NS),
+        right_face_shape=(NK, MN, MU + 4, NS))
+    wrong = jax.device_put(dev[0], NamedSharding(mesh, P(None, "x")))
+    with pytest.raises(ValueError, match="implicit reshard"):
+        proj(wrong, dev[1], dev[2])
+
+
 def test_contract_bands_rejects_bad_layout():
     mesh = _mesh()
     with pytest.raises(ValueError, match="layout"):

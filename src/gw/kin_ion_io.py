@@ -452,10 +452,10 @@ def get_kin_ion_k(wfn_k, Gk_crys, kvec, V_loc_r, vnl_setup, wfn, g_mask=None,
 #                     (1.4 MB at 12×12).  Nothing else is reduced.
 #   V_H(r) = Poisson  **REPLICATED BY DESIGN** — zero collectives; see the
 #                     step-2 comment inside ``compute_hartree_matrix``.
-#   ⟨mk|V_H|nk⟩       ONE k-scan (``common.mtxel_sweep``): k is a trip
-#                     count, and THAT k's bands are sharded over every
-#                     process.  One reshard per k along 'x' (9.4 MB at
-#                     b600/P=64); the output stays sharded
+#   ⟨mk|V_H|nk⟩       ONE k-tile scan (``common.mtxel_sweep``): k is a
+#                     trip count; per tile ψ and V_H ψ are all-to-all'd to
+#                     a G-split layout and the slab partial is
+#                     reduce-scattered; the output stays sharded
 #                     ``P(None,'x','y')`` and is gathered only at the
 #                     boundary, by name.
 #   ψ                 for ρ: loaded per rank for the (k, band) windows that
@@ -467,10 +467,9 @@ def get_kin_ion_k(wfn_k, Gk_crys, kvec, V_loc_r, vnl_setup, wfn, g_mask=None,
 # (k, band) and both axes are free, so k alone suffices until P > nk and a
 # band chunking is layered on.  ⟨mk|V_H|nk⟩ contracts the FULL band window
 # against itself at fixed k, so splitting bands means either a reduction or
-# a two-sided split — and the two-sided split is what ``mtxel_sweep``
-# does: shard the OUTPUT ``H[m_X, n_Y]`` and replicate the contraction
-# axis.  The alternative (shard G, psum the partials) needs every rank to
-# hold a full (nb, nb) to reduce into, which is the wall being removed.
+# a two-sided split.  ``mtxel_sweep`` splits G and reduce-scatters one
+# k-tile's ``(nb, nb)`` partial into ``H[m_X, n_Y]`` — a transient per tile,
+# not the replicated (nk, nb, nb) wall; its module docstring prices it.
 
 
 def rho_work_items(
@@ -956,14 +955,9 @@ def compute_hartree_matrix(wfn, sym, meta, *, truncation_2d: bool,
     # built each k's FULL-BAND FFT box on one rank (1.77 GB at b600
     # bispinor) and could not use more than ``nk`` ranks at all — each
     # rank took a whole k, so its wall was one full-band k however large
-    # P was.  ``sweep_matrix_elements`` scans k one at a time with that
-    # k's bands sharded over every process, so ``nk`` is a trip count and
-    # parallel efficiency is ``nb_logical/nb_padded``.  Measured
-    # b600-class at P=64, worst rank: 4.975 s / 10.83 GiB before,
-    # 2.162 s / 8.21 GiB after (jobs 7888877, 7888907).  At P = nk it is
-    # ~1.45× SLOWER — the per-k reshard is pure overhead once the old
-    # plan already fills the machine — which is expected and is the
-    # documented crossover, not a regression.
+    # P was.  ``sweep_matrix_elements`` scans k tiles with every rank
+    # holding a G slab of every band, so ``nk`` is a trip count and never a
+    # parallel axis (its module docstring owns the plan and its costs).
     #
     # Fixed-shape G (owner decision D10, 2026-07-30): ``padded_gvectors``
     # hands over the loader's OWN ``(nk, ngkmax, 3)`` table, so the scan
@@ -1337,16 +1331,14 @@ def main(argv=None):
     # route boxed a whole k's bands on one rank and stopped scaling at
     # P = nk.  Here the three terms are summed ON THE KET
     # (``sum_operators``) so ⟨m|T+V_loc+V_NL|n⟩ is ONE sweep with one
-    # reshard and one einsum, not three of each.
+    # all-to-all and one slab GEMM, not three of each.
     #
-    #   T       |k+G|² ψ            diagonal in G, no FFT
-    #   V_loc   F[V(r) F⁻¹ψ]        the only real-space excursion
-    #   V_NL    Z E Z† ψ            projector sum, G-local, no FFT
+    #   T       |k+G|² ψ            diagonal in G: applied on the G slab
+    #   V_loc   F[V(r) F⁻¹ψ]        the only real-space excursion (band layout)
+    #   V_NL    Z E Z† ψ            separable: c† E c on slab projections
     #
-    # V_NL DID fit the operator protocol: its G sum is over the replicated
-    # G axis with the band index free, so it needs no collective and forms
-    # no (nb, nb).  ``get_kin_ion_k`` is left in place — it is the per-k
-    # local-plan kernel the sweep is gated against.
+    # ``get_kin_ion_k`` is left in place — it is the per-k local-plan
+    # kernel the sweep is gated against.
     from common.mtxel_sweep import (SweepGeometry, blocks_to_host,
                                     kinetic_operator,
                                     local_potential_operator, sum_operators,
@@ -1363,8 +1355,14 @@ def main(argv=None):
     # either: ``file_io.kin_ion`` unfolds on read and still hands back
     # ``(nk_tot, nb, nb)`` in full-BZ order.
     gtab = padded_gvectors(wfn, k=k_spec)
-    psi_G = wfn.load(bands=(0, nb_eff), k=k_spec,
-                     sharding=band_sphere_spec())
+    # The band-sharded sphere read is this driver's largest single cost at
+    # production size (VI3 12x12, 360 bands: ~53 s of a 75 s run at P16,
+    # runs/runtime/mtxel_sweep_20260923 b01), so it is its own timed stage;
+    # the sync keeps the device transfer inside it rather than in kin_ion.
+    with timing.section("load_psi_sphere"):
+        psi_G = wfn.load(bands=(0, nb_eff), k=k_spec,
+                         sharding=band_sphere_spec())
+        psi_G.block_until_ready()
     geom = SweepGeometry(mesh=mesh_xy, fft_grid=meta.fft_grid,
                          ngkmax=int(psi_G.shape[3]), nb=nb_eff,
                          ns=int(psi_G.shape[2]), nk=nk_irr,
@@ -1540,6 +1538,7 @@ def main(argv=None):
     records = timing.records()
     report.timings((
         ("wavefunction input", timing_total(records, "load_wfn")),
+        ("psi(G) sphere read", timing_total(records, "load_psi_sphere")),
         ("local ionic potential", timing_total(records, "build_V_loc")),
         ("nonlocal projectors", timing_total(records, "build_V_NL")),
         ("T + ionic matrix", timing_total(records, "kin_ion")),
