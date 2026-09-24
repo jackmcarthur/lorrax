@@ -760,7 +760,6 @@ def _host_target_id() -> str:
 #: present — an ImportError here would turn the cache off for a reason that
 #: has nothing to do with the cache.
 RANK_FINGERPRINT_ENV = (
-    "LORRAX_SIGMA_PREPARED_BOUNDS",
     "LORRAX_FFT_FFI",
     "LORRAX_BANDS_GEMM_FFI",
 )
