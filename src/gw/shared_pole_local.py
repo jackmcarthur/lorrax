@@ -71,11 +71,12 @@ def batch_to_face(mesh_xy):
     import jax.numpy as jnp
     from jax.sharding import PartitionSpec as P
     from common.shard_map import shard_map
+    from runtime.padding import padded_axis
     px, py = int(mesh_xy.shape['x']), int(mesh_xy.shape['y'])
 
     def restore(a):
         if py > 1:
-            pad = (-a.shape[2]) % py
+            pad = padded_axis(a.shape[2], py, name='shared_pole_factor_width').pad
             if pad:
                 a = jnp.pad(a, ((0, 0), (0, 0), (0, pad)))
             a = jax.lax.all_to_all(a, 'y', split_axis=2, concat_axis=0, tiled=True)

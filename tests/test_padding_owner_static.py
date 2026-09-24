@@ -80,8 +80,50 @@ MODULO_EXCEPTIONS.update(_registered({
      "int(n) % px"),
     ("services/distrib_la/src/distrib_la/resolve.py", "resolve_backend",
      "int(n) % py"),
+    ("services/distrib_la/src/distrib_la/_batch_reshard.py",
+     "is_batch_layout", "int(a.shape[0]) % ndev"),
+    ("services/distrib_la/src/distrib_la/_batch_reshard.py", "batch_layout",
+     "int(a.shape[1]) % px"),
+    ("services/distrib_la/src/distrib_la/_batch_reshard.py", "batch_layout",
+     "int(a.shape[2]) % py"),
+    ("services/distrib_la/src/distrib_la/_batch_reshard.py",
+     "batch_layout_eigh_call", "nb % (px * py)"),
+    ("services/distrib_la/src/distrib_la/_batch_reshard.py",
+     "local_batch/_run", "a.shape[1] % px"),
+    ("services/distrib_la/src/distrib_la/_batch_reshard.py",
+     "local_batch/_run", "a.shape[2] % py"),
+    ("services/distrib_la/src/distrib_la/_panel_matmul.py", "panel_matmul",
+     "m % px"),
+    ("services/distrib_la/src/distrib_la/_panel_matmul.py", "panel_matmul",
+     "k % px"),
+    ("services/distrib_la/src/distrib_la/_panel_matmul.py", "panel_matmul",
+     "k % py"),
+    ("services/distrib_la/src/distrib_la/_panel_matmul.py", "panel_matmul",
+     "n % py"),
+    ("services/distrib_la/src/distrib_la/workspace.py", "_workspace_details",
+     "n % px"),
+    ("services/distrib_la/src/distrib_la/workspace.py", "_workspace_details",
+     "n % py"),
 }, reason="backend authenticates an already-produced distributed carrier",
    follow_up="caller must obtain the carrier from runtime.padding"))
+
+MODULO_EXCEPTIONS.update(_registered({
+    ("services/distrib_la/src/distrib_la/_batch_reshard.py", "batch_layout",
+     "-nb % ndev"),
+    ("services/distrib_la/src/distrib_la/_batch_reshard.py",
+     "local_batch/_run", "-nb % (px * py)"),
+}, reason=("batch-layout slot pad made inside distrib_la, which cannot import "
+           "runtime; the zero slot rows never reach a local_batch kernel"),
+   follow_up=("owner: take the slot count from a caller-supplied runtime.padding "
+              "receipt, or rule the batch layout a service-owned carrier")))
+
+MODULO_EXCEPTIONS.update(_registered({
+    ("services/symmetry_maps/src/symmetry_maps/qgrid_trs.py",
+     "project_little_group_operator", "m % (px * py)"),
+    ("src/gw/isdf_fitting.py", "add_pad_diagonal_sharded", "n % px"),
+    ("src/gw/isdf_fitting.py", "add_pad_diagonal_sharded", "n % py"),
+}, reason="consumer authenticates an already-padded mesh carrier",
+   follow_up="accept a runtime.padding receipt when the owner next edits it"))
 
 MODULO_EXCEPTIONS.update(_registered({
     ("services/symmetry_maps/src/symmetry_maps/maps.py",
@@ -102,6 +144,10 @@ DIVISIBILITY_REFUSAL_EXCEPTIONS = {
             "the owner tag is used to detect the requested carrier"
         ),
         "follow_up": "rank_truncate is the padded distributed alternative",
+    },
+    ("src/gw/isdf_fitting.py", "add_pad_diagonal_sharded"): {
+        "reason": "authenticates the runtime-padded mu carrier before a tile-local diagonal",
+        "follow_up": "use authenticate_padded_axis when the zeta-fit owner next edits it",
     },
     ("src/runtime/__init__.py", "reshape"): {
         "reason": "square runtime mesh topology, not a padded array axis",
