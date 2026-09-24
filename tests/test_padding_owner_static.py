@@ -112,10 +112,12 @@ MODULO_EXCEPTIONS.update(_registered({
      "-nb % ndev"),
     ("services/distrib_la/src/distrib_la/_batch_reshard.py",
      "local_batch/_run", "-nb % (px * py)"),
-}, reason=("batch-layout slot pad made inside distrib_la, which cannot import "
-           "runtime; the zero slot rows never reach a local_batch kernel"),
-   follow_up=("owner: take the slot count from a caller-supplied runtime.padding "
-              "receipt, or rule the batch layout a service-owned carrier")))
+}, reason=("hand-rounded batch-slot pad (Bp = ceil(B/P)*P) inside distrib_la; "
+           "it cannot route through runtime.padding because distrib_la is a "
+           "standalone distribution that imports no LORRAX src/ module "
+           "(services/distrib_la/README.md; deps lxkit, jax, numpy)"),
+   follow_up=("owner decides: a service-local padding helper, or a slot count "
+              "supplied by the caller from runtime.padding")))
 
 MODULO_EXCEPTIONS.update(_registered({
     ("services/symmetry_maps/src/symmetry_maps/qgrid_trs.py",
