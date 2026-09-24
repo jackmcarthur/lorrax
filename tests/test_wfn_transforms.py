@@ -153,10 +153,16 @@ def test_to_box_empty_cells_are_zero(synth_loader):
     psi = synth_loader.load(bands=(0, b_hi), k="ibz")
     g_index = synth_loader.box_index(k="ibz")
     psi_box = np.asarray(to_box(psi, g_index, synth_loader.fft_grid, mesh=MESH))
-    ngkmax = int(synth_loader.ngkmax)
+    grid = tuple(int(v) for v in synth_loader.fft_grid)
+    n_rtot = int(np.prod(grid))
 
-    # An FFT-box cell is empty iff g_index[k, x, y, z] == ngkmax.
-    sentinel_mask = (np.asarray(g_index) == ngkmax)
+    # A box cell is empty iff no live sphere slot of that k names it.
+    sidx = np.asarray(g_index)
+    occupied = np.zeros((sidx.shape[0], n_rtot), dtype=bool)
+    for k in range(sidx.shape[0]):
+        occupied[k, sidx[k][sidx[k] < n_rtot]] = True
+    sentinel_mask = ~occupied.reshape(sidx.shape[0], *grid)
+    assert np.any(sentinel_mask) and np.any(~sentinel_mask)
     # Broadcast to (n_k, nb, ns, nx, ny, nz).
     sentinel_mask_b = sentinel_mask[:, None, None, :, :, :]
     assert np.all(np.abs(psi_box[np.broadcast_to(
