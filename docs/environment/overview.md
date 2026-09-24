@@ -29,7 +29,7 @@ native library is built and reached.
 
 The FFI layer is required on every platform: a missing or unloadable
 library refuses at startup in `Gate.enforce`, naming the `.so`
-([decisions](../architecture/decisions.md), 2026-08-01).
+([decisions](../architecture/decisions.md)).
 
 ### The Frontera CPU layer stack {#layer-stack}
 
