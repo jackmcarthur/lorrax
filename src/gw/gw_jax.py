@@ -347,8 +347,7 @@ def _report_head_and_photon_policy(config, print0, report):
                    f"<D_TT>) -- {_bare_reason}"
                    if _bare_taken else
                    "incumbent charge-screened W + Sigma^B "
-                   "(gw.sigma_x_bispinor) with the scalar band-diagonal q->0 "
-                   f"head -- {_bare_reason}"))
+                   f"(gw.sigma_x_bispinor) -- {_bare_reason}"))
         if not uses_static_photon_response(config):
             _banner, _head_record = incumbent_bispinor_head_record(config)
             if _banner:

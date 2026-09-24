@@ -3587,13 +3587,20 @@ def uses_bare_tt_gamma_head(config) -> bool:
     """Insert the bare transverse Gamma average into bare-TT V tiles."""
     hybrid = (uses_bare_transverse_shared_pole(config)
               and config.head.correction is not HeadCorrection.OFF)
+    incumbent_ppm = (bool(config.bispinor)
+                     and config.compute_mode.ppm_model is not None
+                     and coerce_bispinor_gw_mode(config.bispinor_gw)
+                         is BispinorGWMode.BARE_TRANSVERSE
+                     and config.head.correction is HeadCorrection.FULL
+                     and int(config.sys_dim) in (2, 3)
+                     and not uses_static_photon_response(config))
     bare_x = (bool(config.bispinor)
               and config.compute_mode is ComputeMode.X_ONLY
               and coerce_bispinor_gw_mode(config.bispinor_gw)
                   is BispinorGWMode.BARE_TRANSVERSE
               and config.head.correction is HeadCorrection.FULL
               and int(config.sys_dim) in (2, 3))
-    return hybrid or bare_x
+    return hybrid or incumbent_ppm or bare_x
 
 
 def uses_direct_bispinor_shared_pole_head(config) -> bool:
@@ -3631,9 +3638,10 @@ def incumbent_bispinor_head_record(config) -> tuple[str, str]:
             and uses_bare_tt_gamma_head(config)):
         return "", ("bare charge and TT Gamma-cell averages in V; "
                     "no screened W")
-    # With head_correction = full, the CHARGE head is band-diagonal and
-    # there is NO transverse q=Gamma head on this route now that the overlay
-    # has no deck key -- say so rather than let a bulk number look complete.
+    if uses_bare_tt_gamma_head(config):
+        return "", ("scalar band-diagonal charge head and bare TT "
+                    "Gamma-cell average in V; screened dynamic TT head absent")
+    # Other incumbent modes have only the scalar band-diagonal charge head.
     return (
         "",
         "scalar band-diagonal charge head only (gw.head_correction "
@@ -3700,6 +3708,12 @@ def refuse_unsupported_bispinor_gw(config) -> None:
             "GATE bare_tt_gamma_restart_unstamped: bare bispinor exchange "
             "needs a fresh V with its TT Gamma-cell average; restart V "
             "does not stamp that choice. Set restart=false.")
+    if (config.compute_mode.ppm_model is not None
+            and uses_bare_tt_gamma_head(config) and bool(config.restart)):
+        raise ValueError(
+            "GATE bare_tt_gamma_restart_unstamped: GN/HL-PPM bare "
+            "transverse exchange needs a fresh V with its TT Gamma-cell "
+            "average; restart V does not stamp that choice. Set restart=false.")
     shared_pole_direct = (uses_direct_bispinor_shared_pole_head(config)
                           or (uses_bare_transverse_shared_pole(config)
                               and config.head.correction is HeadCorrection.NO_LOCAL_FIELDS))
