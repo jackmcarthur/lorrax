@@ -47,6 +47,52 @@ is first order in the long-wavelength vertex.
 | the packed operator on a **dynamic** Σ | **CC dynamic, current blocks static**: `W_00(ω)` follows the PPM model while the other fifteen packed blocks are evaluated at `ω = 0` | CC: the dynamic model's own head (§3.3) for `Σ_c` plus the scalar band-diagonal `⟨v⟩` head for `Σ_X`; TT and CT/TC: the packed Γ-cell completion of §4.2 | either `bispinor_gw` value with `compute_mode` in {`gn_ppm`, `hl_ppm`} inside the packed envelope; `mpa` stays on the incumbent route | experimental, slab, one shot; the current blocks' `ω`-dependence is neglected and bounded as in §2.2 |
 | frequency-dependent current blocks | ordered CC/CT/TT shared-pole sectors | first-order direct Γ completion; no wing/body fold | `bispinor_gw = full_shared_pole` | implemented; see the shared-pole W model |
 
+### Direct bulk head at an FD near-degeneracy
+
+The direct bulk implementation in `src/gw/photon_direct_head.py` uses the
+charge jet `v_nm/(ε_m−ε_n)` and approximates the uniform spatial current by
+`(α_FS/2) v_nm` in Rydberg units. Let `Δ=ε_m−ε_n>0`,
+`d=(f_n−f_m)/Δ`, and `C=2/(Ω N_k n_spin n_spinor)`. Fermi–Dirac statistics
+give the finite divided-difference limit `d→−f′(ε)` as `Δ→0`. For a real
+two-band velocity `v` along `q`, summing **both** directed pairs gives
+
+\[
+χ^{00}_{\rm pair}(q,z)=\frac{2C d(qv)^2}{z^2-Δ^2},\qquad
+χ^{0x}_{\rm pair}(q,z)=
+\frac{2C(α_{\rm FS}/2)d\,qv^2 z}{z^2-Δ^2}.
+\]
+
+At fixed nonzero `z`, both limits are finite. At exactly `z=0`, the first
+expression is `−2C d(qv/Δ)^2`, which is unbounded at fixed nonzero `q`.
+The first-order charge jet is nonuniform when `|qv|` approaches `|Δ|`:
+the exact finite-`q` Bloch overlap, intraband terms and FD energy changes
+must be evaluated together. In the local two-band model
+`H(k)=Δ σ_z/2 + kv σ_x` at half filling, the exact static FD bubble tends
+to `−C tanh(|qv|/(2T))/|qv|` as `Δ→0` at fixed `q` (and to `−C/(2T)` when
+`|qv|≪T`), while the retained jet term diverges.
+The two-band eigenvector Taylor series has its nearest complex-`q` branch
+point at `2|qv|/|Δ|=1`; this is a necessary validity bound for this
+first-order expansion, not a sufficient accuracy certificate in a many-band
+metal. Existing Fe4 and Fe8 head input snapshots have many FD-active pairs
+outside that radius even inside the physical Γ-cell sphere (measurement in
+the linked report), so a global radius refusal would also disable those
+calculations before a replacement response exists.
+The production `photon_direct_degenerate_occupation` refusal therefore
+protects a real model boundary; replacing `(f_n−f_m)/Δ` by `−f′` alone does
+not repair the static response. The existing `1e−8 Ry` gate is only a
+denominator guard and does not certify accuracy above that gap.
+
+The spatial-current substitution is a separate approximation. The body
+bank applies the four-spinor `α^i` operator, whereas the direct head uses
+the dipole velocity. Equality requires an authenticated operator identity
+for the same wavefunctions and Hamiltonian; the present head has no such
+material comparison. A finite-`q` current jet also contains terms beyond
+the uniform velocity. The discriminating measurement is a matched Fe
+matrix-element comparison against `gamma_apply` on the same QP-rotated
+four-spinor manifold, followed by the same Γ-cell Dyson and sector Σ
+contraction. The local FD limit measurement is recorded in the sandbox's
+`reports/photon_direct_head_fd_limit_2026-09-23/report.md`.
+
 Binding rule ([decisions, 2026-09-01](../architecture/decisions.md)): COHSEX
 with bispinors always carries the Γ-cell head; `head_correction = off` is a
 debug setting. A mode whose envelope forbids the head is a defect, not a
