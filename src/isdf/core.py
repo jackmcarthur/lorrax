@@ -191,26 +191,212 @@ def _conv_kpair_setup(mesh_xy, kgrid, ns, trailing_shape, gamma_L, gamma_R):
 	return arm, reason, kernel, gamma_key
 
 
-def _parent_conv_tables(plan, right_perm, right_wraps, mu_loc, nu_loc):
-	"""Slice the plan's typed tables for the native parent-load convolution on this rank."""
+def _parent_conv_tables_local(plan, left_perm, left_L, right_perm, right_L):
+	"""The native parent-load convolution's operands from this rank's local endpoint tables."""
 	from symmetry_maps import open_spin_block_coefficient
-	x = jax.lax.axis_index('x') * mu_loc
-	y = jax.lax.axis_index('y') * nu_loc
-	def local(table, start, width, dtype):
-		return jax.lax.dynamic_slice_in_dim(jnp.asarray(table, dtype), start, width, axis=1)
 	ns = int(plan.nspinor)
 	coef = jnp.stack([open_spin_block_coefficient(plan.spin_action_full, a, b)
 	                 for a in range(ns) for b in range(ns)], axis=1)
 	return (jnp.asarray(plan.irr_idx, jnp.int32),
 	        jnp.asarray(plan.sym_idx, jnp.int32),
-	        local(plan.centroid_local_perm, x, mu_loc, jnp.int32),
-	        local(right_perm, y, nu_loc, jnp.int32),
-	        local(plan.L_table, x, mu_loc, jnp.float64),
-	        local(right_wraps, y, nu_loc, jnp.float64),
+	        jnp.asarray(left_perm, jnp.int32),
+	        jnp.asarray(right_perm, jnp.int32),
+	        jnp.asarray(left_L, jnp.float64),
+	        jnp.asarray(right_L, jnp.float64),
 	        jnp.asarray(plan.k_parent_frac, jnp.float64),
 	        jnp.asarray(np.asarray(plan.sym_idx) >= plan.n_sym_spatial, jnp.int32),
 	        coef.reshape(plan.n_full, ns*ns, ns*ns),
 	        coef.reshape(plan.n_full, ns*ns, ns*ns))
+
+
+def _parent_local_tables(plan, right_perm, right_wraps, mu_loc, nu_loc):
+	"""This rank's X slice of the plan's centroid tables and Y slice of the right tables."""
+	x = jax.lax.axis_index('x') * mu_loc
+	y = jax.lax.axis_index('y') * nu_loc
+	def local(table, start, width, dtype):
+		return jax.lax.dynamic_slice_in_dim(jnp.asarray(table, dtype), start, width, axis=1)
+	return (local(plan.centroid_local_perm, x, mu_loc, jnp.int32),
+	        local(plan.L_table, x, mu_loc, jnp.float64),
+	        local(right_perm, y, nu_loc, jnp.int32),
+	        local(right_wraps, y, nu_loc, jnp.float64))
+
+
+def _parent_conv_tables(plan, right_perm, right_wraps, mu_loc, nu_loc):
+	"""Slice the plan's typed tables for the native parent-load convolution on this rank."""
+	return _parent_conv_tables_local(
+		plan, *_parent_local_tables(plan, right_perm, right_wraps, mu_loc, nu_loc))
+
+
+def parent_projector_kconv(
+	D_l, D_r, *, plan, left_perm, left_L, right_perm, right_L, kgrid,
+	vertex_l=None, vertex_r=None, coupled_mu123: bool = False,
+	pair_kernel=None,
+):
+	"""Z_q(μ, r) for every full-k q from raw-parent pair projectors on one local tile.
+
+	The k-convolution of the ISDF right-hand side on the unfolded zone,
+
+	    P^X_{k,ab}(μ, r) = conj[ Σ_cd U_k[a,c] conj(U_k[b,d]) T_k( D^X_{k̄,cd}(α μ, α r) ) ]
+	    Z_q(μ, r)       = Σ_k Σ_ab conj(P^L_{k,ab}) · φ_ab · P^R_{k+q,π(ab)}
+
+	evaluated as ``FFT_k[Σ_ab conj(IFFT_k P^L) φ IFFT_k P^R]``.  ``D^X`` are
+	built on the plan's raw parent k̄ only; the typed action ``T_k`` (umklapp
+	phase of both endpoints, antiunitary conjugation) is
+	``symmetry_maps.unfold_operator_local`` and the spin action is
+	``symmetry_maps.open_spin_block_coefficient``, both read from ``plan``.
+	The one body behind the r-chunk loop (``_z_q_face_parent``) and the
+	μ-batch loop.  Manual mode: call inside the caller's ``shard_map``.
+
+	Parameters
+	----------
+	D_l, D_r : (n_parent, ns, mu_loc, ns, r_loc) complex128, rank-local
+	    ``D^X_{k̄,cd}(μ, r) = Σ_n w^X_n ψ_{n k̄ c}(r_μ) ψ*_{n k̄ d}(r)`` in
+	    ``plan.k_parent_frac`` order.
+	left_perm : (2·n_sym, mu_loc) int32
+	    Gather offset, inside this local μ extent, of each slot's source
+	    centroid for every action row; ``left_L`` (2·n_sym, mu_loc, 3) its
+	    lattice wrap.  The μ extent must be closed under the rows
+	    ``plan.sym_idx`` selects (r-chunk: the X shard of the packed layout;
+	    μ batch: :func:`gw.centroid_k_unfold.orbit_mu_batches`).
+	right_perm, right_L : (2·n_sym, r_loc), (2·n_sym, r_loc, 3)
+	    The same for the r endpoint (r-chunk: the Y owner of a
+	    ``RealGridOrbitTiles`` tile; μ batch: one ``OrbitRBlocks`` block).
+	kgrid : (nkx, nky, nkz); the full k axis is ``plan.irr_idx`` order, which
+	    must be the C-order grid.
+	vertex_l, vertex_r : (perm, phase) of the Lorentz vertex on the output
+	    spin index (identity for the charge channel).
+	coupled_mu123 : share the left projector across the three current
+	    channels (vertices γ¹, γ², γ³); the vertices are then ignored.
+	pair_kernel : the native fused ``conv_kparent`` callable for this local
+	    shape, or ``None`` for the XLA body.
+
+	Returns
+	-------
+	(nk, mu_loc, r_loc) complex128, or (3, nk, mu_loc, r_loc) when
+	``coupled_mu123``: every q of the full zone, C-order.
+	"""
+	from symmetry_maps import open_spin_block_coefficient, unfold_operator_local
+
+	nkx, nky, nkz = (int(v) for v in kgrid)
+	nk = nkx * nky * nkz
+	ns = int(plan.nspinor)
+	mu_loc = int(D_l.shape[2])
+	r_loc = int(D_l.shape[4])
+	if vertex_l is None:
+		vertex_l = (jnp.arange(ns), jnp.ones(ns))
+	if vertex_r is None:
+		vertex_r = (jnp.arange(ns), jnp.ones(ns))
+	if pair_kernel is not None:
+		tables = _parent_conv_tables_local(plan, left_perm, left_L, right_perm, right_L)
+		if coupled_mu123:
+			vertices = [_gamma_perm_phase_mu(i) for i in (1, 2, 3)]
+			perms = jnp.stack([v[0] for v in vertices])
+			phases = jnp.stack([v[1] for v in vertices])
+			def channel(carry, vertex):
+				return carry, pair_kernel(D_l, D_r, _parent_conv_vertices(tables, vertex, vertex))
+			return jax.lax.scan(channel, 0, (perms, phases))[1]
+		return pair_kernel(D_l, D_r, _parent_conv_vertices(tables, vertex_l, vertex_r))
+
+	irr_idx_np = np.asarray(plan.irr_idx, dtype=np.int32)
+	sym_idx_np = np.asarray(plan.sym_idx, dtype=np.int32)
+	k_parent_np = np.asarray(plan.k_parent_frac, dtype=np.float64)
+	spin_np = np.asarray(plan.spin_action_full, dtype=np.complex128)
+	n_sym_spatial = int(plan.n_sym_spatial)
+	# Skip exact structural zeros in the service-provided spin action.
+	spin_support = np.any(spin_np != 0, axis=0)
+	source_pairs = [np.flatnonzero(
+		(spin_support[a, :, None] & spin_support[b, None, :]).reshape(-1))
+		for a in range(ns) for b in range(ns)]
+	max_sources = max(len(pairs) for pairs in source_pairs)
+	source_counts = np.asarray([len(pairs) for pairs in source_pairs])
+	source_pairs = np.asarray([np.pad(pairs, (0, max_sources - len(pairs)),
+		constant_values=int(pairs[0])) for pairs in source_pairs], dtype=np.int32)
+
+	def unfold_block(D_, coef, sources, source_count):
+		"""One full-k output spin block of P = conj(U D U†)."""
+		def source_spin(acc, slot):
+			pair = sources[slot]
+			c, d = pair // ns, pair % ns
+			block = unfold_operator_local(
+				D_[:, c, :, d, :],
+				irr_idx=irr_idx_np, sym_idx=sym_idx_np,
+				q_irr_frac=k_parent_np,
+				left_local_perm=left_perm, left_L_table=left_L,
+				right_local_perm=right_perm, right_L_table=right_L,
+				n_sym_spatial=n_sym_spatial,
+				left_mesh_axis=None, right_mesh_axis=None)
+			return acc + jnp.where(slot < source_count,
+				coef[:, c, d][:, None, None] * block, 0), None
+
+		acc, _ = jax.lax.scan(source_spin,
+			jnp.zeros((nk, mu_loc, r_loc), dtype=D_.dtype),
+			jnp.arange(max_sources), unroll=1)
+		return jnp.conj(acc)
+
+	coefficients = jnp.stack([
+		open_spin_block_coefficient(spin_np, a, b)
+		for a in range(ns) for b in range(ns)])
+
+	def channel_tail(perm_L, phase_L, perm_R, phase_R):
+		"""Apply fixed vertices to child output indices of the unfolded P_r."""
+		output_pairs = (perm_L[:, None] * ns + perm_R[None, :]).reshape(-1)
+		output_phases = (phase_L[:, None] * phase_R[None, :]).reshape(-1)
+		coefficients_r = coefficients[output_pairs]
+		sources = jnp.asarray(source_pairs)
+		counts = jnp.asarray(source_counts)
+
+		def spin_body(Z_R, pair):
+			coef_l, coef_r, src_l, src_r, count_l, count_r, phase = pair
+			P_l_R = local_ifftn3(
+				unfold_block(D_l, coef_l, src_l, count_l).reshape(
+					nkx, nky, nkz, mu_loc, r_loc),
+				axes=(0, 1, 2), norm='forward')
+			P_r_R = local_ifftn3(
+				unfold_block(D_r, coef_r, src_r, count_r).reshape(
+					nkx, nky, nkz, mu_loc, r_loc),
+				axes=(0, 1, 2), norm='forward')
+			return Z_R + jnp.conj(P_l_R) * (phase * P_r_R), None
+
+		Z_R, _ = jax.lax.scan(
+			spin_body, jnp.zeros(
+				(nkx, nky, nkz, mu_loc, r_loc), dtype=jnp.complex128),
+			(coefficients, coefficients_r, sources, sources[output_pairs],
+			 counts, counts[output_pairs], output_phases), unroll=1)
+		Z_q_3d = local_fftn3(Z_R, axes=(0, 1, 2), norm='forward')
+		return Z_q_3d.reshape(nk, mu_loc, r_loc)
+
+	if coupled_mu123:
+		vertices = [_gamma_perm_phase_mu(mu) for mu in (1, 2, 3)]
+		perms = jnp.stack([vertex[0] for vertex in vertices])
+		phases = jnp.stack([vertex[1] for vertex in vertices])
+		output_pairs = (perms[:, :, None] * ns + perms[:, None, :]).reshape(3, -1)
+		output_phases = (phases[:, :, None] * phases[:, None, :]).reshape(3, -1)
+		sources = jnp.asarray(source_pairs)
+		counts = jnp.asarray(source_counts)
+
+		def spin_channels(acc, pair):
+			"""Share the left child projector across the three current channels."""
+			left = local_ifftn3(unfold_block(
+				D_l, coefficients[pair], sources[pair], counts[pair]).reshape(
+					nkx, nky, nkz, mu_loc, r_loc), axes=(0, 1, 2), norm='forward')
+			def channel(carry, args):
+				"""Accumulate one canonical vertex in its original spin-pair order."""
+				value, target, phase = args
+				right = local_ifftn3(unfold_block(
+					D_r, coefficients[target], sources[target], counts[target]).reshape(
+						nkx, nky, nkz, mu_loc, r_loc), axes=(0, 1, 2), norm='forward')
+				return carry, value + jnp.conj(left) * (phase * right)
+			_, result = jax.lax.scan(channel, 0,
+				(acc, output_pairs[:, pair], output_phases[:, pair]), unroll=1)
+			return result, None
+
+		initial = jnp.zeros((3, nkx, nky, nkz, mu_loc, r_loc), dtype=jnp.complex128)
+		result, _ = jax.lax.scan(spin_channels, initial, jnp.arange(ns * ns), unroll=1)
+		_, channels = jax.lax.scan(lambda carry, value: (carry,
+			local_fftn3(value, axes=(0, 1, 2), norm='forward').reshape(nk, mu_loc, r_loc)),
+			0, result, unroll=1)
+		return channels
+	return channel_tail(*vertex_l, *vertex_r)
 
 
 def _parent_conv_vertices(tables, vertex_l, vertex_r):
@@ -1429,10 +1615,6 @@ def _z_q_face_parent(
 	the result are unchanged.
 	"""
 	from common.wfn_transforms import to_rpoints_inner
-	from ffi import _services
-	_services.ensure_on_path()
-	from symmetry_maps import (
-		open_spin_block_coefficient, unfold_operator_local)
 
 	plan = k_unfold_plan
 	fft_grid = tuple(int(s) for s in psi_G_store.meta.fft_grid)
@@ -1528,25 +1710,9 @@ def _z_q_face_parent(
 	def _slicer_host(x_idx, y_idx, bc_idx):
 		return psi_G_store.read_local_band_chunk(x_idx, y_idx, bc_idx)
 
-	# Plan tables are closure constants (one plan per fit); the tile tables
-	# are runtime operands (one executable for every tile).
-	irr_idx_np = np.asarray(plan.irr_idx, dtype=np.int32)
-	sym_idx_np = np.asarray(plan.sym_idx, dtype=np.int32)
-	k_parent_np = np.asarray(plan.k_parent_frac, dtype=np.float64)
-	left_local_perm_np = np.asarray(plan.centroid_local_perm, dtype=np.int32)
-	left_L_np = np.asarray(plan.L_table, dtype=np.float64)
-	spin_np = np.asarray(plan.spin_action_full, dtype=np.complex128)
-	n_sym_spatial = int(plan.n_sym_spatial)
-	# Skip exact structural zeros in the service-provided spin action.
-	spin_support = np.any(spin_np != 0, axis=0)
-	source_pairs = [np.flatnonzero(
-		(spin_support[a, :, None] & spin_support[b, None, :]).reshape(-1))
-		for a in range(ns) for b in range(ns)]
-	max_sources = max(len(pairs) for pairs in source_pairs)
-	source_counts = np.asarray([len(pairs) for pairs in source_pairs])
-	source_pairs = np.asarray([np.pad(pairs, (0, max_sources - len(pairs)),
-		constant_values=int(pairs[0])) for pairs in source_pairs], dtype=np.int32)
-
+	# Plan tables are closure constants (one plan per fit, read by
+	# ``parent_projector_kconv``); the tile tables are runtime operands (one
+	# executable for every tile).
 	from common.wfn_layout import psi_specs
 	_, mun_spec = psi_specs(layout)
 	pair_spec = P(None, None, 'x', None, 'y')
@@ -1684,101 +1850,13 @@ def _z_q_face_parent(
 		                   (P(None), P(None))),
 		         out_specs=out_spec, check_vma=False)
 		def _tile_tail(D_l_, D_r_, local_perm_r_, wraps_r_, vertex_l, vertex_r):
-			if pair_kernel is not None:
-				tables = _parent_conv_tables(plan, local_perm_r_, wraps_r_, mu_loc, r_loc)
-				if coupled_mu123:
-					vertices = [_gamma_perm_phase_mu(i) for i in (1, 2, 3)]
-					perms = jnp.stack([v[0] for v in vertices])
-					phases = jnp.stack([v[1] for v in vertices])
-					def channel(carry, vertex):
-						return carry, pair_kernel(D_l_, D_r_, _parent_conv_vertices(tables, vertex, vertex))
-					return jax.lax.scan(channel, 0, (perms, phases))[1]
-				return pair_kernel(D_l_, D_r_, _parent_conv_vertices(tables, vertex_l, vertex_r))
-			def unfold_block(D_, coef, sources, source_count):
-				"""One full-k output spin block of P = conj(U D U†)."""
-				def source_spin(acc, slot):
-					pair = sources[slot]
-					c, d = pair // ns, pair % ns
-					block = unfold_operator_local(
-						D_[:, c, :, d, :],
-						irr_idx=irr_idx_np, sym_idx=sym_idx_np,
-						q_irr_frac=k_parent_np,
-						left_local_perm=left_local_perm_np,
-						left_L_table=left_L_np,
-						right_local_perm=local_perm_r_,
-						right_L_table=wraps_r_, n_sym_spatial=n_sym_spatial)
-					return acc + jnp.where(slot < source_count,
-						coef[:, c, d][:, None, None] * block, 0), None
-
-				acc, _ = jax.lax.scan(source_spin,
-					jnp.zeros((nk, mu_loc, r_loc), dtype=D_.dtype),
-					jnp.arange(max_sources), unroll=1)
-				return jnp.conj(acc)
-
-			coefficients = jnp.stack([
-				open_spin_block_coefficient(spin_np, a, b)
-				for a in range(ns) for b in range(ns)])
-
-			def channel_tail(perm_L, phase_L, perm_R, phase_R):
-				"""Apply fixed vertices to child output indices of the unfolded P_r."""
-				output_pairs = (perm_L[:, None] * ns + perm_R[None, :]).reshape(-1)
-				output_phases = (phase_L[:, None] * phase_R[None, :]).reshape(-1)
-				coefficients_r = coefficients[output_pairs]
-				sources = jnp.asarray(source_pairs)
-				counts = jnp.asarray(source_counts)
-
-				def spin_body(Z_R, pair):
-					coef_l, coef_r, src_l, src_r, count_l, count_r, phase = pair
-					P_l_R = local_ifftn3(
-						unfold_block(D_l_, coef_l, src_l, count_l).reshape(
-							nkx, nky, nkz, mu_loc, r_loc),
-						axes=(0, 1, 2), norm='forward')
-					P_r_R = local_ifftn3(
-						unfold_block(D_r_, coef_r, src_r, count_r).reshape(
-							nkx, nky, nkz, mu_loc, r_loc),
-						axes=(0, 1, 2), norm='forward')
-					return Z_R + jnp.conj(P_l_R) * (phase * P_r_R), None
-
-				Z_R, _ = jax.lax.scan(
-					spin_body, jnp.zeros(
-						(nkx, nky, nkz, mu_loc, r_loc), dtype=jnp.complex128),
-					(coefficients, coefficients_r, sources, sources[output_pairs],
-					 counts, counts[output_pairs], output_phases), unroll=1)
-				Z_q_3d = local_fftn3(Z_R, axes=(0, 1, 2), norm='forward')
-				return Z_q_3d.reshape(nk, mu_loc, r_loc)
-
-			if coupled_mu123:
-				vertices = [_gamma_perm_phase_mu(mu) for mu in (1, 2, 3)]
-				perms = jnp.stack([vertex[0] for vertex in vertices])
-				phases = jnp.stack([vertex[1] for vertex in vertices])
-				output_pairs = (perms[:, :, None] * ns + perms[:, None, :]).reshape(3, -1)
-				output_phases = (phases[:, :, None] * phases[:, None, :]).reshape(3, -1)
-				sources = jnp.asarray(source_pairs)
-				counts = jnp.asarray(source_counts)
-
-				def spin_channels(acc, pair):
-					"""Share the left child projector across the three current channels."""
-					left = local_ifftn3(unfold_block(
-						D_l_, coefficients[pair], sources[pair], counts[pair]).reshape(
-							nkx, nky, nkz, mu_loc, r_loc), axes=(0, 1, 2), norm='forward')
-					def channel(carry, args):
-						"""Accumulate one canonical vertex in its original spin-pair order."""
-						value, target, phase = args
-						right = local_ifftn3(unfold_block(
-							D_r_, coefficients[target], sources[target], counts[target]).reshape(
-								nkx, nky, nkz, mu_loc, r_loc), axes=(0, 1, 2), norm='forward')
-						return carry, value + jnp.conj(left) * (phase * right)
-					_, result = jax.lax.scan(channel, 0,
-						(acc, output_pairs[:, pair], output_phases[:, pair]), unroll=1)
-					return result, None
-
-				initial = jnp.zeros((3, nkx, nky, nkz, mu_loc, r_loc), dtype=jnp.complex128)
-				result, _ = jax.lax.scan(spin_channels, initial, jnp.arange(ns * ns), unroll=1)
-				_, channels = jax.lax.scan(lambda carry, value: (carry,
-					local_fftn3(value, axes=(0, 1, 2), norm='forward').reshape(nk, mu_loc, r_loc)),
-					0, result, unroll=1)
-				return channels
-			return channel_tail(*vertex_l, *vertex_r)
+			left_perm, left_L, right_perm, right_L = _parent_local_tables(
+				plan, local_perm_r_, wraps_r_, mu_loc, r_loc)
+			return parent_projector_kconv(
+				D_l_, D_r_, plan=plan, left_perm=left_perm, left_L=left_L,
+				right_perm=right_perm, right_L=right_L, kgrid=kgrid,
+				vertex_l=vertex_l, vertex_r=vertex_r,
+				coupled_mu123=coupled_mu123, pair_kernel=pair_kernel)
 
 		@jax.jit
 		def fn(psi_mun_, w_l_, w_r_, r_index_, local_perm_r_, wraps_r_,
