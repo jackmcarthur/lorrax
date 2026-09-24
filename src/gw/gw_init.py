@@ -3219,6 +3219,13 @@ def _prepare_fresh_isdf(
             get_enk_bandrange, mesh_xy, meta, print0, resolve_restart_q_storage_for_run,
             restart_tensor_writes_enabled, sigma_parent_carrier, sym, take_pre_unfold,
             tensors_filename, transverse_wfn_data, wfn, wfns_transverse, write_restart_state_to_h5)
+        if hasattr(zeta_path, 'contract_v') and jax.process_index() == 0:
+            # Route G's stage split through V_q (read, faces, C, fit, V_q),
+            # a receipt kept by the production report.
+            V_qmunu.block_until_ready()
+            _rows = []
+            timing.report(print_fn=_rows.append, title="", max_depth=3)
+            print0("  μ-batch timing through V_q (rank 0, s):\n" + "\n".join(_rows))
     V_qmunu.block_until_ready()
     print0("  Chunked ISDF path complete")
     return (V_qmunu, wfns, wfns_transverse, sigma_parent_carrier, green_parent_carrier, basis_T, head_channel, photon_g0_vectors, basis_wfn_fingerprint_binding, charge_basis_receipt, transverse_basis_receipt, charge_zeta_identity_receipt)
