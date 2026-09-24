@@ -182,10 +182,13 @@ def _direct_kernel_gate(mesh: Mesh) -> tuple[int, int, int, int, int]:
     cells = np.ravel_multi_index(
         tuple((g_child_box[:, axis] % grid[axis]) for axis in range(3)),
         grid)
-    expected_box = np.full(np.prod(grid), ng, dtype=np.int32)
-    expected_box[cells] = np.arange(ng_valid, dtype=np.int32)
+    # The per-k sphere index (loader tables, d7a8444e): the flat box cell of
+    # each physical slot, n_rtot + g on a pad slot.
+    n_rtot = int(np.prod(grid))
+    expected_box = n_rtot + np.arange(ng, dtype=np.int32)
+    expected_box[:ng_valid] = cells
     _assert_local_equal(
-        box, expected_box.reshape((1, *grid)),
+        box, expected_box.reshape((1, ng)),
         label="one-child FFT index")
 
     umklapp_host = np.asarray([1, -2, 0], dtype=np.int32)
