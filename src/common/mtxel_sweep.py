@@ -63,6 +63,13 @@ medians, band-split → G-split (``runs/runtime/mtxel_sweep_20260923``
 a10/a14): V_H 2.963 → 2.480 s, kinetic 0.675 → 0.144 s, dipole p
 0.900 → 0.275 s; executables 12.78 → 12.78, 9.93 → 9.74, 10.27 → 9.88 GiB;
 blocks equal to 1.4e-14 relative.  V_H gains least: its wall is the FFTs.
+At P16 over OFI (A100-40GB, old and new on the same pool, legs a20/a21):
+V_H 1.599 → 1.220 s, kinetic 0.860 → 0.232 s, dipole p 0.919 → 0.302 s;
+executables 4.126 → 4.126, 2.895 → 2.739, 3.055 → 2.778 GiB.  Per k and
+rank the HLO moves 212.5 → 35.4 MiB (V_H), 968.8 → 105.0 (kin_ion's
+T+V_loc+V_NL), 616.3 → 63.5 (dipole).  In the drivers at 360 bands:
+kin_ion "T + ionic matrix" 10.25 → 7.14 s, dipole "q=0 velocity" 13.97 →
+8.12 s; written artifacts equal to 5.1e-13 relative.
 
 WHERE THE CROSSOVER IS.  The one non-``1/P`` transient is the tile's
 ``(K, c, nb, nb)`` partial.  The G split beats the band split in both bytes
@@ -1364,9 +1371,11 @@ def plan_sweep(geom: SweepGeometry, operator) -> SweepPlan:
     per-peer all-to-all block, ``K·(nb/P)·ns·g_carrier·16 / P``, reaches
     :data:`A2A_BANDWIDTH_BLOCK_BYTES`, never more than the largest divisor
     whose step fits in this rank's resident ψ sphere (the density scan's
-    memory rule), and ``K = 1`` at ``nk = 1``.  At every shape measured so
-    far that is ``K = 1``; the packed regime (small per-k slabs at large
-    P) is where the rule would first choose ``K > 1``.
+    memory rule), and ``K = 1`` at ``nk = 1``.  Measured at P16 over OFI
+    (legs a22/a24): at the production window (1.2 MB per-peer blocks) the
+    rule picks K = 1 and K = 2 would be ~4% faster for ~2% more executable
+    memory; in a 16-band window (145 KB blocks) it picks K = 8, 12–18%
+    faster than K = 1.
 
     One k of a step holds, per rank: ψ and its G-split copy, the operator's
     ket in band layout and in G-split layout (``c = max(ncomp, 1)``
