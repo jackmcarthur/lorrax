@@ -13,6 +13,11 @@ must resolve to ``mathdx`` on this mesh (asserted, TASTE 30).
    rolled by one parent k.
 3. ``test_isdf_parent_conv.gpu_main``: random parents, ns = 1/2/4, both
    layouts, against literal direct k sums, with its own rolled-map red twin.
+3b. ``make_fused_conv_kplane`` (mode 6, the route-G plane door) at the
+   production operand layout D (nk, g, ns, 2c, ns, p) with its Bloch phase:
+   BITWISE equal to the chain it replaced (XLA phase + moveaxis + L/R split,
+   then the parent door on the identity plan), and 1e-12 of the dense sum.
+   Red twin: the phase rolled by one k.
 4. The stored-kernel doors (modes 2-5) against NumPy ``np.fft`` on sharded
    operands, including an odd grid and 8x8x8: ``make_kconv_klead`` (Σ/COHSEX,
    prep + apply), ``make_kconv_kminor`` (BSE rung, both store layouts),
@@ -177,6 +182,73 @@ def face_parent_case(mesh, rng):
                 mathdx_vs_plan=_rel(C_mathdx, C_plan), red_rolled_k=_rel(C_red, C_plan))
 
 
+def _xla_cmul_form(rng):
+    """Which FMA spelling XLA:GPU uses for an HLO complex multiply (diagnostic).
+
+    Mode 6 forms F·D itself and must round like the XLA multiply it replaced;
+    the candidate spellings are compared exactly (Fraction arithmetic).
+    """
+    from fractions import Fraction as Q
+    a = _crand(rng, 4096)
+    b = _crand(rng, 4096)
+    got = np.asarray(jax.device_get(jax.jit(lambda x, y: x * y)(jnp.asarray(a), jnp.asarray(b))))
+    fma = lambda x, y, z: float(Q(x) * Q(y) + Q(z))
+    forms = {
+        "fma(ac,-bd)/fma(ad,bc)": lambda x, y: (fma(x.real, y.real, -(x.imag * y.imag)),
+                                                 fma(x.real, y.imag, x.imag * y.real)),
+        "fma(-bd,ac)/fma(bc,ad)": lambda x, y: (fma(-x.imag, y.imag, x.real * y.real),
+                                                 fma(x.imag, y.real, x.real * y.imag)),
+        "no-fma": lambda x, y: (x.real * y.real - x.imag * y.imag,
+                                x.real * y.imag + x.imag * y.real),
+    }
+    hits = {}
+    for name, f in forms.items():
+        ref = np.asarray([complex(*f(x, y)) for x, y in zip(a, b)])
+        hits[name] = int(np.sum((ref.real == got.real) & (ref.imag == got.imag)))
+    return hits
+
+
+def plane_case(mesh, rng):
+    """Mode 6 vs the old route-G chain (bitwise) and the dense k sum; g sharded over ranks."""
+    from ffi import fft as F
+    from functools import partial
+    from common.shard_map import shard_map
+    from test_kconv_plane import _identity_tables, _literal
+    kg, ns, g, c, p = (4, 2, 1), 2, 8, 3, 50
+    nk = int(np.prod(kg))
+    D = _crand(rng, nk, g, ns, 2 * c, ns, p)
+    kfrac = np.stack(np.unravel_index(np.arange(nk), kg), 1) / np.asarray(kg, float)
+    xg = rng.uniform(size=(g, p, 3))
+    Fb = np.exp(-2j * np.pi * np.einsum("kd,gpd->kgp", kfrac, xg)) / np.sqrt(80.0)
+    sd = NamedSharding(mesh, P(None, XY, None, None, None, None))
+    sf = NamedSharding(mesh, P(None, XY, None))
+    su = P(None, None, XY)
+    perm, phase = np.arange(ns), np.ones(ns)
+    door = F.make_fused_conv_kplane(mesh, kg, ns, perm_l=perm, phase_l=phase,
+                                    perm_r=perm, phase_r=phase)
+    parent = F.make_fused_conv_kparent(mesh, kg, ns, None, perm_l=perm, phase_l=phase,
+                                       perm_r=perm, phase_r=phase)
+    run_new = jax.jit(shard_map(door, mesh=mesh, in_specs=(sd.spec, sf.spec),
+                                out_specs=su, check_vma=False))
+
+    @partial(shard_map, mesh=mesh, in_specs=(sd.spec, sf.spec), out_specs=su, check_vma=False)
+    def run_old(d, f):
+        gl = d.shape[1]
+        x = d * f[:, :, None, None, None, :]
+        Dk = jnp.moveaxis(x, 1, 4).reshape(nk, ns, 2 * c, ns, gl * p)
+        return parent(Dk[:, :, :c], Dk[:, :, c:], _identity_tables(nk, ns, c, gl * p, kg))
+    Dd, Fd = _put(D, sd), _put(Fb, sf)
+    U = _host(run_new(Dd, Fd))
+    U_old = _host(jax.jit(run_old)(Dd, Fd))
+    U_red = _host(run_new(Dd, _put(np.roll(Fb, 1, axis=0), sf)))
+    ref = _literal(D, Fb, ns, c, perm, phase, kg)
+    return dict(case="kconv_plane", kgrid=list(kg), ns=ns, g=g, c=c, p=p,
+                bitwise_vs_old_chain=int(np.array_equal(U, U_old)),
+                max_abs_vs_old_chain=float(np.max(np.abs(U - U_old))),
+                ref_mathdx_vs_dense=_rel(U, ref), red_rolled_phase=_rel(U_red, ref),
+                xla_cmul_form=_xla_cmul_form(rng))
+
+
 def _np3(x, kg, axis0, kind, norm):
     """np.fft over three consecutive k axes starting at axis0 of the reshaped array."""
     f = np.fft.ifftn if kind == "ifftn" else np.fft.fftn
@@ -260,7 +332,8 @@ def main() -> int:
     import json
     mesh = Mesh(np.asarray(jax.devices()).reshape(2, 2), XY)
     rng = np.random.default_rng(20260924)
-    recs = [downfold_case(mesh, rng), face_parent_case(mesh, rng)] + stored_cases(mesh, rng)
+    recs = ([downfold_case(mesh, rng), face_parent_case(mesh, rng), plane_case(mesh, rng)]
+            + stored_cases(mesh, rng))
     bad = []
     for r in recs:
         for k, v in r.items():
@@ -270,6 +343,8 @@ def main() -> int:
                 bad.append(f"{r['case']}.{k}={v:.2e} > {lim}")
             if k.startswith("red_") and not v > RED:
                 bad.append(f"{r['case']}.{k}={v:.2e} <= {RED} (red twin did not fire)")
+            if k.startswith("bitwise_") and v != 1:
+                bad.append(f"{r['case']}.{k}: not bitwise ({r.get('max_abs_vs_old_chain')})")
         if jax.process_index() == 0:
             print(TAG, json.dumps(r), flush=True)
     import test_isdf_parent_conv as tpc

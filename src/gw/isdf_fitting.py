@@ -336,14 +336,13 @@ def _fit_mubatch(
     q_axis = padded_axis(Q, P_, name="μ-batch stored q rows")
     g_axis = padded_axis(ngkmax, int(plan.g_tile), name="μ-batch ζ-sphere G tiles")
     zt = zmb.zeta_plane_tables(gvec_components, ngk_per_q, fft_grid, axis, g_axis)
-    plan_id = zmb.identity_kplan(kv, centroid_indices, fft_grid, mesh_xy, ns)
     # μ-owned rows: rank p owns slots p·c + [0, c) of every batch, whole
     # orbits per owner (the owner unfolds its own pair projectors).
     mb = zmb.best_owner_orbit_batches(k_unfold_plan, mu_pad, P_,
                                       c_max=max(1, int(plan.b) // P_))
     b = int(mb.b)
     kernel = zmb.make_route_g_kernel(
-        mesh=mesh_xy, plan_id=plan_id, kgrid=kgrid, fft_grid=fft_grid, ns=ns, b=b,
+        mesh=mesh_xy, kgrid=kgrid, fft_grid=fft_grid, ns=ns, b=b,
         q_sel=q_irr_full_idx, q_axis=q_axis, q_neg=q_neg_idx, qvec_frac=q_frac,
         n_col=int(cyl[0].shape[1]), n_s=int(cyl[0].shape[2]),
         n_pg=int(plan.r_sub), axis=axis, n_src=n_par)
@@ -352,7 +351,7 @@ def _fit_mubatch(
         # Debug split timers: the same kernel truncated after each stage.
         for stage in ('x', 'gemm', 'a2a', 'planes', 'kconv'):
             split_kernels[stage] = zmb.make_route_g_kernel(
-                mesh=mesh_xy, plan_id=plan_id, kgrid=kgrid, fft_grid=fft_grid,
+                mesh=mesh_xy, kgrid=kgrid, fft_grid=fft_grid,
                 ns=ns, b=b, q_sel=q_irr_full_idx, q_axis=q_axis, q_neg=q_neg_idx,
                 qvec_frac=q_frac, n_col=int(cyl[0].shape[1]),
                 n_s=int(cyl[0].shape[2]), n_pg=int(plan.r_sub), axis=axis,

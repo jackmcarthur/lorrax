@@ -83,6 +83,8 @@ variable (decisions.md 2026-09-24, QUALITY #8):
     ------------------------  -------------  ----------------------------------------
     make_fused_conv_kpair     3-D leading    ISDF CCT/ZCT post-pair convolution
     make_fused_conv_kparent   parent tables  the same with the typed parent load
+    make_fused_conv_kplane    route-G planes the same read from the D-plane FFT output,
+                                             Bloch phase and L/R split applied on load
     make_kconv_klead          flat leading   Σ / COHSEX  fftn(ifftn(T)·ifftn(W))
     make_kconv_kminor         trailing       BSE rung    fftn(ifftn(X)·K_R)
     make_kfft_klead / _local  flat leading   one transform
@@ -145,7 +147,8 @@ __all__ = [
     "KFFT_KLEAD_TARGET", "KCONV_KMINOR_TARGET", "KFFT_KMINOR_TARGET",
     "KCONV_TARGETS", "KCONV_AXIS_MAX",
     "kconv_backend", "require_kconv", "mathdx_root", "cubin_cache_dir", "conv_kpair_scale",
-    "make_fused_conv_kpair", "make_fused_conv_kparent",
+    "make_fused_conv_kpair", "make_fused_conv_kparent", "make_fused_conv_kplane",
+    "KCONV_PLANE_TARGET",
     "KConvStored", "make_kconv_klead", "make_kconv_kminor", "kconv_kminor_out_shape",
     "make_kfft_klead", "make_kfft_kminor",
     "make_local_kfft_klead", "make_local_kfft_kminor", "make_local_kconv_kminor",
@@ -160,12 +163,13 @@ GW_CONV_TARGET = "lorrax_mklfft_gw_conv"
 #: The NVIDIA k-convolution family on nvidia-mathdx (the router's CUDA leg).
 KCONV_PAIR_TARGET = "lorrax_mathdx_kconv_pair"
 KCONV_PARENT_TARGET = "lorrax_mathdx_kconv_parent"
+KCONV_PLANE_TARGET = "lorrax_mathdx_kconv_plane"
 KCONV_KLEAD_TARGET = "lorrax_mathdx_kconv_klead"
 KFFT_KLEAD_TARGET = "lorrax_mathdx_kfft_klead"
 KCONV_KMINOR_TARGET = "lorrax_mathdx_kconv_kminor"
 KFFT_KMINOR_TARGET = "lorrax_mathdx_kfft_kminor"
 #: Every mathdx target; ``require_kconv`` checks them all at startup.
-KCONV_TARGETS = (KCONV_PAIR_TARGET, KCONV_PARENT_TARGET, KCONV_KLEAD_TARGET,
+KCONV_TARGETS = (KCONV_PAIR_TARGET, KCONV_PARENT_TARGET, KCONV_PLANE_TARGET, KCONV_KLEAD_TARGET,
                  KFFT_KLEAD_TARGET, KCONV_KMINOR_TARGET, KFFT_KMINOR_TARGET)
 
 #: The ``LORRAX_FFT_FFI`` dial.  Default ON — the FFI layer is REQUIRED
@@ -730,6 +734,61 @@ def make_fused_conv_kparent(mesh, kgrid, ns, trailing_shape, *,
 
     _require_plan_route()
     return _plan_kparent(kgrid, ns, perm_l, phase_l, perm_r, phase_r, scale)
+
+
+def make_fused_conv_kplane(mesh, kgrid, ns, *, perm_l, phase_l, perm_r, phase_r) -> Callable:
+    """The route-G pair convolution ``fn(D, F) -> U`` read from the D-plane FFT output.
+
+    ``D`` ``(nk, g, ns, 2c, ns, p)`` c128 is the plane transform exactly as
+    ``isdf.zeta_mubatch`` leaves it (``g`` planes of ``p`` points; slots
+    ``[0, c)`` of the ``2c`` axis are the L projector, ``[c, 2c)`` the R one),
+    ``F`` ``(nk, g, p)`` its Bloch phase; ``U`` ``(nk, c, g·p)``::
+
+        P^X_{k,ab}(m, (g,p)) = conj(F[k,g,p] · D[k,g,a,X+m,b,p])      X = 0 | c
+        U = s·FFT_k Σ_ab phase_l[a]·phase_r[b]·conj(IFFT_k P^L_ab)·IFFT_k P^R_{π_l a, π_r b}
+
+    — :func:`make_fused_conv_kparent` on the identity plan, without the
+    transposed, phased and split copy of ``D`` that its operand layout needs.
+    CUDA: nvidia-mathdx mode 6 (the phase and the split are applied on load);
+    cpu: the plan route on the same composition.  ``s`` is the forward-norm
+    pair scale of the parent door.
+    """
+    ns = int(ns)
+    nkx, nky, nkz = (int(v) for v in kgrid)
+    nk = nkx * nky * nkz
+    scale = conv_kpair_scale("forward", nk, 1.0)
+    if kconv_backend(mesh) == "mathdx":
+        _require_target(KCONV_PLANE_TARGET, "CUDA")
+        attrs = _mathdx_attrs(kgrid, ns, perm_l, phase_l, perm_r, phase_r, scale)
+
+        def _mathdx(D, F):
+            c = _check_plane_operands(D, F, nk, ns)
+            out = jax.ShapeDtypeStruct((nk, c, D.shape[1] * D.shape[5]), D.dtype)
+            return jax.ffi.ffi_call(KCONV_PLANE_TARGET, out)(D, F, **attrs)
+        return _mathdx
+
+    _require_plan_route()
+    pl, pr = _check_perm(perm_l, ns, "left"), _check_perm(perm_r, ns, "right")
+    phl = np.asarray(phase_l, np.complex128).reshape(-1)
+    phr = np.asarray(phase_r, np.complex128).reshape(-1)
+
+    def _plan(D, F):
+        c = _check_plane_operands(D, F, nk, ns)
+        X = jnp.moveaxis(D * F[:, :, None, None, None, :], 1, 4)    # (k, a, 2c, b, g, p)
+        X = jnp.conj(jnp.moveaxis(X.reshape(nk, ns, 2 * c, ns, -1), 3, 4))
+        return _plan_pair_tail(X[:, :, :c], X[:, :, c:], kgrid, pl, phl, pr, phr, scale)
+    return _plan
+
+
+def _check_plane_operands(D, F, nk: int, ns: int) -> int:
+    """Shape/dtype contract of :func:`make_fused_conv_kplane`; returns ``c``."""
+    if (D.ndim != 6 or F.ndim != 3 or D.dtype != jnp.complex128 or F.dtype != jnp.complex128
+            or int(D.shape[0]) != nk or int(D.shape[2]) != ns or int(D.shape[4]) != ns
+            or int(D.shape[3]) % 2 or tuple(F.shape) != (nk, D.shape[1], D.shape[5])):
+        raise ValueError(
+            f"k-conv plane expects c128 D (nk={nk}, g, ns={ns}, 2c, ns, p) and F (nk, g, p); "
+            f"got {D.shape} {D.dtype} / {F.shape} {F.dtype}")
+    return int(D.shape[3]) // 2
 
 
 def _plan_kpair(kgrid, ns, perm_l, phase_l, perm_r, phase_r, scale) -> Callable:
