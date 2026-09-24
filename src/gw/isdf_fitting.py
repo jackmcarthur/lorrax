@@ -236,8 +236,7 @@ def _fit_mubatch(
     layout, weight_l_face, weight_r_face, L_q, lu_piv, q_chunk_size,
     solver_kind, zeta_gather, distrib_la_batched_route, n_rmu_solve,
     q_irr_full_idx, q_neg_idx, q_frac, sphere_idx, ngk_per_q, zeta_io,
-    mu_basis, output_file, gvec_components, q_full_frac, bvec, scratch_dir,
-    print_fn,
+    mu_basis, output_file, gvec_components, scratch_dir, print_fn,
 ):
     """The μ-batch charge fit: Z_q(G) by batches, C⁺ once on the sphere.
 
@@ -449,15 +448,12 @@ def _fit_mubatch(
     print_fn(_host_mem("pre-V_q (Z store full)"))
 
     # ---- ζ = C⁺ Z, held lazily; written only for a file consumer --------
-    shell_slots, shell_gvec = zmb.zeta_shell_slots(
-        gvec_components, ngk_per_q, q_frac, bvec, q_full_frac, fft_grid)
     zeta_g = zmb.ZetaG(
         store, mesh=mesh_xy, L_q=L_q, lu_piv=lu_piv, q_chunk_size=q_chunk_size,
         solver_kind=solver_kind, zeta_gather=zeta_gather,
         batched_route=distrib_la_batched_route, n_rmu_solve=n_rmu_solve,
         n_rmu=int(meta.n_rmu), mu_basis=mu_basis, ngk_per_q=ngk_per_q,
-        gvec_components=gvec_components, shell_slots=shell_slots,
-        shell_gvec=shell_gvec, path=output_file, print_fn=print_fn)
+        gvec_components=gvec_components, path=output_file, print_fn=print_fn)
     print_fn(f"  μ-batch timing: {n_run} batches {t_batch:.2f}s (store write "
              f"{store.t_write:.2f}s, {store.placement}, overlapped with the next "
              "batch)")
@@ -465,6 +461,7 @@ def _fit_mubatch(
         t_w = time.perf_counter()
         with timing.section("zeta_fit.mubatch.write_zeta"):
             zeta_g.contract_v(np.zeros((Q, ngkmax), np.complex128),
+                              keep=np.zeros((Q, 1), np.int32),
                               zeta_io=zeta_io, print_fn=print_fn)
         print_fn(f"  μ-batch ζ file written in {time.perf_counter() - t_w:.2f}s")
     print_fn(store.receipt())
@@ -1310,8 +1307,6 @@ def fit_zeta_to_h5(
             sphere_idx=_gflat_sphere_idx_padded, ngk_per_q=_gflat_ngk_per_q,
             zeta_io=zeta_io, mu_basis=mu_basis, output_file=output_file,
             gvec_components=_gflat_gvec_components,
-            q_full_frac=bgw_integer_q_to_fractional(sym.kvecs_asints, meta.kgrid),
-            bvec=_bvec_for_sphere,
             scratch_dir=os.path.dirname(os.path.abspath(output_file)),
             print_fn=print_fn)
         _trunc = active_zeta_truncating_knobs()

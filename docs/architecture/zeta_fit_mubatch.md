@@ -63,7 +63,7 @@ for each μ batch B (b centroids, b a multiple of P, serial):
         gather the ζ slots → rows Z_q(μ_B, G), μ-owned
     write the rows into the Z store (asynchronous; batch β+1 computes meanwhile)
 after all batches:  stream the store by G tiles:  ζ_t = C⁺ Z_t (isdf.cplus),
-                    V_q += conj(ζ_t) diag(v_q) ζ_tᵀ,  keep the G≈0 shell;
+                    V_q += conj(ζ_t) diag(v_q) ζ_tᵀ,  keep the head columns;
                     write ζ_t only when a consumer needs the file
 ```
 
@@ -153,8 +153,8 @@ The fit returns `ZetaG`, a lazy ζ over the store (`zeta_layout =
 | consumer | needs ζ on disk? | handled by |
 |---|---|---|
 | scalar V_q (`v_q_g_flat._compute_V_q_g_flat_one_tile`) | no | `ZetaG.contract_v`: streamed ζ-first V_q |
-| g0 one-leg unfold (non-IBZ) | the G≈0 shell | `ZetaG.shell` (`|q+G| ≤ max|q_full|`, pads at the FFT-box sentinel) |
-| head channel (`compute_head_channel_zeta`) | a few G columns | `ZetaG.head_columns(sel)` from the shell |
+| g0 and the IBZ one-leg unfold | the head columns | `ZetaG.shell`: ζ at `contract_v(…, keep=)`, the union the V_q consumer names (`v_q_g_flat._head_shell`: slot 0, the one-leg sources, `head_slot_table.sel`) |
+| head channel (`compute_head_channel_zeta`) | a few G columns | `ZetaG.head_columns(sel)` from the shell; a slot not kept refuses (`GATE zeta-mubatch-shell`) |
 | `write_restart_tensors = true`, restart | yes | the same streamed tiles are written (`contract_v(…, zeta_io=…)`) |
 | bispinor / transverse V_q, BSE `vq_interp`, downfold, exciton bands | yes | the file is written; consumers open `ZetaG.path` |
 
@@ -166,7 +166,7 @@ the upgrade path).  The finalize solve tier follows `zeta_auto_tier`:
 q-local (each G tile read onto q owners) or replicated.  The distributed
 tier refuses (`GATE zeta-mubatch-tier`): route G applies the factor B
 with C⁺ = B·Bᴴ, and the distributed 2D factor application for μ ~ 1e5
-supercells is future work.  Each finish (V, the G≈0 shell, a ζ tile for
+supercells is future work.  Each finish (V, the head columns, a ζ tile for
 the file) leaves the q-local or G-split accumulator in ONE explicit
 collective (`_to_mu_owner`: an all-to-all, or a reduce-scatter of the
 partial sums), so SPMD never replicates V.  Nq = Nk = 1

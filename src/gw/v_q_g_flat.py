@@ -501,29 +501,70 @@ def _make_read_q_tile(zeta_loader, n_rmu_padded: int, mesh_xy: Mesh):
     return read_q_tile
 
 
-def _one_leg_columns(gvec_components, *, sym, sym_idx, q_irr_frac, kgrid):
-    """``(n_q_ibz, n_sub)`` parent-sphere slots the IBZ one-leg unfold reads.
+def _one_leg_columns(gvec_components, *, sym, sym_idx, q_irr_frac, kgrid,
+                     fft_grid):
+    """``(cols, gvec)``: the parent-sphere slots the IBZ one-leg unfold reads.
 
     ``symmetry_maps.isdf_one_leg_source_slots`` names the slot of every full
     q's literal-G=0 coefficient; a parent keeps the distinct slots of its
-    star, padded to a common ``n_sub`` with the lowest slots the star does
-    not use.  Those are genuine sphere columns whose G the star does not
-    need, so on the sub-sphere the service finds every needed G exactly once
-    and gathers the same coefficients it would from the whole sphere.
+    star, padded to a common ``n_sub`` by repeating its first slot.  A pad's
+    ``gvec`` is the FFT-box pad sentinel, never a sphere G, so the service's
+    exact-G search finds every needed G exactly once and never reads a pad.
+    The columns named are therefore exactly the columns read, which is what
+    route G's shell keeps (:func:`_head_shell`).  (``(n_q, n_sub)`` int32,
+    ``(n_q, 3, n_sub)`` int32.)
     """
     from symmetry_maps import isdf_one_leg_source_slots
+    from common.gvec_fft_box import fft_box_pad_sentinel
     slots = isdf_one_leg_source_slots(
         gvec_components, sym=sym, sym_idx=sym_idx,
         q_irr_frac=q_irr_frac, kgrid=kgrid)
     parent = np.asarray(sym.irr_idx_q, dtype=np.int32)
-    n_q, _, n_G = (int(s) for s in np.shape(gvec_components))
+    gvec = np.asarray(gvec_components, dtype=np.int32)
+    n_q = int(gvec.shape[0])
     need = [np.unique(slots[parent == p]) for p in range(n_q)]
     n_sub = max(1, max(len(cols) for cols in need))
-    out = np.empty((n_q, n_sub), dtype=np.int32)
-    for p, cols in enumerate(need):
-        filler = np.setdiff1d(np.arange(n_G, dtype=np.int32), cols)
-        out[p] = np.concatenate([cols, filler[:n_sub - len(cols)]])
+    sentinel = np.asarray(fft_box_pad_sentinel(tuple(fft_grid))[0], np.int32)
+    cols = np.zeros((n_q, n_sub), dtype=np.int32)
+    g_sub = np.broadcast_to(sentinel[None, :, None], (n_q, 3, n_sub)).copy()
+    for p, c in enumerate(need):
+        cols[p] = c[0]
+        cols[p, :len(c)] = c
+        g_sub[p][:, :len(c)] = gvec[p][:, c]
+    return cols, g_sub
+
+
+def _head_shell(n_q, *slot_lists):
+    """Route G's kept columns: per stored q, the slots its head consumers read.
+
+    Slot 0 first (the full-zone g0 reads ``shell[..., 0]``), then every other
+    slot named by ``slot_lists`` — the one-leg sources
+    (:func:`_one_leg_columns`) and the head channel's argmin |q+G| set
+    (``vcoul.head_slot_table(...).sel``); ``None`` entries are skipped.
+    Padded by repeating slot 0.  ``(n_q, n_shell)`` int32.
+    """
+    need = [np.unique(np.concatenate(
+        [np.zeros(1, np.int32)]
+        + [np.asarray(l[q], np.int32).ravel() for l in slot_lists
+           if l is not None])) for q in range(int(n_q))]
+    out = np.zeros((int(n_q), max(len(c) for c in need)), dtype=np.int32)
+    for q, c in enumerate(need):
+        out[q, :len(c)] = c                        # sorted: slot 0 first
     return out
+
+
+def _head_slot_table(q_irr_frac, gvec_components, *, sys_dim, bvec,
+                     cell_volume, bdot, fft_grid, bare_coulomb_cutoff_ry,
+                     v_head_fn=None):
+    """The head channel's slot table (``sel`` = the ζ columns it reads)."""
+    from vcoul import CoulombGeometry, get_kernel, head_slot_table
+    return head_slot_table(
+        get_kernel(sys_dim), q_irr_frac, gvec_components,
+        geometry=CoulombGeometry(bvec=bvec, cell_volume=cell_volume,
+                                 bdot=bdot, fft_grid=fft_grid),
+        vcoul_cutoff_ry=bare_coulomb_cutoff_ry,
+        v_head_fn=v_head_fn,
+    )
 
 
 _ONE_LEG_TAKE_CACHE: dict = {}
@@ -567,6 +608,7 @@ def _compute_V_q_g_flat_one_tile(
     one_leg_action: str,
     qgrid_policy=None,
     source_component: int | None = None,
+    head_slots=None,                   # callable(q_irr_frac, gvec_components) -> (n_q, k) slots
     timing_label: str,
     verbose: bool,
     budget_bytes: float | None = None,
@@ -576,13 +618,14 @@ def _compute_V_q_g_flat_one_tile(
     One tile of :func:`_compute_V_q_g_flat_tiles`.  ``budget_bytes`` is the
     per-rank V_q memory allowance that sizes the ζ q-tile and the G panel
     (``_plan_vq_tiles``); ``None`` measures it live (``_vq_budget_bytes``).
-    Either way it is agreed across processes.
+    Either way it is agreed across processes.  ``head_slots`` names the ζ
+    columns the head channel reads; route G keeps them (:func:`_head_shell`).
     """
     return _compute_V_q_g_flat_tiles(
         [dict(L=zeta_L_loader, R=zeta_R_loader, v_per_G_builder=v_per_G_builder,
               is_charge_cc=is_charge_cc, write_g0=write_g0,
               one_leg_action=one_leg_action, source_component=source_component,
-              timing_label=timing_label)],
+              head_slots=head_slots, timing_label=timing_label)],
         kgrid=kgrid, fft_grid=fft_grid, mesh_xy=mesh_xy, g_chunk=g_chunk,
         sym=sym, centroid_indices=centroid_indices, qgrid_policy=qgrid_policy,
         verbose=verbose, budget_bytes=budget_bytes)[0]
@@ -683,9 +726,10 @@ def _compute_V_q_g_flat_tiles(
     for s in specs:
         s['one_leg'] = bool(s['write_g0'] and use_ibz)
     one_leg_any = any(s['one_leg'] for s in specs)
-    one_leg_cols = (_one_leg_columns(
+    one_leg_cols, one_leg_gvec = (_one_leg_columns(
         gvec_components, sym=sym, sym_idx=unfold_sym,
-        q_irr_frac=q_irr_frac, kgrid=kgrid) if one_leg_any else None)
+        q_irr_frac=q_irr_frac, kgrid=kgrid, fft_grid=fft_grid)
+        if one_leg_any else (None, None))
     n_sub = int(one_leg_cols.shape[1]) if one_leg_any else 0
 
     for s in specs:
@@ -753,14 +797,18 @@ def _compute_V_q_g_flat_tiles(
 
     if len(specs) == 1 and hasattr(specs[0]['L'], 'contract_v'):
         # The μ-batch fit's ζ (Z store + C⁺, isdf.zeta_mubatch.ZetaG): V is
-        # accumulated tile by tile as ζ is formed, and the G≈0 shell it keeps
-        # carries every column the one-leg unfold and the head channel read.
+        # accumulated tile by tile as ζ is formed, and the pass keeps ζ at
+        # exactly the columns the head consumers name: the one-leg sources
+        # and the head channel's slots.
         s = specs[0]
         if not s['same_zeta']:
             raise ValueError(
                 f"_compute_V_q_g_flat_tiles[{label}]: the in-memory "
                 "ζ serves only the same-ζ charge tile.")
-        s['V'] = s['L'].contract_v(s['v'])
+        head_sel = (None if s.get('head_slots') is None
+                    else s['head_slots'](q_irr_frac, gvec_components))
+        s['V'] = s['L'].contract_v(s['v'], keep=_head_shell(
+            n_q_ibz, one_leg_cols if s['one_leg'] else None, head_sel))
         if tuple(int(v) for v in s['V'].shape) != (n_q_ibz, s['nL'], s['nL']):
             raise ValueError(
                 f"_compute_V_q_g_flat_tiles[{label}]: in-memory V "
@@ -834,8 +882,8 @@ def _compute_V_q_g_flat_tiles(
     for s in specs:
         out.append(_finish_vq_tile(
             s, V_sh=V_sh, mesh_xy=mesh_xy, stack_cols=stack_cols,
-            unfold_isdf_one_leg=unfold_isdf_one_leg, one_leg_cols=one_leg_cols,
-            gvec_components=gvec_components, sym=sym, unfold_sym=unfold_sym,
+            unfold_isdf_one_leg=unfold_isdf_one_leg, one_leg_gvec=one_leg_gvec,
+            sym=sym, unfold_sym=unfold_sym,
             sym_perm=sym_perm, L_table=L_table, q_irr_frac=q_irr_frac,
             kgrid=kgrid, use_ibz=use_ibz, policy=policy,
             full_to_irr_idx=full_to_irr_idx))
@@ -843,7 +891,7 @@ def _compute_V_q_g_flat_tiles(
 
 
 def _finish_vq_tile(s, *, V_sh, mesh_xy, stack_cols, unfold_isdf_one_leg,
-                    one_leg_cols, gvec_components, sym, unfold_sym, sym_perm,
+                    one_leg_gvec, sym, unfold_sym, sym_perm,
                     L_table, q_irr_frac, kgrid, use_ibz, policy,
                     full_to_irr_idx):
     """One contracted tile → ``(V_q, g0 or None)``: the one-leg unfold of its
@@ -857,8 +905,7 @@ def _finish_vq_tile(s, *, V_sh, mesh_xy, stack_cols, unfold_isdf_one_leg,
         del parts
         g0_acc = unfold_isdf_one_leg(
             zeta_cols,
-            gvec_components=np.take_along_axis(
-                gvec_components, one_leg_cols[:, None, :], axis=2),
+            gvec_components=one_leg_gvec,
             sym=sym,
             sym_idx=unfold_sym,
             sym_perm=sym_perm,
@@ -1021,6 +1068,14 @@ def compute_all_V_q_g_flat(
                 v[qi] = np.where(v_at_sphere != 0.0, v_at_sphere, v[qi])
         return v.astype(np.complex128)
 
+    def _head_sel(q_irr_frac, gvec_components):
+        # The columns ``compute_head_channel_zeta`` reads (3D bulk only; it
+        # refuses any other sys_dim).  ``sel`` does not depend on v_head_fn.
+        return _head_slot_table(
+            q_irr_frac, gvec_components, sys_dim=sys_dim, bvec=bvec,
+            cell_volume=cell_volume, bdot=bdot, fft_grid=fft_grid,
+            bare_coulomb_cutoff_ry=bare_coulomb_cutoff_ry).sel
+
     V_q, g0 = _compute_V_q_g_flat_one_tile(
         zeta_loader, None,
         v_per_G_builder=_bare_v_per_G,
@@ -1031,6 +1086,7 @@ def compute_all_V_q_g_flat(
         is_charge_cc=True,
         write_g0=True,
         one_leg_action="scalar",
+        head_slots=_head_sel if sys_dim == 3 else None,
         timing_label='CC',
         verbose=verbose,
         budget_bytes=budget_bytes,
@@ -1094,8 +1150,7 @@ def compute_head_channel_zeta(
     columns is independent of their image ordering.
     """
     from .compute_vcoul import compute_v_q_per_G  # bootstrap, see the CC path
-    from vcoul import (CoulombGeometry, build_v_head_miniBZ_fn_3d, get_kernel,
-                       head_slot_table)
+    from vcoul import build_v_head_miniBZ_fn_3d
 
     del compute_v_q_per_G  # imported for the service-path bootstrap only
 
@@ -1131,13 +1186,10 @@ def compute_head_channel_zeta(
         v_head_fn = build_v_head_miniBZ_fn_3d(kgrid, bvec, cell_volume)
     del mc_average_vcoul_body
 
-    table = head_slot_table(
-        get_kernel(sys_dim), q_irr_frac, gvec_components,
-        geometry=CoulombGeometry(bvec=bvec, cell_volume=cell_volume,
-                                 bdot=bdot, fft_grid=fft_grid),
-        vcoul_cutoff_ry=bare_coulomb_cutoff_ry,
-        v_head_fn=v_head_fn,
-    )
+    table = _head_slot_table(
+        q_irr_frac, gvec_components, sys_dim=sys_dim, bvec=bvec,
+        cell_volume=cell_volume, bdot=bdot, fft_grid=fft_grid,
+        bare_coulomb_cutoff_ry=bare_coulomb_cutoff_ry, v_head_fn=v_head_fn)
 
     from runtime.padding import padded_mu_extent
     n_rmu_padded = padded_mu_extent(
@@ -1145,12 +1197,13 @@ def compute_head_channel_zeta(
         int(mesh_xy.shape['x']) * int(mesh_xy.shape['y']))
 
     if hasattr(zeta_loader, 'contract_v'):
-        # μ-batch ζ: the head slots (argmin |q+G|) lie in the G≈0 shell the
-        # V_q pass kept; read them there instead of re-forming the sphere.
+        # μ-batch ζ: the V_q pass kept these head slots (argmin |q+G|,
+        # ``compute_all_V_q_g_flat``'s ``head_slots``); read them there
+        # instead of re-forming the sphere.
         if zeta_loader.shell is None:
             raise ValueError(
                 "compute_head_channel_zeta: the in-memory ζ has not run its "
-                "V_q pass, so its G≈0 shell is not formed yet.")
+                "V_q pass, so its head columns are not formed yet.")
         zeta_all = zeta_loader.shell            # (n_q_ibz, mu_pad, n_shell)
         take_sel = zeta_loader.head_columns(np.asarray(table.sel))
     else:
