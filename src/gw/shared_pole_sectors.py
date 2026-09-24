@@ -135,14 +135,12 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output):
     from common import timing
     from common.collectives import (device_put_process_local, gather_to_host,
                                     rank0_transaction)
-    from file_io.slab_io import SlabIO
-    from file_io.shared_pole_store import (validate_shared_pole_bank, _metadata,
+    from file_io.shared_pole_store import (validate_shared_pole_bank, _metadata, open_shared_pole_bank,
         write_shared_pole_model,write_shared_pole_sector_manifest)
     from gw.shared_pole_local import parent_rounds,batch_to_face,canonical_factors,face_rows
     from gw.shared_pole_screening import _json
     from gw.shared_pole_directions import _sample_point
     from jax.sharding import NamedSharding,PartitionSpec as P
-    from runtime.padding import padded_axis
     from symmetry_maps import minus_q_parent_partners
 
     header=validate_shared_pole_bank(bank['path'],expected_identity=bank['identity'],
@@ -166,58 +164,10 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output):
     to_face=batch_to_face(mesh_xy)
     ledger=meta.shared_pole_capacity
     upstream=ledger.live_stages
-    import copy, math
     from gw.gw_config import linalg_resolution
-    from gw.shared_pole_execution import (constructor_execution,
-                                           sector_round_schedule,is_face)
-    from gw.shared_pole_recipe import shared_real_pole_v1_r3b
-    policy=shared_real_pole_v1_r3b[recipe['accuracy']]
-    def sector_recipe(n):
-        result=dict(recipe,n=n)
-        for field in ('imaginary_width','infinity_width','line_direction_cap','pole_budget'):
-            fraction=policy.get(field+'_fraction')
-            result[field]=None if fraction is None else math.ceil(n*fraction)
-        return result
-
-    extent=lambda width:padded_axis(width,mesh_xy,name='shared_pole_port',
-        specs=((P('x','y'),0),(P('x','y'),1))).carrier
-    execution_rows=[]
-    for family,basis in enumerate(bank['mu_bases']):
-        components=3 if family else 1
-        local_meta=copy.copy(meta)
-        local_meta.mu_basis=basis
-        local_meta.n_rmu=components*basis.n_logical
-        local_meta.n_rmu_padded=components*basis.n_packed
-        local_recipe=sector_recipe(local_meta.n_rmu)
-        mode,route=constructor_execution(
-            local_meta,linalg_resolution({'linalg':config.backend.linalg}),local_recipe,
-            mesh=mesh_xy,ledger=ledger,upstream=upstream,ordered=True,
-            odd_moments=True,sample_fields=4,moment_fields=4,
-            column_extent=extent)
-        execution_rows.append(dict(sector=('CC','TT')[family],mode=mode,
-                                   packed_extent=local_meta.n_rmu_padded,
-                                   signed_side_bound=extent(2*local_recipe['pole_budget']) if local_recipe['pole_budget'] is not None else route['conservative_pencil_side'],**route))
-    # CT retains both diagonal spans and both rectangular sample stacks. The
-    # CC/TT admission alone cannot promise that their joint pencil fits one
-    # rank. Resolve its conservative route before opening the bank so the
-    # complete round uses one layout and the face batch can be priced below.
-    joint_meta=copy.copy(meta)
-    joint_meta.n_rmu=sum((3 if family else 1)*basis.n_logical
-                         for family,basis in enumerate(bank['mu_bases']))
-    joint_meta.n_rmu_padded=sum(row['packed_extent'] for row in execution_rows)
-    joint_mode,joint_route=constructor_execution(
-        joint_meta,linalg_resolution({'linalg':config.backend.linalg}),
-        sector_recipe(joint_meta.n_rmu),mesh=mesh_xy,ledger=ledger,
-        upstream=upstream,ordered=True,odd_moments=True,
-        sample_fields=8,moment_fields=4,parent_count=header['n_q_irr'],
-        retained_output_families=2,column_extent=extent,
-        defer_reduction=True,
-        cross_original_sides=tuple(row['conservative_pencil_side'] for row in execution_rows),
-        cross_retained_side=sum(min(row['signed_side_bound'],row['conservative_pencil_side'])
-                                for row in execution_rows))
-    resolved_execution=('face' if joint_mode=='face' or
-                        any(row['mode']=='face' for row in execution_rows)
-                        else 'local')
+    from gw.shared_pole_execution import sector_round_schedule,is_face
+    resolved_execution,execution_rows=sector_execution(
+        meta,config,bank['mu_bases'],header['n_q_irr'],mesh_xy=mesh_xy,upstream=upstream)
     batch_width = int(mesh_xy.size)
     if resolved_execution == 'face':
         from gw.shared_pole_execution import sector_batch_width
@@ -233,7 +183,7 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output):
         sectors=[];retained=[]
         for family,name in enumerate(('CC','TT')):
             with timing.section('spole.sector.'+name, announce=True):
-                with SlabIO(bank['path'],mode='r',mesh=mesh_xy) as io:
+                with open_shared_pole_bank(bank['path'],mesh_xy=mesh_xy) as io:
                     exact=read_sector_round(io,meta,bank,header,ids,(family,family),
                         fields=('M0','M1','M2','M3'),retained=retained,execution=execution)
                     samples=read_sector_round(io,meta,bank,header,ids,(family,family),
@@ -259,7 +209,7 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output):
                     write=lambda:path.write_text(_json(dict(identity=bank['identity'],
                         status='DIAGONAL_SPANS_ONLY',rounds=receipts))+'\n'))
         with timing.section('spole.sector.CT', announce=True):
-            with SlabIO(bank['path'],mode='r',mesh=mesh_xy) as io:
+            with open_shared_pole_bank(bank['path'],mesh_xy=mesh_xy) as io:
                 ct=read_sector_round(io,meta,bank,header,ids,(0,1),sample_span=fit_span,
                                       fields=sample_fields,retained=retained,execution=execution)
                 tc=read_sector_round(io,meta,bank,header,ids,(1,0),sample_span=fit_span,
@@ -268,7 +218,7 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output):
                                       retained=(*retained,*ct.values(),*tc.values()),execution=execution)
             cross=construct_cross_sector_round(sectors,(ct,tc),cm,meta,config,mesh_xy=mesh_xy,
                 sample_lo=fit_span[0],partner_slots=slots,real=real)
-            with SlabIO(bank['path'],mode='r',mesh=mesh_xy) as io:
+            with open_shared_pole_bank(bank['path'],mesh_xy=mesh_xy) as io:
                 c1=read_sector_round(io,meta,bank,header,ids,(0,0),fields=('M1',),
                     retained=(*retained,*ct.values(),*tc.values(),*cm.values(),*jax.tree.leaves(cross['models'])),execution=execution)['M1']
                 t1=read_sector_round(io,meta,bank,header,ids,(1,1),fields=('M1',),
@@ -310,7 +260,7 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output):
         # Each held tile is read, scored, and released before the next support.
         held_rows={name:[] for name in ('CC','TT','CT')}
         for name,endpoint_pair,model in zip(held_rows,((0,0),(1,1),(0,1)),signed):
-            with SlabIO(bank['path'],mode='r',mesh=mesh_xy) as io:
+            with open_shared_pole_bank(bank['path'],mesh_xy=mesh_xy) as io:
                 for sample_id in recipe['held_ids']:
                     sample_id=int(sample_id)
                     held=read_sector_round(io,meta,bank,header,ids,endpoint_pair,
@@ -1126,3 +1076,67 @@ def sector_cauchy_schwarz(metrics, *, eigh_charge, eigh_current, matmul, gates):
     supported = defect <= gates["retained_subspace_moments"]["threshold"]
     return dict(cauchy_schwarz_squared=jnp.where(supported, eigenvalues[:, -1], jnp.inf),
                 support_relative=defect, charge_metric_min=min_c, current_metric_min=min_t)
+
+
+def sector_execution(meta, config, mu_bases, nq, *, mesh_xy, upstream):
+    """The CC/TT/CT constructor layout ('local' or 'face') and its per-sector rows.
+
+    One owner for the route: the constructor and the bank-residence admission
+    (which requires that keeping the bank resident does not change it) both
+    resolve it against the whole-map ledger with ``upstream`` live.
+    """
+    import copy, math
+    from jax.sharding import PartitionSpec as P
+    from runtime.padding import padded_axis
+    from gw.gw_config import linalg_resolution
+    from gw.shared_pole_execution import constructor_execution
+    from gw.shared_pole_recipe import shared_real_pole_v1_r3b
+    recipe=meta.shared_pole_recipe
+    ledger=meta.shared_pole_capacity
+    policy=shared_real_pole_v1_r3b[recipe['accuracy']]
+    def sector_recipe(n):
+        result=dict(recipe,n=n)
+        for field in ('imaginary_width','infinity_width','line_direction_cap','pole_budget'):
+            fraction=policy.get(field+'_fraction')
+            result[field]=None if fraction is None else math.ceil(n*fraction)
+        return result
+    extent=lambda width:padded_axis(width,mesh_xy,name='shared_pole_port',
+        specs=((P('x','y'),0),(P('x','y'),1))).carrier
+    execution_rows=[]
+    for family,basis in enumerate(mu_bases):
+        components=3 if family else 1
+        local_meta=copy.copy(meta)
+        local_meta.mu_basis=basis
+        local_meta.n_rmu=components*basis.n_logical
+        local_meta.n_rmu_padded=components*basis.n_packed
+        local_recipe=sector_recipe(local_meta.n_rmu)
+        mode,route=constructor_execution(
+            local_meta,linalg_resolution({'linalg':config.backend.linalg}),local_recipe,
+            mesh=mesh_xy,ledger=ledger,upstream=upstream,ordered=True,
+            odd_moments=True,sample_fields=4,moment_fields=4,
+            column_extent=extent)
+        execution_rows.append(dict(sector=('CC','TT')[family],mode=mode,
+                                   packed_extent=local_meta.n_rmu_padded,
+                                   signed_side_bound=extent(2*local_recipe['pole_budget']) if local_recipe['pole_budget'] is not None else route['conservative_pencil_side'],**route))
+    # CT retains both diagonal spans and both rectangular sample stacks. The
+    # CC/TT admission alone cannot promise that their joint pencil fits one
+    # rank. Resolve its conservative route before opening the bank so the
+    # complete round uses one layout and the face batch can be priced below.
+    joint_meta=copy.copy(meta)
+    joint_meta.n_rmu=sum((3 if family else 1)*basis.n_logical
+                         for family,basis in enumerate(mu_bases))
+    joint_meta.n_rmu_padded=sum(row['packed_extent'] for row in execution_rows)
+    joint_mode,joint_route=constructor_execution(
+        joint_meta,linalg_resolution({'linalg':config.backend.linalg}),
+        sector_recipe(joint_meta.n_rmu),mesh=mesh_xy,ledger=ledger,
+        upstream=upstream,ordered=True,odd_moments=True,
+        sample_fields=8,moment_fields=4,parent_count=nq,
+        retained_output_families=2,column_extent=extent,
+        defer_reduction=True,
+        cross_original_sides=tuple(row['conservative_pencil_side'] for row in execution_rows),
+        cross_retained_side=sum(min(row['signed_side_bound'],row['conservative_pencil_side'])
+                                for row in execution_rows))
+    resolved_execution=('face' if joint_mode=='face' or
+                        any(row['mode']=='face' for row in execution_rows)
+                        else 'local')
+    return resolved_execution,execution_rows

@@ -1,7 +1,8 @@
 """Physical signed photon bank through the public sector constructor/store seam."""
 
 
-def check_sector_constructor(mesh, root, *, linalg="local", parents=16, return_observables=False):
+def check_sector_constructor(mesh, root, *, linalg="local", parents=16, return_observables=False,
+                             resident=False):
     from types import SimpleNamespace
     import os
     import numpy as np
@@ -18,7 +19,7 @@ def check_sector_constructor(mesh, root, *, linalg="local", parents=16, return_o
     from file_io import shared_pole_store as store
     from file_io.slab_io import SlabIO
 
-    run=root/f"constructor_{os.environ['SLURM_STEP_ID']}_{linalg}"
+    run=root/f"constructor_{os.environ['SLURM_STEP_ID']}_{linalg}{'_resident' if resident else ''}"
     rank0_transaction(run,stage='plant.directory',write=lambda:run.mkdir())
     rotation=np.eye(3,dtype=np.int32)[None]
     sym=SimpleNamespace(sym_matrices=rotation,translations=np.zeros((1,3)),
@@ -58,15 +59,19 @@ def check_sector_constructor(mesh, root, *, linalg="local", parents=16, return_o
     # The production ledger receives a resolved per-device budget. For this
     # tiny synthetic bank, use the live GPU limit instead of its 3U fallback;
     # the unchanged 3U scaling predicate is still reported independently.
-    device_limit=int(jax.local_devices()[0].memory_stats()['bytes_limit'])
+    device_limit=int((jax.local_devices()[0].memory_stats() or {}).get('bytes_limit',16<<30))
     meta.shared_pole_capacity=CapacityLedger(meta,mesh_xy=mesh,
         device_budget_bytes=device_limit)
     meta.shared_pole_capacity.live_stages=()
     layout=PhotonBasisLayout.from_centroid_extents(nc,nt,mesh)
     identity={key:'signed-constructor-'+key for key in store._IDENTITY_KEYS}
     path=run/'bank.h5'
-    bank=dict(path=str(path),identity=identity,tables=tables[0],sector_tables=tables,
-              mu_bases=bases,photon_layout=layout)
+    if resident:
+        # The device-resident payload follows the same writer, reader and
+        # sector-rectangle contract as the file bank.
+        path=store.ResidentBankPayload(mesh,carrier=layout.packed_extent,label=str(path))
+    bank=dict(path=path if resident else str(path),identity=identity,tables=tables[0],
+              sector_tables=tables,mu_bases=bases,photon_layout=layout)
     store.initialize_shared_pole_bank(path,meta=meta,tables=tables[0],recipe=recipe,
         identity=identity,mesh_xy=mesh,photon_layout=layout,mu_bases=bases)
     # Charge/current endpoint amplitudes are independent, complex and small
@@ -174,7 +179,8 @@ def check_sector_constructor(mesh, root, *, linalg="local", parents=16, return_o
     assert not bool(jnp.any(zero['zero_policy']))
     assert bool(jnp.all(pair[0][1]==pair[1][1])) and bool(jnp.all(pair[0][2]==pair[1][2]))
     receipt=dict(name='production_sector_constructor_manifest',held_W_relative=errors,
-                 parents=nq,manifest=handle['path'],linalg=linalg,asymmetric_endpoint_loss_refused=True)
+                 parents=nq,manifest=handle['path'],linalg=linalg,resident=resident,
+                 asymmetric_endpoint_loss_refused=True)
     return (receipt,observables) if return_observables else receipt
 
 
@@ -196,6 +202,7 @@ def main():
     if jax.process_index()==0:
         print(json.dumps(dict(status='RETAINED_SPAN_PASS',checks=rows)),flush=True)
     rows.append(check_sector_constructor(mesh,args.output.parent))
+    rows.append(check_sector_constructor(mesh,args.output.parent,resident=True))
     result=dict(status='PASS',checks=rows,job=os.environ.get('SLURM_JOB_ID'),
         step=os.environ.get('SLURM_STEP_ID'),
         scope='P4 signed sector public constructor and authenticated stores; unequal parent coefficient spans; no production deck or integrated Sigma')
