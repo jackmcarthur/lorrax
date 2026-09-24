@@ -311,6 +311,16 @@ def _fit_mubatch(
         q_sel=q_irr_full_idx, q_axis=q_axis, q_neg=q_neg_idx, qvec_frac=q_frac,
         n_col=int(cyl[0].shape[1]), n_s=int(cyl[0].shape[2]),
         n_pg=int(plan.r_sub), axis=axis)
+    split_kernels = {}
+    if debug_print_enabled():
+        # Debug split timers: the same kernel truncated after each stage.
+        for stage in ('x', 'gemm', 'a2a', 'planes', 'kconv'):
+            split_kernels[stage] = zmb.make_route_g_kernel(
+                mesh=mesh_xy, plan_id=plan_id, kgrid=kgrid, fft_grid=fft_grid,
+                ns=ns, b=b, q_sel=q_irr_full_idx, q_axis=q_axis, q_neg=q_neg_idx,
+                qvec_frac=q_frac, n_col=int(cyl[0].shape[1]),
+                n_s=int(cyl[0].shape[2]), n_pg=int(plan.r_sub), axis=axis,
+                stop_at=stage)
     store = zmb.ZStore(
         mesh=mesh_xy, q_axis=q_axis, mu_pad=mu_pad, g_axis=g_axis, b=b,
         placement=plan.placement,
@@ -340,13 +350,16 @@ def _fit_mubatch(
     n_run = 0
     n_go = store.n_batch if _max_n is None else min(store.n_batch, _max_n)
 
-    def launch(beta):
-        """Dispatch batch β (asynchronous); the caller writes it later."""
+    def launch_args(beta):
         slots = mb.mu[beta]
         live = (slots >= 0).astype(np.float64)
         xmu = x_cent[canon[np.clip(slots, 0, None)]] * live[:, None]
-        return kernel(cbar, *ops, g3, _device_put_process_local(xmu, rep),
-                      _device_put_process_local(live, rep), *tabs)
+        return (cbar, *ops, g3, _device_put_process_local(xmu, rep),
+                _device_put_process_local(live, rep), *tabs)
+
+    def launch(beta):
+        """Dispatch batch β (asynchronous); the caller writes it later."""
+        return kernel(*launch_args(beta))
 
     if debug_print_enabled():
         # The collective count of one batch, read from the compiled HLO.
@@ -373,6 +386,18 @@ def _fit_mubatch(
             t_batch += time.perf_counter() - t0
             n_run += 1
             progress.step()
+            if split_kernels and beta in (1, 2):
+                args = launch_args(beta)
+                t_stage = {}
+                for stage, kfn in list(split_kernels.items()) + [('full', kernel)]:
+                    ts = time.perf_counter()
+                    kfn(*args).block_until_ready()
+                    t_stage[stage] = time.perf_counter() - ts
+                if jax.process_index() == 0:
+                    names = ['x', 'gemm', 'a2a', 'planes', 'kconv', 'full']
+                    print_fn(f"[mubatch_dbg] batch {beta + 1} route-G split (s): " + " ".join(
+                        f"{n}={t_stage[n] - (t_stage[names[i - 1]] if i else 0.0):.3f}"
+                        for i, n in enumerate(names)) + f" total={t_stage['full']:.3f}")
             if debug_print_enabled() and jax.process_index() == 0:
                 print_fn(f"[mubatch_dbg] batch={beta + 1}/{store.n_batch} "
                          f"{1e3 * (time.perf_counter() - t0):.0f}ms "

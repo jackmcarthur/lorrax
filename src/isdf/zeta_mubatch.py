@@ -71,22 +71,25 @@ def identity_kplan(k_full_frac, centroid_fft_idx, fft_grid, mesh, ns):
 
 
 def zeta_plane_tables(gvec_components, ngk_per_q, fft_grid, axis, g_axis):
-    """ζ-sphere slot → (in-plane column, axis Miller index) per stored q, at
-    the store's G-tile carrier width (pad slots: column 0, index 0, masked
-    downstream by ``ngk``)."""
+    """The ζ sphere as a cylinder: its in-plane columns ``zc`` (union over the
+    stored q), its axis values ``za`` (mod ``n_a``), and per ``(q, slot)`` the
+    flat index ``col·n_za + a`` into ``(zc, za)``, at the store's G-tile
+    carrier width (pad slots index 0; ``ngk`` masks them downstream)."""
     n_a, (n_b, n_c), (b_ax, c_ax) = _plane_geometry(fft_grid, axis)
     gv = np.asarray(gvec_components, dtype=np.int64)          # (Q, 3, ngk)
-    col = (gv[:, b_ax] % n_b) * n_c + gv[:, c_ax] % n_c
-    ga = gv[:, axis]
     live = np.arange(gv.shape[-1])[None, :] < np.asarray(ngk_per_q)[:, None]
-    col, ga = np.where(live, col, 0), np.where(live, ga, 0)
-    return (np.asarray(pad_to_axis(col.astype(np.int32), g_axis, axis=1)),
-            np.asarray(pad_to_axis(ga.astype(np.int32), g_axis, axis=1)))
+    col = (gv[:, b_ax] % n_b) * n_c + gv[:, c_ax] % n_c
+    ga = gv[:, axis] % n_a
+    zc, zc_i = np.unique(np.where(live, col, col[:, :1]), return_inverse=True)
+    za, za_i = np.unique(np.where(live, ga, ga[:, :1]), return_inverse=True)
+    flat = np.where(live, zc_i.reshape(col.shape) * za.size + za_i.reshape(ga.shape), 0)
+    return (zc.astype(np.int32), za.astype(np.int32),
+            np.asarray(pad_to_axis(flat.astype(np.int32), g_axis, axis=1)))
 
 
 def make_route_g_kernel(*, mesh: Mesh, plan_id, kgrid, fft_grid, ns: int, b: int,
                         q_sel, q_axis, q_neg, qvec_frac, n_col: int, n_s: int,
-                        n_pg: int, axis: int):
+                        n_pg: int, axis: int, stop_at: str | None = None):
     """Compile-once executable for one μ batch on route G.
 
     Returns ``fn(psi_bar, w_l, w_r, kvecs, g3, xmu, live, cyl, zt) -> rows``
@@ -110,6 +113,9 @@ def make_route_g_kernel(*, mesh: Mesh, plan_id, kgrid, fft_grid, ns: int, b: int
     coordinates of the batch slots and ``live (b,)`` their mask; ``cyl`` =
     :func:`common.wfn_transforms.psi_cylinder_tables` of the ψ sphere;
     ``zt`` = :func:`zeta_plane_tables`.
+
+    ``stop_at`` (debug split timers only: ``'x'``, ``'gemm'``, ``'a2a'``,
+    ``'planes'``, ``'kconv'``) truncates after that stage with a checksum.
     """
     from isdf.core import parent_projector_kconv, _conv_kpair_static_gamma
     from isdf.pair_kernels import pair_projectors_lr
@@ -141,7 +147,7 @@ def make_route_g_kernel(*, mesh: Mesh, plan_id, kgrid, fft_grid, ns: int, b: int
     ic = (np.arange(ps) % n_c).astype(np.float64)
     key = ('route_g', _mesh_id(mesh), id(plan_id), tuple(kgrid), tuple(fft_grid), ns, b,
            hash(q_sel.tobytes()), q_axis, hash(q_neg.tobytes()), hash(qv.tobytes()),
-           int(n_col), int(n_s), int(n_pg), int(axis))
+           int(n_col), int(n_s), int(n_pg), int(axis), stop_at)
     hit = _kernel_cache.get(key)
     if hit is not None:
         return hit
@@ -153,66 +159,87 @@ def make_route_g_kernel(*, mesh: Mesh, plan_id, kgrid, fft_grid, ns: int, b: int
              out_specs=P(None, _XY, None), check_vma=False)
     def _local(psi_bar, w_l, w_r, kvecs, g3, xmu, live, cyl, zt):
         ci, cax, pfc = cyl
-        zcol, zga = zt
+        zc, za, zflat = zt
         # 1. X_B = ψ_{nks}(r_μ) = Σ_G c e^{2πi(k+G)·x_μ}/√N, one psum
         kg = kvecs[:, None, :] + g3.astype(jnp.float64)            # (k, Gp, 3)
         ph = jnp.exp(2j * jnp.pi * jnp.einsum('kgd,md->kgm', kg, xmu))
         X = jnp.einsum('knsg,kgm->knsm', jnp.conj(psi_bar), ph) / np.sqrt(N)
         X = jax.lax.psum(X, _XY) * live[None, None, None, :]
+        n_g = int(zflat.shape[-1])
+        chk = lambda a: jnp.zeros((Q, c, n_g), jnp.complex128) + jnp.sum(jnp.abs(a))
+        if stop_at == 'x':
+            return chk(X)
         # 2. pair GEMM in G space on this rank's slice (one band chunk)
         D_l, D_r = pair_projectors_lr(X[None], lambda bc: psi_bar,
                                       w_l[None], w_r[None])     # (k, s, b, s, Gp)
+        if stop_at == 'gemm':
+            return chk(D_l) + chk(D_r)
         # 3. one all-to-all: G split -> μ owners, [L | R] owner-major
         D = jnp.stack([D_l, D_r], axis=2).reshape(nk, ns, 2, P_, c, ns, -1)
         D = jnp.moveaxis(D, 3, 2).reshape(nk, ns, P_ * 2 * c, ns, -1)
         D = jax.lax.all_to_all(D, _XY, split_axis=2, concat_axis=4, tiled=True)
+        if stop_at == 'a2a':
+            return chk(D)
         D = jnp.concatenate([D, jnp.zeros(D.shape[:4] + (1,), D.dtype)], axis=-1)
         ngk1 = int(D.shape[-1])
+
+        # The axis DFT of every k onto all planes, once per batch: the D
+        # cylinder (k, plane, s, μ, s, column), plane axis padded to whole groups.
+        pa_all = jnp.exp(-2j * jnp.pi * cax.astype(jnp.float64)[:, None]
+                         * jnp.arange(pl_ax.carrier)[None, :] / n_a)
+        pa_all = pa_all * (jnp.arange(pl_ax.carrier) < n_a)[None, :]
+
+        def cyl_k(_, k):
+            cy = jnp.take(D[k], jnp.clip(ci[k], 0, ngk1 - 1).reshape(-1), axis=-1)
+            cy = cy.reshape(ns, 2 * c, ns, n_col, n_s)
+            return None, jnp.einsum('asbcj,jp->pasbc', cy, pa_all)
+
+        _, Fa = jax.lax.scan(cyl_k, None, jnp.arange(nk, dtype=jnp.int32), unroll=1)
+        del D
+        if stop_at == 'planes':
+            return chk(Fa)
+        n_zc, n_za = int(zc.shape[0]), int(za.shape[0])
 
         def group(acc, gi):
             a0 = gi * n_pg + jnp.arange(n_pg)
             on = (a0 < n_a).astype(jnp.float64)
-            pa = jnp.exp(-2j * jnp.pi * cax.astype(jnp.float64)[:, None]
-                         * a0[None, :] / n_a) * on[None, :]         # (n_s, n_pg)
-
-            def one_k(Dk, k):
-                cy = jnp.take(D[k], jnp.clip(ci[k], 0, ngk1 - 1).reshape(-1), axis=-1)
-                cy = cy.reshape(ns, 2 * c, ns, n_col, n_s)
-                F = jnp.einsum('asbcj,jp->asbpc', cy, pa)            # (…, n_pg, n_col)
-                F = jnp.concatenate([F, jnp.zeros(F.shape[:4] + (1,), F.dtype)], -1)
-                st = jnp.take(F, pfc, axis=-1).reshape(ns, 2 * c, ns, n_pg, n_b, n_c)
-                d = local_fftn3(st, axes=(-2, -1), norm='backward')  # Σ e^{-iG·r}
-                bl = jnp.exp(-2j * jnp.pi * (
-                    kvecs[k, axis] * a0[:, None] / n_a
-                    + kvecs[k, b_ax] * ib[None, :] / n_b
-                    + kvecs[k, c_ax] * ic[None, :] / n_c)) / np.sqrt(N)
-                d = d.reshape(ns, 2 * c, ns, n_pg, ps) * bl
-                return jax.lax.dynamic_update_index_in_dim(
-                    Dk, d.reshape(ns, 2 * c, ns, r_pl), k, axis=0), None
-
-            Dk, _ = jax.lax.scan(
-                one_k, jnp.zeros((nk, ns, 2 * c, ns, r_pl), jnp.complex128),
-                jnp.arange(nk, dtype=jnp.int32), unroll=1)
+            F = jax.lax.dynamic_slice_in_dim(Fa, gi * n_pg, n_pg, axis=1)
+            F = jnp.concatenate([F, jnp.zeros(F.shape[:5] + (1,), F.dtype)], -1)
+            st = jnp.take(F, pfc, axis=-1).reshape(nk, n_pg, ns, 2 * c, ns, n_b, n_c)
+            d = local_fftn3(st, axes=(-2, -1), norm='backward')        # Σ e^{-iG·r}
+            bl = jnp.exp(-2j * jnp.pi * (
+                kvecs[:, axis][:, None, None] * a0[None, :, None] / n_a
+                + kvecs[:, b_ax][:, None, None] * ib[None, None, :] / n_b
+                + kvecs[:, c_ax][:, None, None] * ic[None, None, :] / n_c)) / np.sqrt(N)
+            d = d.reshape(nk, n_pg, ns, 2 * c, ns, ps) * bl[:, :, None, None, None, :]
+            Dk = jnp.moveaxis(d, 1, 4).reshape(nk, ns, 2 * c, ns, r_pl)
             Z = parent_projector_kconv(
                 Dk[:, :, :c], Dk[:, :, c:], plan=plan_id, left_perm=l_perm,
                 left_L=l_wrap, right_perm=r_perm, right_L=r_wrap, kgrid=kgrid,
                 pair_kernel=pair_kernel)                           # (nk, c, r_pl)
+            if stop_at == 'kconv':
+                return acc + jnp.sum(jnp.abs(Z)), None
             Z = Z + jnp.conj(jnp.take(Z, jnp.asarray(q_neg), axis=0))
             Z = jnp.take(Z, jnp.asarray(q_sel), axis=0).reshape(Q, c, n_pg, ps)
             qin = jnp.exp(-2j * jnp.pi * (jnp.asarray(qv[:, b_ax])[:, None] * ib[None, :] / n_b
                                           + jnp.asarray(qv[:, c_ax])[:, None] * ic[None, :] / n_c))
             Z = (Z * qin[:, None, None, :]).reshape(Q, c, n_pg, n_b, n_c)
             Fz = local_fftn3(Z, axes=(-2, -1), norm='backward').reshape(Q, c, n_pg, ps)
-            for j in range(int(n_pg)):
-                val = jnp.take_along_axis(Fz[:, :, j], zcol[:, None, :], axis=-1)
-                za = jnp.exp(-2j * jnp.pi * (jnp.asarray(qv[:, axis])[:, None]
-                                            + zga.astype(jnp.float64)) * a0[j] / n_a) * on[j]
-                acc = acc + val * za[:, None, :]
+            # The axis transform onto the ζ cylinder: one matmul over the
+            # group's planes, e^{-2πi (q_a + G_a) a/n_a}.
+            E = jnp.exp(-2j * jnp.pi * (jnp.asarray(qv[:, axis])[:, None, None]
+                                        + za.astype(jnp.float64)[None, None, :])
+                        * a0[None, :, None] / n_a) * on[None, :, None]   # (Q, n_pg, n_za)
+            acc = acc + jnp.einsum('qcpj,qpg->qcjg', jnp.take(Fz, zc, axis=-1), E)
             return acc, None
 
         acc, _ = jax.lax.scan(
-            group, jnp.zeros((Q, c, int(zcol.shape[-1])), jnp.complex128),
+            group, jnp.zeros((Q, c, n_zc, n_za), jnp.complex128),
             jnp.arange(n_grp, dtype=jnp.int32), unroll=1)
+        if stop_at == 'kconv':
+            return chk(acc)
+        acc = jnp.take_along_axis(acc.reshape(Q, c, n_zc * n_za),
+                                  zflat[:, None, :], axis=-1)
         return acc
 
     fn = jax.jit(_local)
@@ -300,6 +327,7 @@ class ZStore:
             # Pinned, tile-major host tiles (file_io.HostTileStore): one
             # (Q, b, G_tile) tile per (G tile, batch), sharded like the rows.
             from file_io.host_tile_store import HostTileStore
+            self._written = set()
             self._hts = HostTileStore(
                 mesh=mesh, grid=(self.n_Gt, self.n_batch),
                 tile_shape=(self.Q, self.b, self.g_tile), spec=P(None, _XY, None),
@@ -325,6 +353,7 @@ class ZStore:
             for t, tile in enumerate(_split_g_tiles(self.mesh, self.n_Gt,
                                                     self.g_tile)(rows)):
                 self._hts.put_tile_async((t, int(beta)), tile)
+            self._written.add(int(beta))
         else:
             tiled = _tile_rows(self.mesh, self.Q, self.b, self.n_Gt, self.g_tile)(rows)
             self._io.write_slab('Z', tiled, offset=(0, 0, int(beta) * self.b, 0))
@@ -355,9 +384,18 @@ class ZStore:
         else:
             if t == 0:
                 self._hts.wait()
-            local = _concat_batches(self.mesh, self.n_batch)(
-                tuple(self._hts.get_tile_async((t, beta))
-                      for beta in range(self.n_batch)))
+            # A batch never written (a truncated debug fit) reads as zeros.
+            zero = None
+            tiles = []
+            for beta in range(self.n_batch):
+                if beta in self._written:
+                    tiles.append(self._hts.get_tile_async((t, beta)))
+                else:
+                    zero = zero if zero is not None else jax.jit(
+                        lambda: jnp.zeros((self.Q, self.b, self.g_tile), jnp.complex128),
+                        out_shardings=NamedSharding(self.mesh, P(None, _XY, None)))()
+                    tiles.append(zero)
+            local = _concat_batches(self.mesh, self.n_batch)(tuple(tiles))
             out = _rows_to_layout(self.mesh, layout, self.P, self.n_batch,
                                   self.c, self.n_batch * self.b, self.q_axis)(local)
         # Store slot order → packed centroid order (a prefix for contiguous

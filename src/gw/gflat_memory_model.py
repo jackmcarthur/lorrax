@@ -1673,49 +1673,70 @@ def plan_zeta_route_g(*, meta, mesh_xy, n_q_selected: int, ngkmax: int,
     }
     base_total = sum(base.values())
 
+    r_zeta = (3.0 * N_G / (4.0 * math.pi)) ** (1.0 / 3.0)
+    n_zc = min(ps, math.ceil(1.3 * math.pi * r_zeta * r_zeta))
+    n_za = min(n_a, math.ceil(2 * r_zeta) + 1)
+
     def ws(b, n_pg):
         c, r_pl = b // P_, n_pg * ps
+        n_ap = math.ceil(n_a / n_pg) * n_pg
         return {
             "X_B": 2 * _c128(nk, nb, ns, b) + _c128(nk, Gp, b),
             "pair projectors (G slice, all-to-all)": 4 * 2 * _c128(nk, ns, b, ns, Gp),
-            "plane group D(k, μ, r)": _c128(nk, ns, 2 * c, ns, r_pl),
-            "cylinder + planes": (_c128(ns, 2 * c, ns, n_col, n_s)
-                                  + 3 * _c128(ns, 2 * c, ns, r_pl)),
+            "D cylinder (all planes)": _c128(nk, n_ap, ns, 2 * c, ns, n_col)
+                                       + _c128(ns, 2 * c, ns, n_col, n_s),
+            "plane group": 3 * _c128(nk, n_pg, ns, 2 * c, ns, ps),
             "k-conv + Z": 9 * _c128(nk, c, r_pl) + 3 * _c128(Q, c, r_pl),
-            "Z rows (accumulated, +1 lookahead)": 3 * _c128(Q, c, N_G),
+            "ζ cylinder accumulator": _c128(Q, c, n_zc, n_za),
+            "Z rows (+1 lookahead)": 3 * _c128(Q, c, N_G),
         }
 
-    def need(b, n_pg):
-        return base_total + sum(ws(b, n_pg).values())
+    # The memory split (owner rule): ψ(G) resident iff what is left after
+    # the fixed terms holds it and the smallest batch; then every remaining
+    # byte buys centroids at c_μ bytes each (the per-centroid slope of the
+    # batch working set).  Partially cached ψ is never optimal (the stream
+    # cost ∝ (1-x)/(M_f - xΨ) is monotone in x), so there is no middle tier.
+    psi_bytes = base.pop("conj ψ(G) slice")
+    base_total = sum(base.values())
+    M_f = target - base_total
+
+    def batch_bytes(b, n_pg):
+        return sum(ws(b, n_pg).values())
 
     green = _c128(nk, ns * ns, mu, mu, shard=P_)
-    need_min = need(P_, 1)
-    if need_min > target:
+    need_min = base_total + psi_bytes + batch_bytes(P_, 1)
+    if M_f - psi_bytes < batch_bytes(P_, 1):
         raise ValueError(
             f"GATE zeta-mubatch-capacity: got {need_min / 1e9:.2f} GB/dev for the "
-            f"smallest route-G configuration (b = P = {P_}, one plane), want <= "
-            f"{target / 1e9:.2f} GB/dev; why: no batch fits.  Fix: more ranks or "
-            "more memory per device.")
+            f"smallest route-G configuration (ψ(G) resident {psi_bytes / 1e9:.2f}, "
+            f"b = P = {P_}, one plane), want <= {target / 1e9:.2f} GB/dev; why: "
+            "ψ(G) streaming in two band-chunk buffers is not implemented.  Fix: "
+            "more ranks or more memory per device.")
     b_top = math.ceil(mu / P_) * P_
     cands = []
     n_pg = 1
     while True:
-        if need(P_, n_pg) <= target:
-            b = P_
-            while b + P_ <= b_top and need(b + P_, n_pg) <= target:
-                b += P_
+        c_mu = (batch_bytes(2 * P_, n_pg) - batch_bytes(P_, n_pg)) / P_
+        fixed = batch_bytes(P_, n_pg) - c_mu * P_
+        room = M_f - psi_bytes - fixed
+        if room >= c_mu * P_:
+            b = min(b_top, int(room // c_mu) // P_ * P_)
             n_b = math.ceil(mu / b)
-            b = math.ceil(math.ceil(mu / n_b) / P_) * P_         # balance
+            b = math.ceil(math.ceil(mu / n_b) / P_) * P_          # balance
             n_grp = math.ceil(n_a / n_pg)
             # Per batch: the X_B psum and the pair-projector all-to-all
             # (gw.comm_model), n_grp·nk scan steps, and the owner's cylinder
             # gathers.  ponytail: gathers at 1 TB/s and 5 µs per scan step,
             # measured on A100; the per-centroid arithmetic is the same for
             # every candidate and is left out.
+            # ponytail: per plane group 3 ms of launches plus the owner's
+            # k-conv and plane FFTs at 0.65 s per centroid-grid per batch of
+            # c = 1, amortized as c/(c+1) (VI3 P16 A100 measurement); the
+            # comm-model service prices the two collectives.
+            c_ = b // P_
             t_b = (comm_model.comm_time(_c128(nk, nb, ns, b), P_ - 1)
                    + comm_model.comm_time(2 * _c128(nk, ns, b, ns, Gp), P_ - 1)
-                   + 5e-6 * n_grp * nk
-                   + n_grp * nk * _c128(ns, 2 * (b // P_), ns, n_col, n_s) / 1e12)
+                   + 3e-3 * n_grp + 0.65 * (c_ + 1) / 2)
             cands.append((n_b * t_b, n_pg, b))
         if n_pg >= n_a:
             break
@@ -1724,6 +1745,9 @@ def plan_zeta_route_g(*, meta, mesh_xy, n_q_selected: int, ngkmax: int,
     t_model, n_pg, b = cands[0]
     ru = (f"n_pg={cands[1][1]} b={cands[1][2]}: {cands[1][0]:.0f} s"
           if len(cands) > 1 else None)
+    base["conj ψ(G) slice (resident)"] = psi_bytes
+    # The all-to-all floor: every pair projector crosses the network once.
+    t_a2a_floor = mu * 2 * _c128(nk, ns, 1, ns, Gp) / comm_model.BETA_BPS
     n_batch = math.ceil(mu / b)
     per_g = (6.0 * _c128(Q_pad, mu, 1, shard=P_)
              + (_c128(Q, mu, mu) if finalize_layout == 'g' else 0.0) / max(N_G, 1))
@@ -1736,8 +1760,10 @@ def plan_zeta_route_g(*, meta, mesh_xy, n_q_selected: int, ngkmax: int,
     br.update(ws(b, n_pg))
     store_total = Q * mu * N_G * 16.0
     transfer = {
-        "pair-projector all-to-all": mu * 2 * _c128(nk, ns, 1, ns, Gp),
-        "X_B psum": mu * _c128(nk, nb, ns, 1),
+        f"pair-projector all-to-all (floor {t_a2a_floor:.0f} s)":
+            mu * 2 * _c128(nk, ns, 1, ns, Gp),
+        f"X_B psum ({_c128(nk, nb, ns, b) / 1e6:.0f} MB per batch)":
+            mu * _c128(nk, nb, ns, 1),
         "Z store write": store_total / P_, "Z store read": store_total / P_,
     }
     return MuBatchPlan(

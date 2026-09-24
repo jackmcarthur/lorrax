@@ -166,7 +166,7 @@ def run_case(case, fx, mesh, scratch):
                       flush=True)
             if not e <= TOL:
                 raise SystemExit(f"{TAG} FAIL {case} {placement}/{lay}: {e:.3e}")
-    bad = (tabs[0], (tabs[1][0], put_rep(zt[1] + 1)))         # axis Miller off by one
+    bad = (tabs[0], (tabs[1][0], put_rep(zt[1] + 1), tabs[1][2]))   # axis index off by one
     red_g = parity._rel(run_g(bad)["q"], ref)
     if jax.process_index() == 0:
         print(f"{TAG} {case} route G red twin (ζ axis index shifted by one): "
