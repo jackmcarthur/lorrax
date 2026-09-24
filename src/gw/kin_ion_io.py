@@ -1355,8 +1355,14 @@ def main(argv=None):
     # either: ``file_io.kin_ion`` unfolds on read and still hands back
     # ``(nk_tot, nb, nb)`` in full-BZ order.
     gtab = padded_gvectors(wfn, k=k_spec)
-    psi_G = wfn.load(bands=(0, nb_eff), k=k_spec,
-                     sharding=band_sphere_spec())
+    # The band-sharded sphere read is this driver's largest single cost at
+    # production size (VI3 12x12, 360 bands: ~53 s of a 75 s run at P16,
+    # runs/runtime/mtxel_sweep_20260923 b01), so it is its own timed stage;
+    # the sync keeps the device transfer inside it rather than in kin_ion.
+    with timing.section("load_psi_sphere"):
+        psi_G = wfn.load(bands=(0, nb_eff), k=k_spec,
+                         sharding=band_sphere_spec())
+        psi_G.block_until_ready()
     geom = SweepGeometry(mesh=mesh_xy, fft_grid=meta.fft_grid,
                          ngkmax=int(psi_G.shape[3]), nb=nb_eff,
                          ns=int(psi_G.shape[2]), nk=nk_irr,
@@ -1532,6 +1538,7 @@ def main(argv=None):
     records = timing.records()
     report.timings((
         ("wavefunction input", timing_total(records, "load_wfn")),
+        ("psi(G) sphere read", timing_total(records, "load_psi_sphere")),
         ("local ionic potential", timing_total(records, "build_V_loc")),
         ("nonlocal projectors", timing_total(records, "build_V_NL")),
         ("T + ionic matrix", timing_total(records, "kin_ion")),

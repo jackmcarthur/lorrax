@@ -1387,8 +1387,13 @@ def main(argv=None):
 			_dipole_block(debug_kindex)     # the table, nothing else
 		nk_file = int(sym.nk_red)
 		gtab_file = padded_gvectors(wfn, k="ibz")
-		psi_G = wfn.load(bands=(0, nb), k="ibz",
-		                 sharding=band_sphere_spec(), bispinor=bispinor)
+		# The sphere read is its own timed stage (~48 s of the q=0
+		# section at VI3 12x12 P16, runs/runtime/mtxel_sweep_20260923 c01);
+		# the sync keeps the device transfer out of the sweep's row.
+		with timing.section("load_psi_sphere"):
+			psi_G = wfn.load(bands=(0, nb), k="ibz",
+			                 sharding=band_sphere_spec(), bispinor=bispinor)
+			psi_G.block_until_ready()
 		geom = SweepGeometry(mesh=RUNTIME.mesh, fft_grid=meta.fft_grid,
 		                     ngkmax=int(psi_G.shape[3]), nb=nb,
 		                     ns=int(psi_G.shape[2]), nk=nk_file,
@@ -1588,6 +1593,7 @@ def main(argv=None):
 	wall = time.perf_counter() - _t_main
 	records = timing.records()
 	report.timings((
+		("psi(G) sphere read", timing_total(records, "load_psi_sphere")),
 		("q=0 velocity", timing_total(records, "dipole_sweep")),
 		("parallel gauge", timing_total(
 			records, "parallel_transport_velocity", "parallel_transport_links")),
