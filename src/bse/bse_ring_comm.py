@@ -18,6 +18,8 @@ from common.contract_bands import contract_bands_block_reshard
 from common.fft_helpers import make_kconv_kminor
 from common.vma import mark_varying
 
+from .bse_preconditioner import exchange_spin_weight
+
 
 jax.config.update("jax_enable_x64", True)
 
@@ -508,51 +510,6 @@ def _ring_sum_B_encode(
     return T_total
 
 
-def ring_spin_degeneracy(nspinor: int) -> float:
-    """Spin-summation weight on the RING (bare-Coulomb) ENCODE step.
-
-    THE SINGLE OWNER of the fix for KNOWN_LORRAX_ISSUES.md's
-    ``bse_w_exact._build_rpa_resolvent`` / ``compute_pair_amplitude`` row
-    (2026-08-23): the ring's transition-density ENCODE (the step that
-    SUMS a (c,v,k) trial vector, weighted by ``conj(M)``, down to a
-    centroid-space (mu) density — ``S_total`` below and its twin in
-    :func:`build_density_snapshot_operator`) silently assumed weight 1 for
-    every transition. That is correct for a spinor (``nspinor == 2``)
-    calculation, where ``compute_pair_amplitude``'s own ``Sigma_s`` already
-    sums both physical spin components into one stored transition — but
-    WRONG for a spin-restricted scalar calculation (``nspinor == 1``),
-    which stores only ONE of the two spin-degenerate channels per
-    transition and must double the sum to recover the physical response.
-    This is the textbook ``D + 2V - W`` (scalar) vs ``D + V - W`` (spinor)
-    split already DOCUMENTED, but never implemented, in
-    ``bse/context/README.md`` ("Note on spin factors"); same convention,
-    same nspin==1-only scope, as the GW producer's own Dyson-route
-    prefactor (``gw.w_isdf._w_solve_pref_scalar``,
-    ``2.0/(nspin*nspinor)``) and the shared ``psp.get_DFT_mtxels.
-    spin_degeneracy_factor`` this specialises — BSE has no ``wfn`` at
-    these call sites and never tracks collinear ``nspin == 2`` (grep
-    confirms no ``nspin`` token anywhere under ``src/bse/``), so ``nspin``
-    is fixed at 1 here rather than threaded through.
-
-    Applied ONLY at ENCODE (the transition-index sum); the matching
-    DECODE (``M`` broadcast back onto (c,v,k), no sum over transitions —
-    e.g. ``VX_partial`` below, or the generator in
-    :func:`build_realspace_random_transition_generator`) does not carry
-    it, and must not: doubling a decode-only leg would introduce the
-    weight where the physical multiplicity was never lost.  Symmetric
-    consequence, stated because it is the part most likely to surprise a
-    reader: this is used by BOTH ``screening=True`` (the RPA/ladder
-    density response W is resolved from) and ``screening=False`` (the
-    production OPTICAL BSE exciton Hamiltonian's own K^x term) — the ring
-    coupling is the SAME function in every block by design (module
-    docstring, ``build_bse_ring_matvec_full``'s ``screening`` branch
-    doc), so this one fix corrects the missing spin weight in EVERY
-    scalar (``nspinor == 1``) BSE run, not only ``w_bse``/
-    ``w_rpa_resolvent``.
-    """
-    return 2.0 if int(nspinor) == 1 else 1.0
-
-
 def apply_V_ring(
     X: jax.Array,
     psi_c_Y: jax.Array,
@@ -626,10 +583,8 @@ def apply_V_ring(
     # transition-Hartree density, one V_q0 solve, then broadcast back at every
     # k in the decode (VERDICT.md).  k is a replicated (unsharded) axis here, so
     # the reduction is device-local.  The two 1/sqrt_nk compose to 1/Nk.
-    # ring_spin_degeneracy(nspinor): the missing spin-restricted-singlet
-    # weight (KNOWN_LORRAX_ISSUES.md 2026-08-23) — see that function's
-    # docstring for the derivation and scope.
-    S_total = (jnp.sum(S_total, axis=2) / sqrt_nk) * ring_spin_degeneracy(nspinor)  # (b, nu_local)
+    # exchange_spin_weight: the scalar-singlet 2 (bse_preconditioner owns it).
+    S_total = (jnp.sum(S_total, axis=2) / sqrt_nk) * exchange_spin_weight(nspinor)  # (b, nu_local)
 
     U_partial = jnp.einsum("MN,bN->bM", V_q0, S_total)  # (b, mu_local)
     U = lax.psum(U_partial, axis_name="y")
@@ -649,120 +604,6 @@ def apply_V_ring(
     VX = lax.psum_scatter(VX_partial, axis_name="x", scatter_dimension=1, tiled=True)
 
     return VX / sqrt_nk
-
-
-def build_bse_ring_matvec(
-    mesh_xy: Mesh,
-    nkx: int,
-    nky: int,
-    nkz: int,
-    low_mem: bool = True,
-    include_W: bool = True,
-):
-    px, py = mesh_xy.devices.shape
-    sh = make_bse_shardings(mesh_xy)
-    nk = nkx * nky * nkz
-
-    def _encode_T(X, psi_c_X, psi_v_Y):
-        c_chunk = X.shape[1]
-        v_chunk = X.shape[2]
-        n_rmu_local_X = psi_c_X.shape[-1]
-        n_rmu_local_Y = psi_v_Y.shape[-1]
-        R = _ring_sum_valence(X, psi_v_Y, v_chunk, py, n_rmu_local_Y)
-        T = _ring_sum_conduction(R, psi_c_X, c_chunk, px, n_rmu_local_X)
-        return T
-
-    encode_T_ring = _shard_map_fn(
-        _encode_T,
-        mesh=mesh_xy,
-        in_specs=(P(None, "x", "y", None), P(None, None, None, "x"), P(None, None, None, "y")),
-        out_specs=P(None, "x", "y", None, None, None),
-    )
-
-    def _encode_T_gather(X, psi_c_X, psi_v_Y):
-        X_full_v = lax.all_gather(X, "y", axis=2, tiled=True)
-        R = jnp.einsum("kvsN,bcvk->bcksN", jnp.conj(psi_v_Y), X_full_v)
-        R_full_c = lax.all_gather(R, "x", axis=1, tiled=True)
-        T = jnp.einsum("kctM,bcksN->bMNtsk", psi_c_X, R_full_c)
-        return T
-
-    encode_T_gather = _shard_map_fn(
-        _encode_T_gather,
-        mesh=mesh_xy,
-        in_specs=(P(None, "x", "y", None), P(None, None, None, "x"), P(None, None, None, "y")),
-        out_specs=P(None, "x", "y", None, None, None),
-    )
-
-    def _apply_V_ring_only(X, psi_c_Y, psi_v_Y, M_X, V_q0):
-        return apply_V_ring(X, psi_c_Y, psi_v_Y, M_X, V_q0, nk, px, py)
-
-    apply_V_ring_only = _shard_map_fn(
-        _apply_V_ring_only,
-        mesh=mesh_xy,
-        in_specs=(P(None, "x", "y", None), P(None, None, None, "y"), P(None, None, None, "y"),
-                  P(None, None, None, "x"), P("x", "y")),
-        out_specs=P(None, "x", "y", None),
-    )
-
-    # ψ†Uψ decode = contract_bands_block_reshard, extra="leading" (owner
-    # order 2026-07-29; adoption map wk_REL/contract_bands_notes.md §6.2):
-    # the structural stacked psum_scatter chain -- large partial over the
-    # node-local 'y' groups, small final over 'x', all b trials on ONE
-    # collective per mesh axis.  The rung's k-convolution emits the decode's
-    # canonical O layout (b, k, t, M, s, N) straight from its store
-    # (:func:`_make_ring_rung`), so no transpose sits between them.
-    _w_decode = contract_bands_block_reshard(mesh_xy, extra="leading")
-    _apply_W_from_T = _make_ring_rung(mesh_xy, (nkx, nky, nkz), _w_decode)
-
-    apply_W_from_T = jax.jit(
-        _apply_W_from_T,
-        in_shardings=(sh.T, sh.psi_x, sh.psi_y, sh.W),
-        out_shardings=sh.X,
-        # NB: T (arg 0) is NOT donated — the WX output has a different shape
-        # (nt,c,v,k) so the donation is always declined (no aliasable output) and
-        # emits no fallback copy. Dropping the cosmetic donate_argnums silences the
-        # recurring "donated buffers not usable" warning (audit P5, JOINT_FINDINGS §3).
-    )
-
-    def _apply_D_term(X, eps_c, eps_v):
-        delta_E = eps_c.T[None, :, None, :] - eps_v.T[None, None, :, :]
-        return delta_E * X
-
-    apply_D_term = jax.jit(
-        _apply_D_term,
-        in_shardings=(sh.X, sh.eps, sh.eps),
-        out_shardings=sh.X,
-    )
-
-    def _matvec_impl(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0,
-                     M_X, M_Y):
-        # M_X: hoisted decode-side exchange pair amplitude (audit P3). M_Y / psi_v_X
-        # are unused here — kept for a uniform matvec signature with the stack path.
-        D_term = apply_D_term(X, eps_c, eps_v)
-        V_term = apply_V_ring_only(X, psi_c_Y, psi_v_Y, M_X, V_q0)
-        if not include_W:
-            return D_term + V_term
-        T = encode_T_ring(X, psi_c_X, psi_v_Y) if low_mem else encode_T_gather(X, psi_c_X, psi_v_Y)
-        W_term = apply_W_from_T(T, psi_c_X, psi_v_Y, W_R)
-        return D_term + V_term - W_term
-
-    return jax.jit(
-        _matvec_impl,
-        in_shardings=(
-            sh.X,
-            sh.psi_x,
-            sh.psi_y,
-            sh.psi_x,
-            sh.psi_y,
-            sh.eps,
-            sh.eps,
-            sh.W,
-            sh.V,
-            sh.psi_x,
-            sh.psi_y,
-        ),
-        out_shardings=sh.X,
-    )
 
 
 def build_bse_ring_matvec_full(
@@ -1485,12 +1326,12 @@ def build_density_snapshot_operator(
 
         _, S_total = lax.fori_loop(0, px, step_x, (A_local, S0))
 
-        # ring_spin_degeneracy(nspinor): this ENCODE is the resolvent's own
+        # exchange_spin_weight(nspinor): this ENCODE is the resolvent's own
         # outer readout (v(M s), the density-snapshot vertex named in
         # bse_w_exact._build_rpa_resolvent's docstring) and needs the SAME
         # missing weight as apply_V_ring's identically-shaped S_total — see
-        # ring_spin_degeneracy's docstring (KNOWN_LORRAX_ISSUES.md 2026-08-23).
-        S_total = (S_total / sqrt_nk) * ring_spin_degeneracy(nspinor)
+        # exchange_spin_weight's docstring (KNOWN_LORRAX_ISSUES.md 2026-08-23).
+        S_total = (S_total / sqrt_nk) * exchange_spin_weight(nspinor)
 
         # V_q0 @ S: local N-slice partials, N tiled on y (mu on x from V_q0).
         U_partial = jnp.einsum("MN,bNk->bMk", V_q0, S_total)  # (b, mu_local_x, k)

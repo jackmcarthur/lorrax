@@ -71,8 +71,12 @@ def _build_dense_H(data):
     # Exchange — DENSE in (k,k′).  Kx[c,v,k, c',v',k'] = M V M†: the bra carries
     # the bare vertex, the ket the conjugate (transition density
     # <0|ρ̂|Ψ> = Σ A_cvk ψ_ck ψ*_vk).
+    # Scalar-singlet weight (bse/context/README.md): D + 2V − W for a scalar
+    # run, D + V − W for spinors.  Spelled here, not imported, so the oracle
+    # stays independent of the matvec it checks.
+    w_x = 2.0 if psi_c.shape[2] == 1 else 1.0
     lhs = np.einsum("kcvM,MN->kcvN", M, V_q0)            # M·V
-    Kx = np.einsum("kcvN,KCVN->cvkCVK", lhs, np.conj(M)) / nk
+    Kx = w_x * np.einsum("kcvN,KCVN->cvkCVK", lhs, np.conj(M)) / nk
 
     # Direct — screened W_{μν}(k−k′), 1/Nk, q = k − k′ (ortho fft convolution).
     Wflat = W_q.reshape(nmu, nmu, nk)   # (μ,ν,qflat) C-order
@@ -128,7 +132,7 @@ def _build_dense_nontda(data):
 
 
 # ---------------------------------------------------------------------------
-# Matvec drivers (single device; 1×1 mesh for the sharded kinds).
+# Matvec driver (single device, 1×1 mesh): the stack matvec.
 # ---------------------------------------------------------------------------
 def _random_X(nb, nc, nv, nk):
     rng = np.random.default_rng(1234)
@@ -137,9 +141,10 @@ def _random_X(nb, nc, nv, nk):
     return jnp.asarray(x)
 
 
-def _sharded_matvec(kind, data, X, include_W):
+def _sharded_matvec(data, X, include_W):
     from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
-    from bse.bse_ring_comm import build_bse_ring_matvec, make_bse_shardings
+    from bse.bse_ring_comm import make_bse_shardings
+    from bse.bse_stack_matvec import build_bse_stack_matvec
     from bse.bse_preconditioner import compute_pair_amplitude
 
     mesh = Mesh(np.array(jax.devices()[:1]).reshape(1, 1), axis_names=("x", "y"))
@@ -159,22 +164,12 @@ def _sharded_matvec(kind, data, X, include_W):
             compute_pair_amplitude(psi_c_X, psi_v_X), sh.psi_x)
         M_Y = jax.lax.with_sharding_constraint(
             compute_pair_amplitude(psi_c_Y, psi_v_Y), sh.psi_y)
-        if kind == "stack":
-            from bse.bse_stack_matvec import build_bse_stack_matvec
-            mv = build_bse_stack_matvec(mesh, nkx, nky, nkz,
-                                        kernel="bse" if include_W else "rpa")
-        else:
-            mv = build_bse_ring_matvec(
-                mesh, nkx, nky, nkz, include_W=include_W,
-                low_mem=(kind == "ring"))
+        mv = build_bse_stack_matvec(mesh, nkx, nky, nkz,
+                                    kernel="bse" if include_W else "rpa")
         HX = mv(Xs, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y,
                 data["eps_c"], data["eps_v"], W_R, V_q0, M_X, M_Y)
         HX.block_until_ready()
     return HX
-
-
-def _run_matvec(kind, data, X, include_W):
-    return _sharded_matvec(kind, data, X, include_W)
 
 
 def _relerr(a, b):
@@ -183,15 +178,11 @@ def _relerr(a, b):
     return float(np.linalg.norm(a - b) / max(np.linalg.norm(b), 1e-300))
 
 
-MATVEC_KINDS = ["stack", "ring"]
-
-
 # ---------------------------------------------------------------------------
 # Gates.
 # ---------------------------------------------------------------------------
 @pytest.mark.gpu
-@pytest.mark.parametrize("kind", MATVEC_KINDS)
-def test_w_positive_control(bse_dense_state, kind):
+def test_w_positive_control(bse_dense_state):
     """W-only control (passes pre- AND post-fix; pins q = k−k′ sign).
 
     (matvec_W − matvec_noW)(X) == −(Kd @ X), exactly — W is untouched by B1.
@@ -202,16 +193,15 @@ def test_w_positive_control(bse_dense_state, kind):
     nc = int(data["psi_c"].shape[1]); nv = int(data["psi_v"].shape[1])
     nk = int(data["nkx"] * data["nky"] * data["nkz"])
     X = _random_X(1, nc, nv, nk)
-    hxw = np.asarray(_run_matvec(kind, data, X, True))[0].reshape(-1)
-    hx0 = np.asarray(_run_matvec(kind, data, X, False))[0].reshape(-1)
+    hxw = np.asarray(_sharded_matvec(data, X, True))[0].reshape(-1)
+    hx0 = np.asarray(_sharded_matvec(data, X, False))[0].reshape(-1)
     lhs = hxw - hx0
     rhs = -(Kd @ np.asarray(X)[0].reshape(-1))
-    assert _relerr(lhs, rhs) < 1e-9, f"{kind}: W control rel-err {_relerr(lhs, rhs):.2e}"
+    assert _relerr(lhs, rhs) < 1e-9, f"W control rel-err {_relerr(lhs, rhs):.2e}"
 
 
 @pytest.mark.gpu
-@pytest.mark.parametrize("kind", MATVEC_KINDS)
-def test_full_H_matches_dense(bse_dense_state, kind):
+def test_full_H_matches_dense(bse_dense_state):
     """matvec(X) == H @ X — dense (k,k') exchange (B1 fixed)."""
     harness.skip_unless_gpu(pytest)
     data = bse_dense_state
@@ -219,14 +209,13 @@ def test_full_H_matches_dense(bse_dense_state, kind):
     nc = int(data["psi_c"].shape[1]); nv = int(data["psi_v"].shape[1])
     nk = int(data["nkx"] * data["nky"] * data["nkz"])
     X = _random_X(1, nc, nv, nk)
-    hx = np.asarray(_run_matvec(kind, data, X, True))[0].reshape(-1)
+    hx = np.asarray(_sharded_matvec(data, X, True))[0].reshape(-1)
     ref = H @ np.asarray(X)[0].reshape(-1)
-    assert _relerr(hx, ref) < 1e-9, f"{kind}: full-H rel-err {_relerr(hx, ref):.2e}"
+    assert _relerr(hx, ref) < 1e-9, f"full-H rel-err {_relerr(hx, ref):.2e}"
 
 
 @pytest.mark.gpu
-@pytest.mark.parametrize("kind", MATVEC_KINDS)
-def test_DV_matches_dense(bse_dense_state, kind):
+def test_DV_matches_dense(bse_dense_state):
     """matvec_{include_W=False}(X) == (diag(D)+Kx) @ X — dense exchange locus (B1)."""
     harness.skip_unless_gpu(pytest)
     data = bse_dense_state
@@ -234,10 +223,10 @@ def test_DV_matches_dense(bse_dense_state, kind):
     nc = int(data["psi_c"].shape[1]); nv = int(data["psi_v"].shape[1])
     nk = int(data["nkx"] * data["nky"] * data["nkz"])
     X = _random_X(1, nc, nv, nk)
-    hx = np.asarray(_run_matvec(kind, data, X, False))[0].reshape(-1)
+    hx = np.asarray(_sharded_matvec(data, X, False))[0].reshape(-1)
     xf = np.asarray(X)[0].reshape(-1)
     ref = D * xf + Kx @ xf
-    assert _relerr(hx, ref) < 1e-9, f"{kind}: D+V rel-err {_relerr(hx, ref):.2e}"
+    assert _relerr(hx, ref) < 1e-9, f"D+V rel-err {_relerr(hx, ref):.2e}"
 
 
 @pytest.mark.gpu
@@ -262,7 +251,7 @@ def test_spectrum_matches_dense(bse_dense_state):
     N = nc * nv * nk
     basis = jnp.asarray(np.eye(N, dtype=np.complex128).reshape(N, nc, nv, nk))
     # row i of the batched output is H·e_i = column i of H, so cols == Hᵀ.
-    cols = np.asarray(_run_matvec("stack", data, basis, True)).reshape(N, N)
+    cols = np.asarray(_sharded_matvec(data, basis, True)).reshape(N, N)
     Hmat = cols.T
     assert _relerr(Hmat, H) < 1e-9, f"materialised matvec ≠ H: {_relerr(Hmat, H):.2e}"
     ev_mat = np.sort(np.linalg.eigvalsh(0.5 * (Hmat + Hmat.conj().T)))

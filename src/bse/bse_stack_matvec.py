@@ -78,15 +78,13 @@ now stands:
     deleted, and the ``yhoist`` collective hoist is unconditional (``3a7704bb``,
     ``8349b65c``, ``ac67fd3c``).  ``LORRAX_BSE_MATVEC_OPT`` survives because
     ``gspmd`` remains — see the dial's own note below.
-  * STILL OPEN — ``bse_ring_comm.build_bse_ring_matvec`` (TDA), used by
-    ``bse_feast.estimate_spectral_bounds_sharded`` (spectral-bound Lanczos) and
-    the equality gates.  Repoint + delete together with ``bse_simple`` and the
-    ``matvec_kind`` CLI flag/data key once the spectral-bound Lanczos is moved
-    over.  The flag is ALREADY INERT on the sharded eigensolve path
-    (``bse_lanczos.py``, "the legacy ``matvec_kind`` selector is retired here"):
-    it is still parsed and still steers ``absorption_haydock``, so deleting it
-    is a driver-surface change, not a rename.  This is the one row of the plan
-    that needs an owner call rather than a follow-up commit.
+  * DONE 2026-09-24 — ``bse_simple``, ``bse_serial``, ``--matvec-kind`` and the
+    TDA ``build_bse_ring_matvec`` are deleted.  Its three consumers (FEAST
+    spectral bounds, KPM, pseudopoles) now use this builder, and the dense
+    references in the tests are the TDA oracle.  The audit that retired it: the
+    ring's 1.02 disagreement with the dense reference was the scalar-singlet
+    exchange weight, which the ring applied and this module did not
+    (``bse_preconditioner.exchange_spin_weight`` now owns it for both).
 
 THE COUPLING BLOCK, AND THE FUSION THAT PAYS FOR IT
 ---------------------------------------------------
@@ -137,6 +135,7 @@ from common.shard_map import shard_map as _shard_map_fn
 
 from common.contract_bands import reduce_scatter_to_band_block
 from common.fft_helpers import make_kconv_kminor, make_local_kconv_kminor
+from .bse_preconditioner import exchange_spin_weight
 from .bse_ring_comm import make_bse_shardings
 
 
@@ -504,8 +503,10 @@ def build_bse_stack_matvec(
         # decode.  Fixed by the transition density <0|ρ̂|Ψ> = Σ A_cvk ψ_ck ψ*_vk;
         # the reverse assignment builds conj(K^x), which cannot be covariant
         # alongside the (correct, untouched) W term.
+        # The encode carries the scalar-singlet weight (2 scalar, 1 spinor).
+        w_x = exchange_spin_weight(psi_c_X.shape[2])
         S = jnp.einsum("kcvN,bcvk->bN", jnp.conj(M_Y), X)         # k SUMMED → (b, ν_loc)
-        S = lax.with_sharding_constraint(S, sh.S_k0) / sqrt_nk
+        S = lax.with_sharding_constraint(S, sh.S_k0) / sqrt_nk * w_x   # ×1.0 is exact
         U = jnp.einsum("MN,bN->bM", V_q0, S)                      # (b, μ_loc)
         U = lax.with_sharding_constraint(U, sh.d_mu)
         VX = jnp.einsum("kcvM,bM->bcvk", M_X, U)                 # broadcast over k
@@ -520,7 +521,7 @@ def build_bse_stack_matvec(
             #    encode leg carries the conjugated vertex.
             # D_head = conj(d), so conj(D_head) is the bare dipole and the
             # two legs read exactly as M_Y / M_X do above.
-            Sh = jnp.einsum("kcva,bcvk->ba", jnp.conj(D_head), X) / sqrt_nk
+            Sh = jnp.einsum("kcva,bcvk->ba", jnp.conj(D_head), X) / sqrt_nk * w_x
             Uh = Sh @ M_head.astype(Sh.dtype).T                   # U_a = M_ab S_b
             HX = jnp.einsum("kcva,ba->bcvk", D_head, Uh)
             VX = VX + lax.with_sharding_constraint(HX, sh.X) / sqrt_nk
@@ -659,7 +660,8 @@ def build_bse_stack_pair_matvec(
         #    conjugation is settled and re-litigating it is a known failure.
         S_A = jnp.einsum("kcvN,bcvk->bN", jnp.conj(M_Y), X)       # (b, ν_loc)
         S_B = jnp.einsum("kcvN,bcvk->bN", M_Y, Xb)                # (b, ν_loc)
-        S = lax.with_sharding_constraint(S_A + sc * S_B, sh.S_k0) / sqrt_nk
+        S = (lax.with_sharding_constraint(S_A + sc * S_B, sh.S_k0) / sqrt_nk
+             * exchange_spin_weight(psi_c_X.shape[2]))
         U = jnp.einsum("MN,bN->bM", V_q0, S)                      # (b, μ_loc)
         U = lax.with_sharding_constraint(U, sh.d_mu)
         VX = jnp.einsum("kcvM,bM->bcvk", M_X, U)                  # broadcast over k

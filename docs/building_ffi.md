@@ -122,7 +122,7 @@ The ten gates it runs, and the property each one guards:
 | gate | property |
 |---|---|
 | 0 | the backends this build was **declared** to contain are the ones it exports, by stamp *and* by symbol |
-| 1 | exactly one MPI runtime in the resolved closure — two means `MPI_COMM_WORLD` differs between frames |
+| 1 | exactly one MPI runtime in the resolved closure — two means `MPI_COMM_WORLD` differs between frames (matches `libmpi`, `libmpi_gnu` and `libmpi_gnu_<N>`; before 2026-09-24 it missed cray-mpich 9.1's `libmpi_gnu.so.12`) |
 | 2 | one BLAS, one threading flavour — two lets ELF load order pick which one runs |
 | 3 | the host leg links nothing from the CUDA stack |
 | 4 | the dependency closure resolves at load time in this environment |
@@ -159,6 +159,20 @@ itself loudly on every invocation. An unverified library must not be deployed.
 bash config/perlmutter/build_ffi_host.sh --fresh          # host leg
 src/ffi/cpp/run_shifter.sh bash src/ffi/cpp/build.sh      # device leg
 ```
+
+**Both legs link one MPI, pinned in one file:** `config/perlmutter/ffi_mpi.sh`.
+It sets cray-mpich/9.0.1 (`libmpi_gnu_123.so.12`) and cray-libsci/25.09.0,
+and unloads darshan.
+- The host recipe sources it.
+- The bare-host CUDA-13 recipe (`lorrax_cuda13_runtime/recipe/build_ffi_phdf5.sh`,
+  driven by `rebuild_ffi.sh`) sources it out of the checkout it builds.
+- The values are the ones the phdf5 stage (cray-hdf5-parallel/1.14.3.7) and
+  the SLATE host install already need.
+- Change them there and nowhere else.
+
+Before this pin, the host leg took the site defaults: cray-mpich 9.1.0 via
+cray-libsci/26.03.0, plus darshan's `libdarshan.so.0`.  The CUDA leg linked
+9.0.1, so the pair could not be sealed.
 
 Running the *generic* `src/ffi/cpp/build_host.sh` here now hands over to the
 site recipe rather than building a reduced library — that hand-off is the direct

@@ -30,8 +30,9 @@ from solvers.chebyshev import (
     reconstruct_dos,
     partition_windows,
 )
-from .bse_ring_comm import (build_bse_ring_matvec, build_bse_ring_matvec_full,
+from .bse_ring_comm import (build_bse_ring_matvec_full,
                             create_mesh_xy_from_flags, make_bse_shardings)
+from .bse_stack_matvec import build_bse_stack_matvec
 from .bse_feast import (estimate_spectral_bounds_sharded,
                         _build_gmres_data_fp32, ensure_W_R)
 from .bse_io import (load_bse_data_from_restart_sharded, pad_zone_mask_np)
@@ -156,12 +157,12 @@ def run_kpm_dos(
 ) -> dict:
     """Run KPM DOS calculation: bounds, moments, reconstruction, plot."""
     if use_tda:
-        matvec = build_bse_ring_matvec(
+        matvec = build_bse_stack_matvec(
             mesh_xy,
             data["nkx"],
             data["nky"],
             data["nkz"],
-            include_W=include_W,
+            kernel="bse" if include_W else "rpa",
         )
     else:
         matvec = build_bse_ring_matvec_full(

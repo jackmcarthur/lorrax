@@ -66,11 +66,15 @@ if printf %s "$LDD_OUT" | grep -q "not found"; then
     exit 1
 fi
 
-# Every resolved path in the closure whose basename is an MPI *runtime*
-# (libmpi.so / libmpi_gnu_<N>.so).  Excludes libmpifort*, libmpi_gtl_*.
+# Every resolved path in the closure whose basename is an MPI *runtime*:
+# libmpi.so, libmpi_gnu.so (cray-mpich >= 9.1) or libmpi_gnu_<N>.so.
+# Excludes libmpifort* and libmpi_gtl_*.  The pattern missed libmpi_gnu.so
+# until 2026-09-24.  A host leg linking 9.1.0's libmpi_gnu.so.12 beside HDF5's
+# 9.0.1 libmpi_gnu_123.so.12 then passed this gate with one "distinct" MPI.
+MPI_RE="/libmpi(_gnu(_[0-9]+)?)?\\.so"
 mapfile -t MPI_PATHS < <(printf %s\\n "$LDD_OUT" \
     | sed -n "s|.*=> \\(/[^ ]*\\).*|\\1|p" \
-    | grep -E "/libmpi(_gnu_[0-9]+)?\\.so" || true)
+    | grep -E "$MPI_RE" || true)
 
 if [[ ${#MPI_PATHS[@]} -eq 0 ]]; then
     echo "[$TAG] GATE FAILED (S3): no libmpi in the closure of $SO" >&2
@@ -85,7 +89,7 @@ mapfile -t MPI_SONAMES < <(for p in "${MPI_REAL[@]}"; do
 done | sort -u)
 
 echo "[$TAG] libmpi requests in closure:"
-printf %s\\n "$LDD_OUT" | grep -E "/libmpi(_gnu_[0-9]+)?\\.so" | sed "s/^/[$TAG]   /"
+printf %s\\n "$LDD_OUT" | grep -E "$MPI_RE" | sed "s/^/[$TAG]   /"
 echo "[$TAG] distinct mapped objects: ${#MPI_REAL[@]}"
 for p in "${MPI_REAL[@]}"; do echo "[$TAG]   $p"; done
 echo "[$TAG] SONAMEs: ${MPI_SONAMES[*]}"

@@ -27,7 +27,7 @@ import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from solvers.quadrature import feast_ellipse_quadrature as _feast_ellipse_quadrature_generic
-from .bse_ring_comm import (build_bse_ring_matvec, build_bse_ring_matvec_full,
+from .bse_ring_comm import (build_bse_ring_matvec_full,
                             create_mesh_xy_from_flags, make_bse_shardings)
 from .bse_stack_matvec import build_bse_stack_matvec
 from .bse_preconditioner import energy_diff_cv_k
@@ -1018,12 +1018,12 @@ def estimate_spectral_bounds_sharded(
     n_val_pad = int(data["n_val_pad"])
 
     sh = make_bse_shardings(mesh_xy)
-    matvec = build_bse_ring_matvec(
+    matvec = build_bse_stack_matvec(
         mesh_xy,
         data["nkx"],
         data["nky"],
         data["nkz"],
-        include_W=include_W,
+        kernel="bse" if include_W else "rpa",
     )
 
     key = jax.random.PRNGKey(seed)
