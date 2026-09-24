@@ -1517,6 +1517,11 @@ def build_gram_q0_via_loadwfns(
         raise ValueError(
             f"Empty band window: left={left_range} right={right_range}"
         )
+    # Equal windows (every production run) load ONE set of faces and pair
+    # tensors and pass them as both sides: the right load would repeat the
+    # same WFN read, FFT and norm clamp on the same bands, so reuse is
+    # bitwise the second load's value.
+    same_window = left_range == right_range
 
     # Meta's nband must cover whichever of left/right reaches higher.
     max_band = max(left_range[1], right_range[1])
@@ -1676,16 +1681,21 @@ def build_gram_q0_via_loadwfns(
         col_block = 0  # one full block == the original computation
 
     if col_block:
-        with timing.section("right.load"):
-            psi_r_rmu_Y, psi_r_rmuT_X = load_centroids_band_chunked(
-                wfn, sym, meta, cand_idx, bispinor, mesh_xy, right_range,
-                band_chunk_size=band_chunk_size,
-                k_chunk_size=prune_k_tile,
-            )
-            if norms_r_j is not None:
-                psi_r_rmu_Y = psi_r_rmu_Y / norms_r_j[None, :, None, None]
-                psi_r_rmuT_X = psi_r_rmuT_X / norms_r_j[None, None, :, None]
-            psi_r_rmu_Y.block_until_ready()
+        if same_window:
+            psi_r_rmu_Y, psi_r_rmuT_X = psi_l_rmu_Y, psi_l_rmuT_X
+        else:
+            with timing.section("right.load"):
+                psi_r_rmu_Y, psi_r_rmuT_X = load_centroids_band_chunked(
+                    wfn, sym, meta, cand_idx, bispinor, mesh_xy,
+                    right_range,
+                    band_chunk_size=band_chunk_size,
+                    k_chunk_size=prune_k_tile,
+                )
+                if norms_r_j is not None:
+                    psi_r_rmu_Y = psi_r_rmu_Y / norms_r_j[None, :, None, None]
+                    psi_r_rmuT_X = (
+                        psi_r_rmuT_X / norms_r_j[None, None, :, None])
+                psi_r_rmu_Y.block_until_ready()
 
         # Compiler-aware width selection happens only after BOTH canonical
         # WFN windows exist.  The allocator reading is therefore the actual
@@ -1710,8 +1720,9 @@ def build_gram_q0_via_loadwfns(
             # CPU/fallback accounting: sum the returned WFN shards.  Announce
             # that this is weaker because it cannot see service tables.
             resident_local_bytes = 0
-            for arr in (psi_l_rmu_Y, psi_l_rmuT_X,
-                        psi_r_rmu_Y, psi_r_rmuT_X):
+            faces = {id(arr): arr for arr in (psi_l_rmu_Y, psi_l_rmuT_X,
+                                              psi_r_rmu_Y, psi_r_rmuT_X)}
+            for arr in faces.values():
                 resident_local_bytes += sum(
                     int(np.asarray(sh.data).nbytes)
                     for sh in arr.addressable_shards
@@ -1720,7 +1731,7 @@ def build_gram_q0_via_loadwfns(
             announce_once(
                 "gram-live-allocator-unavailable",
                 "allocator bytes_in_use unavailable for the Gram planner; "
-                "using the four canonical WFN output shards as a KNOWN-LOW "
+                "using the canonical WFN output shards as a KNOWN-LOW "
                 "resident floor",
             )
         else:
@@ -1792,7 +1803,8 @@ def build_gram_q0_via_loadwfns(
                 f"{n_dev_total}-device path; {block_source}; "
                 f"square-law={square_gib:.2f} GiB global, "
                 f"pair-workspace model={local_gib:.2f} GiB/device; "
-                f"resident(two WFN windows; worst rank)="
+                f"resident({'one shared' if same_window else 'two'} "
+                f"WFN window(s); worst rank)="
                 f"{resident_bytes / 2**30:.2f}, "
                 f"compiled scan increment="
                 f"{live_facts['scan_increment'] / 2**30:.2f}, "
@@ -1821,20 +1833,23 @@ def build_gram_q0_via_loadwfns(
     del psi_l_rmu_Y, psi_l_rmuT_X
 
     # ---- Right window ----
-    with timing.section("right.load"):
-        psi_r_rmu_Y, psi_r_rmuT_X = load_centroids_band_chunked(
-            wfn, sym, meta, cand_idx, bispinor, mesh_xy, right_range,
-            band_chunk_size=band_chunk_size,
-            k_chunk_size=prune_k_tile,
-        )
-        if norms_r_j is not None:
-            psi_r_rmu_Y = psi_r_rmu_Y / norms_r_j[None, :, None, None]
-            psi_r_rmuT_X = psi_r_rmuT_X / norms_r_j[None, None, :, None]
-        psi_r_rmu_Y.block_until_ready()
-    with timing.section("right.pair"):
-        P_r_k = pair_density(psi_r_rmuT_X, psi_r_rmu_Y, mesh_xy)
-        P_r_k.block_until_ready()
-    del psi_r_rmu_Y, psi_r_rmuT_X
+    if same_window:
+        P_r_k = P_l_k
+    else:
+        with timing.section("right.load"):
+            psi_r_rmu_Y, psi_r_rmuT_X = load_centroids_band_chunked(
+                wfn, sym, meta, cand_idx, bispinor, mesh_xy, right_range,
+                band_chunk_size=band_chunk_size,
+                k_chunk_size=prune_k_tile,
+            )
+            if norms_r_j is not None:
+                psi_r_rmu_Y = psi_r_rmu_Y / norms_r_j[None, :, None, None]
+                psi_r_rmuT_X = psi_r_rmuT_X / norms_r_j[None, None, :, None]
+            psi_r_rmu_Y.block_until_ready()
+        with timing.section("right.pair"):
+            P_r_k = pair_density(psi_r_rmuT_X, psi_r_rmu_Y, mesh_xy)
+            P_r_k.block_until_ready()
+        del psi_r_rmu_Y, psi_r_rmuT_X
 
     # ---- q=0 Gram: sum_k w_k · Σ_{αβ} conj(P_l_k,αβ) · P_r_k,αβ ----
     # γ̃ identity (charge channel) — open-spin Frobenius reduction.
