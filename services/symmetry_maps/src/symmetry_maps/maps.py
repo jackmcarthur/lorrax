@@ -1246,6 +1246,7 @@ def unfold_spin_centroid_operator(
     operator_transpose=None,
     right_sym_perm=None,
     right_L_table=None,
+    conjugate=False,
 ):
     r"""Unfold an open-spin centroid operator from k parents to full k.
 
@@ -1275,6 +1276,13 @@ def unfold_spin_centroid_operator(
     source maps prove that every endpoint gather stays within its X/Y shard.
     The lower-level owner authenticates that claim before compiling the
     collective-free local-gather kernel.
+
+    ``conjugate=True`` returns ``conj(O_k)`` at no extra pass: the conjugate
+    rides the gather's own fusion and the spin action takes ``conj(U)``,
+    since ``conj(U X U^dagger) = conj(U) conj(X) conj(U)^dagger`` holds
+    exactly in IEEE arithmetic (negation commutes with every product and
+    sum).  A consumer that needs the conjugated Green (the chi0 pair) would
+    otherwise materialise a second full-k copy after the opaque rotation.
     """
     shape = tuple(int(v) for v in operator_ibz.shape)
     if len(shape) != 5 or shape[2] != shape[4]:
@@ -1365,6 +1373,9 @@ def unfold_spin_centroid_operator(
         right_axis_local_sym_perm=right_local_perm,
     )
     spatial = flat_full.reshape(n_full, n_left, ns, n_right, ns)
+    if conjugate:
+        spatial = jnp.conj(spatial)
+        spin = np.conj(spin)
     # Keep the irregular centroid gather and the small dense spin action as
     # two device kernels.  Fusing them makes each gathered value feed four
     # output blocks and was 1.58x slower on the real P4 Si operator, whereas

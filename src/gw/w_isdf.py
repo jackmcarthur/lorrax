@@ -265,21 +265,23 @@ def _get_chi_minimax_kernel_face(mesh_xy, kgrid, nk, n_out, complex_contour,
             mask_v, mask_c, enk_full = (jnp.take(v, rows, axis=0)
                                        for v in (mask_v, mask_c, enk_full))
         t_c = jnp.conj(tau_scalar) if complex_contour else tau_scalar
+        # The pair leaves conjugated; the unfold writes the conjugate in its
+        # own gather pass (no second full-k copy after the spin rotation).
         Gv_k = jax.lax.with_sharding_constraint(
             build_G_tau(psi_mun_left, psi_nmu_right, enk_full,
                        -tau_scalar, e_ref=vmax,
                        mask=mask_v, layout=layout, gemm=g_plan,
                        k_unfold_plan=None if paired else k_unfold_plan,
-                       trim_zero_bands=True),
+                       trim_zero_bands=True, conjugate=True),
             _G_k_shard)
         Gc_k = jax.lax.with_sharding_constraint(
             build_G_tau(psi_mun_left, psi_nmu_right, enk_full,
                        t_c, e_ref=cmin,
                        mask=mask_c, layout=layout, gemm=g_plan,
                        k_unfold_plan=None if paired else k_unfold_plan,
-                       trim_zero_bands=True),
+                       trim_zero_bands=True, conjugate=True),
             _G_k_shard)
-        return jnp.conj(Gv_k), jnp.conj(Gc_k)
+        return Gv_k, Gc_k
 
     @partial(jax.jit,
              in_shardings=(_psi_mun_shard, _psi_nmu_shard,
@@ -304,12 +306,12 @@ def _get_chi_minimax_kernel_face(mesh_xy, kgrid, nk, n_out, complex_contour,
         for log_weight in (eps * tau - jnp.logaddexp(0.0, beta * eps),
                            -eps * tau - jnp.logaddexp(0.0, -beta * eps)):
             weight = jnp.where(live, jnp.exp(log_weight), 0.0)
-            green = jax.lax.with_sharding_constraint(
+            factors.append(jax.lax.with_sharding_constraint(
                 build_G_tau(psi_mun_left, psi_nmu_right, enk, zero_t,
                             band_weight=weight, layout=layout, gemm=g_plan,
-                            k_unfold_plan=k_unfold_plan),
-                _G_k_shard)
-            factors.append(green if ordered else jnp.conj(green))
+                            k_unfold_plan=k_unfold_plan,
+                            conjugate=not ordered),
+                _G_k_shard))
         return factors[0], factors[1]
 
     negate_full_q = None

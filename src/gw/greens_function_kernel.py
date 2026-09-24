@@ -58,11 +58,12 @@ def _build_G_face(psi_mun, psi_nmu, *, gemm, Gij=None, phases=None, mesh=None,
 
 def build_G(psi_xn, psi_yr, *, Gij=None, phases=None, layout='face',
            gemm=None, k_unfold_plan=None, right_k_unfold_plan=None, real_weights=None,
-           band_range=None, prepared_active_gemm=None):
+           band_range=None, prepared_active_gemm=None, conjugate=False):
     """Build parent operators and transport both typed endpoints without processor exchange.
 
     The Green is centroid-major ``(nk, mu, s, nu, s')`` on parents and on
-    full k alike; see :func:`_build_G_face`.
+    full k alike; see :func:`_build_G_face`.  ``conjugate=True`` returns
+    ``conj(G)``, folded into the unfold's own pass when there is one.
     """
     if layout not in ('face', 'axis'):
         raise ValueError("build_G requires canonical faces with layout=face or axis.")
@@ -73,7 +74,7 @@ def build_G(psi_xn, psi_yr, *, Gij=None, phases=None, layout='face',
                       band_range=band_range,
                       prepared_active_gemm=prepared_active_gemm)
     if k_unfold_plan is None:
-        return G
+        return jnp.conj(G) if conjugate else G
     transposed = None
     if np.any(np.asarray(k_unfold_plan.sym_idx) >= k_unfold_plan.n_sym_spatial):
         if (real_weights is True or phases is None
@@ -89,7 +90,8 @@ def build_G(psi_xn, psi_yr, *, Gij=None, phases=None, layout='face',
                                         prepared_active_gemm=prepared_active_gemm),
                 lambda _: jnp.conj(G), operand=None)
     return k_unfold_plan.unfold_operator(
-        G, operator_transpose=transposed, right_plan=right_k_unfold_plan)
+        G, operator_transpose=transposed, right_plan=right_k_unfold_plan,
+        conjugate=conjugate)
 
 
 def windowed_exp_iEt(E, t, E_min=None, E_max=None, *, e_ref=0.0):
@@ -202,7 +204,8 @@ def _phase_band_interval(phases):
 def build_G_tau(psi_xn, psi_yr, enk, t, *, e_ref=0.0, mask=None,
                 band_weight=None, E_min=None, E_max=None,
                 layout='face', gemm=None, k_unfold_plan=None, band_range=None,
-                trim_zero_bands=False, prepared_active_gemm=None):
+                trim_zero_bands=False, prepared_active_gemm=None,
+                conjugate=False):
     """Contract phases exp(-t*(energy-reference)) with energy windows, identity masks and signed weights."""
     real_weights = not jnp.issubdtype(jnp.result_type(t), jnp.complexfloating)
     if not real_weights:
@@ -228,4 +231,5 @@ def build_G_tau(psi_xn, psi_yr, enk, t, *, e_ref=0.0, mask=None,
     return build_G(
         psi_xn, psi_yr, phases=phases, layout=layout, gemm=gemm,
         k_unfold_plan=k_unfold_plan, real_weights=real_weights,
-        band_range=band_range, prepared_active_gemm=prepared_active_gemm)
+        band_range=band_range, prepared_active_gemm=prepared_active_gemm,
+        conjugate=conjugate)

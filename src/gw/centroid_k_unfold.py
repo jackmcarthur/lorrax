@@ -179,14 +179,19 @@ class CentroidKUnfoldPlan:
             source[unused] = 0
         return jnp.take(src, jnp.asarray(source), axis=axis)
 
-    def unfold_operator(self, operator_parent, *, operator_transpose=None, right_plan=None):
-        """Transport the centroid-major ``(k_parent,mu,s,nu,s)`` Green to full k locally, in that order."""
+    def unfold_operator(self, operator_parent, *, operator_transpose=None, right_plan=None,
+                        conjugate=False):
+        """Transport the centroid-major ``(k_parent,mu,s,nu,s)`` Green to full k locally, in that order.
+
+        ``conjugate=True`` returns the conjugated full-k operator in the same pass.
+        """
         right = self if right_plan is None else right_plan
         return unfold_spin_centroid_operator(
             operator_parent,
             right_sym_perm=None if right_plan is None else right.sym_perm,
             right_L_table=None if right_plan is None else right.L_table,
             operator_transpose=operator_transpose,
+            conjugate=conjugate,
             irr_idx=self.irr_idx,
             sym_idx=self.sym_idx,
             sym_perm=self.sym_perm,
