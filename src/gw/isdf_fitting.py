@@ -268,8 +268,22 @@ def _fit_mubatch(
     # (over the ψ sphere, ~20x smaller than the r-space GEMM it replaced) and
     # on the ψ(G) slice; the upgrade path is the loader's unfold applied to D~.
     with timing.section("zeta_fit.mubatch.psi_G"):
-        psi = wfn.load(bands=(b_lo, b_hi), k="full_bz", bispinor=bool(bispinor),
-                       bispinor_lift=(bispinor_lift if bispinor else "raw"))
+        _lift = dict(bispinor=bool(bispinor),
+                     bispinor_lift=(bispinor_lift if bispinor else "raw"))
+        if int(k_unfold_plan.n_parent) < nk:
+            # The children by the plan's typed transport (the one C_q and the
+            # faces use), not the loader's G-space unfold: see
+            # zmb.typed_children_psi_G.
+            _pd = k_unfold_plan.sym.parent_k_domain
+            psi = zmb.typed_children_psi_G(
+                wfn.load(bands=(b_lo, b_hi), k=_pd, **_lift), mesh=mesh_xy,
+                plan=k_unfold_plan, fft_grid=fft_grid,
+                box_par=np.asarray(wfn.box_index(k=_pd)),
+                gvec_child=np.asarray(wfn.gvecs(k="full_bz")),
+                ngk_child=np.asarray(wfn.ngk_valid(k="full_bz")),
+                k_child=np.asarray(wfn.kvecs(k="full_bz")))
+        else:
+            psi = wfn.load(bands=(b_lo, b_hi), k="full_bz", **_lift)
         nb_p, ngk_psi = int(psi.shape[1]), int(psi.shape[3])
         s_ax = padded_axis(ngk_psi, P_, name="route-G ψ sphere slots")
         g_spec = NamedSharding(mesh_xy, P(None, None, None, ('x', 'y')))

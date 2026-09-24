@@ -70,6 +70,74 @@ def identity_kplan(k_full_frac, centroid_fft_idx, fft_grid, mesh, ns):
                                         mesh, nspinor=int(ns), parent_k_frac=kf)
 
 
+def typed_children_psi_G(psi_par, *, mesh: Mesh, plan, fft_grid, box_par,
+                         gvec_child, ngk_child, k_child):
+    """Full-zone ψ(G) from the raw parents by the plan's typed transport.
+
+    The one transport ``C_q`` and the centroid faces use (so route G's Z and
+    C agree to rounding): per full k, the parent's box IFFT, the snapped grid
+    action (``symmetry_maps.centroid_source_map_and_wrap`` on the whole grid:
+    source point, lattice-wrap phase ``e^{2πi L·k̄}``, antiunitary
+    conjugation, then the spinor action ``plan.spin_action_full``), the
+    child's Bloch factor and the box FFT, gathered on the child's sphere.
+    The loader's own G-space unfold applies the raw translation phase and
+    differs from this by ~1e-10, which κ(C) ~ 1e8 turns into ~1e-6 in ζ
+    (CrI3 8x8), hence this path.
+
+    ``psi_par (n_parent, nb, ns, ngk)`` band-sharded ``P(None, XY, None,
+    None)``; ``box_par (n_parent, N_r)`` box → parent sphere slot (``ngk``
+    empty); ``gvec_child (nk, ngk, 3)`` / ``ngk_child`` / ``k_child`` the
+    children's sphere, valid count and k (the loader's full-BZ tables).
+    Returns ``(nk, nb, ns, ngk)`` band-sharded.
+    """
+    from symmetry_maps import centroid_source_map_and_wrap
+    fg = tuple(int(v) for v in fft_grid)
+    N = int(np.prod(fg))
+    grid = np.stack(np.meshgrid(*(np.arange(n) for n in fg), indexing='ij'),
+                    -1).reshape(-1, 3).astype(np.int32)
+    perm, L = centroid_source_map_and_wrap(grid, np.asarray(plan.spatial_ops),
+                                           np.asarray(plan.translations), fg,
+                                           extend_trs=True)
+    gv = np.asarray(gvec_child, dtype=np.int64) % np.asarray(fg)
+    child_flat = (gv[..., 0] * fg[1] * fg[2] + gv[..., 1] * fg[2] + gv[..., 2]).astype(np.int32)
+    live = (np.arange(gv.shape[1])[None, :] < np.asarray(ngk_child)[:, None])
+    nk = int(gv.shape[0])
+    n_sym = int(plan.n_sym_spatial)
+    xs = (grid / np.asarray(fg, float))
+    ops = [np.asarray(a) for a in (
+        np.asarray(box_par, np.int32).reshape(-1, N), perm.astype(np.int32),
+        L.astype(np.float64), child_flat, live.astype(np.float64),
+        np.asarray(plan.k_parent_frac, np.float64), np.asarray(k_child, np.float64),
+        np.asarray(plan.spin_action_full, np.complex128),
+        np.asarray(plan.irr_idx, np.int32), np.asarray(plan.sym_idx, np.int32), xs)]
+    from common.collectives import device_put_process_local
+    rep = NamedSharding(mesh, P())
+    ops = [device_put_process_local(a, rep) for a in ops]
+
+    @partial(shard_map, mesh=mesh,
+             in_specs=(P(None, _XY, None, None),) + (P(),) * len(ops),
+             out_specs=P(None, _XY, None, None), check_vma=False)
+    def _f(psi, inv_par, perm, L, cflat, lv, kpar, kch, U, irr, sym, x):
+        nb, ns = int(psi.shape[1]), int(psi.shape[2])
+
+        def one(_, k):
+            p, s_ = irr[k], sym[k]
+            cz = jnp.concatenate([psi[p], jnp.zeros((nb, ns, 1), psi.dtype)], -1)
+            box = jnp.take(cz, inv_par[p], axis=-1).reshape(nb, ns, *fg)
+            u = jnp.fft.ifftn(box, axes=(-3, -2, -1), norm='ortho').reshape(nb, ns, N)
+            v = u * jnp.exp(2j * jnp.pi * (x @ kpar[p]))
+            v = jnp.take(v, perm[s_], axis=-1) * jnp.exp(2j * jnp.pi * (L[s_] @ kpar[p]))
+            v = jnp.where(s_ >= n_sym, jnp.conj(v), v)
+            v = jnp.einsum('ac,ncr->nar', U[k], v) * jnp.exp(-2j * jnp.pi * (x @ kch[k]))
+            ck = jnp.fft.fftn(v.reshape(nb, ns, *fg), axes=(-3, -2, -1),
+                              norm='ortho').reshape(nb, ns, N)
+            return None, jnp.take(ck, cflat[k], axis=-1) * lv[k]
+
+        return jax.lax.scan(one, None, jnp.arange(nk, dtype=jnp.int32), unroll=1)[1]
+
+    return jax.jit(_f)(psi_par, *ops)
+
+
 def zeta_plane_tables(gvec_components, ngk_per_q, fft_grid, axis, g_axis):
     """The ζ sphere as a cylinder: its in-plane columns ``zc`` (union over the
     stored q), its axis values ``za`` (mod ``n_a``), and per ``(q, slot)`` the
