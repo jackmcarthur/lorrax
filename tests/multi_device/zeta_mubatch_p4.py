@@ -213,6 +213,68 @@ def run_case(case, fx, mesh, scratch):
                           f"b={mb.b}x{mb.n_batch}  rel={e:.2e}", flush=True)
                 if not e <= TOL:
                     raise SystemExit(f"{TAG} FAIL {case} {source}/{rows}/{pl}/{layout}: {e:.3e}")
+    # Route G: conj ψ(G) of the full zone (the children) sharded over G slots;
+    # the pair GEMM in G space, one all-to-all to the μ owners, planes there.
+    from common.wfn_transforms import psi_cylinder_tables
+    child = parity._children(fx)
+    kfull = np.asarray(fx["kfull"], dtype=np.float64)
+    xg = parity._grid_points(fg) / np.asarray(fg, float)
+    u = child * np.exp(-2j * np.pi * (xg @ kfull.T).T)[:, None, None, :]
+    cG = np.fft.fftn(u.reshape(*u.shape[:3], *fg), axes=(-3, -2, -1),
+                     norm="ortho").reshape(u.shape)
+    s_ax = padded_axis(n_rtot, 4, name="ψ sphere slots")
+    cbar = np.conj(np.asarray(pad_to_axis(cG, s_ax, axis=3)))
+    g3 = np.asarray(pad_to_axis(np.broadcast_to(G.astype(np.int32), (nk,) + G.shape).copy(),
+                                s_ax, axis=1))
+    axis = int(np.argmax(fg))
+    cyl = psi_cylinder_tables(np.broadcast_to(np.arange(n_rtot, dtype=np.int32).reshape(fg),
+                                              (nk,) + fg).copy(), fg, axis, ngkmax=n_rtot)
+    zt = zmb.zeta_plane_tables(G[sphere].transpose(0, 2, 1).astype(np.int64),
+                               np.full(len(q_sel), ngk), fg, axis, g_axis)
+    plan_id = zmb.identity_kplan(kfull, parity._grid_points(fg)[fx["cent_flat"]], fg, mesh, ns)
+    canon = np.asarray(plan.layout.axis.packed_to_canonical)
+    cbar_d = parity._put(cbar, NamedSharding(mesh, P(None, None, None, ("x", "y"))))
+    g3_d = parity._put(g3, NamedSharding(mesh, P(None, ("x", "y"), None)))
+    ops = (put(w_l, rep), put(w_r, rep), put(kfull, rep))
+    tabs = (tuple(put(np.asarray(a), rep) for a in cyl), tuple(put(a, rep) for a in zt))
+
+    def run_g(tabs):
+        mb = orbit_mu_batches(plan, mu_pad, 4, b_target=int(fx["b_target"]))
+        kern = zmb.make_route_g_kernel(
+            mesh=mesh, plan_id=plan_id, kgrid=kgrid, fft_grid=fg, ns=ns, b=mb.b,
+            q_sel=q_sel, q_axis=q_axis, q_neg=q_neg, qvec_frac=qf,
+            n_col=int(cyl[0].shape[1]), n_s=int(cyl[0].shape[2]), n_pg=2, axis=axis)
+        zs = zmb.ZStore(mesh=mesh, q_axis=q_axis, mu_pad=mu_pad, g_axis=g_axis, b=mb.b,
+                        placement="host", rows="mu", n_batch=mb.n_batch,
+                        packed_from_slot=mb.packed_to_slot(mu_pad))
+        for beta in range(mb.n_batch):
+            slots = mb.mu[beta]
+            live = (slots >= 0).astype(np.float64)
+            xmu = xg[fx["cent_flat"][canon[np.clip(slots, 0, None)]]] * live[:, None]
+            zs.write_batch(beta, kern(cbar_d, *ops, g3_d, put(xmu, rep), put(live, rep),
+                                      *tabs))
+        out = {lay: np.concatenate([parity._host(zs.read_tile(i, layout=lay))
+                                    for i in range(zs.n_Gt)], axis=2)[:len(q_sel), :, :ngk]
+               for lay in ("q", "g")}
+        zs.close()
+        return out
+
+    for lay, got in run_g(tabs).items():
+        e = parity._rel(got, ref)
+        worst = max(worst, e)
+        if jax.process_index() == 0:
+            print(f"{TAG} {case:<11s} route G  rows=mu store=host   read={lay}  rel={e:.2e}",
+                  flush=True)
+        if not e <= TOL:
+            raise SystemExit(f"{TAG} FAIL {case} route G/{lay}: {e:.3e}")
+    bad = (tabs[0], (tabs[1][0], put(zt[1] + 1, rep)))       # axis Miller off by one
+    red_g = parity._rel(run_g(bad)["q"], ref)
+    if jax.process_index() == 0:
+        print(f"{TAG} {case} route G red twin (ζ axis index shifted by one): "
+              f"rel={red_g:.2e}", flush=True)
+    if not red_g > RED:
+        raise SystemExit(f"{TAG} FAIL {case}: route G red twin did not fire ({red_g:.3e})")
+
     _, _, res = run("cache", "cache", "q", ("host",), roll=True)
     red = parity._rel(res["host", "q"], ref)
     if jax.process_index() == 0:
