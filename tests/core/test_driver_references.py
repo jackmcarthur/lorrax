@@ -151,10 +151,11 @@ def test_b_retained_escape_grows_grid_in_the_same_map(core_fixtures):
     _run(run, "mpa.in", allow_runtime_solve=True)
     _run(run, "mpa_sc1.in", allow_runtime_solve=True)
     report = (run / "mpa_sc1.out").read_text()
-    # ``role=initial`` is rCROP's name for map call 0 (``_run_rcrop._role_of``);
-    # it was ``role=linear`` while the deck could name the plain fixed point,
-    # which GATE sc_accelerator_rcrop_only now refuses.  Everything this cell
-    # asserts after the split is structural, so only the anchor moves.
+    # ``role=initial`` is the accelerated loop's name for map call 0
+    # (``_run_anderson._role_of``); it was ``role=linear`` while the deck
+    # could name the plain fixed point, which GATE
+    # sc_accelerator_anderson_only refuses.  Everything this cell asserts
+    # after the split is structural, so only the anchor moves.
     first, second = report.split("SC iteration: call=0000 role=initial", 1)
     assert "SC sampled-support growth" not in first
     growth = second.index("SC sampled-support growth: band=2, k=0")

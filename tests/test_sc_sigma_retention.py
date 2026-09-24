@@ -81,11 +81,11 @@ def test_gw_iteration_map_reads_only_the_carry_and_the_counter():
     assert _state_attrs(_func("gw_iteration_map")) == _CARRY_KEYS
 
 
-@pytest.mark.parametrize("driver", ["_run_rcrop", "_run_linear_mixing"])
+@pytest.mark.parametrize("driver", ["_run_anderson", "_run_linear_mixing"])
 def test_no_driver_feeds_a_stale_sigma_result_into_the_map(driver):
     """Every ``SCState(...)`` built as a map ARGUMENT carries H and i only.
 
-    The finalize state at the end of ``_run_rcrop`` legitimately carries
+    The finalize state at the end of ``_run_anderson`` legitimately carries
     the last ``SCOutputs``, so the check is on the constructions whose
     keywords are exactly the two fields the map reads — there must be at
     least one — and on every other construction still naming ``outputs``.
@@ -104,14 +104,14 @@ def test_no_driver_feeds_a_stale_sigma_result_into_the_map(driver):
             f"to gw_iteration_map must carry exactly the carry fields")
 
 
-def test_rcrop_clears_the_capture_cells_before_the_map_call():
+def test_anderson_clears_the_capture_cells_before_the_map_call():
     """The cell must be emptied BEFORE ``gw_iteration_map``, not after.
 
     Assigning after the call is what the previous code did, and that is
     the whole defect: the reference stays live for the entire build of
     the next Σ.
     """
-    body = _block("_run_rcrop")
+    body = _block("_run_anderson")
     clear = body.index("_last_outputs[0] = None")
     call = body.index("gw_iteration_map(")
     assert clear < call
@@ -142,8 +142,8 @@ def test_sc_output_lifecycle_has_one_owner_per_large_artifact():
     assert "enk_full_base_ry=enk_full_base_ry" in dump
 
 
-def test_rcrop_preserves_output_metadata_from_the_last_map():
-    body = _block("_run_rcrop")
+def test_anderson_preserves_output_metadata_from_the_last_map():
+    body = _block("_run_anderson")
     assert "_last_outputs[0] = None" in body
     assert "_last_outputs[0] = state_out.outputs" in body
     assert "outputs=_last_outputs[0]" in body
@@ -196,9 +196,9 @@ def test_linear_mixing_returns_the_last_evaluated_input_not_mixed_candidate(
     assert final.head_surface_weight_kn == "surface-from-input-zero"
 
 
-def test_rcrop_early_stop_binds_outputs_to_the_accepted_map_input():
-    """AST red twin for the exception path hidden inside rcrop_nojit."""
-    fn = _func("_run_rcrop")
+def test_early_stop_binds_outputs_to_the_accepted_map_input():
+    """AST red twin for the exception path hidden inside anderson_nojit."""
+    fn = _func("_run_anderson")
     converged = [
         node for node in ast.walk(fn)
         if isinstance(node, ast.Call)

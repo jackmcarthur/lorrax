@@ -71,13 +71,13 @@ memory_per_device_gb = 4.0
 """
 
 # The three keys the fractional-occupation rule already required before
-# this mode existed; only the head-mode value is under test below.  rcrop is
-# the only accelerator a deck may name (GATE sc_accelerator_rcrop_only), and
+# this mode existed; only the head-mode value is under test below.  anderson is
+# the only accelerator a deck may name (GATE sc_accelerator_anderson_only), and
 # it is legal on a metal since the entry-solve rule -- see
-# ``test_rcrop_is_legal_on_a_metallic_deck`` below.
+# ``test_anderson_is_legal_on_a_metallic_deck`` below.
 _FRACTIONAL = (
     "qp_solver = self_consistent\n"
-    "sc_accelerator = rcrop\n"
+    "sc_accelerator = anderson\n"
     "occ_broadening = 0.13605693122994\n"
 )
 
@@ -142,16 +142,16 @@ def test_the_other_two_fractional_preconditions_are_unchanged(tmp_path, mode):
 
 
 @pytest.mark.parametrize("mode", METAL_HEAD_UPDATES)
-def test_rcrop_is_legal_on_a_metallic_deck(tmp_path, mode):
+def test_anderson_is_legal_on_a_metallic_deck(tmp_path, mode):
     """The entry-solve rule (2026-08-15) makes F(H) a self-map of H alone,
-    so the accelerator refusal is gone: a metallic rCROP deck parses."""
+    so the accelerator refusal is gone: a metallic accelerated deck parses."""
     cfg = _config(
         tmp_path,
         "qp_solver = self_consistent\n"
-        "sc_accelerator = rcrop\n"
+        "sc_accelerator = anderson\n"
         "occ_broadening = 0.13605693122994\n"
         f"sc_head_update = {mode}\n")
-    assert cfg.sc.accelerator == "rcrop"
+    assert cfg.sc.accelerator == "anderson"
 
 
 def test_an_unknown_head_update_value_refuses_and_names_both_modes(tmp_path):
