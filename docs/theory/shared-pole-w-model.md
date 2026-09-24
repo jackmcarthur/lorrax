@@ -281,9 +281,10 @@ variables. Under TRS the partner's factors are $\bar b$ and (W 16) reduces to
 
 One real-time $\chi_0$ stream per parent evaluates $W_c$ and $\partial_sW_c$ at
 a fixed set of **supports** $z_a$: points on the damped line $z=\omega+ih$ and
-on the imaginary axis $z=iu$. $W$ is never formed at a real frequency; remote
-transitions enter through Laplace cells ([response Laplace](response-laplace.md))
-and the moments are exact band sums. Production uses 18 fitted supports; held
+on the imaginary axis $z=iu$. $W$ is never formed at a real frequency; one
+occupation-weighted time rule covers the whole active transition interval
+([the bank](../architecture/shared_pole_model.md#2-the-response-bank)), and the
+moments are exact band sums. Production uses 18 fitted supports; held
 diagnostic supports and the $M_1/M_3$ block are additional.
 
 Placement is a condenser problem, not a choice of interesting frequencies:
