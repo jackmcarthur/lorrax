@@ -56,13 +56,17 @@
 //
 // Disk cache: the router passes `cubin_dir` (ffi.fft.cubin_cache_dir:
 // $SCRATCH/.cache/lorrax/kconv_mathdx, else ~/.cache/lorrax/kconv_mathdx;
-// "" = no disk cache).  A cubin is keyed
-// by FNV-1a over the embedded source, the NVRTC options (mode, grid, ns, rows
-// per block, sm), the cuFFTDx/commonDx version headers of the wheel and the
-// NVRTC version; it is written to a unique temporary and renamed (atomic on
-// one filesystem, so concurrent ranks cannot tear it) and re-hashed on read
-// (a torn or foreign file is recompiled and replaced).  No environment
-// variable is read here.
+// "" = no disk cache).  A cubin is keyed by FNV-1a over the embedded source,
+// the NVRTC options (mode, grid, ns, rows per block, sm) and the whole
+// toolchain that can change the image: the cuFFTDx, commonDx, CUTLASS and
+// CCCL version headers, the nvidia-mathdx wheel's dist-info name, and the
+// NVRTC version with the loaded libnvrtc's real path (its patch level).  A
+// version header that reads empty disables the disk cache for that build
+// rather than dropping out of the key.  The image is written to a unique
+// temporary and renamed (atomic on one filesystem, so concurrent ranks cannot
+// tear it) and re-hashed on read; a torn, foreign or non-ELF file, or one the
+// driver refuses to load, is deleted, recompiled once and replaced.  No
+// environment variable is read here.
 
 #include <algorithm>
 #include <chrono>
@@ -76,6 +80,7 @@
 #include <tuple>
 #include <vector>
 
+#include <dirent.h>
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -643,6 +648,40 @@ static std::string toolkit_include(std::string* why) {
     return "";
 }
 
+// The loaded libnvrtc's real path: its file name carries the patch level
+// (libnvrtc.so.13.2.78), which nvrtcVersion's major.minor does not.
+static std::string nvrtc_library_realpath() {
+    Dl_info info{};
+    if (!dladdr(reinterpret_cast<void*>(&nvrtcVersion), &info) || !info.dli_fname) return "";
+    char buf[4096];
+    return realpath(info.dli_fname, buf) ? std::string(buf) : std::string(info.dli_fname);
+}
+
+// The nvidia-mathdx wheel's dist-info directory name(s) beside `root`
+// (<site>/nvidia/mathdx -> <site>/nvidia_mathdx-<version>.dist-info): one
+// listing of one directory; "" when the headers are not a wheel install.
+static std::string mathdx_dist_info(const std::string& root) {
+    const std::string site = root + "/../..";
+    DIR* d = opendir(site.c_str());
+    if (!d) return "";
+    std::vector<std::string> names;
+    while (dirent* e = readdir(d)) {
+        const std::string n(e->d_name);
+        if (n.rfind("nvidia_mathdx-", 0) == 0 && n.size() > 10 && n.substr(n.size() - 10) == ".dist-info")
+            names.push_back(n);
+    }
+    closedir(d);
+    std::sort(names.begin(), names.end());
+    std::string out;
+    for (const auto& n : names) out += n + ";";
+    return out;
+}
+
+// A cubin is an ELF image; anything else on disk is not one of ours.
+static bool is_elf(const std::vector<char>& b) {
+    return b.size() > 4 && b[0] == 0x7f && b[1] == 'E' && b[2] == 'L' && b[3] == 'F';
+}
+
 static std::string read_file(const std::string& path) {
     std::ifstream f(path, std::ios::binary);
     if (!f) return "";
@@ -775,16 +814,28 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
     for (const std::string& d : {"-I" + inc, "-I" + cutlass, "-I" + cuda_inc, "-I" + cuda_inc + "/cccl"})
         o.push_back(d);
 
-    // Disk cache key: source, deciding options, wheel version headers, NVRTC version.
+    // Disk cache key: source, deciding options and the toolchain (file header).
     int nv_major = 0, nv_minor = 0;
     nvrtcVersion(&nv_major, &nv_minor);
     uint64_t h = fnv1a(kSrc);
     for (const auto& d : defs) h = fnv1a(d, fnv1a("\x1f", h));
-    h = fnv1a(read_file(inc + "/cufftdx/cufftdx_version.hpp"), h);
-    h = fnv1a(read_file(inc + "/commondx/commondx_version.hpp"), h);
-    h = fnv1a("nvrtc" + std::to_string(nv_major) + "." + std::to_string(nv_minor), h);
+    const std::string cccl = exists(cuda_inc + "/cccl/cuda/std/__cccl/version.h")
+        ? cuda_inc + "/cccl/cuda/std/__cccl/version.h" : cuda_inc + "/cuda/std/__cccl/version.h";
+    std::string missing;
+    for (const std::string& f : {inc + "/cufftdx/cufftdx_version.hpp", inc + "/commondx/commondx_version.hpp",
+                                 cutlass + "/cutlass/version.h", cccl}) {
+        const std::string text = read_file(f);
+        if (text.empty()) missing += (missing.empty() ? "" : ", ") + f;
+        h = fnv1a(text, fnv1a("\x1e" + f.substr(f.find_last_of('/') + 1), h));
+    }
+    h = fnv1a("nvrtc" + std::to_string(nv_major) + "." + std::to_string(nv_minor) + "@" +
+              nvrtc_library_realpath(), h);
+    h = fnv1a("mathdx-dist:" + mathdx_dist_info(root), h);
     const std::string key_hex = hex16(h);
-    const std::string dir(cubin_dir);
+    const std::string dir(missing.empty() ? std::string(cubin_dir) : std::string());
+    if (!missing.empty() && !std::string(cubin_dir).empty() && (mklpin::announce_here() || log_enabled()))
+        std::fprintf(stderr, "[kconv_mathdx] disk cubin cache OFF for this build: empty version header(s) %s "
+                     "would drop out of the key\n", missing.c_str());
     std::string path;
     if (!dir.empty()) {
         std::ostringstream name;
@@ -794,32 +845,55 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
     }
 
     const auto t0 = std::chrono::steady_clock::now();
-    std::vector<char> cubin;
-    const bool from_disk = !path.empty() && disk_load(path, key_hex, &cubin);
-    bool stored = false;
-    if (!from_disk) {
+    auto compile = [&](std::vector<char>* image, std::string* where, std::string* err) {
         std::vector<const char*> opts;
         for (auto& x : o) opts.push_back(x.c_str());
         nvrtcProgram prog = nullptr;
         nvrtcResult nr = nvrtcCreateProgram(&prog, kSrc, "lrx_kconv_mathdx.cu", 0, nullptr, nullptr);
-        if (nr != NVRTC_SUCCESS) return sticky("nvrtcCreateProgram", nvrtcGetErrorString(nr));
+        if (nr != NVRTC_SUCCESS) { *where = "nvrtcCreateProgram"; *err = nvrtcGetErrorString(nr); return false; }
         nr = nvrtcCompileProgram(prog, static_cast<int>(opts.size()), opts.data());
         if (nr != NVRTC_SUCCESS) {
             size_t n = 0; std::string log;
             if (nvrtcGetProgramLogSize(prog, &n) == NVRTC_SUCCESS && n > 1) { log.resize(n); nvrtcGetProgramLog(prog, &log[0]); }
             nvrtcDestroyProgram(&prog);
-            return sticky("nvrtcCompileProgram", std::string(nvrtcGetErrorString(nr)) + " -- " + log.substr(0, 4000));
+            *where = "nvrtcCompileProgram";
+            *err = std::string(nvrtcGetErrorString(nr)) + " -- " + log.substr(0, 4000);
+            return false;
         }
         size_t n = 0;
         if (nvrtcGetCUBINSize(prog, &n) != NVRTC_SUCCESS || n == 0) {
-            nvrtcDestroyProgram(&prog); return sticky("nvrtcGetCUBINSize", "empty cubin");
+            nvrtcDestroyProgram(&prog); *where = "nvrtcGetCUBINSize"; *err = "empty cubin"; return false;
         }
-        cubin.resize(n); nvrtcGetCUBIN(prog, cubin.data()); nvrtcDestroyProgram(&prog);
+        image->assign(n, 0);
+        nr = nvrtcGetCUBIN(prog, image->data());
+        nvrtcDestroyProgram(&prog);
+        if (nr != NVRTC_SUCCESS || !is_elf(*image)) {
+            *where = "nvrtcGetCUBIN";
+            *err = nr != NVRTC_SUCCESS ? nvrtcGetErrorString(nr) : "image is not an ELF cubin";
+            return false;
+        }
+        return true;
+    };
+    std::vector<char> cubin;
+    // A disk image must frame, hash AND be an ELF; one the driver then refuses
+    // is deleted and rebuilt once below.
+    bool from_disk = !path.empty() && disk_load(path, key_hex, &cubin) && is_elf(cubin);
+    bool stored = false, rebuilt_bad = false;
+    std::string where, err;
+    if (!from_disk) {
+        if (!compile(&cubin, &where, &err)) return sticky(where.c_str(), err);
         if (!path.empty()) stored = disk_store(dir, path, key_hex, cubin);
     }
-    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     CUmodule module = nullptr;
     cr = api.ModuleLoadData(&module, cubin.data());
+    if (cr != CUDA_SUCCESS && from_disk) {
+        unlink(path.c_str());
+        from_disk = false; rebuilt_bad = true;
+        if (!compile(&cubin, &where, &err)) return sticky(where.c_str(), err);
+        stored = disk_store(dir, path, key_hex, cubin);
+        cr = api.ModuleLoadData(&module, cubin.data());
+    }
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     if (cr != CUDA_SUCCESS) return sticky("cuModuleLoadData", cu_err(cr));
     Built b;
     cr = api.ModuleGetFunction(&b.fn, module, "lrx_kconv");
@@ -834,7 +908,7 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
     if (mklpin::announce_here() || log_enabled()) {
         std::fprintf(stderr, "[kconv_mathdx] %s mode=%d%s kgrid=(%d,%d,%d) ns=%d sm_%d%d in %.1f ms "
                      "(rows/block=%d, smem=%d B, cubin %s)\n",
-                     from_disk ? "disk-cache hit" : "NVRTC built", mode, f32 ? " c64" : "", nkx, nky, nkz, ns,
+                     from_disk ? "disk-cache hit" : (rebuilt_bad ? "NVRTC rebuilt (cached image refused)" : "NVRTC built"), mode, f32 ? " c64" : "", nkx, nky, nkz, ns,
                      cc_major, cc_minor, ms, b.rb, b.smem,
                      path.empty() ? "not cached (no cubin_dir)"
                                   : (from_disk ? path.c_str() : (stored ? "stored" : "store FAILED")));
