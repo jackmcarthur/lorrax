@@ -1,5 +1,7 @@
 # The bispinor GN-PPM fixture runs end to end again; its 2026-08-09 reference is stale by 1.43 eV and was NOT re-frozen
 
+> **AMENDED 2026-09-24:** the 1.43 eV is fully attributed: claim 635 on 09-03, and the landing legs for d7f556fc. The reference is re-frozen at `c52b2c42`; see [2026-09-24-bispinor-and-core-fixture-refreeze.md](2026-09-24-bispinor-and-core-fixture-refreeze.md). The "`sigC` half has none" [explanation] below is superseded: it is 4534dc79.
+
 **Date:** 2026-09-02
 **Branch:** `lane/bisp-n-dynamic-packed-2026-09-01`, cut from
 `integ/bispinor-static-cleanup-2026-09-01@837ed531`.

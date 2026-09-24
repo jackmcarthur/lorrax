@@ -111,6 +111,24 @@ gate cannot reach it: `packed_bare_transverse_route` requires
 route's own gates are the P=4 MoS2 legs of
 `runs/MoS2/11_bisp_n_dynamic_packed_20260901/`.
 
+## 2026-09-24 — re-frozen at the landing tree, every move explained
+
+`sigma_diag_bispinor_ref.dat` is re-cut from `land/overnight-2026-09-24@c52b2c42`
+at P4 (JID 58826502, step `lx-Xg4-090722-712967-8498`). No input in this
+directory changed. The 1.434 eV the 2026-09-02 section below calls
+undecomposed was decomposed on 2026-09-03 (sandbox claim 635, matched
+historical FFI builds), but that write-up only landed on a docs branch:
+- the direct column is the `kin_ion.h5` regeneration switching V_H from ISDF
+  to exact, plus 07451900;
+- `sigC` is 4534dc79 (the Dyson prefactor stopped halving χ₀ blocks), plus
+  27f1e5c9 and 0140d997;
+- `sigX` is 8f46b0de.
+
+After 09-02, d7f556fc (Σ(ω=0) for states off the ±4 eV grid; owner rule
+2026-09-22) moves only out-of-grid `sigC`. The per-commit table is in the
+reference header and in
+`tests/known_failures/2026-09-24-bispinor-and-core-fixture-refreeze.md`.
+
 ## Files
 
 - `bispinor_test.in` — GN-PPM bispinor input (Tier-1 gate; the Tier-2
@@ -118,6 +136,6 @@ route's own gates are the P=4 MoS2 legs of
   restart round-trips in both layouts since 2026-08-23, see gw_init.py).
 - `centroids_frac_256.txt` / `centroids_frac_209_current.txt` — charge /
   transverse ISDF centroid sets (seed 42).
-- `sigma_diag_bispinor_ref.dat` — frozen reference (sigX/sigC/sigXC).
+- `sigma_diag_bispinor_ref.dat` — frozen reference (sigX/sigC/sigXC), re-cut 2026-09-24 at c52b2c42.
 - `WFN.h5` (34 bands), `kin_ion.h5` (regenerated 2026-09-02, stamped),
   `Mo.upf` / `S.upf` (added 2026-09-02; see above for which generation).
