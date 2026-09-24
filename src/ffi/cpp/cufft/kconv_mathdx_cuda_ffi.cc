@@ -31,8 +31,8 @@
 //             R = slots [c,2c) of the 2c axis, so no transposed, phased or
 //             split copy is made; U is (nk, c, g*p).  The element product
 //             D*F is the one XLA formed before this mode existed (see
-//             lrx_mul_xla), so mode 6 equals the old moveaxis + mode 1 chain
-//             bit for bit.
+//             lrx_mul_xla), so mode 6 is meant to equal the old moveaxis +
+//             mode 1 chain bit for bit.
 //   7 klead unfold conv   mode 2 read from the RAW-PARENT Green tiles: per
 //             full k the load gathers G[row(k), lsrc(k,i), rsrc(k,j)] (the
 //             transposed-pair tile on an antiunitary row), applies the
@@ -245,15 +245,50 @@ __device__ __forceinline__ lrx_c2 lrx_mul(lrx_c2 a, lrx_c2 b) {
     lrx_c2 z = {a.x*b.x - a.y*b.y, a.x*b.y + a.y*b.x};
     return z;
 }
-// (a+bi)(c+di) exactly as XLA:GPU forms an HLO complex multiply: its
-// emitter writes (ac - bd, ad + bc) and its NVPTX target fuses each into one
-// FMA (AllowFPOpFusion=Fast).  Spelled with explicit fma so NVRTC's own
-// contraction cannot pick the other operand; checked bitwise against XLA in
-// tests/multi_device/kconv_router_p4.py (plane_case).
+#if !LRX_F32
+// Products that must round exactly as the chains modes 6 and 7 replace.  Each
+// is spelled with round-to-nearest intrinsics or explicit fma, so NVRTC's own
+// contraction cannot change it (runs/runtime/kconv_fused_load_20260924/fma_forms).
+//
+// (a+bi)(c+di) as XLA:GPU forms an HLO complex multiply: (ac - bd, ad + bc)
+// with NO fused multiply-add (measured 4096/4096 against exact emulation,
+// tests/multi_device/kconv_router_p4.py xla_cmul_form).
 __device__ __forceinline__ lrx_c2 lrx_mul_xla(lrx_c2 a, lrx_c2 b) {
-    lrx_c2 z = {fma(a.x, b.x, -(a.y*b.y)), fma(a.x, b.y, a.y*b.x)};
+    lrx_c2 z = {__dsub_rn(__dmul_rn(a.x, b.x), __dmul_rn(a.y, b.y)),
+                __dadd_rn(__dmul_rn(a.x, b.y), __dmul_rn(a.y, b.x))};
     return z;
 }
+// cuCmul(a, b) as nvcc compiles it in cpp/symmetry/spin_rotate.cu (SASS):
+// re = fma(a.x, b.x, -(a.y b.y)), im = fma(a.x, b.y, a.y b.x).
+__device__ __forceinline__ lrx_c2 lrx_mul_cu(lrx_c2 a, lrx_c2 b) {
+    lrx_c2 z = {fma(a.x, b.x, -__dmul_rn(a.y, b.y)), fma(a.x, b.y, __dmul_rn(a.y, b.x))};
+    return z;
+}
+// cuCmul(a, cuConj(u)) as nvcc compiles it there: the negation folds, so
+// re = fma(a.x, u.x, a.y u.y) and im = fma(a.y, u.x, -(a.x u.y)).
+__device__ __forceinline__ lrx_c2 lrx_mul_cu_conj(lrx_c2 a, lrx_c2 u) {
+    lrx_c2 z = {fma(a.x, u.x, __dmul_rn(a.y, u.y)), fma(a.y, u.x, -__dmul_rn(a.x, u.y))};
+    return z;
+}
+// The spin action U G U^dagger of the chain mode 7 replaces: the
+// spin-rotate FFI (nvcc) for ns = 2, 4; for ns = 1 the unfold rotates in XLA
+// (symmetry_maps._rotate_open_spin_centroid_operator), which does not fuse.
+__device__ __forceinline__ lrx_c2 lrx_rot_mul(lrx_c2 u, lrx_c2 g) {
+#if LRX_NS == 1
+    return lrx_mul_xla(u, g);
+#else
+    return lrx_mul_cu(u, g);
+#endif
+}
+__device__ __forceinline__ lrx_c2 lrx_rot_mul_conj(lrx_c2 l, lrx_c2 u) {
+#if LRX_NS == 1
+    const lrx_c2 uc = {u.x, -u.y};
+    return lrx_mul_xla(l, uc);
+#else
+    return lrx_mul_cu_conj(l, u);
+#endif
+}
+#endif
 __device__ __forceinline__ lrx_c2 lrx_phase(lrx_c2 z, int code) {
     if (code == 1) { lrx_c2 q = {-z.y, z.x}; return q; }
     if (code == 2) { lrx_c2 q = {-z.x, -z.y}; return q; }
@@ -534,8 +569,8 @@ extern "C" __global__ void __launch_bounds__(256) lrx_kconv(
                     lrx_c2 v = {0.0, 0.0};
 #pragma unroll
                     for (int c = 0; c < NS; ++c) {
-                        const lrx_c2 p = lrx_mul_xla(u[a][c], g[c][d]);
-                        v.x = v.x + p.x; v.y = v.y + p.y;
+                        const lrx_c2 p = lrx_rot_mul(u[a][c], g[c][d]);
+                        v.x = __dadd_rn(v.x, p.x); v.y = __dadd_rn(v.y, p.y);
                     }
                     left[d] = v;
                 }
@@ -544,9 +579,8 @@ extern "C" __global__ void __launch_bounds__(256) lrx_kconv(
                     lrx_c2 v = {0.0, 0.0};
 #pragma unroll
                     for (int d = 0; d < NS; ++d) {
-                        const lrx_c2 ub = {u[b][d].x, -u[b][d].y};
-                        const lrx_c2 p = lrx_mul_xla(left[d], ub);
-                        v.x = v.x + p.x; v.y = v.y + p.y;
+                        const lrx_c2 p = lrx_rot_mul_conj(left[d], u[b][d]);
+                        v.x = __dadd_rn(v.x, p.x); v.y = __dadd_rn(v.y, p.y);
                     }
                     sm[(jp * SS + a * NS + b) * SP + k] = v;
                 }
