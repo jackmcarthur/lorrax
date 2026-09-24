@@ -208,7 +208,7 @@ class GWProductionReport:
             return
         # The μ-batch ζ fit's plan and its measured store/timing receipts are
         # the run's record of where Z lived and what the transfers cost.
-        if text.startswith(("  ISDF μ-batch plan", "  μ-batch ", "  Z store: ")):
+        if text.startswith(("  ISDF μ-batch plan", "  μ-batch ", "  Z store: ", "  [host mem] ")):
             self.emit(text)
             return
         # Every box plan carries a durable policy and accepted-rule receipt,

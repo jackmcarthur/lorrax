@@ -450,9 +450,9 @@ class ZStore:
         if self.placement == 'host':
             # One tile-major numpy block per addressable device, exact bytes
             # (Q·n_batch·c·N_G·16 per rank): a G tile's rows for every batch
-            # are one contiguous (Q, n_batch·c, G_tile) read.  ponytail: not
-            # the pinned HostTileStore -- its pool growth took VI3 12x12 P16
-            # (34.6 GB/rank of Z) past node RAM (p4v_vi3_p16_whole OOM); the
+            # are one contiguous (Q, n_batch·c, G_tile) read.  ponytail:
+            # pageable, not the pinned HostTileStore -- VI3 12x12 P16 (33.4
+            # GB/rank of Z) was host-OOM-killed on it (p4v_vi3_p16_whole); the
             # pinned tier returns when the planner can price its overhead.
             # np.zeros commits pages on first write, so a batch never
             # written (a truncated debug fit) costs nothing and reads zero.
@@ -537,7 +537,7 @@ class ZStore:
                     pass
 
     def receipt(self) -> str:
-        return (f"Z store: placement={self.placement}, μ-owned rows, "
+        return (f"  Z store: placement={self.placement}, μ-owned rows, "
                 f"(Q={self.Q}, μ={self.mu_pad}, "
                 f"N_G={self.n_G}) as {self.n_Gt} tiles x {self.g_tile}, "
                 f"{self.n_batch} batches of {self.b}; written "

@@ -39,16 +39,21 @@ applied it.
 ## The loop (route G)
 
 ```text
-setup:  conj ψ(G) of the full zone, G slots over the mesh (ψ(G)/P per rank)
-        C_q, factor (the CCT path);  Z store (pinned host tiles or slab_io)
+setup:  conj ψ(G) of the parent k (one read, `load_parent_psi_G`), G slots
+        over the mesh (ψ(G)/P per rank);  C_q, factor (the CCT path);
+        Z store (numpy host blocks or slab_io)
 for each μ batch B (b centroids, b a multiple of P, serial):
     X_B = ψ_{nks}(r_μ)                       each rank's partial DFT over its
                                               G slots, one psum (replicated)
-    D̃^X_k(a, μ, b, G) = Σ_n w^X_n X_{nka}(r_μ) conj c_{nkb}(G)
-                                              G-space GEMM on the rank's slice
-                                              (isdf.pair_kernels)
-    ONE all-to-all: G split → μ owner (rank p owns slots p·c + [0, c), c = b/P)
+    D̃^X_k̄(a, μ, b, G) = Σ_n w^X_n X_{nk̄a}(r_μ) conj c_{nk̄b}(G)
+                                              G-space GEMM on the parents k̄,
+                                              the rank's slice (isdf.pair_kernels)
+    ONE all-to-all: G split → μ owner (rank p owns slots p·c + [0, c), c = b/P,
+                    whole centroid orbits per owner)
     on the owner:
+        typed unfold to the full zone (the Fourier image of the r-space typed
+        transport C_q was built with, `typed_child_G_tables`):
+            D̃_k = (U⊗Ū)ᵀ D̃_k̄(perm μ, pslot G) e^{2πiL·k̄} conj(phase)
         cylinder gather + axis DFT onto ALL planes, once per k: the D cylinder
         per group of n_pg planes: 2D FFT, Bloch phase → D(k, μ, r_plane);
             Z_q(μ, r) = Σ_k Σ_ab D^L_k conj D^R_{k+q}
@@ -74,13 +79,16 @@ core fixture A, 1.7e-3 on CrI3 8×8 with κ(C) = 1.0e8).
 ### Z store
 
 `ZStore` is one write-once resource of μ-owned rows, never on the device:
-pinned host tiles `(Q, b, G_tile)` per (G tile, batch) in a
-`file_io.HostTileStore`, or a slab_io scratch dataset
-`(n_Gt, Q, n_batch·b, G_tile)` when the node's host share does not hold
-it.  A G-tile read gathers the batches rank-locally and reaches the
-finalize layout (q-local for the local solve tier, G-split for the
-replicated one) with one all-to-all.  The μ axis is batch-slot order;
-reads gather the packed carrier (`MuOrbitBatches.packed_to_slot`).
+one numpy block `(n_Gt, Q, n_batch, c, G_tile)` per local device (exact
+bytes, `Q·n_batch·c·N_G·16` per rank), or a slab_io scratch dataset
+`(n_Gt, Q, n_batch·b, G_tile)` when the host share does not hold it.  The
+host share is `0.8·MemAvailable` at plan time over the processes on the
+node, the minimum over processes; the ψ read's phdf5 staging is released
+before the store fills (`WfnLoader.release_read_staging`).  A G-tile read
+is one contiguous host block per device and reaches the finalize layout
+(q-local for the local solve tier, G-split for the replicated one) with
+one all-to-all.  The μ axis is batch-slot order; reads gather the packed
+carrier (`OwnerOrbitBatches.slot_of_packed`).
 
 ## Per-rank memory model and planner
 
@@ -91,10 +99,10 @@ the fit never sets the node count; the plan then uses the device target.
 
 | object | bytes/rank |
 |---|---|
-| conj ψ(G) slice (full zone), Ψ | `nk·nb·ns·N_Gψ·16/P` |
+| conj ψ(G) slice (parents), Ψ | `n_parent·nb·ns·N_Gψ·16/P` |
 | C factor | `Q_loc·μ²·16` (q-local) or `Q·μ²·16` (replicated) |
-| X_B (replicated per batch) | `nk·nb·ns·b·16` |
-| pair projectors, G slice and after the all-to-all | `2·nk·ns²·b·N_Gψ·16/P` each |
+| X_B (replicated per batch) | `n_parent·nb·ns·b·16` |
+| pair projectors, G slice and after the all-to-all | `2·n_parent·ns²·b·N_Gψ·16/P` each |
 | D cylinder (all planes, owner) | `nk·n_a·ns²·2c·n_col·16` |
 | plane group | `2·nk·n_pg·ns²·2c·(N_r/n_a)·16` |
 | k-conv + Z (group) | `(9·nk + 3·Q)·c·n_pg·(N_r/n_a)·16` |
@@ -124,8 +132,9 @@ their pads in `MuOrbitBatches.mu` (−1).
 | what | edge case that loses | cost |
 |---|---|---|
 | route G only (no ψ(r) cache, no flat blocks) | axis-mixing groups with a cheap cache | TaAs 8³ ~1.5× vs flat blocks (auditor) |
-| route G's GEMM on the loader's full-BZ ψ(G), not parent k + a D̃ unfold | symmetric decks: nk/n_parent on a GEMM over the ψ sphere and on Ψ; **magnetic groups: NOT valid today** — the loader's unfold and the plan's typed transport (C, faces) disagree (CrI3 8×8: eqp 238 µeV) | the fix is the parent-k GEMM with the plan's typed D̃ unfold, or one unfold for both |
+| the typed D̃ unfold uses the grid-snapped τ of the r-space transport, not the loader's raw τ | none: C and Z share one transport (owner ruling); the loader's raw-τ unfold differs by 2e-10, 2e-6 in ζ at κ(C) ~ 1e8 (KNOWN_LORRAX_ISSUES) | — |
 | the Z store never lives on the device | small decks whose store fits beside the batch | one host round trip |
+| host tier is pageable numpy, not pinned (`HostTileStore`) | none measured; VI3 12×12 P16 (33.4 GB/rank of Z) was host-OOM-killed on the pinned tier | pageable D2H/H2D bandwidth; the pinned tier returns when the planner prices its overhead |
 | one conditioning procedure (`isdf/cplus.py`, rank truncation) | none measured | per-q eigh |
 | ψ(G) streaming (two band-chunk buffers) not implemented | decks where Ψ does not fit beside the smallest batch | refuses with `GATE zeta-mubatch-capacity` |
 
