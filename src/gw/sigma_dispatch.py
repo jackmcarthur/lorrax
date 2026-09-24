@@ -676,6 +676,7 @@ def finalize_dynamic_sigma(
             config, band_slices, meta)
         qsgw_edge_kwargs = ({"one_sided_core_mask": one_sided_core_mask}
                              if one_sided_core_mask is not None else {})
+        qsgw_edge_kwargs["out_of_grid"] = config.sigma.out_of_grid
         sigma_xc_qsgw, qsgw_diag = build_qsgw_sigma_xc(
             sigma_c_omega, sig_x_rep,
             omega_grid_ev, e_qp_rel_ev, mesh_xy,
@@ -1275,7 +1276,7 @@ def _compute_mpa_sigma(
                 shell, _ = build_qsgw_sigma_xc(
                     value.sigma_c_kij, zero_x, config.omega_grid_ev,
                     e_qp_rel_ev, mesh_xy, band_axis=value.band_axis,
-                    **edge_kwargs)
+                    out_of_grid=config.sigma.out_of_grid, **edge_kwargs)
                 return shell
 
         sector_result = compute_sector_sigma(

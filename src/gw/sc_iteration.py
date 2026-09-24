@@ -2871,12 +2871,19 @@ def _sc_sampled_support(inputs, partition, energies_loop, mu_ev):
         support_partition.protected_mask | support_partition.in_range_mask,
         dtype=bool), energies_loop.shape)
     energy_relative_ev = energies_loop - mu_ev
-    # Owner rule 2026-09-22: states outside the requested window (plus the
-    # SC pad) use Sigma(omega=0); only states inside it may grow the grid.
-    win_lo, win_hi = sc_padded_window_ev(
-        float(inputs.config.sigma.omega_min_ev),
-        float(inputs.config.sigma.omega_max_ev))
-    required_kn = required_kn & (energy_relative_ev >= win_lo) & (energy_relative_ev <= win_hi)
+    if inputs.config.sigma.out_of_grid == "cover":
+        # Owner 2026-09-24: every protected identity reads its own Sigma(E);
+        # the grid grows over it, bounded by the spectrum it covers.  Frozen
+        # core is decoupled from H and never grows the grid.
+        required_kn = np.array(required_kn)
+        required_kn[:, :int(inputs.config.sc.frozen_core_bands)] = False
+    else:
+        # clamp/static: only states inside the requested window plus the SC
+        # pad grow the grid; the rest read the edge or omega = 0.
+        win_lo, win_hi = sc_padded_window_ev(
+            float(inputs.config.sigma.omega_min_ev),
+            float(inputs.config.sigma.omega_max_ev))
+        required_kn = required_kn & (energy_relative_ev >= win_lo) & (energy_relative_ev <= win_hi)
     expanded_grid = extend_sc_omega_grid_ev(
         sampled_grid, energy_relative_ev, required_kn,
         float(inputs.config.sigma.omega_step_ev))
@@ -2885,10 +2892,11 @@ def _sc_sampled_support(inputs, partition, energies_loop, mu_ev):
 
 def _fit_sum_band_tail(fit_kwargs, fit_mask_kn, sigma0_kn):
     """Owner ruling 2026-09-24: the sum-band tail law averages only states
-    that consume Sigma(E_nk).  A state on the Sigma(omega=0) fallback this
-    map (``sigma0_kn``, the uncovered set of ``qsgw_utils.omega_coverage``
-    on the grid build_qsgw_sigma_xc uses) is excluded, so its energy cannot
-    move the tail: on Fe 4^3 three such states set a 14.9 meV tail shift.
+    that consume Sigma(E_nk).  A state off the sampled grid this map
+    (``sigma0_kn``, the uncovered set of ``qsgw_utils.omega_coverage`` on the
+    grid build_qsgw_sigma_xc uses; it reads the edge or omega = 0) is
+    excluded, so its energy cannot move the tail: on Fe 4^3 three such states
+    set a 14.9 meV tail shift (CLAIMS 2703).
 
     No qualifying conduction state: no tail law (E_DFT), said in the log.
     Never a previous map's law: the map reads only its carry
@@ -3000,9 +3008,14 @@ def _classify_sc_partition(
         _record_sc(
             inputs,
             f"  SC map {int(iteration)} (identity, mu-anchored) partition: all "
-            f"{energies_loop.shape[1]} QP-window identities protected; energies "
-            f"outside [{float(inputs.config.sigma.omega_min_ev):+.2f}, "
-            f"{float(inputs.config.sigma.omega_max_ev):+.2f}] eV use Sigma(omega=0).")
+            f"{energies_loop.shape[1]} QP-window identities protected; "
+            f"sigma_out_of_grid={inputs.config.sigma.out_of_grid}"
+            + (" (the grid grows over every non-frozen identity)."
+               if inputs.config.sigma.out_of_grid == "cover" else
+               f"; energies outside [{float(inputs.config.sigma.omega_min_ev):+.2f}, "
+               f"{float(inputs.config.sigma.omega_max_ev):+.2f}] eV plus the SC pad read "
+               + ("the nearest grid edge." if inputs.config.sigma.out_of_grid == "clamp"
+                  else "Sigma(omega=0).")))
     if not ks.is_identity:
         partition = BandPartition(
             protected_mask=ks.broadcast(partition.protected_mask),
@@ -3354,9 +3367,9 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         inputs.print_fn(
             f"    SC scissor classes: {scissor_classes.summary()}")
 
-    # THE Sigma(omega=0) FALLBACK SET OF THIS MAP, decided once: the grid the
-    # Sigma build below uses and qsgw_utils.omega_coverage, the same test
-    # build_qsgw_sigma_xc applies.  The tail law excludes it.
+    # THE OFF-GRID SET OF THIS MAP, decided once: the grid the Sigma build
+    # below uses and qsgw_utils.omega_coverage, the classification
+    # build_qsgw_sigma_xc reads (sigma_eval_omega).  The tail law excludes it.
     from .qsgw_utils import omega_coverage
     sc_support = _sc_sampled_support(inputs, partition, energies_loop, _mu_ev)
     sigma0_kn = (np.zeros(energies_loop.shape, dtype=bool) if sc_support is None
@@ -3442,7 +3455,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             f"beta={tail_fit.beta_c_ev:+.4f} eV "
             f"(n={tail_fit.n_fit_c}, w={tail_fit.w_fit_c:.0f}, "
             f"policy={inputs.config.sc.tail_fit}; "
-            f"{n_sigma0_excluded} Sigma(0)-fallback state(s) excluded)")
+            f"{n_sigma0_excluded} off-grid state(s) excluded)")
 
     # Same-run metal threading: the ENTRY-solved state feeds chi, the head
     # and Sigma — one mu per map call, from this call's spectrum.
@@ -4622,6 +4635,10 @@ def _sc_edge_ambiguity(inputs: SCInputs, state_out: SCState) -> tuple[int, str]:
     applies ``qsgw_utils.sigma_grid_edge_ambiguity``.  Collective for a
     band-sharded cube, so every rank calls it.  Returns (count, detail).
     """
+    # Only Sigma(0) jumps at an edge: clamp is continuous there, and cover
+    # leaves no protected identity off the grid.
+    if inputs.config.sigma.out_of_grid != "static":
+        return 0, ""
     sigma = state_out.outputs.sigma_result
     cube, omega = sigma.sigma_c_omega_kij_ry, sigma.omega_grid_ev
     if cube is None or omega is None:
