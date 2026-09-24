@@ -1,7 +1,8 @@
 """The scissor fit is a REDUCTION over k, so it needs k weights.
 
 Four properties, each of which failed at least once in the IBZ
-self-consistency work (``docs/dev/ibz_self_consistency_scaffold.md`` §8):
+self-consistency work (contract: the ``gw.scissor`` module docstring; the
+loop's k-set invariant: ``docs/self_consistency.md``):
 
 1. ``fit_scissor`` has NO unweighted spelling.  Omitting ``k_weights`` is
    a ``TypeError`` at the call site, not a silently different fit.

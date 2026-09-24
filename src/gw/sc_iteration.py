@@ -6990,7 +6990,7 @@ def final_qp_eigenstates(
     ``U_mnk`` with a full-BZ index).  A single k-set kwarg here can only
     be right for one of them; it used to broadcast for both, and that is
     what made the WFN writer fail on an IBZ loop
-    (ibz_self_consistency_scaffold.md §7 row 3).
+    (the loop's k-set invariant, ``docs/self_consistency.md``).
 
     ``efermi_ry`` is k-set independent.  For a metal it is the accepted
     map's fixed-N reference; :func:`dump_qp_wfn_artifacts` replaces it with

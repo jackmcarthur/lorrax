@@ -96,7 +96,8 @@ have multiplicity 2.  The unweighted fit made the carried H differ from
 the full-BZ arm by 1.67e-02 Ry = 0.23 eV after ONE iteration and eqp0 by
 0.386 eV max / 0.037 eV rms after three (jobs 7889373, 7889375), while
 Σ itself, the star select/broadcast and the ψ rotation were bit-identical
-between the arms — see ``docs/dev/ibz_self_consistency_scaffold.md`` §8.
+between the arms.  The loop's k-set invariant: ``docs/self_consistency.md``
+("What the loop does").
 
 ``k_weights`` is consequently a REQUIRED keyword argument of
 ``fit_scissor``.  There is no unweighted spelling to forget, and the two
@@ -655,7 +656,7 @@ def full_bz_k_weights(nk: int) -> np.ndarray:
     Use this only where the k axis really is the full grid.  Everything
     ``compute_sigma_xc`` / ``compute_screening`` produce is on the full BZ
     because Σ is an FFT over the k-grid
-    (``docs/dev/ibz_self_consistency_scaffold.md`` §7).
+    (the loop's k-set invariant, ``docs/self_consistency.md``).
     """
     return np.ones(int(nk), dtype=np.float64)
 
