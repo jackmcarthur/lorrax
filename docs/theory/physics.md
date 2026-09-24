@@ -73,9 +73,11 @@ axis evaluates for every q at once.
 
 The charge solve is rank-truncated under the one
 [rank criterion](../dev/rank_truncation_policy.md); current channels use a
-ridge-regularized LU. The right-hand side is built and solved on orbit-closed
-real-space tiles, and each solved tile is added straight into the
-\(\mathbf q+\mathbf G\) sphere, so the stored object is
+ridge-regularized LU. The charge fit forms \(Z_q\) directly in G space by
+[route G](../architecture/zeta_fit_mubatch.md) and applies \(C_q^+\) tile by
+tile over G; the current channels build and solve on orbit-closed real-space
+tiles and add each solved tile into the \(\mathbf q+\mathbf G\) sphere.
+Either way the stored object is
 \(\widetilde z[q_{\rm irr},\mu,G]\), \(\mathcal O(N_qN_\mu N_G)\), never
 \(\zeta\) on the full real-space grid. Equations and the irreducible-q
 cascade: [G-flat ζ and V](isdf-zeta-vq.md). Carriers, band windows and tiles:
