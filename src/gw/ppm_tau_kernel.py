@@ -230,6 +230,69 @@ def get_sigma_spatial_kernel(
 _NO_BRACKETS = None
 
 
+def _sigma_spin_pair_stream(*, mesh_xy, kgrid, layout, face_shape,
+                            face_band_extent, k_unfold_plan):
+    """Σ_c(τ) on raw parents, one spin block of the Green at a time (A4).
+
+        Σ_nm(k̄) = Σ_ab Σ_μν ψ*_{m,a}(μ) [G_ab(τ) ⋆_k W(τ)](k̄; μ, ν) ψ_{n,b}(ν)
+
+    ``G_ab`` is built at full k from the parents unfolded by their typed ψ
+    action (the full-k Green's own (a, b) block), convolved with the same
+    prepared ``W`` by the k-convolution router, restricted to the parent
+    rows and projected on the parents' ``a`` and ``b`` spinor rows.  No
+    ``ns²`` Green or Σ_k exists; the live set is a few ``16·N_k·μ²/P``
+    blocks.  Arguments match the τ kernel's
+    ``(psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn, E_A, sel, E_min,
+    E_max, E_ref_A, t_node, W_prep)``.
+    """
+    from common.fft_helpers import make_kconv_klead
+    from distrib_la import gemm_plan
+    from .greens_function_kernel import (
+        _phase_band_interval, _weighted_tau_phases, build_G, spin_pair_rows,
+        unfold_parent_faces)
+    from .wavefunction_bundle import (SIGMA_CONV_G7D_SPEC, V_FFT5D_SPEC,
+                                      sigma_conv_operand)
+
+    nk_tot = int(np.prod(kgrid))
+    _, nb, mu, ns = (int(v) for v in face_shape)
+    n_full = int(k_unfold_plan.n_full)
+    kconv = make_kconv_klead(mesh_xy, kgrid, SIGMA_CONV_G7D_SPEC, V_FFT5D_SPEC,
+                             norm='ortho', mult=-1.0 / np.sqrt(float(nk_tot)))
+    pair_plan = gemm_plan(mesh_xy, m=mu, k=nb, n=mu, nq=n_full,
+                          dtype=jnp.complex128, layout=layout,
+                          enable_active_range=True)
+    project = _make_project_ri_reduce_scatter(
+        mesh_xy, merged_x=True, layout=layout, face_shape=(n_full, nb, mu, 1),
+        face_band_extent=face_band_extent, k_unfold_plan=k_unfold_plan)
+    irr = np.asarray(k_unfold_plan.irr_idx, dtype=np.int32)
+
+    def stream(psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
+               E_A, sel, E_min, E_max, E_ref_A, t_node, W_prep):
+        weights = dict(mask=sel) if sel.dtype == jnp.bool_ else dict(band_weight=sel)
+        phases = _weighted_tau_phases(E_A, 1j * t_node, e_ref=E_ref_A,
+                                      E_min=E_min, E_max=E_max, **weights)
+        phases = jnp.take(phases, jnp.asarray(irr), axis=0)
+        lo, hi = _phase_band_interval(phases)
+        psi_mun, psi_nmu = unfold_parent_faces(
+            k_unfold_plan, psi_coh_xn, psi_coh_yr, layout=layout)
+
+        def block(index):
+            left, right = spin_pair_rows(psi_mun, psi_nmu, index, ns)
+            G_ab = build_G(left, right, phases=phases, layout=layout,
+                           gemm=pair_plan, band_range=(jnp.minimum(lo, hi), hi))
+            S_ab = kconv.apply(sigma_conv_operand(G_ab), W_prep)
+            proj_left = jax.lax.dynamic_slice_in_dim(psi_proj_xr, index // ns, 1, axis=2)
+            proj_right = jax.lax.dynamic_slice_in_dim(psi_proj_yn, index % ns, 1, axis=1)
+            return project(proj_left, S_ab, proj_right)
+
+        first = block(0)
+        total, _ = jax.lax.scan(lambda acc, index: (acc + block(index), None),
+                                first, jnp.arange(1, ns * ns), unroll=1)
+        return total
+
+    return stream
+
+
 def _get_sigma_kij_kernel(
     *, mesh_xy: Mesh, kgrid: tuple[int, int, int], merged_x: bool = True,
     brackets: tuple[tuple[int, int], ...] | None = _NO_BRACKETS,
@@ -260,6 +323,14 @@ def _get_sigma_kij_kernel(
     g_plan = gemm_plan(mesh_xy, m=mu * ns, k=nb, n=mu * ns,
                        nq=k_unfold_plan.n_parent, dtype=jnp.complex128, layout=layout,
                        enable_active_range=True)
+    from .greens_function_kernel import spin_pairs_needed
+    # A4: stream spin pairs when the whole-spin Σ_k and its convolution
+    # transient (~2 G_tile) exceed the device target.
+    pairs = (None if _stage_timing_enabled() or not spin_pairs_needed(
+        n_full=k_unfold_plan.n_full, n_rmu=mu, ns=ns, mesh=mesh_xy,
+        live_green_tiles=2) else _sigma_spin_pair_stream(
+            mesh_xy=mesh_xy, kgrid=kgrid, layout=layout, face_shape=face_shape,
+            face_band_extent=face_band_extent, k_unfold_plan=k_unfold_plan))
 
     def _g_from_selector(xn, yr, E, sel, E_min, E_max, ref, t, band_range=None):
         """Apply boolean identity masks or signed occupation weights without clipping."""
@@ -286,6 +357,10 @@ def _get_sigma_kij_kernel(
             in_range = (idx >= lo) & (idx < hi)
             mask_bracket = (mask_A & in_range if mask_A.dtype == jnp.bool_
                            else mask_A * in_range.astype(mask_A.dtype))
+            if pairs is not None:
+                return None, pairs(psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
+                                   E_A, mask_bracket, E_min, E_max, E_ref_A,
+                                   t_node, W_prep)
             G_k = build_g(psi_coh_xn, psi_coh_yr, E_A, mask_bracket,
                          E_min, E_max, E_ref_A, t_node,
                          band_range=(lo, hi))
@@ -311,6 +386,9 @@ def _get_sigma_kij_kernel(
             # left to CSE: on the decomposed chain this is ``ifftn(W)``, the
             # only transform in the chain that does not depend on G.
             W_prep = spatial.prep_w(W_q)
+            if brackets is None and pairs is not None:
+                return pairs(psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
+                             E_A, mask_A, E_min, E_max, E_ref_A, t_node, W_prep)
             if brackets is None:
                 G_k = _build_g(psi_coh_xn, psi_coh_yr, E_A, mask_A,
                                E_min, E_max, E_ref_A, t_node)
