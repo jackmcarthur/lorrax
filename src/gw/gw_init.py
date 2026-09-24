@@ -2824,9 +2824,11 @@ def _prepare_fresh_isdf(
             get_enk_bandrange, mesh_xy, meta, print0, resolve_restart_q_storage_for_run,
             restart_tensor_writes_enabled, sigma_parent_carrier, sym, take_pre_unfold,
             tensors_filename, transverse_wfn_data, wfn, wfns_transverse, write_restart_state_to_h5)
-        if hasattr(zeta_path, 'contract_v') and jax.process_index() == 0:
+        if ((hasattr(zeta_path, 'contract_v') or cfg.bispinor)
+                and jax.process_index() == 0):
             # Route G's stage split through V_q (read, faces, C, fit, V_q),
-            # a receipt kept by the production report.
+            # a receipt kept by the production report.  A bispinor run hands
+            # V_q the ζ files (its Z stores are closed after the fits).
             V_qmunu.block_until_ready()
             _rows = []
             timing.report(print_fn=_rows.append, title="", max_depth=3)
