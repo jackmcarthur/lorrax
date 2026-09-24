@@ -68,9 +68,10 @@ def check_tables():
     a = np.zeros((10, 10), complex)
     live = [0, 2, 3, 5, 6, 9]
     a[np.ix_(live, live)] = x @ x.conj().T - 20 * np.eye(6)  # indefinite live block, zero rows between
-    values, vectors = zero_row_safe_eigh(jnp.linalg.eigh)(jnp.asarray(a))
-    assert np.allclose(values, np.linalg.eigvalsh(a), atol=1e-12)
-    assert np.allclose(np.asarray(vectors) @ np.diag(values) @ np.asarray(vectors).conj().T, a, atol=1e-10)
+    values, vectors = map(np.asarray, zero_row_safe_eigh(jnp.linalg.eigh)(jnp.asarray(a)))
+    tol = 1e3 * np.finfo(values.dtype).eps * np.abs(a).max()  # x64 or not, as the runtime chose
+    assert np.allclose(values, np.linalg.eigvalsh(a), atol=tol)
+    assert np.allclose(vectors @ np.diag(values) @ vectors.conj().T, a, atol=tol)
 
 
 def check_reuse(mesh):
