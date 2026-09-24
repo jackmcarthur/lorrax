@@ -436,7 +436,8 @@ class Plan:
             fits on one device, the distributed libraries' cost IS their
             fixed per-call charge — cuSOLVERMp eigh is a flat ~1.55 s per
             matrix from n=64 to n=1024, where native replicated is 1.5 ms
-            to 27 ms (§ Performance in ``docs/services/distrib_la.md``).
+            to 27 ms (the per-call rule: § Performance in
+            ``docs/services/distrib_la.md``).
             Route (c) serves that whole regime with no distributed-library
             call at all, and it is how small-system linalg happens without
             a second, parallel API.

@@ -24,17 +24,20 @@ Native JAX routes, capability reporting and the backend vocabulary work with
 no shared library present. The FFI provider is a separate capability: the CUDA
 and host libraries are found through a sealed bundle or pinned by
 `LORRAX_FFI_SO` / `LORRAX_FFI_HOST_SO`, whose rules
-[`docs/dev/env_vars.md`](../dev/env_vars.md) owns. The loader expects handler
-ABI 5 (`loader.LORRAX_FFI_ABI_VERSION`). An absent `.so` does not break
+[`docs/dev/env_vars.md`](../dev/env_vars.md) owns. The loader expects the handler
+ABI `loader.LORRAX_FFI_ABI_VERSION`, which mirrors
+`src/ffi/common/ffi_loader.py`'s. An absent `.so` does not break
 import; an explicit pin that is missing, mis-stamped or ABI-incompatible
 refuses instead of falling through. The environment grants capability and
 never selects a backend: `distrib_la.resolve` reads no environment.
 
-Both platform libraries link `libslate.so.2` and `libblaspp.so.2` by SONAME,
-and the first library opened decides which copy the other binds. The loader
-therefore opens the CUDA library before the host one in any process that can
-use CUDA (`loader._open_cuda_before_host`); opening the host library first
-gives every CUDA SLATE handler `blas::get_device_count() == 0`.
+When both platform libraries link SLATE, they bind `libslate.so.2` and
+`libblaspp.so.2` by SONAME, and the first library opened decides which copy
+the other uses. The loader therefore opens the CUDA library before the host
+one in any process that can use CUDA (`loader._open_cuda_before_host`);
+opening the host library first gives every CUDA SLATE handler
+`blas::get_device_count() == 0`. Which leg of the Perlmutter bundle carries
+SLATE: [Perlmutter §2](../environment/machines/perlmutter.md#2-the-lorrax_a-module-and-the-ffi-bundle).
 
 ## API
 
@@ -463,41 +466,16 @@ admit.
 
 ## Performance
 
-For every matrix that fits one device, the distributed libraries' cost is
-their fixed per-call charge, which is why `auto` eigh resolves to native and
-route (c) is the default. Complex128, one node, 4 ranks on a 2×2 A100 mesh,
-warm, one matrix per call:
+For a matrix that fits one device, a distributed library's cost is its fixed
+per-call charge: warm cuSOLVERMp eigh costs a flat ~1.55 s per matrix,
+almost all of it inside `cusolverMpSyevd`, and `block_size` does not move it.
+That is why `auto` eigh resolves to native and route (c) is the default:
+`distributed` eigh is a capacity route for a matrix that does not fit one
+device, not a speed route.
 
-| n | native replicated (s) | cuSOLVERMp (s) | SLATE (s) | cuSOLVERMp / native |
-|---|---|---|---|---|
-| 64 | 0.00149 | 1.586 | 0.401 | 1064× |
-| 256 | 0.00412 | 1.561 | 0.546 | 378× |
-| 1024 | 0.02662 | 1.754 | 1.387 | 66× |
-| 2048 | 0.07275 | 1.932 | 5.444 | 27× |
-| 4096 | 0.39550 | 2.739 | SIGSEGV (L-4) | 6.9× |
-
-cuSOLVERMp eigh costs a flat ~1.55 s per matrix; 99.998% of a warm call is
-inside `cusolverMpSyevd` (plan and resolve ≈ 10 µs, context-cache hit < 1 µs),
-and `block_size` does not move it. Cold extras: context bootstrap
-0.66–0.81 s, XLA compile ~0.8 s. On CPU (one node), ScaLAPACK `pzheevd` never
-beats native replicated eigh (4.0× slower at n = 64, 2.77× at n = 2048).
-
-Extrapolated break-even for distributed eigh is n ≈ 2 × 10⁴ (the fit window
-moves it between 1.4 and 2.8 × 10⁴), the same decade where an n×n complex128
-matrix, its eigenvectors and workspace stop fitting in 40 GB (n ≈ 2.7 × 10⁴).
-`distributed` eigh is therefore a capacity route, not a speed route.
-
-The route (c) exchanges and the scan route compile once per signature; a
-Python loop over the batch recompiled SLATE's eager `shard_map` wrappers per
-matrix (165 compiles and 5.9 s against 3 compiles and 0.17 s for an 8-matrix
-factor + solve on GPU 2×2).
-
-### Open measurement gaps
-
-Every number above is one node with 4 ranks and n ≤ 4096, complex128. The
-regime `distributed` exists for, a matrix too large for one device or a mesh
-spanning nodes, is unmeasured, as are float64 rows and the SLATE CUDA eigh
-crash threshold inside (2048, 4096].
+Route (c)'s exchanges and the scan route compile once per signature. A Python
+loop over the batch recompiles SLATE's eager `shard_map` wrappers per matrix;
+never factor a batch that way.
 
 ## Tests
 
@@ -522,7 +500,7 @@ Every check ships with its red twin, and the real 2×2 cells use non-dividing
 extents with padding round trips. On Perlmutter the real-process gate is
 
 ```bash
-lx run -N 1 -G 4 -n 4 python3 -u \
+lx run --pool POOL -N 1 -G 4 -n 4 python3 -u \
   services/distrib_la/tests/test_distrib_la_multiproc.py --mesh 2x2 --only batch_reshard_local_ops
 ```
 

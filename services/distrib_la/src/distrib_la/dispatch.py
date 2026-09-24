@@ -135,8 +135,7 @@ def dispatch_batched_eigh(A, mesh_xy: Mesh, backend: str = "distributed",
     traceback (guard 5 exists because ``cusolverMpSyevd`` hangs inside a
     collective on a rectangular grid instead of returning an error
     status).  Closing that gap is a MEASUREMENT and not an argument: the
-    gate below runs the scan route on a real CUDA mesh, and § Performance
-    in ``docs/services/distrib_la.md`` carries what it cost.
+    gate below runs the scan route on a real CUDA mesh.
 
     What the scan does NOT do is recover what the stacked entry buys.
     That saving is in C++, where the handler takes ``nq`` as a

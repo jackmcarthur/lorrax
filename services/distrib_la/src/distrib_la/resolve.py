@@ -447,8 +447,8 @@ def _announce_eigh_fixed_cost(px: int, py: int, n: int) -> None:
     a tile too large for one device, or a mesh spanning several nodes --
     was NOT measured by this investigation: single node, 4 ranks, n<=4096
     throughout.  MULTI-NODE IS THE LARGEST OPEN GAP in this package's
-    performance record (docs/services/distrib_la.md, "Open measurement
-    gaps").  Nobody should infer from a 1064x loss at n=64 that the
+    performance record (docs/services/distrib_la.md, "Performance").
+    Nobody should infer from a 1064x loss at n=64 that the
     library is bad at what it is for.
     """
     announce_once(

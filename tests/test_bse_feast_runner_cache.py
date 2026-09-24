@@ -15,8 +15,8 @@ their own operand set -- ``bse_feast.run_feast_ritz`` (``build_bse_stack_matvec`
 or ``build_bse_ring_matvec_full``) and ``bse_pseudopoles._feast_filter``
 (``build_bse_ring_matvec``).  With matching scalars the second caller in a
 process silently got back the FIRST caller's runner: wrong operator, wrong
-arrays, rc=0, plausible-looking numbers.  That is the same failure family as
-the recorded -161 eV silent route change in ``docs/services/distrib_la.md``.
+arrays, rc=0, plausible-looking numbers: the silent-route-change failure
+family.
 
 The sibling ten lines up already gets this right: ``_get_gmres_solver`` keys on
 ``id(matvec)`` and stores the matvec beside the solver so the ``id()`` cannot be
