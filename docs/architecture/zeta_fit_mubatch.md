@@ -45,7 +45,7 @@ centroid orbits.
 4  typed unfold k̄ → k        D̃_k = (U_k⊗Ū_k) T_k[D̃_k̄(perm μ, pslot G) e^{2πi L·k̄} conj(phase)];
                                the ψ spheres' occupied (b,c) columns, DFT along the longest grid
                                axis onto every plane: the D cylinder (k, plane, s, 2c, s, column)
-5  per group of n_pg planes   columns → planes, 2D FFT, Bloch phase: D(k, μ, r_plane);
+5  per group of n_pg planes   columns → planes, 2D FFT: D(k, μ, r_plane) up to its Bloch phase;
                                k-convolution → Z_q(μ, r_plane) for every q of the full zone;
                                LR+RL, stored-q selection, e^{-iq·r}, forward 2D FFT, one matmul
                                onto the ζ-sphere cylinder (columns × axis values)
@@ -64,12 +64,14 @@ applies the spinor rotation U_k, conjugation on antiunitary rows, and the
 centroid permutation and lattice wrap from the owner's orbit tables. Because
 each owner holds whole orbits, the centroid gather is local.
 
-The k-convolution in step 5 is `isdf.core.parent_projector_kconv` on the
-identity unfold plan, where every k is its own parent. Its pair kernel comes
-from the k-convolution router `ffi.fft.make_fused_conv_kparent`, which uses
-nvidia-mathdx on CUDA and MKL plans on CPU. The kernel correlates over k by
-FFTs on the k grid, at O(N_k log N_k) per (μ, r) point. Kernel contracts are
-on [the FFI layer](ffi_layout.md).
+The k-convolution in step 5 is the pair convolution on the identity plan,
+where every k is its own parent: `ffi.fft.make_fused_conv_kplane(D, F)`. It
+reads the 2D-FFT output `D (N_k, n_pg, ns, 2c, ns, p)` where the FFT left it
+and applies the Bloch phase `F (N_k, n_pg, p)` and the L | R split of the 2c
+slots on its load (mathdx mode 6 on CUDA; the XLA composition and the host
+plans on CPU), so no phased, split or transposed copy of D is written. It
+correlates over k by FFTs on the k grid, at O(N_k log N_k) per (μ, r) point.
+Kernel contracts are on [the FFI layer](ffi_layout.md#k-convolution-router-and-the-mathdx-family).
 
 **Cost per batch and rank** (n_b fit bands, n_⊥ = N_r/n_a points per plane,
 n_col × n_s the ψ cylinder):
