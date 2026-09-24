@@ -252,8 +252,8 @@ def _sigma_spin_pair_stream(*, mesh_xy, kgrid, layout, face_shape,
     from distrib_la import gemm_plan
     from .greens_function_kernel import (
         _phase_band_interval, _weighted_tau_phases, build_G, build_G_tau,
-        spin_block_sources, spin_pair_rows, spin_pairs_needed,
-        unfold_parent_faces, unfold_parent_spin_block)
+        pair_stream_layout, spin_block_sources, spin_pair_rows, spin_pairs_needed,
+        to_pair_stream_layout, unfold_parent_faces, unfold_parent_spin_block)
     from .wavefunction_bundle import (SIGMA_CONV_G7D_SPEC, V_FFT5D_SPEC,
                                       sigma_conv_operand)
 
@@ -262,8 +262,10 @@ def _sigma_spin_pair_stream(*, mesh_xy, kgrid, layout, face_shape,
     n_full = int(k_unfold_plan.n_full)
     kconv = make_kconv_klead(mesh_xy, kgrid, SIGMA_CONV_G7D_SPEC, V_FFT5D_SPEC,
                              norm='ortho', mult=-1.0 / np.sqrt(float(nk_tot)))
+    pair_layout = pair_stream_layout(n_full=n_full, ns=ns, mu=mu, nb=nb,
+                                     layout=layout, mesh=mesh_xy)
     pair_plan = gemm_plan(mesh_xy, m=mu, k=nb, n=mu, nq=n_full,
-                          dtype=jnp.complex128, layout=layout,
+                          dtype=jnp.complex128, layout=pair_layout,
                           enable_active_range=True)
     project = _make_project_ri_reduce_scatter(
         mesh_xy, merged_x=True, layout=layout, face_shape=(n_full, nb, mu, 1),
@@ -299,12 +301,13 @@ def _sigma_spin_pair_stream(*, mesh_xy, kgrid, layout, face_shape,
                                       E_min=E_min, E_max=E_max, **weights)
         phases = jnp.take(phases, jnp.asarray(irr), axis=0)
         lo, hi = _phase_band_interval(phases)
-        psi_mun, psi_nmu = unfold_parent_faces(
-            k_unfold_plan, psi_coh_xn, psi_coh_yr, layout=layout)
+        psi_mun, psi_nmu = to_pair_stream_layout(*unfold_parent_faces(
+            k_unfold_plan, psi_coh_xn, psi_coh_yr, layout=layout),
+            layout=pair_layout, mesh=mesh_xy)
 
         def block(index):
             left, right = spin_pair_rows(psi_mun, psi_nmu, index, ns)
-            G_ab = build_G(left, right, phases=phases, layout=layout,
+            G_ab = build_G(left, right, phases=phases, layout=pair_layout,
                            gemm=pair_plan, band_range=(jnp.minimum(lo, hi), hi))
             S_ab = kconv.apply(sigma_conv_operand(G_ab), W_prep)
             proj_left = jax.lax.dynamic_slice_in_dim(psi_proj_xr, index // ns, 1, axis=2)

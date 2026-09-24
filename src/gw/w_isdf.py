@@ -501,11 +501,14 @@ def _get_chi_minimax_kernel_spin_pairs(mesh_xy, kgrid, nk, n_out, complex_contou
     from common.fft_helpers import make_flat_k_fftn
     from common.wfn_layout import psi_specs
     from distrib_la import gemm_plan
-    from .greens_function_kernel import build_G_tau, spin_pair_rows, unfold_parent_faces
+    from .greens_function_kernel import (build_G_tau, pair_stream_layout, spin_pair_rows,
+                                         to_pair_stream_layout, unfold_parent_faces)
     from .wavefunction_bundle import CHI_Q_SPEC as _chi_spec, CHI_R_SPEC as _chi_R_spec
 
     psi_nmu_spec, psi_mun_spec = psi_specs(layout)
     nk_in, nb_full, n_rmu, ns = (int(v) for v in face_shape)
+    pair_layout = pair_stream_layout(n_full=nk, ns=ns, mu=n_rmu, nb=nb_full,
+                                     layout=layout, mesh=mesh_xy)
     expected_input_nk = nk if k_unfold_plan is None else k_unfold_plan.n_parent
     if nk_in != expected_input_nk:
         raise ValueError("chi spin pairs: face k extent disagrees with its parent plan.")
@@ -518,7 +521,7 @@ def _get_chi_minimax_kernel_spin_pairs(mesh_xy, kgrid, nk, n_out, complex_contou
     rep0, rep1, rep2 = (NamedSharding(mesh_xy, s) for s in (P(), P(None), P(None, None)))
     # One planned block GEMM at full k, shared by every Gv/Gc block build.
     g_plan = gemm_plan(mesh_xy, m=n_rmu, k=nb_full, n=n_rmu, nq=nk,
-                       dtype=jnp.complex128, layout=layout, enable_active_range=True)
+                       dtype=jnp.complex128, layout=pair_layout, enable_active_range=True)
 
     def to_full_k(psi_mun, psi_nmu, tables):
         if k_unfold_plan is None:
@@ -532,13 +535,15 @@ def _get_chi_minimax_kernel_spin_pairs(mesh_xy, kgrid, nk, n_out, complex_contou
     def integrate(nodes, psi_mun, psi_nmu, mask_v, mask_c, enk_full, vmax, cmin):
         psi_mun, psi_nmu, mask_v, mask_c, enk_full = to_full_k(
             psi_mun, psi_nmu, (mask_v, mask_c, enk_full))
+        psi_mun, psi_nmu = to_pair_stream_layout(psi_mun, psi_nmu, layout=pair_layout,
+                                                 mesh=mesh_xy)
         zero = jax.lax.with_sharding_constraint(
             jnp.zeros((nk, n_rmu, n_rmu), dtype=jnp.complex128), chi_R_shard)
         alpha_rows = (nodes.alpha[:, None] if n_out == 1 else jnp.transpose(nodes.alpha))
 
         def block_green(left, right, t, ref, mask):
             G = build_G_tau(left, right, enk_full, t, e_ref=ref, mask=mask,
-                            layout=layout, gemm=g_plan, trim_zero_bands=True,
+                            layout=pair_layout, gemm=g_plan, trim_zero_bands=True,
                             conjugate=True)
             return chi_fftn(jax.lax.with_sharding_constraint(
                 G.reshape(nk, n_rmu, n_rmu), chi_R_shard))

@@ -11,7 +11,8 @@ import jax.numpy as jnp
 import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
-from .greens_function_kernel import (build_G, spin_pair_rows, spin_pairs_needed,
+from .greens_function_kernel import (build_G, pair_stream_layout, spin_pair_rows,
+                                     spin_pairs_needed, to_pair_stream_layout,
                                      unfold_parent_faces)
 from .head_correction import static_head_terms_to_kij
 from .wavefunction_bundle import project as _project
@@ -339,9 +340,11 @@ def _make_cohsex_kernels_face(mesh_xy: Mesh, face_shape, _convolve,
         n_full=k_unfold_plan.n_full, n_rmu=n_rmu_g, ns=ns_g, mesh=mesh_xy,
         live_green_tiles=2))
     if stream:
+        pair_layout = pair_stream_layout(n_full=k_unfold_plan.n_full, ns=ns_g, mu=n_rmu_g,
+                                         nb=nb_g, layout=layout, mesh=mesh_xy)
         pair_plan = gemm_plan(mesh_xy, m=n_rmu_g, k=nb_g, n=n_rmu_g,
                               nq=k_unfold_plan.n_full, dtype=jnp.complex128,
-                              layout=layout)
+                              layout=pair_layout)
         pair_proj = contract_bands_block_reshard(
             mesh_xy, layout=layout, face_shape=(nk_g, nb_g, n_rmu_g, 1))
         _irr = np.asarray(k_unfold_plan.irr_idx, dtype=np.int32)
@@ -350,14 +353,15 @@ def _make_cohsex_kernels_face(mesh_xy: Mesh, face_shape, _convolve,
         """Σ = Σ_ab ψ*_a [G_ab · interaction] ψ_b on parent rows, one spin block at a time."""
         from .wavefunction_bundle import parent_sigma_operands
         carrier = wfns.green_parent
-        psi_mun, psi_nmu = unfold_parent_faces(
-            k_unfold_plan, carrier.psi_mun, carrier.psi_nmu, layout=layout)
+        psi_mun, psi_nmu = to_pair_stream_layout(*unfold_parent_faces(
+            k_unfold_plan, carrier.psi_mun, carrier.psi_nmu, layout=layout),
+            layout=pair_layout, mesh=mesh_xy)
         phases = jnp.take(phases_parent, jnp.asarray(_irr), axis=0)
         _, _, proj_nmu, proj_mun, _, _ = parent_sigma_operands(wfns)
 
         def block(acc, index):
             left, right = spin_pair_rows(psi_mun, psi_nmu, index, ns_g)
-            G_ab = build_G(left, right, phases=phases, layout=layout, gemm=pair_plan)
+            G_ab = build_G(left, right, phases=phases, layout=pair_layout, gemm=pair_plan)
             S_ab = jnp.take(_convolve(G_ab, interaction, prefactor),
                             jnp.asarray(_k_rows), axis=0)
             proj_left = jax.lax.dynamic_slice_in_dim(proj_nmu, index // ns_g, 1, axis=2)
