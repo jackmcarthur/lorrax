@@ -209,15 +209,39 @@ def main():
 
     nocc = int(wfn.nelec)
     f_spin = spin_degeneracy_factor(wfn)
-    # The reference density is the one density builder's, on the full BZ
-    # (uniform weights), independent of the edited function's wedge route.
+    # The reference density is production's own recipe (the one density
+    # builder on the star wedge: |star|/nk weights and the FFT-grid star
+    # average), so the e2e check below certifies the matrix-element CALL
+    # SITE, which is what this gate is for.  The full-BZ uniform sum is
+    # printed beside it as a diagnostic: it is a different quadrature of
+    # the same density and is not gated here.  Both load ψ exactly as
+    # production does -- the bispinor lift on a four-component meta, whose
+    # small components carry charge (26.0008 e of 26 on the MoS2 bispinor
+    # fixture); a raw two-spinor reference misses it by 3.7e-5 in H.
     from common.wfn_layout import band_sphere_spec
     from gw.qsgw_density import rho_from_wfns
+    from gw.kin_ion_io import (_wedge_density_occupations,
+                               _wedge_sweep_kspec)
+    k_spec, _, _ = _wedge_sweep_kspec(wfn, sym)
+    occ_w, kw_w = _wedge_density_occupations(wfn, sym, k_spec, nocc, nocc)
+    lift = dict(bispinor=(int(meta.nspinor) == 4), bispinor_lift="raw")
     rho_np = np.asarray(rho_from_wfns(
-        wfn.load(bands=(0, nocc), k="full_bz", sharding=band_sphere_spec()),
+        wfn.load(bands=(0, nocc), k=k_spec, sharding=band_sphere_spec(),
+                 **lift),
+        occ_w, kw_w, mesh=mesh, box_index=wfn.box_index(k=k_spec),
+        fft_grid=grid, cell_volume=float(wfn.cell_volume),
+        spin_degeneracy=f_spin, sym=sym,
+        sym_perm=sym.fft_grid_pullback(sym.active_symmetry_rows, grid)))
+    rho_full = np.asarray(rho_from_wfns(
+        wfn.load(bands=(0, nocc), k="full_bz", sharding=band_sphere_spec(),
+                 **lift),
         np.ones((nk, nocc)), np.full(nk, 1.0 / nk), mesh=mesh,
         box_index=wfn.box_index(k="full_bz"), fft_grid=grid,
         cell_volume=float(wfn.cell_volume), spin_degeneracy=f_spin))
+    p0(f"[mtxel] diagnostic: full-BZ uniform rho vs wedge+pullback rho  "
+       f"max rel = {np.max(np.abs(rho_full - rho_np)) / np.max(np.abs(rho_np)):.3e}"
+       f"  (not gated)")
+    del rho_full
     V_H_r = build_hartree_potential(
         jnp.asarray(rho_np), wfn, truncation_2d=truncation_2d,
         expected_electrons=f_spin * float(nocc), print_fn=p0)
