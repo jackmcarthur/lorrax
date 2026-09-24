@@ -274,7 +274,7 @@ teardown (effects barrier → unregister jax's `clean_up` atexit →
 destruction deadlocks after fully-cold in-process compile storms (jobs
 7884928/7884989); `gw.gw_jax` is the adopter. Order: failfast hook → env defaults
 (including the one GPU pool policy, `set_default_gpu_pool()`: `cuda_async`,
-reserved, fraction 0.85 — [environment overview](../environment/overview.md) §2.1) →
+reserved, fraction 0.89 — [environment overview](../environment/overview.md) §2.1) →
 collectives announcement → plugin skip → `jax.distributed` → backend init
 (the CPU demotion point) → mesh + warm-up → compile cache → the rank-0
 startup report. The compile-cache step also arms an fd-level exact-line

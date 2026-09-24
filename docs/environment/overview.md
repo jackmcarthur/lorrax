@@ -176,7 +176,9 @@ resolved to 'platform' (raw 'platform') — NOT LORRAX's canonical pair …; a c
 
 This is the pair §2.1 is about, and it is the reason to read the block rather
 than the environment: after backend init `os.environ` is a false witness.
-**The sanctioned launcher resolves `platform`,** which is plain `cudaMalloc`
+(This transcript is from 2026-08-06.  Since the GPU pool policy the line
+reads `resolved to true … 'cuda_async' … — LORRAX's GPU pool policy`, and no
+launcher sets any of the three.)  **That launcher resolved `platform`,** which is plain `cudaMalloc`
 — so `bytes_limit` and `peak_bytes_in_use` both read 0 and every memory
 figure the run prints later comes from an `nvidia-smi` sample of the whole
 GPU, not from LORRAX's own accounting. That is why the very next line of the
@@ -399,7 +401,7 @@ rest.
 |---|---|---|
 | `JAX_ENABLE_X64` | `1` | 64-bit precision (required for GW).  Runtime-owned: applied even when jax was imported first, and a resolved `False` refuses at startup (`LORRAX_ALLOW_X64_OFF=1` continues, announced uncertified) |
 | `JAX_PLATFORMS` | `cuda,cpu` (GPU) / `cpu` (CPU runs) | an explicit `cpu` also arms the CUDA-plugin-skip (below) |
-| `XLA_PYTHON_CLIENT_ALLOCATOR` / `XLA_PYTHON_CLIENT_PREALLOCATE` / `XLA_CLIENT_MEM_FRACTION` | `cuda_async` / `true` / `0.85` on CUDA; untouched on CPU; ROCm keeps BFC with `PREALLOCATE=false` | the one GPU pool policy, `runtime.set_default_gpu_pool()` (§2.1).  A run script sets none of them |
+| `XLA_PYTHON_CLIENT_ALLOCATOR` / `XLA_PYTHON_CLIENT_PREALLOCATE` / `XLA_CLIENT_MEM_FRACTION` | `cuda_async` / `true` / `0.89` on CUDA (40 and 80 GB alike); untouched on CPU; ROCm keeps BFC with `PREALLOCATE=false` | the one GPU pool policy, `runtime.set_default_gpu_pool()` (§2.1).  A run script sets none of them |
 | `HDF5_USE_FILE_LOCKING` | `FALSE` | Lustre HDF5 compatibility |
 
 There is one repository-configured LORRAX compile-cache owner:
@@ -434,7 +436,7 @@ Measured on 8× Quadro RTX 5000 across 2 nodes (jobs 7882442 / 7882447 /
 pool — pre-grabbing 95 % into BFC (`MEM_FRACTION=0.95`) starves NCCL and
 surfaces as `cusolverMpSyevd: status=7`.
 
-**The policy: `cuda_async`, reserved, fraction 0.85** (`runtime.set_default_gpu_pool()`,
+**The policy: `cuda_async`, reserved, fraction 0.89** (`runtime.GPU_POOL_FRACTION`, one value on every CUDA node; `runtime.set_default_gpu_pool()`,
 every CUDA run; an explicit export wins and the startup report names it).
 What XLA does with it (jaxlib 0.9.1 source): PJRT allocates from the device's
 **default** mempool (`create_new_pool=false`), the same pool every FFI
@@ -444,7 +446,10 @@ reservation: `PREALLOCATE=true` maps `fraction × total` once and keeps it;
 synchronize and the next launch maps it again (the per-executable 25–110 ms
 stall measured in `runs/runtime/sigma_tau_sweep_20260924`).  The fraction is
 **not a cap** under `cuda_async` — `AllocateRaw` never checks it; it sizes the
-reservation and the `bytes_limit` the planners budget 0.9× of.  Reserved
+reservation and the `bytes_limit` the planners budget 0.9× of.  0.89 is
+derived from the bytes measured outside the pool (1 − 4.72 GB / 42.4 GB on
+A100-40GB, table below) and kept on 80 GB cards too — one value, no
+per-card-size branch (owner ruling 2026-09-24).  Reserved
 memory XLA is not using is released by the driver to an unrelated
 allocation in the same process (raw `cudaMalloc`, `cuMemCreate`, NCCL), so
 the reservation takes nothing from the C++ libraries that an unreserved pool
@@ -461,7 +466,7 @@ Measured on A100-40GB, P4 on a 2×2 mesh, 2026-09-24 (sandbox
 | + cuSOLVERMp potrf n=8192 (context's grow-only `cudaMalloc` workspace) | 4.71 GB |
 | + jaxlib local eigh n=10000 (workspace is XLA's) | 4.72 GB |
 
-With the pool reserved at 0.85 (36.04 GB) and 5.0 GB free, a raw `cuMemAlloc`
+Measured at the earlier 0.85 default: with the pool reserved (36.04 GB) and 5.0 GB free, a raw `cuMemAlloc`
 of 23.0 GB succeeded in 0.85 s (the driver trimmed the idle pool 36.0 → 4.0 GB),
 and so did `cuMemCreate`; at 0.95 (0.77 GB free) 20.9 GB succeeded too.  A
 4 GB allocate-sync-free loop costs 5.5 ms reserved and 68–151 ms unreserved.
@@ -537,7 +542,7 @@ the CUDA plugin cold load hiding inside the first `jax.devices()`.
 |---|---|
 | `No GPU/TPU found, falling back to CPU` | `nvidia-smi`; `CUDA_VISIBLE_DEVICES`; jaxlib must be the CUDA build |
 | `RESOURCE_EXHAUSTED: Out of memory` | check `memory_per_device_gb` and the A–F planner report; lower `band_chunk_size`, `r_chunk_size`, or `gflat_chunk_size` for Peaks A/C/D, and `vq_g_chunk_size` only for the Vq kernel's inner G workspace; zero selects the live auto policies documented in [memory-model](../architecture/memory-model.md) |
-| `cusolverMpSyevd: status=7` + NCCL error 1 | memory outside XLA's pool could not be had: under BFC that is the pre-grabbed arena; under the `cuda_async` policy it means XLA's LIVE bytes plus the non-pool bytes exceed the card — check for a caller's `ALLOCATOR=bfc` or a `MEM_FRACTION` above 0.85 in the startup report (§2.1) |
+| `cusolverMpSyevd: status=7` + NCCL error 1 | memory outside XLA's pool could not be had: under BFC that is the pre-grabbed arena; under the `cuda_async` policy it means XLA's LIVE bytes plus the non-pool bytes exceed the card — check for a caller's `ALLOCATOR=bfc` or a `MEM_FRACTION` above the policy's 0.89 in the startup report (§2.1) |
 | a CPU/MPI run exits rc=1 **after** succeeding | its driver did not cross the shared `runtime.run_main_and_finalize()` boundary (the older Frontera overlay is a driver-specific fallback; [transports](transports.md)) |
 | HDF5 "file is already open" on Lustre | `HDF5_USE_FILE_LOCKING=FALSE` |
 | wrong data from `psum_scatter` on CPU, rc=0 | you are on gloo — see [transports](transports.md); this is the corruption that moved LORRAX to `impl=mpi` |

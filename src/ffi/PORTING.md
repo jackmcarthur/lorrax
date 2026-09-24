@@ -599,7 +599,7 @@ Baked-in DCPL: `H5D_FILL_TIME_NEVER` + `H5D_ALLOC_TIME_EARLY` +
   arena; under the runtime's reserved `cuda_async` pool the driver hands
   idle pool memory to NCCL, so it means XLA's live bytes plus the non-pool
   bytes exceed the card.  Check the startup report for a caller's
-  `ALLOCATOR=bfc` or a `MEM_FRACTION` above 0.85
+  `ALLOCATOR=bfc` or a `MEM_FRACTION` above the policy's 0.89
   (`docs/environment/overview.md` §2.1).
 - **`MPI_COMM_WORLD` size 1 inside `--module=mpich`**: wrong
   `--mpi=` flavour. Use `cray_shasta`.

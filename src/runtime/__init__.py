@@ -711,19 +711,23 @@ def set_default_env(*, platform: str = "gpu") -> None:
     configure_gpu_network(platform=xla_platform, say=rank0_print)
 
 
-#: The budget fraction of the reserved pool, and of every memory planner
+#: The ONE memory fraction on every CUDA node (owner ruling 2026-09-24; no
+#: per-card-size branch): the reserved pool, the ``bytes_limit`` the client
+#: reports, and therefore every memory planner's budget
 #: (``common.gpu_utils.get_device_memory_gb`` budgets 0.9 x bytes_limit).
-#: The certified large-deck value (sandbox claims 703/708), formerly typed
-#: per run.  It is a PLANNER budget, not a pool knob: under cuda_async XLA
-#: never refuses an allocation above it (see set_default_gpu_pool).
-GPU_POOL_FRACTION = "0.85"
+#: Derived from the measured bytes outside the pool: 1 - 4.72 GB / 42.4 GB
+#: on A100-40GB (sandbox runs/runtime/gpu_pool_policy_20260924, JID
+#: 58826377); the same value is kept on 80 GB cards rather than the 0.94
+#: the byte rule would give there.  It is a PLANNER budget, not a pool cap:
+#: under cuda_async XLA never refuses an allocation above it.
+GPU_POOL_FRACTION = "0.89"
 
 _PREALLOCATE_ENV = "XLA_PYTHON_CLIENT_PREALLOCATE"
 _FRACTION_ENVS = ("XLA_CLIENT_MEM_FRACTION", "XLA_PYTHON_CLIENT_MEM_FRACTION")
 
 
 def set_default_gpu_pool() -> None:
-    """The one GPU memory-pool policy: cudaMallocAsync, reserved, 0.85.
+    """The one GPU memory-pool policy: cudaMallocAsync, reserved, 0.89.
 
     Must run before the CUDA client exists (jaxlib reads these three
     variables once, in ``generate_pjrt_gpu_plugin_options()``).  Each is a
