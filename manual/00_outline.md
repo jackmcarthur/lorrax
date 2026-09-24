@@ -73,9 +73,7 @@ G bibliography (all method citations; the home for every "Appendix G" reference)
    *other* normalization (B_h/(ω²−Ω_h²), R_h = B_h/2Ω_h) — App. B must state both.
 2. ~~Window scheme~~ **RESOLVED 2026-07-10** from `ppm_windows.py:250-353`: three
    windows (core ≤T/HGL; a_stripe E>T/GL; b_slab Ω>T/GL), T = ω_max + edge_factor·ξ,
-   A_core = 2T/ξ; 4 branches {occ,emp}×{±ω}, one crossing branch per half. The
-   six-window note (`dev/notes/NEW_WINDOW_MINIMAX_GUIDELINES.md`) is unshipped design
-   — archive it.
+   A_core = 2T/ξ; 4 branches {occ,emp}×{±ω}, one crossing branch per half.
 3. Pin bispinor cost exponents (×4 memory / ×16 runtime claim) against the planner.
 4. Confirm the non-sym-reduced stage list for Appendix A (P_k pair-density k-sum).
 5. Fresh periodic Σ(ω)-vs-BGW gate before §7.6 prints accuracy numbers.
@@ -85,9 +83,8 @@ G bibliography (all method citations; the home for every "Appendix G" reference)
 ## Source-material map (freq chapter)
 
 Reading order: `docs/theory/minimax-quadrature.md` (spine, incl. LORRAX-fitted error
-laws) → `docs/dev/notes/ctsp_revised.md` (derivation prose, CD analogy) →
-`docs/theory/physics.md` §6.9 (Σ code narrative) →
-`docs/dev/notes/GN_PPM_MINIMAX_SIGMA_GUIDE_REVISED.md` (window-edge algebra; ±ω prose
-unreliable) → Kim-2020 appendix transcription (primary source) →
+laws) → `docs/theory/physics.md` §6.9 (Σ code narrative) →
+`docs/theory/THEORY_mpa_implementation.md` §7–8 (Σ branches; core, stripe and slab
+windows) → Kim-2020 appendix transcription (primary source) →
 `services/minimax/src/minimax/minimax_assets/README.md` + `reports/sigma_ppm_tighten_2026-07-04`
 (error conventions; the per-pole-term −ω identity correction).

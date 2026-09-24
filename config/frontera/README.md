@@ -118,8 +118,8 @@ on CLX, writable inside apptainer — once per node under `flock`, in 1.5–2.2 
 and **says so on rank 0**.
 
 Nothing here is a patched dependency: every file is a byte-for-byte copy of
-what uv installed, and the GPU venv is untouched. Full measurement and the
-falsified instruments: **`docs/dev/notes/cold_start_2026-07.md`**.
+what uv installed, and the GPU venv is untouched. Owner of the cold-start
+contract and its numbers: [`docs/environment/machines/frontera.md` §3](../../docs/environment/machines/frontera.md#3-cold-start).
 
 ## Built since (formerly "Deferred" — updated 2026-07-28)
 

@@ -440,7 +440,7 @@ def test_ordered_fit_recovers_two_hermitian_residues_from_a_nonhermitian_probe()
 
     # RED TWIN: the incumbent single-residue formula on the same probe gives
     # a non-Hermitian B and a non-symmetric Omega -- the closure premise
-    # (DERIVATION_channel_hermiticity.md section 1.3) fails.
+    # (docs/dev/notes/DERIVATION_gnppm_nonhermitian.md section 5) fails.
     om_raw, B_raw, D_raw, _g = _fit(Wc0, Wcp, ordered=False)
     assert D_raw is None
     assert _herm_rel(B_raw) > 1.0e-3

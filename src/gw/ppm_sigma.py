@@ -621,10 +621,9 @@ def _compute_invalid_static_sigma(
         Σ_static = sigma_sx(G_occ, W_static) + sigma_coh(W_static − 0)
                  = −⟨G_occ·W_static⟩ + ½·⟨G_RI·W_static⟩
 
-    matching design note GN_PPM_MINIMAX_SIGMA_GUIDE_REVISED.md §8
-    (Σ_occ − ½·Σ_RI in its sign convention).  μ-pad safety is inherited
-    from ``invalid_mask`` (pad modes are born dead at the fit, so they
-    are never flagged invalid and ``W_static`` is exactly zero there).
+    μ-pad safety is inherited from ``invalid_mask`` (pad modes are born
+    dead at the fit, so they are never flagged invalid and ``W_static`` is
+    exactly zero there).
 
     Returns the replicated host tensor (nk, nb_sigma, nb_sigma) in Ry,
     to be added to Σ_c at EVERY ω (the term is ω-independent).

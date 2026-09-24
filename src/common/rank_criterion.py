@@ -37,7 +37,7 @@ WHY THE FAILURE MODE FIXES THE OBJECTIVE
 ----------------------------------------
 The danger is **not** cutting a real direction.  It is **keeping a near-null
 one**, whose pseudo-inverse amplifies noise by ``1/σ``.  Measured on this
-code (docs/dev/notes/ladder_rung1_R19_zeta_rcond.md, MoS2 4×4, nb=1024, μ≈10k,
+code (docs/dev/rank_truncation_policy.md, MoS2 4×4, nb=1024, μ≈10k,
 ``zeta_rcond`` swept, everything else fixed):
 
     zeta_rcond   retained rank   eqp0        eqp1
@@ -691,7 +691,7 @@ POLICY_MODE_ENV = "LORRAX_RANK_POLICY"
 #:
 #: 1e8, measured on two decks sharing no code path downstream of the fit:
 #:
-#:   * R19 (``docs/dev/notes/ladder_rung1_R19_zeta_rcond.md``), MoS2 4×4,
+#:   * R19 (``docs/dev/rank_truncation_policy.md``), MoS2 4×4,
 #:     nb=1024, μ≈10k — rcond 1e-8 (κ ≤ 1e8) gives eqp0 3.1350; 1e-10
 #:     (κ ≈ 1e10) gives −206.83; 1e-12 (κ ≈ 1e12) gives −5049.59.
 #:   * Si 4×4×4 SYM/SOC 128-band at 1776 centroids (register 2026-08-15) —

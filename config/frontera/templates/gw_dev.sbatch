@@ -47,7 +47,7 @@ set +u; module load tacc-apptainer 2>/dev/null; set -u
 export LORRAX_ROOT LORRAX_RUN_DIR LORRAX_INPUT
 [ -f "$LORRAX_SIF" ] || { echo "REFUSING: no container image at $LORRAX_SIF"; exit 2; }
 
-# Optional node-local runtime bundle (docs/dev/cold_start.md §3.2).  Unset =>
+# Optional node-local runtime bundle (docs/environment/machines/frontera.md §3).  Unset =>
 # stage_runtime.sh announces the fallback to the Lustre venv and runs anyway.
 #   build once: config/frontera/build_cpu_runtime_bundle.sh
 export LORRAX_BUNDLE="${LORRAX_BUNDLE:-$SCRATCH/lorrax_bundle/lorrax_cpu_bundle.tar}"
@@ -130,7 +130,7 @@ if [ -d /hostlibs ]; then
   export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:$RD:/hostlibs/libibverbs
 fi
 
-# --- node-local runtime staging (docs/dev/cold_start.md; loud fallback) ----
+# --- node-local runtime staging (frontera.md §3; loud fallback) ----
 . "$LORRAX_ROOT/config/frontera/stage_runtime.sh"
 export PYTHONPATH=$LORRAX_OVERLAY_DIR:$LORRAX_SRC_DIR
 

@@ -1320,7 +1320,7 @@ def gflat_to_rmu(
 # ---------------------------------------------------------------------------
 #
 # Mirror of :func:`to_rchunk` in the opposite direction.  Used by the
-# new G-flat zeta writer (Phase C of PLAN_zeta_g_flat_migration.md):
+# G-flat zeta writers (``gw.isdf_fitting`` r-tile fits, ``bse.vq_interp``):
 # for each r-chunk produced by the ζ solve, the caller feeds the
 # slab back through this function which adds its FFT-G-sphere
 # contribution into a persistent ``gflat_acc`` buffer.  After the loop
