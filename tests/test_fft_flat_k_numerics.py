@@ -59,8 +59,8 @@ from ffi.fft import FLAT_K_TARGET, make_flat_k_fft_ffi  # noqa: E402
 
 # PARITY CLASS, STATED EXPLICITLY (TASTE rule 15).
 #
-# Value-level, NOT bit-exact.  Per docs/architecture/ffi_layout.md §9 (the
-# engine-swap parity gate): comparing against a different FFT
+# Value-level, NOT bit-exact.  Per docs/architecture/ffi_layout.md (the
+# engine-swap parity rule): comparing against a different FFT
 # engine is a ~1e-15 value-level agreement, and the Sigma path is gated at
 # relative 1e-12.  Two things this deliberately is NOT:
 #

@@ -8,8 +8,8 @@ from runtime.padding import authenticate_padded_axis, combined_divisor
 
 
 # Value-level parity contract for the canonical flat-k service.  This is the
-# registered Sigma-path class (``docs/architecture/ffi_layout.md`` §9, the
-# engine-swap parity gate), not a bit-equality promise between FFT engines.
+# registered Sigma-path class (``docs/architecture/ffi_layout.md``, the
+# engine-swap parity rule), not a bit-equality promise between FFT engines.
 FLAT_K_FFT_VALUE_RTOL = 1.0e-12
 
 
@@ -372,7 +372,7 @@ def make_sharded_fftn_3d(
 # "today" number and the 9-k fixture's 0.07%-of-wall does not generalise.
 # Stride descriptors read the dot-layout tile where it lies, so the transposes
 # disappear instead of moving.  Contract: ``docs/architecture/services.md``
-# § ffi.fft; the k-convolution router: ``docs/architecture/ffi_layout.md`` §9.
+# (``ffi.fft``); the k-convolution router: ``docs/architecture/ffi_layout.md``.
 #
 # What stays here: the OWNER RULE that these helpers are the single FFT entry
 # point (``make_flat_k_fft`` below is still the only door), and the XLA

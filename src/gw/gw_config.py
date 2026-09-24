@@ -1814,7 +1814,7 @@ _DEFAULTS = {
     "sigma_omega_step_ev": 0.25,
     # "" = the contiguous [min, max] grid.  "lo:hi, lo:hi" (eV) = a union
     # of uniform patches at sigma_omega_step_ev — the semicore dynamic-
-    # range spelling (docs/theory/metallic-mpa-screening.md §5.6).
+    # range spelling (docs/input_reference.md, sigma_omega_patches_ev).
     "sigma_omega_patches_ev": "",
     "sigma_regularization_ev": 0.25,
     "sigma_w_model": "mpa",

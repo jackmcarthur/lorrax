@@ -652,7 +652,7 @@ def build_shared_sigma_windows(
         # whose bandwidth is set by the cluster span and pole bracket —
         # independent of the dynamic range — plus sign-definite bulk slabs
         # on the logarithmic rotated-Laplace family
-        # (docs/theory/THEORY_mpa_implementation.md §10.1).
+        # (docs/theory/THEORY_mpa_implementation.md, the pane planner).
         idx, bounds, phase, stats = selected["shallow"]
         if idx.size:
             gamma_min = eta + min(row[2] for row in stats)

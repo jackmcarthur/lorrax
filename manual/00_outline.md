@@ -84,7 +84,7 @@ G bibliography (all method citations; the home for every "Appendix G" reference)
 
 Reading order: `docs/theory/minimax-quadrature.md` (spine, incl. LORRAX-fitted error
 laws) → `docs/theory/physics.md` §6.9 (Σ code narrative) →
-`docs/theory/THEORY_mpa_implementation.md` §7–8 (Σ branches; core, stripe and slab
+`docs/theory/THEORY_mpa_implementation.md` (Σ branches; core, stripe and slab
 windows) → Kim-2020 appendix transcription (primary source) →
 `services/minimax/src/minimax/minimax_assets/README.md` + `reports/sigma_ppm_tighten_2026-07-04`
 (error conventions; the per-pole-term −ω identity correction).

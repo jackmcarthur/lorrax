@@ -353,7 +353,7 @@ def test_nonpositive_eta_refuses():
 
 
 # ---------------------------------------------------------------------------
-#  Clustered decomposition (docs/theory/THEORY_mpa_implementation.md §10.1)
+#  Clustered decomposition (docs/theory/THEORY_mpa_implementation.md, the pane planner)
 # ---------------------------------------------------------------------------
 
 def _oracle_total(plan, B, Omega, n_omega, shape):

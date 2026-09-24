@@ -96,8 +96,7 @@ have multiplicity 2.  The unweighted fit made the carried H differ from
 the full-BZ arm by 1.67e-02 Ry = 0.23 eV after ONE iteration and eqp0 by
 0.386 eV max / 0.037 eV rms after three (jobs 7889373, 7889375), while
 Σ itself, the star select/broadcast and the ψ rotation were bit-identical
-between the arms.  The loop's k-set invariant: ``docs/self_consistency.md``
-("What the loop does").
+between the arms.  The loop's k-set invariant: ``docs/self_consistency.md``.
 
 ``k_weights`` is consequently a REQUIRED keyword argument of
 ``fit_scissor``.  There is no unweighted spelling to forget, and the two
