@@ -50,7 +50,13 @@ import argparse
 from functools import partial
 from types import SimpleNamespace
 
-import jax
+# x64 / JAX_PLATFORMS from the runtime owner before jax is imported; the
+# lorrax_A module is not a place for runtime policy.
+from runtime import set_default_env
+
+set_default_env()
+
+import jax  # noqa: E402
 import jax.numpy as jnp
 import numpy as np
 

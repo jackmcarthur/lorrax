@@ -18,13 +18,15 @@ HOW TO RUN IT (Perlmutter; needs a GPU node and BOTH pins):
 
     LX_BASE_MODULE=lorrax_A LORRAX_CHECKOUT=$PWD PYTHONPATH=$PWD/src \
     LORRAX_FFI_SO=<device .so> LORRAX_FFI_HOST_SO=<host .so> \
-    lx run -G 1 -n 1 env JAX_PLATFORMS=cuda,cpu JAX_ENABLE_X64=1 \
+    lx run -G 1 -n 1 env \
         LORRAX_FFI_SO=<device .so> LORRAX_FFI_HOST_SO=<host .so> \
         PROBE_DIR=<scratch dir> \
         bash -c 'tools/require_jax09.py && \
                  python3 -u src/ffi/cpp/gate_one_odr.py'
 
-`JAX_PLATFORMS=cuda,cpu` is the whole setup: the process IS CUDA-capable
+`JAX_PLATFORMS=cuda,cpu` is the whole setup, and `runtime.set_default_env`
+below supplies it together with x64 (the SlabIO handle is int64), so the
+gate no longer depends on the lorrax_A module exporting either: the process IS CUDA-capable
 (`jax.default_backend() == 'gpu'`), which is what `_process_can_use_cuda()`
 answers True to, so `get_lib('cpu')` pre-opens the CUDA library FIRST and
 BOTH .so files end up in the process; and the SlabIO mesh is built from
@@ -65,6 +67,11 @@ def check(name, ok, detail=""):
         FAILS.append(name)
 
 
+# x64 and JAX_PLATFORMS come from the runtime owner, before jax is imported
+# (release 2026-09-24: without the module's JAX lines this gate's SlabIO
+# int64 handle canonicalized to int32).
+from runtime import set_default_env                          # noqa: E402
+set_default_env()
 import jax                                                    # noqa: E402
 from jax.sharding import Mesh, PartitionSpec as P             # noqa: E402
 import h5py                                                   # noqa: E402
