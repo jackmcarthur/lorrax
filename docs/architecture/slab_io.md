@@ -172,7 +172,7 @@ peers blocked in the collective with no traceback.
 | a caller may not assume that… | because |
 |---|---|
 | program order serialises two HDF5 handles on the same ranks | writes are asynchronous; call `sync_writes()` before entering another handle |
-| `write_slab`'s data is on disk, or its failure visible, when it returns | a writer error is sticky and raised at `close`, agreed across ranks |
+| `write_slab`'s data is on disk, or its failure visible, when it returns | a writer error is sticky; it is raised at `close`, or at the first read after the write (`read_slab`, `read_slabs`, `read_whole`, `padded_shape_for` on a write handle), agreed across ranks either way |
 | `write_attr`, `stamp_dataset_attrs` or `create_dataset(attrs=…)` output is readable before `close()` | all three land in one rank-0 h5py reopen after `H5Fclose` |
 | a rank other than 0 contributes deferred metadata | every rank queues, only rank 0's copy is written |
 | `close()` is local | it drains, closes collectively, and agrees on errors across ranks |
@@ -180,7 +180,7 @@ peers blocked in the collective with no traceback.
 | it can hold an h5py handle and a writable `SlabIO` on one path | refused by name ([one owner](#one-owner)) |
 | two `SlabIO` handles may be open on one path in one process | refused unless both are `"r"`; identical read-only opens share one native context |
 | a handle is re-openable, thread-safe or fork-safe | it is one collective handle over one mesh; use `with`, one at a time |
-| it may raise between collectives on one rank | peers stay in the collective; an error is agreed only once every rank reaches `close` |
+| it may raise between collectives on one rank | peers stay in the collective; an error is agreed only when every rank reaches `close` or a read after writes |
 
 ---
 
@@ -222,6 +222,13 @@ owned by `file_io.commit_state`:
 - A caller that mutates a committed artifact outside SlabIO does it inside
   `rank0_transaction`, clearing the receipt first and setting it last.
   `tagged_arrays` does this for readiness flags and head scalars.
+
+**Read after write.** On a `"w"`/`"a"` handle, a read door that follows
+writes drains the queue and then calls
+`agree_io_error(stage="SlabIO.read_after_write")` before it touches the file,
+so no rank reads bytes that another rank failed to write. Writes are
+collective, so every rank takes this agreement or none does; it is taken
+once per batch of writes followed by a read.
 
 Cost per write-mode close: two bounded host control exchanges and one rank-0
 serial reopen. This is error agreement, not crash recovery. A process that
