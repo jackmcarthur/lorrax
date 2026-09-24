@@ -26,7 +26,7 @@ buffers complex128 (16 B).
 |---|---|---|
 | ζ CCT `C_q` build | always 2-D sharded, `P(None,'x','y')`: `Q·μ²/P` | same |
 | ζ charge factor (`rank_truncate`) | replicated whole-tile eigh pseudo-inverse, one q-batch at a time under `LORRAX_ZETA_REPLICATE_CAP_GIB`; q-parallel above `Q·μ³ ≥ 5e9`, compute `ceil(Q/P)·μ³` per rank | same: route G applies the whole-tile factor on each G tile |
-| ζ back-solve (per tile) | at or below `LORRAX_ZETA_GATHER_CAP_GIB` the small factor stack may be gathered (`Q·μ²·16` B per rank per tile); above it each factor stays on its q owner and only the RHS moves, `2·ceil(Q/P)·μ·R·16` B | same |
+| ζ back-solve (per tile) | whole-tile factor, tier chosen by `isdf.core.zeta_auto_tier`: `replicated` gathers the factor stack (`Q·μ²·16` B per rank per tile) only when few q sit on many ranks (`ceil(Q/P)·P > 2Q`) and the stack is within `LORRAX_ZETA_GATHER_CAP_GIB`; otherwise `local` keeps each factor on its q owner and moves only the RHS, `2·ceil(Q/P)·μ·R·16` B | same |
 | ζ transverse factor (ridge LU) | `lax.linalg.lu` once per q and channel, `lu_solve` per tile; or the batch-reshard route (below) | `distrib_la.factor('solve_lu')`: one batched `getrf` into a 2-D-sharded `FactorToken`, `solve(token, Z_q)` runs `getrs` per tile |
 | ζ `Z_q` build and G-flat write | always sharded; SlabIO collective hyperslab writes, no gather | same |
 | W Dyson solve (`gw/w_isdf`) | q-parallel per-q dense LU: `ceil(Q/P)` whole `(μ, μ)` tiles per rank | `plan('solve_lu', backend='distributed').batched`: `Q·μ²/P`, μ axes never leave `P(None,'x','y')` |
@@ -55,7 +55,8 @@ The charge factor's only parallel axis is q, so it saturates at `P = Q`:
 every rank past `Q` idles for the whole factor stage, and the run announces
 this whenever `P > Q`. There is no distributed charge factor; `linalg =
 distributed` distributes the W Dyson solve, the transverse LU and the
-eigensolves.
+eigensolves. Route G plans the whole-tile tier under either layout and prints
+it once in its plan receipt (`ζ tier = …`; `linalg` sets the other stages).
 
 ## Thresholds
 
