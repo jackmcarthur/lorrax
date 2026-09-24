@@ -198,7 +198,8 @@ readers above it (`epsreader`, `mf_header`, `sigma_output`, `tagged_arrays`,
 
 Each exception is listed in `tests/test_layering.py` with its reason and is
 asserted to be still needed: an exception that outlives its violation fails
-the suite.
+the suite. An import of a service's top-level package is not an exception:
+`upward_edges()` does not rank it, and rule 6 governs it.
 
 | # | exception | rule | why it is still here |
 |---|---|---|---|
