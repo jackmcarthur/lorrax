@@ -50,12 +50,13 @@ _RUNTIME_NOISE_EPSILON = 6.0e-8
 _RUNTIME_NOISE_SAFETY = 0.05
 _SC_POLE_PAD_FRACTION = 0.10
 _BOX_SIGN_FRACTION = 0.7
-#: Flat real-axis coverage pad on every SC product window (owner ruling
-#: 2026-09-19). One tau node map must hold for the whole self-consistency
-#: loop, so the iteration-1 certificate pays a full +2 eV at each real end
-#: instead of re-fitting windows as states move; an escape refits the set
-#: (see ``_fit_fixed_sc_rules``).
-_SC_WINDOW_PAD_EV = 2.0
+#: SC planner calls served by the one-shot planner before the rule set
+#: freezes (owner 2026-09-24, survey A3). Maps 0 and 1 carry the loop's
+#: largest motion (Si: every state rigidly +0.39 eV at map 1), and the flat
+#: +-2 eV certificate that absorbed it was paid on every later map. The set
+#: now freezes at map 1's output with the classification and pole pads only;
+#: a later escape refits it (see ``_fit_fixed_sc_rules``).
+_SC_ONE_SHOT_CALLS = 2
 #: Pad toward zero for a sign-definite SC window: 0.5 of its distance escaped by 1.6% on TaAs 8^3
 #: map 1 and 0.25 again at map 2 (semimetal valence state 30 -> 15 -> 6 meV from E_F); 0.05 floors it below 1 meV.
 _SC_ZERO_SIDE_CAP = 0.05
@@ -714,14 +715,14 @@ def _box_escape_reasons(outer, inner):
 
 
 def _sc_padded_box_spec(spec, eta):
-    """Return the iteration-1 SC certificate box required by policy.
+    """Return the frozen SC certificate box required by policy.
 
     State drift uses the classification pad on the movable real edge(s).
     Branch state energies already measure distance from mu; take the largest
     allowance in this product window so every state is covered. Pole drift is
     covered independently by widening every real and imaginary pole extent
-    by ten percent before recomputing the denominator box. Every window then
-    pays a flat +2 eV at each real end so one node map covers the whole loop.
+    by ten percent before recomputing the denominator box. Nothing else is
+    added; a map that leaves this box is an escape and refits the set.
     """
     a_lo, a_hi, gamma_lo, gamma_hi = spec["pole_extent"]
     frac = _SC_POLE_PAD_FRACTION
@@ -733,7 +734,7 @@ def _sc_padded_box_spec(spec, eta):
     )]
     # A treatment ceiling is a fixed-domain contract, not a live pole. Keep
     # its declared support separate from the current pole statistics and
-    # factor references, and use it only to size the iteration-1 certificate.
+    # factor references, and use it only to size the frozen certificate.
     if "sc_support_pole_extent" in spec:
         padded_poles.append(tuple(spec["sc_support_pole_extent"]))
     support_frequencies = spec.get("sc_support_frequencies", spec["frequencies"])
@@ -753,12 +754,6 @@ def _sc_padded_box_spec(spec, eta):
         box[0] -= state_pad_ry
     if spec["kind"] in ("crossing", "sign_definite_positive"):
         box[1] += state_pad_ry
-    # Owner ruling 2026-09-19: the flat pad is what lets the same tau node
-    # map hold for every SC iteration. The classification pad above tracks
-    # state drift; this one covers the first QP map's rigid motion.
-    flat_pad_ry = _SC_WINDOW_PAD_EV / RYD_TO_EV
-    box[0] -= flat_pad_ry
-    box[1] += flat_pad_ry
     # A SIGN-DEFINITE SUPPORT STAYS SIGN-DEFINITE.  The pole pad above can
     # push the zero-side edge of a strictly negative (or positive) support
     # across zero, which turns an easy relative rule into a crossing rule
@@ -793,7 +788,6 @@ def _sc_padded_box_spec(spec, eta):
         "sign_definite_negative" if box[1] < 0.0 else "crossing")
     padded["sc_unpadded_box"] = tuple(spec["box"])
     padded["sc_state_pad_ev"] = state_pad_ev
-    padded["sc_flat_pad_ev"] = _SC_WINDOW_PAD_EV
     padded["sc_pole_pad_fraction"] = _SC_POLE_PAD_FRACTION
     if not _box_contains(padded["box"], spec["box"]):
         raise RuntimeError(
@@ -829,15 +823,17 @@ def _fixed_fit_for_spec(entry, spec):
 def _fit_fixed_sc_rules(
     specs, eta, *, eps, cache_dir, session, material_class=None,
 ):
-    """Fit one padded SC rule set, then reuse those exact nodes.
+    """One-shot rules for the first maps, then one frozen, padded rule set.
 
-    The +2 eV window pad is the run's certificate: the same tau node map is
-    reused on every self-consistent map while it holds. Three events refit:
+    The first ``_SC_ONE_SHOT_CALLS`` planner calls use the ordinary one-shot
+    planner (unpadded, cache-served). The next call freezes a rule set on its
+    own boxes padded by :func:`_sc_padded_box_spec`, and the same tau node
+    map is reused on every later map while it holds. Three events refit:
 
     * a window that escapes its certificate box, changes error currency, or
-      did not exist at iteration 1 refits the whole rule set for this map
+      did not exist when the set froze refits the whole rule set for this map
       (owner 2026-09-22, TaAs semimetal SC); the receipt names every refit
-      window and the escaped windows' reasons, and keeps iteration 1's pair
+      window and the escaped windows' reasons, and keeps the freezing map's pair
       cost;
     * a metal<->insulator flip re-initializes the set under the new class;
     * a rule-validity failure during reuse (factored-log growth above the
@@ -862,6 +858,16 @@ def _fit_fixed_sc_rules(
             "SC fixed quadrature session changed currency: "
             f"eta {session['eta_ry']!r}->{eta!r}, "
             f"eps {session['eps']!r}->{eps!r}")
+    if iteration <= _SC_ONE_SHOT_CALLS:
+        fits, fit_rows = fit_sigma_box_specs(
+            rows, eta, eps=eps, cache_dir=cache_dir)
+        return fits, fit_rows, {
+            "iteration": iteration, "mode": "one-shot", "initialized": False,
+            "rebuilt": (), "recompute_reasons": (),
+            "rebuild_count_total": int(session.get("rebuild_count", 0)),
+            "material_class": session.get("material_class"),
+            "class_flip": session.pop("class_flip", None),
+        }
     # Owner 2026-09-22 (TaAs semimetal SC): a window that escapes its frozen
     # box, or a new window, refits the rule set for this map instead of
     # refusing.
@@ -870,7 +876,7 @@ def _fit_fixed_sc_rules(
         for spec in rows:
             entry = session["rules"].get(spec["name"])
             if entry is None:
-                escape_reasons[spec["name"]] = "absent at iteration 1"
+                escape_reasons[spec["name"]] = "absent when the rules froze"
                 continue
             reasons = _box_escape_reasons(
                 entry["fit"]["rule_box"], spec["box"])
@@ -900,7 +906,7 @@ def _fit_fixed_sc_rules(
             }
         session["rules"] = rules
         if rebuild:
-            # Iteration 1's pair cost stays the reference the kept line
+            # The freezing map's pair cost stays the reference the kept line
             # compares against; every window of the set was refit.
             session["rebuild_count"] = int(
                 session.get("rebuild_count", 0)) + len(rows)
@@ -913,7 +919,7 @@ def _fit_fixed_sc_rules(
                 fit["node_count"] for fit in fits))
             rebuilt, reasons = (), ()
         return [dict(rules[spec["name"]]["fit"]) for spec in rows], fit_rows, {
-            "iteration": iteration, "initialized": not rebuild,
+            "iteration": iteration, "mode": "frozen", "initialized": not rebuild,
             "rebuilt": rebuilt, "recompute_reasons": reasons,
             "rebuild_count_total": int(session.get("rebuild_count", 0)),
             "material_class": session.get("material_class"),
@@ -922,7 +928,7 @@ def _fit_fixed_sc_rules(
 
     rules = session["rules"]
     # A product window may temporarily have no live state/pole tuples.  Keep
-    # its iteration-1 receipt in ``rules`` and simply omit its zero
+    # its frozen receipt in ``rules`` and simply omit its zero
     # contribution from this map; if it reappears, the containment check
     # above applies to it again.
     fit_rows = []
@@ -957,7 +963,7 @@ def _fit_fixed_sc_rules(
                 print(f"  [sc-fixed] iteration {iteration}: recomputed the "
                       f"rule for {name!r} ({reason})")
     return fits, fit_rows, {
-        "iteration": iteration, "initialized": False,
+        "iteration": iteration, "mode": "frozen", "initialized": False,
         "rebuilt": tuple(recomputed),
         "recompute_reasons": tuple(sorted(recomputed.items())),
         "rebuild_count_total": int(session.get("rebuild_count", 0)),
@@ -1047,11 +1053,12 @@ def plan_sigma_windows(
         Directory for immutable box-rule certificates, or ``None``.
     fixed_rule_session
         Mutable run-local receipt used only by a multi-map SC calculation.
-        Iteration 1 certifies boxes padded by the fixed SC policy; every
+        Its first ``_SC_ONE_SHOT_CALLS`` calls use the one-shot planner; the
+        next call certifies boxes padded by the fixed SC policy, and every
         later map reuses the exact same nodes by containment.  ``None``
         preserves the ordinary one-shot planner byte-for-byte.
     fixed_pole_support_ry
-        Optional positive real-pole endpoint that the iteration-1 fixed rule
+        Optional positive real-pole endpoint that the frozen fixed rule
         must cover. The declared ``[0, endpoint]`` interval is intersected
         with each existing pole selector only for the SC certificate; live
         pole statistics, references and executor intervals remain unchanged.
@@ -1210,6 +1217,7 @@ def plan_sigma_windows(
     # can afford is a planning question answered by eps and the window
     # geometry, not a runtime refusal (TASTE 70).
     pairs = sum(row["node_count"] for row in fits)
+    frozen = fixed_receipt is not None and fixed_receipt["mode"] == "frozen"
 
     output = []
     for spec, fit in zip(specs, fits):
@@ -1258,10 +1266,10 @@ def plan_sigma_windows(
             "factor_growth": list(fit["factor_growth"]),
             "cache_status": fit["cache_status"],
             "fit_seconds": fit["seconds"],
-            "sc_fixed_rule": fixed_rule_session is not None,
+            "sc_fixed_rule": frozen,
             "sc_fixed_padded_box_ry": (
-                None if fixed_rule_session is None else list(
-                    fixed_rule_session["rules"][spec["name"]]["padded_box"])),
+                list(fixed_rule_session["rules"][spec["name"]]["padded_box"])
+                if frozen else None),
         })
         if _resolve_uniform_rule_trace() and process_rank() == 0:
             print_fn(
@@ -1289,6 +1297,7 @@ def plan_sigma_windows(
     if fixed_rule_session is not None:
         geometry.update({
             "sc_fixed_quadrature": True,
+            "sc_rule_mode": fixed_receipt["mode"],
             "sc_fixed_iteration": int(fixed_receipt["iteration"]),
             "sc_fixed_initialized": bool(fixed_receipt["initialized"]),
             "sc_fixed_rebuilds_this_iteration": len(
@@ -1296,9 +1305,8 @@ def plan_sigma_windows(
             "sc_fixed_rebuilt_windows": list(fixed_receipt.get("rebuilt", ())),
             "sc_fixed_total_rebuild_count": int(
                 fixed_receipt.get("rebuild_count_total", 0)),
-            "sc_fixed_initial_window_tau_pairs": int(
-                fixed_rule_session["initial_window_tau_pairs"]),
-            "sc_fixed_window_pad_ev": _SC_WINDOW_PAD_EV,
+            "sc_fixed_initial_window_tau_pairs": fixed_rule_session.get(
+                "initial_window_tau_pairs"),
             "sc_fixed_material_class": fixed_receipt.get("material_class"),
             "sc_fixed_recompute_reasons": dict(
                 fixed_receipt.get("recompute_reasons", ())),

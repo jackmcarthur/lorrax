@@ -308,14 +308,16 @@ metals (`mpa_material_class = metal`) has wider pole widths and partial
 occupations; the non-identifiability of pitfall 2 is worse when the fit family
 is richer. Bi (bispinor) and Na are the pending cases.
 
-**12. Quadrature rules are frozen across maps** (2026-09-03). The first map
-plans and certifies one rule per product window on the window's box padded by
-`sc` state padding; later maps reuse the rule (`cache=hit:sc-fixed`) and, when
-a state leaves its padded box or a window appears that iteration 1 did not
-have, rebuild that rule on the escaped box with the same padding
-(`rebuild:sc-fixed`, counted in the geometry receipt and printed per map;
-main 0cfaf059). One-shot results are bit-identical with and without the
-freeze. The eqp1 file is written from the converged map.
+**12. Quadrature rules are frozen across maps** (2026-09-03; one-shot maps 0
+and 1 since 2026-09-24). Maps 0 and 1 carry the loop's largest motion, so they
+use the ordinary one-shot planner (`SC fixed quadrature: ... rules=one-shot`).
+The next map certifies one rule per product window on the window's box padded
+by the classification state pad and a 10% pole pad, with no flat pad;
+later maps reuse the rule (`cache=hit:sc-fixed`) and, when a state leaves its
+padded box or a window appears that the frozen set did not have, rebuild the
+set on the escaped boxes with the same padding (`rebuild:sc-fixed`, counted in
+the geometry receipt and printed per map). One-shot results are bit-identical
+with and without the freeze. The eqp1 file is written from the converged map.
 
 **13. Map gain is a diagnostic, not a controller.** From map 2 onward the
 driver prints `SC map gain: max |dSigma_on-shell| / max |dE_in| = ...`, using
@@ -570,7 +572,7 @@ occupations. `restart=true` restores the invariant ISDF basis. SC W models remai
 map-local scratch and are never published as reusable ISDF bundle members.
 
 The run-local fixed-quadrature session holds mathematical integration rules.
-Sigma uses its existing 2 eV state and 10% pole margins, retaining identical
+Sigma uses its classification state and 10% pole margins, retaining identical
 nodes and weights while recomputing current masks, pole selectors, reference
 energies and W(time). Containment, error currency and separated-factor growth
 are checked at every map. Initial tail certificates cover the selector's
