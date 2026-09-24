@@ -6,6 +6,7 @@ from ffi import _services
 _services.ensure_on_path()
 from distrib_la import mesh_key as _mesh_key
 from dataclasses import dataclass
+from functools import lru_cache
 
 from common.collectives import device_put_process_local
 
@@ -181,6 +182,39 @@ def _photon_head_pairs(response, term, mesh_xy):
     return expand(pairs), expand(bare)
 
 
+def _policy_key(policy):
+    """Content key of a q-grid TRS policy (a frozen dataclass holding arrays)."""
+    import dataclasses
+    import hashlib
+    if policy is None:
+        return None
+    parts = []
+    for f in dataclasses.fields(policy):
+        value = getattr(policy, f.name)
+        if isinstance(value, np.ndarray):
+            value = (value.shape, value.dtype.str,
+                     hashlib.sha256(np.ascontiguousarray(value).tobytes()).hexdigest())
+        parts.append((f.name, value))
+    return tuple(parts)
+
+
+@lru_cache(maxsize=None)
+def band_sigma_finish(mesh_xy, nb, sym):
+    """Replicate a parent-band Sigma, keep ``nb`` bands and unfold the wedge to full k.
+
+    One program per (mesh, band count, SymMaps); SC maps keep the SymMaps
+    object, so every map dispatches the same executable.
+    """
+    from symmetry_maps import unfold_file_wedge_band_operator
+    from .cohsex_sigma import _replicate_band_sigma
+
+    @jax.jit
+    def finish(value):
+        parent = _replicate_band_sigma(value, mesh_xy)[:, :nb, :nb]
+        return unfold_file_wedge_band_operator(sym, parent, trs_rule="transpose")
+    return finish
+
+
 def _make_photon_class_restore(response, keys, mesh_xy):
     """Compile one canonical full-q producer per class without caching interaction arrays.
 
@@ -192,7 +226,9 @@ def _make_photon_class_restore(response, keys, mesh_xy):
     from .cohsex_sigma import lorentz_class_vertices
     from common.gamma_matrices import gamma_perm_phase
     layout, plans, policy = response.layout, response.family_plans, response.qgrid_policy
-    key = ("restore", id(layout), tuple(map(id, plans)), id(policy), keys, _mesh_key(mesh_xy))
+    # By value, not identity: every SC map builds a new (equal) layout and
+    # policy, and an id key recompiled this program in every map.
+    key = ("restore", layout, tuple(map(id, plans)), _policy_key(policy), keys, _mesh_key(mesh_xy))
     if key not in _photon_sigma_kernel_cache:
         lefts, rights = lorentz_class_vertices(keys)
         spec = NamedSharding(mesh_xy, P(None, "x", None, "y", None))
@@ -259,8 +295,6 @@ def compute_static_photon_sigma(
     diagnostic_input_basis=None, head_diagnostics=False, print_fn=print, verbose=True,
 ):
     """Sum X/SX/COH Lorentz sectors on parents before their band-operator unfold."""
-    from symmetry_maps import unfold_file_wedge_band_operator
-    from .cohsex_sigma import _replicate_band_sigma
     if blocks not in _PHOTON_BLOCK_SELECTIONS:
         raise ValueError(f"Unknown photon block selection {blocks!r}.")
     families = (wfns_charge, wfns_transverse)
@@ -291,13 +325,8 @@ def compute_static_photon_sigma(
                 head_totals[term] = head if head_totals[term] is None else head_totals[term] + head
             if verbose and jax.process_index() == 0:
                 print_fn(f"  packed photon Sigma term {term} class {key} submitted")
-    sym = wfns_charge.green_parent.plan.sym
-    nb = wfns_charge.slices.nb_sigma
-
-    @jax.jit
-    def finish(value):
-        parent = _replicate_band_sigma(value, mesh_xy)[:, :nb, :nb]
-        return unfold_file_wedge_band_operator(sym, parent, trs_rule="transpose")
+    finish = band_sigma_finish(mesh_xy, int(wfns_charge.slices.nb_sigma),
+                               wfns_charge.green_parent.plan.sym)
     sig_x, sig_sx, sig_coh = (finish(value) for value in totals)
     zero = jnp.zeros_like(totals[0])
     sectors = jnp.stack([finish(

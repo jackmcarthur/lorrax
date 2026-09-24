@@ -40,7 +40,7 @@ from ffi import _services
 _services.ensure_on_path()
 from distrib_la import mesh_key as _mesh_key
 from dataclasses import dataclass
-from functools import partial
+from functools import lru_cache, partial
 from typing import Callable, Mapping
 
 import jax
@@ -271,18 +271,25 @@ def pack_photon_faces(faces, layout, mesh_xy, *, orientation, wfn_layout="face")
         Same face layout with the centroid axis replaced by packed photons.
         This packs one-particle carriers only; no quadratic operator is made.
     """
-    from common.shard_map import shard_map
-    from common.wfn_layout import psi_specs
-
     layout.assert_mesh(mesh_xy)
     if orientation not in ("mun", "nmu") or len(faces) != 4:
         raise ValueError("photon faces require four mun or nmu endpoints")
-    nmu_spec, mun_spec = psi_specs(wfn_layout)
-    axis, mesh_axis, spec = ((2, "x", mun_spec) if orientation == "mun"
-                             else (3, "y", nmu_spec))
+    axis = 2 if orientation == "mun" else 3
     for channel, face in enumerate(faces):
         if face.shape[axis] != layout.carrier_extent(channel):
             raise ValueError("photon face extent differs from its channel layout")
+    return _face_packer(layout, mesh_xy, orientation, wfn_layout)(*faces)
+
+
+@lru_cache(maxsize=None)
+def _face_packer(layout, mesh_xy, orientation, wfn_layout):
+    """The jitted four-channel face pack of :func:`pack_photon_faces`, once per configuration."""
+    from common.shard_map import shard_map
+    from common.wfn_layout import psi_specs
+
+    nmu_spec, mun_spec = psi_specs(wfn_layout)
+    axis, mesh_axis, spec = ((2, "x", mun_spec) if orientation == "mun"
+                             else (3, "y", nmu_spec))
 
     @partial(shard_map, mesh=mesh_xy, in_specs=(spec,) * 4,
              out_specs=spec, check_vma=False)
@@ -302,7 +309,7 @@ def pack_photon_faces(faces, layout, mesh_xy, *, orientation, wfn_layout="face")
             result = jax.lax.dynamic_update_slice(result, value, tuple(offset))
         return result
 
-    return jax.jit(pack)(*faces)
+    return jax.jit(pack)
 
 
 def _view_program(layout, mesh_xy, nq, p_left, p_right):

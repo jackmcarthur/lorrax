@@ -111,6 +111,9 @@ def _device_output_add(sharding):
         donate_argnums=(0,), out_shardings=sharding)
 
 
+_WINDOW_COMPILED = {}
+
+
 @lru_cache(maxsize=16)
 def _device_window_runner(tau_kernel, sharding, omega_axis, antihermitian):
     """ONE executable for a whole quadrature window: loop the time nodes on device.
@@ -366,7 +369,14 @@ class DeviceOmegaAccumulator:
         arguments = (self._total, tuple(tau_arguments), t_pad, coeff,
                      n_active, active_count)
         if compile_only:
-            return run.lower(*arguments).compile()
+            # A later SC map asks again for the same runner and signature;
+            # the admitted executable is the same, so compile it once.
+            key = (run, jax.tree.structure(arguments),
+                   tuple((tuple(x.shape), str(x.dtype), x.sharding)
+                         for x in jax.tree.leaves(arguments)))
+            if key not in _WINDOW_COMPILED:
+                _WINDOW_COMPILED[key] = run.lower(*arguments).compile()
+            return _WINDOW_COMPILED[key]
         self._total = run(*arguments)
         return self._total
 
