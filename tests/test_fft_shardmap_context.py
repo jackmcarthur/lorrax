@@ -57,6 +57,13 @@ _SANCTIONED_EAGER = {
     # bse_pseudopoles._feast_filter/run_pseudopoles — was closed 2026-08-01:
     # every solver W_q→W_R now routes through bse_feast.ensure_W_R →
     # bse_io.make_w_densifier.)
+    # NOT eager -- a limitation of the syntactic proxy.  The SC density
+    # scan's ``_density_scan_body`` returns ``body``, which the caller
+    # (``rho_from_wfns``) wraps in ``shard_map`` itself; ``body>step``'s
+    # local_ifftn3 therefore always sees this rank's own (k-tile, band)
+    # shard.  The lexical chain never names shard_map, so the proxy reports
+    # it (0caf385b; flagged since the stage-2 scanner).
+    ("gw/qsgw_density.py", "step"): 1,
 }
 
 
