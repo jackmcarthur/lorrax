@@ -52,7 +52,6 @@ do not implicitly suppress tests.
 {"nodeid":"tests/test_driver_debug_print_contract.py::test_driver_debug_does_not_force_jax_cache_miss_explanations","reason":"environment registry is missing the JAX cache-miss default row","owner":"runtime/docs"}
 {"nodeid":"tests/test_exciton_bands_refit_window.py::test_the_refusal_names_the_window_and_the_basis_not_the_tolerance","reason":"the refusal text no longer names the required orthonormality condition","owner":"BSE/exciton-bands"}
 {"nodeid":"tests/test_ff_compute_mode.py::test_no_module_dispatches_on_the_mode_through_a_bare_else","reason":"compute-mode exhaustiveness/source-documentation contract is violated","owner":"GW/config"}
-{"nodeid":"tests/test_ff_compute_mode.py::test_the_reference_docs_carry_the_mode_and_say_it_refuses[input_reference.md]","reason":"compute-mode exhaustiveness/source-documentation contract is violated","owner":"GW/config"}
 {"nodeid":"tests/test_gw_jax_regression.py::test_gnppm_matches_reference","reason":"frozen GW reference differs from the current computed result","owner":"GW/physics"}
 {"nodeid":"tests/test_invariance_gates.py::test_fixed_point_frozen_qp_rotations","reason":"restart/IBZ/fixed-point invariance remains outside its pinned contract","owner":"GW/physics"}
 {"nodeid":"tests/test_invariance_gates.py::test_restart_equals_fresh","reason":"restart/IBZ/fixed-point invariance remains outside its pinned contract","owner":"GW/physics"}
