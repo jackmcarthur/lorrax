@@ -213,7 +213,8 @@ def test_initialize_no_longer_gates_the_velocity_write_on_kgrid():
             "must-not-open.h5", wfn=wfn, sym=None, mesh=None, nbands=1,
             effective_nspinor=1, bispinor=False,
             velocity_dft_kmajor=None, wfn_path="WFN.h5",
-            wfn_fingerprint="0" * 64)
+            wfn_fingerprint="0" * 64, vnl_velocity_sign=1.0,
+            vnl_included=True)
 
 
 def test_forward_neighbors_do_not_assume_flattening_order():
