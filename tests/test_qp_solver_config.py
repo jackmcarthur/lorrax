@@ -358,8 +358,6 @@ def test_sc_buffer_controls_refuse_invalid_values(tmp_path):
 def test_sc_env_overrides_deprecated(tmp_path, monkeypatch):
     monkeypatch.setenv("LORRAX_SC_MAX_ITER", "3")
     monkeypatch.setenv("LORRAX_SC_TOL_EV", "1e-10")
-    monkeypatch.setenv("LORRAX_SC_ACCEL", "anderson")
-    monkeypatch.setenv("LORRAX_SC_DEPTH", "2")
     monkeypatch.setenv("LORRAX_SC_MIXING", "0.25")
     monkeypatch.setenv("LORRAX_SC_DUMP_DIR", "/tmp/sc_dump")
     lines: list[str] = []
@@ -368,9 +366,8 @@ def test_sc_env_overrides_deprecated(tmp_path, monkeypatch):
     sc = LorraxConfig.from_input_file(
         str(path), print_fn=lambda *a, **k: lines.append(" ".join(map(str, a)))
     ).sc
-    assert (sc.max_iter, sc.tol_ev, sc.accelerator, sc.history_depth,
-            sc.mixing, sc.dump_dir) == (3, 1.0e-10, "anderson", 2, 0.25,
-                                        "/tmp/sc_dump")
+    assert (sc.max_iter, sc.tol_ev, sc.mixing, sc.dump_dir) == (
+        3, 1.0e-10, 0.25, "/tmp/sc_dump")
     assert any("deprecated env override" in l for l in lines)
 
 
@@ -384,9 +381,7 @@ def test_sc_accelerator_linear_refuses_by_name(tmp_path):
 
     Undamped linear self-consistency amplifies the input's
     time-reversal-reality error 6-8x per map and refuses at map 3 on
-    scalar Si; damping makes it worse (claim 2391).  The deck spelling
-    and the deprecated env override are two doors onto the same field,
-    so both are checked.
+    scalar Si; damping makes it worse (claim 2391).
     """
     with pytest.raises(ValueError, match="sc_accelerator_anderson_only") as got:
         _config(tmp_path, "sc_accelerator = linear\n")
@@ -400,13 +395,6 @@ def test_sc_accelerator_rcrop_is_retired_by_name(tmp_path):
     with pytest.raises(ValueError, match="rCROP was retired") as got:
         _config(tmp_path, "sc_accelerator = rcrop\n")
     assert "delete the key" in str(got.value)
-
-
-def test_sc_accelerator_env_override_cannot_select_linear(
-        tmp_path, monkeypatch):
-    monkeypatch.setenv("LORRAX_SC_ACCEL", "linear")
-    with pytest.raises(ValueError, match="sc_accelerator_anderson_only"):
-        _config(tmp_path)
 
 
 # ---------------------------------------------------------------------------
