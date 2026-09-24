@@ -35,6 +35,7 @@ class _PaddedReadSlabIO(HostSlabIO):
             **kw)
 
 
+@pytest.mark.mesh(4)
 @pytest.mark.parametrize("ordered", [True, False])
 def test_memory_source_batches_equal_the_store_round_trip(monkeypatch, ordered):
     if len(jax.devices()) < 4:

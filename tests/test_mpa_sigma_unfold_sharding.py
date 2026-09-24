@@ -17,6 +17,7 @@ from gw.mpa.sigma import _unfold_sigma_cube  # noqa: E402
 from symmetry_maps import unfold_file_wedge_band_operator  # noqa: E402
 
 
+@pytest.mark.mesh(4)
 @pytest.mark.parametrize("bracketed", [False, True])
 def test_unfold_sigma_cube_is_sharded_and_matches_unpinned(bracketed):
     if len(jax.devices()) < 4:
