@@ -551,30 +551,35 @@ def resolve_head_sample(params, input_dir, wfn, sym, meta, print_fn, omega) -> H
 def build_S_cart_omega(wfn, sym, meta, params, dipole_path, omega,
                        *, eta: float = 0.0, print_fn=print) -> np.ndarray:
     """``S(ω)``, the Cartesian q²-coefficient tensor, from ``dipole.h5``; see docs/architecture/four_current_wiring.md."""
-    from common.chi_from_dipole import read_dipole_h5, compute_S_omega
+    from common.chi_from_dipole import compute_S_omega_cv
     from common import timing as _tmg
+    from file_io.restart_bundle import read_dipole_cv_block
 
-    with _tmg.section("head.read_dipole"):
-        dipole_cart, deltaE = read_dipole_h5(dipole_path)
+    mesh = (params or {}).get("_mesh")
+    if mesh is None:
+        raise ValueError(
+            "build_S_cart_omega reads dipole.h5 through SlabIO and needs the "
+            "run's mesh as params['_mesh'] (HeadResolver and the BSE head "
+            "channel pass it).")
     nk_tot = int(sym.nk_tot)
-    nb = int(dipole_cart.shape[2])
     nelec = int(wfn.nelec)
+    # TODO(metal-head): this legacy one-shot dipole path retains the ifmax
+    # step occupation; metallic QSGW uses the explicit weighted PT head.
+    with _tmg.section("head.read_dipole"):
+        v_cvk, dE_cv = read_dipole_cv_block(dipole_path, nelec=nelec, mesh=mesh)
+    nk_file = int(v_cvk.shape[1])
+    nb = int(v_cvk.shape[2]) + int(v_cvk.shape[3])
     with _tmg.section("head.checks"):
         _check_dipole_coverage(
-            dipole_path, nb_file=nb, nk_file=int(dipole_cart.shape[1]),
+            dipole_path, nb_file=nb, nk_file=nk_file,
             nk_run=nk_tot, nb_run=int(getattr(meta, "nb_sigma", 0) or 0),
             nelec=nelec, print_fn=print_fn)
         _check_dipole_provenance(dipole_path, params=params or {}, wfn=wfn,
                                  print_fn=print_fn)
-    # TODO(metal-head): this legacy one-shot dipole path retains the ifmax
-    # step occupation; metallic QSGW uses the explicit weighted PT head.
-    occ = np.zeros((nk_tot, nb), dtype=float)
-    occ[:, :max(0, min(nelec, nb))] = 1.0
-    f_nk = jnp.asarray(occ, dtype=jnp.float64)
     omega_grid = jnp.asarray([complex(omega)], dtype=jnp.complex128)
     with _tmg.section("head.S_omega"):
-        S_cart_omega = compute_S_omega(
-            dipole_cart, deltaE, f_nk, float(wfn.cell_volume), int(sym.nk_tot),
+        S_cart_omega = compute_S_omega_cv(
+            v_cvk, dE_cv, float(wfn.cell_volume), nk_tot,
             int(wfn.nspin), int(wfn.nspinor), omega_grid, eta=float(eta),
         )[0]
     return np.asarray(S_cart_omega, dtype=np.complex128)
@@ -1367,7 +1372,7 @@ class HeadResolver:
                  "_screened")
 
     def __init__(self, config, input_dir, wfn, sym, meta, print_fn,
-                 q0_certificate_fn=None):
+                 q0_certificate_fn=None, mesh=None):
         head = config.head
         from common.four_current_model import (
             resolve_four_current_representation)
@@ -1393,6 +1398,7 @@ class HeadResolver:
             "head_minibz_average": head.head_minibz_average,
             "bgw_metal_q0_treatment": head.bgw_metal_q0_treatment,
             "_q0_certificate_fn": q0_certificate_fn,
+            "_mesh": mesh,
         }
         from gw.gw_config import coerce_head_correction
         self._policy = coerce_head_correction(

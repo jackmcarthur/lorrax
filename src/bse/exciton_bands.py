@@ -2435,6 +2435,7 @@ def main(argv=None):
                     # would silently rescale the head by ~m².
                     ref_grid=(nkx, nky, nkz),
                     input_file=args.input, restart_file=restart_file,
+                    mesh=mesh_xy,
                     gamma_cell=args.w_head_gamma_cell, log_fn=log)
                 W_dense = attach_head_channel(
                     W_dense, data["g0_X"], data["g0_Y"], S_fine,
