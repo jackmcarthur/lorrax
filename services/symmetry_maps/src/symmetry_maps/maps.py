@@ -1923,6 +1923,19 @@ def unfold_psi(
     return cnk
 
 
+@lru_cache(maxsize=4)
+def _fft_grid_pullback_cached(matrices, matrices_shape, translations,
+                              translations_shape, grid, validate):
+    """Content-keyed memo of :func:`fft_grid_pullback_perm` (read-only result)."""
+    from .orbit_syms import fft_grid_pullback_perm
+    table = fft_grid_pullback_perm(
+        np.frombuffer(matrices, dtype=np.int64).reshape(matrices_shape),
+        np.frombuffer(translations, dtype=np.float64).reshape(translations_shape),
+        np.asarray(grid, dtype=np.int64), validate=validate)
+    table.flags.writeable = False
+    return table
+
+
 class SymMaps:
     def trivial_view(self):
         """Restrict the computational group to identity over loader-unfolded full-k parents."""
@@ -2677,7 +2690,13 @@ class SymMaps:
                 np.asarray(self.translations)[spatial], idx >= n)
 
     def fft_grid_pullback(self, rows, fft_grid, *, validate=True):
-        """Return real-space FFT pullbacks for canonical operation rows."""
+        """Return real-space FFT pullbacks for canonical operation rows.
+
+        The table depends only on the operations and the grid, so it is
+        built once per process and returned READ-ONLY (a self-consistent run
+        asks for it every map: 8.7 s per call with validation on the CrI3
+        80x80x250 grid, measured 2026-09-24).
+        """
         raw = np.asarray(rows)
         if raw.ndim != 1:
             raise ValueError(
@@ -2686,10 +2705,13 @@ class SymMaps:
         _, translations, _ = self.operation_rows(raw)
         n = int(np.asarray(self.sym_matrices).shape[0])
         spatial = raw.astype(np.int32, copy=False) % n
-        from .orbit_syms import fft_grid_pullback_perm
-        return fft_grid_pullback_perm(
-            np.asarray(self.sym_matrices)[spatial], translations, fft_grid,
-            validate=validate)
+        matrices = np.ascontiguousarray(
+            np.asarray(self.sym_matrices)[spatial], dtype=np.int64)
+        translations = np.ascontiguousarray(translations, dtype=np.float64)
+        grid = tuple(int(v) for v in np.asarray(fft_grid).reshape(-1))
+        return _fft_grid_pullback_cached(
+            matrices.tobytes(), matrices.shape, translations.tobytes(),
+            translations.shape, grid, bool(validate))
 
     def cartesian_action(self, rows, *, axial, time_odd):
         """Forward action for a typed Cartesian index; see docs/architecture/symmetry_register.md."""
