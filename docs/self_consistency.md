@@ -29,8 +29,7 @@ H (bitwise re-evaluation, sandbox claim 2678), so every pair is valid secant
 data. A discrete map event (a Σ rule rebuild or sampled-grid growth) is
 logged but does not restart the history. The loop STOPS AS STALLED — never reported converged —
 when the label-free residual `max_k ||P f_k P||_2` (logged every call as
-`SC matrix residual`) has not improved by 10% over two history turnovers,
-2(m+1) maps. Within the active
+`SC matrix residual`) has not improved by 10% over 12 maps. Within the active
 subspace (`nval + ncond` bands around E_F) each band is in one of three
 classes (`gw/band_partition.py`):
 
