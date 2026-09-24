@@ -271,7 +271,7 @@ class FfiLibraryNotBuilt(FileNotFoundError):
 #: this boundary is unavoidable; what IS avoidable is the mirror drifting
 #: silently, and ``tests/test_ffi_abi_stamp.py`` parses the header and fails if
 #: these two numbers disagree.
-LORRAX_FFI_ABI_VERSION = 5
+LORRAX_FFI_ABI_VERSION = 6
 
 #: platform -> the C entry point that reports the library's ABI.  Per leg on
 #: purpose: both libraries are dlopened RTLD_GLOBAL in a GPU process and

@@ -18,6 +18,7 @@
 // `grid_layout_col_major=false` so cuSOLVERMp's rank→tile mapping
 // matches JAX's row-major mesh reshape (rank = x_idx*Py + y_idx).
 
+#include "../common/ctx_registry.h"
 #include <complex>
 #include <cstdint>
 #include <cstdio>
@@ -153,8 +154,9 @@ static ffi::Error BatchedPotrfDispatch(
     ffi::AnyBuffer A,
     ffi::Result<ffi::AnyBuffer> L_out,
     int64_t nq, int64_t n, int64_t mb, int64_t nb,
-    int64_t ctx_handle)
+    int64_t ctx_key)
 {
+    const int64_t ctx_handle = ::lorrax_ffi::ctx_registry::resolve(ctx_key, "cusolvermp");
     auto* ctx = reinterpret_cast<LorraxCusolverMpCtx*>(ctx_handle);
     if (ctx == nullptr) {
         return ffi::Error(ffi::ErrorCode::kInvalidArgument,
@@ -199,4 +201,4 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Attr<int64_t>("n")
         .Attr<int64_t>("mb")
         .Attr<int64_t>("nb")
-        .Attr<int64_t>("ctx_handle"));
+        .Attr<int64_t>("ctx_key"));

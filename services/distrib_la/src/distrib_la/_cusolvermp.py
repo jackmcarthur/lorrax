@@ -42,6 +42,7 @@ __all__ = [
     "batched_distributed_solve_lu",
     "cholesky_handle_to_natural_L",
     "distributed_eigh",
+    "context_key",
     "get_or_init_context",
 ]
 
@@ -75,6 +76,14 @@ MeshKey = Tuple[int, int, bool]
 
 _CTX_LOCK = threading.Lock()
 _CTX_CACHE: Dict[MeshKey, int] = {}
+#: (p, q, layout) -> the context's FFI ``ctx_key`` (loader.context_key).
+_CTX_KEYS: Dict[MeshKey, int] = {}
+
+
+def _ctx_config(key: MeshKey) -> str:
+    """The canonical configuration string of a cuSOLVERMp/cuBLASMp context."""
+    p, q, col_major = key
+    return f"lorrax-ctx/v1|cusolvermp|{p}x{q}|{'col' if col_major else 'row'}"
 
 
 def _ctx_key(mesh: Mesh, col_major: bool) -> MeshKey:
@@ -126,8 +135,20 @@ def get_or_init_context(mesh: Mesh, *, col_major: bool = True) -> int:
         if h is not None:
             return h
         h = _make_ctx(mesh, col_major)
+        _CTX_KEYS[key] = loader.bind_context("CUDA", _ctx_config(key), h)
         _CTX_CACHE[key] = h
         return h
+
+
+def context_key(mesh: Mesh, *, col_major: bool = True) -> int:
+    """The FFI ``ctx_key`` attribute of this mesh's cuSOLVERMp context.
+
+    A pure function of (p, q, layout), identical on every rank and in every
+    run, so a module that carries it stays cacheable; the native handler
+    resolves it to the live context this call ensured and bound.
+    """
+    get_or_init_context(mesh, col_major=col_major)
+    return _CTX_KEYS[_ctx_key(mesh, col_major)]
 
 
 def _atexit_teardown() -> None:
@@ -138,8 +159,9 @@ def _atexit_teardown() -> None:
         loader.get_lib("CUDA")
     except Exception:                                          # noqa: BLE001
         return
-    for h in list(_CTX_CACHE.values()):
+    for k, h in list(_CTX_CACHE.items()):
         try:
+            loader.unbind_context("CUDA", _CTX_KEYS.pop(k, 0))
             loader.destroy_cusolvermp_context(int(h))
         except Exception:                                      # noqa: BLE001
             pass
@@ -286,7 +308,7 @@ def distributed_eigh(
 
     # --- one-time setup per process (lazy, cached) ------------------------
     loader.get_lib("CUDA")                  # load the .so, register targets
-    ctx_handle = get_or_init_context(mesh)  # NCCL + cal_comm + cusolverMp
+    ctx_key = context_key(mesh)  # NCCL + cal_comm + cusolverMp
 
     mb = n // p if block_size is None else block_size
     nb = n // q if block_size is None else block_size
@@ -304,7 +326,7 @@ def distributed_eigh(
     # fallback: that path is the one taken on CUDA, and it calls this
     # wrapper Nq times.
     key = ("eigh", _mesh_key(mesh), A.dtype, n, mb, nb,
-           bool(compute_evecs), int(ctx_handle))
+           bool(compute_evecs), int(ctx_key))
     jit_eigh = _JIT_CACHE.get(key)
     if jit_eigh is None:
         # Local output shapes + partition specs for shard_map.
@@ -312,7 +334,7 @@ def distributed_eigh(
         Q_local = jax.ShapeDtypeStruct((n // p, n // q), A.dtype)
         # Attributes forwarded to the C++ handler.
         attrs = dict(n=n, mb=mb, nb=nb,
-                     ctx_handle=int(ctx_handle),
+                     ctx_key=int(ctx_key),
                      compute_evecs=bool(compute_evecs))
 
         @partial(shard_map,
@@ -439,17 +461,17 @@ def batched_distributed_getrf(
             f"N={n} must be divisible by Px={Px} and Py={Py}.")
 
     loader.get_lib("CUDA")
-    ctx_handle = get_or_init_context(mesh, col_major=False)
+    ctx_key = context_key(mesh, col_major=False)
     mb, nb = n // Px, n // Py
     ipiv_len = ipiv_local_len(n, Px, mb)
     key = ("getrf", _mesh_key(mesh), A.dtype, nq, n, mb, nb,
-           int(ctx_handle))
+           int(ctx_key))
     jit_getrf = _JIT_CACHE.get(key)
     if jit_getrf is None:
         LU_local_T = jax.ShapeDtypeStruct((nq, nb, mb), A.dtype)
         ipiv_local = jax.ShapeDtypeStruct((nq, ipiv_len), jnp.int64)
         attrs = dict(nq=nq, n=n, mb=mb, nb=nb,
-                     ipiv_len=ipiv_len, ctx_handle=int(ctx_handle))
+                     ipiv_len=ipiv_len, ctx_key=int(ctx_key))
 
         @partial(shard_map, mesh=mesh,
                  in_specs=P(None, "x", "y"),
@@ -493,18 +515,18 @@ def batched_distributed_getrs(
         raise ValueError(f"NRHS={nrhs} must be divisible by Py={Py}.")
 
     loader.get_lib("CUDA")
-    ctx_handle = get_or_init_context(mesh, col_major=False)
+    ctx_key = context_key(mesh, col_major=False)
     mb_b, nb_b = LU.mb, nrhs // Py
     ipiv_len = ipiv_local_len(LU.n, Px, LU.mb)
     key = ("getrs", _mesh_key(mesh), B.dtype, LU.nbatch, LU.n, nrhs,
-           LU.mb, LU.nb, mb_b, nb_b, int(ctx_handle))
+           LU.mb, LU.nb, mb_b, nb_b, int(ctx_key))
     jit_getrs = _JIT_CACHE.get(key)
     if jit_getrs is None:
         X_local_T = jax.ShapeDtypeStruct(
             (LU.nbatch, nrhs // Py, LU.n // Px), B.dtype)
         attrs = dict(nq=LU.nbatch, n=LU.n, nrhs=nrhs,
                      mb_a=LU.mb, nb_a=LU.nb, mb_b=mb_b, nb_b=nb_b,
-                     ipiv_len=ipiv_len, ctx_handle=int(ctx_handle))
+                     ipiv_len=ipiv_len, ctx_key=int(ctx_key))
 
         @partial(shard_map, mesh=mesh,
                  in_specs=(P(None, "y", "x"), P(None, ("x", "y")),
@@ -561,18 +583,18 @@ def batched_distributed_cholesky(
 
     loader.get_lib("CUDA")
     # Row-major grid → tile (i, j) on rank i*Py + j = JAX rank ordering.
-    ctx_handle = get_or_init_context(mesh, col_major=False)
+    ctx_key = context_key(mesh, col_major=False)
 
     mb = n // Px          # A's row block (per-rank local row count)
     nb = n // Py          # A's col block (per-rank local col count)
 
-    key = ("potrf", _mesh_key(mesh), A.dtype, nq, n, mb, nb, int(ctx_handle))
+    key = ("potrf", _mesh_key(mesh), A.dtype, nq, n, mb, nb, int(ctx_key))
     jit_potrf = _JIT_CACHE.get(key)
     if jit_potrf is None:
         # Inner-dim transpose per slice: (Nq, N/Px, N/Py) row-major →
         # (Nq, N/Py, N/Px) row-major ≡ (N/Px, N/Py) col-major per slice.
         L_local_T = jax.ShapeDtypeStruct((nq, n // Py, n // Px), A.dtype)
-        attrs = dict(nq=nq, n=n, mb=mb, nb=nb, ctx_handle=int(ctx_handle))
+        attrs = dict(nq=nq, n=n, mb=mb, nb=nb, ctx_key=int(ctx_key))
 
         @partial(shard_map, mesh=mesh,
                  in_specs=P(None, "x", "y"),
@@ -636,7 +658,7 @@ def batched_distributed_potrs(
         raise ValueError(f"L.dtype {L.raw.dtype} != B.dtype {B.dtype}")
 
     loader.get_lib("CUDA")
-    ctx_handle = get_or_init_context(mesh, col_major=False)
+    ctx_key = context_key(mesh, col_major=False)
 
     # descA : mb=L.mb (rows block = N/Px), nb=L.nb (cols block = N/Py)
     # descB : mb_B = L.mb   (row block must equal A's row block — each rank's
@@ -647,13 +669,13 @@ def batched_distributed_potrs(
     mb_b, nb_b = L.mb, mrhs // Py
 
     key = ("potrs", _mesh_key(mesh), B.dtype,
-           nq, n, mrhs, mb_a, nb_a, mb_b, nb_b, int(ctx_handle))
+           nq, n, mrhs, mb_a, nb_a, mb_b, nb_b, int(ctx_key))
     jit_potrs = _JIT_CACHE.get(key)
     if jit_potrs is None:
         X_local_T = jax.ShapeDtypeStruct((nq, mrhs // Py, n // Px), B.dtype)
         attrs = dict(nq=nq, n=n, mrhs=mrhs,
                      mb_a=mb_a, nb_a=nb_a, mb_b=mb_b, nb_b=nb_b,
-                     ctx_handle=int(ctx_handle))
+                     ctx_key=int(ctx_key))
 
         @partial(shard_map, mesh=mesh,
                  in_specs=(P(None, "y", "x"), P(None, "x", "y")),
@@ -779,19 +801,19 @@ def batched_distributed_solve_lu(
         raise ValueError(f"NRHS={nrhs} must be divisible by Py={Py}.")
 
     loader.get_lib("CUDA")
-    ctx_handle = get_or_init_context(mesh, col_major=False)
+    ctx_key = context_key(mesh, col_major=False)
 
     mb_a, nb_a = n // Px, n // Py
     mb_b, nb_b = n // Px, nrhs // Py
 
     key = ("solve_lu", _mesh_key(mesh), A.dtype,
-           nq, n, nrhs, mb_a, nb_a, mb_b, nb_b, int(ctx_handle))
+           nq, n, nrhs, mb_a, nb_a, mb_b, nb_b, int(ctx_key))
     jit_solve = _JIT_CACHE.get(key)
     if jit_solve is None:
         X_local_T = jax.ShapeDtypeStruct((nq, nrhs // Py, n // Px), B.dtype)
         attrs = dict(nq=nq, n=n, nrhs=nrhs,
                      mb_a=mb_a, nb_a=nb_a, mb_b=mb_b, nb_b=nb_b,
-                     ctx_handle=int(ctx_handle))
+                     ctx_key=int(ctx_key))
 
         @partial(shard_map, mesh=mesh,
                  in_specs=(P(None, "x", "y"), P(None, "x", "y")),

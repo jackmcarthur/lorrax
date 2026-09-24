@@ -14,6 +14,7 @@
 // Python pre-transposes inner dims (standard col-major-bytes trick) so the
 // FFI reads each local tile as col-major lld = N/Px with one tile per rank.
 
+#include "../common/ctx_registry.h"
 #include <complex>
 #include <cstdint>
 #include <cstdio>
@@ -465,9 +466,10 @@ static ffi::Error BatchedWSolveDispatch(
     ffi::Result<ffi::AnyBuffer> W_out,
     int64_t nq, int64_t n,
     double pref_re, double pref_im,
-    int64_t ctx_handle,
+    int64_t ctx_key,
     int64_t stop_after_step)
 {
+    const int64_t ctx_handle = ::lorrax_ffi::ctx_registry::resolve(ctx_key, "cusolvermp");
     auto* ctx = reinterpret_cast<LorraxCusolverMpCtx*>(ctx_handle);
     if (ctx == nullptr) {
         return ffi::Error(ffi::ErrorCode::kInvalidArgument,
@@ -529,5 +531,5 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Attr<int64_t>("n")
         .Attr<double>("pref_re")
         .Attr<double>("pref_im")
-        .Attr<int64_t>("ctx_handle")
+        .Attr<int64_t>("ctx_key")
         .Attr<int64_t>("stop_after_step"));

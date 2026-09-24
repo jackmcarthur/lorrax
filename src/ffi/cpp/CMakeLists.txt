@@ -620,7 +620,7 @@ set(LORRAX_CFG_GEMM 0)
 set(LORRAX_CFG_MATH_LINK "")
 configure_file("${CMAKE_CURRENT_SOURCE_DIR}/common/lorrax_config.h.in"
                "${CMAKE_CURRENT_BINARY_DIR}/lorrax_config.h" @ONLY)
-list(APPEND LORRAX_FFI_SOURCES common/build_config.cc)
+list(APPEND LORRAX_FFI_SOURCES common/build_config.cc common/ctx_registry.cc)
 
 add_library(lorrax_ffi SHARED ${LORRAX_FFI_SOURCES})
 
@@ -1452,7 +1452,7 @@ endif()
 list(APPEND _host_rpaths ${_host_math_rpaths})
 list(APPEND _host_link_libs ${_host_math_link})
 
-list(APPEND LORRAX_FFI_HOST_SOURCES common/build_config.cc)
+list(APPEND LORRAX_FFI_HOST_SOURCES common/build_config.cc common/ctx_registry.cc)
 
 if(NOT LORRAX_FFI_HOST_SOURCES)
     message(FATAL_ERROR

@@ -61,6 +61,14 @@
 //                only way the loaders can refuse it.  The rule's "silent one"
 //                clause, applied after the fact.
 //
+//   ABI 5 -> 6   (2026-09-24, perf/ffi-ctx-operand, phase-2 P2-I).  Every
+//                cuSolverMp/cuBLASMp/active-subspace/SLATE/ScaLAPACK handler's
+//                `ctx_handle` Attr (a heap address, so a new HLO and a
+//                persistent-cache miss per process) became `ctx_key`, a hash
+//                of the context configuration resolved through the per-.so
+//                registry common/ctx_registry.{h,cc}; new C entry points
+//                lrx_ctx_bind / lrx_ctx_unbind (leg-suffixed).
+//
 // ---------------------------------------------------------------------------
 // THE RULE
 // ---------------------------------------------------------------------------
@@ -85,4 +93,4 @@
 // Python tree with a still-correct .so.  What has to match is the CONTRACT.
 #pragma once
 
-#define LORRAX_FFI_ABI_VERSION 5
+#define LORRAX_FFI_ABI_VERSION 6

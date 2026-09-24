@@ -16,6 +16,7 @@
 //         per rank → matches JAX's contiguous P(None, 'x', 'y') slab),
 //         lld=N/Px.
 
+#include "../common/ctx_registry.h"
 #include <complex>
 #include <cstdint>
 #include <cstdio>
@@ -174,8 +175,9 @@ static ffi::Error BatchedPotrsDispatch(
     ffi::Result<ffi::AnyBuffer> X_out,
     int64_t nq, int64_t n, int64_t mrhs,
     int64_t mb_a, int64_t nb_a, int64_t mb_b, int64_t nb_b,
-    int64_t ctx_handle)
+    int64_t ctx_key)
 {
+    const int64_t ctx_handle = ::lorrax_ffi::ctx_registry::resolve(ctx_key, "cusolvermp");
     auto* ctx = reinterpret_cast<LorraxCusolverMpCtx*>(ctx_handle);
     if (ctx == nullptr) {
         return ffi::Error(ffi::ErrorCode::kInvalidArgument,
@@ -226,4 +228,4 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Attr<int64_t>("nb_a")
         .Attr<int64_t>("mb_b")
         .Attr<int64_t>("nb_b")
-        .Attr<int64_t>("ctx_handle"));
+        .Attr<int64_t>("ctx_key"));

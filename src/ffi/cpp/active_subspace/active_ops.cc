@@ -1,3 +1,4 @@
+#include "../common/ctx_registry.h"
 #include "xla/ffi/api/ffi.h"
 #include <climits>
 #include <complex>
@@ -234,7 +235,8 @@ static ffi::Error orthogonalize(cudaStream_t stream, B v, B p, I active, R out,
 // rejected by every peer before any peer can enter a different collective.
 static ffi::Error distributed_orthogonalize(
     cudaStream_t xla_stream, B v, B p, I range, R out, CR coefficients,
-    IR gathered_ranges, ScratchResult scratch, int64_t ctx_handle) {
+    IR gathered_ranges, ScratchResult scratch, int64_t ctx_key) {
+    const int64_t ctx_handle = ::lorrax_ffi::ctx_registry::resolve(ctx_key, "cusolvermp");
   if (!ctx_handle)
     return ffi::Error::InvalidArgument(
         "distributed orthogonalize context is null");
@@ -528,7 +530,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Ret<C>()
         .Ret<I>()
         .Ret<Scratch>()
-        .Attr<int64_t>("ctx_handle"));
+        .Attr<int64_t>("ctx_key"));
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
     ActiveSubspaceSubtractFfi, subtract,

@@ -43,6 +43,7 @@ no trace.
 from __future__ import annotations
 
 import ctypes
+import hashlib
 import os
 import sys
 from pathlib import Path
@@ -54,6 +55,7 @@ from lxkit.probe import (AVAILABLE, LibraryNotBuilt, LibraryUnusable,
                          unknown_target)
 
 __all__ = ["get_lib", "has_target", "probe_target", "loaded_lib_path",
+           "context_key", "bind_context", "unbind_context",
            "loaded_platforms_in_order", "LibraryNotBuilt", "LibraryUnusable",
            "LORRAX_FFI_ABI_VERSION", "AbiMismatch"]
 
@@ -66,7 +68,7 @@ __all__ = ["get_lib", "has_target", "probe_target", "loaded_lib_path",
 #: header whenever the monorepo is reachable and FAILS if the two disagree.
 #: That is the whole mechanism keeping a copy honest: a copy nothing compares
 #: is how the ten dispatch sites drifted.
-LORRAX_FFI_ABI_VERSION = 5
+LORRAX_FFI_ABI_VERSION = 6
 
 #: platform -> the C entry point reporting the library's ABI.  Per leg,
 #: because both libraries are dlopened RTLD_GLOBAL and already share sixteen
@@ -277,6 +279,8 @@ _SLATE_C_ENTRY_POINTS = (
     "lrx_slate_subrow_context_create",
     "lrx_slate_context_destroy",
     "lrx_slate_init_mpi",
+    "lrx_ctx_bind",
+    "lrx_ctx_unbind",
 )
 
 #: platform -> the suffix ``LRX_C_ENTRY`` appends on that leg.
@@ -334,6 +338,17 @@ def _declare_cusolvermp(lib: ctypes.CDLL) -> None:
 
     lib.lrx_destroy_cusolvermp_context.argtypes = [ctypes.c_int64]
     lib.lrx_destroy_cusolvermp_context.restype = None
+
+
+def _declare_ctx_registry(lib: ctypes.CDLL) -> None:
+    """The configuration-key registry (``cpp/common/ctx_registry.h``), both legs."""
+    if not hasattr(lib, "lrx_ctx_bind"):
+        return
+    lib.lrx_ctx_bind.argtypes = [ctypes.c_int64, ctypes.c_int64, ctypes.c_char_p,
+                                 ctypes.c_char_p, ctypes.c_int]
+    lib.lrx_ctx_bind.restype = ctypes.c_int
+    lib.lrx_ctx_unbind.argtypes = [ctypes.c_int64]
+    lib.lrx_ctx_unbind.restype = None
 
 
 def _declare_slate(lib: ctypes.CDLL) -> None:
@@ -636,6 +651,7 @@ def get_lib(platform: str) -> ctypes.CDLL:
     _bind_c_abi(lib, platform)
     _declare_cusolvermp(lib)
     _declare_slate(lib)
+    _declare_ctx_registry(lib)
     _register_ffi_targets(lib, platform)
     _LIBS[platform] = lib
     _LIB_PATHS[platform] = str(actual_origin)
@@ -780,6 +796,44 @@ def create_slate_subrow_context(rank: int, world_size: int,
         raise RuntimeError("lorrax_ffi slate.subrow_context_create failed: "
                            + err.value.decode("utf-8", errors="replace"))
     return int(h)
+
+
+def context_key(config: str) -> int:
+    """The FFI ``ctx_key`` of a native context: a pure function of its configuration.
+
+    An FFI attribute is baked into the HLO, so it must not be an address:
+    the heap ``ctx_handle`` it replaces made every process emit a new module
+    and the persistent compile cache miss on every run.  SHA-256 of the
+    canonical configuration string, low 63 bits (never Python's salted
+    ``hash``), so every rank and every run compute the same key.
+    """
+    digest = hashlib.sha256(config.encode("utf-8")).digest()
+    return (int.from_bytes(digest[:8], "little") & ((1 << 63) - 1)) or 1
+
+
+def bind_context(platform: str, config: str, handle: int) -> int:
+    """Bind ``handle`` under ``context_key(config)`` in ``platform``'s library; return the key.
+
+    The registry stores ``config`` beside the key and refuses a collision or
+    a second live context for one configuration (``ctx_registry.h``).
+    """
+    lib = get_lib(platform)
+    key = context_key(config)
+    if not hasattr(lib, "lrx_ctx_bind"):
+        raise LibraryUnusable(
+            f"{_LIB_PATHS.get(platform)} has no lrx_ctx_bind: it predates the ctx_key "
+            "registry (handler ABI 6); rebuild and reseal both legs")
+    err = ctypes.create_string_buffer(_ERR_CAP)
+    if lib.lrx_ctx_bind(int(key), int(handle), config.encode("utf-8"), err, _ERR_CAP) != 0:
+        raise RuntimeError("lorrax_ffi ctx_registry refused: "
+                           + err.value.decode("utf-8", errors="replace"))
+    return key
+
+
+def unbind_context(platform: str, key: int) -> None:
+    lib = _LIBS.get(platform)
+    if lib is not None and hasattr(lib, "lrx_ctx_unbind"):
+        lib.lrx_ctx_unbind(int(key))
 
 
 def destroy_slate_context(ctx_handle: int, platform: str) -> None:

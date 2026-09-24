@@ -173,7 +173,7 @@ class LocalSubspacePlan:
             input_output_aliases={1: 0}, has_side_effect=True,
             vmap_method='sequential')
         result, _, _, _ = call(self._flat(v), flat,
-            _orthogonalization_range(start, active, self.capacity), ctx_handle=context)
+            _orthogonalization_range(start, active, self.capacity), ctx_key=context)
         return result.reshape(p.shape)
 
     def subtract_projection(self, v, p, coefficients, active, *, start=0,

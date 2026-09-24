@@ -29,6 +29,7 @@
 // local shard into the Q output buffer and let SLATE destroy that copy;
 // the eigenvector tiles are then written over it after heev returns.
 
+#include "../common/ctx_registry.h"
 #include <complex>
 #include <cstdint>
 #include <cstdio>
@@ -237,8 +238,9 @@ static ffi::Error EighDispatch(
     ffi::Result<ffi::AnyBuffer> W_out,
     ffi::Result<ffi::AnyBuffer> Q_out,
     int64_t n, int64_t nb,
-    int64_t ctx_handle, bool compute_evecs)
+    int64_t ctx_key, bool compute_evecs)
 {
+    const int64_t ctx_handle = ::lorrax_ffi::ctx_registry::resolve(ctx_key, "slate");
     auto* ctx = reinterpret_cast<lorrax_ffi::slate::SlateCtx*>(ctx_handle);
     if (ctx == nullptr) {
         return ffi::Error(ffi::ErrorCode::kInvalidArgument,
@@ -301,5 +303,5 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Ret<xla::ffi::AnyBuffer>()              // Q (local shard, same dtype as A)
         .Attr<int64_t>("n")
         .Attr<int64_t>("nb")
-        .Attr<int64_t>("ctx_handle")
+        .Attr<int64_t>("ctx_key")
         .Attr<bool>("compute_evecs"));
