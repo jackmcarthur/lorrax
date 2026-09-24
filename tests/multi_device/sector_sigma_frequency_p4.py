@@ -128,6 +128,8 @@ def check(mesh, root, layout, resident=False):
         omega_grid_step_ry=.3,print_fn=print)
     result.sigma_c_kij.block_until_ready()
     consumer_wall_s=time.perf_counter()-started
+    # The four sector calls share one Sigma-rule request scope (union census).
+    assert len([p for p in (root/'rules').iterdir() if p.name.startswith('request_')])==1
     pauli=(np.array([[0,1],[1,0]]),np.array([[0,-1j],[1j,0]]),np.diag([1,-1]))
     gamma=[np.eye(4)]+[np.block([[np.zeros((2,2)),a],[a,np.zeros((2,2))]]) for a in pauli]
     expected=np.zeros((len(omega),nk,nb,nb),complex)
