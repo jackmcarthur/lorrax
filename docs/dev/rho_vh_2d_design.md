@@ -1,7 +1,7 @@
 # G-space Hartree implementation
 
-Status: current implementation. [Direct Hartree field](../theory/hartree.md)
-owns the equations and conventions; this page owns APIs and schedules.
+[Direct Hartree field](../theory/hartree.md) owns the equations and
+conventions; this page owns the APIs and schedules.
 
 ## API contracts
 
@@ -24,15 +24,8 @@ Hartree builder or cache the field across self-consistent iterations.
 | one-shot GW | process-distributed stream; one final grid reduction | bounded wavefunction memory |
 | density-self-consistent GW | resident band-sharded orbital scan | reuses rotations; retains orbitals and performs mesh reductions |
 
-The one-shot schedule is parallel under the required one-process-per-GPU
-launch. A historical one-process/four-visible-GPU diagnostic used only the
-first device during source construction; it is single-rank evidence, not P=4.
-The later matrix sweep did use the visible mesh, which does not upgrade the
-source-stage evidence.
+The one-shot schedule assumes the required one-process-per-GPU launch.
 
 Both schedules use the canonical WFN symmetry service and must preserve
 two-band-axis sharding and Hermiticity. Scissors are applied only after the
 final direct-field map.
-
-Evidence: sandbox
-`reports/gspace_hartree_single_path_2026-08-29/report.md`, claim 500.
