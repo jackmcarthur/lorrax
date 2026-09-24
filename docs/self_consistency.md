@@ -15,12 +15,22 @@ defined in [input_reference.md](input_reference.md); the drivers are in
 ## What the loop does
 
 One map is `H → rotate ψ → χ₀ → W → screening model (poles) → Σ(ω) → H'`.
-The map is iterated with rCROP (`sc_accelerator = rcrop`, history 5, the only
-supported accelerator — see the key's row in
-[input_reference.md](input_reference.md)) until
-the identity-aligned input-to-output energy residual of every non-scissored
-band is below `sc_tol_ev` on an accepted input. A small change between mixed
-iterates or a trial-map residual is not the stopping criterion. Within the active
+The map is iterated with one-evaluation Anderson (Pulay) acceleration
+(`sc_accelerator = anderson`, history 5, the only supported accelerator — see
+the key's row in [input_reference.md](input_reference.md);
+`mixing.acceleration.anderson_nojit`) until the identity-aligned
+input-to-output energy residual of every non-scissored band is below
+`sc_tol_ev` on an evaluated input. A small change between mixed iterates is
+not the stopping criterion. Each iteration evaluates the map once, at
+`sum_i alpha_i (x_i + f_i)`, and every evaluated pair enters the history. It
+replaced rCROP (2026-09-24), whose second evaluation per iteration re-derived
+the residual its linear model already predicts; the map is a pure function of
+H (bitwise re-evaluation, sandbox claim 2678), so every pair is valid secant
+data. A discrete map event (a Σ rule rebuild or sampled-grid growth) is
+logged but does not restart the history. The loop STOPS AS STALLED — never reported converged —
+when the label-free residual `max_k ||P f_k P||_2` (logged every call as
+`SC matrix residual`) has not improved by 10% over two history turnovers,
+2(m+1) maps. Within the active
 subspace (`nval + ncond` bands around E_F) each band is in one of three
 classes (`gw/band_partition.py`):
 
@@ -186,7 +196,7 @@ and must be chosen per material.
 qp_solver = self_consistent
 sc_max_iter = 30             # deck; default 20 (13–15 maps when healthy)
 sc_tol_ev = 1e-4             # default
-sc_accelerator = rcrop       # default, and the only supported value
+sc_accelerator = anderson    # default, and the only supported value
 sc_history_depth = 5         # default
 nval = 8                     # deck; default 5
 ncond = 8                    # deck; default 5
@@ -517,9 +527,8 @@ non-contracting 0.3-2.4 eV residual band on the same deck before them.
 * **Keep the window around the complete Fermi-surface manifold with margin.**
   On Fe the manifold is bands 13-18 and the frozen set is 9-20; if the manifold
   approaches the set edge the scissor starts cutting the Fermi surface.
-* **`sc_max_iter` counts map calls, not iterates** (rCROP spends two per
-  accepted iterate). Size it for the measured 2.5x-per-pair contraction; the
-  default is now 30.
+* **`sc_max_iter` counts accelerated map calls** (one per iteration, plus
+  map 0). The default is 30.
 * **mu is solved, not mixed.** One fixed-N solve per map from the map's own
   input spectrum (`_solve_occupation_state`), used by the window
   classification, the chi0/W weights and the shared-pole recipe; the scissor's

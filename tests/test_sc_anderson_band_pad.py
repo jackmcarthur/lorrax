@@ -1,6 +1,6 @@
-"""The rCROP band axes are PADDED, not degraded to an unsharded history.
+"""The SC history band axes are PADDED, not degraded to an unsharded history.
 
-``_run_rcrop`` used to carry a ``DEGRADE, DO NOT REFUSE`` branch: a band
+``_run_anderson`` used to carry a ``DEGRADE, DO NOT REFUSE`` branch: a band
 count that did not divide the mesh fell back to an unsharded history, i.e.
 to the 92.2 GB-on-one-device wall the function's own residency budget
 exists to describe.  It pads both band axes instead.
@@ -38,7 +38,7 @@ def _block(name):
     return _SRC[start: nxt if nxt != -1 else len(_SRC)]
 
 
-_RCROP = _block("_run_rcrop")
+_RCROP = _block("_run_anderson")
 
 
 def test_the_unsharded_degrade_branch_is_gone():
@@ -61,7 +61,7 @@ def test_the_band_divisor_comes_from_the_spec_not_from_the_mesh_axes():
     """
     function = next(
         node for node in ast.walk(_TREE)
-        if isinstance(node, ast.FunctionDef) and node.name == "_run_rcrop")
+        if isinstance(node, ast.FunctionDef) and node.name == "_run_anderson")
     call = next(
         node for node in ast.walk(function)
         if isinstance(node, ast.Call)
@@ -105,7 +105,7 @@ def test_the_tolerance_is_built_from_the_logical_element_count():
     tolerance stays the per-element RMS it claims to be.
     """
     fn = next(n for n in ast.walk(_TREE)
-              if isinstance(n, ast.FunctionDef) and n.name == "_run_rcrop")
+              if isinstance(n, ast.FunctionDef) and n.name == "_run_anderson")
     # n_elem is assigned from nk/nb, which are unpacked from H0.shape
     assert "nk, nb, _ = H0.shape" in _RCROP
     assert "n_elem = nk * nb * nb" in _RCROP

@@ -15,7 +15,7 @@ from gw import sc_iteration as sc
 from gw.scissor import ScissorFit
 
 
-def test_qp_seed_reconstruction_partition_enters_real_rcrop_seam(
+def test_qp_seed_reconstruction_partition_enters_real_anderson_seam(
     monkeypatch, tmp_path,
 ):
     rng = np.random.default_rng(20260920)
@@ -213,15 +213,15 @@ def test_qp_seed_reconstruction_partition_enters_real_rcrop_seam(
 
     import mixing.acceleration as acceleration
 
-    def fake_rcrop(residual_fn, x, **_kwargs):
+    def fake_anderson(residual_fn, x, **_kwargs):
         residual = residual_fn(x)
         return acceleration.AccelerationResult(
             x=x, residual_norms=jnp.asarray([jnp.linalg.norm(residual)]),
             iterations=1, converged=False)
 
-    monkeypatch.setattr(acceleration, "rcrop_nojit", fake_rcrop)
+    monkeypatch.setattr(acceleration, "anderson_nojit", fake_anderson)
     final, _ = sc.run_self_consistency(
-        state, inputs, max_iter=2, accelerator="rcrop", history_depth=1)
+        state, inputs, max_iter=2, accelerator="anderson", history_depth=1)
     assert seen and seen[0] is partition
     assert final.partition is partition
     assert final.frozen_scissor_fits == (fit, None)

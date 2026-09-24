@@ -72,7 +72,7 @@ do not implicitly suppress tests.
 {"nodeid":"tests/test_star_wedge_measured_values.py::test_the_committed_kin_ion_fixtures_carry_their_measured_deviation[bispinor_debug]","reason":"committed kin_ion fixtures gained wedge-storage stamps; measured table needs regeneration","owner":"GW/fixtures"}
 {"nodeid":"tests/test_star_wedge_measured_values.py::test_the_committed_kin_ion_fixtures_carry_their_measured_deviation[cohsex_debug]","reason":"committed kin_ion fixtures gained wedge-storage stamps; measured table needs regeneration","owner":"GW/fixtures"}
 {"nodeid":"tests/test_star_wedge_measured_values.py::test_the_committed_kin_ion_fixtures_carry_their_measured_deviation[gnppm_debug]","reason":"committed kin_ion fixtures gained wedge-storage stamps; measured table needs regeneration","owner":"GW/fixtures"}
-{"nodeid":"tests/core/test_driver_references.py::test_b_mpa_one_update_matches_references","reason":"mpa_sc1 SC reference family is the retired linear trajectory; needs an owner-authorized re-baseline on rCROP (POSTLAND 2026-09-16)","owner":"GW/fixtures"}
+{"nodeid":"tests/core/test_driver_references.py::test_b_mpa_one_update_matches_references","reason":"mpa_sc1 SC reference family is the retired linear trajectory; needs an owner-authorized re-baseline on the one-evaluation Anderson route (POSTLAND 2026-09-16; rCROP retired 2026-09-24)","owner":"GW/fixtures"}
 ```
 <!-- executable-xfails:end -->
 
