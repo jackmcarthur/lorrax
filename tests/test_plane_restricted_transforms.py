@@ -161,7 +161,8 @@ def test_tiles_are_orbit_closed_and_plane_local():
     ops = np.array(rots + [sh @ r for r in rots])
     tau = np.zeros((8, 3))
     fg = (8, 8, 10)
-    tiles = build_real_grid_orbit_tiles(ops, tau, fg, n_y=2, target_width=32)
+    tiles = build_real_grid_orbit_tiles(ops, tau, fg, n_y=2, target_width=32,
+                                        fill="least_loaded")
     assert tiles.plane_axis == 2
     act = tiles.r_index[tiles.r_index >= 0]
     assert np.array_equal(np.sort(act), np.arange(np.prod(fg)))
@@ -192,7 +193,7 @@ def test_fmode_matches_resident_accumulator():
     _, sphere, ngkmax, _ = _sphere(rng, nq, cut=9.0)
     tiles = build_real_grid_orbit_tiles(
         np.eye(3, dtype=np.int64)[None], np.zeros((1, 3)), _FFT,
-        n_y=2, target_width=48)
+        n_y=2, target_width=48, fill="least_loaded")
     axis = int(tiles.plane_axis)
     n_a = _FFT[axis]
     zr = (rng.standard_normal((nq, n_mu, n_rtot))
