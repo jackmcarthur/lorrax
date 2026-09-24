@@ -515,6 +515,13 @@ def test_gw_init_calls_the_canonical_refusal():
     assert "refuse_unsupported_bispinor_tt_head_correction(cfg)" in src
 
 
+def test_the_docs_row_names_the_key():
+    repo = pathlib.Path(__file__).resolve().parents[1]
+    text = (repo / "docs" / "input_reference.md").read_text()
+    assert "bispinor_tt_head_correction" in text
+    assert "bispinor_tt_head_unsupported" in text
+
+
 def test_refusal_doc_pointer_names_a_section_that_actually_exists(tmp_path):
     """Both refusal messages cite a ``docs/input_reference.md`` section by
     its ``## `` heading -- catches the class of bug where the row lands

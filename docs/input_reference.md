@@ -49,8 +49,8 @@ The material class is inferred from the WFN occupations; no deck key selects it.
 | `fermi_reference` | str | `midgap` | `vbm` or `midgap` on an insulator. On a metal, `mp1_fixed_n` (the fixed-N chemical potential) is required, and it is refused on an insulator. The value is resolved once, in `gw.efermi.resolve_sigma_efermi_ry`, and stamped as `omega_reference_provenance` in `sigma_mnk.h5`. |
 | `occ_smearing_width_ry` | float | unset | The Fermi–Dirac kBT (Ry) of a metal's occupations, f = 1/(1 + exp((E − μ)/kBT)); QE `smearing = 'fd'` matches it at `degauss = kBT`. It is required when the WFN occupations identify a metal and refused when they identify an insulator. It is the one width every metallic occupation solve uses. |
 | `occ_broadening` | float (eV) | `0.0` | First-order Methfessel–Paxton broadening for the smeared QSGW head on an insulator, in BerkeleyGW's convention z = (E − E_F)/(2·occ_broadening); `0` gives step occupations. With `qp_solver = self_consistent` and a head mode in `sc_head_update`, each map solves its own fixed-N table at entry. A value > 0 beside `occ_smearing_width_ry` refuses (`GATE metal_sc_head_update_disabled`). |
-| `occupation_clamp_tol` | float | `1e-8` | Snaps an MP1 occupation within `tol` of 0 or 1 to exactly 0 or 1. It is applied inside the fixed-N root, so μ is solved for the clamped table. Range [0, 1e-3]; `0` disables it. Fermi–Dirac tables ignore it. |
-| `occupation_window_threshold` | float | `0.995` | Drops a band from a Green's-function branch when \|weight\| ≤ 1 − threshold, where the weight is `f` on the hole side and `1 − f` on the electron side. It is a magnitude cut, so negative MP1 weights are kept. Consumers share `gw.efermi.occupation_weight_floor` and `band_in_occupation_window`: the Σ branch supports (`gw.ppm_windows.branches_for_omega_grid`), the MPA pane geometry (`gw.mpa.sigma_windows`), and the χ0 fractional-occupation supports (`gw.w_isdf`). |
+| `occupation_clamp_tol` | float | `1e-8` | Snaps an MP1 occupation within `tol` of 0 or 1 to exactly 0 or 1. It is applied inside the fixed-N root, so μ is solved for the clamped table. Unclamped, the table's support edge is where `exp(−x²)` underflows, `x = 27.2971`, a float64 property; at `1e-8` it is `\|x\| < 4.30834`. The overshoot lobe beyond [0, 1] is never touched. Range [0, 1e-3]; `0` disables it. Fermi–Dirac tables ignore it. It decides which values exist in the table; `occupation_window_threshold` decides which bands enter a branch. |
+| `occupation_window_threshold` | float | `0.995` | Drops a band from a Green's-function branch when \|weight\| ≤ 1 - threshold, where the weight is `f` on the hole side and `1 − f` on the electron side. It is a MAGNITUDE cut, so negative MP1 weights are kept. Consumers share `gw.efermi.occupation_weight_floor` and `band_in_occupation_window`: the Σ branch supports (`gw.ppm_windows.branches_for_omega_grid`), the MPA pane geometry (`gw.mpa.sigma_windows`), and the χ0 fractional-occupation supports (`gw.w_isdf`). |
 
 ## ISDF / zeta
 
@@ -60,15 +60,20 @@ The material class is inferred from the WFN occupations; no deck key selects it.
 | `centroids_file_current` | str | `""` | Bispinor transverse-channel centroid table, selected from the Dirac-current feature norm. |
 | `zeta_rcond` | float | `1e-8` | Rank-truncation cutoff of the charge CCT, relative to λ_max. A cut that discards directions while the achieved κ_eff exceeds the certified 1e8 refuses ([rank-truncation policy](dev/rank_truncation_policy.md)). |
 | `transverse_zeta_rcond` | float | `1e-10` | Transverse-channel cutoff, relative to \|λ\|_max. Its κ cap is 1e10 and is uncertified, so exceeding it warns. |
-| `zeta_ridge` | float | `0.0` | Tikhonov ridge on the charge CCT, as a fraction of the mean diagonal; `0` means no ridge. |
+| `zeta_ridge` | float | `0.0` | Tikhonov ridge on the charge CCT, as a fraction of the mean diagonal; `0` means no ridge. Only the `cholesky` charge family reads it; the `rank_truncate` factor that both `linalg` layouts resolve does not. |
 | `zeta_cutoff` | float | unset (= ecutwfc) | G-sphere cutoff (Ry) of the per-q ζ_q(G) writes. It must be ≥ `bare_coulomb_cutoff`. |
 | `low_mem_bands` | bool | `true` | Raw-parent ψ layout. `true`: two mesh-face copies with distributed band contractions. `false`: two single-axis centroid copies with complete bands and local band contractions, which use more memory. The Green's-function, screening and projection algorithms are the same for both. |
 | `linalg` | str | `local` | Dense linear-algebra layout. `local`: each task factors ⌈N_q,irr/P⌉ whole N_μ×N_μ matrices (the startup report prints the complex128 GiB per task). `distributed`: 2-D block-distributed matrices through the `distrib_la` providers (cuSOLVERMp/cuBLASMp on CUDA, ScaLAPACK on CPU) for the W Dyson solve, the transverse ζ LU and the eigensolvers; the charge ζ solve stays whole-tile (route G). The value does not invalidate a restart. |
 | `memory_per_device_gb` | float | `0.0` | Per-device budget for the chunk planners; `0` auto-detects it. |
-| `r_chunk_size` | int | `0` | Real-space columns per Stage-C ζ-fit chunk. `0` lets the planner size it from the memory budget; an explicit value overrides the budget cap. |
+| `r_chunk_size` | int | `0` | Real-space tile width of the bispinor current-channel (transverse) ζ fits. `0` lets the planner size it from the memory budget; an explicit value overrides the budget cap and turns the planner's over-budget refusal into a warning. The charge channel runs route G, whose own planner sizes its tiles. |
 | `gflat_chunk_size` | int | `0` | Stage-D flat-axis chunk of the ζ-fit accumulation. `0` lets the planner choose. |
 | `vq_g_chunk_size` | int | `0` | G-axis tile of the V_q GEMM. `0` lets `v_q_g_flat._plan_vq_tiles` choose. |
 | `gamma_contract_mode` | str | `take` | HLO variant of the γ̃ double contraction: `take`, `einsum` or `scan`. All three are mathematically identical. |
+
+**Raw-parent GW.** The Green's-function contraction consumes diagonal band
+occupations (`occupation_state`); an explicit dense `Gij` passed to
+`compute_sigma_xc` refuses under either `low_mem_bands` layout
+(`GATE low_mem_bands_explicit_gij_unported`).
 
 A centroid set that is not closed under the symmetry orbits runs unreduced: a
 WARNING names the set, `SymMaps.trivial_view()` selects loader-unfolded full-k
@@ -124,6 +129,14 @@ the QE-schema receipt and the occupied two-component DFT states
 | `sigma_w_model` | str | `mpa` | Body model under `compute_mode = mpa`: `mpa` or `shared_pole` ([shared-pole model](architecture/shared_pole_model.md)). Under self-consistency, shared poles rebuild W from the current wavefunctions and retain the certified quadrature rules. |
 | `sigma_w_accuracy` | str | `production` | Shared-pole recipe tier: `production` or `relaxed`. It requires `sigma_w_model = shared_pole`. |
 | `sigma_w_support_sites_ev` | str | `""` | Shared-pole ladder override: `"<line eV list> \| <imaginary eV list>"`, each strictly increasing. Empty keeps the resolver's line rule and the Zolotarev imaginary ladder. The sites enter the recipe hash, so a model built on another ladder refuses. It requires `sigma_w_model = shared_pole`. |
+
+`bispinor_tt_head_correction` is not a deck key: the transverse Γ head comes
+with `head_correction`, and a deck that names the key refuses at parse. A
+hand-built config with `head.bispinor_tt_head_correction = true` refuses with
+`GATE bispinor_tt_head_unsupported` (`bispinor = false`, or `sys_dim` not 2
+or 3) or `GATE packed_bare_transverse_tt_head_double_count` (a packed
+static-photon route, which already inserts the head). Fix: leave the field
+at its default, `false`.
 
 ## Sigma
 

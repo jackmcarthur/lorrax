@@ -3813,8 +3813,8 @@ def refuse_unsupported_bispinor_gw(config) -> None:
                 "  fix:  leave head.bispinor_tt_head_correction at its "
                 "default (False) -- it is not a deck key any more; the TT "
                 "head is on by default with the charge head\n"
-                "  doc:  docs/input_reference.md, "
-                "bispinor_tt_head_correction.")
+                "  doc:  docs/input_reference.md '## Screening', "
+                "head_correction.")
     if mode is BispinorGWMode.BARE_TRANSVERSE:
         return
     if mode is BispinorGWMode.FULL_SHARED_POLE:
@@ -3896,7 +3896,7 @@ def refuse_unsupported_bispinor_tt_head_correction(config) -> None:
             "bare bispinor TT (transverse-transverse) V-tiles, which a "
             "non-bispinor run never builds\n"
             "  doc:  docs/input_reference.md '## Screening', "
-            "bispinor_tt_head_correction.")
+            "head_correction.")
     sys_dim = int(config.sys_dim)
     if sys_dim not in (2, 3):
         raise ValueError(
@@ -3912,7 +3912,7 @@ def refuse_unsupported_bispinor_tt_head_correction(config) -> None:
             "slot (vcoul.box_0d.Box0D._v_bare_per_q's own docstring), so "
             "there is no missing slot for this correction to fill\n"
             "  doc:  docs/input_reference.md '## Screening', "
-            "bispinor_tt_head_correction.")
+            "head_correction.")
 
 
 def refuse_explicit_gij_under_low_mem_bands(config, Gij) -> None:
