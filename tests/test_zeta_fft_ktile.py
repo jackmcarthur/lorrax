@@ -39,11 +39,11 @@ def _case_transform() -> dict:
     psi = jnp.asarray(
         rng.standard_normal((nk, nb, ns, ngkmax))
         + 1j * rng.standard_normal((nk, nb, ns, ngkmax)))
-    g_index = np.full((nk,) + fft_grid, ngkmax, dtype=np.int32)
+    # The per-k sphere index (common.gvec_fft_box.build_sphere_box_index):
+    # slot g sits in box cell g_index[k, g].
+    g_index = np.zeros((nk, ngkmax), dtype=np.int32)
     for k in range(nk):
-        flat = g_index[k].reshape(n_rtot)
-        flat[rng.choice(n_rtot, size=ngkmax, replace=False)] = np.arange(
-            ngkmax, dtype=np.int32)
+        g_index[k] = rng.choice(n_rtot, size=ngkmax, replace=False)
     g_index = jnp.asarray(g_index)
     kvecs = jnp.asarray(rng.uniform(-0.5, 0.5, size=(nk, 3)))
     # Scattered tile cells, including two out-of-range pad slots.

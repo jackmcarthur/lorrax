@@ -75,13 +75,15 @@ def _case(seed=20260923):
     psi_full = np.zeros((NK, 8, NS, NG), dtype=np.complex128)
     psi_full[:, :NB_FULL] = (rng.standard_normal((NK, NB_FULL, NS, NG))
                              + 1j * rng.standard_normal((NK, NB_FULL, NS, NG)))
-    bidx = np.full((NK, *GRID), NG, dtype=np.int32)
+    # The per-k sphere index (common.gvec_fft_box.build_sphere_box_index):
+    # slot g sits in box cell bidx[k, g].
+    bidx = np.zeros((NK, NG), dtype=np.int32)
     coords = []
     for ik in range(NK):
         cells = rng.choice(ngrid, size=NG, replace=False)
         xyz = np.column_stack(np.unravel_index(cells, GRID))
         coords.append(xyz)
-        bidx[ik, xyz[:, 0], xyz[:, 1], xyz[:, 2]] = np.arange(NG)
+        bidx[ik] = cells
     occ = np.zeros((NK, 8), dtype=np.float64)      # the bundle carrier
     occ[:, :NB_SIGMA] = [[0.95, 0.55, 0.15], [0.85, 0.35, -0.02]]
     U = np.stack([_haar(rng, NB_SIGMA) for _ in range(NK)])

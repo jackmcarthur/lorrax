@@ -58,12 +58,11 @@ def _case_rpoints() -> dict:
         dtype=jnp.complex128)
     # Sentinel ``ngkmax`` in most cells: only a handful of box cells hold a
     # G coefficient, exactly as a real G-sphere does.
-    g_index = np.full((nk,) + fft_grid, ngkmax, dtype=np.int32)
+    # The per-k sphere index (common.gvec_fft_box.build_sphere_box_index):
+    # slot g sits in box cell g_index[k, g].
+    g_index = np.zeros((nk, ngkmax), dtype=np.int32)
     for k in range(nk):
-        cells = rng.choice(n_rtot, size=ngkmax, replace=False)
-        flat = g_index[k].reshape(n_rtot)
-        flat[cells] = np.arange(ngkmax, dtype=np.int32)
-        g_index[k] = flat.reshape(fft_grid)
+        g_index[k] = rng.choice(n_rtot, size=ngkmax, replace=False)
     g_index_j = jnp.asarray(g_index)
     # Non-trivial k vectors: a zero phase would hide a wrong phase lookup.
     kvecs = jnp.asarray([[0.25, -0.5, 0.125], [-0.375, 0.25, 0.5]],

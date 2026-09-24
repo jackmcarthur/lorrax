@@ -41,13 +41,15 @@ def _fixture():
     ngrid = int(np.prod(grid))
     psi = (rng.standard_normal((nk, nb, ns, ng))
            + 1j * rng.standard_normal((nk, nb, ns, ng)))
-    bidx = np.full((nk, *grid), ng, dtype=np.int32)
+    # The per-k sphere index (common.gvec_fft_box.build_sphere_box_index):
+    # slot g sits in box cell bidx[k, g].
+    bidx = np.zeros((nk, ng), dtype=np.int32)
     coords = []
     for ik in range(nk):
         cells = rng.choice(ngrid, size=ng, replace=False)
         xyz = np.column_stack(np.unravel_index(cells, grid))
         coords.append(xyz)
-        bidx[ik, xyz[:, 0], xyz[:, 1], xyz[:, 2]] = np.arange(ng)
+        bidx[ik] = cells
     return rng, psi.astype(np.complex128), bidx, coords, grid
 
 

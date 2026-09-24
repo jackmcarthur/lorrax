@@ -199,11 +199,11 @@ def _worker(case_name: str, *, mesh_shape=(2, 2), return_arrays=False, return_fi
             self._bpd_max = max(hi-lo for lo, hi in band_chunk_ranges) // (PX * PY)
             self.meta = SimpleNamespace(
                 fft_grid=fft_grid, nk_tot=nrows, nspinor=ns)
+            # The per-k sphere index of the identity box: slot g in cell g.
             g_index = np.broadcast_to(
-                np.arange(n_rtot, dtype=np.int32).reshape(fft_grid),
-                (nrows,) + fft_grid)
+                np.arange(n_rtot, dtype=np.int32), (nrows, n_rtot))
             self._g = jax.device_put(
-                jnp.asarray(g_index), NamedSharding(mesh, P(None, None, None, None)))
+                jnp.asarray(g_index), NamedSharding(mesh, P(None, None)))
             self._k = jax.device_put(
                 jnp.asarray(kvecs), NamedSharding(mesh, P(None, None)))
             self._per_rank_shape = (nrows, self._bpd_max, ns, n_rtot)

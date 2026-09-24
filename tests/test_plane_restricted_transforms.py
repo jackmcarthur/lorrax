@@ -49,13 +49,16 @@ def _sphere(rng, nk, cut):
         inside = np.flatnonzero(np.sum((g + shift) ** 2, 1) < cut)
         flat_all.append(inside)
     ngkmax = max(f.size for f in flat_all)
-    g_index = np.full((nk, nx * ny * nz), ngkmax, np.int32)
+    # g_index: the per-k sphere index (common.gvec_fft_box.
+    # build_sphere_box_index), n_rtot + g on a pad slot.
+    n_rtot = nx * ny * nz
+    g_index = np.tile(n_rtot + np.arange(ngkmax, dtype=np.int32), (nk, 1))
     sphere = np.zeros((nk, ngkmax), np.int32)
     for k, f in enumerate(flat_all):
-        g_index[k, f] = np.arange(f.size)
+        g_index[k, :f.size] = f
         sphere[k, :f.size] = f
         sphere[k, f.size:] = f[0]            # pad: a valid box cell, masked later
-    return g_index.reshape(nk, *_FFT), sphere, ngkmax, [f.size for f in flat_all]
+    return g_index, sphere, ngkmax, [f.size for f in flat_all]
 
 
 def _tile(rng, axis, planes, width):
