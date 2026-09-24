@@ -1,58 +1,46 @@
 # Perlmutter (NERSC)
 
-Perlmutter is LORRAX's reference 4×A100 GPU-node platform. The maintained
-sources are:
+Perlmutter (4×A100 GPU nodes) is the reference platform. There is one route:
+the `lorrax_A` base module, launched through `lx`. Launch geometry and machine
+behaviour are owned by [machines/perlmutter.md](../environment/machines/perlmutter.md),
+and the module and site descriptor by [`config/README.md`](../../config/README.md).
 
-- [`config/README.md`](../../config/README.md) for installing the environment
-  descriptor and native stages;
-- [`docs/environment/machines/perlmutter.md`](../environment/machines/perlmutter.md)
-  for launch geometry and verified machine behavior;
-- [`docs/architecture/ffi_layout.md`](../architecture/ffi_layout.md) for native
-  binding and ABI design.
+## What the module provides
 
-## One-time environment install
-
-```bash
-vi config/perlmutter/site_config.sh
-LORRAX_MODULE_NAME=lorrax_A bash config/perlmutter/install.sh
-LX_BASE_MODULE=lorrax_A lx doctor --refresh
-```
-
-The base module is a site descriptor used by `lx`; it is not a launcher. It
-contains the container image, native bind mounts, MPI capabilities, and
-supplemental third-party Python path. LORRAX runtime owns JAX, allocator,
-HDF5, compilation, and profiling defaults.
+`lorrax_A` is a site descriptor that `lx` reads; it is not a launcher. It
+supplies the CUDA-13.2 / JAX-0.9.1 runtime, the MPI capabilities and one sealed
+FFI bundle: both `LORRAX_FFI_SO` and `LORRAX_FFI_HOST_SO` point into a single
+[sealed pair](../architecture/ffi_layout.md#2a-the-deployable-unit-is-one-sealed-pair),
+so an ordinary run builds nothing. LORRAX's `runtime` package owns the JAX,
+GPU-allocator, HDF5 and compile-cache policy ([env_vars.md](../dev/env_vars.md)).
+Run scripts export none of it.
 
 ## Every run
 
-Never run a driver on a login node and never submit an iteration with
-`sbatch`. Pin the source when starting from a data directory:
-
 ```bash
 export LX_BASE_MODULE=lorrax_A
-export LORRAX_CHECKOUT=/path/to/lorrax
 lx doctor
-lx run -N 1 -G 4 -n 4 -- \
-  env PYTHONPATH="$LORRAX_CHECKOUT/src${PYTHONPATH:+:$PYTHONPATH}" \
-  python3 -u -m gw.gw_jax -i cohsex.in
+lx run -N 1 -G 4 -n 4 -- python3 -u -m gw.gw_jax -i cohsex.in
 ```
 
-Use one rank per GPU. Run preprocessing as separate `lx run` steps; do not use
-the retired `lxpre` wrapper. The source path belongs after `lx run`, because the
-container replaces an outer `PYTHONPATH`; the runtime closure receipt must name
-the checkout and its first-party services. `lx help` is the authority for
-allocations, concurrent batches, status, and tests.
+- `lx` runs the checkout that contains the working directory. From a data
+  directory outside any checkout, `LORRAX_CHECKOUT=/path/to/lorrax` selects the
+  checkout; with neither, `lx` runs the module's installed source. It puts the
+  selected `src/` first on the payload's `PYTHONPATH`, and startup attests that
+  the core and the first-party services were imported from it.
+- Use one rank per GPU: `-G` is per node, so P16 is `-N 4 -G 4 -n 16`.
+- Run each preprocessing step (k-means, dipoles, kin_ion) as its own `lx run`.
+- Never run a driver on a login node, and never `sbatch` an iteration.
+  `lx help` documents allocations, pools, status and `lx test`.
 
-## Native FFI stack
+## Native FFI stack on Perlmutter
 
-Stage one compatible cuSOLVERMp, parallel-HDF5, SLATE, and FFTW closure, then
-build in the selected environment:
+A private build replaces the module's bundle only as a pair. Pin both legs to
+one sealed bundle (`LORRAX_FFI_SO` and `LORRAX_FFI_HOST_SO`). Pinning one leg,
+or mixing a private leg with the module's, refuses at startup. The build and
+seal recipe is [Building the FFI libraries § Perlmutter](../building_ffi.md#perlmutter).
 
-```bash
-export LORRAX_FFI_IMAGE=<verified-jax-0.9-image>
-src/ffi/cpp/run_shifter.sh bash src/ffi/cpp/build.sh
-```
-
-The embedded convolution kernels currently carry an A100 `sm_80` image and
-fall back to NVRTC on other architectures. That fallback is functional, but
-does not certify another GPU architecture as production-ready.
+The nvcc translation units of the CUDA leg are compiled for
+`CMAKE_CUDA_ARCHITECTURES=80` (A100) unless the build sets another
+architecture. The mathdx k-convolution router compiles its kernels per k-grid
+with NVRTC at run time.
