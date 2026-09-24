@@ -1,14 +1,19 @@
-"""Frequency-specific exponential sums, with sampled value/slope accuracy.
+"""Response-bank exponential sums shared by groups of samples.
 
-Scalar construction only: Hankel shift pencils choose complex Laplace times;
-linear projection fits 1/(d-p) and 1/(d-p)^2 on the same nodes. No continuum
-certificate is claimed. Energies are Ry, times Ry^-1, slopes are d/d(z^2).
+Scalar construction only: a stacked Hankel shift pencil chooses complex
+Laplace times shared by every forward (z) and reverse (-conj z) pole of a
+sample group; linear projection fits 1/(d-p) and 1/(d-p)^2 on those nodes.
+No continuum certificate is claimed. Energies are Ry, times Ry^-1, slopes are
+d/d(z^2).
 """
 import numpy as np
 from scipy import linalg as la
 
 RESPONSE_RULE_CAPACITY = 192
 _RESPONSE_MAX_KAPPA = 5000.
+# A pencil geometry is abandoned after this many more exponentials without a
+# decade of accuracy; the next geometry, then a smaller group, is tried.
+_STAGNATION_NODES = 24
 
 
 def _project(lo, hi, pole, times, decay_rate=0.):
@@ -43,45 +48,77 @@ def _project(lo, hi, pole, times, decay_rate=0.):
     return coeff / np.array([eta, eta*eta]), error, mass
 
 
-def _primitive(lo, hi, pole, tol, previous=None, decay_rate=0.):
-    if pole.imag < 0:
-        t, c, error = _primitive(lo, hi, pole.conjugate(), tol,
-                                 None if previous is None else previous.conj(), decay_rate)
-        return t.conj(), c.conj(), error
-    eta = pole.imag
+def _poles(z):
+    """Forward poles z and reverse poles -conj(z), all in the upper half plane.
+
+    One Green-pair evaluation A(t) serves both orientations: the reverse
+    product at time conj(t) is conj(A(t)). An imaginary-axis sample is its own
+    reverse pole, so it contributes one pole, not two.
+    """
+    poles = []
+    for p in np.asarray(z, dtype=np.complex128):
+        for q in (p, -p.conjugate()):
+            if not any(abs(q - r) <= 1e-12*abs(q) for r in poles):
+                poles.append(q)
+    return np.asarray(poles)
+
+
+def _fits(lo, hi, poles, times, tol, decay_rate):
+    """Project every pole on shared times; stop at the first rejected pole."""
+    fits, worst = [], 0.
+    for pole in poles:
+        fit = _project(lo, hi, pole, times, decay_rate)
+        if fit is None:
+            return None, np.inf, False
+        error = float(np.max(fit[1]*[1., pole.imag/(2*abs(pole))]))
+        if not error <= tol or not np.isfinite(fit[2]).all():
+            return None, error, False
+        if fit[2][0] > _RESPONSE_MAX_KAPPA:
+            return None, error, True
+        worst = max(worst, error)
+        fits.append(fit)
+    return fits, worst, False
+
+
+def _shared_times(lo, hi, poles, tol, previous=None, decay_rate=0.):
+    """Complex times shared by every pole, or None.
+
+    A stacked (multi-channel) Hankel shift pencil: each pole contributes the
+    Hankel matrix of 1/(x - z_p) sampled at the group's finest scale; their
+    common row space holds the shared exponentials. Coefficients are then the
+    per-pole linear projection of the single-pole construction, with the same
+    sampled-error and coefficient-mass acceptance.
+    """
+    if previous is not None and len(previous):
+        fits, _, _ = _fits(lo, hi, poles, previous, tol, decay_rate)
+        if fits is not None:
+            return previous, fits
+    eta = float(poles.imag.min())
     origin = 0. if decay_rate else lo
     span = max(abs(lo), abs(hi))/eta if decay_rate else (hi-lo)/eta
-    zp = (pole-origin)/eta
-    geometry = max(span, 8*max(zp.real, 0.))
+    zps = (poles-origin)/eta
+    geometry = max(span, 8*max(float(zps.real.max()), 0.))
     # Resolve the reciprocal and its square before taking the shift pencil:
     # principal-log modes stop at pi/step; their tails decay as t*exp(-t).
     horizon = -np.log(tol) + np.log(-np.log(tol)) + 6.
     size = max(800, int(np.ceil((geometry + 16.)*horizon/(2*np.pi))))
-    best = [float("inf"), None]
-    def accept(t):
-        if decay_rate and np.any(t.real > decay_rate):
-            return None, False
-        fit = _project(lo, hi, pole, t, decay_rate)
-        error = np.inf if fit is None else np.max(fit[1]*[1., eta/(2*abs(pole))])
-        if error < best[0]:
-            best[:] = [float(error), (len(t), fit[1], fit[2])]
-        accurate = error <= tol and np.isfinite(fit[2]).all()
-        if accurate and fit[2][0] <= _RESPONSE_MAX_KAPPA:
-            return (t, fit[0], fit[1]), False
-        return None, accurate
-    if previous is not None:
-        got, _ = accept(previous)
-        if got is not None:
-            return got
     ids = np.arange(size)
     for padding, flatten in ((0., 1.), (2., .9), (4., .9), (8., 1.), (10., 1.), (16., .9)):
         # A short interval ending near the resonance gives growing modes.
         # Extend only the proposal geometry; fit/check the physical interval.
         step = (geometry+padding)/(2*size)
-        center = -padding+(ids[:, None]+ids[None, :])*step-zp
-        u, s, vh = la.svd(1/center, full_matrices=False, check_finite=False)
-        shift = u[:, :RESPONSE_RULE_CAPACITY].conj().T@(1/(center+step))@vh[:RESPONSE_RULE_CAPACITY].conj().T
-        for n in range(8, RESPONSE_RULE_CAPACITY + 1, 4):
+        base = -padding+(ids[:, None]+ids[None, :])*step
+        blocks, shifted = [], []
+        for zp in zps:
+            block = 1/(base-zp)
+            scale = 1/la.norm(block)
+            blocks.append(scale*block)
+            shifted.append(scale/(base+step-zp))
+        u, s, vh = la.svd(np.hstack(blocks), full_matrices=False, check_finite=False)
+        rank = min(RESPONSE_RULE_CAPACITY, len(s))
+        shift = u[:, :rank].conj().T@np.hstack(shifted)@vh[:rank].conj().T
+        best, best_n = np.inf, 0
+        for n in range(8, rank + 1, 4):
             roots = la.eigvals(shift[:n, :n]/np.sqrt(s[:n, None]*s[None, :n]),
                               check_finite=False)
             with np.errstate(divide='ignore', invalid='ignore'):
@@ -93,41 +130,82 @@ def _primitive(lo, hi, pole, tol, previous=None, decay_rate=0.):
                 times = times[times.real <= decay_rate]
             if not len(times):
                 continue
-            got, mass_rejected = accept(times)
-            if got is not None:
-                return got
+            fits, error, mass_rejected = _fits(lo, hi, poles, times, tol, decay_rate)
+            if fits is not None:
+                return times, fits
             if mass_rejected:
                 break  # Try the next padding/flattening geometry, not more cancelling terms.
-    raise ValueError(f'response exponential fit failed: interval={lo, hi}, pole={pole}, tolerance={tol}, best={best}')
+            if error < best/10:
+                best, best_n = error, n
+            elif n - best_n >= _STAGNATION_NODES:
+                break  # No decade of accuracy in this many more exponentials.
+    return None
 
 
-def response_frequency_rule(lo_ry, hi_ry, z_ry, *, rel_tol=1e-8, previous=None,
-                            decay_rate=0.):
-    """Return independent forward/backward nodes and value/ds coefficients.
+def _rule(lo, hi, z, times, fits, poles):
+    """Scatter shared-node pole fits into forward and reverse sample rows."""
+    count = len(times)
+    t = np.zeros(RESPONSE_RULE_CAPACITY, complex)
+    t[:count] = times
+    shape = (len(z), 2, RESPONSE_RULE_CAPACITY)
+    value, derivative = np.zeros(shape, complex), np.zeros(shape, complex)
+    errors, mass = np.zeros((len(z), 2, 2)), np.zeros((len(z), 2, 2))
+    for j, point in enumerate(z):
+        forward = fits[int(np.argmin(abs(poles - point)))]
+        reverse = fits[int(np.argmin(abs(poles + point.conjugate())))]
+        # Forward nodes at t fit 1/(d-z); reverse nodes at conj(t) fit
+        # 1/(d+z), the conjugate of the -conj(z) fit on t.
+        sides = ((forward[0], forward[1]), (np.conj(reverse[0]), reverse[1]))
+        for side, (coefficient, fit_error) in enumerate(sides):
+            value[j, side, :count] = coefficient[:, 0]
+            derivative[j, side, :count] = (1 if side == 0 else -1)*coefficient[:, 1]/(2*point)
+            errors[j, side] = [fit_error[0], fit_error[1]*abs(point.imag/(2*point))]
+            mass[j, side] = [point.imag*np.sum(abs(value[j, side])),
+                             point.imag**3*np.sum(abs(derivative[j, side]))]
+    return dict(t=t, value=value, derivative=derivative, count=count,
+                sampled_error=errors, coefficient_mass=mass)
 
-    Arrays have fixed capacity [2,RESPONSE_RULE_CAPACITY]; zero coefficient entries do no spatial
-    work. Each exponential is exp[-(d-reference_ry)*t]. A positive decay_rate
-    bounds occupation products by min(1,exp(decay_rate*d)); errors then use
-    that envelope and 0<=Re(t)<=decay_rate. This adds no occupation discard
-    to the caller's support policy.
-    Bounds are sampled, not proven.
+
+def response_group_rules(lo_ry, hi_ry, z_ry, *, rel_tol=1e-8, previous=None,
+                         decay_rate=0.):
+    """Shared complex-time rules for a group of response samples.
+
+    Every node t is ONE Green-pair evaluation A(t): forward rows use the
+    exponential exp[-(d-reference_ry)*t] and fit 1/(d-z); reverse rows use
+    conj(A(t)), i.e. the exponential at conj(t), and fit 1/(d+z). A group
+    whose shared fit fails is split in halves, down to single samples, so
+    no sample is ever evaluated with more nodes than its own rule needs.
+
+    Returns a list of rules. Each has ``members`` (indices into ``z_ry``),
+    ``t[RESPONSE_RULE_CAPACITY]``, ``value``/``derivative`` of shape
+    ``[members, 2 (forward, reverse), RESPONSE_RULE_CAPACITY]`` (value and
+    d/d(z^2)), ``count``, ``sampled_error`` and ``coefficient_mass``
+    ``[members, 2, 2]``, and ``reference_ry``. ``previous`` is a list of
+    earlier rules; one whose members match is tried first. A positive
+    decay_rate bounds occupation products by min(1,exp(decay_rate*d)); errors
+    then use that envelope and 0<=Re(t)<=decay_rate. Bounds are sampled, not
+    proven.
     """
-    lo, hi, z = float(lo_ry), float(hi_ry), complex(z_ry)
-    if not np.isfinite([lo, hi, z.real, z.imag, rel_tol, decay_rate]).all() or decay_rate < 0 or hi <= lo or z.imag <= 0 or not 1e-13 <= rel_tol < .1:
+    lo, hi = float(lo_ry), float(hi_ry)
+    z = np.asarray(z_ry, dtype=np.complex128).reshape(-1)
+    if (not z.size or not np.isfinite([lo, hi, rel_tol, decay_rate]).all()
+            or not np.isfinite(z).all() or decay_rate < 0 or hi <= lo
+            or np.any(z.imag <= 0) or not 1e-13 <= rel_tol < .1):
         raise ValueError('invalid response frequency/domain/tolerance')
-    times = np.zeros((2, RESPONSE_RULE_CAPACITY), complex)
-    value, derivative = np.zeros_like(times), np.zeros_like(times)
-    errors, counts = [], []
-    for i, pole in enumerate((z, -z)):
-        old = None if previous is None else previous[i][np.abs(previous[i]) > 0]
-        t, c, err = _primitive(lo, hi, pole, rel_tol/2, old, decay_rate)
-        counts.append(len(t))
-        times[i, :len(t)] = t
-        value[i, :len(t)] = c[:, 0]
-        derivative[i, :len(t)] = (1 if i == 0 else -1)*c[:, 1]/(2*z)
-        errors.append([err[0], err[1]*abs(z.imag/(2*z))])
-    return dict(t=times, value=value, derivative=derivative,
-                reference_ry=0. if decay_rate else lo,
-                coefficient_mass=np.column_stack((z.imag*np.sum(abs(value),axis=1),
-                    z.imag**3*np.sum(abs(derivative),axis=1))),
-                counts=np.asarray(counts), sampled_error=np.asarray(errors))
+    reference = 0. if decay_rate else lo
+    old = {tuple(rule["members"]): rule["t"][:rule["count"]]
+           for rule in (previous or ())}
+
+    def build(members):
+        poles = _poles(z[members])
+        got = _shared_times(lo, hi, poles, rel_tol/2, old.get(tuple(members)), decay_rate)
+        if got is not None:
+            rule = _rule(lo, hi, z[members], *got, poles)
+            return [dict(rule, members=list(members), reference_ry=reference)]
+        if len(members) == 1:
+            raise ValueError(f'response exponential fit failed: interval={lo, hi}, '
+                             f'sample={z[members[0]]}, tolerance={rel_tol}')
+        half = len(members)//2
+        return build(members[:half]) + build(members[half:])
+
+    return build(list(range(len(z))))

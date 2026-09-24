@@ -23,37 +23,42 @@ def check(a, b):
     assert error < 2e-10, error
     return error
 n, nk, nb = 8, 8, 8
+grid = (4, 2, 1)
 energy = np.broadcast_to(np.linspace(-1.,2.,nb),(nk,nb)).copy()
 f = 1/(1+np.exp(energy/.3))
 f[:,:2] = 1.
 f[:,6:] = 0.
 refs = np.array([0.,0.])
+# Shared nodes: row 0 weights A(t) at q, row 1 weights conj(A(t)) at -q.
 t = np.array([.13+.27j, .41-.11j, 0.])
-c = np.array([[.3+.2j,-.7+.1j,0.], [-.2+.4j,.1-.3j,0.]])
-reverse = np.array([False,True,False])
+c = np.array([[[.3+.2j,-.7+.1j,0.], [-.2+.4j,.1-.3j,0.]],
+              [[.05-.3j,.2+.6j,0.], [.4+.1j,-.15-.25j,0.]]])
+coords = np.unravel_index(np.arange(nk), grid)
+negative = np.ravel_multi_index(tuple((-x) % m for x, m in zip(coords, grid)), grid)
+assert np.any(negative != np.arange(nk))   # the reverse rows are really -q rows
 for ns in (2,4):
     bare = (rng.normal(size=(nk,ns,n,nb))+1j*rng.normal(size=(nk,ns,n,nb)))/8
     current = bare if ns == 2 else bare[:,::-1].copy()*np.array([1,1j,-1,-1j])[None,:,None,None]
     br, cr = bare.transpose(0,3,1,2), current.transpose(0,3,1,2)
     expected=np.zeros((2,nk,n,n),complex)
     def fft(a):
-        return np.fft.fftn(a.reshape((2,2,2)+a.shape[1:]),axes=(0,1,2),norm='ortho').reshape(a.shape)
+        return np.fft.fftn(a.reshape(grid+a.shape[1:]),axes=(0,1,2),norm='ortho').reshape(a.shape)
     def green(psi,weight,tau,ref):
         return np.einsum('kamj,kj,kbnj->kmanb',psi,weight*np.exp(-(energy-ref)*tau),psi.conj())
-    for time,coef,rev in zip(t,c.T,reverse):
-        tau=time.conjugate() if rev else time
-        upper=fft(green(current,1-f,tau,refs[1]))
-        lower=fft(green(bare,f,-tau.conjugate(),refs[0]))
-        product=np.einsum('kmanb,kmanb->kmn',upper,lower.conj())
-        expected+=coef[:,None,None,None]*fft(product.conj() if rev else product)[None]
-    # Every q is its own negative on this 2x2x2 oracle grid.
+    for node,time in enumerate(t):
+        upper=fft(green(current,1-f,time,refs[1]))
+        lower=fft(green(bare,f,-time.conjugate(),refs[0]))
+        transform=fft(np.einsum('kmanb,kmanb->kmn',upper,lower.conj()))
+        # ordered=True returns the physical row -q; the reverse rows are then q.
+        expected+=c[0,:,node,None,None,None]*transform[negative][None]
+        expected+=c[1,:,node,None,None,None]*transform.conj()[None]
     for layout,bounds in [('face',None),('axis',None),('axis',((0,6),(2,8)))]:
         sn, sm = psi_specs(layout)
-        args = ((put(t),put(reverse)),put(c),
+        args = (put(t),put(c),
             put(bare,sm) if ns==2 else (put(bare,sm),put(current,sm)),
             put(br,sn) if ns==2 else (put(br,sn),put(cr,sn)),
             put(energy),put(f),put(1-f),put(refs))
-        kernel = _get_chi_fractional_contour_kernel_face(mesh,(2,2,2),2,(nk,nb,n,ns),
+        kernel = _get_chi_fractional_contour_kernel_face(mesh,grid,2,(nk,nb,n,ns),
             selected_q=tuple(range(nk)),pair_mode='direct',ordered=True,vertex=ns==4,
             bank_carry=True,layout=layout,band_ranges=bounds)
         carry=put(np.zeros_like(expected),P(None,None,'x','y'))
@@ -64,16 +69,19 @@ for ns in (2,4):
             print(f'PASS complex-time ns={ns} {layout=} {bounds=} max_error={error:.3e} memory={executable.memory_analysis()}',flush=True)
 # A scalar fit on a metallic interval checks values and analytic ds independently.
 if stack.process_index == 0:
-    z=.7+.2j
-    rule=minimax.response_frequency_rule(-.2,1.,z)
+    # One group: every member's forward (t) and reverse (conj t) rows.
+    z=np.array([.7+.2j,.3+.2j,.45j])
     d=np.linspace(-.2,1.,10001)
-    for i,pole in enumerate((z,-z)):
-        basis=np.exp(-(d[:,None]+.2)*rule['t'][i])
-        err=np.max(abs(basis@rule['value'][i]-1/(d-pole)))*z.imag
-        ds=(1 if i==0 else -1)/(2*z*(d-pole)**2)
-        derr=np.max(abs(basis@rule['derivative'][i]-ds))*z.imag**3
-        assert max(err,derr)<1e-8,(err,derr)
-        print(f'PASS scalar primitive={i} nodes={rule["counts"][i]} value={err:.3e} ds={derr:.3e}',flush=True)
+    for rule in minimax.response_group_rules(-.2,1.,z):
+        m=rule['count']
+        for row,sample in enumerate(rule['members']):
+            for side,(pole,times) in enumerate(((z[sample],rule['t'][:m]),(-z[sample],np.conj(rule['t'][:m])))):
+                basis=np.exp(-(d[:,None]+.2)*times)
+                err=np.max(abs(basis@rule['value'][row,side,:m]-1/(d-pole)))*z[sample].imag
+                ds=(1 if side==0 else -1)/(2*z[sample]*(d-pole)**2)
+                derr=np.max(abs(basis@rule['derivative'][row,side,:m]-ds))*z[sample].imag**3
+                assert max(err,derr)<1e-8,(err,derr)
+        print(f'PASS scalar group members={rule["members"]} nodes={m} value+ds<1e-8',flush=True)
     # Physical occupation products, including negative differences, against
     # exact denominators; no small occupations are removed for this check.
     eps=np.linspace(-.5,.5,32)
@@ -83,16 +91,16 @@ if stack.process_index == 0:
     weight=occ[:,None]*(1-occ)[None,:]
     assert np.all(weight <= amp*np.exp(np.minimum(beta*delta,0.))*(1+1e-14))
     z=.3+.19j
-    rule=minimax.response_frequency_rule(-1.,1.,z,decay_rate=beta)
-    for i,pole in enumerate((z,-z)):
-        t=rule['t'][i]
+    (rule,)=minimax.response_group_rules(-1.,1.,[z],decay_rate=beta)
+    m=rule['count']
+    for side,(pole,t) in enumerate(((z,rule['t'][:m]),(-z,np.conj(rule['t'][:m])))):
         basis=np.exp(-delta[...,None]*t)*weight[...,None]
-        error=np.max(abs(basis@rule['value'][i]-weight/(delta-pole)))*z.imag
-        exact=weight*(1 if i==0 else -1)/(2*z*(delta-pole)**2)
-        slope=np.max(abs(basis@rule['derivative'][i]-exact))*z.imag**3
+        error=np.max(abs(basis@rule['value'][0,side,:m]-weight/(delta-pole)))*z.imag
+        exact=weight*(1 if side==0 else -1)/(2*z*(delta-pole)**2)
+        slope=np.max(abs(basis@rule['derivative'][0,side,:m]-exact))*z.imag**3
         assert max(error,slope)<1e-8,(error,slope)
         assert np.all((t.real>=0)&(t.real<=beta))
-        print(f'PASS weighted scalar primitive={i} nodes={rule["counts"][i]} value={error:.3e} ds={slope:.3e}',flush=True)
+        print(f'PASS weighted scalar side={side} nodes={m} value={error:.3e} ds={slope:.3e}',flush=True)
     import runpy
     from pathlib import Path
     oracle=runpy.run_path(str(Path(__file__).resolve().parents[1]/'test_response_occupation_rule.py'))

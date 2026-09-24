@@ -495,6 +495,10 @@ def _get_chi_fractional_contour_kernel_face(
     ``selected_q`` selects canonical full-grid q rows before accumulation and
     returns ``[parent, output, mu_x, mu_y]`` at ``P(None,None,'x','y')``;
     ``pair_mode="laplace"`` accumulates the remote Laplace-cell correlation.
+    ``pair_mode="direct"`` takes shared complex times ``t[n]`` and weights
+    ``projection_rows[2, n_out, n]``: each node is ONE Green pair A(t); row 0
+    weights A(t) at q, row 1 weights conj(A(t)) at -q, which is the reverse
+    orientation at time conj(t).
 
     Orientation. With ``FT_q[f](mu,nu) = sum_R f(r_mu, r_nu+R) e^{iq.R}`` (the
     transform under which Sigma's ``G_{k-q} W_q`` contraction is exact), the
@@ -552,17 +556,22 @@ def _get_chi_fractional_contour_kernel_face(
     if vertex and (not physical or k_unfold_plan is not None):
         raise ValueError("GATE response_vertex: current carriers require ordered "
                          "full-k endpoints, with vertices applied after symmetry unfold")
+    def negate(rows):
+        coords = np.unravel_index(np.asarray(rows), grid)
+        return tuple(int(i) for i in np.ravel_multi_index(
+            tuple((-c) % n for c, n in zip(coords, grid)), grid))
+
     gather_q = selected_q
     negate_full_q = None
     if physical:
-        rows = np.arange(nk) if selected_q is None else np.asarray(selected_q)
-        coords = np.unravel_index(rows, grid)
-        negated = tuple(int(i) for i in np.ravel_multi_index(
-            tuple((-c) % n for c, n in zip(coords, grid)), grid))
+        negated = negate(np.arange(nk) if selected_q is None else selected_q)
         if selected_q is None:
             negate_full_q = negated
         else:
             gather_q = negated
+    # A direct node's reverse orientation is conj(A(t)); its q rows are the
+    # conjugated -q rows of the same transform (FFT[conj a](q) = conj FFT[a](-q)).
+    reverse_q = None if gather_q is None else negate(gather_q)
     selected_shard = NamedSharding(mesh_xy, P(None, None, "x", "y"))
     nk_shape, nb_full, n_rmu, ns = (int(v) for v in face_shape)
     # Raw-parent transport (``k_unfold_plan``): the two G's are contracted
@@ -775,18 +784,20 @@ def _get_chi_fractional_contour_kernel_face(
             return jax.lax.cond(window == 0, crossing, remote, None), None
 
         def direct_body(accumulators, node):
-            time, projection, reverse = node
+            time, forward, reverse = node
             def add(acc):
-                # A(t)=Gu(t) conj(Gf(conj(t))); the reverse product is
-                # conj(A(conj(t))), not conj(A(t)). green_k owns its own
-                # physical/incumbent conjugation convention.
-                tau = jnp.where(reverse, jnp.conj(time), time)
-                value = spin_correlation(occ_f, -tau, energy_reference[0],
-                    occ_u, jnp.conj(tau), energy_reference[1])
-                value = jnp.where(reverse, jnp.conj(value), value)
-                return accumulate_selected(acc, selected(value), projection)
-            return jax.lax.cond(jnp.any(projection != 0), add, lambda acc: acc,
-                                accumulators), None
+                # ONE Green pair A(t)=Gu(t) conj(Gf(conj(t))) per node serves
+                # both orientations: the reverse product at time conj(t) is
+                # conj(A(t)), read from the -q rows of the same transform.
+                # green_k owns its own physical/incumbent conjugation.
+                value = chi_fftn(spin_correlation(occ_f, -time, energy_reference[0],
+                    occ_u, jnp.conj(time), energy_reference[1]))
+                acc = accumulate_selected(
+                    acc, jnp.take(value, jnp.asarray(gather_q), axis=0), forward)
+                return accumulate_selected(
+                    acc, jnp.conj(jnp.take(value, jnp.asarray(reverse_q), axis=0)), reverse)
+            return jax.lax.cond(jnp.any(forward != 0) | jnp.any(reverse != 0), add,
+                                lambda acc: acc, accumulators), None
 
         def body(accumulators, node):
             time, projection = node
@@ -810,8 +821,10 @@ def _get_chi_fractional_contour_kernel_face(
             )
             return updated, None
 
-        nodes = ((time_nodes[0], projection_rows.T, time_nodes[1])
-                 if pair_mode in ("windowed", "direct") else (time_nodes, projection_rows.T))
+        nodes = ((time_nodes, projection_rows[0].T, projection_rows[1].T)
+                 if pair_mode == "direct" else
+                 (time_nodes[0], projection_rows.T, time_nodes[1])
+                 if pair_mode == "windowed" else (time_nodes, projection_rows.T))
         final_R, _ = jax.lax.scan(
             (direct_body if pair_mode == "direct" else window_body)
             if pair_mode in ("windowed", "direct") else body, initial, nodes, unroll=1)
