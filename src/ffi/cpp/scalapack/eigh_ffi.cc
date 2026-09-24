@@ -41,6 +41,7 @@
 // host_collective_mutex() (cpp/slate/ctx.h) exactly like the slate host
 // handlers and scalapack solve_lu — they share the same comms.
 
+#include "../common/ctx_registry.h"
 #include <algorithm>
 #include <complex>
 #include <cstdint>
@@ -274,8 +275,9 @@ static ffi::Error EighDispatch(
     ffi::Result<ffi::AnyBuffer> W_out,
     ffi::Result<ffi::AnyBuffer> Z_out,
     int64_t nq, int64_t n, int64_t g,
-    int64_t ctx_handle)
+    int64_t ctx_key)
 {
+    const int64_t ctx_handle = ::lorrax_ffi::ctx_registry::resolve(ctx_key, "slate");
     auto* ctx = reinterpret_cast<SlateCtx*>(ctx_handle);
     if (ctx == nullptr) {
         return ffi::Error(ffi::ErrorCode::kInvalidArgument,
@@ -358,4 +360,4 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Attr<int64_t>("nq")
         .Attr<int64_t>("n")
         .Attr<int64_t>("g")              // square block: N / max(Px, Py)
-        .Attr<int64_t>("ctx_handle"));   // SlateCtx (shared with ffi.slate)
+        .Attr<int64_t>("ctx_key"));   // SlateCtx (shared with ffi.slate)

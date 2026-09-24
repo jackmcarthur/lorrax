@@ -25,6 +25,7 @@
 // validates; on those meshes block-cyclic == JAX's contiguous shards).
 // A is factored in place (donated by the wrapper); ipiv stays internal.
 
+#include "../common/ctx_registry.h"
 #include <complex>
 #include <cstdint>
 #include <cstring>
@@ -179,8 +180,9 @@ static ffi::Error SolveLuDispatch(
     ffi::Result<ffi::AnyBuffer> X_out,
     int64_t nq, int64_t n, int64_t nrhs,
     int64_t g, int64_t nb_b,
-    int64_t ctx_handle)
+    int64_t ctx_key)
 {
+    const int64_t ctx_handle = ::lorrax_ffi::ctx_registry::resolve(ctx_key, "slate");
     auto* ctx = reinterpret_cast<SlateCtx*>(ctx_handle);
     if (ctx == nullptr) {
         return ffi::Error(ffi::ErrorCode::kInvalidArgument,
@@ -257,4 +259,4 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Attr<int64_t>("nrhs")
         .Attr<int64_t>("g")              // square block: N / max(Px, Py)
         .Attr<int64_t>("nb_b")           // B col block: NRHS/Py (or NRHS if Py==1)
-        .Attr<int64_t>("ctx_handle"));   // SlateCtx (shared with ffi.slate)
+        .Attr<int64_t>("ctx_key"));   // SlateCtx (shared with ffi.slate)

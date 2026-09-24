@@ -32,7 +32,7 @@ from jax.sharding import Mesh, PartitionSpec as P
 from distrib_la._shard_map import shard_map
 from distrib_la._shape import ipiv_local_len
 from distrib_la._slate import (_mesh_key, ensure_registered,
-                               get_or_init_context, validate_mesh)
+                               context_key, validate_mesh)
 
 __all__ = [
     "batched_distributed_matmul",
@@ -131,7 +131,7 @@ def batched_distributed_matmul(
             raise ValueError(
                 f"scalapack matmul {name}={dim} not divisible by {divisor}")
     ensure_registered(mesh)
-    ctx = get_or_init_context(mesh)
+    ctx_key = context_key(mesh)
     alpha, beta = complex(alpha), complex(beta)
     attrs = dict(
         nq=nq, m=m, n=n, k=ka,
@@ -143,9 +143,9 @@ def batched_distributed_matmul(
         transb={"N": 0, "T": 1, "C": 2}[transb],
         alpha_re=float(alpha.real), alpha_im=float(alpha.imag),
         beta_re=float(beta.real), beta_im=float(beta.imag),
-        ctx_handle=int(ctx))
+        ctx_key=int(ctx_key))
     key = ("scalapack_gemm", _mesh_key(mesh), A.dtype, A.shape, B.shape,
-           C.shape, transa, transb, alpha, beta, int(ctx))
+           C.shape, transa, transb, alpha, beta, int(ctx_key))
     fn = _JIT_CACHE.get(key)
     if fn is None:
         local_out_t = jax.ShapeDtypeStruct((nq, n // py, m // px), C.dtype)
@@ -217,12 +217,12 @@ def batched_distributed_eigh(
         raise ValueError(f"N={n} must be divisible by max(Px,Py)={gmax}.")
 
     ensure_registered(mesh)
-    ctx_handle = get_or_init_context(mesh)
+    ctx_key = context_key(mesh)
 
     g = n // gmax                      # square block (MB_A == NB_A)
 
     key = ("scalapack_eigh", _mesh_key(mesh), A.dtype, nq, n, g,
-           int(ctx_handle))
+           int(ctx_key))
     jit_eigh = _JIT_CACHE.get(key)
     if jit_eigh is None:
         W_out = jax.ShapeDtypeStruct((nq, n), jnp.float64)
@@ -230,7 +230,7 @@ def batched_distributed_eigh(
         # bytes of the per-rank block of Zᵀ; assembled at P(None,'y','x')
         # then locally untransposed (same trick as the slate eigh).
         Z_local_T = jax.ShapeDtypeStruct((nq, n // Py, n // Px), A.dtype)
-        attrs = dict(nq=nq, n=n, g=g, ctx_handle=int(ctx_handle))
+        attrs = dict(nq=nq, n=n, g=g, ctx_key=int(ctx_key))
 
         @partial(shard_map, mesh=mesh,
                  in_specs=P(None, "x", "y"),
@@ -368,17 +368,17 @@ def batched_distributed_getrf(
     """
     Px, Py, nq, n, g = _validate_lu_geometry(A, mesh, what="getrf")
     ensure_registered(mesh)
-    ctx_handle = get_or_init_context(mesh)
+    ctx_key = context_key(mesh)
     ipiv_len = ipiv_local_len(n, Px, g)
 
     key = ("scalapack_getrf", _mesh_key(mesh), A.dtype,
-           nq, n, g, int(ctx_handle))
+           nq, n, g, int(ctx_key))
     jit_getrf = _JIT_CACHE.get(key)
     if jit_getrf is None:
         LU_local_T = jax.ShapeDtypeStruct((nq, n // Py, n // Px), A.dtype)
         ipiv_local = jax.ShapeDtypeStruct((nq, ipiv_len), jnp.int32)
         attrs = dict(nq=nq, n=n, g=g, ipiv_len=ipiv_len,
-                     ctx_handle=int(ctx_handle))
+                     ctx_key=int(ctx_key))
 
         @partial(shard_map, mesh=mesh,
                  in_specs=(P(None, "x", "y"),),
@@ -435,16 +435,16 @@ def batched_distributed_getrs(
         raise ValueError(f"NRHS={nrhs} must be divisible by Py={Py}.")
 
     ensure_registered(mesh)
-    ctx_handle = get_or_init_context(mesh)
+    ctx_key = context_key(mesh)
     nb_b = nrhs // Py if Py > 1 else nrhs
 
     key = ("scalapack_getrs", _mesh_key(mesh), LU.dtype,
-           nq, n, nrhs, g, nb_b, int(ctx_handle))
+           nq, n, nrhs, g, nb_b, int(ctx_key))
     jit_getrs = _JIT_CACHE.get(key)
     if jit_getrs is None:
         X_local_T = jax.ShapeDtypeStruct((nq, nrhs // Py, n // Px), B.dtype)
         attrs = dict(nq=nq, n=n, nrhs=nrhs, g=g, nb_b=nb_b,
-                     ipiv_len=ipiv_len, ctx_handle=int(ctx_handle))
+                     ipiv_len=ipiv_len, ctx_key=int(ctx_key))
 
         @partial(shard_map, mesh=mesh,
                  in_specs=(P(None, "x", "y"), P(None, ("x", "y")),
@@ -511,18 +511,18 @@ def batched_distributed_solve_lu(
         raise ValueError(f"NRHS={nrhs} must be divisible by Py={Py}.")
 
     ensure_registered(mesh)
-    ctx_handle = get_or_init_context(mesh)
+    ctx_key = context_key(mesh)
 
     g = n // gmax                      # square block (MB_A == NB_A)
     nb_b = nrhs // Py if Py > 1 else nrhs
 
     key = ("scalapack_lu", _mesh_key(mesh), A.dtype,
-           nq, n, nrhs, g, nb_b, int(ctx_handle))
+           nq, n, nrhs, g, nb_b, int(ctx_key))
     jit_solve = _JIT_CACHE.get(key)
     if jit_solve is None:
         X_local_T = jax.ShapeDtypeStruct((nq, nrhs // Py, n // Px), B.dtype)
         attrs = dict(nq=nq, n=n, nrhs=nrhs, g=g, nb_b=nb_b,
-                     ctx_handle=int(ctx_handle))
+                     ctx_key=int(ctx_key))
 
         @partial(shard_map, mesh=mesh,
                  in_specs=(P(None, "x", "y"), P(None, "x", "y")),

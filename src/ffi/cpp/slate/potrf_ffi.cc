@@ -19,6 +19,7 @@
 //     L.conj().T (complex) to recover standard "lower triangular in
 //     JAX row-major" form.  Tests document the exact transform.
 
+#include "../common/ctx_registry.h"
 #include <complex>
 #include <cstdint>
 #include <cstdio>
@@ -126,8 +127,9 @@ static ffi::Error PotrfDispatch(
     ffi::AnyBuffer A,
     ffi::Result<ffi::AnyBuffer> L_out,
     int64_t n, int64_t nb,
-    int64_t ctx_handle)
+    int64_t ctx_key)
 {
+    const int64_t ctx_handle = ::lorrax_ffi::ctx_registry::resolve(ctx_key, "slate");
     auto* ctx = reinterpret_cast<lorrax_ffi::slate::SlateCtx*>(ctx_handle);
     if (ctx == nullptr) {
         return ffi::Error(ffi::ErrorCode::kInvalidArgument,
@@ -172,4 +174,4 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Ret<xla::ffi::AnyBuffer>()              // L (Cholesky factor, lower)
         .Attr<int64_t>("n")
         .Attr<int64_t>("nb")
-        .Attr<int64_t>("ctx_handle"));
+        .Attr<int64_t>("ctx_key"));

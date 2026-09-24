@@ -30,7 +30,7 @@ from distrib_la.resolve import mesh_key
 
 __all__ = [
     # context (was slate/context.py)
-    "ensure_registered", "get_or_init_context",
+    "ensure_registered", "get_or_init_context", "context_key",
     "validate_mesh", "validate_tile_layout",
     # single-matrix ops
     "SlateLowerL", "distributed_cholesky", "distributed_trsm",
@@ -189,8 +189,32 @@ def get_or_init_context(mesh: Mesh) -> int:
         if entry is not None:
             return entry[0]
         h = _make_ctx(mesh)
-        _CACHE[key] = (h, _mesh_platform(mesh))
+        plat = _mesh_platform(mesh)
+        _KEYS[("world",) + key] = loader.bind_context(plat, _ctx_config("world", key, plat), h)
+        _CACHE[key] = (h, plat)
         return h
+
+
+#: ("world" | "subrow", p, q) -> the context's FFI ``ctx_key``.
+_KEYS: dict = {}
+
+
+def _ctx_config(kind: str, key, platform: str) -> str:
+    """The canonical configuration string of a SLATE context (ScaLAPACK shares it)."""
+    p, q = key
+    return f"lorrax-ctx/v1|slate|{kind}|{p}x{q}|{platform}"
+
+
+def context_key(mesh: Mesh) -> int:
+    """The FFI ``ctx_key`` attribute of this mesh's SLATE context (see
+    ``distrib_la.loader.context_key``): a pure function of the configuration."""
+    get_or_init_context(mesh)
+    return _KEYS[("world",) + validate_mesh(mesh)]
+
+
+def _subrow_context_key(mesh: Mesh) -> int:
+    _get_or_init_subrow_context(mesh)
+    return _KEYS[("subrow",) + validate_mesh(mesh)]
 
 
 def _make_subrow_ctx(mesh: Mesh) -> int:
@@ -224,14 +248,17 @@ def _get_or_init_subrow_context(mesh: Mesh) -> int:
         if entry is not None:
             return entry[0]
         h = _make_subrow_ctx(mesh)
-        _SUBROW_CACHE[key] = (h, _mesh_platform(mesh))
+        plat = _mesh_platform(mesh)
+        _KEYS[("subrow",) + key] = loader.bind_context(plat, _ctx_config("subrow", key, plat), h)
+        _SUBROW_CACHE[key] = (h, plat)
         return h
 
 
 def _atexit_teardown() -> None:
-    for cache in (_CACHE, _SUBROW_CACHE):
-        for _, (h, plat) in list(cache.items()):
+    for kind, cache in (("world", _CACHE), ("subrow", _SUBROW_CACHE)):
+        for k, (h, plat) in list(cache.items()):
             try:
+                loader.unbind_context(plat, _KEYS.pop((kind,) + k, 0))
                 loader.destroy_slate_context(int(h), platform=plat)
             except Exception:                                  # noqa: BLE001
                 pass
@@ -319,7 +346,7 @@ def distributed_cholesky(
             f"axes ({p},{q}).")
 
     ensure_registered(mesh)
-    ctx_handle = get_or_init_context(mesh)
+    ctx_key = context_key(mesh)
 
     # Default tile size divides by the larger grid axis so each rank
     # still holds >=1 tile along both directions.
@@ -334,7 +361,7 @@ def distributed_cholesky(
     # on the C++ side (context.cc), SLATE assembles the global A
     # correctly for any p x q mesh.
     L_local_T = jax.ShapeDtypeStruct((n // q, n // p), A.dtype)
-    attrs = dict(n=n, nb=nb, ctx_handle=int(ctx_handle))
+    attrs = dict(n=n, nb=nb, ctx_key=int(ctx_key))
 
     @partial(shard_map, mesh=mesh,
              in_specs=P("x", "y"), out_specs=P("y", "x"),
@@ -444,7 +471,7 @@ def distributed_trsm(
             f"({p},{q}) along (rows, cols)")
 
     ensure_registered(mesh)
-    ctx_handle = get_or_init_context(mesh)
+    ctx_key = context_key(mesh)
     nb = n // max(p, q) if block_size is None else int(block_size)
     validate_tile_layout(n, nb, p, q, what="distributed_trsm")
 
@@ -460,7 +487,7 @@ def distributed_trsm(
         side=_SIDE[side], uplo=_UPLO[uplo], op=_OP[op], diag=_DIAG[diag],
         alpha_re=float(alpha_c.real),
         alpha_im=float(alpha_c.imag),
-        ctx_handle=int(ctx_handle),
+        ctx_key=int(ctx_key),
     )
 
     # When A is a handle, A_arg is already P('y','x') sharded with
@@ -563,7 +590,7 @@ def distributed_eigh(
             f"distributed_eigh: n={n} must be divisible by mesh axis size {p}.")
 
     ensure_registered(mesh)
-    ctx_handle = get_or_init_context(mesh)
+    ctx_key = context_key(mesh)
 
     nb = n // p if block_size is None else int(block_size)
     validate_tile_layout(n, nb, p, q, what="distributed_eigh")
@@ -581,7 +608,7 @@ def distributed_eigh(
 
     attrs = dict(
         n=n, nb=nb,
-        ctx_handle=int(ctx_handle),
+        ctx_key=int(ctx_key),
         compute_evecs=bool(compute_evecs),
     )
 
@@ -702,7 +729,7 @@ def batched_distributed_matmul(
             raise ValueError(
                 f"slate matmul {name}={dim} not divisible by {divisor}")
     ensure_registered(mesh)
-    ctx = get_or_init_context(mesh)
+    ctx_key = context_key(mesh)
     alpha, beta = complex(alpha), complex(beta)
     attrs = dict(
         nq=nq, m=m, n=n, k=ka,
@@ -714,9 +741,9 @@ def batched_distributed_matmul(
         transb={"N": 0, "T": 1, "C": 2}[transb],
         alpha_re=float(alpha.real), alpha_im=float(alpha.imag),
         beta_re=float(beta.real), beta_im=float(beta.imag),
-        ctx_handle=int(ctx))
+        ctx_key=int(ctx_key))
     key = ("slate_gemm", _mesh_key(mesh), A.dtype, A.shape, B.shape,
-           C.shape, transa, transb, alpha, beta, int(ctx))
+           C.shape, transa, transb, alpha, beta, int(ctx_key))
     fn = _JIT_CACHE.get(key)
     if fn is None:
         local_out_t = jax.ShapeDtypeStruct((nq, n // py, m // px), C.dtype)
@@ -799,7 +826,7 @@ def batched_distributed_cholesky(
             f"mesh 'y' axis size {Py}.")
 
     ensure_registered(mesh)
-    ctx_handle = _get_or_init_subrow_context(mesh)
+    ctx_key = _subrow_context_key(mesh)
 
     nb_batch_local = nbatch // Px
     nb = n // Py if block_size is None else int(block_size)
@@ -808,7 +835,7 @@ def batched_distributed_cholesky(
                          allow_row_grid=True)
 
     key = ("potrf", _mesh_key(mesh), A.dtype,
-           nbatch, n, nb, int(ctx_handle))
+           nbatch, n, nb, int(ctx_key))
     jit_potrf = _JIT_CACHE.get(key)
     if jit_potrf is None:
         # Local transpose of the inner two dims: (Nb_local, N, N/Py) row-major
@@ -818,7 +845,7 @@ def batched_distributed_cholesky(
             (nb_batch_local, n // Py, n), A.dtype)
         attrs = dict(
             nbatch_local=nb_batch_local, n=n, nb=nb,
-            ctx_handle=int(ctx_handle),
+            ctx_key=int(ctx_key),
         )
 
         @partial(shard_map, mesh=mesh,
@@ -918,7 +945,7 @@ def batched_distributed_trsm(
             f"N={n}, M={m} must be divisible by mesh 'y' axis {Py}.")
 
     ensure_registered(mesh)
-    ctx_handle = _get_or_init_subrow_context(mesh)
+    ctx_key = _subrow_context_key(mesh)
     nbatch_local = nbatch // Px
     nb = n // Py if block_size is None else int(block_size)
     validate_tile_layout(n, nb, 1, Py, what="batched_distributed_trsm",
@@ -929,7 +956,7 @@ def batched_distributed_trsm(
            nbatch, n, m, nb,
            _SIDE[side], _UPLO[uplo], _OP[op], _DIAG[diag],
            float(alpha_c.real), float(alpha_c.imag),
-           int(ctx_handle))
+           int(ctx_key))
     jit_trsm = _JIT_CACHE.get(key)
     if jit_trsm is None:
         # Expected per-slice: (B.shape[1], B.shape[2]/Py) row-major → transpose
@@ -944,7 +971,7 @@ def batched_distributed_trsm(
             op=_OP[op], diag=_DIAG[diag],
             alpha_re=float(alpha_c.real),
             alpha_im=float(alpha_c.imag),
-            ctx_handle=int(ctx_handle),
+            ctx_key=int(ctx_key),
         )
 
         if A_is_handle:

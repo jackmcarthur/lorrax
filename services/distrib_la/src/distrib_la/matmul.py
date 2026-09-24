@@ -285,7 +285,7 @@ def _transpose_kernel(op, tile):
 
 def _cublasmp(mesh, A, B, C, *, alpha: complex, beta: complex,
               transa: str, transb: str):
-    from distrib_la._cusolvermp import get_or_init_context
+    from distrib_la._cusolvermp import context_key
 
     px, py = _mesh_shape(mesh)
     if transa != "N" or transb != "N":
@@ -307,7 +307,7 @@ def _cublasmp(mesh, A, B, C, *, alpha: complex, beta: complex,
     br, bc = int(B.shape[1]), int(B.shape[2])
     m, k = _op_shape((ar, ac), transa)
     _, n = _op_shape((br, bc), transb)
-    ctx = get_or_init_context(mesh, col_major=False)
+    ctx = context_key(mesh, col_major=False)
     attrs = dict(
         nq=nq, m=m, n=n, k=k,
         mb_a=ar // px, nb_a=ac // py, mb_b=br // px, nb_b=bc // py,
@@ -316,7 +316,7 @@ def _cublasmp(mesh, A, B, C, *, alpha: complex, beta: complex,
         transa=_OP_CODE[transa], transb=_OP_CODE[transb],
         alpha_re=float(alpha.real), alpha_im=float(alpha.imag),
         beta_re=float(beta.real), beta_im=float(beta.imag),
-        ctx_handle=int(ctx),
+        ctx_key=int(ctx),
     )
     key = (mesh_key(mesh), tuple(A.shape), tuple(B.shape), tuple(C.shape),
            str(A.dtype), transa, transb, alpha, beta, int(ctx))

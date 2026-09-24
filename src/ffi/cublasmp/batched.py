@@ -31,7 +31,7 @@ from jax.sharding import Mesh, PartitionSpec as P
 from runtime.padding import authenticate_padded_axis
 
 from ..common.ffi_loader import get_lib
-from ..cusolvermp.context import get_or_init_context
+from ..cusolvermp.context import context_key
 
 __all__ = ["batched_distributed_gemm", "batched_fused_w_solve",
            "batched_fused_w_solve_jit"]
@@ -147,7 +147,7 @@ def batched_distributed_gemm(
             "be integer — one tile per rank requirement")
 
     get_lib()
-    ctx_handle = get_or_init_context(mesh, col_major=False)
+    ctx_key = context_key(mesh, col_major=False)
 
     # Per-rank leading dimensions (= local rows) for each matrix, in the
     # col-major view after the inner transpose.
@@ -165,7 +165,7 @@ def batched_distributed_gemm(
     beta_c  = complex(beta)
 
     key = ("gemm", _mesh_key(mesh), A.dtype, A.shape, B.shape, C.shape,
-           transa, transb, alpha_c, beta_c, int(ctx_handle))
+           transa, transb, alpha_c, beta_c, int(ctx_key))
     jit_gemm = _JIT_CACHE.get(key)
     if jit_gemm is None:
         C_local_T = jax.ShapeDtypeStruct(
@@ -181,7 +181,7 @@ def batched_distributed_gemm(
             alpha_im=float(alpha_c.imag),
             beta_re=float(beta_c.real),
             beta_im=float(beta_c.imag),
-            ctx_handle=int(ctx_handle),
+            ctx_key=int(ctx_key),
         )
 
         @partial(shard_map, mesh=mesh,
@@ -280,12 +280,12 @@ def batched_fused_w_solve_jit(
             f"screening solver.")
 
     get_lib()
-    ctx_handle = get_or_init_context(mesh, col_major=False)
+    ctx_key = context_key(mesh, col_major=False)
 
     pref_c = complex(pref)
     stop_after_step = int(stop_after_step)
     key = ("w_solve", _mesh_key(mesh), dtype, nq, n,
-           pref_c, int(ctx_handle), stop_after_step)
+           pref_c, int(ctx_key), stop_after_step)
     jit_fn = _JIT_CACHE.get(key)
     if jit_fn is not None:
         return jit_fn
@@ -296,7 +296,7 @@ def batched_fused_w_solve_jit(
         nq=nq, n=n,
         pref_re=float(pref_c.real),
         pref_im=float(pref_c.imag),
-        ctx_handle=int(ctx_handle),
+        ctx_key=int(ctx_key),
         stop_after_step=stop_after_step,
     )
 

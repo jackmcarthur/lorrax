@@ -272,8 +272,8 @@ def _distribute(local, vector_sharding, *, native_collectives=False):
             target = probe_target('lorrax_active_subspace_distributed_ortho', 'CUDA')
             if not target.ok:
                 raise RuntimeError(f'distributed orthogonalization provider unavailable: {target}')
-            from distrib_la._cusolvermp import get_or_init_context
-            context = get_or_init_context(mesh, col_major=False)
+            from distrib_la._cusolvermp import context_key
+            context = context_key(mesh, col_major=False)
         else:
             for name in ('gram', 'subtract', 'subtract_gram'):
                 target = probe_target('lorrax_active_subspace_'+name, 'CUDA')

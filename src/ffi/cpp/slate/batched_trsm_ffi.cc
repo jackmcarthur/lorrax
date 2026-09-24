@@ -20,6 +20,7 @@
 // are exercised by the cholesky-solve callers; the handler still accepts
 // the full (side, uplo, op, diag) matrix for uniformity.
 
+#include "../common/ctx_registry.h"
 #include <complex>
 #include <cstdint>
 #include <cstdio>
@@ -168,8 +169,9 @@ static ffi::Error BatchedTrsmDispatch(
     int64_t nbatch_local, int64_t n, int64_t m, int64_t nb,
     int64_t side, int64_t uplo, int64_t op, int64_t diag,
     double alpha_re, double alpha_im,
-    int64_t ctx_handle)
+    int64_t ctx_key)
 {
+    const int64_t ctx_handle = ::lorrax_ffi::ctx_registry::resolve(ctx_key, "slate");
     auto* ctx = reinterpret_cast<lorrax_ffi::slate::SlateCtx*>(ctx_handle);
     if (ctx == nullptr) {
         return ffi::Error(ffi::ErrorCode::kInvalidArgument,
@@ -229,4 +231,4 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Attr<int64_t>("diag")
         .Attr<double>("alpha_re")
         .Attr<double>("alpha_im")
-        .Attr<int64_t>("ctx_handle"));
+        .Attr<int64_t>("ctx_key"));

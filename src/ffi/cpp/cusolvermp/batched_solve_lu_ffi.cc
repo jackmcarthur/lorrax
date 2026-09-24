@@ -45,6 +45,7 @@
 // cross-stream event.  cuSOLVERMp requires LOCr(M_A) + MB_A pivot entries
 // per rank, including the extra block used by distributed row interchanges.
 
+#include "../common/ctx_registry.h"
 #include <cctype>
 #include <complex>
 #include <cstdint>
@@ -442,8 +443,9 @@ static ffi::Error BatchedGetrfDispatch(
     ffi::Result<ffi::AnyBuffer> LU_out,
     ffi::Result<ffi::AnyBuffer> ipiv_out,
     int64_t nq, int64_t n, int64_t mb, int64_t nb, int64_t ipiv_len,
-    int64_t ctx_handle)
+    int64_t ctx_key)
 {
+    const int64_t ctx_handle = ::lorrax_ffi::ctx_registry::resolve(ctx_key, "cusolvermp");
     auto* ctx = reinterpret_cast<LorraxCusolverMpCtx*>(ctx_handle);
     if (ctx == nullptr)
         return ffi::Error(ffi::ErrorCode::kInvalidArgument,
@@ -487,8 +489,9 @@ static ffi::Error BatchedGetrsDispatch(
     ffi::AnyBuffer B, ffi::Result<ffi::AnyBuffer> X_out,
     int64_t nq, int64_t n, int64_t nrhs,
     int64_t mb_a, int64_t nb_a, int64_t mb_b, int64_t nb_b,
-    int64_t ipiv_len, int64_t ctx_handle)
+    int64_t ipiv_len, int64_t ctx_key)
 {
+    const int64_t ctx_handle = ::lorrax_ffi::ctx_registry::resolve(ctx_key, "cusolvermp");
     auto* ctx = reinterpret_cast<LorraxCusolverMpCtx*>(ctx_handle);
     if (ctx == nullptr)
         return ffi::Error(ffi::ErrorCode::kInvalidArgument,
@@ -538,8 +541,9 @@ static ffi::Error BatchedSolveLuDispatch(
     ffi::Result<ffi::AnyBuffer> X_out,
     int64_t nq, int64_t n, int64_t nrhs,
     int64_t mb_a, int64_t nb_a, int64_t mb_b, int64_t nb_b,
-    int64_t ctx_handle)
+    int64_t ctx_key)
 {
+    const int64_t ctx_handle = ::lorrax_ffi::ctx_registry::resolve(ctx_key, "cusolvermp");
     auto* ctx = reinterpret_cast<LorraxCusolverMpCtx*>(ctx_handle);
     if (ctx == nullptr) {
         return ffi::Error(ffi::ErrorCode::kInvalidArgument,
@@ -594,7 +598,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Attr<int64_t>("nb_a")
         .Attr<int64_t>("mb_b")
         .Attr<int64_t>("nb_b")
-        .Attr<int64_t>("ctx_handle"));
+        .Attr<int64_t>("ctx_key"));
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
     CusolverMpBatchedGetrfFfi,
@@ -609,7 +613,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Attr<int64_t>("mb")
         .Attr<int64_t>("nb")
         .Attr<int64_t>("ipiv_len")
-        .Attr<int64_t>("ctx_handle"));
+        .Attr<int64_t>("ctx_key"));
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
     CusolverMpBatchedGetrsFfi,
@@ -628,4 +632,4 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Attr<int64_t>("mb_b")
         .Attr<int64_t>("nb_b")
         .Attr<int64_t>("ipiv_len")
-        .Attr<int64_t>("ctx_handle"));
+        .Attr<int64_t>("ctx_key"));

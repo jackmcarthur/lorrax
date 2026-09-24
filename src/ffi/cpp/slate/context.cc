@@ -21,6 +21,7 @@
 
 #include "ctx.h"
 #include "../common/c_abi.h"
+#include "../common/ctx_registry.h"
 #include "../common/mpi_thread_guard.h"
 
 namespace lorrax_ffi::slate {
@@ -197,6 +198,8 @@ int64_t LRX_C_ENTRY(lrx_slate_subrow_context_create)(
 }
 
 void LRX_C_ENTRY(lrx_slate_context_destroy)(int64_t handle) {
+    // A cached executable run after teardown must refuse, not dereference.
+    lorrax_ffi::ctx_registry::forget_handle(handle);
     auto* ctx = reinterpret_cast<lorrax_ffi::slate::SlateCtx*>(handle);
     if (ctx == nullptr) return;
     if (ctx->owns_comm && ctx->comm != MPI_COMM_NULL) {

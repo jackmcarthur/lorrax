@@ -115,7 +115,7 @@ two-part shape: a ``shard_map`` that does nothing but hand the body its
 LOCAL per-rank tile, and a body — the transpose/``ffi_call``/transpose
 sequence below — that is pure local computation plus one collective FFI
 custom-call (the cuBLASMp handler does its OWN NCCL communication across
-the mesh via ``ctx_handle``, entirely inside the C++ layer; no JAX-level
+the mesh via ``ctx_key``, entirely inside the C++ layer; no JAX-level
 collective wraps it).  That body needs nothing from ``shard_map`` except
 being handed the right-shaped local array — which is exactly what a
 caller's OWN manual-mode body already has in hand.  So the obstacle is the
@@ -131,9 +131,10 @@ for this route: ``batched_gemm_ffi.cc`` builds and destroys its
 ``cublasMpMatrixDescriptor``/``cublasMpMatmulDescriptor`` handles FRESH on
 every FFI invocation (``BatchedGemmImpl``, read 2026-08-22) — the only
 state persisting across calls is ``ctx`` itself (the NCCL communicator +
-growable workspace buffer), addressed by the SAME ``ctx_handle`` integer
+growable workspace buffer), addressed by the SAME ``ctx_key`` integer
 :func:`gemm_plan` already resolved once, baked as a static attr into
-whichever call issues it.  A ``local_call`` invocation and an ``__call__``
+whichever call issues it (a hash of the context configuration, resolved to
+the live context by the native registry, so the module stays cacheable).  A ``local_call`` invocation and an ``__call__``
 invocation of the same plan therefore share the identical warmed
 communicator; there is nothing further to warm for the manual route.
 
@@ -207,7 +208,7 @@ def _same_layout(have, want: NamedSharding) -> bool:
             and getattr(have, "mesh", None) == want.mesh)
 
 
-def _gemm_attrs(*, px, py, nq, m, k, n, alpha, beta, ctx_handle,
+def _gemm_attrs(*, px, py, nq, m, k, n, alpha, beta, ctx_key,
                 with_c: bool) -> dict:
     """The FFI attrs dict for one exact N,N shape — the SINGLE place this
     package computes it, shared by the auto-mode (``_build_kernel``) and
@@ -222,7 +223,7 @@ def _gemm_attrs(*, px, py, nq, m, k, n, alpha, beta, ctx_handle,
         alpha_re=float(alpha.real), alpha_im=float(alpha.imag),
         beta_re=float(beta.real) if with_c else 0.0,
         beta_im=float(beta.imag) if with_c else 0.0,
-        ctx_handle=int(ctx_handle))
+        ctx_key=int(ctx_key))
 
 
 def _local_gemm_call(a, b, c, *, attrs: dict, out_t, with_c: bool,
@@ -256,14 +257,14 @@ def _local_gemm_call(a, b, c, *, attrs: dict, out_t, with_c: bool,
 
 
 def _build_kernel(mesh, *, px, py, nq, m, k, n, dtype, alpha, beta,
-                  ctx_handle, with_c: bool) -> Callable:
+                  ctx_key, with_c: bool) -> Callable:
     """The uncompiled shard_map+ffi_call N,N GEMM body for one exact shape
     — the AUTO-mode entry point (``GemmPlan.__call__``): the caller hands
     in GLOBALLY-sharded operands, this ``shard_map`` extracts the local
     tile, and :func:`_local_gemm_call` does the actual work.
 
     Mirrors ``distrib_la.matmul._cublasmp``'s column-major-transpose /
-    ``ctx_handle`` / attrs convention — the only other cuBLASMp GEMM FFI
+    ``ctx_key`` / attrs convention — the only other cuBLASMp GEMM FFI
     wrapper in this package — specialised to N,N and to this module's
     eager-warm-then-call lifecycle instead of ``matmul()``'s per-call
     resolve-and-cache.  The two are cross-checked numerically on real
@@ -280,11 +281,11 @@ def _build_kernel(mesh, *, px, py, nq, m, k, n, dtype, alpha, beta,
     liveness".
     """
     key = ("planned", mesh_key(mesh), px, py, nq, m, k, n, str(dtype),
-           alpha, beta, int(ctx_handle), with_c)
+           alpha, beta, int(ctx_key), with_c)
     if key in _CUBLASMP_CACHE:
         return _CUBLASMP_CACHE[key]
     attrs = _gemm_attrs(px=px, py=py, nq=nq, m=m, k=k, n=n, alpha=alpha,
-                        beta=beta, ctx_handle=ctx_handle, with_c=with_c)
+                        beta=beta, ctx_key=ctx_key, with_c=with_c)
     out_t = jax.ShapeDtypeStruct((nq, n // py, m // px), dtype)
 
     if with_c:
@@ -311,7 +312,7 @@ def _build_active_kernel(plan, *, with_c):
     spec = P(None, "x", "y")
     attrs = _gemm_attrs(px=px, py=py, nq=plan.nq, m=plan.m, k=plan.k,
         n=plan.n, alpha=plan.alpha, beta=plan.beta,
-        ctx_handle=plan.ctx_handle, with_c=with_c)
+        ctx_key=plan.ctx_key, with_c=with_c)
     out_t = jax.ShapeDtypeStruct((plan.nq, plan.n // py, plan.m // px), plan.dtype)
 
     def apply(a, b, bounds, c):
@@ -331,7 +332,7 @@ def _build_prepared_active_kernel(plan, active_bounds, *, with_c):
     spec = P(None, "x", "y")
     attrs = _gemm_attrs(px=px, py=py, nq=plan.nq, m=plan.m, k=plan.k,
         n=plan.n, alpha=plan.alpha, beta=plan.beta,
-        ctx_handle=plan.ctx_handle, with_c=with_c)
+        ctx_key=plan.ctx_key, with_c=with_c)
     out_t = jax.ShapeDtypeStruct((plan.nq, plan.n // py, plan.m // px), plan.dtype)
 
     def apply(a, b, c):
@@ -453,6 +454,10 @@ class GemmPlan:
     reduction_axis: str | None = None
     _active_fn_with_c: Callable | None = field(default=None, compare=False, hash=False)
     _active_fn_no_c: Callable | None = field(default=None, compare=False, hash=False)
+    #: The FFI ``ctx_key`` attribute of the cuBLASMp context (0 for local
+    #: plans): a pure function of the configuration, unlike ``ctx_handle``
+    #: (the live address, for the ctypes workspace queries only).
+    ctx_key: int = 0
 
     def describe(self) -> str:
         """One line for a run banner: what resolved, and to what shape."""
@@ -751,14 +756,14 @@ class GemmPlan:
                     f"(this plan's beta={self.beta})")
             attrs = _gemm_attrs(px=px, py=py, nq=self.nq, m=self.m, k=self.k,
                                 n=self.n, alpha=self.alpha, beta=self.beta,
-                                ctx_handle=self.ctx_handle, with_c=False)
+                                ctx_key=self.ctx_key, with_c=False)
             return _local_gemm_call(A, B, None, attrs=attrs, out_t=out_t,
                                     with_c=False)
         _check_local_operand(self, "C/out", c_or_out,
                              (self.nq, self.m // px, self.n // py))
         attrs = _gemm_attrs(px=px, py=py, nq=self.nq, m=self.m, k=self.k,
                             n=self.n, alpha=self.alpha, beta=self.beta,
-                            ctx_handle=self.ctx_handle, with_c=True)
+                            ctx_key=self.ctx_key, with_c=True)
         return _local_gemm_call(A, B, c_or_out, attrs=attrs, out_t=out_t,
                                 with_c=True)
 
@@ -1007,8 +1012,9 @@ def gemm_plan(
         if not usable:
             raise RuntimeError(f"gemm_plan active_range unavailable: {reason}")
 
-    from distrib_la._cusolvermp import get_or_init_context
+    from distrib_la._cusolvermp import context_key, get_or_init_context
     ctx_handle = get_or_init_context(mesh, col_major=False)
+    ctx_key = context_key(mesh, col_major=False)
 
     in_sharding_a = NamedSharding(mesh, P(None, "x", "y"))
     in_sharding_b = in_sharding_a
@@ -1016,7 +1022,7 @@ def gemm_plan(
 
     fn_with_c = jax.jit(
         _build_kernel(mesh, px=px, py=py, nq=nq, m=m, k=k, n=n, dtype=dtype,
-                     alpha=alpha_c, beta=beta_c, ctx_handle=ctx_handle,
+                     alpha=alpha_c, beta=beta_c, ctx_key=ctx_key,
                      with_c=True),
         donate_argnums=(2,))
     # A REAL warmup call, not merely a trace: this is what forces the
@@ -1032,7 +1038,7 @@ def gemm_plan(
     if beta_c == 0:
         fn_no_c = jax.jit(_build_kernel(
             mesh, px=px, py=py, nq=nq, m=m, k=k, n=n, dtype=dtype,
-            alpha=alpha_c, beta=beta_c, ctx_handle=ctx_handle,
+            alpha=alpha_c, beta=beta_c, ctx_key=ctx_key,
             with_c=False))
         if warmup:
             fn_no_c(_zeros((nq, m, k), dtype, in_sharding_a),
@@ -1042,7 +1048,7 @@ def gemm_plan(
         mesh=mesh, backend=resolved, m=m, k=k, n=n, nq=nq, dtype=dtype,
         alpha=alpha_c, beta=beta_c,
         in_sharding_a=in_sharding_a, in_sharding_b=in_sharding_b,
-        out_sharding=out_sharding, ctx_handle=int(ctx_handle),
+        out_sharding=out_sharding, ctx_handle=int(ctx_handle), ctx_key=int(ctx_key),
         _fn_with_c=fn_with_c, _fn_no_c=fn_no_c)
 
     if not enable_active_range:

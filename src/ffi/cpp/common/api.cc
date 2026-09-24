@@ -5,6 +5,7 @@
 // are already exposed by XLA_FFI_DEFINE_HANDLER_SYMBOL as C symbols in
 // cpp/cusolvermp/eigh_ffi.cc.
 
+#include "ctx_registry.h"
 #include <cstdint>
 #include <cstring>
 #include <stdexcept>
@@ -93,6 +94,8 @@ int lrx_create_cusolvermp_context(
 }
 
 void lrx_destroy_cusolvermp_context(int64_t ctx_handle) {
+    // A cached executable run after teardown must refuse, not dereference.
+    lorrax_ffi::ctx_registry::forget_handle(ctx_handle);
     lrx::destroy_context(ctx_handle);
 }
 

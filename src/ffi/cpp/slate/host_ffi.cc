@@ -40,6 +40,7 @@
 // shared with the scalapack host handlers that use the same comms.  The
 // CUDA handlers are serialized by the XLA stream and take no lock.
 
+#include "../common/ctx_registry.h"
 #include <complex>
 #include <cstdint>
 #include <cstring>
@@ -119,8 +120,9 @@ static ffi::Error PotrfDispatch(
     ffi::AnyBuffer A,
     ffi::Result<ffi::AnyBuffer> L_out,
     int64_t n, int64_t nb,
-    int64_t ctx_handle)
+    int64_t ctx_key)
 {
+    const int64_t ctx_handle = ::lorrax_ffi::ctx_registry::resolve(ctx_key, "slate");
     auto* ctx = reinterpret_cast<lorrax_ffi::slate::SlateCtx*>(ctx_handle);
     if (ctx == nullptr) return null_ctx_error("slate.potrf(host)");
     std::lock_guard<std::mutex> lock(
@@ -237,8 +239,9 @@ static ffi::Error TrsmDispatch(
     int64_t n, int64_t m, int64_t nb,
     int64_t side, int64_t uplo, int64_t op, int64_t diag,
     double alpha_re, double alpha_im,
-    int64_t ctx_handle)
+    int64_t ctx_key)
 {
+    const int64_t ctx_handle = ::lorrax_ffi::ctx_registry::resolve(ctx_key, "slate");
     auto* ctx = reinterpret_cast<lorrax_ffi::slate::SlateCtx*>(ctx_handle);
     if (ctx == nullptr) return null_ctx_error("slate.trsm(host)");
     std::lock_guard<std::mutex> lock(
@@ -358,8 +361,9 @@ static ffi::Error EighDispatch(
     ffi::Result<ffi::AnyBuffer> W_out,
     ffi::Result<ffi::AnyBuffer> Q_out,
     int64_t n, int64_t nb,
-    int64_t ctx_handle, bool compute_evecs)
+    int64_t ctx_key, bool compute_evecs)
 {
+    const int64_t ctx_handle = ::lorrax_ffi::ctx_registry::resolve(ctx_key, "slate");
     auto* ctx = reinterpret_cast<lorrax_ffi::slate::SlateCtx*>(ctx_handle);
     if (ctx == nullptr) return null_ctx_error("slate.eigh(host)");
     std::lock_guard<std::mutex> lock(
@@ -458,8 +462,9 @@ static ffi::Error BatchedPotrfDispatch(
     ffi::AnyBuffer A,
     ffi::Result<ffi::AnyBuffer> L_out,
     int64_t nbatch_local, int64_t n, int64_t nb,
-    int64_t ctx_handle)
+    int64_t ctx_key)
 {
+    const int64_t ctx_handle = ::lorrax_ffi::ctx_registry::resolve(ctx_key, "slate");
     auto* ctx = reinterpret_cast<lorrax_ffi::slate::SlateCtx*>(ctx_handle);
     if (ctx == nullptr) return null_ctx_error("slate.batched_potrf(host)");
     std::lock_guard<std::mutex> lock(
@@ -576,8 +581,9 @@ static ffi::Error BatchedTrsmDispatch(
     int64_t nbatch_local, int64_t n, int64_t m, int64_t nb,
     int64_t side, int64_t uplo, int64_t op, int64_t diag,
     double alpha_re, double alpha_im,
-    int64_t ctx_handle)
+    int64_t ctx_key)
 {
+    const int64_t ctx_handle = ::lorrax_ffi::ctx_registry::resolve(ctx_key, "slate");
     auto* ctx = reinterpret_cast<lorrax_ffi::slate::SlateCtx*>(ctx_handle);
     if (ctx == nullptr) return null_ctx_error("slate.batched_trsm(host)");
     std::lock_guard<std::mutex> lock(
@@ -629,7 +635,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Ret<xla::ffi::AnyBuffer>()              // L (Cholesky factor, lower)
         .Attr<int64_t>("n")
         .Attr<int64_t>("nb")
-        .Attr<int64_t>("ctx_handle"));
+        .Attr<int64_t>("ctx_key"));
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
     SlateTrsmHostFfi, lorrax_ffi::slate_host::TrsmDispatch,
@@ -646,7 +652,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Attr<int64_t>("diag")    // 0 NonUnit, 1 Unit
         .Attr<double>("alpha_re")
         .Attr<double>("alpha_im")
-        .Attr<int64_t>("ctx_handle"));
+        .Attr<int64_t>("ctx_key"));
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
     SlateEighHostFfi, lorrax_ffi::slate_host::EighDispatch,
@@ -656,7 +662,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Ret<xla::ffi::AnyBuffer>()              // Q (local shard, same dtype as A)
         .Attr<int64_t>("n")
         .Attr<int64_t>("nb")
-        .Attr<int64_t>("ctx_handle")
+        .Attr<int64_t>("ctx_key")
         .Attr<bool>("compute_evecs"));
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
@@ -667,7 +673,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Attr<int64_t>("nbatch_local")
         .Attr<int64_t>("n")
         .Attr<int64_t>("nb")
-        .Attr<int64_t>("ctx_handle"));
+        .Attr<int64_t>("ctx_key"));
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
     SlateBatchedTrsmHostFfi, lorrax_ffi::slate_host::BatchedTrsmDispatch,
@@ -685,4 +691,4 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Attr<int64_t>("diag")
         .Attr<double>("alpha_re")
         .Attr<double>("alpha_im")
-        .Attr<int64_t>("ctx_handle"));
+        .Attr<int64_t>("ctx_key"));

@@ -20,6 +20,7 @@
 //   - d_info (tiny; allocated once on ctx)
 //   - NCCL scratch in the CAL→NCCL shim (lives outside any FFI call)
 
+#include "../common/ctx_registry.h"
 #include <complex>
 #include <cstdint>
 #include <cstdio>
@@ -231,8 +232,9 @@ static ffi::Error EighDispatch(
     ffi::Result<ffi::AnyBuffer> W_out,
     ffi::Result<ffi::AnyBuffer> Q_out,
     int64_t n, int64_t mb, int64_t nb,
-    int64_t ctx_handle, bool compute_evecs)
+    int64_t ctx_key, bool compute_evecs)
 {
+    const int64_t ctx_handle = ::lorrax_ffi::ctx_registry::resolve(ctx_key, "cusolvermp");
     auto* ctx = reinterpret_cast<LorraxCusolverMpCtx*>(ctx_handle);
     if (ctx == nullptr) {
         return ffi::Error(ffi::ErrorCode::kInvalidArgument,
@@ -296,7 +298,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Attr<int64_t>("n")
         .Attr<int64_t>("mb")
         .Attr<int64_t>("nb")
-        .Attr<int64_t>("ctx_handle")
+        .Attr<int64_t>("ctx_key")
         .Attr<bool>("compute_evecs"));
 
 // Query-only planning door. No matrix or workspace allocation and no solve.

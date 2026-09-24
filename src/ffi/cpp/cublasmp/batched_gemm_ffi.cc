@@ -19,6 +19,7 @@
 // the call is effectively in-place (D === C), which matches standard
 // BLAS semantics.
 
+#include "../common/ctx_registry.h"
 #include <algorithm>
 #include <climits>
 #include <type_traits>
@@ -228,8 +229,9 @@ static ffi::Error BatchedGemmDispatch(
     int64_t transa_code, int64_t transb_code,
     double alpha_re, double alpha_im,
     double beta_re,  double beta_im,
-    int64_t ctx_handle)
+    int64_t ctx_key)
 {
+    const int64_t ctx_handle = ::lorrax_ffi::ctx_registry::resolve(ctx_key, "cusolvermp");
     auto* ctx = reinterpret_cast<LorraxCusolverMpCtx*>(ctx_handle);
     if (ctx == nullptr) {
         return ffi::Error(ffi::ErrorCode::kInvalidArgument,
@@ -429,7 +431,8 @@ static ffi::Error ActiveRangeDispatch(
     int64_t mb_c,int64_t nb_c,int64_t lda,int64_t ldb,int64_t ldc,
     int64_t transa_code,int64_t transb_code,
     double alpha_re,double alpha_im,double beta_re,double beta_im,
-    int64_t ctx_handle) {
+    int64_t ctx_key) {
+    const int64_t ctx_handle = ::lorrax_ffi::ctx_registry::resolve(ctx_key, "cusolvermp");
     if (bounds.dimensions()[1]!=2 ||
         (bounds.dimensions()[0]!=1 && bounds.dimensions()[0]!=nq))
         return ffi::Error::InvalidArgument(
@@ -452,7 +455,8 @@ static ffi::Error PreparedActiveRangeDispatch(
     int64_t mb_c,int64_t nb_c,int64_t lda,int64_t ldb,int64_t ldc,
     int64_t transa_code,int64_t transb_code,
     double alpha_re,double alpha_im,double beta_re,double beta_im,
-    int64_t ctx_handle, ffi::Span<const int64_t> active_bounds) {
+    int64_t ctx_key, ffi::Span<const int64_t> active_bounds) {
+    const int64_t ctx_handle = ::lorrax_ffi::ctx_registry::resolve(ctx_key, "cusolvermp");
     const size_t pair_count=active_bounds.size()/2;
     if (nq<1 || active_bounds.size()%2!=0 ||
         (pair_count!=1 && pair_count!=static_cast<size_t>(nq)))
@@ -501,7 +505,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Attr<double>("alpha_im")
         .Attr<double>("beta_re")
         .Attr<double>("beta_im")
-        .Attr<int64_t>("ctx_handle"));
+        .Attr<int64_t>("ctx_key"));
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
     CublasMpPreparedActiveRangeGemmFfi,
@@ -531,7 +535,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Attr<double>("alpha_im")
         .Attr<double>("beta_re")
         .Attr<double>("beta_im")
-        .Attr<int64_t>("ctx_handle")
+        .Attr<int64_t>("ctx_key")
         .Attr<xla::ffi::Span<const int64_t>>("active_bounds"));
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
@@ -563,7 +567,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Attr<double>("alpha_im")
         .Attr<double>("beta_re")
         .Attr<double>("beta_im")
-        .Attr<int64_t>("ctx_handle"));
+        .Attr<int64_t>("ctx_key"));
 
 // Query-only N,N planning door; all batches reuse one workspace in the
 // execution handler. Sizing never reads the supplied device address token.
