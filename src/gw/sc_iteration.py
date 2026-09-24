@@ -6057,6 +6057,20 @@ def _run_rcrop(
             map_gain=map_gain,
         )
         _record_sc(inputs, f"    SC convergence: {_verdict.summary()}")
+        # DIAGNOSTIC (sc_accel 2026-09-24): label-free matrix residual.  The
+        # per-k spectral norm bounds every sorted-eigenvalue residual (Weyl)
+        # and also sees eigenvector (off-diagonal) error; Frobenius is what
+        # the accelerator's Gram minimizes.  Protected block = metric mask.
+        from common.collectives import gather_to_host as _gth
+        _fh = (np.asarray(_gth(state_out.H_qp_dft))
+               - np.asarray(_gth(H))) * RYD_TO_EV * 1e3
+        _pm = _metric_np[:, :nb, :nb] > 0
+        _fp = np.where(_pm, _fh, 0.0)
+        _spec = np.abs(np.linalg.eigvalsh(
+            0.5 * (_fp + np.conj(np.swapaxes(_fp, -1, -2))))).max()
+        _record_sc(inputs, f"    SC matrix residual: call={call_index} "
+                           f"max_k ||f_k||_2 = {_spec:.6e} meV; ||f||_F = "
+                           f"{np.linalg.norm(_fp):.6e} meV (protected block)")
         _iter_idx[0] += 1
         # Non-trial calls only: there the INPUT is the accepted iterate
         # (rcrop_nojit's ``f_new = residual_fn(x_new)``), so this is the
