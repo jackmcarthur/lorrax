@@ -1707,13 +1707,16 @@ def plan_zeta_route_g(*, meta, mesh_xy, n_q_selected: int, ngkmax: int,
             n_b = math.ceil(mu / b)
             b = math.ceil(math.ceil(mu / n_b) / P_) * P_         # balance
             n_grp = math.ceil(n_a / n_pg)
-            # ponytail: constants from the VI3 P16 OFI measurement (per-batch
-            # dispatch + psum/all-to-all latency 20 ms, 5 µs per scan step,
-            # gathers at 1 TB/s); the comm-model service's comm_time replaces
-            # them.
-            t = (n_b * (0.02 + 5e-6 * n_grp * nk)
-                 + (mu / P_) * n_grp * nk * _c128(ns, 2, ns, n_col, n_s) / 1e12)
-            cands.append((t, n_pg, b))
+            # Per batch: the X_B psum and the pair-projector all-to-all
+            # (gw.comm_model), n_grp·nk scan steps, and the owner's cylinder
+            # gathers.  ponytail: gathers at 1 TB/s and 5 µs per scan step,
+            # measured on A100; the per-centroid arithmetic is the same for
+            # every candidate and is left out.
+            t_b = (comm_model.comm_time(_c128(nk, nb, ns, b), P_ - 1)
+                   + comm_model.comm_time(2 * _c128(nk, ns, b, ns, Gp), P_ - 1)
+                   + 5e-6 * n_grp * nk
+                   + n_grp * nk * _c128(ns, 2 * (b // P_), ns, n_col, n_s) / 1e12)
+            cands.append((n_b * t_b, n_pg, b))
         if n_pg >= n_a:
             break
         n_pg = min(2 * n_pg, n_a)
@@ -1740,6 +1743,8 @@ def plan_zeta_route_g(*, meta, mesh_xy, n_q_selected: int, ngkmax: int,
     return MuBatchPlan(
         green_tile_bytes=float(green), min_config_bytes=float(need_min),
         collectives_per_batch=2, t_model_s=float(t_model), runner_up=ru,
+        min_call_bytes=float(_c128(nk, nb, ns, b)),
+        min_efficient_bytes=comm_model.min_efficient_payload(P_ - 1),
         route='G', source='resident', band_chunk=int(nb), k_chunk=int(nk),
         b=int(b), n_batch=int(n_batch), r_sub=int(n_pg), row_chunk=0,
         g_tile=int(g_tile), placement=placement, finalize_layout=finalize_layout,
