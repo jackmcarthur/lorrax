@@ -1121,6 +1121,8 @@ static void async_read_kchunk_union_worker(
     hsize_t npts_total = 0;
     size_t n_chunks = 0;
     double sel_ms = 0.0, read_ms = 0.0, h2d_ms = 0.0;
+    double wait_ms = 0.0, iter_ms = 0.0;
+    size_t n_seq_total = 0;
     bool copies_in_flight = false;
     for (hsize_t r0 = 0; r0 < n_rows; r0 += rows_per_chunk, ++n_chunks) {
         const hsize_t r1 = std::min<hsize_t>(n_rows, r0 + rows_per_chunk);
@@ -1212,6 +1214,8 @@ static void async_read_kchunk_union_worker(
         // the next chunk's H5Dread is about to fill.
         if (copies_in_flight) cudaEventSynchronize(ctx->h2d_event);
 #endif
+        auto t_cw = now();
+        wait_ms += ms(t_c2, t_cw);
         if (npts_file > 0) {
             hid_t it = H5Ssel_iter_create(memspace, element_size, 0);
             if (it < 0) {
@@ -1222,9 +1226,13 @@ static void async_read_kchunk_union_worker(
             size_t cursor = 0;
             for (;;) {
                 size_t nseq = 0, nelm = 0;
-                if (H5Ssel_iter_get_seq_list(it, kSeqBatch, SIZE_MAX, &nseq,
-                                             &nelm, seq_off.data(),
-                                             seq_len.data()) < 0) {
+                auto t_i0 = now();
+                const herr_t ist = H5Ssel_iter_get_seq_list(
+                    it, kSeqBatch, SIZE_MAX, &nseq, &nelm, seq_off.data(),
+                    seq_len.data());
+                iter_ms += ms(t_i0, now());
+                n_seq_total += nseq;
+                if (ist < 0) {
                     H5Ssel_iter_close(it);
                     fail_spaces(ffi::ErrorCode::kInternal,
                         "phdf5 read_kchunk_union: H5Ssel_iter_get_seq_list failed");
@@ -1292,13 +1300,13 @@ static void async_read_kchunk_union_worker(
         std::fprintf(stderr,
             "[phdf5 kchunk-union r0] n_k=%d bytes/rank=%zu chunks=%zu "
             "rows/chunk=%llu staging=%zu  prev_h2d_wait=%.2f  zero=%.2f  "
-            "select=%.2f  read=%.2f  scatter=%.2f  total=%.2f (ms)  "
-            "[selected_elts=%lld, independent]\n",
+            "select=%.2f  read=%.2f  scatter=%.2f (wait=%.2f iter=%.2f "
+            "seqs=%zu)  total=%.2f (ms)  [selected_elts=%lld, independent]\n",
             n_kchunk, bytes, n_chunks, (unsigned long long)rows_per_chunk,
             2 * chunk_cap,
             ms(t0, t_prev_h2d_done),
             ms(t_prev_h2d_done, t_pin),
-            sel_ms, read_ms, h2d_ms,
+            sel_ms, read_ms, h2d_ms, wait_ms, iter_ms, n_seq_total,
             ms(t0, t_h2d),
             (long long)npts_total);
     }
