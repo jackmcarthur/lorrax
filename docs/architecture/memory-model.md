@@ -64,6 +64,15 @@ the zero-padded final band chunk exactly.  `PsiGStore` holds source ψ(G)
 tiles on the host only while that device cache is built; the r-chunk fit reads
 the cache and does not reread or re-FFT ψ(G).
 
+When the ψ(r) cache does not fit, the streamed route transforms ψ(G) per band
+chunk on every r chunk.  The planner then prices `psi_G_resident`
+(`16·n_parent·n_bc·B·n_s·ngkmax^ψ/P`) and keeps ψ(G) on device
+(`isdf.core.build_psi_G_resident_sm`) whenever the floor plus it still admits
+the Stage-C constant and a minimal chunk; otherwise the source reads the host
+store per chunk.  The banner line `zeta FFT` names the choice.  VI3 12x12 P16:
+7.69 GB/rank resident, ψ source 1.8 s → 0.17 s per chunk
+(`runs/runtime/zeta_fit_20260923/15_*`).
+
 Peak E starts from a different, smaller base because `L_q`, `gflat_acc`, and
 the ψ(r) fit cache have been released.  It retains one X- and one
 Y-sharded centroid copy for the downstream GW path.
