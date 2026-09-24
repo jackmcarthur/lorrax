@@ -190,7 +190,7 @@ def test_bse_matches_frozen_and_bgw(tmp_path):
 
     bse = _run([
         "bse.bse_jax", "-i", INPUT_NAME,
-        "--bse", "--lanczos", "--tda", "--matvec-kind=ring",
+        "--bse", "--lanczos", "--tda",
         "--n-val", str(N_VAL), "--n-cond", str(N_COND), "--n-occ", str(N_OCC),
         # PINNED, NOT DEFAULTED, AND STILL PINNED AFTER THE 2026-08-10 FLIP.
         # BerkeleyGW produced bgw_eigenvalues_dft_ref.dat at 4v4c, so this

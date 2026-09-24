@@ -44,7 +44,7 @@ def exciton_dipole_projections(A, d_alpha):
         transitions ``t = (c, v, k)``.  That ``A`` is the amplitude in
         THAT basis is fixed by LORRAX's own kernel, not assumed: the
         exchange term is assembled as ``K^x = M V M†`` with
-        ``M_t = conj(ψ_c) ψ_v`` (``bse_simple.py``'s V-term, and the
+        ``M_t = conj(ψ_c) ψ_v`` (the stack matvec's V-term, and the
         direct term ``K^d_{tt'} = −Σ conj(ψ_c[k]) ψ_c'[k'] W
         ψ_v[k] conj(ψ_v'[k'])`` documented at ``bse_nontda.py:169``).
         Both are the standard ``⟨t|H|t'⟩`` with the CONDUCTION index on

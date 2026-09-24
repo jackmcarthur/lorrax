@@ -38,7 +38,8 @@ Skipping any of the six conventions below produces silent O(1) errors.
 Prereq: a run dir with `cohsex.in`, `centroids_frac_*.txt`, `WFN.h5`,
 `tmp/isdf_tensors_*.h5` from a prior `gw_jax` pass, plus a BGW
 reference dir with `eqp.dat`, `vcoul`, `absorption_eh.dat`,
-`eigenvalues.dat`. See `runs/Si/04_si_4x4x4_bse/` for examples.
+`eigenvalues.dat`. (The `runs/Si/04_si_4x4x4_bse/` example this line used to
+cite was purged; the in-tree Si BSE deck is `tests/regression/si_bse_debug`.)
 
 ```bash
 export LX_BASE_MODULE=lorrax_A LORRAX_CHECKOUT=/path/to/lorrax

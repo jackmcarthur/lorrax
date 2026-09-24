@@ -149,7 +149,6 @@ def _serial_matvec(data, X, include_W):
 def _sharded_matvec(kind, data, X, include_W):
     from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
     from bse.bse_ring_comm import build_bse_ring_matvec, make_bse_shardings
-    from bse.bse_simple import build_bse_simple_matvec
     from bse.bse_serial import compute_pair_amplitude
 
     mesh = Mesh(np.array(jax.devices()[:1]).reshape(1, 1), axis_names=("x", "y"))
@@ -169,8 +168,10 @@ def _sharded_matvec(kind, data, X, include_W):
             compute_pair_amplitude(psi_c_X, psi_v_X), sh.psi_x)
         M_Y = jax.lax.with_sharding_constraint(
             compute_pair_amplitude(psi_c_Y, psi_v_Y), sh.psi_y)
-        if kind == "simple":
-            mv = build_bse_simple_matvec(mesh, nkx, nky, nkz, include_W=include_W)
+        if kind == "stack":
+            from bse.bse_stack_matvec import build_bse_stack_matvec
+            mv = build_bse_stack_matvec(mesh, nkx, nky, nkz,
+                                        kernel="bse" if include_W else "rpa")
         else:
             mv = build_bse_ring_matvec(
                 mesh, nkx, nky, nkz, include_W=include_W,
@@ -193,7 +194,7 @@ def _relerr(a, b):
     return float(np.linalg.norm(a - b) / max(np.linalg.norm(b), 1e-300))
 
 
-MATVEC_KINDS = ["serial", "simple", "ring"]
+MATVEC_KINDS = ["serial", "stack", "ring"]
 
 
 # ---------------------------------------------------------------------------

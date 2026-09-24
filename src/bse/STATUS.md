@@ -18,7 +18,6 @@ Absorption / eigensolvers (the 2026-04 arc, validated vs BGW below):
 | File | Role | Status |
 |---|---|---|
 | `bse_jax.py`            | CLI entry, sharded driver, `_preview_lanczos` | working; `--n-reorth -1` (full reorth) is the right default for spinor BSE |
-| `bse_simple.py`         | plain-jit (μ,ν) matvec — XLA partitioner, no shard_map | **legacy.** Reachable only from `absorption_haydock --matvec-kind=simple` and `davidson_absorption`; the sharded eigensolve never builds it. Slated for deletion with `--matvec-kind` |
 | `bse_ring_comm.py`      | shard_map + ppermute / all-gather matvec | **no longer the eigensolve matvec.** Still live and NOT retiring: `build_bse_ring_matvec` carries `bse_feast.estimate_spectral_bounds_sharded`, and `build_bse_ring_matvec_full` is the non-TDA `_materialize_A_B` oracle and the equality gates' twin |
 | `bse_lanczos.py`        | `solve_bse_sharded` Lanczos / block-Lanczos / convergence-driven | works; ghost eigenvalues at high N without full reorth. Reorthogonalisation is **CGS2 by default** since 2026-08-08 (`LORRAX_LANCZOS_REORTH`; `mgs` is the legacy fallback) |
 | `bse_stack_matvec.py`   | batched trial-stack matvec, one T-tensor regardless of `n_trials`; also the non-TDA fused pair applier | **THE matvec.** Every sharded solve (Lanczos / block-Lanczos / Davidson / FEAST) applies H through it. `build_bse_stack_pair_matvec` adds the coupling block as one fused program (1.83× predicted over two ring applies) |
@@ -29,7 +28,7 @@ Absorption / eigensolvers (the 2026-04 arc, validated vs BGW below):
 | `bse_io.py`             | restart-bundle reader, padding utils, `write_eigenvectors_stream` | writer is BGW-compliant (see "Index ordering" below); also `pad_W_R_to_grid` / `bse_k_grid` coarse→fine |
 | `absorption_common.py`  | h5 readers + Lorentzian + JDOS + Kramers-Kronig + BGW-format `.dat` writers | working. **The single site** for the three formulas both drivers share: `exciton_dipole_projections` (the ⟨0\|r̂\|S⟩ contraction), `lorentzian_broaden`, and `jdos_from_transitions` (the 4th `absorption_*.dat` column). The two drivers and `eigvals_to_eps2` each carried their own copy of the last two until 2026-08-11 |
 | `absorption_eigvecs.py` | ε₂(ω) via Σ_S \|⟨0\|r̂\|S⟩\|²·L (sum-over-states) | working |
-| `absorption_haydock.py` | ε₂(ω) via continued fraction on (α_n, β_n), no eigvecs | *the* method to use vs BGW |
+| `absorption_haydock.py` | ε₂(ω) via continued fraction on (α_n, β_n), no eigvecs; the three polarisations are the stack matvec's trial block (C10, 2026-09-24) | *the* method to use vs BGW |
 | `eigenvectors.h5.spec`  | BGW spec, kept verbatim | reference |
 
 Finite-/arbitrary-Q and screened-W (the 2026-07 arc — see EXCITON_BANDS.md):
@@ -103,7 +102,11 @@ Gauge-DEPENDENT quantities (do NOT compare per-state directly):
 
 ## Run artifacts
 
-In `/pscratch/sd/j/jackm/lorrax_sandbox/runs/Si/04_si_4x4x4_bse/C_lorrax_bse_bgweqp/`:
+**Purged** (checked 2026-09-24: the directory below no longer exists; the
+figures and BGW reference dirs are gone with it).  The in-tree Si BSE deck is
+`tests/regression/si_bse_debug` (Si 4×4×4 SOC, BGW-anchored eigenvalues); the
+C10 Haydock gate of 2026-09-24 ran on it with a `--skip-vnl` dipole.
+Formerly in `/pscratch/sd/j/jackm/lorrax_sandbox/runs/Si/04_si_4x4x4_bse/C_lorrax_bse_bgweqp/`:
 
 - `eps2_8x8_haydock_compare.png` — BGW Haydock 100 vs LORRAX Haydock 100 (the apples-to-apples plot)
 - `eps2_8x8_converged.png` — convergence comparison including Lanczos n=100/400

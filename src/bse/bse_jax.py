@@ -128,7 +128,6 @@ def _preview_lanczos(
     block_size: int = 1,
     rtol: float = 0.0,
     check_every: int = 4,
-    matvec_kind: str = "ring",
     n_reorth: int = -1,
     solver_kind: str = "lanczos",
     davidson_m_max: int | None = None,
@@ -208,8 +207,6 @@ def _preview_lanczos(
                 htransform_quality_record_fn=(
                     _htransform_quality_records.append),
             )
-            # T-encoding strategy plumbed via the data dict (see solve_bse_sharded).
-            data["matvec_kind"] = matvec_kind
             grid_x, grid_y = mesh_xy.devices.shape
             # EQP override on enk_full (BGW eqp1.dat semantics).
             if eqp_file is not None:
@@ -538,20 +535,6 @@ def main(argv=None) -> int:
              "is no longer a speed reason to narrow this.",
     )
     parser.add_argument(
-        "--matvec-kind",
-        choices=("ring", "gather", "simple"),
-        default="ring",
-        help="BSE matvec implementation. ``ring`` (default): shard_map + "
-             "lax.ppermute (low memory). ``gather``: shard_map + lax.all_gather "
-             "(faster on small problems). ``simple``: plain jit + jnp.einsum "
-             "+ with_sharding_constraint, no shard_map (XLA auto-partitions).",
-    )
-    parser.add_argument(
-        "--gather-t",
-        action="store_true",
-        help="(Deprecated alias for --matvec-kind=gather)",
-    )
-    parser.add_argument(
         "--solver",
         choices=("lanczos", "davidson", "trlan"),
         default="lanczos",
@@ -807,7 +790,7 @@ def main(argv=None) -> int:
             f"relative convergence {float(args.lanczos_rtol):.5e}, "
             f"checked every {int(args.lanczos_check_every)} iterations"
             if args.lanczos_rtol > 0.0 else "fixed Krylov dimension"),
-        f"Matvec route   : {('gather' if args.gather_t else args.matvec_kind)}",
+        "Matvec route   : trial-stack (bse_stack_matvec)",
         f"Band boundary  : {args.band_degeneracy}; "
         f"tolerance={float(args.degeneracy_tol_ry) * RYD_TO_EV * 1.0e3:.5f} meV",
     ))
@@ -844,7 +827,6 @@ def main(argv=None) -> int:
         block_size=args.block_size,
         rtol=args.lanczos_rtol,
         check_every=args.lanczos_check_every,
-        matvec_kind=("gather" if args.gather_t else args.matvec_kind),
         n_reorth=args.n_reorth,
         solver_kind=args.solver,
         davidson_m_max=args.davidson_m_max,

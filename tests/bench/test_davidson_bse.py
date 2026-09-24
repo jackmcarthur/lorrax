@@ -42,7 +42,7 @@ from solvers.davidson import davidson
 from bse.bse_io import (load_bse_data_from_restart_sharded)
 from file_io.restart_bundle import (_find_restart_file)
 from bse.bse_ring_comm import create_mesh_2d, make_bse_shardings
-from bse.bse_simple import build_bse_simple_matvec
+from bse.bse_stack_matvec import build_bse_stack_matvec
 from bse.bse_davidson_helpers import bse_diagonal_precond, init_bse_subspace
 
 
@@ -111,8 +111,8 @@ def _load_data_and_matvec(
     nkx, nky, nkz = int(data["nkx"]), int(data["nky"]), int(data["nkz"])
 
     # ── Build matvec ─────────────────────────────────────────────────
-    matvec_simple = build_bse_simple_matvec(
-        mesh_xy, nkx, nky, nkz, include_W=include_W)
+    matvec_stack = build_bse_stack_matvec(
+        mesh_xy, nkx, nky, nkz, kernel="bse" if include_W else "rpa")
 
     # Precompute W_R outside the per-call jit. Use the same sharded
     # 3D-FFT helper as solve_bse_sharded.
@@ -127,7 +127,7 @@ def _load_data_and_matvec(
 
     # Keep all distributed arrays in explicit operator_data for the solver.
     # Davidson hands back X with shape (m, nc, nv, nk) and sharding
-    # P(None, "x", "y", None); matvec_simple already wraps that with
+    # P(None, "x", "y", None); the stack matvec already wraps that with
     # with_sharding_constraint internally and returns HX with the same
     # spec. No distributed array becomes a closed-over compiled constant.
     psi_c_X = data["psi_c_X"]
@@ -144,7 +144,7 @@ def _load_data_and_matvec(
                      eps_c, eps_v, W_R, V_q0, M_X, M_Y)
 
     def apply_H(solver_data, X):
-        return matvec_simple(X, *solver_data[0])
+        return matvec_stack(X, *solver_data[0])
 
     return mesh_xy, sh, data, apply_H, operator_data
 
