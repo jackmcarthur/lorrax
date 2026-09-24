@@ -98,9 +98,13 @@ static ffi::Error PotrfDispatch(cudaStream_t stream,
                                 ffi::AnyBuffer A,
                                 ffi::Result<ffi::AnyBuffer> A_out,
                                 int64_t n, int64_t mb, int64_t nb,
-                                int64_t ctx_handle, bool lower)
+                                int64_t ctx_key, bool lower)
 {
-    auto* ctx = reinterpret_cast<LorraxElpaCtx*>(ctx_handle);
+    // The Attr is a configuration key, never an address (common/ctx_registry.h):
+    // an address changes the HLO in every process and defeats the compile cache.
+    auto* ctx = reinterpret_cast<LorraxElpaCtx*>(
+        ::lorrax_ffi::ctx_registry::resolve(ctx_key, "elpa"));
+    if (!ctx) return ffi::Error::InvalidArgument("elpa potrf: ctx_key is not bound");
     // ... dtype switch ...
 }
 
@@ -114,9 +118,15 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Attr<int64_t>("n")
         .Attr<int64_t>("mb")
         .Attr<int64_t>("nb")
-        .Attr<int64_t>("ctx_handle")
+        .Attr<int64_t>("ctx_key")
         .Attr<bool>("lower"));
 ```
+
+The Python side creates the context once per configuration, binds it with
+`distrib_la.loader.bind_context(platform, "lorrax-ctx/v1|elpa|PxQ|...", handle)`
+(which returns the key, SHA-256 of that string) and passes the key as the
+`ctx_key` Attr; the context's destroy path calls
+`ctx_registry::forget_handle` so a stale executable refuses.
 
 ### (5) Per-dtype wrapper header (`<lib>_interface.h`)
 
