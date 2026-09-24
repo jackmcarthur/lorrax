@@ -254,48 +254,6 @@ def plane_case(mesh, rng):
                 xla_cmul_form=_xla_cmul_form(rng))
 
 
-def _spin_ffi_form(mesh, rng):
-    """Which FMA spelling the spin-rotate FFI (nvcc, cuCmul) uses (diagnostic for mode 7)."""
-    from fractions import Fraction as Q
-    from symmetry_maps._spin_rotation import rotate_spin
-    ns = 2
-    g = _crand(rng, 1, 2, ns, 2, ns)
-    u = _crand(rng, 1, ns, ns)
-    one = Mesh(np.asarray(jax.devices()[:1]).reshape(1, 1), XY)
-    sh = NamedSharding(one, P(None, "x", None, "y", None))
-    if jax.process_index() != 0:
-        return {}
-    got = np.asarray(jax.device_get(rotate_spin(jax.device_put(g, sh), u, one)))
-    fma = lambda x, y, z: float(Q(x) * Q(y) + Q(z))
-    forms = {"fma(ac,-bd)/fma(ad,bc)": lambda x, y: complex(fma(x.real, y.real, -(x.imag * y.imag)),
-                                                            fma(x.real, y.imag, x.imag * y.real)),
-             "fma(-bd,ac)/fma(bc,ad)": lambda x, y: complex(fma(-x.imag, y.imag, x.real * y.real),
-                                                            fma(x.imag, y.real, x.real * y.imag)),
-             "no-fma": lambda x, y: complex(x.real * y.real - x.imag * y.imag,
-                                            x.real * y.imag + x.imag * y.real)}
-    hits = {}
-    for name, mul in forms.items():
-        ok = 0
-        for m in range(2):
-            for n in range(2):
-                G = g[0, m, :, n, :]
-                left = [[0j] * ns for _ in range(ns)]
-                for a in range(ns):
-                    for d in range(ns):
-                        v = 0j
-                        for c in range(ns):
-                            p = mul(u[0, a, c], G[c, d]); v = complex(v.real + p.real, v.imag + p.imag)
-                        left[a][d] = v
-                for a in range(ns):
-                    for b in range(ns):
-                        v = 0j
-                        for d in range(ns):
-                            p = mul(left[a][d], np.conj(u[0, b, d])); v = complex(v.real + p.real, v.imag + p.imag)
-                        ok += int(v == got[0, m, a, n, b])
-        hits[name] = ok
-    return hits
-
-
 def unfold_cases(mesh, rng):
     """Mode 7 on the glide plans and A-cubic vs the old Σ chain (test_kconv_klead_unfold.unfold_case)."""
     import zeta_mubatch_fixtures as fixtures
@@ -309,7 +267,6 @@ def unfold_cases(mesh, rng):
                          bitwise_tables_vs_unfold=int(r["tables_bitwise"]),
                          max_abs_vs_old_chain=r["max_abs"], rel_vs_old_chain=r["rel"],
                          red_rolled_rsrc=r["red_rel"]))
-    recs[0]["spin_ffi_form"] = _spin_ffi_form(mesh, rng)
     return recs
 
 
