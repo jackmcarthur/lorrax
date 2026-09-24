@@ -3,8 +3,8 @@
 The deployed front door runs before the LORRAX environment exists, so this
 module is standard-library-only.  It owns decisions that otherwise drift
 between ``lx``, its pool helper, and deck-doctor tests: allocation pin
-spelling, newest-first ordering, per-node GPU geometry, persistent-cache
-intent, and checkout selection.  Slurm probes and command execution remain in
+spelling, newest-first ordering, per-node GPU geometry and checkout
+selection.  Slurm probes and command execution remain in
 the deployed launcher.
 """
 from __future__ import annotations
@@ -113,10 +113,16 @@ def export_allocation_pin(environ: MutableMapping[str, str], jid: str) -> None:
 
 
 def apply_cache_policy(environ: MutableMapping[str, str]) -> str:
-    """Default persistent reuse off; preserve every explicit user request."""
+    """Name the caller's persistent-cache request; never change it.
+
+    The compile-cache policy belongs to the LORRAX runtime
+    (``common.jax_compile_cache``: on by default, one namespace per release),
+    so a launcher that exported ``ISDF_JAX_CACHE_DIR=""`` would silently opt
+    every run out of it.  Kept as a read-only label only because the deployed
+    ``lx`` still calls it; delete the call and this function together.
+    """
     if "ISDF_JAX_CACHE_DIR" not in environ:
-        environ["ISDF_JAX_CACHE_DIR"] = ""
-        return "default cold"
+        return "runtime default"
     if not environ["ISDF_JAX_CACHE_DIR"].strip():
         return "explicit cold"
     return "explicit warm"

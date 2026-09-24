@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import importlib
 import inspect
+import os
 import types
 
 import jax  # noqa: F401  -- populates the jax._src submodule attributes
@@ -259,6 +260,8 @@ def test_p1_cache_setup_arms_the_observer_before_return(monkeypatch, tmp_path):
     monkeypatch.setattr(jcc, "_install_compile_counter", lambda: None)
     monkeypatch.setattr(jcc.atexit, "register", lambda _fn: None)
     monkeypatch.setenv("ISDF_JAX_CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.delenv("JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS",
+                       raising=False)
     monkeypatch.setattr(
         jax.config, "update",
         lambda *args: config_updates.append(args))
@@ -278,6 +281,31 @@ def test_p1_cache_setup_arms_the_observer_before_return(monkeypatch, tmp_path):
     assert jcc._STATE.enabled is True
     assert ("jax_compilation_cache_dir",
             str(tmp_path / "cache" / "np1")) in config_updates
+    # Threshold 0 is the runtime's policy whenever the cache is on ...
+    assert ("jax_persistent_cache_min_compile_time_secs", 0.0) \
+        in config_updates
+
+
+def test_an_exported_write_threshold_wins(monkeypatch, tmp_path):
+    """... and an exported JAX threshold is the caller's to keep."""
+    config_updates = []
+    monkeypatch.setattr(jcc, "_COMPILATION_CACHE_READY", False)
+    for name in ("enabled", "dir", "n_proc", "proc_idx"):
+        monkeypatch.setattr(jcc._STATE, name, getattr(jcc._STATE, name))
+    monkeypatch.setattr(jax, "process_count", lambda: 1)
+    monkeypatch.setattr(jax, "process_index", lambda: 0)
+    monkeypatch.setattr(jcc, "_install_compile_counter", lambda: None)
+    monkeypatch.setattr(jcc.atexit, "register", lambda _fn: None)
+    monkeypatch.setattr(jcc, "_install_atomic_put_patch", lambda: None)
+    monkeypatch.setattr(jcc, "_install_observation_patch", lambda: None)
+    monkeypatch.setattr(jcc, "bound_cache_dir", lambda: "")
+    monkeypatch.setenv("ISDF_JAX_CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.setenv("JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS", "1")
+    monkeypatch.setattr(
+        jax.config, "update", lambda *args: config_updates.append(args))
+
+    jcc.ensure_jax_compile_cache()
+
     assert not [name for name, _value in config_updates
                 if name == "jax_persistent_cache_min_compile_time_secs"]
 
@@ -301,17 +329,50 @@ def test_explicit_cache_off_also_disables_xla_subcaches(monkeypatch, n_proc):
         ("jax_persistent_cache_enable_xla_caches", "")]
 
 
-def test_cache_default_is_cold_despite_ambient_cache_roots(monkeypatch,
-                                                           tmp_path):
-    """Absent expert control cannot silently inherit a persistent cache."""
+def test_cache_default_is_the_namespaced_scratch_tree(monkeypatch, tmp_path):
+    """Unset means the runtime default; no ambient root is ever adopted."""
     monkeypatch.delenv("ISDF_JAX_CACHE_DIR", raising=False)
     monkeypatch.setenv("LORRAX_RUN_DIR", str(tmp_path / "this-workflow"))
     monkeypatch.setenv("SCRATCH", str(tmp_path / "scratch"))
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "xdg"))
     monkeypatch.setenv(
         "JAX_COMPILATION_CACHE_DIR", str(tmp_path / "native-jax-cache"))
+    monkeypatch.setattr(jcc, "cache_namespace", lambda: "git-abc_jax_ffi")
 
-    assert jcc._resolve_cache_base_dir() == ("", "default cold")
+    assert jcc._resolve_cache_base_dir() == (
+        str(tmp_path / "scratch" / ".cache" / "lorrax" / "jax_compile"
+            / "git-abc_jax_ffi"), "runtime default")
+
+
+def test_namespace_names_source_jax_and_ffi(monkeypatch):
+    monkeypatch.setattr(jcc, "_source_identity", lambda: "source-3697ea6e")
+    monkeypatch.setattr(jcc, "_ffi_identity", lambda: "bundle-4ebfb2a4011e")
+    ns = jcc.cache_namespace()
+    assert ns.startswith("source-3697ea6e_jax") and "jaxlib" in ns
+    assert ns.endswith("_bundle-4ebfb2a4011e") and "/" not in ns
+
+
+def test_prune_retires_stale_and_over_cap_namespaces_but_never_a_live_one(
+        tmp_path, monkeypatch):
+    """TTL, then least-recently-used past the byte cap; live ones stay."""
+    day = 86400.0
+    now = 100 * day
+    ages = {"current": 0.0, "live": 1.0, "old": 8.0, "lru_a": 3.0,
+            "lru_b": 4.0}
+    for name, age in ages.items():
+        d = tmp_path / name / "np4"
+        d.mkdir(parents=True)
+        (d / "k-cache").write_bytes(b"x" * 100)
+        stamp = tmp_path / name / jcc._NS_STAMP
+        stamp.touch()
+        os.utime(stamp, (now - age * day, now - age * day))
+    # Cap at three namespaces' bytes: current + live + lru_a fit, lru_b not.
+    monkeypatch.setattr(jcc, "_NS_MAX_BYTES", 300)
+    removed = jcc._prune_namespaces(tmp_path, "current", now=now)
+    assert sorted(removed) == ["lru_b", "old"]
+    assert sorted(p.name for p in tmp_path.iterdir()
+                  if not p.name.startswith(".")) == ["current", "live",
+                                                      "lru_a"]
 
 
 def test_explicit_cache_control_wins_over_run_dir(monkeypatch, tmp_path):

@@ -50,10 +50,10 @@ def test_internal_jobid_export_feeds_both_old_helpers():
     assert env == {"SLURM_JOBID": "57920327", "SLURM_JOB_ID": "57920327"}
 
 
-def test_cache_default_is_cold_and_explicit_values_win():
+def test_cache_policy_is_the_runtimes_and_explicit_values_are_untouched():
     env = {}
-    assert apply_cache_policy(env) == "default cold"
-    assert env["ISDF_JAX_CACHE_DIR"] == ""
+    assert apply_cache_policy(env) == "runtime default"
+    assert env == {}
 
     env = {"ISDF_JAX_CACHE_DIR": "/run/warm-cache"}
     assert apply_cache_policy(env) == "explicit warm"

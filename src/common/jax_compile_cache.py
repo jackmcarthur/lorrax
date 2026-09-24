@@ -18,11 +18,9 @@ nothing else arms it.
 
 Knobs (all optional):
 
-  ``ISDF_JAX_CACHE_DIR=/some/path``    — override cache location.
+  ``ISDF_JAX_CACHE_DIR=/some/path``    — use this directory as-is (no
+                                          namespace, never pruned).
   ``ISDF_JAX_CACHE_DIR=""``             — opt out entirely.
-  ``LORRAX_RUN_DIR=/some/run``         — when the cache knob is unset, share
-                                          ``.lorrax_jax_cache`` only among
-                                          processes/drivers in this workflow.
   ``LORRAX_JAX_CACHE_MULTIPROCESS=0``   — restore the scorecard-AG refusal
                                           (no cache at all when P > 1).
   ``LORRAX_JAX_CACHE_AGREE_TIMEOUT_S``  — agreement timeout, default 300.
@@ -84,16 +82,26 @@ Knobs (all optional):
                                           refused at P>1 because it can
                                           invalidate the agreed startup set.
   ``JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS`` — standard JAX write
-                                          threshold (default 1 second).  LORRAX
-                                          does not lower it: cheap compiles are
-                                          cheaper than a Lustre entry.
+                                          threshold.  Unset, LORRAX sets 0:
+                                          almost every LORRAX executable
+                                          compiles in under JAX's default 1 s,
+                                          so that default persisted 2 of 666
+                                          (MoS2 bispinor P4).  An export wins.
 
-Default policy (``ISDF_JAX_CACHE_DIR`` unset) is cache-cold across Python
-processes.  This is the ordinary one-shot path and creates no persistent-cache
-files.  A deliberate restart or cold-to-warm campaign enables reuse by naming
-one bounded, rank-visible directory explicitly.  An empty or whitespace-only
-value is the retained explicit opt-out.  JAX's in-process executable cache is
-active in every case.
+DEFAULT POLICY (``ISDF_JAX_CACHE_DIR`` unset): ON, at
+``$SCRATCH/.cache/lorrax/jax_compile/<namespace>/np{P}``
+(:func:`default_cache_dir`), threshold 0.  The namespace names the source
+release or commit, the jax/jaxlib versions and the native FFI bundle
+(:func:`cache_namespace`); JAX's own key covers the module, the compile
+options and the backend, and the namespace covers what the key cannot see (a
+rebuilt FFI bundle behind an unchanged custom-call name).  Rank 0 prunes
+whole namespaces in a background thread (:func:`_prune_namespaces`): past a
+week unused, or least-recently-used first past a byte or file cap, and never
+one used in the last two days, so a namespace a live job agreed on is never
+removed.  MEASURED (P4, 3697ea6e, explicit directory and threshold 0): MoS2
+bispinor 71.8 s cold -> 40.1 s warm.  An empty or whitespace-only value is the
+retained explicit opt-out; JAX's in-process executable cache is active in
+every case.
 
 Within an enabled base, ``np{N_proc}`` is ONE directory shared by every rank
 of that world size (the old ``rank{i}/`` partitioning is gone; see below).
@@ -386,6 +394,8 @@ class _CacheState:
         self.compile_secs = 0.0
         self.read_secs = 0.0   # time spent loading executables from disk
         self.prefetch_secs = 0.0
+        self.agree_secs = 0.0  # startup listing + agreement + prefetch
+        self.namespace = ""    # default-policy namespace ("" when explicit/off)
         self.compile_agreement_configured = False
         self.compile_agreement_enabled = False
         self.compile_agreement_reason = "not installed"
@@ -649,28 +659,20 @@ def _jax_generation() -> str:
 # local view of the shared cache directory
 # ---------------------------------------------------------------------------
 def _local_entry_keys(cache_path: Path) -> list[str]:
-    """Cache keys this rank can see on disk, sorted.
+    """Cache keys this rank can see on disk, sorted: one ``listdir``.
 
-    An entry counts only if the file is non-empty; our atomic ``put`` makes
-    torn files impossible within a job, and this also screens out anything a
-    pre-AH (non-atomic) writer may have left behind.
+    No per-entry ``stat``: on Lustre that is a size glimpse per file on every
+    rank (0.12 ms each, measured on 1261 entries), and the atomic ``put``
+    never publishes a partial file under its final name.  An entry that is
+    unreadable anyway (a node lost before its data reached the OSTs) is
+    removed by :func:`_fatal` so the next run is clean.
     """
-    out: list[str] = []
     try:
         names = os.listdir(cache_path)
     except OSError:
-        return out
-    for name in names:
-        if not name.endswith(_CACHE_SUFFIX) or name.startswith("."):
-            continue
-        try:
-            if os.path.getsize(os.path.join(cache_path, name)) <= 0:
-                continue
-        except OSError:
-            continue
-        out.append(name[: -len(_CACHE_SUFFIX)])
-    out.sort()
-    return out
+        return []
+    return sorted(name[: -len(_CACHE_SUFFIX)] for name in names
+                  if name.endswith(_CACHE_SUFFIX) and not name.startswith("."))
 
 
 def _mask_bytes(n: int) -> bytearray:
@@ -765,7 +767,7 @@ RANK_FINGERPRINT_ENV = (
 )
 
 
-def _key_env_fingerprint() -> bytes:
+def _key_env_fingerprint(namespace: str = "") -> bytes:
     """32-byte digest of everything OUTSIDE the module that feeds the cache key.
 
     The agreement below decides which cache ENTRIES may be used; it cannot see
@@ -784,6 +786,10 @@ def _key_env_fingerprint() -> bytes:
     import hashlib
 
     h = hashlib.sha256()
+    # The runtime-default namespace is computed on every rank (git, the FFI
+    # bundle); ranks that resolved different ones would agree on rank 0's key
+    # list while reading their own directories.
+    h.update(f"namespace={namespace};".encode("utf-8"))
     try:
         from jax._src import cache_key as _ck
         excluded = set(_ck.xla_flags_to_exclude_from_cache_key)
@@ -866,7 +872,7 @@ def _agree_on_entries(cache_path: Path, n_proc: int, proc_idx: int,
         if k in local_set and k not in hidden:
             _set_bit(mask, i)
 
-    fp = _key_env_fingerprint()
+    fp = _key_env_fingerprint(_STATE.namespace)
     if proc_idx != 0:
         client.key_value_set_bytes(f"{_KV_NS}/mask/{proc_idx}",
                                    b"M" + fp + bytes(mask))
@@ -948,13 +954,22 @@ def _prefetch_agreed(cache_path: Path, agreed, n_threads: int) -> float:
 # the monkeypatches
 # ---------------------------------------------------------------------------
 def _fatal(cache_key: str, why: str) -> None:
+    # Remove the bad entry first: with the cache on by default, an entry that
+    # cannot be read would otherwise abort every later run in its namespace.
+    # A missing file is the "disappeared" case and needs no removal.
+    removed = ""
+    try:
+        os.unlink(os.path.join(_STATE.dir, cache_key + _CACHE_SUFFIX))
+        removed = " The entry has been removed; the next run recompiles it."
+    except OSError:
+        pass
     msg = (f"  [compile-cache] FATAL: entry '{cache_key[:48]}...' was agreed "
            f"readable by every rank but this rank ({_STATE.proc_idx}) cannot "
            f"load it ({why}).  Continuing would make the ranks' hit/miss "
            f"patterns diverge, which deadlocks XLA:GPU's cross-process "
-           f"autotune exchange (scorecard AG).  Aborting instead of hanging. "
-           f"Delete {_STATE.dir} and re-run; set LORRAX_JAX_CACHE_STRICT=0 to "
-           f"downgrade this to a warning (UNSAFE on GPU).")
+           f"autotune exchange (scorecard AG).  Aborting instead of hanging."
+           f"{removed} Set LORRAX_JAX_CACHE_STRICT=0 to downgrade this to a "
+           f"warning (UNSAFE on GPU).")
     if _truthy("LORRAX_JAX_CACHE_STRICT", "1"):
         print(msg, file=sys.stderr, flush=True)
         print(msg, flush=True)
@@ -1802,6 +1817,10 @@ def _dump_keys() -> None:
         "vetoed": s.blocked,
         "n_seen": s.n_seen,
         "n_agreed": s.n_agreed,
+        "namespace": s.namespace,
+        "agree_secs": s.agree_secs,
+        "prefetch_secs": s.prefetch_secs,
+        "read_secs": s.read_secs,
         # These are THIS PROCESS'S completed writes.  JAX invokes its
         # persistent-cache writer on process 0 only, so peers correctly
         # report zero rather than duplicating p0's work.
@@ -1937,6 +1956,7 @@ def compile_cache_stats() -> dict:
         "compile_fingerprint_secs": s.compile_fingerprint_secs,
         "compile_agreement_secs": s.compile_agreement_secs,
         "read_secs": s.read_secs, "prefetch_secs": s.prefetch_secs,
+        "agree_secs": s.agree_secs, "namespace": s.namespace,
         **writes,
         "is_cache_writer": s.proc_idx == 0,
         "write_scope": "process-local; JAX writes on process 0 only",
@@ -1945,20 +1965,226 @@ def compile_cache_stats() -> dict:
     }
 
 
-def _resolve_cache_base_dir() -> tuple[str, str]:
-    """Resolve the one persistent-cache owner without implicit reuse.
+# ---------------------------------------------------------------------------
+# the default location: one namespace per release, pruned by rank 0
+# ---------------------------------------------------------------------------
+#: Namespace retention.  A namespace used in the last two days is never
+#: removed: Perlmutter's longest job is 48 h, and a live job's agreed entries
+#: must stay readable until it exits (an agreed entry that vanishes aborts
+#: the run, :func:`_fatal`).  Past that a namespace goes after a week unused,
+#: or earlier, least recently used first, while the tree exceeds either cap.
+#: Measured sizes (P4, 3697ea6e): MoS2 bispinor 606 entries / 4.0 MB, Fe 4^3
+#: bispinor 1261 / 18 MB, so the caps hold roughly a hundred deck-releases.
+_NS_LIVE_S = 2 * 86400
+_NS_TTL_S = 7 * 86400
+_NS_MAX_BYTES = 2 << 30
+_NS_MAX_FILES = 200_000
+_NS_PRUNE_EVERY_S = 6 * 3600
+_NS_STAMP = ".last_used"
+_NS_PRUNE_STAMP = ".last_prune"
 
-    Cross-process reuse is an explicit request: a nonempty
-    ``ISDF_JAX_CACHE_DIR``.  Unset and empty both stay cache-cold, so an
-    ordinary one-shot run cannot inherit tens of thousands of global entries
-    merely because ``LORRAX_RUN_DIR``, ``SCRATCH`` or ``XDG_CACHE_HOME`` is
-    present.  The empty spelling remains distinguishable in the receipt as an
-    explicit opt-out.
+
+def default_cache_root() -> Path:
+    """``$SCRATCH/.cache/lorrax/jax_compile`` (``~`` where there is no SCRATCH).
+
+    Beside the k-convolution cubin cache (``ffi.fft.cubin_cache_dir``): on
+    scratch, never home, and one tree per user.
+    """
+    root = os.environ.get("SCRATCH") or os.path.expanduser("~")
+    return Path(root) / ".cache" / "lorrax" / "jax_compile"
+
+
+def _source_identity() -> str:
+    """The LORRAX source this process runs: a git commit or a release name.
+
+    A checkout reports ``git-<12 hex>``; a release copy (the module's
+    ``releases/source-3697ea6e``) has no ``.git`` and reports its directory
+    name; an installed distribution reports its version.
+    """
+    root = None
+    try:
+        from runtime import source_closure as _sc
+        rec = _sc._RECEIPT
+        if rec is None:
+            root = _sc._runtime_source_root(
+                Path(_sc.__file__).with_name("__init__.py"))
+        elif rec.mode == "source":
+            root = Path(rec.root)
+    except Exception:                                      # noqa: BLE001
+        root = None
+    if root is None:
+        try:
+            from importlib import metadata
+            return "lorrax-" + metadata.version("lorrax")
+        except Exception:                                  # noqa: BLE001
+            return "source-unknown"
+    if (root / ".git").exists():
+        import subprocess
+        try:
+            out = subprocess.run(
+                ["git", "-C", str(root), "rev-parse", "--short=12", "HEAD"],
+                capture_output=True, text=True, timeout=60, check=True)
+            return "git-" + out.stdout.strip()
+        except Exception:                                  # noqa: BLE001
+            pass
+    return root.name
+
+
+def _library_identity(path) -> str:
+    """A native library's sealed bundle id, or its own SHA-256 when unsealed."""
+    p = Path(path).resolve()
+    for manifest in (p.parent / "lorrax_ffi_bundle.json",
+                     p.parent.parent / "lorrax_ffi_bundle.json"):
+        if manifest.is_file():
+            bundle = json.loads(manifest.read_text(encoding="utf-8"))
+            return "bundle-" + str(bundle["bundle_id"])[:12]
+    h = hashlib.sha256()
+    with open(p, "rb") as fh:
+        for block in iter(lambda: fh.read(1 << 20), b""):
+            h.update(block)
+    return "so-" + h.hexdigest()[:12]
+
+
+def _ffi_identity() -> str:
+    """The FFI libraries this process loaded, or would load first."""
+    try:
+        from ffi.common import ffi_loader
+    except Exception:                                      # noqa: BLE001
+        return "noffi"
+    ids = set()
+    for platform in ("CUDA", "cpu"):
+        path = ffi_loader.loaded_lib_path(platform)
+        if path is None:
+            path = next((c for c in ffi_loader._candidate_paths(platform)
+                         if c.is_file()), None)
+        if path is not None:
+            try:
+                ids.add(_library_identity(path))
+            except (OSError, ValueError, KeyError):
+                ids.add("unreadable")
+    return "+".join(sorted(ids)) or "noffi"
+
+
+def cache_namespace() -> str:
+    """``<source>_jax<v>-jaxlib<v>_<ffi>``: what JAX's own key cannot see.
+
+    JAX keys an entry on the module, the compile options, the jaxlib version
+    and the backend.  It does not see the native bundle behind a custom-call
+    name (a handler's traits, e.g. command-buffer compatibility, are read at
+    compile time), and grouping by source release is what lets the pruner
+    retire a whole release at once.
+    """
+    import jax
+    from jax._src.lib import version_str as jaxlib_version
+    raw = (f"{_source_identity()}_jax{jax.__version__}-jaxlib{jaxlib_version}"
+           f"_{_ffi_identity()}")
+    return re.sub(r"[^A-Za-z0-9._+-]", "-", raw)
+
+
+def default_cache_dir() -> Path:
+    """The default-policy base: :func:`default_cache_root` / namespace."""
+    return default_cache_root() / cache_namespace()
+
+
+def _prune_namespaces(root: Path, current: str, *,
+                      now: float | None = None) -> list[str]:
+    """Retire whole stale namespaces under ``root``; return their names.
+
+    Newest-used first, a namespace is kept while it is ``current``, used
+    within :data:`_NS_LIVE_S`, or both younger than :data:`_NS_TTL_S` and
+    inside the byte and file caps counted so far.  Removal is a rename into
+    ``root/.trash`` (atomic, so no run ever lists a half-deleted namespace)
+    and then a best-effort delete.
+    """
+    import shutil
+
+    now = time.time() if now is None else float(now)
+    usage = []
+    for entry in os.scandir(root):
+        if entry.name.startswith(".") or not entry.is_dir(follow_symlinks=False):
+            continue
+        try:
+            used = os.stat(os.path.join(entry.path, _NS_STAMP)).st_mtime
+        except OSError:
+            used = entry.stat(follow_symlinks=False).st_mtime
+        nbytes = nfiles = 0
+        for dirpath, _dirs, files in os.walk(entry.path):
+            nfiles += len(files)
+            for name in files:
+                try:
+                    nbytes += os.stat(os.path.join(dirpath, name)).st_size
+                except OSError:
+                    pass
+        usage.append((used, entry.name, nbytes, nfiles))
+    usage.sort(reverse=True)
+    removed: list[str] = []
+    total_bytes = total_files = 0
+    for used, name, nbytes, nfiles in usage:
+        total_bytes += nbytes
+        total_files += nfiles
+        age = now - used
+        if name == current or age < _NS_LIVE_S:
+            continue
+        if (age > _NS_TTL_S or total_bytes > _NS_MAX_BYTES
+                or total_files > _NS_MAX_FILES):
+            trash = root / ".trash" / f"{name}.{uuid.uuid4().hex[:8]}"
+            try:
+                trash.parent.mkdir(exist_ok=True)
+                os.rename(root / name, trash)
+            except OSError:
+                continue
+            removed.append(name)
+            total_bytes -= nbytes
+            total_files -= nfiles
+    shutil.rmtree(root / ".trash", ignore_errors=True)
+    return removed
+
+
+def _start_namespace_prune(root: Path, current: str) -> None:
+    """Rank 0, at most every :data:`_NS_PRUNE_EVERY_S`: prune in a daemon thread.
+
+    Off the startup path: the walk stats every file of every namespace.  A
+    process that exits mid-walk leaves only atomic renames behind, and the
+    next prune finishes the ``.trash`` delete.
+    """
+    stamp = root / _NS_PRUNE_STAMP
+    try:
+        if time.time() - stamp.stat().st_mtime < _NS_PRUNE_EVERY_S:
+            return
+    except OSError:
+        pass
+    try:
+        stamp.touch()
+    except OSError:
+        return
+
+    def _run() -> None:
+        try:
+            removed = _prune_namespaces(root, current)
+            if removed:
+                _debug_say(f"pruned {len(removed)} stale namespace(s) under "
+                           f"{root}: {', '.join(removed)}")
+        except Exception as exc:                           # noqa: BLE001
+            _say(f"namespace prune under {root} failed "
+                 f"({type(exc).__name__}: {exc}); nothing is lost but space.")
+
+    threading.Thread(target=_run, name="lorrax-jax-cache-prune",
+                     daemon=True).start()
+
+
+def _resolve_cache_base_dir() -> tuple[str, str]:
+    """Resolve the one persistent-cache owner: ``(base, source)``.
+
+    A nonempty ``ISDF_JAX_CACHE_DIR`` is used as-is (``"explicit"``); an
+    empty or whitespace one is the explicit opt-out.  Unset, the runtime
+    default is :func:`default_cache_dir` (``"runtime default"``).  No other
+    variable (``LORRAX_RUN_DIR``, ``XDG_CACHE_HOME``, JAX's own
+    ``JAX_COMPILATION_CACHE_DIR``) selects a location.
     """
     explicit = os.environ.get("ISDF_JAX_CACHE_DIR")
     if explicit is not None:
         return explicit.strip(), "explicit"
-    return "", "default cold"
+    return str(default_cache_dir()), "runtime default"
 
 
 # ---------------------------------------------------------------------------
@@ -2037,7 +2263,12 @@ def ensure_jax_compile_cache() -> None:
                  f"will read 0 no matter what this run compiles — do not "
                  f"read that as a cache hit.")
 
-    cache_dir, cache_source = _resolve_cache_base_dir()
+    try:
+        cache_dir, cache_source = _resolve_cache_base_dir()
+    except Exception as exc:                               # noqa: BLE001
+        cache_dir, cache_source = "", (
+            f"the runtime-default namespace could not be resolved "
+            f"({type(exc).__name__}: {exc})")
     if n_proc > 1 or not cache_dir:
         # This setting belongs before every early return below.  Otherwise an
         # explicit cache opt-out leaves JAX's process-0 UPDATE / peer READ
@@ -2047,21 +2278,27 @@ def ensure_jax_compile_cache() -> None:
     if not cache_dir:
         if proc_idx == 0:
             reason = ("ISDF_JAX_CACHE_DIR=\"\" opt-out"
-                      if cache_source == "explicit"
-                      else "ISDF_JAX_CACHE_DIR unset: cache-cold default")
+                      if cache_source == "explicit" else cache_source)
             _say(f"persistent compile cache OFF ({reason}). JAX's in-process "
-                 f"executable cache remains active. For reuse among "
-                 f"sequential drivers or a deliberate restart campaign, set "
-                 f"ISDF_JAX_CACHE_DIR to a rank-visible directory.")
+                 f"executable cache remains active.")
         return
 
-    if cache_source != "explicit" and proc_idx == 0:
-        # A derived location must be visible in the log (quality-pattern #8).
-        label = ("workflow-local" if cache_source == "LORRAX_RUN_DIR"
-                 else "legacy fallback")
-        _debug_say(
-            f"cache dir ({label}): {cache_dir} ({cache_source}; "
-            f"ISDF_JAX_CACHE_DIR overrides, \"\" opts out).")
+    if cache_source != "explicit":
+        _STATE.namespace = Path(cache_dir).name
+        if proc_idx == 0:
+            # A derived location must be visible in the log (quality-pattern
+            # #8).  The stamp is what the pruner reads as "last used".
+            try:
+                Path(cache_dir).mkdir(parents=True, exist_ok=True)
+                (Path(cache_dir) / _NS_STAMP).touch()
+                _start_namespace_prune(Path(cache_dir).parent,
+                                       Path(cache_dir).name)
+            except OSError as exc:
+                _say(f"cannot stamp {cache_dir} ({exc}); it may be pruned "
+                     f"early.")
+            _debug_say(
+                f"cache dir (runtime default): {cache_dir} "
+                f"(ISDF_JAX_CACHE_DIR overrides, \"\" opts out).")
 
     # ---- back-compat escape hatch: the scorecard-AG refusal --------------
     if n_proc > 1 and not _truthy("LORRAX_JAX_CACHE_MULTIPROCESS", "1"):
@@ -2093,10 +2330,13 @@ def ensure_jax_compile_cache() -> None:
     try:
         import jax as _jax
         _jax.config.update("jax_compilation_cache_dir", str(cache_path))
-        # Keep JAX's standard one-second write threshold (or the user's
-        # JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS override).  Forcing zero
-        # here made every persistable compilation eligible regardless of its
-        # compile time, creating a Lustre-file storm of cheap entries.
+        # Threshold 0 unless exported: JAX's 1 s default persisted 2 of 666
+        # executables on the MoS2 bispinor deck, whose cold compile is 65 %
+        # of its wall.  The file count this adds is bounded by the namespace
+        # pruner (default location) or by whoever owns an explicit directory.
+        if os.environ.get("JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS") is None:
+            _jax.config.update(
+                "jax_persistent_cache_min_compile_time_secs", 0.0)
         if n_proc > 1:
             # See docstring §4: JAX would otherwise auto-enable XLA's own
             # per-fusion autotune cache in UPDATE(p0)/READ(peers) mode, which
@@ -2266,6 +2506,7 @@ def ensure_jax_compile_cache() -> None:
             cache_path, agreed,
             _int_env("LORRAX_JAX_CACHE_PREFETCH_THREADS", 16))
 
+    _STATE.agree_secs = time.monotonic() - t0
     dropped = n_seen - len(agreed)
     if proc_idx == 0:
         _debug_say(

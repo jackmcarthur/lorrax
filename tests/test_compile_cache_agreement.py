@@ -94,15 +94,17 @@ def _make_entries(d, keys, size=16):
 
 
 # ---------------------------------------------------------------------------
-def test_local_entry_keys_ignores_partial_and_temp_files(tmp_path):
+def test_local_entry_keys_ignores_temp_files_without_a_stat(tmp_path):
     _make_entries(tmp_path, ["jit_a-1111", "jit_b-2222"])
-    # a zero-length file (a torn write from a pre-AH, non-atomic writer)
-    (tmp_path / f"jit_c-3333{jcc._CACHE_SUFFIX}").write_bytes(b"")
     # our own in-flight temp file
     (tmp_path / f".jit_d-4444{jcc._CACHE_SUFFIX}.tmp.123.abcd").write_bytes(b"x")
     # jax's atime sidecar
     (tmp_path / "jit_a-1111-atime").write_bytes(b"12345678")
     assert jcc._local_entry_keys(tmp_path) == ["jit_a-1111", "jit_b-2222"]
+    # A zero-length file is listed (one listdir, no per-entry stat); if it is
+    # ever agreed and read, _fatal removes it before aborting.
+    (tmp_path / f"jit_c-3333{jcc._CACHE_SUFFIX}").write_bytes(b"")
+    assert "jit_c-3333" in jcc._local_entry_keys(tmp_path)
 
 
 def test_all_ranks_agree_when_the_directory_is_shared(tmp_path):
