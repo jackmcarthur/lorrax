@@ -1081,6 +1081,7 @@ def pulay_nojit(
     metric=None,
     history: str = "evaluated",
     safeguard: bool = False,
+    restart_fn: Callable = None,
 ) -> AccelerationResult:
     """One map evaluation per iteration: Anderson type II or CROP.
 
@@ -1195,6 +1196,18 @@ def pulay_nojit(
         f = _entry(residual_fn(x))
         res = _norm(f)
         res_history.append(res)
+        if restart_fn is not None and restart_fn():
+            # The map itself changed discretely during this evaluation (a
+            # quadrature rebuild or sampled-grid growth): every stored
+            # difference straddling the event carries the jump, so keep only
+            # the newest pair.  No parameter.
+            filled, head = 0, 0
+            best, best_res = (x, f), res
+            window_res = [res]
+            fallback = False
+            if print_fn is not None:
+                print_fn(f"  pulay step {it:02d}: map event, history restarted")
+            continue
         if safeguard:
             # Never two fallbacks in a row: the second would re-evaluate the
             # same G(x_best).

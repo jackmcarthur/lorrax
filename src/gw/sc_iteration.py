@@ -5847,6 +5847,24 @@ def _run_rcrop(
     _identity_history = {}
     _frozen_fits: list = [getattr(state_init, "frozen_scissor_fits", None)]
     _probe_line_ref: list = [None]   # DIAGNOSTIC (LORRAX_SC_STATE_PROBE_LINE)
+    _map_event: list = [False]
+
+    def _event_key():
+        """Discrete map-changing state: sampled grid, rule rebuild counts."""
+        sess = inputs.fixed_quadrature_session
+        if sess is None:
+            return None
+        counts = []
+
+        def walk(d):
+            for k in sorted(d, key=repr):
+                v = d[k]
+                if k in ("rebuild_count", "epoch", "material_class"):
+                    counts.append((k, repr(v)))
+                elif isinstance(v, dict):
+                    walk(v)
+        walk(sess)
+        return (tuple(sess.get("omega_grid_ev", ())), tuple(counts))
 
     def residual_fn(H_in: jnp.ndarray) -> jnp.ndarray:
         # SHARDED IN, REPLICATED CARRY, SHARDED OUT.  The gather is one
@@ -5881,6 +5899,7 @@ def _run_rcrop(
             head_surface_weight_kn=_head_surface_weight[0],
             frozen_scissor_fits=_frozen_fits[0],
         )
+        _key_before = _event_key()
         _probe_env = os.environ.get("LORRAX_SC_STATE_PROBE", "").strip()
         if _probe_env:
             _probe_state = lambda: dict(  # noqa: E731
@@ -5993,6 +6012,10 @@ def _run_rcrop(
                                        "sc_state_probe.jsonl"), "a") as _fh:
                     _fh.write(_json.dumps(_rec) + "\n")
             _record_sc(inputs, f"    SC STATE PROBE: {_json.dumps(_rec)}")
+        _map_event[0] = (_iter_idx[0] > 0 and _event_key() != _key_before)
+        if _map_event[0]:
+            _record_sc(inputs, f"    SC map event at call {_iter_idx[0]}: "
+                               "sampled grid or Sigma rule set changed")
         _last_outputs[0] = state_out.outputs
         if _frozen_fits[0] is None:
             _frozen_fits[0] = _capture_frozen_scissor_fits(state_out.outputs)
@@ -6172,7 +6195,9 @@ def _run_rcrop(
                 tol=0.0, print_fn=lambda l: _record_sc(inputs, l),
                 entry_sharding=entry_sh, metric=_metric_np,
                 history=("optimal" if _accel == "crop" else "evaluated"),
-                safeguard=_accel in ("anderson_sg", "anderson_z"))
+                safeguard=_accel in ("anderson_sg", "anderson_z"),
+                restart_fn=((lambda: _map_event[0])
+                            if _accel in ("anderson_sg", "anderson_z") else None))
     except _Converged as stop:
         # The criterion fired inside the map.  Return the accepted
         # map INPUT that met it, NOT F(input) and not rCROP's stale internal
