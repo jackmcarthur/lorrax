@@ -402,17 +402,22 @@ def _announce_solved(quad: Quadrature, sum_abs_w: float,
         return
     _SERVE_ANNOUNCED.add(key)
     kappa = "unrecorded" if quad.kappa0 is None else f"{quad.kappa0:.4g}"
+    met = (quad.max_error is not None and quad.error_bound is not None
+           and float(quad.max_error) <= float(quad.error_bound))
+    verdict = ("met its target" if met else
+               f"MISSED its target: the n_max={int(n_max)} rule's max_err "
+               f"exceeds {quad.error_bound:.0e}")
     warnings.warn(
         f"minimax: SOLVED {quad.family}/{quad.target} "
         f"{quad.range_param}={quad.range_value:g} target "
         f"{quad.error_bound:.0e} n_max={int(n_max)} -> "
         f"{quad.node_count} nodes, max_err {quad.max_error:.4g}, "
         f"sum|w| {sum_abs_w:.4g}, kappa0 {kappa} | "
-        f"{quad.provenance.one_line()}.  Every rule is computed at run time "
-        f"(2026-09-16), so this one was solved here and met its own target. "
-        f"Node positions can differ in the last digits between hosts because "
-        f"the solve goes through this machine's LAPACK: compare two rules by "
-        f"their node count and error, not byte for byte.",
+        f"{quad.provenance.one_line()}.  Solved here at run time; it "
+        f"{verdict}.  Node positions can differ in the last digits between "
+        f"hosts because the solve goes through this machine's LAPACK: "
+        f"compare two rules by their node count and error, not byte for "
+        f"byte.",
         RuntimeWarning, stacklevel=3)
 
 

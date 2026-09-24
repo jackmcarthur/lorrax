@@ -406,7 +406,25 @@ def test_the_solve_announces_itself_once_with_its_numbers(isolated_cache):
     line = lines[0]
     assert "crossing/hgl A_dim=20" in line
     assert "sum|w|" in line and "kappa0" in line
-    assert "computed at run time" in line
+    assert "Solved here at run time" in line
+    assert ("met its target" in line) == (q.max_error <= q.error_bound)
+
+
+def test_the_solved_announcement_says_when_the_target_was_missed():
+    """A rule whose measured error exceeds the request is announced as a miss."""
+    from minimax import door
+    from minimax.records import Quadrature, runtime_provenance
+    q = Quadrature(
+        nodes=np.ones(3), weights=np.ones(3), family="crossing",
+        target="hgl", range_param="A_dim", range_value=20.0,
+        error_bound=1.0e-6, max_error=3.0e-6, kappa0=None, kappa1=None,
+        provenance=runtime_provenance("x", "numpy"))
+    door._SERVE_ANNOUNCED.clear()
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        door._announce_solved(q, sum_abs_w=3.0, n_max=3)
+    line = str(caught[-1].message)
+    assert "MISSED its target" in line and "met its target" not in line
 
 
 def test_a_family_with_no_in_process_solver_refuses_rather_than_hanging():
