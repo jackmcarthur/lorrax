@@ -180,8 +180,10 @@ def _endpoint_route(header, basis, sym, span, rows, mesh_xy, axis, width):
 def sector_synthesis(readers, headers, bases, families, frequencies, meta, mesh_xy):
     """Retain full-q endpoint factors and form one W(t) tile per tau.
 
-    The store and symmetry services are called once at setup.  The same
-    configured wavefunction layout selects face or axis GEMM input placement.
+    The store and symmetry services are called once at setup.  The factors
+    are placed once, with pole columns replicated (axis orientation) whenever
+    the capacity ledger admits it, so each tau is a local GEMM; otherwise the
+    configured face placement is kept.
     Occupied windows use conj(B_A(-q)) d(t) B_B(-q)^T; d is never conjugated.
     """
     from distrib_la import gemm_plan
@@ -220,24 +222,39 @@ def sector_synthesis(readers, headers, bases, families, frequencies, meta, mesh_
         route,cost=_endpoint_route(h,b,f.green_parent.plan.sym,(0,nq),rows,
                                    mesh_xy,axis,kcarrier)
         routes.append(route);costs.append(cost)
-    # A face input is required by the established symmetry route. After it
-    # completes, keep only the configured GEMM input layout across all tau.
-    factor_spec=_shared_pole_factor_specs(layout)
     def place(value,spec):
         return jax.jit(lambda x:x,out_shardings=NamedSharding(mesh_xy,spec))(value)
     px,py=int(mesh_xy.shape['x']),int(mesh_xy.shape['y'])
     face_bytes=16*nq*kcarrier*(m*nc+n*nt)//mesh_xy.size
-    # Each factor has one centroid axis. Pole columns divide over the other
-    # mesh axis only in low_mem_bands face layout.
-    resident_bytes=16*nk*((m//px)*nc*(kcarrier//py if layout=='face' else kcarrier)
-                          +(n//py)*nt*(kcarrier//px if layout=='face' else kcarrier))
-    resident_bytes+=8*nk*kcarrier+16*nk*m*nc*n*nt//mesh_xy.size
+
+    def resident_for(factor_layout):
+        # Each factor has one centroid axis. Pole columns divide over the
+        # other mesh axis only in the face orientation.
+        split=factor_layout=='face'
+        return (16*nk*((m//px)*nc*(kcarrier//py if split else kcarrier)
+                       +(n//py)*nt*(kcarrier//px if split else kcarrier))
+                +8*nk*kcarrier+16*nk*m*nc*n*nt//mesh_xy.size)
     native=_native_workspace(mesh_xy,(((nk,m*nc,kcarrier),(nk,kcarrier,n*nt)),))
+    workspace=sum(c['estimated_live_bytes_per_rank'] for c in costs)+native
+    # A face input is required by the established symmetry route. After it
+    # completes the factors are placed once for every tau: they do not depend
+    # on tau, only d(tau) does. With K replicated (axis orientation) each tau
+    # is a local batched GEMM with no collective; the face GEMM's per-q SUMMA
+    # re-broadcast the same panels every call (Fe 4^3 bispinor: 158k NCCL
+    # broadcasts, 9.9 s of the first sector sweep). Face stays the fallback
+    # when the ledger cannot admit the replicated pole columns.
+    factor_layout=layout
+    if layout=='face' and capacity.preview(
+            resident_bytes_per_rank=resident_for('axis')+2*face_bytes,
+            workspace_bytes_per_rank=workspace,
+            concurrent_with=ambient)['device_budget_status']=='PASS':
+        factor_layout='axis'
+    factor_spec=_shared_pole_factor_specs(factor_layout)
+    resident_bytes=resident_for(factor_layout)
     setup=f'sigma.sector.setup.{tag}'
     resident=f'sigma.sector.resident.{tag}'
     capacity.reserve(setup,resident_bytes_per_rank=resident_bytes+2*face_bytes,
-        workspace_bytes_per_rank=sum(c['estimated_live_bytes_per_rank'] for c in costs)+native,
-        concurrent_with=ambient)
+        workspace_bytes_per_rank=workspace,concurrent_with=ambient)
     capacity.live_stages=(*ambient,setup)
     try:
         same=readers[0] is readers[1] and headers[0] is headers[1]
@@ -270,7 +287,7 @@ def sector_synthesis(readers, headers, bases, families, frequencies, meta, mesh_
         raise
     try:
         gemm=gemm_plan(mesh_xy,m=m*nc,n=n*nt,k=kcarrier,nq=nk,
-                       dtype=np.complex128,layout=layout)
+                       dtype=np.complex128,layout=factor_layout)
         minus=jnp.asarray(q_negation_index(tuple(left['grid'])))
         @partial(jax.jit,static_argnums=(6,))
         def kernel(x,y,omega,interval,ref,time,hole):
@@ -280,7 +297,7 @@ def sector_synthesis(readers, headers, bases, families, frequencies, meta, mesh_
                 omega=jnp.take(omega,minus,axis=0)
                 interval=jnp.take(interval,minus,axis=0)
             weights=_shared_pole_weights(omega,interval,ref,time)
-            return _shared_pole_contract(x,y,weights,gemm=gemm,layout=layout)
+            return _shared_pole_contract(x,y,weights,gemm=gemm,layout=factor_layout)
         def abstract(shape,dtype,spec=P()):
             return jax.ShapeDtypeStruct(shape,dtype,sharding=NamedSharding(mesh_xy,spec))
         args=(abstract((nk,m,nc,kcarrier),np.complex128,factor_spec[0]),
