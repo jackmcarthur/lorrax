@@ -1027,18 +1027,29 @@ class ResidentBankPayload:
     own code. The header is kept as the JSON text the file would store.
     Reads return exactly the file read's values: one sliced face copy, moved
     to batch layout by the same staged exchange as a permuted file read.
+
+    ``memory_kind="pinned_host"`` is the tier for a payload the devices cannot
+    hold: each [d_c, d_c] face tile (one q, one sample) is a pinned-host array
+    with the face sharding, written by the frequency-major producer and moved
+    back whole by the parent-major reader, so every move is one contiguous
+    per-rank DMA and the devices hold only the span being read.
     """
 
-    def __init__(self, mesh, *, carrier, label):
+    def __init__(self, mesh, *, carrier, label, memory_kind="device"):
+        if memory_kind not in ("device", "pinned_host"):
+            _refuse(f"resident bank memory kind {memory_kind!r}")
         self.mesh = mesh
         self.carrier = int(carrier)
         self.label = str(label)
+        self.memory_kind = memory_kind
         self.header_json = None
         self._fields = {}
         self._logical = {}
+        self._stored = {}
 
     def __str__(self):
-        return f"device-resident shared-pole bank ({self.label})"
+        tier = "device-resident" if self.memory_kind == "device" else "pinned-host"
+        return f"{tier} shared-pole bank ({self.label})"
 
     def __enter__(self):
         return self
@@ -1047,8 +1058,8 @@ class ResidentBankPayload:
         return False
 
     def payload_bytes_per_rank(self):
-        return sum(_local_bytes(v.shape, v.dtype, self.mesh, v.sharding.spec)
-                   for v in self._fields.values())
+        return sum(_local_bytes(shape, np.complex128, self.mesh, self._spec(len(shape)))
+                   for shape in self._stored.values())
 
     def release(self):
         """Drop every device payload; the handle cannot be read afterwards."""
@@ -1074,8 +1085,12 @@ class ResidentBankPayload:
         if max(shape[-2:]) > self.carrier:
             _refuse(f"resident bank {name} logical extent exceeds canonical carrier")
         stored = shape[:-2] + (self.carrier, self.carrier)
-        self._fields[name] = _resident_zeros(self.mesh, stored)()
+        # Host tiles are keyed by their lead index; an unwritten one reads as
+        # the file's zero fill.
+        self._fields[name] = (_resident_zeros(self.mesh, stored)()
+                              if self.memory_kind == "device" else {})
         self._logical[name] = shape
+        self._stored[name] = stored
 
     def write_attr(self, name, value):
         # Masks and typed tables are authenticated by the JSON header alone.
@@ -1088,32 +1103,46 @@ class ResidentBankPayload:
     def write_slab(self, name, A, *, offset):
         if name not in self._fields:
             _refuse(f"resident bank {name} was not created")
-        store = self._fields[name]
+        store, stored = self._fields[name], self._stored[name]
         offset = tuple(int(v) for v in offset)
-        if (A.ndim != store.ndim or tuple(A.shape[-2:]) != tuple(store.shape[-2:])
+        if (A.ndim != len(stored) or tuple(A.shape[-2:]) != stored[-2:]
                 or any(o != 0 for o in offset[-2:])
-                or any(o + s > n for o, s, n in zip(offset, A.shape, store.shape))
+                or any(o + s > n for o, s, n in zip(offset, A.shape, stored))
                 or not A.sharding.is_equivalent_to(NamedSharding(self.mesh, self._spec(A.ndim)), A.ndim)):
             _refuse(f"resident bank {name} write must be a face-tiled full-carrier span")
         logical = self._logical[name][-1]
-        self._fields[name] = _resident_update(self.mesh, store.ndim, logical)(
-            store, A, self._lead(offset))
+        if self.memory_kind == "device":
+            self._fields[name] = _resident_update(self.mesh, len(stored), logical)(
+                store, A, self._lead(offset))
+            return
+        A = _resident_mask(self.mesh, A.ndim, logical)(A)
+        host = NamedSharding(self.mesh, P("x", "y"), memory_kind=self.memory_kind)
+        for index in np.ndindex(A.shape[:-2]):
+            store[tuple(o + i for o, i in zip(offset, index))] = jax.device_put(A[index], host)
 
     def read_slab(self, name, *, shape, offset, dtype, partition_spec, valid_shape=None):
         if name not in self._fields:
             _refuse(f"resident bank {name} has no payload")
-        store = self._fields[name]
+        store, stored = self._fields[name], self._stored[name]
         shape = tuple(int(s) for s in shape)
         offset = tuple(int(v) for v in offset)
         valid = shape if valid_shape is None else tuple(int(v) for v in valid_shape)
         logical = self._logical[name]
-        if (np.dtype(dtype) != np.dtype(np.complex128) or len(shape) != store.ndim
-                or shape[-2:] != tuple(store.shape[-2:]) or any(o != 0 for o in offset[-2:])
+        if (np.dtype(dtype) != np.dtype(np.complex128) or len(shape) != len(stored)
+                or shape[-2:] != stored[-2:] or any(o != 0 for o in offset[-2:])
                 or valid[:-2] != shape[:-2] or valid[-2:] != logical[-2:]
-                or any(o + s > n for o, s, n in zip(offset, shape, store.shape))):
+                or any(o + s > n for o, s, n in zip(offset, shape, stored))):
             _refuse(f"resident bank {name} read must request full-carrier spans")
-        face = self._spec(store.ndim)
-        value = _resident_slice(self.mesh, store.ndim, shape[:-2])(store, self._lead(offset))
+        face = self._spec(len(stored))
+        if self.memory_kind == "device":
+            value = _resident_slice(self.mesh, len(stored), shape[:-2])(store, self._lead(offset))
+        else:
+            device = NamedSharding(self.mesh, P("x", "y"))
+            tiles = [store.get(tuple(o + i for o, i in zip(offset, index)))
+                     for index in np.ndindex(shape[:-2])]
+            tiles = [_resident_zeros(self.mesh, shape[-2:])() if t is None
+                     else jax.device_put(t, device) for t in tiles]
+            value = _resident_stack(self.mesh, shape[:-2])(*tiles)
         layout = _bank_layout(None if tuple(partition_spec) == tuple(face) else partition_spec)
         return value if layout == "face" else _bank_face_to_batch(self.mesh, value.ndim)(value)
 
@@ -1125,15 +1154,34 @@ def _resident_zeros(mesh, shape):
                    out_shardings=NamedSharding(mesh, spec))
 
 
+def _logical_mask(value, logical):
+    rows = jnp.arange(value.shape[-2])[:, None] < logical
+    cols = jnp.arange(value.shape[-1])[None, :] < logical
+    return jnp.where(rows & cols, value, jnp.zeros((), value.dtype))
+
+
+@lru_cache(maxsize=None)
+def _resident_mask(mesh, ndim, logical):
+    """Zero past the logical extent as the file stores it (host-tier writes)."""
+    spec = NamedSharding(mesh, P(*((None,) * (ndim - 2)), "x", "y"))
+    return jax.jit(lambda value: _logical_mask(value, logical), out_shardings=spec)
+
+
+@lru_cache(maxsize=None)
+def _resident_stack(mesh, lead_shape):
+    """Host-tier read: device face tiles stacked into one face-tiled span."""
+    spec = NamedSharding(mesh, P(*((None,) * len(lead_shape)), "x", "y"))
+    return jax.jit(lambda *tiles: jnp.stack(tiles).reshape(tuple(lead_shape) + tiles[0].shape),
+                   out_shardings=spec)
+
+
 @lru_cache(maxsize=None)
 def _resident_update(mesh, ndim, logical):
     """In-place span update; zero past the logical extent as the file stores it."""
     spec = NamedSharding(mesh, P(*((None,) * (ndim - 2)), "x", "y"))
 
     def update(store, value, lead):
-        rows = jnp.arange(value.shape[-2])[:, None] < logical
-        cols = jnp.arange(value.shape[-1])[None, :] < logical
-        value = jnp.where(rows & cols, value, jnp.zeros((), value.dtype))
+        value = _logical_mask(value, logical)
         zero = jnp.zeros((), lead.dtype)
         start = tuple(lead[i] for i in range(ndim - 2)) + (zero, zero)
         return jax.lax.dynamic_update_slice(store, value, start)
