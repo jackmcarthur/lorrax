@@ -160,7 +160,10 @@ def test_b_retained_escape_grows_grid_in_the_same_map(core_fixtures):
     assert "SC sampled-support growth" not in first
     growth = second.index("SC sampled-support growth: band=2, k=0")
     assert growth < second.index("Started Sigma tau sweep")
-    assert "protected=1-2 in_range=1" in second
+    # d7f556fc (owner rule 2026-09-22): every QP-window band stays protected
+    # and off-grid energies take Sigma(omega=0); no scissor for leaving the
+    # grid, so band 3 is protected too (was "protected=1-2 in_range=1").
+    assert "protected=1-3 in_range=1-3" in second
     from file_io.restart_bundle import (read_eqp_assembly_receipt)
     receipt = read_eqp_assembly_receipt(str(run / "mpa_sc1_sigma.h5"))
     grid = np.asarray(receipt['omega_rel_ev'])

@@ -125,9 +125,27 @@ def expected(label: str) -> dict:
         "files": {name: sha256(root / name) for name in names},
     }
     if label == "A":
+        # 2026-09-24 re-freeze, cut at the landing tree c52b2c42 (P4 JID
+        # 58826502, step lx-Xg4-084936-627447-3573):
+        # - GN-PPM refs + box rules (schema v4).  States outside the
+        #   [-8, +8] eV Sigma grid take Sigma(omega=0) instead of the
+        #   endpoint clamp (d7f556fc, owner rule 2026-09-22): the 10
+        #   out-of-grid eqp0/eqp1 cells move by up to 0.887 eV.  Four
+        #   in-grid states within dE = 0.5 eV of the +8 eV edge move in eqp1
+        #   only (-0.10..-0.18 eV): their Z probes are clipped onto the grid
+        #   with the true one-sided spacing (5335d487).  The other in-grid
+        #   cells move by <= 0.97 meV because the box-rule builder no longer
+        #   has a time budget (89eaa9a3); the shipped v3 rules were not
+        #   served after that change.
+        # - excited_state_ref.json: scalar-singlet exchange weight
+        #   (a0bae022, re-frozen by 01465925).
         result["additional_reference_source_commits"] = {
             "htransform_bse_exciton":
                 "1fc5cb8f2b974a14ac1c5f97f5c9d7ee2be274b0",
+            "bse_scalar_singlet_exchange":
+                "01465925b7a12d63181a737f866a5c81f03a7b68",
+            "gnppm_static_omega0_box_rules_v4":
+                "c52b2c42565dd53271ca3bf91c7a2cd0de99120b",
         }
     if label == "B":
         # MPA one-shot / one-update references regenerated under the
@@ -135,6 +153,10 @@ def expected(label: str) -> dict:
         # (9.2 eV, outside the requested +-12 eV grid) is evaluated on the
         # padded support instead of clamped to the scissor (eqp0 -3.97 meV,
         # eqp1 -10.32 meV; bands 1-2 unchanged to 0.07 meV).
+        # 2026-09-24 restamp: the mpa.in / mpa_sc1.in deck bytes changed
+        # (89eaa9a3 retired the quadrature time-budget key; d4214ace and
+        # a5a35701 renamed the SC accelerator).  No reference was regenerated;
+        # the mpa_sc1_* family stays the strict xfail in tests/KNOWN_FAILURES.md.
         result["additional_reference_source_commits"] = {
             "mpa_sc_pad_identity":
                 "0262d4833c470ef5768270ca048de1faaaf06a9b",
