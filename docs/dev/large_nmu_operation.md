@@ -44,10 +44,10 @@ square meshes (a nonsquare P refuses; [decisions](../architecture/decisions.md))
 which satisfies every backend's geometry rule; the matrix extent must still
 divide both axes.
 
-The transverse ridge routes (local JAX, local batch-reshard, fully
-distributed) and the coupled μ1–3 live set are specified with their capacity
-equations in the [memory model](../architecture/memory-model.md#solve-stage-routes);
-their schedule is in [Face-ψ ζ fitting](../architecture/zeta_fit_face_psi_cct.md#coupled-current-schedule).
+The transverse ridge factor is the whole-tile local LU on every layout (route
+G applies it per G tile; [the solve seam](../architecture/zeta_fit_mubatch.md#the-solve-seam)),
+priced with the three current channels in the
+[memory model](../architecture/memory-model.md#route-g-every-ζ-fit).
 
 ## Where the ζ factor saturates
 

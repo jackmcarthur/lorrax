@@ -8,9 +8,10 @@
 >   `src/gw/breit_sigma.py` was never created); V_q^{μν} tiles in
 >   `src/gw/v_q_bispinor.py`.
 > - Transverse ζ uses the Hermitian-indefinite CCT path: pivoted LU with a
->   trace-scaled ridge. Fresh μ=1,2,3 fits may share their
->   face transform while keeping separate ordered solves. See
->   [the face ζ architecture](architecture/zeta_fit_face_psi_cct.md#coupled-current-schedule).
+>   trace-scaled ridge. Fresh μ=1,2,3 fits share one route-G loop (one
+>   ψ(G) read, shared pair GEMM and plane FFTs) with a k-convolution, factor
+>   and file per channel. See
+>   [the solve seam](architecture/zeta_fit_mubatch.md#the-solve-seam).
 > - File-map rows that no longer exist: `src/common/load_wfns.py`,
 >   `src/common/isdf_fitting.py` (now `src/gw/isdf_fitting.py` +
 >   `src/isdf/core.py`), `src/centroid/centroid_io.py` (centroid provenance
@@ -148,46 +149,17 @@ indefinite. It therefore uses pivoted LU with the accepted trace-scaled ridge.
 The old claim that all four channels share one Cholesky path
 is false.
 
-The principal layouts are:
-
-```text
-psi_mun[k,s,mu_X,n_Y]
-C_q[mu_L,q,mu_X,nu_Y]
-Z_mu123[mu_L,q,mu_X,r_Y]
-zeta_q[q,mu_XY,r]
-zeta_G[q,mu_XY,G]
-```
-
 Charge has its own centroid extent. The three transverse systems share the
-current-centroid extent but remain distinct matrices and files. On an eligible
-fresh fit, `_z_q_face_coupled_mu123` builds one leading-three-channel RHS. It
-reuses the face-Y transform/scatter, the X-owner broadcast, and the
-channel-independent left pair density. It evaluates the three right densities
-in μ=1→2→3 order, keeping one right carry live at a time.
-
-The solves are deliberately separate and ordered, not one flattened
-three-channel solve. With `batch_reshard`, each channel's raw CCT and RHS move
-from the 2-D face layout to whole matrices distributed over the q batch; local
-JAX LU factor-and-solve runs once per r chunk. On the distributed route, each
-channel is factored once into an opaque `distrib_la.FactorToken`, and the
-provider applies that token to the 2-D-sharded RHS in every r chunk. No
-provider factor is exposed or moved into `isdf`.
-
-Each channel's persistent G-flat accumulator is parked in process-local host
-memory. The active channel alone is restored for the canonical
-`accumulate_rchunk_to_gflat` call and spilled immediately afterward. A final
-barrier makes all three fits reach completion before μ=1 starts writing; final
-writes, closes, and provenance remain μ=1→2→3.
-
-Coupling is automatic only when all three transverse files are fresh, the
-bounded face-Y cache is selected, host spill fits its node-RAM cap, and the
-complete device live set fits the planner budget. Partial reuse fits only the
-missing files on the sequential schedule. Capacity failure also falls back to
-the sequential schedule without changing the fit or the requested public
-`distrib_la` route.
+current-centroid extent but remain distinct matrices, factors and files. A
+fresh fit runs all missing current channels in one route-G μ-batch loop: one
+ψ(G) read, then per batch one X_B, pair GEMM, all-to-all and set of plane
+FFTs, and per channel one k-convolution (γ̃^μ on its load), accumulator and
+Z store. Each channel's factor is the ridged pivoted LU, factored once and
+applied per G tile. Partial reuse fits only the missing channels, in the same
+loop.
 
 The detailed loop and sharding contract is in
-[ζ-fit CCT on the two-face carrier](architecture/zeta_fit_face_psi_cct.md#coupled-current-schedule).
+[ζ fit by μ-batches](architecture/zeta_fit_mubatch.md).
 Closed-form memory and capacity policy belong to the
 [memory model](architecture/memory-model.md); this page does not duplicate
 them.

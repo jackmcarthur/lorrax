@@ -52,8 +52,8 @@ stages, sets the node count.
 | stage | resident per rank (leading terms) | priced by | refuses |
 |---|---|---|---|
 | ψ(G) and centroid faces | charge fit: conj ψ(G) on the rank's G slots, `16·N_k·N_b·n_s·N_Gψ/P`. Centroid faces `ψ(r_μ)`: two copies of `16·n_par·n_s·μ·N_b/P` in the face layout (`low_mem_bands = true`, the default; `n_par` raw parent k points) | the ζ-fit planners below | with the fit |
-| ζ fit, charge channel (route G) | C factor, one μ-batch working set, the ψ(G) slice; the Z store `16·Q·μ·N_G/P` lives on host or disk | `plan_zeta_route_g` ([§ route G](#charge-channel-route-g)) | `GATE zeta-mubatch-capacity` |
-| ζ fit, current channels (bispinor) | persistent floor plus the largest of stages A–D | `plan_gflat_chunks` ([§ r-tile fit](#current-channels-the-r-tile-fit)) | `[planner] the certified plan does not fit` |
+| ζ fit, charge channel (route G) | C factor, one μ-batch working set, the ψ(G) slice; the Z store `16·Q·μ·N_G/P` lives on host or disk | `plan_zeta_route_g` ([§ route G](#route-g-every-ζ-fit)) | `GATE zeta-mubatch-capacity` |
+| ζ fit, current channels (bispinor) | the same, at μ_T, with three factors, accumulators and Z stores | `plan_zeta_route_g(n_vertex=3)` ([§ route G](#route-g-every-ζ-fit)) | `GATE zeta-mubatch-capacity` |
 | V_q | `V_acc` `16·Q·μ_L·μ_R/P`, one q-tile of ζ rows, G panels | `vq_tile_bytes` ([§ V_q](#vq-g-panels-and-q-tiles)) | `GATE vq_tile_budget` |
 | V_q unfold | `16·N_k·μ²/P`, sharded `P(None,'x','y')` | — | — |
 | shared-pole screening and Σ | response-bank faces, pencils, eigh workspace, then G and W tiles | the capacity ledger ([shared-pole model](shared_pole_model.md), byte model) | before allocating, when a stage and its named concurrent stages exceed the budget |
@@ -71,20 +71,23 @@ term is bounded: a completed W of an earlier screening role is spilled to host
 (`common.collectives.spill_to_host`) while a later role runs, and restored
 afterwards.
 
-## Charge channel: route G
+## Route G: every ζ fit
 
-The charge ζ fit forms `Z_q(μ, G)` a batch of centroids at a time and solves
-`ζ = C⁺ Z` once, in G tiles
+Each ζ fit forms `Z_q(μ, G)` a batch of centroids at a time and solves
+`ζ = C⁻¹ Z` once, in G tiles
 ([ζ fit by μ-batches](zeta_fit_mubatch.md) owns the algorithm and the
-per-object byte table). Per rank:
+per-object byte table). The charge channel is one fit; the three bispinor
+current channels are one fit with `n_v = 3` channels at μ_T. Per rank:
 
 ```text
-fixed    = C factor (16·⌈Q/P⌉·μ², q-local tier; 16·Q·μ², replicated tier)
+fixed    = n_v · C factor (16·⌈Q/P⌉·μ², q-local tier; 16·Q·μ², replicated tier)
          + centroid faces + sphere and cylinder index tables
 Ψ        = 16·N_k·N_b·n_s·⌈N_Gψ/P⌉                        ψ(G), device-resident
 work(b)  = max over the batch's three stages (GEMM + all-to-all;
-           D cylinder; plane groups) of their live sets     b centroids, b = multiple of P
-store    = 16·Q·μ·N_G/P                                     host or disk, never the device
+           D cylinder; plane groups) of their live sets     b centroids, b = multiple of P;
+                                                            Z rows, Z/k-conv output rows and
+                                                            the ζ-cylinder accumulator × n_v
+store    = n_v · 16·Q·μ·N_G/P                               host or disk, never the device
 ```
 
 The rule: with `M_f = target − fixed`, ψ(G) is resident and the batch is
@@ -102,116 +105,6 @@ dataset. The finalize streams it in G tiles sized to a quarter of the target.
 The receipt (`ISDF μ-batch plan`) prints the route, batch, collectives per
 batch against the minimum efficient payload, the Z-store placement, every
 term in `G_tile` units, and the HWM estimate.
-
-## Current channels: the r-tile fit
-
-The three transverse channels of a bispinor fit tile real space in `r_chunk`
-points and accumulate ζ in G. `gw.gflat_memory_model.plan_gflat_chunks`
-prices it:
-
-```text
-HWM_fit  = persistent(P) + max(A, B, C, D)
-HWM_post = E_base + max(E, F)
-
-persistent = 16·Q·μ²/P                        L_q
-           + 16·Q·μ·N_G/P                     G-flat ζ accumulator
-           + centroid faces
-           + loader tables                    replicated, P-independent
-           + 16·N_k·N_b,pad·n_s·N_r/P         hoisted ψ(r) cache, when it fits
-
-A  centroid load       the compiled ψ(G)→ψ(r) FFT box (queried, below)
-B  CCT + factor        16·N_k·μ²/P + 2·16·N_k·n_s²·μ²/P
-C  pair density + solve  max(C_slope·r_chunk, solve transient)
-D  accumulate          2·16·cs·N_r,  cs = gflat_chunk_size ≤ 100
-E  V_q                 the one-q floor of the V_q model
-F  tensor write        max(16·Q·μ²/P, 16·Q·μ·N_G/P)
-```
-
-E and F start from the smaller post-fit base, after `L_q`, the accumulator
-and the ψ(r) cache are released. `C_slope` is the per-r-point Stage-C live
-set ([pair-density slots](#measured-corrections-behind-the-g-flat-terms)):
-
-- **Face layout** (`low_mem_bands = true`, the default): one arena of `slots`
-  rank-3 `16·N_k·μ/P` equivalents, the two open-spin parent projectors
-  `2·16·n_par·n_s²·μ/P`, and the gathered ψ(r) Y slabs (one per band chunk
-  when cached).
-- **Axis layout**: `slots` rank-5 pair-density buffers of `16·N_k·n_s²·μ/P`,
-  the `Z_q` column `16·Q·μ/P`, and the gathered ψ(r) slabs.
-
-When the ψ(r) cache does not fit, the streamed route transforms ψ(G) per band
-chunk on every r-chunk, and keeps ψ(G) on device when the floor still admits
-it.
-
-The planner is deterministic:
-
-1. **`P_min`**: the smallest mesh whose persistent floor fits the target.
-2. **`band_chunk`**: 16, raised to the mesh floor and capped at the fit
-   window. The deck key `band_chunk_size` is retired; `low_mem_bands`
-   chooses the face layout.
-3. **`r_chunk`**: the largest width whose Stage C fits the headroom. It is at
-   least `μ` and at most 64 chunks, unless the budget says less. Under every
-   allocator except an unreserved `cuda_async` pool, one Stage-C arena may
-   also claim at most 0.5 of the post-persistent headroom, because the pair
-   temporaries are placed as one contiguous allocation. The result is
-   rounded down to a multiple of `p_y` on the parent route (`P` otherwise).
-   A positive `r_chunk_size` overrides all of it.
-4. **`gflat_chunk_size`**: from Stage-D headroom, a multiple of 4 in
-   `[4, 100]`. Above ~1000 rows the cuFFT plan scratch of the accumulate box
-   grows non-linearly.
-5. **`q_chunk`**: on the replicated back-solve tier only, the q batch whose
-   replicated `(μ, μ)` factors fit after the two sharded RHS/output stacks
-   and the live `Z_q`. Other tiers report 1.
-
-A plan with `HWM > budget` or `P_min > P` is refused, and the message carries
-the plan. With an explicit `r_chunk_size` an overrun only warns. The receipt
-(`ISDF memory model — chunk plan + HWM estimate`) prints every choice, the
-floor, and the A–F peaks sorted with the binder marked.
-
-### Solve-stage routes
-
-The transverse ridge solve enters with `C_q[Q, M_T, M_T]` and `Z_q[Q, M_T, R]`,
-both at `P(None, 'x', 'y')` (`M_T` the transverse centroid count,
-`R = r_chunk`):
-
-| route | per-rank storage |
-|---|---|
-| local JAX LU | one LU per q and channel, hoisted; the replicated or local tier moves factor or RHS per r-chunk |
-| local batch-reshard | two `all_to_all`s to `P(('x','y'), None, None)`, local solves, two back; floor `3·16·⌈Q/P⌉·M_T·(M_T + R)`, refactored per r-chunk by design |
-| distributed token | `distrib_la.factor('solve_lu')` once per channel, `getrs` per r-chunk; factor `16·Q·M_T²/P`, RHS `16·Q·M_T·R/P`, no whole matrix on any rank |
-
-[Large-N_μ operation](../dev/large_nmu_operation.md) owns the route choice.
-
-### Coupled mu1-3 transverse live set
-
-When all three current channels are fitted together they share one
-`Z_q[3, Q, M_T, R]` transform and solve in the order μ1, μ2, μ3. Over one
-transverse plan the device increment is
-
-```text
-ΔM = 2·16·Q·M_T·R/P            two extra completed Z_q stacks
-   + 16·N_k·n_s·M_T·N_b/p_x    shared full-spin X face
-   + 2·16·Q·M_T²/P             two extra factors
-   + 2·16·N_k·N_b,pad·n_s·N_r/P  two extra ψ(r) caches, when hoisted
-```
-
-(`_coupled_mu123_zq_incremental_bytes`). The three G-flat accumulators are
-parked in process-local host RAM, `3·16·Q·M_T·N_G/P` per rank, with only the
-active channel on the device. The increment is `O(Q·M_T²/P + Q·M_T·R/P)` on
-the device and adds no whole `M_T²` tile.
-
-Admission (`gw_init`) runs the coupled schedule only when:
-
-1. The host spill, summed over the ranks on a node, is at most 35 % of node
-   RAM; unknown node RAM fails this gate.
-2. For the local batch-reshard route: CUDA on A100, a square mesh with
-   `P ∈ {4, 16}`, `M_T ≤ 16384`, and the reshard floor at most 0.5 of the
-   budget.
-3. The projected HWM, `max(base + ΔM, persistent + floor + ΔM)`, fits
-   `budget × utilization`. If `auto` cannot fit the local route, the
-   distributed token route is tried; an explicit route is never changed.
-
-Otherwise the channels run sequentially. Partial restart reuse is always
-sequential.
 
 ## Vq G panels and q-tiles
 
@@ -239,10 +132,7 @@ leaves), then `q_tile` as every q that fits both the device budget and the
 host staging budget, balanced across tiles. The budget is 0.9 of live
 available device memory, agreed as the minimum across processes because the
 tile count fixes the collective reads every rank issues. `GATE vq_tile_budget`
-refuses when `resident + work + per_q` alone exceeds it. Stage E of the
-r-tile plan prices `q_tile = 1`; the V_q stage then spends the remaining
-budget on more q per read, so its measured high-water may exceed Peak E by
-design.
+refuses when `resident + work + per_q` alone exceeds it.
 
 For the charge channel, `ZetaG.contract_v` accumulates `V_q` tile by tile as
 it forms ζ from the Z store, keeping ζ only at the columns the head consumers
@@ -376,19 +266,14 @@ per batch against rule 1. All planners stay single-stage and generic.
    below the device (for example 56–72 on an 80 GB A100).
 2. **Mesh.** Use a square mesh. Every chunked term and the default
    face-layout centroid copies fall as `1/P`.
-3. **Read the receipts** in `gwjax.out`: `ISDF μ-batch plan` for the charge
-   fit, `ISDF memory model` for the current channels (and the A–F prices the
-   charge fit's dict fields use, marked not binding there). Each names its
-   binder.
-4. **On a refusal**, add ranks or memory per device. For the current
-   channels, stage by stage:
-   - A: more ranks; the centroid-load FFT box follows the automatic band
-     chunk.
-   - B: fewer centroids.
-   - C: more ranks, a shorter fit window, or a smaller `r_chunk_size`.
-   - D: a smaller `gflat_chunk_size`.
-   - E and F: more ranks, fewer centroids, or a smaller ζ sphere.
-     `vq_g_chunk_size` shrinks only the panel workspace.
+3. **Read the receipts** in `gwjax.out`: `ISDF μ-batch plan` for each ζ
+   fit (the charge channel, and the current channels with `channels = 3`).
+   The `ISDF memory model` A–F receipt prices only dict fields the fits
+   still read and is marked not binding. Each names its binder.
+4. **On a refusal**, add ranks or memory per device: `GATE
+   zeta-mubatch-capacity` names ψ(G) and the smallest batch. For V_q, more
+   ranks, fewer centroids, or a smaller ζ sphere; `vq_g_chunk_size` shrinks
+   only the panel workspace.
 5. **Compare with the run.** Define `γ = runtime peak / planner HWM`; `γ > 1`
    is an under-estimate to investigate. Count Stage-C slots in the HLO
    memory-usage report before changing `_pair_density_slots`, and check the
