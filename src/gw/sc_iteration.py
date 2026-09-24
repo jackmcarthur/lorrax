@@ -5260,7 +5260,7 @@ def run_self_consistency(
     max_iter: int = 1,
     tol_ev: float = 1.0e-4,
     accelerator: str = "anderson",
-    history_depth: int = 5,
+    history_depth: int = 20,
     mixing: float = 1.0,
 ) -> tuple[SCState, list[float]]:
     """Iterate ``gw_iteration_map`` until ``max_iter`` or RMS ΔE < ``tol_ev``.
@@ -5290,7 +5290,9 @@ def run_self_consistency(
         6-8x per map (claim 2391), which is why no deck may ask for it.
     history_depth
         Anderson history depth (only used when ``accelerator="anderson"``).
-        ``m=5`` is BGW's QSGW default.
+        20 by default: with fewer entries than the map has stiff
+        directions Anderson stalls, and the conditioning filter makes
+        depth cost memory only.
     mixing
         Linear damping coefficient when ``accelerator="linear"``.
 
@@ -5539,9 +5541,10 @@ def _run_anderson(
     secant information.  Both counts are fixed, not deck keys.
 
     RESIDENCY BUDGET.  The solver holds 2(m+1) copies of the carry (history
-    plus the newest pair) and a transient window of the same size.  With
-    m = 5, complex128, nk=144, nb=2000 (one copy = 9.22 GB) that is 110.6 GB
-    global for the history, over ``mesh.size`` per rank.  Entries keep the
+    plus the newest pair) and a transient window of the same size.  One copy
+    is nk*nb^2*16 B: 21 MB on CrI3 8x8 (144 bands), 33 MB on VI3 12x12 (120
+    bands), 9.22 GB at nk=144, nb=2000, where m = 20 is 387 GB global,
+    3.9 GB per rank at P100.  Entries keep the
     carry's (nk, nb, nb) shape at ``qsgw_density.band_rotation_spec`` --
     bra band on 'x', ket band on 'y', k replicated -- stacked on a LEADING
     history axis that is never sharded.  ``nk`` is the loop's k-set.
