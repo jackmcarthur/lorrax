@@ -759,10 +759,12 @@ class ZetaG:
             if jax.process_index() == 0:
                 print_fn(f"  μ-batch V check: conj(C+) M conj(C+) vs zeta-first "
                          f"rel {d:.3e} (production keeps zeta-first)")
+        peak = (jax.local_devices()[0].memory_stats() or {}).get("peak_bytes_in_use", 0)
         self.receipt = (f"  μ-batch V_q: {st.n_Gt} G tiles, {layout}-layout, "
                         f"{time.perf_counter() - t0:.2f}s (store read "
                         f"{st.t_read:.2f}s); zeta file "
-                        f"{'written' if zeta_io is not None else 'not written'}")
+                        f"{'written' if zeta_io is not None else 'not written'}; "
+                        f"device peak so far {peak / 1e9:.2f} GB")
         if jax.process_index() == 0:
             print_fn(self.receipt)
         return V

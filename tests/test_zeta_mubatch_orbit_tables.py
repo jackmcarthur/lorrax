@@ -157,3 +157,15 @@ def test_split_orbit_refuses_by_name(acubic):
 # ---------------------------------------------------------------------------
 # r blocks
 # ---------------------------------------------------------------------------
+
+
+def test_route_g_planner_refuses_distributed_tier():
+    """Route G reads the rank-truncated factor B; the distributed tier's
+    2D-sharded C⁺ would be applied as B and give a wrong ζ, so it refuses."""
+    from gw.gflat_memory_model import plan_zeta_route_g
+    meta = SimpleNamespace(nk_tot=4, nspinor=1, n_rmu=16, n_rmu_padded=16,
+                           fft_grid=(8, 8, 8))
+    with pytest.raises(ValueError, match="GATE zeta-mubatch-tier"):
+        plan_zeta_route_g(meta=meta, mesh_xy=4, n_q_selected=2, ngkmax=64,
+                          psi_ngkmax=64, fit_nb=8, n_col=4, n_s=8,
+                          zeta_tier="distributed", budget_gb=40.0)
