@@ -151,7 +151,7 @@ def compute_all_V_q(
     verbose: bool = True,
     sym=None,
     centroid_indices: np.ndarray | None = None,
-    g_chunk_size: int = 0,              # 0 = auto _pick_g_chunk(ngkmax)
+    g_chunk_size: int = 0,              # 0 = auto v_q_g_flat._plan_vq_tiles
 ) -> tuple[jax.Array, jax.Array]:
     """Compute V_qmunu(q,μ,ν) and g0_μ(q) at q=0 from a sharded ζ HDF5.
 
@@ -164,12 +164,14 @@ def compute_all_V_q(
     layout raises :class:`NotImplementedError` — the legacy r-space
     tile path (``gw/v_q_tile.py``) was deleted 2026-07-02.
 
-    Working-set memory is bounded by ``g_chunk_size`` (per-q G-chunk)
-    and the mesh-sharded ζ slabs; there is no separate byte budget knob.
+    Working-set memory is the V tile, one ζ̃ q-tile and one G panel per
+    operand, all ÷P; the q-tile and the auto panel width are sized from the
+    live V_q memory budget (``v_q_g_flat._plan_vq_tiles``), so there is no
+    byte-budget knob.
     """
     # G-flat dispatch — when the loader carries the new per-q sphere
-    # components, hand off to the G-flat orchestrator (sync per-q loop;
-    # it pre-reads all IBZ ζ̃ slabs in one batched call).
+    # components, hand off to the G-flat orchestrator (synchronous q-tile
+    # reads; every q in one read whenever they fit the budget).
     if getattr(zeta_io, 'zeta_layout', None) == 'G_flat':
         from .v_q_g_flat import compute_all_V_q_g_flat
         return compute_all_V_q_g_flat(

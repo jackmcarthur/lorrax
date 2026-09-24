@@ -1401,12 +1401,18 @@ def plan_gflat_chunks(
         stage_cd_psi_bytes = face_terms["constant"] + face_y_route_bytes
     else:
         stage_cd_psi_bytes = 2.0 * psi_one / p_x
-    zeta_slab = _c128(n_q_ibz, mu, ngkmax, shard=p_xy)
-    E_t = (_c128(n_q_ibz, mu, mu, shard=p_xy)          # V_acc
-           + zeta_slab                                  # ζ_L_all
-           + (zeta_slab if is_bispinor else 0.0)        # ζ_R_all (TT off-diag)
-           + _c128(mu, ngkmax, shard=p_x)               # ζ resharded on 'x'
-           + _c128(mu, ngkmax, shard=p_y))              # ζ resharded on 'y'
+    # V_q reads ζ in q-tiles sized from the live V_q budget
+    # (``gw.v_q_g_flat._plan_vq_tiles``), so what it REQUIRES is its one-q
+    # floor, priced by the same owner of the V_q bytes.  It spends any
+    # remaining budget on more q per read (every q when they fit), so a
+    # measured V_q high-water can exceed this term, up to the budget, by
+    # design.  The G panel is priced at its automatic upper width.
+    from .v_q_g_flat import _VQ_G_CHUNK_TARGET, vq_tile_bytes
+    _vq = vq_tile_bytes(
+        n_q=n_q_ibz, n_rmu_L=mu, n_rmu_R=mu, ngkmax=ngkmax,
+        same_zeta=not is_bispinor, n_sub=0, p_x=p_x, p_y=p_y,
+        g_chunk=min(int(ngkmax), _VQ_G_CHUNK_TARGET))
+    E_t = _vq["resident"] + _vq["per_q"] + _vq["work"]
 
     # Stage F — the restart-tensor WRITE (isdf_tensors_<n_rmu>.h5).  SlabIO
     # writes per-rank hyperslabs, so this costs the sharded amount. The
