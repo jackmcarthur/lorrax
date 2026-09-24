@@ -3,8 +3,8 @@
 [`docs/services/distrib_la.md`](../services/distrib_la.md) owns the service:
 API, `Plan`/`FactorToken`/`matmul`, backend vocabularies, the guard ladder,
 promise semantics, layouts, donation, refusals and performance. The ζ-fit
-channel policy (charge rank truncation, transverse ridge, local versus
-distributed solve) is owned by
+channel policy (charge rank truncation, transverse ridge, the whole-tile
+back-solve tiers) is owned by
 [Face-ψ ζ fitting](../architecture/zeta_fit_face_psi_cct.md). This page owns
 the one deck dial, the procedure for adding a backend, and the failure modes
 inside the ScaLAPACK handlers that no Python guard can see.
@@ -22,7 +22,6 @@ dial.
 | transverse ζ LU (`distributed_lu`) | `auto` | `distributed` (ScaLAPACK on cpu, cuSOLVERMp on CUDA) |
 | batched route | `DISTRIB_LA_BATCHED_ROUTE_DEFAULT` | `auto` |
 | eigensolves (`eigh_backend`, `sc_eigh`) | `auto` (native, q-batched) | `distributed` (cpu → `scalapack`, CUDA → `cusolvermp`) |
-| ζ solve tier | `auto` | `auto` (route G applies the whole-tile factor) |
 | charge ζ factor | `rank_truncate` | `rank_truncate` |
 | transverse ζ factor | `ridge` | `ridge` |
 
@@ -36,13 +35,13 @@ CLI overrides (`--eigh-backend`, …) are debugging controls.
 
 **Replication cap.** Block-cyclic distributed factors are grid-dependent
 (partial-sum order changes with the process grid), and GN-PPM amplifies that
-drift. Under `local`, the rank-truncating charge factor therefore runs
-replicated and mesh-invariant, one q-batch at a time. When one batch
-`q_batch·n_μ²·16 B` exceeds `LORRAX_ZETA_REPLICATE_CAP_GIB` (default 4 GiB),
+drift. Under both layouts the rank-truncating charge factor therefore runs
+replicated and mesh-invariant, one q-batch at a time; there is no distributed
+charge factor. When one batch `q_batch·n_μ²·16 B` exceeds
+`LORRAX_ZETA_REPLICATE_CAP_GIB` (default 4 GiB),
 `isdf.core._rank_truncate_capacity_error` refuses and names the cap value that
 would clear it. Raising the cap makes the route resolve, not finish: the
 replicated factor is a dense whole-tile eigh per q, `ceil(nq/P)·n_μ³` per rank.
-The fix at large `n_μ` is `linalg = distributed`.
 
 ## Adding a backend
 
