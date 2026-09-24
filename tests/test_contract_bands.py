@@ -691,15 +691,15 @@ def test_face_projector_rejects_bad_channels():
             mesh, layout="face", face_shape=face_shape, channels="bogus")
 
 
-def _axis_operands(mesh, mu_l=MU, mu_r=MU + 4, nb=MN, seed=11):
-    """Rectangular (μ_left != ν_right) axis-layout operands, ns = NS."""
+def _axis_operands(mesh, mu_l=MU, mu_r=MU + 4, nb=MN, seed=11, ns=NS):
+    """Rectangular (μ_left != ν_right) axis-layout operands."""
     rng = np.random.default_rng(seed)
 
     def c(*shape):
         return rng.standard_normal(shape) + 1j * rng.standard_normal(shape)
-    psi_l = c(NK, nb, NS, mu_l)
-    o = c(NK, NS, mu_l, NS, mu_r)
-    psi_r = c(NK, NS, mu_r, nb)
+    psi_l = c(NK, nb, ns, mu_l)
+    o = c(NK, ns, mu_l, ns, mu_r)
+    psi_r = c(NK, ns, mu_r, nb)
     put = lambda a, spec: jax.device_put(jnp.asarray(a),     # noqa: E731
                                          NamedSharding(mesh, spec))
     dev = (put(psi_l, P(None, None, None, "x")),
@@ -709,7 +709,8 @@ def _axis_operands(mesh, mu_l=MU, mu_r=MU + 4, nb=MN, seed=11):
     return dev, (psi_l, o, psi_r), ref
 
 
-def test_axis_projector_matches_reference_with_one_reduction():
+@pytest.mark.parametrize("ns", [1, 2, 4])     # scalar, Pauli, bispinor
+def test_axis_projector_matches_reference_with_one_reduction(ns):
     """``layout='axis'``: slab partial + ONE reduce-scatter, exact to 1e-14.
 
     The rectangular (μ_left != ν_right) case and both channel plans; the
@@ -718,9 +719,9 @@ def test_axis_projector_matches_reference_with_one_reduction():
     twin: the transposed block misses the same reference by O(1).
     """
     mesh = _mesh()
-    dev, (psi_l, o, psi_r), ref = _axis_operands(mesh)
-    face = (NK, MN, MU, NS)
-    right = (NK, MN, MU + 4, NS)
+    dev, (psi_l, o, psi_r), ref = _axis_operands(mesh, ns=ns)
+    face = (NK, MN, MU, ns)
+    right = (NK, MN, MU + 4, ns)
     proj = contract_bands_block_reshard(
         mesh, layout="axis", face_shape=face, right_face_shape=right)
     got = np.asarray(proj(*dev))
