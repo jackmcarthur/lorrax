@@ -140,11 +140,12 @@ which enters through \(S_{n_t+s}=-S_s\). Applying one without the other
 replaces \(\psi(\mathbf r)\) by \(\overline{\psi(-\mathbf r)}\). That error
 preserves norms, overlaps and the kinetic energy, and shows up only in
 position-dependent terms such as the local and nonlocal pseudopotential. The
-coefficients are conjugated before the phase is applied. The plane-wave form
-omits the band-independent factor
+coefficients are conjugated before the phase is applied. The loader's
+plane-wave unfold omits the band-independent factor
 \(e^{-2\pi i(S_s\bar{\mathbf k})\cdot\boldsymbol\tau_s}\) that the centroid
-form contains. That factor is a gauge of \(\psi_{\mathbf k}\) and cancels in
-every \(G_{\mathbf k}\) and every same-k band matrix.
+form contains; the ζ fit's plane-wave tables keep it. The factor is a gauge
+of \(\psi_{\mathbf k}\) and cancels in every \(G_{\mathbf k}\) and every
+same-k band matrix.
 
 ## 4. Two-point operators: G, χ, V, W
 
@@ -262,21 +263,21 @@ is measured at every parent with the unfold's own formula and reported.
 ## 6. Orbit-packed centroids
 
 On the square \(s\times s\) process mesh every centroid axis is held in one
-*orbit-packed* order. Centroids are grouped into orbits under the operations
-available on the set. Whole orbits are placed on the \(s\) shards of the axis,
-largest first onto the least-loaded shard, and each shard is padded at its tail
-to a common size that is a multiple of \(s\). Every \(\alpha_s\) then maps
-each shard into itself. On an operator sharded \([\mu_X,\nu_Y]\) the transport
-of §4 becomes a gather inside each rank's tile. It has no collective and costs
-\(O(N_{\rm child}M^2/P)\) memory traffic per rank for \(M\) centroids on \(P\)
-ranks. Pad slots are fixed points of every \(\alpha_s\), have zero wrap and hold
+*orbit-packed* order: whole orbits are placed on the \(s\) shards of the axis
+and each shard is padded at its tail to a common size
+([register §4](../architecture/symmetry_register.md#4-orbit-packed-layout-and-the-axis-local-certificate)).
+Every \(\alpha_s\) then maps each shard into itself. On an operator sharded
+\([\mu_X,\nu_Y]\) the transport of §4 becomes a gather inside each rank's
+tile. It has no collective and costs \(O(N_{\rm child}M^2/P)\) memory traffic
+per rank for \(M\) centroids on \(P\) ranks. Pad slots are fixed points of every \(\alpha_s\), have zero wrap and hold
 exact zeros. One order serves both mesh axes, which is why the layout needs a
 square mesh. In canonical order the same transport needs an all-to-all out and
 back on each endpoint axis.
 
 Files keep the canonical centroid order at its logical extent. The conversion
-happens only where bytes cross a file. The ζ fit unfolds its pair projectors
-the same way, over centroid batches that are unions of whole orbits
+happens only where bytes cross a file. The ζ fit forms its pair projectors
+on the parents and transports them with the plane-wave form of the same
+action, each μ owner holding whole orbits
 ([ζ fit by μ-batches](../architecture/zeta_fit_mubatch.md)).
 
 ## 7. Where symmetry replaces work
@@ -305,7 +306,7 @@ The action is refused, never approximated: a missing time-reversal verdict,
 incomplete k coverage, a stored k off the file's own grid, a required
 operation that does not permute the centroids, a packed map that crosses a
 shard, or a non-square mesh stops the run. The
-[register](../architecture/symmetry_register.md#8-refusals) lists each with
+[register](../architecture/symmetry_register.md#10-refusals) lists each with
 its fix.
 
 ## 8. Test systems
