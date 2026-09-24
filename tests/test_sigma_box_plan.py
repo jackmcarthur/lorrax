@@ -328,7 +328,7 @@ def test_sc_fixed_rule_covers_the_declared_pole_support(monkeypatch):
     assert first_geometry["sc_fixed_initial_window_tau_pairs"] == 6
 
 
-def test_sc_fixed_session_refuses_an_escaped_window(monkeypatch):
+def test_sc_fixed_session_rebuilds_an_escaped_window_and_says_so(monkeypatch):
     calls = []
 
     def counted(box, eps, **kwargs):
@@ -341,17 +341,30 @@ def test_sc_fixed_session_refuses_an_escaped_window(monkeypatch):
         eps=1.0e-4, cache_dir=None,
         fixed_rule_session=session,
         print_fn=lambda *_args, **_kwargs: None)
-    plan_sigma_windows(
+    _, first = plan_sigma_windows(
         _summaries(), [_branch_at((0.1, 3.0))],
         np.asarray([0.2, 0.5]), 0.1, **args)
     calls.clear()
-    # The frozen map is never silently re-keyed: a box that escapes the
-    # +2 eV certificate is a named refusal, not a rebuild.
-    with pytest.raises(RuntimeError, match="sc_fixed_quadrature_escape"):
-        plan_sigma_windows(
-            _summaries(), [_branch_at((0.1, 8.0))],
-            np.asarray([0.2, 0.5]), 0.1, **args)
-    assert calls == []
+    # A box that escapes the +2 eV certificate refits the rule set (owner
+    # 2026-09-22), and the receipt must say so: not initialized, every
+    # refit window named, the escaped one with its edge, iteration 1's
+    # pair cost kept.
+    _, escaped = plan_sigma_windows(
+        _summaries(), [_branch_at((0.1, 8.0))],
+        np.asarray([0.2, 0.5]), 0.1, **args)
+    assert calls
+    names = [row["name"] for row in escaped["branches"][0]["windows"]]
+    assert not escaped["sc_fixed_initialized"]
+    assert escaped["sc_fixed_rebuilt_windows"] == names
+    assert escaped["sc_fixed_rebuilds_this_iteration"] == len(names)
+    assert escaped["sc_fixed_total_rebuild_count"] == len(names)
+    reasons = escaped["sc_fixed_recompute_reasons"]
+    assert set(reasons) == set(names)
+    assert any(reason.startswith("escape: ") for reason in reasons.values())
+    assert (escaped["sc_fixed_initial_window_tau_pairs"]
+            == first["sc_fixed_initial_window_tau_pairs"])
+    assert all(rule["fit"]["cache_status"].startswith("rebuild:sc-fixed")
+               for rule in session["rules"].values())
 
 
 def test_sc_fixed_session_keeps_receipt_for_temporarily_empty_window(
@@ -400,7 +413,7 @@ def test_sc_fixed_session_keeps_receipt_for_temporarily_empty_window(
         row["node_digest"] for row in first]
 
 
-def test_sc_fixed_session_refuses_a_window_absent_from_iteration_one(
+def test_sc_fixed_session_rebuilds_for_a_window_absent_from_iteration_one(
         monkeypatch):
     calls = []
 
@@ -418,11 +431,14 @@ def test_sc_fixed_session_refuses_a_window_absent_from_iteration_one(
         _summaries(), [_branch_at((0.1, 0.2))],
         np.asarray([0.2, 0.5]), 0.1, **args)
     calls.clear()
-    with pytest.raises(RuntimeError, match="sc_fixed_quadrature_map"):
-        plan_sigma_windows(
-            _summaries(), [_branch_at((0.1, 3.0))],
-            np.asarray([0.2, 0.5]), 0.1, **args)
-    assert calls == []
+    _, grown = plan_sigma_windows(
+        _summaries(), [_branch_at((0.1, 3.0))],
+        np.asarray([0.2, 0.5]), 0.1, **args)
+    assert calls
+    assert not grown["sc_fixed_initialized"]
+    new = {name for name, reason in grown["sc_fixed_recompute_reasons"].items()
+           if reason == "absent at iteration 1"}
+    assert new and new <= set(grown["sc_fixed_rebuilt_windows"])
 
 
 def test_sc_fixed_session_refits_only_on_material_class_flip(monkeypatch):

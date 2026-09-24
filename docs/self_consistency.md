@@ -357,8 +357,9 @@ sup=0.0405 against eps=1e-4 with 906 nodes in every self-consistent arm; its
 actual support has a 24-node rule at eps (sandbox lane QUADCHECK). The cause
 was the SC pad: the ten-percent pole pad pushed a strictly negative support
 across zero and asked for a crossing rule. The pad now keeps sign-definite
-supports sign-definite (the zero-side edge moves at most halfway to zero;
-a support that really crosses later is a box escape and rebuilds), and the
+supports sign-definite (the zero-side edge stops at 5% of its distance to
+zero, `_SC_ZERO_SIDE_CAP`; a support that really crosses later is a box
+escape and rebuilds), and the
 disk cache never returns a certificate above eps. Do not loosen eps to admit
 a rule.
 
@@ -574,10 +575,13 @@ nodes and weights while recomputing current masks, pole selectors, reference
 energies and W(time). Containment, error currency and separated-factor growth
 are checked at every map. Initial tail certificates cover the selector's
 minimum separation for both scalar and sector shared-pole models, so states
-entering an existing tail retain the same nodes. A containment escape refuses;
-only a material-class change or separated-factor growth failure can rebuild
-rules. Eta and epsilon remain fixed for a session. Disk model identity is not
-relaxed.
+entering an existing tail retain the same nodes. A containment escape, or a
+window absent at iteration 1, refits the whole rule set for that map (owner
+2026-09-22, TaAs semimetal SC); the `SC fixed quadrature:` kept line then
+reports `initialized=False`, the refit windows and the escape reasons against
+iteration 1's `initial_pair_cost`. A material-class change re-initializes the
+set, and a separated-factor growth failure refits one window. Eta and epsilon
+remain fixed for a session. Disk model identity is not relaxed.
 
 Chi rules pad transition endpoints by up to 4 eV, corresponding to 2 eV on
 each one-particle endpoint. The physical band selection and occupations are
