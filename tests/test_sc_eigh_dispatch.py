@@ -246,27 +246,14 @@ def test_the_pad_is_a_sentinel_and_the_result_is_sliced_back_by_count():
     src = pathlib.Path(qsgw_density.__file__).read_text()
     body = src[src.index("def distributed_eigh_bands("):]
     body = body[:body.index("\ndef ")]
-    assert "_EIGH_PAD_SENTINEL_RY" in body, (
-        "the band pad must carry the large diagonal sentinel; a zero pad "
+    assert "_eigh_pad_sentinel(H_j)" in body, (
+        "the band pad must carry a spectral upper bound; a zero pad "
         "injects exact-0.0 eigenvalues mid-spectrum and moves band order, "
         "_midgap_efermi and the occupations")
     assert "E = E[:, :nb]" in body and "U = U[:, :nb, :nb]" in body, (
         "the eigh result must be sliced back to the LOGICAL band extent "
         "by COUNT — that is what makes the sentinel correct rather than "
         "merely convenient, and what the lifted refusal relies on")
-
-
-def test_the_sentinel_is_orders_clear_of_any_physical_eigenvalue():
-    """1e10 Ry vs O(1) Ry QP eigenvalues.
-
-    Not a style check: the sentinel is only safe if pad eigenvalues
-    cannot interleave with the physical spectrum at ANY deck.  An
-    identity pad (1.0 Ry = 13.6 eV) fails exactly this — it is above most
-    states of interest but inside a wide QP window.
-    """
-    from gw.qsgw_density import _EIGH_PAD_SENTINEL_RY as S
-    assert S >= 1e8
-    assert S / 13.6057 > 1e6          # eV, vs any conceivable QP window
 
 
 def test_a_sentinel_pad_block_decouples_exactly():
@@ -276,13 +263,16 @@ def test_a_sentinel_pad_block_decouples_exactly():
     eigenvalues are EXACTLY s, they occupy the last slots of an ascending
     spectrum, and the physical eigenvectors carry zero weight on pad rows.
     """
-    from gw.qsgw_density import _EIGH_PAD_SENTINEL_RY as S
+    import jax.numpy as jnp
+    from gw.qsgw_density import _eigh_pad_sentinel
     rng = np.random.default_rng(3)
     nb, nb_pad = 10, 16
     A = rng.normal(size=(nb, nb))
     H = 0.5 * (A + A.T)
     Hp = np.zeros((nb_pad, nb_pad))
     Hp[:nb, :nb] = H
+    S = float(np.asarray(_eigh_pad_sentinel(jnp.asarray(H)[None]))[0])
+    assert S > np.linalg.eigvalsh(H)[-1]
     Hp[np.arange(nb, nb_pad), np.arange(nb, nb_pad)] = S
     w, V = np.linalg.eigh(Hp)
     assert np.all(w[nb:] == S)                       # exactly, not approx
