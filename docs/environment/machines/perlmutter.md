@@ -71,10 +71,10 @@ The module is a descriptor: it sets `LORRAX_ROOT`, `PYTHONPATH` (a
 `JAX_PLATFORMS=cuda,cpu` and `JAX_ENABLE_X64=1`. It sets no allocator,
 compile-cache, HDF5 or profiling policy; the runtime owns those.
 
-| bundle leg | libraries | serves |
+| bundle leg | libraries (private closure in the bundle's `lib/`) | serves |
 |---|---|---|
-| CUDA `liblorrax_ffi.so` | cuSOLVERMp, cuBLASMp, cuFFT, NVRTC, parallel HDF5, Cray MPICH | distributed eigh/Cholesky/LU, distributed GEMM, the mathdx k-convolution, slab I/O |
-| host `liblorrax_ffi_host.so` | SLATE-CPU, ScaLAPACK (libsci), FFTW, parallel HDF5 | CPU providers |
+| CUDA `liblorrax_ffi.so` | cuSOLVERMp, cuBLASMp (private); cuFFT, NVRTC, NCCL, parallel HDF5, Cray MPICH | distributed eigh/Cholesky/LU (`cusolvermp`), distributed GEMM (`cublasmp`), the mathdx k-convolution, slab I/O. It carries no SLATE handler (device SLATE is not built), so `slate` on a CUDA mesh refuses at resolve |
+| host `liblorrax_ffi_host.so` | SLATE, BLAS++, LAPACK++ (private); ScaLAPACK and CBLAS (LibSci), FFTW (dlopened), parallel HDF5, Cray MPICH | the SLATE handlers on a CPU mesh (eigh, potrf, trsm, batched potrf and trsm), ScaLAPACK eigh and LU, host GEMM and FFT, slab I/O |
 
 The bundle manifest (`lorrax_ffi_bundle.json`) hashes every byte; the loader
 refuses a library whose handler ABI differs from the source's and announces
@@ -82,7 +82,8 @@ an unsealed library as `LEGACY-UNSEALED`. The mathdx k-convolution also needs
 the `nvidia-mathdx` wheel in the venv (`GATE mathdx-headers` otherwise).
 Cray MPICH GPU support is off (`MPICH_GPU_SUPPORT_ENABLED=0`); cuSOLVERMp and
 cuBLASMp communicate through NCCL. Building, sealing and publishing a bundle
-is the runtime recipe `lorrax_cuda13_runtime/recipe/README.md`.
+is the runtime recipe,
+`/global/common/software/m4598/jackm/lorrax_cuda13_runtime/recipe/README.md`.
 
 ## 3. CPU multi-process runs (Milan)
 
@@ -121,5 +122,6 @@ lx run --cpu --pool POOL -N 2 -n 4 -- bash -c '
 rank, shared by XLA's CPU worker pool (not capped by `OMP_NUM_THREADS`),
 LibSci/SLATE OpenMP teams (capped by `OMP_NUM_THREADS` and the handler dials
 the startup report prints), the MPICH progress thread and Python's I/O
-threads. None is bound to a private CPU subset; `OMP_NUM_THREADS=14` with
-`-c16` leaves nominal headroom only. Thread placement has not been measured.
+threads. LORRAX binds none of them to a private CPU subset, so set
+`OMP_NUM_THREADS` below `-c` (`14` with `-c16`) to leave CPUs for the XLA
+pool, the progress thread and I/O.
