@@ -149,8 +149,46 @@ def partner_realization(meta, header, ids, partner_parent, partner_row, *, mesh_
             _batch_put(mesh_xy, phase.astype(np.complex128)))
 
 
+_HIGH_WATER = {}
+
+
+def grow_only(key, values):
+    """``values`` raised to the widest seen for ``key`` in this process.
+
+    Direction ranks move between rounds and SC maps, and every round program
+    is keyed by its carriers; carriers that never shrink let later rounds and
+    maps reuse those executables. Extra columns are exact zeros no count
+    selects. Every rank computes the same widths, so the high water agrees.
+    """
+    # ponytail: process-wide high water per structural key; a later, smaller
+    # map keeps the larger carrier (bounded by the admitted recipe caps).
+    values = tuple(int(v) for v in values)
+    old = _HIGH_WATER.get(key)
+    if old is not None and len(old) == len(values):
+        values = tuple(max(a, b) for a, b in zip(old, values))
+    _HIGH_WATER[key] = values
+    return values
+
+
+@lru_cache(maxsize=None)
+def _pad_columns(sharding, shape, width):
+    import jax
+    import jax.numpy as jnp
+    pad = ((0, 0),) * (len(shape) - 1) + ((0, width - shape[-1]),)
+    return jax.jit(lambda a: jnp.pad(a, pad), out_shardings=sharding)
+
+
+def grow_round(key, states, infinity):
+    """Pad a round's state panels and infinity block to ``key``'s high water."""
+    pad = lambda a, w: a if a.shape[-1] == w else _pad_columns(a.sharding, a.shape, w)(a)
+    widths = grow_only((key, "states", len(states)), [st[1].shape[-1] for st in states])
+    states = [(st[0], *(pad(a, w) for a in st[1:])) for st, w in zip(states, widths)]
+    (width,) = grow_only((key, "infinity"), [infinity[0].shape[-1]])
+    return states, tuple(pad(a, width) for a in infinity)
+
+
 def round_tables(counts, widths, nodes, infinity_counts, infinity_width, *, column_extent, ordered,
-                 odd_moments):
+                 odd_moments, key=None):
     """Host column tables of one round: each slot's states packed into its pencil columns.
 
     ``counts`` int [P, A] retained widths per slot and state, ``widths`` the A
@@ -190,6 +228,10 @@ def round_tables(counts, widths, nodes, infinity_counts, infinity_width, *, colu
     selected = max(int(carriers[:, list(half)].sum(axis=1).max()) for half in halves)
     # Never below the selection: an extent function may saturate on a sum.
     extent = min(capacity, max(selected, column_extent(selected)))
+    if key is not None:
+        # Grow-only with the panels (grow_round); a round with a different
+        # state count can have less capacity, which only costs a compile.
+        extent = min(capacity, grow_only((key, "extent", len(halves), len(widths)), [extent])[0])
     order = np.full((ranks, extent * len(halves)), offsets[-1], np.int32)
     points = np.zeros(order.shape, np.complex128)
     live = np.zeros(order.shape, bool)
