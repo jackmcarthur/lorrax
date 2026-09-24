@@ -490,32 +490,6 @@ def hubbard_matrix_and_velocity(psi_G, Zt, dZt, W):
     return H, v, P
 
 
-def hubbard_k(psi_G, kvec, Gk_int, hub: HubbardSetup):
-    """Everything at one k: (H_U, v_U, P, lowdin eigenvalues)."""
-    from psp import vnl_ops
-    kd = vnl_ops.build_vnl_kdata_from_kvec(kvec, Gk_int, hub.atwfc, compute_dZ=True)
-    hub_idx = jnp.asarray(hub.hub_rows.reshape(-1), dtype=jnp.int32)
-    Zt, dZt, lam = lowdin_rows_with_derivative(kd.Z, kd.dZ, hub_idx)
-    H, v, P = hubbard_matrix_and_velocity(
-        psi_G, Zt, dZt, jnp.asarray(hub.W, dtype=jnp.complex128))
-    return H, v, P, lam
-
-
-def occupations_from_projections(P, f) -> np.ndarray:
-    """QE new_ns_nc (no symmetrization): ns[m1, m2, 2 s1 + s2, i] summed with
-    band weights ``f`` (nb,).  ``P`` (n_hub, 2ld, nb)."""
-    P = np.asarray(P)
-    n_hub, two_ld, _ = P.shape
-    ld = two_ld // 2
-    nr = np.einsum("n,ian,ibn->iab", np.asarray(f), np.conj(P), P)       # (i, a, b)
-    ns = np.zeros((ld, ld, 4, n_hub), dtype=np.complex128)
-    for s1 in range(2):
-        for s2 in range(2):
-            ns[:, :, 2 * s1 + s2, :] = np.transpose(
-                nr[:, s1 * ld:(s1 + 1) * ld, s2 * ld:(s2 + 1) * ld], (1, 2, 0))
-    return ns
-
-
 # ---------------------------------------------------------------------------
 # The ket form used by the ONE velocity path (common.mtxel_sweep, finite q)
 # ---------------------------------------------------------------------------
