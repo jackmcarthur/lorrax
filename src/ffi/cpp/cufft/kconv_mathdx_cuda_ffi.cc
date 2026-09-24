@@ -498,14 +498,13 @@ extern "C" __global__ void __launch_bounds__(256) lrx_kconv(
     for (int i = threadIdx.x; i < PB * NK; i += blockDim.x) {
         const int k = i / PB, jp = i % PB;
         const long long pr = p0 + jp;
-        lrx_c2 out[NS][NS];
         if (pr < pairs) {
             const long long xx = pr / my, yy = pr - xx * my;
             // The typed unfold (symmetry_maps unfold_isdf_operator, axis-local
             // pair_transpose arm): the source row, both endpoint gathers, and
             // (mph * G) * nph, then where(valid, ., 0) as a -1 source.
             const lrx_c2* src = (t.trs[k] ? gt : gp) + (long long)t.row[k] * t.ml * t.nl;
-            lrx_c2 g[NS][NS], u[NS][NS], left[NS][NS];
+            lrx_c2 g[NS][NS], u[NS][NS];
 #pragma unroll
             for (int c = 0; c < NS; ++c) {
                 const long long li = (long long)k * t.ml + xx * NS + c;
@@ -525,9 +524,11 @@ extern "C" __global__ void __launch_bounds__(256) lrx_kconv(
             for (int a = 0; a < NS; ++a)
 #pragma unroll
                 for (int b = 0; b < NS; ++b) u[a][b] = spin[((long long)k * NS + a) * NS + b];
-            // U G U^dagger exactly as the spin-rotate FFI accumulates it.
+            // U G U^dagger exactly as the spin-rotate FFI accumulates it,
+            // one output spin row a at a time (NS left values live).
 #pragma unroll
-            for (int a = 0; a < NS; ++a)
+            for (int a = 0; a < NS; ++a) {
+                lrx_c2 left[NS];
 #pragma unroll
                 for (int d = 0; d < NS; ++d) {
                     lrx_c2 v = {0.0, 0.0};
@@ -536,31 +537,24 @@ extern "C" __global__ void __launch_bounds__(256) lrx_kconv(
                         const lrx_c2 p = lrx_mul_xla(u[a][c], g[c][d]);
                         v.x = v.x + p.x; v.y = v.y + p.y;
                     }
-                    left[a][d] = v;
+                    left[d] = v;
                 }
-#pragma unroll
-            for (int a = 0; a < NS; ++a)
 #pragma unroll
                 for (int b = 0; b < NS; ++b) {
                     lrx_c2 v = {0.0, 0.0};
 #pragma unroll
                     for (int d = 0; d < NS; ++d) {
                         const lrx_c2 ub = {u[b][d].x, -u[b][d].y};
-                        const lrx_c2 p = lrx_mul_xla(left[a][d], ub);
+                        const lrx_c2 p = lrx_mul_xla(left[d], ub);
                         v.x = v.x + p.x; v.y = v.y + p.y;
                     }
-                    out[a][b] = v;
+                    sm[(jp * SS + a * NS + b) * SP + k] = v;
                 }
+            }
         } else {
 #pragma unroll
-            for (int a = 0; a < NS; ++a)
-#pragma unroll
-                for (int b = 0; b < NS; ++b) out[a][b] = {0.0, 0.0};
+            for (int ab = 0; ab < SS; ++ab) sm[(jp * SS + ab) * SP + k] = {0.0, 0.0};
         }
-#pragma unroll
-        for (int a = 0; a < NS; ++a)
-#pragma unroll
-            for (int b = 0; b < NS; ++b) sm[(jp * SS + a * NS + b) * SP + k] = out[a][b];
     }
     __syncthreads();
     transform3<fft_direction::inverse>(sm);
