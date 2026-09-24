@@ -165,10 +165,13 @@ def test_route_g_planner_refuses_distributed_tier():
     from gw.gflat_memory_model import plan_zeta_route_g
     meta = SimpleNamespace(nk_tot=4, nspinor=1, n_rmu=16, n_rmu_padded=16,
                            fft_grid=(8, 8, 8))
-    with pytest.raises(ValueError, match="GATE zeta-mubatch-tier"):
+    with pytest.raises(ValueError, match="GATE zeta-mubatch-tier") as err:
         plan_zeta_route_g(meta=meta, mesh_xy=4, n_q_selected=2, ngkmax=64,
                           psi_ngkmax=64, fit_nb=8, n_col=4, n_s=8,
                           zeta_tier="distributed", budget_gb=40.0)
+    # The fix it names is a live deck key, not the retired distributed_zeta_solve.
+    assert "Fix: `linalg = local`" in str(err.value)
+    assert "distributed_zeta_solve" not in str(err.value)
 
 
 def test_best_owner_batching_never_packs_worse_than_the_planned_bin(acubic):

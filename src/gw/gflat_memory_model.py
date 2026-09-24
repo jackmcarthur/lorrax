@@ -1687,9 +1687,8 @@ def plan_zeta_route_g(*, meta, mesh_xy, n_q_selected: int, ngkmax: int,
             "'local' or 'replicated'; why: route G applies the rank-truncated "
             "factor B (C⁺ = B·Bᴴ, isdf.cplus) on each G tile, and the "
             "distributed tier hands over a 2D-sharded C⁺ it does not read.  "
-            "Fix: distributed_zeta_solve = local (or replicated); the "
-            "distributed factor application is future work "
-            "(docs/architecture/zeta_fit_mubatch.md, Regime guard).")
+            "`linalg = distributed` selects that tier.  Fix: `linalg = "
+            "local` (docs/architecture/zeta_fit_mubatch.md, Regime guard).")
     finalize_layout = 'q' if str(zeta_tier) == 'local' else 'g'
     base = {
         "C factor": (_c128(Q_loc, mu, mu) if finalize_layout == 'q'
