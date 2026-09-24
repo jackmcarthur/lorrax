@@ -2,21 +2,21 @@
 
 `gw.gw_init.fit_zeta` decides reuse separately for each centroid family: the
 charge family, and under `bispinor` the three current channels. Each fresh fit
-calls `gw.isdf_fitting.fit_zeta_to_h5`, which requires a typed
-`CentroidKUnfoldPlan` and both packed raw-parent faces. The fit has no full-k
-fallback.
+calls `gw.isdf_fitting.fit_zeta_to_h5` once per family (`output_files` maps
+μ_L to its file: the charge channel alone, or the missing current channels
+together), which requires a typed `CentroidKUnfoldPlan` and both packed
+raw-parent faces. The fit has no full-k fallback.
 
-This page owns five parts of the fit:
+This page owns three parts of the fit:
 
 - the normal equations: C_q, the pad diagonal, the LR+RL completion and the
   q selection;
 - the factor and back-solve tiers;
-- the current-channel right-hand side;
-- the coupled current schedule;
 - centroid order in memory and on disk.
 
-The charge right-hand side runs on [route G](zeta_fit_mubatch.md). The
-equations are on the [ISDF page](../theory/isdf-zeta-vq.md).
+Every right-hand side runs on [route G](zeta_fit_mubatch.md), which also owns
+the per-tile solve seam. The equations are on the
+[ISDF page](../theory/isdf-zeta-vq.md).
 
 ## Carriers and band windows
 
@@ -137,66 +137,12 @@ pairing (sC + sδI)⁻¹(sZ) = (C + δI)⁻¹Z. The indefinite solve always runs
 the logical extent (`runtime.padding.solve_at_logical`), because pad-extent LU
 round-off is amplified O(1) in the near-null current modes.
 
-On a 2-D GPU mesh the provider LU is selected. Under the default batched
-route (`batch_reshard`), the fit hoists it to a local JAX LU factored once per
-channel. When μ_T does not divide the mesh axes, `linalg = local` demotes to
-the per-q replicated LU, and `linalg = distributed` refuses. On the local LU,
-the conditioning instrument κ_lb = max|u_ii|/min|u_ii|, a lower bound on κ,
+Route G applies the factor per G tile, so it is always the local whole-tile
+JAX LU (`factor_c_q` with `batch_reshard`), laid out on the q owners by the
+back-solve tier like the charge factor; a resolved provider LU is hoisted to
+it, and `linalg = distributed` no longer selects a block-cyclic token here.
+The conditioning instrument κ_lb = max|u_ii|/min|u_ii|, a lower bound on κ,
 refuses above 1e12 under the same policy.
-
-## Current channels
-
-Route G does not carry the current vertices. Each current channel runs the
-orbit-closed real-grid tile loop of `fit_zeta_to_h5`, planned by its own
-`plan_gflat_chunks` call at the current centroid count μ_T. The loop works as
-follows:
-
-- **Tiles.** The real grid is cut into tiles of whole symmetry orbits, with
-  each orbit on one Y owner (`CentroidKUnfoldPlan.real_grid_tiles` →
-  `RealGridOrbitTiles`), so the r-endpoint symmetry gather is local, like the
-  centroid gather. Tiles are filled plane by plane along the axis the orbits
-  cross least (`plane_axis_for_orbits`), so a tile of W points touches about
-  W/n_⊥ planes. A tile is at least one whole orbit per owner, and the driver
-  reports a tile wider than planned.
-- **ψ on the tile.** ψ comes from a band-sharded ψ(r) cache built once
-  (`build_psi_r_cache_sm`). When the planner declines the cache, ψ(G) is
-  transformed onto the tile's planes instead: sphere → occupied columns →
-  partial axis IDFT → 2D IFFT. ψ(G) is device-resident when the planner
-  admits it.
-- **Z on the tile.** `isdf.core._z_q_face_parent` accumulates the parent
-  projectors over band chunks, transports both endpoints, applies the vertex,
-  and correlates over k on the same router, giving Z_q(μ, r_tile).
-- **Solve and accumulate.** `solve_zeta` applies the factor. Then
-  `common.wfn_transforms.accumulate_rchunk_to_gflat` adds
-  FFT[e^{-iq·r} 1_tile ζ_q] into the per-q sphere accumulator
-  (Q, μ, N_G) at `P(None, ('x','y'), None)`. Each pad slot carries a distinct
-  out-of-range drop sentinel.
-
-For ns > 1 the planner may cache the Y-side transform per spin pair (the
-face-Y cache) rather than repeating it for each of the ns² pairs.
-
-## Coupled current schedule
-
-The three current channels couple only when all three need fresh fits and the
-planner admits the coupled live set (`_select_coupled_mu123_route`, which
-requires the face-Y cache). The coordinator (`_CoupledMu123ZqCoordinator`)
-then runs one ordered transaction:
-
-- For each tile, `_z_q_face_parent(coupled_mu123=True)` builds the parent
-  projectors, and each output spin pair's left transport and inverse FFT,
-  once. It then advances the three channel accumulators in vertex order
-  μ = 1, 2, 3. Each channel keeps its own spin-pair reduction order.
-- Each channel's C_q is prepared separately. On the provider LU routes, the
-  three C_q stacks are concatenated and factored and solved as one 3Q
-  transaction. Otherwise each channel factors and solves its own Q systems.
-- The three G-sphere accumulators are parked in process-local host memory,
-  and only the active one is restored to the device. Writes, closes and
-  provenance stamps follow the loop in μ = 1 → 2 → 3 order.
-
-Partial reuse, or a capacity miss, fits the missing channels one after
-another with the same equations. [The memory model](memory-model.md) owns the
-capacity equations. `gw_jax.zeta_fit_transverse` times the whole schedule.
-The per-channel intervals overlap, so they must not be summed.
 
 ## One centroid order; canonical files
 

@@ -1,31 +1,37 @@
 # ζ fit by μ batches (route G)
 
-`gw.isdf_fitting._fit_mubatch` runs every fresh charge-channel ζ fit, at
-ns = 1, 2 and 4 (the bispinor charge lift). It forms the right-hand side
-Z_q(μ, G) on the ζ sphere in batches of centroids, then applies C_q⁺ and
-contracts V_q one G tile at a time. The three current channels use the
-[real-grid tile loop](zeta_fit_face_psi_cct.md#current-channels). The theory
-is on the [ISDF page](../theory/isdf-zeta-vq.md). Code: `isdf.zeta_mubatch`
-(the kernel, `ZStore`, `ZetaG`), `isdf.pair_kernels`, `isdf.cplus`, and the
-planner `gw.gflat_memory_model.plan_zeta_route_g`.
+`gw.isdf_fitting._fit_mubatch` runs every fresh ζ fit: the charge channel at
+ns = 1, 2 and 4 (the bispinor charge lift), and the three bispinor current
+channels μ_L = 1, 2, 3, which share one loop. It forms the right-hand side
+Z^{μ_L}_q(μ, G) on the ζ sphere in batches of centroids, then applies each
+channel's C_q⁻¹ one G tile at a time (and, for the charge channel, contracts
+V_q in the same pass). The theory is on the
+[ISDF page](../theory/isdf-zeta-vq.md). Code: `isdf.zeta_mubatch` (the kernel,
+`ZStore`, `ZetaG`), `isdf.pair_kernels`, `isdf.cplus`, the transverse factor
+in `isdf.core`, and the planner `gw.gflat_memory_model.plan_zeta_route_g`.
 
 ## The identity
 
 ```text
 D^X_{k,ab}(μ, r) = Σ_n w^X_n ψ_{nka}(r_μ) ψ*_{nkb}(r)          X = L, R band windows (0/1 weights)
-Z_q(μ, r)        = Σ_k Σ_ab D^L_{k,ab}(μ, r) conj D^R_{k+q,ab}(μ, r)
-C_q(μ, ν)        = Z_q(μ, r_ν),      ζ_q = C_q⁺ Z_q,      C_q⁺ = B Bᴴ  (isdf.cplus)
+Z^γ_q(μ, r)      = Σ_k Σ_ab conj P^L_{k,ab}(μ, r) · γ_a γ_b · P^R_{k+q,π(a)π(b)}(μ, r)
+                   (P^X = conj D^X after the typed unfold; γ̃^{μ_L} = (π, γ) is
+                   monomial; γ̃^0 = I is the charge channel)
+C^γ_q(μ, ν)      = Z^γ_q(μ, r_ν),    ζ_q = (C^γ_q)⁻¹ Z^γ_q
 
 Z_q(μ, G) = FFT_r[e^{-iq·r} Z_q(μ, r)]    on the ζ sphere |q+G|² ≤ zeta_cutoff
-ζ_q(μ, G) = C_q⁺ Z_q(μ, G),               V_q = conj(ζ_q) diag(v_q) ζ_qᵀ
+ζ_q(μ, G) = C_q⁻¹ Z_q(μ, G),              V_q = conj(ζ_q) diag(v_q) ζ_qᵀ
 ```
 
-C_q⁺ acts on the centroid index only, so it commutes with the r → G
-transform of the other index. The fit therefore never forms ζ(r), a full FFT
-box of ζ, or an accumulator over r. It writes Z_q(μ, G) once and applies C⁺
-afterwards. When the L and R windows differ, the LR+RL completion
-Z_q ← Z_q + conj Z_{−q} is applied in r space before the q selection, as it
-is for C_q ([normal equations](zeta_fit_face_psi_cct.md#normal-equations)).
+C_q⁻¹ acts on the centroid index only, so it commutes with the r → G
+transform of the other index. What C_q⁻¹ means is each channel's
+[solve seam](#the-solve-seam). The fit therefore never forms ζ(r), a full FFT
+box of ζ, or an accumulator over r. It writes Z_q(μ, G) once and applies the
+solve afterwards. When the charge channel's L and R windows differ, the LR+RL
+completion Z_q ← Z_q + conj Z_{−q} is applied in r space before the q
+selection, as it is for C_q
+([normal equations](zeta_fit_face_psi_cct.md#normal-equations)); the current
+channels train on LR alone.
 
 ## One μ batch
 
@@ -46,11 +52,18 @@ centroid orbits.
                                the ψ spheres' occupied (b,c) columns, DFT along the longest grid
                                axis onto every plane: the D cylinder (k, plane, s, 2c, s, column)
 5  per group of n_pg planes   columns → planes, 2D FFT: D(k, μ, r_plane) up to its Bloch phase;
-                               k-convolution → Z_q(μ, r_plane) for every q of the full zone;
-                               LR+RL, stored-q selection, e^{-iq·r}, forward 2D FFT, one matmul
-                               onto the ζ-sphere cylinder (columns × axis values)
-6  ζ-sphere slots             rows Z_q(μ_B, G), μ-owned → ZStore while batch β+1 runs
+                               then per channel: k-convolution with γ̃^{μ_L} → Z_q(μ, r_plane)
+                               for every q of the full zone; LR+RL (charge), stored-q selection,
+                               e^{-iq·r}, forward 2D FFT, one matmul onto the ζ-sphere cylinder
+                               (columns × axis values)
+6  ζ-sphere slots             rows Z^{μ_L}_q(μ_B, G), μ-owned → the channel's ZStore while
+                               batch β+1 runs
 ```
+
+Everything through the plane FFT depends only on ψ and the centroids, so the
+three current channels share it: one X_B, one pair GEMM, one all-to-all and
+one set of plane FFTs per batch, then one k-convolution, one accumulator and
+one Z store per channel. The charge fit is the same kernel with one channel.
 
 Each batch runs two collectives, the X_B psum and the pair-projector
 all-to-all; `LORRAX_DEBUG_PRINT=1` counts them from the compiled HLO. Every
@@ -67,9 +80,12 @@ each owner holds whole orbits, the centroid gather is local.
 The k-convolution in step 5 is the pair convolution on the identity plan,
 where every k is its own parent: `ffi.fft.make_fused_conv_kplane(D, F)`. It
 reads the 2D-FFT output `D (N_k, n_pg, ns, 2c, ns, p)` where the FFT left it
-and applies the Bloch phase `F (N_k, n_pg, p)` and the L | R split of the 2c
-slots on its load (mathdx mode 6 on CUDA; the XLA composition and the host
-plans on CPU), so no phased, split or transposed copy of D is written. It
+and applies the Bloch phase `F (N_k, n_pg, p)`, the L | R split of the 2c
+slots and the channel's vertex (the static `(perm, phase)` of γ̃^{μ_L} on
+both endpoints' output spins, as `isdf.core.c_q_from_psi_sm` applies it to
+C_q) on its load (mathdx mode 6 on CUDA; the XLA composition and the host
+plans on CPU), so no phased, split, vertex-folded or transposed copy of D is
+written. It
 correlates over k by FFTs on the k grid, at O(N_k log N_k) per (μ, r) point.
 Kernel contracts are on [the FFI layer](ffi_layout.md#k-convolution-router-and-the-mathdx-family).
 
@@ -87,7 +103,8 @@ n_col × n_s the ψ cylinder):
 
 Summed over the μ/b batches, each rank does 2·n_p·ns²·μ·n_b·N_Gψ/P GEMM MACs,
 sends 2·n_p·ns²·μ·N_Gψ·16/P bytes, and does O(μ·N_k·ns²·N_r·(log N_r +
-log N_k)/P) of owner transforms.
+log N_k)/P) of owner transforms. With n_v channels only the k-convolution
+and the forward plane FFTs (the last two rows) are paid n_v times.
 
 ## Z store
 
@@ -109,19 +126,41 @@ reaches the finalize layout with one all-to-all, then gathers slot order into
 packed centroid order (`OwnerOrbitBatches.slot_of_packed`). Tile t+1 is read
 while tile t is contracted.
 
+## The solve seam
+
+C_q⁻¹ is each channel's conditioning, applied as a whole-tile factor on every
+G tile (`zeta_mubatch._logical_solve`):
+
+- **Charge.** C_q is a PSD Gram. The factor is B = V_keep Λ_keep^{-1/2} with
+  B Bᴴ = C⁺, keeping λ > `zeta_rcond`·λ_max (`isdf.cplus`,
+  [factor and back-solve](zeta_fit_face_psi_cct.md#factor-and-back-solve)).
+- **Currents.** C^μ_q is Hermitian INDEFINITE: the PSD cut would drop its whole
+  negative half, an O(1) error, not a regularization (the P4 gate's red twin
+  measures 0.23 on a ±-spectrum). Route G therefore keeps the transverse fits'
+  own solve: the sign-aware ridged pivoted LU of C + δI with
+  δ = 1e-12·sign(Re tr C)·|tr C|/μ, factored once per channel at the logical
+  extent and certified by κ_lb (`isdf.core.factor_c_q`), and applied per tile
+  as `(LU, pivots)`. Route G always takes the local whole-tile LU; a
+  block-cyclic provider token (`linalg = distributed`) cannot be applied per
+  tile, so under `distributed` the current ζ changes pivot gauge at
+  round-off·κ, as the charge factor did.
+
+No deck key selects the seam: the channel does.
+
 ## Finalize: ζ, V_q and the head columns
 
-`ZetaG` holds ζ as the pair (Z store, factor B). `ZetaG.contract_v` streams
+`ZetaG` holds ζ as the pair (Z store, factor). `ZetaG.contract_v` streams
 the G tiles once:
 
 ```text
-for each G tile t:   ζ_t    = B (Bᴴ Z_t)              at the logical μ extent (solve_at_logical)
+for each G tile t:   ζ_t    = C⁻¹ Z_t                 through the seam, at the logical μ extent
                      V     += conj(ζ_t) diag(v_q) ζ_tᵀ  v and ζ masked to each q's sphere
                      shell ← ζ_t at the kept slots
                      ζ_t → zeta_q_G                  only when a file consumer needs it
 ```
 
-The back-solve tier ([factor and back-solve](zeta_fit_face_psi_cct.md#factor-and-back-solve))
+`ZetaG.write_file` is the same pass without V and the shell: it forms and
+writes ζ only, for a file consumer. The back-solve tier ([factor and back-solve](zeta_fit_face_psi_cct.md#factor-and-back-solve))
 fixes the layout. Under `local`, Z tiles are q-local,
 `P(('x','y'), None, None)`, and V accumulates on the q owner. Under
 `replicated`, Z tiles are G-split, and each rank accumulates partial sums over
@@ -155,13 +194,25 @@ The fit returns a `ZetaG` (`zeta_layout = 'G_flat'`) in place of a ζ loader.
 |---|---|---|
 | scalar charge V_q (`v_q_g_flat`) | all of ζ, once | `ZetaG.contract_v` |
 | g0, IBZ one-leg unfold, head channel (`compute_head_channel_zeta`) | a few G columns per q | the shell |
-| restart and reuse, the BSE bundle, the four-current V_q | `zeta_q.h5` | written when `write_restart_tensors = true` (the default) or `bispinor = true`, by one extra pass over the store |
+| restart and reuse, the BSE bundle, the four-current V_q | `zeta_q.h5`, `zeta_q_mu{1,2,3}.h5` | `ZetaG.write_file`: the charge file when `write_restart_tensors = true` (the default) or `bispinor = true`, the current files always |
+
+A bispinor run hands the four-current V_q the four files and closes every Z
+store after its file is written (the charge store before the current fit
+fills its own). The in-memory route for the four-current V_q needs a
+cross-channel `contract_v` (V^{μν} from two ζ streams); it is not built.
+
+Each fit family reads ψ(G) once: `common.psi_G_store.load_parent_psi_G`
+samples the family's centroid faces and keeps the G-slot store on the device
+for the loop (charge in `gw_init._prepare_fresh_parent_faces`, currents in
+`gw_init._fit_transverse_zeta_channels`).
 
 ## Memory per rank and the planner
 
 `plan_zeta_route_g` sizes everything from the one device budget,
 `memory_per_device_gb` times the fragmentation target. No deck key or
-environment variable sizes the fit.
+environment variable sizes the fit. With `n_vertex` channels (3 for the
+currents) the Z rows, the ζ-cylinder accumulator, the Z/k-conv output rows,
+the factors and the store are priced n_vertex times; everything else once.
 
 | object | bytes per rank | live |
 |---|---|---|
@@ -232,9 +283,13 @@ they contribute nothing to V. Pad batch slots are −1 in
 - **`tests/multi_device/zeta_mubatch_p4.py`** (P = 4) checks the kernel, both
   store placements and both read layouts against the dense full-BZ sum at
   1e-12. It covers a glide group with spin mixing and an antiunitary row
-  (ns = 2), the 48-operation A-cubic fixture (ns = 1), and a ragged deck where
-  no axis divides the mesh. Its red twin shifts the ζ-sphere axis index by one
-  and must miss by more than 1e-3.
+  (ns = 2), the 48-operation A-cubic fixture (ns = 1), a ragged deck where
+  no axis divides the mesh, and the glide group at ns = 4 with the three
+  current vertices in one kernel. Its red twins shift the ζ-sphere axis index
+  by one, and compare channel 1 against channel 2's reference; both must miss
+  by more than 1e-3. It also checks the current solve seam against a dense
+  (C + δI)⁻¹Z on an indefinite C, on both finalize layouts, with the PSD cut
+  as the red twin.
 - **`tests/test_zeta_mubatch_orbit_tables.py`** checks the whole-orbit batch
   tables against a direct Seitz evaluation, and checks that a split orbit
   refuses.
