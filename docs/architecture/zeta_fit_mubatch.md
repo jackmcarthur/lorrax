@@ -126,7 +126,14 @@ fixes the layout. Under `local`, Z tiles are q-local,
 its own G columns. Each finished object (V, the shell, or a ζ tile for the file) leaves its
 accumulator in one explicit collective (`_to_mu_owner`: an all-to-all or a
 reduce-scatter), so V lands at `P(None,'x','y')` without being replicated.
-Per rank, C⁺ and V each cost O(Q·μ²·N_G/P).
+Per rank, C⁺ and V each cost O(Q·μ²·N_G/P). The finalize holds three
+things per rank:
+
+- V: ceil(Q/P)·μ²·16 under `local`, or Q·μ²·16 of partial sums under
+  `replicated`;
+- the factor;
+- about 6·ceil(Q/P)·μ·G_tile·16 bytes of Z and ζ tiles, which the choice of
+  G_tile keeps below target/4.
 
 V is formed ζ-first. The equal conj(C⁺) M_q conj(C⁺), with
 M_q = conj(Z_q) diag(v) Z_qᵀ, applies C⁺ twice to a product formed before the
