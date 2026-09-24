@@ -1079,7 +1079,6 @@ def anderson_nojit(
     print_fn: Callable = None,
     entry_sharding=None,
     metric=None,
-    restart_fn: Callable = None,
 ) -> AccelerationResult:
     """Anderson type II (Pulay/DIIS): ONE map evaluation per iteration.
 
@@ -1094,8 +1093,8 @@ def anderson_nojit(
     same iterates on an affine map at two evaluations per iteration, the
     second re-evaluating a residual the linear model already predicts.
 
-    Three safeguards, none costing a map evaluation and none with a tunable
-    constant (the thresholds are the literature's numerical defaults):
+    Two safeguards, neither costing a map evaluation nor carrying a tunable
+    constant (the threshold is the literature's numerical default):
 
     * conditioning filter (Walker & Ni 2011; DFTK): the oldest differences
       are dropped until the unit-column Gram has cond <= 1e12 (cond(R) <=
@@ -1105,11 +1104,14 @@ def anderson_nojit(
       there, so the next point is the two-point secant between the best
       evaluated pair and the rejected one -- a free line search along the
       failed step; never twice in a row; the rejected pair stays in the
-      history (it is valid secant data);
-    * restart on a discrete map event: ``restart_fn()`` true after an
-      evaluation (the caller's Sigma rule set or sampled grid changed) keeps
-      only that newest pair, because every stored difference straddling the
-      event carries the jump.
+      history (it is valid secant data).
+
+    There is deliberately NO restart on the map's discrete events: early QSGW
+    maps grow the sampled Sigma grid on every call, and restarting there
+    reduced the method to Picard steps, which diverge on an expansive map
+    (CrI3 / Fe bispinor, 2026-09-24).  The jumps are far below the
+    secant-model error at that stage, and stale pairs are down-weighted by
+    the least squares itself.
 
     alpha is solved over the REAL numbers: the iterates are Hermitian
     matrices, a real vector space, and the Gram of Hermitian residuals is
@@ -1188,14 +1190,6 @@ def anderson_nojit(
         f = _entry(residual_fn(x))
         res = _norm(f)
         res_history.append(res)
-        if restart_fn is not None and restart_fn():
-            filled, head = 0, 0
-            best, best_res = (x, f), res
-            window_res = [res]
-            fallback = False
-            if print_fn is not None:
-                print_fn(f"  Anderson step {it:02d}: map event, history restarted")
-            continue
         fallback = (not fallback) and res > max(window_res)
         window_res = (window_res + [res])[-(m + 1):]
         if res < best_res:

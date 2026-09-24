@@ -26,8 +26,8 @@ not the stopping criterion. Each iteration evaluates the map once, at
 replaced rCROP (2026-09-24), whose second evaluation per iteration re-derived
 the residual its linear model already predicts; the map is a pure function of
 H (bitwise re-evaluation, sandbox claim 2678), so every pair is valid secant
-data. The history restarts only on a discrete map event (a Σ rule rebuild or
-sampled-grid growth). The loop STOPS AS STALLED — never reported converged —
+data. A discrete map event (a Σ rule rebuild or sampled-grid growth) is
+logged but does not restart the history. The loop STOPS AS STALLED — never reported converged —
 when the label-free residual `max_k ||P f_k P||_2` (logged every call as
 `SC matrix residual`) has not improved by 10% over two history turnovers,
 2(m+1) maps. Within the active

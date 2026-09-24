@@ -5523,9 +5523,11 @@ def _run_anderson(
     of accelerated evaluations after map 0.
 
     The map is a pure function of H (bitwise re-evaluation, claim 2678), so
-    every pair is valid secant data; the history is restarted only when the
-    map itself changes discretely (a Sigma rule rebuild or sampled-grid
-    growth, read from ``inputs.fixed_quadrature_session``).
+    every pair is valid secant data.  A discrete map event (a Sigma rule
+    rebuild or sampled-grid growth, read from
+    ``inputs.fixed_quadrature_session``) is logged but does not restart the
+    history: early maps grow the grid on every call, and restarting there
+    reduced the method to divergent Picard steps.
 
     THE STOP RULES.  CONVERGED when the criterion (max|dE| over the
     non-scissored identities, F(H) against H) is below ``tol_ev``.
@@ -5910,7 +5912,6 @@ def _run_anderson(
             print_fn=lambda line: _record_sc(inputs, line),
             entry_sharding=entry_sh,
             metric=_metric_np,
-            restart_fn=lambda: _map_event[0],
         )
     except _Converged as stop:
         # The criterion (or the stall rule) fired inside the map.  Return the accepted
