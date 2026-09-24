@@ -1011,10 +1011,12 @@ def _integrate_sigma_batches(
         debug_max_tau = _resolve_debug_max_tau_dispatches(print_fn=print_fn)
         tau_profile = env_bool(
             "LORRAX_SIGMA_TAU_TIMING", False, print_fn=print_fn)
-        # The resident pole route (GN/HL-PPM and elementwise MPA) runs each
-        # window as ONE executable; only a host-driven W builder (shared-pole
-        # panels, sectors) still dispatches node by node.
-        windowed = w_synthesis is None and tau_kernel_factory is None
+        # The resident pole route (GN/HL-PPM and elementwise MPA) and the
+        # sectors (whose tau kernel carries its own W synthesis) run each
+        # window as ONE executable; only the scalar shared-pole panel builder,
+        # whose W crosses host-driven q/K panels, dispatches node by node.
+        sector = tau_kernel_factory is not None
+        windowed = w_synthesis is None or sector
         if windowed and tau_profile:
             raise ValueError(
                 "GATE sigma_tau_timing_route:\n"
@@ -1170,11 +1172,21 @@ def _integrate_sigma_batches(
                     jnp.reshape(selector, np.shape(row.E_A)))
                 # These arrays do not change between time nodes in this planned
                 # window, so they are built once per window rather than per node.
-                tau_arguments = (
-                    psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
-                    E_A_call, selector, B_branch, Omega,
-                    pole_indices, bounds, phase_real,
-                    jnp.asarray(win.E_ref_A), jnp.asarray(win.E_ref_B))
+                if sector:
+                    # The sector kernel reads the right endpoint's faces and
+                    # its synthesis's window operands (host intervals, once).
+                    row_kernel = tau_kernel.window_kernel(row.space)
+                    tau_arguments = tau_kernel.window_arguments(
+                        psi_coh_xn, psi_proj_xr, E_A_call, selector,
+                        jnp.asarray(win.E_ref_A), jnp.asarray(win.E_ref_B),
+                        row.space, row.pole_indices, row.bounds)
+                else:
+                    row_kernel = tau_kernel
+                    tau_arguments = (
+                        psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
+                        E_A_call, selector, B_branch, Omega,
+                        pole_indices, bounds, phase_real,
+                        jnp.asarray(win.E_ref_A), jnp.asarray(win.E_ref_B))
             if not sweep_started:
                 fence('tau.initial_compile_and_probe', sync_ranks=True)
                 with timing.section('tau.initial_compile_and_probe'):
@@ -1197,8 +1209,8 @@ def _integrate_sigma_batches(
                             kernel_for=tau_kernel_for)
                         print_fn(f"  shared-pole inherited Sigma peak: {inherited}")
                     if windowed:
-                        accumulator.integrate_window(
-                            tau_kernel, tau_arguments, win.nodes.t,
+                        compiled = accumulator.integrate_window(
+                            row_kernel, tau_arguments, win.nodes.t,
                             win.nodes.alpha, n_active=len(win.nodes.t),
                             active_count=active_count, capacity=tau_capacity,
                             omega_sign=win.omega_sign, prefactor=win.prefactor,
@@ -1206,6 +1218,8 @@ def _integrate_sigma_batches(
                             antihermitian=(win.project_code == 1),
                             omega_indices=row.omega_idx,
                             omega_values=row.omega_abs, compile_only=True)
+                        if sector:
+                            tau_kernel.admit(compiled, tau_arguments)
                     elif hasattr(tau_kernel, "lower"):
                         tau_kernel.lower(*prewarm_args).compile()
                     else:
@@ -1239,7 +1253,7 @@ def _integrate_sigma_batches(
             if windowed:
                 # One executable per window: the node loop runs on device.
                 total = accumulator.integrate_window(
-                    tau_kernel, tau_arguments, t_nodes, alpha_nodes,
+                    row_kernel, tau_arguments, t_nodes, alpha_nodes,
                     n_active=len(t_nodes), active_count=active_count,
                     capacity=tau_capacity,
                     omega_sign=win.omega_sign, prefactor=win.prefactor,

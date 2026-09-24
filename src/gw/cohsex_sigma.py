@@ -204,22 +204,21 @@ _static_convolution_cache: dict[tuple[object, ...], object] = {}
 
 
 def _make_static_convolution(mesh_xy: Mesh, kgrid: tuple[int, int, int],
-                             nk_tot: int, *, q0_only=False, lorentz=False):
-    """Own the normalized flat-k convolution for scalar and streamed Lorentz sums.
+                             nk_tot: int, *, q0_only=False):
+    """Own the normalized flat-k convolution of the scalar static sums.
 
     Every branch takes the Green in its own centroid-major order and puts it
     into the fused handler's operand order first (``sigma_conv_operand``), so
     Σ_k leaves every branch in the face projector's ``(nk, s, mu, s', nu)``.
+    The four-current sums have their own door, :func:`make_lorentz_convolution`.
     """
     from ffi import ffi_dial_key
     from common.fft_helpers import make_kconv_klead
-    key = (_mesh_key(mesh_xy), tuple(kgrid), ffi_dial_key(), int(nk_tot), q0_only, lorentz)
+    key = (_mesh_key(mesh_xy), tuple(kgrid), ffi_dial_key(), int(nk_tot), q0_only)
     if key in _static_convolution_cache:
         return _static_convolution_cache[key]
     scale = -1.0 / (float(nk_tot) if q0_only else np.sqrt(float(nk_tot)))
-    if lorentz:
-        convolve = _make_lorentz_convolution(mesh_xy, kgrid, scale, q0_only)
-    elif q0_only:
+    if q0_only:
         @jax.jit
         def convolve(G_k, interaction, prefactor):
             return (prefactor * sigma_conv_operand(G_k)
@@ -237,31 +236,83 @@ def _make_static_convolution(mesh_xy: Mesh, kgrid: tuple[int, int, int],
     return convolve
 
 
-def _make_lorentz_convolution(mesh_xy, kgrid, scale, q0_only):
-    """Transform one Green tensor and stream vertex-weighted interactions into one sum."""
+_lorentz_convolution_cache: dict[tuple[object, ...], object] = {}
+
+
+def lorentz_class_vertices(keys):
+    """The ``(A-set, B-set)`` of one endpoint class's Lorentz blocks, in ``keys`` order.
+
+    A class's blocks are one product ``A x B`` enumerated A-major (every
+    caller builds them that way); anything else is refused, because the
+    convolution's interaction operand is laid out ``(nk, mx, nA, my, nB)``.
+    """
+    lefts = tuple(dict.fromkeys(int(A) for A, _ in keys))
+    rights = tuple(dict.fromkeys(int(B) for _, B in keys))
+    if tuple((int(A), int(B)) for A, B in keys) != tuple((A, B) for A in lefts for B in rights):
+        raise ValueError(f"Lorentz blocks {tuple(keys)} are not one A x B product in A-major order")
+    return lefts, rights
+
+
+def make_lorentz_convolution(mesh_xy: Mesh, kgrid, nk_tot: int, keys, left_plan,
+                             right_plan=None):
+    """The four-current Σ door: ``fn(parent_green, V) -> Σ_k``, read from the raw parents.
+
+        Σ_k = -1/√N_k · fftn( Σ_AB γ̃_A ifftn(Ĝ) γ̃_B† · ifftn(V)[:, x, A, y, B] )
+
+    ``parent_green`` is the :class:`gw.greens_function_kernel.ParentGreen` of
+    the class (left endpoint ``left_plan``, right ``right_plan``, default the
+    same) and ``V`` ``(nk, mx, nA, my, nB)`` the class's blocks in k space;
+    ``Ĝ`` is its typed unfold, done on the convolution's load
+    (``common.fft_helpers.make_kconv_lorentz_unfold``: nvidia-mathdx mode 8 on
+    CUDA).  Σ_k leaves spin-major ``(nk, s, mu, s', nu)``, the face
+    projector's order.
+    """
+    from ffi import ffi_dial_key
+    from common.fft_helpers import make_kconv_lorentz_unfold
+    from common.gamma_matrices import gamma_perm_phase_host
+    lefts, rights = lorentz_class_vertices(keys)
+    right = left_plan if right_plan is None else right_plan
+    key = (_mesh_key(mesh_xy), tuple(int(v) for v in kgrid), ffi_dial_key(), int(nk_tot),
+           lefts, rights, id(left_plan), id(right))
+    if key not in _lorentz_convolution_cache:
+        tables = left_plan.unfold_load_tables(
+            right_plan=None if right is left_plan else right)
+        door = make_kconv_lorentz_unfold(
+            mesh_xy, kgrid, tables,
+            left_vertices=[gamma_perm_phase_host(A) for A in lefts],
+            right_vertices=[gamma_perm_phase_host(B) for B in rights],
+            norm='ortho', mult=-1.0 / np.sqrt(float(nk_tot)))
+
+        def convolve(parent_green, interactions):
+            return door(parent_green.G, parent_green.transpose, interactions)
+        # The entry keeps both plans alive, so their ids cannot be reused.
+        _lorentz_convolution_cache[key] = (convolve, left_plan, right)
+    return _lorentz_convolution_cache[key][0]
+
+
+def make_lorentz_q0_product(nk_tot: int):
+    """The q→0 head's Lorentz sum: a pointwise product of the full-k Green, no k-convolution.
+
+    ``fn(G_k, interactions, prefactor, vertices)`` with ``G_k`` the unfolded
+    centroid-major Green, ``interactions`` ``(nblk, nq, mx, my)`` (slot 0 is
+    q = 0) and ``vertices`` the stacked ``(perm, phase)`` pairs of the blocks.
+    """
     from common.gamma_matrices import gamma_apply
-    from common.fft_helpers import make_flat_k_fftn, make_flat_k_ifftn
-    if not q0_only:
-        inverse_g = make_flat_k_ifftn(mesh_xy, kgrid, SIGMA_CONV_G7D_SPEC, norm='ortho')
-        forward_g = make_flat_k_fftn(mesh_xy, kgrid, SIGMA_CONV_G7D_SPEC, norm='ortho')
-        inverse_v = make_flat_k_ifftn(mesh_xy, kgrid, V_FFT5D_SPEC, norm='ortho')
+    scale = -1.0 / float(nk_tot)
 
     @jax.jit
-    def convolve(G_k, interactions, prefactor, vertices):
-        G_k = sigma_conv_operand(G_k)
-        green = G_k if q0_only else inverse_g(G_k)
+    def product(G_k, interactions, prefactor, vertices):
+        green = sigma_conv_operand(G_k)
 
         def add(total, block):
             interaction, (left, right) = block
             value = gamma_apply(green, *left, axis=1)
             value = gamma_apply(value, right[0], jnp.conj(right[1]), axis=3)
-            weight = (interaction[0][None, None, :, None, :] if q0_only else
-                      inverse_v(interaction)[:, None, :, None, :])
-            return total + value * weight, None
+            return total + value * interaction[0][None, None, :, None, :], None
 
         sigma, _ = jax.lax.scan(add, jnp.zeros_like(green), (interactions, vertices), unroll=1)
-        return prefactor * (sigma if q0_only else forward_g(sigma)) * scale
-    return convolve
+        return prefactor * sigma * scale
+    return product
 
 
 def _make_cohsex_kernels(mesh_xy: Mesh, kgrid: tuple[int, int, int],
@@ -317,16 +368,10 @@ def _make_cohsex_kernels_face(mesh_xy: Mesh, face_shape, _convolve,
         _k_rows = np.asarray(k_unfold_plan.parent_full_rows, dtype=np.int32)
         _sym = k_unfold_plan.sym
 
-    def _g_operands(wfns, wfns_g=None):
+    def _g_operands(wfns):
         """(direct face, conjugated face, band-table owner) for the G build."""
-        g = wfns_g if wfns_g is not None else wfns
         if k_unfold_plan is None:
-            return g.psi_mun, g.psi_nmu, g
-        if wfns_g is not None:
-            raise NotImplementedError(
-                "_make_cohsex_kernels_face: a separate G-build bundle "
-                "(bispinor vertex trick) is not combined with the parent "
-                "route.")
+            return wfns.psi_mun, wfns.psi_nmu, wfns
         c = wfns.green_parent
         return c.psi_mun, c.psi_nmu, c
 
@@ -347,10 +392,10 @@ def _make_cohsex_kernels_face(mesh_xy: Mesh, face_shape, _convolve,
             _sym, parent_rows, trs_rule="transpose")
 
     @jax.jit
-    def sigma_sx(wfns, Gij, W_q, *, wfns_g=None):
-        """Build occupied Green functions from the selected endpoints and project with the original states."""
+    def sigma_sx(wfns, Gij, W_q):
+        """Build the occupied Green function and project it on the same states."""
         s = wfns.slices
-        g_mun, g_nmu, _ = _g_operands(wfns, wfns_g)
+        g_mun, g_nmu, _ = _g_operands(wfns)
         phases = _occ_diag_full(Gij, s.nb_sigma, nb_full)
         if k_unfold_plan is not None:
             phases = k_unfold_plan.parent_rows(phases)

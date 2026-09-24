@@ -17,10 +17,9 @@ import jax.numpy as jnp
 import numpy as np
 from jax.sharding import NamedSharding, PartitionSpec as P
 
-from common.gamma_matrices import gamma_perm_phase
+from common.collectives import device_put_process_local
 from runtime.padding import pad_to_axis, padded_axis
-from gw.ppm_tau_kernel import get_shared_sigma_tau_kernel
-from gw.wavefunction_bundle import parent_sigma_operands, sigma_face_kernel_kwargs
+from gw.wavefunction_bundle import parent_sigma_operands
 
 
 def _native_workspace(mesh_xy, shapes):
@@ -32,29 +31,78 @@ def _native_workspace(mesh_xy, shapes):
                for a,b in shapes)
 
 
-def _admit_compiled(kernel,args,meta,stage,*,native=0,resident=0):
+def _admit(compiled,meta,stage,*,native=0,resident=0,counted=0):
+    """Reserve a compiled executable's peak; ``counted`` argument bytes are charged elsewhere."""
     from runtime.aot_memory import aot_kernel_peak_bytes
-    compiled=kernel.lower(*args).compile()
     peak=aot_kernel_peak_bytes(compiled)
     if not peak.cufft_measured:
         raise ValueError('GATE shared_pole_capacity: sector FFT workspace unavailable')
     meta.shared_pole_capacity.reserve(stage,resident_bytes_per_rank=resident,
-        workspace_bytes_per_rank=peak.total+native,
+        workspace_bytes_per_rank=max(0,peak.total-counted)+native,
         concurrent_with=meta.shared_pole_capacity.live_stages)
     return compiled
 
 
-def sector_tau_factory(left, right, keys, meta, mesh_xy):
-    """Bind Gamma_A G_AB(t) Gamma_B to the established tau executor.
+def _admit_compiled(kernel,args,meta,stage,*,native=0,resident=0):
+    return _admit(kernel.lower(*args).compile(),meta,stage,native=native,resident=resident)
 
-    G[k,mu_X,s,nu_Y,s'] has rectangular centroid endpoints. Each of the
-    at-most-nine Lorentz blocks uses the existing FFT convolution owner.
-    Only the small projected band operator survives the call.
+
+class SectorTau:
+    """One sector's τ kernel for the window executable: W(τ) synthesis and Σ(τ) in one body.
+
+    ``window_kernel(space)`` is the traceable ``fn(*arguments, t, active_count)``
+    of :meth:`DeviceOmegaAccumulator.integrate_window` (one per branch space,
+    since the valence branch reads the q-negated factors); ``window_arguments``
+    swaps in the right endpoint's operands and the synthesis's per-window
+    operands.  Neither closes over a device buffer, so the accumulator's
+    runner cache retains no resident factors.
+    """
+
+    def __init__(self, spatial, synthesis, right_yr, right_proj, native, stage, meta):
+        self._spatial, self._synthesis = spatial, synthesis
+        self._right = (right_yr, right_proj)
+        self._native, self._stage, self._meta = native, stage, meta
+        self._kernels = {}
+        self._admitted = False
+
+    def window_kernel(self, space):
+        hole = space == 'val'
+        if hole not in self._kernels:
+            spatial, w_kernel = self._spatial, self._synthesis.w_kernel
+
+            def tau(xn, yr, xr, yn, energies, weight, w_operands, e_ref_a, e_ref_b, t, _active):
+                interactions = w_kernel(*w_operands, e_ref_b, t, hole)
+                return spatial(xn, yr, xr, yn, energies, weight, e_ref_a, t, interactions)
+            self._kernels[hole] = tau
+        return self._kernels[hole]
+
+    def window_arguments(self, xn, xr, energies, weight, e_ref_a, e_ref_b, space, indices, bounds):
+        w_operands = self._synthesis.window_operands(space, indices, bounds)
+        return (xn, self._right[0], xr, self._right[1], energies, weight, w_operands,
+                e_ref_a, e_ref_b)
+
+    def admit(self, compiled, arguments):
+        """Reserve the first window executable; the resident factors are the synthesis's stage."""
+        if self._admitted:
+            return
+        counted = sum(int(x.addressable_shards[0].data.nbytes)
+                      for x in jax.tree.leaves(self._synthesis.resident_operands()))
+        _admit(compiled, self._meta, self._stage, native=self._native, counted=counted)
+        self._admitted = True
+
+
+def sector_tau_factory(left, right, keys, meta, mesh_xy):
+    """Bind Gamma_A G_AB(t) Gamma_B to the window executor.
+
+    G[k,mu_X,s,nu_Y,s'] has rectangular centroid endpoints. The at-most-nine
+    Lorentz blocks share one transform of the raw-parent Green in the
+    four-current door (``gw.cohsex_sigma.make_lorentz_convolution``). Only
+    the small projected band operator survives the call.
     """
     from distrib_la import gemm_plan, panel_matmul
     from common.contract_bands import contract_bands_block_reshard
-    from gw.greens_function_kernel import build_G, _weighted_tau_phases
-    from gw.cohsex_sigma import _make_static_convolution
+    from gw.greens_function_kernel import build_G_parents, _weighted_tau_phases
+    from gw.cohsex_sigma import make_lorentz_convolution
 
     a, b = left.green_parent, right.green_parent
     plans = a.plan, b.plan
@@ -78,9 +126,8 @@ def sector_tau_factory(left, right, keys, meta, mesh_xy):
     else:
         gemm = gemm_plan(mesh_xy, m=m, k=k, n=n, nq=q,
                          dtype=jnp.complex128, layout=a.layout)
-    convolve = _make_static_convolution(mesh_xy, meta.kgrid, meta.nk_tot, lorentz=True)
-    vertices = jax.tree.map(lambda *xs: jnp.stack(xs),
-        *((gamma_perm_phase(A), gamma_perm_phase(B)) for A, B in keys))
+    convolve = make_lorentz_convolution(mesh_xy, meta.kgrid, meta.nk_tot, keys,
+                                        plans[0], plans[1])
     rows = jnp.asarray(plans[0].parent_full_rows)
 
     def factory(synthesis, band_axis):
@@ -90,31 +137,20 @@ def sector_tau_factory(left, right, keys, meta, mesh_xy):
         _, right_yr, _, right_proj, _, _ = parent_sigma_operands(right)
         right_proj = pad_to_axis(right_proj, band_axis, axis=3)
 
-        @jax.jit
-        def kernel(xn, yr, xr, yn, energies, weight, reference, time, interactions):
+        def spatial(xn, yr, xr, yn, energies, weight, reference, time, interactions):
             phases = _weighted_tau_phases(energies, 1j*time, e_ref=reference,
                                          band_weight=weight)
-            green = build_G(xn, yr, phases=phases, layout=a.layout,
-                gemm=gemm, k_unfold_plan=plans[0], right_k_unfold_plan=plans[1])
-            sigma = convolve(green, interactions, 1.0, vertices)
+            green = build_G_parents(xn, yr, phases=phases, layout=a.layout,
+                                    gemm=gemm, k_unfold_plan=plans[0])
+            sigma = convolve(green, interactions)
             return project(xr, jnp.take(sigma, rows, axis=0), yn)
 
-        admitted=None
-        def spatial(*args):
-            nonlocal admitted
-            args=(args[0],right_yr,args[2],right_proj,*args[4:])
-            if admitted is None:
-                q=shapes[0][0]; m=shapes[0][2]*shapes[0][3]
-                n=shapes[1][2]*shapes[1][3]; k=shapes[0][1]; b=band_axis.padded
-                projector_shapes=(((q,b,m),(q,m,n)),((q,b,n),(q,n,b)))
-                native=_native_workspace(mesh_xy,projector_shapes if face_green
-                    else (((q,m,k),(q,k,n)),*projector_shapes))
-                admitted=_admit_compiled(kernel,args,meta,
-                    f'sigma.sector.tau.{keys[0]}',native=native)
-            return admitted(*args)
-        return get_shared_sigma_tau_kernel(mesh_xy=mesh_xy, kgrid=meta.kgrid,
-            brackets=None, w_synthesis=synthesis, _sigma_kij=spatial,
-            cache=False, **sigma_face_kernel_kwargs(left))
+        b=band_axis.padded
+        projector_shapes=(((q,b,m),(q,m,n)),((q,b,n),(q,n,b)))
+        native=_native_workspace(mesh_xy,projector_shapes if face_green
+            else (((q,m,k),(q,k,n)),*projector_shapes))
+        return SectorTau(spatial, synthesis, right_yr, right_proj,
+                         native+synthesis.native, f'sigma.sector.tau.{keys[0]}', meta)
     return factory
 
 
@@ -171,10 +207,8 @@ def sector_synthesis(readers, headers, bases, families, frequencies, meta, mesh_
     sharding=NamedSharding(mesh_xy,P(None,'x','y'))
     if not kmax:
         zero=jax.jit(lambda:jnp.zeros(shape,jnp.complex128),out_shardings=sharding)
-        def empty(*_args):return jnp.transpose(zero().reshape(nk,m,nc,n,nt),(2,4,0,1,3)).reshape(nc*nt,nk,m,n)
-        empty.ordered=True
-        empty.close=lambda _result=None:None
-        return empty
+        return _SectorW(lambda _ref,_time,_hole:zero().reshape(nk,m,nc,n,nt),
+                        lambda _space,_indices,_bounds:(),lambda:(),lambda _result=None:None,0)
     # The store reader pads physical Kmax for both endpoint face shardings.
     # Keep that carrier through unfolding and GEMM; K and the interval bounds
     # remain physical, so the padded pole columns have identically zero weight.
@@ -259,11 +293,16 @@ def sector_synthesis(readers, headers, bases, families, frequencies, meta, mesh_
         capacity.live_stages=ambient
         b_x=b_y=poles=None
         raise
-    def build(space,_omega,indices,bounds,_real,ref,time,_count=None):
+    replicated=NamedSharding(mesh_xy,P())
+    def w_kernel(x,y,omega,interval,ref,time,hole):
+        # (nk, m*nc, n*nt) is centroid-major per endpoint: the four-current
+        # door reads it as (nk, m, nc, n, nt) without a transpose.
+        return kernel(x,y,omega,interval,ref,time,hole).reshape(nk,m,nc,n,nt)
+    def window_operands(space,indices,bounds):
+        # Host intervals once per window; every tau node of the window reuses them.
         intervals=shared_pole_intervals(frequencies,np.asarray(indices),np.asarray(bounds))
-        selected=jnp.asarray(intervals[parent])
-        value=kernel(b_x,b_y,poles,selected,ref,time,space=='val')
-        return jnp.transpose(value.reshape(nk,m,nc,n,nt),(2,4,0,1,3)).reshape(nc*nt,nk,m,n)
+        return (b_x,b_y,poles,device_put_process_local(
+            np.ascontiguousarray(intervals[parent]),replicated))
     closed=False
     def close(result=None):
         nonlocal b_x,b_y,poles,closed
@@ -275,9 +314,25 @@ def sector_synthesis(readers, headers, bases, families, frequencies, meta, mesh_
             b_x=b_y=poles=None
             capacity.live_stages=ambient
             closed=True
-    build.close=close
-    build.ordered=True
-    return build
+    return _SectorW(w_kernel,window_operands,lambda:(b_x,b_y,poles),close,native)
+
+
+class _SectorW:
+    """A sector's bound W(tau) synthesis: its kernel, per-window operands and lifetime.
+
+    ``w_kernel(*window_operands(space, indices, bounds), ref, time, hole)`` is
+    W(tau) as the four-current door's ``(nk, m, nc, n, nt)`` operand;
+    ``resident_operands()`` are the factors the synthesis stage already
+    charged; ``native`` is its GEMM's native workspace; ``close`` releases them.
+    """
+    ordered=True
+
+    def __init__(self,w_kernel,window_operands,resident_operands,close,native):
+        self.w_kernel=w_kernel
+        self.window_operands=window_operands
+        self.resident_operands=resident_operands
+        self.close=close
+        self.native=int(native)
 
 
 def instantaneous_sector_sigma(handle, families, bases, meta, mesh_xy, *,

@@ -126,50 +126,23 @@ def check_vertex_build_g(mesh, dtype="complex128", *, mu_L, nu_L, ns=4,
 def check_sigma_sx_chain_matches_dense(
         mesh, dtype="complex128", *, mu_L, nu_L, ns=4, mu=8, nb_full=8,
         nb_sigma=5, nk=2):
-    from gw.cohsex_sigma import _make_cohsex_kernels
     from gw.photon_sigma import (
         _TERM_SX, _TERM_X, _make_photon_static_class_kernel)
-    from gw.wavefunction_bundle import (
-        BandSlices, Wavefunctions, PSI_MUN_SPEC, PSI_NMU_SPEC)
+    from gw.wavefunction_bundle import BandSlices
 
     rng = np.random.default_rng(2026082310 + 17 * mu_L + nu_L)
     psi_np = _rng_mat(rng, (nk, nb_full, ns, mu), dtype)   # (nk,n,s,mu)
     psi_band_last = psi_np.transpose(0, 2, 3, 1)
     enk_np = np.sort(rng.standard_normal((nk, nb_full)), axis=1)
     f_np = rng.uniform(0.05, 0.95, size=(nk, nb_sigma))
-    Gij_np = np.zeros((nk, nb_sigma, nb_sigma), dtype=complex)
-    idx = np.arange(nb_sigma)
-    Gij_np[:, idx, idx] = f_np
     V0_np = _rng_mat(rng, (mu, mu), dtype)
     V0_np = 0.5 * (V0_np + np.conj(V0_np.T))     # Hermitian, physical V(q)
-    # sigma_sx (unlike hartree) runs V through the flat-k FFT convolve
-    # (_convolve -> make_flat_k_ifftn), which needs the FULL nkx*nky*nkz
-    # leading extent -- one (Hermitian) V slice per k, not a single q=0
-    # slot the way check_hartree's own V_q_np gets away with.
+    # The Lorentz convolution transforms V over the FULL nkx*nky*nkz leading
+    # extent -- one (Hermitian) V slice per k, not a single q=0 slot.
     V_q_np = np.tile(V0_np[None], (nk, 1, 1))
     kgrid = (nk, 1, 1)
     slices = BandSlices.from_band_edges(0, 0, 2, nb_sigma, nb_full)
 
-    wfns_face = Wavefunctions(
-        psi_nmu=_put(psi_np, mesh, PSI_NMU_SPEC),
-        psi_mun=_put(psi_band_last, mesh, PSI_MUN_SPEC),
-        enk=_put(enk_np, mesh, (None, None)),
-        occ=_put(np.zeros_like(enk_np), mesh, (None, None)),
-        slices=slices, layout="face",
-    )
-    Gij_face = _put(Gij_np, mesh, (None, None, None))
-    V_q_face = _put(V_q_np, mesh, (None, None, None))
-
-    sigma_sx_face, _ = _make_cohsex_kernels(
-        mesh, kgrid, nk, layout="face",
-        face_shape=(nk, nb_full, mu, ns))
-
-    wfns_face_v = replace(wfns_face,
-        psi_mun=jnp.einsum("ab,kbxn->kaxn", _gamma_full(mu_L), wfns_face.psi_mun),
-        psi_nmu=jnp.einsum("ab,knbx->knax", _gamma_full(nu_L), wfns_face.psi_nmu))
-
-    got_face_full = _gather(sigma_sx_face(wfns_face, Gij_face, V_q_face,
-                                          wfns_g=wfns_face_v))
     left = np.einsum("st,kbtm->kbsm", _gamma_full(mu_L), psi_np)
     right = np.einsum("st,kbtm->kbsm", _gamma_full(nu_L), psi_np)
     reference = np.zeros((nk, nb_full, nb_full), complex)
@@ -182,32 +155,29 @@ def check_sigma_sx_chain_matches_dense(
             sigma -= green * V_q_np[q][None, :, None, :] / nk
         reference[k] = np.einsum("asm,smtn,btn->ab",
             psi_np[k].conj(), sigma, psi_np[k])
-    r = _rel(got_face_full, reference)
-    assert r < RTOL, f"static SX vs literal q/band sum: {r:.3e}"
 
-    # The coupled photon path must evaluate X[V_packed] and SX[W_packed]
-    # through the same Green/convolution/projector graph and one compiled
-    # executable.  Use W=2V so both selector branches have an exact algebraic
-    # reference, while keeping V/W in their production 2-D packed sharding.
-    V_q_packed = _put(V_q_np, mesh, (None, "x", "y"))
-    W_q_packed = 2.0 * V_q_packed
+    # The coupled photon path must evaluate X[V] and SX[W] through the same
+    # Green/convolution/projector graph and one compiled executable.  Use
+    # W=2V so both selector branches have an exact algebraic reference.
     from full_photon_head_sigma_gate import _bundle
-    from common.gamma_matrices import gamma_perm_phase
     parent = _bundle(mesh, psi_np, enk_np, np.zeros_like(enk_np), slices)
     photon_block = _make_photon_static_class_kernel(
-        mesh, kgrid, nk, parent, parent)
-    vertices = tuple(tuple(x[None] for x in gamma_perm_phase(v)) for v in (mu_L, nu_L))
+        mesh, kgrid, nk, parent, parent, [(mu_L, nu_L)])
     weights = np.zeros((nk, nb_full), dtype=np.complex128)
     weights[:, :nb_sigma] = f_np
     weights = _put(weights, mesh, (None, None))
+    # Both operands placed alike, so the one executable serves both calls.
+    class_spec = (None, "x", None, "y", None)
+    V_q_class = _put(V_q_np[:, :, None, :, None], mesh, class_spec)
+    W_q_class = _put(2.0 * V_q_np[:, :, None, :, None], mesh, class_spec)
     photon_x = photon_block(parent.green_parent, parent.green_parent,
-        weights, V_q_packed[None], 1.0, vertices)
+        weights, V_q_class, 1.0)
     photon_x.block_until_ready()
     photon_sx = photon_block(parent.green_parent, parent.green_parent,
-        weights, W_q_packed[None], 1.0, vertices)
+        weights, W_q_class, 1.0)
     photon_sx.block_until_ready()
-    r_photon_x = _rel(_gather(photon_x), got_face_full)
-    r_photon_sx = _rel(_gather(photon_sx), 2.0 * got_face_full)
+    r_photon_x = _rel(_gather(photon_x), reference)
+    r_photon_sx = _rel(_gather(photon_sx), 2.0 * reference)
     assert r_photon_x < RTOL, (
         f"photon X[V] rel err {r_photon_x:.3e} "
         f"(mu_L={mu_L}, nu_L={nu_L})")
@@ -220,7 +190,6 @@ def check_sigma_sx_chain_matches_dense(
         f"cache_size={cache_size}")
 
     return {
-        "face_vs_dense": r,
         "photon_x_vs_v": r_photon_x,
         "photon_sx_vs_2v": r_photon_sx,
         "photon_kernel_cache_size": cache_size,

@@ -112,21 +112,26 @@ def _require_packed_operator(name, packed, mesh_xy):
 
 
 def _make_photon_static_class_kernel(
-    mesh_xy, kgrid, nk_tot, wfns_left, wfns_right, *, with_head=False,
+    mesh_xy, kgrid, nk_tot, wfns_left, wfns_right, keys, *, with_head=False,
 ):
-    """Share unfolded endpoints, G, transforms and projection across one Lorentz class."""
-    from common.shard_map import shard_map
+    """Share the parent Green, its one transform and the projection across one Lorentz class.
+
+    ``keys`` are the class's blocks, one ``A x B`` product; the interaction
+    operand is ``(nk, mx, nA, my, nB)`` (:func:`_make_photon_class_restore`).
+    """
     from ffi import ffi_dial_key
     from common.contract_bands import contract_bands_block_reshard
     from distrib_la import gemm_plan
-    from .cohsex_sigma import _make_static_convolution
-    from .greens_function_kernel import build_G
+    from .cohsex_sigma import make_lorentz_convolution, make_lorentz_q0_product
+    from .greens_function_kernel import build_G_parents
     left, right = wfns_left.green_parent, wfns_right.green_parent
     layout = left.layout
     plans = (left.plan, right.plan)
+    keys = tuple((int(A), int(B)) for A, B in keys)
     shapes = tuple((p.n_parent, c.psi_nmu.shape[1], p.n_centroid_packed, p.nspinor)
                    for c, p in zip((left, right), plans))
-    key = (_mesh_key(mesh_xy), tuple(kgrid), tuple(map(id, plans)), shapes, layout, ffi_dial_key(), with_head)
+    key = (_mesh_key(mesh_xy), tuple(kgrid), tuple(map(id, plans)), shapes, layout, ffi_dial_key(),
+           keys, with_head)
     if key in _photon_sigma_kernel_cache:
         return _photon_sigma_kernel_cache[key]
     plan_key = ("plans", _mesh_key(mesh_xy), tuple(kgrid), nk_tot, shapes, layout, ffi_dial_key())
@@ -137,20 +142,23 @@ def _make_photon_static_class_kernel(
             n=shapes[1][2]*shapes[1][3], nq=shapes[0][0], dtype=jnp.complex128, layout=layout)
         _photon_sigma_kernel_cache[plan_key] = project, g_plan
     project, g_plan = _photon_sigma_kernel_cache[plan_key]
-    convolve = _make_static_convolution(mesh_xy, kgrid, nk_tot, q0_only=False, lorentz=True)
-    head_convolve = (_make_static_convolution(mesh_xy, kgrid, nk_tot, q0_only=True, lorentz=True)
-                     if with_head else None)
+    convolve = make_lorentz_convolution(mesh_xy, kgrid, nk_tot, keys, plans[0], plans[1])
+    head_product = make_lorentz_q0_product(nk_tot) if with_head else None
     rows = np.asarray(plans[0].parent_full_rows)
     @jax.jit
-    def contract_class(left, right, weights, interaction, factor, vertices, head_interaction=None):
+    def contract_class(left, right, weights, interaction, factor, head_interaction=None,
+                       head_vertices=None):
         weights = plans[0].parent_rows(weights)
-        G = build_G(left.psi_mun, right.psi_nmu, phases=jnp.real(weights),
-                    layout=layout, gemm=g_plan, k_unfold_plan=plans[0],
-                    right_k_unfold_plan=plans[1])
-        sigma = convolve(G, interaction, factor, vertices)
+        green = build_G_parents(left.psi_mun, right.psi_nmu, phases=jnp.real(weights),
+                                layout=layout, gemm=g_plan, k_unfold_plan=plans[0])
+        # The prefactor is -1/2 or 1: an exact power of two, applied after the door.
+        sigma = factor * convolve(green, interaction)
         result = project(left.projection_faces()[0], jnp.take(sigma, jnp.asarray(rows), axis=0), right.projection_faces()[1])
         if with_head:
-            head_sigma = head_convolve(G, head_interaction, factor, vertices)
+            # The q -> 0 head is a pointwise product on the unfolded Green.
+            G = plans[0].unfold_operator(green.G, operator_transpose=green.transpose,
+                                         right_plan=plans[1])
+            head_sigma = head_product(G, head_interaction, factor, head_vertices)
             head = project(left.projection_faces()[0], jnp.take(head_sigma, jnp.asarray(rows), axis=0), right.projection_faces()[1])
             return result, head
         return result
@@ -173,17 +181,29 @@ def _photon_head_pairs(response, term, mesh_xy):
     return expand(pairs), expand(bare)
 
 
-def _make_photon_class_restore(response, keys):
-    """Compile one canonical full-q producer per class without caching interaction arrays."""
+def _make_photon_class_restore(response, keys, mesh_xy):
+    """Compile one canonical full-q producer per class without caching interaction arrays.
+
+    Returns the class's blocks as the four-current door's ``(nk, mx, nA, my,
+    nB)`` operand and the stacked ``(perm, phase)`` vertices the q -> 0 head
+    product reads.
+    """
     from .w_isdf import photon_blocks_full_q
+    from .cohsex_sigma import lorentz_class_vertices
     from common.gamma_matrices import gamma_perm_phase
     layout, plans, policy = response.layout, response.family_plans, response.qgrid_policy
-    key = ("restore", id(layout), tuple(map(id, plans)), id(policy), keys)
+    key = ("restore", id(layout), tuple(map(id, plans)), id(policy), keys, _mesh_key(mesh_xy))
     if key not in _photon_sigma_kernel_cache:
+        lefts, rights = lorentz_class_vertices(keys)
+        spec = NamedSharding(mesh_xy, P(None, "x", None, "y", None))
+
         @jax.jit
         def restore(packed):
-            interactions = jnp.stack([value for _, value in photon_blocks_full_q(
+            blocks = jnp.stack([value for _, value in photon_blocks_full_q(
                 packed, keys, layout=layout, family_plans=plans, qgrid_policy=policy)])
+            nq, mx, my = (int(d) for d in blocks.shape[1:])
+            interactions = jax.lax.with_sharding_constraint(jnp.transpose(
+                blocks.reshape(len(lefts), len(rights), nq, mx, my), (2, 3, 0, 4, 1)), spec)
             vertices = jax.tree.map(lambda *v: jnp.stack(v),
                 *((gamma_perm_phase(A), gamma_perm_phase(B)) for A, B in keys))
             return interactions, vertices
@@ -215,16 +235,17 @@ def contract_lorentz_blocks(blocks, *, families, term, response, Gij, meta, mesh
                    if term != _TERM_COH else left.band_mask(slices.sigma_sum).astype(jnp.complex128))
         weights = jax.lax.with_sharding_constraint(
             jnp.broadcast_to(weights, (meta.nk_tot, slices.nb_full)), NamedSharding(mesh_xy, P()))
-        interactions, vertices = _make_photon_class_restore(response, keys)(packed)
+        interactions, vertices = _make_photon_class_restore(response, keys, mesh_xy)(packed)
         head_blocks = None
         if with_head:
             head_blocks = jnp.stack([photon_q0_low_rank_block(pairs, response.layout, A, B, mesh_xy)
                 - (photon_q0_low_rank_block(bare, response.layout, A, B, mesh_xy) if bare else 0)
                 for A, B in keys])
         kernel = _make_photon_static_class_kernel(mesh_xy, meta.kgrid, meta.nk_tot,
-                                                  left, right, with_head=with_head)
+                                                  left, right, keys, with_head=with_head)
         arguments = (left.green_parent, right.green_parent, weights, interactions,
-                     -0.5 if term == _TERM_COH else 1.0, vertices, head_blocks)
+                     -0.5 if term == _TERM_COH else 1.0, head_blocks,
+                     vertices if with_head else None)
         if admit_kernel is not None:
             admit_kernel(kernel, arguments, keys[0])
         value = kernel(*arguments)
