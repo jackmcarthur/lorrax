@@ -52,7 +52,7 @@ stages, sets the node count.
 | stage | resident per rank (leading terms) | priced by | refuses |
 |---|---|---|---|
 | ψ(G) and centroid faces | charge fit: conj ψ(G) on the rank's G slots, `16·N_k·N_b·n_s·N_Gψ/P`. Centroid faces `ψ(r_μ)`: two copies of `16·n_par·n_s·μ·N_b/P` in the face layout (`low_mem_bands = true`, the default; `n_par` raw parent k points) | the ζ-fit planners below | with the fit |
-| ζ fit, charge channel (route G) | C factor, one μ-batch working set, the ψ(G) slice; the Z store `16·Q·μ·N_G/P` lives on host or disk | `plan_zeta_route_g` ([§ route G](#charge-channel-route-g)) | `GATE zeta-mubatch-capacity`, `GATE zeta-mubatch-tier` |
+| ζ fit, charge channel (route G) | C factor, one μ-batch working set, the ψ(G) slice; the Z store `16·Q·μ·N_G/P` lives on host or disk | `plan_zeta_route_g` ([§ route G](#charge-channel-route-g)) | `GATE zeta-mubatch-capacity` |
 | ζ fit, current channels (bispinor) | persistent floor plus the largest of stages A–D | `plan_gflat_chunks` ([§ r-tile fit](#current-channels-the-r-tile-fit)) | `[planner] the certified plan does not fit` |
 | V_q | `V_acc` `16·Q·μ_L·μ_R/P`, one q-tile of ζ rows, G panels | `vq_tile_bytes` ([§ V_q](#vq-g-panels-and-q-tiles)) | `GATE vq_tile_budget` |
 | V_q unfold | `16·N_k·μ²/P`, sharded `P(None,'x','y')` | — | — |
@@ -98,9 +98,6 @@ dataset. The finalize streams it in G tiles sized to a quarter of the target.
 - **`GATE zeta-mubatch-capacity`**: the smallest configuration (ψ(G)
   resident, `b = P`, one plane per group) exceeds the target. ψ(G) streaming
   is not implemented. Fix: more ranks or more memory per device.
-- **`GATE zeta-mubatch-tier`**: the back-solve tier is `distributed`, whose
-  2-D-sharded C⁺ route G does not read. Fix: `distributed_zeta_solve = local`
-  or `replicated`.
 
 The receipt (`ISDF μ-batch plan`) prints the route, batch, collectives per
 batch against the minimum efficient payload, the Z-store placement, every
@@ -311,9 +308,9 @@ without re-measuring.
    `all_gather('x')` (bands). Each rank holds `(n_k, band_chunk, n_s,
    r_chunk/p_y)` (all bands, its r block), twice to cover the short-final-chunk
    compaction, plus its own `band_chunk/P` bands over the full r-chunk, the
-   all-to-all source (`n_k` the parents on the parent route). A gather over both axes at the full r-chunk, with no
-   mesh division, is what once let the planner pick `r_chunk = N_r` and ask
-   XLA for a single allocation several times the device.
+   all-to-all source (`n_k` the parents on the parent route). The planner prices
+   both divisions, so no r-tile width is admitted whose slab is undivided by the
+   mesh.
 3. **Stage F takes the larger of two tensors.** The restart write carries
    `V_qμν`/`W0_qμν` `(Q, μ, μ)` and the G-flat ζ tensor `(Q, μ, N_G)`. SlabIO
    writes per-rank hyperslabs, so each costs one sharded tile, and the ζ
