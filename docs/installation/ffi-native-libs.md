@@ -1,126 +1,107 @@
 # FFI native libraries
 
-!!! tip "Read [Building the FFI libraries](../building_ffi.md) first"
-    That page covers *why* the two libraries exist, the build contract every
-    build path now runs (`scripts/verify_ffi_build.sh`), the handler-ABI
-    pairing rule, and a per-lever trap table for porting to a new site. This
-    page is the per-dependency acquisition detail underneath it.
+This page lists where each native dependency of the FFI pair comes from on a
+site with no LORRAX module. Read [Building the FFI libraries](../building_ffi.md)
+first: it owns the verify contract, the sealing step and the porting levers.
+None of these dependencies are declared in `pyproject.toml` except
+`nvidia-mathdx`.
 
-The distributed code paths (cuSolverMp `eigh`, sharded parallel-HDF5 I/O, SLATE Cholesky /
-trsm / heev) call into three native libraries through `src/ffi/`. A single
-`liblorrax_ffi.so` exposes all of them. None of these are declared in `pyproject.toml`; you
-obtain them separately, then build the `.so` against them.
+## 1. cuSOLVERMp and cuBLASMp (CUDA leg)
 
-!!! warning "Fresh clone has no `liblorrax_ffi.so`"
-    It is a gitignored build artifact. The pure-JAX path never needs it; the first
-    distributed / FFI-I/O call without it fails with
-    `FileNotFoundError … Build with: bash src/ffi/cpp/build.sh`.
+Stage scripts, one per source:
 
-!!! note "TODO"
-    These recipes are assembled from the portability and dependency-architecture reviews.
-    The provider-agnostic (non-Cray) variants are documented but **untested** on a
-    non-NERSC cluster. The Cray-PE path (stage scripts) is the validated one on Perlmutter.
+- `src/ffi/cpp/stage/cusolvermp_stage_pypi.sh`: the standalone
+  `nvidia-cusolvermp-cu12` wheel (`CUSOLVERMP_VERSION`, default 0.7.2.888).
+- `src/ffi/cpp/stage/cusolvermp_stage_nvhpc.sh`: from an NVHPC SDK install.
+- `src/ffi/cpp/stage/cusolvermp_stage_cublasmp_redist.sh`: the cuBLASMp
+  redistributable.
 
-## 1. cuSolverMp + CAL
+Every stage exports the same SONAME, `libcusolverMp.so.0`, so the stage a leg
+is built against must be the stage its runs load. `src/ffi/cpp/build.sh`
+refuses until `LORRAX_NVHPC_ROOT` (or `LORRAX_NVHPC_SUBPATH`) names it.
+cuSOLVERMp 0.6.0 returns wrong `getrf`/`getrs` results on any mesh with both
+P_x > 1 and P_y > 1; use ≥ 0.7. Versions ≥ 0.7 are NCCL-native, ship no
+`cal.h`, and need `-DLORRAX_FFI_HAVE_CAL=OFF`. Versions ≥ 0.8 need NCCL ≥ 2.27.
 
-**Preferred (any cluster): PyPI wheel.** The validated baseline is
-`nvidia-cusolvermp-cu12==0.7.2.888` plus the matching `nvidia-cal-cu12`. Version matters:
-0.6.0 silently returns **wrong answers** on $P_x>1$ and $P_y>1$ meshes; 0.7.2 includes the
-CAL→NCCL ABI fix and the race-condition follow-up (see comments in
-`config/perlmutter/site_config.sh`).
+## 2. Parallel HDF5 (both legs)
 
-```bash
-pip install nvidia-cusolvermp-cu12==0.7.2.888 nvidia-cal-cu12
-# then point CMake at the wheel's include/lib (see the build step below):
-#   -DCUSOLVERMP_INCLUDE_DIR=<site-packages>/nvidia/.../include
-#   -DCUSOLVERMP_LIB_DIR=<site-packages>/nvidia/.../lib
-```
+CMake refuses an HDF5 without `HDF5_IS_PARALLEL`. Point it at the install with
+`-DHDF5_ROOT=<prefix>` (or `$HDF5_ROOT` / `$HDF5_DIR`).
 
-**Alternative: NVHPC SDK** (spack `nvhpc`, or the tarball from developer.nvidia.com) → use
-`src/ffi/cpp/stage/cusolvermp_stage_nvhpc.sh` with `NVHPC_ROOT` pointed at the install.
+- Cray: load `cray-hdf5-parallel` and stage it with
+  `src/ffi/cpp/stage/phdf5_stage_cray.sh`.
+- OpenMPI sites: `src/ffi/cpp/stage/phdf5_stage_openmpi.sh`, or an MPI build
+  from conda-forge (`hdf5=*=mpi_openmpi_*`) or spack (`hdf5+mpi`).
 
-## 2. Parallel HDF5
+The host leg must link the same HDF5 SOVERSION the runtime provides (GATE 7).
 
-The CMake check enforces `HDF5_IS_PARALLEL`; a serial HDF5 will be rejected with a clear
-error.
+## 3. SLATE, BLAS++ and LAPACK++
 
-**Preferred (non-Cray): conda-forge or spack.**
-
-```bash
-# conda-forge, OpenMPI-flavored build:
-conda install -c conda-forge 'hdf5=*=mpi_openmpi_*' openmpi
-# or spack:
-spack install hdf5+mpi
-```
-
-Build the FFI against it directly with `-DHDF5_ROOT=<prefix>` — no staging and no
-library-name shimming needed off-container.
-
-**Cray:** load `cray-hdf5-parallel` and stage it with
-`src/ffi/cpp/stage/phdf5_stage_cray.sh`. The OpenMPI stage script
-(`src/ffi/cpp/stage/phdf5_stage_openmpi.sh`) is the portable stack for non-Cray clusters.
-
-## 3. SLATE (+ blaspp + lapackpp)
-
-Build from source (blaspp/lapackpp build as part of the superbuild and land under the same
-prefix):
+Build SLATE from source; BLAS++ and LAPACK++ install under the same prefix. The
+host leg needs a `gpu_backend=none` install (`LORRAX_SLATE_HOST_INSTALL_DIR`,
+default `$HOME/software/slate_builds/cpu/install`). The CUDA leg needs a
+`gpu_backend=cuda` install (`LORRAX_SLATE_INSTALL_DIR`). On a Cray PE,
+`src/ffi/cpp/stage/slate_build_perlmutter.sh cpu|gpu` builds both
+reproducibly. Elsewhere:
 
 ```bash
 git clone --recurse-submodules https://github.com/icl-utk-edu/slate
-cd slate
-cmake -B build -S . \
-    -Dgpu_backend=cuda \
-    -Dblas=openblas \
-    -DCMAKE_INSTALL_PREFIX=$HOME/software/slate/install
-cmake --build build -j && cmake --install build
+cmake -S slate -B slate/build -Dgpu_backend=none -Dblas=openblas \
+    -DCMAKE_INSTALL_PREFIX=$HOME/software/slate_builds/cpu/install
+cmake --build slate/build -j && cmake --install slate/build
 ```
 
-!!! note
-    The BLAS backend is a free choice — Cray uses `libsci`; elsewhere OpenBLAS or MKL is
-    fine. SLATE does not require libsci (that is a Perlmutter performance choice). Point the
-    build at the install prefix with `-DLORRAX_SLATE_INSTALL_DIR=$HOME/software/slate/install`.
+Any BLAS works (LibSci, OpenBLAS, MKL), provided the host leg links exactly one
+BLAS flavour (GATE 2).
+
+## 3a. FFTW and nvidia-mathdx
+
+- The host leg resolves FFTW at run time. The FFTW prefix reaches CMake only as
+  a dlopen hint, never as `DT_NEEDED` (GATE 5); on Cray,
+  `src/ffi/cpp/stage/fftw_stage_cray.sh` stages it.
+- The CUDA leg's k-convolution router needs the Python package
+  `nvidia-mathdx==25.6.0`, pinned in the `cuda12`/`cuda13` extras of
+  `pyproject.toml`. It is header-only and nothing is linked: kernels are
+  compiled per k-grid with NVRTC at run time.
 
 ## 4. Build `liblorrax_ffi.so` (non-Shifter)
 
-!!! danger "TODO — direct-convolution AOT is sm_80 only"
-    With nvcc enabled, this build currently embeds direct-convolution cubins
-    for **sm_80 only** (Perlmutter's A100). Other GPU architectures still
-    work through a named runtime-NVRTC fallback, but a cold process can pay
-    about 30 seconds before its first convolution. A production installer
-    for another GPU must supply a real fatbin architecture list or an
-    install-time compile step; the present A100-only default is not portable.
-    The source remains single-copy: generated `.cu` files are extracted from
-    each handler's `kKernelSrc` literal. See
-    [CUDA kernel migration](../dev/cuda_kernel_migration.md#aot-images-and-the-sm_80-installation-gap).
-
-On NERSC the launcher `src/ffi/cpp/run_shifter.sh` sets the MPI env vars and runs
-`build.sh` inside the container (see [Perlmutter](perlmutter.md)). Off-container, drive
-CMake directly with explicit `-D` overrides — the CMake config already supports pointing at
-arbitrary install locations:
+Drive CMake on `src/ffi/cpp/` with the platform selector and explicit paths.
+`LORRAX_FFI_PLATFORM` is required; unset, CMake stops with an error naming both
+legs. The XLA FFI headers must come from the JAX that will load the library:
+the CUDA leg reads `jax.ffi.include_dir()` from the `python3` on `PATH`, and the
+host leg takes `-DLORRAX_XLA_FFI_INCLUDE_DIR` or probes the same way.
 
 ```bash
-cd src/ffi/cpp/common
-cmake -B build -S . \
-    -DCUSOLVERMP_INCLUDE_DIR=<cusolvermp-include> \
-    -DCUSOLVERMP_LIB_DIR=<cusolvermp-lib> \
-    -DHDF5_ROOT=<hdf5-parallel-prefix> \
-    -DLORRAX_SLATE_INSTALL_DIR=$HOME/software/slate/install \
-    -DLORRAX_MPI_INCLUDE_DIR=<mpi-include> \
-    -DLORRAX_MPICH_LIB_DIR=<mpi-lib>
-cmake --build build -j
-# -> build/liblorrax_ffi.so ; the loader (ffi_loader.py) searches cpp/build/,
-#    $LORRAX_FFI_SO, and sys.path.
+cmake -S src/ffi/cpp -B build_cuda \
+    -DLORRAX_FFI_PLATFORM=cuda \
+    -DCUSOLVERMP_INCLUDE_DIR=<dir with cusolverMp.h> \
+    -DCUSOLVERMP_LIB_DIR=<dir with libcusolverMp.so> \
+    -DLORRAX_FFI_HAVE_CAL=OFF \
+    -DHDF5_ROOT=<parallel HDF5 prefix> \
+    -DLORRAX_SLATE_INSTALL_DIR=<gpu_backend=cuda SLATE prefix> \
+    -DLORRAX_MPI_INCLUDE_DIR=<dir with mpi.h> \
+    -DLORRAX_MPICH_LIB_DIR=<dir with libmpi> \
+    -DCMAKE_CUDA_ARCHITECTURES=<sm of the target GPU>
+cmake --build build_cuda -j
+scripts/verify_ffi_build.sh --leg cuda build_cuda/liblorrax_ffi.so
 ```
 
-For an OpenMPI / non-Cray build, `build.sh` accepts `LORRAX_FFI_ALLOW_DEFAULT_MPI=1` so it
-does not hard-require the Cray-MPICH env vars; set `LORRAX_PHDF5_MPI_STACK=openmpi`
-accordingly (this variable is consumed by the build pipeline — run_shifter.sh / CMake — not
-by `build.sh` itself). The build-time and runtime MPI stacks **must match** — a mismatch surfaces as a
-segfault or a "cannot open shared object file" at start-up, not a clean message.
+The host leg is the same command with `-DLORRAX_FFI_PLATFORM=host`,
+`-DLORRAX_SLATE_HOST_INSTALL_DIR=<gpu_backend=none prefix>` and no CUDA
+options. Then seal the two legs
+([Building the FFI libraries](../building_ffi.md#seal-the-deployable-pair)).
+
+- Without `LORRAX_MPICH_LIB_DIR`, CMake warns and falls back to
+  `/opt/hpcx/ompi/lib`, and the library requests `libmpi.so.40`.
+- `src/ffi/cpp/build.sh` refuses to run without `LORRAX_MPI_INCLUDE_DIR` and
+  `LORRAX_MPICH_LIB_DIR`; `LORRAX_FFI_ALLOW_DEFAULT_MPI=1` lifts that for an
+  OpenMPI build.
+- The build-time and run-time MPI must match. A mismatch appears as a
+  segfault or a "cannot open shared object file" error at startup, not as a
+  named refusal.
 
 ## See also
 
-- `src/ffi/PORTING.md` — the full FFI porting checklist (in the repo)
-- `src/ffi/AGENTS.md` — FFI subpackage entry points
-- [`docs/environment/machines/perlmutter.md` §2](../environment/machines/perlmutter.md) — the FFI stack
-  reference (bind-mounts, staging, MPI override)
+- `src/ffi/PORTING.md`: the FFI porting checklist.
+- `src/ffi/AGENTS.md`: the FFI subpackage entry points.
