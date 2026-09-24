@@ -29,6 +29,7 @@ from .gw_config import (ZETA_RCOND_DEFAULT,
                         active_zeta_truncating_knobs, env_bool)
 
 from isdf.core import (
+    build_psi_G_resident_sm,
     build_psi_r_cache_sm,
     c_q_from_psi_sm,
     complete_ordered_pair_normal_equations,
@@ -250,6 +251,7 @@ def fit_zeta_to_h5(
     write_ibz_only: bool = True,
     zeta_cutoff_ry: float | None = None,
     cache_psi_r: bool = True,
+    resident_psi_G: bool = False,
     cache_face_y_blocks: bool = False,
     bispinor_lift: str = "raw",
     _coupled_mu123_coordinator=None,
@@ -1085,6 +1087,22 @@ def fit_zeta_to_h5(
         # but retain the store-owned box index and k vectors consumed by the
         # parent kernel metadata until the final close below.
         psi_G_store.release_host_tiles()
+    psi_G_res = None
+    if not cache_psi_r and resident_psi_G:
+        # The planner admitted a device-resident ψ(G): read the store's band
+        # chunks onto device once instead of once per r chunk.
+        with timing.section("zeta_fit.build_psi_G_resident"):
+            psi_G_res = build_psi_G_resident_sm(psi_G_store, mesh_xy=mesh_xy)
+            psi_G_res.block_until_ready()
+        psi_G_store.release_host_tiles()
+        if jax.process_index() == 0:
+            _res_local = sum(int(sh.data.size) * 16
+                             for sh in psi_G_res.addressable_shards)
+            print_fn(f"  ψ(G) device-resident: {psi_G_res.shape}, "
+                     f"{_res_local / 1e9:.2f} GB local; the streamed "
+                     f"ψ(G)→ψ(tile) source reads it instead of host")
+    if cache_psi_r:
+        pass
     elif jax.process_index() == 0:
         from gw.gflat_memory_model import zeta_fft_k_tile
         from runtime.padding import mesh_divisor
@@ -1279,6 +1297,8 @@ def fit_zeta_to_h5(
                                dtype=np.int32), _rep),
                 plane_axis=int(real_grid_tiles.plane_axis),
             )
+            if psi_G_res is not None:
+                _tile_args["psi_G_resident"] = psi_G_res
             # Each pad slot gets its OWN out-of-range sentinel so the
             # scatter's unique-index promise holds with mode='drop'.
             _tile_r_indices_dev = _device_put_process_local(
@@ -1307,7 +1327,8 @@ def fit_zeta_to_h5(
                         tile_local_perm=_tile_args["tile_local_perm"],
                         tile_wraps=_tile_args["tile_wraps"],
                         tile_planes=_tile_args["tile_planes"],
-                        plane_axis=_tile_args["plane_axis"])
+                        plane_axis=_tile_args["plane_axis"],
+                        psi_G_resident=psi_G_res)
 
                 if _coupled_stacked_solve:
                     def _build_coupled_zeta():

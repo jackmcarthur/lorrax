@@ -1595,7 +1595,7 @@ def zeta_sphere_ngkmax(wfn, sym, meta, zeta_cutoff_ry) -> int:
 def _plan_gflat_chunks_for_channel(
 		*, meta, cfg, band_slices, mesh_xy, is_bispinor, n_q_selected,
 		face_current_vertex=False, parent_route=None, print_fn=print,
-		zeta_ngkmax=None):
+		zeta_ngkmax=None, psi_ngkmax=None):
 	"""Chunk-plan ONE ISDF centroid channel: the charge channel
 	(``meta.n_rmu``) or one transverse channel (``meta.n_rmu`` — μ_T is
 	typically ≈ μ_C/3).
@@ -1665,6 +1665,7 @@ def _plan_gflat_chunks_for_channel(
 		low_mem_bands=bool(mem.low_mem_bands),
 		face_current_vertex=bool(face_current_vertex),
 		parent_route=parent_route,
+		psi_ngkmax=psi_ngkmax,
 		# Stage F writes per-rank hyperslabs; the planner therefore
 		# charges only the local sharded tile.
 	)
@@ -1721,6 +1722,7 @@ def _plan_gflat_chunks_for_channel(
 		'q_chunk': int(gflat_plan.q_chunk),
 		'gflat_chunk_size': int(gflat_plan.gflat_chunk_size),
 		'cache_psi_r': bool(gflat_plan.cache_psi_r),
+		'resident_psi_G': bool(gflat_plan.resident_psi_G),
 		'cache_face_y_blocks': bool(gflat_plan.cache_face_y_blocks),
 		'gflat_hwm_gb': gflat_plan.hwm_bytes / 1e9,
 		'memory_estimate': {
@@ -2058,7 +2060,7 @@ def _reuse_zeta_faces(
 
 def _plan_transverse_zeta(
         _reuse_T, band_slices, cfg, mesh_xy, print_fn, sym, zeta_contract,
-        zeta_ngkmax=None):
+        zeta_ngkmax=None, psi_ngkmax=None):
     """Produce the existing independently sized transverse fit plan."""
     _meta_T = zeta_contract.meta_transverse
     _cent_T_idx = zeta_contract.centroids_transverse
@@ -2084,7 +2086,7 @@ def _plan_transverse_zeta(
                 parent_route=dict(n_parent=int(np.asarray(sym.kirr_fullids).size),
                                   parents_only=True),
                 face_current_vertex=True, print_fn=print_fn,
-                zeta_ngkmax=zeta_ngkmax)
+                zeta_ngkmax=zeta_ngkmax, psi_ngkmax=psi_ngkmax)
     return _meta_T, _cent_T_idx, _chunks_T, _gflat_plan_T, _write_ibz_only_transverse
 
 
@@ -2234,6 +2236,7 @@ def _fit_charge_zeta_channel(
                 zeta_rcond=cfg.backend.zeta_rcond,
                 gflat_chunk_size=int(chunks.get('gflat_chunk_size', 0)),
                 cache_psi_r=bool(chunks.get('cache_psi_r', True)),
+                resident_psi_G=bool(chunks.get('resident_psi_G', False)),
                 cache_face_y_blocks=bool(
                     chunks.get('cache_face_y_blocks', False)),
                 write_ibz_only=_write_ibz_only_charge,
@@ -2358,6 +2361,7 @@ def _transverse_zeta_channel_runner(
                 transverse_zeta_rcond=cfg.backend.transverse_zeta_rcond,
                 gflat_chunk_size=int(_chunks_T.get('gflat_chunk_size', 0)),
                 cache_psi_r=bool(_chunks_T.get('cache_psi_r', True)),
+                resident_psi_G=bool(_chunks_T.get('resident_psi_G', False)),
                 cache_face_y_blocks=bool(
                     _chunks_T.get('cache_face_y_blocks', False)),
                 vertex_mu_L=mu_L,
@@ -2503,7 +2507,8 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 	    _reuse_T, band_slices, cfg, mesh_xy, print_fn, sym, zeta_contract,
 	    zeta_ngkmax=(zeta_sphere_ngkmax(
 	        wfn, sym, zeta_contract.meta_transverse, _zeta_cutoff)
-	        if cfg.bispinor and not all(_reuse_T) else None))
+	        if cfg.bispinor and not all(_reuse_T) else None),
+	    psi_ngkmax=int(wfn.ngkmax))
 	(_coupled_mu123_enabled, _transverse_batched_route) = _plan_coupled_zeta_fit(
 	    _chunks_T, _gflat_plan_T, _meta_T, _reuse_T, band_slices, cfg, mesh_xy, print_fn)
 	_provenance = zeta_contract.provenance
@@ -2869,7 +2874,8 @@ def _prepare_fresh_parent_faces(
     		parent_route=dict(n_parent=_candidate_plan.n_parent,
     		                  parents_only=True), print_fn=print0,
     		zeta_ngkmax=zeta_sphere_ngkmax(
-    			wfn, sym, meta, zeta_contract.zeta_cutoff))
+    			wfn, sym, meta, zeta_contract.zeta_cutoff),
+    		psi_ngkmax=int(wfn.ngkmax))
     _parent_zeta_plan = _candidate_plan if chunks is not None else None
     load_band_chunk = (chunks['band_chunk'] if chunks is not None
                        else zeta_contract.loader_band_chunk)

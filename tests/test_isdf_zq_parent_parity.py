@@ -74,7 +74,8 @@ def _worker(case_name: str, *, mesh_shape=(2, 2), return_arrays=False, return_fi
     from types import SimpleNamespace
 
     from isdf.core import (
-        build_psi_r_cache_sm, c_q_from_psi_sm, z_q_from_psi_sm)
+        build_psi_G_resident_sm, build_psi_r_cache_sm, c_q_from_psi_sm,
+        z_q_from_psi_sm)
     from gw.centroid_k_unfold import build_centroid_k_unfold_plan
     from symmetry_maps import (
         centroid_source_map_and_wrap, spinor_rotation_for_sym_row)
@@ -247,6 +248,10 @@ def _worker(case_name: str, *, mesh_shape=(2, 2), return_arrays=False, return_fi
     # ---- parent route, both ψ(r) sources, every tile -------------------
     parent_cache = jax.block_until_ready(
         build_psi_r_cache_sm(parent_store, mesh_xy=mesh))
+    # The third source (2026-09-23): the store's ψ(G) device-resident and
+    # the plane-restricted transform on the tile's planes.
+    parent_res = jax.block_until_ready(
+        build_psi_G_resident_sm(parent_store, mesh_xy=mesh))
     scale = float(np.max(np.abs(Z_face)))
     max_rel = 0.0
     max_pad = 0.0
@@ -255,7 +260,10 @@ def _worker(case_name: str, *, mesh_shape=(2, 2), return_arrays=False, return_fi
         local_perm, wraps = tiles.source_tables(t)
         r_index = tiles.r_index[t]
         active = r_index >= 0
-        for cache in (None, parent_cache):
+        plane_kw = dict(
+            tile_planes=jnp.asarray(tiles.tile_planes[t], dtype=jnp.int32),
+            plane_axis=int(tiles.plane_axis), psi_G_resident=parent_res)
+        for cache, extra in ((None, {}), (parent_cache, {}), (None, plane_kw)):
             Z_pk = z_q_from_psi_sm(
                 psi_G_store=parent_store, psi_r_cache=cache,
                 band_chunk_ranges=band_chunk_ranges,
@@ -264,7 +272,7 @@ def _worker(case_name: str, *, mesh_shape=(2, 2), return_arrays=False, return_fi
                 k_unfold_plan=plan, gamma_L=vertex, gamma_R=vertex_right,
                 tile_r_index=jnp.asarray(r_index, dtype=jnp.int32),
                 tile_local_perm=jnp.asarray(local_perm),
-                tile_wraps=jnp.asarray(wraps))
+                tile_wraps=jnp.asarray(wraps), **extra)
             if vertex == vertex_right and vertex and cache is not None:
                 from isdf.core import _z_q_face_parent
                 coupled = _z_q_face_parent(
