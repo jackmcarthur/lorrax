@@ -216,6 +216,46 @@ head_correction = no_local_fields
     assert np.asarray(builder(q, g))[0, 1] == -7. / _CELL_VOLUME
 
 
+@pytest.mark.parametrize("mode", ["gn_ppm", "hl_ppm"])
+def test_incumbent_ppm_uses_bare_tt_gamma_but_packed_does_not(
+        tmp_path, monkeypatch, mode):
+    """Both PPM models use bare TT exchange; the packed completion owns its head."""
+    import dataclasses
+    from gw.gw_config import (HeadCorrection, incumbent_bispinor_head_record,
+                              refuse_unsupported_bispinor_gw,
+                              uses_bare_tt_gamma_head,
+                              uses_static_photon_response)
+    from gw import v_q_bispinor
+
+    deck = (f"bispinor = true\nbispinor_gw = bare_transverse\n"
+            f"compute_mode = {mode}\nsys_dim = 2\n"
+            "head_correction = full\nlinalg = local\n"
+            "use_ppm_sigma = true\nppm_omega_p = 2.0\n")
+    cfg = _config(tmp_path, deck, name=f"{mode}_incumbent.in")
+    assert not uses_static_photon_response(cfg)
+    assert uses_bare_tt_gamma_head(cfg)
+    assert "bare TT Gamma-cell average in V" in incumbent_bispinor_head_record(cfg)[1]
+
+    monkeypatch.setattr(v_q_bispinor, "_tt_head_tensor",
+                        lambda **_: np.diag([7., 8., 9.]))
+    q, g = _one_q_gamma_g0_table()
+    builder = v_q_bispinor._make_per_q_v_builder_for_tile(
+        mu_L=1, nu_L=1, bvec=_BVEC, cell_volume=_CELL_VOLUME,
+        sys_dim=_SYS_DIM, vcoul_cutoff_ry=None,
+        kgrid=_KGRID, tt_head_correction=uses_bare_tt_gamma_head(cfg))
+    assert np.asarray(builder(q, g))[0, 1] == -7. / _CELL_VOLUME
+
+    packed = dataclasses.replace(
+        cfg, backend=dataclasses.replace(cfg.backend, linalg="distributed"))
+    assert uses_static_photon_response(packed)
+    assert not uses_bare_tt_gamma_head(packed)
+    off = dataclasses.replace(
+        cfg, head=dataclasses.replace(cfg.head, correction=HeadCorrection.OFF))
+    assert not uses_bare_tt_gamma_head(off)
+    with pytest.raises(ValueError, match="GATE bare_tt_gamma_restart_unstamped"):
+        refuse_unsupported_bispinor_gw(dataclasses.replace(cfg, restart=True))
+
+
 def test_tt_head_tensor_refuses_box_truncation():
     from gw.v_q_bispinor import _tt_head_tensor
     with pytest.raises(ValueError, match="sys_dim"):
