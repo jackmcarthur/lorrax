@@ -104,6 +104,11 @@ def _solve_all(mesh, L, Z, *, kind, vertex, piv=None):
                                solver_kind=kind, n_rmu_logical=_NLOG,
                                zeta_gather="local", lu_piv=piv)
     assert loc.sharding.spec == P(None, ("x", "y"), None), loc.sharding
+    r, lf = np.asarray(jax.device_get(ref)), np.asarray(jax.device_get(loc))
+    print(f"[qlocal parity] kind={kind} platform={jax.devices()[0].platform} "
+          f"zeta rel={_rel(lf, r):.3e} "
+          f"face-factor rel={_rel(np.asarray(jax.device_get(loc_face)), r):.3e} "
+          f"V_q rel={_rel(_vq(lf), _vq(r)):.3e} bitwise={bool(np.array_equal(lf, r))}")
     return (np.asarray(jax.device_get(ref)), np.asarray(jax.device_get(loc)),
             np.asarray(jax.device_get(loc_face)), L_res, piv_res)
 
