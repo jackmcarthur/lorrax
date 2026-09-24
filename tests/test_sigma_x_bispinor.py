@@ -67,3 +67,48 @@ def test_gamma_apply_matches_dense_matmul_yr_axis():
         ref = np.einsum('bs,knsx->knbx', np.asarray(gamma_dense), np.asarray(psi))
         np.testing.assert_allclose(np.asarray(out), ref, atol=1e-14,
                                    err_msg=f"γ̃^{mu} mismatch on psi_yr axis")
+
+
+def test_bare_transverse_v_is_read_once_per_run_and_never_for_zero_blocks(
+        monkeypatch, tmp_path):
+    """SC maps restore the packed V from the host; charge blocks are never read."""
+    from types import SimpleNamespace
+    from jax.sharding import Mesh
+    import gw.sigma_x_bispinor as sxb
+    from gw.photon_layout import PhotonBasisLayout
+
+    mesh = Mesh(np.asarray(jax.devices()[:1]).reshape(1, 1), ("x", "y"))
+    layout = PhotonBasisLayout.from_centroid_extents(3, 3, mesh)
+    reads = []
+
+    class Reader:
+        n_q_total = 2
+
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+        def get_tile(self, a, b):
+            reads.append((a, b))
+            return jnp.full((2, 3, 3), 10 * a + b, dtype=jnp.complex128)
+
+    monkeypatch.setattr("file_io.restart_bundle.BispinorVqReader", Reader)
+    monkeypatch.setattr(sxb, "_HOST_PACKED", {})
+    path = tmp_path / "v_q_bispinor.h5"
+    path.write_bytes(b"stand-in")
+    plan = SimpleNamespace(sym_perm=np.arange(3), L_table=np.zeros((1, 3, 3)))
+    bases = (None, SimpleNamespace(canonical_indices=np.arange(9).reshape(3, 3)))
+    kwargs = dict(plan=plan, mu_bases=bases, layout=layout, mesh_xy=mesh)
+    first = np.asarray(sxb._bare_transverse_packed(str(path), **kwargs))
+    assert sorted(reads) == [(a, b) for a in (1, 2, 3) for b in (1, 2, 3)]
+    reads.clear()
+    second = np.asarray(sxb._bare_transverse_packed(str(path), **kwargs))
+    assert reads == []
+    np.testing.assert_array_equal(first, second)
+    charge = slice(0, layout.carrier_extents[0])
+    assert not np.any(first[:, charge, :]) and not np.any(first[:, :, charge])
