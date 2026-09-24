@@ -1,12 +1,11 @@
 # Planned Davidson
 
-`solvers.plan_davidson` builds a complex128 Davidson solver with fixed
-capacity and explicit operator data. `plan_local_davidson` specializes the
-same implementation to one Hamiltonian on one device. The complete solve is a single compiled
-`lax.while_loop`; different k-points are explicit data arguments to that
-same executable. Its native operations enter through
-[`distrib_la`](distrib_la.md). The `solvers.davidson` host API delegates to this same implementation;
-there is no growing-shape production Davidson loop or shape-warmup ladder.
+`solvers.plan_davidson` builds a complex128 block Davidson solver with fixed
+capacity and explicit operator data; `plan_local_davidson` is the same solver
+on one device. The whole solve is one compiled `lax.while_loop`, and different
+k-points are data arguments to the same executable. Its native linear algebra
+enters through [`distrib_la.plan_subspace`](#shared-subspace-service). The host
+API `solvers.davidson.davidson` delegates to the same implementation.
 
 ## API
 
@@ -14,7 +13,7 @@ there is no growing-shape production Davidson loop or shape-warmup ladder.
 from solvers import plan_local_davidson
 from solvers.davidson_fixed import CONVERGED
 
-# Both functions are traceable. data is an array pytree, not captured H data.
+# Both callbacks are traceable; data is an array pytree, not captured H data.
 # apply_h(data, vectors) -> vectors
 # precondition(data, residuals, eigenvalues, vectors) -> corrections
 plan = plan_local_davidson(
@@ -28,123 +27,96 @@ values, vectors, info = executable(data, initial, 1e-8, 100)
 assert int(info.status) == CONVERGED
 ```
 
-`initial` and the returned vectors have shape `(n_eig, *vector_shape)`.
-`capacity >= 2*n_eig` is required and is never silently changed. Reuse the
-plan and executable across same-shape Hamiltonians; constructing a new
-factory inside a k-point loop defeats that reuse. `max_iterations` and the
-positive scalar tolerance are dynamic arguments, not compilation keys.
+* **Shapes.** `initial` and the returned vectors are `(n_eig, *vector_shape)`
+  (row eigenvectors). `1 ≤ n_eig ≤ prod(vector_shape)` and
+  `capacity ≥ 2·n_eig` are required and never adjusted. `solve(data,
+  initial, tolerance=1e-8, max_iterations=100, stall_patience=0)`; tolerance,
+  iteration budget and stall patience are dynamic, not compilation keys.
+* **Reuse.** Build the plan and executable once and reuse them across
+  same-shape Hamiltonians; a new plan inside a k-point loop recompiles.
+  `lower` accepts `jax.ShapeDtypeStruct` leaves, so the buffer schedule can be
+  inspected before the arrays exist.
+* **Operator.** `apply_h` must accept full `n_eig` blocks and power-of-two
+  tail widths; only retained corrections are applied. The preconditioner
+  receives a full residual block. For independent per-k solves, callbacks
+  must not contain inter-rank collectives, because solves stop at different
+  iterations.
+* **Distributed vectors.** Pass
+  `vector_sharding=NamedSharding(mesh, P(None, "x", "y", None))` to
+  `plan_davidson`: the first axis is the replicated subspace row axis, and
+  every persistent buffer and conditional output keeps the trailing vector
+  layout. Explicit shard maps flatten only each rank's local tile; CGS2 uses
+  two batched coefficient reductions and never gathers a vector. Incremental
+  projection reduces only new matrix entries. `tests/test_davidson_planned.py`
+  fails on any synchronous or asynchronous all-gather in the compiled HLO.
+* **Host API.** Pass `data=payload` and callbacks that take the payload first
+  when arrays are distributed; JAX cannot close over non-addressable arrays.
+  `solvers.davidson.LAST_RUN` holds one final snapshot with its status.
 
-The operator must accept full `n_eig` blocks and power-of-two tail widths.
-Only retained corrections are sent to it. The preconditioner receives a
-full residual block. For an independent local k-point solve, callbacks must not contain inter-rank
-collectives: those solves can stop at different iterations. For distributed
-vectors, pass `vector_sharding=NamedSharding(mesh, P(None, "x", "y", None))`
-to `plan_davidson`. The first axis is the replicated subspace row axis;
-trailing vector axes retain that layout in every persistent buffer. Explicit
-shard maps flatten only each rank's local vector tile. CGS2 uses two batched
-reductions of coefficient panels, never a vector gather. Incremental projection
-reduces only new matrix entries so retained global entries are not counted P times.
-Correction and normalization conditional outputs explicitly retain vector
-sharding. Without these constraints, GSPMD gathered whole correction blocks
-at conditional boundaries despite correctly sharded final outputs. The P4
-diagonal-operator HLO regression checks synchronous and asynchronous gather
-names and exercises shaped X/Y vector axes.
-
-The CPU service uses active NumPy BLAS/LAPACK callbacks as a compatibility
-implementation. It preserves fixed compiled shapes and active arithmetic, but
-host transfer costs and private LAPACK workspace are not covered by the CUDA
-memory/performance contract. There is no silent GPU-to-CPU fallback.
-
-For the host convenience API, pass `data=payload` and callbacks taking that
-payload first when arrays are distributed; closing over non-addressable arrays
-is not supported by JAX. `LAST_RUN` records a final snapshot with explicit
-status, rather than per-iteration host transfers. Native callers should use
-`DavidsonInfo` directly.
-
-`DavidsonInfo` contains `status`, `iterations`, `matvecs`, `restarts`,
-`active_size`, and per-root residual norms. CONVERGED means every norm is
-less than `tolerance * max(1, abs(eigenvalue))`. Other statuses distinguish
-an exhausted iteration budget, no independent directions, a deficient
-initial block, nonfinite computation, an invalid tolerance, and a stalled residual. The optional dynamic fifth
-argument `stall_patience` stops after that many iterations without a 1%
-reduction of the largest residual (zero disables it). Inspect the
-status: an invalid initial block or zero iteration budget does not return
-certified Ritz pairs. Matvec counts include initial vectors.
+**Result.** `DavidsonInfo` holds `status`, `iterations`, `matvecs` (including
+the initial vectors), `restarts`, `active_size` and per-root `residuals`.
+`CONVERGED` means every residual norm is below
+`tolerance·max(1, |eigenvalue|)`. The other statuses are `ITERATION_LIMIT`,
+`NO_DIRECTIONS`, `BAD_INITIAL`, `NONFINITE`, `BAD_TOLERANCE` and `STALLED`
+(`stall_patience > 0` iterations without a 1% reduction of the largest
+residual). Inspect the status on every return: a bad initial block or a zero
+iteration budget does not return certified Ritz pairs.
 
 ## Memory and active work
 
-The two persistent vector buffers contain `2*capacity*prod(vector_shape)`
-complex128 elements. Projected matrices and native workspaces have fixed
-maximum shapes. `workspace_specs` describes persistent buffers and native
-scratch before lowering; `memory_analysis()` reports the compiled XLA
-buffer schedule, including XLA-visible callback temporaries. CUDA context/handle
-memory, provider-owned caches or workspace, allocator reservations, and application
-arrays outside this executable are not part of that XLA byte count. The generic
-solver cannot declare private allocations made by an arbitrary operator callback. `lower` also
-accepts `jax.ShapeDtypeStruct` leaves for the data and initial block, so the
-compiled buffer schedule can be inspected before allocating those arrays.
+The two persistent vector buffers (basis and images) hold
+`2·capacity·prod(vector_shape)` complex128 elements; the projected matrix is
+`capacity²` and the coefficient block `capacity·n_eig`. `workspace_specs`
+lists these plus the subspace provider's native scratch before lowering.
+`memory_analysis()` reports the compiled XLA schedule, including XLA-visible
+callback temporaries; CUDA context and handle memory, provider caches,
+allocator reservations, arrays outside the executable and private allocations
+inside an operator callback are not in it.
 
-Runtime dimensions reach cuBLAS and cuSOLVER through the existing provider
-library. The BLAS scratch allocation is explicit, and eigensolver scratch is
-queried at planning time and checked against the active-size requirement.
-The handlers copy small dimension descriptors to the host and synchronize
-the stream. Thus the Python iteration is fully staged, but native calls
-still have host size synchronization; this is not a host-free CUDA graph.
+Only active work is done. Projection updates only new rows and columns; CGS2
+takes an active count and window start; Ritz reconstruction uses the active
+prefix; a partial H block is decomposed into exact power-of-two pieces. Rank
+discovery uses the relative Gram cutoff in `solvers/subspace_numerics.py`, and
+normalization touches only retained directions. No projected eigensolve or
+vector GEMM runs over unused capacity. Capacity-sized arrays never cross a
+conditional output (projections and stores alias in place), so only small
+correction blocks do. Initial reservation and zero fills are fixed-size;
+iteration never grows them.
 
-Projection updates only new rows/columns. CGS2 accepts an active count and optional window start; Ritz reconstruction
-uses only the active prefix. Rank discovery uses the shared relative
-Gram cutoff in `solvers/subspace_numerics.py`; subsequent normalization processes only retained directions.
-The H application decomposes a partial block into exact power-of-two pieces.
-There is no projected eigensolve or vector GEMM over the unused capacity.
-
-Capacity arrays never cross a conditional output: XLA generated full-array
-copies even for identity branches in the initial implementation. The provider
-now exposes aliased active-range stores, and projections alias their projected
-matrix. Only small correction blocks cross conditionals. Initial reservation
-and zero fills remain fixed-size allocations; iteration does not grow them.
-
-## Provider and verification scope
-
-Rebuild the canonical CUDA `src/ffi/cpp/CMakeLists.txt` target to obtain the
-`ActiveSubspace*Ffi` handlers. An older provider refuses by name when a plan
-is requested. No separate shared library, private driver binding, or silent
-backend fallback is used. The provider selection follows the existing
-[`FFI contract`](../architecture/ffi_layout.md).
-
-The Perlmutter investigation is recorded in sandbox run
-`runs/DEV/388_davidson_jit_20260913`, allocation `58264396`; its report owns
-the timing tables and evidence paths. Focused tests live in
-`tests/test_davidson_fixed.py` and
-`services/distrib_la/tests/test_active_subspace.py`. They cover complex and
-degenerate spectra, restarts, failure statuses, explicit changed operator
-data, rank-one correction tails, poisoned inactive storage, and distributed
-input refusal. The PSP benchmarks use the production Hamiltonian application;
-they are solver comparisons, not a QE total-potential certification or a
-certification of the complete NSCF writer/scheduler.
+On CUDA, runtime dimensions reach cuBLAS and cuSOLVER through the provider;
+BLAS scratch is explicit and eigensolver scratch is queried at planning time.
+Each native call copies small dimension descriptors to the host and
+synchronizes the stream, so the loop is fully staged but is not a host-free
+CUDA graph. On CPU the provider uses NumPy BLAS/LAPACK callbacks: fixed
+compiled shapes and active arithmetic, but host transfers and LAPACK workspace
+fall outside the memory contract. There is no GPU-to-CPU fallback.
 
 ## Shared subspace service
 
-`distrib_la.plan_subspace(capacity=..., n_eig=..., vector_sharding=...,
-max_block_size=...)` owns provider resolution for Davidson and Lanczos.
-`max_block_size` defaults to `n_eig`; Lanczos declares its correction width
-separately when it differs from the requested Ritz-vector count. `start` and
-`active` arguments mean interval start and **count**, including an empty window.
-The provider includes active Gram, reconstruction, CGS2, projected eigensolve,
-aliased store and incremental projection operations.
+`distrib_la.plan_subspace(*, capacity, n_eig, vector_sharding=None,
+max_block_size=None, native_collectives=False)` resolves the provider for
+Davidson and Lanczos before tracing: runtime-sized native BLAS/LAPACK on CUDA
+(`plan_local_subspace`), host LAPACK callbacks on CPU. `max_block_size`
+defaults to `n_eig`; Lanczos declares its block width when it differs from the
+Ritz count. `start` and `active` arguments are interval start and **count**,
+and an empty window is legal. The plan provides active Gram, reconstruction,
+CGS2, projected eigensolve, aliased stores and incremental projection.
 
-The same service provides stable block TSQR for Lanczos. Each rank factors
-its local vector tile, exchanges only reduced R factors, and applies its
-small factor from the stacked-R QR. Nearly dependent blocks do not use
-normal equations. `qr_stacked_r` bounds the replicated coefficient stack;
-QR backend temporaries appear in the compiled memory schedule. Local tiles
-shorter than the block width contribute their reduced R height.
+For Lanczos it also provides block TSQR: each rank factors its local tile,
+exchanges only reduced R factors, and applies its small factor from the
+stacked-R QR, so nearly dependent blocks never go through normal equations.
+`qr_stacked_r` bounds the replicated coefficient stack; tiles shorter than the
+block width contribute their reduced R height.
 
-Native-provider consumers must rebuild the canonical provider with this
-source revision: active Gram is a new target, and the window descriptors
-for reconstruction/CGS2 have changed. The provider probe refuses a missing
-target; it does not silently select padded math or a CPU fallback.
+The CUDA provider must export the `ActiveSubspace*Ffi` handlers of the
+canonical `src/ffi/cpp/CMakeLists.txt` target; a missing target refuses by name
+at planning, with no padded-math or CPU fallback. The
+[FFI layout](../architecture/ffi_layout.md) owns provider selection. The
+[orthogonalization service](orthogonalization.md) owns CGS2, its coefficient
+communication and the correction-buffer alias.
 
-The reusable [orthogonalization service](orthogonalization.md) owns the CGS2
-provider, coefficient communication, and correction-buffer alias contracts.
-Its standalone planner omits eigensolver workspace and is available to callers
-that only need to project a block out of an existing basis.
+Tests: `tests/test_davidson_fixed.py`, `tests/test_davidson_planned.py` and
+`services/distrib_la/tests/test_active_subspace.py` cover complex and
+degenerate spectra, restarts, every failure status, changed operator data,
+rank-one correction tails, poisoned inactive storage and distributed-input
+refusal.
