@@ -17,6 +17,12 @@ from gw.mpa.sigma import _unfold_sigma_cube  # noqa: E402
 from symmetry_maps import unfold_file_wedge_band_operator  # noqa: E402
 
 
+class _Sym(SimpleNamespace):
+    """A symmetry-table stand-in that hashes by identity, like ``SymMaps``:
+    the unfold executable is cached per table (``_unfold_sigma_cube_fn``)."""
+    __hash__ = object.__hash__
+
+
 @pytest.mark.mesh(4)
 @pytest.mark.parametrize("bracketed", [False, True])
 def test_unfold_sigma_cube_is_sharded_and_matches_unpinned(bracketed):
@@ -25,7 +31,7 @@ def test_unfold_sigma_cube_is_sharded_and_matches_unpinned(bracketed):
     mesh = Mesh(np.array(jax.devices()[:4]).reshape(2, 2), ("x", "y"))
     nirr, nk, nss, nw, nb = 3, 8, 2, 5, 6
     rng = np.random.default_rng(7)
-    sym = SimpleNamespace(
+    sym = _Sym(
         irr_idx_k=rng.integers(0, nirr, nk).astype(np.int32),
         sym_idx_k=rng.integers(0, 2 * nss, nk).astype(np.int32),
         sym_mats_k=np.zeros((2 * nss, 3, 3)),
