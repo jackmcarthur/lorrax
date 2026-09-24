@@ -70,8 +70,16 @@ correctly and such".
 * `nvidia-mathdx` is pinned in the `cuda12`/`cuda13` extras and in the
   Perlmutter runtime recipe.
 * Compiled images are disk-cached (content-hashed, atomic, re-verified).
-* The flat-k transform stays on cuFFT plans until measured otherwise
-  ([`ffi_layout.md`](ffi_layout.md) §9).
+* The flat-k transform moved to mathdx once measured 1.8–7.4x faster than the
+  cuFFT plan; the cuFFT CUDA handler is deleted ([`ffi_layout.md`](ffi_layout.md) §9).
+* BSE: `bse_simple`, `bse_serial`, `--matvec-kind` and the TDA ring matvec
+  are deleted, and every TDA solve uses the stack matvec.  The scalar-singlet
+  exchange weight (D + 2V − W for nspinor = 1) now has one owner,
+  `bse_preconditioner.exchange_spin_weight`, applied at every encode.  The
+  stack had lacked it, and the ring had carried it since 2026-08-23.
+* Perlmutter builds: both FFI legs link one MPI, pinned in
+  `config/perlmutter/ffi_mpi.sh`.  The first sealed two-leg bundle is
+  `lorrax_cuda13_runtime/releases/61c8d018-bundle-850899e8d404`.
 
 ## 2026-09-18 — Headless shared-pole SC is allowed for brute-grid development
 
