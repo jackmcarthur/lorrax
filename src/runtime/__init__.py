@@ -663,9 +663,6 @@ def set_default_env(*, platform: str = "gpu") -> None:
     :data:`GPU_POOL_FRACTION`.  The measured reasons are in that function's
     docstring.  A caller's explicit export still wins (``setdefault``), and
     the startup report names any pair that is not this one.
-    ``TF_GPU_ALLOCATOR`` is a TensorFlow variable and is **inert for JAX**
-    (a cell setting only it was byte-identical to the unset cell, job
-    7882442); do not add it back.
 
     A caller-supplied ``XLA_PYTHON_CLIENT_ALLOCATOR`` is VALIDATED here —
     see :func:`_check_allocator_env`.
@@ -2656,7 +2653,6 @@ def collect_startup_facts(mesh, *, cache_error: str | None = None) -> dict:
             "preallocate_looks_like_a_typo": xm.preallocate_looks_like_a_typo,
             "mem_fraction": xm.mem_fraction,
             "mem_fraction_var": xm.mem_fraction_var,
-            "tf_gpu_allocator_raw": xm.tf_gpu_allocator_raw,
         }
         pool["corroboration"] = reading.peak_source
         pool["disagreement"] = reading.disagreement
@@ -2880,9 +2876,6 @@ def format_startup_report(f: dict) -> list:
                 add(f"  The live client holds the reserved pool: bytes_limit "
                     f"{limit/1e9:.2f} GB = {GPU_POOL_FRACTION} x "
                     f"{total/1e9:.2f} GB.")
-        if env.get("tf_gpu_allocator_raw"):
-            add(f"  TF_GPU_ALLOCATOR={env['tf_gpu_allocator_raw']!r} is set "
-                f"but is INERT for jax; it selects nothing here.")
         if not env.get("allocator_is_valid"):
             add(f"  WARNING: XLA_PYTHON_CLIENT_ALLOCATOR="
                 f"{env['allocator_raw']!r} is not a value jaxlib accepts, and "

@@ -454,19 +454,12 @@ the site descriptor plus `runtime` and reported at startup. The canonical
 ownership and override list is [`docs/dev/env_vars.md`](../../docs/dev/env_vars.md);
 a run script should not duplicate those defaults.
 
-> **`platform` is not cudaMallocAsync**, and `TF_GPU_ALLOCATOR` does
-> nothing.  This block used to read
-> `XLA_PYTHON_CLIENT_ALLOCATOR=platform  # = cudaMallocAsync (via
-> TF_GPU_ALLOCATOR)`; both halves are false.  The CUDA plugin carries three
-> distinct allocators — BFC (unset/`default`/`bfc`), plain `cudaMalloc`
-> (`platform`), and `cudaMallocAsync` (`cuda_async`) — and `TF_GPU_ALLOCATOR`
-> is a TensorFlow variable that JAX never reads (a cell setting only it was
-> byte-identical to the unset cell, job 7882442).  `platform` also zeroes
-> `memory_stats()`, which every LORRAX memory report reads.  Porting a
-> cluster: set nothing — `runtime.set_default_gpu_pool()` selects
-> `cuda_async` with its pool reserved on every CUDA run; on sm_75 add the
-> command-buffer `XLA_FLAGS` restriction (`config/frontera/gpu_env.sh`).  Full table in
-> [`docs/environment/overview.md`](../../docs/environment/overview.md) §2.1.
+> **Set no allocator variable.** The CUDA plugin has three allocators:
+> BFC (unset/`default`/`bfc`), plain `cudaMalloc` (`platform`, which zeroes
+> `memory_stats()`) and `cudaMallocAsync` (`cuda_async`). Porting a
+> cluster sets none of them: `runtime.set_default_gpu_pool()` selects
+> `cuda_async` with its pool reserved on every CUDA run
+> ([`docs/environment/overview.md`](../../docs/environment/overview.md#gpu-pool)).
 
 `CUDA_VISIBLE_DEVICES=$SLURM_LOCALID` is set per-rank by
 `select_gpu.sh` (invoked by `lx` on Perlmutter). JAX callers must pass

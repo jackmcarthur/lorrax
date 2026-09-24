@@ -139,10 +139,8 @@ are the next lever if wider windows are needed. `compute_wfns_fi`'s existing
 `batch_size` reduces eigh memory linearly at zero wall cost and is exposed on
 no CLI.
 
-Allocator matters: the async pool (`cuda_async`, the runtime's GPU pool
-policy since 2026-09-24) runs the full E_min-anchored window where BFC@0.95
-OOMs on the same hardware.  (The note first recorded it as
-`TF_GPU_ALLOCATOR=cuda_malloc_async`, which is inert for JAX.)
+Allocator matters: the runtime's reserved `cuda_async` pool runs the full
+E_min-anchored window where a BFC arena at 0.95 OOMs on the same hardware.
 
 `LORRAX_SKIP_VQ_GATES=1` (read in `vq_interp.py`) drops the `run_gates` /
 `run_nulls` batteries *and* the `keep_host_mirrors` replicated host tensors —
