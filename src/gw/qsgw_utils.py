@@ -98,6 +98,53 @@ def interp_along_omega(
             + w_hi * values_w_kn[idx_hi, k_idx, n_idx])
 
 
+def sigma_grid_edge_ambiguity(
+    sigma_c_diag_w_kn_ev: np.ndarray,
+    omega_grid_ev: np.ndarray,
+    e_kn_ev: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """States whose QSGW diagonal fixed point is not unique at a grid edge.
+
+    The out-of-grid rule above (and :func:`build_qsgw_sigma_xc`) makes the
+    QSGW map DISCONTINUOUS at each sampled-grid edge ω_e: a state inside the
+    grid takes Σ_c,nn(E_n), a state outside takes Σ_c,nn(0), so its diagonal
+    jumps by
+
+        Δ_n = Re Σ_c,nn(0) − Re Σ_c,nn(ω_e)      (ω_e = the nearer edge).
+
+    In the diagonal model E = A + Σ(E), when the jump carries a state OUTWARD
+    (Δ_n > 0 at the top edge, Δ_n < 0 at the bottom) a state within |Δ_n| of
+    the edge, on either side, has a self-consistent partner on the other
+    side: two fixed points, and the one the loop reaches depends on its path.
+    That is what is flagged.  An inward jump leaves no fixed point within
+    |Δ_n| outside the edge (such a state maps back inside), so a converged
+    state there cannot occur and an inside state is unique.  Measured: Fe 4^3 bispinor H-point states at
+    E-μ = +9.8 (inside, Σ(E)) and +11.7 eV (outside, Σ(0)) around a +10 eV
+    edge, Δ = 1.87 eV, one branch per accelerator (sandbox claim 2688).
+
+    No threshold: the band is the jump itself.  Parameters are the diagonal
+    Σ_c(ω) samples ``(nω, nk, nb)`` (eV, complex or real), the increasing
+    grid ``(nω,)`` and the evaluation energies ``(nk, nb)``, all on the same
+    E_F-relative reference.  Returns ``(ambiguous_kn, jump_kn_ev)``.
+    """
+    omega = np.asarray(omega_grid_ev, dtype=np.float64)
+    e = np.asarray(e_kn_ev, dtype=np.float64)
+    sig = np.real(np.asarray(sigma_c_diag_w_kn_ev))
+    if sig.shape != (omega.size,) + e.shape:
+        raise ValueError(
+            f"sigma_grid_edge_ambiguity: Sigma diag {sig.shape} does not match "
+            f"grid {omega.shape} x energies {e.shape}")
+    at_zero = interp_along_omega(sig, omega, np.zeros_like(e))
+    lo, hi = float(omega[0]), float(omega[-1])
+    use_top = np.abs(e - hi) <= np.abs(e - lo)
+    edge = np.where(use_top, hi, lo)
+    at_edge = np.where(use_top, sig[-1], sig[0])
+    jump = at_zero - at_edge
+    outward = np.where(use_top, jump > 0.0, jump < 0.0)
+    ambiguous = outward & (np.abs(e - edge) < np.abs(jump))
+    return ambiguous, jump
+
+
 # ---------------------------------------------------------------------------
 # Diagonal-Σ(E) fixed point  (host NumPy, vectorised)
 # ---------------------------------------------------------------------------
@@ -1087,6 +1134,7 @@ __all__ = [
     "omega_coverage",
     "plot_qp_energy_comparison",
     "remove_managed",
+    "sigma_grid_edge_ambiguity",
     "solve_diagonal_sigma_fixed_point",
     "write_qsgw_sigma_cube",
 ]

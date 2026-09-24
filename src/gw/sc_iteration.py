@@ -106,6 +106,11 @@ class ConvergenceVerdict:
     #: The stall rule fired (label-free residual flat over 12 maps).
     #: Always paired with converged=False.
     stalled: bool = False
+    #: States within the Sigma(E)/Sigma(0) jump of a sampled-grid edge
+    #: (``qsgw_utils.sigma_grid_edge_ambiguity``): there the map is
+    #: discontinuous and the fixed point reached depends on the path.
+    edge_ambiguous: int = 0
+    edge_ambiguous_detail: str = ""
 
     def summary(self) -> str:
         """The log line.  Says which number is the test and which is not."""
@@ -116,7 +121,10 @@ class ConvergenceVerdict:
             f"RMS_nonscissored = {self.rms_protected_ev:.6f} eV, "
             f"RMS_all({self.n_total}) = {self.rms_all_ev:.6f} eV "
             f"(diagnostics, NOT the criterion) | "
-            f"{'CONVERGED' if self.converged else ('STALLED at floor, not converged' if self.stalled else 'not converged')}")
+            f"{'CONVERGED' if self.converged else ('STALLED at floor, not converged' if self.stalled else 'not converged')}"
+            + (f" | fixed point NOT UNIQUE: {self.edge_ambiguous} state(s) within "
+               f"the Sigma(E)/Sigma(0) jump of a Sigma-grid edge "
+               f"({self.edge_ambiguous_detail})" if self.edge_ambiguous else ""))
 
 
 @dataclass(frozen=True)
@@ -4563,6 +4571,39 @@ def _record_sc(inputs: SCInputs, line: str) -> None:
         fallback(line)
 
 
+def _sc_edge_ambiguity(inputs: SCInputs, state_out: SCState) -> tuple[int, str]:
+    """Count this map's states that sit within a Sigma-grid edge jump.
+
+    Reads the map's own diagonal Sigma_c(omega) cube, grid and evaluation
+    ladder (the same operands and reference ``_sc_z_factors`` uses) and
+    applies ``qsgw_utils.sigma_grid_edge_ambiguity``.  Collective for a
+    band-sharded cube, so every rank calls it.  Returns (count, detail).
+    """
+    sigma = state_out.outputs.sigma_result
+    cube, omega = sigma.sigma_c_omega_kij_ry, sigma.omega_grid_ev
+    if cube is None or omega is None:
+        return 0, ""
+    from .qsgw_utils import extract_sigma_diag_replicated, sigma_grid_edge_ambiguity
+    diag = np.asarray(extract_sigma_diag_replicated(cube, inputs.mesh_xy),
+                      dtype=np.complex128) * RYD_TO_EV
+    if sigma.sigma_band_axis is not None:
+        from runtime.padding import strip_axis
+        diag = np.asarray(strip_axis(diag, sigma.sigma_band_axis, axis=-1))
+    e_rel = np.asarray(sigma.e_eval_ev, dtype=np.float64) - float(sigma.efermi_dft_ev)
+    ambiguous, jump = sigma_grid_edge_ambiguity(
+        diag, np.asarray(omega, dtype=np.float64), e_rel)
+    # Frozen-core bands are held at their DFT block (no Sigma enters them).
+    ambiguous[:, :int(inputs.config.sc.frozen_core_bands)] = False
+    n = int(np.count_nonzero(ambiguous))
+    if not n:
+        return 0, ""
+    k, b = np.unravel_index(int(np.argmax(np.where(ambiguous, np.abs(jump), -1.0))),
+                            jump.shape)
+    return n, (f"largest jump {float(jump[k, b]):+.3f} eV at k={int(k)} sorted band "
+               f"{int(b) + 1}, E-mu={float(e_rel[k, b]):+.3f} eV; grid "
+               f"[{float(omega[0]):+.2f}, {float(omega[-1]):+.2f}] eV")
+
+
 def _sc_z_factors(
     inputs: SCInputs,
     state_out: SCState,
@@ -5760,6 +5801,12 @@ def _run_anderson(
         # that produced H, so the accelerator cannot flatter it.
         _verdict, state_out = _sc_identity_for_call(
             inputs, state_out, E_in, E_new, _identity_history, cutoff_ev=tol_ev)
+        _n_edge, _edge_detail = _sc_edge_ambiguity(inputs, state_out)
+        if _n_edge:
+            _verdict = replace(_verdict, edge_ambiguous=_n_edge,
+                               edge_ambiguous_detail=_edge_detail)
+            _record_sc(inputs, f"    SC grid-edge ambiguity: {_n_edge} state(s) "
+                               f"within the Sigma(E)/Sigma(0) jump; {_edge_detail}")
         _last_outputs[0] = state_out.outputs
         _last_verdict[0] = _verdict
         rms = float(np.sqrt(np.mean((E_new - _e_history[-1]) ** 2)))
