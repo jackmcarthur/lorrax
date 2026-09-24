@@ -520,6 +520,16 @@ class ZStore:
         self.bytes_written += self.Q * self.b * self.n_Gt * self.g_tile * 16
         self.t_write += time.perf_counter() - t0
 
+    def sync(self) -> None:
+        """Drain this store's queued (asynchronous, collective) disk writes.
+
+        Two stores writing at once put two SlabIO worker threads' collective
+        MPI-IO on the wire together, in an order no rank agrees on; a
+        multi-channel fit drains each store before the next one writes.
+        """
+        if self.placement == 'disk':
+            self._io.sync_writes()
+
     # -- read -------------------------------------------------------------
     def read_tile(self, t: int, *, layout: str) -> jax.Array:
         """G tile ``t``: ``layout='q'`` q-local, ``'g'`` G-split (see class doc)."""
