@@ -46,7 +46,7 @@ def _mesh(px, py):
 
 def _payload(px, py, ns=NS):
     import bse.bse_ring_comm as brc
-    from bse.bse_serial import compute_pair_amplitude
+    from bse.bse_preconditioner import compute_pair_amplitude
 
     rng = np.random.default_rng(20260924)
     cx = lambda *s: rng.standard_normal(s) + 1j * rng.standard_normal(s)  # noqa: E731

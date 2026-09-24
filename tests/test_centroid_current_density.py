@@ -134,8 +134,9 @@ def _fake_loader(psi_by_parent_band, kweights, *, raw_nspinor, bispinor):
         psi.shape[:3] + (n_grid,))
 
     def box_index(self, *, k):
-        cells = np.arange(n_grid, dtype=np.int32).reshape(self.fft_grid)
-        return np.broadcast_to(cells, (len(k.rows),) + self.fft_grid).copy()
+        # The per-k sphere index (loader tables): slot g sits in cell g.
+        cells = np.arange(n_grid, dtype=np.int32)
+        return np.broadcast_to(cells, (len(k.rows), n_grid)).copy()
 
     def load(self, *, bands, k, sharding, bispinor):
         assert bispinor is bispinor_expected and sharding is not None
