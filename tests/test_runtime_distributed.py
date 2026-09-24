@@ -165,13 +165,15 @@ def test_set_default_env_reserves_the_cuda_async_pool(clean_env):
     cuda_async draws from the device's default mempool; unreserved, its
     release threshold is 0 and it re-maps memory at every synchronize
     (CrI3 8x8 P4, 2026-09-24: whole run 204.3 -> 175.0 s once reserved).
-    The fraction is the planners' budget, formerly typed per run.
+    The fraction is the planners' budget (bytes_limit x 0.9).
     """
     clean_env.setenv("JAX_PLATFORMS", "cuda,cpu")
     set_default_env()
     assert os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] == "cuda_async"
     assert os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] == "true"
     assert os.environ["XLA_CLIENT_MEM_FRACTION"] == runtime.GPU_POOL_FRACTION
+    # Owner ruling 2026-09-24: one fraction on every CUDA node, 40 and 80 GB.
+    assert runtime.GPU_POOL_FRACTION == "0.89"
     # TF_GPU_ALLOCATOR is a TensorFlow variable and is inert for JAX.
     assert "TF_GPU_ALLOCATOR" not in os.environ
 

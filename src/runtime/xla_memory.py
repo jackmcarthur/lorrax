@@ -97,7 +97,7 @@ from . import _FALSY_TOKENS as _ENV_FALSE
 #
 # This function READS ONLY.  It never sets an allocator variable: which
 # values LORRAX ships is decided in ``runtime.set_default_gpu_pool``
-# (cuda_async, PREALLOCATE=true, fraction 0.85 on CUDA).  Everything here
+# (cuda_async, PREALLOCATE=true, fraction runtime.GPU_POOL_FRACTION on CUDA).  Everything here
 # must stay correct under every one of them, including unset.
 
 _XLA_ALLOCATORS = ("default", "platform", "bfc", "cuda_async")

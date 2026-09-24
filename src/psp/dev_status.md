@@ -93,7 +93,6 @@ SIDIR=/pscratch/sd/j/jackm/lorrax_sandbox_fresh/runs/Si/00_si_4x4x4_60band
 cd $SIDIR
 PYTHONPATH="$LORRAX/src:$SITE" \
 JAX_ENABLE_X64=1 HDF5_USE_FILE_LOCKING=FALSE \
-XLA_PYTHON_CLIENT_PREALLOCATE=false \
 python3 -u -m psp.tests.test_dft_hamiltonian \
     --save qe/scf/silicon.save \
     --pseudo_dir qe/scf \
