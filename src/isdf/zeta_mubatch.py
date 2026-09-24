@@ -508,12 +508,15 @@ class ZStore:
         else:
             if t == 0:
                 self._hts.wait()
-            # A batch never written (a truncated debug fit) reads as zeros.
+            # One dispatch moves the tile's every batch; a batch never written
+            # (a truncated debug fit) reads as zeros.
+            got = iter(self._hts.get_tiles_async(
+                [(t, beta) for beta in range(self.n_batch) if beta in self._written]))
             zero = None
             tiles = []
             for beta in range(self.n_batch):
                 if beta in self._written:
-                    tiles.append(self._hts.get_tile_async((t, beta)))
+                    tiles.append(next(got))
                 else:
                     zero = zero if zero is not None else jax.jit(
                         lambda: jnp.zeros((self.Q, self.b, self.g_tile), jnp.complex128),
