@@ -786,7 +786,12 @@ NVRTC version; the file name carries mode, grid, ns, precision, sm and the key.
 Writes go to a unique temporary and are `rename`d into place (atomic on one
 filesystem, so concurrent ranks each publish a whole file); reads re-hash the
 payload and recompile on any mismatch.  The startup `[kconv]` line names the
-directory, its image count and its size.
+directory, its image count and its size.  **Under `lx` the cache is off unless
+you name a directory:** the launcher sets `ISDF_JAX_CACHE_DIR=""` when it is
+unset (`lxkit.launcher_policy.apply_cache_policy`, the XLA cache's cold
+default), so a production campaign should set `ISDF_JAX_CACHE_DIR` to a
+rank-visible directory (measured: each process otherwise pays the cold compile,
+about 12 s for the two Σ modes on CrI3 8×8).
 
 A new mode is added in three steps:
 

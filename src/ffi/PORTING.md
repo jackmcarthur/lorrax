@@ -425,7 +425,8 @@ runtime libs SLATE links against.
 cached on disk under `ISDF_JAX_CACHE_DIR/kconv_mathdx` (or
 `~/.cache/lorrax/kconv_mathdx` when that variable is unset; `""` disables the
 cache), and a hit costs about 10 ms.  On a new cluster point
-`ISDF_JAX_CACHE_DIR` at a rank-visible directory for production campaigns; the
+`ISDF_JAX_CACHE_DIR` at a rank-visible directory for production campaigns (on
+Perlmutter `lx` exports it as `""` when unset, which turns the cache off); the
 cache is content-hashed and rank-safe, so it never needs clearing for
 correctness.
 

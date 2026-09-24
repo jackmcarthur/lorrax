@@ -16,7 +16,11 @@ changes live in `docs/architecture/decisions.md`.
   refused by name.
 - The kernels compile on first use (about 6 s per k-grid) and are cached in
   `ISDF_JAX_CACHE_DIR/kconv_mathdx`, or `~/.cache/lorrax/kconv_mathdx` when
-  that variable is unset; `ISDF_JAX_CACHE_DIR=""` turns the cache off.
+  that variable is unset; `ISDF_JAX_CACHE_DIR=""` turns the cache off — and
+  `lx` exports exactly that when the variable is unset, so under `lx` name a
+  directory to keep the images between runs.
+- The flat-k transform (χ0, head, htransform) also runs on nvidia-mathdx on
+  CUDA; `LORRAX_FFT_FFI` now governs the cpu leg only.
 
 ## 2026-08-28 — startup ownership, BSE mesh flags, emulated CPU meshes
 
