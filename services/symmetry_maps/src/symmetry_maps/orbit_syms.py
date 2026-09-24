@@ -2090,15 +2090,50 @@ def fft_grid_pullback_perm(
             f"{tau_grid_residual[bad_sym, bad_axis]:.6e}. Off-grid "
             "translations cannot be represented by an FFT-grid permutation.")
 
+    # Real-space transform uses Rinv = inv(S).
+    Rinv = np.rint(np.linalg.inv(S)).astype(np.int64)            # (n_sym, 3, 3)
+
+    # EXACT INTEGER ROUTE.  When every coefficient Rinv[a,b]*N_a/N_b is an
+    # integer (the grid maps onto itself: always true for an FFT grid chosen
+    # by QE for this group) and tau is on-grid (checked above), the snapped
+    # image below is the integer (sum_b C[a,b] i_b + tau_grid_a) mod N_a
+    # exactly: the float route's rounding noise never reaches 0.5.  Built one
+    # operation at a time from broadcast 1-D axes, it gives the same table
+    # without the (n_sym, n_rtot, 3) float temporaries (0.46 GB and 2.4 s of
+    # a host einsum per call on the CrI3 80x80x250 grid, P2-E 2026-09-24).
+    numerator = fg[None, :, None] * Rinv
+    if not np.any(numerator % fg[None, None, :]):
+        coeff = numerator // fg[None, None, :]                    # (n_sym, 3, 3)
+        shift = np.rint(tau_grid).astype(np.int64)                # (n_sym, 3)
+        axes = (np.arange(nx, dtype=np.int64)[:, None, None],
+                np.arange(ny, dtype=np.int64)[None, :, None],
+                np.arange(nz, dtype=np.int64)[None, None, :])
+        base = np.arange(n_rtot, dtype=np.int64)
+        sym_perm = np.empty((n_sym, n_rtot), dtype=np.int32)
+        for s in range(n_sym):
+            coords = []
+            for a in range(3):
+                acc = int(shift[s, a])
+                for b in range(3):
+                    if coeff[s, a, b]:
+                        acc = acc + int(coeff[s, a, b]) * axes[b]
+                coords.append(np.mod(acc, fg[a]))
+            img_flat = np.broadcast_to(
+                coords[0] * (ny * nz) + coords[1] * nz + coords[2],
+                (nx, ny, nz)).reshape(-1)
+            if validate and np.bincount(img_flat, minlength=n_rtot).max() != 1:
+                raise RuntimeError(
+                    f"fft_grid_pullback_perm: sym_perm[{s}] is not a "
+                    f"permutation of [0, n_rtot={n_rtot}).")
+            sym_perm[s, img_flat] = base
+        return sym_perm
+
     # Enumerate every grid point as (i_x, i_y, i_z) in flat C-order.
     ix, iy, iz = np.meshgrid(
         np.arange(nx), np.arange(ny), np.arange(nz), indexing='ij')
     r_idx = np.stack([ix.reshape(-1), iy.reshape(-1), iz.reshape(-1)],
                        axis=1).astype(np.int64)                  # (n_rtot, 3)
     r_frac = r_idx.astype(np.float64) / fg[None, :]              # (n_rtot, 3)
-
-    # Real-space transform uses Rinv = inv(S).
-    Rinv = np.rint(np.linalg.inv(S)).astype(np.int64)            # (n_sym, 3, 3)
 
     # images[s, r] = r @ Rinv[s].T + τ[s]
     images = (np.einsum('rj,sij->sri', r_frac, Rinv.astype(np.float64))
