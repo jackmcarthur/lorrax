@@ -6,10 +6,10 @@ both encodes with the full c and v locally, decodes through this rank's
 reduce-scatter after the scan.  Two checks on a 2x2 mesh:
 
 1. The compiled TDA matvec and the non-TDA pair applier carry ZERO
-   collectives inside any while body (the trial scan), and their W-term
-   collectives outside it are exactly the block gather and the one
-   reduce-scatter.  Red twin: the same census on a program that DOES run a
-   per-trial collective must count it.
+   collectives inside any while body (the trial scan) AND the same total
+   collective count at NT and 2·NT trials — unroll-proof, since XLA:GPU
+   may unroll or hoist a short scan and make a while-body census vacuous.
+   Red twin: a carry-dependent per-trial psum must fail that criterion.
 2. The TDA matvec (and the pair at s = ±1) on the 2x2 mesh equals the 1x1
    mesh result to 1e-12 relative — the sums are only reassociated.
 
@@ -122,30 +122,61 @@ def _pair(d):
     return pair
 
 
+def _per_trial_free(fn_of_nt):
+    """(inside, total@NT, total@2NT) — unroll-proof per-trial census.
+
+    XLA:GPU may fully unroll (or hoist out of) a short trial scan, which
+    makes "no collective inside the while body" vacuous.  A per-trial
+    collective shows either INSIDE a while body or as a total count that
+    grows with the trial count, so both are checked.
+    """
+    i4, o4 = fn_of_nt(NT)
+    i8, o8 = fn_of_nt(2 * NT)
+    return i4 + i8, i4 + o4, i8 + o8
+
+
 @pytest.mark.mesh(4)
-def test_no_collective_inside_the_trial_scan():
+def test_no_collective_per_trial():
     d = _payload(2, 2)
     with d["mesh"]:
         mv, args = _tda(d)
-        inside, outside = _census(mv, *args)
-        assert inside == 0, f"TDA: {inside} collective(s) inside the trial scan"
-        assert outside > 0
         pair = _pair(d)
-        pin, pout = _census(pair, d["X"], jnp.asarray(1.0), *d["args"])
-        assert pin == 0, f"pair: {pin} collective(s) inside the trial scan"
 
-        # RED TWIN: the census must see a per-trial collective when one exists.
-        def per_trial(x):
+        def tda_census(nt):
+            X = jnp.concatenate([d["X"]] * (nt // NT), axis=0)
+            return _census(mv, X, *args[1:])
+
+        def pair_census(nt):
+            X = jnp.concatenate([d["X"]] * (nt // NT), axis=0)
+            return _census(pair, X, jnp.asarray(1.0), *d["args"])
+
+        for name, fn in (("TDA", tda_census), ("pair", pair_census)):
+            inside, t4, t8 = _per_trial_free(fn)
+            assert inside == 0, f"{name}: {inside} collective(s) in the scan"
+            assert t4 == t8 > 0, (
+                f"{name}: collective count grows with the trial count "
+                f"({t4} at {NT} trials, {t8} at {2 * NT})")
+
+        # RED TWIN: a per-trial psum that depends on the carry (so it can be
+        # neither hoisted nor batched) must fail the same criterion.
+        from common.shard_map import shard_map
+        from jax.sharding import PartitionSpec as P
+
+        def twin_census(nt):
+            X = jnp.concatenate([d["X"]] * (nt // NT), axis=0)
+
             def body(c, xb):
-                return c, jax.lax.psum(xb, "x")
-            from common.shard_map import shard_map
-            from jax.sharding import PartitionSpec as P
-            return shard_map(lambda a: jax.lax.scan(body, None, a, unroll=1)[1],
-                             mesh=d["mesh"], in_specs=P(None, "x", "y", None),
-                             out_specs=P(None, "x", "y", None),
-                             check_vma=False)(x)
-        twin_in, _ = _census(per_trial, d["X"])
-        assert twin_in >= 1, "the census cannot see a per-trial collective"
+                y = jax.lax.psum(xb * c, "x")
+                return c + jnp.sum(y).real * 1e-30, y
+            f = shard_map(
+                lambda a: jax.lax.scan(body, jnp.float64(1.0), a,
+                                       unroll=1)[1],
+                mesh=d["mesh"], in_specs=P(None, "x", "y", None),
+                out_specs=P(None, "x", "y", None), check_vma=False)
+            return _census(f, X)
+        inside, t4, t8 = _per_trial_free(twin_census)
+        assert inside > 0 or t8 > t4, (
+            "the census cannot see a per-trial collective")
 
 
 @pytest.mark.mesh(4)
