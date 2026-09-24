@@ -1724,7 +1724,7 @@ def plan_zeta_mubatch(*, meta, mesh_xy, n_q_selected: int, ngkmax: int,
                 f"route (largest box axis {axis} of {fft_grid}); why: the "
                 "pencil split is not implemented.  Fix: more memory per "
                 "device, or a rank count whose cache fits.")
-        route, r_s, r_sub = 'planes', ps, 1
+        route, r_s, r_sub = 'planes', ps, ps
         # The plane route accumulates D over regenerated band chunks, so a
         # wide chunk saves D round trips: the widest (a multiple of P) whose
         # regeneration transient stays within a fifth of the target.

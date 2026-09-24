@@ -1,32 +1,31 @@
 """μ-batch ζ fit kernels: Z_q(G) by centroid batches; see docs/architecture/zeta_fit_mubatch.md.
 
-Per μ batch ``B`` every rank builds, on its own block ``R_p`` of the real
-grid and for every q of the full zone,
+Per μ batch ``B`` (a union of whole centroid orbits) every rank builds, on
+its own orbit-closed r blocks and for every q of the full zone,
 
-    D^X_{k,ab}(μ, r) = Σ_n w^X_n ψ_{nka}(r_μ) ψ*_{nkb}(r)         (X = L, R)
-    Z_q(μ, r)        = Σ_k Σ_ab D^L_{k,ab}(μ, r) conj(D^R_{k+q,ab}(μ, r))
+    D^X_{k̄,cd}(μ, r) = Σ_n w^X_n ψ_{n k̄ c}(r_μ) ψ*_{n k̄ d}(r)        (X = L, R; raw parents k̄)
+    Z_q(μ, r)         = isdf.core.parent_projector_kconv(D^L, D^R)    (typed unfold + k-convolution)
 
-(the pair GEMM and the k-convolution of ``isdf.core._tile_tail``, on the
-unfolded full BZ, so no orbit-closed tile exists), completes the LR+RL
-normal equations and keeps the stored q rows.  One all-to-all per r
-sub-block moves the rows ``(q, μ_B)`` to their owners over the full grid;
-each owner applies ``e^{-iq·r}`` and a local full-box FFT and keeps the ζ
-sphere.  ``Z_q(G)`` is written once into :class:`ZStore`; no accumulator
-and no distributed FFT exist.  ``C_q⁺`` acts on μ only, so the caller
-applies it afterwards on the sphere: ``ζ_q(G) = C_q⁺ Z_q(G)``.
+completes the LR+RL normal equations and keeps the stored q rows.  One
+all-to-all per r sub-block moves the rows to their owners over the full
+grid (q-owned on the R4 tier, μ-owned otherwise); each owner applies
+``e^{-iq·r}`` and a local full-box FFT and keeps the ζ sphere.  ``Z_q(G)``
+is written once into :class:`ZStore`; no accumulator and no distributed FFT
+exist.  ``C_q⁺`` acts on μ only, so it is applied afterwards on the sphere:
+``ζ_q(G) = C_q⁺ Z_q(G)`` (:class:`ZetaG`).
+
+One route serves every deck: a group of one operation is the identity
+plan (singleton orbits), whose parents are the full grid.
 
 Layouts (P ranks, flat index ``p = x·P_y + y``):
 
-* ψ(r) block cache ``(n_bc, nk, bc_w, ns, P·R)`` at
+* ψ(r) block cache ``(n_bc, n_parent, bc_w, ns, P·R)`` at
   ``P(None, None, None, None, ('x','y'))``: rank p holds every band on its
-  r block.  Built once (one band→r all-to-all per band chunk).
-* ψ(G) resident ``(n_bc, nk, P·b_p, ns, ngkmax)`` at
+  r blocks.  Built once (one band→r all-to-all per band chunk).
+* ψ(G) resident ``(n_bc, n_parent, P·b_p, ns, ngkmax)`` at
   ``P(None, None, ('x','y'), None, None)`` (the plane route): each rank
-  evaluates its own bands on every rank's current planes through the ψ
-  cylinder, then one plane→owner all-to-all.
-* Z store ``(Q, μ_pad, N_G)`` at ``P(None, ('x','y'), None)``: batch β
-  holds ``c = b/P`` consecutive μ of every rank's μ block, so each rank
-  writes only its own rows.
+  evaluates its own bands on every rank's planes of the current sub-block
+  through the ψ cylinder, then one plane→owner all-to-all.
 """
 from __future__ import annotations
 
@@ -46,6 +45,7 @@ from common.fft_helpers import local_fftn3, local_ifftn3
 from common.wfn_transforms import (
     _norm_split,
     _plane_geometry,
+    _tile_plane_slots,
     apply_bloch_phase_at,
     to_rchunk_inner,
 )
@@ -64,93 +64,87 @@ def _mesh_id(mesh: Mesh) -> tuple:
 
 
 # ---------------------------------------------------------------------------
-# r-block geometry
+# r blocks
 # ---------------------------------------------------------------------------
 
-class RBlocks(NamedTuple):
-    """The r partition of one fit: rank p owns ``R`` transport slots.
+class RSpec(NamedTuple):
+    """Static geometry of the rank r blocks (the per-block tables are operands).
 
-    ``route='cache'``: flat grid blocks ``[p·R, (p+1)·R)`` (no box axis).
-    ``route='planes'``: whole planes ``[p·n_pl, (p+1)·n_pl)`` of ``axis``
-    (the largest box axis), ``R = n_pl·ps``.  Either way the transport
-    order of rank p's slots is ``R = n_sub·r_s`` sub-blocks, and the
-    concatenation over p of all slots is a permutation of the padded grid
-    that :func:`transport_to_box` inverts.
+    Rank p owns ``n_sub`` sub-blocks of ``r_s`` transport slots; their
+    concatenation over ``(p, s)`` is a permutation of the (padded) grid.
+    ``route`` names the ψ source: ``'cache'`` (the block cache, any point
+    set) or ``'planes'`` (plane regeneration: each sub-block lies on at most
+    ``n_pl`` planes of ``plane_axis``).
     """
     route: str
     n_ranks: int
-    R: int
-    r_s: int
     n_sub: int
-    axis: int
+    r_s: int
     n_pl: int
-    n_pg: int
-    ps: int
+    plane_axis: int
     fft_grid: tuple
 
+    @property
+    def R(self) -> int:
+        return self.n_sub * self.r_s
 
-def make_r_blocks(fft_grid, n_ranks: int, *, route: str, r_sub: int) -> RBlocks:
-    """Partition the grid for ``n_ranks``; ``r_sub`` is the sub-block width
-    (points for ``cache``, planes for ``planes``)."""
-    fft_grid = tuple(int(s) for s in fft_grid)
-    n_rtot = math.prod(fft_grid)
+
+def r_blocks(k_unfold_plan, fft_grid, n_ranks: int, *, route: str,
+             r_s_target: int):
+    """The rank r blocks of the fit and their typed-unfold tables.
+
+    Returns ``(rs, points (P, n_sub, r_s), local_perm (P, n_sub, n_rows,
+    r_s), wraps (P, n_sub, n_rows, r_s, 3), planes (P, n_sub, n_pl))``.
+    A symmetric group takes :func:`gw.centroid_k_unfold.orbit_r_blocks`
+    (orbit-closed, owner-contiguous).  A group of one operation (singleton
+    orbits, identity tables) on the plane route takes whole planes of the
+    largest axis per rank, so no plane is regenerated for half its points;
+    ``P`` beyond that axis refuses (pencils are not implemented).
+    """
+    from gw.centroid_k_unfold import orbit_r_blocks
+    plan = k_unfold_plan
+    fft_grid = tuple(int(v) for v in fft_grid)
     P_ = int(n_ranks)
-    if route == 'cache':
-        R0 = -(-n_rtot // P_)
-        r_s = max(1, min(int(r_sub), R0))
-        n_sub = -(-R0 // r_s)
-        return RBlocks('cache', P_, n_sub * r_s, r_s, n_sub, -1, 0, 0, 0,
-                       fft_grid)
-    if route == 'planes':
+    n_rows = int(np.asarray(plan.sym_perm).shape[0])
+    if route == 'planes' and int(plan.n_sym_spatial) == 1:
         axis = int(np.argmax(fft_grid))
-        n_a, (n_b, n_c), _ = _plane_geometry(fft_grid, axis)
+        n_a, (n_b, n_c), (b_ax, c_ax) = _plane_geometry(fft_grid, axis)
         if P_ > n_a:
             raise ValueError(
-                "GATE zeta-mubatch-pencils: got P="
-                f"{P_} ranks for the plane-regenerated psi(r) route, want P <= "
-                f"{n_a} (planes along the largest box axis {axis} of "
-                f"{fft_grid}); why: a rank would own no plane, and the pencil "
-                "split over two axes is not implemented.  Fix: a P at which "
-                "the psi(r) cache fits (the planner then takes the flat-block "
-                "route), or fewer ranks.")
-        n_pl0 = -(-n_a // P_)
-        n_pg = max(1, min(int(r_sub), n_pl0))
-        n_sub = -(-n_pl0 // n_pg)
-        n_pl = n_sub * n_pg
+                f"GATE zeta-mubatch-pencils: got P={P_} ranks for the "
+                f"plane-regenerated ψ(r) route, want P <= {n_a} (planes of the "
+                f"largest box axis {axis} of {fft_grid}); why: a rank would own "
+                "no plane, and the pencil split is not implemented.  Fix: a P at "
+                "which the ψ(r) block cache fits.")
         ps = n_b * n_c
-        return RBlocks('planes', P_, n_pl * ps, n_pg * ps, n_sub, axis, n_pl,
-                       n_pg, ps, fft_grid)
-    raise ValueError(f"make_r_blocks: unknown route {route!r}")
-
-
-def orbit_r_blocks(k_unfold_plan, n_ranks: int, *, r_sub: int):
-    """Orbit-closed r blocks for the parent-k fit: sub-block s of rank p is a union of whole orbits.
-
-    ``build_real_grid_orbit_tiles`` with every rank as an owner: tile ``s``
-    owner ``p`` is rank p's sub-block s, so the r-side symmetry gather of the
-    typed unfold stays on the rank.  Returns ``(rb, points (P, n_sub, r_s),
-    perm (P, n_sub, 2·n_sym, r_s) int32, wraps (P, n_sub, 2·n_sym, r_s, 3))``
-    with block-local offsets (the ``RealGridOrbitTiles.source_tables``
-    convention).
-    """
-    from gw.centroid_k_unfold import build_real_grid_orbit_tiles
-    plan = k_unfold_plan
-    P_ = int(n_ranks)
-    tiles = build_real_grid_orbit_tiles(
-        plan.spatial_ops, plan.translations, plan.fft_grid, n_y=P_,
-        target_width=P_ * int(r_sub), shard_multiple=1)
-    n_sub, cap = int(tiles.n_tiles), int(tiles.shard_size)
-    pts = np.asarray(tiles.r_index).reshape(n_sub, P_, cap).transpose(1, 0, 2)
-    perm, wraps = [], []
-    for t in range(n_sub):
-        lp, wr = tiles.source_tables(t)
-        n_rows = lp.shape[0]
-        perm.append(lp.reshape(n_rows, P_, cap).transpose(1, 0, 2))
-        wraps.append(wr.reshape(n_rows, P_, cap, 3).transpose(1, 0, 2, 3))
-    fft_grid = tuple(int(v) for v in plan.fft_grid)
-    rb = RBlocks('orbit', P_, n_sub * cap, cap, n_sub, -1, 0, 0, 0, fft_grid)
-    return (rb, pts.astype(np.int32), np.stack(perm, 1).astype(np.int32),
-            np.stack(wraps, 1).astype(np.int32))
+        n_pg = max(1, int(r_s_target) // ps)
+        n_pl_rank = -(-n_a // P_)
+        n_pg = min(n_pg, n_pl_rank)
+        n_sub = -(-n_pl_rank // n_pg)
+        plane = (np.arange(P_)[:, None, None] * (n_sub * n_pg)
+                 + np.arange(n_sub)[None, :, None] * n_pg
+                 + np.arange(n_pg)[None, None, :])            # (P, n_sub, n_pg)
+        inp = np.arange(ps)
+        coords = [None, None, None]
+        coords[axis] = plane[..., None]
+        coords[b_ax] = (inp // n_c)[None, None, None, :]
+        coords[c_ax] = (inp % n_c)[None, None, None, :]
+        nx, ny, nz = fft_grid
+        flat = coords[0] * ny * nz + coords[1] * nz + coords[2]
+        flat = np.where(plane[..., None] < n_a, flat, -1).reshape(P_, n_sub, n_pg * ps)
+        planes = np.where(plane < n_a, plane, -1)
+        r_s = n_pg * ps
+        perm = np.broadcast_to(np.arange(r_s, dtype=np.int32),
+                               (P_, n_sub, n_rows, r_s)).copy()
+        wraps = np.zeros((P_, n_sub, n_rows, r_s, 3), dtype=np.int32)
+        rs = RSpec('planes', P_, n_sub, r_s, n_pg, axis, fft_grid)
+        return rs, flat.astype(np.int32), perm, wraps, planes.astype(np.int32)
+    ob = orbit_r_blocks(plan, fft_grid, P_, r_s_target=int(r_s_target), route=route)
+    planes = np.asarray(ob.planes, dtype=np.int32)
+    rs = RSpec(route, P_, int(ob.n_sub), int(ob.r_s), int(planes.shape[-1]),
+               int(ob.plane_axis), fft_grid)
+    return (rs, np.asarray(ob.points, np.int32), np.asarray(ob.local_perm, np.int32),
+            np.asarray(ob.wraps, np.int32), planes)
 
 
 def box_from_slots(points: np.ndarray, n_rtot: int) -> np.ndarray:
@@ -162,43 +156,6 @@ def box_from_slots(points: np.ndarray, n_rtot: int) -> np.ndarray:
     if np.any(inv < 0):
         raise ValueError("box_from_slots: the r blocks do not cover the grid")
     return inv.astype(np.int32)
-
-
-def block_points(rb: RBlocks) -> np.ndarray:
-    """``(P, n_sub, r_s)`` flat grid index of every transport slot (-1 = pad)."""
-    n_rtot = math.prod(rb.fft_grid)
-    if rb.route == 'cache':
-        pts = np.arange(rb.n_ranks * rb.R, dtype=np.int64)
-        pts = np.where(pts < n_rtot, pts, -1)
-        return pts.reshape(rb.n_ranks, rb.n_sub, rb.r_s).astype(np.int32)
-    n_a, (n_b, n_c), (b_ax, c_ax) = _plane_geometry(rb.fft_grid, rb.axis)
-    plane = np.arange(rb.n_ranks * rb.n_pl).reshape(rb.n_ranks, rb.n_pl)
-    inp = np.arange(rb.ps)
-    coords = [None, None, None]
-    coords[rb.axis] = plane[:, :, None]
-    coords[b_ax] = (inp // n_c)[None, None, :]
-    coords[c_ax] = (inp % n_c)[None, None, :]
-    nx, ny, nz = rb.fft_grid
-    flat = (coords[0] * ny * nz + coords[1] * nz + coords[2])
-    flat = np.where(plane[:, :, None] < n_a, flat, -1)
-    return flat.reshape(rb.n_ranks, rb.n_sub, rb.r_s).astype(np.int32)
-
-
-def transport_to_box(rows, rb: RBlocks, box_from_slot=None):
-    """``(..., P·R)`` transport order → ``(..., nx, ny, nz)`` box order."""
-    lead = rows.shape[:-1]
-    if rb.route == 'orbit':
-        return jnp.take(rows, box_from_slot, axis=-1).reshape(*lead, *rb.fft_grid)
-    if rb.route == 'cache':
-        n_rtot = math.prod(rb.fft_grid)
-        return rows[..., :n_rtot].reshape(*lead, *rb.fft_grid)
-    n_a, (n_b, n_c), (b_ax, c_ax) = _plane_geometry(rb.fft_grid, rb.axis)
-    x = rows.reshape(*lead, rb.n_ranks * rb.n_pl, n_b, n_c)[..., :n_a, :, :]
-    nl = len(lead)
-    # (a, b, c) → grid axis order.
-    order = [None, None, None]
-    order[rb.axis], order[b_ax], order[c_ax] = nl, nl + 1, nl + 2
-    return jnp.transpose(x, tuple(range(nl)) + tuple(order))
 
 
 # ---------------------------------------------------------------------------
@@ -236,27 +193,22 @@ def band_slot_tables(psi_G_store, *, band_start: int, nb_face: int,
 # ψ(r) sources
 # ---------------------------------------------------------------------------
 
-def build_psi_block_cache(psi_G_store, *, mesh: Mesh, rb: RBlocks,
-                          points: np.ndarray | None = None) -> jax.Array:
-    """ψ on every rank's r block, all bands: built once for all batches.
+def build_psi_block_cache(psi_G_store, *, mesh: Mesh, rs: RSpec,
+                          points: np.ndarray) -> jax.Array:
+    """ψ on every rank's r blocks, all bands: built once for all batches.
 
     Each rank full-box IFFTs its own band shard (``to_rchunk_inner``, the
-    same transform as the incumbent cache), then one all-to-all per band
-    chunk moves bands → r blocks.  Returns
-    ``(n_bc, nk, P·b_p, ns, P·R)`` at ``P(None, None, None, None, ('x','y'))``.
+    incumbent transform), gathers every rank's block points, and one
+    all-to-all per band chunk moves bands → r blocks.  Returns
+    ``(n_bc, n_parent, P·b_p, ns, P·R)`` at ``P(None, None, None, None, ('x','y'))``.
     """
-    if rb.route not in ('cache', 'orbit'):
-        raise ValueError("build_psi_block_cache: needs a flat or orbit block route")
-    fft_grid = rb.fft_grid
+    fft_grid = rs.fft_grid
     n_rtot = math.prod(fft_grid)
     nk, b_p, ns, ngkmax = (int(v) for v in psi_G_store.local_band_chunk_shape)
     n_bc = len(psi_G_store.band_chunk_ranges)
-    P_ = rb.n_ranks
-    pad = P_ * rb.R - n_rtot
-    gather = None if rb.route == 'cache' else np.clip(
-        np.asarray(points).reshape(-1), 0, n_rtot - 1).astype(np.int32)
-    key = ('psi_block_cache', _mesh_id(mesh), id(psi_G_store), rb, nk, b_p, ns,
-           ngkmax, n_bc, None if gather is None else hash(gather.tobytes()))
+    gather = np.clip(np.asarray(points).reshape(-1), 0, n_rtot - 1).astype(np.int32)
+    key = ('psi_block_cache', _mesh_id(mesh), id(psi_G_store), rs, nk, b_p, ns,
+           ngkmax, n_bc, hash(gather.tobytes()))
     fn = _kernel_cache.get(key)
     if fn is None:
         store = psi_G_store
@@ -275,11 +227,7 @@ def build_psi_block_cache(psi_G_store, *, mesh: Mesh, rb: RBlocks,
                 g = _io_callback(_host, sds, x_idx, y_idx, bc, ordered=False)
                 r = to_rchunk_inner(g, g_index, fft_grid, jnp.int32(0), n_rtot,
                                     kvecs_frac=kvecs, norm="ortho")
-                if gather is not None:
-                    # Orbit blocks: every rank's slots, in transport order.
-                    r = jnp.take(r, jnp.asarray(gather), axis=-1)
-                elif pad:
-                    r = jnp.pad(r, ((0, 0), (0, 0), (0, 0), (0, pad)))
+                r = jnp.take(r, jnp.asarray(gather), axis=-1)   # every rank's slots
                 r = jax.lax.all_to_all(r, _XY, split_axis=3, concat_axis=1,
                                        tiled=True)
                 return carry, r
@@ -293,11 +241,11 @@ def build_psi_block_cache(psi_G_store, *, mesh: Mesh, rb: RBlocks,
     return fn(psi_G_store.g_index, psi_G_store.kvecs_frac)
 
 
-def plane_cylinder(psi_G_store, rb: RBlocks):
+def plane_cylinder(psi_G_store, rs: RSpec):
     """The store's ψ cylinder along the plane axis (``psi_cylinder_tables``)."""
     from common.wfn_transforms import psi_cylinder_tables
     return psi_cylinder_tables(
-        psi_G_store.g_index, rb.fft_grid, rb.axis,
+        psi_G_store.g_index, rs.fft_grid, rs.plane_axis,
         ngkmax=int(psi_G_store.local_band_chunk_shape[3]))
 
 
@@ -305,120 +253,20 @@ def plane_cylinder(psi_G_store, rb: RBlocks):
 # One μ batch: Z_q(μ_B, G) rows on their owners
 # ---------------------------------------------------------------------------
 
-def _kconv_tail(D_l, D_r, kgrid, vertex):
-    """Z_q(μ, r) = FFT_k Σ_ab conj(IFFT_k conj D^L_ab) · φ_ab IFFT_k conj D^R_{π(ab)}.
-
-    The identity-plan arm of ``isdf.core._tile_tail`` (both transforms
-    ``norm='forward'``).  ``D`` is ``(ns, ns, nk, b, r)``; ``vertex`` the
-    static current-vertex output permutation/phase (identity for charge).
-    """
-    ns = int(D_l.shape[0])
-    nkx, nky, nkz = kgrid
-    b, r = int(D_l.shape[3]), int(D_l.shape[4])
-    sh = (nkx, nky, nkz, b, r)
-    perm, phase = vertex
-    pairs = np.arange(ns * ns, dtype=np.int32)
-    rpairs = (np.asarray(perm)[:, None] * ns
-              + np.asarray(perm)[None, :]).reshape(-1).astype(np.int32)
-    phases = (np.asarray(phase)[:, None]
-              * np.asarray(phase)[None, :]).reshape(-1).astype(np.complex128)
-    Dl = D_l.reshape(ns * ns, *D_l.shape[2:])
-    Dr = D_r.reshape(ns * ns, *D_r.shape[2:])
-
-    def spin(acc, args):
-        i, j, ph = args
-        Pl = local_ifftn3(jnp.conj(Dl[i]).reshape(sh), axes=(0, 1, 2),
-                          norm='forward')
-        Pr = local_ifftn3(jnp.conj(Dr[j]).reshape(sh), axes=(0, 1, 2),
-                          norm='forward')
-        return acc + jnp.conj(Pl) * (ph * Pr), None
-
-    acc, _ = jax.lax.scan(
-        spin, jnp.zeros(sh, dtype=jnp.complex128),
-        (jnp.asarray(pairs), jnp.asarray(rpairs), jnp.asarray(phases)),
-        unroll=1)
-    return local_fftn3(acc, axes=(0, 1, 2), norm='forward').reshape(
-        nkx * nky * nkz, b, r)
-
-
-def _parent_tail(D_l, D_r, ut, lperm, lL, rperm, rL, kgrid, vertex):
-    """Parent-k projectors → Z_q(μ, r) on full q by the typed unfold, then the k-convolution.
-
-    The identity-plan arm generalized exactly as ``isdf.core._tile_tail``:
-    each full-k output spin block is ``conj(Σ_cd coef_k[c,d] U(D_cd))`` with
-    ``U = symmetry_maps.unfold_operator_local`` (centroid gather on the batch,
-    r gather on the rank's orbit-closed sub-block, lattice-wrap phases,
-    antiunitary rows conjugated), then ``FFT_k Σ_ab conj(IFFT_k P^L_ab) ·
-    φ_ab IFFT_k P^R_π(ab)``.  ``D`` is ``(ns, ns, n_parent, b, r)``.
-
-    The unfold slices its tables at ``axis_index·n_local``; the tables here
-    are exactly one local block wide (the batch, the rank's sub-block), and
-    ``dynamic_slice`` clamps the start into range, so every rank reads its
-    own table whole.
-    """
-    from ffi import _services
-    _services.ensure_on_path()
-    from symmetry_maps import open_spin_block_coefficient, unfold_operator_local
-    ns = int(D_l.shape[0])
-    nkx, nky, nkz = kgrid
-    nk = nkx * nky * nkz
-    b, r = int(D_l.shape[3]), int(D_l.shape[4])
-    sh = (nkx, nky, nkz, b, r)
-    spin_np = np.asarray(ut['spin_action_full'], dtype=np.complex128)
-    support = np.any(spin_np != 0, axis=0)
-    src_pairs = [np.flatnonzero((support[a, :, None] & support[c, None, :]).reshape(-1))
-                 for a in range(ns) for c in range(ns)]
-    n_src = max(len(x) for x in src_pairs)
-    counts = np.asarray([len(x) for x in src_pairs], np.int32)
-    src_pairs = np.asarray([np.pad(x, (0, n_src - len(x)), constant_values=int(x[0]))
-                            for x in src_pairs], np.int32)
-    coef = jnp.stack([open_spin_block_coefficient(spin_np, a, c)
-                      for a in range(ns) for c in range(ns)])  # (ns², nk, ns, ns)
-    Dl = D_l.reshape(ns * ns, *D_l.shape[2:])
-    Dr = D_r.reshape(ns * ns, *D_r.shape[2:])
-    perm, phase = vertex
-    rpairs = (np.asarray(perm)[:, None] * ns
-              + np.asarray(perm)[None, :]).reshape(-1).astype(np.int32)
-    phases = (np.asarray(phase)[:, None]
-              * np.asarray(phase)[None, :]).reshape(-1).astype(np.complex128)
-
-    def block(D, i):
-        """One full-k output spin block ``i``: conj of the coefficient-weighted unfold."""
-        def source(acc, slot):
-            pair = jnp.asarray(src_pairs)[i, slot]
-            c, d = pair // ns, pair % ns
-            U = unfold_operator_local(
-                D[pair], irr_idx=ut['irr_idx'], sym_idx=ut['sym_idx'],
-                q_irr_frac=ut['k_parent_frac'], left_local_perm=lperm,
-                left_L_table=lL, right_local_perm=rperm, right_L_table=rL,
-                n_sym_spatial=int(ut['n_sym_spatial']))
-            w = coef[i][:, c, d][:, None, None]
-            return acc + jnp.where(slot < jnp.asarray(counts)[i], w * U, 0), None
-
-        acc, _ = jax.lax.scan(source, jnp.zeros((nk, b, r), jnp.complex128),
-                              jnp.arange(n_src), unroll=1)
-        return jnp.conj(acc)
-
-    def spin(acc, args):
-        i, j, ph = args
-        Pl = local_ifftn3(block(Dl, i).reshape(sh), axes=(0, 1, 2), norm='forward')
-        Pr = local_ifftn3(block(Dr, j).reshape(sh), axes=(0, 1, 2), norm='forward')
-        return acc + jnp.conj(Pl) * (ph * Pr), None
-
-    acc, _ = jax.lax.scan(
-        spin, jnp.zeros(sh, jnp.complex128),
-        (jnp.arange(ns * ns, dtype=jnp.int32), jnp.asarray(rpairs),
-         jnp.asarray(phases)), unroll=1)
-    return local_fftn3(acc, axes=(0, 1, 2), norm='forward').reshape(nk, b, r)
-
-
-def make_batch_kernel(*, mesh: Mesh, rb: RBlocks, kgrid, fft_grid, nk: int,
-                      ns: int, b: int, n_bc: int, bc_w: int, nb_face: int,
+def make_batch_kernel(*, mesh: Mesh, rs: RSpec, plan, kgrid, fft_grid, ns: int,
+                      b: int, n_bc: int, bc_w: int, nb_face: int,
                       q_sel, q_neg, sphere_idx, qvec_frac, row_chunk: int,
                       source: str, rows: str = 'mu', psi_G_store=None,
-                      cylinder=None, vertex=None, stop_at: str | None = None,
-                      unfold: dict | None = None, n_k_src: int | None = None):
+                      cylinder=None, vertex=None, stop_at: str | None = None):
     """Compile-once executable for one batch; see the module docstring.
+
+    ``source``: ``'cache'`` (ψ block cache), ``'resident'`` (ψ(G) on
+    device, plane route) or ``'host'`` (ψ(G) host store via io_callback,
+    plane route).  ``plan`` is the fit's ``CentroidKUnfoldPlan`` (parents,
+    actions, spin representation).  Returns ``fn(src, X_B, band_rel, w_l,
+    w_r, kvecs, cyl, geo, batch) -> rows`` with ``geo = (points, r_perm,
+    r_wrap, planes, box_from_slot)`` (:func:`r_blocks`) and ``batch =
+    (left_perm, left_L)`` of this batch (``gw.centroid_k_unfold.orbit_mu_batches``).
 
     ``rows`` names who owns a row after the transpose: ``'q'`` (the R4
     q-local tier: rank p gets whole stored q's, ``Q_pad/P`` of them, for
@@ -427,28 +275,14 @@ def make_batch_kernel(*, mesh: Mesh, rb: RBlocks, kgrid, fft_grid, nk: int,
     ``p·c + [0, c)`` for every q; output ``(Q, b, ngk)`` at
     ``P(None, ('x','y'), None)``).
 
-    ``unfold`` (the parent plan's ``irr_idx``/``sym_idx``/``k_parent_frac``/
-    ``n_sym_spatial``/``spin_action_full``) selects the parent-k route: ψ
-    and ``X_B`` carry ``n_k_src`` raw-parent rows, the pair GEMM runs on them
-    and :func:`_parent_tail` unfolds to the full grid before the
-    k-convolution; the r blocks must then be orbit-closed (``rb.route ==
-    'orbit'``).  The call then takes ``extra = (box_from_slot, r_perm, r_wrap,
-    l_perm, l_wrap)`` (see :func:`orbit_r_blocks`, batch-local left tables).
-
     ``stop_at`` (debug split timers only: ``'psi'``, ``'gemm'``, ``'kconv'``,
     ``'transpose'``) builds the same kernel truncated after that stage,
     returning a checksum, so stage walls come from differences.
-
-    ``source``: ``'cache'`` (ψ block cache), ``'resident'`` (ψ(G) on
-    device, plane route) or ``'host'`` (ψ(G) host store via io_callback,
-    plane route).  Returns ``fn(src, X_B, band_rel, w_l, w_r, pts, kvecs)
-    -> rows (Q, P·c, ngkmax)`` at ``P(None, ('x','y'), None)`` where rank p's
-    ``c = b/P`` rows are its batch centroids.
     """
-    P_ = rb.n_ranks
-    nk_src = int(nk if n_k_src is None else n_k_src)
-    if unfold is not None and rb.route != 'orbit':
-        raise ValueError("make_batch_kernel: the parent-k unfold needs orbit r blocks")
+    from isdf.core import parent_projector_kconv
+    P_ = rs.n_ranks
+    nk_src = int(plan.n_parent)
+    nk = int(np.prod(kgrid))
     if rows == 'mu' and b % P_:
         raise ValueError(f"make_batch_kernel: batch {b} must be a multiple of P={P_}")
     c = b // P_ if rows == 'mu' else 0
@@ -471,32 +305,25 @@ def make_batch_kernel(*, mesh: Mesh, rb: RBlocks, kgrid, fft_grid, nk: int,
     n_rows = Qloc * b if rows == 'q' else Q * c
     cs = max(1, min(int(row_chunk), n_rows))
     n_fft = -(-n_rows // cs)
-    key = ('batch', _mesh_id(mesh), rb, tuple(kgrid), nk, ns, b, n_bc, bc_w,
+    key = ('batch', _mesh_id(mesh), rs, id(plan), tuple(kgrid), ns, b, n_bc, bc_w,
            nb_face, hash(q_sel.tobytes()),
            None if q_neg is None else hash(q_neg.tobytes()),
            hash(sphere.tobytes()), hash(qv.tobytes()), cs, source, rows,
            None if psi_G_store is None else id(psi_G_store),
            tuple(int(v) for v in np.asarray(vertex[0])),
-           tuple(complex(v) for v in np.asarray(vertex[1])), stop_at,
-           nk_src, None if unfold is None else id(unfold))
+           tuple(complex(v) for v in np.asarray(vertex[1])), stop_at)
     hit = _kernel_cache.get(key)
     if hit is not None:
         return hit
 
     if source in ('resident', 'host'):
-        if rb.route != 'planes':
+        if rs.route != 'planes':
             raise ValueError("ψ(G) sources run on the plane route")
         cyl_index, cyl_axis, plane_from_col = cylinder
-        n_a, (n_b, n_c), _ = _plane_geometry(fft_grid, rb.axis)
-        norm2, a_scale = _norm_split("ortho", n_a, rb.ps, inverse=True)
-        cyl_axis_np = np.asarray(jax.device_get(cyl_axis), dtype=np.float64)
-        # Global plane coordinates of sub-block s on every rank: (n_sub, P·n_pg).
-        planes = (np.arange(P_)[None, :, None] * rb.n_pl
-                  + np.arange(rb.n_sub)[:, None, None] * rb.n_pg
-                  + np.arange(rb.n_pg)[None, None, :]).reshape(rb.n_sub, -1)
-        ph_np = (np.exp(2j * np.pi / n_a * cyl_axis_np[None, :, None]
-                        * planes[:, None, :].astype(np.float64)) * a_scale)
+        n_a, (n_b, n_c), _ = _plane_geometry(fft_grid, rs.plane_axis)
+        norm2, a_scale = _norm_split("ortho", n_a, n_b * n_c, inverse=True)
         n_col = int(cyl_index.shape[1])
+        ps = n_b * n_c
     if source == 'host':
         store = psi_G_store
         b_p = int(store.local_band_chunk_shape[1])
@@ -513,64 +340,73 @@ def make_batch_kernel(*, mesh: Mesh, rb: RBlocks, kgrid, fft_grid, nk: int,
     src_spec = (P(None, None, None, None, _XY) if source == 'cache'
                 else P(None, None, _XY, None, None) if source == 'resident'
                 else P())
-    extra_spec = (P(), P(_XY, None, None, None), P(_XY, None, None, None, None),
-                  P(), P())
+    geo_spec = (P(), P(_XY, None, None, None), P(_XY, None, None, None, None),
+                P(), P())
 
     @partial(shard_map, mesh=mesh,
-             in_specs=(src_spec, P(), P(), P(), P(), P(), P(), P(), extra_spec),
+             in_specs=(src_spec, P(), P(), P(), P(), P(), P(), geo_spec, P()),
              out_specs=(P(_XY, None, None) if rows == 'q'
                         else P(None, _XY, None)), check_vma=False)
-    def _local(src, X_B, band_rel, w_l, w_r, pts, kvecs, cyl, extra):
-        box_from_slot, r_perm, r_wrap, l_perm, l_wrap = extra
+    def _local(src, X_B, band_rel, w_l, w_r, kvecs, cyl, geo, batch):
+        points, r_perm, r_wrap, planes, box_from_slot = geo
+        l_perm, l_wrap = batch
         x_idx = jax.lax.axis_index('x')
         y_idx = jax.lax.axis_index('y')
         p = x_idx * int(mesh.shape['y']) + y_idx
-        pts_p = pts[p]                                    # (n_sub, r_s)
 
         def psi_at(bc, s):
-            """ψ(nk, bc_w, ns, r_s) of band chunk bc on sub-block s."""
-            if source == 'cache':
-                return jax.lax.dynamic_slice_in_dim(
-                    src[bc], s * rb.r_s, rb.r_s, axis=3)
+            """ψ(n_parent, bc_w, ns, r_s) of band chunk bc on sub-block s (plane route)."""
             g = (src[bc] if source == 'resident' else _io_callback(
                 _host, host_sds, x_idx, y_idx, bc, ordered=False))
             ngk = int(g.shape[-1])
             gpad = jnp.concatenate(
                 [g, jnp.zeros(g.shape[:3] + (1,), g.dtype)], axis=-1)
-            ci, _, pfc = cyl
+            ci, cax, pfc = cyl
             idx = jnp.clip(ci, 0, ngk).reshape(nk_src, 1, 1, -1)
             cyl_v = jnp.take_along_axis(gpad, idx, axis=-1).reshape(
-                nk_src, g.shape[1], ns, n_col, -1)         # (k, b_p, s, col, n_s)
-            ph = jnp.asarray(ph_np)[s]                     # (n_s, P·n_pg)
-            F = jnp.einsum('kbscj,jp->kbspc', cyl_v, ph)    # all ranks' planes
+                nk_src, g.shape[1], ns, n_col, -1)       # (k, b_p, s, col, n_s)
+            pl_all = planes[:, s, :].reshape(-1)          # every rank's planes
+            ph = jnp.exp((2j * jnp.pi / n_a) * (
+                cax.astype(jnp.float64)[:, None]
+                * jnp.maximum(pl_all, 0).astype(jnp.float64)[None, :])) * a_scale
+            ph = jnp.where((pl_all >= 0)[None, :], ph, 0)
+            F = jnp.einsum('kbscj,jp->kbspc', cyl_v, ph)
             F = jax.lax.all_to_all(F, _XY, split_axis=3, concat_axis=1,
-                                   tiled=True)             # (k, bc_w, s, n_pg, col)
+                                   tiled=True)             # (k, bc_w, s, n_pl, col)
             F = jnp.concatenate(
                 [F, jnp.zeros(F.shape[:4] + (1,), F.dtype)], axis=-1)
-            stack = jnp.take(F, pfc, axis=-1)              # (k, bc_w, s, n_pg, ps)
+            stack = jnp.take(F, pfc, axis=-1)              # (k, bc_w, s, n_pl, ps)
             r = local_ifftn3(stack.reshape(*stack.shape[:4], n_b, n_c),
                              axes=(-2, -1), norm=norm2)
-            r = r.reshape(nk_src, bc_w, ns, rb.r_s)
-            return apply_bloch_phase_at(r, kvecs, fft_grid, pts_p[s])
+            r = r.reshape(nk_src, bc_w, ns, rs.n_pl * ps)
+            pts = points[p, s]
+            slot, on = _tile_plane_slots(pts, planes[p, s], fft_grid, rs.plane_axis)
+            r = jnp.take(r, jnp.clip(slot, 0, rs.n_pl * ps - 1), axis=-1)
+            r = jnp.where(on[None, None, None, :], r, 0)
+            return apply_bloch_phase_at(r, kvecs, fft_grid, pts)
 
         def sub_body(carry, s):
             buf, chk = carry
             if stop_at == 'psi':
                 acc = chk
-                for bc in range(n_bc):
-                    acc = acc + jnp.sum(jnp.abs(psi_at(bc, s)))
+                if source == 'cache':
+                    acc = acc + jnp.sum(jnp.abs(jax.lax.dynamic_slice_in_dim(
+                        src, s * rs.r_s, rs.r_s, axis=4)))
+                else:
+                    for bc in range(n_bc):
+                        acc = acc + jnp.sum(jnp.abs(psi_at(bc, s)))
                 return (buf, acc), None
             if source == 'cache':
                 # Every band is resident on this r block: one GEMM over all
                 # of them (K = n_bc·bc_w), no accumulator round trips.
                 psi = jax.lax.dynamic_slice_in_dim(
-                    src, s * rb.r_s, rb.r_s, axis=4)   # (c, k, n, b, r)
+                    src, s * rs.r_s, rs.r_s, axis=4)   # (c, k, n, b, r)
                 rel = jnp.clip(band_rel.reshape(-1), 0, nb_face - 1)
                 x = jnp.take(X_B, rel, axis=3).reshape(nk_src, ns, b, n_bc, bc_w)
                 yc = jnp.conj(psi)
-                D_l = jnp.einsum('kamcn,cknbr->abkmr',
+                D_l = jnp.einsum('kamcn,cknbr->kambr',
                                  x * w_l[None, None, None], yc)
-                D_r = jnp.einsum('kamcn,cknbr->abkmr',
+                D_r = jnp.einsum('kamcn,cknbr->kambr',
                                  x * w_r[None, None, None], yc)
             else:
                 def band_body(carry, bc):
@@ -580,23 +416,21 @@ def make_batch_kernel(*, mesh: Mesh, rb: RBlocks, kgrid, fft_grid, nk: int,
                     x = jnp.take(X_B, jnp.clip(rel, 0, nb_face - 1), axis=3)
                     yc = jnp.conj(psi)
                     D_l = D_l + jnp.einsum(
-                        'kamn,knbr->abkmr', x * w_l[bc][None, None, None, :], yc)
+                        'kamn,knbr->kambr', x * w_l[bc][None, None, None, :], yc)
                     D_r = D_r + jnp.einsum(
-                        'kamn,knbr->abkmr', x * w_r[bc][None, None, None, :], yc)
+                        'kamn,knbr->kambr', x * w_r[bc][None, None, None, :], yc)
                     return (D_l, D_r), None
 
-                z0 = jnp.zeros((ns, ns, nk_src, b, rb.r_s), dtype=jnp.complex128)
+                z0 = jnp.zeros((nk_src, ns, b, ns, rs.r_s), dtype=jnp.complex128)
                 (D_l, D_r), _ = jax.lax.scan(
                     band_body, (z0, z0), jnp.arange(n_bc, dtype=jnp.int32),
                     unroll=1)
             if stop_at == 'gemm':
                 return (buf, chk + jnp.sum(jnp.abs(D_l)) + jnp.sum(jnp.abs(D_r))), None
-            if unfold is not None:
-                Z = _parent_tail(D_l, D_r, unfold, l_perm, l_wrap,
-                                 r_perm[0, s], r_wrap[0, s].astype(jnp.float64),
-                                 kgrid, vertex)             # (nk, b, r_s)
-            else:
-                Z = _kconv_tail(D_l, D_r, kgrid, vertex)    # (nk, b, r_s)
+            Z = parent_projector_kconv(
+                D_l, D_r, plan=plan, left_perm=l_perm, left_L=l_wrap,
+                right_perm=r_perm[0, s], right_L=r_wrap[0, s], kgrid=kgrid,
+                vertex_l=vertex, vertex_r=vertex)       # (nk, b, r_s)
             if stop_at == 'kconv':
                 return (buf, chk + jnp.sum(jnp.abs(Z))), None
             if q_neg is not None:
@@ -606,26 +440,26 @@ def make_batch_kernel(*, mesh: Mesh, rb: RBlocks, kgrid, fft_grid, nk: int,
                      * jnp.asarray(q_live)[:, None, None])  # (Q_pad, b, r_s)
                 Zt = jax.lax.all_to_all(Z, _XY, split_axis=0, concat_axis=2,
                                         tiled=True)         # (Qloc, b, P·r_s)
-                Zt = Zt.reshape(Qloc, b, P_, 1, rb.r_s)
+                Zt = Zt.reshape(Qloc, b, P_, 1, rs.r_s)
             else:
                 Z = jnp.take(Z, jnp.asarray(q_sel), axis=0)  # (Q, b, r_s)
                 Zt = jax.lax.all_to_all(Z, _XY, split_axis=1, concat_axis=2,
                                         tiled=True)         # (Q, c, P·r_s)
-                Zt = Zt.reshape(Q, c, P_, 1, rb.r_s)
+                Zt = Zt.reshape(Q, c, P_, 1, rs.r_s)
             return (jax.lax.dynamic_update_slice_in_dim(buf, Zt, s, axis=3),
                     chk), None
 
         lead = (Qloc, b) if rows == 'q' else (Q, c)
-        buf = jnp.zeros(lead + (P_, rb.n_sub, rb.r_s), dtype=jnp.complex128)
+        buf = jnp.zeros(lead + (P_, rs.n_sub, rs.r_s), dtype=jnp.complex128)
         (buf, chk), _ = jax.lax.scan(
             sub_body, (buf, jnp.float64(0.0)),
-            jnp.arange(rb.n_sub, dtype=jnp.int32), unroll=1)
+            jnp.arange(rs.n_sub, dtype=jnp.int32), unroll=1)
         if stop_at in ('psi', 'gemm', 'kconv'):
             return jnp.zeros(lead + (ngkmax,), jnp.complex128) + chk
         if stop_at == 'transpose':
             return jnp.zeros(lead + (ngkmax,), jnp.complex128) + jnp.sum(
                 jnp.abs(buf))
-        buf = buf.reshape(n_rows, P_ * rb.R)
+        buf = buf.reshape(n_rows, P_ * rs.R)
         if rows == 'q':
             q_row_all = jnp.minimum(
                 p * Qloc + jnp.arange(n_rows, dtype=jnp.int32) // b, Q - 1)
@@ -642,7 +476,7 @@ def make_batch_kernel(*, mesh: Mesh, rb: RBlocks, kgrid, fft_grid, nk: int,
         def fft_body(out, i):
             sub = jax.lax.dynamic_slice_in_dim(buf, i * cs, cs, axis=0)
             qr = jax.lax.dynamic_slice_in_dim(q_row_all, i * cs, cs, axis=0)
-            box = transport_to_box(sub, rb, box_from_slot)  # (cs, nx, ny, nz)
+            box = jnp.take(sub, box_from_slot, axis=-1).reshape(cs, nx, ny, nz)
             box = (box * phx_d[qr][:, :, None, None]
                    * phy_d[qr][:, None, :, None] * phz_d[qr][:, None, None, :])
             G = local_fftn3(box, axes=(-3, -2, -1), norm='backward').reshape(
@@ -662,133 +496,14 @@ def make_batch_kernel(*, mesh: Mesh, rb: RBlocks, kgrid, fft_grid, nk: int,
     return fn
 
 
+def gather_batch_centroids(psi_mun, slots, *, mesh: Mesh) -> jax.Array:
+    """``X_B = ψ_{n k̄ s}(r_μ)`` for one batch's packed centroids, replicated.
 
-
-def dummy_extra(mesh: Mesh):
-    """Placeholder ``extra`` operands for a kernel without the parent unfold."""
-    P_ = _mesh_size(mesh)
-    z = lambda shape: jax.jit(lambda: jnp.zeros(shape, jnp.int32),
-                              out_shardings=NamedSharding(
-                                  mesh, P(_XY, *([None] * (len(shape) - 1)))
-                                  if len(shape) > 1 and shape[0] == P_ else P()))()
-    return (z((1,)), z((P_, 1, 1, 1)), z((P_, 1, 1, 1, 1)), z((1,)), z((1,)))
-
-
-def orbit_mu_batches(k_unfold_plan, mu_pad: int, b: int, *,
-                     multiple: int = 1) -> np.ndarray:
-    """μ batches that are unions of whole centroid orbits: ``(n_batch, b)`` packed slots, -1 pad.
-
-    Orbits are the classes of the plan's packed centroid source map
-    (``sym_perm``, every spatial and antiunitary row), poured greedily in
-    packed order of their first member into batches of at most ``b`` slots
-    (``b`` a multiple of ``multiple``); the typed unfold's centroid gather
-    then stays inside the batch.  A trivial group gives singleton orbits,
-    i.e. contiguous batches.  An orbit wider than ``b`` refuses.
+    ``psi_mun`` is the raw-parent face ``(n_parent, ns, μ_pad, nb)``;
+    ``slots`` ``(b,)`` packed indices, ``-1`` for a pad slot (zero column).
+    Bytes ``n_parent·ns·b·nb·16`` per rank (VI3, b=80: 0.13 GB).
     """
-    plan = k_unfold_plan
-    perm = np.asarray(plan.sym_perm, dtype=np.int64)          # (n_rows, μ_pk)
-    mu_pk = int(perm.shape[1])
-    parent = np.arange(mu_pk)
-
-    def find(i):
-        while parent[i] != i:
-            parent[i] = parent[parent[i]]
-            i = parent[i]
-        return i
-
-    for row in perm:
-        for i, j in enumerate(row):
-            if j >= 0:
-                a, c = find(i), find(int(j))
-                if a != c:
-                    parent[max(a, c)] = min(a, c)
-    roots = np.array([find(i) for i in range(mu_pk)])
-    orbits = {}
-    for i, r in enumerate(roots):
-        orbits.setdefault(int(r), []).append(i)
-    b = int(b)
-    batches, cur = [], []
-    for r in sorted(orbits):
-        o = orbits[r]
-        if len(o) > b:
-            raise ValueError(
-                f"GATE zeta-mubatch-orbit-batch: got a centroid orbit of "
-                f"{len(o)} sites, want <= the μ batch {b}; why: an orbit must "
-                "sit whole in one batch.  Fix: a larger budget per device.")
-        if len(cur) + len(o) > b:
-            batches.append(cur)
-            cur = []
-        cur = cur + o
-    if cur:
-        batches.append(cur)
-    out = np.full((len(batches), b), -1, dtype=np.int32)
-    for i, bt in enumerate(batches):
-        out[i, :len(bt)] = bt
-    del mu_pad, multiple
-    return out
-
-
-def batch_centroid_tables(k_unfold_plan, slots):
-    """Batch-local centroid source map and wraps for the typed unfold.
-
-    ``slots`` is one row of :func:`orbit_mu_batches` (a union of whole
-    orbits, -1 pads), so every op maps the batch onto itself: the source of
-    slot ``j`` under row ``r`` is the slot holding ``sym_perm[r, slots[j]]``.
-    Pad slots map to themselves with zero wrap.
-    """
-    plan = k_unfold_plan
-    sl = np.asarray(slots, dtype=np.int64)
-    b = sl.size
-    live = sl >= 0
-    perm_g = np.asarray(plan.sym_perm, dtype=np.int64)       # (n_rows, μ_pk)
-    L = np.asarray(plan.L_table, dtype=np.int64)              # (n_rows, μ_pk, 3)
-    n_rows = perm_g.shape[0]
-    pos = np.full((perm_g.shape[1],), -1, dtype=np.int64)
-    pos[sl[live]] = np.flatnonzero(live)
-    perm = np.broadcast_to(np.arange(b), (n_rows, b)).copy()
-    wrap = np.zeros((n_rows, b, 3), dtype=np.int64)
-    src = perm_g[:, sl[live]]
-    ok = src >= 0
-    local = np.where(ok, pos[np.clip(src, 0, None)], np.flatnonzero(live)[None, :])
-    if np.any(local < 0):
-        raise ValueError(
-            "GATE zeta-mubatch-orbit-batch: a μ batch is not closed under the "
-            "centroid action; why: the typed unfold would read a centroid "
-            "outside the batch.")
-    perm[:, live] = local
-    wrap[:, live] = L[:, sl[live]]
-    return perm.astype(np.int32), wrap.astype(np.int32)
-
-
-def packed_from_slots(batches: np.ndarray, mu_pad: int) -> np.ndarray:
-    """``(μ_pad,)``: the store slot (β·b + j) holding each packed centroid."""
-    flat = np.asarray(batches).reshape(-1)
-    inv = np.full((int(mu_pad),), -1, dtype=np.int64)
-    live = flat >= 0
-    inv[flat[live]] = np.flatnonzero(live)
-    if np.any(inv < 0):
-        raise ValueError("packed_from_slots: the μ batches do not cover the carrier")
-    return inv.astype(np.int32)
-
-
-def batch_slots(mu_pad: int, b: int, beta: int) -> np.ndarray:
-    """Packed centroid of each slot of batch ``beta`` (``β·b + slot``; -1 past μ_pad).
-
-    Batches are contiguous in the packed order; slot ``p·c + j`` is owned by
-    rank p after the transpose, so rank p's rows are ``β·b + p·c + [0, c)``.
-    """
-    s = int(beta) * int(b) + np.arange(int(b))
-    return np.where(s < int(mu_pad), s, -1).astype(np.int32)
-
-
-def gather_batch_centroids(psi_mun_full, slots, *, mesh: Mesh) -> jax.Array:
-    """``X_B = ψ_{nks}(r_μ)`` for the batch's packed centroids, replicated.
-
-    ``psi_mun_full`` is the full-BZ face ``(nk, ns, μ_pad, nb)``; ``slots``
-    ``(b,)`` packed indices, ``-1`` for a pad slot (zero column).  Bytes
-    ``nk·ns·b·nb·16`` per rank (VI3, b=100: 0.17 GB).
-    """
-    key = ('gather_X', _mesh_id(mesh), tuple(int(v) for v in psi_mun_full.shape),
+    key = ('gather_X', _mesh_id(mesh), tuple(int(v) for v in psi_mun.shape),
            int(np.size(slots)))
     fn = _kernel_cache.get(key)
     if fn is None:
@@ -800,7 +515,7 @@ def gather_batch_centroids(psi_mun_full, slots, *, mesh: Mesh) -> jax.Array:
     from common.collectives import device_put_process_local
     idx_dev = device_put_process_local(np.asarray(slots, dtype=np.int32),
                                        NamedSharding(mesh, P()))
-    return fn(psi_mun_full, idx_dev)
+    return fn(psi_mun, idx_dev)
 
 
 # ---------------------------------------------------------------------------
@@ -936,11 +651,10 @@ class ZStore:
         if self.placement == 'device':
             return _q_take_tile(self.mesh, n_slot)(self._dev, jnp.int32(t))
         if self.placement == 'host':
-            arrays = [jax.device_put(self._host[dev.id][:, t, :, :], dev)
-                      for dev in self.mesh.local_devices]
-            return jax.make_array_from_single_device_arrays(
-                (self.Q_pad, n_slot, self.g_tile),
-                NamedSharding(self.mesh, P(_XY, None, None)), arrays)
+            return _host_tile_to_device(
+                self.mesh, P(_XY, None, None), (self.Q_pad, n_slot, self.g_tile),
+                {dev: self._host[dev.id][:, t, :, :]
+                 for dev in self.mesh.local_devices})
         self._io.sync_writes()
         raw = self._io.read_slab(
             'Z', shape=(self.Q_pad, 1, n_slot, self.g_tile),
@@ -1011,11 +725,11 @@ class ZStore:
             if self.placement == 'device':
                 local = _device_take_tile(self.mesh)(self._dev, jnp.int32(t))
             else:
-                arrays = [jax.device_put(self._host[dev.id][t], dev)
-                          for dev in self.mesh.local_devices]
-                local = jax.make_array_from_single_device_arrays(
+                local = _host_tile_to_device(
+                    self.mesh, P(None, _XY, None),
                     (self.Q, self.P * self.n_batch * self.c, self.g_tile),
-                    NamedSharding(self.mesh, P(None, _XY, None)), arrays)
+                    {dev: self._host[dev.id][t]
+                     for dev in self.mesh.local_devices})
             out = _rows_to_layout(self.mesh, layout, self.P, self.n_batch,
                                   self.c, self.n_batch * self.b, self.Q_pad)(local)
         # Store slot order → packed centroid order (a prefix for contiguous
@@ -1537,6 +1251,19 @@ def _q_disk_tile(mesh, mu_pad):
     return fn
 
 
+def _host_tile_to_device(mesh, spec, shape, local_tiles):
+    """This process's host tiles → one sharded array, through the collectives service.
+
+    ``common.collectives.restore_from_host`` is the one place this process
+    places host shards on its own devices (no cross-process traffic).
+    """
+    from common.collectives import HostSpill, restore_from_host
+    return restore_from_host(HostSpill(
+        shape=tuple(int(v) for v in shape),
+        sharding=NamedSharding(mesh, spec),
+        shards=[(dev, np.ascontiguousarray(a)) for dev, a in local_tiles.items()]))
+
+
 def _slots_to_packed(mesh, layout):
     """Store slot order → packed centroid order on the (unsharded) μ axis."""
     key = ('slots_to_packed', _mesh_id(mesh), layout)
@@ -1547,7 +1274,10 @@ def _slots_to_packed(mesh, layout):
         @partial(shard_map, mesh=mesh, in_specs=(spec, P()), out_specs=spec,
                  check_vma=False)
         def _g(x, pfs):
-            return jnp.take(x, pfs, axis=1)
+            # -1: a layout pad centroid, in no batch; its Z row is exactly zero.
+            y = jnp.take(x, jnp.clip(pfs, 0, None), axis=1)
+            live = (pfs >= 0)[None, :, None]
+            return jnp.where(live, y, 0)
         fn = jax.jit(_g)
         _kernel_cache[key] = fn
     return fn
