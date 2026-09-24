@@ -15,7 +15,6 @@ Usage (Perlmutter login node, single GPU):
     PYTHONPATH="/global/u2/j/jackm/software/lorrax_bse/src:\
     /global/homes/j/jackm/scratchperl/.isdf/isdf_venvs/isdf_site" \
     JAX_ENABLE_X64=1 HDF5_USE_FILE_LOCKING=FALSE \
-    XLA_PYTHON_CLIENT_PREALLOCATE=false \
     python3 -u tests/bench/test_dft_hamiltonian.py \
         --save qe/scf/silicon.save \
         --pseudo_dir qe/scf \

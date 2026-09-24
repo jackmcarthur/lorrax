@@ -8,8 +8,8 @@
 //   XLA_FFI_DEFINE_HANDLER_SYMBOL(EighMpFfi, EighDispatch, Bind()...)
 //
 // Patterns adopted from jaxlib:
-//   - ffi::ScratchAllocator for per-call device workspace (so we don't
-//     fight XLA's MEM_FRACTION preallocation)
+//   - ffi::ScratchAllocator for per-call device workspace (it comes from
+//     XLA's own pool, so it is inside the planners' budget)
 //   - FFI_RETURN_IF_ERROR / LORRAX_*_CHECK for one-line error paths
 //   - per-dtype cusolvermp::mp::{SyevdBufferSize,Syevd}<T> shims
 //
@@ -132,11 +132,11 @@ static ffi::Error EighImpl(
     }
     if (prof) LORRAX_CUDA_CHECK(cudaEventRecord(ev[3], ctx->stream));
 
-    // Device workspace from XLA's scratch pool — plays nice with
-    // MEM_FRACTION reservation (cusolverMp's own libcal/UCC internals
-    // still do their own cudaMalloc, so MEM_FRACTION=0.5 remains needed
-    // until/unless that's fixed upstream; this at least keeps OUR
-    // workspace from double-dipping).
+    // Device workspace from XLA's scratch pool, i.e. inside XLA's reserved
+    // pool.  cuSOLVERMp's own internals (NCCL, handles) still allocate
+    // outside it; those bytes were measured (<= 4.7 GB/rank at P4, sandbox
+    // runs/runtime/gpu_pool_policy_20260924) and are what the runtime's
+    // pool fraction leaves room for (docs/environment/overview.md §2.1).
     const size_t scratch_bytes = eigh_scratch_bytes(d_ws_bytes, n, ctx, sizeof(T));
     auto ws_opt = scratch.Allocate(scratch_bytes);
     if (!ws_opt.has_value()) {
