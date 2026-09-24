@@ -103,8 +103,8 @@ class ConvergenceVerdict:
     worst_k: int
     worst_band: int
     cutoff_ev: float
-    #: The stall rule fired (label-free residual flat over two history
-    #: turnovers).  Always paired with converged=False.
+    #: The stall rule fired (label-free residual flat over 12 maps).
+    #: Always paired with converged=False.
     stalled: bool = False
 
     def summary(self) -> str:
@@ -5531,9 +5531,12 @@ def _run_anderson(
     STALLED -- never reported as converged -- when the label-free residual
     max_k ||P f_k P||_2 (P = the metric block; it bounds every sorted
     eigenvalue residual by Weyl and also sees eigenvector error) has not
-    improved by 10% over the last 2(m+1) evaluations, i.e. over two full
-    turnovers of the history, after which the accelerator holds no new
-    secant information.  Both counts are fixed, not deck keys.
+    improved by 10% over the last 12 evaluations.  With a converging
+    accelerator the residual falls well over 10% per map (CrI3: 12 maps
+    take it through five decades); a 12-map plateau is a map the
+    accelerator cannot reduce further (TaAs 4^3 with its Sigma rules
+    rebuilt every few maps: identical residuals at calls 8 and 9).  Both
+    numbers are fixed, not deck keys, and independent of the history depth.
 
     RESIDENCY BUDGET.  The solver holds 2(m+1) copies of the carry (history
     plus the newest pair) and a transient window of the same size.  One copy
@@ -5813,7 +5816,7 @@ def _run_anderson(
         _iter_idx[0] += 1
         if call_index > 0:
             _floor_history.append(float(_spec))
-        _stall_window = 2 * (history_depth + 1)
+        _stall_window = 12   # maps; fixed, not a deck key (see docstring)
         _stalled = (
             not _verdict.converged
             and len(_floor_history) > _stall_window
