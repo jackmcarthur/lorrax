@@ -1072,6 +1072,10 @@ def make_kconv_klead_unfold(mesh: Mesh, kgrid, tables, *, norm: str | None = "or
     ns = int(tables.spin.shape[-1])
     spin_host = np.asarray(tables.spin)
     needs_partner = bool(np.any(np.asarray(tables.trs)))
+    mesh_shape = (int(mesh.shape["x"]), int(mesh.shape["y"]))
+    if tuple(tables.mesh_shape) != mesh_shape:
+        raise ValueError(f"k-leading unfold conv: tables were cut for a {tuple(tables.mesh_shape)} "
+                         f"mesh; this mesh is {mesh_shape}")
     si, sf = ffi_fft_scale("ifftn", norm, nk), ffi_fft_scale("fftn", norm, nk)
     if kconv_backend(mesh) == "mathdx":
         _require_target(KCONV_KLEAD_UNFOLD_TARGET, "CUDA")
@@ -1111,6 +1115,16 @@ def make_kconv_klead_unfold(mesh: Mesh, kgrid, tables, *, norm: str | None = "or
         if Gt.shape != G.shape or W_prep.shape != (nk, G.shape[1], G.shape[3]):
             raise ValueError(f"k-leading unfold conv: Gt {Gt.shape} / W_prep {W_prep.shape} do not "
                              f"match G {G.shape} and nk={nk}")
+        # The kernel addresses parent row row[k] and local sources below the
+        # tables' widths without bounds checks: the operands must be the ones
+        # the tables were built for.
+        if (int(G.shape[0]) != int(tables.n_parent)
+                or int(G.shape[1]) * ns != int(tables.lsrc.shape[1])
+                or int(G.shape[3]) * ns != int(tables.rsrc.shape[1])):
+            raise ValueError(
+                f"k-leading unfold conv: G {G.shape} does not match its tables (n_parent="
+                f"{tables.n_parent}, endpoints {tables.lsrc.shape[1]}/{tables.rsrc.shape[1]} "
+                f"merged over ns={ns})")
         return sm(G, Gt, W_prep)
     return apply
 

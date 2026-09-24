@@ -15,14 +15,17 @@ must resolve to ``mathdx`` on this mesh (asserted, TASTE 30).
    layouts, against literal direct k sums, with its own rolled-map red twin.
 3b. ``make_fused_conv_kplane`` (mode 6, the route-G plane door) at the
    production operand layout D (nk, g, ns, 2c, ns, p) with its Bloch phase:
-   BITWISE equal to the chain it replaced (XLA phase + moveaxis + L/R split,
-   then the parent door on the identity plan), and 1e-12 of the dense sum.
+   within 2 ulp of max|ref| of the chain it replaced (XLA phase + moveaxis + L/R
+   split, then the parent door on the identity plan; bitwise today, reported),
+   and 1e-12 of the dense sum.
    Red twin: the phase rolled by one k.
 3c. ``make_kconv_klead_unfold`` (mode 7, the Σ door from the raw-parent
-   Green): BITWISE equal to the chain it replaced (the typed unfold, the
-   spin-rotate FFI, sigma_conv_operand, then mode 2) on the glide plans
-   (ns 2, 4; spin mixing, an antiunitary row) and A-cubic (48 operations,
-   ns 1).  Red twin: the right source table rolled by one slot.
+   Green): within 2 ulp of max|ref| of the chain it replaced (the typed
+   unfold, the spin-rotate FFI, sigma_conv_operand, then mode 2; bitwise today,
+   reported) on the glide plans (ns 2, 4; spin mixing, an antiunitary row),
+   A-cubic (48 operations, ns 1) and C3 with a general complex U and q = n/3
+   (ns 2, 4; plus nk = 196 at ns 4, the per-bank load).  Red twin: the right
+   source table rolled by one slot.
 4. The stored-kernel doors (modes 2-5) against NumPy ``np.fft`` on sharded
    operands, including an odd grid and 8x8x8: ``make_kconv_klead`` (Σ/COHSEX,
    prep + apply), ``make_kconv_kminor`` (BSE rung, both store layouts),
@@ -250,6 +253,7 @@ def plane_case(mesh, rng):
     return dict(case="kconv_plane", kgrid=list(kg), ns=ns, g=g, c=c, p=p,
                 bitwise_vs_old_chain=int(np.array_equal(U, U_old)),
                 max_abs_vs_old_chain=float(np.max(np.abs(U - U_old))),
+                ulp_vs_old_chain=float(np.max(np.abs(U - U_old)) / (np.finfo(float).eps * np.max(np.abs(U_old)))),
                 ref_mathdx_vs_dense=_rel(U, ref), red_rolled_phase=_rel(U_red, ref),
                 xla_cmul_form=_xla_cmul_form(rng))
 
@@ -259,13 +263,19 @@ def unfold_cases(mesh, rng):
     import zeta_mubatch_fixtures as fixtures
     from test_kconv_klead_unfold import unfold_case
     recs = []
-    fxs = [fixtures._glide_fixture(mesh, rng, ns) for ns in (2, 4)] + [fixtures._acubic_fixture(mesh, rng)]
+    from test_kconv_klead_unfold import c3_fixture
+    fxs = ([fixtures._glide_fixture(mesh, rng, ns) for ns in (2, 4)] + [fixtures._acubic_fixture(mesh, rng)]
+           + [c3_fixture(mesh, ns) for ns in (2, 4)]
+           # nk = 196 at ns = 4: fewer rows than one 16-row spin group fit the
+           # 48 KiB budget, so mode 7 takes its per-bank load (audit M2).
+           + [c3_fixture(mesh, 4, kgrid=(14, 14, 1))])
     for fx in fxs:
         r = unfold_case(mesh, fx)
-        recs.append(dict(case=f"kconv_klead_unfold_ns{r['ns']}", nk=r["nk"], n_parent=r["n_parent"],
+        recs.append(dict(case=f"kconv_klead_unfold_ns{r['ns']}_nk{r['nk']}", nk=r["nk"], n_parent=r["n_parent"],
                          antiunitary=r["antiunitary"], bitwise_vs_old_chain=int(r["door_bitwise"]),
                          bitwise_tables_vs_unfold=int(r["tables_bitwise"]),
                          max_abs_vs_old_chain=r["max_abs"], rel_vs_old_chain=r["rel"],
+                         ulp_vs_old_chain=r["rel"] / np.finfo(float).eps,
                          red_rolled_rsrc=r["red_rel"]))
     return recs
 
@@ -364,8 +374,12 @@ def main() -> int:
                 bad.append(f"{r['case']}.{k}={v:.2e} > {lim}")
             if k.startswith("red_") and not v > RED:
                 bad.append(f"{r['case']}.{k}={v:.2e} <= {RED} (red twin did not fire)")
-            if k.startswith("bitwise_") and v != 1:
-                bad.append(f"{r['case']}.{k}: not bitwise ({r.get('max_abs_vs_old_chain')})")
+            # The fused kernels spell every product as the chain they replace,
+            # so today they are bitwise (reported); the gate allows 2 ulp of the
+            # largest value so a compiler that re-contracts the OLD chain does
+            # not turn it red without a physics change (audit L2).
+            if k == "ulp_vs_old_chain" and not v <= 2.0:
+                bad.append(f"{r['case']}.{k}={v:.2f} > 2 ulp of max|ref|")
         if jax.process_index() == 0:
             print(TAG, json.dumps(r), flush=True)
     import test_isdf_parent_conv as tpc
