@@ -324,7 +324,7 @@ backend_symbol_re() {
         host:fft)        echo '^MklFft[A-Za-z0-9]*HostFfi$' ;;
         cuda:cusolvermp) echo '^(EighMpFfi|CusolverMp[A-Za-z0-9]*Ffi)$' ;;
         cuda:cublasmp)   echo '^CublasMp[A-Za-z0-9]*Ffi$' ;;
-        cuda:cufft)      echo '^Cufft[A-Za-z0-9]*CudaFfi$' ;;
+        cuda:cufft)      echo '^(Cufft|KConvMathdx|KFftMathdx)[A-Za-z0-9]*CudaFfi$' ;;
         cuda:slate)      echo '^Slate[A-Za-z0-9]*Ffi$' ;;
         cuda:phdf5)      echo '^Phdf[A-Za-z0-9]*Ffi$' ;;
         *) echo "" ;;

@@ -8,8 +8,9 @@ must resolve to ``mathdx`` on this mesh (asserted, TASTE 30).
    Red twin: an R-side operand rolled by one k.
 2. ``isdf.core.c_q_from_psi_sm`` (parent mode, centroid-major operands,
    glide ns=2 plan with spin mixing and an antiunitary row) against the
-   router's cpu leg (the flat-k plan route, evaluated here on the GPU's plan
-   handler). Red twin: the ψ operand rolled by one parent k.
+   router's cpu-leg composition (typed parent load + spin contraction), its
+   transforms evaluated with jnp.fft on the GPU. Red twin: the ψ operand
+   rolled by one parent k.
 3. ``test_isdf_parent_conv.gpu_main``: random parents, ns = 1/2/4, both
    layouts, against literal direct k sums, with its own rolled-map red twin.
 4. The stored-kernel doors (modes 2-5) against NumPy ``np.fft`` on sharded
@@ -157,11 +158,20 @@ def face_parent_case(mesh, rng):
         del mesh_, trailing, centroid_major
         return F._plan_kparent(kgrid_, ns_, perm_l, phase_l, perm_r, phase_r,
                                F.conv_kpair_scale("forward", int(np.prod(kgrid_))))
-    F.make_fused_conv_kparent = plan_route
+    def jnp_kfft(x_flat, kgrid_, kind):
+        # The plan composition's transforms as jnp.fft (test reference; the
+        # CUDA leg has no plan handler since the flat-k transform moved to mathdx).
+        kg = tuple(int(v) for v in kgrid_)
+        f = jnp.fft.ifftn if kind == "ifftn" else jnp.fft.fftn
+        norm = "forward" if kind == "ifftn" else "backward"
+        return f(x_flat.reshape(kg + tuple(x_flat.shape[1:])), axes=(0, 1, 2),
+                 norm=norm).reshape(x_flat.shape)
+    plan_kfft = F._plan_kfft
+    F.make_fused_conv_kparent, F._plan_kfft = plan_route, jnp_kfft
     try:
         C_plan = call(nmu)
     finally:
-        F.make_fused_conv_kparent = router
+        F.make_fused_conv_kparent, F._plan_kfft = router, plan_kfft
         core._isdf_pipeline_cache.clear()
     return dict(case="c_q_from_psi_sm", kgrid=list(kgrid), n_parent=n_par, mu=mu,
                 mathdx_vs_plan=_rel(C_mathdx, C_plan), red_rolled_k=_rel(C_red, C_plan))

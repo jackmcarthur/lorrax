@@ -1,11 +1,7 @@
 """Batched flat-k 3-D FFT (the ``LORRAX_FFT_FFI`` service) and the k-convolution
 router (decisions.md 2026-09-24).
 
-The Python half of the flat-k FFT handlers.  ONE set of ``ffi_call`` sites
-serves BOTH platforms, because the two libraries deliberately register the
-SAME target strings under different C++ symbols
-(``ffi_loader.py:99-107`` CUDA vs ``:140-142`` host — the phdf5
-same-target/different-symbol split):
+The Python half of the flat-k FFT handlers:
 
     cpu   liblorrax_ffi_host.so   the FFTW3 ABI (``fftw_plan_many_dft``, the
                                   advanced-layout planner) in
@@ -17,15 +13,14 @@ same-target/different-symbol split):
                                   DFTI calls were deleted 2026-08-05 and the
                                   library is now bound by ``dlsym`` over a
                                   candidate ladder (``LORRAX_FFTW3_SO``).
-    CUDA  liblorrax_ffi.so        cuFFT with the ADVANCED DATA LAYOUT
-                                  (``src/ffi/cpp/cufft/fft_flat_k_cuda_ffi.cc``):
-                                  ``cufftPlanMany64`` inembed/istride=T/idist=1,
-                                  the exact stride-descriptor analog; an
-                                  NVRTC-compiled kernel fuses the G·W
-                                  multiply + norms.
+    CUDA  liblorrax_ffi.so        the k-convolution router's nvidia-mathdx
+                                  k-leading transform (mode 3 of
+                                  ``src/ffi/cpp/cufft/kconv_mathdx_cuda_ffi.cc``)
+                                  since 2026-09-24; the cuFFT advanced-layout
+                                  handler it replaced was measured 1.8-7.4x
+                                  slower at the production tiles and deleted.
 
-That is why ``src/ffi/cufft/`` has no Python module of its own — see its
-``__init__.py``.  Full contract: ``docs/dev/flat_k_fft_service.md``.
+Full contract of the host service: ``docs/dev/flat_k_fft_service.md``.
 
 WHY the service exists: XLA:CPU's ``fft`` custom-call requires the
 transformed axes minor-most, so every ``dot`` (k-major flat) ↔ ``fft``
@@ -98,9 +93,10 @@ not transpose to reach another.  A k-grid axis above ``KCONV_AXIS_MAX`` (40,
 the fp64 cuFFTDx thread-FFT limit) or a row that does not fit shared memory is
 refused by name on CUDA.
 
-The plain flat-k transform (``make_flat_k_fft_ffi``) is still cuFFT's strided
-advanced-layout plan on CUDA; whether its consumers move onto
-``make_kfft_klead`` is a measurement (docs/architecture/ffi_layout.md).
+The plain flat-k transform is the same router: ``common.fft_helpers.
+make_flat_k_fft`` calls :func:`make_kfft_klead` (mathdx mode 3 on CUDA,
+measured 1.8-7.4x faster than the cuFFT plan it replaced; the FFTW3-ABI host
+handler on cpu, whose sharded door :func:`make_flat_k_fft_ffi` is cpu-only).
 """
 
 from __future__ import annotations
@@ -183,7 +179,14 @@ KCONV_TARGETS = (KCONV_PAIR_TARGET, KCONV_PARENT_TARGET, KCONV_KLEAD_TARGET,
 GATE = Gate(
     env="LORRAX_FFT_FFI",
     target=FLAT_K_TARGET,
-    platforms=("cpu", "CUDA"),
+    # cpu ONLY since 2026-09-24: on CUDA the flat-k transform is the
+    # k-convolution router's nvidia-mathdx k-leading mode (make_kfft_klead),
+    # measured 1.8-7.4x faster than the cuFFT advanced-layout plan it replaced
+    # (runs/runtime/kconv_stage2_20260924/bench_flatk_v2.log).
+    platforms=("cpu",),
+    silent_platform_demote=(
+        "on CUDA the flat-k transform is the k-convolution router's "
+        "nvidia-mathdx family, checked at startup by require_kconv"),
     modes=("off", "on"),
     default="on",
     off_label="(deleted) XLA flat-k FFT path",
@@ -194,10 +197,9 @@ GATE = Gate(
         "common.fft_helpers.make_flat_k_fft) was DELETED under the "
         "FFI-required ruling (docs/architecture/decisions.md, 2026-08-01) — "
         "the certified backend is the platform FFI handler (the FFTW3 ABI "
-        "on cpu, cuFFT strided on CUDA).  Unset LORRAX_FFT_FFI, or recover the "
-        "XLA arm from git history for a debugging build.  BSE and the "
-        "shard_map-interior local_*fftn3 aliases are unaffected (they never "
-        "had an FFI route)."),
+        "on cpu, the nvidia-mathdx k-convolution router on CUDA).  Unset "
+        "LORRAX_FFT_FFI, or recover the XLA arm from git history for a "
+        "debugging build."),
     # NOTE the platform names below are ABIs, not products.  The host handler
     # calls the FFTW3 ABI (`fftw_plan_many_dft` ×4 in
     # cpp/mklfft/fft_flat_k_ffi.cc; zero `DftiCreateDescriptor` since
@@ -207,8 +209,7 @@ GATE = Gate(
     # DFTI code was deleted, so every CPU startup block named an engine the
     # translation unit no longer contained.  Name the ABI; let
     # LORRAX_DEBUG_PRINT name the library.
-    label={"cpu": "FFTW3-ABI host",
-           "CUDA": "cuFFT strided CUDA"},
+    label={"cpu": "FFTW3-ABI host"},
     resolved_msg={
         "cpu": ("[fft_ffi] flat-k 3-D FFTs -> FFTW3-ABI host FFI handler "
                 "({target}): O(N log N) FFT reading the dot-layout tile "
@@ -217,24 +218,19 @@ GATE = Gate(
                 "time by dlsym over the candidate ladder (see "
                 "LORRAX_FFTW3_SO and docs/architecture/ffi_layout.md §3), "
                 "and is NOT stated by this line."),
-        "CUDA": ("[fft_ffi] flat-k 3-D FFTs -> cuFFT strided CUDA FFI "
-                 "handler ({target}): cufftPlanMany64 advanced layout "
-                 "(istride=T, idist=1 — the stride-descriptor analog) "
-                 "reading the dot-layout tile in place; jnp.fft norm "
-                 "scales applied by a fused device kernel."),
     },
     refuse_platform_msg=(
         "LORRAX_FFT_FFI: the required FFI flat-k FFT backend cannot serve "
-        "this mesh — its devices are '{platform}', and backends exist for "
-        "cpu (the FFTW3 ABI) and CUDA (cuFFT strided) only."),
+        "this mesh — its devices are '{platform}'; this gate serves cpu (the "
+        "FFTW3 ABI) only, and CUDA meshes take the k-convolution router "
+        "(nvidia-mathdx)."),
     refuse_probe_msg=(
         "The required {label} backend is unavailable: FFI target "
         "'{target}' is unusable on platform '{platform}': {reason}  The "
         "FFI layer is REQUIRED (docs/architecture/decisions.md, "
         "2026-08-01); build/locate the library per "
         "docs/environment/overview.md (host: build_host.sh -> "
-        "liblorrax_ffi_host.so, selected by LORRAX_FFI_HOST_SO; CUDA: "
-        "build.sh -> liblorrax_ffi.so, LORRAX_FFI_SO)."),
+        "liblorrax_ffi_host.so, selected by LORRAX_FFI_HOST_SO)."),
 )
 
 def fft_ffi_mode() -> str:
@@ -854,6 +850,8 @@ def make_local_kfft_klead(mesh: Mesh, kgrid, *, kind: str, norm: str | None) -> 
             return y.reshape(x.shape)
         return _mathdx
     _require_plan_route()
+    if not _cpu_test_arm():
+        return make_local_flat_k_fft_ffi(kg, kind=kind, norm=norm)   # the host plan handler
 
     def _plan(x):
         _check_complex(x)

@@ -113,14 +113,14 @@ _CUDA_TARGET_SYMBOLS = {
     # the CPU prototype): common.fft_helpers issues ONE platform-agnostic
     # ffi_call per site and the lowering platform resolves the handler —
     # exactly the phdf5 same-target/different-symbol split.
-    "lorrax_mklfft_flat_k":         "CufftFlatKCudaFfi",
     # The NVIDIA k-convolution family on nvidia-mathdx (cpp/cufft/
     # kconv_mathdx_cuda_ffi.cc): cuFFTDx transforms, NVRTC-built per
     # (mode, grid, ns, context) and disk-cached.  CUDA-only; the ffi.fft router
     # returns the MKL plan route on cpu and never these targets (decisions.md
     # 2026-09-24).  The Sigma k-leading convolution, the BSE k-minor one and
-    # both transform-only modes replaced the cuFFT strided gw_conv and the
-    # direct-DFT conv_klead/conv_kminor handlers.
+    # both transform-only modes replaced the cuFFT strided flat_k/gw_conv
+    # handlers and the direct-DFT conv_klead/conv_kminor handlers; the
+    # flat-k transform (lorrax_mklfft_flat_k) is host-only now.
     "lorrax_mathdx_kconv_pair":     "KConvMathdxPairCudaFfi",
     "lorrax_mathdx_kconv_parent":   "KConvMathdxParentCudaFfi",
     "lorrax_mathdx_kconv_klead":    "KConvMathdxKleadCudaFfi",

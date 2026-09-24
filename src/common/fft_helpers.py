@@ -384,11 +384,6 @@ def make_sharded_fftn_3d(
 from ffi.mklfft import (  # noqa: E402  (re-export: see the block above)
     GATE,
     fft_ffi_enabled,
-    make_flat_k_fft_ffi as _make_flat_k_fft_ffi,
-)
-from ffi.fft import (  # noqa: E402
-    make_local_flat_k_fft_ffi as _make_local_flat_k_fft_ffi,
-    require_fft_ffi as _require_fft_ffi,
 )
 
 
@@ -412,8 +407,10 @@ from ffi.fft import (  # noqa: E402,F401  (re-exported front doors)
     KConvStored,
     make_kconv_klead,
     make_kconv_kminor,
+    make_kfft_klead,
     make_kfft_kminor,
     make_local_kconv_kminor,
+    make_local_kfft_klead,
     make_local_kfft_kminor,
 )
 
@@ -449,21 +446,25 @@ def make_flat_k_fft(
 
     ``spec`` is the ``PartitionSpec`` on the 3-D form
     ``(nkx, nky, nkz, *trail)``.  The three leading k-axes must be
-    replicated (``None``) so the batched per-rank FFT sees the full FFT
-    axis on every device.  ``out_spec`` must equal ``spec`` (the FFI
-    backend implements no post-FFT reshard).
+    replicated (``None``) so the per-rank transform sees the full k axis on
+    every device.  ``out_spec`` must equal ``spec`` (no post-FFT reshard).
 
     ``kind='ifftn'`` or ``'fftn'`` selects the direction.  ``norm``
     follows ``jnp.fft.*`` ('ortho', 'forward', 'backward' / None).
 
-    Always the platform FFI backend (announce-or-refuse inside; the
-    factory-time ``fft_ffi_enabled()`` read stays in every consumer's
-    kernel cache key — see ppm_tau_kernel).
+    The k-convolution router's k-leading transform
+    (:func:`ffi.fft.make_kfft_klead`): nvidia-mathdx on CUDA (measured 1.8-7.4x
+    faster than the cuFFT advanced-layout plan it replaced at the χ0/Σ
+    production tiles, runs/runtime/kconv_stage2_20260924/bench_flatk_v2.log),
+    the FFTW3-ABI flat-k plan handler on cpu.  ``LORRAX_FFT_FFI=0`` refuses.
     """
     if not fft_ffi_enabled():
         raise RuntimeError(GATE.off_refuse_msg)
-    return _make_flat_k_fft_ffi(mesh, kgrid, spec, kind=kind,
-                                norm=norm, out_spec=out_spec)
+    if out_spec is not None and tuple(out_spec) != tuple(spec):
+        raise ValueError(
+            f"the flat-k transform implements no post-FFT reshard (out_spec "
+            f"{out_spec} != spec {spec}); drop out_spec.")
+    return make_kfft_klead(mesh, kgrid, spec, kind=kind, norm=norm)
 
 
 def make_flat_k_ifftn(
@@ -500,11 +501,11 @@ def make_local_flat_k_fftn(
 ) -> Callable:
     """Device-local flat-k FFT for a caller already inside ``shard_map``.
 
-    This is the same required FFI kernel as :func:`make_flat_k_fftn`, without
-    its outer ``shard_map`` wrapper.  It exists for bounded local trailing-axis
-    slabs; callers must keep the complete k axis local.
+    The same router transform as :func:`make_flat_k_fftn`
+    (:func:`ffi.fft.make_local_kfft_klead`), without its outer ``shard_map``
+    wrapper.  It exists for bounded local trailing-axis slabs; callers must
+    keep the complete k axis local.
     """
     if not fft_ffi_enabled():
         raise RuntimeError(GATE.off_refuse_msg)
-    _require_fft_ffi(mesh)
-    return _make_local_flat_k_fft_ffi(kgrid, kind='fftn', norm=norm)
+    return make_local_kfft_klead(mesh, kgrid, kind='fftn', norm=norm)

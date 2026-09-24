@@ -551,8 +551,11 @@ if(LORRAX_CUFFT_ON)
         "${CMAKE_CURRENT_SOURCE_DIR}/common")
     target_compile_options(build_kconv_mathdx_cuda PRIVATE
         -Wall -Wextra)
+    # The CUDA FFT leg is the nvidia-mathdx k-convolution family only (the
+    # cuFFT strided flat-k handler was replaced 2026-09-24, measured).
+    # ponytail: the leg still probes/links libcufft and stamps itself "cufft";
+    # nothing calls cuFFT any more.  Rename/unlink with the next build review.
     list(APPEND LORRAX_FFI_SOURCES
-        cufft/fft_flat_k_cuda_ffi.cc
         $<TARGET_OBJECTS:build_kconv_mathdx_cuda>
     )
 endif()

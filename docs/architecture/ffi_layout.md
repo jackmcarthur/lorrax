@@ -139,7 +139,7 @@ its actual hash; it is not production attestation.
 | Service | Perlmutter (GPU leg + host leg) | Frontera |
 |---|---|---|
 | FFT (CPU) | `cray-fftw/3.3.10.11` | MKL's native FFTW3 export *(verified 2026-08-06, below)* |
-| FFT (GPU) | cuFFT (`cufftPlanMany64`) for the flat-k transform; **nvidia-mathdx** (cuFFTDx, NVRTC) for every k-axis convolution and k-minor transform | n/a on the CPU leg |
+| FFT (GPU) | **nvidia-mathdx** (cuFFTDx, NVRTC) for every k-axis transform and convolution; cuFFT is no longer called | n/a on the CPU leg |
 | GEMM | Cray LibSci CBLAS | MKL CBLAS |
 | Dense solvers | SLATE (GPU + host), cuSOLVERMp | ScaLAPACK (MKL), SLATE |
 | Parallel HDF5 | `cray-hdf5-parallel` + Cray MPICH | HDF5 + Intel MPI |
@@ -160,7 +160,7 @@ is a routine we are trusting without evidence.
 |---|---|---|---|---|---|
 | **3-D FFT** (in-`shard_map`) | XLA:GPU `fft` → **cuFFT** in jaxlib | XLA:CPU `fft` → **DUCC/Eigen** in XLA | none — `fft_helpers.local_fftn3`/`local_ifftn3` are bare `jnp.fft` aliases with **no FFI route**; `LORRAX_FFT_FFI` structurally cannot reach them | **(none)** | — |
 | **k-axis convolutions + k-minor transforms** (ζ fit, Σ, COHSEX, BSE) | CUDA: **nvidia-mathdx** cuFFTDx thread FFTs in one fused pass, NVRTC-built per k-grid from the wheel's headers, disk-cached. Host: the FFTW3-ABI plan handlers below | host plan handlers | none on CUDA by ruling (decisions.md 2026-09-24); a missing wheel refuses at startup (`GATE mathdx-headers`) | `tests/multi_device/kconv_router_p4.py` (every mode vs `np.fft`, red twins) | **PASS**, Perlmutter P4, 2026-09-24 (branch, not main) |
-| **flat-k FFT** (batched 3-D) | CUDA leg: **cuFFT** `cufftPlanMany64` + NVRTC. Host leg: FFTW3 ABI by `dlopen` → **cray-fftw** bare-metal; **nothing in-container** | **MKL**'s FFTW3 export, bound at `resolve_sym` stage 1 (MKL is already loaded via the ScaLAPACK link line, so the ladder never runs) | the whole `fftw3_candidates()` ladder: `$LORRAX_FFTW3_SO` → build-time `LORRAX_FFTW3_SO_HINT` → `libfftw3.so.3` → `libfftw3.so.mpi31.3` → `libmkl_rt.so` → `libfftw3.so`. On Frontera `libfftw3.so.3` **is** reachable (`/usr/lib64`, FFTW 3.3.2) and would win over `libmkl_rt.so` if MKL were not already resident | **GATE 5b** — zero `fftw` in `DT_NEEDED` (`build_ffi_host.sh`). Covers *load* time only | **PASS**, Perlmutter, measured 2026-08-06 |
+| **flat-k FFT** (batched 3-D) | CUDA leg: **nvidia-mathdx** k-leading transform (router mode 3; the cuFFT `cufftPlanMany64` handler was deleted 2026-09-24). Host leg: FFTW3 ABI by `dlopen` → **cray-fftw** bare-metal; **nothing in-container** | **MKL**'s FFTW3 export, bound at `resolve_sym` stage 1 (MKL is already loaded via the ScaLAPACK link line, so the ladder never runs) | the whole `fftw3_candidates()` ladder: `$LORRAX_FFTW3_SO` → build-time `LORRAX_FFTW3_SO_HINT` → `libfftw3.so.3` → `libfftw3.so.mpi31.3` → `libmkl_rt.so` → `libfftw3.so`. On Frontera `libfftw3.so.3` **is** reachable (`/usr/lib64`, FFTW 3.3.2) and would win over `libmkl_rt.so` if MKL were not already resident | **GATE 5b** — zero `fftw` in `DT_NEEDED` (`build_ffi_host.sh`). Covers *load* time only | **PASS**, Perlmutter, measured 2026-08-06 |
 | ↳ *which engine actually answered* | — | — | — | **GATE 8** (`gate_one_fftw.sh`) — **NOT ON THIS BRANCH**, see §3b | **no check** |
 | **Host band-block contraction** | **Cray LibSci** CBLAS | **MKL** CBLAS | LibSci exports no `cblas_?gemm_batch`, so the run-time `dlsym` picks the plain-`cblas_?gemm` loop; MKL has the batched entry. Also netlib/AOCL/OpenBLAS/BLIS/ATLAS are accepted as CBLAS providers | **GATE 2** — one LibSci flavour, no sequential/threaded mix. Which *entry* was chosen is **announced at run time, not gated** | **PASS**, Perlmutter (`seq=0 mp=2`), measured 2026-08-06 |
 | **Planned axis GEMM** | Full range: XLA:GPU `dot` → **cuBLAS**. Active range: local classic-**cuBLAS** FFI over pointer views, with 4 MiB XLA-owned workspace | Full range: XLA:CPU `dot`; active range: bounded JAX dot panels | CUDA active plans require `CublasLocalActiveRangeGemmFfi`; CPU needs no provider. Both keep K local and shard only output centroid axes | `services/distrib_la/tests/test_local_active_gemm_range.py` on a real P4 CUDA mesh and emulated P4 CPU mesh | branch evidence in `docs/dev/active_gemm_ranges.md`; not on main |
@@ -798,9 +798,13 @@ A new mode is added in three steps:
    the plan-route composition on cpu.
 
 There is no second NVIDIA path.  The plain flat-k transform
-(`make_flat_k_fft_ffi`, cuFFT advanced-layout plans) remains the χ₀/head/
-htransform route on CUDA until a measurement says the k-leading mathdx
-transform (mode 3) is faster at their shapes.
+(`common.fft_helpers.make_flat_k_fft`, the χ₀/head/htransform/Lorentz-Σ route)
+is the same router's mode 3 on CUDA since 2026-09-24: at the production local
+tiles it measured 1.8–7.4× faster than the cuFFT advanced-layout plan it
+replaced (CrI3 8×8 P4 G(τ) 12.6 → 5.6 ms, VI3 12×12 P16 G(τ) 41.2 → 15.6 ms,
+TaAs 8³ 45.0 → 6.1 ms; `runs/runtime/kconv_stage2_20260924/bench_flatk_v2.log`),
+so the cuFFT strided CUDA handler was deleted and `LORRAX_FFT_FFI` is a
+cpu-only gate.  On cpu the transform stays the FFTW3-ABI host handler.
 
 ### Parent-load ISDF pair convolution (2026-09-06)
 
