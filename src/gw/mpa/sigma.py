@@ -1088,10 +1088,15 @@ def _integrate_sigma_batches(
 
         # Band-replicated (axis) Green faces are cut once per window to its
         # bucketed band interval; the kernel for that width contracts them
-        # densely with no per-tau traced bound. Face carriers and bracketed
-        # (band-extrapolation) kernels keep the full carrier.
+        # densely with no per-tau traced bound. Face carriers and a real
+        # band-extrapolation partition (more than the one trivial bracket)
+        # keep the full carrier.
+        trivial_bracket = (not bracketed or (
+            len(brackets) == 1 and brackets[0][0] == 0
+            and (brackets[0][1] is None
+                 or brackets[0][1] >= int(psi_coh_xn.shape[3]))))
         band_step = (32 if (face_kwargs.get("layout") == "axis"
-                            and not bracketed and tau_kernel_factory is None)
+                            and trivial_bracket and tau_kernel_factory is None)
                      else None)
         kernels_by_width = {}
         window_widths = []

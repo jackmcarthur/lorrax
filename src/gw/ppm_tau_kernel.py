@@ -272,8 +272,11 @@ def _get_sigma_kij_kernel(
 
     def _g_from_selector(xn, yr, E, sel, E_min, E_max, ref, t, band_range=None):
         """Apply boolean identity masks or signed occupation weights without clipping."""
+        # A sliced window contracts its bands densely; the only bracket it
+        # admits is the trivial one (0, carrier), so no range is passed.
         options = dict(e_ref=ref, layout=layout, gemm=g_plan,
-                       k_unfold_plan=k_unfold_plan, band_range=band_range,
+                       k_unfold_plan=k_unfold_plan,
+                       band_range=None if sliced else band_range,
                        trim_zero_bands=not sliced, unfold=False)
         options["mask" if sel.dtype == jnp.bool_ else "band_weight"] = sel
         if energy_windows:
