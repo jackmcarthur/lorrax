@@ -22,6 +22,7 @@ import re
 import pickle
 import socket
 import time
+import zipfile
 
 from ffi import _services
 
@@ -400,7 +401,24 @@ def _rule_cache_lookup(
                     continue
                 if best is None or rule.node_count < best[0].node_count:
                     best = (rule, name)
-        except (EOFError, OSError, KeyError, ValueError) as exc:
+        except (zipfile.BadZipFile, EOFError) as exc:
+            # A CORRUPT archive (a torn write, a quota-truncated copy) is a
+            # miss, never a refusal: zipfile.BadZipFile is not an OSError, so
+            # it used to escape this loop and refuse every later run in the
+            # scope.  Rank 0 deletes it so the scope heals; a peer reading
+            # it concurrently also misses (or finds it gone: an OSError).
+            removed = ""
+            if process_rank() == 0:
+                try:
+                    os.unlink(path)
+                    removed = "; deleted by rank 0"
+                except OSError as unlink_exc:
+                    removed = f"; delete failed: {unlink_exc}"
+            warnings.append(
+                "WARNING sigma quadrature cache entry is corrupt and was "
+                f"treated as a miss: path={path} "
+                f"error={type(exc).__name__}: {exc}{removed}")
+        except (OSError, KeyError, ValueError) as exc:
             warnings.append(
                 "WARNING sigma quadrature cache entry is unreadable and "
                 "will not be used: "
@@ -453,6 +471,10 @@ def _rule_cache_store(directory, rule, noise_amplification):
                 roundoff_amplification=float(noise_amplification),
                 theta_deg=float(rule.theta_deg), rank=int(rule.rank),
                 seconds=float(rule.seconds))
+            # Durable before it becomes visible: without this a node loss
+            # after the rename can leave a torn archive under the final name.
+            handle.flush()
+            os.fsync(handle.fileno())
         os.replace(temporary, path)
     except OSError as exc:
         if temporary is not None:
@@ -769,6 +791,13 @@ def fit_sigma_box_specs(
                     cache_dir, fit["rule"], fit["roundoff_amplification"])
             if fit["built"]:
                 fit["cache_write_warning"] = stored[fit["rule_digest"]]
+    if process_count() > 1 and any(fit["built"] for fit in fits):
+        # ORDER the store before any rank's NEXT lookup.  Sector Sigma calls
+        # share one scope (eb19474d): without this a peer can look up the TT
+        # or CT windows before rank 0 has stored CC's builds, miss, and fit a
+        # different (within-eps) rule, so the plan would depend on rank
+        # timing.  ``fits`` is replicated, so every rank takes this or none.
+        all_gather_processes(np.asarray(0, np.int32))
     return _serve_from_plan(rows, fits, tolerance, cache_dir), fit_rows
 
 
