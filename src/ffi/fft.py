@@ -20,7 +20,8 @@ The Python half of the flat-k FFT handlers:
                                   handler it replaced was measured 1.8-7.4x
                                   slower at the production tiles and deleted.
 
-Full contract of the host service: ``docs/dev/flat_k_fft_service.md``.
+Contract: ``docs/architecture/services.md`` § ffi.fft; the k-convolution
+router: ``docs/architecture/ffi_layout.md`` §9.
 
 WHY the service exists: XLA:CPU's ``fft`` custom-call requires the
 transformed axes minor-most, so every ``dot`` (k-major flat) ↔ ``fft``

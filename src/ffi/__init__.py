@@ -42,7 +42,7 @@ def ffi_dial_key() -> tuple:
     dial (``LORRAX_FFT_FFI``, ``LORRAX_BANDS_GEMM_FFI``) at FACTORY time, so
     a kernel cache that omits the dials serves a stale backend after a
     mid-process flag flip (tests flip them; the service contract —
-    ``docs/dev/flat_k_fft_service.md`` — says the dial MUST be in every
+    ``docs/architecture/services.md`` § ffi.fft — says the dial MUST be in every
     consumer cache key).  This helper is the single owner of "which dials
     were live when this factory ran"; consumers fold the returned tuple into
     their cache keys instead of each re-listing the dials (and drifting when
