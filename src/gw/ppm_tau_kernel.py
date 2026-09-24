@@ -432,13 +432,6 @@ def get_shared_sigma_tau_kernel(
     process-wide incumbent cache: a compile-only measurement of the
     incumbent route on a run that never dispatches it must not leave its
     control executable behind for a later caller.
-
-    ``prepare_active_range(lo, hi)`` on the returned callable constructs an
-    uncached variant sharing this kernel's GEMM plan and spatial kernels. The
-    caller owns that variant's lifetime and must certify exact phase support
-    across the times it will use; distinct intervals can require distinct
-    compiles. It is attached only to resident-route kernels (``_sigma_kij is
-    None and w_synthesis is None``).
     """
     kgrid = tuple(int(x) for x in kgrid)
     if brackets is not None:
@@ -463,21 +456,10 @@ def get_shared_sigma_tau_kernel(
         k_unfold_plan=k_unfold_plan)
 
     def finish(kernel):
-        # One guard for both sides: main publishes the kernel and attaches its
-        # prepared-interval constructor; the landing route must NOT publish a
-        # kernel whose builder owns resident faces and an open reader, and a
-        # prepared variant is never published either.
-        if _sigma_kij is None and w_synthesis is None:
-            def prepare_active_range(lo, hi):
-                return get_shared_sigma_tau_kernel(
-                    mesh_xy=mesh_xy, kgrid=kgrid, brackets=brackets,
-                    layout=layout, face_shape=face_shape,
-                    face_band_extent=face_band_extent,
-                    k_unfold_plan=k_unfold_plan,
-                    _sigma_kij=sigma_kij.prepare_active_range(lo, hi))
-            kernel.prepare_active_range = prepare_active_range
-            if cache:
-                _sigma_shared_tau_kernel_cache[key] = kernel
+        # Never publish a kernel whose builder owns resident faces and an open
+        # reader, nor one built around a caller's spatial kernel.
+        if _sigma_kij is None and w_synthesis is None and cache:
+            _sigma_shared_tau_kernel_cache[key] = kernel
         return kernel
 
     @jax.jit
