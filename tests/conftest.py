@@ -864,6 +864,23 @@ def _run_session_case(tmp_path_factory, case_name, input_name, output_name):
     import pytest as _pytest
     harness.skip_unless_gpu(_pytest)
     case_dir = harness.REG / case_name
+    from core import rank_session
+    if rank_session._resolve_proc_count() > 1:
+        # PLAIN P4 PYTEST (tests/README.md "Process geometry", the core
+        # tier's launch): one pytest per rank.  Rank 0 stages ONE run dir
+        # and publishes its path; every rank's gw_jax child keeps its Slurm
+        # rank environment, so the four children are ONE 4-process driver
+        # on a 2x2 mesh — the geometry the multi-process services
+        # (cublasmp) require.  Four private copies would instead be four
+        # drivers joining one process group from four directories.
+        run_dir = rank_session.stage(case_dir, harness.copy_fixture)
+        res = rank_session.run_child(
+            lambda: harness.run_gw_jax(run_dir, input_name, platform="gpu"),
+            run_dir / input_name)
+        out = run_dir / output_name
+        assert out.exists(), f"session run wrote no {out}"
+        return _NS(run_dir=run_dir, input_name=input_name,
+                   output_name=output_name, stdout=res.stdout)
     run_dir = harness.copy_fixture(
         case_dir, tmp_path_factory.mktemp(f"{case_name}_session") / case_name)
     res = harness.run_gw_jax(run_dir, input_name)
