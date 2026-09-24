@@ -631,6 +631,30 @@ def test_sc_edge_pad_is_the_pad_of_the_state_that_sets_the_edge():
     assert grown < (near + 1.0) / RYD_TO_EV < far / RYD_TO_EV
 
 
+def test_sc_pad_does_not_cross_the_windows_own_state_selector():
+    """A bulk window's zero side stops where its selector puts it, not at the cap.
+
+    TaAs 4^3 metal SC (2026-09-24): val:bulk states lie above the 0.0276 Ry
+    state edge, but padding the nearest one by its 0.54 eV pad crossed zero
+    and the edge fell to the 5% zero-side cap (0.0013 Ry): a 14.6 Ry-tall
+    relative box that certified by 0.04% and was refused on a refit.
+    """
+    from gw.sigma_box_plan import _SC_ZERO_SIDE_CAP
+    eta, state_lo = 0.02, 0.0276
+    spec = make_sigma_box_spec(
+        name="val bulk", frequencies=(0.0, 1.0), states=(0.03, 0.5),
+        pole_stats=((0.01, 1.0, 0.0, 0.5),), pole_sign=-1.0, eta_ry=eta)
+    assert spec["kind"] == "sign_definite_positive"
+    unbounded = _sc_padded_box_spec(spec, eta)
+    assert unbounded["box"][0] == _SC_ZERO_SIDE_CAP * spec["box"][0]
+    spec["state_interval"] = (state_lo, np.inf)
+    bounded = _sc_padded_box_spec(spec, eta)
+    nearest_member = 0.0 + state_lo + 0.9 * 0.01
+    assert bounded["box"][0] >= 0.7 * nearest_member * (1 - 1e-12)
+    assert bounded["box"][0] > 10 * unbounded["box"][0]
+    assert bounded["box"][0] <= spec["box"][0]
+
+
 def test_states_drifting_within_their_pads_stay_inside_the_frozen_box():
     """The classification guarantee: no state inside its pad escapes."""
     rng = np.random.default_rng(7)
