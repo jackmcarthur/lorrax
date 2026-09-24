@@ -1170,11 +1170,17 @@ def pulay_nojit(
         x_opt = jnp.tensordot(alpha, Xw, axes=(0, 0))
         f_opt = jnp.tensordot(alpha, Fw, axes=(0, 0))
         if safeguard and fallback:
-            # Nonmonotone safeguard (Ouyang et al. 2023, no extra map): the
-            # last evaluation did worse than every residual in the window,
-            # so step from the best evaluated point instead.  The rejected
-            # pair stays in the history -- it is still valid secant data.
-            x_opt, f_opt = best
+            # Nonmonotone safeguard (after Ouyang et al. 2023; no extra map):
+            # the last evaluation did worse than every residual in the
+            # window, so the multisecant model failed there.  Take the
+            # two-point secant step between the best evaluated pair and the
+            # rejected one instead -- a line search along the failed step
+            # that costs nothing, has no damping constant, and cannot
+            # re-evaluate G(x_best).  The rejected pair stays in the history.
+            a2, _ = _solve_alpha_filtered(
+                _weighted(jnp.stack([best[1], f])))
+            x_opt = a2[0] * best[0] + a2[1] * x
+            f_opt = a2[0] * best[1] + a2[1] * f
         if print_fn is not None and safeguard:
             print_fn(f"  pulay step {it:02d}: window {n_used + 1}"
                      f"{' FALLBACK to best' if fallback else ''}")
