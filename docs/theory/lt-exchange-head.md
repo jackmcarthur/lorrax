@@ -107,3 +107,19 @@ pointwise evaluation along a finite-q band path.
 The dipole includes the nonlocal-pseudopotential commutator and carries its
 velocity-sign provenance in `dipole.h5`. The tensor follows the Cartesian
 convention in [The S-tensor convention](s-tensor-convention.md).
+
+The deck key `head_minibz_average` selects the cell average in the
+exciton-band driver. `bse.vq_interp.minibz_head_vlr(..., moment=True)`
+evaluates \(\mathsf M\) per sampled \(\mathbf Q\) on the same mini-BZ
+draws as the scalar \(\langle v\rangle\). `bse.exciton_bands` passes it to
+the BSE matvec (`bse.bse_stack_matvec`, `head_tensor=True`), which adds
+
+$$
+K^{\mathrm{head}}_{tt'}=\frac1{N_k}\,\overline{d_a(t)}\,\mathsf M_{ab}\,d_b(t')
+$$
+
+as a rank-three term over transitions, beside the ISDF exchange term. Per
+matvec it costs \(O(N_t)\) for \(N_t\) transitions, against the
+exchange body's \(O(N_tN_\mu)\). It cannot live in the centroid basis:
+there it would need \(\partial_q\zeta_\mu\) and would break the
+\(\zeta\sqrt v\) factorisation of \(V\).
