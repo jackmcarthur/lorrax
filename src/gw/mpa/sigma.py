@@ -1645,8 +1645,7 @@ def compute_sigma_c_mpa_omega_grid(
     shared_pole = sigma_w_model == "shared_pole"
     fixed_pole_support_ry = None
     if shared_pole:
-        from file_io.shared_pole_store import validate_shared_pole_model
-        from file_io.slab_io import SlabIO
+        from file_io.shared_pole_store import open_shared_pole_model, validate_shared_pole_model
         with timing.section("sigma.model_validate"):
             ledger = validate_shared_pole_model(
                 fit_src, expected_identity=fit_identity, mesh_xy=mesh_xy,
@@ -1706,7 +1705,7 @@ def compute_sigma_c_mpa_omega_grid(
     # (audit A1; hdf5_owner enforces it).  The context manager is the
     # release path: a refusal from the planner or the executor must still
     # close the handle on every rank.
-    with (SlabIO(fit_src, mode="r", mesh=mesh_xy) if shared_pole else
+    with (open_shared_pole_model(fit_src, mesh_xy=mesh_xy) if shared_pole else
           fit_src if isinstance(fit_src, MemoryPoleSource) else
           open_pole_reader(fit_src, mesh_xy=mesh_xy)) as reader:
         # One bounded extrema census serves both routes.  In particular, the

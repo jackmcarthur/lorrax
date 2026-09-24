@@ -2,7 +2,9 @@
 
 Unequal C/T centroid extents, independent CC/TT/CT poles, nonreciprocal q,
 fractional occupations and nonzero W_infinity-V. The direct band/q/pole
-sum is confined to this small harness.
+sum is confined to this small harness. ``resident`` hands Sigma the same
+models as device-resident ResidentSectorModel objects; main() requires that
+Sigma to equal the file route's bit for bit.
 """
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,7 +15,7 @@ import sys
 import time
 
 
-def check(mesh, root, layout):
+def check(mesh, root, layout, resident=False):
     import jax
     import jax.numpy as jnp
     import numpy as np
@@ -31,7 +33,7 @@ def check(mesh, root, layout):
     print('sector Sigma source:', production.__file__,flush=True)
     from file_io import shared_pole_store as store
     from symmetry_maps import SymMaps, QirrTables, centroid_source_map_and_wrap
-    assert mesh.size == jax.process_count() == 4
+    assert mesh.size == 4
     rng=np.random.default_rng(1717)
     nmu_spec,mun_spec=psi_specs(layout)
     nk,nb,ns=4,4,4
@@ -85,7 +87,8 @@ def check(mesh, root, layout):
         carrier=(count+1)//2*2
         stored_factor=np.pad(factor,((0,0),(0,0),(0,0),(0,carrier-count)))
         stored_p=np.pad(p*p,((0,0),(0,carrier-count)),constant_values=1.0)
-        path=root/f'{name}.h5'
+        path=(store.ResidentSectorModel(mesh,label=str(root/f'{name}.h5')) if resident
+              else root/f'{name}.h5')
         header=store.write_shared_pole_model(path,
             put(bases[which].pack_host(stored_factor,axis=1),P(None,'x',None,'y')),
             put(stored_p),np.full(nk,count,np.int64),q_span=(0,nk),meta=meta,
@@ -113,6 +116,7 @@ def check(mesh, root, layout):
         identity=identity,mesh_xy=mesh,photon_layout=photon_layout,mu_bases=tuple(bases))
     zero=jnp.zeros_like(packed);samples=jnp.stack((zero,zero),axis=1)
     store.write_shared_pole_bank(bank,q_span=(0,nk),sample_span=(0,2),Wc=samples,dWc_ds=samples,
+        Wc_mirror=samples,dWc_mirror_ds=samples,
         M0=zero,M1=zero,M2=zero,M3=zero,constant=packed,meta=meta,expected_identity=identity,mesh_xy=mesh)
     handle=store.write_shared_pole_sector_manifest(root/'manifest.json',models=models,
         bank=dict(path=bank),identity=identity,receipts=dict(scope='synthetic oracle'),mesh_xy=mesh)
@@ -155,7 +159,9 @@ def check(mesh, root, layout):
     error=float(np.max(abs(got-expected)))
     scale=float(np.max(abs(expected)))
     assert error < 3e-4*scale+1e-9,(error,scale)
-    return dict(status='PASS',layout=layout,consumer_wall_s=consumer_wall_s,
+    if resident:
+        assert all(model[0].header_json is None for model in models.values()),'Sigma releases resident models'
+    return got,dict(status='PASS',layout=layout,resident=resident,consumer_wall_s=consumer_wall_s,
         max_absolute_error_ry=error,reference_max_ry=scale,
         constant_max_ry=float(abs(instantaneous).max()),
         frequency_half_max_ry=[float(abs(x).max()) for x in halves],
@@ -173,12 +179,17 @@ def main():
     from common.collectives import resolve_mesh
     import jax
     mesh=resolve_mesh()
+    assert jax.process_count() == 4
     layouts=('face','axis') if args.layouts=='both' else (args.layouts,)
     results={}
     for layout in layouts:
         root=args.output.parent/layout if len(layouts)>1 else args.output.parent
-        root.mkdir(parents=True,exist_ok=True)
-        results[layout]=check(mesh,root,layout)
+        (root/'resident').mkdir(parents=True,exist_ok=True)
+        got,results[layout]=check(mesh,root,layout)
+        held,row=check(mesh,root/'resident',layout,resident=True)
+        import numpy as np
+        assert np.array_equal(got,held),'resident sector models must give the file route Sigma bit for bit'
+        results[layout+'_resident']=dict(row,bitwise_equal_to_files=True)
     result=dict(status='PASS',layouts=results,job=os.environ.get('SLURM_JOB_ID'),
                 step=os.environ.get('SLURM_STEP_ID'))
     if jax.process_index()==0:

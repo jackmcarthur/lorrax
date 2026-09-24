@@ -2,7 +2,7 @@
 
 
 def check_sector_constructor(mesh, root, *, linalg="local", parents=16, return_observables=False,
-                             resident=False):
+                             resident=False, model_files=False):
     from types import SimpleNamespace
     import os
     import numpy as np
@@ -19,7 +19,7 @@ def check_sector_constructor(mesh, root, *, linalg="local", parents=16, return_o
     from file_io import shared_pole_store as store
     from file_io.slab_io import SlabIO
 
-    run=root/f"constructor_{os.environ['SLURM_STEP_ID']}_{linalg}{'_'+resident if resident else ''}"
+    run=root/f"constructor_{os.environ['SLURM_STEP_ID']}_{linalg}{'_'+resident if resident else ''}{'_files' if model_files else ''}"
     rank0_transaction(run,stage='plant.directory',write=lambda:run.mkdir())
     rotation=np.eye(3,dtype=np.int32)[None]
     sym=SimpleNamespace(sym_matrices=rotation,translations=np.zeros((1,3)),
@@ -123,16 +123,28 @@ def check_sector_constructor(mesh, root, *, linalg="local", parents=16, return_o
         dWc_mirror_ds=packed(np.stack([a[1] for a in mirrors],axis=1),True),
         constant=packed(u-v),**{f'M{k}':packed(m) for k,m in enumerate(moments)},
         meta=meta,expected_identity=identity,mesh_xy=mesh)
-    result=construct_sector_poles(bank,meta,SimpleNamespace(backend=SimpleNamespace(linalg=linalg)),
-                                  mesh_xy=mesh,output=str(run/'model.h5'))
+    # Sector models stay on the devices for Sigma whenever they fit; the file
+    # arm forces the fallback so the two routes can be compared bit for bit.
+    import gw.shared_pole_sectors as sectors_module
+    admission=sectors_module._sector_model_residence
+    if model_files:
+        sectors_module._sector_model_residence=lambda *a,**k:(None,dict(residence='file',reason='test file arm'))
+    try:
+        result=construct_sector_poles(bank,meta,SimpleNamespace(backend=SimpleNamespace(linalg=linalg)),
+                                      mesh_xy=mesh,output=str(run/'model.h5'))
+    finally:
+        sectors_module._sector_model_residence=admission
     assert _contiguous_q_spans([4,1,3,2,9,9],5)==((1,5,(1,3,2,0)),(9,10,(4,)))
     rounds=[row for row in result['q_receipts'] if 'held' in row]
     assert all(row['execution']==('face' if linalg=='distributed' else 'local') for row in rounds)
     if linalg=='distributed':
         assert len(rounds)==1 and len(rounds[0]['parents'])==nq
     handle=result['handle']
+    models={name:sector['path'] for name,sector in handle['sectors'].items()
+            if isinstance(sector['path'],store.ResidentSectorModel)}
+    assert (result['model_residence']['residence']=='file')==model_files and len(models)==(0 if model_files else 4)
     manifest=store.validate_shared_pole_sector_manifest(handle['path'],expected_identity=identity,
-        mesh_xy=mesh,capacity=meta.shared_pole_capacity)
+        mesh_xy=mesh,capacity=meta.shared_pole_capacity,resident=models)
     assert manifest['digest']==handle['digest']
     treatment_rows=[row for row in result['q_receipts']
                     if row.get('pole_treatment') is not None]
@@ -146,10 +158,21 @@ def check_sector_constructor(mesh, root, *, linalg="local", parents=16, return_o
     if linalg=='local' and parents>=4:
         assert all(any(batch['hi']-batch['lo']>1 for batch in headers[sector]['batches'])
                    for sector in ('CC','TT','CT_C','CT_T'))
-    factors={}
+    factors={};reads={}
     for sector,family in (('CC',0),('TT',1),('CT_C',0),('CT_T',1)):
-        with SlabIO(handle['sectors'][sector]['path'],mode='r',mesh=mesh) as io:
-            b,_,poles,k=store.read_shared_pole_faces(io,(0,nq),meta=meta,header=headers[sector],basis=bases[family])
+        header=headers[sector]
+        with store.open_shared_pole_model(handle['sectors'][sector]['path'],mesh_xy=mesh) as io:
+            b,y,poles,k=store.read_shared_pole_faces(io,(0,nq),meta=meta,header=header,basis=bases[family])
+            census=store.read_shared_pole_census(io,header=header,capacity=meta.shared_pole_capacity)
+            window=store.read_shared_pole_faces(io,(1,nq),meta=meta,header=header,basis=bases[family],
+                orientations=('y',),column_span=(1,max(1,header['Kmax'])))
+        # Every Sigma read (both faces, census, a column window) in its layout;
+        # the file and resident routes must agree bit for bit.
+        for key,array in dict(x=b,y=y,poles=poles,k=k,census=census[0],window=window[1]).items():
+            layout=getattr(array.sharding,'spec',type(array.sharding).__name__)
+            host=gather_to_host(array) if key in ('x','y','window') else jax.device_get(array)
+            reads[f'{sector}_{key}_{layout}']=np.asarray(host)
+        reads[f'{sector}_digest']=np.frombuffer(header['digest'].encode(),np.uint8)
         # Tiny oracle only: production never gathers a factor panel.
         factors[sector]=(gather_to_host(b).reshape((nq,-1,b.shape[-1])),np.asarray(poles),np.asarray(k))
     errors={};observables={}
@@ -181,14 +204,16 @@ def check_sector_constructor(mesh, root, *, linalg="local", parents=16, return_o
     assert bool(jnp.all(pair[0][1]==pair[1][1])) and bool(jnp.all(pair[0][2]==pair[1][2]))
     receipt=dict(name='production_sector_constructor_manifest',held_W_relative=errors,
                  parents=nq,manifest=handle['path'],linalg=linalg,resident=resident,
+                 model_residence=result['model_residence']['residence'],
                  asymmetric_endpoint_loss_refused=True)
-    return (receipt,observables) if return_observables else receipt
+    return (receipt,dict(observables,**reads)) if return_observables else receipt
 
 
 def main():
     import argparse
     import json
     import os
+    import numpy as np
     from pathlib import Path
     from runtime import initialize_communicator_stack, finalize_process
     parser=argparse.ArgumentParser()
@@ -202,9 +227,20 @@ def main():
     rows=run_extent_span_checks(mesh)
     if jax.process_index()==0:
         print(json.dumps(dict(status='RETAINED_SPAN_PASS',checks=rows)),flush=True)
-    rows.append(check_sector_constructor(mesh,args.output.parent))
-    rows.append(check_sector_constructor(mesh,args.output.parent,resident="device"))
-    rows.append(check_sector_constructor(mesh,args.output.parent,resident="pinned_host"))
+    # File bank + file models is the reference; every resident route must
+    # hand Sigma the same reads and digests bit for bit.
+    arms=[dict(model_files=True),dict(),dict(resident="device"),dict(resident="pinned_host")]
+    reference=None
+    for arm in arms:
+        row,observed=check_sector_constructor(mesh,args.output.parent,return_observables=True,**arm)
+        if reference is None:
+            reference=observed
+        else:
+            assert observed.keys()==reference.keys(),arm
+            for key in reference:
+                assert np.array_equal(observed[key],reference[key]),(arm,key)
+            row['bitwise_equal_to_file_models']=True
+        rows.append(row)
     result=dict(status='PASS',checks=rows,job=os.environ.get('SLURM_JOB_ID'),
         step=os.environ.get('SLURM_STEP_ID'),
         scope='P4 signed sector public constructor and authenticated stores; unequal parent coefficient spans; no production deck or integrated Sigma')

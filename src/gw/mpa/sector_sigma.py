@@ -351,15 +351,18 @@ def compute_sector_sigma(handle, families, bases, meta, mesh_xy, *,
     occupation state and fixed-rule sessions remain owned by the caller.
     The scalar charge entry is unchanged. No model is kept across SC maps.
     """
-    from file_io.slab_io import SlabIO
-    from file_io.shared_pole_store import validate_shared_pole_sector_manifest
+    from file_io.shared_pole_store import (ResidentSectorModel, open_shared_pole_model,
+                                           validate_shared_pole_sector_manifest)
     from .sigma import compute_sigma_c_mpa_omega_grid
     if handle.get('representation')!='sector-ordered-ph':
         raise ValueError('GATE shared_pole_sectors: missing ordered sector handle')
     if families[1] is None or len(bases)!=2:
         raise ValueError('GATE shared_pole_sectors: both endpoint families are required')
+    resident={name:sector['path'] for name,sector in handle['sectors'].items()
+              if isinstance(sector['path'],ResidentSectorModel)}
     manifest=validate_shared_pole_sector_manifest(handle['path'],
-        expected_identity=handle['identity'],mesh_xy=mesh_xy,capacity=meta.shared_pole_capacity)
+        expected_identity=handle['identity'],mesh_xy=mesh_xy,capacity=meta.shared_pole_capacity,
+        resident=resident)
     for key in ('digest','sectors','constant'):
         if manifest[key]!=handle[key]:
             raise ValueError(f'GATE shared_pole_sector_identity: stale handle {key}')
@@ -379,7 +382,7 @@ def compute_sector_sigma(handle, families, bases, meta, mesh_xy, *,
                 # All serial metadata authentication precedes collective file
                 # opens. Diagonal sectors share the already-open first reader.
                 other=(reader if names[0]==names[1] else stack.enter_context(
-                    SlabIO(sectors[names[1]]['path'],mode='r',mesh=mesh_xy)))
+                    open_shared_pole_model(sectors[names[1]]['path'],mesh_xy=mesh_xy)))
                 builder=sector_synthesis((reader,other),pair,(bases[a],bases[b]),
                     (families[a],families[b]),freq,meta,mesh_xy)
                 bound.append(builder)
@@ -401,6 +404,12 @@ def compute_sector_sigma(handle, families, bases, meta, mesh_xy, *,
                 currents[channel]=(shell if currents[channel] is None
                                    else currents[channel]+shell)
             total=value if total is None else replace(total,sigma_c_kij=total.sigma_c_kij+value.sigma_c_kij)
+    # Resident models are read once per map: release them and their stage.
+    for model in resident.values():
+        model.release()
+    if handle.get('model_stage'):
+        ledger=meta.shared_pole_capacity
+        ledger.live_stages=tuple(s for s in ledger.live_stages if s!=handle['model_stage'])
     constant=instantaneous_sector_sigma(handle['constant'],families,bases,meta,mesh_xy,
         occupation_state=options.get('occupation_state'),
         return_components=on_shell is not None)
