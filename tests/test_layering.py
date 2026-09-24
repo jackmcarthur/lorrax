@@ -184,7 +184,7 @@ _L3_MODULES = frozenset({
 #: ``zeta_loader`` is DELIBERATELY NOT HERE.  Being a service says nothing
 #: about a level; it knows about q-points, centroids and ζ, which is physics,
 #: so it takes the L1 default that ``file_io.zeta_loader`` always had
-#: (docs/architecture/layers.md:163 — format readers are L1, only the
+#: (docs/architecture/layers.md §1 and §4 — format readers are L1, only the
 #: transport ``slab_io``/``_slab_io_ffi``/``paths`` below them is L3).  The
 #: default is silent, so this note is where the decision is recorded.
 #:
@@ -231,7 +231,7 @@ _L2_MODULES = frozenset({
 # production importer — ``gw.minimax_screening`` — and it is repointed at the
 # door in the same commit, so there was nothing for a shim to bridge.
 # ``common.cholesky_2d`` was here.  It is ``distrib_la``'s ``native2d``
-# backend now, so the L2-vs-L3 conflict layers.md:196-200 records
+# backend now, so the L2-vs-L3 conflict layers.md once recorded
 # (blocked Cholesky is mathematics, but it is distributed mathematics)
 # dissolved by extraction rather than by a ruling: it left src/ entirely,
 # and inside the service it is L3 like the rest of the package.

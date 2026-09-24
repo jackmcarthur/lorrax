@@ -523,7 +523,7 @@ def compute_s_tensor_contrib_at_q0(
     operator is built at.  The tree's canonical S-tensor is the **Cartesian
     q²-coefficient** ``S_ab`` with ``χ_{00}(q→0) = q_a S_ab q_b`` — see
     ``common.chi_from_dipole`` for the statement of that convention and
-    ``docs/theory/s_tensor_convention.md`` for both.  ``run_sternheimer``
+    ``docs/theory/s-tensor-convention.md`` for both.  ``run_sternheimer``
     converts (halve, then ``B⁻¹ · H · B⁻ᵀ``) at the write site, so
     ``s_tensor_q0`` on disk is canonical and this function's raw output
     never leaves the driver.  Do not hand this array to a reader of
@@ -1428,7 +1428,7 @@ def run_sternheimer(
         S_per_k.block_until_ready()
         S_hess_crys = prefactor_st_val * np.asarray(jnp.sum(S_per_k, axis=0))
         # ── Canonicalise to the Cartesian q²-coefficient ──────────────────
-        # ``s_tensor_convention`` (docs/theory/s_tensor_convention.md): the
+        # ``s_tensor_convention`` (docs/theory/s-tensor-convention.md): the
         # ONE S-tensor representation in this tree is the Cartesian
         # q²-coefficient S_ab with  χ_{00}(q→0) = q_a S_ab q_b  (q in
         # Cartesian 1/bohr), which is what ``common.chi_from_dipole.

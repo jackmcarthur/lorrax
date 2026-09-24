@@ -205,8 +205,10 @@ def band_in_occupation_window(weight, weight_floor):
     """``abs(weight) > weight_floor`` — the one band-inclusion predicate.
 
     MAGNITUDE, NEVER A ONE-SIDED CUT.  :attr:`OccupationState.f_kn` is never
-    clipped (MP1's overshoot beyond [0, 1] is part of the configured
-    quadrature — see :func:`mp1_occupations`), so a band just above μ carries
+    clipped.  Metals now take Fermi-Dirac occupations (GATE
+    metal_occupations_fermi_dirac), whose weights lie in [0, 1]; under an MP1
+    state, whose overshoot beyond [0, 1] is part of its quadrature (see
+    :func:`mp1_occupations`), a band just above μ carries
     a NEGATIVE occupied-branch weight, down to about **-0.0355** at the MP1
     lobe minimum — seven times the 0.005 floor the default threshold sets.
     ``weight > floor`` would silently discard every one of them; the exact

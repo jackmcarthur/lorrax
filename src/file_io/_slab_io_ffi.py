@@ -179,8 +179,9 @@ def _announce_legacy_introspect(path: str) -> None:
     no such entry point, so a read-only handle still falls back to a
     serial-h5py open of the same path — legal, counted by
     ``file_io.hdf5_owner``, and exactly the cohabitation the metadata
-    entry points exist to retire.  Announce-or-refuse: the run does not
-    get to take the old route silently.
+    entry points exist to retire.  A writable handle refuses instead
+    (``_introspect_dataset``); on a read-only one the fallback is forensic
+    detail, so this receipt prints under ``LORRAX_DEBUG_PRINT`` only.
     """
     if path in _LEGACY_INTROSPECT_ANNOUNCED:
         return

@@ -3,7 +3,7 @@
 A single ``state → state`` step :func:`gw_iteration_map` and a small
 Python-loop driver :func:`run_self_consistency` that wraps it.  The
 state is :class:`SCState` carrying ``H_qp_dft_mnk`` in the **original
-DFT basis** (so the iteration carry has a fixed coordinate system; rcrop
+DFT basis** (so the iteration carry has a fixed coordinate system;
 Anderson mixing composes meaningfully).  Every iteration:
 
 1. Diagonalize ``H_qp_dft`` → ``(E_qp, U_qp)`` where
@@ -17,7 +17,7 @@ Anderson mixing composes meaningfully).  Every iteration:
    ``H_qp_dft = kin_ion_dft + (V_H + Σ_xc)_dft``.
 
 The iteration map is a pure function: ``state → state``.  The body has
-no closure capture of mutable bundles; it composes trivially with rcrop
+no closure capture of mutable bundles; it composes trivially with
 Anderson mixing or future ``jax.lax.scan`` migration.
 
 Active / inactive partition
@@ -857,8 +857,8 @@ def make_initial_state_from_qp_rotations(
     Hamiltonian ``U diag(E) U^H`` is imported; an SC companion also continues
     its accepted protected identities and frozen active scissor law.  The
     selected mean-field WFN, pristine kinetic/ionic operator, current
-    occupation solve, sum-band-tail refit, fixed quadrature session and rCROP
-    history remain owned by the new run.
+    occupation solve, sum-band-tail refit, fixed quadrature session and
+    Anderson history remain owned by the new run.
     """
     from file_io.qp_wfn import authenticate_qp_rotations_source_wfn
     from file_io.restart_bundle import (
@@ -923,7 +923,7 @@ def make_initial_state_from_qp_rotations(
         "  SC initial Hamiltonian: external compact QP seed "
         f"{artifact_path}; authenticated original DFT basis; "
         "seed-only U diag(E) U^H. Occupations, DFT tail, reference "
-        "operators, quadrature and rCROP history belong to this new run; "
+        "operators, quadrature and Anderson history belong to this new run; "
         + ("protected identities and frozen active scissor continue from "
            "the authenticated companion."
            if seed_policy is not None else
@@ -2933,8 +2933,8 @@ def _classify_sc_partition(
 ) -> tuple[BandPartition, np.ndarray, np.ndarray, float, bool]:
     """Assign DFT identities and resolve the one SC partition policy.
 
-    The external-Hamiltonian seed calls this before rCROP constructs its
-    metric. Map 0 then reuses that current decision; the diagonal DFT seed
+    The external-Hamiltonian seed calls this before the accelerator
+    constructs its metric. Map 0 then reuses that current decision; the diagonal DFT seed
     retains its historical map-0 rebuild with DFT hysteresis. The returned
     frozen flag also owns whether the output scissor may promote a frontier.
     """
@@ -4432,8 +4432,8 @@ def _apply_scissor_partition_policy(
             _, frontier_kn = band_classes.masks(retained_kn.shape)
         else:
             # IDENTITY SPACE, AND ONLY A REAL CROSSING.  ``retained_kn`` is a
-            # ``(k, DFT identity)`` mask -- the carry's own basis (pitfall 18
-            # of docs/self_consistency.md) -- so the frontier it is compared
+            # ``(k, DFT identity)`` mask -- the carry's own basis
+            # (docs/self_consistency.md §2) -- so the frontier it is compared
             # against must be one too.  The historical fallback named the two
             # sorted COLUMNS ``[n_occ - 1, n_occ]``; a crossing changes which
             # identity sits in a column, so the promoted identity followed the
@@ -4913,7 +4913,7 @@ def _sc_map_gain_for_call(
         sigma_result, "sigma_c_at_dft_diag_ev", None)
     # Static self-consistent modes have no dynamic Sigma-c table.  Preserve
     # their historical path; this diagnostic is defined for the dynamic
-    # QSGW maps studied in pitfall 13.
+    # QSGW maps.
     if sigma_on_shell is None:
         return None, None
     e_now = np.asarray(e_input_ev, dtype=np.float64)
@@ -5019,7 +5019,8 @@ def _write_sc_eqp_snapshot(
     The QP column is ``eigvalsh(F(H_in))``.  The active-band and sum-band
     scissor are the same input law used to build this map's chi/W/Sigma;
     recording both ranges makes the closure across ``b3`` auditable.
-    rCROP trial outputs are useful diagnostics but are not accepted iterates.
+    (Under the retired two-evaluation rCROP, trial outputs were diagnostics,
+    not accepted iterates.)
     The sibling ``eqp1_iterNNNN.dat`` is the BGW-shaped, output-only
     linearization ``E_eval + Z * (eqp0_map - E_eval)`` using the central
     difference on this map's retained Sigma grid.  The SC map never reads Z,
@@ -5033,8 +5034,8 @@ def _write_sc_eqp_snapshot(
 
     ``rms_ev`` / ``rms2_ev`` are the historical output-vs-previous-output
     diagnostics and they are stamped as such, now WITH the previous call's
-    role.  That role is the whole reason the old stamp misled: under rCROP
-    the preceding call alternates trial / accepted, and a trial step sits
+    role.  That role is the whole reason the old stamp misled: under the
+    retired rCROP the preceding call alternated trial / accepted, and a trial step sits
     near its accepted neighbour by construction, so the number understates
     the accepted-iterate residual.  MEASURED 2026-08-14 by re-analysing an
     accepted MPA QSGW run's retained snapshots
@@ -5841,7 +5842,7 @@ def _run_anderson(
         E_new = np.asarray(eigvalsh_kshard(state_out.H_qp_dft)) * RYD_TO_EV
         # THE CRITERION: the fixed-point residual of THIS call, output
         # against that same call's input.  Not the difference between
-        # successive accepted iterates -- under rCROP the accepted
+        # successive accepted iterates -- under Anderson the accepted
         # iterate is a mixed combination of the history, so that
         # difference can be driven small by damping while F still has no
         # fixed point.  ||F(H) - H|| makes no reference to the iteration
@@ -5880,8 +5881,8 @@ def _run_anderson(
             call_index=call_index, role=role, rms_ev=rms, rms2_ev=rms2,
             # NAMING THE PREVIOUS CALL'S ROLE IS THE FIX.  ``rms`` is
             # measured against ``_e_history[-1]``, i.e. the immediately
-            # preceding MAP CALL, which under rCROP alternates trial and
-            # accepted.  A trial step sits near its accepted neighbour by
+            # preceding MAP CALL, which under the retired rCROP alternated
+            # trial and accepted.  A trial step sits near its accepted neighbour by
             # construction, so this pair understates the accepted-iterate
             # residual (measured ~19x on the 2026-08-14 MPA QSGW run).  The
             # criterion is stamped beside it from ``_verdict``.

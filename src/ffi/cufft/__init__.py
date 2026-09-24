@@ -47,9 +47,9 @@ def __getattr__(name: str):
     not here, but only if they read it."""
     if name in _REDIRECT:
         raise AttributeError(
-            f"ffi.cufft has no {name!r}: the cuFFT handlers register the "
-            f"SAME XLA target strings as the host MKL-DFTI handlers, so ONE "
-            f"platform-agnostic wrapper serves both platforms.  Import it "
-            f"from ffi.fft instead (`from ffi.fft import {name}`) — "
-            f"it lowers to cuFFT on a CUDA mesh.  See ffi/cufft/__init__.py.")
+            f"ffi.cufft has no {name!r}: the k-convolution router in "
+            f"ffi.fft serves both platforms (nvidia-mathdx on CUDA, the "
+            f"FFTW3-ABI host handler on cpu).  Import it from ffi.fft "
+            f"instead (`from ffi.fft import {name}`).  See "
+            f"ffi/cufft/__init__.py.")
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

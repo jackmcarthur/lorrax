@@ -1056,14 +1056,14 @@ _DEFAULTS = {
     #   1. EQUIVALENCE, measured on the undamped plain fixed point
     #      (``x_{n+1} = F(x_n)``, then still selectable as
     #      ``sc_accelerator = linear`` with ``sc_mixing = 1``; that
-    #      spelling is now refused by GATE sc_accelerator_rcrop_only and
-    #      the measurement stands as history): the on and off arms agree
+    #      spelling is now refused by GATE sc_accelerator_anderson_only
+    #      and the measurement stands as history): the on and off arms agree
     #      to **1e-6 meV** -- the ``%15.9f`` print floor -- on E_QP at
     #      EVERY iterate and in the final eqp0/eqp1, with identical k
     #      coordinates.  The map is exactly k-set invariant, so the two
     #      arms have the same fixed point.
     #
-    #   2. THE TRAJECTORY IS NOT, under rCROP.  The same pair diverges to
+    #   2. THE TRAJECTORY WAS NOT, under the retired rCROP.  The same pair diverged to
     #      24.45 meV by map call 5 and 113.3 meV in the final eqp0.  That
     #      is not a defect: rCROP's least-squares mixing minimises a
     #      residual norm summed over the loop's OWN k-set, so on the star
@@ -1289,13 +1289,10 @@ _DEFAULTS = {
     # New input files should set ``compute_mode`` explicitly:
     #   "x_only" | "cohsex" | "gn_ppm" | "hl_ppm" | "mpa".
     #
-    # ``mpa`` — the multipole-W ansatz, the owner's "FF" — PARSES TODAY AND
-    # REFUSES TO RUN TODAY.  Its Σ stage has not landed, so the driver
-    # stops at entry naming the mode rather than falling through to a
-    # plasmon-pole run; ``auto`` never infers it, and no legacy flag
-    # combination reaches it.  See ``UNIMPLEMENTED_MODES`` beside the enum
-    # for why the value ships ahead of the kernels, and the ``ComputeMode``
-    # docstring for why it is spelled ``mpa`` rather than ``full_freq``.
+    # ``mpa`` — the multipole-W ansatz, the owner's "FF" — runs end to end;
+    # ``auto`` never infers it, and no legacy flag combination reaches it.
+    # See the ``ComputeMode`` docstring for why it is spelled ``mpa`` rather
+    # than ``full_freq``.
     "compute_mode": "auto",
     # ``qp_solver`` is the orthogonal axis describing how QP energies are
     # extracted from Σ (see the ``QPSolver`` enum).  ``"auto"`` resolves
@@ -1341,16 +1338,9 @@ _DEFAULTS = {
     # wired for ALL modes (mode-agnostic sigma_dispatch), not just COHSEX.
     "self_consistent": False,
     # Self-consistency loop knobs (read only when qp_solver=self_consistent).
-    # Promoted from the LORRAX_SC_* env vars (2026-07-08); the envs are
-    # still honored as deprecated overrides.
-    # rCROP spends TWO map calls per accepted iterate (one trial, one
-    # accepted input map), so this number is a count of map calls, not of
-    # iterates.  MEASURED on Fe 4x4x4 charge-only headless shared-pole SC
-    # (10p, source e0ab4c6e): from a DFT start the accepted max|dE| falls
-    # 5.50 -> 0.90 -> 0.19 -> 0.10 -> 0.046 -> 0.0098 -> 0.0030 eV, i.e.
-    # about 2.5x per accepted pair, so reaching the 1e-4 eV criterion needs
-    # roughly 22 map calls on that deck -- a 20-call default truncates a run
-    # that is still contracting.
+    # Promoted from the LORRAX_SC_* env vars (2026-07-08); LORRAX_SC_MAX_ITER
+    # and LORRAX_SC_TOL_EV remain deprecated overrides.  sc_max_iter counts GW map calls; one-evaluation Anderson
+    # spends one per iterate (13 on CrI3 8x8 and Fe 4x4x4, claims 2686-2687).
     "sc_max_iter": 30,
     "sc_tol_ev": 1.0e-4,
     # anderson is the ONLY supported value; `linear` and the retired
@@ -4720,8 +4710,8 @@ class LorraxConfig:
                 + ", ".join(METAL_HEAD_UPDATES)
                 + ". A metal takes its width from "
                 "occ_smearing_width_ry alone.")
-        # rCROP is legal on metallic decks since the ENTRY-solve rule
-        # (2026-08-15): gw_iteration_map solves its MP1 occupation state
+        # Any accelerator is legal on metallic decks since the ENTRY-solve
+        # rule (2026-08-15): gw_iteration_map solves its occupation state
         # from the spectrum of the H it is handed, every call, so F(H) is
         # a self-map of H alone and any accelerator trajectory (trial or
         # accepted iterates) gets occupations consistent with its own H

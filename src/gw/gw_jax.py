@@ -17,9 +17,8 @@ in this file, in execution order:
 	eqp0/eqp1[/eqp2]/σ.dat = write_results(...)            # writers, debug tables       (gw_output)
 
 Two orthogonal config axes pivot the flow: ``compute_mode`` — the
-self-energy ansatz (``x_only`` / ``cohsex`` / ``gn_ppm`` / ``hl_ppm``,
-plus ``mpa``, which is declared on the axis and refused at entry until
-its Σ stage lands) — and ``qp_solver`` — how QP energies are extracted
+self-energy ansatz (``x_only`` / ``cohsex`` / ``gn_ppm`` / ``hl_ppm`` /
+``mpa``) — and ``qp_solver`` — how QP energies are extracted
 from Σ (``one_shot_dft`` / ``fixed_point`` / ``self_consistent``).  The
 self-consistent path iterates the same ``compute_sigma_xc`` dispatch;
 iteration 1 reproduces the one-shot result exactly (gated by

@@ -345,7 +345,7 @@ def make_flat_k_fft_ffi(
 ) -> Callable:
     """FFI-backed flat-k FFT: ``(nk, *trail) -> (nk, *trail)``, same contract
     as ``fft_helpers.make_flat_k_fft`` — one batched strided FFT per rank
-    over the local shard (the FFTW3 ABI on cpu, cuFFT advanced layout on CUDA),
+    over the local shard (the FFTW3-ABI host handler; this door is cpu-only),
     k-major layout end to end (never reshaped to the 3-D k-minor form, which
     is the whole point).
 

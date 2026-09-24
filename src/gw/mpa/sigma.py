@@ -1545,8 +1545,9 @@ def _branches(wfns, omega, efermi_ry, occupation_state=None,
     With a state (duck-typed: ``.f_kn``, ``.mu_ry``), the branches carry the
     fractional supports and weights: the val branch sums every band whose
     weight f clears the occupancy window at weight f, the cond branch every
-    band whose weight 1−f clears it at weight 1−f.  Nothing is clipped and MP
-    overshoot (f<0 or f>1) rides through unchanged
+    band whose weight 1−f clears it at weight 1−f.  Nothing is clipped; the
+    Fermi-Dirac weights metals use lie in [0, 1], and an MP overshoot
+    (f<0 or f>1) would ride through unchanged
     (docs/theory/finite-occupation-screening.md).
 
     ``occupation_window_threshold`` sets that window;
