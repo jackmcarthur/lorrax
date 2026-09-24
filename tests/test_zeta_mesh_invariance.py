@@ -302,8 +302,6 @@ def _run_worker(tag: str, timeout: int = 600, env_extra: dict | None = None,
     env = dict(os.environ)
     env["JAX_PLATFORMS"] = "cpu"
     env["JAX_ENABLE_X64"] = "1"
-    # These workers are deliberately CPU-emulated mesh oracles.  A production
-    # CUDA accelerator setting inherited from the parent is inapplicable.
     if env_extra:
         env.update(env_extra)
     # Append so any pre-existing XLA_FLAGS survive.
