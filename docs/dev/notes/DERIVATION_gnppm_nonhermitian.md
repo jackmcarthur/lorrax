@@ -1,12 +1,11 @@
 # The GN plasmon-pole model from a non-Hermitian $W(i\omega_p)$
 
-**Scope.** Derivation memo for the time-reversal-broken (magnetic) GN-PPM as
-implemented at `34228021`. The model uses the Hermitian and anti-Hermitian
-$i\omega_p$ components. Sources:
-`src/gw/w_isdf.py` (χ₀ kernels), `src/gw/minimax_screening.py` (the fit),
-`src/gw/ppm_sigma.py` / `ppm_accumulators.py` (the Σ windows), and
-`DERIVATION_channel_hermiticity.md` §1.3 (the crossing-closure premise).
-Every identity below is pinned by `tests/test_gnppm_ordered_orientations.py`.
+The time-reversal-broken (magnetic) GN-PPM and ordered MPA: the Hermitian
+and anti-Hermitian parts of $W(i\omega_p)$ fix two Hermitian residues, and
+each causal Σ branch consumes one of them. Code: `src/gw/w_isdf.py` (χ₀
+kernels), `src/gw/minimax_screening.py` (the fit), `src/gw/ppm_sigma.py`,
+`src/gw/ppm_accumulators.py` and `src/gw/mpa/sigma.py` (the Σ windows). Every
+identity below is pinned by `tests/test_gnppm_ordered_orientations.py`.
 
 ## 1. Exact pole structure without time reversal
 
@@ -74,8 +73,8 @@ F_q=\sum_l \gamma_l\,e^{-\tau_l E_{\rm gap}}\,A_q(\tau_l),\qquad
 \gamma_l=-(\alpha_l-i\beta_l)\ }
 $$
 
-with $\sum_l\alpha_l e^{-\tau_l x}\approx x/(x^2+\omega_p^2)$ (the incumbent
-even rule, unchanged) and $\sum_l\beta_l e^{-\tau_l x}\approx\omega_p/(x^2+\omega_p^2)$
+with $\sum_l\alpha_l e^{-\tau_l x}\approx x/(x^2+\omega_p^2)$ (the even
+rule) and $\sum_l\beta_l e^{-\tau_l x}\approx\omega_p/(x^2+\omega_p^2)$
 (the odd rule: the same nodes plus a few greedily added ones, weights-only
 Lawson fits, `minimax_screening.solve_laplace_minimax_imag_interval(with_odd_kernel=True)`).
 The sign of $i\beta$ is fixed by $P^{\rm kern}$ being the $-\Delta$-pole
@@ -83,8 +82,8 @@ orientation; the conjugate partner then receives $\overline{\gamma_l}\approx-1/(
 automatically.  $F_q$ is one `complex_contour` sweep with real nodes and
 complex weights (`w_isdf.compute_chi0_imag_ordered`); the completion is a
 $q$-negation gather plus a conjugate, sharding-preserving.  On a $\Theta$ deck
-$\overline{A_{-q}}=A_q$ and the formula reduces to the incumbent; the code
-keeps the incumbent path there (bit-identity) and routes only when
+$\overline{A_{-q}}=A_q$ and the formula reduces to the even form; the code
+keeps the even path there (bit-identical) and takes the ordered route only when
 `SymMaps.trs_allowed` is false.
 
 ## 3. The two-point model with an odd residue
@@ -98,7 +97,7 @@ W^c(i\omega)=-\frac{(R_++R_-)\,\Omega+i\omega\,(R_+-R_-)}{\omega^2+\Omega^2}.
 $$
 
 Data: $W^c(0)$ (Hermitian) and $W^c(i\omega_p)=h_p+a_p$ split elementwise into
-its Hermitian and anti-Hermitian halves.  The even part is the incumbent fit:
+its Hermitian and anti-Hermitian halves.  The even part is the TRS fit:
 
 $$
 \Omega^2=\omega_p^2\,\frac{h_p}{W^c(0)-h_p}\ (\text{elementwise, Re taken as today}),\qquad
@@ -115,7 +114,7 @@ $$
 $a_p$ is anti-Hermitian and $\Omega$ real symmetric, so $D$ is Hermitian and
 each of $R_\pm$ is Hermitian even though $W^c(i\omega_p)$ is not.  Under a
 magnetisation flip ($\psi\to\bar\psi$) $a_p\to-a_p$, $B,\Omega$ invariant,
-$D\to-D$: the two residues swap.  $\Theta$ deck: $a_p=0$, $D=0$, incumbent.
+$D\to-D$: the two residues swap.  $\Theta$ deck: $a_p=0$, $D=0$, the TRS model.
 Elementwise, $D$ vanishes wherever $\Omega$ is dead (pads, invalid modes:
 $D$ is computed AFTER the tail policy from the final $\Omega$).
 
@@ -133,23 +132,50 @@ $$
 
 ($\odot$ elementwise in $(\mu,\nu)$, then band-projected).  So the
 **conduction branches consume $R_+=B+D$ and the valence branches $R_-=B-D$**;
-with $D=0$ this is the incumbent GPP formula.  Verified independently by the
+with $D=0$ this is the GPP formula.  Verified independently by the
 imaginary-axis contour $\Sigma_c(E)=-\frac1{2\pi}\int d\nu\,G(E-i\nu)W^c(i\nu)$
 at midgap (test cell), whose red twin (residues swapped) fails.  The static
 limit picks up $D/\Omega$ beyond COHSEX, the model's image of the odd channel
 that the exact $\Sigma_c$ also carries at $E$ in the gap.
 
-## 5. The crossing closure is unchanged; its premise is supplied per branch
+## 5. The crossing closure and its premise
 
-`ppm_accumulators._complete_one_sided_tau` closes each crossing window as
-$(Z-Z^\dagger)/2i$, which requires the residue fed to THAT window to be
-Hermitian and $\Omega$ real symmetric (`DERIVATION_channel_hermiticity.md`
-§1.3).  With §3 both branches receive a Hermitian residue ($R_+$ or $R_-$), so
-the sine-sum closure stays valid.  What was wrong is not the closure but the
-incumbent's single $B$ for both branches, and — had the corrected χ₀ been fed
-to the incumbent elementwise fit — a non-Hermitian $B$ and non-symmetric
-$\Omega$ from the raw $W^c(i\omega_p)$, which breaks the pair-adjoint identity
-(red twin in the tests).  The Laplace windows need only bilinearity.
+The Σ accumulator closes a crossing (anti-Hermitian, `project_code = 1`)
+window from a one-sided node sum $Z$ as $(Z-Z^\dagger)/2i$ on the band axes
+(`ppm_accumulators._antiherm_band_fn`). The per-node operand is the Hadamard
+product $\sigma^t_k(\mu,\nu)=\sum_q G^t_{k-q}(\mu,\nu)\,W^t_q(\mu,\nu)$ with
+$W^t_q=m_B\odot R\odot e^{-it(\Omega_q-E^{\rm ref})}$. For a real crossing time
+$t$ neither factor is Hermitian on one slice; what holds is
+
+$$
+[G^t]^\dagger=G^{-t},\qquad [W^t]^\dagger=W^{-t}\quad\Longrightarrow\quad
+[\sigma^t_k]^\dagger=\sigma^{-t}_k ,
+$$
+
+provided the residue $R$ is Hermitian and $\Omega$ and the mask $m_B$ are real
+symmetric in $(\mu,\nu)$ (the Hadamard product of Hermitian matrices is
+Hermitian; the ordinary product is not). That relation is what makes
+$(Z-Z^\dagger)/2i$ the sine-sum closure of a one-sided grid. On Laplace
+windows ($t=-i\tau$, real positive phases) the same premise makes every
+$\sigma^\tau_k$ Hermitian, and those windows need only bilinearity.
+
+**Premise.** With $W(0)$, $W(i\omega_p)$ and $V$ Hermitian per $q$ and
+$z=i\omega_p$ ($z^2$ real), every step of the elementwise fit is equivariant
+under $(\mu,\nu)\to(\nu,\mu)$ with conjugation: the elementwise ratio of two
+Hermitian matrices is Hermitian, $-z^2\times$ Hermitian is Hermitian, and its
+elementwise real part is real symmetric. So $\Omega^{\mathsf T}=\Omega$ and
+$B^\dagger=B$, and the validity masks are symmetric. $W$ comes from an LU
+Dyson solve with no Hermitisation step, so the premise holds to the solve's
+Hermiticity residual, which `screening._gate_w` gates on imaginary-axis
+frequencies. On an HL real-axis probe the premise fails: $B$ is not Hermitian
+and $\Omega$ is not symmetric (§6). Pad centroids are born dead ($\Omega=B=0$)
+and perturb nothing.
+
+With §3 both branches receive a Hermitian residue ($R_+$ or $R_-$), so the
+closure stays valid on a magnet. Feeding the raw $W^c(i\omega_p)$ of a broken-TR
+system to the single-residue elementwise fit would instead give a non-Hermitian
+$B$ and a non-symmetric $\Omega$ and break the pair-adjoint identity (the red
+twin in the tests).
 
 ## 6. The charge head, HL, MPA
 
@@ -165,15 +191,13 @@ which no scalar head can carry.
 *HL.* At a real probe $\Omega_{\rm HL}$ above all transitions $W^c$ is
 Hermitian for any system ($W^c(z)^\dagger=W^c(\bar z)$ with $z$ real), so a
 two-point real-axis fit cannot separate $R_+-R_-$; `hl_ppm` keeps the
-incumbent single-residue fit on magnets (registered, not changed).
+single-residue fit on magnets.
 
 *MPA.* Samples on complex lines need $\overline{F_{-q}(-\bar z)}$ at the
 reflected frequency, i.e. a sample set symmetric under $\omega\to-\omega$;
-the identity of §2 applies with that pairing. Before the ordered MPA change,
-the contour completion had been corrected but the Padé model was still a
-function of $z^2$ only.  It therefore deleted the odd channel downstream even
-though the samples contained it.  The ordered fit and its Sigma assignment are
-derived next.
+the identity of §2 applies with that pairing. A Padé model in $z^2$ alone
+would delete the odd channel even though the samples carry it; the ordered fit
+and its Σ assignment follow.
 
 ## 7. Multipole fit from an ordered complex-frequency pair
 
@@ -230,7 +254,7 @@ W_{\rm odd}(z_j)=\sum_p\frac{2z_jD_p}{z_j^2-\Omega_p^2}.
 $$
 
 The staged fit store carries $B_p$ and $D_p$ on the same row-sharded layout.
-A TRS fit has no $D_p$ dataset and follows the incumbent arithmetic and I/O
+A TRS fit has no $D_p$ dataset and follows the even-only arithmetic and I/O
 path.  A measured-broken-TR fit carries the explicit ordered-residue stamp;
 an absent dataset with a true stamp, or a present dataset with a false stamp,
 is a refused partial schema.
