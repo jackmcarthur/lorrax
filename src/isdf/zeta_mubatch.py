@@ -396,9 +396,9 @@ class ZStore:
     * ``'disk'``: a slab_io scratch dataset ``(n_Gt, Q, n_batch·b, G_tile)``
       in packed μ order.  A batch is one hyperslab at μ offset ``β·b``; a
       G tile is one hyperslab.
-    * ``'host'``: pinned tiles ``(Q, b, G_tile)`` per (G tile, batch) in a
-      ``file_io.HostTileStore``, sharded like the rows: each rank keeps the
-      rows it computed.
+    * ``'host'``: one exact-bytes numpy block ``(n_Gt, Q, n_batch, c,
+      G_tile)`` per local device: each rank keeps the rows it computed, and
+      a G tile is one contiguous read.
 
     Rows are μ-owned (rank p owns batch slots ``p·c + [0, c)``, ``c = b/P``),
     as route G produces them.

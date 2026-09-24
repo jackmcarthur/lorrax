@@ -82,13 +82,6 @@ def _mover(mesh, spec, memory_kind: str):
 
 
 @lru_cache(maxsize=None)
-def _movers(mesh, spec, memory_kind: str, n: int):
-    """One ``jit`` identity moving ``n`` tiles at once (one dispatch)."""
-    out = NamedSharding(mesh, spec, memory_kind=memory_kind)
-    return jax.jit(lambda ts: ts, out_shardings=tuple(out for _ in range(n)))
-
-
-@lru_cache(maxsize=None)
 def _lead_axes(mesh, spec, g: int):
     """Device-side reshape between a tile and its ``(1,)*g + tile`` hyperslab.
 
@@ -201,12 +194,6 @@ class HostTileStore:
         consuming this one to keep the host side busy.
         """
         return _mover(self.mesh, self.spec, _DEVICE)(self.host_tile(idx))
-
-    def get_tiles_async(self, idxs) -> tuple:
-        """Slots ``idxs`` on device in ONE dispatch (a G tile's every batch):
-        the per-call latency of :meth:`get_tile_async` paid once."""
-        tiles = tuple(self.host_tile(i) for i in idxs)
-        return _movers(self.mesh, self.spec, _DEVICE, len(tiles))(tiles)
 
     def host_tile(self, idx) -> jax.Array:
         """The pinned-host ``jax.Array`` in slot ``idx`` (no copy).
