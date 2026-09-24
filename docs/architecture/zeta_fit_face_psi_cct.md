@@ -79,7 +79,9 @@ the sphere.  Per row that costs n_planes·(plane FFT + sphere) instead of one
 full-box FFT; the former LPT packing dealt equal-size orbits round-robin, so
 every tile touched every plane.  VI3 12×12 P16: accumulate 3.31 s → 0.10 s
 and Z_q build 2.80 s → 1.93 s per 1280-point chunk
-(`runs/runtime/zeta_fit_20260923`).  The ψ(r)-cache route is unchanged.
+(`runs/runtime/zeta_fit_20260923`).  The ψ(r)-cache route is unchanged.  This is
+`fill='least_loaded'`; the μ-batch loop's rank blocks use `fill=
+'owner_contiguous'` of the same builder ([μ-batch symmetry](zeta_fit_mubatch.md#symmetry-parent-k)).
 
 The Z kernel carries centroid axes in packed order and its r axis in tile
 slot order. The q-selected RHS enters the existing factor/solve owner;

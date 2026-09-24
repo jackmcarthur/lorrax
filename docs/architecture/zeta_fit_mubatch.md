@@ -133,6 +133,71 @@ today. The saving is the solve (two `μ³` products per q instead of `N_r`
 columns), the accumulator's per-tile transforms, the ψ(tile) sources, and
 the ζ write and re-read.
 
+## Symmetry: parent k
+
+The loop above is written on the full BZ.  The r-chunk loop's symmetry
+saving carries over unchanged: the pair GEMM runs on the raw parent k̄
+only and the pair projectors are unfolded to full k before the
+k-convolution (TRS is used in the unfold, never inside the k FFT; TASTE 7).
+The unfold gathers on both endpoints, so each must be closed under the rows
+`plan.sym_idx` selects — the batch on μ, the rank block on r.  Branch
+`feat/zeta-mubatch-sym-2026-09-23`; the builders live in
+`gw.centroid_k_unfold`, the tail in `isdf.core`.
+
+| name | returns | layout |
+|---|---|---|
+| `orbit_mu_batches(plan, mu_pad, P, *, b_target)` | `mu (n_batch, b)` packed centroid per slot (−1 pad); `left_perm (n_batch, 2n_sym, b)` batch-local source slot; `left_L (…, 3)` wraps; `.rank_mu`, `.packed_to_slot(mu_pad)` | host; one batch's tables replicated `P()` |
+| `orbit_r_blocks(plan, fft_grid, P, *, r_s_target, route)` | `points (P, n_sub, r_s)` flat grid index (−1 pad); `local_perm (P, n_sub, 2n_sym, r_s)`; `wraps (…, 3)`; `planes (P, n_sub, n_pl_max)`, `plane_axis` | host; device copy `P(('x','y'))` on the rank axis |
+| `mu_batch_tables`, `r_block_tables` | the tables of a given partition; refuse a split orbit by name | host |
+| `parent_projector_kconv(D_l, D_r, *, plan, left_perm, left_L, right_perm, right_L, kgrid, vertex_l, vertex_r, pair_kernel)` | `Z (nk, b, r_s)`, every full-k q | manual mode, rank-local |
+
+Batches are unions of whole orbits (not per rank: `X_B` is replicated and
+the unfold precedes the transpose); `b` is a multiple of P and at least the
+largest orbit, so the planner prices the returned `b`, not `b_target`.  The
+layout's pad centroids are in no batch — their Z rows are exactly zero — so
+the store starts zeroed and rows land through `packed_to_slot`.  The r
+blocks come from `build_real_grid_orbit_tiles(fill='owner_contiguous')`:
+rank p takes the p-th contiguous run of the orbit plane order and `r_s` is
+the smallest cap that holds the grid in `P·n_sub` blocks.  `route` changes
+no point; on a group that mixes all three axes (cubic; TaAs in its
+primitive bct cell) a block touches most planes, which `planes` prices.
+
+Per batch β, rank p, sub-block s:
+
+```text
+D^X(k̄, a, μ_B, b, r_s) = Σ_n w^X_n ψ_{n k̄ a}(r_μ) ψ*_{n k̄ b}(r)      k̄ = raw parents
+Z(q, μ_B, r_s) = parent_projector_kconv(D^L, D^R, left = batch β tables,
+                                        right = rank p block s tables)
+```
+
+`parent_projector_kconv` is the r-chunk `_z_q_face_parent` tail factored
+out (bit-identical there): typed transport by
+`symmetry_maps.unfold_operator_local` with `left_mesh_axis=right_mesh_axis=None`
+(the tables are already local), spin by `open_spin_block_coefficient`, or
+the native `conv_kparent` arm built by `make_fused_conv_kparent(mesh, kgrid,
+ns, (b, r_s), …)`.  It replaces `_kconv_tail`, the identity-plan arm.
+
+What scales with k: the pair GEMM, ψ(r) cache or regeneration, `X_B` and
+`D^L, D^R` fall from `nk` to `n_parent` rows; the k-convolution and its
+transients stay on the full zone; the unfold adds `ns²` gathers of
+`nk·b·r_s` per sub-block.  The r tables cost `2n_sym·R·16` bytes per rank.
+
+| deck | n_parent / nk | GEMM and ψ-cache factor |
+|---|---|---|
+| core fixture A (P1, TRS) | 5 / 9 | 1.8× |
+| A-cubic (48 ops) | 3 / 8 | 2.7× |
+| TaAs 4×4×4 (I4₁md, TRS) | 13 / 64 | 4.9× |
+| Si 4×4×4 SOC | 8 / 64 | 8.0× |
+| Bi 8×8×8 | 65 / 512 | 7.9× |
+| TaAs 8×8×8 | 59 / 512 | 8.7× |
+| Fe bcc FM (ntran = 1) | 64 / 64 | 1× |
+
+Verification: `tests/test_zeta_mubatch_orbit_tables.py` (tables, red
+twins), `tests/test_zeta_mubatch_sym_parity.py` (CPU 2×2) and
+`tests/multi_device/zeta_mubatch_sym_p4.py` (P4, native arm): the batch
+layout against the incumbent r-chunk kernel, the full-BZ children and
+direct sums, then ζ and V_q through one C⁺.
+
 ## ζ consumers
 
 | consumer | needs ζ on disk? | handled by |
