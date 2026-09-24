@@ -2613,6 +2613,13 @@ def _fractional_pair_scan_face(
 
     zero = jnp.zeros((z.size, nmu_x_loc, nmu_y_loc), dtype=jnp.complex128)
 
+    # EXPERIMENT (measurement only): unfold every b tile once per q row
+    # instead of once per (a, b) pair. Materializes the full-k b faces.
+    b_x_all = jnp.stack([_roll(_children(_gather_mun(psi_mun_b, ib * tile), unfold_x))
+                         for ib in range(ntiles)])
+    b_y_all = jnp.stack([_roll(_children(_gather_nmu(psi_nmu_b, ib * tile), unfold_y))
+                         for ib in range(ntiles)])
+
     def _outer(acc, ia_step):
         ia = ia_step * tile
         ga = ia + jnp.arange(tile)
@@ -2624,8 +2631,8 @@ def _fractional_pair_scan_face(
         def _inner(acc_inner, ib_step):
             ib = ib_step * tile
             gb = ib + jnp.arange(tile)
-            b_x = _roll(_children(_gather_mun(psi_mun_b, ib), unfold_x))
-            b_y = _roll(_children(_gather_nmu(psi_nmu_b, ib), unfold_y))
+            b_x = b_x_all[ib_step]
+            b_y = b_y_all[ib_step]
             eb = jax.lax.dynamic_slice(eb_full, (0, ib), (nk, tile))
             fb = jax.lax.dynamic_slice(fb_full, (0, ib), (nk, tile))
             contribution = _pair_contribution(
