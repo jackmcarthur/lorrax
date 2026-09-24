@@ -177,6 +177,10 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output):
         for row in execution_rows:
             row['batch_admission'] = batch_admission
             row['parent_batch'] = batch_width
+    sector_models,model_residence=_sector_model_residence(meta,config,header,bank['mu_bases'],
+        execution_rows,mesh_xy=mesh_xy,root=root,upstream=upstream,route=resolved_execution)
+    if sector_models is not None:
+        upstream=ledger.live_stages=(*upstream,model_residence['stage'])
     for ids,real,slots,execution in sector_round_schedule(
             bank,header,meta,config,mesh_xy,partner,execution=resolved_execution,
             batch_width=batch_width):
@@ -333,13 +337,13 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output):
                     factor=face_rows(mesh_xy,tuple(range(real)),width)(treated_factor if is_face(treated_factor) else to_face(treated_factor))
                     for q0,q1,slots in _contiguous_q_spans(ids,real):
                         public=canonical_factors(mesh_xy,slots,components=3 if family else 1)(factor)
-                        filename=root/(name+'.h5')
+                        filename=root/(name+'.h5') if sector_models is None else sector_models[name]
                         store_header=write_shared_pole_model(filename,public,
                             device_put_process_local(poles[list(slots),:width],NamedSharding(mesh_xy,P())),
                             counts[list(slots)],q_span=(q0,q1),meta=meta,tables=bank['sector_tables'][family],
                             recipe=recipe,receipts=dict(identity=bank['identity'],constructor=row_receipt),
                             ordered=True,basis=bank['mu_bases'][family],sector=name)
-                        stores[name]=(str(filename),store_header)
+                        stores[name]=(str(filename) if sector_models is None else filename,store_header)
                         del public
                     del factor,treated_factor,treated_poles
                 finally:
@@ -354,9 +358,53 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output):
     handle=write_shared_pole_sector_manifest(root/'sectors.json',models=stores,bank=bank,
         identity=bank['identity'],receipts=dict(rounds=receipts,status='CONSTRUCTED',
             acceptance='signed-retained-H-v1',sigma_accuracy='NOT_MEASURED'),mesh_xy=mesh_xy)
+    if sector_models is not None:
+        # Sigma keeps this stage live while it reads the models, then releases both.
+        handle['model_stage']=model_residence['stage']
     return dict(handle=handle,identity=bank['identity'],status='CONSTRUCTED',
                 q_receipts=receipts,capacity=ledger.receipt(),
-                execution=execution_rows)
+                execution=execution_rows,model_residence=model_residence)
+
+
+def _sector_model_residence(meta,config,header,mu_bases,execution_rows,*,mesh_xy,root,
+                            upstream,route):
+    """Keep this map's four sector models on the devices for Sigma when they fit.
+
+    The constructor writes CC, TT, CT_C and CT_T once and Sigma reads each once
+    in the same map; the files only carry them across that boundary. Under the
+    bank's admission rule they stay resident when R, their bytes at the
+    retained-pole bound (``signed_side_bound``; CT at the sum of both), and
+    one copy fit in half the device budget and the constructor keeps its route
+    with R live. Otherwise the files are written as before.
+    Returns ``(models or None, receipt)``; a resident R is reserved as
+    ``receipt["stage"]``.
+    """
+    from file_io.shared_pole_store import ResidentSectorModel
+    from runtime.padding import combined_divisor, round_up
+    ledger=meta.shared_pole_capacity
+    nq=int(header['n_q_irr'])
+    divisor=combined_divisor(mesh_xy.shape['x'],mesh_xy.shape['y'])
+    bound=[min(row['signed_side_bound'],row['conservative_pencil_side']) for row in execution_rows]
+    rows=dict(CC=(mu_bases[0].n_canonical,bound[0]),TT=(3*mu_bases[1].n_canonical,bound[1]),
+              CT_C=(mu_bases[0].n_canonical,sum(bound)),CT_T=(3*mu_bases[1].n_canonical,sum(bound)))
+    R=sum(16*nq*n*round_up(k,divisor)//int(mesh_xy.size)+8*nq*k for n,k in rows.values())
+    receipt=dict(residence='file',payload_bytes_per_rank=int(R))
+    both=ledger.preview(resident_bytes_per_rank=2*R,workspace_bytes_per_rank=0,
+                        concurrent_with=upstream)
+    receipt['half_budget_bytes_per_rank']=both['available_device_bytes_per_rank']//2
+    if both['aggregate_bytes_per_rank']>receipt['half_budget_bytes_per_rank']:
+        receipt['reason']='models and one copy exceed half the device budget'
+        return None,receipt
+    stage=f"sector_models.{header['identity']['iteration_id']}"
+    ledger.reserve(stage,resident_bytes_per_rank=R,workspace_bytes_per_rank=0,
+                   concurrent_with=upstream)
+    if sector_execution(meta,config,mu_bases,nq,mesh_xy=mesh_xy,
+                        upstream=(*upstream,stage))[0]!=route:
+        receipt['reason']='constructor would change route with the models live'
+        return None,receipt
+    receipt.update(residence='device',stage=stage,
+                   reason='models, one copy and the unchanged constructor route fit')
+    return {name:ResidentSectorModel(mesh_xy,label=str(root/(name+'.h5'))) for name in rows},receipt
 
 
 def _host_sector_census(poles,mask,mesh_xy,real,*,common=None):

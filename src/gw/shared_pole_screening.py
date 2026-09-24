@@ -26,6 +26,9 @@ def _json(value):
             return x.item()
         if isinstance(x, complex):
             return dict(real=x.real, imag=x.imag)
+        from file_io.shared_pole_store import ResidentSectorModel
+        if isinstance(x, ResidentSectorModel):
+            return str(x)
         raise TypeError(type(x).__name__)
     return json.dumps(value, default=encode, sort_keys=True, allow_nan=False)
 
@@ -443,11 +446,16 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
     receipts["bank_residence"] = residence
     with timing.section("spole.screening_finalize"):
         record("constructor", result)
+        if photon:
+            models = result["model_residence"]
+            print_fn(f"shared-pole sector models: {models['residence']}; "
+                     f"{models['payload_bytes_per_rank'] / 2**30:.3f} GiB/rank bound; {models['reason']}")
         header = None if photon else result["model_header"]
         handle = (result['handle'] if photon else
                   dict(path=str(root / "model.h5"), identity=identity,
                        digest=header["digest"], K=list(header["K"])))
-        ledger.live_stages = ()
+        # Device-resident sector models stay live until Sigma releases them.
+        ledger.live_stages = (handle['model_stage'],) if handle.get('model_stage') else ()
         result = dict(shared_pole=handle)
         if photon:
             result['photon_static_reference'] = receipts['bank']['static_reference']

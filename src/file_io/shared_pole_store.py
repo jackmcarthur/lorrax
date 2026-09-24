@@ -157,6 +157,8 @@ def _json(value):
             return x.item()
         if isinstance(x, complex):
             return {"real": x.real, "imag": x.imag}
+        if isinstance(x, ResidentSectorModel):
+            return str(x)
         raise TypeError(f"not JSON metadata: {type(x).__name__}")
     return json.dumps(value, default=encode, sort_keys=True, separators=(",", ":"),
                       allow_nan=False)
@@ -190,9 +192,9 @@ def _check_identity(actual, expected):
 
 
 def _read_header(path):
-    if isinstance(path, ResidentBankPayload):
+    if isinstance(path, (ResidentBankPayload, ResidentSectorModel)):
         if path.header_json is None:
-            _refuse("resident bank has no committed header")
+            _refuse(f"{path} has no committed header")
         return json.loads(path.header_json)
     with h5py.File(path, "r") as f:
         assert_committed(f, path=path)
@@ -210,7 +212,8 @@ def _read_staging_header(path):
     """Close every serial reader before any rank can reopen the staged writer."""
     header = error = None
     try:
-        if Path(path).exists():
+        if (path.header_json is not None if isinstance(path, ResidentSectorModel)
+                else Path(path).exists()):
             header = _read_header(path)
     except BaseException as exc:
         error = exc
@@ -457,6 +460,19 @@ def write_shared_pole_model(path, b, poles2, K, *, q_span, meta, tables,
         name = f"staging/q{lo}_{hi}"
     with timing.section("canonical_basis_conversion_and_packing"):
         canonical = basis.unpack_axis(b, 1)
+    if isinstance(path, ResidentSectorModel):
+        # The staged batch stays on the devices; its dataset extents are the
+        # file's, so finalization trims exactly what the file would store.
+        path.staging[name] = (canonical, poles2, width)
+        header["written_q"][lo:hi] = [True] * (hi-lo)
+        header["K"][lo:hi] = K.tolist()
+        header["batches"].append({"lo": lo, "hi": hi, "width": width, "name": name})
+        header["construction_receipts"].append({"q_span": [lo, hi], "receipt": receipts})
+        path.header_json = _json(header)
+        del canonical
+        if all(header["written_q"]):
+            return _finalize_model(path, meta=meta, header=header, basis=basis)
+        return header
     if previous is None:
         with SlabIO(path, mode="w", mesh=mesh) as io:
             _write_metadata(io, header)
@@ -524,6 +540,13 @@ def _finalize_model(path, *, meta, header, basis=None):
     header["compact_payload_bytes"] = nq * (16*nmu*components*kmax + 8*kmax + 8)
     header["staging_payload_bytes"] = sum((v["hi"]-v["lo"]) * v["width"] * (16*nmu*components+8) for v in header["batches"])
     header["peak_payload_bytes"] = header["compact_payload_bytes"] + header["staging_payload_bytes"]
+    if isinstance(path, ResidentSectorModel):
+        path.finalize_payload(header, n_canonical=basis.n_canonical)
+        header["digest"] = _model_digest(path, header, mesh, capacity=_capacity(meta))
+        header["finalized"] = True
+        path.header_json = _json(header)
+        path.final_commit = header["digest"]
+        return _read_header(path)
     with SlabIO(path, mode="a", mesh=mesh) as io:
         io.create_dataset("factor", shape=(nq, nmu, components, kmax), dtype=np.complex128)
         io.create_dataset("poles2_ry2", shape=(nq, kmax), dtype=np.float64)
@@ -593,7 +616,7 @@ def _model_digest(path, header, mesh, *, capacity):
            batch_limit*(panel+24*kmax), host_payload=batch_limit*panel,
            device_panel=batch_limit*panel,
            host_metadata=batch_limit*(256*nmu*components+8*kmax), native_host=True)
-    with SlabIO(path, mode="r", mesh=mesh) as io:
+    with open_shared_pole_model(path, mesh_xy=mesh) as io:
         for q0 in range(0, header["n_q_irr"], batch_limit):
             q1 = min(q0+batch_limit, header["n_q_irr"])
             batch = q1-q0
@@ -672,29 +695,38 @@ def validate_shared_pole_model(path, *, expected_identity, mesh_xy, capacity=Non
             _refuse("component factors require an explicit sector identity")
         qt = shared_pole_qirr_tables(header)
         validate_qirr_tables(qt, header["n_q_irr"], header["n_mu_logical"])
-        with h5py.File(path, "r") as f:
-            for name, shape, dtype in (
-                ("factor", (header["n_q_irr"],header["n_mu_logical"],header.get("factor_components",1),header["Kmax"]), np.complex128),
-                ("poles2_ry2", (header["n_q_irr"],header["Kmax"]), np.float64),
-                ("K", (header["n_q_irr"],), np.int64)):
-                if name not in f or f[name].shape != shape or f[name].dtype != dtype or f[name].chunks is not None:
-                    _refuse(f"dataset {name} shape/dtype/contiguity mismatch")
-            if "final_commit" not in f or f["final_commit"][()].decode() != header["digest"]:
-                _refuse("missing or inconsistent final commit")
-            if not np.array_equal(f["K"][:], header["K"]) or not np.array_equal(f["written_q"][:],header["written_q"]):
-                _refuse("count/completion metadata mismatch")
-            for key in _TABLE_KEYS:
-                if not np.array_equal(f["qirr/"+key][:], np.asarray(header["qirr"][key])):
-                    _refuse(f"typed qirr metadata changed: {key}")
-            if (not np.array_equal(f["q_irr_full_idx"][:], header["q_irr_full_idx"])
-                    or int(f["qirr/n_sym_spatial"][()]) != header["qirr"]["n_sym_spatial"]):
-                _refuse("typed parent or operation-count metadata changed")
-            for key, expected in header["operations"].items():
-                actual = f["operations/"+key][()]
-                if key == "typing_source":
-                    actual = actual.decode()
-                if not np.array_equal(actual, expected):
-                    _refuse(f"typed operation metadata changed: {key}")
+        if isinstance(path, ResidentSectorModel):
+            # One in-process copy: the typed tables have no second record to
+            # drift from; the payload extents and commit must still agree.
+            if (path.logical("factor") != (header["n_q_irr"], header["n_mu_logical"],
+                                           components, header["Kmax"])
+                    or path.logical("poles2_ry2") != (header["n_q_irr"], header["Kmax"])
+                    or path.final_commit != header["digest"]):
+                _refuse("resident model payload/commit mismatch")
+        else:
+            with h5py.File(path, "r") as f:
+                for name, shape, dtype in (
+                    ("factor", (header["n_q_irr"],header["n_mu_logical"],header.get("factor_components",1),header["Kmax"]), np.complex128),
+                    ("poles2_ry2", (header["n_q_irr"],header["Kmax"]), np.float64),
+                    ("K", (header["n_q_irr"],), np.int64)):
+                    if name not in f or f[name].shape != shape or f[name].dtype != dtype or f[name].chunks is not None:
+                        _refuse(f"dataset {name} shape/dtype/contiguity mismatch")
+                if "final_commit" not in f or f["final_commit"][()].decode() != header["digest"]:
+                    _refuse("missing or inconsistent final commit")
+                if not np.array_equal(f["K"][:], header["K"]) or not np.array_equal(f["written_q"][:],header["written_q"]):
+                    _refuse("count/completion metadata mismatch")
+                for key in _TABLE_KEYS:
+                    if not np.array_equal(f["qirr/"+key][:], np.asarray(header["qirr"][key])):
+                        _refuse(f"typed qirr metadata changed: {key}")
+                if (not np.array_equal(f["q_irr_full_idx"][:], header["q_irr_full_idx"])
+                        or int(f["qirr/n_sym_spatial"][()]) != header["qirr"]["n_sym_spatial"]):
+                    _refuse("typed parent or operation-count metadata changed")
+                for key, expected in header["operations"].items():
+                    actual = f["operations/"+key][()]
+                    if key == "typing_source":
+                        actual = actual.decode()
+                    if not np.array_equal(actual, expected):
+                        _refuse(f"typed operation metadata changed: {key}")
     except Exception as exc:
         error = exc
     agree_io_refusal(error, path=path, stage="shared_pole_model/metadata")
@@ -724,7 +756,8 @@ def write_shared_pole_sector_manifest(path, *, models, bank, identity, receipts,
                 or not header.get('ordered')
                 or header['recipe'].get('operator_realization')!='raw-sector-endpoint-v1'):
             _refuse(f'unfinalized or mistyped sector {sector}')
-        handles[sector]=dict(path=str(Path(filename).resolve()),identity=identity,
+        handles[sector]=dict(path=(filename if isinstance(filename,ResidentSectorModel)
+                                   else str(Path(filename).resolve())),identity=identity,
                              digest=header['digest'],K=header['K'])
     left,right=models['CT_C'][1],models['CT_T'][1]
     for key in ('K','Kmax','q_irr_full_idx','ordered'):
@@ -754,8 +787,14 @@ def write_shared_pole_sector_manifest(path, *, models, bank, identity, receipts,
                 representation=header['representation'],sectors=handles,constant=content['constant'])
 
 
-def validate_shared_pole_sector_manifest(path, *, expected_identity, mesh_xy, capacity=None):
-    """Authenticate the manifest and each bound current-map model resource."""
+def validate_shared_pole_sector_manifest(path, *, expected_identity, mesh_xy, capacity=None,
+                                         resident=None):
+    """Authenticate the manifest and each bound current-map model resource.
+
+    ``resident`` maps sectors to this process's ResidentSectorModel objects;
+    each must be the one the manifest names, and it replaces that name in the
+    returned sector handles.
+    """
     header=None
     error=None
     try:
@@ -775,6 +814,10 @@ def validate_shared_pole_sector_manifest(path, *, expected_identity, mesh_xy, ca
     model_headers={}
     for sector,handle in header['sectors'].items():
         _check_identity(handle['identity'],expected_identity)
+        if sector in (resident or {}):
+            if str(resident[sector])!=handle['path']:
+                _refuse(f'resident sector model is not the published {sector}')
+            handle['path']=resident[sector]
         model=validate_shared_pole_model(handle['path'],expected_identity=expected_identity,
                                         mesh_xy=mesh_xy,capacity=capacity)
         if (model.get('sector')!=sector or not model.get('ordered')
@@ -1197,6 +1240,125 @@ def _resident_slice(mesh, ndim, lead_shape):
         start = tuple(lead[i] for i in range(ndim - 2)) + (zero, zero)
         return jax.lax.dynamic_slice(store, start, tuple(lead_shape) + tuple(store.shape[-2:]))
     return jax.jit(take, out_shardings=spec)
+
+
+class ResidentSectorModel:
+    """One sector model held on the devices for Sigma instead of a file.
+
+    The constructor writes each sector round by round and Sigma reads it once
+    (census, then endpoint faces) in the same map. When the four models fit
+    (``gw.shared_pole_sectors._sector_model_residence``) they stay here:
+    ``write_shared_pole_model`` stages each batch, finalization assembles the
+    file's own datasets (``factor`` [nq, nmu, components, Kmax], exact zeros
+    past each K; ``poles2_ry2`` [nq, Kmax], 1 past each K) on a mesh-divisible
+    carrier, and every reader (census, faces, digest) goes through
+    ``read_slab`` with SlabIO's semantics, so Sigma reads the file route's
+    values bit for bit. Only reads are implemented; writes are the staging.
+    """
+
+    def __init__(self, mesh, *, label):
+        self.mesh = mesh
+        self.label = str(label)
+        self.header_json = None
+        self.final_commit = None
+        self.staging = {}
+        self._fields = {}
+        self._logical = {}
+
+    def __str__(self):
+        return f"device-resident shared-pole model ({self.label})"
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        return False
+
+    def logical(self, name):
+        return self._logical.get(name)
+
+    def release(self):
+        """Drop every device payload; the model cannot be read afterwards."""
+        self.staging.clear()
+        self._fields.clear()
+        self.header_json = None
+
+    def finalize_payload(self, header, *, n_canonical):
+        """Assemble the file's final datasets from the staged batches."""
+        nq, nmu, kmax = header["n_q_irr"], header["n_mu_logical"], header["Kmax"]
+        components = header.get("factor_components", 1)
+        carrier = round_up(max(kmax, 1), combined_divisor(self.mesh.shape["x"], self.mesh.shape["y"]))
+        counts = np.asarray(header["K"], np.int64)
+        factors, poles = [], []
+        for batch in sorted(header["batches"], key=lambda row: row["lo"]):
+            canonical, staged, width = self.staging.pop(batch["name"])
+            factors.append(_model_factor_block(self.mesh, canonical.shape, carrier, nmu, width)(canonical))
+            poles.append(_model_pole_block(self.mesh, staged.shape, kmax, width)(
+                staged, counts[batch["lo"]:batch["hi"]]))
+        self._fields["factor"] = _model_concat(self.mesh, 4)(*factors)
+        self._fields["poles2_ry2"] = _model_concat(self.mesh, 2)(*poles)
+        self._logical["factor"] = (nq, nmu, components, kmax)
+        self._logical["poles2_ry2"] = (nq, kmax)
+
+    def read_slab(self, name, *, shape=None, offset=None, partition_spec=P(),
+                  valid_shape=None, dtype=None):
+        if name not in self._fields:
+            _refuse(f"{self} has no dataset {name}")
+        logical = self._logical[name]
+        shape = logical if shape is None else tuple(int(v) for v in shape)
+        offset = (0,) * len(shape) if offset is None else tuple(int(v) for v in offset)
+        valid = shape if valid_shape is None else tuple(int(v) for v in valid_shape)
+        return _model_read(self.mesh, logical, shape, offset, valid, tuple(partition_spec))(
+            self._fields[name])
+
+
+@lru_cache(maxsize=None)
+def _model_factor_block(mesh, shape, carrier, nmu, width):
+    """A staged canonical batch as its file dataset holds it: rows < nmu, columns < width."""
+    def block(b):
+        b = b[..., :min(shape[-1], carrier)]
+        b = jnp.pad(b, ((0, 0),) * 3 + ((0, carrier - b.shape[-1]),))
+        keep = ((jnp.arange(shape[1]) < nmu)[None, :, None, None]
+                & (jnp.arange(carrier) < width)[None, None, None, :])
+        return jnp.where(keep, b, jnp.zeros((), b.dtype))
+    return jax.jit(block, out_shardings=NamedSharding(mesh, P(None, "x", None, "y")))
+
+
+@lru_cache(maxsize=None)
+def _model_pole_block(mesh, shape, kmax, width):
+    """Staged poles as finalization writes them: dataset columns < width, 1 past K."""
+    def block(poles, counts):
+        poles = poles[:, :min(width, shape[-1])]
+        poles = jnp.pad(poles, ((0, 0), (0, kmax - poles.shape[-1])))
+        return jnp.where(jnp.arange(kmax)[None, :] < counts[:, None], poles, 1.0)
+    return jax.jit(block, out_shardings=NamedSharding(mesh, P()))
+
+
+@lru_cache(maxsize=None)
+def _model_concat(mesh, ndim):
+    spec = P(None, "x", None, "y") if ndim == 4 else P()
+    return jax.jit(lambda *blocks: jnp.concatenate(blocks, axis=0),
+                   out_shardings=NamedSharding(mesh, spec))
+
+
+@lru_cache(maxsize=None)
+def _model_read(mesh, logical, shape, offset, valid, spec):
+    """SlabIO read semantics: dataset values inside its extent and the valid prefix, zero elsewhere."""
+    def take(store):
+        stop = tuple(min(o + s, n) for o, s, n in zip(offset, shape, logical))
+        value = store[tuple(slice(o, max(o, e)) for o, e in zip(offset, stop))]
+        value = jnp.pad(value, tuple((0, s - v) for s, v in zip(shape, value.shape)))
+        for axis, v in enumerate(valid):
+            if v < shape[axis]:
+                keep = jax.lax.broadcasted_iota(jnp.int32, shape, axis) < v
+                value = jnp.where(keep, value, jnp.zeros((), value.dtype))
+        return value
+    return jax.jit(take, out_shardings=NamedSharding(mesh, P(*spec)))
+
+
+def open_shared_pole_model(path, *, mesh_xy):
+    """Read handle for a finalized model, file or device resident."""
+    return path if isinstance(path, ResidentSectorModel) else SlabIO(path, mode="r", mesh=mesh_xy)
 
 
 def _bank_io(path, mode, mesh):
