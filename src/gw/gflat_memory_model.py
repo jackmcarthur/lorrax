@@ -664,6 +664,9 @@ class GFlatChunkPlan:
     #: band-chunk FFT path; the planner uses it only for ``low_mem_bands``
     #: when even the cache's minimum persistent floor exceeds the target.
     cache_psi_r: bool = True
+    #: The streamed route keeps the ψ(G) store device-resident (no per-chunk
+    #: host read); only meaningful when ``cache_psi_r`` is False.
+    resident_psi_G: bool = False
     #: Face-layout Stage-C structural route.  True stacks the canonical
     #: current-r-chunk Y band slabs once and reuses them for every scalar
     #: spin pair; False repeats one bounded transform/scatter and is the
@@ -719,7 +722,8 @@ class GFlatChunkPlan:
             f"{self.centroid_fft_rows_local} local rows, "
             f"{self.centroid_fft_bytes / 1e9:.3f} GB/dev",
             ("    zeta FFT      = full-nk transform, " if self.cache_psi_r
-             else f"    zeta FFT      = k_tile {self.zeta_k_chunk} (streamed), ")
+             else f"    zeta FFT      = k_tile {self.zeta_k_chunk} (streamed"
+                  f"{', psi(G) device-resident' if self.resident_psi_G else ', psi(G) from host'}), ")
             + f"{self.zeta_transform_fft_bytes / 1e9:.3f} GB/dev",
             f"    r_chunk       = {self.r_chunk}  ({self.n_r_chunks} chunks)",
             f"    q rows        = selected Q {self.n_q_selected} / "
@@ -767,6 +771,7 @@ def plan_gflat_chunks(
     low_mem_bands: bool = False,
     face_current_vertex: bool = False,
     parent_route=None,
+    psi_ngkmax: int | None = None,
 ) -> GFlatChunkPlan:
     """Pick ``(band_chunk, centroid_k_chunk, r_chunk, q_chunk,
     gflat_chunk_size)`` so the
@@ -1118,6 +1123,29 @@ def plan_gflat_chunks(
     if cache_psi_r:
         persistent["psi_r_cache"] = _c128(
             nk, _cache_n_bc * band_chunk, ns, n_rtot, shard=p_xy)
+    # Device-resident ψ(G) (2026-09-23): when the ψ(r) cache does not fit,
+    # the streamed route re-reads every band chunk of ψ(G) from host on every
+    # r chunk (VI3 12x12 P16: ~7.7 GB/rank/chunk).  Keep the store's ψ(G)
+    # itself on device instead — band-sharded over all P, n_parent rows —
+    # whenever the persistent floor plus it still admits the Stage-C
+    # constant and a minimal chunk.
+    resident_psi_G = False
+    if not cache_psi_r and parent_algorithm:
+        _psi_rows = (int(parent_route["n_parent"]) if parent_route else nk)
+        _res_bytes = _c128(
+            _psi_rows, _cache_n_bc * band_chunk, ns,
+            int(psi_ngkmax) if psi_ngkmax else int(ngkmax), shard=p_xy)
+        _res_face = _stage_C_face_terms(
+            nk=nk, ns=ns, mu=mu, face_nb=face_nb, slots=face_slots,
+            p_x=p_x, p_y=p_y, p_xy=p_xy, band_chunk=band_chunk,
+            n_band_chunks=_cache_n_bc, parent_route=parent_route)
+        _res_min_r = p_y       # the budget outranks the mu floor (Stage C)
+        resident_psi_G = (
+            sum(persistent.values()) + _res_bytes + _res_face["constant"]
+            + fft_box_zeta_transform
+            + _res_face["repeated_pair_slope"] * _res_min_r) <= target
+        if resident_psi_G:
+            persistent["psi_G_resident"] = _res_bytes
     persistent_total = sum(persistent.values())
 
     # ---- Phase 2: dial chunk_r against Stage C's slope ------------------
@@ -1505,6 +1533,7 @@ def plan_gflat_chunks(
         psi_layout_bytes=float(persistent["psi_copies"]),
         stage_cd_psi_bytes=float(stage_cd_psi_bytes),
         cache_psi_r=bool(cache_psi_r),
+        resident_psi_G=bool(resident_psi_G),
         cache_face_y_blocks=bool(cache_face_y_blocks),
         face_y_cache_r_tile=int(face_y_cache_r_tile),
         face_y_cache_bytes=float(face_y_cache_bytes),

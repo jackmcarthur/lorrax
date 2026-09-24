@@ -1301,11 +1301,60 @@ def build_psi_r_cache_sm(psi_G_store, *, mesh_xy: Mesh) -> jax.Array:
 	return fn(psi_G_store.g_index, psi_G_store.kvecs_frac)
 
 
+_psi_G_resident_cache: dict = {}
+
+
+def build_psi_G_resident_sm(psi_G_store, *, mesh_xy: Mesh) -> jax.Array:
+	"""Place the ψ(G) store's band chunks on device once; see docs/architecture/zeta_fit_face_psi_cct.md.
+
+	The same one-pass io_callback scan as :func:`build_psi_r_cache_sm`
+	without the transform: ``(n_bc, n_parent, P·b_local, ns, ngkmax)`` at
+	``P(None, None, ('x','y'), None, None)``, so each rank holds exactly the
+	``(n_parent, b_local, ns, ngkmax)`` tiles its streamed source reads from
+	host on every r chunk — n_parent·n_bands·ns·ngkmax·16/P bytes per rank
+	(VI3 12x12 P16: ~7.7 GB).  The r-chunk source then indexes it instead of
+	calling back to host.  Selected by the memory planner
+	(``resident_psi_G``) only when the ψ(r) cache does not fit and this does.
+	"""
+	nk, bpd_max, ns, ngkmax = (
+		int(v) for v in psi_G_store.local_band_chunk_shape)
+	n_bc = len(psi_G_store.band_chunk_ranges)
+	key = (_mesh_key(mesh_xy), id(psi_G_store),
+	       tuple(psi_G_store.band_chunk_ranges), nk, bpd_max, ns, ngkmax)
+	fn = _psi_G_resident_cache.get(key)
+	if fn is None:
+		_store = psi_G_store
+		out_sds = jax.ShapeDtypeStruct((nk, bpd_max, ns, ngkmax), jnp.complex128)
+
+		def _slice_host(x_idx, y_idx, bc_idx):
+			return _store.read_local_band_chunk(x_idx, y_idx, bc_idx)
+
+		@partial(shard_map, mesh=mesh_xy, in_specs=(),
+		         out_specs=P(None, None, ('x', 'y'), None, None),
+		         check_vma=False)
+		def _local():
+			x_idx = jax.lax.axis_index('x')
+			y_idx = jax.lax.axis_index('y')
+
+			def body(_carry, bc_idx):
+				return _carry, _io_callback(
+					_slice_host, out_sds, x_idx, y_idx, bc_idx, ordered=False)
+
+			_, stack = jax.lax.scan(
+				body, jnp.int32(0), jnp.arange(n_bc, dtype=jnp.int32), unroll=1)
+			return stack
+
+		fn = jax.jit(_local)
+		_psi_G_resident_cache.clear()
+		_psi_G_resident_cache[key] = fn
+	return fn()
+
+
 def z_q_from_psi_sm(
     *, psi_G_store, psi_r_cache=None, band_chunk_ranges,
     kgrid, mesh_xy, psi_mun, weight_l, weight_r, k_unfold_plan,
     tile_r_index, tile_local_perm, tile_wraps, gamma_L=0, gamma_R=0, layout="face",
-    tile_planes=None, plane_axis=None,
+    tile_planes=None, plane_axis=None, psi_G_resident=None,
 ):
     """Build Zq from raw parents on one typed orbit-closed real-grid tile."""
     if k_unfold_plan is None:
@@ -1318,7 +1367,8 @@ def z_q_from_psi_sm(
         tile_r_index=tile_r_index, tile_local_perm=tile_local_perm,
         tile_wraps=tile_wraps, band_chunk_ranges=band_chunk_ranges,
         kgrid=kgrid, mesh_xy=mesh_xy, gamma_L=gamma_L, gamma_R=gamma_R, layout=layout,
-        tile_planes=tile_planes, plane_axis=plane_axis)
+        tile_planes=tile_planes, plane_axis=plane_axis,
+        psi_G_resident=psi_G_resident)
 
 
 
@@ -1369,6 +1419,7 @@ def _z_q_face_parent(
 	layout="face",
 	tile_planes: jax.Array | None = None,
 	plane_axis: int | None = None,
+	psi_G_resident: jax.Array | None = None,
 ) -> jax.Array:
 	"""Build raw-parent pair projectors and unfold each spin block on an orbit-closed tile.
 
@@ -1433,6 +1484,7 @@ def _z_q_face_parent(
 	_bfs = bcr[0][0]
 	use_psi_r_cache = psi_r_cache is not None
 	planar = tile_planes is not None and not use_psi_r_cache
+	resident = psi_G_resident is not None and not use_psi_r_cache
 	if tile_planes is not None and plane_axis is None:
 		raise ValueError("_z_q_face_parent: tile_planes= needs plane_axis=")
 	if planar:
@@ -1514,12 +1566,13 @@ def _z_q_face_parent(
 		(None if use_psi_r_cache else int(zeta_k_tile)),
 		((int(plane_axis), n_tile_planes, tuple(int(v) for v in cyl_index.shape))
 		 if planar else None),
+		bool(resident),
 	)
 	if cache_key not in _pair_pipeline_sm_cache:
 
 		def _y_block(bc_idx, x_idx, y_idx, r_index_, g_index_dev,
 		             kvecs_frac_dev, psi_r_cache_, planes_, cylinder_,
-		             use_planes):
+		             use_planes, psi_G_res_):
 			"""ψ_kbar(r) at the tile's slots, all bands of one chunk, this
 			rank's Y slab: the incumbent transaction on parent rows with the
 			arbitrary-point gather in place of the slab slice."""
@@ -1528,9 +1581,9 @@ def _z_q_face_parent(
 				slab = jnp.take(psi_r_cache_[bc_idx],
 				                jnp.clip(r_index_, 0, n_rtot - 1), axis=-1)
 			else:
-				psi_G_bc = _io_callback(
+				psi_G_bc = (psi_G_res_[bc_idx] if resident else _io_callback(
 					_slicer_host, _slicer_out_sds,
-					x_idx, y_idx, bc_idx, ordered=False)
+					x_idx, y_idx, bc_idx, ordered=False))
 				slab = to_rpoints_inner(
 					psi_G_bc, g_index_dev, fft_grid, r_index_,
 					kvecs_frac=kvecs_frac_dev, norm="ortho",
@@ -1549,17 +1602,17 @@ def _z_q_face_parent(
 			"""Debug timer (a): the ψ(G)→ψ(tile) source and its transport alone."""
 			@partial(shard_map, mesh=mesh_xy,
 			         in_specs=(P(), P(), P(None, None), cache_spec, P(),
-			                   (P(), P(), P())),
+			                   (P(), P(), P()), cache_spec),
 			         out_specs=P(), check_vma=False)
 			def _probe(r_index_, g_index_dev, kvecs_frac_dev, psi_r_cache_,
-			           planes_, cylinder_):
+			           planes_, cylinder_, psi_G_res_):
 				x_idx = jax.lax.axis_index('x')
 				y_idx = jax.lax.axis_index('y')
 
 				def body(acc, bc_idx):
 					blk = _y_block(bc_idx, x_idx, y_idx, r_index_, g_index_dev,
 					               kvecs_frac_dev, psi_r_cache_, planes_,
-					               cylinder_, use_planes)
+					               cylinder_, use_planes, psi_G_res_)
 					return acc + jnp.sum(jnp.abs(blk)), None
 				tot, _ = jax.lax.scan(body, jnp.float64(0.0),
 				                      jnp.arange(n_bc, dtype=jnp.int32), unroll=1)
@@ -1568,10 +1621,11 @@ def _z_q_face_parent(
 
 		@partial(shard_map, mesh=mesh_xy,
 		         in_specs=(mun_spec, w_spec, w_spec, P(), P(), P(None, None),
-		                   cache_spec, P(), (P(), P(), P())),
+		                   cache_spec, P(), (P(), P(), P()), cache_spec),
 		         out_specs=(pair_spec, pair_spec), check_vma=False)
 		def _projectors(psi_mun_, w_l_, w_r_, r_index_, g_index_dev,
-		                kvecs_frac_dev, psi_r_cache_, planes_, cylinder_):
+		                kvecs_frac_dev, psi_r_cache_, planes_, cylinder_,
+		                psi_G_res_):
 			x_idx = jax.lax.axis_index('x')
 			y_idx = jax.lax.axis_index('y')
 			shard_w = psi_mun_.shape[3]
@@ -1581,7 +1635,7 @@ def _z_q_face_parent(
 			def load_y_block(bc_idx):
 				return _y_block(bc_idx, x_idx, y_idx, r_index_, g_index_dev,
 				                kvecs_frac_dev, psi_r_cache_, planes_, cylinder_,
-				                planar)
+				                planar, psi_G_res_)
 
 			def load_x_block(bc_idx):
 				"""ψ_kbar(r_mu) for one band chunk, un-conjugated (the
@@ -1729,10 +1783,10 @@ def _z_q_face_parent(
 		@jax.jit
 		def fn(psi_mun_, w_l_, w_r_, r_index_, local_perm_r_, wraps_r_,
 		        g_index_, kvecs_frac_, psi_r_cache_, vertex_l, vertex_r,
-		        planes_, cylinder_):
+		        planes_, cylinder_, psi_G_res_):
 			D_l, D_r = _projectors(
 				psi_mun_, w_l_, w_r_, r_index_, g_index_, kvecs_frac_,
-				psi_r_cache_, planes_, cylinder_)
+				psi_r_cache_, planes_, cylinder_, psi_G_res_)
 			return _tile_tail(D_l, D_r, local_perm_r_, wraps_r_, vertex_l, vertex_r)
 
 		# Debug-only split executables (LORRAX_DEBUG_PRINT): the production
@@ -1764,7 +1818,9 @@ def _z_q_face_parent(
 		psi_G_store.g_index, psi_G_store.kvecs_frac, psi_r_cache, left, right,
 		(jnp.asarray(tile_planes, dtype=jnp.int32) if planar
 		 else jnp.zeros((1,), jnp.int32)),
-		(cyl_index, cyl_axis, plane_from_col))
+		(cyl_index, cyl_axis, plane_from_col),
+		(psi_G_resident if resident
+		 else jnp.zeros((1, 1, P_total, 1, 1), dtype=jnp.complex128)))
 	if (debug_print_enabled() and not coupled_mu123
 			and not isinstance(psi_mun_parent, jax.core.Tracer)):
 		return _z_q_split_timed(fn, args, planar=planar,
@@ -1782,7 +1838,7 @@ def _z_q_split_timed(fn, args, *, planar: bool, use_cache: bool):
 	in debug mode; ``prod`` is projectors + tail, the production work.
 	"""
 	(psi_mun, w_l, w_r, r_idx, perm, wraps, g_idx, kv, cache, left, right,
-	 planes, cyl) = args
+	 planes, cyl, gres) = args
 
 	def _t(f, *a):
 		t0 = time.perf_counter()
@@ -1790,16 +1846,18 @@ def _z_q_split_timed(fn, args, *, planar: bool, use_cache: bool):
 		jax.block_until_ready(out)
 		return out, 1e3 * (time.perf_counter() - t0)
 
-	_, t_src = _t(fn.psi_probe[planar], r_idx, g_idx, kv, cache, planes, cyl)
+	_, t_src = _t(fn.psi_probe[planar], r_idx, g_idx, kv, cache, planes, cyl, gres)
 	t_full = None
 	if planar:
-		_, t_full = _t(fn.psi_probe[False], r_idx, g_idx, kv, cache, planes, cyl)
+		_, t_full = _t(fn.psi_probe[False], r_idx, g_idx, kv, cache, planes, cyl, gres)
 	(D_l, D_r), t_proj = _t(fn.projectors, psi_mun, w_l, w_r, r_idx, g_idx,
-	                        kv, cache, planes, cyl)
+	                        kv, cache, planes, cyl, gres)
 	out, t_tail = _t(fn.tail, D_l, D_r, perm, wraps, left, right)
 	if jax.process_index() == 0:
 		src = "cache gather" if use_cache else (
-			"plane path" if planar else "full box")
+			("plane path" if planar else "full box")
+			+ (", psi(G) resident" if gres.shape[0] > 1 or gres.shape[1] > 1
+			   else ", psi(G) from host"))
 		ref = (f" (full-box source {t_full:.0f}ms)" if t_full is not None else "")
 		print(f"[rchunk_dbg]   z_q split: psi_source[{src}]={t_src:.0f}ms{ref} "
 		      f"pair_gemm={t_proj - t_src:.0f}ms (projectors {t_proj:.0f}ms) "
@@ -4655,7 +4713,8 @@ def _make_fit_one_rchunk_kernel(
                     np.asarray(q_neg_idx, dtype=np.int32))
 
     def z_q_phase(psi_r_cache, psi_mun, weight_l, weight_r,
-                  tile_r_index, tile_local_perm, tile_wraps, tile_planes=None):
+                  tile_r_index, tile_local_perm, tile_wraps, tile_planes=None,
+                  psi_G_resident=None):
         """Complete the parent RHS on full q before the external row selection."""
         Z_q = z_q_from_psi_sm(
             psi_G_store=psi_G_store, psi_r_cache=psi_r_cache,
@@ -4666,7 +4725,8 @@ def _make_fit_one_rchunk_kernel(
             gamma_L=vertex_mu_L, gamma_R=vertex_mu_L,
             tile_r_index=tile_r_index, tile_local_perm=tile_local_perm,
             tile_wraps=tile_wraps, layout=layout,
-            tile_planes=tile_planes, plane_axis=plane_axis)
+            tile_planes=tile_planes, plane_axis=plane_axis,
+            psi_G_resident=psi_G_resident)
         if q_neg_idx_np is not None:
             Z_q = complete_ordered_pair_normal_equations(Z_q, q_neg_idx_np)
         return Z_q
@@ -4726,6 +4786,7 @@ def fit_one_rchunk(
     layout="face",
     tile_planes: jax.Array | None = None,
     plane_axis: int | None = None,
+    psi_G_resident: jax.Array | None = None,
 ):
     """Build or reuse a parent RHS, select q rows, and solve with cached factors."""
     if k_unfold_plan is None:
@@ -4808,7 +4869,8 @@ def fit_one_rchunk(
         if _prebuilt_Z_q is None:
             Z_q = fn.z_q_phase(
                 psi_r_cache, psi_mun, weight_l, weight_r,
-                tile_r_index, tile_local_perm, tile_wraps, tile_planes)
+                tile_r_index, tile_local_perm, tile_wraps, tile_planes,
+                psi_G_resident)
             # Keep the full-domain charge completion inside z_q_phase, but
             # select in this separate scheduling operation before the outer
             # wait.  Putting the take inside the compiled physics producer
