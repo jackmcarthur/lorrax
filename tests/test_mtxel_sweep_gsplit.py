@@ -344,3 +344,37 @@ def test_red_twin_conjugated_bra_sweep_fails(monkeypatch):
         drop_sweeps()                  # never leave the defect cached
     ref = _run("vh", 2)[1]
     assert _rel(got[..., :NB, :NB], ref) > 1e-3
+
+
+@pytest.mark.mesh(4)
+def test_operator_tuple_is_bitwise_per_operator():
+    """One sweep, several operators (the kin_ion + velocity fusion, B13).
+
+    The tuple shares ψ's all-to-all and G slabs; every operator keeps its
+    own ket, contraction and reduction, so each block must be BIT-identical
+    to that operator's own sweep — not merely within tolerance.
+    """
+    mesh = _mesh()
+    psi, gv, gmask, bidx, kvecs = _fixture(2)
+    rng = np.random.default_rng(3)
+    extra = dict(V_r=rng.standard_normal(GRID),
+                 bdot=np.eye(3) * 1.31 + 0.07,
+                 B=np.eye(3) * 1.17 + 0.05 * rng.standard_normal((3, 3)),
+                 setup=_vnl_setup(2))
+    with mesh:
+        geom = SweepGeometry(mesh=mesh, fft_grid=GRID, ngkmax=NGKMAX, nb=NB,
+                             ns=2, nk=NK, cell_volume=VOLUME)
+        ops = (_operator("kin_ion", geom, extra),
+               _operator("dipole", geom, extra))
+        psi_pad = np.pad(psi, ((0, 0), (0, geom.nb - NB), (0, 0), (0, 0)))
+        psi_j = jax.make_array_from_callback(
+            psi_pad.shape, NamedSharding(mesh, band_sphere_spec()),
+            lambda idx: psi_pad[idx])
+        kw = dict(geom=geom, gvecs=gv, gmask=gmask, box_index=bidx,
+                  kvecs=kvecs)
+        both = sweep_matrix_elements(psi_j, operator=ops, **kw)
+        alone = [sweep_matrix_elements(psi_j, operator=o, **kw) for o in ops]
+        assert isinstance(both, tuple) and len(both) == 2
+        for b, a in zip(both, alone):
+            assert b.sharding.spec == a.sharding.spec
+            assert np.array_equal(np.asarray(b), np.asarray(a))

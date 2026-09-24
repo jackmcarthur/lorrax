@@ -1351,7 +1351,7 @@ class SweepPlan(NamedTuple):
     g_carrier: int
 
 
-def plan_sweep(geom: SweepGeometry, operator: Operator) -> SweepPlan:
+def plan_sweep(geom: SweepGeometry, operator) -> SweepPlan:
     """The G carrier and the k tile.
 
     THE k TILE PACKS k ONLY WHILE THE ALL-TO-ALL IS LATENCY-BOUND.  A tile
@@ -1382,9 +1382,12 @@ def plan_sweep(geom: SweepGeometry, operator: Operator) -> SweepPlan:
     g_carrier = padded_axis(
         geom.ngkmax, geom.mesh, name="matrix-element sweep G all-to-all",
         spec=P(None, None, None, ("x", "y")), axis=3).carrier
-    c = max(int(operator.ncomp), 1)
-    ket_copies = (2 * c if operator.apply is not None else 0) + \
-        (c if operator.apply_g is not None else 0)
+    ops = (operator,) if isinstance(operator, Operator) else tuple(operator)
+    c = sum(max(int(o.ncomp), 1) for o in ops)
+    ket_copies = sum(
+        (2 * max(int(o.ncomp), 1) if o.apply is not None else 0)
+        + (max(int(o.ncomp), 1) if o.apply_g is not None else 0)
+        for o in ops)
     sphere = geom.nk * nb_rank * geom.ns * geom.ngkmax * c128
     step = ((2 + ket_copies) * nb_rank * geom.ns * g_carrier * c128
             + 2.0 * c * float(geom.nb) ** 2 * c128)
@@ -1402,8 +1405,8 @@ def plan_sweep(geom: SweepGeometry, operator: Operator) -> SweepPlan:
 A2A_BANDWIDTH_BLOCK_BYTES = 1 << 20
 
 
-def _sweep_body(geom: SweepGeometry, operator: Operator, plan: SweepPlan,
-                *, use_scan: bool):
+def _sweep_body(geom: SweepGeometry, operators: tuple, spans: tuple,
+                plan: SweepPlan, *, use_scan: bool):
     """The per-rank program: scan k tiles; per tile, band → G split, GEMM,
     reduce-scatter.
 
@@ -1412,8 +1415,11 @@ def _sweep_body(geom: SweepGeometry, operator: Operator, plan: SweepPlan,
     ngkmax, 3)`` and ``gmask`` ``(nk, ngkmax)`` — each rank cuts its own G
     slab from them per tile, so no padded ``(nk, g_carrier)`` table ever
     exists — and, for a band-layout operator, the replicated ``bidx``.
-    Returns ``(nk, [ncomp,] nb/p_x, nb/p_y)`` — this rank's block of
-    ``P(None, [None,] 'x', 'y')``.
+    Returns one ``(nk, [ncomp,] nb/p_x, nb/p_y)`` block of
+    ``P(None, [None,] 'x', 'y')`` per operator, in order.  Operators share
+    the ψ all-to-all and the G slabs; each keeps its own ket, contraction
+    and reduction, so its arithmetic is the same as in a sweep of its own.
+    ``spans`` slices each operator's ``consts`` out of the flat operand list.
 
     ORDER CONVENTION, shared with ``band_sphere_spec`` and the density scan:
     the linear rank over ``('x','y')`` is ``x·p_y + y``.  The band
@@ -1432,9 +1438,8 @@ def _sweep_body(geom: SweepGeometry, operator: Operator, plan: SweepPlan,
     nbx, nby = nb // px, nb // py
     gc, K = plan.g_carrier, plan.k_tile
     n_tiles = geom.nk // K
-    contraction = ("kmsg,knsg->kmn" if not operator.ncomp
-                   else "kmsg,knsgc->kcmn")
-    need_gvec_s = operator.apply_g is not None or operator.coeffs is not None
+    need_gvec_s = any(o.apply_g is not None or o.coeffs is not None
+                      for o in operators)
 
     def to_g_split(a):
         """(K, nb/P, ns, ngkmax, …) band layout → (K, nb, ns, gc/P, …)."""
@@ -1446,7 +1451,7 @@ def _sweep_body(geom: SweepGeometry, operator: Operator, plan: SweepPlan,
         (``K·c·nb²·16`` bytes per rank: 0.26 MB per k at nb=128)."""
         return reduce_scatter_to_band_block(part, px=px, py=py, axes=axes)
 
-    def band_ket(t, consts):
+    def band_ket(operator, t, consts):
         """The band-layout operator one k at a time: its box never scales
         with K.  (K, nb/P, ns, ngkmax[, c])."""
         def one(xs):
@@ -1470,14 +1475,13 @@ def _sweep_body(geom: SweepGeometry, operator: Operator, plan: SweepPlan,
         return jax.lax.dynamic_slice_in_dim(
             jnp.pad(a, pad), jax.lax.axis_index(axes) * gs, gs, axis=1)
 
-    def tile(t, consts):
-        gm_s = my_slab(t["gmask"])
-        gv_s = my_slab(t["gvec"]) if need_gvec_s else None
-        psi_g = to_g_split(t["psi"]) * gm_s[:, None, None, :].astype(
-            t["psi"].dtype)
+    def op_block(operator, t, psi_g, gv_s, gm_s, consts):
+        """One operator's (K, [c,] nb/p_x, nb/p_y) block of one tile."""
+        contraction = ("kmsg,knsg->kmn" if not operator.ncomp
+                       else "kmsg,knsgc->kcmn")
         ket = None
         if operator.apply is not None:
-            ket = to_g_split(band_ket(t, consts))
+            ket = to_g_split(band_ket(operator, t, consts))
         if operator.apply_g is not None:
             kg = per_k(operator.apply_g, consts)(
                 psi_g, gv_s, gm_s, t["kvec"])
@@ -1503,16 +1507,25 @@ def _sweep_body(geom: SweepGeometry, operator: Operator, plan: SweepPlan,
             blk = sb if blk is None else blk + sb
         return blk * operator.post
 
+    def tile(t, consts):
+        gm_s = my_slab(t["gmask"])
+        gv_s = my_slab(t["gvec"]) if need_gvec_s else None
+        psi_g = to_g_split(t["psi"]) * gm_s[:, None, None, :].astype(
+            t["psi"].dtype)
+        return tuple(op_block(o, t, psi_g, gv_s, gm_s, consts[a:b])
+                     for o, (a, b) in zip(operators, spans))
+
     def body(ops, *consts):
         tiles = {k: v.reshape(n_tiles, K, *v.shape[1:])
                  for k, v in ops.items()}
         if use_scan:
-            _, H = jax.lax.scan(lambda c_, t: (c_, tile(t, consts)), None,
-                                tiles, unroll=1)
+            _, Hs = jax.lax.scan(lambda c_, t: (c_, tile(t, consts)), None,
+                                 tiles, unroll=1)
         else:
-            H = jnp.stack([tile({k: v[i] for k, v in tiles.items()}, consts)
-                           for i in range(n_tiles)])
-        return H.reshape(geom.nk, *H.shape[2:])
+            per_tile = [tile({k: v[i] for k, v in tiles.items()}, consts)
+                        for i in range(n_tiles)]
+            Hs = tuple(jnp.stack(col) for col in zip(*per_tile))
+        return tuple(H.reshape(geom.nk, *H.shape[2:]) for H in Hs)
 
     return body
 
@@ -1540,7 +1553,7 @@ def sweep_matrix_elements(
     psi_G,
     *,
     geom: SweepGeometry,
-    operator: Operator,
+    operator,
     gvecs,
     gmask,
     box_index,
@@ -1555,7 +1568,10 @@ def sweep_matrix_elements(
         The G-sphere ψ, resident on device, at ``band_sphere_spec`` (the
         loader's layout; any other is constrained to it once).
     geom, operator
-        See above.
+        See above.  ``operator`` may also be a TUPLE of operators: one
+        sweep then returns one block per operator, sharing the ψ read, the
+        ψ all-to-all and the G slabs (e.g. ⟨m|T+V_loc+V_NL|n⟩ and ⟨m|v|n⟩
+        from one pass), each block computed exactly as its own sweep would.
     gvecs : (nk, ngkmax, 3) i32
         The loader's own fixed-shape table (D10) — ``PaddedGVectors.gvecs``.
     gmask : (nk, ngkmax) f64
@@ -1632,13 +1648,16 @@ def sweep_matrix_elements(
             f"(nk, nb, ns, ngkmax) = "
             f"({nk}, {geom.nb_logical}, {geom.ns}, {geom.ngkmax}), "
             f"got {tuple(psi.shape)}")
-    if (operator.apply is None and operator.apply_g is None
-            and operator.coeffs is None):
-        raise ValueError("sweep_matrix_elements: the operator fills no slot")
-    if (operator.coeffs is None) != (operator.couple is None):
-        raise ValueError(
-            "sweep_matrix_elements: a separable operator needs both "
-            "coeffs and couple")
+    single = isinstance(operator, Operator)
+    operators = (operator,) if single else tuple(operator)
+    for o in operators:
+        if o.apply is None and o.apply_g is None and o.coeffs is None:
+            raise ValueError(
+                "sweep_matrix_elements: an operator fills no slot")
+        if (o.coeffs is None) != (o.couple is None):
+            raise ValueError(
+                "sweep_matrix_elements: a separable operator needs both "
+                "coeffs and couple")
 
     # THE BAND PAD, applied here so no caller states it (SlabIO ruling,
     # decisions.md 2026-08-04: padding is the infrastructure's business).
@@ -1646,9 +1665,8 @@ def sweep_matrix_elements(
     # exactly zero -- the product of an exact zero, not "close to zero".
     psi = pad_axis(psi, geom.p_prod, axis=1).array
 
-    plan = plan_sweep(geom, operator)
-    band = operator.apply is not None
-    ncomp = int(operator.ncomp)
+    plan = plan_sweep(geom, operators)
+    band = any(o.apply is not None for o in operators)
     rep = P()
 
     gvecs_j = jnp.asarray(gvecs, dtype=jnp.int32)
@@ -1660,10 +1678,15 @@ def sweep_matrix_elements(
     # The operator's runtime operands.  They are jit ARGUMENTS, so one
     # executable serves every value of them; anything the operator closes
     # over instead is a jaxpr constant and forces a lowering per value.
-    op_consts = tuple(jnp.asarray(c) for c in operator.consts)
+    op_consts, spans = [], []
+    for o in operators:
+        spans.append((len(op_consts), len(op_consts) + len(o.consts)))
+        op_consts.extend(jnp.asarray(c) for c in o.consts)
+    op_consts = tuple(op_consts)
 
-    out_spec = geom.spec_block_for(ncomp)
-    body = _sweep_body(geom, operator, plan, use_scan=bool(use_scan))
+    out_spec = tuple(geom.spec_block_for(int(o.ncomp)) for o in operators)
+    body = _sweep_body(geom, operators, tuple(spans), plan,
+                       use_scan=bool(use_scan))
 
     def _run(psi, gvecs_, gmask_, kvecs_, bidx_, *consts_):
         ops = {"psi": jax.lax.with_sharding_constraint(
@@ -1687,13 +1710,15 @@ def sweep_matrix_elements(
     fn = _cached_jit(
         'sweep_matrix_elements',
         (psi.shape, geom.ngkmax, geom.ns, nk, bool(use_scan),
-         _operator_key(operator), float(operator.post), ncomp,
+         tuple((_operator_key(o), float(o.post), int(o.ncomp))
+               for o in operators),
          geom.fft_grid, tuple(plan), mesh, _sharding_key(psi)[1],
          None if bidx_j is None else tuple(bidx_j.shape),
          tuple((tuple(int(d) for d in c.shape), str(c.dtype))
                for c in op_consts)),
         lambda: jax.jit(_run))
-    return fn(psi, gvecs_j, gmask_j, kvecs_j, bidx_j, *op_consts)
+    blocks = fn(psi, gvecs_j, gmask_j, kvecs_j, bidx_j, *op_consts)
+    return blocks[0] if single else blocks
 
 
 # ---------------------------------------------------------------------------
