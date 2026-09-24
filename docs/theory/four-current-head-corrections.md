@@ -32,15 +32,16 @@ contracts them. All three values ride the same four-spinor carrier.
 | full shared-pole | `full_shared_pole`, `compute_mode = mpa`, `sigma_w_model = shared_pole` | ordered CC/CT/TC/TT sectors, each with its own poles ([shared-pole model](../architecture/shared_pole_model.md)) | first-order direct bulk head under `no_local_fields` (§5); `full` refuses | [sector Σ consumer](../dev/sector_sigma_consumer.md) |
 
 **The packed envelope** is `compute_mode ∈ {cohsex, gn_ppm, hl_ppm}`,
-`qp_solver = one_shot_dft`, `screening_diagrams = w_rpa`,
-`head_correction ∈ {full, off}` and `linalg = distributed`. The bare route
-also needs `sys_dim = 2`. The screened mode additionally refuses a named
-scalar-head override, and it refuses `sys_dim ≠ 2` under
-`head_correction = full`. Outside the envelope, `full_static_cohsex`
-refuses; `bare_transverse` takes the incumbent route, and the run record's
-`Photon route` line names the first unmet condition. The default
-`linalg = local` keeps `bare_transverse` incumbent. On CUDA the distributed
-Dyson plan needs a true 2-D mesh ($p_x,p_y\ge2$).
+`qp_solver = one_shot_dft`, `screening_diagrams = w_rpa` and
+`head_correction ∈ {full, off}`. The bare route also needs `sys_dim = 2`;
+it solves no packed Dyson equation, so `linalg` never chooses it (one Σ^B
+route under either value, owner 2026-09-24). The screened mode additionally
+needs `linalg = distributed` (its packed Dyson solve has only that plan; on
+CUDA a true 2-D mesh, $p_x,p_y\ge2$), refuses a named scalar-head override,
+and refuses `sys_dim ≠ 2` under `head_correction = full`. Outside the
+envelope, `full_static_cohsex` refuses; `bare_transverse` takes the
+incumbent route, and the run record's `Photon route` line names the first
+unmet condition.
 
 **Heads are always on** ([decisions, 2026-09-01](../architecture/decisions.md)).
 `head_correction = off` is a DEBUG skip with a loud banner on every route.

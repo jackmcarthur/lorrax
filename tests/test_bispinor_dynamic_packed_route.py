@@ -34,7 +34,7 @@ restart = false
 head_correction = full
 """
 
-#: The explicit non-distributed negative control.
+#: The same deck under the other `linalg` value: the route must not change.
 _PACKED_BARE_LOCAL_SOLVER = _PACKED_BARE.replace(
     "linalg = distributed\n", "linalg = local\n")
 
@@ -132,30 +132,26 @@ def test_the_hand_tt_overlay_is_refused_on_the_dynamic_packed_route(tmp_path):
     assert "REMOVED" in message
 
 
-def test_the_route_is_not_taken_when_its_dyson_solver_would_refuse(tmp_path):
-    """A route predicate must not claim a deck its screening owner refuses.
+def test_linalg_does_not_choose_the_sigma_b_route(tmp_path):
+    """One Σ^B route: the bare route solves no packed Dyson, so `linalg` never selects it.
 
-    ``w_isdf.compute_static_photon_response``'s first statement refuses
-    anything but ``dyson_solver = 'distributed'`` (the packed solve has no
-    local plan, and ``distrib_la`` additionally needs a true 2-D mesh).  The
-    public ``linalg`` dial is never silently promoted. This explicit
-    ``local`` arm proves a user request is preserved and keeps
-    the deck on the incumbent route rather than being silently overwritten.
+    Owner 2026-09-24: an in-envelope bispinor deck under ``linalg = local``
+    takes the same packed route as under ``distributed``; only the screened
+    mode's packed Dyson solve still requires the distributed plan.
     """
     from gw.gw_config import (packed_bare_transverse_route,
                               uses_dynamic_packed_photon_route,
                               uses_static_photon_response)
-    cfg = _config(
-        tmp_path, _PACKED_BARE_LOCAL_SOLVER + _PPM_KEYS + "compute_mode = gn_ppm\n",
-        name="gnppm_auto_solver.in")
-    taken, reason = packed_bare_transverse_route(cfg)
-    assert not taken
-    assert "linalg" in reason, reason
-    assert not uses_static_photon_response(cfg)
-    assert not uses_dynamic_packed_photon_route(cfg)
+    for deck in (_PACKED_BARE, _PACKED_BARE_LOCAL_SOLVER):
+        cfg = _config(tmp_path, deck + _PPM_KEYS + "compute_mode = gn_ppm\n",
+                      name="gnppm_either_linalg.in")
+        taken, reason = packed_bare_transverse_route(cfg)
+        assert taken, reason
+        assert uses_static_photon_response(cfg)
+        assert uses_dynamic_packed_photon_route(cfg)
 
 
-def test_unnamed_linalg_uses_local_default_and_incumbent_route(tmp_path):
+def test_unnamed_linalg_uses_local_default_and_packed_route(tmp_path):
     from gw.gw_config import LorraxConfig, uses_dynamic_packed_photon_route
 
     path = tmp_path / "gnppm_derived_solver.in"
@@ -168,7 +164,7 @@ def test_unnamed_linalg_uses_local_default_and_incumbent_route(tmp_path):
     cfg = LorraxConfig.from_input_file(
         str(path), print_fn=lambda *a, **k: lines.append(" ".join(map(str, a))))
     assert cfg.backend.linalg == "local"
-    assert not uses_dynamic_packed_photon_route(cfg)
+    assert uses_dynamic_packed_photon_route(cfg)
     assert not any("linalg was not named" in line for line in lines)
 
 

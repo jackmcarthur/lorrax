@@ -53,12 +53,11 @@ centroids_file_current = centroids_frac_209_current.txt
 memory_per_device_gb = 30.0
 
 restart = false
-# EXPLICIT local plan: this is a ONE-GPU deck.  The distributed packed route
-# needs a multi-process mesh; naming 'local' keeps this fixture on the
-# incumbent route (Sigma^B via
-# gw.sigma_x_bispinor, scalar band-diagonal head, NO transverse q=Gamma head),
-# which is the route its frozen reference was cut from.  Lane N's dynamic
-# packed route needs >= 2x2 GPUs until the packed Dyson solve has a local plan.
+# EXPLICIT local plan.  Since 2026-09-24 `linalg` no longer chooses the Sigma^B
+# route (owner: one route): this slab one-shot GN-PPM deck takes the packed
+# bare-transverse route under either value (W_00 on the charge block, bare
+# D_TT, the fifteen current blocks at omega = 0; head_correction = off keeps
+# it headless), and its frozen reference was re-cut on that route.
 linalg = local
 
 do_screened = true
