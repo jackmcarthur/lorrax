@@ -1677,19 +1677,28 @@ def plan_zeta_route_g(*, meta, mesh_xy, n_q_selected: int, ngkmax: int,
     n_zc = min(ps, math.ceil(1.3 * math.pi * r_zeta * r_zeta))
     n_za = min(n_a, math.ceil(2 * r_zeta) + 1)
 
-    def ws(b, n_pg):
+    def stages(b, n_pg):
+        """The batch's live sets per stage; the working set is their max
+        (XLA frees each stage's inputs before the next; measured VI3 P16:
+        28.2 GB peak against 53.4 GB for the old sum of all terms)."""
         c, r_pl = b // P_, n_pg * ps
         n_ap = math.ceil(n_a / n_pg) * n_pg
-        return {
-            "X_B": 2 * _c128(nk, nb, ns, b) + _c128(nk, Gp, b),
-            "pair projectors (G slice, all-to-all)": 4 * 2 * _c128(nk, ns, b, ns, Gp),
-            "D cylinder (all planes)": _c128(nk, n_ap, ns, 2 * c, ns, n_col)
-                                       + _c128(ns, 2 * c, ns, n_col, n_s),
-            "plane group": 3 * _c128(nk, n_pg, ns, 2 * c, ns, ps),
-            "k-conv + Z": 9 * _c128(nk, c, r_pl) + 3 * _c128(Q, c, r_pl),
-            "ζ cylinder accumulator": _c128(Q, c, n_zc, n_za),
-            "Z rows (+1 lookahead)": 3 * _c128(Q, c, N_G),
-        }
+        rows = {"Z rows (+1 lookahead)": 2 * _c128(Q, c, N_G)}
+        d_g = 2 * _c128(nk, ns, b, ns, Gp)                  # D~ L+R, one copy
+        return [
+            dict(rows, **{"X_B": 2 * _c128(nk, nb, ns, b) + _c128(nk, Gp, b),
+                          "pair projectors (GEMM out, all-to-all out)": 2 * d_g}),
+            dict(rows, **{"pair projectors (owner)": d_g,
+                          "D cylinder (all planes)": _c128(nk, n_ap, ns, 2 * c, ns, n_col)
+                          + _c128(ns, 2 * c, ns, n_col, n_s)}),
+            dict(rows, **{"D cylinder (all planes)": _c128(nk, n_ap, ns, 2 * c, ns, n_col),
+                          "plane group": 2 * _c128(nk, n_pg, ns, 2 * c, ns, ps),
+                          "k-conv + Z": 9 * _c128(nk, c, r_pl) + 3 * _c128(Q, c, r_pl),
+                          "ζ cylinder accumulator": _c128(Q, c, n_zc, n_za)}),
+        ]
+
+    def ws(b, n_pg):
+        return max(stages(b, n_pg), key=lambda d: sum(d.values()))
 
     # The memory split (owner rule): ψ(G) resident iff what is left after
     # the fixed terms holds it and the smallest batch; then every remaining

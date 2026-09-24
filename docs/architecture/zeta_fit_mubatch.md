@@ -1,12 +1,13 @@
-# ζ fit by μ-batches: Z(G) first, C⁺ once
+# ζ fit by μ-batches (route G): Z(G) first, C⁺ once
 
-Status: implemented for the charge channel on branch
-`feat/zeta-mubatch-2026-09-23` (not on main): `isdf.zeta_mubatch`,
-`gw.isdf_fitting._fit_mubatch`, planner `gw.gflat_memory_model.plan_zeta_mubatch`.
-Evidence: `runs/runtime/zeta_mubatch_20260923/` in the sandbox.
-Owner design 2026-09-23, refined the same day (direction-agnostic
-transpose; ψ(r) cache when it fits, plane-regenerated ψ only when it does
-not).
+Status: the charge channel runs route G on branch
+`feat/zeta-mubatch-2026-09-23` (not on main): `isdf.zeta_mubatch`
+(`make_route_g_kernel`, `ZStore`, `ZetaG`), `gw.isdf_fitting._fit_mubatch`,
+planner `gw.gflat_memory_model.plan_zeta_route_g`, conditioning `isdf.cplus`.
+Evidence: `runs/runtime/zeta_mubatch_20260923/` in the sandbox (manifest.yaml).
+Owner decision 2026-09-23: route G is the single route; the r-space
+machinery (ψ(r) cache and plane regeneration, the Z-row transpose, the
+orbit r blocks, the planes/flat switch) is retired.
 
 ## The identity
 
@@ -35,215 +36,98 @@ completion `Z_q ← Z_q + conj(Z_{−q})` is applied in r space, before the
 q selection and before the transform, exactly where the r-chunk loop
 applied it.
 
-## The loop
-
-The r-chunk loop (orbit-closed tiles; each tile built for all μ, solved
-and accumulated into an all-G ζ(G) buffer) is replaced by:
+## The loop (route G)
 
 ```text
-setup:  C_q, factor (unchanged);  Z store (Q, μ, N_G), zeroed
-        r blocks R_p (one per rank);  ψ(r) source (cache or regeneration)
-for each μ batch B (b centroids, serial):
-    X_B = ψ_{nks}(r_μ ∈ B), all full-BZ k, all fit bands     (replicated, small)
-    every rank p, for each r sub-block r_s ⊂ R_p:
-        D^L, D^R(k, a, μ_B, b, r_s) = X_B · ψ*(r_s)          (band-chunked GEMM)
-        Z_q(μ_B, r_s) for all q = k-conv tail                (the existing tail math)
-        LR+RL completion, then select the Q stored q rows
-    ONE all-to-all per batch: rows (q, μ_B) × r-split  →  row-owned × full r
-    each rank: e^{-iq·r}, local full-box FFT per row, gather the ζ sphere
-    write the rows into the Z store (write-once; no accumulator)
-after all batches:  stream the store by G tiles:  ζ_t = C⁺ Z_t,
+setup:  conj ψ(G) of the full zone, G slots over the mesh (ψ(G)/P per rank)
+        C_q, factor (the CCT path);  Z store (pinned host tiles or slab_io)
+for each μ batch B (b centroids, b a multiple of P, serial):
+    X_B = ψ_{nks}(r_μ)                       each rank's partial DFT over its
+                                              G slots, one psum (replicated)
+    D̃^X_k(a, μ, b, G) = Σ_n w^X_n X_{nka}(r_μ) conj c_{nkb}(G)
+                                              G-space GEMM on the rank's slice
+                                              (isdf.pair_kernels)
+    ONE all-to-all: G split → μ owner (rank p owns slots p·c + [0, c), c = b/P)
+    on the owner:
+        cylinder gather + axis DFT onto ALL planes, once per k: the D cylinder
+        per group of n_pg planes: 2D FFT, Bloch phase → D(k, μ, r_plane);
+            Z_q(μ, r) = Σ_k Σ_ab D^L_k conj D^R_{k+q}
+                        (isdf.core.parent_projector_kconv on the identity plan)
+            LR+RL completion; e^{-iq·r}; forward 2D FFT;
+            one matmul onto the ζ-sphere cylinder (columns × axis values)
+        gather the ζ slots → rows Z_q(μ_B, G), μ-owned
+    write the rows into the Z store (asynchronous; batch β+1 computes meanwhile)
+after all batches:  stream the store by G tiles:  ζ_t = C⁺ Z_t (isdf.cplus),
                     V_q += conj(ζ_t) diag(v_q) ζ_tᵀ,  keep the G≈0 shell;
-                    write ζ_t to zeta_q.h5 only when a consumer needs the file
+                    write ζ_t only when a consumer needs the file
 ```
+
+Two collectives per batch (read from the compiled HLO): the X_B psum and
+the pair-projector all-to-all.  There is no distributed FFT and no
+accumulator over r: every plane transform, the k-convolution and the
+axis transform are local to the owner of whole μ rows.
 
 V_q is formed ζ-first, not as `conj(C⁺) M conj(C⁺)`: the two are the same
-operator in exact arithmetic, but the second loses `≈ ε·κ(C)²` because it
-applies the rank-truncated `C⁺` twice to an `M` that has already mixed
-scales.  Measured: 3.3e-14 on core fixture A, 1.7e-3 on CrI3 8×8
-(κ(C) = 1.0e8).  ζ-first costs the same `N_G·μ²` GEMM per tile plus one
-`μ²·G_tile` solve application, and only `V_q` (plus the shell) is resident.
+operator in exact arithmetic, but the second loses `≈ ε·κ(C)²` (3.3e-14 on
+core fixture A, 1.7e-3 on CrI3 8×8 with κ(C) = 1.0e8).
 
-The transpose is direction-agnostic: `R_p` may be any equal split of the
-flat grid. No distributed FFT and no second redistribution exist: the
-all-to-all lands whole rows on their owners, and each row's full-box FFT
-is local.
+### Z store
 
-### Row ownership (the Z-store layout)
+`ZStore` is one write-once resource of μ-owned rows, never on the device:
+pinned host tiles `(Q, b, G_tile)` per (G tile, batch) in a
+`file_io.HostTileStore`, or a slab_io scratch dataset
+`(n_Gt, Q, n_batch·b, G_tile)` when the node's host share does not hold
+it.  A G-tile read gathers the batches rank-locally and reaches the
+finalize layout (q-local for the local solve tier, G-split for the
+replicated one) with one all-to-all.  The μ axis is batch-slot order;
+reads gather the packed carrier (`MuOrbitBatches.packed_to_slot`).
 
-`ZStore` is one write-once resource, never on the device: the planner
-places it in host memory (one tile-major numpy block per addressable
-device) or in a slab_io scratch dataset.  SlabIO datasets are contiguous, so the owner's
-`(q, G_tile, μ_batch)` chunking lives in the dataset shape:
+## Per-rank memory model and planner
 
-- **q-owned** (the q-local solve tier, `Q ≥ P` and a q's factor plus a G
-  tile fit): `(Q_pad, n_Gt, n_batch·b, G_tile)` at `P(('x','y'), …)`.  The
-  all-to-all splits the q axis; rank p owns whole q rows, a batch write is
-  whole `(q, G_tile, μ_B)` chunks per writer, and a G-tile read is local
-  on host and device — V_q runs with no communication.
-- **μ-owned** (otherwise, any Q including Q = 1): `(n_Gt, Q, n_batch·c,
-  G_tile)` per rank, `c = b/P`; the all-to-all splits the batch's μ axis;
-  a G-tile read reaches the solve's layout with one all-to-all.
+Unit: the Green's-function tile `G_tile = nk·ns²·μ²·16/P`; the GW run's
+bottleneck is about `4·G_tile`.  Feasibility: the smallest configuration
+(ψ(G) resident, `b = P`, one plane per group) must fit `4·G_tile`, so
+the fit never sets the node count; the plan then uses the device target.
 
-The μ axis is stored in batch-slot order (`β·b + j`); `read_tile` gathers
-the packed carrier through `MuOrbitBatches.packed_to_slot` (−1: a layout
-pad centroid, an exact zero row).  The device holds only the batch being
-written (and the next one, dispatched before the write).
+| object | bytes/rank |
+|---|---|
+| conj ψ(G) slice (full zone), Ψ | `nk·nb·ns·N_Gψ·16/P` |
+| C factor | `Q_loc·μ²·16` (q-local) or `Q·μ²·16` (replicated) |
+| X_B (replicated per batch) | `nk·nb·ns·b·16` |
+| pair projectors, G slice and after the all-to-all | `2·nk·ns²·b·N_Gψ·16/P` each |
+| D cylinder (all planes, owner) | `nk·n_a·ns²·2c·n_col·16` |
+| plane group | `2·nk·n_pg·ns²·2c·(N_r/n_a)·16` |
+| k-conv + Z (group) | `(9·nk + 3·Q)·c·n_pg·(N_r/n_a)·16` |
+| ζ cylinder accumulator | `Q·c·n_zc·n_za·16` |
+| Z rows (+1 lookahead) | `2·Q·c·N_G·16` |
 
-### ψ(r_local) source
+The batch working set is the maximum over its three stages (GEMM and
+all-to-all; D cylinder; plane groups), not their sum.  The rule (owner):
+ψ(G) resident iff `M_f − Ψ ≥ c_μ·b_min` (`M_f` the target minus the fixed
+terms, `c_μ` the per-centroid slope of the working set); then
+`b = (M_f − Ψ)/c_μ` in multiples of P.  Candidates over the plane-group
+width `n_pg` are costed by the two collectives (`gw.comm_model.comm_time`),
+the per-group launches and the owner's per-centroid work; the receipt
+prints every object as a `G_tile` ratio, the minimum configuration, the
+collectives per batch, the all-to-all floor
+`μ·2·nk·ns²·N_Gψ·16/(P·β)`, the X_B bytes, the modelled loop and the
+runner-up.  No deck key or environment knob sizes anything.
 
-- **Cache (preferred).** When `nk·nb·ns·R·16` plus the batch workspace
-  fits, regenerate ψ once: each rank full-box IFFTs its own band shard
-  (the existing transform), one all-to-all band→r, cache across all
-  batches. `R_p` is a flat-index block; no box axis enters.
-- **Regeneration (small P only).** Otherwise `R_p` is a block of whole
-  planes along the largest box axis (padding when uneven). Per batch and
-  per band chunk each rank evaluates its own bands on every plane
-  through the ψ cylinder (the plane-pruned partial DFT already on this
-  branch), one all-to-all plane→owner, then 2D IFFTs of its own planes.
-  This is the only place a box axis enters; P larger than that axis
-  (pencils) refuses by GATE until needed.
-
-## Per-rank memory model
-
-Symbols: `Q` stored q rows, `nk` full-BZ k, `ns` spinor, `μ` packed centroid
-carrier, `nb` fit bands (transport-padded), `N_r` grid, `N_G` ζ sphere
-(`ngkmax`), `R = ⌈N_r/P⌉`, `b` μ batch, `r_s` r sub-block, `bc` band chunk,
-`16` bytes per c128.
-
-| object | sharding | bytes/rank |
-|---|---|---|
-| C factor | `P(None,'x','y')` or q-local batch | `Q·μ²·16/P` |
-| Z store | q-owned or μ-owned tiles | `Q·μ·N_G·16/P` off device: host (0.6 of the node's MemTotal per task), else slab_io disk |
-| ψ(r) cache (cache route) | r-block `R_p` | `nk·nb·ns·R·16` |
-| ψ(G) resident (regen route) | bands over `('x','y')` | `nk·nb·ns·N_Gψ·16/P` |
-| centroid face, full BZ | `μ_X × band_Y` | `nk·ns·μ·nb·16/P` (the parent faces serve C) |
-| X_B | replicated | `nk·ns·b·nb·16` |
-| D^L, D^R | local | `2·nk·ns²·b·r_s·16` |
-| k-conv transients | local | `≈3·nk·b·r_s·16` |
-| Z batch (pre-transpose) | r-block | `Q·b·R·16` |
-| rows (post-transpose) | row-owned | `Q·b·N_r·16/P` |
-| row FFT box | local, row-chunked | `c·N_r·16·f_FFT` |
-| regen transient (regen route) | local | `nk·bc_p·ns·n_col·n_a·16` + `nk·bc·ns·r_s·16` |
-
-The planner (`gw.gflat_memory_model`, the one budget) picks, in order:
-the ψ route (cache if it fits with the smallest batch), the store tier
-(device, host, disk), then the largest `b` (a multiple of P dividing the
-μ carrier's per-rank share when possible), then `r_s` and `bc`. No new
-deck key or environment knob exists.
-
-### Communication and flops (whole fit, per rank)
-
-| term | volume / flops | VI3 12×12 P16 | P100 |
-|---|---|---|---|
-| Z transpose | `Q·μ·N_r·16/P` | 637 GB | 102 GB |
-| ψ regeneration (regen route) | `n_batch · nk·nb·ns·n_col·n_a·16/P` | 28 GB per batch | 0 (cache fits) |
-| pair GEMM | `16·nk·ns²·μ·nb·R` | 9.2e14 | 1.5e14 |
-| ζ = C⁺Z on the sphere (only if ζ is written) | `8·Q·μ²·N_G/P` | 5.4e13 | 8.6e12 |
-| M = conj(Z) v Zᵀ | `8·Q·μ²·N_G/P` | 5.4e13 | 8.6e12 |
-| C⁺ M C⁺ | `16·Q·μ³/P` | 4.7e12 | 7.6e11 |
-| retired r-space solve | `8·Q·μ²·N_r/P` (2× for rank-truncate) | 1.0e15 | 1.6e14 |
-
-(VI3: Q = nk = 144, ns = 2, nb = 360, μ = 3200, N_r = 1 382 400,
-N_G = 72 541.) Honest accounting: the pair GEMM and the k-convolution are
-unchanged in total; the M contraction is the same `N_G·μ²` GEMM V_q runs
-today. The saving is the solve (two `μ³` products per q instead of `N_r`
-columns), the accumulator's per-tile transforms, the ψ(tile) sources, and
-the ζ write and re-read.
-
-## Symmetry: parent k
-
-The loop above is written on the full BZ.  The r-chunk loop's symmetry
-saving carries over unchanged: the pair GEMM runs on the raw parent k̄
-only and the pair projectors are unfolded to full k before the
-k-convolution (TRS is used in the unfold, never inside the k FFT; TASTE 7).
-The unfold gathers on both endpoints, so each must be closed under the rows
-`plan.sym_idx` selects — the batch on μ, the rank block on r.  Branch
-`feat/zeta-mubatch-sym-2026-09-23`; the builders live in
-`gw.centroid_k_unfold`, the tail in `isdf.core`.
-
-| name | returns | layout |
-|---|---|---|
-| `orbit_mu_batches(plan, mu_pad, P, *, b_target)` | `mu (n_batch, b)` packed centroid per slot (−1 pad); `left_perm (n_batch, 2n_sym, b)` batch-local source slot; `left_L (…, 3)` wraps; `.rank_mu`, `.packed_to_slot(mu_pad)` | host; one batch's tables replicated `P()` |
-| `orbit_r_blocks(plan, fft_grid, P, *, r_s_target, route)` | `points (P, n_sub, r_s)` flat grid index (−1 pad); `local_perm (P, n_sub, 2n_sym, r_s)`; `wraps (…, 3)`; `planes (P, n_sub, n_pl_max)`, `plane_axis` | host; device copy `P(('x','y'))` on the rank axis |
-| `mu_batch_tables`, `r_block_tables` | the tables of a given partition; refuse a split orbit by name | host |
-| `parent_projector_kconv(D_l, D_r, *, plan, left_perm, left_L, right_perm, right_L, kgrid, vertex_l, vertex_r, pair_kernel)` | `Z (nk, b, r_s)`, every full-k q | manual mode, rank-local |
-
-Batches are unions of whole orbits (not per rank: `X_B` is replicated and
-the unfold precedes the transpose); `b` is a multiple of P and at least the
-largest orbit, so the planner prices the returned `b`, not `b_target`.  The
-layout's pad centroids are in no batch — their Z rows are exactly zero — so
-the store starts zeroed and rows land through `packed_to_slot`.  The r
-blocks come from `build_real_grid_orbit_tiles(fill='owner_contiguous')`:
-rank p takes the p-th contiguous run of the orbit plane order and `r_s` is
-the smallest cap that holds the grid in `P·n_sub` blocks.  `route` changes
-no point; on a group that mixes all three axes (cubic; TaAs in its
-primitive bct cell) a block touches most planes, which `planes` prices.
-
-Per batch β, rank p, sub-block s:
-
-```text
-D^X(k̄, a, μ_B, b, r_s) = Σ_n w^X_n ψ_{n k̄ a}(r_μ) ψ*_{n k̄ b}(r)      k̄ = raw parents
-Z(q, μ_B, r_s) = parent_projector_kconv(D^L, D^R, left = batch β tables,
-                                        right = rank p block s tables)
-```
-
-`parent_projector_kconv` is the r-chunk `_z_q_face_parent` tail factored
-out (bit-identical there): typed transport by
-`symmetry_maps.unfold_operator_local` with `left_mesh_axis=right_mesh_axis=None`
-(the tables are already local), spin by `open_spin_block_coefficient`, or
-the native `conv_kparent` arm built by `make_fused_conv_kparent(mesh, kgrid,
-ns, (b, r_s), …)`.  It replaces `_kconv_tail`, the identity-plan arm.
-
-What scales with k: the pair GEMM, ψ(r) cache or regeneration, `X_B` and
-`D^L, D^R` fall from `nk` to `n_parent` rows; the k-convolution and its
-transients stay on the full zone; the unfold adds `ns²` gathers of
-`nk·b·r_s` per sub-block.  The r tables cost `2n_sym·R·16` bytes per rank.
-
-| deck | n_parent / nk | GEMM and ψ-cache factor |
-|---|---|---|
-| core fixture A (P1, TRS) | 5 / 9 | 1.8× |
-| A-cubic (48 ops) | 3 / 8 | 2.7× |
-| TaAs 4×4×4 (I4₁md, TRS) | 13 / 64 | 4.9× |
-| Si 4×4×4 SOC | 8 / 64 | 8.0× |
-| Bi 8×8×8 | 65 / 512 | 7.9× |
-| TaAs 8×8×8 | 59 / 512 | 8.7× |
-| Fe bcc FM (ntran = 1) | 64 / 64 | 1× |
-
-Verification: `tests/test_zeta_mubatch_orbit_tables.py` (tables, red
-twins), `tests/test_zeta_mubatch_sym_parity.py` (CPU 2×2) and
-`tests/multi_device/zeta_mubatch_sym_p4.py` (P4, native arm): the batch
-layout against the incumbent r-chunk kernel, the full-BZ children and
-direct sums, then ζ and V_q through one C⁺.
-
-### Planner rule and receipt
-
-Unit: the Green's-function tile `G_tile = nk·ns²·μ²·16/P` per rank; the GW
-run's bottleneck is about `4·G_tile`.  Feasibility: the smallest
-configuration (plane route, smallest batch, ψ(G) from host, band chunk P,
-k chunk 1, store off device) must fit `4·G_tile`, so the fit never sets the
-node count.  The plan then spends the device target where the time model
-says it removes the most time: candidates are (route × ψ source) at their
-largest batch and at half of it; the modelled loop time counts the ψ
-all-to-all bytes, the host ψ(G) uploads and the collective count per batch
-(constants measured on VI3 P16 OFI until the comm-model service lands).
-The receipt prints every object as a `G_tile` ratio, the minimum
-configuration's ratio, collectives per batch, the modelled time and the
-runner-up.  All sizes come from the planner; there is no knob.
-
-Padding goes through `runtime.padding` at named boundaries: the stored q
-rows (`Q → Q_pad`, a multiple of P) and the ζ sphere cut into whole G
-tiles are `PaddedAxis` records made once in `_fit_mubatch` and shared by
-the kernel, the store and the finalize; batch slots, r-block points and
-band slots carry their pads in their own tables (−1 / weight 0).
+Padding goes through `runtime.padding`: the stored q rows and the ζ
+sphere cut into whole G tiles are `PaddedAxis` records made once in
+`_fit_mubatch` and shared by the kernel, the store and the finalize; the
+ψ G-slot axis and the plane groups are padded by name; batch slots carry
+their pads in `MuOrbitBatches.mu` (−1).
 
 ### Simplifications taken
 
 | what | edge case that loses | cost |
 |---|---|---|
-| the Z store never lives on the device | a small deck whose whole store fits beside the batch | one host round trip; about 1 s on CrI3 8×8 P16 (1.1 GB/rank) |
-| one conditioning procedure (rank truncation, `isdf/cplus.py`); the charge Cholesky kinds are gone from this path | none measured; a well-conditioned C_q pays an eigh instead of a Cholesky | per-q factor time only |
-| batch β+1 dispatched before β is written, instead of a pipelined store | the device holds two batches' output rows | `2·Q_loc·b·N_G·16` bytes, priced |
+| route G only (no ψ(r) cache, no flat blocks) | axis-mixing groups with a cheap cache | TaAs 8³ ~1.5× vs flat blocks (auditor) |
+| route G's GEMM on the loader's full-BZ ψ(G), not parent k + a D̃ unfold | symmetric decks: nk/n_parent on a GEMM over the ψ sphere and on Ψ; **magnetic groups: NOT valid today** — the loader's unfold and the plan's typed transport (C, faces) disagree (CrI3 8×8: eqp 238 µeV) | the fix is the parent-k GEMM with the plan's typed D̃ unfold, or one unfold for both |
+| the Z store never lives on the device | small decks whose store fits beside the batch | one host round trip |
+| one conditioning procedure (`isdf/cplus.py`, rank truncation) | none measured | per-q eigh |
+| ψ(G) streaming (two band-chunk buffers) not implemented | decks where Ψ does not fit beside the smallest batch | refuses with `GATE zeta-mubatch-capacity` |
 
 ## ζ consumers
 
@@ -260,18 +144,22 @@ The fit returns `ZetaG`, a lazy ζ over the store (`zeta_layout =
 
 ## Regime guard
 
-One planner rule picks the solve: q-local (q-owned store, R4) when
-`Q ≥ P` and one q's factor plus a G tile fit a rank, else the 2D
-distributed factor applied per G tile (μ-owned store; kept for huge
-`N_μ`).  `check_mubatch_solve` refuses (`GATE zeta-mubatch-solve-tier`)
-a store/tier pair that disagree.  The planner refuses with `GATE
-zeta-mubatch-capacity` naming the shortfall when even the smallest
-whole-orbit batch does not fit, and `GATE zeta-mubatch-pencils` when the
-plane route would need P above the largest box axis.  Nq = Nk = 1 runs
-the μ-owned layout (core fixture B).
+The planner refuses with `GATE zeta-mubatch-capacity` naming the
+shortfall when ψ(G) plus the smallest batch does not fit (ψ streaming is
+the upgrade path).  The finalize solve tier follows `zeta_auto_tier`:
+q-local (each G tile read onto q owners) or replicated.  The distributed
+2D factor application for μ ~ 1e5 supercells is future work.  Nq = Nk = 1
+runs (core fixture B).
+
+## Verification
+
+`tests/multi_device/zeta_mubatch_p4.py` (P4: glide ns=2 with an antiunitary
+row, A-cubic 48 ops, and a deck where no axis divides P; both store tiers
+and read layouts; red twin) against the dense full-BZ sum.  NumPy
+prototype and whole-run evidence in the sandbox manifest.
 
 ## Scope
 
-Charge channel, ns = 1 and ns = 2. The current (transverse) channels
-keep their incumbent loop until their vertex tails are ported; the
-coupled μ = 1,2,3 coordinator is unchanged.
+Charge channel, ns = 1 and ns = 2.  The current (transverse) channels keep
+their r-chunk loop until their vertex tails are ported; the coupled
+μ = 1,2,3 coordinator is unchanged.
