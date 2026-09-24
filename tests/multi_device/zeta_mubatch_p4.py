@@ -5,8 +5,9 @@ system on a box whose three extents differ (6, 5, 8), per-k ψ spheres, a
 3x2x1 k grid (a nontrivial -q map), asymmetric L/R band windows (so the LR+RL completion runs),
 three of four q rows selected, a μ carrier that the batch does not divide,
 and band chunks with pad slots.  Every ψ route (flat-block cache; planes with
-ψ(G) resident or read from host) times every Z-store placement (device, host,
-slab_io disk) times both read layouts (q-local, G-split) must reproduce an
+ψ(G) resident or read from host) times both row owners (q-owned chunks for
+the R4 tier, μ-owned rows otherwise) times every Z-store placement (device,
+host, slab_io disk) times each read layout must reproduce an
 independent NumPy evaluation of
 
     Z_q(μ, G) = FFT_r[e^{-iq·r} Σ_k Σ_ab D^L_{k,ab}(μ,r) conj(D^R_{k+q,ab}(μ,r))]
@@ -194,7 +195,7 @@ def main():
     sph_pad = np.concatenate(
         [sphere, np.repeat(sphere[:, -1:], n_Gt * g_tile - ngk_z, axis=1)], 1)
 
-    def run(route, source, placement, *, swap_spin=False, tmpdir=None):
+    def run(route, source, placement, *, rows='mu', swap_spin=False, tmpdir=None):
         rb = zmb.make_r_blocks(FFT, 4, route=route,
                                r_sub=(16 if route == 'cache' else 1))
         cyl = None
@@ -208,10 +209,11 @@ def main():
             mesh=mesh, rb=rb, kgrid=KGRID, fft_grid=FFT, nk=nk, ns=NS, b=b,
             n_bc=len(bcr), bc_w=int(band_rel.shape[1]), nb_face=NB,
             q_sel=q_sel, q_neg=q_neg, sphere_idx=sph_pad, qvec_frac=qf,
-            row_chunk=3, source=source, psi_G_store=store, cylinder=cyl)
+            row_chunk=3, source=source, rows=rows, psi_G_store=store,
+            cylinder=cyl)
         zs = zmb.ZStore(mesh=mesh, Q=len(q_sel), mu_pad=mu_pad,
                         n_G=n_Gt * g_tile, b=b, g_tile=g_tile,
-                        placement=placement,
+                        placement=placement, rows=rows,
                         scratch_path=os.path.join(tmpdir or ".", "zstore.h5"))
         pts = device_put_process_local(zmb.block_points(rb), rep)
         cyl_ops = cyl if cyl is not None else tuple(
@@ -222,9 +224,9 @@ def main():
             if swap_spin:
                 X = X.at[1].set(X[1, ::-1])
             zs.write_batch(beta, kern(src, X, *tables, pts, store.kvecs_frac,
-                                      cyl_ops))
+                                      cyl_ops, zmb.dummy_extra(mesh)))
         out = {}
-        for layout in ('q', 'g'):
+        for layout in (('q',) if rows == 'q' else ('q', 'g')):
             tiles = [_gather(zs.read_tile(t, layout=layout)) for t in range(zs.n_Gt)]
             full = np.concatenate(tiles, axis=2)[:len(q_sel), :, :ngk_z]
             out[layout] = full
@@ -239,19 +241,21 @@ def main():
         td0 = bytes(np.asarray(shared)).rstrip(b"\0").decode()
         for route, source in (('cache', 'cache'), ('planes', 'resident'),
                               ('planes', 'host')):
-            for placement in ('device', 'host', 'disk'):
-                if placement == 'disk' and source != 'cache':
-                    continue
-                res = run(route, source, placement, tmpdir=td0)
-                for layout, Z in res.items():
-                    e = rel(Z)
-                    worst = max(worst, e)
-                    if jax.process_index() == 0:
-                        print(f"{TAG} route={route:<6s} source={source:<8s} "
-                              f"store={placement:<6s} read={layout}  "
-                              f"rel={e:.2e}", flush=True)
-                    if not e <= TOL:
-                        _fail(f"{route}/{source}/{placement}/{layout}: {e:.3e}")
+            for rows in ('q', 'mu'):
+                for placement in ('device', 'host', 'disk'):
+                    if placement == 'disk' and source != 'cache':
+                        continue
+                    res = run(route, source, placement, rows=rows, tmpdir=td0)
+                    for layout, Z in res.items():
+                        e = rel(Z)
+                        worst = max(worst, e)
+                        if jax.process_index() == 0:
+                            print(f"{TAG} route={route:<6s} source={source:<8s} "
+                                  f"rows={rows:<2s} store={placement:<6s} "
+                                  f"read={layout}  rel={e:.2e}", flush=True)
+                        if not e <= TOL:
+                            _fail(f"{route}/{source}/{rows}/{placement}/{layout}: "
+                                  f"{e:.3e}")
         red = rel(run('cache', 'cache', 'device', swap_spin=True)['q'])
     if jax.process_index() == 0:
         print(f"{TAG} red twin (spinor components swapped in X_B at k=1): rel={red:.2e}",

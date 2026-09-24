@@ -1736,6 +1736,7 @@ def _plan_gflat_chunks_for_channel(
 			face_nb=int(band_slices.b4 - band_slices.b0),
 			band_chunk=int(gflat_plan.band_chunk),
 			n_parent=int((parent_route or {}).get('n_parent', meta.nk_tot)),
+			mu_multiple=int((parent_route or {}).get('mu_shard', 1)),
 			zeta_tier=_tier, budget_gb=float(mem.per_device_gb),
 			target_utilization=(mem.chunk_target_utilization
 			                    if mem.chunk_target_utilization > 0 else None),
@@ -2922,7 +2923,9 @@ def _prepare_fresh_parent_faces(
     		is_bispinor=bool(int(meta.nspinor) == 4),
     		n_q_selected=int(np.asarray(sym.q_irr_full_idx).shape[0]),
     		parent_route=dict(n_parent=_candidate_plan.n_parent,
-    		                  parents_only=True), print_fn=print0,
+    		                  parents_only=True,
+    		                  mu_shard=int(_candidate_plan.layout.axis_shard_size)),
+    		print_fn=print0,
     		zeta_ngkmax=zeta_sphere_ngkmax(
     			wfn, sym, meta, zeta_contract.zeta_cutoff),
     		psi_ngkmax=int(wfn.ngkmax), mubatch=True)

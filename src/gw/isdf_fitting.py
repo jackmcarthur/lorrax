@@ -266,18 +266,35 @@ def _fit_mubatch(
     nb_face = int(psi_mun_parent.shape[3])
     _bfs = int(band_range_full[0])
 
+    # The planner owns the ψ band chunk of this fit (cache build or plane
+    # regeneration); the transport range stays the P-padded fit window.
+    _lo = int(band_chunk_ranges[0][0])
+    _hi = int(band_chunk_ranges[-1][1])
+    _w = int(plan.band_chunk)
+    band_chunk_ranges = [(lo, min(lo + _w, _hi)) for lo in range(_lo, _hi, _w)]
     # ψ sources on the unfolded full BZ: the r side of Z needs every k on a
     # rank's own r block, so no orbit-closed tile is required.
+    # A symmetric deck keeps the IBZ saving: ψ and the pair GEMM live on the
+    # raw parents, and the typed unfold (orbit-closed r blocks, whole-orbit
+    # μ batches) carries each projector to the full grid on the rank, the
+    # same transport C_q was built with.  A deck whose parents already span
+    # the full grid (no operation beyond identity) needs neither.
+    plan_k = k_unfold_plan
+    parent = int(plan_k.n_parent) < int(plan_k.n_full)
     with timing.section("zeta_fit.mubatch.psi_store"):
         psi_G_store = build_psi_G_store(
             wfn=wfn, mesh_xy=mesh_xy, meta=meta,
             band_chunk_ranges=band_chunk_ranges, bispinor=bispinor,
-            bispinor_lift=bispinor_lift, k_domain="full_bz")
-    _assert_full_bz_grid_order(jax.device_get(psi_G_store.kvecs_frac),
-                               meta.kgrid, where="the ψ(G) store")
-    if str(k_unfold_plan.sym.parent_k_domain) == "full_bz":
-        psi_mun_full = psi_mun_parent
-    else:
+            bispinor_lift=bispinor_lift,
+            k_domain=(plan_k.sym.parent_k_domain if parent else "full_bz"))
+    if not parent:
+        _assert_full_bz_grid_order(jax.device_get(psi_G_store.kvecs_frac),
+                                   meta.kgrid, where="the ψ(G) store")
+    psi_mun_src = psi_mun_parent
+    n_k_src = int(psi_mun_src.shape[0])
+    if not parent and str(plan_k.sym.parent_k_domain) != "full_bz":
+        # Parents cover the full grid but in the file's row order: the
+        # k-convolution needs grid order, so read the full-BZ face.
         with timing.section("zeta_fit.mubatch.full_bz_face"):
             _y, _x = load_centroids_band_chunked(
                 wfn, sym, meta, centroid_indices, bispinor, mesh_xy,
@@ -285,14 +302,41 @@ def _fit_mubatch(
                 band_chunk_size=int(band_chunk_ranges[0][1] - band_chunk_ranges[0][0]),
                 bispinor_lift=bispinor_lift, k_domain="full_bz")
             from gw.wavefunction_bundle import parent_faces
-            _, psi_mun_full = parent_faces(_y, _x, mesh_xy=mesh_xy, layout=layout)
+            _, psi_mun_src = parent_faces(_y, _x, mesh_xy=mesh_xy, layout=layout)
             del _y, _x
-    if tuple(int(v) for v in psi_mun_full.shape) != (nk, ns, mu_pad, nb_face):
+        n_k_src = nk
+    if tuple(int(v) for v in psi_mun_src.shape) != (n_k_src, ns, mu_pad, nb_face):
         raise ValueError(
-            "_fit_mubatch: full-BZ centroid face shape "
-            f"{tuple(psi_mun_full.shape)} != {(nk, ns, mu_pad, nb_face)}")
+            "_fit_mubatch: centroid face shape "
+            f"{tuple(psi_mun_src.shape)} != {(n_k_src, ns, mu_pad, nb_face)}")
 
-    rb = zmb.make_r_blocks(fft_grid, P_, route=plan.route, r_sub=plan.r_sub)
+    unfold = None
+    extra = zmb.dummy_extra(mesh_xy)
+    if parent:
+        if plan.route != 'cache':
+            raise ValueError(
+                "GATE zeta-mubatch-orbit-planes: got the plane-regenerated ψ "
+                "route on a symmetric deck, want the ψ(r) block cache; why: "
+                "orbit-closed r blocks for plane regeneration are not built "
+                "yet.  Fix: more ranks (the parent cache is n_parent/nk of the "
+                "full one).")
+        rb, pts_np, r_perm, r_wrap = zmb.orbit_r_blocks(
+            plan_k, P_, r_sub=int(plan.r_sub))
+        box_inv = zmb.box_from_slots(pts_np, int(meta.n_rtot))
+        unfold = dict(irr_idx=np.asarray(plan_k.irr_idx, np.int32),
+                      sym_idx=np.asarray(plan_k.sym_idx, np.int32),
+                      k_parent_frac=np.asarray(plan_k.k_parent_frac, np.float64),
+                      n_sym_spatial=int(plan_k.n_sym_spatial),
+                      spin_action_full=np.asarray(plan_k.spin_action_full))
+        rspec = lambda a: NamedSharding(mesh_xy, P(('x', 'y'), *([None] * (a.ndim - 1))))
+        r_perm_d = jax.make_array_from_callback(
+            r_perm.shape, rspec(r_perm), lambda idx: r_perm[idx])
+        r_wrap_d = jax.make_array_from_callback(
+            r_wrap.shape, rspec(r_wrap), lambda idx: r_wrap[idx])
+        box_d = _device_put_process_local(box_inv, NamedSharding(mesh_xy, P()))
+    else:
+        rb = zmb.make_r_blocks(fft_grid, P_, route=plan.route, r_sub=plan.r_sub)
+        pts_np = zmb.block_points(rb)
     band_rel, w_l, w_r = zmb.band_slot_tables(
         psi_G_store, band_start=_bfs, nb_face=nb_face,
         weight_l=np.asarray(jax.device_get(weight_l_face)),
@@ -301,7 +345,8 @@ def _fit_mubatch(
     cylinder = None
     with timing.section("zeta_fit.mubatch.psi_source"):
         if plan.source == 'cache':
-            src = zmb.build_psi_block_cache(psi_G_store, mesh=mesh_xy, rb=rb)
+            src = zmb.build_psi_block_cache(psi_G_store, mesh=mesh_xy, rb=rb,
+                                            points=pts_np)
             src.block_until_ready()
             psi_G_store.release_host_tiles()
         else:
@@ -313,7 +358,7 @@ def _fit_mubatch(
             else:
                 src = jnp.zeros((1,), jnp.complex128)
     rep = NamedSharding(mesh_xy, P())
-    pts = _device_put_process_local(zmb.block_points(rb), rep)
+    pts = _device_put_process_local(pts_np, rep)
     tables = tuple(_device_put_process_local(np.asarray(a), rep)
                    for a in (band_rel, w_l, w_r))
     cyl_ops = (cylinder if cylinder is not None else
@@ -327,15 +372,30 @@ def _fit_mubatch(
     if ng_pad > ngkmax:
         sph = np.concatenate(
             [sph, np.repeat(sph[:, -1:], ng_pad - ngkmax, axis=1)], axis=1)
+    rows_owner = 'q' if plan.finalize_layout == 'q' else 'mu'
+    zmb.check_mubatch_solve(rows_owner, zeta_gather, solver_kind)
     kernel = zmb.make_batch_kernel(
         mesh=mesh_xy, rb=rb, kgrid=tuple(meta.kgrid), fft_grid=fft_grid,
         nk=nk, ns=ns, b=int(plan.b), n_bc=n_bc, bc_w=bc_w, nb_face=nb_face,
         q_sel=q_irr_full_idx, q_neg=q_neg_idx, sphere_idx=sph,
         qvec_frac=q_frac, row_chunk=int(plan.row_chunk),
-        source=plan.source, psi_G_store=psi_G_store, cylinder=cylinder)
+        source=plan.source, rows=rows_owner, psi_G_store=psi_G_store,
+        cylinder=cylinder, unfold=unfold, n_k_src=n_k_src)
+    split_kernels = {}
+    if debug_print_enabled():
+        # Debug split timers: the same kernel truncated after each stage.
+        for stage in ('psi', 'gemm', 'kconv', 'transpose'):
+            split_kernels[stage] = zmb.make_batch_kernel(
+                mesh=mesh_xy, rb=rb, kgrid=tuple(meta.kgrid), fft_grid=fft_grid,
+                nk=nk, ns=ns, b=int(plan.b), n_bc=n_bc, bc_w=bc_w,
+                nb_face=nb_face, q_sel=q_irr_full_idx, q_neg=q_neg_idx,
+                sphere_idx=sph, qvec_frac=q_frac, row_chunk=int(plan.row_chunk),
+                source=plan.source, rows=rows_owner, psi_G_store=psi_G_store,
+                cylinder=cylinder, stop_at=stage, unfold=unfold,
+                n_k_src=n_k_src)
     store = zmb.ZStore(
         mesh=mesh_xy, Q=Q, mu_pad=mu_pad, n_G=ng_pad, b=int(plan.b),
-        g_tile=int(plan.g_tile), placement=plan.placement,
+        g_tile=int(plan.g_tile), placement=plan.placement, rows=rows_owner,
         scratch_path=os.path.join(scratch_dir, "zeta_Z_store.scratch.h5"))
     print_fn(f"  μ-batch fit: {store.n_batch} batches of {plan.b} centroids, "
              f"r route {rb.route} ({rb.n_sub} sub-blocks of {rb.r_s} slots per "
@@ -352,21 +412,51 @@ def _fit_mubatch(
             f"LORRAX_MAX_RCHUNKS={_max!r} must be >= 1; unset it to fit every "
             "μ batch.")
     t_batch = 0.0
+    t_kernel = 0.0
     n_run = 0
     with timing.section("zeta_fit.mubatch.loop"):
         for beta in range(store.n_batch):
             t0 = time.perf_counter()
-            X_B = zmb.gather_batch_centroids(
-                psi_mun_full, zmb.batch_slots(mu_pad, int(plan.b), beta),
-                mesh=mesh_xy)
+            slots = zmb.batch_slots(mu_pad, int(plan.b), beta)
+            X_B = zmb.gather_batch_centroids(psi_mun_src, slots, mesh=mesh_xy)
+            if parent:
+                l_perm, l_wrap = zmb.batch_centroid_tables(plan_k, slots)
+                extra = (box_d, r_perm_d, r_wrap_d,
+                         _device_put_process_local(l_perm, rep),
+                         _device_put_process_local(l_wrap, rep))
             rows = kernel(src, X_B, *tables, pts, psi_G_store.kvecs_frac,
-                          cyl_ops)
+                          cyl_ops, extra)
             del X_B
+            # Settle the batch before the store write so the receipt splits
+            # compute (pair GEMM, k-conv, transpose, row FFT) from the write.
+            rows.block_until_ready()
+            t_kernel += time.perf_counter() - t0
             store.write_batch(beta, rows)
             del rows
             t_batch += time.perf_counter() - t0
             n_run += 1
             progress.step()
+            if split_kernels and beta in (1, 2):
+                X_d = zmb.gather_batch_centroids(psi_mun_src, slots, mesh=mesh_xy)
+                t_stage = {}
+                for stage, kfn in split_kernels.items():
+                    ts = time.perf_counter()
+                    kfn(src, X_d, *tables, pts, psi_G_store.kvecs_frac,
+                        cyl_ops, extra).block_until_ready()
+                    t_stage[stage] = time.perf_counter() - ts
+                ts = time.perf_counter()
+                kernel(src, X_d, *tables, pts, psi_G_store.kvecs_frac,
+                       cyl_ops, extra).block_until_ready()
+                t_full = time.perf_counter() - ts
+                del X_d
+                if jax.process_index() == 0:
+                    print_fn(
+                        f"[mubatch_dbg] batch {beta + 1} split (s): psi_source="
+                        f"{t_stage['psi']:.3f} pair_gemm="
+                        f"{t_stage['gemm'] - t_stage['psi']:.3f} kconv="
+                        f"{t_stage['kconv'] - t_stage['gemm']:.3f} transpose="
+                        f"{t_stage['transpose'] - t_stage['kconv']:.3f} row_fft="
+                        f"{t_full - t_stage['transpose']:.3f} full={t_full:.3f}")
             if debug_print_enabled() and jax.process_index() == 0:
                 print_fn(f"[mubatch_dbg] batch={beta + 1}/{store.n_batch} "
                          f"{1e3 * (time.perf_counter() - t0):.0f}ms "
@@ -381,7 +471,7 @@ def _fit_mubatch(
 
     # ---- ζ = C⁺ Z, held lazily; written only for a file consumer --------
     shell_slots, shell_gvec = zmb.zeta_shell_slots(
-        gvec_components, ngk_per_q, q_frac, bvec, q_full_frac)
+        gvec_components, ngk_per_q, q_frac, bvec, q_full_frac, fft_grid)
     zeta_g = zmb.ZetaG(
         store, mesh=mesh_xy, L_q=L_q, lu_piv=lu_piv, q_chunk_size=q_chunk_size,
         solver_kind=solver_kind, zeta_gather=zeta_gather,
@@ -389,8 +479,9 @@ def _fit_mubatch(
         n_rmu=int(meta.n_rmu), mu_basis=mu_basis, ngk_per_q=ngk_per_q,
         gvec_components=gvec_components, shell_slots=shell_slots,
         shell_gvec=shell_gvec, path=output_file)
-    print_fn(f"  μ-batch timing: {n_run} batches {t_batch:.2f}s "
-             f"(of which store write {store.t_write:.2f}s)")
+    print_fn(f"  μ-batch timing: {n_run} batches {t_batch:.2f}s = batch "
+             f"compute {t_kernel:.2f}s + store write {store.t_write:.2f}s "
+             f"({store.placement})")
     if zeta_io is not None:
         t_w = time.perf_counter()
         with timing.section("zeta_fit.mubatch.write_zeta"):

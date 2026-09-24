@@ -1546,7 +1546,7 @@ def plan_gflat_chunks(
 # ---------------------------------------------------------------------------
 
 #: Host RAM a Z store may claim, as a fraction of the node's MemTotal.
-_ZSTORE_HOST_FRAC = 0.5
+_ZSTORE_HOST_FRAC = 0.6
 
 
 def _host_bytes_per_rank() -> float:
@@ -1572,6 +1572,7 @@ class MuBatchPlan:
     """Resolved μ-batch fit plan: every size comes from the one budget."""
     route: str                 # 'cache' (flat r blocks) | 'planes'
     source: str                # 'cache' | 'resident' | 'host'
+    band_chunk: int            # ψ band chunk (cache build / plane regeneration)
     b: int                     # μ batch (multiple of P)
     n_batch: int
     r_sub: int                 # points (cache) or planes (planes) per sub-block
@@ -1588,7 +1589,8 @@ class MuBatchPlan:
     def format(self) -> str:
         lines = [
             "  ISDF μ-batch plan (one budget; docs/architecture/zeta_fit_mubatch.md)",
-            f"    ψ(r) route    = {self.route} (source {self.source})",
+            f"    ψ(r) route    = {self.route} (source {self.source}, "
+            f"band chunk {self.band_chunk})",
             f"    μ batch       = {self.b}  ({self.n_batch} batches)",
             f"    r sub-block   = {self.r_sub} {'points' if self.route == 'cache' else 'plane(s)'}",
             f"    FFT rows/step = {self.row_chunk}",
@@ -1611,7 +1613,8 @@ def plan_zeta_mubatch(*, meta, mesh_xy, n_q_selected: int, ngkmax: int,
                       band_chunk: int, n_parent: int, zeta_tier: str,
                       budget_gb: float, target_utilization: float | None = None,
                       psi_face_bytes: float = 0.0, n_col_psi: int | None = None,
-                      n_s_psi: int | None = None) -> MuBatchPlan:
+                      n_s_psi: int | None = None,
+                      mu_multiple: int = 1) -> MuBatchPlan:
     """Size the μ-batch ζ fit; refuses by GATE when even the smallest batch fails.
 
     Order (doc "Per-rank memory model"): ψ route (the r-block cache when it
@@ -1622,6 +1625,11 @@ def plan_zeta_mubatch(*, meta, mesh_xy, n_q_selected: int, ngkmax: int,
     host share holds it, else slab_io disk.  ``zeta_tier`` is the solve tier
     (``isdf.core._resolve_zeta_gather``): ``local`` streams q-local tiles,
     anything else G-split tiles.
+
+    A symmetric deck (``n_parent < nk``) keeps ψ, ``X_B`` and the pair
+    projectors on the raw parents and unfolds on the rank, so those terms
+    are priced at ``n_parent`` rows and the k-convolution at the full grid;
+    its μ batches are whole X shards of the packed order (``mu_multiple``).
     """
     from runtime.padding import mesh_divisor
     P_ = int(mesh_divisor(mesh_xy))
@@ -1638,6 +1646,8 @@ def plan_zeta_mubatch(*, meta, mesh_xy, n_q_selected: int, ngkmax: int,
     budget = float(budget_gb) * 1e9
     target = budget * float(target_utilization)
 
+    parent = int(n_parent) < nk
+    nk_src = int(n_parent) if parent else nk
     bc = max(P_, padded_axis(int(band_chunk), P_, name="μ-batch band chunk").carrier)
     b_p = bc // P_
     n_bc = math.ceil(int(fit_nb) / bc)
@@ -1649,15 +1659,14 @@ def plan_zeta_mubatch(*, meta, mesh_xy, n_q_selected: int, ngkmax: int,
     base = {
         "C factor": _c128(Q, mu, mu, shard=P_),
         "centroid faces": float(psi_face_bytes),
-        "full-BZ face": (_c128(nk, ns, mu, face_nb, shard=P_)
-                         if int(n_parent) != nk else 0.0),
+        "orbit tables": (4.0 * n_rtot * (1 + 8 * 2) / P_ if parent else 0.0),
         "loader tables": 4.0 * nk * n_rtot + _C128 * nk * N_Gpsi,
     }
     base_total = sum(base.values())
-    cache_bytes = _c128(nk, nb_slots, ns, R0)
-    cache_build = (_c128(nk, b_p, ns, n_rtot) * _FFT_CUFFT_FACTOR
-                   + _c128(nk, bc, ns, R0))
-    resident_bytes = _c128(nk, nb_slots, ns, N_Gpsi, shard=P_)
+    cache_bytes = _c128(nk_src, nb_slots, ns, R0)
+    cache_build = (_c128(nk_src, b_p, ns, n_rtot) * _FFT_CUFFT_FACTOR
+                   + _c128(nk_src, bc, ns, R0))
+    resident_bytes = _c128(nk_src, nb_slots, ns, N_Gpsi, shard=P_)
 
     axis = max(range(3), key=lambda i: fft_grid[i])
     n_a = fft_grid[axis]
@@ -1665,28 +1674,34 @@ def plan_zeta_mubatch(*, meta, mesh_xy, n_q_selected: int, ngkmax: int,
     n_col = int(n_col_psi) if n_col_psi else ps
     n_s = int(n_s_psi) if n_s_psi else n_a
 
-    def ws(route, b, r_s, cs, *, source):
+    def ws(route, b, r_s, cs, *, source, bc=None):
+        bc = bc_now[0] if bc is None else int(bc)
+        b_p = bc // P_
         c = b // P_
         R = R0 if route == 'cache' else math.ceil(n_a / P_) * ps
         t = {
-            "X_B": _c128(nk, ns, b, face_nb) + 2 * _c128(nk, ns, b, bc),
-            "pair projectors": 2 * ns * ns * _c128(nk, b, r_s),
-            "k-conv + Z": 7 * _c128(nk, b, r_s) + 2 * _c128(Q, b, r_s),
+            "X_B": _c128(nk_src, ns, b, face_nb) + 2 * _c128(nk_src, ns, b, bc),
+            "pair projectors": 2 * ns * ns * _c128(nk_src, b, r_s),
+            "k-conv + Z": ((9 if parent else 7) * _c128(nk, b, r_s)
+                           + 2 * _c128(Q, b, r_s)),
             "rows (transposed)": _c128(Q, c, P_ * R),
             "row FFT": _c128(cs, n_rtot) * _FFT_CUFFT_FACTOR
                        + 2 * _c128(Q, c, N_G),
         }
         if route == 'cache':
-            t["ψ sub-block"] = 2 * _c128(nk, bc, ns, r_s)
+            t["ψ sub-block"] = 2 * _c128(nk_src, nb_slots if parent else bc,
+                                         ns, r_s)
         else:
             n_pg = max(1, r_s // ps)
             t["ψ regeneration"] = (
-                _c128(nk, b_p, ns, n_col, n_s)
-                + 2 * _c128(nk, b_p, ns, P_ * n_pg, n_col)
-                + 3 * _c128(nk, bc, ns, r_s))
+                _c128(nk_src, b_p, ns, n_col, n_s)
+                + 2 * _c128(nk_src, b_p, ns, P_ * n_pg, n_col)
+                + 3 * _c128(nk_src, bc, ns, r_s))
             if source == 'host':
-                t["ψ(G) host tile"] = _c128(nk, b_p, ns, N_Gpsi)
+                t["ψ(G) host tile"] = _c128(nk_src, b_p, ns, N_Gpsi)
         return t
+
+    bc_now = [bc]
 
     def fits(route, source, b, r_s, cs, extra=0.0):
         src = (cache_bytes if source == 'cache' else
@@ -1694,7 +1709,11 @@ def plan_zeta_mubatch(*, meta, mesh_xy, n_q_selected: int, ngkmax: int,
         return base_total + src + extra + sum(
             ws(route, b, r_s, cs, source=source).values()) <= target
 
-    b_min = P_
+    step = int(mu_multiple) if parent else 1
+    if finalize_layout == 'g':
+        step = step * P_ // math.gcd(step, P_)
+    step = max(1, step)
+    b_min = step
     # 1. route and source
     r_cache = min(R0, 4096)
     if (fits('cache', 'cache', b_min, r_cache, 1)
@@ -1710,6 +1729,19 @@ def plan_zeta_mubatch(*, meta, mesh_xy, n_q_selected: int, ngkmax: int,
                 "pencil split is not implemented.  Fix: more memory per "
                 "device, or a rank count whose cache fits.")
         route, r_s, r_sub = 'planes', ps, 1
+        # The plane route accumulates D over regenerated band chunks, so a
+        # wide chunk saves D round trips: the widest (a multiple of P) whose
+        # regeneration transient stays within a fifth of the target.
+        wide = max(P_, padded_axis(int(fit_nb), P_, name="μ-batch fit bands").carrier)
+        while wide > P_:
+            if ws('planes', b_min, r_s, 1, source='resident',
+                  bc=wide)["ψ regeneration"] <= 0.2 * target:
+                break
+            wide = max(P_, (wide // 2) // P_ * P_)
+        bc_now[0] = bc = wide
+        n_bc = math.ceil(int(fit_nb) / bc)
+        nb_slots = n_bc * bc
+        resident_bytes = _c128(nk, nb_slots, ns, N_Gpsi, shard=P_)
         source = ('resident' if fits('planes', 'resident', b_min, r_s, 1)
                   else 'host')
         if not fits('planes', source, b_min, r_s, 1):
@@ -1722,20 +1754,21 @@ def plan_zeta_mubatch(*, meta, mesh_xy, n_q_selected: int, ngkmax: int,
                 "budget.  Fix: more ranks (every term but the loader tables "
                 "divides by P) or more memory per device.")
     # 2. the largest batch with the store off the device
-    b_cap = math.ceil(mu / P_) * P_
+    b_cap = math.ceil(mu / step) * step
     b = b_min
-    while b + P_ <= b_cap and fits(route, source, b + P_, r_s, 1):
-        b += P_
+    while b + step <= b_cap and fits(route, source, b + step, r_s, 1):
+        b += step
     # Balance the batches: the same batch count with the smallest width.
     n_batch = math.ceil(mu / b)
-    b = math.ceil(math.ceil(mu / n_batch) / P_) * P_
+    b = math.ceil(math.ceil(mu / n_batch) / step) * step
     n_batch = math.ceil(mu / b)
     # 3. FFT rows per step from what is left.
     left = target - base_total - (
         cache_bytes if source == 'cache' else
         resident_bytes if source == 'resident' else 0.0) - sum(
         ws(route, b, r_s, 1, source=source).values())
-    cs_max = Q * (b // P_)
+    cs_max = max(1, (math.ceil(Q / P_) * b) if finalize_layout == 'q'
+                 else Q * (b // P_))
     cs = max(1, min(cs_max, int(0.5 * max(left, 0.0)
                                 // (_c128(1, n_rtot) * _FFT_CUFFT_FACTOR)) + 1))
     # 4. G tile for the streamed finalize (multiple of P, ~quarter target).
@@ -1767,10 +1800,12 @@ def plan_zeta_mubatch(*, meta, mesh_xy, n_q_selected: int, ngkmax: int,
         "Z store write": 0.0 if placement == 'device' else store_total / P_,
         "Z store read": 0.0 if placement == 'device' else store_total / P_,
         "ψ regeneration": (0.0 if route == 'cache' else
-                           n_batch * _c128(nk, nb_slots, ns, n_col, n_a, shard=P_)),
+                           n_batch * _c128(nk_src, nb_slots, ns, n_col, n_a,
+                                           shard=P_)),
     }
     return MuBatchPlan(
-        route=route, source=source, b=int(b), n_batch=int(n_batch),
+        route=route, source=source, band_chunk=int(bc), b=int(b),
+        n_batch=int(n_batch),
         r_sub=int(r_sub), row_chunk=int(cs), g_tile=int(g_tile),
         placement=placement, finalize_layout=finalize_layout,
         hwm_bytes=float(hwm), budget_bytes=float(budget),
