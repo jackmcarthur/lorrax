@@ -433,6 +433,165 @@ def to_rmu(
               jnp.asarray(kvecs_frac, dtype=jnp.float64))
 
 
+# ---------------------------------------------------------------------------
+# Plane-restricted transforms: a real-grid TILE that lies on a few planes of
+# one box axis.  ONE implementation for both directions of the ζ fit's
+# r-chunk transforms (ψ(G) → ψ(tile) and ζ(tile) → ζ(G)); the full-box forms
+# below remain the transform of a whole grid or a contiguous slab.
+#
+# For planes {a_p} of axis ``a`` (in-plane axes b < c, plane size n_b·n_c)
+#
+#   f(r) on the tile  ──2D FFT over (b,c) of each touched plane──▶  F_p(g_b, g_c)
+#   ζ(G) = Σ_p exp(-2πi g_a a_p / n_a) · F_p(g_b, g_c)               (forward)
+#
+# and the adjoint for ψ, whose sphere is first gathered into the
+# "cylinder" of (b,c) columns × axis coordinates it occupies:
+#
+#   F_p(col) = Σ_s exp(+2πi s a_p / n_a) · ψ(col, s)  ──2D IFFT──▶  ψ(tile).
+#
+# Cost per row: n_planes·n_b·n_c·log(n_b·n_c) + n_planes·n_sphere, against
+# n_rtot·log(n_rtot) for the full box: proportional to the tile's planes,
+# not to the box.  Both FFTs are the module's ``local_fftn3`` /
+# ``local_ifftn3`` kernels over two axes.  Exact up to roundoff: every
+# tile point lies on a listed plane, and the omitted planes carry zeros.
+# ---------------------------------------------------------------------------
+
+def _plane_geometry(fft_grid, axis: int):
+    """``(n_a, (n_b, n_c), (b, c))`` for planes normal to ``axis``."""
+    n = tuple(int(s) for s in fft_grid)
+    others = tuple(i for i in range(3) if i != int(axis))
+    return n[int(axis)], (n[others[0]], n[others[1]]), others
+
+
+def plane_split(flat, fft_grid, axis: int):
+    """Flat C-order grid index → ``(coordinate along axis, in-plane flat index)``.
+
+    Works on NumPy or JAX integer arrays.  The in-plane index is C order
+    over the two remaining axes, the layout the plane FFT stack uses.
+    """
+    nx, ny, nz = (int(s) for s in fft_grid)
+    coords = (flat // (ny * nz), (flat // nz) % ny, flat % nz)
+    _, (_, n_c), (b, c) = _plane_geometry(fft_grid, axis)
+    return coords[int(axis)], coords[b] * n_c + coords[c]
+
+
+def _norm_split(norm, n_a: int, n_plane: int, *, inverse: bool):
+    """(2D FFT norm, scale of the axis-a partial DFT) composing ``norm`` in 3D."""
+    norm = "backward" if norm is None else str(norm)
+    if norm == "ortho":
+        return "ortho", 1.0 / np.sqrt(n_a)
+    if norm == "backward":
+        return "backward", (1.0 / n_a) if inverse else 1.0
+    if norm == "forward":
+        return "forward", 1.0 if inverse else (1.0 / n_a)
+    raise ValueError(f"plane transform: unknown norm {norm!r}")
+
+
+def _tile_plane_slots(r_idx, planes, fft_grid, axis: int):
+    """Per tile slot: its flat index in the ``(n_p, n_b·n_c)`` plane stack.
+
+    ``r_idx`` holds grid indices with out-of-grid pad sentinels; ``planes``
+    the tile's plane coordinates, ``-1`` padded.  A slot whose point is not
+    on a listed plane — a pad, or a table/tile mismatch — gets a DISTINCT
+    out-of-stack index (``n_p·plane + slot``) so ``mode='drop'`` scatters
+    and zero-masked gathers ignore it without breaking uniqueness.
+    Returns ``(stack_idx, on_plane)``.
+    """
+    n_a, (n_b, n_c), _ = _plane_geometry(fft_grid, axis)
+    n_rtot = int(np.prod(fft_grid))
+    n_p = int(planes.shape[0])
+    ps = n_b * n_c
+    r_idx = jnp.asarray(r_idx, dtype=jnp.int32)
+    valid = (r_idx >= 0) & (r_idx < n_rtot)
+    a, inp = plane_split(jnp.clip(r_idx, 0, n_rtot - 1), fft_grid, axis)
+    match = a[:, None] == jnp.asarray(planes, dtype=jnp.int32)[None, :]
+    on_plane = valid & jnp.any(match, axis=1)
+    pos = jnp.argmax(match, axis=1).astype(jnp.int32)
+    sentinel = n_p * ps + jnp.arange(r_idx.shape[0], dtype=jnp.int32)
+    return jnp.where(on_plane, pos * ps + inp, sentinel), on_plane
+
+
+def psi_cylinder_tables(g_index, fft_grid, axis: int, *, ngkmax: int):
+    """The ψ sphere's cylinder: the (b,c) columns and axis coordinates it occupies.
+
+    ``g_index`` is the ``(nk, nx, ny, nz)`` box → sphere-slot table
+    (``ngkmax`` = empty).  Returns ``(cyl_index (nk, n_col, n_s) int32,
+    cyl_axis (n_s,) int32, plane_from_col (n_b·n_c,) int32)``: sphere slot
+    of column ``col``, axis coordinate ``cyl_axis[s]`` (``ngkmax`` where the
+    sphere of that k has no point), and the column of each in-plane cell
+    (``n_col`` = none).  Columns and coordinates are the union over k, so
+    one static shape serves every k row.  Built once per fit.
+    """
+    n_a, (n_b, n_c), (b, c) = _plane_geometry(fft_grid, axis)
+    g = jnp.asarray(g_index, dtype=jnp.int32)
+    occ = g < int(ngkmax)                                     # (nk, nx, ny, nz)
+    ax = 1 + int(axis)
+    col_mask = np.asarray(jax.device_get(jnp.any(occ, axis=(0, ax))))
+    s_mask = np.asarray(jax.device_get(
+        jnp.any(occ, axis=tuple(i for i in range(4) if i != ax))))
+    cols = np.flatnonzero(col_mask.reshape(-1)).astype(np.int32)   # (n_col,)
+    cyl_axis = np.flatnonzero(s_mask).astype(np.int32)              # (n_s,)
+    # (nk, n_b, n_c, n_a) with the plane axis last, then the cylinder.
+    g_t = jnp.moveaxis(g, ax, -1).reshape(g.shape[0], n_b * n_c, n_a)
+    cyl_index = jnp.take(jnp.take(g_t, jnp.asarray(cols), axis=1),
+                         jnp.asarray(cyl_axis), axis=2)
+    plane_from_col = np.full((n_b * n_c,), cols.size, dtype=np.int32)
+    plane_from_col[cols] = np.arange(cols.size, dtype=np.int32)
+    return cyl_index, jnp.asarray(cyl_axis), jnp.asarray(plane_from_col)
+
+
+def to_rpoints_planes_inner(
+    psi: jax.Array,
+    cylinder,
+    fft_grid: Sequence[int],
+    r_flat_idx: jax.Array,
+    planes: jax.Array,
+    axis: int,
+    *,
+    norm: str = "backward",
+    kvecs_frac: jax.Array | None = None,
+) -> jax.Array:
+    """ψ(G) → ψ at a tile's points through its planes only (device-local).
+
+    ``psi`` ``(n_k, nb, ns, ngkmax)``; ``cylinder`` the
+    :func:`psi_cylinder_tables` triple for these k rows; ``planes`` the
+    tile's ``(n_p,)`` plane coordinates (``-1`` pads).  Returns
+    ``(n_k, nb, ns, R)``, equal to :func:`to_rpoints_inner` on the same
+    points up to roundoff; slots off every listed plane come back zero.
+    """
+    cyl_index, cyl_axis, plane_from_col = cylinder
+    n_a, (n_b, n_c), _ = _plane_geometry(fft_grid, axis)
+    ps = n_b * n_c
+    n_k, nb, ns, ngkmax = (int(v) for v in psi.shape)
+    n_col, n_s = int(cyl_index.shape[1]), int(cyl_index.shape[2])
+    n_p = int(planes.shape[0])
+    norm2, scale = _norm_split(norm, n_a, ps, inverse=True)
+
+    psi_pad = jnp.concatenate(
+        [psi, jnp.zeros((n_k, nb, ns, 1), dtype=psi.dtype)], axis=-1)
+    idx = jnp.clip(cyl_index, 0, ngkmax).reshape(n_k, 1, 1, n_col * n_s)
+    cyl = jnp.take_along_axis(psi_pad, idx, axis=-1).reshape(
+        n_k, nb, ns, n_col, n_s)
+    planes_i = jnp.asarray(planes, dtype=jnp.int32)
+    ph = jnp.exp((2j * jnp.pi / n_a) * (
+        cyl_axis.astype(jnp.float64)[:, None]
+        * planes_i.astype(jnp.float64)[None, :])) * scale            # (n_s, n_p)
+    F = jnp.einsum("kbscj,jp->kbspc", cyl, ph.astype(psi.dtype))
+    F = jnp.concatenate(
+        [F, jnp.zeros((n_k, nb, ns, n_p, 1), dtype=F.dtype)], axis=-1)
+    stack = jnp.take(F, plane_from_col, axis=-1)                     # (.., n_p, ps)
+    rb = local_ifftn3(stack.reshape(n_k, nb, ns, n_p, n_b, n_c),
+                      axes=(-2, -1), norm=norm2).reshape(n_k, nb, ns, n_p * ps)
+    slot, on_plane = _tile_plane_slots(r_flat_idx, planes_i, fft_grid, axis)
+    slab = jnp.take(rb, jnp.clip(slot, 0, n_p * ps - 1), axis=-1)
+    slab = jnp.where(on_plane[None, None, None, :], slab, 0)
+    if kvecs_frac is not None:
+        slab = apply_bloch_phase_at(
+            slab, kvecs_frac, tuple(int(s) for s in fft_grid),
+            jnp.asarray(r_flat_idx, dtype=jnp.int32))
+    return slab
+
+
 def to_rchunk_inner(
     psi: jax.Array,
     g_index: jax.Array,
@@ -471,6 +630,9 @@ def to_rpoints_inner(
     norm: str = "backward",
     kvecs_frac: jax.Array | None = None,
     k_tile: int | None = None,
+    planes: jax.Array | None = None,
+    plane_axis: int | None = None,
+    cylinder=None,
 ) -> jax.Array:
     """The arbitrary-point twin of :func:`to_rchunk_inner`; see docs/architecture/zeta_fit_face_psi_cct.md.
 
@@ -480,7 +642,17 @@ def to_rpoints_inner(
     so the result is the untiled one.  The tile must divide the k extent
     (``gw.gflat_memory_model.zeta_fft_k_tile`` picks such a divisor), so no
     pad k row exists.
+
+    With ``planes`` (the tile's plane coordinates along ``plane_axis``) and
+    ``cylinder`` (:func:`psi_cylinder_tables` for these k rows) the points
+    are produced by :func:`to_rpoints_planes_inner` instead of a full-box
+    IFFT: the same values up to roundoff, at a cost set by the tile.
     """
+    planar = planes is not None
+    if planar and (cylinder is None or plane_axis is None):
+        raise ValueError(
+            "to_rpoints_inner: planes= needs plane_axis= and cylinder= "
+            "(psi_cylinder_tables of the same k rows).")
     nk = int(psi.shape[0])
     if k_tile is not None and int(k_tile) < nk:
         kt = int(k_tile)
@@ -493,6 +665,20 @@ def to_rpoints_inner(
         def _tiles(x):
             return x.reshape(n_t, kt, *x.shape[1:])
 
+        if planar:
+            cyl_index, cyl_axis, plane_from_col = cylinder
+
+            def _one_tile(args):
+                psi_t, c_t, kv_t = args
+                return to_rpoints_planes_inner(
+                    psi_t, (c_t, cyl_axis, plane_from_col), fft_grid,
+                    r_flat_idx, planes, plane_axis, norm=norm,
+                    kvecs_frac=kv_t)
+
+            kv = None if kvecs_frac is None else _tiles(kvecs_frac)
+            out = jax.lax.map(_one_tile, (_tiles(psi), _tiles(cyl_index), kv))
+            return out.reshape(nk, *out.shape[2:])
+
         def _one_tile(args):
             psi_t, g_t, kv_t = args
             return to_rpoints_inner(
@@ -501,6 +687,10 @@ def to_rpoints_inner(
         kv = None if kvecs_frac is None else _tiles(kvecs_frac)
         out = jax.lax.map(_one_tile, (_tiles(psi), _tiles(g_index), kv))
         return out.reshape(nk, *out.shape[2:])
+    if planar:
+        return to_rpoints_planes_inner(
+            psi, cylinder, fft_grid, r_flat_idx, planes, plane_axis,
+            norm=norm, kvecs_frac=kvecs_frac)
     ngkmax = int(psi.shape[-1])
     fft_grid_t = tuple(int(s) for s in fft_grid)
     nx, ny, nz = fft_grid_t
@@ -1112,14 +1302,29 @@ def accumulate_rchunk_to_gflat(
     norm: str = "backward",
     chunk_size: int | None = None,
     r_indices: jax.Array | None = None,
+    planes: jax.Array | None = None,
+    plane_axis: int | None = None,
 ) -> jax.Array:
-    """Add ``FFT(pad(phase(rchunk)))[sphere_idx]`` into ``gflat_acc``; see docs/architecture/zeta_fit_face_psi_cct.md."""
+    """Add ``FFT(pad(phase(rchunk)))[sphere_idx]`` into ``gflat_acc``; see docs/architecture/zeta_fit_face_psi_cct.md.
+
+    With ``planes`` (the tile's ``(n_p,)`` plane coordinates along
+    ``plane_axis``, ``-1`` padded; requires ``r_indices``) the transform
+    runs on those planes only: 2D FFTs of the touched planes and a partial
+    DFT along the axis evaluated directly on the sphere (see "Plane-
+    restricted transforms" above).  Same result up to roundoff; cost set by
+    the tile, not the box.
+    """
     indexed = r_indices is not None
     if indexed == (r0 is not None):
         raise ValueError(
             "accumulate_rchunk_to_gflat: pass exactly one of r0 / r_indices "
             f"(got r0={r0!r}, r_indices="
             f"{'an array' if indexed else None}).")
+    planar = planes is not None
+    if planar and (not indexed or plane_axis is None):
+        raise ValueError(
+            "accumulate_rchunk_to_gflat: planes= needs r_indices= and "
+            "plane_axis= (the tile's point list and its plane axis).")
 
     fft_grid_t = tuple(int(s) for s in fft_grid)
     nx, ny, nz = fft_grid_t
@@ -1178,6 +1383,7 @@ def accumulate_rchunk_to_gflat(
         fft_grid_t, r_len_i, ngkmax, sphere_id,
         norm, qvec_shape, qvec_id, cs, n_chunks, pad_N, indexed,
         _sharding_key(rchunk), _sharding_key(gflat_acc),
+        (None if not planar else (int(plane_axis), int(np.shape(planes)[0]))),
     )
 
     def build():
@@ -1199,15 +1405,27 @@ def accumulate_rchunk_to_gflat(
         # gflat_acc.  P(None, ('x','y'), None) is enforced by the
         # caller; the shard_map below sees per-rank slabs.
         in_spec = out_spec = mu_gflat_spec
+        if planar:
+            n_a, (n_b, n_c), _ = _plane_geometry(fft_grid_t, plane_axis)
+            ps = n_b * n_c
+            n_p = int(np.shape(planes)[0])
+            norm2, a_scale = _norm_split(norm, n_a, ps, inverse=False)
+            # Sphere (q, G) → (axis coordinate, in-plane cell): static per fit.
+            sph_a_np, sph_inp_np = plane_split(
+                sphere_arr.astype(np.int64), fft_grid_t, plane_axis)
+            sph_a = jnp.asarray(sph_a_np.astype(np.int32))
+            sph_inp = jnp.asarray(sph_inp_np.astype(np.int32))
 
         @partial(shard_map, mesh=mesh,
-                 in_specs=(in_spec, in_spec, P()),
+                 in_specs=((in_spec, in_spec, P(), P()) if planar
+                           else (in_spec, in_spec, P())),
                  out_specs=out_spec,
                  check_vma=False)
-        def _kernel(rch_, acc_, r_):
+        def _kernel(rch_, acc_, r_, *plane_args):
             # Per-rank: (n_q, n_mu_local, r_len) / (n_q, n_mu_local, ngkmax).
             # ``r_`` is the flat-r start scalar (r0 path) or the (r_len,)
-            # index table (r_indices path); both arrive replicated.
+            # index table (r_indices path); both arrive replicated, as do
+            # the tile's plane coordinates on the plane path.
             rch_flat = rch_.reshape(N, r_len_i)
             acc_flat = acc_.reshape(N, ngkmax)
             if pad_N:
@@ -1238,10 +1456,27 @@ def accumulate_rchunk_to_gflat(
                 # zero column.  A scatter into the (cs, n_rtot) box was
                 # measured at 1.27 s per tile against 5 ms for the slab
                 # path (Si P4, 2026-09-05); this gather restores that class.
-                box_from_slab = jnp.full((n_rtot,), r_len_i, dtype=jnp.int32)
-                box_from_slab = box_from_slab.at[r_].set(
-                    jnp.arange(r_len_i, dtype=jnp.int32), mode='drop',
-                    unique_indices=True)
+                if planar:
+                    # The same gather, into the tile's plane stack only.
+                    planes_ = plane_args[0]
+                    stack_idx, _ = _tile_plane_slots(
+                        r_, planes_, fft_grid_t, plane_axis)
+                    box_from_slab = jnp.full(
+                        (n_p * ps,), r_len_i, dtype=jnp.int32)
+                    box_from_slab = box_from_slab.at[stack_idx].set(
+                        jnp.arange(r_len_i, dtype=jnp.int32), mode='drop',
+                        unique_indices=True)
+                    # exp(-2πi g_a a_p / n_a) for every axis index g_a.
+                    ph_axis = jnp.exp(
+                        (-2j * jnp.pi / n_a)
+                        * planes_.astype(jnp.float64)[:, None]
+                        * jnp.arange(n_a, dtype=jnp.float64)[None, :]
+                    ) * a_scale                                  # (n_p, n_a)
+                else:
+                    box_from_slab = jnp.full((n_rtot,), r_len_i, dtype=jnp.int32)
+                    box_from_slab = box_from_slab.at[r_].set(
+                        jnp.arange(r_len_i, dtype=jnp.int32), mode='drop',
+                        unique_indices=True)
 
             def body(acc, i):
                 i0    = i * cs
@@ -1267,10 +1502,20 @@ def accumulate_rchunk_to_gflat(
                     buf = jnp.zeros((cs, n_rtot), dtype=sub.dtype)
                     buf = jax.lax.dynamic_update_slice_in_dim(
                         buf, sub, r_, axis=-1)
-                box = buf.reshape(cs, nx, ny, nz)
-                G = local_fftn3(box, axes=(-3, -2, -1), norm=norm).reshape(cs, n_rtot)
-                contrib = jnp.take_along_axis(
-                    G, sphere_c[q_row], axis=-1, mode='promise_in_bounds')
+                if planar:
+                    F = local_fftn3(buf.reshape(cs, n_p, n_b, n_c),
+                                    axes=(-2, -1), norm=norm2
+                                    ).reshape(cs, n_p, ps)
+                    Fg = jnp.take_along_axis(
+                        F, sph_inp[q_row][:, None, :], axis=-1,
+                        mode='promise_in_bounds')           # (cs, n_p, ngk)
+                    w = jnp.take(ph_axis, sph_a[q_row], axis=1)  # (n_p, cs, ngk)
+                    contrib = jnp.einsum('cpg,pcg->cg', Fg, w)
+                else:
+                    box = buf.reshape(cs, nx, ny, nz)
+                    G = local_fftn3(box, axes=(-3, -2, -1), norm=norm).reshape(cs, n_rtot)
+                    contrib = jnp.take_along_axis(
+                        G, sphere_c[q_row], axis=-1, mode='promise_in_bounds')
                 acc_sub = jax.lax.dynamic_slice_in_dim(acc, i0, cs, axis=0)
                 return jax.lax.dynamic_update_slice_in_dim(
                     acc, acc_sub + contrib, i0, axis=0), None
@@ -1288,6 +1533,8 @@ def accumulate_rchunk_to_gflat(
         r_arg = jnp.asarray(r_indices, dtype=jnp.int32)
     else:
         r_arg = (jnp.int32(int(r0)) if isinstance(r0, (int, np.integer)) else r0)
+    if planar:
+        return fn(rchunk, gflat_acc, r_arg, jnp.asarray(planes, dtype=jnp.int32))
     return fn(rchunk, gflat_acc, r_arg)
 
 

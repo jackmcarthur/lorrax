@@ -1305,6 +1305,7 @@ def z_q_from_psi_sm(
     *, psi_G_store, psi_r_cache=None, band_chunk_ranges,
     kgrid, mesh_xy, psi_mun, weight_l, weight_r, k_unfold_plan,
     tile_r_index, tile_local_perm, tile_wraps, gamma_L=0, gamma_R=0, layout="face",
+    tile_planes=None, plane_axis=None,
 ):
     """Build Zq from raw parents on one typed orbit-closed real-grid tile."""
     if k_unfold_plan is None:
@@ -1316,7 +1317,8 @@ def z_q_from_psi_sm(
         k_unfold_plan=k_unfold_plan,
         tile_r_index=tile_r_index, tile_local_perm=tile_local_perm,
         tile_wraps=tile_wraps, band_chunk_ranges=band_chunk_ranges,
-        kgrid=kgrid, mesh_xy=mesh_xy, gamma_L=gamma_L, gamma_R=gamma_R, layout=layout)
+        kgrid=kgrid, mesh_xy=mesh_xy, gamma_L=gamma_L, gamma_R=gamma_R, layout=layout,
+        tile_planes=tile_planes, plane_axis=plane_axis)
 
 
 
@@ -1365,8 +1367,16 @@ def _z_q_face_parent(
 	kgrid: tuple[int, int, int],
 	mesh_xy: Mesh,
 	layout="face",
+	tile_planes: jax.Array | None = None,
+	plane_axis: int | None = None,
 ) -> jax.Array:
-	"""Build raw-parent pair projectors and unfold each spin block on an orbit-closed tile."""
+	"""Build raw-parent pair projectors and unfold each spin block on an orbit-closed tile.
+
+	With ``tile_planes``/``plane_axis`` (the tile's plane list from
+	``RealGridOrbitTiles``) the streamed ψ(G)→ψ(tile) source runs on those
+	planes only (``to_rpoints_inner(planes=...)``); the ψ(r)-cache route and
+	the result are unchanged.
+	"""
 	from common.wfn_transforms import to_rpoints_inner
 	from ffi import _services
 	_services.ensure_on_path()
@@ -1422,6 +1432,17 @@ def _z_q_face_parent(
 		raise ValueError("_z_q_face_parent: band_chunk_ranges is empty")
 	_bfs = bcr[0][0]
 	use_psi_r_cache = psi_r_cache is not None
+	planar = tile_planes is not None and not use_psi_r_cache
+	if tile_planes is not None and plane_axis is None:
+		raise ValueError("_z_q_face_parent: tile_planes= needs plane_axis=")
+	if planar:
+		cyl_index, cyl_axis, plane_from_col = _psi_cylinder(
+			psi_G_store, int(plane_axis))
+		n_tile_planes = int(np.shape(tile_planes)[0])
+	else:
+		cyl_index = jnp.zeros((1, 1, 1), jnp.int32)
+		cyl_axis = plane_from_col = jnp.zeros((1,), jnp.int32)
+		n_tile_planes = 0
 	from runtime.padding import mesh_divisor
 	P_total = mesh_divisor(mesh_xy)
 	local_band_chunk_shape = tuple(
@@ -1491,15 +1512,17 @@ def _z_q_face_parent(
 		(None if psi_r_cache is None
 		 else tuple(int(s) for s in psi_r_cache.shape)),
 		(None if use_psi_r_cache else int(zeta_k_tile)),
+		((int(plane_axis), n_tile_planes, tuple(int(v) for v in cyl_index.shape))
+		 if planar else None),
 	)
 	if cache_key not in _pair_pipeline_sm_cache:
 
 		@partial(shard_map, mesh=mesh_xy,
 		         in_specs=(mun_spec, w_spec, w_spec, P(), P(), P(None, None),
-		                   cache_spec),
+		                   cache_spec, P(), (P(), P(), P())),
 		         out_specs=(pair_spec, pair_spec), check_vma=False)
 		def _projectors(psi_mun_, w_l_, w_r_, r_index_, g_index_dev,
-		                kvecs_frac_dev, psi_r_cache_):
+		                kvecs_frac_dev, psi_r_cache_, planes_, cylinder_):
 			x_idx = jax.lax.axis_index('x')
 			y_idx = jax.lax.axis_index('y')
 			shard_w = psi_mun_.shape[3]
@@ -1523,7 +1546,9 @@ def _z_q_face_parent(
 					slab = to_rpoints_inner(
 						psi_G_bc, g_index_dev, fft_grid, r_index_,
 						kvecs_frac=kvecs_frac_dev, norm="ortho",
-						k_tile=zeta_k_tile)
+						k_tile=zeta_k_tile,
+						**(dict(planes=planes_, plane_axis=int(plane_axis),
+						        cylinder=cylinder_) if planar else {}))
 				slab = jnp.where(active[None, None, None, :], slab, 0)
 				col = jax.lax.all_to_all(
 					slab, 'y', split_axis=3, concat_axis=1, tiled=True)
@@ -1677,10 +1702,11 @@ def _z_q_face_parent(
 
 		@jax.jit
 		def fn(psi_mun_, w_l_, w_r_, r_index_, local_perm_r_, wraps_r_,
-		        g_index_, kvecs_frac_, psi_r_cache_, vertex_l, vertex_r):
+		        g_index_, kvecs_frac_, psi_r_cache_, vertex_l, vertex_r,
+		        planes_, cylinder_):
 			D_l, D_r = _projectors(
 				psi_mun_, w_l_, w_r_, r_index_, g_index_, kvecs_frac_,
-				psi_r_cache_)
+				psi_r_cache_, planes_, cylinder_)
 			return _tile_tail(D_l, D_r, local_perm_r_, wraps_r_, vertex_l, vertex_r)
 
 		_pair_pipeline_sm_cache[cache_key] = fn
@@ -1699,7 +1725,29 @@ def _z_q_face_parent(
 		jnp.asarray(tile_r_index, dtype=jnp.int32),
 		jnp.asarray(tile_local_perm, dtype=jnp.int32),
 		jnp.asarray(tile_wraps, dtype=jnp.float64),
-		psi_G_store.g_index, psi_G_store.kvecs_frac, psi_r_cache, left, right)
+		psi_G_store.g_index, psi_G_store.kvecs_frac, psi_r_cache, left, right,
+		(jnp.asarray(tile_planes, dtype=jnp.int32) if planar
+		 else jnp.zeros((1,), jnp.int32)),
+		(cyl_index, cyl_axis, plane_from_col))
+
+
+_psi_cylinder_cache: dict = {}
+
+
+def _psi_cylinder(psi_G_store, axis: int):
+	"""The store's ψ-sphere cylinder along ``axis``, built once per store (see ``psi_cylinder_tables``)."""
+	from common.wfn_transforms import psi_cylinder_tables
+	g_index = psi_G_store.g_index
+	key = (id(g_index), tuple(int(v) for v in g_index.shape), int(axis))
+	hit = _psi_cylinder_cache.get(key)
+	if hit is None or hit[0] is not g_index:
+		tables = psi_cylinder_tables(
+			g_index, tuple(int(s) for s in psi_G_store.meta.fft_grid), int(axis),
+			ngkmax=int(psi_G_store.local_band_chunk_shape[3]))
+		hit = (g_index, tables)
+		_psi_cylinder_cache.clear()
+		_psi_cylinder_cache[key] = hit
+	return hit[1]
 
 
 # Backward-compat shim removed — old z_q_from_psi_sm signature
@@ -4476,6 +4524,7 @@ def _make_fit_one_rchunk_kernel(
     distrib_la_batched_route: str = "batch_reshard",
     k_unfold_plan=None,
     layout="face",
+    plane_axis=None,
 ):
     """Cache parent Zq construction and the unchanged selected-q solve phases."""
     if k_unfold_plan is None:
@@ -4495,7 +4544,7 @@ def _make_fit_one_rchunk_kernel(
                     np.asarray(q_neg_idx, dtype=np.int32))
 
     def z_q_phase(psi_r_cache, psi_mun, weight_l, weight_r,
-                  tile_r_index, tile_local_perm, tile_wraps):
+                  tile_r_index, tile_local_perm, tile_wraps, tile_planes=None):
         """Complete the parent RHS on full q before the external row selection."""
         Z_q = z_q_from_psi_sm(
             psi_G_store=psi_G_store, psi_r_cache=psi_r_cache,
@@ -4505,7 +4554,8 @@ def _make_fit_one_rchunk_kernel(
             k_unfold_plan=k_unfold_plan,
             gamma_L=vertex_mu_L, gamma_R=vertex_mu_L,
             tile_r_index=tile_r_index, tile_local_perm=tile_local_perm,
-            tile_wraps=tile_wraps, layout=layout)
+            tile_wraps=tile_wraps, layout=layout,
+            tile_planes=tile_planes, plane_axis=plane_axis)
         if q_neg_idx_np is not None:
             Z_q = complete_ordered_pair_normal_equations(Z_q, q_neg_idx_np)
         return Z_q
@@ -4563,6 +4613,8 @@ def fit_one_rchunk(
     tile_local_perm: jax.Array | None = None,
     tile_wraps: jax.Array | None = None,
     layout="face",
+    tile_planes: jax.Array | None = None,
+    plane_axis: int | None = None,
 ):
     """Build or reuse a parent RHS, select q rows, and solve with cached factors."""
     if k_unfold_plan is None:
@@ -4593,6 +4645,8 @@ def fit_one_rchunk(
         str(distrib_la_batched_route),
         bool(lu_piv is not None),
         id(k_unfold_plan), layout,
+        (None if tile_planes is None
+         else (int(plane_axis), int(np.shape(tile_planes)[0]))),
         (None if q_irr_full_idx is None
          else (int(q_irr_full_idx.shape[0]),
                hash(np.asarray(q_irr_full_idx,
@@ -4616,6 +4670,7 @@ def fit_one_rchunk(
             lu_hoisted=bool(lu_piv is not None),
             distrib_la_batched_route=str(distrib_la_batched_route),
             k_unfold_plan=k_unfold_plan, layout=layout,
+            plane_axis=(None if tile_planes is None else int(plane_axis)),
         )
         _fit_one_rchunk_cache[cache_key] = fn
     # cct_trace_per_q is None for the charge channel (Cholesky path
@@ -4642,7 +4697,7 @@ def fit_one_rchunk(
         if _prebuilt_Z_q is None:
             Z_q = fn.z_q_phase(
                 psi_r_cache, psi_mun, weight_l, weight_r,
-                tile_r_index, tile_local_perm, tile_wraps)
+                tile_r_index, tile_local_perm, tile_wraps, tile_planes)
             # Keep the full-domain charge completion inside z_q_phase, but
             # select in this separate scheduling operation before the outer
             # wait.  Putting the take inside the compiled physics producer
