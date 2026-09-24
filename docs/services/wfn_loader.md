@@ -114,10 +114,8 @@ and returns a window axis. The per-rank band clamp,
 `max(0, min(slab, logical − offset))` per dimension, lives only in
 `file_io._slab_io_ffi._derive_window_counts` → `_derive_valid_shape`. One
 union read beats n separate `read_slab` calls because each collective
-`H5Dread` has a fixed overhead and the loop adds a `jnp.stack`: 1.44× slower
-at MoS2 12×12, 400 bands, 144 IBZ windows (15.6 GB) on P = 4, and 3.2–3.6× at
-fixture scale. The number of reads is the request's IBZ k-count, the axis
-production decks grow along. A `stripe_count = 1` file reads through one
+`H5Dread` has a fixed overhead and the loop adds a `jnp.stack`; n is the
+request's IBZ k-count, the axis production decks grow along. A `stripe_count = 1` file reads through one
 aggregator at any rank count; rank 0 announces the file's stripe layout at
 open.
 
