@@ -767,8 +767,8 @@ def plan_gflat_chunks(
     ``band_chunk_override=None`` and opts into the full-window-first ladder.
 
     ``distributed_zeta_solve`` controls the solve-memory inventory.  ``auto``
-    is conservatively priced as ``replicated``; the live resolver may choose
-    ``per_q`` at execution time, but that cannot make this plan optimistic.
+    is priced as the tier the live resolver picks, through the resolver's own
+    function ``isdf.core.zeta_auto_tier`` at the plan's (Q, μ, P).
 
     ``low_mem_bands`` selects the face or axis centroid inventory; the
     deck default is True. Both layouts use the parent band-chunk route,
@@ -1252,18 +1252,21 @@ def plan_gflat_chunks(
 
     # ---- q_chunk + ζ solve peak, at the ACTUAL chunk_r -----------------
     # ``replicated`` gathers one full (μ,μ) factor per q in the compute
-    # batch.  ``per_q`` structurally gathers exactly one factor and ignores
-    # q_chunk.  ``distributed`` keeps the factor 2-D sharded and also bypasses
-    # the replicated batch.  ``auto`` is deliberately priced as replicated:
-    # the live resolver may narrow it to per_q, but must never make the memory
-    # model optimistic.  Z_col and the donated output accumulator are both
-    # live across the solve and therefore contribute two full sharded RHS
-    # stacks independently of the factor route.
+    # batch.  ``local`` (R4, 2026-09-23) keeps ceil(Q/P) whole factors
+    # resident on each rank and exchanges the RHS: per rank it holds the
+    # q-local RHS and solution, 2·ceil(Q/P)·μ·r·16 B, plus the batch
+    # layout's pad rows of the factor.  ``distributed`` keeps the factor 2-D
+    # sharded and also bypasses the replicated batch.  ``auto`` is priced as
+    # the tier the live resolver will pick, from the SAME function
+    # (``isdf.core.zeta_auto_tier``) at the plan's (Q, μ, P).  Z_col and the donated
+    # output accumulator are both live across the solve and therefore
+    # contribute two full sharded RHS stacks independently of the factor
+    # route.
     _solve_route_requested = str(distributed_zeta_solve).strip().lower()
     if _solve_route_requested not in {
-            "auto", "replicated", "per_q", "distributed"}:
+            "auto", "replicated", "local", "distributed"}:
         raise ValueError(
-            "distributed_zeta_solve must be auto, replicated, per_q, or "
+            "distributed_zeta_solve must be auto, replicated, local, or "
             f"distributed; got {distributed_zeta_solve!r}")
     # Face pair accumulation needs only Py alignment; every solve still sees
     # an all-P carrier.  Price that pad here without imposing it on the face
@@ -1275,17 +1278,24 @@ def plan_gflat_chunks(
     # rather than beside ``C_t`` because ``q_chunk``'s own headroom has to
     # subtract it: see ``_factor_headroom``.
     _zq_live = _c128(nq, mu, _solve_r_chunk, shard=p_xy)
+    _q_local = -(-int(nq_disk) // int(p_xy))
+    _local_t = (_rhs_stacks
+                + 2 * _c128(_q_local, mu, _solve_r_chunk)
+                + _c128(_q_local * p_xy - nq_disk, mu, mu, shard=p_xy))
+    _auto_tier = None
+    if _solve_route_requested == "auto":
+        # The runtime resolver's own arithmetic (isdf.core), not a mirror.
+        from isdf.core import zeta_auto_tier
+        _auto_tier = zeta_auto_tier(int(nq_disk), int(mu), int(p_xy))
+        _solve_route_requested = _auto_tier
     if _solve_route_requested == "distributed":
         q_chunk = 1                    # ignored by the distributed route
         solve_t = _rhs_stacks
         _solve_memory_route = "distributed (2-D-sharded factor)"
-    elif _solve_route_requested == "per_q":
-        q_chunk = 1                    # ignored; one q is structural
-        # The inner shard_map holds the replicated tile plus its y-gather
-        # row, matching isdf.core's live-byte contract.
-        solve_t = (_rhs_stacks
-                   + _c128(mu, mu) * (1.0 + 1.0 / p_y))
-        _solve_memory_route = "per_q (one replicated factor)"
+    elif _solve_route_requested == "local":
+        q_chunk = 1                    # ignored; the q batch is the mesh
+        solve_t = _local_t
+        _solve_memory_route = "local (resident q-local factor)"
     else:
         _factor_per_q = _c128(mu, mu)
         # SUBTRACT THE LIVE Z_q TOO.  ``C_t`` charges ``solve_t + Z_q``
@@ -1309,10 +1319,9 @@ def plan_gflat_chunks(
         q_chunk = max(
             1, min(nq_disk, int(_factor_headroom / _factor_per_q)))
         solve_t = _rhs_stacks + q_chunk * _factor_per_q
-        _solve_memory_route = (
-            "replicated (auto-conservative)"
-            if _solve_route_requested == "auto" else
-            "replicated")
+        _solve_memory_route = "replicated"
+    if _auto_tier is not None:
+        _solve_memory_route = f"auto -> {_solve_memory_route}"
 
     # ---- stage transients + per-stage peaks ----------------------------
     # These are different transforms and different peaks.  Centroid sampling

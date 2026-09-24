@@ -51,7 +51,10 @@ _services.ensure_on_path()
 # when it does not is a stale HIT on a recycled id.
 from distrib_la import (                                            # noqa: E402
     FactorToken,
+    batch_layout as linalg_batch_layout,
     factor as linalg_factor,
+    is_batch_layout as linalg_is_batch_layout,
+    local_batch as linalg_local_batch,
     mesh_is_cpu as _mesh_is_cpu,
     mesh_key as _mesh_key,
     plan as linalg_plan,
@@ -2073,12 +2076,16 @@ def _resolve_solver_kind(
 
 # Budget for the ζ back-solve's replicated-factor ALL-GATHER, i.e. the
 # transient that ``_solve_all_at_once`` / ``_solve_batch_and_update`` put on
-# every rank when they pull the (q_batch, μ, μ) factor to P(None,None,None).
+# every rank when they pull the (q_batch, μ, μ) factor to P(None,None,None)
+# on EVERY r-chunk.  It is THE auto boundary between the two whole-tile tiers:
+# at or below it the small stack is gathered (compute balanced over all P,
+# the gather bounded by this cap); above it the ``local`` tier keeps each
+# factor on its q owner and moves only the RHS (R4, 2026-09-23).
 # Deliberately SEPARATE from ``_REPLICATED_CHOL_MAX_STACK_BYTES``: that one
 # gates whether the FACTORIZATION may be replicated (a physics-route
 # decision, and production raises it to 16 GiB to keep rank_truncate
-# reachable), this one gates only the gather GRANULARITY inside the
-# back-solve, which is numerically free either way.
+# reachable), this one gates only the back-solve's data movement, which is
+# numerically free either way.
 _ZETA_GATHER_MAX_BYTES = int(
     float(os.environ.get("LORRAX_ZETA_GATHER_CAP_GIB", "4")) * 1024 ** 3)
 
@@ -2184,7 +2191,7 @@ def _resolve_zeta_gather(
             # Resolve to the tightest tier this key CAN offer here; the
             # caller's banner prints the request and the resolution side
             # by side, so it is visible, not silent.
-            return "per_q"
+            return "local"
         if str(charge_zeta_solve) != 'rank_truncate':
             raise ValueError(
                 "distributed_zeta_solve='distributed' requires "
@@ -2202,17 +2209,39 @@ def _resolve_zeta_gather(
         # process coverage / geometry / divisibility).
         _resolve_linalg_backend('eigh', 'distributed', mesh_xy, n=n_rmu)
         return tier
-    if tier in ("replicated", "per_q"):
+    if tier in ("replicated", "local"):
         return tier
     if tier != "auto":
+        # ``per_q`` (one replicated (mu, mu) tile gathered per q per r-chunk)
+        # was retired 2026-09-23 for ``local``, which never moves a factor.
         raise ValueError(
             f"distributed_zeta_solve={override!r} invalid; expected "
-            f"auto / replicated / per_q / distributed.")
+            f"auto / replicated / local / distributed.")
     if nq is None or n_rmu is None:
         return "replicated"
-    return ("replicated"
-            if int(nq) * int(n_rmu) ** 2 * 16 <= _ZETA_GATHER_MAX_BYTES
-            else "per_q")
+    return zeta_auto_tier(
+        int(nq), int(n_rmu),
+        1 if mesh_xy is None else int(mesh_xy.devices.size))
+
+
+def zeta_auto_tier(nq: int, n_rmu: int, ndev: int) -> str:
+    """THE ``auto`` choice between the two whole-tile back-solve tiers — read by the resolver and the memory planner alike.
+
+    ``local`` puts ``ceil(nq/P)`` whole q's (factor AND each chunk's RHS
+    columns) on each rank; the even share is ``nq/P``.  Within a factor of
+    two (``ceil(nq/P)·P <= 2·nq``, i.e. every ``nq >= P/2``) that keeps
+    memory O(total/P) with at most half the ranks idle in the solve, and it
+    moves no factor: ``local``.  Below that (a few q on many ranks, e.g. a
+    Γ-only deck) a small stack is gathered instead (``replicated``: compute
+    and RHS stay balanced over all P), while a stack above the gather cap
+    still takes ``local``, its only whole-tile route, with its RHS residency
+    priced by the memory planner.
+    """
+    nq, ndev = int(nq), max(1, int(ndev))
+    within_even_share = -(-nq // ndev) * ndev <= 2 * nq
+    if within_even_share or nq * int(n_rmu) ** 2 * 16 > _ZETA_GATHER_MAX_BYTES:
+        return "local"
+    return "replicated"
 
 
 _replicated_chol_cache = {}  # replicated dense Cholesky kernel (keyed by shape)
@@ -2803,8 +2832,8 @@ def _factor_c_q_replicated_qparallel(
 #   a provider LU kind) — per-q pivoted LU on the whole ridged LOGICAL
 #   tile, computed ONCE per channel (q-parallel over devices at P>1 under
 #   the charge fold's policy), stored as (LU, perm) with the LU factors
-#   identity-re-embedded at the padded extent so every downstream gather
-#   tier (replicated / per_q) consumes them exactly like the CCT it
+#   identity-re-embedded at the padded extent so every downstream whole-tile
+#   tier (replicated / local) consumes them exactly like the CCT it
 #   replaced.  BIT-IDENTICAL to the fused per-r-chunk solve:
 #   jnp.linalg.solve(A, b) IS lax.linalg.lu(A) followed by
 #   lax.linalg.lu_solve(lu, perm, b, 0) (jax _solve), and this stage runs
@@ -3121,7 +3150,7 @@ def _factor_c_q_transverse_distributed_lu(
 # the ranks that share a column block to cooperate on the μ contraction, so
 # this tier keeps Z in the layout it is BUILT in (P(None,'x','y')) and never
 # does the `_reshard_z` two-step all-to-all at all.  Net communication is
-# strictly LOWER than the replicated/per_q tiers — see the accounting in
+# strictly LOWER than the replicated tier — see the accounting in
 # :func:`_distributed_pinv_apply`.
 
 _dist_factor_cache: dict = {}   # distributed rank-truncate factor kernel
@@ -3480,10 +3509,9 @@ def _distributed_pinv_apply(
     _chunk_log('C+ back-solve (GEMM)', nq, qb, per_q_coll)
 
     # NOTE on the eager ``C_pinv[q0:q1]`` / ``Z_q[q0:q1]`` slices below:
-    # the sibling per_q tier (``_solve_one_q_and_update``) slices INSIDE
-    # its jit off a traced q, which gives one compiled shape for the whole
-    # loop.  Here the slices are eager, so a non-dividing ``nq`` gives a
-    # second compiled shape for the remainder block — bounded at two, and
+    # the retired per_q tier sliced INSIDE its jit off a traced q, which
+    # gave one compiled shape for the whole loop.  Here the slices are
+    # eager, so a non-dividing ``nq`` gives a second compiled shape for the remainder block — bounded at two, and
     # deliberate: the q-batch is chosen from a BYTE budget, so making the
     # block shape uniform would mean padding nq and factoring q-blocks
     # that do not exist.  Two compiles + two transient slices per r-chunk
@@ -3904,87 +3932,6 @@ def _zeta_batched_kernels(
     return _sharded_cho_solve, _sharded_cho_solve_batch, _solve_batch_and_update, _solve_all_at_once
 
 
-def _zeta_per_q_kernel(
-        L_batch_xy_shard, _lu_apply_logical, _pinv_apply_T_logical, _pinv_matmul_logical,
-        _ridge_indef_solve, _tri_solve_logical, hoisted_lu, mesh_xy, piv_rep_shard, use_lu,
-        use_pinv_T, use_rank_trunc):
-    """Produce the existing one-q factor-gather and donated zeta update kernel."""
-    # PER-Q tier.  The q-selection happens INSIDE a shard_map, where
-    # the gather is a `lax.all_gather` on an already-sliced tile — so
-    # the per-q extent is a STRUCTURAL property of the program, not a
-    # request the partitioner is free to reorder.
-    #
-    # HISTORY — do not regress this (scorecard Y.2, measured on the
-    # production deck).  The first implementation sliced a traced ``q``
-    # out of the sharded stack and then asked for the tile replicated::
-    #
-    #     L_one = lax.dynamic_slice_in_dim(L_q_sharded, q, 1, axis=0)
-    #     L_one_rep = lax.with_sharding_constraint(L_one, replicated)
-    #
-    # which reads as "gather one (μ,μ) tile".  XLA:CPU's SPMD
-    # partitioner does NOT sink a q-axis ``dynamic_slice`` through the
-    # μ-axis ``all-gather`` even though the two commute: it emitted the
-    # WHOLE ``(nq, μ_pad, μ_pad)`` gather and applied the slice
-    # afterwards.  Measured at 1998 centroids / μ_pad = 2048 / P = 64,
-    # the buffer assignment charged ``jit(_solve_one_q_and_update)``
-    # ``nq·μ_pad·(μ_pad + μ_pad/P_x)·16`` = 10.87 GB — i.e. the tier's
-    # own gather was LARGER than the ``replicated`` gather it exists to
-    # avoid (9.66 GB), and because the module runs once per q it moved
-    # 144× that per r-chunk.  That is the whole of the 12–40× wall-clock
-    # penalty Y.1 measured, and it is why T.5's "9.36 GB → 0.065 GB"
-    # headline was wrong.
-    #
-    # Inside a shard_map there is nothing left to hoist: the local
-    # slice is a local slice of the rank's OWN ``(nq, μ/Px, μ/Py)``
-    # block, and the two ``all_gather``s that follow it are written on
-    # a single-q operand.  Gathered bytes per execution are exactly
-    # ``μ_pad·(μ_pad/Py)·16 + μ_pad²·16`` — 75 MB at μ_pad = 2048,
-    # independent of nq.
-    @partial(shard_map, mesh=mesh_xy,
-             in_specs=(P(None, 'x', 'y'),            # L_q  (nq, μ, μ)
-                       P(None, None, ('x', 'y')),    # Z_col
-                       P(None, None, ('x', 'y')),    # zeta_acc
-                       P(),                          # q (replicated scalar)
-                       P(None, None)),               # piv (replicated)
-             out_specs=P(None, None, ('x', 'y')),
-             check_vma=False)
-    def _per_q_block(L_loc, Z_loc, zeta_loc, q, piv_loc):
-        # L_loc: (nq, μ/Px, μ/Py) — this rank's 2-D block of the stack.
-        L_one = jax.lax.dynamic_slice_in_dim(L_loc, q, 1, axis=0)
-        # Rebuild EXACTLY the replicated (1, μ, μ) tile the batched
-        # kernel would have seen: 'x' owns axis 1, 'y' owns axis 2, so
-        # the tiled all_gathers concatenate in mesh-index order.
-        L_row = jax.lax.all_gather(L_one, 'x', axis=1, tiled=True)
-        L_tile = jax.lax.all_gather(L_row, 'y', axis=2, tiled=True)
-        Z_one = jax.lax.dynamic_slice_in_dim(Z_loc, q, 1, axis=0)
-        piv_one = jax.lax.dynamic_slice_in_dim(piv_loc, q, 1, axis=0)
-        # Same back-solve bodies as ``_sharded_cho_solve_batch``
-        # at batch 1 — identical shapes, identical operand values,
-        # therefore bit-identical arithmetic.
-        if use_rank_trunc:
-            out = jax.vmap(_pinv_matmul_logical)(L_tile, Z_one)
-        elif use_pinv_T:
-            out = jax.vmap(_pinv_apply_T_logical)(L_tile, Z_one)
-        elif hoisted_lu:
-            out = jax.vmap(_lu_apply_logical)(L_tile, piv_one, Z_one)
-        elif use_lu:
-            out = jax.vmap(_ridge_indef_solve)(L_tile, Z_one)
-        else:
-            out = jax.vmap(_tri_solve_logical)(L_tile, Z_one)
-        return jax.lax.dynamic_update_slice_in_dim(
-            zeta_loc, out, q, axis=0)
-
-    @partial(jax.jit, donate_argnums=(2,))
-    def _solve_one_q_and_update(L_q_sharded, Z_col, zeta_acc, q, piv):
-        """PER-Q tier: gather ONE ``(μ, μ)`` factor tile, solve that q, scatter into ``zeta_acc``; see docs/architecture/zeta_fit_face_psi_cct.md."""
-        L_xy = jax.lax.with_sharding_constraint(
-            L_q_sharded, L_batch_xy_shard)
-        piv_rep = jax.lax.with_sharding_constraint(piv, piv_rep_shard)
-        return _per_q_block(L_xy, Z_col, zeta_acc, jnp.asarray(q),
-                            piv_rep)
-    return _solve_one_q_and_update
-
-
 def _zeta_rhs_resharder(
         intermediate_shard, z_col_shard):
     """Produce the donated two-stage RHS reshard kernel."""
@@ -4009,17 +3956,13 @@ def _zeta_rhs_resharder(
 
 
 def _cache_zeta_solve_kernels(
-        L_batch_rep_shard, L_batch_xy_shard, _lu_apply_logical, _pinv_apply_T_logical,
+        L_batch_rep_shard, _lu_apply_logical, _pinv_apply_T_logical,
         _pinv_matmul_logical, _ridge_indef_solve, _tri_solve_logical, cache_key, hoisted_lu,
         intermediate_shard, mesh_xy, piv_rep_shard, use_lu, use_pinv_T, use_rank_trunc,
         z_col_shard):
     """Populate the existing solve cache with its shape-specific kernels."""
     (_sharded_cho_solve, _sharded_cho_solve_batch, _solve_batch_and_update, _solve_all_at_once) = _zeta_batched_kernels(
         L_batch_rep_shard, _lu_apply_logical, _pinv_apply_T_logical, _pinv_matmul_logical,
-        _ridge_indef_solve, _tri_solve_logical, hoisted_lu, mesh_xy, piv_rep_shard, use_lu,
-        use_pinv_T, use_rank_trunc)
-    (_solve_one_q_and_update) = _zeta_per_q_kernel(
-        L_batch_xy_shard, _lu_apply_logical, _pinv_apply_T_logical, _pinv_matmul_logical,
         _ridge_indef_solve, _tri_solve_logical, hoisted_lu, mesh_xy, piv_rep_shard, use_lu,
         use_pinv_T, use_rank_trunc)
     (_reshard_z) = _zeta_rhs_resharder(
@@ -4029,14 +3972,13 @@ def _cache_zeta_solve_kernels(
         solve_all_at_once=_solve_all_at_once,
         sharded_cho_solve=_sharded_cho_solve,
         sharded_cho_solve_batch=_sharded_cho_solve_batch,
-        solve_one_q_and_update=_solve_one_q_and_update,
         reshard_z=_reshard_z,
     )
 
 
 def _apply_replicated_zeta(
         L_q, Z_q, helpers, mesh_xy, n_zchunk, n_zchunk_padded, needs_padding, nq, nq_padded,
-        per_q_gather, piv_arr, q_batch, z_col_shard):
+        piv_arr, q_batch, z_col_shard):
     """Produce zeta by applying the cached solver and restoring centroid sharding."""
     if needs_padding:
         pad_width = n_zchunk_padded - n_zchunk
@@ -4083,25 +4025,6 @@ def _apply_replicated_zeta(
             Z_col.block_until_ready()
         del Z_q
 
-    # PER-Q tier: one (μ, μ) gather at a time.  Sits BEFORE the
-    # ``q_batch >= nq`` fast path because it deliberately overrides the
-    # planner's q_chunk (which is a compute-batching choice, not a memory
-    # one) — the whole point of this tier is that the gathered extent is
-    # independent of both nq and q_chunk_size.
-    if per_q_gather:
-        zeta = jnp.zeros_like(Z_col)
-        # Python loop, not lax.scan/fori: a scan over a q-sharded carry
-        # makes SPMD replicate the accumulator (documented at the
-        # q-batch loop below).  Same reason, same shape of fix.
-        for q in range(nq):
-            zeta = helpers.solve_one_q_and_update(L_q, Z_col, zeta, q,
-                                                  piv_arr)
-        del Z_col
-        zeta = _reshard_zeta_r_XY_to_mu_XY(zeta, mesh_xy)
-        if needs_padding:
-            return zeta[:, :, :n_zchunk]
-        return zeta
-
     # Fast path: solve all q-points at once
     if q_batch >= nq:
         result = helpers.solve_all_at_once(L_q, Z_col, piv_arr)
@@ -4140,9 +4063,8 @@ def _apply_replicated_zeta(
 
 
 def _solve_zeta_replicated(
-        L_q, Z_q, lu_piv, mesh_xy, n_log, n_rmu, n_zchunk, nq, q_chunk_size, solver_kind,
-        zeta_gather):
-    """Produce zeta with the existing replicated-factor or per-q gather route."""
+        L_q, Z_q, lu_piv, mesh_xy, n_log, n_rmu, n_zchunk, nq, q_chunk_size, solver_kind):
+    """Produce zeta with the replicated-factor gather route (small stacks)."""
     from runtime.padding import padded_axis
     z_axis = padded_axis(
         n_zchunk, mesh_xy, name="zeta RHS column carrier",
@@ -4157,9 +4079,6 @@ def _solve_zeta_replicated(
     intermediate_shard = NamedSharding(mesh_xy, P('x', None, 'y'))
     L_rep_shard = NamedSharding(mesh_xy, P(None, None))
     L_batch_rep_shard = NamedSharding(mesh_xy, P(None, None, None))  # (B_q, n_rmu, n_rmu)
-    # The layout ``L_q`` actually ARRIVES in (2-D over the mesh face); the
-    # per_q tier consumes it directly instead of asking for a replica.
-    L_batch_xy_shard = NamedSharding(mesh_xy, P(None, 'x', 'y'))
     q_batch = min(q_chunk_size, nq)
     nq_padded = padded_axis(
         nq, q_batch, name="zeta solve q-batch carrier").carrier
@@ -4192,24 +4111,8 @@ def _solve_zeta_replicated(
     # (2026-08-01): ``L_q`` is the EXPLICIT truncated pseudo-inverse C⁺
     # of the indefinite transverse CCT (no BBᴴ factor exists there), so
     # ζ = C⁺Z is ONE matmul at the logical extent.  Flows through the
-    # same replicated/per_q gather tiers as every other whole-tile
-    # factor.
+    # same replicated/local tiers as every other whole-tile factor.
     use_pinv_T = (solver_kind == 'transverse_rank_truncate')
-
-    # ``zeta_gather`` selects the GATHER GRANULARITY of the replicated
-    # factor, not the factorization — see :func:`_resolve_zeta_gather`.
-    #   'replicated' : one all-gather of the whole (q_batch, μ, μ) stack
-    #                  (today's path, and what ``_solve_all_at_once``
-    #                  does at q_batch = nq).
-    #   'per_q'      : one all-gather of a SINGLE (1, μ, μ) tile at a
-    #                  time, looped over q.  Same arithmetic per q as the
-    #                  batched kernel — only the live gathered extent
-    #                  changes, from ``nq·μ²·16`` to ``μ²·(1+1/Py)·16``.
-    #                  The gather is written INSIDE a shard_map so the
-    #                  partitioner cannot hoist it back to the full stack;
-    #                  see ``_per_q_block`` for the measurement that forced
-    #                  that form (scorecard Y.2).
-    per_q_gather = (str(zeta_gather).strip().lower() == "per_q")
 
     # Cache key for solve function (includes q_chunk_size and padded size).
     # ``use_lu`` / ``use_rank_trunc`` partition the cache so the three
@@ -4218,7 +4121,7 @@ def _solve_zeta_replicated(
     # cache too.
     cache_key = ('solve_from_L', _mesh_key(mesh_xy), nq, n_rmu, n_log,
                  n_zchunk_padded, q_chunk_size, bool(use_lu),
-                 bool(use_rank_trunc), bool(per_q_gather),
+                 bool(use_rank_trunc),
                  bool(hoisted_lu), bool(use_pinv_T))
 
     # Uniform piv operand for the kernels below: the real (nq, n_log)
@@ -4234,14 +4137,111 @@ def _solve_zeta_replicated(
 
     if cache_key not in _solve_cache:
         _cache_zeta_solve_kernels(
-            L_batch_rep_shard, L_batch_xy_shard, _lu_apply_logical, _pinv_apply_T_logical,
+            L_batch_rep_shard, _lu_apply_logical, _pinv_apply_T_logical,
             _pinv_matmul_logical, _ridge_indef_solve, _tri_solve_logical, cache_key, hoisted_lu,
             intermediate_shard, mesh_xy, piv_rep_shard, use_lu, use_pinv_T, use_rank_trunc,
             z_col_shard)
     helpers = _solve_cache[cache_key]
     return _apply_replicated_zeta(
         L_q, Z_q, helpers, mesh_xy, n_zchunk, n_zchunk_padded, needs_padding, nq, nq_padded,
-        per_q_gather, piv_arr, q_batch, z_col_shard)
+        piv_arr, q_batch, z_col_shard)
+
+
+#: Solver kinds whose factor is a whole-tile ARRAY applied per q — the kinds
+#: the ``replicated`` and ``local`` tiers serve.  A FactorToken, the 2-D C⁺ of
+#: the distributed tier and the fused provider LU plans have their own routes.
+_WHOLE_TILE_KINDS = frozenset({
+    'replicated_rank_truncate', 'replicated_cholesky', 'sharded_cholesky',
+    'transverse_rank_truncate', 'lu'})
+
+
+def _whole_tile_solve_kind(solver_kind, lu_piv, distrib_la_batched_route):
+    """The whole-tile kind ``solve_zeta`` will execute, or ``None`` for a library/distributed route.
+
+    ``factor_c_q`` answers a provider LU request under ``batch_reshard`` with
+    the local-JAX ``(LU, pivots)`` pair (a block-cyclic token cannot cross
+    that route; the JAX factor can be retained across r chunks), so that
+    already-resolved provider name is normalized to ``'lu'`` here.  A non-None
+    pivot vector is the unambiguous tag: provider tokens keep theirs opaque.
+    The ONE place both the solve and the factor-residency step read it.
+    """
+    kind = str(solver_kind)
+    if (lu_piv is not None and kind in ('cusolvermp_lu', 'scalapack_lu')
+            and distrib_la_batched_route == 'batch_reshard'):
+        kind = 'lu'
+    return kind if kind in _WHOLE_TILE_KINDS else None
+
+
+def zeta_factor_resident(L_q, lu_piv, mesh_xy, *, zeta_gather, solver_kind,
+                         distrib_la_batched_route="batch_reshard"):
+    """Lay a whole-tile ζ factor out ONCE where the ``local`` tier reads it (R4); see docs/architecture/zeta_fit_face_psi_cct.md.
+
+    Returns ``(L_q, lu_piv)``.  Under ``zeta_gather == 'local'`` a whole-tile
+    array factor ``(nq, μ, μ)`` at ``P(None,'x','y')`` moves to the batch
+    layout ``(ceil(nq/P)·P, μ, μ)`` at ``P(('x','y'), None, None)`` — rank
+    ``x·Py + y`` then holds its ``ceil(nq/P)`` q's as whole tiles for the
+    whole r-chunk loop — and a replicated pivot table ``(nq, μ_log)`` is
+    sliced to the same rows.  Every other tier, a :class:`FactorToken` and a
+    distributed or fused-provider factor are returned untouched.  Residency
+    is an optimisation, never a precondition: the ``local`` solve also takes
+    a face factor (it then moves that factor on every call).
+    """
+    if (str(zeta_gather).strip().lower() != 'local'
+            or isinstance(L_q, FactorToken)
+            or _whole_tile_solve_kind(
+                solver_kind, lu_piv, distrib_la_batched_route) is None):
+        return L_q, lu_piv
+    if not linalg_is_batch_layout(L_q, mesh_xy):
+        L_q = linalg_batch_layout(L_q, mesh_xy)
+    if lu_piv is not None and not linalg_is_batch_layout(lu_piv, mesh_xy):
+        lu_piv = linalg_batch_layout(lu_piv, mesh_xy)
+    return L_q, lu_piv
+
+
+def _solve_zeta_local(L_q, Z_q, lu_piv, mesh_xy, n_log, solver_kind):
+    """The ``local`` tier (R4): solve each q on the rank that holds its whole factor, moving only the RHS; see docs/architecture/zeta_fit_face_psi_cct.md.
+
+    ``Z_q`` is ``(nq, μ, n_cols)`` at ``P(None,'x','y')`` with ``n_cols``
+    divisible by ``Py``.  ``distrib_la.local_batch`` exchanges it face →
+    batch (x then y ``all_to_all``), applies the SAME per-q logical-extent
+    back-solve the replicated tier vmaps, and returns it batch → face.  Per
+    rank and call that moves ``2·ceil(nq/P)·μ·n_cols·16`` B of RHS and no
+    factor, against ``nq·μ²·16·(1+1/Py)`` B of gathered factor in the retired
+    ``per_q`` tier.  Measured at the VI3 12×12 shape (nq 144, μ 3200, 1280
+    columns, P16 over OFI): 994 ms → 210 ms, result bit-identical
+    (``runs/runtime/zeta_fit_20260923/b01_base_vi3shape_p16.log``).
+    """
+    hoisted_lu = bool(solver_kind == 'lu' and lu_piv is not None)
+    ops = [L_q]
+    resident = [0] if linalg_is_batch_layout(L_q, mesh_xy) else []
+    if hoisted_lu:
+        if not linalg_is_batch_layout(lu_piv, mesh_xy):
+            lu_piv = linalg_batch_layout(lu_piv, mesh_xy)
+        ops.append(lu_piv)
+        resident.append(1)
+    ops.append(Z_q)
+    key = ('solve_local', _mesh_key(mesh_xy), int(n_log), str(solver_kind),
+           hoisted_lu, tuple(resident))
+    run = _solve_cache.get(key)
+    if run is None:
+        (_ridge_indef_solve, _lu_apply_logical, _tri_solve_logical,
+         _pinv_matmul_logical, _pinv_apply_T_logical) = _zeta_logical_solvers(
+            int(n_log))
+        if hoisted_lu:
+            def kernel(F, piv, Z):
+                return jax.vmap(_lu_apply_logical)(F, piv, Z)
+        else:
+            one = {'replicated_rank_truncate': _pinv_matmul_logical,
+                   'transverse_rank_truncate': _pinv_apply_T_logical,
+                   'lu': _ridge_indef_solve,
+                   'replicated_cholesky': _tri_solve_logical,
+                   'sharded_cholesky': _tri_solve_logical}[str(solver_kind)]
+
+            def kernel(F, Z):
+                return jax.vmap(one)(F, Z)
+        run = linalg_local_batch(kernel, mesh_xy, resident=tuple(resident))
+        _solve_cache[key] = run
+    return run(*ops)
 
 
 def _solve_zeta_token(
@@ -4383,17 +4383,10 @@ def solve_zeta(
 
     solver_kind = _resolve_solver_kind(mesh_xy, vertex_mu_L, solver_kind)
 
-    # ``factor_c_q`` deliberately answers a provider LU request with the
-    # local-JAX (LU, pivots) pair when batch_reshard is selected: the provider
-    # token has a block-cyclic lifetime and cannot cross that route, whereas
-    # the JAX factor can be retained across r chunks.  Normalize the already
-    # resolved provider name at this seam so the remainder takes the ordinary
-    # hoisted lu_solve path.  A non-None pivot vector is the unambiguous tag;
-    # provider tokens keep their pivots opaque and were handled above.
-    if (lu_piv is not None
-            and solver_kind in ('cusolvermp_lu', 'scalapack_lu')
-            and distrib_la_batched_route == 'batch_reshard'):
-        solver_kind = 'lu'
+    # The provider-LU-under-batch_reshard seam (see _whole_tile_solve_kind):
+    # the remainder then takes the ordinary hoisted lu_solve path.
+    solver_kind = (_whole_tile_solve_kind(
+        solver_kind, lu_piv, distrib_la_batched_route) or solver_kind)
 
     if isinstance(L_q, FactorToken):
         return _solve_zeta_token(
@@ -4448,10 +4441,21 @@ def solve_zeta(
             L_q, Z_q, cct_trace_per_q, distrib_la_batched_route, lu_piv, mesh_xy, mu_pad, n_log,
             solver_kind)
 
+    if str(zeta_gather).strip().lower() == 'local':
+        # R4: the factor stays on its q owner; only this chunk's RHS moves.
+        return _distributed_backsolve(
+            Z_q, mesh_xy,
+            lambda Z: _solve_zeta_local(L_q, Z, lu_piv, mesh_xy, n_log,
+                                        solver_kind))
+    if linalg_is_batch_layout(L_q, mesh_xy) and int(mesh_xy.devices.size) > 1:
+        raise ValueError(
+            f"solve_zeta: the factor is in the q-local batch layout "
+            f"{tuple(L_q.shape)} but zeta_gather={zeta_gather!r}; only the "
+            f"'local' tier reads it there.  Pass zeta_gather='local', or keep "
+            f"the factor at P(None,'x','y') for the replicated tier.")
     # Compute padding needed for even sharding across all devices
     return _solve_zeta_replicated(
-        L_q, Z_q, lu_piv, mesh_xy, n_log, n_rmu, n_zchunk, nq, q_chunk_size, solver_kind,
-        zeta_gather)
+        L_q, Z_q, lu_piv, mesh_xy, n_log, n_rmu, n_zchunk, nq, q_chunk_size, solver_kind)
 
 
 _fit_one_rchunk_cache: dict = {}

@@ -17,7 +17,7 @@ demands EXACT bit equality of ζ against the preserved fused path (raw
 CCT + ``lu_piv=None``) across:
 
 * CPU meshes 1x1 / 2x2 / 1x4 (``--xla_force_host_platform_device_count``),
-* both back-solve gather tiers (``replicated`` / ``per_q``),
+* both back-solve gather tiers (``replicated`` / ``local``),
 * both factor schedules (``LORRAX_ZETA_QPARALLEL`` 0 / 1),
 * multiple r-chunks against ONE factor (the reuse that motivates the
   hoist),
@@ -103,7 +103,7 @@ def _worker_hoist() -> int:
                 C_dev, mesh, vertex_mu_L=1, n_rmu_logical=n_log,
                 solver_kind='lu')
             assert piv is not None and piv.shape == (nq, n_log), piv.shape
-            for gather in ('replicated', 'per_q'):
+            for gather in ('replicated', 'local'):
                 for q_chunk in (2, nq):
                     ref1 = np.asarray(jax.device_get(solve_zeta(
                         L_fused, jax.device_put(jnp.asarray(Z), in_sh),

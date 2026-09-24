@@ -428,38 +428,58 @@ def test_rank_truncate_refuses_above_the_replication_cap():
 
 
 def test_zeta_gather_tier_ladder_is_pinned():
-    """``distributed_zeta_solve`` route-pin — the GATHER granularity of the
-    ζ back-solve, orthogonal to ``charge_zeta_solve``'s factorization choice.
+    """``distributed_zeta_solve`` route-pin — the DATA MOVEMENT of the ζ
+    back-solve, orthogonal to ``charge_zeta_solve``'s factorization choice.
 
-    Load-bearing invariant: ``auto`` at fixture scale must resolve to
-    ``replicated``, i.e. the pre-feature path, so the default GW answer is
-    bit-identical.  ``auto`` only switches to ``per_q`` once the replicated
-    ``(nq, μ, μ)`` gather crosses ``LORRAX_ZETA_GATHER_CAP_GIB`` (4 GiB) —
-    a memory decision, never a physics one (both tiers run the same per-q
-    kernel).  ``distributed`` (workstream V) is a real tier now, but it
-    must stay EXPLICIT-only and refuse loudly on the combinations it cannot
-    serve — the same fails-loudly contract the replication cap test above
-    pins for ``rank_truncate``.
+    ``auto`` picks ``local`` (R4, 2026-09-23: each whole-tile factor stays on
+    its q owner, only the RHS moves) whenever the q-local batch holds at most
+    twice the even share per rank (``ceil(nq/P)·P <= 2·nq``), and whenever the
+    replicated ``(nq, μ, μ)`` gather would cross ``LORRAX_ZETA_GATHER_CAP_GIB``
+    (4 GiB).  Only a small stack spread over many more ranks than q's keeps
+    ``replicated``.  A memory/movement decision, never a physics one: both
+    tiers run the same per-q logical-extent kernel.  ``distributed``
+    (workstream V) must stay EXPLICIT-only and refuse loudly on the
+    combinations it cannot serve.  The retired ``per_q`` spelling refuses.
     """
+    import numpy as np
+
     import isdf.core as core
+
+    class _Mesh:                       # the auto rule reads only the count
+        def __init__(self, n):
+            self.devices = np.empty(int(n))
 
     assert core._ZETA_GATHER_MAX_BYTES == 4 * 1024 ** 3, \
         f"default gather cap changed: {core._ZETA_GATHER_MAX_BYTES}"
 
-    # Fixture scale (cohsex_debug: nq=9, μ_pad=64 → 0.6 MB) — must stay
-    # on today's path.
-    assert core._resolve_zeta_gather("auto", n_rmu=64, nq=9) == "replicated"
-    # MoS2 12×12 / 606c (nq=144, μ_pad=640 → 0.94 GB) — still replicated.
-    assert core._resolve_zeta_gather("auto", n_rmu=640, nq=144) == "replicated"
-    # MoS2 12×12 / 1998c (nq=144, μ_pad=2016 → 9.36 GB) — over the cap.
-    assert core._resolve_zeta_gather("auto", n_rmu=2016, nq=144) == "per_q"
-    # No size info → conservative, keep today's path.
+    # q-local batch within twice the even share -> local, at any stack size.
+    for mu, nq_, p in ((64, 9, 4), (640, 144, 16), (1446, 10, 16),
+                       (2016, 144, 64), (3200, 144, 100), (64, 9, 1)):
+        assert core._resolve_zeta_gather(
+            "auto", n_rmu=mu, nq=nq_, mesh_xy=_Mesh(p)) == "local", (mu, nq_, p)
+    # Few q on many ranks with a small stack -> replicated (balanced gather).
+    assert core._resolve_zeta_gather(
+        "auto", n_rmu=1446, nq=10, mesh_xy=_Mesh(64)) == "replicated"
+    assert core._resolve_zeta_gather(
+        "auto", n_rmu=640, nq=1, mesh_xy=_Mesh(4)) == "replicated"
+    # ...unless that stack is over the cap: local is its only whole-tile route.
+    assert core._resolve_zeta_gather(
+        "auto", n_rmu=20000, nq=2, mesh_xy=_Mesh(64)) == "local"
+    # The boundary itself: ceil(nq/P)*P == 2*nq is still local, one q fewer
+    # is not.
+    assert core._resolve_zeta_gather(
+        "auto", n_rmu=64, nq=8, mesh_xy=_Mesh(16)) == "local"
+    assert core._resolve_zeta_gather(
+        "auto", n_rmu=64, nq=7, mesh_xy=_Mesh(16)) == "replicated"
+    # No size info -> the conservative replicated path.
     assert core._resolve_zeta_gather("auto") == "replicated"
 
     # Explicit overrides win in both directions.
     assert core._resolve_zeta_gather(
         "replicated", n_rmu=2016, nq=144) == "replicated"
-    assert core._resolve_zeta_gather("per_q", n_rmu=64, nq=9) == "per_q"
+    assert core._resolve_zeta_gather("local", n_rmu=64, nq=1) == "local"
+    with pytest.raises(ValueError, match="local"):
+        core._resolve_zeta_gather("per_q", n_rmu=64, nq=9)
 
     # 'distributed' is EXPLICIT-only: ``auto`` may never pick it, at any
     # size, because it changes the arithmetic (block-cyclic eigh gauge).
@@ -481,12 +501,12 @@ def test_zeta_gather_tier_ladder_is_pinned():
                                   charge_zeta_solve="rank_truncate")
     assert "mesh" in str(exc.value)
 
-    # Transverse channels resolve to per_q instead of raising: ONE key
+    # Transverse channels resolve to local instead of raising: ONE key
     # drives both channels, and the transverse CCT is indefinite (its
     # distributed route is distributed_lu=scalapack, a different key).
     assert core._resolve_zeta_gather(
         "distributed", n_rmu=2016, nq=144, vertex_mu_L=1,
-        charge_zeta_solve="rank_truncate") == "per_q"
+        charge_zeta_solve="rank_truncate") == "local"
 
     with pytest.raises(ValueError):
         core._resolve_zeta_gather("nonsense")

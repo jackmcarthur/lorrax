@@ -214,6 +214,9 @@ hang documented at the top applies to the dilation extent 2n as well.
 | `mesh_key(mesh)`, `mesh_platform(mesh)`, `mesh_is_cpu(mesh)` | Stable hashable mesh identity (axes, extents, platform, device ids) and its two predicates. `mesh_key` is for any cache whose stored value does **not** retain the mesh; `id(mesh)` there is the documented drift. |
 | `dial_key()` | Factory-time dials folded into one tuple, for kernel cache keys. |
 | `probe_target`, `has_target` | Capability, with the ABSENT / BROKEN split (`lxkit.probe`). |
+| `local_batch(kernel, mesh, *, resident=())` | Build a jitted `run(*operands)` that applies a row kernel to a batch of whole matrices q-locally: face operands `(B, M, N)` at `P(None,'x','y')` move face → batch → face (the route-(c) exchanges); operands at the positions in `resident` are already in the batch layout and do not move. See § "q-local batch with resident operands". |
+| `batch_layout(A, mesh)` | Place a batch in the batch layout ONCE: a face stack by the two exchanges, a fully replicated array by a local row slice; result `(ceil(B/P)·P, ...)` at `P(('x','y'), None, ...)`, zero pad rows. |
+| `is_batch_layout(A, mesh)` | The layout predicate `local_batch` checks for a `resident` operand. |
 | `dispatch_batched_eigh(A, mesh, backend, *, batched_route='batch_reshard')` | The one legacy entry point kept for `gw.qsgw_density`; it passes the same public route selection into `plan`. |
 | `matmul(A, B, C=None, *, mesh, alpha=1, beta=0, transa='N', transb='N', backend='auto', batched_route='batch_reshard')` | Top-level distributed GEMM. Rank 2 uses `P('x','y')`; rank 3 uses `P(None,'x','y')`. The default stages complete local matrices; explicit `auto` uses the distributed provider chosen by `backend`. |
 | `resolve_matmul_backend(requested, mesh, *, batched_route='batch_reshard') -> str`, `MATMUL_BACKEND_CHOICES` | Raising GEMM-provider probe and its public vocabulary. `cusolvermp` is an accepted alias for `cublasmp`; `off` is legal only for the provider-free staged route. |
@@ -1213,6 +1216,38 @@ not a claim about total compiled/native workspace. Callers must also admit
 `memory_analysis()` and provider workspace before executing. The service
 adds no physics prefactor, conjugation, or backend-selection dial. The
 local/distributed Dyson solve choice remains with the existing LU plan.
+
+## q-local batch with resident operands
+
+"Move the right-hand side to the matrices, never the matrices to the
+right-hand side" (R4).  A factor used against many right-hand sides is laid
+out once with `batch_layout`; `local_batch(kernel, mesh, resident=(0,))`
+then moves only the other operands:
+
+```python
+F_b = distrib_la.batch_layout(F_face, mesh)          # once: (Bp, n, n) q-local
+run = distrib_la.local_batch(lambda F, Z: F @ Z, mesh, resident=(0,))
+X = run(F_b, Z_face)                                  # per RHS: Z moves, F does not
+```
+
+Layout: `Bp = ceil(B/(Px·Py))·Px·Py`; rank `x·Py + y` owns rows
+`[rank·Bp/P, (rank+1)·Bp/P)`, the order the two route-(c) exchanges produce,
+so a resident row and the exchanged RHS row it meets are the same global q.
+Pad rows are zeros and never reach the kernel (the `_real_rows` scalar-cond
+schedule).  Per rank and call the RHS costs `2·ceil(B/P)` whole RHS blocks of
+exchange; the resident operand costs nothing after its one placement.  A
+position declared resident whose operand is not in the batch layout refuses
+before tracing, because the implicit reshard it would otherwise get is the
+per-call matrix movement this exists to remove.  The face operands must tile
+the mesh (`M % Px == N % Py == 0`); resident operands may have any trailing
+shape (a `(Bp, n)` pivot table, for instance).  Capacity is the route-(c)
+boundary: `ceil(B/P)` whole matrices plus their RHS blocks per rank.
+
+LORRAX's ζ back-solve `local` tier is the consumer
+(`isdf.core.zeta_factor_resident` / `_solve_zeta_local`).  Gates:
+`tests/test_zeta_qlocal_solve.py` (P4 parity against the replicated tier and
+a NumPy oracle, the owner-map red twin, the resident refusal and the
+row-to-owner layout check).
 
 ## Face-pinned block glue
 

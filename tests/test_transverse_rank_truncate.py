@@ -15,7 +15,7 @@ Gates:
 * ``test_local_family_is_bit_identical_across_schedules`` — within the
   family, EXACT bit equality across CPU meshes 1x1/2x2/1x4, both factor
   schedules (``LORRAX_ZETA_QPARALLEL`` 0/1), both back-solve gather
-  tiers (replicated/per_q), two q-chunkings, and two r-chunks against
+  tiers (replicated/local), two q-chunkings, and two r-chunks against
   ONE factor.  Fixture: indefinite spectrum with TRS-paired near-null
   modes, non-dividing nq (q-pad + cond-skip), padded mu (identity
   re-embed + logical-extent slicing), and a spinor²-blocked RHS column
@@ -143,7 +143,7 @@ def _worker_rt() -> int:
                 solver_kind='transverse_rank_truncate',
                 transverse_zeta_rcond=tau)
             assert piv is None, "rank_truncate family returns piv=None"
-            for gather in ('replicated', 'per_q'):
+            for gather in ('replicated', 'local'):
                 for q_chunk in (2, nq):
                     # ONE hoisted factor, TWO r-chunks (the reuse).
                     got1 = np.asarray(jax.device_get(solve_zeta(
@@ -342,7 +342,7 @@ def _worker_resolver() -> int:
     except ValueError:
         out["bad_family_raises"] = True
     # The back-solve tier key: 'distributed' on a RIDGE-family transverse
-    # channel still resolves to per_q (the documented one-key-two-
+    # channel still resolves to local (the documented one-key-two-
     # channels demotion).
     out["ridge_dist_tier"] = _resolve_zeta_gather(
         "distributed", n_rmu=64, nq=4, mesh_xy=mesh22, vertex_mu_L=1,
@@ -428,7 +428,7 @@ def test_resolver_semantics():
         "explicit distributed_lu + rank_truncate must refuse")
     assert out["ridge_auto"] == "lu"
     assert out["bad_family_raises"]
-    assert out["ridge_dist_tier"] == "per_q"
+    assert out["ridge_dist_tier"] == "local"
 
 
 if __name__ == "__main__":
