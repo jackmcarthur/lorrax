@@ -29,7 +29,7 @@ saying which artifact answered, and the driver prints below say it.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from functools import partial
+from functools import lru_cache, partial
 import os
 from typing import Callable
 
@@ -969,7 +969,13 @@ def _match_layout(x, like):
     target = getattr(like, "sharding", None)
     if target is None or getattr(x, "sharding", None) == target:
         return x
-    return jax.device_put(x, target)
+    return _reshard_to(target)(x)
+
+
+@lru_cache(maxsize=None)
+def _reshard_to(target):
+    """One compiled identity per target layout; XLA emits the reshard."""
+    return jax.jit(lambda a: a, out_shardings=target)
 
 
 @partial(jax.jit, static_argnums=(4,))
