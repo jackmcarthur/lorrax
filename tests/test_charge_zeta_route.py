@@ -150,8 +150,8 @@ class TestAboveCap:
 # a comment.
 #
 # The falsifiable form of isdf/core's is Arm B's D2: the explicit
-# 'cusolvermp'/'slate'/'scalapack'/'distributed' handlers must still CALL the
-# raising probe, and the raise must still reach the caller.  There are six
+# 'cusolvermp'/'slate'/'scalapack' handlers must still CALL the
+# raising probe, and the raise must still reach the caller.  There are four
 # such calls and A1's site table counted them as zero, so a conversion that
 # dropped one would have moved a loud refusal into a silent different-backend
 # run with nothing failing.  Two cells: the sites exist, and the raise
@@ -163,7 +163,6 @@ _PROBE_SITES = {
                                         ("cholesky", "cusolvermp")},
     "_resolve_solver_kind_transverse": {("solve_lu", "scalapack"),
                                         ("solve_lu", "cusolvermp")},
-    "_resolve_zeta_gather":            {("eigh", "distributed")},
 }
 
 
@@ -190,8 +189,8 @@ def _probe_calls_by_function():
     return found
 
 
-def test_the_six_explicit_backends_still_run_the_raising_probe():
-    """AST, not grep: the six probe calls, by enclosing function and by the
+def test_the_explicit_backends_still_run_the_raising_probe():
+    """AST, not grep: the probe calls, by enclosing function and by the
     (op, backend) pair each one asserts.
 
     A grep for the NAME proves nothing — the module-level alias is imported
@@ -211,7 +210,7 @@ def test_the_six_explicit_backends_still_run_the_raising_probe():
             f"isdf.core.{fname} lost probe(s) {sorted(pairs - found[fname])}"
             f"; it still probes {sorted(found[fname])}")
     total = sum(len(v) for v in found.values())
-    assert total >= 5, found
+    assert total >= 4, found
     # ...and the alias is the module attribute the two worker suites
     # monkeypatch, not a locally re-spelled import (Arm B seams 4 and 5).
     import isdf.core

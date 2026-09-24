@@ -159,19 +159,39 @@ def test_split_orbit_refuses_by_name(acubic):
 # ---------------------------------------------------------------------------
 
 
-def test_route_g_planner_refuses_distributed_tier():
-    """Route G reads the rank-truncated factor B; the distributed tier's
-    2D-sharded C⁺ would be applied as B and give a wrong ζ, so it refuses."""
-    from gw.gflat_memory_model import plan_zeta_route_g
-    meta = SimpleNamespace(nk_tot=4, nspinor=1, n_rmu=16, n_rmu_padded=16,
-                           fft_grid=(8, 8, 8))
-    with pytest.raises(ValueError, match="GATE zeta-mubatch-tier") as err:
-        plan_zeta_route_g(meta=meta, mesh_xy=4, n_q_selected=2, ngkmax=64,
-                          psi_ngkmax=64, fit_nb=8, n_col=4, n_s=8,
-                          zeta_tier="distributed", budget_gb=40.0)
-    # The fix it names is a live deck key, not the retired distributed_zeta_solve.
-    assert "Fix: `linalg = local`" in str(err.value)
-    assert "distributed_zeta_solve" not in str(err.value)
+def test_route_g_plans_the_whole_tile_tier_under_linalg_distributed():
+    """`linalg = distributed` sets the other stages; route G's ζ tier stays
+    the planner's whole-tile choice, stated once in the plan receipt."""
+    from gw.gw_config import resolve_linalg
+    from gw.gw_init import _plan_gflat_chunks_for_channel
+    from gw.wavefunction_bundle import BandSlices
+    prof = resolve_linalg({"linalg": "distributed"})
+    assert (prof.w_dyson_solver, prof.eigh_backend, prof.distributed_lu) == (
+        "distributed", "distributed", "distributed")
+    meta = SimpleNamespace(nk_tot=64, nspinor=2, n_rmu=1446, n_rmu_padded=1448,
+                           n_rtot=60 * 60 * 180, fft_grid=(60, 60, 180))
+    cfg = SimpleNamespace(
+        zeta_nband=144,
+        memory=SimpleNamespace(
+            per_device_gb=33.9, chunk_target_utilization=0.0,
+            band_chunk_size=16, r_chunk_override=0, gflat_chunk_size=0,
+            low_mem_bands=False),
+        backend=SimpleNamespace(
+            distributed_zeta_solve=prof.distributed_zeta_solve,
+            charge_zeta_solve=prof.charge_zeta_solve))
+    mesh = SimpleNamespace(shape={'x': 2, 'y': 2},
+                           devices=np.empty(4, dtype=object))
+    lines = []
+    chunks, _ = _plan_gflat_chunks_for_channel(
+        meta=meta, cfg=cfg,
+        band_slices=BandSlices.from_band_edges(0, 0, 130, 144, 144),
+        mesh_xy=mesh, is_bispinor=False, n_q_selected=10,
+        parent_route=dict(n_parent=10, parents_only=True),
+        print_fn=lines.append, zeta_ngkmax=8000, psi_ngkmax=12000,
+        mubatch=True)
+    assert chunks["mubatch"].zeta_tier == "local"
+    receipt = "\n".join(lines).splitlines()
+    assert sum("ζ tier" in line for line in receipt) == 1
 
 
 def test_best_owner_batching_never_packs_worse_than_the_planned_bin(acubic):

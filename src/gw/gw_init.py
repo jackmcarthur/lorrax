@@ -368,21 +368,12 @@ def _zeta_fit_provenance(*, wfn, meta, cfg, band_range_left, band_range_right,
 		'zeta_rcond':           _dep_env_record(
 			"LORRAX_ZETA_RCOND", cfg.backend.zeta_rcond),
 		'charge_zeta_solve':    str(cfg.backend.charge_zeta_solve),
-		# GAUGE tier of the charge-channel factor (zeta audit 2026-08-01):
-		# the `distributed` tier's block-cyclic pzheevd is a different,
-		# equally valid gauge (~kappa*eps vs the whole-tile eigh), so a
-		# zeta fit under one tier must not be silently reused by a rerun
-		# under the other.  `replicated` and `per_q` are back-solve GATHER
-		# granularities over the SAME whole-tile factor (bit-identical),
-		# and `auto` never resolves to `distributed` — so exactly two
-		# gauge classes exist and both collapse here.  The schema is NOT
-		# bumped: `_zeta_reuse_ok` treats a stamp MISSING this key as
-		# legacy replicated-gauge (every pre-2026-08 zeta was), keeping
-		# old run dirs usable.
-		'distributed_zeta_solve': (
-			'distributed'
-			if str(cfg.backend.distributed_zeta_solve).strip().lower()
-			== 'distributed' else 'replicated'),
+		# GAUGE tier of the charge-channel factor.  Every ζ tier is a
+		# whole-tile factor (`local`/`replicated` are bit-identical gather
+		# granularities), so a fresh fit stamps `replicated`; a stamp from
+		# the deleted distributed tier (block-cyclic pzheevd, a different
+		# gauge) therefore refits.  A stamp MISSING this key is whole-tile.
+		'distributed_zeta_solve': 'replicated',
 		# TRANSVERSE solve family + cut (2026-08-01, same reader-matrix
 		# idiom as the tier key above): recorded so a family change is
 		# never silently absorbed by reuse.  Collapsed to the inert
@@ -1730,9 +1721,7 @@ def _plan_gflat_chunks_for_channel(
 		from isdf.core import _resolve_zeta_gather
 		_tier = _resolve_zeta_gather(
 			str(cfg.backend.distributed_zeta_solve),
-			n_rmu=int(meta.n_rmu_padded), nq=n_q_selected, mesh_xy=mesh_xy,
-			vertex_mu_L=0,
-			charge_zeta_solve=str(cfg.backend.charge_zeta_solve))
+			n_rmu=int(meta.n_rmu_padded), nq=n_q_selected, mesh_xy=mesh_xy)
 		_psi_ng = int(psi_ngkmax) if psi_ngkmax else _ngkmax
 		_r = (3.0 * _psi_ng / (4.0 * math.pi)) ** (1.0 / 3.0)
 		_n_a = max(int(v) for v in meta.fft_grid)

@@ -16,12 +16,10 @@ What is pinned here:
    so.
 2. **The transverse resolver refuses where the charge resolver refuses**,
    with the same arithmetic and the same ``n_mu <= ...`` ceiling.
-3. **Both escapes survive.**  ``nq=None`` (the ``gw_init`` pre-flight,
-   which has only the centroid file) and ``replicated_factor_used=False``
-   (``distributed_zeta_solve='distributed'`` replaces the factor, so the
-   buffer is never allocated) both keep the route reachable.  Losing
-   either would refuse runs on the size of a buffer they do not use --
-   the defect the charge branch's own escape was added for.
+3. **The pre-flight escape survives.**  ``nq=None`` (the ``gw_init``
+   pre-flight, which has only the centroid file) keeps the route
+   reachable; the ζ-fit call site re-resolves with ``nq`` and refuses
+   there.
 
 Pure host: builds a 1x1 CPU mesh, no GPU, no FFI.  SCOPE: this is a
 RESOLVER contract test.  It does not run a ζ fit and says nothing about
@@ -121,24 +119,6 @@ def test_unknown_nq_keeps_the_legacy_policy(mesh11, monkeypatch):
     kind = _resolve_solver_kind_transverse(
         mesh11, "auto", n_rmu_logical=_MU_TOO_BIG,
         transverse_zeta_solve="rank_truncate")
-    assert kind == "transverse_rank_truncate"
-
-
-def test_the_distributed_tier_escape_survives(mesh11, monkeypatch):
-    """``distributed_zeta_solve='distributed'`` never allocates the buffer.
-
-    The caller overrides the kind to
-    ``distributed_transverse_rank_truncate`` on the next statement, so
-    enforcing the REPLICATED capacity here would refuse a run on the size
-    of a buffer it does not use.  This is the transverse twin of the
-    charge branch's ``replicated_factor_used`` escape (capacity fix
-    2026-07-29, ladder notes R15.1).
-    """
-    monkeypatch.setattr(core, "_resolve_linalg_backend", lambda *a, **k: None)
-    kind = _resolve_solver_kind_transverse(
-        mesh11, "auto", n_rmu_logical=_MU_TOO_BIG,
-        transverse_zeta_solve="rank_truncate", nq=_NQ,
-        replicated_factor_used=False)
     assert kind == "transverse_rank_truncate"
 
 

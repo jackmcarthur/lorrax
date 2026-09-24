@@ -1405,9 +1405,7 @@ def test_resolve_slate_cpu_eigh_at_4096_still_says_the_L2_thing(monkeypatch):
 def test_plan_batched_matches_the_backend_call_cpu():
     """``plan.batched`` on the CPU distributed eigh == the raw wrapper.
 
-    Pins the migration of ``isdf/core._factor_c_q_distributed_rank_truncate``
-    (which now says ``backend='distributed'`` and ``plan.batched``) against
-    what it used to call directly.  ScaLAPACK returns TRUE column
+    ScaLAPACK returns TRUE column
     eigenvectors, so the plan's normaliser is the identity here — and that
     is exactly what must stay true.
     """
