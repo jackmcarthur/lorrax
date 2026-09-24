@@ -94,7 +94,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
         from common.staged_reshard import face_to_batch_reshard
         from gw.shared_pole_local import (batch_to_face, canonical_factors, check_round, face_rows,
                                           own_extent_receipts, parent_rounds, partner_realization,
-                                          reduce_round, round_tables, grow_round)
+                                          reduce_round, round_tables)
         from gw.shared_pole_recipe import (
             build_construction_row, charge4_gates, construction_receipt,
             shared_real_pole_gates_v1_r3b as gates,
@@ -261,13 +261,9 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
             del samples, exchange, qi
         with timing.section("spole.reduction_admission"):
             infinity_counts = [int(v.shape[-1]) for v in round_infinity_values]
-            # Grow-only carriers: later rounds and SC maps reuse the round program.
-            round_key = ("scalar", logical_n, ordered, odd_moments)
-            round_states, infinity = grow_round(round_key, round_states, infinity)
             tables = round_tables(round_counts, [st[1].shape[-1] for st in round_states],
                                   [st[0] for st in round_states], infinity_counts, infinity[0].shape[-1],
-                                  column_extent=column_extent, ordered=ordered, odd_moments=odd_moments,
-                                  key=round_key)
+                                  column_extent=column_extent, ordered=ordered, odd_moments=odd_moments)
             side = int(tables["active"].shape[-1])
             # Resolve before either reduction program is traced. Local mode
             # uses the plan's pure trace-safe native closure; face mode uses
