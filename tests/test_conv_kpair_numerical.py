@@ -1,6 +1,4 @@
-"""CUDA value parity for both ISDF conv_kpair arms."""
-
-import os
+"""CUDA value parity of the router's pair convolution (nvidia-mathdx) against jnp.fft."""
 
 import numpy as np
 import pytest
@@ -19,19 +17,9 @@ def _reference(jnp, a, b, perm_l, phase_l, perm_r, phase_r):
     return jnp.fft.fftn(out, axes=(0, 1, 2), norm="forward")
 
 
-@pytest.mark.parametrize(
-    "kgrid,arm",
-    [
-        ((1, 1, 1), "resident"),
-        ((3, 3, 3), "resident"),
-        ((4, 4, 4), "resident"),
-        ((2, 3, 5), "resident"),
-        ((5, 5, 5), "resident"),
-        ((16, 16, 16), "two_stage"),
-    ],
-)
+@pytest.mark.parametrize("kgrid", [(1, 1, 1), (3, 3, 3), (4, 4, 4), (2, 3, 5), (7, 9, 5)])
 @pytest.mark.parametrize("ns", [1, 2, 4])
-def test_conv_kpair_matches_xla(kgrid, arm, ns):
+def test_conv_kpair_matches_xla(kgrid, ns):
     import jax
     import jax.numpy as jnp
     from jax.sharding import Mesh
@@ -40,7 +28,6 @@ def test_conv_kpair_matches_xla(kgrid, arm, ns):
         pytest.skip("conv_kpair is CUDA-only")
     from ffi.fft import make_fused_conv_kpair
 
-    os.environ["LORRAX_CONV_KPAIR_FFI"] = "on"
     mesh = Mesh(np.asarray(jax.devices()[:1]), ("x",))
     if ns == 1:
         perm_l = perm_r = np.asarray([0], dtype=np.int64)
@@ -68,11 +55,11 @@ def test_conv_kpair_matches_xla(kgrid, arm, ns):
     b = jnp.asarray(b_np, dtype=jnp.complex128)
     native = jax.jit(make_fused_conv_kpair(
         mesh, kgrid, perm_l=perm_l, phase_l=phase_l,
-        perm_r=perm_r, phase_r=phase_r, arm=arm, norm="forward"))
+        perm_r=perm_r, phase_r=phase_r, norm="forward"))
     got = native(a, b)
     ref = jax.jit(lambda x, y: _reference(
         jnp, x, y, perm_l, phase_l, perm_r, phase_r))(a, b)
     got_np, ref_np = np.asarray(got), np.asarray(ref)
     rel = np.max(np.abs(got_np - ref_np)) / max(np.max(np.abs(ref_np)), 1e-300)
-    print(f"conv_kpair parity kgrid={kgrid} ns={ns} arm={arm} rel={rel:.16e}")
-    assert rel <= 1e-13, (kgrid, ns, arm, rel)
+    print(f"kconv pair parity kgrid={kgrid} ns={ns} rel={rel:.16e}")
+    assert rel <= 1e-13, (kgrid, ns, rel)

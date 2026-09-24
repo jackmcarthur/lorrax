@@ -177,14 +177,12 @@ if(LORRAX_FFI_PREBUILD_SM80_KERNELS)
         endfunction()
 
         lorrax_add_sm80_cubin(
-            lrx_conv_kpair cufft/conv_kpair_cuda_ffi.cc)
-        lorrax_add_sm80_cubin(
             lrx_conv_kminor cufft/conv_kminor_cuda_ffi.cc)
         lorrax_add_sm80_cubin(
             lrx_conv_klead cufft/conv_klead_cuda_ffi.cc)
         set(LORRAX_PREBUILT_SM80_ON 1)
         message(STATUS
-            "Direct-convolution AOT: embedding conv_kpair/kminor/klead sm_80 cubins")
+            "Direct-convolution AOT: embedding conv_kminor/klead sm_80 cubins")
     else()
         message(WARNING
             "Direct-convolution AOT requested, but this build has no enabled "
@@ -648,25 +646,24 @@ if(LORRAX_CUFFT_ON)
         -Wall -Wextra)
     target_compile_definitions(build_conv_klead_cuda PRIVATE
         LORRAX_FFI_HAVE_PREBUILT_SM80=${LORRAX_PREBUILT_SM80_ON})
-    # Isolated compile target for the ISDF CCT/ZCT post-pair kernel.  Keep it
-    # separate from the sibling object's ownership lane while feeding the
-    # same production shared object.
-    add_library(build_conv_kpair_cuda OBJECT
-        cufft/conv_kpair_cuda_ffi.cc)
-    set_target_properties(build_conv_kpair_cuda PROPERTIES
+    # Isolated compile target for the NVIDIA k-convolution family on
+    # nvidia-mathdx (decisions.md 2026-09-24).  Its kernels are NVRTC-built at
+    # run time from the installed wheel's cuFFTDx headers, per k-grid: there
+    # is no embedded cubin to extract.
+    add_library(build_kconv_mathdx_cuda OBJECT
+        cufft/kconv_mathdx_cuda_ffi.cc)
+    set_target_properties(build_kconv_mathdx_cuda PROPERTIES
         POSITION_INDEPENDENT_CODE ON)
-    target_include_directories(build_conv_kpair_cuda SYSTEM PRIVATE
+    target_include_directories(build_kconv_mathdx_cuda SYSTEM PRIVATE
         "${JAX_FFI_INCLUDE_DIR}"
         "${CUDA_TOOLKIT_ROOT}/include"
         "${CUDA_TOOLKIT_ROOT}/targets/x86_64-linux/include"
         "${NVRTC_INCLUDE_DIR}")
-    target_include_directories(build_conv_kpair_cuda PRIVATE
+    target_include_directories(build_kconv_mathdx_cuda PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}"
         "${CMAKE_CURRENT_SOURCE_DIR}/common")
-    target_compile_options(build_conv_kpair_cuda PRIVATE
+    target_compile_options(build_kconv_mathdx_cuda PRIVATE
         -Wall -Wextra)
-    target_compile_definitions(build_conv_kpair_cuda PRIVATE
-        LORRAX_FFI_HAVE_PREBUILT_SM80=${LORRAX_PREBUILT_SM80_ON})
     list(APPEND LORRAX_FFI_SOURCES
         cufft/fft_flat_k_cuda_ffi.cc
         # k-MINOR fused conv (BSE ladder-W rung, 2026-08-16).  Rides the same
@@ -676,7 +673,7 @@ if(LORRAX_CUFFT_ON)
         # probe is ever split from the nvrtc probe, this file follows nvrtc.
         cufft/conv_kminor_cuda_ffi.cc
         $<TARGET_OBJECTS:build_conv_klead_cuda>
-        $<TARGET_OBJECTS:build_conv_kpair_cuda>
+        $<TARGET_OBJECTS:build_kconv_mathdx_cuda>
     )
 endif()
 if(LORRAX_FFI_HAVE_PHDF5)
