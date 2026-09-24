@@ -66,8 +66,8 @@ plateau, which is where every registered catastrophe sat. `certify_numbers`
 takes the criterion's `κ_cap` and announces the inert case, and
 `RankReport.describe()` says so on its ceiling line: silence from this arm is
 arithmetic, not a measurement. `isdf/core._certify_the_cut` (the device-face
-ζ gate) prints only when it fires, so it does not yet distinguish inert from
-passed.
+ζ gate) prints only when it fires; its silence means inert or passed, and it
+does not say which.
 
 **The discarded-weight arm** is independent of `rtol` and live on every
 default. `RankReport.discarded_weight = Σ_dropped |λ_i| / Σ_all |λ_i|`; for a
@@ -75,15 +75,15 @@ charge Gram `C = PPᴴ`, `Σλ_i = tr C = ‖P‖_F²`, so it is exactly the fra
 pair-density weight thrown away, at O(n) after the eigh. It is reported on
 every run and gated at `DISCARDED_WEIGHT_MAX = 1e-3`.
 
-### Refuted as gates: do not re-propose
+### What gates nothing
 
-* **Drop fraction.** MoS₂ at the certified rtol discards 33 % and is correct;
-  Si 1776 discards 17 % and is wrong by 54 eV; Si 960 at `zeta_rcond = 1e-6`
-  discards 34 % and moves the Σ star spread by 0.005 meV. Any threshold firing
-  on 17 % fires on 33 %. Retained rank is not basis quality, in either
-  direction. The drop count is reported and gates nothing.
-* **A plane-wave upper bound on N_μ.** The good Si 600-centroid arm already
-  exceeds `ngkmax = 588`, so the naive bound would refuse a 0.90 eV run.
+* **The drop count** is reported and gates nothing: retained rank is not
+  basis quality in either direction. MoS₂ at the certified rtol discards 33 %
+  and is correct; Si 1776 discards 17 % and is wrong by 54 eV; Si 960 at
+  `zeta_rcond = 1e-6` discards 34 % and moves the Σ star spread by 0.005 meV,
+  so any drop-fraction threshold that fires on 17 % fires on 33 %.
+* **N_μ has no plane-wave upper bound.** The good Si 600-centroid arm already
+  exceeds `ngkmax = 588`.
 
 ## No absolute floors
 
@@ -128,7 +128,7 @@ that site; `—` means uncertified, and the site warns instead of refusing.
 | site | operator | rtol | ceiling | certified κ | gate |
 |---|---|---|---|---|---|
 | `isdf/core._charge_factor_math` `rank_truncate` | charge Gram `C_q`, PSD | `zeta_rcond` | `n_log` | 1e8 | refuse |
-| `isdf/core._charge_factor_math` `transverse_rank_truncate`, `_factor_c_q_distributed_rank_truncate(indefinite=True)` | transverse CCT, indefinite | `transverse_zeta_rcond` | `n_log` | — | warn (not deck-selectable: `linalg` resolves the transverse factor to ridge) |
+| `isdf/core._charge_factor_math` `transverse_rank_truncate` | transverse CCT, indefinite | `transverse_zeta_rcond` | `n_log` | — | warn (not deck-selectable: `linalg` resolves the transverse factor to ridge) |
 | `isdf/core._transverse_lu_math` (ridge) | transverse CCT | no truncation | — | κ ≥ 1e12 refuses | refuse |
 | `common/zeta_projection.least_squares_transfer` | small-basis Gram `G_S` | caller `rcond` | `μ_S` | 1e8 | refuse (κ arm only: the route reduces over q before host, so it has no per-q trace for the weight arm) |
 | `centroid/pivoted_cholesky` select | candidate Gram, PSD | `√ε` relative | candidate count | — | reports; see below |
