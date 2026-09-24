@@ -153,6 +153,46 @@ failed state? If the answer is "the same", it is not a signal. (AC §1.)
 
 ---
 
+## 11. GPU data movement — the pass you did not write is still a pass
+
+On the GPU paths the heavy loops are bound by memory traffic, not FLOPs: the
+route-G ζ fit on CrI3 8×8 P4 spent 40 % of its device time in XLA data
+movement against 13 % in GEMM (sandbox `runs/runtime/fft_gemm_budget_20260924`:
+kernel → `hlo_op` → `stack_frame_id` → source line).  Each rule is a pattern
+that compiled to a separate HBM round trip or to uncoalesced loads, with the
+measured case.  Judge by the optimized HLO (`--xla_dump_hlo_as_text`) and the
+per-kernel trace, before and after — never by the Python.
+
+- **Select between gathered candidates.** `where(p, x[i], y[j])` loads BOTH
+  candidates for every element.  Concatenate the candidates and gather one
+  row (`i` or `n + j`).  Measured: the typed pair-transpose unfold (c52b2c42).
+- **An einsum with a contraction of 2 or 4.** A spin sandwich written as
+  `einsum('ac,bd,cxmdj->axmbj', U, conj(U), d)` lowers to several tiny cuBLAS
+  GEMMs plus transposes (512 launches per route-G batch, 5.3 s per CrI3 fit).
+  Write the `ns²` terms elementwise so they fuse with the surrounding gathers.
+- **A transpose between two opaque calls.** XLA cannot fuse into cuFFT or an
+  FFI kernel, so a `moveaxis` between them is a full-size copy.  Move the axis
+  on the small input before the first call so it writes the consumer's
+  order.  Measured: route-G plane FFT → k-conv (12.3 s per fit); Σ
+  spin-rotation FFI → k-conv klead (3.8 ms per τ, needs the FFI store).
+- **Pad with zeros, then gather.** `take(concatenate([x, 0]), idx)` (or
+  `take`'s default NaN fill) is one pass over every destination cell, most of
+  them empty; `take(mode='fill', fill_value=0)` drops the pad and the NaN
+  select.  A scatter into zeros is NOT the cure: XLA materialised a 47 GiB
+  temporary for the route-G planes and ran out of memory.
+- **Conjugation as its own pass.** `where(anti, conj(x), x)` or `jnp.conj`
+  after an opaque call is a copy; fold it into the producer's fusion
+  (`conj(U X U†) = conj(U) conj(X) conj(U)†` exactly).  Measured: the χ0
+  Green pair, 6.85 ms of a 55 ms χ0 node.
+- **Element gathers where rows would do.** A gather whose slice is one
+  element over a permuted minor axis reads uncoalesced; keep the permuted
+  axis major or make the permutation block-structured.  The typed operator
+  unfold (`_apply_unfold_phase_and_trs_local`) streams ~0.5 TB/s for this
+  reason (4.05 ms per Σ τ on 2.16 GB).
+- **Chained takes.** `take(take(x, i), j)` is already ONE fused gather; a
+  host-precomposed full-size int32 index ADDS its own bytes.  Precompose only
+  when it removes a materialised intermediate.
+
 ## The assessment rubric these imply
 For any new distributed-physics code, ask in order:
 1. Which invariants would a *wrong* implementation still satisfy? Add a check
