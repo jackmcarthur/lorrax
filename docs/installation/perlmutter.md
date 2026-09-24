@@ -20,7 +20,7 @@ Run scripts export none of it.
 ```bash
 export LX_BASE_MODULE=lorrax_A
 lx doctor
-lx run -N 1 -G 4 -n 4 -- python3 -u -m gw.gw_jax -i cohsex.in
+lx run --pool POOL -N 1 -G 4 -n 4 -- python3 -u -m gw.gw_jax -i cohsex.in
 ```
 
 - `lx` runs the checkout that contains the working directory. From a data
