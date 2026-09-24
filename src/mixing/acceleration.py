@@ -1028,3 +1028,109 @@ def rcrop_nojit(
         iterations=maxit, converged=False
     )
 
+
+
+def pulay_nojit(
+    residual_fn: Callable[[jnp.ndarray], jnp.ndarray],
+    x0: jnp.ndarray,
+    m: int = 5,
+    maxit: int = 100,
+    tol: float = 1e-10,
+    print_fn: Callable = None,
+    entry_sharding=None,
+    metric=None,
+    history: str = "evaluated",
+) -> AccelerationResult:
+    """One map evaluation per iteration: Anderson type II or CROP.
+
+    Both evaluate the residual only at the extrapolated point
+
+        x_{k+1} = Σ α_i (x_i + f_i),   α = argmin ‖Σ α_i f_i‖_metric, Σ α_i = 1
+
+    over a window of the newest pair plus ``m`` stored pairs (the same
+    m + 1 residuals rCROP's solve sees), with β = 1 and no damping.  They
+    differ only in what the window stores (Wan & Międlar, CROP-Anderson):
+
+    * ``history="evaluated"`` — Anderson type II / Pulay: every EVALUATED
+      pair (x_k, f(x_k)) enters the history.  All stored residuals are real.
+    * ``history="optimal"`` — CROP (Ziółkowski et al. 2008): the stored pair
+      is the optimal combination (Σ α x, Σ α f), whose residual is the
+      linear-model (control) residual, not a re-evaluation.
+
+    rCROP (:func:`rcrop_nojit`) is the second form plus a real-residual
+    evaluation at Σ α x, i.e. two evaluations per iteration.
+
+    α is solved over the REAL numbers: the iterates are Hermitian matrices,
+    a real vector space, and the Gram of Hermitian residuals is real.  The
+    operand layout, the one (m+1, m+1) Gram collective, the metric and the
+    history's leading-axis stacking are those of :func:`rcrop_nojit`.
+    """
+    if history not in ("evaluated", "optimal"):
+        raise ValueError(f"pulay_nojit: history={history!r}")
+    shape = x0.shape
+    dtype = x0.dtype
+
+    if entry_sharding is None:
+        stack_sharding = None
+    else:
+        from jax.sharding import NamedSharding, PartitionSpec as P
+        stack_sharding = NamedSharding(
+            entry_sharding.mesh, P(None, *entry_sharding.spec))
+
+    def _entry(v):
+        return v if entry_sharding is None else jax.device_put(v, entry_sharding)
+
+    def _zeros_hist():
+        if stack_sharding is None:
+            return jnp.zeros((m,) + shape, dtype=dtype)
+        return jax.jit(lambda: jnp.zeros((m,) + shape, dtype=dtype),
+                       out_shardings=stack_sharding)()
+
+    def _weighted(v):
+        return v if metric is None else v * metric
+
+    def _norm(v):
+        return float(jnp.sqrt(jnp.sum(jnp.abs(_weighted(v)) ** 2)))
+
+    x = _entry(x0)
+    f = _entry(residual_fn(x))
+    Xhist = _zeros_hist()
+    Fhist = _zeros_hist()
+    head, filled = 0, 0
+    res_history = [_norm(f)]
+    if res_history[0] <= tol:
+        return AccelerationResult(x=x, residual_norms=jnp.array(res_history),
+                                  iterations=0, converged=True)
+    mask_shape = (m,) + (1,) * len(shape)
+
+    for it in range(maxit):
+        oldest_pos = (head - filled) % m
+        X_ord = jnp.roll(Xhist, shift=-oldest_pos, axis=0)
+        F_ord = jnp.roll(Fhist, shift=-oldest_pos, axis=0)
+        mask_cols = (jnp.arange(m) < filled).reshape(mask_shape)
+        X_ord = jnp.where(mask_cols, X_ord, 0.0 + 0.0j)
+        F_ord = jnp.where(mask_cols, F_ord, 0.0 + 0.0j)
+        Xw = jnp.concatenate([X_ord, x[None]], axis=0)
+        Fw = jnp.concatenate([F_ord, f[None]], axis=0)
+        alpha = jnp.real(_solve_crop_alpha_stacked(_weighted(Fw))).astype(dtype)
+        x_opt = jnp.tensordot(alpha, Xw, axes=(0, 0))
+        f_opt = jnp.tensordot(alpha, Fw, axes=(0, 0))
+        keep_x, keep_f = (x, f) if history == "evaluated" else (x_opt, f_opt)
+        Xhist = Xhist.at[head].set(_entry(keep_x))
+        Fhist = Fhist.at[head].set(_entry(keep_f))
+        head = (head + 1) % m
+        filled = min(filled + 1, m)
+        Xw = Fw = X_ord = F_ord = None
+
+        x = _entry(x_opt + f_opt)
+        f = _entry(residual_fn(x))
+        res = _norm(f)
+        res_history.append(res)
+        if print_fn is not None:
+            print_fn(f"  {history} iter {it:02d}: residual = {res:.6e}")
+        if res <= tol:
+            return AccelerationResult(x=x, residual_norms=jnp.array(res_history),
+                                      iterations=it + 1, converged=True)
+
+    return AccelerationResult(x=x, residual_norms=jnp.array(res_history),
+                              iterations=maxit, converged=False)

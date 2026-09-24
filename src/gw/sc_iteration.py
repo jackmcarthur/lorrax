@@ -4565,6 +4565,82 @@ def _record_sc(inputs: SCInputs, line: str) -> None:
         fallback(line)
 
 
+def _sc_probe_digest(obj) -> str:
+    """DIAGNOSTIC (sc_accel 2026-09-24, not for landing): sha256[:12] of a state tree.
+
+    Every rank walks the same tree in the same order, so the collective
+    ``gather_to_host`` of a global array stays in lockstep.
+    """
+    import dataclasses
+    import hashlib
+    from common.collectives import gather_to_host
+    h = hashlib.sha256()
+
+    def feed(o, depth):
+        if depth > 8:
+            h.update(b"<deep>")
+            return
+        if o is None or isinstance(o, (bool, int, float, complex, str, bytes)):
+            h.update(repr(o).encode())
+        elif isinstance(o, jax.Array):
+            a = np.ascontiguousarray(np.asarray(gather_to_host(o)))
+            h.update(f"{a.dtype}{a.shape}".encode())
+            h.update(a.tobytes())
+        elif isinstance(o, np.ndarray):
+            a = np.ascontiguousarray(o)
+            h.update(f"{a.dtype}{a.shape}".encode())
+            h.update(a.tobytes() if a.dtype != object else repr(a).encode())
+        elif isinstance(o, dict):
+            for k in sorted(o, key=repr):
+                h.update(repr(k).encode())
+                feed(o[k], depth + 1)
+        elif isinstance(o, (list, tuple)):
+            h.update(f"{type(o).__name__}{len(o)}".encode())
+            for x in o:
+                feed(x, depth + 1)
+        elif dataclasses.is_dataclass(o):
+            h.update(type(o).__name__.encode())
+            for f in dataclasses.fields(o):
+                h.update(f.name.encode())
+                feed(getattr(o, f.name, None), depth + 1)
+        elif hasattr(o, "__dict__") and not callable(o):
+            h.update(type(o).__name__.encode())
+            feed({k: v for k, v in vars(o).items() if not k.startswith("__")},
+                 depth + 1)
+        else:
+            h.update(f"<{type(o).__name__}>".encode())
+
+    feed(obj, 0)
+    return h.hexdigest()[:12]
+
+
+def _sc_probe_residual_split(H_in, H_out, U_in, e_in_ev):
+    """DIAGNOSTIC: split f = F(H) - H in the input QP basis (meV).
+
+    diag = eigenvalue-shift part; off = eigenvector-rotation part, split into
+    near-degenerate pairs (|dE| < 10 meV) and the rest.
+    """
+    from common.collectives import gather_to_host
+    hi = np.asarray(gather_to_host(H_in))
+    ho = np.asarray(gather_to_host(H_out))
+    nb = hi.shape[-1]
+    u = np.asarray(gather_to_host(U_in))[:, :nb, :nb]
+    f = (ho - hi) * RYD_TO_EV * 1e3
+    fq = np.einsum("kim,kij,kjn->kmn", np.conj(u), f, u, optimize=True)
+    d = np.diagonal(fq, axis1=1, axis2=2)
+    off = fq - d[:, :, None] * np.eye(nb)[None]
+    de = np.abs(e_in_ev[:, :, None] - e_in_ev[:, None, :]) * 1e3
+    near = (de < 10.0) & ~np.eye(nb, dtype=bool)[None]
+    far = (de >= 10.0)
+    angle = np.where(far, np.abs(off) / np.maximum(de, 1e-30), 0.0)
+    return dict(
+        fro=float(np.linalg.norm(f)), diag_fro=float(np.linalg.norm(d)),
+        diag_max=float(np.abs(d).max()), off_fro=float(np.linalg.norm(off)),
+        off_near_max=float(np.abs(np.where(near, off, 0)).max()),
+        off_far_max=float(np.abs(np.where(far, off, 0)).max()),
+        rot_angle_max=float(angle.max()))
+
+
 def _sc_z_factors(
     inputs: SCInputs,
     state_out: SCState,
@@ -5545,7 +5621,15 @@ def _run_rcrop(
     carry itself is a separate change and needs that iteration-0 readback
     (:628) and ``kin_ion``'s replicated load to move first.
     """
-    from mixing.acceleration import rcrop_nojit
+    from mixing.acceleration import pulay_nojit, rcrop_nojit
+
+    # A/B DIAGNOSTIC (sc_accel 2026-09-24, branch only): which accelerator.
+    # rcrop (default, two maps per iteration) | anderson | crop (one each).
+    _accel = os.environ.get("LORRAX_SC_ACCEL_AB", "rcrop").strip() or "rcrop"
+    if _accel not in ("rcrop", "anderson", "crop"):
+        raise ValueError(f"LORRAX_SC_ACCEL_AB={_accel!r}")
+    _two_eval = _accel == "rcrop"
+    print_fn(f"  SC accelerator (A/B): {_accel}")
 
     H0 = state_init.H_qp_dft
     nk, nb, _ = H0.shape
@@ -5704,7 +5788,56 @@ def _run_rcrop(
             head_surface_weight_kn=_head_surface_weight[0],
             frozen_scissor_fits=_frozen_fits[0],
         )
+        _probe_env = os.environ.get("LORRAX_SC_STATE_PROBE", "").strip()
+        if _probe_env:
+            _probe_state = lambda: dict(  # noqa: E731
+                partition=_partition[0], occ=_occ_state[0],
+                head_w=_head_surface_weight[0], frozen=_frozen_fits[0],
+                session=inputs.fixed_quadrature_session,
+                seed_cache=inputs.screening_seed_cache,
+                meta=inputs.meta, metric=_metric_np)
+            _probe_before = {k: _sc_probe_digest(v)
+                             for k, v in _probe_state().items()}
+            _probe_before["H_in"] = _sc_probe_digest(H)
         state_out = gw_iteration_map(state_in, inputs)
+        if _probe_env:
+            import json as _json
+            _probe_after = {k: _sc_probe_digest(v)
+                            for k, v in _probe_state().items()}
+            _rec = dict(call=_iter_idx[0], before=_probe_before,
+                        after_map=_probe_after,
+                        mutated=sorted(k for k in _probe_after
+                                       if _probe_after[k] != _probe_before[k]))
+            _rec["split_meV"] = _sc_probe_residual_split(
+                H, state_out.H_qp_dft, state_out.outputs.sigma_basis_U, E_in)
+            _purity_calls = {int(c) for c in _probe_env.split(",")
+                             if c.strip().isdigit()}
+            if _iter_idx[0] in _purity_calls:
+                # Same carried inputs, evaluated again immediately: any
+                # difference is state the first evaluation left behind.
+                _twin = gw_iteration_map(SCState(
+                    H_qp_dft=H, iteration=_iter_idx[0],
+                    partition=state_in.partition,
+                    occupation_state=state_in.occupation_state,
+                    head_surface_weight_kn=state_in.head_surface_weight_kn,
+                    frozen_scissor_fits=state_in.frozen_scissor_fits), inputs)
+                from common.collectives import gather_to_host as _g
+                _d = (np.asarray(_g(_twin.H_qp_dft))
+                      - np.asarray(_g(state_out.H_qp_dft))) * RYD_TO_EV * 1e3
+                _e2 = np.asarray(eigvalsh_kshard(_twin.H_qp_dft)) * RYD_TO_EV
+                _e1 = np.asarray(eigvalsh_kshard(state_out.H_qp_dft)) * RYD_TO_EV
+                _rec["purity"] = dict(
+                    dH_max_meV=float(np.abs(_d).max()),
+                    dH_fro_meV=float(np.linalg.norm(_d)),
+                    dE_max_meV=float(np.abs(_e2 - _e1).max() * 1e3),
+                    after_twin={k: _sc_probe_digest(v)
+                                for k, v in _probe_state().items()})
+                _twin = None
+            if jax.process_index() == 0:
+                with open(os.path.join(inputs.input_dir,
+                                       "sc_state_probe.jsonl"), "a") as _fh:
+                    _fh.write(_json.dumps(_rec) + "\n")
+            _record_sc(inputs, f"    SC STATE PROBE: {_json.dumps(_rec)}")
         _last_outputs[0] = state_out.outputs
         if _frozen_fits[0] is None:
             _frozen_fits[0] = _capture_frozen_scissor_fits(state_out.outputs)
@@ -5744,6 +5877,8 @@ def _run_rcrop(
         call_index = _iter_idx[0]
 
         def _role_of(idx):
+            if not _two_eval:
+                return "initial" if idx == 0 else "accepted_input_map"
             return ("initial" if idx == 0 else
                     "trial" if idx % 2 else "accepted_input_map")
 
@@ -5845,17 +5980,26 @@ def _run_rcrop(
         "  SC rCROP metric: Gram over the per-k non-scissored DFT identity "
         "block; masks refreshed after each map, scissored rows follow the map")
     try:
-        result = rcrop_nojit(
-            residual_fn,
-            # THE CARRY ITSELF, not a flattened copy of it.
-            x0,
-            m=history_depth,
-            maxit=max_iter,
-            tol=0.0,   # see above: rCROP does not decide convergence
-            print_fn=None,  # we print our own RMS-ΔE history above
-            entry_sharding=entry_sh,
-            metric=_metric_np,
-        )
+        if _two_eval:
+            result = rcrop_nojit(
+                residual_fn,
+                # THE CARRY ITSELF, not a flattened copy of it.
+                x0,
+                m=history_depth,
+                maxit=max_iter,
+                tol=0.0,   # see above: rCROP does not decide convergence
+                print_fn=None,  # we print our own RMS-ΔE history above
+                entry_sharding=entry_sh,
+                metric=_metric_np,
+            )
+        else:
+            # One map per iteration: twice the iterations for the same map
+            # budget as the two-map rCROP iteration count.
+            result = pulay_nojit(
+                residual_fn, x0, m=history_depth, maxit=2 * max_iter,
+                tol=0.0, print_fn=None, entry_sharding=entry_sh,
+                metric=_metric_np,
+                history=("evaluated" if _accel == "anderson" else "optimal"))
     except _Converged as stop:
         # The criterion fired inside the map.  Return the accepted
         # map INPUT that met it, NOT F(input) and not rCROP's stale internal
