@@ -1452,7 +1452,7 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
         # If every fitted state is QP corrected there is no active/DFT-guard
         # boundary: the incumbent full-H energy ordering is exact.  Otherwise
         # the same compact projector/FFT path selects the complete corrected
-        # block and the returned interior is gated below.
+        # block and the returned-interior margin is logged below (diagnostic).
         active_band_range = (
             None if qp_stop == fit_stop else
             (qp_start - fit_start, qp_stop - fit_start))

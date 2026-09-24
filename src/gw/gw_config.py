@@ -1087,11 +1087,12 @@ _DEFAULTS = {
     "zeta_nband": None,
     "sys_dim": 2,
     # Rebuild V_H from the CURRENT orbitals each self-consistent iteration
-    # instead of rotating the fixed DFT one into the QP basis.  False remains
-    # the scalar-QSGW default.  ``from_input_file`` promotes an UNNAMED false
-    # to true for bispinor QSGW because freezing either member of the required
-    # (rho, J) four-current would be internally inconsistent; an explicit
-    # false is preserved and refused by the four-current gate below.
+    # instead of rotating the fixed DFT one into the QP basis.  The raw False
+    # only lets the envelope tell an omitted key from a named one:
+    # ``from_input_file`` promotes an OMITTED key to true for every
+    # ``qp_solver = self_consistent`` deck (owner 2026-09-23).  An explicit
+    # scalar false is kept as a WARNING-announced comparison mode; an explicit
+    # bispinor false is refused by the four-current gate below.
     "density_self_consistent": False,
     # Run the SC loop's retained H / E / U / Sigma tables on the STAR wedge.
     # A map broadcasts H/E/U to the full BZ for the k-grid FFT, then selects

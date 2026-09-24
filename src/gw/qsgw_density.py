@@ -40,7 +40,7 @@ layout of both eigenvector producers (``distrib_la``'s batched eigh and a
 ``jnp.linalg.eigh`` constrained to it); the whole ``(nk, nb, nb)`` is never
 gathered.  ``g_split`` gathers ONE tile's ``(K, nb, nb)`` inside the scan,
 admitted only while that tile is below the same budget share that lets the
-SC eigh hold a whole tile on one device (:func:`band_tile_fits_one_device`);
+SC eigh hold a whole tile on one device (:func:`band_tile_is_large`);
 past it ``band_2d`` keeps U distributed.
 
 EIGENVECTORS ARE COLUMNS.  ``Z[k, m, n]`` is component m of eigenvector
@@ -626,7 +626,8 @@ def _density_scan_body(mesh: Mesh, plan: DensityScanPlan, *, n_k: int,
 
 # FORCED SYNC, AND IT COSTS NOTHING HERE.  ρ(r) is ``(nx, ny, nz)`` f64 —
 # 750 kB at 60×60×26 — and the very next statement in the only production
-# caller (:func:`hartree_from_orbitals` → ``build_hartree_potential``) is
+# caller (``sc_iteration.rebuild_hartree_dft_basis`` →
+# ``build_hartree_potential``) is
 # ``float(jnp.sum(rho_r))``, a full host synchronisation for the charge
 # check.  ``watch=True`` therefore moves the block a few Python statements
 # earlier and changes nothing else about the pipeline; what it buys is that

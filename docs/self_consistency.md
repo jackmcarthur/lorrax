@@ -246,7 +246,7 @@ semicore states by widening: the node count of the crossing rules grows like
 bandwidth × ln(10/ε)/(π η), and a [−90, +20] eV CrI3 grid at η = 0.25 eV cost
 80 min per Σ evaluation on 16 GPUs. Keep the grid within ±15 eV and let deeper
 states take the scissor tail (owner ruling 2026-09-03). Deep bands therefore
-move with the frontier fit, not with their own Σ; say so when you plot them.
+move with the sum-band tail law (`sc_tail_fit`, default `conduction_mean`), not with their own Σ; say so when you plot them.
 
 **4. `sigma_regularization_ev` is the physics, not a knob.** Since 2026-09-03
 η is literally the Lorentzian broadening every ansatz runs at; the automatic
