@@ -1,372 +1,125 @@
 # Perlmutter (NERSC)
 
-*The CUDA-13/JAX-0.9 reference platform. Authoritative for module mechanics
-and porting knobs: [`config/README.md`](../../../config/README.md). This
-page holds the runtime environment: the Lmod module, the FFI staging
-contract, multi-host topology — and an honest statement of what has and
-has not been exercised recently.*
+The GPU reference platform: A100 40/80 GB nodes, bare-host CUDA 13.2, JAX and
+JAXLIB 0.9.1, one sealed FFI bundle, all selected by the `lorrax_A` module and
+launched by `lx`. Porting knobs are in [`config/README.md`](../../../config/README.md);
+JAX and the GPU memory pool are in the [overview](../overview.md#gpu-pool).
 
-## 0. Test status — honest
-
-* The GPU FFI stack (cuSOLVERMp eigh, phdf5 slab I/O, SLATE) is exercised on
-  Perlmutter at 1–4 nodes × 4 A100. `lx` drives the tracked
-  `select_gpu.sh` + environment + `in_container.sh` composition.
-* CPU multi-process `impl=mpi` is now validated on Milan with Cray MPICH
-  9.0.1.498 and JAX/JAXLIB 0.9.1.  A P=4 collective probe passed on one and
-  two nodes, including all three 2-D mesh cliques and exact
-  reduce-scatter; the two-node tracked-recipe proof is allocation 57261316,
-  step `lx-Xg1-221900-433833-3385`.
-* The same tracked recipe passed at P=16 on four nodes with a 4×4 process
-  mesh and 16 logical CPU affinity slots per rank (256 across the step, not
-  256 physical cores or full-node occupancy), exact on every
-  allreduce/reduce-scatter segment and cleanly finalized: allocation
-  57261316, step `lx-Xg1-222848-493981-5730`.
-* A frozen two-node P=4 GN-PPM GW calculation then completed in 109.907 s and
-  matched all 2,484 reference Sigma cells exactly (allocation 57261316,
-  step `lx-Xg1-222309-460416-9952`).  This certifies the GW path at P=4;
-  it is not yet a large-physics-run scaling or performance claim.
+**Certified scope.** GPU: 1–4 nodes × 4 A100 at P=4 and P=16. CPU
+`impl=mpi` on Milan (Cray MPICH 9.0.1): collective exactness at P=4 (one and
+two nodes) and P=16 (four nodes), and a P=4 GN-PPM GW run matching its
+reference Σ cell for cell. Larger CPU runs are not certified.
 
 ## 1. Entry point: `lx` {#1-entry-point-lx}
 
-### Network transport at startup
-
-Before initializing JAX/NCCL, `runtime.network_env` checks the participating
-nodes. A one-node **step** inside a larger allocation remains a one-node run:
-the policy uses `SLURM_STEP_NUM_NODES`, or expands `SLURM_STEP_NODELIST`, never
-the allocation-wide node count. Open MPI local/world group sizes can also
-establish single-node versus multi-node placement without starting MPI here.
-Unknown topology leaves the environment unchanged.
-
-On multi-node Perlmutter CUDA runs launched with `SLURM_NETWORK=no_vni`,
-startup requests the site's OFI/CXI configuration. The setting belongs to the
-launcher, not the Python payload. `lx run` exports it for every GPU step on
-more than one node, so the plain launch is the correct one:
+`lx` runs a step on a compute node. It joins an allocation (`--pool NAME` or
+`--jid N`), claims a free node per step, loads the base module named by
+`LX_BASE_MODULE` in a throwaway shell, and puts the resolved checkout's `src/`
+first on `PYTHONPATH`. It announces the source tree on every step:
+`LORRAX_CHECKOUT` if set, else the checkout containing `cwd`, else the
+module's snapshot. A run directory is not a checkout, so production runs set
+`LORRAX_CHECKOUT`.
 
 ```bash
-lx run -N 4 -G 4 -n 16 -- python3 -m gw.gw_jax -i cohsex.in
+export LX_BASE_MODULE=lorrax_A LORRAX_CHECKOUT=/path/to/checkout
+lx run --pool POOL --wait 3600 -N 1 -G 4 -n 4 -- python3 -u -m gw.gw_jax -i cohsex.in
+lx test                  # the default test gate on a compute node, in cwd
+lx status                # allocations and steps
+lx doctor                # site, module and helpers
+lx run --dry-run …       # print the srun line and exit
 ```
 
-A raw `srun` needs `SLURM_NETWORK=no_vni` (or `--network=no_vni`) itself.
-Full MPI-I/O plus NCCL GW initialization failed without this Slurm setting
-(`OFI EP enable failed: No space left on device`); a GEMM-only probe had
-passed and was insufficient. Python cannot repair an already-created step's
-VNI allocation, and without it NCCL falls back to TCP sockets, measured 12x
-slower (every multi-node sandbox run from 2026-09-15 to 09-23 ran that way).
-Startup therefore refuses a multi-node Perlmutter CUDA step that lacks the
-launch setting, or that sets `NCCL_NET=Socket`, and names the relaunch.
-Other explicit transport overrides remain the caller's responsibility.
+### Required GPU task geometry {#required-gpu-task-geometry}
 
-The defaults repeat every network setting in the site `nccl` module,
-including `FI_CXI_RDZV_THRESHOLD=0`. Without that setting, cross-node NCCL
-send/recv (XLA `all_to_all` and `collective_permute`, first used by `sc.eigh`)
-deadlocked on every P16 test. libfabric's NCCL proxy thread copied an unexpected
-eager message to the GPU with `cudaMemcpy` plus `cudaDeviceSynchronize`, which
-waits on the NCCL kernel that is waiting for that thread
-(`runs/runtime/nccl_ofi_hang_20260923` in the sandbox).
+One rank per GPU: `-N n -G 4 -n 4n` (`-G` is per node). `-G 4 -n 1` is a
+single process over four devices, not P=4 evidence. `src/ffi/cpp/select_gpu.sh`
+pins each rank's GPU through `CUDA_VISIBLE_DEVICES`; the runtime passes
+`local_device_ids` accordingly, so each rank sees `jax.local_devices() ==
+[cuda:0]` and `len(jax.devices())` equals the rank count.
 
-It names the plugin by absolute path through `NCCL_NET_PLUGIN`,
-so no change to Python's already-initialized library search path is needed.
-The plugin and its machine settings have one owner in `runtime.network_env`.
-The currently supported site installation is supplied by `nccl/2.29.2-cu13`.
-A missing required plugin produces an actionable startup error before GPU
-communicators are created.
+A job uses one GPU model and memory class. A multi-node allocation requests
+`-C 'gpu&hbm40g'` or `-C 'gpu&hbm80g'`; the runtime refuses a mixed
+40/80 GB set before building the mesh, because independently compiled XLA
+programs on mixed nodes can disagree on collective exchange order.
 
-Single-node runs receive no additional network settings. Explicit `NCCL_NET`
-or `NCCL_NET_PLUGIN` settings bypass site selection entirely; individually
-specified tuning settings also take precedence. CPU, ROCm, and other sites
-retain their existing transport configuration. This is a machine-topology
-decision, independent of matrix sizes or drivers. Other clusters must supply
-their supported NCCL environment rather than inherit Perlmutter's OFI choice.
+### Network transport at startup {#network-transport-at-startup}
 
-Startup prints one rank-zero line with placement and requested policy.
-`runtime.network_env.network_configuration()` records the decision; NCCL's
-own transport log attests the provider actually loaded. Initialize LORRAX's
-runtime before creating GPU backends or native communicators.
+`runtime.network_env` decides the NCCL transport before JAX or NCCL starts,
+from the step's node count (`SLURM_STEP_NUM_NODES` or the expanded
+`SLURM_STEP_NODELIST`, never the allocation's).
 
-**`lx` is how you run things on Perlmutter.** Never on a login node, never
-`sbatch`. It allocates if nothing is live, attaches if something is, and
-calling it twice never double-allocates.
+| placement | result |
+|---|---|
+| one node | no network settings |
+| several nodes, CUDA, `SLURM_NETWORK` contains `no_vni` | the site OFI/CXI profile: `NCCL_NET_PLUGIN` = the absolute path of `nccl/2.29.2-cu13`'s plugin, plus that module's settings including `FI_CXI_RDZV_THRESHOLD=0`; a value the caller set is kept |
+| several nodes, CUDA, no `no_vni` | **refuses**, naming the relaunch: without a VNI, NCCL falls back to TCP sockets (about 12× slower) and MPI-IO + NCCL initialization fails |
+| `NCCL_NET=Socket` on several nodes | **refuses** |
+| explicit `NCCL_NET` or `NCCL_NET_PLUGIN` | the caller's configuration, unchanged |
 
-```bash
-export LORRAX_CHECKOUT=$PWD
-SOURCE_PATH="$LORRAX_CHECKOUT/src${PYTHONPATH:+:$PYTHONPATH}"
-lx run -- env PYTHONPATH="$SOURCE_PATH" \
-  python3 -u -m gw.gw_jax -i cohsex.in       # one step on a compute node
-lx test                                       # the default gate, on a compute node, in cwd
-lx test --census                              # the full census (see docs/contributing.md)
-lx status                                     # who is running where
-lx doctor                                     # verify site, module, helpers
-lx shell                                      # one-task, one-GPU interactive pty
-lx alloc -N 4 --time 04:00:00                 # allocate deliberately (idempotent)
-lx release                                    # cancel only what lx created
-```
+`lx run` exports `SLURM_NETWORK=no_vni` for every multi-node GPU step; a raw
+`srun` passes `--network=no_vni` itself. The variable acts at step creation,
+so setting it from Python is too late. `FI_CXI_RDZV_THRESHOLD=0` prevents a
+cross-node send/recv deadlock (XLA `all_to_all` / `collective_permute`) in
+which libfabric's NCCL proxy thread synchronizes the device while the NCCL
+kernel waits on that thread.
 
-Defaults are **one GPU per step** (so several steps share a node), and a new
-allocation is 4 nodes / 4 h. Ask for `-G 4` when you want a whole node,
-`-N n` for multiple nodes, `--cpu` for the Milan CPU partition. `--dry-run`
-prints the `srun` line and exits — the fastest way to see what your step will
-actually inherit.
+## 2. The `lorrax_A` module and the FFI bundle
 
-### Required GPU task geometry
+The module is a descriptor: it sets `LORRAX_ROOT`, `PYTHONPATH` (a
+`releases/source-<rev>` snapshot), `LORRAX_FFI_SO` and `LORRAX_FFI_HOST_SO`
+(the two legs of one sealed bundle), the CUDA and vendor library paths,
+`JAX_PLATFORMS=cuda,cpu` and `JAX_ENABLE_X64=1`. It sets no allocator,
+compile-cache, HDF5 or profiling policy; the runtime owns those.
 
-Use one task/rank per GPU. Keep `lx`'s default rank count or set it explicitly:
-
-```bash
-lx run -N 1 -G 4 -n 4 -- env PYTHONPATH="$SOURCE_PATH" \
-  python3 -u -m gw.gw_jax -i cohsex.in
-```
-
-`-N 1 -G 4 -n 1` violates the process/collective contract and is not P=4
-evidence. `lx shell` is one task/one GPU. Report GPU count, rank count, and
-runtime mesh.
-
-> ### Source intent and import selection are separate
->
-> `lx` resolves and announces the intended source in this order:
-> `LORRAX_CHECKOUT`, then the checkout `cwd` sits inside, then the base
-> module's tree, where "a checkout" means a directory holding both
-> `src/gw/__init__.py` and `tests/`. `lx` announces which one it picked on
-> every invocation, tagged with the reason:
->
-> ```text
-> [lx] source tree: /pscratch/sd/j/jackm/lorrax_pipehealth/src  [cwd]
-> [lx] source tree: /pscratch/sd/j/jackm/lorrax_pipehealth/src  [LORRAX_CHECKOUT]
-> [lx] source tree: /global/u2/j/jackm/software/lorrax_P/src    [module default (cwd is not in a checkout)]
-> ```
->
-> A data directory is not a checkout, so production run directories must set
-> `LORRAX_CHECKOUT`. `LX_BASE_MODULE` chooses the machine environment; it does
-> not choose the source. The deployed container can replace an outer-shell
-> `PYTHONPATH`, so the banner alone is not an import seal: pass
-> `PYTHONPATH="$LORRAX_CHECKOUT/src..."` on the payload side of `lx run`, as in
-> the examples above. Current runtime then derives every first-party service
-> root from package metadata and refuses a mixed checkout before JAX.
->
-> `lx doctor` prints the base environment, and every run records its actual
-> Python source and native-library origins. Until an `lx test` canary proves its
-> announced and imported checkouts agree, feature-checkout tests use `lx run`
-> with the same payload-side source path.
->
-> Current source requires the 0.9 series for both JAX and JAXLIB.  Select the
-> deployed bare-host CUDA-13 lane and pin the source checkout independently:
->
-> ```bash
-> export LX_BASE_MODULE=lorrax_A
-> export LORRAX_CHECKOUT=/path/to/your/checkout
-> lx run -- env PYTHONPATH="$LORRAX_CHECKOUT/src${PYTHONPATH:+:$PYTHONPATH}" \
->   python3 "$LORRAX_CHECKOUT/tools/require_jax09.py"
-> ```
->
-> `tools/require_jax09.py` must run before the first driver import.  The driver
-> repeats the version check internally, so an old module or copied launcher
-> refuses even if the preflight was omitted.
-
-### The module is a descriptor, not a launcher
-
-`lx` loads the named module in a throwaway shell only to obtain
-`LORRAX_ROOT` and the assembled native/container capability string. The
-tracked module defines no run or allocation functions and sets no JAX,
-allocator, HDF5, compile-cache, or profiling policy. Those defaults are set
-and reported by `runtime` before JAX/HDF5 import; documented experiments may
-override them explicitly.
-
-### One-time install
-
-```bash
-vi config/perlmutter/site_config.sh          # image and dependency paths
-bash config/perlmutter/install.sh            # or LORRAX_MODULE_NAME=<name> bash …
-```
-
-## 2. FFI stack: staging and bind-mounts
-
-One `liblorrax_ffi.so` calls three native stacks not present in the JAX
-container:
-
-| subpackage | library | use |
+| bundle leg | libraries | serves |
 |---|---|---|
-| `cusolvermp` | cuSOLVERMp + CAL/NCCL | distributed `eigh` (syevd) |
-| `phdf5` | parallel HDF5 via MPI-IO | sharded slab read/write |
-| `slate` | SLATE + libsci | distributed Cholesky, trsm, heev |
+| CUDA `liblorrax_ffi.so` | cuSOLVERMp, cuBLASMp, cuFFT, NVRTC, parallel HDF5, Cray MPICH | distributed eigh/Cholesky/LU, distributed GEMM, the mathdx k-convolution, slab I/O |
+| host `liblorrax_ffi_host.so` | SLATE-CPU, ScaLAPACK (libsci), FFTW, parallel HDF5 | CPU providers |
 
-Beside the native stacks the CUDA leg needs one Python package at run time:
-**`nvidia-mathdx`** (header-only cuFFTDx), the only NVIDIA backend of the
-k-convolution router (decisions.md 2026-09-24).  The `lorrax_A` runtime venv
-at `/global/common/software/m4598/jackm/lorrax_cuda13_runtime/.venv` carries
-`nvidia-mathdx==25.6.0` (installed 2026-09-24; pinned by the runtime
-`recipe/stack.sh`).  Nothing is linked or bind-mounted: the handler finds the
-headers through the package spec and compiles per k-grid with NVRTC, caching
-the images in `$SCRATCH/.cache/lorrax/kconv_mathdx`.
+The bundle manifest (`lorrax_ffi_bundle.json`) hashes every byte; the loader
+refuses a library whose handler ABI differs from the source's and announces
+an unsealed library as `LEGACY-UNSEALED`. The mathdx k-convolution also needs
+the `nvidia-mathdx` wheel in the venv (`GATE mathdx-headers` otherwise).
+Cray MPICH GPU support is off (`MPICH_GPU_SUPPORT_ENABLED=0`); cuSOLVERMp and
+cuBLASMp communicate through NCCL. Building, sealing and publishing a bundle
+is the runtime recipe `lorrax_cuda13_runtime/recipe/README.md`.
 
-Staged once per cluster (idempotent, each ends with a `readelf -d` check;
-staging is mandatory because Shifter cannot mount the vendor `/opt/*` trees
-directly):
+## 3. CPU multi-process runs (Milan)
 
-```bash
-src/ffi/cpp/stage/cusolvermp_stage_nvhpc.sh   # cuSolverMp + CAL
-src/ffi/cpp/stage/phdf5_stage_cray.sh         # Cray HDF5 (canonical here)
-src/ffi/cpp/stage/phdf5_stage_openmpi.sh      # portable non-Cray stack
-src/ffi/cpp/stage/slate_stage_cray.sh         # libsci + GTL + xpmem
-```
-
-Bind-mounts (host dir → container mount): `$LORRAX_FFI_NVHPC_DIR` →
-`/lorrax_nvhpc`, `$LORRAX_FFI_PHDF5_DIR` → `/lorrax_phdf5`,
-`$LORRAX_FFI_SLATE_DIR` → `/lorrax_slate`; `LORRAX_NVHPC_SUBPATH`,
-`LORRAX_MPICH_CONTAINER_DIR`, `LORRAX_DARSHAN_LIB_DIR` are patched from
-`site_config.sh`.
-
-Build (needs staged libs + a GPU allocation):
-
-```bash
-src/ffi/cpp/run_shifter.sh bash src/ffi/cpp/build.sh
-```
-
-Off-Shifter builds drive CMake directly with `-D` overrides —
-`src/ffi/PORTING.md` and
-[installation/ffi-native-libs](../../installation/ffi-native-libs.md).
-
-MPI stack override: `LORRAX_MPI_TYPE=cray_shasta` (default) | `none` |
-`pmix` (legacy, has hung non-FFI workloads — never set unconditionally).
-GPU-aware Cray MPICH: the module sets `MPICH_GPU_SUPPORT_ENABLED=1` and
-preloads `libmpi_gtl_cuda.so.0` — Cray-specific; no OpenMPI/UCX
-equivalent exists for these two knobs.
-
-## 3. Multi-host topology
-
-`SLURM_NTASKS > 1` auto-triggers `jax.distributed.initialize()` (via
-`runtime.initialize_communicator_stack()`; a sentinel guards re-import).
-Expected in-job topology: `jax.local_devices()` = `[cuda:0]` per rank,
-`len(jax.devices())` = total ranks = nodes × GPUs per node.
-
-## 4. Generic-cluster porting
-
-The image and native stage roots funnel through `site_config.sh`; the full
-ownership map is in [`config/README.md`](../../../config/README.md). A
-non-Shifter site needs its own environment descriptor. Do not copy the
-retired shell launch functions as a portability layer.
-
-## 5. CPU multi-process runs (Milan)
-
-The former gloo-era recipe and its mpi4py/parallel-h5py SlabIO tier are
-retired. Current CPU runs require the host native FFI and use the same single
-parallel-HDF5 transport as GPU runs; the `slab_io` and `use_ffi_io` deck keys
-are refused.
-
-Build the small MPI ABI adapter once on a CPU compute node.  This builds the
-exact pinned, **unmodified** upstream MPIwrapper against versioned Cray
-wrappers; Cray MPICH remains the MPI implementation. The candidate is gated
-in isolation and an immutable, content-addressed release becomes `current`
-atomically, so a failed rebuild cannot delete the active adapter.
+CPU runs use the same parallel-HDF5 transport as GPU runs and require the
+host FFI leg. Build the MPI ABI adapter once on a CPU compute node (pinned,
+unmodified upstream MPIwrapper against the versioned Cray wrappers; a failed
+rebuild cannot replace the active release):
 
 ```bash
 config/perlmutter/build_mpiwrapper.sh --fresh
 ```
 
-For every core-driver multi-process CPU step, source the tracked launch
-prelude before Python/JAX:
+Every multi-process CPU step sources `config/perlmutter/cpu_mpi_env.sh` in the
+rank shell before Python:
 
 ```bash
-export LORRAX_CHECKOUT=/path/to/lorrax
-export LORRAX_ROOT="$LORRAX_CHECKOUT"
-export CPU_JAX_VENV=/path/to/jax-0.9.1-venv
-export LX_BASE_MODULE=lorrax_A
-export LORRAX_CPUS_PER_TASK=16
-export PYTHONPATH="$LORRAX_CHECKOUT/src${PYTHONPATH:+:$PYTHONPATH}"
-lx run --cpu -N 2 -n 4 -- bash -c '
+export LX_BASE_MODULE=lorrax_A LORRAX_CHECKOUT=/path/to/checkout
+lx run --cpu --pool POOL -N 2 -n 4 -- bash -c '
   set -euo pipefail
-  export PATH="$CPU_JAX_VENV/bin:$PATH"
-  export LORRAX_CPU_SKIP_GPU_PLUGINS=1
   export OMP_NUM_THREADS=14
   . "$LORRAX_CHECKOUT/config/perlmutter/cpu_mpi_env.sh"
-  python3 -u "$LORRAX_CHECKOUT/tools/require_jax09.py"
-  python3 -u -m gw.gw_jax -i gw.in
-'
+  python3 -u -m gw.gw_jax -i gw.in'
 ```
 
-All three selections are required: `LORRAX_CHECKOUT` declares the intended
-source, the explicit `PYTHONPATH` selects it for Python, and `CPU_JAX_VENV`
-selects the tested CPU JAX environment inside the rank shell. The tracked
-preflight checks JAX and jaxlib before either is imported; current runtime
-then attests the full first-party source closure.
-
-The source inside the `lx` rank shell is the load-bearing one.  It sets the
-four-part Cray contract before JAX import:
+`cpu_mpi_env.sh` refuses `JAX_PLATFORMS` other than `cpu` and sets:
 
 | setting | why |
 |---|---|
-| `JAX_CPU_COLLECTIVES_IMPLEMENTATION=mpi` | selects JAX's non-corrupting MPI backend |
-| `MPITRAMPOLINE_LIB=<unmodified Cray-built MPIwrapper>` | supplies the ABI adapter expected by JAX's bundled MPItrampoline |
-| `LD_PRELOAD=/opt/cray/pe/lib64/libpmi.so.0` | loads the verified Cray PMI implementation before `jax.distributed` starts coordination threads; omitting it segfaults in `_pmi_spawn_init`; `libpmi2.so.0` is a measured negative |
-| `MPICH_ASYNC_PROGRESS=1` | HPE's public control; promotes XLA's explicit FUNNELED request to `MPI_THREAD_MULTIPLE`, required when XLA executor threads coexist with native MPI I/O/linalg |
+| `JAX_CPU_COLLECTIVES_IMPLEMENTATION=mpi` | gloo corrupts `psum_scatter` silently ([transports](../transports.md)) |
+| `MPITRAMPOLINE_LIB` = the MPIwrapper release | the ABI adapter JAX's bundled MPItrampoline loads |
+| `LD_PRELOAD=/opt/cray/pe/lib64/libpmi.so.0` | loads Cray PMI before `jax.distributed` starts threads; without it `PMI2_Init` segfaults (`libpmi2.so.0` also segfaults) |
+| `MPICH_ASYNC_PROGRESS=1` | promotes XLA's FUNNELED request to `MPI_THREAD_MULTIPLE`, required when XLA threads and native MPI I/O or linear algebra coexist; the native FFI aborts the MPI world on a lower grant |
+| `MPICH_GPU_SUPPORT_ENABLED=0` | CPU steps |
 
-Async progress consumes a progress thread. The example requests two fewer
-OpenMP threads than affinity slots, but this is not a certified reservation:
-XLA workers do not obey `OMP_NUM_THREADS`, and progress-thread placement was
-not measured. The prelude also forces
-`MPICH_GPU_SUPPORT_ENABLED=0` and unsets the retired
-`LORRAX_MPI_FORCE_THREAD_MAIN`; communicator creation is owned by
-`common.collectives.warm_mesh_cliques()`.
-
-### CPU rank threads: one affinity mask, several thread populations
-
-`-c`/`LORRAX_CPUS_PER_TASK` gives each MPI rank an **allowed set of logical
-CPUs**. It does not divide that set among the work performed by the rank. A
-CPU rank can contain all of these at once:
-
-| population | controlled by | important limitation |
-|---|---|---|
-| XLA CPU workers for compiled `jax.numpy` operations | XLA and the rank affinity mask | `jax.numpy` is lowered by XLA, not executed by NumPy; one JAX device per rank is not one CPU thread; `OMP_NUM_THREADS` does not cap this pool |
-| LibSci/BLAS/SLATE OpenMP teams | `OMP_NUM_THREADS` and handler-specific controls printed in the startup block | the team is not assigned a private subset of the rank's CPUs |
-| Cray MPICH progress thread | `MPICH_ASYNC_PROGRESS=1` | required by the current route to obtain `MPI_THREAD_MULTIPLE`; it is not automatically given a reserved CPU |
-| Python/runtime and asynchronous-I/O threads | the OS within the same affinity mask | usually small, but can overlap compilation, I/O, and native calls |
-
-Unless a launcher supplies a measured binding policy, these threads inherit
-the same rank affinity mask and may migrate or contend on the same logical
-CPUs. `OMP_NUM_THREADS=14` with `-c16` therefore leaves *nominal headroom*; it
-does not prove that two CPUs are reserved for XLA and MPI. Synchronous native
-calls often leave other XLA workers idle, so oversubscription is also not
-proved merely by counting threads.
-
-The measured P=16/four-node smoke used `-c16`, `OMP_NUM_THREADS=14`, one JAX
-device per rank, and a live `MPI_THREAD_MULTIPLE` grant. It proved collective
-correctness, not thread placement or application scaling. The P=4/two-node
-GN-PPM calculation and P=4 ScaLAPACK, SLATE, and PHDF5 controls passed; GN-PPM
-selected its in-tree per-q solve and did not exercise ScaLAPACK. Do not turn
-off async progress for a performance experiment under this recipe: the live
-thread gate will correctly refuse the resulting FUNNELED grant.
-
-The next CPU-performance pass should, in order:
-
-1. record every thread's affinity and CPU residency after XLA initialization
-   and during one representative XLA kernel, one LibSci call, and MPI traffic;
-2. measure ranks-per-node, CPUs-per-rank, and OpenMP-team-size as a matrix,
-   reporting cold compile separately from warm execution;
-3. only then add `OMP_PLACES`/`OMP_PROC_BIND`, a supported XLA worker-pool cap,
-   or a dedicated progress-thread placement—do not guess a binding policy;
-4. repeat with an application at P=16 and then P=64/P=256 before making a
-   production-scale or multi-terabyte-workspace claim.
-
-The two unavoidable Perlmutter-specific seams remain the early
-`libpmi.so.0` preload and the async-progress request. Everything else is
-tracked, fail-closed build/activation plumbing around an unmodified ABI
-adapter; MPIwrapper is not a second MPI implementation. A fresh-machine
-reproduction still needs the pinned JAX 0.9.1 venv and the versioned Cray
-modules named by the builder.
-
-The PMI diagnosis and controls are allocation 57261316: no preload crashes in
-`PMI2_Init` (`lx-Xg1-203405-2056047-6411`), the stable SONAME preload passes
-(`lx-Xg1-204021-2096105-1906`), and `libpmi2.so.0` still crashes
-(`lx-Xg1-203924-2089729-3659`).  Full mechanism and machine split:
-[collective transports](../transports.md) and
-[`docs/dev/mpi_collectives.md`](../../dev/mpi_collectives.md).
-
-## Homogeneous GPU targets
-
-A JAX job must use one GPU model **and memory class** across its ranks.
-Use `-C 'gpu&hbm40g'` or `-C 'gpu&hbm80g'` for a multi-node allocation;
-`-C gpu` alone can mix A10040GB and A10080GB nodes. The runtime refuses a
-mixed target before preparing the mesh. Agreeing the minimum memory budget
-is necessary for common tile shapes but does not make independently compiled
-XLA programs identical: DEV498 (sandbox claim2534) reproduces swapped
-same-shape all-to-all exchanges and incorrect Dyson matrices on a mixed pool,
-while the identical program agrees with single-sample results on a homogeneous
-pool. No physics workaround or compiler-option override is used.
+**Threads per rank.** `-c`/`LORRAX_CPUS_PER_TASK` sets one affinity mask per
+rank, shared by XLA's CPU worker pool (not capped by `OMP_NUM_THREADS`),
+LibSci/SLATE OpenMP teams (capped by `OMP_NUM_THREADS` and the handler dials
+the startup report prints), the MPICH progress thread and Python's I/O
+threads. None is bound to a private CPU subset; `OMP_NUM_THREADS=14` with
+`-c16` leaves nominal headroom only. Thread placement has not been measured.
