@@ -59,7 +59,8 @@ def check_sector_constructor(mesh, root, *, linalg="local", parents=16, return_o
     # The production ledger receives a resolved per-device budget. For this
     # tiny synthetic bank, use the live GPU limit instead of its 3U fallback;
     # the unchanged 3U scaling predicate is still reported independently.
-    device_limit=int((jax.local_devices()[0].memory_stats() or {}).get('bytes_limit',16<<30))
+    # cuda_async reports bytes_limit 0 (no pool limit) and CPU reports none; price 16 GiB then.
+    device_limit=int((jax.local_devices()[0].memory_stats() or {}).get('bytes_limit') or 16<<30)
     meta.shared_pole_capacity=CapacityLedger(meta,mesh_xy=mesh,
         device_budget_bytes=device_limit)
     meta.shared_pole_capacity.live_stages=()
