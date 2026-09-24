@@ -44,7 +44,7 @@ Bottom to top; every script is in `config/frontera/`.
 | 5 | MPIwrapper with `lorrax_thread.patch` (`MPI_THREAD_MULTIPLE`) | `build_mpiwrapper.sh --fresh` on a login node; verifies the patch in the disassembly | host gcc/gfortran + Intel MPI | `MPITRAMPOLINE_LIB` unset: MPItrampoline refuses at startup; an unpatched wrapper loads and reintroduces a multi-node segfault/hang class |
 | 6 | host FFI `.so` (`liblorrax_ffi_host.so`) | `build_ffi_host.sh` | 2, host MPI, CBLAS/ScaLAPACK, SLATE | refusal at startup, naming the `.so` |
 | 7 | env glue (`gpu_env.sh`, `mpi_transport_env.sh`, staged PMI2 lib) | sourced per job; `stage_host_pmi.sh` | 5, 6, SLURM | without the staged PMI2 lib, `srun --mpi=pmi2` binds TACC's PMI-1 `libpmi.so` and `MPIR_pmi_init` fails; without `mpi_transport_env.sh`, the login shell's `FI_PROVIDER`/`I_MPI_PMI_LIBRARY` leak in |
-| 8 | staged runtime bundle (`lorrax_cpu_bundle.tar` → node-local `/tmp`) | `build_cpu_runtime_bundle.sh` once per revision, `stage_runtime.sh` per job | 3, 4, `src/` | announced fallback to the Lustre venv on rank 0; cold import 44–88 s instead of 4.6 s |
+| 8 | staged runtime bundle (`lorrax_cpu_bundle.tar` → node-local `/tmp`) | `build_cpu_runtime_bundle.sh` once per revision, `stage_runtime.sh` per job | 3, 4, `src/` | announced fallback to the Lustre venv on rank 0, at the cold-import cost in [frontera.md §3](machines/frontera.md#3-cold-start) |
 | 9 | launch template | `templates/gw_dev.sbatch` | all | edit the `#SBATCH` block and deck variables only |
 
 ---
@@ -106,7 +106,7 @@ overrides it and refuses anything but `highest` or `float32` (`high` is a
 dtype, is unaffected.
 
 **Compile cache.** One owner, `common.jax_compile_cache`; the directory
-resolution and controls are in [`env_vars.md`](../dev/env_vars.md) §2b. The
+resolution and controls are in [`env_vars.md` §2e](../dev/env_vars.md#2e-compile-cache). The
 persistent key includes every array shape, so a new system size misses.
 
 ### 2.1 The GPU memory pool {#gpu-pool}
@@ -187,7 +187,8 @@ then come from an `nvidia-smi` sample of the whole GPU.
 ### 2.2 The CPU-run plugin skip
 
 On a run that resolves to CPU, jax 0.9.1 still dlopens the CUDA library stack
-during plugin discovery, 77 s on a cold Frontera node.
+during plugin discovery (its cost on a cold Frontera node:
+[frontera.md §3](machines/frontera.md#3-cold-start)).
 `runtime.skip_gpu_plugin_discovery()`, armed by `bootstrap()` /
 `set_default_env()` when `JAX_PLATFORMS=cpu` or no NVIDIA device node is
 visible, answers the discovery with a stub module; the same venv still runs
