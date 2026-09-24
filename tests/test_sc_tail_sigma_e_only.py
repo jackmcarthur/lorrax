@@ -42,3 +42,24 @@ def test_no_qualifying_state_is_no_tail_law_never_nan():
     kw, mask = _case()
     fit, n_ex, note = _fit_sum_band_tail(kw, mask, ~kw["valence_mask_kn"])
     assert fit is None and n_ex == 8 and "E_DFT" in note
+
+
+def test_unit_z_is_the_plain_mean_bitwise_and_a_satellite_barely_moves_beta():
+    kw, mask = _case()
+    none = np.zeros_like(mask)
+    plain = _fit_sum_band_tail(kw, mask, none)[0]
+    assert _fit_sum_band_tail(kw, mask, none, np.ones(mask.shape))[0] == plain
+    # Owner 2026-09-24: Z-weighted.  One conduction state on a satellite:
+    # shifted +3 eV with Z = 0.1 against Z = 0.8 elsewhere.
+    z = np.full(mask.shape, 0.8); z[0, 4] = 0.1
+    kw_sat = dict(kw, E_qp_kn_ev=kw["E_qp_kn_ev"].copy()); kw_sat["E_qp_kn_ev"][0, 4] += 3.0
+    moved_mean = _fit_sum_band_tail(kw_sat, mask, none)[0].beta_c_ev - plain.beta_c_ev
+    moved_z = (_fit_sum_band_tail(kw_sat, mask, none, z)[0].beta_c_ev
+               - _fit_sum_band_tail(kw, mask, none, z)[0].beta_c_ev)
+    assert moved_z < 0.2 * moved_mean          # measured 0.13: Z = 0.1 vs 0.8
+    # Z outside (0, 1] is not a quasiparticle: the sample leaves the fit.
+    z_bad = np.full(mask.shape, 0.8); z_bad[0, 4] = 1.7
+    fit = _fit_sum_band_tail(kw_sat, mask, none, z_bad)[0]
+    drop = mask.copy(); drop[0, 4] = False
+    assert fit.n_fit_c == 7 and np.isclose(
+        fit.beta_c_ev, _fit_sum_band_tail(kw_sat, drop, none, np.full(mask.shape, 0.8))[0].beta_c_ev)
