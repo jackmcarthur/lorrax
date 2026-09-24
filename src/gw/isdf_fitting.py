@@ -456,7 +456,7 @@ def _fit_mubatch(
         batched_route=distrib_la_batched_route, n_rmu_solve=n_rmu_solve,
         n_rmu=int(meta.n_rmu), mu_basis=mu_basis, ngk_per_q=ngk_per_q,
         gvec_components=gvec_components, shell_slots=shell_slots,
-        shell_gvec=shell_gvec, path=output_file)
+        shell_gvec=shell_gvec, path=output_file, print_fn=print_fn)
     print_fn(f"  μ-batch timing: {n_run} batches {t_batch:.2f}s (store write "
              f"{store.t_write:.2f}s, {store.placement}, overlapped with the next "
              "batch)")

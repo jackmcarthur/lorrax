@@ -192,6 +192,29 @@ def run_case(case, fx, mesh, scratch):
     return worst
 
 
+def _check_finish(mesh):
+    """The finalize's one-collective reshards (q-local all-to-all, partial-sum
+    reduce-scatter) against the host reference, both μ splits."""
+    from isdf import zeta_mubatch as zmb
+    rng = np.random.default_rng(7)
+    Q, Q_pad, a, b = 3, 4, 8, 4
+    worst = 0.0
+    for layout, shape, spec in (("q", (Q_pad, a, b), P(("x", "y"), None, None)),
+                                ("g", (4, Q, a, b), P(("x", "y"), None, None, None))):
+        x = rng.standard_normal(shape) + 1j * rng.standard_normal(shape)
+        want = x[:Q] if layout == "q" else x.sum(axis=0)
+        for split in ("xy", "mu"):
+            got = parity._host(zmb._to_mu_owner(mesh, layout, Q, split)(
+                parity._put(x, NamedSharding(mesh, spec))))
+            e = parity._rel(got, want)
+            worst = max(worst, e)
+            if jax.process_index() == 0:
+                print(f"{TAG} finish layout={layout} split={split}  rel={e:.2e}", flush=True)
+            if not e <= TOL:
+                raise SystemExit(f"{TAG} FAIL finish {layout}/{split}: {e:.3e}")
+    return worst
+
+
 def main():
     if jax.process_count() != 4 or jax.device_count() != 4:
         raise SystemExit(f"{TAG} FAIL: needs 4 processes x 1 GPU")
@@ -209,6 +232,7 @@ def main():
                   else parity._acubic_fixture(mesh, rng) if case == "acubic_ns1"
                   else _ragged_fixture(mesh, rng))
             worst = max(worst, run_case(case, fx, mesh, scratch))
+        worst = max(worst, _check_finish(mesh))
     finally:
         multihost_utils.sync_global_devices("zeta_mubatch_p4 done")
         if jax.process_index() == 0:

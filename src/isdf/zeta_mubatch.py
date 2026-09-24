@@ -659,8 +659,10 @@ class ZetaG:
 
     def __init__(self, store, *, mesh, L_q, lu_piv, q_chunk_size, solver_kind,
                  zeta_gather, batched_route, n_rmu_solve, n_rmu, mu_basis,
-                 ngk_per_q, gvec_components, shell_slots, shell_gvec, path):
+                 ngk_per_q, gvec_components, shell_slots, shell_gvec, path,
+                 print_fn=print):
         self.store = store
+        self.print_fn = print_fn        # the fit's report sink (V_q receipt)
         self.mesh = mesh
         self.L_q, self.lu_piv = L_q, lu_piv
         self.q_chunk_size = int(q_chunk_size)
@@ -688,7 +690,7 @@ class ZetaG:
 
 
     # -- the one pass ---------------------------------------------------
-    def contract_v(self, v_table, *, zeta_io=None, print_fn=print):
+    def contract_v(self, v_table, *, zeta_io=None, print_fn=None):
         """Stream every G tile once; return V (Q, μ_pad, μ_pad) at ``P(None,'x','y')``.
 
         ``v_table`` is ``(Q, ngkmax)`` v(q+G) on the stored sphere.  V and
@@ -696,6 +698,7 @@ class ZetaG:
         ``zeta_io`` the masked ζ tiles are also written to ``zeta_q_G``.
         """
         t0 = time.perf_counter()
+        print_fn = print_fn or self.print_fn
         st = self.store
         # Pad q rows and G-tile slots carry v = 0, ngk = 0: inert in V.
         qa, ga = st.q_axis, st.g_axis
@@ -767,9 +770,9 @@ class ZetaG:
     def _write_tile(self, zeta_io, zt, g0):
         """One masked ζ tile into ``zeta_q_G`` (canonical μ order, clipped)."""
         if zt.sharding.spec[0] is not None:     # q-local → the writer's layout
-            zt = jax.lax.with_sharding_constraint(
-                zt, NamedSharding(self.mesh, P(None, _XY, None)))
-        zt = zt[:self.store.Q]
+            zt = _to_mu_owner(self.mesh, 'q', self.store.Q, 'mu')(zt)
+        else:
+            zt = zt[:self.store.Q]
         if self.mu_basis is not None:
             zt = self.mu_basis.unpack_axis(zt, 1)
         zeta_io.write_slab('zeta_q_G', zt, offset=(0, 0, int(g0)))
@@ -874,32 +877,53 @@ def _zero_accumulators(mesh, layout, Q_pad, Q, mu, n_sh, *, debug_m):
     return z(vs), (z(vs) if debug_m else z(vs[:1] + (1,) * (len(vs) - 1))), z(ss)
 
 
+def _to_mu_owner(mesh, layout, Q, split):
+    """q-local ``(Q_pad, a, b)`` or per-rank partial sums ``(P, Q, a, b)`` →
+    ``(Q, a, b)`` with μ split, in ONE collective (all-to-all or
+    reduce-scatter over ('x','y')).
+
+    ``split='xy'``: a over 'x' and b over 'y' (``P(None,'x','y')``, V);
+    ``split='mu'``: a over ('x','y') (``P(None,('x','y'),None)``, shell, ζ tile).
+    """
+    key = ('to_mu_owner', _mesh_id(mesh), layout, int(Q), split)
+    fn = _kernel_cache.get(key)
+    if fn is not None:
+        return fn
+    px, py = int(mesh.shape['x']), int(mesh.shape['y'])
+    P_ = px * py
+    out = P(None, 'x', 'y') if split == 'xy' else P(None, _XY, None)
+
+    def blocks(x):
+        """(n, a, b) → (P, n, a', b'): the block rank p = x·py + y owns, first."""
+        n, a, b = x.shape
+        if split == 'xy':
+            return x.reshape(n, px, a // px, py, b // py).transpose(
+                1, 3, 0, 2, 4).reshape(P_, n, a // px, b // py)
+        return x.reshape(n, P_, a // P_, b).transpose(1, 0, 2, 3)
+
+    @partial(shard_map, mesh=mesh, in_specs=(_acc_specs(layout),),
+             out_specs=out, check_vma=False)
+    def f(x):
+        if layout == 'q':            # (Q_pad/P, a, b): the q block this rank owns
+            x = jax.lax.all_to_all(blocks(x), _XY, 0, 0, tiled=True)
+            x = x.reshape((-1,) + x.shape[2:])         # q blocks in rank order
+        else:                        # (1, Q, a, b): this rank's partial sum
+            x = jax.lax.psum_scatter(blocks(x[0]), _XY, scatter_dimension=0,
+                                     tiled=True)[0]
+        return x[:Q]
+    fn = jax.jit(f)
+    _kernel_cache[key] = fn
+    return fn
+
+
 def _finish_v(mesh, layout, Q):
     """Accumulator → ``(Q, μ, μ)`` at ``P(None, 'x', 'y')``."""
-    key = ('finish_v', _mesh_id(mesh), layout, int(Q))
-    fn = _kernel_cache.get(key)
-    if fn is None:
-        out = NamedSharding(mesh, P(None, 'x', 'y'))
-
-        @partial(jax.jit, out_shardings=out)
-        def fn(V):
-            return (V[:Q] if layout == 'q' else jnp.sum(V, axis=0))
-        _kernel_cache[key] = fn
-    return fn
+    return _to_mu_owner(mesh, layout, Q, 'xy')
 
 
 def _finish_shell(mesh, layout, Q):
     """Shell accumulator → ``(Q, μ, n_shell)`` at ``P(None, ('x','y'), None)``."""
-    key = ('finish_shell', _mesh_id(mesh), layout, int(Q))
-    fn = _kernel_cache.get(key)
-    if fn is None:
-        out = NamedSharding(mesh, P(None, _XY, None))
-
-        @partial(jax.jit, out_shardings=out)
-        def fn(S):
-            return (S[:Q] if layout == 'q' else jnp.sum(S, axis=0))
-        _kernel_cache[key] = fn
-    return fn
+    return _to_mu_owner(mesh, layout, Q, 'mu')
 
 
 def _v_from_m(mesh, layout, solver_kind, n_log):
