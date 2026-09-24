@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from contextlib import ExitStack
 from dataclasses import replace
-from functools import partial
+from functools import lru_cache, partial
 from types import SimpleNamespace
 
 import jax
@@ -43,8 +43,98 @@ def _admit(compiled,meta,stage,*,native=0,resident=0,counted=0):
     return compiled
 
 
+_ADMIT_COMPILED = {}
+
+
 def _admit_compiled(kernel,args,meta,stage,*,native=0,resident=0):
-    return _admit(kernel.lower(*args).compile(),meta,stage,native=native,resident=resident)
+    """AOT-compile ``kernel`` at ``args`` (once per signature) and reserve its peak.
+
+    ``lower().compile()`` bypasses jit's executable cache, so an admission
+    repeated every SC map would recompile an unchanged program; the
+    reservation itself is still taken on every call.
+    """
+    leaves=jax.tree.leaves(args)
+    key=(kernel,jax.tree.structure(args),tuple(
+        (tuple(x.shape),str(x.dtype),getattr(x,'sharding',None))
+        if hasattr(x,'shape') else x for x in leaves))
+    if key not in _ADMIT_COMPILED:
+        _ADMIT_COMPILED[key]=kernel.lower(*args).compile()
+    return _admit(_ADMIT_COMPILED[key],meta,stage,native=native,resident=resident)
+
+
+# ---- executables built once per process ------------------------------------
+# Every SC map rebuilds the sector models, but not the programs that consume
+# them: the builders below are keyed on static configuration (shapes, mesh,
+# layout, symmetry tables by content), so a later map dispatches the same jit
+# objects and XLA compiles each program once per run.  Data (factors, poles,
+# intervals) always enters as an argument, never as a closure constant.
+
+def _static_key(value):
+    """Hashable content key of a small table tree (arrays by bytes digest)."""
+    import hashlib
+    if isinstance(value, dict):
+        return tuple(sorted((k, _static_key(v)) for k, v in value.items()))
+    if isinstance(value, (list, tuple)):
+        return tuple(_static_key(v) for v in value)
+    if isinstance(value, (np.ndarray, jax.Array)):
+        a = np.asarray(value)
+        return ('array', a.shape, a.dtype.str,
+                hashlib.sha256(np.ascontiguousarray(a).tobytes()).hexdigest())
+    return value
+
+
+_ENDPOINT_UNFOLD = {}
+
+
+def _endpoint_unfold(kwargs):
+    """``jit(face -> unfold_endpoint_panel(face, **kwargs)[0])``, one per table set."""
+    from symmetry_maps import unfold_endpoint_panel
+    key = _static_key(kwargs)
+    if key not in _ENDPOINT_UNFOLD:
+        _ENDPOINT_UNFOLD[key] = jax.jit(
+            lambda face: unfold_endpoint_panel(face, **kwargs)[0])
+    return _ENDPOINT_UNFOLD[key]
+
+
+@lru_cache(maxsize=None)
+def _placer(mesh_xy, spec):
+    """Reshard to ``spec`` (identity values)."""
+    return jax.jit(lambda x: x, out_shardings=NamedSharding(mesh_xy, spec))
+
+
+@lru_cache(maxsize=None)
+def _zeros(mesh_xy, shape):
+    return jax.jit(lambda: jnp.zeros(shape, jnp.complex128),
+                   out_shardings=NamedSharding(mesh_xy, P(None, 'x', 'y')))
+
+
+@lru_cache(maxsize=None)
+def _w_contraction(mesh_xy, grid, nk, mc, nt_n, kcarrier, layout):
+    """W(t) = B_A d(t) B_B^T on the full-q grid; the valence branch reads -q.
+
+    ``(nk, m*nc, n*nt)`` from ``(x, y, omega, interval, ref, time, hole)``
+    with ``hole`` static.  One GEMM plan per configuration.
+    """
+    from distrib_la import gemm_plan
+    from symmetry_maps import q_negation_index
+    from .sigma import _shared_pole_weights, _shared_pole_contract
+    gemm = gemm_plan(mesh_xy, m=mc, n=nt_n, k=kcarrier, nq=nk,
+                     dtype=np.complex128, layout=layout)
+    minus = jnp.asarray(q_negation_index(grid))
+
+    @partial(jax.jit, static_argnums=(6,))
+    def kernel(x, y, omega, interval, ref, time, hole):
+        if hole:
+            x = jnp.conj(jnp.take(x, minus, axis=0))
+            y = jnp.conj(jnp.take(y, minus, axis=0))
+            omega = jnp.take(omega, minus, axis=0)
+            interval = jnp.take(interval, minus, axis=0)
+        weights = _shared_pole_weights(omega, interval, ref, time)
+        return _shared_pole_contract(x, y, weights, gemm=gemm, layout=layout)
+    return kernel
+
+
+_SECTOR_TAU = {}
 
 
 class SectorTau:
@@ -58,23 +148,33 @@ class SectorTau:
     runner cache retains no resident factors.
     """
 
-    def __init__(self, spatial, synthesis, right_yr, right_proj, native, stage, meta):
+    def __init__(self, spatial, synthesis, right_yr, right_proj, native, stage, meta, key, plans):
         self._spatial, self._synthesis = spatial, synthesis
         self._right = (right_yr, right_proj)
         self._native, self._stage, self._meta = native, stage, meta
-        self._kernels = {}
+        self._key, self._plans = key, plans
         self._admitted = False
 
     def window_kernel(self, space):
+        """The τ body for ``space``, one function object per static configuration.
+
+        The window runner is cached on this object, so returning the first
+        map's body for an equal configuration (same shapes, mesh, layout,
+        parent plans and W contraction) lets every later SC map dispatch the
+        compiled window executable instead of recompiling it.  The body
+        closes over no device buffer.
+        """
         hole = space == 'val'
-        if hole not in self._kernels:
+        key = (self._key, self._synthesis.key, hole)
+        if key not in _SECTOR_TAU:
             spatial, w_kernel = self._spatial, self._synthesis.w_kernel
 
             def tau(xn, yr, xr, yn, energies, weight, w_operands, e_ref_a, e_ref_b, t, _active):
                 interactions = w_kernel(*w_operands, e_ref_b, t, hole)
                 return spatial(xn, yr, xr, yn, energies, weight, e_ref_a, t, interactions)
-            self._kernels[hole] = tau
-        return self._kernels[hole]
+            # The plans ride along so the ids in the key cannot be reused.
+            _SECTOR_TAU[key] = (self._plans, tau)
+        return _SECTOR_TAU[key][1]
 
     def window_arguments(self, xn, xr, energies, weight, e_ref_a, e_ref_b, space, indices, bounds):
         w_operands = self._synthesis.window_operands(space, indices, bounds)
@@ -149,14 +249,18 @@ def sector_tau_factory(left, right, keys, meta, mesh_xy):
         projector_shapes=(((q,b,m),(q,m,n)),((q,b,n),(q,n,b)))
         native=_native_workspace(mesh_xy,projector_shapes if face_green
             else (((q,m,k),(q,k,n)),*projector_shapes))
+        # Everything spatial() closes over is a function of this key; SC maps
+        # keep the parent plans, so their identities are stable.
+        key=(mesh_xy,a.layout,shapes,int(b),tuple(keys),tuple(int(v) for v in meta.kgrid),
+             int(meta.nk_tot),id(plans[0]),id(plans[1]))
         return SectorTau(spatial, synthesis, right_yr, right_proj,
-                         native+synthesis.native, f'sigma.sector.tau.{keys[0]}', meta)
+                         native+synthesis.native, f'sigma.sector.tau.{keys[0]}', meta, key, plans)
     return factory
 
 
 def _endpoint_route(header, basis, sym, span, rows, mesh_xy, axis, width):
     """Bind the symmetry service's current/charge endpoint action, once per panel."""
-    from symmetry_maps import unfold_endpoint_panel, endpoint_panel_cost
+    from symmetry_maps import endpoint_panel_cost
     from gw.qgrid_symmetry import shared_pole_packed_action
     proxy = SimpleNamespace(mu_basis=basis)
     perm, wraps, _ = shared_pole_packed_action(proxy, header, mesh_xy=mesh_xy)
@@ -174,7 +278,7 @@ def _endpoint_route(header, basis, sym, span, rows, mesh_xy, axis, width):
         spin_action_full=action,n_sym_spatial=int(qt['n_sym_spatial']),
         active_mask=basis.active_mask,mesh=mesh_xy,mesh_axis=axis,
         max_live_bytes=cost['estimated_live_bytes_per_rank'])
-    return jax.jit(lambda face: unfold_endpoint_panel(face,**kwargs)[0]), cost
+    return _endpoint_unfold(kwargs), cost
 
 
 def sector_synthesis(readers, headers, bases, families, frequencies, meta, mesh_xy):
@@ -184,10 +288,8 @@ def sector_synthesis(readers, headers, bases, families, frequencies, meta, mesh_
     configured wavefunction layout selects face or axis GEMM input placement.
     Occupied windows use conj(B_A(-q)) d(t) B_B(-q)^T; d is never conjugated.
     """
-    from distrib_la import gemm_plan
     from file_io.shared_pole_store import read_shared_pole_faces
-    from symmetry_maps import q_negation_index
-    from .sigma import _shared_pole_weights, _shared_pole_contract, _shared_pole_factor_specs
+    from .sigma import _shared_pole_factor_specs
     from .sigma_windows import shared_pole_intervals
 
     left,right=headers
@@ -204,11 +306,11 @@ def sector_synthesis(readers, headers, bases, families, frequencies, meta, mesh_
     ambient=capacity.live_stages
     tag=f'{left.get("sector")}.{right.get("sector")}'
     shape=(nk,m*nc,n*nt)
-    sharding=NamedSharding(mesh_xy,P(None,'x','y'))
     if not kmax:
-        zero=jax.jit(lambda:jnp.zeros(shape,jnp.complex128),out_shardings=sharding)
+        zero=_zeros(mesh_xy,shape)
         return _SectorW(lambda _ref,_time,_hole:zero().reshape(nk,m,nc,n,nt),
-                        lambda _space,_indices,_bounds:(),lambda:(),lambda _result=None:None,0)
+                        lambda _space,_indices,_bounds:(),lambda:(),lambda _result=None:None,0,
+                        ('zero',mesh_xy,shape,nc,nt))
     # The store reader pads physical Kmax for both endpoint face shardings.
     # Keep that carrier through unfolding and GEMM; K and the interval bounds
     # remain physical, so the padded pole columns have identically zero weight.
@@ -224,7 +326,7 @@ def sector_synthesis(readers, headers, bases, families, frequencies, meta, mesh_
     # completes, keep only the configured GEMM input layout across all tau.
     factor_spec=_shared_pole_factor_specs(layout)
     def place(value,spec):
-        return jax.jit(lambda x:x,out_shardings=NamedSharding(mesh_xy,spec))(value)
+        return _placer(mesh_xy,spec)(value)
     px,py=int(mesh_xy.shape['x']),int(mesh_xy.shape['y'])
     face_bytes=16*nq*kcarrier*(m*nc+n*nt)//mesh_xy.size
     # Each factor has one centroid axis. Pole columns divide over the other
@@ -269,26 +371,10 @@ def sector_synthesis(readers, headers, bases, families, frequencies, meta, mesh_
         capacity.live_stages=ambient
         raise
     try:
-        gemm=gemm_plan(mesh_xy,m=m*nc,n=n*nt,k=kcarrier,nq=nk,
-                       dtype=np.complex128,layout=layout)
-        minus=jnp.asarray(q_negation_index(tuple(left['grid'])))
-        @partial(jax.jit,static_argnums=(6,))
-        def kernel(x,y,omega,interval,ref,time,hole):
-            if hole:
-                x=jnp.conj(jnp.take(x,minus,axis=0))
-                y=jnp.conj(jnp.take(y,minus,axis=0))
-                omega=jnp.take(omega,minus,axis=0)
-                interval=jnp.take(interval,minus,axis=0)
-            weights=_shared_pole_weights(omega,interval,ref,time)
-            return _shared_pole_contract(x,y,weights,gemm=gemm,layout=layout)
-        def abstract(shape,dtype,spec=P()):
-            return jax.ShapeDtypeStruct(shape,dtype,sharding=NamedSharding(mesh_xy,spec))
-        args=(abstract((nk,m,nc,kcarrier),np.complex128,factor_spec[0]),
-              abstract((nk,n,nt,kcarrier),np.complex128,factor_spec[1]),
-              abstract((nk,kcarrier),np.float64),abstract((nk,2),np.int32),
-              abstract((),np.float64),abstract((),np.complex128))
-        for hole in (False,True):
-            _admit_compiled(kernel,(*args,hole),meta,f'sigma.sector.compiled.{tag}.{hole}',native=native)
+        # The window runner inlines this contraction and SectorTau.admit
+        # reserves the runner's peak plus this GEMM's native workspace; a
+        # standalone AOT compile per hole would only repeat that work.
+        kernel=_w_contraction(mesh_xy,tuple(left['grid']),nk,m*nc,n*nt,kcarrier,layout)
     except BaseException:
         capacity.live_stages=ambient
         b_x=b_y=poles=None
@@ -314,7 +400,8 @@ def sector_synthesis(readers, headers, bases, families, frequencies, meta, mesh_
             b_x=b_y=poles=None
             capacity.live_stages=ambient
             closed=True
-    return _SectorW(w_kernel,window_operands,lambda:(b_x,b_y,poles),close,native)
+    return _SectorW(w_kernel,window_operands,lambda:(b_x,b_y,poles),close,native,
+                    ('w',mesh_xy,tuple(left['grid']),nk,m,nc,n,nt,kcarrier,layout))
 
 
 class _SectorW:
@@ -327,7 +414,8 @@ class _SectorW:
     """
     ordered=True
 
-    def __init__(self,w_kernel,window_operands,resident_operands,close,native):
+    def __init__(self,w_kernel,window_operands,resident_operands,close,native,key):
+        self.key=key
         self.w_kernel=w_kernel
         self.window_operands=window_operands
         self.resident_operands=resident_operands
@@ -342,7 +430,6 @@ def instantaneous_sector_sigma(handle, families, bases, meta, mesh_xy, *,
     from gw.photon_sigma import contract_lorentz_blocks, _TERM_X
     from gw.cohsex_sigma import _resolve_Gij
     from gw.qgrid_symmetry import qgrid_trs_policy_from_shared_pole_store
-    from symmetry_maps import unfold_file_wedge_band_operator
     from file_io.shared_pole_store import read_bank_constant_header, read_bank_constant
     header=read_bank_constant_header(handle,mesh_xy=mesh_xy)
     raw_layout=PhotonBasisLayout.from_centroid_extents(bases[0].n_logical,bases[1].n_logical,mesh_xy)
@@ -386,13 +473,9 @@ def instantaneous_sector_sigma(handle, families, bases, meta, mesh_xy, *,
             channel=int(key[0] != 0 and key[1] != 0)  # 0: CT+TC, 1: TT
             currents[channel]=(value if currents[channel] is None
                                else currents[channel]+value)
-    from gw.cohsex_sigma import _replicate_band_sigma
-    nb=families[0].slices.nb_sigma
-    @jax.jit
-    def finish(value):
-        parent=_replicate_band_sigma(value,mesh_xy)[:,:nb,:nb]
-        return unfold_file_wedge_band_operator(families[0].green_parent.plan.sym,
-                                               parent,trs_rule='transpose')
+    from gw.photon_sigma import band_sigma_finish
+    finish=band_sigma_finish(mesh_xy,int(families[0].slices.nb_sigma),
+                             families[0].green_parent.plan.sym)
     if return_components:
         return finish(total), finish(currents[0]), finish(currents[1])
     return finish(total)
