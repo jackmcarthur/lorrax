@@ -30,6 +30,7 @@ os.environ.setdefault("JAX_ENABLE_X64", "1")
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax.scipy.linalg import solve_triangular
 
 
@@ -1030,6 +1031,45 @@ def rcrop_nojit(
 
 
 
+def _solve_alpha_filtered(Fw: jnp.ndarray, cond_max: float = 1.0e12):
+    """``_solve_crop_alpha_stacked`` with the Walker-Ni conditioning filter.
+
+    Same affine least squares (newest entry last, zero-norm slots invalid),
+    but the OLDEST valid differences are dropped until the unit-column Gram
+    has condition number <= ``cond_max`` (1e12 on the Gram = 1e6 on R, the
+    DFTK / Walker-Ni cap).  One (k, k) Gram and one length-k reduction, as
+    before; the reduced solves are on the host.  Returns (alpha, n_used).
+    """
+    k = Fw.shape[0] - 1
+    ax = tuple(range(1, Fw.ndim))
+    bshape = (k,) + (1,) * (Fw.ndim - 1)
+    f_new = Fw[-1]
+    F_hist = Fw[:k]
+    hist_norms = np.asarray(jnp.sqrt(jnp.sum(jnp.abs(F_hist) ** 2, axis=ax)))
+    valid = hist_norms > 1e-14
+    F_prev = jnp.where(jnp.asarray(valid).reshape(bshape),
+                       F_hist - f_new[None], 0.0 + 0.0j)
+    col = np.asarray(jnp.sqrt(jnp.sum(jnp.abs(F_prev) ** 2, axis=ax)))
+    scale = np.where(col > 0.0, col, 1.0)
+    F_s = F_prev / jnp.asarray(scale).reshape(bshape)
+    G = np.real(np.asarray(jnp.tensordot(jnp.conj(F_s), F_s, axes=(ax, ax))))
+    b = -np.real(np.asarray(jnp.tensordot(
+        jnp.conj(F_s), f_new, axes=(ax, tuple(range(f_new.ndim))))))
+    use = [i for i in range(k) if valid[i] and col[i] > 0.0]
+    while use:
+        Gu = G[np.ix_(use, use)]
+        w = np.linalg.eigvalsh(Gu)
+        if w[0] > 0.0 and w[-1] / w[0] <= cond_max:
+            break
+        use = use[1:]                       # drop the oldest difference
+    gamma = np.zeros(k)
+    if use:
+        Gu = G[np.ix_(use, use)] + 1e-12 * np.eye(len(use))
+        gamma[use] = np.linalg.solve(Gu, b[use]) / scale[use]
+    alpha = np.concatenate([gamma, [1.0 - gamma.sum()]])
+    return jnp.asarray(alpha, dtype=Fw.dtype), len(use)
+
+
 def pulay_nojit(
     residual_fn: Callable[[jnp.ndarray], jnp.ndarray],
     x0: jnp.ndarray,
@@ -1040,6 +1080,7 @@ def pulay_nojit(
     entry_sharding=None,
     metric=None,
     history: str = "evaluated",
+    safeguard: bool = False,
 ) -> AccelerationResult:
     """One map evaluation per iteration: Anderson type II or CROP.
 
@@ -1059,6 +1100,12 @@ def pulay_nojit(
 
     rCROP (:func:`rcrop_nojit`) is the second form plus a real-residual
     evaluation at Σ α x, i.e. two evaluations per iteration.
+
+    ``safeguard=True`` adds two dimensionless, literature-default guards
+    that cost no map evaluation: the Walker-Ni / DFTK conditioning filter
+    (drop the oldest differences until cond(R) <= 1e6) and a nonmonotone
+    fallback -- when an evaluation is worse than every residual in the
+    window, the next point is G(x_best) = x_best + f_best.
 
     α is solved over the REAL numbers: the iterates are Hermitian matrices,
     a real vector space, and the Gram of Hermitian residuals is real.  The
@@ -1102,6 +1149,10 @@ def pulay_nojit(
         return AccelerationResult(x=x, residual_norms=jnp.array(res_history),
                                   iterations=0, converged=True)
     mask_shape = (m,) + (1,) * len(shape)
+    best = (x, f)
+    best_res = res_history[0]
+    window_res = [res_history[0]]
+    fallback = False
 
     for it in range(maxit):
         oldest_pos = (head - filled) % m
@@ -1112,9 +1163,21 @@ def pulay_nojit(
         F_ord = jnp.where(mask_cols, F_ord, 0.0 + 0.0j)
         Xw = jnp.concatenate([X_ord, x[None]], axis=0)
         Fw = jnp.concatenate([F_ord, f[None]], axis=0)
-        alpha = jnp.real(_solve_crop_alpha_stacked(_weighted(Fw))).astype(dtype)
+        if safeguard:
+            alpha, n_used = _solve_alpha_filtered(_weighted(Fw))
+        else:
+            alpha = jnp.real(_solve_crop_alpha_stacked(_weighted(Fw))).astype(dtype)
         x_opt = jnp.tensordot(alpha, Xw, axes=(0, 0))
         f_opt = jnp.tensordot(alpha, Fw, axes=(0, 0))
+        if safeguard and fallback:
+            # Nonmonotone safeguard (Ouyang et al. 2023, no extra map): the
+            # last evaluation did worse than every residual in the window,
+            # so step from the best evaluated point instead.  The rejected
+            # pair stays in the history -- it is still valid secant data.
+            x_opt, f_opt = best
+        if print_fn is not None and safeguard:
+            print_fn(f"  pulay step {it:02d}: window {n_used + 1}"
+                     f"{' FALLBACK to best' if fallback else ''}")
         keep_x, keep_f = (x, f) if history == "evaluated" else (x_opt, f_opt)
         Xhist = Xhist.at[head].set(_entry(keep_x))
         Fhist = Fhist.at[head].set(_entry(keep_f))
@@ -1126,6 +1189,13 @@ def pulay_nojit(
         f = _entry(residual_fn(x))
         res = _norm(f)
         res_history.append(res)
+        if safeguard:
+            # Never two fallbacks in a row: the second would re-evaluate the
+            # same G(x_best).
+            fallback = (not fallback) and res > max(window_res)
+            window_res = (window_res + [res])[-(m + 1):]
+            if res < best_res:
+                best, best_res = (x, f), res
         if print_fn is not None:
             print_fn(f"  {history} iter {it:02d}: residual = {res:.6e}")
         if res <= tol:

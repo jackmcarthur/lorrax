@@ -4641,6 +4641,67 @@ def _sc_probe_residual_split(H_in, H_out, U_in, e_in_ev):
         rot_angle_max=float(angle.max()))
 
 
+def _sigma_onshell_slope(inputs, state_out):
+    """DIAGNOSTIC / A/B: Re dSigma_c,nn/domega on the segment E_n sits on.
+
+    The map evaluates Sigma_c(E_n) by linear interpolation of its omega grid
+    (``qsgw_utils.interp_along_omega``), so this segment slope is the map's
+    exact diagonal on-shell Jacobian dF_nn/dE_n.  Outside the grid the map
+    uses Sigma(omega=0): slope 0.  Shape (nk_loop, nb), input QP order.
+    """
+    from .qsgw_utils import extract_sigma_diag_replicated
+    sigma = state_out.outputs.sigma_result
+    cube, omega = sigma.sigma_c_omega_kij_ry, sigma.omega_grid_ev
+    if cube is None or omega is None:
+        return None
+    sig = np.asarray(extract_sigma_diag_replicated(cube, inputs.mesh_xy),
+                     dtype=np.complex128) * RYD_TO_EV
+    if sigma.sigma_band_axis is not None:
+        from runtime.padding import strip_axis
+        sig = np.asarray(strip_axis(sig, sigma.sigma_band_axis, axis=-1))
+    om = np.asarray(omega, dtype=np.float64)
+    e_rel = np.asarray(sigma.e_eval_ev, dtype=np.float64) - float(sigma.efermi_dft_ev)
+    inside = (e_rel >= om[0]) & (e_rel <= om[-1])
+    hi = np.clip(np.searchsorted(om, e_rel, side="left"), 1, om.size - 1)
+    lo = hi - 1
+    kk = np.arange(e_rel.shape[0])[:, None]
+    nn = np.arange(e_rel.shape[1])[None, :]
+    slope = np.real(sig[hi, kk, nn] - sig[lo, kk, nn]) / (om[hi] - om[lo])
+    return np.where(inside, slope, 0.0)
+
+
+def _z_precondition_residual(inputs, state_out, H_in, e_in_ev, *, print_fn):
+    """A/B candidate: per-state Newton (Z) step on the diagonal of f = F(H) - H.
+
+    In the input QP basis U, dF_nn/dE_n = s_n (``_sigma_onshell_slope``), so
+    the diagonal Newton step for state n is Z_n f_nn with Z_n = 1/(1 - s_n):
+    the linearized quasiparticle equation, the same Z the eqp1 column uses.
+    It is applied only where 1 - s_n >= 1/2 (|Z| <= 2): damping of every
+    overshooting (s < 0) state and up to 2x extrapolation of slow ones; a
+    state whose QP equation is near-singular or expansive keeps the plain
+    step, which Anderson owns.  Off-diagonal entries unchanged.
+    """
+    from common.collectives import gather_to_host
+    f_dev = state_out.H_qp_dft - H_in
+    slope = _sigma_onshell_slope(inputs, state_out)
+    if slope is None:
+        return f_dev
+    z = np.where(1.0 - slope >= 0.5, 1.0 / (1.0 - slope), 1.0)
+    f = np.asarray(gather_to_host(f_dev))
+    nb = f.shape[-1]
+    zz = z[:, :nb] if z.shape[1] >= nb else np.pad(
+        z, ((0, 0), (0, nb - z.shape[1])), constant_values=1.0)
+    u = np.asarray(gather_to_host(state_out.outputs.sigma_basis_U))[:, :nb, :nb]
+    fq = np.einsum("kim,kij,kjn->kmn", np.conj(u), f, u, optimize=True)
+    dq = np.diagonal(fq, axis1=1, axis2=2) * (zz - 1.0)
+    f = f + np.einsum("kim,km,kjm->kij", u, dq, np.conj(u), optimize=True)
+    print_fn(f"    SC Z-precondition: {int((z != 1.0).sum())} of {z.size} states; "
+             f"Z in [{float(z.min()):.3f}, {float(z.max()):.3f}]; slope range "
+             f"[{float(slope.min()):+.3f}, {float(slope.max()):+.3f}]; "
+             f"{int((1.0 - slope < 0.5).sum())} states left to Anderson")
+    return _place(np.ascontiguousarray(f), inputs.mesh_xy)
+
+
 def _sc_z_factors(
     inputs: SCInputs,
     state_out: SCState,
@@ -5625,8 +5686,10 @@ def _run_rcrop(
 
     # A/B DIAGNOSTIC (sc_accel 2026-09-24, branch only): which accelerator.
     # rcrop (default, two maps per iteration) | anderson | crop (one each).
+    # anderson_sg = + conditioning filter and nonmonotone fallback;
+    # anderson_z  = anderson_sg on the Z-preconditioned residual.
     _accel = os.environ.get("LORRAX_SC_ACCEL_AB", "rcrop").strip() or "rcrop"
-    if _accel not in ("rcrop", "anderson", "crop"):
+    if _accel not in ("rcrop", "anderson", "anderson_sg", "anderson_z", "crop"):
         raise ValueError(f"LORRAX_SC_ACCEL_AB={_accel!r}")
     _two_eval = _accel == "rcrop"
     print_fn(f"  SC accelerator (A/B): {_accel}")
@@ -5875,6 +5938,24 @@ def _run_rcrop(
                         _outs[1.0][2] - 2 * _outs[0.5][2] + _e0).max() * 1e3),
                     eig_first_diff_max_meV=float(np.abs(
                         _outs[1.0][2] - _e0).max() * 1e3))
+                _sp = _sigma_onshell_slope(inputs, state_out)
+                _din = (_e0 - E_in)            # t=1 input is H_out: sorted E_out(0) - E_in
+                _dout = _outs[1.0][2] - _e0
+                _ok = np.abs(_din) > 0.05e-3
+                if _sp is not None and _ok.any():
+                    _nbs = min(_sp.shape[1], _din.shape[1])
+                    _so = np.where(_ok, _dout / np.where(_ok, _din, 1.0), np.nan)[:, :_nbs]
+                    _pr = _sp[:, :_nbs]
+                    _m = ~np.isnan(_so)
+                    _rec["line"]["slope_obs_pct"] = [float(v) for v in np.percentile(_so[_m], [5, 25, 50, 75, 95])]
+                    _rec["line"]["slope_pred_pct"] = [float(v) for v in np.percentile(_pr[_m], [5, 25, 50, 75, 95])]
+                    _rec["line"]["slope_obs_pred_corr"] = float(np.corrcoef(_so[_m], _pr[_m])[0, 1]) if _m.sum() > 2 else None
+                    _rec["line"]["slope_absdiff_median"] = float(np.median(np.abs(_so[_m] - _pr[_m])))
+                    _rec["line"]["n_states"] = int(_m.sum())
+                    if jax.process_index() == 0:
+                        np.savez(os.path.join(inputs.input_dir, f"sc_line_probe_{_iter_idx[0]:04d}.npz"),
+                                 e_in=E_in, e_out0=_e0, e_out_half=_outs[0.5][2], e_out1=_outs[1.0][2],
+                                 slope_pred=_sp)
                 _probe_line_ref[0] = (_outs[1.0][0], _outs[1.0][1])
                 _outs = None
             if jax.process_index() == 0:
@@ -5962,6 +6043,9 @@ def _run_rcrop(
                         convergence_verdict=_verdict,
                         frozen_scissor_fits=_frozen_fits[0]),
                 _verdict)
+        if _accel == "anderson_z":
+            return _to_entry(_z_precondition_residual(
+                inputs, state_out, H, E_in, print_fn=lambda l: _record_sc(inputs, l)))
         return _to_entry(state_out.H_qp_dft - H)
 
     # rCROP HAS NO STOPPING AUTHORITY.  ``tol=0.0`` below is not a
@@ -6041,9 +6125,10 @@ def _run_rcrop(
             # budget as the two-map rCROP iteration count.
             result = pulay_nojit(
                 residual_fn, x0, m=history_depth, maxit=2 * max_iter,
-                tol=0.0, print_fn=None, entry_sharding=entry_sh,
-                metric=_metric_np,
-                history=("evaluated" if _accel == "anderson" else "optimal"))
+                tol=0.0, print_fn=lambda l: _record_sc(inputs, l),
+                entry_sharding=entry_sh, metric=_metric_np,
+                history=("optimal" if _accel == "crop" else "evaluated"),
+                safeguard=_accel in ("anderson_sg", "anderson_z"))
     except _Converged as stop:
         # The criterion fired inside the map.  Return the accepted
         # map INPUT that met it, NOT F(input) and not rCROP's stale internal
