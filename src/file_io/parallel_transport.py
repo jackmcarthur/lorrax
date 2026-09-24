@@ -41,6 +41,7 @@ SINGULAR_VALUES_DATASET = "singular_values_ibz"
 CONNECTION_REDUCED_DATASET = "berry_connection_reduced"
 CONNECTION_CART_DATASET = "berry_connection_cart"
 VELOCITY_DFT_DATASET = "velocity_dft_cart"
+HUBBARD_PROVENANCE_ATTR = "hubbard_provenance_utf8"
 ENERGIES_DATASET = "dft_energies_ry_full"
 W_AV_DENSITY_DATASET = "w_av_density_mtxel"
 W_AV_SCHEMA_VERSION = 3
@@ -403,6 +404,7 @@ def initialize_parallel_transport_artifact(
     wfn_path: str,
     wfn_fingerprint: str,
     rcond: float = 1.0e-10,
+    hubbard_provenance: str | None = None,
 ) -> None:
     """Create the schema and write exact velocity before the WFN stream.
 
@@ -526,6 +528,13 @@ def initialize_parallel_transport_artifact(
             np.frombuffer(
                 str(wfn_fingerprint).encode("utf-8"), dtype=np.uint8).astype(np.int32))
         io.write_attr("polar_rcond", np.float64(rcond))
+        if hubbard_provenance is not None:
+            # DFT+U stamp (psp.hubbard_ops): 'none' or the JSON of occupations
+            # hash, U/J/B, formulation, projector.  Absent = pre-V_U file.
+            io.write_attr(
+                HUBBARD_PROVENANCE_ATTR,
+                np.frombuffer(str(hubbard_provenance).encode("utf-8"),
+                              dtype=np.uint8).astype(np.int32))
         # Numeric convention stamps are SlabIO-readable on every backend.
         # 1 means the sole supported convention documented by this schema.
         io.write_attr("energy_units_ry", np.int32(1))

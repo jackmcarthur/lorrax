@@ -415,9 +415,16 @@ def _check_dipole_provenance(dipole_path, *, params, wfn, print_fn) -> None:
                  f"({type(exc).__name__}: {exc})")
         return
     expected_bispinor = params.get("_charge_bispinor")
+    import os
+    from psp.hubbard_ops import hubbard_provenance_for
+    expected_hubbard = hubbard_provenance_for(
+        params.get("hubbard_input", ""), params.get("hubbard_occupations", ""),
+        wfn=wfn, base_dir=os.path.dirname(os.path.abspath(dipole_path)),
+        caller="gw.head_correction dipole")
     authenticated = check_dipole_provenance(
         dipole_path, wfn=wfn, nval=nval, ncond=ncond, nband=nband,
-        bispinor=expected_bispinor, print_fn=print_fn)
+        bispinor=expected_bispinor, print_fn=print_fn,
+        hubbard=expected_hubbard)
     if explicit_comparison and not authenticated:
         raise ValueError(
             "GATE comparison_charge_dipole_provenance: the explicit "

@@ -6175,7 +6175,7 @@ def load_head_velocity_source(
         from .qsgw_head import load_dft_velocity_head
 
         source = load_dft_velocity_head(
-            pt_path, mesh=mesh, wfn=wfn, meta=meta)
+            pt_path, mesh=mesh, wfn=wfn, meta=meta, config=config)
         print_fn(
             "  SC head: loaded the exact DFT p-matrix velocity stage from "
             f"{pt_path} (nb={source.nb_logical}); no finite links, so "

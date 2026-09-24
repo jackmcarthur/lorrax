@@ -1379,6 +1379,12 @@ _DEFAULTS = {
     # "1 unrecognized deck key(s)" in the log, which is this project's
     # named failure mode reproduced in one line of a deck.
     "vnl_velocity_sign": "",
+    # DFT+U mean field (QE ortho-atomic): the pw.x input carrying the HUBBARD
+    # card, and that run's prefix.save/occup.txt.  Read by psp.hubbard_ops'
+    # one resolver, which the dipole/velocity producer and every velocity
+    # consumer call; a WFN whose QE schema declares DFT+U refuses without them.
+    "hubbard_input": "",
+    "hubbard_occupations": "",
     "do_G0": True,
     # Deprecated (2026-07-08): ``self_consistent = true`` is honored as an
     # alias for ``qp_solver = self_consistent`` via auto-resolution.  SC is
@@ -2935,6 +2941,8 @@ def _assemble_input_config(
         bispinor=bool(params["bispinor"]),
         bispinor_gw=coerce_bispinor_gw_mode(params["bispinor_gw"]),
         vnl_velocity_sign=str(params["vnl_velocity_sign"] or ""),
+        hubbard_input=str(params["hubbard_input"] or ""),
+        hubbard_occupations=str(params["hubbard_occupations"] or ""),
         do_G0=_resolved_do_g0,
         self_consistent=bool(params["self_consistent"]),
         use_ppm_sigma=bool(params["use_ppm_sigma"]),
@@ -4655,6 +4663,10 @@ class LorraxConfig:
     #: point of use.  Keeping the spelling (rather than a second resolver in
     #: gw_config) lets every velocity consumer take the producer's exact arm.
     vnl_velocity_sign: str
+    #: DFT+U velocity inputs (deck-relative spellings); resolved at the point
+    #: of use by ``psp.hubbard_ops.resolve_hubbard_input``.
+    hubbard_input: str
+    hubbard_occupations: str
     do_G0: bool
     self_consistent: bool         # deprecated alias; ``qp_solver`` is canonical
     use_ppm_sigma: bool           # legacy mirror; ``compute_mode`` is canonical

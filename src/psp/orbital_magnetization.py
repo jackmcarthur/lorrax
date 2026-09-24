@@ -488,6 +488,14 @@ def main(argv=None):
     print(f"\n[orbmag] WFN: {wfn_path}")
     wfn = WfnLoader(str(wfn_path))
     sym = wfn.symmetry()
+    # This script assembles its OWN p + dV_NL/dk (velocity_at_k / run_ibz)
+    # and has no i[r, V_U].  A DFT+U mean field refuses here through the one
+    # resolver instead of silently omitting the term; the DFT+U velocity is
+    # the one path (common.mtxel_sweep.dipole_operator with the deck keys
+    # hubbard_input / hubbard_occupations) and psp.orbital_response.
+    from psp.hubbard_ops import resolve_hubbard_input
+    resolve_hubbard_input("", "", wfn=wfn, base_dir=str(wfn_path.parent),
+                          caller="psp.orbital_magnetization (no V_U term)")
 
     nspinor = int(wfn.nspinor)
     if nspinor != 2:
