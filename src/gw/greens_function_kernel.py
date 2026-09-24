@@ -440,3 +440,30 @@ def unfold_parent_spin_block(parent, plan, tables, index, *, conjugate=False):
         term = w[:, None, None] * T.reshape(n_full, T.shape[1], T.shape[3])
         total = term if total is None else total + term
     return total
+
+
+def pair_stream_layout(*, n_full, ns, mu, nb, layout, mesh):
+    """The layout a spin-pair stream contracts its full-k faces in.
+
+    A stream issues ``2·n_s²`` block GEMMs per Green; on faces each gathers
+    its band panels again.  When the two full-k axis copies,
+    ``16·N_k·n_s·μ·N_b·(1/p_x + 1/p_y)``, are no larger than one Green tile
+    ``16·N_k·n_s²·μ²/P`` (the panel bound of the face route), the stream
+    gathers them once (:func:`to_pair_stream_layout`) and every block GEMM
+    is local.
+    """
+    if layout != "face":
+        return layout
+    px, py = int(mesh.shape['x']), int(mesh.shape['y'])
+    axis_bytes = 16.0 * n_full * ns * mu * nb * (1.0 / px + 1.0 / py)
+    tile_bytes = 16.0 * n_full * ns * ns * mu * mu / (px * py)
+    return "axis" if axis_bytes <= tile_bytes else "face"
+
+
+def to_pair_stream_layout(psi_mun, psi_nmu, *, layout, mesh):
+    """Reshard full-k faces to ``layout`` (a no-op when they already are)."""
+    from common.wfn_layout import psi_specs
+
+    nmu_spec, mun_spec = psi_specs(layout)
+    return (jax.lax.with_sharding_constraint(psi_mun, jax.sharding.NamedSharding(mesh, mun_spec)),
+            jax.lax.with_sharding_constraint(psi_nmu, jax.sharding.NamedSharding(mesh, nmu_spec)))
