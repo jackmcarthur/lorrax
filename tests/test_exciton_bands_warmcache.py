@@ -132,7 +132,7 @@ def _unsunk_twin(mesh):
     """
     from jax import lax
     from bse.bse_ring_comm import make_bse_shardings
-    from bse.bse_serial import compute_pair_amplitude
+    from bse.bse_preconditioner import compute_pair_amplitude
     from bse.bse_stack_matvec import build_bse_stack_matvec
     from solvers.lanczos import block_lanczos_eig_jit
 

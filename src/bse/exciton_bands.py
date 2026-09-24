@@ -149,7 +149,7 @@ from runtime.production_stream import ProductionStdout
 from .bse_io import (load_bse_data_from_restart_sharded, decimate_W_q_to_subgrid, make_w_densifier, build_w_head_channel, resolve_w_head_densify, _resolve_head_params, PAD_EPS_GUARD_RY)
 from file_io.restart_bundle import (_find_restart_file)
 from .bse_ring_comm import create_mesh_xy_from_flags, make_bse_shardings
-from .bse_serial import compute_pair_amplitude
+from .bse_preconditioner import compute_pair_amplitude
 from .bse_stack_matvec import build_bse_stack_matvec
 from .bse_window import refuse_eqp_on_a_qp_wfn
 from . import vq_interp

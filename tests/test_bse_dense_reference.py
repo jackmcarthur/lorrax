@@ -137,19 +137,10 @@ def _random_X(nb, nc, nv, nk):
     return jnp.asarray(x)
 
 
-def _serial_matvec(data, X, include_W):
-    from bse.bse_serial import apply_bse_hamiltonian_single_device
-    return apply_bse_hamiltonian_single_device(
-        X, data["psi_c"], data["psi_v"], data["eps_c"], data["eps_v"],
-        data["W_q"], data["V_q0"],
-        int(data["nkx"]), int(data["nky"]), int(data["nkz"]),
-        include_W=include_W)
-
-
 def _sharded_matvec(kind, data, X, include_W):
     from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
     from bse.bse_ring_comm import build_bse_ring_matvec, make_bse_shardings
-    from bse.bse_serial import compute_pair_amplitude
+    from bse.bse_preconditioner import compute_pair_amplitude
 
     mesh = Mesh(np.array(jax.devices()[:1]).reshape(1, 1), axis_names=("x", "y"))
     sh = make_bse_shardings(mesh)
@@ -183,8 +174,6 @@ def _sharded_matvec(kind, data, X, include_W):
 
 
 def _run_matvec(kind, data, X, include_W):
-    if kind == "serial":
-        return _serial_matvec(data, X, include_W)
     return _sharded_matvec(kind, data, X, include_W)
 
 
@@ -194,7 +183,7 @@ def _relerr(a, b):
     return float(np.linalg.norm(a - b) / max(np.linalg.norm(b), 1e-300))
 
 
-MATVEC_KINDS = ["serial", "stack", "ring"]
+MATVEC_KINDS = ["stack", "ring"]
 
 
 # ---------------------------------------------------------------------------
@@ -253,14 +242,14 @@ def test_DV_matches_dense(bse_dense_state, kind):
 
 @pytest.mark.gpu
 def test_spectrum_matches_dense(bse_dense_state):
-    """Materialised serial matvec has the dense-H spectrum (B1).
+    """Materialised stack matvec has the dense-H spectrum (B1).
 
     Design (d) asked for an *iterative* lowest-4 check, but both single-vector
     and block Lanczos are numerically fragile on this fixture: the q=0 head
     injection makes the V/W ISDF tiles O(1e5) (V_q0[0,0]≈2.3e5) and they
     near-cancel against D, so the Krylov solvers return ghost / below-λ_min
     Ritz values (a solver-conditioning issue orthogonal to B1 — see
-    PHASE2_LOG.md).  We instead MATERIALISE the corrected serial matvec into an
+    PHASE2_LOG.md).  We instead MATERIALISE the corrected stack matvec into an
     N×N matrix with ONE batched application to the identity basis and compare
     its full spectrum to the dense reference — a robust, solver-independent
     proof that the B1-corrected operator IS the dense Hamiltonian.
@@ -273,7 +262,7 @@ def test_spectrum_matches_dense(bse_dense_state):
     N = nc * nv * nk
     basis = jnp.asarray(np.eye(N, dtype=np.complex128).reshape(N, nc, nv, nk))
     # row i of the batched output is H·e_i = column i of H, so cols == Hᵀ.
-    cols = np.asarray(_run_matvec("serial", data, basis, True)).reshape(N, N)
+    cols = np.asarray(_run_matvec("stack", data, basis, True)).reshape(N, N)
     Hmat = cols.T
     assert _relerr(Hmat, H) < 1e-9, f"materialised matvec ≠ H: {_relerr(Hmat, H):.2e}"
     ev_mat = np.sort(np.linalg.eigvalsh(0.5 * (Hmat + Hmat.conj().T)))
@@ -323,7 +312,7 @@ def _materialize_nontda_operator(data):
     N..2N-1 = anti-resonant.  Chunked so it fits any 1 GPU."""
     from jax.sharding import Mesh
     from bse.bse_ring_comm import build_bse_ring_matvec_full, make_bse_shardings
-    from bse.bse_serial import compute_pair_amplitude
+    from bse.bse_preconditioner import compute_pair_amplitude
 
     nkx, nky, nkz = int(data["nkx"]), int(data["nky"]), int(data["nkz"])
     nk = nkx * nky * nkz
@@ -495,7 +484,7 @@ def _nontda_data_from_subset(data):
     restart load (1×1 mesh, so no band padding)."""
     from jax.sharding import Mesh
     from bse.bse_ring_comm import make_bse_shardings
-    from bse.bse_serial import compute_pair_amplitude
+    from bse.bse_preconditioner import compute_pair_amplitude
     mesh = Mesh(np.array(jax.devices()[:1]).reshape(1, 1), axis_names=("x", "y"))
     sh = make_bse_shardings(mesh)
     nc = int(data["psi_c"].shape[1]); nv = int(data["psi_v"].shape[1])

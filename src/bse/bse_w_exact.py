@@ -66,7 +66,7 @@ from .bse_ring_comm import (
     create_mesh_xy_from_flags,
     make_bse_shardings,
 )
-from .bse_serial import compute_pair_amplitude
+from .bse_preconditioner import compute_pair_amplitude
 from common.collectives import device_put_process_local, gather_to_host
 from common import rank_criterion
 import common.timing as timing
@@ -232,7 +232,7 @@ def build_finite_q_data(data, q, mesh_xy):
     # encode (``build_density_snapshot_operator``) — all carry ONE fixed
     # conjugation convention, ``K^x = M V M†`` with the conjugate on the ENCODE
     # leg.  That convention is NOT ours to move: it is pinned by the optical BSE
-    # exchange term (``bse_serial.apply_bse_hamiltonian_single_device``, the
+    # exchange term (the since-deleted ``bse_serial`` single-device matvec, the
     # "Conjugation:" block) and gated there.  Composed through the resolvent it
     # assembles
     #

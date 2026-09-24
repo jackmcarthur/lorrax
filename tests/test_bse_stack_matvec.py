@@ -44,7 +44,7 @@ def _random_stack(nt, nc, nv, nk):
 def _place(data, mesh):
     """Shard the fixture arrays + build W_R and the hoisted pair-amps M_X/M_Y."""
     from bse.bse_ring_comm import make_bse_shardings
-    from bse.bse_serial import compute_pair_amplitude
+    from bse.bse_preconditioner import compute_pair_amplitude
     sh = make_bse_shardings(mesh)
     with mesh:
         out = dict(

@@ -113,7 +113,7 @@ def synthetic_payload(mesh, *, nkx, nky, nkz, nc, nv, nmu, ns, seed=7):
     separated energies.
     """
     from bse.bse_ring_comm import make_bse_shardings
-    from bse.bse_serial import compute_pair_amplitude
+    from bse.bse_preconditioner import compute_pair_amplitude
 
     nk = nkx * nky * nkz
     rng = np.random.default_rng(seed)

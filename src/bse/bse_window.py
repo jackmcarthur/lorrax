@@ -75,7 +75,7 @@ def _log0(*a, **k):
 #
 #   ε pad entries -> ±PAD_EPS_GUARD_RY.  ``H_BSE``'s diagonal is
 #     ΔE(c,v,k) = ε_c(k,c) − ε_v(k,v) (``bse_ring_comm._apply_D_term``,
-#     and the same construction in bse_serial / bse_simple /
+#     and the same construction in the (deleted) bse_serial / bse_simple /
 #     w_omega_chain / bse_preconditioner).  With a ZERO ε pad the pad
 #     transitions acquire diagonal energies
 #         (c_pad, v_pad) -> 0 − 0        = 0

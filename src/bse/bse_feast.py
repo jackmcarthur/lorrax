@@ -31,7 +31,7 @@ from .bse_ring_comm import (build_bse_ring_matvec, build_bse_ring_matvec_full,
                             create_mesh_xy_from_flags, make_bse_shardings)
 from .bse_stack_matvec import build_bse_stack_matvec
 from .bse_preconditioner import energy_diff_cv_k
-from .bse_serial import compute_pair_amplitude
+from .bse_preconditioner import compute_pair_amplitude
 from .bse_davidson_helpers import build_bse_exact_diagonal
 import common.timing as timing
 from common.units import RYD_TO_EV

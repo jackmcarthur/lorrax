@@ -45,7 +45,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from common.fft_helpers import make_kfft_kminor
 
-from .bse_serial import compute_pair_amplitude
+from .bse_preconditioner import compute_pair_amplitude
 from .bse_window import PAD_EPS_GUARD_RY
 
 
@@ -682,7 +682,7 @@ def _interpolate_bse_data_to_grid(
 
     # ── V_Q exchange q=0 tile on the fine grid ────────────────────────────
     # A Q=0 exciton's exchange kernel is DENSE in (k,k') through the ONE q=0
-    # tile (bse_serial.apply_bse_hamiltonian_single_device); so the fine
+    # tile (the since-deleted bse_serial single-device matvec); so the fine
     # k-grid's exchange q-set is just q=0.
     #
     # WHAT IS AND IS NOT GRID-DEPENDENT.  The q=0 exchange BODY

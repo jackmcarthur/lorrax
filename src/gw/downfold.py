@@ -48,7 +48,7 @@ into a product of two single-band quantities.  Every LORRAX kernel downstream
 contracts the two legs separately — Σ's ``G_μν`` build
 (``gw/greens_function_kernel.py``), the BSE's ``_encode_T_A``
 (``bse/bse_stack_matvec.py``), the exchange ``M`` matrix
-(``bse/bse_serial.py``) — so a rotated basis would need a dense rank-3
+(the since-deleted ``bse/bse_serial.py``) — so a rotated basis would need a dense rank-3
 coefficient tensor, which is precisely the storage ISDF exists to avoid.
 
 So the small set is a SUBSET of the large one, chosen by pivoted Cholesky

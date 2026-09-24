@@ -51,17 +51,12 @@ KERNELS = {"local_ifftn3", "local_fftn3"}
 # leave a stale excuse behind.  Numbers only go down.
 # ===========================================================================
 _SANCTIONED_EAGER = {
-    # Single-device REFERENCE matvec ("single-device reference, values
-    # byte-identical" — its own comment); operands are unsharded by contract.
-    ("bse/bse_serial.py", "apply_bse_hamiltonian_single_device"): 3,
+    # (The single-device reference matvec bse_serial and the ring smoke /
+    # correctness diagnostics that used it were deleted with C10, 2026-09-24.)
     # (The former KNOWN-DEBT block — bse_feast.ensure_W_R, bse_kpm.run_kpm_dos,
     # bse_pseudopoles._feast_filter/run_pseudopoles — was closed 2026-08-01:
     # every solver W_q→W_R now routes through bse_feast.ensure_W_R →
     # bse_io.make_w_densifier.)
-    # Diagnostics on tiny synthetic decks (smoke / correctness cross-checks),
-    # run at sizes where a replicated W is intended and harmless.
-    ("bse/bse_ring_comm.py", "ring_matvec_smoke_test"): 1,
-    ("bse/bse_ring_comm.py", "ring_matvec_correctness_check"): 5,
 }
 
 

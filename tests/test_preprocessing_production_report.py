@@ -85,11 +85,10 @@ def test_dipole_cli_has_no_second_debug_print_control():
     assert "LORRAX_DEBUG_PRINT" in source
 
 
-def test_bse_random_demo_is_named_as_a_self_test_not_a_debug_switch():
+def test_bse_driver_has_no_debug_switch_and_writes_the_shared_report():
     source = (Path(__file__).parents[1] / "src" / "bse" /
               "bse_jax.py").read_text(encoding="utf-8")
     assert '"--debug-parallelism"' not in source
-    assert '"--parallelism-self-test"' in source
     assert "ScientificProductionReport" in source
     assert '"--report-file"' in source
     assert "report.sampling(wfn=wfn, sym=sym)" in source
