@@ -66,8 +66,16 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int],
                             vertex_pairs=None,
                             k_unfold_plan=None,
                             occupations: str = "step",
-                            ordered: bool = False):
+                            ordered: bool = False,
+                            band_windows=None):
     """Build the face or parent imaginary-time response with vertices applied after unfold.
+
+    ``band_windows`` (step occupations only) is the static
+    ``((v_start, v_width), (c_start, c_width))`` pair of
+    :func:`gw.greens_function_kernel.window_band_slice` intervals: the
+    valence and conduction Greens then contract their own band slices
+    densely, cut once per sweep, instead of trimming the full carrier with a
+    traced bound on every node.
 
     ``occupations="step"`` is the zero-temperature gapped response (masked
     valence/conduction Green pair, references vmax/cmin); ``"fermi_dirac"``
@@ -115,6 +123,11 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int],
                                if isinstance(k_unfold_plan, tuple) else id(k_unfold_plan)))
     if fermi_dirac:
         cache_key = cache_key + ("fermi_dirac", bool(ordered))
+    if band_windows is not None:
+        if fermi_dirac:
+            raise ValueError("band_windows apply to the step-occupation response")
+        band_windows = tuple(tuple(int(v) for v in w) for w in band_windows)
+        cache_key = cache_key + ("band_windows", band_windows)
     if cache_key in _chi_minimax_kernel_cache:
         return _chi_minimax_kernel_cache[cache_key]
 
@@ -127,7 +140,8 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int],
         right_face_shape=right_face_shape,
         vertex_pairs=vertex_pairs,
         k_unfold_plan=k_unfold_plan, layout=layout,
-        fermi_dirac=fermi_dirac, ordered=bool(ordered))
+        fermi_dirac=fermi_dirac, ordered=bool(ordered),
+        band_windows=band_windows)
     _chi_minimax_kernel_cache[cache_key] = kernel
     return kernel
 
@@ -177,7 +191,8 @@ def _get_chi_minimax_kernel_face(mesh_xy, kgrid, nk, n_out, complex_contour,
                                  face_shape, *, right_face_shape=None,
                                  vertex_pairs=None,
                                  k_unfold_plan=None, layout="face",
-                                 fermi_dirac=False, ordered=False):
+                                 fermi_dirac=False, ordered=False,
+                                 band_windows=None):
     """Build the node Green pair (step masks or Fermi-Dirac KMS weights) and integrate both response orientations."""
     from common.fft_helpers import make_flat_k_fftn
     from distrib_la import gemm_plan
@@ -235,6 +250,14 @@ def _get_chi_minimax_kernel_face(mesh_xy, kgrid, nk, n_out, complex_contour,
         mesh_xy, m=n_rmu_left * ns, k=nb_full,
         n=n_rmu_right * ns, nq=nk if paired else expected_input_nk,
         dtype=jnp.complex128, layout=layout, enable_active_range=True)
+    sliced = band_windows is not None
+    if sliced:
+        v_plan, c_plan = (gemm_plan(
+            mesh_xy, m=n_rmu_left * ns, k=width, n=n_rmu_right * ns,
+            nq=nk if paired else expected_input_nk, dtype=jnp.complex128,
+            layout=layout) for _, width in band_windows)
+    else:
+        v_plan = c_plan = g_plan
     if paired:
         from common.shard_map import shard_map
         def unfold_pair(psi_left, psi_right):
@@ -248,38 +271,43 @@ def _get_chi_minimax_kernel_face(mesh_xy, kgrid, nk, n_out, complex_contour,
 
     @partial(jax.jit,
              in_shardings=(_psi_mun_shard, _psi_nmu_shard,
+                            _psi_mun_shard, _psi_nmu_shard,
                             NamedSharding(mesh_xy, _rep2),   # mask_v
                             NamedSharding(mesh_xy, _rep2),   # mask_c
-                            NamedSharding(mesh_xy, _rep2),   # enk_full
+                            NamedSharding(mesh_xy, _rep2),   # enk_v
+                            NamedSharding(mesh_xy, _rep2),   # enk_c
                             NamedSharding(mesh_xy, _rep0),
                             NamedSharding(mesh_xy, _rep0),
                             NamedSharding(mesh_xy, _rep0)),
              out_shardings=(_G_k_shard, _G_k_shard))
-    def _build_Gv_Gc(psi_mun_left, psi_nmu_right,
-                    mask_v, mask_c, enk_full,
+    def _build_Gv_Gc(psi_mun_v, psi_nmu_v, psi_mun_c, psi_nmu_c,
+                    mask_v, mask_c, enk_v, enk_c,
                     tau_scalar, vmax, cmin):
         if paired:
-            psi_mun_left, psi_nmu_right = unfold_pair(
-                psi_mun_left, psi_nmu_right)
+            psi_mun_v, psi_nmu_v = unfold_pair(psi_mun_v, psi_nmu_v)
+            psi_mun_c, psi_nmu_c = (
+                (psi_mun_v, psi_nmu_v) if not sliced
+                else unfold_pair(psi_mun_c, psi_nmu_c))
             rows = jnp.asarray(left_plan.irr_idx)
-            mask_v, mask_c, enk_full = (jnp.take(v, rows, axis=0)
-                                       for v in (mask_v, mask_c, enk_full))
+            mask_v, mask_c, enk_v, enk_c = (
+                jnp.take(v, rows, axis=0)
+                for v in (mask_v, mask_c, enk_v, enk_c))
         t_c = jnp.conj(tau_scalar) if complex_contour else tau_scalar
         # The pair leaves conjugated; the unfold writes the conjugate in its
         # own gather pass (no second full-k copy after the spin rotation).
         Gv_k = jax.lax.with_sharding_constraint(
-            build_G_tau(psi_mun_left, psi_nmu_right, enk_full,
+            build_G_tau(psi_mun_v, psi_nmu_v, enk_v,
                        -tau_scalar, e_ref=vmax,
-                       mask=mask_v, layout=layout, gemm=g_plan,
+                       mask=mask_v, layout=layout, gemm=v_plan,
                        k_unfold_plan=None if paired else k_unfold_plan,
-                       trim_zero_bands=True, conjugate=True),
+                       trim_zero_bands=not sliced, conjugate=True),
             _G_k_shard)
         Gc_k = jax.lax.with_sharding_constraint(
-            build_G_tau(psi_mun_left, psi_nmu_right, enk_full,
+            build_G_tau(psi_mun_c, psi_nmu_c, enk_c,
                        t_c, e_ref=cmin,
-                       mask=mask_c, layout=layout, gemm=g_plan,
+                       mask=mask_c, layout=layout, gemm=c_plan,
                        k_unfold_plan=None if paired else k_unfold_plan,
-                       trim_zero_bands=True, conjugate=True),
+                       trim_zero_bands=not sliced, conjugate=True),
             _G_k_shard)
         return Gv_k, Gc_k
 
@@ -352,6 +380,22 @@ def _get_chi_minimax_kernel_face(mesh_xy, kgrid, nk, n_out, complex_contour,
                       dtype=jnp.complex128), stack_shard)
         tables = (None if vertex_pairs is None else
                   tuple(jnp.stack(values) for values in zip(*vertex_operands)))
+        if not fermi_dirac:
+            # The valence and conduction supports are fixed for the sweep:
+            # cut each Green's band slice once, before the node loop.
+            mask_v, mask_c, enk_full, vmax, cmin = green_operands
+            if sliced:
+                (sv, wv), (sc, wc) = band_windows
+                cut = lambda x, axis, lo, w: jax.lax.slice_in_dim(x, lo, lo + w, axis=axis)
+                green_operands = (
+                    cut(psi_mun, 3, sv, wv), cut(psi_nmu, 1, sv, wv),
+                    cut(psi_mun, 3, sc, wc), cut(psi_nmu, 1, sc, wc),
+                    cut(mask_v, 1, sv, wv), cut(mask_c, 1, sc, wc),
+                    cut(enk_full, 1, sv, wv), cut(enk_full, 1, sc, wc),
+                    vmax, cmin)
+            else:
+                green_operands = (psi_mun, psi_nmu, psi_mun, psi_nmu,
+                                  mask_v, mask_c, enk_full, enk_full, vmax, cmin)
         alpha_rows = (nodes.alpha[:, None] if n_out == 1
                       else jnp.transpose(nodes.alpha))
 
@@ -362,9 +406,8 @@ def _get_chi_minimax_kernel_face(mesh_xy, kgrid, nk, n_out, complex_contour,
             if fermi_dirac:
                 Gv_k, Gc_k = _build_Gl_Gu(psi_mun, psi_nmu, *green_operands, tau_kernel)
             else:
-                mask_v, mask_c, enk_full, vmax, cmin = green_operands
-                Gv_k, Gc_k = _build_Gv_Gc(psi_mun, psi_nmu, mask_v, mask_c,
-                                          enk_full, tau_kernel, vmax, cmin)
+                *faces_and_tables, vmax, cmin = green_operands
+                Gv_k, Gc_k = _build_Gv_Gc(*faces_and_tables, tau_kernel, vmax, cmin)
             Gv_R, Gc_R = _Gv_fftn(Gv_k), _Gc_fftn(Gc_k)
 
             def vertex_step(index, acc):
@@ -1337,6 +1380,21 @@ def _minimax_chi_operands(wfns, eref, vmax, cmin, t, alpha):
     )
 
 
+def _chi_band_windows(slices, face_kwargs):
+    """Bucketed static valence/conduction band windows of a band-replicated
+    (axis) carrier, or ``None`` for face carriers (their bands are sharded)."""
+    if face_kwargs.get("layout") != "axis":
+        return None
+    from .greens_function_kernel import window_band_slice
+    nb = int(face_kwargs["face_shape"][1])
+    windows = []
+    for part in (slices.val, slices.cond):
+        live = np.zeros((1, nb), dtype=bool)
+        live[:, part] = True
+        windows.append(window_band_slice(live, nb, 32))
+    return tuple(windows)
+
+
 def _run_minimax_chi(wfns, meta, mesh_xy, args, *, n_out=1,
                      complex_contour=False, compile_only=False):
     """Execute, or only lower and compile, the gapped response kernel on ``args``.
@@ -1346,9 +1404,11 @@ def _run_minimax_chi(wfns, meta, mesh_xy, args, *, n_out=1,
     """
     ensure_jax_compile_cache()
     kgrid = (int(meta.nkx), int(meta.nky), int(meta.nkz))
+    face_kwargs = _chi_parent_face_kwargs(wfns)
     kernel = _get_chi_minimax_kernel(
         mesh_xy, kgrid, n_out=n_out, complex_contour=complex_contour,
-        **_chi_parent_face_kwargs(wfns))
+        band_windows=_chi_band_windows(wfns.slices, face_kwargs),
+        **face_kwargs)
     if compile_only:
         kernel.lower(*args).compile()
         return None
@@ -1736,7 +1796,9 @@ def compute_no_pair_dirac_current_blocks(
     kernel = _get_chi_minimax_kernel(
         mesh_xy, kgrid, layout=left.layout, face_shape=left_shape,
         right_face_shape=right_shape, vertex_pairs=vertex_pairs,
-        k_unfold_plan=(left.plan, right.plan))
+        k_unfold_plan=(left.plan, right.plan),
+        band_windows=_chi_band_windows(
+            s, {"layout": left.layout, "face_shape": left_shape}))
     mask_v = left.plan.parent_rows(wfns_left.band_mask(s.val))
     mask_c = left.plan.parent_rows(wfns_left.band_mask(s.cond))
     args = (nodes, left.psi_mun, right.psi_nmu, mask_v, mask_c,
