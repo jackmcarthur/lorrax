@@ -266,7 +266,28 @@ _GFLAT_CHUNK_FLOOR = 4  # cuFFT plan amortisation
 #: use).  0.80 of the post-persistent headroom is the measured failing
 #: ratio; 0.5 is the margin this model claims, stated as a placement
 #: heuristic rather than shape algebra.
+#:
+#: 2026-09-23: applied to the Stage-C r_chunk caps only under the BFC-class
+#: allocators it was measured on (``_arena_cap_applies``).  Under the
+#: mandated cuda_async allocator (a virtual-memory pool that does not need a
+#: physically contiguous arena) the VI3 12x12 P16 fit at the full sum cap
+#: (r_chunk 3416 instead of 1715) peaked at 52.95 GB against a 59.42 GB
+#: target (runs/runtime/zeta_fit_20260923/08_vi3_slab_planner_p16_capped).
+#: Not yet measured under cuda_async: a single arena of the MoS2 8x8
+#: failure's size (~32 GiB), which the uncapped plan would now place.
 _ARENA_PLACEMENT_FRAC = 0.5
+
+
+def _allocator_name() -> str:
+    from runtime.xla_memory import resolve_xla_gpu_memory_env
+    return resolve_xla_gpu_memory_env().allocator
+
+
+def _arena_cap_applies() -> bool:
+    """Whether Stage C's single-arena placement cap binds: every allocator
+    except ``cuda_async`` (BFC ``default``/``bfc`` is where the two measured
+    placement failures occurred; ``platform`` is unmeasured and kept)."""
+    return _allocator_name() != "cuda_async"
 
 
 def batch_reshard_square_solve_capacity(
@@ -1133,12 +1154,11 @@ def plan_gflat_chunks(
             _ARENA_PLACEMENT_FRAC * face_headroom
             / (face_terms["pair_arena_slope"]
                + _ARENA_PLACEMENT_FRAC * cache_other_slope))
-        # The single-arena placement cap (``_ARENA_PLACEMENT_FRAC``) is not
-        # applied to Stage C since 2026-09-23: it was calibrated on two BFC
-        # fragmentation failures, and under the mandated cuda_async
-        # allocator the VI3 12x12 P16 fit ran at the full sum cap (see the
-        # constant's note).  The arena caps stay computed for the banner.
-        cache_cap = min(cache_pair_cap, cache_build_cap)
+        # The single-arena placement cap binds only where it was measured:
+        # the BFC-class allocators (see ``_arena_cap_applies``).
+        cache_cap = (min(cache_pair_cap, cache_build_cap, cache_arena_cap)
+                     if _arena_cap_applies() else
+                     min(cache_pair_cap, cache_build_cap))
 
         repeated_headroom = max(face_headroom - streamed_fft, 0.0)
         repeated_pair_cap = int(
@@ -1150,7 +1170,8 @@ def plan_gflat_chunks(
             _ARENA_PLACEMENT_FRAC * repeated_headroom
             / (face_terms["pair_arena_slope"]
                + _ARENA_PLACEMENT_FRAC * repeated_other_slope))
-        repeated_cap = repeated_pair_cap
+        repeated_cap = (min(repeated_pair_cap, repeated_arena_cap)
+                        if _arena_cap_applies() else repeated_pair_cap)
 
         route_width = (min(int(r_chunk_override), n_rtot)
                        if r_chunk_override and r_chunk_override > 0
@@ -1203,7 +1224,8 @@ def plan_gflat_chunks(
             r_from_arena = (
                 int(_ARENA_PLACEMENT_FRAC * headroom_C / arena_slope)
                 if arena_slope > 0 else n_rtot)
-            r_budget_cap = r_from_budget
+            r_budget_cap = (min(r_from_budget, r_from_arena)
+                            if _arena_cap_applies() else r_from_budget)
         # Performance floors — chunks at least μ wide, at most
         # ``max_chunks`` of them.  THE BUDGET OUTRANKS THE FLOORS: until
         # 2026-08-22 ``r_lo = min(μ, n_rtot)`` silently overrode a
@@ -1219,11 +1241,13 @@ def plan_gflat_chunks(
             _announce(
                 "stage-c-rchunk-budget-cap",
                 f"Stage C r_chunk lowered {r_chunk} -> {capped} by the "
-                f"memory budget (sum cap {r_from_budget}; the retired "
-                f"single-arena placement cap would have been "
-                f"{r_from_arena}); the mu-wide performance floor does not "
-                f"outrank the budget.  Explicit r_chunk_size overrides "
-                f"this cap")
+                f"memory budget (sum cap {r_from_budget}, single-arena "
+                f"placement cap {r_from_arena} at "
+                f"{_ARENA_PLACEMENT_FRAC:.2f}x post-persistent headroom "
+                f"{'APPLIED' if _arena_cap_applies() else 'not applied'} "
+                f"under XLA_PYTHON_CLIENT_ALLOCATOR={_allocator_name()}); "
+                f"the mu-wide performance floor does not outrank the "
+                f"budget.  Explicit r_chunk_size overrides this cap")
             r_chunk = capped
         else:
             r_chunk = max(r_chunk, min(n_rtot, r_budget_cap))
