@@ -2,7 +2,7 @@
 
 LORRAX calls vendor libraries through two shared objects built from the one
 C++ tree `src/ffi/cpp/` ([ffi_layout.md §2](architecture/ffi_layout.md#2-the-one-c-tree)).
-They are deployed as one sealed pair ([§2a](architecture/ffi_layout.md#2a-the-deployable-unit-is-one-sealed-pair)).
+They are deployed as one sealed pair ([§2a](architecture/ffi_layout.md#2c-the-deployable-unit-is-one-sealed-pair)).
 This page owns how a pair is built, verified and sealed on each site, and the
 ABI rule that pairs it with a Python tree.
 
