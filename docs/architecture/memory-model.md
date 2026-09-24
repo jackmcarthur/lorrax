@@ -47,17 +47,67 @@ receipt prints every term as a `G_tile` ratio against a ceiling of
 `4·G_tile`, so a reader sees at once whether the fit, rather than the GW
 stages, sets the node count.
 
+## ψ carriers: face and band-complete
+
+The raw-parent carrier holds two orientations of `ψ_{n k̄ s}(r_μ)` on the
+`n_par` parents. `low_mem_bands` chooses how they are tiled:
+
+```text
+face  (true, default)  M_face = 2·16·n_par·n_s·μ·N_b / P              μ and bands both tiled
+axis  (false)          M_axis = 16·n_par·n_s·μ·N_b·(1/p_x + 1/p_y)
+                              = 2·16·n_par·n_s·μ·N_b / √P              bands complete on every rank
+```
+
+With `s = n_par/N_k` (the symmetry reduction) and `r = N_b/μ`, in units of
+the Green tile:
+
+```text
+M_face / G_tile = 2·s·r / n_s          independent of P
+M_axis / G_tile = 2·s·r·√P / n_s       grows as √P
+```
+
+The axis copies overtake one Green tile at `√P = n_s/(2·s·r)`. Past that
+point they spend the GW feasibility floor (`4·G_tile`) on wavefunctions, so
+`low_mem_bands = true` is mandatory there. For `μ = 10·N_b` (`r = 0.1`):
+
+| P | n_s=1, s=1 | n_s=2, s=1 | n_s=4, s=1 | n_s=2, s=1/6 |
+|---|---|---|---|---|
+| 16 | 0.8 | 0.4 | 0.2 | 0.07 |
+| 64 | 1.6 | 0.8 | 0.4 | 0.13 |
+| 256 | 3.2 | 1.6 | 0.8 | 0.27 |
+| 1024 | 6.4 | 3.2 | 1.6 | 0.53 |
+
+(`M_axis` in `G_tile`; `M_face = 0.2·s/n_s` at every P.)
+
+The face layout pays for its memory in communication. A band contraction on
+faces (the Green build `G = ψ·diag(f)·ψ†`, the Σ projection `ψ†·Σ·ψ`) is a
+distributed GEMM, and its SUMMA broadcasts move about `M_axis` bytes per
+rank for every Green `G(τ)`. On axis copies the same contraction is local,
+followed by one reduction of the band-sized partial. The fit therefore keeps
+the faces, and the GW stages take band-complete copies when the budget
+admits them: after the fit, `gw.wavefunction_bundle.band_complete_gw_carriers`
+all-gathers every face carrier once to the axis layout if
+
+```text
+4·G_tile + Σ_carriers M_axis ≤ budget × utilization(n_s)
+```
+
+and otherwise leaves the faces, whose every stage runs the distributed
+contraction. The receipt line `GW ψ carriers:` names the choice and the
+three terms. Below the crossover, `true` then runs the `false` kernels at
+`false`'s memory, and above it `true` stays feasible where `false` is not.
+
 ## Stage inventory
 
 | stage | resident per rank (leading terms) | priced by | refuses |
 |---|---|---|---|
-| ψ(G) and centroid faces | charge fit: conj ψ(G) on the rank's G slots, `16·N_k·N_b·n_s·N_Gψ/P`. Centroid faces `ψ(r_μ)`: two copies of `16·n_par·n_s·μ·N_b/P` in the face layout (`low_mem_bands = true`, the default; `n_par` raw parent k points) | the ζ-fit planners below | with the fit |
+| ψ(G) and centroid faces | charge fit: conj ψ(G) on the rank's G slots, `16·N_k·N_b·n_s·N_Gψ/P`. Centroid carrier `ψ(r_μ)`: `M_face` during the fit, then `M_axis` for the GW stages when admitted ([§ ψ carriers](#ψ-carriers-face-and-band-complete)) | the ζ-fit planners below; `band_complete_gw_carriers` | with the fit |
 | ζ fit, charge channel (route G) | C factor, one μ-batch working set, the ψ(G) slice; the Z store `16·Q·μ·N_G/P` lives on host or disk | `plan_zeta_route_g` ([§ route G](#charge-channel-route-g)) | `GATE zeta-mubatch-capacity` |
 | ζ fit, current channels (bispinor) | persistent floor plus the largest of stages A–D | `plan_gflat_chunks` ([§ r-tile fit](#current-channels-the-r-tile-fit)) | `[planner] the certified plan does not fit` |
 | V_q | `V_acc` `16·Q·μ_L·μ_R/P`, one q-tile of ζ rows, G panels | `vq_tile_bytes` ([§ V_q](#vq-g-panels-and-q-tiles)) | `GATE vq_tile_budget` |
 | V_q unfold | `16·N_k·μ²/P`, sharded `P(None,'x','y')` | — | — |
 | shared-pole screening and Σ | response-bank faces, pencils, eigh workspace, then G and W tiles | the capacity ledger ([shared-pole model](shared_pole_model.md), byte model) | before allocating, when a stage and its named concurrent stages exceed the budget |
-| static / GN-PPM screening | χ₀ τ-scan scratch `O(N_k·μ²/P)`, unchunked over q | nothing | — |
+| static / GN-PPM screening | χ₀ τ-scan: for `n_s > 1` the spin pairs stream, four `(a,b)` blocks `16·N_k·μ²/P` (Gv, Gc and their transforms) plus the parents unfolded to full k (`M_face·N_k/n_par` or `M_axis·N_k/n_par`) and the `16·N_k·μ²/P` accumulator; unchunked over q | nothing | — |
 | restart write | one sharded tile, `max(16·Q·μ²/P, 16·Q·μ·N_G/P)` | stage F | — |
 
 Replicated per-process metadata (the TRS-augmented centroid permutation and
