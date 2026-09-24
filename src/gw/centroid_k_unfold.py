@@ -26,7 +26,6 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from common.grouped_layout import (
     SquareGroupedShardLayout,
-    build_grouped_shard_layout,
     build_square_grouped_shard_layout,
 )
 from symmetry_maps import (
@@ -320,6 +319,13 @@ class RealGridOrbitTiles:
     Pads trail within each owner, hold exact zeros in every carrier and map
     to themselves under every operation.  All tiles share one width so one
     compiled kernel serves them; the tables below are runtime operands.
+
+    Tiles are filled in PLANE order along ``plane_axis`` (see
+    :func:`build_real_grid_orbit_tiles`), so a tile's points lie on the few
+    grid planes listed in ``tile_planes[t]`` (``-1`` pads).  The r-chunk
+    transforms (``common.wfn_transforms``: ψ(G)→ψ(tile), ζ(tile)→ζ(G)) then
+    run 2D FFTs over those planes only, at a cost set by the tile rather
+    than by the whole box.
     """
 
     fft_grid: np.ndarray
@@ -328,6 +334,8 @@ class RealGridOrbitTiles:
     n_y: int
     shard_size: int
     r_index: np.ndarray
+    plane_axis: int
+    tile_planes: np.ndarray
 
     @property
     def n_tiles(self) -> int:
@@ -378,46 +386,118 @@ class RealGridOrbitTiles:
         return (perm % int(self.shard_size)).astype(np.int32), wraps
 
 
+def plane_axis_for_orbits(labels, fft_grid) -> int:
+    """The grid axis whose planes the symmetry orbits cross least.
+
+    Scores each axis by the number of (orbit, plane) incidences — for a
+    layered crystal whose point group maps the stacking axis onto itself
+    (every operation sends z to ±z) an orbit touches at most two planes of
+    that axis — and breaks ties toward the axis with more planes, i.e. the
+    smaller planes.  A pure function of the orbits: no dial.
+    """
+    fg = np.asarray(fft_grid, dtype=np.int64).reshape(3)
+    lab = np.asarray(labels, dtype=np.int64).reshape(-1)
+    idx = np.arange(lab.size, dtype=np.int64)
+    coords = (idx // (fg[1] * fg[2]), (idx // fg[2]) % fg[1], idx % fg[2])
+    best = None
+    for axis in range(3):
+        n_inc = np.unique(lab * int(fg[axis]) + coords[axis]).size
+        key = (n_inc, -int(fg[axis]), axis)
+        if best is None or key < best:
+            best = key
+    return int(best[2])
+
+
 def build_real_grid_orbit_tiles(
     spatial_ops, translations, fft_grid, *, n_y: int, target_width: int,
     shard_multiple: int = 1,
 ) -> RealGridOrbitTiles:
-    """Partition the FFT grid into orbit-closed tiles of one fixed width.
+    """Partition the FFT grid into orbit-closed tiles of one fixed width, in plane order.
 
     Orbits are labelled by :func:`symmetry_maps.real_space_orbit_labels`
-    (O(n_rtot) host memory) and placed by the same LPT packing that places
-    centroid orbits (:func:`common.grouped_layout.build_grouped_shard_layout`)
-    over ``n_tiles·n_y`` equal Y-owner shards; tile ``t`` is shards
-    ``[t·n_y, (t+1)·n_y)``.  ``target_width`` is the memory planner's r
-    chunk; the realized width is the smallest LPT placement whose padded
-    owner extent fits it (one more tile is added while it does not), and it
-    is a multiple of ``n_y·shard_multiple`` so the r axis stays a legal
-    carrier for every downstream reshard.
+    (O(n_rtot) host memory).  They are ordered by the planes they touch
+    along :func:`plane_axis_for_orbits` (lowest plane, highest plane, first
+    grid index) and poured into consecutive tiles: each orbit goes whole onto
+    the least-loaded of the tile's ``n_y`` Y owners, and a tile closes when
+    the next orbit fits on none.  ``target_width`` is the memory planner's r
+    chunk; the realized width ``n_y·shard_size`` does not exceed it (unless
+    one orbit is wider than an owner's share) and is a multiple of
+    ``n_y·shard_multiple``.  Consecutive tiles therefore share planes, and a
+    tile of ``W`` points touches about ``W / plane_size`` planes (times the
+    number of planes one orbit spans), which is what bounds the r-chunk
+    transforms.  (The former layout packed orbits LPT across all tiles at
+    once, which dealt equal-size orbits round-robin: every tile then touched
+    every plane.)
     """
     ops = np.asarray(spatial_ops, dtype=np.int64)
     tau = np.asarray(translations, dtype=np.float64)
     fg = np.asarray(fft_grid, dtype=np.int64).reshape(3)
     n_y = int(n_y)
-    multiple = int(shard_multiple)
-    labels = real_space_orbit_labels(ops, tau, fg)
+    multiple = max(1, int(shard_multiple))
+    labels = np.asarray(real_space_orbit_labels(ops, tau, fg), dtype=np.int64)
     n_rtot = int(labels.size)
-    width = max(int(target_width), n_y * multiple)
-    n_tiles = max(1, -(-n_rtot // width))
-    while True:
-        layout = build_grouped_shard_layout(
-            labels, n_tiles * n_y, shard_size_multiple=multiple)
-        if n_y * int(layout.shard_size) <= width or n_tiles * n_y >= n_rtot:
-            break
-        n_tiles += 1
-    r_index = layout.packed_to_canonical.reshape(
-        n_tiles, n_y * int(layout.shard_size))
+    axis = plane_axis_for_orbits(labels, fg)
+    flat = np.arange(n_rtot, dtype=np.int64)
+    plane = (flat // (fg[1] * fg[2]), (flat // fg[2]) % fg[1], flat % fg[2])[axis]
+
+    # Orbits in canonical first-appearance order, members in canonical order.
+    order = np.argsort(labels, kind="stable")
+    uniq, start, sizes = np.unique(labels[order], return_index=True,
+                                   return_counts=True)
+    members = np.split(order, start[1:])
+    p_min = np.minimum.reduceat(plane[order], start)
+    p_max = np.maximum.reduceat(plane[order], start)
+    first = np.minimum.reduceat(order, start)
+    orbit_order = np.lexsort((first, p_max, p_min))
+
+    # One Y owner's share of the planner's width, rounded DOWN to the carrier
+    # multiple; an orbit wider than that share raises it (rounded up).
+    largest = int(sizes.max())
+    cap = max(multiple, (int(target_width) // n_y) // multiple * multiple)
+    cap = max(cap, -(-largest // multiple) * multiple)
+
+    tiles: list[list[list[int]]] = []
+    loads: list[int] = []
+    cur = [[] for _ in range(n_y)]
+    cur_load = [0] * n_y
+    for g in orbit_order:
+        size = int(sizes[g])
+        owner = int(np.argmin(cur_load))
+        if cur_load[owner] + size > cap:
+            tiles.append(cur)
+            cur = [[] for _ in range(n_y)]
+            cur_load = [0] * n_y
+            owner = 0
+        cur[owner].append(int(g))
+        cur_load[owner] += size
+    tiles.append(cur)
+
+    n_tiles = len(tiles)
+    width = n_y * cap
+    r_index = np.full((n_tiles, width), -1, dtype=np.int64)
+    planes_per_tile = []
+    for t, owners in enumerate(tiles):
+        for o, groups in enumerate(owners):
+            cursor = o * cap
+            for g in groups:
+                rows = members[g]
+                r_index[t, cursor:cursor + rows.size] = rows
+                cursor += rows.size
+        active = r_index[t][r_index[t] >= 0]
+        planes_per_tile.append(np.unique(plane[active]))
+    n_planes = max(1, max(p.size for p in planes_per_tile))
+    tile_planes = np.full((n_tiles, n_planes), -1, dtype=np.int64)
+    for t, pl in enumerate(planes_per_tile):
+        tile_planes[t, :pl.size] = pl
     return RealGridOrbitTiles(
         fft_grid=_readonly(fg, np.int64),
         spatial_ops=_readonly(ops, np.int64),
         translations=_readonly(tau, np.float64),
         n_y=n_y,
-        shard_size=int(layout.shard_size),
+        shard_size=int(cap),
         r_index=_readonly(r_index, np.int64),
+        plane_axis=int(axis),
+        tile_planes=_readonly(tile_planes, np.int64),
     )
 
 
@@ -426,4 +506,5 @@ __all__ = [
     "RealGridOrbitTiles",
     "build_centroid_k_unfold_plan",
     "build_real_grid_orbit_tiles",
+    "plane_axis_for_orbits",
 ]

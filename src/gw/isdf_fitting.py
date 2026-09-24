@@ -1057,7 +1057,11 @@ def fit_zeta_to_h5(
         f"-> {nk_tot} full k by the typed unfold on {num_chunks} "
         f"orbit-closed real-grid tiles x {n_rchunk} slots "
         f"(planned chunk_r {int(chunk_r)}; pad slots "
-        f"{num_chunks * n_rchunk - n_rtot})")
+        f"{num_chunks * n_rchunk - n_rtot}); tiles filled in plane order "
+        f"along axis {int(real_grid_tiles.plane_axis)}, at most "
+        f"{int(real_grid_tiles.tile_planes.shape[1])} plane(s) of "
+        f"{n_rtot // int(meta.fft_grid[int(real_grid_tiles.plane_axis)])} "
+        f"points per tile")
 
     # Hoist the full-grid ψ(G)->ψ(r) transforms when the memory plan admits
     # the cache.  Otherwise retain the SAME host staging store and let the
@@ -1267,6 +1271,13 @@ def fit_zeta_to_h5(
                     _tile_perm.astype(np.int32), _rep),
                 tile_wraps=_device_put_process_local(
                     _tile_wraps.astype(np.int32), _rep),
+                # The tile's planes: both r-chunk transforms (the streamed
+                # ψ(G)→ψ(tile) source and the ζ(tile)→ζ(G) accumulate) run
+                # on these planes only.
+                tile_planes=_device_put_process_local(
+                    np.asarray(real_grid_tiles.tile_planes[chunk_idx],
+                               dtype=np.int32), _rep),
+                plane_axis=int(real_grid_tiles.plane_axis),
             )
             # Each pad slot gets its OWN out-of-range sentinel so the
             # scatter's unique-index promise holds with mode='drop'.
@@ -1294,7 +1305,9 @@ def fit_zeta_to_h5(
                         k_unfold_plan=k_unfold_plan, coupled_mu123=True, layout=layout,
                         tile_r_index=_tile_args["tile_r_index"],
                         tile_local_perm=_tile_args["tile_local_perm"],
-                        tile_wraps=_tile_args["tile_wraps"])
+                        tile_wraps=_tile_args["tile_wraps"],
+                        tile_planes=_tile_args["tile_planes"],
+                        plane_axis=_tile_args["plane_axis"])
 
                 if _coupled_stacked_solve:
                     def _build_coupled_zeta():
@@ -1412,6 +1425,8 @@ def fit_zeta_to_h5(
                     fft_grid=meta.fft_grid,
                     r0=None,
                     r_indices=_tile_r_indices_dev,
+                    planes=_tile_args["tile_planes"],
+                    plane_axis=_tile_args["plane_axis"],
                     sphere_idx=_gflat_sphere_idx_padded,
                     qvec_frac=_q_irr_frac_dev,
                     norm='backward',
