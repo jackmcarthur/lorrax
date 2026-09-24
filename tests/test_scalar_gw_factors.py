@@ -9,8 +9,9 @@ DENSITY; the Σ band sums carry occupancy 1 per band with NO spin factor
   * χ₀'s prefactor  — ``gw.w_isdf._w_solve_pref_scalar`` (already correct;
     pinned here so nobody "fixes" it by moving spin into the ``-2.0``
     time-ordering factor at w_isdf.py:925/970/1672, which is NOT spin);
-  * the live G-space Hartree ρ — the canonical density quadrature called by
-    ``gw.kin_ion_io.build_valence_density_distributed``.
+  * the live G-space Hartree ρ — the canonical density quadrature, the SC
+    density scan ``gw.qsgw_density.rho_from_wfns`` that
+    ``gw.kin_ion_io.compute_hartree_matrix`` calls.
 
 Every factor introduced is exactly 1.0 on the nspinor≥2 path (bispinor
 meta.nspinor=4 included) — the spinor arms below are bit-identity pins,

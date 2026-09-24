@@ -23,6 +23,10 @@ $$
 Charge and current use the same orbitals, occupations, and inverse FFT. $J/c$
 is a current, not a second charge density.
 
+The one-shot and the self-consistent map build these sums with one owner, the
+density scan `gw.qsgw_density.rho_from_wfns` (wedge weights $|\text{star}|/N_k$
+and the FFT-grid star average).
+
 ## G-space solve
 
 $$

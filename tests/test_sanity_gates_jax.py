@@ -399,51 +399,6 @@ def test_kin_ion_io_catches_a_BROKEN_multiprocess_launch():
 # 3b. The exact-V_H distribution layer (workstream X)
 # ---------------------------------------------------------------------------
 
-def test_rho_work_items_cover_every_band_exactly_once():
-    """The ρ partition must be a partition — no band counted twice, none
-    dropped.  A duplicated (k, band) silently inflates a ~500 eV term."""
-    from gw.kin_ion_io import rho_work_items
-    for nk, nocc, world in ((9, 26, 1), (9, 26, 4), (9, 26, 16), (9, 26, 64),
-                            (144, 26, 1), (144, 26, 16), (144, 26, 80),
-                            (144, 26, 144), (144, 26, 512), (4, 3, 64)):
-        items = rho_work_items(nk, nocc, world)
-        seen = {}
-        for ik, lo, hi in items:
-            for b in range(lo, hi):
-                key = (ik, b)
-                assert key not in seen, f"duplicate {key} at P={world}"
-                seen[key] = True
-        assert len(seen) == nk * nocc, (
-            f"P={world}: covered {len(seen)} of {nk * nocc} (k, band) pairs")
-
-
-def test_rho_work_items_are_the_serial_sweep_when_P_le_nk():
-    """THE BIT-PARITY PRECONDITION.
-
-    At ``world <= nk`` the sweep must be exactly the serial one — one
-    item per k, in k order, with the whole occupied manifold — because
-    that is what makes the P=1 result bit-for-bit the pre-distribution
-    result rather than merely equal to 1e-16.
-    """
-    from gw.kin_ion_io import rho_work_items
-    for world in (1, 2, 9, 144):
-        nk, nocc = 144, 26
-        if world > nk:
-            continue
-        assert rho_work_items(nk, nocc, world) == [
-            (ik, 0, nocc) for ik in range(nk)], f"P={world} reordered the sweep"
-
-
-def test_rho_work_items_balance_within_one_item():
-    """Round-robin, not contiguous blocks: nk=9 at P=4 must be 3/2/2/2,
-    not 3/3/3/0 (which idles a quarter of the machine)."""
-    from gw.kin_ion_io import rho_work_items
-    items = rho_work_items(9, 26, 4)
-    counts = [len(items[r::4]) for r in range(4)]
-    assert max(counts) - min(counts) <= 1, counts
-    assert sum(counts) == len(items)
-
-
 def test_valence_density_nocc_none_matches_the_sliced_form():
     """``nocc=None`` is a slicing convention, not a second quadrature."""
     from psp.get_DFT_mtxels import valence_density_from_kpoint
