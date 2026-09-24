@@ -1,203 +1,188 @@
-# G-flat interpolation vectors and \(V_q\)
+# Interpolation vectors \(\zeta_q(\mathbf G)\) and \(V_q\)
 
-This page describes the current interpolation-vector and Coulomb-matrix
-pipeline. Its purpose is to connect the ISDF normal equations to the few
-layout choices that preserve their scaling. Historical real-space zeta files,
-benchmark campaigns, and fixed source-line inventories are intentionally
-omitted.
+ISDF replaces every band-pair density with its values at \(N_\mu\) centroids
+\(\mathbf r_\mu\) times interpolation vectors \(\zeta_{q\mu}\). This page
+covers four things: the least-squares problem that defines \(\zeta\), the
+identity that lets LORRAX fit \(\zeta\) directly in G space, the Coulomb
+matrix built from \(\zeta\), and what each stage costs. The data movement is
+on [route G](../architecture/zeta_fit_mubatch.md) and in
+[raw-parent ζ fitting](../architecture/zeta_fit_face_psi_cct.md).
 
-## 1. Open-spin pair density
+## 1. The least-squares fit
 
-For channel-dependent left and right band spaces, define
-
-$$
-P_{\mathbf k,\alpha\beta}(\mu,r)
-=\sum_n
-\psi^*_{n\mathbf k\alpha}(\mathbf r_\mu)
-\psi_{n\mathbf k\beta}(\mathbf r).
-$$
-
-The charge channel traces the appropriate spin components. Bispinor channels
-retain the open indices and apply their gamma-matrix factors after the lattice
-transform. The same pair-density builder therefore serves charge and
-transverse response without duplicating the wavefunction transform.
-
-At fixed momentum transfer, the Galerkin matrices are lattice convolutions:
+For momentum transfer \(q\), the pair products of left states \(m\) at
+\(\mathbf k\) and right states \(n\) at \(\mathbf k+\mathbf q\) are
+approximated as
 
 $$
-C_q(\mu,\nu)
-=\mathcal F_{\mathbf R\to\mathbf q}
-\left[
-\widetilde\gamma_L\widetilde\gamma_R\,
-\overline{\mathcal F^{-1}_{\mathbf k\to\mathbf R}P_L(\mu,\nu)}
-\mathcal F^{-1}_{\mathbf k\to\mathbf R}P_R(\mu,\nu)
-\right],
+\psi^*_{m\mathbf k}(\mathbf r)\,\psi_{n\mathbf k+\mathbf q}(\mathbf r)
+\approx\sum_\mu
+\psi^*_{m\mathbf k}(\mathbf r_\mu)\,\psi_{n\mathbf k+\mathbf q}(\mathbf r_\mu)\,
+\zeta_{q\mu}(\mathbf r).
 $$
 
-$$
-Z_q(\mu,r)
-=\mathcal F_{\mathbf R\to\mathbf q}
-\left[
-\widetilde\gamma_L\widetilde\gamma_R\,
-\overline{\mathcal F^{-1}P_L(\mu,r)}
-\mathcal F^{-1}P_R(\mu,r)
-\right].
-$$
-
-The interpolation vectors solve
+Minimizing the squared residual over every \(\mathbf k\), every \(m\) in the
+left window \(L\) and every \(n\) in the right window \(R\) gives the normal
+equations \(C_q\zeta_q=Z_q\). The band sums factor through one projector per
+window,
 
 $$
-C_q\,\zeta_q=Z_q
+D^X_{\mathbf k,ab}(\mu,\mathbf r)=\sum_{n\in X}
+\psi_{n\mathbf k a}(\mathbf r_\mu)\,\psi^*_{n\mathbf k b}(\mathbf r),
+\qquad X=L,R,
 $$
 
-independently for each \(q\) and response channel. The charge channel uses a
-Hermitian positive-semidefinite factorization; more general channel blocks use
-the certified pivoted solve selected by the same driver.
-
-## 2. Why the solve is real-space chunked
-
-The right-hand side has a full real-space axis and cannot be retained at
-production size. The driver therefore:
-
-1. loads band slabs of \(\psi(\mathbf G)\) into a bounded host cache;
-2. evaluates \(\psi(\mathbf r_\mu)\) once for the persistent centroid legs;
-3. builds and factors \(C_q\) once;
-4. scans over bounded real-space chunks \(r_c\);
-5. builds \(Z_q(\mu,r_c)\), solves for \(\zeta_q(\mu,r_c)\), and immediately
-   accumulates that chunk into reciprocal space.
-
-The band loop remains inside one compiled sharded kernel. Moving it outside
-would repeatedly materialize the FFT box and turn a bounded workspace into a
-sequence of large host/device transfers.
-
-On a mesh `('x','y')`, the centroid axes of \(C_q\) are
-`P(None,'x','y')`. During the \(Z_q\) build, the output centroid and real-space
-chunk axes occupy different mesh axes, so neither becomes replicated. A
-solver may stage through another sharding, but it must return to this native
-matrix layout before the next physical owner consumes the result.
-
-## 3. Direct accumulation into G-flat storage
-
-Define the cell-periodic interpolation vector
+where \(a,b\) are open spinor indices. The right-hand side and the metric are
+then
 
 $$
-z_{q\mu}(\mathbf r)
-=e^{-2\pi i\mathbf q\cdot\mathbf r}\zeta_{q\mu}(\mathbf r).
+Z_q(\mu,\mathbf r)=\sum_{\mathbf k}\sum_{ab}
+D^L_{\mathbf k,ab}(\mu,\mathbf r)\,
+\overline{D^R_{\mathbf k+\mathbf q,ab}(\mu,\mathbf r)},
+\qquad
+C_q(\mu,\nu)=Z_q(\mu,\mathbf r_\nu).
 $$
 
-For nonoverlapping real-space chunks,
+The k sum is a cross-correlation on the periodic \(N_k\) grid, so the code
+evaluates it by FFTs over \(\mathbf k\), at \(O(N_k\log N_k)\) per
+\((\mu,\mathbf r)\) point instead of \(O(N_k^2)\). The projectors are built
+only at the raw WFN k-points and transported to the full zone by the symmetry
+action ([symmetry §3–4](symmetry.md)). \(C_q\) is the Gram matrix of the
+training pair products sampled at the centroids, so it is Hermitian positive
+semidefinite.
+
+A current (bispinor) channel inserts its vertex \(\tilde\gamma^i\) on the
+output spinor indices after transport. Its \(C_q\) is then a Hermitian
+indefinite, signed Gram
+([four-current wiring](../architecture/four_current_wiring.md)).
+
+**Conjugation closure.** The charge windows are asymmetric: \(L\) holds every
+occupied state plus the \(\Sigma\) conduction window, and \(R\) holds the
+\(\Sigma\) occupied window plus every empty state. Complex conjugation swaps
+the ordered endpoints, and relabelling \((m,n,\mathbf k)\) gives
 
 $$
-\widetilde z_{q\mu}(\mathbf G)
-=\sum_c
-\mathcal F\!\left[
-\mathbf 1_{r\in c}\,
-e^{-2\pi i\mathbf q\cdot\mathbf r}
-\zeta_{q\mu}(\mathbf r)
-\right]_{\mathbf G}.
+N_{RL}(q)=\overline{N_{LR}(-q)}
 $$
 
-Linearity makes each chunk an additive update to one persistent G-flat
-accumulator. Only the \(\mathbf q+\mathbf G\) sphere used by the Coulomb
-contraction is retained. The final on-disk object is therefore
+for both \(C\) and \(Z\). The fit therefore solves the normal equations of
+the conjugation-closed set,
+\(C_q+\overline{C_{-q}}\) and \(Z_q+\overline{Z_{-q}}\). This completes the
+training set; it is not a projection of \(\zeta\), \(V\) or \(W\).
+
+## 2. Conditioning
+
+\(C_q\) becomes nearly singular when \(N_\mu\) over-completes the rank of the
+pair products, and then an exact inverse amplifies round-off without bound.
+The charge channel uses a rank-truncated pseudo-inverse instead. From
+\(C_q=V\Lambda V^\dagger\) it keeps \(\lambda>\epsilon_\zeta\lambda_{\max}\)
+(`zeta_rcond`, default \(10^{-8}\)) and sets
 
 $$
-\widetilde z[q_{\mathrm{irr}},\mu,G_{\mathrm{sphere}}],
+B=V_{\mathrm{keep}}\Lambda_{\mathrm{keep}}^{-1/2},\qquad
+C_q^{+}=BB^\dagger,\qquad
+\kappa_{\mathrm{eff}}\le 1/\epsilon_\zeta .
 $$
 
-not a full real-space image and not a full FFT box. Padding outside each
-logical sphere is exactly zero.
+The cut is never placed inside a degenerate multiplet: it moves down to
+drop the whole block. \(C_q\) commutes with the point group when the centroid
+set is orbit-closed, so a cut between blocks keeps the retained span
+invariant, and \(C_{Sq}=\Pi C_q\Pi^\dagger\) survives truncation. A cut
+through a block would break the k-star identity of \(W\) and \(\Sigma\). The
+criterion and its certification are in the
+[rank-truncation policy](../dev/rank_truncation_policy.md).
 
-SlabIO creates and writes the distributed dataset collectively. The
-interpolation-point axis remains flat-sharded across both mesh axes; no rank
-gathers a full \(\mu\) slab for I/O.
+## 3. Fit \(Z\) in G space, apply \(C^+\) afterwards
 
-## 4. Coulomb contraction
-
-For the scalar charge channel,
+The Coulomb contraction needs \(\zeta\) only on the sphere
+\(|\mathbf q+\mathbf G|^2\le E_\zeta\) (`zeta_cutoff`), expressed through the
+cell-periodic vector
 
 $$
-V_{q,\mu\nu}
-=\sum_{\mathbf G\in\mathrm{sphere}(q)}
-\widetilde z^*_{q\mu}(\mathbf G)\,
-v(\mathbf q+\mathbf G)\,
-\widetilde z_{q\nu}(\mathbf G).
+\tilde\zeta_{q\mu}(\mathbf G)=\mathcal F_{\mathbf r\to\mathbf G}
+\!\left[e^{-i\mathbf q\cdot\mathbf r}\zeta_{q\mu}(\mathbf r)\right].
 $$
 
-The G axis is reduced in bounded chunks. With left centroids on `'x'` and
-right centroids on `'y'`, each chunk is a local matrix multiplication and the
-result lands directly as `P(None,'x','y')`. The Coulomb service supplies
+\(C_q^+\) acts on the centroid index and \(\mathcal F\) acts on
+\(\mathbf r\), so the two commute:
+
+$$
+\tilde\zeta_q(\mu,\mathbf G)=\sum_\nu C^+_q(\mu,\nu)\,\tilde Z_q(\nu,\mathbf G),
+\qquad
+\tilde Z_q(\mu,\mathbf G)=\mathcal F\!\left[e^{-i\mathbf q\cdot\mathbf r}
+Z_q(\mu,\mathbf r)\right]_{\mathbf G\in\mathrm{sphere}(q)}.
+$$
+
+Three consequences shape the implementation:
+
+- **Batches need no factor.** \(\tilde Z_q(\mu,\cdot)\) of one centroid needs
+  nothing from any other centroid, so the fit runs in independent μ batches,
+  and each owner forms whole rows.
+- **The pair GEMM runs in G space.** The projector's band contraction runs
+  against the stored plane-wave coefficients \(c_{n\mathbf k}(\mathbf G)\).
+  Only the k-correlation needs real space, and it runs on grid planes, one
+  batch at a time.
+- **ζ(r) never exists.** What the fit stores is
+  \(\tilde Z(q,\mu,\mathbf G_{\mathrm{sphere}})\), of size
+  \(N_qN_\mu N_G\), never \(N_qN_\mu N_r\). \(C^+\) is applied afterwards,
+  one G tile at a time. Entries outside each q's sphere are exactly zero.
+
+## 4. Coulomb matrix
+
+For the charge channel,
+
+$$
+V_{q,\mu\nu}=\sum_{\mathbf G\in\mathrm{sphere}(q)}
+\overline{\tilde\zeta_{q\mu}(\mathbf G)}\,v(\mathbf q+\mathbf G)\,
+\tilde\zeta_{q\nu}(\mathbf G).
+$$
+
+V is accumulated over G tiles as each tile of \(\tilde\zeta\) is formed. The
+equal expression \(\overline{C^+}\,M_q\,\overline{C^+}\), with
+\(M_q=\overline{\tilde Z}\,\mathrm{diag}(v)\,\tilde Z^{T}\), is not used,
+because its rounding error grows as \(\epsilon\,\kappa(C)^2\) instead of
+\(\epsilon\,\kappa(C)\). The [`vcoul`](../services/vcoul.md) service supplies
 \(v(\mathbf q+\mathbf G)\), including dimensional truncation and the
-long-wavelength slot; this pipeline does not reproduce those formulas.
+long-wavelength slot. The four-current channels contract their own
+\(\tilde\zeta^i\) with the channel tensor
+([four-current wiring](../architecture/four_current_wiring.md)).
 
-For bispinor response,
+## 5. Irreducible q
 
-$$
-V_{q,\mu\nu}^{ij}
-=\sum_{\mathbf G}
-\widetilde z^{i*}_{q\mu}(\mathbf G)\,
-v(\mathbf q+\mathbf G)\,
-t^{ij}(\mathbf q+\mathbf G)\,
-\widetilde z^j_{q\nu}(\mathbf G),
-$$
+When the centroid set is closed under the full space group with time
+reversal, only the irreducible q wedge is fitted and stored. \(V_q\) is then
+unfolded to the full zone by the centroid permutation and lattice-wrap phase
+([symmetry §4–5](symmetry.md)). Closure is a correctness gate, never an
+approximation. A nonclosed set runs with identity symmetry, with every k a
+parent and every q stored
+([unreduced admission](../architecture/zeta_fit_face_psi_cct.md#unreduced-admission-for-nonclosed-centroid-sets)).
+Symmetry reduction precedes storage, while full-zone unfolding precedes any
+lattice convolution that needs it.
 
-where \(t^{ij}\) is the channel tensor. The driver evaluates only the unique
-channel tiles and restores their Cartesian mixing after symmetry unfolding.
+## 6. Cost
 
-## 5. Irreducible-q cascade
+Symbols: \(n_p\) raw parents, \(N_k\) full-zone k, \(Q\) stored q,
+\(n_b\) fit bands, \(n_s\) spinor components, \(N_{G\psi}\) and \(N_G\) the
+ψ and ζ spheres, \(N_r\) grid points, \(P\) ranks.
 
-The G-flat file uses the irreducible q wedge only when the centroid set closes
-under the complete spatial-plus-time-reversal table. For a symmetry operation
-\(s\), the transformed interpolation points satisfy
-
-$$
-\mathbf r_{\pi_s(\mu)}
-=S_s\mathbf r_\mu+\boldsymbol\tau_s+\mathbf L_{s\mu},
-$$
-
-where \(\pi_s\) is a permutation and \(\mathbf L_{s\mu}\) is a lattice wrap.
-These two tables determine the phase used to unfold \(V_q\):
-
-$$
-V_{Sq,\mu'\nu'}
-=e^{2\pi i\mathbf q\cdot
-(\mathbf L_{s\mu'}-\mathbf L_{s\nu'})}
-V_{q,\pi_s(\mu'),\pi_s(\nu')}.
-$$
-
-Time-reversal rows apply the corresponding complex conjugation. The full
-convention is owned by [Symmetry](symmetry.md).
-
-Orbit closure is a correctness gate. If it fails, the driver computes and
-stores all q points; it does not apply a partial or approximate unfold.
-
-## 6. Lifetimes and scaling
-
-The important live objects, in order, are:
-
-| object | lifetime | distribution |
+| stage | arithmetic per rank | memory per rank |
 |---|---|---|
-| wavefunction G-slab cache | complete zeta fit | host, bounded band slabs |
-| \(\psi(\mathbf r_\mu)\) | complete zeta fit | centroid sharded |
-| factorized \(C_q\) | all real-space chunks | both matrix axes sharded |
-| G-flat accumulator | all real-space chunks | q wedge, \(\mu\) sharded |
-| \(\zeta_q(\mu,r_c)\) | one real-space chunk | \(\mu\) and \(r_c\) sharded |
-| \(V_q(\mu,\nu)\) | screening/self-energy stage | both matrix axes sharded |
+| \(C_q\) | \(2n_pn_s^2N_\mu^2n_b/P\) GEMM, plus \(O(N_\mu^2n_s^2N_k\log N_k/P)\) correlation | \(N_kN_\mu^2\cdot16/P\) before the IBZ slice |
+| factor | \(O(QN_\mu^3)\), divided by \(\min(P,Q)\) when q-parallel | a replicated q batch of at most 4 GiB, then \(\lceil Q/P\rceil N_\mu^2\cdot16\) or \(QN_\mu^2\cdot16\) |
+| \(\tilde Z_q(\mathbf G)\) | \(2n_pn_s^2N_\mu n_bN_{G\psi}/P\) GEMM, plus \(O(N_\mu N_kn_s^2N_r(\log N_r+\log N_k)/P)\) transforms | the batch working set ([route G](../architecture/zeta_fit_mubatch.md#memory-per-rank-and-the-planner)) |
+| \(\tilde\zeta\) and \(V_q\) | \(O(QN_\mu^2N_G/P)\) | \(\tilde Z\) store \(QN_\mu N_G\cdot16/P\) on host or disk; \(V\) \(\lceil Q/P\rceil N_\mu^2\cdot16\) (partial sums \(QN_\mu^2\cdot16\) on the replicated tier) |
 
-The method stores \(\mathcal O(N_qN_\mu N_G)\) interpolation data and
-\(\mathcal O(N_qN_\mu^2)\) Coulomb data, never
-\(\mathcal O(N_qN_\mu N_r)\) zeta plus an additional replicated copy.
-Chunk sizes change peak memory and launch count but not the equations.
+At a fixed k grid, \(N_\mu\), \(n_b\) and \(N_G\) all grow linearly with
+system size, so the fit is cubic. The all-to-all moves
+\(2n_pn_s^2N_\mu N_{G\psi}\cdot16/P\) bytes per rank over the whole fit. No
+object of size \(N_\mu^2\) is gathered for I/O.
 
-Three implementation invariants follow:
+Code owners:
 
-1. no full zeta tensor exists between the real-space solve and G-flat
-   accumulation;
-2. no \(N_\mu^2\) object is gathered merely for I/O;
-3. symmetry reduction precedes storage, but full-zone unfolding precedes any
-   lattice FFT convolution that requires it.
-
-The current owners are `gw.isdf_fitting` for \(C/Z\) and the solve,
-`wfn_transforms` for G-flat accumulation, `gw.v_q_g_flat` for the Coulomb
-contraction, `symmetry_maps` for orbit closure and unfolding, and
-`file_io.SlabIO` for distributed bytes.
+- `gw.isdf_fitting`: the driver;
+- `isdf.core`: \(C_q\), the factor tiers and the k-correlation seam;
+- `isdf.cplus`: conditioning;
+- `isdf.zeta_mubatch`: \(\tilde Z\), the store and \(V\);
+- `gw.v_q_g_flat`: the V consumers and the unfold;
+- `symmetry_maps`: closure and transport;
+- `file_io.SlabIO`: distributed bytes.
