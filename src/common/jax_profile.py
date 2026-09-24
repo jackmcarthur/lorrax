@@ -80,22 +80,6 @@ def trace_section(section: str) -> Iterator[None]:
 
 
 @contextmanager
-def step_annotation(name: str, *, step_num: int | None = None, detail: str | None = None) -> Iterator[None]:
-	"""Annotate host-side regions so they show up inside a profiler trace."""
-	profiler = getattr(jax, "profiler", None)
-	step_cls = getattr(profiler, "StepTraceAnnotation", None) if profiler else None
-	label = name if detail is None else f"{name}[{detail}]"
-	if step_cls is None:
-		yield
-		return
-	kwargs = {}
-	if step_num is not None:
-		kwargs["step_num"] = int(step_num)
-	with step_cls(label, **kwargs):
-		yield
-
-
-@contextmanager
 def annotation(name: str) -> Iterator[None]:
 	"""Light-weight annotation that does not bump the step counter."""
 	profiler = getattr(jax, "profiler", None)
@@ -122,6 +106,6 @@ def annotation(name: str) -> Iterator[None]:
 # the wall line.
 #
 # The WORKING profiler entry points are above and are untouched:
-# ``trace_section`` (driven by ISDF_JAX_PROFILE_DIR), ``annotation`` and
-# ``step_annotation``.  Guarded by
+# ``trace_section`` (driven by ISDF_JAX_PROFILE_DIR) and ``annotation``.
+# Guarded by
 # tests/test_no_sandbox_path_injection.py.

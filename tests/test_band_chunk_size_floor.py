@@ -4,8 +4,8 @@ When the band axis is sharded across the device mesh of size ``p_xy``
 (:class:`common.psi_G_store.PsiGStore` band-flat-shards per-bc bands
 across all mesh ranks), each device's per-bc local band count is
 ``bpd_per_bc = band_chunk_size // p_xy``.  If ``band_chunk_size < p_xy``,
-that division collapses to 0 for every bc and downstream
-``z_q_from_psi_sm._local`` raises::
+that division collapses to 0 for every bc and the downstream (since
+retired) r-tile ``z_q_from_psi_sm._local`` raised::
 
     dimension size of operand at 'all_gather_dim' cannot be zero
 

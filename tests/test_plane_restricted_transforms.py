@@ -1,9 +1,8 @@
-"""Plane-restricted r-chunk transforms equal the full-box ones (2026-09-23).
+"""The plane-restricted r-chunk transform equals the full-box one (2026-09-23).
 
-``to_rpoints_inner(planes=...)`` (ψ(G) → ψ at a tile's points) and
-``accumulate_rchunk_to_gflat(planes=...)`` (ζ(tile) → ζ(G)) run 2D FFTs over
+``accumulate_rchunk_to_gflat(planes=...)`` (ζ(tile) → ζ(G)) runs 2D FFTs over
 the tile's planes and a partial DFT along the plane axis instead of one
-full-box FFT per row.  This gate compares them with the full-box forms on
+full-box FFT per row.  This gate compares it with the full-box form on
 random data, for every plane axis, on a box whose three extents differ
 (so a wrong axis bookkeeping cannot cancel), with per-k spheres that differ
 (the cylinder is a union), Bloch phases, pad slots, and a tile that touches
@@ -73,43 +72,6 @@ def _tile(rng, axis, planes, width):
 
 
 @pytest.mark.parametrize("axis", [0, 1, 2])
-def test_to_rpoints_planes_matches_full_box(axis):
-    from common.wfn_transforms import (psi_cylinder_tables, to_rpoints_inner)
-
-    rng = np.random.default_rng(10 + axis)
-    nk, nb, ns = 3, 2, 2
-    g_index, _, ngkmax, _ = _sphere(rng, nk, cut=9.0)
-    psi = (rng.standard_normal((nk, nb, ns, ngkmax))
-           + 1j * rng.standard_normal((nk, nb, ns, ngkmax)))
-    kv = rng.uniform(-0.5, 0.5, (nk, 3))
-    planes = np.array([1, _FFT[axis] - 2, -1], np.int32)       # non-adjacent + pad
-    r_idx = _tile(rng, axis, planes[:2], 40)
-    real = r_idx < np.prod(_FFT)
-    # The full-box form returns clipped-index values on pad slots (its
-    # caller zeroes them); the plane form returns zeros there.  Compare the
-    # real slots and check the plane form's pads directly.
-    ref = np.asarray(to_rpoints_inner(
-        jnp.asarray(psi), jnp.asarray(g_index), _FFT, jnp.asarray(r_idx),
-        norm="ortho", kvecs_frac=jnp.asarray(kv)))[..., real]
-    cyl = psi_cylinder_tables(jnp.asarray(g_index), _FFT, axis, ngkmax=ngkmax)
-    got = np.asarray(to_rpoints_inner(
-        jnp.asarray(psi), jnp.asarray(g_index), _FFT, jnp.asarray(r_idx),
-        norm="ortho", kvecs_frac=jnp.asarray(kv),
-        planes=jnp.asarray(planes), plane_axis=axis, cylinder=cyl))
-    assert not np.any(got[..., ~real])
-    got = got[..., real]
-    print(f"[plane parity] psi axis={axis} rel={_rel(got, ref):.3e}")
-    assert _rel(got, ref) <= _TOL
-    # red twin: a plane missing from the list loses its points
-    bad = np.asarray(to_rpoints_inner(
-        jnp.asarray(psi), jnp.asarray(g_index), _FFT, jnp.asarray(r_idx),
-        norm="ortho", kvecs_frac=jnp.asarray(kv),
-        planes=jnp.asarray(np.array([planes[0], -1, -1], np.int32)),
-        plane_axis=axis, cylinder=cyl))[..., real]
-    assert _rel(bad, ref) > 1e-2
-
-
-@pytest.mark.parametrize("axis", [0, 1, 2])
 def test_accumulate_planes_matches_full_box(axis):
     from common.wfn_transforms import accumulate_rchunk_to_gflat
 
@@ -148,27 +110,3 @@ def test_accumulate_planes_matches_full_box(axis):
     bad = run(planes=jnp.asarray(np.array([planes[0], -1, -1], np.int32)),
               plane_axis=axis)
     assert _rel(bad - acc0, ref - acc0) > 1e-2
-
-
-def test_tiles_are_orbit_closed_and_plane_local():
-    """The plane-ordered tile builder: every point once, whole orbits per Y
-    owner, fixed width, and each tile on few planes of its axis."""
-    from gw.centroid_k_unfold import build_real_grid_orbit_tiles
-
-    # C4 about z (mixes x and y planes) times sigma_h (pairs z with -z): the
-    # layered-crystal case, where only the stacking axis keeps orbits on
-    # few planes (two), so the incidence rule must pick it.
-    c4 = np.array([[0, -1, 0], [1, 0, 0], [0, 0, 1]], dtype=np.int64)
-    sh = np.diag([1, 1, -1]).astype(np.int64)
-    rots = [np.linalg.matrix_power(c4, i) for i in range(4)]
-    ops = np.array(rots + [sh @ r for r in rots])
-    tau = np.zeros((8, 3))
-    fg = (8, 8, 10)
-    tiles = build_real_grid_orbit_tiles(ops, tau, fg, n_y=2, target_width=32)
-    assert tiles.plane_axis == 2
-    act = tiles.r_index[tiles.r_index >= 0]
-    assert np.array_equal(np.sort(act), np.arange(np.prod(fg)))
-    for t in range(tiles.n_tiles):
-        tiles.source_tables(t)            # refuses if an orbit crosses an owner
-        n_planes = int(np.sum(tiles.tile_planes[t] >= 0))
-        assert n_planes <= 4, (t, tiles.tile_planes[t])

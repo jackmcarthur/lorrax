@@ -612,7 +612,7 @@ def check_padding_solve_at_logical(mesh, dtype, nq=2, n_log=13, n_pad=16,
     _needs_monorepo("runtime.padding.solve_at_logical")
     batched_distributed_solve_lu = backend_module(
         "cusolvermp").batched_distributed_solve_lu
-    from runtime.padding import pad_last_axis_to, solve_at_logical
+    from runtime.padding import pad_axis, solve_at_logical
     rng = np.random.default_rng(41)
     A_log = _herm(rng, nq, n_log, dtype)
     B_log = _rng_mat(rng, (nq, n_log, nrhs), dtype)
@@ -642,8 +642,8 @@ def check_padding_solve_at_logical(mesh, dtype, nq=2, n_log=13, n_pad=16,
     assert not X_pad[:, n_log:, :].any(), "pad rows not exact zeros"
     # NRHS-pad idiom: zero RHS columns -> zero solution columns, retained
     # columns bit-identical (per-column triangular solves are independent).
-    _pad = pad_last_axis_to(
-        _put(B_log, mesh, (None, "x", "y")), 5)   # 8 -> 10 columns
+    _pad = pad_axis(
+        _put(B_log, mesh, (None, "x", "y")), 5, axis=-1)   # 8 -> 10 columns
     B_wide, n_orig = _pad.array, _pad.logical     # NAMED: the NRHS pad
     assert n_orig == nrhs                          # wants the LOGICAL count
     assert _pad.padded == 10
@@ -1003,8 +1003,8 @@ if __name__ == "__main__":
 
 def check_factor_c_q_slate(mesh):
     """factor_c_q(solver_kind='slate_cholesky') returns a conventional L
-    equal to the numpy Cholesky (1×1 mesh), so downstream solve_zeta's
-    triangular-solve branch consumes it unchanged."""
+    equal to the numpy Cholesky (1×1 mesh), so the downstream per-q
+    triangular back-solve consumes it unchanged."""
     import jax
     import jax.numpy as jnp
     from jax.sharding import NamedSharding, PartitionSpec as P

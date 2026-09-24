@@ -50,8 +50,8 @@ def test_zero_user_band_pad_in_shard_rejects_strided_band_slice():
 
 
 # ---------------------------------------------------------------------------
-# _slice_local_tile_bc — per-iter host-tile slicer used by the one-time
-# ψ(r)-cache builder's io_callback (and the narrow no-cache reference path).
+# read_local_band_chunk — per-iter host-tile slicer used by the r-chunk
+# sources' io_callback.
 # Built without going through PsiGStore.__init__ so the test stays free of
 # WfnLoader / Meta plumbing: subclasses PsiGStore, populates _host_tiles
 # directly with a random multi-bc ψ(G) tile, and exercises the slicer.
@@ -87,7 +87,7 @@ class _FakePsiGStore(PsiGStore):
             offsets.append(offsets[-1] + bpd)
         self._bc_band_offsets = tuple(offsets)
 
-def test_slice_local_tile_bc_returns_correct_band_window():
+def test_read_local_band_chunk_returns_correct_band_window():
     """Slicer returns each bc's bands of the host tile, padded to bpd_max."""
     mesh = Mesh(np.asarray(jax.devices()[:1]).reshape(1, 1),
                  axis_names=('x', 'y'))
@@ -104,23 +104,23 @@ def test_slice_local_tile_bc_returns_correct_band_window():
     assert store._bpd_max == bpd_max
 
     # bc 0: bands [0, 4) — full
-    out0 = store._slice_local_tile_bc(0, 0, 0)
+    out0 = store.read_local_band_chunk(0, 0, 0)
     assert out0.shape == (nk, bpd_max, ns, ngkmax)
     np.testing.assert_array_equal(out0[:, :4, :, :], tile[:, 0:4, :, :])
 
     # bc 1: bands [4, 8) — full
-    out1 = store._slice_local_tile_bc(0, 0, 1)
+    out1 = store.read_local_band_chunk(0, 0, 1)
     np.testing.assert_array_equal(out1[:, :4, :, :], tile[:, 4:8, :, :])
 
     # bc 2: bands [8, 10) — short; pad rows must be exactly zero (math-neutral)
-    out2 = store._slice_local_tile_bc(0, 0, 2)
+    out2 = store.read_local_band_chunk(0, 0, 2)
     assert out2.shape == (nk, bpd_max, ns, ngkmax)
     np.testing.assert_array_equal(out2[:, :2, :, :], tile[:, 8:10, :, :])
     assert np.all(out2[:, 2:, :, :] == 0.0)             # pad-rows EXACTLY zero
     assert out2[:, 2:, :, :].dtype == np.complex128
 
 
-def test_slice_local_tile_bc_traced_bc_idx_inputs():
+def test_read_local_band_chunk_traced_bc_idx_inputs():
     """Slicer accepts traced int32 scalars (the io_callback contract); resolved
     to Python ints inside the host fn."""
     import jax.numpy as jnp_local                       # noqa
@@ -136,11 +136,11 @@ def test_slice_local_tile_bc_traced_bc_idx_inputs():
     x_idx = np.int32(0)
     y_idx = np.int32(0)
     bc_idx = np.int32(1)
-    out = store._slice_local_tile_bc(x_idx, y_idx, bc_idx)
+    out = store.read_local_band_chunk(x_idx, y_idx, bc_idx)
     np.testing.assert_array_equal(out[:, :2, :, :], tile[:, 2:4, :, :])
 
 
-def test_slice_local_tile_bc_rejects_out_of_range_bc():
+def test_read_local_band_chunk_rejects_out_of_range_bc():
     mesh = Mesh(np.asarray(jax.devices()[:1]).reshape(1, 1),
                  axis_names=('x', 'y'))
     nk, ns, ngkmax = 2, 1, 3
@@ -148,7 +148,7 @@ def test_slice_local_tile_bc_rejects_out_of_range_bc():
     store = _FakePsiGStore(mesh_xy=mesh, tile=tile,
                             band_chunk_ranges=((0, 2), (2, 4)))
     with pytest.raises(ValueError, match=r"bc_idx=2 not in"):
-        store._slice_local_tile_bc(0, 0, 2)
+        store.read_local_band_chunk(0, 0, 2)
 
 
 def test_psi_G_device_full_property_removed():

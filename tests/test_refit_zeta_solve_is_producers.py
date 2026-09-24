@@ -27,9 +27,9 @@ are the cells that can hold the same fact in a second on CPU:
    the producer's solve DISAGREE by orders of magnitude.  Without this the rest
    could pass on a well-conditioned matrix, where every solve agrees, and the
    file would be measuring nothing.
-2. The refit's kernel now agrees with the producer's ``isdf.core.solve_zeta``
-   to round-off, at the same ``zeta_rcond`` — the same comparison, one level
-   below the tile.
+2. The refit's kernel now agrees with the producer's back-solve (route G:
+   ``isdf.zeta_mubatch._logical_solve``) to round-off, at the same
+   ``zeta_rcond`` — the same comparison, one level below the tile.
 3. ``zeta_rcond`` is read from the BUNDLE'S provenance, not from the deck.
 4. A refit that cannot name the fit it is reproducing REFUSES.
 5. The dead ``_ridged_chol`` citation is gone and cannot come back.
@@ -134,15 +134,17 @@ def test_the_producers_solve_is_the_truncated_pseudo_inverse():
 
 def test_refit_kernel_matches_the_producer_solve_path():
     """One level below the tile null: the refit's own jitted ``_solve_zeta``
-    against ``isdf.core.solve_zeta``'s rank-truncate back-solve, driven
-    through ``isdf.factor_c_q`` exactly as the ζ fit drives it."""
+    against route G's rank-truncate back-solve
+    (``isdf.zeta_mubatch._logical_solve``, vmapped over q), driven through
+    ``isdf.factor_c_q`` exactly as the ζ fit drives it."""
     pytest.importorskip("jax")
     import jax
     import jax.numpy as jnp
     from jax.sharding import Mesh
 
     from bse import vq_interp
-    from isdf import factor_c_q, solve_zeta
+    from isdf import factor_c_q
+    from isdf.zeta_mubatch import _logical_solve
 
     C, Z, _ = _rank_deficient_system()
     mesh = Mesh(np.asarray(jax.devices()[:1]).reshape(1, 1),
@@ -151,9 +153,8 @@ def test_refit_kernel_matches_the_producer_solve_path():
         L = factor_c_q(jnp.asarray(C)[None], mesh, n_rmu_logical=_N,
                        solver_kind="replicated_rank_truncate",
                        zeta_rcond=_RCOND)
-        ref = np.asarray(jax.device_get(solve_zeta(
-            L, jnp.asarray(Z)[None], mesh,
-            solver_kind="replicated_rank_truncate", n_rmu_logical=_N)))[0]
+        ref = np.asarray(jax.device_get(jax.vmap(_logical_solve(
+            "replicated_rank_truncate", _N))(L, jnp.asarray(Z)[None])))[0]
         _, refit_solve = vq_interp._refit_kernels(
             1, 1, 1, _N, ("rank_truncate", _RCOND, 0.0))
         got = np.asarray(jax.device_get(refit_solve(jnp.asarray(C),
@@ -342,6 +343,7 @@ def test_no_source_cites_a_symbol_that_does_not_exist():
                         hits.append(f"{os.path.relpath(p, src_root)}:{i}")
     assert not hits, (
         f"_ridged_chol is cited at {hits} and there is no such symbol under "
-        f"src/.  The production charge path is isdf.core.solve_zeta in its "
-        f"replicated_rank_truncate mode; the whole-tile entry point is "
+        f"src/.  The production charge path is route G's back-solve "
+        f"(isdf.zeta_mubatch._logical_solve) in its replicated_rank_truncate "
+        f"mode; the whole-tile entry point is "
         f"isdf.core.solve_zeta_charge_dense.")

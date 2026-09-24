@@ -41,6 +41,17 @@ _NDEV = 4
 _TOL = 1.0e-10
 
 
+def _per_q_solve(F, Z, *, kind, n_log):
+    """ζ = C⁻¹Z per q at the logical extent: the per-q back-solve kernels
+    (``isdf.core._zeta_logical_solvers``) vmapped over q.  The charge
+    rank-truncate kernel is route G's charge seam (``cplus.apply``)."""
+    import jax
+    from isdf.core import _zeta_logical_solvers
+    _, _, tri_solve, pinv_matmul, _ = _zeta_logical_solvers(int(n_log))
+    fn = pinv_matmul if kind == 'replicated_rank_truncate' else tri_solve
+    return jax.jit(jax.vmap(fn))(F, Z)
+
+
 def _worker() -> int:
     """Child process: build a fixed SPD CCT, factor + solve on every mesh,
     print the worst cross-mesh frob-rel for L_q and ζ as JSON."""
@@ -49,7 +60,7 @@ def _worker() -> int:
     import jax.numpy as jnp
     from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
-    from isdf import factor_c_q, solve_zeta
+    from isdf import factor_c_q
     from isdf.core import _resolve_solver_kind
 
     devs = jax.devices()
@@ -87,8 +98,7 @@ def _worker() -> int:
         Z_dev = jax.device_put(jnp.asarray(Zrhs), in_sh)
         L = factor_c_q(C_dev, mesh, vertex_mu_L=0,
                        n_rmu_logical=n_mu, solver_kind=kind)
-        zeta = solve_zeta(L, Z_dev, mesh, q_chunk_size=nq,
-                          solver_kind=kind, n_rmu_logical=n_mu)
+        zeta = _per_q_solve(L, Z_dev, kind=kind, n_log=n_mu)
         L_np = np.asarray(jax.device_get(L))
         z_np = np.asarray(jax.device_get(zeta))
         if L_ref is None:
@@ -115,7 +125,7 @@ def _worker_rank_truncate() -> int:
     import jax.numpy as jnp
     from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
-    from isdf import factor_c_q, solve_zeta
+    from isdf import factor_c_q
     from isdf.core import _resolve_solver_kind
 
     devs = jax.devices()
@@ -160,8 +170,7 @@ def _worker_rank_truncate() -> int:
         Z_dev = jax.device_put(jnp.asarray(Zrhs), in_sh)
         B = factor_c_q(C_dev, mesh, vertex_mu_L=0, n_rmu_logical=n_mu,
                        solver_kind=kind, zeta_rcond=rcond)
-        zeta = solve_zeta(B, Z_dev, mesh, q_chunk_size=nq,
-                          solver_kind=kind, n_rmu_logical=n_mu)
+        zeta = _per_q_solve(B, Z_dev, kind=kind, n_log=n_mu)
         B_np = np.asarray(jax.device_get(B))
         z_np = np.asarray(jax.device_get(zeta))
         if B_ref is None:
@@ -183,8 +192,7 @@ def _worker_rank_truncate() -> int:
     Lc = factor_c_q(C_dev, mesh22, vertex_mu_L=0, n_rmu_logical=n_mu,
                     solver_kind='replicated_cholesky')
     zeta_chol = np.asarray(jax.device_get(
-        solve_zeta(Lc, Z_dev, mesh22, q_chunk_size=nq,
-                   solver_kind='replicated_cholesky', n_rmu_logical=n_mu)))
+        _per_q_solve(Lc, Z_dev, kind='replicated_cholesky', n_log=n_mu)))
     amp = float(np.linalg.norm(zeta_chol) / max(np.linalg.norm(zeta_rt_2x2), 1e-300))
     # ζ_rt should reconstruct Z on the range of C: C ζ ≈ P_range Z.  With the
     # designed spectrum the range is exactly the top-r subspace; the residual
@@ -319,7 +327,7 @@ def _run_worker(tag: str, timeout: int = 600, env_extra: dict | None = None,
 
 
 def test_zeta_fit_charge_factor_solve_is_mesh_invariant():
-    """factor_c_q + solve_zeta (charge, cholesky alternative) give
+    """factor_c_q + the per-q back-solve (charge, cholesky alternative) give
     bit-identical L_q and ζ across CPU meshes {1×1, 1×2, 2×1, 2×2, 1×4,
     4×1}."""
     out = _run_worker("worker")

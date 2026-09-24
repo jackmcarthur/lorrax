@@ -258,61 +258,27 @@ def test_a_refusing_resolver_reaches_the_isdf_caller(monkeypatch, resolver,
 
 
 # ---------------------------------------------------------------------------
-#  The two closures Arm B left open on the FactorToken
+#  The closure Arm B left open on the FactorToken
 # ---------------------------------------------------------------------------
 
-def test_a_factor_token_cannot_enter_the_composed_kernel():
+def test_a_factor_token_cannot_enter_a_jit():
     """The pytree DECLINE, pinned — which is what makes it safe to rely on.
 
-    ``isdf.core``'s composed ``@jax.jit _kernel`` takes ``L_q`` as a TRACED
-    ARGUMENT.  ``FactorToken`` is a frozen dataclass that is deliberately
-    not registered as a pytree, so jax refuses it by name at the jit
-    boundary instead of tracing a handle.  The comment at :4250-4256 states
-    that; nothing checked it, and the day somebody registers the token as a
-    pytree "for convenience" the refusal becomes a silent trace of an opaque
-    block-cyclic handle in the AOT/memory-model path — which the default
-    suite does not exercise.
+    ``FactorToken`` is a frozen dataclass that is deliberately not
+    registered as a pytree, so jax refuses it by name at the jit boundary
+    instead of tracing a handle.  (Route G also refuses a token by name
+    before any jit: ``isdf.zeta_mubatch.ZetaG``.)  The day somebody
+    registers the token as a pytree "for convenience" the refusal becomes a
+    silent trace of an opaque block-cyclic handle.
 
     RED ARM: register FactorToken as a pytree node and this raises nothing.
     """
-    import ast
-    import pathlib
-    import isdf.core as core
     from distrib_la import FactorToken
 
     token = FactorToken(op="cholesky", backend="slate", mesh=_mesh(1, 1),
                         n=8, nbatch=2, _factor=object())
     with pytest.raises(TypeError):
         jax.jit(lambda L_q: L_q)(token)
-
-    # ...and ``L_q`` really is a jit ARGUMENT of _kernel, which is the only
-    # reason the decline above protects anything.
-    src = pathlib.Path(core.__file__).with_suffix(".py").read_text()
-    kernels = [n for n in ast.walk(ast.parse(src))
-               if isinstance(n, ast.FunctionDef) and n.name == "_kernel"]
-    assert kernels, "isdf.core has no _kernel"
-    assert any("L_q" in [a.arg for a in k.args.args] for k in kernels), (
-        "_kernel no longer takes L_q as a jit argument; the pytree decline "
-        "is guarding nothing")
-
-
-def test_the_token_seams_still_take_the_array_path_without_a_token():
-    """The NEGATIVE branch of the ``isinstance(L_q, FactorToken)`` seams.
-
-    Every one of them reads extents off the token instead of a ``.shape``
-    the token does not have — and every one has an ``else`` that must still
-    serve the plain sharded array the JAX routes return.  An isinstance seam
-    is exactly the shape that gets tested on one side only.
-    """
-    import numpy as np
-    import isdf.core as core
-    from distrib_la import FactorToken
-
-    array = np.zeros((3, 8, 8))
-    assert core._factor_nbatch(array) == 3
-    token = FactorToken(op="cholesky", backend="slate", mesh=_mesh(1, 1),
-                        n=8, nbatch=3, _factor=object())
-    assert core._factor_nbatch(token) == 3
 
 
 # ─────────────────────────────────────────────────────────────────────────

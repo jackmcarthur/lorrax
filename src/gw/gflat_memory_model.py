@@ -4,7 +4,9 @@ Design: ``reports/gw_refactor_map_2026-07-01/MEMORY_MODEL_DESIGN.md`` (§1a).
 Substrate: ``SHARDING_RULES.md`` (the trichotomy: μ² → all-P, μ×nb → √P,
 nb² → replicated).
 
-The fit-loop model is two things summed:
+The fit-loop model is two things summed.  (Stages C/D price the r-tile ζ
+executor, retired 2026-09-24; the fit runs on route G, whose own plan is
+:func:`plan_zeta_route_g`.)
 
     HWM_fit(cr, bc, P) = persistent(P) + max( A, B, C, D )
 
@@ -21,7 +23,7 @@ co-exist, so the HWM takes a ``max``, not a sum:
 
     A  centroid load    fit FFT box (k_tile, bc, ns, n_rtot)  knob: band_chunk
     B  CCT + Cholesky   C_q + full-(μ,μ) pair density
-    C  fit_one_rchunk   legacy open-spin or face scalar-pair rank-3 peaks    ← binder
+    C  r-tile ζ fit     legacy open-spin or face scalar-pair rank-3 peaks    ← binder
     D  accumulate       accumulate FFT box (cs, n_rtot)       knob: gflat_chunk_size
 Post-fit stages use their own smaller base because ``L_q`` and ``gflat_acc``
 have been released:
@@ -119,90 +121,11 @@ def _c128(*dims, shard: int = 1) -> float:
     return _C128 * n / max(int(shard), 1)
 
 
-def _coupled_mu123_zq_incremental_bytes(
-        *, nk: int, nq: int, ns: int, mu: int, face_nb: int,
-        r_chunk: int, p_x: int, p_y: int, ngkmax: int = 0,
-        n_rtot: int = 0, cache_psi_r: bool = False,
-        stack_three_solves: bool = False,
-        host_spill_gflat: bool = False) -> dict[str, float]:
-    """Production coupled-schedule delta over one transverse face fit.
-
-    The coupled transport returns all three completed ``Z_q`` channels, so
-    two additional ``Z_q[q,mu_X,r_Y]`` arrays are live.  Its full-spin X
-    owner cache is sharded only over ``mu_X`` and replicated over Y.  The
-    production coordinator also retains two extra G-flat outputs and two
-    extra transverse CCT factors.  ``host_spill_gflat`` parks those outputs
-    in process-local RAM, so their bytes are reported separately and do not
-    inflate the device HWM.  When ψ(r) is hoisted, its two additional
-    all-P-sharded copies are included too.  The incumbent bounded Y cache and
-    one channel's two P carries are unchanged.  ``stack_three_solves`` adds
-    the larger of the two nonconcurrent face↔batch solve liveness phases.
-    """
-    completed_zq = 2.0 * _c128(
-        nq, mu, r_chunk, shard=int(p_x) * int(p_y))
-    shared_x_face = _c128(nk, ns, mu, face_nb, shard=p_x)
-    extra_gflat_host = 2.0 * _c128(
-        nq, mu, ngkmax, shard=int(p_x) * int(p_y))
-    extra_gflat = 0.0 if host_spill_gflat else extra_gflat_host
-    extra_factors = 2.0 * _c128(
-        nq, mu, mu, shard=int(p_x) * int(p_y))
-    from runtime.padding import padded_axis
-    face_nb_transport = padded_axis(
-        face_nb, int(p_x) * int(p_y),
-        name="gflat face band carrier").carrier
-    extra_psi_r = (2.0 * _c128(
-        nk, face_nb_transport, ns, n_rtot,
-        shard=int(p_x) * int(p_y)) if cache_psi_r else 0.0)
-    stacked_solve = 0.0
-    if stack_three_solves:
-        p_xy = int(p_x) * int(p_y)
-        b_one = padded_axis(
-            nq, p_xy, name="single-channel q carrier").carrier
-        b_three = padded_axis(
-            3 * nq, p_xy, name="three-channel q carrier").carrier
-        delta_b = b_three - b_one
-        # Two nonconcurrent liveness phases bind.  First, face→batch local
-        # RHS input/output plus the larger A arena; second, one enlarged local
-        # RHS arena plus all three face outputs retained by the coordinator.
-        local_phase = (
-            2.0 * _c128(delta_b, mu, r_chunk, shard=p_xy)
-            + _c128(delta_b, mu, mu, shard=p_xy))
-        face_phase = (
-            _c128(delta_b, mu, r_chunk, shard=p_xy)
-            + 2.0 * _c128(nq, mu, r_chunk, shard=p_xy))
-        stacked_solve = max(local_phase, face_phase)
-    return {
-        "two_additional_completed_zq": completed_zq,
-        "shared_full_spin_x_face": shared_x_face,
-        "two_additional_gflat_outputs": extra_gflat,
-        "two_additional_host_gflat_outputs": (
-            extra_gflat_host if host_spill_gflat else 0.0),
-        "three_host_gflat_outputs": (
-            1.5 * extra_gflat_host if host_spill_gflat else 0.0),
-        "two_additional_transverse_factors": extra_factors,
-        "two_additional_psi_r_caches": extra_psi_r,
-        "stacked_solve_transient": stacked_solve,
-        "total": (completed_zq + shared_x_face + extra_gflat
-                  + extra_factors + extra_psi_r + stacked_solve),
-    }
-
-
 def _batch_reshard_operand_floor_bytes(
         *, batch: int, mu: int, nrhs: int, processes: int) -> float:
     """Measured three-arena floor of one local batch-reshard solve."""
     batch_local = (int(batch) + int(processes) - 1) // int(processes)
     return 3.0 * _c128(batch_local, mu, int(mu) + int(nrhs))
-
-
-def _coupled_route_projected_hwm_bytes(
-        *, base_hwm: float, persistent: float, coupled_delta: float,
-        solve_operand_floor: float = 0.0) -> float:
-    """Maximum of the incumbent stage HWM and route-specific solve stage."""
-    delta = float(coupled_delta)
-    return max(
-        float(base_hwm) + delta,
-        float(persistent) + float(solve_operand_floor) + delta,
-    )
 
 
 def _pair_density_slots() -> int:
@@ -406,7 +329,7 @@ def zeta_fft_k_tile(*, n_k_rows: int, band_chunk: int, p_band: int) -> int:
     the tile so the local FFT-row batch stays one band tile; the tile is
     then the largest divisor of ``n_k_rows`` under that bound, so every
     tile has one static shape and no pad k row exists.  The planner prices
-    and ``isdf.core._z_q_face_parent`` runs this one rule.
+    this one rule (the retired r-tile executor ran it).
     """
     n_k_rows = int(n_k_rows)
     bound, _ = centroid_fft_tile_geometry(
@@ -507,7 +430,7 @@ def _fft_box_bytes(*, nk, bc, ns, fft_grid, mesh_xy, p_xy) -> float:
 
 
 #: Concurrent copies of the band-all_gathered FULL-r ψ(r) slab that XLA
-#: keeps live inside ``z_q_from_psi_sm``'s scan body.  ONE is unavoidable
+#: keeps live inside the (retired) r-tile Z build's scan body.  ONE is unavoidable
 #: (the ``lax.all_gather`` output); the historical second came from the
 #: ``jnp.take`` band-compaction, now elided at trace time whenever the
 #: permutation is the identity (``isdf/core.py`` ``_y_compact_identity``).
@@ -522,8 +445,8 @@ def _stage_C_slope(*, nk, ns, nq, mu, slots, p_xy, band_chunk, p_y) -> float:
     slabs the band-gather machinery keeps live.
 
     THE GATHERED psi(r) SLAB IS SHARDED ON 'y' ONLY -- 1/p_y, not 1/P.
-    ``z_q_from_psi_sm`` computes each rank's 1/P band block over the FULL
-    r-chunk, then does ``all_to_all('y', split r, concat bands)`` +
+    The r-tile Z build (retired) computes each rank's 1/P band block over
+    the FULL r-chunk, then does ``all_to_all('y', split r, concat bands)`` +
     ``all_gather('x', bands)``, so every rank ends up holding
     ``(nk, band_chunk, ns, cr/p_y)`` -- ALL bands, but only ITS r-block.
     A second, smaller slab is live alongside it: this rank's OWN
@@ -565,7 +488,7 @@ def _stage_C_face_terms(
     # two open-spin projectors D_L/D_R (n_parent, ns, mu, ns, r) are live
     # beside the tail.  The tail itself stays FULL k: after the unfold the
     # pair densities are (nk, mu/Px, r/Py) whatever the parent count, one
-    # output spin block at a time (isdf.core._z_q_face_parent's scan).
+    # output spin block at a time (the retired r-tile Z build's scan).
     psi_rows = nk
     projector = 0.0
     if parent_route is not None:
@@ -643,7 +566,7 @@ class GFlatChunkPlan:
     #: prints next to ``psi_layout``.
     psi_layout_bytes: float = 0.0
     #: Per-rank bytes of the r-chunk loop's OWN incremental ψ residency
-    #: during Stage C/D (``fit_one_rchunk`` / the accumulate step),
+    #: during Stage C/D (the retired r-tile fit / the accumulate step),
     #: beyond whatever ``psi_layout_bytes`` already counts as persistent
     #: for the run.  LAYOUT-DEPENDENT (unlike its name suggests — kept for
     #: back-compat):
@@ -1424,13 +1347,13 @@ def plan_gflat_chunks(
         C_fit_t = C_slope * r_chunk
         if not cache_psi_r:
             C_fit_t += fft_box_zeta_transform
-    # THE Z_q/SOLVE SEAM IS A SUM, NOT A MAX.  ``fit_one_rchunk`` hands
+    # THE Z_q/SOLVE SEAM IS A SUM, NOT A MAX.  The r-tile fit (retired) hands
     # the full-BZ ``Z_q (nq, μ, cr) P(None,'x','y')`` it just built to
     # ``solve_phase`` as a live input: the solve's Z_col reshard targets a
     # DIFFERENT sharding, so donation cannot alias and Z_q coexists with
     # the solve's two RHS stacks.  In the historical forced-full measurement
     # or when the 81-q mesh is naturally unreduced,
-    # Z_q is built at the full BZ (z_q_from_psi_sm's contract) — the two
+    # Z_q is built at the full BZ (the r-tile Z build's contract) — the two
     # measured escapes this seam-charge closes are JID 57269074 step
     # lx-Xg4-005932 (forced 8x8) and JID 57281385 step .28 (natural 9x9).
     C_t = max(C_fit_t, solve_t + _zq_live)
@@ -1444,7 +1367,7 @@ def plan_gflat_chunks(
     #
     # low_mem_bands=False (legacy): the two surviving X-form single-axis
     # copies (mu on 'x', bands replicated) — what is ACTUALLY resident
-    # during Stage C/D (fit_one_rchunk / the accumulate step) after
+    # during Stage C/D (the retired r-tile fit / the accumulate step) after
     # fit_zeta_to_h5 frees the Y-form copies right after CCT (2026-08-22
     # fresh-fit low-mem psi contract).
     #
@@ -1456,8 +1379,8 @@ def plan_gflat_chunks(
     # psi_mun_fresh (already priced in ``persistent["psi_copies"]`` /
     # ``psi_layout_bytes`` above; NOT double-counted here).  The only
     # INCREMENTAL Stage-C/D cost is (a) one conjugated copy of psi_mun's
-    # own local shard, held for the duration of one z_q_from_psi_sm call
-    # (``isdf.core._z_q_face``'s ``psi_mun_conj``), and (b) the
+    # own local shard, held for the duration of one r-tile Z build
+    # (the retired ``isdf.core._z_q_face``'s ``psi_mun_conj``), and (b) the
     # band_chunk-bounded per-bc gather/weight transient (tiny against (a)
     # whenever band_chunk << n_rmu, the normal case).  Both scale with P
     # (px·py), not sqrt(P) — the fix this term exists to disclose.
