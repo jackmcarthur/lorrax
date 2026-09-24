@@ -22,7 +22,7 @@ dial.
 | transverse ζ LU (`distributed_lu`) | `auto` | `distributed` (ScaLAPACK on cpu, cuSOLVERMp on CUDA) |
 | batched route | `DISTRIB_LA_BATCHED_ROUTE_DEFAULT` | `auto` |
 | eigensolves (`eigh_backend`, `sc_eigh`) | `auto` (native, q-batched) | `distributed` (cpu → `scalapack`, CUDA → `cusolvermp`) |
-| ζ solve tier | `auto` | `distributed` |
+| ζ solve tier | `auto` | `auto` (route G applies the whole-tile factor) |
 | charge ζ factor | `rank_truncate` | `rank_truncate` |
 | transverse ζ factor | `ridge` | `ridge` |
 
