@@ -52,6 +52,7 @@ from __future__ import annotations
 import functools as _functools
 import math as _math
 import os
+import time
 from dataclasses import asdict, dataclass, replace
 from typing import Callable
 
@@ -3887,6 +3888,10 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         raise RuntimeError(
             "SigmaResult Hartree-omission receipt disagrees with the "
             "density-SC direct-field owner")
+    # The map's post-Sigma assembly (rotation, scissor/partition policy,
+    # star gate, identity and occupation carry) was untimed, about 3 s per
+    # VI3 P100 map (survey B5). One top-level row, no re-indent.
+    _assemble_t0 = time.perf_counter()
     _check_sigma_stage(sigma_result, print_fn=inputs.print_fn)
 
     # Form the complete full-BZ update before selecting it.  This is the
@@ -4143,6 +4148,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         from file_io.hdf5_owner import probe as _hdf5_probe
         _hdf5_probe(f"sc_{state.iteration:04d}", print_fn=inputs.print_fn)
 
+    timing.record("sc.map_assemble", time.perf_counter() - _assemble_t0)
     return SCState(
         H_qp_dft=H_qp_dft_new,
         iteration=state.iteration + 1,
