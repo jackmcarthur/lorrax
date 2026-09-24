@@ -736,7 +736,10 @@ def _parallel_fits(specs, worker):
             dtype=np.uint8)
         lengths = np.asarray(all_gather_processes(
             np.asarray(payload.size, np.int32)), dtype=np.int64).reshape(-1)
-        width = int(np.max(lengths))
+        # A power-of-two carrier: the gather's shape is part of its compile
+        # key, and the pickled receipts carry the run's rule-cache path, so
+        # an exact width gave every run directory its own executable.
+        width = 1 << max(0, int(np.max(lengths)) - 1).bit_length()
         padded = np.zeros(width, np.uint8)
         padded[:payload.size] = payload
         gathered = np.asarray(all_gather_processes(padded), np.uint8)
