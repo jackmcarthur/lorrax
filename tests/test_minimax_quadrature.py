@@ -445,8 +445,8 @@ def test_large_omega_asymptote():
 
 
 def test_omega_below_xmax_raises():
-    """Decomposition is ill-defined for Ω ≤ x_max — should error cleanly."""
+    """Decomposition is ill-defined for Ω ≤ x_max: a standard refusal naming the probe fix."""
     qs = _static_quad()
     cfg = MinimaxConfig(target_error=TARGET_ERROR, max_nodes=MAX_NODES)
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="GATE hl_ppm_probe_in_spectrum.*fix: set ppm_omega_p"):
         build_real_quadrature(qs, X_MAX * 0.9, cfg)
