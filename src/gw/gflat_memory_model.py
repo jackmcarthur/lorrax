@@ -1552,26 +1552,26 @@ def plan_gflat_chunks(
 # The μ-batch ζ fit (docs/architecture/zeta_fit_mubatch.md)
 # ---------------------------------------------------------------------------
 
-#: Host RAM a Z store may claim, as a fraction of the node's MemTotal.
-_ZSTORE_HOST_FRAC = 0.6
+#: Host RAM a Z store may claim, as a fraction of the node's live MemAvailable.
+_ZSTORE_HOST_FRAC = 0.8
 
 
 def _host_bytes_per_rank() -> float:
-    """Rank-invariant host budget for the Z store: a fraction of MemTotal per task."""
-    import os
-    try:
-        with open("/proc/meminfo") as fh:
-            total = next(int(l.split()[1]) * 1024 for l in fh
-                         if l.startswith("MemTotal:"))
-    except Exception:
-        return 0.0
-    raw = os.environ.get("SLURM_NTASKS_PER_NODE") or os.environ.get(
-        "SLURM_TASKS_PER_NODE") or "1"
-    try:
-        per_node = max(1, int(str(raw).split("(")[0].split(",")[0]))
-    except ValueError:
-        per_node = 1
-    return _ZSTORE_HOST_FRAC * total / per_node
+    """Host budget for the Z store per rank: 0.8 of the node's live
+    ``MemAvailable`` over the processes sharing the node, the minimum over
+    processes (rank-invariant).  Measured at plan time, after nothing large
+    is held on the host (the ψ read's staging is released before the fit)."""
+    import socket
+    import zlib
+    import numpy as _np
+    from common.collectives import all_gather_processes
+    from common.gpu_utils import get_host_memory_available_gb, minimum_process_budget_gb
+    avail_gb = get_host_memory_available_gb()
+    host = zlib.crc32(socket.gethostname().encode())
+    hosts = _np.asarray(all_gather_processes(_np.asarray(host, dtype=_np.int64)))
+    per_node = max(1, int(_np.sum(hosts == host)))
+    local_gb = 0.0 if avail_gb is None else _ZSTORE_HOST_FRAC * avail_gb / per_node
+    return float(minimum_process_budget_gb(min(local_gb, 1e12))) * 1e9
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1600,6 +1600,8 @@ class MuBatchPlan:
     min_call_bytes: float = 0.0     # smallest per-rank collective payload
     min_efficient_bytes: float = 0.0  # gw.comm_model.min_efficient_payload
     runner_up: str | None = None
+    store_bytes: float = 0.0        # Z store per rank
+    host_budget_bytes: float = 0.0  # host share per rank at plan time
 
     def format(self) -> str:
         gt = max(self.green_tile_bytes, 1.0)
@@ -1615,8 +1617,9 @@ class MuBatchPlan:
             f"    r sub-block   = {self.r_sub} "
             f"{'points' if self.route == 'cache' else 'planes per group' if self.route == 'G' else 'plane(s)'}",
             f"    FFT rows/step = {self.row_chunk}",
-            f"    Z store       = {self.placement}, G-vector tile {self.g_tile}, "
-            f"finalize {self.finalize_layout}-layout",
+            f"    Z store       = {self.placement} ({self.store_bytes / 1e9:.1f} GB/rank; "
+            f"host share {self.host_budget_bytes / 1e9:.1f} GB/rank from MemAvailable), "
+            f"G-vector tile {self.g_tile}, finalize {self.finalize_layout}-layout",
             f"    G_tile unit   = {gt / 1e9:.3f} GB/dev (nk·ns²·μ²·16/P); "
             f"feasibility ceiling 4·G_tile = {4 * gt / 1e9:.2f}",
             f"    minimum cfg   = {self.min_config_bytes / 1e9:.2f} GB/dev "
@@ -1770,7 +1773,8 @@ def plan_zeta_route_g(*, meta, mesh_xy, n_q_selected: int, ngkmax: int,
     g_tile = min(g_tile, math.ceil(N_G / P_) * P_)
     n_Gt = math.ceil(N_G / g_tile)
     store = _c128(Q, n_batch * b, n_Gt * g_tile, shard=P_)
-    placement = 'host' if store <= _host_bytes_per_rank() else 'disk'
+    host_budget = _host_bytes_per_rank()
+    placement = 'host' if store <= host_budget else 'disk'
     br = dict(base)
     br.update(ws(b, n_pg))
     store_total = Q * mu * N_G * 16.0
@@ -1784,6 +1788,7 @@ def plan_zeta_route_g(*, meta, mesh_xy, n_q_selected: int, ngkmax: int,
     return MuBatchPlan(
         green_tile_bytes=float(green), min_config_bytes=float(need_min),
         collectives_per_batch=2, t_model_s=float(t_model), runner_up=ru,
+        store_bytes=float(store), host_budget_bytes=float(host_budget),
         min_call_bytes=float(_c128(nk, nb, ns, b)),
         min_efficient_bytes=comm_model.min_efficient_payload(P_ - 1),
         route='G', source='resident', band_chunk=int(nb), k_chunk=int(nk),

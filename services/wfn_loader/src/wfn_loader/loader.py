@@ -500,6 +500,20 @@ class WfnLoader:
         self.trs_holds = bool(report.trs_holds)
 
     # ------------------------------------------------------------------
+    def release_read_staging(self) -> None:
+        """Close the collective SlabIO read handle, freeing its host staging.
+
+        The phdf5 file context keeps its host read buffer at the size of the
+        largest read until the file closes (``ctx->read_buf``,
+        ``src/ffi/cpp/phdf5/context.cc``); after a large read phase (the ψ(G)
+        k-chunk union reads) that buffer is ~ψ(G)/P per rank.  The next read
+        reopens the handle lazily.  COLLECTIVE: every process calls it at the
+        same point.  A no-op when no handle is open.
+        """
+        handle, self._slab_io = self._slab_io, None
+        if handle is not None:
+            handle.close()
+
     def close(self) -> None:
         """Release both handles, propagating the first cleanup failure.
 

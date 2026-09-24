@@ -448,14 +448,17 @@ class ZStore:
         self.t_write = 0.0
         self.t_read = 0.0
         if self.placement == 'host':
-            # Pinned, tile-major host tiles (file_io.HostTileStore): one
-            # (Q, b, G_tile) tile per (G tile, batch), sharded like the rows.
-            from file_io.host_tile_store import HostTileStore
-            self._written = set()
-            self._hts = HostTileStore(
-                mesh=mesh, grid=(self.n_Gt, self.n_batch),
-                tile_shape=(self.Q, self.b, self.g_tile), spec=P(None, _XY, None),
-                dtype=np.complex128)
+            # One tile-major numpy block per addressable device, exact bytes
+            # (Q·n_batch·c·N_G·16 per rank): a G tile's rows for every batch
+            # are one contiguous (Q, n_batch·c, G_tile) read.  ponytail: not
+            # the pinned HostTileStore -- its pool growth took VI3 12x12 P16
+            # (34.6 GB/rank of Z) past node RAM (p4v_vi3_p16_whole OOM); the
+            # pinned tier returns when the planner can price its overhead.
+            # np.zeros commits pages on first write, so a batch never
+            # written (a truncated debug fit) costs nothing and reads zero.
+            self._host = {dev.id: np.zeros(
+                (self.n_Gt, self.Q, self.n_batch, self.c, self.g_tile), np.complex128)
+                for dev in mesh.local_devices}
         elif self.placement == 'disk':
             from file_io.slab_io import SlabIO
             if scratch_path is None:
@@ -473,11 +476,11 @@ class ZStore:
         """``rows (Q, b, n_Gt·G_tile)`` at ``P(None, ('x','y'), None)`` for batch ``beta``."""
         t0 = time.perf_counter()
         if self.placement == 'host':
-            # Asynchronous D2H; the next batch computes meanwhile.
-            for t, tile in enumerate(_split_g_tiles(self.mesh, self.n_Gt,
-                                                    self.g_tile)(rows)):
-                self._hts.put_tile_async((t, int(beta)), tile)
-            self._written.add(int(beta))
+            # The next batch is already dispatched, so this D2H overlaps it.
+            for shard in rows.addressable_shards:
+                d = np.asarray(shard.data).reshape(self.Q, self.c, self.n_Gt,
+                                                   self.g_tile)
+                self._host[shard.device.id][:, :, int(beta)] = d.transpose(2, 0, 1, 3)
         else:
             tiled = _tile_rows(self.mesh, self.Q, self.b, self.n_Gt, self.g_tile)(rows)
             self._io.write_slab('Z', tiled, offset=(0, 0, int(beta) * self.b, 0))
@@ -506,23 +509,11 @@ class ZStore:
                     partition_spec=P(None, None, None, _XY))
             out = _disk_tile(self.mesh, layout, self.n_batch * self.b)(raw)
         else:
-            if t == 0:
-                self._hts.wait()
-            # One dispatch moves the tile's every batch; a batch never written
-            # (a truncated debug fit) reads as zeros.
-            got = iter(self._hts.get_tiles_async(
-                [(t, beta) for beta in range(self.n_batch) if beta in self._written]))
-            zero = None
-            tiles = []
-            for beta in range(self.n_batch):
-                if beta in self._written:
-                    tiles.append(next(got))
-                else:
-                    zero = zero if zero is not None else jax.jit(
-                        lambda: jnp.zeros((self.Q, self.b, self.g_tile), jnp.complex128),
-                        out_shardings=NamedSharding(self.mesh, P(None, _XY, None)))()
-                    tiles.append(zero)
-            local = _concat_batches(self.mesh, self.n_batch)(tuple(tiles))
+            nc = self.n_batch * self.c
+            local = _host_tile_to_device(
+                self.mesh, P(None, _XY, None), (self.Q, self.P * nc, self.g_tile),
+                {dev: self._host[dev.id][t].reshape(self.Q, nc, self.g_tile)
+                 for dev in self.mesh.local_devices})
             out = _rows_to_layout(self.mesh, layout, self.P, self.n_batch,
                                   self.c, self.n_batch * self.b, self.q_axis)(local)
         # Store slot order → packed centroid order (a prefix for contiguous
@@ -535,7 +526,7 @@ class ZStore:
 
     def close(self) -> None:
         if self.placement == 'host':
-            self._hts.close()
+            self._host.clear()
         else:
             self._io.close()
             if jax.process_index() == 0:
@@ -553,33 +544,6 @@ class ZStore:
                 f"{self.bytes_written / 1e9:.2f} GB in {self.t_write:.2f} s, "
                 f"read {self.bytes_read / 1e9:.2f} GB in {self.t_read:.2f} s "
                 f"(global volumes)")
-
-
-def _split_g_tiles(mesh, n_Gt, g_tile):
-    """``(Q, b, n_Gt·G_tile)`` at ``P(None, XY, None)`` → the ``n_Gt`` G tiles, same sharding."""
-    key = ('split_g_tiles', _mesh_id(mesh), int(n_Gt), int(g_tile))
-    fn = _kernel_cache.get(key)
-    if fn is None:
-        sh = NamedSharding(mesh, P(None, _XY, None))
-        fn = jax.jit(lambda r: tuple(
-            jax.lax.slice_in_dim(r, t * g_tile, (t + 1) * g_tile, axis=2)
-            for t in range(n_Gt)), out_shardings=tuple(sh for _ in range(n_Gt)))
-        _kernel_cache[key] = fn
-    return fn
-
-
-def _concat_batches(mesh, n_batch):
-    """One G tile's per-batch ``(Q, b, G_tile)`` tiles → rank-local rows in
-    (batch, slot) order, ``(Q, P·n_batch·c, G_tile)`` at ``P(None, XY, None)``."""
-    key = ('concat_batches', _mesh_id(mesh), int(n_batch))
-    fn = _kernel_cache.get(key)
-    if fn is None:
-        spec = P(None, _XY, None)
-        fn = jax.jit(shard_map(lambda ts: jnp.concatenate(ts, axis=1), mesh=mesh,
-                               in_specs=(tuple(spec for _ in range(n_batch)),),
-                               out_specs=spec, check_vma=False))
-        _kernel_cache[key] = fn
-    return fn
 
 
 def _tile_rows(mesh, Q, b, n_Gt, g_tile):
@@ -960,6 +924,19 @@ def _v_from_m(mesh, layout, solver_kind, n_log):
         fn = jax.jit(k)
         _kernel_cache[key] = fn
     return fn
+
+
+def _host_tile_to_device(mesh, spec, shape, local_tiles):
+    """This process's host tiles → one sharded array, through the collectives service.
+
+    ``common.collectives.restore_from_host`` is the one place this process
+    places host shards on its own devices (no cross-process traffic).
+    """
+    from common.collectives import HostSpill, restore_from_host
+    return restore_from_host(HostSpill(
+        shape=tuple(int(v) for v in shape),
+        sharding=NamedSharding(mesh, spec),
+        shards=[(dev, np.ascontiguousarray(a)) for dev, a in local_tiles.items()]))
 
 
 def _slots_to_packed(mesh, layout):

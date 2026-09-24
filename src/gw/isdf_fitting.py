@@ -221,6 +221,15 @@ def add_pad_diagonal_sharded(C, active_mask, n_logical, *, mesh_xy):
     return kernel(C, pad)
 
 
+def _host_mem(label):
+    """Rank-local host line: this process's VmRSS and the node's MemAvailable."""
+    from common.gpu_utils import get_host_memory_available_gb
+    from isdf.core import host_rss_gb
+    avail = get_host_memory_available_gb()
+    return (f"  [host mem] {label}: RSS {host_rss_gb():.1f} GiB, node MemAvailable "
+            f"{'?' if avail is None else f'{avail:.1f}'} GB")
+
+
 def _fit_mubatch(
     *, wfn, sym, meta, centroid_indices, mesh_xy, plan, parent_psi, band_chunk_ranges,
     band_range_full, bispinor, bispinor_lift, k_unfold_plan, psi_mun_parent,
@@ -365,6 +374,7 @@ def _fit_mubatch(
              f"{n_par} parent k -> {nk}, ψ sphere {ngk_psi} "
              f"slots ({s_ax.carrier // P_}/rank), Z store {plan.placement}")
 
+    print_fn(_host_mem("fit start"))
     from common.progress import LoopProgress
     progress = LoopProgress(store.n_batch, print_fn, title="zeta fitting",
                             item_name="μ-batch",
@@ -412,6 +422,8 @@ def _fit_mubatch(
             t_batch += time.perf_counter() - t0
             n_run += 1
             progress.step()
+            if n_run % 10 == 0:
+                print_fn(_host_mem(f"after μ-batch {n_run}"))
             if split_kernels and beta in (1, 2):
                 args = launch_args(beta)
                 t_stage = {}
@@ -433,6 +445,7 @@ def _fit_mubatch(
                  f"μ-batch {n_run}; the fit is truncated.")
     progress.finish()
     del cbar
+    print_fn(_host_mem("pre-V_q (Z store full)"))
 
     # ---- ζ = C⁺ Z, held lazily; written only for a file consumer --------
     shell_slots, shell_gvec = zmb.zeta_shell_slots(
