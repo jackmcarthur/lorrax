@@ -1717,6 +1717,10 @@ _DEFAULTS = {
     # range spelling (docs/input_reference.md, sigma_omega_patches_ev).
     "sigma_omega_patches_ev": "",
     "sigma_regularization_ev": 0.25,
+    # Where a QSGW Sigma(E) evaluation outside the sampled grid reads
+    # (owner 2026-09-24): cover (grow the grid over every protected
+    # identity), clamp (the nearest grid edge), static (omega = 0).
+    "sigma_out_of_grid": "cover",
     "sigma_w_model": "mpa",
     "sigma_w_accuracy": "production",
     # "" = the shared-pole resolver's own line and imaginary ladders.
@@ -2584,6 +2588,7 @@ def _input_response(
         omega_max_ev=float(params["sigma_omega_max_ev"]),
         omega_step_ev=float(params["sigma_omega_step_ev"]),
         regularization_ev=float(params["sigma_regularization_ev"]),
+        out_of_grid=str(params["sigma_out_of_grid"]).strip().lower(),
         w_model=str(params["sigma_w_model"]),
         w_accuracy=str(params["sigma_w_accuracy"]),
         w_support_sites_ev=str(params["sigma_w_support_sites_ev"]),
@@ -3973,6 +3978,9 @@ class DynamicSigmaConfig:
     sigma_at_dft_energies: bool
     #: Uniform denominator-box policy for dynamic Sigma quadrature.  The
     #: cache spelling is "auto" (run tmp), "off", or a deck-relative path.
+    #: ``sigma_out_of_grid``: cover | clamp | static, the QSGW Sigma(E)
+    #: rule outside the sampled grid (``qsgw_utils.sigma_eval_omega``).
+    out_of_grid: str = "cover"
     w_model: str = "mpa"
     w_accuracy: str = "production"
     #: ``sigma_w_support_sites_ev``: "" (default, the shared-pole
@@ -4025,6 +4033,10 @@ class DynamicSigmaConfig:
             raise ValueError("sigma_omega_step_ev must be > 0.")
         if self.omega_max_ev < self.omega_min_ev:
             raise ValueError("sigma_omega_max_ev must be >= sigma_omega_min_ev.")
+        if self.out_of_grid not in ("cover", "clamp", "static"):
+            raise ValueError(
+                "sigma_out_of_grid must be 'cover', 'clamp' or 'static'; got "
+                f"{self.out_of_grid!r}.")
         self.parsed_omega_patches_ev()
         if self.fermi_reference not in ("vbm", "midgap", "mp1_fixed_n"):
             raise ValueError(
