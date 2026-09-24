@@ -271,7 +271,7 @@ def run_sternheimer_orbmag(wfn, sym, meta, vnl_setup, pseudos, nbnd, nocc,
     Per full-BZ k, per occupied band v: solve the Sternheimer equation (reusing
     ``run_sternheimer.compute_kp_tangent_at_kvec``) for |∂̃_a u_v⟩ (a=x,y,z),
     then the per-k orbital-moment AXIAL VECTOR
-        m_γ(k) = (−1/2) Im Σ_v ε_{γab} ⟨∂̃_a u_v|(H_k+ε_v−2μ)|∂̃_b u_v⟩.
+        m_γ(k) = (+1/2) Im Σ_v ε_{γab} ⟨∂̃_a u_v|(H_k+ε_v−2μ)|∂̃_b u_v⟩.
     The conduction manifold is summed exactly inside the Sternheimer inverse, so
     the result is BAND-COUNT INDEPENDENT (no SOS tail).  μ-linear split:
         cA from the (H_k+ε_v)-sandwich, cB from the overlap ⟨∂̃_a|∂̃_b⟩
