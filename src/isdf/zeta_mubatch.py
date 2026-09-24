@@ -20,6 +20,7 @@ from __future__ import annotations
 import math
 import time
 from functools import partial
+from typing import NamedTuple
 
 import numpy as np
 import jax
@@ -70,72 +71,93 @@ def identity_kplan(k_full_frac, centroid_fft_idx, fft_grid, mesh, ns):
                                         mesh, nspinor=int(ns), parent_k_frac=kf)
 
 
-def typed_children_psi_G(psi_par, *, mesh: Mesh, plan, fft_grid, box_par,
-                         gvec_child, ngk_child, k_child):
-    """Full-zone ψ(G) from the raw parents by the plan's typed transport.
+class OwnerOrbitBatches(NamedTuple):
+    """μ batches whose every owner (``c`` slots per rank) holds whole orbits."""
+    mu: np.ndarray            # (n_batch, P·c) packed centroid per slot, −1 pad
+    left_perm: np.ndarray     # (n_batch, P, n_rows, c) owner-local source slot
+    left_L: np.ndarray        # (n_batch, P, n_rows, c, 3) lattice wrap
+    c: int
+    n_batch: int
+    slot_of_packed: np.ndarray  # (μ_pad,) store slot β·P·c + p·c + j, −1 pad
 
-    The one transport ``C_q`` and the centroid faces use (so route G's Z and
-    C agree to rounding): per full k, the parent's box IFFT, the snapped grid
-    action (``symmetry_maps.centroid_source_map_and_wrap`` on the whole grid:
-    source point, lattice-wrap phase ``e^{2πi L·k̄}``, antiunitary
-    conjugation, then the spinor action ``plan.spin_action_full``), the
-    child's Bloch factor and the box FFT, gathered on the child's sphere.
-    The loader's own G-space unfold applies the raw translation phase and
-    differs from this by ~1e-10, which κ(C) ~ 1e8 turns into ~1e-6 in ζ
-    (CrI3 8x8), hence this path.
+    @property
+    def b(self) -> int:
+        return int(self.mu.shape[1])
 
-    ``psi_par (n_parent, nb, ns, ngk)`` band-sharded ``P(None, XY, None,
-    None)``; ``box_par (n_parent, N_r)`` box → parent sphere slot (``ngk``
-    empty); ``gvec_child (nk, ngk, 3)`` / ``ngk_child`` / ``k_child`` the
-    children's sphere, valid count and k (the loader's full-BZ tables).
-    Returns ``(nk, nb, ns, ngk)`` band-sharded.
+
+def owner_orbit_batches(plan, mu_pad: int, n_ranks: int, *, c_target: int):
+    """Whole-orbit bins of about ``c_target`` (one per owner), ``P`` bins a batch.
+
+    The owner unfolds the left endpoint of its pair projectors inside its own
+    bin, so a bin must hold whole orbits
+    (:func:`gw.centroid_k_unfold.orbit_mu_batches` with one rank).  Empty
+    bins pad the last batch.
     """
-    from symmetry_maps import centroid_source_map_and_wrap
-    fg = tuple(int(v) for v in fft_grid)
-    N = int(np.prod(fg))
-    grid = np.stack(np.meshgrid(*(np.arange(n) for n in fg), indexing='ij'),
-                    -1).reshape(-1, 3).astype(np.int32)
-    perm, L = centroid_source_map_and_wrap(grid, np.asarray(plan.spatial_ops),
-                                           np.asarray(plan.translations), fg,
-                                           extend_trs=True)
-    gv = np.asarray(gvec_child, dtype=np.int64) % np.asarray(fg)
-    child_flat = (gv[..., 0] * fg[1] * fg[2] + gv[..., 1] * fg[2] + gv[..., 2]).astype(np.int32)
-    live = (np.arange(gv.shape[1])[None, :] < np.asarray(ngk_child)[:, None])
-    nk = int(gv.shape[0])
+    from gw.centroid_k_unfold import orbit_mu_batches
+    P_ = int(n_ranks)
+    bins = orbit_mu_batches(plan, int(mu_pad), 1, b_target=max(1, int(c_target)))
+    c = int(bins.b)
+    n_bins = int(bins.n_batch)
+    n_batch = -(-n_bins // P_)
+    pad = n_batch * P_ - n_bins
+    n_rows = int(bins.left_perm.shape[1])
+    mu = np.concatenate([bins.mu, np.full((pad, c), -1, bins.mu.dtype)])
+    lp = np.concatenate([bins.left_perm, np.broadcast_to(
+        np.arange(c, dtype=bins.left_perm.dtype), (pad, n_rows, c))])
+    lL = np.concatenate([bins.left_L, np.zeros((pad, n_rows, c, 3), bins.left_L.dtype)])
+    return OwnerOrbitBatches(
+        mu=mu.reshape(n_batch, P_ * c),
+        left_perm=lp.reshape(n_batch, P_, n_rows, c).astype(np.int32),
+        left_L=lL.reshape(n_batch, P_, n_rows, c, 3).astype(np.int32),
+        c=c, n_batch=n_batch,
+        slot_of_packed=np.asarray(bins.packed_to_slot(int(mu_pad)), dtype=np.int32))
+
+
+def typed_child_G_tables(plan, *, fft_grid, box_par, ngk_par, gvec_child,
+                         ngk_child, k_child):
+    """The r-space typed transport of :func:`typed_children_psi_G` as G-space
+    tables, its exact Fourier image.
+
+    The typed child is ``ψ_k(x) = U_k T[ψ_p(S x − t)]`` with the snapped
+    offset ``t = round(N·S·τ)/N`` (the grid permutation's), so on the child's
+    sphere ``c_k(G') = U_k T[c_p(G) e^{-2πi (k̄+G)·t}]`` with
+    ``S^T(k̄+G) = ±(k + G')`` (+ unitary, − antiunitary rows, where T
+    conjugates).  Returns ``(pslot (nk, ngk_c) int32`` parent slot of each
+    child slot (``ngk_par`` for pad slots), ``phase (nk, ngk_c)``
+    ``e^{-2πi (k̄+G)·t}``, ``anti (nk,) bool)``.
+    """
+    fg = np.asarray(fft_grid, dtype=np.int64)
+    S_all = np.asarray(plan.spatial_ops, dtype=np.int64)
+    tau = np.asarray(plan.translations, dtype=np.float64) / (2.0 * np.pi)
     n_sym = int(plan.n_sym_spatial)
-    xs = (grid / np.asarray(fg, float))
-    ops = [np.asarray(a) for a in (
-        np.asarray(box_par, np.int32).reshape(-1, N), perm.astype(np.int32),
-        L.astype(np.float64), child_flat, live.astype(np.float64),
-        np.asarray(plan.k_parent_frac, np.float64), np.asarray(k_child, np.float64),
-        np.asarray(plan.spin_action_full, np.complex128),
-        np.asarray(plan.irr_idx, np.int32), np.asarray(plan.sym_idx, np.int32), xs)]
-    from common.collectives import device_put_process_local
-    rep = NamedSharding(mesh, P())
-    ops = [device_put_process_local(a, rep) for a in ops]
-
-    @partial(shard_map, mesh=mesh,
-             in_specs=(P(None, _XY, None, None),) + (P(),) * len(ops),
-             out_specs=P(None, _XY, None, None), check_vma=False)
-    def _f(psi, inv_par, perm, L, cflat, lv, kpar, kch, U, irr, sym, x):
-        nb, ns = int(psi.shape[1]), int(psi.shape[2])
-
-        def one(_, k):
-            p, s_ = irr[k], sym[k]
-            cz = jnp.concatenate([psi[p], jnp.zeros((nb, ns, 1), psi.dtype)], -1)
-            box = jnp.take(cz, inv_par[p], axis=-1).reshape(nb, ns, *fg)
-            u = jnp.fft.ifftn(box, axes=(-3, -2, -1), norm='ortho').reshape(nb, ns, N)
-            v = u * jnp.exp(2j * jnp.pi * (x @ kpar[p]))
-            v = jnp.take(v, perm[s_], axis=-1) * jnp.exp(2j * jnp.pi * (L[s_] @ kpar[p]))
-            v = jnp.where(s_ >= n_sym, jnp.conj(v), v)
-            v = jnp.einsum('ac,ncr->nar', U[k], v) * jnp.exp(-2j * jnp.pi * (x @ kch[k]))
-            ck = jnp.fft.fftn(v.reshape(nb, ns, *fg), axes=(-3, -2, -1),
-                              norm='ortho').reshape(nb, ns, N)
-            return None, jnp.take(ck, cflat[k], axis=-1) * lv[k]
-
-        return jax.lax.scan(one, None, jnp.arange(nk, dtype=jnp.int32), unroll=1)[1]
-
-    return jax.jit(_f)(psi_par, *ops)
+    kp = np.asarray(plan.k_parent_frac, dtype=np.float64)
+    kc = np.asarray(k_child, dtype=np.float64)
+    gvc = np.asarray(gvec_child, dtype=np.int64)
+    nk, ngk_c = int(gvc.shape[0]), int(gvc.shape[1])
+    box = np.asarray(box_par, dtype=np.int64).reshape(box_par.shape[0], -1)
+    pslot = np.full((nk, ngk_c), int(ngk_par), dtype=np.int32)
+    phase = np.zeros((nk, ngk_c), dtype=np.complex128)
+    anti = np.zeros(nk, dtype=bool)
+    for k in range(nk):
+        p, s = int(plan.irr_idx[k]), int(plan.sym_idx[k])
+        S = S_all[s % n_sym]
+        anti[k] = s >= n_sym
+        t = np.rint(fg * (S @ tau[s % n_sym])) / fg
+        live = np.arange(ngk_c) < int(ngk_child[k])
+        K = (kc[k][None, :] + gvc[k]) * (-1.0 if anti[k] else 1.0)   # = S^T (k̄+G)
+        kg = np.linalg.solve(S.T.astype(np.float64), K.T).T            # k̄ + G
+        G = np.rint(kg - kp[p][None, :]).astype(np.int64)
+        if np.max(np.abs((kg - kp[p]) - G)[live], initial=0.0) > 1e-6:
+            raise ValueError(f"typed_child_G_tables: child k={k} is not an image "
+                             f"of parent {p} under row {s}")
+        flat = (((G % fg) * np.array([fg[1] * fg[2], fg[2], 1])).sum(-1))
+        sl = box[p][flat]
+        if np.any(sl[live] >= int(ngk_par)):
+            raise ValueError(f"typed_child_G_tables: child k={k} has a G outside "
+                             f"parent {p}'s sphere")
+        pslot[k] = np.where(live, sl, int(ngk_par))
+        phase[k] = np.where(live, np.exp(-2j * np.pi * ((kp[p] + G) @ t)), 0.0)
+    return pslot, phase, anti
 
 
 def zeta_plane_tables(gvec_components, ngk_per_q, fft_grid, axis, g_axis):
@@ -157,10 +179,10 @@ def zeta_plane_tables(gvec_components, ngk_per_q, fft_grid, axis, g_axis):
 
 def make_route_g_kernel(*, mesh: Mesh, plan_id, kgrid, fft_grid, ns: int, b: int,
                         q_sel, q_axis, q_neg, qvec_frac, n_col: int, n_s: int,
-                        n_pg: int, axis: int, stop_at: str | None = None):
+                        n_pg: int, axis: int, n_src: int, stop_at: str | None = None):
     """Compile-once executable for one μ batch on route G.
 
-    Returns ``fn(psi_bar, w_l, w_r, kvecs, g3, xmu, live, cyl, zt) -> rows``
+    Returns ``fn(psi_bar, w_l, w_r, kvecs, g3, xmu, live, cyl, zt, unf, lt) -> rows``
     ``(Q, b, N_G)`` at ``P(None, ('x','y'), None)`` (μ-owned; rank p owns the
     batch slots ``p·c + [0, c)``, ``c = b/P``):
 
@@ -175,12 +197,21 @@ def make_route_g_kernel(*, mesh: Mesh, plan_id, kgrid, fft_grid, ns: int, b: int
        LR+RL completion; ``e^{-iq·r}``, forward 2D FFT, the ζ-sphere
        columns and the axis phase accumulate ``Z_q(μ, G)``.
 
-    Operands: ``psi_bar (nk, nb, ns, ngk_pad)`` = conj ψ(G) on the full
-    zone, G sharded ``P(None, None, None, ('x','y'))``; ``g3 (nk, ngk_pad, 3)``
-    Miller index of each slot, same G sharding; ``xmu (b, 3)`` fractional
-    coordinates of the batch slots and ``live (b,)`` their mask; ``cyl`` =
-    :func:`common.wfn_transforms.psi_cylinder_tables` of the ψ sphere;
-    ``zt`` = :func:`zeta_plane_tables`.
+    Operands: ``psi_bar (n_src, nb, ns, ngk_pad)`` = conj ψ(G) of the raw
+    parents, G sharded ``P(None, None, None, ('x','y'))``; ``g3 (n_src,
+    ngk_pad, 3)`` Miller index of each parent slot, same G sharding;
+    ``kvecs (n_src, 3)``; ``xmu (b, 3)`` fractional coordinates of the batch
+    slots and ``live (b,)`` their mask; ``cyl`` =
+    :func:`common.wfn_transforms.psi_cylinder_tables` of the CHILDREN's
+    spheres; ``zt`` = :func:`zeta_plane_tables`.  ``unf = (irr (nk,), sym
+    (nk,), anti (nk,), U (nk, ns, ns), pslot (nk, ngk_c), phase (nk,
+    ngk_c), k_child (nk, 3))`` is the typed transport in G space
+    (:func:`typed_child_G_tables`) and ``lt = (left_perm (P, n_rows, c),
+    left_L (P, n_rows, c, 3))`` each owner's whole-orbit centroid tables,
+    sharded over the ranks: the owner unfolds the parents' pair projectors
+    ``D̃_k = (U⊗Ū) T[D̃_k̄(perm μ, pslot G) e^{2πi L·k̄} conj(phase)]``,
+    the exact Fourier image of the r-space typed transport C_q and the
+    faces use.
 
     ``stop_at`` (debug split timers only: ``'x'``, ``'gemm'``, ``'a2a'``,
     ``'planes'``, ``'kconv'``) truncates after that stage with a checksum.
@@ -217,19 +248,23 @@ def make_route_g_kernel(*, mesh: Mesh, plan_id, kgrid, fft_grid, ns: int, b: int
     key = ('route_g', _mesh_id(mesh), id(plan_id), tuple(kgrid), tuple(fft_grid), ns, b,
            hash(q_sel.tobytes()), q_axis,
            None if q_neg is None else hash(q_neg.tobytes()), hash(qv.tobytes()),
-           int(n_col), int(n_s), int(n_pg), int(axis), stop_at)
+           int(n_col), int(n_s), int(n_pg), int(axis), int(n_src), stop_at)
     hit = _kernel_cache.get(key)
     if hit is not None:
         return hit
 
     G_ = P(None, None, None, _XY)
+    R_ = P(_XY)
 
     @partial(shard_map, mesh=mesh,
-             in_specs=(G_, P(), P(), P(), P(None, _XY, None), P(), P(), P(), P()),
+             in_specs=(G_, P(), P(), P(), P(None, _XY, None), P(), P(), P(), P(),
+                       P(), (R_, R_)),
              out_specs=P(None, _XY, None), check_vma=False)
-    def _local(psi_bar, w_l, w_r, kvecs, g3, xmu, live, cyl, zt):
+    def _local(psi_bar, w_l, w_r, kvecs, g3, xmu, live, cyl, zt, unf, lt):
         ci, cax, pfc = cyl
         zc, za, zflat = zt
+        irr, sym, anti, U, pslot, phase, kch = unf
+        lperm, lL = lt[0][0], lt[1][0]                    # this owner's orbits
         # 1. X_B = ψ_{nks}(r_μ) = Σ_G c e^{2πi(k+G)·x_μ}/√N, one psum
         kg = kvecs[:, None, :] + g3.astype(jnp.float64)            # (k, Gp, 3)
         ph = jnp.exp(2j * jnp.pi * jnp.einsum('kgd,md->kgm', kg, xmu))
@@ -245,8 +280,8 @@ def make_route_g_kernel(*, mesh: Mesh, plan_id, kgrid, fft_grid, ns: int, b: int
         if stop_at == 'gemm':
             return chk(D_l) + chk(D_r)
         # 3. one all-to-all: G split -> μ owners, [L | R] owner-major
-        D = jnp.stack([D_l, D_r], axis=2).reshape(nk, ns, 2, P_, c, ns, -1)
-        D = jnp.moveaxis(D, 3, 2).reshape(nk, ns, P_ * 2 * c, ns, -1)
+        D = jnp.stack([D_l, D_r], axis=2).reshape(n_src, ns, 2, P_, c, ns, -1)
+        D = jnp.moveaxis(D, 3, 2).reshape(n_src, ns, P_ * 2 * c, ns, -1)
         D = jax.lax.all_to_all(D, _XY, split_axis=2, concat_axis=4, tiled=True)
         if stop_at == 'a2a':
             return chk(D)
@@ -260,7 +295,17 @@ def make_route_g_kernel(*, mesh: Mesh, plan_id, kgrid, fft_grid, ns: int, b: int
         pa_all = pa_all * (jnp.arange(pl_ax.carrier) < n_a)[None, :]
 
         def cyl_k(_, k):
-            cy = jnp.take(D[k], jnp.clip(ci[k], 0, ngk1 - 1).reshape(-1), axis=-1)
+            # the typed unfold of the parent's pair projectors to child k
+            p, s_ = irr[k], sym[k]
+            d = D[p].reshape(ns, 2, c, ns, ngk1)
+            wl = jnp.exp(2j * jnp.pi * (lL[s_].astype(jnp.float64) @ kvecs[p]))
+            d = jnp.take(d, lperm[s_], axis=2) * wl[None, None, :, None, None]
+            d = jnp.take(d, pslot[k], axis=-1) * jnp.conj(phase[k])
+            d = jnp.where(anti[k], jnp.conj(d), d)
+            d = jnp.einsum('ac,bd,cxmdj->axmbj', U[k], jnp.conj(U[k]), d)
+            d = jnp.concatenate([d.reshape(ns, 2 * c, ns, -1),
+                                 jnp.zeros((ns, 2 * c, ns, 1), d.dtype)], -1)
+            cy = jnp.take(d, jnp.clip(ci[k], 0, int(d.shape[-1]) - 1).reshape(-1), axis=-1)
             cy = cy.reshape(ns, 2 * c, ns, n_col, n_s)
             return None, jnp.einsum('asbcj,jp->pasbc', cy, pa_all)
 
@@ -278,9 +323,9 @@ def make_route_g_kernel(*, mesh: Mesh, plan_id, kgrid, fft_grid, ns: int, b: int
             st = jnp.take(F, pfc, axis=-1).reshape(nk, n_pg, ns, 2 * c, ns, n_b, n_c)
             d = local_fftn3(st, axes=(-2, -1), norm='backward')        # Σ e^{-iG·r}
             bl = jnp.exp(-2j * jnp.pi * (
-                kvecs[:, axis][:, None, None] * a0[None, :, None] / n_a
-                + kvecs[:, b_ax][:, None, None] * ib[None, None, :] / n_b
-                + kvecs[:, c_ax][:, None, None] * ic[None, None, :] / n_c)) / np.sqrt(N)
+                kch[:, axis][:, None, None] * a0[None, :, None] / n_a
+                + kch[:, b_ax][:, None, None] * ib[None, None, :] / n_b
+                + kch[:, c_ax][:, None, None] * ic[None, None, :] / n_c)) / np.sqrt(N)
             d = d.reshape(nk, n_pg, ns, 2 * c, ns, ps) * bl[:, :, None, None, None, :]
             Dk = jnp.moveaxis(d, 1, 4).reshape(nk, ns, 2 * c, ns, r_pl)
             Z = parent_projector_kconv(

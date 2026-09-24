@@ -110,19 +110,27 @@ def run_case(case, fx, mesh, scratch):
     put_rep = lambda a: put(np.asarray(a), NamedSharding(mesh, P()))
     worst = 0.0
 
-    # Route G: conj ψ(G) of the full zone (the children) sharded over G slots;
-    # the pair GEMM in G space, one all-to-all to the μ owners, planes there.
+    # Route G: conj ψ(G) of the raw PARENTS sharded over G slots; the pair
+    # GEMM on the parents, one all-to-all to the whole-orbit owners, the typed
+    # unfold of the pair projectors there, then the planes.
     from common.wfn_transforms import psi_cylinder_tables
-    child = parity._children(fx)
     kfull = np.asarray(fx["kfull"], dtype=np.float64)
+    kpar = np.asarray(plan.k_parent_frac, dtype=np.float64)
+    n_par = int(psi.shape[0])
     xg = parity._grid_points(fg) / np.asarray(fg, float)
-    u = child * np.exp(-2j * np.pi * (xg @ kfull.T).T)[:, None, None, :]
+    u = psi * np.exp(-2j * np.pi * (xg @ kpar.T).T)[:, None, None, :]
     cG = np.fft.fftn(u.reshape(*u.shape[:3], *fg), axes=(-3, -2, -1),
                      norm="ortho").reshape(u.shape)
     s_ax = padded_axis(n_rtot, 4, name="ψ sphere slots")
     cbar = np.conj(np.asarray(pad_to_axis(cG, s_ax, axis=3)))
-    g3 = np.asarray(pad_to_axis(np.broadcast_to(G.astype(np.int32), (nk,) + G.shape).copy(),
+    miller = G.astype(np.int32)
+    g3 = np.asarray(pad_to_axis(np.broadcast_to(miller, (n_par,) + miller.shape).copy(),
                                 s_ax, axis=1))
+    box_id = np.broadcast_to(np.arange(n_rtot, dtype=np.int32), (n_par, n_rtot)).copy()
+    pslot, phase, anti = zmb.typed_child_G_tables(
+        plan, fft_grid=fg, box_par=box_id, ngk_par=n_rtot,
+        gvec_child=np.broadcast_to(miller, (nk,) + miller.shape),
+        ngk_child=np.full(nk, n_rtot), k_child=kfull)
     axis = int(np.argmax(fg))
     cyl = psi_cylinder_tables(np.broadcast_to(np.arange(n_rtot, dtype=np.int32).reshape(fg),
                                               (nk,) + fg).copy(), fg, axis, ngkmax=n_rtot)
@@ -132,25 +140,32 @@ def run_case(case, fx, mesh, scratch):
     canon = np.asarray(plan.layout.axis.packed_to_canonical)
     cbar_d = parity._put(cbar, NamedSharding(mesh, P(None, None, None, ("x", "y"))))
     g3_d = parity._put(g3, NamedSharding(mesh, P(None, ("x", "y"), None)))
-    ops = (put_rep(w_l), put_rep(w_r), put_rep(kfull))
+    ops = (put_rep(w_l), put_rep(w_r), put_rep(kpar))
+    unf = tuple(put_rep(a) for a in (plan.irr_idx.astype(np.int32),
+                                     plan.sym_idx.astype(np.int32), anti,
+                                     plan.spin_action_full, pslot, phase, kfull))
     tabs = (tuple(put_rep(a) for a in cyl), tuple(put_rep(a) for a in zt))
+    rank = NamedSharding(mesh, P(("x", "y")))
 
     def run_g(tabs, placement="host"):
-        mb = orbit_mu_batches(plan, mu_pad, 4, b_target=int(fx["b_target"]))
+        ob = zmb.owner_orbit_batches(plan, mu_pad, 4,
+                                     c_target=max(1, int(fx["b_target"]) // 4))
         kern = zmb.make_route_g_kernel(
-            mesh=mesh, plan_id=plan_id, kgrid=kgrid, fft_grid=fg, ns=ns, b=mb.b,
+            mesh=mesh, plan_id=plan_id, kgrid=kgrid, fft_grid=fg, ns=ns, b=ob.b,
             q_sel=q_sel, q_axis=q_axis, q_neg=q_neg, qvec_frac=qf,
-            n_col=int(cyl[0].shape[1]), n_s=int(cyl[0].shape[2]), n_pg=2, axis=axis)
-        zs = zmb.ZStore(mesh=mesh, q_axis=q_axis, mu_pad=mu_pad, g_axis=g_axis, b=mb.b,
-                        placement=placement, n_batch=mb.n_batch,
-                        packed_from_slot=mb.packed_to_slot(mu_pad),
+            n_col=int(cyl[0].shape[1]), n_s=int(cyl[0].shape[2]), n_pg=2, axis=axis,
+            n_src=n_par)
+        zs = zmb.ZStore(mesh=mesh, q_axis=q_axis, mu_pad=mu_pad, g_axis=g_axis, b=ob.b,
+                        placement=placement, n_batch=ob.n_batch,
+                        packed_from_slot=ob.slot_of_packed,
                         scratch_path=os.path.join(scratch, f"{case}_zstore.h5"))
-        for beta in range(mb.n_batch):
-            slots = mb.mu[beta]
+        for beta in range(ob.n_batch):
+            slots = ob.mu[beta]
             live = (slots >= 0).astype(np.float64)
             xmu = xg[fx["cent_flat"][canon[np.clip(slots, 0, None)]]] * live[:, None]
+            lt = (parity._put(ob.left_perm[beta], rank), parity._put(ob.left_L[beta], rank))
             zs.write_batch(beta, kern(cbar_d, *ops, g3_d, put_rep(xmu), put_rep(live),
-                                      *tabs))
+                                      *tabs, unf, lt))
         out = {lay: np.concatenate([parity._host(zs.read_tile(i, layout=lay))
                                     for i in range(zs.n_Gt)], axis=2)[:len(q_sel), :, :ngk]
                for lay in ("q", "g")}

@@ -240,7 +240,6 @@ def _fit_mubatch(
     from isdf import zeta_mubatch as zmb
     from common.wfn_transforms import psi_cylinder_tables
     from runtime.padding import mesh_divisor, pad_to_axis, padded_axis
-    from gw.centroid_k_unfold import orbit_mu_batches
 
     P_ = int(mesh_divisor(mesh_xy))
     nk = int(meta.nk_tot)
@@ -261,30 +260,17 @@ def _fit_mubatch(
     rep = NamedSharding(mesh_xy, P())
     axis = int(np.argmax(fft_grid))
 
-    # ---- conj ψ(G) on the full zone, G slots over the mesh --------------
-    # ponytail: the loader's full-BZ unfold (its one source of truth for the
-    # typed action) feeds the G-space GEMM directly, instead of parent-k
-    # GEMMs plus a D~ unfold.  Symmetric decks pay nk/n_parent on this GEMM
-    # (over the ψ sphere, ~20x smaller than the r-space GEMM it replaced) and
-    # on the ψ(G) slice; the upgrade path is the loader's unfold applied to D~.
+    # ---- conj ψ(G) of the raw parents, G slots over the mesh -------------
+    # The pair GEMM runs on the parents; each owner unfolds its pair
+    # projectors to the full zone with the plan's typed transport in G space
+    # (zmb.typed_child_G_tables: the exact Fourier image of the r-space
+    # transport C_q and the faces use -- rotation as a G permutation, the
+    # grid-snapped τ phase, spinor U, conjugation on antiunitary rows).
     with timing.section("zeta_fit.mubatch.psi_G"):
-        _lift = dict(bispinor=bool(bispinor),
-                     bispinor_lift=(bispinor_lift if bispinor else "raw"))
-        if int(k_unfold_plan.n_parent) < nk:
-            # The children by the plan's typed transport (the one C_q and the
-            # faces use), not the loader's G-space unfold: see
-            # zmb.typed_children_psi_G.
-            _pd = k_unfold_plan.sym.parent_k_domain
-            psi = zmb.typed_children_psi_G(
-                wfn.load(bands=(b_lo, b_hi), k=_pd, **_lift), mesh=mesh_xy,
-                plan=k_unfold_plan, fft_grid=fft_grid,
-                box_par=np.asarray(wfn.box_index(k=_pd)),
-                gvec_child=np.asarray(wfn.gvecs(k="full_bz")),
-                ngk_child=np.asarray(wfn.ngk_valid(k="full_bz")),
-                k_child=np.asarray(wfn.kvecs(k="full_bz")))
-        else:
-            psi = wfn.load(bands=(b_lo, b_hi), k="full_bz", **_lift)
-        nb_p, ngk_psi = int(psi.shape[1]), int(psi.shape[3])
+        _pd = k_unfold_plan.sym.parent_k_domain
+        psi = wfn.load(bands=(b_lo, b_hi), k=_pd, bispinor=bool(bispinor),
+                       bispinor_lift=(bispinor_lift if bispinor else "raw"))
+        n_par, nb_p, ngk_psi = int(psi.shape[0]), int(psi.shape[1]), int(psi.shape[3])
         s_ax = padded_axis(ngk_psi, P_, name="route-G ψ sphere slots")
         g_spec = NamedSharding(mesh_xy, P(None, None, None, ('x', 'y')))
         cbar = jax.jit(lambda x: jnp.conj(pad_to_axis(x, s_ax, axis=3)),
@@ -295,13 +281,22 @@ def _fit_mubatch(
         if not np.array_equal(np.ravel_multi_index(kin.T, kgrid), np.arange(nk)):
             raise ValueError("_fit_mubatch: the loader's full-BZ rows are not the "
                              "C-order k grid the k-convolution assumes")
-        g3 = np.asarray(pad_to_axis(np.asarray(wfn.gvecs(k="full_bz"), np.int32),
+        kpar = np.asarray(k_unfold_plan.k_parent_frac, dtype=np.float64)
+        g3 = np.asarray(pad_to_axis(np.asarray(wfn.gvecs(k=_pd), np.int32),
                                     s_ax, axis=1))
         g3 = jax.make_array_from_callback(
             g3.shape, NamedSharding(mesh_xy, P(None, ('x', 'y'), None)),
             lambda idx: g3[idx])
+        pslot, phase, anti = zmb.typed_child_G_tables(
+            k_unfold_plan, fft_grid=fft_grid, box_par=np.asarray(wfn.box_index(k=_pd)),
+            ngk_par=int(wfn.ngkmax), gvec_child=np.asarray(wfn.gvecs(k="full_bz")),
+            ngk_child=np.asarray(wfn.ngk_valid(k="full_bz")), k_child=kv)
+        unf = tuple(_device_put_process_local(np.asarray(a), rep) for a in (
+            np.asarray(k_unfold_plan.irr_idx, np.int32),
+            np.asarray(k_unfold_plan.sym_idx, np.int32), anti,
+            np.asarray(k_unfold_plan.spin_action_full, np.complex128), pslot, phase, kv))
         cyl = psi_cylinder_tables(wfn.box_index(k="full_bz"), fft_grid, axis,
-                                  ngkmax=ngk_psi)
+                                  ngkmax=int(wfn.ngkmax))
     w = lambda wf: np.asarray(pad_to_axis(jnp.asarray(
         np.asarray(jax.device_get(wf))[:nb]), padded_axis(nb, nb_p, name="bands"),
         axis=0))
@@ -317,14 +312,16 @@ def _fit_mubatch(
     g_axis = padded_axis(ngkmax, int(plan.g_tile), name="μ-batch ζ-sphere G tiles")
     zt = zmb.zeta_plane_tables(gvec_components, ngk_per_q, fft_grid, axis, g_axis)
     plan_id = zmb.identity_kplan(kv, centroid_indices, fft_grid, mesh_xy, ns)
-    # μ-owned rows: rank p owns slots p·c + [0, c) of every batch.
-    mb = orbit_mu_batches(k_unfold_plan, mu_pad, P_, b_target=int(plan.b))
+    # μ-owned rows: rank p owns slots p·c + [0, c) of every batch, whole
+    # orbits per owner (the owner unfolds its own pair projectors).
+    mb = zmb.owner_orbit_batches(k_unfold_plan, mu_pad, P_,
+                                 c_target=max(1, int(plan.b) // P_))
     b = int(mb.b)
     kernel = zmb.make_route_g_kernel(
         mesh=mesh_xy, plan_id=plan_id, kgrid=kgrid, fft_grid=fft_grid, ns=ns, b=b,
         q_sel=q_irr_full_idx, q_axis=q_axis, q_neg=q_neg_idx, qvec_frac=q_frac,
         n_col=int(cyl[0].shape[1]), n_s=int(cyl[0].shape[2]),
-        n_pg=int(plan.r_sub), axis=axis)
+        n_pg=int(plan.r_sub), axis=axis, n_src=n_par)
     split_kernels = {}
     if debug_print_enabled():
         # Debug split timers: the same kernel truncated after each stage.
@@ -334,20 +331,22 @@ def _fit_mubatch(
                 ns=ns, b=b, q_sel=q_irr_full_idx, q_axis=q_axis, q_neg=q_neg_idx,
                 qvec_frac=q_frac, n_col=int(cyl[0].shape[1]),
                 n_s=int(cyl[0].shape[2]), n_pg=int(plan.r_sub), axis=axis,
-                stop_at=stage)
+                n_src=n_par, stop_at=stage)
     store = zmb.ZStore(
         mesh=mesh_xy, q_axis=q_axis, mu_pad=mu_pad, g_axis=g_axis, b=b,
         placement=plan.placement,
-        packed_from_slot=mb.packed_to_slot(mu_pad), n_batch=int(mb.n_batch),
+        packed_from_slot=mb.slot_of_packed, n_batch=int(mb.n_batch),
         scratch_path=os.path.join(scratch_dir, "zeta_Z_store.scratch.h5"))
     canon = np.asarray(k_unfold_plan.layout.axis.packed_to_canonical)
     x_cent = np.asarray(centroid_indices, dtype=np.float64) / np.asarray(fft_grid)
     ops = (_device_put_process_local(w_l, rep), _device_put_process_local(w_r, rep),
-           _device_put_process_local(kv, rep))
+           _device_put_process_local(kpar, rep))
+    rank_sh = NamedSharding(mesh_xy, P(('x', 'y')))
     tabs = (tuple(_device_put_process_local(np.asarray(a), rep) for a in cyl),
             tuple(_device_put_process_local(a, rep) for a in zt))
-    print_fn(f"  μ-batch fit (route G): {store.n_batch} batches of {b} centroids, "
-             f"{int(plan.r_sub)} planes per group, {nk} k, ψ sphere {ngk_psi} "
+    print_fn(f"  μ-batch fit (route G): {store.n_batch} batches of {b} centroids "
+             f"(whole orbits per owner), {int(plan.r_sub)} planes per group, "
+             f"{n_par} parent k -> {nk}, ψ sphere {ngk_psi} "
              f"slots ({s_ax.carrier // P_}/rank), Z store {plan.placement}")
 
     from common.progress import LoopProgress
@@ -368,8 +367,10 @@ def _fit_mubatch(
         slots = mb.mu[beta]
         live = (slots >= 0).astype(np.float64)
         xmu = x_cent[canon[np.clip(slots, 0, None)]] * live[:, None]
+        lt = tuple(jax.make_array_from_callback(a.shape, rank_sh, lambda i, a=a: a[i])
+                   for a in (mb.left_perm[beta], mb.left_L[beta]))
         return (cbar, *ops, g3, _device_put_process_local(xmu, rep),
-                _device_put_process_local(live, rep), *tabs)
+                _device_put_process_local(live, rep), *tabs, unf, lt)
 
     def launch(beta):
         """Dispatch batch β (asynchronous); the caller writes it later."""
@@ -377,12 +378,7 @@ def _fit_mubatch(
 
     if debug_print_enabled():
         # The collective count of one batch, read from the compiled HLO.
-        slots = mb.mu[0]
-        live = (slots >= 0).astype(np.float64)
-        hlo = kernel.lower(
-            cbar, *ops, g3, _device_put_process_local(x_cent[canon[np.clip(slots, 0, None)]]
-                                                      * live[:, None], rep),
-            _device_put_process_local(live, rep), *tabs).compile().as_text()
+        hlo = kernel.lower(*launch_args(0)).compile().as_text()
         n_coll = {k: hlo.count(k + '(') + hlo.count(k + '-start(')
                   for k in ('all-to-all', 'all-reduce', 'all-gather',
                             'reduce-scatter', 'collective-permute')}
