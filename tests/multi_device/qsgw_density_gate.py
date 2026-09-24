@@ -80,13 +80,13 @@ def main():
 
     rng = np.random.default_rng(20260804)
     gv = np.zeros((NK, NGK, 3), dtype=np.int32)
-    bidx = np.full((NK, nx, ny, nz), NGK, dtype=np.int32)
+    bidx = np.zeros((NK, NGK), dtype=np.int32)     # per-k sphere index
     for ik in range(NK):
         cells = rng.choice(ngrid, size=NGK, replace=False)
         gv[ik, :, 0] = cells // (ny * nz)
         gv[ik, :, 1] = (cells // nz) % ny
         gv[ik, :, 2] = cells % nz
-        bidx[ik, gv[ik, :, 0], gv[ik, :, 1], gv[ik, :, 2]] = np.arange(NGK)
+        bidx[ik] = cells
 
     # Orthonormal ψ per k: QR over the (spinor⊗G) index so |ψ|² integrates
     # to 1 per band and the electron-count check means something.

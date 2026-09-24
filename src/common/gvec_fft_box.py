@@ -38,10 +38,9 @@ This module owns TWO things that must not drift apart:
    sentinel cell in ANY row, padded or not — max ``|G|`` per axis runs
    ``(8, 8, 27)`` against a corner at ``(15, 15, 60)``, and similar.
 
-2. **The gather index.**  See ``GVEC_FFT_BOX_GATHER.md``.  For each k-point
-   a lookup table maps every ``(nx, ny, nz)`` FFT-box cell to the ``g``-index
-   within that k's coefficient slab (or ``ngkmax`` if the cell has no
-   coefficient).  Device-side gathers and FFTs belong to
+2. **The sphere index.**  For each k-point and each coefficient slot ``g``,
+   the flat FFT-box cell that G occupies (``n_rtot + g`` on a pad slot).
+   Box order is computed from it; there is no dense box-sized table.  Device-side gathers and FFTs belong to
    :mod:`common.wfn_transforms`; this module owns only their host-built index
    and padded-G representation.
 
@@ -53,7 +52,7 @@ Public API
 ``refuse_padded_gvecs_without_mask``
                               — the consumer-side detector for a padded
                                 list that lost its mask.
-``build_g_index_for_fft_box`` — host-side precompute, once per WFN.
+``build_sphere_box_index``    — the per-k sphere → flat box cell list.
 
 Everything here is pure numpy: the pad sentinel, padded-table build and
 inverse index are host-side facts about an FFT grid.  A host-side producer
@@ -74,7 +73,7 @@ __all__ = [
     "pad_mask",
     "pad_gvecs_to_sentinel",
     "refuse_padded_gvecs_without_mask",
-    "build_g_index_for_fft_box",
+    "build_sphere_box_index",
 ]
 
 
@@ -213,7 +212,7 @@ def pad_gvecs_to_sentinel(
     ``common.coulomb_sphere`` on per-q cutoff spheres; ψ calls it from
     ``wfn_loader.WfnLoader.gvecs`` on the ragged on-disk
     ``wfns/gvecs``.  Both get the same in-memory object, so everything
-    downstream (``build_g_index_for_fft_box``, ``pad_mask``,
+    downstream (``build_sphere_box_index``, ``pad_mask``,
     ``psp.dft_operators.padded_gvectors``) is written once.
 
     Parameters
@@ -408,19 +407,25 @@ def refuse_padded_gvecs_without_mask(
 #  The gather index
 # ===========================================================================
 
-def build_g_index_for_fft_box(
+def build_sphere_box_index(
     gvecs_per_k: Sequence[np.ndarray] | np.ndarray,
     fft_grid: tuple[int, int, int],
     ngkmax: int,
     *,
     ngk_valid=None,
 ) -> np.ndarray:
-    """Precompute ``g_index[k, nx, ny, nz]``.
+    """Precompute ``sphere_index[k, g]``: the flat FFT-box cell of each G.
 
-    For each k and each FFT-box cell ``(nx, ny, nz)``, the entry is the
-    position ``g`` in ``[0, ngk[k])`` such that ``gvecs[k, g] % fft_grid
-    == (nx, ny, nz)``, or ``ngkmax`` (a sentinel used by the runtime
-    kernel to gather zero for empty cells).
+    THE one ψ(G)↔box table (loader tables 2026-09-23).  For each k and each
+    sphere slot ``g < ngk[k]`` the entry is the C-order flat cell
+    ``((Gx % nx)·ny + Gy % ny)·nz + Gz % nz``.  Pad slots ``g ≥ ngk[k]``
+    hold the DISTINCT out-of-box value ``n_rtot + g``, so a scatter with
+    ``mode='drop'`` ignores them while every index stays unique, and a
+    gather with ``mode='fill'`` returns zero there.  Box order is computed
+    from this list (scatter into the box, gather out of it); no
+    ``(nk, nx, ny, nz)`` table exists.  Cost ``nk·ngkmax·4`` bytes — the
+    sphere's share of the box (VI3 12×12: 83 MB against the retired
+    dense table's 0.80 GB).
 
     Parameters
     ----------
@@ -432,74 +437,64 @@ def build_g_index_for_fft_box(
         shapes).
     fft_grid : (nx, ny, nz)
     ngkmax : int
-        Max G-count across all k; also the empty-cell sentinel VALUE of
-        the returned table (unrelated to the pad G sentinel).
+        Width of the returned table (the ψ(G) axis it indexes).
     ngk_valid : ``(nk,)`` int, keyword-only
         Logical extent per k.  Required for the rectangular form.
 
     Returns
     -------
-    g_index : ``(nk, nx, ny, nz)`` int32
+    sphere_index : ``(nk, ngkmax)`` int32
 
     Notes
     -----
-    The scatter is **masked**, not pad-then-scatter-everything: only
-    slots ``g < ngk[k]`` are written.  The alternative — scatter all
-    ``ngkmax`` rows and let the pad rows land on the sentinel cell —
-    would let a pad row (higher ``g``, hence last writer) WIN that cell
-    and shadow a physical G sitting there.  Masking removes the ordering
-    dependence entirely; :func:`pad_gvecs_to_sentinel` separately refuses
-    tables where such a physical G exists at all.
-
-    Vectorised over k: one fancy-index scatter for the whole table, no
-    Python k-loop, no ragged ``Sequence`` in the hot path.
+    The pad mask is applied here, not at the consumer: a pad row carries the
+    FFT-box pad sentinel G, whose cell a physical G never occupies
+    (:func:`pad_gvecs_to_sentinel` refuses a table where one does), but the
+    out-of-box value makes the slot inert without relying on that.
     """
     nx, ny, nz = (int(v) for v in fft_grid)
-    # int32 throughout: Miller indices and their residues both fit, and
-    # the ``(nk, ngkmax, 3)`` wrap temporary below is the largest array
-    # this function touches besides its own output.
-    grid = np.asarray((nx, ny, nz), dtype=np.int32)
+    n_rtot = nx * ny * nz
+    grid = np.asarray((nx, ny, nz), dtype=np.int64)
 
     if isinstance(gvecs_per_k, np.ndarray) and gvecs_per_k.ndim == 3:
-        gvecs = np.asarray(gvecs_per_k, dtype=np.int32)
+        gvecs = np.asarray(gvecs_per_k, dtype=np.int64)
         if ngk_valid is None:
             raise ValueError(
-                "build_g_index_for_fft_box: a rectangular (nk, ngkmax, 3) "
+                "build_sphere_box_index: a rectangular (nk, ngkmax, 3) "
                 "gvecs table needs ngk_valid=... — its pad rows carry the "
-                "FFT-box pad sentinel, and scattering them would shadow "
-                "whatever real G shares that cell.")
+                "FFT-box pad sentinel, not a physical G.")
         ngk = np.asarray(ngk_valid, dtype=np.int64).reshape(-1)
     else:
-        rows = [np.asarray(g, dtype=np.int32).reshape(-1, 3)
+        rows = [np.asarray(g, dtype=np.int64).reshape(-1, 3)
                 for g in gvecs_per_k]
         ngk = np.asarray([r.shape[0] for r in rows], dtype=np.int64)
         width = int(ngk.max()) if len(rows) else 0
-        gvecs = np.zeros((len(rows), width, 3), dtype=np.int32)
+        gvecs = np.zeros((len(rows), width, 3), dtype=np.int64)
         for k, r in enumerate(rows):
             gvecs[k, :r.shape[0]] = r
 
     nk, width = int(gvecs.shape[0]), int(gvecs.shape[1])
     if nk != int(ngk.shape[0]):
         raise ValueError(
-            f"build_g_index_for_fft_box: {nk} k-rows but ngk_valid has "
+            f"build_sphere_box_index: {nk} k-rows but ngk_valid has "
             f"{int(ngk.shape[0])} entries")
     if nk and int(ngk.max()) > int(ngkmax):
         bad = int(np.argmax(ngk))
         raise ValueError(
             f"k={bad}: ngk={int(ngk[bad])} > ngkmax={int(ngkmax)}")
+    if n_rtot + int(ngkmax) >= 2**31:
+        raise ValueError(
+            f"build_sphere_box_index: n_rtot + ngkmax = {n_rtot + int(ngkmax)} "
+            "overflows the int32 table")
 
-    g_index = np.full((nk, nx, ny, nz), int(ngkmax), dtype=np.int32)
+    out = np.broadcast_to(
+        n_rtot + np.arange(int(ngkmax), dtype=np.int64)[None, :],
+        (nk, int(ngkmax))).copy()
     if nk == 0 or width == 0:
-        return g_index
-
-    wrapped = gvecs % grid[None, None, :]                  # (nk, width, 3)
-    valid = pad_mask(ngk, width)                           # (nk, width) bool
-    k_of = np.broadcast_to(
-        np.arange(nk, dtype=np.int32)[:, None], (nk, width))
-    g_of = np.broadcast_to(
-        np.arange(width, dtype=np.int32)[None, :], (nk, width))
-    g_index[k_of[valid],
-            wrapped[..., 0][valid],
-            wrapped[..., 1][valid],
-            wrapped[..., 2][valid]] = g_of[valid]
-    return g_index
+        return out.astype(np.int32)
+    w = min(width, int(ngkmax))
+    wrapped = gvecs[:, :w] % grid[None, None, :]
+    flat = (wrapped[..., 0] * ny + wrapped[..., 1]) * nz + wrapped[..., 2]
+    valid = pad_mask(ngk, w)
+    out[:, :w] = np.where(valid, flat, out[:, :w])
+    return out.astype(np.int32)

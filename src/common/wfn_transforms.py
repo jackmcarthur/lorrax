@@ -160,39 +160,77 @@ def _resolve_gindex_dev(g_index):
 
 
 # ---------------------------------------------------------------------------
-# Shared kernel: G-flat ψ + g_index → FFT-box ψ (zero-sentinel gather)
+# Shared kernels: G-flat ψ ↔ FFT box through the per-k sphere index
 # ---------------------------------------------------------------------------
 #
-# ``common.gvec_fft_box`` owns the host-built inverse index; this is the sole
-# device gather that consumes it.  For each FFT-box cell (nx, ny, nz),
-# ``g_index[k, nx, ny, nz]`` gives the position along the G-axis of psi
-# to gather from; positions equal to ``ngkmax`` map to a synthetic
-# zero slot appended on the G-axis before the gather.  One ``take``
-# call fills the whole box; no per-k loop, no scatter, no per-cell
-# masking.
+# ``common.gvec_fft_box.build_sphere_box_index`` owns the host-built table:
+# ``sphere_index[k, g]`` is the flat C-order box cell of sphere slot ``g`` at
+# k, and ``n_rtot + g`` (distinct, out of the box) on a pad slot.  It is THE
+# one ψ(G)↔box table that is stored, passed and cached.  Box order is computed
+# from it inside each executable: a 1-D int32 unique scatter builds this
+# call's ``(n_k, n_rtot)`` inverse, and the established zero-sentinel gather
+# fills the box from it.  Values are copies, so the box — and every
+# transform of it — is bit-identical to the retired persistent table's.
+# ponytail: one stored table format for every consumer; the inverse is
+# rebuilt per call (a transient ``n_k·n_rtot·4`` bytes inside the kernel,
+# never a retained replicated buffer).  Scattering the complex ψ directly
+# was measured 14 600× slower than the gather on this XLA/GPU build
+# (runs/runtime/loader_tables_20260923/b01, b02), so it is not used.
 
-def _box_kernel(psi: jax.Array, g_index: jax.Array, *, ngkmax: int) -> jax.Array:
-    """psi: (n_k, nb, ns, ngkmax) c128 — band-sharded acceptable; see docs/architecture/zeta_fit_face_psi_cct.md."""
-    n_k, nb, ns, _ = psi.shape
-    k_stride = ngkmax + 1
-    # Append a zero slot on the G-axis so sentinel index `ngkmax`
-    # gathers zero.
+def _sphere_inverse(sphere_index: jax.Array, n_rtot: int) -> jax.Array:
+    """Per-call box → sphere-slot inverse ``(n_k, n_rtot)`` int32 (``ngk`` = empty)."""
+    ngk = int(sphere_index.shape[-1])
+    slots = jnp.arange(ngk, dtype=jnp.int32)
+    return jax.vmap(lambda i: jnp.full((int(n_rtot),), ngk, jnp.int32).at[i].set(
+        slots, mode='drop', unique_indices=True))(sphere_index)
+
+
+def _gather_box(psi: jax.Array, inverse: jax.Array, *,
+                fft_grid: Sequence[int]) -> jax.Array:
+    """ψ(G) ``(n_k, nb, ns, ngk)`` + inverse ``(n_k, n_rtot)`` → box."""
+    n_k, nb, ns, ngk = (int(v) for v in psi.shape)
+    grid = tuple(int(v) for v in fft_grid)
+    k_stride = ngk + 1
     zero = jnp.zeros((n_k, nb, ns, 1), dtype=psi.dtype)
-    psi_padded = jnp.concatenate([psi, zero], axis=-1)            # (..., ngkmax+1)
-    # Move (nb, ns) to the front so the gather indexes the (k, g) plane.
-    psi_t = jnp.transpose(psi_padded, (1, 2, 0, 3))               # (nb, ns, n_k, ngkmax+1)
+    psi_t = jnp.transpose(jnp.concatenate([psi, zero], axis=-1), (1, 2, 0, 3))
     psi_flat = psi_t.reshape(nb, ns, n_k * k_stride)
-    # Per-cell flat index combining k and g.
-    flat_index = (
-        jnp.arange(n_k, dtype=jnp.int32)[:, None, None, None] * k_stride
-        + g_index)                                                # (n_k, nx, ny, nz)
-    # ``mode='clip'`` skips the OOB ``_where`` mask jnp.take inserts under
-    # the default ``mode='fill'``.  By construction ``flat_index`` is in
-    # range (psi was padded with a zero slot at index ``ngkmax``), so the
-    # clip is a no-op on the values — and avoids the per-shape ``_where``
-    # retraces (8 cache misses in MoS2 3×3 profile before this change).
-    gathered = jnp.take(psi_flat, flat_index, axis=2, mode='clip')  # (nb, ns, n_k, nx, ny, nz)
-    return jnp.transpose(gathered, (2, 0, 1, 3, 4, 5))
+    flat_index = (jnp.arange(n_k, dtype=jnp.int32)[:, None] * k_stride
+                  + inverse)                                   # (n_k, n_rtot)
+    # ``mode='clip'``: every index is in range by construction (the zero
+    # slot sits at ``ngk``), and clip skips take's fill mask.
+    gathered = jnp.take(psi_flat, flat_index, axis=2, mode='clip')
+    return jnp.transpose(gathered, (2, 0, 1, 3)).reshape(n_k, nb, ns, *grid)
+
+
+def _box_kernel(psi: jax.Array, sphere_index: jax.Array, *,
+                fft_grid: Sequence[int]) -> jax.Array:
+    """ψ(G) ``(n_k, nb, ns, ngk)`` → box ``(n_k, nb, ns, nx, ny, nz)``.
+
+    ``sphere_index`` ``(n_k, ngk)`` int32 (see the block comment above).
+    Band-sharded ``psi`` is acceptable: nothing crosses the band axis.
+    """
+    n_k, _, _, ngk = (int(v) for v in psi.shape)
+    if tuple(int(v) for v in sphere_index.shape) != (n_k, ngk):
+        raise ValueError(
+            f"_box_kernel: sphere_index {tuple(sphere_index.shape)} does not "
+            f"index ψ {tuple(psi.shape)}; want ({n_k}, {ngk}).")
+    n_rtot = int(np.prod([int(v) for v in fft_grid]))
+    return _gather_box(psi, _sphere_inverse(sphere_index, n_rtot),
+                       fft_grid=fft_grid)
+
+
+def _sphere_gather(box: jax.Array, sphere_index: jax.Array) -> jax.Array:
+    """Box ``(n_k, nb, ns, nx, ny, nz)`` → sphere ``(n_k, nb, ns, ngk)``.
+
+    The inverse of :func:`_box_kernel` on its image: pad slots read zero.
+    """
+    n_k, nb, ns = (int(v) for v in box.shape[:3])
+    flat = box.reshape(n_k, nb, ns, -1)
+
+    def one_k(b, idx):
+        return jnp.take(b, idx, axis=-1, mode='fill', fill_value=0)
+
+    return jax.vmap(one_k)(flat, sphere_index)
 
 
 # ---------------------------------------------------------------------------
@@ -285,7 +323,7 @@ def to_box(
     def build():
         @jax.jit
         def fn(psi_, g_index_):
-            out = _box_kernel(psi_, g_index_, ngkmax=ngkmax)
+            out = _box_kernel(psi_, g_index_, fft_grid=fft_grid_t)
             return _maybe_constrain(out, out_sharding)
         return fn
 
@@ -317,12 +355,12 @@ def to_rbox(
         if kvecs_frac is None:
             @jax.jit
             def fn(psi_, g_index_):
-                box = _box_kernel(psi_, g_index_, ngkmax=ngkmax)
+                box = _box_kernel(psi_, g_index_, fft_grid=fft_grid_t)
                 return _maybe_constrain(ifftn(box), out_sharding)
             return fn
         @jax.jit
         def fn(psi_, g_index_, kvecs_):
-            box = _box_kernel(psi_, g_index_, ngkmax=ngkmax)
+            box = _box_kernel(psi_, g_index_, fft_grid=fft_grid_t)
             rb = apply_bloch_phase(ifftn(box), kvecs_, fft_grid_t)
             return _maybe_constrain(rb, out_sharding)
         return fn
@@ -412,13 +450,13 @@ def to_rmu(
         if kvecs_frac is None:
             @jax.jit
             def fn(psi_, g_index_, r_mu_):
-                rb = ifftn(_box_kernel(psi_, g_index_, ngkmax=ngkmax))
+                rb = ifftn(_box_kernel(psi_, g_index_, fft_grid=fft_grid_t))
                 out = rb[:, :, :, r_mu_[:, 0], r_mu_[:, 1], r_mu_[:, 2]]
                 return _maybe_constrain(out, out_sharding)
             return fn
         @jax.jit
         def fn(psi_, g_index_, r_mu_, kvecs_):
-            rb = ifftn(_box_kernel(psi_, g_index_, ngkmax=ngkmax))
+            rb = ifftn(_box_kernel(psi_, g_index_, fft_grid=fft_grid_t))
             rb = apply_bloch_phase(rb, kvecs_, fft_grid_t)
             out = rb[:, :, :, r_mu_[:, 0], r_mu_[:, 1], r_mu_[:, 2]]
             return _maybe_constrain(out, out_sharding)
@@ -514,30 +552,52 @@ def _tile_plane_slots(r_idx, planes, fft_grid, axis: int):
 def psi_cylinder_tables(g_index, fft_grid, axis: int, *, ngkmax: int):
     """The ψ sphere's cylinder: the (b,c) columns and axis coordinates it occupies.
 
-    ``g_index`` is the ``(nk, nx, ny, nz)`` box → sphere-slot table
-    (``ngkmax`` = empty).  Returns ``(cyl_index (nk, n_col, n_s) int32,
-    cyl_axis (n_s,) int32, plane_from_col (n_b·n_c,) int32)``: sphere slot
-    of column ``col``, axis coordinate ``cyl_axis[s]`` (``ngkmax`` where the
-    sphere of that k has no point), and the column of each in-plane cell
-    (``n_col`` = none).  Columns and coordinates are the union over k, so
-    one static shape serves every k row.  Built once per fit.
+    ``g_index`` is the ``(nk, ngkmax)`` per-k sphere index
+    (:func:`common.gvec_fft_box.build_sphere_box_index`; ``≥ n_rtot`` =
+    pad).  Returns ``(cyl_index (nk, n_col, n_s) int32, cyl_axis (n_s,)
+    int32, plane_from_col (n_b·n_c,) int32)``: sphere slot of column
+    ``col``, axis coordinate ``cyl_axis[s]`` (``ngkmax`` where the sphere of
+    that k has no point), and the column of each in-plane cell (``n_col`` =
+    none).  Columns and coordinates are the union over k, so one static
+    shape serves every k row.  Built once per fit, from the sphere list
+    alone: the only box-plane-sized tables are the ``(n_b·n_c,)`` and
+    ``(n_a,)`` occupancy masks.
     """
-    n_a, (n_b, n_c), (b, c) = _plane_geometry(fft_grid, axis)
-    g = jnp.asarray(g_index, dtype=jnp.int32)
-    occ = g < int(ngkmax)                                     # (nk, nx, ny, nz)
-    ax = 1 + int(axis)
-    col_mask = np.asarray(jax.device_get(jnp.any(occ, axis=(0, ax))))
+    n_a, (n_b, n_c), _ = _plane_geometry(fft_grid, axis)
+    n_rtot = int(np.prod(fft_grid))
+    idx = jnp.asarray(g_index, dtype=jnp.int32)               # (nk, ngk)
+    nk, ngk = (int(v) for v in idx.shape)
+    if ngk != int(ngkmax):
+        raise ValueError(
+            f"psi_cylinder_tables: sphere index width {ngk} != ngkmax "
+            f"{int(ngkmax)}")
+    valid = idx < n_rtot
+    a, inp = plane_split(jnp.where(valid, idx, 0), fft_grid, axis)
+    col_mask = np.asarray(jax.device_get(
+        jnp.zeros((n_b * n_c,), jnp.bool_).at[
+            jnp.where(valid, inp, n_b * n_c)].set(True, mode='drop')))
     s_mask = np.asarray(jax.device_get(
-        jnp.any(occ, axis=tuple(i for i in range(4) if i != ax))))
-    cols = np.flatnonzero(col_mask.reshape(-1)).astype(np.int32)   # (n_col,)
-    cyl_axis = np.flatnonzero(s_mask).astype(np.int32)              # (n_s,)
-    # (nk, n_b, n_c, n_a) with the plane axis last, then the cylinder.
-    g_t = jnp.moveaxis(g, ax, -1).reshape(g.shape[0], n_b * n_c, n_a)
-    cyl_index = jnp.take(jnp.take(g_t, jnp.asarray(cols), axis=1),
-                         jnp.asarray(cyl_axis), axis=2)
-    plane_from_col = np.full((n_b * n_c,), cols.size, dtype=np.int32)
-    plane_from_col[cols] = np.arange(cols.size, dtype=np.int32)
-    return cyl_index, jnp.asarray(cyl_axis), jnp.asarray(plane_from_col)
+        jnp.zeros((n_a,), jnp.bool_).at[
+            jnp.where(valid, a, n_a)].set(True, mode='drop')))
+    cols = np.flatnonzero(col_mask).astype(np.int32)              # (n_col,)
+    cyl_axis = np.flatnonzero(s_mask).astype(np.int32)            # (n_s,)
+    n_col, n_s = int(cols.size), int(cyl_axis.size)
+    plane_from_col = np.full((n_b * n_c,), n_col, dtype=np.int32)
+    plane_from_col[cols] = np.arange(n_col, dtype=np.int32)
+    s_from_axis = np.full((n_a,), n_s, dtype=np.int32)
+    s_from_axis[cyl_axis] = np.arange(n_s, dtype=np.int32)
+    # Scatter each sphere slot into its (col, s) cell; pads go to distinct
+    # out-of-range cells, so every index stays unique.
+    cell = (jnp.take(jnp.asarray(plane_from_col), inp) * n_s
+            + jnp.take(jnp.asarray(s_from_axis), a))
+    cell = jnp.where(valid, cell,
+                     n_col * n_s + jnp.arange(ngk, dtype=jnp.int32)[None, :])
+    slots = jnp.broadcast_to(jnp.arange(ngk, dtype=jnp.int32), (nk, ngk))
+    cyl_index = jax.vmap(
+        lambda c, v: jnp.full((n_col * n_s,), int(ngkmax), jnp.int32).at[c].set(
+            v, mode='drop', unique_indices=True))(cell, slots)
+    return (cyl_index.reshape(nk, n_col, n_s), jnp.asarray(cyl_axis),
+            jnp.asarray(plane_from_col))
 
 
 def to_rpoints_planes_inner(
@@ -609,7 +669,7 @@ def to_rchunk_inner(
     n_rtot = nx * ny * nz
     r_len_i = int(r_len)
 
-    box = _box_kernel(psi, g_index, ngkmax=ngkmax)
+    box = _box_kernel(psi, g_index, fft_grid=fft_grid_t)
     rb = local_ifftn3(box, axes=(-3, -2, -1), norm=norm)
     # Reshape (..., nx, ny, nz) → (..., n_rtot).  Same contract as
     # to_rchunk._local_rchunk: assumes 3 leading axes before the spatial.
@@ -696,7 +756,7 @@ def to_rpoints_inner(
     nx, ny, nz = fft_grid_t
     n_rtot = nx * ny * nz
 
-    box = _box_kernel(psi, g_index, ngkmax=ngkmax)
+    box = _box_kernel(psi, g_index, fft_grid=fft_grid_t)
     rb = local_ifftn3(box, axes=(-3, -2, -1), norm=norm)
     # Reshape (..., nx, ny, nz) → (..., n_rtot), then gather the tile's
     # own cells.  Same 3-leading-axes contract as to_rchunk_inner.
@@ -785,7 +845,7 @@ def to_rchunk(
             @partial(
                 shard_map,
                 mesh=mesh,
-                in_specs=(psi_spec, P(None, None, None, None), P()),
+                in_specs=(psi_spec, P(None, None), P()),
                 out_specs=P(*out_spec),
                 check_vma=False,
             )
@@ -801,7 +861,7 @@ def to_rchunk(
         @partial(
             shard_map,
             mesh=mesh,
-            in_specs=(psi_spec, P(None, None, None, None), P(),
+            in_specs=(psi_spec, P(None, None), P(),
                       P(None, None)),
             out_specs=P(*out_spec),
             check_vma=False,
@@ -870,14 +930,14 @@ def gflat_to_rchunk_aot_memory(
         return hit
 
     psi_sharding = NamedSharding(mesh, band_sphere_spec())
-    gindex_sharding = NamedSharding(mesh, P(None, None, None, None))
+    gindex_sharding = NamedSharding(mesh, P(None, None))
     kvec_sharding = NamedSharding(mesh, P(None, None))
     rep = NamedSharding(mesh, P())
 
     @partial(
         shard_map,
         mesh=mesh,
-        in_specs=(band_sphere_spec(), P(None, None, None, None), P(),
+        in_specs=(band_sphere_spec(), P(None, None), P(),
                   P(None, None)),
         out_specs=band_sphere_spec(),
         check_vma=False,
@@ -897,7 +957,7 @@ def gflat_to_rchunk_aot_memory(
             (nk, band_carrier, nspinor, ngkmax), dtype,
             sharding=psi_sharding),
         jax.ShapeDtypeStruct(
-            (nk, *fft_grid_t), jnp.int32, sharding=gindex_sharding),
+            (nk, ngkmax), jnp.int32, sharding=gindex_sharding),
         jax.ShapeDtypeStruct((), jnp.int32, sharding=rep),
         jax.ShapeDtypeStruct((nk, 3), jnp.float64, sharding=kvec_sharding),
     )
@@ -969,7 +1029,7 @@ def to_rmu_inner(
     """Per-rank-local body of :func:`to_rmu`: G-flat → FFT-box → IFFT → centroid sample → optional Bloch phase; see docs/architecture/zeta_fit_face_psi_cct.md."""
     ngkmax = int(psi.shape[-1])
     fft_grid_t = tuple(int(s) for s in fft_grid)
-    box = _box_kernel(psi, g_index, ngkmax=ngkmax)
+    box = _box_kernel(psi, g_index, fft_grid=fft_grid_t)
     rb = local_ifftn3(box, axes=(-3, -2, -1), norm=norm)
     if kvecs_frac is not None:
         rb = apply_bloch_phase(rb, kvecs_frac, fft_grid_t)
@@ -1036,14 +1096,10 @@ def gflat_to_rmu(
     # without a device→host roundtrip.  Validation uses ``.shape`` /
     # ``.ndim`` (both supported by numpy and jax.Array natively).
     g_shape = tuple(int(s) for s in np.shape(g_index))
-    if len(g_shape) != 4 or g_shape[0] != nk:
+    if g_shape != (nk, int(psi_G.shape[-1])):
         raise ValueError(
-            f"gflat_to_rmu: g_index must be (nk, nx, ny, nz); got "
-            f"shape {g_shape}, expected nk={nk}.")
-    if g_shape[1:] != fft_grid_t:
-        raise ValueError(
-            f"gflat_to_rmu: g_index trailing shape {g_shape[1:]} "
-            f"≠ fft_grid {fft_grid_t}.")
+            f"gflat_to_rmu: the sphere index must be (nk, ngkmax) = "
+            f"{(nk, int(psi_G.shape[-1]))}; got {g_shape}.")
 
     # Retain the eager caller guard without forcing a device→host roundtrip
     # when the canonical producer already supplies a jax.Array.  Device
@@ -1134,13 +1190,15 @@ def gflat_to_rmu(
         # the same buffer and ensures both sides share the canonical
         # WfnLoader-cached device allocation.
         in_spec  = band_sphere_spec()
-        gidx_spec = P(None, None, None, None)
+        gidx_spec = P(None, None)
         rmu_spec = P(None, None)
         kvec_spec = P(None, None)
         out_spec = band_sphere_spec()
 
         def _body(psi_, g_index_, r_mu_, kvecs_, k_row_map_):
-            # Per-rank: (nk, nb_local, ns, ngkmax).
+            # Per-rank: (nk, nb_local, ns, ngkmax).  The box order of every
+            # k row is computed once here, outside the row scan.
+            inv_ = _sphere_inverse(g_index_, nx * ny * nz)
             psi_flat = psi_.reshape(N, ns, ngkmax)
             if pad_N:
                 psi_flat = jnp.pad(
@@ -1173,11 +1231,11 @@ def gflat_to_rmu(
                                 else k_row_map_[k_row])
                 # Singleton-nb reshape so _box_kernel's (n_k, nb, ns,
                 # ngkmax) contract takes (cs, 1, ns, ngkmax) per row.
-                # Per-row g_index gather: (cs, nx, ny, nz).
+                # Per-row sphere-index gather: (cs, ngkmax).
                 sub4 = sub.reshape(cs, 1, ns, ngkmax)
-                g_per_row = g_index_[mapped_k_row]
-                box = _box_kernel(
-                    sub4, g_per_row, ngkmax=ngkmax)      # (cs, 1, ns, nx, ny, nz)
+                g_per_row = inv_[mapped_k_row]         # (cs, n_rtot)
+                box = _gather_box(
+                    sub4, g_per_row, fft_grid=fft_grid_t)  # (cs, 1, ns, nx, ny, nz)
                 box = box.reshape(cs, ns, nx, ny, nz)
                 rb = local_ifftn3(box, axes=(-3, -2, -1), norm=norm)
                 # Centroid gather — (cs, ns, n_rmu).
@@ -2204,8 +2262,8 @@ def _centroid_resident_bytes(
         # All terms remain bounded by one symmetry star, never O(nk).
         parent_stream_extra_bytes += (
             int(loader.ngkmax) * 40
-            + max_parent_star * n_rtot * 4
-            + n_rtot * 4)
+            + max_parent_star * int(loader.ngkmax) * 4
+            + int(loader.ngkmax) * 4)
         if bispinor:
             # The fused child-G transform/kinetic-balance lift needs one
             # float64 Cartesian momentum row. It is device-local and never

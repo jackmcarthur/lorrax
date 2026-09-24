@@ -359,7 +359,7 @@ class WfnLoader:
         # ``(k_set, fft_grid)`` only — identical across charge + transverse
         # bispinor channels and across V_q tiles.  Caching the device copy
         # here (not in ``psi_G_store._g_index_dev``, which dies with each
-        # ``fit_zeta_to_h5`` instance) deduplicates the (nk, nx, ny, nz)
+        # ``fit_zeta_to_h5`` instance) deduplicates the (nk, ngkmax) sphere
         # int32 buffer across the full GW pipeline.  Pre-fix:
         # ``jax.device_put`` allocated a fresh REPLICATED buffer per
         # ``psi_G_store`` construction → 1 buffer/channel × 4 channels =
@@ -1112,31 +1112,26 @@ class WfnLoader:
     # G-flat → FFT-box index (zero-sentinel gather table)
     # ------------------------------------------------------------------
     def box_index(self, *, k: KSpec = "full_bz") -> np.ndarray:
-        """Return ``(n_k, nx, ny, nz)`` int32 — for each FFT-box cell, the
-        index along the ψ(G) axis to gather from.  Empty cells take the
-        sentinel value ``ngkmax``; downstream transforms append a zero
-        slot at that position so empty cells gather zero (see
-        :func:`common.wfn_transforms.to_box`).
+        """Return ``(n_k, ngkmax)`` int32 — the per-k sphere index.
 
-        Cached per (k-set, ``self.fft_grid``).  Reuses
-        :func:`common.gvec_fft_box.build_g_index_for_fft_box` so the
-        algorithm lives in one place — and hands it the loader's OWN
-        rectangular ``(n_k, ngkmax, 3)`` table plus ``ngk_valid``, so the
-        builder does a masked scatter with no ragged Python k-loop
-        between the two.
+        Entry ``[k, g]`` is the flat C-order FFT-box cell of sphere slot
+        ``g``; pad slots hold the distinct out-of-box value ``n_rtot + g``.
+        THE one ψ(G)↔box table
+        (:func:`common.gvec_fft_box.build_sphere_box_index`): every
+        transform computes box order from it, and no ``(n_k, nx, ny, nz)``
+        table exists (loader tables 2026-09-23; the retired dense gather
+        table cost ``n_k·n_rtot·4`` bytes, 0.80 GB at VI3 12×12).
+
+        Cached per (k-set, ``self.fft_grid``).
         """
-        # ``fft_grid`` is in the key because the g_index is a function of
-        # (k-set, fft_grid) and the docstring above has always said so —
-        # it just wasn't true.  A loader's ``fft_grid`` is read-only in
-        # practice, so this has never fired; it costs one tuple.
         cache_key = ("box_index", *self._k_cache_key(k),
                      tuple(int(s) for s in self.fft_grid))
         if cache_key in self._gvecs_cache:
             return self._gvecs_cache[cache_key]
 
-        from common.gvec_fft_box import build_g_index_for_fft_box
+        from common.gvec_fft_box import build_sphere_box_index
 
-        g_index = build_g_index_for_fft_box(
+        g_index = build_sphere_box_index(
             self.gvecs(k=k), tuple(int(s) for s in self.fft_grid),
             int(self.ngkmax), ngk_valid=self.ngk_valid(k=k))
         self._gvecs_cache[cache_key] = g_index
@@ -1149,8 +1144,8 @@ class WfnLoader:
         mesh: "Mesh | None" = None,
         sharding: "NamedSharding | PartitionSpec | None" = None,
     ) -> "jax.Array":
-        """Return ``box_index(k=k)`` as a REPLICATED ``jax.Array`` on
-        ``mesh`` — but only do the ``device_put`` once per ``(k, mesh)``.
+        """Return ``box_index(k=k)`` — the ``(n_k, ngkmax)`` sphere index — as
+        a REPLICATED ``jax.Array`` on ``mesh``, placed once per ``(k, mesh)``.
 
         Fixes the sphere-idx replicated leak (agent_h §3 Finding 3):
         every fresh ``psi_G_store._populate_from_loader`` used to call
@@ -1175,7 +1170,7 @@ class WfnLoader:
             fallback for a sharding-aware accessor.
         sharding : NamedSharding | PartitionSpec, optional
             For callers that need a non-default replicated layout.
-            Default ``None`` ⇒ ``NamedSharding(mesh, P(None, None, None, None))``
+            Default ``None`` ⇒ ``NamedSharding(mesh, P(None, None))``
             (the only layout used in production; centralised here so
             future shape changes (e.g. 5-D ψ for bispinor) update one
             site instead of three).
@@ -1195,7 +1190,7 @@ class WfnLoader:
             return self._gvecs_dev_cache[cache_key]
         # Resolve the requested sharding (default = replicated 4-axis).
         if sharding is None:
-            sharding = NamedSharding(mesh, P(None, None, None, None))
+            sharding = NamedSharding(mesh, P(None, None))
         elif isinstance(sharding, P):
             sharding = NamedSharding(mesh, sharding)
         # Process-local placement (``common.collectives``): every rank
@@ -1366,7 +1361,7 @@ class WfnLoader:
         ``"full_bz"``: that would retain both ``O(nk*ngkmax)`` host G vectors
         and an ``O(nk*n_r)`` replicated device index. This door instead
         reuses the loader's single parent-G slot and returns only
-        ``(1,nx,ny,nz)`` for the requested child.
+        ``(1, ngkmax)`` for the requested child.
         """
         if self._mesh is None:
             raise ValueError(
@@ -2268,7 +2263,12 @@ def _parent_box_index_kernel(
     fft_grid: tuple[int, int, int],
     ngkmax: int,
 ):
-    """One child's replicated FFT gather index from one parent G row."""
+    """One child's replicated ``(1, ngkmax)`` sphere index from one parent G row.
+
+    The same table :func:`common.gvec_fft_box.build_sphere_box_index` builds
+    on host: the flat box cell of each rotated G, ``n_rtot + g`` on a pad
+    slot.
+    """
     from symmetry_maps import unfold_reciprocal_carriers
 
     fft_grid = tuple(int(v) for v in fft_grid)
@@ -2283,22 +2283,15 @@ def _parent_box_index_kernel(
         gz = jnp.mod(g_child[:, 2], fft_grid[2])
         cells = (gx * (fft_grid[1] * fft_grid[2])
                  + gy * fft_grid[2] + gz)
-        valid = jnp.arange(ngkmax, dtype=jnp.int32) < ngk_child
-        # Pad carriers are sent out of bounds and dropped. Physical reciprocal
-        # vectors occupy unique FFT cells by the WFN contract, licensing the
-        # parallel unique-scatter lowering instead of a scalar update loop.
-        cells = jnp.where(valid, cells, jnp.int32(n_rtot))
-        values = jnp.arange(ngkmax, dtype=jnp.int32)
-        flat = jnp.full((n_rtot,), ngkmax, dtype=jnp.int32)
-        flat = flat.at[cells].set(
-            values, mode="drop", unique_indices=True)
-        return flat.reshape((1, *fft_grid))
+        slot = jnp.arange(ngkmax, dtype=jnp.int32)
+        cells = jnp.where(slot < ngk_child, cells, jnp.int32(n_rtot) + slot)
+        return cells.astype(jnp.int32).reshape(1, ngkmax)
 
     return jax.jit(shard_map(
         _per_rank,
         mesh=mesh,
         in_specs=(P(None, None), P(None, None), P(None), P()),
-        out_specs=P(None, None, None, None),
+        out_specs=P(None, None),
         check_vma=False,
     ))
 

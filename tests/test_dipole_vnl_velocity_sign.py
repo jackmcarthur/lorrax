@@ -134,12 +134,13 @@ def _fixture(seed=3):
     rng = np.random.default_rng(seed)
     nx, ny, nz = GRID
     gv = np.zeros((NK, NGKMAX, 3), dtype=np.int32)
-    bidx = np.zeros((NK,) + GRID, dtype=np.int32)
     for ik in range(NK):
         cells = rng.choice(nx * ny * nz, size=NGK, replace=False)
         for i, c in enumerate(cells):
             gv[ik, i] = [c // (ny * nz), (c // nz) % ny, c % nz]
-            bidx[ik, gv[ik, i, 0], gv[ik, i, 1], gv[ik, i, 2]] = i
+    from common.gvec_fft_box import build_sphere_box_index
+    bidx = build_sphere_box_index(gv, GRID, NGKMAX,
+                                  ngk_valid=np.full(NK, NGK))
     gmask = np.zeros((NK, NGKMAX), dtype=np.float64)
     gmask[:, :NGK] = 1.0
     psi = (rng.standard_normal((NK, NB, NS, NGKMAX))

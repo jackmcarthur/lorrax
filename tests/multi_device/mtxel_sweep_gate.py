@@ -91,12 +91,13 @@ def main():
     # ---- deterministic inputs, identical on every rank -------------------
     rng = np.random.default_rng(20260804)
     gv = np.zeros((NK, ngkmax, 3), dtype=np.int32)
-    bidx = np.full((NK, nx, ny, nz), ngkmax, dtype=np.int32)
     for ik in range(NK):
         cells = rng.choice(nx * ny * nz, size=NGK, replace=False)
         for i, c in enumerate(cells):
             gv[ik, i] = [c // (ny * nz), (c // nz) % ny, c % nz]
-            bidx[ik, gv[ik, i, 0], gv[ik, i, 1], gv[ik, i, 2]] = i
+    from common.gvec_fft_box import build_sphere_box_index
+    bidx = build_sphere_box_index(gv, GRID, ngkmax,
+                                  ngk_valid=np.full(NK, NGK))
     gmask = np.zeros((NK, ngkmax), dtype=np.float64)
     gmask[:, :NGK] = 1.0
 
