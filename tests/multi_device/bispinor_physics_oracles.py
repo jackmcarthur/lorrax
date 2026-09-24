@@ -145,6 +145,12 @@ def _cpu_algebra(monkeypatch):
         return lambda x: jnp.fft.ifftn(x.reshape(tuple(grid)+x.shape[1:]),
             axes=(0, 1, 2), norm=norm).reshape(x.shape)
     monkeypatch.setattr(fft, 'make_flat_k_ifftn', inverse)
+    import ffi.fft as router
+    def local(mesh, grid, *, kind, norm='ortho'):
+        op = jnp.fft.fftn if kind == 'fftn' else jnp.fft.ifftn
+        return lambda x: op(x.reshape(tuple(grid)+x.shape[1:]),
+            axes=(0, 1, 2), norm=norm).reshape(x.shape)
+    monkeypatch.setattr(router, 'make_local_kfft_klead', local)
 
 
 def _chi_literal(left, right, gamma, tau, energies):
@@ -275,13 +281,15 @@ def test_parent_sigma_all_vertices_q_convolution_and_projection(monkeypatch):
             hs = np.einsum('ac,kcmdv,db->kambv',gamma[a],
                 -green*head[0][None,None,:,None,:]/9,gamma[b])
             head_full += np.einsum('kiam,kambv,kjbv->kij',child.conj(),hs,child)
-        kernel = _make_photon_static_class_kernel(mesh,(3,3,1),9,wfns,wfns,with_head=True)
+        kernel = _make_photon_static_class_kernel(mesh,(3,3,1),9,wfns,wfns,keys,with_head=True)
         vertices = jax.tree.map(lambda *x:jnp.stack(x),
             *((gamma_perm_phase(a),gamma_perm_phase(b)) for a,b in keys))
+        # The class operand is (nk, mx, nA, my, nB), blocks A-major.
+        stacked = np.array(blocks).reshape(len(aa),len(bb),*interaction.shape).transpose(2,3,0,4,1)
         for factor in (1.,-.5):
             actual, actual_head = kernel(carrier,carrier,jnp.asarray(weight),
-                put(np.array(blocks),P(None,None,'x','y')),jnp.array(factor),vertices,
-                put(np.array(heads),P(None,None,'x','y')))
+                put(stacked,P(None,'x',None,'y',None)),jnp.array(factor),
+                put(np.array(heads),P(None,None,'x','y')),vertices)
             np.testing.assert_allclose(actual,factor*full[plan.parent_full_rows],rtol=3e-12,atol=3e-12,err_msg=f'Sigma {keys}')
             np.testing.assert_allclose(actual_head,factor*head_full[plan.parent_full_rows],rtol=3e-12,atol=3e-12)
 
@@ -505,13 +513,13 @@ def test_full_band_unfold_matches_literal_sigma_on_symmetric_complete_toy(monkey
     wfns = SimpleNamespace(green_parent=carrier)
     # Symmetrize a diagonal centroid operator over all canonical permutations.
     site = np.mean(np.array([np.arange(1,nmu+1)[perm] for perm in plan.sym_perm]),axis=0)
-    interaction = np.broadcast_to(np.diag(site),(9,nmu,nmu)).copy()
+    interaction = np.broadcast_to(np.diag(site),(9,nmu,nmu)).astype(complex)
     child = _literal_children(raw,plan)
     parent_sigma = None
     for a,scale in ((1,-1.),(2,-1.),(3,-2.)):
-        kernel = _make_photon_static_class_kernel(mesh,(3,3,1),9,wfns,wfns)
-        value = kernel(carrier,carrier,jnp.ones((9,nb)),put(scale*interaction[None],P(None,None,'x','y')),jnp.array(1.),
-                       jax.tree.map(lambda x:x[None],(gamma_perm_phase(a),gamma_perm_phase(a))))
+        kernel = _make_photon_static_class_kernel(mesh,(3,3,1),9,wfns,wfns,[(a,a)])
+        value = kernel(carrier,carrier,jnp.ones((9,nb)),
+                       put((scale*interaction)[:,:,None,:,None],P(None,'x',None,'y',None)),jnp.array(1.))
         parent_sigma = value if parent_sigma is None else parent_sigma+value
     actual = unfold_file_wedge_band_operator(plan.sym,parent_sigma,trs_rule='transpose')
     # G=identity on the complete occupied spin/centroid space; alpha_i^2=I.
@@ -669,11 +677,12 @@ def test_wrapper_selects_v_w_difference_fractional_occupations_and_sum_window(mo
     occ = np.array([[.25+.01*k,.75-.02*k] for k in range(9)])
     gij = jnp.asarray([np.diag(row) for row in occ])
     calls = []
-    def factory(mesh_arg,kgrid,nk,left,right,*,with_head):
+    def factory(mesh_arg,kgrid,nk,left,right,class_keys,*,with_head):
         assert not with_head and mesh_arg is mesh and nk == 9
-        def kernel(l,r,weights,interaction,factor,vertices,head):
-            calls.append((left,right,np.array(weights),float(factor),vertices))
-            assert head is None and l is left.green_parent and r is right.green_parent
+        def kernel(l,r,weights,interaction,factor,head,head_vertices):
+            calls.append((left,right,np.array(weights),float(factor),class_keys))
+            assert head is None and head_vertices is None
+            assert l is left.green_parent and r is right.green_parent
             return jnp.sum(interaction)*jnp.sum(weights*jnp.array([2.,3.,5.,7.]))*factor
         return kernel
     monkeypatch.setattr(owner,'_make_photon_static_class_kernel',factory)
@@ -684,13 +693,12 @@ def test_wrapper_selects_v_w_difference_fractional_occupations_and_sum_window(mo
         got = list(owner.contract_lorentz_blocks(keys,families=families,term=term,response=response,
             Gij=gij,meta=SimpleNamespace(nk_tot=9,kgrid=(3,3,1)),mesh_xy=mesh))
         for (a,b),actual,head in got:
-            left,right,weights,factor,vertices = calls.pop(0)
+            left,right,weights,factor,class_keys = calls.pop(0)
             expected_weights = np.pad(occ,((0,0),(0,2))) if term < 2 else np.broadcast_to(masks[bool(a)],(9,4))
             assert left is families[bool(a)] and right is families[bool(b)] and head is None
             np.testing.assert_array_equal(weights,expected_weights)
             assert factor == (1.,1.,-.5)[term]
-            for index,(perm,phase) in zip((a,b),vertices):
-                np.testing.assert_array_equal(np.asarray(phase)[0,:,None]*np.eye(4)[np.asarray(perm)[0]],gamma[index])
+            assert tuple(class_keys) == ((a,b),)
             expected = full[:,a*nmu:(a+1)*nmu,b*nmu:(b+1)*nmu].sum()*np.sum(expected_weights*[2.,3.,5.,7.])*(1.,1.,-.5)[term]
             np.testing.assert_allclose(actual,expected,rtol=3e-12,atol=3e-12)
 

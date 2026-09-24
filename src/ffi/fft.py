@@ -89,6 +89,8 @@ variable (decisions.md 2026-09-24, QUALITY #8):
     make_kconv_klead          flat leading   Σ / COHSEX  fftn(ifftn(T)·ifftn(W))
     make_kconv_klead_unfold   parent Green   the Σ one read from the raw-parent G with
                                              the typed unfold and spin action on load
+    make_kconv_lorentz_unfold parent Green   the four-current Σ: the same load, then
+                                             the γ_i Ĝ γ_j† · V_ij block sum in R space
     make_kconv_kminor         trailing       BSE rung    fftn(ifftn(X)·K_R)
     make_kfft_klead / _local  flat leading   one transform
     make_kfft_kminor / _local trailing       one transform
@@ -153,6 +155,7 @@ __all__ = [
     "make_fused_conv_kpair", "make_fused_conv_kparent", "make_fused_conv_kplane",
     "KCONV_PLANE_TARGET",
     "KConvStored", "make_kconv_klead", "make_kconv_klead_unfold", "KCONV_KLEAD_UNFOLD_TARGET",
+    "make_kconv_lorentz_unfold", "KCONV_KLEAD_LORENTZ_TARGET",
     "make_kconv_kminor", "kconv_kminor_out_shape",
     "make_kfft_klead", "make_kfft_kminor",
     "make_local_kfft_klead", "make_local_kfft_kminor", "make_local_kconv_kminor",
@@ -170,12 +173,13 @@ KCONV_PARENT_TARGET = "lorrax_mathdx_kconv_parent"
 KCONV_PLANE_TARGET = "lorrax_mathdx_kconv_plane"
 KCONV_KLEAD_TARGET = "lorrax_mathdx_kconv_klead"
 KCONV_KLEAD_UNFOLD_TARGET = "lorrax_mathdx_kconv_klead_unfold"
+KCONV_KLEAD_LORENTZ_TARGET = "lorrax_mathdx_kconv_klead_lorentz"
 KFFT_KLEAD_TARGET = "lorrax_mathdx_kfft_klead"
 KCONV_KMINOR_TARGET = "lorrax_mathdx_kconv_kminor"
 KFFT_KMINOR_TARGET = "lorrax_mathdx_kfft_kminor"
 #: Every mathdx target; ``require_kconv`` checks them all at startup.
 KCONV_TARGETS = (KCONV_PAIR_TARGET, KCONV_PARENT_TARGET, KCONV_PLANE_TARGET, KCONV_KLEAD_TARGET,
-                 KCONV_KLEAD_UNFOLD_TARGET,
+                 KCONV_KLEAD_UNFOLD_TARGET, KCONV_KLEAD_LORENTZ_TARGET,
                  KFFT_KLEAD_TARGET, KCONV_KMINOR_TARGET, KFFT_KMINOR_TARGET)
 
 #: The ``LORRAX_FFT_FFI`` dial.  Default ON — the FFI layer is REQUIRED
@@ -1127,6 +1131,122 @@ def make_kconv_klead_unfold(mesh: Mesh, kgrid, tables, *, norm: str | None = "or
                 f"{tables.n_parent}, endpoints {tables.lsrc.shape[1]}/{tables.rsrc.shape[1]} "
                 f"merged over ns={ns})")
         return sm(G, Gt, W_prep)
+    return apply
+
+
+def _vertex_tables(vertices, ns: int, label: str) -> tuple[np.ndarray, np.ndarray]:
+    """``(perm, phase)`` monomial vertices → concatenated perm and phase-code attributes."""
+    if not 1 <= len(vertices) <= 4:
+        raise ValueError(f"k-conv {label}: 1..4 Lorentz vertices per side, got {len(vertices)}")
+    perms = [_check_perm(perm, ns, f"{label} vertex {i}") for i, (perm, _) in enumerate(vertices)]
+    codes = [_conv_kpair_phase_codes(phase, ns, f"{label} vertex {i}")
+             for i, (_, phase) in enumerate(vertices)]
+    return np.concatenate(perms).astype(np.int64), np.concatenate(codes).astype(np.int64)
+
+
+def make_kconv_lorentz_unfold(mesh: Mesh, kgrid, tables, *, left_vertices, right_vertices,
+                              norm: str | None = "ortho", mult: float = 1.0) -> Callable:
+    """The four-current Σ convolution read from the RAW-PARENT Green: ``fn(G, Gt, V) -> U``.
+
+    ``U[k,a,x,b,y] = mult · fftn( Σ_ij (γ_i ifftn(Ĝ) γ_j†)[a,x,b,y] · ifftn(V)[k,x,i,y,j] )``
+
+    ``Ĝ`` is the full-k Green :func:`make_kconv_klead_unfold` reads from ``G``/``Gt``
+    and ``tables`` (the typed unfold, spin action and spin-major order on the
+    load); ``left_vertices``/``right_vertices`` are the Lorentz vertices ``γ_i``,
+    ``γ_j`` as ``(perm, phase)`` monomial pairs
+    (``common.gamma_matrices.gamma_perm_phase``: ``γ[α,β] = phase[α] δ_{β,perm[α]}``),
+    and ``V`` ``(nk, mx, nA, my, nB)`` c128 at ``P(None,'x',None,'y',None)`` holds
+    the block ``(i, j)`` interaction in k space.  One transform of the Green
+    serves every block.  Returns ``U`` ``(nk, ns, mx, ns, my)`` at
+    ``P(None,None,'x',None,'y')``.
+
+    CUDA: nvidia-mathdx mode 3 on ``V`` then mode 8; each rounds as the XLA
+    chain it replaces (the ``norm`` transforms of ``Ĝ`` and ``V``, the vertex
+    products, the block sum in ``(i, j)`` order, the forward transform, then
+    ``mult``).  cpu: that chain on the service's reference unfold and the plan
+    route.
+    """
+    from symmetry_maps import apply_unfold_load_tables_local, local_unfold_load_tables
+    kg = _check_kgrid(kgrid)
+    nk = kg[0] * kg[1] * kg[2]
+    if int(tables.row.shape[0]) != nk:
+        raise ValueError(f"k-leading lorentz conv: tables cover {tables.row.shape[0]} k, grid has {nk}")
+    ns = int(tables.spin.shape[-1])
+    spin_host = np.asarray(tables.spin)
+    needs_partner = bool(np.any(np.asarray(tables.trs)))
+    mesh_shape = (int(mesh.shape["x"]), int(mesh.shape["y"]))
+    if tuple(tables.mesh_shape) != mesh_shape:
+        raise ValueError(f"k-leading lorentz conv: tables were cut for a {tuple(tables.mesh_shape)} "
+                         f"mesh; this mesh is {mesh_shape}")
+    perm_l, phase_l = _vertex_tables(left_vertices, ns, "left")
+    perm_r, phase_r = _vertex_tables(right_vertices, ns, "right")
+    na, nb = len(left_vertices), len(right_vertices)
+    si, sf = ffi_fft_scale("ifftn", norm, nk), ffi_fft_scale("fftn", norm, nk)
+    prep_local = make_local_kfft_klead(mesh, kg, kind="ifftn", norm=norm)
+    if kconv_backend(mesh) == "mathdx":
+        _require_target(KCONV_KLEAD_LORENTZ_TARGET, "CUDA")
+        attrs = dict(nkx=np.int64(kg[0]), nky=np.int64(kg[1]), nkz=np.int64(kg[2]),
+                     scale_g=np.float64(si), scale_f=np.float64(sf), mult=np.float64(mult),
+                     perm_l=perm_l, phase_l=phase_l, perm_r=perm_r, phase_r=phase_r,
+                     **_mathdx_common())
+
+        def local(g, gt, v):
+            t = local_unfold_load_tables(tables)
+            n_par, mx, _, my, _ = (int(d) for d in g.shape)
+            flat = lambda a: a.reshape(n_par, mx * ns, my * ns)
+            out = jax.ShapeDtypeStruct((nk, ns, mx, ns, my), g.dtype)
+            return jax.ffi.ffi_call(KCONV_KLEAD_LORENTZ_TARGET, out)(
+                flat(g), flat(gt), t.row, t.trs, t.lsrc, t.rsrc, t.mph, t.nph, t.spin,
+                prep_local(v), **attrs)
+    else:
+        forward_local = make_local_kfft_klead(mesh, kg, kind="fftn", norm=norm)
+        quarter = np.asarray([1, 1j, -1, -1j], dtype=np.complex128)
+        left = [(perm_l[i * ns:(i + 1) * ns], quarter[phase_l[i * ns:(i + 1) * ns]]) for i in range(na)]
+        right = [(perm_r[j * ns:(j + 1) * ns], quarter[phase_r[j * ns:(j + 1) * ns]]) for j in range(nb)]
+
+        def local(g, gt, v):
+            t = local_unfold_load_tables(tables)
+            n_par, mx, _, my, _ = (int(d) for d in g.shape)
+            flat = lambda a: a.reshape(n_par, mx * ns, my * ns)
+            O = apply_unfold_load_tables_local(flat(g), flat(gt), t, spin_host)
+            green = prep_local(jnp.transpose(O, (0, 2, 1, 4, 3)))
+            v_r = prep_local(v)
+            total = jnp.zeros_like(green)
+            for i, (pl, hl) in enumerate(left):
+                for j, (pr, hr) in enumerate(right):
+                    # gamma_A on the left spin axis, gamma_B^dagger on the right:
+                    # a gather and an exact quarter-turn phase each.
+                    value = (jnp.take(green, jnp.asarray(pl), axis=1)
+                             * jnp.asarray(hl).reshape(1, ns, 1, 1, 1))
+                    value = (jnp.take(value, jnp.asarray(pr), axis=3)
+                             * jnp.asarray(np.conj(hr)).reshape(1, 1, 1, ns, 1))
+                    total = total + value * v_r[:, None, :, i, None, :, j]
+            return forward_local(total) * mult
+
+    g_spec = P(None, "x", None, "y", None)
+    sm = _sharded(local, mesh, (g_spec, g_spec, g_spec), P(None, None, "x", None, "y"))
+
+    def apply(G, Gt, V):
+        _check_complex(G, V)
+        if G.ndim != 5 or int(G.shape[2]) != ns or int(G.shape[4]) != ns:
+            raise ValueError(f"k-leading lorentz conv expects G (n_parent, mu, {ns}, nu, {ns}); "
+                             f"got {G.shape}")
+        if Gt is None:
+            if needs_partner:
+                raise ValueError("k-leading lorentz conv: the plan has antiunitary rows, so the "
+                                 "transposed parent Green Gt is required")
+            Gt = G
+        if Gt.shape != G.shape or V.shape != (nk, G.shape[1], na, G.shape[3], nb):
+            raise ValueError(f"k-leading lorentz conv: Gt {Gt.shape} / V {V.shape} do not match "
+                             f"G {G.shape}, nk={nk} and ({na}, {nb}) vertices")
+        if (int(G.shape[0]) != int(tables.n_parent)
+                or int(G.shape[1]) * ns != int(tables.lsrc.shape[1])
+                or int(G.shape[3]) * ns != int(tables.rsrc.shape[1])):
+            raise ValueError(
+                f"k-leading lorentz conv: G {G.shape} does not match its tables (n_parent="
+                f"{tables.n_parent}, endpoints {tables.lsrc.shape[1]}/{tables.rsrc.shape[1]} "
+                f"merged over ns={ns})")
+        return sm(G, Gt, V)
     return apply
 
 

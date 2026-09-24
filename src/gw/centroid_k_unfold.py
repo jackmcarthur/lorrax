@@ -209,18 +209,22 @@ class CentroidKUnfoldPlan:
             axis_local=True,
         )
 
-    def unfold_load_tables(self):
+    def unfold_load_tables(self, right_plan=None):
         """:meth:`unfold_operator` as load tables (``symmetry_maps.unfold_load_tables``), same arguments.
 
         For a consumer that reads the parent Green and does the typed unfold
-        on its own load (``ffi.fft.make_kconv_klead_unfold``).
+        on its own load (``ffi.fft.make_kconv_klead_unfold``,
+        ``make_kconv_lorentz_unfold``).  ``right_plan`` is the right endpoint's
+        plan of a rectangular Green (charge x current), as in :meth:`unfold_operator`.
         """
         from symmetry_maps import unfold_load_tables
         return unfold_load_tables(
             irr_idx=self.irr_idx, sym_idx=self.sym_idx, sym_perm=self.sym_perm,
             L_table=self.L_table, k_irr_frac=self.k_parent_frac,
             spin_action_full=self.spin_action_full, n_sym_spatial=self.n_sym_spatial,
-            mesh_xy=self.mesh_xy, logical_centroid_extent=self.n_centroid_packed)
+            mesh_xy=self.mesh_xy, logical_centroid_extent=self.n_centroid_packed,
+            right_sym_perm=None if right_plan is None else right_plan.sym_perm,
+            right_L_table=None if right_plan is None else right_plan.L_table)
 
 
 

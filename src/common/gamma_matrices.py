@@ -156,6 +156,13 @@ def gamma_perm_phase(mu_lorentz: int) -> tuple[jax.Array, jax.Array]:
     return gammas_perm[mu], gammas_phase[mu]
 
 
+def gamma_perm_phase_host(mu_lorentz: int) -> tuple[_np.ndarray, _np.ndarray]:
+    """:func:`gamma_perm_phase` as the HOST tables, for a consumer that bakes
+    the vertex into a kernel as static attributes (the four-current Σ door)."""
+    perm, phase = _perm_phase[int(mu_lorentz)]
+    return perm.copy(), phase.copy()
+
+
 def gamma_apply(X: jax.Array, perm: jax.Array, phase: jax.Array,
                 axis: int, is_identity: bool = False) -> jax.Array:
     """Apply a monomial γ̃ matrix on ``axis`` of X via gather + phase mul.
