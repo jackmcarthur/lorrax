@@ -25,22 +25,29 @@ from typing import NamedTuple
 import jax
 import jax.numpy as jnp
 import numpy as np
-from jax.sharding import NamedSharding, PartitionSpec as P
 
 from symmetry_maps.maps import certify_endpoint_locality
 
-__all__ = ["UnfoldLoadTables", "unfold_load_tables", "apply_unfold_load_tables_local"]
+__all__ = ["UnfoldLoadTables", "unfold_load_tables", "local_unfold_load_tables",
+           "apply_unfold_load_tables_local"]
 
 
 class UnfoldLoadTables(NamedTuple):
-    """Device tables of the typed unfold (module docstring); left ``P(None,'x')``, right ``P(None,'y')``."""
-    row: jax.Array      # (nk,) int32, replicated: the parent row of each full k
-    trs: jax.Array      # (nk,) int32, replicated: 1 on an antiunitary row (read Gt)
-    lsrc: jax.Array     # (nk, n_left*ns) int32: X-shard-local merged source, -1 = zero
-    rsrc: jax.Array     # (nk, n_right*ns) int32: Y-shard-local merged source
-    mph: jax.Array      # (nk, n_left*ns) c128: left umklapp phase, TRS rule applied
-    nph: jax.Array      # (nk, n_right*ns) c128: right umklapp phase, TRS rule applied
-    spin: jax.Array     # (nk, ns, ns) c128, replicated: U_k
+    """Host tables of the typed unfold (module docstring), global over both endpoints.
+
+    Host arrays on purpose: a jitted consumer bakes them as constants and
+    slices this rank's part inside its ``shard_map``
+    (:func:`local_unfold_load_tables`), the way the unfold kernel itself
+    carries its tables; a closed-over multi-process device array is refused
+    by JAX.
+    """
+    row: np.ndarray     # (nk,) int32: the parent row of each full k
+    trs: np.ndarray     # (nk,) int32: 1 on an antiunitary row (read Gt)
+    lsrc: np.ndarray    # (nk, n_left*ns) int32: X-shard-local merged source, -1 = zero
+    rsrc: np.ndarray    # (nk, n_right*ns) int32: Y-shard-local merged source
+    mph: np.ndarray     # (nk, n_left*ns) c128: left umklapp phase, TRS rule applied
+    nph: np.ndarray     # (nk, n_right*ns) c128: right umklapp phase, TRS rule applied
+    spin: np.ndarray    # (nk, ns, ns) c128: U_k
 
 
 def _merged(perm, wraps, ns):
@@ -98,15 +105,25 @@ def unfold_load_tables(*, irr_idx, sym_idx, sym_perm, L_table, k_irr_frac, spin_
         pr = jnp.exp(2j * jnp.pi * jnp.einsum('qi,qmi->qm', q_per, L_r).astype(jnp.complex128))
         return (jnp.where(trs[:, None], jnp.conj(pl), pl),
                 jnp.where(trs[:, None], pr, jnp.conj(pr)))
-    mph, nph = phases()
+    mph, nph = (np.asarray(jax.device_get(a)) for a in phases())
+    return UnfoldLoadTables(row=irr, trs=trs.astype(np.int32), lsrc=lsrc, rsrc=rsrc,
+                            mph=mph, nph=nph, spin=spin)
 
-    def put(a, spec):
-        return jax.device_put(a, NamedSharding(mesh_xy, spec))
+
+def local_unfold_load_tables(t: UnfoldLoadTables) -> UnfoldLoadTables:
+    """This rank's slice of the host tables, inside a ``shard_map`` over ('x', 'y').
+
+    Left tables are cut at this rank's X shard, right tables at its Y shard;
+    the per-k tables stay whole.
+    """
+    ml = int(t.lsrc.shape[1]) // jax.lax.axis_size("x")
+    nl = int(t.rsrc.shape[1]) // jax.lax.axis_size("y")
+    x0, y0 = jax.lax.axis_index("x") * ml, jax.lax.axis_index("y") * nl
+    cut = lambda a, start, width: jax.lax.dynamic_slice_in_dim(jnp.asarray(a), start, width, axis=1)
     return UnfoldLoadTables(
-        row=put(irr, P()), trs=put(trs.astype(np.int32), P()),
-        lsrc=put(lsrc, P(None, "x")), rsrc=put(rsrc, P(None, "y")),
-        mph=put(mph, P(None, "x")), nph=put(nph, P(None, "y")),
-        spin=put(spin, P()))
+        row=jnp.asarray(t.row), trs=jnp.asarray(t.trs),
+        lsrc=cut(t.lsrc, x0, ml), rsrc=cut(t.rsrc, y0, nl),
+        mph=cut(t.mph, x0, ml), nph=cut(t.nph, y0, nl), spin=jnp.asarray(t.spin))
 
 
 def apply_unfold_load_tables_local(G, Gt, t: UnfoldLoadTables, spin_host):

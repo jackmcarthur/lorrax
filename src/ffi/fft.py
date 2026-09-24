@@ -1064,21 +1064,22 @@ def make_kconv_klead_unfold(mesh: Mesh, kgrid, tables, *, norm: str | None = "or
     happen on the convolution's load.  CUDA: nvidia-mathdx mode 7; cpu: the
     service's reference composition, then the plan route.
     """
-    from symmetry_maps import UnfoldLoadTables, apply_unfold_load_tables_local
+    from symmetry_maps import apply_unfold_load_tables_local, local_unfold_load_tables
     kg = _check_kgrid(kgrid)
     nk = kg[0] * kg[1] * kg[2]
     if int(tables.row.shape[0]) != nk:
         raise ValueError(f"k-leading unfold conv: tables cover {tables.row.shape[0]} k, grid has {nk}")
     ns = int(tables.spin.shape[-1])
-    spin_host = np.asarray(jax.device_get(tables.spin))
-    needs_partner = bool(np.any(np.asarray(jax.device_get(tables.trs))))
+    spin_host = np.asarray(tables.spin)
+    needs_partner = bool(np.any(np.asarray(tables.trs)))
     si, sf = ffi_fft_scale("ifftn", norm, nk), ffi_fft_scale("fftn", norm, nk)
     if kconv_backend(mesh) == "mathdx":
         _require_target(KCONV_KLEAD_UNFOLD_TARGET, "CUDA")
         attrs = dict(nkx=np.int64(kg[0]), nky=np.int64(kg[1]), nkz=np.int64(kg[2]),
                      scale=np.float64(si * sf * float(mult)), **_mathdx_common())
 
-        def local(g, gt, t, v_r):
+        def local(g, gt, v_r):
+            t = local_unfold_load_tables(tables)
             n_par, mx, _, my, _ = (int(v) for v in g.shape)
             flat = lambda a: a.reshape(n_par, mx * ns, my * ns)
             out = jax.ShapeDtypeStruct((nk, ns, mx, ns, my), g.dtype)
@@ -1087,17 +1088,15 @@ def make_kconv_klead_unfold(mesh: Mesh, kgrid, tables, *, norm: str | None = "or
     else:
         _, conv_local = _klead_locals(mesh, kg, norm, mult)
 
-        def local(g, gt, t, v_r):
+        def local(g, gt, v_r):
+            t = local_unfold_load_tables(tables)
             n_par, mx, _, my, _ = (int(v) for v in g.shape)
             flat = lambda a: a.reshape(n_par, mx * ns, my * ns)
             O = apply_unfold_load_tables_local(flat(g), flat(gt), t, spin_host)
             return conv_local(jnp.transpose(O, (0, 2, 1, 4, 3)), v_r)
 
     g_spec = P(None, "x", None, "y", None)
-    t_specs = UnfoldLoadTables(row=P(), trs=P(), lsrc=P(None, "x"), rsrc=P(None, "y"),
-                               mph=P(None, "x"), nph=P(None, "y"), spin=P())
-    sm = _sharded(local, mesh, (g_spec, g_spec, t_specs, P(None, "x", "y")),
-                  P(None, None, "x", None, "y"))
+    sm = _sharded(local, mesh, (g_spec, g_spec, P(None, "x", "y")), P(None, None, "x", None, "y"))
 
     def apply(G, Gt, W_prep):
         _check_complex(G, W_prep)
@@ -1112,7 +1111,7 @@ def make_kconv_klead_unfold(mesh: Mesh, kgrid, tables, *, norm: str | None = "or
         if Gt.shape != G.shape or W_prep.shape != (nk, G.shape[1], G.shape[3]):
             raise ValueError(f"k-leading unfold conv: Gt {Gt.shape} / W_prep {W_prep.shape} do not "
                              f"match G {G.shape} and nk={nk}")
-        return sm(G, Gt, tables, W_prep)
+        return sm(G, Gt, W_prep)
     return apply
 
 
