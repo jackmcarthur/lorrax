@@ -55,6 +55,28 @@ def omega_coverage(omega_grid: np.ndarray,
     return covered, n_out, frac
 
 
+def sigma_eval_omega(omega_grid: np.ndarray, eval_kn: np.ndarray,
+                     policy: str) -> tuple[np.ndarray, np.ndarray]:
+    """``(omega_read_kn, covered_kn)``: where each QSGW Sigma(E) evaluation
+    reads, under ``sigma_out_of_grid`` (docs/self_consistency.md §4).
+
+    The coverage is :func:`omega_coverage`'s, the one classification the Sigma
+    build, the SC grid growth and the sum-band tail mask all read.  A covered
+    energy reads itself.  An uncovered one reads the nearest grid edge under
+    ``clamp`` and omega = 0 under ``static``; under ``cover`` the SC growth has
+    already covered every protected identity, so what remains uncovered is a
+    frozen-core band (decoupled from H) and reads omega = 0.
+    """
+    covered = omega_coverage(omega_grid, eval_kn)[0]
+    omega = np.asarray(omega_grid, dtype=np.float64)
+    e = np.asarray(eval_kn, dtype=np.float64)
+    if policy == "clamp":
+        return np.clip(e, float(omega[0]), float(omega[-1])), covered
+    if policy in ("cover", "static"):
+        return np.where(covered, e, 0.0), covered
+    raise ValueError(f"sigma_out_of_grid must be cover, clamp or static; got {policy!r}")
+
+
 
 
 def interp_along_omega(
@@ -662,6 +684,7 @@ def build_qsgw_sigma_xc(
     replicated_output: bool = True,
     one_sided_core_mask: np.ndarray | None = None,
     band_axis=None,
+    out_of_grid: str = "cover",
 ) -> tuple[jax.Array, dict[str, float]]:
     """Build the static Hermitian QSGW Σ_xc[k, m, n].
 
@@ -704,7 +727,8 @@ def build_qsgw_sigma_xc(
     sigma_xc_qsgw_kij_ry : jax.Array, (nk, nb, nb), complex128, replicated
         unless ``replicated_output=False``, then two-axis band sharded.
     diagnostics : dict with ``n_clipped`` (count of ``E_kn`` outside
-        ``[ω_min, ω_max]`` clamped to the grid) and ``omega_min/max_ev``.
+        ``[ω_min, ω_max]``, read per ``out_of_grid`` through
+        :func:`sigma_eval_omega`) and ``omega_min/max_ev``.
     """
     omega = np.asarray(omega_ev, dtype=np.float64)
     E = np.asarray(e_qp_kn_ev, dtype=np.float64)
@@ -763,16 +787,13 @@ def build_qsgw_sigma_xc(
     # Linear-interp index/weight arrays, host-side then pushed replicated.
     omega_lo = float(omega[0])
     omega_hi = float(omega[-1])
-    # Owner rule 2026-09-22: an energy outside the sampled grid evaluates the
-    # static Sigma_mn(omega = 0); the grid is E_F-relative, so omega = 0 is E_F.
-    if not omega_lo <= 0.0 <= omega_hi:
+    # sigma_out_of_grid decides where an uncovered energy reads; the grid is
+    # E_F-relative, so omega = 0 is E_F and must be sampled for cover/static.
+    if out_of_grid != "clamp" and not omega_lo <= 0.0 <= omega_hi:
         raise ValueError(
             f"build_qsgw_sigma_xc: the Sigma(omega=0) fallback needs omega = 0 inside "
             f"[{omega_lo:.3f}, {omega_hi:.3f}] eV")
-    # omega_coverage is the ONE Sigma(E)/Sigma(0) decision: the SC tail
-    # scissor excludes exactly its uncovered states (sc_iteration).
-    inside = omega_coverage(omega, E)[0]
-    E_clamped = np.where(inside, E, 0.0)
+    E_clamped, inside = sigma_eval_omega(omega, E, out_of_grid)
     n_clipped = int(np.count_nonzero(~inside[:, :logical_nb]))
     idx_hi = np.clip(np.searchsorted(omega, E_clamped, side="left"),
                      1, n_omega - 1)
@@ -1148,6 +1169,7 @@ __all__ = [
     "plot_qp_energy_comparison",
     "remove_managed",
     "sigma_grid_edge_ambiguity",
+    "sigma_eval_omega",
     "solve_diagonal_sigma_fixed_point",
     "write_qsgw_sigma_cube",
 ]
