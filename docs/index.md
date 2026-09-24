@@ -28,21 +28,14 @@ chmod -R u+w "$LORRAX_QUICKSTART"
 (cd "$LORRAX_QUICKSTART" && uv run --project "$LORRAX_SOURCE" python -m gw.gw_jax -i tests/regression/cohsex_debug/cohsex_test.in)
 ```
 
-!!! warning "There is no longer a pure-JAX path that skips the native build"
-    `uv sync` alone is not enough, on any platform, at any process count.
-    [Design decisions, 2026-08-01](architecture/decisions.md) made the FFI layer
-    **required**: a missing or unloadable library is a refusal at startup, not a
-    demotion to a JAX fallback, because the fallback paths were deleted. Verified
-    2026-08-10 on a fresh clone at `88f28325`, the command above without the build
-    step refuses with `RuntimeError: The required FFTW3-ABI host backend is
-    unavailable … Could not locate liblorrax_ffi_host.so`. The former
-    `use_ffi_io` and `slab_io` deck keys are now refused: the three I/O tiers
-    collapsed to one transport, so a deck cannot select an HDF5 implementation.
-
-    `build_host.sh` needs a SLATE `gpu_backend=none` install and refuses without
-    one, naming `src/ffi/cpp/stage/slate_build_perlmutter.sh cpu` as the step
-    before it. Budget for that: the 60-second promise this section used to make
-    was measured against a tree that no longer exists.
+!!! warning "The native build is required"
+    `uv sync` alone is not enough, on any platform, at any process count. The
+    FFI layer is required ([design decisions](architecture/decisions.md)): a
+    missing or unloadable library refuses at startup with `RuntimeError: The
+    required FFTW3-ABI host backend is unavailable … Could not locate
+    liblorrax_ffi_host.so`. `build_host.sh` needs a SLATE `gpu_backend=none`
+    install and refuses without one, naming
+    `src/ffi/cpp/stage/slate_build_perlmutter.sh cpu` as the step before it.
 
 See the [Quickstart](quickstart.md) for the worked example, and
 [Installation](installation/index.md) for the GPU / distributed / from-source tracks.
