@@ -380,14 +380,14 @@ def _sector_model_residence(meta,config,header,mu_bases,execution_rows,*,mesh_xy
     ``receipt["stage"]``.
     """
     from file_io.shared_pole_store import ResidentSectorModel
-    from runtime.padding import combined_divisor, round_up
+    from runtime.padding import combined_divisor, padded_axis
     ledger=meta.shared_pole_capacity
     nq=int(header['n_q_irr'])
     divisor=combined_divisor(mesh_xy.shape['x'],mesh_xy.shape['y'])
     bound=[min(row['signed_side_bound'],row['conservative_pencil_side']) for row in execution_rows]
     rows=dict(CC=(mu_bases[0].n_canonical,bound[0]),TT=(3*mu_bases[1].n_canonical,bound[1]),
               CT_C=(mu_bases[0].n_canonical,sum(bound)),CT_T=(3*mu_bases[1].n_canonical,sum(bound)))
-    R=sum(16*nq*n*round_up(k,divisor)//int(mesh_xy.size)+8*nq*k for n,k in rows.values())
+    R=sum(16*nq*n*padded_axis(k,divisor,name="shared_pole_sector_K").carrier//int(mesh_xy.size)+8*nq*k for n,k in rows.values())
     receipt=dict(residence='file',payload_bytes_per_rank=int(R))
     both=ledger.preview(resident_bytes_per_rank=2*R,workspace_bytes_per_rank=0,
                         concurrent_with=upstream)

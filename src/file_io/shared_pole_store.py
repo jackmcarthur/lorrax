@@ -20,7 +20,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax.sharding import NamedSharding, PartitionSpec as P
 
-from runtime.padding import padded_axis
+from runtime.padding import combined_divisor, padded_axis
 from common import timing
 from common.collectives import device_put_process_local, rank0_transaction, psum_replicate
 from file_io.slab_io import SlabIO, mesh_divisible_shape
@@ -1287,7 +1287,8 @@ class ResidentSectorModel:
         """Assemble the file's final datasets from the staged batches."""
         nq, nmu, kmax = header["n_q_irr"], header["n_mu_logical"], header["Kmax"]
         components = header.get("factor_components", 1)
-        carrier = round_up(max(kmax, 1), combined_divisor(self.mesh.shape["x"], self.mesh.shape["y"]))
+        carrier = padded_axis(max(kmax, 1), combined_divisor(self.mesh.shape["x"], self.mesh.shape["y"]),
+                              name="shared_pole_model_K").carrier
         counts = np.asarray(header["K"], np.int64)
         factors, poles = [], []
         for batch in sorted(header["batches"], key=lambda row: row["lo"]):
