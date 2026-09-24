@@ -109,10 +109,18 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int],
             "why: the finite-temperature vertex columns are not gated yet")
     if bool(ordered) and not fermi_dirac:
         raise ValueError("_get_chi_minimax_kernel: ordered is a Fermi-Dirac kernel option")
+    # The identity-vertex step response traces the spin pairs elementwise,
+    # chi = sum_ab Gc_ab conj(Gv_ab), so it streams one (a, b) block at a
+    # time and never holds a full ns^2 Green (phase-1 item A4).
+    spin_pairs = (vertex_pairs is None and not fermi_dirac
+                  and face_shape is not None and int(face_shape[3]) > 1
+                  and right_face_shape is None
+                  and not isinstance(k_unfold_plan, tuple))
     cache_key = (_mesh_key(mesh_xy), kgrid, ffi_dial_key(), n_out,
                  complex_contour, layout, face_shape, right_face_shape,
                  vertex_classes, (tuple(id(p) for p in k_unfold_plan)
-                               if isinstance(k_unfold_plan, tuple) else id(k_unfold_plan)))
+                               if isinstance(k_unfold_plan, tuple) else id(k_unfold_plan)),
+                 spin_pairs)
     if fermi_dirac:
         cache_key = cache_key + ("fermi_dirac", bool(ordered))
     if cache_key in _chi_minimax_kernel_cache:
@@ -122,12 +130,17 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int],
         raise ValueError(
             "_get_chi_minimax_kernel(layout='face') requires "
             "face_shape=(nk, nb_full, n_rmu, nspinor)")
-    kernel = _get_chi_minimax_kernel_face(
-        mesh_xy, kgrid, nk, n_out, complex_contour, face_shape,
-        right_face_shape=right_face_shape,
-        vertex_pairs=vertex_pairs,
-        k_unfold_plan=k_unfold_plan, layout=layout,
-        fermi_dirac=fermi_dirac, ordered=bool(ordered))
+    if spin_pairs:
+        kernel = _get_chi_minimax_kernel_spin_pairs(
+            mesh_xy, kgrid, nk, n_out, complex_contour, face_shape,
+            k_unfold_plan=k_unfold_plan, layout=layout)
+    else:
+        kernel = _get_chi_minimax_kernel_face(
+            mesh_xy, kgrid, nk, n_out, complex_contour, face_shape,
+            right_face_shape=right_face_shape,
+            vertex_pairs=vertex_pairs,
+            k_unfold_plan=k_unfold_plan, layout=layout,
+            fermi_dirac=fermi_dirac, ordered=bool(ordered))
     _chi_minimax_kernel_cache[cache_key] = kernel
     return kernel
 
@@ -448,6 +461,103 @@ def _get_chi_minimax_kernel_face(mesh_xy, kgrid, nk, n_out, complex_contour,
             (None,))[0, 0])
 
     return minimax_tau_integrate_chi
+
+
+def _get_chi_minimax_kernel_spin_pairs(mesh_xy, kgrid, nk, n_out, complex_contour,
+                                       face_shape, *, k_unfold_plan=None,
+                                       layout="face"):
+    """The step-occupation, identity-vertex response streamed over spin pairs.
+
+        chi_R(mu, nu) = sum_tau alpha_tau sum_ab Gc_ab(R; tau) conj(Gv_ab(R; tau))
+
+    The spin trace is elementwise in ``(mu, nu)``, so each ``(a, b)`` block is
+    built, transformed and accumulated on its own.  The parents are unfolded
+    to full k once per call (the typed ψ action, whose Green equals the
+    operator unfold of the parent Green), so a block Green is one GEMM of the
+    ``a`` and ``b`` spinor rows at full k.  No full ``ns^2`` Green exists: the
+    live Green set is four ``16·N_k·μ²/P`` blocks, ``ns^2`` times smaller than
+    the whole-spin kernel's (phase-1 item A4).  Same signature and output as
+    :func:`_get_chi_minimax_kernel_face` for ``vertex_pairs=None``.
+    """
+    from common.fft_helpers import make_flat_k_fftn
+    from common.shard_map import shard_map
+    from common.wfn_layout import psi_specs
+    from distrib_la import gemm_plan
+    from .greens_function_kernel import build_G_tau
+    from .wavefunction_bundle import CHI_Q_SPEC as _chi_spec, CHI_R_SPEC as _chi_R_spec
+
+    psi_nmu_spec, psi_mun_spec = psi_specs(layout)
+    nk_in, nb_full, n_rmu, ns = (int(v) for v in face_shape)
+    expected_input_nk = nk if k_unfold_plan is None else k_unfold_plan.n_parent
+    if nk_in != expected_input_nk:
+        raise ValueError("chi spin pairs: face k extent disagrees with its parent plan.")
+    if k_unfold_plan is not None and k_unfold_plan.n_full != nk:
+        raise ValueError("chi parent plan full-k extent disagrees with kgrid.")
+    chi_fftn = make_flat_k_fftn(mesh_xy, kgrid, _chi_spec, norm='ortho')
+    chi_R_shard = NamedSharding(mesh_xy, _chi_R_spec)
+    psi_mun_shard = NamedSharding(mesh_xy, psi_mun_spec)
+    psi_nmu_shard = NamedSharding(mesh_xy, psi_nmu_spec)
+    rep0, rep1, rep2 = (NamedSharding(mesh_xy, s) for s in (P(), P(None), P(None, None)))
+    # One planned block GEMM at full k, shared by every Gv/Gc block build.
+    g_plan = gemm_plan(mesh_xy, m=n_rmu, k=nb_full, n=n_rmu, nq=nk,
+                       dtype=jnp.complex128, layout=layout, enable_active_range=True)
+
+    def to_full_k(psi_mun, psi_nmu, tables):
+        if k_unfold_plan is None:
+            return (psi_mun, psi_nmu) + tuple(tables)
+        unfold = shard_map(
+            lambda l, r: (k_unfold_plan.unfold_face(l, spin_axis=1, mu_axis=2, mesh_axis="x"),
+                          k_unfold_plan.unfold_face(r, spin_axis=2, mu_axis=3, mesh_axis="y")),
+            mesh=mesh_xy, in_specs=(psi_mun_spec, psi_nmu_spec),
+            out_specs=(psi_mun_spec, psi_nmu_spec), check_vma=False)
+        rows = jnp.asarray(k_unfold_plan.irr_idx)
+        return unfold(psi_mun, psi_nmu) + tuple(jnp.take(v, rows, axis=0) for v in tables)
+
+    nodes_shard = MinimaxNodes(t=rep1, alpha=rep1 if n_out == 1 else rep0)
+
+    def integrate(nodes, psi_mun, psi_nmu, mask_v, mask_c, enk_full, vmax, cmin):
+        psi_mun, psi_nmu, mask_v, mask_c, enk_full = to_full_k(
+            psi_mun, psi_nmu, (mask_v, mask_c, enk_full))
+        zero = jax.lax.with_sharding_constraint(
+            jnp.zeros((nk, n_rmu, n_rmu), dtype=jnp.complex128), chi_R_shard)
+        alpha_rows = (nodes.alpha[:, None] if n_out == 1 else jnp.transpose(nodes.alpha))
+
+        def block_green(left, right, t, ref, mask):
+            G = build_G_tau(left, right, enk_full, t, e_ref=ref, mask=mask,
+                            layout=layout, gemm=g_plan, trim_zero_bands=True,
+                            conjugate=True)
+            return chi_fftn(jax.lax.with_sharding_constraint(
+                G.reshape(nk, n_rmu, n_rmu), chi_R_shard))
+
+        def node(acc, xs):
+            t_scalar, alpha_col = xs
+            tau = t_scalar if complex_contour else jnp.real(t_scalar).astype(jnp.float64)
+            t_c = jnp.conj(tau) if complex_contour else tau
+
+            def pair(chi, index):
+                left = jax.lax.dynamic_slice_in_dim(psi_mun, index // ns, 1, axis=1)
+                right = jax.lax.dynamic_slice_in_dim(psi_nmu, index % ns, 1, axis=2)
+                Gv_R = block_green(left, right, -tau, vmax, mask_v)
+                # Finish the valence block before the conduction GEMM starts.
+                Gv_R, left = jax.lax.optimization_barrier((Gv_R, left))
+                Gc_R = block_green(left, right, t_c, cmin, mask_c)
+                return jax.lax.with_sharding_constraint(
+                    chi + Gc_R * jnp.conj(Gv_R), chi_R_shard), None
+
+            chi_tau, _ = jax.lax.scan(pair, zero, jnp.arange(ns * ns), unroll=1)
+            if not complex_contour:
+                chi_tau = _complete_static_vertex_orientations(chi_tau)
+            return tuple(a + alpha_col[i] * chi_tau for i, a in enumerate(acc)), None
+
+        final_R, _ = jax.lax.scan(node, (zero,) * n_out, (nodes.t, alpha_rows), unroll=1)
+        return tuple(chi_fftn(value) for value in final_R)
+
+    in_shardings = (nodes_shard, psi_mun_shard, psi_nmu_shard, rep2, rep2, rep2, rep0, rep0)
+    if n_out >= 2:
+        return jax.jit(integrate, in_shardings=in_shardings,
+                       out_shardings=tuple(chi_R_shard for _ in range(n_out)))
+    return jax.jit(lambda *args: integrate(*args)[0], in_shardings=in_shardings,
+                   out_shardings=chi_R_shard)
 
 
 def _get_chi_fractional_contour_kernel(
