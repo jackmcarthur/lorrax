@@ -219,6 +219,25 @@ def response_weights(wfns, meta):
     }
 
 
+@lru_cache(maxsize=None)
+def _parent_face_unfold(plan, mesh_xy, wfn_layout):
+    """Both endpoint faces of one parent family unfolded to full k, once per plan.
+
+    SC maps keep the parent plan and rotate only the carrier values, so the
+    same program serves every map.
+    """
+    from common.shard_map import shard_map
+    from common.wfn_layout import psi_specs
+    nmu_spec, mun_spec = psi_specs(wfn_layout)
+
+    @partial(shard_map, mesh=mesh_xy, in_specs=(mun_spec, nmu_spec),
+             out_specs=(mun_spec, nmu_spec), check_vma=False)
+    def unfold(mun, nmu):
+        return (plan.unfold_face(mun, spin_axis=1, mu_axis=2, mesh_axis="x"),
+                plan.unfold_face(nmu, spin_axis=2, mu_axis=3, mesh_axis="y"))
+    return jax.jit(unfold)
+
+
 def prepare_photon_carriers(wfns, wfns_transverse, mu_bases, *,
                             mesh_xy, layout):
     """Prepare bare/J-applied photon endpoints for the one response stream.
@@ -231,7 +250,6 @@ def prepare_photon_carriers(wfns, wfns_transverse, mu_bases, *,
     Only linear-size wavefunction carriers are materialized here.
     """
     from common.gamma_matrices import gamma_apply, gamma_perm_phase
-    from common.shard_map import shard_map
     from common.wfn_layout import psi_specs
     from .photon_layout import pack_photon_faces
     from .w_isdf import _require_current_chi_endpoints
@@ -247,13 +265,8 @@ def prepare_photon_carriers(wfns, wfns_transverse, mu_bases, *,
     nmu_spec, mun_spec = psi_specs(wfns.layout)
     families = []
     for carrier, basis in zip((left, right), mu_bases):
-        plan = carrier.plan
-        @partial(shard_map, mesh=mesh_xy, in_specs=(mun_spec, nmu_spec),
-                 out_specs=(mun_spec, nmu_spec), check_vma=False)
-        def unfold(mun, nmu):
-            return (plan.unfold_face(mun, spin_axis=1, mu_axis=2, mesh_axis="x"),
-                    plan.unfold_face(nmu, spin_axis=2, mu_axis=3, mesh_axis="y"))
-        mun, nmu = jax.jit(unfold)(carrier.psi_mun, carrier.psi_nmu)
+        mun, nmu = _parent_face_unfold(carrier.plan, mesh_xy, wfns.layout)(
+            carrier.psi_mun, carrier.psi_nmu)
         families.append((basis.unpack_axis(mun, 2, spec=mun_spec),
                          basis.unpack_axis(nmu, 3, spec=nmu_spec)))
     endpoints = []
