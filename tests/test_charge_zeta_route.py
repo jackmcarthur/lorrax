@@ -223,11 +223,9 @@ def test_the_explicit_backends_still_run_the_raising_probe():
     ("_resolve_solver_kind_charge",
      dict(charge_zeta_solve="cholesky", **_UNDER_CAP), "cusolvermp"),
     ("_resolve_solver_kind_transverse",
-     dict(transverse_zeta_solve="ridge", n_rmu_logical=64),
-     "scalapack"),
+     dict(n_rmu_logical=64), "scalapack"),
     ("_resolve_solver_kind_transverse",
-     dict(transverse_zeta_solve="ridge", n_rmu_logical=64),
-     "cusolvermp"),
+     dict(n_rmu_logical=64), "cusolvermp"),
 ])
 def test_a_refusing_resolver_reaches_the_isdf_caller(monkeypatch, resolver,
                                                      kwargs, override):
@@ -378,11 +376,8 @@ def test_the_zeta_rank_gate_fires_inside_a_shard_map(tmp_path):
     ``runtime.initialize_communicator_stack`` sets ``JAX_PLATFORMS=
     "cuda,cpu"`` (``runtime/__init__.py:395``), so a CPU device is always
     present — but a pytest process that imports ``isdf.core`` without booting
-    the runtime does, and that is what makes the sibling cell
-    ``test_spectral_closure::test_the_padded_distributed_helper_ignores_the_\
-identity_pad`` red on this module at ``origin/main`` too.  So the probe runs
-    under ``JAX_PLATFORMS=cpu``, which is the same idiom
-    ``test_transverse_rank_truncate`` uses for its device-face workers.
+    the runtime does.  So the probe runs under ``JAX_PLATFORMS=cpu``, the
+    idiom the multi-device workers use for their device faces.
     """
     import os
     import subprocess

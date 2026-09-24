@@ -869,7 +869,6 @@ class LinalgResolution:
     sc_eigh: str
     charge_zeta_solve: str
     distributed_zeta_solve: str
-    transverse_zeta_solve: str
 
 
 _LINALG_RESOLUTION = "_linalg_resolution"
@@ -896,7 +895,6 @@ def resolve_linalg(params) -> LinalgResolution:
             sc_eigh="auto",
             charge_zeta_solve="rank_truncate",
             distributed_zeta_solve="auto",
-            transverse_zeta_solve="ridge",
         )
     return LinalgResolution(
         layout=layout,
@@ -915,7 +913,6 @@ def resolve_linalg(params) -> LinalgResolution:
         # route G applies the factor B on each G tile, and the planner picks
         # local/replicated (isdf.core.zeta_auto_tier).
         distributed_zeta_solve="auto",
-        transverse_zeta_solve="ridge",
     )
 
 
@@ -987,24 +984,6 @@ def resolve_eigh_backend(params, *, override: str | None = None) -> str:
 #: the value itself is owner-scoped (R19: lowering it on a noise-floor
 #: argument would have cost a 5000 eV error) and did not change here.
 ZETA_RCOND_DEFAULT: float = 1e-8
-
-#: The production TRANSVERSE ζ rank-truncation cutoff τ (relative to
-#: ``|λ|_max``, per q).  Same one-copy rule as :data:`ZETA_RCOND_DEFAULT`
-#: above, and for the same reason: until 2026-08-22 this number lived THREE
-#: times — here in ``_DEFAULTS`` and as the signature default of
-#: ``gw/isdf_fitting.fit_zeta_to_h5`` and ``isdf/core.factor_c_q`` — so a
-#: producer-side caller that omitted the argument silently picked up a
-#: literal nobody would have thought to change.  The two signature sites now
-#: import THIS name.  The measured rationale is at the
-#: ``"transverse_zeta_rcond"`` deck entry below.
-#:
-#: NOTE what this value implies under the truncation policy: κ_cap = 1e10,
-#: which is ABOVE the 1e8 certified for a PSD overlap Gram.  That is not an
-#: oversight — the transverse channel is a different (indefinite) operator
-#: with no production-deck measurement behind it, so its site is
-#: UNCERTIFIED and warns rather than refusing
-#: (``docs/dev/rank_truncation_policy.md`` §6, §9).
-TRANSVERSE_ZETA_RCOND_DEFAULT: float = 1e-10
 
 _DEFAULTS = {
     # System geometry
@@ -1558,31 +1537,6 @@ _DEFAULTS = {
     # ZETA_RCOND_DEFAULT (defined above _DEFAULTS) — one copy, no mirrors.
     # reports/gw_rank_truncation_2026-07-20 + gw_bandrange_centroids_2026-07-21.
     "zeta_rcond":           ZETA_RCOND_DEFAULT,
-    # Internal transverse ζ-solve family (bispinor μ_L=1,2,3 channels only;
-    # inert otherwise).  Both public layouts retain ridge: the historical hoisted pivoted-LU
-    # with the 1e-12·|tr|/n diagonal ridge — byte-identical to the
-    # pre-feature behavior.  "rank_truncate" = per-q eigh pseudo-inverse
-    # of the Hermitian INDEFINITE transverse CCT with an |λ| cut (drop
-    # |λ| < transverse_zeta_rcond·|λ|_max): the charge channel's
-    # conditioning cure ported to the transverse channel — TRS-paired
-    # near-null current modes are REMOVED instead of inverted through at
-    # the ridge floor (κ~1e12), and the per-q n_keep log doubles as the
-    # transverse basis-adequacy instrument.  Grammar mirrors
-    # charge_zeta_solve.  Its LOCAL plan (replicated whole-tile eigh,
-    # q-parallel at P>1) runs at ANY centroid count on ANY mesh; its
-    # DISTRIBUTED plan is selected by distributed_zeta_solve=distributed
-    # (pzheevd at the padded extent — the mesh-divisibility constraint of
-    # distributed_lu=scalapack does not apply).  distributed_lu is an LU
-    # backend key and conflicts with this family: explicit
-    # scalapack/cusolvermp + rank_truncate refuses at parse time.
-    # Transverse rank-truncation cutoff τ (relative to |λ|_max, per q).
-    # Only read by transverse_zeta_solve=rank_truncate.  Default from the
-    # 2026-08 MoS2 4×4 bispinor calibration ladder (eqp drift vs the
-    # ridge control monotone in τ and within the 1e-4 eV gauge tolerance
-    # across transverse set sizes).  No env twin (scorecard AV: policy
-    # knobs live in the deck).  TRANSVERSE_ZETA_RCOND_DEFAULT (defined above
-    # _DEFAULTS) — one copy, no mirrors.
-    "transverse_zeta_rcond": TRANSVERSE_ZETA_RCOND_DEFAULT,
     # γ̃-double-contract kernel variant inside the monolithic pair
     # pipeline (see ``common.gamma_matrices.gamma_double_contract``).
     # Math identical across all three; differ in HLO structure.
@@ -2004,6 +1958,7 @@ _LEGACY_DECK_KEYS = frozenset({
     "mpa_sigma_sector_target_error",   # refused (one box rule, no sectors)
     "mpa_sigma_max_nodes",             # refused (no pair ceiling)
     "sigma_regularization_floor_ev",   # refused (sigma_regularization_ev)
+    "transverse_zeta_rcond",           # refused (ridge LU family only)
     "ppm_sigma_max_nodes",
     # 2026-08-14: host-tile accumulation is the only Σ(ω) accumulation
     # mode, so the key steered nothing.  The removed ``kij_stream`` VALUE
@@ -2788,11 +2743,6 @@ def _input_memory_group(
 def _input_backend(
         _linalg, params, runtime_platform):
     """Produce the resolved factorization and contraction backends."""
-    _transverse_zeta_rcond = float(params["transverse_zeta_rcond"])
-    if not (0.0 < _transverse_zeta_rcond < 1.0):
-        raise ValueError(
-            f"transverse_zeta_rcond={_transverse_zeta_rcond!r} must be "
-            f"a relative cutoff in (0, 1).")
     if runtime_platform is not None:
         platform = str(runtime_platform).strip().lower()
         if platform not in ("cpu", "gpu", "cuda"):
@@ -2824,8 +2774,6 @@ def _input_backend(
         charge_zeta_solve=_linalg.charge_zeta_solve,
         distributed_zeta_solve=_linalg.distributed_zeta_solve,
         zeta_rcond=float(params["zeta_rcond"]),
-        transverse_zeta_solve=_linalg.transverse_zeta_solve,
-        transverse_zeta_rcond=_transverse_zeta_rcond,
         gamma_contract_mode=str(params["gamma_contract_mode"]).strip().lower(),
     )
     return (backend)
@@ -3165,7 +3113,10 @@ def _report_early_retired_keys(
              "accuracy dial."),
             ("sigma_regularization_floor_ev",
              "sigma_regularization_ev is the broadening every ansatz runs "
-             "at and nothing raises it. Remove the key.")):
+             "at and nothing raises it. Remove the key."),
+            ("transverse_zeta_rcond",
+             "the transverse ζ is solved by the ridge LU family, which has "
+             "no rank cut. Remove the key.")):
         if section.get(legacy_key, fallback=None) is not None:
             raise ValueError(f"{legacy_key} is retired: {message}")
     for legacy_key in ("ppm_sigma_target_error", "ppm_sigma_max_nodes"):
@@ -4454,8 +4405,6 @@ class BackendConfig:
     charge_zeta_solve: str     # "rank_truncate" | "cholesky"
     distributed_zeta_solve: str  # "auto"|"replicated"|"local"
     zeta_rcond: float          # rank-truncation cutoff (·λ_max)
-    transverse_zeta_solve: str  # "ridge" | "rank_truncate" (bispinor ζ_T)
-    transverse_zeta_rcond: float  # transverse cut τ (·|λ|_max)
     gamma_contract_mode: str  # "take" | "einsum" | "scan"
 
     def summary(self) -> str:

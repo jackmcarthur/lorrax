@@ -374,25 +374,12 @@ def _zeta_fit_provenance(*, wfn, meta, cfg, band_range_left, band_range_right,
 		# the deleted distributed tier (block-cyclic pzheevd, a different
 		# gauge) therefore refits.  A stamp MISSING this key is whole-tile.
 		'distributed_zeta_solve': 'replicated',
-		# TRANSVERSE solve family + cut (2026-08-01, same reader-matrix
-		# idiom as the tier key above): recorded so a family change is
-		# never silently absorbed by reuse.  Collapsed to the inert
-		# canonical ('ridge', None) when the run has no transverse
-		# channel (non-bispinor) — the keys do not change the CHARGE ζ
-		# numerically, so a non-bispinor deck toggling them must not
-		# force a spurious refit.  τ is likewise collapsed to None under
-		# the ridge family (it is not read there).  A stamp MISSING these
-		# keys is a legacy ridge-family fit (every pre-2026-08 ζ was);
-		# `_zeta_reuse_ok` allows reuse for a ridge-family rerun and
-		# refits on a real family mismatch.
-		'transverse_zeta_solve': (
-			str(cfg.backend.transverse_zeta_solve).strip().lower()
-			if _couple_transverse else 'ridge'),
-		'transverse_zeta_rcond': (
-			float(cfg.backend.transverse_zeta_rcond)
-			if (_couple_transverse
-			    and str(cfg.backend.transverse_zeta_solve).strip().lower()
-			    == 'rank_truncate') else None),
+		# TRANSVERSE solve family + cut: the ridge LU family is the only one,
+		# so a fresh fit stamps ('ridge', None); a stamp from the deleted
+		# rank_truncate family (a different gauge) therefore refits.  A stamp
+		# MISSING these keys is a ridge-family fit.
+		'transverse_zeta_solve': 'ridge',
+		'transverse_zeta_rcond': None,
 		# TRANSVERSE CHANNEL identity (2026-08-04, same reader-matrix
 		# idiom as the two key generations above).  ζ reuse used to be
 		# switched off for the whole bispinor run, so none of this had
@@ -411,8 +398,7 @@ def _zeta_fit_provenance(*, wfn, meta, cfg, band_range_left, band_range_right,
 		#       already demotes `auto`→`off` on a CPU backend, so the
 		#       recorded string is what the fit ran.
 		#   transverse_solver_kind   — what `_resolve_solver_kind_transverse`
-		#       actually returned ('lu' | 'scalapack_lu' | 'cusolvermp_lu'
-		#       | 'transverse_rank_truncate').  Recorded IN ADDITION to
+		#       actually returned ('lu' | 'scalapack_lu' | 'cusolvermp_lu').  Recorded IN ADDITION to
 		#       the two knobs above because on a GPU mesh `auto` resolves
 		#       by mesh shape, and those two resolutions are genuinely
 		#       different gauges.  This is the one place a device-count
@@ -1455,8 +1441,7 @@ def _resolve_zeta_fit_contract(
 			n_rmu_padded=basis_T.n_packed)
 		solver_kind_T = _resolve_solver_kind_transverse(
 			mesh_xy, cfg.backend.distributed_lu,
-			n_rmu_logical=meta_transverse.mu_solve_extent,
-			transverse_zeta_solve=cfg.backend.transverse_zeta_solve)
+			n_rmu_logical=meta_transverse.mu_solve_extent)
 		meta_transverse.sys_dim = meta.sys_dim
 		meta_transverse.bispinor = True
 		transverse_identity = {
@@ -2392,8 +2377,6 @@ def _transverse_zeta_channel_runner(
                 distrib_la_batched_route=_transverse_batched_route,
                 zeta_ridge=cfg.backend.zeta_ridge,
                 distributed_zeta_solve=cfg.backend.distributed_zeta_solve,
-                transverse_zeta_solve=cfg.backend.transverse_zeta_solve,
-                transverse_zeta_rcond=cfg.backend.transverse_zeta_rcond,
                 gflat_chunk_size=int(_chunks_T.get('gflat_chunk_size', 0)),
                 cache_psi_r=bool(_chunks_T.get('cache_psi_r', True)),
                 resident_psi_G=bool(_chunks_T.get('resident_psi_G', False)),

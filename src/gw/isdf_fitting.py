@@ -25,7 +25,6 @@ from runtime.padding import bounded_partition_tile
 # See gw/gw_config.py's module comment and tests/test_env_grammar.py for
 # the drift gate.
 from .gw_config import (ZETA_RCOND_DEFAULT,
-                        TRANSVERSE_ZETA_RCOND_DEFAULT,
                         active_zeta_truncating_knobs, env_bool)
 
 from isdf.core import (
@@ -490,8 +489,6 @@ def fit_zeta_to_h5(
     charge_zeta_solve: str = "cholesky",
     distributed_zeta_solve: str = "auto",
     zeta_rcond: float = ZETA_RCOND_DEFAULT,
-    transverse_zeta_solve: str = "ridge",
-    transverse_zeta_rcond: float = TRANSVERSE_ZETA_RCOND_DEFAULT,
     distrib_la_batched_route: str = "batch_reshard",
     gflat_chunk_size: int = 0,
     write_ibz_only: bool = True,
@@ -813,8 +810,7 @@ def fit_zeta_to_h5(
             distributed_cholesky=distributed_cholesky,
             distributed_lu=distributed_lu,
             n_rmu=n_rmu_solve, nq=int(C_q_flat.shape[0]),
-            charge_zeta_solve=charge_zeta_solve,
-            transverse_zeta_solve=transverse_zeta_solve)
+            charge_zeta_solve=charge_zeta_solve)
 
         # Preserve the fused path's exact ridge scalar for distributed LU.
         # Materializing this tiny (nq,) reduction before factor preparation
@@ -840,10 +836,6 @@ def fit_zeta_to_h5(
                            "once per channel)"
                       if _resolved_solver_kind in
                       ('scalapack_lu', 'cusolvermp_lu')
-                      else "rank-truncated pinv (|lambda| cut, explicit "
-                           "C+, once per channel, rcond="
-                           f"{float(transverse_zeta_rcond):g})"
-                      if _resolved_solver_kind == 'transverse_rank_truncate'
                       else "CCT passthrough (fused per-r-chunk getrf+getrs)")
             print_fn(f"  Computing transverse factor = {_how_t}  "
                      f"[γ̃^{vertex_mu_L} indefinite — "
@@ -875,7 +867,6 @@ def fit_zeta_to_h5(
                 C_q_flat, mesh_xy, vertex_mu_L=int(vertex_mu_L),
                 n_rmu_logical=n_rmu_solve, solver_kind=_resolved_solver_kind,
                 zeta_ridge=zeta_ridge, zeta_rcond=zeta_rcond,
-                transverse_zeta_rcond=float(transverse_zeta_rcond),
                 distrib_la_batched_route=distrib_la_batched_route,
                 transverse_trace_per_q=factor_trace_per_q)
         else:
@@ -903,15 +894,11 @@ def fit_zeta_to_h5(
     if _coupled_factor:
         cct_trace_per_q = factor_trace_per_q
     elif (int(vertex_mu_L) != 0 and lu_piv is None
-            and not isinstance(L_q, FactorToken)
-            and _resolved_solver_kind != 'transverse_rank_truncate'):
+            and not isinstance(L_q, FactorToken)):
         # ``not isinstance(...)`` is the ScaLAPACK hoist: its ridge is
         # baked into the factored matrix, so it needs no trace operand —
         # the condition used to read that off ``lu_piv is not None``, and
-        # the pivots live in the token now.  Rank-truncate kinds also
-        # return piv=None but carry no fused LU path — no ridge, hence no
-        # trace operand (their L_q is C⁺, whose trace would be a
-        # different, meaningless quantity here).
+        # the pivots live in the token now.
         with timing.section("zeta_fit.trace_L_q"):
             # LOGICAL-block trace only: the identity pad block would
             # contribute exactly +mu_pad to the padded trace, making
@@ -1615,7 +1602,6 @@ def fit_zeta_to_h5(
                                 n_rmu_logical=n_rmu_solve,
                                 solver_kind=_resolved_solver_kind,
                                 zeta_ridge=zeta_ridge, zeta_rcond=zeta_rcond,
-                                transverse_zeta_rcond=transverse_zeta_rcond,
                                 distrib_la_batched_route=distrib_la_batched_route,
                                 transverse_trace_per_q=trace)
                             return zeta_factor_resident(

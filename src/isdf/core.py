@@ -1886,19 +1886,12 @@ def _replicate_rank_truncate_ok(nq: int | None, n_rmu: int | None) -> bool:
                                      _REPLICATED_FACTOR_MAX_BATCH_BYTES)
 
 
-#: Per-channel tail of :func:`_rank_truncate_capacity_error` — the deck keys
-#: that actually exist on each channel.  The arithmetic and the ceiling are
-#: identical because THE BUFFER IS THE SAME BUFFER (one replicated
-#: ``(q_batch, mu, mu)`` c128 eigh operand); only the escape routes differ.
+#: Per-channel tail of :func:`_rank_truncate_capacity_error`.  Only the
+#: charge channel runs a rank-truncating factor.
 _RANK_TRUNCATE_CHANNEL_ADVICE = {
     'charge': (
         "The charge channel's ζ is route G's, which needs this whole-tile "
         "factor; there is no distributed charge factor."),
-    'transverse': (
-        "For large n_mu_T use the LU+ridge family (transverse_zeta_solve="
-        "'ridge', the `linalg` default; NOT rank-conditioned — the "
-        "transverse CCT is indefinite and near-null, so verify the fit "
-        "residual)."),
 }
 
 
@@ -1917,9 +1910,7 @@ def _rank_truncate_capacity_error(nq, n_rmu, *, channel: str) -> ValueError:
     cap = max(_REPLICATED_CHOL_MAX_STACK_BYTES,
               _REPLICATED_FACTOR_MAX_BATCH_BYTES)
     mu_max = int(math.isqrt(cap // 16))
-    key = ('charge_zeta_solve' if channel == 'charge'
-           else 'transverse_zeta_solve')
-    mu_name = 'n_mu' if channel == 'charge' else 'n_mu_T'
+    key, mu_name = 'charge_zeta_solve', 'n_mu'
     try:
         advice = _RANK_TRUNCATE_CHANNEL_ADVICE[channel]
     except KeyError:  # pragma: no cover - programming error
@@ -2035,34 +2026,8 @@ def _resolve_solver_kind_charge(
 
 def _resolve_solver_kind_transverse(mesh_xy: Mesh, override: str = "auto",
                                     n_rmu_logical: int | None = None,
-                                    transverse_zeta_solve: str = "ridge",
-                                    nq: int | None = None,
                                     ) -> str:
     """Pick the transverse-channel ζ-fit solver: cuSolverMp distributed getrf+getrs vs the in-tree per-q ``jnp.linalg.solve`` + ridge; see docs/architecture/zeta_fit_face_psi_cct.md."""
-    fam = str(transverse_zeta_solve).strip().lower()
-    if fam == 'rank_truncate':
-        if override in ('on', 'cusolvermp', 'scalapack'):
-                raise ValueError(
-                f"transverse_zeta_solve='rank_truncate' selects the eigh "
-                f"pseudo-inverse family, which has no distributed plan — "
-                f"but distributed_lu={override!r} explicitly requests an LU "
-                f"backend the family does not run.  Leave distributed_lu "
-                f"at 'auto'/'off', or set transverse_zeta_solve='ridge' "
-                f"to use the LU family.")
-        # Same capacity gate as the charge branch: one replicated
-        # (q_batch, mu_T, mu_T) c128 eigh operand.  With nq unknown (the
-        # gw_init pre-flight has only the centroid file) the ζ-fit call site
-        # re-resolves with nq and refuses there.
-        if (nq is not None and n_rmu_logical is not None
-                and not _replicate_rank_truncate_ok(nq, n_rmu_logical)):
-            raise _rank_truncate_capacity_error(
-                nq, n_rmu_logical, channel='transverse')
-        return 'transverse_rank_truncate'
-    if fam != 'ridge':
-        raise ValueError(
-            f"transverse_zeta_solve={transverse_zeta_solve!r} invalid; "
-            f"expected ridge / rank_truncate.")
-
     def _scalapack(px: int, py: int) -> str:
         # Door guard ladder (distrib_la.resolve_backend): host-only platform
         # (defense-in-depth — gw_config already rejects scalapack on
@@ -2106,15 +2071,10 @@ def _resolve_solver_kind_transverse(mesh_xy: Mesh, override: str = "auto",
                     f"indefinite transverse solve must run at the LOGICAL "
                     f"extent (pad-extent LU roundoff is amplified O(1) in "
                     f"the near-null transverse modes) and the block-cyclic "
-                    f"descriptors need n % px == n % py == 0.  Either pick "
-                    f"a transverse centroid count divisible by both mesh "
-                    f"axes, change the process mesh, set "
-                    f"distributed_lu = off (per-q replicated "
-                    f"jnp.linalg.solve, valid at any extent), or use "
-                    f"transverse_zeta_solve = rank_truncate (its "
-                    f"distributed plan runs pzheevd at the PADDED extent "
-                    f"— divisible by construction — with exactly-inert "
-                    f"pad modes, so any count fits any square mesh).")
+                    f"descriptors need n % px == n % py == 0.  Pick a "
+                    f"transverse centroid count divisible by both mesh "
+                    f"axes, change the process mesh, or use `linalg = "
+                    f"local` (per-q replicated LU, valid at any extent).")
             if jax.process_index() == 0:
                 print(
                     f"  [solver resolve] transverse LU: auto resolved to "
@@ -2134,15 +2094,13 @@ def _resolve_solver_kind(
     n_rmu: int | None = None,
     nq: int | None = None,
     charge_zeta_solve: str = "cholesky",
-    transverse_zeta_solve: str = "ridge",
 ) -> str:
     """Single source of truth for the ``auto`` resolution; see docs/architecture/zeta_fit_face_psi_cct.md."""
     if solver_kind != 'auto':
         return solver_kind
     if int(vertex_mu_L) != 0:
         return _resolve_solver_kind_transverse(
-            mesh_xy, distributed_lu, n_rmu_logical=n_rmu,
-            transverse_zeta_solve=transverse_zeta_solve, nq=nq)
+            mesh_xy, distributed_lu, n_rmu_logical=n_rmu)
     return _resolve_solver_kind_charge(
         mesh_xy, distributed_cholesky, n_rmu=n_rmu, nq=nq,
         charge_zeta_solve=charge_zeta_solve)
@@ -2205,8 +2163,7 @@ def deprecated_env_record(env_name: str, key_value) -> str:
 # deliberately jax-free and imports nothing from ``isdf``.
 # (P1.3 grammar unification, 2026-07-31; the drift gate is
 # ``tests/test_env_grammar.py``, which scans this file as an OWNED file.)
-from gw.gw_config import (ZETA_RCOND_DEFAULT,
-                          TRANSVERSE_ZETA_RCOND_DEFAULT, env_bool)
+from gw.gw_config import ZETA_RCOND_DEFAULT, env_bool
 
 
 def _deprecated_env_float(env_name: str, key_name: str, key_value) -> float:
@@ -2378,48 +2335,6 @@ def _certify_the_cut(spectrum, keep, *, where: str, kappa_certified,
 def _charge_factor_math(C_log, *, mode: str, n_log: int,
                         ridge_extra: float, rcond: float, rank_log: bool):
     """The per-q dense factor arithmetic — ONE kernel, shared bit-for-bit by the all-ranks (replicated) and q-parallel executions of the replicated plan (:func:`_factor_c_q_replicated`, :func:`_factor_c_q_replicated_qparallel`); see docs/architecture/zeta_fit_face_psi_cct.md."""
-    if mode == 'transverse_rank_truncate':
-        # WHY THIS FEATURE EXISTS (mirror of the charge cure below, for
-        # the indefinite transverse CCT): TRS in non-magnetic ground
-        # states gives near-null transverse-current modes; the LU+ridge
-        # family inverts THROUGH them (lifted only to the 1e-12·tr/n
-        # ridge floor, κ~1e12), so ULP/mesh roundoff on those modes is
-        # amplified O(1) into ζ_T.  Rank truncation DROPS |λ| <
-        # τ·|λ|_max instead — κ_eff ≤ 1/τ by construction — and is the
-        # basis-adequacy instrument for the transverse set (n_keep/q).
-        lam, V = jnp.linalg.eigh(C_log)      # Hermitian INDEFINITE
-        sig = jnp.abs(lam)
-        sig_max = jnp.max(sig, axis=-1, keepdims=True)
-        keep = sig > (rcond * sig_max)
-        keep = _close_the_cut(lam, keep, where="zeta transverse rank_truncate")
-        # THE GATE.  ``kappa_certified=None``: no production-deck measurement
-        # of the truncated TRANSVERSE route exists, so its ceiling is absent
-        # and only the discarded-weight finding can fire.  That is stated in
-        # the log rather than left to look like a clean bill
-        # (docs/dev/rank_truncation_policy.md §6, §9).
-        _certify_the_cut(lam, keep, where="zeta transverse rank_truncate",
-                         kappa_certified=None, rcond=rcond)
-        inv = jnp.where(keep, 1.0 / jnp.where(keep, lam, 1.0), 0.0)
-        if rank_log:
-            # Same conditioning signal as the charge route: n_keep/q is
-            # the measured transverse basis adequacy; σ_min(kept)/σ_max
-            # bound the achieved amplification κ_eff ≤ 1/τ.
-            sig_keep_min = jnp.min(
-                jnp.where(keep, sig, jnp.inf), axis=-1)
-            n_keep = jnp.sum(keep, axis=-1)
-            sig_drop_hi = jnp.max(
-                jnp.where(keep, -jnp.inf, sig), axis=-1)
-            jax.debug.print(
-                "[zeta transverse rank_truncate] n_log={n} rcond={rc:.1e} "
-                "n_keep/q={k} sig_max/q={mx} sig_min_kept/q={mn} "
-                "kappa/q={kp} sdrop_hi/q={dh}",
-                n=n_log, rc=rcond, k=n_keep,
-                mx=sig_max[..., 0], mn=sig_keep_min,
-                kp=sig_max[..., 0] / sig_keep_min,
-                dh=sig_drop_hi,
-                ordered=False)
-        Vs = V * inv[..., None, :].astype(V.dtype)
-        return Vs @ jnp.conj(jnp.swapaxes(V, -1, -2))
     if mode == 'rank_truncate':
         from isdf import cplus
         return cplus.factor(C_log, rcond=rcond, rank_log=rank_log, n_log=n_log)
@@ -2440,9 +2355,9 @@ def solve_zeta_charge_dense(C, Z, *, charge_zeta_solve: str,
         raise ValueError(
             f"solve_zeta_charge_dense: charge_zeta_solve={charge_zeta_solve!r} "
             f"is not a charge-channel solve.  Expected 'rank_truncate' (the "
-            f"production default) or 'cholesky'.  The transverse families "
-            f"('ridge', 'transverse_rank_truncate') solve an INDEFINITE CCT "
-            f"and do not belong on this entry point.")
+            f"production default) or 'cholesky'.  The transverse ridge "
+            f"family solves an INDEFINITE CCT and does not belong on this "
+            f"entry point.")
     n_log = int(C.shape[-1])
     if rank_log is None:
         rank_log = mode == 'rank_truncate'
@@ -2468,15 +2383,10 @@ def _factor_c_q_replicated(
     nq, n_rmu, _ = C_q.shape
     n_log = int(n_rmu_logical)
     mode = str(charge_zeta_solve)
-    # DEPRECATED env forms — the input keys are the record (scorecard AV).
-    # The env twins are CHARGE-channel keys; the transverse tau
-    # (transverse_zeta_rcond) deliberately has no env twin, so the charge
-    # override must not bleed into the transverse mode.
+    # Deprecated env twins of the charge input keys.
     ridge_extra = _deprecated_env_float(
         "LORRAX_ZETA_RIDGE", "zeta_ridge", zeta_ridge)
-    rcond = (float(zeta_rcond) if mode == 'transverse_rank_truncate'
-             else _deprecated_env_float(
-                 "LORRAX_ZETA_RCOND", "zeta_rcond", zeta_rcond))
+    rcond = _deprecated_env_float("LORRAX_ZETA_RCOND", "zeta_rcond", zeta_rcond)
     out_sh = NamedSharding(mesh_xy, P(None, 'x', 'y'))
     rep_sh = NamedSharding(mesh_xy, P())
     key = (_mesh_key(mesh_xy), int(nq), int(n_rmu), n_log,
@@ -2484,7 +2394,7 @@ def _factor_c_q_replicated(
     if key not in _replicated_chol_cache:
         _re = ridge_extra
         _rc = rcond
-        _rank_log = mode in ('rank_truncate', 'transverse_rank_truncate')
+        _rank_log = mode == 'rank_truncate'
         @partial(jax.jit, out_shardings=out_sh)
         def _fn(C):
             def _factor_log(C_log):
@@ -2498,22 +2408,6 @@ def _factor_c_q_replicated(
                 F = _charge_factor_math(
                     C_log, mode=mode, n_log=n_log, ridge_extra=_re,
                     rcond=_rc, rank_log=_rank_log)
-                if mode == 'transverse_rank_truncate':
-                    # This mode's factor ENDS in a GEMM (C⁺ = Vs Vᴴ).
-                    # LAPACK factor outputs (cholesky/eigh) plus
-                    # elementwise tails are replicated-identical under
-                    # SPMD, but an unconstrained GEMM feeding the jit's
-                    # P(None,'x','y') out_shardings gets partitioned —
-                    # each device then runs a SHARD-shaped dot micro-
-                    # kernel whose fma grouping differs from the whole-
-                    # tile one, breaking the plan's mesh-invariance
-                    # contract (caught by the unit gate, job 7885328:
-                    # q-parallel legs exact, all-ranks multi-device legs
-                    # drifted).  Pin the product replicated so every
-                    # device computes the WHOLE tile — bit-identical to
-                    # 1x1 and to the q-parallel whole-tile GEMM; the
-                    # out_shardings shard afterwards is a local slice.
-                    F = jax.lax.with_sharding_constraint(F, rep_sh)
                 return F
 
             F_log = solve_at_logical(
@@ -2652,14 +2546,11 @@ def _factor_c_q_replicated_qparallel(
     nq, n_rmu, _ = C_q.shape
     n_log = int(n_rmu_logical)
     mode = str(charge_zeta_solve)
-    # DEPRECATED env forms — charge-channel only; the transverse tau has
-    # no env twin (see _factor_c_q_replicated).
+    # Deprecated env twins of the charge input keys.
     ridge_extra = _deprecated_env_float(
         "LORRAX_ZETA_RIDGE", "zeta_ridge", zeta_ridge)
-    rcond = (float(zeta_rcond) if mode == 'transverse_rank_truncate'
-             else _deprecated_env_float(
-                 "LORRAX_ZETA_RCOND", "zeta_rcond", zeta_rcond))
-    rank_log = mode in ('rank_truncate', 'transverse_rank_truncate')
+    rcond = _deprecated_env_float("LORRAX_ZETA_RCOND", "zeta_rcond", zeta_rcond)
+    rank_log = mode == 'rank_truncate'
     ndev = int(mesh_xy.devices.size)
     py = int(mesh_xy.shape['y'])
     from runtime.padding import padded_axis
@@ -2822,11 +2713,8 @@ def _certify_transverse_ridge(LU_q: jax.Array, *, n_log: int,
         f"eigenvalues TOWARD zero.  Above kappa ~ 1e12 the ridge is measured "
         f"actively harmful (register bispinor, job 7885987), and the ridge's "
         f"own docstring mechanism claim was refuted by that measurement.\n"
-        f"  fix   : set transverse_zeta_solve = rank_truncate, which cuts on "
-        f"|lambda| and returns the explicit truncated pseudo-inverse — the "
-        f"correct scheme for an indefinite operator, and the one whose "
-        f"conditioning is bounded by construction (kappa_eff <= "
-        f"1/transverse_zeta_rcond).\n"
+        f"  fix   : reduce the transverse centroid count, which removes the "
+        f"near-null current modes that set kappa.\n"
         f"  override: {rank_criterion.POLICY_MODE_ENV}=warn continues and "
         f"leaves a trace; =off disarms the gate.")
     if mode == "refuse":
@@ -3159,7 +3047,6 @@ def factor_c_q(
     solver_kind: str = 'auto',
     zeta_ridge: float = 0.0,
     zeta_rcond: float = ZETA_RCOND_DEFAULT,
-    transverse_zeta_rcond: float = TRANSVERSE_ZETA_RCOND_DEFAULT,
     distrib_la_batched_route: str = "batch_reshard",
     transverse_trace_per_q: jax.Array | None = None,
 ) -> jax.Array:
@@ -3179,20 +3066,13 @@ def factor_c_q(
     C_q = _identity_pad_block_diagonal(
         C_q, n_rmu_logical=n_rmu_logical, mesh_xy=mesh_xy)
 
-    # Indefinite-CCT path: no Cholesky.  TWO solve families since
-    # 2026-08-01.  The ordinary routes are hoisted (factor ONCE per channel,
-    # applied per r-chunk):
-    #   ridge (LU) family — per-q pivoted LU + 1e-12 ridge (see the
-    #   "hoisted TRANSVERSE factor stage" section above);
-    #   rank_truncate family — per-q eigh pseudo-inverse with an |λ| cut
-    #   (transverse_zeta_solve='rank_truncate'; the charge conditioning
-    #   cure ported to the indefinite CCT).
+    # Indefinite-CCT path: no Cholesky.  The ridge (LU) family is hoisted
+    # (factored ONCE per channel, applied per r-chunk): per-q pivoted LU +
+    # 1e-12 ridge (see the "hoisted TRANSVERSE factor stage" section above).
     # Returns a (factor, piv) PAIR:
     #   'lu'           -> (LU embedded at padded extent, perm)  [local]
     #   'scalapack_lu' -> (FactorToken, None)   [the ipiv is INSIDE it]
     #   'cusolvermp_lu'-> (FactorToken, None)   [CUDA pivots INSIDE it]
-    #   'transverse_rank_truncate' -> (C⁺ at padded extent via the
-    #                     replicated scaffolding, None)
     # The piv SLOT survives for the local 'lu' plan, whose (LU, perm) is
     # jax's own ``lax.linalg.lu_solve`` pair and not a library handle at
     # all.  Every DISTRIBUTED factor now travels in the token instead, so
@@ -3200,17 +3080,6 @@ def factor_c_q(
     if int(vertex_mu_L) != 0:
         t_kind = _resolve_solver_kind(
             mesh_xy, int(vertex_mu_L), solver_kind, n_rmu=n_rmu_logical)
-        if t_kind == 'transverse_rank_truncate':
-            # LOCAL plan of the rank_truncate family (2026-08-01):
-            # explicit truncated pseudo-inverse C⁺ per q, through the
-            # SAME replicated scaffolding as the charge factor (batched
-            # + q-parallel fold, identity pad re-embed) — the schedule
-            # contract is inherited, not duplicated.  piv slot is None:
-            # the back-solve is one matmul, no permutation exists.
-            return factor_c_q_replicated_batched(
-                C_q, mesh_xy, n_rmu_logical, zeta_ridge=0.0,
-                charge_zeta_solve='transverse_rank_truncate',
-                zeta_rcond=float(transverse_zeta_rcond)), None
         if t_kind in ('scalapack_lu', 'cusolvermp_lu'):
             # A block-cyclic token cannot enter distrib_la's face-to-batch
             # schedule.  Factor ONCE with the existing local-JAX kernel and
@@ -3238,9 +3107,7 @@ def factor_c_q(
                           "NOT MEASURED: the block-cyclic provider LU factor "
                           "is inside a FactorToken with no public buffer, so "
                           "the |diag U| kappa bound is unreachable here.  "
-                          "That is an absence, not a pass — use "
-                          "transverse_zeta_solve = rank_truncate for a route "
-                          "whose conditioning is bounded by construction.",
+                          "That is an absence, not a pass.",
                           flush=True)
                 return _factor_c_q_transverse_distributed_lu(
                     C_q, mesh_xy, n_rmu_logical,
@@ -3427,18 +3294,13 @@ def _zeta_logical_solvers(
         from isdf import cplus
         return solve_at_logical(cplus.apply, n_log, (B,), Z)
 
-    def _pinv_apply_T_logical(Cp: jax.Array, Z: jax.Array) -> jax.Array:
-        """Transverse rank-truncation back-solve at the LOGICAL μ extent: ζ = C⁺Z, ONE matmul (``Cp`` is the explicit truncated pseudo-inverse of the indefinite transverse CCT); see docs/architecture/zeta_fit_face_psi_cct.md."""
-        def _mm(Cp_log, Z_log):
-            return Cp_log @ Z_log
-        return solve_at_logical(_mm, n_log, (Cp,), Z)
-    return _ridge_indef_solve, _lu_apply_logical, _tri_solve_logical, _pinv_matmul_logical, _pinv_apply_T_logical
+    return _ridge_indef_solve, _lu_apply_logical, _tri_solve_logical, _pinv_matmul_logical
 
 
 def _zeta_batched_kernels(
-        L_batch_rep_shard, _lu_apply_logical, _pinv_apply_T_logical, _pinv_matmul_logical,
+        L_batch_rep_shard, _lu_apply_logical, _pinv_matmul_logical,
         _ridge_indef_solve, _tri_solve_logical, hoisted_lu, mesh_xy, piv_rep_shard, use_lu,
-        use_pinv_T, use_rank_trunc):
+        use_rank_trunc):
     """Produce the existing sharded and donated batched zeta solve kernels."""
     @partial(shard_map, mesh=mesh_xy,
              in_specs=(P(None, None), P(None, ('x', 'y'))),
@@ -3447,9 +3309,6 @@ def _zeta_batched_kernels(
         if use_rank_trunc:
             # Charge C⁺ pseudo-inverse factor: matmul back-solve.
             return _pinv_matmul_logical(L, Z_cols)
-        if use_pinv_T:
-            # Transverse explicit C⁺: one-matmul back-solve.
-            return _pinv_apply_T_logical(L, Z_cols)
         if use_lu:
             # Indefinite CCT^μ: pivoted-LU back-solve with ridge.
             return _ridge_indef_solve(L, Z_cols)
@@ -3469,9 +3328,6 @@ def _zeta_batched_kernels(
             # C⁺ factor matmul back-solve, per-q vmapped (same reshard
             # plan as the Cholesky/LU paths so the caller is agnostic).
             return jax.vmap(_pinv_matmul_logical)(L_batch, Z_batch)
-        if use_pinv_T:
-            # Transverse explicit C⁺, per-q vmapped one-matmul.
-            return jax.vmap(_pinv_apply_T_logical)(L_batch, Z_batch)
         if hoisted_lu:
             # Apply the once-per-channel (LU, perm) factor.
             return jax.vmap(_lu_apply_logical)(
@@ -3529,15 +3385,15 @@ def _zeta_rhs_resharder(
 
 
 def _cache_zeta_solve_kernels(
-        L_batch_rep_shard, _lu_apply_logical, _pinv_apply_T_logical,
+        L_batch_rep_shard, _lu_apply_logical,
         _pinv_matmul_logical, _ridge_indef_solve, _tri_solve_logical, cache_key, hoisted_lu,
-        intermediate_shard, mesh_xy, piv_rep_shard, use_lu, use_pinv_T, use_rank_trunc,
+        intermediate_shard, mesh_xy, piv_rep_shard, use_lu, use_rank_trunc,
         z_col_shard):
     """Populate the existing solve cache with its shape-specific kernels."""
     (_sharded_cho_solve, _sharded_cho_solve_batch, _solve_batch_and_update, _solve_all_at_once) = _zeta_batched_kernels(
-        L_batch_rep_shard, _lu_apply_logical, _pinv_apply_T_logical, _pinv_matmul_logical,
+        L_batch_rep_shard, _lu_apply_logical, _pinv_matmul_logical,
         _ridge_indef_solve, _tri_solve_logical, hoisted_lu, mesh_xy, piv_rep_shard, use_lu,
-        use_pinv_T, use_rank_trunc)
+        use_rank_trunc)
     (_reshard_z) = _zeta_rhs_resharder(
         intermediate_shard, z_col_shard)
     _solve_cache[cache_key] = SimpleNamespace(
@@ -3680,13 +3536,6 @@ def _solve_zeta_replicated(
     # inverse does not exist, so the tri-solve would be wrong).
     use_rank_trunc = (solver_kind == 'replicated_rank_truncate')
 
-    # ``use_pinv_T`` selects the transverse rank-truncation back-solve
-    # (2026-08-01): ``L_q`` is the EXPLICIT truncated pseudo-inverse C⁺
-    # of the indefinite transverse CCT (no BBᴴ factor exists there), so
-    # ζ = C⁺Z is ONE matmul at the logical extent.  Flows through the
-    # same replicated/local tiers as every other whole-tile factor.
-    use_pinv_T = (solver_kind == 'transverse_rank_truncate')
-
     # Cache key for solve function (includes q_chunk_size and padded size).
     # ``use_lu`` / ``use_rank_trunc`` partition the cache so the three
     # back-solve compiles don't collide on the same key.  ``n_log`` is
@@ -3694,8 +3543,7 @@ def _solve_zeta_replicated(
     # cache too.
     cache_key = ('solve_from_L', _mesh_key(mesh_xy), nq, n_rmu, n_log,
                  n_zchunk_padded, q_chunk_size, bool(use_lu),
-                 bool(use_rank_trunc),
-                 bool(hoisted_lu), bool(use_pinv_T))
+                 bool(use_rank_trunc), bool(hoisted_lu))
 
     # Uniform piv operand for the kernels below: the real (nq, n_log)
     # permutation on the hoisted-LU path, a (nq, 1) placeholder (dead
@@ -3705,14 +3553,14 @@ def _solve_zeta_replicated(
                else jnp.zeros((nq, 1), dtype=jnp.int32))
     piv_rep_shard = NamedSharding(mesh_xy, P(None, None))
 
-    (_ridge_indef_solve, _lu_apply_logical, _tri_solve_logical, _pinv_matmul_logical, _pinv_apply_T_logical) = _zeta_logical_solvers(
-        n_log)
+    (_ridge_indef_solve, _lu_apply_logical, _tri_solve_logical,
+     _pinv_matmul_logical) = _zeta_logical_solvers(n_log)
 
     if cache_key not in _solve_cache:
         _cache_zeta_solve_kernels(
-            L_batch_rep_shard, _lu_apply_logical, _pinv_apply_T_logical,
+            L_batch_rep_shard, _lu_apply_logical,
             _pinv_matmul_logical, _ridge_indef_solve, _tri_solve_logical, cache_key, hoisted_lu,
-            intermediate_shard, mesh_xy, piv_rep_shard, use_lu, use_pinv_T, use_rank_trunc,
+            intermediate_shard, mesh_xy, piv_rep_shard, use_lu, use_rank_trunc,
             z_col_shard)
     helpers = _solve_cache[cache_key]
     return _apply_replicated_zeta(
@@ -3721,11 +3569,11 @@ def _solve_zeta_replicated(
 
 
 #: Solver kinds whose factor is a whole-tile ARRAY applied per q — the kinds
-#: the ``replicated`` and ``local`` tiers serve.  A FactorToken, the 2-D C⁺ of
-#: the distributed tier and the fused provider LU plans have their own routes.
+#: the ``replicated`` and ``local`` tiers serve.  A FactorToken and the fused
+#: provider LU plans have their own routes.
 _WHOLE_TILE_KINDS = frozenset({
     'replicated_rank_truncate', 'replicated_cholesky', 'sharded_cholesky',
-    'transverse_rank_truncate', 'lu'})
+    'lu'})
 
 
 def _whole_tile_solve_kind(solver_kind, lu_piv, distrib_la_batched_route):
@@ -3798,14 +3646,12 @@ def _solve_zeta_local(L_q, Z_q, lu_piv, mesh_xy, n_log, solver_kind):
     run = _solve_cache.get(key)
     if run is None:
         (_ridge_indef_solve, _lu_apply_logical, _tri_solve_logical,
-         _pinv_matmul_logical, _pinv_apply_T_logical) = _zeta_logical_solvers(
-            int(n_log))
+         _pinv_matmul_logical) = _zeta_logical_solvers(int(n_log))
         if hoisted_lu:
             def kernel(F, piv, Z):
                 return jax.vmap(_lu_apply_logical)(F, piv, Z)
         else:
             one = {'replicated_rank_truncate': _pinv_matmul_logical,
-                   'transverse_rank_truncate': _pinv_apply_T_logical,
                    'lu': _ridge_indef_solve,
                    'replicated_cholesky': _tri_solve_logical,
                    'sharded_cholesky': _tri_solve_logical}[str(solver_kind)]
