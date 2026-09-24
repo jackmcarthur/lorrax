@@ -37,7 +37,8 @@ workload it exists for.
 **Host memory**, per open handle:
 
 - **Write staging (CUDA leg).** One pinned buffer grows to the largest
-  local tile written. `read_slabs` also uses this buffer.
+  local tile written. `read_slabs` also uses this buffer, as at most three
+  chunks of max(one output row, 256 MiB) each.
 - **Read staging.** A second buffer is sized to the local tile being read.
   A read buffer larger than 32 MiB is freed once its copy completes.
 - **Host leg.** Writes read the XLA buffer in place, so only reads stage.
@@ -107,7 +108,7 @@ a backend, striping, ROMIO hints, or a mesh-divisible extent.
 | `create_dataset(name, *, shape, dtype, attrs=None)` | yes | Creates a dataset at its logical shape. An identical existing dataset is reused; a different shape or dtype refuses on every rank. Drains queued writes first. `attrs` are stamped at close. |
 | `write_slab(name, A, *, offset=None, global_shape=None, valid_shape=None)` | yes, **asynchronous** | Enqueues and returns. Bytes are on disk after `sync_writes()` or `close()`. |
 | `read_slab(name, *, shape=None, dtype=None, offset=None, valid_shape=None, mesh=None, partition_spec=None, as_numpy=False)` | yes, synchronous | Returns a `jax.Array` sharded `partition_spec` on `mesh` (default: the handle's). `as_numpy=True` returns host numpy through `device_get`, which is valid for a replicated read. |
-| `read_slabs(name, *, shape, offsets, valid_shapes, partition_spec, window_axis, dtype=None, mesh=None)` | yes | n windows of one slab shape in one collective `H5Dread`, stacked on a new axis at `window_axis`. Returns an async result that the caller's next op sequences. |
+| `read_slabs(name, *, shape, offsets, valid_shapes, partition_spec, window_axis, dtype=None, mesh=None)` | yes (every rank calls it; a band-block transfer is independent) | n windows of one slab shape, stacked on a new axis at `window_axis`, read in chunks of output rows ([tuning](#tuning)). Returns an async result that the caller's next op sequences. |
 | `read_small(name, *, dtype=None)` | yes | A whole small dataset as host numpy on every rank, scalars included. |
 | `write_attr(name, value)` | no (queues) | A small replicated dataset, written by rank 0 at close. It replaces any existing dataset of that name. |
 | `stamp_dataset_attrs(name, attrs)` | no (queues) | HDF5 attributes on an existing dataset, stamped by rank 0 at close. |
@@ -337,12 +338,32 @@ union-read target and is not cached. Nothing here keys on process count.
 ## Striping and collective I/O {#tuning}
 
 <a id="defaults"></a>
-**Transfers are collective, for reads and writes (`H5FD_MPIO_COLLECTIVE`).
-Metadata operations are independent, and ROMIO's collective-buffering hints
-are left to ROMIO.** Two-phase aggregation turns each rank's strided 2-D tile
-into a few large contiguous writes per aggregator. Independent I/O issues one
-short write per row-run of the tile, so its throughput depends on how the
-stripe layout happens to line up with those rows. The overrides
+**Transfers are collective (`H5FD_MPIO_COLLECTIVE`), except a
+`read_slabs` whose windows are band blocks. Metadata operations are
+independent, and ROMIO's collective-buffering hints are left to ROMIO.**
+Two-phase aggregation turns each rank's strided 2-D tile into a few large
+contiguous writes per aggregator. Independent I/O issues one short write per
+row-run of the tile, so its throughput depends on how the stripe layout
+happens to line up with those rows.
+
+`read_slabs` decides per call, the same way on every rank. If every window
+is whole along each dim after the one the windows vary in (a WFN band block:
+long contiguous file runs), the read is independent. There, two-phase
+aggregation only re-ships every byte through 16 MiB collective-buffer
+rounds: at VI3 12×12 P16, bands 0:360 (120.2 GB,
+`runs/runtime/p2d_io_20260924`), it took 56.8 s cold and 44.4 s warm, against
+17.8 s and 7.6 s independent. Short strided windows (shared-pole bank
+rectangles) stay collective.
+
+Either way the handler reads each chunk of output rows into packed pinned
+staging, with the memory side contiguous. It holds two chunks, plus one
+padded chunk on CUDA, each at most max(one row, 256 MiB). It then places the
+data on the device run by run, or through the padded chunk when the runs are
+short. Pad cells are zeroed. The bytes are identical to a one-shot union
+read, because HDF5 maps the n-th selected file element to the n-th selected
+memory element in both. HDF5's own selection iterator costs about 1 ms per
+run on an OR'd selection, so the runs are enumerated directly. The
+overrides
 `LORRAX_PHDF5_COLLECTIVE_WRITES=0`, `LORRAX_PHDF5_INDEPENDENT=1` (reads),
 `LORRAX_PHDF5_COLL_META=1` and `LORRAX_PHDF5_CB_*` exist for A/B runs.
 [`ffi_layout.md`](ffi_layout.md) §6 lists every field's effective default,
