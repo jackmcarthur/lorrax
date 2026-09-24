@@ -407,13 +407,54 @@ def _grid_size(d, theta, S, eps=1e-5, points_per_half_wave=3.0, cap=6000):
     return int(min(max(interior, near_zero, near_decay) + 100, cap))
 
 
+#: Element-wise work on a tall ``m x n`` block below this size stays inline.
+_ROW_BLOCK_MIN = 1 << 16
+_ROW_POOL = None
+
+
+def _by_rows(block, shape, dtype=complex):
+    """``block(slice)`` for row slices of an array of ``shape``, in row order.
+
+    numpy runs element-wise ufuncs on one core while the planner owns ~16
+    (only the GEMMs used them): the complex exponentials of the design matrix
+    and the conjugate copies were half of a crossing fit's wall
+    (P2-E 2026-09-24).  Rows are independent and every element is computed
+    by the same ufunc as before, so the result is bit-identical to the
+    single-block call.
+    """
+    global _ROW_POOL
+    m = int(shape[0])
+    threads = min(16, len(os.sched_getaffinity(0)), m)
+    if threads < 2 or int(np.prod(shape)) < _ROW_BLOCK_MIN:
+        return block(slice(0, m))
+    if _ROW_POOL is None:
+        from concurrent.futures import ThreadPoolExecutor
+        _ROW_POOL = ThreadPoolExecutor(max_workers=threads)
+    out = np.empty(shape, dtype)
+    edges = np.linspace(0, m, threads + 1).astype(int)
+
+    def fill(lo_hi):
+        lo, hi = lo_hi
+        out[lo:hi] = block(slice(lo, hi))
+
+    list(_ROW_POOL.map(fill, zip(edges[:-1], edges[1:])))
+    return out
+
+
+def _conj(M):
+    """``M.conj()`` of a tall matrix, computed on the planner's cores."""
+    if not M.flags.c_contiguous:
+        return M.conj()
+    return _by_rows(lambda rows: M[rows].conj(), M.shape, M.dtype)
+
+
 def _cholesky_qr2(M):
     """Economy QR of a tall matrix by two Cholesky-QR passes (all GEMM);
     Householder QR when a Gram is not positive definite."""
     try:
-        R1 = np.linalg.cholesky(M.conj().T @ M).conj().T          # upper
+        R1 = np.linalg.cholesky(_conj(M).T @ M).conj().T          # upper
         Q1 = M @ np.linalg.inv(R1)                                # n x n inverse: cheap
-        R2 = np.linalg.cholesky(Q1.conj().T @ Q1).conj().T
+        R2 = np.linalg.cholesky(_conj(Q1).T @ Q1).conj().T
         Q = Q1 @ np.linalg.inv(R2)
         return Q, R2 @ R1
     except np.linalg.LinAlgError:
@@ -591,7 +632,8 @@ class _CloudFit:
 
     def A(self, s):
         """Design matrix ``exp(i d t)`` with the rows in the rule's currency."""
-        return _cexp(self.idp[:, None] * s[None, :]) * self.scale[:, None]
+        return _by_rows(lambda r: _cexp(self.idp[r, None] * s[None, :])
+                        * self.scale[r, None], (self.idp.size, s.size))
 
     def ls(self, s):
         """Penalised least-squares weights for nodes ``s``: QR of ``[A; mu I]``
@@ -621,7 +663,7 @@ class _CloudFit:
         Aa = np.concatenate([A, self.mu * np.eye(n, dtype=complex)], 0)
         ba = np.concatenate([self.b, np.zeros(n, complex)])
         Q, R = _cholesky_qr2(Aa)
-        c = Q.conj().T @ ba
+        c = _conj(Q).T @ ba
         w = solve_triangular(R, c, check_finite=False)
         return w, ba - Q @ c, Q, A
 
@@ -677,20 +719,22 @@ class _CloudFit:
                 if nF > (1.0 - stall) * n_last:
                     break
                 n_last = nF
-            Jc = np.concatenate([-(self.idp[:, None] * A) * w[None, :],
-                                 np.zeros((n, n), complex)], 0)
-            Jc -= Q @ (Q.conj().T @ Jc)
+            Jc = np.concatenate([
+                _by_rows(lambda r: -(self.idp[r, None] * A[r]) * w[None, :], A.shape),
+                np.zeros((n, n), complex)], 0)
+            Jc -= Q @ (_conj(Q).T @ Jc)
             dIm = self.h / np.cosh(y) ** 2
             # column norms of the real Jacobian [[Re, -Im dIm], [Im, Re dIm]]
             cn = np.sqrt(np.sum(np.abs(Jc) ** 2, axis=0))
             D = np.concatenate([cn, cn * dIm])
             D = np.where(D > 0, D, 1.0)
-            Gc = Jc.conj().T @ Jc
+            JcH = _conj(Jc).T
+            Gc = JcH @ Jc
             ReG, ImG = Gc.real, Gc.imag
             Gr = np.block([[ReG, -ImG * dIm[None, :]],
                            [dIm[:, None] * ImG.T, dIm[:, None] * ReG * dIm[None, :]]])
             Gr /= D[:, None] * D[None, :]
-            v = Jc.conj().T @ (-F)
+            v = JcH @ (-F)
             g = np.concatenate([v.real, dIm * v.imag]) / D
             improved = False
             for _lm in range(12):
