@@ -364,18 +364,23 @@ def make_route_g_kernel(*, mesh: Mesh, plan_id, kgrid, fft_grid, ns: int, b: int
         def group(acc, gi):
             a0 = gi * n_pg + jnp.arange(n_pg)
             on = (a0 < n_a).astype(jnp.float64)
-            F = jax.lax.dynamic_slice_in_dim(Fa, gi * n_pg, n_pg, axis=1)
+            # The group's planes move next to the plane cells on the SMALL
+            # cylinder, so the 2D FFT writes the k-convolution's
+            # (k, s, μ, s', plane·cell) order and no full-plane transpose
+            # sits between cuFFT and the k-conv.
+            F = jnp.moveaxis(
+                jax.lax.dynamic_slice_in_dim(Fa, gi * n_pg, n_pg, axis=1), 1, 4)
             # Empty plane cells carry the out-of-range column n_col: a zero
             # fill in the gather itself, no padded copy of the cylinder.
             st = jnp.take(F, pfc, axis=-1, mode='fill', fill_value=0).reshape(
-                nk, n_pg, ns, 2 * c, ns, n_b, n_c)
+                nk, ns, 2 * c, ns, n_pg, n_b, n_c)
             d = local_fftn3(st, axes=(-2, -1), norm='backward')        # Σ e^{-iG·r}
             bl = jnp.exp(-2j * jnp.pi * (
                 kch[:, axis][:, None, None] * a0[None, :, None] / n_a
                 + kch[:, b_ax][:, None, None] * ib[None, None, :] / n_b
                 + kch[:, c_ax][:, None, None] * ic[None, None, :] / n_c)) / np.sqrt(N)
-            d = d.reshape(nk, n_pg, ns, 2 * c, ns, ps) * bl[:, :, None, None, None, :]
-            Dk = jnp.moveaxis(d, 1, 4).reshape(nk, ns, 2 * c, ns, r_pl)
+            Dk = (d.reshape(nk, ns, 2 * c, ns, n_pg, ps)
+                  * bl[:, None, None, None, :, :]).reshape(nk, ns, 2 * c, ns, r_pl)
             Z = parent_projector_kconv(
                 Dk[:, :, :c], Dk[:, :, c:], plan=plan_id, left_perm=l_perm,
                 left_L=l_wrap, right_perm=r_perm, right_L=r_wrap, kgrid=kgrid,
