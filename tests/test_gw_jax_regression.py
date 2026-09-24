@@ -52,6 +52,7 @@ headroom, not slack.  The BerkeleyGW gate is separate and is stated in
 meV against measured values — see ``_BGW_TOL``.
 """
 
+import re
 import sys
 import warnings
 from pathlib import Path
@@ -76,6 +77,26 @@ _NEEDS_P4_E2E_MEMORY = pytest.mark.skipif(
     jax.device_count() < 4,
     reason=("needs >=4 JAX devices: the full regression fixture exhausts "
             "one A100 during a 9.84-10.68 GiB allocation"),
+)
+
+from core.rank_session import _resolve_proc_count  # noqa: E402
+
+#: The bispinor deck runs its driver on a 2x2 mesh whose multi-process
+#: services (the cublasmp matmul, ``distrib_la/matmul.py``) need ONE JAX
+#: process per mesh cell, so no single-process geometry can run it: pinned
+#: to one GPU the cell used to skip, and handed four devices in one process
+#: (``LORRAX_MESH_CELL=1``) the driver refused the mesh.  It runs in the
+#: core tier's geometry instead — four pytest ranks, each owning one GPU,
+#: whose gw_jax children form one 4-process driver (``conftest``'s
+#: ``_run_session_case`` stages the run dir once through
+#: ``core.rank_session``):
+#:     lx run -N 1 -G 4 -n 4 python3 -m pytest -p no:cacheprovider \
+#:         tests/test_gw_jax_regression.py::test_bispinor_gnppm_matches_reference
+_NEEDS_P4_RANKS = pytest.mark.skipif(
+    _resolve_proc_count() < 4,
+    reason=("needs 4 pytest ranks, one GPU each (lx run -N 1 -G 4 -n 4 "
+            "python3 -m pytest ...): the bispinor driver's 2x2 mesh needs "
+            "one JAX process per mesh cell"),
 )
 
 #: Cross-machine tolerance for the FRONTERA-FROZEN Tier-1 pins, in eV.
@@ -530,12 +551,13 @@ def test_gnppm_matches_reference(gnppm_session):
 
 
 @pytest.mark.regression
-@_NEEDS_P4_E2E_MEMORY
+@_NEEDS_P4_RANKS
 def test_bispinor_gnppm_matches_reference(bispinor_session):
     """Bispinor GN-PPM frozen gate (Σ^B folded into sigX).
 
-    Frontera-frozen; runs on Perlmutter too at ``_XMACHINE_ATOL_EV``
+    Frozen at P4 (2026-09-24, c52b2c42); compared at ``_XMACHINE_ATOL_EV``
     (owner ruling 2026-08-07 — read that constant before touching it).
+    Runs only as four pytest ranks; see ``_NEEDS_P4_RANKS``.
     """
     _assert_matches_reference(
         bispinor_session.run_dir / bispinor_session.output_name,
@@ -547,4 +569,10 @@ def test_bispinor_gnppm_matches_reference(bispinor_session):
     assert "WARNING: non-orbit-closed centroid set(s):" in out
     assert "n_parent = nk" in out
     assert "orbit-closed centroids with kmeans" in out
-    assert "V_qmunu_TT_11" in out
+    # The transverse (TT) channel really ran.  Was ``"V_qmunu_TT_11" in out``:
+    # the per-tile V_q print that token came from went with the grouped
+    # mu-batch V_q (948b02b6), so it could only ever fail; the sector
+    # census below is what the driver prints now.
+    assert "Spin channels  : charge + transverse current (bispinor)" in out
+    tt = re.search(r"TT max\|diag\|=(\S+) eV", out)
+    assert tt and float(tt.group(1)) > 0.0, "no nonzero TT Sigma block reported"
