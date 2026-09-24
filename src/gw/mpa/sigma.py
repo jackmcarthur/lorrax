@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import gc
+from collections import Counter
 import math
 import os
 import sys
@@ -1093,6 +1094,7 @@ def _integrate_sigma_batches(
                             and not bracketed and tau_kernel_factory is None)
                      else None)
         kernels_by_width = {}
+        window_widths = []
 
         def window_kernel(width):
             if width not in kernels_by_width:
@@ -1197,6 +1199,7 @@ def _integrate_sigma_batches(
                         psi_coh_xn, psi_coh_yr, E_A_call, selector,
                         np.int32(start), width=width)
                     tau_kernel = window_kernel(width)
+                    window_widths.append((int(live.any(axis=0).sum()), width))
                 # These arrays do not change between time nodes in this planned
                 # window, so they are built once per window rather than per node.
                 tau_arguments = (
@@ -1361,6 +1364,14 @@ def _integrate_sigma_batches(
             f"({n_poles} poles, batches of {batch_size}); "
             f"{transform_saving} undispatched logical tau; "
             f"panes and product windows used one shared tau kernel")
+        if window_widths:
+            live_bands, widths = zip(*window_widths)
+            print_fn(
+                f"  MPA Sigma band slices: {len(widths)} windows of "
+                f"{int(psi_coh_xn.shape[3])} carrier bands; live bands "
+                f"{min(live_bands)}-{max(live_bands)}, sliced widths "
+                f"{dict(sorted(Counter(widths).items()))} "
+                f"({len(kernels_by_width)} width classes)")
         ratio = None
         if max_b or max_d:
             ratio = max_d / max_b if max_b else np.inf
