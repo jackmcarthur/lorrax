@@ -8,6 +8,7 @@ entirely by :func:`gw.gflat_memory_model.plan_gflat_chunks` — the single
 production planner (persistent floor + max over five stage transients).
 """
 import hashlib
+import math
 import json
 import os
 import threading
@@ -1595,7 +1596,7 @@ def zeta_sphere_ngkmax(wfn, sym, meta, zeta_cutoff_ry) -> int:
 def _plan_gflat_chunks_for_channel(
 		*, meta, cfg, band_slices, mesh_xy, is_bispinor, n_q_selected,
 		face_current_vertex=False, parent_route=None, print_fn=print,
-		zeta_ngkmax=None, psi_ngkmax=None):
+		zeta_ngkmax=None, psi_ngkmax=None, mubatch=False):
 	"""Chunk-plan ONE ISDF centroid channel: the charge channel
 	(``meta.n_rmu``) or one transverse channel (``meta.n_rmu`` — μ_T is
 	typically ≈ μ_C/3).
@@ -1715,7 +1716,37 @@ def _plan_gflat_chunks_for_channel(
 			# is lost when a peer's FAIL-FAST kills the step first
 			# (CrI3 16x16 P36, pool 58781114 steps .15/.17/.20).
 			raise ValueError(_msg + "\n" + gflat_plan.format())
+	mubatch_plan = None
+	if mubatch:
+		# The charge channel's μ-batch fit (docs/architecture/zeta_fit_mubatch.md):
+		# the same budget, its own inventory.
+		from gw.gflat_memory_model import plan_zeta_mubatch
+		from isdf.core import _resolve_zeta_gather
+		_tier = _resolve_zeta_gather(
+			str(cfg.backend.distributed_zeta_solve),
+			n_rmu=int(meta.n_rmu_padded), nq=n_q_selected, mesh_xy=mesh_xy,
+			vertex_mu_L=0,
+			charge_zeta_solve=str(cfg.backend.charge_zeta_solve))
+		_psi_ng = int(psi_ngkmax) if psi_ngkmax else _ngkmax
+		_r = (3.0 * _psi_ng / (4.0 * math.pi)) ** (1.0 / 3.0)
+		_n_a = max(int(v) for v in meta.fft_grid)
+		mubatch_plan = plan_zeta_mubatch(
+			meta=meta, mesh_xy=mesh_xy, n_q_selected=n_q_selected,
+			ngkmax=_ngkmax, psi_ngkmax=_psi_ng, fit_nb=_zeta_fit_nb,
+			face_nb=int(band_slices.b4 - band_slices.b0),
+			band_chunk=int(gflat_plan.band_chunk),
+			n_parent=int((parent_route or {}).get('n_parent', meta.nk_tot)),
+			zeta_tier=_tier, budget_gb=float(mem.per_device_gb),
+			target_utilization=(mem.chunk_target_utilization
+			                    if mem.chunk_target_utilization > 0 else None),
+			psi_face_bytes=float(gflat_plan.psi_layout_bytes),
+			n_col_psi=int(min(int(meta.n_rtot) // _n_a,
+			                  math.ceil(1.2 * math.pi * _r * _r))),
+			n_s_psi=int(min(_n_a, math.ceil(2.4 * _r) + 1)))
+		if jax.process_index() == 0:
+			print_fn(mubatch_plan.format())
 	chunks = {
+		'mubatch': mubatch_plan,
 		'band_chunk': int(gflat_plan.band_chunk),
 		'centroid_k_chunk': int(gflat_plan.centroid_k_chunk),
 		'chunk_r': int(gflat_plan.r_chunk),
@@ -2247,6 +2278,7 @@ def _fit_charge_zeta_channel(
                 k_unfold_plan=k_unfold_plan,
                 psi_nmu_parent=psi_nmu_parent,
                 psi_mun_parent=psi_mun_parent,
+                mubatch_plan=chunks.get('mubatch'),
             )
     if not _reuse_charge:
         _gate_fresh_zeta_rank_findings(
@@ -2875,7 +2907,7 @@ def _prepare_fresh_parent_faces(
     		                  parents_only=True), print_fn=print0,
     		zeta_ngkmax=zeta_sphere_ngkmax(
     			wfn, sym, meta, zeta_contract.zeta_cutoff),
-    		psi_ngkmax=int(wfn.ngkmax))
+    		psi_ngkmax=int(wfn.ngkmax), mubatch=True)
     _parent_zeta_plan = _candidate_plan if chunks is not None else None
     load_band_chunk = (chunks['band_chunk'] if chunks is not None
                        else zeta_contract.loader_band_chunk)

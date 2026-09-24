@@ -206,6 +206,11 @@ class GWProductionReport:
         if text.startswith("  Resident ψ "):
             self.emit(text)
             return
+        # The μ-batch ζ fit's plan and its measured store/timing receipts are
+        # the run's record of where Z lived and what the transfers cost.
+        if text.startswith(("  ISDF μ-batch plan", "  μ-batch ", "  Z store: ")):
+            self.emit(text)
+            return
         # Every box plan carries a durable policy and accepted-rule receipt,
         # including ordinary shared-pole runs with debug disabled.
         if text.startswith(("Sigma quadrature receipt: ", "Response quadrature: ")):

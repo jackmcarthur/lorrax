@@ -1539,3 +1539,239 @@ def plan_gflat_chunks(
         face_y_cache_bytes=float(face_y_cache_bytes),
         zeta_k_chunk=int(zeta_k_chunk),
     )
+
+
+# ---------------------------------------------------------------------------
+# The μ-batch ζ fit (docs/architecture/zeta_fit_mubatch.md)
+# ---------------------------------------------------------------------------
+
+#: Host RAM a Z store may claim, as a fraction of the node's MemTotal.
+_ZSTORE_HOST_FRAC = 0.5
+
+
+def _host_bytes_per_rank() -> float:
+    """Rank-invariant host budget for the Z store: a fraction of MemTotal per task."""
+    import os
+    try:
+        with open("/proc/meminfo") as fh:
+            total = next(int(l.split()[1]) * 1024 for l in fh
+                         if l.startswith("MemTotal:"))
+    except Exception:
+        return 0.0
+    raw = os.environ.get("SLURM_NTASKS_PER_NODE") or os.environ.get(
+        "SLURM_TASKS_PER_NODE") or "1"
+    try:
+        per_node = max(1, int(str(raw).split("(")[0].split(",")[0]))
+    except ValueError:
+        per_node = 1
+    return _ZSTORE_HOST_FRAC * total / per_node
+
+
+@dataclasses.dataclass(frozen=True)
+class MuBatchPlan:
+    """Resolved μ-batch fit plan: every size comes from the one budget."""
+    route: str                 # 'cache' (flat r blocks) | 'planes'
+    source: str                # 'cache' | 'resident' | 'host'
+    b: int                     # μ batch (multiple of P)
+    n_batch: int
+    r_sub: int                 # points (cache) or planes (planes) per sub-block
+    row_chunk: int             # FFT rows per scan step
+    g_tile: int                # G slots per store tile (multiple of P)
+    placement: str             # 'device' | 'host' | 'disk'
+    finalize_layout: str       # 'q' (q-local solve) | 'g' (G-split)
+    hwm_bytes: float
+    budget_bytes: float
+    target_bytes: float
+    breakdown: dict
+    transfer: dict
+
+    def format(self) -> str:
+        lines = [
+            "  ISDF μ-batch plan (one budget; docs/architecture/zeta_fit_mubatch.md)",
+            f"    ψ(r) route    = {self.route} (source {self.source})",
+            f"    μ batch       = {self.b}  ({self.n_batch} batches)",
+            f"    r sub-block   = {self.r_sub} {'points' if self.route == 'cache' else 'plane(s)'}",
+            f"    FFT rows/step = {self.row_chunk}",
+            f"    Z store       = {self.placement}, G tile {self.g_tile}, "
+            f"finalize {self.finalize_layout}-layout",
+            f"    target        = {self.target_bytes / 1e9:.2f} GB/dev of "
+            f"{self.budget_bytes / 1e9:.2f}",
+            f"    HWM estimate  = {self.hwm_bytes / 1e9:.2f} GB/dev",
+            "    terms (GB/dev):",
+        ]
+        for k, v in sorted(self.breakdown.items(), key=lambda kv: -kv[1]):
+            lines.append(f"      {k:.<22s} {v / 1e9:>8.3f}")
+        lines.append("    whole-fit volumes (GB/rank): " + ", ".join(
+            f"{k} {v / 1e9:.1f}" for k, v in self.transfer.items()))
+        return "\n".join(lines)
+
+
+def plan_zeta_mubatch(*, meta, mesh_xy, n_q_selected: int, ngkmax: int,
+                      psi_ngkmax: int, fit_nb: int, face_nb: int,
+                      band_chunk: int, n_parent: int, zeta_tier: str,
+                      budget_gb: float, target_utilization: float | None = None,
+                      psi_face_bytes: float = 0.0, n_col_psi: int | None = None,
+                      n_s_psi: int | None = None) -> MuBatchPlan:
+    """Size the μ-batch ζ fit; refuses by GATE when even the smallest batch fails.
+
+    Order (doc "Per-rank memory model"): ψ route (the r-block cache when it
+    fits beside the smallest batch), ψ(G) source on the plane route
+    (resident, else host), the largest batch ``b`` with the Z store off the
+    device, then the store placement: device only when it fits beside that
+    same batch (no batch-size cost, no I/O), else host when the per-rank
+    host share holds it, else slab_io disk.  ``zeta_tier`` is the solve tier
+    (``isdf.core._resolve_zeta_gather``): ``local`` streams q-local tiles,
+    anything else G-split tiles.
+    """
+    from runtime.padding import mesh_divisor
+    P_ = int(mesh_divisor(mesh_xy))
+    nk = int(meta.nk_tot)
+    ns = int(meta.nspinor)
+    mu = int(getattr(meta, "n_rmu_padded", None) or meta.n_rmu)
+    fft_grid = tuple(int(v) for v in meta.fft_grid)
+    n_rtot = int(math.prod(fft_grid))
+    Q = int(n_q_selected)
+    N_G = int(ngkmax)
+    N_Gpsi = int(psi_ngkmax)
+    if target_utilization is None:
+        target_utilization = bfc_fragmentation_target_utilization(ns)
+    budget = float(budget_gb) * 1e9
+    target = budget * float(target_utilization)
+
+    bc = max(P_, padded_axis(int(band_chunk), P_, name="μ-batch band chunk").carrier)
+    b_p = bc // P_
+    n_bc = math.ceil(int(fit_nb) / bc)
+    nb_slots = n_bc * bc
+    R0 = math.ceil(n_rtot / P_)
+    Q_pad = math.ceil(Q / P_) * P_
+    finalize_layout = 'q' if str(zeta_tier) == 'local' else 'g'
+
+    base = {
+        "C factor": _c128(Q, mu, mu, shard=P_),
+        "centroid faces": float(psi_face_bytes),
+        "full-BZ face": (_c128(nk, ns, mu, face_nb, shard=P_)
+                         if int(n_parent) != nk else 0.0),
+        "loader tables": 4.0 * nk * n_rtot + _C128 * nk * N_Gpsi,
+    }
+    base_total = sum(base.values())
+    cache_bytes = _c128(nk, nb_slots, ns, R0)
+    cache_build = (_c128(nk, b_p, ns, n_rtot) * _FFT_CUFFT_FACTOR
+                   + _c128(nk, bc, ns, R0))
+    resident_bytes = _c128(nk, nb_slots, ns, N_Gpsi, shard=P_)
+
+    axis = max(range(3), key=lambda i: fft_grid[i])
+    n_a = fft_grid[axis]
+    ps = n_rtot // n_a
+    n_col = int(n_col_psi) if n_col_psi else ps
+    n_s = int(n_s_psi) if n_s_psi else n_a
+
+    def ws(route, b, r_s, cs, *, source):
+        c = b // P_
+        R = R0 if route == 'cache' else math.ceil(n_a / P_) * ps
+        t = {
+            "X_B": _c128(nk, ns, b, face_nb) + 2 * _c128(nk, ns, b, bc),
+            "pair projectors": 2 * ns * ns * _c128(nk, b, r_s),
+            "k-conv + Z": 7 * _c128(nk, b, r_s) + 2 * _c128(Q, b, r_s),
+            "rows (transposed)": _c128(Q, c, P_ * R),
+            "row FFT": _c128(cs, n_rtot) * _FFT_CUFFT_FACTOR
+                       + 2 * _c128(Q, c, N_G),
+        }
+        if route == 'cache':
+            t["ψ sub-block"] = 2 * _c128(nk, bc, ns, r_s)
+        else:
+            n_pg = max(1, r_s // ps)
+            t["ψ regeneration"] = (
+                _c128(nk, b_p, ns, n_col, n_s)
+                + 2 * _c128(nk, b_p, ns, P_ * n_pg, n_col)
+                + 3 * _c128(nk, bc, ns, r_s))
+            if source == 'host':
+                t["ψ(G) host tile"] = _c128(nk, b_p, ns, N_Gpsi)
+        return t
+
+    def fits(route, source, b, r_s, cs, extra=0.0):
+        src = (cache_bytes if source == 'cache' else
+               resident_bytes if source == 'resident' else 0.0)
+        return base_total + src + extra + sum(
+            ws(route, b, r_s, cs, source=source).values()) <= target
+
+    b_min = P_
+    # 1. route and source
+    r_cache = min(R0, 4096)
+    if (fits('cache', 'cache', b_min, r_cache, 1)
+            and base_total + cache_bytes + cache_build <= target):
+        route, source, r_s, r_sub = 'cache', 'cache', r_cache, r_cache
+    else:
+        if P_ > n_a:
+            raise ValueError(
+                f"GATE zeta-mubatch-pencils: got P={P_} with the ψ(r) cache "
+                f"({cache_bytes / 1e9:.2f} GB/dev) over the target "
+                f"{target / 1e9:.2f} GB/dev; want P <= {n_a} for the plane "
+                f"route (largest box axis {axis} of {fft_grid}); why: the "
+                "pencil split is not implemented.  Fix: more memory per "
+                "device, or a rank count whose cache fits.")
+        route, r_s, r_sub = 'planes', ps, 1
+        source = ('resident' if fits('planes', 'resident', b_min, r_s, 1)
+                  else 'host')
+        if not fits('planes', source, b_min, r_s, 1):
+            need = base_total + sum(ws('planes', source=source, b=b_min,
+                                       r_s=r_s, cs=1).values())
+            raise ValueError(
+                f"GATE zeta-mubatch-capacity: got {need / 1e9:.2f} GB/dev for "
+                f"the smallest μ batch (b = P = {P_}) on the plane route, want "
+                f"<= {target / 1e9:.2f} GB/dev; why: no batch width fits the "
+                "budget.  Fix: more ranks (every term but the loader tables "
+                "divides by P) or more memory per device.")
+    # 2. the largest batch with the store off the device
+    b_cap = math.ceil(mu / P_) * P_
+    b = b_min
+    while b + P_ <= b_cap and fits(route, source, b + P_, r_s, 1):
+        b += P_
+    # Balance the batches: the same batch count with the smallest width.
+    n_batch = math.ceil(mu / b)
+    b = math.ceil(math.ceil(mu / n_batch) / P_) * P_
+    n_batch = math.ceil(mu / b)
+    # 3. FFT rows per step from what is left.
+    left = target - base_total - (
+        cache_bytes if source == 'cache' else
+        resident_bytes if source == 'resident' else 0.0) - sum(
+        ws(route, b, r_s, 1, source=source).values())
+    cs_max = Q * (b // P_)
+    cs = max(1, min(cs_max, int(0.5 * max(left, 0.0)
+                                // (_c128(1, n_rtot) * _FFT_CUFFT_FACTOR)) + 1))
+    # 4. G tile for the streamed finalize (multiple of P, ~quarter target).
+    per_g = (6.0 * _c128(Q_pad, mu, 1, shard=P_)
+             + (_c128(Q, mu, mu) if finalize_layout == 'g' else 0.0) / max(N_G, 1))
+    g_tile = int(max(P_, (0.25 * target // max(per_g, 1.0)) // P_ * P_))
+    g_tile = min(g_tile, math.ceil(N_G / P_) * P_)
+    n_Gt = math.ceil(N_G / g_tile)
+    store_dev = _c128(Q, n_batch * b, n_Gt * g_tile, shard=P_)
+    # 5. placement
+    if fits(route, source, b, r_s, cs, extra=store_dev):
+        placement = 'device'
+    elif store_dev <= _host_bytes_per_rank():
+        placement = 'host'
+    else:
+        placement = 'disk'
+    br = dict(base)
+    br.update(ws(route, b, r_s, cs, source=source))
+    if source == 'cache':
+        br["ψ(r) block cache"] = cache_bytes
+    elif source == 'resident':
+        br["ψ(G) resident"] = resident_bytes
+    if placement == 'device':
+        br["Z store (device)"] = store_dev
+    hwm = sum(br.values())
+    store_total = Q * mu * N_G * 16.0
+    transfer = {
+        "Z transpose": Q * mu * n_rtot * 16.0 / P_,
+        "Z store write": 0.0 if placement == 'device' else store_total / P_,
+        "Z store read": 0.0 if placement == 'device' else store_total / P_,
+        "ψ regeneration": (0.0 if route == 'cache' else
+                           n_batch * _c128(nk, nb_slots, ns, n_col, n_a, shard=P_)),
+    }
+    return MuBatchPlan(
+        route=route, source=source, b=int(b), n_batch=int(n_batch),
+        r_sub=int(r_sub), row_chunk=int(cs), g_tile=int(g_tile),
+        placement=placement, finalize_layout=finalize_layout,
+        hwm_bytes=float(hwm), budget_bytes=float(budget),
+        target_bytes=float(target), breakdown=br, transfer=transfer)
