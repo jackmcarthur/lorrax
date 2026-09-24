@@ -2281,6 +2281,7 @@ def _fit_charge_zeta_channel(
                 psi_nmu_parent=psi_nmu_parent,
                 psi_mun_parent=psi_mun_parent,
                 mubatch_plan=chunks.get('mubatch'),
+                parent_psi=chunks.pop('parent_psi', None),
                 write_zeta_file=_write_zeta_file,
             )
     if not _reuse_charge:
@@ -2931,20 +2932,20 @@ def _prepare_fresh_parent_faces(
     	if _mb_plan is not None:
     		# ONE ψ(G) pass (loader tables 2026-09-23): each band chunk is read
     		# once, moved to G slots by one all-to-all and sampled at the
-    		# centroids by a DFT.  The G-slot store is not retained yet
-    		# (placement 'none'): the μ-batch fit still builds its own store.
-    		# When the route-G fit takes ``ParentPsiG`` it passes 'device'
-    		# (resident) or 'host' (streaming) here and the second read goes.
+    		# centroids by a DFT.  The G-slot store stays on device for the
+    		# route-G fit (its planner priced it resident: M_f − Ψ ≥ c_μ·b_min;
+    		# ψ streaming is not implemented and refuses by GATE there).
     		from common.psi_G_store import load_parent_psi_G
     		_parent_psi = load_parent_psi_G(
     			wfn=wfn, mesh_xy=mesh_xy, meta=meta,
     			band_range=band_slices.full_range,
     			band_chunk=int(_mb_plan.band_chunk),
-    			centroid_indices=centroid_indices, placement="none",
+    			centroid_indices=centroid_indices, placement="device",
     			bispinor=bool(int(meta.nspinor) == 4),
     			bispinor_lift=(representation.charge_lift or "raw"),
     			k_domain=sym.parent_k_domain, print_fn=print0)
     		parent_y, parent_x = _parent_psi.faces
+    		chunks['parent_psi'] = _parent_psi._replace(faces=None)
     		del _parent_psi
     	else:
     		parent_y, parent_x = load_centroids_band_chunked(

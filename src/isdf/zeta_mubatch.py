@@ -113,7 +113,7 @@ def owner_orbit_batches(plan, mu_pad: int, n_ranks: int, *, c_target: int):
         slot_of_packed=np.asarray(bins.packed_to_slot(int(mu_pad)), dtype=np.int32))
 
 
-def typed_child_G_tables(plan, *, fft_grid, box_par, ngk_par, gvec_child,
+def typed_child_G_tables(plan, *, fft_grid, sphere_par, gvec_child,
                          ngk_child, k_child):
     """The r-space typed transport of :func:`typed_children_psi_G` as G-space
     tables, its exact Fourier image.
@@ -122,9 +122,11 @@ def typed_child_G_tables(plan, *, fft_grid, box_par, ngk_par, gvec_child,
     offset ``t = round(N·S·τ)/N`` (the grid permutation's), so on the child's
     sphere ``c_k(G') = U_k T[c_p(G) e^{-2πi (k̄+G)·t}]`` with
     ``S^T(k̄+G) = ±(k + G')`` (+ unitary, − antiunitary rows, where T
-    conjugates).  Returns ``(pslot (nk, ngk_c) int32`` parent slot of each
-    child slot (``ngk_par`` for pad slots), ``phase (nk, ngk_c)``
-    ``e^{-2πi (k̄+G)·t}``, ``anti (nk,) bool)``.
+    conjugates).  ``sphere_par (n_parent, ngk_par)`` is the parents' sphere
+    index (slot → flat box cell, ``≥ N_r`` on a pad slot;
+    :func:`common.gvec_fft_box.build_sphere_box_index`).  Returns ``(pslot
+    (nk, ngk_c) int32`` parent slot of each child slot (``ngk_par`` for pad
+    slots), ``phase (nk, ngk_c)`` ``e^{-2πi (k̄+G)·t}``, ``anti (nk,) bool)``.
     """
     fg = np.asarray(fft_grid, dtype=np.int64)
     S_all = np.asarray(plan.spatial_ops, dtype=np.int64)
@@ -134,8 +136,14 @@ def typed_child_G_tables(plan, *, fft_grid, box_par, ngk_par, gvec_child,
     kc = np.asarray(k_child, dtype=np.float64)
     gvc = np.asarray(gvec_child, dtype=np.int64)
     nk, ngk_c = int(gvc.shape[0]), int(gvc.shape[1])
-    box = np.asarray(box_par, dtype=np.int64).reshape(box_par.shape[0], -1)
-    pslot = np.full((nk, ngk_c), int(ngk_par), dtype=np.int32)
+    sph = np.asarray(sphere_par, dtype=np.int64)
+    n_par, ngk_par = (int(v) for v in sph.shape)
+    N = int(np.prod(fg))
+    box = np.full((n_par, N), ngk_par, dtype=np.int64)      # flat cell → slot
+    for p_ in range(n_par):
+        live_p = sph[p_] < N
+        box[p_, sph[p_][live_p]] = np.flatnonzero(live_p)
+    pslot = np.full((nk, ngk_c), ngk_par, dtype=np.int32)
     phase = np.zeros((nk, ngk_c), dtype=np.complex128)
     anti = np.zeros(nk, dtype=bool)
     for k in range(nk):

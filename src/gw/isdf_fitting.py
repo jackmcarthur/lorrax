@@ -222,7 +222,7 @@ def add_pad_diagonal_sharded(C, active_mask, n_logical, *, mesh_xy):
 
 
 def _fit_mubatch(
-    *, wfn, sym, meta, centroid_indices, mesh_xy, plan, band_chunk_ranges,
+    *, wfn, sym, meta, centroid_indices, mesh_xy, plan, parent_psi, band_chunk_ranges,
     band_range_full, bispinor, bispinor_lift, k_unfold_plan, psi_mun_parent,
     layout, weight_l_face, weight_r_face, L_q, lu_piv, q_chunk_size,
     solver_kind, zeta_gather, distrib_la_batched_route, n_rmu_solve,
@@ -268,28 +268,44 @@ def _fit_mubatch(
     # grid-snapped τ phase, spinor U, conjugation on antiunitary rows).
     with timing.section("zeta_fit.mubatch.psi_G"):
         _pd = k_unfold_plan.sym.parent_k_domain
-        psi = wfn.load(bands=(b_lo, b_hi), k=_pd, bispinor=bool(bispinor),
-                       bispinor_lift=(bispinor_lift if bispinor else "raw"))
-        n_par, nb_p, ngk_psi = int(psi.shape[0]), int(psi.shape[1]), int(psi.shape[3])
-        s_ax = padded_axis(ngk_psi, P_, name="route-G ψ sphere slots")
+        if parent_psi is None:
+            # The one ψ read (common.psi_G_store.load_parent_psi_G) when the
+            # caller did not hand its G-slot store over with the faces.
+            from common.psi_G_store import load_parent_psi_G
+            parent_psi = load_parent_psi_G(
+                wfn=wfn, mesh_xy=mesh_xy, meta=meta, band_range=(b_lo, b_hi),
+                band_chunk=int(plan.band_chunk), centroid_indices=None,
+                placement="device", bispinor=bool(bispinor),
+                bispinor_lift=(bispinor_lift if bispinor else "raw"),
+                k_domain=_pd, print_fn=print_fn)
+        _br = tuple(int(v) for v in parent_psi.band_range)
+        if _br[0] != b_lo or _br[1] < b_hi:
+            raise ValueError(
+                f"_fit_mubatch: the ψ(G) store holds bands {_br}, the fit "
+                f"window is {(b_lo, b_hi)}")
+        n_par, nb_p, _, ngk_c = (int(v) for v in parent_psi.psi_G.shape)
         g_spec = NamedSharding(mesh_xy, P(None, None, None, ('x', 'y')))
-        cbar = jax.jit(lambda x: jnp.conj(pad_to_axis(x, s_ax, axis=3)),
-                       out_shardings=g_spec)(psi)
-        del psi
+        cbar = jax.jit(jnp.conj, out_shardings=g_spec, donate_argnums=0)(
+            parent_psi.psi_G)
+        sphere_par = np.asarray(jax.device_get(parent_psi.sphere_index), dtype=np.int64)
+        ngk_psi = ngk_c
+        s_ax = padded_axis(ngk_c, P_, name="route-G ψ sphere slots")
         kv = np.asarray(wfn.kvecs(k="full_bz"), dtype=np.float64)
         kin = np.rint(kv * np.asarray(kgrid)).astype(int) % np.asarray(kgrid)
         if not np.array_equal(np.ravel_multi_index(kin.T, kgrid), np.arange(nk)):
             raise ValueError("_fit_mubatch: the loader's full-BZ rows are not the "
                              "C-order k grid the k-convolution assumes")
         kpar = np.asarray(k_unfold_plan.k_parent_frac, dtype=np.float64)
-        g3 = np.asarray(pad_to_axis(np.asarray(wfn.gvecs(k=_pd), np.int32),
-                                    s_ax, axis=1))
+        fgv = np.asarray(fft_grid, dtype=np.int64)
+        flat = np.where(sphere_par < int(np.prod(fgv)), sphere_par, 0)
+        g3 = np.stack([flat // (fgv[1] * fgv[2]), (flat // fgv[2]) % fgv[1],
+                       flat % fgv[2]], axis=-1).astype(np.int32)
         g3 = jax.make_array_from_callback(
             g3.shape, NamedSharding(mesh_xy, P(None, ('x', 'y'), None)),
             lambda idx: g3[idx])
         pslot, phase, anti = zmb.typed_child_G_tables(
-            k_unfold_plan, fft_grid=fft_grid, box_par=np.asarray(wfn.box_index(k=_pd)),
-            ngk_par=int(wfn.ngkmax), gvec_child=np.asarray(wfn.gvecs(k="full_bz")),
+            k_unfold_plan, fft_grid=fft_grid, sphere_par=sphere_par,
+            gvec_child=np.asarray(wfn.gvecs(k="full_bz")),
             ngk_child=np.asarray(wfn.ngk_valid(k="full_bz")), k_child=kv)
         unf = tuple(_device_put_process_local(np.asarray(a), rep) for a in (
             np.asarray(k_unfold_plan.irr_idx, np.int32),
@@ -483,6 +499,7 @@ def fit_zeta_to_h5(
     psi_mun_parent: jax.Array | None = None,
     layout="face",
     mubatch_plan=None,
+    parent_psi=None,
     write_zeta_file: bool = True,
     print_fn=print,
 ):
@@ -1264,7 +1281,7 @@ def fit_zeta_to_h5(
         t_mb0 = time.perf_counter()
         zeta_g, n_run, n_total = _fit_mubatch(
             wfn=wfn, sym=sym, meta=meta, centroid_indices=centroid_indices,
-            mesh_xy=mesh_xy, plan=mubatch_plan,
+            mesh_xy=mesh_xy, plan=mubatch_plan, parent_psi=parent_psi,
             band_chunk_ranges=band_chunk_ranges,
             band_range_full=band_range_full, bispinor=bispinor,
             bispinor_lift=bispinor_lift, k_unfold_plan=k_unfold_plan,

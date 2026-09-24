@@ -126,14 +126,14 @@ def run_case(case, fx, mesh, scratch):
     miller = G.astype(np.int32)
     g3 = np.asarray(pad_to_axis(np.broadcast_to(miller, (n_par,) + miller.shape).copy(),
                                 s_ax, axis=1))
-    box_id = np.broadcast_to(np.arange(n_rtot, dtype=np.int32), (n_par, n_rtot)).copy()
+    sph_id = np.broadcast_to(np.arange(n_rtot, dtype=np.int32), (n_par, n_rtot)).copy()
     pslot, phase, anti = zmb.typed_child_G_tables(
-        plan, fft_grid=fg, box_par=box_id, ngk_par=n_rtot,
+        plan, fft_grid=fg, sphere_par=sph_id,
         gvec_child=np.broadcast_to(miller, (nk,) + miller.shape),
         ngk_child=np.full(nk, n_rtot), k_child=kfull)
     axis = int(np.argmax(fg))
-    cyl = psi_cylinder_tables(np.broadcast_to(np.arange(n_rtot, dtype=np.int32).reshape(fg),
-                                              (nk,) + fg).copy(), fg, axis, ngkmax=n_rtot)
+    cyl = psi_cylinder_tables(np.broadcast_to(np.arange(n_rtot, dtype=np.int32),
+                                              (nk, n_rtot)).copy(), fg, axis, ngkmax=n_rtot)
     zt = zmb.zeta_plane_tables(G[sphere].transpose(0, 2, 1).astype(np.int64),
                                np.full(len(q_sel), ngk), fg, axis, g_axis)
     plan_id = zmb.identity_kplan(kfull, parity._grid_points(fg)[fx["cent_flat"]], fg, mesh, ns)
