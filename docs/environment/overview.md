@@ -401,7 +401,7 @@ rest.
 |---|---|---|
 | `JAX_ENABLE_X64` | `1` | 64-bit precision (required for GW).  Runtime-owned: applied even when jax was imported first, and a resolved `False` refuses at startup (`LORRAX_ALLOW_X64_OFF=1` continues, announced uncertified) |
 | `JAX_PLATFORMS` | `cuda,cpu` (GPU) / `cpu` (CPU runs) | an explicit `cpu` also arms the CUDA-plugin-skip (below) |
-| `XLA_PYTHON_CLIENT_ALLOCATOR` / `XLA_PYTHON_CLIENT_PREALLOCATE` / `XLA_CLIENT_MEM_FRACTION` | `cuda_async` / `true` / `0.89` on CUDA (40 and 80 GB alike); untouched on CPU; ROCm keeps BFC with `PREALLOCATE=false` | the one GPU pool policy, `runtime.set_default_gpu_pool()` (§2.1).  A run script sets none of them |
+| `XLA_PYTHON_CLIENT_ALLOCATOR` / `XLA_PYTHON_CLIENT_PREALLOCATE` / `XLA_CLIENT_MEM_FRACTION` | `cuda_async` / `true` / `0.89` on CUDA (40 and 80 GB alike); untouched on CPU, GPU-less nodes and ROCm; all-or-nothing, and `cuda_async` with `PREALLOCATE=false` refuses | the one GPU pool policy, `runtime.set_default_gpu_pool()` (§2.1).  A run script sets none of them |
 | `HDF5_USE_FILE_LOCKING` | `FALSE` | Lustre HDF5 compatibility |
 
 There is one repository-configured LORRAX compile-cache owner:
@@ -430,14 +430,19 @@ the codebase works:
 | `cuda_async` | `cudaMallocAsync` mempool | keeps `peak_bytes_in_use` |
 
 Measured on 8× Quadro RTX 5000 across 2 nodes (jobs 7882442 / 7882447 /
-7882468, every cell run twice): `cuda_async` is the best of the three
-(0.19 GB overhead, largest creatable cuFFT plan 9.20 GB) **and** keeps
+7882468, every cell run twice, with preallocation off and the since-deleted
+cuFFT arena): `cuda_async` had the least overhead of the three
+(0.19 GB; largest creatable cuFFT plan 9.20 GB) **and** keeps
 `memory_stats()` alive. It also lets XLA, NCCL, CAL and SLATE share one
 pool — pre-grabbing 95 % into BFC (`MEM_FRACTION=0.95`) starves NCCL and
 surfaces as `cusolverMpSyevd: status=7`.
 
 **The policy: `cuda_async`, reserved, fraction 0.89** (`runtime.GPU_POOL_FRACTION`, one value on every CUDA node; `runtime.set_default_gpu_pool()`,
-every CUDA run; an explicit export wins and the startup report names it).
+every CUDA run on an NVIDIA node).  All or nothing: applied whole only when
+neither `ALLOCATOR` nor `PREALLOCATE` is exported (either export leaves the
+caller's allocator, named by the startup report), and `cuda_async` with
+`PREALLOCATE` off REFUSES.  The startup report checks the live `bytes_limit`
+against `fraction × cuDeviceTotalMem`.
 What XLA does with it (jaxlib 0.9.1 source): PJRT allocates from the device's
 **default** mempool (`create_new_pool=false`), the same pool every FFI
 `cudaMallocAsync` uses.  The pool's release threshold equals the
@@ -495,10 +500,12 @@ Three standing corrections:
   (byte-identical run with and without it, job 7882442). Do not add it to
   any table.
 
-The memory-fraction cap is read new-spelling-first:
-`XLA_CLIENT_MEM_FRACTION`, then the deprecated
-`XLA_PYTHON_CLIENT_MEM_FRACTION` (flagged in the startup report) —
-`runtime/xla_memory.py`.
+The memory fraction (a reservation and budget under `cuda_async`, a cap
+only under BFC) has two spellings: `XLA_CLIENT_MEM_FRACTION` and the
+deprecated `XLA_PYTHON_CLIENT_MEM_FRACTION` (flagged in the startup report).
+jaxlib refuses the two together, inside plugin discovery where the error
+reads as a missing backend, so `runtime.set_default_gpu_pool()` refuses the
+pair first; either one alone is read by `runtime/xla_memory.py`.
 
 ### 2.2 The CPU-run plugin skip
 
