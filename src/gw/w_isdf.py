@@ -480,10 +480,9 @@ def _get_chi_minimax_kernel_spin_pairs(mesh_xy, kgrid, nk, n_out, complex_contou
     :func:`_get_chi_minimax_kernel_face` for ``vertex_pairs=None``.
     """
     from common.fft_helpers import make_flat_k_fftn
-    from common.shard_map import shard_map
     from common.wfn_layout import psi_specs
     from distrib_la import gemm_plan
-    from .greens_function_kernel import build_G_tau
+    from .greens_function_kernel import build_G_tau, spin_pair_rows, unfold_parent_faces
     from .wavefunction_bundle import CHI_Q_SPEC as _chi_spec, CHI_R_SPEC as _chi_R_spec
 
     psi_nmu_spec, psi_mun_spec = psi_specs(layout)
@@ -505,13 +504,9 @@ def _get_chi_minimax_kernel_spin_pairs(mesh_xy, kgrid, nk, n_out, complex_contou
     def to_full_k(psi_mun, psi_nmu, tables):
         if k_unfold_plan is None:
             return (psi_mun, psi_nmu) + tuple(tables)
-        unfold = shard_map(
-            lambda l, r: (k_unfold_plan.unfold_face(l, spin_axis=1, mu_axis=2, mesh_axis="x"),
-                          k_unfold_plan.unfold_face(r, spin_axis=2, mu_axis=3, mesh_axis="y")),
-            mesh=mesh_xy, in_specs=(psi_mun_spec, psi_nmu_spec),
-            out_specs=(psi_mun_spec, psi_nmu_spec), check_vma=False)
         rows = jnp.asarray(k_unfold_plan.irr_idx)
-        return unfold(psi_mun, psi_nmu) + tuple(jnp.take(v, rows, axis=0) for v in tables)
+        return (unfold_parent_faces(k_unfold_plan, psi_mun, psi_nmu, layout=layout)
+                + tuple(jnp.take(v, rows, axis=0) for v in tables))
 
     nodes_shard = MinimaxNodes(t=rep1, alpha=rep1 if n_out == 1 else rep0)
 
@@ -535,8 +530,7 @@ def _get_chi_minimax_kernel_spin_pairs(mesh_xy, kgrid, nk, n_out, complex_contou
             t_c = jnp.conj(tau) if complex_contour else tau
 
             def pair(chi, index):
-                left = jax.lax.dynamic_slice_in_dim(psi_mun, index // ns, 1, axis=1)
-                right = jax.lax.dynamic_slice_in_dim(psi_nmu, index % ns, 1, axis=2)
+                left, right = spin_pair_rows(psi_mun, psi_nmu, index, ns)
                 Gv_R = block_green(left, right, -tau, vmax, mask_v)
                 # Finish the valence block before the conduction GEMM starts.
                 Gv_R, left = jax.lax.optimization_barrier((Gv_R, left))
