@@ -1706,7 +1706,13 @@ def _plan_gflat_chunks_for_channel(
 			        "register-documented run-level workaround, "
 			        "which bypasses this gate")
 			+ ".")
-		if mem.r_chunk_override > 0 and not _floor_broken:
+		if mubatch:
+			# The charge channel runs route G, whose planner (below) owns
+			# feasibility and refuses on its own terms; the r-chunk plan is
+			# priced only for the dict fields the fit still reads.
+			print_fn(f"  {_msg}  Not binding: the charge channel runs the "
+			         "μ-batch fit, planned below.")
+		elif mem.r_chunk_override > 0 and not _floor_broken:
 			print_fn(f"  {_msg}  Proceeding under the explicit "
 			       f"r_chunk_size={int(mem.r_chunk_override)} the "
 			       f"operator asserted; the plan is still priced "
