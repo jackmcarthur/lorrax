@@ -729,6 +729,7 @@ def fit_scissor(
     k_weights: np.ndarray,
     conduction_frontier_tol_ev: float | None = None,
     conduction_rigid_mean: bool = False,
+    state_weights_kn: np.ndarray | None = None,
 ) -> ScissorFit:
     """Fit valence / conduction scissor lines to (E_DFT, ΔE) samples.
 
@@ -780,6 +781,11 @@ def fit_scissor(
         k-weighted mean of ``E_QP - E_DFT`` over every trusted conduction
         sample (``fit_mask_kn`` and not valence).  Exclusive with
         ``conduction_frontier_tol_ev``.
+    state_weights_kn : np.ndarray, optional
+        Per-sample weights multiplying ``k_weights`` (the SC tail's
+        quasiparticle weights Z), in DFT-identity order like the masks.
+        Must be positive wherever ``fit_mask_kn`` is set.  ``None`` is unit
+        weight, bit for bit the unweighted fit.
     """
     E_dft = np.asarray(E_dft_kn_ev, dtype=np.float64)
     E_qp = np.real(np.asarray(E_qp_kn_ev, dtype=np.complex128))
@@ -825,6 +831,13 @@ def fit_scissor(
     # sort permutation is per-k (rows are not reordered), hence no
     # reordering of w_kn is needed.
     w_kn = np.broadcast_to(w_k[:, None], E_dft.shape)
+    if state_weights_kn is not None:
+        sw = np.asarray(state_weights_kn, dtype=np.float64)
+        if sw.shape != E_dft.shape or not np.all(sw[fm] > 0.0):
+            raise ValueError(
+                "fit_scissor: state_weights_kn must match E_DFT's shape and be "
+                "positive on every fit sample.")
+        w_kn = w_kn * sw[rows, order_dft]
 
     # Fit E_QP = α · E_DFT + β directly so α reads as the stretching factor
     # (α = 1 ⇒ rigid shift).  RMSE is reported on the QP correction
