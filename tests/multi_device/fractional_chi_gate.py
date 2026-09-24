@@ -1,6 +1,6 @@
 """P=4 dense Kubo gate for the finite-occupation chi0 contour kernel."""
 
-from runtime import initialize_communicator_stack, finalize_process
+from runtime import initialize_communicator_stack, run_main_and_finalize
 
 RUNTIME = initialize_communicator_stack()
 
@@ -255,7 +255,4 @@ def main():
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    finally:
-        finalize_process()
+    run_main_and_finalize(main)   # a failure keeps its traceback and a nonzero status

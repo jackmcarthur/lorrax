@@ -13,7 +13,7 @@ sys.path.insert(0, os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
     "src"))
 
-from runtime import initialize_communicator_stack, finalize_process  # noqa: E402
+from runtime import initialize_communicator_stack, run_main_and_finalize  # noqa: E402
 
 RUNTIME = initialize_communicator_stack()
 
@@ -106,7 +106,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    finally:
-        finalize_process()
+    run_main_and_finalize(main)   # a failure keeps its traceback and a nonzero status

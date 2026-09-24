@@ -2,7 +2,7 @@
 
 Tiny plant only; does not certify endpoint preparation or native workspace.
 """
-from runtime import initialize_communicator_stack, finalize_process
+from runtime import initialize_communicator_stack, run_main_and_finalize
 initialize_communicator_stack()
 
 import json
@@ -101,7 +101,4 @@ def main():
 
 
 if __name__ == '__main__':
-    try:
-        main()
-    finally:
-        finalize_process()
+    run_main_and_finalize(main)   # a failure keeps its traceback and a nonzero status
