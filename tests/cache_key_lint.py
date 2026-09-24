@@ -268,17 +268,6 @@ ALLOW: tuple[AllowRow, ...] = (
             "callback this module cannot see inside."),
         ledger="tests/known_failures/2026-08-10-jax-cache-contract.md"),
     AllowRow(
-        path="src/gw/kin_ion_io.py", rule="rank-branch",
-        dated="2026-08-10",
-        reason=_EMPTY_SHARE + (
-            "A CONSUMER.  The other half of this site — the RAGGED band "
-            "chunk, which gave the rank holding the short chunk its own "
-            "compiled FFT and its own cache key — IS fixed on this branch "
-            "(rho_work_items now snaps n_bchunk to a divisor of nocc, so "
-            "every chunk is the same width).  What is left is only the "
-            "empty-share half, which belongs to the carrier above."),
-        ledger="tests/known_failures/2026-08-10-jax-cache-contract.md"),
-    AllowRow(
         path="src/psp/run_nscf.py", rule="rank-branch",
         dated="2026-08-10",
         reason=_EMPTY_SHARE + (
@@ -959,9 +948,9 @@ def tree_compiling_index(root: Path = None, roots=SCAN_ROOTS) -> set:
 
     The second pass is not decoration: pass 1 learns ``local_ifftn3``
     compiles, and only then can pass 2 conclude that
-    ``valence_density_from_kpoint`` does, and pass 3 that
-    ``build_valence_density_distributed``'s loop body does.  Three packages,
-    one chain, and the middle link is what a per-file lint cannot see.
+    ``valence_density_from_kpoint`` does, and pass 3 that a loop body
+    calling it does.  Several packages, one chain, and the middle link is
+    what a per-file lint cannot see.
     """
     trees = []
     for rel, p in iter_sources(root, roots):

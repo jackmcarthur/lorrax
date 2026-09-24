@@ -54,9 +54,7 @@ import h5py
 
 from common import Meta
 from common.gvec_fft_box import refuse_padded_gvecs_without_mask
-from common.collectives import (barrier, local_share, process_rank_world,
-                                psum_replicate, resolve_mesh)
-from common.wfn_transforms import load_kpoint_fftbox_local
+from common.collectives import barrier, process_rank_world, resolve_mesh
 import common.timing as timing
 from common.preprocessing_output import (PreprocessingProductionReport,
                                          timing_total)
@@ -85,7 +83,6 @@ from psp.get_DFT_mtxels import (
     compute_local_V_k,
     build_hartree_potential,
     spin_degeneracy_factor,
-    valence_density_from_kpoint,
 )
 from psp.operator_checks import validate_operator_inputs
 import psp.vnl_ops as vnl_ops
@@ -302,6 +299,39 @@ def broadcast_ibz_to_full_bz(A_irr, sym):
     return _broadcast_ibz_slab(A_irr, *star_tables(sym))
 
 
+def _wedge_density_occupations(wfn, sym, k_spec, nb_carrier: int,
+                                band_stop: int):
+    """``(occ, kweights)`` for the density on the sweep's own k rows.
+
+    ``occ`` is ``(n_k, nb_carrier)``: the canonical physical occupations
+    (unit below ``band_stop`` for an exact insulator) and exact zeros above.
+    On the star wedge each row weighs its star's share of the full zone,
+    ``|star| / nk_full`` -- the same partition ``star_wedge_rows`` hands the
+    matrix sweep -- and the density scan's star average then makes the
+    weighted wedge sum the crystal's density.  A full-BZ k-set is uniform.
+    """
+    stop = int(band_stop)
+    if k_spec == "full_bz":
+        nk = int(sym.nk_tot)
+        weights = np.full(nk, 1.0 / nk)
+        occ_rows = wfn.physical_density_occupations(
+            k="full_bz", unit_as_none=True)
+    else:
+        rows, irr_idx_wedge = star_wedge_rows(sym)
+        nk = int(rows.size)
+        counts = np.bincount(np.asarray(irr_idx_wedge, dtype=np.int64),
+                             minlength=nk).astype(np.float64)
+        weights = counts / counts.sum()
+        occ_rows = wfn.physical_density_occupations(
+            k="file", unit_as_none=True)
+        if occ_rows is not None:
+            occ_rows = np.asarray(occ_rows)[np.asarray(rows)]
+    occ = np.zeros((nk, int(nb_carrier)), dtype=np.float64)
+    occ[:, :stop] = 1.0 if occ_rows is None else np.asarray(
+        occ_rows, dtype=np.float64)[:, :stop]
+    return occ, weights
+
+
 def _wedge_sweep_kspec(wfn, sym):
     """``(k_spec, kvecs, n_k)`` for a matrix-element sweep over the wedge.
 
@@ -447,9 +477,14 @@ def get_kin_ion_k(wfn_k, Gk_crys, kvec, V_loc_r, vnl_setup, wfn, g_mask=None,
 #
 # COMMUNICATION CONTRACT (this is the whole design, in four lines):
 #
-#   ρ(r)              partitioned over (k, band-chunk); per-rank partials
-#                     combined by **exactly one psum of nx·ny·nz f64**
-#                     (1.4 MB at 12×12).  Nothing else is reduced.
+#   ψ                 ONE G-sphere load on the star wedge, band-sharded and
+#                     resident (≈19 MB/rank at b600/P=64); it serves both
+#                     the density and the matrix elements.
+#   ρ(r)              the SC loop's density scan
+#                     (``gw.qsgw_density.rho_from_wfns``): each rank sums
+#                     its own bands, ONE reduction of the nx·ny·nz field,
+#                     then the star average.  The one-shot and the SC
+#                     Hartree have one density builder.
 #   V_H(r) = Poisson  **REPLICATED BY DESIGN** — zero collectives; see the
 #                     step-2 comment inside ``compute_hartree_matrix``.
 #   ⟨mk|V_H|nk⟩       ONE k-tile scan (``common.mtxel_sweep``): k is a
@@ -458,291 +493,6 @@ def get_kin_ion_k(wfn_k, Gk_crys, kvec, V_loc_r, vnl_setup, wfn, g_mask=None,
 #                     reduce-scattered; the output stays sharded
 #                     ``P(None,'x','y')`` and is gathered only at the
 #                     boundary, by name.
-#   ψ                 for ρ: loaded per rank for the (k, band) windows that
-#                     rank owns — process-local, no collective implied.
-#                     For the matrix elements: the G-SPHERE for all k,
-#                     band-sharded and resident (≈19 MB/rank at b600/P=64).
-#
-# Why the partitions differ between the two sweeps: ρ is a sum over
-# (k, band) and both axes are free, so k alone suffices until P > nk and a
-# band chunking is layered on.  ⟨mk|V_H|nk⟩ contracts the FULL band window
-# against itself at fixed k, so splitting bands means either a reduction or
-# a two-sided split.  ``mtxel_sweep`` splits G and reduce-scatters one
-# k-tile's ``(nb, nb)`` partial into ``H[m_X, n_Y]`` — a transient per tile,
-# not the replicated (nk, nb, nb) wall; its module docstring prices it.
-
-
-def rho_work_items(
-    nk: int,
-    nocc: int,
-    world: int,
-    *,
-    max_bands_per_item: int | None = None,
-) -> list[tuple[int, int, int]]:
-    """The ρ sweep's work list: ``(ik, b_lo, b_hi)`` items, k-major.
-
-    Without an explicit memory bound, one item per k while ``world <= nk``
-    leaves the band axis whole.  That retains the former P=1 sequence for
-    small fixtures.  Past ``world > nk`` the occupied manifold is cut into
-    ``ceil(world/nk)`` contiguous band chunks so ranks beyond the k count
-    still get work.  A positive ``max_bands_per_item`` can require a tighter
-    split at any P; ``valence_density_from_kpoint`` sums whatever bands it is
-    handed, so no band-index bookkeeping leaks out of here.
-
-    EVERY CHUNK IS THE SAME WIDTH, and that is a cache-contract
-    requirement rather than a tidiness preference.  The band extent of an
-    item is the SHAPE of two compiled programs — ``common.wfn_transforms``
-    keys its ``to_box`` kernel cache on ``psi.shape``, and
-    ``psp.get_DFT_mtxels._valence_density_kernel`` is a 3-D IFFT whose
-    batch axis is the band count.  The old ``nocc*i//n_bchunk`` bounds are
-    ragged whenever ``n_bchunk`` does not divide ``nocc`` (``nocc=26`` at
-    ``n_bchunk=4`` gives 6,7,6,7), ``local_share`` hands each rank a
-    disjoint subset of the items, and so the rank holding a 7-band chunk
-    compiled an FFT module no rank holding a 6-band chunk ever compiled —
-    a persistent-cache key it alone held, missed while its peers hit,
-    which is the collective-compile deadlock precondition
-    (FIX_multislice_cachekey.md §6.1, sibling 2).
-
-    So the parallel ``n_bchunk`` is snapped DOWN to a divisor of ``nocc``.
-    ``max_bands_per_item`` then imposes the memory bound owned by the run's
-    existing ``band_chunk_size`` policy: when the parallel split is too
-    coarse, choose the smallest divisor whose uniform width is no larger
-    than that bound.  The parallel divisor is retained exactly when it is
-    already tighter.  At CrI3 ``nocc=130``, ``P=16 <= nk=36`` and
-    ``max_bands_per_item=16``, this changes one 130-band FFT box into ten
-    identically-shaped 13-band boxes without introducing a ragged compile.
-
-    The cost of divisor-uniform shapes is stated rather than hidden: at
-    prime ``nocc`` a tight memory bound collapses the width to one band.
-    That is slower, but bounded and cache-symmetric; padding a ragged final
-    carrier would be a separate transport-ABI change.
-
-    The three properties this function is pinned on are: every band is
-    covered exactly once (uniform division of ``nocc`` by one of its
-    divisors), the no-bound ``world <= nk`` path remains one whole-band item
-    per k, and the round-robin share stays balanced to within one item.
-    """
-    nk = int(nk)
-    nocc = int(nocc)
-    target = max(1, min(-(-int(world) // max(nk, 1)), nocc))
-    # Preserve the incumbent parallel split: largest divisor <= target.
-    parallel_chunks = next(
-        d for d in range(target, 0, -1) if nocc % d == 0)
-    n_bchunk = parallel_chunks
-    if max_bands_per_item is not None and int(max_bands_per_item) > 0:
-        min_chunks = min(
-            nocc, -(-nocc // int(max_bands_per_item)))
-        threshold = max(parallel_chunks, min_chunks)
-        # Smallest divisor >= threshold.  ``nocc`` always qualifies.
-        n_bchunk = next(
-            d for d in range(threshold, nocc + 1) if nocc % d == 0)
-    width = nocc // n_bchunk
-    bounds = [(i * width, (i + 1) * width) for i in range(n_bchunk)]
-    return [(ik, lo, hi) for ik in range(nk) for lo, hi in bounds if hi > lo]
-
-
-def _load_rotated_occ_fftbox(wfn, meta, ik: int, U_k):
-    """The ``nocc`` CURRENT-basis occupied orbitals at k, in the FFT box.
-
-    ``U_k`` is ``(nmix, nocc)``: column ``n`` gives the current
-    (QP / mixed) occupied orbital ``n`` as a combination of the first
-    ``nmix`` DFT orbitals from the WFN file,
-    ``ψ^cur_n = Σ_m U[m, n] ψ^DFT_m``.
-
-    The rotation is applied on the **G-flat** coefficients, before the
-    scatter into the FFT box: ``nmix·nocc·ns·ngkmax`` flops instead of
-    ``nmix·nocc·ns·N_r`` (a 20× saving at MoS₂ 12×12), and the box is
-    only ever materialised at ``nocc`` bands rather than ``nmix``.
-    """
-    from common.collectives import single_device_mesh
-    from common.wfn_transforms import to_box
-    nmix = int(np.shape(U_k)[0])
-    # Same reasoning as the unrotated leg in build_valence_density_distributed:
-    # ask the loader for the extent meta declares, so the small components are
-    # lifted rather than zero-filled below.
-    psi_g = wfn.load_process_local(bands=(0, nmix), k=[int(ik)],
-                                   bispinor=(int(meta.nspinor) == 4))
-    ns_have = int(psi_g.shape[2])
-    if int(meta.nspinor) > ns_have:
-        from common.wfn_transforms import _refuse_spinor_zero_fill
-        _refuse_spinor_zero_fill(int(meta.nspinor), ns_have,
-                                 origin="kin_ion_io._load_rotated_occ_fftbox")
-    U = jnp.asarray(U_k, dtype=psi_g.dtype)
-    psi_g = jnp.einsum('mn,kmsg->knsg', U, psi_g, optimize=True)
-    box = to_box(psi_g, wfn.box_index(k=[int(ik)]),
-                 tuple(int(s) for s in meta.fft_grid),
-                 mesh=single_device_mesh())
-    return box[0]
-
-
-def build_valence_density_distributed(wfn, sym, meta, *,
-                                      nk: int | None = None,
-                                      mesh=None,
-                                      psi_rotation=None,
-                                      max_bands_per_item: int | None = None,
-                                      include_dirac_current: bool = False,
-                                      charge_nspinor: int | None = None,
-                                      bispinor_lift: str = "raw",
-                                      print_fn=print) -> np.ndarray:
-    """ρ_v(r) on the ψ FFT box grid — k/band-partitioned, ONE psum.
-
-    Replaces the serial k loop.  Each rank sweeps only the
-    ``(k, band-chunk)`` items :func:`rho_work_items` hands it, loading
-    ψ process-locally for exactly those windows, and accumulates into
-    its own full-grid partial ρ.  ρ is *small* — ``nx·ny·nz`` f64,
-    1.4 MB for the MoS₂ 12×12 — so replicating the accumulator costs
-    nothing and the combination is a single all-reduce of that size.
-    Sharding ρ itself would buy 1.4 MB of memory and cost an
-    all-to-all; it is deliberately not done.
-
-    The FFT flops (nk·nocc 3-D FFTs, 1.1e11 at 12×12) divide by P
-    exactly, and so does the ψ read.  The pad-band contract is
-    irrelevant here because the items carry real band bounds, not
-    mesh-rounded ones.
-
-    Mirrors :func:`psp.get_DFT_mtxels.compute_valence_density` — SAME
-    per-k quadrature helper, no second copy of the density math — and
-    never holds more than one ``(k, band-chunk)`` of ψ, which is what
-    keeps the 144-k / 400-band decks inside a node.  The unfolded full
-    BZ carries uniform k weights ``1/nk_tot`` by construction.  WfnLoader
-    supplies the matching full-BZ per-band occupations through the same
-    cached ``irr_idx_k`` source rows used by its ψ unfold.
-
-    THE QSGW SEAM — ``psi_rotation``
-    --------------------------------
-    ``None`` (default, and the only thing a one-shot run needs) builds ρ
-    from the WFN file's DFT orbitals.
-
-    Pass ``(nk, nmix, nocc)`` and ρ is built instead from the CURRENT
-    occupied orbitals ``ψ^cur_n = Σ_m U[k, m, n] ψ^DFT_m`` — i.e. from
-    whatever mixed/rotated wavefunctions the SC loop is holding, which
-    is what makes an updated-density QSGW iteration possible rather
-    than a fixed-mean-field one.  This is the *density-side* twin of
-    ``sigma_dispatch``'s ``hartree_basis_rotation``, and the two are
-    orthogonal by construction: this one changes WHICH density V_H is
-    generated by; that one changes which BASIS the resulting operator
-    is expressed in.  The matrix-element sweep still uses the file's
-    DFT orbitals, so the kernel keeps returning a DFT-basis operator
-    and the existing ``U†·O_DFT·U`` seam still applies unchanged.
-
-    With a rotation supplied the band axis is NOT chunked (the mixing
-    couples all ``nmix`` bands, so a band split would need its own
-    reduction); the sweep stays k-partitioned, which is full-rate for
-    every P ≤ nk.
-
-    Returns the summed ρ(r) as a host array identical on every rank.
-    ``include_dirac_current=True`` returns ``(rho,Jx,Jy,Jz)`` from the
-    same WFN load and IFFT transaction.  ``charge_nspinor=2`` keeps those
-    currents on the raw four-spinor carrier while forming rho from its
-    normalized upper/source Pauli two-spinor block.
-    """
-    mesh = resolve_mesh(mesh)
-    _, world = process_rank_world()
-    nk = int(sym.nk_tot if nk is None else nk)
-    nx, ny, nz = (int(s) for s in meta.fft_grid)
-    rotated = psi_rotation is not None
-    include_current = bool(include_dirac_current)
-    if include_current and int(meta.nspinor) != 4:
-        raise ValueError(
-            "Dirac-current density requires meta.nspinor=4; got "
-            f"{int(meta.nspinor)}")
-    if include_current and rotated:
-        raise ValueError(
-            "evolving-orbital Dirac-current density is not implemented; "
-            "bispinor self-consistency must fail closed")
-    nocc = int(wfn.physical_density_band_stop)
-    occupation_weights = wfn.physical_density_occupations(
-        k="full_bz", unit_as_none=True)
-    f_spin = spin_degeneracy_factor(wfn)
-    if occupation_weights is not None:
-        if rotated:
-            raise ValueError(
-                "fractional WFN occupations cannot be attached to rotated "
-                "current-orbital columns; the self-consistent occupation "
-                "state must be supplied explicitly")
-        if occupation_weights.shape != (nk, nocc):
-            raise ValueError(
-                "canonical full-BZ occupations have shape "
-                f"{occupation_weights.shape}, expected ({nk},{nocc})")
-    # A supplied rotation couples the whole occupied band manifold.  It
-    # deliberately retains the all-band item; making that path bounded needs
-    # a distributed rotation, not silently applying independent band slices.
-    if (rotated and max_bands_per_item is not None
-            and 0 < int(max_bands_per_item) < int(nocc)):
-        raise ValueError(
-            "build_valence_density_distributed: the requested "
-            f"max_bands_per_item={int(max_bands_per_item)} is tighter than "
-            f"nocc={int(nocc)}, but psi_rotation couples the full occupied "
-            "manifold.  The rotated path has not been ported to the "
-            "distributed band-rotation owner; refusing instead of silently "
-            "retaining an all-band FFT box.")
-    items = (rho_work_items(nk, int(nocc), 1) if rotated
-             else rho_work_items(
-                 nk, int(nocc), world,
-                 max_bands_per_item=max_bands_per_item))
-    mine = local_share(items)
-    wk = 1.0 / float(nk)
-    # Even an idle rank must compile the process-local box/FFT kernels:
-    # compile agreement is world-wide. A zero-weight copy of the first
-    # uniform-width item joins those kernels without adding charge/current.
-    # The weight is a traced scalar, so this is the same program on all ranks.
-    if not mine and items:
-        mine = [items[0]]
-        wk = 0.0
-    print_fn(f"    rho{' + signed J/c' if include_current else ''} sweep: "
-             f"{len(items)} (k, band-chunk) items over "
-             f"P={world} ranks; this rank has {len(mine)}"
-             f"{'  [rotated ψ: k-partition only]' if rotated else ''}")
-    accumulator_shape = ((4, nx, ny, nz) if include_current
-                         else (nx, ny, nz))
-    # Match the process-local FFT result from the first addition onward;
-    # uneven item counts must not introduce a second compile signature.
-    from jax import local_devices
-    rho_local = jnp.zeros(accumulator_shape, dtype=jnp.float64,
-                          device=local_devices()[0])
-    for n_done, (ik, b_lo, b_hi) in enumerate(mine):
-        if n_done % 32 == 0:
-            print_fn(f"    rho: item {n_done + 1}/{len(mine)} "
-                     f"(k={ik + 1}/{nk}, bands [{b_lo},{b_hi}))...")
-        if rotated:
-            psi_k = _load_rotated_occ_fftbox(
-                wfn, meta, ik, np.asarray(psi_rotation)[ik])
-        else:
-            # bispinor from meta, not defaulted: meta.nspinor == 4 IS the
-            # bispinor flag (common/meta.py), and omitting it here made the
-            # loader return 2 components that the callee then zero-filled to
-            # 4 — silently building rho and V_H from large components only.
-            # The zero fill now refuses; this is the call that keeps it
-            # unreachable, by LIFTING the small components instead.
-            psi_k = load_kpoint_fftbox_local(
-                wfn, meta, ik, b_hi, b_lo=b_lo,
-                bispinor=(int(meta.nspinor) == 4),
-                bispinor_lift=bispinor_lift)
-        if occupation_weights is None:
-            rho_local = rho_local + valence_density_from_kpoint(
-                psi_k, nocc=None, weight=wk,
-                cell_volume=float(wfn.cell_volume), spin_degeneracy=f_spin,
-                include_dirac_current=include_current,
-                charge_nspinor=charge_nspinor,
-            )
-        else:
-            rho_local = rho_local + valence_density_from_kpoint(
-                psi_k, nocc=None, weight=wk,
-                cell_volume=float(wfn.cell_volume), spin_degeneracy=f_spin,
-                band_occupations=occupation_weights[ik, b_lo:b_hi],
-                include_dirac_current=include_current,
-                charge_nspinor=charge_nspinor,
-            )
-        # The Python loop is otherwise an asynchronous dispatch queue.  At a
-        # large FFT grid, queuing every local item can retain several completed
-        # box/workspace families until the final np.asarray synchronisation.
-        # Make the updated carry the per-item scheduling boundary so psi_k and
-        # its FFT temporaries are dead before the next item is loaded.  This is
-        # the same arithmetic and the same accumulator order.
-        rho_local.block_until_ready()
-        del psi_k
-    with timing.section("vh_rho_psum"):
-        return psum_replicate(np.asarray(rho_local), mesh)
 
 
 class ExactHartreeMatrices(NamedTuple):
@@ -765,8 +515,6 @@ class ExactHartreeMatrices(NamedTuple):
 
 def compute_hartree_matrix(wfn, sym, meta, *, truncation_2d: bool,
                            nb: int, mesh=None,
-                           psi_rotation=None,
-                           band_chunk_size: int | None = None,
                            include_transverse: bool = False,
                            charge_nspinor: int | None = None,
                            bispinor_lift: str = "raw",
@@ -777,15 +525,15 @@ def compute_hartree_matrix(wfn, sym, meta, *, truncation_2d: bool,
     Single distributed source for the live GW Hamiltonian and density-SC
     rebuild.
 
-    Distribution: see the contract block at the head of this section.
-    ρ is partitioned over (k, band-chunk) and reduced with one psum;
-    the Poisson solve is replicated; ⟨mk|V_H|nk⟩ is ONE k-scan with that
-    k's bands sharded over every process (``common.mtxel_sweep``).
-    ``mesh`` is the collectives' device mesh — pass the run's own (the
-    driver does) or leave it None and one is derived, 1×1 on a single
-    device.  With no band-memory bound, P=1 retains the serial operation
-    order bit-for-bit.  A tighter ``band_chunk_size`` only reassociates the
-    exact occupied-band sum; it does not change its terms.
+    Distribution: ONE resident ψ(G) sphere on the star wedge, band-sharded
+    over every process, serves both halves.  ρ is the SC loop's own density
+    scan (:func:`gw.qsgw_density.rho_from_wfns`: the wedge-weighted sum,
+    star-averaged by the FFT-grid pullback, one reduction) — one density
+    builder for the one-shot and the self-consistent Hartree; the Poisson
+    solve is replicated; ⟨mk|V_H|nk⟩ is ONE k-scan over the same sphere
+    (``common.mtxel_sweep``).  ``mesh`` is the collectives' device mesh —
+    pass the run's own (the driver does) or leave it None and one is
+    derived, 1×1 on a single device.
 
     Needs no pseudopotentials: ρ comes from ψ, V_H from the Poisson
     solve, and the matrix element from the same normalisation chain
@@ -820,46 +568,43 @@ def compute_hartree_matrix(wfn, sym, meta, *, truncation_2d: bool,
         raise ValueError(
             "transverse direct Hartree requires the canonical four-component "
             f"kinetic-balance carrier; meta.nspinor={int(meta.nspinor)}")
-    if with_transverse and psi_rotation is not None:
-        raise ValueError(
-            "evolving-orbital transverse Hartree is not implemented; "
-            "bispinor self-consistency must fail closed")
     if exact_unit_occupations and nocc > nb:
         raise ValueError(
             f"V_H needs the {nocc} occupied bands but only {nb} were requested")
 
-    # ---- 1. ρ(r): (k, band-chunk)-partitioned, one psum ----------------
-    # Bootstrap the ρ all-reduce BEFORE the sweep, on a zero array of the
-    # exact same shape.  MEASURED on Frontera/Gloo at P=4: the first call
-    # to this reduction costs 11.7 s (XLA lowering of the shard_map module
-    # + Gloo's communicator handshake for that replica group) and every
-    # later call costs milliseconds — ``runtime.nccl_warmup``'s generic
-    # psums do NOT cover it, because they lower a different module.  Left
-    # inside the sweep it is a P-independent constant that masquerades as
-    # 70 % of the ρ phase and destroys the strong-scaling reading.  Doing
-    # it here also means a QSGW loop pays it once, on iteration 0.
-    if world > 1:
-        with timing.section("vh_collective_bootstrap"):
-            psum_replicate(
-                np.zeros(((4, *tuple(int(s) for s in meta.fft_grid))
-                          if with_transverse
-                          else tuple(int(s) for s in meta.fft_grid)),
-                         dtype=np.float64), mesh)
-
+    # ---- 1. ρ(r): the SC density scan on the resident wedge sphere -------
+    # ONE ψ(G) load serves the density AND the matrix sweep (step 3): the
+    # star wedge, band-sharded, at the extent both need.  The wedge sum is
+    # weighted by star size and star-averaged by the FFT-grid pullback,
+    # exactly the SC loop's map-0 density (sc_iteration.
+    # rebuild_hartree_dft_basis) at U = 1.
+    from common.wfn_layout import band_sphere_spec
+    from gw.qsgw_density import rho_from_wfns
+    k_spec, _, nk_irr = _wedge_sweep_kspec(wfn, sym)
+    nb_load = max(int(nb), density_band_stop)
+    psi_G = wfn.load(
+        bands=(0, nb_load), k=k_spec, sharding=band_sphere_spec(),
+        bispinor=(int(meta.nspinor) == 4),
+        bispinor_lift=bispinor_lift)
+    box_index = wfn.box_index(k=k_spec)
     density_label = ("occupied bands" if exact_unit_occupations else
                      "WFN bands with canonical fractional occupations")
     print_fn(f"\nBuilding valence density from {density_band_stop} "
-             f"{density_label} (P={world}, {nk} k-points)...")
+             f"{density_label} (P={world}, {nk_irr} star-wedge k of {nk})...")
     f_spin = spin_degeneracy_factor(wfn)
+    occ, kweights = _wedge_density_occupations(
+        wfn, sym, k_spec, nb_load, density_band_stop)
+    grid = tuple(int(s) for s in meta.fft_grid)
     with timing.section("vh_rho"):
-        rho_np = build_valence_density_distributed(
-            wfn, sym, meta, nk=nk, mesh=mesh,
-            psi_rotation=psi_rotation,
-            max_bands_per_item=band_chunk_size,
+        rho_np = np.asarray(rho_from_wfns(
+            psi_G, occ, kweights, mesh=mesh, box_index=box_index,
+            fft_grid=grid, cell_volume=float(wfn.cell_volume),
+            spin_degeneracy=f_spin,
             include_dirac_current=with_transverse,
             charge_nspinor=(None if charge_nspinor is None else charge_ns),
-            bispinor_lift=bispinor_lift,
-            print_fn=print_fn)
+            sym=sym,
+            sym_perm=sym.fft_grid_pullback(sym.active_symmetry_rows, grid),
+            print_fn=print_fn), dtype=np.float64)
 
     if with_transverse:
         fields = np.asarray(rho_np, dtype=np.float64)
@@ -976,12 +721,7 @@ def compute_hartree_matrix(wfn, sym, meta, *, truncation_2d: bool,
                                     local_potential_operator,
                                     sweep_matrix_elements)
     from common.wfn_layout import band_sphere_spec
-    k_spec, _, nk_irr = _wedge_sweep_kspec(wfn, sym)
     gtab = padded_gvectors(wfn, k=k_spec)
-    psi_G = wfn.load(
-        bands=(0, nb), k=k_spec, sharding=band_sphere_spec(),
-        bispinor=(int(meta.nspinor) == 4),
-        bispinor_lift=bispinor_lift)
     # The four-current operator takes its charge block by charge_nspinor
     # from psi_G itself, so a spinor slice is needed only by the scalar
     # sweep; in transverse mode it was a dead second copy of the sphere.
@@ -990,7 +730,7 @@ def compute_hartree_matrix(wfn, sym, meta, *, truncation_2d: bool,
         else psi_G[:, :, :charge_ns, :]
     geom_matrix = SweepGeometry(
         mesh=mesh, fft_grid=meta.fft_grid,
-        ngkmax=int(psi_G.shape[3]), nb=nb,
+        ngkmax=int(psi_G.shape[3]), nb=nb_load,
         ns=(int(psi_G.shape[2]) if with_transverse
             else int(psi_charge.shape[2])),
         nk=nk_irr, cell_volume=float(wfn.cell_volume))
@@ -1009,7 +749,7 @@ def compute_hartree_matrix(wfn, sym, meta, *, truncation_2d: bool,
         H_matrix = sweep_matrix_elements(
             matrix_psi, operator=matrix_operator, geom=geom_matrix,
             gvecs=gtab.gvecs, gmask=gtab.mask,
-            box_index=wfn.box_index(k=k_spec), kvecs=gtab.kvecs)
+            box_index=box_index, kvecs=gtab.kvecs)
         if with_transverse:
             H_vh, H_vt = H_matrix[:, 0], H_matrix[:, 1]
         else:

@@ -98,8 +98,8 @@ from common.wfn_transforms import load_kpoint_fftbox_local     # noqa: E402
 import symmetry_maps                                           # noqa: E402
 from wfn_loader import WfnLoader                               # noqa: E402
 from gw.gw_config import read_lorrax_input                     # noqa: E402
-from gw.kin_ion_io import (build_valence_density_distributed,   # noqa: E402
-                           compute_hartree_matrix, get_kin_ion_k)
+from gw.kin_ion_io import (compute_hartree_matrix,              # noqa: E402
+                           get_kin_ion_k)
 from psp.dft_operators import padded_gvectors                  # noqa: E402
 from psp.get_DFT_mtxels import (build_hartree_potential,        # noqa: E402
                                 compute_local_V_k,
@@ -209,8 +209,15 @@ def main():
 
     nocc = int(wfn.nelec)
     f_spin = spin_degeneracy_factor(wfn)
-    rho_np = build_valence_density_distributed(
-        wfn, sym, meta, nk=nk, mesh=mesh, print_fn=p0)
+    # The reference density is the one density builder's, on the full BZ
+    # (uniform weights), independent of the edited function's wedge route.
+    from common.wfn_layout import band_sphere_spec
+    from gw.qsgw_density import rho_from_wfns
+    rho_np = np.asarray(rho_from_wfns(
+        wfn.load(bands=(0, nocc), k="full_bz", sharding=band_sphere_spec()),
+        np.ones((nk, nocc)), np.full(nk, 1.0 / nk), mesh=mesh,
+        box_index=wfn.box_index(k="full_bz"), fft_grid=grid,
+        cell_volume=float(wfn.cell_volume), spin_degeneracy=f_spin))
     V_H_r = build_hartree_potential(
         jnp.asarray(rho_np), wfn, truncation_2d=truncation_2d,
         expected_electrons=f_spin * float(nocc), print_fn=p0)

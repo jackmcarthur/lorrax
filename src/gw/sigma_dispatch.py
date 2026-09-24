@@ -478,7 +478,6 @@ def _compute_live_hartree(config, meta, band_slices, mesh_xy, *, wfn, sym,
         wfn, sym, hartree_meta,
         truncation_2d=(int(config.sys_dim) == 2),
         nb=int(band_slices.b3), mesh=mesh_xy,
-        band_chunk_size=int(config.memory.band_chunk_size),
         include_transverse=include_transverse,
         charge_nspinor=(
             int(wfn.nspinor)

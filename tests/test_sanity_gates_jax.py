@@ -554,52 +554,6 @@ _FIXTURE = os.path.join(
     "tests", "regression", "cohsex_debug")
 
 
-def test_rotated_density_load_reduces_to_the_plain_load_at_U_identity():
-    """The QSGW density seam must be a no-op at U = 1.
-
-    ``build_valence_density_distributed(psi_rotation=U)`` is what lets a
-    density-updating SC loop rebuild ρ from the CURRENT orbitals.  With
-    U the identity it must reproduce the DFT-orbital load exactly, or
-    the seam is quietly changing the one-shot answer too.
-    """
-    wfn_path = os.path.join(_FIXTURE, "WFNsmall.h5")
-    if not os.path.exists(wfn_path):
-        # A bare ``return`` here until 2026-08-07: pytest reports PASS for a
-        # cell that ran nothing, which is worse than a skip because nothing
-        # in the summary line says the coverage went away.  The fixture is
-        # CHECKED IN (tests/regression/cohsex_debug/WFNsmall.h5, chmod a-w
-        # by tests/conftest.py), so this never fires in the monorepo -- and
-        # that is exactly why the silent form could sit here unnoticed.
-        pytest.skip(f"checked-in deck absent: {wfn_path} is not in this "
-                    f"tree, so the QSGW density seam has no operands -- "
-                    f"covered by the monorepo run, where the fixture is "
-                    f"committed")
-    from wfn_loader import WfnLoader
-    from common import Meta
-    import symmetry_maps
-    from common.wfn_transforms import load_kpoint_fftbox_local
-    from gw.kin_ion_io import _load_rotated_occ_fftbox
-    wfn = WfnLoader(wfn_path)
-    sym = symmetry_maps.SymMaps(wfn)
-    meta = Meta.from_system(wfn, sym, 4, 4, 8, 0, False)
-    nmix = 8
-    plain = load_kpoint_fftbox_local(wfn, meta, 0, nmix)
-    U = np.eye(nmix, dtype=np.complex128)
-    rot = _load_rotated_occ_fftbox(wfn, meta, 0, U)
-    assert plain.shape == rot.shape, (plain.shape, rot.shape)
-    assert float(jnp.abs(plain - rot).max()) == 0.0
-    # a pure band SWAP must permute, not change, the density
-    from psp.get_DFT_mtxels import valence_density_from_kpoint
-    Us = np.eye(nmix, dtype=np.complex128)[:, [1, 0] + list(range(2, nmix))]
-    swapped = _load_rotated_occ_fftbox(wfn, meta, 0, Us)
-    kw = dict(nocc=None, weight=1.0, cell_volume=float(wfn.cell_volume),
-              spin_degeneracy=1.0)
-    r0 = valence_density_from_kpoint(plain, **kw)
-    r1 = valence_density_from_kpoint(swapped, **kw)
-    assert float(jnp.abs(r0 - r1).max()) < 1e-10 * float(jnp.abs(r0).max())
-    wfn.close()
-
-
 def test_process_local_load_matches_the_legacy_wrapper():
     """``load_kpoint_fftbox`` must keep its values while gaining a
     process-local backend — every existing single-process caller
