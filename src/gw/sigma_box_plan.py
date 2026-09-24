@@ -715,14 +715,23 @@ def _box_escape_reasons(outer, inner):
 
 
 def _sc_padded_box_spec(spec, eta):
-    """Return the frozen SC certificate box required by policy.
+    """Return the frozen SC certificate box for one product window.
 
-    State drift uses the classification pad on the movable real edge(s).
-    Branch state energies already measure distance from mu; take the largest
-    allowance in this product window so every state is covered. Pole drift is
-    covered independently by widening every real and imaginary pole extent
-    by ten percent before recomputing the denominator box. Nothing else is
-    added; a map that leaves this box is an escape and refits the set.
+    Every state may drift by its own classification pad ``sc_state_pad_ev``
+    before it is reclassified, so the corners are taken over the padded state
+    interval ``[min(E - pad(E)), max(E + pad(E))]``: each real edge moves by
+    the pad of the state that sets it. Branch state energies already measure
+    distance from mu. Pole drift is covered independently by widening every
+    real and imaginary pole extent by ten percent. Nothing else is added; a
+    map that leaves this box is an escape and refits the set.
+
+    Tempting, and why not: pad every edge by the window's largest pad. A
+    crossing rule's node count follows twice its SHORT side, which the
+    frontier state sets, while the largest pad belongs to the farthest state:
+    on the Si 101 map-0 boxes the two crossing rules certify at 127 + 135
+    nodes that way against 108 + 94 per state (one-shot 86 + 93; the retired
+    flat +-2 eV pad on top gave 167 + 161).
+    runs/runtime/sigma_quad_20260924/m3_planner.
     """
     a_lo, a_hi, gamma_lo, gamma_hi = spec["pole_extent"]
     frac = _SC_POLE_PAD_FRACTION
@@ -738,8 +747,13 @@ def _sc_padded_box_spec(spec, eta):
     if "sc_support_pole_extent" in spec:
         padded_poles.append(tuple(spec["sc_support_pole_extent"]))
     support_frequencies = spec.get("sc_support_frequencies", spec["frequencies"])
+    states = np.asarray(spec["states"], dtype=np.float64)
+    pad_ry = sc_state_pad_ev(states * RYD_TO_EV) / RYD_TO_EV
+    low, high = int(np.argmin(states - pad_ry)), int(np.argmax(states + pad_ry))
+    padded_states = np.asarray(
+        [states[low] - pad_ry[low], states[high] + pad_ry[high]])
     pole_box, _, _ = _box_for_window(
-        support_frequencies, spec["states"], padded_poles,
+        support_frequencies, padded_states, padded_poles,
         spec["pole_sign"], eta)
     box = [
         min(spec["box"][0], pole_box[0]),
@@ -747,14 +761,7 @@ def _sc_padded_box_spec(spec, eta):
         min(spec["box"][2], pole_box[2]),
         max(spec["box"][3], pole_box[3]),
     ]
-    state_pad_ev = float(np.max(sc_state_pad_ev(
-        np.asarray(spec["states"]) * RYD_TO_EV)))
-    state_pad_ry = state_pad_ev / RYD_TO_EV
-    if spec["kind"] in ("crossing", "sign_definite_negative"):
-        box[0] -= state_pad_ry
-    if spec["kind"] in ("crossing", "sign_definite_positive"):
-        box[1] += state_pad_ry
-    # A SIGN-DEFINITE SUPPORT STAYS SIGN-DEFINITE.  The pole pad above can
+    # A SIGN-DEFINITE SUPPORT STAYS SIGN-DEFINITE.  The pads above can
     # push the zero-side edge of a strictly negative (or positive) support
     # across zero, which turns an easy relative rule into a crossing rule
     # the builder cannot certify: the Na conduction pole-tail window was
@@ -787,7 +794,8 @@ def _sc_padded_box_spec(spec, eta):
         "sign_definite_positive" if box[0] > 0.0 else
         "sign_definite_negative" if box[1] < 0.0 else "crossing")
     padded["sc_unpadded_box"] = tuple(spec["box"])
-    padded["sc_state_pad_ev"] = state_pad_ev
+    padded["sc_state_pad_ev"] = (float(pad_ry[low] * RYD_TO_EV),
+                                 float(pad_ry[high] * RYD_TO_EV))
     padded["sc_pole_pad_fraction"] = _SC_POLE_PAD_FRACTION
     if not _box_contains(padded["box"], spec["box"]):
         raise RuntimeError(

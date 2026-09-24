@@ -312,7 +312,8 @@ is richer. Bi (bispinor) and Na are the pending cases.
 and 1 since 2026-09-24). Maps 0 and 1 carry the loop's largest motion, so they
 use the ordinary one-shot planner (`SC fixed quadrature: ... rules=one-shot`).
 The next map certifies one rule per product window on the window's box padded
-by the classification state pad and a 10% pole pad, with no flat pad;
+by each state's own classification pad (each real edge moves by the pad of
+the state that sets it) and a 10% pole pad, with no flat pad;
 later maps reuse the rule (`cache=hit:sc-fixed`) and, when a state leaves its
 padded box or a window appears that the frozen set did not have, rebuild the
 set on the escaped boxes with the same padding (`rebuild:sc-fixed`, counted in

@@ -531,22 +531,64 @@ def test_sc_rule_padding_scales_with_state_energy_and_ten_percent_on_poles():
     assert spec["kind"] == "crossing"
     padded = _sc_padded_box_spec(spec, eta)
     expanded_poles = ((0.9, 2.2, 0.45, 1.1),)
-    pole_box, _, _ = _box_for_window(
-        spec["frequencies"], spec["states"], expanded_poles,
-        spec["pole_sign"], eta)
     pad_ev = 0.5 + 0.10 * (0.2 * RYD_TO_EV)
+    pad_ry = pad_ev / RYD_TO_EV
+    pole_box, _, _ = _box_for_window(
+        spec["frequencies"], (-0.2 - pad_ry, 0.2 + pad_ry), expanded_poles,
+        spec["pole_sign"], eta)
     expected = (
-        min(spec["box"][0], pole_box[0]) - pad_ev / RYD_TO_EV,
-        max(spec["box"][1], pole_box[1]) + pad_ev / RYD_TO_EV,
+        min(spec["box"][0], pole_box[0]),
+        max(spec["box"][1], pole_box[1]),
         min(spec["box"][2], pole_box[2]),
         max(spec["box"][3], pole_box[3]),
     )
     # No flat pad remains (owner 2026-09-24): the certificate is the
     # classification and pole pads alone.
     np.testing.assert_allclose(padded["box"], expected, rtol=0.0, atol=0.0)
-    assert padded["sc_state_pad_ev"] == pad_ev
+    assert padded["sc_state_pad_ev"] == (pad_ev, pad_ev)
     assert "sc_flat_pad_ev" not in padded
     assert padded["sc_pole_pad_fraction"] == 0.10
+
+
+def test_sc_edge_pad_is_the_pad_of_the_state_that_sets_the_edge():
+    """A crossing box's short side takes the frontier state's pad."""
+    eta = 0.02
+    states = np.asarray([0.03, 0.4, 1.2])
+    spec = make_sigma_box_spec(
+        name="cond resonant", frequencies=(0.0, 1.0), states=states,
+        pole_stats=((0.6, 1.1, 0.0, 0.0),), pole_sign=1.0, eta_ry=eta)
+    assert spec["kind"] == "crossing"
+    padded = _sc_padded_box_spec(spec, eta)
+    near, far = (0.5 + 0.1 * states[[0, -1]] * RYD_TO_EV)
+    assert padded["sc_state_pad_ev"] == pytest.approx((near, far))
+    # The short (positive) side moved by the frontier pad plus the pole pad,
+    # not by the farthest state's pad.
+    grown = padded["box"][1] - spec["box"][1]
+    assert grown < (near + 1.0) / RYD_TO_EV < far / RYD_TO_EV
+
+
+def test_states_drifting_within_their_pads_stay_inside_the_frozen_box():
+    """The classification guarantee: no state inside its pad escapes."""
+    rng = np.random.default_rng(7)
+    eta = 0.02
+    for trial in range(40):
+        states = np.sort(rng.uniform(-0.3, 2.0, 6))
+        pole = (float(rng.uniform(0.3, 0.8)), float(rng.uniform(0.9, 1.6)), 0.0, 0.0)
+        frequencies = (0.0, float(rng.uniform(0.5, 1.2)))
+        spec = make_sigma_box_spec(
+            name=f"trial {trial}", frequencies=frequencies, states=states,
+            pole_stats=(pole,), pole_sign=1.0, eta_ry=eta)
+        if spec["kind"] != "crossing":
+            continue
+        padded = _sc_padded_box_spec(spec, eta)
+        pads = (0.5 + 0.1 * np.abs(states) * RYD_TO_EV) / RYD_TO_EV
+        for shift in (-1.0, 1.0, rng.uniform(-1.0, 1.0, states.size)):
+            moved = make_sigma_box_spec(
+                name="moved", frequencies=frequencies,
+                states=states + shift * pads, pole_stats=(pole,),
+                pole_sign=1.0, eta_ry=eta)
+            assert all((padded["box"][0] <= moved["box"][0],
+                        padded["box"][1] >= moved["box"][1])), (trial, shift)
 
 
 def test_fixed_sc_refuses_a_rule_above_eps_without_retrying(monkeypatch):
