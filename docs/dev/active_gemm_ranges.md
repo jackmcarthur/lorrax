@@ -30,8 +30,8 @@ upstream operations, not this Sigma carrier selection.
 | CPU face | Distributed bands | Unsupported planned ScaLAPACK GEMM; explicit refusal |
 
 The public service page is [distrib_la](../services/distrib_la.md); vendor
-routing belongs to [FFI layout](../architecture/ffi_layout.md). An older
-CUDA provider refuses a missing active target by name; rebuild the canonical
+routing belongs to [FFI layout](../architecture/ffi_layout.md). A CUDA library
+without the active target refuses by name; the fix is to rebuild the canonical
 library. No driver chooses an external backend, and there is no full-Green
 gather fallback.
 
@@ -77,32 +77,29 @@ an explicit scratch output. Workspace is reset after binding the stream, so the
 handle never relies on a previous invocation's scratch allocation. C aliases
 the result inside the FFI. Empty intervals honor beta semantics without GEMM.
 
-Weighting still forms the same full weighted-A tile required by the original
-GPU implementation. The memory improvement removes additional slice panels
-and accumulation buffers; it does not claim to eliminate this baseline tile.
-When all parents request the full interval, a JAX conditional retains the
-original weighted dense dot and its evaluation order.
+Weighting forms one full weighted-A tile; the kernel adds no slice panels or
+accumulation buffers beyond it. When all parents request the full interval, a
+JAX conditional takes the dense weighted dot and its evaluation order.
 
 The prepared target `lorrax_cublas_local_prepared_active_range_gemm` uses the
-same pointer and leading-dimension implementation with immutable FFI metadata.
-It removes the per-call device-to-host bounds copy and stream synchronization;
-it does not remove the full weighted-A tile or the 4 MiB FFI scratch result.
+same pointer and leading-dimension implementation with immutable FFI metadata:
+no per-call device-to-host bounds copy or stream synchronization. The weighted-A
+tile and the 4 MiB scratch output remain.
 
 ## Local CPU kernel
 
 `distrib_la._active_local.active_local_matmul` uses existing JAX dot lowering
 without a native context or callback. A `lax.while_loop` traverses an interval
-using widths selected by `lax.switch`: powers of two capped at256 columns.
+using widths selected by `lax.switch`: powers of two capped at 256 columns.
 Only wholly active, disjoint slices enter each dot; the last piece never pads
 inactive columns. Weights are applied inside the selected slices, avoiding a
-full weighted-A temporary in partial branches. Compiled width variants are
-bounded independently of K above256; changing bounds does not recompile them.
+full weighted-A temporary in partial branches. At most nine width variants are
+compiled, independent of K; changing bounds does not recompile them.
 
-Equal parent intervals retain batched products; differing intervals scan
-parents into the original output shape. Full intervals use the original dense
-dot. Slice scratch and dot launches remain real costs and must be measured.
-This kernel also ran on GPUs as a development control, but production CUDA
-axis plans select the local cuBLAS implementation.
+Equal parent intervals keep batched products; differing intervals scan
+parents into the original output shape. Full intervals use the dense dot.
+Slice scratch and dot launches are real costs. CUDA axis plans select the
+local cuBLAS kernel instead.
 
 Prepared CPU calls close over the validated bounds and use this same panel
 kernel. They remain callback-free and accept no runtime bounds operand.
@@ -148,9 +145,6 @@ full intervals would bypass the active native handlers.
 - `tests/multi_device/active_band_sigma_gate.py`: typed scalar/spinor tau
   projections, time reversal, selectors, energy windows and bracket additivity.
 
-Run391 and Run392 own the dynamic and local active-range numerical, HLO and
-timing evidence. Run396 owns prepared-bound provider and service acceptance
-plus physical full-driver parity and timing evidence.
-CPU emulation verifies local JAX semantics; it is not real CPU/MPI or Frontera
-certification. The deployed MPI adapter must be available and attested before
-claiming the complete CPU driver route.
+CPU emulation verifies local JAX semantics only; the complete CPU driver
+route additionally needs the attested MPI adapter
+([MPI collectives](mpi_collectives.md)).
