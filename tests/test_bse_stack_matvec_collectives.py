@@ -44,13 +44,13 @@ def _mesh(px, py):
     return Mesh(np.asarray(devs[:px * py]).reshape(px, py), ("x", "y"))
 
 
-def _payload(px, py):
+def _payload(px, py, ns=NS):
     import bse.bse_ring_comm as brc
     from bse.bse_serial import compute_pair_amplitude
 
     rng = np.random.default_rng(20260924)
     cx = lambda *s: rng.standard_normal(s) + 1j * rng.standard_normal(s)  # noqa: E731
-    psi_c, psi_v = cx(NK, NC, NS, NMU), cx(NK, NV, NS, NMU)
+    psi_c, psi_v = cx(NK, NC, ns, NMU), cx(NK, NV, ns, NMU)
     eps_c = np.sort(rng.random((NK, NC)), axis=1) + 1.0
     eps_v = np.sort(rng.random((NK, NV)), axis=1) - 1.0
     V = cx(NMU, NMU)
@@ -180,8 +180,9 @@ def test_no_collective_per_trial():
 
 
 @pytest.mark.mesh(4)
-def test_tda_and_pair_are_mesh_invariant():
-    one, four = _payload(1, 1), _payload(2, 2)
+@pytest.mark.parametrize("ns", [1, 2, 4])     # scalar, Pauli, bispinor
+def test_tda_and_pair_are_mesh_invariant(ns):
+    one, four = _payload(1, 1, ns), _payload(2, 2, ns)
     out = {}
     for tag, d in (("1x1", one), ("2x2", four)):
         with d["mesh"]:
@@ -192,4 +193,4 @@ def test_tda_and_pair_are_mesh_invariant():
                 for s in (1.0, -1.0)]
     for a, b, name in zip(out["1x1"], out["2x2"], ("tda", "pair+", "pair-")):
         rel = np.abs(a - b).max() / np.abs(a).max()
-        assert rel <= RTOL, f"{name}: 1x1 vs 2x2 rel {rel:.3e}"
+        assert rel <= RTOL, f"{name} ns={ns}: 1x1 vs 2x2 rel {rel:.3e}"
