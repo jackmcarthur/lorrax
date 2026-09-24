@@ -230,25 +230,32 @@ def bands_to_contraction_slabs(a, *, band_axis: int, slab_axis: int,
 
 
 def reduce_scatter_to_band_block(part, *, px: int, py: int,
-                                 axes=("x", "y")):
-    """Σ over the mesh of a ``(…, m, n)`` partial → this rank's block.
+                                 axes=("x", "y"), row_axis: int = -2,
+                                 col_axis: int = -1):
+    """Σ over the mesh of a ``(…, m, …, n, …)`` partial → this rank's block.
 
     Every rank holds a partial of the WHOLE ``(m, n)`` matrix (its slab's
     share of the contraction); one reduce-scatter over ``axes`` sums them
     and delivers rows ``x·m/p_x + [0, m/p_x)`` and columns
-    ``y·n/p_y + [0, n/p_y)`` — the ``P(…, 'x', 'y')`` block.  ``m`` and ``n``
-    must divide ``p_x`` and ``p_y``.
+    ``y·n/p_y + [0, n/p_y)`` — the block whose spec carries 'x' at
+    ``row_axis`` and 'y' at ``col_axis`` (default the trailing pair).  ``m``
+    and ``n`` must divide ``p_x`` and ``p_y``.
 
     THE ONE REPLICATED OBJECT, priced: the partial is ``prod(lead)·m·n``
     elements per rank.  Against a 2-D band split that gathers operand
     panels of ``(1 + c)·N/√P`` per rank, it wins while ``nb·√P < N``, N the
     contracted extent per band (``ns·N_G`` for a matrix element).
     """
-    lead = part.shape[:-2]
-    m, n = int(part.shape[-2]), int(part.shape[-1])
-    r = part.reshape(*lead, px, m // px, py, n // py)
-    r = jnp.moveaxis(r, (len(lead), len(lead) + 2), (0, 1))
-    r = r.reshape(px * py, *lead, m // px, n // py)
+    ra, ca = row_axis % part.ndim, col_axis % part.ndim
+    if not ra < ca:
+        raise ValueError("reduce_scatter_to_band_block: row_axis must "
+                         "precede col_axis")
+    m, n = int(part.shape[ra]), int(part.shape[ca])
+    shape = list(part.shape)
+    shape[ca:ca + 1] = [py, n // py]
+    shape[ra:ra + 1] = [px, m // px]        # ra < ca: split the later first
+    r = jnp.moveaxis(part.reshape(shape), (ra, ca + 1), (0, 1))
+    r = r.reshape(px * py, *r.shape[2:])
     return jax.lax.psum_scatter(r, axes, scatter_dimension=0, tiled=False)
 
 
