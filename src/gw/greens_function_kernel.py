@@ -310,3 +310,57 @@ def build_G_tau(psi_xn, psi_yr, enk, t, *, e_ref=0.0, mask=None,
         k_unfold_plan=k_unfold_plan, real_weights=real_weights,
         band_range=band_range, prepared_active_gemm=prepared_active_gemm,
         conjugate=conjugate)
+
+
+# ---------------------------------------------------------------------------
+# Spin-pair streaming (phase-1 item A4).  A contraction that is elementwise in
+# the two spinor indices -- chi = sum_ab Gc_ab conj(Gv_ab), and
+# Sigma_nm = sum_ab psi*_a [G_ab . W] psi_b with a spin-independent W -- never
+# needs the ns^2 Green at once.  The typed unfold mixes spinor components, so
+# the parents move to full k first (the psi action, whose Green equals the
+# operator unfold of the parent Green) and each (a, b) block is one GEMM of
+# the a and b spinor rows there.
+# ---------------------------------------------------------------------------
+
+def unfold_parent_faces(plan, psi_mun, psi_nmu, *, layout):
+    """The raw-parent faces transported to full k by the plan's typed psi action.
+
+    ``psi_mun`` ``(n_parent, s, mu, n)`` and ``psi_nmu`` ``(n_parent, n, s, mu)``
+    at the ``layout`` specs in, the same orientations on ``plan.n_full`` rows
+    out.  Collective-free: the packed centroid source map stays in its shard.
+    """
+    from common.shard_map import shard_map
+    from common.wfn_layout import psi_specs
+
+    nmu_spec, mun_spec = psi_specs(layout)
+    return shard_map(
+        lambda left, right: (
+            plan.unfold_face(left, spin_axis=1, mu_axis=2, mesh_axis="x"),
+            plan.unfold_face(right, spin_axis=2, mu_axis=3, mesh_axis="y")),
+        mesh=plan.mesh_xy, in_specs=(mun_spec, nmu_spec),
+        out_specs=(mun_spec, nmu_spec), check_vma=False)(psi_mun, psi_nmu)
+
+
+def spin_pair_rows(psi_mun, psi_nmu, index, ns):
+    """The spinor rows ``a, b = divmod(index, ns)`` of the two orientations."""
+    return (jax.lax.dynamic_slice_in_dim(psi_mun, index // ns, 1, axis=1),
+            jax.lax.dynamic_slice_in_dim(psi_nmu, index % ns, 1, axis=2))
+
+
+def spin_pairs_needed(*, n_full, n_rmu, ns, mesh, live_green_tiles):
+    """True when a whole-spin stage's live Greens exceed the device target.
+
+    ``live_green_tiles`` counts the stage's concurrent ``G_tile =
+    16·N_k·ns²·μ²/P``; the target is the agreed minimum device budget times
+    the spinor's fragmentation utilization.  Every process must enter.
+    """
+    if int(ns) <= 1:
+        return False
+    from common.gpu_utils import (bfc_fragmentation_target_utilization,
+                                  get_device_memory_gb,
+                                  minimum_process_budget_gb)
+    P_ = int(mesh.shape['x']) * int(mesh.shape['y'])
+    g_tile = 16.0 * int(n_full) * int(ns) ** 2 * int(n_rmu) ** 2 / P_
+    target = (minimum_process_budget_gb(get_device_memory_gb()) * 1e9
+              * bfc_fragmentation_target_utilization(int(ns)))
+    return float(live_green_tiles) * g_tile > target
