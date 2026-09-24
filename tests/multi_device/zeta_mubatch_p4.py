@@ -8,7 +8,7 @@ where no axis divides the mesh (one operation, box (5, 5, 7) so N_r = 175 and
 ζ sphere that fills no whole G tile).  conj ψ(G) of the full zone (the typed
 children) is sharded over G slots; the kernel's Z_q(μ, G) -- G-space pair
 GEMM, one all-to-all to the μ owners, planes (cylinder, axis DFT, 2D FFT),
-the k-convolution on the identity plan, LR+RL completion, forward plane FFT
+the plane k-convolution (the identity plan, phase and L/R split on load), LR+RL completion, forward plane FFT
 and axis-phase accumulation -- goes through the write-once store (pinned host
 tiles and a slab_io file) and both read layouts, and must match the dense sum
 over the full-BZ children,
@@ -136,7 +136,6 @@ def run_case(case, fx, mesh, scratch):
                                               (nk, n_rtot)).copy(), fg, axis, ngkmax=n_rtot)
     zt = zmb.zeta_plane_tables(G[sphere].transpose(0, 2, 1).astype(np.int64),
                                np.full(len(q_sel), ngk), fg, axis, g_axis)
-    plan_id = zmb.identity_kplan(kfull, parity._grid_points(fg)[fx["cent_flat"]], fg, mesh, ns)
     canon = np.asarray(plan.layout.axis.packed_to_canonical)
     cbar_d = parity._put(cbar, NamedSharding(mesh, P(None, None, None, ("x", "y"))))
     g3_d = parity._put(g3, NamedSharding(mesh, P(None, ("x", "y"), None)))
@@ -151,7 +150,7 @@ def run_case(case, fx, mesh, scratch):
         ob = zmb.owner_orbit_batches(plan, mu_pad, 4,
                                      c_target=max(1, int(fx["b_target"]) // 4))
         kern = zmb.make_route_g_kernel(
-            mesh=mesh, plan_id=plan_id, kgrid=kgrid, fft_grid=fg, ns=ns, b=ob.b,
+            mesh=mesh, kgrid=kgrid, fft_grid=fg, ns=ns, b=ob.b,
             q_sel=q_sel, q_axis=q_axis, q_neg=q_neg, qvec_frac=qf,
             n_col=int(cyl[0].shape[1]), n_s=int(cyl[0].shape[2]), n_pg=2, axis=axis,
             n_src=n_par)

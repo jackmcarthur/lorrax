@@ -6,7 +6,8 @@ Per μ batch ``B``, with conj ψ(G) of the full zone sharded over G slots:
     D̃^X_k(a, μ, b, G) = Σ_n w^X_n X_{nka}(r_μ) conj c_{nkb}(G)   (G-space GEMM, local)
     one all-to-all: G split → μ owner (rank p owns batch slots p·c + [0, c))
     on the owner, per plane group: cylinder → planes → D(k, μ, r_plane);
-        Z_q(μ, r) = isdf.core.parent_projector_kconv(D^L, D^R) (identity plan);
+        Z_q(μ, r) = ffi.fft.make_fused_conv_kplane(D, Bloch phase), the pair
+        convolution on the identity plan read from the plane FFT output;
         LR+RL completion; e^{-iq·r}, 2D FFT, ζ-sphere columns, axis phase
         accumulate Z_q(μ, G)
 
@@ -49,27 +50,6 @@ def _mesh_id(mesh: Mesh) -> tuple:
 # Route G: the pair GEMM in G space, one all-to-all to the μ owners, planes
 # on the owner (docs/architecture/zeta_fit_mubatch.md, "Route G")
 # ---------------------------------------------------------------------------
-
-def identity_kplan(k_full_frac, centroid_fft_idx, fft_grid, mesh, ns):
-    """The one-operation ``CentroidKUnfoldPlan`` on the full zone: every k is
-    its own parent, so :func:`isdf.core.parent_projector_kconv` is the plain
-    k-convolution (its identity-plan arm, native or XLA)."""
-    from types import SimpleNamespace
-    from gw.centroid_k_unfold import build_centroid_k_unfold_plan
-    from symmetry_maps import spinor_rotation_for_sym_row
-    kf = np.asarray(k_full_frac, dtype=np.float64)
-    nk = int(kf.shape[0])
-    ops = np.eye(3, dtype=np.int64)[None]
-    U = np.eye(2, dtype=np.complex128)[None]
-    sym = SimpleNamespace(
-        sym_matrices=ops, translations=np.zeros((1, 3)),
-        irr_idx_k=np.arange(nk, dtype=np.int32), sym_idx_k=np.zeros(nk, np.int32),
-        unfolded_kpts=kf, kirr_fullids=np.arange(nk),
-        spinor_action=lambda rows, *, nspinor: spinor_rotation_for_sym_row(
-            U, np.asarray(rows), 2, nspinor=nspinor, R_cart=ops))
-    return build_centroid_k_unfold_plan(sym, np.asarray(centroid_fft_idx), fft_grid,
-                                        mesh, nspinor=int(ns), parent_k_frac=kf)
-
 
 class OwnerOrbitBatches(NamedTuple):
     """μ batches whose every owner (``c`` slots per rank) holds whole orbits."""
@@ -222,7 +202,7 @@ def _spin_sandwich(U, d):
                       for b in range(ns)], axis=3)
 
 
-def make_route_g_kernel(*, mesh: Mesh, plan_id, kgrid, fft_grid, ns: int, b: int,
+def make_route_g_kernel(*, mesh: Mesh, kgrid, fft_grid, ns: int, b: int,
                         q_sel, q_axis, q_neg, qvec_frac, n_col: int, n_s: int,
                         n_pg: int, axis: int, n_src: int, stop_at: str | None = None):
     """Compile-once executable for one μ batch on route G.
@@ -238,8 +218,9 @@ def make_route_g_kernel(*, mesh: Mesh, plan_id, kgrid, fft_grid, ns: int, b: int
     4. on the owner, per group of ``n_pg`` planes normal to ``axis``: the
        sphere → cylinder gather, the axis DFT onto the planes, the 2D FFT
        and Bloch phase → ``D(k, μ, r_plane)``; the k-convolution
-       (``parent_projector_kconv`` on ``plan_id``, the identity plan);
-       LR+RL completion; ``e^{-iq·r}``, forward 2D FFT, the ζ-sphere
+       (``ffi.fft.make_fused_conv_kplane``: the pair convolution on the
+       identity plan, reading the 2D FFT output in place and applying the
+       Bloch phase and the L/R split on load); LR+RL completion; ``e^{-iq·r}``, forward 2D FFT, the ζ-sphere
        columns and the axis phase accumulate ``Z_q(μ, G)``.
 
     Operands: ``psi_bar (n_src, nb, ns, ngk_pad)`` = conj ψ(G) of the raw
@@ -261,9 +242,9 @@ def make_route_g_kernel(*, mesh: Mesh, plan_id, kgrid, fft_grid, ns: int, b: int
     ``stop_at`` (debug split timers only: ``'x'``, ``'gemm'``, ``'a2a'``,
     ``'planes'``, ``'kconv'``) truncates after that stage with a checksum.
     """
-    from isdf.core import parent_projector_kconv, _conv_kpair_static_gamma
+    from isdf.core import _conv_kpair_static_gamma
     from isdf.pair_kernels import pair_projectors_lr
-    from ffi.fft import make_fused_conv_kparent
+    from ffi.fft import make_fused_conv_kplane
     P_ = _mesh_size(mesh)
     if b % P_:
         raise ValueError(f"make_route_g_kernel: batch {b} must be a multiple of P={P_}")
@@ -279,18 +260,12 @@ def make_route_g_kernel(*, mesh: Mesh, plan_id, kgrid, fft_grid, ns: int, b: int
     # None: equal L/R windows, the pair equations are already symmetric.
     q_neg = None if q_neg is None else np.asarray(q_neg, dtype=np.int32)
     qv = np.asarray(qvec_frac, dtype=np.float64)
-    r_pl = int(n_pg) * ps
     p_l, ph_l = _conv_kpair_static_gamma(None, ns)
-    pair_kernel = make_fused_conv_kparent(mesh, kgrid, ns, (c, r_pl), perm_l=p_l,
-                                          phase_l=ph_l, perm_r=p_l, phase_r=ph_l)
-    n_rows = int(np.asarray(plan_id.sym_perm).shape[0])
-    l_perm = np.broadcast_to(np.arange(c, dtype=np.int32), (n_rows, c)).copy()
-    l_wrap = np.zeros((n_rows, c, 3), np.int32)
-    r_perm = np.broadcast_to(np.arange(r_pl, dtype=np.int32), (n_rows, r_pl)).copy()
-    r_wrap = np.zeros((n_rows, r_pl, 3), np.int32)
+    pair_kernel = make_fused_conv_kplane(mesh, kgrid, ns, perm_l=p_l, phase_l=ph_l,
+                                         perm_r=p_l, phase_r=ph_l)
     ib = (np.arange(ps) // n_c).astype(np.float64)
     ic = (np.arange(ps) % n_c).astype(np.float64)
-    key = ('route_g', _mesh_id(mesh), id(plan_id), tuple(kgrid), tuple(fft_grid), ns, b,
+    key = ('route_g', _mesh_id(mesh), tuple(kgrid), tuple(fft_grid), ns, b,
            hash(q_sel.tobytes()), q_axis,
            None if q_neg is None else hash(q_neg.tobytes()), hash(qv.tobytes()),
            int(n_col), int(n_s), int(n_pg), int(axis), int(n_src), stop_at)
@@ -373,12 +348,9 @@ def make_route_g_kernel(*, mesh: Mesh, plan_id, kgrid, fft_grid, ns: int, b: int
                 kch[:, axis][:, None, None] * a0[None, :, None] / n_a
                 + kch[:, b_ax][:, None, None] * ib[None, None, :] / n_b
                 + kch[:, c_ax][:, None, None] * ic[None, None, :] / n_c)) / np.sqrt(N)
-            d = d.reshape(nk, n_pg, ns, 2 * c, ns, ps) * bl[:, :, None, None, None, :]
-            Dk = jnp.moveaxis(d, 1, 4).reshape(nk, ns, 2 * c, ns, r_pl)
-            Z = parent_projector_kconv(
-                Dk[:, :, :c], Dk[:, :, c:], plan=plan_id, left_perm=l_perm,
-                left_L=l_wrap, right_perm=r_perm, right_L=r_wrap, kgrid=kgrid,
-                pair_kernel=pair_kernel)                           # (nk, c, r_pl)
+            # The k-convolution reads d where the FFT left it: the Bloch
+            # phase and the L | R split of the 2c slots happen on its load.
+            Z = pair_kernel(d.reshape(nk, n_pg, ns, 2 * c, ns, ps), bl)   # (nk, c, n_pg·ps)
             if stop_at == 'kconv':
                 return acc + jnp.sum(jnp.abs(Z)), None
             if q_neg is not None:
