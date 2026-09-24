@@ -62,12 +62,30 @@ defining $U$.
 | the `nval + ncond` QP window | full $\Sigma^{\rm QSGW}$, off-diagonals kept within the window |
 | `sc_buffer_nbands` extra bands on each side | set by `sc_buffer_mode`: `diagonal` keeps the band's own Σ diagonal and drops its couplings; `one_sided` keeps cross-edge couplings, evaluated at the in-window energy; `carry` drops the couplings and carries the previous input's energies |
 | the lowest `sc_frozen_core_bands` | held at the DFT block $\mathrm{diag}(E_{\rm DFT})$; they stay in the $\Sigma_x$ and $\chi_0$ sums |
-| the sum-band tail `[b3, number_bands)` | DFT orbitals with an energy-only rigid shift from `sc_tail_fit`, refit every map. The default `conduction_mean` is the k-weighted mean QP correction of the window's conduction states |
+| the sum-band tail `[b3, number_bands)` | DFT orbitals with an energy-only rigid shift from `sc_tail_fit`, refit every map. The default `conduction_mean` is the $Z$-weighted mean QP correction of the window's conduction states that read their own $\Sigma(E)$ (below) |
 
-Every window band keeps its full Σ, including a band whose energy lies outside
-the sampled Σ grid: that band takes $\Sigma(\omega = 0)$ (§4). Map 0, or an
+Every window band keeps its full Σ at its own energy: under the default
+`sigma_out_of_grid = cover` the grid grows over it (§4). Map 0, or an
 authenticated seed, classifies the band set once, and the set stays frozen:
 no band enters or leaves it later.
+
+**Tail law.** The rigid shift is
+
+$$
+\beta = \frac{\sum_{kn} w_k Z_{nk}\,(E^{\rm QP}_{nk} - E^{\rm DFT}_{nk})}{\sum_{kn} w_k Z_{nk}},
+\qquad Z_{nk} = \bigl(1 - \partial_\omega \mathrm{Re}\,\Sigma_{nn}(\omega)\rvert_{E_{nk}}\bigr)^{-1},
+$$
+
+over the window's conduction states that are on the sampled grid and have
+$0 < Z \le 1$. A state on a satellite or near a pole of Σ has small $Z$ and
+cannot drag the tail: a state moved 3 eV onto a satellite with $Z = 0.1$
+shifts β by 21 meV, where the plain mean moves 188 meV (CLAIMS 2710). An
+off-grid state is excluded because its energy did not come from its own
+$\Sigma(E)$; on Fe 4³ three such states moved β by 14.9 meV between two fixed
+points (CLAIMS 2703). The map's Σ exists only after the tail has fed
+$\chi_0$ and $W$, so $Z$ comes from the previous map and rides the carry
+(`SCState.tail_z_kn`); map 0 uses unit weights. No qualifying state leaves
+the tail at $E_{\rm DFT}$.
 
 The masks are indexed by `(k, DFT identity)` because the carry is in the DFT
 basis. On every map, `sc_state_identity.assign_qp_identity` assigns each
@@ -154,20 +172,42 @@ not a failure of the accelerator.
 The ω grid is measured from $E_F$. Map 0 samples the requested grid for every
 state.
 
-- **Out-of-grid rule (owner, 2026-09-22).** An energy outside the sampled grid
-  evaluates $\Sigma_{mn}(\omega = 0)$.
-- **Growth.** A window state that moves past the sampled grid while staying
-  inside the padded window grows only the outer samples, out to
-  $E \pm \mathrm{pad}(E)$ with $\mathrm{pad}(E) = 0.5\ \mathrm{eV} + 0.10\,\lvert E - \mu\rvert$
-  (`scissor.sc_state_pad_ev`). The padded window is the solution of
+- **Out-of-grid policy** (`sigma_out_of_grid`, owner 2026-09-24). One
+  classification, `qsgw_utils.omega_coverage`, decides which energies are
+  on the sampled grid. The Σ build (`qsgw_utils.sigma_eval_omega`), the
+  growth below and the tail mask all read it.
+
+  | policy | an off-grid $\Sigma(E)$ reads | error past the edge, median / p90 (eV) | risk | cost |
+  |---|---|---|---|---|
+  | `cover` (default) | nothing is off-grid: the grid grows over every protected identity outside `sc_frozen_core_bands` | 0 | unfrozen semicore is covered too: MoS2 to −90 eV costs 19× the quadrature nodes and 9× the wall time, and converges more slowly | Fe 4³, +28 against +8: pair cost 797 against 509, the same steady map time, 2 min more rule build |
+  | `clamp` | $\Sigma(\omega_{\rm edge})$ | Fe 0.3–0.7 / 0.8–4.7; CrI3 0.05–0.12 / 0.5–2.2; MoS2 0.2–0.3 / 0.6–0.8 | continuous at the edge, but every clamped state inherits Σ there; an edge on a GN-PPM pole gives errors of order $10^3$ eV | none |
+  | `static` | $\Sigma(\omega = 0)$ | Fe 1.6–4.4; CrI3 0.4–0.5; MoS2 0.6–0.8 (median) | two fixed points for states within the edge jump (§5) | none |
+
+  The numbers are from CLAIMS 2710: truth is the sampled Σ over the 2–6 eV
+  beyond a truncated edge. `clamp` and `static` are there to second-guess a
+  hard system; `cover` with the semicore frozen is the production policy.
+  A tail matched to the edge, $C_n/(\omega - \bar\omega_n)$ with the sum
+  rule $C_n > 0$, is not offered: Σ at a grid edge is far from its $1/\omega$
+  asymptote (Fe: −5 to −7 eV at +28 eV), so the matched pole falls inside
+  the extrapolated range for 10–92 % of the states (CLAIMS 2710).
+- **Growth.** A state that must be covered and moves past the sampled grid
+  grows only the outer samples, out to $E \pm \mathrm{pad}(E)$ with
+  $\mathrm{pad}(E) = 0.5\ \mathrm{eV} + 0.10\,\lvert E - \mu\rvert$
+  (`scissor.sc_state_pad_ev`). Under `cover` that is every protected identity
+  outside `sc_frozen_core_bands`. Under `clamp` and `static` it is only a
+  state inside the padded window, the solution of
   $E \ge \omega_{\min} - \mathrm{pad}(E)$ and $E \le \omega_{\max} + \mathrm{pad}(E)$
-  (`scissor.sc_padded_window_ev`). Old samples do not change, and the grown
-  support persists. An interior hole refuses.
-- **Width.** The crossing-rule node count grows linearly in bandwidth$/\eta$.
-  Keep the grid within ±15 eV (owner ruling, 2026-09-03); deeper states take
-  Σ(0) or `sc_frozen_core_bands`. `sigma_regularization_ev` is the literal
-  broadening η of every ansatz and is not a speed knob. The quadrature page
-  owns η and `sigma_quadrature_eps`.
+  (`scissor.sc_padded_window_ev`). Old samples do not change, the grown
+  support persists, and an interior hole refuses. Growth is monotone and
+  bounded by the covered spectrum; in practice it stops after map 1, so
+  growth late in a run marks a state that is still running away.
+- **Width.** The crossing-rule node count grows linearly in bandwidth$/\eta$,
+  and Σ far from $E_F$ is not smoother: on Fe the curvature at
+  $\lvert\omega\rvert \ge 15$ eV is 13× that near $E_F$. Put deep semicore in
+  `sc_frozen_core_bands`, where it stays at its DFT block and costs nothing.
+  `sigma_regularization_ev` is the literal broadening η of every ansatz and
+  is not a speed knob. The quadrature page owns η and
+  `sigma_quadrature_eps`.
 - **Frozen rules** (`sigma_box_plan`). Maps 0 and 1 use the one-shot planner,
   because they carry the loop's largest motion. From map 2, one rule per
   product window is certified on the window's box, padded in two ways: each
@@ -184,8 +224,8 @@ state.
 
 ## 5 Where the map is not smooth
 
-**The grid-edge switch.** The out-of-grid rule makes $F$ discontinuous at each
-edge $\omega_e$ by
+**The grid-edge switch** (`sigma_out_of_grid = static` only). $\Sigma(0)$
+makes $F$ discontinuous at each edge $\omega_e$ by
 
 $$
 \Delta_n = \mathrm{Re}\,\Sigma_{c,nn}(0) - \mathrm{Re}\,\Sigma_{c,nn}(\omega_e).
@@ -202,9 +242,9 @@ the outer of the sampled-grid edge and the padded-window edge, since a state
 inside the padded window grows the grid rather than leaving it. Frozen-core
 bands are excluded. On Fe 4³ bispinor, the H-point states converge at
 $E - \mu = +9.8$ eV (inside) under one trajectory and at $+11.7$ eV (outside)
-under another, around a +10 eV edge with $\Delta = 1.87$ eV (CLAIMS 2688). To
-remove the ambiguity, place `sigma_omega_min_ev` and `sigma_omega_max_ev` so
-that no window state lies within its jump of an edge.
+under another, around a +10 eV edge with $\Delta = 1.87$ eV (CLAIMS 2688).
+Under `cover` both seeds reach one branch within 2 meV (CLAIMS 2703); `clamp`
+has no jump, so the verdict flags edge states only under `static`.
 
 **The elementwise MPA pole refit** (`compute_mode = mpa`,
 `sigma_w_model = mpa`). The imaginary-axis samples of $\chi_0$ and $W$ respond
