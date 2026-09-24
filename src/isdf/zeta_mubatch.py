@@ -674,39 +674,101 @@ def dummy_extra(mesh: Mesh):
     return (z((1,)), z((P_, 1, 1, 1)), z((P_, 1, 1, 1, 1)), z((1,)), z((1,)))
 
 
+def orbit_mu_batches(k_unfold_plan, mu_pad: int, b: int, *,
+                     multiple: int = 1) -> np.ndarray:
+    """μ batches that are unions of whole centroid orbits: ``(n_batch, b)`` packed slots, -1 pad.
+
+    Orbits are the classes of the plan's packed centroid source map
+    (``sym_perm``, every spatial and antiunitary row), poured greedily in
+    packed order of their first member into batches of at most ``b`` slots
+    (``b`` a multiple of ``multiple``); the typed unfold's centroid gather
+    then stays inside the batch.  A trivial group gives singleton orbits,
+    i.e. contiguous batches.  An orbit wider than ``b`` refuses.
+    """
+    plan = k_unfold_plan
+    perm = np.asarray(plan.sym_perm, dtype=np.int64)          # (n_rows, μ_pk)
+    mu_pk = int(perm.shape[1])
+    parent = np.arange(mu_pk)
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    for row in perm:
+        for i, j in enumerate(row):
+            if j >= 0:
+                a, c = find(i), find(int(j))
+                if a != c:
+                    parent[max(a, c)] = min(a, c)
+    roots = np.array([find(i) for i in range(mu_pk)])
+    orbits = {}
+    for i, r in enumerate(roots):
+        orbits.setdefault(int(r), []).append(i)
+    b = int(b)
+    batches, cur = [], []
+    for r in sorted(orbits):
+        o = orbits[r]
+        if len(o) > b:
+            raise ValueError(
+                f"GATE zeta-mubatch-orbit-batch: got a centroid orbit of "
+                f"{len(o)} sites, want <= the μ batch {b}; why: an orbit must "
+                "sit whole in one batch.  Fix: a larger budget per device.")
+        if len(cur) + len(o) > b:
+            batches.append(cur)
+            cur = []
+        cur = cur + o
+    if cur:
+        batches.append(cur)
+    out = np.full((len(batches), b), -1, dtype=np.int32)
+    for i, bt in enumerate(batches):
+        out[i, :len(bt)] = bt
+    del mu_pad, multiple
+    return out
+
+
 def batch_centroid_tables(k_unfold_plan, slots):
     """Batch-local centroid source map and wraps for the typed unfold.
 
-    Batches are unions of whole X shards of the packed order, and orbits
-    never cross an X shard, so the shard-local offsets of
-    ``plan.centroid_local_perm`` shifted by each shard's position in the
-    batch are a permutation of the batch.  ``slots`` past the carrier (-1)
-    map to themselves with zero wrap.
+    ``slots`` is one row of :func:`orbit_mu_batches` (a union of whole
+    orbits, -1 pads), so every op maps the batch onto itself: the source of
+    slot ``j`` under row ``r`` is the slot holding ``sym_perm[r, slots[j]]``.
+    Pad slots map to themselves with zero wrap.
     """
     plan = k_unfold_plan
-    shard = int(plan.layout.axis_shard_size)
     sl = np.asarray(slots, dtype=np.int64)
     b = sl.size
     live = sl >= 0
-    first = int(sl[live][0]) if np.any(live) else 0
-    if first % shard or (np.any(live) and (int(sl[live][-1]) + 1) % shard
-                         and int(sl[live][-1]) + 1 != int(plan.n_centroid_packed)):
-        raise ValueError(
-            "GATE zeta-mubatch-orbit-batch: got a μ batch starting at "
-            f"{first} of width {b}, want whole X shards of {shard} packed "
-            "centroids; why: an orbit would straddle two batches.")
-    lp = np.asarray(plan.centroid_local_perm, dtype=np.int64)       # (n_rows, μ)
-    L = np.asarray(plan.L_table, dtype=np.int64)                     # (n_rows, μ, 3)
-    n_rows = lp.shape[0]
+    perm_g = np.asarray(plan.sym_perm, dtype=np.int64)       # (n_rows, μ_pk)
+    L = np.asarray(plan.L_table, dtype=np.int64)              # (n_rows, μ_pk, 3)
+    n_rows = perm_g.shape[0]
+    pos = np.full((perm_g.shape[1],), -1, dtype=np.int64)
+    pos[sl[live]] = np.flatnonzero(live)
     perm = np.broadcast_to(np.arange(b), (n_rows, b)).copy()
     wrap = np.zeros((n_rows, b, 3), dtype=np.int64)
-    src = np.clip(sl, 0, lp.shape[1] - 1)
-    off = (np.arange(b) // shard) * shard
-    local = lp[:, src]
-    perm[:, live] = np.where(local[:, live] >= 0, local[:, live] + off[None, live],
-                             np.arange(b)[None, live])
-    wrap[:, live] = L[:, src[live]]
+    src = perm_g[:, sl[live]]
+    ok = src >= 0
+    local = np.where(ok, pos[np.clip(src, 0, None)], np.flatnonzero(live)[None, :])
+    if np.any(local < 0):
+        raise ValueError(
+            "GATE zeta-mubatch-orbit-batch: a μ batch is not closed under the "
+            "centroid action; why: the typed unfold would read a centroid "
+            "outside the batch.")
+    perm[:, live] = local
+    wrap[:, live] = L[:, sl[live]]
     return perm.astype(np.int32), wrap.astype(np.int32)
+
+
+def packed_from_slots(batches: np.ndarray, mu_pad: int) -> np.ndarray:
+    """``(μ_pad,)``: the store slot (β·b + j) holding each packed centroid."""
+    flat = np.asarray(batches).reshape(-1)
+    inv = np.full((int(mu_pad),), -1, dtype=np.int64)
+    live = flat >= 0
+    inv[flat[live]] = np.flatnonzero(live)
+    if np.any(inv < 0):
+        raise ValueError("packed_from_slots: the μ batches do not cover the carrier")
+    return inv.astype(np.int32)
 
 
 def batch_slots(mu_pad: int, b: int, beta: int) -> np.ndarray:
@@ -781,7 +843,8 @@ class ZStore:
 
     def __init__(self, *, mesh: Mesh, Q: int, mu_pad: int, n_G: int, b: int,
                  g_tile: int, placement: str, rows: str = 'mu',
-                 scratch_path: str | None = None):
+                 scratch_path: str | None = None, packed_from_slot=None,
+                 n_batch: int | None = None):
         self.mesh = mesh
         self.P = _mesh_size(mesh)
         self.Q, self.mu_pad, self.n_G = int(Q), int(mu_pad), int(n_G)
@@ -790,10 +853,18 @@ class ZStore:
             raise ValueError(f"ZStore: batch {b} must be a multiple of P={self.P}")
         self.g_tile = int(g_tile)
         self.n_Gt = -(-self.n_G // self.g_tile)
-        self.n_batch = -(-self.mu_pad // self.b)
+        self.n_batch = (-(-self.mu_pad // self.b) if n_batch is None
+                        else int(n_batch))
         self.Q_pad = -(-self.Q // self.P) * self.P
         self.placement = str(placement)
         self.rows = str(rows)
+        # The store's μ axis is batch-slot order (β·b + j); readers gather the
+        # packed carrier from it.  Contiguous batches make this a prefix.
+        pfs = (np.arange(self.mu_pad, dtype=np.int32) if packed_from_slot is None
+               else np.asarray(packed_from_slot, dtype=np.int32))
+        if pfs.shape != (self.mu_pad,):
+            raise ValueError(f"ZStore: packed_from_slot has shape {pfs.shape}")
+        self._pfs = pfs
         self.bytes_written = 0
         self.bytes_read = 0
         self.t_write = 0.0
@@ -861,20 +932,21 @@ class ZStore:
         return chunks
 
     def _read_q(self, t):
+        n_slot = self.n_batch * self.b
         if self.placement == 'device':
-            return _q_take_tile(self.mesh, self.mu_pad)(self._dev, jnp.int32(t))
+            return _q_take_tile(self.mesh, n_slot)(self._dev, jnp.int32(t))
         if self.placement == 'host':
-            arrays = [jax.device_put(self._host[dev.id][:, t, :self.mu_pad, :], dev)
+            arrays = [jax.device_put(self._host[dev.id][:, t, :, :], dev)
                       for dev in self.mesh.local_devices]
             return jax.make_array_from_single_device_arrays(
-                (self.Q_pad, self.mu_pad, self.g_tile),
+                (self.Q_pad, n_slot, self.g_tile),
                 NamedSharding(self.mesh, P(_XY, None, None)), arrays)
         self._io.sync_writes()
         raw = self._io.read_slab(
-            'Z', shape=(self.Q_pad, 1, self.n_batch * self.b, self.g_tile),
+            'Z', shape=(self.Q_pad, 1, n_slot, self.g_tile),
             offset=(0, int(t), 0, 0), mesh=self.mesh,
             partition_spec=P(_XY, None, None, None))
-        return _q_disk_tile(self.mesh, self.mu_pad)(raw)
+        return _q_disk_tile(self.mesh, n_slot)(raw)
 
     @property
     def device_bytes_per_rank(self) -> int:
@@ -934,7 +1006,7 @@ class ZStore:
                     'Z', shape=(1, self.Q, self.n_batch * self.b, self.g_tile),
                     offset=(t, 0, 0, 0), mesh=self.mesh,
                     partition_spec=P(None, None, None, _XY))
-            out = _disk_tile(self.mesh, layout, self.mu_pad)(raw)
+            out = _disk_tile(self.mesh, layout, self.n_batch * self.b)(raw)
         else:
             if self.placement == 'device':
                 local = _device_take_tile(self.mesh)(self._dev, jnp.int32(t))
@@ -945,7 +1017,10 @@ class ZStore:
                     (self.Q, self.P * self.n_batch * self.c, self.g_tile),
                     NamedSharding(self.mesh, P(None, _XY, None)), arrays)
             out = _rows_to_layout(self.mesh, layout, self.P, self.n_batch,
-                                  self.c, self.mu_pad, self.Q_pad)(local)
+                                  self.c, self.n_batch * self.b, self.Q_pad)(local)
+        # Store slot order → packed centroid order (a prefix for contiguous
+        # batches, a gather for orbit batches).
+        out = _slots_to_packed(self.mesh, layout)(out, jnp.asarray(self._pfs))
         jax.block_until_ready(out)
         self.bytes_read += self.Q * self.mu_pad * self.g_tile * 16
         self.t_read += time.perf_counter() - t0
@@ -1458,5 +1533,21 @@ def _q_disk_tile(mesh, mu_pad):
         def _f(raw):
             return jax.lax.slice_in_dim(raw[:, 0], 0, mu_pad, axis=1)
         fn = jax.jit(_f)
+        _kernel_cache[key] = fn
+    return fn
+
+
+def _slots_to_packed(mesh, layout):
+    """Store slot order → packed centroid order on the (unsharded) μ axis."""
+    key = ('slots_to_packed', _mesh_id(mesh), layout)
+    fn = _kernel_cache.get(key)
+    if fn is None:
+        spec = P(_XY, None, None) if layout == 'q' else P(None, None, _XY)
+
+        @partial(shard_map, mesh=mesh, in_specs=(spec, P()), out_specs=spec,
+                 check_vma=False)
+        def _g(x, pfs):
+            return jnp.take(x, pfs, axis=1)
+        fn = jax.jit(_g)
         _kernel_cache[key] = fn
     return fn

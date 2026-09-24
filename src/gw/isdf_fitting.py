@@ -393,9 +393,20 @@ def _fit_mubatch(
                 source=plan.source, rows=rows_owner, psi_G_store=psi_G_store,
                 cylinder=cylinder, stop_at=stage, unfold=unfold,
                 n_k_src=n_k_src)
+    # μ batches: whole centroid orbits on a symmetric deck (the unfold's
+    # centroid gather stays in the batch), contiguous otherwise; the store
+    # keeps batch-slot order and hands the packed carrier back on read.
+    if parent:
+        batches = zmb.orbit_mu_batches(
+            plan_k, mu_pad, int(plan.b), multiple=(P_ if rows_owner == 'mu' else 1))
+    else:
+        batches = np.stack([zmb.batch_slots(mu_pad, int(plan.b), beta)
+                            for beta in range(-(-mu_pad // int(plan.b)))])
     store = zmb.ZStore(
         mesh=mesh_xy, Q=Q, mu_pad=mu_pad, n_G=ng_pad, b=int(plan.b),
         g_tile=int(plan.g_tile), placement=plan.placement, rows=rows_owner,
+        packed_from_slot=zmb.packed_from_slots(batches, mu_pad),
+        n_batch=int(batches.shape[0]),
         scratch_path=os.path.join(scratch_dir, "zeta_Z_store.scratch.h5"))
     print_fn(f"  μ-batch fit: {store.n_batch} batches of {plan.b} centroids, "
              f"r route {rb.route} ({rb.n_sub} sub-blocks of {rb.r_s} slots per "
@@ -417,7 +428,7 @@ def _fit_mubatch(
     with timing.section("zeta_fit.mubatch.loop"):
         for beta in range(store.n_batch):
             t0 = time.perf_counter()
-            slots = zmb.batch_slots(mu_pad, int(plan.b), beta)
+            slots = batches[beta]
             X_B = zmb.gather_batch_centroids(psi_mun_src, slots, mesh=mesh_xy)
             if parent:
                 l_perm, l_wrap = zmb.batch_centroid_tables(plan_k, slots)

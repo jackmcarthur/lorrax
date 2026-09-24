@@ -1613,8 +1613,7 @@ def plan_zeta_mubatch(*, meta, mesh_xy, n_q_selected: int, ngkmax: int,
                       band_chunk: int, n_parent: int, zeta_tier: str,
                       budget_gb: float, target_utilization: float | None = None,
                       psi_face_bytes: float = 0.0, n_col_psi: int | None = None,
-                      n_s_psi: int | None = None,
-                      mu_multiple: int = 1) -> MuBatchPlan:
+                      n_s_psi: int | None = None) -> MuBatchPlan:
     """Size the μ-batch ζ fit; refuses by GATE when even the smallest batch fails.
 
     Order (doc "Per-rank memory model"): ψ route (the r-block cache when it
@@ -1629,7 +1628,7 @@ def plan_zeta_mubatch(*, meta, mesh_xy, n_q_selected: int, ngkmax: int,
     A symmetric deck (``n_parent < nk``) keeps ψ, ``X_B`` and the pair
     projectors on the raw parents and unfolds on the rank, so those terms
     are priced at ``n_parent`` rows and the k-convolution at the full grid;
-    its μ batches are whole X shards of the packed order (``mu_multiple``).
+    its μ batches are unions of whole centroid orbits of at most ``b``.
     """
     from runtime.padding import mesh_divisor
     P_ = int(mesh_divisor(mesh_xy))
@@ -1709,10 +1708,7 @@ def plan_zeta_mubatch(*, meta, mesh_xy, n_q_selected: int, ngkmax: int,
         return base_total + src + extra + sum(
             ws(route, b, r_s, cs, source=source).values()) <= target
 
-    step = int(mu_multiple) if parent else 1
-    if finalize_layout == 'g':
-        step = step * P_ // math.gcd(step, P_)
-    step = max(1, step)
+    step = P_ if finalize_layout == 'g' else 1
     b_min = step
     # 1. route and source
     r_cache = min(R0, 4096)
