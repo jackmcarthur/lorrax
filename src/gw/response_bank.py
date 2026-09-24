@@ -932,83 +932,55 @@ def _tr_odd_census(receipt, solve_value, h, chi, value, z, q_full):
             print("TRBANK tr_odd_census " + " ".join(f"{k}={row[k]}" for k in row), flush=True)
 
 
-def response_quadrature(wfns, meta, sample_plan, receipt, *, ordered=False, print_fn=print):
-    """Plan independent frequency sums across hosts; broadcast only scalars."""
-    import minimax
-    from jax.experimental import multihost_utils
-    z = bank_points(sample_plan)
+def response_groups(z, group_size):
+    """Consecutive sample groups: imaginary axis by Im z, then the rest by Re z.
+
+    Neighbouring samples need nearly the same exponentials, so a group costs
+    about as many Green pairs as its hardest member.
+    """
+    order = sorted(range(len(z)), key=lambda i: (z[i].real != 0.,
+                   z[i].real if z[i].real != 0. else z[i].imag))
+    return [order[i:i+group_size] for i in range(0, len(order), group_size)]
+
+
+def _gather_group_rules(requests, build):
+    """Build requested groups round-robin across hosts; replicate the small rules."""
+    import pickle
+    from common.collectives import all_gather_processes, process_count, process_rank
+    rank, world = int(process_rank()), int(process_count())
+    local = []
+    for index in range(rank, len(requests), world):
+        try:
+            local.append((index, build(requests[index]), None))
+        except Exception as error:  # refusals cross hosts as data, then raise
+            local.append((index, None, f"{type(error).__name__}: {error}"))
+    if world == 1:
+        shards = [local]
+    else:
+        payload = np.frombuffer(pickle.dumps(local, protocol=pickle.HIGHEST_PROTOCOL), np.uint8)
+        lengths = np.asarray(all_gather_processes(np.asarray(payload.size, np.int32)), np.int64).reshape(-1)
+        padded = np.zeros(int(lengths.max()), np.uint8)
+        padded[:payload.size] = payload
+        gathered = np.asarray(all_gather_processes(padded), np.uint8)
+        shards = [pickle.loads(np.ascontiguousarray(gathered[r, :int(n)]).tobytes())
+                  for r, n in enumerate(lengths)]
+    rows = sorted((row for shard in shards for row in shard), key=lambda row: row[0])
+    if [row[0] for row in rows] != list(range(len(requests))):
+        raise RuntimeError("response rule construction did not gather every group")
+    for _, _, error in rows:
+        if error is not None:
+            raise ValueError(error)
+    return [rule for _, rules, _ in rows for rule in rules]
+
+
+def response_support(wfns, meta, sample_plan, receipt, *, print_fn=print):
+    """Occupation weights, transition interval, envelope and band support."""
     energy, f, u, _, _ = response_weights(wfns, meta)
     f, u, receipt["sample_activity"] = response_sample_weights(f, u)
     refs = np.array([energy[f != 0].max(), energy[u != 0].min()])
     lo, hi = refs[1]-refs[0], float(energy[u != 0].max()-energy[f != 0].min())
     mu = sample_plan["census"]["mu_ry"]
     decay_rate, amplitude = response_occupation_envelope(energy, f, u, mu)
-    session = getattr(meta, "shared_pole_response_rules", None)
-    old = None if session is None else session.get("frequency")
-    metallic = sample_plan["census"]["partial_at_mu"]
-    reuse = (old is not None and old["lo"] <= lo and hi <= old["hi"]
-             and old.get("decay_rate", 0.) <= decay_rate
-             and old.get("amplitude", 0.) >= amplitude
-             and old["metallic"] == metallic and np.array_equal(old["z"], z))
-    if reuse:
-        plan = old
-    else:
-        pad = 4./RYD_TO_EV if session is not None else 0.
-        plan = dict(lo=lo-pad, hi=hi+pad, z=z, metallic=metallic,
-            decay_rate=decay_rate, amplitude=amplitude,
-            reference=0. if decay_rate else lo-pad,
-            t=np.zeros((len(z), 2, minimax.RESPONSE_RULE_CAPACITY), complex),
-            value=np.zeros((len(z), 2, minimax.RESPONSE_RULE_CAPACITY), complex),
-            derivative=np.zeros((len(z), 2, minimax.RESPONSE_RULE_CAPACITY), complex),
-            sampled_error=np.zeros((len(z), 2, 2)), coefficient_mass=np.zeros((len(z), 2, 2)),
-            counts=np.zeros((len(z), 2), np.int64))
-        progress = LoopProgress(len(z), print_fn, title="response rule construction",
-                                item_name="frequency", max_updates=len(z)).start()
-        rank, workers = jax.process_index(), jax.process_count()
-        for start in range(0, len(z), workers):
-            assigned = start + rank
-            status = np.zeros(1024, np.uint8)
-            rule = None
-            if assigned < len(z):
-                try:
-                    rule = minimax.response_frequency_rule(
-                        plan["lo"], plan["hi"], z[assigned],
-                        rel_tol=sample_plan["bank_rule_tolerance"]/amplitude,
-                        decay_rate=decay_rate,
-                        previous=None if old is None or assigned >= len(old["t"]) else old["t"][assigned])
-                except Exception as error:
-                    message = str(error).encode()[:1023]
-                    status[:len(message)] = np.frombuffer(message, dtype=np.uint8)
-            for i in range(start, min(start + workers, len(z))):
-                owner = i == assigned
-                error = np.asarray(multihost_utils.broadcast_one_to_all(
-                    status, is_source=owner))
-                if error.any():
-                    raise ValueError(bytes(error).rstrip(b"\0").decode(errors="replace"))
-                for key in ("t", "value", "derivative", "sampled_error", "coefficient_mass", "counts"):
-                    payload = rule[key] if owner else plan[key][i]
-                    plan[key][i] = np.asarray(multihost_utils.broadcast_one_to_all(
-                        payload, is_source=owner))
-                progress.step()
-        progress.finish()
-        if session is not None:
-            session["frequency"] = plan
-    if plan["decay_rate"]:
-        refs[:] = mu
-    receipt["rule_provider"] = "minimax occupation-weighted frequency fit; sampled scalar accuracy"
-    receipt["rule"] = dict(interval_ry=[plan["lo"], plan["hi"]],
-        counts=plan["counts"].tolist(), sampled_error=plan["sampled_error"].tolist(),
-        coefficient_mass=plan["coefficient_mass"].tolist(),
-        decay_rate_ry_inv=plan["decay_rate"], occupation_amplitude=plan["amplitude"], reused=reuse)
-    receipt["nodes"] = int(plan["counts"].sum())
-    if jax.process_index() == 0:
-        print_fn(f"Response interval (eV): [{plan['lo']*RYD_TO_EV:.8g}, {plan['hi']*RYD_TO_EV:.8g}]", flush=True)
-        print_fn("Response quadrature: z(eV)   forward backward executed  sampled value/ds error  kappa(value/ds); "
-              + ("reused" if reuse else "constructed"), flush=True)
-        for point, counts, errors, mass in zip(z, plan["counts"], plan["sampled_error"], plan["coefficient_mass"]):
-            print_fn(f"Response quadrature: {point*RYD_TO_EV:20.8g} {counts[0]:4d} {counts[1]:4d} {counts.sum():4d}  "
-                  f"{errors[:,0].max():.2e} {errors[:,1].max():.2e}  {mass[:,0].max():.2e} {mass[:,1].max():.2e}", flush=True)
-        print_fn(f"Response quadrature: {receipt['nodes']} total Green-pair evaluations (value + derivative)", flush=True)
     band_ranges = None
     if wfns.layout == "axis":
         from .greens_function_kernel import _phase_band_interval
@@ -1018,31 +990,156 @@ def response_quadrature(wfns, meta, sample_plan, receipt, *, ordered=False, prin
         band_ranges = tuple((int(lo.min()), int(hi.max())) for lo, hi in zip(lo_band, hi_band))
         if jax.process_index() == 0:
             print_fn(f"Response occupied/empty band intervals: {band_ranges} of {f.shape[-1]}")
-    return dict(plan=plan, f=f, u=u, refs=refs, band_ranges=band_ranges)
+    return dict(f=f, u=u, refs=refs, lo=lo, hi=hi, mu=mu, decay_rate=decay_rate,
+                amplitude=amplitude, band_ranges=band_ranges)
 
 
-def integrate_response_frequency(wfns, meta, mesh_xy, rules, *, q_ids, sample,
-                                 execute, receipt, ordered=False, vertex=None):
-    """Donated [value/ds,q,mu_X,nu_Y]; one Green/FFT scan per frequency."""
+def response_quadrature(meta, sample_plan, receipt, support, *, group_size, print_fn=print):
+    """Plan shared complex-time rules for sample groups; replicate small rules.
+
+    Each node of a group is ONE Green-pair evaluation that serves every
+    member's forward and reverse orientation (see ``minimax.response_group_rules``).
+    """
+    import minimax
+    z = bank_points(sample_plan)
+    f, u, refs = support["f"], support["u"], support["refs"].copy()
+    lo, hi, mu = support["lo"], support["hi"], support["mu"]
+    decay_rate, amplitude = support["decay_rate"], support["amplitude"]
+    session = getattr(meta, "shared_pole_response_rules", None)
+    old = None if session is None else session.get("frequency")
+    metallic = sample_plan["census"]["partial_at_mu"]
+    reuse = (old is not None and old["lo"] <= lo and hi <= old["hi"]
+             and old.get("decay_rate", 0.) <= decay_rate
+             and old.get("amplitude", 0.) >= amplitude
+             and old["metallic"] == metallic and np.array_equal(old["z"], z)
+             and old.get("group_size") == group_size)
+    if reuse:
+        plan = old
+    else:
+        pad = 4./RYD_TO_EV if session is not None else 0.
+        plan = dict(lo=lo-pad, hi=hi+pad, z=z, metallic=metallic, group_size=group_size,
+                    decay_rate=decay_rate, amplitude=amplitude,
+                    reference=0. if decay_rate else lo-pad)
+        requests = response_groups(z, group_size)
+        previous = [] if old is None else old["groups"]
+
+        def build(members):
+            local = {m: i for i, m in enumerate(members)}
+            warm = [dict(rule, members=[local[m] for m in rule["members"]])
+                    for rule in previous if set(rule["members"]) <= set(members)]
+            rules = minimax.response_group_rules(
+                plan["lo"], plan["hi"], z[members],
+                rel_tol=sample_plan["bank_rule_tolerance"]/amplitude,
+                decay_rate=decay_rate, previous=warm)
+            return [dict(rule, members=[members[m] for m in rule["members"]]) for rule in rules]
+
+        with timing.section("bank.rule_construction", announce=True):
+            plan["groups"] = _gather_group_rules(requests, build)
+        if session is not None:
+            session["frequency"] = plan
+    if plan["decay_rate"]:
+        refs[:] = mu
+    groups = plan["groups"]
+    receipt["rule_provider"] = ("minimax shared-node group fit (forward t, reverse conj t from "
+                                "one Green pair); sampled scalar accuracy")
+    receipt["rule"] = dict(interval_ry=[plan["lo"], plan["hi"]], group_size=group_size,
+        groups=[dict(members=[int(m) for m in g["members"]], count=int(g["count"]),
+                     sampled_error=g["sampled_error"].tolist(),
+                     coefficient_mass=g["coefficient_mass"].tolist()) for g in groups],
+        decay_rate_ry_inv=plan["decay_rate"], occupation_amplitude=plan["amplitude"], reused=reuse)
+    receipt["nodes"] = int(sum(g["count"] for g in groups))
+    if jax.process_index() == 0:
+        print_fn(f"Response interval (eV): [{plan['lo']*RYD_TO_EV:.8g}, {plan['hi']*RYD_TO_EV:.8g}]", flush=True)
+        print_fn(f"Response quadrature: {len(z)} samples in {len(groups)} shared-node groups "
+                 f"(planned size {group_size}); each node is one Green pair serving value, "
+                 "ds and both orientations; " + ("reused" if reuse else "constructed"), flush=True)
+        for g in groups:
+            points = " ".join(f"{complex(z[m])*RYD_TO_EV:.4g}" for m in g["members"])
+            print_fn(f"Response quadrature: nodes {g['count']:4d}  error {g['sampled_error'].max():.2e}  "
+                     f"kappa {g['coefficient_mass'].max():.2e}  z(eV) {points}", flush=True)
+        print_fn(f"Response quadrature: {receipt['nodes']} total Green-pair evaluations "
+                 f"(value + derivative, forward + reverse)", flush=True)
+    return dict(plan=plan, f=f, u=u, refs=refs, band_ranges=support["band_ranges"])
+
+
+def _group_stream_arguments(rules, group):
+    """Shared times and [forward/reverse, value/ds per member, node] weights."""
     plan, refs = rules["plan"], rules["refs"]
-    times = plan["t"][sample]
-    # Translate the scalar gauge to the physical endpoint references.
-    coefficients = -np.stack((plan["value"][sample], plan["derivative"][sample])) * np.exp(
-        -(refs[1]-refs[0]-plan["reference"])*times)
+    times = group["t"]
+    # Translate the scalar gauge to the physical endpoint references; the
+    # reverse orientation is evaluated at conj(t).
+    shift = -(refs[1]-refs[0]-plan["reference"])
+    gauge = (np.exp(shift*times), np.exp(shift*np.conj(times)))
+    members = len(group["members"])
+    weights = np.zeros((2, 2*members, times.size), np.complex128)
+    for side in (0, 1):
+        weights[side, 0::2] = -group["value"][:, side]*gauge[side]
+        weights[side, 1::2] = -group["derivative"][:, side]*gauge[side]
+    return times, weights
+
+
+def integrate_response_group(wfns, meta, mesh_xy, rules, group, *, q_ids,
+                             execute, receipt, ordered=False, vertex=None):
+    """Donated [value/ds per member, q, mu_X, nu_Y]; one Green/FFT scan per group."""
+    times, weights = _group_stream_arguments(rules, group)
     n = meta.mu_basis.n_packed if vertex is None else vertex[0][0].shape[2]
     kernel, fixed = response_stream(wfns, meta, mesh_xy=mesh_xy,
-        q_ids=q_ids, n_outputs=2, pair_mode="direct", bank_carry=True,
+        q_ids=q_ids, n_outputs=weights.shape[1], pair_mode="direct", bank_carry=True,
         ordered=ordered, vertex=vertex, band_ranges=rules["band_ranges"])
-    raw = jax.jit(lambda: jnp.zeros((2,len(q_ids),n,n),jnp.complex128),
+    raw = jax.jit(lambda: jnp.zeros((weights.shape[1],len(q_ids),n,n),jnp.complex128),
         out_shardings=NamedSharding(mesh_xy,P(None,None,"x","y")))()
-    weights = partial(stream_weights, parents=vertex is None)
-    args = ((jnp.asarray(times.reshape(-1)), jnp.repeat(jnp.array([False, True]), times.shape[1])),
-        jnp.asarray(coefficients.reshape(2,-1)), *fixed,
-        weights(wfns, rules["f"], mesh_xy), weights(wfns, rules["u"], mesh_xy),
-        jnp.asarray(refs), raw)
+    stream = partial(stream_weights, parents=vertex is None)
+    args = (jnp.asarray(times), jnp.asarray(weights), *fixed,
+        stream(wfns, rules["f"], mesh_xy), stream(wfns, rules["u"], mesh_xy),
+        jnp.asarray(rules["refs"]), raw)
     raw = execute(kernel, args, "direct")
-    receipt["correlation_count"] += int(plan["counts"][sample].sum())
+    receipt["correlation_count"] += int(group["count"])
     return raw
+
+
+def _stream_workspace(wfns, meta, mesh_xy, support, *, q_ids, n_outputs, ordered, vertex):
+    """Compiled temporaries of the group stream; nothing is allocated.
+
+    Lowered with the production shapes, so the first group's dispatch reuses
+    this compilation when every sample fits in one group.
+    """
+    import minimax
+    n = meta.mu_basis.n_packed if vertex is None else vertex[0][0].shape[2]
+    kernel, fixed = response_stream(wfns, meta, mesh_xy=mesh_xy, q_ids=q_ids,
+        n_outputs=n_outputs, pair_mode="direct", bank_carry=True, ordered=ordered,
+        vertex=vertex, band_ranges=support["band_ranges"])
+    capacity = minimax.RESPONSE_RULE_CAPACITY
+    weights = partial(stream_weights, parents=vertex is None)
+    abstract = (jax.ShapeDtypeStruct((capacity,), jnp.complex128),
+                jax.ShapeDtypeStruct((2, n_outputs, capacity), jnp.complex128),
+                *fixed, weights(wfns, support["f"], mesh_xy), weights(wfns, support["u"], mesh_xy),
+                jax.ShapeDtypeStruct((2,), jnp.float64),
+                jax.ShapeDtypeStruct((n_outputs, len(q_ids), n, n), jnp.complex128,
+                    sharding=NamedSharding(mesh_xy, P(None, None, "x", "y"))))
+    with timing.section('bank.compile.direct', announce=True):
+        memory = kernel.lower(*abstract).compile().memory_analysis()
+    if memory is None:
+        raise ValueError("GATE response_capacity: compiled memory unavailable")
+    return int(memory.temp_size_in_bytes)
+
+
+def response_group_size(meta, mesh_xy, *, n_samples, carry_per_sample, stream_workspace):
+    """Largest sample group whose carry and stream workspace fit the ledger.
+
+    One route and no dial: every sample in one group when it fits (symmetric
+    decks), otherwise the largest group that does (about four on a
+    two-component deck without q symmetry, where the carry is G/2 Green tiles).
+    """
+    ledger = meta.shared_pole_capacity
+    fits = lambda g: ledger.preview(resident_bytes_per_rank=g*carry_per_sample,
+        workspace_bytes_per_rank=stream_workspace,
+        concurrent_with=ledger.live_stages)["device_budget_status"] == "PASS"
+    if not fits(1):
+        return 1   # admission refuses with the actual compiled bytes
+    size = 1
+    while size < n_samples and fits(size+1):
+        size += 1
+    return size
 
 
 def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_io,
@@ -1093,11 +1190,6 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
         ledger = meta.shared_pole_capacity
         ambient = ledger.live_stages
     from file_io.shared_pole_store import read_shared_pole_bank, shared_pole_bank_writer
-    with timing.section('bank.window_geometry', announce=True,
-                              label="shared-pole frequency rule construction"):
-        solve_value, solve_slope, _, receipt["algebra"] = response_algebra(meta,config,
-            mesh_xy=mesh_xy,n=n,photon=vertex is not None)
-        rules = response_quadrature(wfns, meta, sample_plan, receipt, ordered=ordered, print_fn=print_fn)
     response_rows = panel_rows(0, len(qids))
     row_index = {q: i for i, q in enumerate(response_rows)}
     face_bytes = 16*n*n//mesh_xy.size
@@ -1112,112 +1204,138 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
         ambient += (root_stage,)
     else:
         roots = bank_io["photon_v"]
-    # The paired response accumulator is all-P sharded. Dense work and slab I/O
-    # batch the irreducible parents of one frequency, with their own admission.
+    carry_per_sample = 2*len(response_rows)*face_bytes
+    with timing.section('bank.window_geometry', announce=True,
+                              label="shared-pole frequency rule construction"):
+        solve_value, solve_slope, _, receipt["algebra"] = response_algebra(meta,config,
+            mesh_xy=mesh_xy,n=n,photon=vertex is not None)
+        support = response_support(wfns, meta, sample_plan, receipt, print_fn=print_fn)
+        ledger.live_stages = ambient
+        # Price the stream once at "every sample in one group"; the compiled
+        # temporaries do not grow with the group, only the donated carry does.
+        workspace = _stream_workspace(wfns, meta, mesh_xy, support, q_ids=response_rows,
+            n_outputs=2*len(z), ordered=ordered, vertex=vertex)
+        group_size = response_group_size(meta, mesh_xy, n_samples=len(z),
+            carry_per_sample=carry_per_sample, stream_workspace=workspace)
+        rules = response_quadrature(meta, sample_plan, receipt, support,
+                                    group_size=group_size, print_fn=print_fn)
+    # The group accumulator is all-P sharded. Dense work and slab I/O batch
+    # the irreducible parents of one frequency, with their own admission.
     fields = (("Wc", "dWc_ds"), ("Wc_mirror", "dWc_mirror_ds"))
     progress = LoopProgress(len(z), print_fn, title="response frequency integration",
                             item_name="frequency", max_updates=len(z)).start()
-    for sample, point in enumerate(z):
-        if np.asarray(header["sample_written"])[:,sample].all():
-            progress.step()
+    for group in rules["plan"]["groups"]:
+        members = [int(m) for m in group["members"]]
+        written = np.asarray(header["sample_written"])
+        if written[:, members].all():
+            for _ in members:
+                progress.step()
             continue
+        ledger.live_stages = ambient
+        name, _ = _reserve(meta, "bank_outputs", len(members)*carry_per_sample)
+        ledger.live_stages = ambient+(name,)
+        raw_group = integrate_response_group(wfns, meta, mesh_xy, rules, group,
+            q_ids=response_rows, execute=execute, receipt=receipt,
+            ordered=ordered, vertex=vertex)
         io_started = time.monotonic()
+        # One collective writer transaction per group, not per sample.
         with shared_pole_bank_writer(bank_io["path"], meta=meta,
                 expected_identity=bank_io["identity"], mesh_xy=mesh_xy) as (bank_handle, header, write):
             receipt["seconds"]["io"] = receipt["seconds"].get("io",0.)+time.monotonic()-io_started
-            ledger.live_stages = ambient
-            name, _ = _reserve(meta, "bank_outputs", 2*len(response_rows)*face_bytes)
-            ledger.live_stages = ambient+(name,)
-            raw = integrate_response_frequency(wfns, meta, mesh_xy, rules,
-                q_ids=response_rows, sample=sample, execute=execute,
-                receipt=receipt, ordered=ordered, vertex=vertex)
-            for mirror in range(2 if literal_mirrors else 1):
-                marked = np.asarray(header["sample_written"], bool)[:,sample,2*mirror:2*mirror+2]
-                # A fresh frequency is one q_irr slab. Partial restarts keep
-                # contiguous rows with identical value/slope masks together.
-                edges = np.r_[0, 1+np.flatnonzero(np.any(marked[1:] != marked[:-1], axis=1)), len(qids)]
-                for q0, q1 in zip(edges[:-1], edges[1:]):
-                    need_value, need_slope = ~marked[q0]
-                    if not (need_value or need_slope):
-                        continue
-                    span = (int(q0), int(q1))
-                    selected = (mirror_qids if mirror else qids)[q0:q1]
-                    rows = np.asarray([row_index[int(q)] for q in selected])
-                    h = roots[q0:q1]
-                    constant = 0.
-                    if vertex is not None:
-                        io_started = time.monotonic()
-                        constant = read_shared_pole_bank(bank_handle, span, meta=meta, header=header,
-                                                        fields=("constant",))["constant"]
-                        receipt["seconds"]["io"] = receipt["seconds"].get("io",0.)+time.monotonic()-io_started
-                    head_update = None
-                    if direct_head is not None and q0 == 0:
-                        from .photon_direct_head import add_direct_gamma_field
-                        head_update = direct_head["constant"] + (
-                            direct_head["Wc_mirror"][sample] if mirror
-                            else direct_head["Wc"][sample])
-                        def gamma_add(packed, coefficient):
-                            return add_direct_gamma_field(packed, coefficient,
-                                gamma_vectors=direct_head["gamma_vectors"],
-                                layout=bank_io["photon_layout"], mesh=mesh_xy)
-                    if need_value:
-                        chi_value = raw[0,rows]
-                        if mirror:
-                            chi_value = jnp.conj(chi_value)
-                        value = execute(solve_value, (h,chi_value)+(() if vertex is None else (contact,)),
-                                        "sample_dyson") - constant
-                    else:
-                        io_started = time.monotonic()
-                        saved = read_shared_pole_bank(bank_handle, span, meta=meta, header=header,
-                            sample_span=(sample,sample+1), fields=(fields[mirror][0],))
-                        receipt["seconds"]["io"] = receipt["seconds"].get("io",0.)+time.monotonic()-io_started
-                        value = saved[fields[mirror][0]][:,0]
-                        del saved
-                        if head_update is not None:
-                            value = gamma_add(value, -head_update)
-                    if need_slope:
-                        chi = raw[1,rows]
-                        if mirror:
-                            chi = jnp.conj(chi)
-                        w = value if vertex is None else value+constant
-                        slope = execute(solve_slope, (h, w, chi), "sample_slope")
-                        if head_update is not None:
-                            coefficient = (direct_head["dWc_mirror_ds"][sample]
-                                           if mirror else direct_head["dWc_ds"][sample])
-                            slope = gamma_add(slope, coefficient)
-                        io_started = time.monotonic()
-                        write(q_span=span, sample_span=(sample,sample+1), **{fields[mirror][1]: slope[:,None]})
-                        receipt["seconds"]["io"] = receipt["seconds"].get("io",0.)+time.monotonic()-io_started
-                        del chi, w, slope
-                    if need_value:
-                        if head_update is not None:
-                            value = gamma_add(value, head_update)
-                        if vertex is not None and not mirror:
-                            _photon_sample_norms(receipt,value,q0,sample,bank_io["photon_layout"],mesh_xy)
-                        for iq in range(q0,q1):
-                            part = slice(iq-q0,iq-q0+1)
-                            if vertex is None:
-                                _reciprocity_census(receipt,value[part],z[sample:sample+1],int(qids[iq]),iq,meta)
-                                if ordered and _self_negative(int(qids[iq]),meta):
-                                    _tr_odd_census(receipt,solve_value,h[part],chi_value[part],value[part],z[sample:sample+1],int(qids[iq]))
-                        io_started = time.monotonic()
-                        write(q_span=span, sample_span=(sample,sample+1), **{fields[mirror][0]: value[:,None]})
-                        receipt["seconds"]["io"] = receipt["seconds"].get("io",0.)+time.monotonic()-io_started
-                        del chi_value
-                    del value, h, constant
-            receipt["batches"].append(dict(sample=sample))
-            del raw
-            progress.step()
+            for row, sample in enumerate(members):
+                if np.asarray(header["sample_written"])[:,sample].all():
+                    progress.step()
+                    continue
+                raw = raw_group[2*row:2*row+2]
+                for mirror in range(2 if literal_mirrors else 1):
+                    marked = np.asarray(header["sample_written"], bool)[:,sample,2*mirror:2*mirror+2]
+                    # A fresh frequency is one q_irr slab. Partial restarts keep
+                    # contiguous rows with identical value/slope masks together.
+                    edges = np.r_[0, 1+np.flatnonzero(np.any(marked[1:] != marked[:-1], axis=1)), len(qids)]
+                    for q0, q1 in zip(edges[:-1], edges[1:]):
+                        need_value, need_slope = ~marked[q0]
+                        if not (need_value or need_slope):
+                            continue
+                        span = (int(q0), int(q1))
+                        selected = (mirror_qids if mirror else qids)[q0:q1]
+                        rows = np.asarray([row_index[int(q)] for q in selected])
+                        h = roots[q0:q1]
+                        constant = 0.
+                        if vertex is not None:
+                            io_started = time.monotonic()
+                            constant = read_shared_pole_bank(bank_handle, span, meta=meta, header=header,
+                                                            fields=("constant",))["constant"]
+                            receipt["seconds"]["io"] = receipt["seconds"].get("io",0.)+time.monotonic()-io_started
+                        head_update = None
+                        if direct_head is not None and q0 == 0:
+                            from .photon_direct_head import add_direct_gamma_field
+                            head_update = direct_head["constant"] + (
+                                direct_head["Wc_mirror"][sample] if mirror
+                                else direct_head["Wc"][sample])
+                            def gamma_add(packed, coefficient):
+                                return add_direct_gamma_field(packed, coefficient,
+                                    gamma_vectors=direct_head["gamma_vectors"],
+                                    layout=bank_io["photon_layout"], mesh=mesh_xy)
+                        if need_value:
+                            chi_value = raw[0,rows]
+                            if mirror:
+                                chi_value = jnp.conj(chi_value)
+                            value = execute(solve_value, (h,chi_value)+(() if vertex is None else (contact,)),
+                                            "sample_dyson") - constant
+                        else:
+                            io_started = time.monotonic()
+                            saved = read_shared_pole_bank(bank_handle, span, meta=meta, header=header,
+                                sample_span=(sample,sample+1), fields=(fields[mirror][0],))
+                            receipt["seconds"]["io"] = receipt["seconds"].get("io",0.)+time.monotonic()-io_started
+                            value = saved[fields[mirror][0]][:,0]
+                            del saved
+                            if head_update is not None:
+                                value = gamma_add(value, -head_update)
+                        if need_slope:
+                            chi = raw[1,rows]
+                            if mirror:
+                                chi = jnp.conj(chi)
+                            w = value if vertex is None else value+constant
+                            slope = execute(solve_slope, (h, w, chi), "sample_slope")
+                            if head_update is not None:
+                                coefficient = (direct_head["dWc_mirror_ds"][sample]
+                                               if mirror else direct_head["dWc_ds"][sample])
+                                slope = gamma_add(slope, coefficient)
+                            io_started = time.monotonic()
+                            write(q_span=span, sample_span=(sample,sample+1), **{fields[mirror][1]: slope[:,None]})
+                            receipt["seconds"]["io"] = receipt["seconds"].get("io",0.)+time.monotonic()-io_started
+                            del chi, w, slope
+                        if need_value:
+                            if head_update is not None:
+                                value = gamma_add(value, head_update)
+                            if vertex is not None and not mirror:
+                                _photon_sample_norms(receipt,value,q0,sample,bank_io["photon_layout"],mesh_xy)
+                            for iq in range(q0,q1):
+                                part = slice(iq-q0,iq-q0+1)
+                                if vertex is None:
+                                    _reciprocity_census(receipt,value[part],z[sample:sample+1],int(qids[iq]),iq,meta)
+                                    if ordered and _self_negative(int(qids[iq]),meta):
+                                        _tr_odd_census(receipt,solve_value,h[part],chi_value[part],value[part],z[sample:sample+1],int(qids[iq]))
+                            io_started = time.monotonic()
+                            write(q_span=span, sample_span=(sample,sample+1), **{fields[mirror][0]: value[:,None]})
+                            receipt["seconds"]["io"] = receipt["seconds"].get("io",0.)+time.monotonic()-io_started
+                            del chi_value
+                        del value, h, constant
+                receipt["batches"].append(dict(sample=sample, group=members))
+                del raw
+                progress.step()
             io_started = time.monotonic()
         receipt["seconds"]["io"] += time.monotonic()-io_started
+        del raw_group
     progress.finish()
     if jax.process_index() == 0:
         print_fn("Response quadrature: seconds " + " ".join(
             f"{key}={value:.3f}" for key, value in receipt["seconds"].items()), flush=True)
     del roots
     ledger.live_stages = caller_live
-    receipt["stream_passes"] = len(receipt["batches"])
-    receipt["batch_reason"] = "one frequency per stream; value and derivative share both Green/FFT products"
+    receipt["stream_passes"] = len(rules["plan"]["groups"])
+    receipt["batch_reason"] = ("one stream per sample group; each Green pair serves every member's value, "
+                               "derivative and both orientations")
     receipt["io_scope"] = "I/O envelope includes device readiness, packing, and finite checks; not pure storage time"
     receipt["completion"] = bool(np.asarray(header["sample_written"]).all())
     return _finish_receipt(receipt,meta,header,started)
