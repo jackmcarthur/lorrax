@@ -1596,7 +1596,7 @@ def zeta_sphere_ngkmax(wfn, sym, meta, zeta_cutoff_ry) -> int:
 def _plan_gflat_chunks_for_channel(
 		*, meta, cfg, band_slices, mesh_xy, is_bispinor, n_q_selected,
 		face_current_vertex=False, parent_route=None, print_fn=print,
-		zeta_ngkmax=None, psi_ngkmax=None, mubatch=False):
+		zeta_ngkmax=None, psi_ngkmax=None, mubatch=False, psi_cylinder=None):
 	"""Chunk-plan ONE ISDF centroid channel: the charge channel
 	(``meta.n_rmu``) or one transverse channel (``meta.n_rmu`` — μ_T is
 	typically ≈ μ_C/3).
@@ -1737,9 +1737,12 @@ def _plan_gflat_chunks_for_channel(
 			target_utilization=(mem.chunk_target_utilization
 			                    if mem.chunk_target_utilization > 0 else None),
 			psi_face_bytes=float(gflat_plan.psi_layout_bytes),
-			n_col=int(min(int(meta.n_rtot) // _n_a,
-			              math.ceil(1.2 * math.pi * _r * _r))),
-			n_s=int(min(_n_a, math.ceil(2.4 * _r) + 1)))
+			# the full-zone ψ spheres' actual cylinder when the caller has it
+			# (1257 columns on VI3 12x12, not the isotropic 2530)
+			n_col=(int(psi_cylinder[0]) if psi_cylinder else int(min(
+				int(meta.n_rtot) // _n_a, math.ceil(1.2 * math.pi * _r * _r)))),
+			n_s=(int(psi_cylinder[1]) if psi_cylinder else int(min(
+				_n_a, math.ceil(2.4 * _r) + 1))))
 		if jax.process_index() == 0:
 			print_fn(mubatch_plan.format())
 	chunks = {
@@ -2895,6 +2898,16 @@ def _prepare_parent_wavefunction_plan(
 	return plan, True, True
 
 
+def _route_g_cylinder(wfn, meta):
+	"""``(n_col, n_s)`` of the full-zone ψ spheres' cylinder along the route-G
+	plane axis (the planner prices the owner's D cylinder with it)."""
+	from common.wfn_transforms import psi_cylinder_tables
+	fg = tuple(int(v) for v in meta.fft_grid)
+	ci, _, _ = psi_cylinder_tables(wfn.box_index(k="full_bz"), fg, int(np.argmax(fg)),
+	                               ngkmax=int(wfn.ngkmax))
+	return int(ci.shape[1]), int(ci.shape[2])
+
+
 def _prepare_fresh_parent_faces(
         band_slices, basis_wfn_fingerprint_binding, centroid_indices, cfg,
         load_centroids_band_chunked, mesh_xy, meta, print0, representation, sym, tmp_dir,
@@ -2923,7 +2936,8 @@ def _prepare_fresh_parent_faces(
     		                  parents_only=True), print_fn=print0,
     		zeta_ngkmax=zeta_sphere_ngkmax(
     			wfn, sym, meta, zeta_contract.zeta_cutoff),
-    		psi_ngkmax=int(wfn.ngkmax), mubatch=True)
+    		psi_ngkmax=int(wfn.ngkmax), mubatch=True,
+    		psi_cylinder=_route_g_cylinder(wfn, meta))
     _parent_zeta_plan = _candidate_plan if chunks is not None else None
     load_band_chunk = (chunks['band_chunk'] if chunks is not None
                        else zeta_contract.loader_band_chunk)
