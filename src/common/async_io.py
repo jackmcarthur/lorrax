@@ -40,29 +40,32 @@ class AsyncDispatcher:
     ----------
     submit(task)
         Enqueue ``task: () -> None``.  Blocks if queue is at maxsize.
-        Re-raises any stashed worker exception before queueing.
+        NEVER raises a worker error (see below).
     drain()
-        Wait until every in-flight task has finished.  Re-raises any
-        worker exception.
+        Wait until every in-flight task has finished.  Never raises.
+    error
+        The first worker exception, or ``None``.  STICKY: never cleared.
     close()
         Drain, send a poison-pill to the worker, join the thread.
-        Idempotent.
+        Idempotent; never raises.
 
     Error semantics
     ---------------
-    Worker exceptions are stashed in ``self._error`` and re-raised on
-    the next caller-side ``submit`` / ``drain`` / ``close``.  This
-    matches SlabIO's existing behaviour — exceptions don't silently
-    disappear, but they don't tear down the worker either, so the
-    main thread gets a clean re-raise on the next coordination point.
+    A worker exception is kept in ``error`` and the worker goes on running
+    every later task.  Nothing on the caller's thread raises it: the caller
+    reads ``error`` at a point where every rank can agree on it
+    (``_slab_io_ffi._FfiBackend.close`` -> ``collectives.agree_io_error``).
 
-    ``_raise_if_error`` CLEARS the stash as it raises: the error is
-    delivered exactly once, so a caller that catches it owns it and
-    must not assume a later ``close()`` will resurface it.  That is why
-    ``_slab_io_ffi._FfiBackend.close`` records the drain's exception
-    itself and re-raises after the collective ``H5Fclose`` — under
-    decisions.md 2026-08-04 no rank may skip a collective because of
-    its own error.
+    WHY NOT RE-RAISE AT THE NEXT submit/drain (the pre-2026-09-24
+    behaviour): the tasks are collective H5Dwrites.  A rank-local error
+    re-raised there made that rank leave the write sequence and enter the
+    collective H5Fclose while its peers were still in H5Dwrite: mismatched
+    collectives, which decisions.md 2026-08-04 forbids.  Reproduced at P4
+    (runs/runtime/slabio_concurrency_20260924, step
+    lx-Xg4-115734-1647932-3912): MPICH aborted on "message sizes do not
+    match across processes" inside H5Fclose; elsewhere it is a silent hang.
+    A task that fails BEFORE entering its own collective still leaves its
+    peers waiting; this class cannot recover that, only never add to it.
     """
 
     def __init__(self, name: str, maxsize: int = 2):
@@ -80,7 +83,6 @@ class AsyncDispatcher:
         if self._closed:
             raise RuntimeError(
                 f"AsyncDispatcher({self._worker.name}) already closed")
-        self._raise_if_error()
         with self._cv:
             self._pending += 1
         self._queue.put(task)
@@ -89,28 +91,29 @@ class AsyncDispatcher:
         with self._cv:
             while self._pending > 0:
                 self._cv.wait()
-        self._raise_if_error()
 
     @property
     def pending(self) -> int:
         with self._mu:
             return self._pending
 
+    @property
+    def error(self) -> Optional[BaseException]:
+        """The first worker exception (sticky), or ``None``."""
+        with self._mu:
+            return self._error
+
     def close(self) -> None:
-        # The worker MUST be joined even when the drain re-raises: the
-        # caller (SlabIO) is inside a collective teardown and a rank that
-        # abandoned its writer thread here would leave the thread alive
-        # with a live MPI file handle while its peers close theirs.
-        # ``try/finally``, not ``except``, so the error still reaches the
-        # caller — it just reaches it after the thread is gone.
+        # The worker is joined unconditionally: the caller (SlabIO) is
+        # inside a collective teardown, and a rank that abandoned its
+        # writer thread here would leave it alive with a live MPI file
+        # handle while its peers close theirs.
         if self._closed:
             return
-        try:
-            self.drain()
-        finally:
-            self._closed = True
-            self._queue.put(None)  # poison pill
-            self._worker.join()
+        self.drain()
+        self._closed = True
+        self._queue.put(None)  # poison pill
+        self._worker.join()
 
     def __enter__(self):
         return self
@@ -118,13 +121,6 @@ class AsyncDispatcher:
     def __exit__(self, *exc):
         self.close()
         return False
-
-    def _raise_if_error(self) -> None:
-        with self._cv:
-            if self._error is not None:
-                err = self._error
-                self._error = None
-                raise err
 
     def _loop(self) -> None:
         while True:
