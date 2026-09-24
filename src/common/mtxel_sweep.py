@@ -608,9 +608,9 @@ def vnl_operator(geom: SweepGeometry, vnl_setup) -> Operator:
 #: The shipped relative sign of the nonlocal commutator term inside
 #: :func:`dipole_operator`, as a named constant so the two arms of the
 #: open question can be spelled without a magic ``-1.0`` at four call
-#: sites.  ``-1.0`` is what every ``dipole.h5`` in the tree was built
-#: with and is the default everywhere; see that function's SIGN section
-#: for what is actually in dispute.
+#: sites.  ``-1.0`` is the historical assembly; the default is
+#: :data:`VNL_VELOCITY_SIGN_FLIPPED` (``psp.get_dipole_mtxels``); see that
+#: function's SIGN section for what is actually in dispute.
 VNL_VELOCITY_SIGN_SHIPPED = -1.0
 
 #: The other arm.  It is not "the fix" — the choice is the owner's — it

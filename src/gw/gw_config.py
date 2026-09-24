@@ -108,13 +108,12 @@ def env_float(name: str, default: float, *, print_fn=print,
 # ---------------------------------------------------------------------------
 #: Env knobs that make the ζ fit stop EARLY and still write a file.
 #:
-#: ``LORRAX_MAX_RCHUNKS=N`` breaks the r-chunk loop after N chunks
-#: (``gw/isdf_fitting.py``), and the writer downstream of the loop still
-#: calls ``mark_zeta_done`` — so the truncated ζ is stamped complete.  If
-#: ``gw_init`` then stamps ``fit_provenance`` on it, ``_zeta_reuse_ok``
-#: will REUSE that ζ in a later production run from the same directory,
-#: because provenance records the *configuration*, which is identical.
-#: The result is silently wrong physics from a profiling knob.
+#: ``LORRAX_MAX_RCHUNKS=N`` stops the ζ fit after N μ-batches (charge,
+#: route G) or N real-space tiles (current channels) in ``gw/isdf_fitting.py``.
+#: Provenance records the *configuration*, which is identical, so a stamped
+#: partial ζ would be REUSED by a later production run from the same
+#: directory.  Both guards read this list: the writer does not call
+#: ``mark_zeta_done`` and ``gw_init`` adds no ``fit_provenance``.
 ZETA_TRUNCATING_ENV_KNOBS = ("LORRAX_MAX_RCHUNKS",)
 
 
@@ -564,48 +563,16 @@ _W_RPA_RESOLVENT_REFUSALS: tuple[
         "conservatively rather than shipping an unaudited combination "
         "under a new name",
     ),
-    # NO PARSE-TIME "w_rpa_resolvent_insulators_only" ROW -- audited and
-    # found DEAD, not omitted by oversight.  ``w_bse_insulators_only``'s
-    # deck-key predicate (``mpa_material_class != insulator``) is only
-    # ever TRUE past ``_validate_metal_compute_mode``'s standing invariant
-    # (material_class = metal implies compute_mode = mpa, enforced in
-    # ``LorraxConfig.__post_init__`` BEFORE this table runs -- see
-    # ``metal_material_class_requires_mpa``), i.e. the predicate can only
-    # fire on a ``compute_mode = mpa`` deck.  ``w_rpa_resolvent_mpa_
-    # unimplemented`` above already refuses EVERY ``compute_mode = mpa``
-    # deck under this diagram set, unconditionally, and it appears FIRST
-    # in this tuple -- so a parallel insulators-only row here would be
-    # logically implied by, and always shadowed by, that row: the exact
-    # "narrowed row that is a STRICT SUBSET of an earlier row's predicate"
-    # shape the ``low_mem_bands_metal_material_class_unported`` /
-    # ``low_mem_bands_dynamic_ppm_unported`` precedent in
-    # ``_LOW_MEM_BANDS_REFUSALS`` names and deletes on sight.  MEASURED,
-    # not merely reasoned: ``tests/test_w_rpa_resolvent_config.py`` tried
-    # exactly this deck (``mpa_material_class = metal`` under a non-mpa
-    # compute_mode) and reached ``metal_material_class_requires_mpa``
-    # instead, before this table ever ran.
-    #
-    # The insulators-only CERTIFICATION still applies in full -- audited,
-    # not dropped -- through its OTHER half, the one that does not need a
-    # deck key at all: ``gw.screening_bse.refuse_fractional_occupations``
-    # / ``_refuse_metallic_mean_field`` read the mean field's OWN
-    # occupations at the stage, before any compute, under the rule id
-    # ``w_rpa_resolvent_insulators_only`` (``diagram_name`` threaded from
-    # ``include_w``).  That check fires on every compute_mode this
-    # diagram set supports (cohsex, gn_ppm) and is not shadowed by
-    # anything: it is what actually gates a metallic WFN on a
-    # ``w_rpa_resolvent`` deck that declares nothing, which is the
-    # harder-to-see half of "insulators only" the ``w_bse`` docstring
-    # itself says the deck key cannot always express.  The pair-basis /
-    # integer-occupation argument transfers unchanged from ``w_bse``'s
-    # row (the band-index cut at ``nelec`` does not depend on
-    # ``include_w``); the ladder's OWN TRS-gauge machinery
-    # (``enforce_trs_pair_gauge``) is NOT part of that argument --
-    # ``sweep_q_wedge`` applies the gauge fix only on the
-    # ``include_w=True`` branch, and the RPA arm's reciprocity already
-    # holds without it (``w_ladder.py``'s own measurement: ring dyad and
-    # D are band-window/gauge invariant) -- stated so this comment cannot
-    # be read as citing a defect the RPA arm does not have.
+    # NO PARSE-TIME "w_rpa_resolvent_insulators_only" ROW: no deck key
+    # declares a metal (gw_config.infer_material_class reads the WFN
+    # occupations), so the gate is ``gw.screening_bse.
+    # refuse_fractional_occupations``, which reads the mean field's own
+    # occupations at the stage, before any compute, under
+    # ``w_rpa_resolvent_insulators_only``.  The pair-basis /
+    # integer-occupation argument transfers unchanged from ``w_bse``; the
+    # ladder's TRS pair gauge (``enforce_trs_pair_gauge``) is applied only on
+    # the ``include_w=True`` branch, and the RPA arm's reciprocity holds
+    # without it.
     (
         "w_rpa_resolvent_head_placement_unimplemented",
         lambda cfg: str(cfg.head.mc_average_placement) != "off",
@@ -1391,8 +1358,8 @@ _DEFAULTS = {
     # sc_accelerator_anderson_only).
     "sc_accelerator": "anderson",
     # Anderson history depth.  20, not BGW's 5: with fewer entries than the
-    # map has independent stiff directions Anderson stalls (claim 2679); the
-    # conditioning filter drops dependent columns, so depth costs only
+    # map has independent stiff directions Anderson stalls (the history-20
+    # measurements are claims 2686-2687); the conditioning filter drops dependent columns, so depth costs only
     # memory, 2(m+1) copies of the (nk, nb, nb) carry over the mesh.
     "sc_history_depth": 20,
     # Linear-mixing α.  Read only by the diagnostic
@@ -4457,12 +4424,10 @@ def _validate_occupation_smearing(screening, width_ry):
             "GATE metal_sc_head_update_disabled: occ_smearing_width_ry = "
             f"{width_ry!r} Ry declares a metal's Fermi-Dirac kBT, and "
             f"occ_broadening = {broadening_ev!r} eV > 0 requests the MP1 "
-            "smeared QSGW head (sc_head_update = parallel_transport or "
-            "dft_velocity), which is DISABLED on metals pending the owner's "
-            "replacement head model (owner ruling 2026-09-17). Remove "
-            "occ_broadening; occ_smearing_width_ry is the metal's one width. "
-            "doc: docs/self_consistency.md, 'Metals: velocity head updates "
-            "are disabled'.")
+            "smeared QSGW head, which is DISABLED on metals (owner ruling "
+            "2026-09-17). Remove occ_broadening; occ_smearing_width_ry is "
+            "the metal's one width. doc: docs/self_consistency.md, "
+            "'Metals: direct Drude head'.")
 
 
 def infer_material_class(occupations) -> str:

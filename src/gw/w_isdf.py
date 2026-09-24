@@ -1319,7 +1319,7 @@ def _gap_edges(wfns, energy_reference):
             "  why:  the node factors e^{-(e_c - e_v) tau} of an overlapping "
             "pair grow with tau; the sum diverges instead of converging\n"
             "  fix:  a gapless system takes the fractional-occupation routes "
-            "(mpa_material_class = metal)\n"
+            "(compute_mode = mpa on a WFN whose occupations make it a metal)\n"
             "  doc:  docs/architecture/four_current_wiring.md")
     return eref, vmax, cmin
 
@@ -1389,7 +1389,7 @@ def _chi0_imag_ordered_kernel_args(wfns, quad, energy_reference):
             "GATE chi0_imag_ordered_needs_odd_kernel: the ordered response "
             "received no odd quadrature weights.\n"
             "  got:  quad.alpha_odd = None\n"
-            "  want: build_imag_quadrature(..., with_odd_kernel = true)\n"
+            "  want: build_imag_probe_response_rule(..., with_odd_kernel = true)\n"
             "  why:  without odd weights the time-reversal-odd response "
             "channel is zero by construction\n"
             "  doc:  docs/dev/notes/DERIVATION_gnppm_nonhermitian.md")

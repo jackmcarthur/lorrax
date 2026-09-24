@@ -129,7 +129,7 @@ from χ₀, because only Δ enters.
 
 | refusal | fix |
 |---|---|
-| `GATE chi0_laplace_needs_gap`: ε_c^min ≤ ε_v^max over the χ band slices | a gapless system takes the finite-occupation routes (`mpa_material_class = metal`) |
+| `GATE chi0_laplace_needs_gap`: ε_c^min ≤ ε_v^max over the χ band slices | a gapless system takes the finite-occupation routes (`compute_mode = mpa`; the material class is inferred from the WFN occupations) |
 | HL probe with Ω ≤ Δ_max | HL-PPM is defined only above every transition |
 | `GATE gn_ppm_analytic_probe_real`: complex even or odd probe coefficients | none; the rule is inconsistent with its real target |
 | no certified GN probe rule through 64 nodes | a smaller Δ_max/Δ_min (band window) or a looser `minimax_target_error` |
