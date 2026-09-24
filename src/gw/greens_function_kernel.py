@@ -369,3 +369,74 @@ def spin_pairs_needed(*, n_full, n_rmu, ns, mesh, live_green_tiles):
     target = (minimum_process_budget_gb(get_device_memory_gb()) * 1e9
               * bfc_fragmentation_target_utilization(int(ns)))
     return float(live_green_tiles) * g_tile > target
+
+
+def spin_block_sources(plan):
+    """Host tables of the parent spin blocks behind each full-k spin block.
+
+    The typed unfold gives ``G_ab(k) = Σ_cd U_k[a,c] conj(U_k[b,d]) T_k(G_cd)``
+    with ``T_k`` the centroid transport of one parent block.  Returns
+    ``(src_c, src_d, coef)``: for pair ``p = a·ns + b`` the ``(c, d)`` whose
+    coefficient is nonzero at some full-k row (exact zeros only, as the
+    incumbent rotation skips them), padded to a common count with zero
+    coefficients, and ``coef[p, j, k] = U_k[a,c_j] conj(U_k[b,d_j])``.  A
+    magnetic group whose spin actions are monomial needs two sources per
+    block instead of ``ns²``.
+    """
+    U = np.asarray(plan.spin_action_full, dtype=np.complex128)
+    n_full, ns = int(U.shape[0]), int(U.shape[-1])
+    lists = []
+    for a in range(ns):
+        for b in range(ns):
+            lists.append([(c, d) for c in range(ns) for d in range(ns)
+                          if np.any(U[:, a, c] * np.conj(U[:, b, d]) != 0)])
+    width = max(len(v) for v in lists)
+    src_c = np.zeros((ns * ns, width), np.int32)
+    src_d = np.zeros((ns * ns, width), np.int32)
+    coef = np.zeros((ns * ns, width, n_full), np.complex128)
+    for p, sources in enumerate(lists):
+        a, b = divmod(p, ns)
+        for j, (c, d) in enumerate(sources):
+            src_c[p, j], src_d[p, j] = c, d
+            coef[p, j] = U[:, a, c] * np.conj(U[:, b, d])
+    return src_c, src_d, coef
+
+
+def unfold_parent_spin_block(parent, plan, tables, index, *, conjugate=False):
+    """One full-k spin block ``G_ab`` ``(n_full, mu, nu)`` of a parent Green.
+
+    ``parent`` is the :class:`ParentGreen` pair, ``tables`` the
+    :func:`spin_block_sources` triple, ``index = a·ns + b`` (traced).  Each
+    source block is transported by the service's typed operator unfold with a
+    unit spin action (its antiunitary rows read the partner's ``(d, c)``
+    block), and the sources are summed with their coefficients.  No
+    ``ns²`` full-k Green is formed.
+    """
+    from symmetry_maps import unfold_spin_centroid_operator
+
+    src_c, src_d, coef = tables
+    n_full = int(plan.n_full)
+    unit = np.ones((n_full, 1, 1), dtype=np.complex128)
+    trs = bool(np.any(np.asarray(plan.sym_idx) >= plan.n_sym_spatial))
+
+    def block(op, c, d):
+        op = jax.lax.dynamic_slice_in_dim(op, c, 1, axis=2)
+        return jax.lax.dynamic_slice_in_dim(op, d, 1, axis=4)
+
+    total = None
+    for j in range(int(src_c.shape[1])):
+        c, d = jnp.asarray(src_c)[index, j], jnp.asarray(src_d)[index, j]
+        T = unfold_spin_centroid_operator(
+            block(parent.G, c, d),
+            operator_transpose=(block(parent.transpose, d, c)
+                                if trs and parent.transpose is not None else None),
+            conjugate=conjugate, irr_idx=plan.irr_idx, sym_idx=plan.sym_idx,
+            sym_perm=plan.sym_perm, L_table=plan.L_table,
+            k_irr_frac=plan.k_parent_frac, spin_action_full=unit,
+            n_sym_spatial=plan.n_sym_spatial, mesh_xy=plan.mesh_xy,
+            logical_centroid_extent=plan.n_centroid_packed, axis_local=True)
+        w = jnp.asarray(coef)[index, j]
+        w = jnp.conj(w) if conjugate else w
+        term = w[:, None, None] * T.reshape(n_full, T.shape[1], T.shape[3])
+        total = term if total is None else total + term
+    return total
