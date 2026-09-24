@@ -1812,6 +1812,12 @@ class _FfiBackend(_DatasetGeometry):
         self.path = path
         self.mesh = mesh
         self.mode = mode
+        if mode != "r":
+            # Refuse another live context before append metadata changes or
+            # mode='w' replaces the inode.  open_file checks again at the
+            # collective native-open boundary.
+            from ffi.io import assert_writable_open_available
+            assert_writable_open_available(path)
         # Invalidate an append before MPI-IO can mutate old committed data.
         # A reader checks before opening the collective handle as well.
         from common.collectives import rank0_transaction

@@ -67,7 +67,7 @@ def main():
         args.output.parent, stage="phdf5_receipt.prepare",
         write=lambda: args.output.parent.mkdir(parents=True, exist_ok=True))
 
-    def sample_during(action):
+    def sample_during(action, *, expect_monotonic):
         stop = threading.Event()
         samples = []
         errors = []
@@ -83,7 +83,7 @@ def main():
                     live, staged = (int(value[0]), int(value[1]))
                     if live < 0 or staged < 0:
                         raise AssertionError((live, staged))
-                    if live > 0 and staged < previous:
+                    if expect_monotonic and live > 0 and staged < previous:
                         raise AssertionError(
                             f"live staging receipt decreased {previous}->{staged}")
                     if live > 0:
@@ -124,7 +124,7 @@ def main():
                 handle.write_slab(f"square_{size}", array)
                 handle.sync_writes()
 
-    _, write_samples = sample_during(write_phase)
+    _, write_samples = sample_during(write_phase, expect_monotonic=True)
     assert staging_totals(platform="CUDA") == (0, 0)
 
     def read_phase():
@@ -138,7 +138,8 @@ def main():
                     jax.device_get(jnp.max(jnp.abs(value - arrays[size]))))))
         return errors
 
-    roundtrip_errors, read_samples = sample_during(read_phase)
+    roundtrip_errors, read_samples = sample_during(
+        read_phase, expect_monotonic=False)
     assert staging_totals(platform="CUDA") == (0, 0)
     assert max(roundtrip_errors) == 0.0, roundtrip_errors
 

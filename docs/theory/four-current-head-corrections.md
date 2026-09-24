@@ -708,3 +708,63 @@ and refusal at `34228021` — is
 | Hall artifact schema | `src/file_io/static_gauge_head.py` |
 | four-current carrier resolution (`bispinor_gw` models) | `src/common/four_current_model.py` |
 | head-source frequency plan (GN/HL/MPA) | `src/gw/ppm_pipeline.py`, `src/gw/screening.py` |
+
+## 7. Near-degenerate direct bulk Γ head: bounded finite-q design (2026-09-24)
+
+The direct bulk head in `gw.photon_direct_head` is a declared first-order
+dipole model. Its charge row is `q·v_nm/(E_m−E_n)` at each sampled Γ-cell q,
+with a separate FD Drude/Thomas–Fermi term. The static interband response can
+therefore diverge when a fractional-occupation pair is closer than `q·v` but
+is still above the absolute `1e−8 Ry` refusal. Claims 2656 and 2663 measure
+the synthetic failure and Fe8 exposure; they do not measure a screened W or Σ
+error. The one-node closed-subspace oracle in claim 2665 verifies the remedy's
+two-band mathematics, but no production source change is certified.
+
+For a **closed** local subspace C at a given k and Cartesian q, use
+`H_C(k,q)=diag(E_QP,C(k))+q_a v^a_C(k)` and diagonalize it at the same q used by
+the existing cubature. Let `u_m(q), ε_m(q)` be its eigenpairs. The density
+endpoint is `ρ_nm(q)=<n,k|u_m(q)>`; the model current is
+`Γ^a_nm(q)=(α_FS/2)<n,k|v^a_C|u_m(q)>`. With
+`Δ_nm(q)=ε_m(q)−E_n(k)` and one common FD chemical potential, contract **all**
+`n,m∈C`, including the diagonal/Drude pairs, as
+
+`Π_IJ(q,z)=C0 Σ_nm [f(E_n)−f(ε_m(q))] V_I,nm(q) V*_J,nm(q)/(z−Δ_nm(q))`,
+
+where `C0=2/(Ω Nk Nspin Nspinor)`, `V=(ρ,Γ_x,Γ_y,Γ_z)`. At `z=0`, use the FD
+divided difference `−f'(E)` only for an exactly coincident energy; it is the
+continuous limit of the full finite-q bubble, not a clipped gap. At nonzero
+z the same poles produce CC, CT, TC and TT, their `d/d(z²)` slopes, and the
+four `1/z` moments. In the two-band model,
+`q_a Γ^a_nm=(α_FS/2)Δ_nm ρ_nm` exactly. Consequently
+`z Π_CJ−(2/α_FS)q_a Π_aJ=C0 Σ_nm(f_n−f_m(q))ρ_nm V*_J,nm`.
+The equal-time endpoint on the right fixes the longitudinal contact. The
+two-band oracle independently obtains the TT contact from the FD expectation
+of the model velocity and verifies static TT cancellation and the nonzero-z
+identity. A real material must authenticate the corresponding four-spinor
+current and contact, including transverse components and nonlocal operator
+terms. The existing 4×4 `_solve_photon_head(D,Π−contact)` accepts the q-local
+response without a new Dyson pipeline.
+
+A finite-q C replaces the incumbent first-order interband **and**
+intraband/Drude contributions for its states. Keeping either old term double
+counts the same directed FD transitions. A bounded-cluster implementation
+also needs a certified separation from excluded bands, including the
+off-block `q·v` coupling, and a partition of every directed pair exactly
+once. Such a partition has not been established for Fe. The current rule uses
+four sets of 131,072 Sobol q samples plus 2,304 sphere nodes. Fe8's 512 k
+points imply roughly 2.70×10^8 `(k,q)` diagonalizations; doing a 38×38
+active-space eigensolve at every point is not viable. A future implementation
+must prove a small cluster bound and either reuse a deterministic q rule with
+a controlled integration error or provide equivalent certified compression.
+Band-pair carriers must remain sharded over the full processor mesh; only the
+final 4×4 response and Dyson matrices may be replicated.
+
+Current source inputs are insufficient to certify that implementation. The
+head reads Γ `dipole.h5` velocity and applies `U†v_DFT U`, not the true QP
+velocity including `∂_kΣ`; the body uses its own four-spinor `gamma_apply`.
+`common.mtxel_sweep.FiniteTransferCurrentEndpoint` documents an arbitrary-q
+current artifact, but its producer was deleted on 2026-09-02. The present
+photon contact is made from the separate q=0 packed FD current bank, not a
+matched finite-q endpoint. These gaps block a production CC/CT patch from
+claiming Ward consistency; merely replacing the charge row would silently
+alter the physical model.

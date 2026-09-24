@@ -270,8 +270,50 @@ bool ensure_pinned(PhdfCtx* ctx, size_t need_bytes) {
 
 // SYNCHRONOUS-READER staging (ctx.h OWNERSHIP).
 bool ensure_read_buf(PhdfCtx* ctx, size_t need_bytes) {
+#ifndef LORRAX_FFI_NO_CUDA
+    // Reusing or growing a cached buffer before the previous async H2D
+    // finishes would overwrite/free its source. This wait belongs at the
+    // actual reuse boundary. Oversize buffers are retired instead.
+    if (ctx->read_buf &&
+        cudaEventSynchronize(ctx->h2d_event) != cudaSuccess) return false;
+#endif
     return ensure_staging(&ctx->read_buf, &ctx->read_capacity,
                           need_bytes, "ensure_read_buf");
+}
+
+static std::atomic<size_t> retired_read_bytes{0};
+
+void retire_read_buf(PhdfCtx* ctx) {
+    void* retired = ctx->read_buf;
+    if (!retired) return;
+    const size_t capacity =
+        ctx->read_capacity.load(std::memory_order_acquire);
+    ctx->read_buf = nullptr;
+    ctx->read_capacity.store(0, std::memory_order_release);
+#ifdef LORRAX_FFI_NO_CUDA
+    staging_free(retired);
+#else
+    retired_read_bytes.fetch_add(capacity, std::memory_order_acq_rel);
+    {
+        std::lock_guard<std::mutex> lk(ctx->queue_mu);
+        ctx->task_queue.emplace_back([ctx, retired, capacity]() {
+            // The stream is FIFO: this includes the H2D queued before the
+            // buffer was detached. It runs on the already device-bound
+            // worker, outside the XLA handler's critical path.
+            const cudaError_t st = cudaStreamSynchronize(ctx->stream);
+            if (st != cudaSuccess) {
+                std::fprintf(stderr,
+                    "[phdf5 ERROR rank=%d] retired read H2D failed: %s\n",
+                    ctx->rank, cudaGetErrorString(st));
+                std::fflush(stderr);
+                return;  // Keep the host allocation if DMA safety is unknown.
+            }
+            staging_free(retired);
+            retired_read_bytes.fetch_sub(capacity, std::memory_order_acq_rel);
+        });
+    }
+    ctx->queue_cv.notify_one();
+#endif
 }
 
 // -----------------------------------------------------------------
@@ -344,7 +386,7 @@ bool staging_totals(const PhdfCtx* /*ctx*/, size_t* n_live,
     const auto& s = live_ctx_set();
     if (n_live) *n_live = s.size();
     if (pinned_bytes) {
-        size_t total = 0;
+        size_t total = retired_read_bytes.load(std::memory_order_acquire);
         for (const PhdfCtx* live : s) {
             total += live->pinned_capacity.load(std::memory_order_acquire)
                    + live->read_capacity.load(std::memory_order_acquire);

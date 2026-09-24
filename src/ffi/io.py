@@ -20,6 +20,7 @@ from __future__ import annotations
 import atexit
 import functools
 import threading
+from dataclasses import dataclass
 from typing import Callable, Dict, Optional, Sequence, Tuple
 
 import numpy as np
@@ -55,11 +56,20 @@ __all__ = [
 parallel-IO property lists cached on the context.  The returned
 ``int64`` handle is the address of a C++ ``PhdfCtx`` struct.
 
-File handles are cached per-process so repeated ``open_file(path)``
-calls return the same handle until ``close_file`` is called.
+Read-only file handles are cached per-process.  Each matching open owns one
+reference; the native handle stays live until every owner closes it.
 """
 _LOCK = threading.Lock()
-# path -> (int64 ctx handle, owning platform "CUDA"|"cpu", open mode).
+@dataclass
+class _FileContext:
+    ctx: int
+    platform: str
+    mode: str
+    mesh_shape: tuple[int, int]
+    owners: int = 1
+
+
+# path -> native context and its Python owners.
 # The platform is recorded at open and used for EVERY lifecycle call on
 # the handle: a
 # PhdfCtx* allocated by one platform's .so (its heap, its HDF5/MPI state)
@@ -67,7 +77,16 @@ _LOCK = threading.Lock()
 # (JAX_PLATFORMS=cuda,cpu) hazard the mesh routing exists for.  Routing
 # only the open by mesh platform while close/ensure_dataset followed the
 # JAX default backend was exactly that bug (audit fix/zq 2026-07-28).
-_FILE_CTXS: Dict[str, Tuple[int, str, str]] = {}
+_FILE_CTXS: Dict[str, _FileContext] = {}
+
+
+def assert_writable_open_available(path: str) -> None:
+    """Refuse a second writer before SlabIO replaces or mutates the inode."""
+    with _LOCK:
+        if path in _FILE_CTXS:
+            raise RuntimeError(
+                f"phdf5 writable open({path!r}): this path already has a "
+                "live context; close its SlabIO/handle first")
 
 
 def staging_totals(platform: Optional[str] = None):
@@ -139,33 +158,30 @@ def open_file(path: str, *, mesh: Mesh, mode: str) -> int:
 
     with _LOCK:
         if path in _FILE_CTXS:
-            # Handle reuse is deliberate (see the module docstring), but it
-            # is only sound when the second caller wants the SAME access.
-            # Silently handing back a 'r' context to a 'w' caller loses the
-            # write; handing back a 'w' context to a 'w' caller is worse,
-            # because ``_slab_io_ffi._replace_inode_for_write`` has already
-            # unlinked the path on rank 0 — the cached ctx still points at
-            # the ORPHANED inode, so every subsequent write lands in a file
-            # with no name and the run finishes rc=0 with nothing on disk.
-            # Rank-invariant (every rank performs the same opens), so this
-            # refuses on every rank or on none.
-            prev_ctx, prev_plat, prev_mode = _FILE_CTXS[path]
-            if prev_mode != mode:
+            entry = _FILE_CTXS[path]
+            # Only identical read-only opens can share a native context.
+            # A second writer would address the same file with independent
+            # publication state; mode='w' may already have replaced its inode.
+            if mode != "r" or entry.mode != "r":
                 raise RuntimeError(
                     f"phdf5 open_file({path!r}, mode={mode!r}): this path is "
-                    f"already open in this process with mode={prev_mode!r} "
-                    f"(handle {prev_ctx}).  Handles are cached per path, so "
-                    f"you would get the mode={prev_mode!r} context back — "
-                    f"and on mode='w' the target inode has already been "
-                    f"unlinked, so the writes would go to an orphaned file. "
-                    f"Close the existing SlabIO/handle first.")
-            return prev_ctx
+                    f"already open with mode={entry.mode!r} "
+                    f"(handle {entry.ctx}); close the existing SlabIO/handle "
+                    "first")
+            if entry.platform != platform or entry.mesh_shape != (p, q):
+                raise RuntimeError(
+                    f"phdf5 open_file({path!r}): cached context uses "
+                    f"platform={entry.platform!r}, mesh={entry.mesh_shape}, "
+                    f"but this reader requested platform={platform!r}, "
+                    f"mesh={(p, q)}")
+            entry.owners += 1
+            return entry.ctx
         ctx = ffi_loader.phdf5_open(
             path, p, q,
             int(jax.process_index()), int(jax.process_count()),
             _MODE_FLAGS[mode], platform=platform,
         )
-        _FILE_CTXS[path] = (ctx, platform, mode)
+        _FILE_CTXS[path] = _FileContext(ctx, platform, mode, (p, q))
         return ctx
 
 
@@ -176,15 +192,15 @@ def platform_for_handle(ctx_handle: int) -> Optional[str]:
     must go through the owning platform's .so — this is the lookup the
     write-side lifecycle sites use to route theirs."""
     with _LOCK:
-        for _ctx, _plat, _mode in _FILE_CTXS.values():
-            if _ctx == int(ctx_handle):
-                return _plat
+        for entry in _FILE_CTXS.values():
+            if entry.ctx == int(ctx_handle):
+                return entry.platform
     return None
 
 
 def close_file(path_or_handle, *, timing: bool = False):
-    """Collective close.  Accepts either a path (the original open_file
-    argument) or the int handle returned from open_file.
+    """Release one owner by path or handle; the final release closes the
+    native file collectively.
 
     Routed to the platform library that OPENED the handle (recorded in
     ``_FILE_CTXS`` at open) — not the JAX default backend, which in a
@@ -192,23 +208,25 @@ def close_file(path_or_handle, *, timing: bool = False):
     a foreign PhdfCtx* against foreign HDF5/MPI state.  An unknown handle
     (not opened through this module) falls back to the default-backend
     library, the pre-existing best guess."""
-    global _FILE_CTXS
     with _LOCK:
         platform = None
         if isinstance(path_or_handle, str):
-            entry = _FILE_CTXS.pop(path_or_handle, None)
-            ctx = entry[0] if entry is not None else None
-            platform = entry[1] if entry is not None else None
+            path = path_or_handle
+            entry = _FILE_CTXS.get(path)
+            ctx = entry.ctx if entry is not None else None
         else:
             ctx = int(path_or_handle)
-            # Drop any path entries pointing at this ctx, keeping its
-            # recorded platform.
-            for k in [k for k, v in _FILE_CTXS.items() if v[0] == ctx]:
-                platform = _FILE_CTXS[k][1]
-                _FILE_CTXS.pop(k, None)
+            path = next((k for k, v in _FILE_CTXS.items() if v.ctx == ctx), None)
+            entry = _FILE_CTXS.get(path) if path is not None else None
+        if entry is not None:
+            entry.owners -= 1
+            if entry.owners:
+                return None
+            _FILE_CTXS.pop(path)
+            platform = entry.platform
         if ctx is not None and ctx != 0:
-            # Drop this ctx's memoised dataset ids FIRST.  H5Fclose
-            # invalidates every hid_t opened against the file, and the
+            # Drop this ctx's memoised dataset ids only on final close.
+            # H5Fclose invalidates every hid_t opened against the file, and the
             # ctx address is about to become reusable — a memo entry that
             # outlives the close is a stale ``ds_id`` waiting for the next
             # ``open_file`` that lands on the same address
@@ -226,10 +244,10 @@ def _atexit_close_all() -> None:
     close_file calls.  Runs on every process.  Each handle closes through
     its own recorded platform library."""
     with _LOCK:
-        for path, (ctx, platform, _mode) in list(_FILE_CTXS.items()):
+        for entry in list(_FILE_CTXS.values()):
             try:
-                _forget_datasets_for_ctx(int(ctx))
-                ffi_loader.phdf5_close(int(ctx), platform=platform)
+                _forget_datasets_for_ctx(int(entry.ctx))
+                ffi_loader.phdf5_close(int(entry.ctx), platform=entry.platform)
             except Exception:
                 pass
         _FILE_CTXS.clear()
@@ -607,8 +625,9 @@ def read_kchunk_union_sharded(
 
 
 #: ``(ctx_handle, ds_name, mesh) -> hid_t`` for the k-chunk union reader.
-#: A PLAIN DICT, cleared by :func:`_forget_datasets_for_ctx` at every
-#: ``close_file``.  It used to be an ``lru_cache`` and that is a defect,
+#: A PLAIN DICT, cleared by :func:`_forget_datasets_for_ctx` on the final
+#: ``close_file`` for a native context.  It used to be an ``lru_cache``;
+#: that is a defect,
 #: not a style: see :func:`_open_dataset_memo`.
 _DS_ID_MEMO: Dict[Tuple[int, str, Mesh], int] = {}
 
