@@ -357,8 +357,8 @@ def test_prune_retires_stale_and_over_cap_namespaces_but_never_a_live_one(
     """TTL, then least-recently-used past the byte cap; live ones stay."""
     day = 86400.0
     now = 100 * day
-    ages = {"current": 0.0, "live": 1.0, "old": 8.0, "lru_a": 3.0,
-            "lru_b": 4.0}
+    ages = {"current": 0.0, "live": 4.0, "old": 8.0, "lru_a": 5.5,
+            "lru_b": 6.0}
     for name, age in ages.items():
         d = tmp_path / name / "np4"
         d.mkdir(parents=True)

@@ -97,7 +97,7 @@ options and the backend, and the namespace covers what the key cannot see (a
 rebuilt FFI bundle behind an unchanged custom-call name).  Rank 0 prunes
 whole namespaces in a background thread (:func:`_prune_namespaces`): past a
 week unused, or least-recently-used first past a byte or file cap, and never
-one used in the last two days, so a namespace a live job agreed on is never
+one used in the last five days, so a namespace a live job agreed on is never
 removed.  MEASURED (P4, 3697ea6e, explicit directory and threshold 0): MoS2
 bispinor 71.8 s cold -> 40.1 s warm.  An empty or whitespace-only value is the
 retained explicit opt-out; JAX's in-process executable cache is active in
@@ -1968,14 +1968,15 @@ def compile_cache_stats() -> dict:
 # ---------------------------------------------------------------------------
 # the default location: one namespace per release, pruned by rank 0
 # ---------------------------------------------------------------------------
-#: Namespace retention.  A namespace used in the last two days is never
-#: removed: Perlmutter's longest job is 48 h, and a live job's agreed entries
+#: Namespace retention.  A namespace used in the last five days is never
+#: removed: the longest job wall on either machine is 120 h (Frontera's long
+#: queue; Perlmutter's is 48 h), and a live job's agreed entries
 #: must stay readable until it exits (an agreed entry that vanishes aborts
 #: the run, :func:`_fatal`).  Past that a namespace goes after a week unused,
 #: or earlier, least recently used first, while the tree exceeds either cap.
 #: Measured sizes (P4, 3697ea6e): MoS2 bispinor 606 entries / 4.0 MB, Fe 4^3
 #: bispinor 1261 / 18 MB, so the caps hold roughly a hundred deck-releases.
-_NS_LIVE_S = 2 * 86400
+_NS_LIVE_S = 5 * 86400
 _NS_TTL_S = 7 * 86400
 _NS_MAX_BYTES = 2 << 30
 _NS_MAX_FILES = 200_000
