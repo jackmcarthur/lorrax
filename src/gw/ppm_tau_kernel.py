@@ -236,15 +236,22 @@ def _get_sigma_kij_kernel(
     layout: str = "face", face_shape=None, face_band_extent=None,
     energy_windows: bool = False,
     k_unfold_plan=None,
+    green_band_extent=None,
 ) -> Callable[..., jax.Array]:
-    """Build Green functions with band-range masks and contract each bracket against one prepared W."""
+    """Build Green functions with band-range masks and contract each bracket against one prepared W.
+
+    ``green_band_extent`` names a window's pre-sliced band count
+    (:func:`gw.greens_function_kernel.window_band_slice`): the Green is then
+    a dense contraction over exactly those bands.  ``None`` keeps the full
+    carrier and trims each parent's zero-weight tails per τ.
+    """
     if layout not in ("face", "axis") or face_shape is None or k_unfold_plan is None:
         raise ValueError("Sigma tau requires canonical face shapes and a typed parent unfold plan.")
     from ffi import ffi_dial_key
     key = (id(mesh_xy), tuple(map(int, kgrid)), _stage_timing_enabled(),
            ffi_dial_key(), bool(merged_x), brackets, layout, face_shape,
            face_band_extent, bool(energy_windows),
-           k_unfold_plan)
+           k_unfold_plan, green_band_extent)
     if key in _sigma_kij_kernel_cache:
         return _sigma_kij_kernel_cache[key]
     from .greens_function_kernel import build_G_tau
@@ -257,15 +264,17 @@ def _get_sigma_kij_kernel(
 
     from distrib_la import gemm_plan
     _, nb, mu, ns = face_shape
-    g_plan = gemm_plan(mesh_xy, m=mu * ns, k=nb, n=mu * ns,
+    sliced = green_band_extent is not None
+    g_plan = gemm_plan(mesh_xy, m=mu * ns,
+                       k=int(green_band_extent) if sliced else nb, n=mu * ns,
                        nq=k_unfold_plan.n_parent, dtype=jnp.complex128, layout=layout,
-                       enable_active_range=True)
+                       enable_active_range=not sliced)
 
     def _g_from_selector(xn, yr, E, sel, E_min, E_max, ref, t, band_range=None):
         """Apply boolean identity masks or signed occupation weights without clipping."""
         options = dict(e_ref=ref, layout=layout, gemm=g_plan,
                        k_unfold_plan=k_unfold_plan, band_range=band_range,
-                       trim_zero_bands=True, unfold=False)
+                       trim_zero_bands=not sliced, unfold=False)
         options["mask" if sel.dtype == jnp.bool_ else "band_weight"] = sel
         if energy_windows:
             options.update(E_min=E_min, E_max=E_max)
@@ -423,6 +432,7 @@ def get_shared_sigma_tau_kernel(
     k_unfold_plan=None, _sigma_kij=None,
     w_synthesis=None,
     cache: bool = True,
+    green_band_extent=None,
 ) -> Callable[..., jax.Array]:
     """Build selected multipole W(tau) tiles for the shared complex Sigma contraction.
 
@@ -446,7 +456,7 @@ def get_shared_sigma_tau_kernel(
 
     key = (id(mesh_xy), kgrid, _stage_timing_enabled(), ffi_dial_key(),
            brackets, layout, face_shape, face_band_extent,
-           k_unfold_plan)
+           k_unfold_plan, green_band_extent)
     if (w_synthesis is None and _sigma_kij is None and cache
             and key in _sigma_shared_tau_kernel_cache):
         return _sigma_shared_tau_kernel_cache[key]
@@ -458,7 +468,7 @@ def get_shared_sigma_tau_kernel(
         mesh_xy=mesh_xy, kgrid=kgrid, merged_x=True,
         brackets=brackets, layout=layout, face_shape=face_shape,
         face_band_extent=face_band_extent,
-        k_unfold_plan=k_unfold_plan)
+        k_unfold_plan=k_unfold_plan, green_band_extent=green_band_extent)
 
     def finish(kernel):
         # Never publish a kernel whose builder owns resident faces and an open

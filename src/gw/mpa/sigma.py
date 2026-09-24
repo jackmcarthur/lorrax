@@ -24,6 +24,7 @@ from file_io.restart_bundle import (
     open_pole_reader,
     validate_fit_store,
 )
+from gw.greens_function_kernel import slice_window_bands, window_band_slice
 from gw.ppm_accumulators import DeviceOmegaAccumulator
 from gw.ppm_sigma import SigmaOmegaResult, _residue_for_space, sigma_band_axis
 from gw.ppm_tau_kernel import (TAU_KERNEL_PROFILE_PHASES,
@@ -1075,15 +1076,31 @@ def _integrate_sigma_batches(
             omega_axis=1 if bracketed else 0)
         kgrid = (int(meta.nkx), int(meta.nky), int(meta.nkz))
 
-        def tau_kernel_for(builder, cache=True):
+        def tau_kernel_for(builder, cache=True, green_band_extent=None):
             # The one tau-kernel factory call: the inherited-peak probe reuses it.
             if tau_kernel_factory is not None:
                 return tau_kernel_factory(builder, sigma_axis)
             return get_shared_sigma_tau_kernel(
                 mesh_xy=mesh_xy, kgrid=kgrid, brackets=brackets,
-                w_synthesis=builder, cache=cache, **face_kwargs)
+                w_synthesis=builder, cache=cache,
+                green_band_extent=green_band_extent, **face_kwargs)
 
-        tau_kernel = tau_kernel_for(w_synthesis)
+        # Band-replicated (axis) Green faces are cut once per window to its
+        # bucketed band interval; the kernel for that width contracts them
+        # densely with no per-tau traced bound. Face carriers and bracketed
+        # (band-extrapolation) kernels keep the full carrier.
+        band_step = (32 if (face_kwargs.get("layout") == "axis"
+                            and not bracketed and tau_kernel_factory is None)
+                     else None)
+        kernels_by_width = {}
+
+        def window_kernel(width):
+            if width not in kernels_by_width:
+                kernels_by_width[width] = tau_kernel_for(
+                    w_synthesis, green_band_extent=width)
+            return kernels_by_width[width]
+
+        tau_kernel = tau_kernel_for(w_synthesis) if band_step is None else None
         small = NamedSharding(mesh_xy, P())
         tau_capacity = max((len(row.window.nodes.t) for row in plan), default=0)
 
@@ -1168,10 +1185,22 @@ def _integrate_sigma_batches(
                 E_A_call = k_unfold_plan.parent_rows(row.E_A)
                 selector = k_unfold_plan.parent_rows(
                     jnp.reshape(selector, np.shape(row.E_A)))
+                coh_xn, coh_yr = psi_coh_xn, psi_coh_yr
+                if band_step is not None:
+                    live = np.asarray(win.mask_A, bool)
+                    if weight is not None:
+                        live = live & (np.reshape(np.asarray(
+                            jax.device_get(weight)), live.shape) != 0)
+                    start, width = window_band_slice(
+                        live, int(psi_coh_xn.shape[3]), band_step)
+                    coh_xn, coh_yr, E_A_call, selector = slice_window_bands(
+                        psi_coh_xn, psi_coh_yr, E_A_call, selector,
+                        np.int32(start), width=width)
+                    tau_kernel = window_kernel(width)
                 # These arrays do not change between time nodes in this planned
                 # window, so they are built once per window rather than per node.
                 tau_arguments = (
-                    psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
+                    coh_xn, coh_yr, psi_proj_xr, psi_proj_yn,
                     E_A_call, selector, B_branch, Omega,
                     pole_indices, bounds, phase_real,
                     jnp.asarray(win.E_ref_A), jnp.asarray(win.E_ref_B))

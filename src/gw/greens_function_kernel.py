@@ -222,6 +222,39 @@ def _weighted_tau_phases(enk, t, *, e_ref=0.0, mask=None,
     return phases
 
 
+def window_band_slice(selector, nb, step):
+    """The host-static band interval of one quadrature window, bucketed.
+
+    ``selector`` is the window's host ``(..., nb)`` state mask or weight
+    (zero = absent).  Returns ``(start, width)``: the smallest window
+    ``[start, start + width)`` holding every live column, with ``width`` in
+    ``step * 2**j`` capped at ``nb``.  A sweep therefore compiles one Green
+    contraction per width class, never one per window, and the τ loop runs a
+    dense contraction on ``width`` bands with no traced bound: the traced
+    ``trim_zero_bands`` interval copied its bounds to the host and synced the
+    stream on every τ call (P2-E, 2026-09-24).  Columns in the slice but
+    outside the selector keep exact zero weight.
+    """
+    axes = tuple(range(np.ndim(selector) - 1))
+    live = np.flatnonzero(np.any(np.asarray(selector) != 0, axis=axes))
+    lo, hi = (int(live[0]), int(live[-1]) + 1) if live.size else (0, 1)
+    width = int(step)
+    while width < hi - lo:
+        width *= 2
+    width = min(width, int(nb))
+    return min(lo, int(nb) - width), width
+
+
+@partial(jax.jit, static_argnames=("width",))
+def slice_window_bands(psi_mun, psi_nmu, enk, selector, start, *, width):
+    """Cut one window's band columns once: ``psi_mun (nk,s,mu,nb)`` on axis
+    3, ``psi_nmu (nk,nb,s,mu)`` on axis 1, ``enk``/``selector (nk,nb)`` on
+    axis 1.  Band-replicated (axis-layout) faces slice locally."""
+    def cut(x, axis):
+        return jax.lax.dynamic_slice_in_dim(x, start, width, axis=axis)
+    return cut(psi_mun, 3), cut(psi_nmu, 1), cut(enk, 1), cut(selector, 1)
+
+
 def _phase_band_interval(phases):
     """Return each parent's smallest half-open interval containing nonzeros."""
     nb = phases.shape[-1]
