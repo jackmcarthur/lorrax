@@ -1718,8 +1718,12 @@ def compute_sigma_c_mpa_omega_grid(
                     reader, header=ledger, capacity=meta.shared_pole_capacity)
                 poles2, counts = map(np.asarray, jax.device_get((poles_device, counts_device)))
                 del poles_device, counts_device
+                # A sector call scopes its rules by the map's union census
+                # (compute_sector_sigma), so sectors reuse each other's fits.
+                scope = (sector_context or {}).get("rule_census")
                 quadrature_cache_dir = sigma_rule_request_cache(
-                    quadrature_cache_dir, ledger["identity"], poles2, counts,
+                    quadrature_cache_dir, ledger["identity"],
+                    *((poles2, counts) if scope is None else scope),
                     eta=regularization_width_ry, eps=quadrature_eps)
                 frequencies = shared_pole_frequencies(poles2, counts)
                 summaries = summarize_shared_poles(

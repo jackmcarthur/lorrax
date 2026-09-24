@@ -368,6 +368,19 @@ def compute_sector_sigma(handle, families, bases, meta, mesh_xy, *,
             raise ValueError(f'GATE shared_pole_sector_identity: stale handle {key}')
     sectors=manifest['sectors']
     headers=manifest['model_headers']
+    # One Sigma-rule scope for the map's sector calls. Their windows differ
+    # only at each sector's pole extremes, and the cache serves any rule whose
+    # certified box contains the request, so TT and CT reuse CC's fits (Fe 4^3
+    # bispinor: 27 cold fits -> 9 per map). Deterministic: fixed sector order.
+    from file_io.shared_pole_store import read_shared_pole_census
+    census=[]
+    for name in ('CC','TT','CT_C'):
+        with open_shared_pole_model(sectors[name]['path'],mesh_xy=mesh_xy) as io:
+            poles,counts=read_shared_pole_census(io,header=headers[name],
+                                                 capacity=meta.shared_pole_capacity)
+        census.append(tuple(np.asarray(a) for a in jax.device_get((poles,counts))))
+    rule_census=([np.concatenate([p[q,:int(c[q])] for p,c in census]) for q in range(len(census[0][1]))],
+                 [sum(int(c[q]) for _,c in census) for q in range(len(census[0][1]))])
     total=None
     currents=[None,None]
     for names,endpoints in ((('CC','CC'),(0,0)),(('TT','TT'),(1,1)),
@@ -389,7 +402,7 @@ def compute_sector_sigma(handle, families, bases, meta, mesh_xy, *,
                 stack.callback(builder.close)
                 return builder
             context=dict(schedule=lambda _header:dict(route='sector-panels'),
-                synthesis=synthesis,
+                synthesis=synthesis,rule_census=rule_census,
                 tau_kernel=sector_tau_factory(families[a],families[b],keys,meta,mesh_xy))
             opts=dict(options)
             sessions=opts.pop('fixed_quadrature_session',None)
