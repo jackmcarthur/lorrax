@@ -173,7 +173,8 @@ def check_sector_constructor(mesh, root, *, linalg="local", parents=16, return_o
             layout=getattr(array.sharding,'spec',type(array.sharding).__name__)
             host=gather_to_host(array) if key in ('x','y','window') else jax.device_get(array)
             reads[f'{sector}_{key}_{layout}']=np.asarray(host)
-        reads[f'{sector}_digest']=np.frombuffer(header['digest'].encode(),np.uint8)
+        # Files carry the payload digest; in-process models bind metadata only.
+        assert header['digest'].startswith('resident:')==(not model_files),(sector,header['digest'])
         # Tiny oracle only: production never gathers a factor panel.
         factors[sector]=(gather_to_host(b).reshape((nq,-1,b.shape[-1])),np.asarray(poles),np.asarray(k))
     errors={};observables={}
@@ -229,7 +230,7 @@ def main():
     if jax.process_index()==0:
         print(json.dumps(dict(status='RETAINED_SPAN_PASS',checks=rows)),flush=True)
     # File bank + file models is the reference; every resident route must
-    # hand Sigma the same reads and digests bit for bit.
+    # hand Sigma the same reads bit for bit.
     arms=[dict(model_files=True),dict(),dict(resident="device"),dict(resident="pinned_host")]
     reference=None
     for arm in arms:

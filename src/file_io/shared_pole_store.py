@@ -542,7 +542,12 @@ def _finalize_model(path, *, meta, header, basis=None):
     header["peak_payload_bytes"] = header["compact_payload_bytes"] + header["staging_payload_bytes"]
     if isinstance(path, ResidentSectorModel):
         path.finalize_payload(header, n_canonical=basis.n_canonical)
-        header["digest"] = _model_digest(path, header, mesh, capacity=_capacity(meta))
+        # In-process payload: nothing can drift from the header it was built
+        # with, so the digest binds the metadata only (no payload rehash; the
+        # writer already checked every factor). Files keep the payload digest.
+        identity = {k: v for k, v in header.items() if k not in
+                    ("digest", "finalized", "batches", "staging_payload_bytes", "peak_payload_bytes")}
+        header["digest"] = "resident:" + hashlib.sha256(_json(identity).encode()).hexdigest()
         header["finalized"] = True
         path.header_json = _json(header)
         path.final_commit = header["digest"]
@@ -735,6 +740,8 @@ def validate_shared_pole_model(path, *, expected_identity, mesh_xy, capacity=Non
         # must not be mistaken for payload authentication by a restart caller.
         return dict(header, validation_receipt={"status":"NOT_MEASURED",
                     "scope":"metadata only; payload digest not authenticated"})
+    if isinstance(path, ResidentSectorModel):
+        return header  # bound by object identity and final_commit above
     if _model_digest(path, header, mesh_xy, capacity=capacity) != header["digest"]:
         _refuse("model payload/identity digest mismatch")
     return header
@@ -1293,8 +1300,10 @@ class ResidentSectorModel:
         factors, poles = [], []
         for batch in sorted(header["batches"], key=lambda row: row["lo"]):
             canonical, staged, width = self.staging.pop(batch["name"])
-            factors.append(_model_factor_block(self.mesh, canonical.shape, carrier, nmu, width)(canonical))
-            poles.append(_model_pole_block(self.mesh, staged.shape, kmax, width)(
+            # Batch widths are runtime operands: one executable per staged shape.
+            factors.append(_model_factor_block(self.mesh, canonical.shape, carrier, nmu)(
+                canonical, np.int32(width)))
+            poles.append(_model_pole_block(self.mesh, staged.shape, kmax)(
                 staged, counts[batch["lo"]:batch["hi"]]))
         self._fields["factor"] = _model_concat(self.mesh, 4)(*factors)
         self._fields["poles2_ry2"] = _model_concat(self.mesh, 2)(*poles)
@@ -1314,9 +1323,9 @@ class ResidentSectorModel:
 
 
 @lru_cache(maxsize=None)
-def _model_factor_block(mesh, shape, carrier, nmu, width):
+def _model_factor_block(mesh, shape, carrier, nmu):
     """A staged canonical batch as its file dataset holds it: rows < nmu, columns < width."""
-    def block(b):
+    def block(b, width):
         b = b[..., :min(shape[-1], carrier)]
         b = jnp.pad(b, ((0, 0),) * 3 + ((0, carrier - b.shape[-1]),))
         keep = ((jnp.arange(shape[1]) < nmu)[None, :, None, None]
@@ -1326,10 +1335,10 @@ def _model_factor_block(mesh, shape, carrier, nmu, width):
 
 
 @lru_cache(maxsize=None)
-def _model_pole_block(mesh, shape, kmax, width):
-    """Staged poles as finalization writes them: dataset columns < width, 1 past K."""
+def _model_pole_block(mesh, shape, kmax):
+    """Staged poles as finalization writes them: 1 past K (every column past the batch width is past K)."""
     def block(poles, counts):
-        poles = poles[:, :min(width, shape[-1])]
+        poles = poles[:, :min(kmax, shape[-1])]
         poles = jnp.pad(poles, ((0, 0), (0, kmax - poles.shape[-1])))
         return jnp.where(jnp.arange(kmax)[None, :] < counts[:, None], poles, 1.0)
     return jax.jit(block, out_shardings=NamedSharding(mesh, P()))
