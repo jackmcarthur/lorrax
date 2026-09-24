@@ -1052,6 +1052,15 @@ def solve_laplace_minimax_interval(
         range_value=R, error_bound=scaled_target_error, n_max=max_nodes,
     )
     tau_hat, w_hat, err_hat = served.nodes, served.weights, served.max_error
+    # The levelled solver returns its n_max rule when n_max cannot reach the
+    # target, and leaves the comparison to the caller (minimax.levelled).
+    if served.node_count >= max_nodes and float(err_hat) > float(scaled_target_error):
+        raise ValueError(
+            f"GATE minimax_node_cap: got a {served.node_count}-node rule for 1/x on "
+            f"[{x_min:.6g}, {x_max:.6g}] Ry with error {err_hat / x_min:.3g}; want "
+            f"error <= minimax_target_error = {float(target_error):.3g} within "
+            f"minimax_max_nodes = {max_nodes}; fix: raise minimax_max_nodes or relax "
+            f"minimax_target_error; doc: docs/input_reference.md, minimax_max_nodes.")
 
     tau = tau_hat / x_min
     alpha = w_hat / x_min

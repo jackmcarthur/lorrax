@@ -208,6 +208,15 @@ def test_solve_laplace_minimax_interval_uses_shipped_table_and_rescales(monkeypa
     assert "synthetic/fixture.npz" in quad.provenance
 
 
+def test_a_node_capped_static_rule_that_misses_its_target_refuses():
+    """n_max = 4 cannot reach 1e-10 on [1, 1e4]: the capped rule refuses instead of serving."""
+    import pytest
+    with pytest.raises(ValueError, match="GATE minimax_node_cap"):
+        ms.solve_laplace_minimax_interval(1.0, 1.0e4, target_error=1.0e-10, max_nodes=4)
+    quad = ms.solve_laplace_minimax_interval(1.0, 1.0e4, target_error=1.0e-6, max_nodes=64)
+    assert quad.max_error <= 1.0e-6
+
+
 def test_imag_laplace_lookup_and_fallback_share_physical_error_rescale(
         monkeypatch):
     """The beta selector and fallback door see the same scaled request.
