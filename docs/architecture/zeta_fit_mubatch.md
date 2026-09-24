@@ -157,7 +157,12 @@ The planner refuses with `GATE zeta-mubatch-capacity` naming the
 shortfall when ψ(G) plus the smallest batch does not fit (ψ streaming is
 the upgrade path).  The finalize solve tier follows `zeta_auto_tier`:
 q-local (each G tile read onto q owners) or replicated.  The distributed
-2D factor application for μ ~ 1e5 supercells is future work.  Nq = Nk = 1
+tier refuses (`GATE zeta-mubatch-tier`): route G applies the factor B
+with C⁺ = B·Bᴴ, and the distributed 2D factor application for μ ~ 1e5
+supercells is future work.  Each finish (V, the G≈0 shell, a ζ tile for
+the file) leaves the q-local or G-split accumulator in ONE explicit
+collective (`_to_mu_owner`: an all-to-all, or a reduce-scatter of the
+partial sums), so SPMD never replicates V.  Nq = Nk = 1
 runs (core fixture B).
 
 ## Verification
