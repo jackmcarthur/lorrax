@@ -89,14 +89,16 @@ under either layout (`GATE low_mem_bands_explicit_gij_unported`).
   from `wavefunction_bundle.parent_sigma_operands`. GW τ and static-limit
   factories require the typed parent plan; band brackets are masks over the
   resident parents. Bracketed stage timing is unsupported.
-* **Antiunitary placement.** Green functions contract typed child faces for
-  static and dynamic weights: the symmetry service unfolds each endpoint
-  before the one Green GEMM. Energies, masks and signed complex-time weights
-  follow the parent index without conjugation; quadrature weights are never
-  conjugated. Dynamic band projection returns raw parent rows, and the
-  complex-linear band transpose runs once per result, after the complete ω
-  accumulation. Two complex128 child faces cost `32·nk·nb·ns·M/P` bytes per
-  rank; the quadratic Green result stays distributed over all P ranks.
+* **Antiunitary placement.** The Green GEMM contracts raw parent faces
+  (`greens_function_kernel.build_G_parents`), and the typed unfold transports
+  the two-point operator to full k. An antiunitary row reads the transposed
+  partner rather than a conjugate: `conj(G)` when the band weights are real,
+  otherwise a second parent GEMM on the conjugated faces. Energies, masks and
+  signed complex-time weights follow the parent index without conjugation;
+  quadrature weights are never conjugated. Dynamic band projection returns
+  raw parent rows, and the complex-linear band transpose runs once per result,
+  after the complete ω accumulation. The Green tiles stay distributed over all
+  P ranks.
 * **Restart files** carry raw parent faces in logical centroid order.
   `file_io.restart_bundle` owns format admission and the single
   symmetry-service unfold; BSE reads its full-k selected-band ψ through it.
