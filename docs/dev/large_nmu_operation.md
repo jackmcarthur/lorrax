@@ -39,9 +39,10 @@ buffers complex128 (16 B).
 
 Distributed backends check platform, compiled handler, one process per
 device, mesh geometry and divisibility before any collective
-([distrib_la](../services/distrib_la.md#contract)). A square mesh is the
-portable choice: ScaLAPACK needs square or 1-D, and cuSOLVERMp eigh needs
-square.
+([distrib_la](../services/distrib_la.md#contract)). The runtime builds only
+square meshes (a nonsquare P refuses; [decisions](../architecture/decisions.md)),
+which satisfies every backend's geometry rule; the matrix extent must still
+divide both axes.
 
 The transverse ridge routes (local JAX, local batch-reshard, fully
 distributed) and the coupled μ1–3 live set are specified with their capacity
