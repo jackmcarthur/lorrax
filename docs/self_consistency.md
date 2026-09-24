@@ -229,8 +229,10 @@ only the invariant ISDF basis. Three things persist across maps:
 
 - **Σ rules.** The frozen set of §4 keeps its nodes and weights. Each map
   recomputes the masks, pole selectors, reference energies and $W(\tau)$.
-  Tail certificates cover the selector's minimum separation, so a state that
-  enters an existing tail keeps the same nodes.
+  For a sector (bispinor) model the frozen certificate also covers the pole
+  ceiling $[0, \Omega_{\rm ceil}]$, fixed at map 0 as twice the χ transition
+  span (`shared_pole_recipe._sector_treatment_ceiling`), so a pole that moves
+  within it keeps the same nodes.
 - **Response rules** (`response_bank.response_quadrature`). These are planned
   on the transition interval padded by 4 eV. They are reused while the
   current interval, decay and amplitude bounds, metallicity and sample points
