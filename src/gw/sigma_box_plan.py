@@ -828,8 +828,17 @@ def _sc_padded_box_spec(spec, eta):
     states = np.asarray(spec["states"], dtype=np.float64)
     pad_ry = sc_state_pad_ev(states * RYD_TO_EV) / RYD_TO_EV
     low, high = int(np.argmin(states - pad_ry)), int(np.argmax(states + pad_ry))
+    # Membership is re-selected on every map: a state past the window's own
+    # selector bound belongs to the neighbouring window, whose certificate
+    # covers it. Padding across the bound only drags a sign-definite edge
+    # toward zero until the zero-side cap stops it (TaAs 4^3 metal SC,
+    # 2026-09-24: val:bulk at 0.0013 Ry against a 0.0276 Ry selector edge,
+    # a 14.6 Ry-tall relative box that certified with 0.04% margin and was
+    # refused on refit).
+    state_lo, state_hi = spec.get("state_interval", (-np.inf, np.inf))
     padded_states = np.asarray(
-        [states[low] - pad_ry[low], states[high] + pad_ry[high]])
+        [max(states[low] - pad_ry[low], state_lo),
+         min(states[high] + pad_ry[high], state_hi)])
     pole_box, _, _ = _box_for_window(
         spec["frequencies"], padded_states, padded_poles,
         spec["pole_sign"], eta)
