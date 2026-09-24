@@ -1108,7 +1108,7 @@ def _stream_workspace(wfns, meta, mesh_xy, support, *, q_ids, n_outputs, ordered
     kernel, fixed = response_stream(wfns, meta, mesh_xy=mesh_xy, q_ids=q_ids,
         n_outputs=n_outputs, pair_mode="direct", bank_carry=True, ordered=ordered,
         vertex=vertex, band_ranges=support["band_ranges"])
-    capacity = minimax.RESPONSE_RULE_CAPACITY
+    capacity = minimax.RESPONSE_NODE_CAPACITY
     weights = partial(stream_weights, parents=vertex is None)
     abstract = (jax.ShapeDtypeStruct((capacity,), jnp.complex128),
                 jax.ShapeDtypeStruct((2, n_outputs, capacity), jnp.complex128),

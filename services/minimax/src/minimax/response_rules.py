@@ -9,7 +9,7 @@ import math
 
 import numpy as np
 from numpy.polynomial.legendre import leggauss
-from .complex_response import RESPONSE_RULE_CAPACITY, response_group_rules
+from .complex_response import RESPONSE_NODE_CAPACITY, RESPONSE_RULE_CAPACITY, response_group_rules
 
 
 @lru_cache(maxsize=256)
