@@ -781,6 +781,11 @@ class ZetaG:
                                    jnp.int32(t), V, M, shell)
             if zeta_io is not None:
                 self._write_tile(zeta_io, zt, t * st.g_tile)
+                if st.placement == 'disk':
+                    # The next store read enters another HDF5 handle; the
+                    # asynchronous ζ write must reach MPI-IO first on every
+                    # rank (SlabIO.sync_writes).
+                    zeta_io.sync_writes()
             del Zt, zt
         if not dbg:
             M = None
