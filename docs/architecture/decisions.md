@@ -565,7 +565,10 @@ keys themselves are in the [input reference](../input_reference.md).
 ### Layout and linear algebra
 
 - **`resolve_linalg`** interprets `linalg = local | distributed` exactly once
-  into `LinalgResolution`; no stage reinterprets the dial. The internal
+  into `LinalgResolution`; no stage reinterprets the dial. `distributed`
+  distributes the W Dyson solve, the transverse LU and the eigensolvers; the ζ
+  back-solve is always a whole-tile factor whose `local`/`replicated` tier the
+  planner chooses (`zeta_auto_tier`). The internal
   `distributed_lu = 'distributed'` sentinel lowers to cuSolverMp on CUDA and
   ScaLAPACK on CPU.
 - **`eigh_backend_choices`** reads `distrib_la.BACKEND_CHOICES`, importable
