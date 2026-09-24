@@ -41,10 +41,11 @@ ScaLAPACK `pzheevd` in the host `.so`, reached through the `distrib_la` door
 
 A cold CPU run pays two costs before physics: jax's CUDA plugin discovery
 (34–73 s of `jax.devices()` dlopening a CUDA stack the run cannot use) and
-import-graph resolution from Lustre. `runtime.skip_gpu_plugin_discovery()`
-removes the first ([overview §2.2](../overview.md#22-the-cpu-run-plugin-skip)),
-88 s → 11 s; the node-local runtime bundle removes most of the second,
-11 s → 4.6 s, with bit-identical outputs:
+import-graph resolution from Lustre. Resolving the driver's import graph on a
+fresh node takes 44–88 s as shipped. `runtime.skip_gpu_plugin_discovery()`
+removes the first cost ([overview §2.2](../overview.md#22-the-cpu-run-plugin-skip)),
+leaving 11–20 s; the node-local runtime bundle removes most of the second,
+leaving 4.6 s, with bit-identical outputs:
 
 ```bash
 # once per venv/source revision, inside the SIF:
