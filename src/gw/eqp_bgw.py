@@ -314,26 +314,36 @@ def compute_z_factor_from_omega_grid(
 			f"({omega_rel_ev.size}, {nk}, {nb})"
 		)
 
-	# ``clamp``, named rather than inherited.  The +/- dE_ev probes are
-	# DESIGNED to leave the grid at its two outermost samples -- a central
-	# difference at the edge has nowhere else to stand -- so a refusal here
-	# would fire on every healthy deck.  What the clamp costs is worth
-	# stating: where BOTH probes clamp to the same endpoint the numerator
-	# is exactly zero, dRe[sigma_c]/domega comes back 0 and Z comes back
-	# exactly 1, i.e. eqp1 degenerates to eqp0 for that state.  That is a
-	# recognisable signature rather than a plausible wrong number, which is
-	# why it is tolerable here and is not at the OUTPUT path
-	# (dynamic_sigma.eval_sigma_c_at_dft_energies, which reports its count).
+	# The +/- dE_ev probes are DESIGNED to leave the grid at its two
+	# outermost samples -- a central difference at the edge has nowhere else
+	# to stand.  They are clamped onto the grid, so the derivative is taken
+	# of the continuous sampled Sigma_c: one-sided within dE_ev of an edge,
+	# and exactly 0 (Z = 1, eqp1 = eqp0) where both probes land on the same
+	# endpoint.  They must NOT take the off-grid Sigma(omega=0) value, whose
+	# jump at the edge gave Z < 0 for every state within dE_ev of it
+	# (branch review sigma_omega_fallback_2026-09-23 B5, planted linear
+	# Sigma).  The value at E_DFT itself keeps the Sigma(0) rule.
 	from .qsgw_utils import interp_along_omega
 	sigma_c_at_dft = interp_along_omega(
 		sigma_c_omega_diag_ev, omega_rel_ev, e_dft_rel_ev)
+	lo, hi = float(omega_rel_ev[0]), float(omega_rel_ev[-1])
+	e_plus = np.clip(e_dft_rel_ev + dE_ev, lo, hi)
+	e_minus = np.clip(e_dft_rel_ev - dE_ev, lo, hi)
 	sigma_c_plus = interp_along_omega(
-		sigma_c_omega_diag_ev, omega_rel_ev, e_dft_rel_ev + dE_ev)
+		sigma_c_omega_diag_ev, omega_rel_ev, e_plus)
 	sigma_c_minus = interp_along_omega(
-		sigma_c_omega_diag_ev, omega_rel_ev, e_dft_rel_ev - dE_ev)
+		sigma_c_omega_diag_ev, omega_rel_ev, e_minus)
 
-	# Central-difference dRe[Σ_c]/dω at the centre
-	dsigma_dE = (np.real(sigma_c_plus) - np.real(sigma_c_minus)) / (2.0 * dE_ev)
+	# Finite-difference dRe[Σ_c]/dω over the clamped probe span; an
+	# unclamped pair keeps the exact central 2*dE_ev denominator.
+	clamped = ((e_plus != e_dft_rel_ev + dE_ev)
+		| (e_minus != e_dft_rel_ev - dE_ev))
+	span = np.where(clamped, e_plus - e_minus, 2.0 * dE_ev)
+	dsigma_dE = np.where(
+		span > 0.0,
+		(np.real(sigma_c_plus) - np.real(sigma_c_minus))
+		/ np.where(span > 0.0, span, 1.0),
+		0.0)
 	z_factor = 1.0 / (1.0 - dsigma_dE)
 	return sigma_c_at_dft, z_factor
 

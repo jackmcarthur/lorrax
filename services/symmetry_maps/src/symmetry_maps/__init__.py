@@ -230,6 +230,7 @@ from symmetry_maps.maps import (
     open_spin_block_coefficient,
     unfold_spin_centroid_operator,
     unfold_isdf_one_leg,
+    isdf_one_leg_source_slots,
     mix_lorentz_blocks,
 )
 # Pre-sweep spellings.  Imported from the modules that define them, so
@@ -335,6 +336,7 @@ __all__ = [
     "unfold_operator_local", "open_spin_block_coefficient",
     "certify_endpoint_locality", "endpoint_panel_cost", "unfold_endpoint_panel",
     "unfold_spin_centroid_operator", "unfold_isdf_one_leg",
+    "isdf_one_leg_source_slots",
     "mix_lorentz_blocks",
     # psi unfold / antiunitary rule
     "unfold_psi", "spinor_rotation_for_sym_row", "apply_spinor_rotation",

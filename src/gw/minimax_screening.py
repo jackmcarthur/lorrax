@@ -29,7 +29,7 @@ saying which artifact answered, and the driver prints below say it.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from functools import partial
+from functools import lru_cache, partial
 import os
 from typing import Callable
 
@@ -469,10 +469,18 @@ def fit_gn_ppm_from_wc_pair(
             raise ValueError(
                 "fit_gn_ppm_from_wc_pair: q_neg_index must be an involution "
                 f"over [0,{_nq}).")
-    _per_q = 1
-    for _d in _W0.shape[1:]:
+    # ONE q-slice of the LOCAL tile, which is what the sizer prices (its
+    # arena is per device).  Pricing the global (mu, nu) slice over-chunked
+    # by the device count: VI3 12x12, mu 3200, forced q_block = 1 at P16 and
+    # at P100, i.e. 144 eager slice/fit/reshard rounds per map instead of 6
+    # and 1.  The chunking is movement-only (see the sizer), so the fitted
+    # values are bit-identical at any q_block.
+    _sharding = getattr(_W0, "sharding", None)
+    _local_shape = (tuple(_sharding.shard_shape(tuple(_W0.shape)))
+                    if _sharding is not None else tuple(_W0.shape))
+    _per_q = int(_W0.dtype.itemsize)
+    for _d in _local_shape[1:]:
         _per_q *= int(_d)
-    _per_q *= _W0.dtype.itemsize
     _qb = _gn_ppm_fit_q_block(_nq, _per_q)
 
     # The anti-Hermitian half of the probe, kept only on the ordered path
@@ -961,7 +969,13 @@ def _match_layout(x, like):
     target = getattr(like, "sharding", None)
     if target is None or getattr(x, "sharding", None) == target:
         return x
-    return jax.device_put(x, target)
+    return _reshard_to(target)(x)
+
+
+@lru_cache(maxsize=None)
+def _reshard_to(target):
+    """One compiled identity per target layout; XLA emits the reshard."""
+    return jax.jit(lambda a: a, out_shardings=target)
 
 
 @partial(jax.jit, static_argnums=(4,))

@@ -1317,9 +1317,7 @@ def _integrate_sigma_batches(
             accumulator.finalize(), k_unfold_plan.sym,
             k_axis=2 if bracketed else 1, sharding=output_sharding)
         if bracketed:
-            sigma = jax.jit(
-                lambda values: jnp.cumsum(values, axis=0),
-                out_shardings=sigma.sharding)(sigma)
+            sigma = _bracket_cumsum_fn(sigma.sharding)(sigma)
             if band_counts is None:
                 band_counts = tuple(
                     int(s.nb_sigma_sum) if hi is None else int(hi)
@@ -1360,12 +1358,28 @@ def _unfold_sigma_cube(sigma, sym, *, k_axis, sharding):
     every rank (CrI3 16x16, 3 x 65 x 256 x 184^2 c128 = 27 GB/rank plus a
     57 GB temp at P64 -- the map-0 OOM; KNOWN_LORRAX_ISSUES 2026-09-23).
     """
+    return _unfold_sigma_cube_fn(sym, int(k_axis), sharding)(sigma)
+
+
+# The two finalize executables are built once per (symmetry table, layout),
+# not once per call: a fresh ``jax.jit(lambda ...)`` is a new cache entry, so
+# every SC map re-traced and re-compiled both (QUALITY_PATTERNS §5,
+# compiled-object lifetime).  Same jaxpr, so the values are bit-identical.
+@lru_cache(maxsize=8)
+def _unfold_sigma_cube_fn(sym, k_axis, sharding):
     from symmetry_maps import unfold_file_wedge_band_operator
     return jax.jit(lambda value: jnp.moveaxis(
         unfold_file_wedge_band_operator(
             sym, jnp.moveaxis(value, k_axis, 0),
             trs_rule="transpose"), 0, k_axis),
-        out_shardings=sharding)(sigma)
+        out_shardings=sharding)
+
+
+@lru_cache(maxsize=8)
+def _bracket_cumsum_fn(sharding):
+    """Cumulative band-count sum over the leading bracket axis."""
+    return jax.jit(lambda values: jnp.cumsum(values, axis=0),
+                   out_shardings=sharding)
 
 
 def _attach_ordered_odd_sigma(total, even):

@@ -161,8 +161,7 @@ def test_tiles_are_orbit_closed_and_plane_local():
     ops = np.array(rots + [sh @ r for r in rots])
     tau = np.zeros((8, 3))
     fg = (8, 8, 10)
-    tiles = build_real_grid_orbit_tiles(ops, tau, fg, n_y=2, target_width=32,
-                                        fill="least_loaded")
+    tiles = build_real_grid_orbit_tiles(ops, tau, fg, n_y=2, target_width=32)
     assert tiles.plane_axis == 2
     act = tiles.r_index[tiles.r_index >= 0]
     assert np.array_equal(np.sort(act), np.arange(np.prod(fg)))

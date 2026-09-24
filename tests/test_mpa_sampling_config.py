@@ -321,8 +321,8 @@ def test_gn_ppm_refuses_a_metal_by_name_citing_the_owner_ruling(tmp_path):
     validate_material_inputs(insulator, "insulator")
 
 
-@pytest.mark.parametrize("mode", ("x_only", "cohsex", "hl_ppm"))
-def test_a_metal_deck_refuses_every_mode_without_an_occupation_aware_head(
+@pytest.mark.parametrize("mode", ("cohsex", "hl_ppm"))
+def test_a_metal_deck_refuses_modes_without_fractional_occupations(
         tmp_path, mode):
     with pytest.raises(ValueError) as excinfo:
         config = _config(

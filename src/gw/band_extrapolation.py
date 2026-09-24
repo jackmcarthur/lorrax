@@ -1481,7 +1481,7 @@ BAND_EXTRAPOLATION_ESTIMATORS: tuple[str, ...] = (
     "spectral_shell", "band_index_only")
 BAND_EXTRAPOLATION_ESTIMATOR_DEFAULT: str = "spectral_shell"
 
-#: Bracket for the per-state exponent β, and the bisection depth.
+#: Bracket for the per-state exponent β, and how the root is located in it.
 #:
 #: NOT A MEASURED THRESHOLD, and it must not become one by being tuned.  β is
 #: only meaningful where the local power law is: the measured values run
@@ -1491,12 +1491,16 @@ BAND_EXTRAPOLATION_ESTIMATOR_DEFAULT: str = "spectral_shell"
 #: being quietly clipped to a plausible-looking number.  Narrowing it would
 #: convert refusals into clips, which is exactly the failure the owner's
 #: ruling forbids.
+#:
+#: The root is located to a bracket of relative width
+#: ``SHELL_EXPONENT_RTOL``, not to the ~1e-22 of the 80 fixed halvings this
+#: used to run.
 SHELL_EXPONENT_BRACKET: tuple[float, float] = (0.05, 40.0)
-SHELL_EXPONENT_BISECTIONS: int = 80
+SHELL_EXPONENT_RTOL: float = 1.0e-14
 
 #: A root this close (in β) to either bracket edge is a REFUSAL, not a value.
-#: 80 halvings of the interval leave the root located to ~3e-23, so a β that
-#: is still within 4e-5 of an edge means the bisection walked to the wall:
+#: The root is located to ~1e-14 relative, so a β that is still within 4e-5
+#: of an edge means the root find walked to the wall:
 #: ``f`` did not change sign inside, and what would be returned is the edge
 #: itself dressed up as a solution.
 SHELL_EXPONENT_EDGE_TOL: float = 1.0e-6 * (
@@ -1559,11 +1563,47 @@ class SpectralShellExtrapolationFailed(BandExtrapolationRefused):
 
 
 
-#: Bytes of one (n_terms, chunk) float64 block in BandLadder.log_moment, and
-#: its thread cap: each block has ~5 live temporaries, so the host peak is
-#: about 5 x 64 MiB x 8 = 2.5 GiB per rank.
-_LOG_MOMENT_CHUNK_BYTES = 64 * 2**20
+#: Bytes of one (chunk, n_terms) float64 block in BandLadder.log_moment, and
+#: its thread cap.  One block per thread, updated in place: 2 MiB stays in
+#: cache and under glibc's mmap threshold.  64 MiB blocks page-faulted afresh
+#: on every call: at the CrI3 shape 7 of the 12 CPU minutes were sys time.
+_LOG_MOMENT_CHUNK_BYTES = 2 * 2**20
 _LOG_MOMENT_THREADS = 8
+
+#: Euler–Maclaurin for the k-independent Weyl segment: ``B_2k/(2k)!`` for
+#: k = 1..6, and the shifted index ``u = n + n₀`` it starts at (bands below
+#: it are summed term by term).  At the bracket's largest exponent,
+#: s = 2β/3 = 26.7, the formula is at float64 roundoff from u = 64 on; from
+#: u = 256 the first omitted term is ~1e-23 of the sum.
+_WEYL_EM_B2K = (1 / 12, -1 / 720, 1 / 30240, -1 / 1209600, 1 / 47900160,
+                -691 / 1307674368000)
+_WEYL_EM_FROM = 256.0
+
+
+def _log_weyl_power_sum(s: np.ndarray, u_a: float, n: int) -> np.ndarray:
+    """``log Σ_{j=0}^{n-1} (u_a + j)^(−s)``, vectorised over ``s > 0``.
+
+    Euler–Maclaurin in units of the first term ``u_a^(−s)``: the integral,
+    the two endpoint halves and :data:`_WEYL_EM_B2K` corrections
+    ``B_2k/(2k)! · (f^(2k−1)(u_b) − f^(2k−1)(u_a))`` with ``f = u^(−s)`` and
+    ``u_b = u_a + n − 1``.  Every term is O(1), so nothing overflows at large
+    s.  The integral goes through ``expm1`` so s = 1 (β = 1.5) is its limit
+    ``log(u_b/u_a)``, not 0/0.  Hurwitz ζ is no help: it diverges for s ≤ 1,
+    which the bracket admits.  Requires ``u_a ≥`` :data:`_WEYL_EM_FROM`.
+    """
+    lg = np.log1p((n - 1) / u_a)        # log(u_b/u_a), exact for small n
+    t = (1.0 - s) * lg
+    tz = t == 0.0
+    tot = u_a * lg * np.where(tz, 1.0, np.expm1(t) / np.where(tz, 1.0, t))
+    tot = tot + 0.5 * (1.0 + np.exp(-s * lg))
+    rising = s                          # the rising factorial (s)_(2k−1)
+    for k, c in enumerate(_WEYL_EM_B2K):
+        j = 2 * k + 1
+        if k:
+            rising = rising * (s + (j - 2)) * (s + (j - 1))
+        tot = tot + c * rising * u_a ** (-j) * -np.expm1(-(s + j) * lg)
+    return -s * np.log(u_a) + np.log(tot)
+
 
 @dataclass(frozen=True)
 class BandLadder:
@@ -1635,73 +1675,81 @@ class BandLadder:
         Bands whose ``ε − E₀`` is non-positive (there are none above the
         occupied manifold on a converged mean field, but the ladder is not
         assumed) contribute nothing and are dropped, not clamped.
+
+        The DFT bands are summed term by term, one term per (band, k).  The
+        Weyl continuation is k-independent, ``x_n = (C/E*)·(n + n₀)^(2/3)``,
+        so above ``n + n₀ =`` :data:`_WEYL_EM_FROM` its part is
+        ``(C/E*)^(−β) · Σ_n (n + n₀)^(−2β/3)`` in closed form
+        (:func:`_log_weyl_power_sum`), one value per β.  At CrI3 16x16 that
+        is 152012 bands, formerly 152012 terms per state.
         """
         b = np.asarray(beta, dtype=np.float64)
         flat = b.ravel()
         lo, hi = int(lo), int(hi)
-        # COLUMN CHUNKS.  Each state's max and sum run over its own column
-        # only, and numpy reduces axis 0 row by row, so any chunking is
-        # bit-identical.  Unchunked, the tail shell (a3, N_T) is dense
-        # (n_terms, n_states) float64: CrI3 16x16, N_T = 152912 and 46848
-        # states gave 119 GB host RSS per rank (58783428.7 oom_kill).
-        # Chunks run on threads (numpy releases the GIL in exp/log/sum).
-        n_terms = (max(0, min(hi, self.n_dft) - min(lo, self.n_dft))
-                   * int(self.e_dft_ev.shape[1])
-                   + max(0, max(hi, self.n_dft) - max(lo, self.n_dft)))
-        step = max(1, _LOG_MOMENT_CHUNK_BYTES // (8 * max(1, n_terms)))
-        if flat.size <= step:
-            return self._log_moment_columns(lo, hi, flat).reshape(b.shape)
-        from concurrent.futures import ThreadPoolExecutor
-        import os
-        chunks = [flat[i:i + step] for i in range(0, flat.size, step)]
-        workers = min(len(chunks), _LOG_MOMENT_THREADS,
-                      len(os.sched_getaffinity(0)))
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            parts = list(pool.map(
-                lambda c: self._log_moment_columns(lo, hi, c), chunks))
-        return np.concatenate(parts).reshape(b.shape)
-
-    def _log_moment_columns(self, lo: int, hi: int, flat) -> np.ndarray:
-        """:meth:`log_moment` for a flat vector of β, one ROW per β.
-
-        Row-major (n_beta, n_terms): each β's max and sum run along its own
-        contiguous row, so the result does not depend on how many β share
-        the call -- the chunking in :meth:`log_moment` is bit-invariant.
-        """
-        terms = []                      # each (n_beta, n_terms)
+        nlx, lw = [], []                # per explicit term: −log x, log w
 
         lo_d, hi_d = min(lo, self.n_dft), min(hi, self.n_dft)
         if hi_d > lo_d:
-            x = (self.e_dft_ev[lo_d:hi_d] - self.e0_ev) / self.estar_ev
+            x = ((self.e_dft_ev[lo_d:hi_d] - self.e0_ev)
+                 / self.estar_ev).reshape(-1)
             ok = x > 0.0
-            lg = np.where(ok, -np.log(np.where(ok, x, 1.0)), np.nan)
-            lg = flat[:, None] * lg.reshape(1, -1)
-            lgw = np.log(self.w_k)
-            lg = lg + np.tile(lgw, hi_d - lo_d)[None, :]
-            terms.append(np.where(np.isnan(lg), -np.inf, lg))
+            nlx.append(-np.log(x[ok]))
+            lw.append(np.tile(np.log(self.w_k), hi_d - lo_d)[ok])
 
-        lo_w, hi_w = max(lo, self.n_dft), max(hi, self.n_dft)
-        if hi_w > lo_w:
-            x = ((self.e_weyl_ev[lo_w - self.n_dft:hi_w - self.n_dft]
+        # Weyl bands (lo_w, hi_w], clipped to the ladder's extent as the
+        # slice always was: term by term up to n_em, closed form past it.
+        # Each extended band carries the FULL k weight (which sums to 1)
+        # exactly once.
+        n_end = self.n_dft + int(self.e_weyl_ev.size)
+        lo_w, hi_w = (min(max(v, self.n_dft), n_end) for v in (lo, hi))
+        n_em = min(hi_w, max(lo_w, int(np.ceil(_WEYL_EM_FROM - self.n0)) - 1))
+        if n_em > lo_w:
+            x = ((self.e_weyl_ev[lo_w - self.n_dft:n_em - self.n_dft]
                   - self.e0_ev) / self.estar_ev)
             ok = x > 0.0
-            lg = np.where(ok, -np.log(np.where(ok, x, 1.0)), np.nan)
-            # The extended ladder is k-independent, so each extended band
-            # carries the FULL k weight (which sums to 1) exactly once.
-            lg = flat[:, None] * lg.reshape(1, -1)
-            terms.append(np.where(np.isnan(lg), -np.inf, lg))
+            nlx.append(-np.log(x[ok]))
+            lw.append(np.zeros(int(ok.sum())))
+        tail = None
+        if hi_w > n_em and self.c_ev > 0.0:
+            tail = (-flat * np.log(self.c_ev / self.estar_ev)
+                    + _log_weyl_power_sum(2.0 * flat / 3.0,
+                                          n_em + 1 + self.n0, hi_w - n_em))
 
-        if not terms:
-            return np.full(flat.shape, -np.inf)
-        allt = np.concatenate(terms, axis=1)
-        m = np.max(allt, axis=1)
-        out = np.where(
-            np.isfinite(m),
-            m + np.log(np.sum(
-                np.exp(allt - np.where(np.isfinite(m), m, 0.0)[:, None]),
-                axis=1)),
-            -np.inf)
-        return out
+        nlx = np.concatenate(nlx) if nlx else np.zeros(0)
+        lw = np.concatenate(lw) if lw else np.zeros(0)
+        if nlx.size == 0 and tail is None:
+            return np.full(b.shape, -np.inf)
+
+        def rows(sl):
+            # One (rows, n_terms) block, in place; each β's max and sum run
+            # along its own row, so any chunking is bit-identical.
+            a = np.multiply.outer(flat[sl], nlx)
+            a += lw
+            m = a.max(axis=1, initial=-np.inf)
+            if tail is not None:
+                m = np.maximum(m, tail[sl])
+            a -= m[:, None]
+            np.exp(a, out=a)
+            s = a.sum(axis=1)
+            if tail is not None:
+                s += np.exp(tail[sl] - m)
+            return m + np.log(s)
+
+        # ROW CHUNKS ON THREADS (numpy releases the GIL in exp/log/sum).
+        # Unchunked, the tail shell (a3, N_T) of CrI3 16x16 was a dense
+        # (46848, 164582) float64 block: 119 GB host RSS per rank
+        # (58783428.7 oom_kill).
+        step = max(1, _LOG_MOMENT_CHUNK_BYTES // (8 * max(1, nlx.size)))
+        if flat.size <= step:
+            return rows(slice(None)).reshape(b.shape)
+        from concurrent.futures import ThreadPoolExecutor
+        import os
+        chunks = [slice(i, i + step) for i in range(0, flat.size, step)]
+        workers = min(len(chunks), _LOG_MOMENT_THREADS,
+                      len(os.sched_getaffinity(0)))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            parts = list(pool.map(rows, chunks))
+        return np.concatenate(parts).reshape(b.shape)
 
     def moment(self, lo: int, hi: int, beta) -> np.ndarray:
         """``I(β)`` over ABSOLUTE bands ``(lo, hi]``."""
@@ -1875,11 +1923,18 @@ def solve_shell_exponents(ladder: BandLadder, shell2, shell3, ratio):
     """Bracketed root find for ``β``, one per external state.
 
     Solves ``log I₃(β) − log I₂(β) − log(ratio) = 0`` on
-    :data:`SHELL_EXPONENT_BRACKET` by bisection, vectorised over the state
-    axis.  ``g(β) = log I₃ − log I₂`` is strictly DECREASING — its derivative
+    :data:`SHELL_EXPONENT_BRACKET`, vectorised over the state axis.
+    ``g(β) = log I₃ − log I₂`` is strictly DECREASING — its derivative
     is ``⟨log x⟩₂ − ⟨log x⟩₃`` and shell 3 sits above shell 2 — so the root
     is unique where it exists, which is what makes a bracketed find the right
     tool and a clip the wrong answer.
+
+    The find is Chandrupatla's (``scipy.optimize.elementwise.find_root``):
+    bisection safeguarding inverse-quadratic steps, stopped at a relative
+    bracket width of :data:`SHELL_EXPONENT_RTOL`.  About 8 evaluations of
+    ``g`` per state, against the 82 of the fixed 80-halving bisection this
+    replaced; a bracket without a sign change, or a non-finite ``g``, is
+    unsuccessful and so has no root, exactly as before.
 
     Parameters
     ----------
@@ -1909,29 +1964,20 @@ def solve_shell_exponents(ladder: BandLadder, shell2, shell3, ratio):
     logr = np.log(flat[live])
     lo_b, hi_b = SHELL_EXPONENT_BRACKET
 
-    def f(b):
-        return (ladder.log_moment(*shell3, b)
-                - ladder.log_moment(*shell2, b) - logr)
+    def g(b):
+        return ladder.log_moment(*shell3, b) - ladder.log_moment(*shell2, b)
 
-    lo = np.full(logr.shape, float(lo_b))
-    hi = np.full(logr.shape, float(hi_b))
-    flo, fhi = f(lo), f(hi)
-    ok = np.isfinite(flo) & np.isfinite(fhi) & (flo * fhi <= 0.0)
+    from scipy.optimize import elementwise
+    res = elementwise.find_root(
+        lambda x, lr: g(x) - lr, (float(lo_b), float(hi_b)), args=(logr,),
+        tolerances=dict(xatol=0.0, xrtol=SHELL_EXPONENT_RTOL,
+                        fatol=0.0, frtol=0.0))
+    ok = res.success
+    b = res.x
 
-    for _ in range(SHELL_EXPONENT_BISECTIONS):
-        mid = 0.5 * (lo + hi)
-        fm = f(mid)
-        ok &= np.isfinite(fm)
-        take_hi = (flo * fm) <= 0.0
-        hi = np.where(take_hi, mid, hi)
-        fhi = np.where(take_hi, fm, fhi)
-        lo = np.where(take_hi, lo, mid)
-        flo = np.where(take_hi, flo, fm)
-    b = 0.5 * (lo + hi)
-
-    # A ROOT ON THE WALL IS A CLIP, NOT A FIT.  After 80 halvings a genuine
-    # interior root is located to ~1e-22; still sitting on an edge means the
-    # bisection never found a sign change inside.
+    # A ROOT ON THE WALL IS A CLIP, NOT A FIT.  A genuine interior root is
+    # located to ~1e-14; still sitting on an edge means the find never found
+    # a sign change inside.
     on_edge = ((b - lo_b) <= SHELL_EXPONENT_EDGE_TOL) | (
         (hi_b - b) <= SHELL_EXPONENT_EDGE_TOL)
 
@@ -2956,7 +3002,7 @@ __all__ = [
     "BAND_EXTRAPOLATION_ESTIMATORS",
     "BAND_EXTRAPOLATION_ESTIMATOR_DEFAULT",
     "SHELL_EXPONENT_BRACKET",
-    "SHELL_EXPONENT_BISECTIONS",
+    "SHELL_EXPONENT_RTOL",
     "SHELL_EXPONENT_EDGE_TOL",
     "SHELL_FAILURE_REASONS",
     "SHELL_OK",

@@ -35,6 +35,7 @@ zeta_loader.ZetaLoader(path, *, mesh=None, mode='r')     # first access imports 
     .read_zeta_G_local(key)
     .load(*, q='ibz'|seq[int], mu=None, sharding=None)
     .gvecs(q='ibz') / .ngk_valid(q='ibz')
+    .release_read_staging()                              # collective: reopen the handle
     .close() / context manager
     # + the bound mf_header/isdf_header attribute surface (see Contract)
 zeta_loader.probe_zeta_file(path) -> ZetaFileProbe   # NEVER raises
@@ -49,7 +50,10 @@ append service directories independently.
 plan work with no phdf5 FFI anywhere; the collective reads refuse naming
 the missing mesh. With a mesh, ONE SlabIO handle is opened eagerly and
 held for the loader's lifetime (amortises the phdf5 ctx — measured, see
-Performance). The door itself is lazy on jax (PEP 562): the format
+Performance).  That ctx also keeps its host read buffer at the largest read
+until it closes, so a caller that holds a loader across several large read
+phases calls `release_read_staging()` (collective) between them; the V_q tile
+loop does, once per V tile. The door itself is lazy on jax (PEP 562): the format
 surface is pure h5py+numpy and runs on a jax-free stack (login-node
 `python3` was the case that forced this); `ZetaLoader` pays the jax
 import on first attribute access.

@@ -1,7 +1,7 @@
 """P=4 gate for the route-G μ-batch kernel and Z store (docs/architecture/zeta_fit_mubatch.md).
 
 Four processes, one GPU each, 2x2 mesh, on the fixtures of
-``tests/test_zeta_mubatch_sym_parity.py`` (glide group with spin mixing and an
+``tests/zeta_mubatch_fixtures.py`` (glide group with spin mixing and an
 antiunitary row, ns = 2; A-cubic, 48 operations, ns = 1) plus a ragged deck
 where no axis divides the mesh (one operation, box (5, 5, 7) so N_r = 175 and
 7 planes, 7 bands, 7 centroids, a 3x1x1 k grid with Q = 2 stored q, and a
@@ -42,7 +42,7 @@ import jax.numpy as jnp  # noqa: E402
 from jax.experimental import multihost_utils  # noqa: E402
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P  # noqa: E402
 
-import test_zeta_mubatch_sym_parity as parity  # noqa: E402
+import zeta_mubatch_fixtures as parity  # noqa: E402
 from test_isdf_zq_parent_parity import _dense_pair_rhs  # noqa: E402
 
 TAG = "[zeta-mubatch-p4]"

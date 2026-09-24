@@ -53,3 +53,17 @@ def test_the_count_line_names_the_fallback():
 def test_no_policy_machinery_is_left():
     for name in ("OUT_OF_RANGE_POLICIES", "resolve_out_of_range_policy", "_OUT_OF_RANGE_ENV"):
         assert not hasattr(qsgw_utils, name), name
+
+
+def test_z_factor_probes_the_continuous_sigma_at_the_grid_edge():
+    """Planted Sigma_c = 1 - 0.3*omega on [-10, 10] eV: Z = 1/1.3 everywhere
+    the derivative is sampled, including within dE of the edge; the probes
+    never take the off-grid Sigma(0) value (review B5 gave Z < 0 there)."""
+    from gw.eqp_bgw import compute_z_factor_from_omega_grid
+    omega = np.linspace(-10.0, 10.0, 81)
+    e = np.array([[9.0, 9.6, 9.9, 10.0, 10.4]])
+    sigma = (1.0 - 0.3 * omega)[:, None, None] * np.ones((1, *e.shape))
+    _, z = compute_z_factor_from_omega_grid(
+        sigma_c_omega_diag_ev=sigma.astype(complex), omega_rel_ev=omega,
+        e_dft_rel_ev=e, dE_ev=0.5)
+    np.testing.assert_allclose(z, 1.0 / 1.3, rtol=1e-12)

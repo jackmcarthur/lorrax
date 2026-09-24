@@ -53,8 +53,8 @@ _BOX_SIGN_FRACTION = 0.7
 #: Flat real-axis coverage pad on every SC product window (owner ruling
 #: 2026-09-19). One tau node map must hold for the whole self-consistency
 #: loop, so the iteration-1 certificate pays a full +2 eV at each real end
-#: instead of re-fitting windows as states move. Recompute is reserved for a
-#: metal<->insulator flip or a genuine rule-validity failure.
+#: instead of re-fitting windows as states move; an escape refits the set
+#: (see ``_fit_fixed_sc_rules``).
 _SC_WINDOW_PAD_EV = 2.0
 #: Pad toward zero for a sign-definite SC window: 0.5 of its distance escaped by 1.6% on TaAs 8^3
 #: map 1 and 0.25 again at map 2 (semimetal valence state 30 -> 15 -> 6 meV from E_F); 0.05 floors it below 1 meV.
@@ -765,8 +765,9 @@ def _sc_padded_box_spec(spec, eta):
     # the builder cannot certify: the Na conduction pole-tail window was
     # retained at sup=0.04 against eps=1e-4 with 906 nodes, while its actual
     # support has a 24-node rule at eps (lane QUADCHECK, 2026-09-05).  The
-    # pad toward zero is capped at half the support's distance to zero; a
-    # support that really crosses later is a box escape and rebuilds.
+    # pad toward zero stops the zero-side edge at ``_SC_ZERO_SIDE_CAP`` of
+    # its distance to zero; a support that really crosses later is a box
+    # escape and rebuilds.
     support_box, _, _ = _box_for_window(
         support_frequencies, spec["states"], spec["pole_stats"],
         spec["pole_sign"], eta)
@@ -830,17 +831,17 @@ def _fit_fixed_sc_rules(
 ):
     """Fit one padded SC rule set, then reuse those exact nodes.
 
-    The +2 eV window pad is the run's certificate (owner ruling 2026-09-19):
-    the same tau node map must hold through every self-consistent map. A
-    window that escapes its certificate, or a name that did not exist at
-    iteration 1, is a named refusal, never a silent rebuild. The only
-    sanctioned recomputes are a metal<->insulator flip (the window structure
-    and sign character change with the class) and a genuine rule-validity
-    failure during reuse (factored-log growth above the cap).
+    The +2 eV window pad is the run's certificate: the same tau node map is
+    reused on every self-consistent map while it holds. Three events refit:
 
-    This supersedes the 2026-09-03 rebuild-on-escape policy (Si/MoS2
-    measurements): a deck that escapes the +2 eV certificate needs its
-    window budget revisited, not a silent refit.
+    * a window that escapes its certificate box, changes error currency, or
+      did not exist at iteration 1 refits the whole rule set for this map
+      (owner 2026-09-22, TaAs semimetal SC); the receipt names every refit
+      window and the escaped windows' reasons, and keeps iteration 1's pair
+      cost;
+    * a metal<->insulator flip re-initializes the set under the new class;
+    * a rule-validity failure during reuse (factored-log growth above the
+      cap) refits that one window.
     """
     rows = list(specs)
     iteration = int(session.get("call_count", 0)) + 1
@@ -854,20 +855,31 @@ def _fit_fixed_sc_rules(
             session["material_class"] = named_class
             session.pop("rules", None)
             session["class_flip"] = f"{previous_class}->{named_class}"
-    # Owner 2026-09-22 (TaAs semimetal SC): a window that escapes its frozen box, or a new
-    # window, rebuilds the rule set for this map instead of refusing; each rebuild is counted.
+    if "rules" in session and (
+            float(session["eta_ry"]) != float(eta)
+            or float(session["eps"]) != float(eps)):
+        raise ValueError(
+            "SC fixed quadrature session changed currency: "
+            f"eta {session['eta_ry']!r}->{eta!r}, "
+            f"eps {session['eps']!r}->{eps!r}")
+    # Owner 2026-09-22 (TaAs semimetal SC): a window that escapes its frozen
+    # box, or a new window, refits the rule set for this map instead of
+    # refusing.
+    escape_reasons = {}
     if "rules" in session:
-        stale = [spec["name"] for spec in rows if spec["name"] not in session["rules"]]
         for spec in rows:
             entry = session["rules"].get(spec["name"])
-            if entry is not None and (
-                    _box_escape_reasons(entry["fit"]["rule_box"], spec["box"])
-                    or bool(entry["fit"]["relative"]) != (spec["kind"] != "crossing")):
-                stale.append(spec["name"])
-        if stale:
+            if entry is None:
+                escape_reasons[spec["name"]] = "absent at iteration 1"
+                continue
+            reasons = _box_escape_reasons(
+                entry["fit"]["rule_box"], spec["box"])
+            if bool(entry["fit"]["relative"]) != (spec["kind"] != "crossing"):
+                reasons.append("absolute/relative error currency changed")
+            if reasons:
+                escape_reasons[spec["name"]] = "escape: " + "; ".join(reasons)
+        if escape_reasons:
             session.pop("rules")
-            session["rebuild_count"] = int(session.get("rebuild_count", 0)) + 1
-            session["class_flip"] = f"escape rebuild {session['rebuild_count']}: {sorted(set(stale))}"
     if "rules" not in session:
         session["eta_ry"] = float(eta)
         session["eps"] = float(eps)
@@ -875,63 +887,44 @@ def _fit_fixed_sc_rules(
         fits, fit_rows = fit_sigma_box_specs(
             padded, eta, eps=eps,
             cache_dir=cache_dir, cache_build_widen=False)
+        rebuild = bool(escape_reasons)
+        status = "rebuild:sc-fixed" if rebuild else "init"
         rules = {}
         for spec, padded_spec, fit in zip(rows, padded, fits):
             frozen = dict(fit)
-            frozen["cache_status"] = f"init:{fit['cache_status']}"
+            frozen["cache_status"] = f"{status}:{fit['cache_status']}"
             rules[spec["name"]] = {
                 "fit": frozen,
                 "padded_box": tuple(padded_spec["box"]),
                 "initial_box": tuple(spec["box"]),
             }
         session["rules"] = rules
-        session["initial_window_tau_pairs"] = int(sum(
-            fit["node_count"] for fit in fits))
+        if rebuild:
+            # Iteration 1's pair cost stays the reference the kept line
+            # compares against; every window of the set was refit.
+            session["rebuild_count"] = int(
+                session.get("rebuild_count", 0)) + len(rows)
+            rebuilt = tuple(spec["name"] for spec in rows)
+            reasons = tuple(sorted(
+                (name, escape_reasons.get(name, "refit with the rule set"))
+                for name in rebuilt))
+        else:
+            session["initial_window_tau_pairs"] = int(sum(
+                fit["node_count"] for fit in fits))
+            rebuilt, reasons = (), ()
         return [dict(rules[spec["name"]]["fit"]) for spec in rows], fit_rows, {
-            "iteration": iteration, "initialized": True,
-            "rebuilt": (), "recompute_reasons": (),
+            "iteration": iteration, "initialized": not rebuild,
+            "rebuilt": rebuilt, "recompute_reasons": reasons,
             "rebuild_count_total": int(session.get("rebuild_count", 0)),
             "material_class": session.get("material_class"),
             "class_flip": session.pop("class_flip", None),
         }
 
-    if (float(session["eta_ry"]) != float(eta)
-            or float(session["eps"]) != float(eps)):
-        raise ValueError(
-            "SC fixed quadrature session changed currency: "
-            f"eta {session['eta_ry']!r}->{eta!r}, "
-            f"eps {session['eps']!r}->{eps!r}")
-
     rules = session["rules"]
     # A product window may temporarily have no live state/pole tuples.  Keep
     # its iteration-1 receipt in ``rules`` and simply omit its zero
-    # contribution from this map; if it reappears, the same containment and
-    # node-identity checks below apply.
-    missing = [spec["name"] for spec in rows if spec["name"] not in rules]
-    if missing:
-        raise RuntimeError(
-            "GATE sc_fixed_quadrature_map: window(s) "
-            f"{sorted(missing)!r} did not exist in iteration 1. The SC node "
-            "map is frozen for the whole loop; a new window name means the "
-            "window/material class changed. Recompute is reserved for a "
-            "metal<->insulator flip or a genuine rule-validity failure.")
-    escaped = {}
-    for spec in rows:
-        entry = rules[spec["name"]]
-        reasons = _box_escape_reasons(entry["fit"]["rule_box"], spec["box"])
-        if bool(entry["fit"]["relative"]) != (spec["kind"] != "crossing"):
-            reasons.append("absolute/relative error currency changed")
-        if reasons:
-            escaped[spec["name"]] = "; ".join(reasons)
-    if escaped:
-        detail = ", ".join(
-            f"{name!r} ({reason})" for name, reason in escaped.items())
-        raise RuntimeError(
-            f"GATE sc_fixed_quadrature_escape: {detail}. The +2 eV SC "
-            "certificate (owner ruling 2026-09-19) no longer covers this "
-            "window; the frozen map is never silently re-keyed. Recompute is "
-            "reserved for a metal<->insulator flip or a genuine rule-validity "
-            "failure.")
+    # contribution from this map; if it reappears, the containment check
+    # above applies to it again.
     fit_rows = []
     recomputed = {}
     fits = []

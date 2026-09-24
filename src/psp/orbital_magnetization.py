@@ -271,7 +271,7 @@ def run_sternheimer_orbmag(wfn, sym, meta, vnl_setup, pseudos, nbnd, nocc,
     Per full-BZ k, per occupied band v: solve the Sternheimer equation (reusing
     ``run_sternheimer.compute_kp_tangent_at_kvec``) for |∂̃_a u_v⟩ (a=x,y,z),
     then the per-k orbital-moment AXIAL VECTOR
-        m_γ(k) = (−1/2) Im Σ_v ε_{γab} ⟨∂̃_a u_v|(H_k+ε_v−2μ)|∂̃_b u_v⟩.
+        m_γ(k) = (+1/2) Im Σ_v ε_{γab} ⟨∂̃_a u_v|(H_k+ε_v−2μ)|∂̃_b u_v⟩.
     The conduction manifold is summed exactly inside the Sternheimer inverse, so
     the result is BAND-COUNT INDEPENDENT (no SOS tail).  μ-linear split:
         cA from the (H_k+ε_v)-sandwich, cB from the overlap ⟨∂̃_a|∂̃_b⟩
@@ -488,6 +488,14 @@ def main(argv=None):
     print(f"\n[orbmag] WFN: {wfn_path}")
     wfn = WfnLoader(str(wfn_path))
     sym = wfn.symmetry()
+    # This script assembles its OWN p + dV_NL/dk (velocity_at_k / run_ibz)
+    # and has no i[r, V_U].  A DFT+U mean field refuses here through the one
+    # resolver instead of silently omitting the term; the DFT+U velocity is
+    # the one path (common.mtxel_sweep.dipole_operator with the deck keys
+    # hubbard_input / hubbard_occupations) and psp.orbital_response.
+    from psp.hubbard_ops import resolve_hubbard_input
+    resolve_hubbard_input("", "", wfn=wfn, base_dir=str(wfn_path.parent),
+                          caller="psp.orbital_magnetization (no V_U term)")
 
     nspinor = int(wfn.nspinor)
     if nspinor != 2:

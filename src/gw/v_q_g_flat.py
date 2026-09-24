@@ -10,14 +10,16 @@ sphere conversion) goes away because:
 * The contract chunks over **G** (a fixed-cost reduction axis), not μ
   / ν — one G-chunk is a small GEMM, and the V[μ,ν] output is the
   whole problem at once.
-* One q at a time; q-batching can come back as an outer vmap if a
-  future profile shows the per-q launch latency dominating.
+* One q-TILE per kernel launch: a ``lax.scan`` over the tile's q, and
+  inside it a scan over G panels that gathers one ``(μ, g_chunk)`` panel
+  per operand per step (SUMMA-style), so no rank ever holds a whole
+  ``(μ, n_G)`` face on fewer than all P ranks.
 
-Async I/O — kept from the legacy driver — is the only orchestration
-trick we keep: a worker thread reads ζ̃_{q+1} while the compute thread
-contracts ζ̃_q.  At per-q read size ``n_rmu × ngkmax × 16 B`` (typical
-MoS2 3×3 ~50 MB) the overlap matters more than the chooser/tiling
-machinery.
+I/O is synchronous q-tiles: every q whose ζ̃ fits the V_q budget is read
+in one collective call (all of them whenever they fit — the whole-slab
+read), contracted, and only then is the next tile read.  Overlapping a
+PHDF5 read with the kernel's NCCL collectives deadlocked historically;
+see the tile loop in :func:`_compute_V_q_g_flat_one_tile`.
 
 Math:
 
@@ -50,166 +52,185 @@ if TYPE_CHECKING:                       # pragma: no cover — typing only
 
 
 # ---------------------------------------------------------------------------
-# Inner kernel: ζ_q (μ, G_padded) + v_q (G_padded,) → V_q (μ, μ) at P('x','y')
+# Inner kernel: one q-tile of ζ (q, μ, G) + v (q, G) → V_q (μ, μ) at P('x','y')
 # ---------------------------------------------------------------------------
 
-_PER_Q_KERNEL_CACHE: dict = {}
+_Q_TILE_KERNEL_CACHE: dict = {}
 
 
-def _make_per_q_kernel(mesh_xy: Mesh, n_rmu_L: int, n_rmu_R: int,
-                       ngkmax: int, g_chunk: int,
-                       *, write_g0: bool, same_zeta: bool):
-    """Compile-once kernel for the per-q contract + dynamic_update_slice
-    into the (V_acc, g0_acc) buffers.
+def _make_q_tile_kernel(mesh_xy: Mesh, n_rmu_L: int, n_rmu_R: int,
+                        ngkmax: int, g_chunk: int, q_tile: int,
+                        *, write_g0: bool, same_zeta: bool):
+    """Compile-once kernel: contract one q-tile into the (V_acc, g0_acc) buffers.
 
     Single signature handles both:
       * Charge / diagonal bispinor tiles: ``same_zeta=True``; caller
-        passes ``zeta_R_all is zeta_L_all`` and the kernel re-shards one
-        buffer for the two operands of the einsum.
+        passes ``zeta_R_tile is zeta_L_tile`` and the kernel reshards one
+        buffer for the two operands of the GEMM.
       * Bispinor off-diagonal tiles: ``same_zeta=False``; caller passes
         two separate slabs (potentially different ``n_rmu_*``).
 
-    Returns ``fn(V_acc, g0_acc, zeta_L_all, zeta_R_all, v_q_all, q_idx)
-              -> (V_new, g0_new)``.
-    Donates the two accumulators so the per-q update is in-place.
+    Returns ``fn(V_acc, g0_acc, zeta_L_tile, zeta_R_tile, v_tile, q0)
+              -> (V_new, g0_new)`` where the tiles are the ``q_tile`` rows
+    starting at global q index ``q0``.  Donates the two accumulators so the
+    per-q update is in place.
 
-    THE ζ SLICES ARE TAKEN INSIDE THIS JIT, off the already-traced
-    ``q_idx``, and the whole ``(n_q, μ, G)`` slabs come in whole.  The
-    caller used to slice them eagerly, which emitted one or two
-    ``dynamic_slice_in_dim`` executables plus a gather for ``v_q`` per q
-    outside any jit — O(n_q) dispatches and host round trips, and one
-    live ``(1, n_rmu_padded, ngkmax)`` device temporary per iteration
-    that only the caller's ``block_until_ready`` kept from queueing up
-    (3.28 GB global for a second copy of ζ_L at CrI3 6×6 80 Ry).  Moving
-    the slices in here is what makes gating that sync safe: the
-    temporaries now live and die inside one executable, and the donated
-    accumulator chain serialises the executions anyway.  Same shape as
-    the sibling per-q tier in ``isdf/core.py`` (``_solve_one_q_and_update``),
-    for the same reason: one compiled shape for the whole loop.
+    SUMMA-STYLE PANELS.  ζ_q arrives μ-sharded over every rank,
+    ``P(('x','y'), None)``, and stays that way for the whole contraction.
+    Each G-chunk step gathers ONE panel per operand — L onto 'x', R onto 'y'
+    — multiplies it into the local ``(μ_L/p_x, μ_R/p_y)`` block and drops
+    it.  Per rank that is ``ζ_q/P + (n_μL/p_x + n_μR/p_y)·g_chunk`` live
+    instead of the ``ζ_q/p_x + ζ_q/p_y`` face gathers this replaced, which
+    were O(1/√P) and one 16·μ·n_G/p_x payload per collective.  Total bytes
+    moved are unchanged: every G column still reaches each rank once.  The
+    G scan runs in ``shard_map`` with the two panel all-gathers written in
+    its body; see ``_panel_contract`` for why that is structural.
 
-    Only the three slice operands are new arguments; positions 0 and 1
-    are still the two donated accumulators, so ``donate_argnums`` is
-    unchanged — and the ζ slabs, which every iteration reuses, are
+    THE q LOOP IS A ``lax.scan`` INSIDE THE KERNEL.  The ζ slices are taken
+    off the traced tile index, so the caller hands in whole tile slabs and
+    no per-q eager slice, per-q dispatch or per-q host sync exists.  The
+    donated (V_acc, g0_acc) chain is the scan carry; its dynamic-update-
+    slice is in place.  The tile slabs, which every iteration reads, are
     deliberately NOT donated.
+
+    A G tail that ``g_chunk`` does not divide is handled by clamping the last
+    chunk's start to ``ngkmax - g_chunk`` and zeroing the weight of the
+    columns an earlier chunk already counted, so any ``g_chunk <= ngkmax``
+    is exact.  When it divides, the mask is all-true and every GEMM is the
+    one the whole-face kernel ran, bit for bit.
     """
     key = (id(mesh_xy), int(n_rmu_L), int(n_rmu_R), int(ngkmax),
-           int(g_chunk), bool(write_g0), bool(same_zeta))
-    hit = _PER_Q_KERNEL_CACHE.get(key)
+           int(g_chunk), int(q_tile), bool(write_g0), bool(same_zeta))
+    hit = _Q_TILE_KERNEL_CACHE.get(key)
     if hit is not None:
         return hit
 
-    blk_x_sh = NamedSharding(mesh_xy, P('x', None))
-    blk_y_sh = NamedSharding(mesh_xy, P('y', None))
+    from common.shard_map import shard_map
+    from common.vma import mark_varying
+
+    face_sh = NamedSharding(mesh_xy, P(('x', 'y'), None))
+    # The R face in ('y','x') block order: then each 'y' block of μ_R is the
+    # tiled all-gather over 'x' of one contiguous run of local blocks, just as
+    # each 'x' block of μ_L is the all-gather over 'y' in ('x','y') order.
+    # Reaching it is one collective-permute of the ζ_q/P face (the whole-face
+    # kernel did the same permute).
+    face_yx_sh = NamedSharding(mesh_xy, P(('y', 'x'), None))
     V_sh = NamedSharding(mesh_xy, P(None, 'x', 'y'))
-    V_block_sh = NamedSharding(mesh_xy, P('x', 'y'))
     g0_sh = NamedSharding(mesh_xy, P(None, 'x'))
     g0_block_sh = NamedSharding(mesh_xy, P('x'))
     v_sh = NamedSharding(mesh_xy, P(None))
     # The two slabs arrive exactly as ``ZetaLoader.read_zeta_G_slab``
-    # returns them — q replicated, μ over ('x','y') — and the v(q+G) table
-    # replicated by ``device_put_process_local``.  Now that the per-q slice
-    # is taken in here, the SLAB is what crosses the jit boundary, so the
-    # entry sharding is worth stating rather than inheriting: it is what
-    # keeps the reshard below on the one (μ, G) face instead of on the whole
-    # (n_q, μ, ngkmax) tensor.  Measured a no-op at the production layout on
-    # a 2×2 CPU mesh (identical HLO with and without) — it is a contract
-    # against a caller that hands the kernel a differently-sharded slab, not
-    # a fix for something GSPMD is doing today.
+    # returns them — q replicated, μ over ('x','y') — and the v(q+G) rows
+    # replicated by ``device_put_process_local``.  The entry sharding is
+    # stated rather than inherited: it keeps the per-q slice on the one
+    # (μ, G) face instead of on the whole (q_tile, μ, ngkmax) tensor.
     zeta_all_sh = NamedSharding(mesh_xy, P(None, ('x', 'y'), None))
     v_all_sh = NamedSharding(mesh_xy, P(None, None))
 
-    n_chunks = ngkmax // g_chunk
+    n_chunks = -(-int(ngkmax) // int(g_chunk))
+    last_start = int(ngkmax) - int(g_chunk)
+    p_x, p_y = int(mesh_xy.shape['x']), int(mesh_xy.shape['y'])
 
-    @partial(jax.jit, donate_argnums=(0, 1))
-    def fn(V_acc, g0_acc, zeta_L_all, zeta_R_all, v_q_all, q_idx):
-        q_idx_32 = q_idx.astype(jnp.int32)
-        zero32 = jnp.int32(0)
+    def _panel_contract(face_L, face_R, v_q):
+        """Per rank: V_q[μ_L/p_x, μ_R/p_y] from one G panel per scan step.
 
-        zeta_L_all = jax.lax.with_sharding_constraint(
-            zeta_L_all, zeta_all_sh)
-        zeta_R_src_all = zeta_L_all if same_zeta else (
-            jax.lax.with_sharding_constraint(zeta_R_all, zeta_all_sh))
-        v_q_all = jax.lax.with_sharding_constraint(v_q_all, v_all_sh)
+        The panel all-gathers are written inside the scan body, in manual
+        (``shard_map``) mode, so no partitioner can hoist them to a whole-face
+        gather ahead of the loop — which is exactly what the same loop
+        written with ``with_sharding_constraint`` compiled to (measured in the
+        CPU 2x2 HLO and as 1.4 s/q on VI3 P16, 2026-09-23).
+        """
+        col = jnp.arange(g_chunk, dtype=jnp.int32)
+        V0 = mark_varying(jnp.zeros((n_rmu_L // p_x, n_rmu_R // p_y),
+                                    dtype=face_L.dtype), ('x', 'y'))
 
-        # Per-q slices off the TRACED q.  ``zeta_*_q`` are (1, n_rmu_*,
-        # ngkmax); the size-1 q axis is dropped immediately below.
-        zeta_L_q = jax.lax.dynamic_slice_in_dim(
-            zeta_L_all, q_idx_32, 1, axis=0)
-        # Drop the size-1 q axis FIRST, then reshard the real (μ, G) tensor to
-        # μ-on-x (L) / μ-on-y (R).  The previous code staged through
-        # P(('x','y'), None) — sharding the size-1 q axis over all 4 devices —
-        # which XLA cannot reshard to the μ-sharded layout, so it fell back to a
-        # full replicate-then-repartition ("[SPMD] Involuntary full
-        # rematerialization" on the V_q g-flat tensor).  Indexing [0] first
-        # keeps the reshard on the μ axis (a clean all-to-all / all-gather).
-        # THIS ORDER IS THE POINT — do not fold the [0] into the slice's
-        # sharding constraint.
-        #
-        # ONE ``[0]`` PER SLAB, BOUND TO A NAME, and in the same_zeta case
-        # the two operands share it; then an ``optimization_barrier`` on the
-        # (μ, ngkmax) face.  Both are there for the same measured reason and
-        # neither is cosmetic.  The (1, μ, G) slice has a degenerate leading
-        # axis, so XLA is free to prefer the ``{2,0,1}`` minor-to-major for
-        # it — which is a genuinely different physical layout for the
-        # (n_q, μ, G) slab it is sliced from — and it answers by copying the
-        # WHOLE parameter into that layout, once per call.  Measured in the
-        # optimized HLO on a 2×2 CPU mesh: two ``c128[n_q,μ/p,ngkmax] copy``
-        # ops on the distinct-ζ tile, one on the shared-ζ tile.  Binding the
-        # squeeze once removes the shared-ζ copy; the barrier removes both,
-        # and costs nothing at run time (it is a scheduling fence, not an op).
-        # The collectives are unchanged either way — 2 all-gather + 1
-        # collective-permute, identical to the eager-slice kernel this
-        # replaced.
-        zeta_L_face = jax.lax.optimization_barrier(zeta_L_q[0])
-        zeta_R_face = (zeta_L_face if same_zeta
-                       else jax.lax.optimization_barrier(
-                           jax.lax.dynamic_slice_in_dim(
-                               zeta_R_src_all, q_idx_32, 1, axis=0)[0]))
-        zeta_L = jax.lax.with_sharding_constraint(zeta_L_face, blk_x_sh)
-        zeta_R = jax.lax.with_sharding_constraint(zeta_R_face, blk_y_sh)
-        v_q = jax.lax.with_sharding_constraint(
-            jax.lax.dynamic_slice_in_dim(v_q_all, q_idx_32, 1, axis=0)[0],
-            v_sh)
-
-        V_q = jnp.zeros((n_rmu_L, n_rmu_R), dtype=zeta_L.dtype)
-        V_q = jax.lax.with_sharding_constraint(V_q, V_block_sh)
-
-        # G-chunked accumulation via ``lax.scan`` — compiles once and
-        # executes n_chunks times.  Replaces the historical static
-        # Python loop, which unrolled the HLO ``n_chunks ×`` and grew
-        # compile time linearly with the system size (CrI3 6×6 80 Ry
-        # has n_chunks ~ 14; MoS2 3×3 has 1).  See module docstring
-        # for the math: ``V[μ,ν] += conj(L_chunk) · v · R_chunkᵀ``.
+        # V[μ,ν] += conj(L_panel) · v · R_panelᵀ, one G panel per step.
         def _g_chunk_body(V_carry, i):
-            start = i * g_chunk
-            L_chunk = jax.lax.dynamic_slice_in_dim(
-                zeta_L, start, g_chunk, axis=-1)        # (n_rmu_L/p_x, g_chunk)
-            R_chunk = jax.lax.dynamic_slice_in_dim(
-                zeta_R, start, g_chunk, axis=-1)        # (n_rmu_R/p_y, g_chunk)
+            done = i * g_chunk
+            start = jnp.minimum(done, last_start)
+            L_panel = jax.lax.all_gather(
+                jax.lax.dynamic_slice_in_dim(face_L, start, g_chunk, axis=1),
+                'y', axis=0, tiled=True)                # (n_rmu_L/p_x, g_chunk)
+            R_panel = jax.lax.all_gather(
+                jax.lax.dynamic_slice_in_dim(face_R, start, g_chunk, axis=1),
+                'x', axis=0, tiled=True)                # (n_rmu_R/p_y, g_chunk)
             v_chunk = jax.lax.dynamic_slice_in_dim(
                 v_q, start, g_chunk, axis=0)            # (g_chunk,)
-            L_w = jnp.conj(L_chunk) * v_chunk[None, :]
-            return V_carry + L_w @ R_chunk.T, None
-        V_q, _ = jax.lax.scan(
-            _g_chunk_body, V_q, jnp.arange(n_chunks, dtype=jnp.int32), unroll=1)
-        V_q = jax.lax.with_sharding_constraint(V_q, V_block_sh)
+            v_chunk = jnp.where(start + col >= done, v_chunk,
+                                jnp.zeros_like(v_chunk))
+            L_w = jnp.conj(L_panel) * v_chunk[None, :]
+            return V_carry + L_w @ R_panel.T, None
 
-        V_new = jax.lax.dynamic_update_slice(
-            V_acc, V_q[None, :, :], (q_idx_32, zero32, zero32))
-        V_new = jax.lax.with_sharding_constraint(V_new, V_sh)
+        V_blk, _ = jax.lax.scan(
+            _g_chunk_body, V0, jnp.arange(n_chunks, dtype=jnp.int32),
+            unroll=1)
+        return V_blk
 
-        if write_g0:
-            g0_q = zeta_L[:, 0]                          # (n_rmu_L/p_x,)
-            g0_q = jax.lax.with_sharding_constraint(g0_q, g0_block_sh)
-            g0_new = jax.lax.dynamic_update_slice(
-                g0_acc, g0_q[None, :], (q_idx_32, zero32))
-            g0_new = jax.lax.with_sharding_constraint(g0_new, g0_sh)
-        else:
-            g0_new = g0_acc
+    panel_contract = shard_map(
+        _panel_contract, mesh=mesh_xy,
+        in_specs=(P(('x', 'y'), None), P(('y', 'x'), None), P(None)),
+        out_specs=P('x', 'y'))
 
+    @partial(jax.jit, donate_argnums=(0, 1))
+    def fn(V_acc, g0_acc, zeta_L_tile, zeta_R_tile, v_tile, q0):
+        q0_32 = q0.astype(jnp.int32)
+        zero32 = jnp.int32(0)
+
+        zeta_L_tile = jax.lax.with_sharding_constraint(zeta_L_tile, zeta_all_sh)
+        zeta_R_src = zeta_L_tile if same_zeta else (
+            jax.lax.with_sharding_constraint(zeta_R_tile, zeta_all_sh))
+        v_tile = jax.lax.with_sharding_constraint(v_tile, v_all_sh)
+
+        def _one_q(carry, j):
+            V_acc, g0_acc = carry
+            # Drop the size-1 q axis FIRST, then work on the real (μ, G)
+            # tensor.  Staging through P(('x','y'), None) on the (1, μ, G)
+            # slice — sharding the size-1 q axis — is what XLA cannot
+            # reshard to a μ-sharded layout; it fell back to a full
+            # replicate-then-repartition ("[SPMD] Involuntary full
+            # rematerialization" on the V_q g-flat tensor).  THIS ORDER IS
+            # THE POINT — do not fold the [0] into a sharding constraint.
+            #
+            # ONE ``[0]`` PER SLAB, BOUND TO A NAME (shared by both operands
+            # when same_zeta), then an ``optimization_barrier`` on the
+            # (μ, ngkmax) face.  The (1, μ, G) slice has a degenerate leading
+            # axis, so XLA may prefer a ``{2,0,1}`` minor-to-major for it — a
+            # different physical layout for the slab it is sliced from — and
+            # answers by copying the WHOLE slab parameter into that layout
+            # once per call (measured on the whole-slab kernel: two
+            # ``c128[n_q,μ/p,ngkmax] copy`` ops distinct-ζ, one shared-ζ).
+            # The barrier is a scheduling fence, not an op.
+            face_L = jax.lax.optimization_barrier(
+                jax.lax.dynamic_slice_in_dim(zeta_L_tile, j, 1, axis=0)[0])
+            face_R = (face_L if same_zeta
+                      else jax.lax.optimization_barrier(
+                          jax.lax.dynamic_slice_in_dim(
+                              zeta_R_src, j, 1, axis=0)[0]))
+            face_L = jax.lax.with_sharding_constraint(face_L, face_sh)
+            face_R = jax.lax.with_sharding_constraint(face_R, face_yx_sh)
+            v_q = jax.lax.with_sharding_constraint(
+                jax.lax.dynamic_slice_in_dim(v_tile, j, 1, axis=0)[0], v_sh)
+
+            V_q = panel_contract(face_L, face_R, v_q)   # (μ_L, μ_R) P('x','y')
+
+            q_32 = q0_32 + j
+            V_acc = jax.lax.dynamic_update_slice(
+                V_acc, V_q[None, :, :], (q_32, zero32, zero32))
+            V_acc = jax.lax.with_sharding_constraint(V_acc, V_sh)
+            if write_g0:
+                g0_q = jax.lax.with_sharding_constraint(
+                    face_L[:, 0], g0_block_sh)          # (n_rmu_L/p_x,)
+                g0_acc = jax.lax.dynamic_update_slice(
+                    g0_acc, g0_q[None, :], (q_32, zero32))
+                g0_acc = jax.lax.with_sharding_constraint(g0_acc, g0_sh)
+            return (V_acc, g0_acc), None
+
+        (V_new, g0_new), _ = jax.lax.scan(
+            _one_q, (V_acc, g0_acc), jnp.arange(q_tile, dtype=jnp.int32),
+            unroll=1)
         return V_new, g0_new
 
-    _PER_Q_KERNEL_CACHE[key] = fn
+    _Q_TILE_KERNEL_CACHE[key] = fn
     return fn
 
 
@@ -315,130 +336,224 @@ def _resolve_ibz_q_list(*, sym, centroid_indices, kgrid, fft_grid,
     return (*result, res) if return_resolution else result
 
 
-def _pick_g_chunk(ngkmax: int, target: int = 4096) -> int:
-    """Largest divisor of ``ngkmax`` that is ≤ ``target``."""
-    for c in range(min(target, int(ngkmax)), 0, -1):
-        if ngkmax % c == 0:
-            return int(c)
-    return int(ngkmax)
+#: Upper bound on the automatic G panel width.  With the panel gathers inside
+#: the G scan this is also the per-step collective width, so it is capped by
+#: the collective payload bound as well (``_plan_vq_tiles``).
+_VQ_G_CHUNK_TARGET = 4096
 
 
-def _make_read_all_ibz(zeta_loader, n_rmu_padded: int, mesh_xy: Mesh):
-    """Return ``read_all_ibz(n_q_ibz) -> (n_q_ibz, n_rmu_padded, ngkmax)``.
+def vq_tile_bytes(*, n_q: int, n_rmu_L: int, n_rmu_R: int, ngkmax: int,
+                  same_zeta: bool, n_sub: int, p_x: int, p_y: int,
+                  g_chunk: int) -> dict:
+    """Per-rank bytes of one V tile's contraction; the V_q memory model.
 
-    One read shape: ``ZetaLoader.read_zeta_G_slab`` at ``n_rmu_padded``
-    rows.  SlabIO zero-fills past the dataset's own μ extent
-    (decisions.md 2026-08-04), so the caller states the extent it wants
-    to consume and nothing else.
-    The batched single-call form avoids the ``n_q_ibz`` separate
-    ``read_slab`` closures (each one a distinct
-    ``_FfiBackend.read_slab.<locals>._per_rank`` closure id) that would
-    each cost a JAX trace cache miss.
+    complex128, ``P = p_x·p_y``, μ extents already mesh-padded::
+
+        resident = V_acc 16·n_q·μ_L·μ_R/P + g0_acc 16·n_q·μ_L/p_x
+                 + one-leg columns 16·n_q·μ_L·n_sub/P
+        per_q    = ζ rows 16·(μ_L [+ μ_R])·n_G/P + v row 16·n_G (replicated)
+        host_per_q = ζ rows 16·(μ_L [+ μ_R])·n_G/P  (phdf5 host read staging)
+        work     = faces 16·(μ_L + μ_R [+ μ_R])·n_G/P  (the sliced face(s)
+                   and the ('y','x') permute of the R face)
+                 + V_q carry 2·16·μ_L·μ_R/P
+                 + panels 16·g·(2·μ_L/p_x + μ_R/p_y)   (L, L·v, R)
+
+    The single owner of these terms: ``_plan_vq_tiles`` sizes the run from
+    them and ``gflat_memory_model`` prices its V_q stage E with them.
     """
-    def read_all_ibz(n_q_ibz: int) -> jax.Array:
+    c = 16.0
+    p_all = int(p_x) * int(p_y)
+    rows = n_rmu_L + (0 if same_zeta else n_rmu_R)
+    faces = n_rmu_L + n_rmu_R + (0 if same_zeta else n_rmu_R)
+    panel_col = c * (2.0 * n_rmu_L / p_x + n_rmu_R / p_y)
+    fixed = c * (faces * ngkmax / p_all + 2.0 * n_rmu_L * n_rmu_R / p_all)
+    return dict(
+        resident=c * (n_q * n_rmu_L * n_rmu_R / p_all + n_q * n_rmu_L / p_x
+                      + n_q * n_rmu_L * n_sub / p_all),
+        per_q=c * (rows * ngkmax / p_all + ngkmax),
+        host_per_q=c * rows * ngkmax / p_all,
+        fixed_work=fixed, panel_col=panel_col,
+        work=fixed + panel_col * int(g_chunk))
+
+
+def _plan_vq_tiles(*, n_q: int, n_rmu_L: int, n_rmu_R: int, ngkmax: int,
+                   same_zeta: bool, n_sub: int, mesh_xy: Mesh,
+                   g_chunk: int | None, budget_bytes: float,
+                   host_budget_bytes: float = float('inf')):
+    """Size the G panel and the ζ q-tile of one V tile from the V_q memory budget.
+
+    Bytes are :func:`vq_tile_bytes`.  ``g`` (0/None = auto) is the largest
+    width ≤ ``_VQ_G_CHUNK_TARGET`` whose widest per-step panel all-gather
+    fits ``LORRAX_COLLECTIVE_CHUNK_MB`` and whose panels take at most half of
+    what one q leaves free; an explicit ``g_chunk`` (deck
+    ``vq_g_chunk_size``) is used as given.  The q-tile is then every q that
+    fits the device budget and whose read staging, ``host_per_q`` per q,
+    fits ``host_budget_bytes`` (``_vq_host_staging_bytes``) — all of them
+    whenever they do, which is the whole-slab read — balanced so the last
+    tile is not a sliver.  Every input is
+    rank-invariant (the caller agrees the budget across processes), so every
+    rank issues the same collective reads.
+
+    Returns ``(q_tile, g_chunk, priced)``; refuses when V_acc plus one q
+    does not fit, the only case no tile or panel choice can rescue.
+    """
+    from common.collectives import _owner_gather_chunk_bytes
+
+    p_x, p_y = int(mesh_xy.shape['x']), int(mesh_xy.shape['y'])
+    shape = dict(n_q=n_q, n_rmu_L=n_rmu_L, n_rmu_R=n_rmu_R, ngkmax=ngkmax,
+                 same_zeta=same_zeta, n_sub=n_sub, p_x=p_x, p_y=p_y)
+    b = vq_tile_bytes(**shape, g_chunk=0)
+    if g_chunk:
+        g = min(int(g_chunk), int(ngkmax))
+        if g < 1:
+            raise ValueError(f"vq_g_chunk_size must be positive; got {g_chunk}.")
+    else:
+        widest_row = 16.0 * max(n_rmu_L / p_x, n_rmu_R / p_y)
+        g = min(int(ngkmax), _VQ_G_CHUNK_TARGET,
+                max(1, int(_owner_gather_chunk_bytes() // widest_row)))
+        free = budget_bytes - b['resident'] - b['per_q'] - b['fixed_work']
+        g = max(1, min(g, int(0.5 * free // b['panel_col'])))
+    b = vq_tile_bytes(**shape, g_chunk=g)
+    resident, per_q, work = b['resident'], b['per_q'], b['work']
+    host_per_q = b['host_per_q']
+    q_fit = int(min((budget_bytes - resident - work) // per_q,
+                    host_budget_bytes // host_per_q, n_q))
+    if q_fit < 1:
+        raise ValueError(
+            "GATE vq_tile_budget: "
+            f"got V_acc/g0/one-leg {resident / 1e9:.2f} GB + one q "
+            f"{per_q / 1e9:.2f} GB + faces/panels {work / 1e9:.2f} GB per rank; "
+            f"want <= the V_q budget {budget_bytes / 1e9:.2f} GB, and one q's "
+            f"host read staging {host_per_q / 1e9:.2f} GB <= "
+            f"{host_budget_bytes / 1e9:.2f} GB; "
+            "why: the output accumulator and one q's ζ face cannot both be "
+            "resident, so no q-tile or G-panel choice can run this tile; "
+            "fix: add ranks (every term above is ÷P) or free device memory "
+            "before V_q.")
+    q_max = min(int(n_q), q_fit)
+    n_tiles = -(-int(n_q) // q_max)
+    q_tile = -(-int(n_q) // n_tiles)
+    priced = resident + work + q_tile * per_q
+    return q_tile, g, dict(resident=resident, per_q=per_q, work=work,
+                           priced=priced, n_tiles=n_tiles,
+                           host_staged=q_tile * host_per_q)
+
+
+def _vq_budget_bytes(budget_bytes: float | None) -> float:
+    """The per-rank V_q device budget, agreed across processes (the minimum).
+
+    ``None`` measures it live: ``common.gpu_utils.get_device_memory_info``
+    ``budget_gb`` (0.9 of this device's currently available memory), the
+    same rule the gw_init ``V_q budget`` line prints.  The q-tile count sets
+    how many collective reads every rank issues, so the value must be the
+    same on every rank; the minimum is the only safe agreement.
+    """
+    from common.gpu_utils import get_device_memory_info, minimum_process_budget_gb
+    if budget_bytes is None:
+        local_gb = float(get_device_memory_info()['budget_gb'])
+    else:
+        local_gb = float(budget_bytes) / 1e9
+    return minimum_process_budget_gb(local_gb) * 1e9
+
+
+def _vq_host_staging_bytes() -> float:
+    """Per-rank host bytes one ζ q-tile read may stage, agreed across processes.
+
+    The phdf5 read stages each rank's slab in its file context's host
+    buffer (``ctx->read_buf``, ``src/ffi/cpp/phdf5/context.cc``), which is
+    kept at the largest read until the context closes; the V tile releases
+    it when done (``ZetaLoader.release_read_staging``), so what a tile may
+    stage is 0.9 of the node's live ``MemAvailable`` over the processes
+    sharing the node.
+    """
+    import socket
+    import zlib
+    from common.collectives import all_gather_processes
+    from common.gpu_utils import (get_host_memory_available_gb,
+                                  minimum_process_budget_gb)
+    avail_gb = get_host_memory_available_gb()
+    host = zlib.crc32(socket.gethostname().encode())
+    hosts = np.asarray(all_gather_processes(np.asarray(host, dtype=np.int64)))
+    per_node = max(1, int(np.sum(hosts == host)))
+    local_gb = (float('inf') if avail_gb is None
+                else 0.9 * avail_gb / per_node)
+    return minimum_process_budget_gb(min(local_gb, 1e12)) * 1e9
+
+
+def _make_read_q_tile(zeta_loader, n_rmu_padded: int, mesh_xy: Mesh):
+    """Return ``read_q_tile(q_offset, q_count) -> (q_count, n_rmu_padded, ngkmax)``.
+
+    One read shape per tile: ``ZetaLoader.read_zeta_G_slab`` at
+    ``n_rmu_padded`` rows.  SlabIO zero-fills past the dataset's own μ
+    extent (decisions.md 2026-08-04), so the caller states the extent it
+    wants to consume and nothing else.  One call per q-TILE, not per q:
+    each ``read_slab`` call is a fresh ``_per_rank`` closure and a trace
+    cache miss in the FFI dispatch (2026-05-12: 63 per-q reads on the MoS2
+    3×3 bispinor deck became 7 whole-slab reads), and the tile count is 1
+    whenever every q fits the budget.
+    """
+    def read_q_tile(q_offset: int, q_count: int) -> jax.Array:
         return zeta_loader.read_zeta_G_slab(
-            q_offset=0, q_count=int(n_q_ibz),
+            q_offset=int(q_offset), q_count=int(q_count),
             mu_offset=0, mu_count=int(n_rmu_padded),
             mesh=mesh_xy,
         )
 
-    return read_all_ibz
+    return read_q_tile
+
+
+def _one_leg_columns(gvec_components, *, sym, sym_idx, q_irr_frac, kgrid):
+    """``(n_q_ibz, n_sub)`` parent-sphere slots the IBZ one-leg unfold reads.
+
+    ``symmetry_maps.isdf_one_leg_source_slots`` names the slot of every full
+    q's literal-G=0 coefficient; a parent keeps the distinct slots of its
+    star, padded to a common ``n_sub`` with the lowest slots the star does
+    not use.  Those are genuine sphere columns whose G the star does not
+    need, so on the sub-sphere the service finds every needed G exactly once
+    and gathers the same coefficients it would from the whole sphere.
+    """
+    from symmetry_maps import isdf_one_leg_source_slots
+    slots = isdf_one_leg_source_slots(
+        gvec_components, sym=sym, sym_idx=sym_idx,
+        q_irr_frac=q_irr_frac, kgrid=kgrid)
+    parent = np.asarray(sym.irr_idx_q, dtype=np.int32)
+    n_q, _, n_G = (int(s) for s in np.shape(gvec_components))
+    need = [np.unique(slots[parent == p]) for p in range(n_q)]
+    n_sub = max(1, max(len(cols) for cols in need))
+    out = np.empty((n_q, n_sub), dtype=np.int32)
+    for p, cols in enumerate(need):
+        filler = np.setdiff1d(np.arange(n_G, dtype=np.int32), cols)
+        out[p] = np.concatenate([cols, filler[:n_sub - len(cols)]])
+    return out
+
+
+_ONE_LEG_TAKE_CACHE: dict = {}
+
+
+def _one_leg_take(mesh_xy: Mesh):
+    """Cached ``(take, stack)`` jits for the per-tile one-leg column carrier."""
+    hit = _ONE_LEG_TAKE_CACHE.get(id(mesh_xy))
+    if hit is not None:
+        return hit
+    sh = NamedSharding(mesh_xy, P(None, ('x', 'y'), None))
+    cols_sh = NamedSharding(mesh_xy, P(None, None))
+
+    @partial(jax.jit, in_shardings=(sh, cols_sh), out_shardings=sh)
+    def take(zeta_tile, cols):
+        # G is unsharded, so this gather is local to every rank.
+        return jnp.take_along_axis(zeta_tile, cols[:, None, :], axis=2)
+
+    @partial(jax.jit, out_shardings=sh)
+    def stack(parts):
+        return jnp.concatenate(parts, axis=0)
+
+    _ONE_LEG_TAKE_CACHE[id(mesh_xy)] = (take, stack)
+    return take, stack
 
 
 # ---------------------------------------------------------------------------
 # Per-tile core (one (μ_L, ν_L) tile)
 # ---------------------------------------------------------------------------
-
-def _contract_v_from_loader(
-        zeta_L_loader, zeta_R_loader, V_acc, g0_acc, v_q_dev, *, mesh_xy,
-        n_rmu_L_padded, n_rmu_R_padded, ngkmax, g_chunk, write_g0, use_ibz,
-        same_zeta, n_q_ibz, timing_label, verbose):
-    """V_q from a ζ file: read the IBZ slabs once, contract per q (the file route)."""
-    kernel = _make_per_q_kernel(
-        mesh_xy, n_rmu_L_padded, n_rmu_R_padded, ngkmax, g_chunk,
-        # On an IBZ the literal full-zone G=0 may be a nonzero parent G;
-        # selecting disk slot zero inside this kernel is therefore unsafe.
-        # The service action below reads the exact parent slot while the
-        # same zeta slab is still resident.
-        write_g0=bool(write_g0 and not use_ibz), same_zeta=same_zeta)
-
-    read_L = _make_read_all_ibz(zeta_L_loader, n_rmu_L_padded, mesh_xy)
-    read_R = (read_L if same_zeta
-              else _make_read_all_ibz(zeta_R_loader, n_rmu_R_padded, mesh_xy))
-
-    # ---- Pre-read all IBZ ζ̃ slabs in ONE batched call ---------------
-    # The historical per-q PHDF5 read inside the kernel loop interleaved
-    # with NCCL collectives and was the root cause of the async-prefetch
-    # deadlock.  At MoS2 3×3 the full ζ̃_L is ~50 MB / rank; at CrI3 6×6
-    # 80 Ry it's ~0.8 GB / rank — both comfortable.
-    #
-    # 2026-05-12: switched from ``concatenate([read_L(q) for q in ...])``
-    # (n_q_ibz separate ``read_slab`` calls; each one created a fresh
-    # ``_per_rank`` closure and triggered a JAX trace-cache miss in the
-    # FFI shard_map dispatch) to ONE batched ``read_all_ibz`` call.
-    # Net effect on MoS2 3×3 bispinor: 63 read_slab calls (9 q × 7 tiles)
-    # → 7 calls; the corresponding ``jit__per_rank`` retraces drop from
-    # ~63 to 7.
-    import time as _t
-    _read_t0 = _t.perf_counter()
-    zeta_L_all = read_L(n_q_ibz)                            # (n_q_ibz, n_rmu_L_padded, ngkmax)
-    if same_zeta:
-        zeta_R_all = zeta_L_all
-    else:
-        zeta_R_all = read_R(n_q_ibz)
-    jax.block_until_ready(zeta_L_all)
-    if not same_zeta:
-        jax.block_until_ready(zeta_R_all)
-    _read_total = _t.perf_counter() - _read_t0
-    if verbose and jax.process_index() == 0:
-        print(f"    [{timing_label}] pre-read all {n_q_ibz} IBZ ζ̃ slabs "
-              f"(1 batched call): {_read_total:.2f}s", flush=True)
-
-    # ---- Per-q kernel loop on device-resident ζ̃ ---------------------
-    # The loop hands the kernel the WHOLE slabs and a traced q; the three
-    # per-q slices (ζ_L, ζ_R, v_q) happen inside its jit.  What used to be
-    # here was the eager form of exactly those slices — one or two
-    # ``dynamic_slice_in_dim`` executables and a ``v_q_dev[q]`` gather per
-    # iteration, outside any jit, plus a host→device transfer for the loop
-    # counter.
-    #
-    # THE SYNC AND THE SLICES MOVED TOGETHER, and the order matters.  The
-    # ``block_until_ready`` below is vestigial as a correctness device: it
-    # landed in ac735cca8 when the loop body still did a collective PHDF5
-    # read per q, and ordered the kernel before the next read; 0880066a1
-    # hoisted that read into ``read_all_ibz`` above and left the sync
-    # behind.  But while the slices were still eager it was also the only
-    # backpressure on them — drop it alone and up to n_q live
-    # ``(1, n_rmu_L_padded, ngkmax)`` temporaries queue, a second copy of
-    # ζ_L (3.28 GB global at CrI3 6×6 80 Ry).  With the slices inside the
-    # executable there is nothing left to queue: the donated (V_acc, g0_acc)
-    # chain makes each call depend on the previous one's output, so the
-    # executions serialise on their own and the transients live and die
-    # inside one program.  What is left for the sync to do is make the
-    # per-q number below a KERNEL time rather than a dispatch time — so it
-    # is gated on the same condition as the print it feeds.
-    #
-    # Multiplier for both: ``v_q_bispinor`` calls this function once per
-    # UNIQUE_TILE, so the counts here are per tile (7 tiles × 9 q = 63
-    # syncs on the MoS2 3×3 bispinor deck).
-    _time_each_q = bool(verbose) and jax.process_index() == 0
-    # Hoisted: ``jnp.int32(q)`` inside the loop was a host→device transfer
-    # per iteration.
-    q_idx_dev = [jnp.int32(q) for q in range(n_q_ibz)]
-    for q in range(n_q_ibz):
-        _t1 = _t.perf_counter()
-        V_acc, g0_acc = kernel(
-            V_acc, g0_acc, zeta_L_all, zeta_R_all, v_q_dev, q_idx_dev[q])
-        # The wait consumes a sharded accumulator, so it cannot sit under
-        # the rank-0 timing gate.  All processes rendezvous; only rank 0
-        # formats the diagnostic (INVARIANTS row 21).
-        jax.block_until_ready(V_acc)
-        if _time_each_q:
-            print(f"    [{timing_label}] q={q}/{n_q_ibz}: "
-                  f"kernel={_t.perf_counter() - _t1:.2f}s", flush=True)
-
-    return V_acc, g0_acc, zeta_L_all, zeta_R_all
-
 
 def _compute_V_q_g_flat_one_tile(
     zeta_L_loader,
@@ -455,8 +570,14 @@ def _compute_V_q_g_flat_one_tile(
     source_component: int | None = None,
     timing_label: str,
     verbose: bool,
+    budget_bytes: float | None = None,
 ) -> tuple[jax.Array, jax.Array | None]:
-    """Contract one q-parent V tile and its separately transported full-q G=0 leg."""
+    """Contract one q-parent V tile and its separately transported full-q G=0 leg.
+
+    ``budget_bytes`` is the per-rank V_q memory allowance that sizes the ζ
+    q-tile and the G panel (``_plan_vq_tiles``); ``None`` measures it live
+    (``_vq_budget_bytes``).  Either way it is agreed across processes.
+    """
     same_zeta = (zeta_R_loader is None) or (zeta_R_loader is zeta_L_loader)
     # ``n_rmu_*`` is the logical centroid count for each side — read off the
     # loader so callers don't repeat themselves.
@@ -531,13 +652,6 @@ def _compute_V_q_g_flat_one_tile(
             f"v_per_G_builder returned shape {v_q_table.shape}; "
             f"expected ({n_q_ibz}, {ngkmax}).")
 
-    g_chunk = int(g_chunk) if g_chunk else _pick_g_chunk(ngkmax)
-    if ngkmax % g_chunk != 0:
-        raise ValueError(
-            f"_compute_V_q_g_flat_one_tile[{timing_label}]: g_chunk="
-            f"{g_chunk} does not divide ngkmax={ngkmax}.")
-    n_chunks = ngkmax // g_chunk
-
     # ---- μ padding to mesh-product per side ---------------------------
     # ``padded_mu_extent`` = the same round-up (+ test-only
     # LORRAX_EXTRA_MU_PAD rows) as ``Meta.n_rmu_padded`` — the V tiles
@@ -547,6 +661,27 @@ def _compute_V_q_g_flat_one_tile(
         return padded_mu_extent(int(n), mesh_xy)
     n_rmu_L_padded = _pad(int(n_rmu_L))
     n_rmu_R_padded = _pad(int(n_rmu_R))
+
+    # ---- IBZ one-leg columns (literal full-zone G=0) -------------------
+    # On an IBZ the literal full-zone G=0 may be a nonzero parent G, so the
+    # kernel's slot-zero g0 is unsafe there.  The symmetry service names the
+    # parent slots it will read; each q-tile contributes just those columns,
+    # and the whole slab never has to outlive its tile for the unfold.
+    one_leg = bool(write_g0 and use_ibz)
+    one_leg_cols = (_one_leg_columns(
+        gvec_components, sym=sym, sym_idx=unfold_sym,
+        q_irr_frac=q_irr_frac, kgrid=kgrid) if one_leg else None)
+    n_sub = int(one_leg_cols.shape[1]) if one_leg else 0
+
+    # ---- G panel and q-tile from the V_q budget ------------------------
+    budget = _vq_budget_bytes(budget_bytes)
+    host_budget = _vq_host_staging_bytes()
+    q_tile, g_chunk, priced = _plan_vq_tiles(
+        n_q=n_q_ibz, n_rmu_L=n_rmu_L_padded, n_rmu_R=n_rmu_R_padded,
+        ngkmax=ngkmax, same_zeta=same_zeta, n_sub=n_sub, mesh_xy=mesh_xy,
+        g_chunk=g_chunk, budget_bytes=budget, host_budget_bytes=host_budget)
+    n_chunks = -(-ngkmax // g_chunk)
+    n_tiles = int(priced['n_tiles'])
     if verbose and jax.process_index() == 0:
         print(f"  V_q g-flat [{timing_label}]: n_q_ibz={n_q_ibz}, "
               f"ngkmax={ngkmax}, g_chunk={g_chunk} ({n_chunks}/q), "
@@ -554,26 +689,34 @@ def _compute_V_q_g_flat_one_tile(
               f"n_rmu_R={n_rmu_R}→{n_rmu_R_padded}, "
               f"storage={'q-IBZ' if use_ibz else 'full-BZ'}",
               flush=True)
+        print(f"  V_q plan [{timing_label}]: q_tile={q_tile} "
+              f"({n_tiles} tile(s)), priced {priced['priced'] / 1e9:.2f} GB/rank "
+              f"= resident {priced['resident'] / 1e9:.2f} + "
+              f"{q_tile}×{priced['per_q'] / 1e9:.3f} ζ/q + faces/panels "
+              f"{priced['work'] / 1e9:.2f}, budget {budget / 1e9:.2f} GB; "
+              f"host read staging {priced['host_staged'] / 1e9:.2f} of "
+              f"{host_budget / 1e9:.2f} GB/rank",
+              flush=True)
 
-    # ---- Accumulators + v_q on device --------------------------------
+    # ---- Accumulators ---------------------------------------------------
     V_sh = NamedSharding(mesh_xy, P(None, 'x', 'y'))
     V_acc = jax.jit(lambda: jnp.zeros(
         (n_q_ibz, n_rmu_L_padded, n_rmu_R_padded), dtype=jnp.complex128),
         out_shardings=V_sh)()
     # ``g0_acc`` is also the donate-target when ``write_g0=False`` — the
-    # per-q kernel still needs the buffer; the contents are simply unread.
+    # kernel still needs the buffer; the contents are simply unread.
     g0_sh = NamedSharding(mesh_xy, P(None, 'x'))
     g0_acc = jax.jit(lambda: jnp.zeros(
         (n_q_ibz, n_rmu_L_padded), dtype=jnp.complex128),
         out_shardings=g0_sh)()
     # Process-local placement, NOT plain ``jax.device_put``: the latter
     # fires JAX's hidden ``assert_equal`` all-gather on a multi-process
-    # mesh — P × nq × ngkmax × 8 B of pure assertion traffic (scorecard
-    # AA.1).  ``v_q_table`` is a pure function of the q-grid + cutoff,
-    # identical on every rank; ``LORRAX_CHECK_REPLICA=1`` re-arms the check.
+    # mesh (scorecard AA.1).  The v(q+G) rows are a pure function of the
+    # q-grid + cutoff, identical on every rank; ``LORRAX_CHECK_REPLICA=1``
+    # re-arms the check.  Placed per tile, so the replicated v table is
+    # bounded by the tile too.
     from common.collectives import device_put_process_local
-    v_q_dev = device_put_process_local(
-        v_q_table, NamedSharding(mesh_xy, P(None, None)))
+    v_rows_sh = NamedSharding(mesh_xy, P(None, None))
 
     if hasattr(zeta_L_loader, 'contract_v'):
         # The μ-batch fit's ζ (Z store + C⁺, isdf.zeta_mubatch.ZetaG): V is
@@ -590,24 +733,91 @@ def _compute_V_q_g_flat_one_tile(
                 f"_compute_V_q_g_flat_one_tile[{timing_label}]: in-memory V "
                 f"{tuple(V_acc.shape)} != {(n_q_ibz, n_rmu_L_padded, n_rmu_L_padded)}")
         V_acc = jax.lax.with_sharding_constraint(V_acc, V_sh)
-        zeta_L_all = zeta_L_loader.shell
-        gvec_components = zeta_L_loader.shell_gvec
-        if write_g0 and not use_ibz:
-            g0_acc = jax.lax.with_sharding_constraint(zeta_L_all[:, :, 0], g0_sh)
-        same_zeta = True
-        zeta_R_all = zeta_L_all
+        shell = zeta_L_loader.shell                      # (n_q_ibz, μ_pad, n_shell)
+        if one_leg:
+            take_cols, stack_cols = _one_leg_take(mesh_xy)
+            one_leg_parts = [take_cols(shell, device_put_process_local(
+                zeta_L_loader.head_columns(one_leg_cols),
+                NamedSharding(mesh_xy, P(None, None))))]
+        elif write_g0 and not use_ibz:
+            g0_acc = jax.lax.with_sharding_constraint(shell[:, :, 0], g0_sh)
     else:
-        V_acc, g0_acc, zeta_L_all, zeta_R_all = _contract_v_from_loader(
-            zeta_L_loader, zeta_R_loader, V_acc, g0_acc, v_q_dev,
-            mesh_xy=mesh_xy, n_rmu_L_padded=n_rmu_L_padded,
-            n_rmu_R_padded=n_rmu_R_padded, ngkmax=ngkmax, g_chunk=g_chunk,
-            write_g0=write_g0, use_ibz=use_ibz, same_zeta=same_zeta,
-            n_q_ibz=n_q_ibz, timing_label=timing_label, verbose=verbose)
+        read_L = _make_read_q_tile(zeta_L_loader, n_rmu_L_padded, mesh_xy)
+        read_R = (read_L if same_zeta
+                  else _make_read_q_tile(zeta_R_loader, n_rmu_R_padded, mesh_xy))
+        take_cols, stack_cols = _one_leg_take(mesh_xy) if one_leg else (None, None)
+        one_leg_parts = []
 
-    if write_g0 and use_ibz:
+        # ---- q-tile loop: read (sync) → contract → next --------------------
+        # THE READ IS SYNCHRONOUS BETWEEN KERNEL CALLS, and that is load-bearing.
+        # The historical per-q PHDF5 read inside the kernel loop interleaved its
+        # MPI collectives with the kernel's NCCL collectives and was the root
+        # cause of the async-prefetch deadlock.  So each tile's read completes
+        # (``block_until_ready``) before its kernel is dispatched, and the kernel
+        # completes before the next tile's read is issued.  With every q in one
+        # tile — whenever they fit the budget — this is the old single batched
+        # pre-read followed by one kernel launch.
+        #
+        # Multiplier: ``v_q_bispinor`` calls this function once per UNIQUE_TILE,
+        # so the counts here are per V tile (7 tiles × n_tiles reads).
+        import time as _t
+        _read_total = 0.0
+        _kernel_total = 0.0
+        for t in range(n_tiles):
+            q0 = t * q_tile
+            qn = min(q_tile, n_q_ibz - q0)
+            _t0 = _t.perf_counter()
+            zeta_L_tile = read_L(q0, qn)                    # (qn, n_rmu_L_padded, ngkmax)
+            zeta_R_tile = zeta_L_tile if same_zeta else read_R(q0, qn)
+            jax.block_until_ready(zeta_L_tile)
+            if not same_zeta:
+                jax.block_until_ready(zeta_R_tile)
+            _t1 = _t.perf_counter()
+            _read_total += _t1 - _t0
+            kernel = _make_q_tile_kernel(
+                mesh_xy, n_rmu_L_padded, n_rmu_R_padded, ngkmax, g_chunk, qn,
+                write_g0=bool(write_g0 and not use_ibz), same_zeta=same_zeta)
+            v_tile = device_put_process_local(
+                np.ascontiguousarray(v_q_table[q0:q0 + qn]), v_rows_sh)
+            V_acc, g0_acc = kernel(
+                V_acc, g0_acc, zeta_L_tile, zeta_R_tile, v_tile, jnp.int32(q0))
+            if one_leg:
+                one_leg_parts.append(take_cols(
+                    zeta_L_tile, device_put_process_local(
+                        np.ascontiguousarray(one_leg_cols[q0:q0 + qn]),
+                        NamedSharding(mesh_xy, P(None, None)))))
+            # Every process rendezvouses here (the wait consumes a sharded
+            # accumulator, so it cannot sit under the rank-0 print gate;
+            # INVARIANTS row 21); this is also what orders the kernel's NCCL
+            # before the next tile's collective read.
+            jax.block_until_ready(V_acc)
+            _kernel_total += _t.perf_counter() - _t1
+            del zeta_L_tile, zeta_R_tile, v_tile
+            if verbose and jax.process_index() == 0:
+                print(f"    [{timing_label}] q-tile {t + 1}/{n_tiles} "
+                      f"(q {q0}..{q0 + qn - 1}): read={_t1 - _t0:.2f}s "
+                      f"kernel={_t.perf_counter() - _t1:.2f}s "
+                      f"({(_t.perf_counter() - _t1) / qn:.3f}s/q)", flush=True)
+        # The read contexts keep their largest tile staged on the host until the
+        # file closes, and the bispinor build holds four ζ loaders open across
+        # seven V tiles; without this their staging accumulates (VI3 12x12 P16:
+        # host OOM-kill at the fourth file).  Collective, like the reads.
+        zeta_L_loader.release_read_staging()
+        if not same_zeta:
+            zeta_R_loader.release_read_staging()
+        if verbose and jax.process_index() == 0:
+            print(f"    [{timing_label}] {n_q_ibz} IBZ q in {n_tiles} tile(s): "
+                  f"read={_read_total:.2f}s kernel={_kernel_total:.2f}s "
+                  f"({_kernel_total / max(1, n_q_ibz):.3f}s/q)", flush=True)
+
+    if one_leg:
+        zeta_cols = (one_leg_parts[0] if len(one_leg_parts) == 1
+                     else stack_cols(one_leg_parts))
+        del one_leg_parts
         g0_acc = unfold_isdf_one_leg(
-            zeta_L_all,
-            gvec_components=gvec_components,
+            zeta_cols,
+            gvec_components=np.take_along_axis(
+                gvec_components, one_leg_cols[:, None, :], axis=2),
             sym=sym,
             sym_idx=unfold_sym,
             sym_perm=sym_perm,
@@ -618,9 +828,7 @@ def _compute_V_q_g_flat_one_tile(
             component_action=one_leg_action,
             source_component=source_component,
         )
-    del zeta_L_all
-    if not same_zeta:
-        del zeta_R_all
+        del zeta_cols
 
     # ---- IBZ → full-BZ unfold (centroid double-permute) -------------
     if use_ibz:
@@ -706,6 +914,7 @@ def compute_all_V_q_g_flat(
     verbose: bool = True,
     sym=None,
     centroid_indices: np.ndarray | None = None,
+    budget_bytes: float | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     """V_q^{0,0} (charge-channel CC tile) on a G-flat-on-disk ζ file.
 
@@ -783,6 +992,7 @@ def compute_all_V_q_g_flat(
         one_leg_action="scalar",
         timing_label='CC',
         verbose=verbose,
+        budget_bytes=budget_bytes,
     )
 
     from symmetry_maps import unfold_isdf_operator
@@ -903,8 +1113,11 @@ def compute_head_channel_zeta(
         zeta_all = zeta_loader.shell            # (n_q_ibz, mu_pad, n_shell)
         take_sel = zeta_loader.head_columns(np.asarray(table.sel))
     else:
-        read_all = _make_read_all_ibz(zeta_loader, n_rmu_padded, mesh_xy)
-        zeta_all = read_all(n_q_ibz)              # (n_q_ibz, mu_pad, ngkmax)
+        # ponytail: this second consumer still reads every q at once (ζ_all/P
+        # per rank); q-tile it through ``_make_read_q_tile`` like the V_q loop
+        # if a deck with ``mc_average_placement`` or the metal q0 shift needs it.
+        read_all = _make_read_q_tile(zeta_loader, n_rmu_padded, mesh_xy)
+        zeta_all = read_all(0, n_q_ibz)           # (n_q_ibz, mu_pad, ngkmax)
         take_sel = np.asarray(table.sel)
 
     policy = None
@@ -978,5 +1191,6 @@ def compute_head_channel_zeta(
 
 
 __all__ = ["compute_all_V_q_g_flat", "_compute_V_q_g_flat_one_tile",
-            "_resolve_ibz_q_list", "_pick_g_chunk", "_make_read_all_ibz",
+            "vq_tile_bytes",
+            "_resolve_ibz_q_list", "_plan_vq_tiles", "_make_read_q_tile",
             "compute_head_channel_zeta"]

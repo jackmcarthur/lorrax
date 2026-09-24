@@ -292,11 +292,10 @@ def test_the_driving_sigma_is_the_extrapolated_point_of_the_planned_counts():
     """
     path = os.path.join(_SRC, "gw", "ppm_pipeline.py")
     calls = _calls(path, "_extrapolated_point")
-    # The first call drives the even/full Sigma.  A second call now applies
-    # the SAME weights to the even residue so the reported TR-odd component
-    # is an extrapolated difference rather than a mixed-count subtraction.
-    assert len(calls) == 2, (
-        f"expected driving and even-residue calls, got {len(calls)}")
+    # One call: it drives the Sigma.  The even-residue second call went with
+    # the D=0 odd-reference pass (3e06af95).
+    assert len(calls) == 1, (
+        f"expected exactly the driving call, got {len(calls)}")
     for call in calls:
         args = [ast.unparse(a) for a in call.args]
         assert args[1] == "extrap_weights", args

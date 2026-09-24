@@ -11,12 +11,12 @@ use that transverse plan.  The coupled-μ1–3 admission check in `gw_init.py`
 adds its simultaneous live set to the one-channel A–F plan; it does not run a
 second chunk-size search.
 
-Vq has one additional execution chunk outside that plan:
-`vq_g_chunk_size`.  It chunks the G axis of the per-q contraction.
-Zero selects `_pick_g_chunk(ngkmax)`, the largest divisor of `ngkmax` not
-exceeding 4096.  This is a fixed divisibility heuristic, not a budget-derived
-memory-model result.  The deleted r-space Vq path's `mu_chunk_size` and
-`q_batch_size` selectors are not accepted by the live dispatcher.
+Vq sizes its own two execution extents at run time, outside that plan: the
+G-panel width (`vq_g_chunk_size`, zero = automatic) and the ζ q-tile.  Both
+come from the live V_q budget through `gw/v_q_g_flat.py::_plan_vq_tiles`;
+see [Vq G panels and q-tiles](#vq-g-panels-and-q-tiles).  The deleted
+r-space Vq path's `mu_chunk_size` and `q_batch_size` selectors are not
+accepted by the live dispatcher.
 
 Conventions throughout this doc:
 
@@ -53,7 +53,7 @@ Typical ranges (from production datasets):
 | **C_q build + factor (Peak B)** | `P_l`, `P_r`, full-zone `C_q`, selected-Q factor or pseudo-inverse | `M_B = persistent + 16·K·μ²/P + 2·16·n_k·n_s²·μ²/P` |
 | **fit + ζ solve (Peak C)** | larger of the pair-density/r-chunk live set and route-specific solve live set | see [§R-Chunk](#r-chunk-b_r) and [§Solve stage](#solve-stage) |
 | **accumulate_rchunk_to_gflat (Peak D)** | `gflat_acc`, `zeta_chunk`, two FFT-box-sized slots | `M_D = persistent + 16·n_q^disk·μ·B_r/P + 2·16·cs·n_r` |
-| **Vq contraction (Peak E)** | `V_acc`, one or two full IBZ ζ̃ slabs, and their X/Y resharded faces | see [§Vq G-Chunk](#vq-g-chunk) |
+| **Vq contraction (Peak E)** | `V_acc`, one q of ζ̃ (two on an off-diagonal tile), its face copies and one G panel per operand — the floor; the run fills the V_q budget with more q per read | see [§Vq G panels and q-tiles](#vq-g-panels-and-q-tiles) |
 | **Restart write (Peak F)** | larger of the sharded V/W0 tile and sharded G-flat ζ tile | `M_F = E_base + max(16·n_q^irr·μ²/P, 16·n_q^disk·μ·n_G/P)` |
 | **Vq unfold (IBZ→full)** | `V_full (n_q_full, μ, μ)` sharded over both μ axes + per-q phase | see [§IBZ Cascade Memory](#ibz-cascade-memory) |
 
@@ -342,42 +342,65 @@ coupled schedule:
 replicated route.  The plan report prints the route it priced so a value of one
 on `per_q` or `distributed` cannot be mistaken for an execution throttle.
 
-## Vq G-Chunk
+## Vq G panels and q-tiles
 
-The live Vq path never builds r-space μ/ν tiles.  It pre-reads the
-mesh-sharded G-flat ζ̃ slab, loops synchronously over q, and scans the G axis
-inside each per-q contraction:
-
-```
-V_q[μ,ν] += conj(ζ̃_q[μ,G_chunk])
-             @ (v_q[G_chunk] · ζ̃_q[ν,G_chunk]).T
-```
-
-`vq_g_chunk_size > 0` is the requested G width and must divide the
-padded `ngkmax`.  Zero selects the largest divisor `<= 4096`.  The heuristic
-is fixed in `gw/v_q_g_flat.py::_pick_g_chunk`; `plan_gflat_chunks` neither
-chooses nor reports it.
-
-### Per-q kernel allocation (V_q HWM)
-
-The formulas below use the runtime IBZ extents.  The production planner call
-currently supplies conservative full-BZ counts for D–F, so its printed Peak E
-replaces `n_q^irr` with `n_q^full`:
+The live Vq path never builds r-space μ/ν tiles.  It reads the mesh-sharded
+G-flat ζ̃ in q-tiles, and for each q scans the G axis in panels:
 
 ```
-E_base = one centroid copy / p_x + one centroid copy / p_y
-peak_E = E_base
-       + 16·n_q^irr·μ²/P
-       + (1 or 2)·16·n_q^irr·μ·n_G/P
-       + 16·μ·n_G/p_x + 16·μ·n_G/p_y
+V_q[μ,ν] += conj(ζ̃_q[μ_X, G_panel]) · v_q[G_panel] · ζ̃_q[ν_Y, G_panel]ᵀ
 ```
 
-The second slab is present for a bispinor off-diagonal tile.  The two
-single-axis terms are the per-q ζ faces reshaped for the X/Y contraction.
-The G-chunked matrix-multiply scratch is bounded by `vq_g_chunk_size`, but is
-not a term in the current closed-form planner.  Lowering that knob can reduce
-the compiled per-q kernel workspace; it cannot shrink the full ζ slabs or
-`V_acc`, so compiled-memory inspection remains the authority for that tuning.
+ζ̃_q stays `P(('x','y'), None)` for the whole contraction.  Each G step
+all-gathers one `(μ/p_x, g)` panel over `'y'` and one `(μ/p_y, g)` panel over
+`'x'` (the R face is first collective-permuted into `('y','x')` block order,
+one ζ_q/P move per q), inside a `shard_map` so no partitioner can hoist them
+into a whole-face gather.  One kernel launch contracts a whole q-tile (a scan
+over q around the G scan).
+
+The per-rank bytes have one owner, `gw/v_q_g_flat.py::vq_tile_bytes`
+(complex128, μ extents mesh-padded):
+
+```
+resident = 16·n_q^irr·μ_L·μ_R/P + 16·n_q^irr·μ_L/p_x + 16·n_q^irr·μ_L·n_sub/P
+per_q    = 16·(μ_L [+ μ_R])·n_G/P + 16·n_G              # ζ rows + replicated v row
+work     = 16·(μ_L + μ_R [+ μ_R])·n_G/P                  # sliced face(s) + R permute
+         + 2·16·μ_L·μ_R/P                                # V_q carry
+         + 16·g·(2·μ_L/p_x + μ_R/p_y)                    # L panel, L·v, R panel
+peak     = resident + work + q_tile·per_q
+```
+
+`n_sub` is the one-leg column count of an IBZ diagonal tile (the parent
+slots `symmetry_maps.isdf_one_leg_source_slots` names; 1 on a trivial star).
+Every term is ÷P except the replicated v row, which is per tile.
+
+The read also costs HOST memory: `host_per_q = 16·(μ_L [+ μ_R])·n_G/P` per
+q, staged in the phdf5 file context's `read_buf`, which stays at the largest
+read until the context closes.  The bispinor build holds four ζ loaders open
+across seven V tiles: with whole-slab reads VI3 12x12 at P16 retained
+33.4 + 3·11.7 = 68.5 GB/rank (274 GB on a 263 GB four-rank node) and the step
+was OOM-killed on the host
+(`runs/runtime/vq_summa_20260923/bisp_new_try2_hostoom.log`).  Each V tile
+therefore ends with `ZetaLoader.release_read_staging()` on its loaders, and
+its q-tile also fits a live host budget.
+
+`_plan_vq_tiles` picks, in order: `g` = `vq_g_chunk_size` if positive (any
+width; a tail it does not divide is masked), else the largest width
+≤ 4096 whose widest panel all-gather fits `LORRAX_COLLECTIVE_CHUNK_MB` and
+whose panels take at most half of what one q leaves; then `q_tile` = every q
+that fits both the device budget and the host staging budget (0.9 of the
+node's live `MemAvailable` over the processes on the node, so other loaders'
+retained staging is already excluded), balanced across tiles.  All q fit whenever they do,
+which is the historical whole-slab read.  The budget is 0.9 of the live
+available device memory (`common.gpu_utils.get_device_memory_info`), agreed
+as the minimum across processes because the tile count fixes how many
+collective reads every rank issues.  `GATE vq_tile_budget` refuses when
+`resident + work + per_q` alone exceeds it.
+
+The G-flat planner's stage E prices this model at `q_tile = 1` and the
+automatic panel width: the V_q stage REQUIRES only that floor, and spends any
+remaining budget on more q per read, so a measured V_q high-water can exceed
+Peak E, up to the V_q budget, by design.
 
 ## IBZ Cascade Memory
 
@@ -546,7 +569,7 @@ accumulator (μ-flat sharded across the mesh).  The runtime object can use
 ### Peaks E and F — post-fit Vq and tensor write
 
 These peaks use `E_base`, not the fit-loop persistent floor.  Peak E is the
-full-slab inventory in [§Vq G-Chunk](#vq-g-chunk).  Peak F adds the larger
+one-q floor of [§Vq G panels and q-tiles](#vq-g-panels-and-q-tiles).  Peak F adds the larger
 of the selected-Q sharded V/W0 tensor and G-flat ζ tensor.  SlabIO writes
 per-rank hyperslabs; the deleted
 all-gather writer is not an alternative modeled here.
@@ -1115,11 +1138,17 @@ bispinor on 16 GPUs (4×4 mesh, ``p_xy=16``, ``nk=36``, ``ns=2``,
 
 ### E. V_q per-tile transient (allocated/freed per tile in `_compute_V_q_g_flat_one_tile`)
 
+The rows below are the 2026-07 whole-slab measurements; since 2026-09-23 the
+slab rows are one q-TILE (`q_tile × mu × ngkmax × 16 / p_xy`, all q only when
+they fit the V_q budget) and the `/p_x` face row is gone — replaced by one
+`(mu/p_x, g)` panel per G step.  `vq_tile_bytes` owns the current terms
+([Vq G panels and q-tiles](#vq-g-panels-and-q-tiles)).
+
 | live_arrays signature | meta-var formula | per-rank GB | allocation site | sharded? | planner term | smoking gun |
 |---|---|---|---|---|---|---|
-| ``c128 (n_q_ibz, mu, ngkmax)`` (CC or TT diag) | ``n_q_ibz × mu × ngkmax × 16 / p_xy`` | 3.28 | ``gw/v_q_g_flat.py:372-384`` (zeta_L_all pre-loop) | μ-sharded | ``E.zeta_L_all`` | Agent I §2 binding term |
-| ``c128 (n_q_ibz, mu, ngkmax)`` second copy (TT off-diagonal only) | ``n_q_ibz × mu × ngkmax × 16 / p_xy`` | 3.28 (off-diag) / 0 (CC + diag) | ``gw/v_q_g_flat.py: same`` | μ-sharded | ``E.zeta_R_all`` | Agent I §2: doubles slab term for ``same_zeta=False`` |
-| ``c128 (mu, ngkmax)`` (resharded inside per-q kernel) | ``mu × ngkmax × 16 / p_x`` | 0.365 | ``gw/v_q_g_flat.py: _make_per_q_kernel.fn`` (reshard to ``P('x', None)``) | sharded /p_x (REPLICATED on y) | ``E.zeta_L_on_x_axis`` | Agent I §2 |
+| ``c128 (q_tile, mu, ngkmax)`` (CC or TT diag) | ``q_tile × mu × ngkmax × 16 / p_xy`` | 3.28 (whole slab, 2026-07) | ``gw/v_q_g_flat.py`` (``read_q_tile`` in the tile loop) | μ-sharded | ``vq_tile_bytes.per_q`` | Agent I §2 binding term |
+| ``c128 (q_tile, mu, ngkmax)`` second copy (TT off-diagonal only) | ``q_tile × mu × ngkmax × 16 / p_xy`` | 3.28 (off-diag) / 0 (CC + diag) | ``gw/v_q_g_flat.py: same`` | μ-sharded | ``vq_tile_bytes.per_q`` | Agent I §2: doubles slab term for ``same_zeta=False`` |
+| ``c128 (mu, ngkmax)`` (retired 2026-09-23: whole face resharded to ``P('x', None)``) | was ``mu × ngkmax × 16 / p_x`` | 0.365 | now one ``(mu/p_x, g)`` panel per G step in ``_make_q_tile_kernel`` | — | ``vq_tile_bytes.work`` | Agent I §2 |
 | ``c128 (n_q_ibz, mu, mu)`` (V_acc; post-unfold piggybacks same slot) | ``n_q_ibz × mu × mu × 16 / p_xy`` | 0.083 | ``gw/v_q_g_flat.py:372`` | μ-sharded | ``E.V_acc`` + ``E.V_acc_full_BZ`` | Agent H probe P5: post-V_q live_total +1.33 GB global = V_qmunu_CC |
 | ``c128 (n_q_full, mu, mu)`` ×{9, 6} (Lorentz mix, bispinor IBZ-T only) | ``{9, 6} × nq × mu × mu × 16 / p_xy`` | 1.22 total | ``gw/v_q_bispinor.py:587-728`` (``unfold_v_q_bispinor_lorentz``) | μ-sharded | ``E.tt_full_in_9_tiles`` + ``E.tt_mixed_6_tiles`` | Agent I §4 |
 

@@ -52,10 +52,14 @@ def constructor_execution(meta, resolution, recipe, *, mesh, ledger, upstream,
                           column_extent=lambda width: width):
     """Resolve local or whole-mesh execution once, before a constructor read.
 
-    Explicit distributed service policy selects the face. Otherwise the local
-    parent route requires the complete selection stack to fit. A caller that
-    releases samples before reduction may defer that admission to its measured
-    pencil extent; coupled sectors retain the conservative joint-lifetime check.
+    Local parents (one whole parent per rank, R4) are the fast path whenever
+    the complete selection stack fits, whatever dense layout the deck names:
+    ``linalg`` prices the per-matrix service calls, it does not force every
+    parent through a whole-mesh eigensolve one at a time. A parent that does
+    not fit runs on the face, where ``face_batch_width`` sizes the batch. A
+    caller that releases samples before reduction may defer that admission to
+    its measured pencil extent; coupled sectors retain the conservative
+    joint-lifetime check.
     """
     from gw.shared_pole_capacity import ConstructorCapacity
 
@@ -68,11 +72,7 @@ def constructor_execution(meta, resolution, recipe, *, mesh, ledger, upstream,
     fit_ids = [int(i) for i in recipe['fit_ids']]
     fit = max(fit_ids) - min(fit_ids) + 1
     selection_faces = fit * int(sample_fields) + int(moment_fields)
-    if resolution.layout == 'distributed':
-        return 'face', dict(reason='configured distributed service',
-                            conservative_pencil_side=side,
-                            selection_face_count=selection_faces)
-    if resolution.layout != 'local':
+    if resolution.layout not in ('local', 'distributed'):
         raise ValueError('unsupported resolved constructor linalg layout')
     local = ConstructorCapacity(meta, resolution, mesh_xy=mesh, ledger=ledger,
                                 upstream=upstream, execution='local')
@@ -114,6 +114,7 @@ def constructor_execution(meta, resolution, recipe, *, mesh, ledger, upstream,
            for row in (resident_selection, resident_reduction) if row is not None):
         return 'face', dict(
             reason='local resident lower bound exceeds current device budget',
+            requested_layout=resolution.layout,
             conservative_pencil_side=side,
             selection_face_count=selection_faces,
             retained_output_upper_bound_bytes_per_rank=retained_outputs,
@@ -125,6 +126,7 @@ def constructor_execution(meta, resolution, recipe, *, mesh, ledger, upstream,
     return ('local' if admitted else 'face'), dict(
         reason=('capacity-admitted local parent' if admitted else
                 'local parent exceeds current device budget'),
+        requested_layout=resolution.layout,
         conservative_pencil_side=side, selection_face_count=selection_faces,
         retained_output_upper_bound_bytes_per_rank=retained_outputs,
         local_selection=selection, local_reduction=reduction,
@@ -262,6 +264,44 @@ def sector_round_schedule(bank,header,meta,config,mesh,partner,*,execution=None,
     return [(list(range(q, min(q + batch_width, nq))), min(batch_width, nq-q),
              np.arange(min(batch_width, nq-q), dtype=np.int64), 'face')
             for q in range(0, nq, batch_width)]
+
+
+def face_batch_width(meta, resolution, *, mesh, ledger, upstream, side, sample_batch,
+                     selection_faces, nq):
+    """Largest whole-mesh parent batch whose selection and reduction fit.
+
+    The scalar face route runs a batch of physical parents per round, every
+    matrix tiled over all ranks (``face_reduce_round``), instead of one parent
+    per round. Both phases are priced at the conservative recipe side before
+    any bank read, as ``sector_batch_width`` does for the sector route; the
+    constructor still admits every phase at its actual side.
+    """
+    from gw.shared_pole_capacity import ConstructorCapacity
+
+    budget = ConstructorCapacity(meta, resolution, mesh_xy=mesh, ledger=ledger,
+                                 upstream=upstream, execution='face')
+    phases = (('selection', dict(sample_batch=sample_batch, selection_faces=selection_faces)),
+              ('reduction', {}))
+    rows = None
+    for width in range(int(nq), 0, -1):
+        budget.batch_width = width
+        rows = [ledger.preview(resident_bytes_per_rank=budget.resident_quote(
+                    side, phase=phase, **kwargs)['resident_bytes_per_rank'],
+                    workspace_bytes_per_rank=0, concurrent_with=upstream)
+                for phase, kwargs in phases]
+        if any(row['device_budget_status'] != 'PASS' for row in rows):
+            continue
+        rows = []
+        for phase, kwargs in phases:
+            price, native = budget.quote(side, phase=phase, **kwargs)
+            rows.append(ledger.preview(
+                resident_bytes_per_rank=price['resident_bytes_per_rank'],
+                workspace_bytes_per_rank=sum(native.values()), concurrent_with=upstream))
+        if all(row['device_budget_status'] == 'PASS' for row in rows):
+            return width, dict(parent_batch=width, selection=rows[0], reduction=rows[1])
+    # One parent per round; its actual-side phase admissions decide.
+    return 1, dict(parent_batch=1, reason='conservative side exceeds the budget at one parent',
+                   selection=rows[0], reduction=rows[1])
 
 
 def sector_batch_width(meta, resolution, recipe, routes, *, mesh, ledger, nq):

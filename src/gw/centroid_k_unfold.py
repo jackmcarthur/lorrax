@@ -135,8 +135,7 @@ class CentroidKUnfoldPlan:
             self.spatial_ops, self.translations, self.fft_grid,
             n_y=int(self.mesh_xy.shape['y']),
             target_width=int(target_width),
-            shard_multiple=int(self.mesh_xy.shape['x']),
-            fill="least_loaded")
+            shard_multiple=int(self.mesh_xy.shape['x']))
 
     @property
     def n_full(self) -> int:
@@ -425,83 +424,27 @@ def plane_axis_for_orbits(labels, fft_grid) -> int:
     return int(best[2])
 
 
-def _contiguous_blocks(sizes, cap: int) -> np.ndarray:
-    """Block index of each orbit when the ordered sizes are poured next-fit into blocks of ``cap``."""
-    block = np.empty(len(sizes), dtype=np.int64)
-    b, load = 0, 0
-    for i, size in enumerate(sizes):
-        if load + int(size) > cap:
-            b, load = b + 1, 0
-        block[i] = b
-        load += int(size)
-    return block
-
-
-def _owner_contiguous_cap(sizes, n_owner: int, cap_target: int, largest: int,
-                          multiple: int) -> tuple[int, int]:
-    """``(cap, n_tiles)`` for the owner-contiguous fill: the fewest tiles at a
-    cap not above the target (unless one orbit is wider), then the smallest
-    cap at which the next-fit pour of the plane-ordered orbits needs at most
-    ``n_owner·n_tiles`` blocks."""
-    n_rtot = int(np.sum(sizes))
-
-    def fits(m: int, n_tiles: int) -> bool:
-        # Next-fit block count never grows with the cap, so ``fits`` is
-        # monotone in ``m`` and bisection finds the smallest cap.
-        return (int(_contiguous_blocks(sizes, m * multiple).max()) + 1
-                <= n_owner * n_tiles)
-
-    m_floor = -(-int(largest) // multiple)
-    m_target = max(m_floor, int(cap_target) // multiple)
-    n_tiles = max(1, -(-n_rtot // (n_owner * m_target * multiple)))
-    while not fits(m_target, n_tiles):
-        n_tiles += 1
-    lo = max(m_floor, -(-n_rtot // (n_owner * n_tiles * multiple)))
-    hi = m_target
-    while lo < hi:
-        mid = (lo + hi) // 2
-        if fits(mid, n_tiles):
-            hi = mid
-        else:
-            lo = mid + 1
-    return int(hi) * multiple, int(n_tiles)
-
-
 def build_real_grid_orbit_tiles(
     spatial_ops, translations, fft_grid, *, n_y: int, target_width: int,
-    shard_multiple: int = 1, fill: str,
+    shard_multiple: int = 1,
 ) -> RealGridOrbitTiles:
     """Partition the FFT grid into orbit-closed tiles of one fixed width, in plane order.
 
     Orbits are labelled by :func:`symmetry_maps.real_space_orbit_labels`
     (O(n_rtot) host memory).  They are ordered by the planes they touch
     along :func:`plane_axis_for_orbits` (lowest plane, highest plane, first
-    grid index).  ``fill`` names how they are poured (no default: the two
-    serve different consumers and place different points together):
-
-    * ``'least_loaded'`` (the r-chunk loop): into consecutive tiles, each
-      orbit whole onto the least-loaded of the tile's ``n_y`` Y owners; a
-      tile closes when the next orbit fits on none.  All owners of a tile
-      share the tile's planes.
-    * ``'owner_contiguous'`` (the μ-batch r blocks, owner = rank): owner
-      ``o`` takes the ``o``-th contiguous run of the plane order, cut
-      next-fit into its ``n_tiles`` blocks; the cap is the smallest at which
-      ``n_y·n_tiles`` blocks hold every orbit.  Each owner's blocks then lie
-      on its own planes, the layout a plane→owner transport wants.
-
-    ``target_width`` is the memory planner's r chunk; the realized width
-    ``n_y·shard_size`` does not exceed it (unless one orbit is wider than an
-    owner's share) and is a multiple of ``n_y·shard_multiple``.  Consecutive
-    tiles therefore share planes, and a tile of ``W`` points touches about
-    ``W / plane_size`` planes (times the number of planes one orbit spans),
-    which is what bounds the r-chunk transforms.  (The former layout packed
-    orbits LPT across all tiles at once, which dealt equal-size orbits
-    round-robin: every tile then touched every plane.)
+    grid index) and poured into consecutive tiles: each orbit goes whole onto
+    the least-loaded of the tile's ``n_y`` Y owners, and a tile closes when
+    the next orbit fits on none.  ``target_width`` is the memory planner's r
+    chunk; the realized width ``n_y·shard_size`` does not exceed it (unless
+    one orbit is wider than an owner's share) and is a multiple of
+    ``n_y·shard_multiple``.  Consecutive tiles therefore share planes, and a
+    tile of ``W`` points touches about ``W / plane_size`` planes (times the
+    number of planes one orbit spans), which is what bounds the r-chunk
+    transforms.  (The former layout packed orbits LPT across all tiles at
+    once, which dealt equal-size orbits round-robin: every tile then touched
+    every plane.)
     """
-    if fill not in ("least_loaded", "owner_contiguous"):
-        raise ValueError(
-            "build_real_grid_orbit_tiles: fill must be 'least_loaded' or "
-            f"'owner_contiguous'; got {fill!r}.")
     ops = np.asarray(spatial_ops, dtype=np.int64)
     tau = np.asarray(translations, dtype=np.float64)
     fg = np.asarray(fft_grid, dtype=np.int64).reshape(3)
@@ -526,32 +469,24 @@ def build_real_grid_orbit_tiles(
     # One Y owner's share of the planner's width, rounded DOWN to the carrier
     # multiple; an orbit wider than that share raises it (rounded up).
     largest = int(sizes.max())
+    cap = max(multiple, (int(target_width) // n_y) // multiple * multiple)
+    cap = max(cap, -(-largest // multiple) * multiple)
+
     tiles: list[list[list[int]]] = []
-    if fill == "least_loaded":
-        cap = max(multiple, (int(target_width) // n_y) // multiple * multiple)
-        cap = max(cap, -(-largest // multiple) * multiple)
-        cur = [[] for _ in range(n_y)]
-        cur_load = [0] * n_y
-        for g in orbit_order:
-            size = int(sizes[g])
-            owner = int(np.argmin(cur_load))
-            if cur_load[owner] + size > cap:
-                tiles.append(cur)
-                cur = [[] for _ in range(n_y)]
-                cur_load = [0] * n_y
-                owner = 0
-            cur[owner].append(int(g))
-            cur_load[owner] += size
-        tiles.append(cur)
-    else:
-        ordered_sizes = sizes[orbit_order]
-        cap, n_tiles_c = _owner_contiguous_cap(
-            ordered_sizes, n_y, int(target_width) // n_y, largest, multiple)
-        block = _contiguous_blocks(ordered_sizes, cap)
-        tiles = [[[] for _ in range(n_y)] for _ in range(n_tiles_c)]
-        for g, blk in zip(orbit_order, block):
-            owner, t = divmod(int(blk), n_tiles_c)
-            tiles[t][owner].append(int(g))
+    loads: list[int] = []
+    cur = [[] for _ in range(n_y)]
+    cur_load = [0] * n_y
+    for g in orbit_order:
+        size = int(sizes[g])
+        owner = int(np.argmin(cur_load))
+        if cur_load[owner] + size > cap:
+            tiles.append(cur)
+            cur = [[] for _ in range(n_y)]
+            cur_load = [0] * n_y
+            owner = 0
+        cur[owner].append(int(g))
+        cur_load[owner] += size
+    tiles.append(cur)
 
     n_tiles = len(tiles)
     width = n_y * cap
@@ -764,150 +699,13 @@ def orbit_mu_batches(k_unfold_plan, mu_pad: int, n_ranks: int, *,
                           rows=rows, n_ranks=P_)
 
 
-class OrbitRBlocks(NamedTuple):
-    """Orbit-closed real-grid blocks, one run per rank (see :func:`orbit_r_blocks`).
-
-    ``points[p, s, slot]`` is the flat C-order grid index in slot ``slot``
-    of sub-block ``s`` of rank ``p`` (``-1`` pad); every ``(p, s)`` block is
-    a union of whole orbits, and the concatenation over ``(p, s)`` of the
-    active slots is a permutation of the grid.  ``local_perm[p, s, row]``
-    and ``wraps[p, s, row]`` are :meth:`RealGridOrbitTiles.source_tables`
-    for that block: offsets inside the block and lattice wraps, rows
-    ``[n_sym:]`` duplicating ``[:n_sym]``, pads fixed.  ``planes[p, s]`` are
-    the planes along ``plane_axis`` holding the block's points (``-1`` pad).
-    """
-    route: str
-    points: np.ndarray
-    local_perm: np.ndarray
-    wraps: np.ndarray
-    planes: np.ndarray
-    plane_axis: int
-    fft_grid: tuple
-
-    @property
-    def n_ranks(self) -> int:
-        return int(self.points.shape[0])
-
-    @property
-    def n_sub(self) -> int:
-        return int(self.points.shape[1])
-
-    @property
-    def r_s(self) -> int:
-        return int(self.points.shape[2])
-
-    @property
-    def R(self) -> int:
-        return self.n_sub * self.r_s
-
-
-def _tiles_of_points(plan, fft_grid, points, plane_axis) -> RealGridOrbitTiles:
-    """The rank blocks ``(P, n_sub, r_s)`` as tiles: tile = sub-block, Y owner = rank."""
-    P_, n_sub, r_s = (int(v) for v in np.shape(points))
-    r_index = np.asarray(points, dtype=np.int64).transpose(1, 0, 2).reshape(
-        n_sub, P_ * r_s)
-    return RealGridOrbitTiles(
-        fft_grid=_readonly(np.asarray(fft_grid).reshape(3), np.int64),
-        spatial_ops=_readonly(plan.spatial_ops, np.int64),
-        translations=_readonly(plan.translations, np.float64),
-        n_y=P_, shard_size=r_s, r_index=_readonly(r_index, np.int64),
-        plane_axis=int(plane_axis),
-        tile_planes=_readonly(np.full((n_sub, 1), -1), np.int64))
-
-
-def r_block_tables(k_unfold_plan, fft_grid, points) -> tuple[np.ndarray, np.ndarray]:
-    """``(local_perm, wraps)`` of given rank blocks; refuses a non-closed block.
-
-    ``points`` is ``(P, n_sub, r_s)`` as in :class:`OrbitRBlocks`.  Each
-    sub-block is read as one tile of :class:`RealGridOrbitTiles` with the
-    ranks as its owners, so the tables and both refusals (an unclosed
-    sub-block; an orbit crossing ranks) are that class's
-    :meth:`~RealGridOrbitTiles.source_tables`.
-    """
-    plan = k_unfold_plan
-    tiles = _tiles_of_points(plan, fft_grid, points, plane_axis=0)
-    P_, n_sub, r_s = (int(v) for v in np.shape(points))
-    perm_t, wrap_t = [], []
-    for s in range(n_sub):
-        try:
-            perm, wraps = tiles.source_tables(s)
-        except (AssertionError, RuntimeError, ValueError) as exc:
-            raise ValueError(
-                f"r_block_tables: sub-block {s} is not a union of whole "
-                f"orbits on each rank ({type(exc).__name__}: {exc}).  Fix: "
-                "build the blocks with orbit_r_blocks.") from exc
-        n_rows = int(perm.shape[0])
-        perm_t.append(perm.reshape(n_rows, P_, r_s).transpose(1, 0, 2))
-        wrap_t.append(wraps.reshape(n_rows, P_, r_s, 3).transpose(1, 0, 2, 3))
-    local_perm = np.stack(perm_t, axis=1).astype(np.int32)
-    wraps = np.stack(wrap_t, axis=1).astype(np.int32)
-    return local_perm, wraps
-
-
-def orbit_r_blocks(k_unfold_plan, fft_grid, n_ranks: int, *, r_s_target: int,
-                   route: str) -> OrbitRBlocks:
-    """Split the grid into orbit-closed blocks of about ``N_r/P``, one per rank.
-
-    Each rank's block is cut into ``n_sub`` orbit-closed sub-blocks of
-    ``r_s ≤ r_s_target`` slots (a whole orbit wider than that raises it).
-    Built by :func:`build_real_grid_orbit_tiles` with the ranks as owners
-    and ``fill='owner_contiguous'``: rank ``p`` takes the ``p``-th
-    contiguous run of the orbit plane order along
-    :func:`plane_axis_for_orbits`, and ``r_s`` is the smallest cap at which
-    ``P·n_sub`` blocks hold the grid, so the pad fraction stays at the orbit
-    granularity (TaAs 4×4×4, P=64: 0.999 active against 0.712 for the
-    r-chunk ``least_loaded`` fill at the same target).
-
-    ``route`` names the consumer and changes no point: ``'cache'`` (the
-    ψ(r) block cache reads any flat set) or ``'planes'`` (plane-regenerated
-    ψ reads ``planes[p, s]``).  For a layered group (every operation fixes
-    or flips the plane axis) a block of ``r_s`` points lies on about
-    ``r_s/plane_size`` planes (twice that with a mirror) and the ranks'
-    planes are disjoint except at run boundaries; for a group that mixes
-    all three axes (cubic, or a body-centred cell in its primitive basis)
-    an orbit spans many planes of every axis and ``planes`` prices that
-    honestly.
-
-    The block is direction-agnostic: nothing in the partition requires a
-    box axis to be split, and the r endpoint of the unfold is local to the
-    block by construction (tables by :func:`r_block_tables`).
-    """
-    plan = k_unfold_plan
-    if plan.spatial_ops is None or plan.fft_grid is None:
-        raise ValueError(
-            "orbit_r_blocks: this plan carries no spatial operations/FFT grid "
-            "(hand-assembled test plan).")
-    fg = tuple(int(v) for v in np.asarray(fft_grid).reshape(3))
-    if fg != tuple(int(v) for v in plan.fft_grid):
-        raise ValueError(
-            f"orbit_r_blocks: fft_grid {fg} is not the plan's {tuple(plan.fft_grid)}.")
-    if route not in ("cache", "planes"):
-        raise ValueError(
-            f"orbit_r_blocks: route must be 'cache' or 'planes'; got {route!r}.")
-    P_ = int(n_ranks)
-    tiles = build_real_grid_orbit_tiles(
-        plan.spatial_ops, plan.translations, fg, n_y=P_,
-        target_width=P_ * int(r_s_target), shard_multiple=1,
-        fill="owner_contiguous")
-    points = tiles.r_index.reshape(
-        tiles.n_tiles, P_, tiles.shard_size).transpose(1, 0, 2).astype(np.int32)
-    local_perm, wraps = r_block_tables(plan, fg, points)
-    return OrbitRBlocks(
-        route=route, points=points, local_perm=local_perm, wraps=wraps,
-        planes=tiles.owner_planes().transpose(1, 0, 2).copy(),
-        plane_axis=int(tiles.plane_axis), fft_grid=fg)
-
-
 __all__ = [
     "CentroidKUnfoldPlan",
     "MuOrbitBatches",
-    "OrbitRBlocks",
     "RealGridOrbitTiles",
     "build_centroid_k_unfold_plan",
     "build_real_grid_orbit_tiles",
     "mu_batch_tables",
     "orbit_mu_batches",
-    "orbit_r_blocks",
     "plane_axis_for_orbits",
-    "r_block_tables",
 ]

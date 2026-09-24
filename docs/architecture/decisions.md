@@ -2123,8 +2123,10 @@ envs are still honored as deprecated overrides at config construction
 - ``exact_degeneracy_tol_ev``: maximum splitting for the symmetric
   accidental-degeneracy average.  The default is 0.1 meV; physical SOC
   splittings above it remain distinct states.
-- ``tail_fit``: ``"frontier"`` uses the lowest accidental-degeneracy
-  conduction manifold for the energy-only sum-band tail;
+- ``tail_fit``: ``"conduction_mean"`` (the default since d205ca6f,
+  2026-09-23) is one rigid shift, the k-weighted mean correction over the
+  trusted window conduction states; ``"frontier"`` uses the lowest
+  accidental-degeneracy conduction manifold for the energy-only sum-band tail;
   ``"all_conduction"`` is the historical affine-fit diagnostic control;
   ``"buffer_edges"`` fits the two tails only to their adjacent diagonal
   buffers.

@@ -229,10 +229,15 @@ def compute_finite_q_mtxels(
     nv_block: int,
     nc_block: int,
     vnl_velocity_sign: float = VNL_VELOCITY_SIGN_SHIPPED,
+    hubbard=None,
     progress_fn=None,
     diagnostic_fn=None,
 ):
     """Driver: produce symmetric finite-q matrix elements on G-sphere.
+
+    ``hubbard`` (``psp.hubbard_ops.HubbardSetup``) adds dV_U/dK to both the
+    ket-side and bra-side applies, through the SAME
+    ``hubbard_ops.apply_hubbard_velocity_to_ket`` the q = 0 sweep uses.
 
     Returns numpy arrays:
       rho_cvkq[nc, nv, nk, nq] complex128  — ⟨u_{c, k-q} | u_{v, k}⟩_cell
@@ -371,6 +376,19 @@ def compute_finite_q_mtxels(
                 v_NL_v.shape[:2] + (pad,) + v_NL_v.shape[3:], dtype=v_NL_v.dtype)], axis=2)
             v_NL_c = jnp.concatenate([v_NL_c, jnp.zeros(
                 v_NL_c.shape[:2] + (pad,) + v_NL_c.shape[3:], dtype=v_NL_c.dtype)], axis=2)
+        if hubbard is not None:
+            from psp.hubbard_ops import apply_hubbard_velocity_to_ket
+            gm = jnp.asarray(g_mask, dtype=jnp.float64)
+            for _psi, _lst in ((psi_v, "v"), (psi_c, "c")):
+                _vu = apply_hubbard_velocity_to_ket(_psi[:, :2], kvec, Gk_int, gm, hubbard)
+                if _vu.shape[2] < v_kin_v.shape[2]:
+                    _vu = jnp.concatenate([_vu, jnp.zeros(
+                        _vu.shape[:2] + (v_kin_v.shape[2] - _vu.shape[2],) + _vu.shape[3:],
+                        dtype=_vu.dtype)], axis=2)
+                if _lst == "v":
+                    v_NL_v = v_NL_v + _vu
+                else:
+                    v_NL_c = v_NL_c + _vu
         vket_v_per_k.append(v_kin_v + v_NL_v)
         vket_c_per_k.append(v_kin_c + v_NL_c)
         prep_progress.step()
@@ -468,7 +486,7 @@ _PROV_ATTRS = ("prov_wfn_sha256", "prov_wfn_fingerprint_scheme",
                "prov_nb_written", "prov_bispinor", "prov_skip_vnl",
                "prov_vnl_mode", "prov_wfn_file", "prov_vnl_velocity_sign",
                "prov_nspinor", "prov_soc",
-               "prov_q0_operator_scheme")
+               "prov_q0_operator_scheme", "prov_hubbard")
 
 def resolve_vnl_velocity_sign(cli_value, deck_value):
     """Which sign the i[r, V_NL] term enters this run's velocity with.
@@ -497,8 +515,14 @@ def resolve_vnl_velocity_sign(cli_value, deck_value):
 def stamp_dipole_provenance(h5, *, wfn, wfn_path, nval, ncond, nband,
                              nb_written, bispinor, skip_vnl, vnl_mode,
                              vnl_velocity_sign=None, nspinor=None,
-                             soc=None) -> None:
+                             soc=None, hubbard=None) -> None:
     """Record what this ``dipole.h5`` was built from.
+
+    ``hubbard`` is the DFT+U stamp from ``psp.hubbard_ops``: ``'none'`` (no
+    DFT+U in the mean field), ``'skip_vnl'``, or the canonical JSON of the
+    occupations hash, U/J/B per shell, formulation and projector.
+    ``check_dipole_provenance`` enforces it; an absent stamp reads as
+    ``'none'`` (every file written before V_U existed lacks it).
 
     ``vnl_velocity_sign`` is the RESOLVED relative sign of the nonlocal
     commutator term, on the same reading: ``None`` is a file written
@@ -529,6 +553,8 @@ def stamp_dipole_provenance(h5, *, wfn, wfn_path, nval, ncond, nband,
     h5.attrs["prov_bispinor"] = bool(bispinor)
     h5.attrs["prov_skip_vnl"] = bool(skip_vnl)
     h5.attrs["prov_vnl_mode"] = str(vnl_mode)
+    if hubbard is not None:
+        h5.attrs["prov_hubbard"] = str(hubbard)
     # ``analytic`` and the VNL sign do not identify the implementation.  In
     # particular, 5036f21b replaced the old sqrt(q^2+1e-8) projector
     # regularizer and approximate l>0 origin row by exact reduced-radial
@@ -1045,6 +1071,32 @@ def main(argv=None):
 		compute_contact=bool(args.static_gauge_hall_only),
 		compute_transfer_q2=False,
 	)
+	# ── DFT+U: i[r, V_U] joins the velocity, or the run refuses ─────────
+	# ``resolve_hubbard_input`` is the one owner of the rule: the QE schema
+	# that authenticates this WFN declares DFT+U and the deck names no
+	# Hubbard input -> refuse; the reverse -> refuse; neither -> ``None``,
+	# i.e. the plain-DFT operator, executed literally as before.  --skip-vnl
+	# is the announced p-only arm and omits every nonlocal commutator.
+	from psp import hubbard_ops
+	if args.skip_vnl:
+		hubbard_in, hubbard_setup = None, None
+		hubbard_stamp = "skip_vnl"
+	else:
+		hubbard_in = hubbard_ops.resolve_hubbard_input(
+			params.get("hubbard_input", ""), params.get("hubbard_occupations", ""),
+			wfn=wfn, base_dir=str(input_path.parent), caller="psp.get_dipole_mtxels")
+		hubbard_setup = (None if hubbard_in is None else
+		                 hubbard_ops.build_hubbard_from_input(
+		                     wfn, hubbard_in, pseudos, nspinor=int(wfn.nspinor)))
+		hubbard_stamp = (hubbard_ops.NO_HUBBARD if hubbard_in is None
+		                 else hubbard_in.provenance)
+	if hubbard_setup is not None:
+		for _flag, _bad in (("--vnl-mode numeric", args.vnl_mode == "numeric"),
+		                    ("--static-gauge-hall-only", args.static_gauge_hall_only)):
+			if _bad:
+				parser.error(
+					f"GATE dftu_velocity_route: {_flag} has no i[r, V_U] term; "
+					"a DFT+U deck runs the analytic q=0 / finite-q velocity only")
 	report.environment(wfn=wfn, lines=(
 		"Matrix storage : distributed band blocks on the X x Y mesh",
 		"Output writer  : rank-zero artifact writer after a bounded owner gather",
@@ -1058,6 +1110,15 @@ def main(argv=None):
 		   f"finite difference ({args.vnl_num_scheme})"),
 		f"SOC projectors : {vnl_setup.soc_provenance}",
 		f"V_NL sign      : {float(vnl_velocity_sign):+.5f} in the stored convention",
+		"DFT+U velocity : " + (
+			"none (no Hubbard input; no authenticated QE schema declares DFT+U)"
+			if hubbard_stamp == hubbard_ops.NO_HUBBARD
+			else "omitted with every nonlocal term (--skip-vnl)" if hubbard_setup is None
+			else "i[r,V_U] included; " + hubbard_in.card.formulation + ", "
+			+ hubbard_in.card.projector + "; " + ", ".join(
+				f"{sh.element}-{sh.label.lower()} U={sh.U_eV:g} J={sh.J_eV:g} B={sh.B_eV:.4g} eV"
+				for sh in hubbard_in.shells)
+			+ f"; occupations sha256 {hubbard_in.occupations_sha256[:12]}"),
 		"q = 0 matrix   : enabled; full band-to-band Cartesian velocity",
 		"finite-q SOS   : " + ("enabled" if args.with_finite_q else "off"),
 		"parallel gauge : " + (
@@ -1397,7 +1458,8 @@ def main(argv=None):
 		op = dipole_operator(
 			geom, bvec=wfn.bvec, blat=wfn.blat,
 			vnl_setup=None if args.skip_vnl else vnl_setup,
-			vnl_velocity_sign=vnl_velocity_sign)
+			vnl_velocity_sign=vnl_velocity_sign,
+			hubbard=hubbard_setup)
 		with timing.section("dipole_sweep"):
 			H_v_file = sweep_matrix_elements(
 				psi_G, operator=op, geom=geom,
@@ -1421,6 +1483,7 @@ def main(argv=None):
 						effective_nspinor=int(meta.nspinor),
 						bispinor=bispinor,
 						velocity_dft_kmajor=H_v,
+						hubbard_provenance=hubbard_stamp,
 						wfn_path=str(wfn_path),
 						wfn_fingerprint=wfn_fingerprint(wfn),
 						rcond=float(args.parallel_transport_rcond))
@@ -1505,6 +1568,7 @@ def main(argv=None):
 				nv_block=int(nval),
 				nc_block=int(ncond),
 				vnl_velocity_sign=vnl_velocity_sign,
+				hubbard=hubbard_setup,
 				progress_fn=report.progress,
 				diagnostic_fn=debug_print if debug else None,
 			)
@@ -1523,8 +1587,9 @@ def main(argv=None):
 	out_path = Path(args.out).resolve()
 	note = ('dipole_cart[3,x,y] = p_i (V_NL skipped, --skip-vnl); '
 	        if args.skip_vnl
-	        else f'dipole_cart[3,x,y] = {_arm} '
-	             f'[vnl_velocity_sign = {vnl_velocity_sign:+.1f}]; ')
+	        else f'dipole_cart[3,x,y] = {_arm}'
+	             + ('' if hubbard_setup is None else ' + i[r, V_U] (prov_hubbard)')
+	             + f' [vnl_velocity_sign = {vnl_velocity_sign:+.1f}]; ')
 	note += 'deltaE[k,:,:] = E_b - E_b\''
 	# Rank-0 writes.  Every rank holds the same gathered host arrays, so a
 	# multi-process launch previously had all of them open the SAME path with
@@ -1549,7 +1614,8 @@ def main(argv=None):
 				nband=nband, nb_written=nb, bispinor=bispinor,
 				skip_vnl=bool(args.skip_vnl), vnl_mode=str(args.vnl_mode),
 				vnl_velocity_sign=vnl_velocity_sign,
-				nspinor=int(wfn.nspinor), soc=bool(vnl_setup.soc))
+				nspinor=int(wfn.nspinor), soc=bool(vnl_setup.soc),
+				hubbard=hubbard_stamp)
 			if rho_cvkq is not None:
 				fq = h5.create_group('finite_q')
 				fq.create_dataset('rho_cvkq', data=rho_cvkq)

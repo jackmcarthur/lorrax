@@ -1,14 +1,12 @@
-"""Whole-orbit μ batches and orbit-closed rank r blocks for the μ-batch ζ fit.
+"""Whole-orbit μ batches for the route-G μ-batch ζ fit (the owners' bins).
 
-Host-only contracts of ``gw.centroid_k_unfold.orbit_mu_batches`` and
-``orbit_r_blocks`` (docs/architecture/zeta_fit_mubatch.md, "Symmetry: parent
-k"), on the committed A-cubic fixture (diamond-H2, 48 operations, time
-reversal, 3 raw parents of 8 k) and a layered synthetic group.  The endpoint
-tables are checked against an evaluation that shares no code with their
-builder: the Seitz action applied to fractional coordinates directly.  Red
-twins construct a split orbit and a permuted table and show the refusal.
-The device parity against the r-chunk path is
-``tests/test_zeta_mubatch_sym_parity.py``.
+Host-only contracts of ``gw.centroid_k_unfold.orbit_mu_batches``
+(docs/architecture/zeta_fit_mubatch.md), on the committed A-cubic fixture
+(diamond-H2, 48 operations, time reversal, 3 raw parents of 8 k).  The
+endpoint tables are checked against an evaluation that shares no code with
+their builder: the Seitz action applied to fractional coordinates directly.
+A red twin constructs a split orbit and shows the refusal.  The device
+parity is ``tests/multi_device/zeta_mubatch_p4.py``.
 """
 from __future__ import annotations
 
@@ -20,11 +18,8 @@ import pytest
 
 from gw.centroid_k_unfold import (
     build_centroid_k_unfold_plan,
-    build_real_grid_orbit_tiles,
     mu_batch_tables,
     orbit_mu_batches,
-    orbit_r_blocks,
-    r_block_tables,
 )
 
 _ACUBIC = Path(__file__).resolve().parent / "core" / "fixtures" / "A-cubic"
@@ -162,100 +157,3 @@ def test_split_orbit_refuses_by_name(acubic):
 # ---------------------------------------------------------------------------
 # r blocks
 # ---------------------------------------------------------------------------
-
-def _check_blocks(plan, rb, fft_grid):
-    """Partition, closure, table semantics (independent Seitz evaluation)."""
-    n_rtot = int(np.prod(fft_grid))
-    act = rb.points[rb.points >= 0]
-    assert np.array_equal(np.sort(act), np.arange(n_rtot)), "a partition"
-    rows = rb.local_perm.shape[2]
-    assert rows == 2 * plan.n_sym_spatial
-    for p in range(rb.n_ranks):
-        for s in range(rb.n_sub):
-            pts = rb.points[p, s]
-            live = np.flatnonzero(pts >= 0)
-            assert np.all(pts[live[-1] + 1:] < 0) if live.size else True, \
-                "pads trail within a block"
-            for row in range(rows):
-                src, L = _seitz_source(plan, fft_grid, pts[live], row)
-                off = rb.local_perm[p, s, row]
-                assert np.array_equal(pts[off[live]], src), (p, s, row)
-                assert np.array_equal(rb.wraps[p, s, row, live], L.astype(int))
-                pad = np.flatnonzero(pts < 0)
-                assert np.array_equal(off[pad], pad)
-            pl = rb.planes[p, s]
-            coord = np.stack([pts[live] // (fft_grid[1] * fft_grid[2]),
-                              (pts[live] // fft_grid[2]) % fft_grid[1],
-                              pts[live] % fft_grid[2]])[rb.plane_axis]
-            assert np.array_equal(pl[pl >= 0], np.unique(coord))
-
-
-@pytest.mark.parametrize("route", ["cache", "planes"])
-@pytest.mark.parametrize("n_ranks,r_s", [(4, 96), (4, 216), (3, 100), (2, 500)])
-def test_r_blocks_partition_the_grid_into_closed_blocks(acubic, route, n_ranks, r_s):
-    plan, _ = acubic
-    fg = tuple(int(v) for v in plan.fft_grid)
-    rb = orbit_r_blocks(plan, fg, n_ranks, r_s_target=r_s, route=route)
-    assert rb.route == route and rb.points.shape[0] == n_ranks
-    assert rb.r_s <= max(r_s, 48), (rb.r_s, r_s)     # 48 = the largest orbit
-    _check_blocks(plan, rb, np.asarray(fg))
-
-
-def test_orbit_split_across_ranks_refuses(acubic):
-    """Red twin: exchange one point between two ranks' blocks of one sub-block."""
-    plan, _ = acubic
-    fg = tuple(int(v) for v in plan.fft_grid)
-    rb = orbit_r_blocks(plan, fg, 4, r_s_target=216, route="cache")
-    pts = rb.points.copy()
-    from symmetry_maps import real_space_orbit_labels
-    lab = real_space_orbit_labels(plan.spatial_ops, plan.translations, fg)
-    a, b = pts[0, 0, 0], pts[1, 0, 0]
-    assert lab[a] != lab[b]
-    pts[0, 0, 0], pts[1, 0, 0] = b, a
-    with pytest.raises(ValueError, match="not a union of whole orbits"):
-        r_block_tables(plan, fg, pts)
-    # Across sub-blocks the tile itself is no longer closed: refused too.
-    pts = rb.points.copy()
-    a, b = pts[0, 0, 0], pts[0, 1, 0]
-    pts[0, 0, 0], pts[0, 1, 0] = b, a
-    with pytest.raises(ValueError, match="not a union of whole orbits"):
-        r_block_tables(plan, fg, pts)
-
-
-def test_owner_contiguous_blocks_stay_on_their_own_planes():
-    """Layered group (C4 x sigma_h): the 'planes' route keeps each rank on a
-    contiguous run of stacking planes (plus mirror partners), while every
-    block remains orbit closed."""
-    c4 = np.array([[0, -1, 0], [1, 0, 0], [0, 0, 1]], dtype=np.int64)
-    sh = np.diag([1, 1, -1]).astype(np.int64)
-    rots = [np.linalg.matrix_power(c4, i) for i in range(4)]
-    ops = np.array(rots + [sh @ r for r in rots])
-    fg = np.asarray((8, 8, 16))
-    plan = SimpleNamespace(spatial_ops=ops, translations=np.zeros((8, 3)),
-                           fft_grid=fg, n_sym_spatial=8)
-    rb = orbit_r_blocks(plan, fg, 4, r_s_target=64, route="planes")
-    assert rb.plane_axis == 2
-    _check_blocks(plan, rb, fg)
-    # Orbits pair plane z with -z; runs of the plane order meet only at
-    # run boundaries, each adding at most one shared (z, -z) pair.
-    per_rank = [set(rb.planes[p][rb.planes[p] >= 0].tolist()) for p in range(4)]
-    assert sum(len(s) for s in per_rank) <= fg[2] + 2 * (4 - 1), per_rank
-    # a block of 64 points on 8x8 planes: at most two (z, -z) pairs
-    assert (rb.planes >= 0).sum(-1).max() <= 4
-    # the r-chunk fill on the same group deals every rank onto the tile's
-    # planes: the per-rank plane sets then overlap on every plane
-    tiles = build_real_grid_orbit_tiles(ops, np.zeros((8, 3)), fg, n_y=4,
-                                        target_width=256, fill="least_loaded")
-    owners = tiles.owner_planes()
-    total = sum(len(set(owners[t, o][owners[t, o] >= 0].tolist()))
-                for t in range(tiles.n_tiles) for o in range(4))
-    assert total > sum(len(s) for s in per_rank), total
-
-
-def test_fill_is_a_named_selection():
-    with pytest.raises(TypeError):
-        build_real_grid_orbit_tiles(np.eye(3, dtype=int)[None], np.zeros((1, 3)),
-                                    (4, 4, 4), n_y=2, target_width=16)
-    with pytest.raises(ValueError, match="fill must be"):
-        build_real_grid_orbit_tiles(np.eye(3, dtype=int)[None], np.zeros((1, 3)),
-                                    (4, 4, 4), n_y=2, target_width=16, fill="lpt")

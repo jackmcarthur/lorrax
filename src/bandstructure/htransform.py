@@ -1452,7 +1452,7 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
         # If every fitted state is QP corrected there is no active/DFT-guard
         # boundary: the incumbent full-H energy ordering is exact.  Otherwise
         # the same compact projector/FFT path selects the complete corrected
-        # block and the returned interior is gated below.
+        # block and the returned-interior margin is logged below (diagnostic).
         active_band_range = (
             None if qp_stop == fit_stop else
             (qp_start - fit_start, qp_stop - fit_start))
@@ -1916,17 +1916,21 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
                     "Supply QP U/E through every interleaving guard or widen "
                     "the active state block; do not publish a round-off-chosen "
                     "band assignment.")
+            # Owner 2026-09-23: htransform does NOT need a global energy gap
+            # between returned and non-returned fitted states.  The returned
+            # bands are chosen by active-subspace CHARACTER (the gate above,
+            # and test_active_character_follows_state_through_guard_energy_
+            # crossing), not by energy order, so an interleaving DFT guard or
+            # corrected margin state cannot displace them.  The margin is a
+            # diagnostic; it refused VI3 12x12 QP returns above band 70
+            # because the QP conduction continuum has no global gap.
             if (require_qp_interior_margin
                     and min_returned_interior_margin <= DEGENERACY_TOL_RY):
-                raise ValueError(
-                    "htransform authenticated QP corrected extent does not "
-                    "protect the returned interior: the minimum energy "
-                    "separation from every nonreturned fitted state is "
-                    f"{min_returned_interior_margin:.6e} Ry, not above the "
-                    f"canonical multiplet tolerance {DEGENERACY_TOL_RY:.6e} "
-                    "Ry.  Produce canonical QP U/E for a wider corrected "
-                    "block or return fewer bands; do not track branches "
-                    "along this plotting path.")
+                log_fn(
+                    "  [note] returned QP bands interleave in energy with "
+                    "non-returned fitted states (margin "
+                    f"{min_returned_interior_margin:.6e} Ry); selection is by "
+                    "active character, so the published bands are unaffected")
         if coeffs_on_path is not None:
             jax.block_until_ready(coeffs_on_path)
         energies_on_path = energies_sorted_jax

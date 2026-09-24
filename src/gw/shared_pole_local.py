@@ -5,7 +5,7 @@ column tables and the one round program that packs, assembles, reduces, gates
 and sorts every parent of a round on its own rank with local dense kernels,
 and the restore of round results to the face.
 """
-from functools import lru_cache
+from functools import lru_cache, partial
 
 # Batch layout: rank x*Py + y owns whole parents; every other axis is unsharded.
 BATCH = ('x', 'y')
@@ -276,7 +276,9 @@ def solve_parent_pencil(points, q, o, d, infinity, active, *, eigh, matmul,
         model, zero = apply_shared_pole_zero_policy(model, gates=gates)
         # E selects the infinity block, the last columns of X.
         side, width = pencil[0].shape[-1], infinity[0].shape[-1]
-        selector = (jnp.arange(side)[:, None] == jnp.arange(side - width, side)[None, :])[None]
+        selector = (jnp.arange(side)[:, None] == jnp.arange(side - width, side)[None, :])
+        # One selector per parent: the whole-mesh service matmul does not broadcast batches.
+        selector = jnp.broadcast_to(selector, (pencil[0].shape[0],) + selector.shape)
         retained = retained_moment_identity(pencil, coefficients, model, selector.astype(jnp.complex128),
                                             matmul=matmul)
         signed = ()
@@ -423,14 +425,22 @@ def check_round(model, signed, inverse_coulomb_sqrt, held, moments, infinity_dir
 
     from gw.shared_pole_execution import is_face
     if is_face(model[0]):
-        if real != 1:
-            raise ValueError('whole-mesh shared-pole checks require one physical parent')
+        # A face round holds ``real`` physical parents on the leading axis;
+        # the gate equations are per parent, so each is checked on its own
+        # leading row (no data moves) and the replicated rows are stacked.
         from gw.shared_pole_execution import face_round_check_program
-        out = face_round_check_program(mesh_xy, bool(ordered), model[0].shape[-2])(
-            model, signed, inverse_coulomb_sqrt, *held,
-            np.asarray(nodes, np.complex128), np.float64(eta_ry),
-            *moments, infinity_directions)
-        return jax.tree.map(np.asarray, out)
+        if int(model[0].shape[0]) != int(real):
+            raise ValueError('whole-mesh shared-pole checks take physical parents only')
+        program = face_round_check_program(mesh_xy, bool(ordered), model[0].shape[-2])
+        rows = []
+        for slot in range(int(real)):
+            pick = partial(_leading_row, slot=slot)
+            out = program(jax.tree.map(pick, model), jax.tree.map(pick, signed),
+                          pick(inverse_coulomb_sqrt), *(pick(h) for h in held),
+                          np.asarray(nodes, np.complex128), np.float64(eta_ry),
+                          *(pick(m) for m in moments), pick(infinity_directions))
+            rows.append(jax.tree.map(np.asarray, out))
+        return jax.tree.map(lambda *v: np.concatenate(v, axis=0), *rows)
 
     replicated = NamedSharding(mesh_xy, P())
     # Batch-layout equations run inside shard_map and therefore require the
@@ -442,6 +452,18 @@ def check_round(model, signed, inverse_coulomb_sqrt, held, moments, infinity_dir
                   jax.device_put(np.asarray(nodes, np.complex128), replicated),
                   jax.device_put(np.float64(eta_ry), replicated), *moments, infinity_directions)
     return jax.tree.map(np.asarray, out)
+
+
+def _leading_row(array, *, slot):
+    """Parent ``slot`` of a stack whose leading parent axis is unsharded."""
+    return _leading_row_program(array.sharding)(array, slot)
+
+
+@lru_cache(maxsize=None)
+def _leading_row_program(sharding):
+    import jax
+    return jax.jit(lambda a, s: jax.lax.dynamic_slice_in_dim(a, s, 1, axis=0),
+                   out_shardings=sharding)
 
 
 def _round_check_equations(model, signed, inverse, wc, dw, z, eta, m1, m3, qi,

@@ -832,8 +832,18 @@ def dirac_current_operator(geom: SweepGeometry) -> Operator:
 
 def dipole_operator(geom: SweepGeometry, *, bvec, blat,
                     vnl_setup=None,
-                    vnl_velocity_sign=VNL_VELOCITY_SIGN_FLIPPED) -> Operator:
-    """``v ∘ ψ = 2(k+G)_cart ψ ± (∂V_NL/∂K_cart) ψ`` — THREE components.
+                    vnl_velocity_sign=VNL_VELOCITY_SIGN_FLIPPED,
+                    hubbard=None) -> Operator:
+    """``v ∘ ψ = 2(k+G)_cart ψ ± (∂V_NL/∂K_cart) ψ [+ (∂V_U/∂K_cart) ψ]``.
+
+    THREE components.  ``hubbard`` (a ``psp.hubbard_ops.HubbardSetup``) adds
+    the DFT+U commutator ``i[r, V_U]`` for a QE ortho-atomic DFT+U mean
+    field, through ``hubbard_ops.apply_hubbard_velocity_to_ket`` -- the same
+    band-local projector apply as V_NL (atomic rows replicated,
+    ``4·N_atwfc·ngkmax·16`` B per k: 204 MB on VI3 12x12, a sixth of V_NL's
+    Z/dZ), so ψ stays band-sharded and nothing ``(nb, nb)`` is formed.
+    Its sign is the physical +1 and is not the V_NL knob's.  ``None`` (every
+    non-DFT+U deck) executes the pre-Hubbard operator literally.
 
     The velocity matrix ``psp.get_dipole_mtxels`` writes is
     ``p - i[r, V_NL]`` in the stored convention, assembled here as
@@ -919,20 +929,38 @@ def dipole_operator(geom: SweepGeometry, *, bvec, blat,
     def op(psi_n, gvec, gmask, bidx, kvec, B):
         psi = _ket(psi_n, gmask)
         v = apply_kinetic_velocity_to_ket(psi, gvec, kvec, B)
+        v_nl = None
         if vnl_setup is not None:
             kdata = vnl_ops.build_vnl_kdata_traced(kvec, gvec, vnl_setup,
                                                    compute_dZ=True)
             ns_e = int(kdata.E_super.shape[0])
             v_nl = vnl_ops.apply_vnl_velocity_to_ket(
                 psi[:, :ns_e], kdata.Z, kdata.dZ, kdata.E_super)
+        if hubbard is not None:
+            # Summed on the two Pauli components BEFORE the one spinor pad:
+            # a second padded (3, nb/P, ns, ngkmax) temporary is what pushed
+            # the VI3 12x12 bispinor sweep 1.1 GB over its P9 budget.
+            from psp.hubbard_ops import apply_hubbard_velocity_to_ket
+            v_u = apply_hubbard_velocity_to_ket(psi[:, :2], kvec, gvec, gmask, hubbard)
+            v_nl = v_u if v_nl is None else v_nl + v_u
+        if v_nl is not None:
             pad = _pad_spinor(v_nl, int(psi.shape[1]))
             v = v + pad if flipped else v - pad
         return jnp.moveaxis(v, 0, -1)[None]
 
+    if hubbard is not None and not flipped:
+        raise ValueError(
+            "GATE dftu_velocity_sign: i[r, V_U] requested with the legacy "
+            "vnl_velocity_sign = -1 arm\n  got:  vnl_velocity_sign = -1 with a "
+            "DFT+U Hubbard setup\n  want: vnl_velocity_sign = +1\n  why:  the -1 "
+            "arm exists only to reproduce pre-2026-08-09 files, none of which "
+            "carries V_U; a mixed-sign velocity is no DFT operator\n  fix:  drop "
+            "vnl_velocity_sign or set it to +1")
     return Operator(apply=op, post=1.0, ncomp=3, consts=(B,),
                     key=('dipole', geom.ngkmax, geom.ns, float(blat),
                          None if vnl_setup is None else id(vnl_setup),
-                         sign))
+                         sign)
+                    + (() if hubbard is None else (('hubbard', id(hubbard)),)))
 
 
 class UniformGaugeCurrentMatrixElements(NamedTuple):

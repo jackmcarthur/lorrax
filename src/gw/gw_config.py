@@ -1087,11 +1087,12 @@ _DEFAULTS = {
     "zeta_nband": None,
     "sys_dim": 2,
     # Rebuild V_H from the CURRENT orbitals each self-consistent iteration
-    # instead of rotating the fixed DFT one into the QP basis.  False remains
-    # the scalar-QSGW default.  ``from_input_file`` promotes an UNNAMED false
-    # to true for bispinor QSGW because freezing either member of the required
-    # (rho, J) four-current would be internally inconsistent; an explicit
-    # false is preserved and refused by the four-current gate below.
+    # instead of rotating the fixed DFT one into the QP basis.  The raw False
+    # only lets the envelope tell an omitted key from a named one:
+    # ``from_input_file`` promotes an OMITTED key to true for every
+    # ``qp_solver = self_consistent`` deck (owner 2026-09-23).  An explicit
+    # scalar false is kept as a WARNING-announced comparison mode; an explicit
+    # bispinor false is refused by the four-current gate below.
     "density_self_consistent": False,
     # Run the SC loop's retained H / E / U / Sigma tables on the STAR wedge.
     # A map broadcasts H/E/U to the full BZ for the k-grid FFT, then selects
@@ -1379,6 +1380,12 @@ _DEFAULTS = {
     # "1 unrecognized deck key(s)" in the log, which is this project's
     # named failure mode reproduced in one line of a deck.
     "vnl_velocity_sign": "",
+    # DFT+U mean field (QE ortho-atomic): the pw.x input carrying the HUBBARD
+    # card, and that run's prefix.save/occup.txt.  Read by psp.hubbard_ops'
+    # one resolver, which the dipole/velocity producer and every velocity
+    # consumer call; a WFN whose QE schema declares DFT+U refuses without them.
+    "hubbard_input": "",
+    "hubbard_occupations": "",
     "do_G0": True,
     # Deprecated (2026-07-08): ``self_consistent = true`` is honored as an
     # alias for ``qp_solver = self_consistent`` via auto-resolution.  SC is
@@ -1456,10 +1463,10 @@ _DEFAULTS = {
     # at runtime when its planner picks a smaller value, but cohsex.in
     # > 0 wins over the planner.
     "gflat_chunk_size": 0,
-    # V_q inner G-axis GEMM chunk size.  Bounds the per-q ``lax.scan``
-    # working set inside the per-q V_q kernel.
-    # 0 (default) = auto (``_pick_g_chunk(ngkmax)`` → largest divisor
-    # of ngkmax ≤ 4096).
+    # V_q G-panel width: the columns gathered per step of the V_q kernel's
+    # G scan.  Any positive value (a G tail it does not divide is masked).
+    # 0 (default) = auto (``v_q_g_flat._plan_vq_tiles``: ≤ 4096, capped by
+    # LORRAX_COLLECTIVE_CHUNK_MB and the V_q memory budget).
     "vq_g_chunk_size": 0,
     # The only deck selector for dense-LA placement.  ``resolve_linalg``
     # expands it once into the established whole-matrix or provider profile;
@@ -2424,8 +2431,9 @@ def _resolve_shared_pole_inputs(params):
             "  shared-pole support ladders with explicit sites:\n"
             f"    line      {override['line_ev']} eV\n"
             f"    imaginary {override['imaginary_ev']} eV\n"
-            "  The resolver's 2*eta/4*eta line rule and its Zolotarev\n"
-            "  imaginary count are NOT used.  Height (4*eta), held\n"
+            "  The resolver's band-structure line rule (production),\n"
+            "  endpoint line rule (relaxed), and Zolotarev imaginary\n"
+            "  count are NOT used.  Height (4*eta), held\n"
             "  fractions, widths, zero policy and every gate are unchanged.\n"
             "  The sites enter recipe_version/recipe_hash, so a store built\n"
             "  on another ladder refuses on restart.  This is a support\n"
@@ -2935,6 +2943,8 @@ def _assemble_input_config(
         bispinor=bool(params["bispinor"]),
         bispinor_gw=coerce_bispinor_gw_mode(params["bispinor_gw"]),
         vnl_velocity_sign=str(params["vnl_velocity_sign"] or ""),
+        hubbard_input=str(params["hubbard_input"] or ""),
+        hubbard_occupations=str(params["hubbard_occupations"] or ""),
         do_G0=_resolved_do_g0,
         self_consistent=bool(params["self_consistent"]),
         use_ppm_sigma=bool(params["use_ppm_sigma"]),
@@ -3599,9 +3609,16 @@ def uses_bare_transverse_shared_pole(config) -> bool:
 
 
 def uses_bare_tt_gamma_head(config) -> bool:
-    """Insert the bare transverse Gamma average into hybrid TT V tiles."""
-    return (uses_bare_transverse_shared_pole(config)
-            and config.head.correction is not HeadCorrection.OFF)
+    """Insert the bare transverse Gamma average into bare-TT V tiles."""
+    hybrid = (uses_bare_transverse_shared_pole(config)
+              and config.head.correction is not HeadCorrection.OFF)
+    bare_x = (bool(config.bispinor)
+              and config.compute_mode is ComputeMode.X_ONLY
+              and coerce_bispinor_gw_mode(config.bispinor_gw)
+                  is BispinorGWMode.BARE_TRANSVERSE
+              and config.head.correction is HeadCorrection.FULL
+              and int(config.sys_dim) in (2, 3))
+    return hybrid or bare_x
 
 
 def uses_direct_bispinor_shared_pole_head(config) -> bool:
@@ -3635,6 +3652,10 @@ def incumbent_bispinor_head_record(config) -> tuple[str, str]:
                         "on the four-spinor charge carrier; no wing/body fold; "
                         "bare transverse Gamma exchange")
         return "", "no-local-fields head outside the direct four-current route"
+    if (config.compute_mode is ComputeMode.X_ONLY
+            and uses_bare_tt_gamma_head(config)):
+        return "", ("bare charge and TT Gamma-cell averages in V; "
+                    "no screened W")
     # With head_correction = full, the CHARGE head is band-diagonal and
     # there is NO transverse q=Gamma head on this route now that the overlay
     # has no deck key -- say so rather than let a bulk number look complete.
@@ -3698,6 +3719,12 @@ def refuse_unsupported_bispinor_gw(config) -> None:
     """Validate four-current modes and require live direct fields for QSGW; see docs/architecture/decisions.md."""
     mode = coerce_bispinor_gw_mode(
         getattr(config, "bispinor_gw", BispinorGWMode.BARE_TRANSVERSE))
+    if (config.compute_mode is ComputeMode.X_ONLY
+            and uses_bare_tt_gamma_head(config) and bool(config.restart)):
+        raise ValueError(
+            "GATE bare_tt_gamma_restart_unstamped: bare bispinor exchange "
+            "needs a fresh V with its TT Gamma-cell average; restart V "
+            "does not stamp that choice. Set restart=false.")
     shared_pole_direct = (uses_direct_bispinor_shared_pole_head(config)
                           or (uses_bare_transverse_shared_pole(config)
                               and config.head.correction is HeadCorrection.NO_LOCAL_FIELDS))
@@ -4381,7 +4408,7 @@ class MemoryConfig:
     band_chunk_size: int
     r_chunk_override: int         # 0 = auto
     gflat_chunk_size: int         # 0 = planner-picked
-    vq_g_chunk_size: int          # 0 = auto _pick_g_chunk(ngkmax)
+    vq_g_chunk_size: int          # 0 = auto v_q_g_flat._plan_vq_tiles
     low_mem_bands: bool           # parent ψ layout: face=True, axis=False
     low_mem_bands_provenance: str  # deck | default | derived for packed mode
 
@@ -4491,11 +4518,12 @@ def validate_material_inputs(config, material_class):
                 "splits bands by a 0/1 step at a derived Fermi level "
                 "(gw.ppm_sigma.assert_gapped_occupations_for_ppm)\n"
                 "  doc:  docs/input_reference.md, compute_mode")
-        if config.compute_mode is not ComputeMode.MPA:
+        if config.compute_mode not in (ComputeMode.MPA, ComputeMode.X_ONLY):
             raise ValueError(
                 "GATE fractional_occupations_require_mpa: WFN occupations "
                 f"identify a metal, but compute_mode={config.compute_mode.value}; "
-                "use compute_mode=mpa, the occupation-aware path.")
+                "use compute_mode=mpa for screened GW or "
+                "compute_mode=x_only for bare exchange.")
         if (config.sc.head_update in METAL_HEAD_UPDATES
                 and not uses_metal_direct_drude_head(config)):
             raise ValueError(
@@ -4655,6 +4683,10 @@ class LorraxConfig:
     #: point of use.  Keeping the spelling (rather than a second resolver in
     #: gw_config) lets every velocity consumer take the producer's exact arm.
     vnl_velocity_sign: str
+    #: DFT+U velocity inputs (deck-relative spellings); resolved at the point
+    #: of use by ``psp.hubbard_ops.resolve_hubbard_input``.
+    hubbard_input: str
+    hubbard_occupations: str
     do_G0: bool
     self_consistent: bool         # deprecated alias; ``qp_solver`` is canonical
     use_ppm_sigma: bool           # legacy mirror; ``compute_mode`` is canonical

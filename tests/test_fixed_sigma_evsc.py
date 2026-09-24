@@ -301,27 +301,32 @@ def test_eqp2_reapplies_semicore_and_conduction_scissors_on_final_map():
     assert any("optional out-of-grid" in line for line in log)
 
 
-def test_fixed_sigma_evsc_refuses_uncovered_energy_before_clamping():
+def test_fixed_sigma_evsc_takes_sigma_at_zero_for_a_protected_state_off_the_grid():
     omega_ev = np.linspace(-1.0, 1.0, 5)
-    # Both DFT states are protected initially.  The first map pushes one
-    # outside the table, so the *next* evaluation must refuse rather than
-    # reclassify that protected state as an optional scissored tail.
+    # Both DFT states are protected initially.  The first map pushes state 0
+    # to -2.2 eV, outside the table; the owner rule of 2026-09-22 evaluates
+    # it at Sigma(omega=0) rather than refusing or clamping to the -1 eV
+    # edge.  Sigma_c(omega) = 0.1*omega on that diagonal makes the three
+    # outcomes distinguishable: Sigma(0) = 0, the edge clamp -0.1 eV.
     e_dft_ry = np.array([[-0.2, 0.2]]) / RYD_TO_EV
     zmat = jnp.zeros((1, 2, 2), dtype=jnp.complex128)
     kin = jnp.asarray(np.diag(e_dft_ry[0])[None].astype(complex))
     sigma_x = np.zeros((1, 2, 2), dtype=complex)
     sigma_x[0, 0, 0] = -2.0 / RYD_TO_EV
+    sigma_c = np.zeros((5, 1, 2, 2), dtype=complex)
+    sigma_c[:, 0, 0, 0] = 0.1 * omega_ev / RYD_TO_EV
     result = SigmaResult(
         v_h_kij_ry=zmat,
         sigma_x_kij_ry=jnp.asarray(sigma_x),
         sigma_xc_kij_ry=zmat,
-        sigma_c_omega_kij_ry=jnp.zeros((5, 1, 2, 2), dtype=jnp.complex128),
+        sigma_c_omega_kij_ry=jnp.asarray(sigma_c),
         omega_grid_ev=omega_ev,
         omega_grid_ry=omega_ev / RYD_TO_EV,
         efermi_dft_ev=0.0,
     )
-    with pytest.raises(ValueError, match="eqp2_omega_coverage"):
-        run_fixed_sigma_evsc(
-            result, kin, e_dft_ry, config=_config(),
-            **_band_context(e_dft_ry),
-            mesh_xy=single_device_mesh(), print_fn=lambda *a: None)
+    got = run_fixed_sigma_evsc(
+        result, kin, e_dft_ry, config=_config(),
+        **_band_context(e_dft_ry),
+        mesh_xy=single_device_mesh(), print_fn=lambda *a: None)
+    np.testing.assert_allclose(
+        got.energies_ry[0, 0] * RYD_TO_EV, -2.2, atol=1e-8, rtol=0.0)

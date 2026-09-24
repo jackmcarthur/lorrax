@@ -20,6 +20,53 @@ def detect_version(upf_path: str | Path) -> str:
 	return '0.99'
 
 
+
+def load_upf_pswfc(upf_path: str | Path) -> dict:
+	"""PP_PSWFC atomic wavefunctions of a UPF v2 file, with their j labels.
+
+	Returns ``{"r", "rab", "chi"}``: the radial mesh and one dict per
+	PP_CHI.n in file order, ``{"label", "l", "occupation", "j", "chi"}``,
+	with ``chi`` = the UPF value (r * R(r)) and ``j`` from PP_SPIN_ORB /
+	PP_RELWFC.n (None for a scalar-relativistic file).  The dataclass model
+	only declares PP_CHI.1/.2, so this reads the XML directly; it is the
+	input of QE's atomic_wfc (DFT+U projectors, psp.hubbard_ops).
+	"""
+	root = ET.parse(str(upf_path)).getroot()
+
+	def local(tag):
+		return tag.split('}', 1)[1] if isinstance(tag, str) and '}' in tag else tag
+
+	def values(elem):
+		return [float(x) for x in (elem.text or '').split()]
+
+	import numpy as np
+	mesh = next(c for c in root if local(c.tag) == 'PP_MESH')
+	r = np.asarray(values(next(c for c in mesh if local(c.tag) == 'PP_R')))
+	rab = np.asarray(values(next(c for c in mesh if local(c.tag) == 'PP_RAB')))
+	jchi = {}
+	for c in root:
+		if local(c.tag) == 'PP_SPIN_ORB':
+			for w in c:
+				if local(w.tag).startswith('PP_RELWFC.'):
+					jchi[int(w.get('index'))] = float(w.get('jchi'))
+	chis = []
+	pswfc = [c for c in root if local(c.tag) == 'PP_PSWFC']
+	for c in (pswfc[0] if pswfc else []):
+		tag = local(c.tag)
+		if not tag.startswith('PP_CHI.'):
+			continue
+		idx = int(tag.split('.', 1)[1])
+		chis.append({
+			"index": idx,
+			"label": (c.get('label') or '').strip(),
+			"l": int(c.get('l')),
+			"occupation": float(c.get('occupation')),
+			"j": jchi.get(idx),
+			"chi": np.asarray(values(c))[:len(r)],
+		})
+	chis.sort(key=lambda d: d["index"])
+	return {"r": r, "rab": rab, "chi": chis}
+
 def load_upf(upf_path: str | Path):
 	upf_path = Path(upf_path)
 	version = detect_version(upf_path)

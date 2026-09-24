@@ -1,6 +1,7 @@
 """GW adapter contracts for raw-parent centroid operators."""
 from __future__ import annotations
 
+import harness
 from types import SimpleNamespace
 
 import jax
@@ -170,7 +171,7 @@ def _local_gemm_plan(_mesh, **_kwargs):
     gemm.mesh = _mesh
     gemm.in_sharding_a = NamedSharding(_mesh, P(None, "x", "y"))
     gemm.in_sharding_b = gemm.in_sharding_a
-    return gemm
+    return harness.with_active_range(gemm)
 
 
 def _parent_and_full_minimax_bundles(monkeypatch):

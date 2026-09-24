@@ -40,7 +40,7 @@ layout of both eigenvector producers (``distrib_la``'s batched eigh and a
 ``jnp.linalg.eigh`` constrained to it); the whole ``(nk, nb, nb)`` is never
 gathered.  ``g_split`` gathers ONE tile's ``(K, nb, nb)`` inside the scan,
 admitted only while that tile is below the same budget share that lets the
-SC eigh hold a whole tile on one device (:func:`band_tile_fits_one_device`);
+SC eigh hold a whole tile on one device (:func:`band_tile_is_large`);
 past it ``band_2d`` keeps U distributed.
 
 EIGENVECTORS ARE COLUMNS.  ``Z[k, m, n]`` is component m of eigenvector
@@ -626,7 +626,8 @@ def _density_scan_body(mesh: Mesh, plan: DensityScanPlan, *, n_k: int,
 
 # FORCED SYNC, AND IT COSTS NOTHING HERE.  ρ(r) is ``(nx, ny, nz)`` f64 —
 # 750 kB at 60×60×26 — and the very next statement in the only production
-# caller (:func:`hartree_from_orbitals` → ``build_hartree_potential``) is
+# caller (``sc_iteration.rebuild_hartree_dft_basis`` →
+# ``build_hartree_potential``) is
 # ``float(jnp.sum(rho_r))``, a full host synchronisation for the charge
 # check.  ``watch=True`` therefore moves the block a few Python statements
 # earlier and changes nothing else about the pipeline; what it buys is that
@@ -946,11 +947,11 @@ def rotate_bands(psi_G, U_qp, *, mesh: Mesh):
 # ``np.asarray(U_qp)`` a few lines later for the k-star broadcast, so both
 # were being synchronised immediately regardless; E and Z come out of one
 # FFI call, so blocking on the pair is the same wait as blocking on either.
-# Pad-diagonal sentinel for the band-axis pad below.  Ry; physical QP
-# eigenvalues are O(1) Ry, so this is ~10 orders clear and the pad
-# eigenvalues cannot interleave with the physical spectrum at any deck.
-# Same spelling as the tree's other sentinel, psp/dft_operators.py:736.
-_EIGH_PAD_SENTINEL_RY = 1e10
+def _eigh_pad_sentinel(H):
+    """Place an inert pad above every Hermitian k block's spectrum."""
+    # The maximum absolute row sum bounds every eigenvalue in magnitude.
+    # Reduce the sharded matrix to one small value per k before eigensolving.
+    return jnp.max(jnp.sum(jnp.abs(H), axis=-1), axis=-1) + 1.0
 
 
 @timing.timed("sc.eigh", watch=True)
@@ -1064,18 +1065,14 @@ def distributed_eigh_bands(H, *, mesh: Mesh,
         # deflates exactly; only the safe VALUE differs, because there the
         # pad modes are dropped by |lambda| and here by position.
         #
-        # Sentinel value: 1e10, the tree's existing spelling
-        # (psp/dft_operators.py:736,759). Physical eigenvalues here are
-        # O(1) Ry, so it is ~10 orders clear. NOTE it is safe *because it
-        # is dropped*: common/wfn_transforms.py:1606-1618 deliberately
-        # chose a FINITE max(E)+1 Ry sentinel for band energies that are
-        # KEPT, since those flow into PPM resolvents 1/(w - e + i.eta).
-        # These do not survive this function, and a value that is absurd
-        # on sight makes a future leak loud instead of silent.
+        # A fixed 1e10 Ry sentinel made the eigensolver's backward error
+        # scale with an unphysical norm.  The row-sum bound is above this
+        # k block's entire physical spectrum, with a 1 Ry margin.
+        sentinel = _eigh_pad_sentinel(H_j)
         i = jnp.arange(nb_pad)[:, None]
         j = jnp.arange(nb_pad)[None, :]
         on_pad_diag = ((i == j) & (i >= nb))[None]
-        H_j = jnp.where(on_pad_diag, _EIGH_PAD_SENTINEL_RY, H_j)
+        H_j = jnp.where(on_pad_diag, sentinel[:, None, None], H_j)
     E, U = dispatch_batched_eigh(
         H_j, mesh, distrib_la_backend,
         batched_route=distrib_la_batched_route)

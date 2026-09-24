@@ -121,7 +121,7 @@ def gemm_case(mesh, rng):
 def _identity_plan(kgrid, mesh, ns=2):
     from gw.centroid_k_unfold import build_centroid_k_unfold_plan
     from symmetry_maps import spinor_rotation_for_sym_row
-    import test_zeta_mubatch_sym_parity as parity
+    import zeta_mubatch_fixtures as parity
     ops = np.eye(3, dtype=np.int64)[None]
     kfrac = np.asarray(list(np.ndindex(kgrid))) / np.asarray(kgrid, float)
     nk = kfrac.shape[0]
@@ -141,7 +141,7 @@ def kconv_case(mesh, rng, which):
     from runtime.padding import padded_axis
     from ffi.fft import conv_kpair_plan, make_fused_conv_kparent, CONV_KPARENT_GATE
     from isdf.core import parent_projector_kconv, _conv_kpair_static_gamma
-    import test_zeta_mubatch_sym_parity as parity
+    import zeta_mubatch_fixtures as parity
     if which == "identity":
         kgrid = (3, 4, 2)
         plan = _identity_plan(kgrid, mesh)
