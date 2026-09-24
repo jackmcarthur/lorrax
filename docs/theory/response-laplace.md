@@ -1,85 +1,102 @@
 # Compact noncrossing response quadrature
 
-`minimax.response_laplace_rule` is the service door; `laplace_ritz.py` owns
-placement, projection and the continuum residual certificate. Energies use one
-unit (Ry in GW), times its inverse, and derivatives are with respect to `s=z²`.
-The service accepts a positive transition interval `[L,H]` with
-`L > max|Re z|`, plus a physical reference gap `r`. The
-[service contract](../services/minimax.md#response-bank-rule-sessions) owns
-padding and reuse; the [bank](../architecture/shared_pole_model.md) owns state
-partitioning and response orientation.
+`minimax.response_laplace_rule` returns positive real times and projection
+rows for response kernels on a transition interval [L, H] that no sample
+frequency crosses. `minimax.laplace_ritz` owns the placement, the projection
+and the continuum certificate. The production consumer is the GN-PPM
+imaginary-axis probe ([Minimax quadrature §3](minimax-quadrature.md)). The
+shared-pole response bank uses the grouped shared-node rules of
+`minimax.response_group_rules` instead: complex times shared by a group of
+samples, with sampled rather than continuum error bounds
+([shared-pole model §2](../architecture/shared_pole_model.md)). Energies
+share one unit (Ry in GW), times its inverse, and derivatives are taken with
+respect to s = z².
 
-## Geometry-only positive times
+## Targets
 
-For degree N, set `W=max|Re z|`, `a=(L-W)/2`, `b=(H+W)/2`, `k'=a/b`, and
-`k=sqrt(1-k'²)`. Prescribe auxiliary rates
+For samples z with W = max|Re z| < L and transitions d ∈ [L, H]:
 
-\[
-\alpha_j=b\,\mathrm{dn}\!\left((2j+1)K(k)/(2N),k\right).
-\]
-
-A complementary-modulus product evaluates these without subtracting nearly
-identical numbers. In the orthonormal exponential basis, differentiation has
-`A_ii=-alpha_i`, `A_ij=-2 sqrt(alpha_i alpha_j)` for `i<j`, and zero below the
-diagonal. Solve `Aᵀ M + M A = -I`; the eigenvalues of the symmetric time-moment
-matrix M are the positive times. The implementation scales energies before
-this small solve. It never forms the ill-conditioned Cauchy Gram matrix.
-When all rates coincide, these are Gauss–Laguerre times divided by `2 alpha`.
-
-These are Ritz values of multiplication by time in the exponential subspace;
-positivity follows from `integral t |f(t)|² / integral |f(t)|² > 0`.
-The elliptic rate distribution controls the subspace's Blaschke-product
-projection error, but does **not** by itself certify the final finite sum or
-prove it is minimax. Degree selection uses the final residual certificate,
-not a universal20-node promise. No nonlinear node optimization or node bank
-is used.
-
-## Values and Hermite data on the same times
-
-At deterministic Chebyshev points in `log(d-W)`, form `B_lj=exp(-(d_l-L)t_j)`.
-A column-scaled real SVD with two right-hand sides projects each exact target
-with relative weighting. The targets are
-
-\[
-K_e=\frac{d}{d^2-z^2},\quad \partial_s K_e=\frac{d}{(d^2-z^2)^2},\qquad
+$$
+K_e=\frac{d}{d^2-z^2},\quad \partial_sK_e=\frac{d}{(d^2-z^2)^2},\qquad
 K=\frac1{d^2-z^2},\quad \partial_sK=\frac1{(d^2-z^2)^2}.
-\]
+$$
 
-The last two are needed for ordered response: `K_o=z K` and
-`partial_s K_o=K/(2z)+z partial_sK`. Values and derivatives are independently
-projected exact rational targets; the derivative of a frequency-dependent
-weighted least-squares solve is not used. All rows share exactly the same
-times. Returned coefficients include `exp(-(r-L)t)`, and the existing Green
-factors supply `exp(-(d-r)t)`. Actual physical transitions obey `d>=r`, so no
-production operand grows exponentially. Complex coefficients are allowed;
-no conjugate-time union or new Green/FFT kernel is required.
+The last two serve ordered (broken time reversal) response through
+K_o = zK and ∂_sK_o = K/(2z) + z∂_sK. Every target is represented on the same
+times as Σ_j c_j e^{−(d−r)t_j}, where r ∈ (W, L] is the caller's reference:
+the returned coefficients include e^{−(r−L)t} and the Green's-function factors
+supply e^{−(d−r)t}. Physical transitions obey d ≥ r, so no production operand
+grows.
 
-## Continuum certificate of the returned arrays
+## Times from geometry alone
 
-On short geometric panels in `d-W`, expand each exponential to degree20 in
-`y=(d-centre)/halfwidth`. Its uniform remainder is bounded by
-`exp(-(left-L)t) (halfwidth*t)^21/21!`. Multiply the finite polynomial by the
-exact denominator (`d²-z²`, its square, or a primitive linear denominator or
-its square), subtract the exact numerator, and sum the absolute Chebyshev
-coefficients. Add the exponential remainder times the denominator bound and
-a conventional floating-point arithmetic allowance. The squared denominators
-are degree4 and certify the derivative targets with the same construction.
+For degree N set a = (L − W)/2, b = (H + W)/2, k′ = a/b, k = √(1 − k′²), and
+take the elliptic rates
 
-The certificate covers all real d in the padded interval at every supplied z;
-it is neither a fit-grid residual nor a claim for unsampled frequencies.
-It reconstructs K and its derivative from the **rounded returned odd rows**,
-including their `1/(2z)` term, and reverses the reference shift in extended
-precision before checking. It also checks the primitive orientation sums and
-derivatives directly. Relative error in the odd derivative itself is undefined
-at its zeros; the certificate instead bounds K and its derivative separately.
-There is no omitted infinite-time tail: the finite sum is compared to the full
-rational target. Arithmetic guards assume ordinary libm accuracy, not an
-interval-arithmetic implementation of the exponential function.
+$$
+\alpha_j=b\,\mathrm{dn}\!\left(\frac{(2j+1)K(k)}{2N},\,k\right),\qquad j=0,\dots,N-1,
+$$
 
-## Production response bank
+evaluated by a complementary-modulus product that never subtracts nearly
+equal numbers. In the orthonormal basis of the exponentials e^{−α_j t},
+differentiation has A_jj = −α_j and A_ij = −2√(α_iα_j) for i < j, and zero
+below the diagonal. Solve AᵀM + MA = −I. The eigenvalues of the symmetric
+time-moment matrix M are the times: the Ritz values of multiplication by t on
+that subspace. They are positive because ∫t|f|²/∫|f|² > 0, and equal rates
+give Gauss–Laguerre times divided by 2α. Energies are scaled by √(ab) before
+this N × N solve. The ill-conditioned Cauchy Gram matrix is never formed, and
+no nonlinear optimization or node bank is used.
 
-The bank now uses one occupation-weighted frequency rule over the full active
-transition interval, eliminating separate remote-cell Green sweeps.
-The [shared-pole architecture](../architecture/shared_pole_model.md) owns that
-stream and its error convention. This page documents the standalone
-noncrossing Laplace service and its stronger continuum certificate.
+The elliptic rates bound the Blaschke-product projection error of the
+subspace. That bound does not certify the finite sum; the certificate below
+does.
+
+## Projection on the fixed times
+
+Sample d at max(400, 16N) Chebyshev points in log(d − W) and form
+B_lj = e^{−(d_l−L)t_j}. Each target is fitted independently by a column-scaled
+real least-squares solve with relative row weights, the derivative targets
+included, so no derivative of a frequency-dependent weighted solve is taken.
+Coefficients may be complex; the times stay real and positive, so the
+consumer's Green and FFT kernels are unchanged.
+
+## Continuum certificate
+
+The domain is split into geometric panels in d − W, with ratio 1.15 per
+panel. On each panel every exponential is expanded to degree 20 in
+y = (d − centre)/halfwidth, with remainder bounded by
+e^{−(left−L)t}(halfwidth·t)^{21}/21!. The polynomial is multiplied by the
+exact denominator (d² − z² or its square for K_e and K; d ∓ z or its square
+for the ordered primitives), and the exact numerator is subtracted. The bound
+is the l¹ norm of the residual's Chebyshev coefficients, plus the remainder
+times the denominator bound, plus a floating-point guard.
+
+The certificate covers every real d in [L, H] at every supplied z. It is built
+from the rounded returned rows, including the odd rows' 1/(2z) term, with the
+reference shift reversed in extended precision, and it checks the forward and
+backward primitive sums separately. It bounds K and ∂_sK rather than the
+relative error of the odd derivative, which is undefined at that
+derivative's zeros. The finite sum is compared with the full rational target,
+so no infinite-time tail is omitted. The arithmetic guard assumes ordinary
+libm accuracy; it is not interval arithmetic.
+
+## Degree, reuse and cost
+
+Degree starts at min(64, max(4, ⌈ln(16ρ) ln(1/ε)/π²⌉)), with
+ρ = (H + W)/(L − W), and rises by one until the certificate passes. A previous
+rule is reused when its digest is intact, its certified domain contains
+[L, H] and it passes the current frequencies; otherwise a new rule is built,
+optionally on a padded domain. All of this is host scalar work, dominated per
+degree by the (400 or 16N) × N least squares and one degree-20 expansion per
+panel, of which there are ⌈ln((H − W)/(L − W))/ln 1.15⌉.
+
+## Refusals
+
+| refusal | cause |
+|---|---|
+| `remote Laplace integral does not converge` | L ≤ max\|Re z\|: the interval is crossed and belongs to a crossing rule |
+| `remote reference must lie above \|Re(z)\| and at or below delta_lo` | reference r outside (W, L] |
+| `remote Ritz certificate failed through 64 nodes` | tolerance too tight for the interval ratio |
+| `response rule node digest mismatch` | a corrupted reused rule |
+| `Loss of positivity in the time Ritz spectrum` | numerical breakdown of the Ritz solve |
+| `Reference shift exceeds scalar certification range` | e^{(r−L)t} overflows extended precision; raise r toward L |
