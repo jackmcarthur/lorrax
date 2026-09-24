@@ -9,11 +9,10 @@ mesh carriers through ``runtime.padding``.
    (zeta_mubatch.py plane route) and a host NumPy sum, route-G shapes
    (ψ(G) sharded on its G slice); pad centroid slots and pad G columns must
    be exactly zero.  Red twin: the column store left unconjugated.
-2. conv_kparent: the native arm of ``parent_projector_kconv`` against its
-   XLA arm on an identity plan (plus a host NumPy
-   ``Z_q = Σ_k Σ_ab D^L_k conj D^R_{k+q}``) and on the glide ns=2 plan (spin
-   mixing, an antiunitary row) with in-tile gather tables.  Red twin: the
-   native arm with the right gather rolled by one slot.
+2. The parent-k k-convolution is not here: since the k-convolution router
+   (cef4407c) ``parent_projector_kconv`` has no XLA arm to compare against,
+   and ``tests/multi_device/kconv_router_p4.py`` owns its parity (every
+   router mode against np.fft, with red twins).
 
 Parity at 1e-13 max-abs relative; each red twin must miss by > 1e-3.
 Run: ``lx run -N 1 -G 4 -n 4 python3 -u tests/multi_device/pair_kernels_p4.py``.
@@ -23,7 +22,6 @@ from __future__ import annotations
 import os
 import sys
 from functools import partial
-from types import SimpleNamespace
 
 import numpy as np
 
@@ -118,101 +116,12 @@ def gemm_case(mesh, rng):
         red_wrong_conj=min(_rel(R_l[cut], ref_l), _rel(R_r[cut], ref_r)))
 
 
-def _identity_plan(kgrid, mesh, ns=2):
-    from gw.centroid_k_unfold import build_centroid_k_unfold_plan
-    from symmetry_maps import spinor_rotation_for_sym_row
-    import zeta_mubatch_fixtures as parity
-    ops = np.eye(3, dtype=np.int64)[None]
-    kfrac = np.asarray(list(np.ndindex(kgrid))) / np.asarray(kgrid, float)
-    nk = kfrac.shape[0]
-    U = np.eye(2, dtype=np.complex128)[None]
-    sym = SimpleNamespace(
-        sym_matrices=ops, translations=np.zeros((1, 3)), irr_idx_k=np.arange(nk, dtype=np.int32),
-        sym_idx_k=np.zeros(nk, np.int32), unfolded_kpts=kfrac, kirr_fullids=np.arange(nk),
-        spinor_action=lambda rows, *, nspinor: spinor_rotation_for_sym_row(
-            U, np.asarray(rows), 2, nspinor=nspinor, R_cart=ops))
-    fg = (4, 4, 4)
-    return build_centroid_k_unfold_plan(sym, parity._grid_points(fg)[:8], fg, mesh,
-                                        nspinor=ns, parent_k_frac=kfrac)
-
-
-def kconv_case(mesh, rng, which):
-    """native conv_kparent vs its XLA arm on one uneven (b, cols) tile per rank."""
-    from runtime.padding import padded_axis
-    from ffi.fft import conv_kpair_plan, make_fused_conv_kparent, CONV_KPARENT_GATE
-    from isdf.core import parent_projector_kconv, _conv_kpair_static_gamma
-    import zeta_mubatch_fixtures as parity
-    if which == "identity":
-        kgrid = (3, 4, 2)
-        plan = _identity_plan(kgrid, mesh)
-    else:
-        fx = parity._glide_fixture(mesh, rng, 2)
-        plan, kgrid = fx["plan"], tuple(fx["kgrid"])
-    ns, n_par, nk = int(plan.nspinor), int(plan.n_parent), int(np.prod(kgrid))
-    rows = int(np.asarray(plan.sym_perm).shape[0])
-    b_tag = padded_axis(37, mesh, name="owner b")               # 37 -> 40
-    c_tag = padded_axis(45, mesh, name="plane points")          # 45 -> 48
-    b, c = b_tag.carrier, c_tag.carrier
-    P_ = 4
-    D = _crand(rng, 2, P_, n_par, ns, b, ns, c)
-    D[:, :, :, :, b_tag.logical:] = 0
-    D[..., c_tag.logical:] = 0
-
-    def gather(n_log, n_car):
-        if which == "identity":
-            return (np.broadcast_to(np.arange(n_car), (rows, n_car)).astype(np.int32),
-                    np.zeros((rows, n_car, 3)))
-        perm = np.stack([np.r_[rng.permutation(n_log), np.arange(n_log, n_car)]
-                         for _ in range(rows)]).astype(np.int32)
-        return perm, rng.integers(-1, 2, (rows, n_car, 3)).astype(float)
-    lp, lL = gather(b_tag.logical, b)
-    rp, rL = gather(c_tag.logical, c)
-    arm, reason = conv_kpair_plan(mesh, kgrid, ns, (b, c), gate=CONV_KPARENT_GATE)
-    p_l, ph_l = _conv_kpair_static_gamma(None, ns)
-    native = make_fused_conv_kparent(mesh, kgrid, ns, (b, c), perm_l=p_l, phase_l=ph_l,
-                                     perm_r=p_l, phase_r=ph_l)
-    if native is None:
-        raise SystemExit(f"{TAG} route predicate failed: conv_kparent arm={arm} ({reason})")
-    vtx = (np.arange(ns), np.ones(ns, dtype=np.complex128))
-    rep, sh = NamedSharding(mesh, P()), NamedSharding(mesh, P(None, XY))
-
-    @jax.jit
-    @partial(shard_map, mesh=mesh, in_specs=(P(None, XY), P(), P(), P(), P()),
-             out_specs=(P(XY),) * 3, check_vma=False)
-    def run(D_, lp_, lL_, rp_, rL_):
-        D_l, D_r = D_[0, 0], D_[1, 0]
-        kw = dict(plan=plan, left_perm=lp_, left_L=lL_, right_L=rL_, kgrid=kgrid,
-                  vertex_l=vtx, vertex_r=vtx)
-        Zn = parent_projector_kconv(D_l, D_r, right_perm=rp_, pair_kernel=native, **kw)
-        Zx = parent_projector_kconv(D_l, D_r, right_perm=rp_, pair_kernel=None, **kw)
-        Zr = parent_projector_kconv(D_l, D_r, right_perm=jnp.roll(rp_, 1, axis=1),
-                                    pair_kernel=native, **kw)
-        return Zn[None], Zx[None], Zr[None]
-
-    Zn, Zx, Zr = (_host(v) for v in run(_put(D, sh), *(_put(v, rep) for v in (lp, lL, rp, rL))))
-    rec = dict(case=f"conv_kparent_{which}", kgrid=list(kgrid), n_parent=n_par, rows=rows,
-               b=f"{b_tag.logical}->{b}", cols=f"{c_tag.logical}->{c}", arm=arm,
-               native_vs_xla=_rel(Zn, Zx),
-               pad_zone_max=float(np.max(np.abs(Zn[:, :, b_tag.logical:]))
-                                  + np.max(np.abs(Zn[..., c_tag.logical:]))),
-               red_rolled_right=_rel(Zr, Zx))
-    if which == "identity":   # Z_q = Σ_k Σ_ab D^L_k conj D^R_{k+q} (identity plan)
-        kint = np.asarray(list(np.ndindex(kgrid)))
-        ref = np.zeros_like(Zx)
-        for q in range(nk):
-            kq = np.ravel_multi_index(((kint + kint[q]) % kgrid).T, kgrid)
-            ref[:, q] = np.einsum('pkambr,pkambr->pmr', D[0], np.conj(D[1][:, kq]))
-        rec["native_vs_numpy"] = _rel(Zn, ref)
-    return rec
-
-
 def main() -> int:
     import json
     devs = np.asarray(jax.devices()).reshape(2, 2)
     mesh = Mesh(devs, XY)
     rng = np.random.default_rng(20260923)
-    recs = [gemm_case(mesh, rng), kconv_case(mesh, rng, "identity"),
-            kconv_case(mesh, rng, "glide")]
+    recs = [gemm_case(mesh, rng)]
     bad = []
     for r in recs:
         for k, v in r.items():
