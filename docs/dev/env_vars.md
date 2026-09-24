@@ -42,8 +42,6 @@ fit made at a different cutoff.
 | `LORRAX_ZETA_RIDGE` | `zeta_ridge` (`0`) | twin | float | Additive Tikhonov ridge `ε·tr(C_q)/n` on the charge CCT before the charge factor (`isdf/core._charge_factor_math`). Only the `cholesky` charge family reads it; the `rank_truncate` factor that both `linalg` layouts resolve does not. |
 | `LORRAX_SC_MAX_ITER` | `sc_max_iter` | twin | int | Self-consistency iteration cap. |
 | `LORRAX_SC_TOL_EV` | `sc_tol_ev` | twin | float | Self-consistency convergence tolerance, eV. |
-| `LORRAX_SC_ACCEL` | `sc_accelerator` (`anderson`) | twin | stripped, lower-cased string | Self-consistency accelerator; `SCConfig` refuses every value but `anderson`. |
-| `LORRAX_SC_DEPTH` | `sc_history_depth` (`20`) | twin | int | Accelerator history depth; `< 1` refuses. |
 | `LORRAX_SC_MIXING` | `sc_mixing` | twin | float | Self-consistency mixing weight. |
 | `LORRAX_SC_DUMP_DIR` | `sc_dump_dir` | twin | string | Directory for per-iteration self-consistency dumps. |
 

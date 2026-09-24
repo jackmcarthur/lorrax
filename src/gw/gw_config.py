@@ -2757,12 +2757,8 @@ def _input_iteration(
         tol_ev=_sc_env(
             "LORRAX_SC_TOL_EV", float, float(params["sc_tol_ev"]),
             "sc_tol_ev"),
-        accelerator=_sc_env(
-            "LORRAX_SC_ACCEL", lambda s: str(s).strip().lower(),
-            str(params["sc_accelerator"]).strip().lower(), "sc_accelerator"),
-        history_depth=_sc_env(
-            "LORRAX_SC_DEPTH", int, int(params["sc_history_depth"]),
-            "sc_history_depth"),
+        accelerator=str(params["sc_accelerator"]).strip().lower(),
+        history_depth=int(params["sc_history_depth"]),
         mixing=_sc_env(
             "LORRAX_SC_MIXING", float, float(params["sc_mixing"]),
             "sc_mixing"),
