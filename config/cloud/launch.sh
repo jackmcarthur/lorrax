@@ -34,8 +34,8 @@ export PATH="$LORRAX_CLOUD_ENV/bin:$PATH"
 # join each other's incarnation (see init_jax_distributed's docstring).
 export JAX_COORDINATOR_ADDRESS="${JAX_COORDINATOR_ADDRESS:-127.0.0.1:$((12000 + RANDOM % 20000))}"
 export JAX_PROCESS_COUNT="$NP"
-# Don't let XLA pre-grab the pool cuSOLVERMp/NCCL must share (config/README.md).
-export XLA_PYTHON_CLIENT_PREALLOCATE="${XLA_PYTHON_CLIENT_PREALLOCATE:-false}"
+# The GPU memory pool (allocator, reservation, fraction) is runtime policy:
+# runtime.set_default_gpu_pool().  A launcher sets none of it.
 
 exec mpirun -n "$NP" --bind-to none \
     bash -c 'export JAX_PROCESS_INDEX=$OMPI_COMM_WORLD_RANK

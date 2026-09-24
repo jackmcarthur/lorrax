@@ -160,12 +160,12 @@ _XLA_DEFAULT_MEM_FRACTION = 0.75
 def _derived_pool_bytes() -> tuple[int | None, int | None, str]:
     """(limit, in_use, source) when the live client reports no ``bytes_limit``.
 
-    jaxlib 0.9's ``cuda_async`` client keeps no arena statistics, so
-    ``memory_stats()`` has no ``bytes_limit`` (``bytes_limit=None`` in the
-    2026-09-23 cuda_async logs, runs/runtime/zeta_mubatch_20260923 in the
-    sandbox).  XLA caps that pool at
-    memory_fraction x total device memory, so the limit is derived the same
-    way here, in bytes, honouring the fraction variable jaxlib reads
+    jaxlib 0.9's ``cuda_async`` client reports ``bytes_limit`` only when its
+    pool is reserved (``PREALLOCATE=true``, the runtime's GPU pool policy):
+    unreserved, ``bytes_limit`` is 0 (the 2026-09-23 cuda_async logs,
+    runs/runtime/zeta_mubatch_20260923 in the sandbox).  The limit is then
+    derived as the reservation would have been, memory_fraction x total
+    device memory, in bytes, honouring the fraction variable jaxlib reads
     (:func:`runtime.xla_memory.resolve_xla_gpu_memory_env`).  ``in_use`` is
     the bytes of this process's live arrays on its device.  It is not
     nvidia-smi's used memory, because the async pool keeps freed blocks

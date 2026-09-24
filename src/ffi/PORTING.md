@@ -463,8 +463,9 @@ a run script should not duplicate those defaults.
 > is a TensorFlow variable that JAX never reads (a cell setting only it was
 > byte-identical to the unset cell, job 7882442).  `platform` also zeroes
 > `memory_stats()`, which every LORRAX memory report reads.  Porting a
-> cluster: pick `cuda_async`, and on sm_75 pair it with the command-buffer
-> `XLA_FLAGS` restriction (`config/frontera/ffi_env.sh`).  Full table in
+> cluster: set nothing — `runtime.set_default_gpu_pool()` selects
+> `cuda_async` with its pool reserved on every CUDA run; on sm_75 add the
+> command-buffer `XLA_FLAGS` restriction (`config/frontera/gpu_env.sh`).  Full table in
 > [`docs/environment/overview.md`](../../docs/environment/overview.md) §2.1.
 
 `CUDA_VISIBLE_DEVICES=$SLURM_LOCALID` is set per-rank by
@@ -594,9 +595,12 @@ Baked-in DCPL: `H5D_FILL_TIME_NEVER` + `H5D_ALLOC_TIME_EARLY` +
   Perlmutter; libcal probes InfiniBand transports it won't use
   (we route CAL through NCCL).
 - **`NCCL error 1 unhandled cuda error` → `cusolverMpSyevd status=7`**:
-  NCCL starved of VRAM. Check `XLA_PYTHON_CLIENT_PREALLOCATE=false`
-  is set (the module sets it; don't override with `true` + a fixed
-  `MEM_FRACTION`).
+  NCCL starved of VRAM. Under BFC with a pre-grabbed arena that was the
+  arena; under the runtime's reserved `cuda_async` pool the driver hands
+  idle pool memory to NCCL, so it means XLA's live bytes plus the non-pool
+  bytes exceed the card.  Check the startup report for a caller's
+  `ALLOCATOR=bfc` or a `MEM_FRACTION` above 0.85
+  (`docs/environment/overview.md` §2.1).
 - **`MPI_COMM_WORLD` size 1 inside `--module=mpich`**: wrong
   `--mpi=` flavour. Use `cray_shasta`.
 - **CUDA driver vs toolkit mismatch**: `nvidia-smi`'s "CUDA Version"

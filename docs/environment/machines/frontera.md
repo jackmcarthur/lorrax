@@ -36,8 +36,8 @@ this is the operational summary. All scripts are in `config/frontera/`.
 | certified launch | `templates/gw_dev.sbatch` | the canonical multi-node CPU job |
 
 Environment glue: `gpu_env.sh` (rtx CUDA env — FFI `.so` path, venv nvidia
-libs, `CUSOLVERMP_FORCE_NCCL=1`, and the `cuda_async` + sm_75 `XLA_FLAGS`
-**matched pair**) and `mpi_transport_env.sh` (unconditional Intel-MPI
+libs, `CUSOLVERMP_FORCE_NCCL=1`, and the sm_75 command-buffer `XLA_FLAGS`
+that the runtime's `cuda_async` pool needs on Turing) and `mpi_transport_env.sh` (unconditional Intel-MPI
 transport hygiene). `ffi_env.sh` is a deprecated back-compat shim that
 sources both.
 

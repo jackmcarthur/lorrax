@@ -656,60 +656,16 @@ def set_default_env(*, platform: str = "gpu") -> None:
     ``platform="gpu"`` (default) sets ``JAX_PLATFORMS="cuda,cpu"`` so
     JAX tries CUDA and falls back to CPU.  ``platform="cpu"`` forces CPU.
 
-    WHY ``XLA_PYTHON_CLIENT_PREALLOCATE=false`` IS SET HERE
-    -------------------------------------------------------
-    LORRAX's FFI handlers allocate OUTSIDE the XLA allocator — the cuFFT
-    handler keeps a grow-only ``cudaMalloc`` arena
-    (``ffi/cufft/__init__.py:30``), and cuSOLVERMp/libcal stage through
-    plain ``cudaMalloc`` too.  Whatever XLA hoards is memory those cannot
-    have, so the preallocation default is a correctness knob for this
-    codebase, not a tuning one.
-
-    Left unset, jaxlib omits the ``preallocate`` option entirely and the
-    PJRT GPU client defaults to preallocating 75 % of the card.  Measured
-    on 8 Quadro RTX 5000 (15.74 GB) across 2 nodes, jobs 7882442/7882447,
-    each cell run twice with the second rep in reverse order (every rep-2
-    number reproduced its rep-1 twin to 3 decimals):
-
-    ================= ============== ================== =================
-    PREALLOCATE       XLA holds      free for the FFI   largest cuFFT
-    (allocator unset) for 6 GiB live  arena             plan creatable
-    ================= ============== ================== =================
-    unset (today)     11.93 GB       3.50 GB            3.07 GB
-    ``false``          8.13 GB       13.50 GB           7.16 GB
-    ================= ============== ================== =================
-
-    That is a 2.3x improvement in the largest allocatable cuFFT plan, and
-    it is the mechanism behind the failure recorded at
-    ``scripts/profiling/aot_cufft_sanity.py:24`` (CrI3 Q=13: cuFFT plan
-    creation failed although the compiled peak, 66.32 GB, fit in 80 GB).
-
-    ``XLA_PYTHON_CLIENT_ALLOCATOR`` is deliberately NOT set, and the four
-    accepted values are not interchangeable:
-
-    * ``default``/``bfc`` — BFC.  What we get by leaving this unset.
-      Keeps ``memory_stats()`` fully populated, which ``gw_init``'s
-      high-water report, ``gw_output``'s XLA-pool banner and
-      ``runtime/aot_memory`` all read.
-    * ``platform`` — plain ``cudaMalloc``, **not** cudaMallocAsync
-      (the plugin logs "Using platform allocator." vs "Using BFC
-      allocator." and carries a separate ``CudaAsyncAllocator``).  Best
-      headroom, but ``memory_stats()`` returns ``bytes_limit=0`` and
-      ``peak_bytes_in_use=0`` — it would silently blind every memory
-      report in the codebase.  Measured, job 7882447.
-    * ``cuda_async`` — cudaMallocAsync.  Measurably the best of the three
-      (0.19 GB overhead, 9.20 GB largest plan) AND it keeps
-      ``peak_bytes_in_use``.  It is NOT the default here only because on
-      Frontera rtx (sm_75) it needs the command-buffer restriction in
-      ``config/frontera/ffi_env.sh:44-51``; that script sets both together
-      and its explicit ``export`` correctly overrides this ``setdefault``.
-      Promote it here only together with that XLA_FLAGS mitigation.
-
-    ``TF_GPU_ALLOCATOR`` is a TensorFlow variable and is **inert for JAX**:
-    a cell setting only ``TF_GPU_ALLOCATOR=cuda_malloc_async`` was
-    byte-identical to the unset cell on every metric, including an 11.805
-    GB BFC pool that the real ``cuda_async`` allocator never has (job
-    7882442).  Do not add it back.
+    THE GPU MEMORY POOL (:func:`set_default_gpu_pool` owns it)
+    ----------------------------------------------------------
+    On CUDA every run gets ONE allocator configuration: ``cuda_async``
+    (cudaMallocAsync), its pool RESERVED up front, and the budget fraction
+    :data:`GPU_POOL_FRACTION`.  The measured reasons are in that function's
+    docstring.  A caller's explicit export still wins (``setdefault``), and
+    the startup report names any pair that is not this one.
+    ``TF_GPU_ALLOCATOR`` is a TensorFlow variable and is **inert for JAX**
+    (a cell setting only it was byte-identical to the unset cell, job
+    7882442); do not add it back.
 
     A caller-supplied ``XLA_PYTHON_CLIENT_ALLOCATOR`` is VALIDATED here —
     see :func:`_check_allocator_env`.
@@ -738,12 +694,13 @@ def set_default_env(*, platform: str = "gpu") -> None:
     os.environ.setdefault("HDF5_USE_FILE_LOCKING", "FALSE")
     if platform == "gpu":
         os.environ.setdefault("JAX_PLATFORMS", "cuda,cpu")
-        os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
     elif platform == "cpu":
         os.environ["JAX_PLATFORMS"] = "cpu"
     else:
         raise ValueError(f"platform must be 'gpu' or 'cpu', got {platform!r}")
     _check_allocator_env()
+    if platform == "gpu":
+        set_default_gpu_pool()
     tune_glibc_malloc()
     skip_gpu_plugin_discovery()
     resolved_platforms = os.environ.get("JAX_PLATFORMS", "")
@@ -752,6 +709,82 @@ def set_default_env(*, platform: str = "gpu") -> None:
     set_default_xla_gpu_autotune(platform=xla_platform)
     from runtime.network_env import configure_gpu_network
     configure_gpu_network(platform=xla_platform, say=rank0_print)
+
+
+#: The budget fraction of the reserved pool, and of every memory planner
+#: (``common.gpu_utils.get_device_memory_gb`` budgets 0.9 x bytes_limit).
+#: The certified large-deck value (sandbox claims 703/708), formerly typed
+#: per run.  It is a PLANNER budget, not a pool knob: under cuda_async XLA
+#: never refuses an allocation above it (see set_default_gpu_pool).
+GPU_POOL_FRACTION = "0.85"
+
+_PREALLOCATE_ENV = "XLA_PYTHON_CLIENT_PREALLOCATE"
+_FRACTION_ENVS = ("XLA_CLIENT_MEM_FRACTION", "XLA_PYTHON_CLIENT_MEM_FRACTION")
+
+
+def set_default_gpu_pool() -> None:
+    """The one GPU memory-pool policy: cudaMallocAsync, reserved, 0.85.
+
+    Must run before the CUDA client exists (jaxlib reads these three
+    variables once, in ``generate_pjrt_gpu_plugin_options()``).  Each is a
+    ``setdefault``, so an explicit export wins and the startup report names
+    it.  A CPU run and a ROCm run are left alone (ROCm keeps jaxlib's BFC
+    with preallocation off: LORRAX has no ROCm deployment to measure a pool
+    on).
+
+    WHAT ``cuda_async`` + ``PREALLOCATE=true`` IS (XLA source, jaxlib 0.9.1).
+    PJRT builds ``GpuCudaMallocAsyncAllocator`` with ``create_new_pool=
+    false``: XLA allocates from the device's DEFAULT mempool, the same pool
+    every ``cudaMallocAsync`` in our FFI (cuBLASMp W-solve, cuSOLVERMp LU)
+    uses.  The pool's release threshold is the reservation size: ``true``
+    reserves ``fraction x total`` once and keeps it mapped; ``false`` sets
+    the threshold to 0, so the pool unmaps every idle byte at every stream
+    or event synchronize and the next launch maps it again.  That re-map
+    was measured at ~30 ms of buffer allocation plus a 25-110 ms stall per
+    executable, device idle (CrI3 8x8 GN-PPM P4, A100-40GB, sandbox
+    ``runs/runtime/sigma_tau_sweep_20260924``): reserving took the whole run
+    204.3 -> 175.0 s and the Sigma tau sweep 15.6 -> 4.8 s.  The fraction is
+    NOT a cap under this allocator (``AllocateRaw`` never checks it); it
+    sizes the reservation and the reported ``bytes_limit`` that the memory
+    planners budget from.
+
+    WHY THE RESERVATION TAKES NOTHING FROM C++ LIBRARIES.  Memory outside
+    the pool (the CUDA context, NCCL buffers, the cuSOLVERMp context's
+    grow-only ``cudaMalloc`` workspace, CAL scratch) can still use reserved
+    memory XLA is not using at that moment: the driver releases idle pool
+    memory to an unrelated allocation in the same process (NVIDIA, "Using
+    the CUDA stream-ordered memory allocator", part 1).  What such an
+    allocation can never have is XLA's LIVE bytes, reserved or not.
+    Measured on A100-40GB at P4 (sandbox ``runs/runtime/
+    gpu_pool_policy_20260924``, JID 58826377): pool reserved at 0.85 with
+    5.0 GB free, a raw cuMemAlloc of 23.0 GB succeeded in 0.85 s (the idle
+    pool was trimmed 36.0 -> 4.0 GB), as did cuMemCreate; the bytes outside
+    the pool peaked at 4.7 GB (context, NCCL, the cuSOLVERMp context and its
+    workspace).  The trim does NOT cross processes, so this policy needs
+    one process per GPU -- a co-tenant (``tests/harness.py``'s mesh child)
+    must pick ``ALLOCATOR=platform``, which it does.
+
+    The old BFC default (preallocation off, allocator unset) existed for a
+    grow-only cuFFT ``cudaMalloc`` arena that no longer exists (the CUDA
+    k-convolution is nvidia-mathdx on XLA-owned buffers since 2026-09-24).
+    ``cuda_async`` also keeps ``memory_stats()`` populated
+    (``runtime.xla_memory``), and reports ``bytes_limit`` once reserved.
+    On sm_75 (Frontera rtx, not a supported GPU target) cudaMallocAsync
+    additionally needs ``config/frontera/gpu_env.sh``'s command-buffer
+    ``XLA_FLAGS``.
+    """
+    plats = [p.strip().lower()
+             for p in os.environ.get("JAX_PLATFORMS", "").split(",") if p.strip()]
+    if plats[:1] == ["cpu"]:
+        return
+    if "rocm" in plats:
+        os.environ.setdefault(_PREALLOCATE_ENV, "false")
+        return
+    os.environ.setdefault(_ALLOCATOR_ENV, "cuda_async")
+    async_pool = os.environ[_ALLOCATOR_ENV].lower() == "cuda_async"
+    os.environ.setdefault(_PREALLOCATE_ENV, "true" if async_pool else "false")
+    if not any(os.environ.get(k) for k in _FRACTION_ENVS):
+        os.environ[_FRACTION_ENVS[0]] = GPU_POOL_FRACTION
 
 
 #: The four values jaxlib accepts for ``XLA_PYTHON_CLIENT_ALLOCATOR``.
@@ -1722,7 +1755,8 @@ def initialize_communicator_stack(*, platform: str = "gpu",
        sources before ambient installs, and refuse a checkout/runtime
        disagreement.  Standard-library-only, so it precedes JAX and physics.
     1. :func:`set_default_env` -- JAX_ENABLE_X64, JAX_PLATFORMS,
-       XLA_PYTHON_CLIENT_PREALLOCATE=false, the allocator-spelling refusal,
+       the GPU pool policy (:func:`set_default_gpu_pool`), the
+       allocator-spelling refusal,
        the glibc malloc tuning, and the first arming of the CPU-only plugin
        skip.  MUST precede the first backend init; jax reads x64 at import
        and the GPU knobs when the CUDA client is built.  x64 is also set on a
@@ -2758,13 +2792,12 @@ def format_startup_report(f: dict) -> list:
             f"{f.get('backend')} backend, and that backend keeps no arena "
             f"accounting, so no allocator figure is reported.")
     if env is not None and is_gpu:
-        canonical = (not env["preallocate"]) and env["allocator_raw"] is None
-        why = (" — LORRAX's canonical pair: preallocation off so the cuFFT "
-               "and cuSOLVERMp arenas can allocate outside XLA, and the "
-               "allocator left unset because BFC is the only kind that keeps "
-               "memory_stats() populated" if canonical else
-               " — NOT LORRAX's canonical pair, which is preallocate=false "
-               "with the allocator left unset (BFC); a caller overrode it")
+        canonical = env["preallocate"] and env["allocator"] == "cuda_async"
+        why = (" — LORRAX's GPU pool policy: cudaMallocAsync with its pool "
+               "reserved (runtime.set_default_gpu_pool)" if canonical else
+               " — NOT LORRAX's GPU pool policy (cuda_async with preallocation "
+               "on); a caller overrode it, and an unreserved async pool "
+               "re-maps device memory at every synchronize")
         add(f"  XLA_PYTHON_CLIENT_PREALLOCATE resolved to "
             f"{'true' if env['preallocate'] else 'false'} (raw "
             f"{env['preallocate_raw']!r}) and XLA_PYTHON_CLIENT_ALLOCATOR "
