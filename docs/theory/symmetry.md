@@ -74,10 +74,10 @@ the run restricts the computational group to the identity
 (`SymMaps.trivial_view`). Every grid point is then its own parent
 (\(n_{\rm parent}=N_k\)), each realized once from its WFN row by the
 plane-wave action of §3, and every q is computed. The view uses no
-antiunitary row and reports no time reversal, so consumers that branch on
-time reversal take their general, time-reversal-broken form; the loader's
-measured verdict is untouched, and file outputs still reduce through the
-WFN's own map. A warning names the centroid file; orbit-closed k-means
+antiunitary row, but time reversal is a property of the Hamiltonian rather
+than of the computational group, so the view keeps the loader's measured
+verdict and consumers that branch on it keep their time-reversal form. File
+outputs still reduce through the WFN's own map. A warning names the centroid file; orbit-closed k-means
 centroids restore the reduction.
 
 ## 3. Wavefunctions

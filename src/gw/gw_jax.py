@@ -94,7 +94,7 @@ from common.wfn_transforms import get_enk_bandrange
 import common.timing as timing
 from .gw_config import (
 	ComputeMode, HeadCorrection, LorraxConfig, QPSolver,
-	ScreeningDiagrams, incumbent_bispinor_head_record,
+	ScreeningDiagrams, coerce_screening_diagrams, incumbent_bispinor_head_record,
 	packed_bare_transverse_route,
 	packed_photon_replaces_charge_sigma, packed_photon_screens_current,
 	refuse_unimplemented_compute_mode, uses_dynamic_packed_photon_route,
@@ -376,6 +376,16 @@ def _load_system_inputs(config, input_dir, mesh_xy, report, print0, _config_prov
                + "; using unreduced parents (n_parent = nk) and full q on the same "
                "parent route. Generate orbit-closed centroids with kmeans to restore reduction.")
         sym = sym.trivial_view()
+        diagrams = coerce_screening_diagrams(config.screening.diagrams)
+        if diagrams is not ScreeningDiagrams.W_RPA:
+            raise ValueError(
+                f"GATE resolvent_ladder_trivial_view: screening_diagrams = "
+                f"{diagrams.value} with a non-orbit-closed centroid set.  The "
+                f"resolvent ladder solves on the WFN's reduced q wedge, while the "
+                f"centroid set forces the unreduced trivial view (every q); want an "
+                f"orbit-closed centroid set; fix: regenerate the centroids with "
+                f"kmeans (orbit-closed), or use screening_diagrams = w_rpa; doc: "
+                f"docs/architecture/symmetry_register.md §7.")
     # Before any basis, bank or constructor: the full shared-pole head refuses
     # an ordered or N_spinor != 1 store here, on the final symmetry verdict.
     from .shared_pole_head import refuse_unsupported_shared_pole_head

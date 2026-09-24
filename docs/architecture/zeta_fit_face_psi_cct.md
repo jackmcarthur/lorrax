@@ -212,8 +212,8 @@ MPA stores, so no file shape depends on the process grid.
 
 When a charge or current centroid set is not orbit-closed, the driver warns
 and replaces the symmetry maps with `SymMaps.trivial_view()` before either
-family is packed. The view keeps the identity operation only and drops time
-reversal. `parent_k_domain = "full_bz"`, so the loader supplies every full-zone
+family is packed. The view keeps the identity operation only and uses no
+antiunitary action; the measured time-reversal verdict is unchanged. `parent_k_domain = "full_bz"`, so the loader supplies every full-zone
 k as its own parent. The plan then has n_parent = N_k, identity actions and
 every q row. The same parent route and route G run unchanged. The binding
 ruling is in [decisions](decisions.md).

@@ -25,7 +25,9 @@ def test_trivial_view_preserves_loader_group_and_admits_nonclosed_centroids():
     view = source.trivial_view()
     assert source.parent_k_domain == "ibz" and view.parent_k_domain == "full_bz"
     assert source.nk_red == 2 and view.nk_red == view.nk_tot == 3
-    assert source.trs_allowed and not view.trs_allowed
+    # Time reversal is the measured verdict, not a group action: it carries over.
+    assert source.trs_allowed and view.trs_allowed
+    np.testing.assert_array_equal(view.qe_operation_antiunitary, [False])
     np.testing.assert_array_equal(source.irr_idx_k, original[0])
     np.testing.assert_array_equal(source.sym_idx_k, original[1])
     for rows in (view.irr_idx_k, view.kirr_fullids, view.irr_idx_q, view.q_irr_full_idx):

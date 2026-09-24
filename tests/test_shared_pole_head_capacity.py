@@ -266,6 +266,6 @@ def test_the_driver_calls_the_head_door_on_the_final_symmetry_before_any_build()
               if isinstance(node, ast.FunctionDef) and node.name == "_load_system_inputs")
     body = ast.get_source_segment(source, fn)
     door = body.index("refuse_unsupported_shared_pole_head(")
-    # trivial_view() drops TRS, which makes the store ordered: the door must see it.
+    # trivial_view() restricts the group before the door reads the final verdict.
     assert body.index("sym.trivial_view()") < door
     assert door < body.index("isdf_tensors_")
