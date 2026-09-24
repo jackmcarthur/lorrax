@@ -65,20 +65,25 @@ def test_charge_capture_role_is_explicit_and_label_independent():
     assert "is_charge_cc" in kwonly
     assert kwonly["is_charge_cc"] is None, "charge ownership must be required"
 
-    for node in ast.walk(tile_fn):
-        if not isinstance(node, ast.Compare):
-            continue
-        names = {
-            child.id for child in ast.walk(node)
-            if isinstance(child, ast.Name)
-        }
-        assert "timing_label" not in names, (
-            "display text must not decide charge/capture semantics")
+    # The one tile is a group of one; the group's per-tile finish owns the
+    # charge capture.
+    finish_fn = _function(producer_tree, "_finish_vq_tile")
+    for fn in (tile_fn, _function(producer_tree, "_compute_V_q_g_flat_tiles"),
+               finish_fn):
+        for node in ast.walk(fn):
+            if not isinstance(node, ast.Compare):
+                continue
+            names = {
+                child.id for child in ast.walk(node)
+                if isinstance(child, ast.Name)
+            }
+            assert "timing_label" not in names, (
+                "display text must not decide charge/capture semantics")
 
     assert _if_owns_call(
-        tile_fn, "is_charge_cc", "measure_covariance")
+        finish_fn, "is_charge_cc", "measure_covariance")
     assert _if_owns_call(
-        tile_fn, "is_charge_cc", "deposit_pre_unfold")
+        finish_fn, "is_charge_cc", "deposit_pre_unfold")
 
 
 def test_scalar_and_bispinor_callers_supply_the_same_charge_semantics():
@@ -89,9 +94,14 @@ def test_scalar_and_bispinor_callers_supply_the_same_charge_semantics():
     assert isinstance(scalar_role, ast.Constant) and scalar_role.value is True
 
     bispinor_tree = _tree(BISPINOR)
-    bispinor_calls = _calls(bispinor_tree, "_compute_V_q_g_flat_one_tile")
-    assert len(bispinor_calls) == 1
-    bispinor_role = _kw(bispinor_calls[0], "is_charge_cc")
+    # The bispinor build contracts its tiles in groups (CC; the six TT) and
+    # hands each tile's charge role in its spec.
+    assert len(_calls(bispinor_tree, "_compute_V_q_g_flat_tiles")) == 1
+    roles = [kw.value for node in ast.walk(bispinor_tree)
+             if isinstance(node, ast.Call) for kw in node.keywords
+             if kw.arg == "is_charge_cc"]
+    assert len(roles) == 1
+    bispinor_role = roles[0]
     assert isinstance(bispinor_role, ast.Name)
     assert bispinor_role.id == "is_CC"
 

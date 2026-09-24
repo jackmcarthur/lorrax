@@ -447,7 +447,7 @@ def compute_V_q_bispinor_g_flat_to_h5(
     """
     from file_io.slab_io import SlabIO
     import h5py
-    from .v_q_g_flat import _compute_V_q_g_flat_one_tile
+    from .v_q_g_flat import _compute_V_q_g_flat_tiles
 
     output_h5_path = Path(output_h5_path)
     if len(zeta_T_loaders) != 3:
@@ -499,28 +499,14 @@ def compute_V_q_bispinor_g_flat_to_h5(
         bvec=bvec, cell_volume=cell_volume, sys_dim=sys_dim, kgrid=kgrid)
         if tt_head_correction else None)
 
-    for tile_idx, (mu_L, nu_L) in enumerate(UNIQUE_TILES):
+    def _tile_spec(mu_L, nu_L):
+        """One unique tile's loaders, v(q+G) builder and one-leg action."""
         same_zeta = (mu_L == nu_L)
-        loader_L = zeta_C_loader if mu_L == 0 else zeta_T_loaders[mu_L - 1]
-        loader_R = (None if same_zeta
-                    else (zeta_C_loader if nu_L == 0
-                           else zeta_T_loaders[nu_L - 1]))
-        n_rmu_L = n_rmu_C if mu_L == 0 else n_rmu_T
-        n_rmu_R = n_rmu_C if nu_L == 0 else n_rmu_T
         is_CC = (mu_L == 0 and nu_L == 0)
-        # g0 is a one-leg zeta coefficient, so diagonal tiles are its sole
-        # producer.  On the transverse IBZ path each streamed source
-        # component returns its contributions to all three target Cartesian
-        # channels; only those three small carriers are accumulated.
-        write_g0 = same_zeta
-
         # CC tile: charge-centroid orbit closure.  TT tiles: transverse-
         # centroid orbit closure.  These are independent; either may
         # fall back to full-BZ if its centroid set isn't orbit-closed.
-        _tile_use_ibz = _use_ibz_C if is_CC else _use_ibz_T
-        _tile_sym = sym if _tile_use_ibz else None
-        _tile_cent = (centroid_C_idx if is_CC else centroid_T_idx) if _tile_use_ibz else None
-
+        use_ibz = _use_ibz_C if is_CC else _use_ibz_T
         v_builder = _make_per_q_v_builder_for_tile(
             mu_L=mu_L, nu_L=nu_L,
             bvec=bvec, cell_volume=cell_volume, sys_dim=sys_dim,
@@ -551,60 +537,80 @@ def compute_V_q_bispinor_g_flat_to_h5(
 
         if verbose and jax.process_index() == 0:
             print_fn(f"  [bispinor g-flat] tile "
-                     f"{tile_idx + 1}/{len(UNIQUE_TILES)} "
-                     f"(μ_L={mu_L}, ν_L={nu_L})  n_rmu_L={n_rmu_L} "
-                     f"n_rmu_R={n_rmu_R}  same_zeta={same_zeta}  "
-                     f"use_ibz={_tile_use_ibz}")
+                     f"{UNIQUE_TILES.index((mu_L, nu_L)) + 1}/{len(UNIQUE_TILES)} "
+                     f"(μ_L={mu_L}, ν_L={nu_L})  "
+                     f"n_rmu_L={n_rmu_C if mu_L == 0 else n_rmu_T} "
+                     f"n_rmu_R={n_rmu_C if nu_L == 0 else n_rmu_T}  "
+                     f"same_zeta={same_zeta}  use_ibz={use_ibz}")
+        polar = same_zeta and mu_L != 0 and use_ibz
+        return dict(
+            L=zeta_C_loader if mu_L == 0 else zeta_T_loaders[mu_L - 1],
+            R=(None if same_zeta
+               else (zeta_C_loader if nu_L == 0 else zeta_T_loaders[nu_L - 1])),
+            v_per_G_builder=v_builder, is_charge_cc=is_CC,
+            # g0 is a one-leg zeta coefficient, so diagonal tiles are its sole
+            # producer.  On the transverse IBZ path each streamed source
+            # component returns its contributions to all three target
+            # Cartesian channels; only those three small carriers are
+            # accumulated.
+            write_g0=same_zeta,
+            one_leg_action="polar" if polar else "scalar",
+            source_component=mu_L - 1 if polar else None,
+            timing_label=tile_dataset_name(mu_L, nu_L),
+            use_ibz=use_ibz)
 
-        V_acc, g0_acc = _compute_V_q_g_flat_one_tile(
-            loader_L, loader_R,
-            v_per_G_builder=v_builder,
+    # CC alone, then the six TT tiles as ONE group: each ζ_T is read once
+    # per q-tile instead of once per tile that uses it (three times).
+    for group in (UNIQUE_TILES[:1], UNIQUE_TILES[1:]):
+        specs = [_tile_spec(mu_L, nu_L) for (mu_L, nu_L) in group]
+        is_CC_group = group == ((0, 0),)
+        use_ibz = specs[0]['use_ibz']
+        results = _compute_V_q_g_flat_tiles(
+            specs,
             kgrid=kgrid, fft_grid=fft_grid,
             mesh_xy=mesh_xy,
             g_chunk=g_chunk,
-            sym=_tile_sym, centroid_indices=_tile_cent,
-            is_charge_cc=is_CC,
-            write_g0=write_g0,
+            sym=sym if use_ibz else None,
+            centroid_indices=((centroid_C_idx if is_CC_group else centroid_T_idx)
+                              if use_ibz else None),
             qgrid_policy=qgrid_policy,
-            one_leg_action=(
-                "polar" if (same_zeta and mu_L != 0 and _tile_use_ibz)
-                else "scalar"),
-            source_component=(
-                mu_L - 1 if (same_zeta and mu_L != 0 and _tile_use_ibz)
-                else None),
-            timing_label=tile_dataset_name(mu_L, nu_L),
             verbose=verbose,
         )
+        for (mu_L, nu_L), s_tile, (V_acc, g0_acc) in zip(group, specs, results):
+            same_zeta = (mu_L == nu_L)
+            if (same_zeta and mu_L != 0 and _use_ibz_T
+                    and g0_acc is not None):
+                tt_g0 = g0_acc if tt_g0 is None else tt_g0 + g0_acc
+                del g0_acc
+                g0_acc = None
 
-        if (same_zeta and mu_L != 0 and _use_ibz_T
-                and g0_acc is not None):
-            tt_g0 = g0_acc if tt_g0 is None else tt_g0 + g0_acc
-            del g0_acc
-            g0_acc = None
+            # Keep the literal-G=0 view in memory at its projection owner.
+            # The transverse IBZ case is filled after its three source
+            # components are rotated and accumulated by the symmetry service
+            # below.
+            if same_zeta and g0_acc is not None:
+                g0_by_channel[mu_L] = g0_acc
 
-        # Keep the literal-G=0 view in memory at its projection owner.  The
-        # transverse IBZ case is filled after its three source components are
-        # rotated and accumulated by the symmetry service below.
-        if same_zeta and g0_acc is not None:
-            g0_by_channel[mu_L] = g0_acc
-
-        name = tile_dataset_name(mu_L, nu_L)
-        v_logical_shape = _tile_logical_shape(
-            mu_L, nu_L, n_q_total=nq_total, n_rmu_C=n_rmu_C, n_rmu_T=n_rmu_T)
-        _require_tile_carrier(V_acc, name=name, logical_shape=v_logical_shape)
-        with SlabIO(output_h5_path, mode="a", mesh=mesh_xy) as tile_io:
-            tile_io.create_dataset(name, shape=v_logical_shape, dtype=V_QMUNU_TILE_DTYPE)
-            tile_io.write_slab(name, V_acc)
-        del V_acc, g0_acc
-        barrier("bispinor_V_tile_closed")
-        if jax.process_index() == 0:
-            from symmetry_maps import QirrTables, stamp_qirr_tensor
-            table = _ibz_C if is_CC else _ibz_T
-            stamp_qirr_tensor(output_h5_path, name,
-                tables=QirrTables(table[2], qgrid_policy.unfold_sym_idx, table[1],
-                                  table[4], table[5], qgrid_policy.n_sym_spatial),
-                closure_verdict=table[7].verdict, n_rmu_logical=n_rmu_L)
-        barrier("bispinor_V_tile_stamped")
+            name = tile_dataset_name(mu_L, nu_L)
+            v_logical_shape = _tile_logical_shape(
+                mu_L, nu_L, n_q_total=nq_total, n_rmu_C=n_rmu_C, n_rmu_T=n_rmu_T)
+            _require_tile_carrier(V_acc, name=name, logical_shape=v_logical_shape)
+            with SlabIO(output_h5_path, mode="a", mesh=mesh_xy) as tile_io:
+                tile_io.create_dataset(name, shape=v_logical_shape,
+                                       dtype=V_QMUNU_TILE_DTYPE)
+                tile_io.write_slab(name, V_acc)
+            del V_acc, g0_acc
+            barrier("bispinor_V_tile_closed")
+            if jax.process_index() == 0:
+                from symmetry_maps import QirrTables, stamp_qirr_tensor
+                table = _ibz_C if s_tile['is_charge_cc'] else _ibz_T
+                stamp_qirr_tensor(output_h5_path, name,
+                    tables=QirrTables(table[2], qgrid_policy.unfold_sym_idx, table[1],
+                                      table[4], table[5], qgrid_policy.n_sym_spatial),
+                    closure_verdict=table[7].verdict, n_rmu_logical=(
+                        n_rmu_C if mu_L == 0 else n_rmu_T))
+            barrier("bispinor_V_tile_stamped")
+        del results
     if tt_g0 is not None:
         g0_by_channel[1:] = [tt_g0[i] for i in range(3)]
     del tt_g0
