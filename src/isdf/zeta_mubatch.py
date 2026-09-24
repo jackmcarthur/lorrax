@@ -628,40 +628,24 @@ def _disk_tile(mesh, layout, mu_pad):
 # ---------------------------------------------------------------------------
 
 
-def zeta_shell_slots(gvec_components, ngk_per_q, q_frac, bvec, q_full_frac,
-                     fft_grid):
-    """Per stored q, the sphere slots with |q+G| ≤ max_q' |q'| (the G≈0 shell).
-
-    Every parent G a full-zone literal G=0 unfolds from, and every Coulomb
-    head slot (argmin |q+G|), lies in it: |q_p + G_p| = |q_full| under an
-    orthogonal operation.  Slot 0 (G = 0) comes first.  Returns host
-    ``(slots (Q, n_shell) int32, gvec (Q, 3, n_shell) int32)``; pad slots
-    repeat slot 0 in ``slots`` and carry the FFT-box pad sentinel (never a
-    sphere G, so no exact-G search can match it) in ``gvec``.
-    """
-    from common.gvec_fft_box import fft_box_pad_sentinel
-    sentinel = np.asarray(fft_box_pad_sentinel(tuple(fft_grid))[0], np.int32)
-    gv = np.asarray(gvec_components, dtype=np.int64)       # (Q, 3, ngkmax)
-    B = np.asarray(bvec, dtype=np.float64)
-    qf = np.asarray(q_frac, dtype=np.float64)
-    k = np.einsum('qin,ij->qnj', gv + qf[:, :, None], B)   # Cartesian q+G
-    k2 = np.sum(k * k, axis=-1)
-    qmax2 = float(np.max(np.sum((np.asarray(q_full_frac) @ B) ** 2, axis=-1)))
-    ngk = np.asarray(ngk_per_q, dtype=np.int64)
-    lists = []
-    for q in range(gv.shape[0]):
-        live = np.flatnonzero(k2[q, :ngk[q]] <= qmax2 * (1 + 1e-9) + 1e-12)
-        live = np.r_[0, live[live != 0]]
-        lists.append(live)
-    n = max(len(l) for l in lists)
-    slots = np.zeros((gv.shape[0], n), dtype=np.int32)
-    g_out = np.zeros((gv.shape[0], 3, n), dtype=np.int32)
-    for q, l in enumerate(lists):
-        slots[q, :len(l)] = l
-        g_out[q, :, :len(l)] = gv[q][:, l]
-        if len(l) < n:
-            g_out[q, :, len(l):] = sentinel[:, None]
-    return slots, g_out
+def shell_positions(shell_slots, sel):
+    """Positions in the kept columns ``shell_slots (Q, n)`` of the sphere
+    slots ``sel (Q, j)``; a slot the pass did not keep is a refusal."""
+    kept = np.asarray(shell_slots, dtype=np.int32)
+    sel = np.asarray(sel, dtype=np.int32)
+    pos = np.zeros_like(sel)
+    for q in range(sel.shape[0]):
+        for j in range(sel.shape[1]):
+            hit = np.flatnonzero(kept[q] == sel[q, j])
+            if hit.size == 0:
+                raise ValueError(
+                    "GATE zeta-mubatch-shell: got head slot "
+                    f"{int(sel[q, j])} at stored q {q}, want a slot the V_q "
+                    f"pass kept ({kept[q].tolist()}); why: that pass keeps "
+                    "only the columns its head consumers named, so this "
+                    "consumer would read a ζ column that was never formed.")
+            pos[q, j] = hit[0]
+    return pos
 
 
 class ZetaG:
@@ -671,8 +655,9 @@ class ZetaG:
     ``zeta_layout``, ``gvec_components``) so the V_q and head-channel
     consumers take it in place of a ``ZetaLoader``; their data comes through
     :meth:`contract_v`, which streams G tiles once: C⁺ applied on each tile,
-    ``V_q += conj(ζ) diag(v_q) ζᵀ`` accumulated, the G≈0 shell kept, and each
-    ζ tile written only when a file is wanted.  On the ``local`` tier every
+    ``V_q += conj(ζ) diag(v_q) ζᵀ`` accumulated, ζ kept at the columns the
+    caller names (the head consumers' slots), and each ζ tile written only
+    when a file is wanted.  On the ``local`` tier every
     rank owns whole q's (the factor's R4 batch layout) and the pass moves no
     data but the store read; the only resident accumulator is V (Q·μ²/P).
     """
@@ -681,8 +666,7 @@ class ZetaG:
 
     def __init__(self, store, *, mesh, L_q, lu_piv, q_chunk_size, solver_kind,
                  zeta_gather, batched_route, n_rmu_solve, n_rmu, mu_basis,
-                 ngk_per_q, gvec_components, shell_slots, shell_gvec, path,
-                 print_fn=print):
+                 ngk_per_q, gvec_components, path, print_fn=print):
         self.store = store
         self.print_fn = print_fn        # the fit's report sink (V_q receipt)
         self.mesh = mesh
@@ -698,10 +682,8 @@ class ZetaG:
         self.ngk_per_q = np.asarray(ngk_per_q, dtype=np.int32)
         self.gvec_components = np.asarray(gvec_components, dtype=np.int32)
         self.ngkmax = int(self.gvec_components.shape[-1])
-        self.shell_slots = np.asarray(shell_slots, dtype=np.int32)
-        self.shell_gvec = np.asarray(shell_gvec, dtype=np.int32)
         self.path = str(path)
-        self.shell = None
+        self.shell_slots = self.shell = None
         self.receipt = ""
 
     @property
@@ -712,11 +694,13 @@ class ZetaG:
 
 
     # -- the one pass ---------------------------------------------------
-    def contract_v(self, v_table, *, zeta_io=None, print_fn=None):
+    def contract_v(self, v_table, *, keep, zeta_io=None, print_fn=None):
         """Stream every G tile once; return V (Q, μ_pad, μ_pad) at ``P(None,'x','y')``.
 
-        ``v_table`` is ``(Q, ngkmax)`` v(q+G) on the stored sphere.  V and
-        the shell come back in the canonical (file) centroid order.  With
+        ``v_table`` is ``(Q, ngkmax)`` v(q+G) on the stored sphere.  ``keep``
+        ``(Q, n)`` names the sphere slots the head consumers read (slot 0
+        first); ζ at them comes back as ``self.shell (Q, μ_pad, n)``.  V and
+        the shell are in the canonical (file) centroid order.  With
         ``zeta_io`` the masked ζ tiles are also written to ``zeta_q_G``.
         """
         t0 = time.perf_counter()
@@ -727,7 +711,12 @@ class ZetaG:
         v = np.asarray(pad_to_axis(pad_to_axis(
             jnp.asarray(v_table, dtype=jnp.complex128), qa, axis=0), ga, axis=1))
         ngk = np.asarray(pad_to_axis(jnp.asarray(self.ngk_per_q, jnp.int32), qa, axis=0))
-        sl = np.asarray(pad_to_axis(jnp.asarray(self.shell_slots, jnp.int32), qa, axis=0))
+        keep = np.asarray(keep, dtype=np.int32)
+        if keep.ndim != 2 or keep.shape[0] != st.Q:
+            raise ValueError(
+                f"ZetaG.contract_v: keep must be (Q={st.Q}, n) slots; got "
+                f"{keep.shape}.")
+        sl = np.asarray(pad_to_axis(jnp.asarray(keep, jnp.int32), qa, axis=0))
         from common.collectives import device_put_process_local
         if self.q_local:
             layout = 'q'
@@ -770,7 +759,7 @@ class ZetaG:
         if self.mu_basis is not None:
             V = self.mu_basis.unpack_operator(V)
             shell = self.mu_basis.unpack_axis(shell, 1)
-        self.shell = shell
+        self.shell, self.shell_slots = shell, keep
         if M is not None:
             V_cmc = _v_from_m(self.mesh, layout, self.solver_kind,
                               self.n_rmu_solve)(L_arg, M)
@@ -802,19 +791,8 @@ class ZetaG:
         zeta_io.write_slab('zeta_q_G', zt, offset=(0, 0, int(g0)))
 
     def head_columns(self, sel):
-        """ζ at the stored-sphere slots ``sel (Q, j)`` from the kept shell."""
-        pos = np.zeros_like(np.asarray(sel, dtype=np.int32))
-        for q in range(pos.shape[0]):
-            for j in range(pos.shape[1]):
-                hit = np.flatnonzero(self.shell_slots[q] == int(sel[q, j]))
-                if hit.size == 0:
-                    raise ValueError(
-                        "GATE zeta-mubatch-shell: got head slot "
-                        f"{int(sel[q, j])} at stored q {q}, want a slot inside "
-                        "the kept G≈0 shell; why: the head channel would read a "
-                        "column the μ-batch fit did not keep.")
-                pos[q, j] = hit[0]
-        return pos
+        """Positions in :attr:`shell` of the stored-sphere slots ``sel (Q, j)``."""
+        return shell_positions(self.shell_slots, sel)
 
     def close(self):
         self.store.close()

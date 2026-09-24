@@ -14,7 +14,10 @@ mesh, with the red case constructed where the claim could be vacuous:
   single-tile run of the same function (bitwise);
 * the one-leg sub-sphere against the whole sphere under an inversion whose
   star needs a NONZERO parent G, plus the control that dropping one of the
-  named columns makes the service refuse.
+  named columns makes the service refuse;
+* route G's kept columns on the Si 4x4x4 star table (host only): the
+  one-leg names no column it does not read, so Γ's padded row stays inside
+  the kept columns; the pre-fix sphere fillers are the red twin.
 
 Scope: single-process meshes (``mesh(4)``: four emulated host devices, or
 four GPUs in the mesh child).  The multi-process P16 timing, memory and
@@ -34,8 +37,8 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 jax.config.update("jax_enable_x64", True)
 
 from gw.v_q_g_flat import (  # noqa: E402
-    _compute_V_q_g_flat_one_tile, _make_q_tile_kernel, _one_leg_columns,
-    _plan_vq_tiles, vq_tile_bytes)
+    _compute_V_q_g_flat_one_tile, _head_shell, _make_q_tile_kernel,
+    _one_leg_columns, _plan_vq_tiles, vq_tile_bytes)
 
 
 def _mesh22():
@@ -278,9 +281,9 @@ def test_one_leg_sub_sphere_matches_the_whole_sphere():
     whole = np.asarray(unfold_isdf_one_leg(
         _put(zeta, mesh, spec), gvec_components=gvec, **args))
 
-    cols = _one_leg_columns(gvec, sym=sym, sym_idx=rows, q_irr_frac=q_frac,
-                            kgrid=kgrid)
-    g_sub = np.take_along_axis(gvec, cols[:, None, :], axis=2)
+    cols, g_sub = _one_leg_columns(gvec, sym=sym, sym_idx=rows,
+                                   q_irr_frac=q_frac, kgrid=kgrid,
+                                   fft_grid=(8, 8, 8))
     z_sub = np.take_along_axis(zeta, cols[:, None, :], axis=2)
     slots = isdf_one_leg_source_slots(
         gvec, sym=sym, sym_idx=rows, q_irr_frac=q_frac, kgrid=kgrid)
@@ -306,3 +309,61 @@ def test_one_leg_sub_sphere_matches_the_whole_sphere():
                  spec),
             gvec_components=np.take_along_axis(
                 gvec, broken[:, None, :], axis=2), **args)
+
+
+# Si 4x4x4 (fcc, 48 ops + TRS, orbit-closed 480 centroids): per IBZ parent,
+# its star size and the distinct parent slots its full q's literal G=0 come
+# from (``isdf_one_leg_source_slots``), measured on the kconv-stage-2 Si BSE
+# deck: runs/runtime/route_g_head_shell_20260924/d00_diag_filereuse/diag.txt.
+_SI444_STARS = [(1, [0]), (8, [0]), (4, [0, 9]), (6, [0]), (24, [0, 9, 73]),
+                (12, [0, 1, 67]), (3, [0]), (6, [0, 1, 65, 551])]
+
+
+def test_route_g_shell_keeps_what_the_one_leg_reads_si444(monkeypatch):
+    import symmetry_maps
+    from common.gvec_fft_box import fft_box_pad_sentinel
+    from isdf.zeta_mubatch import shell_positions
+    parent = np.concatenate([np.full(n, p, np.int32)
+                             for p, (n, _) in enumerate(_SI444_STARS)])
+    slots = np.concatenate([np.resize(np.asarray(need, np.int32), n)
+                            for n, need in _SI444_STARS])
+    assert parent.size == 64
+    # 600 distinct Miller vectors per parent (slot 0 is G = 0).
+    box = np.array([(a, b, c) for a in range(-4, 5) for b in range(-4, 5)
+                    for c in range(-4, 5)], dtype=np.int32)
+    box = box[np.argsort(np.sum(box * box, axis=1), kind="stable")][:600]
+    gvec = np.stack([box.T] * len(_SI444_STARS))
+    fft_grid = (20, 20, 20)
+    monkeypatch.setattr(symmetry_maps, "isdf_one_leg_source_slots",
+                        lambda *a, **k: slots)
+
+    cols, g_sub = _one_leg_columns(
+        gvec, sym=SimpleNamespace(irr_idx_q=parent), sym_idx=None,
+        q_irr_frac=None, kgrid=(4, 4, 4), fft_grid=fft_grid)
+    sentinel = fft_box_pad_sentinel(fft_grid)[0]
+    assert cols.shape == (8, 4)
+    for p, (_, need) in enumerate(_SI444_STARS):
+        assert set(cols[p].tolist()) == set(need)        # no unread column
+        np.testing.assert_array_equal(cols[p, :len(need)], need)
+        np.testing.assert_array_equal(g_sub[p][:, :len(need)], gvec[p][:, need])
+        assert np.all(g_sub[p][:, len(need):] == sentinel[:, None])
+    np.testing.assert_array_equal(cols[0], [0, 0, 0, 0])  # Γ: slot 0 only
+
+    # The kept columns are the union the consumers name; head slots join it.
+    head_sel = np.zeros((8, 2), np.int32)
+    head_sel[3] = (5, 6)
+    keep = _head_shell(8, cols, head_sel)
+    np.testing.assert_array_equal(keep[0], np.zeros(keep.shape[1]))
+    np.testing.assert_array_equal(keep[7], [0, 1, 65, 551])
+    np.testing.assert_array_equal(np.unique(keep[3]), [0, 5, 6])
+    pos = shell_positions(keep, cols)
+    np.testing.assert_array_equal(np.take_along_axis(keep, pos, axis=1), cols)
+    shell_positions(keep, head_sel)
+
+    # Red twin: the pre-fix pads (the lowest sphere slots a star does not
+    # use) name slot 1 at Γ, which nothing reads and the pass never formed.
+    old = np.stack([np.r_[need, np.setdiff1d(np.arange(600), need)[:4 - len(need)]]
+                    for _, need in _SI444_STARS]).astype(np.int32)
+    with pytest.raises(ValueError, match=r"GATE zeta-mubatch-shell: got head "
+                                         r"slot 1 at stored q 0"):
+        shell_positions(keep, old)
