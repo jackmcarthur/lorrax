@@ -91,11 +91,11 @@ install already require), cray-libsci 25.09.0, with darshan unloaded. Change
 those values there and nowhere else.
 
 - Host leg: `bash config/perlmutter/build_ffi_host.sh --fresh`.
-- CUDA leg: the CUDA-13 runtime recipe (`lorrax_cuda13_runtime/rebuild_ffi.sh`,
-  outside this repository), which sources `ffi_mpi.sh` from the checkout it
-  builds.
+- CUDA leg: the CUDA-13 runtime recipe
+  ([Perlmutter §2](environment/machines/perlmutter.md#2-the-lorrax_a-module-and-the-ffi-bundle)),
+  which sources `ffi_mpi.sh` from the checkout it builds.
 - Build from a clean checkout in a zero-GPU compute step
-  (`lx run -N 1 -G 0 -n 1 -- …`). On a login node the default HDF5 module links
+  (`lx run --pool POOL -N 1 -G 0 -n 1 -- …`). On a login node the default HDF5 module links
   a second MPI and GATE 1 fails.
 - Seal the two legs as above.
 
@@ -143,8 +143,9 @@ are parallel, so `diff` shows only values.
 ## The ABI pairing rule
 
 `src/ffi/cpp/common/lorrax_ffi_abi.h` holds one number,
-`LORRAX_FFI_ABI_VERSION` (currently 4). It is compiled into both legs and
-mirrored by both Python loaders, and a drift test compares all three.
+`LORRAX_FFI_ABI_VERSION`. It is compiled into both legs and mirrored by both
+Python loaders (the live value: `LORRAX_FFI_ABI_VERSION` in
+`src/ffi/common/ffi_loader.py`), and a drift test compares all three.
 
 Bump it in the same commit as any handler-signature change: adding, removing
 or reordering an `Arg` or `Ret`; moving a value between `Attr` and `Arg`;
