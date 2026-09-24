@@ -133,10 +133,12 @@ static ffi::Error EighImpl(
     if (prof) LORRAX_CUDA_CHECK(cudaEventRecord(ev[3], ctx->stream));
 
     // Device workspace from XLA's scratch pool, i.e. inside XLA's reserved
-    // pool.  cuSOLVERMp's own internals (NCCL, handles) still allocate
-    // outside it; those bytes were measured (<= 4.7 GB/rank at P4, sandbox
-    // runs/runtime/gpu_pool_policy_20260924) and are what the runtime's
-    // pool fraction leaves room for (docs/environment/overview.md §2.1).
+    // pool.  cuSOLVERMp's own internals (NCCL, handles, the context's
+    // grow-only workspace) allocate outside it: up to 4.72 GB/rank at P4.
+    // At fraction 0.89 a 40 GB card leaves 0.11 x 42.4 = 4.66 GB outside
+    // the reservation, so those bytes fit only because the driver releases
+    // idle reserved memory to them on demand (docs/environment/overview.md
+    // §2.1).  What never fits is XLA's LIVE bytes plus these.
     const size_t scratch_bytes = eigh_scratch_bytes(d_ws_bytes, n, ctx, sizeof(T));
     auto ws_opt = scratch.Allocate(scratch_bytes);
     if (!ws_opt.has_value()) {
