@@ -323,11 +323,6 @@ def print_banner(
                 "jax 0.9; the current name is XLA_CLIENT_MEM_FRACTION.")
         if _xm.peak_note:
             print_fn(f"  [note] {_xm.peak_note}")
-        if _xm.tf_gpu_allocator_raw:
-            print_fn(
-                f"  [note] TF_GPU_ALLOCATOR={_xm.tf_gpu_allocator_raw!r} is "
-                f"set but INERT for jax (a TensorFlow variable); it does not "
-                f"select an allocator here.")
     else:
         _gpu_knobs = {n: os.environ.get(n) for n in (
             "XLA_PYTHON_CLIENT_ALLOCATOR",

@@ -600,8 +600,7 @@ _GPU_ENV = {"allocator": "default", "allocator_raw": None,
             "allocator_is_valid": True, "preallocate": False,
             "preallocate_raw": "false",
             "preallocate_looks_like_a_typo": False,
-            "mem_fraction": None, "mem_fraction_var": None,
-            "tf_gpu_allocator_raw": None}
+            "mem_fraction": None, "mem_fraction_var": None}
 
 
 def test_the_reported_pool_figures_are_the_clients():

@@ -89,12 +89,6 @@ from . import _FALSY_TOKENS as _ENV_FALSE
 # ``isdf_fitting.fit_zeta_to_h5._track_peak``, which samples the WHOLE GPU
 # (other processes included), not this run's arena.
 #
-# ``TF_GPU_ALLOCATOR`` is a TensorFlow variable and is INERT for JAX
-# (measured; ``src/runtime/__init__.py:231``).  It is reported when set —
-# ``config/modulefiles/lorrax/0.1.0.lua:131`` still exports it — but it
-# must not change any verdict, or a stale export would caveat a perfectly
-# faithful BFC peak.
-#
 # This function READS ONLY.  It never sets an allocator variable: which
 # values LORRAX ships is decided in ``runtime.set_default_gpu_pool``
 # (cuda_async, PREALLOCATE=true, fraction runtime.GPU_POOL_FRACTION on CUDA).  Everything here
@@ -150,8 +144,6 @@ class XlaGpuMemoryEnv:
     peak_accounting: str            # "arena" | "none" | "unknown"
     peak_is_faithful: bool
     peak_note: str
-    tf_gpu_allocator_raw: str | None
-    tf_gpu_allocator_is_inert: bool
     preallocate: bool
     preallocate_raw: str | None
     preallocate_looks_like_a_typo: bool
@@ -196,9 +188,6 @@ def resolve_xla_gpu_memory_env() -> XlaGpuMemoryEnv:
     note = _XLA_PEAK_NOTE.get(alloc, "") if alloc_valid else (
         f"{alloc!r} is not an allocator jax accepts.")
 
-    # Inert for JAX; reported, never decisive.  (See the module comment.)
-    tf_alloc_raw = os.environ.get("TF_GPU_ALLOCATOR")
-
     prealloc_raw = os.environ.get("XLA_PYTHON_CLIENT_PREALLOCATE")
     if prealloc_raw is None or prealloc_raw == "":
         preallocate = True                      # jax leaves the option unset
@@ -225,8 +214,6 @@ def resolve_xla_gpu_memory_env() -> XlaGpuMemoryEnv:
         peak_accounting=accounting,
         peak_is_faithful=(accounting == "arena"),
         peak_note=note,
-        tf_gpu_allocator_raw=tf_alloc_raw,
-        tf_gpu_allocator_is_inert=True,
         preallocate=preallocate,
         preallocate_raw=prealloc_raw,
         preallocate_looks_like_a_typo=prealloc_typo,

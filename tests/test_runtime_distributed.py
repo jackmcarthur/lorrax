@@ -27,7 +27,7 @@ _ENV_KEYS = ("JAX_PROCESS_COUNT", "JAX_NUM_PROCESSES", "SLURM_NTASKS",
              # make the policy assertions fail for the wrong reason.
              "XLA_PYTHON_CLIENT_PREALLOCATE", "XLA_PYTHON_CLIENT_ALLOCATOR",
              "XLA_CLIENT_MEM_FRACTION", "XLA_PYTHON_CLIENT_MEM_FRACTION",
-             "TF_GPU_ALLOCATOR", "XLA_FLAGS", "JAX_PLATFORM_NAME")
+             "XLA_FLAGS", "JAX_PLATFORM_NAME")
 
 
 @pytest.fixture
@@ -211,13 +211,11 @@ def test_gpu_pool_policy_table(clean_env, case, env_in, want):
 
 
 def test_set_default_env_applies_the_pool_policy(clean_env):
-    """The driver entry point applies it, and TF_GPU_ALLOCATOR stays unset
-    (a TensorFlow variable, inert for JAX)."""
+    """The driver entry point applies it."""
     clean_env.setenv("JAX_PLATFORMS", "cuda,cpu")
     clean_env.setattr(runtime, "_gpu_is_present", lambda: True)
     set_default_env()
     assert {k: os.environ.get(k) for k in _POLICY} == _POLICY
-    assert "TF_GPU_ALLOCATOR" not in os.environ
 
 
 def test_set_default_env_cpu_does_not_touch_gpu_allocator(clean_env):

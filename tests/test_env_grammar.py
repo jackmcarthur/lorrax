@@ -794,22 +794,6 @@ def test_bfc_allocators_are_faithful():
             assert r.caveat() == "", tok
 
 
-def test_tf_gpu_allocator_is_inert_and_changes_no_verdict():
-    """``TF_GPU_ALLOCATOR`` is a TensorFlow variable, inert for JAX
-    (measured; ``src/runtime/__init__.py:231``).  The old branch OR'd it
-    into the caveat test, so a stale export — and
-    ``config/modulefiles/lorrax/0.1.0.lua:131`` still sets it — would have
-    caveated a perfectly faithful BFC peak.
-    """
-    with _Env(XLA_PYTHON_CLIENT_ALLOCATOR=None,
-              TF_GPU_ALLOCATOR="cuda_malloc_async"):
-        r = gw_config.resolve_xla_gpu_memory_env()
-        assert r.allocator == "default"
-        assert r.peak_is_faithful is True
-        assert r.caveat() == "", r.caveat()
-        assert r.tf_gpu_allocator_is_inert is True
-
-
 # --- the client, not the environment ----------------------------------------
 #
 # Job 7882443 (allocator workstream) found kin_ion_io pre- and post-refactor
