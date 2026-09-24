@@ -18,7 +18,7 @@ import numpy as np
 from jax.sharding import NamedSharding, PartitionSpec as P
 
 from common.gamma_matrices import gamma_perm_phase
-from runtime.padding import pad_to_axis, padded_axis
+from runtime.padding import ladder_extent, pad_to_axis, padded_axis
 from gw.ppm_tau_kernel import get_shared_sigma_tau_kernel
 from gw.wavefunction_bundle import parent_sigma_operands, sigma_face_kernel_kwargs
 
@@ -178,7 +178,7 @@ def sector_synthesis(readers, headers, bases, families, frequencies, meta, mesh_
     # The store reader pads physical Kmax for both endpoint face shardings.
     # Keep that carrier through unfolding and GEMM; K and the interval bounds
     # remain physical, so the padded pole columns have identically zero weight.
-    kcarrier=padded_axis(kmax,mesh_xy,name='sector_sigma_K',specs=(
+    kcarrier=padded_axis(ladder_extent(kmax),mesh_xy,name='sector_sigma_K',specs=(
         (P(None,'x',None,'y'),3),(P(None,'y',None,'x'),3))).carrier
     rows=np.arange(nk,dtype=np.int32)
     routes=[];costs=[]
