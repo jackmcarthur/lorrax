@@ -33,11 +33,10 @@ windows are skipped before dispatch.
 
 SC band-extrapolation postprocessing caches JIT callables by output sharding.
 Bracket indices and affine weights are operands, not captured constants.
-The spectral estimator still forms one symmetric per-state weight matrix at
-a time and sums in bracket order. Unsharded callers retain the existing eager
-operation sequence.
+The spectral estimator forms one symmetric per-state weight matrix at a time
+and sums in bracket order. Unsharded callers run the eager operation sequence.
 
-Validation is deliberately split:
+Validation is split:
 
 - `tests/multi_device/active_band_sigma_gate.py` compares bracketed and
   unbracketed projected tau kernels with frozen full-band owners, including
