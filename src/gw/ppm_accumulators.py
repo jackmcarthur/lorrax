@@ -111,6 +111,32 @@ def _device_output_add(sharding):
         donate_argnums=(0,), out_shardings=sharding)
 
 
+@lru_cache(maxsize=16)
+def _device_window_runner(tau_kernel, sharding, omega_axis, antihermitian):
+    """ONE executable for a whole quadrature window: loop the time nodes on device.
+
+    ``coeff`` is ``(capacity, n_omega)`` over the COMPLETE output frequency
+    axis, exactly zero outside the window's frequencies, so every window of a
+    plan shares one signature (``capacity`` is the plan's largest node count)
+    and one compile.  The node loop runs ``n_active`` iterations; nothing
+    returns to the host between nodes.  An anti-Hermitian window sums its
+    one-sided ``Z`` first and adds ``(Z - Z†)/(2i)`` once, as ``end_window``
+    does.
+    """
+    def run(total, tau_arguments, t_nodes, coeff, n_active, active_count):
+        def one(i, acc):
+            sigma = tau_kernel(*tau_arguments, t_nodes[i], active_count)
+            return _omega_fold(acc, sigma, coeff[i], omega_axis)
+
+        if not antihermitian:
+            return jax.lax.fori_loop(0, n_active, one, total)
+        Z = jax.lax.with_sharding_constraint(jnp.zeros_like(total), sharding)
+        Z = jax.lax.fori_loop(0, n_active, one, Z)
+        return total + (Z - jnp.conj(jnp.swapaxes(Z, -1, -2))) / 2j
+
+    return jax.jit(run, donate_argnums=(0,), out_shardings=sharding)
+
+
 class DeviceOmegaAccumulator:
     """Build real-frequency Sigma without retaining time-domain matrices.
 
@@ -291,6 +317,58 @@ class DeviceOmegaAccumulator:
         self._index = 0
         self._indices = self._indices_device = None
         self._contiguous = False
+
+    def integrate_window(self, tau_kernel, tau_arguments, t, alpha, *,
+                         n_active, active_count, capacity, omega_sign,
+                         prefactor, e_ref_sum=0.0, antihermitian=False,
+                         omega_indices=None, omega_values=None,
+                         compile_only=False):
+        """Evaluate ``tau_kernel`` at a window's first ``n_active`` nodes and fold them in.
+
+        The same coefficients as :meth:`begin_window`, scattered into the
+        complete frequency axis and padded to ``capacity`` nodes, go to the
+        device once; the node loop is one executable
+        (:func:`_device_window_runner`).  ``compile_only`` lowers and compiles
+        that executable without running it.
+        """
+        if self._coeff is not None:
+            raise RuntimeError("a per-node frequency window is still open")
+        t = np.asarray(jax.device_get(t), np.complex128)
+        alpha = np.asarray(jax.device_get(alpha), np.complex128)
+        if t.ndim != 1 or alpha.shape != t.shape or t.size == 0:
+            raise ValueError("t and alpha must be nonempty equal vectors")
+        if not 0 < int(n_active) <= t.size <= int(capacity):
+            raise ValueError("require 0 < n_active <= len(t) <= capacity")
+        if omega_indices is None:
+            if omega_values is not None:
+                raise ValueError("omega_values requires omega_indices")
+            columns = np.arange(self._omega.size)
+            omega = self._omega
+        else:
+            columns = np.asarray(omega_indices, dtype=np.int64)
+            omega = np.asarray(omega_values, dtype=np.complex128)
+            if (columns.ndim != 1 or omega.shape != columns.shape
+                    or np.any(columns < 0) or np.any(columns >= self._omega.size)
+                    or np.unique(columns).size != columns.size):
+                raise ValueError("invalid active frequency indices/values")
+        coeff = np.zeros((int(capacity), self._omega.size), np.complex128)
+        coeff[:t.size, columns] = _omega_coefficient(
+            np, omega[None, :], t[:, None], alpha[:, None],
+            float(omega_sign), float(prefactor), float(e_ref_sum))
+        t_pad = np.zeros(int(capacity), np.complex128)
+        t_pad[:t.size] = t
+        t_pad, coeff, n_active = (
+            device_put_process_local(np.asarray(x), self._replicated)
+            for x in (t_pad, coeff, np.int32(n_active)))
+        run = _device_window_runner(
+            tau_kernel, self._sharding, self._omega_axis, bool(antihermitian))
+        arguments = (self._total, tuple(tau_arguments), t_pad, coeff,
+                     n_active, active_count)
+        if compile_only:
+            run.lower(*arguments).compile()
+            return self._total
+        self._total = run(*arguments)
+        return self._total
 
     def add_direct(self, sigma_omega, omega_index, *, coefficient=1.0):
         """Add a Sigma matrix already evaluated at one output frequency.

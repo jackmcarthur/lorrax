@@ -1079,6 +1079,9 @@ def _integrate_sigma_batches(
                 w_synthesis=builder, cache=cache, **face_kwargs)
 
         dynamic_tau_kernel = tau_kernel_for(w_synthesis)
+        # The resident pole route runs each window as one executable.
+        windowed = (w_synthesis is None and tau_kernel_factory is None
+                    and not tau_profile and not prepared_bounds)
         tau_kernel = dynamic_tau_kernel
         small = NamedSharding(mesh_xy, P())
         # Lifetime is one integration: new energies/occupations in a later SC map
@@ -1228,16 +1231,27 @@ def _integrate_sigma_batches(
                             prewarm_args, meta, mesh_xy=mesh_xy,
                             kernel_for=tau_kernel_for)
                         print_fn(f"  shared-pole inherited Sigma peak: {inherited}")
-                    if hasattr(tau_kernel, "lower"):
+                    if windowed:
+                        accumulator.integrate_window(
+                            tau_kernel, tau_arguments, win.nodes.t,
+                            win.nodes.alpha, n_active=len(win.nodes.t),
+                            active_count=active_count, capacity=tau_capacity,
+                            omega_sign=win.omega_sign, prefactor=win.prefactor,
+                            e_ref_sum=win.E_ref_A + win.E_ref_B,
+                            antihermitian=(win.project_code == 1),
+                            omega_indices=row.omega_idx,
+                            omega_values=row.omega_abs, compile_only=True)
+                    elif hasattr(tau_kernel, "lower"):
                         tau_kernel.lower(*prewarm_args).compile()
                     else:
                         # The stage-split diagnostic is a Python dispatcher over
                         # separately-jitted stages.  Execute one real-shape call
                         # to prewarm the same kernels the timed sweep will use.
                         jax.block_until_ready(tau_kernel(*prewarm_args))
-                    accumulator.precompile_tau_add(
-                        sigma_shape=sigma_shape,
-                        sigma_sharding=sigma_sharding)
+                    if not windowed:
+                        accumulator.precompile_tau_add(
+                            sigma_shape=sigma_shape,
+                            sigma_sharding=sigma_sharding)
                     print_fn(
                         "  MPA Sigma sweep begin: shared pane tau kernel "
                         "prewarmed")
@@ -1257,6 +1271,26 @@ def _integrate_sigma_batches(
                         break
                     t_nodes = t_nodes[:remaining]
                     alpha_nodes = alpha_nodes[:remaining]
+            if windowed:
+                # One executable per window: the node loop runs on device.
+                total = accumulator.integrate_window(
+                    tau_kernel, tau_arguments, t_nodes, alpha_nodes,
+                    n_active=len(t_nodes), active_count=active_count,
+                    capacity=tau_capacity,
+                    omega_sign=win.omega_sign, prefactor=win.prefactor,
+                    e_ref_sum=win.E_ref_A + win.E_ref_B,
+                    antihermitian=(win.project_code == 1),
+                    omega_indices=row.omega_idx, omega_values=row.omega_abs)
+                for _ in t_nodes:
+                    progress.step(wait=total)
+                n_tau += len(t_nodes)
+                n_sweeps += 1
+                logical_tau_pairs += len(t_nodes)
+                if debug_max_tau is not None and n_tau >= debug_max_tau:
+                    stop_probe = True
+                    break
+                continue
+            with timing.section('tau.window_setup'):
                 accumulator.begin_window(
                     t_nodes, alpha_nodes,
                     omega_sign=win.omega_sign, prefactor=win.prefactor,
