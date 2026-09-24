@@ -1455,7 +1455,7 @@ def build_psi_r_cache_sm(psi_G_store, *, mesh_xy: Mesh) -> jax.Array:
 		@partial(
 			shard_map,
 			mesh=mesh_xy,
-			in_specs=(P(None, None, None, None), P(None, None)),
+			in_specs=(P(None, None), P(None, None)),
 			out_specs=P(None, None, ('x', 'y'), None, None),
 			check_vma=False,
 		)

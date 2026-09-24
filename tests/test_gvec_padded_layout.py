@@ -23,7 +23,7 @@ import numpy as np
 import pytest
 
 from common.gvec_fft_box import (
-    build_g_index_for_fft_box,
+    build_sphere_box_index,
     fft_box_pad_sentinel,
     pad_gvecs_to_sentinel,
     pad_mask,
@@ -111,7 +111,7 @@ def test_rectangular_input_refuses_to_guess_its_own_extents():
     with pytest.raises(ValueError, match="ngk_valid"):
         pad_gvecs_to_sentinel(tab, grid)
     with pytest.raises(ValueError, match="ngk_valid"):
-        build_g_index_for_fft_box(tab, grid, 2)
+        build_sphere_box_index(tab, grid, 2)
     # With the extents it is idempotent — re-padding an already-padded
     # table is a no-op, which is what lets a consumer normalise anything.
     again, _ = pad_gvecs_to_sentinel(tab, grid, ngk_valid=ngk)
@@ -337,52 +337,49 @@ def test_masked_scatter_equals_the_ragged_build():
                      dtype=np.int32),
             np.array([[0, 0, 0], [0, 1, 0]], dtype=np.int32)]
     tab, ngk = pad_gvecs_to_sentinel(rows, grid, ngkmax=5)
-    rect = build_g_index_for_fft_box(tab, grid, 5, ngk_valid=ngk)
-    ragged = build_g_index_for_fft_box(rows, grid, 5)
+    rect = build_sphere_box_index(tab, grid, 5, ngk_valid=ngk)
+    ragged = build_sphere_box_index(rows, grid, 5)
     assert np.array_equal(rect, ragged)
 
 
-def test_pad_then_scatter_everything_would_clobber_a_real_G():
-    """Why MASKED and not pad-then-scatter-everything.
+def test_an_unmasked_build_would_let_a_pad_claim_a_real_G():
+    """Why the mask is applied in the builder.
 
     Constructed so a physical G sits on the sentinel cell — a table
-    ``pad_gvecs_to_sentinel`` refuses, which is the point: without the
-    refusal, the unmasked scatter writes pad rows LAST (higher ``g``
-    wins in a numpy fancy-index assignment) and the real coefficient
-    index is replaced by a pad index.  The masked build is immune
-    regardless, and this shows both halves.
+    ``pad_gvecs_to_sentinel`` refuses, which is the point.  The masked
+    sphere index keeps the real G's cell and sends pads out of the box;
+    the rejected unmasked build would hand the pad slots that same cell, a
+    collision the box scatter cannot resolve.
     """
     grid = (6, 6, 8)
+    n_rtot = 6 * 6 * 8
     sent, _ = fft_box_pad_sentinel(grid)
     cell = tuple(int(c) % int(n) for c, n in zip(sent, grid))
+    flat = (cell[0] * 6 + cell[1]) * 8 + cell[2]
     ngkmax = 4
-    # Physical: Γ at g=0, the corner at g=1.  Pad: g=2, 3.
     tab = np.broadcast_to(sent, (1, ngkmax, 3)).astype(np.int32).copy()
     tab[0, 0] = [0, 0, 0]
     tab[0, 1] = sent
     ngk = np.asarray([2], dtype=np.int32)
 
-    masked = build_g_index_for_fft_box(tab, grid, ngkmax, ngk_valid=ngk)
-    assert int(masked[0][cell]) == 1                 # the REAL G survives
+    masked = build_sphere_box_index(tab, grid, ngkmax, ngk_valid=ngk)
+    assert masked[0].tolist() == [0, flat, n_rtot + 2, n_rtot + 3]
 
-    # The rejected alternative, written out: scatter every row.
-    everything = build_g_index_for_fft_box(
+    everything = build_sphere_box_index(
         tab, grid, ngkmax, ngk_valid=np.asarray([ngkmax], dtype=np.int32))
-    assert int(everything[0][cell]) == ngkmax - 1    # a PAD row won
+    assert everything[0].tolist() == [0, flat, flat, flat]   # pads collide
 
-    # …and this table is exactly what the producer refuses to build.
     with pytest.raises(ValueError, match="pad sentinel"):
         pad_gvecs_to_sentinel(tab[:, :2], grid, ngkmax=ngkmax,
                               ngk_valid=ngk)
 
 
-def test_empty_cells_take_the_ngkmax_sentinel():
+def test_pad_slots_take_distinct_out_of_box_values():
     grid = (4, 4, 4)
     rows = [np.array([[0, 0, 0]], dtype=np.int32)]
-    gi = build_g_index_for_fft_box(rows, grid, 7)
-    assert gi.shape == (1, 4, 4, 4)
-    assert int(gi[0, 0, 0, 0]) == 0
-    assert int(np.count_nonzero(gi == 7)) == 4 * 4 * 4 - 1
+    si = build_sphere_box_index(rows, grid, 7)
+    assert si.shape == (1, 7) and si.dtype == np.int32
+    assert si[0].tolist() == [0] + [64 + g for g in range(1, 7)]
 
 
 # ---------------------------------------------------------------------------

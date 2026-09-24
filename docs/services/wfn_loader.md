@@ -69,11 +69,12 @@ for the real one, which is exactly what the deleted shim was.
 | `bands(b_lo, b_hi, *, chunk, ...)` | Chunked iterator over `load`. |
 | `full_k_parent_groups(full_k=None)` | Stable O(nk) grouping of requested full-BZ rows by raw IBZ parent. |
 | `unfold_parent_to_full_k(parent_psi, *, parent, full_k, bispinor=False)` | Apply the canonical typed unitary/antiunitary action to one already-loaded raw parent row. Consumers can realize a star with one child workspace and no parent re-read. |
-| `full_k_box_index_one_dev(full_k)` | Build one child's replicated FFT gather index from the current parent G row; strict one-k streams avoid retained full-BZ G/index tables. |
-| `ibz_box_index_one_dev(parent)` | Build the matching FFT gather index for one raw WFN parent without creating a complete IBZ index table. |
+| `full_k_box_index_one_dev(full_k)` | One child's replicated `(1, ngkmax)` sphere index built on device from the current parent G row; strict one-k streams avoid retained full-BZ G/index tables. |
+| `ibz_box_index_one_dev(parent)` | The matching `(1, ngkmax)` sphere index for one raw WFN parent. |
+| one-read consumer (not a loader method) | `common.psi_G_store.load_parent_psi_G` reads each band chunk once through `load`, moves it bands→G slots with one all-to-all, and samples the centroid faces by a DFT over the local G slots: the G-slot store (`P(None,None,None,('x','y'))`, device or host) and the faces from one pass. |
 | `gvecs(k=...)` | `(n_k, ngkmax, 3)` int32, pad rows = the FFT-box **pad sentinel**, never zeros. |
 | `ngk_valid(k=...)` | The mask that makes the pad rows discountable. The pair is the contract. |
-| `box_index(k=...)` / `box_index_dev(...)` | FFT-box gather table, host / device-cached (the replicated-buffer-leak fix). |
+| `box_index(k=...)` / `box_index_dev(...)` | THE ψ(G)↔box table: `(n_k, ngkmax)` int32, the flat C-order box cell of each G slot, `n_rtot + g` on a pad slot (`common.gvec_fft_box.build_sphere_box_index`). Box order is computed from it (unique scatter up, fill-gather down); the dense `(n_k, nx, ny, nz)` table is retired (loader tables 2026-09-23: 0.80 → 0.08 GB/rank replicated at VI3 12×12). Host / device-cached. |
 | `adopt_mesh(mesh)` | Late mesh binding for drivers whose mesh cannot exist at construction; narrow by design; MAY RAISE (the refusal is the point). |
 | `path`, `symmetry()`, `kpt_starts` | The public spellings of what consumers used to reach as `._filename` / `._ensure_sym()` / `._kpt_starts`. |
 | `get_gvec_nk(ik)` | Deprecated one-k shim for legacy vcoul/qp_wfn; one release. |
