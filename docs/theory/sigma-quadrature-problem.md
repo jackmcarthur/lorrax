@@ -1,217 +1,313 @@
-# The MPA Sigma(omega) denominator-box quadrature
+# The dynamic Σ(ω) quadrature
 
-Implementation: `gw/sigma_box_plan.py`. Executor:
-`gw/mpa/sigma.py::_integrate_sigma_batches`. Numerical rule service:
-`minimax.uniform_rule.build_uniform_rule`.
+Every dynamic self-energy reaches one planner and one executor through
+`gw.mpa.sigma.compute_sigma_c_mpa_omega_grid`: GN/HL-PPM (written as a
+one-pole in-memory store), elementwise MPA, the shared-pole W and its photon
+sectors. The planner is `gw.sigma_box_plan`, the rule builder
+`minimax.build_uniform_rule`, the τ kernel `gw.ppm_tau_kernel`. Pole models
+belong to [Multipole frequency integration](THEORY_mpa_implementation.md),
+[Metallic MPA screening](metallic-mpa-screening.md) and the
+[shared-pole model](../architecture/shared_pole_model.md); this page owns the
+frequency integral.
 
-## 1. Problem and separability
+## 1. What is computed
 
-For one causal branch, the MPA correlation self-energy contains terms
+W^c has poles Ω_p (Re Ω_p > 0, Im Ω_p ≤ 0) and residue matrices B_p(q) on the
+ISDF centroids r_μ. After the ω′ integral each causal branch b contributes
 
-```
-R_np / d_jnp,       d_jnp = omega_j - sigma_b (E_n + Omega_p),
-```
+$$
+\Sigma^b_{ij}(\mathbf k,\omega)=\sum_{\mu\nu}\psi^*_{i\mathbf k}(r_\mu)\,S^b_{\mu\nu}(\mathbf k,\omega)\,\psi_{j\mathbf k}(r_\nu),
+\qquad
+S^b_{\mu\nu}=-\frac1{N_k}\sum_{\mathbf q}\sum_{A\in b}\sum_p
+\frac{w_A\,\psi_{A,\mathbf k-\mathbf q}(r_\mu)\,\psi^*_{A,\mathbf k-\mathbf q}(r_\nu)\,B_{p,\mu\nu}(\mathbf q)}
+{d_b(\omega;E_A,\Omega_p)},
+$$
 
-where `sigma_b=+1` for conduction and `-1` for valence. The fitted retarded
-poles have `Im Omega_p <= 0`; the requested broadening `eta` is applied once in
-the executable weights.
+$$
+d_b=\omega-\sigma_b(E_A+\Omega_p)+i\sigma_b\eta .
+$$
 
-The reciprocal is replaced by a short exponential sum,
+On the empty branch σ_b = +1 and E_A = ε_A − μ; on the occupied branch
+σ_b = −1 and E_A = μ − ε_A is the hole energy. The weight w_A is 1 on an
+insulator and 1 − f_A or f_A on a metal. η (`sigma_regularization_ev`) is the
+literal retarded broadening: one kernel and one η for every ansatz, both
+frequency halves and every branch. The four branches are
+(ω ≥ 0, ω < 0) × (empty, occupied). For E_A ≥ 0, Re d_b changes sign only on
+the empty branch at ω ≥ 0 and the occupied branch at ω < 0; the planner reads
+the actual sign topology from each window's box (§5).
 
-```
-1/d ~= sum_l w_l exp(i t_l d).
-```
+Summed as written, this is a (q, A, p) sum at every (k, ω). The quadrature
+below removes the state–pole product.
 
-Each term then factors into independent external-frequency, electronic-state,
-and screened-pole factors. One `(window,tau)` pair therefore costs one spatial
-Green-function/screened-interaction transform, rather than an explicit
-state-by-pole contraction. The total number of `(window,tau)` pairs is the
-resource currency; the plan reports it and never refuses on it.
+## 2. Separation: one τ node is one convolution
 
-## 2. Product windows
+For Im d > 0, 1/d = −i∫₀^∞ e^{itd} dt. A rule Q(d) = Σ_l w_l e^{i t_l d}
+with complex times factors each term into an external-frequency scalar, a
+state factor and a pole factor. In executor time τ = σ_b t, restricted to a
+product window w = (states S_w) × (poles P_w):
 
-Each of the four causal branches (positive/negative external frequency,
-conduction/valence) is partitioned into at most three Cartesian products. Let
+$$
+S^{b,w}_{\mathbf k}(\omega)\approx-\sum_l w_l\,e^{-\eta\tau_l}\,
+e^{-i(E^{\rm ref}_A+E^{\rm ref}_B-\sigma_b\omega)\tau_l}\,
+\big[G^w\circledast W^w\big]_{\mathbf k}(\tau_l),
+$$
 
-```
-state_edge = sigma_window_edge_factor * eta
-pole_edge  = max(abs(omega)) + state_edge + negative-state excursion.
-```
+$$
+G^w_{\mathbf k}(\tau)=\sum_{A\in S_w}\psi_{A\mathbf k}\,w_A\,e^{-i\tau(E_A-E^{\rm ref}_A)}\,\psi^\dagger_{A\mathbf k},
+\qquad
+W^w_{\mathbf q}(\tau)=\sum_{p\in P_w}B_p(\mathbf q)\,e^{-i\tau(\Omega_p-E^{\rm ref}_B)},
+$$
 
-For a crossing branch the products are:
+with [G ⊛ W]_k = N_k⁻¹ Σ_q G_{k−q} ⊙ W_q, a convolution over the k grid done
+by FFT. The rule builder works in the upper half plane; the occupied branch's
+lower-half-plane box is served by 1/d̄ = conj(1/d), i.e. t → −t̄, w → w̄.
+The references sit at the bounded end of each factor (crossing window:
+E^ref_A = min E_A, E^ref_B = 0; sign-definite window: the state and pole
+endpoints on the decaying side), and their sum returns in the scalar
+phase.
 
-```
-resonant   : E <= pole_edge,  Re Omega <= pole_edge
-state_tail : E >  pole_edge,  Re Omega <= pole_edge
-pole_tail  : all E,           Re Omega >  pole_edge
-```
+## 3. Cost
 
-For the other causal orientation they are:
+Per (window, τ) pair on P ranks, with N_k k-points (N_k^par symmetry
+parents), N_μ centroids, n_s spinor components, N_b^w live bands in the
+window and N_σ projected bands:
 
-```
-bulk       : E >  state_edge, all poles
-resonant   : E <= state_edge, Re Omega <= pole_edge
-pole_tail  : E <= state_edge, Re Omega >  pole_edge
-```
+| step | operation | cost |
+|---|---|---|
+| W synthesis | Σ_{p∈P_w} B_p e^{−iτ(Ω_p−E^ref_B)} over (q, μ, ν) | O(\|P_w\| N_k N_μ² / P) |
+| G build | one complex GEMM per parent, (N_μn_s × N_b^w)(N_b^w × N_μn_s), then the typed unfold to full k without processor exchange | 8 N_k^par (N_μn_s)² N_b^w / P flops |
+| k-convolution | inverse FFT of W (once per node), inverse FFT of G, product in R, forward FFT, for every centroid pair | O((N_μn_s)² N_k log N_k / P) |
+| projection | ψ† S ψ on parents, band-block reshard | O(N_k^par N_μn_s N_σ (N_μn_s + N_σ) / P) |
+| fold | the scalar above times S into each of the window's frequencies | O(N_ω^w N_k^par N_σ² / P) |
 
-These are products because the executor windows `G` and `W` independently.
-A diagonal predicate coupling one state to one pole would destroy that
-separability. Empty products are omitted. Products are not merged: a
-whole-branch rule widens cheap sign-definite tails into an expensive crossing
-box and was measured to reintroduce the low-mass-state error the box rule
-removed.
+Only the fold sees the output frequencies. The sweep costs
+(Σ_w N_τ^w) × (one GEMM + one k-convolution + one projection), so the
+**(window, τ) pair count is the currency**: a plan is judged by its pairs
+first and its planning time second. Planning is host scalar work on boxes and
+never touches a spatial array. The live set per node is one full-k G tile and
+one W tile, N_k(N_μn_s)² and N_k N_μ² complex numbers over P; W never carries
+a pole axis.
 
-## 3. Direct support boxes
+On the resident-pole route (GN/HL one-pole store, elementwise MPA) poles are
+read in batches of `mpa_pole_batch_size` (1–8, default 4), and a window runs
+once per batch that holds any of its poles, so a window over N_p poles pays
+⌈N_p/b⌉ G builds and convolutions per node. The one-pole store is one batch.
+The shared-pole route synthesizes W(τ) for all poles inside each node and
+pays each node once.
 
-The caller reduces each distributed pole field to exact live extrema per pole
-and shallow/deep selector. Residues are used only to decide whether a pole
-entry is live; their magnitudes never weight the quadrature. For every product
-window, the real support is the extrema of the literal corners
+## 4. Product windows
 
-```
-omega - sigma_b * (E + Re Omega)
-```
+With a = f_e η (f_e = `sigma_window_edge_factor`, default 1.5),
+x = max(0, −min_A E_A) and Λ = max|ω| + a + x, each branch is partitioned into
+at most three Cartesian products:
 
-over that window's external frequencies, live state energies, and selected
-pole extrema. The positive imaginary support presented to the rule builder is
-`[-Im Omega_min + eta, -Im Omega_max + eta]`.
+| branch | window | states | poles (Re Ω) |
+|---|---|---|---|
+| crossing | resonant | E ≤ Λ | (0, Λ] |
+| crossing | state tail | E > Λ | (0, Λ] |
+| crossing | pole tail | all | > Λ |
+| sign-definite | bulk | E > a | all |
+| sign-definite | resonant | E ≤ a | (0, Λ] |
+| sign-definite | pole tail | E ≤ a | > Λ |
 
-The real interval is padded by 2% of `max(width,eta)`. A sign-definite edge is
-allowed to move at most 30% toward zero, so padding never changes a
-sign-definite box into a crossing box. This matters: widening a near-zero edge
-changes the linear-in-bandwidth crossing rank, whereas far-edge widening of a
-tail costs only logarithmically.
+- **Products**, because only a product set factors into G^w(τ) ⊙ W^w(τ). A
+  selector coupling one state to one pole reinstates the state–pole sum.
+- **A partition**: each causal (state, pole, ω-sign) tuple has one owner, so
+  the error bound of §6 carries no window-count factor.
+- **These cuts** keep far states and far poles out of the crossing box, whose
+  rule is linear in its width, and put them in sign-definite boxes, whose
+  rules are logarithmic. On the sign-definite branch the states within a of
+  zero (a small gap, an inverted band, a metal's Fermi surface) are split off
+  so the bulk box stays sign-definite.
 
-No histogram, lattice representative, envelope, or error apportionment enters
-this construction. The former measure-adapted campaign produced small
-weighted residuals while missing a low-mass Na state at the Fermi level by
-0.95 meV. The direct box makes the same statement for every live tuple.
+Empty windows are dropped. Windows are never merged: a whole-branch rule
+widens cheap sign-definite tails into one expensive crossing box. On a metal
+the branch supports carry the occupation weights: a band belongs to the
+occupied branch at weight f when |f| clears the occupation window and to the
+empty branch at weight 1 − f when |1 − f| clears it, so partially occupied
+bands sit in both. A state on the wrong side of μ widens Λ through x.
 
-## 4. Rule and error currency
+## 5. Denominator boxes
 
-`build_uniform_rule(box, eps)` chooses the error currency:
+The real support of window w is the extent of the eight corners
+ω − σ_b(E + Re Ω), over the branch's extreme frequencies, the window's
+extreme live states and its extreme live poles. The imaginary support is
+[γ_min + η, γ_max + η] with γ = −Im Ω. Pole extrema come from a distributed
+census that keeps, per pole and selector, the extrema over live entries only;
+a residue decides whether an entry is live and never weights anything. The
+real interval is padded by 2% of max(width, η), and a sign-definite edge moves
+at most 30% of its distance toward zero, so padding never turns a
+sign-definite box into a crossing one.
 
-- sign-definite boxes use `sup |d| |Q(d)-1/d| <= eps` (relative);
-- boxes crossing `Re d=0` use
-  `sup eta_min |Q(d)-1/d| <= eps` (peak-relative).
+No histogram, sampled lattice or error apportionment enters. The same box
+gives the same rule on every deck, which makes rules cacheable and certifies a
+low-mass state at the Fermi level exactly as it certifies a heavy one; a
+mass-weighted fit is what loses such a state.
 
-The distinction is physical. Peak-relative error on a far tail grows in
-relative terms like `|d|/eta` and produced a 4 meV Na semicore error; the
-relative tail rule reduced it to about 0.1 meV without extra asymptotic cost.
-Conversely, relative error on a crossing box over-resolves harmless far edges
-and added about 50% more nodes in the measured Na case.
+## 6. Error currencies and the delivered bound
 
-For a frozen SC rule with positive real shared poles, the initial tail
-certificate also covers the selector boundary. Write `a = edge_factor*eta`
-and `x = max(0,-min E)`; the pole split is `omega_max+a+x`.
-Thus state tails, pole tails and opposite-half bulk products satisfy
-`|Re d| >= a`, independently of which states or poles occupy the product.
-The direct box's 30% padding preserves `|Re d| >= 0.7*a`. This supplies the
-toward-zero edge of the initial fixed certificate when `a>0`; using only the
-nearest map-0 sample would exclude a state newly entering the same tail.
-The far edge retains the SC drift padding and its containment check. This
-does not freeze product membership or permit per-map node refitting.
+| box | currency | certificate |
+|---|---|---|
+| crossing (Re d spans 0) | peak-relative | sup_box η_min \|Q(d) − 1/d\| ≤ ε, η_min = min Im d |
+| sign-definite | relative | sup_box \|d\| \|Q(d) − 1/d\| ≤ ε |
 
-The planner rechecks the rule's own sup certificate, the float32-runtime noise
-allowance
+ε is `sigma_quadrature_eps`, the only accuracy dial; the shared-pole W takes
+it from its `sigma_w_accuracy` tier. Defaults are in the
+[input reference](../input_reference.md).
 
-```
-kappa_p99 * 6e-8 <= 0.05 * eps,
-```
+Because the windows partition the tuples, a state's delivered error is one
+factor of its own matrix elements M_np times the certificate:
 
-where the percentile uses Voronoi area weights on the rule builder's own fine
-certification cloud, not a physical histogram. The area weights remove the
-cloud's adaptive sampling density, so the statistic remains a function of the
-box and rule only. The planner also requires a maximum separately factored log
-growth of 30. A refusal is final. It does not trigger a hidden tighter-`eps`
-retry or a second quadrature family.
+$$
+|\delta\Sigma_n(\omega)|\le\varepsilon\sum_{p\in\text{crossing}}\frac{|M_{np}|}{\eta_{\min}}
++\varepsilon\sum_{p\in\text{sign-definite}}\frac{|M_{np}|}{|d_{np}|}.
+$$
 
-### How the rule is constructed
+The two currencies follow from that bound. A term's contribution scales as
+1/|d|. On a sign-definite tail a peak-relative ε would be a relative error of
+ε|d|/η, large on semicore terms at |d| ≫ η, while a relative rule costs
+nothing extra because exponential sums for 1/x on [a, b] are uniformly
+relative at O(log(b/a)) terms. On a crossing box 1/d is bounded by its peak,
+and a relative criterion would over-resolve the far edges by |d|/η for terms
+the peak already dominates.
 
-The two currencies are met by two different constructions, and neither reads
-a clock.
+## 7. The rule and its node laws
 
-A **crossing** box is solved at a predicted node count. `1/d` on such a box is
-a band-limited object: the rule needs time support `T ~ ln(c/eps)/eta` to
-resolve the peak and about `W T / 2 pi` nodes to cover an effective width `W`,
-where `W` saturates once one real side is much longer than the other because
-the nodes that cover the long side leave the real axis and damp it.
-`minimax.fixed_n_start.predict_nodes` evaluates that count and
-`start_param` places it: node density is the live-band Nyquist spacing
-times a measured profile that rises from 1 to 2 between the head and the tail,
-`Im s` takes the sign that damps the wider real edge and saturates at the
-off-ray cap, and the rule ends at the amplitude floor rather than at the
-horizon. One variable-projection Levenberg-Marquardt solve then polishes the
-placement, and the certificate decides. If it fails the count is raised 10%
-and the placement repeated, which is necessary because the count law was
-fitted on boxes whose reduction converged and therefore reads low on the
-widest ones.
+`build_uniform_rule(box, ε)` discretizes 1/d = −i∫₀^∞ e^{itd} dt along a ray
+t = s e^{−iθ}. The angle θ is scanned over the interval where every member
+decays on the box, and the smallest numerical rank wins: symmetric crossing
+boxes get real time; sign-definite boxes rotate toward imaginary time, the
+Laplace family.
 
-A **sign-definite** box is solved by removal, because `1/d` there is a
-Braess-Hackbusch exponential sum whose count is logarithmic in the corner
-dynamic range and small enough that removal terminates quickly: the
-interpolatory rule at the ray rank is polished, then nodes are removed one at
-a time (in batches while far above the target) with the survivors re-solved,
-until no accepted removal remains. Across the corpus that end is reached in
-0.4-3.0 s, the widest box (`R = 3522`) in 1.6 s.
+**Crossing box: linear in A/η.** 1/d is band-limited. Resolving the peak
+needs time support T = ln(c/ε)/η_min, and covering an effective real width
+W_eff at the Nyquist density needs N ≈ W_eff T/2π nodes. W_eff = 2m plus a
+saturating share of the long side's excess over the short side m, because the
+nodes that cover a long side leave the real axis and damp it. For a symmetric
+box of half-width A,
 
-The reason the two differ is cost, not taste. Removal asks for roughly
-`rank/2` removals times `K` candidate solves times 60-180 LM steps. On a wide
-crossing box that is of order `1e5` solves against a problem whose entire
-content is a few hundred GFLOP, and it does not finish; measured on the widest
-corpus box it was still running after nine minutes. That is what a wall-clock
-budget used to cut short, at the cost of making the delivered node count a
-function of machine load. Placing the count asks for one solve instead, and
-over the 41-box corpus delivers 34.6% fewer crossing nodes than the budgeted
-removal it replaced.
+$$
+N\approx1.04\,\frac{A}{\eta_{\min}}\,\frac{\ln(0.086/\varepsilon)}{\pi}\approx2.2\,\frac{A}{\eta_{\min}}\quad(\varepsilon=10^{-4}),
+$$
 
-## 5. Causal conjugation and executor conventions
+which is within a constant of the band-limit floor (bandwidth × horizon/π).
+No construction removes the A/η law; the remaining node savings are in η, ε
+and the window geometry. The builder does not search for the count:
+`minimax.fixed_n_start.predict_nodes` sets it and `start_param` places the
+nodes (live-band Nyquist density, Im s damping the wider real edge within the
+off-ray cap, the last node at the amplitude floor). One variable-projection
+Levenberg–Marquardt polish follows, then the certificate. A failure raises
+the count by 10%, up to eight rungs; past that bracket the interpolatory
+ray-rank rule is polished once and then accepted or refused.
 
-The rule service builds on `Im d > 0`. A lower-half-plane window is served by
-`1/conj(d) = conj(1/d)`, implemented as `t -> -conj(t)`,
-`w -> conj(w)`. The executable window is then assembled once with
+**Sign-definite box: logarithmic.** 1/d there is a Braess–Hackbusch
+exponential sum with N = O(log R · log(1/ε)), R the corner dynamic range. The
+builder starts from the interpolatory rule at the ray rank (pivoted QR of the
+ray family's SVD basis) and removes nodes, in batches while far above the
+target. The survivors are re-solved by variable-projection LM on the sampled
+residual. A removal is kept while the sup on a finer check cloud stays ≤ ε
+and the cancellation ratio stays under its cap. The builder stops when no
+removal is accepted.
 
-```
-time_exec = pole_sign * t
-alpha_exec = w * exp(-eta * time_exec)
-omega_sign = pole_sign * external_sign
-project = "full"
-prefactor = -1
-```
+Neither construction reads a clock, so the rule is a function of (box, ε)
+only, and a rule that cannot be certified is refused in planning, before the
+sweep starts.
 
-and with state/pole reference shifts chosen at the bounded endpoint of each
-factored exponential. `gw/sigma_box_plan.py` is the sole owner of these box
-plan conventions; `gw/mpa/sigma.py` only dispatches the finished windows.
+## 8. Acceptance
 
-## 6. Cache and process independence
+The planner accepts a rule for a window only if all three hold:
 
-Rules depend only on `(box,eps,currency)`. Cache lookup is by containment: a
-rule certified on a superset serves a requested subset. On a miss, only real
-edges farther than `3*eta` from zero are widened by 1% and the far imaginary
-edge by 1%; this lets nearby self-consistent iterations hit without raising the
-crossing rank. The default cache lives below the run's `tmp` directory,
-`sigma_quadrature_cache_dir=off` disables it, and a deck-relative or absolute
-path may be supplied.
+1. **Certificate.** Every node and weight is finite and the certified sup
+   error is ≤ ε in the box's currency.
+2. **Runtime noise.** With a per-term relative perturbation ε_rt = 6·10⁻⁸,
+   ε_rt · max_{d∈∂box} ρ(d) Σ_l |w_l e^{i t_l d}| ≤ 0.05 ε, where ρ = |d| on a
+   sign-definite box and ρ = η_min on a crossing one. The noise mass is
+   subharmonic, so its maximum is on the boundary, sampled at the rule's own
+   horizon. Sign-definite rules are built under the cancellation cap that
+   implies this bound.
+3. **Factored growth.** Over the window's states and pole corners, neither
+   separately factored exponential grows by more than e³⁰.
 
-Independent window fits are assigned round-robin across processes. Only the
-small fitted rules and receipts are gathered, so every rank assembles the same
-plan without gathering a pole field or state-pole product.
+A failure is final. There is no retry at a tighter ε and no second quadrature
+family, and the (window, τ) pair count is reported, never refused on.
 
-## 7. Controls and dials
+## 9. Self-consistent maps
 
-The production/default MPA route is the box plan. `LORRAX_SIGMA_PLAN=panes`
-selects the frozen pane implementation only for comparison controls; there is
-no campaign-planner route. Numerical policy is carried by three deck keys:
+A multi-map QSGW run carries a fixed-quadrature session. The first two
+planner calls (maps 0 and 1) use one-shot rules. The third freezes a rule set
+on its own boxes, each padded:
 
-```
-sigma_quadrature_eps = 1e-4
-sigma_quadrature_cache_dir = auto
-```
+- each real edge by the classification pad of the state that sets it,
+  0.5 eV + 0.10 |E − μ|, never across the window's own selector bound;
+- every pole extent by 10%;
+- a sign-definite edge toward zero at most to 5% of its distance from zero;
+- the zero-side edge of a tail window out to the selector's guaranteed gap
+  0.7a, which covers a state that enters the tail on a later map.
 
-There is no reduction budget. A crossing window stops when its placed rule
-meets the certificate and a sign-definite window when its reduction has no
-accepted removal left, so the delivered node count is a function of the box
-and `eps` alone, not of how loaded the machine was. The keys `sigma_quadrature_reduction_seconds` and
-`sigma_quadrature_reduction_steps` are retired, and a deck that still names
-one is refused rather than silently ignored. Retarded broadening is
-`sigma_regularization_ev`, literal for every ansatz; there is no pair ceiling.
+Later maps reuse the frozen nodes while the current box is contained. Four
+events change that:
+
+- A window that escapes its box, changes currency, or did not exist at the
+  freeze is refit alone.
+- A factored-growth failure refits that window alone.
+- A metal ↔ insulator flip reinitializes the set.
+- A change of η or ε refuses.
+
+The receipt names every refit window and its reason.
+
+## 10. Cache, request scope and parallel planning
+
+**Cache.** Rules are immutable certificates keyed by (box, ε, currency) and
+authenticated by a digest. A lookup serves the smallest rule whose certified
+box contains the request at the same ε and currency with noise amplification
+under the cap. On a miss the build box widens only real edges farther than 3η
+from zero (by 1% of max(width, η)) and the far imaginary edge (by 1%), so
+nearby maps hit without widening a crossing rank.
+`sigma_quadrature_cache_dir = auto` places the cache at
+`<input_dir>/tmp/sigma_quadrature_rules`; `off` disables it; a relative path
+resolves against the deck. The cache accelerates; it is never a second
+correctness path, and a failed write only warns.
+
+**Request scope.** The shared-pole route scopes the cache to a subdirectory
+keyed by the map's physical identity (energies, occupations and recipe, with
+the SC map label stripped), η, ε and the pole census. Equal physical inputs
+share rules across restarts and maps, and a changed spectrum never inherits
+another map's plan. There is one scope per map: a sector Σ call scopes by the
+union census of its CC, TT and CT_C models, so the four sector calls of a map
+reuse each other's fits.
+
+**Parallel planning.** Windows are fit round-robin across processes, and only
+the small rules and receipts are gathered. Each window is then served the
+smallest compatible rule of the whole plan, ranked by (node count, digest),
+which is what a warm rerun would pick and does not depend on rank timing. A
+refusal on one rank travels as data and raises on every rank.
+
+## 11. Execution
+
+- **Resident-pole route.** For each pole batch, each window is one executable
+  whose node loop runs on device and folds each Σ(τ_l) into the window's
+  frequencies; nothing returns to the host between nodes.
+- **Shared-pole and sector routes.** A host-driven builder synthesizes W(τ)
+  from the store's panels, and nodes are dispatched one at a time and
+  accumulated asynchronously.
+- **Band brackets.** For band-convergence extrapolation, one W preparation per
+  node is shared by one G build, convolution and projection per bracket.
+
+`LORRAX_SIGMA_TAU_TIMING=1` splits a node into its stages on the
+host-dispatched routes and is refused on the resident route.
+`LORRAX_SIGMA_PLAN=panes` selects the pane planner of
+[MPA §8–10](THEORY_mpa_implementation.md) as a comparison control and is
+refused with the shared-pole W.
+
+## 12. Refusals
+
+| refusal | fix |
+|---|---|
+| rule not certified at ε, or not finite (names window, box, kind) | a sign-preserving or split product window; never a looser `sigma_quadrature_eps` |
+| runtime-noise bound above 0.05 ε | the same; the box is too ill-conditioned for its currency |
+| factored log growth above 30 | the same |
+| live pole with Re Ω ≤ 0 or Im Ω > 0, or a nonfinite residue | refit the pole model |
+| a branch with no live states | the Σ band window has no band on that side; widen `number_bands_sigma` or `occupation_window_threshold` |
+| η ≤ 0, ε ∉ (0, 1), edge factor < 0 | fix the deck |
+| η or ε changed inside one SC session | one currency per run |
+| shared-pole W with `sigma_quadrature_eps` unequal to its `sigma_w_accuracy` tier's tolerance | drop the key; the recipe owns ε |
