@@ -386,6 +386,20 @@ was skipped.
 MPI is required only for `ffi.phdf5` and `ffi.slate`; `ffi.cusolvermp`
 bootstraps via JAX's KV store + NCCL, no MPI.
 
+**One MPI for both legs.**  A GPU run dlopens the host and device libraries
+into one process, so both must link the SAME libmpi, and that must be the one
+the parallel HDF5 and SLATE already need (read their `DT_NEEDED`).
+- Pin the MPI in ONE file that both build recipes source.  On Perlmutter
+  this is `config/perlmutter/ffi_mpi.sh`.
+- Pin the BLAS/ScaLAPACK version that was built against that MPI.
+- Unload any module whose compiler wrapper injects extra libraries
+  (Perlmutter: darshan).
+- Do not let either recipe take site defaults: the default MPI/LibSci can
+  move under you.
+
+GATE 1 (`gate_one_mpi.sh`) checks each library.  Gate 10 and `seal_bundle.py`
+check the pair.
+
 ## Build system ([`cpp/CMakeLists.txt`](cpp/CMakeLists.txt))
 
 Autodetection probes for each dep, overridable with CMake `-D...` or
@@ -499,6 +513,17 @@ For non-Shifter runtimes (Singularity/Apptainer): swap the
 composition) is runtime-agnostic.
 
 ## Cluster-specific: NERSC Perlmutter
+
+**MPI pin (2026-09-24).**  Both legs link cray-mpich **9.0.1**
+(`libmpi_gnu_123.so.12`) with **cray-libsci/25.09.0** and darshan unloaded, all
+from `config/perlmutter/ffi_mpi.sh`.
+- The host leg sources it from `config/perlmutter/build_ffi_host.sh`.
+- The CUDA leg sources it from `lorrax_cuda13_runtime/recipe/build_ffi_phdf5.sh`,
+  out of the checkout being built.
+- Why 9.0.1: cray-hdf5-parallel/1.14.3.7 and the SLATE host install need
+  `libmpi_gnu_123.so.12`.
+- Why pin LibSci too: the site-default cray-libsci/26.03.0 links cray-mpich
+  9.1.0's `libmpi_gnu.so.12`.  An unpinned host leg therefore carried two MPIs.
 
 Shifter forbids `--volume` sources outside `/pscratch` and a handful
 of other paths, which is why every "stage" script copies to
