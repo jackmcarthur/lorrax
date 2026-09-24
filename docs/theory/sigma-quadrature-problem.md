@@ -296,7 +296,7 @@ refusal on one rank travels as data and raises on every rank.
 `LORRAX_SIGMA_TAU_TIMING=1` splits a node into its stages on the
 host-dispatched routes and is refused on the resident route.
 `LORRAX_SIGMA_PLAN=panes` selects the pane planner of
-[MPA §8–10](THEORY_mpa_implementation.md) as a comparison control and is
+[the MPA page](THEORY_mpa_implementation.md#pane-planner) as a comparison control and is
 refused with the shared-pole W.
 
 ## 12. Refusals

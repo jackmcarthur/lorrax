@@ -11,7 +11,7 @@
 >   family is pivoted LU; `transverse_zeta_solve=rank_truncate` is the explicit
 >   indefinite pseudo-inverse alternative. Fresh μ=1,2,3 fits may share their
 >   face transform while keeping separate ordered solves. See
->   [the face ζ architecture](architecture/zeta_fit_face_psi_cct.md#current-coupled-transverse-schedule-2026-08-29).
+>   [the face ζ architecture](architecture/zeta_fit_face_psi_cct.md#coupled-current-schedule).
 > - File-map rows that no longer exist: `src/common/load_wfns.py`,
 >   `src/common/isdf_fitting.py` (now `src/gw/isdf_fitting.py` +
 >   `src/isdf/core.py`), `src/centroid/centroid_io.py` (centroid provenance
@@ -189,7 +189,7 @@ the sequential schedule without changing the fit or the requested public
 `distrib_la` route.
 
 The detailed loop and sharding contract is in
-[ζ-fit CCT on the two-face carrier](architecture/zeta_fit_face_psi_cct.md#current-coupled-transverse-schedule-2026-08-29).
+[ζ-fit CCT on the two-face carrier](architecture/zeta_fit_face_psi_cct.md#coupled-current-schedule).
 Closed-form memory and capacity policy belong to the
 [memory model](architecture/memory-model.md); this page does not duplicate
 them.
