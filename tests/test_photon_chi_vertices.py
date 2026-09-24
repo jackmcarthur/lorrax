@@ -1,4 +1,5 @@
 """Physical ψ†Γψ vertices at the conjugated Green-pair boundary."""
+import harness
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -18,7 +19,7 @@ def test_current_chi_matches_literal_hermitian_density(monkeypatch):
         gemm.mesh = mesh
         gemm.in_sharding_a = NamedSharding(mesh, P(None, "x", "y"))
         gemm.in_sharding_b = gemm.in_sharding_a
-        return gemm
+        return harness.with_active_range(gemm)
 
     monkeypatch.setattr(distrib_la, "gemm_plan", local_gemm_plan)
     side = 2 if len(jax.devices()) >= 4 else 1

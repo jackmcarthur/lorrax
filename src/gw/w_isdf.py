@@ -227,11 +227,14 @@ def _get_chi_minimax_kernel_face(mesh_xy, kgrid, nk, n_out, complex_contour,
 
     # ONE planned GEMM, built here (eagerly, once) and shared by every Gv
     # and Gc build this kernel ever does — see distrib_la.gemm_plan's own
-    # "hoist this call out of every per-k/per-tau loop" instruction.
+    # "hoist this call out of every per-k/per-tau loop" instruction.  The
+    # active range lets each step Green contract only its own support
+    # (valence for Gv, conduction for Gc) instead of the full band carrier
+    # with zero phases, which spent twice the flops of the two supports.
     g_plan = gemm_plan(
         mesh_xy, m=n_rmu_left * ns, k=nb_full,
         n=n_rmu_right * ns, nq=nk if paired else expected_input_nk,
-        dtype=jnp.complex128, layout=layout)
+        dtype=jnp.complex128, layout=layout, enable_active_range=True)
     if paired:
         from common.shard_map import shard_map
         def unfold_pair(psi_left, psi_right):
@@ -266,13 +269,15 @@ def _get_chi_minimax_kernel_face(mesh_xy, kgrid, nk, n_out, complex_contour,
             build_G_tau(psi_mun_left, psi_nmu_right, enk_full,
                        -tau_scalar, e_ref=vmax,
                        mask=mask_v, layout=layout, gemm=g_plan,
-                       k_unfold_plan=None if paired else k_unfold_plan),
+                       k_unfold_plan=None if paired else k_unfold_plan,
+                       trim_zero_bands=True),
             _G_k_shard)
         Gc_k = jax.lax.with_sharding_constraint(
             build_G_tau(psi_mun_left, psi_nmu_right, enk_full,
                        t_c, e_ref=cmin,
                        mask=mask_c, layout=layout, gemm=g_plan,
-                       k_unfold_plan=None if paired else k_unfold_plan),
+                       k_unfold_plan=None if paired else k_unfold_plan,
+                       trim_zero_bands=True),
             _G_k_shard)
         return jnp.conj(Gv_k), jnp.conj(Gc_k)
 
