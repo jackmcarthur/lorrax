@@ -375,6 +375,8 @@ def test_sigma_spatial_cache_owns_plan_and_selects_each_plans_parent_rows(monkey
     monkeypatch.setattr("common.fft_helpers.make_kconv_klead",
                         lambda *a, **k: SimpleNamespace(prep=lambda w: w,
                                                         apply=lambda g, w: g))
+    monkeypatch.setattr("common.fft_helpers.make_kconv_klead_unfold",
+                        lambda *a, **k: (lambda g, gt, w: g))
     monkeypatch.setattr("common.contract_bands.contract_bands_block_reshard",
                         lambda *a, **k: lambda left, operator, right: operator)
     monkeypatch.setattr("symmetry_maps.unfold_file_wedge_band_operator",
@@ -395,9 +397,11 @@ def test_sigma_spatial_cache_owns_plan_and_selects_each_plans_parent_rows(monkey
 
     second = factory(bundle([1, 2]))
     assert second is not kernel
-    # A Green-shaped stand-in (nk, mu, s, nu, s'): the conv owner re-lays
-    # its operand into the handler's order before the stubbed convolution.
-    rows = jnp.asarray([10., 20., 30.]).reshape(3, 1, 1, 1, 1)
+    # A Green-shaped stand-in (nk, mu, s, nu, s') handed to the stubbed
+    # unfold convolution as the parent pair; the projection then selects
+    # each plan's own parent rows.
+    from gw.greens_function_kernel import ParentGreen
+    rows = ParentGreen(jnp.asarray([10., 20., 30.]).reshape(3, 1, 1, 1, 1), None)
     np.testing.assert_array_equal(np.asarray(kernel.conv_project(
         None, None, rows, None))[:, 0, 0, 0, 0], [10., 30.])
     np.testing.assert_array_equal(np.asarray(second.conv_project(

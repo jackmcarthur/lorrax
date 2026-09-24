@@ -156,8 +156,10 @@ def get_sigma_spatial_kernel(
 
         Σ_k = -1/√N_k · fftn( ifftn(G_k) · ifftn(W_q)[:, None, :, None, :] )
 
-    through the k-convolution router (``common.fft_helpers.make_kconv_klead``):
-    nvidia-mathdx on CUDA, the FFTW gw_conv handler on cpu.
+    through the k-convolution router: ``common.fft_helpers.make_kconv_klead``
+    prepares W, and ``make_kconv_klead_unfold`` convolves the raw-parent Green
+    with the typed unfold on its load (nvidia-mathdx on CUDA; the service's
+    table composition and the FFTW gw_conv handler on cpu).
     """
     kgrid = tuple(int(x) for x in kgrid)
     nk_tot = kgrid[0] * kgrid[1] * kgrid[2]

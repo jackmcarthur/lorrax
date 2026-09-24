@@ -48,6 +48,8 @@ class UnfoldLoadTables(NamedTuple):
     mph: np.ndarray     # (nk, n_left*ns) c128: left umklapp phase, TRS rule applied
     nph: np.ndarray     # (nk, n_right*ns) c128: right umklapp phase, TRS rule applied
     spin: np.ndarray    # (nk, ns, ns) c128: U_k
+    n_parent: int       # parent rows the G tiles must carry (row < n_parent)
+    mesh_shape: tuple   # (Px, Py) the local sources were cut for
 
 
 def _merged(perm, wraps, ns):
@@ -71,6 +73,12 @@ def unfold_load_tables(*, irr_idx, sym_idx, sym_perm, L_table, k_irr_frac, spin_
     nk, ns = int(spin.shape[0]), int(spin.shape[-1])
     irr = np.asarray(irr_idx, dtype=np.int32)
     sym = np.asarray(sym_idx, dtype=np.int32)
+    n_parent = int(np.asarray(k_irr_frac).shape[0])
+    if irr.shape != (nk,) or sym.shape != (nk,) or np.any(irr < 0) or np.any(irr >= n_parent):
+        raise ValueError(
+            f"unfold_load_tables: irr_idx/sym_idx must be ({nk},) with parent rows in "
+            f"[0, {n_parent}); got {irr.shape}/{sym.shape}, rows {irr.min(initial=0)}.."
+            f"{irr.max(initial=0)}")
     trs = sym >= int(n_sym_spatial)
     perm_l, wraps_l = _merged(np.asarray(sym_perm, np.int32), np.asarray(L_table), ns)
     perm_r, wraps_r = ((perm_l, wraps_l) if right_sym_perm is None else
@@ -79,7 +87,13 @@ def unfold_load_tables(*, irr_idx, sym_idx, sym_perm, L_table, k_irr_frac, spin_
     logical_l = n_left if logical_centroid_extent is None else int(logical_centroid_extent) * ns
 
     def local(perm, axis, logical):
-        cert = certify_endpoint_locality(perm[sym], mesh=mesh_xy, mesh_axis=axis)
+        used = perm[sym]
+        if np.any(used[:, :logical] >= logical) or np.any(used[:, logical:] < logical):
+            raise ValueError(
+                f"unfold_load_tables: the {'left' if axis == 'x' else 'right'} source maps do "
+                f"not preserve the logical/padded split at {logical}/{perm.shape[1]} "
+                "(unfold_isdf_operator refuses the same tables)")
+        cert = certify_endpoint_locality(used, mesh=mesh_xy, mesh_axis=axis)
         if not cert["is_local"]:
             raise ValueError(
                 f"unfold_load_tables: the {'left' if axis == 'x' else 'right'} source map "
@@ -107,7 +121,8 @@ def unfold_load_tables(*, irr_idx, sym_idx, sym_perm, L_table, k_irr_frac, spin_
                 jnp.where(trs[:, None], pr, jnp.conj(pr)))
     mph, nph = (np.asarray(jax.device_get(a)) for a in phases())
     return UnfoldLoadTables(row=irr, trs=trs.astype(np.int32), lsrc=lsrc, rsrc=rsrc,
-                            mph=mph, nph=nph, spin=spin)
+                            mph=mph, nph=nph, spin=spin, n_parent=n_parent,
+                            mesh_shape=(int(mesh_xy.shape["x"]), int(mesh_xy.shape["y"])))
 
 
 def local_unfold_load_tables(t: UnfoldLoadTables) -> UnfoldLoadTables:
@@ -120,7 +135,7 @@ def local_unfold_load_tables(t: UnfoldLoadTables) -> UnfoldLoadTables:
     nl = int(t.rsrc.shape[1]) // jax.lax.axis_size("y")
     x0, y0 = jax.lax.axis_index("x") * ml, jax.lax.axis_index("y") * nl
     cut = lambda a, start, width: jax.lax.dynamic_slice_in_dim(jnp.asarray(a), start, width, axis=1)
-    return UnfoldLoadTables(
+    return t._replace(
         row=jnp.asarray(t.row), trs=jnp.asarray(t.trs),
         lsrc=cut(t.lsrc, x0, ml), rsrc=cut(t.rsrc, y0, nl),
         mph=cut(t.mph, x0, ml), nph=cut(t.nph, y0, nl), spin=jnp.asarray(t.spin))

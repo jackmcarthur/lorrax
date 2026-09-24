@@ -519,11 +519,71 @@ extern "C" __global__ void __launch_bounds__(256) lrx_kconv(
     }
 }
 #else
-// Mode 7: mode 2 on the full-k Green read from its raw parents.  A block owns
-// PB (x, y) centroid pairs and all NS*NS spin rows of each (RB = PB*NS*NS
-// banks), so the spin action runs in registers on one load of the NS*NS
-// sources.  Bank j = (pair, a, b); output U[k, a, x, b, y] (spin-major).
-constexpr int SS = NS * NS, PB = RB / SS;
+// Mode 7: mode 2 on the full-k Green read from its raw parents.  Row r of the
+// convolution is (pair, a, b) = (r / NS^2, (r % NS^2) / NS, r % NS) with pair =
+// x*my + y; U[k, a, x, b, y] is stored spin-major.  When RB holds whole spin
+// groups (the usual case) a block's load reads the NS*NS sources of a pair once
+// and runs the spin action in registers for all NS*NS rows; when fewer rows fit
+// (large k-grids) each bank loads its own row, with the same arithmetic.
+constexpr int SS = NS * NS;
+constexpr bool GROUPED = (RB % SS) == 0;
+
+// The typed unfold of one (k, x, y) pair (symmetry_maps unfold_isdf_operator,
+// axis-local pair_transpose arm): source row, both endpoint gathers, then
+// (mph * G) * nph, a -1 source being an exact zero; and U_k.
+__device__ __forceinline__ void lrx_unfold_pair(
+    const lrx_c2* __restrict__ gp, const lrx_c2* __restrict__ gt, const UnfoldTab& t,
+    int k, long long xx, long long yy, lrx_c2 (&g)[NS][NS], lrx_c2 (&u)[NS][NS]) {
+    const lrx_c2* __restrict__ mph = reinterpret_cast<const lrx_c2*>(t.mph);
+    const lrx_c2* __restrict__ nph = reinterpret_cast<const lrx_c2*>(t.nph);
+    const lrx_c2* __restrict__ spin = reinterpret_cast<const lrx_c2*>(t.spin);
+    const lrx_c2* src = (t.trs[k] ? gt : gp) + (long long)t.row[k] * t.ml * t.nl;
+#pragma unroll
+    for (int c = 0; c < NS; ++c) {
+        const long long li = (long long)k * t.ml + xx * NS + c;
+        const int ls = t.lsrc[li];
+        const lrx_c2 mp = mph[li];
+#pragma unroll
+        for (int d = 0; d < NS; ++d) {
+            const long long rj = (long long)k * t.nl + yy * NS + d;
+            const int rs = t.rsrc[rj];
+            lrx_c2 v = {0.0, 0.0};
+            if (ls >= 0 && rs >= 0)
+                v = lrx_mul_xla(lrx_mul_xla(mp, src[(long long)ls * t.nl + rs]), nph[rj]);
+            g[c][d] = v;
+        }
+    }
+#pragma unroll
+    for (int a = 0; a < NS; ++a)
+#pragma unroll
+        for (int b = 0; b < NS; ++b) u[a][b] = spin[((long long)k * NS + a) * NS + b];
+}
+
+// Row a of U G U^dagger, accumulated exactly as the spin-rotate FFI does.
+__device__ __forceinline__ void lrx_spin_row(const lrx_c2 (&u)[NS][NS], const lrx_c2 (&g)[NS][NS],
+                                             int a, lrx_c2 (&out)[NS]) {
+    lrx_c2 left[NS];
+#pragma unroll
+    for (int d = 0; d < NS; ++d) {
+        lrx_c2 v = {0.0, 0.0};
+#pragma unroll
+        for (int c = 0; c < NS; ++c) {
+            const lrx_c2 p = lrx_rot_mul(u[a][c], g[c][d]);
+            v.x = __dadd_rn(v.x, p.x); v.y = __dadd_rn(v.y, p.y);
+        }
+        left[d] = v;
+    }
+#pragma unroll
+    for (int b = 0; b < NS; ++b) {
+        lrx_c2 v = {0.0, 0.0};
+#pragma unroll
+        for (int d = 0; d < NS; ++d) {
+            const lrx_c2 p = lrx_rot_mul_conj(left[d], u[b][d]);
+            v.x = __dadd_rn(v.x, p.x); v.y = __dadd_rn(v.y, p.y);
+        }
+        out[b] = v;
+    }
+}
 
 extern "C" __global__ void __launch_bounds__(256) lrx_kconv(
     const lrx_c2* __restrict__ gp, const lrx_c2* __restrict__ gt,
@@ -531,75 +591,50 @@ extern "C" __global__ void __launch_bounds__(256) lrx_kconv(
     extern __shared__ lrx_c2 sm[];
     using namespace cufftdx;
     const long long mx = t.ml / NS, my = t.nl / NS, pairs = mx * my;
-    const long long p0 = (long long)blockIdx.x * PB;
-    const lrx_c2* __restrict__ mph = reinterpret_cast<const lrx_c2*>(t.mph);
-    const lrx_c2* __restrict__ nph = reinterpret_cast<const lrx_c2*>(t.nph);
-    const lrx_c2* __restrict__ spin = reinterpret_cast<const lrx_c2*>(t.spin);
-    for (int i = threadIdx.x; i < PB * NK; i += blockDim.x) {
-        const int k = i / PB, jp = i % PB;
-        const long long pr = p0 + jp;
-        if (pr < pairs) {
-            const long long xx = pr / my, yy = pr - xx * my;
-            // The typed unfold (symmetry_maps unfold_isdf_operator, axis-local
-            // pair_transpose arm): the source row, both endpoint gathers, and
-            // (mph * G) * nph, then where(valid, ., 0) as a -1 source.
-            const lrx_c2* src = (t.trs[k] ? gt : gp) + (long long)t.row[k] * t.ml * t.nl;
-            lrx_c2 g[NS][NS], u[NS][NS];
+    const long long r0 = (long long)blockIdx.x * RB;
+    if constexpr (GROUPED) {
+        constexpr int PB = RB / SS;
+        const long long p0 = r0 / SS;
+        for (int i = threadIdx.x; i < PB * NK; i += blockDim.x) {
+            const int k = i / PB, jp = i % PB;
+            const long long pr = p0 + jp;
+            if (pr < pairs) {
+                const long long xx = pr / my, yy = pr - xx * my;
+                lrx_c2 g[NS][NS], u[NS][NS];
+                lrx_unfold_pair(gp, gt, t, k, xx, yy, g, u);
 #pragma unroll
-            for (int c = 0; c < NS; ++c) {
-                const long long li = (long long)k * t.ml + xx * NS + c;
-                const int ls = t.lsrc[li];
-                const lrx_c2 mp = mph[li];
+                for (int a = 0; a < NS; ++a) {
+                    lrx_c2 out[NS];
+                    lrx_spin_row(u, g, a, out);
 #pragma unroll
-                for (int d = 0; d < NS; ++d) {
-                    const long long rj = (long long)k * t.nl + yy * NS + d;
-                    const int rs = t.rsrc[rj];
-                    lrx_c2 v = {0.0, 0.0};
-                    if (ls >= 0 && rs >= 0)
-                        v = lrx_mul_xla(lrx_mul_xla(mp, src[(long long)ls * t.nl + rs]), nph[rj]);
-                    g[c][d] = v;
+                    for (int b = 0; b < NS; ++b) sm[(jp * SS + a * NS + b) * SP + k] = out[b];
                 }
+            } else {
+#pragma unroll
+                for (int ab = 0; ab < SS; ++ab) sm[(jp * SS + ab) * SP + k] = {0.0, 0.0};
             }
-#pragma unroll
-            for (int a = 0; a < NS; ++a)
-#pragma unroll
-                for (int b = 0; b < NS; ++b) u[a][b] = spin[((long long)k * NS + a) * NS + b];
-            // U G U^dagger exactly as the spin-rotate FFI accumulates it,
-            // one output spin row a at a time (NS left values live).
-#pragma unroll
-            for (int a = 0; a < NS; ++a) {
-                lrx_c2 left[NS];
-#pragma unroll
-                for (int d = 0; d < NS; ++d) {
-                    lrx_c2 v = {0.0, 0.0};
-#pragma unroll
-                    for (int c = 0; c < NS; ++c) {
-                        const lrx_c2 p = lrx_rot_mul(u[a][c], g[c][d]);
-                        v.x = __dadd_rn(v.x, p.x); v.y = __dadd_rn(v.y, p.y);
-                    }
-                    left[d] = v;
-                }
-#pragma unroll
-                for (int b = 0; b < NS; ++b) {
-                    lrx_c2 v = {0.0, 0.0};
-#pragma unroll
-                    for (int d = 0; d < NS; ++d) {
-                        const lrx_c2 p = lrx_rot_mul_conj(left[d], u[b][d]);
-                        v.x = __dadd_rn(v.x, p.x); v.y = __dadd_rn(v.y, p.y);
-                    }
-                    sm[(jp * SS + a * NS + b) * SP + k] = v;
-                }
+        }
+    } else {
+        for (int i = threadIdx.x; i < RB * NK; i += blockDim.x) {
+            const int k = i / RB, j = i % RB;
+            const long long r = r0 + j, pr = r / SS;
+            lrx_c2 v = {0.0, 0.0};
+            if (pr < pairs) {
+                const long long xx = pr / my, yy = pr - xx * my;
+                const int a = (int)((r % SS) / NS), b = (int)(r % NS);
+                lrx_c2 g[NS][NS], u[NS][NS], out[NS];
+                lrx_unfold_pair(gp, gt, t, k, xx, yy, g, u);
+                lrx_spin_row(u, g, a, out);
+                v = out[b];
             }
-        } else {
-#pragma unroll
-            for (int ab = 0; ab < SS; ++ab) sm[(jp * SS + ab) * SP + k] = {0.0, 0.0};
+            sm[j * SP + k] = v;
         }
     }
     __syncthreads();
     transform3<fft_direction::inverse>(sm);
     for (int i = threadIdx.x; i < RB * NK; i += blockDim.x) {
         const int k = i / RB, j = i % RB;
-        const long long pr = p0 + j / SS;
+        const long long pr = (r0 + j) / SS;
         if (pr < pairs) {
             const long long xx = pr / my, yy = pr - xx * my;
             sm[j * SP + k] = lrx_mul(sm[j * SP + k], kern[((long long)k * mx + xx) * my + yy]);
@@ -609,10 +644,10 @@ extern "C" __global__ void __launch_bounds__(256) lrx_kconv(
     transform3<fft_direction::forward>(sm);
     for (int i = threadIdx.x; i < RB * NK; i += blockDim.x) {
         const int k = i / RB, j = i % RB;
-        const long long pr = p0 + j / SS;
+        const long long r = r0 + j, pr = r / SS;
         if (pr < pairs) {
             const long long xx = pr / my, yy = pr - xx * my;
-            const int a = (j % SS) / NS, b = j % NS;
+            const int a = (int)((r % SS) / NS), b = (int)(r % NS);
             const lrx_c2 v = sm[j * SP + k];
             y[(((long long)k * NS + a) * mx + xx) * t.nl + b * my + yy] = {v.x * scale, v.y * scale};
         }
@@ -780,12 +815,13 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
     const long long row_bytes = static_cast<long long>(banks) * (f32 ? 8 : 16) * sp;
     long long rb = std::min<long long>(rows_max, (pair ? kSmemBudget : kSmemBudget1) / row_bytes);
     if (rb < 1) rb = std::min<long long>(rows_max, smem_optin / row_bytes);
-    if (mode == 7) rb -= rb % (ns * ns);               // whole (x, y) pairs of NS*NS spin rows
+    if (mode == 7 && rb >= ns * ns) rb -= rb % (ns * ns);  // whole spin groups: the grouped load
+    // (fewer rows than one spin group: mode 7 loads per bank, as mode 2 would fit)
     if (rb < 1) {
         std::ostringstream os;
         os << "GATE mathdx-kconv-residency: got k-grid (" << nkx << "," << nky << "," << nkz
-           << ") whose resident row needs " << banks << "*" << (f32 ? 8 : 16) << "*(nk|1)=" << row_bytes << " B; want <= "
-           << smem_optin << " B of opt-in shared memory on this device; why: the fused "
+           << ") whose resident row needs " << banks << "*" << (f32 ? 8 : 16) << "*(nk|1)=" << row_bytes << " B"
+           << "; want <= " << smem_optin << " B of opt-in shared memory on this device; why: the fused "
               "one-pass family keeps a k-row in shared memory; fix: a smaller k-grid (the "
               "family has no out-of-core arm)";
         return sticky("residency", os.str(), ffi::ErrorCode::kInvalidArgument);
@@ -1184,8 +1220,8 @@ static ffi::Error KleadUnfoldConv(
     void* up = U->untyped_data();
     double sc = scale;
     void* args[] = {(void*)&gpp, (void*)&gtp, (void*)&vp, (void*)&up, (void*)&t, (void*)&sc};
-    const long long pb = k->rb / (ns * ns);
-    const long long blocks = (pairs + pb - 1) / pb;
+    const long long rows = pairs * ns * ns;
+    const long long blocks = (rows + k->rb - 1) / k->rb;
     if (blocks > 2147483647LL) return bad("grid.x overflow");
     CUresult cr = driver_api().LaunchKernel(k->fn, static_cast<unsigned>(blocks), 1, 1, kThreads, 1, 1,
                                             static_cast<unsigned>(k->smem),
