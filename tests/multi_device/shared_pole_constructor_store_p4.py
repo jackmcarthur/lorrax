@@ -152,7 +152,7 @@ def run_checks(mesh, directory):
         assert execution == want, (arm, execution)
         assert result['execution']['requested_layout'] == layout
         if arm == 'face_batched':
-            assert result['execution']['face_batch'][0] == 3, result['execution']['face_batch']
+            assert result['execution']['face_batch']['parent_batch'] == 3, result['execution']['face_batch']
         expected_ops = {'eigh', 'gemm'} if execution == 'face' else {'eigh'}
         for receipt in result['q_receipts']:
             queries = receipt['constructor']['native_workspace_queries']
