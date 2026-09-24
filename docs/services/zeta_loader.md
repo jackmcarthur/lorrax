@@ -42,9 +42,9 @@ delegates to the same seal.
 ## Contract
 
 * **One data layout.** Every data method reads G-flat `zeta_q_G` and refuses
-  anything else by name. The layout dispatch
-  `(('zeta_q_G', 1), ('zeta_q', 2))` lives once, in `format.py`; the
-  constructor still opens legacy r-space files because the header surface is
+  an r-space `zeta_q` by name. The layout dispatch
+  `(('zeta_q_G', 1), ('zeta_q', 2))` lives once, in `format.py`. The
+  constructor opens either layout, because the header surface is
   layout-independent.
 * **`mesh=None` is header-only.** Header attributes, `gvecs`, the probe and
   the local read work without the phdf5 FFI; collective reads refuse, naming
@@ -57,8 +57,9 @@ delegates to the same seal.
   - completeness: `isdf_header/zeta_is_done = False` refuses
     (`LORRAX_ALLOW_PARTIAL_ZETA=1` overrides, for debugging; see
     [`env_vars.md`](../dev/env_vars.md));
-  - μ: the G-flat dataset's μ extent must be at least the header's `n_rmu`
-    (equal for r-space), else the header and ζ block came from different runs;
+  - μ: the ζ dataset's μ extent must be at least the header's `n_rmu` for
+    `zeta_q_G` and equal to it for `zeta_q`, else the header and ζ block came
+    from different runs;
   - G: the header `ngkmax_zeta` must equal the `zeta_q_G` G axis, because the
     collective plan sizes from the header and the local plan from the dataset.
 * **Refusal order: request before stack.** A bad request (wrong layout,
