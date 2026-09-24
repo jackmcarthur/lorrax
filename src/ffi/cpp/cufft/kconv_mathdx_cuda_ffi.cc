@@ -41,6 +41,16 @@
 //             (nk, a, mx, b, my).  The tables are symmetry_maps's
 //             (unfold_load_tables); every product rounds as the XLA unfold
 //             and the spin-rotate FFI it replaces.
+//   8 klead lorentz conv   mode 7's load, then the four-current vertex sum in
+//             R space: U = mult * sf * FFT_k( sum_{A,B} gamma_A (si * IFFT_k
+//             G_unfolded) gamma_B^dagger * V[k,x,A,y,B] ) with V (nk, mx, nA,
+//             my, nB) ALREADY in R space (mode 3 made it, scale si), the
+//             signed-permutation vertices gamma_A (left) and gamma_B (right)
+//             as attributes, and U spin-major (nk, a, mx, b, my).  One
+//             transform of G serves every Lorentz block; the scales and the
+//             product/sum order are those of the XLA chain it replaces (mode-3
+//             transforms and a scan over the blocks), so it is meant to equal
+//             that chain bit for bit.  It needs a whole spin group per block.
 // A new mode adds (1) an entry under its LRX_MODE value in kSrc, (2) a mode
 // code and a handler below, (3) a router factory in ffi/fft.py.
 //
@@ -196,6 +206,15 @@ struct UnfoldTab {
     long long ml, nl;                            // merged local endpoints mx*ns, my*ns
 };
 
+// Mode 8 vertex tables and scales (the embedded source declares the same struct).
+// Vertex i of a side is packed like modes 0/1/6's single vertex, shifted by i:
+// perm entry (i, a) at bits 16*i + 4*a, phase code (i, a) at bits 8*i + 2*a.
+struct LorentzTab {
+    unsigned long long perm_l, phase_l, perm_r, phase_r;
+    int na, nb;
+    double s_g, s_f, mult;
+};
+
 // Modes 2-5 row geometry (the embedded source declares the same struct).
 struct RowGeo {
     long long rows;           // independent k-rows in the tile
@@ -236,6 +255,11 @@ struct UnfoldTab {
     const int *row, *trs, *lsrc, *rsrc;
     const double *mph, *nph, *spin;
     long long ml, nl;
+};
+struct LorentzTab {
+    unsigned long long perm_l, phase_l, perm_r, phase_r;
+    int na, nb;
+    double s_g, s_f, mult;
 };
 struct RowGeo {
     long long rows;
@@ -456,7 +480,7 @@ extern "C" __global__ void __launch_bounds__(256) lrx_kconv(
         }
     }
 }
-#elif LRX_MODE != 7
+#elif LRX_MODE < 7
 // Modes 2-5: one resident bank per row.  k-LEADING tiles (2, 3) hold element
 // (k, r) at k*rows + r, so a block's load walks its RB rows fastest (coalesced
 // over rows); k-MINOR tiles (4, 5) hold (r, k) at r*NK + k and walk k fastest.
@@ -519,6 +543,7 @@ extern "C" __global__ void __launch_bounds__(256) lrx_kconv(
     }
 }
 #else
+// Modes 7 and 8 share the unfold load below.
 // Mode 7: mode 2 on the full-k Green read from its raw parents.  Row r of the
 // convolution is (pair, a, b) = (r / NS^2, (r % NS^2) / NS, r % NS) with pair =
 // x*my + y; U[k, a, x, b, y] is stored spin-major.  When RB holds whole spin
@@ -585,6 +610,35 @@ __device__ __forceinline__ void lrx_spin_row(const lrx_c2 (&u)[NS][NS], const lr
     }
 }
 
+// The grouped load (RB holds whole spin groups): PB pairs per block, the NS*NS
+// sources of a pair read once and U G U^dagger formed in registers; bank
+// (jp, a, b) = row jp*SS + a*NS + b holds all NK values of that element.
+template <int PB>
+__device__ __forceinline__ void lrx_group_load(
+    const lrx_c2* __restrict__ gp, const lrx_c2* __restrict__ gt, const UnfoldTab& t,
+    long long p0, long long pairs, long long my, lrx_c2* sm) {
+    for (int i = threadIdx.x; i < PB * NK; i += blockDim.x) {
+        const int k = i / PB, jp = i % PB;
+        const long long pr = p0 + jp;
+        if (pr < pairs) {
+            const long long xx = pr / my, yy = pr - xx * my;
+            lrx_c2 g[NS][NS], u[NS][NS];
+            lrx_unfold_pair(gp, gt, t, k, xx, yy, g, u);
+#pragma unroll
+            for (int a = 0; a < NS; ++a) {
+                lrx_c2 out[NS];
+                lrx_spin_row(u, g, a, out);
+#pragma unroll
+                for (int b = 0; b < NS; ++b) sm[(jp * SS + a * NS + b) * SP + k] = out[b];
+            }
+        } else {
+#pragma unroll
+            for (int ab = 0; ab < SS; ++ab) sm[(jp * SS + ab) * SP + k] = {0.0, 0.0};
+        }
+    }
+}
+
+#if LRX_MODE == 7
 extern "C" __global__ void __launch_bounds__(256) lrx_kconv(
     const lrx_c2* __restrict__ gp, const lrx_c2* __restrict__ gt,
     const lrx_c2* __restrict__ kern, lrx_c2* __restrict__ y, UnfoldTab t, double scale) {
@@ -593,27 +647,7 @@ extern "C" __global__ void __launch_bounds__(256) lrx_kconv(
     const long long mx = t.ml / NS, my = t.nl / NS, pairs = mx * my;
     const long long r0 = (long long)blockIdx.x * RB;
     if constexpr (GROUPED) {
-        constexpr int PB = RB / SS;
-        const long long p0 = r0 / SS;
-        for (int i = threadIdx.x; i < PB * NK; i += blockDim.x) {
-            const int k = i / PB, jp = i % PB;
-            const long long pr = p0 + jp;
-            if (pr < pairs) {
-                const long long xx = pr / my, yy = pr - xx * my;
-                lrx_c2 g[NS][NS], u[NS][NS];
-                lrx_unfold_pair(gp, gt, t, k, xx, yy, g, u);
-#pragma unroll
-                for (int a = 0; a < NS; ++a) {
-                    lrx_c2 out[NS];
-                    lrx_spin_row(u, g, a, out);
-#pragma unroll
-                    for (int b = 0; b < NS; ++b) sm[(jp * SS + a * NS + b) * SP + k] = out[b];
-                }
-            } else {
-#pragma unroll
-                for (int ab = 0; ab < SS; ++ab) sm[(jp * SS + ab) * SP + k] = {0.0, 0.0};
-            }
-        }
+        lrx_group_load<RB / SS>(gp, gt, t, r0 / SS, pairs, my, sm);
     } else {
         for (int i = threadIdx.x; i < RB * NK; i += blockDim.x) {
             const int k = i / RB, j = i % RB;
@@ -653,6 +687,78 @@ extern "C" __global__ void __launch_bounds__(256) lrx_kconv(
         }
     }
 }
+#else
+// Mode 8: mode 7's load, then the Lorentz vertex sum in R space.  Per (k, pair)
+// one thread holds the NS*NS transformed Green values g (scaled by si as the
+// mode-3 transform stores them) and accumulates, block by block in (A, B)
+// order, acc[a][b] += (i^code g[perm_A[a]][perm_B[b]]) * V[k, x, A, y, B]: the
+// signed permutation is exact, the product is XLA's (no FMA) and the sum starts
+// at zero, as the scan over blocks did.  The result goes back to the same banks.
+static_assert(GROUPED && RB >= SS, "mode 8 keeps whole spin groups resident (the host picks RB)");
+extern "C" __global__ void __launch_bounds__(256) lrx_kconv(
+    const lrx_c2* __restrict__ gp, const lrx_c2* __restrict__ gt,
+    const lrx_c2* __restrict__ kern, lrx_c2* __restrict__ y, UnfoldTab t, LorentzTab v) {
+    extern __shared__ lrx_c2 sm[];
+    using namespace cufftdx;
+    constexpr int PB = RB / SS;
+    const long long mx = t.ml / NS, my = t.nl / NS, pairs = mx * my;
+    const long long p0 = (long long)blockIdx.x * PB;
+    lrx_group_load<PB>(gp, gt, t, p0, pairs, my, sm);
+    __syncthreads();
+    transform3<fft_direction::inverse>(sm);
+    const long long wy = (long long)my * v.nb, wx = (long long)v.na * wy;
+    for (int i = threadIdx.x; i < PB * NK; i += blockDim.x) {
+        const int k = i / PB, jp = i % PB;
+        const long long pr = p0 + jp;
+        if (pr >= pairs) continue;
+        const long long xx = pr / my, yy = pr - xx * my;
+        lrx_c2 g[SS], acc[SS];
+#pragma unroll
+        for (int ab = 0; ab < SS; ++ab) {
+            const lrx_c2 z = sm[(jp * SS + ab) * SP + k];
+            g[ab].x = __dmul_rn(z.x, v.s_g);
+            g[ab].y = __dmul_rn(z.y, v.s_g);
+            acc[ab].x = 0.0;
+            acc[ab].y = 0.0;
+        }
+        const lrx_c2* __restrict__ w = kern + ((long long)k * mx + xx) * wx + yy * v.nb;
+        for (int ia = 0; ia < v.na; ++ia) {
+            for (int ib = 0; ib < v.nb; ++ib) {
+                const lrx_c2 wv = w[ia * wy + ib];
+#pragma unroll
+                for (int a = 0; a < NS; ++a) {
+                    const int pa = (int)((v.perm_l >> (16 * ia + 4 * a)) & 15);
+                    const int ca = (int)((v.phase_l >> (8 * ia + 2 * a)) & 3);
+#pragma unroll
+                    for (int b = 0; b < NS; ++b) {
+                        const int pb = (int)((v.perm_r >> (16 * ib + 4 * b)) & 15);
+                        const int cb = (int)((v.phase_r >> (8 * ib + 2 * b)) & 3);
+                        // phase_A[a] * conj(phase_B[b]) as one quarter turn.
+                        const lrx_c2 p = lrx_mul_xla(lrx_phase(g[pa * NS + pb], (ca + 4 - cb) & 3), wv);
+                        acc[a * NS + b].x = __dadd_rn(acc[a * NS + b].x, p.x);
+                        acc[a * NS + b].y = __dadd_rn(acc[a * NS + b].y, p.y);
+                    }
+                }
+            }
+        }
+#pragma unroll
+        for (int ab = 0; ab < SS; ++ab) sm[(jp * SS + ab) * SP + k] = acc[ab];
+    }
+    __syncthreads();
+    transform3<fft_direction::forward>(sm);
+    for (int i = threadIdx.x; i < RB * NK; i += blockDim.x) {
+        const int k = i / RB, j = i % RB;
+        const long long r = (long long)blockIdx.x * RB + j, pr = r / SS;
+        if (pr < pairs) {
+            const long long xx = pr / my, yy = pr - xx * my;
+            const int a = (int)((r % SS) / NS), b = (int)(r % NS);
+            const lrx_c2 z = sm[j * SP + k];
+            y[(((long long)k * NS + a) * mx + xx) * t.nl + b * my + yy] =
+                {__dmul_rn(__dmul_rn(z.x, v.s_f), v.mult), __dmul_rn(__dmul_rn(z.y, v.s_f), v.mult)};
+        }
+    }
+}
+#endif
 #endif
 )__lrx__";
 
@@ -814,9 +920,20 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
     const long long rows_max = pair ? kRowsMax : kRowsMax1;
     const long long row_bytes = static_cast<long long>(banks) * (f32 ? 8 : 16) * sp;
     long long rb = std::min<long long>(rows_max, (pair ? kSmemBudget : kSmemBudget1) / row_bytes);
-    if (rb < 1) rb = std::min<long long>(rows_max, smem_optin / row_bytes);
-    if (mode == 7 && rb >= ns * ns) rb -= rb % (ns * ns);  // whole spin groups: the grouped load
+    // Mode 8 sums the Lorentz blocks across a pair's spin rows, so it needs a
+    // whole spin group resident: reach for the opt-in shared memory first.
+    if (rb < 1 || (mode == 8 && rb < ns * ns)) rb = std::min<long long>(rows_max, smem_optin / row_bytes);
+    if ((mode == 7 || mode == 8) && rb >= ns * ns) rb -= rb % (ns * ns);  // whole spin groups: the grouped load
     // (fewer rows than one spin group: mode 7 loads per bank, as mode 2 would fit)
+    if (mode == 8 && rb < ns * ns) {
+        std::ostringstream os;
+        os << "GATE mathdx-kconv-lorentz-residency: got k-grid (" << nkx << "," << nky << "," << nkz
+           << ") with ns=" << ns << ", whose " << ns * ns << " spin rows need " << ns * ns << "*16*(nk|1)="
+           << ns * ns * row_bytes << " B; want <= " << smem_optin << " B of opt-in shared memory on this "
+              "device; why: the Lorentz vertex sum mixes a pair's spin rows in R space, so one block holds "
+              "all of them; fix: a smaller k-grid (the family has no out-of-core arm)";
+        return sticky("residency", os.str(), ffi::ErrorCode::kInvalidArgument);
+    }
     if (rb < 1) {
         std::ostringstream os;
         os << "GATE mathdx-kconv-residency: got k-grid (" << nkx << "," << nky << "," << nkz
@@ -1230,6 +1347,91 @@ static ffi::Error KleadUnfoldConv(
     return ffi::Error::Success();
 }
 
+// Mode 8: mode 7's load plus the Lorentz vertex sum; V (nk, mx, nA, my, nB) in R
+// space, perm/phase (nA*ns) left and (nB*ns) right, U (nk, ns, mx, ns, my).
+static ffi::Error KleadLorentzConv(
+    cudaStream_t stream, ffi::AnyBuffer Gp, ffi::AnyBuffer Gt, ffi::AnyBuffer row, ffi::AnyBuffer trs,
+    ffi::AnyBuffer lsrc, ffi::AnyBuffer rsrc, ffi::AnyBuffer mph, ffi::AnyBuffer nph, ffi::AnyBuffer spin,
+    ffi::AnyBuffer V, ffi::Result<ffi::AnyBuffer> U, int64_t nkx, int64_t nky, int64_t nkz,
+    double scale_g, double scale_f, double mult, ffi::Span<const int64_t> perm_l,
+    ffi::Span<const int64_t> phase_l, ffi::Span<const int64_t> perm_r, ffi::Span<const int64_t> phase_r,
+    std::string_view mathdx_root, std::string_view cubin_dir) {
+    auto bad = [](const std::string& why) {
+        return fail("klead lorentz conv", why, ffi::ErrorCode::kInvalidArgument);
+    };
+    if (nkx < 1 || nky < 1 || nkz < 1 || nkx > kAxisMax || nky > kAxisMax || nkz > kAxisMax) {
+        std::ostringstream os;
+        os << "GATE mathdx-kconv-axis: got k-grid (" << nkx << "," << nky << "," << nkz
+           << "); want every axis in [1, " << kAxisMax << "] (the fp64 cuFFTDx thread-FFT limit)";
+        return bad(os.str());
+    }
+    const int64_t nk = nkx * nky * nkz;
+    auto is = [](ffi::AnyBuffer x, ffi::DataType t, std::vector<int64_t> dims) {
+        auto d = x.dimensions();
+        return x.element_type() == t && d.size() == dims.size() && std::equal(d.begin(), d.end(), dims.begin());
+    };
+    const auto gd = Gp.dimensions(), sd = spin.dimensions(), vd = V.dimensions();
+    if (gd.size() != 3 || sd.size() != 3 || vd.size() != 5)
+        return bad("want Gp (n_parent, ml, nl), spin (nk, ns, ns) and V (nk, mx, nA, my, nB)");
+    const int64_t np = gd[0], ml = gd[1], nl = gd[2], ns = sd[1], na = vd[2], nb = vd[4];
+    const auto C = ffi::DataType::C128, I = ffi::DataType::S32;
+    if ((ns != 1 && ns != 2 && ns != 4) || ml % ns || nl % ns || np < 1 || na < 1 || na > 4 || nb < 1 ||
+        nb > 4 || !is(Gp, C, {np, ml, nl}) || !is(Gt, C, {np, ml, nl}) || !is(row, I, {nk}) ||
+        !is(trs, I, {nk}) || !is(lsrc, I, {nk, ml}) || !is(rsrc, I, {nk, nl}) || !is(mph, C, {nk, ml}) ||
+        !is(nph, C, {nk, nl}) || !is(spin, C, {nk, ns, ns}) || !is(V, C, {nk, ml / ns, na, nl / ns, nb}) ||
+        !(U->element_type() == C && U->dimensions().size() == 5 && U->dimensions()[0] == nk &&
+          U->dimensions()[1] == ns && U->dimensions()[2] == ml / ns && U->dimensions()[3] == ns &&
+          U->dimensions()[4] == nl / ns))
+        return bad("want c128 Gp=Gt (np,ml,nl); s32 row,trs (nk), lsrc (nk,ml), rsrc (nk,nl); c128 mph "
+                   "(nk,ml), nph (nk,nl), spin (nk,ns,ns), V (nk,ml/ns,nA,nl/ns,nB) with nA,nB in [1,4]; "
+                   "U (nk,ns,ml/ns,ns,nl/ns)");
+    LorentzTab v{};
+    std::string why;
+    auto pack = [&](ffi::Span<const int64_t> perm, ffi::Span<const int64_t> phase, int64_t count,
+                    const char* side, unsigned long long* pp, unsigned long long* hp) {
+        if (perm.size() != static_cast<size_t>(count * ns) || phase.size() != static_cast<size_t>(count * ns)) {
+            why = std::string(side) + " perm/phase lengths != (vertices * ns)"; return false;
+        }
+        for (int64_t i = 0; i < count; ++i) {
+            unsigned long long p1 = 0, h1 = 0;
+            if (!pack_attrs(ffi::Span<const int64_t>(perm.begin() + i * ns, ns),
+                            ffi::Span<const int64_t>(phase.begin() + i * ns, ns), ns, side, &p1, &h1, &why))
+                return false;
+            *pp |= p1 << (16 * i);
+            *hp |= h1 << (8 * i);
+        }
+        return true;
+    };
+    if (!pack(perm_l, phase_l, na, "left", &v.perm_l, &v.phase_l) ||
+        !pack(perm_r, phase_r, nb, "right", &v.perm_r, &v.phase_r))
+        return fail("vertex attributes", why, ffi::ErrorCode::kInvalidArgument);
+    v.na = static_cast<int>(na); v.nb = static_cast<int>(nb);
+    v.s_g = scale_g; v.s_f = scale_f; v.mult = mult;
+    const int64_t pairs = (ml / ns) * (nl / ns);
+    if (pairs == 0) return ffi::Error::Success();
+    const Built* k = nullptr;
+    ffi::Error e = build(8, static_cast<int>(nkx), static_cast<int>(nky), static_cast<int>(nkz),
+                         static_cast<int>(ns), false, mathdx_root, cubin_dir, &k);
+    if (!e.success()) return e;
+    UnfoldTab t{static_cast<const int*>(row.untyped_data()), static_cast<const int*>(trs.untyped_data()),
+                static_cast<const int*>(lsrc.untyped_data()), static_cast<const int*>(rsrc.untyped_data()),
+                static_cast<const double*>(mph.untyped_data()), static_cast<const double*>(nph.untyped_data()),
+                static_cast<const double*>(spin.untyped_data()), ml, nl};
+    const void* gpp = Gp.untyped_data();
+    const void* gtp = Gt.untyped_data();
+    const void* vp = V.untyped_data();
+    void* up = U->untyped_data();
+    void* args[] = {(void*)&gpp, (void*)&gtp, (void*)&vp, (void*)&up, (void*)&t, (void*)&v};
+    const long long rows = pairs * ns * ns;
+    const long long blocks = (rows + k->rb - 1) / k->rb;
+    if (blocks > 2147483647LL) return bad("grid.x overflow");
+    CUresult cr = driver_api().LaunchKernel(k->fn, static_cast<unsigned>(blocks), 1, 1, kThreads, 1, 1,
+                                            static_cast<unsigned>(k->smem),
+                                            reinterpret_cast<CUstream>(stream), args, nullptr);
+    if (cr != CUDA_SUCCESS) return fail("cuLaunchKernel", cu_err(cr));
+    return ffi::Error::Success();
+}
+
 static ffi::Error KleadConv(cudaStream_t s, ffi::AnyBuffer T, ffi::AnyBuffer V, ffi::Result<ffi::AnyBuffer> U,
                             int64_t nkx, int64_t nky, int64_t nkz, double scale,
                             std::string_view mathdx_root, std::string_view cubin_dir) {
@@ -1351,6 +1553,34 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Arg<xla::ffi::AnyBuffer>()   // V (R space)
         .Ret<xla::ffi::AnyBuffer>()
         LRX_KCONV_GRID_ATTRS
+        .Attr<std::string_view>("mathdx_root")
+        .Attr<std::string_view>("cubin_dir"));
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(
+    KConvMathdxKleadLorentzCudaFfi, lorrax_ffi::kconv_mathdx::KleadLorentzConv,
+    xla::ffi::Ffi::Bind()
+        .Ctx<xla::ffi::PlatformStream<cudaStream_t>>()
+        .Arg<xla::ffi::AnyBuffer>()   // Gp
+        .Arg<xla::ffi::AnyBuffer>()   // Gt
+        .Arg<xla::ffi::AnyBuffer>()   // row
+        .Arg<xla::ffi::AnyBuffer>()   // trs
+        .Arg<xla::ffi::AnyBuffer>()   // lsrc
+        .Arg<xla::ffi::AnyBuffer>()   // rsrc
+        .Arg<xla::ffi::AnyBuffer>()   // mph
+        .Arg<xla::ffi::AnyBuffer>()   // nph
+        .Arg<xla::ffi::AnyBuffer>()   // spin
+        .Arg<xla::ffi::AnyBuffer>()   // V (nk, mx, nA, my, nB), R space
+        .Ret<xla::ffi::AnyBuffer>()
+        .Attr<int64_t>("nkx")
+        .Attr<int64_t>("nky")
+        .Attr<int64_t>("nkz")
+        .Attr<double>("scale_g")
+        .Attr<double>("scale_f")
+        .Attr<double>("mult")
+        .Attr<xla::ffi::Span<const int64_t>>("perm_l")
+        .Attr<xla::ffi::Span<const int64_t>>("phase_l")
+        .Attr<xla::ffi::Span<const int64_t>>("perm_r")
+        .Attr<xla::ffi::Span<const int64_t>>("phase_r")
         .Attr<std::string_view>("mathdx_root")
         .Attr<std::string_view>("cubin_dir"));
 

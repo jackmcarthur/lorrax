@@ -26,6 +26,12 @@ must resolve to ``mathdx`` on this mesh (asserted, TASTE 30).
    A-cubic (48 operations, ns 1) and C3 with a general complex U and q = n/3
    (ns 2, 4; plus nk = 196 at ns 4, the per-bank load).  Red twin: the right
    source table rolled by one slot.
+3d. ``make_kconv_lorentz_unfold`` (mode 8, the four-current Σ door): within
+   2 ulp of max|ref| of the Lorentz chain it replaced (the typed unfold,
+   mode-3 transforms of G and V, the XLA scan over γ̃ blocks, the forward
+   transform; bitwise today, reported) for the CC, CT and TT classes on the
+   glide plans (ns 2, 4), a rectangular (charge x current) glide class and C3
+   with a general complex U (ns 4).  Red twin: the right source table rolled.
 4. The stored-kernel doors (modes 2-5) against NumPy ``np.fft`` on sharded
    operands, including an odd grid and 8x8x8: ``make_kconv_klead`` (Σ/COHSEX,
    prep + apply), ``make_kconv_kminor`` (BSE rung, both store layouts),
@@ -280,6 +286,21 @@ def unfold_cases(mesh, rng):
     return recs
 
 
+def lorentz_cases(mesh, rng):
+    """Mode 8 vs the old Lorentz chain (test_kconv_lorentz_unfold.lorentz_case)."""
+    from test_kconv_lorentz_unfold import cases, lorentz_case
+    recs = []
+    for fx, cls, rplan, pref in cases(mesh, rng):
+        r = lorentz_case(mesh, fx, cls, right_plan=rplan, prefactor=pref)
+        recs.append(dict(case=f"kconv_lorentz_{cls}_ns{r['ns']}_nk{r['nk']}"
+                         + ("_rect" if r["rectangular"] else ""),
+                         antiunitary=r["antiunitary"], bitwise_vs_old_chain=int(r["door_bitwise"]),
+                         max_abs_vs_old_chain=r["max_abs"], rel_vs_old_chain=r["rel"],
+                         ulp_vs_old_chain=r["rel"] / np.finfo(float).eps,
+                         red_rolled_rsrc=r["red_rel"]))
+    return recs
+
+
 def _np3(x, kg, axis0, kind, norm):
     """np.fft over three consecutive k axes starting at axis0 of the reshaped array."""
     f = np.fft.ifftn if kind == "ifftn" else np.fft.fftn
@@ -364,7 +385,7 @@ def main() -> int:
     mesh = Mesh(np.asarray(jax.devices()).reshape(2, 2), XY)
     rng = np.random.default_rng(20260924)
     recs = ([downfold_case(mesh, rng), face_parent_case(mesh, rng), plane_case(mesh, rng)]
-            + unfold_cases(mesh, rng) + stored_cases(mesh, rng))
+            + unfold_cases(mesh, rng) + lorentz_cases(mesh, rng) + stored_cases(mesh, rng))
     bad = []
     for r in recs:
         for k, v in r.items():

@@ -329,7 +329,8 @@ class DeviceOmegaAccumulator:
         complete frequency axis and padded to ``capacity`` nodes, go to the
         device once; the node loop is one executable
         (:func:`_device_window_runner`).  ``compile_only`` lowers and compiles
-        that executable without running it.
+        that executable without running it and returns the compiled
+        executable (for a caller that admits its peak).
         """
         if self._coeff is not None:
             raise RuntimeError("a per-node frequency window is still open")
@@ -365,8 +366,7 @@ class DeviceOmegaAccumulator:
         arguments = (self._total, tuple(tau_arguments), t_pad, coeff,
                      n_active, active_count)
         if compile_only:
-            run.lower(*arguments).compile()
-            return self._total
+            return run.lower(*arguments).compile()
         self._total = run(*arguments)
         return self._total
 

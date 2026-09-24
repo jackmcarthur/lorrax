@@ -408,6 +408,7 @@ from ffi.fft import (  # noqa: E402,F401  (re-exported front doors)
     KConvStored,
     make_kconv_klead,
     make_kconv_klead_unfold,
+    make_kconv_lorentz_unfold,
     make_kconv_kminor,
     make_kfft_klead,
     make_kfft_kminor,
