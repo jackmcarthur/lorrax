@@ -342,10 +342,12 @@ def test_build_G_and_tau_transport_parent_operators_after_contraction(gemm):
         n_sym_spatial = 1
 
         @staticmethod
-        def unfold_operator(operator, *, operator_transpose, right_plan):
+        def unfold_operator(operator, *, operator_transpose, right_plan,
+                            conjugate=False):
             assert operator.shape[0] == 2
             assert operator_transpose is None and right_plan is None
-            return operator[jnp.asarray([1, 0, 1])]
+            out = operator[jnp.asarray([1, 0, 1])]
+            return jnp.conj(out) if conjugate else out
 
     xn = jnp.asarray(np.arange(2 * 1 * 2 * 3).reshape(2, 1, 2, 3)
                      + 1j)

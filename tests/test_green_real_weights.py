@@ -16,7 +16,8 @@ def _operands():
         return a @ b
     gemm.in_sharding_a = gemm.in_sharding_b = NamedSharding(mesh, P())
     plan = SimpleNamespace(sym_idx=np.array([1]), n_sym_spatial=1, mesh_xy=mesh,
-        unfold_operator=lambda g, *, operator_transpose, right_plan: operator_transpose)
+        unfold_operator=lambda g, *, operator_transpose, right_plan, conjugate=False: (
+            jnp.conj(operator_transpose) if conjugate else operator_transpose))
     left = jnp.full((1, 1, 1, 1), 2+3j)
     right = jnp.full((1, 1, 1, 1), 4+1j)
     return left, right, gemm, plan, calls
