@@ -769,7 +769,9 @@ def build_qsgw_sigma_xc(
         raise ValueError(
             f"build_qsgw_sigma_xc: the Sigma(omega=0) fallback needs omega = 0 inside "
             f"[{omega_lo:.3f}, {omega_hi:.3f}] eV")
-    inside = (E >= omega_lo) & (E <= omega_hi)
+    # omega_coverage is the ONE Sigma(E)/Sigma(0) decision: the SC tail
+    # scissor excludes exactly its uncovered states (sc_iteration).
+    inside = omega_coverage(omega, E)[0]
     E_clamped = np.where(inside, E, 0.0)
     n_clipped = int(np.count_nonzero(~inside[:, :logical_nb]))
     idx_hi = np.clip(np.searchsorted(omega, E_clamped, side="left"),

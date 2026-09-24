@@ -2853,6 +2853,59 @@ def _capture_frozen_scissor_fits(outputs):
     return (active, getattr(outputs, "tail_scissor_fit", None))
 
 
+def _sc_sampled_support(inputs, partition, energies_loop, mu_ev):
+    """This map's sampled Sigma(omega) support: ``(sampled, grown, E - mu,
+    required)``, or None for a static Sigma (no grid, no fallback).  Pure;
+    the caller logs the growth and writes the session once."""
+    if not inputs.config.compute_mode.is_dynamic:
+        return None
+    from .scissor import extend_sc_omega_grid_ev, sc_padded_window_ev
+
+    session = inputs.fixed_quadrature_session
+    sampled_grid = np.asarray(
+        session.get("omega_grid_ev", inputs.config.omega_grid_ev)
+        if session is not None else inputs.config.omega_grid_ev,
+        dtype=np.float64)
+    support_partition = _partition_on_loop(partition, inputs)
+    required_kn = np.broadcast_to(np.asarray(
+        support_partition.protected_mask | support_partition.in_range_mask,
+        dtype=bool), energies_loop.shape)
+    energy_relative_ev = energies_loop - mu_ev
+    # Owner rule 2026-09-22: states outside the requested window (plus the
+    # SC pad) use Sigma(omega=0); only states inside it may grow the grid.
+    win_lo, win_hi = sc_padded_window_ev(
+        float(inputs.config.sigma.omega_min_ev),
+        float(inputs.config.sigma.omega_max_ev))
+    required_kn = required_kn & (energy_relative_ev >= win_lo) & (energy_relative_ev <= win_hi)
+    expanded_grid = extend_sc_omega_grid_ev(
+        sampled_grid, energy_relative_ev, required_kn,
+        float(inputs.config.sigma.omega_step_ev))
+    return sampled_grid, expanded_grid, energy_relative_ev, required_kn
+
+
+def _fit_sum_band_tail(fit_kwargs, fit_mask_kn, sigma0_kn, previous_fit):
+    """Owner ruling 2026-09-24: the sum-band tail law averages only states
+    that consume Sigma(E_nk).  A state on the Sigma(omega=0) fallback this
+    map (``sigma0_kn``, the uncovered set of ``qsgw_utils.omega_coverage``
+    on the grid build_qsgw_sigma_xc uses) is excluded, so its energy cannot
+    move the tail: on Fe 4^3 three such states set a 14.9 meV tail shift.
+
+    No qualifying conduction state: keep ``previous_fit`` (the last map's
+    law, itself Sigma(E)-only), else no tail law (E_DFT).  Returns
+    ``(fit or None, n_excluded, note)``.
+    """
+    sigma0_kn = np.asarray(sigma0_kn, dtype=bool)
+    n_excluded = int(np.count_nonzero(fit_mask_kn & sigma0_kn))
+    fit = fit_scissor(fit_mask_kn=fit_mask_kn & ~sigma0_kn, **fit_kwargs)
+    if int(fit.n_fit_c) > 0:
+        return fit, n_excluded, ""
+    if previous_fit is not None and int(previous_fit.n_fit_c) > 0:
+        return previous_fit, n_excluded, (
+            "no conduction state consumes Sigma(E); previous map's law kept")
+    return None, n_excluded, (
+        "no conduction state consumes Sigma(E) and no previous law; tail at E_DFT")
+
+
 def _state_partition(state: SCState, inputs: SCInputs) -> BandPartition:
     """Current partition, with compatibility for synthetic bare states."""
     return state.partition if state.partition is not None else inputs.partition
@@ -3303,6 +3356,14 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         inputs.print_fn(
             f"    SC scissor classes: {scissor_classes.summary()}")
 
+    # THE Sigma(omega=0) FALLBACK SET OF THIS MAP, decided once: the grid the
+    # Sigma build below uses and qsgw_utils.omega_coverage, the same test
+    # build_qsgw_sigma_xc applies.  The tail law excludes it.
+    from .qsgw_utils import omega_coverage
+    sc_support = _sc_sampled_support(inputs, partition, energies_loop, _mu_ev)
+    sigma0_kn = (np.zeros(energies_loop.shape, dtype=bool) if sc_support is None
+                 else ~omega_coverage(sc_support[1], sc_support[2])[0])
+
     # ENERGY-ONLY SCISSOR FOR THE SUM-BAND TAIL.  No new iteration state:
     # the fit is derived from the current carry's eigenspectrum and the
     # immutable active DFT ladder.  The logical stop is b4_user, not padded
@@ -3345,11 +3406,10 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         # semiconductors that nothing here justifies.  Only the ACTIVE-window
         # scissor (states inside the Sigma window but outside the omega grid,
         # Na's 14-86) is frozen; see _frozen_scissor_fits.
-        tail_fit = fit_scissor(
+        tail_fit, n_sigma0_excluded, tail_note = _fit_sum_band_tail(dict(
             E_dft_kn_ev=e_dft_fit_ev,
             E_qp_kn_ev=energies_loop,
             valence_mask_kn=valence_kn,
-            fit_mask_kn=fit_mask_kn,
             k_weights=k_star_weights(ks),
             # The sum-band tail is not part of the rotated QP subspace; its
             # update is one rigid scissor.  conduction_mean (default) takes
@@ -3361,7 +3421,11 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
                 if inputs.config.sc.tail_fit == "frontier" else None),
             conduction_rigid_mean=(
                 inputs.config.sc.tail_fit == "conduction_mean"),
-        )
+        ), fit_mask_kn, sigma0_kn,
+            None if state.outputs is None else state.outputs.tail_scissor_fit)
+        if tail_note:
+            _record_sc(inputs, f"    SC sum-band tail: {tail_note}")
+    if tail_fit is not None:
         enk_base_ev = apply_conduction_scissor_to_tail(
             np.asarray(inputs.wfns_dft.enk, dtype=np.float64) * RYD_TO_EV,
             tail_fit,
@@ -3380,7 +3444,8 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             f"alpha={tail_fit.alpha_c:+.4f}, "
             f"beta={tail_fit.beta_c_ev:+.4f} eV "
             f"(n={tail_fit.n_fit_c}, w={tail_fit.w_fit_c:.0f}, "
-            f"policy={inputs.config.sc.tail_fit})")
+            f"policy={inputs.config.sc.tail_fit}; "
+            f"{n_sigma0_excluded} Sigma(0)-fallback state(s) excluded)")
 
     # Same-run metal threading: the ENTRY-solved state feeds chi, the head
     # and Sigma — one mu per map call, from this call's spectrum.
@@ -3823,30 +3888,11 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     # Same metal-only threading as the screening step above: Σ_x/SX
     # diag(f), Σ_c branch weights, and the metal E_F reference.
     sigma_config = inputs.config
-    if inputs.config.compute_mode.is_dynamic:
-        from .scissor import (
-            extend_sc_omega_grid_ev, sc_padded_window_ev, sc_state_pad_ev,
-        )
+    if sc_support is not None:
+        from .scissor import sc_state_pad_ev
 
         session = inputs.fixed_quadrature_session
-        sampled_grid = np.asarray(
-            session.get("omega_grid_ev", inputs.config.omega_grid_ev)
-            if session is not None else inputs.config.omega_grid_ev,
-            dtype=np.float64)
-        support_partition = _partition_on_loop(partition, inputs)
-        required_kn = np.broadcast_to(np.asarray(
-            support_partition.protected_mask | support_partition.in_range_mask,
-            dtype=bool), energies_loop.shape)
-        energy_relative_ev = energies_loop - _mu_ev
-        # Owner rule 2026-09-22: states outside the requested window (plus the
-        # SC pad) use Sigma(omega=0); only states inside it may grow the grid.
-        win_lo, win_hi = sc_padded_window_ev(
-            float(inputs.config.sigma.omega_min_ev),
-            float(inputs.config.sigma.omega_max_ev))
-        required_kn = required_kn & (energy_relative_ev >= win_lo) & (energy_relative_ev <= win_hi)
-        expanded_grid = extend_sc_omega_grid_ev(
-            sampled_grid, energy_relative_ev, required_kn,
-            float(inputs.config.sigma.omega_step_ev))
+        sampled_grid, expanded_grid, energy_relative_ev, required_kn = sc_support
         escaped_kn = required_kn & (
             (energy_relative_ev < sampled_grid[0])
             | (energy_relative_ev > sampled_grid[-1]))
