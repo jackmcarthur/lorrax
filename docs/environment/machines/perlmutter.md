@@ -38,19 +38,23 @@ establish single-node versus multi-node placement without starting MPI here.
 Unknown topology leaves the environment unchanged.
 
 On multi-node Perlmutter CUDA runs launched with `SLURM_NETWORK=no_vni`,
-startup requests the site's OFI/CXI configuration. Set this on the launcher,
-not inside the Python payload:
+startup requests the site's OFI/CXI configuration. The setting belongs to the
+launcher, not the Python payload. `lx run` exports it for every GPU step on
+more than one node, so the plain launch is the correct one:
 
 ```bash
-SLURM_NETWORK=no_vni lx run -N 4 -G 4 -n 16 -- python3 -m gw.gw_jax -i cohsex.in
+lx run -N 4 -G 4 -n 16 -- python3 -m gw.gw_jax -i cohsex.in
 ```
 
+A raw `srun` needs `SLURM_NETWORK=no_vni` (or `--network=no_vni`) itself.
 Full MPI-I/O plus NCCL GW initialization failed without this Slurm setting
 (`OFI EP enable failed: No space left on device`); a GEMM-only probe had
-passed and was insufficient. Without the launch setting, automatic selection
-leaves the existing transport policy unchanged and prints the prerequisite.
-Python cannot repair an already-created step's VNI allocation. Explicit
-transport overrides remain the caller's responsibility.
+passed and was insufficient. Python cannot repair an already-created step's
+VNI allocation, and without it NCCL falls back to TCP sockets, measured 12x
+slower (every multi-node sandbox run from 2026-09-15 to 09-23 ran that way).
+Startup therefore refuses a multi-node Perlmutter CUDA step that lacks the
+launch setting, or that sets `NCCL_NET=Socket`, and names the relaunch.
+Other explicit transport overrides remain the caller's responsibility.
 
 The defaults repeat every network setting in the site `nccl` module,
 including `FI_CXI_RDZV_THRESHOLD=0`. Without that setting, cross-node NCCL
