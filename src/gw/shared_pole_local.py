@@ -276,7 +276,9 @@ def solve_parent_pencil(points, q, o, d, infinity, active, *, eigh, matmul,
         model, zero = apply_shared_pole_zero_policy(model, gates=gates)
         # E selects the infinity block, the last columns of X.
         side, width = pencil[0].shape[-1], infinity[0].shape[-1]
-        selector = (jnp.arange(side)[:, None] == jnp.arange(side - width, side)[None, :])[None]
+        selector = (jnp.arange(side)[:, None] == jnp.arange(side - width, side)[None, :])
+        # One selector per parent: the whole-mesh service matmul does not broadcast batches.
+        selector = jnp.broadcast_to(selector, (pencil[0].shape[0],) + selector.shape)
         retained = retained_moment_identity(pencil, coefficients, model, selector.astype(jnp.complex128),
                                             matmul=matmul)
         signed = ()
