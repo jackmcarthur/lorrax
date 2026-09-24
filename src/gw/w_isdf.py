@@ -1982,10 +1982,11 @@ def _resolve_static_photon_policy(
         BispinorGWMode, HeadCorrection,
         coerce_bispinor_gw_mode, packed_bare_transverse_route,
         packed_photon_screens_current)
-    if str(dyson_solver).strip().lower() != "distributed":
+    if screen_current and str(dyson_solver).strip().lower() != "distributed":
         raise ValueError(
-            "packed static photon response requires "
-            "dyson_solver='distributed'")
+            "the screened packed static photon response requires "
+            "dyson_solver='distributed' (its packed Dyson solve has only "
+            "the distributed plan); the bare route solves no packed Dyson")
     if config is None:
         raise ValueError(
             "packed static photon response requires the run config: the "

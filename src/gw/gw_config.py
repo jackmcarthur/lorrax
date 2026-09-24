@@ -3420,12 +3420,15 @@ def packed_static_envelope(config, *, screened: bool):
            "heads are always on with bispinors and 'off' is the announced "
            "DEBUG skip (owner ruling 2026-09-01, "
            "docs/architecture/decisions.md; TASTE.md row 20)", None)
+    if not screened:
+        # The bare route builds no packed Dyson solve (chi_TT = chi_CT = 0),
+        # so no backend dial may choose it: under either `linalg` value an
+        # in-envelope deck takes this one Sigma^B route (owner 2026-09-24).
+        return
     yield (str(config.backend.linalg) == "distributed",
            f"linalg = {config.backend.linalg}",
            "linalg = distributed", _ENV_IMPL,
-           "the packed response facade has only the distributed plan", None)
-    if not screened:
-        return
+           "the screened packed Dyson solve has only the distributed plan", None)
     _overrides = scalar_head_overrides_named(config)
     yield (not _overrides, ", ".join(_overrides),
            "no scalar q->0 head override named", _ENV_IMPL,
