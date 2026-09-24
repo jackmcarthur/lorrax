@@ -241,7 +241,8 @@ the saved parent rows are the full grid of a reduced WFN.
 | `sym_matrices`, `translations`, `U_spinor` | the identity row |
 | `sym_mats_k`, `R_cart` | \([I,-I]\) |
 | `active_symmetry_rows` | `[0]` |
-| `trs_allowed` | `False` |
+| `trs_allowed` | the source's measured verdict |
+| `qe_operation_antiunitary`, `qe_antiunitary_rows` | `[False]`, empty |
 | `irr_idx_k`, `kirr_fullids` | `arange(N_k)`; `sym_idx_k` zero; `nk_red = N_k` |
 | `irr_idx_q`, `q_irr_full_idx` | `arange(N_k)`; `sym_idx_q` zero |
 | `parent_k_domain` | `"full_bz"` |
@@ -251,10 +252,13 @@ the original `SymMaps`. The loader keeps that original for G spheres, file
 energies and file-wedge output. The view refuses unless exactly one identity
 row exists.
 
-Because `trs_allowed` is false on the view, consumers that branch on time
-reversal take their broken-symmetry form. Response stores are ordered,
-`screening_diagrams = w_bse` refuses (`GATE w_bse_requires_measured_trs`), and
-a full shared-pole head refuses (`GATE shared_pole_head_ordered`).
+The view selects no antiunitary action, but time reversal is a property of the
+Hamiltonian, so `trs_allowed` keeps the measured verdict: on a time-reversal
+symmetric crystal response stores stay unordered and the full shared-pole head
+runs. Each q is its own parent with the identity row, so no q is paired with
+−q through a table. The resolvent ladders (`screening_diagrams = w_bse` or
+`w_rpa_resolvent`) solve on the WFN's reduced q wedge and refuse the view at
+startup (`GATE resolvent_ladder_trivial_view`).
 
 The in-tree non-closed sets are deliberate test specimens and are not
 regenerated: `si_cohsex_debug/centroids_frac_960.txt`,

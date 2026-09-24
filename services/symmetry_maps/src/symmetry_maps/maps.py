@@ -1972,8 +1972,11 @@ class SymMaps:
         view.active_symmetry_rows = np.array([0], dtype=np.int32)
         view._sym_row_ids_search = view.active_symmetry_rows.copy()
         view._sym_mats_k_search = view.sym_mats_k[:1].copy()
-        # The source object's measured verdict is unchanged; this view selects no TR action.
-        view.trs_allowed = False
+        # The view selects no antiunitary action (below), but time reversal is a
+        # property of the Hamiltonian, not of the computational group: the
+        # measured verdict carries over, so TR consumers (unordered response
+        # stores, the shared-pole head, W Hermiticity) keep their TR form.
+        view.trs_allowed = self.trs_allowed
         view.qe_operation_antiunitary = np.array([False])
         view.qe_antiunitary_rows = np.empty(0, dtype=np.int32)
         rows = np.arange(self.nk_tot, dtype=np.int32)
