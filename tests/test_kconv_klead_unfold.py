@@ -53,6 +53,7 @@ def unfold_case(mesh, fx, seed=0):
         return apply_unfold_load_tables_local(flat(g), flat(gt if anti else g),
                                               local_unfold_load_tables(tables), tables.spin)
     O = fixtures._host(jax.jit(composed)(Gd, Gtd))
+    Gk_h = fixtures._host(Gk)
     red_tables = tables._replace(rsrc=np.roll(tables.rsrc, 1, axis=1))
     red_door = F.make_kconv_klead_unfold(mesh, kg, red_tables, norm="ortho", mult=mult)
     red = fixtures._host(red_door(Gd, Gtd if anti else None, Wp))
@@ -60,7 +61,8 @@ def unfold_case(mesh, fx, seed=0):
                 door_bitwise=bool(np.array_equal(got, ref)),
                 max_abs=float(np.max(np.abs(got - ref))),
                 rel=float(np.max(np.abs(got - ref)) / np.max(np.abs(ref))),
-                tables_bitwise=bool(np.array_equal(O, fixtures._host(Gk))),
+                tables_bitwise=bool(np.array_equal(O, Gk_h)),
+                tables_rel=float(np.max(np.abs(O - Gk_h)) / np.max(np.abs(Gk_h))),
                 red_rel=float(np.max(np.abs(red - ref)) / np.max(np.abs(ref))))
 
 
@@ -112,19 +114,25 @@ def _mesh():
     return Mesh(np.asarray(jax.devices()[:4]).reshape(2, 2), ("x", "y"))
 
 
-def test_unfold_door_matches_old_sigma_chain_bitwise():
-    """cpu leg on the glide plans (ns 2, 4) and A-cubic (ns 1): bitwise; red twin fires."""
+def test_unfold_door_matches_old_sigma_chain():
+    """cpu leg vs the old chain within 2 ulp of max|ref| (bitwise on plans whose products
+    have a zero term; XLA:CPU may contract a general product differently in the two
+    fusions); red twin fires.  The CUDA kernel is held bitwise by the P4 gate."""
     from ffi import fft as F
     mesh = _mesh()
     assert F.kconv_backend(mesh) == "plan"
     rng = np.random.default_rng(3)
-    cases = [fixtures._glide_fixture(mesh, rng, ns) for ns in (2, 4)]
-    cases.append(fixtures._acubic_fixture(mesh, rng))
-    cases += [c3_fixture(mesh, ns) for ns in (2, 4)]
-    for fx in cases:
+    # (fixture, bitwise expected): the glide and A-cubic products all carry an
+    # exactly-zero term, so any contraction agrees there; C3 ones do not.
+    cases = [(fixtures._glide_fixture(mesh, rng, ns), True) for ns in (2, 4)]
+    cases.append((fixtures._acubic_fixture(mesh, rng), True))
+    cases += [(c3_fixture(mesh, ns), False) for ns in (2, 4)]
+    eps = np.finfo(float).eps
+    for fx, exact in cases:
         r = unfold_case(mesh, fx)
-        assert r["tables_bitwise"], r
-        assert r["door_bitwise"], r
+        assert r["tables_rel"] <= 2 * eps and r["rel"] <= 2 * eps, r
+        if exact:
+            assert r["tables_bitwise"] and r["door_bitwise"], r
         assert r["red_rel"] > 1e-3, r
 
 
