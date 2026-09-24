@@ -1,10 +1,12 @@
 # Shared orthogonalization
 
-`distrib_la.plan_orthogonalization` returns a callable for removing a block's
-components along an existing orthonormal basis. It uses two classical
-Gram–Schmidt passes (CGS2). It does not normalize the result, detect rank, or
-orthogonalize vectors within the new block; use the shared subspace QR or
-normalization operation for those separate steps.
+`distrib_la.plan_orthogonalization(*, capacity, max_block_size,
+vector_sharding=None, native_collectives=False)` returns a callable that
+removes a block's components along an existing orthonormal basis by two
+classical Gram–Schmidt passes (CGS2). It does not normalize the result,
+detect rank, or orthogonalize vectors within the block; the subspace QR and
+normalization operations of [`plan_subspace`](davidson.md#shared-subspace-service)
+do that.
 
 ```python
 from distrib_la import plan_orthogonalization
@@ -12,84 +14,67 @@ from distrib_la import plan_orthogonalization
 orthogonalize = plan_orthogonalization(
     capacity=512, max_block_size=32, vector_sharding=vector_sharding)
 # Inspect orthogonalize.workspace_specs before allocating operands.
-# basis: (512, *vector_shape), block: (32, *vector_shape), complex128.
-# start and count can change inside a compiled loop.
-result = orthogonalize(basis, block, count, start=start)
+# basis: (512, *vector_shape), block: (b <= 32, *vector_shape), complex128.
+result = orthogonalize(basis, block, count, start=start)   # start/count may be traced
 ```
 
-The basis rows in `[start, start + count)` must be orthonormal under the
-ordinary complex Euclidean inner product. For each of two passes the service
-computes `C = basis.conj() @ block.T`, then `block -= C.T @ basis`, with
-vector dimensions flattened and only the selected basis interval present in
-the products. Empty intervals preserve the block; inactive basis rows may
-contain NaNs. Two passes control projection roundoff; they cannot repair an
-incorrect basis or a different physical metric.
+For each pass, with vector axes flattened and only basis rows
+`[start, start + count)` present,
 
-The row axis is unsharded. Vector axes must cover every nontrivial mesh axis.
-Both operands retain that sharding, and vectors never gather to fewer ranks.
-`start` and `count` must agree across ranks; the optional native-collective
-path explicitly checks this agreement at runtime.
-Plan before tracing. Collective invocations must occur in the same order on
-all ranks. With `native_collectives=True`, planning also initializes the shared
-native communicator collectively; do not submit independent calls on it from
-concurrent host threads. Solver iterations order calls through their vector
-data dependencies. Invocation is JIT-compatible. Changing
-capacity, vector shape, or block width changes compiled geometry; changing
-only start/count does not.
+$$C = \bar{Q}\,B^{\mathsf T}, \qquad B \leftarrow B - C^{\mathsf T} Q .$$
+
+The selected rows must be orthonormal in the complex Euclidean inner product.
+An empty interval returns the block unchanged, and inactive basis rows may
+hold NaNs. Two passes control projection roundoff; they cannot repair a wrong
+basis or a different metric (the symplectic BSE orthogonalization is a
+separate operation).
+
+**Contract.** Operands are complex128 with `basis.shape[0] == capacity`,
+matching trailing shapes and `1 ≤ block.shape[0] ≤ max_block_size`; anything
+else raises. The row axis is unsharded, vector axes must cover every
+nontrivial mesh axis, both operands keep that sharding, and no vector is
+gathered to fewer ranks. `start` and `count` must agree across ranks. Plan
+before tracing; the callable is `jit`-compatible. Capacity, vector shape or
+block width change the compiled geometry; `start`/`count` do not. Collective
+invocations must be issued in the same order on every rank; with
+`native_collectives=True` planning initializes the shared native communicator
+collectively, and calls on it must not be issued from concurrent host threads.
 
 ## Providers and memory
 
-`orthogonalize.backend` identifies the selected implementation:
+`orthogonalize.backend` names the resolved implementation:
 
-- `cuda`: local cuBLAS CGS2 with a declared block input/output alias.
-- `cuda_jax_collectives`: the default for distributed CUDA. A local Gram
-  operation, an in-place subtraction combined with the next Gram operation,
-  and a final in-place subtraction surround two JAX coefficient reductions.
-  GEMMs use only the selected basis rows. Reductions retain the fixed
-  `capacity * block_width` coefficient array. This path creates no native
-  NCCL context and avoids reconstructed vector temporaries.
-- `cuda_nccl`: explicit `native_collectives=True` on one process per GPU
-  over the complete X/Y mesh. One native handler updates the local block
-  in place and allreduces only `count * block_width` complex coefficients
-  per pass. A fixed-size exchange checks interval agreement before mutation.
-  This option can reduce communication and host waits, but initializing its
-  shared native context has a substantial separate memory and startup cost.
-- `jax_collectives`: distributed CPU callbacks operate on local vector tiles,
-  with capacity-sized JAX coefficient reductions.
-- `cpu_callback`: both active NumPy passes in one host callback.
+| backend | when | mechanism |
+|---|---|---|
+| `cuda` | CUDA, one device | local cuBLAS CGS2 with a declared block input/output alias |
+| `cuda_jax_collectives` | CUDA, distributed (default) | local Gram, an in-place subtraction fused with the next Gram, and a final in-place subtraction around two JAX coefficient reductions of the fixed `capacity × block_width` array; GEMMs use only selected rows; no native NCCL context |
+| `cuda_nccl` | CUDA, distributed, `native_collectives=True`, one GPU per process over the whole X/Y mesh | one native handler updates the block in place and all-reduces only `count × block_width` coefficients per pass; a fixed-size exchange checks interval agreement across ranks before any mutation |
+| `jax_collectives` | CPU, distributed | host callbacks on local vector tiles with capacity-sized JAX coefficient reductions |
+| `cpu_callback` | CPU, one device | both passes in one NumPy host callback |
 
-CUDA scratch is bounded by `capacity * max_block_size` complex128
-coefficients, 4 MiB of BLAS workspace, and, for the native distributed
-operation, two int32 range entries per rank. These are XLA-owned arrays.
-`native_collectives` affects distributed CUDA only. There is no eigensolver workspace query in this standalone planner. An
-undonated input must remain unchanged: XLA may copy the correction block to
-honor that contract. A surrounding JIT can donate the block when its caller
-no longer needs it; inspect optimized HLO and `memory_analysis()` for the
-actual buffer schedule.
+`workspace_specs` lists the XLA-owned scratch: `capacity × max_block_size`
+complex128 coefficients, 4 MiB of BLAS workspace and, for `cuda_nccl`, two
+int32 range entries per rank. Native context allocations and CPU callback
+temporaries are not included, and there is no eigensolver workspace. An
+undonated block must stay unchanged, so XLA may copy it; a surrounding `jit`
+can donate it when the caller no longer needs it. Read the actual buffer
+schedule from optimized HLO and `memory_analysis()`.
 
-The optional native distributed handler reuses the linear-algebra service's existing NCCL
-context, stream, and pooled CUDA events. Initializing that context has a
-separate time and device-memory cost. Native library/context allocations and
-CPU callback temporaries are not included in `workspace_specs`. Native
-runtime dimensions still require host reads and stream waits: three for the
-default distributed CUDA path, one for the optional native collective path. This is
-not a host-free CUDA graph.
+`cuda_nccl` reuses the service's existing NCCL context, stream and pooled CUDA
+events; initializing that context has its own time and device-memory cost.
+Every CUDA route reads runtime dimensions to the host with a stream
+synchronization, so none is a host-free CUDA graph.
 
-The default distributed CUDA path requires `ActiveSubspaceSubtractFfi` and
-`ActiveSubspaceSubtractGramFfi` alongside the existing Gram target. The optional
-native path requires `ActiveSubspaceDistributedOrthoFfi`. Missing required
-targets refuse at planning. Rebuild through the [FFI owner](../architecture/ffi_layout.md).
-No private driver binding or additional shared library is introduced.
+Required handlers are probed at planning and refuse by name when missing:
+`ActiveSubspaceOrthoFfi` on CUDA; `ActiveSubspaceGramFfi`,
+`ActiveSubspaceSubtractFfi` and `ActiveSubspaceSubtractGramFfi` for
+`cuda_jax_collectives`; `ActiveSubspaceDistributedOrthoFfi` for `cuda_nccl`.
+Rebuild through the [FFI owner](../architecture/ffi_layout.md).
 
-## Existing solvers and scope
+## Consumers
 
-`plan_subspace(...).orthogonalize` uses the same implementation. Planned
-Davidson and ordinary scalar/block/thick-restart Lanczos therefore share the
-optimization without duplicate solver math. Symplectic BSE orthogonalization
-has a different metric and is not replaced by this Euclidean operation.
-
-Tests in `tests/test_subspace_orthogonalize.py` cover active windows,
-poisoned inactive rows, nearly dependent inputs, input preservation, and
-real distributed execution. The Run398 sandbox investigation owns measured
-performance and memory results; source structure alone is not a speedup
-certificate.
+`plan_subspace(...).orthogonalize` uses the same implementation, so planned
+Davidson and scalar, block and thick-restart Lanczos share it.
+`tests/test_subspace_orthogonalize.py` covers active windows, poisoned inactive
+rows, nearly dependent inputs, input preservation and real distributed
+execution.
