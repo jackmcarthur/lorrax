@@ -1133,7 +1133,12 @@ def plan_gflat_chunks(
             _ARENA_PLACEMENT_FRAC * face_headroom
             / (face_terms["pair_arena_slope"]
                + _ARENA_PLACEMENT_FRAC * cache_other_slope))
-        cache_cap = min(cache_pair_cap, cache_build_cap, cache_arena_cap)
+        # The single-arena placement cap (``_ARENA_PLACEMENT_FRAC``) is not
+        # applied to Stage C since 2026-09-23: it was calibrated on two BFC
+        # fragmentation failures, and under the mandated cuda_async
+        # allocator the VI3 12x12 P16 fit ran at the full sum cap (see the
+        # constant's note).  The arena caps stay computed for the banner.
+        cache_cap = min(cache_pair_cap, cache_build_cap)
 
         repeated_headroom = max(face_headroom - streamed_fft, 0.0)
         repeated_pair_cap = int(
@@ -1145,7 +1150,7 @@ def plan_gflat_chunks(
             _ARENA_PLACEMENT_FRAC * repeated_headroom
             / (face_terms["pair_arena_slope"]
                + _ARENA_PLACEMENT_FRAC * repeated_other_slope))
-        repeated_cap = min(repeated_pair_cap, repeated_arena_cap)
+        repeated_cap = repeated_pair_cap
 
         route_width = (min(int(r_chunk_override), n_rtot)
                        if r_chunk_override and r_chunk_override > 0
@@ -1198,7 +1203,7 @@ def plan_gflat_chunks(
             r_from_arena = (
                 int(_ARENA_PLACEMENT_FRAC * headroom_C / arena_slope)
                 if arena_slope > 0 else n_rtot)
-            r_budget_cap = min(r_from_budget, r_from_arena)
+            r_budget_cap = r_from_budget
         # Performance floors — chunks at least μ wide, at most
         # ``max_chunks`` of them.  THE BUDGET OUTRANKS THE FLOORS: until
         # 2026-08-22 ``r_lo = min(μ, n_rtot)`` silently overrode a
@@ -1214,11 +1219,11 @@ def plan_gflat_chunks(
             _announce(
                 "stage-c-rchunk-budget-cap",
                 f"Stage C r_chunk lowered {r_chunk} -> {capped} by the "
-                f"memory budget (sum cap {r_from_budget}, single-arena "
-                f"placement cap {r_from_arena} at "
-                f"{_ARENA_PLACEMENT_FRAC:.2f}x post-persistent headroom); "
-                f"the mu-wide performance floor does not outrank the "
-                f"budget.  Explicit r_chunk_size overrides this cap")
+                f"memory budget (sum cap {r_from_budget}; the retired "
+                f"single-arena placement cap would have been "
+                f"{r_from_arena}); the mu-wide performance floor does not "
+                f"outrank the budget.  Explicit r_chunk_size overrides "
+                f"this cap")
             r_chunk = capped
         else:
             r_chunk = max(r_chunk, min(n_rtot, r_budget_cap))

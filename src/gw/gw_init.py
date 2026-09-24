@@ -1565,9 +1565,37 @@ def _resolve_zeta_fit_contract(
 		reuse_transverse=reuse_transverse)
 
 
+def zeta_sphere_ngkmax(wfn, sym, meta, zeta_cutoff_ry) -> int:
+	"""The G extent of the ζ(G) accumulator: the fit's own per-q sphere size.
+
+	``gw.isdf_fitting.fit_zeta_to_h5`` builds ``{G : |q+G|² ≤ zeta_cutoff}``
+	with ``common.coulomb_sphere.compute_per_q_bare_coulomb_components`` and
+	pads it to its max over q; this is the same call on the IBZ q rows (the
+	sphere size is invariant under the point group, so the full-BZ max is the
+	same).  Without a cutoff (or for sys_dim 0) the writer stores the full
+	flat-FFT axis, ``n_rtot``.  The memory planner prices ζ(G) with it
+	instead of a 6%-of-box guess (VI3 12x12: 72,560 vs 82,944 → 4.8 GB/rank
+	over-priced at P16).
+	"""
+	if zeta_cutoff_ry is None or int(meta.sys_dim) == 0:
+		return int(meta.n_rtot)
+	from common.coulomb_sphere import compute_per_q_bare_coulomb_components
+	from ffi import _services
+	_services.ensure_on_path()
+	from symmetry_maps import bgw_integer_q_to_fractional
+	from vcoul import CoulombGeometry
+	q_frac = bgw_integer_q_to_fractional(sym.q_irr_kgrid_int, meta.kgrid)
+	pkg = compute_per_q_bare_coulomb_components(
+		fft_grid=meta.fft_grid, bvec=CoulombGeometry.from_wfn(wfn).bvec,
+		q_irr_frac=q_frac, vcoul_cutoff_ry=float(zeta_cutoff_ry),
+		sys_dim=int(meta.sys_dim))
+	return int(pkg["ngkmax"])
+
+
 def _plan_gflat_chunks_for_channel(
 		*, meta, cfg, band_slices, mesh_xy, is_bispinor, n_q_selected,
-		face_current_vertex=False, parent_route=None, print_fn=print):
+		face_current_vertex=False, parent_route=None, print_fn=print,
+		zeta_ngkmax=None):
 	"""Chunk-plan ONE ISDF centroid channel: the charge channel
 	(``meta.n_rmu``) or one transverse channel (``meta.n_rmu`` — μ_T is
 	typically ≈ μ_C/3).
@@ -1612,7 +1640,8 @@ def _plan_gflat_chunks_for_channel(
 		raise ValueError(
 			"selected zeta q rows must be in [1, full-zone K], got "
 			f"Q={n_q_selected}, K={int(meta.nk_tot)}")
-	_ngkmax = int(getattr(meta, 'ngkmax', 0)) or int(0.06 * meta.n_rtot)
+	_ngkmax = (int(zeta_ngkmax) if zeta_ngkmax
+	           else int(getattr(meta, 'ngkmax', 0)) or int(0.06 * meta.n_rtot))
 	gflat_plan = plan_gflat_chunks(
 		meta=meta, mesh_xy=mesh_xy,
 		nb_total=nb_total,
@@ -2028,7 +2057,8 @@ def _reuse_zeta_faces(
 
 
 def _plan_transverse_zeta(
-        _reuse_T, band_slices, cfg, mesh_xy, print_fn, sym, zeta_contract):
+        _reuse_T, band_slices, cfg, mesh_xy, print_fn, sym, zeta_contract,
+        zeta_ngkmax=None):
     """Produce the existing independently sized transverse fit plan."""
     _meta_T = zeta_contract.meta_transverse
     _cent_T_idx = zeta_contract.centroids_transverse
@@ -2053,7 +2083,8 @@ def _plan_transverse_zeta(
                 n_q_selected=_n_q_selected_T,
                 parent_route=dict(n_parent=int(np.asarray(sym.kirr_fullids).size),
                                   parents_only=True),
-                face_current_vertex=True, print_fn=print_fn)
+                face_current_vertex=True, print_fn=print_fn,
+                zeta_ngkmax=zeta_ngkmax)
     return _meta_T, _cent_T_idx, _chunks_T, _gflat_plan_T, _write_ibz_only_transverse
 
 
@@ -2469,7 +2500,10 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 	    return _reuse_zeta_faces(
 	        band_slices, cfg, mem_est, mesh_xy, print_fn, sym, wfn, zeta_contract, zeta_h5_path)
 	(_meta_T, _cent_T_idx, _chunks_T, _gflat_plan_T, _write_ibz_only_transverse) = _plan_transverse_zeta(
-	    _reuse_T, band_slices, cfg, mesh_xy, print_fn, sym, zeta_contract)
+	    _reuse_T, band_slices, cfg, mesh_xy, print_fn, sym, zeta_contract,
+	    zeta_ngkmax=(zeta_sphere_ngkmax(
+	        wfn, sym, zeta_contract.meta_transverse, _zeta_cutoff)
+	        if cfg.bispinor and not all(_reuse_T) else None))
 	(_coupled_mu123_enabled, _transverse_batched_route) = _plan_coupled_zeta_fit(
 	    _chunks_T, _gflat_plan_T, _meta_T, _reuse_T, band_slices, cfg, mesh_xy, print_fn)
 	_provenance = zeta_contract.provenance
@@ -2833,7 +2867,9 @@ def _prepare_fresh_parent_faces(
     		is_bispinor=bool(int(meta.nspinor) == 4),
     		n_q_selected=int(np.asarray(sym.q_irr_full_idx).shape[0]),
     		parent_route=dict(n_parent=_candidate_plan.n_parent,
-    		                  parents_only=True), print_fn=print0)
+    		                  parents_only=True), print_fn=print0,
+    		zeta_ngkmax=zeta_sphere_ngkmax(
+    			wfn, sym, meta, zeta_contract.zeta_cutoff))
     _parent_zeta_plan = _candidate_plan if chunks is not None else None
     load_band_chunk = (chunks['band_chunk'] if chunks is not None
                        else zeta_contract.loader_band_chunk)
