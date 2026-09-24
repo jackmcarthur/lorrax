@@ -32,6 +32,11 @@ current density `ψ†α^iψ`).
 > the incumbent route must cover. One-GPU operation requires explicit
 > `w_dyson_solver = local`.)
 
+The table below retains the original packed static/PPM phase boundaries.
+The later frequency-dependent CC/CT/TT shared-pole route is specified in
+[the shared-pole W model](shared-pole-w-model.md); its direct Γ completion
+is first order in the long-wavelength vertex.
+
 | self-energy channel | frequency dependence | Γ-cell head | deck route | status |
 |---|---|---|---|---|
 | charge exchange `Σ_X` (CC) | none | `⟨v⟩_mBZ`, band-diagonal (§3.1) | every mode | production |
@@ -40,7 +45,7 @@ current density `ψ†α^iψ`).
 | screened TT/CT/TC (packed 4×4) | **static only** (`compute_mode = cohsex`) | charge CC `q²` + the charge wings + **optional** Hall CT/TC `q¹` (§4), **always on**; `head_correction = off` is a DEBUG skip behind a loud banner | `bispinor_gw = full_static_cohsex` | experimental, insulating slab, one shot |
 | *unscreened* TT via the same packed operator | current block evaluated once at `ω = 0`, in static COHSEX and packed GN/HL-PPM | the same Γ-cell completion, charge-only `R(q)`, returning `diag(W^{00}_h, ⟨D_TT⟩)`; Hall **refused** (§4) | `bispinor_gw = bare_transverse` inside the packed envelope | experimental, slab, one shot; body byte-identical to the incumbent route when compared without its head |
 | the packed operator on a **dynamic** Σ | **CC dynamic, current blocks static**: `W_00(ω)` follows the PPM model while the other fifteen packed blocks are evaluated at `ω = 0` | CC: the dynamic model's own head (§3.3) for `Σ_c` plus the scalar band-diagonal `⟨v⟩` head for `Σ_X`; TT and CT/TC: the packed Γ-cell completion of §4.2 | either `bispinor_gw` value with `compute_mode` in {`gn_ppm`, `hl_ppm`} inside the packed envelope; `mpa` stays on the incumbent route | experimental, slab, one shot; the current blocks' `ω`-dependence is neglected and bounded as in §2.2 |
-| retarded / dynamic photon `D^{IJ}(ω)` — the current blocks' own frequency dependence | — | — | none | **does not exist**; bounded from above in §2.2 |
+| frequency-dependent current blocks | ordered CC/CT/TT shared-pole sectors | first-order direct Γ completion; no wing/body fold | `bispinor_gw = full_shared_pole` | implemented; see the shared-pole W model |
 
 Binding rule ([decisions, 2026-09-01](../architecture/decisions.md)): COHSEX
 with bispinors always carries the Γ-cell head; `head_correction = off` is a
