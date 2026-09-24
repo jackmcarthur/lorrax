@@ -349,6 +349,97 @@ def _make_read_all_ibz(zeta_loader, n_rmu_padded: int, mesh_xy: Mesh):
 # Per-tile core (one (μ_L, ν_L) tile)
 # ---------------------------------------------------------------------------
 
+def _contract_v_from_loader(
+        zeta_L_loader, zeta_R_loader, V_acc, g0_acc, v_q_dev, *, mesh_xy,
+        n_rmu_L_padded, n_rmu_R_padded, ngkmax, g_chunk, write_g0, use_ibz,
+        same_zeta, n_q_ibz, timing_label, verbose):
+    """V_q from a ζ file: read the IBZ slabs once, contract per q (the file route)."""
+    kernel = _make_per_q_kernel(
+        mesh_xy, n_rmu_L_padded, n_rmu_R_padded, ngkmax, g_chunk,
+        # On an IBZ the literal full-zone G=0 may be a nonzero parent G;
+        # selecting disk slot zero inside this kernel is therefore unsafe.
+        # The service action below reads the exact parent slot while the
+        # same zeta slab is still resident.
+        write_g0=bool(write_g0 and not use_ibz), same_zeta=same_zeta)
+
+    read_L = _make_read_all_ibz(zeta_L_loader, n_rmu_L_padded, mesh_xy)
+    read_R = (read_L if same_zeta
+              else _make_read_all_ibz(zeta_R_loader, n_rmu_R_padded, mesh_xy))
+
+    # ---- Pre-read all IBZ ζ̃ slabs in ONE batched call ---------------
+    # The historical per-q PHDF5 read inside the kernel loop interleaved
+    # with NCCL collectives and was the root cause of the async-prefetch
+    # deadlock.  At MoS2 3×3 the full ζ̃_L is ~50 MB / rank; at CrI3 6×6
+    # 80 Ry it's ~0.8 GB / rank — both comfortable.
+    #
+    # 2026-05-12: switched from ``concatenate([read_L(q) for q in ...])``
+    # (n_q_ibz separate ``read_slab`` calls; each one created a fresh
+    # ``_per_rank`` closure and triggered a JAX trace-cache miss in the
+    # FFI shard_map dispatch) to ONE batched ``read_all_ibz`` call.
+    # Net effect on MoS2 3×3 bispinor: 63 read_slab calls (9 q × 7 tiles)
+    # → 7 calls; the corresponding ``jit__per_rank`` retraces drop from
+    # ~63 to 7.
+    import time as _t
+    _read_t0 = _t.perf_counter()
+    zeta_L_all = read_L(n_q_ibz)                            # (n_q_ibz, n_rmu_L_padded, ngkmax)
+    if same_zeta:
+        zeta_R_all = zeta_L_all
+    else:
+        zeta_R_all = read_R(n_q_ibz)
+    jax.block_until_ready(zeta_L_all)
+    if not same_zeta:
+        jax.block_until_ready(zeta_R_all)
+    _read_total = _t.perf_counter() - _read_t0
+    if verbose and jax.process_index() == 0:
+        print(f"    [{timing_label}] pre-read all {n_q_ibz} IBZ ζ̃ slabs "
+              f"(1 batched call): {_read_total:.2f}s", flush=True)
+
+    # ---- Per-q kernel loop on device-resident ζ̃ ---------------------
+    # The loop hands the kernel the WHOLE slabs and a traced q; the three
+    # per-q slices (ζ_L, ζ_R, v_q) happen inside its jit.  What used to be
+    # here was the eager form of exactly those slices — one or two
+    # ``dynamic_slice_in_dim`` executables and a ``v_q_dev[q]`` gather per
+    # iteration, outside any jit, plus a host→device transfer for the loop
+    # counter.
+    #
+    # THE SYNC AND THE SLICES MOVED TOGETHER, and the order matters.  The
+    # ``block_until_ready`` below is vestigial as a correctness device: it
+    # landed in ac735cca8 when the loop body still did a collective PHDF5
+    # read per q, and ordered the kernel before the next read; 0880066a1
+    # hoisted that read into ``read_all_ibz`` above and left the sync
+    # behind.  But while the slices were still eager it was also the only
+    # backpressure on them — drop it alone and up to n_q live
+    # ``(1, n_rmu_L_padded, ngkmax)`` temporaries queue, a second copy of
+    # ζ_L (3.28 GB global at CrI3 6×6 80 Ry).  With the slices inside the
+    # executable there is nothing left to queue: the donated (V_acc, g0_acc)
+    # chain makes each call depend on the previous one's output, so the
+    # executions serialise on their own and the transients live and die
+    # inside one program.  What is left for the sync to do is make the
+    # per-q number below a KERNEL time rather than a dispatch time — so it
+    # is gated on the same condition as the print it feeds.
+    #
+    # Multiplier for both: ``v_q_bispinor`` calls this function once per
+    # UNIQUE_TILE, so the counts here are per tile (7 tiles × 9 q = 63
+    # syncs on the MoS2 3×3 bispinor deck).
+    _time_each_q = bool(verbose) and jax.process_index() == 0
+    # Hoisted: ``jnp.int32(q)`` inside the loop was a host→device transfer
+    # per iteration.
+    q_idx_dev = [jnp.int32(q) for q in range(n_q_ibz)]
+    for q in range(n_q_ibz):
+        _t1 = _t.perf_counter()
+        V_acc, g0_acc = kernel(
+            V_acc, g0_acc, zeta_L_all, zeta_R_all, v_q_dev, q_idx_dev[q])
+        # The wait consumes a sharded accumulator, so it cannot sit under
+        # the rank-0 timing gate.  All processes rendezvous; only rank 0
+        # formats the diagnostic (INVARIANTS row 21).
+        jax.block_until_ready(V_acc)
+        if _time_each_q:
+            print(f"    [{timing_label}] q={q}/{n_q_ibz}: "
+                  f"kernel={_t.perf_counter() - _t1:.2f}s", flush=True)
+
+    return V_acc, g0_acc, zeta_L_all, zeta_R_all
+
+
 def _compute_V_q_g_flat_one_tile(
     zeta_L_loader,
     zeta_R_loader,                     # None ⇒ same_zeta=True
@@ -484,88 +575,34 @@ def _compute_V_q_g_flat_one_tile(
     v_q_dev = device_put_process_local(
         v_q_table, NamedSharding(mesh_xy, P(None, None)))
 
-    kernel = _make_per_q_kernel(
-        mesh_xy, n_rmu_L_padded, n_rmu_R_padded, ngkmax, g_chunk,
-        # On an IBZ the literal full-zone G=0 may be a nonzero parent G;
-        # selecting disk slot zero inside this kernel is therefore unsafe.
-        # The service action below reads the exact parent slot while the
-        # same zeta slab is still resident.
-        write_g0=bool(write_g0 and not use_ibz), same_zeta=same_zeta)
-
-    read_L = _make_read_all_ibz(zeta_L_loader, n_rmu_L_padded, mesh_xy)
-    read_R = (read_L if same_zeta
-              else _make_read_all_ibz(zeta_R_loader, n_rmu_R_padded, mesh_xy))
-
-    # ---- Pre-read all IBZ ζ̃ slabs in ONE batched call ---------------
-    # The historical per-q PHDF5 read inside the kernel loop interleaved
-    # with NCCL collectives and was the root cause of the async-prefetch
-    # deadlock.  At MoS2 3×3 the full ζ̃_L is ~50 MB / rank; at CrI3 6×6
-    # 80 Ry it's ~0.8 GB / rank — both comfortable.
-    #
-    # 2026-05-12: switched from ``concatenate([read_L(q) for q in ...])``
-    # (n_q_ibz separate ``read_slab`` calls; each one created a fresh
-    # ``_per_rank`` closure and triggered a JAX trace-cache miss in the
-    # FFI shard_map dispatch) to ONE batched ``read_all_ibz`` call.
-    # Net effect on MoS2 3×3 bispinor: 63 read_slab calls (9 q × 7 tiles)
-    # → 7 calls; the corresponding ``jit__per_rank`` retraces drop from
-    # ~63 to 7.
-    import time as _t
-    _read_t0 = _t.perf_counter()
-    zeta_L_all = read_L(n_q_ibz)                            # (n_q_ibz, n_rmu_L_padded, ngkmax)
-    if same_zeta:
+    if hasattr(zeta_L_loader, 'contract_v'):
+        # The μ-batch fit's ζ (Z store + C⁺, isdf.zeta_mubatch.ZetaG): V is
+        # accumulated tile by tile as ζ is formed, and the G≈0 shell it keeps
+        # carries every column the one-leg unfold and the head channel read.
+        if not same_zeta:
+            raise ValueError(
+                f"_compute_V_q_g_flat_one_tile[{timing_label}]: the in-memory "
+                "ζ serves only the same-ζ charge tile.")
+        V_acc = zeta_L_loader.contract_v(v_q_table)
+        if tuple(int(v) for v in V_acc.shape) != (
+                n_q_ibz, n_rmu_L_padded, n_rmu_L_padded):
+            raise ValueError(
+                f"_compute_V_q_g_flat_one_tile[{timing_label}]: in-memory V "
+                f"{tuple(V_acc.shape)} != {(n_q_ibz, n_rmu_L_padded, n_rmu_L_padded)}")
+        V_acc = jax.lax.with_sharding_constraint(V_acc, V_sh)
+        zeta_L_all = zeta_L_loader.shell
+        gvec_components = zeta_L_loader.shell_gvec
+        if write_g0 and not use_ibz:
+            g0_acc = jax.lax.with_sharding_constraint(zeta_L_all[:, :, 0], g0_sh)
+        same_zeta = True
         zeta_R_all = zeta_L_all
     else:
-        zeta_R_all = read_R(n_q_ibz)
-    jax.block_until_ready(zeta_L_all)
-    if not same_zeta:
-        jax.block_until_ready(zeta_R_all)
-    _read_total = _t.perf_counter() - _read_t0
-    if verbose and jax.process_index() == 0:
-        print(f"    [{timing_label}] pre-read all {n_q_ibz} IBZ ζ̃ slabs "
-              f"(1 batched call): {_read_total:.2f}s", flush=True)
-
-    # ---- Per-q kernel loop on device-resident ζ̃ ---------------------
-    # The loop hands the kernel the WHOLE slabs and a traced q; the three
-    # per-q slices (ζ_L, ζ_R, v_q) happen inside its jit.  What used to be
-    # here was the eager form of exactly those slices — one or two
-    # ``dynamic_slice_in_dim`` executables and a ``v_q_dev[q]`` gather per
-    # iteration, outside any jit, plus a host→device transfer for the loop
-    # counter.
-    #
-    # THE SYNC AND THE SLICES MOVED TOGETHER, and the order matters.  The
-    # ``block_until_ready`` below is vestigial as a correctness device: it
-    # landed in ac735cca8 when the loop body still did a collective PHDF5
-    # read per q, and ordered the kernel before the next read; 0880066a1
-    # hoisted that read into ``read_all_ibz`` above and left the sync
-    # behind.  But while the slices were still eager it was also the only
-    # backpressure on them — drop it alone and up to n_q live
-    # ``(1, n_rmu_L_padded, ngkmax)`` temporaries queue, a second copy of
-    # ζ_L (3.28 GB global at CrI3 6×6 80 Ry).  With the slices inside the
-    # executable there is nothing left to queue: the donated (V_acc, g0_acc)
-    # chain makes each call depend on the previous one's output, so the
-    # executions serialise on their own and the transients live and die
-    # inside one program.  What is left for the sync to do is make the
-    # per-q number below a KERNEL time rather than a dispatch time — so it
-    # is gated on the same condition as the print it feeds.
-    #
-    # Multiplier for both: ``v_q_bispinor`` calls this function once per
-    # UNIQUE_TILE, so the counts here are per tile (7 tiles × 9 q = 63
-    # syncs on the MoS2 3×3 bispinor deck).
-    _time_each_q = bool(verbose) and jax.process_index() == 0
-    # Hoisted: ``jnp.int32(q)`` inside the loop was a host→device transfer
-    # per iteration.
-    q_idx_dev = [jnp.int32(q) for q in range(n_q_ibz)]
-    for q in range(n_q_ibz):
-        _t1 = _t.perf_counter()
-        V_acc, g0_acc = kernel(
-            V_acc, g0_acc, zeta_L_all, zeta_R_all, v_q_dev, q_idx_dev[q])
-        # The wait consumes a sharded accumulator, so it cannot sit under
-        # the rank-0 timing gate.  All processes rendezvous; only rank 0
-        # formats the diagnostic (INVARIANTS row 21).
-        jax.block_until_ready(V_acc)
-        if _time_each_q:
-            print(f"    [{timing_label}] q={q}/{n_q_ibz}: "
-                  f"kernel={_t.perf_counter() - _t1:.2f}s", flush=True)
+        V_acc, g0_acc, zeta_L_all, zeta_R_all = _contract_v_from_loader(
+            zeta_L_loader, zeta_R_loader, V_acc, g0_acc, v_q_dev,
+            mesh_xy=mesh_xy, n_rmu_L_padded=n_rmu_L_padded,
+            n_rmu_R_padded=n_rmu_R_padded, ngkmax=ngkmax, g_chunk=g_chunk,
+            write_g0=write_g0, use_ibz=use_ibz, same_zeta=same_zeta,
+            n_q_ibz=n_q_ibz, timing_label=timing_label, verbose=verbose)
 
     if write_g0 and use_ibz:
         g0_acc = unfold_isdf_one_leg(
@@ -856,8 +893,19 @@ def compute_head_channel_zeta(
         int(zeta_loader.n_rmu),
         int(mesh_xy.shape['x']) * int(mesh_xy.shape['y']))
 
-    read_all = _make_read_all_ibz(zeta_loader, n_rmu_padded, mesh_xy)
-    zeta_all = read_all(n_q_ibz)              # (n_q_ibz, mu_pad, ngkmax)
+    if hasattr(zeta_loader, 'contract_v'):
+        # μ-batch ζ: the head slots (argmin |q+G|) lie in the G≈0 shell the
+        # V_q pass kept; read them there instead of re-forming the sphere.
+        if zeta_loader.shell is None:
+            raise ValueError(
+                "compute_head_channel_zeta: the in-memory ζ has not run its "
+                "V_q pass, so its G≈0 shell is not formed yet.")
+        zeta_all = zeta_loader.shell            # (n_q_ibz, mu_pad, n_shell)
+        take_sel = zeta_loader.head_columns(np.asarray(table.sel))
+    else:
+        read_all = _make_read_all_ibz(zeta_loader, n_rmu_padded, mesh_xy)
+        zeta_all = read_all(n_q_ibz)              # (n_q_ibz, mu_pad, ngkmax)
+        take_sel = np.asarray(table.sel)
 
     policy = None
     if use_ibz:
@@ -869,7 +917,7 @@ def compute_head_channel_zeta(
             context="head-channel one-leg")
         from symmetry_maps import unfold_isdf_one_leg
 
-    sel_dev = jnp.asarray(np.asarray(table.sel, dtype=np.int32))
+    sel_dev = jnp.asarray(np.asarray(take_sel, dtype=np.int32))
     mask_dev = jnp.asarray(np.asarray(table.mask, dtype=np.float64),
                            dtype=jnp.complex128)
     g0_sh = NamedSharding(mesh_xy, P(None, 'x'))

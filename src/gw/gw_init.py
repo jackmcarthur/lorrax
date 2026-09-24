@@ -2242,13 +2242,18 @@ def _fit_charge_zeta_channel(
             "a non-reusable charge zeta reached fit_zeta without the canonical "
             "G-flat chunk plan")
     peak_bytes = 0
+    zeta_g = None
+    # zeta_q.h5 is written for the consumers that read it back: the restart /
+    # reuse / BSE bundle (write_restart_tensors) and the four-current V_q.
+    _write_zeta_file = bool(getattr(cfg, 'write_restart_tensors', True)
+                            or cfg.bispinor)
     if _reuse_charge:
         print_fn(f"  [zeta reuse] charge ζ accepted at {zeta_h5_path}; "
                  "charge fit skipped independently.")
     else:
         with timing.section("gw_jax.zeta_fit_chunked"), \
              jax_profile.trace_section("zeta_fit"):
-            peak_bytes = fit_zeta_to_h5(
+            peak_bytes, zeta_g = fit_zeta_to_h5(
                 wfn=wfn, sym=sym, meta=meta,
                 centroid_indices=centroid_indices, mesh_xy=mesh_xy,
                 chunk_r=chunks['chunk_r'], output_file=zeta_h5_path,
@@ -2279,6 +2284,7 @@ def _fit_charge_zeta_channel(
                 psi_nmu_parent=psi_nmu_parent,
                 psi_mun_parent=psi_mun_parent,
                 mubatch_plan=chunks.get('mubatch'),
+                write_zeta_file=_write_zeta_file,
             )
     if not _reuse_charge:
         _gate_fresh_zeta_rank_findings(
@@ -2297,7 +2303,8 @@ def _fit_charge_zeta_channel(
         print_fn( "  directory.")
         print_fn("  " + "!" * 68)
         print_fn("")
-    elif not _reuse_charge and jax.process_index() == 0:
+    elif (not _reuse_charge and jax.process_index() == 0
+          and (zeta_g is None or _write_zeta_file)):
         try:
             from file_io.isdf_header import stamp_fit_provenance
             stamp_fit_provenance(zeta_h5_path, _provenance)
@@ -2306,7 +2313,7 @@ def _fit_charge_zeta_channel(
                      f"will be refit on the next run.")
     if not _reuse_charge:
         barrier("zeta_provenance")
-    return peak_bytes, _trunc
+    return peak_bytes, _trunc, zeta_g
 
 
 def _report_zeta_fit_peak(
@@ -2552,7 +2559,7 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 		mu_L: path for mu_L, path in
 		enumerate(zeta_contract.zeta_transverse_paths, start=1)
 	}
-	(peak_bytes, _trunc) = _fit_charge_zeta_channel(
+	(peak_bytes, _trunc, zeta_g) = _fit_charge_zeta_channel(
 	    _band_norms, _provenance, _reuse_charge, _write_ibz_only_charge, _zeta_cutoff,
 	    band_range_left, band_range_right, centroid_indices, cfg, chunks, k_unfold_plan,
 	    mesh_xy, meta, print_fn, psi_mun_parent, psi_nmu_parent, representation, sym, wfn,
@@ -2566,7 +2573,8 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 	        _reuse_T, _transverse_batched_route, _trunc, _write_ibz_only_transverse, _zeta_T_paths,
 	        _zeta_cutoff, band_range_left, band_range_right, band_slices, cfg, mesh_xy, print_fn,
 	        representation, sym, wfn, zeta_contract)
-	return zeta_h5_path, mem_est, transverse_wfn_data
+	# The μ-batch fit hands V_q its ζ as (Z store, C⁺); a file path otherwise.
+	return (zeta_g if zeta_g is not None else zeta_h5_path), mem_est, transverse_wfn_data
 
 
 def _build_head_channel(zeta_io, *, cfg, meta, wfn, bvec, mesh_xy, sym,
@@ -2662,7 +2670,7 @@ def _vcoul_geometry_and_budget(
 def _vcoul_transverse_inputs(
         cfg, zeta_h5_path):
     """Produce the authenticated transverse zeta paths for Coulomb projection."""
-    zeta_dir = os.path.dirname(zeta_h5_path)
+    zeta_dir = os.path.dirname(getattr(zeta_h5_path, 'path', zeta_h5_path))
     zeta_T_paths = [
         os.path.join(zeta_dir, f"zeta_q_mu{mu_L}.h5") for mu_L in (1, 2, 3)
     ]
@@ -2780,9 +2788,13 @@ def _compute_scalar_vq(
         vcoul_cutoff_ry, wfn, zeta_h5_path):
     """Produce the scalar Coulomb operator and its live head views."""
     from .compute_vcoul import compute_all_V_q
+    import contextlib
+    # The μ-batch fit's ZetaG (Z store + C⁺) stands in for the file reader.
+    _zeta_ctx = (contextlib.nullcontext(zeta_h5_path)
+                 if hasattr(zeta_h5_path, 'contract_v')
+                 else ZetaLoader(zeta_h5_path, mesh=mesh_xy))
     with timing.section("gw_jax.V_q_compute"), jax_profile.trace_section("V_q_compute"):
-        with ZetaLoader(zeta_h5_path, mesh=mesh_xy,
-                        ) as zeta_io:
+        with _zeta_ctx as zeta_io:
             _cent_idx_np = (
                 np.asarray(jax.device_get(centroid_indices),
                            dtype=np.int32)
@@ -2809,6 +2821,8 @@ def _compute_scalar_vq(
                     centroid_indices=_cent_idx_np,
                     vcoul_cutoff_ry=vcoul_cutoff_ry,
                     print_fn=print_fn)
+    if hasattr(zeta_h5_path, 'contract_v'):
+        zeta_h5_path.close()
     return V_q_raw, G0_all, head_channel
 
 
@@ -2850,6 +2864,10 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 	(zeta_dir, zeta_T_paths, bispinor_ready) = _vcoul_transverse_inputs(
 	    cfg, zeta_h5_path)
 	if bispinor_ready:
+	    if hasattr(zeta_h5_path, 'contract_v'):
+	        # The four-current tiles read the charge ζ file the fit wrote.
+	        zeta_h5_path.close()
+	        zeta_h5_path = zeta_h5_path.path
 	    (V_q_raw, G0_all, head_channel, photon_g0_vectors) = _compute_photon_vq(
 	        bvec, centroid_indices, cfg, mesh_xy, meta, print_fn, sym, vcoul_cutoff_ry, wfn,
 	        zeta_T_paths, zeta_dir, zeta_h5_path)
