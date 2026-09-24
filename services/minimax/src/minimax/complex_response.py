@@ -63,20 +63,25 @@ def _poles(z):
     return np.asarray(poles)
 
 
-def _fits(lo, hi, poles, times, tol, decay_rate):
-    """Project every pole on shared times; stop at the first rejected pole."""
-    fits, worst = [], 0.
-    for pole in poles:
+def _fits(lo, hi, poles, times, tol, decay_rate, order=None):
+    """Project every pole on shared times; stop at the first rejected pole.
+
+    ``order`` is a caller-owned list of pole indices; a rejected pole moves to
+    its front, so the next candidate is tested on the hardest pole first.
+    """
+    order = list(range(len(poles))) if order is None else order
+    fits = [None]*len(poles)
+    worst = 0.
+    for position, index in enumerate(list(order)):
+        pole = poles[index]
         fit = _project(lo, hi, pole, times, decay_rate)
-        if fit is None:
-            return None, np.inf, False
-        error = float(np.max(fit[1]*[1., pole.imag/(2*abs(pole))]))
-        if not error <= tol or not np.isfinite(fit[2]).all():
-            return None, error, False
-        if fit[2][0] > _RESPONSE_MAX_KAPPA:
-            return None, error, True
+        error = np.inf if fit is None else float(np.max(fit[1]*[1., pole.imag/(2*abs(pole))]))
+        mass_rejected = fit is not None and error <= tol and fit[2][0] > _RESPONSE_MAX_KAPPA
+        if fit is None or not error <= tol or not np.isfinite(fit[2]).all() or mass_rejected:
+            order.insert(0, order.pop(position))
+            return None, error, bool(mass_rejected)
         worst = max(worst, error)
-        fits.append(fit)
+        fits[index] = fit
     return fits, worst, False
 
 
@@ -89,8 +94,9 @@ def _shared_times(lo, hi, poles, tol, previous=None, decay_rate=0.):
     per-pole linear projection of the single-pole construction, with the same
     sampled-error and coefficient-mass acceptance.
     """
+    order = list(range(len(poles)))
     if previous is not None and len(previous):
-        fits, _, _ = _fits(lo, hi, poles, previous, tol, decay_rate)
+        fits, _, _ = _fits(lo, hi, poles, previous, tol, decay_rate, order)
         if fits is not None:
             return previous, fits
     eta = float(poles.imag.min())
@@ -109,14 +115,23 @@ def _shared_times(lo, hi, poles, tol, previous=None, decay_rate=0.):
         step = (geometry+padding)/(2*size)
         base = -padding+(ids[:, None]+ids[None, :])*step
         blocks, shifted = [], []
+        # The shared exponentials live in the ROW space (index i). A column
+        # subset dense near j=0, where 1/(x-z_p) varies fastest, and geometric
+        # beyond spans it; the stack stays ~2*size wide for any group.
+        width = max(32, 2*size//len(zps))
+        columns = np.unique(np.r_[ids[:16], np.round(np.geomspace(16, size-1, width)).astype(int)])
         for zp in zps:
-            block = 1/(base-zp)
+            block = 1/(base[:, columns]-zp)
             scale = 1/la.norm(block)
             blocks.append(scale*block)
-            shifted.append(scale/(base+step-zp))
-        u, s, vh = la.svd(np.hstack(blocks), full_matrices=False, check_finite=False)
+            shifted.append(scale/(base[:, columns]+step-zp))
+        # The stack is size x (poles*size). Factor its tall adjoint once,
+        # H = R^H Q^H, and take the SVD of the small R^H: the same singular
+        # triplets as a direct SVD of the wide stack, at QR cost.
+        q, r = la.qr(np.hstack(blocks).conj().T, mode="economic", check_finite=False)
+        u, s, wh = la.svd(r.conj().T, check_finite=False)
         rank = min(RESPONSE_RULE_CAPACITY, len(s))
-        shift = u[:, :rank].conj().T@np.hstack(shifted)@vh[:rank].conj().T
+        shift = u[:, :rank].conj().T@(np.hstack(shifted)@q)@wh[:rank].conj().T
         best, best_n = np.inf, 0
         for n in range(8, rank + 1, 4):
             roots = la.eigvals(shift[:n, :n]/np.sqrt(s[:n, None]*s[None, :n]),
@@ -130,7 +145,7 @@ def _shared_times(lo, hi, poles, tol, previous=None, decay_rate=0.):
                 times = times[times.real <= decay_rate]
             if not len(times):
                 continue
-            fits, error, mass_rejected = _fits(lo, hi, poles, times, tol, decay_rate)
+            fits, error, mass_rejected = _fits(lo, hi, poles, times, tol, decay_rate, order)
             if fits is not None:
                 return times, fits
             if mass_rejected:

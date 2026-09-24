@@ -1237,15 +1237,16 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
         raw_group = integrate_response_group(wfns, meta, mesh_xy, rules, group,
             q_ids=response_rows, execute=execute, receipt=receipt,
             ordered=ordered, vertex=vertex)
-        for row, sample in enumerate(members):
-            if np.asarray(header["sample_written"])[:,sample].all():
-                progress.step()
-                continue
-            raw = raw_group[2*row:2*row+2]
-            io_started = time.monotonic()
-            with shared_pole_bank_writer(bank_io["path"], meta=meta,
-                    expected_identity=bank_io["identity"], mesh_xy=mesh_xy) as (bank_handle, header, write):
-                receipt["seconds"]["io"] = receipt["seconds"].get("io",0.)+time.monotonic()-io_started
+        io_started = time.monotonic()
+        # One collective writer transaction per group, not per sample.
+        with shared_pole_bank_writer(bank_io["path"], meta=meta,
+                expected_identity=bank_io["identity"], mesh_xy=mesh_xy) as (bank_handle, header, write):
+            receipt["seconds"]["io"] = receipt["seconds"].get("io",0.)+time.monotonic()-io_started
+            for row, sample in enumerate(members):
+                if np.asarray(header["sample_written"])[:,sample].all():
+                    progress.step()
+                    continue
+                raw = raw_group[2*row:2*row+2]
                 for mirror in range(2 if literal_mirrors else 1):
                     marked = np.asarray(header["sample_written"], bool)[:,sample,2*mirror:2*mirror+2]
                     # A fresh frequency is one q_irr slab. Partial restarts keep
@@ -1323,8 +1324,8 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                 receipt["batches"].append(dict(sample=sample, group=members))
                 del raw
                 progress.step()
-                io_started = time.monotonic()
-            receipt["seconds"]["io"] += time.monotonic()-io_started
+            io_started = time.monotonic()
+        receipt["seconds"]["io"] += time.monotonic()-io_started
         del raw_group
     progress.finish()
     if jax.process_index() == 0:
