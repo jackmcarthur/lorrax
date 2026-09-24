@@ -51,6 +51,19 @@ def round_up(n: int, divisor: int) -> int:
     return ((int(n) + d - 1) // d) * d
 
 
+def ladder_extent(n: int, cap: int | None = None) -> int:
+    """``n`` rounded up to an eighth of its leading power of two, at most ``cap``.
+
+    For an extent that moves from call to call (a retained rank, a round's
+    selection): at most 12.5 % padding and eight values per octave, so the
+    carrier, and every program keyed by it, repeats across rounds and SC maps.
+    Round to a mesh divisor afterwards (``padded_axis``).
+    """
+    n = int(n)
+    value = round_up(n, 1 << max(0, n.bit_length() - 4))
+    return value if cap is None else min(int(cap), value)
+
+
 def round_down(n: int, divisor: int) -> int:
     """Round ``n`` down to a nonnegative multiple of ``divisor``."""
     value = max(int(n), 0)

@@ -506,7 +506,10 @@ def construct_diagonal_sector_round(samples, moments, meta, config, geometry, *,
                 selection_faces=selection_faces)
     eig=budget.eigenplan(local_meta.n_rmu_padded)
     svd=budget.eigenplan(2*local_meta.n_rmu_padded)
-    extent=lambda width:padded_axis(width,mesh_xy,name='shared_pole_port',
+    # Direction ranks move between rounds and maps; their carriers sit on the
+    # extent ladder so the selection and round programs repeat.
+    from runtime.padding import ladder_extent
+    extent=lambda width:padded_axis(ladder_extent(width,n),mesh_xy,name='shared_pole_port',
         specs=((P('x','y'),0),(P('x','y'),1))).carrier
     qi,values=leading_response_directions(moments['M1'],min(n,recipe['infinity_width']),
         eigh_plan=eig,column_extent=extent,multiplet_tol=recipe['multiplet_relative_tolerance'],
@@ -590,7 +593,13 @@ def construct_cross_sector_round(sectors, samples, moments, meta, config, *,
     # Cross assembly has rectangular original pencils; only the projected
     # retained pair is square. Keep those two extents distinct in the ledger.
     original_sides = tuple(s['coefficients'].shape[-2] for s in sectors)
-    widths = [int(jnp.max(jnp.sum(s['signed'][2],axis=-1))) for s in sectors]
+    # The compacted span is the round's largest retained count on the extent
+    # ladder, so rounds and SC maps share the compaction and cross-reduction
+    # executables; the extra columns are inactive, as they already are for a
+    # parent below the round's maximum.
+    from runtime.padding import ladder_extent
+    widths = [ladder_extent(int(jnp.max(jnp.sum(s['signed'][2],axis=-1))), s['signed'][2].shape[-1])
+              for s in sectors]
     if execution == 'face':
         from runtime.padding import padded_axis
         widths = [padded_axis(width,mesh_xy,name='shared_pole_port',
@@ -848,10 +857,10 @@ def _local_cross_parent_program(mesh,native_eigh):
     import jax
     from common.shard_map import shard_map
     from jax.sharding import PartitionSpec as P
-    from gw.shared_pole_local import _mm
+    from gw.shared_pole_local import _mm, zero_row_safe_eigh
     from gw.shared_pole_recipe import shared_real_pole_gates_ordered_v1 as gates
     spec=P(('x','y'))
-    body=partial(_cross_reduce_equations,mm=_mm,eigh=native_eigh,gates=gates)
+    body=partial(_cross_reduce_equations,mm=_mm,eigh=zero_row_safe_eigh(native_eigh),gates=gates)
     return jax.jit(shard_map(body,mesh=mesh,in_specs=(spec,)*4,
                             out_specs=(spec,spec),check_vma=False))
 
@@ -1102,7 +1111,8 @@ def sector_execution(meta, config, mu_bases, nq, *, mesh_xy, upstream):
             fraction=policy.get(field+'_fraction')
             result[field]=None if fraction is None else math.ceil(n*fraction)
         return result
-    extent=lambda width:padded_axis(width,mesh_xy,name='shared_pole_port',
+    from runtime.padding import ladder_extent
+    extent=lambda width:padded_axis(ladder_extent(width),mesh_xy,name='shared_pole_port',
         specs=((P('x','y'),0),(P('x','y'),1))).carrier
     execution_rows=[]
     for family,basis in enumerate(mu_bases):
