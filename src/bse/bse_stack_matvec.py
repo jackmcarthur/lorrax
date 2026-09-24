@@ -135,8 +135,34 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from common.shard_map import shard_map as _shard_map_fn
 
+from common.contract_bands import reduce_scatter_to_band_block
 from common.fft_helpers import make_kconv_kminor, make_local_kconv_kminor
 from .bse_ring_comm import make_bse_shardings
+
+
+def _gather_trial_block(X):
+    """(b, c_loc, v_loc, nk) → the WHOLE (b, c, v, nk) trial block, once.
+
+    The trial vector is the smallest tensor in the chain (T carries two ζ
+    axes, R one) and carries no ζ axis at all, so gathering IT — once per
+    block, never per trial — keeps both ζ legs stationary in every encode.
+    Per rank this holds ``b·c·v·nk·16`` bytes (Si 836c at P4: 49 KB per
+    trial), the one replicated operand of the W term.
+    """
+    return lax.all_gather(lax.all_gather(X, "y", axis=2, tiled=True),
+                          "x", axis=1, tiled=True)
+
+
+def _scatter_trial_block(WX, mesh_xy):
+    """Σ over the mesh of the (b, c, v, nk) decode partial → (b, c_x, v_y, nk).
+
+    The ONE reduction of the W term per block (the slab-contraction
+    primitive, ``common.contract_bands``): each rank's partial holds its
+    (μ_loc, ν_loc) share of both decode sums.
+    """
+    return reduce_scatter_to_band_block(
+        WX, px=int(mesh_xy.shape["x"]), py=int(mesh_xy.shape["y"]),
+        row_axis=1, col_axis=2)
 
 
 # ===========================================================================
@@ -154,17 +180,20 @@ from .bse_ring_comm import make_bse_shardings
 #           and the numbers behind it are stated once, at the site it governs:
 #           ``_conv_decode``'s "THIS IS AN FFT AND IT STAYS AN FFT".]
 #
-# The 'y'-axis collective hoist is PERMANENT (was ``yhoist``, made
-# unconditional 2026-08-08).  ``all_gather(X_b,'y')`` and the final
-# ``psum_scatter(...,'y')`` are the two SMALL collectives -- the operand is
-# (c_loc, v, nk), 2 KB per trial at P=64 against 426 KB for the 'x' pair -- so
-# batching them over the trial axis costs 16 KB per rank in total and removes
-# 2 of the 4 collectives per trial.  The 'x' pair is deliberately NOT hoisted:
-# batching those needs an (n_trials, c, nk, ns, nu_loc) staging buffer, 3.4 MB
-# per rank, an n_trials-fold replication of a T-adjacent intermediate -- the
-# memory-for-comm trade the owner has vetoed.  The accounting is per-rank
-# bytes, and it is the whole argument for why one half of this is allowed and
-# the other is not.
+# The W term runs NO collective per trial (survey_C §C1, 2026-09-24).  The
+# trial block X (b, c, v, nk) -- the smallest tensor in the chain, with no ζ
+# axis -- is all-gathered over both mesh axes ONCE per block, both encodes
+# build their partials with the full c and v locally, the decode contracts
+# through this rank's μ_loc and ν_loc into a (b, c, v, nk) partial, and ONE
+# reduce-scatter after the scan completes both sums
+# (``common.contract_bands.reduce_scatter_to_band_block``).  This retires the
+# per-trial 'x' pair (an all-gather of R and a psum_scatter of A, 426 KB per
+# trial at P=64) WITHOUT the (n_trials, c, nk, ns, nu_loc) staging buffer that
+# made hoisting that pair a vetoed memory-for-comm trade: the block-sized
+# operands here are X-class, b·c·v·nk.  The price is the two small
+# ζ-free GEMMs running over c_full instead of c_loc, (p_x-1)·v/(ns·μ_loc) of
+# the encode's flops.  (Was: the 'y' pair hoisted per block since
+# 2026-08-08, the 'x' pair per trial.)
 #
 #   gspmd   AUDIT ROUTE, default OFF.  Build the W term with NO ``shard_map``:
 #           the same einsum chain and the same ``lax.scan`` over trials, but
@@ -227,22 +256,25 @@ def matvec_opts() -> frozenset[str]:
 # ===========================================================================
 
 def _encode_T_A(X_b, psi_c_X, psi_v_Y):
-    """A-block ISDF encode.  ``X_b`` (c_loc, v_full, nk) -> T (μ_loc,ν_loc,ns,ns,nk).
+    """A-block ISDF encode.  ``X_b`` (c_full, v_full, nk) -> T (μ_loc,ν_loc,ns,ns,nk).
 
     ``T[μ,ν,t,s,k] = Σ_c ψ^X_c[k,c,t,μ] Σ_v conj(ψ^Y_v[k,v,s,ν]) X[c,v,k]``.
-    μ rides 'x' (from ``psi_c_X``), ν rides 'y' (from ``psi_v_Y``).
+    μ rides 'x' (from ``psi_c_X``), ν rides 'y' (from ``psi_v_Y``).  The trial
+    block arrives WHOLE (gathered once per block by the caller), so both ζ
+    legs are produced in stationary accumulators and nothing crosses the
+    mesh here (survey_C §C1, reports/gwjax_algorithmic_upgrades_2026-09-24).
     """
-    R = jnp.einsum("kvsN,cvk->cksN", jnp.conj(psi_v_Y), X_b)   # (c_loc,nk,ns,ν_loc)
-    Rc = lax.all_gather(R, "x", axis=0, tiled=True)            # (c_full,...)
-    return jnp.einsum("kctM,cksN->MNtsk", psi_c_X, Rc)
+    R = jnp.einsum("kvsN,cvk->cksN", jnp.conj(psi_v_Y), X_b)   # (c_full,nk,ns,ν_loc)
+    return jnp.einsum("kctM,cksN->MNtsk", psi_c_X, R)
 
 
 def _encode_T_B(Xb_b, psi_c_Y, psi_v_X):
     """Coupling-block ISDF encode -- the c<->v leg swap (Henneke Eq. 4-3).
 
     ``T[μ,ν,t,s,k] = Σ_v ψ^X_v[k,v,t,μ] Σ_c conj(ψ^Y_c[k,c,s,ν]) X[c,v,k]``,
-    ``Xb_b`` arrives as (c_full, v_loc, nk) and is gathered to
-    (c_full, v_full, nk) here, so BOTH ζ legs stay stationary.  The legs
+    ``Xb_b`` arrives WHOLE, (c_full, v_full, nk) — gathered once per block by
+    the caller — so BOTH ζ legs stay stationary and nothing crosses the mesh
+    here.  The legs
     swap but the SHARDING does not: μ still rides 'x' (now from
     ``psi_v_X``) and ν still rides 'y' (now from ``psi_c_Y``), so this T is
     add-compatible with ``_encode_T_A``'s with no collective and no
@@ -265,8 +297,7 @@ def _encode_T_B(Xb_b, psi_c_Y, psi_v_X):
     # the port carried that file's defect here, so it takes that file's fix.
     # X is the smallest tensor in the chain -- T carries TWO ζ axes, R carries
     # one -- so this takes the T- and R-sized tensors off the wire entirely.
-    Xb_full = lax.all_gather(Xb_b, "y", axis=1, tiled=True)    # (c_full,v_full,nk)
-    R = jnp.einsum("kcsN,cvk->vksN", jnp.conj(psi_c_Y), Xb_full)  # (v_full,nk,ns,ν_loc)
+    R = jnp.einsum("kcsN,cvk->vksN", jnp.conj(psi_c_Y), Xb_b)  # (v_full,nk,ns,ν_loc)
     return jnp.einsum("kvtM,vksN->MNtsk", psi_v_X, R)
 
 
@@ -288,17 +319,17 @@ def _conv_decode(T_b, psi_c_X, psi_v_Y, W_R, kconv, sqrt_nk):
     under any name, on any measurement.  If the k-transform is a bottleneck the
     answer is a better FFT library, never a denser algorithm.
 
-    decode: ``(WX)_b = (1/√Nk) Σ_{μ,ν,t,s} conj(ψ_c) ψ_v U_b``.  psum_scatter
-    completes the μ-sum while scattering c→x; the ν-sum's scatter to 'y' is
-    hoisted OUT of the scan by the caller.
+    decode: ``(WX)_b = (1/√Nk) Σ_{μ,ν,t,s} conj(ψ_c) ψ_v U_b``, contracted
+    through THIS rank's μ_loc and ν_loc only: the result is the rank's
+    ``(c_full, v_full, nk)`` PARTIAL, and the caller completes both sums
+    with one reduce-scatter per block after the scan — no collective per
+    trial.
     """
     mu_loc, nu_loc = T_b.shape[0], T_b.shape[1]
     U_b = kconv(T_b[None], W_R.reshape(mu_loc, nu_loc, -1))[0]
 
-    A = lax.psum_scatter(
-        jnp.einsum("kctM,MNtsk->cNsk", jnp.conj(psi_c_X), U_b),
-        "x", scatter_dimension=0, tiled=True)               # (c_loc, ν_loc, ns, nk)
-    WXcv = jnp.einsum("kvsN,cNsk->cvk", psi_v_Y, A)         # (c_loc, v_full, nk)
+    A = jnp.einsum("kctM,MNtsk->cNsk", jnp.conj(psi_c_X), U_b)  # (c_full, ν_loc, ns, nk)
+    WXcv = jnp.einsum("kvsN,cNsk->cvk", psi_v_Y, A)             # (c_full, v_full, nk)
     return WXcv / sqrt_nk
 
 
@@ -372,27 +403,23 @@ def build_bse_stack_matvec(
         # (2026-07-16); the fp32-GMRES path casts upstream in bse_feast, not here.
         sqrt_nk = jnp.sqrt(jnp.asarray(nk, dtype=X.real.dtype))
 
-        def _body(carry, X_b):                       # X_b: (c_loc, v_full, nk)
+        def _body(carry, X_b):                       # X_b: (c_full, v_full, nk)
             # encode: T_b[μ,ν,t,s,k] = Σ_c ψ_c[k,c,t,μ] Σ_v conj(ψ_v[k,v,s,ν]) X_b
-            # The 'y' all-gather already happened OUTSIDE the scan, so X_b
-            # arrives as (c_loc, v_full, nk) — one collective per BLOCK
-            # instead of one per trial.  Encode / conv+decode are the shared
-            # module-level stages (``_encode_T_A`` / ``_conv_decode``); the
-            # coupling block reuses the SAME ``_conv_decode``, which is what
-            # makes the non-TDA fusion exact.
+            # NO COLLECTIVE IN THIS BODY (survey_C §C1): X_b arrives whole,
+            # and the decode returns this rank's (μ_loc, ν_loc) partial.
+            # Encode / conv+decode are the shared module-level stages
+            # (``_encode_T_A`` / ``_conv_decode``); the coupling block reuses
+            # the SAME ``_conv_decode``, which is what makes the non-TDA
+            # fusion exact.
             T_b = _encode_T_A(X_b, psi_c_X, psi_v_Y)
-            # NB no per-trial psum_scatter on 'y' inside _conv_decode: it is
-            # hoisted to one scatter for the whole block, after the scan.
             return carry, _conv_decode(T_b, psi_c_X, psi_v_Y, W_R, kconv, sqrt_nk)
 
-        # ONE 'y' all-gather for the whole block instead of n_trials of them.
-        # Operand (n_trials, c_loc, v_loc, nk) -> (…, v_full, …): 16 KB per
-        # rank at P=64, against the 11.08 MB T_b the scan body already holds.
-        # The scan carries no extra T-class buffer.
-        X = lax.all_gather(X, "y", axis=2, tiled=True)
-        _, WX = lax.scan(_body, None, X)             # WX: (n_trials, c_loc, v_*, nk)
-        WX = lax.psum_scatter(WX, "y", scatter_dimension=2, tiled=True)
-        return WX
+        # Once per block: gather the trial block, scan, reduce once.  The
+        # per-trial 'x' all-gather of R and psum_scatter of A are gone; the
+        # partial the scan stacks is (n_trials, c, v, nk), X-sized, never a
+        # T-class buffer.
+        _, WX = lax.scan(_body, None, _gather_trial_block(X), unroll=1)
+        return _scatter_trial_block(WX, mesh_xy)
 
     # ── W term, GSPMD twin: same math, same scan, NO shard_map ────────────────
     # Audit route (``LORRAX_BSE_MATVEC_OPT=gspmd``).  Line-for-line the same
@@ -402,11 +429,15 @@ def build_bse_stack_matvec(
     # manual collective produces -- so if the partitioner is any good it should
     # emit the same four collectives.  Whether it does is the experiment.
     #
-    #   manual                                    | gspmd hint
+    #   pre-C1 manual schedule (per trial)        | gspmd hint
     #   all_gather(X_b, 'y', axis=1)              | wsc(X_b,  P('x', None, None))
     #   all_gather(R,   'x', axis=0)              | wsc(R,    P(None, None, None, 'y'))
     #   psum_scatter(..., 'x', scatter_dim=0)     | wsc(A,    P('x', 'y', None, None))
     #   psum_scatter(..., 'y', scatter_dim=1)     | wsc(WXcv, P('x', 'y', None))
+    #
+    # The manual body no longer issues these per trial (survey_C §C1); this
+    # twin still mirrors the 2026-08-08 schedule and stays an audit A/B of
+    # THAT plan.
     #
     # The convolution necessarily changes door: with no enclosing shard_map
     # this route uses the router's sharded k-minor door (``make_kconv_kminor``),
@@ -563,18 +594,17 @@ def build_bse_stack_pair_matvec(
     # ── W term: one shard_map over ('x','y') — the SAME single region the TDA
     #    stack matvec opens.  No new shard_map is created by the coupling port:
     #    the B encode is an einsum pair plus one all_gather INSIDE this body.
-    def _w_pair(X, Xb, sc, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, W_R):
-        # Local shards: X, Xb (n_trials, c_loc, v_loc, nk); psi_*_X (…, μ_loc);
+    def _w_pair(X, sc, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, W_R):
+        # Local shards: X (n_trials, c_loc, v_loc, nk); psi_*_X (…, μ_loc);
         # psi_*_Y (…, ν_loc); W_R (μ_loc, ν_loc, kx, ky, kz).
         sqrt_nk = jnp.sqrt(jnp.asarray(nk, dtype=X.real.dtype))
 
-        # Two block-level gathers, both hoisted OUT of the scan.  The A encode
-        # wants v replicated; the B encode wants c replicated.  Both operands
-        # are (n_trials, c_loc, v_loc, nk) — 16 KB per rank at P=64 — against
-        # the 11 MB T the scan body already holds, so this is the same trade
-        # the permanent 'y' hoist already makes, taken twice.
-        X_y = lax.all_gather(X, "y", axis=2, tiled=True)    # (b, c_loc, v_full, nk)
-        Xb_x = lax.all_gather(Xb, "x", axis=1, tiled=True)  # (b, c_full, v_loc, nk)
+        # ONE block-level gather, hoisted OUT of the scan: both encodes take
+        # the whole trial block, and Xb = conj(X) is formed locally from it
+        # (conj commutes with the gather exactly, so this is the same array
+        # a second gather of Xb would deliver).  No collective runs per trial.
+        X_full = _gather_trial_block(X)                     # (b, c, v, nk)
+        Xb_full = jnp.conj(X_full)
 
         def _body_fused(carry, xs):
             X_b, Xb_b = xs
@@ -595,13 +625,13 @@ def build_bse_stack_pair_matvec(
             return carry, WA + sc * WB
 
         _, WX = lax.scan(_body_fused if fuse else _body_unfused,
-                         None, (X_y, Xb_x))
-        return lax.psum_scatter(WX, "y", scatter_dimension=2, tiled=True)
+                         None, (X_full, Xb_full), unroll=1)
+        return _scatter_trial_block(WX, mesh_xy)
 
     w_pair = _shard_map_fn(
         _w_pair,
         mesh=mesh_xy,
-        in_specs=(P(None, "x", "y", None), P(None, "x", "y", None), P(),
+        in_specs=(P(None, "x", "y", None), P(),
                   P(None, None, None, "x"), P(None, None, None, "y"),
                   P(None, None, None, "x"), P(None, None, None, "y"),
                   P("x", "y", None, None, None)),
@@ -638,7 +668,7 @@ def build_bse_stack_pair_matvec(
         if not include_W:
             return D_term + VX
 
-        WX = w_pair(X, Xb, sc, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, W_R)
+        WX = w_pair(X, sc, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, W_R)
         return D_term + VX - WX
 
     return jax.jit(
