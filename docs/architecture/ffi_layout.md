@@ -739,9 +739,9 @@ anything else → refusal), and no environment variable picks a route.
 | Layer | What |
 |---|---|
 | 1 consumer | ζ fit: `isdf.core` tails (`c_q_downfold`, `c_q_from_psi_sm`, `_z_q_face_parent`, `parent_projector_kconv`) and the route-G plane group (`isdf.zeta_mubatch.make_route_g_kernel`).  Σ: `gw.ppm_tau_kernel.get_sigma_spatial_kernel`, `gw.cohsex_sigma._make_static_convolution`.  BSE: `bse_stack_matvec._conv_decode`, `bse_ring_comm._make_ring_rung`, and the W_R builds (`bse_densify.make_w_densifier`, `bse_lanczos`, `davidson_absorption`, `absorption_haydock`, `bse_nontda`, `exciton_bands`) |
-| 2 facade / router | `ffi/fft.py` (re-exported by `common.fft_helpers`): `make_fused_conv_kpair`, `make_fused_conv_kparent`, `make_fused_conv_kplane`, `make_kconv_klead` (→ `KConvStored(prep, apply)`), `make_kconv_kminor` / `make_local_kconv_kminor`, `make_kfft_klead` / `make_local_kfft_klead`, `make_kfft_kminor` / `make_local_kfft_kminor`; `get_donated_kfft_kminor` is the memoised donating W_R transform |
-| 3 gate | startup `require_kconv`: on CUDA the wheel's headers must be found (`importlib` spec of `nvidia.mathdx`), else `GATE mathdx-headers`, and all seven targets must be registered; axes ≤ 40 (`GATE mathdx-kconv-axis`); a row that does not fit shared memory is `GATE mathdx-kconv-residency` |
-| 4 target | `lorrax_mathdx_kconv_pair`, `_kconv_parent`, `_kconv_plane`, `_kconv_klead`, `_kfft_klead`, `_kconv_kminor`, `_kfft_kminor` |
+| 2 facade / router | `ffi/fft.py` (re-exported by `common.fft_helpers`): `make_fused_conv_kpair`, `make_fused_conv_kparent`, `make_fused_conv_kplane`, `make_kconv_klead_unfold`, `make_kconv_klead` (→ `KConvStored(prep, apply)`), `make_kconv_kminor` / `make_local_kconv_kminor`, `make_kfft_klead` / `make_local_kfft_klead`, `make_kfft_kminor` / `make_local_kfft_kminor`; `get_donated_kfft_kminor` is the memoised donating W_R transform |
+| 3 gate | startup `require_kconv`: on CUDA the wheel's headers must be found (`importlib` spec of `nvidia.mathdx`), else `GATE mathdx-headers`, and all eight targets must be registered; axes ≤ 40 (`GATE mathdx-kconv-axis`); a row that does not fit shared memory is `GATE mathdx-kconv-residency` |
+| 4 target | `lorrax_mathdx_kconv_pair`, `_kconv_parent`, `_kconv_plane`, `_kconv_klead`, `_kconv_klead_unfold`, `_kfft_klead`, `_kconv_kminor`, `_kfft_kminor` |
 | 5 handler | `cpp/cufft/kconv_mathdx_cuda_ffi.cc`: one embedded cuFFTDx source, NVRTC-built per (mode, nkx, nky, nkz, ns, precision, CUcontext); in-process cache plus the disk cubin cache below |
 
 The modes of the one kernel source:
@@ -754,12 +754,14 @@ The modes of the one kernel source:
 | 3 klead fft | `s·FFT^±(X)` | flat k leading `(nk, rows)` | 1 |
 | 4 kminor conv | `s·FFT(IFFT(X)·K_R)`, store layout 0 (X's) or 1 `(d0,nk,d3,d1,d4,d2)` | k minor `(d0..d4, nk)` | 1 |
 | 5 kminor fft | `s·FFT^±(X)` | k minor `(rows, nk)` | 1 |
+| 7 klead unfold conv | mode 2 read from the raw-parent Green `G` (and its antiunitary partner `Gt`) through `symmetry_maps.unfold_load_tables`: parent row, both endpoint gathers, umklapp phases and the ns×ns spin action on load, spin-major store | `G, Gt (n_par, mu·ns, nu·ns)`, `V_R (nk, mu, nu)` → `U (nk,ns,mu,ns,nu)` | 1 (rows in whole ns² spin groups) |
 | 6 plane | mode 1 on the identity plan, loaded from the route-G D-plane FFT output: Bloch phase `F[k,g,p]` and the L/R split of the `2c` slot axis applied on load | `D (nk,g,ns,2c,ns,p)`, `F (nk,g,p)` → `U (nk,c,g·p)` | 3 |
 
 Mode 6 forms the product `F·D` with the same two FMAs XLA:GPU emits for an HLO
 complex multiply, so it reproduces the chain it replaced (XLA moveaxis, phase
-and split, then mode 1) bit for bit; `tests/multi_device/kconv_router_p4.py`
-checks that.  Modes 2–5 also compile a complex64 image (the fp32-GMRES BSE arm); modes 2,
+and split, then mode 1) bit for bit; mode 7 does the same for the Σ chain (the
+XLA unfold's `(mph·G)·nph`, then the spin-rotate FFI's `U·G·U†` accumulation
+order).  `tests/multi_device/kconv_router_p4.py` checks both.  Modes 2–5 also compile a complex64 image (the fp32-GMRES BSE arm); modes 2,
 3 and 5 run in place.  The cpu legs are compositions on the host plan
 handlers: the Σ convolution is the FFTW `gw_conv` host handler (`prep` is the
 identity there, because that handler transforms W itself), everything else is

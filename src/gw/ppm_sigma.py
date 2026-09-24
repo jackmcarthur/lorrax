@@ -639,7 +639,7 @@ def _compute_invalid_static_sigma(
     from common.collectives import gather_to_host
     from symmetry_maps import unfold_file_wedge_band_operator
     from .cohsex_sigma import build_Gij, _occ_diag_full
-    from .greens_function_kernel import build_G
+    from .greens_function_kernel import build_G_parents
 
     Gij = build_Gij(meta, mesh_xy, occupation_state)
     face_kwargs = sigma_face_kernel_kwargs(wfns)
@@ -673,7 +673,7 @@ def _compute_invalid_static_sigma(
         nb_full = int(s.nb_full)
         phases = _occ_diag_full(Gij, s.nb_sigma, nb_full)
         phases = k_unfold_plan.parent_rows(phases)
-        G_occ = build_G(g_mun, g_nmu, phases=phases,
+        G_occ = build_G_parents(g_mun, g_nmu, phases=phases,
                         real_weights=not jnp.issubdtype(phases.dtype, jnp.complexfloating),
                         layout=wfns.layout, gemm=g_plan,
                         k_unfold_plan=k_unfold_plan)
@@ -685,7 +685,7 @@ def _compute_invalid_static_sigma(
         del G_occ, sig_sx
 
         mask = g_carrier.band_mask(s.sigma_sum)
-        G_ri = build_G(g_mun, g_nmu, phases=mask, real_weights=True,
+        G_ri = build_G_parents(g_mun, g_nmu, phases=mask, real_weights=True,
                        layout=wfns.layout, gemm=g_plan,
                        k_unfold_plan=k_unfold_plan)
         sig_ri = spatial.conv_project(psi_xr, psi_yn, G_ri, W_prep)
@@ -746,7 +746,7 @@ def _invalid_static_coh_by_bracket(
     """
     from common.collectives import gather_to_host
     from symmetry_maps import unfold_file_wedge_band_operator
-    from .greens_function_kernel import build_G
+    from .greens_function_kernel import build_G_parents
 
     face_kwargs = sigma_face_kernel_kwargs(wfns)
     k_unfold_plan = wfns.green_parent.plan
@@ -772,7 +772,7 @@ def _invalid_static_coh_by_bracket(
         for lo, hi in brackets:
             mask = g_carrier.band_mask(
                 slice(int(lo), int(hi)))
-            G_ri = build_G(g_mun, g_nmu, phases=mask, real_weights=True,
+            G_ri = build_G_parents(g_mun, g_nmu, phases=mask, real_weights=True,
                            layout=wfns.layout, gemm=g_plan,
                            k_unfold_plan=k_unfold_plan)
             sig_ri = spatial.conv_project(psi_xr, psi_yn, G_ri, W_prep)

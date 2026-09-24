@@ -204,6 +204,19 @@ class CentroidKUnfoldPlan:
             axis_local=True,
         )
 
+    def unfold_load_tables(self):
+        """:meth:`unfold_operator` as load tables (``symmetry_maps.unfold_load_tables``), same arguments.
+
+        For a consumer that reads the parent Green and does the typed unfold
+        on its own load (``ffi.fft.make_kconv_klead_unfold``).
+        """
+        from symmetry_maps import unfold_load_tables
+        return unfold_load_tables(
+            irr_idx=self.irr_idx, sym_idx=self.sym_idx, sym_perm=self.sym_perm,
+            L_table=self.L_table, k_irr_frac=self.k_parent_frac,
+            spin_action_full=self.spin_action_full, n_sym_spatial=self.n_sym_spatial,
+            mesh_xy=self.mesh_xy, logical_centroid_extent=self.n_centroid_packed)
+
 
 
 def build_centroid_k_unfold_plan(
