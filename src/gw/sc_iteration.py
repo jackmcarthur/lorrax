@@ -2883,27 +2883,25 @@ def _sc_sampled_support(inputs, partition, energies_loop, mu_ev):
     return sampled_grid, expanded_grid, energy_relative_ev, required_kn
 
 
-def _fit_sum_band_tail(fit_kwargs, fit_mask_kn, sigma0_kn, previous_fit):
+def _fit_sum_band_tail(fit_kwargs, fit_mask_kn, sigma0_kn):
     """Owner ruling 2026-09-24: the sum-band tail law averages only states
     that consume Sigma(E_nk).  A state on the Sigma(omega=0) fallback this
     map (``sigma0_kn``, the uncovered set of ``qsgw_utils.omega_coverage``
     on the grid build_qsgw_sigma_xc uses) is excluded, so its energy cannot
     move the tail: on Fe 4^3 three such states set a 14.9 meV tail shift.
 
-    No qualifying conduction state: keep ``previous_fit`` (the last map's
-    law, itself Sigma(E)-only), else no tail law (E_DFT).  Returns
-    ``(fit or None, n_excluded, note)``.
+    No qualifying conduction state: no tail law (E_DFT), said in the log.
+    Never a previous map's law: the map reads only its carry
+    (tests/test_sc_sigma_retention.py).  Returns ``(fit or None,
+    n_excluded, note)``.
     """
     sigma0_kn = np.asarray(sigma0_kn, dtype=bool)
     n_excluded = int(np.count_nonzero(fit_mask_kn & sigma0_kn))
     fit = fit_scissor(fit_mask_kn=fit_mask_kn & ~sigma0_kn, **fit_kwargs)
     if int(fit.n_fit_c) > 0:
         return fit, n_excluded, ""
-    if previous_fit is not None and int(previous_fit.n_fit_c) > 0:
-        return previous_fit, n_excluded, (
-            "no conduction state consumes Sigma(E); previous map's law kept")
     return None, n_excluded, (
-        "no conduction state consumes Sigma(E) and no previous law; tail at E_DFT")
+        "no conduction state consumes Sigma(E); no tail law, tail at E_DFT")
 
 
 def _state_partition(state: SCState, inputs: SCInputs) -> BandPartition:
@@ -3421,8 +3419,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
                 if inputs.config.sc.tail_fit == "frontier" else None),
             conduction_rigid_mean=(
                 inputs.config.sc.tail_fit == "conduction_mean"),
-        ), fit_mask_kn, sigma0_kn,
-            None if state.outputs is None else state.outputs.tail_scissor_fit)
+        ), fit_mask_kn, sigma0_kn)
         if tail_note:
             _record_sc(inputs, f"    SC sum-band tail: {tail_note}")
     if tail_fit is not None:
