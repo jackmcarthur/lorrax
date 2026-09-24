@@ -1071,8 +1071,16 @@ def fit_zeta_to_h5(
         # parent kernel metadata until the final close below.
         psi_G_store.release_host_tiles()
     elif jax.process_index() == 0:
+        from gw.gflat_memory_model import zeta_fft_k_tile
+        from runtime.padding import mesh_divisor
+        _zeta_k_rows = int(psi_G_store.local_band_chunk_shape[0])
+        _zeta_k_tile = zeta_fft_k_tile(
+            n_k_rows=_zeta_k_rows,
+            band_chunk=int(psi_G_store.band_chunk_carrier),
+            p_band=mesh_divisor(mesh_xy))
         print_fn("  ψ(r) cache: disabled by the low-memory plan; streaming "
-                 "one ψ(G) band chunk per r chunk")
+                 "one ψ(G) band chunk per r chunk in k tiles of "
+                 f"{_zeta_k_tile} of {_zeta_k_rows} rows")
 
     # ========== STEP 6: Loop over chunks ==========
     # Wall-clock totals for the end-of-fit timing line.  ``t_fit_total``

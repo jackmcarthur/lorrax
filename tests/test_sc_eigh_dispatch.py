@@ -35,8 +35,9 @@ import jax.numpy as jnp                                        # noqa: E402
 from jax.sharding import Mesh                                  # noqa: E402
 
 from gw import sc_iteration                                    # noqa: E402
-from gw.sc_iteration import (                                  # noqa: E402
-    _SC_EIGH_TILE_BUDGET_FRACTION, _resolve_sc_eigh)
+from gw.qsgw_density import (                                  # noqa: E402
+    BAND_TILE_BUDGET_FRACTION as _SC_EIGH_TILE_BUDGET_FRACTION)
+from gw.sc_iteration import _resolve_sc_eigh                   # noqa: E402
 
 
 class _FakeMesh:
@@ -145,7 +146,7 @@ def test_an_indivisible_band_window_stays_native_under_auto_for_SIZE():
     That callee now pads with a sentinel and slices back by count, so
     divisibility is not a condition any more — nb = 46 stays native
     purely because one (46, 46) tile is 33 kB, far under
-    ``_SC_EIGH_TILE_BUDGET_FRACTION`` of the 40 GB/device budget.
+    ``qsgw_density.BAND_TILE_BUDGET_FRACTION`` of the 40 GB/device budget.
 
     nb = 46 is the repo's own gnppm fixture (nval + ncond = 26 + 20);
     the band divisor of an 8×8 mesh is 64 and 46 % 64 = 46.

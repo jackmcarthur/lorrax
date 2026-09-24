@@ -1312,7 +1312,7 @@ PROVED means equality at the explicitly tested seam/fixture within the tolerance
 | Final antiunitary band transpose after sector sum | maps:3872; photon_sigma:235 | PROVED static toy | full_band_unfold_matches_literal_sigma_on_symmetric_complete_toy |
 | Screened production parent/full-k self-energy | complete driver | FLAGGED | no new fixed-main comparison |
 | Density signed weights, real ψ†Γψ, TR signs | get_DFT_mtxels:165,263 | PROVED local density | density_all_currents_signed_weights_and_time_reversal |
-| Density caller Ω/k factors, complete SCF feedback | qsgw_density:361 and callers | FLAGGED | local density proof does not cover every caller |
+| Density caller Ω/k factors, complete SCF feedback | `qsgw_density.rho_from_wfns` and callers | FLAGGED | local density proof does not cover every caller |
 | Periodic direct TT −8πP_T/G², G0=0 | dft_operators:174; kin_ion_io:893 | PROVED | periodic_transverse_hartree_sign_projector_and_zero_mode |
 | Hall −iεσ and CT/TC conjugate pairing | head_correction:162 | PROVED declared model | existing photon_head_sign_oracle, rerun final leg |
 | Head S+YWZ/Ω, WZ transpose and YW orientation | head_correction:1343,1526–1556 | PROVED local declared formulas | existing head-sign/moment suite; shared sampler limitation |

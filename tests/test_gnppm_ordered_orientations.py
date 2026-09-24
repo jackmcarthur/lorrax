@@ -892,3 +892,34 @@ def test_odd_kernel_rule_meets_the_even_rules_gate_and_leaves_it_untouched(
     # -(alpha - i beta) e^{-tau E_gap}, real nodes, complex weights.
     gamma = -(both.alpha - 1j * both.alpha_odd)
     assert np.max(np.abs(E @ gamma + 1.0 / (x + 1j * OMEGA_P))) <= 3.0 * gate
+
+
+def test_ordered_odd_residue_shares_the_omega_layout_and_values():
+    """CRIU 2026-09-22: the anti-Hermitian half is resharded per q block onto Omega's layout.
+
+    On a sharded (q, mu, nu) input the ordered kernel's ``a`` comes out of an
+    X<->Y transpose; ``_match_layout`` moves it onto ``Omega``'s sharding so the
+    odd-residue product no longer reshards the whole array at once (CrI3 16x16 P64
+    OOM, 4161798144 B).  Values must be bit-identical to the unsharded fit.
+    """
+    rng = np.random.default_rng(922)
+    _Om, _R_plus, _R_minus, Wc0, Wcp = _pole_model(rng)
+    ref = ms.fit_gn_ppm_from_wc_pair(
+        jnp.asarray(Wc0), jnp.asarray(Wcp), 1j * OMEGA_P, fallback_omega=2.0,
+        n_mu_logical=Wc0.shape[-1], ordered_orientations=True, print_fn=lambda *a: None)
+    devs = np.asarray(jax.devices())
+    n = int(np.sqrt(devs.size))
+    if n * n != devs.size or Wc0.shape[-1] % n:
+        pytest.skip("needs a square device count dividing mu")
+    mesh = Mesh(devs.reshape(n, n), ("x", "y"))
+    sh = NamedSharding(mesh, P(None, "x", "y"))
+    got = ms.fit_gn_ppm_from_wc_pair(
+        jax.device_put(jnp.asarray(Wc0), sh), jax.device_put(jnp.asarray(Wcp), sh),
+        1j * OMEGA_P, fallback_omega=2.0, n_mu_logical=Wc0.shape[-1],
+        ordered_orientations=True, print_fn=lambda *a: None)
+    assert got.B_odd_qmunu.sharding == got.omega_qmunu.sharding
+    for name in ("omega_qmunu", "B_qmunu", "B_odd_qmunu"):
+        np.testing.assert_array_equal(np.asarray(jax.device_get(getattr(got, name))),
+                                      np.asarray(jax.device_get(getattr(ref, name))))
+    a = jnp.arange(8.0).reshape(2, 2, 2)
+    assert ms._match_layout(a, a) is a

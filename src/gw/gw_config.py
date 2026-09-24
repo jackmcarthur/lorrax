@@ -1416,14 +1416,20 @@ _DEFAULTS = {
     # degeneracies.  This 0.1 meV owner-set ceiling is deliberately more
     # than an order below MoS2's physical 1.7--3.6 meV SOC-split K pair.
     "sc_exact_degeneracy_tol_ev": 1.0e-4,
-    # The frontier law is the production window-stable tail update.  The
-    # all_conduction spelling retains the historical affine-fit control for
-    # diagnosing window-edge cycles; it never changes degeneracy treatment.
-    "sc_tail_fit": "frontier",   # frontier | all_conduction | buffer_edges
+    # conduction_mean (owner 2026-09-23): one rigid shift, the k-weighted mean
+    # QP correction over every trusted conduction state in the QP window.
+    # frontier copied the lowest multiplet alone, which on CrI3 was one
+    # localized Cr-d band (+7.0 eV vs the window mean +3.5 eV) and fed the gap.
+    # all_conduction retains the historical affine fit as a diagnostic.
+    "sc_tail_fit": "conduction_mean",   # conduction_mean | frontier | all_conduction | buffer_edges
     # Optional symmetric diagonal buffer around the named nval/ncond window.
     # Zero preserves the historical window exactly.  Nonzero values are
     # interpreted only by qp_solver=self_consistent.
     "sc_buffer_nbands": 0,
+    # Owner 2026-09-23: the lowest N bands (1-based 1..N; semicore) are held
+    # at their DFT Hamiltonian block in every QSGW map -- still in the Sigma_x
+    # and chi0 sums, never updated.  0 updates every QP-window band.
+    "sc_frozen_core_bands": 0,
     "sc_buffer_mode": "diagonal",  # diagonal | one_sided | carry
     # Optional fourth text output beside the ordinary one-shot eqp0/eqp1
     # pair.  This iterates ONLY the eigenvalues/eigenvectors against the
@@ -2752,6 +2758,7 @@ def _input_iteration(
             params["sc_exact_degeneracy_tol_ev"]),
         tail_fit=str(params["sc_tail_fit"]).strip().lower(),
         buffer_nbands=int(params["sc_buffer_nbands"]),
+        frozen_core_bands=int(params["sc_frozen_core_bands"]),
         buffer_mode=str(params["sc_buffer_mode"]).strip().lower(),
         eigh=_linalg.sc_eigh,
         head_update=str(params["sc_head_update"]).strip().lower(),
@@ -4284,8 +4291,9 @@ class SCConfig:
     mixing: float
     dump_dir: str | None
     exact_degeneracy_tol_ev: float = 1.0e-4
-    tail_fit: str = "frontier"
+    tail_fit: str = "conduction_mean"
     buffer_nbands: int = 0
+    frozen_core_bands: int = 0
     buffer_mode: str = "diagonal"
     eigh: str = "auto"    # "auto" | "native" | "distributed"
     #: "off" | "parallel_transport" | "dft_velocity".  Both non-off modes
@@ -4323,13 +4331,16 @@ class SCConfig:
                 "sc_exact_degeneracy_tol_ev must be in (0, 1e-4] eV. "
                 "The 0.1 meV ceiling separates accidental degeneracy from "
                 "resolved physical splittings; it is not an SC damping knob.")
-        if self.tail_fit not in ("frontier", "all_conduction", "buffer_edges"):
+        if self.tail_fit not in ("conduction_mean", "frontier",
+                                 "all_conduction", "buffer_edges"):
             raise ValueError(
-                "sc_tail_fit must be 'frontier', 'all_conduction' or "
-                "'buffer_edges'; "
+                "sc_tail_fit must be 'conduction_mean', 'frontier', "
+                "'all_conduction' or 'buffer_edges'; "
                 f"got {self.tail_fit!r}.")
         if self.buffer_nbands < 0:
             raise ValueError("sc_buffer_nbands must be >= 0.")
+        if self.frozen_core_bands < 0:
+            raise ValueError("sc_frozen_core_bands must be >= 0.")
         if self.buffer_mode not in ("diagonal", "one_sided", "carry"):
             raise ValueError(
                 "sc_buffer_mode must be 'diagonal', 'one_sided' or 'carry'; "

@@ -17,7 +17,7 @@ def _mesh():
                 ("x", "y"))
 
 
-def test_ppm_fit_is_persisted_then_consumed_by_the_mpa_route(monkeypatch):
+def test_ppm_fit_is_handed_in_memory_to_the_mpa_route(monkeypatch):
     from file_io import mpa_store
     from gw import ppm_sigma
     from gw.mpa import sigma as mpa_sigma
@@ -54,10 +54,8 @@ def test_ppm_fit_is_persisted_then_consumed_by_the_mpa_route(monkeypatch):
     omega_grid = np.asarray([-0.1, 0.2])
     captured = {}
 
-    def fake_write(path, Omega_p, B_p, **kwargs):
-        captured["store"] = (
-            path, np.asarray(Omega_p), np.asarray(B_p), kwargs)
-        return {"complete": True}
+    def no_store(*_args, **_kwargs):
+        raise AssertionError("GN/HL Sigma must not write a pole store")
 
     def fake_mpa(wfns_arg, path, meta_arg, mesh_arg, **kwargs):
         captured["mpa"] = (wfns_arg, path, meta_arg, mesh_arg, kwargs)
@@ -72,7 +70,7 @@ def test_ppm_fit_is_persisted_then_consumed_by_the_mpa_route(monkeypatch):
             band_counts=plan.counts)
 
     monkeypatch.setattr(
-        mpa_store, "write_complete_pole_store_collective", fake_write)
+        mpa_store, "write_complete_pole_store_collective", no_store)
     monkeypatch.setattr(
         mpa_sigma, "compute_sigma_c_mpa_omega_grid", fake_mpa)
 
@@ -83,29 +81,41 @@ def test_ppm_fit_is_persisted_then_consumed_by_the_mpa_route(monkeypatch):
         mpa_cfg=mpa_cfg,
         omega_grid_ry=omega_grid,
         ansatz="gn_ppm",
-        fit_store_path="/tmp/one-pole.h5",
         screening_diagrams="w_rpa",
         quadrature_cache_dir="/tmp/rule-cache",
         plan=plan,
         print_fn=lambda *_args, **_kwargs: None)
 
-    path, stored_Omega, stored_B, store_kw = captured["store"]
-    assert path == "/tmp/one-pole.h5"
+    _, source, _, _, mpa_kw = captured["mpa"]
+    assert isinstance(source, mpa_sigma.MemoryPoleSource)
+    stored_Omega, stored_B, stored_D = source.read(
+        None, return_sharded=True, to_unit="Ry", include_odd=True)
     assert stored_Omega.shape == stored_B.shape == (1, 1, 2, 2)
-    assert stored_Omega[0, 0, 0, 1] == 0.0
-    assert stored_B[0, 0, 0, 1] == 0.0
-    assert store_kw["provenance"]["fit_protocol"] == "two_point_ppm"
-    assert store_kw["provenance"]["pole_model"] == "gn_ppm"
-    assert store_kw["provenance"]["ppm_invalid_mode"] == "zero"
-
-    _, mpa_path, _, _, mpa_kw = captured["mpa"]
-    assert mpa_path == path
+    assert stored_D is None
+    assert np.asarray(stored_Omega)[0, 0, 0, 1] == 0.0
+    assert np.asarray(stored_B)[0, 0, 0, 1] == 0.0
+    provenance = source.ledger["provenance"]
+    assert provenance["fit_protocol"] == "two_point_ppm"
+    assert provenance["pole_model"] == "gn_ppm"
+    assert provenance["ppm_invalid_mode"] == "zero"
     assert mpa_kw["quadrature_eps"] == 3.0e-5
     assert mpa_kw["quadrature_cache_dir"] == "/tmp/rule-cache"
-    assert mpa_kw["analytic_line"] is True
+    assert mpa_kw["analytic_line"] is False
     assert mpa_kw["pole_batch_size"] == 4
     assert mpa_kw["band_brackets"] == plan.bounds
     assert mpa_kw["band_counts"] == plan.counts
     assert len(mpa_kw["sigma_branches"]) == 4
     assert result.band_counts == plan.counts
     assert result.sigma_c_kij.shape == (1, 2, 1, 2, 2)
+    # The body's omega frame travels with the result (midgap of -0.4/0.6).
+    assert mpa_kw["efermi_ry"] == result.efermi_ry
+    np.testing.assert_allclose(result.efermi_ry, 0.1, rtol=0, atol=1e-15)
+
+
+def test_ppm_finalize_reads_sigma_in_the_body_frame():
+    """Audit 2026-09-23 item 2: the PPM finalizer used wfn.efermi (DFT midgap)
+    while the body was measured from the current VBM."""
+    import inspect
+    from gw import sigma_dispatch
+    src = inspect.getsource(sigma_dispatch._compute_ppm_sigma)
+    assert "efermi_ry=ppm_outputs.efermi_ry" in src

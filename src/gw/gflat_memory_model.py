@@ -79,7 +79,8 @@ job today; do not read the absence of a screening-stage row here as "it
 fits", only as "unmeasured".
 
 Most terms above are closed-form shape algebra.  The bounded-k Stage-A load
-and the separate full-nk psi-r/to_rchunk transform both query the same
+and the separate psi-r transform (full k for the hoisted cache, one
+``zeta_fft_k_tile`` of the store's k rows on the streamed route) query the same
 production FFT helper at their real shape/mesh, including XLA's buffer peak
 plus cuFFT plan workspace, through
 ``common.fft_helpers.query_fft_peak_bytes``.  Stage D's two-box factor and
@@ -365,6 +366,23 @@ def centroid_fft_tile_geometry(
     return k_tile, k_tile * local_bands
 
 
+def zeta_fft_k_tile(*, n_k_rows: int, band_chunk: int, p_band: int) -> int:
+    """Return the k tile of the streamed Stage-C ζ transform ψ(G)->ψ(r).
+
+    The cache-free route transforms one band chunk of the ψ(G) store's k
+    rows (the raw parents on the parent route) per real-grid tile.  The
+    centroid transfer's rule (:func:`centroid_fft_tile_geometry`) bounds
+    the tile so the local FFT-row batch stays one band tile; the tile is
+    then the largest divisor of ``n_k_rows`` under that bound, so every
+    tile has one static shape and no pad k row exists.  The planner prices
+    and ``isdf.core._z_q_face_parent`` runs this one rule.
+    """
+    n_k_rows = int(n_k_rows)
+    bound, _ = centroid_fft_tile_geometry(
+        nk=n_k_rows, band_chunk=band_chunk, p_band=p_band)
+    return bounded_partition_tile(n_k_rows, bound, 1)
+
+
 # ---------------------------------------------------------------------------
 # The consequential array inventory (§1)
 # ---------------------------------------------------------------------------
@@ -420,7 +438,8 @@ def _fft_box_bytes(*, nk, bc, ns, fft_grid, mesh_xy, p_xy) -> float:
     """Per-rank bytes of one production WFN spatial FFT box.
 
     The caller supplies the transform's actual live k extent: bounded
-    ``centroid_k_chunk`` for Stage A, full ``nk`` for psi-r/to_rchunk stages.
+    ``centroid_k_chunk`` for Stage A, full ``nk`` for the hoisted psi-r
+    cache, and the ``zeta_fft_k_tile`` on the streamed route.
     MEASURED whenever a real ``Mesh`` is available: compiles the production
     WFN spatial ``ifftn(norm='ortho')`` helper at this shape/sharding and
     reads XLA's buffer peak PLUS the cuFFT plan workspace, which is not in
@@ -564,7 +583,8 @@ class GFlatChunkPlan:
     centroid_fft_rows_local: int
     #: Stage-A centroid-load FFT price at the bounded outer-k tile.
     centroid_fft_bytes: float
-    #: Full-nk to_rchunk_inner price for psi-r cache/streamed face stages.
+    #: ψ(G)->ψ(r) price for the psi-r stages: full nk for the hoisted
+    #: cache, ``zeta_k_chunk`` k rows on the streamed route.
     zeta_transform_fft_bytes: float
     r_chunk: int
     n_r_chunks: int
@@ -638,6 +658,9 @@ class GFlatChunkPlan:
     parent_route: object = None
     #: Per-rank bytes in the selected face Y cache at resolved r width.
     face_y_cache_bytes: float = 0.0
+    #: k rows per streamed ζ transform (``zeta_fft_k_tile``); ``nk`` on the
+    #: hoisted-cache route, whose builder transforms every k row at once.
+    zeta_k_chunk: int = 0
 
     def format(self) -> str:
         bg = self.budget_bytes / 1e9
@@ -674,8 +697,9 @@ class GFlatChunkPlan:
             f"    centroid FFT = k_tile {self.centroid_k_chunk}, "
             f"{self.centroid_fft_rows_local} local rows, "
             f"{self.centroid_fft_bytes / 1e9:.3f} GB/dev",
-            f"    zeta FFT      = full-nk transform, "
-            f"{self.zeta_transform_fft_bytes / 1e9:.3f} GB/dev",
+            ("    zeta FFT      = full-nk transform, " if self.cache_psi_r
+             else f"    zeta FFT      = k_tile {self.zeta_k_chunk} (streamed), ")
+            + f"{self.zeta_transform_fft_bytes / 1e9:.3f} GB/dev",
             f"    r_chunk       = {self.r_chunk}  ({self.n_r_chunks} chunks)",
             f"    q rows        = selected Q {self.n_q_selected} / "
             f"full-zone K {self.n_q_full}",
@@ -857,6 +881,20 @@ def plan_gflat_chunks(
         cache_psi_r = not (
             sum(_persistent_base.values()) + _min_cache_bytes > target
             or _cache_probe_peak > target)
+    # The streamed ζ transform runs over k tiles of the ψ(G) store's rows,
+    # the raw parents on the parent route.  Without a parent count, price the
+    # selector's bound, which caps the tile of every row count <= nk.  The
+    # hoisted cache builder transforms all k rows at once (priced at nk).
+    def _zeta_k_tile(bc: int, pp: int) -> int:
+        if cache_psi_r:
+            return nk
+        if parent_route is None:
+            return centroid_fft_tile_geometry(
+                nk=nk, band_chunk=bc, p_band=pp)[0]
+        return zeta_fft_k_tile(
+            n_k_rows=int(parent_route["n_parent"]), band_chunk=bc,
+            p_band=pp)
+
     if not cache_psi_r:
         _announce(
             "stream-psi-r-cache-lowmem",
@@ -875,8 +913,17 @@ def plan_gflat_chunks(
             face_nb, pp, name="face bands at candidate rank").carrier
         if band_chunk_override and band_chunk_override > 0:
             floor_bc = int(band_chunk_override)
-        else:
+        elif cache_psi_r:
             floor_bc = fit_nb
+        else:
+            # Streamed (cache-free) route: the band chunk is chosen below by
+            # ``_band_candidate_fits`` and may be as small as one band per
+            # rank, so the un-chunkable floor is priced at that smallest legal
+            # chunk.  Pricing it at the whole fit window made the FFT box and
+            # the face pair accumulator look un-chunkable and refused CrI3
+            # 16x16 / 501 bands / 5030 centroids at P36 with P_min = 60
+            # (pool 58781114 step .17) although Phase 2 picks smaller chunks.
+            floor_bc = pp
         floor_bc = max(pp, padded_axis(
             floor_bc, pp, name="fit-band chunk at candidate rank").carrier)
         fit_padded = max(pp, padded_axis(
@@ -892,15 +939,28 @@ def plan_gflat_chunks(
                  + (psi_r_cache if cache_psi_r else 0.0))
         if parent_algorithm:
             # P_min must admit one legal face r slab.  Use the universal
-            # repeated route at r=Py and the full-nk analytic transform.
+            # repeated route at r=Py and the transform's live k extent: all
+            # k for the hoisted cache, one ζ k tile on the streamed route.
+            fft_k = _zeta_k_tile(floor_bc, pp)
             face_floor = _stage_C_face_terms(
                 nk=nk, ns=ns, mu=mu, face_nb=face_nb_pp,
                 slots=face_slots, p_x=px, p_y=py, p_xy=pp,
                 band_chunk=floor_bc,
                 n_band_chunks=math.ceil(fit_nb / floor_bc))
-            fft_floor = (_c128(
-                nk, floor_bc, ns, n_rtot, shard=pp)
-                * _FFT_CUFFT_FACTOR)
+            if pp == p_xy:
+                # At this mesh the production FFT box is MEASURED (compiled
+                # buffer peak + cuFFT plan), the same number Phase 2 prices
+                # the chosen chunk with.  The analytic 4x factor alone put
+                # the floor above a plan that fits: CrI3 16x16, 481 bands,
+                # 3998 centroids at P36 refused with P_min = 45 while its own
+                # HWM was 46.86 of 70.41 GB/dev (pool 58781114 step .23).
+                fft_floor = _fft_box_bytes(
+                    nk=fft_k, bc=floor_bc, ns=ns, fft_grid=fft_grid,
+                    mesh_xy=mesh_xy, p_xy=p_xy)
+            else:
+                fft_floor = (_c128(
+                    fft_k, floor_bc, ns, n_rtot, shard=pp)
+                    * _FFT_CUFFT_FACTOR)
             pair_floor = (
                 face_floor["constant"]
                 + face_floor["repeated_pair_slope"] * py
@@ -974,7 +1034,7 @@ def plan_gflat_chunks(
         centroid_k, _ = centroid_fft_tile_geometry(
             nk=nk, band_chunk=bc, p_band=p_xy)
         centroid_fft_t = _fft_for_bc(bc, nk_extent=centroid_k)
-        zeta_fft_t = _fft_for_bc(bc, nk_extent=nk)
+        zeta_fft_t = _fft_for_bc(bc, nk_extent=_zeta_k_tile(bc, p_xy))
         if parent_algorithm:
             face = _stage_C_face_terms(
                 nk=nk, ns=ns, mu=mu, face_nb=face_nb,
@@ -987,9 +1047,9 @@ def plan_gflat_chunks(
                 nk=nk, ns=ns, nq=nq, mu=mu, slots=slots,
                 p_xy=p_xy, band_chunk=bc, p_y=p_y)
             fit_t = c_slope * r_for_band_guard
-        # Centroid sampling sees only its bounded k tile.  The incumbent
-        # to_rchunk_inner source sees full nk and is a distinct peak when
-        # hoisted, or coexists with the streamed pair route when not.
+        # Centroid sampling sees only its bounded k tile.  The ψ(r) source
+        # sees full nk when hoisted (a distinct peak), or one ζ k tile that
+        # coexists with the streamed pair route when not.
         transient = (max(centroid_fft_t, zeta_fft_t, fit_t)
                      if cache_psi_r else
                      max(centroid_fft_t, zeta_fft_t + fit_t))
@@ -1021,8 +1081,9 @@ def plan_gflat_chunks(
         nk=nk, band_chunk=band_chunk, p_band=p_xy)
     fft_box_A = _fft_for_bc(
         band_chunk, nk_extent=centroid_k_chunk)
+    zeta_k_chunk = _zeta_k_tile(band_chunk, p_xy)
     fft_box_zeta_transform = _fft_for_bc(
-        band_chunk, nk_extent=nk)
+        band_chunk, nk_extent=zeta_k_chunk)
 
     # ψ(r) is hoisted across the outer r-chunk loop.  It is a band-flat
     # all-P-sharded cache, never a replicated full-window object.  Price its
@@ -1054,8 +1115,8 @@ def plan_gflat_chunks(
             slots=face_slots, p_x=p_x, p_y=p_y, p_xy=p_xy,
             band_chunk=band_chunk, n_band_chunks=_cache_n_bc,
             parent_route=parent_route)
-        # to_rchunk_inner consumes the full-nk carrier.  This is deliberately
-        # the 12.96-GB CrI3/P16 term, not Stage A's 5.76-GB bounded k tile.
+        # The streamed source transforms one ζ k tile of the store's rows
+        # at a time; that box coexists with the Stage-C pair route.
         streamed_fft = 0.0 if cache_psi_r else fft_box_zeta_transform
         face_headroom = max(
             target - persistent_total - face_terms["constant"], 0.0)
@@ -1255,8 +1316,8 @@ def plan_gflat_chunks(
 
     # ---- stage transients + per-stage peaks ----------------------------
     # These are different transforms and different peaks.  Centroid sampling
-    # sees only ``centroid_k_chunk``; the psi-r cache / streamed face source
-    # passes full nk to the incumbent to_rchunk_inner owner.
+    # sees only ``centroid_k_chunk``; the psi-r cache builder transforms full
+    # nk, the streamed face source one ``zeta_k_chunk`` tile.
     A_t = fft_box_A
     A_psi_r_cache_t = fft_box_zeta_transform if cache_psi_r else 0.0
     B_t = (_c128(nq, mu, mu, shard=p_xy)               # C_q
@@ -1409,4 +1470,5 @@ def plan_gflat_chunks(
         cache_face_y_blocks=bool(cache_face_y_blocks),
         face_y_cache_r_tile=int(face_y_cache_r_tile),
         face_y_cache_bytes=float(face_y_cache_bytes),
+        zeta_k_chunk=int(zeta_k_chunk),
     )

@@ -323,7 +323,7 @@ def test_incomplete_sigma_coverage_is_an_actionable_final_warning(tmp_path):
     assert "out-of-range policy=clamp" in text
     assert "sigma_omega_min_ev / sigma_omega_max_ev" in text
     assert "sigma_omega_patches_ev" in text
-    assert "LORRAX_OMEGA_OUT_OF_RANGE=refuse" in text
+    assert "Sigma(omega=0)" in text
 
 
 def test_timing_report_hides_sub_display_precision_residuals(tmp_path):

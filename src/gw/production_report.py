@@ -526,12 +526,9 @@ class GWProductionReport:
                 self._retain_warning(
                     "WARNING: dynamic Sigma grid is incomplete for requested "
                     "DFT output bands (" + "; ".join(shortfalls) + f"){affected}; "
-                    f"out-of-range policy={policy_name}. Widen "
-                    "sigma_omega_min_ev / sigma_omega_max_ev or add a "
-                    "sigma_omega_patches_ev window; use "
-                    "LORRAX_OMEGA_OUT_OF_RANGE=refuse when endpoint values "
-                    "must never enter an output. In SC runs these counts include "
-                    "scissored bands; the SC partition reports protected-band coverage.")
+                    f"out-of-range policy={policy_name}: those states use "
+                    "Sigma(omega=0). Widen sigma_omega_min_ev / sigma_omega_max_ev "
+                    "or add a sigma_omega_patches_ev window to sample them.")
 
         state = "ON" if config.sigma.band_extrapolation else "OFF"
         estimator = (getattr(

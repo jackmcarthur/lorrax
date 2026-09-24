@@ -343,51 +343,35 @@ def test_sc_density_applies_rotation_inside_the_scan():
                    for n in ast.walk(fn))
 
 
-def test_density_scan_reshards_only_the_singleton_k_slice():
-    """Resident psi stays band-xy; only psi[k] is placed m-on-x."""
+def test_density_scan_slices_k_inside_the_manual_region():
+    """The k slice happens inside shard_map, where GSPMD cannot hoist it.
+
+    The previous auto-sharded scan constrained ``psi[k]`` to m-on-x, and the
+    partitioner propagated that constraint to the scan OPERAND: every trip
+    all-gathered the whole ``(n_k, nb/P, s, G)`` stack, 16 GB/rank/trip at
+    VI3 12x12 P16 (``runs/runtime/density_scan_20260923``, HLO census).  The
+    body is now manual-axis code: one scan, one psum after it, and no
+    sharding constraint for the partitioner to propagate.  The compiled
+    census is ``tests/test_qsgw_density_scan.py``.
+    """
     module = ast.parse((ROOT / "src" / "gw" / "qsgw_density.py").read_text(
         encoding="utf-8"))
-    fn = next(n for n in module.body
-              if isinstance(n, ast.FunctionDef)
-              and n.name == "rho_from_wfns")
-    constraints = [
-        n for n in ast.walk(fn)
-        if isinstance(n, ast.Call)
-        and isinstance(n.func, ast.Attribute)
-        and n.func.attr == "with_sharding_constraint"
-        and len(n.args) >= 2
-    ]
+    fns = {n.name: n for n in module.body if isinstance(n, ast.FunctionDef)}
 
-    def _named_arg(call, value, sharding):
-        return (isinstance(call.args[0], ast.Name)
-                and call.args[0].id == value
-                and isinstance(call.args[1], ast.Name)
-                and call.args[1].id == sharding)
+    def calls(fn, attr):
+        return [n for n in ast.walk(fn) if isinstance(n, ast.Call)
+                and isinstance(n.func, (ast.Attribute, ast.Name))
+                and getattr(n.func, "attr", getattr(n.func, "id", "")) == attr]
 
-    assert sum(_named_arg(call, "psi_", "band_xy")
-               for call in constraints) == 1
-    assert not any(_named_arg(call, "psi_", "m_on_x")
-                   for call in constraints)
-    slice_reshards = [
-        call for call in constraints
-        if isinstance(call.args[0], ast.Subscript)
-        and isinstance(call.args[0].value, ast.Name)
-        and call.args[0].value.id == "psi_k"
-        and isinstance(call.args[0].slice, ast.Constant)
-        and call.args[0].slice.value is None
-        and isinstance(call.args[1], ast.Name)
-        and call.args[1].id == "m_on_x"
-    ]
-    assert len(slice_reshards) == 1
-    rotation_einsums = [
-        call for call in ast.walk(fn)
-        if isinstance(call, ast.Call)
-        and isinstance(call.func, ast.Attribute)
-        and call.func.attr == "einsum"
-        and any(isinstance(arg, ast.Name) and arg.id == "psi_k_x"
-                for arg in call.args)
-    ]
-    assert len(rotation_einsums) == 1
+    body = fns["_density_scan_body"]
+    assert len(calls(body, "scan")) == 1
+    assert len(calls(body, "psum")) == 1
+    assert not calls(body, "with_sharding_constraint")
+    rho = fns["rho_from_wfns"]
+    sm = calls(rho, "shard_map")
+    assert len(sm) == 1
+    assert all(not isinstance(c.args[0], ast.Name) or c.args[0].id != "psi"
+               for c in calls(rho, "with_sharding_constraint"))
 
 
 def test_live_gspace_hartree_cannot_cross_the_host_gather_boundary():

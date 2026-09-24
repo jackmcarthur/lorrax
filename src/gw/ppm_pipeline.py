@@ -14,9 +14,8 @@ only sequences them.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from functools import lru_cache
-import os
 
 import jax
 import jax.numpy as jnp
@@ -25,8 +24,8 @@ import numpy as np
 
 from common.units import RYD_TO_EV
 from common.wfn_transforms import get_enk_bandrange
-from common.collectives import barrier, process_rank
 import common.timing as timing
+from runtime.padding import strip_axis
 
 from .band_extrapolation import (
     BAND_EXTRAPOLATION_ESTIMATOR_DEFAULT,
@@ -49,6 +48,7 @@ from .gw_config import LorraxConfig
 from .head_correction import HeadResolver
 from .ppm_sigma import (
     compute_sigma_c_ppm_omega_grid,
+    host_rss_diag,
     fit_ppm,
 )
 from runtime.padding import PaddedAxis
@@ -80,11 +80,10 @@ class PPMOutputs:
     # absent from every downstream branch, which is what keeps that path
     # bit-identical.
     sigma_c_body_omega_unextrap: jax.Array | None = None
-    # Exact ordered-residue contribution, defined as Sigma_c[B,D] -
-    # Sigma_c[B,D=0].  None on every measured-TRS deck.
-    sigma_c_odd_body_omega: jax.Array | None = None
     probe_hermiticity_residual: float | None = None
     odd_even_residue_ratio: float | None = None
+    #: The body's omega reference (Ry), from ``SigmaOmegaResult.efermi_ry``.
+    efermi_ry: float | None = None
 
 
 def _fit_head_correction(
@@ -150,8 +149,13 @@ def _compute_analytic_head_diag(
     wfn, sym, meta,
     print_fn,
     iteration_head=None,
+    body_efermi_ry=None,
 ) -> np.ndarray:
     """Compute the analytic q→0, G=G'=0 PPM head diagonal.
+
+    ``body_efermi_ry`` is the omega reference of the Sigma body this head is
+    added to (``SigmaOmegaResult.efermi_ry``).  The head Sigma(omega) lives
+    on the same omega grid, so it must be measured from the same energy.
 
     A head-less Σ_c is a silent wrong answer (Bug B,
     reports/sigma_ppm_tighten_2026-07-04).  Injection is deliberately left
@@ -182,6 +186,8 @@ def _compute_analytic_head_diag(
                 f"{expected}, got {enk_full_np.shape}.")
         occupations = np.asarray(
             iteration_head.sigma_occupations, dtype=np.float64)
+    if body_efermi_ry is not None:
+        efermi_ry = float(body_efermi_ry)
     n_occ = min(meta.nelec, enk_full_np.shape[1])
 
     # The head is band-diagonal; compute that lossless (nω, nk, nb)
@@ -315,6 +321,16 @@ def _extrapolated_point(cube, weights):
         raise ValueError(
             f"_extrapolated_point: weights must be (3,) [band_index_only] or "
             f"(3, nk, nb) [spectral_shell], got shape {w.shape}")
+    if w.ndim == 3 and w.shape[-1] != int(cube.shape[-1]):
+        # Per-state weights are fitted on the LOGICAL bands; the cube keeps
+        # its padded band carrier, whose extra rows/columns are zero.  Zero
+        # weights there keep them zero without stripping the cube.
+        carrier = int(cube.shape[-1])
+        if w.shape[-1] > carrier:
+            raise ValueError(
+                f"_extrapolated_point: {w.shape[-1]} logical bands exceed the "
+                f"cube's band carrier {carrier}")
+        w = np.pad(w, ((0, 0), (0, 0), (0, carrier - w.shape[-1])))
 
     sharding = getattr(cube, "sharding", None)
     if not isinstance(sharding, NamedSharding):
@@ -358,15 +374,21 @@ def _report_band_extrapolation(
         wfn, sym, band_slices.sigma_range, band_slices.sigma_range,
         nspinor=meta.nspinor)
     enk_ev = np.asarray(enk_dft) * RYD_TO_EV
-    omega_eval_ev = enk_ev - float(wfn.efermi) * RYD_TO_EV
+    omega_eval_ev = enk_ev - (float(wfn.efermi) if sigma_omega.efermi_ry is None
+                              else float(sigma_omega.efermi_ry)) * RYD_TO_EV
     omega_grid_ev = np.asarray(config.omega_grid_ev, dtype=np.float64)
     head = (None if head_sigma_diag_w_kn_ry is None
             else np.asarray(head_sigma_diag_w_kn_ry))
 
     points = []
     for i in range(cube.shape[0]):
+        # The cube lives on the padded band carrier; the head, the DFT
+        # energies and the fit are logical.  Strip at this consumer boundary.
         diag_w_kn = np.asarray(
             extract_sigma_diag_replicated(_band_count_point(cube, i), mesh_xy))
+        if sigma_omega.band_axis is not None:
+            diag_w_kn = np.asarray(strip_axis(
+                diag_w_kn, sigma_omega.band_axis, axis=-1))
         if head is not None:
             diag_w_kn = diag_w_kn + head
         # Ry -> eV here, exactly where ``eval_sigma_c_at_dft_energies`` does
@@ -378,8 +400,7 @@ def _report_band_extrapolation(
         # ones through the same least squares.  The count is reported once
         # at the output path, on the same grid and the same eval energies.
         points.append(interp_along_omega(
-            diag_w_kn * RYD_TO_EV, omega_grid_ev, omega_eval_ev,
-            out_of_range="clamp"))
+            diag_w_kn * RYD_TO_EV, omega_grid_ev, omega_eval_ev))
     s_at_counts = np.stack(points)
 
     # ── WHICH ESTIMATOR ─────────────────────────────────────────────────
@@ -657,11 +678,6 @@ def compute_ppm_sigma_pipeline(
         from .sigma_box_plan import resolve_sigma_box_cache_dir
         quadrature_cache_dir = resolve_sigma_box_cache_dir(
             config.sigma.quadrature_cache_dir, config.input_dir)
-        fit_dir = os.path.join(config.input_dir, "tmp", "mpa")
-        if process_rank() == 0:
-            os.makedirs(fit_dir, exist_ok=True)
-        barrier("ppm_mpa_fit_directory_ready")
-        fit_store_path = os.path.join(fit_dir, "mpa_fit_oneshot.h5")
         with timing.section("sigma.exec"):
             sigma_omega = compute_sigma_c_ppm_omega_grid(
                 wfns, ppm, meta, mesh_xy,
@@ -670,7 +686,6 @@ def compute_ppm_sigma_pipeline(
                 mpa_cfg=config.mpa,
                 omega_grid_ry=config.omega_grid_ry,
                 ansatz=config.compute_mode,
-                fit_store_path=fit_store_path,
                 screening_diagrams=config.screening.diagrams,
                 quadrature_cache_dir=quadrature_cache_dir,
                 occupation_state=occupation_state,
@@ -680,32 +695,7 @@ def compute_ppm_sigma_pipeline(
                     fixed_quadrature_session.setdefault("primary", {})),
                 print_fn=print_fn,
             )
-        sigma_omega_even = None
-        if ppm.B_odd_q is not None:
-            # Sigma is linear in the fitted residue.  Reusing the identical
-            # one-pole MPA route with D=0 gives the exact per-state odd
-            # contribution by subtraction, preserving main's observable.
-            even_store_path = os.path.join(
-                fit_dir, "mpa_fit_oneshot_even.h5")
-            with timing.section("sigma.exec.odd_reference"):
-                sigma_omega_even = compute_sigma_c_ppm_omega_grid(
-                    wfns, replace(ppm, B_odd_q=None), meta, mesh_xy,
-                    ppm_cfg=config.ppm,
-                    sigma_cfg=config.sigma,
-                    mpa_cfg=config.mpa,
-                    omega_grid_ry=config.omega_grid_ry,
-                    ansatz=config.compute_mode,
-                    fit_store_path=even_store_path,
-                    screening_diagrams=config.screening.diagrams,
-                    quadrature_cache_dir=quadrature_cache_dir,
-                    occupation_state=occupation_state,
-                    plan=plan,
-                    fixed_quadrature_session=(
-                        None if fixed_quadrature_session is None else
-                        fixed_quadrature_session.setdefault(
-                            "odd_even_reference", {})),
-                    print_fn=lambda *args, **kwargs: None,
-                )
+        host_rss_diag("Sigma(omega) executor returned")
         # THE BLAST RADIUS STOPS HERE.  ``sigma_omega.sigma_c_kij`` carries
         # the leading band-count axis; everything downstream of this line —
         # the head injection, the eqp interpolation, sigma_mnk.h5, the QSGW
@@ -727,12 +717,6 @@ def compute_ppm_sigma_pipeline(
         # is byte-for-byte what it was when it happened at this line.
         sigma_c_body_omega = sigma_c_body_omega_n3
         sigma_c_body_omega_unextrap = None
-        sigma_c_odd_body_omega = None
-        if sigma_omega_even is not None:
-            even_n3 = _band_count_point(
-                sigma_omega_even.sigma_c_kij,
-                sigma_omega_even.sigma_c_kij.shape[0] - 1)
-            sigma_c_odd_body_omega = sigma_c_body_omega_n3 - even_n3
 
         # Step 3: q→0 head construction (analytic, mini-BZ-averaged)
         head_gn = _fit_head_correction(
@@ -745,6 +729,7 @@ def compute_ppm_sigma_pipeline(
             config=config, band_slices=band_slices,
             wfn=wfn, sym=sym, meta=meta,
             iteration_head=iteration_head,
+            body_efermi_ry=sigma_omega.efermi_ry,
             print_fn=print_fn,
         )
 
@@ -752,6 +737,7 @@ def compute_ppm_sigma_pipeline(
         # because the head is part of the Σ_c being reported; before the
         # return, because the cube's leading axis does not survive it.
         extrap_payload = None
+        host_rss_diag("head built, before band extrapolation")
         if plan.enabled:
             extrap_payload, extrap_weights = _report_band_extrapolation(
                 sigma_omega, head_sigma_diag_w_kn_ry,
@@ -770,19 +756,15 @@ def compute_ppm_sigma_pipeline(
             sigma_c_body_omega = _extrapolated_point(
                 sigma_omega.sigma_c_kij, extrap_weights)
             sigma_c_body_omega_unextrap = sigma_c_body_omega_n3
-            if sigma_omega_even is not None:
-                sigma_c_odd_body_omega = (
-                    sigma_c_body_omega
-                    - _extrapolated_point(
-                        sigma_omega_even.sigma_c_kij, extrap_weights))
 
+    host_rss_diag("band extrapolation applied, PPM outputs ready")
     return PPMOutputs(
         sigma_c_body_omega=sigma_c_body_omega,
         band_axis=sigma_omega.band_axis,
         head_sigma_diag_w_kn_ry=head_sigma_diag_w_kn_ry,
         band_extrapolation=extrap_payload,
         sigma_c_body_omega_unextrap=sigma_c_body_omega_unextrap,
-        sigma_c_odd_body_omega=sigma_c_odd_body_omega,
         probe_hermiticity_residual=ppm.probe_hermiticity_residual,
         odd_even_residue_ratio=ppm.odd_even_residue_ratio,
+        efermi_ry=sigma_omega.efermi_ry,
     )

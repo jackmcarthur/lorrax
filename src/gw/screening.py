@@ -501,7 +501,7 @@ def compute_screening(
     quadrature ``quad`` and runs through :func:`compute_static_w` — the
     IBZ fast path (slice → per-q Dyson solve on the wedge → unfold).
     Non-static roles build a single-frequency quadrature on the fly
-    using the existing :func:`gw.minimax_screening.build_imag_quadrature` /
+    using the existing :func:`gw.minimax_screening.build_imag_probe_response_rule` (GN probe) /
     :func:`gw.minimax_screening.build_real_quadrature` helpers (chosen by whether
     ``omega_ry`` is on the imag or real axis) and solve on the full BZ
     directly: the nonlinear PPM fit downstream has a documented ~0.1 meV
@@ -540,7 +540,7 @@ def compute_screening(
     regardless.
     """
     from .minimax_screening import (
-        build_imag_quadrature,
+        build_imag_probe_response_rule,
         build_real_quadrature,
     )
 
@@ -604,7 +604,9 @@ def compute_screening(
                 f"compute_screening: complex-axis ω={req.omega_ry!r} "
                 f"not supported — ω must be pure real or pure imag.")
         if on_imag:
-            quad_used = build_imag_quadrature(
+            # GN-PPM probe: times placed by the analytic response rule the
+            # shared-pole bank uses (owner 2026-09-22), not a runtime minimax.
+            quad_used = build_imag_probe_response_rule(
                 quad, abs(req.omega_ry.imag),
                 config.minimax_config, print_fn=print_fn,
                 with_odd_kernel=_tr_odd)

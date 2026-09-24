@@ -474,6 +474,24 @@ def _apply_sc_buffer_partition(
         in_range_mask=partition.in_range_mask)
 
 
+def _freeze_core_block_to_dft(H, e_dft_kn_ry, n_frozen):
+    """Hold bands ``[0, n_frozen)`` at the DFT Hamiltonian block.
+
+    In the DFT basis that block is ``diag(E_DFT)`` with no coupling to the
+    other bands, so the frozen states keep their DFT energies and orbitals
+    exactly.  Only the logical ``[:n_frozen]`` energies are read; padded
+    carrier columns are untouched.
+    """
+    nb = H.shape[-1]
+    idx = jnp.arange(nb)
+    frozen = idx < int(n_frozen)
+    either = frozen[:, None] | frozen[None, :]
+    H = jnp.where(either[None], jnp.zeros((), H.dtype), H)
+    e = jnp.asarray(e_dft_kn_ry)[:, :int(n_frozen)].astype(H.dtype)
+    diag = jnp.diagonal(H, axis1=-2, axis2=-1).at[:, :int(n_frozen)].set(e)
+    return H.at[:, idx, idx].set(diag)
+
+
 @jax.jit
 def _carry_sc_buffer_diagonal(H_new, H_input, buffer_mask):
     """Replace buffer diagonals by the preceding map input's references."""
@@ -1375,32 +1393,9 @@ def _partitioned_candidate_efermi(
     return float(candidate_occ_state.mu_ry)
 
 
-# The largest share of the per-device memory budget one (nb, nb) tile is
-# allowed to take before the native eigh stops being acceptable.
-#
-# The native path is a k-sharded BATCH: each device runs whole per-k
-# eighs, so it materialises the input tile, the eigenvector tile and
-# LAPACK's workspace — call it three tiles — on ONE device, on top of ψ,
-# the FFT boxes and the ω-cube.  Capping ONE tile at 1% of the budget
-# therefore caps the eigh's single-device footprint near 3%.
-#
-# Derived from bytes and the budget rather than from a band count, so it
-# tracks the device it runs on.  Where 1% puts the switch, against the
-# budgets ``gw_config`` actually resolves:
-#
-#   80 GB GPU   → budget 72 GB (0.9·bytes_limit)      → nb ≈ 6.7e3
-#   CLX node    → budget 169 GB (0.9·RAM / n_devices) → nb ≈ 1.0e4
-#   8 GB device → budget 7.2 GB                       → nb ≈ 2.2e3
-#
-# which is the band the owner ruling names — robustness at 1e4+ bands
-# over speed at 1e3, where the native batch solves ndev matrices at once
-# and wins by roughly ndev (``distrib_la.resolve``, eigh ``auto``
-# policy).  3% was the first choice and was wrong on the CPU arm: the
-# CPU budget is the whole node's RAM divided by the JAX device count, so
-# with several ranks per node it over-counts, and 3% of 169 GB puts the
-# switch past nb = 1.8e4 — it would not have fired on the nb = 1e4 case
-# the distributed eigh exists for.
-_SC_EIGH_TILE_BUDGET_FRACTION = 0.01
+# The one-device band-tile threshold is owned by ``gw.qsgw_density``
+# (``BAND_TILE_BUDGET_FRACTION``, with its derivation); the density scan's
+# U-replication route asks the same question and must agree.
 
 
 def _resolve_sc_eigh(nb: int, mesh_xy: Mesh, config, *, print_fn) -> str:
@@ -1419,8 +1414,8 @@ def _resolve_sc_eigh(nb: int, mesh_xy: Mesh, config, *, print_fn) -> str:
 
     * the mesh has more than one device — on one device "distributed" is
       the same tile with an FFI call around it;
-    * one tile exceeds :data:`_SC_EIGH_TILE_BUDGET_FRACTION` of the
-      per-device budget.
+    * one tile exceeds ``qsgw_density.BAND_TILE_BUDGET_FRACTION`` of the
+      per-device budget (:func:`gw.qsgw_density.band_tile_is_large`).
 
     and then only if the distributed backend actually resolves on this
     mesh.  ``resolve_backend`` is the probe: it raises at RESOLVE time
@@ -1470,10 +1465,12 @@ def _resolve_sc_eigh(nb: int, mesh_xy: Mesh, config, *, print_fn) -> str:
     if requested == "distributed":
         return "distributed"
 
+    from .qsgw_density import BAND_TILE_BUDGET_FRACTION, band_tile_is_large
+
     tile_b = float(nb) * float(nb) * 16.0
     budget_b = float(getattr(getattr(config, "memory", None),
                              "per_device_gb", 0.0)) * 1e9
-    big = budget_b > 0.0 and tile_b > _SC_EIGH_TILE_BUDGET_FRACTION * budget_b
+    big = band_tile_is_large(tile_b, budget_b)
     if ndev <= 1 or not big:
         return "native"
 
@@ -1486,7 +1483,7 @@ def _resolve_sc_eigh(nb: int, mesh_xy: Mesh, config, *, print_fn) -> str:
         print_fn(
             f"  SC eigh: auto wanted the distributed eigh (one (nb, nb) tile "
             f"is {tile_b / 2**30:.3f} GiB, over "
-            f"{_SC_EIGH_TILE_BUDGET_FRACTION:.0%} of the "
+            f"{BAND_TILE_BUDGET_FRACTION:.0%} of the "
             f"{budget_b / 1e9:.1f} GB/device budget) but the backend refused "
             f"— {type(exc).__name__}: {exc}.  Falling back to the k-sharded "
             f"native batch, which puts that whole tile on ONE device.")
@@ -1666,7 +1663,6 @@ def _sigma_c_at_dft_diag_from_dft_cube(
     from .qsgw_utils import (
         extract_sigma_diag_replicated,
         interp_along_omega,
-        resolve_out_of_range_policy,
     )
 
     if (sigma_result.omega_grid_ev is None
@@ -1684,7 +1680,6 @@ def _sigma_c_at_dft_diag_from_dft_cube(
         diagonal_ev,
         np.asarray(sigma_result.omega_grid_ev, dtype=np.float64),
         np.asarray(sigma_result.omega_dft_rel_ev, dtype=np.float64),
-        out_of_range=resolve_out_of_range_policy(),
         context="DFT-basis Sigma_c at E_DFT after SC finalize",
         print_fn=print_fn,
     )
@@ -1923,19 +1918,12 @@ def run_fixed_sigma_evsc(
         covered, n_out, _ = omega_coverage(omega_ev, e_rel_ev)
         required_out = required_kn & ~covered
         n_required_out = int(np.count_nonzero(required_out))
-        if n_required_out:
-            bad = e_rel_ev[required_out]
-            worst = float(bad.flat[int(np.argmax(np.abs(bad)))])
-            raise ValueError(
-                "GATE eqp2_omega_coverage: fixed-Sigma eigenvalue "
-                f"self-consistency requested Sigma at {n_required_out}/"
-                f"{int(np.count_nonzero(required_kn))} protected/non-scissored "
-                "energies outside the sampled "
-                f"grid [{omega_ev[0]:+.3f}, {omega_ev[-1]:+.3f}] eV "
-                f"(worst {worst:+.3f} eV).  An endpoint clamp would not be "
-                "Sigma(E), so eqp2 is refused.  Widen "
-                "sigma_omega_min_ev / sigma_omega_max_ev or add a "
-                "sigma_omega_patches_ev patch.")
+        if n_required_out and call_index == 0:
+            # Owner rule 2026-09-22: off-grid energies evaluate Sigma(omega=0)
+            # (build_qsgw_sigma_xc); counted, not refused.
+            print_fn(
+                f"    EQP2: {n_required_out}/{int(np.count_nonzero(required_kn))} protected "
+                f"energies outside [{omega_ev[0]:+.3f}, {omega_ev[-1]:+.3f}] eV use Sigma(omega=0)")
         assert_omega_grid_covers(
             e_rel_ev / RYD_TO_EV, required_kn & covered, omega_ry,
             context=f"eqp2 map call {call_index + 1}")
@@ -2175,13 +2163,25 @@ def _hartree_density_embed_kernel(mesh_xy: Mesh, nb_full: int):
     return kernel
 
 
-def _dft_psi_sphere(inputs, *, full_density: bool = False):
-    """DFT ψ(G) on the SC k-set, loaded ONCE and cached.
+def _dft_psi_sphere(inputs):
+    """DFT ψ(G) on the SC k-set over the QP window, loaded ONCE and cached.
 
     The SC bundle carries ψ at ISDF CENTROIDS, which cannot reconstruct
     ρ on the FFT grid, so the density rebuild needs the G-sphere.  ψ_DFT
     is constant across iterations — only U moves — so this is one read per
     run, not one per iteration.
+
+    ONE WINDOW, READ AT ITS OWN CARRIER, NEVER SLICED.  The density and the
+    matrix sweep both consume exactly ``[b0, b3)``; the loader shards that
+    window over the whole mesh as it reads it (``band_sphere_spec``), which
+    is already the sweep's carrier.  Reading a wider ladder and slicing the
+    band axis afterwards is the defect this replaced: an eager slice of the
+    ``('x','y')``-sharded band axis lowers to a dynamic slice that the
+    partitioner resolves by replicating, and on VI3 12x12 at P100 that was
+    the whole ``(144, 200, 4, 72541)`` c128 window, 124.52 GiB on EVERY
+    rank (``runs/VI3/09_*/11_gnppm_sc_bispinor_ferroU6/gwjax.log``).  Why
+    the tail above ``b3`` may be left out of ρ is argued, and enforced, at
+    :func:`_density_window_occupations`.
 
     THE BAND RANGE IS GLOBAL, THE CARRY'S EXTENT IS b0-RELATIVE.
     ``WfnLoader.load`` indexes the file's bands, ``[0, wfn.nbands)``
@@ -2207,8 +2207,6 @@ def _dft_psi_sphere(inputs, *, full_density: bool = False):
             f"{b_hi - b_lo} bands but the SC carry is {nb_sigma} wide.  These "
             f"describe the same active subspace and a mismatch means one of "
             f"them is b0-relative where the other is global.")
-    if full_density:
-        b_hi = int(inputs.band_slices.b4_logical)
     # Key on the GLOBAL RANGE, not on its width: two windows of equal
     # extent at different b0 are different ψ and must not share a cache
     # entry.
@@ -2261,6 +2259,51 @@ def _kstar(inputs):
     if ks is not None:
         return ks
     return KStarMap.identity(int(inputs.kin_ion_dft.shape[0]))
+
+
+# The electrons the SC density may leave out of a band cut are budgeted
+# once, ``gw.qsgw_density.DENSITY_TAIL_ELECTRON_TOL``: the window cut
+# below and the occupied cut inside ``rho_from_wfns`` share it.
+
+
+def _density_window_occupations(occ, kweights, nb_window: int,
+                                f_spin: float):
+    """The QP-window occupations the density uses, after refusing a tail.
+
+    WHY THE WINDOW IS ENOUGH.  ``rho = f_spin sum_k w_k sum_n f_nk
+    |psi~_nk|^2`` with ``psi~ = psi . blockdiag(U_qp, 1)``.  ``U_qp`` mixes
+    only inside ``[b0, b3)`` (``b0 = 0``, :func:`run_sc_driver`), so every
+    band at or above ``b3`` is its own unrotated DFT state and enters only
+    through its own weight ``f_nk``.  Leaving those bands out moves rho by
+    ``f_spin sum_k w_k sum_{n>=b3} f_nk |psi_nk|^2``, whose integral of
+    ``|.|`` is at most ``D = f_spin sum_k w_k sum_{n>=b3} |f_nk|``
+    electrons (each ``|psi|^2`` integrates to one and the star average is an
+    average).  The Dirac current carries the same per-state weights and
+    ``|J| <= rho`` state by state (J = j/c), so D bounds it too.  ``D == 0``
+    makes the cut exact, not approximate; the check is on D itself.
+
+    ``occ`` is the rotated bundle's table on the density's k rows: tiny and
+    replicated ``P(None, None)`` (``rotate_wavefunctions``), so the slice
+    below cannot re-replicate anything.  Returns ``(occ_window, D)``.
+    """
+    from gw.qsgw_density import (DENSITY_TAIL_ELECTRON_TOL,
+                                 density_tail_electrons)
+
+    nb_window = int(nb_window)
+    if int(occ.shape[1]) < nb_window:
+        raise ValueError(
+            f"SC density occupations have {int(occ.shape[1])} bands, fewer "
+            f"than the {nb_window}-band QP window")
+    dropped = float(density_tail_electrons(occ, kweights, f_spin)[nb_window])
+    if not np.isfinite(dropped) or dropped > DENSITY_TAIL_ELECTRON_TOL:
+        raise ValueError(
+            "GATE sc_density_band_cut: bands at or above the QP window "
+            f"[0, {nb_window}) carry {dropped:.3e} electrons per cell "
+            f"(budget {DENSITY_TAIL_ELECTRON_TOL:.0e}).  The density is "
+            "built from the QP window only, because the QP rotation mixes "
+            "nothing above it; an occupied state there would be silently "
+            "dropped.  Widen the QP window (ncond) in a new calculation.")
+    return occ[:, :nb_window], dropped
 
 
 # THE DENSITY-SC ROW, AND ITS CHILDREN.  ``vh.rebuild`` is the whole
@@ -2328,19 +2371,19 @@ def rebuild_hartree_dft_basis(inputs, U_qp, occupations_full,
                                     sweep_matrix_elements)
     from psp.dft_operators import padded_gvectors
 
-    psi_G, bidx = _dft_psi_sphere(inputs, full_density=True)
+    # ONE resident ψ(G) serves the density AND the sweep: the QP window
+    # [b0, b3), read by the loader directly at its band-sharded carrier.
+    # Nothing below slices its band axis (_dft_psi_sphere says why).
+    psi_G, bidx = _dft_psi_sphere(inputs)
     nk = int(psi_G.shape[0])
-    # Density uses the full logical loaded ladder, including physical bands
-    # above the QP window.  The loader returns its mesh-padded carrier.
     nb_logical = int(inputs.band_slices.nb_sigma)
-    nb_full_logical = int(inputs.band_slices.nb_full_logical)
     from common.wfn_layout import band_sphere_spec
     from runtime.padding import authenticate_axis, padded_axis, strip_axis
-    full_band_axis = padded_axis(
-        nb_full_logical, inputs.mesh_xy, name='SC density band sphere',
+    band_axis = padded_axis(
+        nb_logical, inputs.mesh_xy, name='SC Hartree band sphere',
         spec=band_sphere_spec(), axis=1)
-    authenticate_axis(psi_G, full_band_axis, axis=1,
-                      where='SC exact Hartree density band sphere')
+    authenticate_axis(psi_G, band_axis, axis=1,
+                      where='SC exact Hartree band sphere')
     # The rotated bundle carries its face-mesh pad; rho_from_wfns owns the
     # further zero-occupation pad to the sphere carrier before its scan.
     bundle_shape = tuple(inputs.wfns_dft.enk.shape)
@@ -2361,13 +2404,16 @@ def rebuild_hartree_dft_basis(inputs, U_qp, occupations_full,
         raise ValueError(
             f'SC exact Hartree active rotation must be {nb_logical} square; '
             f'got {U_qp.shape[-2:]}')
+    f_spin = spin_degeneracy_factor(inputs.wfn)
+    occ, dropped = _density_window_occupations(
+        occ, kweights, nb_logical, f_spin)
     U_density = _hartree_density_embed_kernel(
-        inputs.mesh_xy, full_band_axis.carrier)(U_qp)
+        inputs.mesh_xy, band_axis.carrier)(U_qp)
     inputs.print_fn(
-        f'    V_H rebuild: current-map full-band occupations, '
+        f'    V_H rebuild: current-map occupations on the QP window '
+        f'[0, {nb_logical}) (tail above it: {dropped:.1e} e), '
         f'mu={float(efermi_ry) * RYD_TO_EV:.8f} eV')
 
-    f_spin = spin_degeneracy_factor(inputs.wfn)
     grid = tuple(int(v) for v in inputs.wfn.fft_grid)
     representation = resolve_four_current_representation(
         bool(inputs.config.bispinor), inputs.config.bispinor_gw)
@@ -2381,7 +2427,10 @@ def rebuild_hartree_dft_basis(inputs, U_qp, occupations_full,
         spin_degeneracy=f_spin,
         include_dirac_current=include_current,
         charge_nspinor=charge_ns, sym=inputs.sym,
-        sym_perm=inputs.sym.fft_grid_pullback(inputs.sym.active_symmetry_rows, grid))
+        sym_perm=inputs.sym.fft_grid_pullback(inputs.sym.active_symmetry_rows, grid),
+        memory_budget_bytes=float(getattr(getattr(inputs.config, "memory", None),
+                                          "per_device_gb", 0.0)) * 1e9,
+        print_fn=inputs.print_fn)
     rho_r = fields[0] if include_current else fields
     expected_electrons = f_spin * occupied_band_count(occ, kweights)
     with timing.section("vh.poisson"):
@@ -2419,21 +2468,24 @@ def rebuild_hartree_dft_basis(inputs, U_qp, occupations_full,
                 tt_metric_sign=float(COULOMB_GAUGE_TT_SIGN))
 
     gtab = padded_gvectors(inputs.wfn, k=inputs.sym.parent_k_domain)
+    # Both branches sweep the resident sphere itself.  The four-current
+    # operator takes the charge block by ``charge_nspinor``; without a
+    # current the loader read no bispinor, so the charge IS every loaded
+    # component and a spinor slice would only be a second copy of ψ.
+    if V_T_r is None and charge_ns != int(psi_G.shape[2]):
+        raise ValueError(
+            f'SC exact Hartree: scalar sweep needs charge nspinor '
+            f'{charge_ns} == loaded nspinor {int(psi_G.shape[2])}')
     geom_matrix = SweepGeometry(
         mesh=inputs.mesh_xy, fft_grid=grid,
         ngkmax=int(psi_G.shape[3]), nb=nb_logical,
-        ns=(int(psi_G.shape[2]) if V_T_r is not None
-            else charge_ns), nk=nk,
+        ns=int(psi_G.shape[2]), nk=nk,
         cell_volume=float(inputs.wfn.cell_volume))
-    # The sweep projects only the QP carry.  Keep its mesh-legal active
-    # carrier; the full density sphere above remains resident and sharded.
-    psi_matrix = psi_G[:, :geom_matrix.band_axis.carrier, :, :]
-    authenticate_axis(psi_matrix, geom_matrix.band_axis, axis=1,
-                      where='SC exact Hartree active band sphere')
-    psi_charge = psi_matrix[:, :, :charge_ns, :]
+    authenticate_axis(psi_G, geom_matrix.band_axis, axis=1,
+                      where='SC exact Hartree matrix band sphere')
     if V_T_r is not None:
         H_pair = sweep_matrix_elements(
-            psi_matrix,
+            psi_G,
             operator=four_current_potential_operator(
                 geom_matrix, V_H_r, V_T_r,
                 charge_nspinor=charge_ns),
@@ -2444,7 +2496,7 @@ def rebuild_hartree_dft_basis(inputs, U_qp, occupations_full,
         del H_pair
     else:
         H_scalar = sweep_matrix_elements(
-            psi_charge,
+            psi_G,
             operator=local_potential_operator(geom_matrix, V_H_r),
             geom=geom_matrix,
             gvecs=gtab.gvecs, gmask=gtab.mask, box_index=bidx,
@@ -2877,20 +2929,18 @@ def _classify_sc_partition(
             f"in_range={_band_ranges(partition.in_range_mask, band_offset=int(inputs.band_slices.b0))}; "
             "no band enters or leaves the set for the rest of the loop.")
     else:
-        partition = build_omega_band_partition(
-            energies_loop / RYD_TO_EV,
-            (reference_full if ks.is_identity else
-             np.asarray(ks.select(reference_full))),
-            band_offset=int(inputs.band_slices.b0),
-            omega_min_abs_ev=float(inputs.config.sigma.omega_min_ev) + mu_ev,
-            omega_max_abs_ev=float(inputs.config.sigma.omega_max_ev) + mu_ev,
-            previous_partition=(
-                None if previous_partition is None else
-                _partition_on_loop(previous_partition, inputs)),
-            mu_ev=mu_ev, current_indices_kn=indices_loop,
-            degeneracy_tol_ev=float(inputs.config.sc.exact_degeneracy_tol_ev),
-            label=f"SC map {int(iteration)} (identity, mu-anchored)",
-            print_fn=lambda line: _record_sc(inputs, line))
+        # Owner rule 2026-09-22: every band of the QP window keeps its full
+        # QSGW Sigma; an energy outside the omega grid evaluates Sigma_mn at
+        # omega = 0 (qsgw_utils.build_qsgw_sigma_xc). No band is scissored
+        # for leaving the grid, so there is nothing to classify.
+        ones = np.ones(energies_loop.shape, dtype=bool)
+        partition = BandPartition(protected_mask=jnp.asarray(ones), in_range_mask=jnp.asarray(ones))
+        _record_sc(
+            inputs,
+            f"  SC map {int(iteration)} (identity, mu-anchored) partition: all "
+            f"{energies_loop.shape[1]} QP-window identities protected; energies "
+            f"outside [{float(inputs.config.sigma.omega_min_ev):+.2f}, "
+            f"{float(inputs.config.sigma.omega_max_ev):+.2f}] eV use Sigma(omega=0).")
     if not ks.is_identity:
         partition = BandPartition(
             protected_mask=ks.broadcast(partition.protected_mask),
@@ -3290,14 +3340,16 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             valence_mask_kn=valence_kn,
             fit_mask_kn=fit_mask_kn,
             k_weights=k_star_weights(ks),
-            # The sum-band tail is not part of the rotated QP subspace. Its
-            # update is a rigid edge scissor defined by the lowest accidental-
-            # degeneracy manifold, not by a user-expanded near-degenerate/SOC
-            # scale.  A resolved 1.7 meV pair is physics and remains two
-            # distinct samples; only <=0.1 meV may be grouped here.
+            # The sum-band tail is not part of the rotated QP subspace; its
+            # update is one rigid scissor.  conduction_mean (default) takes
+            # the mean correction of every trusted conduction state in the
+            # window; frontier takes the lowest accidental-degeneracy
+            # manifold only (grouping <=0.1 meV, never resolved SOC pairs).
             conduction_frontier_tol_ev=(
                 float(inputs.config.sc.exact_degeneracy_tol_ev)
                 if inputs.config.sc.tail_fit == "frontier" else None),
+            conduction_rigid_mean=(
+                inputs.config.sc.tail_fit == "conduction_mean"),
         )
         enk_base_ev = apply_conduction_scissor_to_tail(
             np.asarray(inputs.wfns_dft.enk, dtype=np.float64) * RYD_TO_EV,
@@ -3308,7 +3360,10 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         enk_base = device_put_process_local(
             enk_base_ev / RYD_TO_EV,
             NamedSharding(inputs.mesh_xy, P(None, None)))
-        inputs.print_fn(
+        # _record_sc, not print_fn: the production log drops print_fn, and
+        # this law feeds chi0/W and the Sigma band sum every map.
+        _record_sc(
+            inputs,
             f"    SC sum-band tail: scissored [{tail_start}, "
             f"{logical_stop}) with conduction "
             f"alpha={tail_fit.alpha_c:+.4f}, "
@@ -3619,8 +3674,13 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         # ladder (energies, occupations, reference) is the DFT one, a step by
         # band index.  On a metal every head consumer (the static terms here,
         # the dynamic head of MPA and finalized samples) must see THIS map's
-        # ladder and its one occupation state instead.
-        if metal_occ_state is not None:
+        # ladder and its one occupation state instead.  The GN/HL-PPM head is
+        # band-diagonal in this map's basis too, so it takes this map's ladder
+        # on an insulator as well; its omega reference is then the PPM body's
+        # own (ppm_pipeline passes sigma_omega.efermi_ry).  CrI3 16x16 SC
+        # evaluated the head at DFT energies ~4-7 eV off the QP ones (audit
+        # 2026-09-23 item 5).  The MPA insulator head is unchanged here.
+        if metal_occ_state is not None or not mpa_mode:
             nb_sigma_head = int(inputs.meta.nb_sigma)
             iteration_head_response = replace(
                 iteration_head_response,
@@ -3628,7 +3688,9 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
                     wfns_qp.enk[:, :nb_sigma_head], dtype=np.float64),
                 sigma_occupations=np.asarray(
                     wfns_qp.occ[:, :nb_sigma_head], dtype=np.float64),
-                efermi_ry=float(metal_occ_state.mu_ry))
+                efermi_ry=(float(metal_occ_state.mu_ry)
+                           if metal_occ_state is not None
+                           else iteration_head_response.efermi_ry))
         # The static head is diagonal in THIS map's band basis, so its
         # occupations are this map's bundle table (the entry state on a
         # metal), never the frozen DFT response's step by band index.
@@ -3765,6 +3827,12 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             support_partition.protected_mask | support_partition.in_range_mask,
             dtype=bool), energies_loop.shape)
         energy_relative_ev = energies_loop - _mu_ev
+        # Owner rule 2026-09-22: states outside the requested window (plus the
+        # SC pad) use Sigma(omega=0); only states inside it may grow the grid.
+        win_lo, win_hi = sc_padded_window_ev(
+            float(inputs.config.sigma.omega_min_ev),
+            float(inputs.config.sigma.omega_max_ev))
+        required_kn = required_kn & (energy_relative_ev >= win_lo) & (energy_relative_ev <= win_hi)
         expanded_grid = extend_sc_omega_grid_ev(
             sampled_grid, energy_relative_ev, required_kn,
             float(inputs.config.sigma.omega_step_ev))
@@ -3885,6 +3953,19 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     # block and can create symmetry breaking in the next SC state. BGW
     # diagonal averaging belongs to the one-shot/output convention.
     H_qp_dft_full = inputs.kin_ion_dft + delta_h_dft
+    n_frozen_core = int(inputs.config.sc.frozen_core_bands)
+    if n_frozen_core > 0:
+        # Owner 2026-09-23 (CrI3): semicore off the Sigma grid is not updated
+        # at all -- neither Sigma(omega=0) nor a scissor -- but stays in every
+        # band sum.  H is on the loop's k-set; take the same rows of E_DFT.
+        _e_frz = inputs.e_dft_active_kn_ry
+        if not ks.is_identity:
+            _e_frz = ks.select(_e_frz)
+        H_qp_dft_full = _freeze_core_block_to_dft(
+            H_qp_dft_full, _e_frz, n_frozen_core)
+        if int(state.iteration) == 0:
+            _record_sc(inputs, f"    SC frozen core: bands 1-{n_frozen_core} "
+                               "held at their DFT block (not updated)")
     if (buffer_mask.any()
             and inputs.config.sc.buffer_mode == "carry"
             and int(state.iteration) > 0):
