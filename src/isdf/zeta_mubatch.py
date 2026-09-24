@@ -279,7 +279,8 @@ def make_batch_kernel(*, mesh: Mesh, rs: RSpec, plan, kgrid, fft_grid, ns: int,
     ``'transpose'``) builds the same kernel truncated after that stage,
     returning a checksum, so stage walls come from differences.
     """
-    from isdf.core import parent_projector_kconv
+    from isdf.core import parent_projector_kconv, _conv_kpair_static_gamma
+    from ffi.fft import make_fused_conv_kparent
     P_ = rs.n_ranks
     nk_src = int(plan.n_parent)
     nk = int(np.prod(kgrid))
@@ -333,6 +334,12 @@ def make_batch_kernel(*, mesh: Mesh, rs: RSpec, plan, kgrid, fft_grid, ns: int,
         def _host(x_idx, y_idx, bc_idx):
             return store.read_local_band_chunk(x_idx, y_idx, bc_idx)
 
+    # The k-convolution arm the r-chunk loop uses: native conv_kparent where
+    # its gate resolves it (CUDA auto), else the XLA tail.
+    p_l, ph_l = _conv_kpair_static_gamma(None, ns)
+    pair_kernel = make_fused_conv_kparent(
+        mesh, kgrid, ns, (b, rs.r_s), perm_l=p_l, phase_l=ph_l, perm_r=p_l,
+        phase_r=ph_l)
     phx = np.exp(-2j * np.pi * qv[:, 0:1] * (np.arange(nx) / nx)[None, :])
     phy = np.exp(-2j * np.pi * qv[:, 1:2] * (np.arange(ny) / ny)[None, :])
     phz = np.exp(-2j * np.pi * qv[:, 2:3] * (np.arange(nz) / nz)[None, :])
@@ -430,7 +437,8 @@ def make_batch_kernel(*, mesh: Mesh, rs: RSpec, plan, kgrid, fft_grid, ns: int,
             Z = parent_projector_kconv(
                 D_l, D_r, plan=plan, left_perm=l_perm, left_L=l_wrap,
                 right_perm=r_perm[0, s], right_L=r_wrap[0, s], kgrid=kgrid,
-                vertex_l=vertex, vertex_r=vertex)       # (nk, b, r_s)
+                vertex_l=vertex, vertex_r=vertex,
+                pair_kernel=pair_kernel)                # (nk, b, r_s)
             if stop_at == 'kconv':
                 return (buf, chk + jnp.sum(jnp.abs(Z))), None
             if q_neg is not None:
