@@ -5,8 +5,7 @@ control flow, so any disagreement is the sweep.  Owner tolerance is 1e-12
 relative; the sharding deliberately reassociates the G sum, so bit-identity
 is neither expected nor demanded (numerical-tolerance ruling).
 
-Four questions, in the order ``docs/dev/matrix_element_sweep_handoff.md``
-§6 asks them:
+Four questions, in this order:
 
   1. KINETIC — no FFT, so a failure isolates the scan, the reshard and the
      einsum, never the transform.  vs ``compute_kinetic_k``.

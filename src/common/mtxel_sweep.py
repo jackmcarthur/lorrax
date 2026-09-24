@@ -1,6 +1,6 @@
 """One k-tile scan serving V_H, kinetic+ion and dipole — G-split contraction.
 
-Implements ``docs/dev/matrix_element_sweep_handoff.md``.  Read
+API contract: ``docs/dev/rho_vh_2d_design.md``.  Read
 ``docs/architecture/decisions.md`` first: D10 (fixed-shape ``ngkmax`` G
 tables) and the 2026-08-04 SlabIO padding entry are both load-bearing.
 
@@ -10,8 +10,7 @@ Three sweeps with one shape between them —
 ``gw.kin_ion_io._vh_block``, ``._kin_ion_block`` and
 ``psp.get_dipole_mtxels._dipole_block`` — each calling
 ``collectives.gather_k_blocks``, which is k-partitioned and returns an
-array **identical on every rank**.  Three walls follow (measured in
-``docs/dev/rho_vh_2d_design.md`` §1):
+array **identical on every rank**.  Three walls follow:
 
   W1  the per-k full-band FFT box: 1.77 GB at b600 bispinor, 37 GB and
       OOM at 12×12, because the local plan takes BOTH sides of the
