@@ -55,14 +55,12 @@ arc on this branch:
 
 ## Compilation breakdown
 
-JAX persistent compile cache: LORRAX owns it through
-`$ISDF_JAX_CACHE_DIR`.  A named workflow defaults to
-`$LORRAX_RUN_DIR/.lorrax_jax_cache/npP`; use an explicit fresh base for a
-cold/populate/warm experiment:
+JAX persistent compile cache: on by default, one namespace per source
+release under `$SCRATCH/.cache/lorrax/jax_compile` (the policy and its
+knobs: `common/jax_compile_cache.py`, `docs/dev/env_vars.md`).  For a
+cold/populate/warm experiment name a fresh directory, which is used as-is:
 
 ```bash
-module load lorrax_B
-unset JAX_COMPILATION_CACHE_DIR
 export ISDF_JAX_CACHE_DIR=/path/to/fresh_cache
 ```
 

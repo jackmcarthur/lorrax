@@ -298,7 +298,7 @@ Environment variables, loosely in order of how often you'd touch them:
 
 | var | default | effect |
 |---|---|---|
-| `ISDF_JAX_CACHE_DIR` | `~/.cache/isdf_jax_compilation` | persistent compile-cache path; set to `""` to disable. Safe and ON at every process count since scorecard AH — see `common/jax_compile_cache.py` and `docs/dev/env_vars.md` for the `LORRAX_JAX_CACHE_*` knobs |
+| `ISDF_JAX_CACHE_DIR` | unset: `$SCRATCH/.cache/lorrax/jax_compile/<namespace>` | persistent compile-cache path; `""` disables it. The policy lives in `common/jax_compile_cache.py`; the knobs are in `docs/dev/env_vars.md` |
 | `LORRAX_PHDF5_INDEPENDENT` | `0` | if `1`, force **reads** to independent — rarely helpful on OpenMPI; neutral on Cray |
 | `LORRAX_PHDF5_COLLECTIVE_WRITES` | `1` | if `0`, back to independent writes (pre-AI behaviour; the strided-tile pathology is 3 orders slower — scorecard AI).  The Cray MPICH `ad_cray_write_coll.c:669` OOM caution (≥ 1 GB/rank) predates this default and is recorded in context.cc |
 | `LORRAX_PHDF5_DEDUP_REPLICAS` | `1` | if `0`, replica ranks all write their identical copy — UB under collective MPI-IO, debugging only |

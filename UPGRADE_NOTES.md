@@ -28,8 +28,9 @@ changes live in `docs/architecture/decisions.md`.
   run. The per-driver `jax.config.update` lines are gone.
 - Drivers no longer arm the persistent compile cache; step 7 of
   `runtime.initialize_communicator_stack` owns it. With `ISDF_JAX_CACHE_DIR`
-  unset and `LORRAX_RUN_DIR` set, sequential drivers share one
-  workflow-local cache under `$LORRAX_RUN_DIR/.lorrax_jax_cache`.
+  unset it is on, in one namespace per source release under
+  `$SCRATCH/.cache/lorrax/jax_compile`, with JAX's write threshold at 0;
+  `ISDF_JAX_CACHE_DIR=""` turns it off.
 - BSE-family drivers: omitted `--px/--py` now means the run's canonical
   square mesh (it used to mean 1×1). An explicit shape must consume the
   job's device count exactly — under- and over-requests both refuse.

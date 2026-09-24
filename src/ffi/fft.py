@@ -589,8 +589,8 @@ def cubin_cache_dir() -> str:
     """Where the compiled mathdx kernels are kept: ``$SCRATCH/.cache/lorrax/kconv_mathdx``,
     or ``~/.cache/lorrax/kconv_mathdx`` where the site defines no ``SCRATCH``.
 
-    Always on, and deliberately NOT the XLA compile cache's policy
-    (``ISDF_JAX_CACHE_DIR``, cold by default under ``lx``): this store is small
+    Always on, and separate from the XLA compile cache
+    (``common.jax_compile_cache``, one namespace per release): this store is small
     and content-addressed — each image is keyed by the full hash of its source,
     NVRTC options, wheel version and NVRTC version, written by tmp+rename and
     re-hashed on read — so reusing it can never change a result, while
