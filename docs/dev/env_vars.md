@@ -1,32 +1,30 @@
 # LORRAX environment variables — the registry
 
-*Every environment variable LORRAX reads, what it defaults to, how it
-parses, and whether it should still be an env var at all.  Rows also name
-where the variable is read, but that is an ADVISORY convenience, not
-something this page owns or anything gates — see [What this page is, and
-what it is not](#what-this-page-is-and-what-it-is-not).*
+This page owns four facts about every environment variable LORRAX reads: its
+**spelling**, its **default**, its **class**, and its **parse grammar**. Each
+row adds one sentence on what the variable controls and what it refuses; the
+explanation belongs to the page the row links to. `tests/test_env_registry.py`
+fails when a variable read under `src/` or `services/*/src` (Python or C++)
+has no row here.
 
-First generated 2026-07-25 from an audit of every `os.environ` /
-`os.getenv` / `getenv()` read under `src/` (Python **and** C++);
-reorganized 2026-07-27 (workstream AV) around the rule the campaign keeps
-re-learning (QUALITY_PATTERNS #8):
+**Policy.** The environment grants machine capability (library paths,
+transport, thread counts, resource caps) and debug switches. It never selects
+physics or routing: those are input-file keys, which are validated, echoed and
+recorded in provenance. An env twin of an input key that still works is
+deprecated and prints a notice whenever it is set (§1a); the routing-affecting
+variables that remain are §1b.
 
-Re-audited 2026-09-02 against the bounded Python roots `src/gw`,
-`src/common`, `src/centroid`, `src/file_io`, and `services/*/src`. The grep
-found 95 read-site lines; every literal spelling is represented below.
-Fallback aliases remain grouped with their owner rows—notably
-`LORRAX_PHDF5_STRIPE_SIZE` under `LORRAX_PHDF5_STRIPE_SIZE_FS`, and
-`JAX_NUM_PROCESSES` in the process-count fallback chain.
+**Grammars used below.** *bool* is `runtime/env_flags.py::env_bool`: unset or
+blank gives the default, `1 true yes on` (any case) is on, `0 false no off` is
+off, and any other value is off and announced once with `*** LORRAX SANITY`.
+*falsy-set* means `"" 0 false no off` (any case) is off and every other value
+is on. A row with neither word states its own grammar.
 
-> **Environment may grant capability; it must not silently select
-> policy.**  Physics- and routing-relevant choices change only via
-> declared inputs (the input file), where they are parsed, validated,
-> echoed into the run log, and captured by provenance.  Env vars are for
-> *machine facts* (where a library lives, which fabric, how many ranks)
-> and for *debug switches*.  Where an env var still overrides an input
-> key, that override is DEPRECATED and prints loudly.
+What a run resolved is printed in its rank-0 [startup report](../environment/overview.md#startup-block).
+Several variables are read once, before backend creation, so `os.environ`
+after startup is not evidence of what applied.
 
-## What this page is, and what it is not
+## Network transport at startup
 
 Network startup machine facts and overrides (behavior is owned by
 [`Perlmutter startup`](../environment/machines/perlmutter.md#network-transport-at-startup)):
@@ -40,112 +38,6 @@ Network startup machine facts and overrides (behavior is owned by
 | `NCCL_NET`, `NCCL_NET_PLUGIN` | site defaults only for multi-node Perlmutter CUDA launched with `SLURM_NETWORK=no_vni` | transport override | Presence preserves the caller's configuration and bypasses automatic site selection, including empty values; on multi-node Perlmutter CUDA, `NCCL_NET=Socket` (any case) is refused. Plugin may be an absolute library filename. |
 | `SLURM_NETWORK` | unchanged; `lx run` exports `no_vni` for GPU steps on more than one node | launcher network allocation | Comma-separated Slurm network options; the `no_vni` token selects automatic Perlmutter OFI. A multi-node Perlmutter CUDA step without it is refused at startup. A raw `srun` must set it itself. See the Perlmutter machine page; setting it inside Python is too late. |
 | `NCCL_NET_GDR_LEVEL`, `FI_CXI_DISABLE_HOST_REGISTER`, `FI_CXI_RDZV_THRESHOLD`, `NCCL_CROSS_NIC`, `NCCL_SOCKET_IFNAME` | site profile when selected | machine transport settings | Existing values are preserved verbatim; otherwise the supported site profile supplies defaults. |
-
-**This page owns four columns and nothing else: the SPELLING, the DEFAULT,
-the CLASS, and the PARSE GRAMMAR of every variable LORRAX reads.** Those four
-are what `tests/test_env_registry.py` enforces and what nothing else in the
-tree records.
-
-**The read site is not a fifth column.** Most rows name the file or the
-function where the variable is read, and that pointer is worth having, but
-it is advisory and nothing checks it. `test_env_registry.py` is pure
-name-token coverage — it walks `source_roots()` for spellings and never
-resolves a path — so a row keeps passing after the module it cites has
-moved or been deleted, which is how the `wfn_loader` and `zeta_loader`
-rows came to point at shims that had already been deleted. Some
-paths are *deliberately* historical: the four `_slab_io_mpi_host.py` rows
-record where a since-deleted transport read its knobs, and other rows
-point into `cpp/`, `context.cc` or `run_shifter.sh`, outside `src/`
-entirely. Treat a read site as a lead to follow, not as a fact this page
-warrants; if it is wrong, fixing it is welcome and gates nothing.
-
-**It does not own the explanation.** Why collective writes are on, what the
-nvhpc stage selects, how the allocator changes what `memory_stats()` reports
-— each of those has an owner page, named in the
-[register](../index.md#register), and each row below links to it instead of
-repeating it. Rows that used to carry a paragraph of measurement now carry
-one sentence and a link.
-
-That is a deliberate reduction and it is the point. This page had grown to
-carry a second copy of `slab_io.md`'s tuning campaign, a second copy of
-`environment/overview.md`'s allocator table and a second copy of
-`mpi_collectives.md`'s transport argument. Three copies of a fact is three
-places for it to go stale, and it did: the `LORRAX_FFT_FFI` row still said
-the CPU engine was "MKL FFT (DFTI API)" five days after `DftiCreateDescriptor`
-was deleted from the translation unit.
-
-Parse grammar stays here in full, including the ugly parts, because a knob's
-grammar *is* its interface and there is nowhere else it is written down. Where
-two sites read one variable with two different parses, that is recorded in the
-[consistency audit](#consistency-audit) — a split parse is a defect this page
-is responsible for surfacing.
-
-## How to read this page
-
-Three classes, in three sections:
-
-| class | meaning | section |
-|---|---|---|
-| **input-file keys (env twins deprecated)** | policy: physics / numerics / routing. The key is the record; any env twin still honoured prints a deprecation notice. | §1 |
-| **machine-capability env** | runtime machine/library facts and resource caps. Legitimately env vars. May affect perf, never physics. | §2 |
-| **debug / diagnostic env** | printing, dumping, timing, test hooks. Never changes numerics. | §3 |
-
-Build-time-only variables (§4) and external variables LORRAX sets or
-depends on (§5) close the page.  The **Measured scope** column records
-the conditions under which a default was chosen (QUALITY_PATTERNS #9:
-every performance claim carries its measured domain) — an empty cell
-means the default is a design constant, not a measurement.
-
----
-
-## 0. Do not read this page to find out what a RUN resolved
-
-This page is the registry of what *can* be set.  What a particular run
-*did* resolve is printed by the run itself, in one rank-0 block, by
-`runtime.initialize_communicator_stack()` — the single startup call every
-core driver makes.  Read the block; it is authoritative in a way this page
-cannot be, because several of these knobs interact and two of them
-(`XLA_PYTHON_CLIENT_ALLOCATOR`, `XLA_PYTHON_CLIENT_PREALLOCATE`) are read
-from the environment only *before* backend init, after which `os.environ`
-is a **false witness** — measured, job 7882443: two runs with byte-identical
-`os.environ` and `bytes_limit` 11.805 GB vs 0.000 GB.
-
-The block states, in complete sentences, every choice where more than one
-outcome was possible:
-
-* the process count, the resolved platform, the device count and kind, and
-  the device mesh with a note that its communicator cliques were warmed;
-* **every demotion**, tagged `DEMOTION:` — the CPU pin, the CUDA-plugin
-  skip, a failed `jax.distributed` auto-detect, a malloc tuning that did
-  not arm.  (Rank-0's demotions only; a demotion that happened on one other
-  rank is announced from that rank, and the block says so.);
-* the CPU collectives transport and **why** it resolved that way; live
-  multi-process CPU startup refuses gloo because its measured failure is
-  silent corruption (the pure formatter retains the hypothetical diagnosis);
-* the XLA pool **read from `jax.local_devices()[0].memory_stats()`**, and a
-  warning when the live client disagrees with the environment;
-* which FFI `.so` loaded and from which variable; `LORRAX_BANDS_GEMM_FFI`
-  and `LORRAX_FFT_FFI` each with their resolved
-  mode and route — *including when they are off*, because silence about an
-  off dial is indistinguishable from silence about an on one.  (The FFI
-  layer is REQUIRED since 2026-08-01: startup enforcement —
-  `Gate.enforce`, step 6b — refuses a missing library before this block
-  prints, so an off dial in the block is always an explicit `=0` opt-out,
-  stated as uncertified or as a refusal per the dial's `off_policy`);
-* the distributed linalg backends available for `eigh` / `cholesky` /
-  `solve_lu` on this mesh (capability; the CHOICE is an input-file key);
-* CPU affinity and the thread-count variables, with an oversubscription
-  warning;
-* the persistent compile-cache state and directory, always with the caveat
-  that the key includes every array shape;
-* whether the fail-fast excepthook and the glibc malloc tuning are armed;
-* how long each startup phase took, so the 43.8 s `jax.distributed` init at
-  P=16 and the 75.0 s cold-node import storm are visible without a profiler.
-
-Adding a dial and *not* adding it to that block is a bug, and
-`tests/test_runtime_startup_report.py` fails on it: it scans `src/ffi/**`
-for `Gate(env=…)` and requires `runtime._ffi_dial_facts` to collect every
-one it finds.
 
 ---
 
