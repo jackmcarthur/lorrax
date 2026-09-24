@@ -74,7 +74,7 @@ def test_the_shipped_defaults_are_full_reorth():
             f"{fn.__name__} defaults to n_reorth={default!r}, not FULL_REORTH")
 
     from bse import bse_lanczos as BL
-    for fn in (BL.solve_bse, BL.solve_bse_sharded):
+    for fn in (BL.solve_bse_sharded,):
         default = inspect.signature(fn).parameters["n_reorth"].default
         assert default == LZ.FULL_REORTH, (
             f"{fn.__name__} defaults to n_reorth={default!r}, not FULL_REORTH")

@@ -371,10 +371,10 @@ def test_sigma_spatial_cache_owns_plan_and_selects_each_plans_parent_rows(monkey
                 psi_nmu=np.zeros((2, 1, 1, 4))))
 
     monkeypatch.setattr(tau, "_sigma_spatial_kernel_cache", {})
-    monkeypatch.setattr(tau, "_fft_ffi_fused_enabled", lambda: True)
     monkeypatch.setattr(tau, "ensure_jax_compile_cache", lambda: None)
-    monkeypatch.setattr("common.fft_helpers.make_flat_k_gw_conv",
-                        lambda *a, **k: lambda g, w: g)
+    monkeypatch.setattr("common.fft_helpers.make_kconv_klead",
+                        lambda *a, **k: SimpleNamespace(prep=lambda w: w,
+                                                        apply=lambda g, w: g))
     monkeypatch.setattr("common.contract_bands.contract_bands_block_reshard",
                         lambda *a, **k: lambda left, operator, right: operator)
     monkeypatch.setattr("symmetry_maps.unfold_file_wedge_band_operator",

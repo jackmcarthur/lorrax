@@ -29,9 +29,9 @@ def test_ordered_sigma_matches_real_space_igw_and_the_swapped_routing_does_not(m
 
     import distrib_la
 
+    # The flat-k transforms through the jnp emulation (no host FFI library); the Σ
+    # convolution takes the k-convolution router's announced cpu test arm.
     cpu_flat_k_fft(monkeypatch)
-    # The decomposed IFFT, G W, FFT chain through the emulated flat-k transforms (no host FFI library).
-    monkeypatch.setattr(tau_kernel, "_fft_ffi_fused_enabled", lambda: False)
 
     # Every planned GEMM (G build with active ranges, band projection) through the service's
     # local plan: on one CPU device auto would resolve a provider without a warmed kernel.

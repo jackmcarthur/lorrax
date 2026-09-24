@@ -44,7 +44,7 @@ def _random_stack(nt, nc, nv, nk):
 def _place(data, mesh):
     """Shard the fixture arrays + build W_R and the hoisted pair-amps M_X/M_Y."""
     from bse.bse_ring_comm import make_bse_shardings
-    from bse.bse_serial import compute_pair_amplitude
+    from bse.bse_preconditioner import compute_pair_amplitude
     sh = make_bse_shardings(mesh)
     with mesh:
         out = dict(
@@ -66,11 +66,11 @@ def _place(data, mesh):
 
 @pytest.mark.gpu
 @pytest.mark.parametrize("kernel", ["bse", "rpa"])
-def test_stack_matches_dense_and_simple(bse_dense_state, kernel):
-    """stack(X)[b] == H @ X[b] (dense) and == simple(X[b]), per trial."""
+def test_stack_matches_dense_and_ring(bse_dense_state, kernel):
+    """stack(X)[b] == H @ X[b] (dense) and == ring(X[b]) (the test oracle), per trial."""
     harness.skip_unless_gpu(pytest)
     from bse.bse_stack_matvec import build_bse_stack_matvec
-    from bse.bse_simple import build_bse_simple_matvec
+    from bse.bse_ring_comm import build_bse_ring_matvec
 
     data = bse_dense_state
     H, D, Kx, _ = _build_dense_H(data)
@@ -87,14 +87,15 @@ def test_stack_matches_dense_and_simple(bse_dense_state, kernel):
     with mesh:
         Xs = jax.lax.with_sharding_constraint(X, sh.X)
         stack_mv = build_bse_stack_matvec(mesh, nkx, nky, nkz, kernel=kernel)
-        simple_mv = build_bse_simple_matvec(mesh, nkx, nky, nkz, include_W=include_W)
+        ring_mv = build_bse_ring_matvec(mesh, nkx, nky, nkz, include_W=include_W,
+                                        low_mem=True)
         HXs = np.asarray(stack_mv(
             Xs, arr["psi_c_X"], arr["psi_c_Y"], arr["psi_v_X"], arr["psi_v_Y"],
             data["eps_c"], data["eps_v"], arr["W_R"], arr["V_q0"],
             arr["M_X"], arr["M_Y"]))
         for t in range(nt):
             xin = jax.lax.with_sharding_constraint(Xs[t:t + 1], sh.X)
-            s_t = np.asarray(simple_mv(
+            s_t = np.asarray(ring_mv(
                 xin, arr["psi_c_X"], arr["psi_c_Y"], arr["psi_v_X"], arr["psi_v_Y"],
                 data["eps_c"], data["eps_v"], arr["W_R"], arr["V_q0"],
                 arr["M_X"], arr["M_Y"]))[0].reshape(-1)
@@ -103,7 +104,7 @@ def test_stack_matches_dense_and_simple(bse_dense_state, kernel):
             assert _relerr(got, ref) < 1e-9, \
                 f"{kernel} trial {t}: vs dense relerr {_relerr(got, ref):.2e}"
             assert _relerr(got, s_t) < 1e-9, \
-                f"{kernel} trial {t}: vs simple relerr {_relerr(got, s_t):.2e}"
+                f"{kernel} trial {t}: vs ring relerr {_relerr(got, s_t):.2e}"
 
 
 @pytest.mark.gpu

@@ -146,16 +146,8 @@ def _relerr(a, b):
 
 def _matvec(kind, data, X, include_W=True):
     from jax.sharding import Mesh
-    from bse.bse_serial import (apply_bse_hamiltonian_single_device,
-                                compute_pair_amplitude)
-    if kind == "serial":
-        return apply_bse_hamiltonian_single_device(
-            jnp.asarray(X), jnp.asarray(data["psi_c"]), jnp.asarray(data["psi_v"]),
-            jnp.asarray(data["eps_c"]), jnp.asarray(data["eps_v"]),
-            jnp.asarray(data["W_q"]), jnp.asarray(data["V_q0"]), NK, 1, 1,
-            include_W=include_W)
+    from bse.bse_preconditioner import compute_pair_amplitude
     from bse.bse_ring_comm import build_bse_ring_matvec, make_bse_shardings
-    from bse.bse_simple import build_bse_simple_matvec
     from bse.bse_stack_matvec import build_bse_stack_matvec
     mesh = Mesh(np.array(jax.devices()[:1]).reshape(1, 1), axis_names=("x", "y"))
     sh = make_bse_shardings(mesh)
@@ -170,9 +162,7 @@ def _matvec(kind, data, X, include_W=True):
         W_R = jnp.fft.ifftn(Wq, axes=(2, 3, 4), norm="ortho")
         M_X = jax.lax.with_sharding_constraint(compute_pair_amplitude(pcx, pvx), sh.psi_x)
         M_Y = jax.lax.with_sharding_constraint(compute_pair_amplitude(pcy, pvy), sh.psi_y)
-        if kind == "simple":
-            mv = build_bse_simple_matvec(mesh, NK, 1, 1, include_W=include_W)
-        elif kind == "stack":
+        if kind == "stack":
             mv = build_bse_stack_matvec(mesh, NK, 1, 1)
         else:
             mv = build_bse_ring_matvec(mesh, NK, 1, 1, include_W=include_W,
@@ -238,7 +228,7 @@ def test_full_H_covariance_and_red_twins(sym_fixture):
         "RED TWIN FAILED: fixed H should not commute with conj(U)")
 
 
-@pytest.mark.parametrize("kind", ["serial", "simple", "stack"])
+@pytest.mark.parametrize("kind", ["stack"])
 def test_cross_solver_agreement(sym_fixture, kind):
     """Every live matvec path builds the SAME corrected operator.
 

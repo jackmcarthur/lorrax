@@ -106,7 +106,7 @@ def _worker() -> int:
     from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
     import bse.bse_ring_comm as brc
-    from bse.bse_serial import compute_pair_amplitude
+    from bse.bse_preconditioner import compute_pair_amplitude
 
     devs = jax.devices()
     if len(devs) < _NDEV:

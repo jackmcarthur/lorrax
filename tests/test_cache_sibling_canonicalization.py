@@ -287,8 +287,7 @@ def test_the_declared_dials_are_the_ones_ffi_dial_key_actually_reads():
     """The declaration must not drift from the function it describes."""
     src = (REPO_ROOT / "src" / "ffi" / "__init__.py").read_text()
     body = src[src.index("def ffi_dial_key"):]
-    for dial, gate in (("LORRAX_FFT_FFI_FUSED", "fused_fft_ffi_enabled"),
-                       ("LORRAX_FFT_FFI", "fft_ffi_enabled"),
+    for dial, gate in (("LORRAX_FFT_FFI", "fft_ffi_enabled"),
                        ("LORRAX_BANDS_GEMM_FFI", "gemm_ffi_enabled")):
         assert gate in body, f"{gate} is no longer read by ffi_dial_key"
         assert dial in src, f"{dial} is not declared in FFI_DIAL_ENV"

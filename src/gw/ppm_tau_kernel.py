@@ -54,8 +54,6 @@ _sigma_shared_tau_kernel_cache: dict[
 TAU_PHASE_W_PHASE = "sigma.tau.w_phase"
 TAU_PHASE_W_PREP = "sigma.tau.w_prep"
 TAU_PHASE_G_BUILD = "sigma.tau.G_build"
-TAU_PHASE_G_IFFT = "sigma.tau.G_ifft"
-TAU_PHASE_GW_MULT_FFT = "sigma.tau.GW_mult_fft"
 TAU_PHASE_GW_CONV_FFI = "sigma.tau.GW_conv_ffi"
 TAU_PHASE_PROJECT_RS = "sigma.tau.project_rs"
 
@@ -64,8 +62,6 @@ TAU_KERNEL_PROFILE_PHASES = (
     TAU_PHASE_W_PHASE,
     TAU_PHASE_W_PREP,
     TAU_PHASE_G_BUILD,
-    TAU_PHASE_G_IFFT,
-    TAU_PHASE_GW_MULT_FFT,
     TAU_PHASE_GW_CONV_FFI,
     TAU_PHASE_PROJECT_RS,
 )
@@ -77,8 +73,8 @@ def _stage_timing_enabled() -> bool:
     Diagnostic knob (2026-07-28; evidence: AQ 4962c/P=64 HLO module_0912 —
     'sigma.exec 272.040' is a single opaque row, 176 τ dispatches at a uniform
     ~1.51 s that no existing timing row decomposes).  When ON, the per-τ body
-    is dispatched as its cached stage jits (W-phase build / G build / flat-k
-    IFFTs / G·W multiply + forward FFT / ψ-projection + reduce-scatter), each
+    is dispatched as its cached stage jits (W-phase build / W prep / G build /
+    the fused G·W k-convolution / ψ-projection + reduce-scatter), each
     wrapped in a blocking ``timing.section`` sub-row, so ONE run splits the
     per-τ wall into those stages.  When OFF (default) the production fused
     ``_tau_kernel`` jit is returned unchanged — the flag is read once at
@@ -95,32 +91,6 @@ def _stage_timing_enabled() -> bool:
     n_atoms / N_μ / nk / P / backend.
     """
     return env_bool("LORRAX_SIGMA_TAU_TIMING", False)
-
-
-def _fft_ffi_fused_enabled() -> bool:
-    """``LORRAX_FFT_FFI_FUSED=1`` routes the τ kernel's IFFT·(G·W)·FFT step
-    through ONE fused FFTW3-ABI host-FFI entry point
-    (``common.fft_helpers.make_flat_k_gw_conv``) so the R-space G tile never
-    materializes.  O(N log N) FFTs via the FFTW3 advanced-layout plans reading the
-    dot-layout tile directly (NOT a DFT-as-matmul) — see the backend block
-    in fft_helpers.  Independent of ``LORRAX_FFT_FFI``; default ON since
-    the FFI-required ruling (decisions.md 2026-08-01) — ``=0`` opts out to
-    the decomposed three-transform chain, which is itself FFI-served.  Read
-    at kernel-factory time and part of the kernel cache keys.
-    Announce/refuse semantics live in the FFT service factory (raises if
-    the platform's .so lacks the handler).
-
-    THE FLAG IS NOT READ HERE (2026-07-30).  It used to be — a consumer
-    parsing ``in ("1","true","yes","on")`` with no grammar check and no
-    announcement, so ``=yes`` worked, ``=Y`` silently did nothing, and
-    neither said anything.  That violated the FFT service's own stated rule
-    ("these helpers stay THE single FFT entry point — the backend switch
-    happens here and nowhere else", ``fft_helpers.py:306-307``).  The gate
-    now lives with the handler it gates (``ffi.mklfft.FUSED_GATE``, on the
-    shared ``ffi.gate.Gate``), with the same strict grammar as the
-    other two dials; every spelling that worked before still works."""
-    from ffi.mklfft import fused_fft_ffi_enabled
-    return fused_fft_ffi_enabled()
 
 
 def _make_project_ri_reduce_scatter(
@@ -154,25 +124,18 @@ class SpatialKernel(NamedTuple):
     """The ``G_k x W_q -> Sigma_kij`` owner, split at its ONE τ-local seam.
 
     ``prep_w(W_q) -> W_prep``
-        Everything in the chain that depends on W and NOT on G.  On the
-        decomposed chain that is ``ifftn(W)`` — the R-space screened
-        interaction — and hoisting it is the one real saving available to a
-        caller that contracts SEVERAL G(τ) against the same W(τ) (the band
-        brackets).  On the fused ``gw_conv`` chain it is the IDENTITY,
-        because that entry point's ABI takes W in k-space and performs its
-        transform inside the pinned handler; see the note in
-        :func:`get_sigma_spatial_kernel`.
+        Everything in the chain that depends on W and NOT on G: the
+        k-convolution router's ``prep`` (``ifftn(W)`` into R space on CUDA,
+        the identity on the cpu handler, which transforms W itself).  Hoisting
+        it is the saving available to a caller that contracts SEVERAL G(τ)
+        against the same W(τ) (the band brackets).
     ``conv_project(psi_xr, psi_yn, G_k, W_prep) -> Sigma``
-        The G-dependent remainder: the G transform, the R-space multiply,
-        the forward transform and the ψ projection.  Paid ONCE PER G(τ).
-        ``G_k`` arrives in the Green's own centroid-major order and is put
-        into the fused handler's operand order here
+        The G-dependent remainder: the router's fused ``apply`` (G transform,
+        R-space multiply, forward transform, one pass) and the ψ projection.
+        Paid ONCE PER G(τ).  ``G_k`` arrives in the Green's own centroid-major
+        order and is put into the convolution's operand order here
         (``wavefunction_bundle.sigma_conv_operand``); Σ_k leaves in that
         order, the face projector's contract.
-
-    Composed back to back this is exactly the single callable this factory
-    used to return; the split exists so the caller can place the loop
-    boundary between the two halves instead of around both.
     """
     prep_w: Callable[..., jax.Array]
     conv_project: Callable[..., jax.Array]
@@ -188,11 +151,16 @@ def get_sigma_spatial_kernel(
     face_band_extent=None,
     k_unfold_plan=None,
 ) -> SpatialKernel:
-    """Convolve a Green tile with one prepared W tile and project on typed raw parents."""
+    """Convolve a Green tile with one prepared W tile and project on typed raw parents.
+
+        Σ_k = -1/√N_k · fftn( ifftn(G_k) · ifftn(W_q)[:, None, :, None, :] )
+
+    through the k-convolution router (``common.fft_helpers.make_kconv_klead``):
+    nvidia-mathdx on CUDA, the FFTW gw_conv handler on cpu.
+    """
     kgrid = tuple(int(x) for x in kgrid)
     nk_tot = kgrid[0] * kgrid[1] * kgrid[2]
-    from common.fft_helpers import (
-        make_flat_k_fftn, make_flat_k_gw_conv, make_flat_k_ifftn)
+    from common.fft_helpers import make_kconv_klead
     from ffi import ffi_dial_key
     key = (id(mesh_xy), kgrid, _stage_timing_enabled(), ffi_dial_key(),
            bool(merged_x), layout, face_shape, face_band_extent,
@@ -203,22 +171,8 @@ def get_sigma_spatial_kernel(
                                       V_FFT5D_SPEC as _V_spec,
                                       sigma_conv_operand)
     ensure_jax_compile_cache()
-    inv_sqrt_nk = -1.0 / np.sqrt(float(nk_tot))
-    use_fused_ffi = _fft_ffi_fused_enabled()
-    if use_fused_ffi:
-        # ONE fused FFTW3-ABI (host) / cuFFT (CUDA) FFI call per rank per τ:
-        # sigma_k = fftn(ifftn(G_k)·ifftn(W_q)[:,None,:,None,:]·inv_sqrt_nk)
-        # with the R-space G tile chunked away inside the handler.  The
-        # decomposed helpers below are deliberately NOT built on this route
-        # (their announce/probe belongs to LORRAX_FFT_FFI).
-        _gw_conv = make_flat_k_gw_conv(
-            mesh_xy, kgrid, _G_spec, _V_spec,
-            norm='ortho', mult=inv_sqrt_nk)
-    else:
-        _G_ifftn = make_flat_k_ifftn(mesh_xy, kgrid, _G_spec, norm='ortho')
-        _G_fftn  = make_flat_k_fftn( mesh_xy, kgrid, _G_spec, norm='ortho')
-        _V_ifftn = make_flat_k_ifftn(mesh_xy, kgrid, _V_spec, norm='ortho')
-
+    kconv = make_kconv_klead(mesh_xy, kgrid, _G_spec, _V_spec,
+                             norm='ortho', mult=-1.0 / np.sqrt(float(nk_tot)))
     project = _make_project_ri_reduce_scatter(
         mesh_xy, merged_x=merged_x, layout=layout, face_shape=face_shape,
         face_band_extent=face_band_extent, k_unfold_plan=k_unfold_plan)
@@ -226,65 +180,35 @@ def get_sigma_spatial_kernel(
     @jax.jit
     def prep_w(W_q):
         """The W-only half of the chain — see :class:`SpatialKernel`."""
-        if use_fused_ffi:
-            return W_q
-        return _V_ifftn(W_q)[:, None, :, None, :]
+        return kconv.prep(W_q)
 
     @partial(jax.jit, donate_argnums=(2,))
     def conv_project(psi_proj_xr, psi_proj_yn, G_k, W_prep):
-        # The Green's own order is centroid-major; the handler's operand
+        # The Green's own order is centroid-major; the convolution's operand
         # order is fixed (SIGMA_CONV_G7D_SPEC).  One copy, replacing the
         # one the parent-k unfold used to make.
-        G_k = sigma_conv_operand(G_k)
-        if use_fused_ffi:
-            sigma_k = _gw_conv(G_k, W_prep)
-        else:
-            sigma_k = _G_fftn(_G_ifftn(G_k) * W_prep * inv_sqrt_nk)
+        sigma_k = kconv.apply(sigma_conv_operand(G_k), W_prep)
         return project(psi_proj_xr, sigma_k, psi_proj_yn)
     if not _stage_timing_enabled():
         pair = SpatialKernel(prep_w=prep_w, conv_project=conv_project)
         _sigma_spatial_kernel_cache[key] = pair
         return pair
-    if use_fused_ffi:
-        _conv_j = jax.jit(lambda G_k, W_prep: _gw_conv(sigma_conv_operand(G_k), W_prep),
-                          donate_argnums=(0,))
-    else:
-        _G_ifft_j = jax.jit(lambda G_k: _G_ifftn(sigma_conv_operand(G_k)),
-                            donate_argnums=(0,))
-        _V_ifft_j = jax.jit(lambda W_q: _V_ifftn(W_q)[:, None, :, None, :],
-                            donate_argnums=(0,))
-        _mult_fft_j = jax.jit(lambda G_R, V_R: _G_fftn(G_R * V_R * inv_sqrt_nk),
-                              donate_argnums=(0,))
+    _conv_j = jax.jit(lambda G_k, W_prep: kconv.apply(sigma_conv_operand(G_k), W_prep),
+                      donate_argnums=(0,))
     _project_j = jax.jit(project, donate_argnums=(1,))
 
     def prep_w_staged(W_q):
-        """``sigma.tau.w_prep`` — the ONCE-PER-τ half, timed on its own row.
-
-        On the fused chain this is the identity and the row reads ~0: that
-        is the measurement, not an instrumentation gap.  It is what says
-        whether ``ifftn(W)`` was genuinely hoisted or is being paid inside
-        ``sigma.tau.GW_conv_ffi`` once per bracket.
-        """
-        if use_fused_ffi:
-            return W_q
+        """``sigma.tau.w_prep`` — the ONCE-PER-τ half, timed on its own row."""
         with timing.section(TAU_PHASE_W_PREP) as sec:
-            V_R = _V_ifft_j(W_q)
-            sec.watch(V_R)
-        return V_R
+            W_prep = prep_w(W_q)
+            sec.watch(W_prep)
+        return W_prep
 
     def conv_project_staged(psi_proj_xr, psi_proj_yn, G_k, W_prep):
         """Diagnostic split of the same spatial operation sequence."""
-        if use_fused_ffi:
-            with timing.section(TAU_PHASE_GW_CONV_FFI) as sec:
-                sigma_k = _conv_j(G_k, W_prep)
-                sec.watch(sigma_k)
-        else:
-            with timing.section(TAU_PHASE_G_IFFT) as sec:
-                G_R = _G_ifft_j(G_k)
-                sec.watch(G_R)
-            with timing.section(TAU_PHASE_GW_MULT_FFT) as sec:
-                sigma_k = _mult_fft_j(G_R, W_prep)
-                sec.watch(sigma_k)
+        with timing.section(TAU_PHASE_GW_CONV_FFI) as sec:
+            sigma_k = _conv_j(G_k, W_prep)
+            sec.watch(sigma_k)
         with timing.section(TAU_PHASE_PROJECT_RS) as sec:
             out = _project_j(psi_proj_xr, sigma_k, psi_proj_yn)
             sec.watch(out)

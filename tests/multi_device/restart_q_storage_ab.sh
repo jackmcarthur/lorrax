@@ -87,7 +87,7 @@ INPUT=bse_si_test.in
 
 # Solver settings, verbatim from tests/test_bse_bgw_regression.py.  MATCHED
 # across arms on purpose — see the header.
-BSE_FLAGS=(--bse --lanczos --tda --matvec-kind=ring
+BSE_FLAGS=(--bse --lanczos --tda
            --n-val 4 --n-cond 4 --n-occ 8 --n-reorth -1
            --max-lanczos-iter 200 --n-eig 20)
 

@@ -251,7 +251,7 @@ def _synthetic_payload(mesh, *, nkx=2, nky=2, nkz=1, nc=2, nv=2, nmu=8, seed=7):
     the shifted solve at z = 0 is well conditioned.
     """
     from bse.bse_ring_comm import make_bse_shardings
-    from bse.bse_serial import compute_pair_amplitude
+    from bse.bse_preconditioner import compute_pair_amplitude
 
     nk = nkx * nky * nkz
     rng = np.random.default_rng(seed)
@@ -305,7 +305,7 @@ def _trs_synthetic_payload(mesh, *, nkx=3, nky=3, nkz=1, nc=2, nv=2, nmu=8,
     — and scrambling the gauge (a legal per-band phase at the -k slots) must
     break it.  Grid default 3x3x1: only Gamma is TRIM, so the k-pair overwrite
     path is actually exercised (a 2x2 grid is ALL TRIM points)."""
-    from bse.bse_serial import compute_pair_amplitude
+    from bse.bse_preconditioner import compute_pair_amplitude
     from bse.bse_ring_comm import make_bse_shardings
     from bse.bse_w_exact import _theta
     from symmetry_maps import spinor_rotation_for_sym_row
@@ -410,7 +410,7 @@ def test_w_ladder_trs_gauge_mechanism_on_a_synthetic_payload(ns):
     """
     harness.skip_unless_gpu(pytest)
     from common.collectives import single_device_mesh
-    from bse.bse_serial import compute_pair_amplitude
+    from bse.bse_preconditioner import compute_pair_amplitude
     from bse.bse_ring_comm import make_bse_shardings
     from bse.bse_w_exact import enforce_trs_pair_gauge
     mesh = single_device_mesh()
@@ -585,7 +585,7 @@ def test_w_ladder_gauge_sensitivity_is_real_bounded_and_reciprocity_blind():
     harness.skip_unless_gpu(pytest)
     from bse.bse_ring_comm import make_bse_shardings
     from common.collectives import single_device_mesh
-    from bse.bse_serial import compute_pair_amplitude
+    from bse.bse_preconditioner import compute_pair_amplitude
     from bse.bse_w_exact import _theta
     from symmetry_maps import spinor_rotation_for_sym_row
     mesh = single_device_mesh()

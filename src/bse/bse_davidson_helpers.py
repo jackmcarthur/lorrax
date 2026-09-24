@@ -3,7 +3,7 @@ helpers tailored to the (block, nc_pad, nv_pad, nk) BSE vector layout.
 
 These plug into ``solvers.davidson.davidson`` without that solver knowing
 anything about excitons. The trial-vector layout matches the matvec from
-``bse_simple.build_bse_simple_matvec``:
+``bse_stack_matvec.build_bse_stack_matvec``:
 
     X.shape   = (m, nc_pad, nv_pad, nk)         (m = batch axis)
     X.sharding = P(None, "x", "y", None)        (c on x, v on y)
@@ -82,7 +82,7 @@ def init_bse_subspace(
         caller should pass them.
     n_random : how many of those slots are random (default 5)
     mesh, sharding : if given, the result is shard-constrained to
-        ``sharding`` (canonically P(None, "x", "y", None) for ``bse_simple``).
+        ``sharding`` (canonically P(None, "x", "y", None), the stack matvec's).
     seed : RNG seed (numpy keyed). Default 0 → reproducible.
 
     Returns
@@ -498,7 +498,7 @@ def bse_diagonal_precond(
     def _impl(data, R, Lambda, X=None):
         eps_c_in, eps_v_in, diag_in = data
         if diag_in is None:
-            # ΔE[c, v, k] = E_c[k] − E_v[k]; same convention as bse_simple's
+            # ΔE[c, v, k] = E_c[k] − E_v[k]; same convention as the stack matvec's
             # D term.  The BARE route: correct, cheap, and an approximation.
             D = eps_c_in.T[:, None, :] - eps_v_in.T[None, :, :]
         else:

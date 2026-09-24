@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import os
-import sys
 import time
 
 # THE startup call (runtime module docstring) before any jax-collective
@@ -18,7 +17,6 @@ from runtime import (debug_print, debug_print_enabled,
 RUNTIME = initialize_communicator_stack(print_fn=debug_print)
 
 import jax
-import jax.numpy as jnp
 
 import common.timing as timing
 from common.band_degeneracy import DEFAULT_MODE, DEGENERACY_TOL_RY, MODES
@@ -36,27 +34,18 @@ from .bse_ring_comm import (
     create_mesh_2d,
     create_mesh_xy_from_flags,
     make_bse_shardings,
-    ring_matvec_correctness_check,
-    ring_matvec_smoke_test,
 )
-from .bse_io import (_load_ring_subset)
+from .bse_preconditioner import compute_pair_amplitude
 from file_io.restart_bundle import (_find_restart_file)
-from .bse_serial import (
-    apply_bse_hamiltonian_single_device,
-    apply_bse_hamiltonian_single_device_jit,
-)
 from .bse_lanczos import (
     block_lanczos_eig,
     lanczos_eig_jit,
     simple_lanczos_eig,
-    solve_bse,
     iters_reported,
 )
 from .bse_io import write_eigenvectors_stream
 
 __all__ = [
-    "apply_bse_hamiltonian_single_device",
-    "apply_bse_hamiltonian_single_device_jit",
     "block_lanczos_eig",
     "build_bse_ring_matvec",
     "build_bse_ring_matvec_full",
@@ -64,55 +53,8 @@ __all__ = [
     "create_mesh_2d",
     "lanczos_eig_jit",
     "make_bse_shardings",
-    "ring_matvec_correctness_check",
-    "ring_matvec_smoke_test",
     "simple_lanczos_eig",
-    "solve_bse",
 ]
-
-
-def compute_pair_amplitude(psi_c: jax.Array, psi_v: jax.Array) -> jax.Array:
-    return jnp.einsum("kcsm,kvsm->kcvm", jnp.conj(psi_c), psi_v)
-
-
-def _main_random_demo() -> None:
-    print("Testing BSE matvec with random data...")
-
-    nk, nc, nv, nspinor, n_rmu = 8, 4, 4, 2, 32
-    nkx, nky, nkz = 2, 2, 2
-
-    key = jax.random.PRNGKey(0)
-    keys = jax.random.split(key, 7)
-
-    psi_c = jax.random.normal(keys[0], (nk, nc, nspinor, n_rmu)) + \
-            1j * jax.random.normal(keys[1], (nk, nc, nspinor, n_rmu))
-    psi_v = jax.random.normal(keys[2], (nk, nv, nspinor, n_rmu)) + \
-            1j * jax.random.normal(keys[3], (nk, nv, nspinor, n_rmu))
-
-    eps_v = jax.random.uniform(keys[4], (nk, nv), minval=-0.5, maxval=-0.1)
-    eps_c = jax.random.uniform(keys[5], (nk, nc), minval=0.1, maxval=0.5)
-
-    W_q = jax.random.normal(keys[6], (n_rmu, n_rmu, nkx, nky, nkz)) * 0.01
-    V_q0 = jnp.eye(n_rmu) * 0.05
-
-    X = jnp.ones((1, nc, nv, nk), dtype=jnp.complex128)
-    X = X / jnp.linalg.norm(X)
-
-    HX = apply_bse_hamiltonian_single_device(
-        X, psi_c, psi_v, eps_c, eps_v, W_q, V_q0, nkx, nky, nkz
-    )
-    print(f"Input shape: {X.shape}, Output shape: {HX.shape}")
-    E_expect = jnp.vdot(X.flatten(), HX.flatten()).real
-    ryd2ev = RYD_TO_EV
-    print(f"Expectation value: {E_expect:.6f} Ry = {E_expect * ryd2ev:.4f} eV")
-
-    print("\nRunning Lanczos solver...")
-    eigenvalues, _ = solve_bse(
-        psi_c, psi_v, eps_c, eps_v, W_q, V_q0, nkx, nky, nkz,
-        n_eig=5, max_iter=30,
-    )
-    print(f"Lowest 5 eigenvalues (Ry): {eigenvalues}")
-    print(f"Lowest 5 eigenvalues (eV): {eigenvalues * ryd2ev}")
 
 
 def _preview_lanczos(
@@ -128,7 +70,6 @@ def _preview_lanczos(
     block_size: int = 1,
     rtol: float = 0.0,
     check_every: int = 4,
-    matvec_kind: str = "ring",
     n_reorth: int = -1,
     solver_kind: str = "lanczos",
     davidson_m_max: int | None = None,
@@ -180,165 +121,111 @@ def _preview_lanczos(
         timing.record("bse.imports",
                       max(_pre_main - float(_phases.get("total", 0.0)), 0.0))
     restart_file = _find_restart_file(input_file)
-    n_devices = jax.device_count()
-    # Non-TDA has no 1-device (``solve_bse``) path — it runs through the sharded
-    # loader + ``solve_bse_sharded(tda=False)`` on a 1x1 mesh just as well.
-    use_sharded = n_devices > 1 or not tda
+    # ONE solve path on any mesh (1x1 included): the sharded loader and
+    # ``solve_bse_sharded`` on the trial-stack matvec.  The single-device
+    # ``solve_bse`` / ``bse_serial`` twin was deleted with C10 (2026-09-24).
     _htransform_rank_records = []
     _htransform_quality_records = []
 
-    if use_sharded:
-        # Sharded ring matvec — parallelises (μ,ν) and avoids per-iter
-        # 3D-FFT of W_q (precomputes W_R once outside the Lanczos loop).
-        from .bse_io import load_bse_data_from_restart_sharded
-        from .bse_lanczos import solve_bse_sharded
-        mesh_xy = create_mesh_2d()
-        # n_occ-aware band split: load_bse_data_from_restart_sharded
-        # auto-detects valence by ``mean_enk < fermi_energy``; user-given
-        # n_occ replaces that detection identically to _load_ring_subset.
-        # We pass fermi_energy=0.0 (default) and rely on enk_full's reference.
-        with timing.section("bse.load", announce=True,
-                            label="restart load (psi, W_q, V_q0)"):
-            data = load_bse_data_from_restart_sharded(
-                restart_file, n_val=n_val, n_cond=n_cond, mesh_xy=mesh_xy,
-                input_file=input_file, n_occ=n_occ,
-                degeneracy_mode=degeneracy_mode,
-                degeneracy_tol_ry=degeneracy_tol_ry,
-                htransform_rank_record_fn=_htransform_rank_records.append,
-                htransform_quality_record_fn=(
-                    _htransform_quality_records.append),
-            )
-            # T-encoding strategy plumbed via the data dict (see solve_bse_sharded).
-            data["matvec_kind"] = matvec_kind
-            grid_x, grid_y = mesh_xy.devices.shape
-            # EQP override on enk_full (BGW eqp1.dat semantics).
-            if eqp_file is not None:
-                # Re-slice the band window on the eqp-corrected energies. Uses the
-                # loader-CLAMPED band counts (data['n_val']/data['n_cond']), not the
-                # raw CLI n_val/n_cond, so an over-request can't slice out of bounds.
-                from .bse_io import apply_eqp_and_reslice_bands
-                data["eps_v"], data["eps_c"], _ = apply_eqp_and_reslice_bands(
-                    restart_file, eqp_file, input_file,
-                    int(data["n_val"]), int(data["n_cond"]), n_occ, grid_x,
-                    grid_y, degeneracy_mode=degeneracy_mode,
-                    degeneracy_tol_ry=degeneracy_tol_ry)
-        if report is not None:
-            for receipt in _htransform_rank_records:
-                report.spectral_compression(
-                    receipt,
-                    title="BSE-grid htransform spectral compression")
-            for receipt in _htransform_quality_records:
-                report.htransform_quality(
-                    receipt,
-                    title="BSE-grid htransform interpolation quality")
-        if stage_progress is not None:
-            stage_progress.step()
-        nkx = data["nkx"]; nky = data["nky"]; nkz = data["nkz"]
-        nk = nkx * nky * nkz
-        nc_pad = int(data["n_cond_pad"])
-        nv_pad = int(data["n_val_pad"])
-        # The window this run is ACTUALLY solving, read off the loader — which
-        # clamped the request to what the file holds and then, under an
-        # explicit ``--band-degeneracy snap``, may have widened it outward past
-        # a cut multiplet.  Everything downstream that needs to name
-        # bands uses these, never the ``n_val``/``n_cond`` arguments: those are
-        # the request, and the request is stale the moment the guard fires.
-        n_val_eff = int(data["n_val"])
-        n_cond_eff = int(data["n_cond"])
-        bse_dim = nc_pad * nv_pad * nk
-        print(f"BSE problem (sharded {grid_x}x{grid_y}): "
-              f"{nc_pad} cond × {nv_pad} val × {nk} k = {bse_dim} dim")
-        if max_lanczos_iter is None:
-            max_lanczos_iter = max(30, min(200, bse_dim // 2))
-        # ``max_lanczos_iter`` is the *total* Krylov dimension upper
-        # bound; block path divides by block_size.
-        block_max_iter = max(1, max_lanczos_iter // max(1, block_size))
-        mode = (f"convergence-driven (rtol={rtol:.1e}, every {check_every} iters)"
-                if rtol > 0 else "fixed")
-        if block_size > 1:
-            print(f"Block Lanczos [{mode}]: ≤ {block_max_iter} block iter × "
-                  f"block_size={block_size} = ≤ {block_max_iter * block_size} Krylov dim")
-        else:
-            print(f"Lanczos [{mode}]: ≤ {block_max_iter} iterations")
-        # Resolve full-reorth sentinel (-1) to the actual Krylov depth.
-        n_reorth_eff = block_max_iter if n_reorth < 0 else n_reorth
-        # ONE row for the eigensolve — compile + every Krylov iteration.  It
-        # is the number worth comparing across decks, and the only honest way
-        # to say "the BSE solve cost X" (the matvec itself runs
-        # block_max_iter x block_size times and must NOT be timed per call).
-        with timing.section("bse.eigensolve", announce=True,
-                            label=f"{solver_kind} eigensolve") as _sec:
-            eigenvalues, eigenvectors, n_iter_done = solve_bse_sharded(
-                data, mesh_xy, n_eig=n_eig, max_iter=block_max_iter,
-                include_W=include_W, block_size=block_size,
-                rtol=rtol, check_every=check_every, n_reorth=n_reorth_eff,
-                solver_kind=solver_kind, tda=tda,
-                davidson_m_max=davidson_m_max,
-                davidson_eps_shift_Ry=(davidson_eps_shift
-                    if davidson_eps_shift else 1e-3),
-                davidson_precond=davidson_precond,
-                davidson_olsen=davidson_olsen,
-                trlan_m_max=trlan_m_max, trlan_n_keep=trlan_n_keep,
-            )
-            _sec.watch(eigenvalues, eigenvectors)
-        # Fixed-iteration routes return N_ITER_NOT_MEASURED; only the
-        # convergence-driven route (rtol > 0) reports a real count.  Going
-        # through the helper is what keeps the sentinel out of arithmetic.
-        n_done = iters_reported(n_iter_done, block_max_iter)
-        if rtol > 0:
-            tag = "Block Lanczos" if block_size > 1 else "Lanczos"
-            print(f"{tag} exited at iter {n_done}/{block_max_iter} "
-                  f"(Krylov dim = {n_done * block_size})")
+    # Sharded ring matvec — parallelises (μ,ν) and avoids per-iter
+    # 3D-FFT of W_q (precomputes W_R once outside the Lanczos loop).
+    from .bse_io import load_bse_data_from_restart_sharded
+    from .bse_lanczos import solve_bse_sharded
+    mesh_xy = create_mesh_2d()
+    # n_occ-aware band split: load_bse_data_from_restart_sharded
+    # auto-detects valence by ``mean_enk < fermi_energy``; user-given
+    # n_occ replaces that detection identically to _load_ring_subset.
+    # We pass fermi_energy=0.0 (default) and rely on enk_full's reference.
+    with timing.section("bse.load", announce=True,
+                        label="restart load (psi, W_q, V_q0)"):
+        data = load_bse_data_from_restart_sharded(
+            restart_file, n_val=n_val, n_cond=n_cond, mesh_xy=mesh_xy,
+            input_file=input_file, n_occ=n_occ,
+            degeneracy_mode=degeneracy_mode,
+            degeneracy_tol_ry=degeneracy_tol_ry,
+            htransform_rank_record_fn=_htransform_rank_records.append,
+            htransform_quality_record_fn=(
+                _htransform_quality_records.append),
+        )
+        grid_x, grid_y = mesh_xy.devices.shape
+        # EQP override on enk_full (BGW eqp1.dat semantics).
+        if eqp_file is not None:
+            # Re-slice the band window on the eqp-corrected energies. Uses the
+            # loader-CLAMPED band counts (data['n_val']/data['n_cond']), not the
+            # raw CLI n_val/n_cond, so an over-request can't slice out of bounds.
+            from .bse_io import apply_eqp_and_reslice_bands
+            data["eps_v"], data["eps_c"], _ = apply_eqp_and_reslice_bands(
+                restart_file, eqp_file, input_file,
+                int(data["n_val"]), int(data["n_cond"]), n_occ, grid_x,
+                grid_y, degeneracy_mode=degeneracy_mode,
+                degeneracy_tol_ry=degeneracy_tol_ry)
+    if report is not None:
+        for receipt in _htransform_rank_records:
+            report.spectral_compression(
+                receipt,
+                title="BSE-grid htransform spectral compression")
+        for receipt in _htransform_quality_records:
+            report.htransform_quality(
+                receipt,
+                title="BSE-grid htransform interpolation quality")
+    if stage_progress is not None:
+        stage_progress.step()
+    nkx = data["nkx"]; nky = data["nky"]; nkz = data["nkz"]
+    nk = nkx * nky * nkz
+    nc_pad = int(data["n_cond_pad"])
+    nv_pad = int(data["n_val_pad"])
+    # The window this run is ACTUALLY solving, read off the loader — which
+    # clamped the request to what the file holds and then, under an
+    # explicit ``--band-degeneracy snap``, may have widened it outward past
+    # a cut multiplet.  Everything downstream that needs to name
+    # bands uses these, never the ``n_val``/``n_cond`` arguments: those are
+    # the request, and the request is stale the moment the guard fires.
+    n_val_eff = int(data["n_val"])
+    n_cond_eff = int(data["n_cond"])
+    bse_dim = nc_pad * nv_pad * nk
+    print(f"BSE problem (sharded {grid_x}x{grid_y}): "
+          f"{nc_pad} cond × {nv_pad} val × {nk} k = {bse_dim} dim")
+    if max_lanczos_iter is None:
+        max_lanczos_iter = max(30, min(200, bse_dim // 2))
+    # ``max_lanczos_iter`` is the *total* Krylov dimension upper
+    # bound; block path divides by block_size.
+    block_max_iter = max(1, max_lanczos_iter // max(1, block_size))
+    mode = (f"convergence-driven (rtol={rtol:.1e}, every {check_every} iters)"
+            if rtol > 0 else "fixed")
+    if block_size > 1:
+        print(f"Block Lanczos [{mode}]: ≤ {block_max_iter} block iter × "
+              f"block_size={block_size} = ≤ {block_max_iter * block_size} Krylov dim")
     else:
-        with timing.section("bse.load", announce=True,
-                            label="restart load (1 device)"):
-            payload = _load_ring_subset(
-                restart_file,
-                n_val,
-                n_cond,
-                1,
-                1,
-                eqp_file=eqp_file,
-                n_occ=n_occ,
-                input_file=input_file,
-                degeneracy_mode=degeneracy_mode,
-                degeneracy_tol_ry=degeneracy_tol_ry,
-            )
-        if stage_progress is not None:
-            stage_progress.step()
-        psi_c = payload["psi_c"]
-        psi_v = payload["psi_v"]
-        eps_c = payload["eps_c"]
-        eps_v = payload["eps_v"]
-        W_q = payload["W_q"]
-        V_q0 = payload["V_q0"]
-        nkx = payload["nkx"]
-        nky = payload["nky"]
-        nkz = payload["nkz"]
-
-        nk = nkx * nky * nkz
-        # Same rule as the sharded branch: the loader's resolved window, not
-        # the request.  ``psi_c.shape[1]`` is the PADDED extent (px=py=1 here,
-        # so the two coincide today — but naming the padded number as if it
-        # were a band count is how this defect got written the first time).
-        n_val_eff = int(payload["n_val"])
-        n_cond_eff = int(payload["n_cond"])
-        nc_actual = psi_c.shape[1]
-        nv_actual = psi_v.shape[1]
-        bse_dim = nc_actual * nv_actual * nk
-        print(f"BSE problem: {nc_actual} cond x {nv_actual} val x {nk} k = {bse_dim} dimension")
-
-        if max_lanczos_iter is None:
-            max_lanczos_iter = max(30, min(200, bse_dim // 2))
-        print(f"Lanczos: {max_lanczos_iter} iterations")
-
-        with timing.section("bse.eigensolve", announce=True,
-                            label="lanczos eigensolve (1 device)") as _sec:
-            eigenvalues, eigenvectors = solve_bse(
-                psi_c, psi_v, eps_c, eps_v, W_q, V_q0, nkx, nky, nkz,
-                n_eig=n_eig, max_iter=max_lanczos_iter, include_W=include_W,
-            )
-            _sec.watch(eigenvalues, eigenvectors)
+        print(f"Lanczos [{mode}]: ≤ {block_max_iter} iterations")
+    # Resolve full-reorth sentinel (-1) to the actual Krylov depth.
+    n_reorth_eff = block_max_iter if n_reorth < 0 else n_reorth
+    # ONE row for the eigensolve — compile + every Krylov iteration.  It
+    # is the number worth comparing across decks, and the only honest way
+    # to say "the BSE solve cost X" (the matvec itself runs
+    # block_max_iter x block_size times and must NOT be timed per call).
+    with timing.section("bse.eigensolve", announce=True,
+                        label=f"{solver_kind} eigensolve") as _sec:
+        eigenvalues, eigenvectors, n_iter_done = solve_bse_sharded(
+            data, mesh_xy, n_eig=n_eig, max_iter=block_max_iter,
+            include_W=include_W, block_size=block_size,
+            rtol=rtol, check_every=check_every, n_reorth=n_reorth_eff,
+            solver_kind=solver_kind, tda=tda,
+            davidson_m_max=davidson_m_max,
+            davidson_eps_shift_Ry=(davidson_eps_shift
+                if davidson_eps_shift else 1e-3),
+            davidson_precond=davidson_precond,
+            davidson_olsen=davidson_olsen,
+            trlan_m_max=trlan_m_max, trlan_n_keep=trlan_n_keep,
+        )
+        _sec.watch(eigenvalues, eigenvectors)
+    # Fixed-iteration routes return N_ITER_NOT_MEASURED; only the
+    # convergence-driven route (rtol > 0) reports a real count.  Going
+    # through the helper is what keeps the sentinel out of arithmetic.
+    n_done = iters_reported(n_iter_done, block_max_iter)
+    if rtol > 0:
+        tag = "Block Lanczos" if block_size > 1 else "Lanczos"
+        print(f"{tag} exited at iter {n_done}/{block_max_iter} "
+              f"(Krylov dim = {n_done * block_size})")
     if stage_progress is not None:
         stage_progress.step()
     ryd2ev = 13.6056980659
@@ -538,20 +425,6 @@ def main(argv=None) -> int:
              "is no longer a speed reason to narrow this.",
     )
     parser.add_argument(
-        "--matvec-kind",
-        choices=("ring", "gather", "simple"),
-        default="ring",
-        help="BSE matvec implementation. ``ring`` (default): shard_map + "
-             "lax.ppermute (low memory). ``gather``: shard_map + lax.all_gather "
-             "(faster on small problems). ``simple``: plain jit + jnp.einsum "
-             "+ with_sharding_constraint, no shard_map (XLA auto-partitions).",
-    )
-    parser.add_argument(
-        "--gather-t",
-        action="store_true",
-        help="(Deprecated alias for --matvec-kind=gather)",
-    )
-    parser.add_argument(
         "--solver",
         choices=("lanczos", "davidson", "trlan"),
         default="lanczos",
@@ -615,8 +488,6 @@ def main(argv=None) -> int:
     parser.add_argument("--kpm-plot-file", type=str, default="bse_dos_kpm.png", help="KPM DOS plot output file.")
     parser.add_argument("--eqp", type=str, default=None, help="Path to BGW eqp1.dat for QP corrections.")
     parser.add_argument("--n-occ", type=int, default=None, help="Number of occupied bands.")
-    parser.add_argument("--ring-test", action="store_true")
-    parser.add_argument("--ring-check", action="store_true")
     # INERT, and deliberately still accepted.  Its only consumer was the
     # ``timed=True`` arm of ``bse_ring_comm.build_bse_ring_matvec*``, which was
     # dead code (no caller ever passed it) and was deleted 2026-08-08; the dest
@@ -626,10 +497,6 @@ def main(argv=None) -> int:
     # If per-term ring timings are wanted again, use common.timing sections on
     # the jitted matvec -- not an unjitted arm that re-traces on every call.
     parser.add_argument("--ring-timing", action="store_true")
-    parser.add_argument("--components", action="store_true")
-    parser.add_argument(
-        "--parallelism-self-test", action="store_true",
-        help="Run the deterministic random-data matvec/Lanczos self-test and exit.")
     args, _ = parser.parse_known_args(argv)
 
     # Omitted --px/--py = the run's canonical square mesh, not 1x1.  Resolved
@@ -637,39 +504,15 @@ def main(argv=None) -> int:
     # the job's then refuses at the top of main() rather than after a delegate
     # has printed its banner; and the default route is a delegation --
     # `if not args.lanczos:` hands the solve to bse_feast.main(["--px",
-    # str(args.px), ...]), with --kpm-dos and ring_matvec_correctness_check
-    # taking px/py the same way -- so the forwarded argv must carry the
+    # str(args.px), ...]), with --kpm-dos taking px/py the same way -- so the forwarded argv must carry the
     # resolved shape.  Until 2026-08-27 it carried the argparse placeholder
     # 1/1: the default run put a four-GPU node's whole BSE on one device while
     # the startup report above announced 2x2.
     mesh_xy = create_mesh_xy_from_flags(args.px, args.py)
     args.px, args.py = tuple(int(n) for n in mesh_xy.devices.shape)
 
-    if args.ring_test:
-        ring_matvec_smoke_test()
-        raise SystemExit(0)
-
-    if args.ring_check:
-        if args.input is None:
-            parser.error("--ring-check requires -i/--input")
-        ring_matvec_correctness_check(
-            args.input,
-            args.n_val,
-            args.n_cond,
-            args.px,
-            args.py,
-            args.components,
-        )
-        raise SystemExit(0)
-
-    if args.parallelism_self_test:
-        _main_random_demo()
-        raise SystemExit(0)
-
     if args.input is None:
-        parser.error(
-            "Default run requires -i/--input (use --parallelism-self-test "
-            "for the random-data self-test).")
+        parser.error("Default run requires -i/--input.")
 
     use_tda = args.tda
 
@@ -807,7 +650,7 @@ def main(argv=None) -> int:
             f"relative convergence {float(args.lanczos_rtol):.5e}, "
             f"checked every {int(args.lanczos_check_every)} iterations"
             if args.lanczos_rtol > 0.0 else "fixed Krylov dimension"),
-        f"Matvec route   : {('gather' if args.gather_t else args.matvec_kind)}",
+        "Matvec route   : trial-stack (bse_stack_matvec)",
         f"Band boundary  : {args.band_degeneracy}; "
         f"tolerance={float(args.degeneracy_tol_ry) * RYD_TO_EV * 1.0e3:.5f} meV",
     ))
@@ -844,7 +687,6 @@ def main(argv=None) -> int:
         block_size=args.block_size,
         rtol=args.lanczos_rtol,
         check_every=args.lanczos_check_every,
-        matvec_kind=("gather" if args.gather_t else args.matvec_kind),
         n_reorth=args.n_reorth,
         solver_kind=args.solver,
         davidson_m_max=args.davidson_m_max,

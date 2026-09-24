@@ -771,8 +771,7 @@ def test_the_dial_roster_scanners_can_fail():
     assert _gate_env_of("ffi.gemm", "NOT_A_GATE") is None
     # ...and it really does resolve the ones that exist.
     assert _gate_env_of("ffi.gemm", "GATE") == "LORRAX_BANDS_GEMM_FFI"
-    assert _gate_env_of("ffi.fft", "FUSED_GATE") == \
-        "LORRAX_FFT_FFI_FUSED"
+    assert _gate_env_of("ffi.fft", "GATE") == "LORRAX_FFT_FFI"
 
 
 def test_a_dial_missing_from_the_facts_is_missing_from_the_block():

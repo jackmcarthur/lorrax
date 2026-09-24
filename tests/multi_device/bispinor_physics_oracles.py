@@ -124,7 +124,6 @@ def _cpu_algebra(monkeypatch):
     """Substitute only backend FFT/GEMM plumbing, preserving production physics contractions."""
     import common.fft_helpers as fft
     import distrib_la
-    import ffi.mklfft
     def transform(mesh, grid, spec, *, norm='ortho', **kwargs):
         return lambda x: jnp.fft.fftn(x.reshape(tuple(grid)+x.shape[1:]),
             axes=(0, 1, 2), norm=norm).reshape(x.shape)
@@ -142,7 +141,6 @@ def _cpu_algebra(monkeypatch):
         contract.in_sharding_b = contract.in_sharding_a
         return contract
     monkeypatch.setattr(distrib_la, 'gemm_plan', gemm)
-    monkeypatch.setattr(ffi.mklfft, 'fused_fft_ffi_enabled', lambda: False)
     def inverse(mesh, grid, spec, *, norm='ortho', **kwargs):
         return lambda x: jnp.fft.ifftn(x.reshape(tuple(grid)+x.shape[1:]),
             axes=(0, 1, 2), norm=norm).reshape(x.shape)

@@ -320,7 +320,7 @@ def _worker() -> int:
 
     import bse.bse_ring_comm as brc
     import bse.bse_stack_matvec as bsm
-    from bse.bse_serial import compute_pair_amplitude
+    from bse.bse_preconditioner import compute_pair_amplitude
 
     devs = jax.devices()
     if len(devs) < _NDEV:

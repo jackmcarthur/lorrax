@@ -135,11 +135,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from common.shard_map import shard_map as _shard_map_fn
 
-from common.fft_helpers import (
-    local_fftn3,
-    make_sharded_fftn_3d,
-    make_sharded_ifftn_3d,
-)
+from common.fft_helpers import make_kconv_kminor, make_local_kconv_kminor
 from .bse_ring_comm import make_bse_shardings
 
 
@@ -180,12 +176,10 @@ from .bse_ring_comm import make_bse_shardings
 #           It is an A/B instrument, not a proposed default: it changes which
 #           collectives the program issues, so every claim about it must be
 #           backed by an HLO diff and a timing pair.  See SHARDMAP_AUDIT.md.
-#           NOTE the structural consequence, which is the reason it exists:
-#           with no enclosing shard_map the W-term FFTs go through
-#           ``make_sharded_*fftn_3d`` (which wraps its OWN shard_map) instead
-#           of the interior ``local_*fftn3`` aliases -- i.e. this route is the
-#           only one from which the flat-k FFT FFI is structurally reachable
-#           (FFT_DONATION_AUDIT §3.1: shard_map cannot nest).
+#           NOTE the structural consequence: with no enclosing shard_map the
+#           W-term convolution goes through the router's sharded door
+#           ``make_kconv_kminor`` (which wraps its OWN shard_map) instead of
+#           the local door the manual body calls.
 #
 # The permanent hoist does not change the number of live
 # (nk, mu_loc, nu_loc, ns^2)-class intermediates, which stays at the one
@@ -276,10 +270,15 @@ def _encode_T_B(Xb_b, psi_c_Y, psi_v_X):
     return jnp.einsum("kvtM,vksN->MNtsk", psi_v_X, R)
 
 
-def _conv_decode(T_b, psi_c_X, psi_v_Y, W_R, nkx, nky, nkz, nk, sqrt_nk):
-    """conv(T) then decode -- the eight stages both blocks share.
+def _conv_decode(T_b, psi_c_X, psi_v_Y, W_R, kconv, sqrt_nk):
+    """conv(T) then decode -- the stages both blocks share.
 
-    conv: ``U_b = (1/√Nk) Σ_q W_q T_b[..., k−q]`` (ifft_k · W_R · fft_k).
+    conv: ``U_b = (1/Nk) fft_k(W_R · ifft_k-unnormalised(T_b))``, i.e.
+    ``fftn_ortho(ifftn_ortho(T_b) · W_R)``, as ONE call of the k-convolution
+    router's local k-minor door ``kconv`` (``make_local_kconv_kminor``:
+    nvidia-mathdx on CUDA, the plan route on cpu).  Both norm factors are one
+    folded constant inside it; ``W_R`` is already in R space
+    (``bse_feast.ensure_W_R``).
 
     THIS IS AN FFT AND IT STAYS AN FFT.  A dense (nk x nk) DFT contraction gives
     the same numbers and measured 2.3x faster on this deck, and it was REMOVED
@@ -287,34 +286,20 @@ def _conv_decode(T_b, psi_c_X, psi_v_Y, W_R, nkx, nky, nkz, nk, sqrt_nk):
     O(nk log nk), so it is a win only because nk = 16 here and it inverts at the
     thousand-k-point sizes LORRAX is being built for.  Do not reintroduce it,
     under any name, on any measurement.  If the k-transform is a bottleneck the
-    answer is a better FFT (batching, an FFI handler, fewer dispatches), never a
-    denser algorithm.
-
-    The inverse transform is spelled conj(fft(conj(x))) so that BOTH transforms
-    are forward and UNNORMALISED.  An ``ifft`` here would put the 1/nk inside
-    XLA's FFT thunk, where it runs as a separate cuBLAS zscal over the whole
-    T-tensor that no fusion pass can see -- a full extra HBM round trip per
-    matvec.  The 1/nk is folded onto the decode output below instead.
+    answer is a better FFT library, never a denser algorithm.
 
     decode: ``(WX)_b = (1/√Nk) Σ_{μ,ν,t,s} conj(ψ_c) ψ_v U_b``.  psum_scatter
     completes the μ-sum while scattering c→x; the ν-sum's scatter to 'y' is
     hoisted OUT of the scan by the caller.
     """
-    mu_loc, nu_loc, ns = T_b.shape[0], T_b.shape[1], T_b.shape[2]
-    T_k = T_b.reshape(mu_loc, nu_loc, ns, ns, nkx, nky, nkz)
-    T_R = jnp.conj(local_fftn3(jnp.conj(T_k), axes=(4, 5, 6), norm=None))
-    U_R = W_R[:, :, None, None, :, :, :] * T_R
-    U_b = local_fftn3(U_R, axes=(4, 5, 6), norm=None).reshape(
-        mu_loc, nu_loc, ns, ns, nk)
+    mu_loc, nu_loc = T_b.shape[0], T_b.shape[1]
+    U_b = kconv(T_b[None], W_R.reshape(mu_loc, nu_loc, -1))[0]
 
     A = lax.psum_scatter(
         jnp.einsum("kctM,MNtsk->cNsk", jnp.conj(psi_c_X), U_b),
         "x", scatter_dimension=0, tiled=True)               # (c_loc, ν_loc, ns, nk)
     WXcv = jnp.einsum("kvsN,cNsk->cvk", psi_v_Y, A)         # (c_loc, v_full, nk)
-    # Carries the two unnormalised transforms' 1/nk, on a (c_loc, v, nk) tensor
-    # ~120x smaller than T that is being written anyway -- that is the whole
-    # reason it is folded to here.
-    return WXcv / (sqrt_nk * nk)
+    return WXcv / sqrt_nk
 
 
 def build_bse_stack_matvec(
@@ -371,6 +356,9 @@ def build_bse_stack_matvec(
     nk = nkx * nky * nkz
     opts = matvec_opts()
     use_gspmd = "gspmd" in opts
+    # The W-term k-convolution: the router's local k-minor door (inside the
+    # shard_map below), one fused call per trial.
+    kconv = make_local_kconv_kminor(mesh_xy, (nkx, nky, nkz), norm="ortho")
 
     # ── W term: one shard_map over ('x','y'); body = scan over the trial axis ──
     def _w_stack(X, psi_c_X, psi_v_Y, W_R):
@@ -395,8 +383,7 @@ def build_bse_stack_matvec(
             T_b = _encode_T_A(X_b, psi_c_X, psi_v_Y)
             # NB no per-trial psum_scatter on 'y' inside _conv_decode: it is
             # hoisted to one scatter for the whole block, after the scan.
-            return carry, _conv_decode(T_b, psi_c_X, psi_v_Y, W_R,
-                                       nkx, nky, nkz, nk, sqrt_nk)
+            return carry, _conv_decode(T_b, psi_c_X, psi_v_Y, W_R, kconv, sqrt_nk)
 
         # ONE 'y' all-gather for the whole block instead of n_trials of them.
         # Operand (n_trials, c_loc, v_loc, nk) -> (…, v_full, …): 16 KB per
@@ -421,18 +408,15 @@ def build_bse_stack_matvec(
     #   psum_scatter(..., 'x', scatter_dim=0)     | wsc(A,    P('x', 'y', None, None))
     #   psum_scatter(..., 'y', scatter_dim=1)     | wsc(WXcv, P('x', 'y', None))
     #
-    # The FFTs necessarily change door: with no enclosing shard_map the interior
-    # ``local_*fftn3`` aliases would gather the (μ,ν)-sharded operand onto every
-    # rank (fft_helpers:221-226 forbids exactly that), so this route uses the
-    # ``make_sharded_*fftn_3d`` factories, which wrap the identical local kernel
-    # in their own shard_map.  That shard_map is NOT nested here -- which is the
-    # structural point this route exists to demonstrate.
+    # The convolution necessarily changes door: with no enclosing shard_map
+    # this route uses the router's sharded k-minor door (``make_kconv_kminor``),
+    # which wraps the identical local call in its own shard_map.  That
+    # shard_map is NOT nested here -- which is the structural point this route
+    # exists to demonstrate.
     _ns = lambda spec: NamedSharding(mesh_xy, spec)
-    _T7_spec = P("x", "y", None, None, None, None, None)
-    _g_ifftn = make_sharded_ifftn_3d(
-        mesh_xy, _T7_spec, _T7_spec, axes=(4, 5, 6), norm="ortho")
-    _g_fftn = make_sharded_fftn_3d(
-        mesh_xy, _T7_spec, _T7_spec, axes=(4, 5, 6), norm="ortho")
+    _g_conv = make_kconv_kminor(mesh_xy, (nkx, nky, nkz),
+                                P(None, "x", "y", None, None, None), P("x", "y", None),
+                                norm="ortho")
 
     def _w_gspmd(X, psi_c_X, psi_v_Y, W_R):
         # Global shapes: X (n_trials, c, v, nk); psi_c_X (nk, c, ns, μ);
@@ -450,10 +434,7 @@ def build_bse_stack_matvec(
                 T_b, _ns(P("x", "y", None, None, None)))
             mu, nu, ns = T_b.shape[0], T_b.shape[1], T_b.shape[2]
 
-            T_k = T_b.reshape(mu, nu, ns, ns, nkx, nky, nkz)
-            T_R = _g_ifftn(T_k)
-            U_R = W_R[:, :, None, None, :, :, :] * T_R
-            U_b = _g_fftn(U_R).reshape(mu, nu, ns, ns, nk)
+            U_b = _g_conv(T_b[None], W_R.reshape(mu, nu, nk))[0]
 
             # μ-sum with c landing on 'x' -- the psum_scatter('x') ask.
             A = jnp.einsum("kctM,MNtsk->cNsk", jnp.conj(psi_c_X), U_b)
@@ -577,6 +558,7 @@ def build_bse_stack_pair_matvec(
     sh = make_bse_shardings(mesh_xy)
     rep = NamedSharding(mesh_xy, P())
     nk = nkx * nky * nkz
+    kconv = make_local_kconv_kminor(mesh_xy, (nkx, nky, nkz), norm="ortho")
 
     # ── W term: one shard_map over ('x','y') — the SAME single region the TDA
     #    stack matvec opens.  No new shard_map is created by the coupling port:
@@ -601,16 +583,15 @@ def build_bse_stack_pair_matvec(
             # and decode are linear, so one chain serves both blocks.
             T_b = (_encode_T_A(X_b, psi_c_X, psi_v_Y)
                    + sc * _encode_T_B(Xb_b, psi_c_Y, psi_v_X))
-            return carry, _conv_decode(T_b, psi_c_X, psi_v_Y, W_R,
-                                       nkx, nky, nkz, nk, sqrt_nk)
+            return carry, _conv_decode(T_b, psi_c_X, psi_v_Y, W_R, kconv, sqrt_nk)
 
         def _body_unfused(carry, xs):
             # THE TWIN.  Two full chains.  Kept only to price the fusion.
             X_b, Xb_b = xs
             WA = _conv_decode(_encode_T_A(X_b, psi_c_X, psi_v_Y),
-                              psi_c_X, psi_v_Y, W_R, nkx, nky, nkz, nk, sqrt_nk)
+                              psi_c_X, psi_v_Y, W_R, kconv, sqrt_nk)
             WB = _conv_decode(_encode_T_B(Xb_b, psi_c_Y, psi_v_X),
-                              psi_c_X, psi_v_Y, W_R, nkx, nky, nkz, nk, sqrt_nk)
+                              psi_c_X, psi_v_Y, W_R, kconv, sqrt_nk)
             return carry, WA + sc * WB
 
         _, WX = lax.scan(_body_fused if fuse else _body_unfused,

@@ -110,7 +110,7 @@ def _synthetic_payload(mesh, D: Dims = SMALL, *, seed=20260817, trs=False,
     cell therefore reports a weak and a strong arm and says which is which.
     """
     from bse.bse_ring_comm import make_bse_shardings
-    from bse.bse_serial import compute_pair_amplitude
+    from bse.bse_preconditioner import compute_pair_amplitude
 
     rng = np.random.default_rng(seed)
     sh = make_bse_shardings(mesh)

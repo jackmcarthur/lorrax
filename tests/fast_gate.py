@@ -151,7 +151,7 @@ CONTRACT_DECKS: dict[str, tuple[dict, ...]] = {
          "argv": ("-i", "bse_si_test.in")},
         {"stage": "bse", "deck": "si_bse_debug", "module": "bse.bse_jax",
          "argv": ("-i", "bse_si_test.in", "--bse", "--lanczos", "--tda",
-                  "--matvec-kind=ring", "--n-val", "4", "--n-cond", "4",
+                  "--n-val", "4", "--n-cond", "4",
                   "--n-occ", "4", "--band-degeneracy", "off",
                   "--n-reorth", "-1", "--max-lanczos-iter", "60",
                   "--n-eig", "8", "--px", "2", "--py", "2")},

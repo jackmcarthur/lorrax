@@ -139,7 +139,7 @@ its actual hash; it is not production attestation.
 | Service | Perlmutter (GPU leg + host leg) | Frontera |
 |---|---|---|
 | FFT (CPU) | `cray-fftw/3.3.10.11` | MKL's native FFTW3 export *(verified 2026-08-06, below)* |
-| FFT (GPU) | cuFFT (`cufftPlanMany64`) | n/a on the CPU leg |
+| FFT (GPU) | **nvidia-mathdx** (cuFFTDx, NVRTC) for every k-axis transform and convolution; cuFFT is no longer called | n/a on the CPU leg |
 | GEMM | Cray LibSci CBLAS | MKL CBLAS |
 | Dense solvers | SLATE (GPU + host), cuSOLVERMp | ScaLAPACK (MKL), SLATE |
 | Parallel HDF5 | `cray-hdf5-parallel` + Cray MPICH | HDF5 + Intel MPI |
@@ -159,7 +159,8 @@ is a routine we are trusting without evidence.
 | Routine | Perlmutter | Frontera | Reachable alternatives | How you know it built right | Passing? |
 |---|---|---|---|---|---|
 | **3-D FFT** (in-`shard_map`) | XLA:GPU `fft` → **cuFFT** in jaxlib | XLA:CPU `fft` → **DUCC/Eigen** in XLA | none — `fft_helpers.local_fftn3`/`local_ifftn3` are bare `jnp.fft` aliases with **no FFI route**; `LORRAX_FFT_FFI` structurally cannot reach them | **(none)** | — |
-| **flat-k FFT** (batched 3-D) | CUDA leg: **cuFFT** `cufftPlanMany64` + NVRTC. Host leg: FFTW3 ABI by `dlopen` → **cray-fftw** bare-metal; **nothing in-container** | **MKL**'s FFTW3 export, bound at `resolve_sym` stage 1 (MKL is already loaded via the ScaLAPACK link line, so the ladder never runs) | the whole `fftw3_candidates()` ladder: `$LORRAX_FFTW3_SO` → build-time `LORRAX_FFTW3_SO_HINT` → `libfftw3.so.3` → `libfftw3.so.mpi31.3` → `libmkl_rt.so` → `libfftw3.so`. On Frontera `libfftw3.so.3` **is** reachable (`/usr/lib64`, FFTW 3.3.2) and would win over `libmkl_rt.so` if MKL were not already resident | **GATE 5b** — zero `fftw` in `DT_NEEDED` (`build_ffi_host.sh`). Covers *load* time only | **PASS**, Perlmutter, measured 2026-08-06 |
+| **k-axis convolutions + k-minor transforms** (ζ fit, Σ, COHSEX, BSE) | CUDA: **nvidia-mathdx** cuFFTDx thread FFTs in one fused pass, NVRTC-built per k-grid from the wheel's headers, disk-cached. Host: the FFTW3-ABI plan handlers below | host plan handlers | none on CUDA by ruling (decisions.md 2026-09-24); a missing wheel refuses at startup (`GATE mathdx-headers`) | `tests/multi_device/kconv_router_p4.py` (every mode vs `np.fft`, red twins) | **PASS**, Perlmutter P4, 2026-09-24 (branch, not main) |
+| **flat-k FFT** (batched 3-D) | CUDA leg: **nvidia-mathdx** k-leading transform (router mode 3; the cuFFT `cufftPlanMany64` handler was deleted 2026-09-24). Host leg: FFTW3 ABI by `dlopen` → **cray-fftw** bare-metal; **nothing in-container** | **MKL**'s FFTW3 export, bound at `resolve_sym` stage 1 (MKL is already loaded via the ScaLAPACK link line, so the ladder never runs) | the whole `fftw3_candidates()` ladder: `$LORRAX_FFTW3_SO` → build-time `LORRAX_FFTW3_SO_HINT` → `libfftw3.so.3` → `libfftw3.so.mpi31.3` → `libmkl_rt.so` → `libfftw3.so`. On Frontera `libfftw3.so.3` **is** reachable (`/usr/lib64`, FFTW 3.3.2) and would win over `libmkl_rt.so` if MKL were not already resident | **GATE 5b** — zero `fftw` in `DT_NEEDED` (`build_ffi_host.sh`). Covers *load* time only | **PASS**, Perlmutter, measured 2026-08-06 |
 | ↳ *which engine actually answered* | — | — | — | **GATE 8** (`gate_one_fftw.sh`) — **NOT ON THIS BRANCH**, see §3b | **no check** |
 | **Host band-block contraction** | **Cray LibSci** CBLAS | **MKL** CBLAS | LibSci exports no `cblas_?gemm_batch`, so the run-time `dlsym` picks the plain-`cblas_?gemm` loop; MKL has the batched entry. Also netlib/AOCL/OpenBLAS/BLIS/ATLAS are accepted as CBLAS providers | **GATE 2** — one LibSci flavour, no sequential/threaded mix. Which *entry* was chosen is **announced at run time, not gated** | **PASS**, Perlmutter (`seq=0 mp=2`), measured 2026-08-06 |
 | **Planned axis GEMM** | Full range: XLA:GPU `dot` → **cuBLAS**. Active range: local classic-**cuBLAS** FFI over pointer views, with 4 MiB XLA-owned workspace | Full range: XLA:CPU `dot`; active range: bounded JAX dot panels | CUDA active plans require `CublasLocalActiveRangeGemmFfi`; CPU needs no provider. Both keep K local and shard only output centroid axes | `services/distrib_la/tests/test_local_active_gemm_range.py` on a real P4 CUDA mesh and emulated P4 CPU mesh | branch evidence in `docs/dev/active_gemm_ranges.md`; not on main |
@@ -728,41 +729,94 @@ unit residuals sitting at the c128 ULP, where a threshold tests nothing.
 ### k-convolution router and the mathdx family (2026-09-24)
 
 This supersedes the direct-DFT arms described in the 2026-09-06 subsection
-below (ruling: [`decisions.md`](decisions.md), 2026-09-24).
+below, the cuFFT strided `gw_conv` CUDA handler, and the direct-DFT
+`conv_klead`/`conv_kminor` handlers (ruling: [`decisions.md`](decisions.md),
+2026-09-24).  Every k-axis convolution and every k-minor k-axis transform in
+the physics goes through one router front door; the router picks the backend
+from the mesh platform only (CUDA → nvidia-mathdx, cpu → the plan route,
+anything else → refusal), and no environment variable picks a route.
 
-| Layer | ζ-fit pair convolution |
+| Layer | What |
 |---|---|
-| 1 consumer | `isdf.core` tails (`c_q_downfold`, `c_q_from_psi_sm`, `_z_q_face_parent`, `parent_projector_kconv`) |
-| 2 facade / router | `ffi/fft.py`: `make_fused_conv_kpair`, `make_fused_conv_kparent` choose by mesh platform. CUDA → a mathdx callable; cpu → `None`, which is the consumer's flat-k MKL plan tail (`common.fft_helpers.local_kfft3`); other → refusal |
-| 3 gate | the wheel's headers must be found (`importlib` spec of `nvidia.mathdx`), else `GATE mathdx-headers`; axes ≤ 40 |
-| 4 target | `lorrax_mathdx_kconv_pair`, `lorrax_mathdx_kconv_parent` |
-| 5 handler | `cpp/cufft/kconv_mathdx_cuda_ffi.cc`: NVRTC compiles one embedded cuFFTDx source per (mode, nkx, nky, nkz, ns, CUcontext); in-process cache |
+| 1 consumer | ζ fit: `isdf.core` tails (`c_q_downfold`, `c_q_from_psi_sm`, `_z_q_face_parent`, `parent_projector_kconv`).  Σ: `gw.ppm_tau_kernel.get_sigma_spatial_kernel`, `gw.cohsex_sigma._make_static_convolution`.  BSE: `bse_stack_matvec._conv_decode`, `bse_ring_comm._make_ring_rung`, and the W_R builds (`bse_densify.make_w_densifier`, `bse_lanczos`, `davidson_absorption`, `absorption_haydock`, `bse_nontda`, `exciton_bands`) |
+| 2 facade / router | `ffi/fft.py` (re-exported by `common.fft_helpers`): `make_fused_conv_kpair`, `make_fused_conv_kparent`, `make_kconv_klead` (→ `KConvStored(prep, apply)`), `make_kconv_kminor` / `make_local_kconv_kminor`, `make_kfft_klead` / `make_local_kfft_klead`, `make_kfft_kminor` / `make_local_kfft_kminor`; `get_donated_kfft_kminor` is the memoised donating W_R transform |
+| 3 gate | startup `require_kconv`: on CUDA the wheel's headers must be found (`importlib` spec of `nvidia.mathdx`), else `GATE mathdx-headers`, and all six targets must be registered; axes ≤ 40 (`GATE mathdx-kconv-axis`); a row that does not fit shared memory is `GATE mathdx-kconv-residency` |
+| 4 target | `lorrax_mathdx_kconv_pair`, `_kconv_parent`, `_kconv_klead`, `_kfft_klead`, `_kconv_kminor`, `_kfft_kminor` |
+| 5 handler | `cpp/cufft/kconv_mathdx_cuda_ffi.cc`: one embedded cuFFTDx source, NVRTC-built per (mode, nkx, nky, nkz, ns, precision, CUcontext); in-process cache plus the disk cubin cache below |
 
-The operands, tables, `centroid_major` layout and perm/phase attributes are
-exactly those of the 2026-09-06 handler below, so the consumers are unchanged.
-The one new attribute is the string `mathdx_root`, the installed wheel's
-`nvidia/mathdx` directory. From it NVRTC includes `include/` and
-`external/cutlass/include`. The CUDA toolkit's `include/` and
-`include/cccl` (libcu++) are derived from the loaded libnvrtc, never from an
-environment variable.
+The modes of the one kernel source:
+
+| mode | operation | layout | resident banks per k-row |
+|---|---|---|---|
+| 0 pair | `s·FFT Σ_ab phase·conj(IFFT A)·IFFT B` | 3-D k leading | 3 |
+| 1 parent | mode 0 with the typed parent load | parent tables | 3 |
+| 2 klead conv | `s·FFT(IFFT(T)·V_R)`, `V_R` already R space | flat k leading `(nk,a,mx,b,my)` | 1 |
+| 3 klead fft | `s·FFT^±(X)` | flat k leading `(nk, rows)` | 1 |
+| 4 kminor conv | `s·FFT(IFFT(X)·K_R)`, store layout 0 (X's) or 1 `(d0,nk,d3,d1,d4,d2)` | k minor `(d0..d4, nk)` | 1 |
+| 5 kminor fft | `s·FFT^±(X)` | k minor `(rows, nk)` | 1 |
+
+Modes 2–5 also compile a complex64 image (the fp32-GMRES BSE arm); modes 2,
+3 and 5 run in place.  The cpu legs are compositions on the host plan
+handlers: the Σ convolution is the FFTW `gw_conv` host handler (`prep` is the
+identity there, because that handler transforms W itself), everything else is
+the flat-k FFTW handler, with the k-minor tiles moved to k-leading by XLA.  In
+the in-process pytest cpu meshes (no host library on Perlmutter) the cpu leg
+takes an announced `jnp.fft` arm under `LORRAX_KFFT_CPU_TEST_XLA=1`, set by
+`tests/conftest.py` only.
+
+**Headers and dependency.** `nvidia-mathdx` (header-only cuFFTDx) is a
+required dependency on every NVIDIA GPU: the `cuda12`/`cuda13` extras of
+`pyproject.toml` pin it, the Perlmutter runtime venv carries it
+(`lorrax_cuda13_runtime/recipe/stack.sh` pins the version, `setup_env.sh`
+installs it `--no-deps`), and `config/cloud/` does the same.  The handler takes
+the wheel's `nvidia/mathdx` directory as the string attribute `mathdx_root`
+and includes `include/` and `external/cutlass/include` beneath it; the CUDA
+toolkit's `include/` and `include/cccl` (libcu++) are derived from the loaded
+libnvrtc, never from an environment variable.  Nothing about mathdx is linked
+into `liblorrax_ffi.so`; the build needs no mathdx at all.
+
+**Disk cubin cache.** Cold NVRTC costs 5–7.5 s per (mode, grid) per process;
+a disk hit costs 8–10 ms (`runs/runtime/kconv_stage2_20260924/`).  The images
+live under their own always-on root, `ffi.fft.cubin_cache_dir()`:
+`$SCRATCH/.cache/lorrax/kconv_mathdx`, or `~/.cache/lorrax/kconv_mathdx` where
+the site defines no `SCRATCH`.  It is deliberately not the XLA compile cache's
+policy (`ISDF_JAX_CACHE_DIR`, which `lx` exports as `""`): this store is small
+and content-addressed, so reuse cannot change a result.  The key is FNV-1a over
+the embedded source, the NVRTC options that decide the image (mode, grid, ns,
+rows per block, sm, precision), the wheel's
+`cufftdx_version.hpp`/`commondx_version.hpp` and the NVRTC version; the file
+name carries mode, grid, ns, precision, sm and the key.  Writes go to a unique
+temporary and are `rename`d into place (atomic on one filesystem, so
+concurrent ranks each publish a whole file); reads re-hash the payload and
+recompile on any mismatch.  The startup `[kconv]` line names the directory
+with its image count and size, and every build logs `disk-cache hit` or
+`NVRTC built … stored` on rank 0.  No knob.
 
 A new mode is added in three steps:
 
 1. A kernel entry in the embedded source, keyed by the `LRX_MODE` compile
    definition.
-2. A mode code and handler in the same TU.
-3. A factory in `ffi/fft.py` that the router returns on CUDA.
+2. A mode code and handler in the same TU, and its target in
+   `ffi_loader._CUDA_TARGET_SYMBOLS` and `ffi.fft.KCONV_TARGETS`.
+3. A router factory in `ffi/fft.py` that returns the mathdx call on CUDA and
+   the plan-route composition on cpu.
 
-The CPU leg of a new mode is its plan-route composition. There is still no
-second NVIDIA path.
+There is no second NVIDIA path.  The plain flat-k transform
+(`common.fft_helpers.make_flat_k_fft`, the χ₀/head/htransform/Lorentz-Σ route)
+is the same router's mode 3 on CUDA since 2026-09-24: at the production local
+tiles it measured 1.8–7.4× faster than the cuFFT advanced-layout plan it
+replaced (CrI3 8×8 P4 G(τ) 12.6 → 5.6 ms, VI3 12×12 P16 G(τ) 41.2 → 15.6 ms,
+TaAs 8³ 45.0 → 6.1 ms; `runs/runtime/kconv_stage2_20260924/bench_flatk_v2.log`),
+so the cuFFT strided CUDA handler was deleted and `LORRAX_FFT_FFI` is a
+cpu-only gate.  On cpu the transform stays the FFTW3-ABI host handler.
 
 ### Parent-load ISDF pair convolution (2026-09-06)
 
-`CufftConvKParentCudaFfi` / `lorrax_cufft_conv_kparent` is an additive
-handler in the conv_kpair family; existing handler signatures and ABI 3
-are unchanged, as required by `common/lorrax_ffi_abi.h`. The build stamp
-and live target probe authenticate this entry. Its NVRTC string follows
-the existing `extract_nvrtc_kernel.cmake` / sm_80 prebuild path.
+*Historical: the handler below is deleted; its operand contract lives on
+in the mathdx parent mode (`lorrax_mathdx_kconv_parent`).*
+
+`CufftConvKParentCudaFfi` / `lorrax_cufft_conv_kparent` was an additive
+handler in the conv_kpair family.
 
 | Positional operands (row-major except CCT parents below) | Shape / dtype |
 |---|---|

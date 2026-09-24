@@ -113,7 +113,6 @@ debug rendering, captured **2026-08-06 on Perlmutter, job 56393848** from
   FFI build provenance: /global/u2/j/jackm/software/lorrax_P/src/ffi/cpp/build/liblorrax_ffi.so | rev 886139f8e000 | sha 5e2eaa7a30e82a85 | built 2026-08-06T08:10:39Z | slate=?
   The LORRAX_BANDS_GEMM_FFI dial is unset and resolved to on, so the contract_bands right-GEMM contraction rides the platform's native lowering — the dial exists on cpu only and this run's backend is 'gpu', where startup enforcement skips it by the gate's declared platform policy (the native lowering IS the required path there).
   The LORRAX_FFT_FFI dial is unset and resolved to on, so the flat-k 3-D FFT helper path is routed through the FFI handler (the required layer).
-  The LORRAX_FFT_FFI_FUSED dial is unset and resolved to on, so the fused IFFT-multiply-FFT tau kernel is routed through the FFI handler (the required layer).
   The distributed backends available for eigh on this mesh are cusolvermp, distributed, native, slate; which one runs is the input-file key, not an environment variable.
   The distributed backends available for cholesky on this mesh are native, slate; which one runs is the input-file key, not an environment variable.
   The distributed backends available for solve_lu on this mesh are native; which one runs is the input-file key, not an environment variable.
@@ -514,6 +513,16 @@ Debug flags: `JAX_DEBUG_NANS=1`, `JAX_DISABLE_JIT=1`, `JAX_LOG_COMPILES=1`,
 The dependency authority is [`pyproject.toml`](../../pyproject.toml)
 (runtime deps, `[dependency-groups]`: `dev`, `jax`, `build`, `profile`).
 Not dependencies, despite older prose: cupy, jax-finufft, Docker.
+
+**NVIDIA GPUs require `nvidia-mathdx`** (header-only cuFFTDx, pinned in the
+`cuda12`/`cuda13` extras; decisions.md 2026-09-24).  Every k-axis convolution
+(ζ fit, Σ, COHSEX, BSE) runs on kernels NVRTC-compiles at run time from that
+wheel's headers; a CUDA run without it refuses at startup with
+`GATE mathdx-headers`.  The Perlmutter runtime venv carries it
+(`lorrax_cuda13_runtime/recipe/stack.sh` pins the version and
+`setup_env.sh` installs it `--no-deps`); `config/cloud/` does the same.  The
+compiled images are disk-cached in `$SCRATCH/.cache/lorrax/kconv_mathdx`
+(`docs/architecture/ffi_layout.md`, "Disk cubin cache").
 
 Porting to another SLURM cluster goes through `config/<cluster>/` —
 [`config/README.md`](../../config/README.md) §Porting is the knob list.

@@ -267,7 +267,7 @@ def _pair_ctx(data):
     """1x1 mesh + the argument tuple both stack matvecs take."""
     from jax.sharding import Mesh
     from bse.bse_ring_comm import make_bse_shardings
-    from bse.bse_serial import compute_pair_amplitude
+    from bse.bse_preconditioner import compute_pair_amplitude
     mesh = Mesh(np.array(jax.devices()[:1]).reshape(1, 1), axis_names=("x", "y"))
     sh = make_bse_shardings(mesh)
     with mesh:

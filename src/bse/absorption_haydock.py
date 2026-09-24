@@ -50,13 +50,14 @@ import numpy as np
 from jax import lax
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
-from common.fft_helpers import make_sharded_ifftn_3d
+from common.fft_helpers import make_kfft_kminor
 
 from .absorption_common import (RYD2EV, build_dipole_vector_bse, jdos_from_transitions, kramers_kronig_eps1, slice_dipole_to_bse_window, write_absorption_dat, write_absorption_h5)
 from file_io.restart_bundle import (load_dipole_h5)
 from .bse_io import (load_bse_data_from_restart_sharded)
 from file_io.restart_bundle import (_find_restart_file)
-from .bse_ring_comm import build_bse_ring_matvec, create_mesh_2d, make_bse_shardings
+from .bse_ring_comm import create_mesh_2d, make_bse_shardings
+from .bse_stack_matvec import build_bse_stack_matvec
 
 
 def haydock_recursion_block(matvec_block, d_block, n_iter):
@@ -144,7 +145,6 @@ def run_haydock(
     n_omega: int,
     out_prefix: str,
     no_eps1: bool,
-    matvec_kind: str = "ring",
 ):
     """End-to-end Haydock absorption: load BSE data, run 3-block recursion,
     evaluate continued fraction, write outputs."""
@@ -204,17 +204,12 @@ def run_haydock(
     d_block_np = build_dipole_vector_bse(d_alpha, n_cond_pad=nc_pad, n_val_pad=nv_pad)
     d_block = jnp.asarray(d_block_np)                                         # (3, nc_pad, nv_pad, nk)
 
-    # Build the BSE matvec (ring or simple), wrap to accept the (3, ...) block shape.
-    if matvec_kind == "simple":
-        from .bse_simple import build_bse_simple_matvec
-        matvec_ring = build_bse_simple_matvec(mesh_xy, nkx, nky, nkz, include_W=True)
-    else:
-        matvec_ring = build_bse_ring_matvec(
-            mesh_xy, nkx, nky, nkz, include_W=True,
-            low_mem=(matvec_kind == "ring"))
+    # THE BSE matvec (bse_stack_matvec): the three polarisations are its trial
+    # block, one T-tensor alive regardless of the block width.
+    matvec_stack = build_bse_stack_matvec(mesh_xy, nkx, nky, nkz, kernel="bse")
 
-    _W_local_ifftn = make_sharded_ifftn_3d(
-        mesh_xy, sh.W.spec, sh.W.spec, axes=(2, 3, 4), norm="ortho")
+    _W_local_ifftn = make_kfft_kminor(
+        mesh_xy, (nkx, nky, nkz), sh.W.spec, kind="ifftn", norm="ortho")
     rep = NamedSharding(mesh_xy, P())
 
     @partial(
@@ -234,7 +229,7 @@ def run_haydock(
 
         def matvec_block(X_block):
             X_block = jax.lax.with_sharding_constraint(X_block, sh.X)
-            return matvec_ring(
+            return matvec_stack(
                 X_block, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y,
                 eps_c, eps_v, W_R, V_q0, M_X, M_Y,
             )
@@ -272,6 +267,12 @@ def run_haydock(
         eps1 = np.stack(
             [kramers_kronig_eps1(omegas_Ry, eps2[:, a]) for a in range(3)], axis=1)
 
+    # ONE writer.  The (α, β) are replicated, so every rank holds the same
+    # spectrum; at P>1 four ranks truncating the same h5 collided ("Unable to
+    # synchronously create file (file signature not found)", rc 137 on
+    # 2026-09-24's P4 gate run, before and after the stack-matvec move).
+    if jax.process_index() != 0:
+        return
     suffixes = ["b1", "b2", "b3"]
     out_prefix_p = Path(out_prefix)
     for a, sfx in enumerate(suffixes):
@@ -333,7 +334,6 @@ def main(argv=None):
     p.add_argument("--out-prefix", default="absorption_haydock")
     p.add_argument("--no-eps1", action="store_true",
                    help="Skip Kramers-Kronig eps1 (faster)")
-    p.add_argument("--matvec-kind", choices=("ring", "gather", "simple"), default="ring")
     args = p.parse_args(argv)
 
     run_haydock(
@@ -345,7 +345,6 @@ def main(argv=None):
         omega_min_eV=args.omega_min_eV, omega_max_eV=args.omega_max_eV,
         n_omega=args.n_omega,
         out_prefix=args.out_prefix, no_eps1=args.no_eps1,
-        matvec_kind=args.matvec_kind,
     )
 
 

@@ -69,15 +69,10 @@ def _runtime():
         "ffi_dials": [
             {"env": "LORRAX_FFT_FFI", "enabled": True,
              "platforms": ("CUDA",), "target": "lorrax_cufft_flat_k"},
-            {"env": "LORRAX_FFT_FFI_FUSED", "enabled": False,
-             "platforms": ("CUDA",), "off_label": "three FFT chain"},
             # CPU-only: production output must state the active GPU-native
             # lowering, not describe a skipped platform-policy gate.
             {"env": "LORRAX_BANDS_GEMM_FFI", "enabled": True,
              "platforms": ("cpu",), "off_label": "native XLA dot lowering"},
-            # No production Sigma caller: this capability is not a run control.
-            {"env": "LORRAX_CONV_KLEAD_FFI", "enabled": False,
-             "platforms": ("CUDA",), "off_label": "XLA"},
         ],
     }
     return SimpleNamespace(process_index=0, facts=facts)
@@ -213,12 +208,11 @@ def test_report_is_scientific_rank_zero_output(tmp_path):
     assert "Gap correction : +0.00000 eV relative to DFT" in text
     assert "Quasiparticle energies" not in text
     assert "cuFFT flat-k FFI" in text
-    assert "pair-density convolution forming V(q) (nvidia-mathdx fused cuFFTDx kernels)" in text
+    assert "k-axis convolutions of the zeta fit and Sigma (nvidia-mathdx fused cuFFTDx kernels)" in text
     assert "mklfft" not in text
     gemm_line = next(line for line in text.splitlines()
                      if "LORRAX_BANDS_GEMM_FFI" in line)
     assert "= NATIVE" in gemm_line
-    assert "LORRAX_CONV_KLEAD_FFI" not in text
     assert "harmless backend implementation chatter" not in text
     assert "Started sigma[correlation]" in text
     assert "tau node 5 / 10" in text

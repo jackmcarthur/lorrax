@@ -12,16 +12,12 @@ import sys as _sys
 from ffi import fft as flat_k  # noqa: F401  (ffi.mklfft.flat_k module alias)
 from ffi.fft import (  # noqa: F401
     FLAT_K_TARGET,
-    FUSED_GATE,
     GATE,
     GW_CONV_TARGET,
     ffi_fft_scale,
     fft_ffi_enabled,
     fft_ffi_mode,
-    fused_fft_ffi_enabled,
-    fused_fft_ffi_mode,
     make_flat_k_fft_ffi,
-    make_gw_conv_ffi,
     require_fft_ffi,
     validate_flat_spec,
 )
@@ -30,9 +26,8 @@ from ffi.fft import (  # noqa: F401
 _sys.modules[__name__ + ".flat_k"] = flat_k
 
 __all__ = [
-    "FLAT_K_TARGET", "GW_CONV_TARGET", "GATE", "FUSED_GATE",
+    "FLAT_K_TARGET", "GW_CONV_TARGET", "GATE",
     "fft_ffi_enabled", "fft_ffi_mode",
-    "fused_fft_ffi_enabled", "fused_fft_ffi_mode",
-    "require_fft_ffi", "make_flat_k_fft_ffi", "make_gw_conv_ffi",
+    "require_fft_ffi", "make_flat_k_fft_ffi",
     "ffi_fft_scale", "validate_flat_spec",
 ]

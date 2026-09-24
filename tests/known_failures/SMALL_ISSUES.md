@@ -184,7 +184,7 @@ silent overwrite.
     twin writes none). Landed on main in the `feat/exciton-bands-2026-08-09`
     merge, `824032b7`. Closes `FIX_warmcache.md` open item 3.
     [EXCITON_BANDS_FEATURES.md §3; was ASIDES_AUDIT.md §A3]
-16. **`--matvec-kind` is parsed and silently ignored on `bse_jax`** —
+16. **RESOLVED 2026-09-24 (C10): `--matvec-kind` is deleted.** Was: **`--matvec-kind` is parsed and silently ignored on `bse_jax`** —
     `src/bse/bse_jax.py:192` writes `data["matvec_kind"]` and nothing
     reads it; `bse_lanczos.py:243` says the selector is retired and builds
     `build_bse_stack_matvec` unconditionally. The only live consumer of

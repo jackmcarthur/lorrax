@@ -741,9 +741,8 @@ def _host_target_id() -> str:
 #:
 #: Everything else in :func:`_key_env_fingerprint` is about the cache KEY of
 #: the same module.  These are different and worse: they change the module
-#: ITSELF.  ``LORRAX_FFT_FFI_FUSED`` picks between a fused host-FFI
-#: ``ffi_call`` and a native three-FFT ``jnp`` chain inside
-#: ``gw.ppm_tau_kernel`` / ``gw.cohsex_sigma`` / ``gw.w_isdf``, so a rank
+#: ITSELF.  ``LORRAX_BANDS_GEMM_FFI`` picks between a vendor-GEMM
+#: ``ffi_call`` and a native ``dot`` inside the band contractions, so a rank
 #: launched with a different value emits different HLO, compiles a different
 #: program, and misses where its peers hit — ``jit__multi_slice``'s
 #: divergence (FIX_multislice_cachekey.md §6.1, sibling 5) arriving through
@@ -763,10 +762,7 @@ def _host_target_id() -> str:
 RANK_FINGERPRINT_ENV = (
     "LORRAX_SIGMA_PREPARED_BOUNDS",
     "LORRAX_FFT_FFI",
-    "LORRAX_FFT_FFI_FUSED",
     "LORRAX_BANDS_GEMM_FFI",
-    "LORRAX_CONV_KMINOR_FFI",
-    "LORRAX_CONV_KLEAD_FFI",
 )
 
 

@@ -13,23 +13,42 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from common.shard_map import shard_map as _shard_map_fn
 
-from common.collectives import gather_to_host, prepare_mesh, resolve_mesh
+from common.collectives import prepare_mesh, resolve_mesh
 from common.contract_bands import contract_bands_block_reshard
-from bse.w_ladder_conv_kminor import (build_rung_body,
-                                      rung_uses_conv_kminor)
-from common.fft_helpers import (
-    local_fftn3,
-    local_ifftn3,
-    make_sharded_fftn_3d,
-    make_sharded_ifftn_3d,
-)
+from common.fft_helpers import make_kconv_kminor
 from common.vma import mark_varying
-from .bse_io import (_load_ring_subset, load_bse_data_from_restart_sharded)
-from file_io.restart_bundle import (_find_restart_file)
-from .bse_serial import apply_D, apply_bse_hamiltonian_single_device, compute_pair_amplitude
 
 
 jax.config.update("jax_enable_x64", True)
+
+
+def _make_ring_rung(mesh_xy: Mesh, kgrid, w_decode):
+    """The ladder-W rung ``f(T, psi_c_X, psi_v_Y, W_R) -> WX`` of both ring builders.
+
+        U  = fftn_k( ifftn_k(T) · W_R )          (both 'ortho')
+        WX = (1/√Nk) Σ conj(ψ_c) ψ_v U           (the decode)
+
+    ``T`` ``(b, μ, ν, t, s, nk)`` (μ on 'x', ν on 'y'), ``W_R``
+    ``(μ, ν, kx, ky, kz)`` already in R space.  The convolution is ONE call of
+    the k-convolution router's k-minor door (nvidia-mathdx on CUDA, the plan
+    route on cpu) whose store emits the decode's ``(b, k, t, μ, s, ν)`` layout
+    (``out_layout=1``); ``w_decode`` is the caller's
+    ``contract_bands_block_reshard(mesh, extra="leading")``.
+    """
+    nkx, nky, nkz = (int(v) for v in kgrid)
+    nk = nkx * nky * nkz
+    conv = make_kconv_kminor(mesh_xy, (nkx, nky, nkz),
+                             P(None, "x", "y", None, None, None), P("x", "y", None),
+                             norm="ortho", out_layout=1)
+
+    def _apply_W_from_T(T, psi_c_X, psi_v_Y, W_R):
+        sqrt_nk = jnp.sqrt(jnp.asarray(nk, dtype=T.real.dtype))
+        O_b = conv(T, W_R.reshape(W_R.shape[0], W_R.shape[1], nk))   # (b, k, t, μ, s, ν)
+        psi_v_snv = jnp.transpose(psi_v_Y, (0, 2, 3, 1))
+        out = w_decode(psi_c_X, O_b, psi_v_snv)      # (b, nk, c_X, v_Y)
+        return jnp.transpose(out, (0, 2, 3, 1)) / sqrt_nk   # (b, c_X, v_Y, nk)
+
+    return _apply_W_from_T
 
 
 def create_mesh_xy(px: int, py: int, devices: Optional[list] = None) -> Mesh:
@@ -685,77 +704,15 @@ def build_bse_ring_matvec(
         out_specs=P(None, "x", "y", None),
     )
 
-    # Custom-partitioned FFTs on the (kx, ky, kz) axes — those axes are
-    # ``None``-sharded in T (sh.T) and W_R (sh.W), so the FFT can run
-    # locally on every device.  Plain ``jnp.fft.ifftn`` / ``fftn`` on a
-    # sharded tensor forces XLA to all-gather the entire array before
-    # the FFT — see ``common.fft_helpers`` for the JAX bug this works
-    # around.  In the BSE Lanczos loop those gathers cost ~5 s over
-    # 200 matvecs on Si 4×4×4 (profile_sharded_v2/trace_summary.md).
-    # T_k 8D spec: (b, μ, ν, ns, ns, kx, ky, kz) — same μ,ν shardings as
-    # storage T (6D) but with last nk axis split into 3 replicated dims.
-    _T_8d_spec = P(None, "x", "y", None, None, None, None, None)
-    _T_local_ifftn = make_sharded_ifftn_3d(
-        mesh_xy, _T_8d_spec, _T_8d_spec, axes=(5, 6, 7), norm='ortho')
-    _T_local_fftn = make_sharded_fftn_3d(
-        mesh_xy, _T_8d_spec, _T_8d_spec, axes=(5, 6, 7), norm='ortho')
-
     # ψ†Uψ decode = contract_bands_block_reshard, extra="leading" (owner
-    # order 2026-07-29; adoption map wk_REL/contract_bands_notes.md §6.2 —
-    # the CLEAN drop-in site: the b-stacked U already exists, so the stack
-    # axis is free).  Replaces the partitioner-chosen collectives of the
-    # historical einsum pair ("kctM,bMNtsk->bcNsk" then "kvsN,bcNsk->bcvk",
-    # c-replicated intermediate, LARGE payload on the strided 'x' groups —
-    # the exact inversion the primitive's §3.2 policy refuses) with the
-    # structural stacked psum_scatter chain: large partial over the
+    # order 2026-07-29; adoption map wk_REL/contract_bands_notes.md §6.2):
+    # the structural stacked psum_scatter chain -- large partial over the
     # node-local 'y' groups, small final over 'x', all b trials on ONE
-    # collective per mesh axis (AK.9), impl=mpi warm-up inherited from the
-    # factory.  Value-level identical (contraction reassociation — gate at
-    # 1e-12, not bit-exact).  The transposes below are rank-local
-    # (sharded axes preserved: M stays on 'x', N on 'y', c on 'x', v on
-    # 'y'); the U transpose to the primitive's k-leading layout is priced
-    # by the parity/perf gate, and composes with the future flat-k conv
-    # layout (map §6.1 route (a)) which emits k-leading natively.
+    # collective per mesh axis.  The rung's k-convolution emits the decode's
+    # canonical O layout (b, k, t, M, s, N) straight from its store
+    # (:func:`_make_ring_rung`), so no transpose sits between them.
     _w_decode = contract_bands_block_reshard(mesh_xy, extra="leading")
-
-    def _apply_W_from_T(T, psi_c_X, psi_v_Y, W_R):
-        nspinor = psi_c_X.shape[2]
-        nb_trial = T.shape[0]
-        n_rmu_local_X = T.shape[1]
-        n_rmu_local_Y = T.shape[2]
-        sqrt_nk = jnp.sqrt(jnp.asarray(nk, dtype=T.real.dtype))
-
-        T_k = T.reshape(nb_trial, n_rmu_local_X, n_rmu_local_Y, nspinor, nspinor, nkx, nky, nkz)
-        T_R = _T_local_ifftn(T_k)
-        U_R = W_R[None, :, :, None, None, :, :, :] * T_R
-        U_q = _T_local_fftn(U_R)
-        U = U_q.reshape(nb_trial, n_rmu_local_X, n_rmu_local_Y, nspinor, nspinor, nk)
-
-        # (b, M, N, t, s, k) -> (b, k, t, M, s, N): the primitive's
-        # canonical O layout (extra="leading"); ψ_v (k, v, s, N) ->
-        # (k, s, N, v) = ψ_right.  conj(ψ_c) is applied inside.
-        O_b = jnp.transpose(U, (0, 5, 3, 1, 4, 2))
-        psi_v_snv = jnp.transpose(psi_v_Y, (0, 2, 3, 1))
-        out = _w_decode(psi_c_X, O_b, psi_v_snv)     # (b, nk, c_X, v_Y)
-        WX = jnp.transpose(out, (0, 2, 3, 1))        # (b, c_X, v_Y, nk)
-        return WX / sqrt_nk
-
-    # --- the fused-conv family's k-MINOR member, DIAL `auto` --------------
-    # LORRAX_CONV_KMINOR_FFI=auto (the default) replaces the chain above —
-    # reshape / ifftn / W_R multiply / fftn / reshape / transpose-to-O — with
-    # ONE FFI call that also emits the decode's O layout from its store,
-    # WHEN the mesh is CUDA, the device library exports the handler and the
-    # k-grid's row is shared-memory resident.  Otherwise this line is a no-op
-    # and the body above runs unchanged, which is the certified path on every
-    # backend.  Same signature, same operands, same output sharding; measured
-    # rel <= 6e-16 against this body and gated in
-    # tests/bench/bench_conv_kminor.py.  Everything behind the dial lives in
-    # bse.w_ladder_conv_kminor, so this file keeps exactly ONE spelling of the
-    # chain plus this hook.
-    _ck_use, _ck_why = rung_uses_conv_kminor(mesh_xy, (nkx, nky, nkz),
-                                             jnp.complex128)
-    if _ck_use:
-        _apply_W_from_T = build_rung_body(mesh_xy, (nkx, nky, nkz), _w_decode)
+    _apply_W_from_T = _make_ring_rung(mesh_xy, (nkx, nky, nkz), _w_decode)
 
     apply_W_from_T = jax.jit(
         _apply_W_from_T,
@@ -1002,77 +959,15 @@ def build_bse_ring_matvec_full(
         out_specs=P(None, "x", "y", None),
     )
 
-    # Custom-partitioned FFTs on the (kx, ky, kz) axes — those axes are
-    # ``None``-sharded in T (sh.T) and W_R (sh.W), so the FFT can run
-    # locally on every device.  Plain ``jnp.fft.ifftn`` / ``fftn`` on a
-    # sharded tensor forces XLA to all-gather the entire array before
-    # the FFT — see ``common.fft_helpers`` for the JAX bug this works
-    # around.  In the BSE Lanczos loop those gathers cost ~5 s over
-    # 200 matvecs on Si 4×4×4 (profile_sharded_v2/trace_summary.md).
-    # T_k 8D spec: (b, μ, ν, ns, ns, kx, ky, kz) — same μ,ν shardings as
-    # storage T (6D) but with last nk axis split into 3 replicated dims.
-    _T_8d_spec = P(None, "x", "y", None, None, None, None, None)
-    _T_local_ifftn = make_sharded_ifftn_3d(
-        mesh_xy, _T_8d_spec, _T_8d_spec, axes=(5, 6, 7), norm='ortho')
-    _T_local_fftn = make_sharded_fftn_3d(
-        mesh_xy, _T_8d_spec, _T_8d_spec, axes=(5, 6, 7), norm='ortho')
-
     # ψ†Uψ decode = contract_bands_block_reshard, extra="leading" (owner
-    # order 2026-07-29; adoption map wk_REL/contract_bands_notes.md §6.2 —
-    # the CLEAN drop-in site: the b-stacked U already exists, so the stack
-    # axis is free).  Replaces the partitioner-chosen collectives of the
-    # historical einsum pair ("kctM,bMNtsk->bcNsk" then "kvsN,bcNsk->bcvk",
-    # c-replicated intermediate, LARGE payload on the strided 'x' groups —
-    # the exact inversion the primitive's §3.2 policy refuses) with the
-    # structural stacked psum_scatter chain: large partial over the
+    # order 2026-07-29; adoption map wk_REL/contract_bands_notes.md §6.2):
+    # the structural stacked psum_scatter chain -- large partial over the
     # node-local 'y' groups, small final over 'x', all b trials on ONE
-    # collective per mesh axis (AK.9), impl=mpi warm-up inherited from the
-    # factory.  Value-level identical (contraction reassociation — gate at
-    # 1e-12, not bit-exact).  The transposes below are rank-local
-    # (sharded axes preserved: M stays on 'x', N on 'y', c on 'x', v on
-    # 'y'); the U transpose to the primitive's k-leading layout is priced
-    # by the parity/perf gate, and composes with the future flat-k conv
-    # layout (map §6.1 route (a)) which emits k-leading natively.
+    # collective per mesh axis.  The rung's k-convolution emits the decode's
+    # canonical O layout (b, k, t, M, s, N) straight from its store
+    # (:func:`_make_ring_rung`), so no transpose sits between them.
     _w_decode = contract_bands_block_reshard(mesh_xy, extra="leading")
-
-    def _apply_W_from_T(T, psi_c_X, psi_v_Y, W_R):
-        nspinor = psi_c_X.shape[2]
-        nb_trial = T.shape[0]
-        n_rmu_local_X = T.shape[1]
-        n_rmu_local_Y = T.shape[2]
-        sqrt_nk = jnp.sqrt(jnp.asarray(nk, dtype=T.real.dtype))
-
-        T_k = T.reshape(nb_trial, n_rmu_local_X, n_rmu_local_Y, nspinor, nspinor, nkx, nky, nkz)
-        T_R = _T_local_ifftn(T_k)
-        U_R = W_R[None, :, :, None, None, :, :, :] * T_R
-        U_q = _T_local_fftn(U_R)
-        U = U_q.reshape(nb_trial, n_rmu_local_X, n_rmu_local_Y, nspinor, nspinor, nk)
-
-        # (b, M, N, t, s, k) -> (b, k, t, M, s, N): the primitive's
-        # canonical O layout (extra="leading"); ψ_v (k, v, s, N) ->
-        # (k, s, N, v) = ψ_right.  conj(ψ_c) is applied inside.
-        O_b = jnp.transpose(U, (0, 5, 3, 1, 4, 2))
-        psi_v_snv = jnp.transpose(psi_v_Y, (0, 2, 3, 1))
-        out = _w_decode(psi_c_X, O_b, psi_v_snv)     # (b, nk, c_X, v_Y)
-        WX = jnp.transpose(out, (0, 2, 3, 1))        # (b, c_X, v_Y, nk)
-        return WX / sqrt_nk
-
-    # --- the fused-conv family's k-MINOR member, DIAL `auto` --------------
-    # LORRAX_CONV_KMINOR_FFI=auto (the default) replaces the chain above —
-    # reshape / ifftn / W_R multiply / fftn / reshape / transpose-to-O — with
-    # ONE FFI call that also emits the decode's O layout from its store,
-    # WHEN the mesh is CUDA, the device library exports the handler and the
-    # k-grid's row is shared-memory resident.  Otherwise this line is a no-op
-    # and the body above runs unchanged, which is the certified path on every
-    # backend.  Same signature, same operands, same output sharding; measured
-    # rel <= 6e-16 against this body and gated in
-    # tests/bench/bench_conv_kminor.py.  Everything behind the dial lives in
-    # bse.w_ladder_conv_kminor, so this file keeps exactly ONE spelling of the
-    # chain plus this hook.
-    _ck_use, _ck_why = rung_uses_conv_kminor(mesh_xy, (nkx, nky, nkz),
-                                             jnp.complex128)
-    if _ck_use:
-        _apply_W_from_T = build_rung_body(mesh_xy, (nkx, nky, nkz), _w_decode)
+    _apply_W_from_T = _make_ring_rung(mesh_xy, (nkx, nky, nkz), _w_decode)
 
     apply_W_from_T = jax.jit(
         _apply_W_from_T,
@@ -1662,161 +1557,3 @@ def build_density_readout_operator_full(mesh_xy, nkx, nky, nkz):
         return w_x + w_y
 
     return _readout
-
-
-def ring_matvec_smoke_test(px: Optional[int] = None,
-                           py: Optional[int] = None) -> None:
-    # Omitted px/py = the run's mesh, the same resolution every bse driver's
-    # main() does.  It was ``px = py = 2`` against the full ``jax.devices()``
-    # list, which the equality guard in create_mesh_xy makes a refusal at
-    # every count but exactly 4 — and `python -m bse.bse_jax --ring-test`
-    # (bse_jax.py, no arguments) is precisely that call, so on a 9- or
-    # 16-device job the driver went from "runs 2x2 on 4 of 16" to "refuses".
-    # A shape default that is not the run's mesh is the defect this module
-    # removed from the six CLIs; it does not get to stay here either.
-    mesh = create_mesh_xy_from_flags(px, py)
-    px, py = (int(n) for n in mesh.devices.shape)
-    sh = make_bse_shardings(mesh)
-
-    nkx, nky, nkz = 2, 2, 1
-    nk = nkx * nky * nkz
-    nc, nv, nspinor, n_rmu = 4 * px, 4 * py, 2, 8 * px * py
-
-    key = jax.random.PRNGKey(0)
-    psi_c = jax.random.normal(key, (nk, nc, nspinor, n_rmu)) + 1j * jax.random.normal(key, (nk, nc, nspinor, n_rmu))
-    psi_v = jax.random.normal(key, (nk, nv, nspinor, n_rmu)) + 1j * jax.random.normal(key, (nk, nv, nspinor, n_rmu))
-    eps_c = jax.random.uniform(key, (nk, nc), minval=0.1, maxval=0.5)
-    eps_v = jax.random.uniform(key, (nk, nv), minval=-0.5, maxval=-0.1)
-    W_q = jax.random.normal(key, (n_rmu, n_rmu, nkx, nky, nkz)) * 0.01
-    V_q0 = jnp.eye(n_rmu) * 0.05
-    X = jax.random.normal(key, (1, nc, nv, nk)) + 1j * jax.random.normal(key, (1, nc, nv, nk))
-
-    with mesh:
-        psi_c_X = jax.lax.with_sharding_constraint(psi_c, sh.psi_x)
-        psi_c_Y = jax.lax.with_sharding_constraint(psi_c, sh.psi_y)
-        psi_v_X = jax.lax.with_sharding_constraint(psi_v, sh.psi_x)
-        psi_v_Y = jax.lax.with_sharding_constraint(psi_v, sh.psi_y)
-        W_q = jax.lax.with_sharding_constraint(W_q, sh.W)
-        V_q0 = jax.lax.with_sharding_constraint(V_q0, sh.V)
-        X = jax.lax.with_sharding_constraint(X, sh.X)
-
-        matvec = build_bse_ring_matvec(mesh, nkx, nky, nkz)
-        W_R = local_ifftn3(W_q, axes=(2, 3, 4), norm="ortho")
-        M_X = compute_pair_amplitude(psi_c_X, psi_v_X)
-        M_Y = compute_pair_amplitude(psi_c_Y, psi_v_Y)
-        HX = matvec(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0, M_X, M_Y)
-        HX.block_until_ready()
-
-    print(f"HX sharding: {HX.sharding}")
-    if hasattr(jax.debug, "inspect_array_sharding"):
-        try:
-            jax.debug.inspect_array_sharding(HX, name="HX")
-        except TypeError:
-            try:
-                jax.debug.inspect_array_sharding(HX, callback=lambda *_: None)
-            except TypeError:
-                pass
-
-
-def ring_matvec_correctness_check(
-    input_file: str,
-    n_val: int = 4,
-    n_cond: int = 4,
-    px: Optional[int] = None,
-    py: Optional[int] = None,
-    component_check: bool = False,
-) -> None:
-    restart_file = _find_restart_file(input_file)
-    # Same resolution as ring_matvec_smoke_test above, and for the same
-    # reason.  This one was safe only because its single caller
-    # (bse_jax.main) overwrites args.px/args.py with the resolved shape
-    # first — an accident of one caller, not a property of the function,
-    # and the signature is public (bse_jax re-exports it).
-    mesh = create_mesh_xy_from_flags(px, py)
-    px, py = (int(n) for n in mesh.devices.shape)
-    sh = make_bse_shardings(mesh)
-
-    payload = _load_ring_subset(restart_file, n_val, n_cond, px, py,
-                                input_file=input_file)
-    psi_c = payload["psi_c"]
-    psi_v = payload["psi_v"]
-    eps_c = payload["eps_c"]
-    eps_v = payload["eps_v"]
-    W_q = payload["W_q"]
-    V_q0 = payload["V_q0"]
-    X = payload["X"]
-    nkx = payload["nkx"]
-    nky = payload["nky"]
-    nkz = payload["nkz"]
-    nk = payload["nk"]
-    n_rmu_pad = payload["n_rmu_pad"]
-
-    HX_ref = apply_bse_hamiltonian_single_device(
-        X, psi_c, psi_v, eps_c, eps_v, W_q, V_q0, nkx, nky, nkz
-    )
-
-    with mesh:
-        psi_c_X = jax.lax.with_sharding_constraint(psi_c, sh.psi_x)
-        psi_c_Y = jax.lax.with_sharding_constraint(psi_c, sh.psi_y)
-        psi_v_X = jax.lax.with_sharding_constraint(psi_v, sh.psi_x)
-        psi_v_Y = jax.lax.with_sharding_constraint(psi_v, sh.psi_y)
-        W_q = jax.lax.with_sharding_constraint(W_q, sh.W)
-        V_q0 = jax.lax.with_sharding_constraint(V_q0, sh.V)
-        X = jax.lax.with_sharding_constraint(X, sh.X)
-        W_R = local_ifftn3(W_q, axes=(2, 3, 4), norm="ortho")
-
-        matvec = build_bse_ring_matvec(mesh, nkx, nky, nkz)
-        M_X = compute_pair_amplitude(psi_c_X, psi_v_X)
-        M_Y = compute_pair_amplitude(psi_c_Y, psi_v_Y)
-        HX_ring = matvec(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0, M_X, M_Y)
-        HX_ring.block_until_ready()
-
-    # ``gather_to_host``: HX_ring carries ``out_shardings=sh.X`` =
-    # P(None,'x','y',None), tiled on BOTH mesh axes, so a bare ``device_get``
-    # raised at P>1 -- i.e. the ring-matvec correctness check could not be run
-    # on the geometry whose correctness it exists to check.
-    HX_ring_host = gather_to_host(HX_ring)
-    diff = jnp.linalg.norm(HX_ring_host - HX_ref) / jnp.maximum(jnp.linalg.norm(HX_ref), 1e-12)
-    print(f"Relative error ||HX_ring - HX_ref||/||HX_ref||: {float(diff):.3e}")
-
-    if component_check:
-        sqrt_nk = jnp.sqrt(jnp.asarray(nk, dtype=jnp.float64))
-        M = compute_pair_amplitude(psi_c, psi_v)
-        D_ref = apply_D(X, eps_c, eps_v)
-        S_V = jnp.einsum("kcvN,bcvk->bNk", jnp.conj(M), X) / sqrt_nk
-        U_V = jnp.einsum("MN,bNk->bMk", V_q0, S_V)
-        V_ref = jnp.einsum("kcvM,bMk->bcvk", M, U_V) / sqrt_nk
-
-        R = jnp.einsum("kvsN,bcvk->bcksN", jnp.conj(psi_v), X)
-        T = jnp.einsum("kctM,bcksN->bMNtsk", psi_c, R)
-        T_k = T.reshape(X.shape[0], n_rmu_pad, n_rmu_pad, psi_c.shape[2], psi_c.shape[2], nkx, nky, nkz)
-        T_R = local_ifftn3(T_k, axes=(5, 6, 7), norm="ortho")
-        W_R = local_ifftn3(W_q, axes=(2, 3, 4), norm="ortho")
-        U_R = W_R[None, :, :, None, None, :, :, :] * T_R
-        U_q = local_fftn3(U_R, axes=(5, 6, 7), norm="ortho")
-        U = U_q.reshape(X.shape[0], n_rmu_pad, n_rmu_pad, psi_c.shape[2], psi_c.shape[2], nk)
-        A = jnp.einsum("kctM,bMNtsk->bcNsk", jnp.conj(psi_c), U)
-        W_ref = jnp.einsum("kvsN,bcNsk->bcvk", psi_v, A) / sqrt_nk
-
-        comp_matvec = build_bse_ring_matvec(mesh, nkx, nky, nkz)
-        with mesh:
-            D_ring = apply_D(X, eps_c, eps_v)
-            W_R = local_ifftn3(W_q, axes=(2, 3, 4), norm="ortho")
-            V_ring = comp_matvec(
-                X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c * 0.0, eps_v * 0.0, W_R * 0.0, V_q0,
-                M_X, M_Y
-            )
-            W_ring = comp_matvec(
-                X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c * 0.0, eps_v * 0.0, W_R, V_q0 * 0.0,
-                M_X, M_Y
-            )
-            D_ring.block_until_ready()
-            V_ring.block_until_ready()
-            W_ring.block_until_ready()
-
-        def _rel_err(a, b):
-            return float(jnp.linalg.norm(a - b) / jnp.maximum(jnp.linalg.norm(b), 1e-12))
-
-        print(f"Component error D: { _rel_err(D_ring, D_ref):.3e}")
-        print(f"Component error V: { _rel_err(V_ring, V_ref):.3e}")
-        print(f"Component error W: { _rel_err(-W_ring, W_ref):.3e}")

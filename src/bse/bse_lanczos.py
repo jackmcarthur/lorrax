@@ -1,8 +1,8 @@
 """Lanczos solvers for BSE.
 
 The generic Lanczos algorithms live in solvers.lanczos.  This module
-re-exports them and provides the BSE-specific solve_bse wrapper that
-builds the matvec from BSE physics arrays.
+re-exports them and provides ``solve_bse_sharded``, the one BSE solve (any
+mesh, including 1x1), built on the trial-stack matvec.
 """
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from common.collectives import replicate_to_mesh
-from common.fft_helpers import get_donated_ifftn_3d
+from common.fft_helpers import get_donated_kfft_kminor
 
 from solvers.lanczos import (
     FULL_REORTH,
@@ -31,7 +31,6 @@ from solvers.lanczos import (
     split_alpha_sink,
     lanczos_eig_jit,
 )
-from .bse_serial import apply_bse_hamiltonian_single_device
 
 #: Third element of ``solve_bse_sharded``'s return tuple when the route ran a
 #: FIXED number of iterations and therefore never measured a convergence point.
@@ -92,77 +91,6 @@ def reorth_route() -> str:
     return reorth_kind(os.environ.get(REORTH_ENV, ""))
 
 
-def solve_bse(
-    psi_c: jax.Array,
-    psi_v: jax.Array,
-    eps_c: jax.Array,
-    eps_v: jax.Array,
-    W_q: jax.Array,
-    V_q0: jax.Array,
-    nkx: int,
-    nky: int,
-    nkz: int,
-    n_eig: int = 20,
-    max_iter: int = 100,
-    use_block: bool = False,
-    block_size: int = 4,
-    use_jit_lanczos: bool = True,
-    n_reorth: int = FULL_REORTH,
-    include_W: bool = True,
-) -> Tuple[jax.Array, jax.Array]:
-    """Solve BSE for lowest exciton eigenvalues."""
-    _reorth = reorth_route()
-    nk, nc, _, _ = psi_c.shape
-    nv = psi_v.shape[1]
-    shape = (nc, nv, nk)
-    n_flat = nc * nv * nk
-
-    @partial(jax.jit, static_argnames=("nkx", "nky", "nkz", "include_W"))
-    def _matvec_impl(v, psi_c, psi_v, eps_c, eps_v, W_q, V_q0, nkx, nky, nkz, include_W):
-        X = v.reshape(1, nc, nv, nk)
-        HX = apply_bse_hamiltonian_single_device(
-            X, psi_c, psi_v, eps_c, eps_v, W_q, V_q0, nkx, nky, nkz, include_W
-        )
-        return HX.reshape(-1)
-
-    matvec_flat = partial(
-        _matvec_impl,
-        psi_c=psi_c,
-        psi_v=psi_v,
-        eps_c=eps_c,
-        eps_v=eps_v,
-        W_q=W_q,
-        V_q0=V_q0,
-        nkx=nkx,
-        nky=nky,
-        nkz=nkz,
-        include_W=include_W,
-    )
-
-    def matvec_block(X):
-        return apply_bse_hamiltonian_single_device(
-            X, psi_c, psi_v, eps_c, eps_v, W_q, V_q0, nkx, nky, nkz, include_W
-        )
-
-    if use_block:
-        eigenvalues, eigenvectors = block_lanczos_eig(
-            matvec_block, shape, n_eig=n_eig, block_size=block_size, max_iter=max_iter
-        )
-    elif use_jit_lanczos:
-        eigenvalues, eigenvectors = lanczos_eig_jit(
-            matvec_flat, n_flat, n_eig=n_eig, max_iter=max_iter,
-            n_reorth=n_reorth, reorth=_reorth,
-        )
-        eigenvectors = eigenvectors.reshape(n_eig, *shape)
-    else:
-        eigenvalues, eigenvectors = simple_lanczos_eig(
-            matvec_flat, n_flat, n_eig=n_eig, max_iter=max_iter
-        )
-        eigenvectors = eigenvectors.reshape(n_eig, *shape)
-
-    return eigenvalues, eigenvectors
-
-
 def solve_bse_sharded(
     data: dict,
     mesh_xy: Mesh,
@@ -185,11 +113,11 @@ def solve_bse_sharded(
     davidson_eps_shift_Ry: float = 1e-3,
     tda: bool = True,
 ) -> Tuple[jax.Array, jax.Array]:
-    """Sharded BSE Lanczos using the (μ,ν) ring matvec.
+    """The BSE eigensolve (Lanczos / block / Davidson / TRLan) on any mesh.
 
-    Drop-in faster replacement for ``solve_bse`` when the mesh has more
-    than one device. Reuses ``bse_ring_comm.build_bse_ring_matvec`` —
-    same kernel as FEAST, so the per-iteration matvec
+    The single-device ``solve_bse`` it used to sit beside was deleted with
+    ``bse_serial`` (C10, 2026-09-24); a one-device run is this on a 1x1 mesh.
+    The per-iteration matvec is the trial-stack matvec, which
     (a) parallelises over (px·py) GPUs,
     (b) precomputes ``W_R = ifft(W_q)`` once outside the Lanczos loop
         instead of per-iter (the dominant cost in the single-device
@@ -314,8 +242,9 @@ def solve_bse_sharded(
             # and named at §7.2).  Donation is unchanged: the accessor sets
             # ``donate_argnums=(0,)`` and the alias is gated in
             # tests/test_bse_w_ifft_hoist.py.
-            _W_ifft_donated = get_donated_ifftn_3d(
-                mesh_xy, sh.W.spec, axes=(2, 3, 4), norm='ortho')
+            _W_ifft_donated = get_donated_kfft_kminor(
+                mesh_xy, tuple(int(n) for n in data["W_q"].shape[-3:]), sh.W.spec,
+                kind="ifftn", norm='ortho')
             W_R = _W_ifft_donated(data["W_q"])
             data["W_q"] = None          # release the caller-side reference
             _sec_wifft.watch(W_R)
