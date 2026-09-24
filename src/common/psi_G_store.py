@@ -647,18 +647,23 @@ class PsiGStore:
             row_state[q * n_loc:q * n_loc + pick.size] = states[pick]
         row_k = np.where(row_state >= 0, row_state // band_count, 0)
 
+        # Each device's block is copied out of its OWN host tile and placed on
+        # that device only: the collectives service's zero-collective
+        # per-device restore, never a replicated or gathered payload.
+        from common.collectives import (
+            HostSpill, device_put_process_local, restore_from_host)
         row_sharding = NamedSharding(self.mesh, P(("x", "y"), None, None))
-        blocks = []
+        shards = []
         for dev in row_sharding.addressable_devices:
-            o, q = owners[dev]
+            o, _ = owners[dev]
             pick = np.flatnonzero(owner == o)
             block = np.zeros((n_loc, ns, ngkmax), dtype=np.complex128)
             tile = self._host_tiles[self._coords[id(dev)]]
             block[:pick.size] = tile[k_idx[pick], tile_band[pick]]
-            blocks.append(jax.device_put(block, dev))
-        rows = jax.make_array_from_single_device_arrays(
-            (p * n_loc, ns, ngkmax), row_sharding, blocks)
-        from common.collectives import device_put_process_local
+            shards.append((dev, block))
+        rows = restore_from_host(HostSpill(
+            shape=(p * n_loc, ns, ngkmax), sharding=row_sharding,
+            shards=shards))
         row_k_dev = device_put_process_local(
             row_k.astype(np.int32), NamedSharding(self.mesh, P(("x", "y"))))
         return rows, row_k_dev, row_state
