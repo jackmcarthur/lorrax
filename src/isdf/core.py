@@ -30,7 +30,7 @@ from common.gamma_matrices import (
     gammas_perm as _gammas_perm,
     gammas_phase as _gammas_phase,
 )
-from common.fft_helpers import compute_block_size_for_2d_cholesky, local_fftn3, local_ifftn3
+from common.fft_helpers import compute_block_size_for_2d_cholesky, local_kfft3
 from common.wfn_transforms import take_rchunk_padded, to_rchunk_inner
 # Face-layout CCT (low_mem_bands=True): the (s,mu) GEMM-seam merge/split the
 # two-face carrier and the face G-build already use.  ``common/`` layer,
@@ -347,14 +347,14 @@ def parent_projector_kconv(
 
 		def spin_body(Z_R, pair):
 			coef_l, coef_r, src_l, src_r, count_l, count_r, phase = pair
-			P_l_R = local_ifftn3(
+			P_l_R = local_kfft3(
 				unfold_block(D_l, coef_l, src_l, count_l).reshape(
 					nkx, nky, nkz, mu_loc, r_loc),
-				axes=(0, 1, 2), norm='forward')
-			P_r_R = local_ifftn3(
+				kind='ifftn', norm='forward')
+			P_r_R = local_kfft3(
 				unfold_block(D_r, coef_r, src_r, count_r).reshape(
 					nkx, nky, nkz, mu_loc, r_loc),
-				axes=(0, 1, 2), norm='forward')
+				kind='ifftn', norm='forward')
 			return Z_R + jnp.conj(P_l_R) * (phase * P_r_R), None
 
 		Z_R, _ = jax.lax.scan(
@@ -362,7 +362,7 @@ def parent_projector_kconv(
 				(nkx, nky, nkz, mu_loc, r_loc), dtype=jnp.complex128),
 			(coefficients, coefficients_r, sources, sources[output_pairs],
 			 counts, counts[output_pairs], output_phases), unroll=1)
-		Z_q_3d = local_fftn3(Z_R, axes=(0, 1, 2), norm='forward')
+		Z_q_3d = local_kfft3(Z_R, kind='fftn', norm='forward')
 		return Z_q_3d.reshape(nk, mu_loc, r_loc)
 
 	if coupled_mu123:
@@ -376,15 +376,15 @@ def parent_projector_kconv(
 
 		def spin_channels(acc, pair):
 			"""Share the left child projector across the three current channels."""
-			left = local_ifftn3(unfold_block(
+			left = local_kfft3(unfold_block(
 				D_l, coefficients[pair], sources[pair], counts[pair]).reshape(
-					nkx, nky, nkz, mu_loc, r_loc), axes=(0, 1, 2), norm='forward')
+					nkx, nky, nkz, mu_loc, r_loc), kind='ifftn', norm='forward')
 			def channel(carry, args):
 				"""Accumulate one canonical vertex in its original spin-pair order."""
 				value, target, phase = args
-				right = local_ifftn3(unfold_block(
+				right = local_kfft3(unfold_block(
 					D_r, coefficients[target], sources[target], counts[target]).reshape(
-						nkx, nky, nkz, mu_loc, r_loc), axes=(0, 1, 2), norm='forward')
+						nkx, nky, nkz, mu_loc, r_loc), kind='ifftn', norm='forward')
 				return carry, value + jnp.conj(left) * (phase * right)
 			_, result = jax.lax.scan(channel, 0,
 				(acc, output_pairs[:, pair], output_phases[:, pair]), unroll=1)
@@ -393,7 +393,7 @@ def parent_projector_kconv(
 		initial = jnp.zeros((3, nkx, nky, nkz, mu_loc, r_loc), dtype=jnp.complex128)
 		result, _ = jax.lax.scan(spin_channels, initial, jnp.arange(ns * ns), unroll=1)
 		_, channels = jax.lax.scan(lambda carry, value: (carry,
-			local_fftn3(value, axes=(0, 1, 2), norm='forward').reshape(nk, mu_loc, r_loc)),
+			local_kfft3(value, kind='fftn', norm='forward').reshape(nk, mu_loc, r_loc)),
 			0, result, unroll=1)
 		return channels
 	return channel_tail(*vertex_l, *vertex_r)
@@ -1248,10 +1248,10 @@ def c_q_downfold(
 				C_q_3d = _pair_kernel(P_l_3d, P_r_3d)
 				del P_l_3d, P_r_3d
 			else:
-				P_l_R = local_ifftn3(P_l_3d, axes=(0, 1, 2), norm='forward')
+				P_l_R = local_kfft3(P_l_3d, kind='ifftn', norm='forward')
 				P_l_R_conj = jnp.conj(P_l_R)
 				del P_l_3d, P_l_R
-				P_r_R = local_ifftn3(P_r_3d, axes=(0, 1, 2), norm='forward')
+				P_r_R = local_kfft3(P_r_3d, kind='ifftn', norm='forward')
 				del P_r_3d
 				# Reduce over the spin axes (3=ns_l, 6=ns_r) of the rank-7
 				# form.  Output rank-5: (kx, ky, kz, col, μ).
@@ -1264,7 +1264,7 @@ def c_q_downfold(
 					spin_axes=(3, 6),
 				)
 				del P_l_R_conj, P_r_R
-				C_q_3d = local_fftn3(C_R, axes=(0, 1, 2), norm='forward')
+				C_q_3d = local_kfft3(C_R, kind='fftn', norm='forward')
 			# Reshape back to (nk, col, μ); transpose final two axes
 			# to satisfy out_spec ``P(None, 'x', 'y')`` for (nk, μ, col).
 			# This transpose acts on the rank-3 reduced form (~16 MB),
@@ -1406,15 +1406,15 @@ def c_q_from_psi_sm(
 					nkx, nky, nkz, mu_loc, s_, col_loc, s_)
 				P_r_3d = jnp.conj(D_r_).reshape(
 					nkx, nky, nkz, mu_loc, s_, col_loc, s_)
-				P_l_R = local_ifftn3(P_l_3d, axes=(0, 1, 2), norm='forward')
+				P_l_R = local_kfft3(P_l_3d, kind='ifftn', norm='forward')
 				P_l_R_conj = jnp.conj(P_l_R)
 				del P_l_3d, P_l_R
-				P_r_R = local_ifftn3(P_r_3d, axes=(0, 1, 2), norm='forward')
+				P_r_R = local_kfft3(P_r_3d, kind='ifftn', norm='forward')
 				del P_r_3d
 				C_R = gamma_double_contract(
 					P_l_R_conj, P_r_R, *vertex_l, *vertex_r, spin_axes=(4, 6))
 				del P_l_R_conj, P_r_R
-				C_q_3d = local_fftn3(C_R, axes=(0, 1, 2), norm='forward')
+				C_q_3d = local_kfft3(C_R, kind='fftn', norm='forward')
 				return C_q_3d.reshape(nk, mu_loc, col_loc)
 
 			return _tail(D_l, D_r)

@@ -775,7 +775,7 @@ CONV_KPAIR_GATE = Gate(
     platforms=("CUDA",),
     modes=("off", "auto", "on"),
     default="auto",
-    off_label="the ISDF XLA IFFT/conjugate/gamma/FFT reference chain",
+    off_label="the ISDF flat-k FFT-plan IFFT/conjugate/gamma/FFT chain",
     off_policy="fallback",
     auto_capability=(
         "the mesh is CUDA, the loaded device library exports "
@@ -786,11 +786,11 @@ CONV_KPAIR_GATE = Gate(
             "({target}) is available; the plan selected its measured-fast "
             "resident/device arm from mirrored byte arithmetic."),
     auto_off_msg=(
-        "[conv_kpair] auto -> OFF: ISDF keeps the XLA post-pair reference "
+        "[conv_kpair] auto -> OFF: ISDF keeps the flat-k FFT-plan post-pair "
         "chain. Reason: {reason}"),
     off_announce_msg=(
-        "[LORRAX_CONV_KPAIR_FFI] =off: ISDF keeps the XLA post-pair "
-        "reference chain."),
+        "[LORRAX_CONV_KPAIR_FFI] =off: ISDF keeps the flat-k FFT-plan "
+        "post-pair chain."),
     label={"CUDA": "ISDF two-input k-convolution CUDA"},
     resolved_msg={
         "CUDA": (

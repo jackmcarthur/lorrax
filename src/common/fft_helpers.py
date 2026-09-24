@@ -1,5 +1,7 @@
 from typing import Callable, Literal
 
+import os
+
 import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
@@ -601,3 +603,53 @@ def make_local_flat_k_fftn(
         raise RuntimeError(GATE.off_refuse_msg)
     _require_fft_ffi(mesh)
     return _make_local_flat_k_fft_ffi(kgrid, kind='fftn', norm=norm)
+
+
+def _require_local_flat_k() -> None:
+    """Load/register the flat-k handler for the default backend, or refuse by name."""
+    from ffi.common import ffi_loader
+    from ffi.fft import FLAT_K_TARGET
+    backend = jax.default_backend()
+    plat = "CUDA" if backend in ("gpu", "cuda") else backend
+    ok, why = ffi_loader.probe_target(FLAT_K_TARGET, plat)
+    if not ok:
+        raise RuntimeError(
+            f"GATE local-kfft: got backend {backend!r} whose FFI library cannot "
+            f"serve {FLAT_K_TARGET} ({why}); want the flat-k FFT plan for every "
+            "ISDF k-axis transform; why: k-convolutions run on library FFT plans "
+            "only, with no jnp.fft production fallback; fix: point "
+            "LORRAX_FFI_SO / LORRAX_FFI_HOST_SO at a library that exports it.")
+
+
+def local_kfft3(x_local, *, kind: str, norm: str | None):
+    """Device-local FFT over the three LEADING k axes, by the flat-k FFI plan.
+
+    ``x_local`` ``(nkx, nky, nkz, *trail)`` complex128, inside a caller's
+    ``shard_map`` with the whole k grid local.  The k axes merge into the
+    flat axis (a bitcast) and ONE batched library plan (cuFFT advanced
+    layout on CUDA, MKL DFTI on cpu) transforms them in place; the result
+    has the input's shape.  ``kind`` ``'ifftn'``/``'fftn'``, ``norm`` as
+    ``jnp.fft``.  This is the k-axis transform of every ISDF k-convolution
+    tail: O(Nk log Nk) for any grid, no jnp.fft on a k axis.  Platform and
+    handler were enforced at startup (``LORRAX_FFT_FFI`` is required).
+
+    TEST-ONLY exception: on the cpu backend with
+    ``LORRAX_KFFT_CPU_TEST_XLA=1`` (set by ``tests/conftest.py`` for the
+    in-process CPU meshes, which have no host FFI library on Perlmutter)
+    this announces itself and uses ``jnp.fft``.  It never applies on a GPU.
+    """
+    if (os.environ.get("LORRAX_KFFT_CPU_TEST_XLA") == "1"
+            and jax.default_backend() == "cpu"):
+        from ffi.gate import announce_once
+        announce_once(("kfft", "cpu-test-xla"),
+                      "[local_kfft3] TEST-ONLY: LORRAX_KFFT_CPU_TEST_XLA=1 on cpu -> "
+                      "jnp.fft k-axis transform (never a production path)")
+        f = jnp.fft.ifftn if kind == 'ifftn' else jnp.fft.fftn
+        return f(x_local, axes=(0, 1, 2), norm=norm)
+    if not fft_ffi_enabled():
+        raise RuntimeError(GATE.off_refuse_msg)
+    _require_local_flat_k()
+    kg = tuple(int(v) for v in x_local.shape[:3])
+    fn = _make_local_flat_k_fft_ffi(kg, kind=kind, norm=norm)
+    flat = x_local.reshape((kg[0] * kg[1] * kg[2],) + tuple(x_local.shape[3:]))
+    return fn(flat).reshape(x_local.shape)
