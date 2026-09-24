@@ -6,13 +6,13 @@ stack of ``n_trials`` trial vectors at once, materialising exactly ONE direct-te
 ``T``-tensor regardless of ``n_trials`` (scan-inside-shard_map).  These gates
 assert, on the shared ``bse_dense_state`` fixture (MoS2 3×3×1, 2v2c, N=36):
 
-1. **Equality** — per trial, ``stack(X)[b] == H @ X[b]`` (dense reference) AND
-   ``== simple_matvec(X[b])``, for both kernels, to relerr < 1e-9.  The dense
-   reference already carries the settled B1 dense (k,k') exchange, so this pins
-   the stack's exchange + direct terms in one shot.
+1. **Equality** — per trial, ``stack(X)[b] == H @ X[b]`` (dense reference), for
+   both kernels, to relerr < 1e-9.  The dense reference carries the settled B1
+   dense (k,k') exchange and the scalar-singlet weight, so this pins the stack's
+   exchange + direct terms in one shot.  (The TDA ring matvec that used to be a
+   second oracle here is deleted; the dense reference is the oracle.)
 2. **Memory** — the compiled peak temp is FLAT in ``n_trials`` (the ``n_trials``
-   axis never lands on an intermediate), unlike the legacy ring matvec whose
-   ``T`` scales linearly.  Machine-checked via ``memory_analysis()``.
+   axis never lands on an intermediate).  Machine-checked via ``memory_analysis()``.
 """
 from __future__ import annotations
 
@@ -66,11 +66,10 @@ def _place(data, mesh):
 
 @pytest.mark.gpu
 @pytest.mark.parametrize("kernel", ["bse", "rpa"])
-def test_stack_matches_dense_and_ring(bse_dense_state, kernel):
-    """stack(X)[b] == H @ X[b] (dense) and == ring(X[b]) (the test oracle), per trial."""
+def test_stack_matches_dense(bse_dense_state, kernel):
+    """stack(X)[b] == H @ X[b] (dense), per trial."""
     harness.skip_unless_gpu(pytest)
     from bse.bse_stack_matvec import build_bse_stack_matvec
-    from bse.bse_ring_comm import build_bse_ring_matvec
 
     data = bse_dense_state
     H, D, Kx, _ = _build_dense_H(data)
@@ -87,37 +86,26 @@ def test_stack_matches_dense_and_ring(bse_dense_state, kernel):
     with mesh:
         Xs = jax.lax.with_sharding_constraint(X, sh.X)
         stack_mv = build_bse_stack_matvec(mesh, nkx, nky, nkz, kernel=kernel)
-        ring_mv = build_bse_ring_matvec(mesh, nkx, nky, nkz, include_W=include_W,
-                                        low_mem=True)
         HXs = np.asarray(stack_mv(
             Xs, arr["psi_c_X"], arr["psi_c_Y"], arr["psi_v_X"], arr["psi_v_Y"],
             data["eps_c"], data["eps_v"], arr["W_R"], arr["V_q0"],
             arr["M_X"], arr["M_Y"]))
-        for t in range(nt):
-            xin = jax.lax.with_sharding_constraint(Xs[t:t + 1], sh.X)
-            s_t = np.asarray(ring_mv(
-                xin, arr["psi_c_X"], arr["psi_c_Y"], arr["psi_v_X"], arr["psi_v_Y"],
-                data["eps_c"], data["eps_v"], arr["W_R"], arr["V_q0"],
-                arr["M_X"], arr["M_Y"]))[0].reshape(-1)
-            got = HXs[t].reshape(-1)
-            ref = Href @ np.asarray(X)[t].reshape(-1)
-            assert _relerr(got, ref) < 1e-9, \
-                f"{kernel} trial {t}: vs dense relerr {_relerr(got, ref):.2e}"
-            assert _relerr(got, s_t) < 1e-9, \
-                f"{kernel} trial {t}: vs ring relerr {_relerr(got, s_t):.2e}"
+    for t in range(nt):
+        got = HXs[t].reshape(-1)
+        ref = Href @ np.asarray(X)[t].reshape(-1)
+        assert _relerr(got, ref) < 1e-9, \
+            f"{kernel} trial {t}: vs dense relerr {_relerr(got, ref):.2e}"
 
 
 @pytest.mark.gpu
 def test_stack_memory_flat_in_n_trials(bse_dense_state):
     """Compiled peak temp is FLAT in n_trials (the T axis carries no n_trials).
 
-    Contrast with the legacy ring matvec, whose ``T[b,μ,ν,t,s,k]`` temp scales
-    linearly.  Also bound the stack temp against the single-trial T size
+    Also bound the stack temp against the single-trial T size
     ``μ_pad²·ns²·nk·16 B`` (the FFT scratch is a small multiple of one T).
     """
     harness.skip_unless_gpu(pytest)
     from bse.bse_stack_matvec import build_bse_stack_matvec
-    from bse.bse_ring_comm import build_bse_ring_matvec
 
     data = bse_dense_state
     nc = int(data["psi_c"].shape[1]); nv = int(data["psi_v"].shape[1])
@@ -142,19 +130,12 @@ def test_stack_memory_flat_in_n_trials(bse_dense_state):
 
     with mesh:
         stack_mv = build_bse_stack_matvec(mesh, nkx, nky, nkz, kernel="bse")
-        ring_mv = build_bse_ring_matvec(mesh, nkx, nky, nkz, include_W=True, low_mem=True)
 
     st = {nt: temp_bytes(stack_mv, nt) for nt in (1, 4, 8)}
-    rt = {nt: temp_bytes(ring_mv, nt) for nt in (1, 4, 8)}
-    for nt in (1, 4, 8):
-        print(f"n_trials={nt}: stack temp={st[nt]/1e6:.1f} MB  "
-              f"ring temp={rt[nt]/1e6:.1f} MB  (1-T bound={one_T/1e6:.1f})")
+    print(f"stack temp MB by n_trials: { {nt: round(v / 1e6, 1) for nt, v in st.items()} }"
+          f"  (1-T bound={one_T/1e6:.1f})")
 
     # Flat: temp(8) within 25% of temp(1) — no linear n_trials growth.
     assert st[8] < 1.25 * st[1], f"stack temp not flat: {st}"
     # The single-T bound is respected up to the FFT-scratch multiple (~2-3×).
     assert st[8] < 5 * one_T, f"stack temp {st[8]} exceeds 5× one-T bound {one_T}"
-    # And it is strictly better than the ring's linear growth at n_trials=8.
-    assert st[8] < 0.5 * rt[8], f"stack {st[8]} not << ring {rt[8]}"
-    # Sanity: the ring temp DOES grow with n_trials (guards the contrast).
-    assert rt[8] > 2 * rt[1], f"ring temp unexpectedly flat: {rt}"

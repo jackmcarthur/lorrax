@@ -29,7 +29,6 @@ from common.units import RYD_TO_EV
 from runtime.production_stream import ProductionStdout
 
 from .bse_ring_comm import (
-    build_bse_ring_matvec,
     build_bse_ring_matvec_full,
     create_mesh_2d,
     create_mesh_xy_from_flags,
@@ -47,7 +46,6 @@ from .bse_io import write_eigenvectors_stream
 
 __all__ = [
     "block_lanczos_eig",
-    "build_bse_ring_matvec",
     "build_bse_ring_matvec_full",
     "compute_pair_amplitude",
     "create_mesh_2d",

@@ -37,6 +37,8 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from common.collectives import gather_to_host
 
+from .bse_preconditioner import exchange_spin_weight
+
 
 # ═══════════════════════════════════════════════════════════════════════
 #  Initial subspace: lowest (c, v, k) transitions + random tail
@@ -241,7 +243,9 @@ def _exact_diagonal_kernel(eps_c, eps_v, psi_c_X, psi_v_Y, W_q0, M_X, M_Y,
         W_d_c = jnp.einsum('kcN,kvN->cvk', Y, b.astype(W_q0.dtype))
 
     S = jnp.einsum('kcvM,MN->kcvN', M_X, V_q0)
-    V_x_c = jnp.einsum('kcvN,kcvN->cvk', S, jnp.conj(M_Y))
+    # The matvec's scalar-singlet exchange weight (bse_preconditioner owns it).
+    V_x_c = jnp.einsum('kcvN,kcvN->cvk', S, jnp.conj(M_Y)) * exchange_spin_weight(
+        psi_c_X.shape[2])
 
     if complex_out:
         num = V_x_c if W_d_c is None else (V_x_c - W_d_c)
@@ -358,7 +362,7 @@ def build_bse_exact_diagonal(
             with a[k,c,M] = Σ_spinor |psi_c_X[k,c,·,M]|²
                  b[k,v,N] = Σ_spinor |psi_v_Y[k,v,·,N]|²
 
-        diag(H) = ΔE + (V_x − W_d) / nk
+        diag(H) = ΔE + (w·V_x − W_d) / nk,   w = exchange_spin_weight(nspinor)
 
     **The ``1/nk`` and the coefficient on ``V_x`` are MEASURED, not assumed.**
     Fitting ``diag(H_dense) − ΔE = α·V_x + β·W_d`` by least squares against the
@@ -366,8 +370,8 @@ def build_bse_exact_diagonal(
     ``α = +0.015625 = +1/64``, ``β = −0.015625 = −1/64`` on a deck with
     ``nk = 64``, with a fit residual of **1.5e-15 eV** against a 0.123 eV
     signal.  Note α = +1/nk and NOT +2/nk: the spin-singlet factor of two does
-    not appear on this noncolinear/spin-orbit deck, and assuming it would have
-    put the exchange term in at twice its weight.
+    not appear on this noncolinear/spin-orbit deck (w = 1). A scalar deck has
+    w = 2, as in the matvec's own encode.
 
     COST — AND WHAT IT IS NOT
     -------------------------

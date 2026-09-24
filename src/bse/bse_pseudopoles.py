@@ -25,8 +25,8 @@ from .bse_feast import (
     build_default_windows_eV,
     _parse_window_arg,
 )
+from .bse_stack_matvec import build_bse_stack_matvec
 from .bse_ring_comm import (
-    build_bse_ring_matvec,
     build_bse_ring_matvec_full,
     build_density_snapshot_operator,
     build_density_drive_operators,
@@ -235,12 +235,12 @@ def run_pseudopoles(
     include_W: bool,
 ) -> dict:
     if use_tda:
-        matvec = build_bse_ring_matvec(
+        matvec = build_bse_stack_matvec(
             mesh_xy,
             data["nkx"],
             data["nky"],
             data["nkz"],
-            include_W=include_W,
+            kernel="bse" if include_W else "rpa",
         )
     else:
         matvec = build_bse_ring_matvec_full(

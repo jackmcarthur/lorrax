@@ -104,12 +104,14 @@ def _dense(data, exchange="fixed"):
                                data["V_q0"], data["W_q"])
     M = np.einsum("kcsm,kvsm->kcvm", np.conj(psi_c), psi_v)
     D = np.transpose(data["eps_c"][:, :, None] - data["eps_v"][:, None, :], (1, 2, 0))
+    # NS == 1: a scalar run, so the singlet exchange carries 2 (D + 2V − W).
+    w_x = 2.0 if NS == 1 else 1.0
     if exchange == "fixed":
         lhs = np.einsum("kcvM,MN->kcvN", M, V_q0)
-        Kx = np.einsum("kcvN,KCVN->cvkCVK", lhs, np.conj(M)) / NK
+        Kx = w_x * np.einsum("kcvN,KCVN->cvkCVK", lhs, np.conj(M)) / NK
     else:
         lhs = np.einsum("kcvM,MN->kcvN", np.conj(M), V_q0)
-        Kx = np.einsum("kcvN,KCVN->cvkCVK", lhs, M) / NK
+        Kx = w_x * np.einsum("kcvN,KCVN->cvkCVK", lhs, M) / NK
     Wflat = W_q.reshape(NMU, NMU, NK)
     Kd = np.zeros((NC, NV, NK, NC, NV, NK), dtype=complex)
     for k in range(NK):
@@ -144,10 +146,10 @@ def _relerr(a, b):
     return float(np.linalg.norm(a - b) / max(np.linalg.norm(b), 1e-300))
 
 
-def _matvec(kind, data, X, include_W=True):
+def _matvec(data, X):
     from jax.sharding import Mesh
     from bse.bse_preconditioner import compute_pair_amplitude
-    from bse.bse_ring_comm import build_bse_ring_matvec, make_bse_shardings
+    from bse.bse_ring_comm import make_bse_shardings
     from bse.bse_stack_matvec import build_bse_stack_matvec
     mesh = Mesh(np.array(jax.devices()[:1]).reshape(1, 1), axis_names=("x", "y"))
     sh = make_bse_shardings(mesh)
@@ -162,11 +164,7 @@ def _matvec(kind, data, X, include_W=True):
         W_R = jnp.fft.ifftn(Wq, axes=(2, 3, 4), norm="ortho")
         M_X = jax.lax.with_sharding_constraint(compute_pair_amplitude(pcx, pvx), sh.psi_x)
         M_Y = jax.lax.with_sharding_constraint(compute_pair_amplitude(pcy, pvy), sh.psi_y)
-        if kind == "stack":
-            mv = build_bse_stack_matvec(mesh, NK, 1, 1)
-        else:
-            mv = build_bse_ring_matvec(mesh, NK, 1, 1, include_W=include_W,
-                                       low_mem=(kind == "ring"))
+        mv = build_bse_stack_matvec(mesh, NK, 1, 1)
         out = mv(Xs, pcx, pcy, pvx, pvy, jnp.asarray(data["eps_c"]),
                  jnp.asarray(data["eps_v"]), W_R, Vq, M_X, M_Y)
         out.block_until_ready()
@@ -228,22 +226,23 @@ def test_full_H_covariance_and_red_twins(sym_fixture):
         "RED TWIN FAILED: fixed H should not commute with conj(U)")
 
 
-@pytest.mark.parametrize("kind", ["stack"])
-def test_cross_solver_agreement(sym_fixture, kind):
-    """Every live matvec path builds the SAME corrected operator.
+def test_stack_matvec_agreement(sym_fixture):
+    """The stack matvec (the one TDA matvec) builds the corrected dense operator.
 
-    They agreed before this fix only because they shared the bug; this pins that
-    they still agree with each other AND now agree with the corrected dense
-    build.  ``ring``/``gather`` need the MKL batched-GEMM FFI for their W leg and
-    are covered on the GPU/Perlmutter leg instead.
+    This fixture is scalar (NS=1), so it also pins the singlet exchange weight:
+    the stack must build D + 2V − W.  Until 2026-09-24 it built D + V − W, while
+    the since-deleted TDA ring built D + 2V − W (relerr 1.02 between them).
     """
-    H_fix, _, _ = _dense(sym_fixture, "fixed")
+    H_fix, Kx_fix, _ = _dense(sym_fixture, "fixed")
     rng = np.random.default_rng(11)
     X = rng.standard_normal((1, NC, NV, NK)) + 1j * rng.standard_normal((1, NC, NV, NK))
-    hx = np.asarray(_matvec(kind, sym_fixture, X))[0].reshape(-1)
-    ref = H_fix @ X[0].reshape(-1)
-    assert _relerr(hx, ref) < 1e-10, f"{kind} vs dense: {_relerr(hx, ref):.3e}"
-    # RED TWIN: the same matvec must NOT reproduce the shipping operator.
+    x = X[0].reshape(-1)
+    hx = np.asarray(_matvec(sym_fixture, X))[0].reshape(-1)
+    assert _relerr(hx, H_fix @ x) < 1e-10, f"stack vs dense: {_relerr(hx, H_fix @ x):.3e}"
+    # RED TWIN 1: the same matvec must NOT reproduce the shipping operator.
     H_shp, _, _ = _dense(sym_fixture, "shipping")
-    assert _relerr(hx, H_shp @ X[0].reshape(-1)) > COV_RED_MIN, (
+    assert _relerr(hx, H_shp @ x) > COV_RED_MIN, (
         "RED TWIN FAILED: matvec still matches the shipping dense H")
+    # RED TWIN 2: nor the unweighted scalar exchange (D + V − W).
+    assert _relerr(hx, (H_fix - 0.5 * Kx_fix) @ x) > COV_RED_MIN, (
+        "RED TWIN FAILED: matvec builds D + V − W, missing the scalar-singlet 2")

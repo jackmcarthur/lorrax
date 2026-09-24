@@ -18,6 +18,26 @@ def compute_pair_amplitude(psi_c: jax.Array, psi_v: jax.Array) -> jax.Array:
     return jnp.einsum("kcsm,kvsm->kcvm", jnp.conj(psi_c), psi_v)
 
 
+def exchange_spin_weight(nspinor: int) -> float:
+    """Spin weight of the bare-Coulomb exchange channel: 2 scalar, 1 spinor.
+
+    This is the single owner of the textbook singlet split, ``D + 2V - W`` for a
+    spin-restricted scalar run (``nspinor == 1``) against ``D + V - W`` for spinors
+    (bse/context/README.md, "Note on spin factors"). A scalar run stores one of
+    the two degenerate spin channels per transition. A spinor run's
+    :func:`compute_pair_amplitude` already sums both components through ``Σ_s``.
+
+    Every exchange ENCODE applies it: the stack TDA/pair V and head terms, both
+    ring encodes, and the exact diagonal. Decodes do not apply it, since they sum
+    over no transitions. Until 2026-09-24 only the ring encodes applied it, so on
+    a scalar run the stack matvec built ``D + V - W`` while the ring built
+    ``D + 2V - W``: that is ``test_cross_solver_agreement[ring]``'s relerr 1.02,
+    measured against a dense reference that also lacked the weight. Spinor runs
+    were never affected.
+    """
+    return 2.0 if int(nspinor) == 1 else 1.0
+
+
 def energy_diff_cv_k(eps_c: jax.Array, eps_v: jax.Array) -> jax.Array:
     """Compute energy differences delta_E(c,v,k) = eps_c(k) - eps_v(k).
 
