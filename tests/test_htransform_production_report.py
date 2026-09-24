@@ -156,13 +156,9 @@ def test_htransform_runtime_startup_uses_the_one_debug_stream():
     assert "RUNTIME = initialize_communicator_stack()" not in source
 
 
-def test_basis_input_emits_exactly_one_canonical_rank_receipt(
-        tmp_path, monkeypatch):
-    import inspect
-    import bandstructure.htransform as htransform
+def _fixture_basis():
     from isdf import galerkin
-
-    basis = galerkin.GalerkinBasis(
+    return galerkin.GalerkinBasis(
         ctilde=np.eye(2, dtype=np.complex128)[None],
         basis_at_nodes=np.ones((2, 1, 1), dtype=np.complex128),
         rank_physical=2,
@@ -176,19 +172,34 @@ def test_basis_input_emits_exactly_one_canonical_rank_receipt(
         candidate_hash="a" * 64,
         pivot_hash="b" * 64,
     )
-    basis_path = tmp_path / "basis.h5"
+
+
+def _solve(htransform, basis_path, **kwargs):
+    return htransform.streaming_galerkin_solve(
+        object(), object(), SimpleNamespace(nspinor=1, n_rtot=2),
+        np.zeros((1, 3), dtype=np.int32), object(), (3, 5),
+        basis_path=None if basis_path is None else str(basis_path),
+        rank_multiplier=20.0, qr_eps=1.0e-3, qrcp_seed=7, **kwargs)
+
+
+def test_matching_deck_basis_is_reused_with_one_canonical_rank_receipt(
+        tmp_path, monkeypatch):
+    import inspect
+    import bandstructure.htransform as htransform
+    from isdf import galerkin
+
+    basis = _fixture_basis()
+    basis_path = tmp_path / "galerkin_dft.h5"
     basis_path.touch()
     monkeypatch.setattr(
         htransform, "read_galerkin_basis", lambda *args, **kwargs: basis)
-    records = []
-    restored = htransform.streaming_galerkin_solve(
-        object(), object(), SimpleNamespace(nspinor=1, n_rtot=2),
-        np.zeros((1, 3), dtype=np.int32), object(), (3, 5),
-        basis_input=str(basis_path), rank_record_fn=records.append,
-        rank_multiplier=20.0, qr_eps=1.0e-3, qrcp_seed=7,
-    )
+    monkeypatch.setattr(htransform, "fit_galerkin_basis", None)  # never refit
+    records, lines = [], []
+    restored = _solve(htransform, basis_path, log_fn=lines.append,
+                      rank_record_fn=records.append)
 
     assert restored is basis
+    assert any("[galerkin-basis] REUSED" in line for line in lines)
     assert len(records) == 1
     record = records[0]
     assert (record["method"], record["stacked_states"],
@@ -202,6 +213,60 @@ def test_basis_input_emits_exactly_one_canonical_rank_receipt(
     fit_source = inspect.getsource(galerkin.fit_galerkin_basis)
     assert "rank_record = galerkin_rank_record(" in fit_source
     assert '"method": "whole_state_randomized_qrcp"' not in fit_source
+
+
+def test_deck_basis_mismatch_refits_and_absent_basis_is_published(
+        tmp_path, monkeypatch):
+    import bandstructure.htransform as htransform
+    from isdf import galerkin
+
+    basis = _fixture_basis()
+    fits, writes = [], []
+
+    def _mismatch(*args, **kwargs):
+        raise galerkin.GalerkinBasisMismatch(
+            "Galerkin basis provenance mismatch: band_range")
+
+    monkeypatch.setattr(htransform, "read_galerkin_basis", _mismatch)
+    monkeypatch.setattr(
+        htransform, "fit_galerkin_basis",
+        lambda *args, **kwargs: fits.append(kwargs) or basis)
+    monkeypatch.setattr(
+        htransform, "write_galerkin_basis",
+        lambda path, *args, **kwargs: writes.append(path))
+    import common.gpu_utils as gpu_utils
+    import common.collectives as collectives
+    monkeypatch.setattr(gpu_utils, "get_device_memory_info", lambda: {
+        "budget_gb": 1.0, "available_gb": 1.0, "source": "test"})
+    monkeypatch.setattr(collectives, "all_gather_processes",
+                        lambda value: np.asarray([value]))
+
+    stale = tmp_path / "stale" / "galerkin_dft.h5"
+    stale.parent.mkdir()
+    stale.touch()
+    lines = []
+    assert _solve(htransform, stale, log_fn=lines.append) is basis
+    assert len(fits) == 1 and writes == []
+    assert any("[galerkin-basis] REFIT" in line and "band_range" in line
+               for line in lines)
+
+    fresh = tmp_path / "fresh" / "galerkin_dft.h5"
+    fresh.parent.mkdir()
+    lines = []
+    assert _solve(htransform, fresh, log_fn=lines.append) is basis
+    assert len(fits) == 2 and writes == [str(fresh)]
+    assert any("[galerkin-basis] FITTED and published" in line
+               for line in lines)
+
+    # A corrupt artifact is not a mismatch: it refuses rather than refits.
+    monkeypatch.setattr(
+        htransform, "read_galerkin_basis",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            ValueError("Galerkin basis artifact is incomplete")))
+    import pytest
+    with pytest.raises(ValueError, match="incomplete"):
+        _solve(htransform, stale)
+    assert len(fits) == 2
 
 
 def test_outer_r_shell_mask_handles_even_odd_and_singleton_axes():

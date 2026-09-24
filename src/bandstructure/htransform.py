@@ -36,6 +36,7 @@ from file_io.restart_bundle import read_eqp_energies
 from runtime.padding import spec_divisor
 from common.wfn_transforms import get_enk_bandrange
 from isdf.galerkin import (
+    GalerkinBasisMismatch,
     fit_galerkin_basis,
     galerkin_rank_record,
     read_galerkin_basis,
@@ -93,36 +94,10 @@ def _build_mesh_xy() -> Mesh:
     return RUNTIME.mesh
 
 
-# Per-device ceiling on one bounded whole-state real-space tile.  The
-# randomized sketch, exact selected-state Gram and physical projection all use
-# the canonical ``PsiGStore`` outer-r / inner-band stream; the shared planner
-# chooses one carrier that bounds their selected/random rows and WFN transform
-# workspace.  No full-r Galerkin basis is materialized.
-# Override with LORRAX_GALERKIN_CHUNK_GIB (GiB, float).
-#
-# Resolved INSIDE the consuming function, not at module scope: the old
-# module-level ``float(os.environ.get(...))`` meant a malformed export
-# crashed ``import bandstructure.htransform`` itself — a bare
-# ``ValueError: could not convert string to float`` from the import
-# storm, naming neither the variable nor the fix (the import-time-crash
-# class, P1 audit).  ``resolve_galerkin_chunk_bytes`` refuses BY NAME,
-# from the call that actually consumes the budget.
-
-
-def resolve_galerkin_chunk_bytes() -> int:
-    """Per-device ``LORRAX_GALERKIN_CHUNK_GIB`` stream budget in bytes.
-
-    Blank/unset → the default; garbage REFUSES naming the variable
-    (``gw_config.env_float`` refuse mode); non-positive values refuse too
-    — a zero-byte accumulation budget is never what anyone meant.
-    """
-    from gw.gw_config import env_float
-    gib = env_float("LORRAX_GALERKIN_CHUNK_GIB", 6.0, refuse=True)
-    if gib <= 0.0:
-        raise ValueError(
-            f"LORRAX_GALERKIN_CHUNK_GIB={gib!r} must be > 0 (GiB budget "
-            f"for one whole-state real-space tile; unset/blank = 6).")
-    return int(gib * 1024 ** 3)
+# The deck's own Galerkin basis artifact, resolved beside the input deck.
+# A QP run reuses a DFT fit only when this file (or a link the user placed
+# here) carries the exact provenance; no other directory is searched.
+GALERKIN_BASIS_FILE = "galerkin_dft.h5"
 
 
 def resolve_extra_rank_pad() -> int:
@@ -176,42 +151,46 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
                              rank_multiplier: float = 20.0,
                              qr_eps: float = 1.0e-3,
                              qrcp_seed: int = 0,
-                             basis_input: str | None = None,
-                             basis_output: str | None = None,
+                             basis_path: str | None = None,
                              progress_fn=None, rank_record_fn=None,
                              distrib_la_batched_route: str = "batch_reshard"):
     """Resolve htransform policy around the reusable Galerkin fit service.
 
-    Input and output are deliberately distinct: a requested restart may not
-    silently refit, while a requested fit artifact may not silently reuse an
-    old file.  The owner-level service validates the exact numerical identity.
+    ``basis_path`` is the one immutable basis artifact this deck owns (the
+    CLI passes ``galerkin_dft.h5`` beside the deck; nothing else is
+    searched).  If it exists and ``read_galerkin_basis`` finds the exact
+    provenance (WFN fingerprint, centroids, band window, grids, QRCP
+    controls), it is reused.  A file fitted for other inputs is left
+    untouched and the basis is refit in memory.  With no file the fit is
+    published there.  The log names which case applied.  ``None`` fits
+    without any artifact.
     """
     if log_fn is None:
         log_fn = lambda *args, **kwargs: None
-    if basis_input and basis_output:
-        raise ValueError(
-            "Galerkin basis input and output are mutually exclusive")
     rank_multiplier = resolve_galerkin_rank_multiplier(rank_multiplier)
     extra_rank_pad = resolve_extra_rank_pad()
-    if basis_input:
-        basis_path = os.fspath(basis_input)
-        if not os.path.isfile(basis_path):
-            raise FileNotFoundError(
-                f"Galerkin basis input does not exist: {basis_path}")
-        log_fn(f"  [galerkin-restart] reading {basis_path}")
-        basis = read_galerkin_basis(
-            basis_path, wfn=wfn, meta=meta,
-            centroid_indices=centroid_indices, band_range=band_range,
-            bispinor=bispinor, rank_multiplier=rank_multiplier,
-            qrcp_eps=qr_eps, qrcp_seed=qrcp_seed, mesh_xy=mesh_xy,
-            extra_rank_pad=extra_rank_pad)
-        log_fn(
-            f"  [galerkin-restart] reused physical rank "
-            f"{basis.rank_physical} in carried extent {basis.rank_carrier}")
-        if rank_record_fn is not None:
-            rank_record_fn(galerkin_rank_record(
-                basis, meta=meta, rank_multiplier=rank_multiplier))
-        return basis
+    publish = basis_path is not None and not os.path.lexists(basis_path)
+    if basis_path is not None and not publish:
+        try:
+            basis = read_galerkin_basis(
+                os.fspath(basis_path), wfn=wfn, meta=meta,
+                centroid_indices=centroid_indices, band_range=band_range,
+                bispinor=bispinor, rank_multiplier=rank_multiplier,
+                qrcp_eps=qr_eps, qrcp_seed=qrcp_seed, mesh_xy=mesh_xy,
+                extra_rank_pad=extra_rank_pad)
+        except GalerkinBasisMismatch as exc:
+            log_fn(f"  [galerkin-basis] REFIT: {basis_path} was fitted for "
+                   f"other inputs ({exc}); fitting in memory, the file is "
+                   "left unchanged")
+        else:
+            log_fn(
+                f"  [galerkin-basis] REUSED {basis_path}: physical rank "
+                f"{basis.rank_physical} in carried extent "
+                f"{basis.rank_carrier}, pivot SHA256={basis.pivot_hash}")
+            if rank_record_fn is not None:
+                rank_record_fn(galerkin_rank_record(
+                    basis, meta=meta, rank_multiplier=rank_multiplier))
+            return basis
 
     # The whole-state ledger describes allocations made *after this point*.
     # Compare it with the allocator budget still available to the fit, not
@@ -253,22 +232,23 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
         rank_multiplier=rank_multiplier,
         qr_eps=qr_eps,
         qrcp_seed=qrcp_seed,
-        q_tile_budget=resolve_galerkin_chunk_bytes(),
         device_pool_limit=device_fit_budget,
         extra_rank_pad=extra_rank_pad,
         progress_fn=progress_fn,
         rank_record_fn=rank_record_fn,
         distrib_la_batched_route=distrib_la_batched_route,
     )
-    if basis_output:
+    if publish:
         write_galerkin_basis(
-            os.fspath(basis_output), basis, wfn=wfn, meta=meta,
+            os.fspath(basis_path), basis, wfn=wfn, meta=meta,
             centroid_indices=centroid_indices, bispinor=bispinor,
             rank_multiplier=rank_multiplier, qrcp_eps=qr_eps,
             qrcp_seed=qrcp_seed, mesh_xy=mesh_xy)
         log_fn(
-            f"  [galerkin-restart] wrote physical rank "
-            f"{basis.rank_physical} to {basis_output}")
+            f"  [galerkin-basis] FITTED and published physical rank "
+            f"{basis.rank_physical} to {basis_path}")
+    elif basis_path is None:
+        log_fn("  [galerkin-basis] FITTED (no basis artifact requested)")
     return basis
 
 
@@ -1164,8 +1144,7 @@ def initialize_wfns(input_path: str, params: dict, log_fn, eqp_file: str | None 
                     progress_fn=None, centroid_record_fn=None,
                     rank_record_fn=None, wfn_sym=None, *,
                     require_all_occupied: bool = False,
-                    basis_input: str | None = None,
-                    basis_output: str | None = None,
+                    basis_path: str | None = None,
                     distrib_la_batched_route: str | None = None):
     """Load ψ, build the Galerkin ``ctilde``/``B_at_mu`` over the deck's window.
 
@@ -1346,8 +1325,7 @@ def initialize_wfns(input_path: str, params: dict, log_fn, eqp_file: str | None 
     band_range = (int(nsigmarange[0]), int(nsigmarange[1]))
     distrib_la_batched_route = resolve_distrib_la_batched_route(
         params, override=distrib_la_batched_route)
-    basis_input = _resolve(basis_input) if basis_input else None
-    basis_output = _resolve(basis_output) if basis_output else None
+    basis_path = _resolve(basis_path) if basis_path else None
     with mesh_xy:
         basis = streaming_galerkin_solve(
             wfn, sym, meta, centroid_indices, mesh_xy, band_range,
@@ -1357,7 +1335,7 @@ def initialize_wfns(input_path: str, params: dict, log_fn, eqp_file: str | None 
             qrcp_seed=params.get("htransform_qrcp_seed", 0),
             progress_fn=progress_fn,
             rank_record_fn=rank_record_fn,
-            basis_input=basis_input, basis_output=basis_output,
+            basis_path=basis_path,
             distrib_la_batched_route=distrib_la_batched_route,
         )
     log_fn(f"Loaded wavefunctions: nk={sym.nk_tot}, "
@@ -2236,13 +2214,6 @@ def main(argv=None):
     parser.add_argument("--report-file", default="htransform.out",
                         help="Human-readable calculation report (relative "
                              "paths are resolved beside the input deck)")
-    basis_group = parser.add_mutually_exclusive_group()
-    basis_group.add_argument(
-        "--basis-input", default=None,
-        help="Read an immutable fitted Galerkin basis; mismatches refuse.")
-    basis_group.add_argument(
-        "--basis-output", default=None,
-        help="Fit once and atomically publish an immutable Galerkin basis.")
     parser.add_argument("--a-band", type=int, default=None,
                         help="Band index (0-based) whose bandwidth sets 'a'. "
                              "E.g. nval+ncond_keep-1. Default: top band.")
@@ -2364,7 +2335,7 @@ def main(argv=None):
             centroid_record_fn=_centroid_records.append,
             rank_record_fn=_rank_records.append,
             require_all_occupied=True,
-            basis_input=args.basis_input, basis_output=args.basis_output,
+            basis_path=GALERKIN_BASIS_FILE,
             distrib_la_batched_route=distrib_la_batched_route)
     _setup_progress.step()
     _setup_progress.finish()
@@ -2597,6 +2568,8 @@ def main(argv=None):
         ("input deck", "read", args.input),
         ("DFT wavefunctions", "read", _wfn_path),
         ("ISDF centroids", "read", _centroid_path),
+        ("Galerkin basis", "read or published",
+         os.path.join(input_dir, GALERKIN_BASIS_FILE)),
     ]
     if args.eqp_file:
         _eqp_path = (args.eqp_file if os.path.isabs(args.eqp_file) else

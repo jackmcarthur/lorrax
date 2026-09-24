@@ -10,37 +10,35 @@ import pytest
 
 
 def test_whole_state_workspace_must_fit_the_bfc_reserve(monkeypatch):
-    """An aggregate-safe FFT still refuses when its arena cannot be placed."""
+    """An aggregate-safe FFT still refuses when its arena cannot be placed,
+    and the planner sizes every stream from the budget (no tile knob)."""
     pytest.importorskip("jax")
     from isdf import galerkin
 
-    def _ledger(**kwargs):
-        del kwargs
-        return {
-            "HWM": 700.0,
-            "WFN_RCHUNK_TRANSFORM": 650.0,
-            "WFN_RCHUNK_COMPILED": 450.0,
-            "WFN_CUFFT_WORKSPACE": 200.0,
-            "Q_TILE_LOCAL": 10.0,
-            "r_chunk_carrier": 16.0,
-        }
-
-    monkeypatch.setattr(galerkin, "_whole_state_memory_ledger", _ledger)
-    mesh = SimpleNamespace(size=16, shape={"x": 4, "y": 4})
+    monkeypatch.setattr(
+        galerkin, "gflat_to_rchunk_aot_memory",
+        lambda **kwargs: SimpleNamespace(total=100.0, cufft_scratch=200.0))
     kwargs = dict(
-        meta=object(), mesh_xy=mesh, nk=2, nspinor=2, ngkmax=8,
-        band_carrier=64, state_count=32, search_rank=4,
-        candidate_carrier=8, requested_q_tile_budget=512,
-        device_pool_limit=1000.0, log_fn=lambda *args: None)
+        meta=SimpleNamespace(n_rtot=64, fft_grid=(4, 4, 4)),
+        mesh_xy=SimpleNamespace(size=16), nk=2, nspinor=2, ngkmax=8,
+        band_divisor=16, band_range=(0, 32))
 
-    # spinor width 2 owns the public 0.85 target: HWM 700 < 850, but the
-    # independently allocated workspace 200 is larger than its 150 reserve.
+    # spinor width 2 owns the public 0.85 target: the stage fits the target,
+    # but the independently allocated workspace 200 exceeds its 150 reserve.
     with pytest.raises(MemoryError, match="contiguous BFC reserve"):
-        galerkin._resolve_whole_state_stream_budget(**kwargs)
+        galerkin._whole_state_geometry(device_pool_limit=1000.0, **kwargs)
 
-    safe = dict(kwargs, device_pool_limit=1400.0)
-    _, ledger = galerkin._resolve_whole_state_stream_budget(**safe)
-    assert ledger["WFN_CUFFT_WORKSPACE"] == 200.0
+    geom, capacity, memory = galerkin._whole_state_geometry(
+        device_pool_limit=1.0e9, **kwargs)
+    assert memory.cufft_scratch == 200.0 and geom["row_fft"] == 100.0
+    groups, fft, plan, _ = galerkin._plan_rows_pass(
+        geom, rows=3, omega_rows=2, resident=0.0, capacity=capacity,
+        name="test")
+    assert (groups, fft, len(plan.r_chunk_ranges)) == (1, 3, 1)
+    with pytest.raises(MemoryError, match="one state per device"):
+        galerkin._plan_rows_pass(geom, rows=3, omega_rows=2, resident=0.0,
+                                 capacity=1.0, name="test")
+    assert "LORRAX_GALERKIN_CHUNK_GIB" not in inspect.getsource(galerkin)
 
 
 def test_wfn_rchunk_integer_peak_api_is_the_cached_breakdown_view(monkeypatch):

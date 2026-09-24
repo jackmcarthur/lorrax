@@ -565,6 +565,280 @@ class PsiGStore:
             psi_product_r = finish_r_carrier(psi_band_r)
             yield tuple(int(v) for v in bc_range), psi_product_r
 
+    # ---------------------------------------------------------------------
+    # Transform-once sources.  ``iter_rchunk_bandwise`` above repeats the
+    # full-box IFFT for every r chunk; the sources below transform each
+    # G-flat row ONCE over the whole grid (the same ``to_rchunk_inner`` at
+    # ``r0 = 0``, ``r_len = n_rtot``), hold that band-sharded ψ(r) slab, and
+    # then cut it into the caller's r chunks through the same canonical
+    # ``prepare_rchunk_carrier`` exchange.  A consumer therefore pays one
+    # IFFT and one band->r all-to-all per row per pass.
+    # ---------------------------------------------------------------------
+    def _band_owner_map(self):
+        """``{device: (flat band-block owner, flat row-block index)}`` for
+        the band-sphere layout, from JAX's own sharding index maps."""
+        p = spec_divisor(self.mesh, band_sphere_spec(), axis=1)
+        nk, _, ns, ngkmax = self._per_rank_shape
+        band_map = NamedSharding(self.mesh, band_sphere_spec()) \
+            .devices_indices_map((1, p, 1, 1))
+        row_map = NamedSharding(self.mesh, P(("x", "y"), None, None)) \
+            .devices_indices_map((p, 1, 1))
+        return {dev: (int(band_map[dev][1].start or 0),
+                      int(row_map[dev][0].start or 0))
+                for dev in band_map}
+
+    def state_row_owners(self, states, *, band_start: int, band_count: int):
+        """Host tile address of stacked states ``s = k*band_count + b``.
+
+        Returns ``(owner, k, tile_band)``: the flat band-block owner of each
+        state (the device whose host tile holds it) and its row in that tile.
+        """
+        states = np.asarray(states, dtype=np.int64).reshape(-1)
+        nk = int(self._per_rank_shape[0])
+        band_start, band_count = int(band_start), int(band_count)
+        k_idx = states // band_count
+        band = band_start + states % band_count
+        lo = np.asarray([int(b0) for b0, _ in self.band_chunk_ranges])
+        hi = np.asarray([int(b1) for _, b1 in self.band_chunk_ranges])
+        bc = np.searchsorted(hi, band, side="right")
+        if (np.any(states < 0) or np.any(k_idx >= nk)
+                or np.any(bc >= len(lo)) or np.any(band < lo[np.minimum(
+                    bc, len(lo) - 1)])):
+            raise ValueError(
+                "state_row_owners: a requested state lies outside the "
+                f"store's k extent {nk} or bands {self.band_chunk_ranges}")
+        bpd = np.asarray(self._bpd_per_bc, dtype=np.int64)[bc]
+        within = band - lo[bc]
+        return (within // bpd, k_idx,
+                np.asarray(self._bc_band_offsets)[bc] + within % bpd)
+
+    def gather_state_rows(self, states, *, band_start: int, band_count: int,
+                          row_multiple: int = 1):
+        """Stage selected stacked states ``s = k*band_count + b`` on device.
+
+        Each device takes the requested rows that its own host tile already
+        holds, so this is a host copy plus one H2D placement with no
+        collective.  Returns ``(rows, row_k, row_state)``: ``rows`` has shape
+        ``(P*n_loc, ns, ngkmax)`` on ``P(('x','y'),None,None)`` (exact-zero
+        pad rows), ``row_k`` the ``(P*n_loc,)`` int32 k index of every row
+        slot on ``P(('x','y'))``, and ``row_state`` the host ``(P*n_loc,)``
+        stacked-state label of every slot (``-1`` = pad), identical on every
+        process.  ``n_loc`` is the largest per-device count, padded through
+        ``runtime.padding`` to a multiple of ``row_multiple``.
+        """
+        if self._closed or not self._host_tiles:
+            raise RuntimeError("PsiGStore.gather_state_rows: store is closed")
+        from runtime.padding import padded_axis
+        states = np.asarray(states, dtype=np.int64).reshape(-1)
+        _, _, ns, ngkmax = self._per_rank_shape
+        band_count = int(band_count)
+        owner, k_idx, tile_band = self.state_row_owners(
+            states, band_start=band_start, band_count=band_count)
+
+        owners = self._band_owner_map()
+        counts = {o: int(np.count_nonzero(owner == o))
+                  for o, _ in owners.values()}
+        n_loc = padded_axis(
+            max(1, max(counts.values())), int(row_multiple),
+            name="PsiGStore gathered-row carrier").carrier
+        p = len(owners)
+        row_state = np.full(p * n_loc, -1, dtype=np.int64)
+        for o, q in owners.values():
+            pick = np.flatnonzero(owner == o)
+            row_state[q * n_loc:q * n_loc + pick.size] = states[pick]
+        row_k = np.where(row_state >= 0, row_state // band_count, 0)
+
+        # Each device's block is copied out of its OWN host tile and placed on
+        # that device only: the collectives service's zero-collective
+        # per-device restore, never a replicated or gathered payload.
+        from common.collectives import (
+            HostSpill, device_put_process_local, restore_from_host)
+        row_sharding = NamedSharding(self.mesh, P(("x", "y"), None, None))
+        shards = []
+        for dev in row_sharding.addressable_devices:
+            o, _ = owners[dev]
+            pick = np.flatnonzero(owner == o)
+            block = np.zeros((n_loc, ns, ngkmax), dtype=np.complex128)
+            tile = self._host_tiles[self._coords[id(dev)]]
+            block[:pick.size] = tile[k_idx[pick], tile_band[pick]]
+            shards.append((dev, block))
+        rows = restore_from_host(HostSpill(
+            shape=(p * n_loc, ns, ngkmax), sharding=row_sharding,
+            shards=shards))
+        row_k_dev = device_put_process_local(
+            row_k.astype(np.int32), NamedSharding(self.mesh, P(("x", "y"))))
+        return rows, row_k_dev, row_state
+
+    def _rows_fullr_kernel(self, n_rows: int, fft_rows: int):
+        """Rows ψ(G) → band-sharded full-grid ψ(r), ``fft_rows`` at a time."""
+        key = ("rows", int(n_rows), int(fft_rows))
+        fn = self._rchunk_kernel_cache.get(key)
+        if fn is not None:
+            return fn
+        from common.wfn_transforms import to_rchunk_inner
+        p = spec_divisor(self.mesh, band_sphere_spec(), axis=1)
+        n_loc, t = int(n_rows) // p, int(fft_rows)
+        if n_loc * p != int(n_rows) or t <= 0 or n_loc % t:
+            raise ValueError(
+                f"_rows_fullr_kernel: {n_rows} rows over {p} devices must "
+                f"split into whole {fft_rows}-row transform tiles")
+        fft_grid = tuple(int(s) for s in self.meta.fft_grid)
+        n_rtot = int(self.meta.n_rtot)
+        _, _, ns, ngkmax = self._per_rank_shape
+
+        @partial(
+            shard_map, mesh=self.mesh,
+            in_specs=(P(("x", "y"), None, None), P(("x", "y")),
+                      P(None, None, None, None), P(None, None)),
+            out_specs=band_sphere_spec(), check_vma=False)
+        def _local(rows, row_k, g_index, kvecs_frac):
+            def _tile(args):
+                psi_t, k_t = args
+                return to_rchunk_inner(
+                    psi_t[:, None], g_index[k_t], fft_grid, 0, n_rtot,
+                    norm="ortho", kvecs_frac=kvecs_frac[k_t])[:, 0]
+            out = jax.lax.map(_tile, (rows.reshape(n_loc // t, t, ns, ngkmax),
+                                      row_k.reshape(n_loc // t, t)))
+            return out.reshape(1, n_loc, ns, n_rtot)
+
+        fn = jax.jit(
+            _local,
+            in_shardings=(
+                NamedSharding(self.mesh, P(("x", "y"), None, None)),
+                NamedSharding(self.mesh, P(("x", "y"))),
+                NamedSharding(self.mesh, P(None, None, None, None)),
+                NamedSharding(self.mesh, P(None, None))),
+            out_shardings=NamedSharding(self.mesh, band_sphere_spec()))
+        self._rchunk_kernel_cache[key] = fn
+        return fn
+
+    def _bandchunk_fullr_kernel(self, k_tile: int):
+        """One band chunk's host tile → band-sharded full-grid ψ(r).
+
+        ``k_tile`` k rows share one FFT box; it must divide ``nk``.
+        """
+        key = ("bandchunk", int(k_tile))
+        fn = self._rchunk_kernel_cache.get(key)
+        if fn is not None:
+            return fn
+        from common.wfn_transforms import to_rchunk_inner
+        store = self
+        nk, bpd, ns, ngkmax = self.local_band_chunk_shape
+        kt = int(k_tile)
+        if kt <= 0 or nk % kt:
+            raise ValueError(
+                f"_bandchunk_fullr_kernel: k_tile={kt} must divide nk={nk}")
+        fft_grid = tuple(int(s) for s in self.meta.fft_grid)
+        n_rtot = int(self.meta.n_rtot)
+        out_sds = jax.ShapeDtypeStruct((nk, bpd, ns, ngkmax), jnp.complex128)
+
+        def _read_host(x_idx, y_idx, bc_idx):
+            return store.read_local_band_chunk(x_idx, y_idx, bc_idx)
+
+        @partial(
+            shard_map, mesh=self.mesh,
+            in_specs=(P(None, None, None, None), P(None, None), P()),
+            out_specs=band_sphere_spec(), check_vma=False)
+        def _local(g_index, kvecs_frac, bc_idx):
+            psi_G = io_callback(
+                _read_host, out_sds, jax.lax.axis_index('x'),
+                jax.lax.axis_index('y'), bc_idx, ordered=False)
+
+            def _tile(args):
+                psi_t, g_t, kv_t = args
+                return to_rchunk_inner(
+                    psi_t, g_t, fft_grid, 0, n_rtot, norm="ortho",
+                    kvecs_frac=kv_t)
+            split = lambda a: a.reshape(nk // kt, kt, *a.shape[1:])
+            out = jax.lax.map(
+                _tile, (split(psi_G), split(g_index), split(kvecs_frac)))
+            return out.reshape(nk, bpd, ns, n_rtot)
+
+        rep = NamedSharding(self.mesh, P())
+        fn = jax.jit(
+            _local,
+            in_shardings=(
+                NamedSharding(self.mesh, P(None, None, None, None)),
+                NamedSharding(self.mesh, P(None, None)), rep),
+            out_shardings=NamedSharding(self.mesh, band_sphere_spec()))
+        self._rchunk_kernel_cache[key] = fn
+        return fn
+
+    def _slice_rchunk_kernel(self, r_carrier: int):
+        """Band-sharded full-grid slab → one padded r-chunk carrier (local)."""
+        key = ("slice", int(r_carrier))
+        fn = self._rchunk_kernel_cache.get(key)
+        if fn is not None:
+            return fn
+        from common.wfn_transforms import take_rchunk_padded
+        layout = NamedSharding(self.mesh, band_sphere_spec())
+
+        @partial(
+            shard_map, mesh=self.mesh,
+            in_specs=(band_sphere_spec(), P()), out_specs=band_sphere_spec(),
+            check_vma=False)
+        def _local(full, r0):
+            return take_rchunk_padded(full, r0, int(r_carrier))
+
+        fn = jax.jit(_local, in_shardings=(layout, NamedSharding(
+            self.mesh, P())), out_shardings=layout)
+        self._rchunk_kernel_cache[key] = fn
+        return fn
+
+    def _iter_fullr_rchunks(self, psi_full, r_chunk_ranges, product_r_spec):
+        from common.wfn_transforms import prepare_rchunk_carrier
+        for r_idx, (r0, r1) in enumerate(r_chunk_ranges):
+            key = ("carrier", int(r0), int(r1), tuple(product_r_spec))
+            if key not in self._rchunk_kernel_cache:
+                self._rchunk_kernel_cache[key] = prepare_rchunk_carrier(
+                    self.mesh, r_start=int(r0), r_end=int(r1),
+                    n_rtot=self.meta.n_rtot, product_r_spec=product_r_spec)
+            r_axis, _, finish = self._rchunk_kernel_cache[key]
+            slab = self._slice_rchunk_kernel(r_axis.carrier)(
+                psi_full, jnp.asarray(int(r0), dtype=jnp.int32))
+            last = finish(slab)
+            del slab
+            yield r_idx, last
+        # Every reader of ``psi_full`` has run once its last chunk exists, so
+        # the caller's next full-grid slab cannot coexist with this one.
+        jax.block_until_ready(last)
+
+    def iter_rows_rchunks(self, rows, row_k, r_chunk_ranges, *,
+                          product_r_spec: P, fft_rows: int):
+        """Yield ``(r_idx, ψ_rows(r_chunk))`` from rows transformed once.
+
+        ``rows``/``row_k`` come from :meth:`gather_state_rows`.  Every yielded
+        slab has shape ``(1, P*n_loc, ns, r_carrier)`` on ``product_r_spec``
+        (rows in the gathered slot order, r over the full mesh product).
+        """
+        if self._closed:
+            raise RuntimeError("PsiGStore.iter_rows_rchunks: store is closed")
+        kernel = self._rows_fullr_kernel(int(rows.shape[0]), int(fft_rows))
+        psi_full = kernel(rows, row_k, self.g_index, self.kvecs_frac)
+        yield from self._iter_fullr_rchunks(
+            psi_full, r_chunk_ranges, product_r_spec)
+
+    def iter_bandchunks_rchunks(self, r_chunk_ranges, *,
+                                product_r_spec: P, k_tile: int):
+        """Yield ``(band_range, r_idx, ψ_band(r_chunk))``, one IFFT per state.
+
+        The loop-inverted twin of :meth:`iter_rchunk_bandwise`: band chunks
+        outside, r chunks inside, and each band chunk transformed once over
+        the whole grid.  Slabs have the same shape and layout as that
+        iterator's.
+        """
+        if self._closed or not self._host_tiles:
+            raise RuntimeError(
+                "PsiGStore.iter_bandchunks_rchunks: store is closed")
+        kernel = self._bandchunk_fullr_kernel(int(k_tile))
+        for bc_idx, bc_range in enumerate(self.band_chunk_ranges):
+            psi_full = kernel(self.g_index, self.kvecs_frac,
+                              jnp.asarray(bc_idx, dtype=jnp.int32))
+            for r_idx, slab in self._iter_fullr_rchunks(
+                    psi_full, r_chunk_ranges, product_r_spec):
+                yield tuple(int(v) for v in bc_range), r_idx, slab
+            del psi_full
+
     @property
     def g_index(self) -> jax.Array:
         """Replicated ``(nk_tot, nx, ny, nz)`` int32 box-index tensor.
