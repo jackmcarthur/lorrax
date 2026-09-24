@@ -1368,9 +1368,8 @@ def main(argv=None):
 	# symmetry service apply antiunitary conjugation and the forward polar
 	# rotation.  Full-grid wavefunctions remain reserved for the finite-q,
 	# uniform-Hall and transport-link paths whose neighbour connectivity truly
-	# needs them.  The three Cartesian components ride ONE sweep, so the hoisted
-	# m-side reshard is paid once rather than three times; only the
-	# per-k reshard payload is 3x.
+	# needs them.  The three Cartesian components ride ONE sweep; p acts on
+	# each rank's G slab and V_NL is separable, so only ψ crosses the mesh.
 	pt_path = None
 	write_pt_remainder = None
 	debug_kindex = min(1, max(0, nk - 1))

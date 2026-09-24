@@ -1,4 +1,4 @@
-"""One k-scan serving V_H, kinetic+ion and dipole — 2-D band-sharded.
+"""One k-tile scan serving V_H, kinetic+ion and dipole — G-split contraction.
 
 Implements ``docs/dev/matrix_element_sweep_handoff.md``.  Read
 ``docs/architecture/decisions.md`` first: D10 (fixed-shape ``ngkmax`` G
@@ -20,112 +20,56 @@ array **identical on every rank**.  Three walls follow (measured in
       nb=2000, ×3 for dipole.
   W3  the k-partitioned plan CANNOT USE MORE THAN ``nk`` RANKS. Each rank
       takes whole k, so its wall is one full-band k no matter how large P
-      is: adding processors past ``nk`` changes nothing. Measured — the
-      before arm is 4.02 s at nb=512/P=16 and 4.87 s at nb=600/P=64,
-      i.e. flat in P once scaled for nb (jobs 7888868, 7888877).
-
-PARALLELISM OF THIS DESIGN, STATED ONCE SO IT IS NOT RE-DERIVED WRONG
---------------------------------------------------------------------
-The scan processes **one k at a time** and shards **that k's bands over
-every process**.  Therefore:
-
-* ``nk`` DOES NOT AFFECT PARALLEL EFFICIENCY.  It is the scan trip count
-  and nothing else — it scales total work linearly and the wall linearly,
-  exactly as a serial loop bound would.  Any statement of the form "this
-  wins when P > nk" is wrong and describes the plan being replaced.
-* Efficiency is ``nb_logical / nb_padded`` and nothing else.  The sweep
-  keeps scaling until ``P = nb``, where the k-partitioned plan stopped
-  scaling at ``P = nk``.
-* The one IDLE-RANK case is ``nb_logical < P``: the band pad rounds ``nb``
-  up to a multiple of ``∏ p_a`` and the ranks holding only pad bands do
-  zero work.
-* There is ALSO one REPLICATED term, and an earlier version of this
-  paragraph denied it ("there is no other idle case at any P, nk or mesh
-  shape").  That was asserted, not measured, and it is false: the V_NL and
-  dipole operators call ``vnl_ops.build_vnl_kdata_traced`` inside the scan
-  body, and Z is ``(total_R, ngkmax)`` REPLICATED — every rank builds the
-  same Z for every k, where the k-partitioned plan built it for ``nk/P``
-  k.  Now measured (``tests/multi_device/mtxel_vnl_scaling_probe.py``, job
-  7889392, MoS2 4×4 deck_b300, nk=16, nb=128, ns=2, ngkmax=1964,
-  total_R=62 so Z is 1.9 MiB): the build costs 0.017 s at P=1, 0.010 s at
-  P=4 and 0.020 s at P=16 — FLAT, no trend — while the whole V_NL operator
-  over the kinetic baseline is 0.064 / 0.031 / 0.039 s.  So the build is
-  27 % of V_NL's cost at P=1 and 51 % at P=16: the share rises with P
-  exactly as replicated work must.  Z+dZ for the dipole is 0.046 / 0.055 /
-  0.061 s, likewise flat.
-  NOT FIXED, deliberately.  The candidate fixes are to shard the G axis of
-  the build and all-gather Z per k, or to hoist a per-k Z table out of the
-  scan; the first pays a collective per k to save ~1 ms of arithmetic (the
-  per-k reshard this sweep already issues measures 0.176 s at b600/P=64),
-  and the second does not reduce the build count at all — it is already
-  one per k.  Against a V_H sweep of 5.740 s at P=1 the whole term is
-  ≤ 20 ms.  The claim is corrected rather than the code.
-
-What the sweep pays for this is a per-k reshard collective, which the
-k-partitioned plan does not need (a rank owning a whole k communicates
-nothing).  So the trade is COMMUNICATION against SCALABILITY, not idle
-ranks: at ``P = nk`` the old plan is already at its own ceiling and the
-sweep is slower by the collective (measured 1.45× at nb=512/P=16); past
-``P = nk`` the old plan is stuck and the sweep is not (2.05× at
-nb=600/P=64).
+      is (4.02 s at nb=512/P=16 and 4.87 s at nb=600/P=64, jobs 7888868,
+      7888877).  Never shard k: a molecule has ``nk = 1``.
 
 THE STRUCTURAL FACT THAT COLLAPSES THE THREE
 --------------------------------------------
-Only the local-potential terms need a real-space excursion:
+All four operators are ``H[m,n] = Σ_{s,G} conj(ψ_m) · (O ∘ ψ)_n`` and
+differ ONLY in ``O ∘ ψ``:
 
     kinetic   T_G · ψ                    diagonal in G
-    dipole    (k+G) · ψ                  diagonal in G
-    V_NL      projector sum              no FFT
+    dipole    2(k+G) · ψ  +  ∂V_NL/∂K    diagonal in G  +  separable
+    V_NL      Z E Z† ψ                   separable, R ≪ nb·ns projectors
     V_H/V_loc F[ V(r) · F⁻¹ψ ]           FFT round trip
 
-All four are ``H[m,n] = Σ_{s,G} conj(ψ_m) · (O ∘ ψ)_n`` and differ ONLY
-in ``O ∘ ψ``.  One skeleton, one pluggable operator.
+**The m side is never transformed.**  The output is ``nb²`` per k, the
+operand ``nb·ns·N_G``: the contraction axis G is the big one.
 
-**The m side is never transformed.**  For V_H it is the raw stored
-sphere; for the rest the operator is applied on the n side alone.  That
-is what removes W1 — and it is why the operator protocol below is
-"sphere in, sphere out" rather than anything box-shaped.
+THE PLAN (rules R1/R3 of ``reports/gwjax_scaling_levers_2026-09-23``)
+--------------------------------------------------------------------
+ψ is resident at ``band_sphere_spec`` (whole bands, nb/P per rank).  One
+``shard_map`` scans k TILES; per tile of K k-points::
 
-THE PLAN
---------
-::
+    O_band ψ      ← FFT operators, per k, on this rank's whole bands
+    ψ, O_band ψ   → all-to-all → (nb, ns, G/P)       the G-split layout
+    ket           = O_band ψ + O_diag ψ              diagonal terms, on the slab
+    part[m,n]     = Σ_{s, G∈slab} conj ψ_m · ket_n   local GEMM
+    H[m_X, n_Y]   = reduce-scatter(part)             one ``(c, nb, nb)`` per k
+    + Σ c*_m E c_n with c = psum_slab(Z_slab† ψ)     separable terms, R·ns·nb
 
-    scan over k:
-        Opsi    ←  O ∘ psi_XY[k]                 # nb/P bands per rank
-        Opsi_Y  ←  reshard onto 'y'              # the per-k ket collective
-        psi_m_X ←  reshard psi_XY[k] onto 'x'    # the per-k bra collective
-        H[k]    ←  einsum('bsg,nsg->bn', conj(psi_m_X), Opsi_Y)
+Per rank and per k this moves ``(1 + c_band)·ψ_k/P`` plus ``c·nb²``, where
+the band-split plan it replaces moved ``ψ_k/p_x + c·ψ_k/p_y`` through a
+collective-permute and two all-gathers (VI3 12×12, P16: 17.7 MB permuted
+and 2×55.7 MB received per k, ``runs/runtime/mtxel_sweep_20260923``
+census_a01_old_p16.txt).  A diagonal or separable operator moves only ψ:
+the dipole's three-component ket never crosses the mesh, and V_NL's
+projectors are built per slab (``R × G/P``), where the band-split plan built
+the whole ``(R, ngkmax)`` — and ``(3, R, ngkmax)`` for the dipole — on every
+rank for every k.
 
-BOTH reshards are per-k.  The bra one used to be hoisted out of the scan
-— one ``(nk, nb, ns, ngkmax)`` all-gather instead of ``nk`` slice-sized
-ones, on the argument that fewer collectives is fewer collectives.  That
-was measured and it is the wrong way round: at b600/P=64 (nk=16, nb=640,
-ns=2, ngkmax=11008) hoisting costs **2.220 s against 1.985 s**, 1.12×,
-and holds a 430 MiB/rank ``P(None,'x',…)`` copy of ψ live across the
-whole scan on top of the 54 MiB/rank ``('x','y')`` one (jobs 7889241,
-7889250, arms ``vh`` / ``vh_nohoist``).  Per k the same bytes move, but
-in ``nk`` pieces that overlap with the FFT round trip instead of one
-serialised block, and the mask multiply that precedes the reshard runs
-on the ``nb/(p_x·p_y)`` shard rather than the ``nb/p_x`` one.
+WHERE THE CROSSOVER IS.  The one non-``1/P`` transient is the tile's
+``(K, c, nb, nb)`` partial.  The G split beats the band split in both bytes
+and memory while ``nb·√P < ns·N_G``; with N_G/nb ≈ 200–1000 at production
+cutoffs that is P ≲ 1e5, beyond the design envelope, and the ratio does
+not change with system size (both scale with the cell).
 
-``H`` comes out ``(nk, nb, nb)`` sharded ``P(None, 'x', 'y')`` — the
-output is sharded and the CONTRACTION axis is replicated.  The
-alternative (shard over G, psum the partials) needs every rank to hold a
-full ``(nb, nb)`` to reduce into, which is exactly W2.  Not a
-preference; forced.
-
-A Cartesian operator (dipole) appends a length-3 REPLICATED component
-axis and comes back ``(nk, 3, nb, nb)`` at ``P(None, None, 'x', 'y')``.
-Three components ride ONE sweep rather than three, so the bra reshard,
-the bra mask and the scan are paid once instead of three times; only the
-ket payload and the einsum are 3×.  The component axis is MINOR on the
-ket by measurement, not by convenience: carrying it LEADING instead —
-``'kbsg,kcnsg->kcbn'`` on a ``(1, 3, nb, ns, ngkmax)`` operator output,
-which also removes the ``moveaxis`` — is 3.8 % SLOWER at b600/P=64
-(1.327 s against 1.279 s, job 7889241, arms ``dip_first`` /
-``dip_last``), and the ``moveaxis`` itself costs nothing because XLA
-folds it into the copy that feeds the dot (1.288 s for a variant that
-never forms it, arm ``dip_last_nomv``).
+k TILES.  ``K`` comes from :func:`plan_sweep`: k is packed only until each
+per-peer all-to-all block is bandwidth-sized, and never past what the
+resident ψ sphere bounds; ``K = 1`` at ``nk = 1``.  At VI3 12x12 every
+K > 1 measured slower than K = 1, so the rule returns K = 1 there.  The FFT
+box of a band operator is one k at a time inside the tile and never
+scales with K.
 
 WHO GATHERS, AND WHERE IT IS SAID
 ---------------------------------
@@ -140,131 +84,26 @@ WHY ψ(G) IS RESIDENT AND THE BOX NEVER IS
 -----------------------------------------
 The *box* is huge; the G-sphere is not.  ``nk·nb·ns·ngkmax·16`` is 1.2 GB
 globally at b600 but **≈19 MB/rank sharded at P=64**, which is what makes
-a genuine ``lax.scan`` over k possible at all — the reason
-``collectives.sweep_local_k`` is a Python loop is that its ψ load is host
-I/O, and that obstacle disappears once ψ is already on device.  Check the
-number for your deck before assuming it: at 12×12 with nb=2000 it is ~10×
-larger.
+a genuine ``lax.scan`` over k possible at all.  Check the number for your
+deck before assuming it: at 12×12 with nb=2000 it is ~10× larger.
 
-WHY THE FFT IS INLINED HERE, AND WHY THAT BUYS THE OUTER JIT
-------------------------------------------------------------
-``to_rbox``/``from_rbox`` memoise a **device** G-index
-(``_cached_gindex_dev``).  Inside ``lax.scan`` the per-k G table is a
-dynamic slice, i.e. a TRACER, and that cache would capture it — the
-``UnexpectedTracerError`` measured at job 7888526.  The handoff spec's
-stated remedy is to hoist the device G-index out and pass it as an
-operand, which is what this module does: it reuses
-``wfn_transforms._box_kernel`` (pure jax, takes its index as an argument,
-so tracers are fine) and builds the sharded transforms from the SAME
-``fft_helpers`` factories those helpers use.  Nothing in ``fft_helpers``
-or ``wfn_transforms`` is modified or duplicated — the transform is still
-``fft_helpers.make_sharded_{i,}fftn_3d``, i.e. ``shard_map`` around
-XLA's own local ``jnp.fft``, just handed a traced index.  That is NOT
-the flat-k FFI handler and should not be confused with it: the FFI
-handler reads the FFT axes as the LEADING flattened one, this box has
-them minor, and routing this shape through it measured 2.0× slower
-(0.206 s against 0.104 s for the same volume, job 7889250 arm
-``fftbench``).  The FFI's win in the Σ τ kernel is avoiding a μ²-tile
-transpose; there is no such transpose here.
+THE FFT IS DEVICE-LOCAL, AND THAT IS WHY THE WHOLE SWEEP IS ONE PROGRAM
+----------------------------------------------------------------------
+A band-layout operator runs inside the sweep's ``shard_map`` on whole
+bands, so its transforms are ``fft_helpers.local_{i,}fftn3`` — the inner
+kernels of ``make_sharded_{i,}fftn_3d`` — and no FFT is distributed.  The
+sphere→box gather is ``wfn_transforms._box_kernel`` fed a traced per-k
+index, so nothing memoises a device G-index (the ``UnexpectedTracerError``
+of job 7888526).  The flat-k FFT FFI is not used: its axis order suits the
+Σ τ kernel's μ² tiles, and on this box it measured 2.0× slower (0.206 s
+against 0.104 s, job 7889250 arm ``fftbench``).  The whole sweep is one
+``jax.jit`` cached in ``_KERNEL_CACHE``, keyed on shapes, plan, mesh and
+the operator's structural identity.
 
-**Consequence: the whole sweep IS wrapped in one ``jax.jit``.** The
-earlier prohibition ("do NOT wrap the body in an outer jit", job 7888526)
-applied to a version that called ``to_rbox``/``from_rbox``; this one does
-not touch them, so nothing memoises a device G-index and there is no
-tracer to escape. The jit is cached in ``_KERNEL_CACHE`` — the same
-``_cached_jit`` the transforms use — keyed on the shapes, the sharding
-and the operator identity, so it is built once and not once per call.
-
-The outer jit means the input constraint, the scan and the final
-constraint lower as ONE program, so XLA places the per-k collectives
-relative to the scan body's compute rather than seeing them as separate
-eagerly-dispatched ops. Everything is one k at a time inside it; the jit
-changes what XLA is allowed to see, not the algorithm.
-
-WHAT THE SWEEP'S WALL IS ACTUALLY MADE OF
------------------------------------------
-Measured at b600/P=64 (job 7889241), worst rank, median of 3, by
-substituting the operator and by running the skeleton's pieces alone:
-
-    whole sweep, local-potential operator          2.220 s   100 %
-    same skeleton with an IDENTITY operator        0.862 s    39 %
-    the per-k ket reshard alone                    0.176 s     8 %
-
-So the operator — the sphere→box gather, the FFT round trip, the V(r)
-multiply and the box→sphere gather — is 61 % of the wall and the
-collective is 8 %.  A statement that the per-k reshard is the sweep's
-cost at ``P ≤ nk`` is wrong at this shape; the box traffic is.  Two
-consequences that were tested and came out negative are recorded so they
-are not re-proposed: routing the transforms through the flat-k FFT FFI
-(``ffi.fft``) is **2.0× slower** here, 0.206 s against 0.104 s for the
-same volume, because that handler's win is avoiding a μ²-tile transpose
-and this path's box is already FFT-minor; and moving the per-k gather
-onto the other mesh axis is within noise, 0.180 s against 0.176 s
-(job 7889241, arms ``fftbench``, ``reshard_only`` / ``reshard_only_x``).
-
-A bare ``jnp.fft`` here would be the CrI3 6×6×1 80 Ry 121 GB OOM: on a
-sharded tensor XLA's planner is free to insert an all-gather and emit a
-global FFT.  See the module comment above ``wfn_transforms._local_box_fft``.
-
-WHERE THE OPERATOR'S WALL GOES, AND THE FUSION ARGUMENT THAT IS WRONG
----------------------------------------------------------------------
-Measured on the MoS2 4×4 density-SC shape — nk=16, nb=128, ns=2, grid
-24×24×80, ngkmax=1968, i.e. the sweep
-``gw.sc_iteration.rebuild_hartree_dft_basis`` issues and the one behind the
-5.72 s/iteration ``mtxel.sweep`` row of job 7889362 — by running the SAME
-skeleton with operators that add one stage at a time
-(``tests/multi_device/mtxel_fusion_probe.py``; jobs 7889383, 7889385,
-7889386; median of 3, worst rank)::
-
-                                     P=1      P=4      P=16
-      identity (scan+reshards+dot)   0.047 s  0.071 s  0.037 s
-      + sphere→box, box→sphere       0.046 s  0.060 s  0.033 s
-      + V(r) multiply                0.044 s  0.059 s  0.032 s
-      + ifftn                        2.963 s  0.805 s  0.204 s
-      + fftn   (= production)        5.740 s  1.566 s  0.359 s
-      bare ifftn+fftn on the box     2.797 s  0.836 s  0.188 s
-
-FIRST: the operator's wall IS the two transforms — 5.70 s of 5.74 s at P=1,
-99.2 %.  The sphere→box gather, the V(r) multiply, the box→sphere gather,
-the scan, BOTH per-k reshards and the einsum together are 0.047 s.  Nothing
-outside the transforms is worth optimising at this shape, and the b600/P=64
-attribution above (operator 61 %, collective 8 %) is a statement about that
-shape, not this one.
-
-SECOND: THE SHARD_MAP BOUNDARIES ARE NOT A COST.  The argument that they are
-— ``ifftn`` and ``fftn`` are each a ``shard_map``, a shard_map is a hard
-fusion boundary, therefore the 180 MiB box is re-materialised at each of the
-four crossings — was tested by putting sphere→box, both transforms, the
-multiply and box→sphere inside ONE ``shard_map`` (two crossings, not eight).
-The single-region operator is SLOWER: 5.909 s against 5.740 s at P=1
-(−2.9 %), −1.5 % at P=4, −2.6 % at P=16, and bit-identical (max rel delta
-0.000e+00).  It cannot help.  XLA never fuses an elementwise op into an
-``fft`` — it is a library call — so the box materialises between the stages
-either way, and collapsing the regions removes only the
-``SPMDFullToShardShape`` pairs, which the SPMD partitioner has already
-elided (0 of them in the optimized HLO at every P).
-
-THERE IS NO 30× OVERHEAD; THERE IS A 30× SHORTFALL IN CORES.  The 29.2
-GFLOP of transform arithmetic is "≈0.2 s" only at ~150 GFLOP/s, which is
-what 16 ranks deliver and one does not: the bare transform pair measures
-10.5 GFLOP/s at P=1, 35.0 at P=4, 155.8 at P=16.  Job 7889362 ran ``-N 1
--n 1``.  The sweep itself is 5.740 s at P=1 and 0.359 s at P=16 — 16.0× on
-16 ranks, linear.  A wall that scales linearly in P is work.
-
-WHAT IS LEFT is a P-INDEPENDENT 1.9–2.1× over a bare transform pair on the
-same box, and it is on the PRODUCER side.  The same two transforms fed by a
-box built in-jit from ``_box_kernel`` measure 5.956 s against 2.803 s
-parameter-fed, and dropping the trailing box→sphere gather does not move it
-(5.869 s; job 7889385).  The optimized HLO says why: ``_box_kernel``'s
-gather emits the box r-major/band-minor
-(``c128[128,2,1,24,24,80]{1,0,5,4,3,2}``) and XLA:CPU's ``fft`` demands
-band-major/r-minor, so the fft operand is a relayout —
-``fft(%copy_bitcast_fusion)`` here against ``fft(%b.1)`` in the bare pair.
-Expressing the box→sphere gather on a FLATTENED r axis, so the consumer
-stops pulling the layout the other way, does NOT remove it: 5.567 s against
-5.535 s at P=1 and 0.355 s against 0.368 s at P=16, values bit-identical
-(job 7889386, arm ``prod_flatg``).  Closing it means changing the layout
-``wfn_transforms._box_kernel`` produces, which is not this module.
+At MoS2 4×4 (nk=16, nb=128, ns=2, 24×24×80) the operator's wall IS the two
+transforms — 5.70 s of 5.74 s at P=1 — and they scale linearly in P
+(``tests/multi_device`` jobs 7889383–7889386); the sphere→box layout copy
+XLA:GPU inserts before ``fft`` is ``_box_kernel``'s, not this module's.
 """
 
 from __future__ import annotations
@@ -351,42 +190,16 @@ class SweepGeometry:
         self.nb_logical = self.band_axis.logical
         self.nb = self.band_axis.carrier
 
-    # Sphere-shaped operands, band-sharded over the WHOLE mesh.  Used for
-    # the n side during the operator: FFT work is 2nb/P per rank with no
-    # px-fold redundancy, which is the point of carrying ('x','y') here
-    # rather than transforming inside the column layout.
+    # ψ's resident layout: bands over the WHOLE mesh, all of G per band —
+    # the loader's ``band_sphere_spec``.  A band-layout operator runs here
+    # (whole bands, local FFT, no redundancy); the sweep all-to-alls to a
+    # G-split layout for everything else.
     @property
     def spec_sphere_xy(self) -> P:
         return band_sphere_spec()
 
-    @property
-    def spec_sphere_x(self) -> P:
-        return P(None, "x", None, None)
-
-    @property
-    def spec_sphere_y(self) -> P:
-        return P(None, "y", None, None)
-
-    @property
-    def spec_box_xy(self) -> P:
-        return P(None, ("x", "y"), None, None, None, None)
-
-    @property
-    def spec_block(self) -> P:
-        return P(None, "x", "y")
-
-    # --- the optional COMPONENT axis (dipole: 3 Cartesian directions) ---
-    # It is length 3 and REPLICATED: it cannot usefully divide a mesh
-    # axis, and carrying all three through one sweep is what keeps the
-    # hoisted m-side reshard at ONE all-gather instead of three (the
-    # handoff's §3b, which is stated for "all four operators" and holds
-    # verbatim for the three Cartesian components of one operator).
-    # Sphere operands carry it LAST so the band axis stays at index 1 and
-    # every spec above extends by appending a single ``None``.
-    @staticmethod
-    def with_comp(spec: P, ncomp: int) -> P:
-        return spec if not ncomp else P(*spec, None)
-
+    # The output block: m on 'x', n on 'y', a replicated component axis
+    # (dipole: 3 Cartesian directions) leading the two band axes.
     def spec_block_for(self, ncomp: int) -> P:
         return P(None, "x", "y") if not ncomp else P(None, None, "x", "y")
 
@@ -398,18 +211,46 @@ class SweepGeometry:
 class Operator(NamedTuple):
     """``O ∘ ψ`` plus the normalisation that belongs to it.
 
-    ``apply`` is called INSIDE the scan body with traced per-k operands:
+    An operator is applied in whichever of the sweep's two layouts makes
+    it LOCAL, and names that by which slots it fills (any combination; the
+    contributions add):
 
-      psi_n   (1, nb, ns, ngkmax) c128, sharded ``spec_sphere_xy``
+    ``apply`` — BAND layout, for an operator that needs every G of a band
+    at once (the FFT round trip of a local potential).  Called per k,
+    inside the sweep's ``shard_map``, on this rank's whole bands:
+
+      psi_n   (1, nb/P, ns, ngkmax) c128 — this rank's bands, all of G
       gvec    (ngkmax, 3) i32  — this k's G table (D10 fixed shape)
       gmask   (ngkmax,)   f64  — 1 on physical G, 0 on pad columns
       bidx    (1, nx, ny, nz) i32 — sphere→box index map for this k
       kvec    (3,) f64
 
-    and must return ``(1, nb, ns, ngkmax)`` in the same layout — or, when
-    ``ncomp > 0``, ``(1, nb, ns, ngkmax, ncomp)``: the band axis stays at
-    index 1 and the component axis is appended.  It must NOT form
-    anything of shape ``(nb, nb)`` and must not gather over bands.
+    and returns ``(1, nb/P, ns, ngkmax)`` — or, when ``ncomp > 0``,
+    ``(1, nb/P, ns, ngkmax, ncomp)``.  The sweep all-to-alls that ket to
+    the G-split layout.  Anything transforming must use the device-local
+    kernels (``fft_helpers.local_{i,}fftn3``): it already runs per rank.
+
+    ``apply_g`` — G-SPLIT layout, for an operator diagonal in G (T, p,
+    Dirac α).  Called per k on this rank's G slab of EVERY band:
+
+      psi     (nb, ns, g_slab) c128, already masked
+      gvec    (g_slab, 3) i32;  gmask (g_slab,) f64;  kvec (3,) f64
+
+    returning ``(nb, ns, g_slab[, ncomp])``.  Only ψ crosses the mesh for
+    these terms; their ket never does.
+
+    ``coeffs`` + ``couple`` — SEPARABLE, ``O = Σ |β⟩ D ⟨β|`` with a small
+    projector count (V_NL and its K-derivatives).  ``coeffs(psi, gvec,
+    gmask, kvec, *consts)`` returns a tuple of this slab's partial
+    projections, BAND LAST, e.g. ``c[R,s,n] = Σ_{G∈slab} Z*[R,G] ψ[n,s,G]``;
+    the sweep psums them over the mesh (``R·ns·nb``, never a G axis) and
+    hands ``couple(coef_m, coef_n, *consts)`` the bra block's and the ket
+    block's columns, which returns ``(nb_m, nb_n)`` or ``(ncomp, nb_m,
+    nb_n)``.  The projectors are built on the slab, so no rank builds a
+    whole-G ``Z`` for every k.
+
+    No slot may form a ``(nb, nb)`` over G or gather over bands; the sweep
+    owns every collective.
 
     ``ncomp`` is 0 for a scalar operator (T, V_loc, V_H, V_NL), 3 for
     a Cartesian one (dipole), and 12 for the one packed uniform
@@ -425,7 +266,7 @@ class Operator(NamedTuple):
     argument on the sweep would be one more thing to get right at every
     call site, which is the mistake the SlabIO padding ruling names.
     """
-    apply: Callable
+    apply: Callable | None = None
     post: float = 1.0
     ncomp: int = 0
     #: Runtime operands.  The sweep threads them through its own jit and
@@ -437,6 +278,11 @@ class Operator(NamedTuple):
     #: :func:`_operator_key`; an operator that leaves it empty falls back to
     #: ``id(apply)``, i.e. one lowering per factory call.
     key: tuple = ()
+    #: G-split ket (diagonal-in-G terms); see the class docstring.
+    apply_g: Callable | None = None
+    #: Separable projector terms: slab coefficients and their coupling.
+    coeffs: Callable | None = None
+    couple: Callable | None = None
 
 
 def _operator_key(op: "Operator") -> tuple:
@@ -465,7 +311,8 @@ def _operator_key(op: "Operator") -> tuple:
     holds the setup, so the id cannot be recycled onto a different object
     while the entry lives.
     """
-    return tuple(op.key) if op.key else ('id', id(op.apply))
+    return tuple(op.key) if op.key else (
+        'id', id(op.apply), id(op.apply_g), id(op.coeffs), id(op.couple))
 
 
 def kinetic_operator(geom: SweepGeometry, bdot) -> Operator:
@@ -479,16 +326,17 @@ def kinetic_operator(geom: SweepGeometry, bdot) -> Operator:
     bit-identity (numerical-tolerance ruling; D10's ``RTOL_D10``).
 
     This operator is the skeleton's isolation test: no FFT means a
-    failure here is the scan, the reshard or the einsum, never the
-    transform.
+    failure here is the all-to-all, the slab GEMM or the reduce-scatter,
+    never the transform.  Diagonal in G, so it acts on the G slab and its
+    ket never crosses the mesh.
     """
     from psp.get_DFT_mtxels import kinetic_diagonal
 
-    def op(psi_n, gvec, gmask, bidx, kvec, bdot_j):
+    def op_g(psi, gvec, gmask, kvec, bdot_j):
         T_G = kinetic_diagonal(gvec, kvec, bdot_j, g_mask=gmask)
-        return psi_n * T_G[None, None, None, :].astype(psi_n.dtype)
+        return psi * T_G[None, None, :].astype(psi.dtype)
 
-    return Operator(apply=op, post=1.0,
+    return Operator(apply_g=op_g, post=1.0,
                     consts=(jnp.asarray(np.asarray(bdot, dtype=np.float64)),),
                     key=('kinetic', geom.ngkmax, geom.ns))
 
@@ -507,22 +355,17 @@ def local_potential_operator(
     tables.  It is the same scatter/IFFT/FFT/gather and the same
     normalisation, not a parallel band-projection implementation.
 
-    The two transforms are built ONCE, here, outside the scan — they are
-    pure functions of shape, so nothing about them is per-k.  Only the
-    scatter and the gather touch G, and both take their index as a traced
-    operand.
+    BAND layout (``Operator.apply``): the round trip needs every G of a
+    band, and the sweep's ``shard_map`` hands this rank whole bands, so the
+    transforms are the device-local kernels ``fft_helpers.local_{i,}fftn3``
+    — the inner kernels of ``make_sharded_{i,}fftn_3d`` — and no FFT is
+    ever distributed.  Only the scatter and the gather touch G, and both
+    take their index as a traced operand.
 
-    ``V_r`` is the potential on the FFT grid, replicated.  It is closed
-    over rather than scanned because it does not depend on k.
+    ``V_r`` is the potential on the FFT grid, replicated.  It rides in as
+    an operand (``consts``) because it does not depend on k.
     """
-    from common.fft_helpers import make_sharded_fftn_3d, make_sharded_ifftn_3d
-
-    mesh = geom.mesh
-    box_spec = geom.spec_box_xy
-    ifftn = make_sharded_ifftn_3d(mesh, box_spec, box_spec,
-                                  norm='ortho', axes=(-3, -2, -1))
-    fftn = make_sharded_fftn_3d(mesh, box_spec, box_spec,
-                                norm='ortho', axes=(-3, -2, -1))
+    from common.fft_helpers import local_fftn3, local_ifftn3
 
     # THE SHARED NORMALISATION.  Same function the local plan's
     # ``_compute_local_V_k_jit`` calls, so the two agree by construction
@@ -562,7 +405,7 @@ def local_potential_operator(
         # axis, no cross-rank op), and its ngkmax zero-slot makes the
         # sentinel index gather exact zero.
         box = _box_kernel(psi_n, bidx, ngkmax=geom.ngkmax)
-        psi_r = ifftn(box) * scale
+        psi_r = local_ifftn3(box, axes=(-3, -2, -1), norm='ortho') * scale
         if vector:
             phi_r = jnp.zeros_like(psi_r)
             for i, (perm, phase) in enumerate(alpha_vertices):
@@ -570,9 +413,9 @@ def local_potential_operator(
                     psi_r, perm, phase, axis=2)
         else:
             phi_r = psi_r * V_r_j
-        phi_G = fftn(phi_r) * (deltaV * fft_norm)
-        # box → sphere.  Advanced indexing on the three replicated FFT
-        # axes only, so the band sharding is untouched.
+        phi_G = local_fftn3(phi_r, axes=(-3, -2, -1), norm='ortho') \
+            * (deltaV * fft_norm)
+        # box → sphere.  Advanced indexing on the three FFT axes only.
         gx = gvec[:, 0]
         gy = gvec[:, 1]
         gz = gvec[:, 2]
@@ -613,7 +456,7 @@ def four_current_potential_operator(
     scalar operator ket outside that block is algebraically identical to
     slicing both bra and ket because those output spinor rows are exact zero.
     """
-    from common.fft_helpers import make_sharded_fftn_3d, make_sharded_ifftn_3d
+    from common.fft_helpers import local_fftn3, local_ifftn3
     from common.gamma_matrices import gamma_apply, gamma_perm_phase
     from psp.get_DFT_mtxels import local_potential_scalars
 
@@ -638,14 +481,6 @@ def four_current_potential_operator(
             "spatial four-current potential must have shape "
             f"{(3, *grid)}; got {tuple(int(s) for s in V1.shape)}")
 
-    mesh = geom.mesh
-    ifftn = make_sharded_ifftn_3d(
-        mesh, geom.spec_box_xy, geom.spec_box_xy,
-        norm="ortho", axes=(-3, -2, -1))
-    comp_box_spec = P(None, None, ("x", "y"), None, None, None, None)
-    fftn = make_sharded_fftn_3d(
-        mesh, comp_box_spec, comp_box_spec,
-        norm="ortho", axes=(-3, -2, -1))
     scalars = local_potential_scalars(geom.cell_volume, geom.ngrid)
     scale = float(scalars.scale)
     fft_scale = float(scalars.deltaV * scalars.fft_norm)
@@ -657,15 +492,15 @@ def four_current_potential_operator(
     def op(psi_n, gvec, gmask, bidx, kvec, V0, V1):
         del kvec
         box = _box_kernel(psi_n, bidx, ngkmax=geom.ngkmax)
-        psi_r = ifftn(box) * scale
+        psi_r = local_ifftn3(box, axes=(-3, -2, -1), norm="ortho") * scale
         phi_scalar = psi_r * charge_mask * V0
         phi_vector = jnp.zeros_like(psi_r)
         for i, (perm, phase) in enumerate(alpha_vertices):
             phi_vector = phi_vector + V1[i] * gamma_apply(
                 psi_r, perm, phase, axis=2)
-        # (component, k, band, spinor, x, y, z): the component batch is
-        # replicated and the band shard moves from axis 1 to axis 2.
-        phi_G = fftn(jnp.stack((phi_scalar, phi_vector), axis=0)) * fft_scale
+        # (component, k, band, spinor, x, y, z): one batched forward FFT.
+        phi_G = local_fftn3(jnp.stack((phi_scalar, phi_vector), axis=0),
+                            axes=(-3, -2, -1), norm="ortho") * fft_scale
         gx, gy, gz = gvec[:, 0], gvec[:, 1], gvec[:, 2]
         out = phi_G[..., gx, gy, gz]
         out = jnp.moveaxis(out, 0, -1)
@@ -719,42 +554,44 @@ def _pad_spinor(x, ns: int):
 
 
 def vnl_operator(geom: SweepGeometry, vnl_setup) -> Operator:
-    """``V_NL ∘ ψ = Z E Z† ψ`` — a projector sum: no FFT, no band gather.
+    """``⟨m|V_NL|n⟩ = Σ c*_m E c_n`` with ``c = Z† ψ`` — SEPARABLE.
 
-    Why it fits the ``Operator`` protocol at all: the G sum inside the
-    projector overlap ``P[R,s,n] = Σ_G conj(Z) ψ`` runs over the
-    REPLICATED G axis, so it is rank-local; the free index is the band,
-    which stays sharded.  Nothing here needs a collective and nothing
-    forms an ``(nb, nb)``.
+    V_NL is ``Z E Z†`` with a projector count ``R`` far below ``nb·ns``, so
+    it never needs a G-space ket: each rank projects its G slab of every
+    band onto the projectors built ON THAT SLAB (``c`` partial, ``R·ns·nb``),
+    the sweep psums the partials, and the bra and ket blocks couple through
+    ``E`` (:func:`psp.vnl_ops.vnl_block_from_coefficients`).  The same
+    ``Z E Z†`` the local plan's ``vnl_ops.vnl_matrix`` contracts, with the G
+    sum split over ranks: gate at 1e-12 relative, not bit-identity.
 
-    ``vnl_ops.apply_vnl`` is the kernel, unmodified — the same
-    ``Z E Z†`` the local plan's ``vnl_ops.vnl_matrix`` contracts, taken
-    one step earlier.  The two therefore differ only in where the bra is
-    applied, which reassociates the G sum: gate at 1e-12 relative, not
-    bit-identity.
+    The pad columns are inert because the sweep masks ψ before calling
+    ``coeffs``: ``Z`` itself is FINITE on a pad column (evaluated at
+    ``K = kvec``), so it is ψ that must be zero there.
 
-    Cost per k: ``Z`` is ``(total_R, ngkmax)`` REPLICATED (32 MB at
-    total_R=100, ngkmax=20000) — it does not scale with nb, so it does
-    not enter the per-rank wall this sweep exists to remove.
+    The projector BUILD is slab-sized too: ``Z`` is ``(R, G/P)`` per rank,
+    where the band-split plan this replaced built the whole ``(R, ngkmax)``
+    on every rank for every k (replicated work, measured flat in P at MoS2
+    4×4, job 7889392).
 
-    IT DOES, HOWEVER, ENTER THE PARALLEL EFFICIENCY, and the module
-    docstring used to deny that.  Building Z is replicated work: every rank
-    builds it for every k.  Measured at MoS2 4×4 deck_b300 (nk=16, nb=128,
-    ngkmax=1964, total_R=62; job 7889392) the build is 0.017 / 0.010 /
-    0.020 s at P = 1 / 4 / 16 — flat — and 27 % → 51 % of this operator's
-    whole cost over the kinetic baseline across that range.  Read the
-    parallelism section of the module docstring for why it is left alone.
+    A bispinor ψ carries 4 components of which V_NL acts on the first
+    ``E_super``'s ``nspinor``: the projections run over those alone, which
+    is identical to padding the ket with exact-zero rows.
     """
     from psp import vnl_ops
 
-    def op(psi_n, gvec, gmask, bidx, kvec):
-        psi = _ket(psi_n, gmask)
-        kdata = vnl_ops.build_vnl_kdata_traced(kvec, gvec, vnl_setup)
-        ns_e = int(kdata.E_super.shape[0])
-        out = vnl_ops.apply_vnl(psi[:, :ns_e], kdata.Z, kdata.E_super)
-        return _pad_spinor(out, int(psi.shape[1]))[None]
+    ns_e = int(vnl_setup.E_super.shape[0])
 
-    return Operator(apply=op, post=1.0,
+    def coeffs(psi, gvec, gmask, kvec):
+        del gmask                      # ψ arrives masked
+        Z = vnl_ops.build_vnl_kdata_traced(kvec, gvec, vnl_setup).Z
+        c, _ = vnl_ops.projector_coefficients(psi[:, :ns_e], Z)
+        return (c,)
+
+    def couple(bra, ket):
+        return vnl_ops.vnl_block_from_coefficients(
+            bra[0], ket[0], vnl_setup.E_super)
+
+    return Operator(coeffs=coeffs, couple=couple, post=1.0,
                     key=('vnl', geom.ngkmax, geom.ns, id(vnl_setup)))
 
 
@@ -822,11 +659,11 @@ def dirac_current_operator(geom: SweepGeometry) -> Operator:
     if geom.ns != 4:
         raise ValueError('Dirac current sweep requires four-component wavefunctions')
 
-    def op(psi_n, gvec, gmask, bidx, kvec):
-        velocity = apply_dirac_velocity_to_ket(_ket(psi_n, gmask))
-        return jnp.moveaxis(velocity, 0, -1)[None]
+    def op_g(psi, gvec, gmask, kvec):
+        # Spinor mixing only, diagonal in G: acts on the G slab.
+        return jnp.moveaxis(apply_dirac_velocity_to_ket(psi), 0, -1)
 
-    return Operator(apply=op, post=1.0, ncomp=3, consts=(),
+    return Operator(apply_g=op_g, post=1.0, ncomp=3, consts=(),
                     key=('dirac_current', geom.ngkmax, geom.ns))
 
 
@@ -840,16 +677,18 @@ def dipole_operator(geom: SweepGeometry, *, bvec, blat,
     ``p_cart + v_NL_cart``.  WHICH ARM A FILE WAS BUILT WITH IS NOT A
     PROPERTY OF THIS DOCSTRING: it is stamped into every ``dipole.h5``
     as ``prov_vnl_velocity_sign``, and files written before that stamp
-    existed are the ``-1`` arm.  Both halves already have
-    apply-to-ket kernels — ``dft_operators.apply_kinetic_velocity_to_ket``
-    and ``vnl_ops.apply_vnl_velocity_to_ket``, each ``(3, nb, ns, nG)`` —
-    so this operator is their difference and no velocity physics is
-    written twice.
+    existed are the ``-1`` arm.  No velocity physics is written here:
+    ``p`` is ``dft_operators.apply_kinetic_velocity_to_ket`` applied on the
+    G slab (diagonal in G, so only ψ crosses the mesh), and the nonlocal
+    term is the SEPARABLE ``(dc)† E c + c† E dc`` of
+    ``vnl_ops.vnl_velocity_block_from_coefficients`` — the bra contraction
+    of ``vnl_ops.apply_vnl_velocity_to_ket`` — on projections the sweep
+    reduces over the mesh (see :func:`vnl_operator`).
 
     ``vnl_setup=None`` reproduces ``--skip-vnl`` (p̂ only).
 
-    The component axis is moved to the END, where the sweep's specs
-    expect it; that is a transpose of the operator output, not of ψ.
+    The component axis of ``p``'s ket is moved to the END, where the
+    sweep's contraction expects it.
 
     THE SIGN, WHICH WAS AN OPEN QUESTION AND IS NOW DECIDED
     -------------------------------------------------------
@@ -857,8 +696,9 @@ def dipole_operator(geom: SweepGeometry, *, bvec, blat,
     It takes exactly ``+1.0`` (the DEFAULT since 2026-08-09) or ``-1.0``
     (the arm every ``dipole.h5`` committed before that date was built
     with, kept reachable so those files stay reproducible).  The two
-    signs are separate branches rather than a scalar multiply, so the
-    legacy arm still executes the literal subtraction it always did.
+    signs are separate branches rather than a scalar multiply: the legacy
+    arm's nonlocal block is exactly negated (IEEE negation is exact) and
+    added, i.e. the subtraction it always was.
 
     The decision was measured, not argued.  On the si_bigcond_prep mean
     field at the band window matched to the BerkeleyGW contour-
@@ -916,23 +756,37 @@ def dipole_operator(geom: SweepGeometry, *, bvec, blat,
                     dtype=jnp.float64)
     flipped = sign > 0.0
 
-    def op(psi_n, gvec, gmask, bidx, kvec, B):
-        psi = _ket(psi_n, gmask)
-        v = apply_kinetic_velocity_to_ket(psi, gvec, kvec, B)
-        if vnl_setup is not None:
+    def op_g(psi, gvec, gmask, kvec, B):
+        # p = 2(k+G)_cart: diagonal in G, applied on the slab.
+        return jnp.moveaxis(
+            apply_kinetic_velocity_to_ket(psi, gvec, kvec, B), 0, -1)
+
+    separable = {}
+    if vnl_setup is not None:
+        ns_e = int(vnl_setup.E_super.shape[0])
+
+        def coeffs(psi, gvec, gmask, kvec, B):
+            del gmask, B                    # ψ arrives masked
             kdata = vnl_ops.build_vnl_kdata_traced(kvec, gvec, vnl_setup,
                                                    compute_dZ=True)
-            ns_e = int(kdata.E_super.shape[0])
-            v_nl = vnl_ops.apply_vnl_velocity_to_ket(
-                psi[:, :ns_e], kdata.Z, kdata.dZ, kdata.E_super)
-            pad = _pad_spinor(v_nl, int(psi.shape[1]))
-            v = v + pad if flipped else v - pad
-        return jnp.moveaxis(v, 0, -1)[None]
+            return vnl_ops.projector_coefficients(
+                psi[:, :ns_e], kdata.Z, kdata.dZ)
 
-    return Operator(apply=op, post=1.0, ncomp=3, consts=(B,),
+        def couple(bra, ket, B):
+            del B
+            v_nl = vnl_ops.vnl_velocity_block_from_coefficients(
+                bra[0], bra[1], ket[0], ket[1], vnl_setup.E_super)
+            # The sweep ADDS this block to p's; the shipped arm's literal
+            # subtraction is that add of an exactly negated block.
+            return v_nl if flipped else -v_nl
+
+        separable = dict(coeffs=coeffs, couple=couple)
+
+    return Operator(apply_g=op_g, post=1.0, ncomp=3, consts=(B,),
                     key=('dipole', geom.ngkmax, geom.ns, float(blat),
                          None if vnl_setup is None else id(vnl_setup),
-                         sign))
+                         sign),
+                    **separable)
 
 
 class UniformGaugeCurrentMatrixElements(NamedTuple):
@@ -1401,19 +1255,20 @@ def sweep_uniform_current_matrix_elements(
 
 
 def sum_operators(*ops: Operator) -> Operator:
-    """``(O₁ + O₂ + …) ∘ ψ`` — one sweep, one per-k collective.
+    """``(O₁ + O₂ + …) ∘ ψ`` — one sweep, one all-to-all, one reduction.
 
-    ``⟨m|T+V_loc+V_NL|n⟩`` is ONE matrix element, so it is one sweep:
-    summing on the KET costs one extra ``(nb/P, ns, ngkmax)`` add per
-    term and leaves the reshard and the einsum — the expensive halves —
-    paid once, where three sweeps would pay all three three times.
+    ``⟨m|T+V_loc+V_NL|n⟩`` is ONE matrix element, so it is one sweep.  Each
+    slot sums over the terms that fill it: band-layout kets add before
+    their all-to-all, G-split kets add before the slab GEMM, and separable
+    terms keep their own projections (concatenated into one psum) and add
+    their coupled blocks.  So T+V_loc+V_NL moves ψ and V_loc ψ once and
+    runs one GEMM, where three sweeps would pay all of it three times.
 
-    Each term's ``post`` is folded into its own contribution before the
-    sum, which is what lets operators with different normalisations
-    (``local_potential_operator`` carries ``sqrt(1/Ω)``, the others 1)
-    share one einsum.  Algebraically identical, since the einsum is
-    linear; numerically it moves one scalar multiply from after the G
-    sum to before it, i.e. ~1 ulp, inside the 1e-12 gate.
+    Each term's ``post`` is folded into its own contribution, which is
+    what lets operators with different normalisations (the local
+    potential's ``sqrt(1/Ω)``, the others 1) share one contraction.
+    Algebraically identical, since the contraction is linear; numerically
+    one scalar multiply moves from after the G sum to before it, ~1 ulp.
     """
     if not ops:
         raise ValueError("sum_operators: at least one operator required")
@@ -1434,22 +1289,250 @@ def sum_operators(*ops: Operator) -> Operator:
         off += len(o.consts)
     all_consts = tuple(c for o in ops for c in o.consts)
 
-    def op(psi_n, gvec, gmask, bidx, kvec, *cs):
-        acc = None
-        for (a, b), o in zip(spans, ops):
-            term = o.apply(psi_n, gvec, gmask, bidx, kvec, *cs[a:b])
-            if o.post != 1.0:
-                term = term * o.post
-            acc = term if acc is None else acc + term
-        return acc
+    def _scaled(o, x):
+        return x if o.post == 1.0 else x * o.post
 
-    return Operator(apply=op, post=1.0, ncomp=ncomp, consts=all_consts,
+    def _ket_sum(slot):
+        terms = [(span, o) for span, o in zip(spans, ops)
+                 if getattr(o, slot) is not None]
+        if not terms:
+            return None
+
+        def summed(*args):
+            # (layout operands..., *all_consts): split at the consts.
+            cut = len(args) - len(all_consts)
+            head, cs = args[:cut], args[cut:]
+            acc = None
+            for (a, b), o in terms:
+                t = _scaled(o, getattr(o, slot)(*head, *cs[a:b]))
+                acc = t if acc is None else acc + t
+            return acc
+        return summed
+
+    sep = [(span, o) for span, o in zip(spans, ops) if o.coeffs is not None]
+    coeffs = couple = None
+    if sep:
+        def coeffs(psi, gvec, gmask, kvec, *cs):
+            return tuple(o.coeffs(psi, gvec, gmask, kvec, *cs[a:b])
+                         for (a, b), o in sep)
+
+        def couple(bra, ket, *cs):
+            acc = None
+            for i, ((a, b), o) in enumerate(sep):
+                t = _scaled(o, o.couple(bra[i], ket[i], *cs[a:b]))
+                acc = t if acc is None else acc + t
+            return acc
+
+    return Operator(apply=_ket_sum('apply'), apply_g=_ket_sum('apply_g'),
+                    coeffs=coeffs, couple=couple, post=1.0, ncomp=ncomp,
+                    consts=all_consts,
                     key=('sum',) + tuple(_operator_key(o) for o in ops))
 
 
 # ---------------------------------------------------------------------------
 # The sweep
 # ---------------------------------------------------------------------------
+
+class SweepPlan(NamedTuple):
+    """Static shapes of one sweep executable (:func:`plan_sweep`).
+
+    k_tile
+        k-points per scan step; divides ``geom.nk``.  One all-to-all, one
+        slab GEMM and one reduce-scatter serve the whole tile.
+    g_carrier
+        ``ngkmax`` padded to a multiple of P: the extent the all-to-all
+        splits into P slabs.  Pad columns are zero in ψ and in the mask.
+    """
+    k_tile: int
+    g_carrier: int
+
+
+def plan_sweep(geom: SweepGeometry, operator: Operator) -> SweepPlan:
+    """The G carrier and the k tile.
+
+    THE k TILE PACKS k ONLY WHILE THE ALL-TO-ALL IS LATENCY-BOUND.  A tile
+    buys fewer collective rounds and scan trips; it costs a K-times larger
+    working set, and at VI3 12x12 that cost is real: at P4 every K > 1 was
+    slower than K = 1 (V_H 2.48 s at K=1, 2.57–2.64 s at K=2..16; dipole-p
+    0.28 s against 0.33–0.47 s) and the sphere-sized K=24 tile raised the
+    executable from 9.9 to 17.4 GiB (``runs/runtime/mtxel_sweep_20260923``,
+    legs a11–a13).  So ``K`` is the SMALLEST divisor of ``nk`` whose
+    per-peer all-to-all block, ``K·(nb/P)·ns·g_carrier·16 / P``, reaches
+    :data:`A2A_BANDWIDTH_BLOCK_BYTES`, never more than the largest divisor
+    whose step fits in this rank's resident ψ sphere (the density scan's
+    memory rule), and ``K = 1`` at ``nk = 1``.  At every shape measured so
+    far that is ``K = 1``; the packed regime (small per-k slabs at large
+    P) is where the rule would first choose ``K > 1``.
+
+    One k of a step holds, per rank: ψ and its G-split copy, the operator's
+    ket in band layout and in G-split layout (``c = max(ncomp, 1)``
+    components each) and the ``(c, nb, nb)`` slab partial plus its
+    block-ordered copy.  The FFT box of a band operator is NOT in the step:
+    it runs one k at a time inside the tile and never scales with K.
+    """
+    from runtime.padding import bounded_partition_tile, padded_axis
+
+    c128 = 16.0
+    n_ranks = int(geom.p_prod)
+    nb_rank = geom.nb // n_ranks
+    g_carrier = padded_axis(
+        geom.ngkmax, geom.mesh, name="matrix-element sweep G all-to-all",
+        spec=P(None, None, None, ("x", "y")), axis=3).carrier
+    c = max(int(operator.ncomp), 1)
+    ket_copies = (2 * c if operator.apply is not None else 0) + \
+        (c if operator.apply_g is not None else 0)
+    sphere = geom.nk * nb_rank * geom.ns * geom.ngkmax * c128
+    step = ((2 + ket_copies) * nb_rank * geom.ns * g_carrier * c128
+            + 2.0 * c * float(geom.nb) ** 2 * c128)
+    k_mem = max(1, bounded_partition_tile(
+        geom.nk, max(1, int(sphere // step)), 1))
+    peer_block = nb_rank * geom.ns * g_carrier * c128 / n_ranks
+    k_tile = next((k for k in range(1, k_mem + 1) if geom.nk % k == 0
+                   and k * peer_block >= A2A_BANDWIDTH_BLOCK_BYTES), k_mem)
+    return SweepPlan(k_tile, g_carrier)
+
+
+#: Per-peer all-to-all block (bytes) at which the collective is taken to be
+#: bandwidth-bound; :func:`plan_sweep` packs k only below it.  A transport
+#: property, not a knob: no deck or env var reaches it.
+A2A_BANDWIDTH_BLOCK_BYTES = 1 << 20
+
+
+def _sweep_body(geom: SweepGeometry, operator: Operator, plan: SweepPlan,
+                *, use_scan: bool):
+    """The per-rank program: scan k tiles; per tile, band → G split, GEMM,
+    reduce-scatter.
+
+    Local operands (``ops`` dict): ``psi`` ``(nk, nb/P, ns, ngkmax)`` (this
+    rank's bands); the replicated ``kvec`` ``(nk, 3)``, ``gvec`` ``(nk,
+    ngkmax, 3)`` and ``gmask`` ``(nk, ngkmax)`` — each rank cuts its own G
+    slab from them per tile, so no padded ``(nk, g_carrier)`` table ever
+    exists — and, for a band-layout operator, the replicated ``bidx``.
+    Returns ``(nk, [ncomp,] nb/p_x, nb/p_y)`` — this rank's block of
+    ``P(None, [None,] 'x', 'y')``.
+
+    ORDER CONVENTION, shared with ``band_sphere_spec`` and the density scan:
+    the linear rank over ``('x','y')`` is ``x·p_y + y``.  The band
+    all-to-all concatenates blocks in that order (so bands come back in
+    global order), it hands slab ``r`` of G to rank ``r``, and the
+    reduce-scatter delivers the ``r``-th of the ``(p_x, p_y)`` blocks to
+    rank ``r`` — i.e. rows ``x`` and columns ``y``.
+    """
+    from jax.experimental.layout import Layout, with_layout_constraint
+
+    axes = ("x", "y")
+    px, py = int(geom.mesh.shape["x"]), int(geom.mesh.shape["y"])
+    n_ranks = px * py
+    nb, ngk = geom.nb, geom.ngkmax
+    nbx, nby = nb // px, nb // py
+    gc, K = plan.g_carrier, plan.k_tile
+    n_tiles = geom.nk // K
+    contraction = ("kmsg,knsg->kmn" if not operator.ncomp
+                   else "kmsg,knsgc->kcmn")
+    need_gvec_s = operator.apply_g is not None or operator.coeffs is not None
+
+    def to_g_split(a):
+        """(K, nb/P, ns, ngkmax, …) band layout → (K, nb, ns, gc/P, …).
+
+        PIN THE TILE ROW-MAJOR.  The all-to-all wants its split axis (G)
+        major; left free, layout assignment can satisfy that on the scan's
+        LOOP OPERAND and hoist a G-major copy of the whole resident ψ out of
+        the loop (measured +ψ/P per rank on the density scan, legs b02/b05
+        of ``runs/runtime/density_scan_20260923``).  Pinned, the transpose
+        is one tile wide.
+        """
+        a = with_layout_constraint(
+            a, Layout(major_to_minor=tuple(range(a.ndim))))
+        pad = [(0, 0)] * a.ndim
+        pad[3] = (0, gc - ngk)
+        return jax.lax.all_to_all(jnp.pad(a, pad), axes, split_axis=3,
+                                  concat_axis=1, tiled=True)
+
+    def to_blocks(part):
+        """(K, [c,] nb, nb) slab partial → this rank's summed (x, y) block.
+
+        THE ONE REPLICATED OBJECT, priced: ``K·c·nb²·16`` bytes per rank
+        (0.26 MB per k at nb=128; 16 MB at nb=1000).  It exceeds the ψ
+        panels the band-split plan gathered, ``(1+c)·ψ_k/√P``, only when
+        ``nb·√P > ns·N_G`` — P ≳ 1e5 at production G/nb ratios.
+        """
+        lead = part.shape[:-2]
+        r = part.reshape(*lead, px, nbx, py, nby)
+        r = jnp.moveaxis(r, (len(lead), len(lead) + 2), (0, 1))
+        r = r.reshape(n_ranks, *lead, nbx, nby)
+        return jax.lax.psum_scatter(r, axes, scatter_dimension=0,
+                                    tiled=False)
+
+    def band_ket(t, consts):
+        """The band-layout operator one k at a time: its box never scales
+        with K.  (K, nb/P, ns, ngkmax[, c])."""
+        def one(xs):
+            p, g, m, b, kv = xs
+            return operator.apply(p[None], g, m, b[None], kv, *consts)[0]
+        xs = (t["psi"], t["gvec"], t["gmask"], t["bidx"], t["kvec"])
+        if K == 1:
+            return one(jax.tree_util.tree_map(lambda a: a[0], xs))[None]
+        _, out = jax.lax.scan(lambda c_, x: (c_, one(x)), None, xs,
+                              unroll=1)
+        return out
+
+    def per_k(fn, consts):
+        return jax.vmap(lambda *a: fn(*a, *consts))
+
+    def my_slab(a):
+        """(K, ngkmax, …) replicated table → this rank's (K, g_slab, …)."""
+        pad = [(0, 0)] * a.ndim
+        pad[1] = (0, gc - ngk)
+        gs = gc // n_ranks
+        return jax.lax.dynamic_slice_in_dim(
+            jnp.pad(a, pad), jax.lax.axis_index(axes) * gs, gs, axis=1)
+
+    def tile(t, consts):
+        gm_s = my_slab(t["gmask"])
+        gv_s = my_slab(t["gvec"]) if need_gvec_s else None
+        psi_g = to_g_split(t["psi"]) * gm_s[:, None, None, :].astype(
+            t["psi"].dtype)
+        ket = None
+        if operator.apply is not None:
+            ket = to_g_split(band_ket(t, consts))
+        if operator.apply_g is not None:
+            kg = per_k(operator.apply_g, consts)(
+                psi_g, gv_s, gm_s, t["kvec"])
+            ket = kg if ket is None else ket + kg
+        blk = None
+        if ket is not None:
+            blk = to_blocks(jnp.einsum(contraction, jnp.conj(psi_g), ket,
+                                       optimize=True))
+        if operator.coeffs is not None:
+            # Separable terms: psum the slab projections (R·ns·nb, no G
+            # axis), then couple this rank's bra rows and ket columns.
+            co = jax.lax.psum(per_k(operator.coeffs, consts)(
+                psi_g, gv_s, gm_s, t["kvec"]), axes)
+            x0 = jax.lax.axis_index("x") * nbx
+            y0 = jax.lax.axis_index("y") * nby
+
+            def cols(start, width):
+                return jax.tree_util.tree_map(
+                    lambda a: jax.lax.dynamic_slice_in_dim(
+                        a, start, width, axis=a.ndim - 1), co)
+            sb = per_k(operator.couple, consts)(cols(x0, nbx),
+                                                cols(y0, nby))
+            blk = sb if blk is None else blk + sb
+        return blk * operator.post
+
+    def body(ops, *consts):
+        tiles = {k: v.reshape(n_tiles, K, *v.shape[1:])
+                 for k, v in ops.items()}
+        if use_scan:
+            _, H = jax.lax.scan(lambda c_, t: (c_, tile(t, consts)), None,
+                                tiles, unroll=1)
+        else:
+            H = jnp.stack([tile({k: v[i] for k, v in tiles.items()}, consts)
+                           for i in range(n_tiles)])
+        return H.reshape(geom.nk, *H.shape[2:])
+
+    return body
+
 
 # FORCED SYNC, AND WHAT IT COSTS.  ``watch=True`` makes the section
 # ``block_until_ready`` the returned block before it stops its clock, so the
@@ -1486,8 +1569,8 @@ def sweep_matrix_elements(
     Parameters
     ----------
     psi_G : (nk, nb, ns, ngkmax) c128
-        The G-sphere ψ, resident on device.  Any band sharding; it is
-        constrained internally to both layouts it needs.
+        The G-sphere ψ, resident on device, at ``band_sphere_spec`` (the
+        loader's layout; any other is constrained to it once).
     geom, operator
         See above.
     gvecs : (nk, ngkmax, 3) i32
@@ -1497,56 +1580,34 @@ def sweep_matrix_elements(
         FFT-box sentinel Miller index (see ``common.gvec_fft_box``), which
         is a valid box cell, so a forgotten mask does not crash — it
         silently contracts the sentinel column into every matrix element.
-        The sentinel is chosen so that no physical G of a padded row maps
-        to it, which makes the omission detectable rather than harmless;
-        it does not make the mask optional.
     box_index : (nk, nx, ny, nz) i32
-        Sphere→box index map (``WfnLoader.box_index``).  Only consumed by
-        operators that transform; the kinetic and dipole operators ignore it.
+        Sphere→box index map (``WfnLoader.box_index``).  Only consumed —
+        and only moved to the device — for an operator with a band-layout
+        ``apply`` (an FFT); every other operator ignores it.
     kvecs : (nk, 3) f64
     use_scan : bool
-        ``True`` (default) runs ``lax.scan`` — one lowering for the whole
-        sweep.  ``False`` runs the identical body in a Python loop, which
-        is the reference the scan is gated against: same arithmetic, same
-        shardings, different control flow, so a disagreement isolates the
-        scan itself.
+        ``True`` (default) runs ``lax.scan`` over k tiles — one lowering
+        for the whole sweep.  ``False`` runs the identical tile body in a
+        Python loop: same arithmetic and collectives, different control
+        flow, so a disagreement isolates the scan itself.
 
     Returns
     -------
     (nk, nb, nb) c128 sharded ``P(None, 'x', 'y')`` — or, for an operator
     with ``ncomp > 0``, ``(nk, ncomp, nb, nb)`` sharded
-    ``P(None, None, 'x', 'y')``.  No rank ever holds a full ``(nb, nb)``
-    tile.  Band extents are the mesh-PADDED ``geom.nb``;
-    :func:`blocks_to_host` is the boundary that trims back to logical.
+    ``P(None, None, 'x', 'y')``.  Band extents are the mesh-PADDED
+    ``geom.nb``; :func:`blocks_to_host` is the boundary that trims back to
+    logical.  The one transient that is not ``1/P`` is a tile's
+    ``(K, ncomp, nb, nb)`` slab partial, priced in :func:`_sweep_body`.
 
-    MASKING IS IMPLICIT AND UNCONDITIONAL, AND THAT IS THE POINT
-    ------------------------------------------------------------
-    Both operands are masked, always.  There is no flag.
-
-    It is TRUE that the mask is sometimes unnecessary: measured (job
-    7888534), with pad G rows at the box corner ``(nx//2, ny//2, nz//2)``,
-    which cannot intersect the sphere, the unmasked result is
-    bit-identical to the masked one (``0.000e+00``).  But the rule is
-    narrower than it looks — a corner sentinel removes the need for a
-    mask **iff both operands' pad entries come from stored sphere
-    coefficients**.  ``phi_G`` at the sentinel is NOT zero (multiplying by
-    V(r) spreads support over the box); what kills the term is the m side
-    being exact zeros.  If either operand is gathered from the BOX,
-    ``(0,0,0)`` = Γ is a real coefficient and the mask is mandatory again.
-
-    So the condition under which the flag could be set safely depends on
-    where BOTH operands came from — which is exactly the kind of
-    padding question the 2026-08-04 SlabIO ruling says a caller must not
-    have to reason about.  The cost of always masking is one multiply per
-    operand per k against a ``(ngkmax,)`` vector.  That is not worth a
-    decision, so there is no decision to make.
-
-    Now priced, so the question stays closed: dropping the bra-side mask
-    entirely is 2.208 s against 2.220 s at b600/P=64, i.e. inside the
-    noise (job 7889241, arms ``vh`` / ``vh_nomask``).  The lowered HLO
-    says why — the mask is fused into the ``kLoop`` copy that already has
-    to lay the bra out as ``c128[nb/p_x, ns·ngkmax]`` for the dot, so it
-    costs a multiply on bytes that were being touched anyway.
+    MASKING IS IMPLICIT AND UNCONDITIONAL
+    -------------------------------------
+    ψ is masked on its G slab before any G-split slot or the contraction
+    sees it, and every band-layout operator masks its own output.  A corner
+    sentinel makes the bra mask redundant only while BOTH operands' pad
+    entries come from stored sphere coefficients — ``phi_G`` at the
+    sentinel is not zero, and ``Z`` is finite there — which is a padding
+    question no caller should have to reason about, so there is no flag.
 
     A BAND WINDOW NEEDS NO ARGUMENT
     -------------------------------
@@ -1558,11 +1619,9 @@ def sweep_matrix_elements(
         sweep_matrix_elements(psi_win, geom=SweepGeometry(
             ..., nb=hi - lo), ...)      ->  (nk, hi-lo, hi-lo)
 
-    and the block comes back at WINDOW indices.  Everything else keys off
-    ``geom``: the band pad, both reshards, the einsum and the output spec.
-    A ``band_window=`` argument would be a second way to say the same thing
-    and one more thing for every call site to get right — the mistake the
-    2026-08-04 SlabIO padding ruling names — so there deliberately is none.
+    and the block comes back at WINDOW indices.  A ``band_window=`` argument
+    would be a second way to say the same thing (the 2026-08-04 SlabIO
+    padding ruling), so there deliberately is none.
 
     READ THE WINDOW; DO NOT SLICE A RESIDENT ψ TO IT.  An eager
     ``psi_G[:, lo:hi]`` on the ``('x','y')``-sharded band axis lowers to a
@@ -1572,6 +1631,8 @@ def sweep_matrix_elements(
     _dft_psi_sphere`` has the evidence).  The loader shards a window as it
     reads it, at exactly this sweep's carrier.
     """
+    from common.shard_map import shard_map
+
     mesh = geom.mesh
     nk = geom.nk
 
@@ -1588,127 +1649,68 @@ def sweep_matrix_elements(
             f"(nk, nb, ns, ngkmax) = "
             f"({nk}, {geom.nb_logical}, {geom.ns}, {geom.ngkmax}), "
             f"got {tuple(psi.shape)}")
+    if (operator.apply is None and operator.apply_g is None
+            and operator.coeffs is None):
+        raise ValueError("sweep_matrix_elements: the operator fills no slot")
+    if (operator.coeffs is None) != (operator.couple is None):
+        raise ValueError(
+            "sweep_matrix_elements: a separable operator needs both "
+            "coeffs and couple")
 
     # THE BAND PAD, applied here so no caller states it (SlabIO ruling,
     # decisions.md 2026-08-04: padding is the infrastructure's business).
     # Pad bands are ψ = 0, so the extra rows AND columns of ⟨m|O|n⟩ are
-    # exactly zero -- they are not "close to zero", they are the product of
-    # an exact zero, so no downstream mask is needed and no tolerance is
-    # spent on them.
+    # exactly zero -- the product of an exact zero, not "close to zero".
     psi = pad_axis(psi, geom.p_prod, axis=1).array
+
+    plan = plan_sweep(geom, operator)
+    band = operator.apply is not None
+    ncomp = int(operator.ncomp)
+    rep = P()
 
     gvecs_j = jnp.asarray(gvecs, dtype=jnp.int32)
     gmask_j = jnp.asarray(gmask, dtype=jnp.float64)
     kvecs_j = jnp.asarray(kvecs, dtype=jnp.float64)
-    bidx_j = jnp.asarray(box_index, dtype=jnp.int32)
-
-    ncomp = int(operator.ncomp)
-    block_sharding = NamedSharding(mesh, geom.spec_block_for(ncomp))
-    # 'kbsg,knsg->kbn' for a scalar operator; the Cartesian one carries a
-    # replicated component axis through the SAME contraction.
-    contraction = 'kbsg,knsg->kbn' if not ncomp else 'kbsg,knsgc->kcbn'
-
+    # The box index is the largest table here (nk·N_r int32, replicated —
+    # 759 MiB at VI3 12x12) and only a transforming operator reads it.
+    bidx_j = jnp.asarray(box_index, dtype=jnp.int32) if band else None
     # The operator's runtime operands.  They are jit ARGUMENTS, so one
     # executable serves every value of them; anything the operator closes
     # over instead is a jaxpr constant and forces a lowering per value.
     op_consts = tuple(jnp.asarray(c) for c in operator.consts)
 
-    def _run(psi, gvecs_, gmask_, bidx_, kvecs_, *consts_):
-        # ONE resident layout.  ⟨m|O|n⟩ contracts every m with every n, so
-        # the bra must reach 'x' and the ket 'y' — that split is the POINT,
-        # not a cost to be optimised away (owner, 2026-08-04) — but BOTH
-        # are reached per k, from this one ``('x','y')`` copy.  Hoisting the
-        # bra's ``P(None,'x',…)`` copy out of the scan was measured slower
-        # and 430 MiB/rank heavier at b600/P=64; see the module docstring.
-        psi_n_XY = jax.lax.with_sharding_constraint(
-            psi, NamedSharding(mesh, geom.spec_sphere_xy))
+    out_spec = geom.spec_block_for(ncomp)
+    body = _sweep_body(geom, operator, plan, use_scan=bool(use_scan))
 
-        def one_k(ik_psi_n, ik_psi_m, gvec, gm, bidx, kvec):
-            """The body.  Identical under scan and under the Python loop."""
-            Opsi = operator.apply(ik_psi_n, gvec, gm, bidx, kvec, *consts_)
+    def _run(psi, gvecs_, gmask_, kvecs_, bidx_, *consts_):
+        ops = {"psi": jax.lax.with_sharding_constraint(
+                   psi, NamedSharding(mesh, geom.spec_sphere_xy)),
+               "kvec": kvecs_, "gvec": gvecs_, "gmask": gmask_}
+        specs = {"psi": geom.spec_sphere_xy, "kvec": rep, "gvec": rep,
+                 "gmask": rep}
+        if band:
+            ops["bidx"] = bidx_
+            specs["bidx"] = rep
+        per_rank = shard_map(
+            body, mesh=mesh,
+            in_specs=(specs,) + (rep,) * len(consts_),
+            out_specs=out_spec, check_vma=False)
+        return per_rank(ops, *consts_)
 
-            # THE PER-K KET COLLECTIVE, expressed as a re-shard rather than
-            # a hand-rolled all-gather: XLA inserts it.  Payload is the
-            # sphere-space operator output, never the r-space box —
-            # 3.4 MiB/rank in, 26.9 MiB/rank out at b600/P=64.
-            #
-            # It lowers to TWO instructions, not one (HLO read at
-            # b600/P=64, job 7889241): a ``collective-permute`` of the whole
-            # shard that transposes the 8×8 rank grid, then an
-            # ``all-gather`` over ``replica_groups=[8,8]<=[8,8]T(1,0)``,
-            # i.e. the STRIDED 'x' groups.  The permute is what makes
-            # ``('x','y') → 'y'`` expressible as a contiguous gather at all,
-            # and it is a global exchange, not an 'x'-local one.  Both are
-            # inside the scan body; the whole per-k collective measures
-            # 0.176 s of the sweep's 2.220 s, and issuing it over the other
-            # mesh axis instead is 0.180 s, i.e. within noise.
-            Opsi_Y = jax.lax.with_sharding_constraint(
-                Opsi, NamedSharding(
-                    mesh, geom.with_comp(geom.spec_sphere_y, ncomp)))
-
-            # THE PER-K BRA COLLECTIVE.  The mask runs FIRST, on the
-            # ``('x','y')`` shard, so the multiply touches nb/(p_x·p_y)
-            # bands and only the masked result is gathered onto 'x'.
-            m_side = ik_psi_m * gm[None, None, None, :].astype(ik_psi_m.dtype)
-            m_side_X = jax.lax.with_sharding_constraint(
-                m_side, NamedSharding(mesh, geom.spec_sphere_x))
-
-            blk = jnp.einsum(contraction,
-                             jnp.conj(m_side_X), Opsi_Y, optimize=True)
-            blk = blk * operator.post
-            return jax.lax.with_sharding_constraint(blk, block_sharding)
-
-        if not use_scan:
-            # Reference control.  Same arithmetic and shardings, Python
-            # control flow — so a scan-vs-loop disagreement is the scan.
-            # It is ALSO 1.33× faster at b600/P=64 (1.674 s against
-            # 2.220 s, job 7889250 arm ``vh_unrollfull``): the scan's while
-            # body serialises the per-k collective against the compute that
-            # XLA can overlap once the trip is unrolled.  Not the default,
-            # because unrolling makes the module — and the compile — linear
-            # in nk, which at a 12×12 deck's nk=144 is the cost
-            # ``gw.v_q_g_flat`` moved to a scan to escape.  Left as the
-            # caller's flag, with the number attached.
-            out = [one_k(psi_n_XY[ik:ik + 1], psi_n_XY[ik:ik + 1],
-                         gvecs_[ik], gmask_[ik], bidx_[ik:ik + 1],
-                         kvecs_[ik])
-                   for ik in range(nk)]
-            return jax.lax.with_sharding_constraint(
-                jnp.concatenate(out, axis=0), block_sharding)
-
-        def body(carry, xs):
-            psi_k, gvec, gm, bidx, kvec = xs
-            # scan strips the leading axis; put the singleton k axis back
-            # so every shape inside the body matches the non-scan path.
-            # ONE ψ operand serves both sides: the bra and the ket start
-            # from the same ``('x','y')`` slice and are resharded inside.
-            blk = one_k(psi_k[None], psi_k[None], gvec, gm, bidx[None], kvec)
-            return carry, blk[0]
-
-        _, H = jax.lax.scan(
-            body, None, (psi_n_XY, gvecs_, gmask_, bidx_, kvecs_), unroll=1)
-        return jax.lax.with_sharding_constraint(H, block_sharding)
-
-    # NO ``donate_argnums``, and that is a decision rather than an omission.
-    # ψ is the only operand big enough to be worth donating — 129 MB global
-    # at the MoS2 4×4 shape, 8 MB/rank at P=16 — and its lifetime is a
-    # property of the CALLER, not of the sweep: ``gw.kin_ion_io`` does
-    # ``del H_kin_ion, psi_G`` on the next line, but
+    # NO ``donate_argnums``: ψ's lifetime belongs to the CALLER —
     # ``gw.sc_iteration._PSI_G_CACHE`` holds the SAME ψ across every
     # density-SC iteration, so a blanket donation would invalidate a buffer
-    # the next iteration reads.  Expressing it would need a per-call-site
-    # flag, and it would not reach the thing that is actually large: the
-    # 180 MiB per-k box lives inside the scan body, where donation of a jit
-    # argument cannot help it (job 7889383's stage table).
+    # the next iteration reads.
     fn = _cached_jit(
         'sweep_matrix_elements',
         (psi.shape, geom.ngkmax, geom.ns, nk, bool(use_scan),
          _operator_key(operator), float(operator.post), ncomp,
-         geom.fft_grid, _sharding_key(psi),
+         geom.fft_grid, tuple(plan), mesh, _sharding_key(psi)[1],
+         None if bidx_j is None else tuple(bidx_j.shape),
          tuple((tuple(int(d) for d in c.shape), str(c.dtype))
                for c in op_consts)),
         lambda: jax.jit(_run))
-    return fn(psi, gvecs_j, gmask_j, bidx_j, kvecs_j, *op_consts)
+    return fn(psi, gvecs_j, gmask_j, kvecs_j, bidx_j, *op_consts)
 
 
 # ---------------------------------------------------------------------------

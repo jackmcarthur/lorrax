@@ -12,9 +12,18 @@ the default is now the PLUS arm.**  This file no longer gates "the
 default is the legacy sign"; it gates that both arms remain reachable
 from a keyword, a CLI flag and a deck key without anybody patching a
 source file, that the default really is the new one at the operator's
-cache key, and that the LEGACY arm is still bit-identical to the
-pre-knob expression -- which is what keeps every ``dipole.h5`` built
-before the flip reproducible.
+cache key, and that the LEGACY arm still reproduces the pre-knob
+expression -- which is what keeps every ``dipole.h5`` built before the
+flip reproducible.
+
+PARITY CLASS (changed 2026-09-24, perf/mtxel-sweep).  The nonlocal term
+is now SEPARABLE -- ``(dc)† E c + c† E dc`` on projections, never a
+G-space ket -- so there is no ket to compare bit for bit.  The legacy arm
+is therefore held to the pre-knob expression at value level (1e-13
+relative: the G sum is reassociated, as every sweep change has done to
+the files), and the two arms' nonlocal blocks are held BIT-EXACTLY to
+each other's negation, which is the part of the old promise that says
+the sign is the only thing the knob touches.
 
 THE FALSE CASE, WHICH IS THE WHOLE POINT.  This project's named failure
 mode is a key that is parsed, stored and never read -- ``x_only`` was a
@@ -156,12 +165,29 @@ def _geom(mesh):
                          ns=NS, nk=NK, cell_volume=1.0)
 
 
-def _apply_one_k(op, psi, gv, gmask, bidx, kvec):
-    """The operator's own output at one k, as the ket it returns."""
-    return np.asarray(jax.device_get(
-        op.apply(jnp.asarray(psi)[None], jnp.asarray(gv),
-                 jnp.asarray(gmask), jnp.asarray(bidx),
-                 jnp.asarray(kvec), *op.consts)))
+def _slot_args(psi, gv, gmask, kvec):
+    """One k on one device, with the WHOLE G list as the slab."""
+    ket_in = jnp.asarray(psi) * jnp.asarray(gmask)[None, None, :]
+    return (ket_in, jnp.asarray(gv), jnp.asarray(gmask), jnp.asarray(kvec))
+
+
+def _nonlocal_block(op, psi, gv, gmask, kvec):
+    """The operator's separable (nonlocal) block at one k, (3, nb, nb)."""
+    args = _slot_args(psi, gv, gmask, kvec)
+    co = op.coeffs(*args, *op.consts)
+    return np.asarray(jax.device_get(op.couple(co, co, *op.consts)))
+
+
+def _matrix_one_k(op, psi, gv, gmask, kvec):
+    """<m|v|n> at one k from the operator's own slots: p's G-slab ket
+    against the masked bra, plus the separable nonlocal block."""
+    args = _slot_args(psi, gv, gmask, kvec)
+    m = jnp.einsum("msg,nsgc->cmn", jnp.conj(args[0]),
+                   op.apply_g(*args, *op.consts), optimize=True)
+    if op.coeffs is not None:
+        co = op.coeffs(*args, *op.consts)
+        m = m + op.couple(co, co, *op.consts)
+    return np.asarray(jax.device_get(m))
 
 
 def _pre_knob_ket(psi, gv, gmask, kvec, bvec, blat, setup, sign):
@@ -230,17 +256,24 @@ def test_default_arm_is_bit_identical_to_the_pre_knob_assembly():
                                  vnl_setup=setup,
                                  vnl_velocity_sign=VNL_VELOCITY_SIGN_SHIPPED)
         for ik in range(NK):
-            got = _apply_one_k(legacy, psi[ik], gv[ik], gmask[ik],
-                               bidx[ik], kvecs[ik])
-            ref = _pre_knob_ket(psi[ik], gv[ik], gmask[ik], kvecs[ik],
-                                bvec, blat, setup,
-                                VNL_VELOCITY_SIGN_SHIPPED)
-            assert np.array_equal(got, ref), (
+            got = _matrix_one_k(legacy, psi[ik], gv[ik], gmask[ik],
+                                kvecs[ik])
+            ref = _mtxel(_pre_knob_ket(psi[ik], gv[ik], gmask[ik],
+                                       kvecs[ik], bvec, blat, setup,
+                                       VNL_VELOCITY_SIGN_SHIPPED),
+                         psi[ik], gmask[ik])
+            rel = np.max(np.abs(got - ref)) / np.max(np.abs(ref))
+            assert rel <= 1e-13, (
                 f"k={ik}: the legacy arm moved off the pre-knob "
-                f"expression by {np.max(np.abs(got - ref)):.3e}.  This "
-                f"assertion is bit-identity and not a tolerance, because "
-                f"the promise it keeps is that every dipole.h5 built "
-                f"before the flip is still reproducible.")
+                f"expression by {rel:.3e} relative; the promise it keeps "
+                f"is that every dipole.h5 built before the flip is still "
+                f"reproducible (to the G-sum reassociation).")
+            # The sign is the ONLY thing the knob touches: the legacy
+            # nonlocal block is the flipped one negated, bit for bit.
+            n_s = _nonlocal_block(legacy, psi[ik], gv[ik], gmask[ik],
+                                  kvecs[ik])
+            n_f = _nonlocal_block(op, psi[ik], gv[ik], gmask[ik], kvecs[ik])
+            assert np.array_equal(n_s, -n_f)
 
 
 def test_the_bit_identity_reference_can_fail():
@@ -264,9 +297,11 @@ def test_the_bit_identity_reference_can_fail():
         geom = _geom(mesh)
         op = dipole_operator(geom, bvec=bvec, blat=blat, vnl_setup=setup,
                              vnl_velocity_sign=VNL_VELOCITY_SIGN_SHIPPED)
-        got = _apply_one_k(op, psi[0], gv[0], gmask[0], bidx[0], kvecs[0])
-        wrong = _pre_knob_ket(psi[0], gv[0], gmask[0], kvecs[0], bvec, blat,
-                              setup, VNL_VELOCITY_SIGN_FLIPPED)
+        got = _matrix_one_k(op, psi[0], gv[0], gmask[0], kvecs[0])
+        wrong = _mtxel(_pre_knob_ket(psi[0], gv[0], gmask[0], kvecs[0],
+                                     bvec, blat, setup,
+                                     VNL_VELOCITY_SIGN_FLIPPED),
+                       psi[0], gmask[0])
         assert not np.array_equal(got, wrong)
         assert np.max(np.abs(got - wrong)) > 1e-6 * np.max(np.abs(got))
 
@@ -296,10 +331,10 @@ def test_flipped_arm_moves_the_matrix_elements():
                                   vnl_velocity_sign=VNL_VELOCITY_SIGN_FLIPPED)
         p_only = dipole_operator(geom, bvec=bvec, blat=blat, vnl_setup=None)
         for ik in range(NK):
-            args = (psi[ik], gv[ik], gmask[ik], bidx[ik], kvecs[ik])
-            m_s = _mtxel(_apply_one_k(shipped, *args), psi[ik], gmask[ik])
-            m_f = _mtxel(_apply_one_k(flipped, *args), psi[ik], gmask[ik])
-            m_p = _mtxel(_apply_one_k(p_only, *args), psi[ik], gmask[ik])
+            args = (psi[ik], gv[ik], gmask[ik], kvecs[ik])
+            m_s = _matrix_one_k(shipped, *args)
+            m_f = _matrix_one_k(flipped, *args)
+            m_p = _matrix_one_k(p_only, *args)
             scale = np.max(np.abs(m_s))
             moved = np.max(np.abs(m_f - m_s))
             assert moved > 1e-3 * scale, (

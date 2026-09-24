@@ -2354,12 +2354,48 @@ def apply_vnl(psi_G, Z, E_super):
     return jnp.einsum('RG,Rsv->vsG', Z, D, optimize=True)
 
 
+def projector_coefficients(psi_G, Z, dZ=None):
+    """``c = Z† ψ`` and ``dc = (∂_K Z)† ψ`` over the G columns given.
+
+    ``psi_G`` is ``(nb, ns, nG)``, ``Z`` ``(R, nG)``, ``dZ`` ``(3, R, nG)``;
+    returns ``c`` ``(R, ns, nb)`` and ``dc`` ``(3, R, ns, nb)`` (``None``
+    without ``dZ``), band LAST.  Linear in the G sum, so a G slab's result
+    is a partial that sums over slabs — the form
+    ``common.mtxel_sweep`` reduces over the mesh.
+    """
+    block = _contract_projector_coefficients(psi_G, Z, dZ, None, None)
+    return block.c, block.dc_cart
+
+
+def vnl_block_from_coefficients(c_m, c_n, E_super):
+    """``⟨m|V_NL|n⟩ = Σ_{R,s} c*_{Rsm} (E c)_{Rsn}`` from projections.
+
+    ``c_m`` / ``c_n`` are :func:`projector_coefficients` restricted to the
+    bra and the ket bands; returns ``(nb_m, nb_n)``.
+    """
+    D = apply_projector_coupling(c_n, E_super)
+    return jnp.einsum('Rsm,Rsn->mn', jnp.conj(c_m), D, optimize=True)
+
+
+def vnl_velocity_block_from_coefficients(c_m, dc_m, c_n, dc_n, E_super):
+    """``⟨m|∂V_NL/∂K_cart|n⟩ = (dc_m)† E c_n + c_m† E dc_n``.  ``(3, nb_m, nb_n)``.
+
+    ``∂V_NL/∂K = (∂Z) E Z† + Z E (∂Z)†`` contracted on both sides, i.e. the
+    bra contraction of :func:`apply_vnl_velocity_to_ket` without
+    materialising its ``(3, nb, ns, nG)`` ket.
+    """
+    D = apply_projector_coupling(c_n, E_super)
+    dD = jnp.stack([apply_projector_coupling(dc_n[j], E_super)
+                    for j in range(int(dc_n.shape[0]))])
+    return (jnp.einsum('jRsm,Rsn->jmn', jnp.conj(dc_m), D, optimize=True)
+            + jnp.einsum('Rsm,jRsn->jmn', jnp.conj(c_m), dD, optimize=True))
+
+
 @jax.jit
 def vnl_matrix(psi_G, Z, E_super):
     """V_NL matrix elements <m|V_NL|n>.   Returns (nb, nb)."""
-    P = jnp.einsum('RG,nsG->Rsn', jnp.conj(Z), psi_G, optimize=True)
-    D = apply_projector_coupling(P, E_super)
-    return jnp.einsum('Rsm,Rsn->mn', jnp.conj(P), D, optimize=True)
+    c, _ = projector_coefficients(psi_G, Z)
+    return vnl_block_from_coefficients(c, c, E_super)
 
 
 @jax.jit
@@ -2398,13 +2434,5 @@ def vnl_velocity_matrix(psi_G, Z, dZ, E_super):
     ``(3, nb, nspinor, nG)`` output.  The apply-to-ket endpoint remains the
     owner for finite-q matrix elements, where the bra is a different state.
     """
-    coefficients = _contract_projector_coefficients(
-        psi_G, Z, dZ, None, E_super)
-    D, dD, _ = _coupled_projector_coefficients(coefficients)
-    return (
-        jnp.einsum(
-            'jRsm,Rsn->jmn', jnp.conj(coefficients.dc_cart), D,
-            optimize=True)
-        + jnp.einsum(
-            'Rsm,jRsn->jmn', jnp.conj(coefficients.c), dD,
-            optimize=True))
+    c, dc = projector_coefficients(psi_G, Z, dZ)
+    return vnl_velocity_block_from_coefficients(c, dc, c, dc, E_super)
