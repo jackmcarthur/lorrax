@@ -396,14 +396,11 @@ def _zeta_fit_provenance(*, wfn, meta, cfg, band_range_left, band_range_right,
 		#       vice versa.  This is the RESOLVED deck value: gw_config
 		#       already demotes `auto`→`off` on a CPU backend, so the
 		#       recorded string is what the fit ran.
-		#   transverse_solver_kind   — what `_resolve_solver_kind_transverse`
-		#       actually returned ('lu' | 'scalapack_lu' | 'cusolvermp_lu').  Recorded IN ADDITION to
-		#       the two knobs above because on a GPU mesh `auto` resolves
-		#       by mesh shape, and those two resolutions are genuinely
-		#       different gauges.  This is the one place a device-count
-		#       dependence is deliberately admitted into the stamp: the
-		#       exclusion at the top of this docstring covers quantities
-		#       ζ is INVARIANT under, and this is not one of them.
+		#   transverse_solver_kind   — the factor the fit ran.  Route G
+		#       (2026-09-24) applies a whole-tile factor per G tile, so it
+		#       is always 'lu'; a stamp from the r-tile era that recorded a
+		#       provider LU ('scalapack_lu' | 'cusolvermp_lu', a different
+		#       gauge) therefore refits.
 		# All four collapse to None on a non-bispinor deck (no transverse
 		# channel ⇒ inert), so a charge-only rerun over a pre-2026-08-04
 		# stamp reuses under the legacy-missing-key rule below.
@@ -1433,7 +1430,6 @@ def _resolve_zeta_fit_contract(
 				"Bispinor calculation requires centroids_file_current in "
 				"cohsex.in (set it to a current-density kmeans output).")
 		from file_io.centroids import load_centroids as _load_cent_pf
-		from isdf.core import _resolve_solver_kind_transverse
 		from runtime.padding import padded_mu_extent
 		_, cent_T_np, n_rmu_T = _load_cent_pf(
 			cfg.paths.centroids_file_current, meta.fft_grid)
@@ -1447,9 +1443,10 @@ def _resolve_zeta_fit_contract(
 		meta_transverse = replace(
 			meta, n_rmu=int(n_rmu_T), nspinor=4, npol=4, mu_basis=basis_T,
 			n_rmu_padded=basis_T.n_packed)
-		solver_kind_T = _resolve_solver_kind_transverse(
-			mesh_xy, cfg.backend.distributed_lu,
-			n_rmu_logical=meta_transverse.mu_solve_extent)
+		# Route G factors every current channel with the whole-tile local
+		# pivoted LU (gw.isdf_fitting.fit_zeta_to_h5): that is the kind the
+		# stamp records, whatever provider LU the mesh would resolve.
+		solver_kind_T = 'lu'
 		meta_transverse.sys_dim = meta.sys_dim
 		meta_transverse.bispinor = True
 		transverse_identity = {
@@ -2117,7 +2114,6 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
              zeta_contract=None,
              k_unfold_plan=None, psi_nmu_parent=None, psi_mun_parent=None):
 	"""Fit missing charge/current ζ channels from their typed parents, preserving independent reuse; see docs/architecture/zeta_fit_face_psi_cct.md."""
-	from gw.isdf_fitting import fit_zeta_to_h5
 	from common.gamma_matrices import set_gamma_contract_mode
 	representation = resolve_four_current_representation(
 		cfg.bispinor, cfg.bispinor_gw)
