@@ -164,6 +164,7 @@ def spin_moment_ibz(wfn, sym, *, nocc):
     Pad bands and pad G slots of the loader are exact zeros.
     """
     import jax.numpy as jnp
+    from common.collectives import gather_to_host
     from common.wfn_layout import band_sphere_spec
 
     w_ibz = np.asarray(wfn.kweights, dtype=np.float64)
@@ -177,7 +178,7 @@ def spin_moment_ibz(wfn, sym, *, nocc):
         sz = jnp.sum(jnp.abs(up) ** 2 - jnp.abs(dn) ** 2, axis=(1, 2))
         return jnp.stack((2.0 * overlap.real, 2.0 * overlap.imag, sz), 1)
 
-    per_k = np.asarray(_spin(psi), dtype=np.float64)          # (nrk, 3)
+    per_k = np.asarray(gather_to_host(_spin(psi)), dtype=np.float64)
     del psi
     active_rows = np.asarray(sym.active_symmetry_rows, dtype=np.int32)
     action = sym.cartesian_action(active_rows, axial=True, time_odd=True)
