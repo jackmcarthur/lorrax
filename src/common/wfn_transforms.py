@@ -592,6 +592,176 @@ def to_rpoints_planes_inner(
     return slab
 
 
+def sphere_plane_columns(sphere_idx, fft_grid, axis: int):
+    """Static tables of F-mode: the ζ sphere's (b,c) columns and axis coordinates.
+
+    ``sphere_idx`` is the fit's ``(n_q, ngkmax)`` flat box index table.
+    Returns ``(columns (n_col,), s_coords (n_s,), cyl_of_sphere (n_q, ngkmax))``:
+    the in-plane cells the sphere projects onto (union over q), the axis
+    coordinates it occupies, and each sphere slot's flat index
+    ``s·n_col + col`` in the ``(n_s, n_col)`` cylinder.  Host NumPy.
+    """
+    sph = np.asarray(sphere_idx, dtype=np.int64)
+    a, inp = plane_split(sph, fft_grid, axis)
+    columns = np.unique(inp)
+    s_coords = np.unique(a)
+    cyl = (np.searchsorted(s_coords, a) * columns.size
+           + np.searchsorted(columns, inp)).astype(np.int32)
+    return columns.astype(np.int32), s_coords.astype(np.int32), cyl
+
+
+def rchunk_to_plane_columns(
+    rchunk: jax.Array,
+    *,
+    mesh: Mesh,
+    fft_grid: Sequence[int],
+    r_indices: jax.Array,
+    planes: jax.Array,
+    plane_axis: int,
+    columns: np.ndarray,
+    qvec_frac: np.ndarray | None = None,
+    norm: str = "backward",
+    chunk_size: int | None = None,
+) -> jax.Array:
+    """F-mode forward half: one tile's ζ(r) → its planes' 2D FFT on the sphere's columns.
+
+    ``rchunk`` ``(n_q, n_mu, R)`` at ``P(None, ('x','y'), None)`` (the solve's
+    output layout).  Returns ``F (n_p, n_q, n_mu, n_col)`` at
+    ``P(None, None, ('x','y'), None)``: row ``p`` is this tile's contribution
+    to plane ``planes[p]``, 2D-transformed and kept only on ``columns``.
+    Summing tiles per plane and then :func:`plane_columns_to_sphere` equals
+    :func:`accumulate_rchunk_to_gflat` (the resident path) up to roundoff:
+    the axis DFT is simply deferred until every plane is complete, so no
+    all-G accumulator is ever live.  Same Bloch phase, plane gather and
+    ``local_fftn3`` as the resident plane path.
+    """
+    fft_grid_t = tuple(int(s) for s in fft_grid)
+    nx, ny, nz = fft_grid_t
+    n_rtot = nx * ny * nz
+    n_q, n_mu_pad, r_len = (int(v) for v in rchunk.shape)
+    p_prod = spec_divisor(mesh, P(None, ('x', 'y'), None), axis=1)
+    n_mu_local = n_mu_pad // p_prod
+    N = n_q * n_mu_local
+    cs = max(1, min(int(chunk_size or N), N))
+    n_chunks = -(-N // cs)
+    pad_N = n_chunks * cs - N
+    n_a, (n_b, n_c), _ = _plane_geometry(fft_grid_t, plane_axis)
+    ps = n_b * n_c
+    n_p = int(np.shape(planes)[0])
+    cols = np.asarray(columns, dtype=np.int32)
+    n_col = int(cols.size)
+    norm2, _ = _norm_split(norm, n_a, ps, inverse=False)
+    key = (_mesh_key_local(mesh), fft_grid_t, n_q, n_mu_pad, r_len, n_p, n_col,
+           int(plane_axis), norm, cs, hash(cols.tobytes()),
+           None if qvec_frac is None
+           else hash(np.asarray(qvec_frac, np.float64).tobytes()))
+
+    def build():
+        cols_d = jnp.asarray(cols)
+        if qvec_frac is not None:
+            qv = jnp.asarray(np.asarray(qvec_frac), dtype=jnp.float64)
+            _ph = lambda q_axis, n: jnp.exp(
+                -2j * jnp.pi * q_axis[:, None] * (jnp.arange(n) / n)[None, :])
+            phx, phy, phz = _ph(qv[:, 0], nx), _ph(qv[:, 1], ny), _ph(qv[:, 2], nz)
+
+        @partial(shard_map, mesh=mesh,
+                 in_specs=(P(None, ('x', 'y'), None), P(), P()),
+                 out_specs=P(None, None, ('x', 'y'), None), check_vma=False)
+        def _kernel(rch_, r_, planes_):
+            rch_flat = rch_.reshape(N, r_len)
+            if pad_N:
+                rch_flat = jnp.pad(rch_flat, ((0, pad_N), (0, 0)))
+            stack_idx, _ = _tile_plane_slots(r_, planes_, fft_grid_t, plane_axis)
+            from_slab = jnp.full((n_p * ps,), r_len, dtype=jnp.int32).at[
+                stack_idx].set(jnp.arange(r_len, dtype=jnp.int32), mode='drop',
+                               unique_indices=True)
+            safe = jnp.clip(r_, 0, n_rtot - 1)
+            rx, ry, rz = safe // (ny * nz), (safe // nz) % ny, safe % nz
+
+            def body(out, i):
+                i0 = i * cs
+                sub = jax.lax.dynamic_slice_in_dim(rch_flat, i0, cs, axis=0)
+                if qvec_frac is not None:
+                    q_row = jnp.clip((i0 + jnp.arange(cs)) // n_mu_local, 0, n_q - 1)
+                    sub = (sub * phx[q_row][:, rx] * phy[q_row][:, ry]
+                           * phz[q_row][:, rz])
+                buf = jnp.take(jnp.concatenate(
+                    [sub, jnp.zeros((cs, 1), sub.dtype)], axis=-1),
+                    from_slab, axis=-1)
+                F = local_fftn3(buf.reshape(cs, n_p, n_b, n_c), axes=(-2, -1),
+                                norm=norm2).reshape(cs, n_p, ps)
+                return jax.lax.dynamic_update_slice_in_dim(
+                    out, jnp.take(F, cols_d, axis=-1), i0, axis=0), None
+
+            out, _ = jax.lax.scan(
+                body, jnp.zeros((n_chunks * cs, n_p, n_col), rch_.dtype),
+                jnp.arange(n_chunks, dtype=jnp.int32), unroll=1)
+            out = out[:N].reshape(n_q, n_mu_local, n_p, n_col)
+            return jnp.transpose(out, (2, 0, 1, 3))
+
+        return jax.jit(_kernel)
+
+    fn = _cached_jit('rchunk_to_plane_columns', key, build)
+    return fn(rchunk, jnp.asarray(r_indices, dtype=jnp.int32),
+              jnp.asarray(planes, dtype=jnp.int32))
+
+
+def plane_columns_to_sphere(
+    F: jax.Array,
+    *,
+    mesh: Mesh,
+    fft_grid: Sequence[int],
+    plane_axis: int,
+    s_coords: np.ndarray,
+    cyl_of_sphere: np.ndarray,
+    norm: str = "backward",
+) -> jax.Array:
+    """F-mode final pass for one q-tile: the axis DFT from every plane onto the sphere.
+
+    ``F (n_a, q_t, n_mu, n_col)`` at ``P(None, None, ('x','y'), None)`` holds
+    every plane of the q-tile (its ``[a]`` row is plane ``a``);
+    ``cyl_of_sphere (q_t, ngkmax)`` the tile's rows of
+    :func:`sphere_plane_columns`.  Returns ``ζ (q_t, n_mu, ngkmax)`` at
+    ``P(None, ('x','y'), None)``:
+    ``ζ[q, μ, G] = Σ_a exp(-2πi g_a a / n_a)·F[a, q, μ, col(G)]``, formed as a
+    cylinder GEMM over the axis and one gather.  Pad sphere slots return the
+    cylinder cell of the pad index, exactly like the resident writer's
+    ``sphere_idx`` padding, and are masked by the same caller step.
+    """
+    fft_grid_t = tuple(int(s) for s in fft_grid)
+    n_a, (n_b, n_c), _ = _plane_geometry(fft_grid_t, plane_axis)
+    _, a_scale = _norm_split(norm, n_a, n_b * n_c, inverse=False)
+    s_c = np.asarray(s_coords, dtype=np.float64)
+    E = (np.exp(-2j * np.pi * np.arange(n_a)[:, None] * s_c[None, :] / n_a)
+         * a_scale)                                           # (n_a, n_s)
+    n_s = int(s_c.size)
+    n_col = int(F.shape[-1])
+    key = (_mesh_key_local(mesh), tuple(int(v) for v in F.shape), n_s,
+           int(plane_axis), norm, hash(np.asarray(cyl_of_sphere).tobytes()))
+
+    def build():
+        E_d = jnp.asarray(E)
+        cyl_d = jnp.asarray(np.asarray(cyl_of_sphere, dtype=np.int32))
+
+        @partial(shard_map, mesh=mesh,
+                 in_specs=(P(None, None, ('x', 'y'), None),),
+                 out_specs=P(None, ('x', 'y'), None), check_vma=False)
+        def _kernel(F_):
+            cyl = jnp.einsum('aqmc,as->qmsc', F_, E_d.astype(F_.dtype))
+            cyl = cyl.reshape(cyl.shape[0], cyl.shape[1], n_s * n_col)
+            return jnp.take_along_axis(cyl, cyl_d[:, None, :], axis=-1)
+
+        return jax.jit(_kernel)
+
+    return _cached_jit('plane_columns_to_sphere', key, build)(F)
+
+
+def _mesh_key_local(mesh):
+    """Hashable mesh identity for this module's kernel caches."""
+    return (tuple(mesh.axis_names), tuple(int(v) for v in mesh.devices.shape),
+            tuple(int(d.id) for d in mesh.devices.flat))
+
+
 def to_rchunk_inner(
     psi: jax.Array,
     g_index: jax.Array,
