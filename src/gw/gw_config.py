@@ -3584,9 +3584,16 @@ def uses_bare_transverse_shared_pole(config) -> bool:
 
 
 def uses_bare_tt_gamma_head(config) -> bool:
-    """Insert the bare transverse Gamma average into hybrid TT V tiles."""
-    return (uses_bare_transverse_shared_pole(config)
-            and config.head.correction is not HeadCorrection.OFF)
+    """Insert the bare transverse Gamma average into bare-TT V tiles."""
+    hybrid = (uses_bare_transverse_shared_pole(config)
+              and config.head.correction is not HeadCorrection.OFF)
+    bare_x = (bool(config.bispinor)
+              and config.compute_mode is ComputeMode.X_ONLY
+              and coerce_bispinor_gw_mode(config.bispinor_gw)
+                  is BispinorGWMode.BARE_TRANSVERSE
+              and config.head.correction is HeadCorrection.FULL
+              and int(config.sys_dim) in (2, 3))
+    return hybrid or bare_x
 
 
 def uses_direct_bispinor_shared_pole_head(config) -> bool:
@@ -3620,6 +3627,10 @@ def incumbent_bispinor_head_record(config) -> tuple[str, str]:
                         "on the four-spinor charge carrier; no wing/body fold; "
                         "bare transverse Gamma exchange")
         return "", "no-local-fields head outside the direct four-current route"
+    if (config.compute_mode is ComputeMode.X_ONLY
+            and uses_bare_tt_gamma_head(config)):
+        return "", ("bare charge and TT Gamma-cell averages in V; "
+                    "no screened W")
     # With head_correction = full, the CHARGE head is band-diagonal and
     # there is NO transverse q=Gamma head on this route now that the overlay
     # has no deck key -- say so rather than let a bulk number look complete.
@@ -3683,6 +3694,12 @@ def refuse_unsupported_bispinor_gw(config) -> None:
     """Validate four-current modes and require live direct fields for QSGW; see docs/architecture/decisions.md."""
     mode = coerce_bispinor_gw_mode(
         getattr(config, "bispinor_gw", BispinorGWMode.BARE_TRANSVERSE))
+    if (config.compute_mode is ComputeMode.X_ONLY
+            and uses_bare_tt_gamma_head(config) and bool(config.restart)):
+        raise ValueError(
+            "GATE bare_tt_gamma_restart_unstamped: bare bispinor exchange "
+            "needs a fresh V with its TT Gamma-cell average; restart V "
+            "does not stamp that choice. Set restart=false.")
     shared_pole_direct = (uses_direct_bispinor_shared_pole_head(config)
                           or (uses_bare_transverse_shared_pole(config)
                               and config.head.correction is HeadCorrection.NO_LOCAL_FIELDS))
@@ -4472,11 +4489,12 @@ def validate_material_inputs(config, material_class):
                 "splits bands by a 0/1 step at a derived Fermi level "
                 "(gw.ppm_sigma.assert_gapped_occupations_for_ppm)\n"
                 "  doc:  docs/input_reference.md, compute_mode")
-        if config.compute_mode is not ComputeMode.MPA:
+        if config.compute_mode not in (ComputeMode.MPA, ComputeMode.X_ONLY):
             raise ValueError(
                 "GATE fractional_occupations_require_mpa: WFN occupations "
                 f"identify a metal, but compute_mode={config.compute_mode.value}; "
-                "use compute_mode=mpa, the occupation-aware path.")
+                "use compute_mode=mpa for screened GW or "
+                "compute_mode=x_only for bare exchange.")
         if (config.sc.head_update in METAL_HEAD_UPDATES
                 and not uses_metal_direct_drude_head(config)):
             raise ValueError(
