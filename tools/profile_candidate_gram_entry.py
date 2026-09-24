@@ -15,6 +15,12 @@ import json
 import sys
 from pathlib import Path
 
+# x64 / JAX_PLATFORMS from the runtime owner before the probe or isdf pulls
+# jax in; the lorrax_A module is not a place for runtime policy.
+from runtime import set_default_env
+
+set_default_env()
+
 
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()

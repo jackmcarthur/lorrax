@@ -17,7 +17,13 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-import jax
+# x64 / JAX_PLATFORMS from the runtime owner before jax is imported; the
+# lorrax_A module is not a place for runtime policy.
+from runtime import set_default_env
+
+set_default_env()
+
+import jax  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
