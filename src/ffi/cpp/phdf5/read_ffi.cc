@@ -907,6 +907,72 @@ static ffi::Error ReadKchunkDispatch(
 //  ngkmax) gives disjoint per-k slabs even when ngk varies.
 // ────────────────────────────────────────────────────────────────────────────
 
+// Row-major element runs ``emit(offset, length)`` of a union of boxes in a
+// C-order array of ``shape``.  Box b sits at index ``off[b][wax]`` of the
+// window axis ``wax`` (ascending in b, one index each).  Row-major order over
+// the union is: every outer index (dims before ``wax``) in order, then every
+// box that contains it in order, then that box's inner block.  This is the
+// order HDF5 walks the same memory selection in, so it is the order a packed
+// H5Dread fills.  (HDF5's own H5Ssel_iter_get_seq_list does the same walk at
+// ~1 ms per run on an OR'd selection; VI3 P4, 2850 runs: 2.75 s.)
+template <typename Emit>
+static void for_each_union_run(const std::vector<hsize_t>& shape, int wax,
+                               const std::vector<std::vector<hsize_t>>& off,
+                               const std::vector<std::vector<hsize_t>>& cnt,
+                               Emit&& emit)
+{
+    const int N = (int)shape.size();
+    if (off.empty()) return;
+    std::vector<hsize_t> stride((size_t)N, 1);
+    for (int d = N - 2; d >= 0; --d) stride[d] = stride[d + 1] * shape[d + 1];
+    std::vector<hsize_t> lo((size_t)wax), hi((size_t)wax), o((size_t)wax);
+    for (int d = 0; d < wax; ++d) {
+        lo[d] = off[0][d];
+        hi[d] = off[0][d] + cnt[0][d];
+        for (size_t b = 1; b < off.size(); ++b) {
+            lo[d] = std::min(lo[d], off[b][d]);
+            hi[d] = std::max(hi[d], off[b][d] + cnt[b][d]);
+        }
+        o[d] = lo[d];
+    }
+    std::vector<hsize_t> j((size_t)N, 0);
+    for (;;) {
+        hsize_t base = 0;
+        for (int d = 0; d < wax; ++d) base += o[d] * stride[d];
+        for (size_t b = 0; b < off.size(); ++b) {
+            bool in = true;
+            for (int d = 0; d < wax && in; ++d)
+                in = o[d] >= off[b][d] && o[d] < off[b][d] + cnt[b][d];
+            if (!in) continue;
+            const hsize_t kbase = base + off[b][wax] * stride[wax];
+            if (wax == N - 1) { emit(kbase, (hsize_t)1); continue; }
+            // Innermost partial dim t: dims past it are whole rows.
+            int t = wax + 1;
+            for (int d = N - 1; d > wax; --d)
+                if (cnt[b][d] != shape[d] || off[b][d] != 0) { t = d; break; }
+            const hsize_t run = cnt[b][t] * stride[t];
+            for (int d = wax + 1; d < t; ++d) j[d] = off[b][d];
+            for (;;) {
+                hsize_t at = kbase + off[b][t] * stride[t];
+                for (int d = wax + 1; d < t; ++d) at += j[d] * stride[d];
+                emit(at, run);
+                int d = t - 1;
+                for (; d > wax; --d) {
+                    if (++j[d] < off[b][d] + cnt[b][d]) break;
+                    j[d] = off[b][d];
+                }
+                if (d == wax) break;
+            }
+        }
+        int d = wax - 1;
+        for (; d >= 0; --d) {
+            if (++o[d] < hi[d]) break;
+            o[d] = lo[d];
+        }
+        if (d < 0) break;
+    }
+}
+
 // Mirrors write_ffi.cc's async_worker.  Runs on ``ctx->writer_thread``;
 // picks up the next queued read task, does the H5Dread + async H2D, and
 // fires the caller's Promise.  Shares the single ``ctx->writer_thread``
@@ -1045,7 +1111,6 @@ static void async_read_kchunk_union_worker(
     //    is read while chunk c's copies drain.  Pad cells are zeroed on the
     //    output itself.
     constexpr size_t kUnionChunkBytes = size_t{256} << 20;
-    constexpr size_t kSeqBatch = 4096;
     const hsize_t n_rows = mem_shape[0];
     size_t row_bytes = element_size;
     for (int d = 1; d < N_out; ++d) row_bytes *= (size_t)mem_shape[d];
@@ -1116,19 +1181,19 @@ static void async_read_kchunk_union_worker(
 
     std::vector<hsize_t> f_off(N_file), f_cnt(N_file);
     std::vector<hsize_t> m_off(N_out), m_cnt(N_out);
-    std::vector<hsize_t> seq_off(kSeqBatch);
-    std::vector<size_t> seq_len(kSeqBatch);
+    std::vector<std::vector<hsize_t>> box_off, box_cnt;
     hsize_t npts_total = 0;
     size_t n_chunks = 0;
     double sel_ms = 0.0, read_ms = 0.0, h2d_ms = 0.0;
-    double wait_ms = 0.0, iter_ms = 0.0;
-    size_t n_seq_total = 0;
+    size_t n_runs = 0;
     bool copies_in_flight = false;
     for (hsize_t r0 = 0; r0 < n_rows; r0 += rows_per_chunk, ++n_chunks) {
         const hsize_t r1 = std::min<hsize_t>(n_rows, r0 + rows_per_chunk);
         auto t_c0 = now();
         H5Sselect_none(filespace);
         H5Sselect_none(memspace);
+        box_off.clear();
+        box_cnt.clear();
         for (int k = 0; k < n_kchunk; ++k) {
             int fi = 0;
             for (int d = 0; d < N_out; ++d) {
@@ -1170,6 +1235,8 @@ static void async_read_kchunk_union_worker(
                 fail_spaces(ffi::ErrorCode::kInternal, os.str());
                 return;
             }
+            box_off.push_back(m_off);
+            box_cnt.push_back(m_cnt);
         }
         const hssize_t npts_file = H5Sget_select_npoints(filespace);
         const hssize_t npts_mem  = H5Sget_select_npoints(memspace);
@@ -1214,52 +1281,47 @@ static void async_read_kchunk_union_worker(
         // the next chunk's H5Dread is about to fill.
         if (copies_in_flight) cudaEventSynchronize(ctx->h2d_event);
 #endif
-        auto t_cw = now();
-        wait_ms += ms(t_c2, t_cw);
         if (npts_file > 0) {
-            hid_t it = H5Ssel_iter_create(memspace, element_size, 0);
-            if (it < 0) {
-                fail_spaces(ffi::ErrorCode::kInternal,
-                    "phdf5 read_kchunk_union: H5Ssel_iter_create failed");
-                return;
-            }
-            size_t cursor = 0;
-            for (;;) {
-                size_t nseq = 0, nelm = 0;
-                auto t_i0 = now();
-                const herr_t ist = H5Ssel_iter_get_seq_list(
-                    it, kSeqBatch, SIZE_MAX, &nseq, &nelm, seq_off.data(),
-                    seq_len.data());
-                iter_ms += ms(t_i0, now());
-                n_seq_total += nseq;
-                if (ist < 0) {
-                    H5Ssel_iter_close(it);
-                    fail_spaces(ffi::ErrorCode::kInternal,
-                        "phdf5 read_kchunk_union: H5Ssel_iter_get_seq_list failed");
+            // Adjacent runs merge into one copy.
+            size_t cursor = 0, run_at = 0, run_len = 0;
+            bool copy_ok = true;
+            std::string copy_err;
+            auto flush = [&]() {
+                if (run_len == 0 || !copy_ok) return;
+                char* dst = static_cast<char*>(d_dst) + run_at;
+#ifdef LORRAX_FFI_NO_CUDA
+                std::memcpy(dst, buf + cursor, run_len);
+#else
+                cudaError_t ce = cudaMemcpyAsync(
+                    dst, buf + cursor, run_len, cudaMemcpyHostToDevice,
+                    ctx->stream);
+                if (ce != cudaSuccess) {
+                    copy_ok = false;
+                    copy_err = cudaGetErrorString(ce);
+                }
+#endif
+                cursor += run_len;
+                ++n_runs;
+                run_len = 0;
+            };
+            for_each_union_run(mem_shape, kchunk_axis, box_off, box_cnt,
+                               [&](hsize_t at, hsize_t len) {
+                const size_t a = (size_t)at * element_size;
+                const size_t l = (size_t)len * element_size;
+                if (run_len != 0 && run_at + run_len == a) {
+                    run_len += l;
                     return;
                 }
-                if (nseq == 0) break;
-                for (size_t i = 0; i < nseq; ++i) {
-                    char* dst = static_cast<char*>(d_dst) + seq_off[i];
-#ifdef LORRAX_FFI_NO_CUDA
-                    std::memcpy(dst, buf + cursor, seq_len[i]);
-#else
-                    cudaError_t ce = cudaMemcpyAsync(
-                        dst, buf + cursor, seq_len[i],
-                        cudaMemcpyHostToDevice, ctx->stream);
-                    if (ce != cudaSuccess) {
-                        H5Ssel_iter_close(it);
-                        fail_spaces(ffi::ErrorCode::kInternal,
-                            std::string("phdf5 read_kchunk_union: "
-                                        "cudaMemcpyAsync: ") +
-                            cudaGetErrorString(ce));
-                        return;
-                    }
-#endif
-                    cursor += seq_len[i];
-                }
+                flush();
+                run_at = a;
+                run_len = l;
+            });
+            flush();
+            if (!copy_ok) {
+                fail_spaces(ffi::ErrorCode::kInternal,
+                    "phdf5 read_kchunk_union: cudaMemcpyAsync: " + copy_err);
+                return;
             }
-            H5Ssel_iter_close(it);
             if (cursor != chunk_bytes) {
                 std::ostringstream os;
                 os << "phdf5 read_kchunk_union: scattered " << cursor
@@ -1300,13 +1362,13 @@ static void async_read_kchunk_union_worker(
         std::fprintf(stderr,
             "[phdf5 kchunk-union r0] n_k=%d bytes/rank=%zu chunks=%zu "
             "rows/chunk=%llu staging=%zu  prev_h2d_wait=%.2f  zero=%.2f  "
-            "select=%.2f  read=%.2f  scatter=%.2f (wait=%.2f iter=%.2f "
-            "seqs=%zu)  total=%.2f (ms)  [selected_elts=%lld, independent]\n",
+            "select=%.2f  read=%.2f  scatter=%.2f (runs=%zu)  total=%.2f (ms)  "
+            "[selected_elts=%lld, independent]\n",
             n_kchunk, bytes, n_chunks, (unsigned long long)rows_per_chunk,
             2 * chunk_cap,
             ms(t0, t_prev_h2d_done),
             ms(t_prev_h2d_done, t_pin),
-            sel_ms, read_ms, h2d_ms, wait_ms, iter_ms, n_seq_total,
+            sel_ms, read_ms, h2d_ms, n_runs,
             ms(t0, t_h2d),
             (long long)npts_total);
     }
