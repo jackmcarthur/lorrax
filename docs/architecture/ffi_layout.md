@@ -1,25 +1,15 @@
 # The FFI layer
 
-How LORRAX reaches vendor libraries: what the layers are, what each machine
-provides, which knobs decide correctness rather than speed, and how to tell
-the failure modes apart.
+How LORRAX reaches vendor libraries: the layers, the two build legs and their
+acceptance gates, what each machine provides, which cuSOLVERMp selects which
+communication path, which FFT engine the host library binds, the C++ phdf5
+defaults, and how to tell the native-layer failure modes apart.
 
-> **Verification scope.** Every `file:line` and every default below was read
-> from source on **Perlmutter**, on **2026-08-06**. The first pass read
-> `886139f`; the page was then rebased onto `8789131` and the statements in
-> §§3–8 that a commit in between could have moved were **re-read at
-> `8789131`** the same day — the stripe defaults, the CAL option default, the
-> `run_shifter.sh` library path, the DFTI/FFTW3 counts, the `phdf5` context
-> defaults and the three shim call-site counts. Statements marked *(Frontera,
-> unverified 2026-08-06)* were not checked on Frontera and must be re-read
-> there before being relied on. Line numbers drift: they are provided so you
-> can find the code, not so you can quote them. **Read the file.**
->
-> This page owns the *native boundary*. It does not own owner rulings
-> ([`decisions.md`](decisions.md)), the SlabIO contract and its measurements
-> ([`slab_io.md`](slab_io.md)), or knob spellings and defaults
-> ([`../dev/env_vars.md`](../dev/env_vars.md)). See the
-> [register](../index.md#register).
+This page owns the *native boundary*. Owner rulings are in
+[`decisions.md`](decisions.md), the SlabIO contract in
+[`slab_io.md`](slab_io.md), knob spellings and defaults in
+[`../dev/env_vars.md`](../dev/env_vars.md). See the
+[register](../index.md#register).
 
 ---
 
@@ -29,700 +19,446 @@ Five, outermost first. Each one can refuse; none silently substitutes.
 
 | # | Layer | Lives in | Job |
 |---|---|---|---|
-| 1 | **Consumer** | `src/gw/`, `src/file_io/`, `src/bse/`, … | states *logical* intent — shapes, not strides |
-| 2 | **Service facade** (Python) | `src/ffi/io.py`, `fft.py`, `gemm.py`, `linalg/` | owns the gate grammar, builds the descriptor, picks a backend |
-| 3 | **Gate** | `src/ffi/gate.py` | announce-or-refuse; an explicit request that cannot be honoured **refuses**, never downgrades |
-| 4 | **XLA FFI custom call** | `src/ffi/common/ffi_loader.py` | resolves handler symbols out of the built `.so` |
-| 5 | **C++ handler + vendor library** | `src/ffi/cpp/<vendor>/` | the actual MPI-IO / BLAS / FFT / solver call |
+| 1 | **Consumer** | `src/gw/`, `src/file_io/`, `src/bse/`, … | states *logical* intent: shapes, not strides |
+| 2 | **Service facade** (Python) | `src/ffi/io.py`, `fft.py`, `gemm.py`; `services/distrib_la/` | owns the call grammar, builds the descriptor, picks the backend |
+| 3 | **Gate** | `src/ffi/gate.py` (env dials); `distrib_la.resolve` (deck choices); `ffi.fft.require_kconv` (router) | announce-or-refuse: an explicit request that cannot be honoured refuses, never downgrades |
+| 4 | **XLA FFI custom call** | `src/ffi/common/ffi_loader.py`, `distrib_la.loader`, both over `lxkit.native_provider` | locates and attests the `.so`, registers its handler symbols |
+| 5 | **C++ handler + vendor library** | `src/ffi/cpp/<vendor>/` | the MPI-IO / BLAS / FFT / solver call |
 
-The rule that makes this tractable: **a vendor dependency enters only
-through a facade with runtime resolution and an announced refusal.** Since
-the 2026-08-01 ruling (`decisions.md`) the FFI is *required*, so a missing
-library is a startup refusal naming the `.so` — not a demotion to a slower
-Python path. Vendor-portability fallbacks *inside* a handler (FFTW-vs-MKL
-symbol resolution, plain-loop CBLAS) are a different thing and stay: they
-are how the required layer remains buildable everywhere.
+**A vendor dependency enters only through a facade with run-time resolution
+and an announced refusal.** The FFI is required
+([`decisions.md`](decisions.md), 2026-08-01): a missing library is a startup
+refusal naming the `.so`, never a demotion to a Python path. Portability
+fallbacks *inside* a handler (the FFTW3 `dlsym` ladder, batched versus plain
+CBLAS) are how the required layer stays buildable everywhere; each announces
+which entry it bound.
 
 ### Python-side module map
 
-`src/ffi/io.py` (the parallel-HDF5 service), `fft.py` (flat-k FFT and the
-k-convolution router),
-`gemm.py` (batched vendor GEMM), `gate.py`, and the `linalg/` facade are the
-real modules. `phdf5/`, `slate/`, `scalapack/`, `mklfft/`, `mklblas/`,
-`cufft/` survive as **re-export shims** — `src/ffi/phdf5/` is 40 lines
-across four files.
-
-Deleting a shim is gated on its consumers moving, and **one has now moved
-in part**: outside `src/ffi/` there are **5** `ffi.phdf5` references left
-(down from 10), all in `file_io/_slab_io_ffi.py` — `file_io/wfn_loader.py`
-had 3 and has none since the wave-1 wfn_loader extraction promoted the
-union read into `SlabIO.read_slabs` (2026-08-07,
-[docs/services/wfn_loader.md](../services/wfn_loader.md)). Also 6 `ffi.mklblas`
-(`common/contract_bands.py`), and 4 `ffi.mklfft` (`common/fft_helpers.py`,
-`gw/ppm_tau_kernel.py`) — counted at `886139f` and **re-counted unchanged at
-`8789131`, 2026-08-06**. The gate is
-`grep -rn "ffi\.mklfft" src/ tests/ | grep -v '^src/ffi/'` returning empty.
-Run the grep; do not trust a count written down here.
+* **Real modules:** `ffi/io.py` (parallel HDF5), `ffi/fft.py` (the host flat-k
+  FFT and the [k-convolution router](#k-convolution-router-and-the-mathdx-family)),
+  `ffi/gemm.py` (host batched GEMM), `ffi/gate.py`,
+  `ffi/common/ffi_loader.py`, and `ffi/cublasmp/` (cuBLASMp GEMM and W-solve,
+  reached by the bench drivers). Distributed dense linear algebra is
+  `services/distrib_la`, which opens the same two libraries through its own
+  `distrib_la.loader`.
+* **Target table only:** `ffi/cufft/` lists the six CUDA `lorrax_mathdx_*`
+  targets and their C++ symbols. It has no callable.
+* **Re-export shims:** `ffi.phdf5` → `ffi.io`, `ffi.mklfft` → `ffi.fft`,
+  `ffi.mklblas` → `ffi.gemm`, `ffi.cusolvermp` → `distrib_la._cusolvermp`.
+  New code imports the real module. A shim is deleted when
+  `grep -rnE "ffi\.<shim>" src/ services/ tests/ | grep -v '^src/ffi/'` is
+  empty.
 
 ---
 
 ## 2. The one C++ tree
 
-`src/ffi/cpp/` — one directory, one `CMakeLists.txt`, both platform legs
-behind an explicit selector.
+`src/ffi/cpp/`: one `CMakeLists.txt`, both platform legs behind an explicit
+selector.
 
 ```
 src/ffi/cpp/
-├── CMakeLists.txt      -DLORRAX_FFI_PLATFORM=cuda|host; FATAL_ERROR when unset
-├── build.sh            CUDA leg (inside Shifter)
-├── build_host.sh       host leg
-├── run_shifter.sh  in_container.sh  select_gpu.sh  gate_one_mpi.sh
-├── stage/              vendor stage scripts (phdf5_stage_cray.sh, …)
-├── common/  mklfft/  cufft/  mklblas/  scalapack/  slate/  cusolvermp/  cublasmp/
-└── phdf5/   api.cc  context.cc  ctx.h  read_ffi.cc  write_ffi.cc
-            phdf5_interface.h  platform_seam.h  shard_index.h
+├── CMakeLists.txt           -DLORRAX_FFI_PLATFORM=cuda|host; FATAL_ERROR when unset
+├── build.sh  build_host.sh  leg build scripts (container CUDA leg; generic host leg)
+├── exports_cuda.map  exports_host.map     version scripts: LORRAX internals are local
+├── gate_one_mpi.sh  gate_one_hdf5.sh  gate_one_fftw.sh  gate_one_odr.py
+├── run_shifter.sh  in_container.sh  select_gpu.sh    container composition
+├── stage/                   vendor stage scripts, seal_bundle.py, stamp_provenance.sh
+├── common/                  C ABI, ABI and build-config stamps, contour accumulator
+├── phdf5/  slate/                                    both legs
+├── mklfft/  mklblas/  scalapack/                     host leg
+└── cusolvermp/  cublasmp/  cublas/  cufft/  active_subspace/  symmetry/   CUDA leg
 ```
 
-Two legs, two libraries:
+Vendor directory names are historical: `mklfft/` holds the FFTW3-ABI handler
+and `cufft/` the nvidia-mathdx family. Every filename stays unique across
+directories (`slate/ctx.h`, `phdf5/ctx.h`, `cusolvermp/ctx.h`).
 
-* `-DLORRAX_FFI_PLATFORM=host` → `liblorrax_ffi_host.so`. CUDA-free by
-  construction. Feature options `LORRAX_FFI_HAVE_PHDF5`,
-  `LORRAX_HOST_HAVE_SCALAPACK`, `LORRAX_HOST_HAVE_SLATE`,
-  `LORRAX_HOST_HAVE_FFTW3`.
-* `-DLORRAX_FFI_PLATFORM=cuda` → `liblorrax_ffi.so`. Feature options
-  `LORRAX_FFI_HAVE_CAL`, `LORRAX_FFI_HAVE_CUBLASMP`, `LORRAX_FFI_HAVE_CUFFT`,
-  `LORRAX_FFI_HAVE_PHDF5`, plus a SLATE probe.
-* unset → `FATAL_ERROR` naming both legs (`CMakeLists.txt:1399`). "Which
-  directory you pointed cmake at" was an implicit dial; it is gone.
+| leg | CMake | library | feature options (all default `ON`) |
+|---|---|---|---|
+| host | `-DLORRAX_FFI_PLATFORM=host` | `liblorrax_ffi_host.so` | `LORRAX_FFI_HAVE_PHDF5`, `LORRAX_HOST_HAVE_SCALAPACK`, `LORRAX_HOST_HAVE_SLATE`, `LORRAX_HOST_HAVE_FFTW3` |
+| CUDA | `-DLORRAX_FFI_PLATFORM=cuda` | `liblorrax_ffi.so` | `LORRAX_FFI_HAVE_CAL`, `LORRAX_FFI_HAVE_PHDF5`, `LORRAX_FFI_HAVE_CUBLASMP`, `LORRAX_FFI_HAVE_CUFFT`; SLATE is probed at `LORRAX_SLATE_INSTALL_DIR` |
+| unset | — | `FATAL_ERROR` naming both legs | — |
 
-`LORRAX_FFI_PLATFORM` is a **CMake cache variable, not an environment
-variable** — it is never read from the environment by any Python module.
+* **Host leg.** CUDA-free by construction: its sources compile with
+  `LORRAX_FFI_NO_CUDA`, and GATE 3 refuses a CUDA-stack `DT_NEEDED`. A feature
+  group whose dependency is absent is skipped with a `STATUS` line. The FFT
+  handler is always built (it declares the FFTW3 ABI itself);
+  `LORRAX_HOST_HAVE_FFTW3` only records a found FFTW3 as the run-time
+  `dlopen` hint `LORRAX_FFTW3_SO_HINT` and never links it. The GEMM handler is
+  built when a CBLAS header and provider are found. The link uses
+  `-Wl,--no-undefined`.
+* **CUDA leg.** Always links cuSOLVERMp, cuBLASMp, NCCL, cudart, cuSOLVER and
+  cuBLAS, and builds the cuSOLVERMp, local-cuBLAS, active-subspace, contour
+  and spin-rotation handlers. `LORRAX_FFI_HAVE_CUBLASMP` adds the fused
+  cuBLASMp GEMM and W-solve handlers and is the switch that enables the CUDA
+  language (`enable_language(CUDA)`). `LORRAX_FFI_HAVE_CUFFT`
+  builds the mathdx family when the probe finds `cufft.h`, `libcufft`,
+  `nvrtc.h` and `libnvrtc`; otherwise the six targets are absent and startup
+  refuses with `GATE kconv-target`. `LORRAX_FFI_HAVE_CAL` is §4.
+* **Both legs.** `$ORIGIN` is first in `RPATH`. `exports_{cuda,host}.map`
+  localise every LORRAX-owned symbol, and the host leg's C entry points carry
+  a `_host` suffix (`cpp/common/c_abi.h`), so the two libraries define no
+  LORRAX name in common when both are `dlopen`ed `RTLD_GLOBAL`. Each leg
+  exports `lorrax_ffi_{cuda,host}_abi_version` and
+  `lorrax_ffi_{cuda,host}_build_config`.
 
-Vendor subdirectory names are kept deliberately: every filename stays unique
-(`slate/ctx.h` vs `phdf5/ctx.h` vs `cusolvermp/ctx.h`), and every historical
-reference maps mechanically `src/ffi/<v>/cpp/X` → `src/ffi/cpp/<v>/X`. Docs
-and commit messages written before 2026-07-31 use the old spelling.
+`LORRAX_FFI_PLATFORM` is a CMake cache variable; no Python module reads it.
 
-### 2a. The deployable unit is one sealed pair
+### 2a. Build entry points
 
-The two independently built legs become one production provider only through
-`src/ffi/cpp/stage/seal_bundle.py`.  It publishes a new, non-overwriting
-directory containing both canonical shared objects and one
-`lorrax_ffi_bundle.json`.  That manifest binds the pair, the handler ABI, exact
-file sizes and SHA-256 values, each ELF SONAME/`DT_NEEDED` record, and the
-dependency-first private redistributable closure.  Both libraries put literal
-`$ORIGIN` first in their existing RPATHs; the common loader also preloads every
-manifested private provider by exact path, so an ordinary run script owns no
-library search path.
+| machine | leg | entry |
+|---|---|---|
+| Perlmutter `lorrax_A` (bare-host CUDA 13) | CUDA | the runtime's recipe outside this repository: `-DLORRAX_FFI_HAVE_CAL=OFF` against the NCCL-native cuSOLVERMp, no device SLATE, MPI from `config/perlmutter/ffi_mpi.sh` |
+| Perlmutter | host | `config/perlmutter/build_ffi_host.sh`, bare metal: pins MPI through `ffi_mpi.sh`, loads `cray-hdf5-parallel/1.14.3.7`, captures the cray-fftw path as the hint, and unloads `cray-libsci`, `cray-fftw`, `craype-accel-nvidia80` and `cudatoolkit` before configure |
+| Shifter sites | CUDA | `src/ffi/cpp/run_shifter.sh bash src/ffi/cpp/build.sh` |
+| Frontera | host / CUDA | `config/frontera/build_ffi_host.sh` / `config/frontera/build_ffi.sh` |
+| anywhere else | host | `bash src/ffi/cpp/build_host.sh` |
 
-The private closure is deliberately narrow: cuSolverMp/cuBLASMp/CAL,
-SLATE/BLAS++/LAPACK++, and NVSHMEM may be sealed.  MPI, site HDF5, the system
-and compiler runtimes, CUDA runtime/driver libraries, and NCCL remain owned by
-the selected machine runtime and are never copied or manifest-owned.  At load,
-`lxkit.native_provider` rehashes both legs and the private closure, checks the
-live ABI-symbol origin with `dladdr`, and refuses any mapped engine-private
-provider not named by the manifest.  The core loader and standalone
-`distrib_la` loader call this same policy; neither carries a private copy.
+`config/perlmutter/ffi_mpi.sh` pins the one MPI both Perlmutter legs link:
+`cray-mpich/9.0.1` (`libmpi_gnu_123.so.12`, the MPI the phdf5 stage and the
+SLATE host install need) and the LibSci that links it,
+`cray-libsci/25.09.0`. Both legs are loaded into one GPU process, so they
+must name the same `libmpi`. To move to another MPI, change that file only.
 
-`source.revision` records which clean source build produced the sealed pair.
-It is provenance, not a demand that the active Python checkout have the same
-Git SHA: a stable FFI ABI intentionally permits a certified installed wheel or
-backported provider to serve another source commit.  Compatibility is the
-exported `LORRAX_FFI_ABI_VERSION`, live feature/target probes, and the build
-acceptance contract.  A changed ABI is always refused.  An unsealed build-tree
-artifact remains a developer migration path and prints `LEGACY-UNSEALED` with
-its actual hash; it is not production attestation.
+### 2b. The build contract: `scripts/verify_ffi_build.sh`
+
+Every build path ends in `scripts/verify_ffi_build.sh [--leg host|cuda]
+<so>`, and `services/distrib_la/tests/test_so_acceptance.py` checks the exact
+handler names out of the loaders' own tables. The verifier checks patterns;
+the test checks names. Run both.
+
+| gate | invariant | where it can run |
+|---|---|---|
+| 0 | every backend in `LORRAX_FFI_EXPECT_BACKENDS` exports a handler and the build stamp agrees. The default is the leg's full set, so a build that lost one fails | anywhere |
+| 1 | one MPI runtime in the closure (`gate_one_mpi.sh`: `ldd`, deduplicated by `realpath`) | the run environment |
+| 2 | one BLAS vendor and one threading flavour in `DT_NEEDED` | anywhere |
+| 3 | the host leg links nothing from the CUDA stack | anywhere |
+| 4 | the closure resolves (`ldd -r`) | the run environment |
+| 5 | zero undefined `fftw_` symbols and zero `fftw` in `DT_NEEDED` | anywhere |
+| 6 | every OpenMP entry in `DT_NEEDED` is `libgomp`, `libiomp5` or `libomp` | anywhere |
+| 7 | one HDF5 SOVERSION, and the runtime provides it (`gate_one_hdf5.sh`; `LORRAX_FFI_EXPECT_HDF5_SOVERSION`, `LORRAX_FFI_EXPECT_PEER_SO` for the cross-leg check) | ELF halves anywhere; mapped-object half in the run environment |
+| 8 | after one real FFT, exactly one FFTW3 engine is mapped and it is the staged one (`gate_one_fftw.sh`) | host leg, in a process that imports jax (`LORRAX_GATE_FFTW_PY` or `LORRAX_FFTW3_STAGE`) |
+| 9 | no LORRAX internal on the dynamic table; every host `lrx_*` entry is suffixed | `build.sh`, `config/perlmutter/build_ffi_host.sh` |
+| 10 | a CUDA-capable process with both libraries open completes a host phdf5 read (`gate_one_odr.py`) | a GPU node, both pins set |
+| 11 | the exported ABI equals `src/ffi/cpp/common/lorrax_ffi_abi.h` | anywhere |
+
+A gate that cannot run in the current environment prints `GATE COULD NOT
+RUN` and is counted apart from passes. `LORRAX_FFI_VERIFY_STRICT=1` makes it
+a failure; use it for certification inside an allocation.
+`LORRAX_FFI_VERIFY=off` disables the verifier with an announcement, and a
+library built that way is not certifiable.
+
+### 2c. The deployable unit is one sealed pair
+
+The two legs become one production provider only through
+`src/ffi/cpp/stage/seal_bundle.py`. It publishes a new, non-overwriting
+directory holding both libraries under `lib/`, the listed private
+redistributables, and one `lorrax_ffi_bundle.json`. The manifest binds the
+pair, the handler ABI, the full source revision, each file's size and SHA-256,
+each ELF SONAME and `DT_NEEDED` record, and the dependency-first private
+closure.
+
+Only cuSOLVERMp, cuBLASMp, CAL, SLATE (and its ScaLAPACK API), BLAS++,
+LAPACK++ and NVSHMEM may be sealed as private libraries. MPI, site HDF5, the
+system and compiler runtimes, CUDA runtime and driver libraries, and NCCL
+belong to the machine runtime; `seal_bundle.py` refuses them as private
+inputs. At load,
+`lxkit.native_provider` rehashes both legs and the closure, preloads each
+private library by exact path (so no run script owns a library search path),
+checks the live ABI symbol's origin with `dladdr`, and refuses any mapped
+engine-private provider the manifest does not name.
+
+`source.revision` is provenance, not a demand that the active checkout have
+the same SHA. Compatibility is the exported ABI, the live feature and target
+probes, and the build contract. A different ABI always refuses. An unsealed
+build-tree library still loads and prints `LEGACY-UNSEALED` with its hash; it
+is not production attestation. The Perlmutter `lorrax_A` module selects one
+sealed bundle through `LORRAX_FFI_SO` and `LORRAX_FFI_HOST_SO`.
+
+### 2d. How the loader selects a library
+
+`ffi_loader.get_lib(platform)` (and `distrib_la.loader`, through the same
+`lxkit.native_provider` policy):
+
+* **Candidates**, in order: the pin (`LORRAX_FFI_SO` for CUDA,
+  `LORRAX_FFI_HOST_SO` for cpu), the in-tree `src/ffi/cpp/build/` or
+  `build_host/`, then each `sys.path` directory.
+* **Pins.** A pin that is not a file refuses. When a selected leg belongs to
+  a sealed bundle, both pins or neither must be set, and both legs must come
+  from one manifest; a partial override or mixed providers refuse.
+* **ABI.** A stamped library with a different ABI refuses (`FfiAbiMismatch`).
+  An unstamped one is announced once and loads, unless
+  `LORRAX_FFI_ABI_STRICT=1`.
+* **Load order.** In a CUDA-capable process (the first `JAX_PLATFORMS`
+  entry, if set, is `cuda` or `gpu`; `CUDA_VISIBLE_DEVICES` is not empty; an
+  NVIDIA device node is visible), opening the host library opens the CUDA
+  library first, so the CUDA build wins the shared SLATE/BLAS++ SONAMEs.
+  After each `dlopen` the loader refuses a process with more than one mapped
+  MPI runtime.
+* **Probe.** `probe_target(target, platform)` gives one of three reasons:
+  unknown target, library could not be loaded, or library loaded but does not
+  export the handler. Every gate refusal quotes it.
 
 ---
 
 ## 3. What each machine provides
 
-| Service | Perlmutter (GPU leg + host leg) | Frontera |
+| Service | Perlmutter | Frontera |
 |---|---|---|
-| FFT (CPU) | `cray-fftw/3.3.10.11` | MKL's native FFTW3 export *(verified 2026-08-06, below)* |
-| FFT (GPU) | **nvidia-mathdx** (cuFFTDx, NVRTC) for every k-axis transform and convolution; the in-`shard_map` spatial 3-D FFTs are XLA's (cuFFT in jaxlib) | n/a on the CPU leg |
-| GEMM | Cray LibSci CBLAS | MKL CBLAS |
-| Dense solvers | SLATE (GPU + host), cuSOLVERMp | ScaLAPACK (MKL), SLATE |
-| Parallel HDF5 | `cray-hdf5-parallel` + Cray MPICH | HDF5 + Intel MPI |
-| Container | Shifter (`run_shifter.sh`) | apptainer |
+| k-axis FFTs and convolutions, GPU | nvidia-mathdx ([router](#k-convolution-router-and-the-mathdx-family)) | — |
+| k-axis FFTs and convolutions, CPU | FFTW3 ABI → cray-fftw (§3c) | FFTW3 ABI → MKL |
+| spatial 3-D FFT inside `shard_map` | XLA (cuFFT inside jaxlib) | XLA:CPU |
+| host GEMM | Cray LibSci CBLAS | MKL CBLAS |
+| distributed dense solvers | cuSOLVERMp and cuBLASMp (GPU); ScaLAPACK from LibSci and host SLATE (CPU) | ScaLAPACK from MKL; host SLATE |
+| parallel HDF5 | `cray-hdf5-parallel/1.14.3.7` over `cray-mpich/9.0.1` | phdf5 over Intel MPI |
+| runtime | bare-host CUDA 13 (`lorrax_A`); Shifter stages for container sites | apptainer |
 
-### 3a. The dependency matrix — one row per routine we call out for
+Versions and launch recipes: [Perlmutter](../environment/machines/perlmutter.md),
+[Frontera](../environment/machines/frontera.md).
 
-**This table is the register's answer to "how LORRAX reaches a vendor
-library", at routine granularity.** The service table above says which
-*vendors* are on each machine; this one says, for each numerical or I/O
-routine LORRAX does not implement itself, who serves it, what else could,
-**how you would know it built right**, and whether that check is passing.
+### 3a. The dependency matrix
 
-The last two columns are the point. A row whose "how you know" is *(none)*
-is a routine we are trusting without evidence.
+One row per routine LORRAX does not implement itself: who serves it, what
+else could, and what proves it built right.
 
-| Routine | Perlmutter | Frontera | Reachable alternatives | How you know it built right | Passing? |
-|---|---|---|---|---|---|
-| **3-D FFT** (in-`shard_map`) | XLA:GPU `fft` → **cuFFT** in jaxlib | XLA:CPU `fft` → **DUCC/Eigen** in XLA | none — `fft_helpers.local_fftn3`/`local_ifftn3` are bare `jnp.fft` aliases with **no FFI route**; `LORRAX_FFT_FFI` structurally cannot reach them | **(none)** | — |
-| **k-axis convolutions + k-minor transforms** (ζ fit, Σ, COHSEX, BSE) | CUDA: **nvidia-mathdx** cuFFTDx thread FFTs in one fused pass, NVRTC-built per k-grid from the wheel's headers, disk-cached. Host: the FFTW3-ABI plan handlers below | host plan handlers | none on CUDA by ruling (decisions.md 2026-09-24); a missing wheel refuses at startup (`GATE mathdx-headers`) | `tests/multi_device/kconv_router_p4.py` (every mode vs `np.fft` or dense sums, red twins) | **PASS**, Perlmutter P4, 2026-09-24 |
-| **flat-k FFT** (batched 3-D) | CUDA leg: **nvidia-mathdx** k-leading transform (router mode 3). Host leg: FFTW3 ABI by `dlopen` → **cray-fftw** bare-metal; **nothing in-container** | **MKL**'s FFTW3 export, bound at `resolve_sym` stage 1 (MKL is already loaded via the ScaLAPACK link line, so the ladder never runs) | the whole `fftw3_candidates()` ladder: `$LORRAX_FFTW3_SO` → build-time `LORRAX_FFTW3_SO_HINT` → `libfftw3.so.3` → `libfftw3.so.mpi31.3` → `libmkl_rt.so` → `libfftw3.so`. On Frontera `libfftw3.so.3` **is** reachable (`/usr/lib64`, FFTW 3.3.2) and would win over `libmkl_rt.so` if MKL were not already resident | **GATE 5b** — zero `fftw` in `DT_NEEDED` (`build_ffi_host.sh`). Covers *load* time only | **PASS**, Perlmutter, measured 2026-08-06 |
-| ↳ *which engine actually answered* | — | — | — | **GATE 8** (`gate_one_fftw.sh`) — **NOT ON THIS BRANCH**, see §3b | **no check** |
-| **Host band-block contraction** | **Cray LibSci** CBLAS | **MKL** CBLAS | LibSci exports no `cblas_?gemm_batch`, so the run-time `dlsym` picks the plain-`cblas_?gemm` loop; MKL has the batched entry. Also netlib/AOCL/OpenBLAS/BLIS/ATLAS are accepted as CBLAS providers | **GATE 2** — one LibSci flavour, no sequential/threaded mix. Which *entry* was chosen is **announced at run time, not gated** | **PASS**, Perlmutter (`seq=0 mp=2`), measured 2026-08-06 |
-| **Planned axis GEMM** | Full range: XLA:GPU `dot` → **cuBLAS**. Active range: local classic-**cuBLAS** FFI over pointer views, with 4 MiB XLA-owned workspace | Full range: XLA:CPU `dot`; active range: bounded JAX dot panels | CUDA active plans require `CublasLocalActiveRangeGemmFfi`; CPU needs no provider. Both keep K local and shard only output centroid axes | `services/distrib_la/tests/test_local_active_gemm_range.py` on a real P4 CUDA mesh and emulated P4 CPU mesh | branch evidence in `docs/dev/active_gemm_ranges.md`; not on main |
-| **Distributed face GEMM** | GPU leg: **cuBLASMp** planned full-range and active-range N,N GEMM | No planned PBLAS/SLATE GEMM handler; CPU face plans refuse by name | The axis carrier above keeps the contraction axis local. `batch_reshard` is available through the one-shot `matmul` surface only when complete matrices fit each device; the planned face surface never selects it silently | Full planned GEMM: `test_distrib_la_multiproc.py` P4 provider cell. Active ranges: `services/distrib_la/tests/test_active_gemm_range.py`, production integration gate `tests/multi_device/active_band_sigma_gate.py` | **PASS on branch `perf/jittable-davidson-2026-09-13`**, P4 jobs 58278132.11–13 and P16 job 58278132.17; not on main |
-| **`eigh`** | default **native** `jnp.linalg.eigh` → cuSOLVER via jaxlib | default **native** → LAPACK via jaxlib | `eigh_backend` deck key: `scalapack` \| `cusolvermp` \| `slate`. SLATE `heev` on a **host** mesh is refused outright (bug L-2, deterministic SIGSEGV) | the 11-symbol ScaLAPACK/BLACS **pre-flight** in `build_ffi_host.sh`; then `pytest -m distrib_la` (`services/distrib_la/tests/test_distrib_la_contract.py`) at run time | pre-flight **PASS**, Perlmutter. Contract tests: 2 skips are the SLATE `heev` pair |
-| **`eigh`, distributed** | **cuSOLVERMp** `syevd` (GPU); **ScaLAPACK** `pzheevd`/`pdsyevd` from Cray LibSci (CPU) | **ScaLAPACK** from MKL (`libmkl_scalapack_lp64` + `libmkl_blacs_intelmpi_lp64`) | SLATE `heev` (CUDA only) | as above — **no gate asserts which vendor answered**; `CMakeLists.txt` states nothing at run time can observe it | see above |
-| **Cholesky** (`potrf`) | **cuSOLVERMp** batched `potrf`/`potrs`; **SLATE** `potrf`/`trsm` | **SLATE** host `potrf` against MKL (opt-in; unset stage ⇒ phdf5-only lib) | **there is no ScaLAPACK `potrf` handler anywhere in the tree** | **(none at build time)** — `test_distrib_la_contract.py` only | contract tests only |
-| **LU** (`getrf`/`getrs`) | **cuSOLVERMp** batched `solve_lu` (GPU); **ScaLAPACK** `pXgetrf`/`pXgetrs` from LibSci (CPU) | **ScaLAPACK** from MKL | fused `solve_lu` **and** the split `getrf`+`getrs` pair; resolve refuses if any of the three targets is missing | **(none at build time)** — contract tests only. `LORRAX_LU_NO_PIVOT` can disable pivoting at run time with no gate | contract tests only |
-| **Distributed transport** | **NCCL** (cuSOLVERMp ≥0.7.2) or **CAL** (≤0.6.x); **NVSHMEM** transitively via cuBLASMp; `MPI_COMM_WORLD` dup for SLATE/ScaLAPACK | Intel MPI; NCCL for the pip cuSOLVERMp on the rtx leg | the stage choice *is* the transport choice — one string, `LORRAX_NVHPC_SUBPATH`; build refuses if unstated | build-time refusal on an unstated stage (`build.sh`) | — |
-| **Parallel HDF5** | **`cray-hdf5-parallel/1.14.3.7`** (`libhdf5_parallel_gnu.so.310`) over **Cray MPICH** `libmpi_gnu_123.so.12` | **phdf5 1.14.6** (`libhdf5.so.310`) over **Intel MPI 2020.4** | **none — the alternatives were deleted 2026-08-06.** There is one transport; a deployment that cannot serve it refuses at open naming the probe that declined. `bse_loading`'s serial-h5py tile readers are a loud, memory-correct fallback at ANY process count (~17x slower, CLAIMS 76 vs 69) and are deliberately not a tier | **GATE 1** (`gate_one_mpi.sh`, one cray-mpich object) and **GATE 7** (`gate_one_hdf5.sh`, one HDF5 SOVERSION + the stage provides it) | **both PASS**, Perlmutter, measured 2026-08-06 |
-| **OpenMP runtime** | `libgomp.so.1` | `libiomp5` (Intel) | `libgomp` \| `libiomp5` \| `libomp` | **GATE 6** — the OpenMP runtime really is OpenMP | **PASS**, Perlmutter — but see §3b, it passes on an empty set too |
-
-**Scope of every "PASS" above:** Perlmutter, login node, bare metal, against
-`lorrax_hdf5/src/ffi/cpp/build_host/liblorrax_ffi_host.so` (2026-08-06) —
-the newest host artifact, built from `fix/host-ffi-hdf5-closure-2026-08-06`,
-which is an ancestor of this branch. **No host `.so` has been built from
-`integration/2026-08-06` itself**, and **no artifact exists on Frontera at
-all** (`find $WORK $SCRATCH -name 'liblorrax_ffi*.so'` returns only
-`lorrax_ffi_wtA` / `lorrax_ffi_unified` build dirs from earlier campaigns,
-none from this branch). Every Frontera cell above is a claim about what the
-build *would* select, verified at the library level — `nm -D` on
-`libmkl_rt.so` exports all three FFTW3 advanced-ABI entry points — not a
-claim about a built artifact.
-
-### 3b. The routines with no check, and the gates that cannot fail
-
-Four gaps, worst first.
-
-1. **Nothing verifies which FFT engine actually answered.** GATE 5b proves
-   nothing *binds* at load time; after that the engine arrives by `dlopen`
-   and no static tool can see it. The gate written for this — **GATE 8**,
-   `src/ffi/cpp/gate_one_fftw.sh`, which drives one real flat-k FFT and
-   reads `/proc/self/maps` — **exists, is certified, and is not on this
-   branch.** It is four commits (707 insertions) on
-   `fix/host-ffi-fftw-container-stage-2026-08-06`, unmerged:
-
-   ```
-   c973968 docs(env_vars): register the five deployment variables the FFTW3 stage adds
-   85f346a shifter: mount the FFTW3 stage at /lorrax_fftw, beside phdf5/slate/nvhpc
-   7e48d66 ffi build: GATE 8 -- one FFTW3 engine, MAPPED, and it is the staged one
-   a3fafdc ffi stage: the container ships no FFTW3, so stage the one the ladder needs
-   ```
-
-   The hazard is concrete: the Shifter image ships **`libcufftw.so.11`**,
-   which exports `fftw_plan_many_dft` / `fftw_execute_dft` /
-   `fftw_destroy_plan` — all three names the ladder binds. Point
-   `LORRAX_FFTW3_SO` at it and every FFT cell goes green while the **host**
-   handler transforms on the GPU. Merging that branch closes both this and
-   the in-container "no FFTW3 engine in this process" failure below.
-
-2. **GATE 5a reads 0 by construction, and still prints in the PASS banner.**
-   `nm -D --undefined-only … | grep -c fftw_` counts *undefined symbol
-   references*, which `dlsym`ing every entry point drives to zero whatever
-   else is true. Measured on both artifacts, same day:
-
-   | | GATE 5a (`nm -D`) | GATE 5b (`DT_NEEDED`) |
-   |---|---|---|
-   | post-fix `.so` (`lorrax_hdf5`) | 0 → pass | 0 → pass |
-   | **pre-fix `.so` (`lorrax_P`, the broken one)** | **0 → pass** | **3 → fail** |
-
-   Same library, same day: the check that was used for certification passes
-   on the build that could not load. 5b is the load-bearing half.
-
-3. **Two gates announce PASS having scanned nothing.**
-   * **GATE 6** — with zero `lib*omp*.so` entries in `DT_NEEDED`,
-     `omp_needed` is empty, `bad_omp` strips to empty, and the gate prints
-     `GATE 6 … PASSED`. Verified by running the gate's own expression on an
-     empty input.
-   * **`gate_one_hdf5.sh`** guards `ldd` (`GATE FAILED (7d): ldd is not
-     available`) but never guards `readelf`. Handed a non-ELF file it takes
-     the `GATE 7 N/A: none of the 1 artifact(s) link HDF5 at all` branch and
-     exits **0**. Verified directly. This is the failure mode
-     `gate_one_mpi.sh:30-36` was rewritten to remove — *"A GATE THAT CANNOT
-     RUN IS NOT A GATE THAT PASSED"* — left in place one tool over.
-
-4. **Whole routine classes have no build-time check at all.** Cholesky and
-   LU are asserted only by `services/distrib_la/tests/test_distrib_la_contract.py`
-   at run time;
-   nothing at build time says which vendor supplies them, and
-   `CMakeLists.txt` notes that nothing at run time can observe it either.
-   The 3-D FFT row has no check of any kind, on either machine.
-   `LORRAX_LU_NO_PIVOT` disables pivoting from the environment with no gate
-   and, until 2026-08-06, no registry row.
-
-### 3c. The shape of this surface: an arch.mk expressed as environment
-
-Census of `integration/2026-08-06`: **355 distinct `LORRAX_*` names appear
-in the tree; 234 are actually read.** Of those 234, **120 are build-time
-shell variables** — read only by `config/**/*.sh`, `src/ffi/cpp/**/build*.sh`
-and CMake, never by the running Python. 111 are run-time, 3 are both, and
-121 more names survive only in prose and post-mortem comments.
-
-That majority is the finding. **120 build-time knobs is an `arch.mk`
-expressed as environment.** BerkeleyGW answers the same questions this
-layer answers — which FFT, which BLAS/LAPACK, which ScaLAPACK, which HDF5,
-CPU or GPU — in a single ~70-line file per machine
-(`config/<machine>.<compiler>.<target>.<site>.mk`, symlinked to `arch.mk`),
-where the answers are **compile-time cpp macros** in one variable:
-
-```make
-MATHFLAG = -DUSESCALAPACK -DUNPACKED -DUSEFFTW3 -DHDF5   # Frontera
-MATHFLAG = -DUSESCALAPACK -DUNPACKED -DUSEFFTW3 -DHDF5 -DOMP_TARGET -DOPENACC
-FFTWLIB  = $(FFTW_DIR)/libfftw3.so ...                   # a PATH, not a soname
-```
-
-Its entire run-time environment is one commented `module load` line. Note
-what that buys on the exact hazard in §3b: BerkeleyGW's Perlmutter build
-links `libfftw3.so` **and** `-lcufft` into one binary and still cannot
-suffer the `libcufftw.so.11` substitution, because it names a **file path**
-at link time rather than resolving a **soname** at run time. There is no
-moment at which the question "which engine answered?" is open, so there is
-nothing for a GATE 8 to check.
-
-**A build-time fact should be a build-time fact.** The knobs worth moving
-are the ones that defer a decision the build already made — `LORRAX_FFTW3_SO`
-is the clearest (the build already recorded its engine as the compile-time
-`LORRAX_FFTW3_SO_HINT`; the env var exists to override it at run time).
-This is a direction, not a scheduled refactor: a census of read sites
-cannot tell you which knobs a deployment actually sets, and every knob
-tested during this audit turned out **reachable** — see the deletion
-finding below.
-
-**No `LORRAX_*` name was found safely deletable.** Every candidate a
-read-site census flagged as dead proved reachable through indirection the
-census could not see: `LORRAX_FFT_FFI_{CHUNK,LOG,THREADS}` are read through
-a C++ helper taking a name plus a deprecated-alias list;
-`LORRAX_KIN_ION_LOOKAHEAD` is bound to `collectives.SWEEP_LOOKAHEAD_ENV`
-and read through that constant; `LORRAX_RUN_DIR` is read in a `.sbatch`
-template. Treat "nothing reads it" as a hypothesis requiring a hand grep,
-not a result.
-
-**The Frontera leg shares no numbered gate with Perlmutter.**
-`config/frontera/build_ffi_host.sh` calls neither `gate_one_mpi.sh` nor
-`gate_one_hdf5.sh`; it has its own CUDA-free grep, an exported-handler list,
-and a `readelf -d | grep -E 'scalapack|blacs|libsci'` non-emptiness test.
-`config/frontera/build_ffi.sh` asserts nothing beyond the file existing.
-So the machine with no built artifact is also the machine with the weakest
-gates — the two facts compound.
-
-**One FFT source serves both.** The CPU flat-k translation unit was
-source-locked to MKL's DFTI descriptor API until 2026-08-05; it is not any
-more. `src/ffi/cpp/mklfft/fft_flat_k_ffi.cc` now contains **zero**
-`DftiCreateDescriptor` calls and four `fftw_plan_many_dft` calls. Entry
-points are resolved at *run* time by `dlsym` (`RTLD_DEFAULT` → `RTLD_NEXT`),
-so the same object links MKL's native FFTW3 export on Frontera and
-`cray-fftw` on Perlmutter. No environment variable names the engine — **the
-engine is named by what the `.so` links.**
-
-That design produces a signature worth recognising, because it looks like a
-defect and is not: `nm -D --undefined-only | grep -c fftw_` → **0** while
-`libfftw3.so.mpi31.3` sits in `DT_NEEDED`. The `DT_NEEDED` entry exists so
-the library is *loaded* for `dlsym` to resolve against; nothing binds at
-link time. That is the `-Wl,--no-as-needed` idiom, not a dangling
-dependency.
-
-> **That count is not a gate, and it was used as one.** The host-FFI leg was
-> certified partly on `nm -D --undefined-only | grep -c fftw_` → 0. The check
-> is **necessary but not sufficient**: once entry points are resolved by
-> `dlsym`, the count is driven to 0 *by construction* — it would read 0 for a
-> build with no FFTW anywhere near it. It never inspects `DT_NEEDED`, which
-> is the part that actually decides whether the library loads, and the next
-> paragraph is what happens when only the count is checked. A check that
-> cannot fail is not evidence. The sufficient form is `readelf -d` for the
-> `DT_NEEDED` entries plus `ldd` **inside the container on a compute node**
-> (§7c on why the login node cannot answer this).
-
-**`DT_NEEDED` is load-bearing at load time**, and until 2026-08-06 that was
-a live failure. Measured that day, in-container on compute node nid001644:
-the host `.so` carried the right directory in its **RPATH**
-(`/opt/cray/pe/fftw/3.3.10.11/x86_milan/lib`), so on the bare host it
-resolved -- but inside the Shifter image `/opt/cray/pe` **does not exist at
-all**, so all three FFTW entries reported `not found` and the entire
-`liblorrax_ffi_host.so` failed to load. Tier-1 on the CUDA leg was
-consequently 33 passed / **19 skipped**, every skip reading
-`liblorrax_ffi_host.so unavailable: libfftw3.so.mpi31.3: cannot open
-shared object file`.
-
-No `LD_LIBRARY_PATH` value repaired that -- the files are not in the
-container's mount namespace. **The containerized host leg had never been
-green**; the "35/35 on both vendors" certification was a bare-host run.
-A skip is not a pass.
-
-> **Fixed, and IN this tree.** `411e257` ("the run-time-resolved FFT engine
-> stops being a load-time dependency", from
-> `fix/host-ffi-fftw-dt-needed-2026-08-06`) removes the link-time dependency
-> so the engine is `dlopen`'d rather than `DT_NEEDED`, and adds the
-> sufficient invariant -- **zero `fftw` in `DT_NEEDED`** -- as GATE 5 in
-> `config/perlmutter/build_ffi_host.sh`.
->
-> **Verified 2026-08-06 on `integration/2026-08-06`.** `411e257` is an
-> ancestor here (it arrives via `fix/host-ffi-hdf5-closure-2026-08-06`).
-> `readelf -d` on the rebuilt host `.so` shows **0** `fftw` `NEEDED` entries,
-> against **3** on the pre-fix library still staged in `lorrax_P`. In-container
-> Tier-1 host then reads **49 passed / 2 skipped / 1 failed** against the
-> 33/19/0 above; the 2 skips are the known SLATE `heev` L-2 pair and the 1
-> failure is `test_compute_wfns_fi_scalapack_matches_native_cpu`, the FFT cell
-> honestly reporting `mklfft: no FFTW3 engine in this process` because the
-> Shifter image ships no FFTW3. The library itself loads: ScaLAPACK, SLATE and
-> GEMM all pass.
->
-> **Read the launch geometry before comparing numbers.** Those counts require
-> **exactly one visible GPU**. With four GPUs visible (`lx run -G 4`), eight
-> SLATE/ScaLAPACK cells fail with `blas::get_device_count()=4 but JAX
-> one-process-per-GPU model requires exactly 1`, giving 41/2/9 -- a launch
-> artifact, not a regression. Measured both ways on this branch and on
-> `fix/host-ffi-hdf5-closure-2026-08-06`: identical in both trees.
->
-> The closure hole that used to survive this fix is also closed:
-> `libhdf5_parallel_gnu.so.310` needs the **1.14.3.7** phdf5 stage
-> (`bbfa026`), not the 1.12 stage. `config/perlmutter/site_config.sh` now
-> defaults `LORRAX_FFI_PHDF5_DIR_DEFAULT` to
-> `$HOME/software/lorrax_phdf5_cray_1.14.3.7/stage`. **An installed modulefile
-> generated before 2026-08-06 still mounts the 1.12 stage**, and against that
-> stage the repaired `.so` fails to load with
-> `libhdf5_parallel_gnu.so.310: cannot open shared object file`. Re-run the
-> installer, or pass `LORRAX_FFI_PHDF5_DIR` explicitly.
->
-> The earlier repair suggestion here -- bind-mount `/opt/cray/pe` -- is
-> withdrawn. It treats a load-time dependency that should not exist as a
-> mount problem, and `411e257` is the better shape.
-
----
-
-## 4. Picking an nvhpc stage picks a communication path
-
-**This is the section that has caused real skew. Read it before touching
-the CUDA leg.**
-
-The staged NVIDIA HPC SDK trees under `/lorrax_nvhpc` are *not* the same
-library at different version numbers. They differ in how cuSOLVERMp
-communicates:
-
-| Stage | cuSOLVERMp | Ships `cal.h` / `libcal`? | Comm path | Build flag |
+| Routine | Perlmutter | Frontera | Alternatives and refusals | Check |
 |---|---|---|---|---|
-| `25.5_cuda12.9` | 0.6.0 | **yes** | CAL | `-DLORRAX_FFI_HAVE_CAL=ON` (the CMake default, `CMakeLists.txt:51`) |
-| `0.7.2_cuda12.9` | 0.7.2 | **no** | NCCL-native | `-DLORRAX_FFI_HAVE_CAL=OFF` — required |
+| **3-D FFT** inside `shard_map` | XLA:GPU `fft` → cuFFT in jaxlib | XLA:CPU `fft` | none: `fft_helpers.local_fftn3` / `local_ifftn3` are `jnp.fft` for code already inside a `shard_map`; no FFI route reaches them | none |
+| **k-axis transforms and convolutions** (ζ fit, Σ, COHSEX, BSE, and the flat-k transform on CUDA) | CUDA: nvidia-mathdx. cpu: the FFTW3-ABI host handlers | host handlers | none on CUDA; a missing wheel refuses at startup (`GATE mathdx-headers`) | `tests/multi_device/kconv_router_p4.py` |
+| **Flat-k FFT, host leg** | FFTW3 ABI by `dlsym` → cray-fftw | MKL's FFTW3 export, already resident | the candidate ladder (§3c) | GATE 5 (load time), GATE 8 (engine identity) |
+| **Host band-block GEMM** (`ffi.gemm`) | LibSci CBLAS; LibSci has no `cblas_?gemm_batch`, so the handler loops plain `cblas_?gemm` | MKL CBLAS, batched entry | any CBLAS provider (MKL, LibSci, OpenBLAS, BLIS); the chosen entry is announced at first use | GATE 2 |
+| **Planned axis GEMM** | full range: XLA `dot` → cuBLAS. Active range: `lorrax_cublas_local_active_range_gemm` over pointer views | XLA:CPU `dot` panels | K stays local; only output centroid axes are sharded ([active GEMM ranges](../dev/active_gemm_ranges.md)) | `services/distrib_la/tests/test_local_active_gemm_range.py` |
+| **Distributed face GEMM** | cuBLASMp, full and active range | none: a `scalapack` or `slate` face plan refuses by name | `batch_reshard` only through the one-shot `matmul`, when whole matrices fit each device | `test_distrib_la_multiproc.py`, `test_active_gemm_range.py`, `tests/multi_device/active_band_sigma_gate.py` |
+| **`eigh`** | default native `jnp.linalg.eigh` → cuSOLVER (GPU), LAPACK (CPU). Distributed: cuSOLVERMp `syevd` (GPU); ScaLAPACK `p?heevd` / `p?syevd` from LibSci (CPU) | default native → LAPACK. Distributed: ScaLAPACK from MKL | `eigh_backend` deck key (`slate` where a SLATE build serves it); refusals in [`distrib_la`](../services/distrib_la.md) | `pytest -m distrib_la`. Nothing observes which vendor answered |
+| **Cholesky** | cuSOLVERMp batched `potrf`/`potrs` (GPU); host SLATE `potrf`/`trsm` (CPU) | host SLATE | `native2d` (JAX); no ScaLAPACK `potrf` handler exists | contract tests only |
+| **LU** | cuSOLVERMp batched `solve_lu` (GPU); ScaLAPACK `p?getrf`/`p?getrs` (CPU) | ScaLAPACK from MKL | fused `solve_lu` and split `getrf`+`getrs`; resolve refuses if any target is missing | contract tests only |
+| **Distributed transport** | NCCL for cuSOLVERMp (§4) and cuBLASMp; an `MPI_COMM_WORLD` split in mesh order for SLATE and ScaLAPACK | Intel MPI | — | the `[lorrax cusolverMp] … comm path:` banner |
+| **Parallel HDF5** | `libhdf5_parallel_gnu.so.310` over `libmpi_gnu_123.so.12` | phdf5 over Intel MPI | none: one transport; a deployment that cannot serve it refuses at open | GATE 1, GATE 7 |
+| **OpenMP runtime** | `libgomp` | `libiomp5` | `libgomp`, `libiomp5`, `libomp` | GATE 6 |
 
-So a default here does not merely guess a version, it **silently picks a
-communication path**. That is why `build.sh` refuses rather than choosing:
-`src/ffi/cpp/build.sh:54-91` exits 2 when neither `LORRAX_NVHPC_ROOT` nor
-`LORRAX_NVHPC_SUBPATH` is set, and enumerates the stages actually present,
-probing each for `cal.h` and printing which flag it needs
-(`build.sh:80-85`).
+### 3b. Routines with no check
 
-Three further facts, each of which has bitten:
+* The spatial 3-D FFT has no build or run check on either machine.
+* No gate observes which vendor answered a distributed `eigh`, Cholesky or
+  LU; only the `distrib_la` contract tests exercise them.
+* `LORRAX_LU_NO_PIVOT` disables cuSOLVERMp pivoting from the environment with
+  no gate; the handler tests presence, so any value, `0` included, turns
+  pivoting off.
 
-1. **Every stage exports the same SONAME**, `libcusolverMp.so.0`. Building
-   against one and running against another links cleanly and warns about
-   nothing.
-2. **`25.5_cuda12.9` (0.6.0) is racy on any mesh with `Px>1` *and*
-   `Py>1`.** MEASURED 2026-08-06: the failure signature is
-   **nondeterminism, not a stable wrong answer** — at 2×2 it trips a
-   rerun-bit-determinism assert before the residual is ever compared,
-   consistent with `config/perlmutter/site_config.sh` crediting 0.7.2 with
-   "the race fix". `0.7.2_cuda12.9` carries both the CAL→NCCL ABI fix and
-   the race fix, and is what `site_config.sh` selects; `run_shifter.sh:171`
-   defaults `LORRAX_NVHPC_SUBPATH` to
-   `0.7.2_cuda12.9/math_libs/12.9/lib64`.
-   *Note for whoever edits the source:* the comments at
-   `run_shifter.sh:165-166` and `build.sh:27-29,65-66` describe this as
-   "returns WRONG getrf/getrs answers", which overstates a race as a
-   deterministic result. A rerun that agrees proves nothing here.
-3. **Both stages are on `LD_LIBRARY_PATH` at runtime.** `run_shifter.sh:202`
-   places the *selected* stage first and `25.5_cuda12.9` after it, on
-   purpose: only that tree ships `libcal.so.0`, which a CAL-built `.so`
-   carries in `DT_NEEDED`. It means the ordering, not the mount, is what
-   decides which `libcusolverMp` you get.
-   *Still true at `8789131`, re-read 2026-08-06.* Commit `b2df35f`
-   ("the 25.5 libcal fallback is vestigial after the 0.7.2 rebuild") is
-   **comment-only** — it adds sixteen lines above an unchanged `LDLIB=`
-   and says so: "The entry is left in place — an older CAL-linked .so still
-   needs it … No behaviour change." Do not read that commit subject as a
-   removal.
+### 3c. Which FFT engine the host library binds
 
-The single source of truth is `LORRAX_NVHPC_SUBPATH`. `run_shifter.sh`
-exports both it and a `LORRAX_NVHPC_ROOT` derived from its first component
-(`run_shifter.sh:240-241`), so a build launched through `run_shifter.sh`
-agrees with the run it is built for **by construction** rather than by two
-people remembering the same string. Launch builds that way.
+One source, `cpp/mklfft/fft_flat_k_ffi.cc`, serves every host FFT through the
+FFTW3 advanced interface (`fftw_plan_many_dft`). No FFTW symbol binds at link
+time. The engine is resolved at first use:
 
-**Verified end to end on the machine, 2026-08-06** (Perlmutter, compute
-node, in-container build):
+1. **Already loaded.** `resolve_sym` (`RTLD_DEFAULT`, then `RTLD_NEXT`). On an
+   MKL site the ScaLAPACK link line has already loaded MKL's FFTW3 export, so
+   the ladder never runs.
+2. **The candidate ladder**, `dlopen(RTLD_GLOBAL)`, first hit wins:
+   `$LORRAX_FFTW3_SO` → the build's `LORRAX_FFTW3_SO_HINT` (a compile-time
+   path) → `libfftw3.so.3` → `libfftw3.so.mpi31.3` → `libmkl_rt.so` →
+   `libfftw3.so`.
+3. **Refusal.** The handler returns `mklfft: no FFTW3 engine in this
+   process`, naming every candidate tried. The startup gate probes only the
+   exported handler symbol, so this error arrives at the first host FFT.
 
-* `NVHPC_ROOT` resolved to `/lorrax_nvhpc/0.7.2_cuda12.9` from the single
-  `LORRAX_NVHPC_SUBPATH` string.
-* The rebuilt `.so` links cuSOLVERMp **0.7.2 with no CAL**: `libcal` absent
-  from `DT_NEEDED`, zero hits in the build log, `nm -D | grep cal_` → 0
-  symbols. The previous `.so` has `U cal_comm_create`. The runtime banner
-  reads `library 0.7.2, comm path: NCCL`.
+On the Perlmutter bare host the hint is cray-fftw's own path. In a Shifter
+container `/opt/cray/pe` does not exist, so the engine comes from the
+`/lorrax_fftw` stage (`stage/fftw_stage_cray.sh`, mounted by
+`run_shifter.sh`).
 
-So the stage genuinely selects the comm path — this is measured, not
-inferred from the CMake option.
+**Hazard.** CUDA images ship `libcufftw.so`, which exports all three entry
+points the ladder binds. Pointing `LORRAX_FFTW3_SO` at it makes the host
+handler transform on the GPU, and every FFT check still passes. GATE 8 is
+the only check that tells these states apart.
 
-> **Open skew, not yet resolved in code.** The CMake default is
-> `LORRAX_FFI_HAVE_CAL=ON` (`CMakeLists.txt:51`) while the runtime default
-> stage is `0.7.2_cuda12.9`, which ships no `libcal` and needs `OFF`. The
-> two defaults disagree. `build.sh` refusing an unstated stage is what
-> currently prevents the mismatch from being silent; nothing else does.
+An engine swap is accepted at value-level parity, relative 1e-12 on the Σ
+path, never bit-exactness: engines differ in arithmetic order.
 
 ---
 
-## 5. Parallel HDF5 — what the FFI side of it is
+## 4. The cuSOLVERMp version picks the communication path
 
-**[`slab_io.md`](slab_io.md) owns this subsystem**: the tile contract and
-what a call site may assume of it, the striping campaign, the launcher
-requirements, the multi-node certification, the one-owner-per-file rule,
-and the measured failure signatures. Only the FFI-side facts belong here.
+cuSOLVERMp changed its grid communicator from CAL (≤ 0.6.x) to NCCL
+(≥ 0.7.0). The handler reads the loaded version with `cusolverMpGetVersion`
+and selects the path at context creation (`cusolvermp/context.cc`); rank 0
+prints `[lorrax cusolverMp] library X.Y.Z, NCCL …, comm path: NCCL|CAL`.
 
-**There is ONE transport, and no router.** The three tiers (`PHDF5_FFI`,
-`PHDF5_HOST`, `H5PY_ALLGATHER`), the `SlabIOBackend` enum, the `slab_io`
-deck key, the `use_ffi_io` boolean and the `auto` router were **deleted
-2026-08-06**, along with the seven separate refusals that had been guarding
-the allgather tier. `file_io/slab_io.py` today takes a path, a mode and a
-mesh, and a deployment that cannot serve the tile path refuses at open
-naming the probe that declined. Anything on any page that describes
-choosing between tiers, or a gap in a refusal that guards one, describes a
-tree that no longer exists —
-[history](slab_io.md#tiers-history) records why, because the shape of the
-mistake recurs.
+| cuSOLVERMp | ships `cal.h` / `libcal` | comm path | build flag |
+|---|---|---|---|
+| ≤ 0.6.x | yes | CAL | `-DLORRAX_FFI_HAVE_CAL=ON` (the CMake default) |
+| ≥ 0.7.0 | no | NCCL | `-DLORRAX_FFI_HAVE_CAL=OFF` |
 
-**The C++ handler is one source serving both legs.** The same `phdf5/`
-sources compile into `liblorrax_ffi.so` and into the CUDA-free
-`liblorrax_ffi_host.so`, where the D2H staging into a pinned buffer degrades
-to an in-place read of the XLA host buffer. That degradation is why the
-control-operand stream race ([`slab_io.md`](slab_io.md#stream-race)) is a
-CUDA-leg-only defect: on the host leg `copy_index_to_host` is a `memcpy`
-and there is no stream to race.
+* **Every version exports the SONAME `libcusolverMp.so.0`.** A `.so` built
+  against one version loads against another without complaint. The run's
+  search path must therefore hold exactly one cuSOLVERMp: the sealed bundle
+  loads its own by exact path, and `run_shifter.sh` puts exactly one NVHPC
+  stage on `LD_LIBRARY_PATH`.
+* **A `HAVE_CAL=OFF` build refuses a pre-0.7 library** at context creation. A
+  `HAVE_CAL=ON` build carries both paths and `DT_NEEDED` `libcal.so.0`.
+* **0.6.x is wrong on a 2-D grid.** With `Px > 1` and `Py > 1` its
+  `getrf`/`getrs` return wrong answers, and the handler only warns. LORRAX
+  meshes are square, so every run at P ≥ 4 is affected: never run a pre-0.7
+  cuSOLVERMp.
+* **≥ 0.8 needs NCCL ≥ 2.27** (`ncclCommWindowRegister`); the handler warns
+  when the loaded NCCL is older.
 
-**Since `fix/ffi-odr-2026-08-08` the two legs' C entry points are NOT
-interchangeable.** The host leg's carry a `_host` suffix
-(`cpp/common/c_abi.h`) and each leg's internal definitions are localised by
-`exports_{cuda,host}.map`, precisely so that one `PhdfCtx` type name with
-two struct layouts can no longer alias across the two `.so`s under
-`RTLD_GLOBAL`. A library built before that fix still exports the plain
-names and still collides —
-[`slab_io.md#odr-host-so`](slab_io.md#odr-host-so) has the current
-measurement and the acceptance test, and `tests/KNOWN_FAILURES.md` L1 owns
-the defect.
-
-**One boolean grammar spans every reader of these knobs**, so
-`LORRAX_PHDF5_COLLECTIVE_WRITES=0` means "independent" wherever it is
-read — §6.
+**Container stages.** `build.sh` refuses (exit 2) when neither
+`LORRAX_NVHPC_ROOT` nor `LORRAX_NVHPC_SUBPATH` names a stage, listing the
+stages under `/lorrax_nvhpc` with the flag each needs. It also refuses a stage
+without `cal.h` unless `LORRAX_FFI_HAVE_CAL` is set explicitly. The single
+source of truth is `LORRAX_NVHPC_SUBPATH` (`config/perlmutter/site_config.sh`,
+default `0.7.2_cuda12.9/math_libs/12.9/lib64`). `run_shifter.sh` exports it
+with `LORRAX_NVHPC_ROOT` derived from its first component, so a build launched
+there agrees with its runs.
 
 ---
 
-## 6. phdf5 defaults — read them here, then read the file
+## 5. Parallel HDF5: the FFI side
 
-**The struct initialisers in `ctx.h:155-160` are not the effective
-defaults.** Every field is reassigned from the environment at `open_file`
-time in `context.cc:352-373`. Two of the six differ between the two places.
-Read `context.cc`, not the header — quoting a declaration and stopping is
-exactly how the stale `use_collective_write=false` claim survived for ten
-days.
+[`slab_io.md`](slab_io.md) owns the subsystem: the tile contract, the
+launcher requirements, striping, certification, the one-owner-per-file rule
+and the measured failure signatures. This section holds only the FFI facts.
 
-| Field | `ctx.h` decl | **Effective** | Env override | Notes |
-|---|---|---|---|---|
-| `use_collective_read` | `true` | `true` | `LORRAX_PHDF5_INDEPENDENT=1` → independent **reads** | `context.cc:352,355` |
-| `use_collective_write` | `true` | **`true`** | `LORRAX_PHDF5_COLLECTIVE_WRITES=0` | flipped `false`→`true` on **2026-07-27**, commit `d40e7fd` |
-| `coll_metadata` | `false` | `false` | `LORRAX_PHDF5_COLL_META=1` | non-collective metadata lets `H5Dcreate`/extend bypass the collective driver |
-| `dedup_replicas` | `true` | `true` | `LORRAX_PHDF5_DEDUP_REPLICAS=0` | drops all-but-one writer of a replica group's identical hyperslab |
-| `align_threshold` | 1 MiB | **4 MiB** | `LORRAX_PHDF5_ALIGN_MB` (default `4`) | `context.cc:367,372` |
-| `align_length` | 1 MiB | **4 MiB** | same knob — set together | `context.cc:373` |
+* **One transport, no router.** `file_io.slab_io` takes a path, a mode and a
+  mesh; a deployment that cannot serve the tile path refuses at open, naming
+  the probe that declined ([availability](slab_io.md#availability)).
+* **One C++ source, both legs.** The `phdf5/` sources compile into both
+  libraries. On the host leg the device staging collapses: the read tail is a
+  `memcpy` into the host XLA buffer and the write hands `H5Dwrite` the XLA
+  buffer directly. The control-operand stream race
+  ([`slab_io.md`](slab_io.md#stream-race)) is therefore CUDA-leg only.
+* **The legs' entry points are not interchangeable.** The host leg's C entry
+  points end in `_host`, and each leg localises its internals, because one
+  `PhdfCtx` name has two struct layouts. A library built without them exports
+  both layouts under one name, and the first-loaded library answers for both;
+  GATE 9 and GATE 10 catch it.
+* **`ffi.io.open_file(path, *, mesh, mode)`** picks the library from the
+  mesh's devices and records it per handle, so `close_file` returns through
+  the opening library. `mode` has no default. It refuses a mode outside
+  `{w, a, r}`, a mesh without both `x` and `y`, and
+  `p·q ≠ jax.process_count()`. An already-open path may be opened again only
+  when both opens are read-only on the same platform and mesh; they then share
+  one native context.
 
-Alignment is deliberately *not* tied to the striping unit, and is measured
-non-load-bearing on this filesystem: at 16 × 1 MiB striping, `ALIGN_MB` of
-4 / 1 / 0 gave 0.830 / 0.809 / 0.813 GiB/s at 1 node and 2.975 / 2.883 /
-2.915 at 4 nodes — all inside ±1.5 % repeat noise (job 56389339). It stays
-at 4 rather than becoming a knob that must be kept in sync with a value it
-does not depend on.
+---
 
-**Boolean grammar.** All the flags parse through `env_flag`
-(`context.cc`), which mirrors Python's `file_io/_slab_io_ffi._env_flag`
-exactly (it mirrored `_slab_io_mpi_host._env_flag` until that module was
-deleted with the host tier on 2026-08-06): unset or exactly-empty →
-the default; otherwise trimmed, lowercased, and **true only for
-`1` / `true` / `yes` / `on`**. Everything else is false — including `off`,
-`no`, and any typo. There is no "unrecognised value" diagnostic, so
-`LORRAX_PHDF5_COLLECTIVE_WRITES=ture` silently disables collective writes.
-One grammar, every writer.
+## 6. phdf5 defaults
 
-Two of these are correctness, not tuning:
+The struct initialisers in `phdf5/ctx.h` are not the effective defaults:
+`open_ctx_impl` in `phdf5/context.cc` reassigns every field from the
+environment when a file is opened.
 
-* **`dedup_replicas`** is *required* under collective writes. Overlapping
-  hyperslab selections are undefined in HDF5. Under independent writes the
-  same flag is pure waste-removal.
-* **`use_collective_write`** decides whether a PMI-mismatched launch fails
-  loudly or corrupts silently — see §7.
+| Field | Effective default | Override | Role |
+|---|---|---|---|
+| `use_collective_read` | `true` | `LORRAX_PHDF5_INDEPENDENT=1` → independent **reads** | tuning |
+| `use_collective_write` | `true` | `LORRAX_PHDF5_COLLECTIVE_WRITES=0` → independent writes | correctness (§7b) |
+| `coll_metadata` | `false` | `LORRAX_PHDF5_COLL_META=1` | non-collective metadata keeps `H5Dcreate`/extend off the collective driver |
+| `dedup_replicas` | `true` | `LORRAX_PHDF5_DEDUP_REPLICAS=0` | correctness: one writer per replica group; overlapping selections are undefined under collective writes |
+| `align_threshold`, `align_length` | 4 MiB (header: 1 MiB) | `LORRAX_PHDF5_ALIGN_MB` | tuning; independent of the stripe unit |
 
-History of the write default, since prose elsewhere in the tree still
-carries the old value: introduced `3a7f2e5` (2026-04-17); set `false` in
-`d37c47a` (2026-04-20, "independent writes by default; Cray MPICH now
-works"); set `true` in `d40e7fd` (2026-07-27).
-
-> **Known stale comments in source (reported, not edited — those files are
-> owned elsewhere).** `src/ffi/cpp/stage/phdf5_stage_cray.sh:13-19` and
-> `src/ffi/cpp/run_shifter.sh:100-104` both still assert that the phdf5
-> default is *independent* writes with non-collective metadata. That has
-> been false since 2026-07-27. The first of the two is actively harmful —
-> see §7.
+**Boolean grammar.** `env_flag` (`phdf5/ctx.h`): unset or empty → the
+default; otherwise trimmed and lower-cased, and true only for `1`, `true`,
+`yes`, `on`. Any other value is false, silently: `=ture` turns collective
+writes off. The Python twin, `runtime.env_flags.env_bool`, accepts the same
+table but announces an unrecognised value; `tests/test_env_grammar.py` holds
+the two in step. Collective-buffering and stripe knobs are in
+[`slab_io.md`](slab_io.md#tuning).
 
 ---
 
 ## 7. Failure modes, and how to tell them apart
 
-### 7a. The PMI-flavour mismatch — the one that gives wrong answers
+### 7a. The PMI-flavour mismatch gives wrong answers
 
-**Measured**, job 56389339, 4 nodes / 16 ranks, launched `srun --mpi=pmi2`
-(the wrong PMI flavour for Cray MPICH; the right one is `cray_shasta`):
+Launched with the wrong PMI for Cray MPICH (`srun --mpi=pmi2` instead of
+`cray_shasta`), every rank gets a private singleton `MPI_COMM_WORLD`:
+`MPI_Comm_size == 1` while `jax.process_count() == P`. The native checks
+cannot see it: `ffi.io.open_file` checks `p·q == jax.process_count()`, and
+`shard_index.h::validate_shard_encoding` checks `prod(mesh_shape) ==
+ctx->world_size`, where `world_size` *is* `jax.process_count()`. Both compare
+JAX to JAX. With disjoint hyperslabs the write completes bit-exact at rc = 0
+(sandbox CLAIMS 68); two ranks on one chunk would corrupt silently.
 
-```
-MPI_Comm_size(MPI_COMM_WORLD) == 1   on every rank
-jax.process_count()           == 16
-→ 8 hostile geometries written and read back BIT-EXACT, rc=0,
-  file 16-striped and fully populated, no warning anywhere.
-```
+**The guard** (`file_io/_slab_io_ffi._assert_mpi_world`) asks MPI once, at
+the first collective open, and compares `MPI_Comm_size(MPI_COMM_WORLD)` with
+`jax.process_count()`. The verdict is rank-invariant, so it refuses on every
+rank or none.
 
-Nothing in the stack noticed, and the reason is worth internalising:
-`ffi.io.open_file` checks `p*q == jax.process_count()`, and
-`shard_index.h::validate_shard_encoding` checks
-`prod(mesh_shape) == ctx->world_size` — but `ctx->world_size` *is*
-`jax.process_count()`, passed down from Python. **Both checks compare JAX to
-JAX and agree.** The MPI communicator `H5Dwrite` actually collects on was
-never consulted.
+* A mismatch always refuses. Fix the launcher.
+* An MPI world that cannot be probed refuses by default;
+  `LORRAX_PHDF5_REQUIRE_MPI_WORLD=0` downgrades that case to a rank-0
+  warning.
+* `LORRAX_PHDF5_SKIP_MPI_WORLD_CHECK=1` removes the guard. It is a debugging
+  escape, never a remedy.
 
-It "worked" only because the hyperslabs happened to be disjoint, so there
-was no collective handshake left to fail. Change the geometry so two ranks
-touch one HDF5 chunk, or let one rank's metadata update race another's, and
-it is silent corruption with rc=0.
+### 7b. The ROMIO collective-buffer OOM
 
-The guard is in `file_io/_slab_io_ffi.py`: ask MPI once, at the first
-collective open. The verdict is rank-invariant by construction, so it
-refuses everywhere or nowhere — the only kind of refusal a collective
-tolerates.
-
-### 7b. The ROMIO OOM — and the documented remedy that makes it worse
-
-With collective writes ON (the current default) that same mismatched launch
-does **not** survive. But it does not diagnose either. It dies as:
+Cray MPICH's collective write can exhaust memory at large per-rank aggregates:
 
 ```
 Out of memory in .../ad_cray/ad_cray_write_coll.c, line 669
 … MPI_Abort … "HDF5: infinite loop closing library"
 ```
 
-That is the *same* line `stage/phdf5_stage_cray.sh:13-19` documents as a
-known Cray-MPICH `≥1 GB/rank` collective-buffer OOM — whose documented
-remedy is `LORRAX_PHDF5_COLLECTIVE_WRITES=0` / `LORRAX_PHDF5_INDEPENDENT=1`.
+The same line appears when the PMI flavour is wrong (§7a) and collective
+writes are on. The two want opposite remedies:
 
-**That documented remedy is wrong in both halves.**
-
-* `LORRAX_PHDF5_COLLECTIVE_WRITES=0` does exactly what it says — and
-  converts the loud crash into the silent-wrong-answer regime of §7a.
-* `LORRAX_PHDF5_INDEPENDENT=1` forces independent **reads**
-  (`context.cc:352,355`). It does nothing to the write path at all, so
-  against a write-side OOM it is simply inert.
-
-The misdiagnosis is not hypothetical — the tree points straight at it, and
-the half of the advice that *does* something is the half that hides the
-bug.
-
-How to tell the two apart before reaching for the knob:
-
-| | genuine Cray collective-buffer OOM | PMI-flavour mismatch |
+| | genuine collective-buffer OOM | PMI-flavour mismatch |
 |---|---|---|
-| `MPI_Comm_size(MPI_COMM_WORLD)` | == `jax.process_count()` | **1**, on every rank |
-| per-rank aggregate | ≳ 1 GB | any size |
-| independent writes | genuinely fixes it | **hides it** |
+| `MPI_Comm_size(MPI_COMM_WORLD)` | `== jax.process_count()` | `1` on every rank |
+| per-rank aggregate | ≳ 1 GB | any |
+| `LORRAX_PHDF5_COLLECTIVE_WRITES=0` | fixes it | hides it: silent wrong answers (§7a) |
 
-Check the world size **first**. `LORRAX_PHDF5_REQUIRE_MPI_WORLD=1` makes an
-unprobeable world a refusal rather than a warning;
-`LORRAX_PHDF5_SKIP_MPI_WORLD_CHECK` disables the guard entirely and should
-be treated as a debugging-only escape hatch, never a remedy.
+Check the world size first. `LORRAX_PHDF5_INDEPENDENT=1` changes reads only
+and does nothing for a write-side OOM.
 
-Not reproduced at 512 MiB/rank in the 2026-08-05 Perlmutter campaign, and
-the collective default was revalidated there (job 56389339): keep it at `1`.
+### 7c. SONAME aliases that look like two MPIs
 
-### 7c. SONAME aliases that look like two ABIs and are not
+In the Shifter container, `stage/phdf5_stage_cray.sh` creates one symlink per
+Cray compiler-specific SONAME, `libmpi_gnu_{91,110,123}.so.12`, all pointing
+at the container's generic MPICH-ABI `/opt/udiImage/modules/mpich/libmpi.so.12`
+(`SHIM_TARGET`). Every variant is one object. On a login node the closure is
+incomplete and `ldd` reports several dependencies `not found`, which proves
+nothing. Check a library's closure where it runs: inside the container on a
+compute node, where `gate_one_mpi.sh` (GATE 1) deduplicates by `realpath`.
 
-`libmpi_gnu_123.so.12` is **a deliberate symlink, not a second MPI**.
-`src/ffi/cpp/stage/phdf5_stage_cray.sh:128-130` creates one shim per
-cray-pe compiler-specific SONAME — `libmpi_gnu_{91,110,123}.so.12` — all
-pointing at the container's generic MPICH-ABI library,
-`/opt/udiImage/modules/mpich/libmpi.so.12` (`SHIM_TARGET`, line 92). The
-loader follows the symlink at container startup; every variant is MPICH 4.x
-`libmpi.so.12` underneath. **One object, not two.**
+### 7d. Bounds-check asymmetry hangs with no traceback
 
-A 2026-08-05 report of a two-MPI-ABI defect on the CUDA leg was **retracted
-on 2026-08-06** for this reason. The `ldd` behind it was run on a **login
-node**, where the closure is incomplete and four dependencies show
-`not found`.
-
-> **Method note, because this cost real time.** `ldd` on a login node does
-> not describe what a container run loads. Run link-closure checks inside
-> the container, on a compute node, through `lx run`. A `not found` in a
-> login-node `ldd` is evidence of nothing.
-
-### 7d. Bounds-check asymmetry — the hang with no traceback
-
-Bounds are tested once, on the *logical* slab `offset + valid_shape`, which
-is a replicated quantity, so every rank reaches the same verdict. Testing a
-rank-local advanced offset splits the ranks into those that refuse and those
-that enter the collective, stranding the communicator with no HDF5 error and
-no traceback (**measured**: 306 s hang at P=4; silent 420 s timeout on the
-read path). No rank may skip a collective because of its own error: record
-it, participate in the teardown, then raise. See `decisions.md` 2026-08-04.
+Bounds are tested once, on the logical slab `offset + valid_shape`, which is
+replicated, so every rank reaches the same verdict. A test on a rank-local
+offset splits the ranks into those that refuse and those that enter the
+collective, and the communicator hangs with no HDF5 error. No rank may skip a
+collective because of its own error: record it, take part in the teardown,
+then raise ([`decisions.md`](decisions.md), 2026-08-04).
 
 ---
 
 ## 8. Hard invariants
 
-Checked at `886139f` and re-checked at `8789131` on 2026-08-06; not aspirational.
-
-1. **Registered FFI custom-call target names do not change.** The full set
-   is in `src/ffi/common/ffi_loader.py` (`_CUDA_TARGET_SYMBOLS`,
-   `_HOST_TARGET_SYMBOLS`). Refactors move files; they never edit a target
-   string or a C++ handler symbol.
-2. **Env knob spellings do not change.** Aliases only.
-3. **Built `.so` names and consumed paths stay stable, or their consumers
-   are updated in the same commit.** `liblorrax_ffi.so` /
-   `liblorrax_ffi_host.so`.
-4. **A stage script refuses an unstated environment fact rather than
-   guessing it.** `phdf5_stage_cray.sh` refuses an unset `HDF5_DIR`
-   (lines 57-70) and an unset `MPICH_DIR` (73-84); `build.sh` refuses an
-   unset nvhpc stage (54-91). Each of those was a hardcoded guess until
-   2026-08-05/06, and each guess had gone stale: the HDF5 fallback named
-   1.12.2.9 while the host build uses `cray-hdf5-parallel/1.14.3.7`. What
-   is staged is what every later build *links against*, and a wrong guess
-   does not fail at link time — it fails much later, as a wrong answer or a
-   hang, with nothing on disk recording the substitution.
-
-Invariant 4 is the generalisation of §4 and §7b: **in this layer, a
-substituted default is a wrong answer with a long fuse.**
+1. **Registered FFI target names and C++ handler symbols do not change.** The
+   sets are `_CUDA_TARGET_SYMBOLS` and `_HOST_TARGET_SYMBOLS` in
+   `ffi/common/ffi_loader.py` (and `distrib_la.loader`'s table). Refactors
+   move files, never a target string.
+2. **Env knob spellings do not change.** Add an alias instead.
+3. **Library names are `liblorrax_ffi.so` and `liblorrax_ffi_host.so`.** A
+   change updates every consumer in the same commit.
+4. **The two legs share no LORRAX-owned dynamic symbol** (GATE 9, GATE 10).
+5. **A stage or build script refuses an unstated environment fact rather than
+   guessing it.** `phdf5_stage_cray.sh` refuses an unset `HDF5_DIR` or
+   `MPICH_DIR`; `build.sh` refuses an unstated cuSOLVERMp stage, a CAL
+   mismatch, and unset `LORRAX_MPI_INCLUDE_DIR` / `LORRAX_MPICH_LIB_DIR`
+   (CMake would otherwise fall back to HPC-X Open MPI). What is staged is what every later build links, and a wrong guess
+   surfaces much later as a wrong answer or a hang.
+6. **A handler ABI change bumps `src/ffi/cpp/common/lorrax_ffi_abi.h`** and
+   its mirror `ffi_loader.LORRAX_FFI_ABI_VERSION` together
+   (`tests/test_ffi_abi_stamp.py`), and old bundles then refuse.
 
 ---
 
-## 9. Deletion candidates and open work
-
-* **cusolvermp** (~2800 LOC): 11 import sites outside `src/ffi` at
-  `886139f`. The distributed CPU story is ScaLAPACK; the GPU story is
-  SLATE. Deletion removes the `auto|cusolvermp` spelling from the linalg
-  backend grammar — an input-deck surface, so it needs the deprecation
-  window plus a GPU run proving SLATE covers the eigh/LU tiers cusolvermp
-  served.
-* **cublasmp** (~1450 LOC): 4 import sites (`bse/vq_interp.py`,
-  `bandstructure/htransform.py`, tests). The fused W-solve path has no
-  measured replacement, so this leg stays until a GPU gate exists.
-* **Shim deletion**: blocked on consumer migration (§1).
-* **FFT, remaining items**: `fftw_init_threads` / `plan_with_nthreads` on
-  non-MKL engines under the existing `LORRAX_FFT_FFI_THREADS` grammar; the
-  `fftwf_` twin table if BSE adoption wants c64; and only then gating the
-  shard_map-interior `local_*fftn3` entry so the FFI can back
-  `make_sharded_ifftn_3d`. That last flip is a **measurement**, not a move,
-  and until it happens that layer stays XLA by ruling.
-
-Parity gate for any engine swap, stated once with its class: value-level,
-**relative 1e-12** (the Σ-path class, `flat_k_fft_service.md` §7). Not
-bit-exactness — swapping engines changes the arithmetic ordering, where bit
-equality is not promised. And not the 1e-16 figures: those are *measured*
-unit residuals sitting at the c128 ULP, where a threshold tests nothing.
-
-### k-convolution router and the mathdx family
+## k-convolution router and the mathdx family
 
 Every k-axis convolution and every k-axis transform in the physics is requested
 through one factory in `ffi/fft.py` (re-exported by `common.fft_helpers`). The
@@ -895,7 +631,7 @@ A new mode is added in four steps:
    and the plan-route composition on cpu.
 4. Add a case, with a red twin, to `tests/multi_device/kconv_router_p4.py`.
 
-#### Parent-load ISDF pair convolution (mode 1)
+### Parent-load ISDF pair convolution (mode 1)
 
 Mode 1 is the pair convolution with its operands unfolded from the raw parent
 k-points inside the load, so no full-k open-spin array is written to HBM. With
