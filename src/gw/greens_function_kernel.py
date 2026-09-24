@@ -9,6 +9,36 @@ import jax.numpy as jnp
 from common.contract_bands import merge_spin_centroid
 
 
+def _face_band_gather_product(A, B, mesh, phases, band_range):
+    """``A·diag(w)·B`` on band-distributed faces by gathered band panels.
+
+    ``A`` ``(nq, M, N_b)`` and ``B`` ``(nq, N_b, N)`` are both
+    ``P(None,'x','y')``.  ``w`` is the phase row, zero outside the per-row
+    ``band_range``.  ``distrib_la.panel_matmul`` all-gathers the band panels
+    (A over y, B over x) and multiplies them locally into the rank's own
+    output tile, so no reduction follows.  The gathered panels are bounded
+    by the output tile they build: ``16·nq·(M/p_x)·(N/p_y)`` bytes, one full
+    band gather whenever that holds the whole band extent, streamed chunks
+    otherwise.
+    """
+    from distrib_la import panel_matmul
+
+    nq, m, nb = (int(v) for v in A.shape)
+    n = int(B.shape[-1])
+    weight = None if phases is None else phases.astype(A.dtype)
+    if band_range is not None:
+        lo, hi = (jnp.reshape(jnp.asarray(v), (-1, 1)) for v in band_range)
+        idx = jnp.arange(nb)[None, :]
+        live = (idx >= lo) & (idx < hi)
+        weight = (live.astype(A.dtype) if weight is None
+                  else jnp.where(live, weight, jnp.zeros((), A.dtype)))
+    if weight is not None:
+        A = A * weight[:, None, :]
+    px, py = int(mesh.shape['x']), int(mesh.shape['y'])
+    out_bytes = A.dtype.itemsize * nq * (m // px) * (n // py)
+    return panel_matmul(A, B, mesh=mesh, panel_bytes=out_bytes)
+
+
 def _build_G_face(psi_mun, psi_nmu, *, gemm, Gij=None, phases=None, mesh=None,
                   band_range=None, prepared_active_gemm=None):
     """Contract band-replicated faces locally or band-distributed faces with their GEMM plan.
@@ -46,6 +76,10 @@ def _build_G_face(psi_mun, psi_nmu, *, gemm, Gij=None, phases=None, mesh=None,
         if phases is None:
             raise ValueError("prepared_active_gemm requires per-band phases")
         G_flat = prepared_active_gemm(A, B, weights=phases)
+    elif getattr(gemm, "backend", "local") != "local":
+        # A already carries the phases when there is no band range (above).
+        G_flat = _face_band_gather_product(
+            A, B, gemm.mesh, None if band_range is None else phases, band_range)
     else:
         G_flat = (gemm(A, B) if band_range is None
                   else gemm.active_range(A, B, *band_range, weights=phases))
