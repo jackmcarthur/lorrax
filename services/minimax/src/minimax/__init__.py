@@ -8,8 +8,9 @@ The target is part of every rule contract. ``serve`` computes the static,
 imaginary-probe, and regularized crossing screening rules in process;
 ``lookup`` inspects historical certified assets without solving. Sigma's
 complex denominator rectangles use ``build_uniform_rule``. The shared-pole W
-bank uses ``response_bank_rule`` and ``response_laplace_rule`` because it
-needs current-frequency value and derivative projections. Finite-temperature
+bank uses ``response_frequency_rule`` for its active transition stream.
+``response_bank_rule`` and ``response_laplace_rule`` remain standalone
+certified scalar constructors. Finite-temperature
 KMS response has ``matsubara_response_rule``. The GN-PPM odd kernel shares
 its even rule's times through ``augment_odd_laplace``. MPA's damped line and
 rectangle time rules are built through the four ``damped_*_rule`` names.
