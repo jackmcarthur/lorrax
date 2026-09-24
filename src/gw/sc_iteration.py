@@ -662,6 +662,12 @@ class SCState:
     # _frozen_scissor_fits. An authenticated external SC seed may supply it
     # on map 0; ordinary cold and one-shot paths start with None.
     frozen_scissor_fits: tuple | None = None
+    # The previous map's quasiparticle weights Z_n = 1/(1 - dReSigma_nn/dw)
+    # at each identity's own energy, (nk_loop, nb_active) in DFT-identity
+    # order: the sum-band tail's fit weights (owner 2026-09-24).  Sigma of a
+    # map exists only after its tail feeds chi0/W, so the weights ride the
+    # carry one map behind, like ``partition``; None (map 0) is unit weight.
+    tail_z_kn: np.ndarray | None = None
 
 
 def _sc_output_tables_on_loop_kset(
@@ -2890,13 +2896,19 @@ def _sc_sampled_support(inputs, partition, energies_loop, mu_ev):
     return sampled_grid, expanded_grid, energy_relative_ev, required_kn
 
 
-def _fit_sum_band_tail(fit_kwargs, fit_mask_kn, sigma0_kn):
+def _fit_sum_band_tail(fit_kwargs, fit_mask_kn, sigma0_kn, z_kn=None):
     """Owner ruling 2026-09-24: the sum-band tail law averages only states
     that consume Sigma(E_nk).  A state off the sampled grid this map
     (``sigma0_kn``, the uncovered set of ``qsgw_utils.omega_coverage`` on the
     grid build_qsgw_sigma_xc uses; it reads the edge or omega = 0) is
     excluded, so its energy cannot move the tail: on Fe 4^3 three such states
     set a 14.9 meV tail shift (CLAIMS 2703).
+
+    Each sample is weighted by its quasiparticle weight Z (``z_kn``, the
+    carried weights of the previous map): a state riding a satellite or
+    pole has small Z and cannot drag the tail, and a state with Z outside
+    (0, 1] is not a quasiparticle and is dropped.  ``z_kn=None`` (map 0) is
+    unit weight, bit for bit the plain mean.
 
     No qualifying conduction state: no tail law (E_DFT), said in the log.
     Never a previous map's law: the map reads only its carry
@@ -2905,7 +2917,14 @@ def _fit_sum_band_tail(fit_kwargs, fit_mask_kn, sigma0_kn):
     """
     sigma0_kn = np.asarray(sigma0_kn, dtype=bool)
     n_excluded = int(np.count_nonzero(fit_mask_kn & sigma0_kn))
-    fit = fit_scissor(fit_mask_kn=fit_mask_kn & ~sigma0_kn, **fit_kwargs)
+    mask = fit_mask_kn & ~sigma0_kn
+    weights = None
+    if z_kn is not None:
+        z = np.asarray(z_kn, dtype=np.float64)
+        quasiparticle = np.isfinite(z) & (z > 0.0) & (z <= 1.0)
+        mask = mask & quasiparticle
+        weights = np.where(quasiparticle, z, 1.0)
+    fit = fit_scissor(fit_mask_kn=mask, state_weights_kn=weights, **fit_kwargs)
     if int(fit.n_fit_c) > 0:
         return fit, n_excluded, ""
     return None, n_excluded, (
@@ -3432,7 +3451,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
                 if inputs.config.sc.tail_fit == "frontier" else None),
             conduction_rigid_mean=(
                 inputs.config.sc.tail_fit == "conduction_mean"),
-        ), fit_mask_kn, sigma0_kn)
+        ), fit_mask_kn, sigma0_kn, state.tail_z_kn)
         if tail_note:
             _record_sc(inputs, f"    SC sum-band tail: {tail_note}")
     if tail_fit is not None:
@@ -3455,7 +3474,8 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             f"beta={tail_fit.beta_c_ev:+.4f} eV "
             f"(n={tail_fit.n_fit_c}, w={tail_fit.w_fit_c:.0f}, "
             f"policy={inputs.config.sc.tail_fit}; "
-            f"{n_sigma0_excluded} off-grid state(s) excluded)")
+            f"{n_sigma0_excluded} off-grid state(s) excluded; "
+            + ("unit weights" if state.tail_z_kn is None else "Z-weighted") + ")")
 
     # Same-run metal threading: the ENTRY-solved state feeds chi, the head
     # and Sigma — one mu per map call, from this call's spectrum.
@@ -4216,7 +4236,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         _hdf5_probe(f"sc_{state.iteration:04d}", print_fn=inputs.print_fn)
 
     timing.record("sc.map_assemble", time.perf_counter() - _assemble_t0)
-    return SCState(
+    state_out = SCState(
         H_qp_dft=H_qp_dft_new,
         iteration=state.iteration + 1,
         partition=partition,
@@ -4240,6 +4260,14 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             exact_hartree_dft=exact_hartree_dft,
         ),
     )
+    if tail_fit is None:
+        return state_out
+    # This map's Z at each identity's own input energy: the next map's tail
+    # weights.  Sigma was built in the input carry's eigenbasis, whose sorted
+    # columns indices_loop maps to identities.  Collective, every rank.
+    z_sorted = _sc_z_factors(inputs, state_out, energies_loop)
+    return replace(state_out, tail_z_kn=np.take_along_axis(
+        np.asarray(z_sorted, dtype=np.float64), indices_loop, axis=1))
 
 
 # ---------------------------------------------------------------------------
@@ -5502,6 +5530,7 @@ def _run_linear_mixing(
             occupation_state=state.occupation_state,
             head_surface_weight_kn=state.head_surface_weight_kn,
             frozen_scissor_fits=state.frozen_scissor_fits,
+            tail_z_kn=state.tail_z_kn,
         )
         map_input = state
         state_map = gw_iteration_map(map_input, inputs)
@@ -5522,6 +5551,7 @@ def _run_linear_mixing(
             head_surface_weight_kn=state_map.head_surface_weight_kn,
             outputs=state_map.outputs,
             frozen_scissor_fits=_frozen_fits,
+            tail_z_kn=state_map.tail_z_kn,
         )
         if mixing != 1.0:
             H_next = (
@@ -5537,6 +5567,7 @@ def _run_linear_mixing(
             occupation_state=state_map.occupation_state,
             head_surface_weight_kn=state_map.head_surface_weight_kn,
             frozen_scissor_fits=_frozen_fits,
+            tail_z_kn=state_map.tail_z_kn,
         )
         E_new_ev = np.asarray(eigvalsh_kshard(state_next.H_qp_dft)) * RYD_TO_EV
         rms = float(np.sqrt(np.mean((E_new_ev - E_prev_ev) ** 2)))
@@ -5777,6 +5808,7 @@ def _run_anderson(
     _last_verdict: list[ConvergenceVerdict | None] = [None]
     _occ_state: list = [state_init.occupation_state]
     _head_surface_weight: list = [state_init.head_surface_weight_kn]
+    _tail_z: list = [state_init.tail_z_kn]
     _iter_idx = [0]
     rms_history: list[float] = []
     _partition: list[BandPartition | None] = [state_init.partition]
@@ -5835,6 +5867,7 @@ def _run_anderson(
             occupation_state=_occ_state[0],
             head_surface_weight_kn=_head_surface_weight[0],
             frozen_scissor_fits=_frozen_fits[0],
+            tail_z_kn=_tail_z[0],
         )
         _key_before = _event_key()
         state_out = gw_iteration_map(state_in, inputs)
@@ -5853,6 +5886,7 @@ def _run_anderson(
         _metric_np[:, :nb, :nb] = metric_mask[:, :, None] * metric_mask[:, None, :]
         _occ_state[0] = state_out.occupation_state
         _head_surface_weight[0] = state_out.head_surface_weight_kn
+        _tail_z[0] = state_out.tail_z_kn
         # Track per-call eigenvalue RMS so the user sees progress in the
         # same shape the linear path prints.
         E_new = np.asarray(eigvalsh_kshard(state_out.H_qp_dft)) * RYD_TO_EV

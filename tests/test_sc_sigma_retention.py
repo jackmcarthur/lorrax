@@ -64,8 +64,13 @@ def _state_attrs(fn, var="state"):
 # the map solves its own occupations from the spectrum of the H it is
 # handed, so neither correctness nor the head consumes the carry;
 # head_surface_weight_kn is carried for continuity but never read here.
+# tail_z_kn (owner 2026-09-24) is the previous map's quasiparticle weights,
+# the sum-band tail's fit weights: a map's Sigma exists only after its tail
+# feeds chi0/W, so the weights ride one map behind, an explicit carry like
+# partition; None is unit weight, and at the fixed point they are the
+# state's own.
 _CARRY_KEYS = {
-    "iteration", "H_qp_dft", "partition", "occupation_state",
+    "iteration", "H_qp_dft", "partition", "occupation_state", "tail_z_kn",
 }
 
 # What a bare INPUT SCState is constructed with in the drivers: the read
