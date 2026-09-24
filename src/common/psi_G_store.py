@@ -689,7 +689,7 @@ class PsiGStore:
         @partial(
             shard_map, mesh=self.mesh,
             in_specs=(P(("x", "y"), None, None), P(("x", "y")),
-                      P(None, None, None, None), P(None, None)),
+                      P(None, None), P(None, None)),
             out_specs=band_sphere_spec(), check_vma=False)
         def _local(rows, row_k, g_index, kvecs_frac):
             def _tile(args):
@@ -706,7 +706,7 @@ class PsiGStore:
             in_shardings=(
                 NamedSharding(self.mesh, P(("x", "y"), None, None)),
                 NamedSharding(self.mesh, P(("x", "y"))),
-                NamedSharding(self.mesh, P(None, None, None, None)),
+                NamedSharding(self.mesh, P(None, None)),
                 NamedSharding(self.mesh, P(None, None))),
             out_shardings=NamedSharding(self.mesh, band_sphere_spec()))
         self._rchunk_kernel_cache[key] = fn
@@ -737,7 +737,7 @@ class PsiGStore:
 
         @partial(
             shard_map, mesh=self.mesh,
-            in_specs=(P(None, None, None, None), P(None, None), P()),
+            in_specs=(P(None, None), P(None, None), P()),
             out_specs=band_sphere_spec(), check_vma=False)
         def _local(g_index, kvecs_frac, bc_idx):
             psi_G = io_callback(
@@ -758,7 +758,7 @@ class PsiGStore:
         fn = jax.jit(
             _local,
             in_shardings=(
-                NamedSharding(self.mesh, P(None, None, None, None)),
+                NamedSharding(self.mesh, P(None, None)),
                 NamedSharding(self.mesh, P(None, None)), rep),
             out_shardings=NamedSharding(self.mesh, band_sphere_spec()))
         self._rchunk_kernel_cache[key] = fn
@@ -841,7 +841,7 @@ class PsiGStore:
 
     @property
     def g_index(self) -> jax.Array:
-        """Replicated ``(nk_tot, nx, ny, nz)`` int32 box-index tensor.
+        """Replicated ``(nk_tot, ngkmax)`` int32 per-k sphere index.
 
         Staged on device by ``_populate_from_loader``.  Used by
         ``gflat_to_rchunk``.

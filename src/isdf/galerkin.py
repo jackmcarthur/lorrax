@@ -687,7 +687,7 @@ def _whole_state_geometry(*, meta, mesh_xy: Mesh, nk: int, nspinor: int,
     geom = dict(
         p=int(mesh_xy.size), ns=int(nspinor), nk=int(nk),
         ngkmax=int(ngkmax), n_rtot=n_rtot,
-        g_index=float(nk * n_rtot * np.dtype(np.int32).itemsize),
+        g_index=float(nk * ngkmax * np.dtype(np.int32).itemsize),  # sphere index
         row_fft=float(memory.total), row_cufft=float(memory.cufft_scratch),
         reserve=math.inf,
         n_band_chunks=lambda carrier: -(-(b1 - b0) // int(carrier)))

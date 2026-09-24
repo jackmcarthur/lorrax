@@ -50,13 +50,14 @@ class _Loader:
         self.mesh, self.nkpts, self.nbands, self.ngkmax = mesh, nk, nbands, ngkmax
         self.psi = (rng.normal(size=(nk, nbands, ns, ngkmax))
                     + 1j * rng.normal(size=(nk, nbands, ns, ngkmax)))
-        g_index = np.full((nk, n_r), ngkmax, dtype=np.int32)
+        # The per-k sphere index (common.gvec_fft_box.build_sphere_box_index):
+        # the flat box cell of each slot, n_r + g on a pad slot.
+        g_index = np.tile(n_r + np.arange(ngkmax, dtype=np.int32), (nk, 1))
         for k in range(nk):
             ngk = ngkmax - k % 3          # ragged spheres, as in a real WFN
-            cells = rng.choice(n_r, size=ngk, replace=False)
-            g_index[k, cells] = np.arange(ngk, dtype=np.int32)
+            g_index[k, :ngk] = rng.choice(n_r, size=ngk, replace=False)
             self.psi[k, :, :, ngk:] = 0.0
-        self.g_index = g_index.reshape(nk, *fft_grid)
+        self.g_index = g_index
         self.k = rng.uniform(-0.5, 0.5, size=(nk, 3))
 
     def load(self, *, bands, k, sharding, bispinor, bispinor_lift):
