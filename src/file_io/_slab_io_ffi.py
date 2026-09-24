@@ -213,6 +213,13 @@ def _stripe_policy(nranks: int) -> tuple[int, int]:
     the policy can be tested at rank counts no allocation can reach.
     See the block comment above for the measurements behind every number.
     """
+    # ponytail: ONE rule of the rank count; no file-size or payload-shape
+    # branch.  Re-measured 2026-09-23 at the mu-batch Z-store pattern
+    # (runs/runtime/io_layer_20260923, P16 OFI, 24 GiB, W/R GB/s): this
+    # policy 16x1M 4.04/7.90; 16x4M 4.42/8.41; 32x4M 4.08/10.33; 64x4M
+    # 3.65/11.73; the one-stripe directory default 0.61/0.88.  Wider
+    # layouts buy read and cost write, and 4 MiB units lost ~30% on the
+    # 2-D-tile ladder above, so no single alternative wins everywhere.
     n = max(1, int(nranks))
     count = min(max(n, _STRIPE_COUNT_MIN), _STRIPE_COUNT_MAX)
     # Unit: the power of two nearest in log2 to (nranks/16) MiB, clamped.
@@ -389,23 +396,30 @@ def file_stripe_layout(path: str) -> tuple[int, int] | None:
     POLICY is meaningless.  The file's own layout is not, and it was the
     dominant term nobody could see.
 
-    Returns ``(stripe_count, stripe_size_bytes)``.  ``None`` when ``lfs`` is
-    absent, the path is not on Lustre, or the call fails for any reason --
-    this is an observation, never a gate, and must not break a read.
+    Returns ``(stripe_count, stripe_size_bytes)``.  ``None`` when the path
+    is not on Lustre, carries a composite (PFL) layout, or the read fails
+    for any reason -- this is an observation, never a gate, and must not
+    break a read.
+
+    READ FROM THE ``lustre.lov`` XATTR, NOT ``lfs`` (2026-09-23).  The
+    ``lfs`` probe did not answer in production: zeta_mubatch_20260923
+    p4u_cri3_p16/gwjax.log reports "layout=UNKNOWN" for a WFN.h5 that is a
+    plain 1 x 1 MiB Lustre file (``lfs getstripe`` on a login node).  The
+    xattr is the same ``lov_user_md`` the ``lfs`` binary decodes, needs no
+    subprocess, and answered on compute nodes
+    (runs/runtime/io_layer_20260923/p4_stripe: 1x1M, 4x1M, 8x4M, 16x4M,
+    16x16M, each matching the requested hint).
     """
     try:
-        import subprocess
-        out = subprocess.run(
-            ["lfs", "getstripe", "-c", "-S", str(path)],
-            # This is an observability probe before the collective open, not
-            # part of the read.  A sick metadata service must not leave every
-            # peer waiting ten seconds for rank 0 to diagnose it.
-            capture_output=True, text=True, timeout=2, check=False)
-        if out.returncode != 0:
+        import struct
+        raw = os.getxattr(str(path), "lustre.lov")
+        magic = struct.unpack_from("<I", raw, 0)[0]
+        # lov_user_md_v1/v3: magic, pattern, 16-byte object id, then
+        # u32 stripe_size and u16 stripe_count.
+        if magic not in (0x0BD10BD0, 0x0BD30BD0):
             return None
-        nums = [int(tok) for tok in out.stdout.split() if tok.isdigit()]
-        # `-c -S` prints the count then the size, one integer each.
-        return (nums[0], nums[1]) if len(nums) >= 2 else None
+        size, count = struct.unpack_from("<IH", raw, 24)
+        return int(count), int(size)
     except Exception:
         return None
 
@@ -429,7 +443,8 @@ def _announce_read_layout(path: str) -> None:
         print(
             f"  [SlabIO.phdf5_ffi] {os.path.basename(path)} mode=r "
             f"bytes={nbytes if nbytes >= 0 else 'UNKNOWN'} "
-            "file stripe layout=UNKNOWN (lfs unavailable or not Lustre); "
+            "file stripe layout=UNKNOWN (no plain lustre.lov layout: not "
+            "Lustre, or a composite layout); "
             "collective read aggregation cannot be predicted",
             flush=True)
         return
@@ -1889,6 +1904,17 @@ class _FfiBackend(_DatasetGeometry):
             # jax.process_count().  See _assert_mpi_world for the
             # measurement this exists for.
             _assert_mpi_world(mesh)
+            if mode == "w" and _rank0() and _sc > 0:
+                # The hint is a request; the inode is the fact.  Say so when
+                # they differ, in every run, so a one-stripe scratch file is
+                # visible in the log instead of inferred from its wall time.
+                got = file_stripe_layout(path)
+                if got is not None and got != (_sc, _su):
+                    print(f"  [SlabIO.phdf5_ffi] WARNING {os.path.basename(path)} "
+                          f"was created {got[0]} x {got[1]} B but the policy "
+                          f"requested {_sc} x {_su} B (Lustre clamps a count "
+                          f"above its OST count; 1 x 1 MiB means the MPI-IO "
+                          f"hints were ignored).", flush=True)
         except BaseException:
             # An open that failed holds nothing; leaving it registered
             # would refuse every later legitimate open on this path.

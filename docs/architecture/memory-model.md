@@ -678,6 +678,66 @@ now P_min = 12: below it the resident ζ(G) accumulator plus one minimal chunk
 does not fit, which is where a q-tiled or accumulator-free fit would be
 needed.
 
+## Communication cost model (2026-09-23)
+
+At fixed memory workspace, a plan should use as few communication steps as it
+can.  The model that prices a step is `gw/comm_model.py`.  One collective that
+moves `V` bytes per rank among `n_peers` other ranks costs
+
+    T = α₀ + α_peer · n_peers + V / β.
+
+`V` is the all_to_all input (which equals its output) or the all_gather output.
+
+The model is generic: it has no topology term and no intra-node versus
+inter-node distinction (owner ruling 2026-09-23: LORRAX stays transferable
+across HPC architectures).
+
+The constants are per-machine data, owned by `gw/comm_model.py::MACHINES` and
+measured with `tools/comm_model_bench.py` (run it, then `--fit` its log).  The
+row is copied here for reading only:
+
+| machine | α₀ | α_peer | β | one synced jit call | one scan step, no collective | measured |
+|---|---|---|---|---|---|---|
+| `perlmutter-a100-ofi` | 31.6 µs | 2.74 µs | 19.7 GB/s | 72 µs | 5.4 µs | 2026-09-23, pool 58814236, P16 = 4 nodes × 4 A100-80GB, NCCL over OFI/cxi |
+
+**How the constants were fitted.**
+- Data: `lax.all_to_all(tiled=True)` over all ranks (15 peers) and over one mesh axis (3 peers), as steps of one `lax.scan` inside one jit, at 1 KB to 1 GB per rank.
+- Fit quality: model/measured is 0.70 to 1.16.
+- Held-out check: 4, 64 and 512 MB, predicted before the run, came out at 1.03, 0.76 and 0.98.
+- Measured all_to_all over all 16 ranks: 0.114 ms at 1 MB, 1.31 ms at 16 MB, 7.9 ms at 128 MB and 55.8 ms at 1 GB.
+- Evidence: sandbox `runs/runtime/comm_model_20260923/`.
+
+**Simplification taken.** One constant set prices every collective kind.
+- all_gather measured 2.6 to 3.7 times faster than the model at 16 MB and above, so the model over-prices it.
+- all_to_all itself runs 25 to 30 % slower than the model at 16 to 64 MB.
+
+**The rules.** A planner uses three things from the model: the minimum efficient payload, the number of calls, and the overlap estimate.
+
+1. *Each collective is at or above the minimum efficient payload.* `min_efficient_payload(n_peers) = 4·β·(α₀ + α_peer·n_peers)` is the payload at which latency is 20 % of the call.  It is 5.7 MB per rank at P16.
+2. *At most about 10 to 20 collectives per batch.* Moving `V` bytes per rank through an `M_buf` buffer takes `split_calls(V, M_buf, n_peers)` calls, which is `ceil(V / min(M_buf, V))`.  The same function reports whether `V / n_calls` meets rule 1.  If it does not, the buffer is too small: do not add calls.
+3. *One executable per batch.* A batch's collectives are steps of one `lax.scan` inside one jit.  A Python-dispatched call adds 72 µs of host round trip; a scan step adds 5.4 µs.
+4. *Double buffering.* Overlap the communication of step i+1 with the compute of step i.  A batch then costs `max(T_comp, T_comm) + min(T_comp, T_comm)/n_steps` (`overlapped_time`), instead of the sum.
+
+The μ-batch planner (`plan_zeta_mubatch`) prices its loop with `comm_time`.
+Its receipt prints the number of collectives per batch and the smallest
+payload against rule 1.
+
+**Extrapolation to large P (estimates, not measurements).** Assumptions:
+- α₀ stays constant.
+- α_peer is linear in peers: NCCL's all_to_all posts one send/receive pair per peer.
+- β stays the per-rank network rate.  At P16, 12 of the 15 peers are already off-node.
+- There is no congestion.  This is optimistic at P1000.
+
+| P | peers | α of one all_to_all | minimum efficient payload | latency of 322 calls per batch (today's ψ regeneration, upper end) |
+|---|---|---|---|---|
+| 16 | 15 | 73 µs (measured) | 5.7 MB | 24 ms |
+| 100 | 99 | 0.30 ms (estimate) | 24 MB (estimate) | 98 ms (estimate) |
+| 1000 | 999 | 2.8 ms (estimate) | 218 MB (estimate) | 0.89 s (estimate) |
+
+**Observed, with no code path.** At P16, all_to_all over x and then over y
+measured 6 to 22 % faster than one all_to_all over all ranks, at 16 to
+512 MB.  All planners stay single-stage and generic, by owner ruling.
+
 ## Automatic Sizing Algorithm
 
 Run order in `gw_init.prepare_isdf_and_wavefunctions`:

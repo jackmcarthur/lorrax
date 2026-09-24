@@ -19,7 +19,7 @@ I/O is synchronous q-tiles: every q whose ζ̃ fits the V_q budget is read
 in one collective call (all of them whenever they fit — the whole-slab
 read), contracted, and only then is the next tile read.  Overlapping a
 PHDF5 read with the kernel's NCCL collectives deadlocked historically;
-see the tile loop in :func:`_compute_V_q_g_flat_one_tile`.
+see the tile loop in :func:`_compute_V_q_g_flat_tiles`.
 
 Math:
 
@@ -382,40 +382,63 @@ def _plan_vq_tiles(*, n_q: int, n_rmu_L: int, n_rmu_R: int, ngkmax: int,
                    host_budget_bytes: float = float('inf')):
     """Size the G panel and the ζ q-tile of one V tile from the V_q memory budget.
 
-    Bytes are :func:`vq_tile_bytes`.  ``g`` (0/None = auto) is the largest
-    width ≤ ``_VQ_G_CHUNK_TARGET`` whose widest per-step panel all-gather
-    fits ``LORRAX_COLLECTIVE_CHUNK_MB`` and whose panels take at most half of
+    One tile of :func:`_plan_vq_group`; returns ``(q_tile, g_chunk, priced)``.
+    """
+    rows = [n_rmu_L] if same_zeta else [n_rmu_L, n_rmu_R]
+    return _plan_vq_group(
+        [dict(n_rmu_L=n_rmu_L, n_rmu_R=n_rmu_R, same_zeta=same_zeta, n_sub=n_sub)],
+        rows=rows, n_q=n_q, ngkmax=ngkmax, mesh_xy=mesh_xy, g_chunk=g_chunk,
+        budget_bytes=budget_bytes, host_budget_bytes=host_budget_bytes)
+
+
+def _plan_vq_group(tiles, *, rows, n_q: int, ngkmax: int, mesh_xy: Mesh,
+                   g_chunk: int | None, budget_bytes: float,
+                   host_budget_bytes: float = float('inf')):
+    """Size the G panel and the ζ q-tile of V tiles contracted together.
+
+    ``tiles`` holds each tile's ``n_rmu_L``/``n_rmu_R``/``same_zeta``/
+    ``n_sub``; ``rows`` the padded μ of every DISTINCT ζ read per q-tile
+    (each read once, whichever tiles use it).  Bytes are
+    :func:`vq_tile_bytes`: the accumulators of every tile are resident, the
+    ζ rows of every distinct loader and one v row per tile scale with the
+    q-tile, and the faces/panels are those of the widest tile (the kernels
+    run one after another).  ``g`` (0/None = auto) is the largest width
+    ≤ ``_VQ_G_CHUNK_TARGET`` whose widest per-step panel all-gather fits
+    ``LORRAX_COLLECTIVE_CHUNK_MB`` and whose panels take at most half of
     what one q leaves free; an explicit ``g_chunk`` (deck
     ``vq_g_chunk_size``) is used as given.  The q-tile is then every q that
     fits the device budget and whose read staging, ``host_per_q`` per q,
     fits ``host_budget_bytes`` (``_vq_host_staging_bytes``) — all of them
     whenever they do, which is the whole-slab read — balanced so the last
-    tile is not a sliver.  Every input is
-    rank-invariant (the caller agrees the budget across processes), so every
-    rank issues the same collective reads.
+    tile is not a sliver.  Every input is rank-invariant (the caller agrees
+    the budget across processes), so every rank issues the same collective
+    reads.
 
-    Returns ``(q_tile, g_chunk, priced)``; refuses when V_acc plus one q
-    does not fit, the only case no tile or panel choice can rescue.
+    Returns ``(q_tile, g_chunk, priced)``; refuses when the accumulators
+    plus one q do not fit, the only case no tile or panel choice can rescue.
     """
     from common.collectives import _owner_gather_chunk_bytes
 
     p_x, p_y = int(mesh_xy.shape['x']), int(mesh_xy.shape['y'])
-    shape = dict(n_q=n_q, n_rmu_L=n_rmu_L, n_rmu_R=n_rmu_R, ngkmax=ngkmax,
-                 same_zeta=same_zeta, n_sub=n_sub, p_x=p_x, p_y=p_y)
-    b = vq_tile_bytes(**shape, g_chunk=0)
+    c, p_all = 16.0, p_x * p_y
+    shapes = [dict(n_q=n_q, ngkmax=ngkmax, p_x=p_x, p_y=p_y, **t) for t in tiles]
+    b = [vq_tile_bytes(**sh, g_chunk=0) for sh in shapes]
+    resident = sum(x['resident'] for x in b)
+    host_per_q = c * sum(rows) * ngkmax / p_all
+    per_q = host_per_q + c * len(tiles) * ngkmax
     if g_chunk:
         g = min(int(g_chunk), int(ngkmax))
         if g < 1:
             raise ValueError(f"vq_g_chunk_size must be positive; got {g_chunk}.")
     else:
-        widest_row = 16.0 * max(n_rmu_L / p_x, n_rmu_R / p_y)
+        widest_row = c * max(max(t['n_rmu_L'] / p_x, t['n_rmu_R'] / p_y)
+                             for t in tiles)
         g = min(int(ngkmax), _VQ_G_CHUNK_TARGET,
                 max(1, int(_owner_gather_chunk_bytes() // widest_row)))
-        free = budget_bytes - b['resident'] - b['per_q'] - b['fixed_work']
-        g = max(1, min(g, int(0.5 * free // b['panel_col'])))
-    b = vq_tile_bytes(**shape, g_chunk=g)
-    resident, per_q, work = b['resident'], b['per_q'], b['work']
-    host_per_q = b['host_per_q']
+        free = (budget_bytes - resident - per_q
+                - max(x['fixed_work'] for x in b))
+        g = max(1, min(g, int(0.5 * free // max(x['panel_col'] for x in b))))
+    work = max(vq_tile_bytes(**sh, g_chunk=g)['work'] for sh in shapes)
     q_fit = int(min((budget_bytes - resident - work) // per_q,
                     host_budget_bytes // host_per_q, n_q))
     if q_fit < 1:
@@ -574,37 +597,63 @@ def _compute_V_q_g_flat_one_tile(
 ) -> tuple[jax.Array, jax.Array | None]:
     """Contract one q-parent V tile and its separately transported full-q G=0 leg.
 
-    ``budget_bytes`` is the per-rank V_q memory allowance that sizes the ζ
-    q-tile and the G panel (``_plan_vq_tiles``); ``None`` measures it live
-    (``_vq_budget_bytes``).  Either way it is agreed across processes.
+    One tile of :func:`_compute_V_q_g_flat_tiles`.  ``budget_bytes`` is the
+    per-rank V_q memory allowance that sizes the ζ q-tile and the G panel
+    (``_plan_vq_tiles``); ``None`` measures it live (``_vq_budget_bytes``).
+    Either way it is agreed across processes.
     """
-    same_zeta = (zeta_R_loader is None) or (zeta_R_loader is zeta_L_loader)
-    # ``n_rmu_*`` is the logical centroid count for each side — read off the
-    # loader so callers don't repeat themselves.
-    n_rmu_L = int(zeta_L_loader.n_rmu)
-    n_rmu_R = n_rmu_L if same_zeta else int(zeta_R_loader.n_rmu)
-    if str(getattr(zeta_L_loader, 'zeta_layout', '')) != 'G_flat':
-        raise ValueError(
-            f"_compute_V_q_g_flat_one_tile[{timing_label}]: zeta_L "
-            f"layout must be 'G_flat'; got "
-            f"{getattr(zeta_L_loader, 'zeta_layout', None)!r}")
-    if (not same_zeta and
-            str(getattr(zeta_R_loader, 'zeta_layout', '')) != 'G_flat'):
-        raise ValueError(
-            f"_compute_V_q_g_flat_one_tile[{timing_label}]: zeta_R "
-            "layout must be 'G_flat'.")
+    return _compute_V_q_g_flat_tiles(
+        [dict(L=zeta_L_loader, R=zeta_R_loader, v_per_G_builder=v_per_G_builder,
+              is_charge_cc=is_charge_cc, write_g0=write_g0,
+              one_leg_action=one_leg_action, source_component=source_component,
+              timing_label=timing_label)],
+        kgrid=kgrid, fft_grid=fft_grid, mesh_xy=mesh_xy, g_chunk=g_chunk,
+        sym=sym, centroid_indices=centroid_indices, qgrid_policy=qgrid_policy,
+        verbose=verbose, budget_bytes=budget_bytes)[0]
 
+
+def _compute_V_q_g_flat_tiles(
+    specs, *, kgrid, fft_grid, mesh_xy, g_chunk: int | None, sym,
+    centroid_indices, qgrid_policy=None, verbose: bool,
+    budget_bytes: float | None = None,
+) -> list:
+    """Several V tiles over one set of ζ loaders, each loader read ONCE per q-tile.
+
+    ``V^{LR}_q[μ, ν] = Σ_G conj(ζ^L_q(μ, G)) v_q(G) ζ^R_q(ν, G)`` for every
+    tile in ``specs``: one dict per tile with the ``L``/``R`` loaders
+    (``R`` None ⇒ same ζ), ``v_per_G_builder``, ``is_charge_cc``,
+    ``write_g0``, ``one_leg_action``, ``source_component`` and
+    ``timing_label``.  The tiles share one q list (same centroids, same
+    ``sym``).  The q-tile is sized for all of them at once
+    (:func:`_plan_vq_group`): each distinct loader's rows are read once per
+    q-tile and contracted into every tile that uses them, so the bispinor TT
+    block reads each ζ_T once instead of three times.  Returns
+    ``[(V_q at P(None,'x','y'), g0 or None), ...]`` in ``specs`` order.
+    """
     from ffi import _services
     _services.ensure_on_path()
     from symmetry_maps import unfold_isdf_one_leg
 
-    # ---- IBZ list + per-tile v(q+G) -----------------------------------
+    label = "+".join(str(s['timing_label']) for s in specs)
+    loaders = []                                   # distinct, first-use order
+    for s in specs:
+        s['same_zeta'] = (s['R'] is None) or (s['R'] is s['L'])
+        for ld in ((s['L'],) if s['same_zeta'] else (s['L'], s['R'])):
+            if not any(ld is x for x in loaders):
+                loaders.append(ld)
+    for ld in loaders:
+        if str(getattr(ld, 'zeta_layout', '')) != 'G_flat':
+            raise ValueError(
+                f"_compute_V_q_g_flat_tiles[{label}]: ζ layout must be "
+                f"'G_flat'; got {getattr(ld, 'zeta_layout', None)!r}")
+
+    # ---- IBZ list (shared by every tile) --------------------------------
     (_q_int, q_irr_frac,
      full_to_irr_idx, full_to_irr_sym,
      sym_perm, L_table, use_ibz) = _resolve_ibz_q_list(
         sym=sym, centroid_indices=centroid_indices,
         kgrid=kgrid, fft_grid=fft_grid,
-        context=f"V_q g-flat tile [{timing_label}]")
+        context=f"V_q g-flat tile [{label}]")
     n_q_ibz = int(q_irr_frac.shape[0])
 
     policy = qgrid_policy
@@ -617,79 +666,82 @@ def _compute_V_q_g_flat_one_tile(
                 sym=sym, irr_idx_q=full_to_irr_idx,
                 sym_idx_q=full_to_irr_sym, kgrid=tuple(kgrid),
                 n_sym_spatial=n_sym_spatial,
-                context=f"V_q / one-leg [{timing_label}]")
+                context=f"V_q / one-leg [{label}]")
         unfold_sym = np.asarray(policy.unfold_sym_idx, dtype=np.int32)
         if unfold_sym.shape != np.asarray(full_to_irr_sym).shape:
             raise ValueError(
-                f"_compute_V_q_g_flat_one_tile[{timing_label}]: shared "
+                f"_compute_V_q_g_flat_tiles[{label}]: shared "
                 "QgridTrsPolicy has the wrong q extent.")
 
-    gvec_components = np.asarray(
-        zeta_L_loader.gvec_components, dtype=np.int32)
+    gvec_components = np.asarray(loaders[0].gvec_components, dtype=np.int32)
     if gvec_components.shape[0] != n_q_ibz:
         raise ValueError(
-            f"_compute_V_q_g_flat_one_tile[{timing_label}]: ζ_L on "
+            f"_compute_V_q_g_flat_tiles[{label}]: ζ on "
             f"disk has {gvec_components.shape[0]} q's; resolved IBZ "
             f"has {n_q_ibz}.  Mismatch — was the file written with the "
             f"same write_ibz_only setting?")
-    if not same_zeta:
-        gvec_R = np.asarray(zeta_R_loader.gvec_components, dtype=np.int32)
+    for ld in loaders[1:]:
+        gvec_R = np.asarray(ld.gvec_components, dtype=np.int32)
         if gvec_R.shape != gvec_components.shape:
             raise ValueError(
-                f"_compute_V_q_g_flat_one_tile[{timing_label}]: ζ_L vs "
+                f"_compute_V_q_g_flat_tiles[{label}]: ζ_L vs "
                 f"ζ_R gvec_components shape mismatch "
                 f"({gvec_components.shape} vs {gvec_R.shape}).  Both "
                 f"files must be written with matching zeta_cutoff_ry "
                 f"and q-layout.")
     ngkmax = int(gvec_components.shape[-1])
 
-    v_q_table = np.asarray(
-        v_per_G_builder(q_irr_frac, gvec_components),
-        dtype=np.complex128)                                # (n_q_ibz, ngkmax)
-    if v_q_table.shape != (n_q_ibz, ngkmax):
-        raise ValueError(
-            f"_compute_V_q_g_flat_one_tile[{timing_label}]: "
-            f"v_per_G_builder returned shape {v_q_table.shape}; "
-            f"expected ({n_q_ibz}, {ngkmax}).")
-
-    # ---- μ padding to mesh-product per side ---------------------------
+    # ---- μ padding to mesh-product per loader ---------------------------
     # ``padded_mu_extent`` = the same round-up (+ test-only
     # LORRAX_EXTRA_MU_PAD rows) as ``Meta.n_rmu_padded`` — the V tiles
     # built here must match the ψ-side μ extent exactly.
     from runtime.padding import padded_mu_extent
-    def _pad(n: int) -> int:
-        return padded_mu_extent(int(n), mesh_xy)
-    n_rmu_L_padded = _pad(int(n_rmu_L))
-    n_rmu_R_padded = _pad(int(n_rmu_R))
+    mu_pad = [padded_mu_extent(int(ld.n_rmu), mesh_xy) for ld in loaders]
+    slot = lambda ld: next(i for i, x in enumerate(loaders) if x is ld)
 
     # ---- IBZ one-leg columns (literal full-zone G=0) -------------------
     # On an IBZ the literal full-zone G=0 may be a nonzero parent G, so the
     # kernel's slot-zero g0 is unsafe there.  The symmetry service names the
     # parent slots it will read; each q-tile contributes just those columns,
     # and the whole slab never has to outlive its tile for the unfold.
-    one_leg = bool(write_g0 and use_ibz)
+    for s in specs:
+        s['one_leg'] = bool(s['write_g0'] and use_ibz)
+    one_leg_any = any(s['one_leg'] for s in specs)
     one_leg_cols = (_one_leg_columns(
         gvec_components, sym=sym, sym_idx=unfold_sym,
-        q_irr_frac=q_irr_frac, kgrid=kgrid) if one_leg else None)
-    n_sub = int(one_leg_cols.shape[1]) if one_leg else 0
+        q_irr_frac=q_irr_frac, kgrid=kgrid) if one_leg_any else None)
+    n_sub = int(one_leg_cols.shape[1]) if one_leg_any else 0
+
+    for s in specs:
+        s['nL'] = mu_pad[slot(s['L'])]
+        s['nR'] = s['nL'] if s['same_zeta'] else mu_pad[slot(s['R'])]
+        v = np.asarray(s['v_per_G_builder'](q_irr_frac, gvec_components),
+                       dtype=np.complex128)            # (n_q_ibz, ngkmax)
+        if v.shape != (n_q_ibz, ngkmax):
+            raise ValueError(
+                f"_compute_V_q_g_flat_tiles[{s['timing_label']}]: "
+                f"v_per_G_builder returned shape {v.shape}; "
+                f"expected ({n_q_ibz}, {ngkmax}).")
+        s['v'] = v
 
     # ---- G panel and q-tile from the V_q budget ------------------------
     budget = _vq_budget_bytes(budget_bytes)
     host_budget = _vq_host_staging_bytes()
-    q_tile, g_chunk, priced = _plan_vq_tiles(
-        n_q=n_q_ibz, n_rmu_L=n_rmu_L_padded, n_rmu_R=n_rmu_R_padded,
-        ngkmax=ngkmax, same_zeta=same_zeta, n_sub=n_sub, mesh_xy=mesh_xy,
+    q_tile, g_chunk, priced = _plan_vq_group(
+        [dict(n_rmu_L=s['nL'], n_rmu_R=s['nR'], same_zeta=s['same_zeta'],
+              n_sub=n_sub if s['one_leg'] else 0) for s in specs],
+        rows=mu_pad, n_q=n_q_ibz, ngkmax=ngkmax, mesh_xy=mesh_xy,
         g_chunk=g_chunk, budget_bytes=budget, host_budget_bytes=host_budget)
     n_chunks = -(-ngkmax // g_chunk)
     n_tiles = int(priced['n_tiles'])
     if verbose and jax.process_index() == 0:
-        print(f"  V_q g-flat [{timing_label}]: n_q_ibz={n_q_ibz}, "
+        print(f"  V_q g-flat [{label}]: n_q_ibz={n_q_ibz}, "
               f"ngkmax={ngkmax}, g_chunk={g_chunk} ({n_chunks}/q), "
-              f"n_rmu_L={n_rmu_L}→{n_rmu_L_padded}, "
-              f"n_rmu_R={n_rmu_R}→{n_rmu_R_padded}, "
+              f"n_rmu per ζ {[int(ld.n_rmu) for ld in loaders]}→{mu_pad}, "
+              f"{len(specs)} V tile(s), "
               f"storage={'q-IBZ' if use_ibz else 'full-BZ'}",
               flush=True)
-        print(f"  V_q plan [{timing_label}]: q_tile={q_tile} "
+        print(f"  V_q plan [{label}]: q_tile={q_tile} "
               f"({n_tiles} tile(s)), priced {priced['priced'] / 1e9:.2f} GB/rank "
               f"= resident {priced['resident'] / 1e9:.2f} + "
               f"{q_tile}×{priced['per_q'] / 1e9:.3f} ζ/q + faces/panels "
@@ -700,15 +752,15 @@ def _compute_V_q_g_flat_one_tile(
 
     # ---- Accumulators ---------------------------------------------------
     V_sh = NamedSharding(mesh_xy, P(None, 'x', 'y'))
-    V_acc = jax.jit(lambda: jnp.zeros(
-        (n_q_ibz, n_rmu_L_padded, n_rmu_R_padded), dtype=jnp.complex128),
-        out_shardings=V_sh)()
-    # ``g0_acc`` is also the donate-target when ``write_g0=False`` — the
+    # ``g0`` is also the donate-target when ``write_g0=False`` — the
     # kernel still needs the buffer; the contents are simply unread.
     g0_sh = NamedSharding(mesh_xy, P(None, 'x'))
-    g0_acc = jax.jit(lambda: jnp.zeros(
-        (n_q_ibz, n_rmu_L_padded), dtype=jnp.complex128),
-        out_shardings=g0_sh)()
+    for s in specs:
+        s['V'] = jax.jit(lambda nL=s['nL'], nR=s['nR']: jnp.zeros(
+            (n_q_ibz, nL, nR), dtype=jnp.complex128), out_shardings=V_sh)()
+        s['g0'] = jax.jit(lambda nL=s['nL']: jnp.zeros(
+            (n_q_ibz, nL), dtype=jnp.complex128), out_shardings=g0_sh)()
+        s['parts'] = []
     # Process-local placement, NOT plain ``jax.device_put``: the latter
     # fires JAX's hidden ``assert_equal`` all-gather on a multi-process
     # mesh (scorecard AA.1).  The v(q+G) rows are a pure function of the
@@ -717,79 +769,118 @@ def _compute_V_q_g_flat_one_tile(
     # bounded by the tile too.
     from common.collectives import device_put_process_local
     v_rows_sh = NamedSharding(mesh_xy, P(None, None))
+    take_cols, stack_cols = _one_leg_take(mesh_xy) if one_leg_any else (None, None)
 
-    read_L = _make_read_q_tile(zeta_L_loader, n_rmu_L_padded, mesh_xy)
-    read_R = (read_L if same_zeta
-              else _make_read_q_tile(zeta_R_loader, n_rmu_R_padded, mesh_xy))
-    take_cols, stack_cols = _one_leg_take(mesh_xy) if one_leg else (None, None)
-    one_leg_parts = []
+    if len(specs) == 1 and hasattr(specs[0]['L'], 'contract_v'):
+        # The μ-batch fit's ζ (Z store + C⁺, isdf.zeta_mubatch.ZetaG): V is
+        # accumulated tile by tile as ζ is formed, and the G≈0 shell it keeps
+        # carries every column the one-leg unfold and the head channel read.
+        s = specs[0]
+        if not s['same_zeta']:
+            raise ValueError(
+                f"_compute_V_q_g_flat_tiles[{label}]: the in-memory "
+                "ζ serves only the same-ζ charge tile.")
+        s['V'] = s['L'].contract_v(s['v'])
+        if tuple(int(v) for v in s['V'].shape) != (n_q_ibz, s['nL'], s['nL']):
+            raise ValueError(
+                f"_compute_V_q_g_flat_tiles[{label}]: in-memory V "
+                f"{tuple(s['V'].shape)} != {(n_q_ibz, s['nL'], s['nL'])}")
+        s['V'] = jax.lax.with_sharding_constraint(s['V'], V_sh)
+        shell = s['L'].shell                          # (n_q_ibz, μ_pad, n_shell)
+        if s['one_leg']:
+            s['parts'] = [take_cols(shell, device_put_process_local(
+                s['L'].head_columns(one_leg_cols),
+                NamedSharding(mesh_xy, P(None, None))))]
+        elif s['write_g0'] and not use_ibz:
+            s['g0'] = jax.lax.with_sharding_constraint(shell[:, :, 0], g0_sh)
+    else:
+        reads = [_make_read_q_tile(ld, n, mesh_xy) for ld, n in zip(loaders, mu_pad)]
 
-    # ---- q-tile loop: read (sync) → contract → next --------------------
-    # THE READ IS SYNCHRONOUS BETWEEN KERNEL CALLS, and that is load-bearing.
-    # The historical per-q PHDF5 read inside the kernel loop interleaved its
-    # MPI collectives with the kernel's NCCL collectives and was the root
-    # cause of the async-prefetch deadlock.  So each tile's read completes
-    # (``block_until_ready``) before its kernel is dispatched, and the kernel
-    # completes before the next tile's read is issued.  With every q in one
-    # tile — whenever they fit the budget — this is the old single batched
-    # pre-read followed by one kernel launch.
-    #
-    # Multiplier: ``v_q_bispinor`` calls this function once per UNIQUE_TILE,
-    # so the counts here are per V tile (7 tiles × n_tiles reads).
-    import time as _t
-    _read_total = 0.0
-    _kernel_total = 0.0
-    for t in range(n_tiles):
-        q0 = t * q_tile
-        qn = min(q_tile, n_q_ibz - q0)
-        _t0 = _t.perf_counter()
-        zeta_L_tile = read_L(q0, qn)                    # (qn, n_rmu_L_padded, ngkmax)
-        zeta_R_tile = zeta_L_tile if same_zeta else read_R(q0, qn)
-        jax.block_until_ready(zeta_L_tile)
-        if not same_zeta:
-            jax.block_until_ready(zeta_R_tile)
-        _t1 = _t.perf_counter()
-        _read_total += _t1 - _t0
-        kernel = _make_q_tile_kernel(
-            mesh_xy, n_rmu_L_padded, n_rmu_R_padded, ngkmax, g_chunk, qn,
-            write_g0=bool(write_g0 and not use_ibz), same_zeta=same_zeta)
-        v_tile = device_put_process_local(
-            np.ascontiguousarray(v_q_table[q0:q0 + qn]), v_rows_sh)
-        V_acc, g0_acc = kernel(
-            V_acc, g0_acc, zeta_L_tile, zeta_R_tile, v_tile, jnp.int32(q0))
-        if one_leg:
-            one_leg_parts.append(take_cols(
-                zeta_L_tile, device_put_process_local(
-                    np.ascontiguousarray(one_leg_cols[q0:q0 + qn]),
-                    NamedSharding(mesh_xy, P(None, None)))))
-        # Every process rendezvouses here (the wait consumes a sharded
-        # accumulator, so it cannot sit under the rank-0 print gate;
-        # INVARIANTS row 21); this is also what orders the kernel's NCCL
-        # before the next tile's collective read.
-        jax.block_until_ready(V_acc)
-        _kernel_total += _t.perf_counter() - _t1
-        del zeta_L_tile, zeta_R_tile, v_tile
+        # ---- q-tile loop: read (sync) → contract → next --------------------
+        # THE READ IS SYNCHRONOUS BETWEEN KERNEL CALLS, and that is load-bearing.
+        # The historical per-q PHDF5 read inside the kernel loop interleaved its
+        # MPI collectives with the kernel's NCCL collectives and was the root
+        # cause of the async-prefetch deadlock.  So each q-tile's reads (every
+        # distinct ζ once) complete (``block_until_ready``) before its kernels
+        # are dispatched, and the kernels complete before the next tile's read
+        # is issued.  With every q in one tile — whenever they fit the budget —
+        # this is the old single batched pre-read followed by the launches.
+        import time as _t
+        _read_total = 0.0
+        _kernel_total = 0.0
+        for t in range(n_tiles):
+            q0 = t * q_tile
+            qn = min(q_tile, n_q_ibz - q0)
+            _t0 = _t.perf_counter()
+            zt = [read(q0, qn) for read in reads]    # (qn, μ_pad, ngkmax) each
+            jax.block_until_ready(zt)
+            _t1 = _t.perf_counter()
+            _read_total += _t1 - _t0
+            for s in specs:
+                kernel = _make_q_tile_kernel(
+                    mesh_xy, s['nL'], s['nR'], ngkmax, g_chunk, qn,
+                    write_g0=bool(s['write_g0'] and not use_ibz),
+                    same_zeta=s['same_zeta'])
+                z_L = zt[slot(s['L'])]
+                z_R = z_L if s['same_zeta'] else zt[slot(s['R'])]
+                v_tile = device_put_process_local(
+                    np.ascontiguousarray(s['v'][q0:q0 + qn]), v_rows_sh)
+                s['V'], s['g0'] = kernel(
+                    s['V'], s['g0'], z_L, z_R, v_tile, jnp.int32(q0))
+                if s['one_leg']:
+                    s['parts'].append(take_cols(
+                        z_L, device_put_process_local(
+                            np.ascontiguousarray(one_leg_cols[q0:q0 + qn]),
+                            NamedSharding(mesh_xy, P(None, None)))))
+                # Every process rendezvouses here (the wait consumes a sharded
+                # accumulator, so it cannot sit under the rank-0 print gate;
+                # INVARIANTS row 21); this is also what orders the kernel's NCCL
+                # before the next tile's collective read.
+                jax.block_until_ready(s['V'])
+                del z_L, z_R, v_tile
+            _kernel_total += _t.perf_counter() - _t1
+            del zt
+            if verbose and jax.process_index() == 0:
+                print(f"    [{label}] q-tile {t + 1}/{n_tiles} "
+                      f"(q {q0}..{q0 + qn - 1}): read={_t1 - _t0:.2f}s "
+                      f"kernel={_t.perf_counter() - _t1:.2f}s "
+                      f"({(_t.perf_counter() - _t1) / qn:.3f}s/q)", flush=True)
+        # The read contexts keep their largest tile staged on the host until the
+        # file closes, and the bispinor build holds four ζ loaders open across
+        # its V tiles; without this their staging accumulates (VI3 12x12 P16:
+        # host OOM-kill at the fourth file).  Collective, like the reads.
+        for ld in loaders:
+            ld.release_read_staging()
         if verbose and jax.process_index() == 0:
-            print(f"    [{timing_label}] q-tile {t + 1}/{n_tiles} "
-                  f"(q {q0}..{q0 + qn - 1}): read={_t1 - _t0:.2f}s "
-                  f"kernel={_t.perf_counter() - _t1:.2f}s "
-                  f"({(_t.perf_counter() - _t1) / qn:.3f}s/q)", flush=True)
-    # The read contexts keep their largest tile staged on the host until the
-    # file closes, and the bispinor build holds four ζ loaders open across
-    # seven V tiles; without this their staging accumulates (VI3 12x12 P16:
-    # host OOM-kill at the fourth file).  Collective, like the reads.
-    zeta_L_loader.release_read_staging()
-    if not same_zeta:
-        zeta_R_loader.release_read_staging()
-    if verbose and jax.process_index() == 0:
-        print(f"    [{timing_label}] {n_q_ibz} IBZ q in {n_tiles} tile(s): "
-              f"read={_read_total:.2f}s kernel={_kernel_total:.2f}s "
-              f"({_kernel_total / max(1, n_q_ibz):.3f}s/q)", flush=True)
+            print(f"    [{label}] {n_q_ibz} IBZ q in {n_tiles} tile(s): "
+                  f"read={_read_total:.2f}s kernel={_kernel_total:.2f}s "
+                  f"({_kernel_total / max(1, n_q_ibz):.3f}s/q)", flush=True)
 
-    if one_leg:
-        zeta_cols = (one_leg_parts[0] if len(one_leg_parts) == 1
-                     else stack_cols(one_leg_parts))
-        del one_leg_parts
+    out = []
+    for s in specs:
+        out.append(_finish_vq_tile(
+            s, V_sh=V_sh, mesh_xy=mesh_xy, stack_cols=stack_cols,
+            unfold_isdf_one_leg=unfold_isdf_one_leg, one_leg_cols=one_leg_cols,
+            gvec_components=gvec_components, sym=sym, unfold_sym=unfold_sym,
+            sym_perm=sym_perm, L_table=L_table, q_irr_frac=q_irr_frac,
+            kgrid=kgrid, use_ibz=use_ibz, policy=policy,
+            full_to_irr_idx=full_to_irr_idx))
+    return out
+
+
+def _finish_vq_tile(s, *, V_sh, mesh_xy, stack_cols, unfold_isdf_one_leg,
+                    one_leg_cols, gvec_components, sym, unfold_sym, sym_perm,
+                    L_table, q_irr_frac, kgrid, use_ibz, policy,
+                    full_to_irr_idx):
+    """One contracted tile → ``(V_q, g0 or None)``: the one-leg unfold of its
+    literal G=0 columns and, on the charge tile, the IBZ covariance report and
+    the restart capture."""
+    V_acc, g0_acc = s.pop('V'), s.pop('g0')
+    is_charge_cc = bool(s['is_charge_cc'])
+    if s['one_leg']:
+        parts = s.pop('parts')
+        zeta_cols = parts[0] if len(parts) == 1 else stack_cols(parts)
+        del parts
         g0_acc = unfold_isdf_one_leg(
             zeta_cols,
             gvec_components=np.take_along_axis(
@@ -801,8 +892,8 @@ def _compute_V_q_g_flat_one_tile(
             q_irr_frac=q_irr_frac,
             kgrid=kgrid,
             mesh_xy=mesh_xy,
-            component_action=one_leg_action,
-            source_component=source_component,
+            component_action=s['one_leg_action'],
+            source_component=s['source_component'],
         )
         del zeta_cols
 
@@ -855,13 +946,13 @@ def _compute_V_q_g_flat_one_tile(
             from .restart_q_storage import deposit_pre_unfold
             deposit_pre_unfold(
                 "V_qmunu", V_acc,
-                n_rmu_logical=int(zeta_L_loader.n_rmu),
+                n_rmu_logical=int(s['L'].n_rmu),
                 q_irr_frac=q_irr_frac, irr_idx_q=full_to_irr_idx,
                 sym_idx_q=unfold_sym, sym_perm=sym_perm,
                 L_table=L_table, n_sym_spatial=n_sym_spatial)
 
     V_qmunu = jax.lax.with_sharding_constraint(V_acc, V_sh)
-    if write_g0:
+    if s['write_g0']:
         g0_spec = (P(None, 'x') if int(g0_acc.ndim) == 2
                    else P(None, None, 'x'))
         return V_qmunu, jax.lax.with_sharding_constraint(
@@ -1079,11 +1170,22 @@ def compute_head_channel_zeta(
         int(zeta_loader.n_rmu),
         int(mesh_xy.shape['x']) * int(mesh_xy.shape['y']))
 
-    # ponytail: this second consumer still reads every q at once (ζ_all/P per
-    # rank); q-tile it through ``_make_read_q_tile`` like the V_q loop if a
-    # deck with ``mc_average_placement`` or the metal q0 shift needs it.
-    read_all = _make_read_q_tile(zeta_loader, n_rmu_padded, mesh_xy)
-    zeta_all = read_all(0, n_q_ibz)           # (n_q_ibz, mu_pad, ngkmax)
+    if hasattr(zeta_loader, 'contract_v'):
+        # μ-batch ζ: the head slots (argmin |q+G|) lie in the G≈0 shell the
+        # V_q pass kept; read them there instead of re-forming the sphere.
+        if zeta_loader.shell is None:
+            raise ValueError(
+                "compute_head_channel_zeta: the in-memory ζ has not run its "
+                "V_q pass, so its G≈0 shell is not formed yet.")
+        zeta_all = zeta_loader.shell            # (n_q_ibz, mu_pad, n_shell)
+        take_sel = zeta_loader.head_columns(np.asarray(table.sel))
+    else:
+        # ponytail: this second consumer still reads every q at once (ζ_all/P
+        # per rank); q-tile it through ``_make_read_q_tile`` like the V_q loop
+        # if a deck with ``mc_average_placement`` or the metal q0 shift needs it.
+        read_all = _make_read_q_tile(zeta_loader, n_rmu_padded, mesh_xy)
+        zeta_all = read_all(0, n_q_ibz)           # (n_q_ibz, mu_pad, ngkmax)
+        take_sel = np.asarray(table.sel)
 
     policy = None
     if use_ibz:
@@ -1095,7 +1197,7 @@ def compute_head_channel_zeta(
             context="head-channel one-leg")
         from symmetry_maps import unfold_isdf_one_leg
 
-    sel_dev = jnp.asarray(np.asarray(table.sel, dtype=np.int32))
+    sel_dev = jnp.asarray(np.asarray(take_sel, dtype=np.int32))
     mask_dev = jnp.asarray(np.asarray(table.mask, dtype=np.float64),
                            dtype=jnp.complex128)
     g0_sh = NamedSharding(mesh_xy, P(None, 'x'))

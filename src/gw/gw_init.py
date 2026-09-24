@@ -8,6 +8,7 @@ entirely by :func:`gw.gflat_memory_model.plan_gflat_chunks` — the single
 production planner (persistent floor + max over five stage transients).
 """
 import hashlib
+import math
 import json
 import os
 import threading
@@ -1595,7 +1596,7 @@ def zeta_sphere_ngkmax(wfn, sym, meta, zeta_cutoff_ry) -> int:
 def _plan_gflat_chunks_for_channel(
 		*, meta, cfg, band_slices, mesh_xy, is_bispinor, n_q_selected,
 		face_current_vertex=False, parent_route=None, print_fn=print,
-		zeta_ngkmax=None, psi_ngkmax=None):
+		zeta_ngkmax=None, psi_ngkmax=None, mubatch=False, psi_cylinder=None):
 	"""Chunk-plan ONE ISDF centroid channel: the charge channel
 	(``meta.n_rmu``) or one transverse channel (``meta.n_rmu`` — μ_T is
 	typically ≈ μ_C/3).
@@ -1705,7 +1706,13 @@ def _plan_gflat_chunks_for_channel(
 			        "register-documented run-level workaround, "
 			        "which bypasses this gate")
 			+ ".")
-		if mem.r_chunk_override > 0 and not _floor_broken:
+		if mubatch:
+			# The charge channel runs route G, whose planner (below) owns
+			# feasibility and refuses on its own terms; the r-chunk plan is
+			# priced only for the dict fields the fit still reads.
+			print_fn(f"  {_msg}  Not binding: the charge channel runs the "
+			         "μ-batch fit, planned below.")
+		elif mem.r_chunk_override > 0 and not _floor_broken:
 			print_fn(f"  {_msg}  Proceeding under the explicit "
 			       f"r_chunk_size={int(mem.r_chunk_override)} the "
 			       f"operator asserted; the plan is still priced "
@@ -1715,7 +1722,37 @@ def _plan_gflat_chunks_for_channel(
 			# is lost when a peer's FAIL-FAST kills the step first
 			# (CrI3 16x16 P36, pool 58781114 steps .15/.17/.20).
 			raise ValueError(_msg + "\n" + gflat_plan.format())
+	mubatch_plan = None
+	if mubatch:
+		# The charge channel's μ-batch fit (docs/architecture/zeta_fit_mubatch.md):
+		# the same budget, its own inventory.
+		from gw.gflat_memory_model import plan_zeta_route_g
+		from isdf.core import _resolve_zeta_gather
+		_tier = _resolve_zeta_gather(
+			str(cfg.backend.distributed_zeta_solve),
+			n_rmu=int(meta.n_rmu_padded), nq=n_q_selected, mesh_xy=mesh_xy,
+			vertex_mu_L=0,
+			charge_zeta_solve=str(cfg.backend.charge_zeta_solve))
+		_psi_ng = int(psi_ngkmax) if psi_ngkmax else _ngkmax
+		_r = (3.0 * _psi_ng / (4.0 * math.pi)) ** (1.0 / 3.0)
+		_n_a = max(int(v) for v in meta.fft_grid)
+		mubatch_plan = plan_zeta_route_g(
+			meta=meta, mesh_xy=mesh_xy, n_q_selected=n_q_selected,
+			ngkmax=_ngkmax, psi_ngkmax=_psi_ng, fit_nb=_zeta_fit_nb,
+			zeta_tier=_tier, budget_gb=float(mem.per_device_gb),
+			target_utilization=(mem.chunk_target_utilization
+			                    if mem.chunk_target_utilization > 0 else None),
+			psi_face_bytes=float(gflat_plan.psi_layout_bytes),
+			# the full-zone ψ spheres' actual cylinder when the caller has it
+			# (1257 columns on VI3 12x12, not the isotropic 2530)
+			n_col=(int(psi_cylinder[0]) if psi_cylinder else int(min(
+				int(meta.n_rtot) // _n_a, math.ceil(1.2 * math.pi * _r * _r)))),
+			n_s=(int(psi_cylinder[1]) if psi_cylinder else int(min(
+				_n_a, math.ceil(2.4 * _r) + 1))))
+		if jax.process_index() == 0:
+			print_fn(mubatch_plan.format())
 	chunks = {
+		'mubatch': mubatch_plan,
 		'band_chunk': int(gflat_plan.band_chunk),
 		'centroid_k_chunk': int(gflat_plan.centroid_k_chunk),
 		'chunk_r': int(gflat_plan.r_chunk),
@@ -2211,13 +2248,18 @@ def _fit_charge_zeta_channel(
             "a non-reusable charge zeta reached fit_zeta without the canonical "
             "G-flat chunk plan")
     peak_bytes = 0
+    zeta_g = None
+    # zeta_q.h5 is written for the consumers that read it back: the restart /
+    # reuse / BSE bundle (write_restart_tensors) and the four-current V_q.
+    _write_zeta_file = bool(getattr(cfg, 'write_restart_tensors', True)
+                            or cfg.bispinor)
     if _reuse_charge:
         print_fn(f"  [zeta reuse] charge ζ accepted at {zeta_h5_path}; "
                  "charge fit skipped independently.")
     else:
         with timing.section("gw_jax.zeta_fit_chunked"), \
              jax_profile.trace_section("zeta_fit"):
-            peak_bytes = fit_zeta_to_h5(
+            peak_bytes, zeta_g = fit_zeta_to_h5(
                 wfn=wfn, sym=sym, meta=meta,
                 centroid_indices=centroid_indices, mesh_xy=mesh_xy,
                 chunk_r=chunks['chunk_r'], output_file=zeta_h5_path,
@@ -2247,6 +2289,9 @@ def _fit_charge_zeta_channel(
                 k_unfold_plan=k_unfold_plan,
                 psi_nmu_parent=psi_nmu_parent,
                 psi_mun_parent=psi_mun_parent,
+                mubatch_plan=chunks.get('mubatch'),
+                parent_psi=chunks.pop('parent_psi', None),
+                write_zeta_file=_write_zeta_file,
             )
     if not _reuse_charge:
         _gate_fresh_zeta_rank_findings(
@@ -2265,7 +2310,8 @@ def _fit_charge_zeta_channel(
         print_fn( "  directory.")
         print_fn("  " + "!" * 68)
         print_fn("")
-    elif not _reuse_charge and jax.process_index() == 0:
+    elif (not _reuse_charge and jax.process_index() == 0
+          and (zeta_g is None or _write_zeta_file)):
         try:
             from file_io.isdf_header import stamp_fit_provenance
             stamp_fit_provenance(zeta_h5_path, _provenance)
@@ -2274,7 +2320,7 @@ def _fit_charge_zeta_channel(
                      f"will be refit on the next run.")
     if not _reuse_charge:
         barrier("zeta_provenance")
-    return peak_bytes, _trunc
+    return peak_bytes, _trunc, zeta_g
 
 
 def _report_zeta_fit_peak(
@@ -2520,7 +2566,7 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 		mu_L: path for mu_L, path in
 		enumerate(zeta_contract.zeta_transverse_paths, start=1)
 	}
-	(peak_bytes, _trunc) = _fit_charge_zeta_channel(
+	(peak_bytes, _trunc, zeta_g) = _fit_charge_zeta_channel(
 	    _band_norms, _provenance, _reuse_charge, _write_ibz_only_charge, _zeta_cutoff,
 	    band_range_left, band_range_right, centroid_indices, cfg, chunks, k_unfold_plan,
 	    mesh_xy, meta, print_fn, psi_mun_parent, psi_nmu_parent, representation, sym, wfn,
@@ -2534,7 +2580,8 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 	        _reuse_T, _transverse_batched_route, _trunc, _write_ibz_only_transverse, _zeta_T_paths,
 	        _zeta_cutoff, band_range_left, band_range_right, band_slices, cfg, mesh_xy, print_fn,
 	        representation, sym, wfn, zeta_contract)
-	return zeta_h5_path, mem_est, transverse_wfn_data
+	# The μ-batch fit hands V_q its ζ as (Z store, C⁺); a file path otherwise.
+	return (zeta_g if zeta_g is not None else zeta_h5_path), mem_est, transverse_wfn_data
 
 
 def _build_head_channel(zeta_io, *, cfg, meta, wfn, bvec, mesh_xy, sym,
@@ -2630,7 +2677,7 @@ def _vcoul_geometry_and_budget(
 def _vcoul_transverse_inputs(
         cfg, zeta_h5_path):
     """Produce the authenticated transverse zeta paths for Coulomb projection."""
-    zeta_dir = os.path.dirname(zeta_h5_path)
+    zeta_dir = os.path.dirname(getattr(zeta_h5_path, 'path', zeta_h5_path))
     zeta_T_paths = [
         os.path.join(zeta_dir, f"zeta_q_mu{mu_L}.h5") for mu_L in (1, 2, 3)
     ]
@@ -2748,9 +2795,13 @@ def _compute_scalar_vq(
         vcoul_cutoff_ry, wfn, zeta_h5_path):
     """Produce the scalar Coulomb operator and its live head views."""
     from .compute_vcoul import compute_all_V_q
+    import contextlib
+    # The μ-batch fit's ZetaG (Z store + C⁺) stands in for the file reader.
+    _zeta_ctx = (contextlib.nullcontext(zeta_h5_path)
+                 if hasattr(zeta_h5_path, 'contract_v')
+                 else ZetaLoader(zeta_h5_path, mesh=mesh_xy))
     with timing.section("gw_jax.V_q_compute"), jax_profile.trace_section("V_q_compute"):
-        with ZetaLoader(zeta_h5_path, mesh=mesh_xy,
-                        ) as zeta_io:
+        with _zeta_ctx as zeta_io:
             _cent_idx_np = (
                 np.asarray(jax.device_get(centroid_indices),
                            dtype=np.int32)
@@ -2777,6 +2828,8 @@ def _compute_scalar_vq(
                     centroid_indices=_cent_idx_np,
                     vcoul_cutoff_ry=vcoul_cutoff_ry,
                     print_fn=print_fn)
+    if hasattr(zeta_h5_path, 'contract_v'):
+        zeta_h5_path.close()
     return V_q_raw, G0_all, head_channel
 
 
@@ -2818,6 +2871,10 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 	(zeta_dir, zeta_T_paths, bispinor_ready) = _vcoul_transverse_inputs(
 	    cfg, zeta_h5_path)
 	if bispinor_ready:
+	    if hasattr(zeta_h5_path, 'contract_v'):
+	        # The four-current tiles read the charge ζ file the fit wrote.
+	        zeta_h5_path.close()
+	        zeta_h5_path = zeta_h5_path.path
 	    (V_q_raw, G0_all, head_channel, photon_g0_vectors) = _compute_photon_vq(
 	        bvec, centroid_indices, cfg, mesh_xy, meta, print_fn, sym, vcoul_cutoff_ry, wfn,
 	        zeta_T_paths, zeta_dir, zeta_h5_path)
@@ -2845,6 +2902,16 @@ def _prepare_parent_wavefunction_plan(
 		nspinor=int(meta.nspinor), parent_k_frac=wfn.kvecs(k=sym.parent_k_domain),
 		layout=meta.mu_basis.layout)
 	return plan, True, True
+
+
+def _route_g_cylinder(wfn, meta):
+	"""``(n_col, n_s)`` of the full-zone ψ spheres' cylinder along the route-G
+	plane axis (the planner prices the owner's D cylinder with it)."""
+	from common.wfn_transforms import psi_cylinder_tables
+	fg = tuple(int(v) for v in meta.fft_grid)
+	ci, _, _ = psi_cylinder_tables(wfn.box_index(k="full_bz"), fg, int(np.argmax(fg)),
+	                               ngkmax=int(wfn.ngkmax))
+	return int(ci.shape[1]), int(ci.shape[2])
 
 
 def _prepare_fresh_parent_faces(
@@ -2875,20 +2942,45 @@ def _prepare_fresh_parent_faces(
     		                  parents_only=True), print_fn=print0,
     		zeta_ngkmax=zeta_sphere_ngkmax(
     			wfn, sym, meta, zeta_contract.zeta_cutoff),
-    		psi_ngkmax=int(wfn.ngkmax))
+    		psi_ngkmax=int(wfn.ngkmax), mubatch=True,
+    		psi_cylinder=_route_g_cylinder(wfn, meta))
     _parent_zeta_plan = _candidate_plan if chunks is not None else None
     load_band_chunk = (chunks['band_chunk'] if chunks is not None
                        else zeta_contract.loader_band_chunk)
+    _mb_plan = None if chunks is None else chunks.get('mubatch')
     with timing.section("gw_jax.load_centroid_wfns"):
-    	parent_y, parent_x = load_centroids_band_chunked(
-    		wfn, sym, meta, centroid_indices,
-    		bool(int(meta.nspinor) == 4), mesh_xy,
-    		band_range=band_slices.full_range,
-    		band_chunk_size=load_band_chunk,
-    		k_chunk_size=(chunks['centroid_k_chunk'] if chunks is not None
-    		              else zeta_contract.loader_k_chunk),
-    		bispinor_lift=(representation.charge_lift or "raw"),
-    		k_domain=sym.parent_k_domain)
+    	if _mb_plan is not None:
+    		# ONE ψ(G) pass (loader tables 2026-09-23): each band chunk is read
+    		# once, moved to G slots by one all-to-all and sampled at the
+    		# centroids by a DFT.  The G-slot store stays on device for the
+    		# route-G fit (its planner priced it resident: M_f − Ψ ≥ c_μ·b_min;
+    		# ψ streaming is not implemented and refuses by GATE there).
+    		from common.psi_G_store import load_parent_psi_G
+    		_parent_psi = load_parent_psi_G(
+    			wfn=wfn, mesh_xy=mesh_xy, meta=meta,
+    			band_range=band_slices.full_range,
+    			band_chunk=int(_mb_plan.band_chunk),
+    			centroid_indices=centroid_indices, placement="device",
+    			bispinor=bool(int(meta.nspinor) == 4),
+    			bispinor_lift=(representation.charge_lift or "raw"),
+    			k_domain=sym.parent_k_domain, print_fn=print0)
+    		parent_y, parent_x = _parent_psi.faces
+    		chunks['parent_psi'] = _parent_psi._replace(faces=None)
+    		# The read phase is over: free the phdf5 context's host staging
+    		# (~ψ(G)/P per rank) before the fit's host Z store fills (VI3 12x12
+    		# P16 OOM, p4v_vi3_p16_whole).  Collective.
+    		wfn.release_read_staging()
+    		del _parent_psi
+    	else:
+    		parent_y, parent_x = load_centroids_band_chunked(
+    			wfn, sym, meta, centroid_indices,
+    			bool(int(meta.nspinor) == 4), mesh_xy,
+    			band_range=band_slices.full_range,
+    			band_chunk_size=load_band_chunk,
+    			k_chunk_size=(chunks['centroid_k_chunk'] if chunks is not None
+    			              else zeta_contract.loader_k_chunk),
+    			bispinor_lift=(representation.charge_lift or "raw"),
+    			k_domain=sym.parent_k_domain)
     from .wavefunction_bundle import parent_faces
     _parent_green_faces = parent_faces(parent_y, parent_x, mesh_xy=mesh_xy,
         layout="face" if cfg.memory.low_mem_bands else "axis")
@@ -3133,6 +3225,13 @@ def _prepare_fresh_isdf(
             get_enk_bandrange, mesh_xy, meta, print0, resolve_restart_q_storage_for_run,
             restart_tensor_writes_enabled, sigma_parent_carrier, sym, take_pre_unfold,
             tensors_filename, transverse_wfn_data, wfn, wfns_transverse, write_restart_state_to_h5)
+        if hasattr(zeta_path, 'contract_v') and jax.process_index() == 0:
+            # Route G's stage split through V_q (read, faces, C, fit, V_q),
+            # a receipt kept by the production report.
+            V_qmunu.block_until_ready()
+            _rows = []
+            timing.report(print_fn=_rows.append, title="", max_depth=3)
+            print0("  μ-batch timing through V_q (rank 0, s):\n" + "\n".join(_rows))
     V_qmunu.block_until_ready()
     print0("  Chunked ISDF path complete")
     return (V_qmunu, wfns, wfns_transverse, sigma_parent_carrier, green_parent_carrier, basis_T, head_channel, photon_g0_vectors, basis_wfn_fingerprint_binding, charge_basis_receipt, transverse_basis_receipt, charge_zeta_identity_receipt)

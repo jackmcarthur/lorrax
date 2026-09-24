@@ -206,6 +206,12 @@ class GWProductionReport:
         if text.startswith("  Resident ψ "):
             self.emit(text)
             return
+        # The μ-batch ζ fit's plan and its measured store/timing receipts are
+        # the run's record of where Z lived and what the transfers cost.
+        if text.startswith(("  ISDF μ-batch plan", "  μ-batch ", "  Z store: ", "  [host mem] ",
+                            "  Zeta output: ")):
+            self.emit(text)
+            return
         # Every box plan carries a durable policy and accepted-rule receipt,
         # including ordinary shared-pole runs with debug disabled.
         if text.startswith(("Sigma quadrature receipt: ", "Response quadrature: ")):
@@ -349,20 +355,18 @@ class GWProductionReport:
         # particular, the k-leading candidate has no production Sigma caller,
         # and the k-minor member belongs only to ladder-W screening.
         relevant = {"LORRAX_FFT_FFI", "LORRAX_FFT_FFI_FUSED",
-                    "LORRAX_BANDS_GEMM_FFI", "LORRAX_CONV_KPAIR_FFI"}
+                    "LORRAX_BANDS_GEMM_FFI"}
         if getattr(config.screening.diagrams, "value", "") == "w_bse":
             relevant.add("LORRAX_CONV_KMINOR_FFI")
         descriptions = {
             "LORRAX_FFT_FFI": "flat-k FFTs for ISDF, chi0 and Sigma",
             "LORRAX_FFT_FFI_FUSED": "fused tau-domain convolution",
             "LORRAX_BANDS_GEMM_FFI": "right-GEMM contraction forming G(tau)",
-            "LORRAX_CONV_KPAIR_FFI": "pair-density convolution forming V(q)",
             "LORRAX_CONV_KMINOR_FFI": "fused convolution in ladder-W",
         }
         cuda_engines = {
             "LORRAX_FFT_FFI": "cuFFT flat-k FFI",
             "LORRAX_FFT_FFI_FUSED": "cuFFT fused-convolution FFI",
-            "LORRAX_CONV_KPAIR_FFI": "cuFFT pair-convolution FFI",
             "LORRAX_CONV_KMINOR_FFI": "cuFFT k-minor convolution FFI",
         }
         host_engines = {
@@ -390,6 +394,12 @@ class GWProductionReport:
                 implementation = str(dial.get("off_label") or "default lowering")
             self.emit(f"{name:<26} = {state:<6} : "
                       f"{descriptions[name]} ({implementation})")
+        # The k-convolution router has no dial: it answers by platform
+        # (decisions.md 2026-09-24), so the report names the engine it picks.
+        kconv = {"CUDA": "nvidia-mathdx fused cuFFTDx kernels",
+                 "cpu": "MKL flat-k plan route"}.get(platform, "no backend on this platform")
+        self.emit(f"{'k-convolution router':<26} = {platform:<6} : "
+                  f"pair-density convolution forming V(q) ({kconv})")
 
     def sampling(self, *, wfn, sym, centroids=None) -> None:
         self.heading("Crystal symmetry and Brillouin-zone sampling")

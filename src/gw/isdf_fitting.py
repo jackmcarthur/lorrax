@@ -221,6 +221,256 @@ def add_pad_diagonal_sharded(C, active_mask, n_logical, *, mesh_xy):
     return kernel(C, pad)
 
 
+def _host_mem(label):
+    """Rank-local host line: this process's VmRSS and the node's MemAvailable."""
+    from common.gpu_utils import get_host_memory_available_gb
+    from isdf.core import host_rss_gb
+    avail = get_host_memory_available_gb()
+    return (f"  [host mem] {label}: RSS {host_rss_gb():.1f} GiB, node MemAvailable "
+            f"{'?' if avail is None else f'{avail:.1f}'} GB")
+
+
+def _fit_mubatch(
+    *, wfn, sym, meta, centroid_indices, mesh_xy, plan, parent_psi, band_chunk_ranges,
+    band_range_full, bispinor, bispinor_lift, k_unfold_plan, psi_mun_parent,
+    layout, weight_l_face, weight_r_face, L_q, lu_piv, q_chunk_size,
+    solver_kind, zeta_gather, distrib_la_batched_route, n_rmu_solve,
+    q_irr_full_idx, q_neg_idx, q_frac, sphere_idx, ngk_per_q, zeta_io,
+    mu_basis, output_file, gvec_components, q_full_frac, bvec, scratch_dir,
+    print_fn,
+):
+    """The μ-batch charge fit: Z_q(G) by batches, C⁺ once on the sphere.
+
+    See docs/architecture/zeta_fit_mubatch.md.  ``plan`` is the planner's
+    :class:`gw.gflat_memory_model.MuBatchPlan`.  Writes ``zeta_q_G`` into the
+    open ``zeta_io`` handle G tile by G tile and returns ``(peak_bytes,
+    n_batches_run, store_receipt)``.
+    """
+    from isdf import zeta_mubatch as zmb
+    from common.wfn_transforms import psi_cylinder_tables
+    from runtime.padding import mesh_divisor, pad_to_axis, padded_axis
+
+    P_ = int(mesh_divisor(mesh_xy))
+    nk = int(meta.nk_tot)
+    ns = int(meta.nspinor)
+    mu_pad = int(meta.n_rmu_padded)
+    fft_grid = tuple(int(v) for v in meta.fft_grid)
+    Q = int(sphere_idx.shape[0])
+    ngkmax = int(sphere_idx.shape[1])
+    kgrid = tuple(int(v) for v in meta.kgrid)
+    # The fit window's LOGICAL bands: band_range_full is the P-padded transport
+    # range, whose tail past the user's last band is an exact-zero pad on the
+    # faces (PsiGStore zeroes it the same way); route G reads the file, so it
+    # stops at the logical edge and the pad weights are zero.
+    b_lo = int(band_range_full[0])
+    b_hi = min(int(band_range_full[1]),
+               int(getattr(meta, "b_id_4_user", 0) or band_range_full[1]))
+    nb = b_hi - b_lo
+    rep = NamedSharding(mesh_xy, P())
+    axis = int(np.argmax(fft_grid))
+
+    # ---- conj ψ(G) of the raw parents, G slots over the mesh -------------
+    # The pair GEMM runs on the parents; each owner unfolds its pair
+    # projectors to the full zone with the plan's typed transport in G space
+    # (zmb.typed_child_G_tables: the exact Fourier image of the r-space
+    # transport C_q and the faces use -- rotation as a G permutation, the
+    # grid-snapped τ phase, spinor U, conjugation on antiunitary rows).
+    with timing.section("zeta_fit.mubatch.psi_G"):
+        _pd = k_unfold_plan.sym.parent_k_domain
+        if parent_psi is None:
+            # The one ψ read (common.psi_G_store.load_parent_psi_G) when the
+            # caller did not hand its G-slot store over with the faces.
+            from common.psi_G_store import load_parent_psi_G
+            parent_psi = load_parent_psi_G(
+                wfn=wfn, mesh_xy=mesh_xy, meta=meta, band_range=(b_lo, b_hi),
+                band_chunk=int(plan.band_chunk), centroid_indices=None,
+                placement="device", bispinor=bool(bispinor),
+                bispinor_lift=(bispinor_lift if bispinor else "raw"),
+                k_domain=_pd, print_fn=print_fn)
+        _br = tuple(int(v) for v in parent_psi.band_range)
+        if _br[0] != b_lo or _br[1] < b_hi:
+            raise ValueError(
+                f"_fit_mubatch: the ψ(G) store holds bands {_br}, the fit "
+                f"window is {(b_lo, b_hi)}")
+        n_par, nb_p, _, ngk_c = (int(v) for v in parent_psi.psi_G.shape)
+        g_spec = NamedSharding(mesh_xy, P(None, None, None, ('x', 'y')))
+        cbar = jax.jit(jnp.conj, out_shardings=g_spec, donate_argnums=0)(
+            parent_psi.psi_G)
+        sphere_par = np.asarray(jax.device_get(parent_psi.sphere_index), dtype=np.int64)
+        ngk_psi = ngk_c
+        s_ax = padded_axis(ngk_c, P_, name="route-G ψ sphere slots")
+        kv = np.asarray(wfn.kvecs(k="full_bz"), dtype=np.float64)
+        kin = np.rint(kv * np.asarray(kgrid)).astype(int) % np.asarray(kgrid)
+        if not np.array_equal(np.ravel_multi_index(kin.T, kgrid), np.arange(nk)):
+            raise ValueError("_fit_mubatch: the loader's full-BZ rows are not the "
+                             "C-order k grid the k-convolution assumes")
+        kpar = np.asarray(k_unfold_plan.k_parent_frac, dtype=np.float64)
+        fgv = np.asarray(fft_grid, dtype=np.int64)
+        flat = np.where(sphere_par < int(np.prod(fgv)), sphere_par, 0)
+        g3 = np.stack([flat // (fgv[1] * fgv[2]), (flat // fgv[2]) % fgv[1],
+                       flat % fgv[2]], axis=-1).astype(np.int32)
+        g3 = jax.make_array_from_callback(
+            g3.shape, NamedSharding(mesh_xy, P(None, ('x', 'y'), None)),
+            lambda idx: g3[idx])
+        pslot, phase, anti = zmb.typed_child_G_tables(
+            k_unfold_plan, fft_grid=fft_grid, sphere_par=sphere_par,
+            gvec_child=np.asarray(wfn.gvecs(k="full_bz")),
+            ngk_child=np.asarray(wfn.ngk_valid(k="full_bz")), k_child=kv)
+        unf = tuple(_device_put_process_local(np.asarray(a), rep) for a in (
+            np.asarray(k_unfold_plan.irr_idx, np.int32),
+            np.asarray(k_unfold_plan.sym_idx, np.int32), anti,
+            np.asarray(k_unfold_plan.spin_action_full, np.complex128), pslot, phase, kv))
+        cyl = psi_cylinder_tables(wfn.box_index(k="full_bz"), fft_grid, axis,
+                                  ngkmax=int(wfn.ngkmax))
+    w = lambda wf: np.asarray(pad_to_axis(jnp.asarray(
+        np.asarray(jax.device_get(wf))[:nb]), padded_axis(nb, nb_p, name="bands"),
+        axis=0))
+    w_l, w_r = w(weight_l_face), w(weight_r_face)
+    if debug_print_enabled() and jax.process_index() == 0:
+        print_fn(f"[mubatch_dbg] route G bands {b_lo}:{b_hi} (carrier {nb_p}) "
+                 f"w_l={w_l.real.tolist()} w_r={w_r.real.tolist()} "
+                 f"face weights {np.asarray(jax.device_get(weight_l_face)).tolist()} / "
+                 f"{np.asarray(jax.device_get(weight_r_face)).tolist()}")
+
+    # ---- the named pads shared by kernel, store and finalize --------------
+    q_axis = padded_axis(Q, P_, name="μ-batch stored q rows")
+    g_axis = padded_axis(ngkmax, int(plan.g_tile), name="μ-batch ζ-sphere G tiles")
+    zt = zmb.zeta_plane_tables(gvec_components, ngk_per_q, fft_grid, axis, g_axis)
+    plan_id = zmb.identity_kplan(kv, centroid_indices, fft_grid, mesh_xy, ns)
+    # μ-owned rows: rank p owns slots p·c + [0, c) of every batch, whole
+    # orbits per owner (the owner unfolds its own pair projectors).
+    mb = zmb.best_owner_orbit_batches(k_unfold_plan, mu_pad, P_,
+                                      c_max=max(1, int(plan.b) // P_))
+    b = int(mb.b)
+    kernel = zmb.make_route_g_kernel(
+        mesh=mesh_xy, plan_id=plan_id, kgrid=kgrid, fft_grid=fft_grid, ns=ns, b=b,
+        q_sel=q_irr_full_idx, q_axis=q_axis, q_neg=q_neg_idx, qvec_frac=q_frac,
+        n_col=int(cyl[0].shape[1]), n_s=int(cyl[0].shape[2]),
+        n_pg=int(plan.r_sub), axis=axis, n_src=n_par)
+    split_kernels = {}
+    if debug_print_enabled():
+        # Debug split timers: the same kernel truncated after each stage.
+        for stage in ('x', 'gemm', 'a2a', 'planes', 'kconv'):
+            split_kernels[stage] = zmb.make_route_g_kernel(
+                mesh=mesh_xy, plan_id=plan_id, kgrid=kgrid, fft_grid=fft_grid,
+                ns=ns, b=b, q_sel=q_irr_full_idx, q_axis=q_axis, q_neg=q_neg_idx,
+                qvec_frac=q_frac, n_col=int(cyl[0].shape[1]),
+                n_s=int(cyl[0].shape[2]), n_pg=int(plan.r_sub), axis=axis,
+                n_src=n_par, stop_at=stage)
+    store = zmb.ZStore(
+        mesh=mesh_xy, q_axis=q_axis, mu_pad=mu_pad, g_axis=g_axis, b=b,
+        placement=plan.placement,
+        packed_from_slot=mb.slot_of_packed, n_batch=int(mb.n_batch),
+        scratch_path=os.path.join(scratch_dir, "zeta_Z_store.scratch.h5"))
+    canon = np.asarray(k_unfold_plan.layout.axis.packed_to_canonical)
+    x_cent = np.asarray(centroid_indices, dtype=np.float64) / np.asarray(fft_grid)
+    ops = (_device_put_process_local(w_l, rep), _device_put_process_local(w_r, rep),
+           _device_put_process_local(kpar, rep))
+    rank_sh = NamedSharding(mesh_xy, P(('x', 'y')))
+    tabs = (tuple(_device_put_process_local(np.asarray(a), rep) for a in cyl),
+            tuple(_device_put_process_local(a, rep) for a in zt))
+    print_fn(f"  μ-batch fit (route G): {store.n_batch} batches of {b} centroids "
+             f"(whole orbits per owner; planned {int(plan.b)}), "
+             f"{int(plan.r_sub)} planes per group, "
+             f"{n_par} parent k -> {nk}, ψ sphere {ngk_psi} "
+             f"slots ({s_ax.carrier // P_}/rank), Z store {plan.placement}")
+
+    print_fn(_host_mem("fit start"))
+    from common.progress import LoopProgress
+    progress = LoopProgress(store.n_batch, print_fn, title="zeta fitting",
+                            item_name="μ-batch",
+                            max_updates=min(store.n_batch, 20)).start()
+    _max = os.environ.get("LORRAX_MAX_RCHUNKS", "").strip()
+    _max_n = int(_max) if _max else None
+    if _max_n is not None and _max_n < 1:
+        raise ValueError(
+            f"LORRAX_MAX_RCHUNKS={_max!r} must be >= 1; unset it to fit every "
+            "μ batch.")
+    t_batch = 0.0
+    n_run = 0
+    n_go = store.n_batch if _max_n is None else min(store.n_batch, _max_n)
+
+    def launch_args(beta):
+        slots = mb.mu[beta]
+        live = (slots >= 0).astype(np.float64)
+        xmu = x_cent[canon[np.clip(slots, 0, None)]] * live[:, None]
+        lt = tuple(jax.make_array_from_callback(a.shape, rank_sh, lambda i, a=a: a[i])
+                   for a in (mb.left_perm[beta], mb.left_L[beta]))
+        return (cbar, *ops, g3, _device_put_process_local(xmu, rep),
+                _device_put_process_local(live, rep), *tabs, unf, lt)
+
+    def launch(beta):
+        """Dispatch batch β (asynchronous); the caller writes it later."""
+        return kernel(*launch_args(beta))
+
+    if debug_print_enabled():
+        # The collective count of one batch, read from the compiled HLO.
+        hlo = kernel.lower(*launch_args(0)).compile().as_text()
+        n_coll = {k: hlo.count(k + '(') + hlo.count(k + '-start(')
+                  for k in ('all-to-all', 'all-reduce', 'all-gather',
+                            'reduce-scatter', 'collective-permute')}
+        if jax.process_index() == 0:
+            print_fn(f"[mubatch_dbg] route G collectives per batch (HLO): {n_coll}")
+    with timing.section("zeta_fit.mubatch.loop"):
+        # One batch of lookahead: β+1 is on the device while β is written.
+        pending = launch(0)
+        for beta in range(n_go):
+            t0 = time.perf_counter()
+            rows = pending
+            pending = launch(beta + 1) if beta + 1 < n_go else None
+            store.write_batch(beta, rows)
+            del rows
+            t_batch += time.perf_counter() - t0
+            n_run += 1
+            progress.step()
+            if n_run % 10 == 0:
+                print_fn(_host_mem(f"after μ-batch {n_run}"))
+            if split_kernels and beta in (1, 2):
+                args = launch_args(beta)
+                t_stage = {}
+                for stage, kfn in list(split_kernels.items()) + [('full', kernel)]:
+                    ts = time.perf_counter()
+                    kfn(*args).block_until_ready()
+                    t_stage[stage] = time.perf_counter() - ts
+                if jax.process_index() == 0:
+                    names = ['x', 'gemm', 'a2a', 'planes', 'kconv', 'full']
+                    print_fn(f"[mubatch_dbg] batch {beta + 1} route-G split (s): " + " ".join(
+                        f"{n}={t_stage[n] - (t_stage[names[i - 1]] if i else 0.0):.3f}"
+                        for i, n in enumerate(names)) + f" total={t_stage['full']:.3f}")
+            if debug_print_enabled() and jax.process_index() == 0:
+                print_fn(f"[mubatch_dbg] batch={beta + 1}/{store.n_batch} "
+                         f"{1e3 * (time.perf_counter() - t0):.0f}ms "
+                         f"write_total={store.t_write:.2f}s")
+    if n_go < store.n_batch:
+        print_fn(f"[mubatch_dbg] LORRAX_MAX_RCHUNKS={_max_n} reached after "
+                 f"μ-batch {n_run}; the fit is truncated.")
+    progress.finish()
+    del cbar
+    print_fn(_host_mem("pre-V_q (Z store full)"))
+
+    # ---- ζ = C⁺ Z, held lazily; written only for a file consumer --------
+    shell_slots, shell_gvec = zmb.zeta_shell_slots(
+        gvec_components, ngk_per_q, q_frac, bvec, q_full_frac, fft_grid)
+    zeta_g = zmb.ZetaG(
+        store, mesh=mesh_xy, L_q=L_q, lu_piv=lu_piv, q_chunk_size=q_chunk_size,
+        solver_kind=solver_kind, zeta_gather=zeta_gather,
+        batched_route=distrib_la_batched_route, n_rmu_solve=n_rmu_solve,
+        n_rmu=int(meta.n_rmu), mu_basis=mu_basis, ngk_per_q=ngk_per_q,
+        gvec_components=gvec_components, shell_slots=shell_slots,
+        shell_gvec=shell_gvec, path=output_file, print_fn=print_fn)
+    print_fn(f"  μ-batch timing: {n_run} batches {t_batch:.2f}s (store write "
+             f"{store.t_write:.2f}s, {store.placement}, overlapped with the next "
+             "batch)")
+    if zeta_io is not None:
+        t_w = time.perf_counter()
+        with timing.section("zeta_fit.mubatch.write_zeta"):
+            zeta_g.contract_v(np.zeros((Q, ngkmax), np.complex128),
+                              zeta_io=zeta_io, print_fn=print_fn)
+        print_fn(f"  μ-batch ζ file written in {time.perf_counter() - t_w:.2f}s")
+    print_fn(store.receipt())
+    return zeta_g, n_run, store.n_batch
+
+
 def fit_zeta_to_h5(
     wfn,
     sym,
@@ -262,9 +512,18 @@ def fit_zeta_to_h5(
     psi_nmu_parent: jax.Array | None = None,
     psi_mun_parent: jax.Array | None = None,
     layout="face",
+    mubatch_plan=None,
+    parent_psi=None,
+    write_zeta_file: bool = True,
     print_fn=print,
 ):
-    """Fit canonical q-IBZ ζ from raw-parent faces and orbit-closed real-grid tiles."""
+    """Fit canonical q-IBZ ζ from raw-parent faces.
+
+    ``mubatch_plan`` (the planner's charge-channel
+    :class:`gw.gflat_memory_model.MuBatchPlan`) selects the μ-batch fit
+    (docs/architecture/zeta_fit_mubatch.md); the current channels still
+    take the orbit-closed r-tile loop below.
+    """
     if k_unfold_plan is None or psi_nmu_parent is None or psi_mun_parent is None:
         raise ValueError("fit_zeta_to_h5 requires a typed plan and both raw-parent faces.")
     if band_norms is not None:
@@ -903,6 +1162,9 @@ def fit_zeta_to_h5(
     )
     _isdf_hdr = IsdfHeader.build(**_hdr_kwargs)
 
+    # The μ-batch fit writes zeta_q.h5 only for a consumer that reads it
+    # (write_restart_tensors, bispinor); otherwise ζ lives as its Z store.
+    _write_file = (mubatch_plan is None) or bool(write_zeta_file)
     with timing.section("zeta_fit.write_headers"):
         # WHICHEVER CALL CREATES THE INODE DECIDES THE STRIPE LAYOUT.
         # A Lustre layout is fixed at inode create, and the striping
@@ -937,14 +1199,15 @@ def fit_zeta_to_h5(
         # SlabIO mode='w' runs the same rank-0 unlink + barrier helper
         # (``_replace_inode_for_write``) internally, so the explicit call
         # that used to be here would be doing its job twice.
-        with SlabIO(output_file, mode='w', mesh=mesh_xy):
-            pass
-        if jax.process_index() == 0:
-            # Append both header groups to the inode SlabIO just created.
-            copy_mf_header(_wfn_src_path, output_file, dst_mode='a')
-            write_isdf_header(output_file, _isdf_hdr, mode='a')
-        jax.experimental.multihost_utils.sync_global_devices(
-            "zeta_fit_headers_written")
+        if _write_file:
+            with SlabIO(output_file, mode='w', mesh=mesh_xy):
+                pass
+            if jax.process_index() == 0:
+                # Append both header groups to the inode SlabIO just created.
+                copy_mf_header(_wfn_src_path, output_file, dst_mode='a')
+                write_isdf_header(output_file, _isdf_hdr, mode='a')
+            jax.experimental.multihost_utils.sync_global_devices(
+                "zeta_fit_headers_written")
 
     # ========== STEP 4b: SlabIO appends zeta_q to the pre-created file ==========
     # zeta_q is stored flat-q: shape (nq, n_rmu, n_rtot) with
@@ -986,13 +1249,14 @@ def fit_zeta_to_h5(
         # full q slab contiguous without requesting an HDF5 chunk layout.
         _n_G_sph = (int(_gflat_ngkmax)
                      if _gflat_ngkmax is not None else n_rtot)
-        zeta_io = SlabIO(output_file, mode='a', mesh=mesh_xy,
-                         )
-        zeta_io.create_dataset(
-            'zeta_q_G',
-            shape=(n_q_disk, n_rmu, _n_G_sph),
-            dtype=np.complex128,
-        )
+        zeta_io = None
+        if _write_file:
+            zeta_io = SlabIO(output_file, mode='a', mesh=mesh_xy)
+            zeta_io.create_dataset(
+                'zeta_q_G',
+                shape=(n_q_disk, n_rmu, _n_G_sph),
+                dtype=np.complex128,
+            )
 
     # ========== STEP 5: Pre-load G-space for all band chunks (ONCE) ==========
     # This caches the expensive HDF5 read + scatter so we don't repeat it
@@ -1021,6 +1285,61 @@ def fit_zeta_to_h5(
         for i in range(
             (_bfe_transport - _bfs + band_chunk_size - 1) // band_chunk_size)
     ]
+
+    if mubatch_plan is not None:
+        if int(vertex_mu_L) != 0 or _coupled_mu123_coordinator is not None:
+            raise ValueError(
+                "fit_zeta_to_h5: the μ-batch plan is the charge channel's; the "
+                "current channels keep the r-tile loop.")
+        print_fn(mubatch_plan.format())
+        t_mb0 = time.perf_counter()
+        zeta_g, n_run, n_total = _fit_mubatch(
+            wfn=wfn, sym=sym, meta=meta, centroid_indices=centroid_indices,
+            mesh_xy=mesh_xy, plan=mubatch_plan, parent_psi=parent_psi,
+            band_chunk_ranges=band_chunk_ranges,
+            band_range_full=band_range_full, bispinor=bispinor,
+            bispinor_lift=bispinor_lift, k_unfold_plan=k_unfold_plan,
+            psi_mun_parent=psi_mun_parent, layout=layout,
+            weight_l_face=weight_l_face, weight_r_face=weight_r_face,
+            L_q=L_q, lu_piv=lu_piv, q_chunk_size=q_chunk_size,
+            solver_kind=_resolved_solver_kind,
+            zeta_gather=_resolved_zeta_gather,
+            distrib_la_batched_route=distrib_la_batched_route,
+            n_rmu_solve=n_rmu_solve, q_irr_full_idx=q_irr_full_idx,
+            q_neg_idx=_q_neg_idx, q_frac=q_irr_frac,
+            sphere_idx=_gflat_sphere_idx_padded, ngk_per_q=_gflat_ngk_per_q,
+            zeta_io=zeta_io, mu_basis=mu_basis, output_file=output_file,
+            gvec_components=_gflat_gvec_components,
+            q_full_frac=bgw_integer_q_to_fractional(sym.kvecs_asints, meta.kgrid),
+            bvec=_bvec_for_sphere,
+            scratch_dir=os.path.dirname(os.path.abspath(output_file)),
+            print_fn=print_fn)
+        _trunc = active_zeta_truncating_knobs()
+        if _trunc and jax.process_index() == 0:
+            print_fn(f"  *** LORRAX SANITY: {_trunc} truncated this ζ fit "
+                     f"({n_run} of {n_total} μ batches); ζ is PARTIAL"
+                     + (f" and {output_file} is NOT marked complete." if _write_file
+                        else "."))
+        if zeta_io is not None:
+            with timing.section("zeta_fit.close_io"):
+                zeta_io.close()
+            with timing.section("zeta_fit.sync_global"):
+                jax.experimental.multihost_utils.sync_global_devices(
+                    "zeta_writes_complete")
+            if not _trunc and jax.process_index() == 0:
+                from file_io.isdf_header import mark_zeta_done
+                mark_zeta_done(output_file)
+        _track_peak_mb = 0
+        try:
+            _st = jax.local_devices()[0].memory_stats() or {}
+            _track_peak_mb = int(_st.get("peak_bytes_in_use", 0) or 0)
+        except Exception:
+            pass
+        print_fn(f"  Zeta output: {output_file} (n_q_disk={n_q_disk}, "
+                 f"n_rmu={n_rmu}); μ-batch fit {time.perf_counter() - t_mb0:.1f}s, "
+                 f"device peak {_track_peak_mb / 1e9:.2f} GB")
+        mem_probe("zeta_fit_end")
+        return _track_peak_mb, zeta_g
 
     # Build the host-resident ψ(G) staging store.  It supplies one band
     # chunk at a time while the all-P-sharded ψ(r) cache is built below,
@@ -1649,5 +1968,6 @@ def fit_zeta_to_h5(
 
     # Return only peak-memory high-water mark; centroid wavefunctions
     # are not returned (see docstring — callers re-load them directly
-    # via ``load_centroids_band_chunked``).
-    return _peak_bytes
+    # via ``load_centroids_band_chunked``).  The r-tile path writes ζ to
+    # disk and holds no Z store.
+    return _peak_bytes, None

@@ -12,6 +12,10 @@ import sys as _sys
 from pathlib import Path as _Path
 
 os.environ.setdefault("JAX_ENABLE_X64", "1")
+# In-process cpu meshes have no host FFI library on Perlmutter: the k-convolution
+# router's cpu leg (ffi.fft, the MKL flat-k plan route) takes its announced
+# TEST-ONLY jnp.fft arm there.  GPU runs never read this.
+os.environ.setdefault("LORRAX_KFFT_CPU_TEST_XLA", "1")
 
 # Pytest imports test modules during collection, before any production driver
 # can initialize the runtime.  Seal the same metadata-derived package closure

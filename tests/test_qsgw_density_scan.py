@@ -59,12 +59,12 @@ def _fixture(ns):
     psi = (rng.standard_normal((NK, NB, ns, NG))
            + 1j * rng.standard_normal((NK, NB, ns, NG)))
     ngrid = int(np.prod(GRID))
-    bidx = np.full((NK, *GRID), NG, dtype=np.int32)
+    bidx = np.zeros((NK, NG), dtype=np.int32)      # per-k sphere index
     cells = []
     for ik in range(NK):
         c = rng.choice(ngrid, size=NG, replace=False)
         xyz = np.column_stack(np.unravel_index(c, GRID))
-        bidx[ik, xyz[:, 0], xyz[:, 1], xyz[:, 2]] = np.arange(NG)
+        bidx[ik] = c
         cells.append(xyz)
     U = np.stack([_haar(rng, NB) for _ in range(NK)])
     # FD-like: three full-ish bands, a fractional fourth, an FD tail that

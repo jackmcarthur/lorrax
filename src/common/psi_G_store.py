@@ -33,7 +33,8 @@ right path.
 """
 from __future__ import annotations
 
-from functools import partial
+from functools import lru_cache, partial
+from typing import NamedTuple
 import numpy as np
 import jax
 import jax.numpy as jnp
@@ -489,7 +490,7 @@ class PsiGStore:
         @partial(
             shard_map,
             mesh=self.mesh,
-            in_specs=(P(None, None, None, None), P(None, None), P(), P()),
+            in_specs=(P(None, None), P(None, None), P(), P()),
             out_specs=band_sphere_spec(),
             check_vma=False,
         )
@@ -510,7 +511,7 @@ class PsiGStore:
         _run = jax.jit(
             _call,
             in_shardings=(
-                NamedSharding(self.mesh, P(None, None, None, None)),
+                NamedSharding(self.mesh, P(None, None)),
                 NamedSharding(self.mesh, P(None, None)), rep, rep),
             out_shardings=NamedSharding(self.mesh, band_sphere_spec()),
         )
@@ -637,3 +638,305 @@ def build_psi_G_store(
         band_chunk_ranges=band_chunk_ranges, meta=meta,
         bispinor=bispinor, bispinor_lift=bispinor_lift,
         band_pad_to=band_pad_to, k_domain=k_domain)
+
+
+# ===========================================================================
+# ONE ψ(G) read: the G-slot store and the centroid faces (loader tables
+# 2026-09-23, route G).
+# ===========================================================================
+
+class ParentPsiG(NamedTuple):
+    """The product of :func:`load_parent_psi_G` — one pass over WFN.h5.
+
+    ``psi_G``        ``(n_k, nb_c, ns, ngk_c)`` c128 at
+                     ``P(None, None, None, ('x','y'))`` — every band of one
+                     ``ngk_c/P`` G-slot slice per rank (``placement='device'``);
+                     else ``None``.
+    ``host_tile``    this process's ``(n_k, nb_c, ns, ngk_c/P)`` slice of the
+                     same array on host (``placement='host'``); else ``None``.
+    ``sphere_index`` ``(n_k, ngk_c)`` int32, replicated: the flat FFT-box cell
+                     of every G slot, ``n_rtot + g`` on a pad slot — THE one
+                     table (:func:`common.gvec_fft_box.build_sphere_box_index`).
+                     Rank ``p`` owns slots ``[p·ngk_c/P, (p+1)·ngk_c/P)``,
+                     ``p = x·P_y + y``.
+    ``kvecs_frac``   ``(n_k, 3)`` the loader's k representatives for these rows.
+    ``band_range``   the logical ``[b0, b1)``; bands ``[b1, b0+nb_c)`` are zero.
+    ``faces``        ``(psi_y, psi_x)`` exactly as
+                     :func:`common.wfn_transforms.load_centroids_band_chunked`
+                     returns them, or ``None`` without centroids.
+    """
+    psi_G: "jax.Array | None"
+    host_tile: "np.ndarray | None"
+    sphere_index: jax.Array
+    kvecs_frac: np.ndarray
+    band_range: tuple
+    faces: "tuple | None"
+
+
+def _pad_sphere_index(sphere_index: np.ndarray, width: int, n_rtot: int) -> np.ndarray:
+    """Widen the loader's sphere index to a G-slot carrier (pads ``n_rtot + g``)."""
+    nk, ngk = sphere_index.shape
+    out = np.broadcast_to(n_rtot + np.arange(width, dtype=np.int64),
+                          (nk, width)).astype(np.int32)
+    out[:, :ngk] = sphere_index
+    return out
+
+
+@lru_cache(maxsize=None)
+def _gslot_face_kernel(mesh: Mesh, fft_grid: tuple, nk: int, bc_w: int, ns: int,
+                       ngk_c: int, mu_pad: int, mu_t: int, with_faces: bool):
+    """Band-sharded ψ chunk → G-slot chunk (+ centroid DFT into the faces).
+
+    Per rank: ONE all-to-all moves the chunk from ``bands_XY`` to
+    ``G_XY``.  Then, per k,
+
+        X[b,s,μ] = Σ_{G ∈ my slots} ψ[k,b,s,G] · e^{2πi (k+G)·r_μ} / √N_r
+
+    is a GEMM over the local G slots, psum'ed over the mesh, and each face
+    keeps its own μ slice (``'y'`` for ψ_y, ``'x'`` for ψ_x).  The phase is
+    formed from integer residues ``(G_a r_a mod n_a)/n_a``, the twiddles the
+    FFT itself uses.
+    """
+    nx, ny, nz = fft_grid
+    n_rtot = nx * ny * nz
+    XY = ('x', 'y')
+    P_ = int(mesh.size)
+    py = int(mesh.shape['y'])
+    px = int(mesh.shape['x'])
+    ngk_l = ngk_c // P_
+    mu_y, mu_x = mu_pad // py, mu_pad // px
+    n_t = mu_pad // mu_t
+    inv_sqrt_n = 1.0 / np.sqrt(float(n_rtot))
+
+    def local(psi, sidx, kvecs, r_mu, w_mu, acc_y, acc_x, b0):
+        # (nk, bc_w/P, ns, ngk_c) → (nk, bc_w, ns, ngk_l): the one all-to-all.
+        g = jax.lax.all_to_all(psi, XY, split_axis=3, concat_axis=1, tiled=True)
+        if not with_faces:
+            return g, acc_y, acc_x
+        p = jax.lax.axis_index('x') * py + jax.lax.axis_index('y')
+        idx = jax.lax.dynamic_slice_in_dim(sidx, p * ngk_l, ngk_l, axis=1)
+        valid = idx < n_rtot
+        c = jnp.where(valid, idx, 0)
+        G = jnp.stack([c // (ny * nz), (c // nz) % ny, c % nz], axis=-1)  # (nk, ngk_l, 3)
+        grid = jnp.asarray((nx, ny, nz), dtype=jnp.int32)
+        r_t = r_mu.reshape(n_t, mu_t, 3)
+        w_t = w_mu.reshape(n_t, mu_t)
+
+        def one_k(carry, kk):
+            ay, ax_ = carry
+            gk, Gk, vk, kv = g[kk], G[kk], valid[kk], kvecs[kk]
+            a = gk.reshape(bc_w * ns, ngk_l)
+
+            # ponytail: the phase tile e^{2πi(k+G)·r_μ} is recomputed for
+            # every band chunk (one sincos per G·μ) instead of cached across
+            # chunks or built separably from 1-D tables: one direct formula.
+            def one_tile(args):
+                r, w = args                                   # (mu_t, 3), (mu_t,)
+                frac = jnp.sum(
+                    (jnp.mod(Gk[:, None, :] * r[None, :, :], grid)
+                     ).astype(jnp.float64) / grid.astype(jnp.float64), axis=-1)
+                E = jnp.where(vk[:, None], jnp.exp(2j * jnp.pi * frac), 0)
+                bloch = jnp.exp(2j * jnp.pi * jnp.sum(
+                    kv[None, :] * r.astype(jnp.float64)
+                    / grid.astype(jnp.float64), axis=-1)) * w * inv_sqrt_n
+                return (a @ E) * bloch[None, :]                # (bc_w·ns, mu_t)
+
+            X = jax.lax.map(one_tile, (r_t, w_t))              # (n_t, bc_w·ns, mu_t)
+            X = jnp.moveaxis(X, 0, 1).reshape(bc_w, ns, mu_pad)
+            X = jax.lax.psum(X, XY)
+            y0 = jax.lax.axis_index('y') * mu_y
+            x0 = jax.lax.axis_index('x') * mu_x
+            Xy = jax.lax.dynamic_slice_in_dim(X, y0, mu_y, axis=2)
+            Xx = jnp.conj(jax.lax.dynamic_slice_in_dim(X, x0, mu_x, axis=2)
+                          ).transpose(2, 0, 1)
+            z = jnp.int32(0)
+            ay = jax.lax.dynamic_update_slice(ay, Xy[None], (kk, b0, z, z))
+            ax_ = jax.lax.dynamic_update_slice(ax_, Xx[None], (kk, z, b0, z))
+            return (ay, ax_), None
+
+        (acc_y, acc_x), _ = jax.lax.scan(
+            one_k, (acc_y, acc_x), jnp.arange(nk, dtype=jnp.int32), unroll=1)
+        return g, acc_y, acc_x
+
+    rep = P()
+    fn = shard_map(
+        local, mesh=mesh,
+        in_specs=(P(None, XY, None, None), rep, rep, rep, rep,
+                  P(None, None, None, 'y'), P(None, 'x', None, None), rep),
+        out_specs=(P(None, None, None, XY), P(None, None, None, 'y'),
+                   P(None, 'x', None, None)),
+        check_vma=False)
+    return jax.jit(fn, donate_argnums=(5, 6))
+
+
+@lru_cache(maxsize=None)
+def _gslot_insert_kernel(mesh: Mesh):
+    spec = NamedSharding(mesh, P(None, None, None, ('x', 'y')))
+
+    @partial(jax.jit, donate_argnums=(0,), out_shardings=spec)
+    def insert(store, chunk, b0):
+        z = jnp.int32(0)
+        return jax.lax.dynamic_update_slice(store, chunk, (z, b0, z, z))
+    return insert
+
+
+def load_parent_psi_G(
+    *,
+    wfn,
+    mesh_xy: Mesh,
+    meta,
+    band_range: tuple[int, int],
+    band_chunk: int,
+    centroid_indices=None,
+    placement: str = "device",
+    bispinor: bool = False,
+    bispinor_lift: str = "raw",
+    k_domain: str = "ibz",
+    mu_tile_bytes: int = 256 * 2**20,
+    print_fn=print,
+) -> ParentPsiG:
+    """Read ψ(G) of the raw parents ONCE; return the G-slot store and the faces.
+
+    Each band chunk is read band-sharded (the loader's one collective union
+    read, ``WfnLoader.load``), moved to G slots by one all-to-all, sampled at
+    the centroids by a direct DFT (a GEMM over the local G slots), and then
+    either kept on device (``placement='device'``), copied to this process's
+    host tile (``'host'``, the streaming case), or dropped (``'none'``: faces
+    only).  Nothing is read twice and nothing goes device → host → device.
+
+    ``band_chunk`` is the planner's band width (padded to the mesh here).
+    ``centroid_indices`` ``(n_rmu, 3)``; with ``meta.mu_basis`` the packed
+    table and its active mask are used, as in ``load_centroids_band_chunked``,
+    and the faces leave in the same layouts and extents.
+
+    Per-rank bytes: the store ``n_k·nb_c·ns·ngk_c·16/P``, the in-flight chunk
+    twice (read + all-to-all), the replicated sphere index ``n_k·ngk_c·4``
+    and one ``ngk_c/P × μ_tile`` phase tile (``mu_tile_bytes``).
+    """
+    from common import timing
+    from common.collectives import device_put_process_local
+    from common.wfn_transforms import (
+        load_psi_gflat_padded, _centroid_sampling_geometry,
+        _centroid_sampling_shardings, _centroid_face_kernels)
+    from runtime.padding import padded_axis, mesh_divisor
+
+    if placement not in ("device", "host", "none"):
+        raise ValueError(
+            f"load_parent_psi_G: placement must be 'device', 'host' or "
+            f"'none'; got {placement!r}")
+    loader = wfn
+    P_ = int(mesh_divisor(mesh_xy))
+    fft_grid = tuple(int(v) for v in meta.fft_grid)
+    n_rtot = int(np.prod(fft_grid))
+    b0, b1 = (int(v) for v in band_range)
+    w = padded_axis(int(band_chunk), P_, name="ψ(G) band chunk").carrier
+    nb_c = padded_axis(b1 - b0, P_, name="ψ(G) band carrier").carrier
+    ngk_c = padded_axis(int(loader.ngkmax), P_, name="ψ(G) G-slot carrier").carrier
+    k_spec = "ibz" if k_domain == "ibz" else "full_bz"
+    nk = int(loader.nkpts) if k_spec == "ibz" else int(meta.nk_tot)
+
+    sidx_np = _pad_sphere_index(loader.box_index(k=k_spec), ngk_c, n_rtot)
+    kvecs = loader.kvecs(k=k_spec)
+    rep = NamedSharding(mesh_xy, P())
+    sidx = device_put_process_local(sidx_np, NamedSharding(mesh_xy, P(None, None)))
+    kvecs_dev = device_put_process_local(kvecs, NamedSharding(mesh_xy, P(None, None)))
+
+    with_faces = centroid_indices is not None
+    finish = None
+    if with_faces:
+        (_, _, _, _, _, _, _, mu_basis, mu_active_mask, n_rmu, cidx_np, _) = (
+            _centroid_sampling_geometry(
+                (b0, b0 + nb_c), centroid_indices, k_spec, meta, None, False,
+                None, loader))
+        (_, _, _, _, out_Y, out_X, stage_Y, stage_X, mu_pad, _) = (
+            _centroid_sampling_shardings(mesh_xy, meta, mu_basis, n_rmu, loader))
+        ngk_l = ngk_c // P_
+        mu_t = max(1, min(int(mu_pad), int(mu_tile_bytes) // (16 * max(ngk_l, 1))))
+        while mu_pad % mu_t:
+            mu_t -= 1
+        r_mu = np.zeros((int(mu_pad), 3), dtype=np.int32)
+        r_mu[:n_rmu] = cidx_np
+        w_mu = np.zeros((int(mu_pad),), dtype=np.float64)
+        w_mu[:n_rmu] = 1.0 if mu_active_mask is None else mu_active_mask
+        r_mu_dev = device_put_process_local(r_mu, rep)
+        w_mu_dev = device_put_process_local(w_mu, rep)
+
+        @partial(jax.jit, out_shardings=(out_Y, out_X))
+        def _zero_faces():
+            return (jnp.zeros((nk, nb_c, int(meta.nspinor), int(mu_pad)), jnp.complex128),
+                    jnp.zeros((nk, int(mu_pad), nb_c, int(meta.nspinor)), jnp.complex128))
+        acc_y, acc_x = _zero_faces()
+        _, finish = _centroid_face_kernels(
+            b0, meta, mu_active_mask, n_rmu, int(mu_pad), b1 - b0, out_X, out_Y,
+            stage_X, stage_Y)
+    else:
+        mu_pad, mu_t = P_, 1
+        r_mu_dev = device_put_process_local(np.zeros((P_, 3), np.int32), rep)
+        w_mu_dev = device_put_process_local(np.zeros((P_,), np.float64), rep)
+        acc_y, acc_x = jax.jit(
+            lambda: (jnp.zeros((1, 1, 1, P_), jnp.complex128),
+                     jnp.zeros((1, P_, 1, 1), jnp.complex128)),
+            out_shardings=(NamedSharding(mesh_xy, P(None, None, None, 'y')),
+                           NamedSharding(mesh_xy, P(None, 'x', None, None))))()
+
+    ns = int(meta.nspinor) if bispinor else int(loader.nspinor)
+    store = host_tile = None
+    gspec = NamedSharding(mesh_xy, P(None, None, None, ('x', 'y')))
+    if placement == "device":
+        store = jax.jit(lambda: jnp.zeros((nk, nb_c, ns, ngk_c), jnp.complex128),
+                        out_shardings=gspec)()
+    elif placement == "host":
+        if len(mesh_xy.local_devices) != 1:
+            raise ValueError("load_parent_psi_G(placement='host') wants one "
+                             "device per process (the LORRAX launch).")
+        host_tile = np.zeros((nk, nb_c, ns, ngk_c // P_), np.complex128)
+    insert = _gslot_insert_kernel(mesh_xy)
+    t_read = t_xform = t_keep = 0.0
+    import time as _time
+    for lo in range(b0, b0 + nb_c, w):
+        wc = min(w, b0 + nb_c - lo)     # the tail chunk: a P multiple, ≤ w
+        t0 = _time.perf_counter()
+        with timing.section("psi_G_store.gslot.read"):
+            chunk = load_psi_gflat_padded(
+                loader, (lo, min(lo + wc, b1)), mesh_xy=mesh_xy,
+                bispinor=bispinor, pad_to=wc, k=k_spec,
+                sharding=band_sphere_spec(), bispinor_lift=bispinor_lift)
+            if chunk is None:          # wholly past the file's bands: zeros
+                continue
+            if int(chunk.shape[-1]) < ngk_c:
+                chunk = jax.jit(
+                    lambda a: jnp.pad(a, ((0, 0), (0, 0), (0, 0),
+                                          (0, ngk_c - a.shape[-1]))),
+                    out_shardings=NamedSharding(mesh_xy, band_sphere_spec()))(chunk)
+            jax.block_until_ready(chunk)
+        t1 = _time.perf_counter()
+        kern = _gslot_face_kernel(mesh_xy, fft_grid, nk, wc, ns, ngk_c,
+                                  int(mu_pad), int(mu_t), with_faces)
+        with timing.section("psi_G_store.gslot.a2a_faces"):
+            g_chunk, acc_y, acc_x = kern(chunk, sidx, kvecs_dev, r_mu_dev,
+                                         w_mu_dev, acc_y, acc_x,
+                                         jnp.int32(lo - b0))
+            del chunk
+            jax.block_until_ready((g_chunk, acc_y, acc_x))
+        t2 = _time.perf_counter()
+        with timing.section("psi_G_store.gslot.keep"):
+            if placement == "device":
+                store = insert(store, g_chunk, jnp.int32(lo - b0))
+                jax.block_until_ready(store)
+            elif placement == "host":
+                (shard,) = g_chunk.addressable_shards
+                host_tile[:, lo - b0:lo - b0 + wc] = np.asarray(shard.data)
+            del g_chunk
+        t3 = _time.perf_counter()
+        t_read += t1 - t0
+        t_xform += t2 - t1
+        t_keep += t3 - t2
+    faces = None
+    if with_faces:
+        faces = finish(acc_y, acc_x, nk)
+        jax.block_until_ready(faces)
+    print_fn(f"  ψ(G) one-read: {nk} k × {nb_c} bands × {ngk_c} G slots "
+             f"({(b1 - b0)} logical) in chunks of {w}; read {t_read:.2f}s, "
+             f"all-to-all{' + centroid DFT' if with_faces else ''} "
+             f"{t_xform:.2f}s, keep[{placement}] {t_keep:.2f}s")
+    return ParentPsiG(store, host_tile, sidx, kvecs, (b0, b1), faces)

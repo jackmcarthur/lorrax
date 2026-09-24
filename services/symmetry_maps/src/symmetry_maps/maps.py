@@ -633,20 +633,28 @@ def _permute_isdf_operator_axes_local(
     mesh_y: int,
     left_local_source_map=None,
     right_local_source_map=None,
+    left_start=None,
+    right_start=None,
 ):
-    """Fuse owner-local maps and use volume-preserving all-to-all for distributed maps."""
+    """Fuse owner-local maps and use volume-preserving all-to-all for distributed maps.
+
+    ``left_start``/``right_start`` are the offsets of this rank's slice in
+    the owner-local maps; ``None`` means the X (left) / Y (right) shard.
+    """
     n_left_local = int(operator_local.shape[1])
     n_right_local = int(operator_local.shape[2])
-    x_idx = jax.lax.axis_index('x')
-    y_idx = jax.lax.axis_index('y')
+    if left_start is None:
+        left_start = jax.lax.axis_index('x') * n_left_local
+    if right_start is None:
+        right_start = jax.lax.axis_index('y') * n_right_local
 
     if left_local_source_map is not None:
         local_left = jax.lax.dynamic_slice_in_dim(
-            left_local_source_map, x_idx * n_left_local, n_left_local,
+            left_local_source_map, left_start, n_left_local,
             axis=1)
         if right_local_source_map is not None:
             local_right = jax.lax.dynamic_slice_in_dim(
-                right_local_source_map, y_idx * n_right_local, n_right_local,
+                right_local_source_map, right_start, n_right_local,
                 axis=1)
             source = local_left[:, :, None] * n_right_local + local_right[:, None, :]
             rows = int(operator_local.shape[0])
@@ -671,7 +679,7 @@ def _permute_isdf_operator_axes_local(
 
     if right_local_source_map is not None:
         local_right = jax.lax.dynamic_slice_in_dim(
-            right_local_source_map, y_idx * n_right_local, n_right_local,
+            right_local_source_map, right_start, n_right_local,
             axis=1)
         return jnp.take_along_axis(
             permuted_left, local_right[:, None, :], axis=2,
@@ -899,8 +907,17 @@ def unfold_operator_local(
     n_sym_spatial,
     trs_rule='conj',
     transposed_parent_local=None,
+    left_mesh_axis='x',
+    right_mesh_axis='y',
 ):
-    """Transport one local rectangular tile from raw parents to full k; see docs/architecture/symmetry_register.md."""
+    """Transport one local rectangular tile from raw parents to full k; see docs/architecture/symmetry_register.md.
+
+    ``left_mesh_axis``/``right_mesh_axis`` name the mesh axis whose shard of
+    the endpoint tables this rank holds (the tables span the whole endpoint
+    and are sliced by that axis index).  ``None`` means the tables are
+    already this rank's local slice, e.g. a μ batch replicated on every rank
+    or an r block owned by one rank of the flat ``('x','y')`` index.
+    """
     if trs_rule not in ('conj', 'pair_transpose'):
         raise ValueError("unfold_operator_local trs_rule must be conj|pair_transpose")
     pair_transpose = trs_rule == 'pair_transpose'
@@ -924,10 +941,25 @@ def unfold_operator_local(
         at_irr = jnp.where(trs_mask[:, None, None],
                            jnp.take(transposed_parent_local, irr, axis=0),
                            at_irr)
+    mu_local = int(operator_parent_local.shape[1])
+    nu_local = int(operator_parent_local.shape[2])
+    left_start = (0 if left_mesh_axis is None
+                  else jax.lax.axis_index(left_mesh_axis) * mu_local)
+    right_start = (0 if right_mesh_axis is None
+                   else jax.lax.axis_index(right_mesh_axis) * nu_local)
+    for name, table, width, axis in (
+            ("left", left_local_perm, mu_local, left_mesh_axis),
+            ("right", right_local_perm, nu_local, right_mesh_axis)):
+        if axis is None and int(np.shape(table)[1]) != width:
+            raise ValueError(
+                f"unfold_operator_local: {name}_mesh_axis=None needs the "
+                f"{name} tables at the local extent {width}; got "
+                f"{int(np.shape(table)[1])}.")
     V_full_local = _permute_isdf_operator_axes_local(
         at_irr, None, None, mesh_x=1, mesh_y=1,
         left_local_source_map=left_local_q,
-        right_local_source_map=right_local_q)
+        right_local_source_map=right_local_q,
+        left_start=left_start, right_start=right_start)
 
     q_per_q = jnp.take(
         jnp.asarray(q_irr_frac, dtype=jnp.float64), irr, axis=0)
@@ -939,14 +971,10 @@ def unfold_operator_local(
         'qi,qmi->qm', q_per_q, L_left).astype(jnp.complex128))
     phase_right = jnp.exp(2j * jnp.pi * jnp.einsum(
         'qi,qmi->qm', q_per_q, L_right).astype(jnp.complex128))
-    mu_local = int(V_full_local.shape[1])
-    nu_local = int(V_full_local.shape[2])
-    x_idx = jax.lax.axis_index('x')
-    y_idx = jax.lax.axis_index('y')
     phase_mu = jax.lax.dynamic_slice_in_dim(
-        phase_left, x_idx * mu_local, mu_local, axis=1)
+        phase_left, left_start, mu_local, axis=1)
     phase_nu = jax.lax.dynamic_slice_in_dim(
-        phase_right, y_idx * nu_local, nu_local, axis=1)
+        phase_right, right_start, nu_local, axis=1)
     return _apply_unfold_phase_and_trs_local(
         V_full_local, phase_mu, phase_nu, trs_mask, pair_transpose=pair_transpose)
 

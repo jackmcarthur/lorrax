@@ -14,6 +14,7 @@ the resulting two-endpoint operator to full k, still in that order.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import NamedTuple
 
 from ffi import _services
 
@@ -385,6 +386,21 @@ class RealGridOrbitTiles:
                 "grouped layout should have made that impossible.")
         return (perm % int(self.shard_size)).astype(np.int32), wraps
 
+    def owner_planes(self) -> np.ndarray:
+        """``(n_tiles, n_y, n_pl_max)`` planes along ``plane_axis`` holding
+        each owner's points of each tile, ascending, ``-1`` padded."""
+        fg = self.fft_grid
+        r = self.r_index.reshape(self.n_tiles, self.n_y, self.shard_size)
+        coord = (r // (fg[1] * fg[2]), (r // fg[2]) % fg[1], r % fg[2])
+        plane = np.where(r >= 0, coord[self.plane_axis], -1)
+        per = [[np.unique(row[row >= 0]) for row in tile] for tile in plane]
+        n_max = max(1, max(p.size for tile in per for p in tile))
+        out = np.full((self.n_tiles, self.n_y, n_max), -1, dtype=np.int32)
+        for t, tile in enumerate(per):
+            for o, pl in enumerate(tile):
+                out[t, o, :pl.size] = pl
+        return out
+
 
 def plane_axis_for_orbits(labels, fft_grid) -> int:
     """The grid axis whose planes the symmetry orbits cross least.
@@ -501,10 +517,195 @@ def build_real_grid_orbit_tiles(
     )
 
 
+# ---------------------------------------------------------------------------
+# μ-batch ζ fit: whole-orbit centroid batches and orbit-closed rank r blocks
+# (docs/architecture/zeta_fit_mubatch.md, "Symmetry: parent k").  The batch
+# loop computes pair projectors on raw parent k for one batch B of centroids
+# (replicated) and one r block of its own rank, then unfolds them to full k
+# with ``isdf.core.parent_projector_kconv``.  Both endpoint gathers are local
+# exactly when B and the r block are unions of whole orbits; these builders
+# make them so and hand back the endpoint tables in the local frame.
+# ---------------------------------------------------------------------------
+
+class MuOrbitBatches(NamedTuple):
+    """Whole-orbit centroid batches of one plan (see :func:`orbit_mu_batches`).
+
+    ``mu[β, slot]`` is the PACKED centroid in slot ``slot`` of batch ``β``
+    (``-1`` pad).  Slot ``p·c + j`` (``c = b / n_ranks``) is owned by rank
+    ``p`` after the batch transpose.  ``left_perm[β, row, slot]`` is the
+    batch-local slot of the source centroid of action row ``row`` and
+    ``left_L[β, row, slot]`` its lattice wrap: ``plan.centroid_local_perm``
+    / ``plan.L_table`` semantics with the batch as the local extent.  Rows
+    outside ``rows`` (the ones ``plan.sym_idx`` never selects) are ``-1``;
+    pad slots map to themselves with zero wrap.
+    """
+    mu: np.ndarray
+    left_perm: np.ndarray
+    left_L: np.ndarray
+    rows: np.ndarray
+    n_ranks: int
+
+    @property
+    def n_batch(self) -> int:
+        return int(self.mu.shape[0])
+
+    @property
+    def b(self) -> int:
+        return int(self.mu.shape[1])
+
+    @property
+    def c(self) -> int:
+        return self.b // int(self.n_ranks)
+
+    @property
+    def rank_mu(self) -> np.ndarray:
+        """``(n_batch, n_ranks, c)``: each rank's rows after the transpose."""
+        return self.mu.reshape(self.n_batch, int(self.n_ranks), self.c)
+
+    def packed_to_slot(self, mu_pad: int) -> np.ndarray:
+        """``(mu_pad,)`` flat slot ``β·b + slot`` of every packed centroid; ``-1``
+        for the layout's pad slots, whose Z rows are exactly zero."""
+        out = np.full((int(mu_pad),), -1, dtype=np.int64)
+        flat = self.mu.reshape(-1)
+        hit = flat >= 0
+        out[flat[hit]] = np.flatnonzero(hit)
+        return out
+
+
+def mu_batch_tables(k_unfold_plan, mu) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Batch-local endpoint tables for given batches; refuses a split orbit.
+
+    ``mu`` is ``(n_batch, b)`` packed centroids (``-1`` pad).  Returns
+    ``(left_perm, left_L, rows)`` in :class:`MuOrbitBatches` semantics.  A
+    batch not closed under every row ``plan.sym_idx`` selects raises naming
+    the batch, row and centroid: the unfold would need a source outside it.
+    """
+    plan = k_unfold_plan
+    mu = np.asarray(mu, dtype=np.int64)
+    n_rows_all = int(plan.sym_perm.shape[0])
+    rows = np.unique(np.asarray(plan.sym_idx, dtype=np.int64))
+    sym_perm = np.asarray(plan.sym_perm, dtype=np.int64)
+    L = np.asarray(plan.L_table, dtype=np.int64)
+    if np.any(sym_perm[rows] < 0):
+        raise ValueError(
+            "mu_batch_tables: a row plan.sym_idx selects has no centroid "
+            "action; the plan should have refused it.")
+    n_batch, b = mu.shape
+    left_perm = np.full((n_batch, n_rows_all, b), -1, dtype=np.int32)
+    left_L = np.zeros((n_batch, n_rows_all, b, 3), dtype=np.int32)
+    seen = np.zeros((int(plan.n_centroid_packed),), dtype=np.int64)
+    for beta in range(n_batch):
+        slots = np.flatnonzero(mu[beta] >= 0)
+        members = mu[beta, slots]
+        seen[members] += 1
+        slot_of = np.full((int(plan.n_centroid_packed),), -1, dtype=np.int64)
+        slot_of[members] = slots
+        for row in rows:
+            src = slot_of[sym_perm[row, members]]
+            if np.any(src < 0):
+                bad = int(np.flatnonzero(src < 0)[0])
+                raise ValueError(
+                    f"mu_batch_tables: batch {beta} is not a union of whole "
+                    f"orbits: action row {int(row)} takes packed centroid "
+                    f"{int(members[bad])} (slot {int(slots[bad])}) from "
+                    f"{int(sym_perm[row, members[bad]])}, which is outside "
+                    "the batch.  Fix: build the batches with orbit_mu_batches.")
+            left_perm[beta, row] = np.arange(b)
+            left_perm[beta, row, slots] = src
+            left_L[beta, row, slots] = L[row, members]
+    active = np.asarray(plan.layout.axis.active_mask, dtype=bool)
+    if np.any(seen[active] != 1) or np.any(seen[~active] != 0):
+        raise ValueError(
+            "mu_batch_tables: every active packed centroid must sit in "
+            f"exactly one slot and no layout pad in any; got counts "
+            f"{np.unique(seen[active]).tolist()} (active) / "
+            f"{np.unique(seen[~active]).tolist()} (pads).")
+    return left_perm, left_L, rows.astype(np.int32)
+
+
+def orbit_mu_batches(k_unfold_plan, mu_pad: int, n_ranks: int, *,
+                     b_target: int) -> MuOrbitBatches:
+    """Pack the plan's centroid orbits whole into batches of about ``b_target``.
+
+    Orbits are those of the rows ``plan.sym_idx`` selects (the only ones the
+    k unfold applies), in the packed order.  The batch width ``b`` is a
+    multiple of ``n_ranks`` and at least the largest orbit: when the target
+    is smaller the batch is widened to hold one orbit, and the caller prices
+    the returned ``b``.  The batch count is the smallest at which
+    largest-first placement onto the least-loaded batch fits every orbit
+    (LPT), so the active centroids are spread evenly over the batches and the
+    realized ``b`` is the largest load rounded up to ``n_ranks``.  Inside a
+    batch the members are in packed order and each rank's ``c`` slots get
+    ``⌊n/P⌋`` or ``⌈n/P⌉`` of them, pads trailing.  An orbit may span ranks:
+    the batch is replicated and unfolded before the transpose.  The layout's
+    pad slots belong to no batch (their face rows, hence Z rows, are zero).
+    """
+    import heapq
+
+    from symmetry_maps import permutation_orbit_labels
+
+    plan = k_unfold_plan
+    P_ = int(n_ranks)
+    if int(mu_pad) != int(plan.n_centroid_packed):
+        raise ValueError(
+            f"orbit_mu_batches: mu_pad={mu_pad} is not the plan's packed "
+            f"centroid extent {plan.n_centroid_packed}.")
+    if P_ < 1 or int(b_target) < 1:
+        raise ValueError(
+            f"orbit_mu_batches: need n_ranks, b_target >= 1; got {P_}, {b_target}.")
+    rows = np.unique(np.asarray(plan.sym_idx, dtype=np.int64))
+    labels = permutation_orbit_labels(np.asarray(plan.sym_perm)[rows])
+    act = np.flatnonzero(np.asarray(plan.layout.axis.active_mask, dtype=bool))
+    lab = labels[act]
+    order = np.argsort(lab, kind="stable")
+    _, start, sizes = np.unique(lab[order], return_index=True,
+                                return_counts=True)
+    members = np.split(act[order], start[1:])            # packed order inside
+    up = lambda v: -(-int(v) // P_) * P_
+    b_cap = max(up(int(sizes.max())), (int(b_target) // P_) * P_)
+    by_size = sorted(range(len(members)),
+                     key=lambda g: (-int(sizes[g]), int(members[g][0])))
+    n_batch = max(1, -(-int(act.size) // b_cap))
+    while True:
+        heap = [(0, beta) for beta in range(n_batch)]
+        owner = np.empty((len(members),), dtype=np.int64)
+        loads = np.zeros((n_batch,), dtype=np.int64)
+        ok = True
+        for g in by_size:
+            load, beta = heapq.heappop(heap)
+            if load + int(sizes[g]) > b_cap:
+                ok = False
+                break
+            owner[g] = beta
+            loads[beta] = load + int(sizes[g])
+            heapq.heappush(heap, (int(loads[beta]), beta))
+        if ok:
+            break
+        n_batch += 1
+    b = up(int(loads.max()))
+    c = b // P_
+    mu = np.full((n_batch, b), -1, dtype=np.int32)
+    for beta in range(n_batch):
+        mem = np.sort(np.concatenate(
+            [members[g] for g in np.flatnonzero(owner == beta)]))
+        q, r = divmod(int(mem.size), P_)
+        cursor = 0
+        for p in range(P_):
+            take = q + (1 if p < r else 0)
+            mu[beta, p * c:p * c + take] = mem[cursor:cursor + take]
+            cursor += take
+    left_perm, left_L, rows = mu_batch_tables(plan, mu)
+    return MuOrbitBatches(mu=mu, left_perm=left_perm, left_L=left_L,
+                          rows=rows, n_ranks=P_)
+
+
 __all__ = [
     "CentroidKUnfoldPlan",
+    "MuOrbitBatches",
     "RealGridOrbitTiles",
     "build_centroid_k_unfold_plan",
     "build_real_grid_orbit_tiles",
+    "mu_batch_tables",
+    "orbit_mu_batches",
     "plane_axis_for_orbits",
 ]

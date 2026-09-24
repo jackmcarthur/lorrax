@@ -403,7 +403,7 @@ class Operator(NamedTuple):
       psi_n   (1, nb, ns, ngkmax) c128, sharded ``spec_sphere_xy``
       gvec    (ngkmax, 3) i32  — this k's G table (D10 fixed shape)
       gmask   (ngkmax,)   f64  — 1 on physical G, 0 on pad columns
-      bidx    (1, nx, ny, nz) i32 — sphere→box index map for this k
+      bidx    (1, ngkmax) i32 — per-k sphere index (flat box cell per G slot)
       kvec    (3,) f64
 
     and must return ``(1, nb, ns, ngkmax)`` in the same layout — or, when
@@ -561,7 +561,7 @@ def local_potential_operator(
         # jax, band sharding rides through (the gather is over the G
         # axis, no cross-rank op), and its ngkmax zero-slot makes the
         # sentinel index gather exact zero.
-        box = _box_kernel(psi_n, bidx, ngkmax=geom.ngkmax)
+        box = _box_kernel(psi_n, bidx, fft_grid=geom.fft_grid)
         psi_r = ifftn(box) * scale
         if vector:
             phi_r = jnp.zeros_like(psi_r)
@@ -656,7 +656,7 @@ def four_current_potential_operator(
 
     def op(psi_n, gvec, gmask, bidx, kvec, V0, V1):
         del kvec
-        box = _box_kernel(psi_n, bidx, ngkmax=geom.ngkmax)
+        box = _box_kernel(psi_n, bidx, fft_grid=geom.fft_grid)
         psi_r = ifftn(box) * scale
         phi_scalar = psi_r * charge_mask * V0
         phi_vector = jnp.zeros_like(psi_r)
@@ -1528,7 +1528,7 @@ def sweep_matrix_elements(
         The sentinel is chosen so that no physical G of a padded row maps
         to it, which makes the omission detectable rather than harmless;
         it does not make the mask optional.
-    box_index : (nk, nx, ny, nz) i32
+    box_index : (nk, ngkmax) i32
         Sphere→box index map (``WfnLoader.box_index``).  Only consumed by
         operators that transform; the kinetic and dipole operators ignore it.
     kvecs : (nk, 3) f64

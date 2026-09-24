@@ -603,7 +603,7 @@ def _density_scan_body(mesh: Mesh, plan: DensityScanPlan, *, n_k: int,
             phi, n0 = my_bands(psi_t, U_t)
             f = jax.lax.dynamic_slice_in_dim(occ_t, n0, n_loc, axis=1)
             f = f * (f_spin * w_t)[:, None]
-            box = _box_kernel(phi, bidx_t, ngkmax=ngkmax)
+            box = _box_kernel(phi, bidx_t, fft_grid=grid)
             psi_r = local_ifftn3(box, axes=(-3, -2, -1), norm="ortho") * scale
             dens = density_components_from_psi_r(
                 psi_r.reshape(K * n_loc, ns, *grid), f.reshape(K * n_loc),

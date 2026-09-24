@@ -40,10 +40,6 @@ FFI_DIAL_ENV = (
     # exists until its separate seam lands; retain the dial in cross-rank and
     # factory fingerprints for the candidate API and future caller.
     "LORRAX_CONV_KLEAD_FFI",
-    # ISDF CCT/ZCT post-pair accelerator.  The mode changes the post-einsum
-    # HLO body inside a shard_map, so every rank must compile the same arm.
-    "LORRAX_CONV_KPAIR_FFI",
-    "LORRAX_CONV_KPARENT_FFI",
 )
 
 
@@ -68,7 +64,7 @@ def ffi_dial_key() -> tuple:
     All six reads are tier-1 lexical (no JAX backend init) and O(1) —
     safe in any cache-lookup path at any P.
     """
-    from ffi.fft import (conv_klead_mode, conv_kminor_mode, conv_kpair_mode,
+    from ffi.fft import (conv_klead_mode, conv_kminor_mode,
                          fft_ffi_enabled, fused_fft_ffi_enabled)
     from ffi.gemm import gemm_ffi_enabled as bands_gemm_ffi_enabled
     return (
@@ -80,7 +76,6 @@ def ffi_dial_key() -> tuple:
         # so a boolean key would let one be served from the other's cache.
         ("conv_kminor_ffi", conv_kminor_mode()),
         ("conv_klead_ffi", conv_klead_mode()),
-        ("conv_kpair_ffi", conv_kpair_mode()),
     )
 
 

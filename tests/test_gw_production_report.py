@@ -75,8 +75,6 @@ def _runtime():
             # lowering, not describe a skipped platform-policy gate.
             {"env": "LORRAX_BANDS_GEMM_FFI", "enabled": True,
              "platforms": ("cpu",), "off_label": "native XLA dot lowering"},
-            {"env": "LORRAX_CONV_KPAIR_FFI", "enabled": True,
-             "platforms": ("CUDA",), "target": "lorrax_cufft_conv_kpair"},
             # No production Sigma caller: this capability is not a run control.
             {"env": "LORRAX_CONV_KLEAD_FFI", "enabled": False,
              "platforms": ("CUDA",), "off_label": "XLA"},
@@ -215,7 +213,7 @@ def test_report_is_scientific_rank_zero_output(tmp_path):
     assert "Gap correction : +0.00000 eV relative to DFT" in text
     assert "Quasiparticle energies" not in text
     assert "cuFFT flat-k FFI" in text
-    assert "cuFFT pair-convolution FFI" in text
+    assert "pair-density convolution forming V(q) (nvidia-mathdx fused cuFFTDx kernels)" in text
     assert "mklfft" not in text
     gemm_line = next(line for line in text.splitlines()
                      if "LORRAX_BANDS_GEMM_FFI" in line)

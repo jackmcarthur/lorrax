@@ -725,6 +725,37 @@ bit-exactness — swapping engines changes the arithmetic ordering, where bit
 equality is not promised. And not the 1e-16 figures: those are *measured*
 unit residuals sitting at the c128 ULP, where a threshold tests nothing.
 
+### k-convolution router and the mathdx family (2026-09-24)
+
+This supersedes the direct-DFT arms described in the 2026-09-06 subsection
+below (ruling: [`decisions.md`](decisions.md), 2026-09-24).
+
+| Layer | ζ-fit pair convolution |
+|---|---|
+| 1 consumer | `isdf.core` tails (`c_q_downfold`, `c_q_from_psi_sm`, `_z_q_face_parent`, `parent_projector_kconv`) |
+| 2 facade / router | `ffi/fft.py`: `make_fused_conv_kpair`, `make_fused_conv_kparent` choose by mesh platform. CUDA → a mathdx callable; cpu → `None`, which is the consumer's flat-k MKL plan tail (`common.fft_helpers.local_kfft3`); other → refusal |
+| 3 gate | the wheel's headers must be found (`importlib` spec of `nvidia.mathdx`), else `GATE mathdx-headers`; axes ≤ 40 |
+| 4 target | `lorrax_mathdx_kconv_pair`, `lorrax_mathdx_kconv_parent` |
+| 5 handler | `cpp/cufft/kconv_mathdx_cuda_ffi.cc`: NVRTC compiles one embedded cuFFTDx source per (mode, nkx, nky, nkz, ns, CUcontext); in-process cache |
+
+The operands, tables, `centroid_major` layout and perm/phase attributes are
+exactly those of the 2026-09-06 handler below, so the consumers are unchanged.
+The one new attribute is the string `mathdx_root`, the installed wheel's
+`nvidia/mathdx` directory. From it NVRTC includes `include/` and
+`external/cutlass/include`. The CUDA toolkit's `include/` and
+`include/cccl` (libcu++) are derived from the loaded libnvrtc, never from an
+environment variable.
+
+A new mode is added in three steps:
+
+1. A kernel entry in the embedded source, keyed by the `LRX_MODE` compile
+   definition.
+2. A mode code and handler in the same TU.
+3. A factory in `ffi/fft.py` that the router returns on CUDA.
+
+The CPU leg of a new mode is its plan-route composition. There is still no
+second NVIDIA path.
+
 ### Parent-load ISDF pair convolution (2026-09-06)
 
 `CufftConvKParentCudaFfi` / `lorrax_cufft_conv_kparent` is an additive
