@@ -408,7 +408,7 @@ def _plan_vq_group(tiles, *, rows, n_q: int, ngkmax: int, mesh_xy: Mesh,
     what one q leaves free; an explicit ``g_chunk`` (deck
     ``vq_g_chunk_size``) is used as given.  The q-tile is then every q that
     fits the device budget and whose read staging, ``host_per_q`` per q,
-    fits ``host_budget_bytes`` (``_vq_host_staging_bytes``) — all of them
+    fits ``host_budget_bytes`` (``host_bytes_per_process``) — all of them
     whenever they do, which is the whole-slab read — balanced so the last
     tile is not a sliver.  Every input is rank-invariant (the caller agrees
     the budget across processes), so every rank issues the same collective
@@ -477,30 +477,6 @@ def _vq_budget_bytes(budget_bytes: float | None) -> float:
     else:
         local_gb = float(budget_bytes) / 1e9
     return minimum_process_budget_gb(local_gb) * 1e9
-
-
-def _vq_host_staging_bytes() -> float:
-    """Per-rank host bytes one ζ q-tile read may stage, agreed across processes.
-
-    The phdf5 read stages each rank's slab in its file context's host
-    buffer (``ctx->read_buf``, ``src/ffi/cpp/phdf5/read_ffi.cc``); the
-    context retires a buffer above 32 MiB once its H2D has completed
-    (3175fbbb), so the staging is transient and what one tile may stage is
-    0.9 of the node's live ``MemAvailable`` over the processes sharing the
-    node.
-    """
-    import socket
-    import zlib
-    from common.collectives import all_gather_processes
-    from common.gpu_utils import (get_host_memory_available_gb,
-                                  minimum_process_budget_gb)
-    avail_gb = get_host_memory_available_gb()
-    host = zlib.crc32(socket.gethostname().encode())
-    hosts = np.asarray(all_gather_processes(np.asarray(host, dtype=np.int64)))
-    per_node = max(1, int(np.sum(hosts == host)))
-    local_gb = (float('inf') if avail_gb is None
-                else 0.9 * avail_gb / per_node)
-    return minimum_process_budget_gb(min(local_gb, 1e12)) * 1e9
 
 
 def _make_read_q_tile(zeta_loader, n_rmu_padded: int, mesh_xy: Mesh):
@@ -726,7 +702,11 @@ def _compute_V_q_g_flat_tiles(
 
     # ---- G panel and q-tile from the V_q budget ------------------------
     budget = _vq_budget_bytes(budget_bytes)
-    host_budget = _vq_host_staging_bytes()
+    # A ζ q-tile read stages each rank's slab in its phdf5 file context's host
+    # buffer (``ctx->read_buf``); the context retires a buffer above 32 MiB
+    # once its H2D completes (3175fbbb), so the staging is one live tile.
+    from common.gpu_utils import host_bytes_per_process
+    host_budget = host_bytes_per_process()
     q_tile, g_chunk, priced = _plan_vq_group(
         [dict(n_rmu_L=s['nL'], n_rmu_R=s['nR'], same_zeta=s['same_zeta'],
               n_sub=n_sub if s['one_leg'] else 0) for s in specs],

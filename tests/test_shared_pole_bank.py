@@ -304,10 +304,10 @@ def test_bank_reads_parent_lists_in_face_and_batch_layout(tmp_path):
 
 
 def test_resident_bank_reads_equal_file_reads(tmp_path):
-    """A device-resident bank returns the file bank's values bit for bit.
+    """A resident bank (device or pinned host) returns the file bank's values bit for bit.
 
     The same payload goes through the same writer into a scratch file and into
-    a ResidentBankPayload. Every reader route the constructor uses (contiguous
+    a ResidentBankPayload of each tier. Every reader route the constructor uses (contiguous
     face, permuted/repeated face, contiguous batch, permuted interval batch,
     sparse batch) must agree exactly, including the layout. The logical tail of
     the canonical carrier is written NONZERO here, so a resident store that
@@ -323,7 +323,9 @@ def test_resident_bank_reads_equal_file_reads(tmp_path):
                                   sym_perm=qt.sym_perm, L_table=qt.L_table, n_sym_spatial=qt.n_sym_spatial))
     basis = meta.mu_basis
     resident = store.ResidentBankPayload(mesh, carrier=basis.n_canonical, label="test")
-    banks = {"file": tmp_path / "scratch_resident_twin.h5", "device": resident}
+    banks = {"file": tmp_path / "scratch_resident_twin.h5", "device": resident,
+             "pinned_host": store.ResidentBankPayload(mesh, carrier=basis.n_canonical, label="host",
+                                                      memory_kind="pinned_host")}
 
     def payload(samples, value):
         shape = ((1, 1) if samples else (1,)) + (basis.n_canonical,) * 2
@@ -349,9 +351,10 @@ def test_resident_bank_reads_equal_file_reads(tmp_path):
                 meta=meta, expected_identity=identity, mesh_xy=mesh)
         headers[key] = validate_shared_pole_bank(path, expected_identity=identity, mesh_xy=mesh,
                                                  require_complete=True)
-    assert headers["file"] == headers["device"]
-    assert resident.payload_bytes_per_rank() == store.shared_pole_bank_payload_bytes(
-        meta, recipe=recipe, ordered=False, nq=4, mesh_xy=mesh)
+    assert headers["file"] == headers["device"] == headers["pinned_host"]
+    for tier in ("device", "pinned_host"):
+        assert banks[tier].payload_bytes_per_rank() == store.shared_pole_bank_payload_bytes(
+            meta, recipe=recipe, ordered=False, nq=4, mesh_xy=mesh)
     fields = ("Wc", "dWc_ds", "M1", "M3")
     batch = P(('x', 'y'))
     cases = {"span_face": dict(q_span=(0, 4)), "ids_face": dict(q_ids=[3, 1, 1, 0]),
@@ -368,10 +371,11 @@ def test_resident_bank_reads_equal_file_reads(tmp_path):
                                                      partition_spec=batch, sample_span=(1, 2), fields=("Wc",))
     for label in got["file"]:
         for name, expected in got["file"][label].items():
-            actual = got["device"][label][name]
-            assert actual.shape == expected.shape, (label, name)
-            assert actual.sharding.is_equivalent_to(expected.sharding, actual.ndim), (label, name)
-            assert bool(jnp.all(actual == expected)), (label, name)
+            for tier in ("device", "pinned_host"):
+                actual = got[tier][label][name]
+                assert actual.shape == expected.shape, (tier, label, name)
+                assert actual.sharding.is_equivalent_to(expected.sharding, actual.ndim), (tier, label, name)
+                assert bool(jnp.all(actual == expected)), (tier, label, name)
     swapped = store.ResidentBankPayload(mesh, carrier=basis.n_canonical, label="red twin")
     initialize_shared_pole_bank(swapped, meta=meta, tables=tables, recipe=recipe,
                                 identity=identity, mesh_xy=mesh)
@@ -390,3 +394,26 @@ def test_resident_bank_reads_equal_file_reads(tmp_path):
     resident.release()
     with pytest.raises(ValueError, match="no committed header"):
         validate_shared_pole_bank(resident, expected_identity=identity, mesh_xy=mesh)
+
+
+def test_bank_residence_tiers(monkeypatch, tmp_path):
+    """Device when payload + one copy fit half the device budget, else pinned host, else file."""
+    from types import SimpleNamespace
+    import common.gpu_utils as gpu_utils
+    from gw.shared_pole_screening import _bank_residence
+    monkeypatch.setattr(store, "shared_pole_bank_payload_bytes", lambda *a, **k: 40)
+    mesh = SimpleNamespace(size=4)
+    config = SimpleNamespace(debug=SimpleNamespace(write_w=False), backend=SimpleNamespace(linalg="local"))
+    sym = SimpleNamespace(trs_allowed=True, q_irr_full_idx=np.arange(2))
+
+    def residence(device_aggregate, host):
+        monkeypatch.setattr(gpu_utils, "host_bytes_per_process", lambda: host)
+        ledger = SimpleNamespace(preview=lambda **k: dict(available_device_bytes_per_rank=100,
+                                                          aggregate_bytes_per_rank=device_aggregate))
+        meta = SimpleNamespace(shared_pole_capacity=ledger, shared_pole_recipe={},
+                               mu_basis=SimpleNamespace(n_canonical=8))
+        payload, receipt = _bank_residence(meta, config, mesh_xy=mesh, sym=sym, root=tmp_path,
+                                           label="t", photon=None)
+        return receipt["residence"], getattr(payload, "memory_kind", None)
+    assert residence(1000, 80) == ("pinned_host", "pinned_host")
+    assert residence(1000, 79) == ("file", None)

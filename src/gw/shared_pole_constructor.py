@@ -29,12 +29,14 @@ def constructor_route(meta, config, recipe, *, mesh_xy, ledger, upstream, ordere
     moment_fields)``; ``upstream`` names the accepted live reservations.
     """
     from jax.sharding import PartitionSpec as P
-    from runtime.padding import padded_axis
+    from runtime.padding import ladder_extent, padded_axis
     from gw.gw_config import linalg_resolution
     from gw.shared_pole_execution import constructor_execution
 
+    # Direction ranks move between rounds and maps; their carriers sit on the
+    # extent ladder so the selection and round programs repeat.
     column_extent = lambda width: padded_axis(
-        width, mesh_xy, name="shared_pole_port",
+        ladder_extent(width, meta.n_rmu), mesh_xy, name="shared_pole_port",
         specs=((P("x", "y"), 0), (P("x", "y"), 1))).carrier
     sample_fields = (("Wc", "dWc_ds", "Wc_mirror", "dWc_mirror_ds")
                      if mirrored else ("Wc", "dWc_ds"))

@@ -19,7 +19,7 @@ def check_sector_constructor(mesh, root, *, linalg="local", parents=16, return_o
     from file_io import shared_pole_store as store
     from file_io.slab_io import SlabIO
 
-    run=root/f"constructor_{os.environ['SLURM_STEP_ID']}_{linalg}{'_resident' if resident else ''}"
+    run=root/f"constructor_{os.environ['SLURM_STEP_ID']}_{linalg}{'_'+resident if resident else ''}"
     rank0_transaction(run,stage='plant.directory',write=lambda:run.mkdir())
     rotation=np.eye(3,dtype=np.int32)[None]
     sym=SimpleNamespace(sym_matrices=rotation,translations=np.zeros((1,3)),
@@ -67,9 +67,10 @@ def check_sector_constructor(mesh, root, *, linalg="local", parents=16, return_o
     identity={key:'signed-constructor-'+key for key in store._IDENTITY_KEYS}
     path=run/'bank.h5'
     if resident:
-        # The device-resident payload follows the same writer, reader and
-        # sector-rectangle contract as the file bank.
-        path=store.ResidentBankPayload(mesh,carrier=layout.packed_extent,label=str(path))
+        # A resident payload ("device" or "pinned_host") follows the same
+        # writer, reader and sector-rectangle contract as the file bank.
+        path=store.ResidentBankPayload(mesh,carrier=layout.packed_extent,label=str(path),
+                                       memory_kind=resident)
     bank=dict(path=path if resident else str(path),identity=identity,tables=tables[0],
               sector_tables=tables,mu_bases=bases,photon_layout=layout)
     store.initialize_shared_pole_bank(path,meta=meta,tables=tables[0],recipe=recipe,
@@ -202,7 +203,8 @@ def main():
     if jax.process_index()==0:
         print(json.dumps(dict(status='RETAINED_SPAN_PASS',checks=rows)),flush=True)
     rows.append(check_sector_constructor(mesh,args.output.parent))
-    rows.append(check_sector_constructor(mesh,args.output.parent,resident=True))
+    rows.append(check_sector_constructor(mesh,args.output.parent,resident="device"))
+    rows.append(check_sector_constructor(mesh,args.output.parent,resident="pinned_host"))
     result=dict(status='PASS',checks=rows,job=os.environ.get('SLURM_JOB_ID'),
         step=os.environ.get('SLURM_STEP_ID'),
         scope='P4 signed sector public constructor and authenticated stores; unequal parent coefficient spans; no production deck or integrated Sigma')

@@ -259,16 +259,17 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output):
         budget.live(())
         # Each held tile is read, scored, and released before the next support.
         held_rows={name:[] for name in ('CC','TT','CT')}
-        for name,endpoint_pair,model in zip(held_rows,((0,0),(1,1),(0,1)),signed):
-            with open_shared_pole_bank(bank['path'],mesh_xy=mesh_xy) as io:
-                for sample_id in recipe['held_ids']:
-                    sample_id=int(sample_id)
-                    held=read_sector_round(io,meta,bank,header,ids,endpoint_pair,
-                                           sample_span=(sample_id,sample_id+1),execution="face" if is_face(model[0]) else "local")
-                    errors=sector_held_errors(model,held,_sample_point(recipe,sample_id),mesh_xy=mesh_xy)
-                    held_rows[name].append(dict(sample_id=sample_id,
-                        Wc=np.asarray(errors)[:real,0].tolist(),dWc_ds=np.asarray(errors)[:real,1].tolist()))
-                    del held
+        with timing.section('spole.sector.held', announce=True):
+            for name,endpoint_pair,model in zip(held_rows,((0,0),(1,1),(0,1)),signed):
+                with open_shared_pole_bank(bank['path'],mesh_xy=mesh_xy) as io:
+                    for sample_id in recipe['held_ids']:
+                        sample_id=int(sample_id)
+                        held=read_sector_round(io,meta,bank,header,ids,endpoint_pair,
+                                               sample_span=(sample_id,sample_id+1),execution="face" if is_face(model[0]) else "local")
+                        errors=sector_held_errors(model,held,_sample_point(recipe,sample_id),mesh_xy=mesh_xy)
+                        held_rows[name].append(dict(sample_id=sample_id,
+                            Wc=np.asarray(errors)[:real,0].tolist(),dWc_ds=np.asarray(errors)[:real,1].tolist()))
+                        del held
         for key,value in cauchy.items():
             values=np.asarray(value)[:real]
             expected_infinity=(key=='cauchy_schwarz_squared') & np.isposinf(values)
@@ -298,51 +299,52 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output):
         receipts.append(row_receipt)
         # Stage each canonical parent once. One round of face factors is live;
         # no all-parent factor stack or full photon operator is materialized.
-        ct_host_census=None
-        for name,family,model,active_mask in zip(
-                ('CC','TT','CT_C','CT_T'),(0,1,0,1),models,treatment_masks):
-            ambient=ledger.live_stages
-            if treatment_policy is None:
-                treated_factor,treated_poles=model[:2]
-            else:
-                local_factor_bytes=model[0].size*model[0].dtype.itemsize//mesh_xy.size
-                local_pole_bytes=model[1].size*model[1].dtype.itemsize//mesh_xy.size
-                treatment_stage=ledger.reserve(
-                    f'sector.treatment.{name}.{ids[0]}',
-                    resident_bytes_per_rank=local_factor_bytes+local_pole_bytes,
-                    workspace_bytes_per_rank=local_factor_bytes+local_pole_bytes,
-                    concurrent_with=ambient)
-                ledger.live_stages=(*ambient,treatment_stage['stage'])
+        with timing.section('spole.sector.write', announce=True):
+            ct_host_census=None
+            for name,family,model,active_mask in zip(
+                    ('CC','TT','CT_C','CT_T'),(0,1,0,1),models,treatment_masks):
+                ambient=ledger.live_stages
+                if treatment_policy is None:
+                    treated_factor,treated_poles=model[:2]
+                else:
+                    local_factor_bytes=model[0].size*model[0].dtype.itemsize//mesh_xy.size
+                    local_pole_bytes=model[1].size*model[1].dtype.itemsize//mesh_xy.size
+                    treatment_stage=ledger.reserve(
+                        f'sector.treatment.{name}.{ids[0]}',
+                        resident_bytes_per_rank=local_factor_bytes+local_pole_bytes,
+                        workspace_bytes_per_rank=local_factor_bytes+local_pole_bytes,
+                        concurrent_with=ambient)
+                    ledger.live_stages=(*ambient,treatment_stage['stage'])
+                    try:
+                        treated_factor=jnp.where(active_mask[:,None,:],model[0],0)
+                        treated_poles=jnp.where(active_mask,model[1],1)
+                    except Exception:
+                        ledger.live_stages=ambient
+                        raise
                 try:
-                    treated_factor=jnp.where(active_mask[:,None,:],model[0],0)
-                    treated_poles=jnp.where(active_mask,model[1],1)
-                except Exception:
-                    ledger.live_stages=ambient
-                    raise
-            try:
-                # CT_C and CT_T have one physical eigenproblem. Reuse the
-                # exact host pole bytes and mask at the writer boundary;
-                # their endpoint factors still travel independently.
-                census=_host_sector_census(treated_poles,active_mask,mesh_xy,real,
-                    common=ct_host_census if name=='CT_T' else None)
-                if name=='CT_C':
-                    ct_host_census=census
-                poles,active,counts,width=census
-                factor=face_rows(mesh_xy,tuple(range(real)),width)(treated_factor if is_face(treated_factor) else to_face(treated_factor))
-                for q0,q1,slots in _contiguous_q_spans(ids,real):
-                    public=canonical_factors(mesh_xy,slots,components=3 if family else 1)(factor)
-                    filename=root/(name+'.h5')
-                    store_header=write_shared_pole_model(filename,public,
-                        device_put_process_local(poles[list(slots),:width],NamedSharding(mesh_xy,P())),
-                        counts[list(slots)],q_span=(q0,q1),meta=meta,tables=bank['sector_tables'][family],
-                        recipe=recipe,receipts=dict(identity=bank['identity'],constructor=row_receipt),
-                        ordered=True,basis=bank['mu_bases'][family],sector=name)
-                    stores[name]=(str(filename),store_header)
-                    del public
-                del factor,treated_factor,treated_poles
-            finally:
-                if treatment_policy is not None:
-                    ledger.live_stages=ambient
+                    # CT_C and CT_T have one physical eigenproblem. Reuse the
+                    # exact host pole bytes and mask at the writer boundary;
+                    # their endpoint factors still travel independently.
+                    census=_host_sector_census(treated_poles,active_mask,mesh_xy,real,
+                        common=ct_host_census if name=='CT_T' else None)
+                    if name=='CT_C':
+                        ct_host_census=census
+                    poles,active,counts,width=census
+                    factor=face_rows(mesh_xy,tuple(range(real)),width)(treated_factor if is_face(treated_factor) else to_face(treated_factor))
+                    for q0,q1,slots in _contiguous_q_spans(ids,real):
+                        public=canonical_factors(mesh_xy,slots,components=3 if family else 1)(factor)
+                        filename=root/(name+'.h5')
+                        store_header=write_shared_pole_model(filename,public,
+                            device_put_process_local(poles[list(slots),:width],NamedSharding(mesh_xy,P())),
+                            counts[list(slots)],q_span=(q0,q1),meta=meta,tables=bank['sector_tables'][family],
+                            recipe=recipe,receipts=dict(identity=bank['identity'],constructor=row_receipt),
+                            ordered=True,basis=bank['mu_bases'][family],sector=name)
+                        stores[name]=(str(filename),store_header)
+                        del public
+                    del factor,treated_factor,treated_poles
+                finally:
+                    if treatment_policy is not None:
+                        ledger.live_stages=ambient
         placed.extend(ids[:real])
         budget.retained_panels=()
         ledger.live_stages=upstream
@@ -504,7 +506,10 @@ def construct_diagonal_sector_round(samples, moments, meta, config, geometry, *,
                 selection_faces=selection_faces)
     eig=budget.eigenplan(local_meta.n_rmu_padded)
     svd=budget.eigenplan(2*local_meta.n_rmu_padded)
-    extent=lambda width:padded_axis(width,mesh_xy,name='shared_pole_port',
+    # Direction ranks move between rounds and maps; their carriers sit on the
+    # extent ladder so the selection and round programs repeat.
+    from runtime.padding import ladder_extent
+    extent=lambda width:padded_axis(ladder_extent(width,n),mesh_xy,name='shared_pole_port',
         specs=((P('x','y'),0),(P('x','y'),1))).carrier
     qi,values=leading_response_directions(moments['M1'],min(n,recipe['infinity_width']),
         eigh_plan=eig,column_extent=extent,multiplet_tol=recipe['multiplet_relative_tolerance'],
@@ -588,7 +593,13 @@ def construct_cross_sector_round(sectors, samples, moments, meta, config, *,
     # Cross assembly has rectangular original pencils; only the projected
     # retained pair is square. Keep those two extents distinct in the ledger.
     original_sides = tuple(s['coefficients'].shape[-2] for s in sectors)
-    widths = [int(jnp.max(jnp.sum(s['signed'][2],axis=-1))) for s in sectors]
+    # The compacted span is the round's largest retained count on the extent
+    # ladder, so rounds and SC maps share the compaction and cross-reduction
+    # executables; the extra columns are inactive, as they already are for a
+    # parent below the round's maximum.
+    from runtime.padding import ladder_extent
+    widths = [ladder_extent(int(jnp.max(jnp.sum(s['signed'][2],axis=-1))), s['signed'][2].shape[-1])
+              for s in sectors]
     if execution == 'face':
         from runtime.padding import padded_axis
         widths = [padded_axis(width,mesh_xy,name='shared_pole_port',
@@ -846,10 +857,10 @@ def _local_cross_parent_program(mesh,native_eigh):
     import jax
     from common.shard_map import shard_map
     from jax.sharding import PartitionSpec as P
-    from gw.shared_pole_local import _mm
+    from gw.shared_pole_local import _mm, zero_row_safe_eigh
     from gw.shared_pole_recipe import shared_real_pole_gates_ordered_v1 as gates
     spec=P(('x','y'))
-    body=partial(_cross_reduce_equations,mm=_mm,eigh=native_eigh,gates=gates)
+    body=partial(_cross_reduce_equations,mm=_mm,eigh=zero_row_safe_eigh(native_eigh),gates=gates)
     return jax.jit(shard_map(body,mesh=mesh,in_specs=(spec,)*4,
                             out_specs=(spec,spec),check_vma=False))
 
@@ -1100,7 +1111,8 @@ def sector_execution(meta, config, mu_bases, nq, *, mesh_xy, upstream):
             fraction=policy.get(field+'_fraction')
             result[field]=None if fraction is None else math.ceil(n*fraction)
         return result
-    extent=lambda width:padded_axis(width,mesh_xy,name='shared_pole_port',
+    from runtime.padding import ladder_extent
+    extent=lambda width:padded_axis(ladder_extent(width),mesh_xy,name='shared_pole_port',
         specs=((P('x','y'),0),(P('x','y'),1))).carrier
     execution_rows=[]
     for family,basis in enumerate(mu_bases):

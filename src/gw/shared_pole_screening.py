@@ -139,7 +139,7 @@ def _coulomb_resource(value, meta, sym, mesh_xy, path):
 
 
 def _bank_residence(meta, config, *, mesh_xy, sym, root, label, photon, mu_bases=None):
-    """Keep this map's bank on the devices when it fits; else the scratch file.
+    """Keep this map's bank on the devices when it fits, else in pinned host memory.
 
     The bank is written once and read back once by the constructor; the file
     exists only because the producer is frequency-major and the constructor
@@ -148,12 +148,17 @@ def _bank_residence(meta, config, *, mesh_xy, sym, root, label, photon, mu_bases
     q-local margin), and (2) the constructor's own route admission, with R
     live, still selects local parents, so residency never changes the route.
     ``photon`` is the photon layout of a full bispinor bank (else None); its
-    sector constructor route must likewise be unchanged. A W export
-    (``write_w`` re-reads the bank after the constructor) and a requested
-    distributed layout keep the file.
-    Returns ``(payload or None, receipt)``; the payload's R is reserved and
-    the caller keeps it in ``ledger.live_stages`` until it is released.
+    sector constructor route must likewise be unchanged. Otherwise the payload
+    goes to the pinned host tier when it takes at most half of this process's
+    host budget (``host_bytes_per_process``); the devices then hold only the
+    span being read, as on the file route. The scratch file is left for a
+    payload host memory cannot hold, a W export (``write_w`` re-reads the
+    bank after the constructor) and a requested distributed layout.
+    Returns ``(payload or None, receipt)``; a device payload's R is reserved
+    (``receipt["stage"]``) and the caller keeps it in ``ledger.live_stages``
+    until it is released.
     """
+    from common.gpu_utils import host_bytes_per_process
     from file_io.shared_pole_store import ResidentBankPayload, shared_pole_bank_payload_bytes
     from .gw_config import linalg_resolution
     from .shared_pole_constructor import constructor_route
@@ -170,12 +175,23 @@ def _bank_residence(meta, config, *, mesh_xy, sym, root, label, photon, mu_bases
             {"linalg": config.backend.linalg}).layout != "local":
         receipt["reason"] = "write_w export or distributed layout"
         return None, receipt
+    carrier = meta.mu_basis.n_canonical if photon is None else photon.packed_extent
+    bank_label = str(root / "bank.h5")
+
+    def pinned(reason):
+        receipt["half_host_budget_bytes_per_rank"] = int(host_bytes_per_process()) // 2
+        if R > receipt["half_host_budget_bytes_per_rank"]:
+            receipt["reason"] = reason + "; payload exceeds half the host budget"
+            return None, receipt
+        receipt.update(residence="pinned_host", reason=reason + "; pinned host tier")
+        return ResidentBankPayload(mesh_xy, carrier=carrier, label=bank_label,
+                                   memory_kind="pinned_host"), receipt
+
     both = ledger.preview(resident_bytes_per_rank=2 * R, workspace_bytes_per_rank=0,
                           concurrent_with=())
     receipt["half_budget_bytes_per_rank"] = both["available_device_bytes_per_rank"] // 2
     if both["aggregate_bytes_per_rank"] > receipt["half_budget_bytes_per_rank"]:
-        receipt["reason"] = "payload and one read copy exceed half the device budget"
-        return None, receipt
+        return pinned("payload and one read copy exceed half the device budget")
     if photon is not None:
         from .shared_pole_sectors import sector_execution
         route = lambda upstream: sector_execution(meta, config, mu_bases, nq,
@@ -194,13 +210,10 @@ def _bank_residence(meta, config, *, mesh_xy, sym, root, label, photon, mu_bases
             upstream=(stage,), ordered=ordered, odd_moments=ordered, mirrored=ordered,
             nq=nq)[0], "local"
     if execution != wanted:
-        receipt["reason"] = "constructor would change route with the payload live"
-        return None, receipt
+        return pinned("constructor would change route with the payload live")
     receipt.update(residence="device", stage=stage,
                    reason="payload, one read copy and the unchanged constructor route fit")
-    carrier = meta.mu_basis.n_canonical if photon is None else photon.packed_extent
-    return ResidentBankPayload(mesh_xy, carrier=carrier,
-                               label=str(root / "bank.h5")), receipt
+    return ResidentBankPayload(mesh_xy, carrier=carrier, label=bank_label), receipt
 
 
 def _shared_pole_tables(meta, sym, centroid_indices):
@@ -359,7 +372,7 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
                  f"{residence['payload_bytes_total'] / 2**30:.2f} GiB total; {residence['reason']}"
                  if 'payload_bytes_per_rank' in residence else
                  f"shared-pole bank residence: file; {residence['reason']}")
-        if resident is not None:
+        if "stage" in residence:
             ledger.live_stages = (residence["stage"],)
         bank = dict(path=str(root / "bank.h5") if resident is None else resident,
                     identity=identity, tables=tables, coulomb=coulomb)

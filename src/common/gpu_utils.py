@@ -240,6 +240,23 @@ def get_host_memory_available_gb() -> float | None:
     return None
 
 
+def host_bytes_per_process() -> float:
+    """0.9 of the node's live ``MemAvailable`` over the processes sharing the
+    node, in bytes, agreed (minimum) across processes. Every process must
+    enter this call.
+    """
+    import socket
+    import zlib
+    import numpy as np
+    from common.collectives import all_gather_processes
+    avail_gb = get_host_memory_available_gb()
+    host = zlib.crc32(socket.gethostname().encode())
+    hosts = np.asarray(all_gather_processes(np.asarray(host, dtype=np.int64)))
+    per_node = max(1, int(np.sum(hosts == host)))
+    local_gb = float('inf') if avail_gb is None else 0.9 * avail_gb / per_node
+    return minimum_process_budget_gb(min(local_gb, 1e12)) * 1e9
+
+
 def get_device_memory_gb(n_devices: int | None = None) -> float:
     """Get per-device memory budget in GB for JAX computations.
 

@@ -177,16 +177,14 @@ def round_tables(counts, widths, nodes, infinity_counts, infinity_width, *, colu
     offsets = np.concatenate(([0], np.cumsum(widths))).astype(np.int64)
     carriers = np.asarray([[column_extent(int(c)) for c in row] for row in counts], np.int64)
     halves = (range(states // 2), range(states // 2, states)) if ordered else (range(states),)
-    # The round extent rounds the largest selection up to an eighth of the
-    # capacity (every state at its full carrier), so every round and SC map of
-    # a sector reuses at most eight round executables while the eigensolver
-    # side stays within one bucket of the selection. The padding is inert: zero
-    # columns that the zero-row-safe eigensolver keeps out of every spectrum.
-    # ponytail: fixed 1/8 ladder; a finer one trades compiles for eigh flops.
-    from runtime.padding import round_up
-    capacity = max(sum(column_extent(int(widths[a])) for a in half) for half in halves)
+    # The round extent is the carrier (``column_extent``, on the ladder of
+    # ``runtime.padding.ladder_extent`` in the constructors) of the largest
+    # selection, at most every state's full panel, so rounds and SC maps
+    # share round executables. The padding is inert: zero columns that the
+    # zero-row-safe eigensolver keeps out of every spectrum.
+    capacity = max(sum(int(widths[a]) for a in half) for half in halves)
     selected = max(int(carriers[:, list(half)].sum(axis=1).max()) for half in halves)
-    extent = min(capacity, round_up(selected, round_up(-(-capacity // 8), column_extent(1))))
+    extent = min(capacity, column_extent(selected))
     order = np.full((ranks, extent * len(halves)), offsets[-1], np.int32)
     points = np.zeros(order.shape, np.complex128)
     live = np.zeros(order.shape, bool)
@@ -338,10 +336,9 @@ def round_program(mesh_xy, native_eigh, ordered, odd_moments, keep_budget, retai
     local eigensolver ``native_eigh`` (made zero-row safe), applies the zero
     policy, forms the retained (even) or original-infinity (ordered, odd
     moments) moment identity and sorts the poles. Every slot solves at the
-    round's bucketed extent (``round_tables``); its inert columns are exact
-    zeros that the eigensolver wrapper keeps out of every spectrum, so the
-    program's shapes take at most eight values per sector, shared by every
-    round and SC map. A synthetic slot (``live`` False) skips all of it through
+    round's laddered extent (``round_tables``); its inert columns are exact
+    zeros that the eigensolver wrapper keeps out of every spectrum, so rounds
+    and SC maps share the program's shapes. A synthetic slot (``live`` False) skips all of it through
     ``lax.cond``. No array crosses ranks: the models stay in batch layout for
     ``round_checks``; only vectors are gathered.
 

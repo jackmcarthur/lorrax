@@ -2,13 +2,14 @@
 
 CPU (pytest, 2x2 host mesh) and P4 (``python test_shared_pole_callable_reuse.py OUT.json``):
 * ``round_tables``: each state keeps its carrier with the inert tail inside, in state order; the zero
-  column fills a slot to the round extent (the largest selection on an eighth-of-capacity ladder); ordered originals and mirrors pack as two halves of one
+  column fills a slot to the round extent (the carrier of the largest selection, at most every full panel); ordered originals and mirrors pack as two halves of one
   extent (paired per slot); the infinity block is doubled on an odd-moment ordered round and absent
   without odd moments; ``own`` is the spectrum length at the slot's own extent;
 * ``own_extent_receipts`` drops exactly the round padding's zeros; ``zero_row_safe_eigh`` returns
   the zero-padded spectrum and a valid eigenbasis;
-* ``round_program``: a round with new supports, panels and counts in the same extent bucket runs the
+* ``round_program``: a round with new supports, panels and counts at the same round extent runs the
   same executable, every slot solving at the round side; the retained-column kernel is reused;
+* ``ladder_extent``: eighth-octave carriers, capped;
 * ``canonical_factors`` pads round blocks to the widest and places parents in canonical order.
 """
 from pathlib import Path
@@ -35,9 +36,12 @@ def check_tables():
     assert finite[0].tolist() == [True] * 3 + [False] + [True] * 7 + [False]
     assert finite[2].tolist() == [True] * 3 + [False] + [True] * 3 + [False] * 5 and not finite[3].any()
     assert t["active"][:, 12:].sum(axis=1).tolist() == [3, 4, 3, 0]
-    wide = round_tables(counts, (32, 32), (2 + 1j, 3 + 1j), [3, 4, 3, 0], 4, column_extent=_extent,
-                        ordered=False, odd_moments=False)
-    assert wide["order"].shape == (4, 16)  # capacity 64, bucket 8: selection 12 -> 16
+    from runtime.padding import ladder_extent
+    wide = round_tables(counts, (32, 32), (2 + 1j, 3 + 1j), [3, 4, 3, 0], 4,
+                        column_extent=lambda w: _extent(ladder_extent(w)), ordered=False, odd_moments=False)
+    assert wide["order"].shape == (4, 12)  # selection 12 on the ladder, below the 64 capacity
+    assert [ladder_extent(n) for n in (15, 17, 33, 1025, 2047)] == [15, 18, 36, 1152, 2048]
+    assert ladder_extent(1025, 1100) == 1100
     assert t["own"].tolist() == [16, 16, 12, 0]
     assert t["extents"].tolist() == [[12, 4], [12, 4], [8, 4], [0, 0]]
     paired = np.column_stack((counts, counts))
@@ -64,9 +68,10 @@ def check_tables():
     a = np.zeros((10, 10), complex)
     live = [0, 2, 3, 5, 6, 9]
     a[np.ix_(live, live)] = x @ x.conj().T - 20 * np.eye(6)  # indefinite live block, zero rows between
-    values, vectors = zero_row_safe_eigh(jnp.linalg.eigh)(jnp.asarray(a))
-    assert np.allclose(values, np.linalg.eigvalsh(a), atol=1e-12)
-    assert np.allclose(np.asarray(vectors) @ np.diag(values) @ np.asarray(vectors).conj().T, a, atol=1e-10)
+    values, vectors = map(np.asarray, zero_row_safe_eigh(jnp.linalg.eigh)(jnp.asarray(a)))
+    tol = 1e3 * np.finfo(values.dtype).eps * np.abs(a).max()  # x64 or not, as the runtime chose
+    assert np.allclose(values, np.linalg.eigvalsh(a), atol=tol)
+    assert np.allclose(vectors @ np.diag(values) @ vectors.conj().T, a, atol=tol)
 
 
 def check_reuse(mesh):

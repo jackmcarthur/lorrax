@@ -138,9 +138,10 @@ def test_photon_face_packing():
 def check_photon_bank_store(mesh, path, *, resident=False):
     """Full packed sample/derivative/moment/constant roundtrip on P4.
 
-    ``resident=True`` runs the identical contract on a device-resident
-    payload (``path`` then names its static-reference file): every read route,
-    including the C/T sector rectangles, must equal the fixture exactly.
+    ``resident`` ("device" or "pinned_host") runs the identical contract on a
+    resident payload of that tier (``path`` then names its static-reference
+    file): every read route, including the C/T sector rectangles, must equal
+    the fixture exactly.
     """
     from test_shared_pole_bank import _bank_fixture
     from test_shared_pole_store import _fixture
@@ -159,7 +160,8 @@ def check_photon_bank_store(mesh, path, *, resident=False):
     layout = PhotonBasisLayout.from_centroid_extents(basis.n_logical, basis.n_logical, mesh)
     reference_path = path
     if resident:
-        path = store.ResidentBankPayload(mesh, carrier=layout.packed_extent, label=str(path))
+        path = store.ResidentBankPayload(mesh, carrier=layout.packed_extent, label=str(path),
+                                         memory_kind=resident)
     header = store.initialize_shared_pole_bank(path, meta=meta, tables=tables,
         recipe=recipe, identity=identity, mesh_xy=mesh, photon_layout=layout, mu_bases=(basis,basis))
     nq, ns, n = header['bank_shape']['nq'], header['bank_shape']['nsample'], layout.packed_extent
@@ -219,9 +221,10 @@ def check_photon_bank_store(mesh, path, *, resident=False):
 
 
 def test_resident_photon_bank_equals_file_bank(tmp_path):
-    """The photon bank contract holds for the file and the device-resident payload."""
+    """The photon bank contract holds for the file and both resident tiers."""
     if len(jax.devices()) != 4:
         pytest.skip("photon store contract runs on a 2x2 mesh")
     mesh = Mesh(np.asarray(jax.devices()).reshape(2, 2), ("x", "y"))
     check_photon_bank_store(mesh, tmp_path / "photon_bank.h5")
-    check_photon_bank_store(mesh, tmp_path / "photon_static_reference.h5", resident=True)
+    check_photon_bank_store(mesh, tmp_path / "photon_static_reference.h5", resident="device")
+    check_photon_bank_store(mesh, tmp_path / "host_static_reference.h5", resident="pinned_host")
