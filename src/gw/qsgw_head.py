@@ -7,6 +7,7 @@ from typing import Callable
 
 import jax
 import jax.numpy as jnp
+import os
 import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
@@ -501,6 +502,7 @@ def load_dft_velocity_head(
     mesh: Mesh,
     wfn,
     meta,
+    config=None,
 ) -> DftVelocityHeadData:
     """Load the completed exact-DFT velocity stage, and only that stage.
 
@@ -543,6 +545,18 @@ def load_dft_velocity_head(
             dtype=np.float64,
         )
         fingerprint = _ascii_stamp(io, path, "wfn_fingerprint_utf8")
+        # DFT+U stamp; an artifact written before V_U has none and is the
+        # 'none' operator.  Checked only when the caller names its deck.
+        hubbard_got = hubbard_want = None
+        if config is not None:
+            from file_io.parallel_transport import HUBBARD_PROVENANCE_ATTR
+            hubbard_want = expected_hubbard_stamp(
+                config, wfn=wfn, fallback_dir=os.path.dirname(os.path.abspath(path)),
+                caller="sc_head_update = dft_velocity")
+            try:
+                hubbard_got = _ascii_stamp(io, path, HUBBARD_PROVENANCE_ATTR)
+            except Exception:                      # absent: pre-V_U artifact
+                hubbard_got = "none"
         expected_reciprocal = (
             np.asarray(wfn.bvec, dtype=np.float64) * float(wfn.blat)
         )
@@ -566,6 +580,10 @@ def load_dft_velocity_head(
         if fingerprint != wfn_fingerprint(wfn):
             refusals.append(
                 "WFN fingerprint differs from the velocity artifact")
+        if hubbard_want is not None and hubbard_got != hubbard_want:
+            refusals.append(
+                "DFT+U stamp differs (i[r,V_U] present/absent or different "
+                f"U/J/B/occupations): artifact={hubbard_got!r} deck={hubbard_want!r}")
         # Rank-invariant operands, so this refuses everywhere or nowhere —
         # before the (3, nk, nb, nb) read, still inside the handle.
         if refusals:
@@ -2784,6 +2802,22 @@ def build_iteration_head_response(
     )
 
 
+def expected_hubbard_stamp(config, *, wfn, fallback_dir, caller) -> str:
+    """The DFT+U stamp a velocity artifact must carry for THIS deck.
+
+    One resolver (``psp.hubbard_ops.resolve_hubbard_input``) for producer and
+    consumers: it refuses when the WFN's QE schema declares DFT+U and the deck
+    names no Hubbard input, so an old p + i[r,V_NL] file cannot silently feed a
+    DFT+U head.  Deck-relative paths resolve against ``config.input_dir``.
+    """
+    from psp.hubbard_ops import hubbard_provenance_for
+    return hubbard_provenance_for(
+        getattr(config, "hubbard_input", ""),
+        getattr(config, "hubbard_occupations", ""),
+        wfn=wfn, base_dir=(getattr(config, "input_dir", "") or fallback_dir),
+        caller=caller)
+
+
 def read_authenticated_dipole_velocity(
     dipole_path, *, wfn, meta, config, wfn_fingerprint_binding=None,
 ):
@@ -2804,6 +2838,9 @@ def read_authenticated_dipole_velocity(
     )
     expected_vnl_sign = resolve_vnl_velocity_sign(
         None, config.vnl_velocity_sign)
+    expected_hubbard = expected_hubbard_stamp(
+        config, wfn=wfn, fallback_dir=os.path.dirname(os.path.abspath(dipole_path)),
+        caller="dft head dipole velocity")
     from common.four_current_model import resolve_four_current_representation
     representation = resolve_four_current_representation(
         bool(getattr(config, "bispinor", int(meta.nspinor) == 4)),
@@ -2818,12 +2855,13 @@ def read_authenticated_dipole_velocity(
             skip_vnl=False,
             vnl_mode="analytic",
             vnl_velocity_sign=expected_vnl_sign,
-            wfn_fingerprint_binding=wfn_fingerprint_binding):
+            wfn_fingerprint_binding=wfn_fingerprint_binding,
+            hubbard=expected_hubbard):
         raise ValueError(
             "GATE dft_head_dipole_provenance: the full head received an "
             "unauthenticated dipole artifact.\n"
             f"  got:  dipole_file = {dipole_path!r}; at least one WFN, "
-            "q->0 coverage, VNL, or representation stamp mismatched\n"
+            "q->0 coverage, VNL, DFT+U, or representation stamp mismatched\n"
             "  want: dipole.h5 regenerated from this run's exact deck\n"
             "  why:  S_direct and the wings must use the same WFN and "
             "velocity operator as the finite-q charge response")

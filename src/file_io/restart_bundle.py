@@ -4284,6 +4284,7 @@ def check_dipole_provenance(
     bispinor=None, skip_vnl=None, vnl_mode=None, vnl_velocity_sign=None,
     wfn_fingerprint_binding=None,
     print_fn=print,
+    hubbard=None,
 ) -> bool:
     """Does ``path`` match the WFN, window, and requested operator convention?
 
@@ -4384,6 +4385,14 @@ def check_dipole_provenance(
                                             int(wfn.nspinor)):
         bad.append(("prov_nspinor", attrs["prov_nspinor"],
                     int(wfn.nspinor)))
+    # DFT+U: the expected stamp is 'none' or psp.hubbard_ops' JSON.  A file
+    # without the stamp predates V_U and is exactly the 'none' operator.
+    if hubbard is not None:
+        got_hub = attrs.get("prov_hubbard", "none")
+        if isinstance(got_hub, bytes):
+            got_hub = got_hub.decode()
+        if str(got_hub) != str(hubbard):
+            bad.append(("prov_hubbard", got_hub, hubbard))
     if bad:
         detail = "; ".join(f"{k}: file={_prov_show(got)} run={_prov_show(exp)}"
                            for k, got, exp in bad)
