@@ -52,6 +52,14 @@ leaves the existing transport policy unchanged and prints the prerequisite.
 Python cannot repair an already-created step's VNI allocation. Explicit
 transport overrides remain the caller's responsibility.
 
+The defaults repeat every network setting in the site `nccl` module,
+including `FI_CXI_RDZV_THRESHOLD=0`. Without that setting, cross-node NCCL
+send/recv (XLA `all_to_all` and `collective_permute`, first used by `sc.eigh`)
+deadlocked on every P16 test. libfabric's NCCL proxy thread copied an unexpected
+eager message to the GPU with `cudaMemcpy` plus `cudaDeviceSynchronize`, which
+waits on the NCCL kernel that is waiting for that thread
+(`runs/runtime/nccl_ofi_hang_20260923` in the sandbox).
+
 It names the plugin by absolute path through `NCCL_NET_PLUGIN`,
 so no change to Python's already-initialized library search path is needed.
 The plugin and its machine settings have one owner in `runtime.network_env`.
