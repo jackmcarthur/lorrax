@@ -5721,7 +5721,13 @@ def _run_rcrop(
     if _accel not in ("rcrop", "anderson", "anderson_sg", "anderson_z", "crop"):
         raise ValueError(f"LORRAX_SC_ACCEL_AB={_accel!r}")
     _two_eval = _accel == "rcrop"
-    print_fn(f"  SC accelerator (A/B): {_accel}")
+    if not _two_eval:
+        # A/B: the one-evaluation arms run with history 20 (the conditioning
+        # filter drops dependent columns, so depth only costs memory: 2(m+1)
+        # carry copies).  m=5 stalls Anderson whenever the map has more
+        # independent stiff directions than m (CPU toys, 2026-09-24).
+        history_depth = max(int(history_depth), 20)
+    print_fn(f"  SC accelerator (A/B): {_accel}, history_depth={history_depth}")
 
     H0 = state_init.H_qp_dft
     nk, nb, _ = H0.shape
