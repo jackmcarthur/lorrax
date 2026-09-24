@@ -555,9 +555,10 @@ def construct_diagonal_sector_round(samples, moments, meta, config, geometry, *,
     eig=budget.eigenplan(local_meta.n_rmu_padded)
     svd=budget.eigenplan(2*local_meta.n_rmu_padded)
     # Direction ranks move between rounds and maps; their carriers sit on the
-    # extent ladder so the selection and round programs repeat.
+    # extent ladder so the selection and round programs repeat. No rank cap:
+    # the same function sizes round sums and pole budgets, which exceed n.
     from runtime.padding import ladder_extent
-    extent=lambda width:padded_axis(ladder_extent(width,n),mesh_xy,name='shared_pole_port',
+    extent=lambda width:padded_axis(ladder_extent(width),mesh_xy,name='shared_pole_port',
         specs=((P('x','y'),0),(P('x','y'),1))).carrier
     qi,values=leading_response_directions(moments['M1'],min(n,recipe['infinity_width']),
         eigh_plan=eig,column_extent=extent,multiplet_tol=recipe['multiplet_relative_tolerance'],

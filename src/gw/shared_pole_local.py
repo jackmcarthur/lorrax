@@ -182,9 +182,14 @@ def round_tables(counts, widths, nodes, infinity_counts, infinity_width, *, colu
     # selection, at most every state's full panel, so rounds and SC maps
     # share round executables. The padding is inert: zero columns that the
     # zero-row-safe eigensolver keeps out of every spectrum.
+    if np.any(carriers > np.asarray(widths, np.int64)[None, :]):
+        raise ValueError("GATE shared_pole_round_tables: got: a state carrier wider than its "
+                         "panel; want: column_extent(count) <= panel width; why: its columns "
+                         "would index the next state's panel")
     capacity = max(sum(int(widths[a]) for a in half) for half in halves)
     selected = max(int(carriers[:, list(half)].sum(axis=1).max()) for half in halves)
-    extent = min(capacity, column_extent(selected))
+    # Never below the selection: an extent function may saturate on a sum.
+    extent = min(capacity, max(selected, column_extent(selected)))
     order = np.full((ranks, extent * len(halves)), offsets[-1], np.int32)
     points = np.zeros(order.shape, np.complex128)
     live = np.zeros(order.shape, bool)

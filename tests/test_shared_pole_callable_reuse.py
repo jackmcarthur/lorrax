@@ -42,6 +42,19 @@ def check_tables():
     assert wide["order"].shape == (4, 12)  # selection 12 on the ladder, below the 64 capacity
     assert [ladder_extent(n) for n in (15, 17, 33, 1025, 2047)] == [15, 18, 36, 1152, 2048]
     assert ladder_extent(1025, 1100) == 1100
+    # Fe 4^3 bispinor SC regression: an extent function that saturates below
+    # the round's summed carriers (the old rank-capped ladder) must not shrink
+    # the round extent below the selection.
+    capped = round_tables(np.array([[28, 28], [20, 20]]), (28, 28), (1j, 2j), [2, 2], 2,
+                          column_extent=lambda w: _extent(ladder_extent(w, 40)),
+                          ordered=False, odd_moments=False)
+    assert capped["order"].shape == (2, 56) and capped["order"][0].tolist() == list(range(56))
+    try:
+        round_tables(np.array([[9, 8]]), (8, 8), (1j, 2j), [0], 0, column_extent=_extent,
+                     ordered=False, odd_moments=False)
+        raise AssertionError("a carrier wider than its panel must refuse")
+    except ValueError as error:
+        assert "GATE shared_pole_round_tables" in str(error)
     assert t["own"].tolist() == [16, 16, 12, 0]
     assert t["extents"].tolist() == [[12, 4], [12, 4], [8, 4], [0, 0]]
     paired = np.column_stack((counts, counts))

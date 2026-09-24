@@ -34,9 +34,10 @@ def constructor_route(meta, config, recipe, *, mesh_xy, ledger, upstream, ordere
     from gw.shared_pole_execution import constructor_execution
 
     # Direction ranks move between rounds and maps; their carriers sit on the
-    # extent ladder so the selection and round programs repeat.
+    # extent ladder so the selection and round programs repeat. No rank cap:
+    # the same function sizes round sums and pole budgets, which exceed n.
     column_extent = lambda width: padded_axis(
-        ladder_extent(width, meta.n_rmu), mesh_xy, name="shared_pole_port",
+        ladder_extent(width), mesh_xy, name="shared_pole_port",
         specs=((P("x", "y"), 0), (P("x", "y"), 1))).carrier
     sample_fields = (("Wc", "dWc_ds", "Wc_mirror", "dWc_mirror_ds")
                      if mirrored else ("Wc", "dWc_ds"))
