@@ -533,8 +533,12 @@ def plan_density_scan(*, mesh: Mesh, n_k: int, nb_carrier: int,
 def _density_scan_body(mesh: Mesh, plan: DensityScanPlan, *, n_k: int,
                        nb_carrier: int, ns: int, ngkmax: int, grid, scale,
                        f_spin, include_current, charge_ns,
-                       return_spin_matrix):
+                       return_spin_matrix, per_k=False):
     """The per-rank body: scan k tiles, accumulate MY bands, psum once.
+
+    ``per_k`` (``local`` route only, where a tile is one k) emits each k's
+    field as a scan output instead of adding it to the carry; the one psum
+    then reduces the stacked ``(n_k, ...)`` fields.
 
     Local operands: ψ ``(n_k, nb/P, ns, ngkmax)``; U ``(n_k, nb/p_x,
     nb/p_y)`` (rotated routes); occ ``(n_k, nb)``, w ``(n_k,)`` and the box
@@ -558,7 +562,7 @@ def _density_scan_body(mesh: Mesh, plan: DensityScanPlan, *, n_k: int,
     n_tiles = n_k // K
     nb_rank = nb_carrier // n_ranks
     n_loc = plan.n_rot // n_ranks if plan.route == "g_split" else nb_rank
-    field_shape = ((2, 2, *grid) if return_spin_matrix else
+    field_shape = ((ns, ns, *grid) if return_spin_matrix else
                    ((4, *grid) if include_current else tuple(grid)))
     field_dtype = jnp.complex128 if return_spin_matrix else jnp.float64
 
@@ -610,16 +614,18 @@ def _density_scan_body(mesh: Mesh, plan: DensityScanPlan, *, n_k: int,
                 include_dirac_current=include_current,
                 charge_nspinor=(None if return_spin_matrix else charge_ns),
                 return_spin_density_matrix=return_spin_matrix)
+            if per_k:
+                return acc, dens.astype(field_dtype)
             return acc + dens, None
 
-        acc0 = jnp.zeros(field_shape, dtype=field_dtype)
-        acc, _ = jax.lax.scan(
+        acc0 = jnp.zeros(() if per_k else field_shape, dtype=field_dtype)
+        acc, per_k_fields = jax.lax.scan(
             step, acc0, (tiles(psi_l), tiles(U_l), tiles(occ), tiles(w),
                          tiles(bidx)), unroll=1)
         # THE ONE REDUCTION.  Every rank holds the density of its own bands
-        # summed over every k; nothing crossed the mesh for the field before
-        # this line.
-        return jax.lax.psum(acc, band_axes)
+        # summed over every k (or, per_k, stacked by k); nothing crossed the
+        # mesh for the field before this line.
+        return jax.lax.psum(per_k_fields if per_k else acc, band_axes)
 
     return body
 
@@ -638,6 +644,7 @@ def rho_from_wfns(psi_G, occ, kweights, *, mesh: Mesh, box_index,
                   U=None, sym_perm=None, sym=None, include_dirac_current: bool = False,
                   charge_nspinor: int | None = None,
                   return_spin_density_matrix: bool = False,
+                  per_k: bool = False,
                   memory_budget_bytes: float | None = None, print_fn=None):
     """ρ(r) = Σ_k w_k f_spin Σ_{n,s} f_nk |ψ̃_nks(r)|², scanned over k.
 
@@ -679,19 +686,29 @@ def rho_from_wfns(psi_G, occ, kweights, *, mesh: Mesh, box_index,
     projection; scalar pullbacks never rotate current components. The local contraction is shared
     with :func:`psp.get_DFT_mtxels.valence_density_from_kpoint`.
 
-    ``return_spin_density_matrix=True`` requires two-component Pauli
-    spinors and returns raw
-    ``rho_ab(r)=sum_kn w_k f_nk psi_kna(r) psi_knb(r)*`` from the same scan.
-    It refuses
+    ``return_spin_density_matrix=True`` returns the raw ``(ns, ns)``
+    spinor density matrix
+    ``rho_ab(r)=sum_kn w_k f_nk psi_kna(r) psi_knb(r)*`` from the same scan:
+    the Pauli spin-density matrix for two components, the bispinor density
+    matrix for four.  It refuses
     ``sym_perm`` because a scalar pullback cannot supply the spin rotation,
     axial parity, or antiunitary action.  The symmetry service can apply
     those operations to this raw matrix without duplicating the density
     build.
 
+    ``per_k=True`` returns every k's field separately, ``(n_k, ...)``,
+    each still carrying its ``w_k f_spin f_nk`` weight; the same single
+    psum reduces the stacked fields.  It is the local (``U=None``) route
+    only, and refuses ``sym_perm``/``sym``: a star average or polar
+    projection acts on a k-summed field.  Consumers that need a product of
+    two band sums at the same k (the centroid feature metric
+    ``Tr(D_k Γ D_k Γ)``) read it here.
+
     Returns
     -------
     ``(nx,ny,nz)`` or ``(4,nx,ny,nz)`` float64, or
-    ``(2,2,nx,ny,nz)`` complex128 in spin-matrix mode; replicated.
+    ``(ns,ns,nx,ny,nz)`` complex128 in spin-matrix mode; replicated, with
+    a leading ``n_k`` axis when ``per_k``.
 
     NORMALISATION is term-for-term ``psp.get_DFT_mtxels.
     valence_density_from_kpoint``: ψ_r = ifftn(box, 'ortho')·√(N/Ω), so
@@ -747,10 +764,15 @@ def rho_from_wfns(psi_G, occ, kweights, *, mesh: Mesh, box_index,
         raise ValueError(
             "rho_from_wfns: return_spin_density_matrix and "
             "include_dirac_current are mutually exclusive")
-    if return_spin_matrix and ns != 2:
+    if return_spin_matrix and ns not in (2, 4):
         raise ValueError(
-            "rho_from_wfns: spin-density matrix requires exactly "
-            f"two-component Pauli spinors; got nspinor={ns}")
+            "rho_from_wfns: spinor density matrix requires two-component "
+            f"Pauli or four-component bispinors; got nspinor={ns}")
+    if per_k and (U is not None or sym_perm is not None or sym is not None):
+        raise ValueError(
+            "rho_from_wfns: per_k is the unrotated local route and returns "
+            "unsymmetrised per-k fields; pass U=None, sym_perm=None, "
+            "sym=None")
     if return_spin_matrix and charge_nspinor is not None:
         raise ValueError(
             "rho_from_wfns: charge_nspinor does not apply to the complete "
@@ -781,7 +803,8 @@ def rho_from_wfns(psi_G, occ, kweights, *, mesh: Mesh, box_index,
                                 (0, nb_pad - int(U_j.shape[2]))))
 
     w_np = np.asarray(kweights, dtype=np.float64)
-    if (not return_spin_matrix and sym_perm is None and w_np.size > 1
+    if (not return_spin_matrix and not per_k and sym_perm is None
+            and w_np.size > 1
             and not np.allclose(
                 w_np, w_np[0], rtol=0, atol=1e-12)):
         raise ValueError(
@@ -812,7 +835,7 @@ def rho_from_wfns(psi_G, occ, kweights, *, mesh: Mesh, box_index,
             mesh, plan, n_k=nk, nb_carrier=nb_pad, ns=ns, ngkmax=ngkmax,
             grid=grid, scale=scale, f_spin=f_spin,
             include_current=include_current, charge_ns=charge_ns,
-            return_spin_matrix=return_spin_matrix)
+            return_spin_matrix=return_spin_matrix, per_k=per_k)
         rep = P()
         per_rank = shard_map(
             body if have_U else (lambda p, o, w, b: body(p, None, o, w, b)),
@@ -836,7 +859,7 @@ def rho_from_wfns(psi_G, occ, kweights, *, mesh: Mesh, box_index,
     fn = _cached_jit(
         "rho_density_scan",
         (psi.shape, grid, float(cell_volume), f_spin, have_U,
-         include_current, charge_ns, return_spin_matrix,
+         include_current, charge_ns, return_spin_matrix, per_k,
          None if sym_perm is None else tuple(np.shape(sym_perm)),
          tuple(plan), mesh, _sharding_key(psi)[1]),
         build)
