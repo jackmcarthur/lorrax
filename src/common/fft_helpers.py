@@ -358,10 +358,9 @@ def make_sharded_fftn_3d(
 # native-JAX duplicate is not maintained).
 #
 # What the service is: the flat-k batched 3-D FFTs dispatched to the platform
-# FFI library — the FFTW3 ABI on cpu meshes (NOT DFTI; those calls were deleted
-# 2026-08-05, see ffi/fft.py:138), cuFFT with
-# the advanced data layout (cufftPlanMany64) on CUDA meshes.  Both libraries
-# register the SAME target names, so the call sites are platform-agnostic.
+# FFI library through the ffi.fft router — the FFTW3 ABI on cpu meshes,
+# nvidia-mathdx (mode 3) on CUDA meshes — so the call sites are
+# platform-agnostic.
 # WHY: XLA's fft custom-call wants the transformed axes minor-most, so every
 # dot(k-major) <-> fft(k-minor) boundary in the Σ τ kernel pays a full
 # transpose of the ~398 MB/rank μ² tile — 65% of the STAGED τ DISPATCH at
@@ -424,8 +423,8 @@ from ffi.fft import (  # noqa: E402,F401  (re-exported front doors)
 # pipeline (w_isdf chi0, ppm_sigma, gw_jax static COHSEX, isdf_fitting
 # CCT/ZCT).
 #
-# Backend: the platform FFI handler, unconditionally (MKL DFTI on cpu,
-# cuFFT strided on CUDA — see the block above) — ``(nk, *trail) ->
+# Backend: the platform FFI handler, unconditionally (FFTW3 ABI on cpu,
+# nvidia-mathdx on CUDA — see the block above) — ``(nk, *trail) ->
 # (nk, *trail)``, k-major end to end, no 3-D reshape, no layout anchoring.
 # The gated XLA twin (reshape -> make_sharded_*fftn_3d -> reshape) was
 # DELETED 2026-08-01 (decisions.md: FFI backends are required, not

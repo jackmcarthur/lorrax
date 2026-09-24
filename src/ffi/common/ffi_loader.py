@@ -11,9 +11,9 @@ its cpu (lapack) vs CUDA (cusolver) kernels, so ``jax.ffi.ffi_call``
 sites resolve the right handler from the lowering platform and never
 mention a platform themselves:
 
-    CUDA  liblorrax_ffi.so       cuSOLVERMp/cuBLASMp/phdf5/slate/cuFFT flat-k
+    CUDA  liblorrax_ffi.so       cuSOLVERMp/cuBLASMp/phdf5/slate/mathdx k-conv
     cpu   liblorrax_ffi_host.so  phdf5 read+write / slate (Target::HostTask)
-                                 / ScaLAPACK / MKL-DFTI flat-k / MKL GEMM
+                                 / ScaLAPACK / FFTW3-ABI flat-k / MKL GEMM
 
 Public API
 ----------
@@ -107,12 +107,6 @@ _CUDA_TARGET_SYMBOLS = {
     "lorrax_cublasmp_active_range_gemm":  "CublasMpActiveRangeGemmFfi",
     "lorrax_cublasmp_prepared_active_range_gemm": "CublasMpPreparedActiveRangeGemmFfi",
     "lorrax_cublasmp_batched_w_solve":    "CublasMpBatchedWSolveFfi",
-    # cuFFT strided flat-k batched-FFT handlers (cpp/cufft) — the CUDA
-    # platform mirror of the mklfft host handlers below.  The target STRINGS
-    # deliberately keep the host table's "mklfft" names (they were coined by
-    # the CPU prototype): common.fft_helpers issues ONE platform-agnostic
-    # ffi_call per site and the lowering platform resolves the handler —
-    # exactly the phdf5 same-target/different-symbol split.
     # The NVIDIA k-convolution family on nvidia-mathdx (cpp/cufft/
     # kconv_mathdx_cuda_ffi.cc): cuFFTDx transforms, NVRTC-built per
     # (mode, grid, ns, context) and disk-cached.  CUDA-only; the ffi.fft router
@@ -172,8 +166,8 @@ _HOST_TARGET_SYMBOLS = {
     "lorrax_scalapack_batched_getrf": "ScalapackBatchedGetrfHostFfi",
     "lorrax_scalapack_batched_getrs": "ScalapackBatchedGetrsHostFfi",
     "lorrax_scalapack_eigh":          "ScalapackEighHostFfi",
-    # MKL FFT (DFTI API) flat-k batched-FFT handlers (cpp/mklfft) — the
-    # LORRAX_FFT_FFI backend of common.fft_helpers (FFT-FFI prototype).
+    # FFTW3-ABI flat-k batched-FFT handlers (cpp/mklfft; the directory keeps
+    # its historical name) — the cpu leg of the ffi.fft router.
     "lorrax_mklfft_flat_k":           "MklFftFlatKHostFfi",
     "lorrax_mklfft_gw_conv":          "MklFftGwConvHostFfi",
     # MKL batched-GEMM handler (cpp/mklblas) — the LORRAX_BANDS_GEMM_FFI

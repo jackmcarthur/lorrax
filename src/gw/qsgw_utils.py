@@ -704,7 +704,8 @@ def build_qsgw_sigma_xc(
     sigma_xc_qsgw_kij_ry : jax.Array, (nk, nb, nb), complex128, replicated
         unless ``replicated_output=False``, then two-axis band sharded.
     diagnostics : dict with ``n_clipped`` (count of ``E_kn`` outside
-        ``[ω_min, ω_max]`` clamped to the grid) and ``omega_min/max_ev``.
+        ``[ω_min, ω_max]``, which take the static Σ(ω = 0)) and
+        ``omega_min/max_ev``.
     """
     omega = np.asarray(omega_ev, dtype=np.float64)
     E = np.asarray(e_qp_kn_ev, dtype=np.float64)

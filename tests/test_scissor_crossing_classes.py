@@ -88,8 +88,7 @@ _NB = 16
 _ALPHA_V, _BETA_V = 1.20, -0.45
 _ALPHA_C, _BETA_C = 1.05, -1.30
 # What the Fermi pair actually does: nothing like either line.  +1.88 eV is
-# the measured mean QP correction on sodium's converged protected pair
-# (metallic-mpa-screening.md 7.4).
+# the measured mean QP correction on sodium's converged protected pair.
 _DELTA_CROSS = 1.88
 
 
