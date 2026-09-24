@@ -1,215 +1,155 @@
-# Minimax quadrature for static and plasmon-pole GW
+# Minimax quadrature for the space-time χ₀
 
-This chapter describes the scalar quadratures used by static screening and the
-GN/HL plasmon-pole self-energy. The current MPA body uses fitted complex poles,
-a positive causal crossing rule, and complex-sector rules instead; see
-[Multipole frequency integration](THEORY_mpa_implementation.md).
+This page covers the gapped imaginary-time (Laplace) χ₀ behind static,
+GN-PPM and HL-PPM screening, and the rules it consumes. Related material is
+owned elsewhere:
 
-The physics owner supplies an energy interval and a target function. The
-`minimax` service supplies nodes, weights, achieved error, amplification,
-and provenance. Production `serve` now computes screening rules in process;
-historical table lookup remains a separate inspection API. The other target
-contracts, including Sigma boxes and the shared-pole W bank, are listed in
-the [service API](../services/minimax.md#caller-contract).
+- Σ's frequency integral: [the dynamic Σ(ω) quadrature](sigma-quadrature-problem.md).
+- MPA sampling and its damped line rules:
+  [Multipole frequency integration](THEORY_mpa_implementation.md).
+- Finite-occupation response: [Metallic MPA screening](metallic-mpa-screening.md)
+  and its [carrier](../architecture/fractional_chi0_response_face.md).
+- Service contracts: [`minimax`](../services/minimax.md).
 
-## 1. Why reciprocal kernels are separated
+## 1. Laplace kernels
 
-After a spectral window is referenced to one edge, its denominator is either
-sign definite or crosses zero.
+A gapped transition Δ = ε_c − ε_v > 0 enters χ₀ through one scalar kernel of
+Δ, and every kernel used here is a Laplace transform in imaginary time:
 
-For \(x\in[x_{\min},x_{\max}]\) with \(x_{\min}>0\),
+| response | kernel K(Δ) | k(τ) in K = ∫₀^∞ e^{−Δτ} k(τ) dτ |
+|---|---|---|
+| static | 1/Δ | 1 |
+| GN probe, even | Δ/(Δ² + ω_p²) | cos ω_pτ |
+| GN probe, odd (time reversal broken) | ω_p/(Δ² + ω_p²) | sin ω_pτ |
+| HL probe (Ω > Δ_max) | Δ/(Δ² − Ω²) | two shifted 1/y kernels, §3 |
 
-$$
-\frac{1}{x}
-=\int_0^\infty e^{-xt}\,dt
-\approx\sum_{\ell=1}^N w_\ell e^{-x t_\ell}.
-$$
-
-The exponential basis converges rapidly over a positive interval. At fixed
-accuracy its rank grows approximately as
-
-$$
-N=\mathcal O\!\left(
-\log\frac{x_{\max}}{x_{\min}}\,
-\log\frac1\epsilon
-\right).
-$$
-
-If \(x\) changes sign, one decaying Laplace contour cannot cover the complete
-interval. A crossing rule instead represents an odd, regularized reciprocal
-by a sine sum,
+A rule K(Δ) ≈ Σ_l α_l e^{−Δτ_l} on [Δ_min, Δ_max] factors e^{−Δτ} into an
+occupied and an empty factor, so the (v, c) pair sum becomes one product of
+Green's functions per node:
 
 $$
-g_\xi(x)
-\approx\sum_{\ell=1}^N a_\ell\sin(\tau_\ell x),
+G^v_{\mathbf k}(\tau)=\sum_{v}\psi_{v\mathbf k}\,e^{-\tau(\varepsilon^{\max}_v-\varepsilon_{v\mathbf k})}\,\psi^\dagger_{v\mathbf k},
 \qquad
-g_\xi(-x)=-g_\xi(x),
+G^c_{\mathbf k}(\tau)=\sum_{c}\psi_{c\mathbf k}\,e^{-\tau(\varepsilon_{c\mathbf k}-\varepsilon^{\min}_c)}\,\psi^\dagger_{c\mathbf k},
+$$
+
+$$
+A_{\mu\nu}(\mathbf R,\tau)=\sum_{ss'}G^c_{\mu s,\nu s'}(\mathbf R,\tau)\,G^v_{\mu s,\nu s'}(\mathbf R,\tau)^*,
 \qquad
-g_\xi(0)=0.
+\chi^0(\mathbf q)=-\sum_l\alpha_l\,e^{-\tau_lE_g}\,\mathcal F_{\mathbf R\to\mathbf q}\big[A(\tau_l)+A(\tau_l)^*\big],
 $$
 
-The scale \(\xi\) is part of the observable regularization, not a numerical
-way to hide a singular denominator. Crossing rank is linear in the scaled
-bandwidth \(A=E_{\mathrm{bw}}/\xi\) at fixed error for the learned sine
-family. The older HGL target remains a supported GN/PPM asset; it is not the
-MPA crossing construction.
+with E_g = ε_c^min − ε_v^max. G(R) is the lattice Fourier transform of G_k on
+the ISDF centroids r_μ, so the Hadamard product in R is the convolution over
+the k grid that pairs k with k − q, done by FFT. Both factors decay for every
+τ ≥ 0. The two particle–hole orientations are A and A^*. When time reversal is
+measured broken, the ordered route weights A by −(α_l − iβ_l) e^{−τ_lE_g},
+with β the odd kernel's coefficients on the same times, and completes the
+other orientation as the complex conjugate of that result at −q
+([derivation](../dev/notes/DERIVATION_gnppm_nonhermitian.md)).
 
-## 2. Static and imaginary-axis screening
+## 2. Cost
 
-For an insulating transition interval
-\([\Delta_{\min},\Delta_{\max}]\), static screening needs
+Per node, on P ranks, with N_k k-points (N_k^par symmetry parents), N_μ
+centroids and n_s spinor components:
+
+| step | cost |
+|---|---|
+| G^v and G^c: one complex GEMM per parent each, contracting only its own band support (active range) | 8 N_k^par (N_μn_s)² (N_v + N_c) / P flops |
+| two FFTs over the k grid | O((N_μn_s)² N_k log N_k / P) |
+| product and spin trace in R | O(N_k (N_μn_s)² / P) |
+
+One final FFT R → q follows the sweep, and every q is produced at once. The
+live set is two full-k Green tiles and the accumulator, each
+O(N_k (N_μn_s)² / P). The total, O(N_τ N_k N_μ² (N_b + log N_k)), is cubic in
+system size; the direct pair sum costs O(N_q N_k N_v N_c N_μ²). N_τ is the
+only frequency-dependent factor.
+
+## 3. The rules
+
+**Static, 1/Δ.** The interval runs from Δ_min, the gap (floored at the
+occupation smearing width when one is declared), to Δ_max = ε_c^max − ε_v^min.
+The conduction side is the union of the χ and Σ band windows, so one interval
+serves both. The rule is solved on [1, R], R = Δ_max/Δ_min, and rescaled:
+τ = τ̂/Δ_min, α = ŵ/Δ_min. The physical absolute error target
+`minimax_target_error` becomes the scaled target `minimax_target_error`·Δ_min.
+The solver is a levelled Remez exchange that returns the smallest N whose best
+uniform N-term error meets the target, and certifies it by alternation: if
+1/x − Σ_l w_l e^{−t_l x} alternates in sign at 2N + 1 points with magnitude
+≥ δ, no N-term exponential sum does better than δ (de la Vallée Poussin). Its
+count is
 
 $$
-\frac1\Delta
-\approx\sum_\ell w_\ell e^{-\Delta t_\ell}.
+N=\mathcal O\!\left(\log R\,\log\frac1\epsilon\right).
 $$
 
-The physical planner rescales a dimensionless certified rule on
-\([1,R]\), \(R=\Delta_{\max}/\Delta_{\min}\):
+Rules are computed at run time in milliseconds, capped at `minimax_max_nodes`,
+and cached by (log R, target, cap).
+
+**GN probe at iω_p.** `minimax.response_laplace_rule` places positive times
+on [Δ_min, Δ_max] at the single sample z = iω_p (reference Δ_min) and projects
+the even target Δ/(Δ² + ω_p²) with a continuum certificate at relative
+tolerance `minimax_target_error`
+([Compact noncrossing response quadrature](response-laplace.md)). The odd
+target is the same rule's ordered row, i times ω_p/(Δ² + ω_p²), on the same
+times, so a broken-time-reversal deck adds no nodes.
+
+**HL probe at Ω > Δ_max.**
 
 $$
-t_\ell^{\mathrm{phys}}=\frac{t_\ell}{\Delta_{\min}},
+\frac{\Delta}{\Delta^2-\Omega^2}=\frac{1/2}{\Omega+\Delta}-\frac{1/2}{\Omega-\Delta}.
+$$
+
+Both denominators are positive on the interval, so each is a static 1/y rule,
+on [Ω + Δ_min, Ω + Δ_max] and [Ω − Δ_max, Ω − Δ_min]; the second enters with
+negated times. A real-axis probe carries only the even orientation, so on a
+broken-time-reversal deck its odd channel is not represented.
+
+MPA's insulating imaginary samples use the service's `noncrossing_imag` solve
+of Δ/(Δ² + ϖ²) on the same interval. Its damped line rules and the metallic
+rules belong to the pages above.
+
+## 4. Error and amplification
+
+Every rule is judged in its target's norm by two numbers:
+
+$$
+\epsilon_{\max}=\max_{\Delta\in[\Delta_{\min},\Delta_{\max}]}\Big|K(\Delta)-\sum_l\alpha_le^{-\Delta\tau_l}\Big|,
 \qquad
-w_\ell^{\mathrm{phys}}=\frac{w_\ell}{\Delta_{\min}}.
+\kappa=\sup_\Delta\frac{\sum_l|\alpha_le^{-\Delta\tau_l}|}{|K(\Delta)|}.
 $$
 
-The GN probe at \(z=i\omega_p\) uses
+κ multiplies roundoff, ISDF error and reduction-order differences between
+ranks, so a small residual with a large κ is not a good rule. The service
+reports both with each rule, and the driver prints the rule's provenance, node
+count and achieved error. The energy reference (`midgap` by default) cancels
+from χ₀, because only Δ enters.
 
-$$
-\frac{\Delta}{\Delta^2+\omega_p^2}
-=\int_0^\infty e^{-\Delta t}\cos(\omega_p t)\,dt.
-$$
+## 5. Refusals
 
-It has its own certified target because fitting \(1/\Delta\) does not
-automatically certify the cosine-weighted kernel. A shared-node augmentation
-may reuse static nodes, but only after the combined rule passes the
-imaginary-axis residual gate.
+| refusal | fix |
+|---|---|
+| `GATE chi0_laplace_needs_gap`: ε_c^min ≤ ε_v^max over the χ band slices | a gapless system takes the finite-occupation routes (`mpa_material_class = metal`) |
+| HL probe with Ω ≤ Δ_max | HL-PPM is defined only above every transition |
+| `GATE gn_ppm_analytic_probe_real`: complex even or odd probe coefficients | none; the rule is inconsistent with its real target |
+| no certified GN probe rule through 64 nodes | a smaller Δ_max/Δ_min (band window) or a looser `minimax_target_error` |
+| `GATE chi0_imag_ordered_needs_odd_kernel`: ordered χ₀ without odd weights | build the probe with the odd kernel |
 
-On a measured-broken-TR deck the probe needs the sine-weighted kernel as
-well, \(\omega_p/(\Delta^2+\omega_p^2)=\int_0^\infty e^{-\Delta t}\sin(\omega_p t)\,dt\),
-because the two particle-hole orientations then carry the complex weights
-\(-1/(\Delta\pm i\omega_p)\) separately. The odd kernel is represented on the
-served even nodes plus the fewest greedily added nodes (weights-only fits,
-the even weights zero on the extras, so the even accumulation is the served
-rule unchanged) and gated at the even rule's error; measured 2026-09-01 the
-even nodes alone stall at \(10^{-3}\)–\(10^{-5}\) and one to five extras
-reach \(10^{-6}\).
-Numerical owner: `minimax.augment_odd_laplace`; physical adapter:
-`minimax_screening.solve_laplace_minimax_imag_interval(with_odd_kernel=True)`.
-Physics: [`DERIVATION_gnppm_nonhermitian.md`](../dev/notes/DERIVATION_gnppm_nonhermitian.md).
-This quadrature supplies the ordered probe only. The fit owner forms the
-Hermitian `B` and odd Hermitian `D`, and the Sigma owner selects `B+D` for
-empty/conduction branches and `B-D` for occupied/valence branches; the
-quadrature service does not choose a residue.
+A static rule that cannot reach its target within `minimax_max_nodes` is not
+refused: the service returns the capped rule, and the printed achieved error
+is the only record.
 
-## 3. Real-frequency PPM windows
+## 6. Ownership
 
-A PPM self-energy denominator is schematically
-
-$$
-d(\omega)=\omega-E_A-\Omega.
-$$
-
-For each causal branch, the planner partitions the Cartesian
-\((E_A,\Omega)\) domain so that every cell is either:
-
-- **noncrossing**, where \(d\) has a fixed sign and a rescaled exponential
-  rule is valid; or
-- **crossing**, where the requested \(\omega\) interval overlaps the cell and
-  the regularized sine rule is required.
-
-The rectangular windows are not cosmetic. They preserve separability:
-one band-restricted Green function and one pole-restricted screened
-interaction can be formed independently. A selector depending on each
-\((E_A,\Omega)\) pair would recreate the pairwise cost.
-
-For a sine atom,
-
-$$
-\sin(\tau d)
-=\frac{e^{i\tau d}-e^{-i\tau d}}{2i}.
-$$
-
-The two exponentials become forward and backward real-time propagators. Their
-completion must be performed before a band projection unless the relevant
-matrix adjoint identity has been proved.
-
-## 4. Error and stability
-
-Every rule is evaluated in the norm associated with its target. Two numbers
-are required:
-
-$$
-\epsilon_{\max}
-=\max_{x\in\mathcal D}|f(x)-Q_N(x)|,
-\qquad
-\kappa
-=\sup_{x\in\mathcal D}
-\frac{\sum_\ell |w_\ell\phi_\ell(x)|}{|f(x)|}.
-$$
-
-A small residual with large \(\kappa\) can amplify roundoff, ISDF error, and
-small differences between distributed reductions. Production therefore
-selects by certified error and enforces the recorded amplification cap.
-
-Tables are identified by family, target, dimensionless range, requested error,
-node cap, content hash, generator provenance, achieved error, and
-amplification. The range is rounded only in the conservative direction:
-a served table must cover the complete requested interval.
-
-Runtime nonlinear fitting is intentionally not the default. The historical
-VarPro/Lawson solvers can converge to different local supports on different
-numerical stacks even when their residuals are similar. Certified artifacts
-make the mathematical object reproducible.
-
-## 5. Execution form
-
-At one node, the driver forms windowed Green functions such as
-
-$$
-G_A(\mathbf k,t_\ell)
-=\sum_{n\in A}
-\psi_{n\mathbf k}\psi^\dagger_{n\mathbf k}
-e^{-i(\epsilon_{n\mathbf k}-E_{\mathrm{ref}})t_\ell}.
-$$
-
-The lattice FFT, elementwise product, and band projection are shared by all
-frequency models. Quadrature weights and reference phases are scalar
-coefficients applied around that common spatial kernel.
-
-Node count, not the number of requested output frequencies, controls the
-expensive contractions. Output-frequency count controls the comparatively
-cheap coefficient fold and storage. Window count matters because each
-physically distinct band/pole selector requires its own spatial sweep even
-when two windows reuse the same scalar node set.
-
-## 6. Ownership and tuning
-
-`services/minimax` owns target definitions, catalog lookup, provenance,
-certification, the offline solvers, and the denominator-box rule builder.
-`gw.minimax_screening` owns physical intervals, energy references, and
-rescaling. `gw.ppm_sigma` owns PPM causal branches and window selectors.
-`gw.sigma_box_plan` owns the Σ box-plan conventions — product windows, the
-error currency, causal conjugation and the rule cache. The shared
-Green-function and convolution kernels own no quadrature policy.
-
-SCOPE. This page is the χ side: the scalar rules for static, imaginary-axis
-and real-frequency PPM screening, served from the shipped catalog. Σ does not
-use them. Its frequency integral is built from one certified rule per product
-window on the denominator box, which is a different construction with a
-different error currency; see
-[the Σ quadrature problem](sigma-quadrature-problem.md).
-
-Exact tolerances and node caps are documented in the
-[input reference](../input_reference.md). When a wider band interval exceeds
-a shipped table, generate and certify a wider asset or refuse; do not clip the
-interval. When a denominator approaches zero, route it to the crossing family
-or change the declared physical regularization; do not lower-bound it
-silently.
+`services/minimax` owns the targets, solvers, certificates and caches.
+`gw.minimax_screening` owns the physical intervals, the energy reference, the
+rescaling and the probe adapters. `gw.w_isdf` owns the τ sweep. The Green's
+function builder and the FFT helpers carry no quadrature policy.
 
 ## References
 
-- Kim, Martyna, and Ismail-Beigi, *Phys. Rev. B* **101**, 035139 (2020).
+- Rojas, Godby and Needs, *Phys. Rev. Lett.* **74**, 1827 (1995).
+- Kim, Martyna and Ismail-Beigi, *Phys. Rev. B* **101**, 035139 (2020).
+- Braess, *Nonlinear Approximation Theory* (1986).
 - Hackbusch, *Hierarchical Matrices: Algorithms and Analysis* (2015).
-- Beylkin and Monzón, *Applied and Computational Harmonic Analysis* **28**,
-  131 (2010).
+- Beylkin and Monzón, *Appl. Comput. Harmon. Anal.* **28**, 131 (2010).
