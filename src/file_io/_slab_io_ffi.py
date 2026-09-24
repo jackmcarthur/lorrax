@@ -1181,6 +1181,52 @@ def _replicated_sharding(mesh: Mesh, ndim: int) -> NamedSharding:
     return NamedSharding(mesh, P(*([None] * ndim)))
 
 
+def _onto_handle_mesh(A: jax.Array, mesh: Mesh, name: str) -> jax.Array:
+    """An operand that is not ``NamedSharding`` on the handle's mesh, put there
+    without an all-gather, or refused (decisions 2026-08-05: an allgather is a
+    refusal).
+
+    * Every process already holds all of ``A`` (host numpy, a single-device or
+      process-local array, a replicated array): it is staged replicated from
+      this process's own copy, with no collective.  This is the O(global)
+      exception of ``docs/architecture/slab_io.md#contract``; the staging is
+      process-local because ``jax.device_put`` of a host operand to a
+      replicated sharding pays a hidden ``assert_equal`` all-gather of
+      ``P x A.nbytes`` (LORRAX_CHECK_REPLICA=1 re-arms it).
+    * A sharded operand on a mesh over the same devices in the same order,
+      differing only in axis names (the converged Fe SC ``sigma_mnk.h5``
+      write, 2026-09-19): relabelled onto the handle's mesh, each device
+      keeping its own shard, so nothing moves.
+    * Anything else spans devices this process cannot address, and writing it
+      would gather the whole array to every process's host: refused.
+    """
+    if (getattr(A, "is_fully_addressable", True)
+            or getattr(A, "is_fully_replicated", False)):
+        return device_put_process_local(
+            gather_to_host(A), _replicated_sharding(mesh, A.ndim))
+    sh = A.sharding
+    src = getattr(sh, "mesh", None)
+    if (isinstance(sh, NamedSharding) and src.devices.shape == mesh.devices.shape
+            and [d.id for d in src.devices.flat] == [d.id for d in mesh.devices.flat]):
+        rename = dict(zip(src.axis_names, mesh.axis_names))
+        spec = P(*(None if e is None else
+                   tuple(rename[a] for a in e) if isinstance(e, tuple) else rename[e]
+                   for e in sh.spec))
+        target = NamedSharding(mesh, spec)
+        if target.devices_indices_map(A.shape) == sh.devices_indices_map(A.shape):
+            return jax.make_array_from_single_device_arrays(
+                A.shape, target, [s.data for s in A.addressable_shards])
+    raise ValueError(
+        f"GATE slab_io_foreign_mesh: write_slab {name!r} got a {tuple(A.shape)} "
+        f"{A.dtype} operand sharded {sh} that is not on the handle's mesh "
+        f"{dict(mesh.shape)} and spans devices this process cannot address; "
+        f"writing it would gather {A.nbytes / 2**30:.3g} GiB to every process's "
+        f"host.  want: the operand sharded on the handle's mesh (or on a mesh over "
+        f"the same devices in the same order).  fix: produce it on the run's "
+        f"mesh_xy, or, for an O(1) array, gather it at the call site with "
+        f"common.collectives.gather_to_host.  doc: docs/architecture/slab_io.md#contract.")
+
+
 def _replicated_i64_vector(values: Sequence[int], mesh: Mesh) -> jax.Array:
     """Small int64 control buffer, explicitly replicated on ``mesh``.
 
@@ -2354,30 +2400,9 @@ class _FfiBackend(_DatasetGeometry):
     ) -> None:
         if not isinstance(A, jax.Array):
             A = jnp.asarray(A)
-        # Ensure placement: if not sharded on our mesh, put as replicated.
-        # Process-local (see _replicated_i64_vector): a host/uncommitted
-        # operand here would otherwise pay the hidden assert_equal
-        # all-gather at P × A.nbytes — on a WRITE-path tensor, the
-        # single biggest assertion payload in the codebase (AA.1 class).
-        # A replicated write requires rank-identical A anyway (the
-        # collective writer dedups replicas); LORRAX_CHECK_REPLICA=1
-        # re-arms the assertion.
-        # The service resolves the host boundary.  ``jax.device_put`` of a
-        # globally sharded operand to a replicated sharding is JAX's
-        # cross-process, different-device-order reshard, which asserted on the
-        # final sigma_mnk.h5 write of the converged 10p/10q runs (payload
-        # written, receipt left uncommitted).  One host gather of this per-map
-        # artifact, then the existing host-staging placement, which never
-        # reshards between device orders.  The gather itself is the service's
-        # ``gather_to_host``, not a bare ``np.asarray``: the operand arrives on
-        # a DIFFERENT mesh, so it spans devices this process cannot address and
-        # a bare host fetch refuses (measured, 10r, 2026-09-19: "Fetching value
-        # for `jax.Array` that spans non-addressable ... devices").
         if (not isinstance(A.sharding, NamedSharding)
                 or A.sharding.mesh is not self.mesh):
-            A = device_put_process_local(
-                gather_to_host(A),
-                _replicated_sharding(self.mesh, A.ndim))
+            A = _onto_handle_mesh(A, self.mesh, name)
         axis_count_per_dim, axis_flat = _sharding_to_axis_info(
             A.sharding, A.ndim)
         off, slab_shape, req_gshape = _normalize_slab_request(

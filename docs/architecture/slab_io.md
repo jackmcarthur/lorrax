@@ -54,13 +54,18 @@ writes plus the one in flight, and a further `write_slab` blocks.
 
 - `read_slab` **without** `partition_spec` reads the whole requested extent,
   replicated, on every rank.
-- `write_slab` of an operand that is not `NamedSharding` on the handle's mesh
-  (host numpy, a single-device array, or an array on another mesh) is
-  gathered to every process's host (`common.collectives.gather_to_host`) and
-  written replicated.
+- `write_slab` of an operand that every process already holds whole (host
+  numpy, a single-device or process-local array, a replicated array) is
+  staged replicated from each process's own copy, with no collective.
 
 Use them only for O(1)-sized data. Bulk arrays go in on the handle's mesh
 and come out with a `partition_spec`.
+
+A sharded operand on another mesh is never gathered. On a mesh over the same
+devices in the same order that differs only in axis names, it is relabelled
+onto the handle's mesh and each device keeps its shard. Anything else refuses
+with `GATE slab_io_foreign_mesh`, because writing it would gather the whole
+array to every process's host (decisions 2026-08-05).
 
 ## One transport per geometry {#one-transport}
 
@@ -538,6 +543,7 @@ all ranks. A handle that appears under two `path=` values, or after its own
 | `this path is already open with mode=…` / `this path already has a live context` | a second `SlabIO` on a path open in this process, not both `"r"` | close the first |
 | `SlabIO mode='w': could not replace existing file` | rank-0 unlink failed | delete the file or fix permissions |
 | `phdf5 ensure_dataset: dataset '…' already exists with shape …` | shape or dtype differs from the existing dataset | `mode="w"`, a new name, or delete the file |
+| `GATE slab_io_foreign_mesh: write_slab …` | a sharded operand on a mesh that is not the handle's and not the same devices in the same order ([contract](#contract)) | produce it on the run's `mesh_xy`; an O(1) array may be gathered at the call site with `gather_to_host` |
 | `write_slab …: global_shape=… contradicts the dataset's extent` | `global_shape` on a known dataset | drop `global_shape` |
 | `slab shape must be non-empty` | `read_slab` on a scalar dataset | `read_small` |
 | `logical slab out of bounds … refused identically on every rank` | offset or `valid_shape` past the dataset; with a nonzero `offset_base` on a no-offset call, a [stale library](#s3) | fix the request, or rebuild |
