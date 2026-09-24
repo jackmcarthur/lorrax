@@ -107,7 +107,7 @@ three terms. Below the crossover, `true` then runs the `false` kernels at
 | V_q | `V_acc` `16·Q·μ_L·μ_R/P`, one q-tile of ζ rows, G panels | `vq_tile_bytes` ([§ V_q](#vq-g-panels-and-q-tiles)) | `GATE vq_tile_budget` |
 | V_q unfold | `16·N_k·μ²/P`, sharded `P(None,'x','y')` | — | — |
 | shared-pole screening and Σ | response-bank faces, pencils, eigh workspace, then G and W tiles | the capacity ledger ([shared-pole model](shared_pole_model.md), byte model) | before allocating, when a stage and its named concurrent stages exceed the budget |
-| static / GN-PPM screening | χ₀ τ-scan: for `n_s > 1` the spin pairs stream, four `(a,b)` blocks `16·N_k·μ²/P` (Gv, Gc and their transforms) plus the parents unfolded to full k (`M_face·N_k/n_par` or `M_axis·N_k/n_par`) and the `16·N_k·μ²/P` accumulator; unchunked over q | nothing | — |
+| static / GN-PPM screening | χ₀ τ-scan: whole-spin `≈3·G_tile` (Gv, Gc, unfold transient). When that exceeds the target (`gw.greens_function_kernel.spin_pairs_needed`, `n_s > 1`), χ₀ = Σ_ab Gc_ab·conj(Gv_ab) streams the spin pairs: four `(a,b)` blocks `16·N_k·μ²/P` plus the parents unfolded to full k (`M·N_k/n_par`) and the `16·N_k·μ²/P` accumulator; unchunked over q | `spin_pairs_needed` | — |
 | restart write | one sharded tile, `max(16·Q·μ²/P, 16·Q·μ·N_G/P)` | stage F | — |
 
 Replicated per-process metadata (the TRS-augmented centroid permutation and
