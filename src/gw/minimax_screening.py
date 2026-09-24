@@ -1485,9 +1485,13 @@ def build_real_quadrature(quad, Omega, minimax_config, *, print_fn=None):
     Omega = float(Omega)
     if Omega <= float(quad.x_max):
         raise ValueError(
-            f"build_real_quadrature requires Omega > x_max "
-            f"(got Omega={Omega}, x_max={quad.x_max}). "
-            f"HL-PPM is only defined for probes above all transitions."
+            f"GATE hl_ppm_probe_in_spectrum: got ppm_omega_p = {Omega:.6g} Ry "
+            f"at or below the largest chi0 transition x_max = "
+            f"{float(quad.x_max):.6g} Ry; want ppm_omega_p > x_max (the HL "
+            f"probe is a real frequency, and below x_max it sits in the "
+            f"spectrum); fix: set ppm_omega_p above {float(quad.x_max):.6g} Ry "
+            f"(the fit tends to the first-moment limit as it grows; 2.0 Ry is "
+            f"the GN default); doc: docs/theory/hl-gpp-derivation.md §3."
         )
     target_error = float(minimax_config.target_error)
     max_nodes = int(minimax_config.max_nodes)

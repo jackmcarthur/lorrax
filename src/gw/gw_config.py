@@ -1673,8 +1673,9 @@ _DEFAULTS = {
     # ppm_model picks the two-point pole-fit ansatz:
     #   "gn" — Godby-Needs: second probe at ω = i·ppm_omega_p (imaginary,
     #          ppm_omega_p ≈ 2 Ry by default).
-    #   "hl" — Hybertsen-Louie: second probe at ω = ppm_omega_p (real,
-    #          chosen above all transition energies; default 200 Ry).
+    #   "hl" — Hybertsen-Louie: second probe at ω = ppm_omega_p (real; it
+    #          must exceed every chi0 transition energy, so an HL deck sets
+    #          it: the shared 2.0 Ry default refuses on most spectra).
     "ppm_model": "gn",
     "ppm_omega_p": 2.0,
     "ppm_fallback_omega": 2.0,
