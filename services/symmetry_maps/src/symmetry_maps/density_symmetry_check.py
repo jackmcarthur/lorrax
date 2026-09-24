@@ -9,6 +9,12 @@ evidence because that comparison would pass by construction.
 The comparison is gauge invariant and accepts fractional occupations. It
 does not build an FFT box or a real-space density, and it is intentionally
 inactive for scalar, collinear-two-channel, and four-component inputs.
+
+A loader built with a mesh over every process deals the planned evidence
+items round-robin: each process reads only its own k pairs, then one
+all-gather of the per-item residuals, minimum singular values and covered k
+rows follows.  Every process classifies the same merged numbers, so the
+verdict is identical everywhere.  A mesh-less loader keeps the serial sweep.
 """
 
 from __future__ import annotations
@@ -207,6 +213,47 @@ def _plan_two_component_evidence(
         -float(weights[e.source]), priority[e.kind], e.source,
         e.target_raw, -1 if e.spatial_op is None else e.spatial_op))
     return candidates if max_k <= 0 else candidates[:max_k]
+
+
+def _evidence_partition(loader) -> tuple[int, int]:
+    """``(rank, world)`` over which the evidence items are dealt.
+
+    Only a loader constructed with a mesh spanning every process is known to
+    be opened by all of them together (its ``load`` is itself collective).  A
+    mesh-less loader may be opened by one rank alone -- ``file_io.qp_wfn``
+    does so for its rank-0 writer -- so it keeps the serial sweep and issues
+    no collective.
+    """
+    mesh = getattr(loader, "_mesh", None)
+    if mesh is None:
+        return 0, 1
+    import jax
+    world = int(jax.process_count())
+    if world <= 1:
+        return 0, 1
+    owners = {int(d.process_index)
+              for d in np.asarray(mesh.devices).reshape(-1)}
+    if len(owners) != world:
+        return 0, 1
+    return int(jax.process_index()), world
+
+
+def _merge_process_evidence(row: np.ndarray, world: int) -> np.ndarray:
+    """Elementwise max over processes of a non-negative evidence row.
+
+    Every entry is filled by exactly one process and is zero elsewhere, so the
+    max returns the owner's value bit for bit.  It is one all-gather of a few
+    dozen doubles.
+    """
+    row = np.asarray(row, dtype=np.float64)
+    if world <= 1:
+        return row
+    import jax
+    from jax.experimental import multihost_utils
+    local = jax.device_put(row, jax.local_devices()[0])
+    rows = np.asarray(multihost_utils.process_allgather(local),
+                      dtype=np.float64)
+    return rows.reshape(world, row.size).max(axis=0)
 
 
 def _raw_ibz_psi_k(loader, ik: int, nb: int, *, b_lo: int = 0) -> np.ndarray:
@@ -421,12 +468,10 @@ def _check_two_component_trs(
         return raw_cache[ik]
 
     operator_tables = None
-    residuals: list[float] = []
-    singular_values: list[float] = []
-    covered = np.zeros(kpoints.shape[0], dtype=bool)
-    counts = {"raw-pair": 0, "spatial-pair": 0, "trim": 0}
-    t_overlap = 0.0
-    for item in evidence:
+
+    def measure(item: _TRSEvidence) -> tuple[float, float, float]:
+        """``(residual, min singular value, overlap seconds)`` of one item."""
+        nonlocal operator_tables
         source, source_g = raw(item.source)
         if item.kind == "spatial-pair":
             if operator_tables is None:
@@ -461,13 +506,47 @@ def _check_two_component_trs(
             target, target_g, target_k)
         residual, min_singular = occupation_operator_residual(
             overlap, occupations[item.target_raw], occupations[item.source])
-        t_overlap += time.perf_counter() - tic
-        residuals.append(residual)
-        singular_values.append(min_singular)
+        return residual, min_singular, time.perf_counter() - tic
+
+    # Items are dealt round-robin; each process reads only its own k pairs.
+    rank, world = _evidence_partition(loader)
+    n_items = len(evidence)
+    residual_row = np.zeros(n_items, dtype=np.float64)
+    singular_row = np.zeros(n_items, dtype=np.float64)
+    covered_row = np.zeros(kpoints.shape[0], dtype=np.float64)
+    t_overlap = 0.0
+    local_error = None
+    for index, item in enumerate(evidence):
+        if index % world != rank:
+            continue
+        try:
+            residual, min_singular, seconds = measure(item)
+        except Exception as exc:     # every process must still reach the merge
+            local_error = exc
+            break
+        finally:
+            raw_cache.clear()
+        t_overlap += seconds
+        residual_row[index] = residual
+        singular_row[index] = min_singular
+        covered_row[item.source] = 1.0
+        covered_row[item.target_raw] = 1.0
+
+    merged = _merge_process_evidence(np.concatenate([
+        residual_row, singular_row, covered_row,
+        [0.0 if local_error is None else 1.0]]), world)
+    if local_error is not None:
+        raise local_error
+    if merged[-1] > 0.0:
+        raise RuntimeError(
+            "2c TRS evidence measurement failed on another process; that "
+            "process raised the exception itself")
+    residuals = [float(v) for v in merged[:n_items]]
+    singular_values = [float(v) for v in merged[n_items:2 * n_items]]
+    covered = merged[2 * n_items:-1] > 0.0
+    counts = {"raw-pair": 0, "spatial-pair": 0, "trim": 0}
+    for item in evidence:
         counts[item.kind] += 1
-        covered[item.source] = True
-        covered[item.target_raw] = True
-        raw_cache.clear()
 
     max_residual = max(residuals, default=None)
     min_singular = min(singular_values, default=None)
