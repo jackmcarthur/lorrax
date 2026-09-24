@@ -107,7 +107,7 @@ grid; consumers decide that against authenticated symmetry metadata
 | backend | transport | picked by `auto` when |
 |---|---|---|
 | `eager` | per-rank h5py read of the rank's band block, host unfold | no mesh, one process, or forced |
-| `phdf5` | `SlabIO.read_slabs`: one collective MPI-IO `H5Dread` over the union of k windows, unfold on device | several processes, a 2-D mesh, and a phdf5-capable CUDA or host library |
+| `phdf5` | `SlabIO.read_slabs`: the union of k windows, read by independent MPI-IO in chunks of band rows ([slab_io tuning](../architecture/slab_io.md#tuning)), unfold on device | several processes, a 2-D mesh, and a phdf5-capable CUDA or host library |
 
 `read_slabs` takes n windows of one slab shape with per-window valid shapes
 and returns a window axis. The per-rank band clamp,
@@ -115,9 +115,10 @@ and returns a window axis. The per-rank band clamp,
 `file_io._slab_io_ffi._derive_window_counts` → `_derive_valid_shape`. One
 union read beats n separate `read_slab` calls because each collective
 `H5Dread` has a fixed overhead and the loop adds a `jnp.stack`; n is the
-request's IBZ k-count, the axis production decks grow along. A `stripe_count = 1` file reads through one
-aggregator at any rank count; rank 0 announces the file's stripe layout at
-open.
+request's IBZ k-count, the axis production decks grow along. Each rank
+reads its band block straight from the file's stripes, so a
+`stripe_count = 1` file serves every rank from one OST; rank 0 announces the
+file's stripe layout at open.
 
 ## Tests
 
