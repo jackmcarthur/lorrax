@@ -66,7 +66,7 @@ __all__ = ["get_lib", "has_target", "probe_target", "loaded_lib_path",
 #: header whenever the monorepo is reachable and FAILS if the two disagree.
 #: That is the whole mechanism keeping a copy honest: a copy nothing compares
 #: is how the ten dispatch sites drifted.
-LORRAX_FFI_ABI_VERSION = 4
+LORRAX_FFI_ABI_VERSION = 5
 
 #: platform -> the C entry point reporting the library's ABI.  Per leg,
 #: because both libraries are dlopened RTLD_GLOBAL and already share sixteen
