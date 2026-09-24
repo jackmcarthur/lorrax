@@ -7,8 +7,6 @@ import numpy as np
 
 from gw.gflat_memory_model import (
     _batch_reshard_operand_floor_bytes,
-    _coupled_mu123_zq_incremental_bytes,
-    _coupled_route_projected_hwm_bytes,
     _face_pair_density_slots,
     _fft_box_bytes,
     plan_gflat_chunks,
@@ -71,53 +69,10 @@ def _profile_cliff_plan(r_chunk):
         face_current_vertex=True)
 
 
-def test_coupled_mu123_prototype_prices_two_zq_outputs_and_shared_x_face():
-    delta = _coupled_mu123_zq_incremental_bytes(
-        nk=36, nq=36, ns=4, mu=800, face_nb=256,
-        r_chunk=82_944, p_x=4, p_y=4)
-    assert delta["two_additional_completed_zq"] == 4_777_574_400
-    assert delta["shared_full_spin_x_face"] == 117_964_800
-    assert delta["two_additional_transverse_factors"] == 46_080_000
-    assert delta["total"] == 4_941_619_200
-
-
-def test_coupled_mu123_stacked_solve_prices_nonconcurrent_peak():
-    delta = _coupled_mu123_zq_incremental_bytes(
-        nk=36, nq=36, ns=4, mu=800, face_nb=256,
-        r_chunk=27_648, p_x=4, p_y=4,
-        stack_three_solves=True)
-    assert delta["stacked_solve_transient"] == 3_008_102_400
-
-
-def test_coupled_host_spill_moves_gflat_bytes_off_device():
-    resident = _coupled_mu123_zq_incremental_bytes(
-        nk=36, nq=36, ns=4, mu=800, face_nb=256,
-        r_chunk=27_648, p_x=4, p_y=4, ngkmax=76_551)
-    spilled = _coupled_mu123_zq_incremental_bytes(
-        nk=36, nq=36, ns=4, mu=800, face_nb=256,
-        r_chunk=27_648, p_x=4, p_y=4, ngkmax=76_551,
-        host_spill_gflat=True)
-    moved = 2 * 16 * 36 * 800 * 76_551 / 16
-    assert resident["two_additional_gflat_outputs"] == moved
-    assert spilled["two_additional_gflat_outputs"] == 0
-    assert spilled["two_additional_host_gflat_outputs"] == moved
-    assert spilled["three_host_gflat_outputs"] == 1.5 * moved
-    assert resident["total"] - spilled["total"] == moved
-
-
 def test_batch_reshard_floor_matches_three_measured_live_arenas():
     expected = 3 * 16 * 7 * 800 * (800 + 27_648)
     assert _batch_reshard_operand_floor_bytes(
         batch=108, mu=800, nrhs=27_648, processes=16) == expected
-
-
-def test_local_route_hwm_includes_solve_floor_not_just_base_plus_delta():
-    assert _coupled_route_projected_hwm_bytes(
-        base_hwm=70, persistent=50, coupled_delta=10,
-        solve_operand_floor=40) == 100
-    assert _coupled_route_projected_hwm_bytes(
-        base_hwm=70, persistent=20, coupled_delta=10,
-        solve_operand_floor=5) == 80
 
 
 def test_run50_matched_deck_selects_bounded_y_cache_without_full_grid_cache():

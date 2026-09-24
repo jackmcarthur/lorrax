@@ -12,7 +12,7 @@ via :func:`padded_mu_extent`).
 The pad zone is zero-filled BY DEFAULT.  Downstream operators that
 contract along a padded axis (e.g. einsums in V_q tile, V·χ in W solve)
 see no contribution from the pad rows by construction; solves must run at
-the LOGICAL extent (see ``isdf/core.solve_zeta`` and
+the LOGICAL extent (see :func:`solve_at_logical` and
 ``reports/device_invariance_2026-07-08/ROOT_CAUSE.md``).
 
 A zero pad is inert for operators LINEAR or BILINEAR in the padded axis,
@@ -564,7 +564,7 @@ def pad_axis(
 
     Three established uses, and they are the same arithmetic:
 
-    * ``axis=-1`` (:func:`pad_last_axis_to`) — the NRHS pad for
+    * ``axis=-1`` — the NRHS pad for
       distributed solves whose block-cyclic RHS descriptor needs
       last-axis divisibility.  Zero RHS columns give zero solution
       columns.
@@ -597,15 +597,6 @@ def pad_axis(
         n, divisor_or_mesh, name=name, spec=spec,
         axis=ax if spec is not None else None)
     return PadAxisResult(pad_to_axis(A, tag, axis=ax, fill=fill), tag)
-
-
-def pad_last_axis_to(A, divisor):
-    """``pad_axis(A, divisor, axis=-1)`` — the named NRHS spelling.
-
-    Returns the same :class:`PadAxisResult`; NRHS consumers want
-    ``.logical`` (the real column count to slice back to).
-    """
-    return pad_axis(A, divisor, axis=-1)
 
 
 def mesh_divisor(mesh_or_int) -> int:
@@ -684,7 +675,6 @@ __all__ = [
     "solve_at_logical",
     "PadAxisResult",
     "pad_axis",
-    "pad_last_axis_to",
     "mesh_divisor",
     "spec_divisor",
 ]

@@ -132,5 +132,4 @@ def test_profile_section_stays_deleted():
         "common.jax_profile.profile_section is back.  It produced no trace, "
         "printed a plausible timing line that was really the job of "
         "timing.section, and injected a sandbox path at sys.path[0].  The "
-        "working entry points are trace_section / annotation / "
-        "step_annotation.")
+        "working entry points are trace_section / annotation.")

@@ -183,7 +183,8 @@ def test_head_correction_full_is_lifted_on_the_bare_default():
     # bispinor, LIFTED 2026-08-23 (feat/transverse-zeta-face-2026-08-23,
     # row DELETED per the same "delete, don't narrow" precedent as
     # qp_solver=self_consistent's own lift): isdf.core.c_q_from_psi_sm/
-    # z_q_from_psi_sm(layout='face') now accept non-identity gamma_L/
+    # z_q_from_psi_sm(layout='face') (the latter since retired with the
+    # r-tile loop) accepted non-identity gamma_L/
     # gamma_R via psi-endpoint application, gated on real 4-rank CUDA
     # with all 15 non-identity Lorentz-index pairs at ns=4 (tests/
     # test_isdf_cq_face_parity.py, tests/test_isdf_zq_face_parity.py),

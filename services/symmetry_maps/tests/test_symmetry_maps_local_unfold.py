@@ -1,7 +1,7 @@
-"""The manual-mode local unfold body, its spin-block coefficient, the
-O(n_rtot) orbit labels and the left-only basis reorder.
+"""The manual-mode local unfold body, its spin-block coefficient and the
+left-only basis reorder.
 
-These four names exist for the parent-k ζ fit (``isdf.core._z_q_face_parent``):
+These names serve manual-mode kernels (the parent-k ζ fit, the MPA Σ unfold):
 a kernel that already stands inside a manual ``shard_map`` cannot call the
 top-level ``unfold_isdf_operator`` jit, must hold ONE output spin block at a
 time, and changes its right-endpoint (real-grid tile) tables on every call.
@@ -13,8 +13,6 @@ numbers:
   operands, and with no collective in the lowered HLO;
 * :func:`open_spin_block_coefficient` reproduces one ``(a, b)`` block of
   ``_rotate_open_spin_centroid_operator`` on a rectangular operator;
-* :func:`real_space_orbit_labels` induces the same partition as the union-find
-  of :func:`fft_grid_pullback_perm`, on symmorphic and nonsymmorphic groups;
 
 Geometry, mesh and hand reference are the emulated-mesh suite's own
 (``test_symmetry_maps_emulated_mesh``); nothing is re-derived here.
@@ -28,16 +26,14 @@ import pytest
 from lxkit.testing import require_devices
 from symmetry_maps import (
     centroid_source_map_and_wrap,
-    fft_grid_pullback_perm,
     open_spin_block_coefficient,
     permutation_orbit_labels,
-    real_space_orbit_labels,
     unfold_isdf_operator,
     unfold_operator_local,
 )
 
 from test_symmetry_maps_emulated_mesh import (  # noqa: E402  (suite helpers)
-    _FFT, _IRR, _NTRAN, _Q_IRR, _SEEDS_12, _SYM, _SYMS, _geometry, _mesh)
+    _IRR, _NTRAN, _Q_IRR, _SEEDS_12, _SYM, _SYMS, _geometry, _mesh)
 
 
 def _grid_endpoint_geometry():
@@ -151,28 +147,6 @@ def test_open_spin_block_coefficient_is_one_block_of_the_rotation():
                 for c in range(ns) for d in range(ns))
             np.testing.assert_allclose(
                 block, rotated[:, :, a, :, b], rtol=2.0e-13, atol=2.0e-13)
-
-
-@pytest.mark.parametrize("tnp", [
-    np.zeros((2, 3)),
-    np.array([[0.0, 0.0, 0.0], [0.0, np.pi, 0.0]]),   # σ_y with a half glide
-])
-def test_orbit_labels_match_the_pullback_union_find(tnp):
-    """Same partition as permutation_orbit_labels(fft_grid_pullback_perm)."""
-    labels = real_space_orbit_labels(_SYMS, tnp, _FFT)
-    reference = permutation_orbit_labels(
-        fft_grid_pullback_perm(_SYMS, tnp, _FFT))
-    n_rtot = int(np.prod(_FFT))
-    assert labels.shape == (n_rtot,)
-    # A label is the orbit's smallest flat index, so it names its own orbit.
-    assert np.all(labels[labels] == labels)
-    # Partitions agree: the label pairs are in bijection.
-    pairs = {(int(a), int(b)) for a, b in zip(labels, reference)}
-    assert len({a for a, _ in pairs}) == len(pairs) == len({b for _, b in pairs})
-    # Nontrivial: σ_y (with or without the glide) pairs up most points.
-    sizes = np.bincount(labels)
-    sizes = sizes[sizes > 0]
-    assert sizes.max() == 2 and (sizes == 2).sum() > 50
 
 
 def test_unavailable_unused_rows_preserve_canonical_trs_unfold():

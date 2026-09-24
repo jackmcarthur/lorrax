@@ -304,7 +304,8 @@ OWNED_FILES = (
 #: grammar can be fixed here without splitting the knob across packages.
 OWNED_BOOL_KNOBS = (
     "LORRAX_EXIT_AFTER_ZETA",
-    "LORRAX_MALLOC_TRIM",
+    # LORRAX_MALLOC_TRIM retired 2026-09-24 with the r-tile ζ loop, its only
+    # reader (the per-r-chunk malloc_trim); route G has no such hook.
     # Read once, in gw_init's ζ-reuse gate — previously through a lazy
     # ``from isdf.core import _env_bool`` (the last consumer of that
     # helper); collapsed onto the module-scope env_bool import.

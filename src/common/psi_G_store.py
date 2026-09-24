@@ -15,14 +15,11 @@ staging pipeline:
   ny, nz)``.
 * :meth:`PsiGStore.read_local_band_chunk` returns one bc's per-rank
   band slab via ``io_callback``, padded to ``(nk, _bpd_max, ns,
-  ngkmax)`` so the enclosing ``lax.scan`` body sees a static return
-  shape.  :func:`isdf.core.build_psi_r_cache_sm` iterates band chunks via
-  ``lax.scan`` inside its ``shard_map`` body, pulling one bc per iteration
-  via the slicer.  The resulting ψ(r) cache is band-flat-sharded over the
-  full mesh.
+  ngkmax)`` so the enclosing ``shard_map`` body sees a static return
+  shape.
 
-The store populates once and can either feed the one-time ψ(r) cache build or
-serve repeated r chunks through :meth:`PsiGStore.iter_rchunk_bandwise`.  Its
+The store populates once and serves repeated r chunks through
+:meth:`PsiGStore.iter_rchunk_bandwise`.  Its
 host footprint is one band shard per process-addressable mesh cell; the
 process total is the exact sum of those local tiles (one tile in the usual
 one-rank-per-GPU launch).
@@ -118,8 +115,8 @@ def assert_band_chunks_divisible(band_chunk_ranges, world_size: int) -> None:
 
     ``gw.isdf_fitting`` fixed the PRODUCTION path on 2026-08-17 by padding
     the transport range up to a ``P`` multiple (``_bfe_transport``), and
-    ``isdf.core.z_q_from_psi_sm`` carries an equivalent consumer-side
-    check.  Neither makes this one redundant: a guard living in ONE
+    the r-tile Z_q build carried an equivalent consumer-side check.
+    Neither made this one redundant: a guard living in ONE
     consumer is a guard the next consumer does not have, and the padding
     lives in ONE producer.  This function is on the object that performs
     the division, which is the only place every caller must pass through.
@@ -384,9 +381,8 @@ class PsiGStore:
     # ---------------------------------------------------------------------
     # Round 6 Phase 2 restoration of the helper originally added in
     # commit ``cdd0fba`` and removed in ``5cadd4b`` when the (now-buggy)
-    # flat-axis ``psi_G_device_full`` path took over.  The production consumer
-    # is the io_callback inside ``build_psi_r_cache_sm``'s ``lax.scan`` body;
-    # ``z_q_from_psi_sm`` retains a compatibility-only direct consumer.
+    # flat-axis ``psi_G_device_full`` path took over.  The consumer is the
+    # io_callback inside the r-chunk source kernels below.
     #
     # Static-shape contract: ``io_callback`` requires its ``out_sds`` to
     # be static at trace time, AND ``lax.scan`` requires the body output
@@ -444,8 +440,7 @@ class PsiGStore:
 
         Lifetime contract: host tiles must remain valid for the full
         duration of the enclosing kernel jit because ``io_callback`` fires
-        asynchronously inside ``lax.scan``.  ``isdf_fitting.py`` blocks on
-        the completed ψ(r) cache before closing this store.
+        asynchronously inside the kernel.
         """
         if getattr(self, "_closed", False):
             raise RuntimeError(
@@ -465,10 +460,6 @@ class PsiGStore:
         out = np.zeros((nk, self._bpd_max, ns, ngkmax), dtype=tile.dtype)
         out[:, : b_hi - b_lo, :, :] = tile[:, b_lo:b_hi, :, :]
         return out
-
-    def _slice_local_tile_bc(self, x_idx, y_idx, bc_idx) -> np.ndarray:
-        """Compatibility adapter; new consumers use the public method."""
-        return self.read_local_band_chunk(x_idx, y_idx, bc_idx)
 
     def _rchunk_kernel(self, n_r_carrier: int):
         """One cached host-store → band-sharded r-carrier executable."""

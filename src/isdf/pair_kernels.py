@@ -10,8 +10,8 @@ its resident ψ(G) slice once, so no batch pays a conjugate pass over the
 large operand.  Each side is one batched complex GEMM over the raw parents
 k̄ (batch k̄, M = ns·b, K = bands, N = ns·cols) on a k-leading contiguous
 ψ̄ ``(n_parent, nb, ns, cols)``, which needs no operand transpose.  Band
-chunks accumulate in one ``lax.scan``.  The consumer is
-:func:`isdf.core.parent_projector_kconv`.
+chunks accumulate in one ``lax.scan``.  The consumer is route G's
+k-convolution (:func:`ffi.fft.make_fused_conv_kplane`).
 """
 from __future__ import annotations
 
@@ -40,7 +40,7 @@ def pair_projectors_lr(x_b, psi_bar_chunk, w_l, w_r):
     Returns
     -------
     D_l, D_r : (n_parent, ns, b, ns, cols) complex128
-        The operands of :func:`isdf.core.parent_projector_kconv`.
+        The operands of :func:`ffi.fft.make_fused_conv_kplane`.
         Bytes ``2·n_parent·ns²·b·cols·16`` (plus one chunk's pair while a
         scan adds it).
     """

@@ -1,15 +1,10 @@
 """Arbitrary-flat-r-point twins of the contiguous slab helpers.
 
-A parent-k ζ-fit kernel processes real-space *tiles* whose grid points are
-a symmetry orbit, so they are scattered through the flat r index rather
-than contiguous in it.  Three helpers grew arbitrary-point variants for
-that consumer, and this file is their gate:
+The retired r-tile ζ-fit kernel processed real-space *tiles* whose grid
+points are a symmetry orbit, so they are scattered through the flat r index
+rather than contiguous in it.  Helpers grew arbitrary-point variants for
+that consumer, and this file gates the ones that remain:
 
-* :func:`common.wfn_transforms.to_rpoints_inner` — the twin of
-  ``to_rchunk_inner``.  On a contiguous index list it must agree with the
-  slab version BIT FOR BIT (it is the same math with a gather in place of
-  a ``dynamic_slice``); on a permuted list it must agree with a numpy
-  gather of the full-box reference.
 * :func:`common.wfn_transforms.accumulate_rchunk_to_gflat` with
   ``r_indices=`` — the scatter twin of its ``r0=`` path, including the
   per-q Bloch phase, which must be looked up at the tile's own cells and
@@ -37,69 +32,6 @@ import pytest
 #: Scatter order can differ between the r0 and r_indices paths, so the
 #: permuted comparisons are allclose rather than exact.
 _TOL = 1.0e-13
-
-
-def _case_rpoints() -> dict:
-    """``to_rpoints_inner`` vs ``to_rchunk_inner`` on the same synthetic ψ."""
-    import numpy as np
-    import jax.numpy as jnp
-
-    from common.wfn_transforms import to_rchunk_inner, to_rpoints_inner
-
-    rng = np.random.default_rng(20260905)
-    fft_grid = (4, 4, 4)
-    n_rtot = 64
-    nk, nb, ns, ngkmax = 2, 3, 1, 9
-    r0, r_len = 16, 8
-
-    psi = jnp.asarray(
-        rng.standard_normal((nk, nb, ns, ngkmax))
-        + 1j * rng.standard_normal((nk, nb, ns, ngkmax)),
-        dtype=jnp.complex128)
-    # Sentinel ``ngkmax`` in most cells: only a handful of box cells hold a
-    # G coefficient, exactly as a real G-sphere does.
-    # The per-k sphere index (common.gvec_fft_box.build_sphere_box_index):
-    # slot g sits in box cell g_index[k, g].
-    g_index = np.zeros((nk, ngkmax), dtype=np.int32)
-    for k in range(nk):
-        g_index[k] = rng.choice(n_rtot, size=ngkmax, replace=False)
-    g_index_j = jnp.asarray(g_index)
-    # Non-trivial k vectors: a zero phase would hide a wrong phase lookup.
-    kvecs = jnp.asarray([[0.25, -0.5, 0.125], [-0.375, 0.25, 0.5]],
-                        dtype=jnp.float64)
-
-    slab = np.asarray(to_rchunk_inner(
-        psi, g_index_j, fft_grid, r0, r_len, kvecs_frac=kvecs))
-    contiguous = np.asarray(to_rpoints_inner(
-        psi, g_index_j, fft_grid,
-        jnp.arange(r0, r0 + r_len, dtype=jnp.int32), kvecs_frac=kvecs))
-
-    # Full-box reference, gathered in numpy — the independent check that
-    # an arbitrary order picks the cells it names.
-    full = np.asarray(to_rchunk_inner(
-        psi, g_index_j, fft_grid, 0, n_rtot, kvecs_frac=kvecs))
-    perm = rng.permutation(n_rtot)[:r_len].astype(np.int32)
-    permuted = np.asarray(to_rpoints_inner(
-        psi, g_index_j, fft_grid, jnp.asarray(perm), kvecs_frac=kvecs))
-
-    # Out-of-range cells are pad slots: the gathers stay in bounds (so the
-    # values are finite, not NaN), and the CALLER's mask zeroes them.
-    oob = np.array([r0, n_rtot, r0 + 1, n_rtot + 6, -3, r0 + 2],
-                   dtype=np.int32)
-    padded = np.asarray(to_rpoints_inner(
-        psi, g_index_j, fft_grid, jnp.asarray(oob), kvecs_frac=kvecs))
-    keep = ((oob >= 0) & (oob < n_rtot))
-    masked = padded * keep.astype(np.complex128)
-
-    return {
-        "contiguous_bit_identical": bool(np.array_equal(contiguous, slab)),
-        "permuted_max_abs": float(
-            np.max(np.abs(permuted - full[..., perm]))),
-        "padded_all_finite": bool(np.all(np.isfinite(padded))),
-        "masked_pad_all_zero": bool(np.all(masked[..., ~keep] == 0)),
-        "masked_kept_matches": bool(np.array_equal(
-            masked[..., keep], full[..., oob[keep]])),
-    }
 
 
 def _case_gflat() -> dict:
@@ -276,7 +208,6 @@ def _case_store_ibz() -> dict:
 
 
 _WORKERS = {
-    "rpoints": _case_rpoints,
     "gflat": _case_gflat,
     "store_ibz": _case_store_ibz,
 }
@@ -313,22 +244,6 @@ def _run_worker(case_name: str, ndev: int = 4, timeout: int = 300):
     lines = [ln for ln in res.stdout.splitlines() if ln.strip().startswith("{")]
     assert lines, f"no JSON from worker.\nSTDOUT:\n{res.stdout}\nSTDERR:\n{res.stderr}"
     return json.loads(lines[-1])
-
-
-def test_to_rpoints_inner_matches_the_contiguous_slab():
-    out = _run_worker("rpoints")
-    assert out["contiguous_bit_identical"], (
-        "to_rpoints_inner on r0 + arange must reproduce to_rchunk_inner "
-        "bit for bit")
-    assert out["permuted_max_abs"] < _TOL, (
-        "a permuted index list must gather the cells it names: max abs diff "
-        f"{out['permuted_max_abs']:.3e}")
-    assert out["padded_all_finite"], (
-        "out-of-range indices must clip into bounds, not produce NaN/inf")
-    assert out["masked_pad_all_zero"]
-    assert out["masked_kept_matches"], (
-        "the in-range cells of a padded index list must be untouched by "
-        "the presence of pad slots")
 
 
 def test_indexed_gflat_accumulate_matches_the_r0_path():

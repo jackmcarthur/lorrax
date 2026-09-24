@@ -2,12 +2,11 @@
 from __future__ import annotations
 
 import ast
+import gc
 from pathlib import Path
 
 import jax
 import jax.numpy as jnp
-
-from gw.isdf_fitting import _collect_fit_setup_garbage
 
 
 _SOURCE = Path(__file__).resolve().parents[1] / "src/gw/isdf_fitting.py"
@@ -30,7 +29,7 @@ def test_fit_cleanup_preserves_an_identical_jit_executable():
     value = jnp.arange(8, dtype=jnp.float32)
 
     kernel(value).block_until_ready()
-    _collect_fit_setup_garbage()
+    gc.collect()                       # fit_zeta_to_h5's setup cleanup
     kernel(value).block_until_ready()
 
     assert traces["count"] == 1
@@ -58,8 +57,10 @@ def test_fit_zeta_to_h5_uses_only_the_cache_preserving_cleanup():
     calls = [node.func for node in ast.walk(fit) if isinstance(node, ast.Call)]
 
     assert any(
-        isinstance(call, ast.Name)
-        and call.id == "_collect_fit_setup_garbage"
+        isinstance(call, ast.Attribute)
+        and isinstance(call.value, ast.Name)
+        and call.value.id == "gc"
+        and call.attr == "collect"
         for call in calls
     )
     assert not any(

@@ -10,8 +10,8 @@ mesh carriers through ``runtime.padding``.
    (ψ(G) sharded on its G slice); pad centroid slots and pad G columns must
    be exactly zero.  Red twin: the column store left unconjugated.
 2. The parent-k k-convolution is not here: since the k-convolution router
-   (cef4407c) ``parent_projector_kconv`` has no XLA arm to compare against,
-   and ``tests/multi_device/kconv_router_p4.py`` owns its parity (every
+   (cef4407c) it has no XLA arm to compare against, and
+   ``tests/multi_device/kconv_router_p4.py`` owns its parity (every
    router mode against np.fft, with red twins).
 
 Parity at 1e-13 max-abs relative; each red twin must miss by > 1e-3.

@@ -2,9 +2,10 @@
 
 The transverse (bispinor mu_L=1,2,3) CCT is Hermitian indefinite; its
 factor is a per-q pivoted LU with ridge.  Historically the LU was fused
-into ``solve_zeta`` and re-run on EVERY r-chunk; ``factor_c_q`` now runs
-it ONCE per channel (``isdf.core._factor_c_q_transverse_lu``) and
-``solve_zeta`` only applies ``lax.linalg.lu_solve`` per r-chunk.
+into the back-solve and re-run on EVERY r-chunk; ``factor_c_q`` now runs
+it ONCE per channel (``isdf.core._factor_c_q_transverse_lu``) and the
+back-solve only applies ``lax.linalg.lu_solve`` (route G:
+``isdf.zeta_mubatch._logical_solve('lu')``, vmapped over q per G tile).
 
 The hoist's whole contract is the same as the charge fold's
 (``test_zeta_mesh_invariance.test_qparallel_execution_is_bit_identical_to_replicated``):
@@ -14,10 +15,10 @@ lowers to ``lax.linalg.lu(A)`` + ``lax.linalg.lu_solve(lu, perm, b, 0)``
 (jax ``lax_linalg._solve``), and the hoisted stage runs exactly those two
 ops on exactly the ridged matrix the fused path built, so the gate below
 demands EXACT bit equality of ζ against the preserved fused path (raw
-CCT + ``lu_piv=None``) across:
+CCT through the ridged ``jnp.linalg.solve``,
+``isdf.core._zeta_logical_solvers(n)[0]``) across:
 
 * CPU meshes 1x1 / 2x2 / 1x4 (``--xla_force_host_platform_device_count``),
-* both back-solve gather tiers (``replicated`` / ``local``),
 * both factor schedules (``LORRAX_ZETA_QPARALLEL`` 0 / 1),
 * multiple r-chunks against ONE factor (the reuse that motivates the
   hoist),
@@ -46,6 +47,27 @@ import pytest
 _NDEV = 4
 
 
+def _per_q(fn, *operands):
+    """Apply a per-q logical-extent solve over the q axis (route G's
+    ``jax.vmap(one)(F, Z)``), host result."""
+    import numpy as np
+    import jax
+    return np.asarray(jax.device_get(jax.jit(jax.vmap(fn))(*operands)))
+
+
+def _fused(n_log):
+    """The preserved FUSED path: ridged ``jnp.linalg.solve`` on the raw CCT."""
+    from isdf.core import _zeta_logical_solvers
+    return _zeta_logical_solvers(n_log)[0]
+
+
+def _hoisted(n_log):
+    """Route G's application of the hoisted ``(LU, perm)`` factor."""
+    from isdf.zeta_mubatch import _logical_solve
+    one = _logical_solve('lu', n_log)
+    return lambda LU, piv, Z: one((LU, piv), Z)
+
+
 def _worker_hoist() -> int:
     """Child: hoisted factor+solve vs the fused path, exact equality."""
     import numpy as np
@@ -53,7 +75,7 @@ def _worker_hoist() -> int:
     import jax.numpy as jnp
     from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
-    from isdf import factor_c_q, solve_zeta
+    from isdf import factor_c_q
     import isdf.core as core
 
     devs = jax.devices()
@@ -103,37 +125,23 @@ def _worker_hoist() -> int:
                 C_dev, mesh, vertex_mu_L=1, n_rmu_logical=n_log,
                 solver_kind='lu')
             assert piv is not None and piv.shape == (nq, n_log), piv.shape
-            for gather in ('replicated', 'local'):
-                for q_chunk in (2, nq):
-                    ref1 = np.asarray(jax.device_get(solve_zeta(
-                        L_fused, jax.device_put(jnp.asarray(Z), in_sh),
-                        mesh, q_chunk, vertex_mu_L=1, solver_kind='lu',
-                        n_rmu_logical=n_log, zeta_gather=gather)))
-                    ref2 = np.asarray(jax.device_get(solve_zeta(
-                        L_fused, jax.device_put(jnp.asarray(Z2), in_sh),
-                        mesh, q_chunk, vertex_mu_L=1, solver_kind='lu',
-                        n_rmu_logical=n_log, zeta_gather=gather)))
-                    # ONE hoisted factor, TWO r-chunks (the reuse).
-                    got1 = np.asarray(jax.device_get(solve_zeta(
-                        LU, jax.device_put(jnp.asarray(Z), in_sh),
-                        mesh, q_chunk, vertex_mu_L=1, solver_kind='lu',
-                        n_rmu_logical=n_log, zeta_gather=gather,
-                        lu_piv=piv)))
-                    got2 = np.asarray(jax.device_get(solve_zeta(
-                        LU, jax.device_put(jnp.asarray(Z2), in_sh),
-                        mesh, q_chunk, vertex_mu_L=1, solver_kind='lu',
-                        n_rmu_logical=n_log, zeta_gather=gather,
-                        lu_piv=piv)))
-                    tag = f"{px}x{py}_qp{force}_{gather}_qc{q_chunk}"
-                    exact[tag] = bool(np.array_equal(ref1, got1)
-                                      and np.array_equal(ref2, got2))
-                    max_abs = max(max_abs,
-                                  float(np.max(np.abs(ref1 - got1))),
-                                  float(np.max(np.abs(ref2 - got2))))
-                    # Pad rows of zeta must be exactly zero on both paths.
-                    if n_pad > n_log:
-                        exact[tag] = exact[tag] and bool(
-                            np.all(got1[:, n_log:, :] == 0.0))
+            Z_dev = jax.device_put(jnp.asarray(Z), in_sh)
+            Z2_dev = jax.device_put(jnp.asarray(Z2), in_sh)
+            ref1 = _per_q(_fused(n_log), L_fused, Z_dev)
+            ref2 = _per_q(_fused(n_log), L_fused, Z2_dev)
+            # ONE hoisted factor, TWO r-chunks (the reuse).
+            got1 = _per_q(_hoisted(n_log), LU, piv, Z_dev)
+            got2 = _per_q(_hoisted(n_log), LU, piv, Z2_dev)
+            tag = f"{px}x{py}_qp{force}"
+            exact[tag] = bool(np.array_equal(ref1, got1)
+                              and np.array_equal(ref2, got2))
+            max_abs = max(max_abs,
+                          float(np.max(np.abs(ref1 - got1))),
+                          float(np.max(np.abs(ref2 - got2))))
+            # Pad rows of zeta must be exactly zero on both paths.
+            if n_pad > n_log:
+                exact[tag] = exact[tag] and bool(
+                    np.all(got1[:, n_log:, :] == 0.0))
     os.environ.pop('LORRAX_ZETA_QPARALLEL', None)
     print(json.dumps({"exact": exact, "max_abs": max_abs}))
     return 0
@@ -150,7 +158,7 @@ def _worker_ridge_effect() -> int:
     import jax.numpy as jnp
     from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
-    from isdf import factor_c_q, solve_zeta
+    from isdf import factor_c_q
 
     devs = jax.devices()
     rng = np.random.default_rng(7)
@@ -171,9 +179,7 @@ def _worker_ridge_effect() -> int:
     C_dev = jax.device_put(jnp.asarray(C), in_sh)
     LU, piv = factor_c_q(C_dev, mesh, vertex_mu_L=1, n_rmu_logical=n,
                          solver_kind='lu')
-    zeta = np.asarray(jax.device_get(solve_zeta(
-        LU, jax.device_put(jnp.asarray(Z), in_sh), mesh, nq,
-        vertex_mu_L=1, solver_kind='lu', n_rmu_logical=n, lu_piv=piv)))
+    zeta = _per_q(_hoisted(n), LU, piv, jax.device_put(jnp.asarray(Z), in_sh))
     print(json.dumps({
         "finite": bool(np.all(np.isfinite(zeta))),
         "log10_norm": float(np.log10(np.linalg.norm(zeta))),
@@ -188,7 +194,7 @@ def _worker_batch_reshard_hoist() -> int:
     import jax.numpy as jnp
     from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
-    from isdf import factor_c_q, solve_zeta
+    from isdf import factor_c_q
     import isdf.core as core
 
     devs = jax.devices()
@@ -236,18 +242,9 @@ def _worker_batch_reshard_hoist() -> int:
     got = []
     ref = []
     for Z in (Z1, Z2):
-        ref.append(np.asarray(jax.device_get(solve_zeta(
-            C_raw, jax.device_put(jnp.asarray(Z), xy), mesh, 2,
-            vertex_mu_L=1, solver_kind='lu',
-            n_rmu_logical=n))))
-        # solve_zeta donates the Z carrier on this path.  Give the hoisted
-        # arm its own identical device array instead of reusing a deleted
-        # test fixture.
-        got.append(np.asarray(jax.device_get(solve_zeta(
-            LU, jax.device_put(jnp.asarray(Z), xy), mesh, 2,
-            vertex_mu_L=1, solver_kind='cusolvermp_lu',
-            n_rmu_logical=n, lu_piv=piv,
-            distrib_la_batched_route='batch_reshard'))))
+        Z_dev = jax.device_put(jnp.asarray(Z), xy)
+        ref.append(_per_q(_fused(n), C_raw, Z_dev))
+        got.append(_per_q(_hoisted(n), LU, piv, Z_dev))
     print(json.dumps({
         "factor_calls": calls,
         "exact": bool(all(np.array_equal(a, b) for a, b in zip(got, ref))),
@@ -281,9 +278,9 @@ def _run_worker(tag: str, timeout: int = 900):
 
 
 def test_hoisted_transverse_lu_is_bit_identical_to_fused():
-    """factor_c_q's hoisted (LU, perm) + solve_zeta's lu_solve reproduce
+    """factor_c_q's hoisted (LU, perm) + route G's lu_solve reproduce
     the fused per-r-chunk jnp.linalg.solve path EXACTLY — every mesh,
-    both gather tiers, both factor schedules, two r-chunks per factor."""
+    both factor schedules, two r-chunks per factor."""
     out = _run_worker("worker_hoist")
     if "skip" in out:
         pytest.skip(f"hoist gate: {out['skip']}")

@@ -779,8 +779,8 @@ def test_gamma_factor_average_is_covariant_with_nonzero_mixed_blocks():
     assert np.max(np.abs(wrong-expected)) > .1
 
 
-def test_signed_current_z_host_store_fft_cancels_in_normal_solve():
-    """Actual parent host-store and k FFT tails give C=-Q and Z=-RHS for Gamma2, which cancel in the solve."""
+def test_signed_current_parent_c_and_dense_z_cancel_in_normal_solve():
+    """Parent C_q (c_q_from_psi_sm) and the dense Z reference that route G is gated against give C=-Q and Z=-RHS for Gamma2, which cancel in the solve."""
     import importlib.util
     path = Path(__file__).resolve().parents[1] / 'test_isdf_zq_parent_parity.py'
     spec = importlib.util.spec_from_file_location('parent_z_oracle', path)

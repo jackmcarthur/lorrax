@@ -61,8 +61,7 @@ def _function_tree(name):
 def _fit_zeta_tree():
     mod, entry = _function_tree("fit_zeta")
     owners = {"fit_zeta", "_reuse_zeta_faces", "_plan_transverse_zeta",
-              "_fit_charge_zeta_channel", "_transverse_zeta_channel_runner",
-              "_run_transverse_zeta_schedule", "_fit_transverse_zeta_channels"}
+              "_fit_charge_zeta_channel", "_fit_transverse_zeta_channels"}
     return mod, ast.Module(body=[n for n in mod.body
                                 if isinstance(n, ast.FunctionDef)
                                 and n.name in owners], type_ignores=[])
@@ -159,7 +158,7 @@ def test_reuse_contract_precedes_and_bypasses_fit_only_planners():
 
 def test_only_missing_channels_reach_fit_writers():
     _, fit_zeta = _fit_zeta_tree()
-    fits = _calls(fit_zeta, "fit_zeta_to_h5")
+    fits = sorted(_calls(fit_zeta, "fit_zeta_to_h5"), key=lambda n: n.lineno)
     assert len(fits) == 2, (
         "expected the incumbent charge and transverse fit call sites only; "
         "found %d" % len(fits))
@@ -171,14 +170,23 @@ def test_only_missing_channels_reach_fit_writers():
     assert len(charge_guards) == 1, (
         "the charge writer is not exclusively in the non-reuse branch")
 
-    channel = _nested_function(fit_zeta, "_fit_transverse_channel")
-    assert any(x is fits[1] for x in ast.walk(channel))
-    skip = next((n for n in channel.body if isinstance(n, ast.If)
-                 and ast.unparse(n.test) == "_reuse_T[mu_L - 1]"), None)
+    channels = _nested_function(fit_zeta, "_fit_transverse_zeta_channels")
+    assert any(x is fits[1] for x in ast.walk(channels))
+    missing = next((n for n in channels.body if isinstance(n, ast.Assign)
+                    and ast.unparse(n.targets[0]) == "missing"), None)
+    assert missing is not None and "not _reuse_T[mu - 1]" in ast.unparse(
+        missing.value), "the writer's channel list does not exclude accepted files"
+    skip = next((n for n in channels.body if isinstance(n, ast.If)
+                 and ast.unparse(n.test) == "not missing"), None)
     assert skip is not None and any(isinstance(n, ast.Return)
                                     for n in ast.walk(skip)), (
-        "an accepted transverse artifact does not return before the writer")
-    assert skip.lineno < fits[1].lineno
+        "a fully accepted current family does not return before the writer")
+    assert missing.lineno < skip.lineno < fits[1].lineno
+    outputs = next(kw.value for kw in fits[1].keywords
+                   if kw.arg == "output_files")
+    assert isinstance(outputs, ast.DictComp) and ast.unparse(
+        outputs.generators[0].iter) == "missing", (
+        "the current writer is handed channels other than the missing ones")
 
 
 def test_bispinor_reuse_path_returns_rebuilt_transverse_data():
@@ -255,9 +263,8 @@ def test_every_fresh_channel_gates_rank_findings_before_stamp():
                    key=lambda n: n.lineno)
     stamps = sorted(_calls(fit_zeta, "stamp_fit_provenance"),
                     key=lambda n: n.lineno)
-    assert len(fits) == len(stamps) == 2 and len(gates) == 3, (
-        "charge/transverse need one final gate each, plus the coupled "
-        "schedule's deferred-finding drain callback")
+    assert len(fits) == len(stamps) == len(gates) == 2, (
+        "charge/transverse need one final gate each")
     assert fits[0].lineno < gates[0].lineno < stamps[0].lineno, (
         "fresh charge does not cross the rank-finding seam before stamping")
 
@@ -270,20 +277,15 @@ def test_every_fresh_channel_gates_rank_findings_before_stamp():
     assert len(charge_gate_guards) == 1, (
         "an accepted charge artifact can still enter the fresh-fit gate")
 
-    channel = _nested_function(fit_zeta, "_fit_transverse_channel")
-    skip = next(n for n in channel.body if isinstance(n, ast.If)
-                and ast.unparse(n.test) == "_reuse_T[mu_L - 1]")
-    channel_gates = _calls(channel, "_gate_fresh_zeta_rank_findings")
-    channel_stamps = _calls(channel, "stamp_fit_provenance")
+    channels = _nested_function(fit_zeta, "_fit_transverse_zeta_channels")
+    fresh = next(n for n in channels.body if isinstance(n, ast.For)
+                 and ast.unparse(n.iter) == "missing")
+    channel_gates = _calls(fresh, "_gate_fresh_zeta_rank_findings")
+    channel_stamps = _calls(fresh, "stamp_fit_provenance")
     assert len(channel_gates) == len(channel_stamps) == 1
-    assert (skip.lineno < fits[1].lineno < channel_gates[0].lineno
-            < stamps[1].lineno), (
-        "transverse resume/fit/gate/stamp ordering is not fail-closed")
-    assert all(any(x is call for x in ast.walk(channel))
-               for call in (fits[1], channel_gates[0], channel_stamps[0]))
-
-    drain = _nested_function(fit_zeta, "_drain_coupled_rank_findings")
-    assert len(_calls(drain, "_gate_fresh_zeta_rank_findings")) == 1
+    assert (fits[1].lineno < channel_gates[0].lineno
+            < channel_stamps[0].lineno == stamps[1].lineno), (
+        "transverse fit/gate/stamp ordering is not fail-closed")
 
 
 if __name__ == "__main__":
