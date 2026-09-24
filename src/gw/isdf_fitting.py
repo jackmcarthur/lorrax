@@ -432,9 +432,9 @@ def _fit_mubatch(
     progress.finish()
     del cbar
     print_fn(_host_mem("pre-V_q (Z store full)"))
-    print_fn(f"  μ-batch timing: {n_run} batches {t_batch:.2f}s (store write "
-             f"{sum(st.t_write for st in stores):.2f}s, {plan.placement}, overlapped "
-             "with the next batch)")
+    print_fn(f"  μ-batch timing: {n_run} batches {t_batch:.2f}s (store write incl. "
+             f"the wait on the in-flight batch {sum(st.t_write for st in stores):.2f}s, "
+             f"{plan.placement}, overlapped with the next batch)")
 
     # ---- ζ = C⁻¹ Z, held lazily; written only for a file consumer --------
     zetas = {}
