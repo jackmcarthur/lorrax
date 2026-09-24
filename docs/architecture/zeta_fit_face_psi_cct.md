@@ -121,11 +121,13 @@ be replicated refuses, and the refusal names the per-batch bytes.
   moves them to batch layout once), and only the right-hand side moves.
 - **`replicated`.** The whole stack is replicated on every rank.
 
-Under `linalg = local` the tier is automatic. It is `local` when
-ceil(Q/P)·P ≤ 2Q, or when Q·μ²·16 exceeds `LORRAX_ZETA_GATHER_CAP_GIB`
-(default 4 GiB), and `replicated` otherwise, which covers a few q on many
-ranks. `linalg = distributed` resolves to the distributed tier, which route G
-refuses (`GATE zeta-mubatch-tier`). Route G applies either tier's factor tile
+The tier is automatic on every layout (`zeta_auto_tier`, read by the resolver
+and the planner alike). It is `local` when ceil(Q/P)·P ≤ 2Q, or when Q·μ²·16
+exceeds `LORRAX_ZETA_GATHER_CAP_GIB` (default 4 GiB), and `replicated`
+otherwise, which covers a few q on many ranks. Both tiers apply the same
+whole-tile factor, bit for bit. `linalg` does not select the tier:
+`linalg = distributed` distributes the W Dyson solve, the transverse LU and
+the eigensolvers, never the ζ back-solve. Route G applies the factor tile
 by tile ([finalize](zeta_fit_mubatch.md#finalize-v_q-and-the-head-columns)).
 
 **Current channels.** C_q^i is a Hermitian indefinite, signed Gram. The fit
