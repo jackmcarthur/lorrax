@@ -4642,12 +4642,14 @@ def _sc_probe_residual_split(H_in, H_out, U_in, e_in_ev):
 
 
 def _sigma_onshell_slope(inputs, state_out):
-    """DIAGNOSTIC / A/B: Re dSigma_c,nn/domega on the segment E_n sits on.
+    """DIAGNOSTIC / A/B: on-shell Sigma_c slope and its segment, per state.
 
     The map evaluates Sigma_c(E_n) by linear interpolation of its omega grid
-    (``qsgw_utils.interp_along_omega``), so this segment slope is the map's
-    exact diagonal on-shell Jacobian dF_nn/dE_n.  Outside the grid the map
-    uses Sigma(omega=0): slope 0.  Shape (nk_loop, nb), input QP order.
+    (``qsgw_utils.interp_along_omega``), so the slope s_n of the segment E_n
+    sits on is the map's exact diagonal on-shell Jacobian dF_nn/dE_n.
+    Outside the grid the map uses Sigma(omega=0): slope 0.  Returns
+    (slope, e_rel, seg_lo, seg_hi), each (nk_loop, nb) in input QP order
+    (eV); None when the map has no dynamic Sigma.
     """
     from .qsgw_utils import extract_sigma_diag_replicated
     sigma = state_out.outputs.sigma_result
@@ -4667,38 +4669,65 @@ def _sigma_onshell_slope(inputs, state_out):
     kk = np.arange(e_rel.shape[0])[:, None]
     nn = np.arange(e_rel.shape[1])[None, :]
     slope = np.real(sig[hi, kk, nn] - sig[lo, kk, nn]) / (om[hi] - om[lo])
-    return np.where(inside, slope, 0.0)
+    seg_lo = np.where(inside, om[lo], -np.inf)
+    seg_hi = np.where(inside, om[hi], np.inf)
+    return np.where(inside, slope, 0.0), e_rel, seg_lo, seg_hi
 
 
 def _z_precondition_residual(inputs, state_out, H_in, e_in_ev, *, print_fn):
-    """A/B candidate: per-state Newton (Z) step on the diagonal of f = F(H) - H.
+    """A/B candidate: linearized-QSGW (Z) Newton step on f = F(H) - H.
 
-    In the input QP basis U, dF_nn/dE_n = s_n (``_sigma_onshell_slope``), so
-    the diagonal Newton step for state n is Z_n f_nn with Z_n = 1/(1 - s_n):
-    the linearized quasiparticle equation, the same Z the eqp1 column uses.
-    It is applied only where 1 - s_n >= 1/2 (|Z| <= 2): damping of every
-    overshooting (s < 0) state and up to 2x extrapolation of slow ones; a
-    state whose QP equation is near-singular or expansive keeps the plain
-    step, which Anderson owns.  Off-diagonal entries unchanged.
+    With Sigma_c(omega) linear on the segment each E_n sits on, slope s_n,
+    the QSGW ansatz H_out = h + sum_mn |m><m| (Sigma(E_m)+Sigma(E_n))/2 |n><n|
+    responds to an input change dH (input QP basis) as
+    dH_out,mn = (s_m + s_n)/2 dH_mn.  The Newton step on the residual is
+    therefore f_mn / d_mn with d_mn = 1 - (s_m + s_n)/2 -- the per-state Z
+    of the eqp1 column on the diagonal, its pair mean off it.  No parameter;
+    the only guards are the model's own domain:
+
+    * 0 < Z <= 1 (damping an overshooting state or pair) is always taken;
+    * Z > 1 or Z < 0 (a slow or expansive state) is taken on the diagonal
+      only when the Newton target E_n + Z f_nn stays on the segment whose
+      slope defined it, where the diagonal model is exact; otherwise, and
+      always off the diagonal, the plain step (Z = 1) -- Anderson owns it.
     """
     from common.collectives import gather_to_host
     f_dev = state_out.H_qp_dft - H_in
-    slope = _sigma_onshell_slope(inputs, state_out)
-    if slope is None:
+    got = _sigma_onshell_slope(inputs, state_out)
+    if got is None:
         return f_dev
-    z = np.where(1.0 - slope >= 0.5, 1.0 / (1.0 - slope), 1.0)
+    slope, e_rel, seg_lo, seg_hi = got
     f = np.asarray(gather_to_host(f_dev))
     nb = f.shape[-1]
-    zz = z[:, :nb] if z.shape[1] >= nb else np.pad(
-        z, ((0, 0), (0, nb - z.shape[1])), constant_values=1.0)
+    ns = min(nb, slope.shape[1])
+    s_n = np.zeros((f.shape[0], nb))
+    s_n[:, :ns] = slope[:, :ns]
     u = np.asarray(gather_to_host(state_out.outputs.sigma_basis_U))[:, :nb, :nb]
     fq = np.einsum("kim,kij,kjn->kmn", np.conj(u), f, u, optimize=True)
-    dq = np.diagonal(fq, axis1=1, axis2=2) * (zz - 1.0)
-    f = f + np.einsum("kim,km,kjm->kij", u, dq, np.conj(u), optimize=True)
-    print_fn(f"    SC Z-precondition: {int((z != 1.0).sum())} of {z.size} states; "
-             f"Z in [{float(z.min()):.3f}, {float(z.max()):.3f}]; slope range "
-             f"[{float(slope.min()):+.3f}, {float(slope.max()):+.3f}]; "
-             f"{int((1.0 - slope < 0.5).sum())} states left to Anderson")
+    d = 1.0 - 0.5 * (s_n[:, :, None] + s_n[:, None, :])
+    with np.errstate(divide="ignore", invalid="ignore"):
+        z = np.where(d != 0.0, 1.0 / d, 1.0)
+    damp = (z > 0.0) & (z <= 1.0)
+    # Diagonal Newton beyond damping: only when the target stays on the segment.
+    fd = np.real(np.diagonal(fq, axis1=1, axis2=2)) * RYD_TO_EV
+    zd = np.diagonal(z, axis1=1, axis2=2)
+    tgt = np.full(fd.shape, np.nan)
+    tgt[:, :ns] = e_rel[:, :ns] + zd[:, :ns] * fd[:, :ns]
+    lo = np.full(fd.shape, -np.inf); hi = np.full(fd.shape, np.inf)
+    lo[:, :ns], hi[:, :ns] = seg_lo[:, :ns], seg_hi[:, :ns]
+    on_seg = np.isfinite(tgt) & (tgt >= lo) & (tgt <= hi) & np.isfinite(lo) & np.isfinite(hi)
+    zfinal = np.where(damp, z, 1.0)
+    idx = np.arange(nb)
+    diag_ok = np.diagonal(damp, axis1=1, axis2=2) | on_seg
+    zfinal[:, idx, idx] = np.where(diag_ok, zd, 1.0)
+    fq = fq * zfinal
+    f = np.einsum("kim,kmn,kjn->kij", u, fq, np.conj(u), optimize=True)
+    zdiag = zfinal[:, idx, idx]
+    print_fn(f"    SC Z-precondition: diagonal damped {int(np.diagonal(damp, axis1=1, axis2=2).sum())}, "
+             f"Newton beyond damping {int((on_seg & ~np.diagonal(damp, axis1=1, axis2=2)).sum())}, "
+             f"plain {int((~diag_ok).sum())} of {zdiag.size}; Z_diag in "
+             f"[{float(zdiag.min()):+.3f}, {float(zdiag.max()):+.3f}]; slope in "
+             f"[{float(slope.min()):+.3f}, {float(slope.max()):+.3f}]")
     return _place(np.ascontiguousarray(f), inputs.mesh_xy)
 
 
@@ -5939,6 +5968,7 @@ def _run_rcrop(
                     eig_first_diff_max_meV=float(np.abs(
                         _outs[1.0][2] - _e0).max() * 1e3))
                 _sp = _sigma_onshell_slope(inputs, state_out)
+                _sp = None if _sp is None else _sp[0]
                 _din = (_e0 - E_in)            # t=1 input is H_out: sorted E_out(0) - E_in
                 _dout = _outs[1.0][2] - _e0
                 _ok = np.abs(_din) > 0.05e-3
