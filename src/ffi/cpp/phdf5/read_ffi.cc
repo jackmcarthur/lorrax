@@ -19,6 +19,7 @@
 // on non-rank-0 processes under JAX's cuda_async allocator (measured
 // 2026-04-18 on writes; same mechanism applies here).
 
+#include <algorithm>
 #include <chrono>
 #include <complex>
 #include <cstdint>
@@ -892,12 +893,12 @@ static ffi::Error ReadKchunkDispatch(
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-//  Read-kchunk-UNION handler — ONE H5Dread that pulls n_kchunk
-//  non-overlapping hyperslabs of a dataset via H5S_SELECT_OR compound
-//  selection.  Output buffer is (n_kchunk, *per_rank_max_shape); for each
-//  k, the FIRST count[k][d] cells of dim d in that k's output slot get
-//  filled from file offset offset[k][d], and the remaining padding cells
-//  stay at their initial zero.
+//  Read-kchunk-UNION handler — pulls n_kchunk non-overlapping hyperslabs
+//  of a dataset via H5S_SELECT_OR compound selections, one INDEPENDENT
+//  H5Dread per chunk of output rows (the worker below says why).  Output
+//  buffer is (n_kchunk, *per_rank_max_shape); for each k, the FIRST
+//  count[k][d] cells of dim d in that k's output slot get filled from file
+//  offset offset[k][d], and the remaining padding cells are zero.
 //
 //  Caller must guarantee the per-k (offset, count) file slabs are
 //  pairwise disjoint; otherwise HDF5's union-of-hyperslabs deduplicates
@@ -928,14 +929,15 @@ static ffi::Error ReadKchunkDispatch(
 //
 // This is the ONE user of ``ctx->pinned_buf`` on the host build (ctx.h
 // OWNERSHIP): the synchronous readers stage through ``ctx->read_buf``, so
-// nothing on another thread can be inside this buffer here.  Its reuse
-// across tasks is safe because:
+// nothing on another thread can be inside this buffer here.  The task uses
+// it as a two-chunk ring.  Its reuse is safe because:
 //   1. Tasks run strictly sequentially on the writer thread.
 //   2. The task *starts* by ``cudaEventSynchronize(h2d_event)`` which
-//      blocks until the PREVIOUS task's async H2D has drained — so the
-//      ``memset`` + ``H5Dread`` that follow don't stomp a memcpy that's
-//      still reading from ``pinned_buf``.
-//   3. At the end the task records ``h2d_event`` again and syncs
+//      blocks until the PREVIOUS task's async H2D has drained.
+//   3. Inside the task, chunk c's copies are issued only after the event
+//      recorded behind chunk c-1's copies has completed, so the H5Dread of
+//      chunk c+1 never fills the half that a copy is still reading.
+//   4. At the end the task records ``h2d_event`` again and syncs
 //      before firing the Promise, so when downstream XLA reads
 //      ``d_dst`` the H2D is already complete.
 static void async_read_kchunk_union_worker(
@@ -1007,18 +1009,6 @@ static void async_read_kchunk_union_worker(
         }
     }
 
-    if (!ensure_pinned(ctx, bytes)) {
-        std::ostringstream os;
-        os << "phdf5 read_kchunk_union: staging-buffer alloc of " << bytes << " bytes failed";
-        fail_task(ffi::ErrorCode::kResourceExhausted, os.str());
-        return;
-    }
-    // Zero the pinned buffer so padding cells stay at exact zero.
-    std::memset(ctx->pinned_buf, 0, bytes);
-    auto t_pin = now();
-
-    hid_t dxpl = ctx->use_collective_read ? ctx->dxpl_coll : ctx->dxpl_indep;
-
     std::vector<hsize_t> mem_shape(N_out);
     {
         int fi = 0;
@@ -1030,6 +1020,67 @@ static void async_read_kchunk_union_worker(
             }
         }
     }
+
+    // The read is cut into chunks of output rows (dim 0) and each chunk goes
+    // file -> PACKED pinned staging -> its places in the output:
+    //
+    //  * The memory side of the H5Dread is one contiguous run (a 1-D space of
+    //    the chunk's point count).  HDF5 maps the n-th selected file element
+    //    to the n-th selected memory element, both in row-major order, so
+    //    reading packed and then walking the memory selection's own
+    //    (offset, length) runs in order puts every element exactly where the
+    //    one-shot union H5Dread put it (the door's windows are disjoint and
+    //    ascending, and rows are the outermost dim of both orders).
+    //  * The transfer is INDEPENDENT.  Each rank's windows are a band block,
+    //    i.e. long contiguous file runs; two-phase aggregation re-shipped
+    //    every byte through 16 MiB collective-buffer rounds.  VI3 12x12 P16,
+    //    bands 0:360, 120.2 GB (runs/runtime/p2d_io_20260924): collective
+    //    union 56.8 s cold / 44.4 s warm; independent 17.8 / 7.6 s; the
+    //    contiguous-memory collective read 21.4 / 15.7 s.  Independent is
+    //    also what makes a per-rank chunk count safe: nothing here is a
+    //    collective call, so an empty rank skips its reads.
+    //  * Staging is two chunks of pinned memory (<= 2 x max(row, 256 MiB)),
+    //    not the whole per-rank slab: the old path pinned and zeroed ~psi/P
+    //    per call (4.1 s of the 56.8 s above) and kept it pinned.  Chunk c+1
+    //    is read while chunk c's copies drain.  Pad cells are zeroed on the
+    //    output itself.
+    constexpr size_t kUnionChunkBytes = size_t{256} << 20;
+    constexpr size_t kSeqBatch = 4096;
+    const hsize_t n_rows = mem_shape[0];
+    size_t row_bytes = element_size;
+    for (int d = 1; d < N_out; ++d) row_bytes *= (size_t)mem_shape[d];
+    hsize_t rows_per_chunk = (hsize_t)std::max<size_t>(
+        1, kUnionChunkBytes / std::max<size_t>(row_bytes, 1));
+    if (rows_per_chunk > n_rows) rows_per_chunk = std::max<hsize_t>(n_rows, 1);
+    const size_t chunk_cap = (size_t)rows_per_chunk * row_bytes;
+    // Output dim 0 is the window axis when kchunk_axis == 0; otherwise it is
+    // file dim 0 (the per-rank shape keeps file order around the window axis).
+    const bool rows_are_windows = (kchunk_axis == 0);
+
+    if (!ensure_pinned(ctx, 2 * chunk_cap)) {
+        std::ostringstream os;
+        os << "phdf5 read_kchunk_union: staging-buffer alloc of "
+           << 2 * chunk_cap << " bytes failed";
+        fail_task(ffi::ErrorCode::kResourceExhausted, os.str());
+        return;
+    }
+    char* ring[2] = {static_cast<char*>(ctx->pinned_buf),
+                     static_cast<char*>(ctx->pinned_buf) + chunk_cap};
+#ifdef LORRAX_FFI_NO_CUDA
+    std::memset(d_dst, 0, bytes);
+#else
+    {
+        cudaError_t ce = cudaMemsetAsync(d_dst, 0, bytes, ctx->stream);
+        if (ce != cudaSuccess) {
+            fail_task(ffi::ErrorCode::kInternal,
+                std::string("phdf5 read_kchunk_union: cudaMemsetAsync: ") +
+                cudaGetErrorString(ce));
+            return;
+        }
+    }
+#endif
+    auto t_pin = now();
+
     hid_t memspace = H5Screate_simple(N_out, mem_shape.data(), nullptr);
     if (memspace < 0) {
         fail_task(ffi::ErrorCode::kInternal,
@@ -1057,97 +1108,181 @@ static void async_read_kchunk_union_worker(
             return;
         }
     }
-    H5Sselect_none(filespace);
-    H5Sselect_none(memspace);
-    auto t_spaces = now();
+    auto fail_spaces = [&](ffi::ErrorCode code, const std::string& msg) {
+        H5Sclose(memspace);
+        H5Sclose(filespace);
+        fail_task(code, msg);
+    };
 
-    std::vector<hsize_t> mem_off(N_out, 0);
-    std::vector<hsize_t> mem_count(N_out);
-    for (int k = 0; k < n_kchunk; ++k) {
-        if (H5Sselect_hyperslab(filespace, H5S_SELECT_OR,
-                                 file_offsets[k].data(), nullptr,
-                                 file_counts[k].data(), nullptr) < 0) {
-            H5Sclose(memspace); H5Sclose(filespace);
-            std::ostringstream os;
-            os << "phdf5 read_kchunk_union: file H5Sselect_hyperslab(OR) "
-               << "failed at k=" << k;
-            fail_task(ffi::ErrorCode::kInternal, os.str());
-            return;
-        }
-        int fi = 0;
-        for (int d = 0; d < N_out; ++d) {
-            if (d == kchunk_axis) {
-                mem_off[d] = (hsize_t)k;
-                mem_count[d] = 1;
-            } else {
-                mem_off[d] = 0;
-                mem_count[d] = file_counts[k][fi++];
+    std::vector<hsize_t> f_off(N_file), f_cnt(N_file);
+    std::vector<hsize_t> m_off(N_out), m_cnt(N_out);
+    std::vector<hsize_t> seq_off(kSeqBatch);
+    std::vector<size_t> seq_len(kSeqBatch);
+    hsize_t npts_total = 0;
+    size_t n_chunks = 0;
+    double sel_ms = 0.0, read_ms = 0.0, h2d_ms = 0.0;
+    bool copies_in_flight = false;
+    for (hsize_t r0 = 0; r0 < n_rows; r0 += rows_per_chunk, ++n_chunks) {
+        const hsize_t r1 = std::min<hsize_t>(n_rows, r0 + rows_per_chunk);
+        auto t_c0 = now();
+        H5Sselect_none(filespace);
+        H5Sselect_none(memspace);
+        for (int k = 0; k < n_kchunk; ++k) {
+            int fi = 0;
+            for (int d = 0; d < N_out; ++d) {
+                if (d == kchunk_axis) {
+                    m_off[d] = (hsize_t)k;
+                    m_cnt[d] = 1;
+                } else {
+                    m_off[d] = 0;
+                    m_cnt[d] = file_counts[k][fi++];
+                }
+            }
+            const hsize_t lo = std::max<hsize_t>(m_off[0], r0);
+            const hsize_t hi = std::min<hsize_t>(m_off[0] + m_cnt[0], r1);
+            if (hi <= lo) continue;
+            f_off = file_offsets[k];
+            f_cnt = file_counts[k];
+            if (!rows_are_windows) {
+                f_off[0] += lo - m_off[0];
+                f_cnt[0] = hi - lo;
+            }
+            m_off[0] = lo;
+            m_cnt[0] = hi - lo;
+            bool empty = false;
+            for (auto c : f_cnt) if (c == 0) empty = true;
+            if (empty) continue;
+            if (H5Sselect_hyperslab(filespace, H5S_SELECT_OR, f_off.data(),
+                                    nullptr, f_cnt.data(), nullptr) < 0) {
+                std::ostringstream os;
+                os << "phdf5 read_kchunk_union: file H5Sselect_hyperslab(OR) "
+                   << "failed at k=" << k;
+                fail_spaces(ffi::ErrorCode::kInternal, os.str());
+                return;
+            }
+            if (H5Sselect_hyperslab(memspace, H5S_SELECT_OR, m_off.data(),
+                                    nullptr, m_cnt.data(), nullptr) < 0) {
+                std::ostringstream os;
+                os << "phdf5 read_kchunk_union: mem H5Sselect_hyperslab(OR) "
+                   << "failed at k=" << k;
+                fail_spaces(ffi::ErrorCode::kInternal, os.str());
+                return;
             }
         }
-        if (H5Sselect_hyperslab(memspace, H5S_SELECT_OR,
-                                 mem_off.data(), nullptr,
-                                 mem_count.data(), nullptr) < 0) {
-            H5Sclose(memspace); H5Sclose(filespace);
+        const hssize_t npts_file = H5Sget_select_npoints(filespace);
+        const hssize_t npts_mem  = H5Sget_select_npoints(memspace);
+        if (npts_file != npts_mem || npts_file < 0) {
             std::ostringstream os;
-            os << "phdf5 read_kchunk_union: mem H5Sselect_hyperslab(OR) "
-               << "failed at k=" << k;
-            fail_task(ffi::ErrorCode::kInternal, os.str());
+            os << "phdf5 read_kchunk_union: selection size mismatch — "
+               << "filespace=" << npts_file << " memspace=" << npts_mem
+               << " (overlapping per-k slabs?)";
+            fail_spaces(ffi::ErrorCode::kInvalidArgument, os.str());
             return;
         }
-    }
-    auto t_select = now();
-
-    hssize_t npts_file = H5Sget_select_npoints(filespace);
-    hssize_t npts_mem  = H5Sget_select_npoints(memspace);
-    if (npts_file != npts_mem) {
-        H5Sclose(memspace); H5Sclose(filespace);
-        std::ostringstream os;
-        os << "phdf5 read_kchunk_union: selection size mismatch — "
-           << "filespace=" << npts_file << " memspace=" << npts_mem
-           << " (overlapping per-k slabs?)";
-        fail_task(ffi::ErrorCode::kInvalidArgument, os.str());
-        return;
-    }
-
-    herr_t st = H5Dread(ds_id, native_type, memspace, filespace, dxpl,
-                        ctx->pinned_buf);
-    auto t_read = now();
-    if (ctx->timing_enabled && st >= 0) {
-        ctx->read_calls.fetch_add(1, std::memory_order_relaxed);
-        ctx->read_bytes.fetch_add(static_cast<uint64_t>(npts_file) * element_size,
-                                  std::memory_order_relaxed);
-        ctx->read_ns.fetch_add(static_cast<uint64_t>(
-            std::chrono::duration_cast<std::chrono::nanoseconds>(
-                t_read - t_select).count()), std::memory_order_relaxed);
+        const size_t chunk_bytes = (size_t)npts_file * element_size;
+        if (chunk_bytes > chunk_cap) {
+            std::ostringstream os;
+            os << "phdf5 read_kchunk_union: chunk of " << chunk_bytes
+               << " bytes exceeds its staging (" << chunk_cap << ")";
+            fail_spaces(ffi::ErrorCode::kInternal, os.str());
+            return;
+        }
+        char* buf = ring[n_chunks & 1];
+        auto t_c1 = now();
+        if (npts_file > 0) {
+            const hsize_t n1 = (hsize_t)npts_file;
+            hid_t packed = H5Screate_simple(1, &n1, nullptr);
+            if (packed < 0) {
+                fail_spaces(ffi::ErrorCode::kInternal,
+                    "phdf5 read_kchunk_union: H5Screate_simple(packed) failed");
+                return;
+            }
+            herr_t st = H5Dread(ds_id, native_type, packed, filespace,
+                                ctx->dxpl_indep, buf);
+            H5Sclose(packed);
+            if (st < 0) {
+                fail_spaces(ffi::ErrorCode::kInternal,
+                            "phdf5 read_kchunk_union: H5Dread failed");
+                return;
+            }
+        }
+        auto t_c2 = now();
+#ifndef LORRAX_FFI_NO_CUDA
+        // The previous chunk's copies read the OTHER half of the ring, which
+        // the next chunk's H5Dread is about to fill.
+        if (copies_in_flight) cudaEventSynchronize(ctx->h2d_event);
+#endif
+        if (npts_file > 0) {
+            hid_t it = H5Ssel_iter_create(memspace, element_size, 0);
+            if (it < 0) {
+                fail_spaces(ffi::ErrorCode::kInternal,
+                    "phdf5 read_kchunk_union: H5Ssel_iter_create failed");
+                return;
+            }
+            size_t cursor = 0;
+            for (;;) {
+                size_t nseq = 0, nelm = 0;
+                if (H5Ssel_iter_get_seq_list(it, kSeqBatch, SIZE_MAX, &nseq,
+                                             &nelm, seq_off.data(),
+                                             seq_len.data()) < 0) {
+                    H5Ssel_iter_close(it);
+                    fail_spaces(ffi::ErrorCode::kInternal,
+                        "phdf5 read_kchunk_union: H5Ssel_iter_get_seq_list failed");
+                    return;
+                }
+                if (nseq == 0) break;
+                for (size_t i = 0; i < nseq; ++i) {
+                    char* dst = static_cast<char*>(d_dst) + seq_off[i];
+#ifdef LORRAX_FFI_NO_CUDA
+                    std::memcpy(dst, buf + cursor, seq_len[i]);
+#else
+                    cudaError_t ce = cudaMemcpyAsync(
+                        dst, buf + cursor, seq_len[i],
+                        cudaMemcpyHostToDevice, ctx->stream);
+                    if (ce != cudaSuccess) {
+                        H5Ssel_iter_close(it);
+                        fail_spaces(ffi::ErrorCode::kInternal,
+                            std::string("phdf5 read_kchunk_union: "
+                                        "cudaMemcpyAsync: ") +
+                            cudaGetErrorString(ce));
+                        return;
+                    }
+#endif
+                    cursor += seq_len[i];
+                }
+            }
+            H5Ssel_iter_close(it);
+            if (cursor != chunk_bytes) {
+                std::ostringstream os;
+                os << "phdf5 read_kchunk_union: scattered " << cursor
+                   << " bytes of a " << chunk_bytes << "-byte chunk";
+                fail_spaces(ffi::ErrorCode::kInternal, os.str());
+                return;
+            }
+#ifndef LORRAX_FFI_NO_CUDA
+            cudaEventRecord(ctx->h2d_event, ctx->stream);
+            copies_in_flight = true;
+#endif
+        }
+        auto t_c3 = now();
+        npts_total += (hsize_t)npts_file;
+        sel_ms += ms(t_c0, t_c1);
+        read_ms += ms(t_c1, t_c2);
+        h2d_ms += ms(t_c2, t_c3);
     }
     H5Sclose(memspace);
     H5Sclose(filespace);
-    if (st < 0) {
-        fail_task(ffi::ErrorCode::kInternal,
-                  "phdf5 read_kchunk_union: H5Dread failed");
-        return;
+    if (ctx->timing_enabled) {
+        ctx->read_calls.fetch_add(1, std::memory_order_relaxed);
+        ctx->read_bytes.fetch_add(static_cast<uint64_t>(npts_total) * element_size,
+                                  std::memory_order_relaxed);
+        ctx->read_ns.fetch_add(static_cast<uint64_t>(read_ms * 1.0e6),
+                               std::memory_order_relaxed);
     }
 
-    // Queue H2D on ctx->stream; record h2d_event at completion; wait on
-    // the event before firing the Promise so ``d_dst`` is guaranteed on
-    // device by the time XLA schedules downstream consumers.  Overlap
-    // with the NEXT task's H5Dread still works because both live on
-    // ctx->writer_thread and pipeline on its FIFO queue — the next
-    // task's cudaEventSynchronize(h2d_event) at start is a no-op (the
-    // event is already in its recorded-complete state by then).
-#ifdef LORRAX_FFI_NO_CUDA
-    // Host: d_dst is host memory; the memcpy completes synchronously so
-    // ``d_dst`` is fully populated before the Promise fires below.
-    std::memcpy(d_dst, ctx->pinned_buf, bytes);
-#else
-    cudaError_t ce = cudaMemcpyAsync(
-        d_dst, ctx->pinned_buf, bytes, cudaMemcpyHostToDevice, ctx->stream);
-    if (ce != cudaSuccess) {
-        fail_task(ffi::ErrorCode::kInternal,
-            std::string("phdf5 read_kchunk_union: cudaMemcpyAsync: ") +
-            cudaGetErrorString(ce));
-        return;
-    }
+    // The Promise fires only once every copy (and the pad memset) is on the
+    // device, so downstream XLA ops read a complete ``d_dst``.
+#ifndef LORRAX_FFI_NO_CUDA
     cudaEventRecord(ctx->h2d_event, ctx->stream);
     cudaEventSynchronize(ctx->h2d_event);
 #endif
@@ -1155,18 +1290,17 @@ static void async_read_kchunk_union_worker(
 
     if (do_time && ctx->rank == 0) {
         std::fprintf(stderr,
-            "[phdf5 kchunk-union r0] n_k=%d bytes/rank=%zu  "
-            "prev_h2d_wait=%.2f  pin+zero=%.2f  spaces=%.2f  select=%.2f  "
-            "read=%.2f  h2d_setup=%.2f  total=%.2f (ms)  [selected_elts=%lld]\n",
-            n_kchunk, bytes,
+            "[phdf5 kchunk-union r0] n_k=%d bytes/rank=%zu chunks=%zu "
+            "rows/chunk=%llu staging=%zu  prev_h2d_wait=%.2f  zero=%.2f  "
+            "select=%.2f  read=%.2f  scatter=%.2f  total=%.2f (ms)  "
+            "[selected_elts=%lld, independent]\n",
+            n_kchunk, bytes, n_chunks, (unsigned long long)rows_per_chunk,
+            2 * chunk_cap,
             ms(t0, t_prev_h2d_done),
             ms(t_prev_h2d_done, t_pin),
-            ms(t_pin, t_spaces),
-            ms(t_spaces, t_select),
-            ms(t_select, t_read),
-            ms(t_read, t_h2d),
+            sel_ms, read_ms, h2d_ms,
             ms(t0, t_h2d),
-            (long long)npts_file);
+            (long long)npts_total);
     }
     promise.SetAvailable();
 }
