@@ -1088,3 +1088,30 @@ def _parse_eo_column(path: Path) -> dict:
         if m and ik >= 0:
             out[ik].append(float(m.group(1)))
     return {k: v for k, v in out.items() if v}
+
+
+def with_active_range(gemm):
+    """Give a dense test GEMM stub the ``GemmPlan.active_range`` contract.
+
+    Production plans contract only the half-open band interval
+    ``[lo, hi)`` of each parent and scale the kept columns by ``weights``
+    (``distrib_la.GemmPlan.active_range``); a stub standing in for a plan
+    whose caller trims zero-weight bands must do the same.  Masking with
+    exact zeros keeps the stub a dense reference of that contract.
+    """
+    import jax.numpy as jnp
+
+    def active_range(a, b, lo, hi, C=None, *, out=None, weights=None):
+        del C, out
+        nq, _, k = a.shape
+        index = jnp.arange(k)
+        lo = jnp.broadcast_to(jnp.asarray(lo), (nq,))
+        hi = jnp.broadcast_to(jnp.asarray(hi), (nq,))
+        keep = (index[None, :] >= lo[:, None]) & (index[None, :] < hi[:, None])
+        scale = keep.astype(a.dtype)
+        if weights is not None:
+            scale = jnp.where(keep, jnp.asarray(weights).astype(a.dtype), 0)
+        return gemm(a * scale[:, None, :], b)
+
+    gemm.active_range = active_range
+    return gemm

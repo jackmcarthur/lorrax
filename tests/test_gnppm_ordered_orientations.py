@@ -21,6 +21,7 @@ Single CPU device suffices; a 2x2 emulated mesh is used when available::
 
 from __future__ import annotations
 
+import harness
 import os
 from types import SimpleNamespace
 
@@ -98,7 +99,7 @@ def _put(a, mesh, spec):
 def _local_gemm_plan(mesh, **kwargs):
     gemm = lambda a, b: jnp.einsum("qmk,qkn->qmn", a, b)
     gemm.mesh = mesh
-    return gemm
+    return harness.with_active_range(gemm)
 
 
 def _emulated_flat_k_fftn(mesh, kgrid, spec, *, norm="ortho",

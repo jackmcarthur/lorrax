@@ -1,5 +1,6 @@
 """Complex-contour chi keeps the production FFT contraction and sharding."""
 
+import harness
 from types import SimpleNamespace
 
 import numpy as np
@@ -38,7 +39,7 @@ def _put(a, mesh, spec):
 def _local_gemm_plan(mesh, **kwargs):
     gemm = lambda a, b: jnp.einsum("qmk,qkn->qmn", a, b)
     gemm.mesh = mesh
-    return gemm
+    return harness.with_active_range(gemm)
 
 
 def _emulated_flat_k_fftn(mesh, kgrid, spec, *, norm="ortho",

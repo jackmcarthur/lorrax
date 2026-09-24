@@ -1,5 +1,6 @@
 """Finite-temperature Matsubara chi0 against an independent k-space Lehmann sum."""
 
+import harness
 from types import SimpleNamespace
 
 import numpy as np
@@ -40,7 +41,7 @@ def _stand_ins(monkeypatch):
     def gemm_plan(mesh, **kwargs):
         gemm = lambda a, b: jnp.einsum("qmk,qkn->qmn", a, b)
         gemm.mesh = mesh
-        return gemm
+        return harness.with_active_range(gemm)
 
     def flat_k_fftn(mesh, kgrid, spec, *, norm="ortho", out_spec=None):
         fft3 = fft_helpers.make_sharded_fftn_3d(mesh, spec, spec, axes=(0, 1, 2), norm=norm)
