@@ -6202,8 +6202,13 @@ def _run_rcrop(
                 entry_sharding=entry_sh, metric=_metric_np,
                 history=("optimal" if _accel == "crop" else "evaluated"),
                 safeguard=_accel in ("anderson_sg", "anderson_z"),
-                restart_fn=((lambda: _map_event[0])
-                            if _accel in ("anderson_sg", "anderson_z") else None))
+                # No restart on map events: early SC maps grow the sampled
+                # grid on EVERY call (CrI3 calls 1-3, Fe 1-4), and restarting
+                # there reduced Anderson to Picard steps, which diverge on
+                # this expansive map (c11/b11 first attempts, 2026-09-24).
+                # The jump is far below the secant-model error that early;
+                # rCROP never restarted.  Events are still logged.
+                restart_fn=None)
     except _Converged as stop:
         # The criterion fired inside the map.  Return the accepted
         # map INPUT that met it, NOT F(input) and not rCROP's stale internal
