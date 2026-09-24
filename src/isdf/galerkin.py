@@ -43,6 +43,7 @@ from runtime.padding import spec_divisor
 
 __all__ = [
     "GalerkinBasis",
+    "GalerkinBasisMismatch",
     "GalerkinOperatorProjection",
     "GalerkinStateExpectation",
     "GalerkinStreamPlan",
@@ -66,6 +67,14 @@ _BASIS_FORMAT = 2
 _BASIS_ARRAYS = ("galerkin_ctilde", "galerkin_basis_at_nodes",
                  "galerkin_selection_factor")
 _BASIS_META = "galerkin_"
+
+
+class GalerkinBasisMismatch(ValueError):
+    """A complete basis artifact fitted for other inputs or another format.
+
+    Raised only by the provenance/format comparison, so a caller may refit
+    on it; a corrupt or incomplete artifact still raises plain ValueError.
+    """
 
 
 @dataclass(frozen=True)
@@ -433,7 +442,8 @@ def _basis_read_meta(io) -> dict:
         raise ValueError("Galerkin basis artifact is incomplete")
     version = int(small("format", np.int32)[0])
     if version != _BASIS_FORMAT:
-        raise ValueError(f"Galerkin basis format {version} is unsupported")
+        raise GalerkinBasisMismatch(
+            f"Galerkin basis format {version} is unsupported")
     band = small("band_range", np.int32)
     extents = small("nk_nb_nspinor", np.int32)
     controls = small("qrcp_controls", np.float64)
@@ -479,8 +489,8 @@ def read_galerkin_basis(path, *, wfn, meta, centroid_indices, band_range,
         stored = _basis_read_meta(io)
         mismatches = [key for key in expected if stored.get(key) != expected[key]]
         if mismatches:
-            raise ValueError("Galerkin basis provenance mismatch: "
-                             + ", ".join(mismatches))
+            raise GalerkinBasisMismatch(
+                "Galerkin basis provenance mismatch: " + ", ".join(mismatches))
         physical = stored["rank"]
         from runtime.padding import padded_axis
         rank_axis = padded_axis(
