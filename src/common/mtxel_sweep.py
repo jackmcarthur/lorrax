@@ -1422,7 +1422,8 @@ def _sweep_body(geom: SweepGeometry, operator: Operator, plan: SweepPlan,
     reduce-scatter delivers the ``r``-th of the ``(p_x, p_y)`` blocks to
     rank ``r`` — i.e. rows ``x`` and columns ``y``.
     """
-    from jax.experimental.layout import Layout, with_layout_constraint
+    from common.contract_bands import (bands_to_contraction_slabs,
+                                       reduce_scatter_to_band_block)
 
     axes = ("x", "y")
     px, py = int(geom.mesh.shape["x"]), int(geom.mesh.shape["y"])
@@ -1436,36 +1437,14 @@ def _sweep_body(geom: SweepGeometry, operator: Operator, plan: SweepPlan,
     need_gvec_s = operator.apply_g is not None or operator.coeffs is not None
 
     def to_g_split(a):
-        """(K, nb/P, ns, ngkmax, …) band layout → (K, nb, ns, gc/P, …).
-
-        PIN THE TILE ROW-MAJOR.  The all-to-all wants its split axis (G)
-        major; left free, layout assignment can satisfy that on the scan's
-        LOOP OPERAND and hoist a G-major copy of the whole resident ψ out of
-        the loop (measured +ψ/P per rank on the density scan, legs b02/b05
-        of ``runs/runtime/density_scan_20260923``).  Pinned, the transpose
-        is one tile wide.
-        """
-        a = with_layout_constraint(
-            a, Layout(major_to_minor=tuple(range(a.ndim))))
-        pad = [(0, 0)] * a.ndim
-        pad[3] = (0, gc - ngk)
-        return jax.lax.all_to_all(jnp.pad(a, pad), axes, split_axis=3,
-                                  concat_axis=1, tiled=True)
+        """(K, nb/P, ns, ngkmax, …) band layout → (K, nb, ns, gc/P, …)."""
+        return bands_to_contraction_slabs(a, band_axis=1, slab_axis=3,
+                                          carrier=gc, axes=axes)
 
     def to_blocks(part):
-        """(K, [c,] nb, nb) slab partial → this rank's summed (x, y) block.
-
-        THE ONE REPLICATED OBJECT, priced: ``K·c·nb²·16`` bytes per rank
-        (0.26 MB per k at nb=128; 16 MB at nb=1000).  It exceeds the ψ
-        panels the band-split plan gathered, ``(1+c)·ψ_k/√P``, only when
-        ``nb·√P > ns·N_G`` — P ≳ 1e5 at production G/nb ratios.
-        """
-        lead = part.shape[:-2]
-        r = part.reshape(*lead, px, nbx, py, nby)
-        r = jnp.moveaxis(r, (len(lead), len(lead) + 2), (0, 1))
-        r = r.reshape(n_ranks, *lead, nbx, nby)
-        return jax.lax.psum_scatter(r, axes, scatter_dimension=0,
-                                    tiled=False)
+        """(K, [c,] nb, nb) slab partial → this rank's summed (x, y) block
+        (``K·c·nb²·16`` bytes per rank: 0.26 MB per k at nb=128)."""
+        return reduce_scatter_to_band_block(part, px=px, py=py, axes=axes)
 
     def band_ket(t, consts):
         """The band-layout operator one k at a time: its box never scales
