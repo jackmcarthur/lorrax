@@ -331,7 +331,8 @@ def make_route_g_kernel(*, mesh: Mesh, plan_id, kgrid, fft_grid, ns: int, b: int
         D = jax.lax.all_to_all(D, _XY, split_axis=2, concat_axis=4, tiled=True)
         if stop_at == 'a2a':
             return chk(D)
-        D = jnp.concatenate([D, jnp.zeros(D.shape[:4] + (1,), D.dtype)], axis=-1)
+        # Pad slots of the children index ngk_par, one past D's last slot:
+        # the gathers below zero-fill them (no padded copy of D).
         ngk1 = int(D.shape[-1])
 
         # The axis DFT of every k onto all planes, once per batch: the D
@@ -346,12 +347,16 @@ def make_route_g_kernel(*, mesh: Mesh, plan_id, kgrid, fft_grid, ns: int, b: int
             d = D[p].reshape(ns, 2, c, ns, ngk1)
             wl = jnp.exp(2j * jnp.pi * (lL[s_].astype(jnp.float64) @ kvecs[p]))
             d = jnp.take(d, lperm[s_], axis=2) * wl[None, None, :, None, None]
-            d = jnp.take(d, pslot[k], axis=-1) * jnp.conj(phase[k])
-            d = jnp.where(anti[k], jnp.conj(d), d)
-            d = _spin_sandwich(U[k], d)
-            d = jnp.concatenate([d.reshape(ns, 2 * c, ns, -1),
-                                 jnp.zeros((ns, 2 * c, ns, 1), d.dtype)], -1)
-            cy = jnp.take(d, jnp.clip(ci[k], 0, int(d.shape[-1]) - 1).reshape(-1), axis=-1)
+            d = (jnp.take(d, pslot[k], axis=-1, mode='fill', fill_value=0)
+                 * jnp.conj(phase[k]))
+            # Antiunitary k: conj as a ±1 on the imaginary part, fused into
+            # the gather's own pass (a where(anti, conj(d), d) was a copy).
+            d = jax.lax.complex(jnp.real(d),
+                                jnp.where(anti[k], -1.0, 1.0) * jnp.imag(d))
+            d = _spin_sandwich(U[k], d).reshape(ns, 2 * c, ns, -1)
+            # Empty cylinder cells carry the slot ngkmax >= the sphere extent:
+            # zero-filled by the gather, no padded copy.
+            cy = jnp.take(d, ci[k].reshape(-1), axis=-1, mode='fill', fill_value=0)
             cy = cy.reshape(ns, 2 * c, ns, n_col, n_s)
             return None, jnp.einsum('asbcj,jp->pasbc', cy, pa_all)
 
