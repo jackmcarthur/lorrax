@@ -20,10 +20,10 @@ current actions. No W, chi or G average is introduced.
 
 The independently stored instantaneous `W_infinity-V` is contracted once with
 the equal-time occupied projector through `photon_sigma.contract_lorentz_blocks`
-in its exchange mode. The dispatch retains bare V exchange and bypasses the
-previous static screened-current approximation. The constant carries no extra
-volume factor, transverse sign or Coulomb-hole half. Photon heads remain a
-separate, unsupported part of this sector handle.
+in its exchange mode. The dispatch keeps bare V exchange and does not apply a
+static screened-current approximation. The constant carries no extra volume
+factor, transverse sign or Coulomb-hole half. Photon heads are not part of the
+sector handle and are unsupported there.
 
 At the driver dispatch, the manifest path is selected as a handle but is not
 opened as a scalar model: `compute_sector_sigma` validates it before the scalar
@@ -51,23 +51,17 @@ history or state/pole-pair sum is retained. Setup routing, resident factors, and
 contractions have capacity reservations with explicit sector lifetime.
 
 The constant path retains a whole all-P photon bank, then its all-P packed
-replacement. Both copies and packing workspace are admitted together. Kernel
-admission uses the compiler peak plus the runtime cuFFT query and the native
-workspace query for the remaining distributed GEMMs; these are capacity
-estimates, not measured runtime peaks
-or a performance comparison. Full-frequency material validation remains
-separate from the focused synthetic gate.
+replacement; both copies and the packing workspace are admitted together.
+Kernel admission (`sector_sigma._admit_compiled`) takes the compiled peak plus
+the cuFFT plan scratch of the kernel's XLA FFT ops (`runtime.aot_memory`;
+refuses with `GATE shared_pole_capacity` when that scratch cannot be measured
+on CUDA) plus the `distrib_la` native workspace of the distributed GEMMs. These
+are capacity estimates, not measured runtime peaks.
 
-The targeted gate is `tests/multi_device/sector_sigma_frequency_p4.py`. It
-writes real endpoint stores, a bank and manifest, then calls the production
-entry with unequal charge/current centroid extents, distinct sector poles,
-nonreciprocal q dependence, fractional occupations and a nonzero constant. The
-explicit band/q/pole oracle exists only in that harness. Its receipt must be
-consulted before treating a run as passing.
-
-P4 synthetic job 58497206.3 exercises both configured layouts with the same
-direct oracle: maximum error is 2.046e-7 Ry in each, at a 0.008884 Ry reference
-scale. The matched face-layout control 58497206.0 made 588 store face reads and
-took 41.435 s for the complete consumer call; the resident route made six reads
-and took 17.130 s. This is a tiny synthetic consumer measurement, including
-setup and compilation, not a material speed or peak-memory claim.
+The gate is `tests/multi_device/sector_sigma_frequency_p4.py`. It writes real
+endpoint stores, a bank and a manifest, then calls the production entry with
+unequal charge/current centroid extents, distinct sector poles, nonreciprocal q
+dependence, fractional occupations and a nonzero constant, against an explicit
+band/q/pole oracle that exists only in that harness; read its receipt before
+treating a run as passing. It covers both layouts. Full-frequency material
+validation is separate from this synthetic gate.
