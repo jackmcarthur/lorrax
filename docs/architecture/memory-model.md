@@ -97,6 +97,34 @@ contraction. The receipt line `GW ψ carriers:` names the choice and the
 three terms. Below the crossover, `true` then runs the `false` kernels at
 `false`'s memory, and above it `true` stays feasible where `false` is not.
 
+On faces, a Green build all-gathers its band panels (`A` over `y`, `B`
+over `x`, `distrib_la.panel_matmul`) and multiplies them into the rank's own
+tile. The panels are bounded by one full-k Green tile: one gather per
+operand when that holds the band extent, interleaved band chunks with a
+one-chunk prefetch otherwise. The Σ projector reshards the two band-extent
+ψ faces to the axis orientation and runs the axis projector, so the
+μ-sized operator never moves.
+
+## Spin-pair streaming
+
+For `n_s > 1` the charge response and the Σ convolutions are elementwise in
+the spinor pair, `χ₀ = Σ_ab Gc_ab·conj(Gv_ab)` and
+`Σ = Σ_ab ψ*_a (G_ab ⋆ W) ψ_b` with `W` spin-independent, so no stage needs
+the `n_s²` Green at once. The typed unfold mixes spinor components, so the
+parents move to full k first (the ψ action, `M·N_k/n_par` per rank), and
+each `(a, b)` block is one GEMM of the `a` and `b` spinor rows there:
+
+```text
+live per block  ≈ 4 · 16·N_k·μ²/P          (Green, transform, product, accumulator)
+extra GEMM work = N_k/n_par                full-k blocks instead of parent Greens
+```
+
+`gw.greens_function_kernel.spin_pairs_needed` streams a stage only when its
+whole-spin live set exceeds the target: `3·G_tile` for χ₀ (Gv, Gc and the
+unfold transient), `2·G_tile` for Σ_x, the Coulomb hole and Σ_c(τ) (Σ_k and
+its convolution transient). Otherwise the stage keeps the parent Green and
+the fused unfold convolution.
+
 ## Stage inventory
 
 | stage | resident per rank (leading terms) | priced by | refuses |
@@ -107,7 +135,7 @@ three terms. Below the crossover, `true` then runs the `false` kernels at
 | V_q | `V_acc` `16·Q·μ_L·μ_R/P`, one q-tile of ζ rows, G panels | `vq_tile_bytes` ([§ V_q](#vq-g-panels-and-q-tiles)) | `GATE vq_tile_budget` |
 | V_q unfold | `16·N_k·μ²/P`, sharded `P(None,'x','y')` | — | — |
 | shared-pole screening and Σ | response-bank faces, pencils, eigh workspace, then G and W tiles | the capacity ledger ([shared-pole model](shared_pole_model.md), byte model) | before allocating, when a stage and its named concurrent stages exceed the budget |
-| static / GN-PPM screening | χ₀ τ-scan: whole-spin `≈3·G_tile` (Gv, Gc, unfold transient). When that exceeds the target (`gw.greens_function_kernel.spin_pairs_needed`, `n_s > 1`), χ₀ = Σ_ab Gc_ab·conj(Gv_ab) streams the spin pairs: four `(a,b)` blocks `16·N_k·μ²/P` plus the parents unfolded to full k (`M·N_k/n_par`) and the `16·N_k·μ²/P` accumulator; unchunked over q | `spin_pairs_needed` | — |
+| static / GN-PPM screening | χ₀ τ-scan: whole-spin `≈3·G_tile`; when that exceeds the target the spin pairs stream ([§ spin pairs](#spin-pair-streaming)), four `(a,b)` blocks `16·N_k·μ²/P` (Gv, Gc and their transforms) plus the parents unfolded to full k (`M_face·N_k/n_par` or `M_axis·N_k/n_par`) and the `16·N_k·μ²/P` accumulator; unchunked over q | nothing | — |
 | restart write | one sharded tile, `max(16·Q·μ²/P, 16·Q·μ·N_G/P)` | stage F | — |
 
 Replicated per-process metadata (the TRS-augmented centroid permutation and
