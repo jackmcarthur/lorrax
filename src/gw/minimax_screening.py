@@ -469,10 +469,18 @@ def fit_gn_ppm_from_wc_pair(
             raise ValueError(
                 "fit_gn_ppm_from_wc_pair: q_neg_index must be an involution "
                 f"over [0,{_nq}).")
-    _per_q = 1
-    for _d in _W0.shape[1:]:
+    # ONE q-slice of the LOCAL tile, which is what the sizer prices (its
+    # arena is per device).  Pricing the global (mu, nu) slice over-chunked
+    # by the device count: VI3 12x12, mu 3200, forced q_block = 1 at P16 and
+    # at P100, i.e. 144 eager slice/fit/reshard rounds per map instead of 6
+    # and 1.  The chunking is movement-only (see the sizer), so the fitted
+    # values are bit-identical at any q_block.
+    _sharding = getattr(_W0, "sharding", None)
+    _local_shape = (tuple(_sharding.shard_shape(tuple(_W0.shape)))
+                    if _sharding is not None else tuple(_W0.shape))
+    _per_q = int(_W0.dtype.itemsize)
+    for _d in _local_shape[1:]:
         _per_q *= int(_d)
-    _per_q *= _W0.dtype.itemsize
     _qb = _gn_ppm_fit_q_block(_nq, _per_q)
 
     # The anti-Hermitian half of the probe, kept only on the ordered path
