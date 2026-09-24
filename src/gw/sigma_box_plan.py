@@ -1140,6 +1140,7 @@ def plan_sigma_windows(
     analytic_line=False,
     material_class=None,
     fixed_pole_support_ry=None,
+    certificate_pole_summaries=None,
 ):
     """Build the complete MPA Sigma quadrature from raw support boxes.
 
@@ -1179,6 +1180,14 @@ def plan_sigma_windows(
         must cover. The declared ``[0, endpoint]`` interval is intersected
         with each existing pole selector only for the SC certificate; live
         pole statistics, references and executor intervals remain unchanged.
+    certificate_pole_summaries
+        Optional ``summarize_*`` rows of a pole census that contains
+        ``pole_summaries`` (a shared-pole map's union over its sectors).
+        They set only each window's certificate box, so every sector call
+        of one map requests the same boxes and reuses one set of fits; the
+        executor's pole selection, factor references and window kind stay
+        this call's own.  A window whose union box would change kind keeps
+        its own box.
 
     Returns
     -------
@@ -1269,6 +1278,17 @@ def plan_sigma_windows(
                 name=f"{branch.tag}:{name}", frequencies=frequencies,
                 states=states, pole_stats=pole_stats,
                 pole_sign=pole_sign, eta_ry=eta)
+            if certificate_pole_summaries is not None:
+                _, union_stats = _pole_rows(certificate_pole_summaries, selector)
+                union = (make_sigma_box_spec(
+                    name=spec["name"], frequencies=frequencies, states=states,
+                    pole_stats=union_stats, pole_sign=pole_sign, eta_ry=eta)
+                    if union_stats else None)
+                if (union is not None and union["kind"] == spec["kind"]
+                        and _box_contains(union["box"], spec["box"])):
+                    spec.update(box=union["box"],
+                                raw_real_support=union["raw_real_support"],
+                                pole_extent=union["pole_extent"])
             spec["analytic_line"] = bool(analytic_line)
             if fixed_pole_support is not None:
                 support_lo = max(0.0, float(pole_lo))

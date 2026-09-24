@@ -1711,6 +1711,7 @@ def compute_sigma_c_mpa_omega_grid(
         # production route does not read residues into a host histogram and
         # never constructs a sampled state-pole lattice.
         summaries = []
+        certificate = None
         if shared_pole:
             from file_io.shared_pole_store import read_shared_pole_census
             with timing.section("sigma.census"):
@@ -1731,6 +1732,19 @@ def compute_sigma_c_mpa_omega_grid(
                     regularization_width_ry=regularization_width_ry,
                     edge_factor=edge_factor,
                     occupation_window_threshold=occupation_window_threshold)
+                if scope is not None:
+                    # The certificate boxes come from the same union, so the
+                    # map's sector calls request one box set: the first fits
+                    # it and the others hit (Fe 4^3: 3.3 s per later sector).
+                    union_rows, union_counts = scope
+                    union2 = np.ones((len(union_rows), max(1, max(map(len, union_rows)))))
+                    for q, row in enumerate(union_rows):
+                        union2[q, :len(row)] = np.sort(row)
+                    certificate = summarize_shared_poles(
+                        union2, np.asarray(union_counts, np.int64), branches,
+                        regularization_width_ry=regularization_width_ry,
+                        edge_factor=edge_factor,
+                        occupation_window_threshold=occupation_window_threshold)
         for lo in (() if shared_pole else range(0, n_poles, int(pole_batch_size))):
             hi = min(lo + int(pole_batch_size), n_poles)
             Omega, B, B_odd = reader.read(
@@ -1772,7 +1786,8 @@ def compute_sigma_c_mpa_omega_grid(
                     fixed_rule_session=fixed_quadrature_session,
                     analytic_line=bool(analytic_line),
                     material_class=material_class,
-                    fixed_pole_support_ry=fixed_pole_support_ry)
+                    fixed_pole_support_ry=fixed_pole_support_ry,
+                    certificate_pole_summaries=certificate)
         quadrature_log.record_sigma_plan(geometry)
         if plan_mode == "panes":
             print_fn(
