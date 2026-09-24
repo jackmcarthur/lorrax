@@ -119,7 +119,11 @@ the per-group launches and the owner's per-centroid work; the receipt
 prints every object as a `G_tile` ratio, the minimum configuration, the
 collectives per batch, the all-to-all floor
 `μ·2·nk·ns²·N_Gψ·16/(P·β)`, the X_B bytes, the modelled loop and the
-runner-up.  No deck key or environment knob sizes anything.
+runner-up.  No deck key or environment knob sizes anything.  Owners hold
+whole centroid orbits, so the fit packs them at the bin width c ≤ b/P with
+the least padded work, n_batch·(c + 1) (`best_owner_orbit_batches`): the
+planned width can pack badly (CrI3 8×8 P16: c = 19 packs 8 batches of 18,
+c = 12 the same 8 batches of 12).
 
 Padding goes through `runtime.padding`: the stored q rows and the ζ
 sphere cut into whole G tiles are `PaddedAxis` records made once in
@@ -136,6 +140,8 @@ their pads in `MuOrbitBatches.mu` (−1).
 | the Z store never lives on the device | small decks whose store fits beside the batch | one host round trip |
 | host tier is pageable numpy, not pinned (`HostTileStore`) | none measured; VI3 12×12 P16 (33.4 GB/rank of Z) was host-OOM-killed on the pinned tier | pageable D2H/H2D bandwidth; the pinned tier returns when the planner prices its overhead |
 | one conditioning procedure (`isdf/cplus.py`, rank truncation) | none measured | per-q eigh |
+| the orbit bin width is chosen after the plan, by a scan with a one-centroid fixed-cost guess | decks where the batch fixed cost dominates | the planner does not see orbit sizes; its modelled loop assumes b/P |
+| the ζ file, when a consumer wants it, is written by its own pass over the store | runs with `write_restart_tensors` | one extra C⁺ stream (V_q streams again) |
 | ψ(G) streaming (two band-chunk buffers) not implemented | decks where Ψ does not fit beside the smallest batch | refuses with `GATE zeta-mubatch-capacity` |
 
 ## ζ consumers
