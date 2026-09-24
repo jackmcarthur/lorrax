@@ -738,6 +738,9 @@ def set_default_gpu_pool() -> None:
       fraction is already exported);
     * either one exported -> the caller owns the allocator and nothing is
       added (the startup report names the pair as not the policy), EXCEPT
+    * ``PREALLOCATE`` on with no allocator REFUSES: that half of the policy
+      is BFC with the fraction of the card pre-grabbed, never released to
+      NCCL or cuSOLVERMp;
     * an async pool with preallocation off REFUSES: that is the measured-worst
       configuration (below), and the owner's rule is "always preallocate".
       Half of the policy can therefore never arise from one stray export
@@ -807,13 +810,21 @@ def set_default_gpu_pool() -> None:
             f"Unset one (LORRAX's pool policy sets {_FRACTION_ENVS[0]}="
             f"{GPU_POOL_FRACTION} itself).")
     allocator = os.environ.get(_ALLOCATOR_ENV)
-    prealloc = os.environ.get(_PREALLOCATE_ENV)
+    prealloc = os.environ.get(_PREALLOCATE_ENV) or None     # blank = unset
     if allocator is None and prealloc is None:
         os.environ[_ALLOCATOR_ENV] = "cuda_async"
         os.environ[_PREALLOCATE_ENV] = "true"
         if not any(os.environ.get(k) for k in _FRACTION_ENVS):
             os.environ[_FRACTION_ENVS[0]] = GPU_POOL_FRACTION
         return
+    if allocator is None and prealloc not in ("false", "False", "0"):
+        raise ValueError(
+            f"{_PREALLOCATE_ENV}={prealloc!r} without {_ALLOCATOR_ENV} is half "
+            f"of the pool policy: jaxlib then builds BFC with the fraction "
+            f"(0.75 unless exported) of the card pre-grabbed, an arena the "
+            f"driver never releases to NCCL or cuSOLVERMp.  Unset it and "
+            f"runtime.set_default_gpu_pool() applies the policy (cuda_async, "
+            f"reserved, fraction {GPU_POOL_FRACTION}).")
     # jaxlib: an unset allocator is 'default' (BFC); PREALLOCATE is off only
     # for these exact strings (case-sensitive), and unset means on.
     if ((allocator or "default").lower() == "cuda_async"

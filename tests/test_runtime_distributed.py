@@ -169,6 +169,8 @@ _POLICY = {_A: "cuda_async", _P: "true", _F: runtime.GPU_POOL_FRACTION}
 _POOL_TABLE = [
     ("nothing set",               {},                                  _POLICY),
     ("module PREALLOCATE=false",  {_P: "false"},                       {_P: "false"}),
+    ("PREALLOCATE alone refuses", {_P: "true"},                        ValueError),
+    ("blank PREALLOCATE = unset", {_P: ""},                            _POLICY),
     ("async + false refuses",     {_A: "cuda_async", _P: "false"},     ValueError),
     ("case as jaxlib reads it",   {_A: "CUDA_async", _P: "False"},     ValueError),
     ("async alone (reserved)",    {_A: "cuda_async"},                  {_A: "cuda_async"}),
