@@ -577,13 +577,14 @@ def band_complete_gw_carriers(bundles, *, budget_bytes: float, print_fn=print):
     if not admitted:
         return tuple(bundles)
     nmu_spec, mun_spec = psi_specs("axis")
+    # One device-side all-gather per orientation (bands over the other axis).
+    to_axis = jax.jit(lambda nmu, mun: (nmu, mun), out_shardings=(
+        NamedSharding(mesh, nmu_spec), NamedSharding(mesh, mun_spec)))
     converted = {}
     for carrier in carriers:
+        psi_nmu, psi_mun = to_axis(carrier.psi_nmu, carrier.psi_mun)
         converted[id(carrier)] = dataclasses.replace(
-            carrier,
-            psi_nmu=jax.device_put(carrier.psi_nmu, NamedSharding(mesh, nmu_spec)),
-            psi_mun=jax.device_put(carrier.psi_mun, NamedSharding(mesh, mun_spec)),
-            layout="axis")
+            carrier, psi_nmu=psi_nmu, psi_mun=psi_mun, layout="axis")
     return tuple(
         None if bundle is None else
         dataclasses.replace(bundle, layout="axis",
