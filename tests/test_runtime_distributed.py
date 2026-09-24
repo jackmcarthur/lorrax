@@ -27,7 +27,7 @@ _ENV_KEYS = ("JAX_PROCESS_COUNT", "JAX_NUM_PROCESSES", "SLURM_NTASKS",
              # make the policy assertions fail for the wrong reason.
              "XLA_PYTHON_CLIENT_PREALLOCATE", "XLA_PYTHON_CLIENT_ALLOCATOR",
              "XLA_CLIENT_MEM_FRACTION", "XLA_PYTHON_CLIENT_MEM_FRACTION",
-             "TF_GPU_ALLOCATOR", "XLA_FLAGS")
+             "TF_GPU_ALLOCATOR", "XLA_FLAGS", "JAX_PLATFORM_NAME")
 
 
 @pytest.fixture
@@ -159,49 +159,63 @@ def test_forced_cpu_does_not_add_a_gpu_xla_flag(clean_env):
     assert receipt["value"] is None
 
 
-def test_set_default_env_reserves_the_cuda_async_pool(clean_env):
-    """The one GPU pool policy (runtime.set_default_gpu_pool), pinned.
+_A, _P = "XLA_PYTHON_CLIENT_ALLOCATOR", "XLA_PYTHON_CLIENT_PREALLOCATE"
+_F, _FD = "XLA_CLIENT_MEM_FRACTION", "XLA_PYTHON_CLIENT_MEM_FRACTION"
+_POLICY = {_A: "cuda_async", _P: "true", _F: runtime.GPU_POOL_FRACTION}
 
-    cuda_async draws from the device's default mempool; unreserved, its
-    release threshold is 0 and it re-maps memory at every synchronize
-    (CrI3 8x8 P4, 2026-09-24: whole run 204.3 -> 175.0 s once reserved).
-    The fraction is the planners' budget (bytes_limit x 0.9).
-    """
+#: env in -> env out (the four pool variables; None = unset), or an exception.
+#: ALL OR NOTHING: the policy is applied whole or not at all, and the one
+#: pair it refuses is an unreserved async pool (audit H1, 2026-09-24).
+_POOL_TABLE = [
+    ("nothing set",               {},                                  _POLICY),
+    ("module PREALLOCATE=false",  {_P: "false"},                       {_P: "false"}),
+    ("async + false refuses",     {_A: "cuda_async", _P: "false"},     ValueError),
+    ("case as jaxlib reads it",   {_A: "CUDA_async", _P: "False"},     ValueError),
+    ("async alone (reserved)",    {_A: "cuda_async"},                  {_A: "cuda_async"}),
+    ("bfc is the caller's",       {_A: "bfc"},                         {_A: "bfc"}),
+    ("platform is the caller's",  {_A: "platform"},                    {_A: "platform"}),
+    ("blank allocator = unset",   {_A: ""},                            _POLICY),
+    ("current fraction kept",     {_F: "0.7"},                         dict(_POLICY, **{_F: "0.7"})),
+    ("deprecated fraction kept",  {_FD: "0.7"},                        {_A: "cuda_async", _P: "true", _FD: "0.7"}),
+    ("both spellings refuse",     {_F: "0.7", _FD: "0.8"},             ValueError),
+    ("rocm untouched",            {"JAX_PLATFORMS": "rocm,cpu"},       {}),
+    ("cpu untouched",             {"JAX_PLATFORMS": "cpu"},            {}),
+    ("JAX_PLATFORM_NAME=cpu",     {"JAX_PLATFORM_NAME": "cpu"},        {}),
+    ("no NVIDIA device",          {"_no_gpu": "1"},                    {}),
+]
+
+
+@pytest.mark.parametrize("case,env_in,want", _POOL_TABLE,
+                         ids=[c[0] for c in _POOL_TABLE])
+def test_gpu_pool_policy_table(clean_env, case, env_in, want):
+    """runtime.set_default_gpu_pool: cuda_async, reserved, GPU_POOL_FRACTION.
+
+    An unreserved cuda_async pool (release threshold 0) re-maps memory at
+    every synchronize (CrI3 8x8 P4, 2026-09-24: whole run 204.3 -> 175.0 s
+    once reserved; sandbox runs/runtime/gpu_pool_policy_20260924)."""
     clean_env.setenv("JAX_PLATFORMS", "cuda,cpu")
+    clean_env.delenv("JAX_PLATFORM_NAME", raising=False)
+    clean_env.setattr(runtime, "_gpu_is_present", lambda: "_no_gpu" not in env_in)
+    for k, v in env_in.items():
+        if not k.startswith("_"):
+            clean_env.setenv(k, v)
+    if want is ValueError:
+        with pytest.raises(ValueError):
+            runtime.set_default_gpu_pool()
+        return
+    runtime.set_default_gpu_pool()
+    got = {k: os.environ.get(k) for k in (_A, _P, _F, _FD)}
+    assert got == {k: want.get(k) for k in (_A, _P, _F, _FD)}, case
+
+
+def test_set_default_env_applies_the_pool_policy(clean_env):
+    """The driver entry point applies it, and TF_GPU_ALLOCATOR stays unset
+    (a TensorFlow variable, inert for JAX)."""
+    clean_env.setenv("JAX_PLATFORMS", "cuda,cpu")
+    clean_env.setattr(runtime, "_gpu_is_present", lambda: True)
     set_default_env()
-    assert os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] == "cuda_async"
-    assert os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] == "true"
-    assert os.environ["XLA_CLIENT_MEM_FRACTION"] == runtime.GPU_POOL_FRACTION
-    # Owner ruling 2026-09-24: one fraction on every CUDA node, 40 and 80 GB.
-    assert runtime.GPU_POOL_FRACTION == "0.89"
-    # TF_GPU_ALLOCATOR is a TensorFlow variable and is inert for JAX.
+    assert {k: os.environ.get(k) for k in _POLICY} == _POLICY
     assert "TF_GPU_ALLOCATOR" not in os.environ
-
-
-def test_an_explicit_fraction_or_allocator_wins(clean_env):
-    """Either fraction spelling suppresses the default; BFC stays unreserved."""
-    clean_env.setenv("JAX_PLATFORMS", "cuda,cpu")
-    clean_env.setenv("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.7")
-    clean_env.setenv("XLA_PYTHON_CLIENT_ALLOCATOR", "bfc")
-    set_default_env()
-    assert "XLA_CLIENT_MEM_FRACTION" not in os.environ
-    assert os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] == "false"
-
-
-def test_rocm_keeps_the_unreserved_bfc_default(clean_env):
-    clean_env.setenv("JAX_PLATFORMS", "rocm,cpu")
-    set_default_env()
-    assert "XLA_PYTHON_CLIENT_ALLOCATOR" not in os.environ
-    assert os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] == "false"
-    assert "XLA_CLIENT_MEM_FRACTION" not in os.environ
-
-
-def test_set_default_env_preallocate_override_wins(clean_env):
-    """An explicit export beats the setdefault (and the report names it)."""
-    clean_env.setenv("JAX_PLATFORMS", "cuda,cpu")
-    clean_env.setenv("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
-    set_default_env()
-    assert os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] == "false"
 
 
 def test_set_default_env_cpu_does_not_touch_gpu_allocator(clean_env):

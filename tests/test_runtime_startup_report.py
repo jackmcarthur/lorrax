@@ -659,16 +659,41 @@ def test_a_non_canonical_allocator_pair_says_so():
     assert "NOT LORRAX's GPU pool policy" in out
 
 
-def test_a_reserved_cuda_async_pool_is_the_policy():
+def _policy_report(bytes_limit, total, fraction=None):
+    import runtime
+    fraction = fraction or runtime.GPU_POOL_FRACTION
     env = dict(_GPU_ENV, allocator="cuda_async", allocator_raw="cuda_async",
-               preallocate=True, preallocate_raw="true")
-    out = _text(_facts(backend="gpu",
-                       pool={"stats": {"bytes_limit": 1, "bytes_in_use": 1,
-                                       "peak_bytes_in_use": 1},
-                             "error": None, "env": env,
-                             "corroboration": "arena", "disagreement": "",
-                             "accounting_present": True}))
+               preallocate=True, preallocate_raw="true",
+               mem_fraction=fraction, mem_fraction_var="XLA_CLIENT_MEM_FRACTION")
+    return _text(_facts(backend="gpu",
+                        pool={"stats": {"bytes_limit": bytes_limit,
+                                        "bytes_in_use": 1,
+                                        "peak_bytes_in_use": 1},
+                              "error": None, "env": env,
+                              "corroboration": "arena", "disagreement": "",
+                              "accounting_present": True,
+                              "device_total_bytes": total}))
+
+
+def test_a_reserved_cuda_async_pool_is_the_policy():
+    import runtime
+    total = 42_404_806_656
+    out = _policy_report(int(float(runtime.GPU_POOL_FRACTION) * total), total)
     assert "LORRAX's GPU pool policy" in out and "NOT LORRAX" not in out
+    assert "holds the reserved pool" in out and "WARNING" not in out
+
+
+def test_another_fraction_is_not_the_policy():
+    out = _policy_report(1, 42_404_806_656, fraction="0.95")
+    assert "NOT LORRAX's GPU pool policy" in out
+
+
+def test_a_client_built_before_the_policy_is_named():
+    """os.environ is a false witness once the client exists: the live
+    bytes_limit must equal fraction x total (audit M6)."""
+    total = 42_404_806_656
+    out = _policy_report(int(0.75 * total), total)
+    assert "WARNING: the live client does NOT hold LORRAX's pool" in out
 
 
 def test_cpu_run_says_the_gpu_knobs_do_not_apply():

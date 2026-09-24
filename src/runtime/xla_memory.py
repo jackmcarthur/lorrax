@@ -101,6 +101,24 @@ from . import _FALSY_TOKENS as _ENV_FALSE
 # must stay correct under every one of them, including unset.
 
 _XLA_ALLOCATORS = ("default", "platform", "bfc", "cuda_async")
+
+
+def cuda_device_total_bytes(ordinal: int = 0) -> int | None:
+    """The device's total memory as XLA sizes its pool from it (libcuda
+    ``cuDeviceTotalMem``; creates no context).  None where there is no
+    CUDA driver.  The startup report checks ``bytes_limit`` against
+    ``fraction x`` this, because ``os.environ`` is a false witness once the
+    client exists."""
+    try:
+        import ctypes
+        cu = ctypes.CDLL("libcuda.so.1")
+        dev, total = ctypes.c_int(), ctypes.c_size_t()
+        if (cu.cuInit(0) or cu.cuDeviceGet(ctypes.byref(dev), int(ordinal))
+                or cu.cuDeviceTotalMem_v2(ctypes.byref(total), dev)):
+            return None
+        return int(total.value)
+    except Exception:                                         # noqa: BLE001
+        return None
 #: allocator -> whether the PJRT client keeps arena accounting, i.e.
 #: whether ``memory_stats()['peak_bytes_in_use']`` means anything.
 _XLA_PEAK_ACCOUNTING = {

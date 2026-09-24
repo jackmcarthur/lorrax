@@ -729,12 +729,27 @@ _FRACTION_ENVS = ("XLA_CLIENT_MEM_FRACTION", "XLA_PYTHON_CLIENT_MEM_FRACTION")
 def set_default_gpu_pool() -> None:
     """The one GPU memory-pool policy: cudaMallocAsync, reserved, 0.89.
 
-    Must run before the CUDA client exists (jaxlib reads these three
-    variables once, in ``generate_pjrt_gpu_plugin_options()``).  Each is a
-    ``setdefault``, so an explicit export wins and the startup report names
-    it.  A CPU run and a ROCm run are left alone (ROCm keeps jaxlib's BFC
-    with preallocation off: LORRAX has no ROCm deployment to measure a pool
-    on).
+    Must run before the CUDA client exists (jaxlib reads these variables
+    once, in ``generate_pjrt_gpu_plugin_options()``).  ALL OR NOTHING:
+
+    * neither ``XLA_PYTHON_CLIENT_ALLOCATOR`` nor ``..._PREALLOCATE`` set
+      -> all three are set (``cuda_async``, ``true``, and
+      ``XLA_CLIENT_MEM_FRACTION`` = :data:`GPU_POOL_FRACTION` unless a
+      fraction is already exported);
+    * either one exported -> the caller owns the allocator and nothing is
+      added (the startup report names the pair as not the policy), EXCEPT
+    * an async pool with preallocation off REFUSES: that is the measured-worst
+      configuration (below), and the owner's rule is "always preallocate".
+      Half of the policy can therefore never arise from one stray export
+      (audit H1: the deployed module's ``PREALLOCATE=false`` plus a
+      setdefault ``cuda_async`` would have produced exactly that pair).
+
+    Both fraction spellings at once also REFUSE here: jaxlib raises on the
+    pair inside plugin discovery, where it surfaces as "Unable to initialize
+    backend 'cuda'" (audit M7).  Nothing is set unless this is a CUDA run on
+    a node with an NVIDIA device (:func:`_gpu_is_present`): a CPU run, a
+    GPU-less node and ROCm (no LORRAX deployment to measure a pool on) keep
+    jaxlib's own defaults.
 
     WHAT ``cuda_async`` + ``PREALLOCATE=true`` IS (XLA source, jaxlib 0.9.1).
     PJRT builds ``GpuCudaMallocAsyncAllocator`` with ``create_new_pool=
@@ -765,8 +780,8 @@ def set_default_gpu_pool() -> None:
     pool was trimmed 36.0 -> 4.0 GB), as did cuMemCreate; the bytes outside
     the pool peaked at 4.7 GB (context, NCCL, the cuSOLVERMp context and its
     workspace).  The trim does NOT cross processes, so this policy needs
-    one process per GPU -- a co-tenant (``tests/harness.py``'s mesh child)
-    must pick ``ALLOCATOR=platform``, which it does.
+    one process per GPU; the test suite's workers, which share GPUs with the
+    mesh-cell child, take the stated BFC exception in ``tests/conftest.py``.
 
     The old BFC default (preallocation off, allocator unset) existed for a
     grow-only cuFFT ``cudaMalloc`` arena that no longer exists (the CUDA
@@ -779,16 +794,39 @@ def set_default_gpu_pool() -> None:
     """
     plats = [p.strip().lower()
              for p in os.environ.get("JAX_PLATFORMS", "").split(",") if p.strip()]
-    if plats[:1] == ["cpu"]:
+    if (plats[:1] == ["cpu"] or "rocm" in plats
+            or os.environ.get("JAX_PLATFORM_NAME", "").lower() == "cpu"
+            or not _gpu_is_present()):
         return
-    if "rocm" in plats:
-        os.environ.setdefault(_PREALLOCATE_ENV, "false")
+    _check_allocator_env()
+    if all(os.environ.get(k) for k in _FRACTION_ENVS):
+        raise ValueError(
+            f"{_FRACTION_ENVS[0]} and the deprecated {_FRACTION_ENVS[1]} are "
+            f"BOTH set.  jaxlib refuses the pair inside CUDA plugin discovery, "
+            f"where it surfaces as \"Unable to initialize backend 'cuda'\".  "
+            f"Unset one (LORRAX's pool policy sets {_FRACTION_ENVS[0]}="
+            f"{GPU_POOL_FRACTION} itself).")
+    allocator = os.environ.get(_ALLOCATOR_ENV)
+    prealloc = os.environ.get(_PREALLOCATE_ENV)
+    if allocator is None and prealloc is None:
+        os.environ[_ALLOCATOR_ENV] = "cuda_async"
+        os.environ[_PREALLOCATE_ENV] = "true"
+        if not any(os.environ.get(k) for k in _FRACTION_ENVS):
+            os.environ[_FRACTION_ENVS[0]] = GPU_POOL_FRACTION
         return
-    os.environ.setdefault(_ALLOCATOR_ENV, "cuda_async")
-    async_pool = os.environ[_ALLOCATOR_ENV].lower() == "cuda_async"
-    os.environ.setdefault(_PREALLOCATE_ENV, "true" if async_pool else "false")
-    if not any(os.environ.get(k) for k in _FRACTION_ENVS):
-        os.environ[_FRACTION_ENVS[0]] = GPU_POOL_FRACTION
+    # jaxlib: an unset allocator is 'default' (BFC); PREALLOCATE is off only
+    # for these exact strings (case-sensitive), and unset means on.
+    if ((allocator or "default").lower() == "cuda_async"
+            and prealloc in ("false", "False", "0")):
+        raise ValueError(
+            f"{_ALLOCATOR_ENV}=cuda_async with {_PREALLOCATE_ENV}={prealloc!r} "
+            f"is an UNRESERVED async pool: its release threshold is 0, so it "
+            f"unmaps and re-maps device memory at every synchronize (25-110 "
+            f"ms idle per launch, measured).  LORRAX always preallocates: "
+            f"unset both variables and runtime.set_default_gpu_pool() applies "
+            f"the policy (cuda_async, reserved, fraction {GPU_POOL_FRACTION}).  "
+            f"A module or launcher exporting {_PREALLOCATE_ENV}=false is the "
+            f"usual source.")
 
 
 #: The four values jaxlib accepts for ``XLA_PYTHON_CLIENT_ALLOCATOR``.
@@ -2591,7 +2629,8 @@ def collect_startup_facts(mesh, *, cache_error: str | None = None) -> dict:
     except Exception as exc:                                  # noqa: BLE001
         stats_err = f"{type(exc).__name__}: {exc}"
     pool = {"stats": dict(stats) if stats else None, "error": stats_err,
-            "corroboration": None, "disagreement": "", "env": None}
+            "corroboration": None, "disagreement": "", "env": None,
+            "device_total_bytes": None}
     try:
         from .xla_memory import (classify_xla_pool,
                                  resolve_xla_gpu_memory_env)
@@ -2611,6 +2650,10 @@ def collect_startup_facts(mesh, *, cache_error: str | None = None) -> dict:
         pool["corroboration"] = reading.peak_source
         pool["disagreement"] = reading.disagreement
         pool["accounting_present"] = reading.accounting_present
+        if f["backend"] in ("gpu", "cuda") and local:
+            from .xla_memory import cuda_device_total_bytes
+            pool["device_total_bytes"] = cuda_device_total_bytes(
+                getattr(local[0], "local_hardware_id", 0) or 0)
     except Exception as exc:                                  # noqa: BLE001
         pool["corroboration"] = "unavailable"
         pool["disagreement"] = (
@@ -2796,12 +2839,13 @@ def format_startup_report(f: dict) -> list:
             f"{f.get('backend')} backend, and that backend keeps no arena "
             f"accounting, so no allocator figure is reported.")
     if env is not None and is_gpu:
-        canonical = env["preallocate"] and env["allocator"] == "cuda_async"
+        canonical = (env["preallocate"] and env["allocator"] == "cuda_async"
+                     and env.get("mem_fraction") == GPU_POOL_FRACTION)
         why = (" — LORRAX's GPU pool policy: cudaMallocAsync with its pool "
-               "reserved (runtime.set_default_gpu_pool)" if canonical else
-               " — NOT LORRAX's GPU pool policy (cuda_async with preallocation "
-               "on); a caller overrode it, and an unreserved async pool "
-               "re-maps device memory at every synchronize")
+               f"reserved at {GPU_POOL_FRACTION} (runtime.set_default_gpu_pool)"
+               if canonical else
+               " — NOT LORRAX's GPU pool policy (cuda_async, preallocation on, "
+               f"fraction {GPU_POOL_FRACTION}); a caller exported its own")
         add(f"  XLA_PYTHON_CLIENT_PREALLOCATE resolved to "
             f"{'true' if env['preallocate'] else 'false'} (raw "
             f"{env['preallocate_raw']!r}) and XLA_PYTHON_CLIENT_ALLOCATOR "
@@ -2810,6 +2854,21 @@ def format_startup_report(f: dict) -> list:
         if env.get("mem_fraction"):
             add(f"  The XLA client memory fraction is "
                 f"{env['mem_fraction']} from {env['mem_fraction_var']}.")
+        limit = (pool.get("stats") or {}).get("bytes_limit") or 0
+        total = pool.get("device_total_bytes") or 0
+        if canonical and total:
+            want = float(GPU_POOL_FRACTION) * total
+            if abs(limit - want) > 0.01 * want:
+                add(f"  WARNING: the live client does NOT hold LORRAX's pool: "
+                    f"bytes_limit {limit/1e9:.2f} GB against {GPU_POOL_FRACTION}"
+                    f" x {total/1e9:.2f} GB = {want/1e9:.2f} GB.  The CUDA "
+                    f"client was built before runtime.set_default_gpu_pool() "
+                    f"ran (something initialised jax first), so the "
+                    f"environment above is not what the client uses.")
+            else:
+                add(f"  The live client holds the reserved pool: bytes_limit "
+                    f"{limit/1e9:.2f} GB = {GPU_POOL_FRACTION} x "
+                    f"{total/1e9:.2f} GB.")
         if env.get("tf_gpu_allocator_raw"):
             add(f"  TF_GPU_ALLOCATOR={env['tf_gpu_allocator_raw']!r} is set "
                 f"but is INERT for jax; it selects nothing here.")

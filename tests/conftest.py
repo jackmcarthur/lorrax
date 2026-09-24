@@ -35,6 +35,18 @@ if "jax" not in _sys.modules:
                          set_default_xla_gpu_autotune)       # noqa: E402
     set_default_xla_gpu_autotune(
         platform="gpu" if _gpu_is_present() else "cpu")
+    # THE GPU POOL, TEST-ONLY EXCEPTION.  Production runs get the runtime's
+    # reserved cuda_async pool (runtime.set_default_gpu_pool).  Test workers
+    # do NOT: the mesh-cell child (harness.py) is a co-tenant on the same
+    # GPUs, and the driver's release of idle pool memory does not cross
+    # processes, so a worker reserving 0.89 of its card would starve it
+    # (audit M4).  Pinning the allocator HERE, before anything can build a
+    # client, also makes it independent of which test initialises jax first
+    # (audit M5).  BFC with preallocation off is what workers ran under the
+    # old module.  An explicit caller export still wins.
+    if _gpu_is_present():
+        os.environ.setdefault("XLA_PYTHON_CLIENT_ALLOCATOR", "bfc")
+        os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
 # The HDF5 operation journal is off by default in production and in the
 # suite.  ``tests/test_h5_journal.py`` enables it explicitly in a private

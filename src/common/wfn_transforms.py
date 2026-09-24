@@ -2140,9 +2140,14 @@ def _centroid_sampling_shardings(
     p_band = spec_divisor(mesh_xy, sharding_load, axis=1)
     mesh_devices = int(mesh_xy.size)
     peak_copies = 4 if mesh_devices == 1 else 9
-    gpu_mem_bytes = 36e9
-    if hasattr(meta, 'memory_per_device_gb') and meta.memory_per_device_gb > 0:
+    # One budget owner: the caller's certified budget, else the same
+    # client-derived budget every planner uses (0.9 x bytes_limit on GPU).
+    # The old literal 36e9 was the 0.85 reservation on a 40 GB card.
+    if getattr(meta, 'memory_per_device_gb', 0) > 0:
         gpu_mem_bytes = meta.memory_per_device_gb * 1e9
+    else:
+        from common.gpu_utils import get_device_memory_gb
+        gpu_mem_bytes = get_device_memory_gb() * 1e9
 
     # Output shardings + accumulators.  Same final layout as before:
     # psi_rmu_Y has the centroid axis on 'y'; psi_rmuT_X has it on 'x'.

@@ -274,8 +274,13 @@ _GFLAT_CHUNK_FLOOR = 4  # cuFFT plan amortisation
 #: physically contiguous arena) the VI3 12x12 P16 fit at the full sum cap
 #: (r_chunk 3416 instead of 1715) peaked at 52.95 GB against a 59.42 GB
 #: target (runs/runtime/zeta_fit_20260923/08_vi3_slab_planner_p16_capped).
-#: Not yet measured under cuda_async: a single arena of the MoS2 8x8
-#: failure's size (~32 GiB), which the uncapped plan would now place.
+#: That run's pool was UNRESERVED (PREALLOCATE=false).  A reserved pool
+#: (the runtime's GPU pool policy since 2026-09-24) keeps its idle memory
+#: mapped at fixed addresses, so the exemption is not carried over to it:
+#: the cap binds unless the async pool is unreserved, which the runtime now
+#: refuses (audit H2, reports/overnight_2026-09-24/gpu_pool_policy_audit.md).
+#: Not yet measured under a reserved pool: a single arena of the MoS2 8x8
+#: failure's size (~32 GiB).
 _ARENA_PLACEMENT_FRAC = 0.5
 
 
@@ -285,10 +290,14 @@ def _allocator_name() -> str:
 
 
 def _arena_cap_applies() -> bool:
-    """Whether Stage C's single-arena placement cap binds: every allocator
-    except ``cuda_async`` (BFC ``default``/``bfc`` is where the two measured
-    placement failures occurred; ``platform`` is unmeasured and kept)."""
-    return _allocator_name() != "cuda_async"
+    """Whether Stage C's single-arena placement cap binds: always, except an
+    UNRESERVED ``cuda_async`` pool -- the only configuration the exemption
+    was measured on (VI3 12x12 P16 above).  BFC ``default``/``bfc`` is where
+    the two placement failures occurred; a reserved async pool and
+    ``platform`` are unmeasured and keep the cap."""
+    from runtime.xla_memory import resolve_xla_gpu_memory_env
+    env = resolve_xla_gpu_memory_env()
+    return not (env.allocator == "cuda_async" and not env.preallocate)
 
 
 def batch_reshard_square_solve_capacity(
