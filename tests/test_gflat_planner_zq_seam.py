@@ -92,11 +92,12 @@ def test_budget_outranks_the_mu_floor_and_the_arena_is_placeable(monkeypatch):
     assert plan.hwm_bytes <= plan.budget_bytes
 
 
-def test_cuda_async_lifts_the_single_arena_cap(monkeypatch):
-    """The same geometry under cuda_async: the arena cap does not bind
-    (VI3 12x12 P16 ran at the full sum cap, runs/runtime/zeta_fit_20260923/
-    08_*), so r_chunk is set by the sum budget alone and is strictly larger
-    than the BFC plan's, while the certified HWM still fits."""
+def test_only_an_unreserved_async_pool_lifts_the_single_arena_cap(monkeypatch):
+    """The exemption was measured on an UNRESERVED cuda_async pool (VI3 12x12
+    P16 ran at the full sum cap, runs/runtime/zeta_fit_20260923/08_*): there
+    r_chunk is set by the sum budget alone and is strictly larger than the
+    BFC plan's, while the certified HWM still fits.  A RESERVED pool -- the
+    runtime's policy -- keeps the BFC cap (audit H2, 2026-09-24)."""
     kw = dict(
         meta=_fake_meta(nk_tot=64, nspinor=2, n_rmu=5360, n_rtot=46080,
                         ngkmax=1975),
@@ -107,7 +108,11 @@ def test_cuda_async_lifts_the_single_arena_cap(monkeypatch):
     monkeypatch.setenv("XLA_PYTHON_CLIENT_ALLOCATOR", "bfc")
     bfc = plan_gflat_chunks(**kw)
     monkeypatch.setenv("XLA_PYTHON_CLIENT_ALLOCATOR", "cuda_async")
+    monkeypatch.setenv("XLA_PYTHON_CLIENT_PREALLOCATE", "true")
+    reserved = plan_gflat_chunks(**kw)
+    monkeypatch.setenv("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
     asy = plan_gflat_chunks(**kw)
+    assert reserved.r_chunk == bfc.r_chunk
     assert asy.r_chunk > bfc.r_chunk
     assert asy.hwm_bytes <= asy.budget_bytes
 
