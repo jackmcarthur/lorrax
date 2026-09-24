@@ -148,7 +148,7 @@ def sector_synthesis(readers, headers, bases, families, frequencies, meta, mesh_
     configured wavefunction layout selects face or axis GEMM input placement.
     Occupied windows use conj(B_A(-q)) d(t) B_B(-q)^T; d is never conjugated.
     """
-    from distrib_la import gemm_plan
+    from distrib_la import gemm_plan, panel_matmul
     from file_io.shared_pole_store import read_shared_pole_faces
     from symmetry_maps import q_negation_index
     from .sigma import _shared_pole_weights, _shared_pole_contract, _shared_pole_factor_specs
@@ -198,7 +198,14 @@ def sector_synthesis(readers, headers, bases, families, frequencies, meta, mesh_
     resident_bytes=16*nk*((m//px)*nc*(kcarrier//py if layout=='face' else kcarrier)
                           +(n//py)*nt*(kcarrier//px if layout=='face' else kcarrier))
     resident_bytes+=8*nk*kcarrier+16*nk*m*nc*n*nt//mesh_xy.size
-    native=_native_workspace(mesh_xy,(((nk,m*nc,kcarrier),(nk,kcarrier,n*nt)),))
+    # A face contraction gathers bounded pole-column panels (one all-gather
+    # per operand when they fit) and runs one local batched GEMM, as the
+    # sector G does. The per-q distributed GEMM issued two NCCL broadcasts
+    # per q per tau: 158k of them, 9.9 s, in one Fe 4^3 bispinor sweep.
+    face=layout=='face'
+    panel_bytes=32<<20
+    native=(panel_bytes if face else
+            _native_workspace(mesh_xy,(((nk,m*nc,kcarrier),(nk,kcarrier,n*nt)),)))
     setup=f'sigma.sector.setup.{tag}'
     resident=f'sigma.sector.resident.{tag}'
     capacity.reserve(setup,resident_bytes_per_rank=resident_bytes+2*face_bytes,
@@ -235,8 +242,9 @@ def sector_synthesis(readers, headers, bases, families, frequencies, meta, mesh_
         capacity.live_stages=ambient
         raise
     try:
-        gemm=gemm_plan(mesh_xy,m=m*nc,n=n*nt,k=kcarrier,nq=nk,
-                       dtype=np.complex128,layout=layout)
+        gemm=(partial(panel_matmul,mesh=mesh_xy,panel_bytes=panel_bytes) if face else
+              gemm_plan(mesh_xy,m=m*nc,n=n*nt,k=kcarrier,nq=nk,
+                        dtype=np.complex128,layout=layout))
         minus=jnp.asarray(q_negation_index(tuple(left['grid'])))
         @partial(jax.jit,static_argnums=(6,))
         def kernel(x,y,omega,interval,ref,time,hole):
@@ -254,7 +262,9 @@ def sector_synthesis(readers, headers, bases, families, frequencies, meta, mesh_
               abstract((nk,kcarrier),np.float64),abstract((nk,2),np.int32),
               abstract((),np.float64),abstract((),np.complex128))
         for hole in (False,True):
-            _admit_compiled(kernel,(*args,hole),meta,f'sigma.sector.compiled.{tag}.{hole}',native=native)
+            # The gathered face panels are XLA buffers inside the compiled peak.
+            _admit_compiled(kernel,(*args,hole),meta,f'sigma.sector.compiled.{tag}.{hole}',
+                            native=0 if face else native)
     except BaseException:
         capacity.live_stages=ambient
         b_x=b_y=poles=None
