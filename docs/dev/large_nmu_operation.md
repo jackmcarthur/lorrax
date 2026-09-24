@@ -46,7 +46,7 @@ divide both axes.
 
 The transverse ridge routes (local JAX, local batch-reshard, fully
 distributed) and the coupled μ1–3 live set are specified with their capacity
-equations in the [memory model](../architecture/memory-model.md#transverse-ridge-solve-routes);
+equations in the [memory model](../architecture/memory-model.md#solve-stage-routes);
 their schedule is in [Face-ψ ζ fitting](../architecture/zeta_fit_face_psi_cct.md#coupled-current-schedule).
 
 ## Where the ζ factor saturates
