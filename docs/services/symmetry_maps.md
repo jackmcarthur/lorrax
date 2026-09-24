@@ -1,438 +1,261 @@
 # symmetry_maps — k-grid reduction, star maps, unfolds, and the 2c TRS check
 
-`services/symmetry_maps/`. Independently installable (`pyproject.toml`,
-src-layout); depends on `lxkit` + jax + numpy and nothing else in LORRAX.
-`import symmetry_maps` imports jax for unfold machinery. The 2c reference
-check itself uses NumPy coefficient overlaps and no FFT.
+`services/symmetry_maps/` is the one door for crystal symmetry: the
+IBZ ⇄ full-BZ tables (`SymMaps`), the band-index star map (`KStarMap`,
+`star_*`), the sharded q-axis unfolds, the ψ-unfold antiunitary rule, the
+real-space orbit machinery, the q_irr restart store, and the time-reversal
+measurement. It is independently installable (src-layout); it depends on
+`lxkit`, jax and numpy (h5py lazily, inside the two q_irr file functions) and
+on nothing in LORRAX. Import top-level names only: `from symmetry_maps.maps
+import …` from outside fails `tests/test_layering.py`.
 
-## Purpose
-
-One door for everything symmetry: the IBZ ⇄ full-BZ tables (`SymMaps`), the
-k-star index map for band-index quantities (`KStarMap`, `star_select` /
-`star_broadcast` / `star_spread`), the sharded q-axis unfolds (`unfold_v_q`,
-`mix_lorentz_blocks`), the ψ-unfold antiunitary rule (`unfold_psi`,
-`trs_augment_U`, `tau_phase_row`), the real-space orbit machinery
-(`compute_centroid_sym_perm` and friends), and the time-reversal
-MEASUREMENT (`check_density_symmetries`).
-
-Before this service the same machinery was three modules in two packages —
-`common/symmetry_maps.py`, `centroid/orbit_syms.py`,
-`common/density_symmetry_check.py` — consumed by 40 files, and its worst
-failure class was invisible by construction: a conjugation predicate
-applied against the wrong reference row costs **183.61 eV** in off-diagonal
-Σ while every diagonal observable — norm, hermiticity, trace, electron
-count, the eqp columns — stays *exactly* unchanged (`27cc885`). Nothing in
-the suite could see it because nothing in the suite looked off the
-diagonal. The service exists so that predicate lives in ONE place
-(`_star_conj_flags`, the XOR), is read by four entry points, and is pinned
-by tests that CONSTRUCT the disagreement rather than assume it.
-
-The service is the door. `import symmetry_maps` and use top-level names;
-`from symmetry_maps.maps import …` from outside the package is a layering
-failure that `tests/test_layering.py` fails on (with a red twin). Since
-2026-08-07 `upward_edges()` skips an edge whose target is a service's
-top-level package — the door rule made structural, not an exception entry —
-so reaching *past* the door is the thing that still flags.
-
-The service owns star membership and symmetry actions, not the quadrature
-meaning of a WFN's stored k rows. The centroid consumer
-`centroid.sampling_metric.full_k_quadrature_weights` distinguishes full-BZ
-storage (`wfn.nkpts == sym.nk_tot`, stored weights pass through and every
-parent is a self-image) from IBZ storage (each stored parent weight is spread
-over its star). That branch is intentional: `SymMaps` supplies the authenticated
-indices and actions but does not reinterpret `kweights`.
+The conventions (BGW `mtrx`/τ, the ψ-unfold algebra, the (α, L)
+decomposition) are derived in [`theory/symmetry.md`](../theory/symmetry.md);
+the cross-object conventions and design reasoning are in
+[`architecture/symmetry_register.md`](../architecture/symmetry_register.md).
+This page is the service contract.
 
 ## API
 
-| name | what it is |
+| name | contract |
 |---|---|
-| `SymMaps(wfn)` | Canonical operation source. `wfn.trs_holds` is required and becomes the sole consumer verdict `trs_allowed`; a missing verdict refuses. The retired `allow_trs=` argument refuses by name because it could override the measured DFT state. `operation_rows` returns reciprocal rotation, Seitz translation, and the antiunitary bit. `cartesian_action` selects polar/axial and time parity; `fft_grid_pullback`, `spinor_action`, `reciprocal_phase`, and `unfold_wavefunction` use the same typed rows. |
-| `read_qe_symmetry_receipt` / `bind_qe_symmetry_receipt` / `resolve_qe_symmetry_binding` | Bounded `data-file-schema.xml` reader and WFN authentication gate. Pins raw matrix orientation, Seitz translation, k rows/grid, spinor count, per-operation antiunitary bits, and QE's pure-TR k-reduction permission. |
-| `build_spatial_operator_tables(wfn)` | Canonical `mtrx.T`, translation, Cartesian and spinor action tables without a k-map. The 2c reference check uses this to measure an inconsistent reduced WFN before `SymMaps` refuses its mesh coverage. |
-| `KStarMap(irr_idx, sym_idx, n_sym_spatial)` / `.from_sym(sym, nss)` | Band-index IBZ ⇄ full BZ. Bundles the three arrays that always travel together so no call site can supply two of the three. `.identity(nk)` is the no-reduction map, so a driver reads the same whether or not symmetry is in use. `select` / `broadcast` / `spread` / `spread_rel`. |
-| `star_select(A_full, irr_idx_k)` | Keep one row per star — the FIRST occurrence, in full-BZ order, never `np.unique`'s ascending label order. |
-| `star_broadcast(A_irr, irr, sidx, nss, *, trs_reference='star_row')` | IBZ → full BZ with the conjugation predicate. Two legal values, one per operand flavour; an unknown value RAISES rather than defaulting. The default is `'star_row'` — see Contract for why the one `'ibz_slab'` caller passes it as a literal anyway. |
-| `star_spread(A_full, irr, sidx, nss)` | The one diagnostic that sees a gauge or conjugation mismatch. Hermiticity, norms and electron counts all survive one. |
-| `directed_edge_orbit_table(...)` | Pure-array compact-directed-edge → full-grid table. Handles signed elementary steps on shifted/anisotropic grids, records source/target endpoints, direction, adjoint and antiunitary flags, and REFUSES non-permutations, incomplete or conflicting images. |
-| `q_stencil_orbit_table(...)` | Pure-array reduction of a finite-q stencil through canonical q tables and required `active_symmetry_rows`. Returns exact q-IBZ sources plus target-to-source symmetry metadata; it has no second TR authorization switch. |
-| `apply_band_matrix_symmetry(...)` | The one band-matrix action: optional adjoint, antiunitary conjugation, endpoint sewing, and optional component mixing. `star_broadcast` uses its identity-sewing antiunitary path rather than maintaining a second algebra. |
-| `unfold_v_q(V_q_ibz, *, irr_idx, sym_idx, sym_perm, L_table, q_irr_frac, mesh_xy, n_sym_spatial)` | Sharded centroid double-gather + umklapp L-phase + TRS conj. `shard_map` + paired `all_to_all`, 1× single-tile peak memory per rank. |
-| `unfold_operator_local(...)` | The manual-mode body of the axis-local Hermitian (`conj`) rectangular unfold: one local `(n_parent, mu_loc, nu_loc)` tile in, the rank's `(n_full, mu_loc, nu_loc)` tile out, inside the CALLER's `('x','y')` `shard_map`. Endpoint tables (owner-local gather offsets + lattice wraps per typed row) are runtime operands, so a real-grid tile that changes per call reuses one executable. Both endpoints must be orbit-packed; the caller's plan owns that certificate. `left_mesh_axis`/`right_mesh_axis` (default `'x'`/`'y'`) name the axis whose shard of whole-endpoint tables this rank holds; `None` means the tables are already the local slice (a replicated μ batch, an r block of one flat `('x','y')` rank — `isdf.core.parent_projector_kconv`). Shares its phase/time-reversal step with the top-level kernel. |
-| `open_spin_block_coefficient(U, a, b)` | `coef[k,c,d] = U_k[a,c]·conj(U_k[b,d])`: one output block of the spin action `U O U†` as a coefficient table, so a consumer that can hold one full-k spin block at a time accumulates it from its parent blocks. The spin representation stays here. |
-| `real_space_orbit_labels(sym_matrices, tnp, fft_grid)` | Orbit-minimum label of every FFT-grid point, built one operation at a time through `centroid_source_map_and_wrap` on the complete grid: O(n_rtot) host memory, never the O(n_sym·n_rtot) pull-back table. The partition the ζ fit's orbit-closed real-grid tiles are cut from. |
-| `unfold_file_wedge_band_operator(sym, data, *, trs_rule)` | FILE wedge → full BZ for the band matrix of a k-diagonal operator, with the antiunitary rule named by the caller: `"conj"` (an observable, what `unfold_file_wedge_to_full_bz` does) or `"transpose"` (an operator that transforms like G: ψ_Θk = Θψ_k gives G_Θk(r,r') = G_k(r',r) at the same complex frequency, so Σ_{Θk,mn} = Σ_{k,nm} — the diagonal's Im Σ keeps its sign). The raw-parent Σ route's broadcast after projecting on the parents' rows; no default. |
-| `unfold_wavefunction_local(psi_parent_local, *, irr_idx, sym_idx, k_irr_frac, local_perm, L_table, spin_action_full, n_sym_spatial, spin_axis, mu_axis, mesh_axis=None)` | Children ψ_{gk̄} from raw parents on one μ-local slab of an orbit-packed face by the one-endpoint typed action ψ_{gk̄,a}(μ) = Σ_c U_g[a,c] T_g[e^{2πi k̄·L_{g,μ}} ψ_{k̄,c}(α_g μ)], T_g conjugation on antiunitary rows; the spin table is per FULL-k row. For consumers that need ψ itself at every k (the fractional-occupation pair scans); tables either pre-sliced to the slab or complete and sliced by `axis_index(mesh_axis)`. |
-| `mix_channels_by_proper_rotation(..., sym=...)` | Pauli-vector mixing on the bispinor TT block. It requests axial, time-odd actions from `SymMaps`; callers cannot supply a rotation convention. |
-| `unfold_psi(cnk_kbar, *, sym_idx, g_kbar, sym_mats_k, translations, U_spinor_spatial)` | The (★) ψ derivation: spinor rotation, τ phase, G-list negation, TRS conjugation. Hard-raises unless `len(sym_mats_k) == 2·len(U_spinor_spatial)`. |
-| `slice_q_full_to_ibz` | Full-BZ → IBZ q-axis gather, sharding-preserving and jit-cached. |
-| `trs_augment_U`, `tau_phase_row`, `kgrid_shift_map`, `q_negation_index`, `common_uniform_grid_indices`, `find_irreducible_bz_points`, `map_full_kpoints_to_irreducible` | Pure-NumPy primitives. The two mapping routines share the registered highest-parent/lowest-operation rule; `map_full_kpoints_to_irreducible` also returns a coverage mask so incomplete WFN metadata is refused before an index table is used. |
-| `compute_centroid_sym_perm`, `compute_rgrid_sym_perm`, `build_real_space_syms`, `orbit_images`, `canonicalize_orbit`, `unfold_orbit_unique_with_id`, `recover_atomic_space_group`, `recover_symmorphic_density_point_group` | Real-space orbit machinery. `recover_atomic_space_group` derives centroid-only Seitz rows from lattice, positions, and species; it does not authorize electronic reductions. `compute_centroid_sym_perm(validate=True)` refuses a non-closed set. |
-| `check_spinor_reference_trs`, `cached_density_symmetry_check`, `DensitySymmetryReport`, `occupation_operator_residual`, `trs_check_mode` | Gauge-invariant 2c occupied-density comparison and its overlap-to-projector-distance primitive. Raw, spatial-only, and TRIM evidence are distinguished; antiunitary-generated partners are excluded. |
-| `build_qgrid_trs_policy(*, trs_measured, ..., active_symmetry_rows)` → `QgridTrsPolicy` | **The q-axis consumer of operation authorization, and the only one.** `trs_measured` has no default. Global TR true enables pair-coherent q/−q rows and the fixed-q Θ projector. Global TR false disables both, but retains individually authenticated magnetic antiunitary rows and refuses every unauthorized row. |
-| `QgridTrsPolicy.measure_covariance(V_ibz, ...)` / `little_group_covariance_residual(...)` | The little-group covariance assumed by the IBZ→full-BZ unfold, measured with the same authorized row, centroid permutation, umklapp phase, and antiunitary conjugation. Returns `nan` when no non-identity little-group operation exists. |
-| `project_little_group_operator(operator, *, transposed_partner, ...)` | Average all authenticated unitary and antiunitary stabilizers, including at non-TRIM q. Takes same-time operator/transpose tiles and packed source/wrap tables; returns the average and its transpose in `P(None,x,y)`. Streams one operation per loop, with volume-preserving all-to-all for nonlocal permutations. Each matrix remains at most `b*M*M/P` entries/rank; aggregate inputs/scratch require caller admission. Physical consumers own the meaning of the projected operator. |
-| `self_negative_q_mask(q_full_idx, *, kgrid)` | The one-element orbits of `q → −q`: every TRIM of an even mesh, Γ alone on an odd one. These are the rows where the fixed-q pure-Θ projector acts. The full magnetic little group can contain other antiunitary stabilizers at ordinary q. |
+| `SymMaps(wfn)` | The canonical operation source. Requires `wfn.trs_holds`, which becomes `trs_allowed`; a missing verdict refuses, and `allow_trs=` refuses by name. `operation_rows` returns reciprocal rotation, Seitz translation and the antiunitary bit; `cartesian_action(rows, *, axial, time_odd)`, `lorentz_action`, `fft_grid_pullback`, `spinor_action`, `reciprocal_phase` and `unfold_wavefunction` act through the same typed rows. `validate_kgrid_unfolding` checks the tables. |
+| `read_qe_symmetry_receipt`, `bind_qe_symmetry_receipt`, `resolve_qe_symmetry_binding`, `discover_qe_schema_paths`, `qe_xml_seitz_to_bgw` | Bounded `data-file-schema.xml` reader and WFN authentication: matrix orientation, Seitz translation, k rows/grid, spinor count, per-operation antiunitary bits, and QE's pure-TR k-reduction permission. |
+| `build_spatial_operator_tables(wfn)` | `mtrx.T`, translation, Cartesian and spinor tables without a k-map, so the 2c check can measure a reduced WFN that `SymMaps` would refuse. |
+| `KStarMap(irr_idx, sym_idx, n_sym_spatial)`, `.from_sym(sym, nss)`, `.identity(nk)` | The three star arrays bundled so no caller supplies two of three. `select`, `broadcast`, `spread`, `spread_rel`. |
+| `star_select(A_full, irr_idx_k)` | One row per star: the **first** occurrence in full-BZ order, never ascending label order. |
+| `star_broadcast(A_irr, irr, sidx, nss, irr_labels=None, *, trs_reference, trs_rule='conj')` | IBZ → full BZ with conjugation (or transpose) on time-reversed rows. `trs_reference` is required: `'star_row'` or `'ibz_slab'` (§ Contract). |
+| `star_spread(A_full, irr, sidx, nss)` | The residual that sees a gauge or conjugation mismatch; norms, hermiticity and electron counts do not. |
+| `unfold_file_wedge_to_full_bz`, `unfold_star_wedge_to_full_bz`, `unfold_file_wedge_polar_matrix`, `unfold_file_wedge_band_operator(sym, data, *, trs_rule)`, `reduce_full_bz_to_file_wedge`, `star_tables_of` | The named unfolds, taking a `SymMaps` so a driver never holds index tables. The FILE wedge (`wfn.kpoints`, `nk_red`, what BerkeleyGW files use) and the STAR wedge (one row per orbit) differ in size on most decks. `unfold_file_wedge_band_operator` takes `trs_rule='conj'` for an observable or `'transpose'` for an operator that transforms like G (Σ_{Θk,mn} = Σ_{k,nm}). |
+| `directed_edge_orbit_table`, `q_stencil_orbit_table`, `apply_band_matrix_symmetry` | Pure-array edge and q-stencil orbit tables and the one band-matrix symmetry action, § [Directed band-matrix edges](#directed-band-matrix-edges). |
+| `unfold_isdf_operator(V_q_ibz, *, irr_idx, sym_idx, sym_perm, L_table, q_irr_frac, mesh_xy, n_sym_spatial, trs_rule='conj', ...)` | Centroid-indexed operator IBZ → full BZ: double centroid gather, umklapp L-phase, antiunitary conjugation. `shard_map` with paired `all_to_all`; one single-tile peak per rank. |
+| `unfold_operator_local(...)` | The manual-mode body of the same unfold for a caller already inside an `('x','y')` `shard_map`: one local parent tile in, the rank's full-k tile out. Endpoint tables are runtime operands, so changed tables reuse one executable. Both endpoints must be orbit-packed (the caller's plan certifies it); `left_mesh_axis`/`right_mesh_axis` name the axis whose table shard this rank holds, `None` meaning already local. |
+| `unfold_isdf_one_leg`, `isdf_one_leg_source_slots`, `unfold_spin_centroid_operator`, `open_spin_block_coefficient(U, a, b)` | One-leg (parent-G relabelling, scalar/polar transport) and spin-operator unfolds; `open_spin_block_coefficient` gives one block `coef[k,c,d] = U_k[a,c]·conj(U_k[b,d])` of `U O U†`. |
+| `mix_lorentz_blocks(blocks, *, sym, sym_idx, mesh_xy, keys=None)` | Mixes charge/current sectors by Λ⊗Λ from `SymMaps.lorentz_action`; callers supply no rotation convention. `sym_idx` is host metadata. |
+| `unfold_wavefunction_local(psi_parent_local, *, irr_idx, sym_idx, k_irr_frac, local_perm, L_table, spin_action_full, n_sym_spatial, spin_axis, mu_axis, mesh_axis=None)` | Children on one μ-local slab: $\psi_{g\bar k,a}(\mu) = \sum_c U_g[a,c]\,T_g\!\left[e^{2\pi i \bar k\cdot L_{g,\mu}}\psi_{\bar k,c}(\alpha_g\mu)\right]$, $T_g$ conjugating on antiunitary rows; the spin table is per full-k row. |
+| `certify_endpoint_locality`, `endpoint_panel_cost`, `unfold_endpoint_panel` | Bounded endpoint-panel unfolds, § [Endpoint panels](#endpoint-panels). |
+| `unfold_psi`, `spinor_rotation_for_sym_row`, `apply_spinor_rotation`, `tau_phase_row`, `tau_phase_row_jax`, `unfold_reciprocal_carriers` | Pure-array ψ(G) unfold: spinor rotation, τ phase, G-list negation, TRS conjugation. `unfold_psi` refuses unless `len(sym_mats_k) == 2·len(U_spinor_spatial)`. |
+| `slice_q_full_to_ibz` | Full-BZ → IBZ q gather, sharding-preserving, jit-cached. |
+| `kgrid_shift_map`, `bgw_signed_q_representative`, `bgw_integer_q_to_fractional`, `q_negation_index`, `common_uniform_grid_indices`, `find_irreducible_bz_points`, `map_full_kpoints_to_irreducible` | Pure-NumPy grid algebra. The mapping routines share the highest-parent / lowest-operation rule; `map_full_kpoints_to_irreducible` returns a coverage mask so incomplete metadata refuses before an index table is used. |
+| `real_space_action_tables`, `centroid_source_map_and_wrap`, `fft_grid_pullback_perm`, `grid_point_image_perm`, `orbit_images`, `canonicalize_orbit`, `unfold_orbit_unique_with_id`, `permutation_orbit_labels`, `real_space_orbit_labels`, `r_action_forward`, `snap_to_grid_and_split_wrap`, `project_polar_fft_field` | Real-space orbits. `centroid_source_map_and_wrap` returns a SOURCE map plus lattice wrap; `fft_grid_pullback_perm` returns a PULL-BACK permutation; they point in opposite directions. `real_space_orbit_labels(sym_matrices, translations, fft_grid)` builds orbit labels one operation at a time in O(n_rtot) host memory. |
+| `recover_atomic_space_group`, `recover_symmorphic_density_point_group` | Centroid-only Seitz rows from lattice, positions and species; they do not authorize electronic reductions. |
+| `verify_centroid_orbit_closure`, `CentroidClosureVerdict`, `resolve_qgrid_symmetry`, `QgridSymmetryResolution` | Orbit closure as a measurement (by how much, on which operations), and the one q-grid decision (verdict → `"ibz"`/`"full_bz"` → tables → reason). The resolution composes its announcement; the process running the deck prints it. |
+| `write_qirr_tensor`, `read_tensor`, `read_tables`, `allocate_qirr_placeholder`, `QirrTables`, `QirrHeader`, `validate_qirr_tables`, … | q_irr restart tensors: the pre-unfold wedge on disk with its tables, unfolded on read. The writer refuses a non-closed centroid set; the reader refuses version, hash or table drift and an unpersisted placeholder; a file without attrs reads as full BZ. |
+| `check_spinor_reference_trs`, `check_density_symmetries`, `cached_density_symmetry_check`, `DensitySymmetryReport`, `occupation_operator_residual`, `trs_check_mode` | The 2c time-reversal measurement, § Contract. |
+| `build_qgrid_trs_policy(*, trs_measured, irr_idx_q, sym_idx_q, q_irr_full_idx, kgrid, n_sym_spatial, active_symmetry_rows=None, ...) -> QgridTrsPolicy` | The only q-axis consumer of the TRS verdict. `trs_measured` is keyword-only with no default. |
+| `QgridTrsPolicy.measure_covariance`, `little_group_covariance_residual` | The little-group covariance the unfold assumes, measured with the same authorized row, centroid permutation, umklapp phase and conjugation; `nan` when no non-identity little-group operation exists. |
+| `project_little_group_operator(operator, *, transposed_partner, ...)` | Average over all authorized unitary and antiunitary stabilizers of each q. Returns the average and its transpose at `P(None,'x','y')`, one operation per loop step, with volume-preserving `all_to_all` for nonlocal permutations; each matrix stays ≤ `b·M·M/P` entries per rank. |
+| `self_negative_q_mask(q_full_idx, *, kgrid)`, `minus_q_parent_partners`, `trs_pair_coherent_unfold_sym_idx`, `trs_project_self_negative_q_rows` | The one-element orbits of q → −q (every TRIM of an even mesh, Γ alone on an odd one), where the fixed-q Θ projector acts, and the pair-coherent row map. |
 
-`SymMaps.validate_kgrid_unfolding` is public surface on the class and is
-kept rather than deleted, with the case where it returns FALSE constructed
-(a corrupted table) — a check that cannot fail is not a check.
+`unfold_v_q`, `trs_augment_U`, `compute_centroid_sym_perm`,
+`compute_rgrid_sym_perm` and `build_real_space_syms` are call-through
+aliases of `unfold_isdf_operator`, `spinor_rotation_for_sym_row`,
+`centroid_source_map_and_wrap`, `fft_grid_pullback_perm` and
+`real_space_action_tables` (`symmetry_maps.RENAMES`). Use the primary names.
 
 ## Contract
 
-* **The time-reversal verdict is measured once and applied automatically.**
-  `WfnLoader` discovers and authenticates the QE `data-file-schema.xml`, the
-  occupied-density checker measures the two-component DFT state without ever
-  using an antiunitary-generated partner as evidence, and the only executable
-  verdict is `WfnLoader.trs_holds` → `SymMaps.trs_allowed`. Missing or
-  inconclusive evidence disables global TR; it never defaults to true.
-  `SymMaps(..., allow_trs=...)` is retired and refuses by name, as do the old
-  `LORRAX_TRS_CHECK=0/off` values that skipped the measurement. The run record
-  prints `QE schema`, `Stored QE type`, `DFT 2c TRS`, `Global TRS`, and the
-  active operation rows. The q-grid policy, W gates, GN probe, MPA contour,
-  QSGW velocity parity, and every other consumer read `SymMaps.trs_allowed`;
-  none accepts an override. The MPA ordered-orientation equation is owned by
-  [Multipole frequency integration](../theory/THEORY_mpa_implementation.md#21-ordered-orientations-when-time-reversal-is-broken).
-* **`_star_conj_flags` is the single source of conjugation truth.** One
-  predicate — `trs(member) XOR trs(reference_row)` — read by four entry
-  points: `star_broadcast`'s `star_row` branch, `star_spread` via
-  `_spread_tables`, and `KStarMap` twice. No site inside the package
-  re-derives it, and nothing outside imports it. The hand-rolls that remain
-  in `src/` are registered to their owners, not copied in here.
-* **`trs_reference` names the operand flavour, and the one caller that needs
-  the non-default value says so in the source.** `"star_row"` means
-  `A_irr`'s rows are the values at the KEPT FULL-BZ rows (what
-  `star_select` returns), so the conjugation is the XOR. `"ibz_slab"` means
-  `A_irr` is the raw IBZ slab, read with no symmetry operation applied, so
-  every row is TRS-false by construction and the predicate is the member's
-  own flag. The two coincide only while every star's first full-BZ row is
-  spatial, which is a property of the op-selection policy and not of the
-  physics. Getting the pairing wrong costs ~0.4–0.6 relative on real decks
-  (measured: gnppm `kin_ion` 3.7e-16 right vs 5.6e-01 wrong) and is
-  entirely off-diagonal in Σ. The parameter HAS a default (`"star_row"`,
-  right for what `star_select` hands back), so a caller on the other
-  flavour is one omitted keyword away from the 183.61 eV — which is why
-  `gw/kin_ion_io.py` passes the literal and
-  `tests/test_kin_ion_star_broadcast.py` asserts by AST that it is a string
-  CONSTANT, not a variable and not a conditional. An unknown spelling
-  raises with both legal values named; it never falls through.
-* **The op-selection policy is bit-frozen.** `find_symmetry_ops_simple` has
-  no `break` — the HIGHEST matching `ikbar` wins, then the lowest sym — and
-  `find_irreducible_bz_points`' anchored branch shadows it bit-for-bit.
-  Changing either moves eqp by up to 15.9 eV in the V_H column downstream
-  (measured, `3e002f2`) and is an OWNER decision. Two tripwires fail loudly
-  if it drifts: the four-deck `(irr_idx_k, sym_idx_k)` bit-equality test,
-  and the cohsex TRS-first-row precondition assertion (which FAILS rather
-  than skips).
-* **Refusals are part of the API.** A stored k/symmetry table must cover every
-  point declared by `kgrid`; missing rows never fall back to Γ/identity.
-  `ntran=1` reaches the fast full-grid path only when all grid points are
-  actually stored; otherwise it uses the ordinary `[I,-I]` planner.
-  TRS-disallowed construction names `noinv=.true.` and states that the
-  measured verdict has no input/environment override; the
-  orbit-closure refusal names the regeneration fix; `unfold_v_q`'s four
-  shape refusals exist because `promise_in_bounds` gathers clip SILENTLY on
-  an out-of-bounds index, so an unrefused shape is a wrong answer rather
-  than an error.
-* **`nspinor = 2` means NONCOLLINEAR, not spin-orbit.** `SymMaps` and
+* **The time-reversal verdict is measured once and consumed everywhere.**
+  `WfnLoader` authenticates the QE `data-file-schema.xml`; the
+  occupied-density check measures the two-component DFT state; the only
+  executable verdict is `WfnLoader.trs_holds` → `SymMaps.trs_allowed`.
+  Missing or inconclusive evidence disables global TR; it never defaults to
+  true. Every consumer (q-grid policy, W gates, GN probe, MPA contour, QSGW
+  velocity parity) reads `SymMaps.trs_allowed`, and none accepts an override.
+  The run record prints `QE schema`, `Stored QE type`, `DFT 2c TRS`,
+  `Global TRS` and the active operation rows. The MPA ordered-orientation
+  equation is owned by [Multipole frequency integration](../theory/THEORY_mpa_implementation.md#21-ordered-orientations-when-time-reversal-is-broken).
+* **The 2c check never uses an antiunitary-generated state as evidence.** Raw
+  `k/−k` pairs and TRIM closure are direct evidence. With only a spatial
+  partner, the check uses the canonical spatial unfold and labels the result
+  conditional; a mismatch then disables antiunitary unfolding without being
+  attributed to TRS alone. The metric is the occupied one-particle-subspace
+  residual in G space, invariant to band phases and to rotations within
+  degenerate blocks. TRIM-only or absent evidence is inconclusive.
+* **Env surface.** `LORRAX_TRS_CHECK` takes `1`/`on` (default) or `strict`
+  (a broken or inconclusive verdict refuses); `0`/`off` refuses.
+  `LORRAX_TRS_TOL` and `LORRAX_TRS_MAX_K` tune the measurement. The
+  environment never grants a symmetry convention;
+  [`docs/dev/env_vars.md`](../dev/env_vars.md) owns the definitions.
+* **`_star_conj_flags` is the single conjugation predicate:**
+  `trs(member) XOR trs(reference_row)`. It is read by `star_broadcast`'s
+  `'star_row'` branch, by `star_spread`, and twice by `KStarMap`. Nothing
+  outside the package imports it and nothing inside re-derives it.
+* **`trs_reference` names the operand flavour.** `'star_row'`: `A_irr` rows are
+  values at the kept full-BZ rows (what `star_select` returns), so the
+  predicate is the XOR. `'ibz_slab'`: `A_irr` is the raw IBZ slab with no
+  operation applied, so every reference row is TRS-false and the predicate is
+  the member's own flag (`sym_idx >= n_sym_spatial`). The two agree only when
+  every star's first full-BZ row is spatial. Choosing the wrong one leaves
+  every diagonal observable unchanged and corrupts off-diagonal Σ (by
+  183.61 eV on a real deck), so the argument is required, an unknown value
+  raises with both legal values named, and the raw-slab callers
+  (`file_io.kin_ion.broadcast_ibz_to_full_bz`,
+  `unfold_file_wedge_band_operator`) pass the literal.
+* **The op-selection policy is frozen.** `SymMaps.find_symmetry_ops_simple`
+  takes the highest matching irreducible k, then the lowest symmetry index;
+  `find_irreducible_bz_points`' anchored branch reproduces it bit for bit.
+  Changing it moves eqp by up to 15.9 eV (V_H column) and is an owner
+  decision. The tripwire is the bit-equality of `(irr_idx_k, sym_idx_k)` on
+  the four in-tree decks against
+  `services/symmetry_maps/tests/data/star_tables_e9340d1.json`.
+* **Translations: one array, two conventions.** `SymMaps.translations` is raw
+  BGW `tnp` (= 2π·τ). G-space consumes it undivided (`tau_phase_row`); every
+  real-space `orbit_syms` entry point divides by 2π. Passing one function's
+  argument to the other is a 2π error no shape or dtype check catches.
+  `verify_centroid_orbit_closure` takes an exclusive `tnp=`/`tau=` keyword
+  pair for that reason.
+* **Refusals.**
+  - A stored k/symmetry table must cover every point of `kgrid`; missing rows
+    never fall back to Γ or identity. `ntran = 1` takes the fast full-grid
+    path only when all grid points are stored.
+  - With TRS disallowed, a WFN whose reduction needs time reversal refuses
+    and names the fix: regenerate with `noinv=.true.`.
+  - `centroid_source_map_and_wrap` refuses a non-closed centroid set and
+    names regeneration as the fix.
+  - `unfold_isdf_operator` refuses every table/shape mismatch before tracing,
+    because an out-of-bounds `promise_in_bounds` gather clips silently.
+* **`nspinor = 2` means noncollinear, not spin-orbit.** `SymMaps` and
   `unfold_psi` branch on the spinor axis, never on SOC.
-* **The 2c TRS check never tests a state made with an antiunitary row.** Raw
-  `k/-k` pairs and TRIM closure are direct. If only a spatial partner exists,
-  the check uses the canonical spatial unfold and labels the result
-  conditional; a mismatch disables antiunitary unfolding but is not assigned
-  to TRS alone. The metric is the occupied one-particle-subspace residual in
-  G space, invariant to band phases and rotations inside degenerate blocks.
-  TRIM-only or absent evidence is inconclusive and disables antiunitary
-  unfolding. The former `LORRAX_TRS_CHECK=0/off` permissive mode is retired
-  because skipping the measurement asserted global TR rather than merely
-  disabling a diagnostic.
-* **The q axis CONSUMES that verdict and the QE row typing; it never re-derives
-  either.**
-  `QgridTrsPolicy` is the whole of the q-axis time-reversal contract, and
-  `trs_measured` is keyword-only with no default so a caller who has not
-  consulted the density gets a `TypeError`. Before this, `gw/v_q_g_flat`,
-  `gw/screening` and `gw/screening_bse` each composed q with −q through Θ
-  and projected every self-negative row *unconditionally*; on ferromagnetic
-  CrI3 (Perlmutter JID 57271494) q and −q are independent irreducible
-  parents, and the composition refused only after a 685.96-GB ζ fit had
-  closed. The magnetic arm contains no arbitrary global-TR composition or
-  projector; a schema-authenticated antiunitary space-group row remains a
-  valid operation-specific action.
-* **`V_{−q} = conj(V_q)` is NOT a TRS statement and is not gated on the
-  verdict.** The pair densities fitted at −q are the conjugates of those
-  fitted at +q with bra and ket relabelled, for any mean field; `v(|q+G|)`
-  is real and even. So the reciprocity gate stays armed on a ferromagnet.
-  What a magnet changes is only that the relation stops being *imposed* by
-  the unfold — q and −q are independently solved — so the gate becomes an
-  independent measurement instead of an identity.
-* **Point-group covariance of the ζ basis is an ASSUMPTION of the unfold,
-  and it is now measured.** `unfold_isdf_operator` is faithful to its
-  contract (re-implemented offline it reproduces every stored tile to
-  2.030e-16), but that contract presumes the stored parent tile is
-  invariant under its own little group — exact for the continuum operator,
-  approximate for a finite and possibly ill-conditioned ISDF fit, and
-  false by 1.240e-02 at Γ on Na 8×8×8 SOC c464 (47 of 48 ops). Where that
-  holds only approximately, choosing two unrelated spatial coset rows for
-  q and −q converts an ordinary fit error into a forbidden reciprocity
-  error — which is what the pair-coherent row map removes, and what
-  `measure_covariance` reports so the fit, not the unfold, gets diagnosed.
-* Env surface: `LORRAX_TRS_CHECK` (`1` | `strict`; `0/off` refuses), `LORRAX_TRS_TOL`,
-  `LORRAX_TRS_MAX_K` — all in
-  `docs/dev/env_vars.md`. Env tunes the measurement or makes a failing result
-  strict; it never grants a symmetry convention.
+* **The q axis consumes the verdict and the QE row typing.** With
+  `trs_measured=True`, `QgridTrsPolicy` enables pair-coherent q/−q rows and
+  the fixed-q Θ projector. With `False` it disables both but keeps
+  individually authenticated magnetic antiunitary rows, and refuses every
+  unauthorized row; q and −q are then independent irreducible parents.
+* **`V_{−q} = conj(V_q)` is not a TRS statement.** The pair densities at −q are
+  the conjugates of those at +q with bra and ket relabelled, for any mean
+  field, and $v(\lvert q+G\rvert)$ is real and even. The reciprocity gate stays
+  armed on a magnet; there it is an independent measurement because q and −q
+  are solved separately.
+* **Little-group covariance is an assumption of the unfold, and it is
+  measured.** `unfold_isdf_operator` presumes each stored parent tile is
+  invariant under its own little group: exact for the continuum operator,
+  approximate for a finite ISDF fit. `measure_covariance` reports the
+  residual so a fit error is diagnosed as a fit error; the pair-coherent row
+  map prevents it from becoming a reciprocity error.
+* **Storage boundary.** The service owns star membership and symmetry actions,
+  not the quadrature meaning of a WFN's stored k rows: `SymMaps` does not
+  reinterpret `kweights` (the centroid sampling metric decides between
+  full-BZ and IBZ storage).
 
 ### Directed band-matrix edges
 
 `directed_edge_orbit_table` takes only arrays from the canonical point map:
 `kgrid`, the WFN `shift` in mesh-index units, `sym_mats_k`,
-`irr_idx_k`/`sym_idx_k`, and the exact raw-source rows `kirr_fullids`.  A
-stored link has layout
-`(n_source_k, n_source_step, ..., n_band_x, n_band_y)`.  The returned dense
-fields have layout `(n_k_full, n_target_step)` and index that array with
-`source_row`/`source_direction`; `reverse`, `antiunitary`, `sym_idx`, and both
-stored/oriented endpoint pairs make every non-index action explicit.
+`irr_idx_k`/`sym_idx_k`, and the raw-source rows `kirr_fullids`. A stored
+link has layout `(n_source_k, n_source_step, ..., n_band_x, n_band_y)`. The
+returned dense fields have layout `(n_k_full, n_target_step)` and index that
+array with `source_row`/`source_direction`; `reverse`, `antiunitary`,
+`sym_idx` and both stored/oriented endpoint pairs make every action explicit.
 
-For a source link `M(k0,k1)`, `apply_band_matrix_symmetry` implements
+For a source link $M(k_0, k_1)$, `apply_band_matrix_symmetry` implements
 
-```
-M(gk0,gk1) = B_g(k0) M(k0,k1) B_g(k1)† .
-```
+$$M(gk_0, gk_1) = B_g(k_0)\, M(k_0, k_1)\, B_g(k_1)^\dagger .$$
 
-An antiunitary row conjugates `M`; it does not transpose a non-Hermitian
-link.  A reverse edge first adjoints `M` and swaps the endpoint sewings.
-`component_mix[..., out, in]` optionally mixes a component axis after the
-band action. Cartesian callers obtain it from `SymMaps.cartesian_action`;
-non-Cartesian representations remain explicit.
+An antiunitary row conjugates $M$; it does not transpose a non-Hermitian
+link. A reverse edge first adjoints $M$ and swaps the endpoint sewings.
+`component_mix[..., out, in]` optionally mixes a component axis after the band
+action; Cartesian callers take it from `SymMaps.cartesian_action`.
 Translations and nonsymmorphic phases belong in the endpoint sewing matrices,
-not in the edge table.  Identity sewings preserve the existing
-`star_broadcast` convention exactly.
+not in the edge table. Identity sewings reproduce `star_broadcast` exactly.
 
-The builder validates every symmetry row as an affine permutation of
-`(n + shift)/kgrid` and every stored direction as a signed elementary-step
-permutation.  A C3 operation that maps an elementary step to a multi-step
-combination therefore REFUSES and names the fix.  This elementary-step
-service requires a direction basis closed under the
-point group; a multi-hop orbit must be precomputed before using this table.
-No nearest-direction, clipped-index, or last-write-wins fallback exists.
-The host table costs `O(n_k*n_sym + n_k*n_target*n_source_step)` small integer
-work.  Endpoint sewing adds only the two distributed band-space products;
-there is no full-band gather or wavefunction dependency.
+Every symmetry row must be an affine permutation of `(n + shift)/kgrid` and
+every stored direction a signed elementary-step permutation. An operation
+that maps an elementary step to a multi-step combination (a C3 on some grids)
+refuses and names the fix: the direction basis must be closed under the point
+group, or a multi-hop orbit precomputed. There is no nearest-direction,
+clipped-index or last-write-wins fallback. The host table costs
+`O(n_k·n_sym + n_k·n_target·n_source_step)` small-integer work; endpoint
+sewing adds only the two distributed band-space products, with no full-band
+gather or wavefunction dependency.
 
 ### q-stencil orbits
 
-`q_stencil_orbit_table` is the q-only companion to the directed-edge table.
-It closes a small set of integer q-step seeds under the exact
-`SymMaps.sym_mats_k` operations, groups the result with the existing
-`irr_idx_q` table, and returns only the symmetry-inequivalent source q rows
-plus a complete target-to-source/action table. It never acts on a transition
-matrix at fixed k. The finite-q response must first be summed over the full k
-grid at a stored source q; the resulting scalar/vector/tensor is unfolded with
-`apply_band_matrix_symmetry`. Cartesian wings use
-`sym.cartesian_action(target_sym_idx, ...)` as `component_mix`.
+`q_stencil_orbit_table(*, kgrid, sym_mats_k, irr_idx_q, sym_idx_q, seed_steps, n_sym_spatial, active_symmetry_rows)`
+closes a set of integer q-step seeds under the authorized
+`SymMaps.sym_mats_k` operations, groups the result with `irr_idx_q`, and
+returns the symmetry-inequivalent source q rows plus a complete
+target-to-source action table and a target-to-seed mask (so a caller keeps
+shell labels without putting its policy in this service). It never acts on
+a transition matrix at fixed k: sum the finite-q response over the full k grid
+at a stored source q, then unfold the resulting scalar/vector/tensor with
+`apply_band_matrix_symmetry` (Cartesian wings take
+`sym.cartesian_action(target_sym_idx, ...)` as `component_mix`). It has no
+second TR switch. Distinct steps that alias modulo the mesh refuse; there is
+no clipped or nearest-q fallback.
 
-The table also returns a target-to-seed mask so a physics caller can retain
-first/second-shell labels without putting W-av policy into the symmetry
-service. Distinct steps that alias modulo the mesh refuse; there is no clipped
-or nearest-q fallback.
+### Endpoint panels
+
+`unfold_endpoint_panel(factor_face, *, irr_idx, sym_idx, q_irr_frac, source_perm, L_table, spin_action_full, n_sym_spatial, active_mask, mesh, mesh_axis, max_live_bytes)`
+unfolds a bounded child-q panel of a `[parent, μ, spin, K]` factor whose μ
+tiles `mesh_axis` and K the other axis (`P(None,'x',None,'y')` or
+`P(None,'y',None,'x')`, like the two wavefunction faces). It returns
+`(child_face, cost)` in the same layout. `certify_endpoint_locality` checks
+that each `source_perm` row is a permutation preserving `active_mask` and
+reports whether the map is shard-local; a nonlocal map costs `P_axis − 1`
+collective permutes per panel per call on a ring that sends one local child
+panel at a time. `endpoint_panel_cost` returns analytical per-rank bounds
+(`2·parent + 6·child` bytes plus metadata, and the ring traffic), not a
+compiled peak; the caller admits `max_live_bytes` against all other live
+stages. Phase, spin and antiunitary actions delegate to
+`unfold_wavefunction_local`. For repeated calls, bind the immutable metadata
+in an outer `jit`.
 
 ## Backends
 
-Pure jax + numpy. No vendor library, no `.so`, no `dlopen` anywhere in the
-package — the whole "which backend" question that `distrib_la` exists to
-answer does not arise here, and this section is short because of it.
-
-The mesh-touching paths (`unfold_v_q`, `slice_q_full_to_ibz`, the star
-helpers on device operands) go through the package's PRIVATE `_shard_map`,
-a ruling-3 copy of `common/shard_map.py`. It PROBES for the two spellings
-(`jax.shard_map`, `jax.experimental.shard_map`), announces which one it
-took, and REFUSES rather than degrades when a jax has neither — every
-distributed kernel in the tree is written in `shard_map`, so there is no
-meaningful fallback to fall back to. Exercised on both stacks this branch
-runs: jax 0.9.1 in the WSL venv and jax 0.7.0 in the Perlmutter container,
-which announces `using jax.shard_map (jax 0.7.0)` on every rank of the
-four-process legs. Consolidation into `lxkit.jax_compat` retires this copy
-and `distrib_la`'s together, post-wave.
-
-Operand placement is the real dispatch: host operands take numpy fast paths
-(`_take_rows`, `_broadcast_rows`), device operands get cached jits with
-explicit out-shardings, and a sharded `jax.Array` never crosses to the host
-to be indexed.
+Pure jax and numpy: no vendor library and no `.so`. Mesh-touching paths go
+through the package's private `_shard_map`, which picks `jax.shard_map` or
+`jax.experimental.shard_map` and refuses on a jax with neither. Host operands
+take numpy paths; device operands take cached jits with explicit output
+shardings, and a sharded `jax.Array` is never pulled to the host to be
+indexed. The star index tables are `n_k` host integers; the operand
+(`(n_k, nb, nb)` complex128, 9.2 GB at nk = 144, nb = 2000) is what the helpers
+are written not to move. `spread_rel` on a device operand costs one reduction
+and one 16-byte transfer.
 
 ## Tests
 
-`services/symmetry_maps/tests`, markers `services` + `symmetry_maps`.
-**165 cells, and every one of them runs on a laptop in 18 seconds** —
-164 passed, 1 xfailed, nothing skipped.
+`services/symmetry_maps/tests` (markers `services`, `symmetry_maps`) runs on a
+laptop: `pytest services/symmetry_maps/tests`, or `pytest -m symmetry_maps`
+from the monorepo (deselect with `--no-services` /
+`--only-service=symmetry_maps`, never a second `-m`, which replaces
+`addopts = "-m 'not extra'"`).
 
-| tier | file | cells | needs |
-|---|---|---|---|
-| L-a star contract | `test_symmetry_maps_star_contract.py` | 32 | nothing |
-| L-a algebra + primitives | `test_symmetry_maps_algebra.py` | 31 | nothing |
-| L-a typed representation contract | `test_typed_representation_actions.py`, `test_symmetry_maps_r_cart.py` | polar/axial, time parity, C4 orientation, spinor/TR and translation | nothing |
-| L-a+ deck tables | `test_symmetry_maps_deck_tables.py` | 34 | h5py + the four in-tree WFN headers |
-| L-b emulated mesh | `test_symmetry_maps_emulated_mesh.py` | 17 | `XLA_FLAGS` set by the SERVICE conftest; **skips**, never asserts, below 4 devices |
-| L-c real multi-process | `test_symmetry_maps_multiproc.py` | 11 | `srun -n 4`; shared `check_*(mesh, …)` bodies + a `__main__` CLI (`_CLI_CELLS`) |
-| import isolation | `test_symmetry_maps_import_isolation.py` | 9 | `python -S` subprocess; `sys.modules` AND `sys.path` asserted, plus a red twin and a with-lorrax-still-passes |
-| skip honesty | `test_symmetry_maps_skip_honesty.py` | 14 | a machine profile. Four MUST rows — the four in-tree decks, the `cohsex_debug` density fixture, `h5py`, and four forceable devices. ABSENT = skip, PRESENT-AND-BROKEN = **FAIL** |
-
-What the star tier does that the old gate did not:
-
-* **Hand-typed, production-confirmed tables only.** gnppm's and cohsex's,
-  re-derived from `SymMaps(wfn)` on 2026-08-07 and committed as
-  `tests/data/star_tables_e9340d1.json`. A table DERIVED from a generated
-  grid cannot carry these tests — see Antipatterns — and that trap is
-  itself pinned by a meta-test asserting a lex-min-derived grid has ZERO
-  TRS-first stars.
-* **Every table-driven cell carries the anti-tautology assertion.** The
-  `star_row`/`ibz_slab` disagreement count must be 8 (gnppm) resp. 6
-  (cohsex) or the test FAILS. A test that would pass on a deck where the
-  two predicates agree is not testing the predicate.
-* **`SymMaps` on h5py header stubs of all four in-tree decks**, bit-compared
-  to the committed tables, with a WfnLoader parity arm that re-derives them
-  through the PRODUCTION loader. That arm skips on a standalone install
-  (there is no lorrax to import `file_io` from — the quarantine working),
-  and skip-honesty makes that legal only because the allowlist NAMES the
-  leg that runs it: the monorepo run from the checkout root. A skip with no
-  covering leg named is evaporated coverage and fails the gate.
-* **Hostile geometry is mandatory**: `n_rmu % (Px·Py) != 0` must refuse, and
-  the red twin constructs the case.
-
-Integration tests stay on the lorrax side, because what they pin is the
-call site: `tests/test_kin_ion_star_broadcast.py` pins the 183.61 eV class
-end-to-end against the committed `kin_ion.h5` references (including an AST
-assertion that the call site passes the `"ibz_slab"` literal), and
-`tests/test_star_offdiag_gate.py` is the off-diagonal-sensitive symmetry
-gate that the diagonal BGW-anchor metric structurally cannot be.
-
-Run it standalone: `pytest services/symmetry_maps/tests` (never loads
-`tests/conftest.py`). From the monorepo: `pytest -m symmetry_maps`.
-Deselect: `--no-services` / `--only-service=symmetry_maps`, never a second
-`-m` (`pyproject` sets `addopts = "-m 'not extra'"` and an explicit `-m`
-REPLACES it, silently re-enabling 26 deselected suites).
-
-## Performance
-
-**Baselines are `services/symmetry_maps/bench/baselines/`**, written by
-`bench/bench_symmetry_maps.py` in `distrib_la`'s claims format (op,
-backend, shape, mesh, seconds per row; nodes, jobid, machine per file) —
-`wsl1x1.json` (`SymMaps` construction on all four decks, the four star
-entry points host **and** device at nk=64/nb=60, `unfold_v_q` at 1×1) and
-`wsl2x2.json` (`unfold_v_q` on an emulated 2×2); the Perlmutter legs are
-run separately against the same schema, and the WSL rows are an
-under-load band, not a floor — the driver's module note has the numbers.
-Everything below is measured and is quoted, not re-run.
-
-**Suite cost**, both machines, HEAD `5daf979`:
-
-| leg | result | wall |
+| tier | file | needs |
 |---|---|---|
-| WSL venv, jax 0.9.1, `JAX_PLATFORMS=cpu JAX_ENABLE_X64=1` | 164 passed / 1 xfailed | 18.2 s |
-| Perlmutter container, jax 0.7.0, `lx test` | 163 passed / 1 skipped / 1 xfailed | 42.58 s |
+| star contract, algebra, typed actions | `test_symmetry_maps_star_contract.py`, `test_symmetry_maps_algebra.py`, `test_typed_representation_actions.py`, `test_symmetry_maps_r_cart.py` | nothing |
+| deck tables | `test_symmetry_maps_deck_tables.py` | h5py and the four in-tree WFN headers |
+| emulated mesh | `test_symmetry_maps_emulated_mesh.py` | four forced CPU devices; skips below four |
+| real multi-process | `test_symmetry_maps_multiproc.py` (`check_*` bodies plus a `_CLI_CELLS` CLI) | one process per device |
+| import isolation, skip honesty | `test_symmetry_maps_import_isolation.py`, `test_symmetry_maps_skip_honesty.py` | `python -S`; a machine profile (absent skips, present-and-broken fails) |
 
-The one skip is the WSL-kernel row in skip-honesty, correctly refusing to
-assert about a machine it is not on; the xfail is the sharded-NaN
-reduction (see `tests/KNOWN_FAILURES.md`). The two legs differ by one cell and by
-2.3× in wall time; where that time goes has not been measured and this page
-does not guess. The same Perlmutter leg read 39.83 s one commit earlier
-(`1e90726`) on identical cell counts, so quote the band, not a single
-second.
-
-**`SymMaps(wfn)` construction**, before/after the dead parent-map drop
-(`1e90726`; 9 runs per deck, best-of, one process per arm, uncontended,
-`JAX_PLATFORMS=cpu JAX_ENABLE_X64=1`):
-
-| deck | before (ms) | after (ms) | speedup |
-|---|---|---|---|
-| bispinor_debug | 1.74 | 1.33 | 1.30× |
-| cohsex_debug | 2.11 | 1.44 | 1.46× |
-| gnppm_debug | 1.75 | 1.32 | 1.33× |
-| si_cohsex_debug | 78.28 | 44.27 | 1.77× |
-
-Si is where the retired loop cost something real — 64 full k × 96 sym rows
-× 8 IBZ k in python, 34.0 ms of the 78.3. `(irr_idx_k, sym_idx_k)` is
-bit-identical before and after on all four decks; this sits on the 15.9 eV
-op-selection axis, so the tables were re-derived rather than assumed.
-
-**Real four-process legs** (`srun -n 4`, Perlmutter, jax 0.7.0,
-`JAX_PLATFORMS=cpu`), at 2×2 and 4×1 — the first time these
-bodies ran on genuinely separate processes rather than an emulated mesh:
-
-| cell | 2×2 | 4×1 |
-|---|---|---|
-| `unfold_v_q` vs the hand reference | 4.22e-17 rel | 9.43e-17 rel |
-| hostile extent (`n_rmu=10`) | refused | refused |
-| star select/broadcast/spread, device vs host | bit-identical, sharding kept | bit-identical, sharding kept |
-| `spread_rel` on a NaN-poisoned sharded operand | `nan` (propagates) | `nan` (propagates) |
-
-That last row is load-bearing and is NOT what the emulated mesh returns —
-see the KNOWN-issues register.
-
-`spread_rel` is the caller-facing spread: one reduction and one 16-byte
-transfer for a device operand, against two full host readbacks for the
-naive form. The index tables (`irr_idx_k`, `sym_idx_k`, the row tables
-built from them) are `n_k` integers and stay on the host; the array operand
-is `(n_k, nb, nb)` complex128 — 9.2 GB at nk=144/nb=2000, four times per SC
-iteration — and is the thing every helper is written not to move.
+* Star tests use hand-verified production tables
+  (`tests/data/star_tables_e9340d1.json`), never tables derived from a
+  generated grid, and each table-driven cell asserts that `'star_row'` and
+  `'ibz_slab'` disagree on the expected number of rows (8 on gnppm, 6 on
+  cohsex) so it cannot pass as a tautology.
+* Hostile geometry is mandatory: `n_rmu % (Px·Py) ≠ 0` must refuse.
+* `spread_rel` on a NaN-poisoned sharded operand returns `nan` on real
+  processes; the emulated-mesh result differs (`tests/KNOWN_FAILURES.md`).
 
 ## Antipatterns
 
-* **Reading `R_cart` or reconstructing determinant/TR signs in a driver.**
-  Use `SymMaps.cartesian_action`; it owns forward orientation, polar versus
-  axial parity, and the antiunitary time sign.
-* **Re-deriving the conjugation predicate.** `sidx >= n_sym_spatial` is the
-  member's OWN flag, correct only for the raw-IBZ-slab operand flavour.
-  Against a star-row reference it INVERTS the rule for every star whose
-  first member is a time-reversal row — on gnppm that is 4 of 5 stars and
-  8 of 9 rows.
-* **Using a diagonal min/max spread as a symmetry gate.** The BGW-anchor
-  `_star_spread` in `tests/harness.py` is a real-diagonal metric;
-  conjugating an entire star member moves it by EXACTLY 0.0 (measured live
-  on the cohsex fixture: 1.2130460739135742 both ways). It is the right
-  check for anchor agreement and the wrong one for conjugation errors —
-  that is `tests/test_star_offdiag_gate.py`'s job, and the red twin asserts
-  both halves at once.
+* **Reading `R_cart` or reconstructing determinant/TR signs in a driver.** Use
+  `SymMaps.cartesian_action`; it owns orientation, polar versus axial parity
+  and the antiunitary time sign.
+* **Re-deriving the conjugation predicate.** `sidx >= n_sym_spatial` is correct
+  only for the raw-slab flavour; against a star-row reference it inverts the
+  rule for every star whose first member is time-reversed (4 of 5 stars on
+  gnppm).
+* **Using a diagonal spread as a symmetry gate.** Conjugating a Hermitian star
+  member leaves its real diagonal exactly unchanged; only an off-diagonal
+  metric (`star_spread`) sees a conjugation error.
 * **Deriving star-test tables from a generated grid.** Lex-min orbit
-  representatives are always spatial, so a derived grid has no TRS first
-  row and every discriminating test silently becomes a tautology. This is
-  the trap that makes a green symmetry suite worthless.
-* **Testing symmetry on Si only.** Si has 0 TRS rows at all 64 k; every
-  antiunitary branch is dead there. A suite green on Si alone proves
-  nothing whatever about time reversal.
-* **Regenerating a centroid set to make the orbit-closure refusal pass.**
-  The production sets' non-closure is a measured, owner-scoped fact
-  (`centroids_frac_960`: 2.611 meV star spread; cohsex's
-  `centroids_frac_60`: spatial star relations broken at 1.8e-01–3.9e-01 in
-  Σ_SX and V_H while the TRS-conjugation relations hold at ≤ 7e-4).
-  Regenerating means re-freezing the BerkeleyGW anchor. Tests that need a
-  non-closed set construct one SYNTHETICALLY, by dropping a centroid from a
-  closed one.
-* **Reading the theory out of this page.** It is the service's contract,
-  not the conventions. `docs/theory/symmetry.md` is the consolidated
-  derivation — BGW `mtrx`/τ conventions, the ψ-unfold algebra, the
-  (α, L) decomposition — and this page deliberately does not duplicate it.
-
-Cites: `docs/theory/symmetry.md` (the conventions),
-`docs/architecture/layers.md` (R3's dissolution and the service-door
-carve-out), `tests/KNOWN_FAILURES.md` (the two open rows this service
-owns), and the commit messages `27cc885` / `3e002f2` / `f7ef931` /
-`061f8a3` for the measured history — with one erratum, recorded here
-because history is not rewritten: `27cc885`'s message claims gnppm and
-bispinor have all-singleton stars and therefore an identically-zero XOR.
-Re-derived 2026-08-07 from `SymMaps(wfn)`, both decks have 5 stars
-`[1,2,2,2,2]` with 4 TRS first rows and 8/9 predicate disagreement — the
-STRONGEST in-tree discriminators, not no-ops. The fix that commit landed is
-unaffected; the corrected tables live in
-`services/symmetry_maps/tests/data/star_tables_e9340d1.json`.
-
-## Shared-pole endpoint panels
-
-`unfold_endpoint_panel` retains both matrix-axis tilings of the wavefunction
-carrier: `[parent,mu,spin,K]` uses `P(None,'x',None,'y')` or
-`P(None,'y',None,'x')`. K must tile the complementary mesh axis.
-`endpoint_panel_cost` prices each rotating panel with that same two-axis
-divisor. The existing spatial ring transports only the rank-local K slice;
-phase, spin and antiunitary actions remain in `unfold_wavefunction_local`.
-The caller keeps the causal weight separate from these factors.
-
-CPU emulated-mesh checks exercise changed tables, nonlocal permutations,
-complex antiunitary actions and capacity refusals. Those tests do not certify
-GPU compiler buffer assignment or application peak memory.
+  representatives are always spatial, so a derived grid has no TRS-first row
+  and every discriminating test becomes a tautology.
+* **Testing symmetry on Si only.** Si has no TRS rows at its 64 k; every
+  antiunitary branch is dead there.
+* **Regenerating a centroid set to make the orbit-closure refusal pass.** The
+  production sets' non-closure is measured and owner-scoped; regenerating
+  re-freezes the BerkeleyGW anchor. Tests that need a non-closed set build one
+  by dropping a centroid from a closed set.
