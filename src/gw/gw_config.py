@@ -1408,7 +1408,11 @@ _DEFAULTS = {
     # `rcrop` refuse by name at ``SCConfig.__post_init__`` (GATE
     # sc_accelerator_anderson_only).
     "sc_accelerator": "anderson",
-    "sc_history_depth": 5,       # Anderson history depth
+    # Anderson history depth.  20, not BGW's 5: with fewer entries than the
+    # map has independent stiff directions Anderson stalls (claim 2679); the
+    # conditioning filter drops dependent columns, so depth costs only
+    # memory, 2(m+1) copies of the (nk, nb, nb) carry over the mesh.
+    "sc_history_depth": 20,
     # Linear-mixing α.  Read only by the diagnostic
     # ``sc_iteration._run_linear_mixing``, which no deck can now select, so
     # this key changes nothing in a deck; it is retained for that path's

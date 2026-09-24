@@ -302,7 +302,7 @@ def test_sc_defaults(tmp_path):
     assert (sc.max_iter, sc.tol_ev, sc.accelerator, sc.history_depth,
             sc.mixing, sc.dump_dir, sc.exact_degeneracy_tol_ev,
             sc.tail_fit, sc.buffer_nbands, sc.buffer_mode) == (
-                30, 1.0e-4, "anderson", 5, 1.0, None, 1.0e-4, "conduction_mean",
+                30, 1.0e-4, "anderson", 20, 1.0, None, 1.0e-4, "conduction_mean",
                 0, "diagonal")
 
 
