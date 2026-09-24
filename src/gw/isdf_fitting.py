@@ -717,15 +717,15 @@ def fit_zeta_to_h5(
                 distributed_zeta_solve,
                 n_rmu=int(n_rmu_padded), nq=int(C_q_flat.shape[0]),
                 mesh_xy=mesh_xy)
-            _kind = _resolve_solver_kind(
+            # Route G applies a WHOLE-TILE factor on each G tile, so a current
+            # channel always takes the local pivoted LU (a block-cyclic provider
+            # token cannot be applied per tile).
+            _kind = 'lu' if v != 0 else _resolve_solver_kind(
                 mesh_xy, v, solver_kind,
                 distributed_cholesky=distributed_cholesky,
                 distributed_lu=distributed_lu,
                 n_rmu=n_rmu_solve, nq=int(C_q_flat.shape[0]),
                 charge_zeta_solve=charge_zeta_solve)
-            # Route G applies a WHOLE-TILE factor on each G tile, so a current
-            # channel always takes the hoisted local LU (a block-cyclic provider
-            # token cannot be applied per tile): batch_reshard.
             _route = 'batch_reshard' if v != 0 else distrib_la_batched_route
             _factor = factor_c_q(
                 C_q_flat, mesh_xy, vertex_mu_L=v,

@@ -858,10 +858,6 @@ def _logical_solve(solver_kind: str, n_log: int):
     if solver_kind == 'lu':
         lu_apply = _zeta_logical_solvers(n_log)[1]
         return lambda F, Z: lu_apply(F[0], F[1], Z)
-    if solver_kind == 'transverse_rank_truncate':
-        raise NotImplementedError(
-            "route G carries the transverse ridge LU only; transverse_zeta_solve "
-            "= rank_truncate is being retired (use the default, ridge).")
     return lambda B, Z: solve_at_logical(cplus.apply, n_log, (B,), Z)
 
 
