@@ -1,1307 +1,563 @@
 # distrib_la — distributed dense linear algebra over a JAX device mesh
 
-`services/distrib_la/`. Independently installable (`pyproject.toml`,
-src-layout); its runtime dependencies are `lxkit`, JAX, and NumPy. It imports
-nothing from LORRAX's `src/` or `common` packages. Every vendor library it can
-reach — ScaLAPACK/PBLAS, SLATE, cuSOLVERMp/cuBLASMp — appears behind exactly
-one dependency edge (`distrib_la.loader`, which `dlopen`s an optional provider `.so` by path)
-and in zero declared Python dependencies.
+`services/distrib_la/` is the one door for `eigh`, `cholesky`, `solve_lu`,
+`matmul` and the polar factor on an `('x','y')` device mesh. A caller says
+what to compute and where; which library runs is a resolved fact it can read
+but never branches on. The package is independently installable
+(src-layout, Python ≥ 3.12); its runtime dependencies are `lxkit`, JAX and
+NumPy, and it imports nothing from LORRAX's `src/`. ScaLAPACK/PBLAS, SLATE and
+cuSOLVERMp/cuBLASMp are reached through one edge, `distrib_la.loader`, which
+`dlopen`s the LORRAX FFI `.so` by path; none is a declared Python dependency.
 
-Contract audit, 2026-09-02: the package door exports 37 names. Its current
-surface is plan/factor/solve, matmul, polar factorization, backend reporting,
-and their records and constants. There is no centroid-extent policy or
-`padded_centroid_extent` dial in the service; logical and padded matrix extents
-are properties of the resolved plan and its shape descriptor.
+Import top-level names only. `from distrib_la.<submodule> import …` from
+outside the package fails `tests/test_layering.py`.
 
-## Standalone installation and capability model
-
-Python 3.12 or newer is required. From this source tree, install `lxkit` and
-`distrib_la` as two distributions; the editable spelling is useful for
-development but is not required:
+## Installation and capability
 
 ```bash
 cd services/distrib_la
 python -m pip install -e ../lxkit -e '.[test]'
-python -c "import distrib_la as d; print(d.BATCHED_ROUTE_CHOICES)"
-python -m pytest tests/test_distrib_la_shape_algebra.py \
-  tests/test_distrib_la_emulated_mesh.py \
-  tests/test_distrib_la_import_isolation.py \
-  tests/test_distrib_la_batch_reshard.py \
-  tests/test_distrib_la_matmul.py \
-  tests/test_distrib_la_matmul_plan.py
+python -m pytest            # four emulated CPU devices, no vendor library needed
 ```
 
-An installed consumer imports only `distrib_la`'s top-level names. It does
-not call LORRAX's source-path bootstrap and does not need a LORRAX Python
-installation. Native JAX routes, capability reporting, and backend vocabulary
-work with no shared library present. NumPy is declared directly because the
-process-local placement and cuSOLVERMp context code import it at runtime; it
-is not merely a test dependency.
+Native JAX routes, capability reporting and the backend vocabulary work with
+no shared library present. The FFI provider is a separate capability: the CUDA
+and host libraries are found through a sealed bundle or pinned by
+`LORRAX_FFI_SO` / `LORRAX_FFI_HOST_SO`, whose rules
+[`docs/dev/env_vars.md`](../dev/env_vars.md) owns. The loader expects handler
+ABI 4 (`loader.LORRAX_FFI_ABI_VERSION`). An absent `.so` does not break
+import; an explicit pin that is missing, mis-stamped or ABI-incompatible
+refuses instead of falling through. The environment grants capability and
+never selects a backend: `distrib_la.resolve` reads no environment.
 
-`loader.get_lib()` has one optional import: it tries `h5py` in a caught block
-before `dlopen` so an already-installed h5py establishes the safe
-process-wide HDF5 symbol order. Absence is accepted and no public service API
-uses h5py, so it is intentionally not a hard dependency or package extra.
-
-The optional FFI provider is a separate capability. Set `LORRAX_FFI_SO`
-(CUDA) or `LORRAX_FFI_HOST_SO` (CPU) to an absolute path to a compatible
-library. Those historical environment names describe the provider ABI; they
-do not create an upward Python dependency. The current provider is built by
-LORRAX's C++ tree and exports a versioned handler ABI mirrored by this package.
-An absent `.so` does not break import, while an explicit missing, unstamped in
-strict mode, or ABI-incompatible pin refuses rather than falling through.
-`batched_route='batch_reshard'` with `backend='off'` is the completely
-provider-free spelling.
-
-## Known limitation — `distributed_eigh` hangs at a 3×3 mesh for n ≥ 3072
-
-**Read this before you plan a large deck.** `distributed_eigh` is not
-currently safe on a 3×3 device mesh once the matrix reaches n = 3072. It does
-not fail and it does not raise; it hangs silently and forever. The cuSOLVERMp
-banner prints, nothing follows it, and the job sits there until the scheduler
-or a human kills it. Runs were killed at 420 s and, in one case, at 900 s
-without the call ever returning.
-
-The break is bracketed tightly. At a 3×3 mesh, n = 2049 completes in 6.9 s
-with a maximum eigenvalue error of 1.5e−11, and n = 3072 never returns. Every
-larger size tested at that mesh — 3072, 4098, 6144, 8190 — hangs the same way.
-A 2×2 mesh at n = 8192 is fine, finishing in 9.3 s, so this is specific to the
-3×3 geometry rather than a general size ceiling.
-
-**The allocator is exonerated.** The hang reproduces identically under the
-`platform` allocator, which is what the fleet runs today, and under the
-recommended BFC settings. Whatever is wrong at 3×3 was wrong before the
-allocator question was ever asked, and it will still be wrong if the allocator
-recommendation is rejected. The card reported 36.4 GiB free at the moment of
-the call, so this is not memory starvation either.
-
-What this means in practice is that **large-deck users must not assume
-`distributed_eigh` works past roughly n ≈ 2k until this is closed.** If your
-stage calls `eigh` on a big matrix, run it on a 2×2 mesh, or keep the matrix
-below the bracket, or use a non-distributed route. A 3×3 mesh with a large
-matrix will not give you a wrong answer — it will give you no answer at all,
-which in a batch queue is an expensive way to find out.
-
-Two things are still owed here. The first is a control: a 4×4 leg at n = 8192
-is what separates "3×3 is odd because it is not a power of two" from "anything
-past 2×2 is broken". That leg never got a placement before the measuring
-window closed, and the log it did leave carries no cuSOLVERMp line at all, so
-its non-zero exit is a queue artifact and must not be read as a hang. The
-second is the root cause itself, which needs a multi-node GPU allocation to
-chase and therefore has not been attempted. One unconfirmed lead, offered as a
-lead: at a 3×3 grid, n = 2049 gives a local block of 683, below the usual 1024
-tile, while n = 3072 gives exactly 1024 per rank and so more than one block
-column per rank for the first time. A hang appearing exactly where the 2-D
-block-cyclic distribution stops being trivial on a non-power-of-two grid is a
-plausible library-side story, but nobody has confirmed it.
-
-The owner's disposition is **revisit soon**. This is a `distrib_la` solver
-defect and it belongs to whoever owns `distrib_la`.
-
-The seven-leg evidence table, the exact reproduction and the probe live in the
-2026-08-09 amendment to `tests/KNOWN_FAILURES.md` (§1, "`distributed_eigh`
-hangs at a 3×3 mesh for every n ≥ 3072"). The run artifacts are under
-`/pscratch/sd/j/jackm/sigma_scaling_0809/_reports/` in legs `la_p4_bfc85`,
-`la_p9_bfc85`, `la_p9_platform`, `la_p9_small_bfc85`, `la_p9_3072`,
-`la_p9_mid` and `la_p9_6144`; the probe is
-`sigma_scaling_0809/probe_pressure_sq.py`, and the prose write-up is
-`SIGMA_SCALING.md` §8. `la_p16_8192` is the leg that did not run.
-
-## Purpose
-
-The same top-level door also owns the square-matrix polar/SVD operation used
-for parallel-transport links.  It composes the planned distributed Hermitian
-eigensolver rather than introducing a fifth vendor dependency or allowing a
-caller-side dense SVD.
-
-One door for `polar_factor`, `eigh`, `cholesky`, `solve_lu` and `matmul` on an
-`('x','y')` device mesh, so a driver says *what* to compute and *where*,
-never *which library*. Before the GEMM surface landed, the same three solver ops were dispatched from ten
-`src/` modules through four packages (`ffi.linalg`, `ffi.slate`,
-`ffi.scalapack`, `common.cholesky_2d`), with per-call-site guard ladders
-that disagreed; the worst measured consequence of that drift was a silent
-route change that ran to completion with `rc=0` and a QP gap of **−161 eV**.
-Backend selection is declarative data, backend *capability* is probed once,
-and a resolved backend name is a **promise** that every guard passed.
-
-The service is the door. `import distrib_la` and use top-level names;
-`from distrib_la.plan import …` from outside the package is a layering
-failure that `tests/test_layering.py` fails on (with a red twin).
+Both platform libraries link `libslate.so.2` and `libblaspp.so.2` by SONAME,
+and the first library opened decides which copy the other binds. The loader
+therefore opens the CUDA library before the host one in any process that can
+use CUDA (`loader._open_cuda_before_host`); opening the host library first
+gives every CUDA SLATE handler `blas::get_device_count() == 0`.
 
 ## API
 
-The polar additions are:
-
-| name | what it is |
+| name | contract |
 |---|---|
-| polar_factor(A, mesh, backend='distributed', rcond=None) -> (L, s) | Cached one-shot square polar factor. A and L are P('x','y'); descending s is replicated. |
-| plan_polar_factor(mesh, n=..., backend='distributed', rcond=None) -> PolarPlan | Eagerly resolve once for a streamed k-point loop. The returned operation is trace-safe. |
-| PolarPlan(A) | One physical square matrix only. No batch axis: the preprocessing design streams one neighbour at a time. |
-
-### Polar factor / SVD contract
-
-The operation diagonalizes the Hermitian dilation
-
-    H = [[0, A], [A.H, 0]]
-
-with one planned eigh call and forms L = U V.H from its positive-eigenvalue
-subspace.  It never diagonalizes A.H A: that Gram construction squares the
-condition number and loses precisely the small overlap singular values needed
-as the manifold-quality diagnostic.  Singular values are non-negative and
-descending, matching NumPy SVD order.
-
-The cuSolverMp response-direction dilation solve uses the equivalent positive matrix
-`I + H / ||A||_F` and converts eigenvalues back by `(lambda - 1) * ||A||_F`
-(unit scale for zero A). This avoids a reproduced cuSolverMp STEDC convergence
-failure on a saved response matrix without changing eigenvectors,
-rank cutoffs, or the physical operator; only the scalar norm is reduced.
-Before eager direction-rank selection, the small host spectrum is broadcast
-as integer bit patterns from one process before rank decisions, then placed
-with the shared `device_put_process_local` owner. This publishes the canonical
-small table without a redundant global placement collective.
-
-The physical input is exactly one rank-2 square float64 or complex128 array at
-P('x','y') on the supplied mesh.  The service refuses rank, shape, dtype,
-mesh-axis, divisibility, and concrete-layout mismatches before numerical work.
-There is no implicit device_put or full-matrix reshard.  L has the same shape,
-dtype and sharding.  Only s, a length-n real vector, is replicated.
-
-rcond is relative to max(s).  None means n times machine epsilon for the real
-component dtype.  Directions at or below the cutoff do not contribute to L.
-Consequently a rank-deficient matrix returns the unique polar partial
-isometry.  The service does not invent a backend-dependent unitary pairing of
-independent left and right null spaces.  Full-rank overlap matrices return the
-usual unitary polar factor.
-
-P('x','y') requires the physical extent to divide both mesh axes.  For a
-non-divisible logical band count, zero-pad rows and columns to the next common
-multiple, factor that physical matrix, and slice the leading logical block of
-L and leading logical singular values.  The zero pad is safe because its null
-directions are thresholded out.  plan_polar_factor refuses a non-divisible
-physical extent and reports the minimum pad extent rather than rounding
-silently.
-
-Planning and execution remain separate.  Hoist plan_polar_factor out of the
-IBZ loop; it resolves and probes the backend once.  PolarPlan is trace-safe and
-the dilation, planned eigh, masking, and final sharded GEMM are cached as one
-fused operation per mesh/shape/backend/dtype/cutoff signature.  The convenient
-polar_factor call caches that plan for eager streamed calls, but deliberately
-refuses entry from an outer trace and points to the planned form.
-
-Expected array scaling over the design envelope is O(n^2/P) per process for
-every matrix-shaped value.  The dilation and its eigenvectors each have 4n^2
-global elements; A and L each have n^2; no n^2 object is replicated.  The only
-replicated result is n real singular values.  Runtime is the cost of one 2n
-Hermitian eigensolve plus one n-cubic distributed GEMM.  The 3x3 large-eigh
-hang documented at the top applies to the dilation extent 2n as well.
-
-### Planned factorization API
-
-| name | what it is |
-|---|---|
-| `plan(op, mesh, *, backend='auto', n=None, batched_route='batch_reshard', budget_bytes=None) -> Plan` | Resolve once, then call. **Eager** — dlopens, probes, reads `jax.process_count()`. The staged local route is the default; explicit `auto` restores backend batching/scan. With `auto` and a `budget_bytes` every rank shares, an eigh stack whose per-rank whole matrices and local workspace fit takes the staged local route and any other stack the provider (`Plan.route_for(shape, dtype)`), whatever the deck dial asked for. |
-| `Plan(A)` / `Plan.batched(A_stack)` | One tile at `P('x','y')` / a stack at `P(None,'x','y')`. **Trace-safe** — no dlopen, no `device_put`, no process count inside. |
-| `Plan.is_native`, `.backend`, `.describe()` | The resolved fact, readable; never something a caller must branch on to be correct. |
-| `fits_local(plan, op, shapes, dtype, budget_bytes) -> bool` | The fit-on-one-device question: the caller's per-rank live set of whole matrices plus the local kernel's workspace (cuSolverDn query on CUDA, the LAPACK `?heevd` formula on hosts, the compiled local GEMM temporary) against a budget. It decides the capacity route. |
-| `right_singular_vectors` / `leading_eigenvectors` on a batch-layout stack `P(('x','y'),None,...)` | A stack whose rows already live whole on their ranks is solved rank-locally, one matrix at a time, with no movement, whatever the plan's route. Q returns in batch layout; `real_rows` marks trailing synthetic slots of the first axis, which are never solved and retain no column. Row for row equal to the face route's local solve. |
-| `Plan.batched_route`, `BATCHED_ROUTES`, `BATCHED_ROUTE_CHOICES`, `BATCHED_SCAN_UNROLL` | HOW a stack runs: a `lax.scan` over the single-matrix op, the backend's stacked entry, or staged batch-axis movement around a local native kernel. **The one place that decides.** Public selection is `auto|batch_reshard`; `scan`/`backend_batched` remain internal resolutions. |
-| `Plan.native_fn` | A pure closure for a fusion-critical site that needs the math inside its own `jit`. Native backends only. |
-| `factor(op, A, mesh, *, backend, ...) -> FactorToken` | Factor once. |
-| `solve(token, B) -> jax.Array` | Back-solve many. The token carries the handle (ScaLAPACK `ipiv`, cuSOLVERMp raw buffer, SLATE `SlateLowerL`). |
-| `resolve_backend(op, requested, mesh, *, n=None) -> str` | The **raising** probe. `n` is decoupled from the operand so a caller that will pad can ask before it has built anything. |
+| `plan(op, mesh, *, backend='auto', n=None, batched_route='batch_reshard', budget_bytes=None) -> Plan` | Resolve once. **Eager**: dlopens, probes, reads `jax.process_count()`. `op` is `eigh`, `cholesky` or `solve_lu`. Passing `n` runs the divisibility guard at resolve time. |
+| `Plan(A)` / `Plan.batched(A_stack, ...)` | One tile at `P('x','y')` / a stack at `P(None,'x','y')`. **Trace-safe**. Operands are moved to the contract layout by `ensure_sharding`. |
+| `Plan.backend`, `.is_native`, `.batched_route`, `.route_for(shape, dtype)`, `.describe()`, `.donates` | The resolved facts. Introspection only; a caller never branches on them to be correct. |
+| `Plan.native_fn` | Pure trace-safe closure for a caller that needs the math inside its own `jit`. Native backends only. |
+| `factor(op, A, mesh, *, backend, ...) -> FactorToken`, `solve(token, B)` | Factor once, back-solve many. The token carries the backend handle (ScaLAPACK `ipiv`, cuSOLVERMp raw buffer, SLATE `SlateLowerL`). |
+| `resolve_backend(op, requested, mesh, *, n=None, compute_evecs=True) -> str` | The **raising** probe. `n` is independent of any operand, so a caller that will pad can ask first. |
 | `list_backends(op, mesh) -> dict` | The **never-raising** report, for startup banners. |
-| `BACKEND_CHOICES`, `EIGH_BACKENDS`, `CHOLESKY_BACKENDS`, `LU_BACKENDS`, `OPS`, `NATIVE` | The vocabulary. Importable with **no `.so` anywhere on the machine** — a deck parser must not need the FFI layer to read a deck. |
-| `mesh_key(mesh)`, `mesh_platform(mesh)`, `mesh_is_cpu(mesh)` | Stable hashable mesh identity (axes, extents, platform, device ids) and its two predicates. `mesh_key` is for any cache whose stored value does **not** retain the mesh; `id(mesh)` there is the documented drift. |
-| `dial_key()` | Factory-time dials folded into one tuple, for kernel cache keys. |
-| `probe_target`, `has_target` | Capability, with the ABSENT / BROKEN split (`lxkit.probe`). |
-| `local_batch(kernel, mesh, *, resident=())` | Build a jitted `run(*operands)` that applies a row kernel to a batch of whole matrices q-locally: face operands `(B, M, N)` at `P(None,'x','y')` move face → batch → face (the route-(c) exchanges); operands at the positions in `resident` are already in the batch layout and do not move. See § "q-local batch with resident operands". |
-| `batch_layout(A, mesh)` | Place a batch in the batch layout ONCE: a face stack by the two exchanges, a fully replicated array by a local row slice; result `(ceil(B/P)·P, ...)` at `P(('x','y'), None, ...)`, zero pad rows. |
-| `is_batch_layout(A, mesh)` | The layout predicate `local_batch` checks for a `resident` operand. |
-| `dispatch_batched_eigh(A, mesh, backend, *, batched_route='batch_reshard')` | The one legacy entry point kept for `gw.qsgw_density`; it passes the same public route selection into `plan`. |
-| `matmul(A, B, C=None, *, mesh, alpha=1, beta=0, transa='N', transb='N', backend='auto', batched_route='batch_reshard')` | Top-level distributed GEMM. Rank 2 uses `P('x','y')`; rank 3 uses `P(None,'x','y')`. The default stages complete local matrices; explicit `auto` uses the distributed provider chosen by `backend`. |
-| `resolve_matmul_backend(requested, mesh, *, batched_route='batch_reshard') -> str`, `MATMUL_BACKEND_CHOICES` | Raising GEMM-provider probe and its public vocabulary. `cusolvermp` is an accepted alias for `cublasmp`; `off` is legal only for the provider-free staged route. |
-| `gemm_plan(mesh, *, m, k, n, nq, dtype, backend='auto', alpha=1, beta=0, layout='face', enable_active_range=False) -> GemmPlan` | Resolve, probe, warm and COMPILE one N,N GEMM shape ONCE — the `matmul` analogue of `plan_polar_factor`. `GemmPlan(A, B, C=None, *, out=None)` is trace-safe. Opt-in `GemmPlan.active_range(A, B, lo, hi, C=None, *, out=None, weights=None)` contracts exact dynamic intervals without changing operand allocation shapes; optional weights have shape `(nq,K)`. `GemmPlan.prepare_active_range(lo, hi)` captures eager bounds and returns the same operand interface without runtime bound operands. |
-
-`leading_eigenvectors(..., rcond=...)` additionally bounds each requested width
-by eigenvalues above `rcond * max(abs(spectrum))`, then closes the boundary
-multiplet. The default `None` preserves fixed-width selection; the caller owns
-the cutoff. Spectra and input matrices are unchanged, and only the existing
-small spectra cross the host.
-
-Two phases and they stay two: only platform and handler guards can fire at
-resolve time — operand dtype, rank and extent are trace-time facts — so a
-single-phase API would have to lie about when it checked.
-
-One standalone limitation is intentional: under the native backend,
-`Plan.__call__`/automatic `Plan.batched` directly implement `eigh` only.
-Native Cholesky and LU channel policy remains caller-owned, so an installed
-consumer that wants those operations through the array-returning plan surface
-must select `batched_route='batch_reshard'`; Cholesky may alternatively select
-`backend='native2d'`, and either op may select an available FFI backend. The
-opaque `factor()`/`solve()` token surface is separate and is not changed by
-the batch route.
-
-`batched_route` owns only the execution of an array-returning
-`Plan.batched` call. It does not choose whether an application uses a Plan,
-an opaque `FactorToken`, or a larger multi-channel schedule. LORRAX's coupled
-transverse-zeta caller is one deliberate higher-level policy: for an eligible
-all-fresh fit, an explicit `auto` request tries certified local
-`batch_reshard`, then
-a distributed split-factor token, then sequential channels as capacity
-requires. Explicit `batch_reshard` never switches to the token route; failure
-to fit the coupled local live set selects sequential calls that retain the
-explicit route. Partial reuse is sequential. Both coupled schedules share Z
-construction but keep three ordered q-batch solves; there is no public or
-private fused three-channel cuSOLVERMp route.
-
-### Default, explicit `auto`, and certification envelope
-
-`BATCHED_ROUTE_DEFAULT` is `batch_reshard` for every array-returning public
-surface: `plan`, `dispatch_batched_eigh`, `matmul`, and
-`resolve_matmul_backend`. It is not applied to the single-matrix polar
-dilation, `gemm_plan`, or opaque `factor`/`solve`; those APIs retain their
-direct provider plans. LORRAX's backend selectors (`eigh_backend`,
-`distributed_cholesky`, `distributed_lu`, `distributed_zeta_solve`, and
-`w_dyson_solver`) remain `auto`: they choose a library or a higher-level
-algorithm, not this batch schedule.
-
-On CUDA, with the named provider handlers present, an explicit
-`batched_route='auto'` resolves as follows. The mesh does not change the
-eigh backend choice; it changes automatic Cholesky/LU only at the true-2-D
-boundary.
-
-| surface and requested backend | 1x1 | 2x2 | 4x4 |
-|---|---|---|---|
-| `plan('eigh', backend='auto'|'off')` | native `backend_batched` | native `backend_batched` | native `backend_batched` |
-| `plan('eigh', backend='distributed')` / `dispatch_batched_eigh` | cuSOLVERMp `scan` | cuSOLVERMp `scan` | cuSOLVERMp `scan` |
-| `plan('cholesky', backend='auto')` | native caller-owned path; array-returning `Plan.batched(auto)` is unavailable | cuSOLVERMp `backend_batched` | cuSOLVERMp `backend_batched` |
-| `plan('solve_lu', backend='auto')` | native caller-owned path; array-returning `Plan.batched(auto)` is unavailable | cuSOLVERMp `backend_batched` | cuSOLVERMp `backend_batched` |
-| `matmul(backend='auto')` | cuBLASMp provider | cuBLASMp provider | cuBLASMp provider |
-
-The default staged route bypasses those resolved implementations only for the
-array operation; explicit backend requests are still capability-probed. The
-certification evidence is compositional and bounded:
-
-| route component | 1x1 | 2x2 | 4x4 | evidence |
-|---|---|---|---|---|
-| shared face-to-batch transport, ragged padding, inverse | certified | certified | certified through the same transport in the production solve | `test_distrib_la_batch_reshard.py`; P4 JID 57038615; P16 JID 57708736 |
-| local eigh / Cholesky / LU kernels | certified | certified, both float64 and complex128; worst residual 1.496e-15 | LU certified directly; eigh/Cholesky inherit the already-certified transport and the same device-local kernels | sandbox claims 199 and 497; `test_distrib_la_multiproc.py::check_batch_reshard_local_ops` |
-| local `matmul` | certified | certified, float64 and complex128; worst residual below 9.6e-16 | certified by the shared transport plus the mesh-independent local GEMM kernel; no separate P16 matmul timing claim | sandbox claim 210; `test_distrib_la_matmul.py` |
-
-This does not certify arbitrary matrix sizes. Every staged operation requires
-complete per-device matrices. A deck naming `use_low_mem_eigh=true` states
-that this residency is unsafe: an unnamed route default therefore derives
-`auto`, while explicitly naming `batch_reshard` with that key refuses.
-
-GW also records a capacity advisory after both centroid sets are known. For
-logical `M = M_charge + M_current`, `B=nq`, and `P` ranks, the conservative
-square-RHS solve floor is
-
-    floor_bytes/rank = 3 * 16 * ceil(B/P) * M * (M + M).
-
-The three factor counts the measured input/output/workspace arenas and 16 is
-complex128 bytes. The warning threshold is the largest integer M whose floor
-is at most `0.50 * memory_per_device_gb * 1e9`; 50% is the same
-fragmentation-safe placement ceiling used by the transverse route admission.
-The line reports both bytes/rank and the threshold and points to explicit
-`distrib_la_batched_route = auto`, meaning the direct distributed/provider
-path. `direct` is a description, not a legal route value.
-
-### LORRAX call-site inventory
-
-The current direct `Plan.batched` inventory is seven calls; the structural
-test fails if it changes. The repository has no `src/htransform` directory:
-htransform lives under `src/bandstructure`, and its selected-state factor is
-owned by `src/isdf/galerkin.py`.
-
-| owner | operation | setting source |
-|---|---|---|
-| `bandstructure/bse_setup.py::compute_wfns_fi` | fine-grid htransform Hermitian eigh | universal route |
-| `bse/vq_interp.py::prepare_coarse` | coarse interpolation Hermitian eigh | universal route |
-| `gw/w_isdf.py::_get_w_solve_fn_distributed` | distributed W `solve_lu` | universal route; inert when W uses its local solver |
-| `isdf/core.py::_factor_c_q_distributed_rank_truncate` | charge rank-truncation eigh | universal route |
-| `isdf/core.py::factor_c_q` | native2d charge Cholesky | universal route |
-| `isdf/core.py::_dist_ridged_lu` | transverse ridge `solve_lu` | universal route |
-| `isdf/galerkin.py::fit_galerkin_basis` | htransform selected-state Cholesky | universal route |
-
-`gw.qsgw_density.distributed_eigh_bands` reaches the same plan through
-`dispatch_batched_eigh`; GW, BSE, and htransform wrappers only propagate the
-resolved setting. `gemm_plan` call sites in G/Sigma hot loops are excluded by
-construction because the plan must remain provider-owned and trace-safe.
+| `BACKEND_CHOICES`, `EIGH_BACKENDS`, `CHOLESKY_BACKENDS`, `LU_BACKENDS`, `OPS`, `NATIVE`, `BATCHED_ROUTES`, `BATCHED_ROUTE_CHOICES`, `BATCHED_ROUTE_DEFAULT`, `MATMUL_BACKEND_CHOICES` | Vocabulary, importable with no `.so` on the machine, so a deck parser needs no FFI layer. |
+| `mesh_key(mesh)`, `mesh_platform(mesh)`, `mesh_is_cpu(mesh)` | Hashable mesh identity (axes, extents, platform, device ids) and its predicates. Use `mesh_key` for any cache whose value does not retain the mesh. |
+| `dial_key()`, `probe_target`, `has_target`, `backend_module` | Factory-time cache-key aggregate; capability probes with the ABSENT/BROKEN split. |
+| `dispatch_batched_eigh(A, mesh, backend='distributed', *, batched_route='batch_reshard')` | `plan('eigh', …).batched(A)` for `gw.qsgw_density`. |
+| `matmul(A, B, C=None, *, mesh, alpha=1, beta=0, transa='N', transb='N', backend='auto', batched_route='batch_reshard', budget_bytes=None)`, `resolve_matmul_backend` | Distributed GEMM, § [matmul](#matmul). |
+| `gemm_plan(...) -> GemmPlan`, `local_gemm_plan(...)` | Resolve-once N,N GEMM for hot loops, § [Planned GEMM](#planned-gemm). |
+| `panel_matmul(A, B, *, mesh, panel_bytes)` | Face GEMM with bounded contraction panels, § [Bounded face products](#bounded-face-products). |
+| `contract_faces(b_X, b_Y, weights, start, stop, *, mesh, return_transpose=False)` | `(b_X·w) @ b_Yᴴ` for row faces `[b,m,K]` at `P(None,'x',None)` / `P(None,'y',None)` (or `[b,μ,s,K]`, spin merged into μ) with replicated weights `[b,K]` and interval `[start,stop)`; output `[b,m,m]` at `P(None,'x','y')`. Local GEMMs only, no collective, no provider. |
+| `polar_factor`, `plan_polar_factor`, `PolarPlan` | Square polar factor / SVD, § [Polar factor](#polar-factor-and-spectral-directions). |
+| `right_singular_vectors`, `leading_eigenvectors`, `retain_leading_eigenvectors` | Eager spectral-direction selection on face or batch-layout stacks, § [Polar factor](#polar-factor-and-spectral-directions). |
+| `local_batch`, `batch_layout`, `is_batch_layout` | q-local kernels with resident operands, § [q-local batch](#q-local-batch-with-resident-operands). |
+| `hermitian_part`, `hermitian_block`, `join_columns`, `diagonal_like`, `on_face`, `face_sharding` | Face-pinned block glue, § [Face-pinned block glue](#face-pinned-block-glue). |
+| `workspace_bytes_per_rank`, `matmul_workspace_bytes_per_rank`, `fits_local` | Allocation-free workspace and capacity queries, § [Workspace queries](#workspace-queries). |
+| `plan_subspace`, `plan_local_subspace`, `LocalSubspacePlan`, `plan_orthogonalization` | Iterative-eigensolver subspace plans: [Davidson](davidson.md), [orthogonalization](orthogonalization.md). |
 
 ## Contract
 
-* Polar/SVD is a composite, not a resolver operation: its backend argument is
-  passed once to plan('eigh', ..., n=2*n), so there is no second backend
-  vocabulary or demotion ladder to drift.
-* Rank-deficient polar output is value-level comparable through the partial
-  isometry and singular spectrum.  Individual dilation eigenvectors remain
-  gauge-dependent and must never be compared across meshes.
-
+* **Two phases.** `plan()`, `plan_polar_factor()` and `gemm_plan()` are eager;
+  what they return is trace-safe. Only platform and handler guards fire at
+  resolve time; operand dtype, rank and extent are checked at call time.
 * **Promise semantics.** A returned backend name means every guard passed:
-  platform, **known-broken combinations**, compiled handler,
-  one-process-per-device coverage, mesh geometry, divisibility. The call
-  cannot then fail for an availability or geometry reason.
-* **Explicit requests REFUSE**, with the failed guard named and a fix.
-  Only `auto` demotes, and it announces once, from the rank it happened on.
-  A grammar error (an unknown spelling) falls to the gate DEFAULT.
-* **A COST NOTICE is not a demote.** An explicit `distributed`/`cusolvermp`
-  eigh below n=16384 prints what that route costs (rank 0, once per mesh
-  geometry) and then returns it unchanged. The measurement is in
-  § Performance; the reason it is a notice and not a demote is the line
-  above this one.
-* **Exception types are part of the API**: `ValueError` / `RuntimeError`,
-  each constructible from one string. `bandstructure/bse_setup.py:386-403`
-  re-raises `type(exc)(_why)`; a service-specific exception class would
-  escape that handler and delete the `use_low_mem_eigh` refusal message.
-* **Layout.** Eigenvalues come back replicated; eigenvectors as **COLUMNS**,
-  on every backend. Plan and GEMM batched inputs are `P(None,'x','y')`, single
-  tiles `P('x','y')`; GEMM returns the same-rank face layout. `ensure_sharding`
-  is the one place that is spelled.
-* **Donation** is declared per op, not per call site:
-  `eigh` donates nothing, `cholesky` donates argument 0, `solve_lu` donates
-  0 and 1. A donated operand must be a fresh value at the call site.
+  vocabulary, platform, known-broken combinations, compiled handler,
+  one JAX process per device, mesh geometry, divisibility. The call cannot then
+  fail for an availability or geometry reason.
+* **Explicit requests refuse**, naming the failed guard and the fix. Only
+  `auto` demotes, and it announces once on rank 0. An explicit
+  `distributed`/`cusolvermp` eigh below n = 16384 prints a rank-0 cost notice
+  (once per mesh geometry) and still runs what was asked.
+* **Exceptions are `ValueError` / `RuntimeError`** (plus `TypeError` /
+  `NotImplementedError` for misuse), each constructible from one string.
+  `bandstructure/bse_setup.py` re-raises `type(exc)(why)`; a service-specific
+  exception class would break that handler.
+* **Layout.** Single tiles at `P('x','y')`, stacks at `P(None,'x','y')`.
+  Eigenvalues return replicated; eigenvectors return as **columns**
+  (`A Q = Q diag(λ)`) on every backend. `ensure_sharding` is the one
+  FFI-adjacent reshard: a tracer gets `with_sharding_constraint`, an array
+  already in layout is returned untouched, anything else is placed
+  process-locally.
+* **Donation is per op** (`DONATES`): `eigh` donates nothing, `cholesky`
+  argument 0, `solve_lu` arguments 0 and 1. A donated operand must be a fresh
+  value at the call site.
 * **Tokens are opaque.** `FactorToken` exposes `op`, `backend`, `mesh`, `n`,
-  `nbatch` and no factor. "Never reshard it, feed it back verbatim" is the
-  type rather than a comment. It is deliberately **not** a JAX pytree, so a
-  `jit` boundary refuses it by name instead of tracing a block-cyclic
-  handle (pinned by `test_a_factor_token_cannot_enter_the_composed_kernel`).
-* **`solve()` checks `B` against the token's `n` and `nbatch`**, so a
-  mismatched RHS refuses instead of corrupting a solve or hanging in a
-  collective.
-* **`factor`/`solve` is the split-token surface, not `Plan.batched`.**
-  ScaLAPACK and cuSOLVERMp LU expose getrf/getrs through one opaque token, so
-  callers may factor once and apply getrs repeatedly. The array-returning
-  `plan('solve_lu', mesh, backend=…).batched(A, B)` instead owns one complete
-  factor+solve call per input batch and may select the service's staged local
-  route.
-* **Env grants capability, never selects a backend.** `LORRAX_FFI_SO` /
-  `LORRAX_FFI_HOST_SO` pin which `.so` to open. `distrib_la.resolve` reads
-  no environment at all. An explicit pin that cannot be honoured is a
-  refusal, never a fall-through.
+  `nbatch` and no factor. It is not a pytree, so a `jit` boundary refuses it
+  by name. `solve()` checks `B` against `n` and `nbatch`. `factor`/`solve` is
+  the split surface (getrf once, getrs many); `plan('solve_lu').batched(A, B)`
+  is one complete factor + solve per call.
+* **Native Cholesky and LU are caller-owned.** Under `backend='native'`,
+  `Plan(A)` implements `eigh` only; `cholesky`/`solve_lu` raise
+  `NotImplementedError` because their native path is a caller channel policy.
+  Reach them through `batched_route='batch_reshard'`, `backend='native2d'`
+  (Cholesky), or an FFI backend.
 
 ## Backends
 
-Preference is declarative data with every supported platform represented,
-including the declared-untested tier.
-
-| op | vocabulary | `auto` | `distributed` resolves to |
+| op | vocabulary | `auto` | `distributed` |
 |---|---|---|---|
-| `eigh` | `auto off distributed cusolvermp slate scalapack` | `native` | cpu → **scalapack**, CUDA → **cusolvermp**, ROCm → **slate** |
-| `cholesky` | `auto off native2d cusolvermp slate` | `native` | — (its CPU story is a channel-policy ladder in the caller, not one library) |
-| `solve_lu` | `auto off distributed cusolvermp scalapack` | `native` | cpu → **scalapack**, CUDA → **cusolvermp** |
+| `eigh` | `auto off distributed cusolvermp slate scalapack` | `native` everywhere | cpu → `scalapack`, CUDA → `cusolvermp`, ROCm → `slate` |
+| `cholesky` | `auto off native2d cusolvermp slate` | `cusolvermp` on a CUDA mesh with px ≥ 2 and py ≥ 2 when compiled, else `native` | not in the vocabulary |
+| `solve_lu` | `auto off distributed cusolvermp scalapack` | as `cholesky` | cpu → `scalapack`, CUDA → `cusolvermp`; ROCm refuses |
 
-The table above is the `Plan` resolver. GEMM has its own provider vocabulary
-and deliberately different default:
+`off` (and the spelling `native`) resolve to `native` unconditionally. `auto`
+never picks an FFI backend on a CPU mesh and never picks `native2d`.
 
-| `matmul` request | CUDA | CPU | ROCm |
+* **`native2d`** is the pure-JAX 2-D block-distributed tiled Cholesky, on
+  every platform. It is a different algorithm with a different memory
+  profile: at n = 10k on P = 128 the replicated route costs 1.6 GB/device and
+  `native2d` 5 MB/device. Divisibility of `n` into tiles is checked at
+  resolve time.
+* **Geometry guards.** cuSOLVERMp and SLATE eigh need a square mesh
+  (`cusolverMpSyevd` deadlocks on rectangular blocks). SLATE otherwise needs a
+  square or N×1 mesh (1×N hits a stride assert). ScaLAPACK needs a square or
+  1-D mesh (square descriptor blocks). Every FFI backend needs one JAX process
+  per device.
+* **Known-broken combinations refuse at resolve time:**
+  - SLATE `eigh` on a CPU mesh (bug L-2: host `heev` SIGSEGVs, even on 1×1).
+    Use `distributed` (ScaLAPACK `pzheevd`).
+  - cuSOLVERMp `eigh` with `compute_evecs=False` (bug L-3: `cusolverMpSyevd`
+    status 7 at every n). Use `compute_evecs=True`.
+  - SLATE `eigh` at n ≥ 4096 on a multi-rank CUDA mesh (bug L-4: SIGSEGV that
+    kills every rank). It runs at n ≤ 2048; use `distributed`.
+* **Unguarded defect:** cuSOLVERMp `eigh` on a 3×3 mesh hangs silently for
+  n ≥ 3072 (n = 2049 completes; 2×2 at n = 8192 completes). The resolver
+  does not refuse it. Keep large eigh (including the 2n polar dilation) off
+  3×3 meshes. Evidence: `tests/KNOWN_FAILURES.md`, "`distributed_eigh` hangs
+  at a 3×3 mesh".
+* **ROCm is declared-untested.** LORRAX builds no ROCm `.so`, and JAX reports
+  `Device.platform == 'gpu'` for both vendors, so a ROCm mesh currently
+  resolves as CUDA (`resolve.FFI_PLATFORMS`).
+* **Handler inventory.** There is no ScaLAPACK `potrf` and no SLATE
+  `getrf` handler. Adding a backend is one `_<name>.py` module plus one row in
+  each of `loader`'s target table, `resolve._SPEC`/`BACKEND_CHOICES` and
+  `plan._IMPL`; [`docs/dev/linalg_ffi.md`](../dev/linalg_ffi.md) § "Adding a
+  backend" is the procedure. The C++ lives under `src/ffi/cpp/`, and its
+  target strings are frozen.
+
+## Batched routes
+
+`Plan.batched_route` is the one place that decides how a stack runs:
+
+* **(a) `scan`**: `lax.scan` (`BATCHED_SCAN_UNROLL = 1`) over the backend's
+  single-matrix op, compiled once per (op, backend, `mesh_key`, signature).
+* **(b) `backend_batched`**: the library's stacked entry (ScaLAPACK eigh,
+  cuSOLVERMp potrf, both LU backends, `native2d`, native `jnp.linalg.eigh`),
+  one descriptor and one workspace for the stack.
+* **(c) `batch_reshard`**: move the batch axis onto the mesh, run the native
+  JAX kernel (`jnp.linalg.eigh`/`cholesky`/`solve`) on whole local matrices,
+  move matrix outputs back. No distributed-library call.
+
+Public selection is `batched_route ∈ {'batch_reshard', 'auto'}`;
+`BATCHED_ROUTE_DEFAULT = 'batch_reshard'` for `plan`, `dispatch_batched_eigh`,
+`matmul` and `resolve_matmul_backend`. The polar dilation, `gemm_plan` and
+`factor`/`solve` keep their provider plans. Route and backend selection are
+orthogonal: an explicit backend is still resolved and probed before route (c)
+runs its native kernel; `backend='off'` is the provider-free spelling.
+
+Explicit `auto` resolves to (b) when the backend has a stacked entry, else
+(a). On CUDA with handlers present:
+
+| request | 1×1 | 2×2, 4×4 |
+|---|---|---|
+| `eigh`, backend `auto`/`off` | native (b) | native (b) |
+| `eigh`, backend `distributed` | cuSOLVERMp (a) | cuSOLVERMp (a) |
+| `cholesky` / `solve_lu`, backend `auto` | native, caller-owned (no array-returning route) | cuSOLVERMp (b) |
+| `matmul`, backend `auto` | cuBLASMp | cuBLASMp |
+
+**Capacity route.** With `batched_route='auto'` and a `budget_bytes` every
+rank shares, `Plan.route_for` picks (c) for a provider eigh stack when
+`fits_local` admits its per-rank whole matrices (input and output,
+`ceil(nb/P)` each) plus the local kernel workspace, and the provider route
+otherwise. `matmul(..., budget_bytes=...)` applies the same rule to A, B and D.
+
+**Route (c) movement.** Forward exchanges and their literal inverse run in one
+`shard_map`, so GSPMD never sees a face→batch reshard it could lower as
+replicate-then-partition. For padded batch `Bp = ceil(B/(Px·Py))·Px·Py`:
+
+| step | collective (`tiled=True`) | local shape |
+|---|---|---|
+| input face | — | `(Bp, N/Px, N/Py)` |
+| forward x | `all_to_all('x', split_axis=0, concat_axis=1)` | `(Bp/Px, N, N/Py)` |
+| forward y | `all_to_all('y', split_axis=0, concat_axis=2)` | `(Bp/(Px·Py), N, N)` |
+| inverse y | `all_to_all('y', split_axis=2, concat_axis=0)` | `(Bp/Px, N, N/Py)` |
+| inverse x | `all_to_all('x', split_axis=1, concat_axis=0)` | `(Bp, N/Px, N/Py)` |
+
+The inverse must run y then x; x-then-y is shape-correct on a square mesh and
+scrambles the data (the test suite carries that red twin). Eigenvalues are
+restored with one device `all_gather` and returned replicated; eigenvectors,
+Cholesky factors and LU solutions return at `P(None,'x','y')`. Nothing crosses
+the host.
+
+* **Ragged batches** are zero-padded before the first exchange. Synthetic
+  local slots never enter a dense kernel (scalar `fori_loop` + `lax.cond` on
+  the global q index) and are dropped after the inverse.
+* **Matrix faces are not padded:** `N % Px == N % Py == 0`, and LU RHS columns
+  `NRHS % Py == 0`. Shape, rank, dtype and extent violations refuse before
+  placement or any collective. Pad the matrix yourself and slice afterwards.
+* **Keywords.** `block_size` (and `compute_evecs` for eigh) are dropped at the
+  route boundary; any other keyword raises `TypeError`.
+* **Capacity is the hard boundary.** Each device holds `ceil(B/P)` complete
+  `N×N` matrices, their outputs and the native solver workspace. When one
+  matrix does not fit one device, use `batched_route='auto'`.
+* **CPU/MPI transport.** Route (c) planning calls `warm_mesh_cliques(mesh)`,
+  which on multi-process CPU with `JAX_CPU_COLLECTIVES_IMPLEMENTATION=mpi`
+  compiles tiny `psum`s over x, y and (x,y) on the main thread before any
+  `all_to_all` is compiled from an XLA worker thread. It is a cached no-op
+  elsewhere.
+* **Batch-layout input.** An eigh stack already at `P(('x','y'),None,None)` is
+  solved rank-locally with no movement, whatever the plan's route.
+
+## matmul
+
+`matmul` computes `D = alpha·op(A)·op(B) + beta·C` with `op ∈ {N, T, C}`. `C`
+may be omitted only when `beta == 0`. Operands share one dtype; real operands
+refuse complex `alpha`/`beta`.
+
+| input rank | sharding | output |
+|---|---|---|
+| 2 | `P('x','y')` | rank 2, `P('x','y')` |
+| 3 | `P(None,'x','y')`, same nonempty leading batch for A, B, C | rank 3, `P(None,'x','y')` |
+
+Every physical input face and the output face must tile the mesh
+(rows % Px, columns % Py); these checks run before placement.
+
+**Provider route** (`batched_route='auto'`): `auto`/`distributed` resolve to
+cuBLASMp on CUDA, PBLAS on CPU, SLATE on ROCm; `cusolvermp` is an alias for
+`cublasmp`; explicit names never demote.
+
+| request | CUDA | CPU | ROCm |
 |---|---|---|---|
-| `auto` or `distributed` | **cuBLASMp** | **PBLAS** (`pdgemm`/`pzgemm`) | **SLATE** (`slate::multiply`) |
-| `cusolvermp` | **cuBLASMp** alias | refuse | refuse |
-| `cublasmp` | **cuBLASMp** | refuse | refuse |
-| `scalapack` | refuse | **PBLAS** | refuse |
-| `slate` | **SLATE** | **SLATE** | **SLATE** (declared-untested) |
-| `off` | provider-free `batch_reshard` only | provider-free `batch_reshard` only | provider-free `batch_reshard` only |
+| `auto`, `distributed` | cuBLASMp | PBLAS | SLATE |
+| `cublasmp`, `cusolvermp` | cuBLASMp | refuse | refuse |
+| `scalapack` | refuse | PBLAS | refuse |
+| `slate` | SLATE | SLATE | SLATE |
+| `off` | staged route only | staged route only | staged route only |
 
-* For `Plan`, `native` is the floor everywhere and the measured default at
-  every production tile size; its `auto` never picks an FFI backend. For
-  top-level `matmul`, `auto` means the platform's distributed provider.
-* `native2d` is the 2-D block-distributed tiled Cholesky (`_native2d`, the
-  old `common/cholesky_2d`). Pure JAX, every platform, but a *different
-  algorithm*: at n=10k on P=128 the replicated-reshard route costs 1.6
-  GB/device and this one 5 MB/device. `auto` never picks it — a cost model
-  that differs by three orders of magnitude in **both** directions is the
-  caller's decision.
-* **ROCm is DECLARED-UNTESTED.** The preference rows exist so the routing
-  question has an answer; LORRAX builds no ROCm `.so`. Known measurement
-  gap, recorded in `resolve.py`: on the jaxes this tree runs,
-  `Device.platform` is `'gpu'` for both vendors, so a real ROCm mesh lands
-  on the CUDA row. Disambiguating is **one row** and needs a machine.
-* **SLATE `heev` on a host mesh is refused outright** — bug L-2,
-  deterministic SIGSEGV against MKL/LibSci LAPACK. Two contract cells carry
-  the skip by design.
-* **SLATE `eigh` on a MULTI-RANK CUDA mesh is refused at n ≥ 4096** — bug
-  L-4, the CUDA sibling of L-2: SIGSEGV, `srun` rc=139, every rank of the
-  job down (jobid 56457930). Size-scoped, because it *returns* at
-  n ≤ 2048 on the same mesh. A 1×1 CUDA mesh at that size is unmeasured
-  and therefore not refused.
-* **cuSOLVERMp `eigh` with `compute_evecs=False` is refused** — bug L-3,
-  `cusolverMpSyevd` status=7 at every n. A library defect (`bufferSize`
-  succeeds; the handler only forwards the flag). Permanent, not a
-  stopgap: LORRAX wants `compute_evecs=True` everywhere (owner,
-  2026-08-07).
-* **ELPA — REGISTERED CANDIDATE, not built, not wired.** Neither shipped
-  distributed eigensolver is good in the regime that matters: cuSOLVERMp
-  has a ~1.55 s per-matrix floor, and SLATE has a *cheaper* floor
-  (0.40 s at n=64) but worse asymptotics (5.44 s at n=2048, already 2.8×
-  cuSOLVERMp) and it **crashes at 4096** — i.e. it dies exactly where a
-  distributed eigh becomes necessary. Building ELPA as the "dream stack"
-  eigensolver is under consideration by the owner. Nothing in this tree
-  depends on it; the row exists so the question has a written answer.
-* **There is no ScaLAPACK `potrf` handler anywhere in the tree**, and no
-  SLATE `getrf`. The vocabularies above are the whole truth.
-* **The two platform `.so`s share their SLATE.** Both `liblorrax_ffi.so` and
-  `liblorrax_ffi_host.so` carry `NEEDED libslate.so.2` and `NEEDED
-  libblaspp.so.2`, resolved out of different builds; `ld.so` keys a loaded
-  object by SONAME, so the first one opened decides which
-  `blas::get_device_count()` the other calls, and the host build's is a
-  compiled-in 0. Both loaders therefore open **CUDA before cpu**
-  (`_open_cuda_before_host`). See Antipatterns.
+Only `lorrax_cublasmp_batched_gemm` has a C++ handler. The PBLAS and SLATE
+GEMM targets are declared in the loader but not built, so on CPU any provider
+matmul refuses at the capability probe; use `backend='off'` with the staged
+route there. Provider calls need float64 or complex128, an exact 2-D
+`('x','y')` mesh with y-minor process order, one JAX process per cell, and
+exact face tiling; cuBLASMp and SLATE also need a square mesh. The provider
+aliases `C` to the output. On cuBLASMp, `T`/`C` operation codes are served by
+a device face transpose of the operand followed by the N,N call (one extra
+operand-sized distributed buffer per transposed operand); the native
+transpose descriptors are never used.
 
-## Distributed matrix multiplication
+**Staged route** (`batched_route='batch_reshard'`, the default): the route (c)
+exchanges for A, B and C (C only when `beta ≠ 0`), a local `jnp.matmul`, and
+the inverse exchanges for D. A rank-2 call is lifted to batch 1 and padded to
+`Px·Py`, so every device holds one complete operand set. Each device holds
+`ceil(B/P)` complete A, B, D (and C) matrices plus exchange buffers; use it
+only when those fit. A non-`off` backend is still resolved and probed.
 
-`matmul` is a top-level operation rather than a `Plan` op:
+## Planned GEMM
 
-```python
-D = distrib_la.matmul(
-    A, B, C, mesh=mesh, alpha=alpha, beta=beta,
-    transa='N', transb='N', backend='auto', batched_route='auto')
-```
+`gemm_plan(mesh, *, m, k, n, nq, dtype, backend='auto', alpha=1, beta=0,
+layout='face', reduction_axis=None, out_spec=None, enable_active_range=False,
+warmup=True) -> GemmPlan` resolves, probes and (by default) compiles and runs
+one N,N GEMM shape once. `GemmPlan(A, B, C=None, *, out=None)` is trace-safe:
+no dlopen, no probe, no new `jit` wrapper inside a caller's `jit`/`lax.scan`.
 
-It computes `D = alpha * op(A) @ op(B) + beta * C`, where each operation
-code is `N`, `T`, or `C`. `C` is optional only when `beta == 0`; in that case
-the service creates a zero addend. Real operands refuse complex `alpha` or
-`beta`. All operands must have the same dtype, the contraction dimensions
-must agree, and a supplied `C` must have exactly the output shape.
+* **Shapes.** `A (nq,m,k)`, `B (nq,k,n)`, `C`/`D (nq,m,n)`. `nq` is fixed at
+  construction and holds k-points; flatten a spinor axis into m/k/n or call
+  the plan once per spin. `nq = 1` is a legal rank-2 equivalent. float64 or
+  complex128.
+* **N,N only.** There is no `transa`/`transb`; pretranspose into the
+  complementary face layout once.
+* **`alpha`, `beta` are baked in** as FFI attributes. With `beta = 0` the plan
+  also compiles a kernel that creates the zero addend inside the same program;
+  `out=` donates an existing buffer instead (legal only when `beta = 0`, since
+  a `beta ≠ 0` plan would scale the stale content). Pass `C` or `out`, not
+  both. The cuBLASMp handler always binds a live `C` buffer; the plan removes
+  the extra Python-level allocation and program, not that argument.
+* **`GemmPlan.local_call`** runs the same GEMM from inside a caller's manual
+  `shard_map` over the plan's mesh, on bare local tiles
+  `A (nq,m/px,k/py)`, `B (nq,k/px,n/py)`, `C (nq,m/px,n/py)`. `__call__`
+  cannot be entered there.
 
-| input rank | public input sharding | batch contract | output |
+| layout | operands | implementation | active-range kernel |
 |---|---|---|---|
-| 2 | `P('x','y')` | one matrix, internally lifted to batch 1 | rank 2, `P('x','y')` |
-| 3 | `P(None,'x','y')` | A, B, and C have the same nonempty leading batch | rank 3, `P(None,'x','y')` |
-
-With `batched_route='auto'`, the resolved provider receives the original
-face-sharded matrices: cuBLASMp on CUDA, PBLAS `pdgemm`/`pzgemm` on CPU, or
-`slate::multiply` on ROCm. Explicit `cublasmp`, `scalapack`, and `slate`
-requests never demote, and `cusolvermp` names its cuBLASMp sibling. Provider
-handlers accept `float64` and `complex128`, require an exact 2-D `('x','y')`
-mesh with y-minor process order, one JAX process per cell, and exact face
-tiling. They alias/donate `C` to the output. cuBLASMp and SLATE also require a
-square mesh; PBLAS supports rectangular grids. `backend='off'` has no
-provider and is therefore legal only with the staged route.
-
-With `batched_route='batch_reshard'`, the service pads a leading batch `B`
-to `Bp = ceil(B/(Px*Py)) * Px*Py`, using zero A, B, and C matrices. The
-synthetic rows are exchanged but never multiplied: when `Bp > B` each device
-runs its local rows through a scalar `lax.cond` inside a `fori_loop`, the same
-schedule as the staged eigh/cholesky/solve route, and a synthetic row returns
-exact zeros that are discarded. A full batch (`Bp == B`) keeps one batched
-local `jnp.matmul` per device. Each operand then follows these collectives
-inside one `shard_map`:
-
-| stage for a generic `X: (Bp,R,C)` | per-device shape | collective |
-|---|---|---|
-| incoming face | `(Bp, R/Px, C/Py)` | — |
-| x forward | `(Bp/Px, R, C/Py)` | x `all_to_all(split_axis=0, concat_axis=1)` |
-| y forward | `(Bp/(Px*Py), R, C)` | y `all_to_all(split_axis=0, concat_axis=2)` |
-
-Local devices apply `op(A)` and `op(B)`, run `jnp.matmul`, and add `beta*C`.
-For `D: (Bp,M,N)`, the literal inverse is deliberately in reverse order:
-
-| stage for D | per-device shape | collective |
-|---|---|---|
-| local result | `(Bp/(Px*Py), M, N)` | — |
-| y inverse | `(Bp/Px, M, N/Py)` | y `all_to_all(split_axis=2, concat_axis=0)` |
-| x inverse | `(Bp, M/Px, N/Py)` | x `all_to_all(split_axis=1, concat_axis=0)` |
-| returned face | original leading batch only | drop the padded rows |
-
-This is staged device-to-device movement, never a host gather and never a
-direct sharding constraint that could rematerialize a full stack. It accepts
-a ragged leading batch, but deliberately does **not** pad matrix dimensions:
-physical rows of A/B/C must divide `Px`, physical columns must divide `Py`,
-and output M/N must do the same. These checks run before placement or a
-collective. Rank, batch, dtype, contraction, operation-code, scalar, and
-missing-C errors also refuse eagerly.
-
-The staged route is a capacity tradeoff. Each device holds
-`ceil(B/(Px*Py))` complete A, B, and D matrices (plus C when `beta != 0`),
-the still-live caller faces/padded faces, collective exchange buffers, and
-JAX GEMM workspace. With `beta == 0`, no synthetic C is allocated or
-exchanged.
-Rank-2 input is padded to `Px*Py`, so each device still holds one complete
-operand set even though only one row is real. Use it only when those complete
-matrices fit comfortably; the provider route remains the default for matrices
-that require 2-D distribution for capacity.
-
-Provider-specific refusals still matter when a provider is selected. A
-non-`off` provider request is resolved and probed even with
-`batched_route='batch_reshard'`; use `backend='off'` for a provider-free call.
-An unavailable handler, wrong platform, partial-world mesh, unsupported
-provider dtype, or incompatible face extent refuses rather than falling back.
-Multi-rank cuBLASMp accepts only `transa='N', transb='N'`. The real P=4 gate
-found that transpose-A returns a wrong result, while transpose-B can return
-rank-divergent `INVALID_VALUE` and deadlock. Both are refused before the
-provider call; pretranspose into the ordinary face layout, select PBLAS/SLATE,
-or use the staged route.
-
-## Planned GEMM — trace-safe N,N calls for hot loops
-
-`matmul()` resolves its provider and probes capability at every call. That
-is correct for an eager call site, but a caller that runs G construction
-or a per-tau Sigma projection inside its own `jax.jit`/`lax.scan` needs the
-same two-phase split `Plan`/`PolarPlan` already give the solver ops: an
-EAGER phase (provider resolution, mesh geometry and kernel warmup) that runs
-ONCE, and a closure built from its result that touches none of that.
-`gemm_plan`/`GemmPlan` (`distrib_la.matmul_plan`) is that split for GEMM,
-modelled directly on `plan_polar_factor`/`PolarPlan` — the one existing
-precedent for driving an FFI call from inside a composed, jitted kernel.
-
-```python
-plan = distrib_la.gemm_plan(
-    mesh, m=m, k=k, n=n, nq=nq, dtype=dtype, layout=layout,
-    backend='auto', enable_active_range=True)
-# ... hoisted out of the k/tau loop; by here its kernels are warm ...
-D = plan(A, B)                 # inside jit/scan: no dlopen, no probe
-D_active = plan.active_range(A, B, lo, hi, weights=w)  # w.shape == (nq, k)
-prepared = plan.prepare_active_range(lo, hi)  # eager, outside jit/scan
-D_prepared = prepared(A, B, weights=w)        # no runtime bounds operands
-```
-
-The exact active-interval contract, native descriptor-view design, validation
-and workspace limits are owned by [Active ranges in planned distributed
-GEMM](../dev/active_gemm_ranges.md). The service has two implementations
-behind the same opt-in method:
-
-| layout | contraction placement | active-range kernel |
-|---|---|---|
-| `face` | band axis distributed over the two-dimensional mesh | cuBLASMp; each original owner intersection is an exact descriptor view |
-| `axis`, CUDA | complete band axis local, centroid axes sharded | classic cuBLAS pointer/leading-dimension views; no packing or communication |
-| `axis`, CPU | complete band axis local, centroid axes sharded | JAX dot panels capped at 256 bands; no communication |
-
-The axis implementations have no processor exchange. CUDA applies optional
-weights to the fixed-size A tile once before the pointer-view FFI; it does not
-remove that weighted-A allocation. CPU applies weights inside only the
-selected, bounded panels. The face implementation is CUDA-only because the
-planned ScaLAPACK and SLATE GEMM providers do not exist in this tree. Thus a
-CPU `layout='face'` plan refuses by name; there is no silent fallback that
-would materialize a full matrix on each rank.
-
-Use `prepare_active_range(lo, hi)` when an interval is known on the host and
-will be reused. It validates integer scalar or `(nq,)` bounds immediately and
-returns `prepared(A, B, C=None, *, out=None, weights=None)`. The returned
-callable captures a private immutable copy of the bounds. CUDA passes that
-copy as native FFI metadata, avoiding a device-to-host bounds copy and the
-associated stream synchronization on each call; CPU closes over the same
-constants in the JAX panel kernel. An explicit prepared CUDA request probes
-the prepared provider target before returning.
-
-Each prepared callable is owned by its caller and compiles lazily on first
-use. Constructing it neither runs a dummy GEMM nor allocates matrix-shaped
-warmup operands. Different bounds can therefore produce different compiled
-executables, so callers should retain and reuse the callable for each interval
-they need rather than creating one inside a loop. The service keeps no global
-cache of bound variants. Full-range prepared calls retain the existing dense
-operation, including its numerical order. CUDA local calls retain the full
-weighted-A allocation; preparing bounds only removes the runtime metadata
-transfer and synchronization.
-
-Deliberately narrower than `matmul()`:
-
-* **N,N only** — there is no `transa`/`transb` anywhere in the module.
-  Multi-rank cuBLASMp's transpose modes are the ones `matmul()` itself
-  refuses (§ "Distributed matrix multiplication" above); a caller with a
-  transposed operand pretransposes into the complementary face layout
-  once, which is exactly what a two-face `psi_nmu`/`psi_mun` bundle does.
-* **One replicated leading batch, fixed at construction** — `A` is
-  `(nq,m,k)`, `B` is `(nq,k,n)`, `C`/`D` are `(nq,m,n)`, all
-  `P(None,'x','y')`. `nq` holds k-points; a spinor axis is not a second
-  batch — flatten it into m/k/n, or call the SAME plan `ns` times in a
-  small, statically unrolled Python loop. `nq=1` is a legal,
-  zero-overhead rank-2-equivalent plan.
-* **cuBLASMp only for the face layout, today** — `lorrax_scalapack_batched_gemm` and
-  `lorrax_slate_batched_gemm` are claimed by `distrib_la.loader`'s target
-  table but have no C++ definition anywhere in this tree
-  (`KNOWN_LORRAX_ISSUES.md`, "services/distrib_la loader vs src/ffi" row;
-  confirmed again by `nm -D` on the pinned CUDA library, which exports
-  only `CublasMpBatchedGemmFfi`). A request that `resolve_matmul_backend`
-  would send to either provider refuses at `gemm_plan()` construction, by
-  name, using the same capability probe `matmul()` uses.
-* **The face layout is provider-only** — `backend='off'` refuses by name.
-  `batch_reshard` materializes complete A, B, C and D on every device; the
-  reason to reach for a *planned* GEMM at all is a G/Sigma-sized operand
-  that must never be that, so this surface never selects it.
-
-**Output liveness.** A plan built with `beta=0` (the default, and what
-every G/T/Sigma GEMM in the `low_mem_bands` audit needs) additionally
-compiles a kernel that builds its zero addend with `jnp.zeros` INSIDE the
-same compiled program as the GEMM FFI call, so a repeated call never pays
-`matmul()`'s separate top-level `jax.jit` dispatch for a missing `C`
-(`matmul.py:433-437`) — one compiled program, not two. Passing an existing
-buffer as `out=` skips the internal zero-fill entirely and donates that
-buffer's storage to the provider instead, for a caller threading a scratch
-accumulator through a `lax.scan` carry. Neither path removes cuBLASMp's own
-requirement of a live `C` argument: the FFI handler binds it unconditionally
-(`src/ffi/cpp/cublasmp/batched_gemm_ffi.cc`, `.Arg<AnyBuffer>() // C`), so
-there is no provider-level "no C at all" mode — what this surface removes
-is the extra Python-level allocation and compiled program, not the C++
-argument. State that distinction when reporting the memory win.
-
-`out=` is refused on a `beta!=0` plan: `C` and `out` both reach the same
-compiled kernel, and that kernel's `beta` is fixed at *plan construction*,
-not chosen per call, so `out=`'s "content is ignored" contract only holds
-when the plan itself was built with `beta=0` — on a `beta!=0` plan the
-buffer's stale content would silently be scaled by `beta` and folded into
-the result. Pass `C=` on such a plan instead, where the accumulate is
-explicit at the call site.
-
-The full-range planned path is **verified** by
-`services/distrib_la/tests/test_distrib_la_matmul_plan.py`
-(emulated CPU mesh — the eager refusal ladder only: `backend='off'`, a
-resolved non-cuBLASMp provider, mesh topology, dtype, malformed shapes;
-real execution cannot be reached without a CUDA mesh) and
-`test_distrib_la_multiproc.py`'s `gemm_plan_cublasmp` CLI cell, on
-Perlmutter, `lx run -G 4 -n 4 ... --mesh 2x2 --only gemm_plan`: numerics
-against `A @ B` (complex128 and float64, relative ~1e-16), called eagerly,
-inside a `jax.jit`, inside a `lax.scan` (the actual per-tau/per-k hot-loop
-shape), through the `beta!=0` accumulate path, through the donated `out=`
-path, and across five repeated calls with fresh operands. `matmul_cublasmp`
-in the same suite (the pre-existing `matmul()` path, unchanged by this
-work) passed on the same real 2x2 mesh in the same run, confirming no
-regression.
-
-The active-range paths have separate coverage. The P4 CUDA provider tests in
-`services/distrib_la/tests/test_active_gemm_range.py` check scalar and
-per-parent bounds, owner crossings, empty intervals, nontrivial alpha/beta,
-and poisoned inactive inputs. The local tests in
-`services/distrib_la/tests/test_local_active_gemm_range.py` exercise the same
-public method on CPU and CUDA, including optional complex weights, poisoned
-inactive tails, and reuse of one compiled executable across changed bounds.
-CUDA selects the classic-cuBLAS handler; CPU selects the bounded JAX-panel
-route. See the active-range owner page for the evidence boundary; these
-service tests do not turn a CPU face layout into a supported route.
-
-## Tests
-
-test_distrib_la_polar.py is the synthetic complex/real polar tier.  It covers
-NumPy-SVD parity, unitary and repeated-singular-value degeneracies,
-ill-conditioning below the Gram-eigh resolution floor, numerical rank
-deficiency, an all-zero matrix, non-divisible logical padding, output
-shardings, planned tracing, and refusal/red-control cases.  It runs on the
-four-device emulated CPU mesh and does not require a vendor library.
-
-The suite spans local algebra, emulated devices, real processes, FFI/ELF
-acceptance, import isolation, and skip honesty. Markers `services` +
-`distrib_la` are applied by a collection hook
-(a `pytestmark` in a conftest is silent — `tests/test_service_selection.py`
-measures that the marks arrived).
-
-| tier | file | needs |
-|---|---|---|
-| L-a shape/contract algebra | `test_distrib_la_shape_algebra.py` | nothing — a laptop, milliseconds |
-| L-b emulated multi-device | `test_distrib_la_emulated_mesh.py` | `XLA_FLAGS` set by the SERVICE conftest; **skips**, never asserts, below 4 devices |
-| route-c staged movement | `test_distrib_la_batch_reshard.py` | four emulated CPU devices; all three local kernels, ragged batches, inverse round trip + wrong-order red twin |
-| GEMM provider + staged contract | `test_distrib_la_matmul.py` | four emulated CPU devices; backend vocabulary, rank-2 and ragged rank-3 GEMM, transpose codes, and exact x/y + y/x schedule |
-| planned GEMM eager refusal ladder | `test_distrib_la_matmul_plan.py` | nothing but jax; `gemm_plan()`'s pure helpers plus its `backend='off'`/non-cuBLASMp/topology/dtype/shape refusals on an emulated CPU mesh — real cuBLASMp execution is CUDA-only and is leg L-c's `gemm_plan_cublasmp` cell |
-| L-c real multi-process | `test_distrib_la_multiproc.py` | `srun -n 4`; shared `check_*(mesh, …)` bodies + a `__main__` CLI (`_CLI_CELLS`) — same functions, no duplicated logic |
-| contract + wiring | `test_distrib_la_contract.py` | the `.so` pins; every refusal constructibly fires |
-| C++ / ELF acceptance | `test_so_acceptance.py` | binutils + a pinned `.so`; reads the ELF, never dlopens |
-| import isolation | `test_distrib_la_import_isolation.py` | `python -S` subprocess; `sys.modules` AND `sys.path` asserted, plus a red twin and a with-lorrax-still-passes |
-| skip honesty | `test_distrib_la_skip_honesty.py` | a machine profile; ABSENT = skip, BUILT-AND-BROKEN = **FAIL** |
-
-* **Hostile geometry is mandatory**: a real 2×2 with non-dividing extents
-  and padding round-trips, with the anti-tautology self-assertion (the pad
-  divisor must be provably non-vacuous).
-* **Every check ships with the case where it returns FALSE.** No exceptions.
-* From an installed editable package in `services/distrib_la`, run
-  `python -m pytest`. From the repository root, run
-  `python -m pytest services/distrib_la/tests`; the service conftest loads
-  first and creates four emulated CPU devices before JAX imports. Neither
-  spelling loads the monorepo `tests/conftest.py`. Before the GEMM surface
-  landed, the source-only/emulated floor at commit `0ba29095` was **82
-  passed**, including **13** focused route-(c) cells. The current total also
-  includes `test_distrib_la_matmul.py`; use collection/run output rather than
-  treating the historical count as a present invariant.
-* Run it as part of LORRAX with `python -m pytest -m distrib_la`.
-  Deselect: `--no-services` / `--only-service=NAME`, never a second `-m`
-  (`pyproject` sets `addopts = "-m 'not extra'"` and an explicit `-m`
-  REPLACES it, silently re-enabling 26 deselected suites).
-* The scheduler-specific real-GPU gate is deliberately separate from the
-  installable package's local suite. On Perlmutter it is:
-
-  ```bash
-  export LX_BASE_MODULE=lorrax_J070
-  lx run -N 1 -G 4 -n 4 python3 -u \
-    services/distrib_la/tests/test_distrib_la_multiproc.py \
-    --mesh 2x2 --only batch_reshard_local_ops
-  ```
-
-  On 2026-08-15, commit `0ba29095`, that solver gate ran a ragged batch of five on
-  four CUDA ranks and passed `complex128` and `float64` for `eigh`,
-  `cholesky`, and `solve_lu`: **2 cells / 0 failures**. The gate asserts the
-  output shardings before its test-only host readback. It predates `matmul`
-  and is not evidence for either GEMM provider execution or staged GEMM on
-  real CUDA processes.
-* `python -m pytest` runs the FFI/ELF and machine-profile gates as well. On
-  Perlmutter, the profile promises working provider libraries, so the full
-  suite requires the documented `LORRAX_FFI_{,HOST_}SO` pins and dependent
-  library paths; missing promised capabilities fail skip honesty instead of
-  being counted as acceptable standalone skips.
-* Perlmutter floor, 2026-08-07, HEAD `eeece71`, BUILD_NOTES pins: full-suite
-  `-m distrib_la` **130 cells / 0 failed / 22 skipped** (was 124 / 8 failed
-  before the SONAME fix); service-only by path **250 / 0 / 3**, of which
-  lxkit is 120 and unchanged.
-
-## Performance
-
-Recorded baselines (never slow tests) in
-`services/distrib_la/bench/baselines/{cpu,gpu}{1x1,2x2}.json`: one row per
-(op × backend × shape), with `seconds`/`min`/`max`, `compile_seconds`, the
-resolved backend, and — for a combination that cannot run — the refusal
-text instead of a number. All rows below: Perlmutter, **jobid 56447670**,
-1 node, jax `0.7.0.dev20260807`, complex128, BUILD_NOTES `.so` pins.
-Regression detection = diffing baseline files across branches.
-
-> The jobid above read **56444350** until 2026-08-07. That was stale — it
-> is the step-2 L-c multiproc leg, not the leg the committed baselines
-> came from. Every row in all four baseline files carries `"jobid":
-> "56447670"`, which is the number now printed here.
-
-> **The eight `cholesky`/`slate` rows in the baseline files are now
-> PESSIMISTIC and have not been regenerated.** They were measured against
-> the per-q Python loops in `factor`/`solve`, which re-compiled SLATE's
-> kernel once per matrix; those loops are scans as of
-> `feat/batched-canonical-2026-08-08` and § "The batched surface is a
-> scan" measures the same route 35× faster on gpu 2×2. Regenerating the
-> sweep is a perf leg on a shared GPU pool and is deliberately NOT folded
-> into that change — read the A/B table for this route, not
-> `baselines/*.json`, until a regeneration leg lands.
-
-**For the three `Plan` ops, `auto` resolves to `native` everywhere, and the
-numbers say why.** (`matmul` uses the separate provider default above.)
-
-| op | backend | mesh | shape (nq, n) | s |
-|---|---|---|---|---|
-| eigh | native | cpu 1×1 | (2, 1024) | 1.446 |
-| eigh | scalapack | cpu 1×1 | (2, 1024) | 1.451 |
-| eigh | scalapack | cpu 2×2 | (2, 1024) | 1.099 |
-| eigh | native | gpu 1×1 | (2, 1024) | 0.044 (via `plan`, `cusolvermp` 0.0435) |
-| cholesky | native2d | gpu 2×2 | (8, 256) | 0.022 |
-| cholesky | native2d | cpu 2×2 | (2, 1024) | 0.375 |
-
-**cuSOLVERMp `eigh` on a 4-process 2×2 costs a flat ~1.55 s PER MATRIX,
-independent of size.** That is the collective, not the factorization:
-
-| shape (nq, n) | total s | s / matrix |
-|---|---|---|
-| (2, 64) | 3.117 | 1.56 |
-| (2, 256) | 3.201 | 1.60 |
-| (2, 1024) | 3.525 | 1.76 |
-| (8, 256) | 12.713 | **1.59** |
-
-64×64 and 1024×1024 cost the same. A per-matrix cost that does not move
-with n⁴× the work is a fixed collective/context charge.
-
-### The crossover, and where the ~1.55 s actually goes
-
-Step 6's eigh investigation (jobid **56447670**, 4 processes on a real
-2×2 A100 mesh, complex128, warm medians, one matrix per call). Rows are in
-`baselines/{cpu,gpu}2x2.json` tagged `"leg": "step6.cross_size"`.
-
-| n | native replicated | cuSOLVERMp | SLATE | cuSOLVERMp / native |
-|---|---|---|---|---|
-| 64 | **0.00149** | 1.586 | 0.401 | 1064× |
-| 256 | **0.00412** | 1.561 | 0.546 | 378× |
-| 1024 | **0.02662** | 1.754 | 1.387 | 66× |
-| 2048 | **0.07275** | 1.932 | 5.444 | 27× |
-| 4096 | **0.39550** | 2.739 | **SIGSEGV** | 6.9× |
-
-**Is SLATE the reasonable one?** No. It has the cheaper floor — 0.40 s vs
-1.59 s at n=64, and it beats cuSOLVERMp up to n≈1024 — but its scaling is
-worse (5.44 s at 2048, already 2.8× cuSOLVERMp) and it **dies at 4096**,
-which is where distributed eigh starts to be the thing you actually need.
-Faster floor, worse asymptotics, crashes in the capacity regime. That is
-the whole reason ELPA is a registered candidate (§ Backends).
-
-**The ~1.55 s is not ours and is not reachable.** `LORRAX_FFI_PROFILE=1`
-splits the warm n=64 call as: `cusolverMpSyevd` **99.998%**, `plan()` +
-`resolve_backend` 9.6 µs, cuSOLVERMp context-cache HIT 0.72 µs,
-descriptors + `bufferSize` ≤ 0.02 ms. Cold-only extras, outside the warm
-number: one-time context bootstrap 0.66–0.81 s, XLA compile ~0.79 s.
-There is no in-tree edit that moves this. `block_size` does not either
-(64/128/256/default at n=4096: 2.44/2.41/2.44/2.70 s).
-
-**CPU tells the same story without needing an extrapolation.** ScaLAPACK
-`pzheevd` never beat native replicated on one node, and the gap widens:
-
-| n | native replicated | scalapack | ratio |
-|---|---|---|---|
-| 64 | **0.00063** | 0.00255 | 4.0× |
-| 256 | **0.01626** | 0.01717 | 1.06× |
-| 1024 | **0.27120** | 0.55437 | 2.04× |
-| 2048 | **1.48904** | 4.12157 | 2.77× |
-
-`Plan`'s `auto` → `native` (`resolve.py`) is therefore **vindicated on both
-platforms**, at every size anyone has measured. Do not change it.
-
-### `distributed` eigh is for CAPACITY, not speed — and that regime is UNMEASURED
-
-Every row above **fits on one device**, so every row above is a regime
-where a distributed library has no reason to win. Extrapolating two fitted
-power-law exponents puts break-even near **n ≈ 1.9 × 10⁴**, which is
-**4.6× past the largest n measured (4096)** and is sensitive to the fit
-window (last-three-points ≈ 1.4 × 10⁴; all-five ≈ 2.8 × 10⁴). Read the
-**decade**, never the digits. It lands in the same decade as the
-single-device capacity wall: an n×n complex128 matrix plus its
-eigenvector copy and workspace stops fitting in 40 GB around n ≈ 2.7 × 10⁴.
-
-So the honest summary is: *below the capacity wall, native wins by
-between 1064× and 6.9×; at and above it, native cannot run at all and
-nobody has measured what the alternatives cost.* An explicit
-`distributed`/`cusolvermp` eigh below n=16384 now prints that on rank 0,
-once per mesh geometry, and **still runs exactly what was asked for** —
-explicit requests are never demoted.
-
-### Open measurement gaps (inherit this map; do not re-derive it)
-
-1. **MULTI-NODE — the biggest gap by a distance.** Every number in this
-   document is one node, 4 ranks. The case `distributed` exists for is a
-   mesh spanning nodes, and there is not one measurement of it.
-2. **The capacity regime itself** (n ≳ 2.7 × 10⁴, matrices too large for
-   one device). Unmeasured, so the crossover stays an extrapolation.
-3. **float64 rows.** Everything here is complex128. The real-symmetric
-   path is exercised by contract cells but has no baseline row.
-4. **`compute_evecs=False`.** Refused on cuSOLVERMp (bug L-3), so its
-   cost is unknown on every backend — including the ones where it works.
-5. **A genuine CPU partition.** The "cpu" legs ran on the GPU pool's nodes
-   with `JAX_PLATFORMS=cpu`; the Milan CPU partition has one census leg
-   (jobid 56446562) and no perf leg.
-6. **Non-square 1-D meshes.** ScaLAPACK accepts them (square *blocks*, not
-   a square grid) and nothing has been timed on one.
-7. **Batched vs serial, split by backend.** ~~Never isolated.~~ Partly
-   closed by the A/B in § "The batched surface is a scan": on cpu 2×2 at
-   nq=8/n=64 the scan route costs 0.0115 s against the ScaLAPACK stacked
-   entry's 0.01125 s — 2% for a route with no C++ batching at all — so the
-   stacked entry's advantage at THIS shape is small. What stays open is
-   whether that holds at large `nq`, where one descriptor and one
-   workspace should start to tell.
-8. **The (2048, 4096] window for bug L-4.** SLATE CUDA eigh's true crash
-   threshold is somewhere in there; 4096 is just the smallest size anyone
-   watched it die at.
-9. **The 4×4 control at n = 8192.** Owed to the 3×3 hang written up at the
-   top of this document. Until someone runs it, we cannot say whether the
-   hang is a non-power-of-two-grid problem or a "anything past 2×2"
-   problem, and those two have very different blast radii. Root-causing
-   the hang itself needs a multi-node GPU allocation.
-
-### The batched surface is a scan, and the route toggle is one place
-
-**BUILT.** `Plan.batched` is a `lax.scan` over this package's own
-single-matrix operation, at `BATCHED_SCAN_UNROLL = 1` — a named constant,
-deliberately changeable, changed only with a measurement behind it.
-Backend-native stacked entry points (ScaLAPACK's eigh `many`, cuSOLVERMp's
-`batched_potrf`, both `batched_solve_lu`) are backend-internal
-optimizations **behind that same interface**, never a second public
-surface. `dispatch_batched_eigh` used to be that second surface — it
-carried its own `getattr` capability probe and its own serial loop — and
-is now `plan(...).batched(A)`.
-
-The point is not the loop. A Python loop over `nb` matrices is `nb`
-separate calls the compiler never sees together, and there is nowhere in
-it to put "run this batch some other way". A scan is one node, so the
-choice collapses to **`Plan.batched_route`, the one place that decides**:
-
-* **(a)** `ROUTE_SCAN` — a scan of the *distributed* single-matrix op,
-  selected by explicit `auto` when no stacked provider entry exists.
-* **(b)** `ROUTE_BACKEND_BATCHED` — the backend's stacked entry where the
-  library has one. Its saving is in C++, around ONE descriptor and ONE
-  workspace, and no scan can recover it.
-* **(c)** `ROUTE_BATCH_RESHARD` — reshard
-  `(q, μ_x, ν_y) → (q_xy, μ, ν)`, run the op locally with the native
-  JAX kernel per matrix, and reshard matrix outputs back through the literal
-  inverse exchange. This serves batches of matrices below single-device
-  capacity **without paying any distributed-library fixed cost** — which the
-  tables above show is the entire cost below n ≈ 10⁴.
-
-(a)/(b)/(c) behind one toggle point is how small-system, non-distributed
-linalg happens **without a parallel API**.
-
-**Route (c) is built without an upward package dependency.** A direct
-`P(None,'x','y') → P(('x','y'),None,None)` constraint is not a tile
-permutation: GSPMD has lowered it as replicate-then-partition, with a measured
-64× per-rank residency blow-up (job 7882974). The package therefore owns a
-small private implementation in `_batch_reshard`; it imports no LORRAX
-`common` module. Forward movement and its literal inverse run inside one
-`shard_map`, using only device collectives. For padded global batch `Bp`, the
-local shapes and exact `all_to_all` arguments are:
-
-| step | operation | local shape after the step |
-|---|---|---|
-| input face | `P(None,'x','y')` | `(Bp, N/Px, N/Py)` |
-| forward x | `all_to_all('x', split_axis=0, concat_axis=1, tiled=True)` | `(Bp/Px, N, N/Py)` |
-| forward y | `all_to_all('y', split_axis=0, concat_axis=2, tiled=True)` | `(Bp/(Px·Py), N, N)` |
-| inverse y | `all_to_all('y', split_axis=2, concat_axis=0, tiled=True)` | `(Bp/Px, N, N/Py)` |
-| inverse x | `all_to_all('x', split_axis=1, concat_axis=0, tiled=True)` | `(Bp, N/Px, N/Py)` |
-
-Thus x splits batch and joins matrix rows, then y splits batch and joins
-matrix columns; the inverse must run y then x. A wrong-order inverse is
-shape-correct on a square mesh, so the test suite contains both a bit-exact
-movement round trip and a red twin proving that x-then-y scrambles the data.
-No operand or output gathers through the host.
-
-The local kernels are `jnp.linalg.eigh`, `jnp.linalg.cholesky`, and
-`jnp.linalg.solve`, covering all three array-returning `Plan.batched` ops.
-Outputs preserve the ordinary service contract:
-
-* `eigh`: eigenvalues `(B,N)` are restored with a device
-  `all_gather(('x','y'), axis=0, tiled=True)` and returned replicated at
-  `P()`; eigenvectors take the inverse exchanges and return at
-  `P(None,'x','y')`.
-* `cholesky`: factors take the inverse exchanges and return at
-  `P(None,'x','y')`.
-* `solve_lu`: solutions take the inverse exchanges and return at
-  `P(None,'x','y')`.
-
-Ragged batch handling is internal. `Bp = ceil(B/(Px·Py))·Px·Py`, and
-synthetic rows are dropped after the inverse. Eigh gets zero-Hermitian rows;
-Cholesky and LU replace each synthetic A with identity; LU's synthetic RHS
-is zero. Those are safe inputs to the local kernels and prevent padded
-Cholesky/LU rows from producing singular-factor NaNs. This padding covers
-only the leading batch. Matrix faces must tile exactly
-(`N % Px == N % Py == 0`), and LU RHS columns must obey
-`NRHS % Py == 0`; rank/shape/dtype/extent violations refuse eagerly before
-placement or collective entry. A consumer may pad a matrix/RHS extent before
-the call and slice afterward, but the package cannot infer that transformation
-without changing the mathematical problem.
-
-Backend-only `block_size` is consumed at the route boundary and never reaches
-`jnp.linalg.*`. `compute_evecs` is likewise consumed for `eigh`, because the
-public result always contains eigenvectors; any other unsupported keyword
-refuses with `TypeError` instead of leaking into a local kernel.
-
-The shipping default is construction-time:
-`plan(..., batched_route='batch_reshard')`; `Plan.batched(...)` remains the
-single call surface. Route selection and backend selection are orthogonal:
-the requested backend is still resolved and, if explicit, probed before route
-(c) runs its native kernel. Use `backend='off'` when no provider capability is
-intended. `auto` preserves the historical choice exactly: native `eigh` and
-FFI backends with a stacked entry resolve to `backend_batched`; remaining FFI
-backends resolve to `scan`. `Plan.describe()` records both the requested and
-resolved backend and the requested and resolved batch route.
-
-Plan construction also calls the package-local `warm_mesh_cliques(mesh)`.
-It is a cached no-op for GPU/NCCL, non-MPI CPU transports, single-process
-runs, and already-warmed meshes. On multi-process JAX CPU with
-`JAX_CPU_COLLECTIVES_IMPLEMENTATION=mpi`, it synchronously compiles tiny
-`psum`s for the x, y, and flattened `(x,y)` cliques on the main thread before
-the route's `all_to_all`s can be compiled from an intra-op worker.
-
-**Capacity is the route's hard boundary.** After the two forward exchanges,
-each device holds `Bp/(Px·Py)` complete `N×N` matrices and runs a native
-dense solver on them. At least one full matrix, its matrix-shaped output, and
-the solver workspace must fit on one device; multiple local batch elements
-increase that peak further. The exchanges are volume-preserving, but they do
-not make a single matrix smaller. When one full matrix cannot fit, select
-explicit `auto` for the distributed tile/provider route rather than using
-`batch_reshard`.
-
-#### What the restructure cost and bought
-
-A/B on the same nodes with the BUILD_NOTES pins, `origin/main` (`21d68e0`)
-against `feat/batched-canonical-2026-08-08`, real 4-process 2×2 meshes,
-nq=8, n=64, complex128. `compiles` is XLA compilations on the cold call,
-counted off jax's own compile log; `warm` is the median of three
-subsequent calls.
-
-| leg | case | route | compiles | cold s | warm s |
-|---|---|---|---|---|---|
-| cpu 2×2 | eigh, `main` | Python loop | 12 | 0.307 | 0.0237 |
-| cpu 2×2 | eigh, branch | **(a) scan** | **1** | 0.109 | **0.0115** |
-| cpu 2×2 | eigh, `main` | (b) stacked | 1 | 0.063 | 0.01130 |
-| cpu 2×2 | eigh, branch | (b) stacked | 1 | 0.063 | 0.01125 |
-| cpu 2×2 | SLATE cholesky factor+solve, `main` | 2 Python loops | 165 | 3.370 | 3.2578 |
-| cpu 2×2 | SLATE cholesky factor+solve, branch | **2 scans** | **3** | 0.177 | **0.0087** |
-| gpu 2×2 | eigh/cuSOLVERMp, `main` | Python loop | 11 | 14.250 | 12.518 |
-| gpu 2×2 | eigh/cuSOLVERMp, branch | **(a) scan** | **1** | 14.177 | 12.702 |
-| gpu 2×2 | SLATE cholesky factor+solve, `main` | 2 Python loops | 165 | 6.234 | 5.887 |
-| gpu 2×2 | SLATE cholesky factor+solve, branch | **2 scans** | **3** | 0.841 | **0.166** |
-
-**Every result is BIT-IDENTICAL across the two trees** — W and Z for both
-eigh legs and X for the cholesky legs, `np.array_equal` true, on cpu and
-on gpu. This is an interior restructure and the arrays say so.
-
-The eigh/cuSOLVERMp row is the only one where the branch is not faster on
-a single run, and repeating it says it is not slower either. Warm seconds
-over three alternating runs on the same allocation:
-
-| run | `main` | branch |
-|---|---|---|
-| 1 | 12.518 | 12.702 |
-| 2 | 12.613 | 12.459 |
-| 3 | 12.537 | 12.503 |
-| mean | **12.556** | **12.555** |
-
-The ordering lands on the wrong side of the difference as often as the
-right one. That is what a **flat per-matrix collective charge** looks
-like: § "The crossover" measures cuSOLVERMp at 1.56/1.60/1.76/1.59 s per
-matrix across four shapes with **99.998% of it inside
-`cusolverMpSyevd`**. Nothing in that leg is ours to move, and the scan
-did not move it.
-
-**The compile count is the result to read.** The old serial route compiled
-per iteration on any wrapper without a jit cache; the scan compiles once,
-whatever `nq` is. SLATE is where that mattered most —
-`_slate.distributed_cholesky` and `_slate.distributed_trsm` build their
-`shard_map` at eager top level with no `jax.jit` around it and no
-per-signature cache, the shape every other wrapper here has and those two
-do not, so an `nbatch`-long Python loop re-traced and re-compiled the
-kernel `nbatch` times. 165 compiles → 3, and 5.9 s → 0.17 s of GPU wall.
-
-**An eager scan is not enough, and the first measurement said so.**
-Without a `jax.jit` cache per signature the scan is correct and *slower*:
-the cpu eigh row came out at 0.080 s warm against 0.024 s for the Python
-loop, because `lax.scan` called eagerly re-traces and re-lowers the whole
-loop every call while the Python loop's `nq` backend calls each landed in
-the wrapper's own `_JIT_CACHE`. The same scan as a pre-compiled executable
-timed 0.0114 s, so ~69 ms of that 80 was pure retrace. `plan._SCAN_CACHE`
-is the fix and it is keyed on `mesh_key`, which is strictly finer than the
-`(Px, Py)` the backends key their MPI/NCCL contexts on — a cache that
-cannot hand back an executable whose baked-in context handle has moved on.
-
-**`lax.scan` over a distributed FFI call is viable on BOTH platforms, and
-CUDA was the open question.** The host answer was already recorded (job
-7889132, ScaLAPACK, P=4). The route that actually *ships* is cuSOLVERMp
-and SLATE over NCCL + `cal_comm`, whose failure mode is a HANG with no
-traceback, and no CUDA mesh had ever been pointed at it. It traces,
-compiles and runs: `eigh/cusolvermp` above is that route, on a real
-4-process 2×2 A100 mesh, residual 2.296e-15.
-
-*Experiment note, not a plan:* a possible **fourth** route, for the
-capacity regime only (matrices too large for one device **and**
-latency-bound) — overlap `k` independent distributed ops from a C++-side
-context pool. Feasible on CUDA (a second cuSOLVERMp context costs
-**0.065 s**, measured) but NCCL needs one communicator per concurrent
-slot; off-limits on the host leg (Cray MPICH's default
-`MPI_THREAD_SINGLE`, with documented deadlock history at `H5Fclose` —
-`src/ffi/phdf5/ARCHITECTURE.md`); contention-bound at compute-heavy sizes
-anyway. ELPA targets the same slice properly.
-
-**Any such restructuring must keep the batched-vs-serial bit-identity
-gate green** (`tests/multi_device/batched_eigh_dispatch_gate.py`, and its
-adopted twin `check_batched_eigh_dispatch` in the L-c suite: the two
-routes agree to **0 ulp** in both W and Z — job 7889132 at nq=6/n=32, and
-again at nq=8/n=64 with the scan on both sides of the comparison). That
-gate is the guard on this whole design. Route (c) additionally has direct
-native-reference, inverse-round-trip, and wrong-inverse red-twin coverage;
-the real P=4 shared check is `check_batch_reshard_local_ops`. The older gate
-continues to prove scan and backend-stacked execution did not drift. Its
-`_force_serial` argument is `Plan.batched`'s private `_route` override —
-the toggle is what makes the gate able to run two routes over one set of
-operands at all.
-
-**SLATE `factor`+`solve` (potrf + two trsm passes), the route H3 moved
-onto**, cpu 2×2: 0.727–2.945 s; gpu 2×2: 1.397–7.237 s. Its
-**correctness** is the load-bearing result, and it is first-execution
-evidence — the SLATE trsm back-solve had never run before step 2:
-
-| leg | residual vs the native reference | bar |
-|---|---|---|
-| SLATE trsm, CPU c128, per-q | 3.8e-16 / 4.5e-16 | rtol 1e-12, NOT relaxed |
-| SLATE trsm, GPU c128, per-q | 1.0e-15 / 6.9e-16 | " |
-| SLATE token round trip, GPU 2×2 | 4.4e-16 | " |
-| SLATE token round trip, CPU 2×2 | 4.3e-16 | " |
-| cuSOLVERMp token round trip, GPU 2×2 | 5.6e-16 | " |
-| ScaLAPACK LU + ipiv, CPU 2×2 | 3.855e-13 | native LU control 3.856e-13 |
-| batched-vs-serial eigh | **bit-identical** (0.0 in W and Z) | — |
-
-The cuSOLVERMp LU token's rank-private pivot row is sized to the vendor
-contract ``LOCr(M_A) + MB_A``.  It is still O(n/Px) per matrix/rank; the
-extra block is required storage for distributed row interchanges, not a
-replicated global pivot.
-
-## Antipatterns
-
-* Calling jnp.linalg.svd at a consumer, or using eigh(A.H @ A), bypasses the
-  service and is numerically weaker.  Use polar_factor, or hoist one
-  plan_polar_factor for a streamed loop.
-* Passing a replicated/host overlap matrix and relying on an implicit reshard
-  is refused.  Build the overlap directly at P('x','y'); pad before placement
-  when the logical band count does not tile the mesh.
-
-* **Editing `src/ffi/<name>/`.** `src/ffi/linalg/`, `src/ffi/slate/`,
-  `src/ffi/scalapack/` and `src/common/cholesky_2d.py` are **deleted**
-  (17 files, commit `b3f3675`). A backend lives in
-  `services/distrib_la/src/distrib_la/_<name>.py` plus one row in each of
-  `loader._*_TARGET_SYMBOLS`, `resolve._SPEC`/`BACKEND_CHOICES` and
-  `plan._IMPL`. `docs/dev/linalg_ffi.md` § "Adding a backend" is the
-  procedure; the C++ under `src/ffi/cpp/` did not move and its target
-  strings are frozen.
-* **Writing a Python loop over the batch axis.** That is what
-  `Plan.batched` is for, and looping outside it hands the compiler `nb`
-  separate calls, re-traces any wrapper that builds its `shard_map`
-  eagerly, and — the real cost — puts the batch somewhere no route toggle
-  can reach. Measured on the two SLATE wrappers that have no jit cache:
-  165 compiles and 5.9 s of GPU wall for an 8-matrix factor+solve, against
-  3 compiles and 0.17 s through the scan.
-* **Adding a second batched entry point for a backend that has one.** A
-  stacked FFI entry is one `plan._IMPL` row and it is then taken
-  automatically; exposing it as its own public function recreates the
-  `dispatch_batched_eigh` split, where two places decided the same thing
-  and one of them forgot the eigenvector normaliser.
-* **Calling `lax.scan` over an FFI wrapper eagerly, uncached.** It is
-  correct and it is slower than the loop: ~69 ms per call of retrace and
-  relower at nq=8/n=64 on cpu 2×2. Route it through `Plan.batched`, which
-  owns `plan._SCAN_CACHE`.
-* **Selecting a backend from the environment.** There is no env var that
-  does it and adding one is the antipattern. Deck keys choose
-  (`eigh_backend`, `distributed_cholesky`, `distributed_lu`,
-  `w_dyson_solver`); env only says which `.so` exists.
-* **Comparing Z across meshes.** Eigenvectors are gauge-dependent: a
-  degenerate subspace has no canonical basis and two meshes will return
-  different (equally correct) columns. Compare **eigenvalues**, or a
-  gauge-invariant contraction (`Z diag(W) Zᴴ`, subspace projectors,
-  `|Zᴴ Z'|`). A test that diffs Z across meshes will pass on Si and fail on
-  the first degenerate system.
-* **Reading token internals.** `token._factor` is private and its layout is
-  block-cyclic on that mesh's specific grid. Reaching for `.shape` on a
-  token is the same error one level up — it has `.n` and `.nbatch`.
-  Anything that needs the factor's *bytes* wants a different API, not this
-  one.
-* **Branching on `token.backend` / `plan.backend` outside this package.**
-  They are introspection (a banner, a test's message). A caller that
-  branches on them has re-implemented the resolver, and the two will drift.
-* **Re-deriving a mesh identity by hand.** Use `mesh_key(mesh)`. `id(mesh)`
-  as a cache key is only safe when the cached value retains the mesh, and
-  the case where it does not is exactly where somebody re-spells it.
-* **Confusing an installed package with LORRAX's source closure.** A normal
-  consumer installs `lxkit` and `distrib_la` and imports the latter directly;
-  it must not import a LORRAX path helper or edit `sys.path`. An uninstalled
-  LORRAX checkout puts only `<checkout>/src` on the compute payload path; the
-  runtime derives service roots from package metadata and refuses any service
-  outside that checkout before JAX. `tests/test_service_path_bootstrap.py`
-  covers that integration seam, while the package's own import-isolation suite
-  proves the installed service has no upward dependency.
-* **Assuming the two platform `.so`s are independent.** They share
-  `libslate.so.2` / `libblaspp.so.2` by SONAME. Opening the host library
-  first gives every CUDA SLATE handler a `blas::get_device_count()` of 0
-  and a `FAILED_PRECONDITION` naming a device count nobody set. Do not
-  "fix" that by unsetting `CUDA_VISIBLE_DEVICES` — measured, it is not a
-  visible-device problem; the failing leg had exactly one visible GPU.
-* **Making the refusal path a `try/except` at the call site.** An explicit
-  backend that cannot be honoured must raise out of the driver. Six probe
-  calls in `isdf/core.py` exist only for their raise; wrapping any of them
-  turns a loud refusal into a silent different-backend run
-  (`tests/test_charge_zeta_route.py` pins all six).
-
-## Parent wavefunction contractions
-
-`gemm_plan(..., layout="face" | "axis", enable_active_range=True)` resolves
-the carrier's full and exact-interval contractions once. Face selects the
-distributed cuBLASMp GEMM; axis selects `local_gemm_plan`, returning the same
-`GemmPlan` and `active_range` interfaces. The default axis operands are
-`A(q,m_X,k)` and `B(q,k,n_Y)`, with complete local k and output
-`D(q,m_X,n_Y)`. There is no collective in this band contraction. CUDA active
-intervals use local cuBLAS pointer views with a fixed XLA-owned workspace;
-CPU active intervals use bounded JAX dot panels. A CPU face-layout plan remains
-unsupported because there is no planned PBLAS/SLATE GEMM provider.
-
-For projection of a tiled centroid operator, `reduction_axis="y"` or `"x"`
-selects the corresponding local tile GEMM followed by centroid reduce-scatter.
-These reductions do not apply to Green or zeta band sums. SC band rotations
-use `out_spec=P(None,"x",None)` or `P(None,None,"y")` to retain the carrier's
-single-axis centroid sharding. They do not create another Green algorithm.
-
-## Bounded face products with a shared sample operand
-
-`panel_matmul(A, B, mesh=mesh, panel_bytes=bytes_per_rank)` forms `A @ B`
-using contraction-panel broadcasts inside a native `shard_map` scan. A is
-`[q,m,k]` at `P(None,'x','y')`; B is `[q,k,n]` in the same layout or
-`[q,s,k,n]` at `P(None,None,'x','y')`. With a sample axis, the left panel is
-broadcast once before the sample scan. Output faces retain both mesh axes;
-no complete row or column is gathered.
-
-The caller admits the input/output faces and supplies a per-rank byte budget
-for both operand panels. The service chooses a contraction width dividing
-both existing shard extents, with live operand payload
-`itemsize*q*width*(m/Px+n/Py) <= panel_bytes`. This is an operand bound,
-not a claim about total compiled/native workspace. Callers must also admit
-`memory_analysis()` and provider workspace before executing. The service
-adds no physics prefactor, conjugation, or backend-selection dial. The
-local/distributed Dyson solve choice remains with the existing LU plan.
+| `face` | all at `P(None,'x','y')`; `m % px`, `k % px`, `k % py`, `n % py` | cuBLASMp; CUDA only | cuBLASMp descriptor views of each owner intersection |
+| `axis`, CUDA | `A (q,m_X,k)`, `B (q,k,n_Y)`, `D (q,m_X,n_Y)`; complete local k | `local_gemm_plan`, no collective | cuBLAS pointer/leading-dimension views, fixed XLA-owned workspace |
+| `axis`, CPU | as above | `local_gemm_plan`, no collective | JAX dot panels of power-of-two widths ≤ 256 |
+
+The face layout refuses `backend='off'` by name (the staged route would
+materialize complete operands on every device), and on CPU it refuses at the
+provider probe, since no PBLAS/SLATE GEMM handler exists. For `layout='axis'`,
+`out_spec=P(None,'x',None)` or `P(None,None,'y')` keeps a single centroid axis
+sharded, and `reduction_axis='y'` / `'x'` contracts a tiled centroid axis with
+a local GEMM followed by `psum_scatter` (two-axis output only).
+
+**Active ranges.** With `enable_active_range=True`,
+`GemmPlan.active_range(A, B, lo, hi, C=None, *, out=None, weights=None)`
+contracts the exact interval `[lo, hi)` of k without changing allocation
+shapes; `lo`, `hi` are integer scalars or `(nq,)`, `weights` is `(nq, k)`.
+`GemmPlan.prepare_active_range(lo, hi)` validates host bounds eagerly and
+returns `prepared(A, B, C=None, *, out=None, weights=None)` with the bounds
+captured as constants (CUDA passes them as FFI metadata, with no per-call
+device-to-host copy). Each prepared callable compiles lazily on first use and
+the service caches no bound variants, so keep one per interval rather than
+creating it inside a loop. CUDA applies weights to the full A tile once
+before the call; CPU applies them inside the selected panels.
+[Active ranges in planned distributed GEMM](../dev/active_gemm_ranges.md) owns
+the descriptor-view design and validation.
+
+### GEMM plans without dummy execution
+
+`gemm_plan(..., warmup=False)` and `local_gemm_plan(..., warmup=False)` return
+the same trace-safe callables without allocating dummy operands or compiling
+and running standalone warmup GEMMs. Shape validation, provider probing and
+communicator setup still happen at construction; the first real call pays
+compilation and descriptor/workspace initialization. Use it when a one-shot
+outer `jit` compiles the GEMM with its surrounding operations; keep the
+default to move first-use cost ahead of a timed hot loop.
+
+## Polar factor and spectral directions
+
+`polar_factor(A, mesh, *, backend='distributed', rcond=None) -> (L, s)` and
+`plan_polar_factor(mesh, *, n, backend='distributed', rcond=None) -> PolarPlan`
+diagonalize the Hermitian dilation
+
+$$H = \begin{pmatrix} 0 & A \\ A^\dagger & 0 \end{pmatrix}, \qquad
+H \begin{pmatrix} u_i \\ \pm v_i \end{pmatrix} = \pm\sigma_i \begin{pmatrix} u_i \\ \pm v_i \end{pmatrix}$$
+
+with one planned eigh of extent 2n (`batched_route='auto'`), read
+$(u_i, v_i)$ as $\sqrt2$ times the halves of the n positive-eigenvalue
+eigenvectors, and form
+$L = \sum_{\sigma_i > \text{rcond}\cdot\sigma_\text{max}} u_i v_i^\dagger$. It never forms $A^\dagger A$, which squares the condition
+number and loses the small overlap singular values used as a quality
+diagnostic.
+
+* **Input:** one rank-2 square float64/complex128 array at `P('x','y')`, with
+  `n` divisible by both mesh axes. No implicit `device_put` or reshard; rank,
+  shape, dtype, mesh-axis, divisibility and layout mismatches refuse first.
+* **Output:** `L` with A's shape, dtype and sharding; `s` (length n, real,
+  descending, replicated). No n² object is replicated.
+* **`rcond`** is relative to max(s); `None` means n·eps(real dtype). Directions
+  at or below the cutoff are dropped, so a rank-deficient A returns the unique
+  polar partial isometry; a full-rank A returns the unitary polar factor.
+* **Padding.** For a non-divisible logical extent, zero-pad rows and columns
+  to the next common multiple, factor, and slice the leading block of L and
+  the leading singular values; the pad's null directions fall below the
+  cutoff. `plan_polar_factor` refuses a non-divisible `n` and reports the
+  minimum pad extent.
+* **Planning.** Hoist `plan_polar_factor` out of the k-point loop; the
+  `PolarPlan` call is one fused, cached executable per
+  (mesh, n, backend, rcond, dtype). `polar_factor` caches plans for eager
+  streamed calls and refuses a tracer operand.
+* **Cost:** one 2n Hermitian eigensolve plus one n³ GEMM; every matrix value is
+  O(n²/P) per process (the dilation and its eigenvectors hold 4n² elements).
+* **Comparison:** compare L and s across meshes; individual dilation
+  eigenvectors are gauge-dependent.
+
+`right_singular_vectors(W, tau, *, eigh_plan, column_extent, ...)` returns the
+right singular directions with σ/σ_max > `tau`, closing whole multiplets at
+the cut (`multiplet_tol`, default 1e-6) and optionally capped by `max_rank`.
+`leading_eigenvectors(W, r, *, eigh_plan, column_extent, ...)` returns the
+leading `r` eigenvectors with the boundary multiplet closed; `rcond` further
+bounds the width by eigenvalues above `rcond·max|λ|`. Both are eager: `W` is a
+square face `P('x','y')`, a face stack `P(None,'x','y')`, or a batch-layout
+stack (solved rank-locally, returned in batch layout, `real_rows` marking
+synthetic trailing slots). `eigh_plan` is the caller's resolved eigh plan (of
+extent 2m for singular vectors); its route owns the local/distributed choice.
+Only the O(m) spectra cross the host, broadcast from one process as bit
+patterns so every rank makes the same cut. On a cuSOLVERMp plan the dilation
+is solved as the positive matrix $I + H/\lVert W\rVert_F$ and the eigenvalues
+mapped back by $(\lambda - 1)\lVert W\rVert_F$ (provider route only), which avoids a reproduced
+cuSOLVERMp STEDC convergence failure without changing eigenvectors or cuts.
 
 ## q-local batch with resident operands
 
-"Move the right-hand side to the matrices, never the matrices to the
-right-hand side" (R4).  A factor used against many right-hand sides is laid
-out once with `batch_layout`; `local_batch(kernel, mesh, resident=(0,))`
-then moves only the other operands:
+A factor used against many right-hand sides is placed once in the batch
+layout, and only the right-hand sides move per call:
 
 ```python
 F_b = distrib_la.batch_layout(F_face, mesh)          # once: (Bp, n, n) q-local
 run = distrib_la.local_batch(lambda F, Z: F @ Z, mesh, resident=(0,))
-X = run(F_b, Z_face)                                  # per RHS: Z moves, F does not
+X = run(F_b, Z_face)                                  # per call: Z moves, F does not
 ```
 
-Layout: `Bp = ceil(B/(Px·Py))·Px·Py`; rank `x·Py + y` owns rows
-`[rank·Bp/P, (rank+1)·Bp/P)`, the order the two route-(c) exchanges produce,
-so a resident row and the exchanged RHS row it meets are the same global q.
-Pad rows are zeros and never reach the kernel (the `_real_rows` scalar-cond
-schedule).  Per rank and call the RHS costs `2·ceil(B/P)` whole RHS blocks of
-exchange; the resident operand costs nothing after its one placement.  A
-position declared resident whose operand is not in the batch layout refuses
-before tracing, because the implicit reshard it would otherwise get is the
-per-call matrix movement this exists to remove.  The face operands must tile
-the mesh (`M % Px == N % Py == 0`); resident operands may have any trailing
-shape (a `(Bp, n)` pivot table, for instance).  Capacity is the route-(c)
+`batch_layout` accepts a face stack `(B,M,N)` at `P(None,'x','y')` (moved by
+the route (c) exchanges) or a fully replicated `(B,...)` array (sliced
+locally), and returns `(Bp,...)` at `P(('x','y'),None,...)` with zero pad
+rows. Rank `x·Py + y` owns rows `[rank·Bp/P, (rank+1)·Bp/P)`, the order the
+exchanges produce, so a resident row meets the RHS row of the same global q.
+Pad rows never reach the kernel. Face operands must tile the mesh; resident
+operands may have any trailing shape (a `(Bp, n)` pivot table, for example).
+A `resident` position whose operand is not in batch layout refuses before
+tracing. Per call the RHS costs `2·ceil(B/P)` whole blocks of exchange; the
+resident operand costs nothing after placement. Capacity is the route (c)
 boundary: `ceil(B/P)` whole matrices plus their RHS blocks per rank.
 
-LORRAX's ζ back-solve `local` tier is the consumer
-(`isdf.core.zeta_factor_resident` / `_solve_zeta_local`).  Gates:
-`tests/test_zeta_qlocal_solve.py` (P4 parity against the replicated tier and
-a NumPy oracle, the owner-map red twin, the resident refusal and the
-row-to-owner layout check).
+## Bounded face products
+
+`panel_matmul(A, B, *, mesh, panel_bytes)` forms `A @ B` by broadcasting
+contraction panels inside a `shard_map` scan. `A` is `[q,m,k]` at
+`P(None,'x','y')`; `B` is `[q,k,n]` in the same layout or `[q,s,k,n]` at
+`P(None,None,'x','y')`, in which case each A panel is broadcast once outside
+the sample loop. Output faces keep both mesh axes; no complete row or column
+is gathered. The service picks a contraction width dividing both shard
+extents with `itemsize·q·width·(m/Px + n/Py) ≤ panel_bytes`. That bounds the
+operand panels only: the caller admits input/output faces, compiled
+temporaries (`memory_analysis()`) and provider workspace.
 
 ## Face-pinned block glue
 
-Eager slicing, concatenation and `a + a^H` of face-sharded operands return replicated arrays: a
-`[b, R, R]` block then occupies `16 R^2` bytes on every rank instead of `16 R^2/(Px Py)`.
-`distrib_la.blocks` runs the same elementwise program with the operand's own face as output sharding
-and keeps one executable per (function, layout, statics), so values are bitwise equal to the eager form.
+Eager slicing, concatenation and `a + aᴴ` of face-sharded operands come out
+replicated, so a `[b,R,R]` block would occupy 16R² bytes per rank instead of
+16R²/(Px·Py). These helpers run the same elementwise program with the
+operand's face as output sharding (one executable per function, layout and
+statics), bitwise equal to the eager form:
 
 | call | result |
 |---|---|
-| `hermitian_part(a)` | `(a + a^H)/2` for `[b, R, R]` |
-| `hermitian_block(block, off, corner)` | `[[block, off^H], [off, corner]]`, `[b, R + r, R + r]` |
-| `join_columns(a, b)` | column panels `[b, n, R]` and `[b, n, r]` concatenated |
+| `hermitian_part(a)` | `(a + aᴴ)/2` for `[b,R,R]` |
+| `hermitian_block(block, off, corner)` | `[[block, offᴴ], [off, corner]]`, `[b,R+r,R+r]` |
+| `join_columns(a, b)` | column panels `[b,n,R]` and `[b,n,r]` concatenated |
 | `diagonal_like(values, like)` | `diag(values)` in `like`'s dtype and face |
-| `on_face(fn, out, *operands, **static)` | a module-level caller function with outputs placed on `out` |
+| `on_face(fn, out, *operands, **static)` | a module-level `fn` with outputs placed on `out` |
 
-Traced operands (inside `jit`/`shard_map`) and unsharded host arrays take the plain function. No helper
-gathers, pads or reshards. The shared-pole constructor uses these for both the even and the ordered pencil
-(`tests/test_shared_pole_pencil_faces.py`).
+Traced operands and unsharded host arrays take the plain function. No helper
+gathers, pads or reshards.
 
-## Dense workspace queries
+## Workspace queries
 
-`workspace_bytes_per_rank(plan, op, shapes, dtype)` and
-`matmul_workspace_bytes_per_rank(mesh, shapes, dtype, *, backend, batched_route)` return the device
-workspace bytes per rank of a resolved CUDA `Plan`/`GemmPlan` or GEMM route, without allocating an
-operand, a result or the workspace. Query collectively on the actual mesh before admitting operands;
-float64 and complex128 only; an unsupported provider refuses.
+All three are allocation-free and accept float64 or complex128 only.
 
-- `eigh`: pass `((n, n),)` or `((batch, n, n),)`. The distributed provider allocates exactly the
-  returned bytes: vendor workspace rounded to 256-byte alignment plus one private operand tile of
-  `n/Px * n/Py * itemsize`, which keeps the non-donating input contract (`DONATES['eigh'] == ()`)
-  despite destructive tridiagonalisation. Do not add the tile again. Local eigh returns the
-  cuSolverDn divide-and-conquer workspace, with the Jacobi maximum for small matrices.
-- `gemm`: pass `((m, k), (k, n))` or batched shapes after any transpose staging. One vendor workspace
-  per context is reused across batch slices, so the envelope for a construction is
-  `max(GEMM workspace) + max(concurrent eigh scratch)`. The staged route returns compiled local
-  matmul temporaries from a shape-only compile.
+* `workspace_bytes_per_rank(plan, op, shapes, dtype)` returns the device
+  workspace per rank of a resolved CUDA `Plan` or `GemmPlan`. For distributed
+  `eigh` (`((n,n),)` or `((batch,n,n),)`, cuSOLVERMp only) it is the vendor
+  workspace rounded to 256 bytes plus one private operand tile
+  `(n/Px)·(n/Py)·itemsize`, which keeps eigh non-donating despite destructive
+  tridiagonalization; do not add the tile again. Local eigh returns the
+  cuSolverDn workspace plus a 4-byte info word, once per staged-route call
+  and once per stack member on the native stacked route. For `gemm` (`((m,k),(k,n))` after
+  transpose staging), one vendor workspace per context persists across
+  calls, so budget `max(GEMM workspace) + max(concurrent eigh scratch)`; the
+  staged route returns the compiled local-matmul temporary. Query
+  collectively on the actual mesh. Non-CUDA meshes and other providers
+  refuse.
+* `matmul_workspace_bytes_per_rank(mesh, shapes, dtype, *, backend,
+  batched_route)` is the same query for a `matmul` route.
+* `fits_local(plan, op, shapes, dtype, budget_bytes)` answers the
+  fit-on-one-device question: `Σ prod(shape)·itemsize + workspace ≤ budget`
+  for the caller's whole per-rank live set of complete matrices. The workspace
+  is the cuSolverDn query on CUDA, the LAPACK `?heevd` optimum on hosts
+  (complex: lwork = 2n + n², lrwork = 1 + 5n + 2n², liwork = 3 + 5n), or the
+  compiled local GEMM temporary. Pass a budget every rank agrees on (a deck
+  value, never a per-rank measurement): the answer selects collectives.
 
-The native doors are `lrx_eigh_workspace_bytes` and `lrx_gemm_workspace_bytes` (sizing calls with the
-execution descriptors; a context info pointer is the non-null address token and is never read).
-Operand and output carriers, transpose staging, communication buffers and persistent context
-resources are the caller's to admit.
-## GEMM plans without dummy execution
+The native doors are `lrx_eigh_workspace_bytes` and
+`lrx_gemm_workspace_bytes`. Operand and output carriers, transpose staging,
+communication buffers and persistent context resources are the caller's to
+admit.
 
-`gemm_plan(..., warmup=False)` and `local_gemm_plan(..., warmup=False)`
-create the same trace-safe callables as the default `warmup=True`, but do
-not allocate dummy matrix operands or compile/run standalone warmup GEMMs.
-Shape validation, backend checks and distributed communicator setup still
-happen at plan construction. The first real call pays executable compilation
-and native descriptor/workspace initialization. Dense and active-range calls,
-accumulation and donation keep the existing contracts.
+## Performance
 
-Use this option when a one-shot outer JIT compiles the GEMM with its surrounding
-operations, so standalone dummy executions would be redundant. Keep the
-default when deliberately moving first-use work ahead of a timed hot loop.
-The centroid C builder requests `warmup=False` in both band layouts; it does
-not change its GEMM backend or replicate any additional matrix dimension.
+For every matrix that fits one device, the distributed libraries' cost is
+their fixed per-call charge, which is why `auto` eigh resolves to native and
+route (c) is the default. Complex128, one node, 4 ranks on a 2×2 A100 mesh,
+warm, one matrix per call:
+
+| n | native replicated (s) | cuSOLVERMp (s) | SLATE (s) | cuSOLVERMp / native |
+|---|---|---|---|---|
+| 64 | 0.00149 | 1.586 | 0.401 | 1064× |
+| 256 | 0.00412 | 1.561 | 0.546 | 378× |
+| 1024 | 0.02662 | 1.754 | 1.387 | 66× |
+| 2048 | 0.07275 | 1.932 | 5.444 | 27× |
+| 4096 | 0.39550 | 2.739 | SIGSEGV (L-4) | 6.9× |
+
+cuSOLVERMp eigh costs a flat ~1.55 s per matrix; 99.998% of a warm call is
+inside `cusolverMpSyevd` (plan and resolve ≈ 10 µs, context-cache hit < 1 µs),
+and `block_size` does not move it. Cold extras: context bootstrap
+0.66–0.81 s, XLA compile ~0.8 s. On CPU (one node), ScaLAPACK `pzheevd` never
+beats native replicated eigh (4.0× slower at n = 64, 2.77× at n = 2048).
+
+Extrapolated break-even for distributed eigh is n ≈ 2 × 10⁴ (the fit window
+moves it between 1.4 and 2.8 × 10⁴), the same decade where an n×n complex128
+matrix, its eigenvectors and workspace stop fitting in 40 GB (n ≈ 2.7 × 10⁴).
+`distributed` eigh is therefore a capacity route, not a speed route.
+
+The route (c) exchanges and the scan route compile once per signature; a
+Python loop over the batch recompiled SLATE's eager `shard_map` wrappers per
+matrix (165 compiles and 5.9 s against 3 compiles and 0.17 s for an 8-matrix
+factor + solve on GPU 2×2).
+
+### Open measurement gaps
+
+Every number above is one node with 4 ranks and n ≤ 4096, complex128. The
+regime `distributed` exists for, a matrix too large for one device or a mesh
+spanning nodes, is unmeasured, as are float64 rows and the SLATE CUDA eigh
+crash threshold inside (2048, 4096].
+
+## Tests
+
+`services/distrib_la/tests/` runs from the package (`python -m pytest`) or the
+repository root (`python -m pytest services/distrib_la/tests`); the service
+conftest creates four emulated CPU devices before JAX imports and applies the
+`services` and `distrib_la` markers through a collection hook. Inside the
+LORRAX suite, select with `-m distrib_la` and deselect with `--no-services` /
+`--only-service=NAME`, never a second `-m`: an explicit `-m` replaces
+`addopts = "-m 'not extra'"`.
+
+| tier | file | needs |
+|---|---|---|
+| shape and contract algebra | `test_distrib_la_shape_algebra.py` | nothing |
+| emulated multi-device, route (c), matmul, gemm_plan refusals, polar | `test_distrib_la_{emulated_mesh,batch_reshard,matmul,matmul_plan,polar}.py` and siblings | four emulated CPU devices; skips below four |
+| real multi-process | `test_distrib_la_multiproc.py` (`check_*` bodies plus a `__main__` CLI over `_CLI_CELLS`) | one process per device |
+| `.so` contract and ELF acceptance | `test_distrib_la_contract.py`, `test_so_acceptance.py` | pinned libraries; binutils |
+| import isolation | `test_distrib_la_import_isolation.py` | a `python -S` subprocess |
+| skip honesty | `test_distrib_la_skip_honesty.py` | a machine profile: absent capability skips, built-and-broken fails |
+
+Every check ships with its red twin, and the real 2×2 cells use non-dividing
+extents with padding round trips. On Perlmutter the real-process gate is
+
+```bash
+lx run -N 1 -G 4 -n 4 python3 -u \
+  services/distrib_la/tests/test_distrib_la_multiproc.py --mesh 2x2 --only batch_reshard_local_ops
+```
+
+(`--only gemm_plan` for the planned GEMM). `tests/multi_device/batched_eigh_dispatch_gate.py`
+and its twin `check_batched_eigh_dispatch` require the scan and stacked routes
+to agree to 0 ulp in both W and Z; `Plan.batched(..., _route=...)` is the
+private override that makes that comparison possible.
+
+## Antipatterns
+
+* **Calling `jnp.linalg.svd` or `eigh(A.H @ A)` at a consumer.** Use
+  `polar_factor`, or hoist `plan_polar_factor` for a streamed loop.
+* **Passing a replicated or host matrix and relying on an implicit reshard.**
+  Build it at `P('x','y')`, padded to tile the mesh.
+* **A Python loop over the batch axis.** Use `Plan.batched`; a loop hands the
+  compiler `nb` separate calls and puts the batch where no route can reach it.
+* **Exposing a backend's stacked entry as a second public function.** It is one
+  `plan._IMPL` row and is then taken automatically.
+* **`lax.scan` over an FFI wrapper eagerly.** Without the per-signature cache
+  it retraces and relowers every call; `Plan.batched` owns that cache.
+* **Selecting a backend from the environment.** Deck keys choose
+  (`eigh_backend`, `distributed_cholesky`, `distributed_lu`, `w_dyson_solver`);
+  the environment only says which `.so` exists.
+* **Comparing eigenvectors across meshes.** Degenerate subspaces have no
+  canonical basis. Compare eigenvalues or gauge-invariant contractions
+  (`Z diag(W) Zᴴ`, projectors, `|Zᴴ Z'|`).
+* **Reading token internals or branching on `token.backend` /
+  `plan.backend`.** The factor layout is block-cyclic on that mesh; a caller
+  that branches on the backend has re-implemented the resolver.
+* **Hand-rolled mesh identities.** Use `mesh_key(mesh)`; `id(mesh)` is safe
+  only when the cached value retains the mesh.
+* **Wrapping a refusal in `try/except` at a call site.** An explicit backend
+  that cannot be honoured must raise out of the driver;
+  `tests/test_charge_zeta_route.py` pins the probe calls in `isdf/core.py`
+  that exist for their raise.
+* **Editing `sys.path` or importing a LORRAX path helper from a consumer.** An
+  installed consumer imports `distrib_la` directly;
+  `tests/test_service_path_bootstrap.py` covers the checkout integration.
