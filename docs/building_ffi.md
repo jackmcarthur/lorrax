@@ -1,79 +1,32 @@
 # Building the FFI libraries
 
-LORRAX is a JAX program, and on one node with one GPU it needs nothing on this
-page. What it cannot do in JAX is the handful of operations that are only fast
-when a specialist library owns them across many processes: a distributed
-eigensolver, a distributed Cholesky and triangular solve, sharded parallel-HDF5
-reads and writes, and a batched FFT over the flat-k layout. Those live behind
-`src/ffi/`, compiled into two shared objects that JAX dlopens and calls through
-the XLA FFI.
+LORRAX calls vendor libraries through two shared objects built from the one
+C++ tree `src/ffi/cpp/` ([ffi_layout.md §2](architecture/ffi_layout.md#2-the-one-c-tree)).
+They are deployed as one sealed pair ([§2a](architecture/ffi_layout.md#2a-the-deployable-unit-is-one-sealed-pair)).
+This page owns how a pair is built, verified and sealed on each site, and the
+ABI rule that pairs it with a Python tree.
 
-The libraries are not hard to build. What has been hard is knowing whether the
-one you built is *correct*, because almost every way of getting it wrong
-produces an artifact that links cleanly, loads cleanly, and passes every check
-anyone thought to run.
-
-## The failures this page exists because of
-
-On **2026-08-07** a host library was deployed after being built with the generic
-`src/ffi/cpp/build_host.sh` on Perlmutter. That script configures no ScaLAPACK —
-CMake's built-in probe looks for an MKL directory layout, which does not
-describe Cray LibSci — so `ScaLAPACK/BLACS not found` printed as a **warning**,
-the link succeeded, and the library shipped with `scalapack=0` and zero
-`Scalapack*` handlers. The same build left `cray-libsci` loaded while CMake ran,
-so the compiler wrapper auto-injected the sequential LibSci beside the threaded
-pair SLATE needs, and the finished object carries both. Two defects, one
-command, nothing failed. The symptom arrived days later as nineteen contract
-tests going red in a way that needed a person to diagnose.
-
-On **2026-08-06** a host library carried a `DT_NEEDED` on cray-fftw. `DT_NEEDED`
-is resolved before any of the library's own code runs, and the Shifter container
-does not mount `/opt/cray/pe/fftw`, so the whole object failed to `dlopen`
-in-container. Nineteen ScaLAPACK/SLATE/GEMM tests — none of which perform an FFT
-— reported as **skipped**, and the suite was green at zero failures. A lost FFT
-optimisation had silently become a lost linear-algebra test suite.
-
-On **2026-08-08** a rebuild of the host leg set `LORRAX_FFI_PHDF5_DIR` to name
-the HDF5 stage it had to agree with, and got a library linked against a
-different HDF5 anyway. That variable does not choose the host leg's HDF5 — the
-Cray compiler wrappers do, through the module named in `LORRAX_PM_HDF5` — so it
-only fed the comparison, never the link. The result requested SOVERSION 310
-beside a device library requesting 200, which resolves to `not found` and takes
-the entire library down at load.
-
-And twice in two days — **96a6399**, then the kchunk conversion merged as
-**a16a241c** — an FFI handler signature changed. A library built before the
-change and Python from after it link, load, register every target and pass every
-probe, then fail at the first call that crosses the changed signature with
-`INVALID_ARGUMENT: Wrong number of arguments: expected 3 but got 4`, which names
-no library, no version and no fix. In between, the pairing was carried by a
-hand-maintained table in a notes file whose own warning was the problem: a
-mispaired run stays green until something calls `read_slabs`.
-
-The common shape: **a build that quietly delivers less than you asked for, and
-a check that cannot fail.** Everything below is the structural answer.
+The main hazard is a build that links, loads and registers every target while
+delivering less than was asked for: a missing backend, a second MPI or BLAS, or
+the wrong HDF5. The verifier below exists to make each of those a build failure.
 
 ## The two legs
 
-There are two libraries, built in two different places, and they must agree.
+- `liblorrax_ffi_host.so` (host leg) is CUDA-free and built bare-metal against
+  the site compiler environment. It carries the ScaLAPACK, SLATE-CPU, CBLAS
+  GEMM, FFTW and parallel-HDF5 handlers.
+- `liblorrax_ffi.so` (CUDA leg) carries cuSOLVERMp, cuBLASMp, SLATE-CUDA,
+  parallel HDF5 and the mathdx k-convolution router.
 
-`liblorrax_ffi_host.so` — the **host leg** — is CUDA-free and built bare-metal
-against the site's compiler environment. It carries the ScaLAPACK, SLATE-CPU,
-CBLAS GEMM, FFT and parallel-HDF5 handlers. `liblorrax_ffi.so` — the **device
-leg** — is built inside the container against cuSOLVERMp, cuBLASMp, cuFFT,
-SLATE-CUDA and the same parallel HDF5, from whatever is bind-mounted there.
-
-Two build environments and one process at run time is the whole difficulty. In a
-GPU run both are dlopened `RTLD_GLOBAL`, so they share SONAMEs (`libslate.so.2`,
-`libblaspp.so.2`) and sixteen symbol names, and the HDF5 the host leg linked
-bare-metal has to be the HDF5 the container mounts. A host library can be
-perfectly correct on its own and unloadable beside its partner.
+In a GPU run both legs are dlopened `RTLD_GLOBAL` into one process. They
+therefore share SONAMEs (`libslate.so.2`, `libblaspp.so.2`), must link the same
+MPI, and the HDF5 the host leg links must be the HDF5 the runtime provides. A
+leg can be correct on its own and still unloadable beside its partner.
 
 ## Seal the deployable pair
 
-The accepted outputs are still two build artifacts; production deployment is
-one immutable pair.  After both build receipts say `git_dirty=no` at the same
-full revision, seal them together:
+Seal from the checkout that built both legs. Each leg's `PROVENANCE` must say
+`git_dirty=no` at that checkout's `HEAD`:
 
 ```bash
 python src/ffi/cpp/stage/seal_bundle.py \
@@ -81,108 +34,78 @@ python src/ffi/cpp/stage/seal_bundle.py \
   --host path/to/liblorrax_ffi_host.so \
   --private-lib path/to/libblaspp.so.2 \
   --private-lib path/to/libslate.so.2 \
-  --output path/to/new-content-named-bundle
+  --output path/to/new-bundle-dir
 ```
 
-Repeat `--private-lib` in dependency-first order for every private engine
-provider named by either leg's `DT_NEEDED` closure.  The sealer requires each
-ELF's adjacent `PROVENANCE`, validates source and artifact hashes, verifies the
-canonical leg SONAMEs, refuses an incomplete recognized private closure, and
-atomically publishes both legs plus `lorrax_ffi_bundle.json`.  The output must
-not already exist.  Never list MPI, site HDF5, CUDA runtime/driver libraries,
-NCCL, or system/compiler libraries; those belong to the machine runtime.
-
-No manifest environment variable is needed.  Both loaders discover the one
-adjacent bundle manifest, require both legs to agree with it, rehash every
-listed file, preload the exact private closure, and attest the live origin/ABI
-before registering a target.  Literal `$ORIGIN` is already first in both
-legs' RPATHs.  Unsealed build directories remain loadable only as an announced
-`LEGACY-UNSEALED` developer migration path.
-
-The manifest's source revision is reproducibility provenance, not the FFI
-compatibility key.  Requiring Git-SHA equality would wrongly reject installed
-wheels and certified backports whose stable handler ABI is identical.  Bump
-and enforce `LORRAX_FFI_ABI_VERSION` for boundary changes; use source revision
-to reconstruct the build.
+Repeat `--private-lib`, in dependency-first order, for every private engine
+provider in either leg's `DT_NEEDED` closure. Never list MPI, site HDF5, the
+CUDA runtime or driver, NCCL, or system and compiler libraries: the machine
+runtime owns those. The sealer validates source and artifact hashes and the
+canonical SONAMEs, refuses an incomplete private closure and an existing output
+directory, and publishes both legs with `lorrax_ffi_bundle.json` atomically. The loaders find that
+manifest beside the libraries; no environment variable names it.
 
 ## The verify contract
 
-Every build path in this repository ends at `scripts/verify_ffi_build.sh`. The
-site recipes call it, the generic scripts call it, and
-`services/distrib_la/tests/test_so_acceptance.py` runs the same file as pytest
-cells — so a user validates a build by running the test suite, and there is no
-way for the suite and the build to disagree about what a good library is.
+Every build path ends at `scripts/verify_ffi_build.sh`, and
+`services/distrib_la/tests/test_so_acceptance.py` runs the same script as
+pytest cells, so the suite and the build agree on what a good library is.
 
 ```bash
 scripts/verify_ffi_build.sh --leg host build_host/liblorrax_ffi_host.so
 ```
 
-The ten gates it runs, and the property each one guards:
-
 | gate | property |
 |---|---|
-| 0 | the backends this build was **declared** to contain are the ones it exports, by stamp *and* by symbol |
-| 1 | exactly one MPI runtime in the resolved closure — two means `MPI_COMM_WORLD` differs between frames (matches `libmpi`, `libmpi_gnu` and `libmpi_gnu_<N>`; before 2026-09-24 it missed cray-mpich 9.1's `libmpi_gnu.so.12`) |
-| 2 | one BLAS, one threading flavour — two lets ELF load order pick which one runs |
+| 0 | the backends the build was declared to contain are exported, by stamp and by symbol |
+| 1 | exactly one MPI runtime in the resolved closure (`libmpi`, `libmpi_gnu`, `libmpi_gnu_<N>`) |
+| 2 | one BLAS and one threading flavour |
 | 3 | the host leg links nothing from the CUDA stack |
 | 4 | the dependency closure resolves at load time in this environment |
-| 5 | the run-time-resolved FFT engine is not a **load**-time dependency |
-| 6 | the OpenMP runtime is really an OpenMP runtime |
-| 7 | one HDF5, and it is the one the runtime will mount |
-| 8 | the FFT engine that actually binds is the intended one (needs a live process) |
+| 5 | the run-time-resolved FFT engine is not a load-time dependency |
+| 6 | the OpenMP runtime is an OpenMP runtime |
+| 7 | one HDF5, and it is the one the runtime provides |
+| 8 | the FFT engine that binds is the intended one (needs a live process) |
 | 11 | the handler-signature ABI matches this source tree |
 
-The two numbers missing from that list are the gates of the cross-`.so` ODR
-fix, and they are not in this file because neither one is a property of a
-single artifact inspected on its own:
+Two further gates are properties of the pair, not of one artifact:
 
-| gate | property | where it lives |
+| gate | property | where it runs |
 |---|---|---|
-| 9 | nothing LORRAX-owned is on the dynamic table, and every shared `lrx_*` entry point carries its leg's suffix | `config/perlmutter/build_ffi_host.sh` and `src/ffi/cpp/build.sh`, at link time; `test_so_acceptance.py` check 6 intersects the two libraries |
-| 10 | a CUDA-capable process really can do host phdf5 work with both libraries open | `src/ffi/cpp/gate_one_odr.py`, inside a real GPU allocation |
+| 9 | nothing LORRAX-owned is on the dynamic table, and every shared `lrx_*` entry point carries its leg's suffix | at link time in `config/perlmutter/build_ffi_host.sh` and `src/ffi/cpp/build.sh`; check 6 of `test_so_acceptance.py` intersects the two libraries |
+| 10 | a CUDA-capable process with both libraries open does host phdf5 work | `src/ffi/cpp/gate_one_odr.py`, inside a GPU allocation |
 
-Two rules make these hard to fool. **A gate that cannot run is not a gate that
-passed**: GATE 8 needs a real process and cannot run on a login node, so it
-reports `COULD NOT RUN` and is counted separately, and `LORRAX_FFI_VERIFY_STRICT=1`
-turns that into a refusal for a certification run inside an allocation. And
-**expectations are stated, not inferred**: `LORRAX_FFI_EXPECT_BACKENDS` defaults
-to the *full* set for the leg, so a build that quietly loses one fails, and a
-site that genuinely builds fewer says so. That default is the entire lesson of
-the Aug-7 library.
-
-The verifier can be disabled with `LORRAX_FFI_VERIFY=off`, which announces
-itself loudly on every invocation. An unverified library must not be deployed.
+A gate that cannot run reports `COULD NOT RUN` and is counted separately; GATE
+8 cannot run on a login node. `LORRAX_FFI_VERIFY_STRICT=1` turns `COULD NOT RUN`
+into a failure, for certification inside an allocation.
+`LORRAX_FFI_EXPECT_BACKENDS` defaults to the leg's full backend set, so a build
+that loses a backend fails, and a site that builds fewer backends must say so.
+`LORRAX_FFI_VERIFY=off` disables the verifier and announces that on every
+invocation; an unverified library is not deployable.
 
 ## Perlmutter
 
-```bash
-bash config/perlmutter/build_ffi_host.sh --fresh          # host leg
-src/ffi/cpp/run_shifter.sh bash src/ffi/cpp/build.sh      # device leg
-```
+Both legs link one MPI, pinned in `config/perlmutter/ffi_mpi.sh`: cray-mpich
+9.0.1 (`libmpi_gnu_123.so.12`, the MPI that the phdf5 stage and the SLATE host
+install already require), cray-libsci 25.09.0, with darshan unloaded. Change
+those values there and nowhere else.
 
-**Both legs link one MPI, pinned in one file:** `config/perlmutter/ffi_mpi.sh`.
-It sets cray-mpich/9.0.1 (`libmpi_gnu_123.so.12`) and cray-libsci/25.09.0,
-and unloads darshan.
-- The host recipe sources it.
-- The bare-host CUDA-13 recipe (`lorrax_cuda13_runtime/recipe/build_ffi_phdf5.sh`,
-  driven by `rebuild_ffi.sh`) sources it out of the checkout it builds.
-- The values are the ones the phdf5 stage (cray-hdf5-parallel/1.14.3.7) and
-  the SLATE host install already need.
-- Change them there and nowhere else.
+- Host leg: `bash config/perlmutter/build_ffi_host.sh --fresh`.
+- CUDA leg: the CUDA-13 runtime recipe (`lorrax_cuda13_runtime/rebuild_ffi.sh`,
+  outside this repository), which sources `ffi_mpi.sh` from the checkout it
+  builds.
+- Build from a clean checkout in a zero-GPU compute step
+  (`lx run -N 1 -G 0 -n 1 -- …`). On a login node the default HDF5 module links
+  a second MPI and GATE 1 fails.
+- Seal the two legs as above.
 
-Before this pin, the host leg took the site defaults: cray-mpich 9.1.0 via
-cray-libsci/26.03.0, plus darshan's `libdarshan.so.0`.  The CUDA leg linked
-9.0.1, so the pair could not be sealed.
-
-Running the *generic* `src/ffi/cpp/build_host.sh` here now hands over to the
-site recipe rather than building a reduced library — that hand-off is the direct
-fix for the Aug-7 accident. `LORRAX_FFI_GENERIC_BUILD=1` overrides it.
-
-The site recipe knows the machine's answers: the explicit LibSci ScaLAPACK link
-line (CMake's MKL-shaped probe cannot find it), the `_mp` threading flavour that
-matches the `gpu_backend=none` SLATE install, capturing the LibSci and FFTW
-prefixes and then *unloading* both modules before invoking CMake, and the phdf5
-stage to compare the HDF5 against.
+The site recipe carries this machine's answers: the explicit LibSci ScaLAPACK
+link line (CMake's probe expects an MKL layout), the `_mp` threading flavour
+that matches the `gpu_backend=none` SLATE install, LibSci and FFTW prefixes
+captured and their modules unloaded before CMake runs, and the phdf5 stage to
+compare HDF5 against. The generic `src/ffi/cpp/build_host.sh` hands over to it
+on Perlmutter and Frontera; `LORRAX_FFI_GENERIC_BUILD=1` builds generically
+instead.
 
 ## Frontera
 
@@ -192,48 +115,46 @@ LORRAX_SLATE_HOST_INSTALL_DIR=$WORK/slate_builds/cpu/install \
   config/frontera/build_ffi_host.sh --fresh
 ```
 
-Same gates, different vendors: MKL supplies ScaLAPACK, CBLAS and DFTI;
-`libmkl_blacs_intelmpi_lp64` must match the MPI, because the wrong BLACS links
-perfectly and only fails inside the first `blacs_gridinit`. Without
-`LORRAX_SLATE_HOST_INSTALL_DIR` this recipe builds the phdf5-only library, and
-it declares that to the verifier — a reduced build that says so is fine; a
-reduced build that does not is the defect.
+MKL supplies ScaLAPACK, CBLAS and DFTI. `libmkl_blacs_intelmpi_lp64` must
+match the MPI: the wrong BLACS links and fails only inside the first
+`blacs_gridinit`. Without `LORRAX_SLATE_HOST_INSTALL_DIR` the recipe builds the
+phdf5-only library and declares that reduced set to the verifier.
 
 ## Porting to a new site
 
-Copy the closest site recipe and change values, never structure. The two
-existing ones are deliberately parallel so `diff` shows only values. Every lever
-below has cost somebody a build.
+Copy the closest site recipe and change values, not structure; the two recipes
+are parallel, so `diff` shows only values.
 
 | lever | what it selects | the trap |
 |---|---|---|
-| `LORRAX_FFI_EXPECT_BACKENDS` | what the build must contain | omit it and you inherit the full set — deliberately, so a silent reduction fails |
-| the BLAS/ScaLAPACK link line | ScaLAPACK + C-BLACS | CMake's probe expects an MKL layout; on anything else pass `-DLORRAX_SCALAPACK_LIBRARIES` as a whole link line |
-| the BLAS module | which BLAS is linked | leaving it loaded lets the compiler wrapper inject a *second* flavour on top of yours — GATE 2 |
-| the FFTW module | where the FFT engine lives | it must reach CMake as a **dlopen hint** only; on the link line it becomes `DT_NEEDED` and the library stops loading anywhere that SONAME is absent — GATE 5 |
-| the HDF5 module (`LORRAX_PM_HDF5` on Cray) | the SOVERSION the host leg **links** | this, not the stage variable, is the real lever |
-| the phdf5 stage (`LORRAX_FFI_PHDF5_DIR`) | the SOVERSION the runtime **mounts** | it feeds GATE 7's comparison only. **Set both, and set them to the same version** |
-| the XLA FFI headers | the jaxlib ABI compiled against | they must come from the image the library will be *loaded* under, not whatever python is first on `PATH` |
-| the SLATE install | SLATE + blaspp + lapackpp | the host leg needs the `gpu_backend=none` build; a CUDA blaspp here makes `get_device_count()` disagree across the two legs |
-| the cuSOLVERMp stage (device leg) | comm path and correctness | every stage exports the same SONAME; 0.6.0 returns **wrong** `getrf`/`getrs` on any $P_x>1$ *and* $P_y>1$ mesh, and ships `cal.h` where ≥0.7 does not |
-| the MPI include/lib dirs (device leg) | which MPI the library asks for | unset, CMake falls back to HPC-X OpenMPI and the library requests `libmpi.so.40`, which is the wrong name for Cray MPICH |
+| `LORRAX_FFI_EXPECT_BACKENDS` | what the build must contain | omitted, it is the full set, so a silent reduction fails |
+| the BLAS/ScaLAPACK link line | ScaLAPACK + C-BLACS | CMake's probe expects an MKL layout; elsewhere pass `-DLORRAX_SCALAPACK_LIBRARIES` as a whole link line |
+| the BLAS module | which BLAS links | left loaded, the compiler wrapper injects a second flavour (GATE 2) |
+| the FFTW module | where the FFT engine lives | it must reach CMake as a dlopen hint only; on the link line it becomes `DT_NEEDED` (GATE 5) |
+| the HDF5 module (`LORRAX_PM_HDF5` on Cray) | the SOVERSION the host leg links | this, not the stage variable, sets the link |
+| the phdf5 stage (`LORRAX_FFI_PHDF5_DIR`) | the SOVERSION the runtime provides | it feeds only GATE 7's comparison; set it and the HDF5 module to the same version |
+| the MPI module | which MPI both legs link | both legs must name the same `libmpi` (GATE 1, gate 10) |
+| the XLA FFI headers | the jaxlib ABI compiled against | take them from the JAX that will load the library |
+| the SLATE install | SLATE + blaspp + lapackpp | the host leg needs `gpu_backend=none`; a CUDA blaspp makes `get_device_count()` disagree across the legs |
+| the cuSOLVERMp stage (CUDA leg) | comm path and correctness | every stage exports the same SONAME; 0.6.0 returns wrong `getrf`/`getrs` on any mesh with both P_x > 1 and P_y > 1; ≥ 0.7 is NCCL-native and needs `-DLORRAX_FFI_HAVE_CAL=OFF` |
+| the MPI include/lib dirs (CUDA leg) | which MPI the library requests | unset, CMake falls back to HPC-X OpenMPI and requests `libmpi.so.40` |
+| `CMAKE_CUDA_ARCHITECTURES` (CUDA leg) | the SASS/PTX of the nvcc translation units | defaults to `80` (A100) |
 
 ## The ABI pairing rule
 
-A Python tree and a `.so` must agree about what crosses the FFI boundary, and
-nothing in the type system says so. `src/ffi/cpp/common/lorrax_ffi_abi.h` holds
-one number, `LORRAX_FFI_ABI_VERSION`, baked into both libraries and mirrored by
-both Python loaders (a drift test compares all three).
+`src/ffi/cpp/common/lorrax_ffi_abi.h` holds one number,
+`LORRAX_FFI_ABI_VERSION` (currently 4). It is compiled into both legs and
+mirrored by both Python loaders, and a drift test compares all three.
 
-**Bump it in the same commit as any handler-signature change**: adding,
-removing or reordering an `Arg` or `Ret`; moving a value between `Attr` and
-`Arg` — both recent bumps were this; changing a dtype or rank; or changing the
-meaning of a positional value while keeping its type, which is the silent one.
-Do **not** bump for a new handler, which an old library simply does not export
-and `probe_target` already reports precisely.
+Bump it in the same commit as any handler-signature change: adding, removing
+or reordering an `Arg` or `Ret`; moving a value between `Attr` and `Arg`;
+changing a dtype or rank; or changing the meaning of a positional value while
+keeping its type. A new handler needs no bump: an older library does not export
+it, and `probe_target` reports that precisely.
 
-At `dlopen` the loaders read the stamp. A different number is a refusal naming
-both versions and the rebuild command. A library with *no* stamp was built
-before 2026-08-08 and is announced once rather than refused — unstamped is not
-evidence of wrong, and a great many pinned libraries predate the mechanism.
-`LORRAX_FFI_ABI_STRICT=1` closes that ratchet where the fleet has caught up.
+At `dlopen` the loaders read the stamp. A different number refuses with
+`HANDLER ABI MISMATCH`, naming both versions and the rebuild command. A library
+with no stamp refuses when it belongs to a sealed bundle or when
+`LORRAX_FFI_ABI_STRICT=1`; otherwise it loads as `LEGACY-UNSEALED` with its
+hash. The bundle manifest's source revision is provenance, not a compatibility
+key: the ABI number and the build contract decide compatibility.
