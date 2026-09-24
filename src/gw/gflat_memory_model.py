@@ -1606,6 +1606,7 @@ class MuBatchPlan:
     store_bytes: float = 0.0        # Z store per rank
     host_budget_bytes: float = 0.0  # host share per rank at plan time
     zeta_tier: str = "local"        # whole-tile back-solve tier (route G's)
+    n_vertex: int = 1               # channels sharing the loop (1 charge, 3 currents)
 
     def format(self) -> str:
         gt = max(self.green_tile_bytes, 1.0)
@@ -1622,7 +1623,9 @@ class MuBatchPlan:
             f"{'points' if self.route == 'cache' else 'planes per group' if self.route == 'G' else 'plane(s)'}",
             f"    FFT rows/step = {self.row_chunk}",
             f"    ζ tier        = {self.zeta_tier} (chosen by route G, which applies "
-            f"the whole-tile factor B on each G tile; `linalg` sets the other stages)",
+            f"the whole-tile factor on each G tile; `linalg` sets the other stages)",
+            f"    channels      = {self.n_vertex} (one k-convolution, accumulator and "
+            f"Z store each; every other stage shared)",
             f"    Z store       = {self.placement} ({self.store_bytes / 1e9:.1f} GB/rank; "
             f"host share {self.host_budget_bytes / 1e9:.1f} GB/rank from MemAvailable), "
             f"G-vector tile {self.g_tile}, finalize {self.finalize_layout}-layout",
@@ -1648,12 +1651,15 @@ def plan_zeta_route_g(*, meta, mesh_xy, n_q_selected: int, ngkmax: int,
                       psi_ngkmax: int, fit_nb: int, n_col: int, n_s: int,
                       zeta_tier: str, budget_gb: float,
                       target_utilization: float | None = None,
-                      psi_face_bytes: float = 0.0) -> MuBatchPlan:
+                      psi_face_bytes: float = 0.0, n_vertex: int = 1) -> MuBatchPlan:
     """Size the route-G μ-batch fit (docs/architecture/zeta_fit_mubatch.md).
 
     Per rank: conj ψ(G) on its G slice (full zone), the batch's pair
     projectors on the slice and after the one all-to-all, and on the owner
-    one plane group of ``D(k, μ, r)`` for its ``c = b/P`` centroids.  The
+    one plane group of ``D(k, μ, r)`` for its ``c = b/P`` centroids.
+    ``n_vertex`` channels (the three bispinor currents) share every stage but
+    the k-convolution and the accumulate, so their Z rows, ζ-cylinder
+    accumulators, factors and stores are priced ``n_vertex`` times.  The
     candidates are the plane-group width ``n_pg`` (each at its largest
     batch); the modelled time counts the per-batch fixed cost and the
     cylinder gathers (``∝ 1/n_pg``) -- the pair-projector all-to-all, the
@@ -1679,9 +1685,10 @@ def plan_zeta_route_g(*, meta, mesh_xy, n_q_selected: int, ngkmax: int,
     budget = float(budget_gb) * 1e9
     target = budget * float(target_utilization)
     finalize_layout = 'q' if str(zeta_tier) == 'local' else 'g'
+    n_v = int(n_vertex)
     base = {
-        "C factor": (_c128(Q_loc, mu, mu) if finalize_layout == 'q'
-                     else _c128(Q, mu, mu)),
+        "C factor": n_v * (_c128(Q_loc, mu, mu) if finalize_layout == 'q'
+                           else _c128(Q, mu, mu)),
         "centroid faces": float(psi_face_bytes),
         "conj ψ(G) slice": _c128(nk, nb, ns, Gp),
         "sphere tables": 12.0 * nk * Gp + 4.0 * nk * n_col * n_s + 8.0 * Q * N_G,
@@ -1698,7 +1705,7 @@ def plan_zeta_route_g(*, meta, mesh_xy, n_q_selected: int, ngkmax: int,
         28.2 GB peak against 53.4 GB for the old sum of all terms)."""
         c, r_pl = b // P_, n_pg * ps
         n_ap = math.ceil(n_a / n_pg) * n_pg
-        rows = {"Z rows (+1 lookahead)": 2 * _c128(Q, c, N_G)}
+        rows = {"Z rows (+1 lookahead)": 2 * n_v * _c128(Q, c, N_G)}
         d_g = 2 * _c128(nk, ns, b, ns, Gp)                  # D~ L+R, one copy
         return [
             dict(rows, **{"X_B": 2 * _c128(nk, nb, ns, b) + _c128(nk, Gp, b),
@@ -1708,8 +1715,8 @@ def plan_zeta_route_g(*, meta, mesh_xy, n_q_selected: int, ngkmax: int,
                           + _c128(ns, 2 * c, ns, n_col, n_s)}),
             dict(rows, **{"D cylinder (all planes)": _c128(nk, n_ap, ns, 2 * c, ns, n_col),
                           "plane group": 2 * _c128(nk, n_pg, ns, 2 * c, ns, ps),
-                          "k-conv + Z": 9 * _c128(nk, c, r_pl) + 3 * _c128(Q, c, r_pl),
-                          "ζ cylinder accumulator": _c128(Q, c, n_zc, n_za)}),
+                          "k-conv + Z": 9 * _c128(nk, c, r_pl) + 3 * n_v * _c128(Q, c, r_pl),
+                          "ζ cylinder accumulator": n_v * _c128(Q, c, n_zc, n_za)}),
         ]
 
     def ws(b, n_pg):
@@ -1778,12 +1785,12 @@ def plan_zeta_route_g(*, meta, mesh_xy, n_q_selected: int, ngkmax: int,
     g_tile = int(max(P_, (0.25 * target // max(per_g, 1.0)) // P_ * P_))
     g_tile = min(g_tile, math.ceil(N_G / P_) * P_)
     n_Gt = math.ceil(N_G / g_tile)
-    store = _c128(Q, n_batch * b, n_Gt * g_tile, shard=P_)
+    store = n_v * _c128(Q, n_batch * b, n_Gt * g_tile, shard=P_)
     host_budget = _host_bytes_per_rank()
     placement = 'host' if store <= host_budget else 'disk'
     br = dict(base)
     br.update(ws(b, n_pg))
-    store_total = Q * mu * N_G * 16.0
+    store_total = n_v * Q * mu * N_G * 16.0
     transfer = {
         f"pair-projector all-to-all (floor {t_a2a_floor:.0f} s)":
             mu * 2 * _c128(nk, ns, 1, ns, Gp),
@@ -1798,7 +1805,7 @@ def plan_zeta_route_g(*, meta, mesh_xy, n_q_selected: int, ngkmax: int,
         zeta_tier=str(zeta_tier),
         min_call_bytes=float(_c128(nk, nb, ns, b)),
         min_efficient_bytes=comm_model.min_efficient_payload(P_ - 1),
-        route='G', source='resident', band_chunk=int(nb), k_chunk=int(nk),
+        n_vertex=n_v, route='G', source='resident', band_chunk=int(nb), k_chunk=int(nk),
         b=int(b), n_batch=int(n_batch), r_sub=int(n_pg), row_chunk=0,
         g_tile=int(g_tile), placement=placement, finalize_layout=finalize_layout,
         hwm_bytes=float(sum(br.values())), budget_bytes=float(budget),

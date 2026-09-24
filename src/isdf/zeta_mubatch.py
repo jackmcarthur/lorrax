@@ -204,12 +204,16 @@ def _spin_sandwich(U, d):
 
 def make_route_g_kernel(*, mesh: Mesh, kgrid, fft_grid, ns: int, b: int,
                         q_sel, q_axis, q_neg, qvec_frac, n_col: int, n_s: int,
-                        n_pg: int, axis: int, n_src: int, stop_at: str | None = None):
+                        n_pg: int, axis: int, n_src: int, vertices=(0,),
+                        stop_at: str | None = None):
     """Compile-once executable for one μ batch on route G.
 
-    Returns ``fn(psi_bar, w_l, w_r, kvecs, g3, xmu, live, cyl, zt, unf, lt) -> rows``
-    ``(Q, b, N_G)`` at ``P(None, ('x','y'), None)`` (μ-owned; rank p owns the
-    batch slots ``p·c + [0, c)``, ``c = b/P``):
+    Returns ``fn(psi_bar, w_l, w_r, kvecs, g3, xmu, live, cyl, zt, unf, lt) -> rows``,
+    one ``(Q, b, N_G)`` array per vertex of ``vertices`` at ``P(None, ('x','y'),
+    None)`` (μ-owned; rank p owns the batch slots ``p·c + [0, c)``, ``c = b/P``).
+    ``vertices`` are the Lorentz channels μ_L of γ̃^{μ_L}: ``(0,)`` for the
+    charge fit, ``(1, 2, 3)`` for the three current channels, which share
+    every stage but the k-convolution and the accumulate:
 
     1. ``X_B = ψ(r_μ)`` by a direct DFT of each rank's ψ G slice, one psum;
     2. the pair GEMM in G space on the rank's slice
@@ -220,8 +224,10 @@ def make_route_g_kernel(*, mesh: Mesh, kgrid, fft_grid, ns: int, b: int,
        and Bloch phase → ``D(k, μ, r_plane)``; the k-convolution
        (``ffi.fft.make_fused_conv_kplane``: the pair convolution on the
        identity plan, reading the 2D FFT output in place and applying the
-       Bloch phase and the L/R split on load); LR+RL completion; ``e^{-iq·r}``, forward 2D FFT, the ζ-sphere
-       columns and the axis phase accumulate ``Z_q(μ, G)``.
+       Bloch phase and the L/R split on load; the vertex γ̃^{μ_L} on both
+       endpoints' output spins, ``(perm, phase)`` attributes of the load);
+       LR+RL completion; ``e^{-iq·r}``, forward 2D FFT, the ζ-sphere
+       columns and the axis phase accumulate ``Z^{μ_L}_q(μ, G)``.
 
     Operands: ``psi_bar (n_src, nb, ns, ngk_pad)`` = conj ψ(G) of the raw
     parents, G sharded ``P(None, None, None, ('x','y'))``; ``g3 (n_src,
@@ -245,6 +251,7 @@ def make_route_g_kernel(*, mesh: Mesh, kgrid, fft_grid, ns: int, b: int,
     from isdf.core import _conv_kpair_static_gamma
     from isdf.pair_kernels import pair_projectors_lr
     from ffi.fft import make_fused_conv_kplane
+    from common.gamma_matrices import gamma_perm_phase
     P_ = _mesh_size(mesh)
     if b % P_:
         raise ValueError(f"make_route_g_kernel: batch {b} must be a multiple of P={P_}")
@@ -260,15 +267,24 @@ def make_route_g_kernel(*, mesh: Mesh, kgrid, fft_grid, ns: int, b: int,
     # None: equal L/R windows, the pair equations are already symmetric.
     q_neg = None if q_neg is None else np.asarray(q_neg, dtype=np.int32)
     qv = np.asarray(qvec_frac, dtype=np.float64)
-    p_l, ph_l = _conv_kpair_static_gamma(None, ns)
-    pair_kernel = make_fused_conv_kplane(mesh, kgrid, ns, perm_l=p_l, phase_l=ph_l,
-                                         perm_r=p_l, phase_r=ph_l)
+    vertices = tuple(int(v) for v in vertices)
+    if not vertices or any(v not in (0, 1, 2, 3) for v in vertices):
+        raise ValueError(f"make_route_g_kernel: vertices {vertices} must be μ_L in 0..3")
+    # One k-convolution per channel: C_q and Z_q put γ̃^{μ_L} on both
+    # endpoints' output spins after the typed unfold (isdf.core.c_q_from_psi_sm),
+    # which the router takes as the static (perm, phase) of its load.
+    pair_kernels = []
+    for v in vertices:
+        p_v, ph_v = _conv_kpair_static_gamma(None if v == 0 else gamma_perm_phase(v), ns)
+        pair_kernels.append(make_fused_conv_kplane(mesh, kgrid, ns, perm_l=p_v, phase_l=ph_v,
+                                                   perm_r=p_v, phase_r=ph_v))
+    n_v = len(vertices)
     ib = (np.arange(ps) // n_c).astype(np.float64)
     ic = (np.arange(ps) % n_c).astype(np.float64)
     key = ('route_g', _mesh_id(mesh), tuple(kgrid), tuple(fft_grid), ns, b,
            hash(q_sel.tobytes()), q_axis,
            None if q_neg is None else hash(q_neg.tobytes()), hash(qv.tobytes()),
-           int(n_col), int(n_s), int(n_pg), int(axis), int(n_src), stop_at)
+           int(n_col), int(n_s), int(n_pg), int(axis), int(n_src), vertices, stop_at)
     hit = _kernel_cache.get(key)
     if hit is not None:
         return hit
@@ -279,7 +295,7 @@ def make_route_g_kernel(*, mesh: Mesh, kgrid, fft_grid, ns: int, b: int,
     @partial(shard_map, mesh=mesh,
              in_specs=(G_, P(), P(), P(), P(None, _XY, None), P(), P(), P(), P(),
                        P(), (R_, R_)),
-             out_specs=P(None, _XY, None), check_vma=False)
+             out_specs=(P(None, _XY, None),) * n_v, check_vma=False)
     def _local(psi_bar, w_l, w_r, kvecs, g3, xmu, live, cyl, zt, unf, lt):
         ci, cax, pfc = cyl
         zc, za, zflat = zt
@@ -291,14 +307,14 @@ def make_route_g_kernel(*, mesh: Mesh, kgrid, fft_grid, ns: int, b: int,
         X = jnp.einsum('knsg,kgm->knsm', jnp.conj(psi_bar), ph) / np.sqrt(N)
         X = jax.lax.psum(X, _XY) * live[None, None, None, :]
         n_g = int(zflat.shape[-1])
-        chk = lambda a: jnp.zeros((Q, c, n_g), jnp.complex128) + jnp.sum(jnp.abs(a))
+        chk = lambda a: (jnp.zeros((Q, c, n_g), jnp.complex128) + jnp.sum(jnp.abs(a)),) * n_v
         if stop_at == 'x':
             return chk(X)
         # 2. pair GEMM in G space on this rank's slice (one band chunk)
         D_l, D_r = pair_projectors_lr(X[None], lambda bc: psi_bar,
                                       w_l[None], w_r[None])     # (k, s, b, s, Gp)
         if stop_at == 'gemm':
-            return chk(D_l) + chk(D_r)
+            return chk(jnp.sum(jnp.abs(D_l)) + jnp.sum(jnp.abs(D_r)))
         # 3. one all-to-all: G split -> μ owners, [L | R] owner-major
         D = jnp.stack([D_l, D_r], axis=2).reshape(n_src, ns, 2, P_, c, ns, -1)
         D = jnp.moveaxis(D, 3, 2).reshape(n_src, ns, P_ * 2 * c, ns, -1)
@@ -348,34 +364,39 @@ def make_route_g_kernel(*, mesh: Mesh, kgrid, fft_grid, ns: int, b: int,
                 kch[:, axis][:, None, None] * a0[None, :, None] / n_a
                 + kch[:, b_ax][:, None, None] * ib[None, None, :] / n_b
                 + kch[:, c_ax][:, None, None] * ic[None, None, :] / n_c)) / np.sqrt(N)
-            # The k-convolution reads d where the FFT left it: the Bloch
-            # phase and the L | R split of the 2c slots happen on its load.
-            Z = pair_kernel(d.reshape(nk, n_pg, ns, 2 * c, ns, ps), bl)   # (nk, c, n_pg·ps)
-            if stop_at == 'kconv':
-                return acc + jnp.sum(jnp.abs(Z)), None
-            if q_neg is not None:
-                Z = Z + jnp.conj(jnp.take(Z, jnp.asarray(q_neg), axis=0))
-            Z = jnp.take(Z, jnp.asarray(q_sel), axis=0).reshape(Q, c, n_pg, ps)
             qin = jnp.exp(-2j * jnp.pi * (jnp.asarray(qv[:, b_ax])[:, None] * ib[None, :] / n_b
                                           + jnp.asarray(qv[:, c_ax])[:, None] * ic[None, :] / n_c))
-            Z = (Z * qin[:, None, None, :]).reshape(Q, c, n_pg, n_b, n_c)
-            Fz = local_fftn3(Z, axes=(-2, -1), norm='backward').reshape(Q, c, n_pg, ps)
             # The axis transform onto the ζ cylinder: one matmul over the
             # group's planes, e^{-2πi (q_a + G_a) a/n_a}.
             E = jnp.exp(-2j * jnp.pi * (jnp.asarray(qv[:, axis])[:, None, None]
                                         + za.astype(jnp.float64)[None, None, :])
                         * a0[None, :, None] / n_a) * on[None, :, None]   # (Q, n_pg, n_za)
-            acc = acc + jnp.einsum('qcpj,qpg->qcjg', jnp.take(Fz, zc, axis=-1), E)
-            return acc, None
+            d = d.reshape(nk, n_pg, ns, 2 * c, ns, ps)
+            out = []
+            for pair_kernel, acc_v in zip(pair_kernels, acc):
+                # The k-convolution reads d where the FFT left it: the Bloch
+                # phase, the L | R split of the 2c slots and the vertex happen
+                # on its load.
+                Z = pair_kernel(d, bl)                                  # (nk, c, n_pg·ps)
+                if stop_at == 'kconv':
+                    out.append(acc_v + jnp.sum(jnp.abs(Z)))
+                    continue
+                if q_neg is not None:
+                    Z = Z + jnp.conj(jnp.take(Z, jnp.asarray(q_neg), axis=0))
+                Z = jnp.take(Z, jnp.asarray(q_sel), axis=0).reshape(Q, c, n_pg, ps)
+                Z = (Z * qin[:, None, None, :]).reshape(Q, c, n_pg, n_b, n_c)
+                Fz = local_fftn3(Z, axes=(-2, -1), norm='backward').reshape(Q, c, n_pg, ps)
+                out.append(acc_v + jnp.einsum('qcpj,qpg->qcjg', jnp.take(Fz, zc, axis=-1), E))
+            return tuple(out), None
 
         acc, _ = jax.lax.scan(
-            group, jnp.zeros((Q, c, n_zc, n_za), jnp.complex128),
+            group, (jnp.zeros((Q, c, n_zc, n_za), jnp.complex128),) * n_v,
             jnp.arange(n_grp, dtype=jnp.int32), unroll=1)
         if stop_at == 'kconv':
-            return chk(acc)
-        acc = jnp.take_along_axis(acc.reshape(Q, c, n_zc * n_za),
-                                  zflat[:, None, :], axis=-1)
-        return acc
+            return tuple(jnp.zeros((Q, c, n_g), jnp.complex128) + jnp.sum(jnp.abs(a))
+                         for a in acc)
+        return tuple(jnp.take_along_axis(a.reshape(Q, c, n_zc * n_za),
+                                         zflat[:, None, :], axis=-1) for a in acc)
 
     fn = jax.jit(_local)
     _kernel_cache[key] = fn
@@ -656,12 +677,19 @@ class ZetaG:
     def __init__(self, store, *, mesh, L_q, lu_piv, q_chunk_size, solver_kind,
                  zeta_gather, batched_route, n_rmu_solve, n_rmu, mu_basis,
                  ngk_per_q, gvec_components, path, print_fn=print):
+        from isdf.core import FactorToken
+        if isinstance(L_q, FactorToken):
+            raise ValueError(
+                "ZetaG: route G applies a whole-tile factor on each G tile; got a "
+                "block-cyclic FactorToken (factor the channel with "
+                "distrib_la_batched_route='batch_reshard').")
         self.store = store
         self.print_fn = print_fn        # the fit's report sink (V_q receipt)
         self.mesh = mesh
         self.L_q, self.lu_piv = L_q, lu_piv
         self.q_chunk_size = int(q_chunk_size)
-        self.solver_kind = str(solver_kind)
+        # The hoisted transverse LU travels as (LU, pivots): the 'lu' seam.
+        self.solver_kind = 'lu' if lu_piv is not None else str(solver_kind)
         self.zeta_gather = str(zeta_gather)
         self.batched_route = str(batched_route)
         self.n_rmu_solve = int(n_rmu_solve)
@@ -681,16 +709,29 @@ class ZetaG:
         tile onto q owners (one all-to-all per tile from μ-owned rows)."""
         return self.zeta_gather == 'local'
 
+    @property
+    def factor(self):
+        """The factor operand of :func:`_logical_solve`: B, C⁺ or (LU, pivots)."""
+        return self.L_q if self.lu_piv is None else (self.L_q, self.lu_piv)
+
+    def write_file(self, zeta_io, *, print_fn=None):
+        """Stream every G tile once and write ζ = C⁻¹Z into ``zeta_q_G`` (no V)."""
+        Q = self.store.Q
+        self.contract_v(np.zeros((Q, self.ngkmax), np.complex128),
+                        keep=np.zeros((Q, 1), np.int32), zeta_io=zeta_io,
+                        print_fn=print_fn, with_v=False)
+
 
     # -- the one pass ---------------------------------------------------
-    def contract_v(self, v_table, *, keep, zeta_io=None, print_fn=None):
+    def contract_v(self, v_table, *, keep, zeta_io=None, print_fn=None, with_v=True):
         """Stream every G tile once; return V (Q, μ_pad, μ_pad) at ``P(None,'x','y')``.
 
         ``v_table`` is ``(Q, ngkmax)`` v(q+G) on the stored sphere.  ``keep``
         ``(Q, n)`` names the sphere slots the head consumers read (slot 0
         first); ζ at them comes back as ``self.shell (Q, μ_pad, n)``.  V and
         the shell are in the canonical (file) centroid order.  With
-        ``zeta_io`` the masked ζ tiles are also written to ``zeta_q_G``.
+        ``zeta_io`` the masked ζ tiles are also written to ``zeta_q_G``;
+        ``with_v=False`` (:meth:`write_file`) forms and writes ζ only.
         """
         t0 = time.perf_counter()
         print_fn = print_fn or self.print_fn
@@ -721,16 +762,16 @@ class ZetaG:
             v_dev = device_put_process_local(np.asarray(strip_axis(v, qa, axis=0)), rep)
             ngk_dev = device_put_process_local(np.asarray(strip_axis(ngk, qa, axis=0)), rep)
             sl_dev = device_put_process_local(np.asarray(strip_axis(sl, qa, axis=0)), rep)
-        dbg = _debug_enabled()
+        dbg = _debug_enabled() and with_v
         step = _v_tile_kernel(self.mesh, layout, self.solver_kind,
-                              self.n_rmu_solve, st.g_tile, debug_m=dbg)
+                              self.n_rmu_solve, st.g_tile, debug_m=dbg, with_v=with_v)
         mu = int(st.mu_pad)
         V, M, shell = _zero_accumulators(self.mesh, layout, st.Q_pad, st.Q, mu,
-                                         int(sl.shape[1]), debug_m=dbg)
-        L_arg = self.L_q
+                                         int(sl.shape[1]), debug_m=dbg, with_v=with_v)
+        L_arg = self.factor
         if layout == 'g':
-            L_arg = jax.lax.with_sharding_constraint(
-                self.L_q, NamedSharding(self.mesh, P()))
+            L_arg = jax.tree.map(lambda a: jax.lax.with_sharding_constraint(
+                a, NamedSharding(self.mesh, P())), L_arg)
         nxt = st.read_tile(0, layout=layout)
         for t in range(st.n_Gt):
             # Tile t+1 is read while tile t is contracted.
@@ -743,6 +784,12 @@ class ZetaG:
             del Zt, zt
         if not dbg:
             M = None
+        if not with_v:
+            V = None
+            self.receipt = (f"  μ-batch ζ pass: {st.n_Gt} G tiles, {layout}-layout, "
+                            f"{time.perf_counter() - t0:.2f}s (store read "
+                            f"{st.t_read:.2f}s); zeta file written")
+            return None
         V = _finish_v(self.mesh, layout, st.Q)(V)
         shell = _finish_shell(self.mesh, layout, st.Q)(shell)
         if self.mu_basis is not None:
@@ -794,10 +841,36 @@ def _debug_enabled() -> bool:
 
 
 def _logical_solve(solver_kind: str, n_log: int):
-    """ζ = C⁺Z at the logical μ extent through the conditioning seam."""
+    """ζ_q = C_q⁻¹ Z_q at the logical μ extent, through the channel's conditioning seam.
+
+    The charge Gram is PSD: C⁺ = B Bᴴ, the λ > rcond·λ_max eigh cut
+    (:mod:`isdf.cplus`).  A current channel's Gram C^μ is Hermitian
+    INDEFINITE -- that cut would drop its whole negative half -- so the
+    currents keep their own seam from :mod:`isdf.core`, the same arithmetic
+    as every transverse fit: the sign-aware ridged pivoted LU factored once
+    per channel (``'lu'``, operand ``(LU, pivots)``, κ_lb certified at
+    factor time).
+    """
     from isdf import cplus
+    from isdf.core import _zeta_logical_solvers
     from runtime.padding import solve_at_logical
-    return lambda B, Z: solve_at_logical(cplus.apply, int(n_log), (B,), Z)
+    n_log = int(n_log)
+    if solver_kind == 'lu':
+        lu_apply = _zeta_logical_solvers(n_log)[1]
+        return lambda F, Z: lu_apply(F[0], F[1], Z)
+    if solver_kind == 'transverse_rank_truncate':
+        raise NotImplementedError(
+            "route G carries the transverse ridge LU only; transverse_zeta_solve "
+            "= rank_truncate is being retired (use the default, ridge).")
+    return lambda B, Z: solve_at_logical(cplus.apply, n_log, (B,), Z)
+
+
+def _factor_specs(solver_kind: str, layout: str):
+    """In-specs of the factor operand: whole q tiles (q-local) or replicated."""
+    tile = P(_XY, None, None) if layout == 'q' else P()
+    if solver_kind == 'lu':
+        return (tile, P(_XY, None) if layout == 'q' else P())
+    return tile
 
 
 def _acc_specs(layout):
@@ -805,27 +878,29 @@ def _acc_specs(layout):
     return P(_XY, None, None) if layout == 'q' else P(_XY, None, None, None)
 
 
-def _v_tile_kernel(mesh, layout, solver_kind, n_log, g_tile, *, debug_m):
-    """One G tile: ζ = C⁺Z, V += conj(ζ) v ζᵀ, shell gather (and M in debug).
+def _v_tile_kernel(mesh, layout, solver_kind, n_log, g_tile, *, debug_m, with_v=True):
+    """One G tile: ζ = C⁻¹Z, V += conj(ζ) v ζᵀ, shell gather (and M in debug).
 
     ``layout='q'``: F (Q_pad, μ, μ) and Z (Q_pad, μ, g) q-local; V, shell and
     M accumulate on the q owner.  ``layout='g'``: F replicated, Z G-split;
     each rank accumulates its partial sums over its G columns into a leading
-    rank axis, reduced once by :func:`_finish_v`.
+    rank axis, reduced once by :func:`_finish_v`.  ``with_v=False`` forms ζ
+    only (the accumulators pass through untouched).
     """
     key = ('v_tile', _mesh_id(mesh), layout, solver_kind, int(n_log),
-           int(g_tile), bool(debug_m))
+           int(g_tile), bool(debug_m), bool(with_v))
     fn = _kernel_cache.get(key)
     if fn is not None:
         return fn
     one = _logical_solve(solver_kind, n_log)
     acc = _acc_specs(layout)
+    f_spec = _factor_specs(solver_kind, layout)
     if layout == 'q':
-        in_specs = (P(_XY, None, None), P(_XY, None, None), P(_XY, None),
+        in_specs = (f_spec, P(_XY, None, None), P(_XY, None),
                     P(_XY), P(_XY, None), P(), acc, acc, acc)
         z_spec = P(_XY, None, None)
     else:
-        in_specs = (P(), P(None, None, _XY), P(), P(), P(), P(), acc, acc, acc)
+        in_specs = (f_spec, P(None, None, _XY), P(), P(), P(), P(), acc, acc, acc)
         z_spec = P(None, None, _XY)
 
     @partial(shard_map, mesh=mesh, in_specs=in_specs,
@@ -837,6 +912,8 @@ def _v_tile_kernel(mesh, layout, solver_kind, n_log, g_tile, *, debug_m):
             g_idx = g_idx + jax.lax.axis_index(_XY) * n_g
         mask = g_idx[None, :] < ngk[:, None]                    # (q, g)
         zeta = jnp.where(mask[:, None, :], jax.vmap(one)(F, Z), 0)
+        if not with_v:
+            return V, M, S, zeta
         vt = jnp.where(mask, jnp.take(v, jnp.clip(g_idx, 0, v.shape[-1] - 1),
                                       axis=1), 0)
         dV = jnp.einsum('qmg,qg,qng->qmn', jnp.conj(zeta), vt, zeta)
@@ -856,7 +933,7 @@ def _v_tile_kernel(mesh, layout, solver_kind, n_log, g_tile, *, debug_m):
     return fn
 
 
-def _zero_accumulators(mesh, layout, Q_pad, Q, mu, n_sh, *, debug_m):
+def _zero_accumulators(mesh, layout, Q_pad, Q, mu, n_sh, *, debug_m, with_v=True):
     P_ = _mesh_size(mesh)
     sh = NamedSharding(mesh, _acc_specs(layout))
     if layout == 'q':
@@ -865,7 +942,10 @@ def _zero_accumulators(mesh, layout, Q_pad, Q, mu, n_sh, *, debug_m):
         vs, ss = (P_, Q, mu, mu), (P_, Q, mu, n_sh)
     z = lambda shape: jax.jit(lambda: jnp.zeros(shape, jnp.complex128),
                               out_shardings=sh)()
-    return z(vs), (z(vs) if debug_m else z(vs[:1] + (1,) * (len(vs) - 1))), z(ss)
+    stub = lambda shape: z(shape[:1] + (1,) * (len(shape) - 1))
+    if not with_v:                   # ζ only: no V, M or shell is formed
+        return stub(vs), stub(vs), stub(ss)
+    return z(vs), (z(vs) if debug_m else stub(vs)), z(ss)
 
 
 def _to_mu_owner(mesh, layout, Q, split):
@@ -924,7 +1004,7 @@ def _v_from_m(mesh, layout, solver_kind, n_log):
     if fn is None:
         one = _logical_solve(solver_kind, n_log)
         acc = _acc_specs(layout)
-        f_spec = P(_XY, None, None) if layout == 'q' else P()
+        f_spec = _factor_specs(solver_kind, layout)
 
         @partial(shard_map, mesh=mesh, in_specs=(f_spec, acc), out_specs=acc,
                  check_vma=False)
