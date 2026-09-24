@@ -166,36 +166,57 @@ def _resolve_gindex_dev(g_index):
 # ``common.gvec_fft_box.build_sphere_box_index`` owns the host-built table:
 # ``sphere_index[k, g]`` is the flat C-order box cell of sphere slot ``g`` at
 # k, and ``n_rtot + g`` (distinct, out of the box) on a pad slot.  It is THE
-# one ψ(G)↔box table; box order is computed from it — a unique-index scatter
-# into the box going up, a fill-gather out of it coming down.  Every value
-# is a copy, so the box (and every transform of it) is bit-identical to the
-# retired dense ``(nk, nx, ny, nz)`` gather table's, at ngkmax/n_rtot of its
-# bytes.
-# ponytail: one table format for every consumer — the dense gather lowered
-# to one ``take``; the scatter costs a zeroed box per row.  Simplicity over
-# a marginal kernel speed (owner 2026-09-23).
+# one ψ(G)↔box table that is stored, passed and cached.  Box order is computed
+# from it inside each executable: a 1-D int32 unique scatter builds this
+# call's ``(n_k, n_rtot)`` inverse, and the established zero-sentinel gather
+# fills the box from it.  Values are copies, so the box — and every
+# transform of it — is bit-identical to the retired persistent table's.
+# ponytail: one stored table format for every consumer; the inverse is
+# rebuilt per call (a transient ``n_k·n_rtot·4`` bytes inside the kernel,
+# never a retained replicated buffer).  Scattering the complex ψ directly
+# was measured 14 600× slower than the gather on this XLA/GPU build
+# (runs/runtime/loader_tables_20260923/b01, b02), so it is not used.
+
+def _sphere_inverse(sphere_index: jax.Array, n_rtot: int) -> jax.Array:
+    """Per-call box → sphere-slot inverse ``(n_k, n_rtot)`` int32 (``ngk`` = empty)."""
+    ngk = int(sphere_index.shape[-1])
+    slots = jnp.arange(ngk, dtype=jnp.int32)
+    return jax.vmap(lambda i: jnp.full((int(n_rtot),), ngk, jnp.int32).at[i].set(
+        slots, mode='drop', unique_indices=True))(sphere_index)
+
+
+def _gather_box(psi: jax.Array, inverse: jax.Array, *,
+                fft_grid: Sequence[int]) -> jax.Array:
+    """ψ(G) ``(n_k, nb, ns, ngk)`` + inverse ``(n_k, n_rtot)`` → box."""
+    n_k, nb, ns, ngk = (int(v) for v in psi.shape)
+    grid = tuple(int(v) for v in fft_grid)
+    k_stride = ngk + 1
+    zero = jnp.zeros((n_k, nb, ns, 1), dtype=psi.dtype)
+    psi_t = jnp.transpose(jnp.concatenate([psi, zero], axis=-1), (1, 2, 0, 3))
+    psi_flat = psi_t.reshape(nb, ns, n_k * k_stride)
+    flat_index = (jnp.arange(n_k, dtype=jnp.int32)[:, None] * k_stride
+                  + inverse)                                   # (n_k, n_rtot)
+    # ``mode='clip'``: every index is in range by construction (the zero
+    # slot sits at ``ngk``), and clip skips take's fill mask.
+    gathered = jnp.take(psi_flat, flat_index, axis=2, mode='clip')
+    return jnp.transpose(gathered, (2, 0, 1, 3)).reshape(n_k, nb, ns, *grid)
+
 
 def _box_kernel(psi: jax.Array, sphere_index: jax.Array, *,
                 fft_grid: Sequence[int]) -> jax.Array:
     """ψ(G) ``(n_k, nb, ns, ngk)`` → box ``(n_k, nb, ns, nx, ny, nz)``.
 
     ``sphere_index`` ``(n_k, ngk)`` int32 (see the block comment above).
-    Band-sharded ``psi`` is acceptable: the scatter is per (k, band, spinor)
-    row and never crosses the band axis.
+    Band-sharded ``psi`` is acceptable: nothing crosses the band axis.
     """
-    n_k, nb, ns, ngk = (int(v) for v in psi.shape)
-    grid = tuple(int(v) for v in fft_grid)
-    n_rtot = grid[0] * grid[1] * grid[2]
+    n_k, _, _, ngk = (int(v) for v in psi.shape)
     if tuple(int(v) for v in sphere_index.shape) != (n_k, ngk):
         raise ValueError(
             f"_box_kernel: sphere_index {tuple(sphere_index.shape)} does not "
             f"index ψ {tuple(psi.shape)}; want ({n_k}, {ngk}).")
-
-    def one_k(p, idx):
-        box = jnp.zeros((nb, ns, n_rtot), dtype=p.dtype)
-        return box.at[:, :, idx].set(p, mode='drop', unique_indices=True)
-
-    return jax.vmap(one_k)(psi, sphere_index).reshape(n_k, nb, ns, *grid)
+    n_rtot = int(np.prod([int(v) for v in fft_grid]))
+    return _gather_box(psi, _sphere_inverse(sphere_index, n_rtot),
+                       fft_grid=fft_grid)
 
 
 def _sphere_gather(box: jax.Array, sphere_index: jax.Array) -> jax.Array:
@@ -1175,7 +1196,9 @@ def gflat_to_rmu(
         out_spec = band_sphere_spec()
 
         def _body(psi_, g_index_, r_mu_, kvecs_, k_row_map_):
-            # Per-rank: (nk, nb_local, ns, ngkmax).
+            # Per-rank: (nk, nb_local, ns, ngkmax).  The box order of every
+            # k row is computed once here, outside the row scan.
+            inv_ = _sphere_inverse(g_index_, nx * ny * nz)
             psi_flat = psi_.reshape(N, ns, ngkmax)
             if pad_N:
                 psi_flat = jnp.pad(
@@ -1210,8 +1233,8 @@ def gflat_to_rmu(
                 # ngkmax) contract takes (cs, 1, ns, ngkmax) per row.
                 # Per-row sphere-index gather: (cs, ngkmax).
                 sub4 = sub.reshape(cs, 1, ns, ngkmax)
-                g_per_row = g_index_[mapped_k_row]
-                box = _box_kernel(
+                g_per_row = inv_[mapped_k_row]         # (cs, n_rtot)
+                box = _gather_box(
                     sub4, g_per_row, fft_grid=fft_grid_t)  # (cs, 1, ns, nx, ny, nz)
                 box = box.reshape(cs, ns, nx, ny, nz)
                 rb = local_ifftn3(box, axes=(-3, -2, -1), norm=norm)
