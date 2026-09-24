@@ -2345,8 +2345,8 @@ def _enforce_required_ffi(mesh, *, announce: bool = True) -> None:
     log.  An import failure of the gate modules themselves is a broken
     build and propagates for the same reason.
     """
-    from ffi.fft import (CONV_KLEAD_GATE, CONV_KMINOR_GATE, CONV_KPAIR_GATE, CONV_KPARENT_GATE,
-                         FUSED_GATE, GATE as _FFT_GATE)
+    from ffi.fft import (CONV_KLEAD_GATE, CONV_KMINOR_GATE,
+                         FUSED_GATE, GATE as _FFT_GATE, require_kconv)
     from ffi.gemm import GATE as _GEMM_GATE
 
     for gate in (_FFT_GATE, FUSED_GATE, _GEMM_GATE):
@@ -2359,11 +2359,10 @@ def _enforce_required_ffi(mesh, *, announce: bool = True) -> None:
     # production consumer until its separately-reviewed Sigma seam lands.
     CONV_KMINOR_GATE.enforce(mesh, announce=announce)
     CONV_KLEAD_GATE.enforce(mesh, announce=announce)
-    CONV_KPAIR_GATE.enforce(mesh, announce=announce)
-    if CONV_KPARENT_GATE.mode() == "on":
-        CONV_KPARENT_GATE.require(mesh, announce=announce)
-    else:
-        CONV_KPARENT_GATE.enforce(mesh, announce=announce)
+    # The k-convolution router has no dial: it resolves by platform and
+    # refuses here, at startup, when its backend cannot be served (on CUDA a
+    # missing nvidia-mathdx wheel; decisions.md 2026-09-24).
+    require_kconv(mesh, announce=announce)
 
 
 def _ffi_dial_facts() -> list:
@@ -2382,7 +2381,7 @@ def _ffi_dial_facts() -> list:
     try:
         from ffi.gemm import GATE as _GEMM_GATE
         from ffi.fft import (CONV_KLEAD_GATE, CONV_KMINOR_GATE,
-                             CONV_KPAIR_GATE, CONV_KPARENT_GATE, GATE as _FFT_GATE, FUSED_GATE)
+                             GATE as _FFT_GATE, FUSED_GATE)
     except Exception as exc:                                  # noqa: BLE001
         return [{"env": "<ffi dials>", "mode": None, "enabled": None,
                  "detail": f"the FFI gate modules could not be imported "
@@ -2396,11 +2395,7 @@ def _ffi_dial_facts() -> list:
                         "ladder-W rung; accelerator)"),
                        (CONV_KLEAD_GATE,
                         "the direct fused k-LEADING IFFT(G)-IFFT(W)-FFT "
-                        "conv (Sigma; accelerator, default off)"),
-                       (CONV_KPAIR_GATE,
-                        "the fused post-pair convolution used to form the "
-                        "ISDF Coulomb operator"),
-                       (CONV_KPARENT_GATE, "the native parent-load ISDF convolution")):
+                        "conv (Sigma; accelerator, default off)")):
         try:
             mode = gate.mode()
             enabled = gate.enabled()

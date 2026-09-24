@@ -10,6 +10,52 @@ separate question and is stated per entry — an approved ruling that has not
 landed is marked so, with the branch that carries it, because documenting an
 unlanded change as live is how a tuning table becomes a lie.
 
+## 2026-09-24 — NVIDIA k-convolutions run on nvidia-mathdx, behind one platform router
+
+**Ruling (owner, verbatim).** "yes let's absolutely use nvidia-mathdx for
+those kernels as a default on nvidia gpu architectures; make sure to be
+careful to map the physics driver frontend that calls the fft kernels to go
+through a router to the different backends where of course this is the
+preferred nvidia one (and since it's easy to ship mathdx we can make it the
+only supported method on nvidia gpus), in accordance with good software
+design/existing lorrax service/infrastructure/physics driver intended splits"
+
+**Consequences for code.**
+
+* **Front doors.** Physics code calls one backend-agnostic entry for each k
+  operation: the pair convolution of the ζ fit (`isdf.core`'s tails and the
+  `parent_projector_kconv` seam, whose signature does not change), and later
+  the T·W convolution (Σ), the k-minor convolution (BSE rung) and a
+  transform-only mode. Drivers never name a backend, a kernel or an
+  environment variable.
+* **Router.** It lives in the `ffi/fft.py` facade (layer 2 of
+  [`ffi_layout.md`](ffi_layout.md) §1) and chooses by PLATFORM only.
+  * CUDA → the fused nvidia-mathdx (cuFFTDx) kernel family, compiled per
+    (grid, arch) by NVRTC at run time. There is no plan-route fallback on
+    NVIDIA.
+  * cpu → the MKL flat-k plan route.
+  * Anything else → a named refusal.
+  * No environment variable selects a route (QUALITY #8). A missing
+    `nvidia-mathdx` wheel on CUDA is a GATE refusal naming
+    `pip install nvidia-mathdx`.
+* **Backend.** One JIT kernel family with modes (pair and parent-pair now;
+  T·W, transform-only and k-minor later). The per-axis cap is 40, the fp64
+  cuFFTDx thread-FFT limit; beyond it the family refuses by name. A k-row
+  that does not fit shared memory also refuses by name. Kernels are cached
+  in process per (mode, grid, ns, arch).
+* **Deletes.** The hand-written direct-DFT arms of `conv_kpair` and
+  `conv_kparent` and their route gates (`LORRAX_CONV_KPAIR_FFI`,
+  `LORRAX_CONV_KPARENT_FFI`). `conv_klead`, `conv_kminor`, `gw_conv` and the
+  BSE/χ0/flat-k sites are moved by a later lane.
+
+**Evidence.** On one A100, cuFFTDx fused kernels beat the direct DFT by 1.7×
+at 8³ and 4.4× at 12×12×1 for the kpair contract. The NVRTC build matches
+nvcc, and compilation costs 6.5–7.9 s per grid. See sandbox claims 2651 and
+2652.
+
+**Status.** Approved. ζ-fit implementation on branch
+`feat/kconv-mathdx-2026-09-24` (not on main).
+
 ## 2026-09-18 — Headless shared-pole SC is allowed for brute-grid development
 
 **Ruling (owner).** `sigma_w_model = shared_pole` with

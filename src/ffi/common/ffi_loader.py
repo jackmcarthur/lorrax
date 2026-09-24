@@ -127,11 +127,12 @@ _CUDA_TARGET_SYMBOLS = {
     # global pack or transpose.  CUDA-only; no production Sigma caller exists
     # until its separate seam lands.
     "lorrax_cufft_conv_klead":      "CufftConvKLeadCudaFfi",
-    # ISDF CCT/ZCT post-pair convolution.  Both rank-7 inputs keep the three
-    # k axes leading; the handler contracts the two spin axes and returns the
-    # rank-5 tile.  CUDA-only, with the unchanged JAX chain as its fallback.
-    "lorrax_cufft_conv_kpair":      "CufftConvKPairCudaFfi",
-    "lorrax_cufft_conv_kparent":    "CufftConvKParentCudaFfi",
+    # The NVIDIA k-convolution family on nvidia-mathdx (cpp/cufft/
+    # kconv_mathdx_cuda_ffi.cc): cuFFTDx transforms, NVRTC-built per
+    # (mode, grid, ns, context).  CUDA-only; the ffi.fft router returns the
+    # MKL plan route on cpu and never this target (decisions.md 2026-09-24).
+    "lorrax_mathdx_kconv_pair":     "KConvMathdxPairCudaFfi",
+    "lorrax_mathdx_kconv_parent":   "KConvMathdxParentCudaFfi",
     "lorrax_phdf5_write":           "PhdfWriteFfi",
     "lorrax_phdf5_read":            "PhdfReadFfi",
     "lorrax_phdf5_read_kchunk":       "PhdfReadKchunkFfi",

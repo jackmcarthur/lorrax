@@ -106,9 +106,12 @@ def test_parent_conv_typed_tables_match_decomposed():
 
 
 def gpu_main():
-    """Exercise both native arms at P4 against direct k sums on random parent tensors."""
-    import os
-    os.environ["LORRAX_CONV_KPAIR_FFI"] = "on"
+    """The router's CUDA parent convolution (nvidia-mathdx) at P4 against direct k sums.
+
+    Random parent tensors, ns = 1/2/4, a nontrivial vertex at ns = 4, both
+    operand layouts.  Red twin (TASTE 21): the right source map rolled by one
+    slot must miss by more than 1e-3.
+    """
     from runtime import initialize_communicator_stack
     from ffi import fft
     from common.gamma_matrices import gamma_perm_phase
@@ -123,19 +126,17 @@ def gpu_main():
             perm,phase=(gamma_perm_phase(vertex) if vertex else (np.arange(ns),np.ones(ns)))
             expected=_direct_convolution(_literal(parents,tables,U),np.asarray(perm),
                                          np.asarray(phase),np.asarray(perm),np.asarray(phase))
-            for arm, centroid_major in product(('resident','two_stage'), (False, True)):
+            assert fft.kconv_backend(mesh) == "mathdx"
+            for centroid_major, red in product((False, True), (False, True)):
                 folded=list((*tables,tables[-1]))
                 pairs=(np.asarray(perm)[:,None]*ns+np.asarray(perm)[None,:]).reshape(-1)
                 phases=(np.asarray(phase)[:,None]*np.asarray(phase)[None,:]).reshape(-1)
                 folded[-1]=tables[-1][:,pairs,:]*np.conj(phases)[None,:,None]
-                old=fft.conv_kpair_plan
-                fft.conv_kpair_plan=lambda *args: (arm,'oracle forced coverage')
-                try:
-                    kernel=fft.make_fused_conv_kparent(mesh,(2,2,1),ns,(2,3),
-                        perm_l=np.arange(ns),phase_l=np.ones(ns),
-                        perm_r=np.arange(ns),phase_r=np.ones(ns),centroid_major=centroid_major)
-                finally: fft.conv_kpair_plan=old
-                assert kernel is not None
+                if red:
+                    folded[3]=np.roll(folded[3],1,axis=1)
+                kernel=fft.make_fused_conv_kparent(mesh,(2,2,1),ns,(2,3),
+                    perm_l=np.arange(ns),phase_l=np.ones(ns),
+                    perm_r=np.arange(ns),phase_r=np.ones(ns),centroid_major=centroid_major)
                 @partial(shard_map,mesh=mesh,in_specs=(spec,spec,table_specs),
                          out_specs=P(None,'x','y'),check_vma=False)
                 def run(a,b,t): return kernel(a,b,t)
@@ -144,32 +145,11 @@ def gpu_main():
                 value=jax.jit(run)(*operands,device_tables)
                 ref=jax.device_put(expected,NamedSharding(mesh,P(None,'x','y')))
                 error=float(jax.device_get(jnp.linalg.norm(value-ref)/jnp.linalg.norm(ref)))
-                assert error < 1e-12,(ns,vertex,arm,error)
-                if jax.process_index()==0: print(json.dumps(dict(ns=ns,vertex=vertex,arm=arm,centroid_major=centroid_major,relative=error)),flush=True)
+                assert (error > 1e-3) if red else (error < 1e-12),(ns,vertex,centroid_major,red,error)
+                if jax.process_index()==0: print(json.dumps(dict(ns=ns,vertex=vertex,backend="mathdx",centroid_major=centroid_major,red_twin=red,relative=error)),flush=True)
     return 0
 
 
 if __name__ == '__main__':
     from runtime import run_main_and_finalize
     run_main_and_finalize(gpu_main)
-
-
-def test_parent_plan_admits_ns4_above_resident_floor(monkeypatch):
-    """Parent-only registration admits the four-spin two-stage arm above portable SMEM."""
-    from ffi import fft
-    from ffi.gate import Gate
-    monkeypatch.setenv("LORRAX_CONV_KPARENT_FFI", "auto")
-    monkeypatch.setenv("LORRAX_CONV_KPAIR_FFI", "off")
-    probed = []
-    def require(self, mesh, *, target=None, **kwargs):
-        assert target == fft.CONV_KPARENT_TARGET
-        probed.append(target)
-        return "CUDA"
-    monkeypatch.setattr(Gate, "require", require)
-    arm, reason = fft.conv_kpair_plan(
-        object(), (12, 12, 8), 4, (4, 4), gate=fft.CONV_KPARENT_GATE)
-    assert arm == "two_stage" and "over-residency" in reason
-    kernel = fft.make_fused_conv_kparent(
-        object(), (12, 12, 8), 4, (4, 4), perm_l=np.arange(4),
-        phase_l=np.ones(4), perm_r=np.arange(4), phase_r=np.ones(4))
-    assert callable(kernel) and probed == [fft.CONV_KPARENT_TARGET] * 2
