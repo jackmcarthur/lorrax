@@ -18,9 +18,11 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from isdf.galerkin import (
     GalerkinOperatorProjection,
+    _coefficients_from_projection,
     _make_basis_solve_kernel,
-    _make_physical_project_kernel,
+    _make_projection_accum_kernel,
     _make_spin_operator_fold_kernel,
+    _reduce_device_partials,
     plan_galerkin_operator_stream,
     rotate_galerkin_operator,
 )
@@ -96,31 +98,39 @@ def test_physical_solve_and_projection_are_local_r_blocks_with_exact_parity():
     np.testing.assert_allclose(
         _host(basis), expected_basis, rtol=2e-13, atol=2e-13)
 
+    # The fit's projection: per-device partials of Psi X^H with no
+    # collective, one reduction, then C = (Psi X^H) L^-H on the rank face.
     psi_np = (
         rng.normal(size=(nk, band_carrier, ns, r_extent))
         + 1j * rng.normal(size=(nk, band_carrier, ns, r_extent))
     ).astype(np.complex128)
-    coeff_np = (
-        rng.normal(size=(nk, band_carrier, rank))
-        + 1j * rng.normal(size=(nk, band_carrier, rank))
-    ).astype(np.complex128)
     psi = _put_global(psi_np, psi_layout)
-    coefficients = jax.device_put(coeff_np, rep)
-    project = _make_physical_project_kernel(
+    x_rows = _put_global(rows_np, row)          # the solve donated ``rows``
+    accum = _make_projection_accum_kernel(
         mesh=mesh, nk=nk, band_carrier=band_carrier, rank=rank,
-        nspinor=ns, r_carrier=r_extent,
-        psi_layout=psi_layout, basis_layout=row)
-    project_compiled = project.lower(psi, basis, coefficients).compile()
-    project_hlo = project_compiled.as_text().lower()
-    assert "all-gather" not in project_hlo and "all_gather" not in project_hlo
-    assert "all-reduce" in project_hlo or "all_reduce" in project_hlo
+        nspinor=ns, r_carrier=r_extent)
+    acc_layout = NamedSharding(mesh, P(("x", "y"), None, None))
+    acc = _put_global(np.zeros((int(mesh.size) * nk, band_carrier, rank),
+                               dtype=np.complex128), acc_layout)
+    accum_hlo = accum.lower(psi, x_rows, acc).compile().as_text().lower()
+    for collective in ("all-gather", "all-reduce", "all-to-all",
+                       "reduce-scatter", "collective-permute"):
+        assert collective not in accum_hlo, collective
+    projection = _reduce_device_partials(accum(psi, x_rows, acc), mesh)
+    expected_projection = np.einsum(
+        "kbsr,asr->kba", psi_np, np.conj(rows_np), optimize=True)
+    np.testing.assert_allclose(
+        np.asarray(jax.device_get(projection)), expected_projection,
+        rtol=2e-13, atol=2e-12)
 
-    actual = project(psi, basis, coefficients)
-    expected = coeff_np + np.einsum(
+    coefficients = jax.jit(
+        _coefficients_from_projection, in_shardings=(rep, rep),
+        out_shardings=rep)(projection, factor)
+    expected = np.einsum(
         "kbsr,asr->kba", psi_np, np.conj(expected_basis), optimize=True)
     np.testing.assert_allclose(
-        np.asarray(jax.device_get(actual)), expected,
-        rtol=2e-13, atol=2e-13)
+        np.asarray(jax.device_get(coefficients)), expected,
+        rtol=2e-12, atol=2e-12)
 
 
 @pytest.mark.mesh(16)

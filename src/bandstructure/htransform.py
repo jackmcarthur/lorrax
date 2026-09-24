@@ -93,38 +93,6 @@ def _build_mesh_xy() -> Mesh:
     return RUNTIME.mesh
 
 
-# Per-device ceiling on one bounded whole-state real-space tile.  The
-# randomized sketch, exact selected-state Gram and physical projection all use
-# the canonical ``PsiGStore`` outer-r / inner-band stream; the shared planner
-# chooses one carrier that bounds their selected/random rows and WFN transform
-# workspace.  No full-r Galerkin basis is materialized.
-# Override with LORRAX_GALERKIN_CHUNK_GIB (GiB, float).
-#
-# Resolved INSIDE the consuming function, not at module scope: the old
-# module-level ``float(os.environ.get(...))`` meant a malformed export
-# crashed ``import bandstructure.htransform`` itself — a bare
-# ``ValueError: could not convert string to float`` from the import
-# storm, naming neither the variable nor the fix (the import-time-crash
-# class, P1 audit).  ``resolve_galerkin_chunk_bytes`` refuses BY NAME,
-# from the call that actually consumes the budget.
-
-
-def resolve_galerkin_chunk_bytes() -> int:
-    """Per-device ``LORRAX_GALERKIN_CHUNK_GIB`` stream budget in bytes.
-
-    Blank/unset → the default; garbage REFUSES naming the variable
-    (``gw_config.env_float`` refuse mode); non-positive values refuse too
-    — a zero-byte accumulation budget is never what anyone meant.
-    """
-    from gw.gw_config import env_float
-    gib = env_float("LORRAX_GALERKIN_CHUNK_GIB", 6.0, refuse=True)
-    if gib <= 0.0:
-        raise ValueError(
-            f"LORRAX_GALERKIN_CHUNK_GIB={gib!r} must be > 0 (GiB budget "
-            f"for one whole-state real-space tile; unset/blank = 6).")
-    return int(gib * 1024 ** 3)
-
-
 def resolve_extra_rank_pad() -> int:
     """``LORRAX_EXTRA_RANK_PAD`` (default 0) — TEST-ONLY pad-invariance knob.
 
@@ -253,7 +221,6 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
         rank_multiplier=rank_multiplier,
         qr_eps=qr_eps,
         qrcp_seed=qrcp_seed,
-        q_tile_budget=resolve_galerkin_chunk_bytes(),
         device_pool_limit=device_fit_budget,
         extra_rank_pad=extra_rank_pad,
         progress_fn=progress_fn,

@@ -816,10 +816,9 @@ _L1_LIBRARY_ENV_READS = {
     "gw.sigma_box_plan": {
         "LORRAX_UNIFORM_RULE_TRACE",
     },
-    # resolve_galerkin_chunk_bytes / resolve_extra_rank_pad — one resolver
-    # each, refuse-on-garbage; the entry layer passes resolved values down.
+    # resolve_extra_rank_pad — one resolver, refuse-on-garbage; the entry
+    # layer passes the resolved value down.
     "bandstructure.htransform": {
-        "LORRAX_GALERKIN_CHUNK_GIB",
         "LORRAX_EXTRA_RANK_PAD",
     },
     # resolve_reshard_route — explicit kwarg wins, env is the A/B path the

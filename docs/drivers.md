@@ -268,7 +268,7 @@ header.
 
 Invoke: `python -m bandstructure.htransform -i ht.in [--qp-rotations qp_wfn_rotations.h5 | --eqp-file eqp1.dat]`; the production scientific report is `htransform.out` and the interpolated table is `bandstructure.dat` (override with `--report-file` / `--output-file`). Kernel diagnostics use the driver-wide `LORRAX_DEBUG_PRINT=1` switch. The whole-state memory ledger prints and checks the exact mesh-dependent live set before compilation; do not reuse performance or rank expectations from the deleted centroid-Gram implementation.
 
-**Whole-state memory gate.** `isdf.galerkin` owns one bounded, zeta-style outer-r/inner-band stream for the randomized sketch, exact selected-state Gram, and physical projection. Its canonical `PsiGStore` supplies full-Bloch G-flat→r chunks; no full-r basis or second WFN/FFT route exists. The precompile ledger prices each alternative stage, including compiled WFN transform workspace, candidate/sketch faces, selected-state rows, factor, and coefficients; it reduces the WFN band carrier and then the r carrier before refusing against the worst-rank allocator budget. `LORRAX_GALERKIN_CHUNK_GIB` controls the stream tile only and never changes candidates, pivots, or delivered rank.
+**Whole-state memory gate.** `isdf.galerkin` transforms only the rows each pass uses, each once: the candidate states for the randomized sketch, the pivots for the exact selected-state Gram (their r-chunked rows `X` stay resident), and every state once for the projection `C = (Psi X^H) L^-H` (band chunks outside, r chunks inside). The canonical `PsiGStore` supplies the rows (owner-local host gathers) and the full-grid G-flat→r transforms (`to_rchunk_inner` at r0=0); no second WFN/FFT route exists. The live-set planner prices each pass from the measured one-row canonical transform (including cuFFT workspace), chooses state groups, FFT batch widths and r chunks against the worst-rank allocator budget, and reduces the WFN band carrier before refusing. No environment knob sizes the stream; sizes never change candidates, pivots, or delivered rank.
 
 **Spin observables in the interpolated states.**
 `isdf.galerkin.project_galerkin_spin_operator` projects a spatially uniform
@@ -343,7 +343,6 @@ Before 2026-08-15 this required a *pre-unfolded* full-BZ text file (`nk == sym.n
 | `wfn_fi_q_chunk` | 0 = N_q_coarse | fine-q chunk per f(H(q)) build; floor, rounded to device count |
 | `--a-band` | top band | band whose bandwidth sets the f-transform scale a |
 | `--guard-bands` | 4 | fit this many extra conduction bands above the returned `nval+ncond` window; the returned bands must pass the shared f-shoulder gate, while the guards absorb the transform's exact-zero top edge |
-| env `LORRAX_GALERKIN_CHUNK_GIB` | 6 | bounded whole-state r-stream tile budget; changes chunk count, never fitted basis semantics |
 
 Failure modes: a standalone occupied-band refusal means `nval` omitted lower
 occupied states; include them rather than publishing a Hamiltonian with an
