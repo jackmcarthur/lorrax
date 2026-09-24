@@ -10,7 +10,7 @@ and the module and site descriptor by [`config/README.md`](../../config/README.m
 `lorrax_A` is a site descriptor that `lx` reads; it is not a launcher. It
 supplies the CUDA-13.2 / JAX-0.9.1 runtime, the MPI capabilities and one sealed
 FFI bundle: both `LORRAX_FFI_SO` and `LORRAX_FFI_HOST_SO` point into a single
-[sealed pair](../architecture/ffi_layout.md#2a-the-deployable-unit-is-one-sealed-pair),
+[sealed pair](../architecture/ffi_layout.md#2c-the-deployable-unit-is-one-sealed-pair),
 so an ordinary run builds nothing. LORRAX's `runtime` package owns the JAX,
 GPU-allocator, HDF5 and compile-cache policy ([env_vars.md](../dev/env_vars.md)).
 Run scripts export none of it.
