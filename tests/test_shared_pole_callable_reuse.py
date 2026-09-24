@@ -2,12 +2,13 @@
 
 CPU (pytest, 2x2 host mesh) and P4 (``python test_shared_pole_callable_reuse.py OUT.json``):
 * ``round_tables``: each state keeps its carrier with the inert tail inside, in state order; the zero
-  column fills a slot to the round extent; ordered originals and mirrors pack as two halves of one
+  column fills a slot to the round extent (the largest selection on an eighth-of-capacity ladder); ordered originals and mirrors pack as two halves of one
   extent (paired per slot); the infinity block is doubled on an odd-moment ordered round and absent
   without odd moments; ``own`` is the spectrum length at the slot's own extent;
-* ``own_extent_receipts`` drops exactly the round padding's zeros;
-* ``round_program``: a round with new supports, panels and counts at the same extents runs the same
-  executable; the retained-column kernel is reused;
+* ``own_extent_receipts`` drops exactly the round padding's zeros; ``zero_row_safe_eigh`` returns
+  the zero-padded spectrum and a valid eigenbasis;
+* ``round_program``: a round with new supports, panels and counts in the same extent bucket runs the
+  same executable, every slot solving at the round side; the retained-column kernel is reused;
 * ``canonical_factors`` pads round blocks to the widest and places parents in canonical order.
 """
 from pathlib import Path
@@ -34,6 +35,9 @@ def check_tables():
     assert finite[0].tolist() == [True] * 3 + [False] + [True] * 7 + [False]
     assert finite[2].tolist() == [True] * 3 + [False] + [True] * 3 + [False] * 5 and not finite[3].any()
     assert t["active"][:, 12:].sum(axis=1).tolist() == [3, 4, 3, 0]
+    wide = round_tables(counts, (32, 32), (2 + 1j, 3 + 1j), [3, 4, 3, 0], 4, column_extent=_extent,
+                        ordered=False, odd_moments=False)
+    assert wide["order"].shape == (4, 16)  # capacity 64, bucket 8: selection 12 -> 16
     assert t["own"].tolist() == [16, 16, 12, 0]
     assert t["extents"].tolist() == [[12, 4], [12, 4], [8, 4], [0, 0]]
     paired = np.column_stack((counts, counts))
@@ -48,11 +52,21 @@ def check_tables():
         if odd:
             assert np.array_equal(o["active"][:, 24:28], o["active"][:, 28:])
         assert o["own"].tolist() == ([16, 16, 12, 0] if odd else [12, 12, 8, 0])
-    row, = own_extent_receipts({"gram_spectrum_relative": np.array([[-1e-9, 0, .5, 1, 0, 0]]),
+    row, = own_extent_receipts({"gram_spectrum_relative": np.array([[-1e-9, 0, 0, 0, .5, 1]]),
                                 "metric_inverse_root_residual_fro": np.array([2.0])}, [4])
     assert row["gram_spectrum_relative"].tolist() == [[-1e-9, 0, .5, 1]]
     assert row["gram_min_relative"].tolist() == [-1e-9]
     assert row["metric_inverse_root_residual_relative"].tolist() == [1.0]
+    import jax.numpy as jnp
+    from gw.shared_pole_local import zero_row_safe_eigh
+    rng = np.random.default_rng(5)
+    x = rng.normal(size=(6, 6)) + 1j * rng.normal(size=(6, 6))
+    a = np.zeros((10, 10), complex)
+    live = [0, 2, 3, 5, 6, 9]
+    a[np.ix_(live, live)] = x @ x.conj().T - 20 * np.eye(6)  # indefinite live block, zero rows between
+    values, vectors = zero_row_safe_eigh(jnp.linalg.eigh)(jnp.asarray(a))
+    assert np.allclose(values, np.linalg.eigvalsh(a), atol=1e-12)
+    assert np.allclose(np.asarray(vectors) @ np.diag(values) @ np.asarray(vectors).conj().T, a, atol=1e-10)
 
 
 def check_reuse(mesh):
@@ -90,12 +104,12 @@ def check_reuse(mesh):
         return reduce_round(states, infinity, tables, real=ranks, mesh_xy=mesh, native_eigh=native,
                             ordered=False, odd_moments=False, keep_budget=None)
 
-    program = round_program(mesh, native, False, False, None, ((8, 2), (12, 2), (16, 2)))
+    program = round_program(mesh, native, False, False, None, False, None)
     first = round_((-.3 + .2j, -.9 + .1j), np.array([[3, 7], [7, 3], [3, 3], [7, 7]]), 1)
     jax.block_until_ready(first)
     compiled = program._cache_size()
     assert compiled > 0
-    assert solved_sides == {10, 14, 18}, solved_sides
+    assert solved_sides == {18}, solved_sides
     second = round_((-.4 + .3j, -1.1 + .2j), np.array([[7, 3], [3, 7], [3, 3], [8, 7]]), 2)
     jax.block_until_ready(second)
     assert program._cache_size() == compiled

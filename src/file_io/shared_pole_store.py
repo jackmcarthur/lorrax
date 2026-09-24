@@ -730,12 +730,18 @@ def write_shared_pole_sector_manifest(path, *, models, bank, identity, receipts,
     for key in ('K','Kmax','q_irr_full_idx','ordered'):
         if _json(left.get(key))!=_json(right.get(key)):
             _refuse(f'CT endpoint publication disagrees on {key}')
-    validate_shared_pole_bank(bank['path'],expected_identity=identity,
+    bank_header=validate_shared_pole_bank(bank['path'],expected_identity=identity,
                               mesh_xy=mesh_xy,require_complete=True)
+    if isinstance(bank['path'],ResidentBankPayload):
+        # The resident payload is released after construction; the Sigma
+        # consumer's W_infinity-V constant is published to its own file.
+        constant=write_bank_constant(bank['path'],Path(path).with_name('constant.h5'),
+                                     header=bank_header,mesh_xy=mesh_xy)
+    else:
+        constant=dict(path=str(Path(bank['path']).resolve()),identity=identity,field='constant')
     content=dict(schema=SECTOR_SCHEMA,representation='sector-ordered-ph',identity=identity,
         operator_realization='raw-sector-endpoint-v1',
-        sectors=handles,constant=dict(path=str(Path(bank['path']).resolve()),
-            identity=identity,field='constant'),construction=receipts)
+        sectors=handles,constant=constant,construction=receipts)
     digest=hashlib.sha256(_json(content).encode()).hexdigest()
     header=dict(content,digest=digest)
     path=Path(path)
@@ -781,8 +787,7 @@ def validate_shared_pole_sector_manifest(path, *, expected_identity, mesh_xy, ca
     _check_identity(constant['identity'],expected_identity)
     if constant['field']!='constant':
         _refuse('sector constant must name W_infinity-V')
-    validate_shared_pole_bank(constant['path'],expected_identity=expected_identity,
-                              mesh_xy=mesh_xy,require_complete=True)
+    read_bank_constant_header(constant,mesh_xy=mesh_xy)
     return dict(header,model_headers=model_headers)
 
 
@@ -1156,17 +1161,139 @@ def open_shared_pole_bank(path, *, mesh_xy):
     return _bank_io(path, "r", mesh_xy)
 
 
-def shared_pole_bank_payload_bytes(meta, *, recipe, ordered, nq, mesh_xy):
+def shared_pole_bank_payload_bytes(meta, *, recipe, ordered, nq, mesh_xy, photon_extent=None):
     """Per-rank bytes of the complete bank payload in its canonical carrier.
 
     The same fields the scratch file holds: Wc, dWc/ds (plus both mirrors on
     an ordered bank) at every distinct finite sample, M1, M3 (plus M0, M2).
+    A photon bank (``photon_extent`` = its packed extent) is always ordered and
+    also holds the per-parent ``constant`` and the three [1,d,d] static-contact
+    diagnostics (Pi_grid, Drude, TT_contact).
     """
     plan = _bank_plan(recipe)
+    if photon_extent is not None:
+        tiles = int(nq) * (4 * _bank_nsample(plan) + 5) + 3
+        return int(16 * tiles * int(photon_extent)**2 // int(mesh_xy.size))
     samples = (4 if ordered else 2) * _bank_nsample(plan)
     moments = 4 if ordered else 2
     carrier = int(meta.mu_basis.n_canonical)
     return int(16 * int(nq) * (samples + moments) * carrier**2 // int(mesh_xy.size))
+
+
+def write_bank_contact(path, fields, *, mesh_xy):
+    """Write the photon bank's [1,d,d] static-contact diagnostics, file or resident.
+
+    ``fields`` maps Pi_grid/Drude/TT_contact to face-tiled complex128 arrays.
+    """
+    with _bank_io(path, "a", mesh_xy) as io:
+        for name, value in fields.items():
+            if isinstance(io, ResidentBankPayload):
+                io.create_dataset(name, shape=value.shape, dtype=np.complex128)
+                io.write_slab(name, value, offset=(0,) * value.ndim)
+            else:
+                io.write_slab(name, value, offset=(0,) * value.ndim, global_shape=value.shape)
+                io.sync_writes()
+
+
+_CONSTANT_KIND = "photon_bank_constant_v1"
+
+
+def write_bank_constant(payload, dest, *, header, mesh_xy):
+    """Publish a resident photon bank's per-parent W_infinity-V constant to ``dest``.
+
+    Returns the manifest resource ``dict(path, identity, field, kind, commit)``.
+    The file holds dataset ``constant`` [nq,d,d] (Ry, canonical photon order)
+    and ``constant_json``: the authenticated bank header plus a commit digest,
+    so consumers read the same geometry and symmetry tables as from the bank.
+    """
+    nq, d = int(header["bank_shape"]["nq"]), int(header["bank_shape"]["d"])
+    record = dict(header, constant_kind=_CONSTANT_KIND)
+    commit = hashlib.sha256(_json(record).encode()).hexdigest()
+    value = payload.read_slab("constant", shape=(nq, d, d), valid_shape=(nq, d, d),
+                              offset=(0, 0, 0), dtype=np.complex128,
+                              partition_spec=P(None, "x", "y"))
+    with SlabIO(str(dest), mode="w", mesh=mesh_xy) as io:
+        io.write_slab("constant", value, offset=(0, 0, 0), global_shape=(nq, d, d))
+        io.sync_writes()
+        io.write_attr("constant_json", np.bytes_(_json(dict(record, commit=commit))))
+    return dict(path=str(Path(dest).resolve()), identity=header["identity"], field="constant",
+                kind=_CONSTANT_KIND, commit=commit)
+
+
+def read_bank_constant_header(resource, *, mesh_xy):
+    """Authenticated bank header of a manifest ``constant`` resource (bank or published file)."""
+    if resource.get("kind") != _CONSTANT_KIND:
+        return validate_shared_pole_bank(resource["path"], expected_identity=resource["identity"],
+                                         mesh_xy=mesh_xy, require_complete=True)
+    with h5py.File(resource["path"], "r") as f:
+        raw = f["constant_json"][()]
+    header = json.loads(raw.decode() if isinstance(raw, bytes) else str(raw))
+    _check_identity(header["identity"], resource["identity"])
+    if header.pop("commit", None) != resource.get("commit"):
+        _refuse("photon bank constant commit mismatch")
+    return header
+
+
+def read_bank_constant(resource, header, *, meta, mesh_xy):
+    """The [nq,d,d] face-tiled W_infinity-V constant named by a manifest resource."""
+    nq, d = int(header["bank_shape"]["nq"]), int(header["bank_shape"]["d"])
+    with SlabIO(resource["path"], mode="r", mesh=mesh_xy) as io:
+        if resource.get("kind") != _CONSTANT_KIND:
+            return read_shared_pole_bank(io, (0, nq), meta=meta, header=header,
+                                         fields=("constant",))["constant"]
+        return io.read_slab("constant", shape=(nq, d, d), valid_shape=(nq, d, d),
+                            offset=(0, 0, 0), dtype=np.complex128,
+                            partition_spec=P(None, "x", "y"))
+
+
+_STATIC_REFERENCE_KIND = "photon_static_contact_v1"
+
+
+def write_static_reference(path, fields, *, header, mesh_xy):
+    """Publish a device-resident map's static contact for later SC maps.
+
+    A resident bank is released after its constructor, so the three small
+    [1,d,d] contact arrays that later maps freeze are written to their own
+    file with the bank identity, photon layout and centroid digests. Returns
+    the JSON-safe reference ``dict(path, identity, kind, commit)``.
+    """
+    record = dict(identity=header["identity"], photon_layout=header["photon_layout"],
+                  photon_centroid_digests=header["photon_centroid_digests"],
+                  kind=_STATIC_REFERENCE_KIND)
+    commit = hashlib.sha256(_json(record).encode()).hexdigest()
+    record["commit"] = commit
+    with SlabIO(str(path), mode="w", mesh=mesh_xy) as io:
+        for name, value in fields.items():
+            io.write_slab(name, value, offset=(0,) * value.ndim, global_shape=value.shape)
+            io.sync_writes()
+        io.write_attr("static_reference_json", np.bytes_(_json(record)))
+    return dict(path=str(path), identity=header["identity"], kind=_STATIC_REFERENCE_KIND,
+                commit=commit)
+
+
+def read_static_reference(reference, *, n, mesh_xy):
+    """Authenticated static-contact header and (Pi_grid, Drude, TT_contact) of a reference.
+
+    ``reference`` is either an initial file bank (``path``, ``identity``) or a
+    record from :func:`write_static_reference`. Returns ``(record, arrays)``;
+    the record carries photon_layout, photon_centroid_digests and ``commit``.
+    """
+    names = ("Pi_grid", "Drude", "TT_contact")
+    if reference.get("kind") == _STATIC_REFERENCE_KIND:
+        with h5py.File(reference["path"], "r") as f:
+            raw = f["static_reference_json"][()]
+        record = json.loads(raw.decode() if isinstance(raw, bytes) else str(raw))
+        _check_identity(record["identity"], reference["identity"])
+        if record.get("commit") != reference.get("commit"):
+            _refuse("photon static reference commit mismatch")
+    else:
+        record = validate_shared_pole_bank(reference["path"],
+            expected_identity=reference["identity"], mesh_xy=mesh_xy, require_complete=True)
+        record = dict(record, commit=record["final_commit"])
+    with SlabIO(reference["path"], mode="r", mesh=mesh_xy) as io:
+        arrays = tuple(io.read_slab(key, shape=(1, n, n), partition_spec=P(None, "x", "y"),
+                                    dtype=np.complex128) for key in names)
+    return record, arrays
 
 
 def _bank_plan(recipe):
@@ -1633,6 +1760,17 @@ def _bank_concat_columns(mesh, spec):
                    out_shardings=NamedSharding(mesh, spec))
 
 
+@lru_cache(maxsize=None)
+def _resident_sector_select(mesh, ndim, starts, widths):
+    """Local C/T rectangle of each rank's photon face tile, still face tiled."""
+    from common.shard_map import shard_map
+    spec = P(*((None,) * (ndim - 2)), "x", "y")
+
+    def local(tile):
+        return tile[..., starts[0]:starts[0] + widths[0], starts[1]:starts[1] + widths[1]]
+    return jax.jit(shard_map(local, mesh=mesh, in_specs=spec, out_specs=spec, check_vma=False))
+
+
 def _read_photon_bank_sector(io, name, prefix, offset, spec, header, sector, ledger, retained):
     """Read only C/T rectangles; never load the full photon panel to slice it.
 
@@ -1649,6 +1787,20 @@ def _read_photon_bank_sector(io, name, prefix, offset, spec, header, sector, led
     starts = tuple(0 if family == "C" else c for family in sector)
     output_shape = prefix+(side*widths[0],side*widths[1])
     output_bytes = _local_bytes(output_shape,np.complex128,io.mesh,spec)
+    if isinstance(io, ResidentBankPayload):
+        # The mesh-interleaved carrier puts each rank's C and T rows in its
+        # own face tile, so a sector rectangle is a local slice of that tile.
+        d = side*stride
+        face = P(*((None,)*len(prefix)), 'x', 'y')
+        full = _local_bytes(prefix+(d,d),np.complex128,io.mesh,face)
+        _admit(ledger,"read_bank_sector_"+name,retained+output_bytes,output_bytes+full,
+               device_panel=output_bytes)
+        value = io.read_slab(name, shape=prefix+(d,d), valid_shape=prefix+(d,d),
+                             offset=offset, dtype=np.complex128, partition_spec=face)
+        value = _resident_sector_select(io.mesh, len(prefix)+2, starts, widths)(value)
+        if spec is None or tuple(spec) == tuple(face):
+            return value
+        return _bank_face_to_batch(io.mesh, value.ndim)(value)
     _admit(ledger,"read_bank_sector_"+name,retained+output_bytes,output_bytes,
            device_panel=output_bytes,native_host=True,io=io)
     columns = []

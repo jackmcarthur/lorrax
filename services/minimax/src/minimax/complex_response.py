@@ -10,9 +10,13 @@ import numpy as np
 from scipy import linalg as la
 
 RESPONSE_RULE_CAPACITY = 192
+# Node slots of one rule: a shared set uses at most one pencil's capacity; a
+# single sample whose forward and reverse poles need separate sets uses two.
+RESPONSE_NODE_CAPACITY = 2*RESPONSE_RULE_CAPACITY
 _RESPONSE_MAX_KAPPA = 5000.
-# A pencil geometry is abandoned after this many more exponentials without a
-# decade of accuracy; the next geometry, then a smaller group, is tried.
+# A group's pencil geometry is abandoned after this many more exponentials
+# without a decade of accuracy; the next geometry, then a smaller group, is
+# tried. A single sample keeps the full scan, so it never refuses earlier.
 _STAGNATION_NODES = 24
 
 
@@ -85,7 +89,7 @@ def _fits(lo, hi, poles, times, tol, decay_rate, order=None):
     return fits, worst, False
 
 
-def _shared_times(lo, hi, poles, tol, previous=None, decay_rate=0.):
+def _shared_times(lo, hi, poles, tol, previous=None, decay_rate=0., patience=None):
     """Complex times shared by every pole, or None.
 
     A stacked (multi-channel) Hankel shift pencil: each pole contributes the
@@ -152,29 +156,42 @@ def _shared_times(lo, hi, poles, tol, previous=None, decay_rate=0.):
                 break  # Try the next padding/flattening geometry, not more cancelling terms.
             if error < best/10:
                 best, best_n = error, n
-            elif n - best_n >= _STAGNATION_NODES:
+            elif patience is not None and n - best_n >= patience:
                 break  # No decade of accuracy in this many more exponentials.
     return None
 
 
-def _rule(lo, hi, z, times, fits, poles):
-    """Scatter shared-node pole fits into forward and reverse sample rows."""
+def _rule(z, sets):
+    """Scatter pole fits on node sets into forward and reverse sample rows.
+
+    ``sets`` is a list of (times, poles, fits). A node t is one Green pair
+    A(t): forward rows fit 1/(d-z) on t; reverse rows, evaluated at conj(t)
+    from conj(A(t)), fit 1/(d+z) as the conjugate of the -conj(z) fit on t.
+    A set without a sample's pole contributes zero weight to that row.
+    """
+    times = np.concatenate([t for t, _, _ in sets])
     count = len(times)
-    t = np.zeros(RESPONSE_RULE_CAPACITY, complex)
+    t = np.zeros(RESPONSE_NODE_CAPACITY, complex)
     t[:count] = times
-    shape = (len(z), 2, RESPONSE_RULE_CAPACITY)
+    shape = (len(z), 2, RESPONSE_NODE_CAPACITY)
     value, derivative = np.zeros(shape, complex), np.zeros(shape, complex)
     errors, mass = np.zeros((len(z), 2, 2)), np.zeros((len(z), 2, 2))
     for j, point in enumerate(z):
-        forward = fits[int(np.argmin(abs(poles - point)))]
-        reverse = fits[int(np.argmin(abs(poles + point.conjugate())))]
-        # Forward nodes at t fit 1/(d-z); reverse nodes at conj(t) fit
-        # 1/(d+z), the conjugate of the -conj(z) fit on t.
-        sides = ((forward[0], forward[1]), (np.conj(reverse[0]), reverse[1]))
-        for side, (coefficient, fit_error) in enumerate(sides):
-            value[j, side, :count] = coefficient[:, 0]
-            derivative[j, side, :count] = (1 if side == 0 else -1)*coefficient[:, 1]/(2*point)
-            errors[j, side] = [fit_error[0], fit_error[1]*abs(point.imag/(2*point))]
+        start = 0
+        for set_times, poles, fits in sets:
+            stop = start + len(set_times)
+            for side, pole in enumerate((point, -point.conjugate())):
+                match = np.flatnonzero(abs(poles - pole) <= 1e-12*abs(pole))
+                if not match.size:
+                    continue
+                coefficient, fit_error = fits[int(match[0])][:2]
+                if side:
+                    coefficient = np.conj(coefficient)
+                value[j, side, start:stop] = coefficient[:, 0]
+                derivative[j, side, start:stop] = (1 if side == 0 else -1)*coefficient[:, 1]/(2*point)
+                errors[j, side] = [fit_error[0], fit_error[1]*abs(point.imag/(2*point))]
+            start = stop
+        for side in (0, 1):
             mass[j, side] = [point.imag*np.sum(abs(value[j, side])),
                              point.imag**3*np.sum(abs(derivative[j, side]))]
     return dict(t=t, value=value, derivative=derivative, count=count,
@@ -192,8 +209,8 @@ def response_group_rules(lo_ry, hi_ry, z_ry, *, rel_tol=1e-8, previous=None,
     no sample is ever evaluated with more nodes than its own rule needs.
 
     Returns a list of rules. Each has ``members`` (indices into ``z_ry``),
-    ``t[RESPONSE_RULE_CAPACITY]``, ``value``/``derivative`` of shape
-    ``[members, 2 (forward, reverse), RESPONSE_RULE_CAPACITY]`` (value and
+    ``t[RESPONSE_NODE_CAPACITY]``, ``value``/``derivative`` of shape
+    ``[members, 2 (forward, reverse), RESPONSE_NODE_CAPACITY]`` (value and
     d/d(z^2)), ``count``, ``sampled_error`` and ``coefficient_mass``
     ``[members, 2, 2]``, and ``reference_ry``. ``previous`` is a list of
     earlier rules; one whose members match is tried first. A positive
@@ -213,13 +230,24 @@ def response_group_rules(lo_ry, hi_ry, z_ry, *, rel_tol=1e-8, previous=None,
 
     def build(members):
         poles = _poles(z[members])
-        got = _shared_times(lo, hi, poles, rel_tol/2, old.get(tuple(members)), decay_rate)
+        got = _shared_times(lo, hi, poles, rel_tol/2, old.get(tuple(members)), decay_rate,
+                            patience=None if len(members) == 1 else _STAGNATION_NODES)
         if got is not None:
-            rule = _rule(lo, hi, z[members], *got, poles)
+            rule = _rule(z[members], [(*got[:1], poles, got[1])])
             return [dict(rule, members=list(members), reference_ry=reference)]
         if len(members) == 1:
-            raise ValueError(f'response exponential fit failed: interval={lo, hi}, '
-                             f'sample={z[members[0]]}, tolerance={rel_tol}')
+            # Forward and reverse poles on separate node sets: each node then
+            # serves one orientation, exactly as separate per-pole rules do.
+            sets = []
+            for pole in poles:
+                one = np.asarray([pole])
+                got = _shared_times(lo, hi, one, rel_tol/2, None, decay_rate)
+                if got is None:
+                    raise ValueError(f'response exponential fit failed: interval={lo, hi}, '
+                                     f'sample={z[members[0]]}, pole={pole}, tolerance={rel_tol}')
+                sets.append((got[0], one, got[1]))
+            rule = _rule(z[members], sets)
+            return [dict(rule, members=list(members), reference_ry=reference)]
         half = len(members)//2
         return build(members[:half]) + build(members[half:])
 

@@ -1108,7 +1108,7 @@ def _stream_workspace(wfns, meta, mesh_xy, support, *, q_ids, n_outputs, ordered
     kernel, fixed = response_stream(wfns, meta, mesh_xy=mesh_xy, q_ids=q_ids,
         n_outputs=n_outputs, pair_mode="direct", bank_carry=True, ordered=ordered,
         vertex=vertex, band_ranges=support["band_ranges"])
-    capacity = minimax.RESPONSE_RULE_CAPACITY
+    capacity = minimax.RESPONSE_NODE_CAPACITY
     weights = partial(stream_weights, parents=vertex is None)
     abstract = (jax.ShapeDtypeStruct((capacity,), jnp.complex128),
                 jax.ShapeDtypeStruct((2, n_outputs, capacity), jnp.complex128),
@@ -1403,7 +1403,6 @@ def compute_photon_bank(wfns, wfns_transverse, meta, config, *, mesh_xy, sym,
     bank's ``path`` and ``identity`` to keep its contact fixed.
     """
     from file_io.shared_pole_store import validate_shared_pole_bank
-    from file_io.slab_io import SlabIO
 
     started = time.monotonic()
     header = validate_shared_pole_bank(bank_io["path"],
@@ -1469,34 +1468,38 @@ def compute_photon_bank(wfns, wfns_transverse, meta, config, *, mesh_xy, sym,
     before = time.monotonic()
     if jax.process_index() == 0:
         print("photon bank: centroid D and static grid reference", flush=True)
+    from file_io.shared_pole_store import (ResidentBankPayload, read_static_reference,
+                                           write_bank_contact, write_static_reference)
     reference = bank.get("static_reference")
+    initial = None
     if reference is None:
         grid, drude, contact = photon_static_contact(wfns, meta, mesh_xy=mesh_xy,
             layout=layout, vertex=vertex, occupation_state=occupation_state,
             sample_plan=sample_plan, execute=execute, receipt=receipt)
-        reference = {key: bank[key] for key in ("path", "identity")}
+        if isinstance(bank["path"], ResidentBankPayload):
+            # The resident payload is released after this map's constructor;
+            # later maps freeze the contact from its own small file.
+            reference = write_static_reference(
+                Path(bank["path"].label).with_name("photon_static_reference.h5"),
+                dict(Pi_grid=grid, Drude=drude, TT_contact=contact),
+                header=header, mesh_xy=mesh_xy)
+        else:
+            reference = {key: bank[key] for key in ("path", "identity")}
     else:
-        initial = validate_shared_pole_bank(reference["path"],
-            expected_identity=reference["identity"], mesh_xy=mesh_xy, require_complete=True)
+        initial, (grid, drude, contact) = read_static_reference(reference, n=n, mesh_xy=mesh_xy)
         for key in ("photon_layout", "photon_centroid_digests"):
             if initial.get(key) != header[key]:
                 raise ValueError(f"GATE photon_static_reference: initial/current {key} differs")
-        with SlabIO(reference["path"], mode="r", mesh=mesh_xy) as io:
-            grid, drude, contact = (io.read_slab(key, shape=(1,n,n),
-                partition_spec=P(None,"x","y"), dtype=np.complex128)
-                for key in ("Pi_grid", "Drude", "TT_contact"))
     receipt["static_reference"] = reference
     bank["mirror_operator_provenance"] = dict(coulomb=bank["coulomb"],
         static_reference=reference,
-        static_reference_commit=(initial["final_commit"] if bank.get("static_reference") is not None else None),
+        static_reference_commit=(initial["commit"] if initial is not None else None),
         state_identity=bank["identity"],
         moments="M0,M1,M2,M3 and constant computed with the identical photon_v and contact arrays")
     # Persist the contact's two physically defined pieces as bank diagnostics;
     # the constructor consumes the separately committed constant, not these.
-    with SlabIO(bank["path"], mode="a", mesh=mesh_xy) as io:
-        for key, value in (("Pi_grid",grid),("Drude",drude),("TT_contact",contact)):
-            io.write_slab(key, value, offset=(0,0,0), global_shape=(1,n,n))
-            io.sync_writes()
+    write_bank_contact(bank["path"], dict(Pi_grid=grid, Drude=drude, TT_contact=contact),
+                       mesh_xy=mesh_xy)
     receipt["seconds"]["static_contact"] = time.monotonic()-before
     del grid, drude
     direct_head = None

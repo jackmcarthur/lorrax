@@ -170,7 +170,7 @@ _DAMPED_RULE_NAMES = (
 )
 
 
-_RESPONSE_RULE_NAMES = ("RESPONSE_RULE_CAPACITY", "response_bank_rule", "response_laplace_rule", "response_group_rules")
+_RESPONSE_RULE_NAMES = ("RESPONSE_RULE_CAPACITY", "RESPONSE_NODE_CAPACITY", "response_bank_rule", "response_laplace_rule", "response_group_rules")
 
 # Finite-temperature bosonic Matsubara rules (KMS-bounded tau correlations).
 # SciPy (pivoted QR), so lazy.

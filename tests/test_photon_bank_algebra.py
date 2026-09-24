@@ -135,8 +135,13 @@ def test_photon_face_packing():
     check_photon_face_packing(mesh)
 
 
-def check_photon_bank_store(mesh, path):
-    """Full packed sample/derivative/moment/constant roundtrip on P4."""
+def check_photon_bank_store(mesh, path, *, resident=False):
+    """Full packed sample/derivative/moment/constant roundtrip on P4.
+
+    ``resident=True`` runs the identical contract on a device-resident
+    payload (``path`` then names its static-reference file): every read route,
+    including the C/T sector rectangles, must equal the fixture exactly.
+    """
     from test_shared_pole_bank import _bank_fixture
     from test_shared_pole_store import _fixture
     from gw.photon_layout import PhotonBasisLayout
@@ -152,6 +157,9 @@ def check_photon_bank_store(mesh, path):
     meta.shared_pole_capacity.live_stages = ('fixture',)
     basis = meta.mu_basis
     layout = PhotonBasisLayout.from_centroid_extents(basis.n_logical, basis.n_logical, mesh)
+    reference_path = path
+    if resident:
+        path = store.ResidentBankPayload(mesh, carrier=layout.packed_extent, label=str(path))
     header = store.initialize_shared_pole_bank(path, meta=meta, tables=tables,
         recipe=recipe, identity=identity, mesh_xy=mesh, photon_layout=layout, mu_bases=(basis,basis))
     nq, ns, n = header['bank_shape']['nq'], header['bank_shape']['nsample'], layout.packed_extent
@@ -161,17 +169,18 @@ def check_photon_bank_store(mesh, path):
     raw = np.arange(nq*ns*n*n).reshape(nq,ns,n,n).astype(complex)*(1+.3j)
     w, moment = put(raw), put(raw[:,0])
     header = store.write_shared_pole_bank(path,q_span=(0,nq),sample_span=(0,ns),
-        Wc=w,dWc_ds=2*w,M0=moment,M1=2*moment,M2=3*moment,M3=4*moment,constant=-moment,
+        Wc=w,dWc_ds=2*w,Wc_mirror=3*w,dWc_mirror_ds=4*w,
+        M0=moment,M1=2*moment,M2=3*moment,M3=4*moment,constant=-moment,
         meta=meta,expected_identity=identity,mesh_xy=mesh)
     assert header['complete']
     store.validate_shared_pole_bank(path,expected_identity=identity,mesh_xy=mesh,require_complete=True)
-    with SlabIO(path,mode='r',mesh=mesh) as io:
+    with store.open_shared_pole_bank(path,mesh_xy=mesh) as io:
         got=store.read_shared_pole_bank(io,(0,nq),meta=meta,header=header,
             sample_span=(0,ns),fields=('Wc','dWc_ds','M0','M1','M2','M3','constant'))
     for name, expected in dict(Wc=w,dWc_ds=2*w,M0=moment,M1=2*moment,M2=3*moment,M3=4*moment,constant=-moment).items():
         assert bool(jnp.all(got[name] == expected)),name
     # A parent-local constructor reads complete packed matrices on its owner.
-    with SlabIO(path,mode='r',mesh=mesh) as io:
+    with store.open_shared_pole_bank(path,mesh_xy=mesh) as io:
         got=store.read_shared_pole_bank(io,q_ids=[0,1,2,2],meta=meta,header=header,
             sample_span=(0,ns),fields=('Wc','constant'),partition_spec=P(('x','y'),None,None,None))
     from common.collectives import gather_to_host
@@ -187,8 +196,32 @@ def check_photon_bank_store(mesh, path):
             chunks.extend(range(lo,lo+count))
         return np.asarray(chunks)
     for sector in (('C','C'),('C','T'),('T','C'),('T','T')):
-        with SlabIO(path,mode='r',mesh=mesh) as io:
-            got=store.read_shared_pole_bank(io,q_ids=[0,1,2,2],meta=meta,header=header,
-                sample_span=(0,ns),fields=('Wc',),partition_spec=P(('x','y')),sector=sector)
-        expected=raw[[0,1,2,2]][...,indices(sector[0]),:][...,indices(sector[1])]
-        np.testing.assert_array_equal(gather_to_host(got['Wc']),expected)
+        for ids, spec in (([0,1,2,2], P(('x','y'))), ([2,0,1], None), ([0,1,2], P(('x','y')))):
+            if spec is not None and len(ids) % 4:
+                continue
+            with store.open_shared_pole_bank(path,mesh_xy=mesh) as io:
+                got=store.read_shared_pole_bank(io,q_ids=ids,meta=meta,header=header,
+                    sample_span=(0,ns),fields=('Wc','M1'),partition_spec=spec,sector=sector)
+            rows=raw[ids][...,indices(sector[0]),:][...,indices(sector[1])]
+            np.testing.assert_array_equal(gather_to_host(got['Wc']),rows)
+            np.testing.assert_array_equal(gather_to_host(got['M1']),2*rows[:,0])
+    # Static contact: stored beside the payload, and (resident) published for later maps.
+    contact = {name: put(raw[:1,0]*(k+2)) for k, name in enumerate(('Pi_grid','Drude','TT_contact'))}
+    store.write_bank_contact(path, contact, mesh_xy=mesh)
+    if resident:
+        reference = store.write_static_reference(reference_path, contact, header=header, mesh_xy=mesh)
+    else:
+        reference = dict(path=str(path), identity=identity)
+    record, arrays = store.read_static_reference(reference, n=n, mesh_xy=mesh)
+    assert record['photon_layout'] == header['photon_layout'] and record['commit']
+    for array, name in zip(arrays, ('Pi_grid','Drude','TT_contact')):
+        assert bool(jnp.all(array == contact[name])), name
+
+
+def test_resident_photon_bank_equals_file_bank(tmp_path):
+    """The photon bank contract holds for the file and the device-resident payload."""
+    if len(jax.devices()) != 4:
+        pytest.skip("photon store contract runs on a 2x2 mesh")
+    mesh = Mesh(np.asarray(jax.devices()).reshape(2, 2), ("x", "y"))
+    check_photon_bank_store(mesh, tmp_path / "photon_bank.h5")
+    check_photon_bank_store(mesh, tmp_path / "photon_static_reference.h5", resident=True)

@@ -283,15 +283,13 @@ def sector_synthesis(readers, headers, bases, families, frequencies, meta, mesh_
 def instantaneous_sector_sigma(handle, families, bases, meta, mesh_xy, *,
                                occupation_state, return_components=False):
     """Exchange-like equal-time contraction of W_infinity-V, exactly once."""
-    from file_io.slab_io import SlabIO
-    from file_io.shared_pole_store import validate_shared_pole_bank, read_shared_pole_bank
     from gw.photon_layout import PhotonBasisLayout, photon_block_view, pack_photon_operator
     from gw.photon_sigma import contract_lorentz_blocks, _TERM_X
     from gw.cohsex_sigma import _resolve_Gij
     from gw.qgrid_symmetry import qgrid_trs_policy_from_shared_pole_store
     from symmetry_maps import unfold_file_wedge_band_operator
-    header=validate_shared_pole_bank(handle['path'],expected_identity=handle['identity'],
-                                    mesh_xy=mesh_xy,require_complete=True)
+    from file_io.shared_pole_store import read_bank_constant_header, read_bank_constant
+    header=read_bank_constant_header(handle,mesh_xy=mesh_xy)
     raw_layout=PhotonBasisLayout.from_centroid_extents(bases[0].n_logical,bases[1].n_logical,mesh_xy)
     layout=PhotonBasisLayout.from_centroid_extents(bases[0].n_packed,bases[1].n_packed,mesh_xy)
     nq=int(header['bank_shape']['nq'])
@@ -299,8 +297,7 @@ def instantaneous_sector_sigma(handle, families, bases, meta, mesh_xy, *,
     meta.shared_pole_capacity.reserve('sigma.sector.constant.pack',
         resident_bytes_per_rank=2*amount,workspace_bytes_per_rank=2*amount,
         concurrent_with=meta.shared_pole_capacity.live_stages)
-    with SlabIO(handle['path'],mode='r',mesh=mesh_xy) as io:
-        raw=read_shared_pole_bank(io,(0,nq),meta=meta,header=header,fields=('constant',))['constant']
+    raw=read_bank_constant(handle,header,meta=meta,mesh_xy=mesh_xy)
     def block(A,B):
         value=photon_block_view(raw,raw_layout,A,B,mesh_xy)
         value=bases[bool(A)].pack_axis(value,1,spec=P(None,'x','y'))
