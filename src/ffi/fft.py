@@ -559,7 +559,7 @@ def _require_target(target: str, platform: str) -> None:
 
 
 def _mathdx_attrs(kgrid, ns, perm_l, phase_l, perm_r, phase_r, scale) -> dict:
-    kg = _check_kgrid(kgrid)
+    kg = _check_kgrid(kgrid, "mathdx")
     return dict(nkx=np.int64(kg[0]), nky=np.int64(kg[1]), nkz=np.int64(kg[2]),
                 scale=np.float64(scale),
                 perm_l=_check_perm(perm_l, ns, "left"),
@@ -569,9 +569,18 @@ def _mathdx_attrs(kgrid, ns, perm_l, phase_l, perm_r, phase_r, scale) -> dict:
                 **_mathdx_common())
 
 
-def _check_kgrid(kgrid) -> tuple[int, int, int]:
+def _check_kgrid(kgrid, backend: str) -> tuple[int, int, int]:
+    """Three positive k axes; on the ``mathdx`` leg also at most ``KCONV_AXIS_MAX``.
+
+    The cap is the fp64 cuFFTDx thread-FFT limit, a CUDA constraint: the cpu
+    plan route (FFTW) has none, so ``backend = "plan"`` does not apply it.
+    """
     kg = tuple(int(v) for v in kgrid)
-    if len(kg) != 3 or min(kg) < 1 or max(kg) > KCONV_AXIS_MAX:
+    if len(kg) != 3 or min(kg) < 1:
+        raise RuntimeError(
+            f"GATE kconv-kgrid: got k-grid {kg}; want three positive axes; fix: "
+            "pass the (nkx, nky, nkz) of the run's k-grid.")
+    if backend == "mathdx" and max(kg) > KCONV_AXIS_MAX:
         raise RuntimeError(
             f"GATE mathdx-kconv-axis: got k-grid {kg}; want every axis in "
             f"[1,{KCONV_AXIS_MAX}]; why: the fp64 cuFFTDx thread-FFT limit; fix: "
@@ -911,7 +920,7 @@ def make_local_kfft_klead(mesh: Mesh, kgrid, *, kind: str, norm: str | None) -> 
     """Rank-local ``fn(X) -> Y`` over the LEADING flat-k axis of ``X (nk, *trail)``."""
     if kind not in ("ifftn", "fftn"):
         raise ValueError(f"kind must be 'ifftn' or 'fftn', got {kind!r}")
-    kg = _check_kgrid(kgrid)
+    kg = _check_kgrid(kgrid, kconv_backend(mesh))
     nk = kg[0] * kg[1] * kg[2]
     scale = ffi_fft_scale(kind, norm, nk)
     if kconv_backend(mesh) == "mathdx":
@@ -937,7 +946,7 @@ def make_local_kfft_kminor(mesh: Mesh, kgrid, *, kind: str, norm: str | None) ->
     """Rank-local ``fn(X) -> Y`` over the three TRAILING k axes of ``X (..., nkx, nky, nkz)``."""
     if kind not in ("ifftn", "fftn"):
         raise ValueError(f"kind must be 'ifftn' or 'fftn', got {kind!r}")
-    kg = _check_kgrid(kgrid)
+    kg = _check_kgrid(kgrid, kconv_backend(mesh))
     nk = kg[0] * kg[1] * kg[2]
     scale = ffi_fft_scale(kind, norm, nk)
     mathdx = kconv_backend(mesh) == "mathdx"
@@ -994,7 +1003,7 @@ def make_kconv_klead(mesh: Mesh, kgrid, t_spec: P, w_spec: P, *,
     ``prep`` is the identity and ``apply`` the FFTW gw_conv host handler, which
     transforms W itself.
     """
-    kg = _check_kgrid(kgrid)
+    kg = _check_kgrid(kgrid, kconv_backend(mesh))
     nk = kg[0] * kg[1] * kg[2]
     t_flat = validate_flat_spec(t_spec, "T")
     w_flat = validate_flat_spec(w_spec, "W")
@@ -1066,7 +1075,7 @@ def make_kconv_klead_unfold(mesh: Mesh, kgrid, tables, *, norm: str | None = "or
     service's reference composition, then the plan route.
     """
     from symmetry_maps import apply_unfold_load_tables_local, local_unfold_load_tables
-    kg = _check_kgrid(kgrid)
+    kg = _check_kgrid(kgrid, kconv_backend(mesh))
     nk = kg[0] * kg[1] * kg[2]
     if int(tables.row.shape[0]) != nk:
         raise ValueError(f"k-leading unfold conv: tables cover {tables.row.shape[0]} k, grid has {nk}")
@@ -1151,7 +1160,7 @@ def make_local_kconv_kminor(mesh: Mesh, kgrid, *, norm: str | None = "ortho",
     inside a shard_map: ``X`` ``(d0, d1, d2, d3, d4, nk)``, ``K_R`` ``(d1, d2, nk)``."""
     if out_layout not in (0, 1):
         raise ValueError(f"out_layout must be 0 or 1, got {out_layout!r}")
-    kg = _check_kgrid(kgrid)
+    kg = _check_kgrid(kgrid, kconv_backend(mesh))
     nk = kg[0] * kg[1] * kg[2]
     scale = ffi_fft_scale("ifftn", norm, nk) * ffi_fft_scale("fftn", norm, nk) * float(mult)
     if kconv_backend(mesh) == "mathdx":
@@ -1192,7 +1201,7 @@ def make_kconv_kminor(mesh: Mesh, kgrid, x_spec: P, k_spec: P, *,
     """
     if out_layout not in (0, 1):
         raise ValueError(f"out_layout must be 0 or 1, got {out_layout!r}")
-    kg = _check_kgrid(kgrid)
+    kg = _check_kgrid(kgrid, kconv_backend(mesh))
     nk = kg[0] * kg[1] * kg[2]
     xax, kax = tuple(x_spec), tuple(k_spec)
     if len(xax) != 6 or xax[5] is not None or len(kax) != 3 or kax[2] is not None \
