@@ -12,9 +12,8 @@
 //  3. cudaEventRecord(ctx->h2d_event) so downstream ops on xla_stream
 //     wait for the H2D to complete.
 //  4. cudaStreamWaitEvent(xla_stream, h2d_event) — sets up the
-//     dependency; handler returns without a blocking
-//     cudaEventSynchronize because xla_stream will wait on its own
-//     before reading the output buffer.
+//     dependency. Large read buffers are retired through the per-file worker
+//     after DMA completes; the handler does not wait for that cleanup.
 //
 // No per-call cudaEventCreate/Destroy: that causes a ~800 ms stall
 // on non-rank-0 processes under JAX's cuda_async allocator (measured
@@ -47,6 +46,7 @@
 #ifndef LORRAX_FFI_NO_CUDA
 #include <cuda_runtime.h>
 #endif
+
 #include <hdf5.h>
 
 #include "xla/ffi/api/ffi.h"
@@ -91,6 +91,23 @@ static inline ffi::Error stage_host_to_output(
     return ffi::Error::Success();
 }
 #endif
+
+// Keep small pinned buffers for repeated reads, but never retain a large
+// slab in each of several open file contexts. The threshold bounds idle
+// read staging to 32 MiB per file; it does not cap the live H5Dread slab.
+// This is the synchronous-read buffer only. The writer thread owns
+// pinned_buf, including the async k-chunk union reader.
+static constexpr size_t kMaxRetainedReadStaging = size_t{32} << 20;
+
+static inline ffi::Error finish_read(
+    LRX_STREAM_PARAM PhdfCtx* ctx, const void* src, void* d_dst, size_t bytes)
+{
+    FFI_RETURN_IF_ERROR(
+        stage_host_to_output(LRX_STREAM_ARG ctx, src, d_dst, bytes));
+    if (ctx->read_capacity.load(std::memory_order_acquire) >
+        kMaxRetainedReadStaging) retire_read_buf(ctx);
+    return ffi::Error::Success();
+}
 
 // ``copy_index_to_host`` (seam 2) is in platform_seam.h — shared with
 // write_ffi.cc so the two TUs cannot drift.  ``unravel_rank`` /
@@ -293,7 +310,7 @@ static ffi::Error ReadImpl(
     // until the copy completes; host = plain memcpy into the host-resident
     // output.  XLA's FFI contract guarantees the output buffer is available
     // for writing at handler entry, so no cross-stream wait is needed.
-    return stage_host_to_output(LRX_STREAM_ARG ctx, stage, d_dst, bytes);
+    return finish_read(LRX_STREAM_ARG ctx, stage, d_dst, bytes);
 }
 
 // Padding contract: A_out dimensions are the equal-block physical
@@ -662,7 +679,7 @@ static ffi::Error ReadKchunkImpl(
     auto t_reads = now();
 
     FFI_RETURN_IF_ERROR(
-        stage_host_to_output(LRX_STREAM_ARG ctx, stage, d_dst, bytes));
+        finish_read(LRX_STREAM_ARG ctx, stage, d_dst, bytes));
     auto t_h2d = now();
 
     if (do_time && ctx->rank == 0) {

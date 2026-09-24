@@ -164,8 +164,9 @@ struct LORRAX_PHDF_CTX_TYPE {
     //
     //   ``read_buf``    — SYNCHRONOUS-READER staging, XLA thread.  Users:
     //      ``ReadImpl`` and ``ReadKchunkImpl``, both of which return
-    //      ``ffi::Error`` (not a Future) and therefore run to completion on
-    //      the calling XLA thread.  They share one buffer with each other,
+    //      ``ffi::Error`` (not a Future).  Their H5Dread calls complete on
+    //      the calling XLA thread, but CUDA H2D copies can still be in
+    //      flight when the handlers return.  They share one buffer,
     //      which is the relationship they already had; they no longer share
     //      one with the writer thread, which is the relationship that raced.
     //
@@ -255,6 +256,11 @@ bool ensure_pinned(PhdfCtx* ctx, size_t need_bytes);
 // `need_bytes`.  Same allocator as ensure_pinned, no thread guard: its
 // callers are the synchronous read handlers by construction.
 bool ensure_read_buf(PhdfCtx* ctx, size_t need_bytes);
+
+// Transfer a large synchronous read buffer to the existing per-file worker
+// for release after its queued H2D completes. The caller never waits for the
+// copy here. On the host build, release is immediate after memcpy.
+void retire_read_buf(PhdfCtx* ctx);
 
 // ─── THE LIVE-CTX REGISTRY (SLAB_IO_ROOT_CAUSE_AUDIT.md B2) ──────────────
 //
