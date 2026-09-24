@@ -2929,16 +2929,36 @@ def _prepare_fresh_parent_faces(
     _parent_zeta_plan = _candidate_plan if chunks is not None else None
     load_band_chunk = (chunks['band_chunk'] if chunks is not None
                        else zeta_contract.loader_band_chunk)
+    _mb_plan = None if chunks is None else chunks.get('mubatch')
     with timing.section("gw_jax.load_centroid_wfns"):
-    	parent_y, parent_x = load_centroids_band_chunked(
-    		wfn, sym, meta, centroid_indices,
-    		bool(int(meta.nspinor) == 4), mesh_xy,
-    		band_range=band_slices.full_range,
-    		band_chunk_size=load_band_chunk,
-    		k_chunk_size=(chunks['centroid_k_chunk'] if chunks is not None
-    		              else zeta_contract.loader_k_chunk),
-    		bispinor_lift=(representation.charge_lift or "raw"),
-    		k_domain=sym.parent_k_domain)
+    	if _mb_plan is not None:
+    		# ONE ψ(G) pass (loader tables 2026-09-23): each band chunk is read
+    		# once, moved to G slots by one all-to-all and sampled at the
+    		# centroids by a DFT.  The G-slot store is not retained yet
+    		# (placement 'none'): the μ-batch fit still builds its own store.
+    		# When the route-G fit takes ``ParentPsiG`` it passes 'device'
+    		# (resident) or 'host' (streaming) here and the second read goes.
+    		from common.psi_G_store import load_parent_psi_G
+    		_parent_psi = load_parent_psi_G(
+    			wfn=wfn, mesh_xy=mesh_xy, meta=meta,
+    			band_range=band_slices.full_range,
+    			band_chunk=int(_mb_plan.band_chunk),
+    			centroid_indices=centroid_indices, placement="none",
+    			bispinor=bool(int(meta.nspinor) == 4),
+    			bispinor_lift=(representation.charge_lift or "raw"),
+    			k_domain=sym.parent_k_domain, print_fn=print0)
+    		parent_y, parent_x = _parent_psi.faces
+    		del _parent_psi
+    	else:
+    		parent_y, parent_x = load_centroids_band_chunked(
+    			wfn, sym, meta, centroid_indices,
+    			bool(int(meta.nspinor) == 4), mesh_xy,
+    			band_range=band_slices.full_range,
+    			band_chunk_size=load_band_chunk,
+    			k_chunk_size=(chunks['centroid_k_chunk'] if chunks is not None
+    			              else zeta_contract.loader_k_chunk),
+    			bispinor_lift=(representation.charge_lift or "raw"),
+    			k_domain=sym.parent_k_domain)
     from .wavefunction_bundle import parent_faces
     _parent_green_faces = parent_faces(parent_y, parent_x, mesh_xy=mesh_xy,
         layout="face" if cfg.memory.low_mem_bands else "axis")
