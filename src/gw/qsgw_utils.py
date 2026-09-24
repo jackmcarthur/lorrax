@@ -102,6 +102,7 @@ def sigma_grid_edge_ambiguity(
     sigma_c_diag_w_kn_ev: np.ndarray,
     omega_grid_ev: np.ndarray,
     e_kn_ev: np.ndarray,
+    growth_window_ev: tuple[float, float] | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """States whose QSGW diagonal fixed point is not unique at a grid edge.
 
@@ -126,6 +127,14 @@ def sigma_grid_edge_ambiguity(
     Σ_c(ω) samples ``(nω, nk, nb)`` (eV, complex or real), the increasing
     grid ``(nω,)`` and the evaluation energies ``(nk, nb)``, all on the same
     E_F-relative reference.  Returns ``(ambiguous_kn, jump_kn_ev)``.
+
+    ``growth_window_ev`` is the SC loop's padded window (``scissor.
+    sc_padded_window_ev``): a state inside it GROWS the grid instead of
+    leaving it, so the Σ(E)/Σ(0) switch sits at the outer of the grid edge
+    and the window edge.  Where the window reaches past the grid, Σ there is
+    unsampled and the sampled edge value stands in for it (an estimate).
+    Fe 4^3 at +28 eV: without this, 12 states near the +28 grid edge were
+    flagged at map 0 although the grid would have grown under them.
     """
     omega = np.asarray(omega_grid_ev, dtype=np.float64)
     e = np.asarray(e_kn_ev, dtype=np.float64)
@@ -136,6 +145,8 @@ def sigma_grid_edge_ambiguity(
             f"grid {omega.shape} x energies {e.shape}")
     at_zero = interp_along_omega(sig, omega, np.zeros_like(e))
     lo, hi = float(omega[0]), float(omega[-1])
+    if growth_window_ev is not None:
+        lo, hi = min(lo, float(growth_window_ev[0])), max(hi, float(growth_window_ev[1]))
     use_top = np.abs(e - hi) <= np.abs(e - lo)
     edge = np.where(use_top, hi, lo)
     at_edge = np.where(use_top, sig[-1], sig[0])
