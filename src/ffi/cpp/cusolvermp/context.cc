@@ -217,29 +217,31 @@ int64_t create_context(int rank, int world_size,
             p, q, grid_layout_col_major ? "col-major" : "row-major");
     }
 
-    // Actionable warnings for known-broken combinations:
-    //   * 0.6.x + Px>1 AND Py>1: getrf/getrs returns silent wrong answers.
+    // Known-broken combinations:
+    //   * 0.6.x + Px>1 AND Py>1: getrf/getrs return silent wrong answers.
     //     Reproduced 2026-05-09 across (N, NRHS) on a 2x2 mesh; the
     //     cuSolverMp 0.7.0 release notes' "non-square grid" fix is in
     //     fact the CAL→NCCL ABI shift below and applies to ALL 2D grids
     //     (square or not) once the comm type is correct.  1×N and N×1
     //     are unaffected because the broken degenerate-block-cyclic path
-    //     isn't triggered there.
+    //     isn't triggered there.  LORRAX meshes are square, so this
+    //     REFUSES on every rank (the predicate is rank-independent).
     //   * 0.8.0 + NCCL < 2.27: dlopen fails with "undefined symbol:
     //     ncclCommWindowRegister".  We can't reach this point if the
     //     symbol is missing (load fails before this constructor runs),
     //     but a soft warning at NCCL < 2.27 is still useful for any
     //     future cusolverMp ≥ 0.8 binary.
+    if (mp_version < 700 && p > 1 && q > 1) {
+        std::ostringstream os;
+        os << "GATE cusolvermp_2d_grid_version: got cuSOLVERMp " << mp_major
+           << "." << mp_minor << "." << mp_patch << " on a " << p << "x" << q
+           << " process grid; want cuSOLVERMp >= 0.7.0 on any grid with Px > 1"
+           << " and Py > 1 (0.6.x getrf/getrs return wrong answers there,"
+           << " silently); fix: load cuSOLVERMp >= 0.7 (the lorrax_A bundle"
+           << " ships 0.9.1); doc: docs/architecture/ffi_layout.md §4.";
+        throw std::runtime_error(os.str());
+    }
     if (rank == 0) {
-        if (mp_version < 700 && p > 1 && q > 1) {
-            std::fprintf(stderr,
-                "[lorrax cusolverMp] WARNING: cuSolverMp %d.%d.%d on a 2D "
-                "process grid (%dx%d) has a known correctness bug in "
-                "getrf/getrs that returns wrong answers silently.  "
-                "Use a 1xN or Nx1 mesh, or upgrade to ≥0.7.0 (where the "
-                "comm-handle ABI shifts from CAL to NCCL).\n",
-                mp_major, mp_minor, mp_patch, p, q);
-        }
         if (mp_version >= 800 && nccl_version < 22700) {
             std::fprintf(stderr,
                 "[lorrax cusolverMp] WARNING: cuSolverMp %d.%d.%d expects "

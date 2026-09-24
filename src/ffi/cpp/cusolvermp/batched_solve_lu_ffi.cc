@@ -45,11 +45,14 @@
 // cross-stream event.  cuSOLVERMp requires LOCr(M_A) + MB_A pivot entries
 // per rank, including the extra block used by distributed row interchanges.
 
+#include <cctype>
 #include <complex>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <exception>
 #include <sstream>
+#include <string>
 
 #include <cuda_runtime.h>
 #include <cusolverMp.h>
@@ -66,6 +69,26 @@ namespace ffi = ::xla::ffi;
 using lorrax_ffi::cusolvermp::LorraxCusolverMpCtx;
 using lorrax_ffi::cusolvermp::ensure_workspace;
 namespace mp = lorrax_ffi::cusolvermp::mp;
+
+// LORRAX_LU_NO_PIVOT (debug A/B), the *bool* grammar of
+// runtime/env_flags.env_bool: unset, blank, 0, false, no or off keep partial
+// pivoting; 1, true, yes or on disable it; any other value keeps pivoting
+// (the safe direction) and is announced once.  Read once per process.
+static bool lu_no_pivot() {
+    static const bool off = [] {
+        const char* v = std::getenv("LORRAX_LU_NO_PIVOT");
+        if (v == nullptr || *v == '\0') return false;
+        std::string s(v);
+        for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        if (s == "1" || s == "true" || s == "yes" || s == "on") return true;
+        if (s == "0" || s == "false" || s == "no" || s == "off") return false;
+        std::fprintf(stderr,
+            "*** LORRAX SANITY: LORRAX_LU_NO_PIVOT=%s is not a bool; "
+            "cuSOLVERMp LU keeps partial pivoting.\n", v);
+        return false;
+    }();
+    return off;
+}
 
 static ffi::Error cross_stream_wait_pooled(cudaStream_t waiter,
                                            cudaStream_t signaller,
@@ -198,7 +221,7 @@ static ffi::Error BatchedSolveLuImpl(
         if (h_ws_s_buf) std::free(h_ws_s_buf);
     };
 
-    const bool no_pivot = std::getenv("LORRAX_LU_NO_PIVOT") != nullptr;
+    const bool no_pivot = lu_no_pivot();
 
     for (int64_t q = 0; q < nq; ++q) {
         T* A_slice_ptr = d_A_factored_out + q * A_slice;
@@ -282,7 +305,7 @@ static ffi::Error BatchedGetrfImpl(
                                    mp::CudaDataTypeOf<T>::value,
                                    n, n, mb, nb, 0, 0, lld_A),
         CUSOLVER_STATUS_SUCCESS, "cusolverMpCreateMatrixDesc(A)");
-    const bool no_pivot = std::getenv("LORRAX_LU_NO_PIVOT") != nullptr;
+    const bool no_pivot = lu_no_pivot();
     int64_t* piv0 = no_pivot ? nullptr : d_ipiv_out;
     size_t d_ws = 0, h_ws = 0;
     cusolverStatus_t mp_st = mp::GetrfBufferSize<T>(
@@ -359,7 +382,7 @@ static ffi::Error BatchedGetrsImpl(
                                    mp::CudaDataTypeOf<T>::value,
                                    n, nrhs, mb_b, nb_b, 0, 0, lld_A),
         CUSOLVER_STATUS_SUCCESS, "cusolverMpCreateMatrixDesc(B)");
-    const bool no_pivot = std::getenv("LORRAX_LU_NO_PIVOT") != nullptr;
+    const bool no_pivot = lu_no_pivot();
     int64_t* piv0 = no_pivot ? nullptr : const_cast<int64_t*>(d_ipiv);
     size_t d_ws = 0, h_ws = 0;
     cusolverStatus_t mp_st = mp::GetrsBufferSize<T>(

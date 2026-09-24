@@ -243,9 +243,8 @@ else could, and what proves it built right.
 * The spatial 3-D FFT has no build or run check on either machine.
 * No gate observes which vendor answered a distributed `eigh`, Cholesky or
   LU; only the `distrib_la` contract tests exercise them.
-* `LORRAX_LU_NO_PIVOT` disables cuSOLVERMp pivoting from the environment with
-  no gate; the handler tests presence, so any value, `0` included, turns
-  pivoting off.
+* `LORRAX_LU_NO_PIVOT` (a *bool*) disables cuSOLVERMp pivoting from the
+  environment with no gate.
 
 ### 3c. Which FFT engine the host library binds
 
@@ -299,9 +298,9 @@ prints `[lorrax cusolverMp] library X.Y.Z, NCCL …, comm path: NCCL|CAL`.
 * **A `HAVE_CAL=OFF` build refuses a pre-0.7 library** at context creation. A
   `HAVE_CAL=ON` build carries both paths and `DT_NEEDED` `libcal.so.0`.
 * **0.6.x is wrong on a 2-D grid.** With `Px > 1` and `Py > 1` its
-  `getrf`/`getrs` return wrong answers, and the handler only warns. LORRAX
-  meshes are square, so every run at P ≥ 4 is affected: never run a pre-0.7
-  cuSOLVERMp.
+  `getrf`/`getrs` return wrong answers, so context creation refuses that
+  pairing (`GATE cusolvermp_2d_grid_version`). LORRAX meshes are square, so a
+  `HAVE_CAL=ON` build with a pre-0.7 library runs only at P = 2.
 * **≥ 0.8 needs NCCL ≥ 2.27** (`ncclCommWindowRegister`); the handler warns
   when the loaded NCCL is older.
 
