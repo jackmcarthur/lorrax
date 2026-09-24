@@ -257,10 +257,10 @@ def test_the_scan_body_moves_no_field_and_no_k_stack():
     rho_from_wfns(psi_j, occ, kw, U=U_j, **args)
     from common.wfn_transforms import _KERNEL_CACHE
     # Key: (name, psi.shape, grid, volume, f_spin, have_U, current,
-    # charge_ns, spin_matrix, sym_perm shape, plan, mesh, psi spec).
-    hits = [(k[10], v) for k, v in _KERNEL_CACHE.items()
+    # charge_ns, spin_matrix, per_k, sym_perm shape, plan, mesh, psi spec).
+    hits = [(k[11], v) for k, v in _KERNEL_CACHE.items()
             if k[0] == "rho_density_scan" and k[1] == psi.shape
-            and k[5] and k[6] and k[10][0] == "g_split"]
+            and k[5] and k[6] and k[11][0] == "g_split"]
     assert len(hits) == 1, "exactly one g_split four-current executable"
     (plan, fn), = hits
     k_tile = int(plan[2])
