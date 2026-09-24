@@ -399,7 +399,7 @@ rest.
 |---|---|---|
 | `JAX_ENABLE_X64` | `1` | 64-bit precision (required for GW).  Runtime-owned: applied even when jax was imported first, and a resolved `False` refuses at startup (`LORRAX_ALLOW_X64_OFF=1` continues, announced uncertified) |
 | `JAX_PLATFORMS` | `cuda,cpu` (GPU) / `cpu` (CPU runs) | an explicit `cpu` also arms the CUDA-plugin-skip (below) |
-| `XLA_PYTHON_CLIENT_PREALLOCATE` | `false` | don't pre-grab a fixed XLA pool (set by `runtime.set_default_env()`) |
+| `XLA_PYTHON_CLIENT_PREALLOCATE` | `true` under `cuda_async`, else `false` | reserve the async pool (it otherwise re-maps memory on every large launch); BFC keeps the pool un-grabbed (set by `runtime.set_default_env()`, §2.1) |
 | `HDF5_USE_FILE_LOCKING` | `FALSE` | Lustre HDF5 compatibility |
 
 There is one repository-configured LORRAX compile-cache owner:
@@ -436,6 +436,19 @@ surfaces as `cusolverMpSyevd: status=7`.
 
 Three standing corrections:
 
+* **Under `cuda_async` the pool is reserved by default**
+  (`XLA_PYTHON_CLIENT_PREALLOCATE=true`, `runtime._default_preallocate`).
+  An unreserved async pool re-maps device memory on every executable
+  launch that needs a large temporary: ~30 ms of buffer allocation plus a
+  25-110 ms stall at the launch's first host sync, device idle. CrI3 8×8
+  GN-PPM P4 on A100-40GB, one node (sandbox
+  `runs/runtime/sigma_tau_sweep_20260924`, s05_ab4, 2026-09-24): whole run
+  204.3 → 175.0 s, Σ τ sweep 15.6 → 4.8 s, ζ fit 90.8 → 82.6 s. XLA's cap
+  is the same `MEM_FRACTION` either way, so the planners' budgets do not
+  move (the client then also reports `bytes_limit`); what reservation takes
+  away is only the opportunistic use, by allocations outside XLA (NCCL,
+  cuSOLVERMp, CAL), of pool memory XLA is not using at that moment. An
+  explicit `XLA_PYTHON_CLIENT_PREALLOCATE=false` restores the old pool.
 * `runtime.set_default_env()` deliberately leaves the allocator **unset**
   (= BFC). On sm_75 (Frontera rtx) `cuda_async` additionally needs the
   command-buffer `XLA_FLAGS` restriction — `config/frontera/gpu_env.sh`
@@ -495,7 +508,7 @@ the CUDA plugin cold load hiding inside the first `jax.devices()`.
 |---|---|
 | `No GPU/TPU found, falling back to CPU` | `nvidia-smi`; `CUDA_VISIBLE_DEVICES`; jaxlib must be the CUDA build |
 | `RESOURCE_EXHAUSTED: Out of memory` | check `memory_per_device_gb` and the A–F planner report; lower `band_chunk_size`, `r_chunk_size`, or `gflat_chunk_size` for Peaks A/C/D, and `vq_g_chunk_size` only for the Vq kernel's inner G workspace; zero selects the live auto policies documented in [memory-model](../architecture/memory-model.md) |
-| `cusolverMpSyevd: status=7` + NCCL error 1 | XLA pre-allocated the pool — confirm `XLA_PYTHON_CLIENT_PREALLOCATE=false` and no user `MEM_FRACTION` override (§2.1) |
+| `cusolverMpSyevd: status=7` + NCCL error 1 | XLA pre-allocated too much of the card for NCCL/CAL — check for a user `MEM_FRACTION` override above 0.85; under `cuda_async` the pool is reserved by default, so try `XLA_PYTHON_CLIENT_PREALLOCATE=false` (§2.1) |
 | a CPU/MPI run exits rc=1 **after** succeeding | its driver did not cross the shared `runtime.run_main_and_finalize()` boundary (the older Frontera overlay is a driver-specific fallback; [transports](transports.md)) |
 | HDF5 "file is already open" on Lustre | `HDF5_USE_FILE_LOCKING=FALSE` |
 | wrong data from `psum_scatter` on CPU, rc=0 | you are on gloo — see [transports](transports.md); this is the corruption that moved LORRAX to `impl=mpi` |

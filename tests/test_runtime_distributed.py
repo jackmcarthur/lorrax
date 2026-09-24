@@ -185,6 +185,20 @@ def test_set_default_env_disables_gpu_preallocation(clean_env):
     assert "TF_GPU_ALLOCATOR" not in os.environ
 
 
+def test_set_default_env_reserves_the_cuda_async_pool(clean_env):
+    """Under cuda_async the pool is reserved by default (preallocate=true).
+
+    An unreserved cudaMallocAsync pool re-maps device memory on every large
+    executable launch: CrI3 8x8 P4, one node, 2026-09-24 -- whole run
+    204.3 -> 175.0 s, Sigma tau sweep 15.6 -> 4.8 s (sandbox
+    runs/runtime/sigma_tau_sweep_20260924, s05_ab4).  The allocator name is
+    compared after jaxlib's own lowercasing.
+    """
+    clean_env.setenv("XLA_PYTHON_CLIENT_ALLOCATOR", "CUDA_async")
+    set_default_env()
+    assert os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] == "true"
+
+
 def test_set_default_env_preallocate_override_wins(clean_env):
     """A deployment script's explicit export must beat our setdefault.
 

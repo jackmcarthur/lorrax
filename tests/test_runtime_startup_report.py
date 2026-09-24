@@ -656,7 +656,19 @@ def test_a_non_canonical_allocator_pair_says_so():
                              "error": None, "env": env,
                              "corroboration": "arena", "disagreement": "",
                              "accounting_present": True}))
-    assert "NOT LORRAX's canonical pair" in out
+    assert "NOT a LORRAX canonical pair" in out
+
+
+def test_a_reserved_cuda_async_pool_is_canonical():
+    env = dict(_GPU_ENV, allocator="cuda_async", allocator_raw="cuda_async",
+               preallocate=True, preallocate_raw="true")
+    out = _text(_facts(backend="gpu",
+                       pool={"stats": {"bytes_limit": 1, "bytes_in_use": 1,
+                                       "peak_bytes_in_use": 1},
+                             "error": None, "env": env,
+                             "corroboration": "arena", "disagreement": "",
+                             "accounting_present": True}))
+    assert "a LORRAX canonical pair" in out and "NOT a LORRAX" not in out
 
 
 def test_cpu_run_says_the_gpu_knobs_do_not_apply():

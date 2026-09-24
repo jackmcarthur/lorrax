@@ -738,12 +738,14 @@ def set_default_env(*, platform: str = "gpu") -> None:
     os.environ.setdefault("HDF5_USE_FILE_LOCKING", "FALSE")
     if platform == "gpu":
         os.environ.setdefault("JAX_PLATFORMS", "cuda,cpu")
-        os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
     elif platform == "cpu":
         os.environ["JAX_PLATFORMS"] = "cpu"
     else:
         raise ValueError(f"platform must be 'gpu' or 'cpu', got {platform!r}")
     _check_allocator_env()
+    if platform == "gpu":
+        os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE",
+                              _default_preallocate())
     tune_glibc_malloc()
     skip_gpu_plugin_discovery()
     resolved_platforms = os.environ.get("JAX_PLATFORMS", "")
@@ -752,6 +754,27 @@ def set_default_env(*, platform: str = "gpu") -> None:
     set_default_xla_gpu_autotune(platform=xla_platform)
     from runtime.network_env import configure_gpu_network
     configure_gpu_network(platform=xla_platform, say=rank0_print)
+
+
+def _default_preallocate() -> str:
+    """``"true"`` under ``cuda_async``, ``"false"`` under every other allocator.
+
+    An UNRESERVED cudaMallocAsync pool re-maps device memory on every
+    executable launch that needs a large temporary: measured on the CrI3 8x8
+    GN-PPM deck at P4 (A100-40GB, MEM_FRACTION 0.85, 2026-09-24, sandbox
+    runs/runtime/sigma_tau_sweep_20260924, one node): ~30 ms of "Build buffer
+    allocations" plus a 25-110 ms stall at the first host sync of each
+    Sigma tau executable, with the device idle.  Reserving the pool
+    (``preallocate=true``) took the whole run 204.3 -> 175.0 s (tau sweep
+    15.6 -> 4.8 s, zeta fit 90.8 -> 82.6 s).  XLA's pool is capped at the
+    same fraction either way, so the memory planners' budget is unchanged
+    (the client now also reports ``bytes_limit``); what reservation removes
+    is only the OPPORTUNISTIC use, by allocations outside XLA, of pool memory
+    XLA is not using at that moment.  BFC keeps the preallocation-off
+    default argued above: it never returns memory, so it has no re-map cost.
+    """
+    allocator = os.environ.get(_ALLOCATOR_ENV, "").lower()
+    return "true" if allocator == "cuda_async" else "false"
 
 
 #: The four values jaxlib accepts for ``XLA_PYTHON_CLIENT_ALLOCATOR``.
@@ -2758,13 +2781,13 @@ def format_startup_report(f: dict) -> list:
             f"{f.get('backend')} backend, and that backend keeps no arena "
             f"accounting, so no allocator figure is reported.")
     if env is not None and is_gpu:
-        canonical = (not env["preallocate"]) and env["allocator_raw"] is None
-        why = (" — LORRAX's canonical pair: preallocation off so the cuFFT "
-               "and cuSOLVERMp arenas can allocate outside XLA, and the "
-               "allocator left unset because BFC is the only kind that keeps "
-               "memory_stats() populated" if canonical else
-               " — NOT LORRAX's canonical pair, which is preallocate=false "
-               "with the allocator left unset (BFC); a caller overrode it")
+        canonical = ((not env["preallocate"]) and env["allocator_raw"] is None
+                     or env["preallocate"] and env["allocator"] == "cuda_async")
+        why = (" — a LORRAX canonical pair: BFC with preallocation off, or "
+               "cuda_async with its pool reserved (an unreserved async pool "
+               "re-maps memory on every large launch)" if canonical else
+               " — NOT a LORRAX canonical pair (BFC with preallocation off, "
+               "or cuda_async with preallocation on); a caller overrode it")
         add(f"  XLA_PYTHON_CLIENT_PREALLOCATE resolved to "
             f"{'true' if env['preallocate'] else 'false'} (raw "
             f"{env['preallocate_raw']!r}) and XLA_PYTHON_CLIENT_ALLOCATOR "
