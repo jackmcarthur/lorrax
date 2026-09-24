@@ -339,8 +339,8 @@ def _fit_mubatch(
     plan_id = zmb.identity_kplan(kv, centroid_indices, fft_grid, mesh_xy, ns)
     # μ-owned rows: rank p owns slots p·c + [0, c) of every batch, whole
     # orbits per owner (the owner unfolds its own pair projectors).
-    mb = zmb.owner_orbit_batches(k_unfold_plan, mu_pad, P_,
-                                 c_target=max(1, int(plan.b) // P_))
+    mb = zmb.best_owner_orbit_batches(k_unfold_plan, mu_pad, P_,
+                                      c_max=max(1, int(plan.b) // P_))
     b = int(mb.b)
     kernel = zmb.make_route_g_kernel(
         mesh=mesh_xy, plan_id=plan_id, kgrid=kgrid, fft_grid=fft_grid, ns=ns, b=b,
@@ -370,7 +370,8 @@ def _fit_mubatch(
     tabs = (tuple(_device_put_process_local(np.asarray(a), rep) for a in cyl),
             tuple(_device_put_process_local(a, rep) for a in zt))
     print_fn(f"  μ-batch fit (route G): {store.n_batch} batches of {b} centroids "
-             f"(whole orbits per owner), {int(plan.r_sub)} planes per group, "
+             f"(whole orbits per owner; planned {int(plan.b)}), "
+             f"{int(plan.r_sub)} planes per group, "
              f"{n_par} parent k -> {nk}, ψ sphere {ngk_psi} "
              f"slots ({s_ax.carrier // P_}/rank), Z store {plan.placement}")
 

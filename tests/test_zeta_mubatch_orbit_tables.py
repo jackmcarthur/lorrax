@@ -169,3 +169,18 @@ def test_route_g_planner_refuses_distributed_tier():
         plan_zeta_route_g(meta=meta, mesh_xy=4, n_q_selected=2, ngkmax=64,
                           psi_ngkmax=64, fit_nb=8, n_col=4, n_s=8,
                           zeta_tier="distributed", budget_gb=40.0)
+
+
+def test_best_owner_batching_never_packs_worse_than_the_planned_bin(acubic):
+    """The chosen bins are no wider than planned and cost no more padded work
+    than packing at the planned width."""
+    from isdf.zeta_mubatch import best_owner_orbit_batches, owner_orbit_batches
+    plan, _ = acubic
+    mu_pad = int(plan.n_centroid_packed)
+    for c_max in (3, 5, 7, 11):
+        got = best_owner_orbit_batches(plan, mu_pad, 4, c_max=c_max)
+        at_plan = owner_orbit_batches(plan, mu_pad, 4, c_target=c_max)
+        assert got.c <= max(c_max, at_plan.c)
+        assert got.n_batch * (got.c + 1) <= at_plan.n_batch * (at_plan.c + 1)
+        live = got.mu[got.mu >= 0]
+        assert np.array_equal(np.sort(live), np.unique(live))   # each centroid once

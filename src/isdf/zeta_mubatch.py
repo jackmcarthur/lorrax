@@ -113,6 +113,28 @@ def owner_orbit_batches(plan, mu_pad: int, n_ranks: int, *, c_target: int):
         slot_of_packed=np.asarray(bins.packed_to_slot(int(mu_pad)), dtype=np.int32))
 
 
+def best_owner_orbit_batches(plan, mu_pad: int, n_ranks: int, *, c_max: int):
+    """The whole-orbit batching with the least padded work, bins of at most ``c_max``.
+
+    Bins hold whole orbits, so the planned ``c = b/P`` can pack badly (CrI3
+    8x8 P16, p4r_cri3_p16: c = 19 packs 8 batches of 18-slot bins, c = 12
+    the same 8 batches of 12).  Each candidate c ≤ ``c_max`` is packed and
+    costed ``n_batch·(c + 1)``: a batch pays its per-centroid owner work plus
+    about one centroid's worth of fixed cost (collectives, launches).
+    ponytail: a linear scan over c and a fixed-cost guess of one centroid;
+    move the choice into the planner (with the orbit sizes) if either binds.
+    """
+    best = None
+    for c in range(max(1, int(c_max)), 0, -1):
+        mb = owner_orbit_batches(plan, mu_pad, n_ranks, c_target=c)
+        if best is not None and mb.c > c_max:
+            continue                      # an orbit wider than c: no gain
+        cost = mb.n_batch * (mb.c + 1)
+        if best is None or cost < best[0]:
+            best = (cost, mb)
+    return best[1]
+
+
 def typed_child_G_tables(plan, *, fft_grid, sphere_par, gvec_child,
                          ngk_child, k_child):
     """The r-space typed transport of :func:`typed_children_psi_G` as G-space
