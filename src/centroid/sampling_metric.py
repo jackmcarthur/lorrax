@@ -282,7 +282,8 @@ def build_feature_metric_diagonal(
     FFT-grid pullback of that row is applied once at the end.
     """
     from common import timing
-    from common.collectives import process_rank_world, single_device_mesh
+    from common.collectives import (gather_to_host, process_rank_world,
+                                    single_device_mesh)
     from common.wfn_layout import band_sphere_spec
     from gw.qsgw_density import rho_from_wfns
     from wfn_loader import IBZRows, WfnLoader
@@ -406,7 +407,8 @@ def build_feature_metric_diagonal(
             jnp.asarray(pullback[0], dtype=jnp.int32),
             jnp.asarray(1.0, dtype=jnp.float64))
         del pullback
-    metric = np.asarray(metric_dev, dtype=np.float64).reshape(fft_grid)
+    metric = np.asarray(gather_to_host(metric_dev),
+                        dtype=np.float64).reshape(fft_grid)
     scale = float(np.max(np.abs(metric)))
     negative_tolerance = 256.0 * np.finfo(np.float64).eps * scale
     minimum = float(np.min(metric))
