@@ -49,7 +49,6 @@ do not implicitly suppress tests.
 {"nodeid":"tests/test_damped_line_tables.py::test_the_ported_composite_is_the_shipped_evaluator_rule[v1_A20_e1e-06]","reason":"shipped damped-line catalog does not reproduce its recorded certification values","owner":"minimax/quadrature"}
 {"nodeid":"tests/test_damped_line_tables.py::test_the_ported_composite_is_the_shipped_evaluator_rule[v1_A60_e1e-08]","reason":"shipped damped-line catalog does not reproduce its recorded certification values","owner":"minimax/quadrature"}
 {"nodeid":"tests/test_dft_gauge_vertices.py::test_icl_kminusq_jet_reuses_uniform_current_and_contact_exactly","reason":"finite-q jet does not exactly reuse the uniform current/contact payload","owner":"GW/head"}
-{"nodeid":"tests/test_driver_debug_print_contract.py::test_driver_debug_does_not_force_jax_cache_miss_explanations","reason":"environment registry is missing the JAX cache-miss default row","owner":"runtime/docs"}
 {"nodeid":"tests/test_exciton_bands_refit_window.py::test_the_refusal_names_the_window_and_the_basis_not_the_tolerance","reason":"the refusal text no longer names the required orthonormality condition","owner":"BSE/exciton-bands"}
 {"nodeid":"tests/test_ff_compute_mode.py::test_no_module_dispatches_on_the_mode_through_a_bare_else","reason":"compute-mode exhaustiveness/source-documentation contract is violated","owner":"GW/config"}
 {"nodeid":"tests/test_gw_jax_regression.py::test_gnppm_matches_reference","reason":"frozen GW reference differs from the current computed result","owner":"GW/physics"}
