@@ -132,7 +132,8 @@ def make_route_g_kernel(*, mesh: Mesh, plan_id, kgrid, fft_grid, ns: int, b: int
     n_grp = pl_ax.carrier // int(n_pg)
     q_sel = np.asarray(q_sel, dtype=np.int32)
     Q = int(q_axis.logical)
-    q_neg = np.asarray(q_neg, dtype=np.int32)
+    # None: equal L/R windows, the pair equations are already symmetric.
+    q_neg = None if q_neg is None else np.asarray(q_neg, dtype=np.int32)
     qv = np.asarray(qvec_frac, dtype=np.float64)
     r_pl = int(n_pg) * ps
     p_l, ph_l = _conv_kpair_static_gamma(None, ns)
@@ -146,7 +147,8 @@ def make_route_g_kernel(*, mesh: Mesh, plan_id, kgrid, fft_grid, ns: int, b: int
     ib = (np.arange(ps) // n_c).astype(np.float64)
     ic = (np.arange(ps) % n_c).astype(np.float64)
     key = ('route_g', _mesh_id(mesh), id(plan_id), tuple(kgrid), tuple(fft_grid), ns, b,
-           hash(q_sel.tobytes()), q_axis, hash(q_neg.tobytes()), hash(qv.tobytes()),
+           hash(q_sel.tobytes()), q_axis,
+           None if q_neg is None else hash(q_neg.tobytes()), hash(qv.tobytes()),
            int(n_col), int(n_s), int(n_pg), int(axis), stop_at)
     hit = _kernel_cache.get(key)
     if hit is not None:
@@ -219,7 +221,8 @@ def make_route_g_kernel(*, mesh: Mesh, plan_id, kgrid, fft_grid, ns: int, b: int
                 pair_kernel=pair_kernel)                           # (nk, c, r_pl)
             if stop_at == 'kconv':
                 return acc + jnp.sum(jnp.abs(Z)), None
-            Z = Z + jnp.conj(jnp.take(Z, jnp.asarray(q_neg), axis=0))
+            if q_neg is not None:
+                Z = Z + jnp.conj(jnp.take(Z, jnp.asarray(q_neg), axis=0))
             Z = jnp.take(Z, jnp.asarray(q_sel), axis=0).reshape(Q, c, n_pg, ps)
             qin = jnp.exp(-2j * jnp.pi * (jnp.asarray(qv[:, b_ax])[:, None] * ib[None, :] / n_b
                                           + jnp.asarray(qv[:, c_ax])[:, None] * ic[None, :] / n_c))
