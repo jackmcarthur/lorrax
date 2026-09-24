@@ -1685,20 +1685,22 @@ def _get_read_sm(mesh, partition_spec, *,
 #: the operands' (shape, dtype, sharding).  Same key space as that cache: a
 #: handful of write signatures per run.
 _COMPILED_WRITES: dict = {}
+_COMPILED_WRITES_LOCK = threading.Lock()
 
 
 def _compiled_write(sm, *args):
     """The compiled write executable for these operands, built on THIS thread.
 
-    ``LORRAX_WRITE_NO_JIT=1`` hands back the bare shard_map, which has no
-    ``lower``; it is returned unchanged.
+    Only jitted writers reach here (``LORRAX_WRITE_NO_JIT=1`` dispatches its
+    eager shard_map on the calling thread instead).  The lock makes the
+    check-and-build one step for two SlabIO objects on two threads.
     """
-    if not hasattr(sm, "lower"):
-        return sm
-    key = (sm, *((tuple(a.shape), a.dtype, a.sharding) for a in args))
-    compiled = _COMPILED_WRITES.get(key)
-    if compiled is None:
-        compiled = _COMPILED_WRITES[key] = sm.lower(*args).compile()
+    key = (sm, *((tuple(a.shape), a.dtype, a.sharding,
+                  bool(getattr(a, "weak_type", False))) for a in args))
+    with _COMPILED_WRITES_LOCK:
+        compiled = _COMPILED_WRITES.get(key)
+        if compiled is None:
+            compiled = _COMPILED_WRITES[key] = sm.lower(*args).compile()
     return compiled
 
 
@@ -2019,6 +2021,9 @@ class _FfiBackend(_DatasetGeometry):
                 self._drain_pending()
             except BaseException as exc:
                 self._context_error = exc
+            if getattr(self, "_context_error", None) is None:
+                # Worker errors are sticky and never raised by the drain.
+                self._context_error = self._dispatcher.error
             # Construction precedes __enter__: an initialization failure
             # must itself bring every rank through collective close.
             from common.collectives import agree_io_error
@@ -2089,6 +2094,11 @@ class _FfiBackend(_DatasetGeometry):
 
         The byte count is what the drain actually moved, which is the
         numerator the caller needs to turn a duration into a rate.
+
+        Never raises a writer error.  That error is sticky on the dispatcher
+        and every rank agrees on it in :meth:`close`: a rank that raised
+        here would skip the collectives its peers are still inside
+        (``common.async_io`` has the reproduction).
         """
         self._dispatcher.drain()
         nbytes, self._queued_bytes = self._queued_bytes, 0
@@ -2438,11 +2448,27 @@ class _FfiBackend(_DatasetGeometry):
         # and refused (bispinor_debug at P4 under pytest,
         # lx-Xg4-100442-970539-2773).  Compiling here puts it at a fixed
         # point in program order on every rank.
-        call = _compiled_write(sm, A, handle_arr, offset_arr, valid_shape_arr)
+        if hasattr(sm, "lower"):
+            call = _compiled_write(sm, A, handle_arr, offset_arr, valid_shape_arr)
 
-        def _task():
-            tok = call(A, handle_arr, offset_arr, valid_shape_arr)
-            tok.block_until_ready()
+            def _task():
+                tok = call(A, handle_arr, offset_arr, valid_shape_arr)
+                tok.block_until_ready()
+        else:
+            # ``LORRAX_WRITE_NO_JIT=1``: an eager shard_map compiles at its
+            # first CALL, so the call itself is made here, on the calling
+            # thread; the worker only waits for it.  A dispatch error is
+            # handed to the worker so it is sticky like any other.
+            try:
+                tok, dispatch_error = sm(
+                    A, handle_arr, offset_arr, valid_shape_arr), None
+            except BaseException as exc:                      # noqa: BLE001
+                tok, dispatch_error = None, exc
+
+            def _task():
+                if dispatch_error is not None:
+                    raise dispatch_error
+                tok.block_until_ready()
 
         self._queued_bytes += int(A.nbytes)
         self._dispatcher.submit(_task)
@@ -2677,13 +2703,11 @@ class _FfiBackend(_DatasetGeometry):
             print(f"  [SlabIO.close] draining {_pending} pending writes "
                   f"for {os.path.basename(self.path)} …", flush=True)
         # ── A rank must not skip a collective because of its OWN error ──
-        # decisions.md 2026-08-04.  A worker exception surfaces on this
-        # rank's ``drain()``; if it propagated from here it would skip the
-        # collective ``H5Fclose`` below on THIS rank only, and the peers
-        # would sit inside it with no message.  ``AsyncDispatcher.
-        # _raise_if_error`` also CLEARS the error as it raises, so nothing
-        # downstream would re-raise it either.  Record it, complete the
-        # teardown every rank is inside, then raise at the end.
+        # decisions.md 2026-08-04.  A writer error is sticky on the
+        # dispatcher and nothing raised it earlier: this rank has issued
+        # every collective its peers did.  Record it, complete the teardown
+        # every rank is inside, then agree on it (``agree_io_error`` below)
+        # so every rank raises the same message.
         _worker_error: BaseException | None = (
             getattr(self, "_context_error", None) if self.mode != "r" else None)
         _drained_bytes = 0
@@ -2710,6 +2734,8 @@ class _FfiBackend(_DatasetGeometry):
         except BaseException as exc:                          # noqa: BLE001
             if _worker_error is None:
                 _worker_error = exc
+        if _worker_error is None:
+            _worker_error = self._dispatcher.error
         _t_join = _time.perf_counter() - _t0
         if _worker_error is not None:
             print(f"  [SlabIO.close rank={jax.process_index()}] write worker "
