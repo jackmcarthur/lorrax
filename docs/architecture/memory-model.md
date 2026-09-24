@@ -119,6 +119,14 @@ live per block  ≈ 4 · 16·N_k·μ²/P          (Green, transform, product, ac
 extra GEMM work = N_k/n_par                full-k blocks instead of parent Greens
 ```
 
+With symmetry, χ₀ keeps the parent GEMM instead: each τ builds the two
+parent Greens and transports every full-k block from its parent source
+blocks, `G_ab(k) = Σ_cd U_k[a,c] conj(U_k[b,d]) T_k(G_cd)`, summing only the
+`(c, d)` with a nonzero coefficient at some k (two per block for a monomial
+magnetic group). Its live set is `4·(n_par/N_k)·G_tile` of parent Greens and
+partners plus the block set, chosen when that fits; the ψ-unfold route is the
+fallback.
+
 `gw.greens_function_kernel.spin_pairs_needed` streams a stage only when its
 whole-spin live set exceeds the target: `3·G_tile` for χ₀ (Gv, Gc and the
 unfold transient), `2·G_tile` for Σ_x, the Coulomb hole and Σ_c(τ) (Σ_k and
