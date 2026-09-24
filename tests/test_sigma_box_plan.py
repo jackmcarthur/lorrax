@@ -216,6 +216,63 @@ def test_containment_cache_reuses_rules_without_a_builder_call(
         "window_tau_pairs"]
 
 
+def test_cold_plan_serves_the_rules_a_warm_rerun_would(monkeypatch, tmp_path):
+    """Rule choice is a function of the inputs, not of rank timing.
+
+    The pole-tail window's rule contains the state-tail box and is smaller.
+    A lookup that raced the pole-tail store used to decide which rule the
+    state tail got; now every miss is built first and the plan is resolved
+    in a fixed order, so a cold plan equals its warm rerun.
+    """
+    def sized(box, eps, **kwargs):
+        rule = _fake_rule(box, eps, **kwargs)
+        wide = box[1] - box[0] > 1.0
+        count = 2 if wide else 3
+        return UniformRule(
+            times=np.linspace(0.1, 0.4, count) + 0.02j,
+            weights=np.full(count, 0.2 - 0.05j), box=rule.box, eps=rule.eps,
+            relative=rule.relative, theta_deg=5.0, rank=3,
+            sup_error=0.5 * eps, kappa_max=1.2, seconds=0.0)
+
+    monkeypatch.setattr("gw.sigma_box_plan.build_uniform_rule", sized)
+    real_poles = tuple((index, {
+        key: None if row is None else (*row[:2], 0.05, 0.05)
+        for key, row in groups.items()}) for index, groups in _summaries())
+    args = dict(eps=1.0e-4, cache_dir=str(tmp_path),
+                print_fn=lambda *_args, **_kwargs: None)
+    _, cold = plan_sigma_windows(
+        real_poles, [_branch()], np.asarray([0.2, 0.5]), 0.1, **args)
+    _, warm = plan_sigma_windows(
+        real_poles, [_branch()], np.asarray([0.2, 0.5]), 0.1, **args)
+    cold_rows = cold["branches"][0]["windows"]
+    warm_rows = warm["branches"][0]["windows"]
+    assert [w["node_digest"] for w in cold_rows] == [
+        w["node_digest"] for w in warm_rows]
+    served = {w["name"]: w for w in cold_rows}
+    assert served["positive conduction:state_tail"]["node_count"] == 2
+    assert served["positive conduction:state_tail"]["cache_status"].startswith("plan:")
+    assert all(w["cache_status"].startswith("hit:") for w in warm_rows)
+
+
+def test_cache_temporary_names_are_unique_per_node_rank_and_process(
+        monkeypatch, tmp_path):
+    import socket
+    from gw.sigma_box_plan import _rule_cache_store
+
+    seen = []
+    real_replace = __import__("os").replace
+
+    def spy(source, target):
+        seen.append(str(source))
+        return real_replace(source, target)
+
+    monkeypatch.setattr("gw.sigma_box_plan.os.replace", spy)
+    assert _rule_cache_store(str(tmp_path), _fake_rule(
+        (-3.0, -0.3, 0.05, 0.4), 1.0e-4), 1.0) is None
+    assert len(seen) == 1
+    assert f".{socket.gethostname()}.0." in seen[0] and seen[0].endswith(".tmp")
+
+
 @pytest.mark.parametrize("space,negative", [("cond", False), ("val", True)])
 @pytest.mark.parametrize("pole_support", [None, 5.0])
 def test_sc_fixed_tail_covers_a_state_crossing_the_product_edge(

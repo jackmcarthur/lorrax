@@ -20,6 +20,7 @@ import json
 import os
 import re
 import pickle
+import socket
 import time
 
 from ffi import _services
@@ -439,7 +440,8 @@ def _rule_cache_store(directory, rule, noise_amplification):
     temporary = None
     try:
         os.makedirs(directory, exist_ok=True)
-        temporary = f"{path}.{os.getpid()}.tmp"
+        temporary = (f"{path}.{socket.gethostname()}.{process_rank()}."
+                     f"{os.getpid()}.tmp")
         with open(temporary, "wb") as handle:
             np.savez(
                 handle, schema=_RULE_CACHE_SCHEMA, digest=digest,
@@ -504,22 +506,34 @@ def _factor_growth(times, pole_sign, states, pole_stats, e_ref_a, e_ref_b):
     return green, screened
 
 
+def _noise_amplification_cap(eps):
+    """Largest roundoff amplification the executor's noise budget admits."""
+    return _RUNTIME_NOISE_SAFETY * eps / _RUNTIME_NOISE_EPSILON
+
+
 def _fit_rule(spec, eps, cache_dir, eta, *, cache_build_widen=True):
+    """Look up or build one window's rule and accept it; never write the cache.
+
+    The lookup reads only certificates written before this plan: the plan's
+    own builds are stored after every rank has looked up (see
+    :func:`fit_sigma_box_specs`), so no window's choice depends on how far
+    another rank has got.
+    """
     requested_box = spec["box"]
     # This is exactly the builder's default currency predicate.  It is used
     # here only to search cache metadata; cache misses still leave the choice
     # to build_uniform_rule(relative=None).
     relative = requested_box[0] > 0.0 or requested_box[1] < 0.0
-    noise_budget = _RUNTIME_NOISE_SAFETY * eps
-    noise_amplification_cap = noise_budget / _RUNTIME_NOISE_EPSILON
+    noise_amplification_cap = _noise_amplification_cap(eps)
     analytic_line = (bool(spec.get("analytic_line")) and not relative
                      and requested_box[2] == requested_box[3]
                      and spec["pole_extent"][2:] == (0.0, 0.0))
+    built = False
     if analytic_line:
         # PPM's real poles make Im(d)=eta exactly.  Ask the analytic service
         # for that line; a cached rectangle rule cannot silently preempt it.
         rule = analytic_line_box_rule(requested_box, eps)
-        cached, cache_lookup_warnings = rule, ()
+        cache_lookup_warnings = ()
         cache_status = "analytic-line"
     else:
         cached, cache_lookup_warnings = _rule_cache_lookup(
@@ -544,13 +558,23 @@ def _fit_rule(spec, eps, cache_dir, eta, *, cache_build_widen=True):
                 build_kwargs["kappa_cap"] = (
                     noise_amplification_cap / (1.0 + eps))
             rule = build_uniform_rule(build_box, eps, **build_kwargs)
+            built = True
             cache_status = "miss" if cache_dir is not None else "off"
         # There is no retry.  The builder takes no clock and no pass count,
         # so a second call with the same inputs returns the same rule; the
         # old 5x-budget retry existed only because the first attempt could
         # have been cut short by a deadline, and there is no deadline to
         # lengthen.  A refusal here is now a statement about the box.
+    fit = _accept_rule(spec, rule, eps, cache_status=cache_status,
+                       cache_dir=cache_dir)
+    fit.update(built=built, analytic_line=analytic_line,
+               cache_lookup_warnings=cache_lookup_warnings)
+    return fit
 
+
+def _accept_rule(spec, rule, eps, *, cache_status, cache_dir):
+    """Accept one rule for one window, or refuse; return its executor receipt."""
+    noise_budget = _RUNTIME_NOISE_SAFETY * eps
     # ONE ACCEPTANCE ON EVERY PATH.  One-shot, fixed-SC initialization and
     # its rebuilds all require the certified sup error at or below eps; the
     # fixed-SC bypass (enforce_sup_error=False, 2026-09-03) let Na retain a
@@ -599,14 +623,6 @@ def _fit_rule(spec, eps, cache_dir, eta, *, cache_build_widen=True):
         raise RuntimeError(
             f"Sigma box window {spec['name']!r} refused: factored log "
             f"growth {max(growth):.6g} exceeds {_FACTOR_GROWTH_CAP:g}")
-    cache_write_warning = None
-    if cached is None:
-        # Only executor-acceptable rules enter the shared cache.  In
-        # particular, a service-level rule that meets its broad default
-        # cancellation cap but misses Sigma's eps-scaled noise cap must not
-        # poison every subsequent attempt for this box.
-        cache_write_warning = _rule_cache_store(
-            cache_dir, rule, noise_amplification)
     node_digest = hashlib.sha256(
         np.ascontiguousarray(times).view(np.uint8).tobytes()
         + np.ascontiguousarray(weights).view(np.uint8).tobytes()
@@ -621,12 +637,57 @@ def _fit_rule(spec, eps, cache_dir, eta, *, cache_build_widen=True):
         "noise_bound": noise_bound, "noise_budget": noise_budget,
         "roundoff_amplification": noise_amplification,
         "node_digest": node_digest,
-        "cache_write_warning": cache_write_warning,
-        "cache_lookup_warnings": cache_lookup_warnings,
+        "rule": rule, "rule_digest": _rule_digest(rule, noise_amplification),
+        "cache_write_warning": None, "cache_lookup_warnings": (),
         "one_line": (f"analytic line: {rule.node_count} nodes, "
                      f"sup {rule.sup_error:.2e} (eps {eps:g})"
-                     if analytic_line else rule.one_line()),
+                     if cache_status == "analytic-line" else rule.one_line()),
     }
+
+
+def _serve_from_plan(specs, fits, eps, cache_dir):
+    """Give each window the smallest compatible rule of this whole plan.
+
+    Resolution runs after every miss is built, on the replicated receipts, in
+    a fixed order: candidates are the window's own rule (a pre-plan cache hit
+    or its build) and every rule this plan built, ranked by (node count,
+    certificate digest), the same key a later cache lookup uses. The result
+    is the rule a warm rerun would pick and does not depend on rank timing:
+    before this, whether a window saw another window's fresh rule depended on
+    how far the other rank had got (Si shared-pole ``cond:pole_tail`` took
+    the 9-node own rule or the 7-node ``cond:bulk`` one, eqp1 0.80 ueV apart;
+    KNOWN_LORRAX_ISSUES 2026-09-24).
+    """
+    fresh = sorted((fit for fit in fits if fit["built"]),
+                   key=lambda fit: (fit["node_count"], fit["rule_digest"]))
+    cap = _noise_amplification_cap(eps)
+    served = []
+    for spec, own in zip(specs, fits):
+        chosen = own
+        if not own["analytic_line"]:
+            box = spec["box"]
+            relative = box[0] > 0.0 or box[1] < 0.0
+            own_key = (own["node_count"], own["rule_digest"])
+            for other in fresh:
+                if (other["node_count"], other["rule_digest"]) >= own_key:
+                    break
+                rule = other["rule"]
+                if (abs(rule.eps - eps) > 1.0e-12 * eps
+                        or bool(rule.relative) != relative
+                        or other["roundoff_amplification"] > cap
+                        or not _box_contains(tuple(rule.box), box)):
+                    continue
+                try:
+                    chosen = _accept_rule(
+                        spec, rule, eps, cache_dir=cache_dir,
+                        cache_status=f"plan:{other['rule_digest'][:16]}")
+                except RuntimeError:
+                    continue
+                chosen.update(built=False, analytic_line=False,
+                              cache_lookup_warnings=own["cache_lookup_warnings"])
+                break
+        served.append(chosen)
+    return served
 
 
 def _parallel_fits(specs, worker):
@@ -679,7 +740,11 @@ def fit_sigma_box_specs(
     owns the shared cache lookup/build, rule acceptance, lower-half-plane
     conjugation, runtime-noise guard, and factored-growth guard.  It returns
     only small replicated rule receipts; route-specific physical selectors
-    stay with the caller.
+    stay with the caller.  With a cache, every window is looked up against
+    the certificates present before the plan, every miss is built, the
+    builds are stored, and each window is then served the smallest
+    compatible rule of the plan in a fixed order (:func:`_serve_from_plan`),
+    so the result does not depend on rank timing.
     """
     rows = list(specs)
     eta, tolerance = float(eta_ry), float(eps)
@@ -687,10 +752,24 @@ def fit_sigma_box_specs(
         raise ValueError("sigma_quadrature requires eta_ry > 0")
     if not 0.0 < tolerance < 1.0:
         raise ValueError("sigma_quadrature_eps must lie in (0, 1)")
-    return _parallel_fits(
+    fits, fit_rows = _parallel_fits(
         rows, lambda index: _fit_rule(
             rows[index], tolerance, cache_dir, eta,
             cache_build_widen=bool(cache_build_widen)))
+    if cache_dir is None:
+        return fits, fit_rows
+    # Every rank has looked up by now (the gather above), so writing the
+    # plan's builds cannot change any choice made in it. One writer: the
+    # replicated receipts already hold every build.
+    if process_rank() == 0:
+        stored = {}
+        for fit in fits:
+            if fit["built"] and fit["rule_digest"] not in stored:
+                stored[fit["rule_digest"]] = _rule_cache_store(
+                    cache_dir, fit["rule"], fit["roundoff_amplification"])
+            if fit["built"]:
+                fit["cache_write_warning"] = stored[fit["rule_digest"]]
+    return _serve_from_plan(rows, fits, tolerance, cache_dir), fit_rows
 
 
 def _box_contains(outer, inner):
