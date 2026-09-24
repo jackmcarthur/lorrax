@@ -99,6 +99,7 @@ import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from common.gpu_utils import bfc_fragmentation_target_utilization
+from gw import comm_model
 from runtime.padding import bounded_partition_tile, padded_axis, round_down
 
 # The planner's ONE printing path: every fallback below announces its demotion
@@ -1590,6 +1591,8 @@ class MuBatchPlan:
     min_config_bytes: float = 0.0   # the smallest configuration's HWM
     collectives_per_batch: int = 0
     t_model_s: float = 0.0          # modelled loop time (ψ traffic + calls)
+    min_call_bytes: float = 0.0     # smallest per-rank collective payload
+    min_efficient_bytes: float = 0.0  # gw.comm_model.min_efficient_payload
     runner_up: str | None = None
 
     def format(self) -> str:
@@ -1599,7 +1602,9 @@ class MuBatchPlan:
             f"    ψ(r) route    = {self.route} (source {self.source}, "
             f"band chunk {self.band_chunk}, k chunk {self.k_chunk})",
             f"    μ batch       = {self.b}  ({self.n_batch} batches, "
-            f"{self.collectives_per_batch} collectives each; modelled loop "
+            f"{self.collectives_per_batch} collectives each, smallest "
+            f"{self.min_call_bytes / 1e6:.1f} MB/rank (efficient >= "
+            f"{self.min_efficient_bytes / 1e6:.1f}); modelled loop "
             f"{self.t_model_s:.0f} s; runner-up {self.runner_up})",
             f"    r sub-block   = {self.r_sub} {'points' if self.route == 'cache' else 'plane(s)'}",
             f"    FFT rows/step = {self.row_chunk}",
@@ -1768,24 +1773,33 @@ def plan_zeta_mubatch(*, meta, mesh_xy, n_q_selected: int, ngkmax: int,
         return math.ceil(math.ceil(mu / n_) / step) * step
 
     def model(route, source, b, bc_, kc_):
-        """Modelled fit loop time: per-batch ψ traffic and call latency.
+        """Modelled fit loop time: per-batch collectives and ψ host reads.
 
-        ponytail: constants measured on VI3 P16 OFI (ψ all-to-all 7.6 GB/s
-        effective, H2D 20 GB/s, 1 ms per collective); swap for the
-        comm-model service's comm_time when it lands.  The per-centroid
-        pair GEMM / k-conv / FFT work is the same for every candidate and
-        is left out."""
+        Collectives are priced by ``gw.comm_model.comm_time``: per r
+        sub-block one Z transpose, plus on the plane route one ψ
+        all_to_all per (band chunk, k chunk).  Returns (seconds, calls per
+        batch, smallest per-call payload).  ponytail: the H2D rate (20
+        GB/s) is the VI3 P16 figure, not a comm-model constant.  The
+        per-centroid pair GEMM / k-conv / FFT work is the same for every
+        candidate and is left out."""
         n_b = math.ceil(mu / b)
-        n_sub = math.ceil(R0 / min(R0, 4096)) if route == 'cache' else math.ceil(n_a / P_)
+        r_s_ = min(R0, 4096) if route == 'cache' else ps
+        n_sub = math.ceil(R0 / r_s_) if route == 'cache' else math.ceil(n_a / P_)
         n_bc_ = math.ceil(int(fit_nb) / bc_)
-        calls = n_sub * (1 + (0 if route == 'cache' else n_bc_ * (nk_src // kc_)))
-        t = calls * 1e-3
-        if route == 'planes':
-            t += _c128(nk_src, n_bc_ * bc_, ns, math.ceil(n_a / P_), n_col) / 7.6e9
+        n_psi = 0 if route == 'cache' else n_sub * n_bc_ * (nk_src // kc_)
+        v_z = _c128(Q_pad if finalize_layout == 'q' else Q, b, r_s_)
+        t = n_sub * comm_model.comm_time(v_z, P_ - 1)
+        v_min = v_z
+        if n_psi:
+            v_psi = _c128(nk_src, n_bc_ * bc_, ns, math.ceil(n_a / P_),
+                          n_col) / n_psi
+            t += n_psi * comm_model.comm_time(v_psi, P_ - 1)
+            v_min = min(v_z, v_psi)
         if source == 'host':
             t += _c128(nk_src, n_bc_ * bc_, ns, N_Gpsi, shard=P_) / 20e9
-        once = cache_bytes / 7.6e9 if route == 'cache' else 0.0
-        return n_b * t + once, calls
+        once = (n_bc_ * comm_model.comm_time(cache_bytes / n_bc_, P_ - 1)
+                if route == 'cache' else 0.0)
+        return n_b * t + once, n_sub + n_psi, v_min
 
     if (fits('cache', 'cache', b_min, r_cache, 1)
             and base_total + cache_bytes + cache_build <= target):
@@ -1849,7 +1863,7 @@ def plan_zeta_mubatch(*, meta, mesh_xy, n_q_selected: int, ngkmax: int,
     if route == 'planes':
         resident_bytes = _c128(nk_src, nb_slots, ns, N_Gpsi, shard=P_)
     n_batch = math.ceil(mu / b)
-    t_model, calls = model(route, source, b, bc, kc_now[0])
+    t_model, calls, v_call = model(route, source, b, bc, kc_now[0])
     # 3. FFT rows per step from what is left.
     left = target - base_total - (
         cache_bytes if source == 'cache' else
@@ -1895,6 +1909,8 @@ def plan_zeta_mubatch(*, meta, mesh_xy, n_q_selected: int, ngkmax: int,
     return MuBatchPlan(
         green_tile_bytes=float(green), min_config_bytes=float(need_min),
         collectives_per_batch=int(calls), t_model_s=float(t_model),
+        min_call_bytes=float(v_call),
+        min_efficient_bytes=comm_model.min_efficient_payload(P_ - 1),
         runner_up=ru,
         route=route, source=source, band_chunk=int(bc), k_chunk=int(kc_now[0]),
         b=int(b),
