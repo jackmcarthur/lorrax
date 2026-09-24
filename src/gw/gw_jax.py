@@ -1486,7 +1486,7 @@ def main(argv=None):
 	q0_certificates = []
 	head_resolver = HeadResolver(
 		config, input_dir, wfn, sym, meta, print0,
-		q0_certificate_fn=q0_certificates.append)
+		q0_certificate_fn=q0_certificates.append, mesh=mesh_xy)
 	bgw_v_grid_fn = build_bgw_v_grid_fn(
 		config, wfn=wfn, sym=sym, input_dir=input_dir, print_fn=print0)
 	timing.record("gw_jax.startup", time.perf_counter() - _t_main)

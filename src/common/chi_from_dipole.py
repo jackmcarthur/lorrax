@@ -37,8 +37,11 @@ before the stamp existed, which is the legacy arm).
 
 Public API
 ----------
-- read_dipole_h5(path) -> (dipole_cart, deltaE)
+- read_dipole_h5(path) -> (dipole_cart, deltaE)   [small files and tests; the GW
+  static head reads its (c, v) block through file_io.restart_bundle.read_dipole_cv_block]
 - compute_S_omega(dipole_cart, deltaE, f_nk, cell_volume, nk_tot, nspin, nspinor, omegas, eta=0.0)
+- compute_S_omega_cv(v_cvk, dE_cv, cell_volume, nk_tot, nspin, nspinor, omegas, eta=0.0)
+  (the same S from the (c, v) block, step occupations)
 """
 
 
@@ -161,7 +164,13 @@ def _compute_S_omega_jit(
     f_v = f_nk[:, v_idx]
     f_c = f_nk[:, c_idx]
     fv_minus_fc = f_v[:, None, :] - f_c[:, :, None]
+    return _S_from_cv(v_cvk, dE_cv, fv_minus_fc, omegas, pref_c, eta_c,
+                      omegas_is_scalar=omegas_is_scalar)
 
+
+def _S_from_cv(v_cvk, dE_cv, fv_minus_fc, omegas, pref_c, eta_c, *,
+               omegas_is_scalar: bool):
+    """S(ω) from the (c, v) block: the one body both entry points trace."""
     def S_one(omega_val):
         w_c = omega_val + eta_c
         denom = dE_cv * (w_c * w_c - dE_cv * dE_cv)
@@ -228,9 +237,38 @@ def compute_S_omega(
     )
 
 
+def compute_S_omega_cv(
+    v_cvk: jnp.ndarray,
+    dE_cv: jnp.ndarray,
+    cell_volume: float,
+    nk_tot: int,
+    nspin: int,
+    nspinor: int,
+    omegas: jnp.ndarray,
+    eta: float = 0.0,
+) -> jnp.ndarray:
+    """:func:`compute_S_omega` from the (c, v) block with step occupations
+    (f_v − f_c = 1), the static head's case; the block comes from
+    ``file_io.restart_bundle.read_dipole_cv_block``."""
+    pref = 4.0 / (float(cell_volume) * float(nk_tot) * float(max(nspin, 1)) * float(max(nspinor, 1)))
+    omegas_arr = jnp.asarray(omegas, dtype=jnp.complex128)
+    return _compute_S_omega_cv_jit(
+        v_cvk, dE_cv, omegas_arr, jnp.asarray(pref, dtype=jnp.complex128),
+        jnp.asarray(1j * float(eta), dtype=jnp.complex128),
+        omegas_is_scalar=omegas_arr.ndim == 0)
+
+
+@functools.partial(jax.jit, static_argnames=('omegas_is_scalar',))
+def _compute_S_omega_cv_jit(v_cvk, dE_cv, omegas, pref_c, eta_c, *,
+                            omegas_is_scalar: bool):
+    return _S_from_cv(v_cvk, dE_cv, jnp.ones_like(dE_cv), omegas, pref_c,
+                      eta_c, omegas_is_scalar=omegas_is_scalar)
+
+
 __all__ = [
     "read_dipole_h5",
     "compute_S_omega",
+    "compute_S_omega_cv",
     "s_tensor_crystal_hessian_to_cartesian_q2",
 ]
 

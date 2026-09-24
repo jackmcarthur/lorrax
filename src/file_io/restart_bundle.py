@@ -2295,6 +2295,42 @@ def read_dipole_metadata(path):
         return dict(f.attrs)
 
 
+def read_dipole_cv_block(path, *, nelec: int, mesh: Mesh):
+    """The static head's (c, v) block of ``dipole.h5``, read through SlabIO.
+
+    Returns ``(v_cvk, dE_cv)`` = ``dipole_cart[:, :, nelec:, :nelec]``
+    ``(3, nk, nc, nv)`` complex128 and ``deltaE[:, nelec:, :nelec]``
+    ``(nk, nc, nv)`` float64, replicated on ``mesh``.  Each rank reads only
+    its share of the c rows, so the file is read once in total rather than
+    once per rank (Fe 8^3 P64 read its whole 2.65 GB dipole on all 64
+    ranks, claim 2592), and one all-gather of the block replaces the
+    per-rank copy of the whole ``(nb, nb)`` file.  COLLECTIVE over ``mesh``.
+    """
+    from runtime.padding import padded_axis
+    from .slab_io import SlabIO
+    with h5py.File(path, "r") as f:
+        _, nk, nb, _ = f["dipole_cart"].shape
+    nv = max(0, min(int(nelec), int(nb)))
+    nc = int(nb) - nv
+    if nc == 0 or nv == 0:
+        return (jnp.zeros((3, nk, nc, nv), jnp.complex128),
+                jnp.zeros((nk, nc, nv), jnp.float64))
+    xy = tuple(mesh.axis_names)
+    c_axis = padded_axis(nc, mesh, name="dipole c rows")
+    ncp = int(c_axis.carrier)
+    with SlabIO(path, mode="r", mesh=mesh) as io:
+        v = io.read_slab("dipole_cart", shape=(3, nk, ncp, nv),
+                         offset=(0, 0, nv, 0), valid_shape=(3, nk, nc, nv),
+                         dtype=np.complex128,
+                         partition_spec=P(None, None, xy, None))
+        e = io.read_slab("deltaE", shape=(nk, ncp, nv), offset=(0, nv, 0),
+                         valid_shape=(nk, nc, nv), dtype=np.float64,
+                         partition_spec=P(None, xy, None))
+    rep = NamedSharding(mesh, P())
+    return jax.jit(lambda a, b: (a[:, :, :nc], b[:, :nc]),
+                   out_shardings=(rep, rep))(v, e)
+
+
 def read_dipole_parent_window(path, parent_rows, band_start, band_stop, *, nk_full):
     """Return parent-indexed Cartesian velocity blocks (parent, cart, band, band)."""
     with h5py.File(path, "r") as f:

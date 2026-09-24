@@ -315,7 +315,7 @@ def resolve_w_head_densify(mode, params=None) -> str:
 
 
 def build_w_head_channel(wfn, sym, meta, params, *, coarse_grid, fine_grid,
-                         whead, ref_grid, input_file, restart_file,
+                         whead, ref_grid, input_file, restart_file, mesh=None,
                          gamma_cell: str = "fine", log_fn=print):
     """The C1 head channel ``S_fine(q)`` for a coarse→fine W, end to end.
 
@@ -395,7 +395,7 @@ def build_w_head_channel(wfn, sym, meta, params, *, coarse_grid, fine_grid,
 
     S_cart, prov = resolve_head_S_cart(
         restart_file, input_file=input_file, wfn=wfn, sym=sym, meta=meta,
-        params=params, print_fn=log_fn)
+        params={**params, "_mesh": mesh}, print_fn=log_fn)
     if S_cart is None:
         raise ValueError(
             f"w_head_densify = c1 needs the head's S tensor and could not get "
@@ -775,7 +775,7 @@ def _interpolate_bse_data_to_grid(
             wfn, sym, meta, params,
             coarse_grid=coarse_grid, fine_grid=fine_grid,
             whead=head_channel["whead"], ref_grid=coarse_grid,
-            input_file=input_file, restart_file=restart_file,
+            input_file=input_file, restart_file=restart_file, mesh=mesh_xy,
             gamma_cell=head_channel.get("gamma_cell", "fine"), log_fn=log_fn)
         W_q_fine = attach_head_channel(
             W_q_fine, data["g0_X"], data["g0_Y"], S_fine,
