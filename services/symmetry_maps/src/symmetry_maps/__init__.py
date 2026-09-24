@@ -233,6 +233,11 @@ from symmetry_maps.maps import (
     isdf_one_leg_source_slots,
     mix_lorentz_blocks,
 )
+from symmetry_maps.unfold_load import (
+    UnfoldLoadTables,
+    unfold_load_tables,
+    apply_unfold_load_tables_local,
+)
 # Pre-sweep spellings.  Imported from the modules that define them, so
 # the door and the module bind the SAME object and cannot drift apart.
 from symmetry_maps.maps import (              # noqa: F401  (compat surface)
@@ -336,6 +341,7 @@ __all__ = [
     "unfold_operator_local", "open_spin_block_coefficient",
     "certify_endpoint_locality", "endpoint_panel_cost", "unfold_endpoint_panel",
     "unfold_spin_centroid_operator", "unfold_isdf_one_leg",
+    "UnfoldLoadTables", "unfold_load_tables", "apply_unfold_load_tables_local",
     "isdf_one_leg_source_slots",
     "mix_lorentz_blocks",
     # psi unfold / antiunitary rule

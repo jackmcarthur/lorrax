@@ -86,6 +86,8 @@ variable (decisions.md 2026-09-24, QUALITY #8):
     make_fused_conv_kplane    route-G planes the same read from the D-plane FFT output,
                                              Bloch phase and L/R split applied on load
     make_kconv_klead          flat leading   Σ / COHSEX  fftn(ifftn(T)·ifftn(W))
+    make_kconv_klead_unfold   parent Green   the Σ one read from the raw-parent G with
+                                             the typed unfold and spin action on load
     make_kconv_kminor         trailing       BSE rung    fftn(ifftn(X)·K_R)
     make_kfft_klead / _local  flat leading   one transform
     make_kfft_kminor / _local trailing       one transform
@@ -149,7 +151,8 @@ __all__ = [
     "kconv_backend", "require_kconv", "mathdx_root", "cubin_cache_dir", "conv_kpair_scale",
     "make_fused_conv_kpair", "make_fused_conv_kparent", "make_fused_conv_kplane",
     "KCONV_PLANE_TARGET",
-    "KConvStored", "make_kconv_klead", "make_kconv_kminor", "kconv_kminor_out_shape",
+    "KConvStored", "make_kconv_klead", "make_kconv_klead_unfold", "KCONV_KLEAD_UNFOLD_TARGET",
+    "make_kconv_kminor", "kconv_kminor_out_shape",
     "make_kfft_klead", "make_kfft_kminor",
     "make_local_kfft_klead", "make_local_kfft_kminor", "make_local_kconv_kminor",
 ]
@@ -165,11 +168,13 @@ KCONV_PAIR_TARGET = "lorrax_mathdx_kconv_pair"
 KCONV_PARENT_TARGET = "lorrax_mathdx_kconv_parent"
 KCONV_PLANE_TARGET = "lorrax_mathdx_kconv_plane"
 KCONV_KLEAD_TARGET = "lorrax_mathdx_kconv_klead"
+KCONV_KLEAD_UNFOLD_TARGET = "lorrax_mathdx_kconv_klead_unfold"
 KFFT_KLEAD_TARGET = "lorrax_mathdx_kfft_klead"
 KCONV_KMINOR_TARGET = "lorrax_mathdx_kconv_kminor"
 KFFT_KMINOR_TARGET = "lorrax_mathdx_kfft_kminor"
 #: Every mathdx target; ``require_kconv`` checks them all at startup.
 KCONV_TARGETS = (KCONV_PAIR_TARGET, KCONV_PARENT_TARGET, KCONV_PLANE_TARGET, KCONV_KLEAD_TARGET,
+                 KCONV_KLEAD_UNFOLD_TARGET,
                  KFFT_KLEAD_TARGET, KCONV_KMINOR_TARGET, KFFT_KMINOR_TARGET)
 
 #: The ``LORRAX_FFT_FFI`` dial.  Default ON — the FFI layer is REQUIRED
@@ -992,9 +997,31 @@ def make_kconv_klead(mesh: Mesh, kgrid, t_spec: P, w_spec: P, *,
     nk = kg[0] * kg[1] * kg[2]
     t_flat = validate_flat_spec(t_spec, "T")
     w_flat = validate_flat_spec(w_spec, "W")
+    prep_local, apply_local = _klead_locals(mesh, kg, norm, mult)
+
+    prep_sm = _sharded(prep_local, mesh, (w_flat,), w_flat)
+    apply_sm = _sharded(apply_local, mesh, (t_flat, w_flat), t_flat)
+
+    def prep(W):
+        _check_complex(W)
+        if W.ndim != 3 or int(W.shape[0]) != nk:
+            raise ValueError(f"k-leading conv expects W (nk={nk}, mx, my); got {W.shape}")
+        return prep_sm(W)
+
+    def apply(T, W_prep):
+        _check_complex(T, W_prep)
+        if T.ndim != 5 or int(T.shape[0]) != nk:
+            raise ValueError(f"k-leading conv expects T (nk={nk}, a, mx, b, my); got {T.shape}")
+        return apply_sm(T, W_prep)
+
+    return KConvStored(prep=prep, apply=apply)
+
+
+def _klead_locals(mesh, kg, norm, mult):
+    """Rank-local ``(prep, apply)`` of :func:`make_kconv_klead` for this mesh's backend."""
+    nk = kg[0] * kg[1] * kg[2]
     si, sf = ffi_fft_scale("ifftn", norm, nk), ffi_fft_scale("fftn", norm, nk)
-    backend = kconv_backend(mesh)
-    if backend == "mathdx":
+    if kconv_backend(mesh) == "mathdx":
         _require_target(KCONV_KLEAD_TARGET, "CUDA")
         prep_local = make_local_kfft_klead(mesh, kg, kind="ifftn", norm=norm)
         attrs = dict(nkx=np.int64(kg[0]), nky=np.int64(kg[1]), nkz=np.int64(kg[2]),
@@ -1018,23 +1045,75 @@ def make_kconv_klead(mesh: Mesh, kgrid, t_spec: P, w_spec: P, *,
         def prep_local(w):
             return w
         apply_local = _host_gw_conv_local(kg, norm, mult)
+    return prep_local, apply_local
 
-    prep_sm = _sharded(prep_local, mesh, (w_flat,), w_flat)
-    apply_sm = _sharded(apply_local, mesh, (t_flat, w_flat), t_flat)
 
-    def prep(W):
-        _check_complex(W)
-        if W.ndim != 3 or int(W.shape[0]) != nk:
-            raise ValueError(f"k-leading conv expects W (nk={nk}, mx, my); got {W.shape}")
-        return prep_sm(W)
+def make_kconv_klead_unfold(mesh: Mesh, kgrid, tables, *, norm: str | None = "ortho",
+                            mult: float = 1.0) -> Callable:
+    """The Σ k-leading convolution read from the RAW-PARENT Green: ``fn(G, Gt, W_prep) -> U``.
 
-    def apply(T, W_prep):
-        _check_complex(T, W_prep)
-        if T.ndim != 5 or int(T.shape[0]) != nk:
-            raise ValueError(f"k-leading conv expects T (nk={nk}, a, mx, b, my); got {T.shape}")
-        return apply_sm(T, W_prep)
+    ``G`` ``(n_parent, mu, ns, nu, ns)`` c128 at ``P(None,'x',None,'y',None)``
+    is the centroid-major parent Green (``gw.greens_function_kernel.
+    build_G_parents``) and ``Gt`` its transposed partner for the antiunitary
+    rows (``None`` when no row is antiunitary); ``tables`` are
+    ``symmetry_maps.unfold_load_tables`` of the same plan; ``W_prep`` is
+    :func:`make_kconv_klead`'s ``prep(W)`` for the same ``(kgrid, norm, mult)``.
+    Returns ``U`` ``(nk, ns, mu, ns, nu)`` at ``P(None,None,'x',None,'y')``,
+    equal to ``apply(sigma_conv_operand(unfold_spin_centroid_operator(G, Gt)),
+    W_prep)``: the typed unfold, the spin action and the spin-major reorder
+    happen on the convolution's load.  CUDA: nvidia-mathdx mode 7; cpu: the
+    service's reference composition, then the plan route.
+    """
+    from symmetry_maps import UnfoldLoadTables, apply_unfold_load_tables_local
+    kg = _check_kgrid(kgrid)
+    nk = kg[0] * kg[1] * kg[2]
+    if int(tables.row.shape[0]) != nk:
+        raise ValueError(f"k-leading unfold conv: tables cover {tables.row.shape[0]} k, grid has {nk}")
+    ns = int(tables.spin.shape[-1])
+    spin_host = np.asarray(jax.device_get(tables.spin))
+    needs_partner = bool(np.any(np.asarray(jax.device_get(tables.trs))))
+    si, sf = ffi_fft_scale("ifftn", norm, nk), ffi_fft_scale("fftn", norm, nk)
+    if kconv_backend(mesh) == "mathdx":
+        _require_target(KCONV_KLEAD_UNFOLD_TARGET, "CUDA")
+        attrs = dict(nkx=np.int64(kg[0]), nky=np.int64(kg[1]), nkz=np.int64(kg[2]),
+                     scale=np.float64(si * sf * float(mult)), **_mathdx_common())
 
-    return KConvStored(prep=prep, apply=apply)
+        def local(g, gt, t, v_r):
+            n_par, mx, _, my, _ = (int(v) for v in g.shape)
+            flat = lambda a: a.reshape(n_par, mx * ns, my * ns)
+            out = jax.ShapeDtypeStruct((nk, ns, mx, ns, my), g.dtype)
+            return jax.ffi.ffi_call(KCONV_KLEAD_UNFOLD_TARGET, out)(
+                flat(g), flat(gt), t.row, t.trs, t.lsrc, t.rsrc, t.mph, t.nph, t.spin, v_r, **attrs)
+    else:
+        _, conv_local = _klead_locals(mesh, kg, norm, mult)
+
+        def local(g, gt, t, v_r):
+            n_par, mx, _, my, _ = (int(v) for v in g.shape)
+            flat = lambda a: a.reshape(n_par, mx * ns, my * ns)
+            O = apply_unfold_load_tables_local(flat(g), flat(gt), t, spin_host)
+            return conv_local(jnp.transpose(O, (0, 2, 1, 4, 3)), v_r)
+
+    g_spec = P(None, "x", None, "y", None)
+    t_specs = UnfoldLoadTables(row=P(), trs=P(), lsrc=P(None, "x"), rsrc=P(None, "y"),
+                               mph=P(None, "x"), nph=P(None, "y"), spin=P())
+    sm = _sharded(local, mesh, (g_spec, g_spec, t_specs, P(None, "x", "y")),
+                  P(None, None, "x", None, "y"))
+
+    def apply(G, Gt, W_prep):
+        _check_complex(G, W_prep)
+        if G.ndim != 5 or int(G.shape[2]) != ns or int(G.shape[4]) != ns:
+            raise ValueError(f"k-leading unfold conv expects G (n_parent, mu, {ns}, nu, {ns}); "
+                             f"got {G.shape}")
+        if Gt is None:
+            if needs_partner:
+                raise ValueError("k-leading unfold conv: the plan has antiunitary rows, so the "
+                                 "transposed parent Green Gt is required")
+            Gt = G
+        if Gt.shape != G.shape or W_prep.shape != (nk, G.shape[1], G.shape[3]):
+            raise ValueError(f"k-leading unfold conv: Gt {Gt.shape} / W_prep {W_prep.shape} do not "
+                             f"match G {G.shape} and nk={nk}")
+        return sm(G, Gt, tables, W_prep)
+    return apply
 
 
 def kconv_kminor_out_shape(x_shape, out_layout: int) -> tuple[int, ...]:

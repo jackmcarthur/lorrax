@@ -397,6 +397,7 @@ from ffi.mklfft import (  # noqa: E402  (re-export: see the block above)
 # so no caller branches on a backend and no environment variable picks one.
 #
 #     make_kconv_klead        Σ / COHSEX: KConvStored(prep(W), apply(T, W_prep))
+#     make_kconv_klead_unfold Σ from the raw-parent Green: fn(G, Gt, W_prep), same prep
 #     make_kconv_kminor       BSE rung:   fn(X, K_R), out_layout 0 | 1
 #     make_kfft_kminor        sharded transform over the three trailing k axes
 #     make_local_kconv_kminor / make_local_kfft_kminor  the same inside a shard_map
@@ -406,6 +407,7 @@ from ffi.mklfft import (  # noqa: E402  (re-export: see the block above)
 from ffi.fft import (  # noqa: E402,F401  (re-exported front doors)
     KConvStored,
     make_kconv_klead,
+    make_kconv_klead_unfold,
     make_kconv_kminor,
     make_kfft_klead,
     make_kfft_kminor,

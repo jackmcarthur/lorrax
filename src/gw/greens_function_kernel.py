@@ -1,5 +1,6 @@
 """Build parent Green operators and transport them with typed local symmetry actions."""
 from functools import partial
+from typing import NamedTuple
 
 import jax
 import numpy as np
@@ -56,25 +57,31 @@ def _build_G_face(psi_mun, psi_nmu, *, gemm, Gij=None, phases=None, mesh=None,
     return G_flat.reshape(nk_, mu_l_, s_, mu_r_, s_)
 
 
-def build_G(psi_xn, psi_yr, *, Gij=None, phases=None, layout='face',
-           gemm=None, k_unfold_plan=None, right_k_unfold_plan=None, real_weights=None,
-           band_range=None, prepared_active_gemm=None, conjugate=False):
-    """Build parent operators and transport both typed endpoints without processor exchange.
+class ParentGreen(NamedTuple):
+    """The raw-parent Green and what its typed unfold needs.
 
-    The Green is centroid-major ``(nk, mu, s, nu, s')`` on parents and on
-    full k alike; see :func:`_build_G_face`.  ``conjugate=True`` returns
-    ``conj(G)``, folded into the unfold's own pass when there is one.
+    ``G`` ``(n_parent, mu, s, nu, s')`` centroid-major; ``transpose`` the
+    partner an antiunitary row reads (the conjugate-face Green, or ``conj(G)``
+    for real weights), ``None`` when the plan has no antiunitary row.
+    ``k_unfold_plan.unfold_operator(G, operator_transpose=transpose)`` is the
+    full-k Green; ``ffi.fft.make_kconv_klead_unfold`` reads the pair directly.
     """
+    G: jax.Array
+    transpose: jax.Array | None
+
+
+def build_G_parents(psi_xn, psi_yr, *, Gij=None, phases=None, layout='face', gemm=None,
+                    k_unfold_plan, real_weights=None, band_range=None,
+                    prepared_active_gemm=None) -> ParentGreen:
+    """The parent Green and its antiunitary partner, before the typed unfold (see :class:`ParentGreen`)."""
     if layout not in ('face', 'axis'):
         raise ValueError("build_G requires canonical faces with layout=face or axis.")
     if gemm is None:
         raise ValueError("build_G requires a GEMM plan or typed parent plan-provided GEMM callable.")
     G = _build_G_face(psi_xn, psi_yr, gemm=gemm, Gij=Gij, phases=phases,
-                      mesh=None if k_unfold_plan is None else k_unfold_plan.mesh_xy,
+                      mesh=k_unfold_plan.mesh_xy,
                       band_range=band_range,
                       prepared_active_gemm=prepared_active_gemm)
-    if k_unfold_plan is None:
-        return jnp.conj(G) if conjugate else G
     transposed = None
     if np.any(np.asarray(k_unfold_plan.sym_idx) >= k_unfold_plan.n_sym_spatial):
         if (real_weights is True or phases is None
@@ -89,8 +96,32 @@ def build_G(psi_xn, psi_yr, *, Gij=None, phases=None, layout='face',
                                         band_range=band_range,
                                         prepared_active_gemm=prepared_active_gemm),
                 lambda _: jnp.conj(G), operand=None)
+    return ParentGreen(G, transposed)
+
+
+def build_G(psi_xn, psi_yr, *, Gij=None, phases=None, layout='face',
+           gemm=None, k_unfold_plan=None, right_k_unfold_plan=None, real_weights=None,
+           band_range=None, prepared_active_gemm=None, conjugate=False):
+    """Build parent operators and transport both typed endpoints without processor exchange.
+
+    The Green is centroid-major ``(nk, mu, s, nu, s')`` on parents and on
+    full k alike; see :func:`_build_G_face`.  ``conjugate=True`` returns
+    ``conj(G)``, folded into the unfold's own pass when there is one.
+    """
+    if k_unfold_plan is None:
+        if layout not in ('face', 'axis'):
+            raise ValueError("build_G requires canonical faces with layout=face or axis.")
+        if gemm is None:
+            raise ValueError("build_G requires a GEMM plan or typed parent plan-provided GEMM callable.")
+        G = _build_G_face(psi_xn, psi_yr, gemm=gemm, Gij=Gij, phases=phases,
+                          band_range=band_range,
+                          prepared_active_gemm=prepared_active_gemm)
+        return jnp.conj(G) if conjugate else G
+    pg = build_G_parents(psi_xn, psi_yr, Gij=Gij, phases=phases, layout=layout, gemm=gemm,
+                         k_unfold_plan=k_unfold_plan, real_weights=real_weights,
+                         band_range=band_range, prepared_active_gemm=prepared_active_gemm)
     return k_unfold_plan.unfold_operator(
-        G, operator_transpose=transposed, right_plan=right_k_unfold_plan,
+        pg.G, operator_transpose=pg.transpose, right_plan=right_k_unfold_plan,
         conjugate=conjugate)
 
 
@@ -205,8 +236,12 @@ def build_G_tau(psi_xn, psi_yr, enk, t, *, e_ref=0.0, mask=None,
                 band_weight=None, E_min=None, E_max=None,
                 layout='face', gemm=None, k_unfold_plan=None, band_range=None,
                 trim_zero_bands=False, prepared_active_gemm=None,
-                conjugate=False):
-    """Contract phases exp(-t*(energy-reference)) with energy windows, identity masks and signed weights."""
+                conjugate=False, unfold=True):
+    """Contract phases exp(-t*(energy-reference)) with energy windows, identity masks and signed weights.
+
+    ``unfold=False`` returns the :class:`ParentGreen` pair instead of the
+    full-k Green (the consumer does the typed unfold on its own load).
+    """
     real_weights = not jnp.issubdtype(jnp.result_type(t), jnp.complexfloating)
     if not real_weights:
         real_weights = jnp.imag(t) == 0
@@ -228,6 +263,14 @@ def build_G_tau(psi_xn, psi_yr, enk, t, *, e_ref=0.0, mask=None,
             lo = jnp.maximum(lo, band_range[0])
             hi = jnp.minimum(hi, band_range[1])
         band_range = (jnp.minimum(lo, hi), hi)
+    if not unfold:
+        if conjugate:
+            raise ValueError("build_G_tau(unfold=False) returns the parent pair; conjugate "
+                             "applies to the unfolded Green only")
+        return build_G_parents(
+            psi_xn, psi_yr, phases=phases, layout=layout, gemm=gemm,
+            k_unfold_plan=k_unfold_plan, real_weights=real_weights,
+            band_range=band_range, prepared_active_gemm=prepared_active_gemm)
     return build_G(
         psi_xn, psi_yr, phases=phases, layout=layout, gemm=gemm,
         k_unfold_plan=k_unfold_plan, real_weights=real_weights,

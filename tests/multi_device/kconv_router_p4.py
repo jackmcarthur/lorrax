@@ -18,6 +18,11 @@ must resolve to ``mathdx`` on this mesh (asserted, TASTE 30).
    BITWISE equal to the chain it replaced (XLA phase + moveaxis + L/R split,
    then the parent door on the identity plan), and 1e-12 of the dense sum.
    Red twin: the phase rolled by one k.
+3c. ``make_kconv_klead_unfold`` (mode 7, the Σ door from the raw-parent
+   Green): BITWISE equal to the chain it replaced (the typed unfold, the
+   spin-rotate FFI, sigma_conv_operand, then mode 2) on the glide plans
+   (ns 2, 4; spin mixing, an antiunitary row) and A-cubic (48 operations,
+   ns 1).  Red twin: the right source table rolled by one slot.
 4. The stored-kernel doors (modes 2-5) against NumPy ``np.fft`` on sharded
    operands, including an odd grid and 8x8x8: ``make_kconv_klead`` (Σ/COHSEX,
    prep + apply), ``make_kconv_kminor`` (BSE rung, both store layouts),
@@ -249,6 +254,65 @@ def plane_case(mesh, rng):
                 xla_cmul_form=_xla_cmul_form(rng))
 
 
+def _spin_ffi_form(mesh, rng):
+    """Which FMA spelling the spin-rotate FFI (nvcc, cuCmul) uses (diagnostic for mode 7)."""
+    from fractions import Fraction as Q
+    from symmetry_maps._spin_rotation import rotate_spin
+    ns = 2
+    g = _crand(rng, 1, 2, ns, 2, ns)
+    u = _crand(rng, 1, ns, ns)
+    one = Mesh(np.asarray(jax.devices()[:1]).reshape(1, 1), XY)
+    sh = NamedSharding(one, P(None, "x", None, "y", None))
+    if jax.process_index() != 0:
+        return {}
+    got = np.asarray(jax.device_get(rotate_spin(jax.device_put(g, sh), u, one)))
+    fma = lambda x, y, z: float(Q(x) * Q(y) + Q(z))
+    forms = {"fma(ac,-bd)/fma(ad,bc)": lambda x, y: complex(fma(x.real, y.real, -(x.imag * y.imag)),
+                                                            fma(x.real, y.imag, x.imag * y.real)),
+             "fma(-bd,ac)/fma(bc,ad)": lambda x, y: complex(fma(-x.imag, y.imag, x.real * y.real),
+                                                            fma(x.imag, y.real, x.real * y.imag)),
+             "no-fma": lambda x, y: complex(x.real * y.real - x.imag * y.imag,
+                                            x.real * y.imag + x.imag * y.real)}
+    hits = {}
+    for name, mul in forms.items():
+        ok = 0
+        for m in range(2):
+            for n in range(2):
+                G = g[0, m, :, n, :]
+                left = [[0j] * ns for _ in range(ns)]
+                for a in range(ns):
+                    for d in range(ns):
+                        v = 0j
+                        for c in range(ns):
+                            p = mul(u[0, a, c], G[c, d]); v = complex(v.real + p.real, v.imag + p.imag)
+                        left[a][d] = v
+                for a in range(ns):
+                    for b in range(ns):
+                        v = 0j
+                        for d in range(ns):
+                            p = mul(left[a][d], np.conj(u[0, b, d])); v = complex(v.real + p.real, v.imag + p.imag)
+                        ok += int(v == got[0, m, a, n, b])
+        hits[name] = ok
+    return hits
+
+
+def unfold_cases(mesh, rng):
+    """Mode 7 on the glide plans and A-cubic vs the old Σ chain (test_kconv_klead_unfold.unfold_case)."""
+    import zeta_mubatch_fixtures as fixtures
+    from test_kconv_klead_unfold import unfold_case
+    recs = []
+    fxs = [fixtures._glide_fixture(mesh, rng, ns) for ns in (2, 4)] + [fixtures._acubic_fixture(mesh, rng)]
+    for fx in fxs:
+        r = unfold_case(mesh, fx)
+        recs.append(dict(case=f"kconv_klead_unfold_ns{r['ns']}", nk=r["nk"], n_parent=r["n_parent"],
+                         antiunitary=r["antiunitary"], bitwise_vs_old_chain=int(r["door_bitwise"]),
+                         bitwise_tables_vs_unfold=int(r["tables_bitwise"]),
+                         max_abs_vs_old_chain=r["max_abs"], rel_vs_old_chain=r["rel"],
+                         red_rolled_rsrc=r["red_rel"]))
+    recs[0]["spin_ffi_form"] = _spin_ffi_form(mesh, rng)
+    return recs
+
+
 def _np3(x, kg, axis0, kind, norm):
     """np.fft over three consecutive k axes starting at axis0 of the reshaped array."""
     f = np.fft.ifftn if kind == "ifftn" else np.fft.fftn
@@ -333,7 +397,7 @@ def main() -> int:
     mesh = Mesh(np.asarray(jax.devices()).reshape(2, 2), XY)
     rng = np.random.default_rng(20260924)
     recs = ([downfold_case(mesh, rng), face_parent_case(mesh, rng), plane_case(mesh, rng)]
-            + stored_cases(mesh, rng))
+            + unfold_cases(mesh, rng) + stored_cases(mesh, rng))
     bad = []
     for r in recs:
         for k, v in r.items():
