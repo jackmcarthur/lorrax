@@ -223,6 +223,23 @@ Hall term is optional. Physics: [Four-current heads and
 frequency](../theory/four-current-head-corrections.md); wiring:
 [Four-current wiring](four_current_wiring.md).
 
+## 2026-08-22 — One mesh-divisibility pad helper, and its result is named
+
+`runtime.padding.pad_axis(A, divisor, *, axis, fill=0.0)` is the only
+implementation of the mesh-divisibility pad. It returns
+`PadAxisResult(array, logical, padded)`, and a caller reads the extent it
+wants by name. `fill` is keyword-only because the BSE ε axis pads with a
+signed sentinel (`bse_window.PAD_EPS_GUARD_RY`): a positional fill could sign
+the guard by accident and put pad transitions below the optical onset.
+
+**Why named.** Two helpers once returned opposite extents from the same tuple
+slot. A call site copied from the wrong one is wrong only when the extent is
+not already a mesh multiple, which no mesh-divisible validation run sees. Do
+not reintroduce a positional or single-value return, and do not add a second
+helper. `tests/test_pad_parity_gates.py` pins both
+(`test_pad_axis_fill_is_keyword_only_and_signed`, and a source gate against a
+second helper).
+
 ## 2026-08-18 — The ζ band chunk is 16
 
 The ζ fit transports ψ in band chunks of 16
@@ -268,6 +285,16 @@ head-slot guard all read it.
   1 %.
 
 `DEG_B26P` is the in-plane degree ladder only, never a channel set.
+
+## 2026-08-06 — There is deliberately no `LORRAX_EXTRA_BAND_PAD`
+
+The pad-invariance test knobs `LORRAX_EXTRA_MU_PAD` (μ) and
+`LORRAX_EXTRA_RANK_PAD` (the htransform rank axis) work because every consumer
+of their extent reads it from one owner. A band-axis knob is licensed only in
+the same form: a `runtime.padding` knob that every band-axis producer honours,
+including the ψ loaders, the BSE window and the Σ carrier. A knob that reaches
+only some of them reports a pad flip as green for the whole axis. That false
+all-clear is worse than no check, because it stops anyone else looking.
 
 ## 2026-08-06 — `minimax` is the only screening method; `ctsp` is refused
 
