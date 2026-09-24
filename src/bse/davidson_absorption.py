@@ -43,7 +43,7 @@ from .bse_davidson_helpers import bse_diagonal_precond, init_bse_subspace
 from .bse_io import (load_bse_data_from_restart_sharded, resolve_n_occ)
 from file_io.restart_bundle import (_find_restart_file)
 from .bse_ring_comm import create_mesh_2d, make_bse_shardings
-from .bse_simple import build_bse_simple_matvec
+from .bse_stack_matvec import build_bse_stack_matvec
 from common.collectives import gather_to_host
 from common.fft_helpers import make_kfft_kminor
 
@@ -102,7 +102,8 @@ def main(argv=None):
               f"{nc_pad*nv_pad*nk}, n_eig={args.n_eig}, max_iter={args.max_iter}", flush=True)
 
     # ── Build matvec exactly like tests/bench/test_davidson_bse.py ─────────────────────
-    matvec_simple = build_bse_simple_matvec(mesh_xy, nkx, nky, nkz, include_W=True)
+    # THE BSE matvec: the whole Davidson block is its trial stack.
+    matvec_stack = build_bse_stack_matvec(mesh_xy, nkx, nky, nkz, kernel="bse")
     _W_ifftn = make_kfft_kminor(
         mesh_xy, (nkx, nky, nkz), sh.W.spec, kind="ifftn", norm="ortho")
     # W_q is DONATED, and the caller-side reference dropped — copied verbatim
@@ -128,29 +129,18 @@ def main(argv=None):
     V_q0 = data["V_q0"]
     M_X, M_Y = data["M_X"], data["M_Y"]  # hoisted V-term pair-amps (audit P3)
 
-    # The simple matvec's workspace scales worse than linearly with the
-    # batch axis m (~m^1.5; 4.5 GB at m=10 → 88 GB at m=50). The state
-    # vectors themselves are tiny. Use lax.scan over m=1 calls so XLA
-    # reuses the m=1 workspace.
+    # The stack matvec scans its trial axis internally (one T-tensor alive
+    # regardless of the Davidson block width), so the whole block goes in.
     #
     # Multi-host: jit closures over sharded arrays raise
     # "Closing over jax.Array that spans non-addressable devices".
     # Pass psi_*, eps_*, W_R, V_q0 as arguments to the jit'd function;
     # the whole Davidson solve receives those arrays through explicit data.
-    @jax.jit
-    def matvec_scan(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0, M_X, M_Y):
-        def body(carry, x_one):
-            Hx = matvec_simple(x_one[None], psi_c_X, psi_c_Y, psi_v_X, psi_v_Y,
-                               eps_c, eps_v, W_R, V_q0, M_X, M_Y)
-            return carry, Hx[0]
-        _, HX = jax.lax.scan(body, None, X)
-        return HX
-
     operator_data = (psi_c_X, psi_c_Y, psi_v_X, psi_v_Y,
                      eps_c, eps_v, W_R, V_q0, M_X, M_Y)
 
     def apply_H(solver_data, X):
-        return matvec_scan(X, *solver_data[0])
+        return matvec_stack(X, *solver_data[0])
 
     # ── Initial subspace ───────────────────────────────────────────────
     V0 = init_bse_subspace(

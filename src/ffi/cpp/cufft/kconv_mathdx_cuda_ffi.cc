@@ -38,9 +38,9 @@
 // directory as the string attribute `mathdx_root`; the CUDA toolkit include
 // (for libcu++, include/cccl) is derived from the loaded libnvrtc.
 //
-// Disk cache: the router passes `cubin_dir` (common.jax_compile_cache.
-// kernel_cache_dir: ISDF_JAX_CACHE_DIR/kconv_mathdx, else ~/.cache/lorrax/
-// kconv_mathdx; "" = off).  A cubin is keyed
+// Disk cache: the router passes `cubin_dir` (ffi.fft.cubin_cache_dir:
+// $SCRATCH/.cache/lorrax/kconv_mathdx, else ~/.cache/lorrax/kconv_mathdx;
+// "" = no disk cache).  A cubin is keyed
 // by FNV-1a over the embedded source, the NVRTC options (mode, grid, ns, rows
 // per block, sm), the cuFFTDx/commonDx version headers of the wheel and the
 // NVRTC version; it is written to a unique temporary and renamed (atomic on
@@ -626,7 +626,7 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
                      "(rows/block=%d, smem=%d B, cubin %s)\n",
                      from_disk ? "disk-cache hit" : "NVRTC built", mode, f32 ? " c64" : "", nkx, nky, nkz, ns,
                      cc_major, cc_minor, ms, b.rb, b.smem,
-                     path.empty() ? "not cached (ISDF_JAX_CACHE_DIR=\"\")"
+                     path.empty() ? "not cached (no cubin_dir)"
                                   : (from_disk ? path.c_str() : (stored ? "stored" : "store FAILED")));
     }
     *out = &(g_cache[key] = b);

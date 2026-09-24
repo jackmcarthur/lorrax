@@ -421,14 +421,11 @@ runtime libs SLATE links against.
 ## Runtime
 
 **The k-convolution kernels compile on first use.**  Each (mode, k-grid) costs
-5.9–7.5 s of NVRTC per process on an A100 the first time; the images are then
-cached on disk under `ISDF_JAX_CACHE_DIR/kconv_mathdx` (or
-`~/.cache/lorrax/kconv_mathdx` when that variable is unset; `""` disables the
-cache), and a hit costs about 10 ms.  On a new cluster point
-`ISDF_JAX_CACHE_DIR` at a rank-visible directory for production campaigns (on
-Perlmutter `lx` exports it as `""` when unset, which turns the cache off); the
-cache is content-hashed and rank-safe, so it never needs clearing for
-correctness.
+5–7.5 s of NVRTC per process on an A100 the first time; the images are then
+kept in `$SCRATCH/.cache/lorrax/kconv_mathdx` (or `~/.cache/lorrax/kconv_mathdx`
+where the site sets no `SCRATCH`), and a hit costs about 10 ms.  The store is
+content-hashed and rank-safe, so it never needs clearing for correctness; on a
+new cluster make sure that directory is writable from compute nodes.
 
 The installed module is a capability descriptor, not a launcher or a second
 copy of runtime policy. On Perlmutter, `lx` composes task placement,

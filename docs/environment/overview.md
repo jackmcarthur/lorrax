@@ -521,8 +521,8 @@ wheel's headers; a CUDA run without it refuses at startup with
 `GATE mathdx-headers`.  The Perlmutter runtime venv carries it
 (`lorrax_cuda13_runtime/recipe/stack.sh` pins the version and
 `setup_env.sh` installs it `--no-deps`); `config/cloud/` does the same.  The
-compiled images are disk-cached (`ISDF_JAX_CACHE_DIR/kconv_mathdx`, default
-`~/.cache/lorrax/kconv_mathdx`; `docs/dev/env_vars.md`).
+compiled images are disk-cached in `$SCRATCH/.cache/lorrax/kconv_mathdx`
+(`docs/architecture/ffi_layout.md`, "Disk cubin cache").
 
 Porting to another SLURM cluster goes through `config/<cluster>/` —
 [`config/README.md`](../../config/README.md) §Porting is the knob list.

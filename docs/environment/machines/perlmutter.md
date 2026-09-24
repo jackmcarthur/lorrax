@@ -191,7 +191,7 @@ at `/global/common/software/m4598/jackm/lorrax_cuda13_runtime/.venv` carries
 `nvidia-mathdx==25.6.0` (installed 2026-09-24; pinned by the runtime
 `recipe/stack.sh`).  Nothing is linked or bind-mounted: the handler finds the
 headers through the package spec and compiles per k-grid with NVRTC, caching
-the images on disk (`docs/dev/env_vars.md`, `ISDF_JAX_CACHE_DIR`).
+the images in `$SCRATCH/.cache/lorrax/kconv_mathdx`.
 
 Staged once per cluster (idempotent, each ends with a `readelf -d` check;
 staging is mandatory because Shifter cannot mount the vendor `/opt/*` trees

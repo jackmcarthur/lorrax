@@ -1962,25 +1962,6 @@ def _resolve_cache_base_dir() -> tuple[str, str]:
     return "", "default cold"
 
 
-def kernel_cache_dir(name: str) -> str:
-    """Where a small device-kernel cache named ``name`` lives, or ``""`` (off).
-
-    For compile products this module does not manage itself — the
-    nvidia-mathdx k-convolution cubins (``ffi.fft``) — so they follow the same
-    one knob instead of inventing a second: ``ISDF_JAX_CACHE_DIR=<dir>`` puts
-    them in ``<dir>/<name>`` and ``ISDF_JAX_CACHE_DIR=""`` switches them off.
-    Unset, they use the runtime's per-user cache root ``~/.cache/lorrax``
-    (the minimax rule cache's).  Unlike the XLA cache they default ON: a
-    kernel image is a few hundred KB keyed by its full content hash and
-    re-verified on read, so reusing one across runs cannot change a result,
-    and recompiling it costs about 6 s per k-grid per process.
-    """
-    base, source = _resolve_cache_base_dir()
-    if source == "explicit":
-        return os.path.join(base, name) if base else ""
-    return os.path.join(os.path.expanduser("~"), ".cache", "lorrax", name)
-
-
 # ---------------------------------------------------------------------------
 # public entry point
 # ---------------------------------------------------------------------------

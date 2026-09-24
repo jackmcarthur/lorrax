@@ -775,23 +775,22 @@ toolkit's `include/` and `include/cccl` (libcu++) are derived from the loaded
 libnvrtc, never from an environment variable.  Nothing about mathdx is linked
 into `liblorrax_ffi.so`; the build needs no mathdx at all.
 
-**Disk cubin cache.** Cold NVRTC costs 5.9–7.5 s per (mode, grid) per process;
-a disk hit costs 8–10 ms (claims, `runs/runtime/kconv_stage2_20260924/`).  The
-router passes `cubin_dir` from `common.jax_compile_cache.kernel_cache_dir`:
-`ISDF_JAX_CACHE_DIR=<dir>` → `<dir>/kconv_mathdx`, `""` → off, unset →
-`~/.cache/lorrax/kconv_mathdx`.  The key is FNV-1a over the embedded source,
-the NVRTC options that decide the image (mode, grid, ns, rows per block, sm,
-precision), the wheel's `cufftdx_version.hpp`/`commondx_version.hpp` and the
-NVRTC version; the file name carries mode, grid, ns, precision, sm and the key.
-Writes go to a unique temporary and are `rename`d into place (atomic on one
-filesystem, so concurrent ranks each publish a whole file); reads re-hash the
-payload and recompile on any mismatch.  The startup `[kconv]` line names the
-directory, its image count and its size.  **Under `lx` the cache is off unless
-you name a directory:** the launcher sets `ISDF_JAX_CACHE_DIR=""` when it is
-unset (`lxkit.launcher_policy.apply_cache_policy`, the XLA cache's cold
-default), so a production campaign should set `ISDF_JAX_CACHE_DIR` to a
-rank-visible directory (measured: each process otherwise pays the cold compile,
-about 12 s for the two Σ modes on CrI3 8×8).
+**Disk cubin cache.** Cold NVRTC costs 5–7.5 s per (mode, grid) per process;
+a disk hit costs 8–10 ms (`runs/runtime/kconv_stage2_20260924/`).  The images
+live under their own always-on root, `ffi.fft.cubin_cache_dir()`:
+`$SCRATCH/.cache/lorrax/kconv_mathdx`, or `~/.cache/lorrax/kconv_mathdx` where
+the site defines no `SCRATCH`.  It is deliberately not the XLA compile cache's
+policy (`ISDF_JAX_CACHE_DIR`, which `lx` exports as `""`): this store is small
+and content-addressed, so reuse cannot change a result.  The key is FNV-1a over
+the embedded source, the NVRTC options that decide the image (mode, grid, ns,
+rows per block, sm, precision), the wheel's
+`cufftdx_version.hpp`/`commondx_version.hpp` and the NVRTC version; the file
+name carries mode, grid, ns, precision, sm and the key.  Writes go to a unique
+temporary and are `rename`d into place (atomic on one filesystem, so
+concurrent ranks each publish a whole file); reads re-hash the payload and
+recompile on any mismatch.  The startup `[kconv]` line names the directory
+with its image count and size, and every build logs `disk-cache hit` or
+`NVRTC built … stored` on rank 0.  No knob.
 
 A new mode is added in three steps:
 

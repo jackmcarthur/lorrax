@@ -144,7 +144,7 @@ __all__ = [
     "KCONV_PAIR_TARGET", "KCONV_PARENT_TARGET", "KCONV_KLEAD_TARGET",
     "KFFT_KLEAD_TARGET", "KCONV_KMINOR_TARGET", "KFFT_KMINOR_TARGET",
     "KCONV_TARGETS", "KCONV_AXIS_MAX",
-    "kconv_backend", "require_kconv", "mathdx_root", "conv_kpair_scale",
+    "kconv_backend", "require_kconv", "mathdx_root", "cubin_cache_dir", "conv_kpair_scale",
     "make_fused_conv_kpair", "make_fused_conv_kparent",
     "KConvStored", "make_kconv_klead", "make_kconv_kminor", "kconv_kminor_out_shape",
     "make_kfft_klead", "make_kfft_kminor",
@@ -528,9 +528,7 @@ def require_kconv(mesh: Mesh, *, announce: bool = True) -> str:
 def _cubin_cache_summary() -> str:
     """``<dir>: N images, X MB`` for the startup line (one flat directory, no walk)."""
     import os
-    d = _mathdx_common()["cubin_dir"]
-    if not d:
-        return "off (ISDF_JAX_CACHE_DIR=\"\")"
+    d = cubin_cache_dir()
     try:
         sizes = [e.stat().st_size for e in os.scandir(d)
                  if e.is_file() and e.name.endswith(".cubin")]
@@ -573,15 +571,26 @@ def _check_kgrid(kgrid) -> tuple[int, int, int]:
 
 def _mathdx_common() -> dict:
     """The two string attributes every mathdx handler takes: the wheel root and
-    the disk cubin cache directory.
+    the disk cubin cache directory (:func:`cubin_cache_dir`)."""
+    return dict(mathdx_root=mathdx_root(), cubin_dir=cubin_cache_dir())
 
-    The cache adds no knob (``common.jax_compile_cache.kernel_cache_dir``):
-    ``ISDF_JAX_CACHE_DIR=<dir>`` -> ``<dir>/kconv_mathdx``, ``=""`` -> off,
-    unset -> ``~/.cache/lorrax/kconv_mathdx``.  One directory for every world
-    size: a cubin depends on the device and the wheel, not on P.
+
+def cubin_cache_dir() -> str:
+    """Where the compiled mathdx kernels are kept: ``$SCRATCH/.cache/lorrax/kconv_mathdx``,
+    or ``~/.cache/lorrax/kconv_mathdx`` where the site defines no ``SCRATCH``.
+
+    Always on, and deliberately NOT the XLA compile cache's policy
+    (``ISDF_JAX_CACHE_DIR``, cold by default under ``lx``): this store is small
+    and content-addressed — each image is keyed by the full hash of its source,
+    NVRTC options, wheel version and NVRTC version, written by tmp+rename and
+    re-hashed on read — so reusing it can never change a result, while
+    rebuilding it costs about 6 s per (mode, k-grid) per process.  One
+    directory for every world size: an image depends on the device and the
+    wheel, not on P.  No knob.
     """
-    from common.jax_compile_cache import kernel_cache_dir
-    return dict(mathdx_root=mathdx_root(), cubin_dir=kernel_cache_dir("kconv_mathdx"))
+    import os
+    root = os.environ.get("SCRATCH") or os.path.expanduser("~")
+    return os.path.join(root, ".cache", "lorrax", "kconv_mathdx")
 
 
 # ---- the cpu leg: the MKL flat-k plan route ---------------------------------
