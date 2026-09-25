@@ -1007,8 +1007,14 @@ def _eigh_pad_sentinel(H):
 @timing.timed("sc.eigh", watch=True)
 def distributed_eigh_bands(H, *, mesh: Mesh,
                            distrib_la_batched_route: str = "batch_reshard",
-                           distrib_la_backend: str = "distributed"):
+                           distrib_la_backend: str = "distributed",
+                           eigenvalues_only: bool = False):
     """(E, U_qp) for every k through the ``distrib_la`` batched surface.
+
+    ``eigenvalues_only`` returns ``(E, None)``: the solve is the same, but a
+    padded ``U`` is never sliced to the logical extent -- that eager slice
+    cannot keep the band grid (``nb`` does not tile it) and replicates the
+    whole ``(nk, nb, nb)`` stack.
 
     ``H`` is ``(n_k, nb, nb)`` Hermitian at :func:`band_rotation_spec`;
     returns ``E`` ``(n_k, nb)`` replicated ascending and ``U_qp`` at the
@@ -1130,8 +1136,9 @@ def distributed_eigh_bands(H, *, mesh: Mesh,
         # LOGICAL extent, so no band-indexed operand beside the carry has to
         # know a pad ever existed.
         E = E[:, :nb]
-        U = U[:, :nb, :nb]
-    return E, U
+        if not eigenvalues_only:
+            U = U[:, :nb, :nb]
+    return E, (None if eigenvalues_only else U)
 
 
 def hartree_from_orbitals(psi_G, occ, kweights, wfn, *, mesh: Mesh,

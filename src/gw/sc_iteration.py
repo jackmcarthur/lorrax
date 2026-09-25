@@ -1293,7 +1293,8 @@ def _make_kshard_eigh(mesh_xy: Mesh, *, eigvalsh_only: bool,
     def _f(H):
         E, U = distributed_eigh_bands(
             H, mesh=mesh_xy, distrib_la_backend="off",
-            distrib_la_batched_route="batch_reshard")
+            distrib_la_batched_route="batch_reshard",
+            eigenvalues_only=eigvalsh_only)
         if eigvalsh_only:
             return E
         return E, (U if placement is None else jax.device_put(U, placement))
