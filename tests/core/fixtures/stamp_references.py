@@ -139,7 +139,15 @@ def expected(label: str) -> dict:
         #   served after that change.
         # - excited_state_ref.json: scalar-singlet exchange weight
         #   (a0bae022, re-frozen by 01465925).
+        # 2026-09-24 21:00 re-freeze (owner ruling 20:45, Jack McArthur,
+        # option (b)): the one-shot grows its Sigma grid by the SC rule
+        # (scissor.grow_sigma_support_ev, b12181a5), so an active state
+        # outside the requested grid reads Sigma(E) instead of Sigma(0).
+        # 14 of 30 GN-PPM eqp0 rows move by more than 0.5 meV (up to
+        # 1.123 eV; eqp1 up to 1.822 eV).  P4 B5 58849330.
         result["additional_reference_source_commits"] = {
+            "gnppm_one_shot_cover_growth":
+                "b12181a5fb46a6c97c46ce26c7ef144638602927",
             "htransform_bse_exciton":
                 "1fc5cb8f2b974a14ac1c5f97f5c9d7ee2be274b0",
             "bse_scalar_singlet_exchange":

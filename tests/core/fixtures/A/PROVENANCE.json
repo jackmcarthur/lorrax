@@ -1,6 +1,7 @@
 {
   "additional_reference_source_commits": {
     "bse_scalar_singlet_exchange": "01465925b7a12d63181a737f866a5c81f03a7b68",
+    "gnppm_one_shot_cover_growth": "b12181a5fb46a6c97c46ce26c7ef144638602927",
     "gnppm_static_omega0_box_rules_v4": "c52b2c42565dd53271ca3bf91c7a2cd0de99120b",
     "htransform_bse_exciton": "1fc5cb8f2b974a14ac1c5f97f5c9d7ee2be274b0"
   },
@@ -34,10 +35,10 @@
     "exciton.in": "ea390df406849da2619cb4a255c9f01a016fe87883ad045e66a8bfb39928680c",
     "exciton_gw.in": "7606603a39f62c2ade3d8d0e3930471749b89f8d0cfcd36b550000ae67337bd1",
     "gnppm.in": "02a33a66ee6034aa0b65d50a3dbdbc3d1e5ddb480d8a3c420d394341227ec41c",
-    "gnppm_eqp0.dat": "c008bbd61fbfbefdced5b80a3b1d97968206a32db8bf63f3051f6148c8e52280",
-    "gnppm_eqp1.dat": "140b862da3ac937bbfc6911019620bc6cb4f71f019c28f1a9a7e888e142a0a24",
-    "gnppm_sigma.dat": "2e29fe6be9a7340d2a9ff5314f80959d05919df2608d87cb45f727f5692c9438",
-    "gnppm_sigma.h5": "56666e11ce495fd4722a52a78cf6a7584bf58d88977571a7203728e4febfa76b",
+    "gnppm_eqp0.dat": "cfd15d2437dd8c39201030d5a3a33154693dd2bfc622df95e4328ea39662fc88",
+    "gnppm_eqp1.dat": "6c79f71ca122afebab8a0e9320a4b1647f257a846d5e9bd0b6c151e49ee3cf2b",
+    "gnppm_sigma.dat": "267cab56e3a6b78687587c7cb5e08bcc6a954ccb455db5877627ccf98bafd556",
+    "gnppm_sigma.h5": "31d8f2cfbf152601bcd6c8521a61de6fa98e79a3a2b01f10558953ed94af4795",
     "htransform.in": "6ad8419b584988496cbd18dd386c01d26ceed3fb25cfa8f35c75e198de1c114c",
     "kin_ion.h5": "f9434b0deccc7c5ae4aacfd48493b24d4654cabec60bda70941bfb682f3c4879",
     "kmeans.out": "7e60c6d2423019d4a758e2d6f643a2a851e11bafd00a11bf1269edd478053ef9",
