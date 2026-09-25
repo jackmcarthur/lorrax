@@ -292,11 +292,13 @@ def build_G_tau(psi_xn, psi_yr, enk, t, *, e_ref=0.0, mask=None,
                 band_weight=None, E_min=None, E_max=None,
                 layout='face', gemm=None, k_unfold_plan=None, band_range=None,
                 trim_zero_bands=False, prepared_active_gemm=None,
-                conjugate=False, unfold=True):
+                conjugate=False, unfold=True, right_k_unfold_plan=None):
     """Contract phases exp(-t*(energy-reference)) with energy windows, identity masks and signed weights.
 
     ``unfold=False`` returns the :class:`ParentGreen` pair instead of the
     full-k Green (the consumer does the typed unfold on its own load).
+    ``right_k_unfold_plan`` transports the right endpoint of a two-family
+    (charge x current) Green, as in :func:`build_G`.
     """
     real_weights = not jnp.issubdtype(jnp.result_type(t), jnp.complexfloating)
     if not real_weights:
@@ -329,7 +331,8 @@ def build_G_tau(psi_xn, psi_yr, enk, t, *, e_ref=0.0, mask=None,
             band_range=band_range, prepared_active_gemm=prepared_active_gemm)
     return build_G(
         psi_xn, psi_yr, phases=phases, layout=layout, gemm=gemm,
-        k_unfold_plan=k_unfold_plan, real_weights=real_weights,
+        k_unfold_plan=k_unfold_plan, right_k_unfold_plan=right_k_unfold_plan,
+        real_weights=real_weights,
         band_range=band_range, prepared_active_gemm=prepared_active_gemm,
         conjugate=conjugate)
 

@@ -206,7 +206,7 @@ def test_all_16_chi_blocks_nonzero_ct_literal_both_orientations(monkeypatch):
                                        err_msg=f'Lorentz block {(a,b)}')
 
 
-def _toy_plan(mesh):
+def _toy_plan(mesh, points=None, fft=(2, 2, 1)):
     """Build a physical glide/TR group on a 3x3 k mesh through SymMaps."""
     from symmetry_maps import SymMaps
     from gw.centroid_k_unfold import build_centroid_k_unfold_plan
@@ -219,8 +219,8 @@ def _toy_plan(mesh):
         avec=np.eye(3), atom_types=np.array([1,1]),
         atom_crys=np.array([[0.,0.,0.],[.5,.5,0.]]), trs_holds=True)
     sym = SymMaps(header)
-    points = np.array(list(np.ndindex(2,2,1)))
-    return build_centroid_k_unfold_plan(sym, points, (2,2,1), mesh, nspinor=4,
+    points = np.array(list(np.ndindex(2,2,1))) if points is None else points
+    return build_centroid_k_unfold_plan(sym, points, fft, mesh, nspinor=4,
                                        parent_k_frac=header.kpoints)
 
 
@@ -488,6 +488,51 @@ def test_parent_chi_equals_literal_full_k_for_all_16_blocks(monkeypatch):
                             jnp.asarray(energy), jnp.array(-.7), jnp.array(.4), operands)
             for (a, b), block in zip(pairs, actual):
                 np.testing.assert_allclose(block, expected[a, b], rtol=3e-12, atol=3e-12)
+
+
+def test_parent_chi_two_families_equals_literal_full_k(monkeypatch):
+    """Charge x current: a rectangular Green on the raw parents, each endpoint
+    transported by its own family's plan, equals the child-wavefunction sum."""
+    from gw.w_isdf import _get_chi_minimax_kernel, MinimaxNodes
+    _cpu_algebra(monkeypatch)
+    mesh = _mesh()
+    # Three glide orbits of a finer grid: a different extent, source map and
+    # lattice wraps from the charge family's.
+    current = np.array([[1, 0, 0], [2, 3, 0], [0, 0, 0], [2, 2, 0], [1, 1, 0], [3, 3, 0]])
+    plans = (_toy_plan(mesh), _toy_plan(mesh, points=current, fft=(4, 4, 1)))
+    assert plans[1].n_centroid_packed > plans[0].n_centroid_packed
+    rng = np.random.default_rng(115)
+    parents = []
+    for plan in plans:
+        shape = (plan.n_parent, 4, 4, plan.n_centroid_packed)
+        parent = (rng.normal(size=shape)+1j*rng.normal(size=shape))/3
+        parent[..., plan.layout.axis.packed_to_canonical < 0] = 0
+        parents.append(parent)
+    energy = np.tile([-1.2, -.7, .4, 1.3], (plans[0].n_parent, 1))
+    gamma = _gamma()[0]
+    expected = _chi_literal(_literal_children(parents[0], plans[0]),
+                            _literal_children(parents[1], plans[1]), gamma, .2,
+                            energy[plans[0].irr_idx])
+    assert np.max(np.abs(expected[0, 1:])) > .01
+    nodes = MinimaxNodes(t=jnp.array([.2], dtype=jnp.complex128),
+        alpha=jnp.array([-np.exp(-.2*1.1)], dtype=jnp.complex128))
+    mun = jax.device_put(parents[0].transpose(0, 2, 3, 1), NamedSharding(mesh, P(None, None, 'x', 'y')))
+    nmu = jax.device_put(parents[1], NamedSharding(mesh, P(None, 'x', None, 'y')))
+    shapes = [(p.n_parent, 4, p.n_centroid_packed, 4) for p in plans]
+    for left_vertices in ((0,), (1, 2, 3)):
+        for right_vertices in ((0,), (1, 2, 3)):
+            pairs = tuple((a, b) for a in left_vertices for b in right_vertices)
+            kernel = _get_chi_minimax_kernel(mesh, (3, 3, 1), layout='face', face_shape=shapes[0],
+                right_face_shape=shapes[1], vertex_pairs=pairs, k_unfold_plan=plans)
+            operands = tuple((jnp.argmax(jnp.abs(gamma[a]), axis=1),
+                              jnp.conj(jnp.sum(gamma[a], axis=1)),
+                              jnp.argmax(jnp.abs(gamma[b]), axis=1),
+                              jnp.conj(jnp.sum(gamma[b], axis=1))) for a, b in pairs)
+            actual = kernel(nodes, mun, nmu, jnp.asarray(energy < 0), jnp.asarray(energy > 0),
+                            jnp.asarray(energy), jnp.array(-.7), jnp.array(.4), operands)
+            for (a, b), block in zip(pairs, actual):
+                np.testing.assert_allclose(block, expected[a, b], rtol=3e-12, atol=3e-12,
+                                           err_msg=f'Lorentz block {(a, b)}')
 
 
 def test_full_band_unfold_matches_literal_sigma_on_symmetric_complete_toy(monkeypatch):
