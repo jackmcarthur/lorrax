@@ -553,9 +553,8 @@ def initialize_parallel_transport_artifact(
                     "band_layout": "P(None,None,x,y)",
                     "hermitian": True,
                     "nonzero_axes": "collapsed (one-point) axes only",
-                    "branch_cut": ("half a cell from the atoms' circular-"
-                                   "mean fractional coordinate, in the "
-                                   "vacuum"),
+                    "branch_cut": ("centre of the largest vacuum gap "
+                                   "(collapsed_axis_vacuum_gap)"),
                 })
         io.create_dataset(
             CONNECTION_REDUCED_DATASET, shape=(3, nk, nb, nb),
@@ -565,7 +564,9 @@ def initialize_parallel_transport_artifact(
                 "components": "reduced reciprocal coordinates",
                 "band_layout": "P(None,None,x,y)",
                 "hermitian": True,
+                # 4 everywhere keeps a 3D artifact's metadata unchanged.
                 "finite_difference_order": (
+                    4 if orders in (None, (4, 4, 4)) else
                     "per axis: 4 (>=5 points), 2 (3-4 points), "
                     "position operator (collapsed)"),
             })
