@@ -1109,10 +1109,8 @@ def build_mpa_fit(
         write_reflected=_write_reflected if ordered else None,
         print_fn=print_fn)
 
-    import jax
     from symmetry_maps import QirrOperator
-    V = jax.device_put(QirrOperator.of(V_q).at_rows(q_idx),
-                       NamedSharding(mesh_xy, P(None, "x", "y")))
+    V = QirrOperator.of(V_q).at_rows(q_idx)
     if wc_source is None:
         iteration_head = _solve_wc(
             sample_path, V, z_all, q_idx, meta, mesh_xy,
