@@ -26,6 +26,14 @@ those quantities contain physics there. Exit codes: 0 PASS, 1 FAIL,
       --wfn WFN.h5 --centroids centroids_frac_368.txt \
       --nval 4 --ncond 30 --nband 34 --out <evidence> [--plant conj_wrap|doublet_cut]
 
+Bispinor physics oracles: `bispinor_physics_oracles.py`, a pytest module on a
+4-device CPU mesh (literal dense oracles for the four-current signs, endpoint
+order, antiunitary rows, parent χ/Σ against full-k literals). Its name has no
+`test_` prefix, like every file here, so only an explicit path collects it:
+
+    JAX_PLATFORMS=cpu XLA_FLAGS=--xla_force_host_platform_device_count=4 \
+      python3 -m pytest -q -p no:cacheprovider tests/multi_device/bispinor_physics_oracles.py
+
 Tier-2 device-count-invariance gate: runs the gnppm + bispinor e2e fixtures at
 P=1 (1 GPU) and P=4 (4 GPUs, one process per device) and compares ζ / Σ_X /
 minimax node counts / invalid census / off-pole eqp against the tolerances
