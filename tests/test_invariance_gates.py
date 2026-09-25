@@ -36,6 +36,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from core.rank_session import _resolve_proc_count  # noqa: E402
 from harness import (          # noqa: E402
+    PAD_FLIP_EQP_ATOL_EV,
     REG,
     census_lines,
     copy_fixture,
