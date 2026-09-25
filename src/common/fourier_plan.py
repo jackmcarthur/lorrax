@@ -62,15 +62,16 @@ from common.fft_helpers import local_fftn3, local_ifftn3
 # A missing device, or an ``N`` outside the range, means FFT.  Sweep:
 # ``tests/bench/bench_fourier_plan.py``.
 #
-# A100 (complex128, production XLA flags): a batched cuFFT costs about one HBM
-# pass for every N in 2..256, so a full axis never gains from a GEMM past the
-# launch-latency regime (≤1e3 lines).  A supported axis's FFT arm costs about
-# five passes per sphere→box→sphere round trip (gathers, transform, takes); the
-# rotated GEMM chain replaces them with one GEMM pass per axis and wins for
-# 8 ≤ N ≤ 128 at K = N/2 (0.46–0.90 of the FFT arm on 12³–96³ and 24²–128²
-# boxes).  Below N = 8 the GEMM's contraction is too skinny (K = 2–3 loses).
+# A100, complex128, measured through the CUDA leg (one custom call): a batched
+# cuFFT costs about one HBM pass for every N in 2..256, and the Fourier ZGEMMs
+# (DMMA tensor cores, ~7 TFLOP/s at K ≈ 27–40) cost more than a pass, so a full
+# axis never takes the GEMM (1D 1.6–6×, 2-D/3-D grids 1.2–82×).  A supported
+# axis's FFT arm pays the zero-fill embed, the transform and the restriction;
+# the GEMM does all three in one pass: one way 0.50–0.82 and round trip
+# 0.45–0.87 of the FFT arm on 16³–96³ and 24²–128² boxes.  12³ loses (1.16:
+# launch-bound batched GEMMs), hence the floor at 16.
 GEMM_CROSSOVER: dict[str, tuple[range, range]] = {
-    "NVIDIA A100": (range(0), range(8, 129)),
+    "NVIDIA A100": (range(0), range(16, 129)),
 }
 
 _NORMS = (None, "backward", "ortho", "forward")
@@ -105,6 +106,11 @@ def gemm_crossover(device_kind: str) -> tuple[range, range]:
         if device_kind.startswith(prefix):
             return row
     return range(0), range(0)
+
+
+def _default_leg() -> str:
+    """``'ffi'`` (one ``lorrax_fourier_plan`` custom call) on CUDA, XLA ops elsewhere."""
+    return "ffi" if jax.default_backend() == "gpu" else "xla"
 
 
 class LocalFourierPlan:
@@ -150,6 +156,7 @@ class LocalFourierPlan:
 
         self.extents, self.axes, self.sign, self.norm = extents, axes, sign, norm
         gemm, fft, embed, take, self.stages = [], [], [], [], []
+        self._axis = {}                 # ax -> (n, in_idx, out_idx, supported_in, supported_out)
         for n, ax in zip(extents, axes):
             i_idx = np.asarray(in_support.get(ax, np.arange(n)), dtype=np.int64).ravel() % n
             o_idx = np.asarray(out_support.get(ax, np.arange(n)), dtype=np.int64).ravel() % n
@@ -158,6 +165,7 @@ class LocalFourierPlan:
             if np.unique(i_idx).size != i_idx.size:
                 raise ValueError(f"LocalFourierPlan: in_support on axis {ax} repeats an index")
             supported = ax in in_support or ax in out_support
+            self._axis[ax] = (n, i_idx, o_idx, ax in in_support, ax in out_support)
             if n in (n_sup if supported else n_full):
                 A = dft_matrix(n, o_idx, i_idx, sign=sign,
                                scale=_axis_scale(n, sign, norm), dtype=self.dtype)
@@ -184,6 +192,7 @@ class LocalFourierPlan:
         self._groups = (pre, mid, post)
         self.out_perm = None if out_perm is None else tuple(int(a) for a in out_perm)
         self._routes = {}
+        self._leg = _default_leg()
         fft_stages = self.stages
         self.stages = ([(ax, "gemm", A.shape[1], A.shape[0]) for _, ax, A in pre]
                        + fft_stages
@@ -198,6 +207,8 @@ class LocalFourierPlan:
             if x.shape[ax] != k:
                 raise ValueError(f"LocalFourierPlan: axis {ax} of x has extent "
                                  f"{x.shape[ax]}, the plan expects {k}")
+        if self._leg == "ffi":
+            return self._call_ffi(x)
         nd = x.ndim
         target = list(range(nd)) if self.out_perm is None else [a % nd for a in self.out_perm]
         if sorted(target) != list(range(nd)):
@@ -235,6 +246,40 @@ class LocalFourierPlan:
         if phys != target:
             x = jnp.transpose(x, [phys.index(a) for a in target])
         return x
+
+    def _call_ffi(self, x):
+        """The CUDA leg: the transform axes are moved trailing (free when they
+        already are), then one custom call executes the same stages row-major
+        (GEMMs by cuBLAS with the matrix broadcast, the FFT group by cuFFT)."""
+        from ffi.fft import fourier_plan_ffi
+        nd = x.ndim
+        phys = sorted(a % nd for a in self.axes)
+        trailing = list(range(nd - len(phys), nd))
+        if phys != trailing:
+            x = jnp.moveaxis(x, phys, trailing)
+        by_pos = {a % nd: a for a in self.axes}
+        pos = {by_pos[p]: i for i, p in enumerate(phys)}      # plan axis -> trailing slot
+        cols = [self._axis[by_pos[p]] for p in phys]
+        gemm_axes = {ax for kind, ax, _ in self._ops if kind == "gemm"}
+        order = []
+        for kind, ax, _ in self._ops:
+            if kind == "gemm":
+                order.append(pos[ax])
+            elif kind == "fft":
+                order.append(-1)
+        y = fourier_plan_ffi(
+            x, n=[c[0] for c in cols], kin=[c[1].size for c in cols],
+            kout=[c[2].size for c in cols], in_idx=np.concatenate([c[1] for c in cols]),
+            out_idx=np.concatenate([c[2] for c in cols]), sup_in=[int(c[3]) for c in cols],
+            sup_out=[int(c[4]) for c in cols],
+            gemm=[int(by_pos[p] in gemm_axes) for p in phys],
+            scale=[_axis_scale(c[0], self.sign, self.norm) for c in cols], order=order,
+            sign=self.sign)
+        if phys != trailing:
+            y = jnp.moveaxis(y, trailing, phys)
+        if self.out_perm is not None:
+            y = jnp.transpose(y, [a % nd for a in self.out_perm])
+        return y
 
     def _route(self, shape, target):
         """The GEMM order (within equal ratios) and output placements that
