@@ -17,6 +17,7 @@ reader arriving here can confirm the table without opening the loader.
 CUDA_TARGETS = ("lorrax_mathdx_kconv_pair", "lorrax_mathdx_kconv_parent",
                 "lorrax_mathdx_kconv_plane", "lorrax_mathdx_kconv_klead",
                 "lorrax_mathdx_kconv_klead_unfold_rows", "lorrax_mathdx_kconv_klead_lorentz_rows",
+                "lorrax_mathdx_kfft_klead_unfold",
                 "lorrax_mathdx_kfft_klead",
                 "lorrax_mathdx_kconv_kminor", "lorrax_mathdx_kfft_kminor")
 
@@ -29,6 +30,7 @@ CUDA_SYMBOLS = {
     "lorrax_mathdx_kconv_klead":  "KConvMathdxKleadCudaFfi",
     "lorrax_mathdx_kconv_klead_unfold_rows": "KConvMathdxKleadUnfoldRowsCudaFfi",
     "lorrax_mathdx_kconv_klead_lorentz_rows": "KConvMathdxKleadLorentzRowsCudaFfi",
+    "lorrax_mathdx_kfft_klead_unfold": "KFftMathdxKleadUnfoldCudaFfi",
     "lorrax_mathdx_kfft_klead":   "KFftMathdxKleadCudaFfi",
     "lorrax_mathdx_kconv_kminor": "KConvMathdxKminorCudaFfi",
     "lorrax_mathdx_kfft_kminor":  "KFftMathdxKminorCudaFfi",
