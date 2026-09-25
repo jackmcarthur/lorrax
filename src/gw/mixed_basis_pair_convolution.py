@@ -329,6 +329,58 @@ def alias_free_margin(fft_grid, left_support, right_support, out_support) -> np.
     return out
 
 
+def screened_coulomb_cutoff_cap(fft_grid, psi: SphereSet, *, bvec, q_frac) -> float:
+    """The largest χ-sphere cutoff (Ry) the box keeps alias-free, measured on these spheres.
+
+    ``alias_free_margin`` allows the output Miller window ``[hi − N + 1, lo + N − 1]``
+    per axis (``lo``/``hi`` the product's reach from the recentred ψ union support,
+    umklapp included); the cap is the smallest ``|q + G|²`` (``vcoul``'s metric,
+    ``(q + G)·bvec``) over the recentred ``q_frac`` rows and every G outside that
+    window: a sphere strictly below it keeps every margin ≥ 1.  On a density box
+    (N = 4·g_ψ + 1) it sits below 4·ecutwfc, the reach of a pair product.
+    """
+    fg = np.asarray(fft_grid, dtype=np.int64)
+    sup = psi.recentred().union_support()
+    lo_ok, hi_ok = np.empty(3, np.int64), np.empty(3, np.int64)
+    for a in range(3):
+        s = np.asarray(sup[a], np.int64)
+        lo, hi = int(s.min() - s.max() - 1), int(s.max() - s.min() + 1)
+        lo_ok[a], hi_ok[a] = hi - int(fg[a]) + 1, lo + int(fg[a]) - 1
+    q = np.asarray(q_frac, np.float64)
+    q = q - np.rint(q)
+    span = int(np.max(np.abs(np.concatenate([lo_ok, hi_ok])))) + 2
+    rng = np.arange(-span, span + 1)
+    G = np.stack(np.meshgrid(rng, rng, rng, indexing="ij"), -1).reshape(-1, 3)
+    outside = np.any((G < lo_ok) | (G > hi_ok), axis=1)
+    b = np.asarray(bvec, np.float64)
+    e = [np.min(np.sum(((qi[None, :] + G[outside]) @ b) ** 2, axis=1)) for qi in q]
+    return float(min(e))
+
+
+def screened_sphere_set(*, fft_grid, psi: SphereSet, bvec, q_frac, ecutwfc: float,
+                        screened_coulomb_cutoff: float | None = None) -> SphereSet:
+    """The χ_q(G, G') output sphere at the ``q_frac`` rows from the deck key
+    ``screened_coulomb_cutoff`` (Ry; unset = ``ecutwfc``), on the WFN's FFT box.
+
+    Refuses ``GATE screened-coulomb-cutoff`` at or above the box's measured alias cap
+    (``screened_coulomb_cutoff_cap``).  The sphere is ``common.coulomb_sphere``'s
+    ``|q + G|² ≤ cutoff`` in its padded layout."""
+    from common.coulomb_sphere import compute_per_q_bare_coulomb_components
+    cut = float(ecutwfc if screened_coulomb_cutoff is None else screened_coulomb_cutoff)
+    cap = screened_coulomb_cutoff_cap(fft_grid, psi, bvec=bvec, q_frac=q_frac)
+    if not 0.0 < cut < cap:
+        raise ValueError(
+            f"GATE screened-coulomb-cutoff: got {cut:g} Ry ({cut / ecutwfc:.3f}·ecutwfc); want "
+            f"0 < cutoff < {cap:.4f} Ry ({cap / ecutwfc:.3f}·ecutwfc), this FFT box's measured alias "
+            f"cap for {tuple(int(v) for v in fft_grid)}; why: a larger χ sphere holds G onto which "
+            "frequencies of the ψ-pair product fold on this box; fix: lower screened_coulomb_cutoff")
+    pkg = compute_per_q_bare_coulomb_components(fft_grid=tuple(int(v) for v in fft_grid),
+                                                bvec=bvec, q_irr_frac=np.asarray(q_frac),
+                                                vcoul_cutoff_ry=cut, sys_dim=3)
+    return SphereSet(np.asarray(pkg["gvec_components_padded"]).transpose(0, 2, 1),
+                     np.asarray(pkg["ngk_per_q"]), np.asarray(q_frac))
+
+
 @dataclasses.dataclass(frozen=True)
 class PairConvChunks:
     """The budget-derived schedule: r' chunks, batch width, k and q chunks, and the byte model."""
@@ -697,8 +749,9 @@ class MixedBasisPairConvolution:
         S = wedge.sym_matrices[wedge.spatial]
         grid = np.stack(np.unravel_index(np.arange(nr), self.fft_grid), axis=-1).astype(np.int32)
         alpha, L = centroid_source_map_and_wrap(grid, S, wedge.translations[wedge.spatial], fg)
-        labels = permutation_orbit_labels(alpha)
-        n_orb = int(labels.max()) + 1
+        layout = build_grouped_shard_layout(permutation_orbit_labels(alpha), P_)
+        labels = np.asarray(layout.canonical_group_id, np.int64)          # the layout's orbit ids
+        n_orb = int(layout.n_groups)
         rep = np.full(n_orb, nr, np.int64)
         np.minimum.at(rep, labels, np.arange(nr))
         hit = alpha == rep[labels][None, :]                               # (n_rows, N_r)
@@ -706,7 +759,6 @@ class MixedBasisPairConvolution:
             raise AssertionError("ColumnWedge: an orbit member no row sources from its representative")
         jrow = np.argmax(hit, axis=0)                                     # lowest row per member
         Lm = L[jrow, np.arange(nr)].astype(np.float64)                    # (N_r, 3)
-        layout = build_grouped_shard_layout(labels, P_)
         reps, rep_loc = [], np.empty(n_orb, np.int64)
         for r in range(P_):
             orbs = np.flatnonzero(layout.group_owner == r)
