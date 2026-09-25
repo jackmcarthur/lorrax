@@ -1521,6 +1521,22 @@ def _sc_eigh_bands(H: jax.Array, *, kind: str, mesh_xy: Mesh, config):
         f"{kind!r}.")
 
 
+def qp_eigh(H: jax.Array, *, mesh_xy: Mesh, config, print_fn):
+    """``(E, U)`` of a QP Hamiltonian stack through :func:`_sc_eigh_bands`.
+
+    The one-shot and fixed-point QP solves diagonalise ``H = kin_ion + Σ``
+    through the same door as every SC map (so SC map 0 and the one-shot share
+    their eigensolver): ``H`` is hermitised on the band grid, the k batch is
+    staged over the mesh (or each tile distributed, per
+    :func:`_resolve_sc_eigh`), ``E`` returns replicated and ``U`` is
+    replicated for the host writers -- 16 nk nb^2 B per device, the TASTE 1
+    Σ-window figure the kin_ion loader states.
+    """
+    kind = _resolve_sc_eigh(int(H.shape[1]), mesh_xy, config, print_fn=print_fn)
+    E, U = _sc_eigh_bands(H, kind=kind, mesh_xy=mesh_xy, config=config)
+    return E, jax.device_put(U, NamedSharding(mesh_xy, P(None, None, None)))
+
+
 def _band_rotation_spec() -> P:
     """``gw.qsgw_density.band_rotation_spec()``, resolved lazily.
 
