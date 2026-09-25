@@ -59,12 +59,12 @@ Backends, chosen when the plan is built:
   gathers that embed and restrict the supports, and the product in XLA.
 
 ``backend='xla'`` on a CUDA mesh is the parity and benchmark arm; production
-passes nothing.
+passes nothing.  n_s is 1, 2 or 4 (the bispinor width; mode 6 takes n_s ≤ 4): the
+spin blocks ride as axes of every stage and meet only in the step-5 trace.
 """
 from __future__ import annotations
 
 import dataclasses
-import math
 
 import numpy as np
 import jax
