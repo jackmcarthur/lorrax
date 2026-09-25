@@ -341,8 +341,7 @@ def inspect_deck(args) -> None:
     print("MEMORY_DIALS "
           f"per_device={memory_value}; chunk_utilization="
           f"{memory.chunk_target_utilization:g}; "
-          f"band={memory.band_chunk_size}; vq_g={memory.vq_g_chunk_size}; "
-          f"low_mem_bands={memory.low_mem_bands}")
+          f"band={memory.band_chunk_size}; vq_g={memory.vq_g_chunk_size}")
     print(f"LINALG_DIALS {config.backend.summary()}")
 
     from lxkit.launcher_policy import square_mesh, validate_geometry

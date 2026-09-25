@@ -812,8 +812,8 @@ def eigh_backend_choices() -> tuple:
 DISTRIB_LA_BATCHED_ROUTE_DEFAULT = "batch_reshard"
 
 # The owner-selected automatic band chunk remains the implementation policy
-# after the numeric deck key is retired.  ``low_mem_bands`` selects the carrier;
-# the chunk planner still mesh-rounds and caps this request at the fit window.
+# after the numeric deck key is retired; the chunk planner mesh-rounds and
+# caps this request at the fit window.
 AUTOMATIC_BAND_CHUNK_SIZE = 16
 
 
@@ -1498,10 +1498,6 @@ _DEFAULTS = {
     "gamma_contract_mode": "take",
     # Memory / chunking
     "memory_per_device_gb": 0.0,  # 0 = auto-detect
-    # One raw-parent carrier: face (default) shards bands and centroids,
-    # 2*S/(Px*Py) per rank; axis keeps full bands, S/Px + S/Py.
-    # Both layouts share the Green, screening and self-energy algorithms.
-    "low_mem_bands": True,
     # ISDF
     # Which of the TWO W Dyson plans solves A·W = V, A = (1 - Vχ₀):
     #   local (default; auto is an alias)
@@ -2679,16 +2675,13 @@ def _input_iteration(
 
 
 def _input_memory_group(
-        _named_keys, chunk_utilization, memory_per_device_gb, params, print_fn):
-    """Resolve the requested parent layout and memory settings."""
+        chunk_utilization, memory_per_device_gb, params, print_fn):
+    """Resolve the memory settings."""
     memory = MemoryConfig(
         per_device_gb=memory_per_device_gb,
         chunk_target_utilization=chunk_utilization,
         band_chunk_size=AUTOMATIC_BAND_CHUNK_SIZE,
         vq_g_chunk_size=int(params["vq_g_chunk_size"]),
-        low_mem_bands=bool(params["low_mem_bands"]),
-        low_mem_bands_provenance=(
-            "deck" if "low_mem_bands" in _named_keys else "default"),
     )
     return (memory)
 
@@ -2956,13 +2949,13 @@ def _report_early_retired_keys(
         warnings.warn(
             "Input key 'chunk_size' is no longer supported and will be "
             "ignored (it was a no-op; chunk sizing is planner-owned — "
-            "see 'memory_per_device_gb' / 'low_mem_bands').",
+            "see 'memory_per_device_gb').",
             DeprecationWarning, stacklevel=2,
         )
         retired.append((
             "chunk_size",
             "IGNORED — it was a no-op; chunk sizing is planner-owned "
-            "(see 'memory_per_device_gb' / 'low_mem_bands')"))
+            "(see 'memory_per_device_gb')"))
     for legacy_key in ("output_file", "eqp_output_file"):
         if section.get(legacy_key, fallback=None) is not None:
             import warnings
@@ -3104,8 +3097,16 @@ def _report_remaining_retired_keys(
                 "'linalg = local | distributed'.")
     if section.get("band_chunk_size", fallback=None) is not None:
         raise ValueError(
-            "Input key 'band_chunk_size' is retired; use "
-            "'low_mem_bands = true | false' (chunk size is automatic).")
+            "Input key 'band_chunk_size' is retired; band chunks are sized "
+            "from memory_per_device_gb.  Remove the key.")
+    if section.get("low_mem_bands", fallback=None) is not None:
+        raise ValueError(
+            "Input key 'low_mem_bands' is retired: ψ is always stored "
+            "band-distributed (bands on one mesh axis, centroids on the "
+            "other), and each band contraction gathers its band panels in "
+            "as few chunks as memory_per_device_gb allows "
+            "(docs/architecture/memory-model.md, ψ carriers).  Remove the "
+            "key.")
     for legacy_key in ("r_chunk_size", "gflat_chunk_size"):
         if section.get(legacy_key, fallback=None) is not None:
             raise ValueError(
@@ -3317,8 +3318,8 @@ def refuse_unsupported_bgw_metal_q0_treatment(config) -> None:
         "bgw_metal_q0_treatment.")
 
 
-# GW uses typed raw parents; the low_mem_bands transition is recorded in
-# docs/architecture/decisions.md. Explicit dense Gij inputs refuse below.
+# GW uses typed raw parents on band-distributed faces. Explicit dense Gij
+# inputs refuse below.
 
 #: How a reader should read an unmet envelope condition.  PHYSICS means the
 #: quantity does not exist outside the condition; IMPLEMENTATION LIMIT means
@@ -3820,21 +3821,19 @@ def refuse_unsupported_bispinor_tt_head_correction(config) -> None:
             "head_correction.")
 
 
-def refuse_explicit_gij_under_low_mem_bands(config, Gij) -> None:
+def refuse_explicit_gij(Gij) -> None:
     """Require diagonal occupation data for the parent Green contraction."""
     if Gij is None:
         return
-    layout = "face" if config.memory.low_mem_bands else "axis"
     raise ValueError(
-        "GATE low_mem_bands_explicit_gij_unported: "
-        "an explicit Gij operand is refused under either parent layout.\n"
-        f"  got:  layout={layout}, Gij is not None (explicit dense "
-        "band-space occupation projector)\n"
-        "  want: Gij = None under both face and axis layouts\n"
+        "GATE explicit_gij_unported: an explicit Gij operand is refused.\n"
+        "  got:  Gij is not None (explicit dense band-space occupation "
+        "projector)\n"
+        "  want: Gij = None\n"
         "  fix:  use occupation_state for diagonal band weights\n"
         "  why:  parent Green contractions consume diagonal occupation "
         "weights; a dense band-space occupation projector is not supported\n"
-        "  doc:  docs/input_reference.md '## ISDF / zeta', low_mem_bands.")
+        "  doc:  docs/architecture/memory-model.md, ψ carriers.")
 
 
 def _parse_bgw_metal_q0_vector(value) -> tuple[float, float, float]:
@@ -4354,8 +4353,6 @@ class MemoryConfig:
     chunk_target_utilization: float
     band_chunk_size: int
     vq_g_chunk_size: int          # 0 = auto v_q_g_flat._plan_vq_tiles
-    low_mem_bands: bool           # parent ψ layout: face=True, axis=False
-    low_mem_bands_provenance: str  # deck | default | derived for packed mode
 
 
 @dataclass(frozen=True)
@@ -4886,7 +4883,7 @@ class LorraxConfig:
         (sc, eqp2) = _input_iteration(
             _linalg, params, print_fn)
         (memory) = _input_memory_group(
-            _named_keys, chunk_utilization, memory_per_device_gb, params, print_fn)
+            chunk_utilization, memory_per_device_gb, params, print_fn)
         (backend) = _input_backend(
             _linalg, params, runtime_platform)
         (_restart_q_storage, _qp_rot_k_storage, debug, bse) = _input_storage(

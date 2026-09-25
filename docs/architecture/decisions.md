@@ -11,6 +11,20 @@ The last two sections are agent-tier: the GW driver's binding invariants and
 the per-function contracts of `gw.gw_config`, whose one-line docstrings point
 here.
 
+## 2026-09-24 — One memory path per stage; chunk counts come from the budget
+
+A stage that can exceed the device budget derives its chunk count from the
+budget and runs one chunk when everything fits. It never branches into a
+second layout or a low/high-memory mode, and a modest cost is accepted for
+that (owner; sandbox `TASTE.md` 96).
+
+* **ψ is band-distributed.** One `ParentGreenCarrier` holds two packed
+  raw-parent copies with bands on one mesh axis and centroids on the other,
+  `2·16·n_par·n_s·μ·N_b/P` per rank, for every spinor extent and both
+  centroid families. Canonical files are processor-grid independent and read
+  into these faces. `low_mem_bands` refuses by name. An explicit dense `Gij`
+  operand refuses (`GATE explicit_gij_unported`).
+
 ## 2026-09-24 — NVIDIA k-convolutions run on nvidia-mathdx, behind one platform router
 
 **Rule.** Physics code calls one backend-agnostic entry per k-axis operation:
@@ -59,19 +73,6 @@ by its own convergence. The Gram gate is unchanged; a headless run may still
 refuse at `GATE shared_pole_gram_valid`. An ordered (time-reversal-broken)
 store refuses `head_correction = full` (`GATE shared_pole_head_ordered`) and
 carries the direct head (`no_local_fields`) instead.
-
-## 2026-09-06 — Both `low_mem_bands` values select parent ψ shardings
-
-`true` selects the `face` layout and `false` the `axis` layout, for every
-spinor extent and both centroid families. One `ParentGreenCarrier` holds two
-packed raw-parent copies; its static layout chooses their band sharding and
-the `distrib_la` matmul plan. The Green builder and the two-GEMM band
-projector are shared. Axis band contractions have no collectives; projecting
-the tiled centroid operator keeps the X/Y centroid reduce-scatters and the
-final psums. Canonical files are processor-grid independent and read into
-either layout. The carrier stays resident through screening and Σ, which
-consume the same wavefunction bundle. An explicit dense `Gij` operand refuses
-under either layout (`GATE low_mem_bands_explicit_gij_unported`).
 
 ## 2026-09-06 — The GW carrier is the raw parent
 
@@ -244,8 +245,7 @@ second helper).
 
 The ζ fit transports ψ in band chunks of 16
 (`gw_config.AUTOMATIC_BAND_CHUNK_SIZE`), mesh-rounded and capped at the
-logical ζ window. There is no deck key: `band_chunk_size` refuses and names
-`low_mem_bands`, which selects the carrier. The physics band window is the
+logical ζ window. There is no deck key: `band_chunk_size` refuses. The physics band window is the
 same in every mode; mesh pad bands are exact zeros. The ψ(r) cache is one
 rectangular, all-P band-sharded `lax.scan` result, so a 50-band window stores
 64 slots. A ragged tail would split the cache/slice ABI into a second

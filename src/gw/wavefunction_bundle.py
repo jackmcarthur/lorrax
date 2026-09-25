@@ -683,8 +683,7 @@ def wavefunctions_face_from_restart(
     basis_receipt=None, layout="face",
 ) -> Wavefunctions:
     """Assemble the ``layout="face"`` bundle from arrays ALREADY read at
-    their face specs (``file_io.load_restart_state_from_h5``,
-    ``low_mem_bands=True``) — no resharding constraint applied to either
+    their face specs (``file_io.load_restart_state_from_h5``) — no resharding constraint applied to either
     face, since each was read as its own direct SlabIO hyperslab.  Mirrors
     :func:`build_wavefunctions_face`'s ``occ``/``enk`` handling exactly
     (same ``_build_occ`` call, same replicated placement) so a restart

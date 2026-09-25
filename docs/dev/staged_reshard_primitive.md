@@ -40,8 +40,8 @@ GEMM plans eagerly. Call it synchronously on every rank, outside any trace.
 | `layout` | operands | mechanism | collectives | consumers |
 |---|---|---|---|---|
 | `legacy` | ψ band axis replicated going in (`psi_xr`, `psi_yn`) | one `shard_map`: right GEMM → `psum_scatter('y')` → left GEMM → `psum_scatter('x')` | two, the large one on `'y'` | `bse.bse_ring_comm` (`extra="leading"`), `common.zeta_projection` |
-| `face` | two-face carrier (`psi_nmu`, `psi_mun`, 2-D sharded from the start) | two planned `distrib_la.gemm_plan` N,N GEMMs, `T = O·ψ_mun`, `Σ = conj(ψ_nmu)·T` | inside the provider | GW Σ (`gw.ppm_tau_kernel`, `cohsex_sigma`, `photon_sigma`, `mpa.sector_sigma`) with `low_mem_bands = true` |
-| `axis` | every band local, centroid split over one mesh axis | local slab contraction, then `reduce_scatter_to_band_block` | one, `nb²` per rank | the same GW Σ consumers with `low_mem_bands = false` |
+| `face` | two-face carrier (`psi_nmu`, `psi_mun`, 2-D sharded from the start) | two planned `distrib_la.gemm_plan` N,N GEMMs, `T = O·ψ_mun`, `Σ = conj(ψ_nmu)·T` | inside the provider | GW Σ (`gw.ppm_tau_kernel`, `cohsex_sigma`, `photon_sigma`, `mpa.sector_sigma`) on the band-distributed ψ carrier |
+| `axis` | every band local, centroid split over one mesh axis | local slab contraction, then `reduce_scatter_to_band_block` | one, `nb²` per rank | the face projector after it reshards ψ to band-complete copies, and the spin-pair streams |
 
 Face and axis require `face_shape`, refuse any `extra` other than `"none"`
 (call once per slice instead), and accept `channels ∈ {"none", "split_reim"}`.

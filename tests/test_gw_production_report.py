@@ -35,7 +35,7 @@ def _config():
             distrib_la_batched_route="batch_reshard",
         ),
         memory=SimpleNamespace(
-            per_device_gb=40.0, low_mem_bands=False, band_chunk_size=16),
+            per_device_gb=40.0, band_chunk_size=16),
         raw_input_keys=frozenset(),
         screening=SimpleNamespace(
             diagrams=SimpleNamespace(value="w_rpa"), method="minimax"),
@@ -414,15 +414,12 @@ def test_local_linalg_warning_has_dense_matrix_numbers(tmp_path):
         "16 B = 18.8 MiB per task, complex128) plus their factor workspace; "
         "on large systems where that is a large fraction of memory per "
         "task, set linalg = distributed" in text)
-    assert "[config provenance] low_mem_bands = false (default)" in text
 
 
 def test_parent_carrier_description_has_automatic_chunk_number(tmp_path):
     path = tmp_path / "gwjax.out"
     config = _config()
-    config.memory.low_mem_bands = True
     config.memory.band_chunk_size = 24
-    config.raw_input_keys = frozenset({"low_mem_bands"})
     report = GWProductionReport(
         str(path), runtime=_runtime(), debug=False, stdout=lambda line: None)
     report.layout_dials(
@@ -430,11 +427,10 @@ def test_parent_carrier_description_has_automatic_chunk_number(tmp_path):
     report.finish()
 
     text = path.read_text(encoding="utf-8")
-    assert "[config provenance] low_mem_bands = true (deck)" in text
     assert (
-        "low_mem_bands = true: face parent carrier; distributed GEMM; "
-        "band chunks of 24." in text)
-    assert "set false" not in text
+        "ψ parent carrier: band-distributed faces; band contractions gather "
+        "their band panels in memory-sized chunks; band chunks of 24." in text)
+    assert "low_mem_bands" not in text
 
 
 def test_distributed_linalg_reports_2d_layout(tmp_path):

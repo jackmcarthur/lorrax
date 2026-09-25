@@ -320,9 +320,9 @@ def _unfold_wedge(A, tables, n_rmu_pad, mesh_xy):
         n_sym_spatial=int(t.n_sym_spatial))
 
 
-def read_restart_state_from_h5(filename, mesh_xy, *, low_mem_bands=False,
+def read_restart_state_from_h5(filename, mesh_xy, *,
                                band_receipt=None, n_band_carrier=None):
-    """Read raw parent faces and canonical tensors through SlabIO. Spin is a shape; low_mem_bands selects only face partition specs."""
+    """Read raw parent faces (band-distributed) and canonical tensors through SlabIO. Spin is a shape."""
     from .slab_io import SlabIO
     from common.collectives import device_put_process_local
 
@@ -384,7 +384,7 @@ def read_restart_state_from_h5(filename, mesh_xy, *, low_mem_bands=False,
 
     # ---- pass 2: the N_mu²-class and ψ tensors, one tile per rank -------
     from common.wfn_layout import psi_specs
-    psi_nmu_spec, psi_mun_spec = psi_specs("face" if low_mem_bands else "axis")
+    psi_nmu_spec, psi_mun_spec = psi_specs("face")
 
     def _read_munu(io, name):
         if name not in shapes:
@@ -527,7 +527,7 @@ def read_restart_state_from_h5(filename, mesh_xy, *, low_mem_bands=False,
         parent_k_rows=parent_k_rows,
         psi_nmu_parent_transverse=psi_nmu_parent_T,
         psi_mun_parent_transverse=psi_mun_parent_T,
-        layout="face" if low_mem_bands else "axis",
+        layout="face",
     )
 
 
@@ -578,7 +578,7 @@ def read_munu_tensor_from_h5(filename, name, mesh_xy, *, n_rmu_logical=None):
 
 
 def load_restart_state_from_h5(filename, mesh_xy, band_slices=None,
-                              n_rmu_logical=None, low_mem_bands=False):
+                              n_rmu_logical=None):
     """Return the canonical parent state namespace at the requested band layout. All μ axes are canonical and padded; GW packs them in its authenticated basis."""
     from types import SimpleNamespace
     # Loud-fail BEFORE any tensor is trusted (see the function's docstring).
@@ -604,8 +604,7 @@ def load_restart_state_from_h5(filename, mesh_xy, band_slices=None,
             band_axis.divisor, name=band_axis.name)
 
     return read_restart_state_from_h5(
-        filename, mesh_xy, low_mem_bands=bool(low_mem_bands),
-        band_receipt=band_axis)
+        filename, mesh_xy, band_receipt=band_axis)
 
 
 def unfold_parent_faces(faces, restart_file, input_file, mesh_xy, *, family="charge"):

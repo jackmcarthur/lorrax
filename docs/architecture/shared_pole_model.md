@@ -252,10 +252,10 @@ and column panels (`gw.mpa.sigma._shared_pole_w_synthesis`):
 $$ W_{c,+}(q,\tau) = b\,\mathrm{diag}\big(d_j(\tau)\big)\,b^{\dagger}, \qquad
 d_j(\tau) = \frac{e^{-i(\Omega_j - E_{\rm ref})\tau}}{2\Omega_j} . \tag{SP 4} $$
 
-Synthesis uses the Green-function GEMM (`build_G`) in the wavefunction layout:
-with `low_mem_bands = true` the factors are face-sharded,
-`P(None,'x',None,'y')`; otherwise each centroid endpoint is split over its mesh
-axis with the pole columns replicated. The synthesized $W$ always uses both mesh
+Synthesis uses the Green-function GEMM (`build_G`). The factors are
+face-sharded, `P(None,'x',None,'y')`, or, when the panel search admits the
+replicated pole columns, each centroid endpoint is split over its mesh axis
+with the pole columns replicated. The synthesized $W$ always uses both mesh
 axes. A resident factor set is read once per Σ call; otherwise the store reader
 supplies bounded panels per τ, which changes storage and summation order, never
 the number of spatial calls.

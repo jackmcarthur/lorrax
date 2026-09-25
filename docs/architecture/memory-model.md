@@ -50,11 +50,12 @@ stages, sets the node count.
 ## ψ carriers: face and band-complete
 
 The raw-parent carrier holds two orientations of `ψ_{n k̄ s}(r_μ)` on the
-`n_par` parents. `low_mem_bands` chooses how they are tiled:
+`n_par` parents. They are stored as faces; a local band contraction needs
+the band-complete (axis) orientation:
 
 ```text
-face  (true, default)  M_face = 2·16·n_par·n_s·μ·N_b / P              μ and bands both tiled
-axis  (false)          M_axis = 16·n_par·n_s·μ·N_b·(1/p_x + 1/p_y)
+face  (stored)         M_face = 2·16·n_par·n_s·μ·N_b / P              μ and bands both tiled
+axis  (band-complete)  M_axis = 16·n_par·n_s·μ·N_b·(1/p_x + 1/p_y)
                               = 2·16·n_par·n_s·μ·N_b / √P              bands complete on every rank
 ```
 
@@ -68,7 +69,7 @@ M_axis / G_tile = 2·s·r·√P / n_s       grows as √P
 
 The axis copies overtake one Green tile at `√P = n_s/(2·s·r)`. Past that
 point they spend the GW feasibility floor (`4·G_tile`) on wavefunctions, so
-`low_mem_bands = true` is mandatory there. For `μ = 10·N_b` (`r = 0.1`):
+only the faces are feasible there. For `μ = 10·N_b` (`r = 0.1`):
 
 | P | n_s=1, s=1 | n_s=2, s=1 | n_s=4, s=1 | n_s=2, s=1/6 |
 |---|---|---|---|---|
