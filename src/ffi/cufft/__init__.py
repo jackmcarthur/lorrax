@@ -18,7 +18,8 @@ CUDA_TARGETS = ("lorrax_mathdx_kconv_pair", "lorrax_mathdx_kconv_parent",
                 "lorrax_mathdx_kconv_plane", "lorrax_mathdx_kconv_klead",
                 "lorrax_mathdx_kconv_klead_unfold_rows", "lorrax_mathdx_kconv_klead_lorentz_rows",
                 "lorrax_mathdx_kfft_klead",
-                "lorrax_mathdx_kconv_kminor", "lorrax_mathdx_kfft_kminor")
+                "lorrax_mathdx_kconv_kminor", "lorrax_mathdx_kfft_kminor",
+                "lorrax_mathdx_plane_fft_gather")
 
 #: target → the C++ symbol THIS library exports (host exports different
 #: symbols for the same targets; see ``ffi_loader._CUDA_TARGET_SYMBOLS``).
@@ -32,6 +33,7 @@ CUDA_SYMBOLS = {
     "lorrax_mathdx_kfft_klead":   "KFftMathdxKleadCudaFfi",
     "lorrax_mathdx_kconv_kminor": "KConvMathdxKminorCudaFfi",
     "lorrax_mathdx_kfft_kminor":  "KFftMathdxKminorCudaFfi",
+    "lorrax_mathdx_plane_fft_gather": "PlaneFftGatherMathdxCudaFfi",
 }
 
 __all__ = ["CUDA_TARGETS", "CUDA_SYMBOLS"]

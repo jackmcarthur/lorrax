@@ -54,6 +54,13 @@
 //             product/sum order are those of the XLA chain it replaces (mode-3
 //             transforms and a scan over the blocks), so it is meant to equal
 //             that chain bit for bit.  It needs a whole spin group per block.
+//  10 plane fft gather   Y[..., kb, kc] = FFT2_{b,c}(plane[..., b, c]) (forward,
+//             unscaled: jnp.fft.fftn(norm='backward') over the last two axes)
+//             where the plane is the route-G cylinder F (..., n_col) scattered
+//             to its static cells and zero elsewhere.  The zero plane is never
+//             written: the row FFTs run on the occupied rows only, gathering
+//             their cells on load, then the column FFTs read dead rows as zero.
+//             Its own embedded source, kPlaneSrc (see there).
 // A new mode adds (1) an entry under its LRX_MODE value in kSrc, (2) a mode
 // code and a handler below, (3) a router factory in ffi/fft.py.
 //
@@ -775,6 +782,122 @@ extern "C" __global__ void __launch_bounds__(256) lrx_kconv(
 )__lrx__";
 
 // ---------------------------------------------------------------------------
+//  Mode 10: the plane FFT with gather-on-load.  Its own embedded source: it
+//  shares the build, the NVRTC options and the cubin cache with the family,
+//  not its kernels.  Compile-time: LRX_NX = n_b, LRX_NY = n_c (the plane),
+//  LRX_NZ = b1, LRX_NS = c1: the Good-Thomas splits n_b = b1*b2 and
+//  n_c = c1*c2 (gcd 1, every factor <= 40, b2 = c2 = 1 for an axis <= 40), so
+//  every line FFT is a cuFFTDx thread FFT and the splits need index maps only,
+//  no twiddle.  One block per plane keeps the whole (n_b, n_c|1) plane in
+//  shared memory: row passes on the occupied rows, column passes on all
+//  columns, one coalesced store.  HBM traffic is one read of the cylinder and
+//  one write of the plane.
+// ---------------------------------------------------------------------------
+static const char* kPlaneSrc = R"__lrx__(
+#include <cufftdx.hpp>
+
+struct __align__(16) lrx_c2 { double x, y; };
+struct PlaneGather {
+    const int* gidx;       // (rows, n_c): cylinder column of each cell of an occupied row, -1 = empty
+    const int* row_of;     // (rows,): the plane row b of occupied row r
+    long long rows, n_col, planes;
+};
+
+constexpr int NB = LRX_NX, NC = LRX_NY;
+constexpr int B1 = LRX_NZ, B2 = NB / B1, C1 = LRX_NS, C2 = NC / C1;
+constexpr int LD = NC | 1;             // odd row pitch: the column lines read conflict-free
+
+template <int M>
+using TFFT = decltype(cufftdx::Size<M>() + cufftdx::Precision<double>() +
+                      cufftdx::Type<cufftdx::fft_type::c2c>() +
+                      cufftdx::Direction<cufftdx::fft_direction::forward>() +
+                      cufftdx::Thread() + cufftdx::SM<LRX_SM>());
+
+// Good-Thomas: for N = N1 N2 with gcd(N1, N2) = 1 the length-N DFT is the
+// N1 x N2 DFT of x[(N2 i1 + N1 i2) mod N], and its output (k1, k2) is X[k] for
+// k = k1 (mod N1), k = k2 (mod N2).  Run in place, frequency k ends at slot(k).
+template <int N, int N1, int N2>
+__device__ __forceinline__ int slot(int k) { return (N2 * (k % N1) + N1 * (k % N2)) % N; }
+
+// One factor pass on one line: the M elements at positions (step e + off) mod N
+// (element stride es) of `base`.  FIRST: M = N1, step = N2, off = N1 i; else
+// M = N2, step = N1, off = N2 i.  `live` (the first column pass only) reads a
+// dead plane row as zero.
+template <int N, int N1, int N2, bool FIRST>
+__device__ __forceinline__ void pfa_line(lrx_c2* base, int es, int i, const unsigned char* live) {
+    constexpr int M = FIRST ? N1 : N2;
+    if constexpr (M > 1) {
+        using F = TFFT<M>;
+        using V = typename F::value_type;
+        constexpr int step = FIRST ? N2 : N1;
+        const int off = (FIRST ? N1 : N2) * i;
+        V v[F::storage_size];
+#pragma unroll
+        for (int e = 0; e < M; ++e) {
+            const int p = (step * e + off) % N;
+            lrx_c2 z = {0.0, 0.0};
+            if (live == nullptr || live[p]) z = base[p * es];
+            v[e].x = z.x; v[e].y = z.y;
+        }
+        F().execute(v);
+#pragma unroll
+        for (int e = 0; e < M; ++e) {
+            const int p = (step * e + off) % N;
+            base[p * es].x = v[e].x; base[p * es].y = v[e].y;
+        }
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(256) lrx_kconv(
+    const lrx_c2* __restrict__ fin, lrx_c2* __restrict__ yout, PlaneGather g) {
+    extern __shared__ lrx_c2 buf[];                  // (NB, LD): the plane
+    __shared__ unsigned char live[NB];
+    __shared__ int rowb[NB];
+    const int rows = static_cast<int>(g.rows);
+    for (int b = threadIdx.x; b < NB; b += blockDim.x) live[b] = 0;
+    __syncthreads();
+    for (int r = threadIdx.x; r < rows; r += blockDim.x) { rowb[r] = g.row_of[r]; live[g.row_of[r]] = 1; }
+    __syncthreads();
+    for (long long plane = blockIdx.x; plane < g.planes; plane += gridDim.x) {
+        const lrx_c2* __restrict__ f = fin + plane * g.n_col;
+        // The occupied rows' cells, gathered from the cylinder (zeros implicit).
+        for (int t = threadIdx.x; t < rows * NC; t += blockDim.x) {
+            const int r = t / NC, c = t - r * NC, col = g.gidx[t];
+            lrx_c2 z = {0.0, 0.0};
+            if (col >= 0) z = f[col];
+            buf[rowb[r] * LD + c] = z;
+        }
+        __syncthreads();
+        // Row FFTs (along c) on the occupied rows only.
+        for (int l = threadIdx.x; l < rows * C2; l += blockDim.x)
+            pfa_line<NC, C1, C2, true>(buf + rowb[l / C2] * LD, 1, l % C2, nullptr);
+        __syncthreads();
+        if constexpr (C2 > 1) {
+            for (int l = threadIdx.x; l < rows * C1; l += blockDim.x)
+                pfa_line<NC, C1, C2, false>(buf + rowb[l / C1] * LD, 1, l % C1, nullptr);
+            __syncthreads();
+        }
+        // Column FFTs (along b) on every column; a dead row loads as zero.
+        for (int l = threadIdx.x; l < NC * B2; l += blockDim.x)
+            pfa_line<NB, B1, B2, true>(buf + l % NC, LD, l / NC, live);
+        __syncthreads();
+        if constexpr (B2 > 1) {
+            for (int l = threadIdx.x; l < NC * B1; l += blockDim.x)
+                pfa_line<NB, B1, B2, false>(buf + l % NC, LD, l / NC, nullptr);
+            __syncthreads();
+        }
+        // The plane in natural (kb, kc) order, one coalesced store.
+        lrx_c2* __restrict__ y = yout + plane * static_cast<long long>(NB * NC);
+        for (int t = threadIdx.x; t < NB * NC; t += blockDim.x) {
+            const int kb = t / NC, kc = t - kb * NC;
+            y[t] = buf[slot<NB, B1, B2>(kb) * LD + slot<NC, C1, C2>(kc)];
+        }
+        __syncthreads();
+    }
+}
+)__lrx__";
+
+// ---------------------------------------------------------------------------
 //  Build and cache
 // ---------------------------------------------------------------------------
 struct Built { CUfunction fn = nullptr; int rb = 1; int smem = 0; double compile_ms = 0.0; };
@@ -930,13 +1053,25 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
     const bool pair = mode < 2 || mode == 6;           // three banks per row
     const int banks = pair ? 3 : 1;
     const long long rows_max = pair ? kRowsMax : kRowsMax1;
-    const long long row_bytes = static_cast<long long>(banks) * (f32 ? 8 : 16) * sp;
+    long long row_bytes = static_cast<long long>(banks) * (f32 ? 8 : 16) * sp;
     long long rb = std::min<long long>(rows_max, (pair ? kSmemBudget : kSmemBudget1) / row_bytes);
     // Mode 8 sums the Lorentz blocks across a pair's spin rows, so it needs a
     // whole spin group resident: reach for the opt-in shared memory first.
     if (rb < 1 || (mode == 8 && rb < ns * ns)) rb = std::min<long long>(rows_max, smem_optin / row_bytes);
     if ((mode == 7 || mode == 8) && rb >= ns * ns) rb -= rb % (ns * ns);  // whole spin groups: the grouped load
     // (fewer rows than one spin group: mode 7 loads per bank, as mode 2 would fit)
+    if (mode == 10) {                                  // one whole (n_b, n_c|1) plane per block
+        row_bytes = 16LL * nkx * (nky | 1);
+        rb = row_bytes <= smem_optin ? 1 : 0;
+        if (rb < 1) {
+            std::ostringstream os;
+            os << "GATE mathdx-plane-residency: got plane (" << nkx << "," << nky << ") whose resident "
+                  "plane needs 16*n_b*(n_c|1)=" << row_bytes << " B; want <= " << smem_optin << " B of opt-in "
+                  "shared memory on this device; why: the plane FFT keeps one plane in shared memory; fix: "
+                  "ffi.fft.make_plane_fft_gather routes such a plane to the XLA route at plan build";
+            return sticky("residency", os.str(), ffi::ErrorCode::kInvalidArgument);
+        }
+    }
     if (mode == 8 && rb < ns * ns) {
         std::ostringstream os;
         os << "GATE mathdx-kconv-lorentz-residency: got k-grid (" << nkx << "," << nky << "," << nkz
@@ -982,7 +1117,8 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
     // Disk cache key: source, deciding options and the toolchain (file header).
     int nv_major = 0, nv_minor = 0;
     nvrtcVersion(&nv_major, &nv_minor);
-    uint64_t h = fnv1a(kSrc);
+    const char* src = mode == 10 ? kPlaneSrc : kSrc;
+    uint64_t h = fnv1a(src);
     for (const auto& d : defs) h = fnv1a(d, fnv1a("\x1f", h));
     const std::string cccl = exists(cuda_inc + "/cccl/cuda/std/__cccl/version.h")
         ? cuda_inc + "/cccl/cuda/std/__cccl/version.h" : cuda_inc + "/cuda/std/__cccl/version.h";
@@ -1014,7 +1150,7 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
         std::vector<const char*> opts;
         for (auto& x : o) opts.push_back(x.c_str());
         nvrtcProgram prog = nullptr;
-        nvrtcResult nr = nvrtcCreateProgram(&prog, kSrc, "lrx_kconv_mathdx.cu", 0, nullptr, nullptr);
+        nvrtcResult nr = nvrtcCreateProgram(&prog, src, "lrx_kconv_mathdx.cu", 0, nullptr, nullptr);
         if (nr != NVRTC_SUCCESS) { *where = "nvrtcCreateProgram"; *err = nvrtcGetErrorString(nr); return false; }
         nr = nvrtcCompileProgram(prog, static_cast<int>(opts.size()), opts.data());
         if (nr != NVRTC_SUCCESS) {
@@ -1515,6 +1651,67 @@ static ffi::Error KminorFft(cudaStream_t s, ffi::AnyBuffer X, ffi::Result<ffi::A
     return LaunchRows(s, 5, X, nullptr, Y, nkx, nky, nkz, scale, forward, 0, mathdx_root, cubin_dir);
 }
 
+// Mode 10 operand tables (the embedded plane source declares the same struct).
+struct PlaneGather {
+    const int* gidx;       // (rows, n_c) cylinder column of each cell of an occupied row, -1 = empty
+    const int* row_of;     // (rows,) plane row of each occupied row
+    long long rows, n_col, planes;
+};
+
+// Mode 10: Y (..., n_b, n_c) = the forward unscaled 2-D FFT of the plane that
+// F (..., n_col) fills through the static tables; b1 | n_b and c1 | n_c are
+// the Good-Thomas splits ffi.fft.plane_fft_split chose.
+static ffi::Error PlaneFftGather(cudaStream_t stream, ffi::AnyBuffer F, ffi::AnyBuffer gidx,
+                                 ffi::AnyBuffer row_of, ffi::Result<ffi::AnyBuffer> Y, int64_t nb,
+                                 int64_t nc, int64_t b1, int64_t c1, std::string_view mathdx_root,
+                                 std::string_view cubin_dir) {
+    auto bad = [](const std::string& why) {
+        return fail("plane fft gather", why, ffi::ErrorCode::kInvalidArgument);
+    };
+    auto split_ok = [](int64_t n, int64_t n1) {
+        if (n < 2 || n1 < 2 || n % n1 != 0 || n1 > kAxisMax || n / n1 > kAxisMax) return false;
+        int64_t a = n1, b = n / n1;
+        while (b) { const int64_t t = a % b; a = b; b = t; }
+        return a == 1;
+    };
+    if (!split_ok(nb, b1) || !split_ok(nc, c1)) {
+        std::ostringstream os;
+        os << "GATE mathdx-plane-split: got plane (" << nb << "," << nc << ") with splits (" << b1 << ","
+           << c1 << "); want n = n1*n2 with gcd(n1, n2) = 1 and 2 <= n1, n2 <= " << kAxisMax
+           << " (n2 = 1 when n <= " << kAxisMax << "); why: every line FFT is a cuFFTDx thread FFT; "
+              "fix: ffi.fft.make_plane_fft_gather routes such a plane to the XLA route at plan build";
+        return bad(os.str());
+    }
+    const auto C = ffi::DataType::C128, I = ffi::DataType::S32;
+    auto fd = F.dimensions(), yd = Y->dimensions(), gd = gidx.dimensions(), rd = row_of.dimensions();
+    if (F.element_type() != C || Y->element_type() != C || gidx.element_type() != I ||
+        row_of.element_type() != I || fd.size() < 1 || yd.size() != fd.size() + 1 ||
+        yd[yd.size() - 2] != nb || yd[yd.size() - 1] != nc || gd.size() != 2 || gd[1] != nc ||
+        rd.size() != 1 || rd[0] != gd[0] || gd[0] > nb)
+        return bad("want F (..., n_col) c128, Y (..., n_b, n_c) c128, gidx (rows, n_c) s32 and "
+                   "row_of (rows,) s32 with rows <= n_b");
+    long long planes = 1;
+    for (size_t i = 0; i + 1 < fd.size(); ++i) {
+        if (fd[i] != yd[i]) return bad("F and Y leading dimensions differ");
+        planes *= fd[i];
+    }
+    if (planes == 0) return ffi::Error::Success();
+    const Built* k = nullptr;
+    ffi::Error e = build(10, static_cast<int>(nb), static_cast<int>(nc), static_cast<int>(b1),
+                         static_cast<int>(c1), false, mathdx_root, cubin_dir, &k);
+    if (!e.success()) return e;
+    PlaneGather g{static_cast<const int*>(gidx.untyped_data()), static_cast<const int*>(row_of.untyped_data()),
+                  gd[0], fd[fd.size() - 1], planes};
+    const void* fp = F.untyped_data();
+    void* yp = Y->untyped_data();
+    void* args[] = {(void*)&fp, (void*)&yp, (void*)&g};
+    const unsigned blocks = static_cast<unsigned>(std::min<long long>(planes, 2147483647LL));
+    CUresult cr = driver_api().LaunchKernel(k->fn, blocks, 1, 1, kThreads, 1, 1, static_cast<unsigned>(k->smem),
+                                            reinterpret_cast<CUstream>(stream), args, nullptr);
+    if (cr != CUDA_SUCCESS) return fail("cuLaunchKernel", cu_err(cr));
+    return ffi::Error::Success();
+}
+
 }  // namespace lorrax_ffi::kconv_mathdx
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
@@ -1729,5 +1926,20 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Ret<xla::ffi::AnyBuffer>()
         LRX_KCONV_GRID_ATTRS
         .Attr<int64_t>("forward")
+        .Attr<std::string_view>("mathdx_root")
+        .Attr<std::string_view>("cubin_dir"));
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(
+    PlaneFftGatherMathdxCudaFfi, lorrax_ffi::kconv_mathdx::PlaneFftGather,
+    xla::ffi::Ffi::Bind()
+        .Ctx<xla::ffi::PlatformStream<cudaStream_t>>()
+        .Arg<xla::ffi::AnyBuffer>()
+        .Arg<xla::ffi::AnyBuffer>()
+        .Arg<xla::ffi::AnyBuffer>()
+        .Ret<xla::ffi::AnyBuffer>()
+        .Attr<int64_t>("nb")
+        .Attr<int64_t>("nc")
+        .Attr<int64_t>("b1")
+        .Attr<int64_t>("c1")
         .Attr<std::string_view>("mathdx_root")
         .Attr<std::string_view>("cubin_dir"));

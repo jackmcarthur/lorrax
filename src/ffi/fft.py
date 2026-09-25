@@ -161,6 +161,7 @@ __all__ = [
     "make_kconv_kminor", "kconv_kminor_out_shape",
     "make_kfft_klead", "make_kfft_kminor",
     "make_local_kfft_klead", "make_local_kfft_kminor", "make_local_kconv_kminor",
+    "PLANE_FFT_GATHER_TARGET", "plane_fft_split", "make_plane_fft_gather",
 ]
 
 FLAT_K_TARGET = "lorrax_mklfft_flat_k"
@@ -179,10 +180,13 @@ KCONV_KLEAD_LORENTZ_TARGET = "lorrax_mathdx_kconv_klead_lorentz_rows"
 KFFT_KLEAD_TARGET = "lorrax_mathdx_kfft_klead"
 KCONV_KMINOR_TARGET = "lorrax_mathdx_kconv_kminor"
 KFFT_KMINOR_TARGET = "lorrax_mathdx_kfft_kminor"
+#: Mode 10, the route-G plane FFT with gather-on-load (:func:`make_plane_fft_gather`).
+PLANE_FFT_GATHER_TARGET = "lorrax_mathdx_plane_fft_gather"
 #: Every mathdx target; ``require_kconv`` checks them all at startup.
 KCONV_TARGETS = (KCONV_PAIR_TARGET, KCONV_PARENT_TARGET, KCONV_PLANE_TARGET, KCONV_KLEAD_TARGET,
                  KCONV_KLEAD_UNFOLD_TARGET, KCONV_KLEAD_LORENTZ_TARGET,
-                 KFFT_KLEAD_TARGET, KCONV_KMINOR_TARGET, KFFT_KMINOR_TARGET)
+                 KFFT_KLEAD_TARGET, KCONV_KMINOR_TARGET, KFFT_KMINOR_TARGET,
+                 PLANE_FFT_GATHER_TARGET)
 
 #: The ``LORRAX_FFT_FFI`` dial.  Default ON — the FFI layer is REQUIRED
 #: (owner ruling, ``docs/architecture/decisions.md`` 2026-08-01): the flat-k
@@ -995,6 +999,118 @@ def make_kfft_kminor(mesh: Mesh, kgrid, spec: P, *, kind: str, norm: str | None)
     return _sharded(make_local_kfft_kminor(mesh, kgrid, kind=kind, norm=norm),
                     mesh, (spec,), spec)
 
+
+
+def plane_fft_split(n: int) -> tuple[int, int] | None:
+    """The Good-Thomas split ``n = n1·n2`` mode 10 transforms an axis of ``n`` points as.
+
+    ``(n, 1)`` for ``2 <= n <= KCONV_AXIS_MAX`` (one cuFFTDx thread FFT); else
+    coprime ``n1, n2`` in ``[2, KCONV_AXIS_MAX]``, the largest ``n1`` first;
+    ``None`` when no split exists: a prime power above the thread-FFT limit
+    (64, 81, 125, 128, …) or a prime factor above it.
+    """
+    n = int(n)
+    if 2 <= n <= KCONV_AXIS_MAX:
+        return n, 1
+    for n1 in range(KCONV_AXIS_MAX, 1, -1):
+        if n % n1 == 0 and 2 <= n // n1 <= KCONV_AXIS_MAX and math.gcd(n1, n // n1) == 1:
+            return n1, n // n1
+    return None
+
+
+def _plane_runs(pfc: np.ndarray, n_col: int) -> tuple:
+    """The cylinder -> plane zero fill as maximal runs of the flat plane.
+
+    ``(start, stop)`` for cells holding the consecutive columns ``[start,
+    stop)``, ``(-1, length)`` for empty cells; concatenating ``F[...,
+    start:stop]`` and zero blocks is ``take(F, pfc, mode='fill')`` bit for bit.
+    """
+    empty = pfc >= n_col
+    brk = np.flatnonzero(np.r_[True, (empty[1:] != empty[:-1])
+                               | (~empty[1:] & (pfc[1:] != pfc[:-1] + 1))])
+    ends = np.r_[brk[1:], pfc.size]
+    return tuple((-1, int(e - s)) if empty[s] else (int(pfc[s]), int(pfc[e - 1]) + 1)
+                 for s, e in zip(brk, ends))
+
+
+def _optin_smem_bytes(ordinal: int = 0) -> int | None:
+    """The device's opt-in shared memory per block (libcuda attribute 97); None without a driver."""
+    try:
+        import ctypes
+        cu = ctypes.CDLL("libcuda.so.1")
+        dev, v = ctypes.c_int(), ctypes.c_int()
+        if (cu.cuInit(0) or cu.cuDeviceGet(ctypes.byref(dev), int(ordinal))
+                or cu.cuDeviceGetAttribute(ctypes.byref(v), 97, dev)):
+            return None
+        return int(v.value)
+    except Exception:                                         # noqa: BLE001
+        return None
+
+
+def make_plane_fft_gather(mesh: Mesh, plane_from_col, n_col: int, plane_shape) -> Callable:
+    """Rank-local ``fn(F) -> Y``: the route-G plane transform read straight from the cylinder.
+
+    ``F (..., n_col)`` c128 holds the occupied cells of an ``(n_b, n_c)``
+    plane; ``plane_from_col (n_b·n_c,)`` (host, static) is each cell's column,
+    ``n_col`` on an empty one.  ``Y (..., n_b, n_c)`` is::
+
+        Y[..., k_b, k_c] = Σ_{b,c} plane[..., b, c] e^{-2πi (b k_b/n_b + c k_c/n_c)},
+        plane = take(F, plane_from_col, axis=-1, mode='fill').reshape(..., n_b, n_c)
+
+    i.e. ``fftn(plane, axes=(-2, -1), norm='backward')``.  CUDA: nvidia-mathdx
+    mode 10, which never writes the zero plane: the row FFTs run on the
+    occupied rows only and gather their cells on load, the column FFTs read
+    dead rows as zero, and the plane is stored once.  A plane mode 10 cannot
+    serve (an axis with no thread-FFT split, :func:`plane_fft_split`, or a
+    plane above the device's opt-in shared memory) takes the XLA route
+    (static-run concatenate + cuFFT 2-D), decided here once and announced.
+    cpu: the XLA route.
+    """
+    nb, nc = (int(v) for v in plane_shape)
+    n_col = int(n_col)
+    pfc = np.asarray(plane_from_col, dtype=np.int64).reshape(-1)
+    if pfc.size != nb * nc:
+        raise ValueError(f"plane_from_col has {pfc.size} cells; want n_b·n_c = {nb * nc}")
+    runs = _plane_runs(pfc, n_col)
+
+    def _xla(F):
+        _check_complex(F)
+        z = lambda n: jnp.zeros(F.shape[:-1] + (n,), F.dtype)
+        st = jnp.concatenate([F[..., a:e] if a >= 0 else z(e) for a, e in runs], axis=-1)
+        return jnp.fft.fftn(st.reshape(F.shape[:-1] + (nb, nc)), axes=(-2, -1))
+
+    if kconv_backend(mesh) != "mathdx":
+        return _xla
+    from ffi.gate import announce_once
+    sb, sc = plane_fft_split(nb), plane_fft_split(nc)
+    need, have = 16 * nb * (nc | 1), _optin_smem_bytes()
+    why = ("an axis has no coprime split into cuFFTDx thread FFTs (<= "
+           f"{KCONV_AXIS_MAX})" if sb is None or sc is None else
+           f"the resident plane needs {need} B > {have} B of opt-in shared memory"
+           if have is None or need > have else "")
+    if why:
+        announce_once(("plane_fft", nb, nc),
+                      f"[plane_fft] plane ({nb},{nc}): XLA route (run concatenate + "
+                      f"cuFFT 2-D), not mathdx mode 10: {why}", scope="rank0")
+        return _xla
+    _require_target(PLANE_FFT_GATHER_TARGET, "CUDA")
+    occ = (pfc < n_col).reshape(nb, nc)
+    rows = np.flatnonzero(occ.any(axis=1)).astype(np.int32)
+    gidx = np.where(occ[rows], pfc.reshape(nb, nc)[rows], -1).astype(np.int32)
+    attrs = dict(nb=np.int64(nb), nc=np.int64(nc), b1=np.int64(sb[0]), c1=np.int64(sc[0]),
+                 **_mathdx_common())
+    announce_once(("plane_fft", nb, nc),
+                  f"[plane_fft] plane ({nb},{nc}): mathdx mode 10, splits {sb} x {sc}, "
+                  f"{rows.size} of {nb} rows occupied", scope="rank0")
+
+    def _mathdx(F):
+        _check_complex(F)
+        if int(F.shape[-1]) != n_col:
+            raise ValueError(f"plane FFT expects F (..., n_col={n_col}); got {F.shape}")
+        out = jax.ShapeDtypeStruct(F.shape[:-1] + (nb, nc), F.dtype)
+        return jax.ffi.ffi_call(PLANE_FFT_GATHER_TARGET, out)(
+            F, jnp.asarray(gidx), jnp.asarray(rows), **attrs)
+    return _mathdx
 
 def make_kconv_klead(mesh: Mesh, kgrid, t_spec: P, w_spec: P, *,
                      norm: str | None = "ortho", mult: float = 1.0) -> KConvStored:

@@ -124,6 +124,7 @@ _CUDA_TARGET_SYMBOLS = {
     "lorrax_mathdx_kfft_klead":     "KFftMathdxKleadCudaFfi",
     "lorrax_mathdx_kconv_kminor":   "KConvMathdxKminorCudaFfi",
     "lorrax_mathdx_kfft_kminor":    "KFftMathdxKminorCudaFfi",
+    "lorrax_mathdx_plane_fft_gather": "PlaneFftGatherMathdxCudaFfi",
     "lorrax_phdf5_write":           "PhdfWriteFfi",
     "lorrax_phdf5_read":            "PhdfReadFfi",
     "lorrax_phdf5_read_kchunk":       "PhdfReadKchunkFfi",
