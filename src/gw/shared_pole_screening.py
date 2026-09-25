@@ -110,16 +110,20 @@ def shared_pole_identity(wfns, meta, *, label, wfn, binding, centroid_indices):
 def _coulomb_resource(value, meta, sym, mesh_xy, path):
     """Stage bounded canonical V parents via centroid and SlabIO owners.
 
-    ``value`` is the incumbent packed full-q face [Q,mu_p,mu_p], Ry.
+    ``value`` is the packed bare V (a ``QirrOperator`` on the run's q wedge,
+    or a full-q face [Q,mu_p,mu_p]), Ry; its wedge rows are the parents.
     New conversion/transport buffers are reserved before each allocation.
     Only one parent is unpacked at a time; no full-q canonical copy exists.
     """
     from file_io.slab_io import SlabIO
+    from symmetry_maps import QirrOperator
     from .response_bank import _reserve, resource_digest
     basis = meta.mu_basis
     qids = np.asarray(sym.q_irr_full_idx, np.int64)
-    if value.shape != (meta.nk_tot, basis.n_packed, basis.n_packed):
-        raise ValueError("GATE shared_pole_coulomb: expected incumbent packed full-q face")
+    op = QirrOperator.of(value)
+    if op.n_full != meta.nk_tot or tuple(op.values.shape[1:]) != (basis.n_packed, basis.n_packed):
+        raise ValueError("GATE shared_pole_coulomb: expected the packed bare V")
+    value = op.at_rows(qids)
     kernel = jax.jit(lambda v: basis.unpack_operator(v, spec=P(None, "x", "y")))
     shape = (1, basis.n_packed, basis.n_packed)
     operand = jax.ShapeDtypeStruct(shape, value.dtype, sharding=value.sharding)
@@ -131,7 +135,7 @@ def _coulomb_resource(value, meta, sym, mesh_xy, path):
              stats.output_size_in_bytes + stats.temp_size_in_bytes)
     with SlabIO(path, mode="w", mesh=mesh_xy) as io:
         for iq, q in enumerate(qids):
-            canonical = executable(value[int(q):int(q)+1])
+            canonical = executable(value[iq:iq + 1])
             io.write_slab("V_canonical_qwedge", canonical, offset=(iq, 0, 0),
                           global_shape=(len(qids), basis.n_canonical, basis.n_canonical),
                           valid_shape=(1, basis.n_logical, basis.n_logical))

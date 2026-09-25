@@ -67,11 +67,17 @@ def wedge_case(mesh, fx, rule, seed=0):
     door = F.make_kfft_klead_unfold(mesh, kg, tables, norm="ortho")
     partner = Wt_tile if (anti and rule == "pair_transpose") else None
     got = fixtures._host(door(Wd, partner))
+    # The same door fed its tables as device operands (a consumer's jit then
+    # holds no table constants) must be the same bits.
+    from symmetry_maps import device_load_tables
+    got_dev = fixtures._host(jax.jit(lambda w, p, load: door(w, p, load))(
+        Wd, partner if partner is not None else Wd, device_load_tables(tables, mesh)))
     red = fixtures._host(F.make_kfft_klead_unfold(
         mesh, kg, tables._replace(rsrc=np.roll(tables.rsrc, 1, axis=1)), norm="ortho")(Wd, partner))
     scale = float(np.max(np.abs(ref)))
     return dict(rule=rule, nk=nk, n_parent=n_par, mu=mu, antiunitary=anti,
                 door_bitwise=bool(np.array_equal(got, ref)),
+                device_tables_bitwise=bool(np.array_equal(got_dev, got)),
                 max_abs=float(np.max(np.abs(got - ref))),
                 rel=float(np.max(np.abs(got - ref))) / scale,
                 red_rel=float(np.max(np.abs(red - ref))) / scale)
@@ -130,6 +136,10 @@ def test_wedge_door_matches_prep_of_the_unfolded_interaction():
             # (q = n/3): the reference forms its phase inside its own fusion,
             # so the two agree to rounding, as the Green tables do.
             assert r["door_bitwise"] if exact else r["rel"] <= 2 * eps, r
+            # On the mathdx leg the tables are only read, so the operand path
+            # is the same bits everywhere (router gate); the cpu composition
+            # multiplies by them in XLA, which folds constant phases its own way.
+            assert r["device_tables_bitwise"] if exact else r["rel"] <= 2 * eps, r
             assert r["red_rel"] > 1e-3, r
 
 

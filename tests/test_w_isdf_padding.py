@@ -272,7 +272,7 @@ def test_static_gamma_override_accepts_the_chi_carrier_not_logical_prefix(
         sym=SimpleNamespace(q_irr_full_idx=None), centroid_indices=None,
         config=config, meta=meta, mesh_xy=SimpleNamespace(),
         force_full_bz=True, gamma_chi_override=gamma)
-    result.block_until_ready()
+    result.values.block_until_ready()
     np.testing.assert_array_equal(captured["chi"][0], np.asarray(gamma[0]))
 
 

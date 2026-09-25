@@ -673,6 +673,10 @@ def persist_w0_and_head(
             fft_grid=getattr(meta, "fft_grid", None), print_fn=print_fn,
             context="W0 restart tensor")
     with _tmg.section("persist_w0.write_w0"):
+        # Screening holds W on its q wedge; the writer takes the full zone
+        # (its wedge arm stores the producer's own pre-unfold capture).
+        from .cohsex_sigma import interaction_operator
+        W_q = interaction_operator(W_q).unfold(mesh_xy)
         if getattr(meta, "mu_basis", None) is not None:
             # Files keep the canonical centroid order.
             W_q = meta.mu_basis.unpack_operator(W_q)

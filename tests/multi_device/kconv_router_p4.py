@@ -322,6 +322,7 @@ def wedge_cases(mesh, rng):
             r = wedge_case(mesh, fx, rule)
             recs.append(dict(case=f"kfft_klead_unfold_{rule}_nk{r['nk']}", nk=r["nk"],
                              antiunitary=r["antiunitary"], bitwise_vs_old_chain=int(r["door_bitwise"]),
+                             bitwise_parent_rows=int(r["device_tables_bitwise"]),
                              max_abs_vs_old_chain=r["max_abs"], rel_vs_old_chain=r["rel"],
                              ulp_vs_old_chain=r["rel"] / np.finfo(float).eps,
                              red_rolled_rsrc=r["red_rel"]))

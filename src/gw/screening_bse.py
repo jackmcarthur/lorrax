@@ -568,10 +568,12 @@ def prepare_ladder_restart(
                              tensors_filename, include_w=include_w,
                              print_fn=print_fn)
 
+    # The ladder assembly reads W over the full zone (its own wedge
+    # handling is _assemble_full_bz_w's).
     W0_rpa = compute_static_w(
         wfns, V_q, quad, e_ref=e_ref, sym=sym,
         centroid_indices=centroid_indices, config=config, meta=meta,
-        mesh_xy=mesh_xy, role="static", head_channel=None)
+        mesh_xy=mesh_xy, role="static", head_channel=None).unfold(mesh_xy)
     with timing.section("W.gate", announce=True,
                         label="W[static] (RPA, ladder kernel) "
                               "finiteness + hermiticity gate"):
@@ -882,7 +884,8 @@ def _assemble_full_bz_w(wc_wedge, V_q, *, sym, centroid_indices, meta,
 
     _nat = NamedSharding(mesh_xy, P(None, 'x', 'y'))
     mu_target = int(np.asarray(sym_perm).shape[-1])
-    V_wedge = slice_q_full_to_ibz(V_q, sym.q_irr_full_idx, out_sharding=_nat)
+    from symmetry_maps import QirrOperator
+    V_wedge = jax.device_put(QirrOperator.of(V_q).at_rows(sym.q_irr_full_idx), _nat)
     W_wedge = _assert_mu_width(
         wc_wedge, mu_target, where=f"W[{label}] wedge -> full BZ") + V_wedge
     n_sym_spatial = int(np.asarray(sym_perm).shape[0]) // 2

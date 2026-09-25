@@ -995,6 +995,36 @@ def _finish_vq_tile(s, *, V_sh, mesh_xy, stack_cols, unfold_isdf_one_leg,
 # Public charge entry point (CC tile only)
 # ---------------------------------------------------------------------------
 
+def q_wedge(*, sym, centroid_indices, meta, context: str):
+    """The q wedge every interaction of the run is held on, or ``None`` (no reduction).
+
+    ``(tables, policy)``: ``tables`` the keyword arguments of a
+    ``symmetry_maps.QirrOperator`` in the run's packed centroid order (the
+    unfold ``unfold_isdf_operator`` makes of them, with the measured-TRS
+    policy's rows), ``policy`` the ``qgrid_trs_policy_for`` object that chose
+    them.  One resolution: screening's W and the bare V are held on the SAME
+    wedge, so ``W - V`` and every door keyed by the tables are shared.
+    """
+    if getattr(sym, 'q_irr_full_idx', None) is None:
+        return None
+    (_, q_irr_frac, irr, rows, sym_perm, L_table, reduced) = _resolve_ibz_q_list(
+        sym=sym, centroid_indices=centroid_indices, kgrid=tuple(meta.kgrid),
+        fft_grid=tuple(meta.fft_grid), context=context,
+        mu_basis=getattr(meta, 'mu_basis', None))
+    if not reduced:
+        return None
+    from .qgrid_symmetry import qgrid_trs_policy_for
+    n_sym_spatial = int(np.asarray(sym_perm).shape[0]) // 2
+    policy = qgrid_trs_policy_for(
+        sym=sym, irr_idx_q=irr, sym_idx_q=rows, kgrid=tuple(meta.kgrid),
+        n_sym_spatial=n_sym_spatial, context=context)
+    tables = dict(irr_idx=np.asarray(irr), sym_idx=np.asarray(policy.unfold_sym_idx),
+                  sym_perm=np.asarray(sym_perm), L_table=np.asarray(L_table),
+                  q_irr_frac=np.asarray(q_irr_frac), n_sym_spatial=n_sym_spatial,
+                  full_rows=np.asarray(sym.q_irr_full_idx, np.int32))
+    return tables, policy
+
+
 def compute_all_V_q_g_flat(
     zeta_loader,                       # ZetaLoader (G-flat)
     *,
