@@ -799,8 +799,112 @@ def photon_q0_low_rank_block(
             scalar(layout.logical_extent(A)), scalar(layout.logical_extent(B)))
 
 
+# ---------------------------------------------------------------------------
+# The two centroid families of a four-current response stream.  The stream
+# contracts each family pair's Green on the raw parents in the families'
+# in-memory (orbit-packed) centroid order, where every symmetry action is a
+# rank-local gather, and accumulates its rows in ``packed_layout``; the
+# finished rows cross into the bank's canonical ``layout`` once per call.
+# ---------------------------------------------------------------------------
+
+FAMILY_OF_CHANNEL = (0, 1, 1, 1)
+FAMILY_PAIRS = ((0, 0), (0, 1), (1, 0), (1, 1))
+
+
+def family_channels(family: int) -> tuple[int, ...]:
+    """The Lorentz channels one centroid family serves (C, or T1..T3)."""
+    return (CHARGE,) if int(family) == 0 else TRANSVERSE
+
+
+@dataclass(frozen=True)
+class PhotonFamilies:
+    """Static description of a photon stream's endpoints; hashed by value.
+
+    ``plans`` are the charge and current families' raw-parent plans (both
+    ``None`` for full-k faces); ``packed_layout`` holds each family at its
+    in-memory carrier; ``layout`` is the canonical bank layout; ``bases``
+    (``gw.centroid_basis.PackedCentroidBasis`` per family, or ``None`` when
+    the two orders coincide) own the order conversion.  Plans and bases are
+    identity-keyed run objects, so the value hash is stable across SC maps.
+    """
+    plans: tuple
+    packed_layout: PhotonBasisLayout
+    layout: PhotonBasisLayout
+    bases: tuple | None = None
+
+    def __post_init__(self) -> None:
+        if len(self.plans) != 2 or (self.plans[0] is None) != (self.plans[1] is None):
+            raise ValueError("PhotonFamilies: want a (charge, current) plan pair or two Nones")
+        if self.bases is None:
+            if self.packed_layout != self.layout:
+                raise ValueError("PhotonFamilies: distinct layouts need the two family bases")
+            return
+        for channel in range(N_LORENTZ):
+            basis = self.bases[FAMILY_OF_CHANNEL[channel]]
+            if (self.packed_layout.carrier_extent(channel) != basis.n_packed
+                    or self.layout.carrier_extent(channel) != basis.n_canonical):
+                raise ValueError(
+                    f"PhotonFamilies: channel {channel} carriers "
+                    f"{self.packed_layout.carrier_extent(channel)}/"
+                    f"{self.layout.carrier_extent(channel)} are not its basis's "
+                    f"packed/canonical extents {basis.n_packed}/{basis.n_canonical}")
+
+    @property
+    def n_parent(self) -> int | None:
+        return None if self.plans[0] is None else int(self.plans[0].n_parent)
+
+    def order_map(self):
+        """``(source, common, target)`` for ``permute_sharded_axis`` on one photon axis.
+
+        ``source[to]`` is the packed-layout slot, on the common per-shard
+        carrier of ``common`` slots, that fills canonical slot ``to``;
+        unused slots pair bijectively with zero pads.  ``None`` when the
+        orders coincide.
+        """
+        if self.bases is None:
+            return None
+        side = int(self.layout.mesh_side)
+        common = max(self.packed_layout.packed_extent,
+                     self.layout.packed_extent) // side
+
+        def slot(layout, channel, index):
+            width = layout.carrier_extent(channel) // side
+            return ((index // width) * common + layout.local_offset(channel)
+                    + index % width)
+
+        source = np.full(side * common, -1, dtype=np.int64)
+        for channel in range(N_LORENTZ):
+            basis = self.bases[FAMILY_OF_CHANNEL[channel]]
+            canonical = np.arange(basis.n_logical)
+            packed = np.asarray(basis.layout.axis.canonical_to_packed)
+            source[slot(self.layout, channel, canonical)] = slot(
+                self.packed_layout, channel, packed)
+        free = np.setdiff1d(np.arange(side * common), source[source >= 0])
+        source[source < 0] = free
+        return source.astype(np.int32), common, self.layout.packed_extent // side
+
+
+def photon_family_order(value, families: PhotonFamilies, mesh_xy: Mesh, spec):
+    """Both trailing photon axes of ``value`` from the packed to the canonical layout.
+
+    Traceable; two all-to-all round trips (``common.staged_reshard``).  An
+    identity when the orders coincide.
+    """
+    order = families.order_map()
+    if order is None:
+        return value
+    from common.staged_reshard import permute_sharded_axis
+    source, common, target = order
+    for axis in (-2, -1):
+        value = permute_sharded_axis(value, axis, source, mesh_xy, spec,
+                                     pad_to=common, crop_to=target)
+    return value
+
+
 __all__ = [
     "CHARGE", "TRANSVERSE", "N_LORENTZ", "MAX_Q0_UPDATE_RANK",
+    "FAMILY_OF_CHANNEL", "FAMILY_PAIRS", "PhotonFamilies", "family_channels",
+    "photon_family_order",
     "PhotonBasisLayout", "pack_photon_operator", "photon_block_view",
     "pack_photon_response_tiles", "unpack_photon_response_tiles",
     "pack_photon_channel_vectors", "add_photon_q0_low_rank",

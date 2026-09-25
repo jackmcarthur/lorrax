@@ -600,13 +600,16 @@ def _get_chi_fractional_contour_kernel_face(
     permuted by the q negation instead of gathered. Time-reversal-symmetric
     banks keep the incumbent trace, where the two orientations are equal.
 
-    With ``vertex=True`` each psi argument is ``(bare, vertex_applied)``.
-    The unoccupied Green uses the vertex-applied endpoint carriers; the
-    occupied Green uses bare carriers. Thus the same spin trace computes
-    ``tr[J_A G^> J_B G^<]`` without another FFT or a second producer.
-    Carriers must already be unfolded before applying current vertices.
-    Photon spin pairs are traced in a fixed scan of singleton-spin Greens:
-    this retains all components without storing two full spin Green tensors.
+    ``vertex`` (a :class:`gw.photon_layout.PhotonFamilies`) is the
+    four-current stream: each psi argument is the ``(charge, current)``
+    family pair of raw-parent faces.  Every family pair's Green is contracted
+    on the parents and transported by the two families' plans (``build_G_tau``
+    with ``right_k_unfold_plan``, the route of the static current response);
+    the Dirac vertices act on its spin indices,
+    ``chi^AB = sum_ab (J_A G^> J_B^dagger)_ab conj(G^<)_ab``.  One family
+    pair's two Greens are live at a time.  The rows accumulate in the
+    families' packed photon layout and cross into the canonical layout once
+    at the end of the call.  No psi face is unfolded.
     """
     from common.fft_helpers import make_flat_k_fftn
     from distrib_la import gemm_plan
@@ -642,9 +645,16 @@ def _get_chi_fractional_contour_kernel_face(
                 "GATE response_selected_q: got invalid selected_q; want unique "
                 "full-grid indices; why: bank parent rows must be explicit")
     physical = bool(ordered) or pair_mode == "laplace_ordered"
-    if vertex and (not physical or k_unfold_plan is not None):
-        raise ValueError("GATE response_vertex: current carriers require ordered "
-                         "full-k endpoints, with vertices applied after symmetry unfold")
+    photon = vertex if vertex else None
+    if photon is not None and (not physical or k_unfold_plan is not None
+                               or layout != "face" or band_ranges is not None):
+        raise ValueError(
+            "GATE response_vertex: got a four-current stream with "
+            f"ordered={physical}, k_unfold_plan={k_unfold_plan is not None}, "
+            f"layout={layout!r}, band_ranges={band_ranges is not None}; want "
+            "the ordered face stream with the families' own plans; why: the "
+            "current vertices act on the physical orientation's Green, and "
+            "the family plans are the only k transport")
     def negate(rows):
         coords = np.unravel_index(np.asarray(rows), grid)
         return tuple(int(i) for i in np.ravel_multi_index(
@@ -670,6 +680,8 @@ def _get_chi_fractional_contour_kernel_face(
     # restored to the canonical order at the end.
     expected_input_nk = (
         nk if k_unfold_plan is None else int(k_unfold_plan.n_parent))
+    if photon is not None and photon.n_parent is not None:
+        expected_input_nk = photon.n_parent
     if nk_shape != expected_input_nk:
         raise ValueError(
             f"_get_chi_fractional_contour_kernel_face: face_shape "
@@ -691,19 +703,23 @@ def _get_chi_fractional_contour_kernel_face(
     rep0 = NamedSharding(mesh_xy, P())
     psi_mun_shard = NamedSharding(mesh_xy, PSI_MUN_SPEC)
     psi_nmu_shard = NamedSharding(mesh_xy, PSI_NMU_SPEC)
-    mun_input = (psi_mun_shard, psi_mun_shard) if vertex else psi_mun_shard
-    nmu_input = (psi_nmu_shard, psi_nmu_shard) if vertex else psi_nmu_shard
+    mun_input = (psi_mun_shard, psi_mun_shard) if photon else psi_mun_shard
+    nmu_input = (psi_nmu_shard, psi_nmu_shard) if photon else psi_nmu_shard
 
     # One fixed contraction route is shared by every Gf and Gu build.
-    # Face photon carriers exchange bounded band panels; axis carriers
-    # already replicate bands and use the service's local contraction.
-    green_spin = 1 if vertex else ns
+    # Face photon families exchange bounded band panels (one route for every
+    # family pair's shape); axis carriers already replicate bands and use the
+    # service's local contraction.
     if band_ranges is not None and (layout != "axis" or pair_mode != "direct"):
         raise ValueError("prepared response band ranges require the axis direct stream")
-    if vertex and layout == "face":
+    if photon is not None:
         g_plan = partial(face_band_gather_product, mesh=mesh_xy, phases=None, band_range=None)
+        if n_rmu != photon.layout.packed_extent:
+            raise ValueError(
+                f"four-current stream: face_shape extent {n_rmu} is not the "
+                f"canonical photon extent {photon.layout.packed_extent}")
     else:
-        g_plan = gemm_plan(mesh_xy, m=n_rmu * green_spin, k=nb_full, n=n_rmu * green_spin,
+        g_plan = gemm_plan(mesh_xy, m=n_rmu * ns, k=nb_full, n=n_rmu * ns,
                            nq=nk_shape, dtype=jnp.complex128, layout=layout,
                            enable_active_range=band_ranges is not None)
     active_gemms = (tuple(g_plan.prepare_active_range(*bounds) for bounds in band_ranges)
@@ -739,9 +755,8 @@ def _get_chi_fractional_contour_kernel_face(
         *carry,
     ):
         # The caller supplies occ and 1-occ after support masking; do not invert again.
-        bare_mun, current_mun = psi_mun if vertex else (psi_mun, psi_mun)
-        bare_nmu, current_nmu = psi_nmu if vertex else (psi_nmu, psi_nmu)
-        n_mu = bare_mun.shape[2]
+        n_mu = (psi_mun.shape[2] if photon is None
+                else photon.packed_layout.packed_extent)
         q_count = nk if selected_q is None else len(selected_q)
         zero = jax.lax.with_sharding_constraint(
             jnp.zeros((q_count, n_mu, n_mu), dtype=jnp.complex128),
@@ -751,55 +766,73 @@ def _get_chi_fractional_contour_kernel_face(
                    else jax.lax.with_sharding_constraint(
                        jnp.broadcast_to(zero, (n_out,) + zero.shape),
                        selected_shard))
-        if bank_carry:
+        if bank_carry and photon is None:
             initial = carry[0]
 
-        def green_k(weight, t, ref, *, current=False, spin_pair=None):
-            left = current_mun if current else bare_mun
-            right = current_nmu if current else bare_nmu
-            if spin_pair is not None:
-                a, b = spin_pair // ns, spin_pair % ns
-                left = jax.lax.dynamic_slice_in_dim(left, a, 1, axis=1)
-                right = jax.lax.dynamic_slice_in_dim(right, b, 1, axis=2)
+        def green_k(weight, t, ref, *, current=False, family_pair=None):
+            left, right, plan, right_plan = psi_mun, psi_nmu, k_unfold_plan, None
+            if family_pair is not None:
+                L, R = family_pair
+                left, right = psi_mun[L], psi_nmu[R]
+                plan, right_plan = photon.plans[L], photon.plans[R]
+                right_plan = None if right_plan is plan else right_plan
             # Incumbent: conj(G(w, t)) = G(conj w, conj t)^T. Physical: G(conj w, conj t).
             if physical:
                 g = build_G_tau(left, right, enk_full, jnp.conj(t), e_ref=ref,
                                 band_weight=jnp.conj(weight), layout=layout,
-                                gemm=g_plan, k_unfold_plan=k_unfold_plan,
+                                gemm=g_plan, k_unfold_plan=plan,
+                                right_k_unfold_plan=right_plan,
                                 prepared_active_gemm=active_gemms[int(current)])
             else:
                 g = jnp.conj(build_G_tau(left, right, enk_full, t, e_ref=ref,
                                          band_weight=weight, layout=layout,
-                                         gemm=g_plan, k_unfold_plan=k_unfold_plan,
+                                         gemm=g_plan, k_unfold_plan=plan,
                                          prepared_active_gemm=active_gemms[int(current)]))
             return jax.lax.with_sharding_constraint(g, G_shard)
 
         def spin_correlation(lower_weight, lower_time, lower_ref,
                              upper_weight, upper_time, upper_ref):
-            """Exact spin trace; photon components never form a full spin Green.
+            """Exact spin trace of one Green pair; the four-current trace is per family pair.
 
-            Each (a,b) component uses the common Green and FFT owners and
-            remains mu_X/nu_Y tiled on all P ranks. The fixed scan changes
-            storage and summation order only; every spin pair is included.
+            Four-current: one family pair's two Greens are live at a time;
+            each of its Lorentz blocks traces ``(J_A G^> J_B^dagger) conj(G^<)``
+            over both spin indices and lands in its packed-layout block.
             """
-            def component(pair):
-                gf = G_fftn(green_k(lower_weight, lower_time, lower_ref, spin_pair=pair))
+            if photon is None:
+                gf = G_fftn(green_k(lower_weight, lower_time, lower_ref))
                 # Finish the lower Green before building upper parent buffers.
                 gf, next_weight = jax.lax.optimization_barrier((gf, upper_weight))
-                gu = G_fftn(green_k(next_weight, upper_time, upper_ref,
-                                   current=True, spin_pair=pair))
+                gu = G_fftn(green_k(next_weight, upper_time, upper_ref, current=True))
                 # Centroid-major Greens (R, mu, a, nu, b): trace the spin
                 # pairs elementwise in mu, nu.
                 return jax.lax.with_sharding_constraint(
                     jnp.einsum("Rmanb,Rmanb->Rmn", gu, gf.conj()), chi_R_shard)
-            if not vertex:
-                return component(None)
-            initial = jax.lax.with_sharding_constraint(
+            from common.gamma_matrices import gamma_double_contract, gamma_perm_phase
+            from .photon_layout import FAMILY_PAIRS, _insert, family_channels
+            total = jax.lax.with_sharding_constraint(
                 jnp.zeros((nk, n_mu, n_mu), jnp.complex128), chi_R_shard)
-            def add(total, pair):
-                return total + component(pair), None
-            result, _ = jax.lax.scan(add, initial, jnp.arange(ns * ns), unroll=1)
-            return result
+            for pair in FAMILY_PAIRS:
+                # The previous pair's blocks finish before this pair's Greens.
+                total, lower = jax.lax.optimization_barrier((total, lower_weight))
+                gf = G_fftn(green_k(lower, lower_time, lower_ref, family_pair=pair))
+                gf, next_weight = jax.lax.optimization_barrier((gf, upper_weight))
+                gu = G_fftn(green_k(next_weight, upper_time, upper_ref,
+                                    current=True, family_pair=pair))
+                for A in family_channels(pair[0]):
+                    for B in family_channels(pair[1]):
+                        perm_a, phase_a = gamma_perm_phase(A)
+                        perm_b, phase_b = gamma_perm_phase(B)
+                        block = gamma_double_contract(
+                            jnp.conj(gf), gu,
+                            perm_L=None if A == 0 else perm_a,
+                            phase_L=None if A == 0 else phase_a,
+                            perm_R=None if B == 0 else perm_b,
+                            phase_R=None if B == 0 else jnp.conj(phase_b),
+                            spin_axes=(2, 4))
+                        total = _insert(
+                            total, jax.lax.with_sharding_constraint(block, chi_R_shard),
+                            photon.packed_layout, A, B, mesh_xy)
+            return total
 
         def retarded_correlation(time, lower=occ_f, upper=occ_u, reference=energy_reference):
             tau = jnp.asarray(1j, dtype=jnp.complex128) * time
@@ -916,7 +949,17 @@ def _get_chi_fractional_contour_kernel_face(
             (direct_body if pair_mode == "direct" else window_body)
             if pair_mode in ("windowed", "direct") else body, initial, nodes, unroll=1)
         if selected_q is None:
-            return tuple(_finish(value) for value in final_R)
+            finished = tuple(_finish(value) for value in final_R)
+            if photon is not None:
+                from .photon_layout import photon_family_order
+                finished = tuple(photon_family_order(value, photon, mesh_xy, CHI_Q_SPEC)
+                                 for value in finished)
+            return finished
+        if photon is not None:
+            from .photon_layout import photon_family_order
+            final_R = photon_family_order(final_R, photon, mesh_xy, P(None, None, "x", "y"))
+            if bank_carry:
+                final_R = carry[0] + final_R
         if bank_carry:
             return final_R
         # Public bank order [parent, sample, mu_x, mu_y].

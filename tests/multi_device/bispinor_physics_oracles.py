@@ -206,8 +206,11 @@ def test_all_16_chi_blocks_nonzero_ct_literal_both_orientations(monkeypatch):
                                        err_msg=f'Lorentz block {(a,b)}')
 
 
-def _toy_plan(mesh, points=None, fft=(2, 2, 1)):
-    """Build a physical glide/TR group on a 3x3 k mesh through SymMaps."""
+def _toy_plan(mesh, points=None, fft=(2, 2, 1), with_basis=False):
+    """Build a physical glide/TR group on a 3x3 k mesh through SymMaps.
+
+    ``with_basis``: also the run's orbit-packed centroid basis, whose layout
+    the plan then adopts (``(plan, basis)``)."""
     from symmetry_maps import SymMaps
     from gw.centroid_k_unfold import build_centroid_k_unfold_plan
     mirror = np.array([[0,1,0], [1,0,0], [0,0,1]])
@@ -220,8 +223,14 @@ def _toy_plan(mesh, points=None, fft=(2, 2, 1)):
         atom_crys=np.array([[0.,0.,0.],[.5,.5,0.]]), trs_holds=True)
     sym = SymMaps(header)
     points = np.array(list(np.ndindex(2,2,1))) if points is None else points
+    if not with_basis:
+        return build_centroid_k_unfold_plan(sym, points, fft, mesh, nspinor=4,
+                                           parent_k_frac=header.kpoints)
+    from common.centroid_basis import PackedCentroidBasis
+    basis = PackedCentroidBasis.build(points, sym, fft, mesh)
     return build_centroid_k_unfold_plan(sym, points, fft, mesh, nspinor=4,
-                                       parent_k_frac=header.kpoints)
+                                       parent_k_frac=header.kpoints,
+                                       layout=basis.layout), basis
 
 
 def _literal_children(parent, plan):
@@ -533,6 +542,72 @@ def test_parent_chi_two_families_equals_literal_full_k(monkeypatch):
             for (a, b), block in zip(pairs, actual):
                 np.testing.assert_allclose(block, expected[a, b], rtol=3e-12, atol=3e-12,
                                            err_msg=f'Lorentz block {(a, b)}')
+
+
+def test_photon_stream_on_parents_equals_full_k_children(monkeypatch):
+    """The four-current stream on raw parents (two family plans, orbit-packed
+    bases, canonical output) equals the stream on the literal full-k children
+    in canonical order, and so do the Drude current faces: no psi unfold."""
+    import dataclasses
+    from gw.photon_layout import PhotonBasisLayout, PhotonFamilies
+    from gw.response_bank import PhotonEndpoints
+    from gw.static_gauge_response import photon_diagonal_current_faces
+    from gw.w_isdf import _get_chi_fractional_contour_kernel_face
+    _cpu_algebra(monkeypatch)
+    import gw.contour_accumulator as ca
+    monkeypatch.setattr(ca, "contour_accumulator",
+                        lambda mesh_: (lambda acc, c, p: acc + p[:, None, None, None] * c[None]))
+    mesh = _mesh()
+    current = np.array([[1, 0, 0], [2, 3, 0], [0, 0, 0], [2, 2, 0], [1, 1, 0], [3, 3, 0]])
+    (pc, bc), (pt, bt) = (_toy_plan(mesh, with_basis=True),
+                          _toy_plan(mesh, points=current, fft=(4, 4, 1), with_basis=True))
+    assert not (bc.is_identity and bt.is_identity)
+    rng = np.random.default_rng(116)
+    nb = 4
+    energy = np.tile([-1.2, -.7, .4, 1.3], (pc.n_parent, 1)) + .05*np.arange(pc.n_parent)[:, None]
+    occ = 1/(1+np.exp(energy/.5))
+    mun_sh, nmu_sh = (NamedSharding(mesh, P(None, None, 'x', 'y')),
+                      NamedSharding(mesh, P(None, 'x', None, 'y')))
+    parents, children = [], []
+    for plan, basis in ((pc, bc), (pt, bt)):
+        shape = (plan.n_parent, nb, 4, plan.n_centroid_packed)
+        parent = (rng.normal(size=shape)+1j*rng.normal(size=shape))/3
+        parent[..., ~basis.active_mask] = 0
+        parents.append(parent)
+        child = basis.unpack_host(_literal_children(parent, plan), axis=-1)
+        children.append(np.pad(child, [(0, 0)]*3 + [(0, basis.n_canonical-child.shape[-1])]))
+    layout = PhotonBasisLayout.from_centroid_extents(bc.n_logical, bt.n_logical, mesh)
+    candidate = PhotonFamilies(
+        plans=(pc, pt), layout=layout, bases=(bc, bt),
+        packed_layout=PhotonBasisLayout.from_centroid_extents(
+            bc.n_packed, bt.n_packed, mesh, packed=True))
+    reference = PhotonFamilies(plans=(None, None), packed_layout=layout, layout=layout)
+    faces = lambda xs: (tuple(jax.device_put(x.transpose(0, 2, 3, 1), mun_sh) for x in xs),
+                        tuple(jax.device_put(x, nmu_sh) for x in xs))
+    rows = pc.irr_idx
+    times = np.array([.13, .41])
+    q_ids = tuple(range(9))
+    outputs, currents = [], []
+    for families, xs, e, f in ((candidate, parents, energy, occ),
+                               (reference, children, energy[rows], occ[rows])):
+        mun, nmu = faces(xs)
+        nk_in = pc.n_parent if families.plans[0] is not None else 9
+        kernel = _get_chi_fractional_contour_kernel_face(
+            mesh, (3, 3, 1), 1, (nk_in, nb, layout.packed_extent, 4),
+            selected_q=q_ids, ordered=True, vertex=families)
+        outputs.append(np.asarray(kernel(
+            jnp.asarray(times), jnp.asarray([[1., .3j]]), mun, nmu, jnp.asarray(e),
+            jnp.asarray(f.astype(complex)), jnp.asarray((1-f).astype(complex)),
+            jnp.asarray(0.1))))
+        currents.append([np.asarray(c) for c in photon_diagonal_current_faces(
+            PhotonEndpoints(families, mun, nmu, jnp.asarray(e)), mesh_xy=mesh,
+            layout=layout)])
+    scale = np.max(np.abs(outputs[1]))
+    assert scale > .01 and outputs[0].shape == outputs[1].shape
+    np.testing.assert_allclose(outputs[0], outputs[1], rtol=0, atol=1e-12*scale)
+    for got, want in zip(*currents):
+        assert np.max(np.abs(want)) > .01
+        np.testing.assert_allclose(got, want, rtol=0, atol=1e-12*np.max(np.abs(want)))
 
 
 def test_full_band_unfold_matches_literal_sigma_on_symmetric_complete_toy(monkeypatch):
