@@ -1626,7 +1626,7 @@ def _plan_route_g_for_channel(
 			int(meta.n_rtot) // _n_a, math.ceil(1.2 * math.pi * _r * _r)))),
 		n_s=(int(psi_cylinder[1]) if psi_cylinder else int(min(
 			_n_a, math.ceil(2.4 * _r) + 1))),
-		n_vertex=int(n_vertex))
+		n_vertex=int(n_vertex), n_parent=int(n_parent))
 	if jax.process_index() == 0:
 		print_fn(mubatch_plan.format())
 	return {

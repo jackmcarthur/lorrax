@@ -155,6 +155,7 @@ fixed    = n_v · C factor (16·⌈Q/P⌉·μ², q-local tier; 16·Q·μ², repl
 Ψ        = 16·N_k·N_b·n_s·⌈N_Gψ/P⌉                        ψ(G), device-resident
 work(b)  = max over the batch's three stages (GEMM + all-to-all;
            D cylinder; plane groups) of their live sets     b centroids, b = multiple of P;
+                                                            plane stages at c_out ≤ b/P rows;
                                                             Z rows, Z/k-conv output rows and
                                                             the ζ-cylinder accumulator × n_v
 store    = n_v · 16·Q·μ·N_G/P                               host or disk, never the device

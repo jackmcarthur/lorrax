@@ -47,10 +47,10 @@ centroid orbits.
 2  D̃^X_k̄(a, μ, b, G)         Σ_n w^X_n X_{n k̄ a}(r_μ) conj c_{n k̄ b}(G): one batched GEMM
                                per side on the rank's G slice (isdf.pair_kernels)
 3  all-to-all                 G split → μ owner, [L | R] rows owner-major
-   on the owner (c centroids, every G):
+   on the owner (c centroids, every G; steps 4–5 run c_out ≤ c rows at a time):
 4  typed unfold k̄ → k        D̃_k = (U_k⊗Ū_k) T_k[D̃_k̄(perm μ, pslot G) e^{2πi L·k̄} conj(phase)];
                                the ψ spheres' occupied (b,c) columns, DFT along the longest grid
-                               axis onto every plane: the D cylinder (k, plane, s, 2c, s, column)
+                               axis onto every plane: the D cylinder (k, plane, s, 2c_out, s, column)
 5  per group of n_pg planes   columns → planes, 2D FFT: D(k, μ, r_plane) up to its Bloch phase;
                                then per channel: k-convolution with γ̃^{μ_L} → Z_q(μ, r_plane)
                                for every q of the full zone; LR+RL (charge), stored-q selection,
@@ -75,7 +75,12 @@ with (`typed_child_G_tables`). It applies the rotation as a permutation of
 sphere slots and the phase e^{-2πi(k̄+G)·t} with t = round(N·Sτ)/N. It then
 applies the spinor rotation U_k, conjugation on antiunitary rows, and the
 centroid permutation and lattice wrap from the owner's orbit tables. Because
-each owner holds whole orbits, the centroid gather is local.
+each owner holds whole orbits, the centroid gather is local. The bin width c
+is therefore at least the widest orbit, while steps 4–5 hold the all-plane D
+cylinder, one plane group and the k-convolution for the rows in flight: the
+owner streams its c rows through them in balanced chunks of c_out (the
+planned width, `route_g_plane_chunk`), each chunk unfolding its rows from the
+whole-orbit D̃ the all-to-all delivered.
 
 The k-convolution in step 5 is the pair convolution on the identity plan,
 where every k is its own parent: `ffi.fft.make_fused_conv_kplane(D, F)`. It
@@ -223,10 +228,10 @@ the factors and the store are priced n_vertex times; everything else once.
 | X_B and its phase matrix † | 2·n_p·n_b·ns·b·16 + n_p·N'_G·b·16 | stage 1 |
 | pair projectors, GEMM output and all-to-all output † | 4·n_p·ns²·b·N'_G·16 | stage 1 |
 | pair projectors on the owner † | 2·n_p·ns²·b·N'_G·16 | stage 2 |
-| D cylinder, all planes | N_k·n_a'·ns²·2c·n_col·16 | stages 2–3 |
-| one plane group | 2·N_k·n_pg·ns²·2c·n_⊥·16 | stage 3 |
-| k-convolution and Z workspace | (9·N_k + 3·Q)·c·n_pg·n_⊥·16 | stage 3 |
-| ζ-cylinder accumulator | Q·c·n_zc·n_za·16 | stage 3 |
+| D cylinder, all planes | N_k·n_a'·ns²·2c_out·n_col·16 | stages 2–3 |
+| one plane group | 2·N_k·n_pg·ns²·2c_out·n_⊥·16 | stage 3 |
+| k-convolution and Z workspace | (9·N_k + 3·Q)·c_out·n_pg·n_⊥·16 | stage 3 |
+| ζ-cylinder accumulator | Q·c_out·n_zc·n_za·16 | stage 3 |
 
 Here n_a' is n_a rounded up to a multiple of n_pg, and n_zc, n_za are the ζ
 sphere's columns and axis values. A batch's working set is the maximum over
@@ -250,9 +255,17 @@ The planner decides in this order:
    G_tile·(6·ceil(Q/P)·μ·16, plus Q·μ²·16/N_G when G-split) ≤ target/4,
    capped at ceil(N_G/P)·P.
 
-The fit then packs whole orbits into bins of width c ≤ b/P with the least
-padded work, n_batch·(c+1) (`best_owner_orbit_batches`). The planner does not
-see orbit sizes, so the executed c can be smaller than the planned one.
+The fit then packs whole orbits into bins with the least padded work,
+n_batch·(c+1) (`best_owner_orbit_batches`). A bin is at least the widest
+orbit, so the packed c can exceed the planned b/P (CrI3 D3d: 12 members
+against a planned 2 at P64). `route_g_plane_chunk` then re-prices the batch:
+the source rows (X_B, pair projectors, Z rows, and the owner's D̃ kept live
+across chunks) at b = P·c over the n_p raw parents the kernel holds (not the
+† full-zone bound the batch choice uses), the plane stage at the widest
+balanced c_out ≤ b/P that fits the target, down to one row; if none fits, it
+refuses. CrI3 8×8 charge, P4: planned c = 3, packed c = 12, c_out = 3; the
+route-G module's temp is 8.9 GB where the unchunked all-plane cylinder alone
+was 24.8 GB.
 
 The receipt states each term as a multiple of the Green's-function tile
 N_k·ns²·μ²·16/P, the GW run's unit of memory. It also reports, without
@@ -266,6 +279,7 @@ per rank host Z store.
 | refusal | condition | way out |
 |---|---|---|
 | `GATE zeta-mubatch-capacity` | ψ(G) plus the smallest batch exceed the device target (ψ(G) streaming is not implemented) | more ranks or more memory per device |
+| `GATE zeta-mubatch-orbit-capacity` | the whole-orbit bins' source rows plus a one-row plane stage exceed the target | more memory per device (the bin width is set by the widest orbit, not by P) |
 | `GATE zeta-mubatch-shell` | a head consumer reads a ζ column that the V_q pass did not keep | name the slot in `_head_shell`'s lists |
 | `_fit_mubatch` | the loader's full-BZ rows are not the C-order k grid | none |
 | `typed_child_G_tables` | a child k is not an image of its parent, or needs a G outside the parent's sphere | none |
