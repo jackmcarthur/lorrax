@@ -676,15 +676,22 @@ def persist_w0_and_head(
         # Screening holds W on its q wedge; the writer takes the full zone
         # (its wedge arm stores the producer's own pre-unfold capture).
         from .cohsex_sigma import interaction_operator
-        W_q = interaction_operator(W_q).unfold(mesh_xy)
+        W_op = interaction_operator(W_q)
+        capture = take_pre_unfold("W0_qmunu")
+        if capture is not None and not W_op.is_whole_zone():
+            # The captured block IS the wedge W's buffer.  A role spilled to
+            # host while a later role screened was deleted and restored into a
+            # new buffer, so the capture takes the live one (the same bits).
+            import dataclasses as _dc
+            capture = _dc.replace(capture, X_ibz=W_op.values)
+        W_q = W_op.unfold(mesh_xy)
         if getattr(meta, "mu_basis", None) is not None:
             # Files keep the canonical centroid order.
             W_q = meta.mu_basis.unpack_operator(W_q)
         write_w0_qmunu_to_h5(tensors_filename, W_q,
                              n_rmu_logical=int(meta.n_rmu),
                              mesh=mesh_xy,
-                             qirr=_qirr.with_capture(
-                                 take_pre_unfold("W0_qmunu")))
+                             qirr=_qirr.with_capture(capture))
     _stamp_screening_diagrams(tensors_filename, config)
     with _tmg.section("persist_w0.write_head"):
         write_head_scalars_to_h5(
