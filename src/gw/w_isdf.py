@@ -637,7 +637,7 @@ def _get_chi_fractional_contour_kernel_face(
     this retains all components without storing two full spin Green tensors.
     """
     from common.fft_helpers import make_flat_k_fftn
-    from distrib_la import gemm_plan, panel_matmul
+    from distrib_la import gemm_plan
     from .greens_function_kernel import build_G_tau
     from .wavefunction_bundle import (
         G_FFT7D_SPEC,
@@ -728,14 +728,9 @@ def _get_chi_fractional_contour_kernel_face(
     green_spin = 1 if vertex else ns
     if band_ranges is not None and (layout != "axis" or pair_mode != "direct"):
         raise ValueError("prepared response band ranges require the axis direct stream")
-    if vertex and layout == "face":
-        # Four photon faces stay x/y tiled; exchange only bounded band panels
-        # for the singleton-spin Green product, whose result stays x/y tiled.
-        g_plan = partial(panel_matmul, mesh=mesh_xy, panel_bytes=32 << 20)
-    else:
-        g_plan = gemm_plan(mesh_xy, m=n_rmu * green_spin, k=nb_full, n=n_rmu * green_spin,
-                           nq=nk_shape, dtype=jnp.complex128, layout=layout,
-                           enable_active_range=band_ranges is not None)
+    g_plan = gemm_plan(mesh_xy, m=n_rmu * green_spin, k=nb_full, n=n_rmu * green_spin,
+                       nq=nk_shape, dtype=jnp.complex128, layout=layout,
+                       enable_active_range=band_ranges is not None)
     active_gemms = (tuple(g_plan.prepare_active_range(*bounds) for bounds in band_ranges)
                    if band_ranges is not None else (None, None))
     def _finish(value):
