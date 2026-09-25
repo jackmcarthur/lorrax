@@ -22,8 +22,8 @@ Each axis is one stage, a GEMM with a Fourier matrix stored in the plan,
 
 or an FFT.  The integer phase ``idx'·idx mod N`` is reduced exactly before the
 float64 exponential.  The GEMM does the embedding, transform and restriction
-in one pass; it is chosen when ``N`` is at or below the device's measured
-crossover (:data:`GEMM_CROSSOVER`, separately for full and supported axes).
+in one pass; it is chosen when ``N`` lies in the device's measured GEMM range
+(:data:`GEMM_CROSSOVER`, separately for full and supported axes).
 FFT axes go to one ``fft_helpers.local_fftn3``/``local_ifftn3`` call (a single
 multidimensional ``jnp.fft`` transform, so the library keeps its
 multidimensional algorithm), preceded by one gather per embedded axis
@@ -45,6 +45,8 @@ rebuilt per call.
 
 from __future__ import annotations
 
+from itertools import permutations, product
+from math import prod
 from typing import Mapping
 
 import numpy as np
@@ -54,18 +56,22 @@ import jax.numpy as jnp
 from common.fft_helpers import local_fftn3, local_ifftn3
 
 
-# Per ``device_kind`` prefix: the largest ``N`` at which the stored-matrix GEMM
-# beats the library FFT, for a full N→N axis and for an axis with a support
-# (whose FFT arm pays the embedding gather or the restriction take).  A missing
-# device, and 0, mean FFT.  Sweep: ``tests/bench/bench_fourier_plan.py``.
+# Per ``device_kind`` prefix: the axis lengths ``N`` at which the stored-matrix
+# GEMM beats the library FFT, for a full N→N axis and for an axis with a
+# support (whose FFT arm pays the embedding gather or the restriction take).
+# A missing device, or an ``N`` outside the range, means FFT.  Sweep:
+# ``tests/bench/bench_fourier_plan.py``.
 #
 # A100 (complex128, production XLA flags): a batched cuFFT costs about one HBM
 # pass for every N in 2..256, so a full axis never gains from a GEMM past the
 # launch-latency regime (≤1e3 lines).  A supported axis's FFT arm costs about
 # five passes per sphere→box→sphere round trip (gathers, transform, takes); the
-# rotated GEMM chain replaces them with one GEMM pass per axis and wins up to
-# N = 128 at K = N/2 (0.46–0.90 of the FFT arm on 12³–96³ and 24²–128² boxes).
-GEMM_CROSSOVER: dict[str, tuple[int, int]] = {"NVIDIA A100": (0, 128)}
+# rotated GEMM chain replaces them with one GEMM pass per axis and wins for
+# 8 ≤ N ≤ 128 at K = N/2 (0.46–0.90 of the FFT arm on 12³–96³ and 24²–128²
+# boxes).  Below N = 8 the GEMM's contraction is too skinny (K = 2–3 loses).
+GEMM_CROSSOVER: dict[str, tuple[range, range]] = {
+    "NVIDIA A100": (range(0), range(8, 129)),
+}
 
 _NORMS = (None, "backward", "ortho", "forward")
 
@@ -93,12 +99,12 @@ def dft_matrix(n: int, out_idx, in_idx, *, sign: int, scale: float = 1.0,
     return (scale * a).astype(dtype)
 
 
-def gemm_crossover(device_kind: str) -> tuple[int, int]:
-    """``(full-axis max N, supported-axis max N)`` for ``device_kind``."""
-    for prefix, n_max in GEMM_CROSSOVER.items():
+def gemm_crossover(device_kind: str) -> tuple[range, range]:
+    """``(full-axis N range, supported-axis N range)`` taking the GEMM."""
+    for prefix, row in GEMM_CROSSOVER.items():
         if device_kind.startswith(prefix):
-            return n_max
-    return 0, 0
+            return row
+    return range(0), range(0)
 
 
 class LocalFourierPlan:
@@ -108,15 +114,18 @@ class LocalFourierPlan:
     ``in_support``/``out_support`` map an axis (as written in ``axes``) to an
     integer index array.  ``plan(x)`` requires ``x.dtype == dtype`` and the
     compact extent on every in-support axis, the full extent elsewhere.
+    ``out_perm`` returns ``jnp.transpose(y, out_perm)`` instead of ``y``, at no
+    cost when the GEMM chain can write that order directly (see ``_route``).
     ``device_kind`` defaults to ``jax.devices()[0].device_kind``.
-    ``plan.stages`` lists ``(axis, 'gemm'|'fft', n_in, n_out)`` in execution
-    order.
+    ``plan.stages`` lists ``(axis, 'gemm'|'fft', n_in, n_out)``; GEMM stages
+    of equal ``n_out/n_in`` may execute in either order.
     """
 
     def __init__(self, extents, axes, *, sign: int, norm: str | None = "backward",
                  dtype=jnp.complex128,
                  in_support: Mapping[int, np.ndarray] | None = None,
                  out_support: Mapping[int, np.ndarray] | None = None,
+                 out_perm: tuple[int, ...] | None = None,
                  device_kind: str | None = None):
         extents, axes = tuple(int(n) for n in extents), tuple(int(a) for a in axes)
         if len(extents) != len(axes) or len(set(axes)) != len(axes):
@@ -149,7 +158,7 @@ class LocalFourierPlan:
             if np.unique(i_idx).size != i_idx.size:
                 raise ValueError(f"LocalFourierPlan: in_support on axis {ax} repeats an index")
             supported = ax in in_support or ax in out_support
-            if n <= (n_sup if supported else n_full):
+            if n in (n_sup if supported else n_full):
                 A = dft_matrix(n, o_idx, i_idx, sign=sign,
                                scale=_axis_scale(n, sign, norm), dtype=self.dtype)
                 gemm.append((o_idx.size / i_idx.size, ax, A))
@@ -164,14 +173,17 @@ class LocalFourierPlan:
             self.stages.append((ax, "fft", i_idx.size, o_idx.size))
         # Shrinking GEMMs first, then the FFT group (its embeddings, one
         # multidimensional transform, its restrictions), expanding GEMMs last;
-        # within a ratio the last-listed axis first, so a chain of GEMMs
-        # rotates through the trailing axes without transposes (__call__).
+        # within a ratio the last-listed axis first (``_route`` may reorder
+        # equal ratios and chooses where each GEMM writes its new axis).
         rank = {ax: -i for i, ax in enumerate(axes)}       # minor-most listed axis first
         order = sorted(range(len(gemm)), key=lambda s: (gemm[s][0], rank[gemm[s][1]]))
         pre = [("gemm", gemm[s][1], gemm[s][2]) for s in order if gemm[s][0] < 1]
         post = [("gemm", gemm[s][1], gemm[s][2]) for s in order if gemm[s][0] >= 1]
         mid = embed + ([("fft", tuple(fft), None)] if fft else []) + take
         self._ops = pre + mid + post
+        self._groups = (pre, mid, post)
+        self.out_perm = None if out_perm is None else tuple(int(a) for a in out_perm)
+        self._routes = {}
         fft_stages = self.stages
         self.stages = ([(ax, "gemm", A.shape[1], A.shape[0]) for _, ax, A in pre]
                        + fft_stages
@@ -186,10 +198,19 @@ class LocalFourierPlan:
             if x.shape[ax] != k:
                 raise ValueError(f"LocalFourierPlan: axis {ax} of x has extent "
                                  f"{x.shape[ax]}, the plan expects {k}")
-        fft = local_fftn3 if self.sign < 0 else local_ifftn3
         nd = x.ndim
+        target = list(range(nd)) if self.out_perm is None else [a % nd for a in self.out_perm]
+        if sorted(target) != list(range(nd)):
+            raise ValueError(f"LocalFourierPlan: out_perm {self.out_perm} is not a "
+                             f"permutation of {nd} axes")
+        key = (x.shape, tuple(target))
+        if key not in self._routes:
+            self._routes[key] = self._route(x.shape, target)
+        _, ops, places = self._routes[key]
+        fft = local_fftn3 if self.sign < 0 else local_ifftn3
         phys = list(range(nd))          # phys[p]: the logical axis stored at position p
-        for i, (kind, ax, A) in enumerate(self._ops):
+        places = iter(places)
+        for kind, ax, A in ops:
             if kind == "fft":
                 x = fft(x, axes=tuple(phys.index(a % nd) for a in ax), norm=self.norm)
                 continue
@@ -200,28 +221,61 @@ class LocalFourierPlan:
             elif kind == "take":
                 x = jnp.take(x, jnp.asarray(A), axis=p)
             else:
-                later = any(k == "gemm" for k, _, _ in self._ops[i + 1:])
-                x, phys = _apply_axis_matrix(x, jnp.asarray(A), p, phys, rotate=later)
-        if phys != sorted(phys):
-            x = jnp.transpose(x, [phys.index(a) for a in range(nd)])
+                if 0 < p < nd - 1:      # a middle axis: one transpose to make it minor
+                    x = jnp.moveaxis(x, p, -1)
+                    phys.append(phys.pop(p))
+                    p = nd - 1
+                phys.remove(a)
+                if next(places):        # (rest, N'): the new axis minor
+                    x = jax.lax.dot_general(x, jnp.asarray(A), (((p,), (1,)), ((), ())))
+                    phys.append(a)
+                else:                   # (N', rest): the new axis major
+                    x = jax.lax.dot_general(jnp.asarray(A), x, (((1,), (p,)), ((), ())))
+                    phys.insert(0, a)
+        if phys != target:
+            x = jnp.transpose(x, [phys.index(a) for a in target])
         return x
 
+    def _route(self, shape, target):
+        """The GEMM order (within equal ratios) and output placements that
+        move the fewest elements through explicit transposes.
 
-def _apply_axis_matrix(x, A, p: int, phys: list, *, rotate: bool):
-    """``Σ_j A[j', j] x[..., j, ...]`` over physical axis ``p`` as ONE GEMM.
+        A GEMM contracts its axis where it lies when that axis is major or
+        minor, and writes the new axis major or minor for free (the operand
+        transposes live inside the GEMM); a middle axis costs one transpose,
+        and so does a final order other than ``target``.  At most
+        ``3!·2³ = 48`` candidates; the first minimum wins, so every rank
+        chooses the same route.
+        """
+        nd = len(shape)
+        pre, mid, post = self._groups
 
-    Contracting the major or the minor axis needs no transpose; the new axis
-    is written major (``A · Xᵀ``), so the next-minor axis becomes minor for the
-    following stage, unless this is the last GEMM on the minor axis, which
-    writes it back in place (``X · Aᵀ``).  A middle axis is first moved minor.
-    Returns the result and its physical axis order.
-    """
-    nd = x.ndim
-    if 0 < p < nd - 1:
-        x = jnp.moveaxis(x, p, -1)
-        phys = phys[:p] + phys[p + 1:] + [phys[p]]
-        p = nd - 1
-    if p == nd - 1 and not rotate:
-        return jax.lax.dot_general(x, A, (((p,), (1,)), ((), ()))), phys
-    y = jax.lax.dot_general(A, x, (((1,), (p,)), ((), ())))
-    return y, [phys[p]] + phys[:p] + phys[p + 1:]
+        def orders(group):              # permutations within runs of equal ratio
+            runs = {}
+            for op in group:
+                runs.setdefault(op[2].shape[0] / op[2].shape[1], []).append(op)
+            return [sum(c, []) for c in product(*[[list(q) for q in permutations(r)]
+                                                  for r in runs.values()])]
+
+        best = None
+        for ops in (a + mid + b for a in orders(pre) for b in orders(post)):
+            n_g = sum(op[0] == "gemm" for op in ops)
+            for places in product((0, 1), repeat=n_g):
+                dims, phys, cost, it = list(shape), list(range(nd)), 0, iter(places)
+                for kind, ax, A in ops:
+                    if kind == "fft":
+                        continue
+                    a = ax % nd
+                    if kind != "gemm":
+                        dims[a] = len(A)
+                        continue
+                    if 0 < phys.index(a) < nd - 1:
+                        cost += prod(dims)
+                    phys.remove(a)
+                    dims[a] = A.shape[0]
+                    phys = phys + [a] if next(it) else [a] + phys
+                if phys != target:
+                    cost += prod(dims)
+                if best is None or cost < best[0]:
+                    best = (cost, ops, places)
+        return best

@@ -46,7 +46,7 @@ SIZES = (list(range(2, 33)) + [36, 40, 45, 48, 50, 54, 60, 64, 72, 75, 80, 90, 9
                                120, 125, 128, 135, 144, 150, 160, 180, 192, 200, 216, 225,
                                240, 250, 256])
 GEMM, FFT = "__gemm__", "__fft__"
-fourier_plan.GEMM_CROSSOVER[GEMM] = (1 << 30, 1 << 30)
+fourier_plan.GEMM_CROSSOVER[GEMM] = (range(1 << 30),) * 2
 
 
 def chain(f, reps=CHAIN):
