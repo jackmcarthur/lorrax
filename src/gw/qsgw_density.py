@@ -875,8 +875,8 @@ def rho_from_wfns(psi_G, occ, kweights, *, mesh: Mesh, box_index,
     result = fn(psi, U_j if have_U else None, occ_j, w_j, bidx_j, sp_j)
     if include_current and sym is not None:
         from symmetry_maps import project_polar_fft_field
-        projected = project_polar_fft_field(np.asarray(result[1:]), sym)
-        result = result.at[1:].set(jnp.asarray(projected.field))
+        projected = project_polar_fft_field(result[1:], sym)
+        result = result.at[1:].set(projected.field)
     return result
 
 
