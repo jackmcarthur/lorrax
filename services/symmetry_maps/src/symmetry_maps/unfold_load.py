@@ -276,6 +276,8 @@ class QirrOperator:
     through a k-convolution takes :meth:`load_tables` (the unfold on the
     transform's load, ``ffi.fft.make_kfft_klead_unfold``); :meth:`unfold`
     materializes the full zone for a consumer that needs it whole.
+    Kept 2026-09-25 (FP): it saves memory, not time (time-neutral); the W side's
+    per-rank residency falls 4-5x, e.g. CrI3 16x16 P64 12.5 -> 2.4 GB (derived).
     """
     values: object
     irr_idx: np.ndarray

@@ -92,6 +92,11 @@ from common.fft_helpers import local_fftn3, local_ifftn3
 # and win from N = 32 (``sweep_small_n.out``).  3-D supports and 2-D
 # in-supports win from N = 16/20 and keep the third entry's range.
 # Missing entries mean no K/N bound and the same range.
+# Kept 2026-09-25 (FP): at Fe 8³ in real-space GW, sphere↔box is 54–91% of the FFT
+# time (estimate), and the supported-axis GEMM runs it at 0.50–0.73 of the FFT arm
+# (claim 2764), cutting FFT time by 26–47%.  The empty full-axis column is kept for
+# parts with weak FP64 (B300, sm_86/89/120), where a complex128 FFT is compute-bound
+# and an emulated ZGEMM row is unmeasured.
 GEMM_CROSSOVER: dict[str, tuple] = {
     "NVIDIA A100": (range(0), range(16, 129), 0.54, range(32, 129)),
 }
@@ -292,8 +297,10 @@ class LocalFourierPlan:
 
         A transpose-minimising route search over GEMM orders and output placements
         (1.13-1.40x on this leg's GEMM chains, claim 2745) was removed 2026-09-25:
-        <4% of FFT time on every NVIDIA platform we target, because GEMM axes run
-        on the CUDA leg there and cpu, the XLA leg's platform, has no GEMM row.
+        <4% of FFT time on every NVIDIA platform we target.  Every CUDA build carries
+        the complete NVIDIA stack (owner 2026-09-25), so on NVIDIA this leg runs a
+        GEMM axis only when a caller forces it, which production never does, and
+        cpu has no GEMM row.
         """
         nd = x.ndim
         fft = local_fftn3 if self.sign < 0 else local_ifftn3
