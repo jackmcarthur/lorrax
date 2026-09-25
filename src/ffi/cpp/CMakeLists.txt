@@ -511,7 +511,7 @@ endif()
 # Build lorrax_ffi.so
 # ----------------------------------------------------------------------------
 set(LORRAX_FFI_SOURCES
-    common/api.cc
+    cusolvermp/c_api.cc
     active_subspace/active_eigh.cc
     active_subspace/active_ops.cc
     cublas/local_active_gemm_ffi.cc

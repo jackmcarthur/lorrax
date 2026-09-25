@@ -1,11 +1,8 @@
-// api.cc — extern "C" entry points for ctypes consumers.
-//
-// These thin wrappers let Python call the context lifecycle functions via
-// ctypes (no pybind/nanobind dependency).  The XLA FFI handlers themselves
-// are already exposed by XLA_FFI_DEFINE_HANDLER_SYMBOL as C symbols in
-// cpp/cusolvermp/eigh_ffi.cc.
+// c_api.cc -- the cuSOLVERMp/NCCL grid context's extern "C" entry points for
+// ctypes (distrib_la._cusolvermp): the NCCL unique id, context create and
+// destroy, a smoke all-reduce and the version string.  CUDA leg only.
 
-#include "ctx_registry.h"
+#include "../common/ctx_registry.h"
 #include <cstdint>
 #include <cstring>
 #include <stdexcept>
@@ -14,14 +11,7 @@
 #include <nccl.h>
 #include <cusolverMp.h>
 
-#include "../cusolvermp/ctx.h"
-
-// The parallel-HDF5 lifecycle extern-C wrappers (lrx_phdf5_*) now live in
-// the CUDA-free cpp/phdf5/api.cc so the SAME TU compiles into both the CUDA
-// library and the host library.  A build with -DLORRAX_FFI_HAVE_PHDF5=ON
-// adds cpp/phdf5/api.cc to the source list (see cpp/CMakeLists.txt);
-// a build without it simply omits that TU and ffi_loader.py skips the
-// absent phdf5 symbols.
+#include "ctx.h"
 
 namespace lrx = lorrax_ffi::cusolvermp;
 

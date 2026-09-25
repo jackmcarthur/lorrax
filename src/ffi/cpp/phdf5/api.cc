@@ -5,7 +5,7 @@
 // They are deliberately CUDA-FREE so this ONE translation unit compiles
 // into BOTH platform libraries:
 //   * liblorrax_ffi.so       (CUDA)  — alongside the cusolverMp/cuBLASMp
-//                                       extern-C wrappers in cpp/common/api.cc
+//                                       extern-C wrappers in cpp/cusolvermp/c_api.cc
 //   * liblorrax_ffi_host.so   (cpu)   — the CUDA-free host lib
 // so multi-process CPU can open a collective context and drive the host
 // read handlers through the same lifecycle the GPU path uses.  The
