@@ -1086,10 +1086,11 @@ def plane_resident_bytes(nb: int, nc: int) -> int:
     """Shared memory one mode-10 block needs for an ``(nb, nc)`` plane, static included.
 
     The dynamic plane ``16·nb·(nc|1)`` plus the kernel's static tables
-    ``live[nb]`` (1 B), ``rowb[nb]`` (4 B) and ``foff[PB]`` (8 B, PB = 1 for
-    any plane near the limit), with 16 B of alignment slack.  Mode 10 serves
-    the plane only when this fits the device's opt-in shared memory per block;
-    the handler's build() applies the same bound.
+    ``live[nb]`` (1 B), ``rowb[rows]`` (4 B, rows <= nb) and ``foff[PB]`` (8 B,
+    PB = 1 for any plane near the limit), with 16 B of alignment slack.  Mode 10
+    serves the plane only when this fits the device's opt-in shared memory per
+    block; the handler's build() applies the same bound (and adds the
+    asynchronous gather's staging only when that fits as well).
     """
     nb, nc = int(nb), int(nc)
     return 16 * nb * (nc | 1) + 5 * nb + 8 + 16
