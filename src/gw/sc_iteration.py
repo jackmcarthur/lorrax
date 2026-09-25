@@ -413,7 +413,7 @@ class SCInputs:
     #: state exists; later maps read the path as immutable grid provenance.
     screening_seed_cache: dict | None = None
     #: Run-local dynamic-Sigma quadrature receipts.  None for one-shot and
-    #: one-map SC diagnostics; a multi-map SC run fills these on map 1 and
+    #: one-map SC diagnostics; a multi-map SC run fills these on map 0 and
     #: reuses the exact node arrays thereafter.  A window that escapes its
     #: padded certificate, or a new window name, gets its rule rebuilt and
     #: the rebuild is counted in the planner receipt (2026-09-03).
