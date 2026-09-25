@@ -276,9 +276,9 @@ def test_ibz_refuses_rather_than_falling_back(tmp_path):
 def test_a_wedge_row_that_is_never_a_parent_is_refused_not_written(tmp_path):
     """The writer must not produce a file its own reader would refuse.
 
-    ``kin_ion.read_star_map`` refuses when the stored k extent does not equal
-    ``irr_idx_k.max() + 1``, because it cannot tell that from a truncated
-    slab.  The round trip alone does NOT catch it: the round trip only reads
+    ``restart_bundle.read_star_map`` refuses when the stored k extent is not
+    the number of distinct stars in ``irr_idx_k``, because it cannot tell that
+    from a truncated slab.  The round trip alone does NOT catch it: the round trip only reads
     rows the tables point at, so a stored k that is never an orbit parent
     reconstructs perfectly and still leaves an unreadable file.  This is the
     register's ``cohsex_debug`` shape — file wedge 4, star wedge 3, where
@@ -312,6 +312,39 @@ def test_a_wedge_row_that_is_never_a_parent_is_refused_not_written(tmp_path):
     said = []
     assert _w("auto", print_fn=said.append) == K_STORAGE_FULL
     assert any("never an orbit parent" in s for s in said), said
+
+
+def test_sparse_star_labels_fall_back_to_the_full_bz_the_reader_accepts(tmp_path):
+    """RED TWIN of the SC seed write on ``gnppm_debug`` (P2-E 2026-09-24).
+
+    Nine WFN k, labelled ``[0, 2, 2, 6, 8, 7, 6, 7, 8]``: ``max + 1`` = 9
+    equals the 9-row wedge, so the writer filed the tables, and the reader,
+    which counts 5 distinct stars, refused its own file.  ``auto`` must fall
+    back to the full BZ, a file the reader accepts, and ``ibz`` must refuse.
+    """
+    from file_io.kin_ion import broadcast_ibz_to_full_bz as _bc
+    irr = np.array([0, 2, 2, 6, 8, 7, 6, 7, 8], dtype=np.int32)
+    tables = (irr, np.zeros(9, dtype=np.int32), 1)
+    rng = np.random.default_rng(7)
+    nb = 2
+    U = np.asarray(_bc(rng.normal(size=(9, nb, nb)) + 0j, *tables))
+    E = np.asarray(_bc(rng.normal(size=(9, nb)), *tables))
+    kpts = rng.normal(size=(9, 3))
+
+    def _w(k_storage, **kw):
+        path = str(tmp_path / f"sparse_{k_storage}.h5")
+        return path, write_qp_rotations_h5(
+            path, U_mnk=U, E_qp_nk=E, band_start=0, band_stop=nb,
+            kpoints_crys=kpts, nkx=3, nky=3, nkz=1,
+            kirr_to_kfull=np.arange(9, dtype=np.int32),
+            k_storage=k_storage, star_tables=tables,
+            source_wfn=_source_wfn(kpts, nb), **kw)
+
+    with pytest.raises(ValueError, match="never an orbit parent"):
+        _w("ibz")
+    path, stored = _w("auto", print_fn=lambda *_a, **_k: None)
+    assert stored == K_STORAGE_FULL
+    np.testing.assert_array_equal(read_qp_rotations_full_bz(path)["U_mnk"], U)
 
 
 def test_the_wedge_arm_refuses_without_the_tables_it_would_file(tmp_path):

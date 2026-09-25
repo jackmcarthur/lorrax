@@ -516,23 +516,24 @@ def write_qp_rotations_h5(
                 f"full-BZ k but the arrays carry {nk_full} rows — the "
                 f"tables and the arrays are not the same calculation.")
         # THE READER'S OWN CONSISTENCY CONDITION, CHECKED AT THE WRITER.
-        # ``kin_ion.read_star_map`` refuses a file whose stored k extent does
-        # not equal ``irr_idx_k.max() + 1``, and that can fail here without
-        # the round trip noticing: the round trip only reads rows the tables
-        # POINT AT, so a file-wedge row that is never an orbit parent — the
-        # register's ``cohsex_debug`` case, where row 1 is the time-reverse of
-        # row 2 — is reconstructed fine and still leaves a table the reader
-        # will not accept.  Refusing here is the difference between a writer
-        # that cannot produce an unreadable file and one that merely usually
-        # does not.
-        n_star = int(irr.max(initial=-1)) + 1
+        # ``restart_bundle.read_star_map`` refuses a file whose stored k
+        # extent is not the number of DISTINCT stars in ``irr_idx_k``, and
+        # that can fail here without the round trip noticing: the round trip
+        # only reads rows the tables POINT AT, so a file-wedge row that is
+        # never an orbit parent — the register's ``cohsex_debug`` case, where
+        # row 1 is the time-reverse of row 2, or ``gnppm_debug``'s sparse
+        # labels [0,2,2,6,8,7,6,7,8] (5 stars over a 9-row WFN wedge) — is
+        # reconstructed fine and still leaves a table the reader will not
+        # accept.  ``max + 1`` passed the gnppm_debug table (9 == 9) and the
+        # SC seed write then refused inside its own transaction.
+        n_star = int(np.unique(irr).size)
         nk_red = int(np.asarray(kirr_full_bz).size)
         reasons = []
         if n_star != nk_red:
             reasons.append(
                 f"the file wedge has {nk_red} rows but irr_idx_k names only "
                 f"{n_star} distinct parents, so {nk_red - n_star} stored k "
-                f"are never an orbit parent and file_io.kin_ion.read_star_map "
+                f"are never an orbit parent and file_io.restart_bundle.read_star_map "
                 f"would refuse the file — it cannot tell that from a "
                 f"truncated slab")
         reduced, worst = _wedge_reduction(payload, kirr_full_bz, star_tables)
