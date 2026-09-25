@@ -1854,6 +1854,115 @@ def _apply_dataset_attrs(h5, pending) -> None:
 # ---------------------------------------------------------------------------
 # Backend
 # ---------------------------------------------------------------------------
+class _CollectiveLane:
+    """The process's ONE queue for asynchronous collective HDF5 work.
+
+    Every ``_FfiBackend`` in a process writes through this lane, so the
+    collective ``H5Dwrite`` calls leave in program order, which is the same
+    on every rank.  With one worker thread per handle, two handles' writes
+    reached MPI-IO concurrently and each rank matched them in its own order:
+    three ``SlabIO(mode="w")`` handles with queued writes deadlocked a CrI3
+    run (26 min at 0 B/s).  HDF5 is also not thread-safe across files, so a
+    handle's synchronous door must not run beside another handle's writer.
+
+    The rule, at every door that touches HDF5 (they all drain first, through
+    :meth:`_LaneSlot.drain`): every handle's queued writes and every OTHER
+    handle's in-flight async union reads finish before this handle's HDF5
+    call.  One handle's writes still overlap the caller's compute as before;
+    only a switch between handles waits.  Writer errors stay per handle.
+    """
+
+    def __init__(self):
+        self._dispatcher = None
+        self._owner = None                   # the slot whose writes are queued
+        self._reads: dict[int, list] = {}    # id(slot) -> in-flight reads
+
+    def _worker(self):
+        if self._dispatcher is None:
+            from common.async_io import AsyncDispatcher
+            self._dispatcher = AsyncDispatcher(
+                name="phdf5-collective-lane", maxsize=2)
+        return self._dispatcher
+
+    def _finish_reads(self, slot) -> None:
+        for key in [k for k in self._reads if k != id(slot)]:
+            jax.block_until_ready(self._reads.pop(key))
+
+    def quiesce(self, slot) -> None:
+        """Every queued write (any handle) and every other handle's read is done."""
+        if self._owner is not None:
+            self._worker().drain()
+            self._owner = None
+        self._finish_reads(slot)
+
+    def submit(self, slot, task) -> None:
+        """Queue ``slot``'s collective ``task`` behind every earlier one."""
+        if self._owner is not None and self._owner is not slot:
+            self._worker().drain()
+        self._finish_reads(slot)
+        self._owner = slot
+        self._worker().submit(slot._run(task))
+
+    def pending(self, slot) -> int:
+        return self._worker().pending if self._owner is slot else 0
+
+    def track_read(self, slot, result) -> None:
+        """Remember an async union read on ``slot`` until another handle waits.
+
+        What is kept is one element per local shard, sliced from the result:
+        it becomes ready only when the read has landed, and it does not keep
+        the result's buffer alive (a psi read is ~psi/P per rank).
+        """
+        live = [m for m in self._reads.get(id(slot), []) if not m.is_ready()]
+        live.extend(s.data.ravel()[:1] for s in result.addressable_shards)
+        self._reads[id(slot)] = live
+
+    def release(self, slot) -> None:
+        """At close: nothing of ``slot`` is left in the lane."""
+        if self._owner is slot:
+            self._worker().drain()
+            self._owner = None
+        jax.block_until_ready(self._reads.pop(id(slot), []))
+
+
+_LANE = _CollectiveLane()
+
+
+class _LaneSlot:
+    """One handle's door to the lane, with the old per-handle dispatcher API.
+
+    ``submit``/``drain``/``pending``/``close`` go through :data:`_LANE`;
+    ``error`` is this handle's first writer error, STICKY and never raised
+    by a drain (``common.async_io``: a rank that leaves the write sequence
+    strands its peers inside the collective).
+    """
+
+    def __init__(self):
+        self.error: BaseException | None = None
+
+    def _run(self, task):
+        def run():
+            try:
+                task()
+            except BaseException as exc:                  # noqa: BLE001
+                if self.error is None:
+                    self.error = exc
+        return run
+
+    def submit(self, task) -> None:
+        _LANE.submit(self, task)
+
+    def drain(self) -> None:
+        _LANE.quiesce(self)
+
+    @property
+    def pending(self) -> int:
+        return _LANE.pending(self)
+
+    def close(self) -> None:
+        _LANE.release(self)
+
+
 class _FfiBackend(_DatasetGeometry):
     """Collective MPI-IO SlabIO backend."""
 
@@ -1966,6 +2075,9 @@ class _FfiBackend(_DatasetGeometry):
             # before ``H5Fopen``/``H5Fcreate``, and the handle it is about
             # to return cannot appear on it (SlabIO writes the completion
             # line that carries the handle).
+            # H5Fopen/H5Fcreate is collective: no queued write of another
+            # handle may be on the wire beside it (_CollectiveLane).
+            _LANE.quiesce(None)
             with _journal.op_scope("open", path, stack=_J_FFI, mode=mode):
                 self.fh: int = self._open_file(path, mesh=mesh, mode=mode)
             # ``open_file`` has now brought MPI up (context.cc::
@@ -2044,9 +2156,9 @@ class _FfiBackend(_DatasetGeometry):
         #   K=4:           12.91 → 18.50 GB (flat) / 92 s zeta_fit
         # K=2 gives identical throughput to K=4 on this system (writer
         # saturates) while saving 2 × zeta_chunk/rank.
-        from common.async_io import AsyncDispatcher
-        self._dispatcher = AsyncDispatcher(
-            name=f"phdf5-dispatch-{path}", maxsize=2)
+        # This handle's slot in the process's one collective lane
+        # (``_CollectiveLane``), not a writer thread of its own.
+        self._dispatcher = _LaneSlot()
         # Bytes handed to the writer thread that are not on disk yet.
         # write_slab returns as soon as the task is queued, so the
         # only place that can put a denominator under the flush is the
@@ -2730,7 +2842,11 @@ class _FfiBackend(_DatasetGeometry):
         # returns an async ``ffi::Future`` and the caller's next op is what
         # sequences it (measured ~1% end-to-end, read_ffi.cc:819-829).
         # Blocking would be a behaviour change dressed as symmetry.
-        return reader(offsets_dev, counts_dev)
+        result = reader(offsets_dev, counts_dev)
+        # The read runs on this file's native worker thread; another
+        # handle's next HDF5 call waits for it (_CollectiveLane).
+        _LANE.track_read(self._dispatcher, result)
+        return result
 
     # ------------------------------------------------------------------
     def close(self):
@@ -2783,7 +2899,7 @@ class _FfiBackend(_DatasetGeometry):
                   flush=True)
         _t0 = _time.perf_counter()
         try:
-            self._dispatcher.close()            # drain + poison pill + join
+            self._dispatcher.close()            # nothing of this handle left queued
         except BaseException as exc:                          # noqa: BLE001
             if _worker_error is None:
                 _worker_error = exc

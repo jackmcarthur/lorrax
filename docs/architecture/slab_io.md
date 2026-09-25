@@ -48,8 +48,18 @@ show in `/proc`; `ffi.io.staging_totals()` returns
 `(live_contexts, staged_bytes)`.
 
 **Device memory.** `write_slab` holds a reference to its operand until that
-operand's `H5Dwrite` completes. The writer queue holds at most two queued
-writes plus the one in flight, and a further `write_slab` blocks.
+operand's `H5Dwrite` completes. The process's one writer queue holds at most
+two queued writes plus the one in flight, and a further `write_slab` blocks.
+
+**One collective lane per process.** Every handle's asynchronous writes go
+through one queue and one worker (`_slab_io_ffi._CollectiveLane`), so
+collective HDF5 calls leave in program order, which is the same on every
+rank. Before any handle's next HDF5 call (open, create, read, a write to a
+different handle, close), every handle's queued writes and every other
+handle's in-flight `read_slabs` finish. One handle's writes still overlap the
+caller's compute; only a switch between handles waits. With one writer thread
+per handle, three files with queued writes deadlocked a CrI3 run: each rank
+matched the three files' collectives in its own order.
 
 **Two calls are not tile-bounded, and cost O(global array) per process:**
 
@@ -177,7 +187,6 @@ peers blocked in the collective with no traceback.
 
 | a caller may not assume that… | because |
 |---|---|
-| program order serialises two HDF5 handles on the same ranks | writes are asynchronous; call `sync_writes()` before entering another handle |
 | `write_slab`'s data is on disk, or its failure visible, when it returns | a writer error is sticky; it is raised at `close`, or at the first read after the write (`read_slab`, `read_slabs`, `read_whole`, `padded_shape_for` on a write handle), agreed across ranks either way |
 | `write_attr`, `stamp_dataset_attrs` or `create_dataset(attrs=…)` output is readable before `close()` | all three land in one rank-0 h5py reopen after `H5Fclose` |
 | a rank other than 0 contributes deferred metadata | every rank queues, only rank 0's copy is written |
@@ -194,9 +203,9 @@ peers blocked in the collective with no traceback.
 
 `close()` runs the same sequence on every rank:
 
-1. Drain this rank's write queue and join the writer thread. A writer error
-   is recorded, not raised, so this rank still issues every collective its
-   peers do.
+1. Drain this handle's queued writes from the collective lane. A writer
+   error is recorded, not raised, so this rank still issues every collective
+   its peers do.
 2. `H5Fclose`, collectively.
 3. Release the [one-owner](#one-owner) claim.
 4. `common.collectives.agree_io_error(stage="SlabIO.data_close")`. Each rank
@@ -329,8 +338,8 @@ union-read target and is not cached. Nothing here keys on process count.
   ([`ffi_layout.md`](ffi_layout.md) §7a). A gate that needs the check without
   opening a file compares `file_io._slab_io_ffi._probe_mpi_world_size()[0]`
   with `jax.process_count()` after MPI is initialised.
-- **`MPI_THREAD_MULTIPLE`.** The writer thread drives MPI-IO while other
-  threads use MPI. A lower granted level aborts the whole world before any
+- **`MPI_THREAD_MULTIPLE`.** The collective lane's worker drives MPI-IO
+  while other threads use MPI. A lower granted level aborts the whole world before any
   collective (`src/ffi/cpp/common/mpi_thread_guard.h`).
 - **The launch line** belongs to the machine page. On Perlmutter, Shifter's
   Cray MPICH needs `srun --mpi=cray_shasta`, which is the `run_shifter.sh` /
