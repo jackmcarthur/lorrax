@@ -1329,8 +1329,8 @@ def _write_gw_results(
         timing.record("gw_jax.output", time.perf_counter() - _t_out)
 
 
-def _close_timing(_pre_main, _t_main, meta, print0):
-    """Produce the complete process wall time and timing decomposition."""
+def _record_process_wall(_pre_main, _t_main):
+    """Record the pre-main rows and return the complete process wall time."""
     if _pre_main is not None:
         _phases = RUNTIME.facts.get("elapsed", {})
         for _phase, _secs in sorted(_phases.items()):
@@ -1338,7 +1338,12 @@ def _close_timing(_pre_main, _t_main, meta, print0):
                 timing.record(f"gw_jax.runtime_stack.{_phase}", _secs)
         timing.record("gw_jax.imports",
                       max(_pre_main - _phases.get("total", 0.0), 0.0))
-    _wall = time.perf_counter() - _t_main + (_pre_main or 0.0)
+    return time.perf_counter() - _t_main + (_pre_main or 0.0)
+
+
+def _close_timing(_pre_main, _t_main, meta, print0):
+    """Produce the complete process wall time and timing decomposition."""
+    _wall = _record_process_wall(_pre_main, _t_main)
     if meta.rank == 0 and debug_print_enabled():
         timing.report(print_fn=print0, title="--- Timing ---", wall=_wall)
     return (_wall)
@@ -1512,10 +1517,38 @@ def main(argv=None):
 	_pre_main = timing.process_elapsed_s()
 	timing.reset()
 	quadrature_log.reset()
+	opened = _open_production_report(args)
+	try:
+		return _run_gw_stages(args, _t_main, _pre_main, opened)
+	except BaseException as exc:
+		# A named refusal (GATE ...) ends the run before the completion
+		# report; its stage table is the only record of where the wall went.
+		_report_refused_run(opened[4], _pre_main, _t_main, exc)
+		raise
+
+
+def _report_refused_run(report, _pre_main, _t_main, exc):
+	"""Print the major-stage table and name the refusal, then let it raise."""
+	try:
+		_wall = _record_process_wall(_pre_main, _t_main)
+		if report.rank == 0 and debug_print_enabled():
+			timing.report(print_fn=report.legacy_print, title="--- Timing ---",
+			              wall=_wall)
+		report.timings(timing.records(), wall=_wall)
+		report.warnings()
+		import re
+		gate = re.search(r"GATE (\w+)", str(exc))
+		report.finish(status=f"REFUSED ({type(exc).__name__}"
+		              + (f": GATE {gate.group(1)}" if gate else "") + ")")
+	except Exception:  # noqa: BLE001 - a report failure must not mask the refusal
+		pass
+
+
+def _run_gw_stages(args, _t_main, _pre_main, opened):
+	"""The GW stages from the opened report to the completion line."""
 	(
 	    config, input_dir, qp_solver, mode, report, production_stdout, print0,
-	    _config_provenance, do_screened) = _open_production_report(
-	    args)
+	    _config_provenance, do_screened) = opened
 	_report_head_and_photon_policy(config, print0, report)
 	mesh_xy = RUNTIME.mesh
 	_setup_runtime()

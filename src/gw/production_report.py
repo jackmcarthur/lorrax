@@ -168,6 +168,7 @@ class GWProductionReport:
         self.rank = int(getattr(runtime, "process_index", 0))
         self._warnings: list[str] = []
         self._warnings_emitted = False
+        self._timings_emitted = False
         self._stream = None
         if self.rank == 0:
             Path(self.path).parent.mkdir(parents=True, exist_ok=True)
@@ -621,8 +622,12 @@ class GWProductionReport:
         row instead of being added beside the parent.  This keeps the report's
         invariant explicit: every displayed stage contributes to the wall
         exactly once, while retaining the zeta/V and chi0/W distinctions that
-        operators use to diagnose scaling.
+        operators use to diagnose scaling. Printed once: a refusal raised after
+        the completed run's table (the artifact gate) does not repeat it.
         """
+        if self._timings_emitted:
+            return
+        self._timings_emitted = True
         rows = list(records)
 
         def total(predicate):
