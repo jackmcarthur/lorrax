@@ -671,7 +671,8 @@ def _plan_kfft(x_flat, kgrid, kind: str):
         announce_once(("kconv", "cpu-test-xla"),
                       "[kconv] TEST-ONLY: LORRAX_KFFT_CPU_TEST_XLA=1 on cpu -> jnp.fft "
                       "k-axis transforms (never a production path)")
-        f = jnp.fft.ifftn if kind == "ifftn" else jnp.fft.fftn
+        from common.fft_helpers import local_fftn3, local_ifftn3   # see the import-cycle note
+        f = local_ifftn3 if kind == "ifftn" else local_fftn3
         y = f(x_flat.reshape(kg + tuple(x_flat.shape[1:])), axes=(0, 1, 2), norm=norm)
         return y.reshape(x_flat.shape)
     return make_local_flat_k_fft_ffi(kg, kind=kind, norm=norm)(x_flat)

@@ -132,7 +132,7 @@ def _interband_program(mesh: Mesh, nb_logical: int, degeneracy_ry: float):
                 (2 * safe_z * safe_denom * safe_denom), 0.0)
             return None, (contract(weight), contract(slope))
 
-        _, (value, slope) = jax.lax.scan(one, None, frequencies)
+        _, (value, slope) = jax.lax.scan(one, None, frequencies, unroll=1)
         moments = jnp.stack([contract(jnp.where(
             regular, scale * occupation * delta**power, 0.0))
             for power in range(4)])
@@ -259,7 +259,7 @@ def metal_intraband_photon_response(q_cart, frequencies_ry, drude_tensor,
         dynamic = dynamic.at[:, 1:, 0].set(HALFALPHA * (D @ q.T).T / safe)
         return None, jnp.where(point == 0, static, dynamic)
 
-    _, values = jax.lax.scan(one, None, z)
+    _, values = jax.lax.scan(one, None, z, unroll=1)
     return values
 
 
@@ -324,7 +324,7 @@ def _direct_gamma_chunk(q, bare, weight, interband, slopes, coefficients,
                       jnp.maximum(error, mirror_error))
 
     _, (value, slope, mirror_value, mirror_slope, errors) = jax.lax.scan(
-        one, None, (frequencies, interband, slopes))
+        one, None, (frequencies, interband, slopes), unroll=1)
     return (value, slope, mirror_value, mirror_slope, constant_sum,
             moment_sum, bare_sum, jnp.max(errors))
 

@@ -359,7 +359,7 @@ def eval_ladder_freq_chain(chain: dict, data: dict, snapshot, sh, z,
     y = np.linalg.solve(complex(z) * np.eye(n) - Hm, E)          # (n, p)
     denom = np.where(chain["seed_norm"] > 0.0, chain["seed_norm"], 1.0)
     resid = np.linalg.norm(B_eff @ y[n - p:n, :], axis=0) / denom
-    C = jax.device_put(jnp.asarray(y.reshape(m_use, p, p)))
+    C = jnp.asarray(y.reshape(m_use, p, p))
 
     V_use = jax.lax.with_sharding_constraint(
         chain["S_stack"][:m_use],
