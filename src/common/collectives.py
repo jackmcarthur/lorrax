@@ -109,6 +109,8 @@ __all__ = [
     "shard_over_k",
     # reductions and gathers
     "psum_replicate",
+    "transpose_xy",
+    "xy_tile_mesh",
     "all_gather_processes",
     "gather_to_host",
     "gather_indexed_blocks",
@@ -635,6 +637,53 @@ def replicate_to_mesh(host_array, mesh):
 # ---------------------------------------------------------------------------
 # Reductions and gathers over PROCESSES
 # ---------------------------------------------------------------------------
+
+
+def transpose_xy(x, mesh):
+    """``swapaxes(x, -1, -2)`` of ``x`` sharded ``P(..., 'x', 'y')`` on the square mesh.
+
+    Each rank transposes its tile in place and sends it to its transpose
+    partner, rank (i, j) -> (j, i): ONE collective permute of one tile, so
+    per-rank bytes fall as 1/P.  A GSPMD ``swapaxes`` on this layout
+    all-gathers the (μ, ν) slices instead (GN-PPM fit and tail masks, CrI3
+    16x16 P64: 16.65 GB of replicated masks).  ``mesh=None`` is an unsharded
+    (μ, ν) pair: the local transpose.  Traceable under ``jit``; values are
+    moved, never recomputed.
+    """
+    import jax
+    import jax.numpy as jnp
+    from jax.sharding import PartitionSpec as P
+    if mesh is None:
+        return jnp.swapaxes(x, -1, -2)
+    if x.dtype == jnp.bool_:          # collectives move bytes, not predicates
+        return transpose_xy(x.astype(jnp.uint8), mesh).astype(jnp.bool_)
+    from common.shard_map import shard_map
+    p = int(mesh.shape["x"])
+    if int(mesh.shape["y"]) != p:
+        raise ValueError(f"transpose_xy: mesh {dict(mesh.shape)} is not square")
+    spec = P(*((None,) * (x.ndim - 2)), "x", "y")
+    perm = [(i * p + j, j * p + i) for i in range(p) for j in range(p)]
+    return shard_map(
+        lambda t: jax.lax.ppermute(jnp.swapaxes(t, -1, -2), ("x", "y"), perm),
+        mesh=mesh, in_specs=spec, out_specs=spec)(x)
+
+
+def xy_tile_mesh(x):
+    """The mesh of ``x`` when its last two axes are sharded ``('x', 'y')``, else ``None``.
+
+    The static argument :func:`transpose_xy` wants, read from a concrete
+    array before a ``jit`` boundary; refuses any other sharding of (μ, ν).
+    """
+    from jax.sharding import NamedSharding
+    sh = getattr(x, "sharding", None)
+    if not isinstance(sh, NamedSharding):
+        return None
+    spec = tuple(sh.spec) + (None,) * (x.ndim - len(tuple(sh.spec)))
+    if spec[-2:] == ("x", "y"):
+        return sh.mesh
+    if spec[-2:] == (None, None) or sh.mesh.size == 1:
+        return None
+    raise ValueError(f"xy_tile_mesh: (mu, nu) sharded {spec[-2:]}, want ('x', 'y') or none")
 
 
 def psum_replicate(local_np, mesh):

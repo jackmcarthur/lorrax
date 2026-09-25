@@ -41,6 +41,7 @@ import numpy as np
 # Path bootstrap; dies with the owner's workspace fix -- see _services.py.
 from ffi import _services      # noqa: F401
 from runtime.env_flags import env_bool
+from common.collectives import transpose_xy, xy_tile_mesh
 
 _services.ensure_on_path()
 
@@ -473,10 +474,12 @@ def fit_gn_ppm_from_wc_pair(
     # LOCAL (already-sharded) tile against the free bytes, the same on every
     # process.  The chunking is movement-only (see the sizer), so the fitted
     # values are bit-identical at any q_block; one block when it all fits.
+    # The (mu, nu) adjoints move tiles X<->Y by one permute (transpose_xy).
+    xy_mesh = xy_tile_mesh(Wc_probe_qmunu)
     kernel = _gn_ppm_fit_kernel_ordered if ordered else _gn_ppm_fit_kernel
+    _kargs = (_z, _fb, n_log, _mask) + ((xy_mesh,) if ordered else ())
     _qb = _gn_ppm_fit_q_block(
-        _nq, *_gn_ppm_fit_bytes_per_q(kernel, Wc0_qmunu, Wc_probe_qmunu,
-                                      _z, _fb, n_log, _mask),
+        _nq, *_gn_ppm_fit_bytes_per_q(kernel, Wc0_qmunu, Wc_probe_qmunu, *_kargs),
         _gn_ppm_fit_free_bytes())
 
     # The anti-Hermitian half of the probe, kept only on the ordered path
@@ -493,10 +496,9 @@ def fit_gn_ppm_from_wc_pair(
         _q1 = min(_q0 + _qb, _nq)
         _blk = ((Wc0_qmunu, Wc_probe_qmunu) if _qb >= _nq else
                 (Wc0_qmunu[_q0:_q1], Wc_probe_qmunu[_q0:_q1]))
-        (_o, _b, _g, _ng, _nm, _omin, _omax, _rmin, *_a) = kernel(
-            *_blk, _z, _fb, n_log, _mask)
+        (_o, _b, _g, _ng, _nm, _omin, _omax, _rmin, *_a) = kernel(*_blk, *_kargs)
         if ordered:
-            _aod.append(_match_layout(_a[0], _o))
+            _aod.append(_a[0])
         _om.append(_o); _bv.append(_b); _gd.append(_g)
         # Exact integer counts -> summation order is irrelevant.
         n_good = n_good + _ng
@@ -532,7 +534,7 @@ def fit_gn_ppm_from_wc_pair(
          omega_min_after_j, omega_max_after_j,
          tail_anchor_j) = _coarsen_gn_ppm_extreme_tails(
              omega_vals, B_vals, good, Wc0_qmunu, _qneg, _fb,
-             tail_divisor=GN_PPM_EXTREME_TAIL_DIVISOR)
+             tail_divisor=GN_PPM_EXTREME_TAIL_DIVISOR, xy_mesh=xy_mesh)
         n_tail_low = int(_scalar_to_host_float(n_low_j))
         n_tail_high = int(_scalar_to_host_float(n_high_j))
         if n_valid:
@@ -646,7 +648,7 @@ def _gn_ppm_fit_bytes_per_q(kernel, Wc0, Wprobe, *args) -> tuple[int, int]:
         return jax.ShapeDtypeStruct((1,) + tuple(x.shape[1:]), x.dtype,
                                     sharding=getattr(x, "sharding", None))
     key = (kernel.__name__, tuple(Wc0.shape[1:]), str(getattr(Wc0, "sharding", None)),
-           str(getattr(Wprobe, "sharding", None)), args[2], args[3] is None)
+           str(getattr(Wprobe, "sharding", None)), args[2], args[3] is None, args[4:])
     if key not in _GN_PPM_FIT_BYTES_PER_Q:
         ma = kernel.lower(one_q(Wc0), one_q(Wprobe), *args).compile().memory_analysis()
         sh = getattr(Wc0, "sharding", None)
@@ -700,7 +702,7 @@ def _gn_ppm_fit_q_block(nq: int, block_bytes_per_q: int, out_bytes_per_q: int,
 
 @partial(
     jax.jit,
-    static_argnames=("tail_divisor",),
+    static_argnames=("tail_divisor", "xy_mesh"),
     donate_argnums=(0, 1),
 )
 def _coarsen_gn_ppm_extreme_tails(
@@ -712,6 +714,7 @@ def _coarsen_gn_ppm_extreme_tails(
     fallback_omega,
     *,
     tail_divisor: int,
+    xy_mesh=None,
 ):
     """Apply the lossy user-ruled GN tail policy without a tensor gather.
 
@@ -722,7 +725,9 @@ def _coarsen_gn_ppm_extreme_tails(
     index array is made.  Each exact per-lane candidate mask is then reduced
     to its group-closure interior over the physical orbit
     ``(q,mu,nu)``, ``(q,nu,mu)``, ``(-q,mu,nu)``, ``(-q,nu,mu)`` (with the
-    natural collapses on diagonals and self-negative q).  An orbit is changed
+    natural collapses on diagonals and self-negative q; the (mu, nu) swap is
+    one X<->Y tile permute, :func:`common.collectives.transpose_xy`, on
+    ``xy_mesh``).  An orbit is changed
     only if every member was already inside the same tail candidate; a
     one-ulp boundary split therefore retains the whole orbit.  This can only
     undershoot the per-tail budget, never exceed it, and all selected lanes
@@ -810,8 +815,8 @@ def _coarsen_gn_ppm_extreme_tails(
     def _orbit_interior(mask):
         mask_mq = jnp.take(mask, q_neg, axis=0)
         return (
-            mask & jnp.swapaxes(mask, -1, -2) & mask_mq
-            & jnp.swapaxes(mask_mq, -1, -2)
+            mask & transpose_xy(mask, xy_mesh) & mask_mq
+            & transpose_xy(mask_mq, xy_mesh)
         )
 
     lower = _orbit_interior(lower)
@@ -987,32 +992,9 @@ def _gn_ppm_fit_kernel(Wc0_qmunu, Wc_probe_qmunu, z_probe, fallback, n_log,
     )
 
 
-def _match_layout(x, like):
-    """Reshard ``x`` onto ``like``'s layout now, one q block at a time.
-
-    The ordered kernel's anti-Hermitian half comes out of an X<->Y transpose
-    and may carry the transposed layout.  Left alone, the first elementwise
-    use against ``Omega`` (``_gn_ppm_odd_residue``) reshards the whole
-    ``(nq, mu, mu)`` array at once: on CrI3 16x16 P64 (mu 3998 -> 4032) that
-    was a 4161798144-byte temporary (256 x 1008 x 1008 c128) and map 0 ran
-    out of memory (pool 58750500 steps .79-.84).  Per block it is one small
-    permute.  Values are untouched.
-    """
-    target = getattr(like, "sharding", None)
-    if target is None or getattr(x, "sharding", None) == target:
-        return x
-    return _reshard_to(target)(x)
-
-
-@lru_cache(maxsize=None)
-def _reshard_to(target):
-    """One compiled identity per target layout; XLA emits the reshard."""
-    return jax.jit(lambda a: a, out_shardings=target)
-
-
-@partial(jax.jit, static_argnums=(4,))
+@partial(jax.jit, static_argnums=(4, 6))
 def _gn_ppm_fit_kernel_ordered(Wc0_qmunu, Wc_probe_qmunu, z_probe, fallback,
-                               n_log, mu_active_mask=None):
+                               n_log, mu_active_mask=None, xy_mesh=None):
     """The ordered-orientation twin of :func:`_gn_ppm_fit_kernel`.
 
     Same module, same eight outputs, plus the anti-Hermitian half of the
@@ -1020,15 +1002,15 @@ def _gn_ppm_fit_kernel_ordered(Wc0_qmunu, Wc_probe_qmunu, z_probe, fallback,
     ``W^c(i*omega_p)`` -- ``(W + W^H)/2`` over the trailing ``(mu, nu)`` pair
     -- so ``Omega`` stays real symmetric and ``B`` Hermitian whatever the
     deck (``docs/dev/notes/DERIVATION_gnppm_nonhermitian.md`` section 3).
-    The adjoint is taken INSIDE the jit for the same reason
-    ``common.sanity.check_hermitian`` takes its transpose inside one: on the
-    ``P(None, 'x', 'y')`` layout the transpose is an X<->Y resharding, and
-    fused under one module GSPMD moves the tile locally instead of
-    all-gathering both operands.  This is a separate XLA program from the
-    incumbent kernel by design: the incumbent stays bit-identical.
+    On the ``P(None, 'x', 'y')`` layout the adjoint is an X<->Y tile permute
+    (:func:`common.collectives.transpose_xy` on ``xy_mesh``): one tile per
+    rank, where a GSPMD ``swapaxes`` all-gathered ~3 global (q, mu, nu)
+    slices per q (CrI3 16x16 P64, module 0465).  This is a separate XLA
+    program from the incumbent kernel by design: the incumbent stays
+    bit-identical.
     """
     Wc_probe = jnp.asarray(Wc_probe_qmunu, dtype=jnp.complex128)
-    Wc_probe_adj = jnp.conj(jnp.swapaxes(Wc_probe, -1, -2))
+    Wc_probe_adj = jnp.conj(transpose_xy(Wc_probe, xy_mesh))
     herm = 0.5 * (Wc_probe + Wc_probe_adj)
     anti = 0.5 * (Wc_probe - Wc_probe_adj)
     (omega_vals, B_vals, good, n_good, n_modes,
