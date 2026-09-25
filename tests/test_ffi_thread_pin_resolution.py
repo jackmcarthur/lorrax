@@ -4,8 +4,8 @@ Gate for the 2026-07-30 FFI C++ divergence audit.  Three families copied the
 MKL thread-pin block and the copies drifted on the resolver line:
 
     cpp/scalapack/blacs_grid.h      bare dlsym(RTLD_DEFAULT, ...)
-    cpp/mklfft/fft_flat_k_ffi.cc    bare dlsym(RTLD_DEFAULT, ...)
-    cpp/mklblas/gemm_batch_ffi.cc   dlsym(RTLD_DEFAULT) then dlsym(RTLD_NEXT)
+    cpp/fftw/fft_flat_k_ffi.cc    bare dlsym(RTLD_DEFAULT, ...)
+    cpp/cblas/gemm_batch_ffi.cc   dlsym(RTLD_DEFAULT) then dlsym(RTLD_NEXT)
 
 They really were three independent resolutions, not one shared inline — each
 is a function-local static, invisible to `strings` and visible to `nm -C`:

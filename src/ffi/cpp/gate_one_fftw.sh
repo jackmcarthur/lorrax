@@ -20,7 +20,7 @@
 # property of the ARTIFACT and it is checked at build time.  It says nothing
 # about which engine — or how many — a running process ends up with, because
 # after GATE 5 the engine arrives by `dlopen` at first use
-# (`mklfft/fft_flat_k_ffi.cc`, the stage-1/stage-2/stage-3 ladder).
+# (`fftw/fft_flat_k_ffi.cc`, the stage-1/stage-2/stage-3 ladder).
 #
 # So the two gates cover the two halves of run-time resolution:
 #

@@ -1113,7 +1113,7 @@ endif()
 
 # ----------------------------------------------------------------------------
 #  RESOLVE 2/4 — CBLAS header for the vendor-BLAS GEMM host handler
-#  (cpp/mklblas/gemm_batch_ffi.cc; contract_bands FFI GEMM body, 2026-07-28 —
+#  (cpp/cblas/gemm_batch_ffi.cc; contract_bands FFI GEMM body, 2026-07-28 —
 #  RESHARD_OVERHEAD_MEMO Sec. 4.4 exit (b)).  VENDOR-PORTABLE since
 #  2026-07-29 (owner order): it builds against ANY standard CBLAS — Intel MKL
 #  via mkl_cblas.h (the Frontera path; zero new link deps) or Cray LibSci /
@@ -1210,7 +1210,7 @@ endif()
 
 # ----------------------------------------------------------------------------
 #  RESOLVE 3/4 — MKL FFT (DFTI API) flat-k batched-FFT host handlers
-#  (cpp/mklfft/fft_flat_k_ffi.cc; FFT-FFI prototype 2026-07-28).  O(N log N)
+#  (cpp/fftw/fft_flat_k_ffi.cc; FFT-FFI prototype 2026-07-28).  O(N log N)
 #  FFT at any k-count via MKL's DFTI descriptor API.
 #  Rides the ScaLAPACK link line already resolved above (DFTI lives inside
 #  libmkl_intel_lp64 / libmkl_core / the threading layer — zero new link
@@ -1267,7 +1267,7 @@ endif()
 #
 #  So this leg no longer contributes to the link line.  What it contributes
 #  instead is a compile-time ABSOLUTE-PATH HINT that heads the runtime dlopen
-#  candidate ladder in mklfft/fft_flat_k_ffi.cc.  The build still names the
+#  candidate ladder in fftw/fft_flat_k_ffi.cc.  The build still names the
 #  engine it was configured against — invariant 2 is preserved, and the answer
 #  to "which FFT am I running" is still baked into the artifact rather than
 #  set by a knob — but naming it can no longer prevent the library loading.
@@ -1406,9 +1406,9 @@ if(_scalapack_on)
         scalapack/eigh_ffi.cc)
 endif()
 if(_mklfft_on)
-    list(APPEND LORRAX_FFI_HOST_SOURCES mklfft/fft_flat_k_ffi.cc)
+    list(APPEND LORRAX_FFI_HOST_SOURCES fftw/fft_flat_k_ffi.cc)
     set_source_files_properties(
-        mklfft/fft_flat_k_ffi.cc
+        fftw/fft_flat_k_ffi.cc
         PROPERTIES COMPILE_OPTIONS "-fopenmp")
     # The TU's own OpenMP pragmas need gomp even if the MKL threading layer
     # is switched to mkl_sequential (mkl_gnu_thread already pulls it in).
@@ -1423,20 +1423,20 @@ if(_mklfft_on)
     # bare-metal-only directory is how a container-invisible dependency gets
     # baked in without anyone noticing.
     if(_fftw3_on AND _fftw3_hint)
-        set_property(SOURCE mklfft/fft_flat_k_ffi.cc APPEND PROPERTY
+        set_property(SOURCE fftw/fft_flat_k_ffi.cc APPEND PROPERTY
             COMPILE_DEFINITIONS
             "LORRAX_FFTW3_SO_HINT=\"${_fftw3_hint}\"")
     endif()
 endif()
 if(_mklblas_on)
-    list(APPEND LORRAX_FFI_HOST_SOURCES mklblas/gemm_batch_ffi.cc)
+    list(APPEND LORRAX_FFI_HOST_SOURCES cblas/gemm_batch_ffi.cc)
     set(LORRAX_MKLBLAS_INCLUDE_DIR "${_gemm_cblas_incdir}")
     set(_gemm_defs "")
     if(_gemm_cblas_header STREQUAL "mkl_cblas.h")
         list(APPEND _gemm_defs "LORRAX_MKLBLAS_MKL_HEADER=1")
     endif()
     set_source_files_properties(
-        mklblas/gemm_batch_ffi.cc
+        cblas/gemm_batch_ffi.cc
         PROPERTIES COMPILE_OPTIONS "-fopenmp"
                    COMPILE_DEFINITIONS "${_gemm_defs}")
     # The CBLAS library resolved above (cblas.h path only; the MKL path's
@@ -1453,7 +1453,7 @@ if(_mklblas_on)
     # build log by the probe-removal gate (wk_REL/harness/gbp_dlsym.sbatch:68).
     # `dlsym` stays in THIS line for that reason and because a build log is
     # the one place naming the mechanism is the point; the LORRAX-facing
-    # runtime announcement (cpp/mklblas/gemm_batch_ffi.cc) says it in plain
+    # runtime announcement (cpp/cblas/gemm_batch_ffi.cc) says it in plain
     # words instead.
     message(STATUS
         "mklblas: GEMM host handler ON (${_gemm_cblas_header} at "

@@ -5,7 +5,7 @@ Retained one wave so existing ``ffi.mklblas`` imports keep working
 public names keep the ``bands_gemm`` prefix they have carried since the
 dial shipped.  Not a general GEMM service — see ``ffi/gemm.py``'s docstring
 and ``docs/dev/vendor_gemm_service.md``.  C++ handler:
-``src/ffi/cpp/mklblas/gemm_batch_ffi.cc``.
+``src/ffi/cpp/cblas/gemm_batch_ffi.cc``.
 """
 import sys as _sys
 

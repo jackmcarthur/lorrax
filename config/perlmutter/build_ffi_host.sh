@@ -119,7 +119,7 @@ LORRAX_PM_HDF5="${LORRAX_PM_HDF5:-cray-hdf5-parallel/1.14.3.7}"
 # cray-fftw supplies the FFT engine.  The flat-k handlers call the FFTW3
 # ADVANCED interface and resolve every entry point by RUNTIME dlsym, and the
 # library that defines them is brought in by a RUNTIME dlopen ladder
-# (src/ffi/cpp/mklfft/fft_flat_k_ffi.cc).  This module therefore exists only
+# (src/ffi/cpp/fftw/fft_flat_k_ffi.cc).  This module therefore exists only
 # to tell the build WHERE that engine lives, so CMake can record it as the
 # dlopen hint.  NOTHING FROM IT REACHES THE LINK LINE -- see GATE 5 in
 # scripts/verify_ffi_build.sh.

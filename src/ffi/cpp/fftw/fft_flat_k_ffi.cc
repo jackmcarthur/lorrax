@@ -229,7 +229,7 @@ struct DescKey {
 //  THE FFTW3 SYMBOL TABLE, resolved at RUN time.
 //
 //  Design: docs/architecture/ffi_layout.md §7.  This is the pattern the GEMM
-//  service already proved (cpp/mklblas/gemm_batch_ffi.cc) -- resolve each
+//  service already proved (cpp/cblas/gemm_batch_ffi.cc) -- resolve each
 //  vendor entry point through mklpin::resolve_sym (RTLD_DEFAULT then
 //  RTLD_NEXT) rather than taking a link-time dependency.  Three consequences,
 //  all of them the point:
