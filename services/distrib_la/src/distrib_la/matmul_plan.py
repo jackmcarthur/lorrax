@@ -834,10 +834,9 @@ def _local_plan(mesh: Mesh, *, m, k, n, nq, dtype, alpha, beta,
             raise ValueError("local_gemm_plan: output extent does not tile its mesh axis")
     a_spec, b_spec = P(None, out_spec[1], None), P(None, None, out_spec[2])
     if face_gather:
+        # gemm_plan has already checked the face contract (m, k, n tile the mesh).
         if reduction_axis is not None or out_spec != P(None, "x", "y"):
             raise ValueError("face plan: two-axis output, no centroid reduction")
-        if k % px or k % py:
-            raise ValueError(f"gemm_plan: k={k} does not tile the {px}x{py} mesh")
         a_spec = b_spec = P(None, "x", "y")
     if reduction_axis is not None and out_spec != P(None, "x", "y"):
         raise ValueError("local_gemm_plan: centroid reduction requires the two-axis output")
@@ -1023,6 +1022,14 @@ def gemm_plan(
             "GEMM exists to avoid for a G/Sigma-sized operand.  Use "
             "distrib_la.matmul(..., batched_route='batch_reshard') "
             "directly for that route.")
+    # The face contract, shared by the CPU gathered plan and cuBLASMp.
+    for label, extent, divisor in (("m", m, px), ("k", k, px),
+                                   ("k", k, py), ("n", n, py)):
+        if extent % divisor:
+            raise ValueError(
+                f"gemm_plan: {label}={extent} does not tile the "
+                f"{px}x{py} mesh (needs divisor {divisor})")
+
     if requested.strip().lower() in ("auto", "distributed") and mesh_platform(mesh) == "cpu":
         return _local_plan(mesh, m=m, k=k, n=n, nq=nq, dtype=dtype,
                            alpha=alpha_c, beta=beta_c, reduction_axis=None,
@@ -1040,13 +1047,6 @@ def gemm_plan(
             f"library; land the {resolved} kernel variant here before "
             "requesting it planned, or call distrib_la.matmul() directly "
             "for this provider.")
-
-    for label, extent, divisor in (("m", m, px), ("k", k, px),
-                                   ("k", k, py), ("n", n, py)):
-        if extent % divisor:
-            raise ValueError(
-                f"gemm_plan: {label}={extent} does not tile the "
-                f"{px}x{py} mesh (needs divisor {divisor})")
 
     if enable_active_range:
         if k > 2**31 - 1:

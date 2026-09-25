@@ -132,6 +132,14 @@ def test_cpu_face_plan_matches_dense(grid, beta):
     np.testing.assert_allclose(np.asarray(got), want(a @ b), atol=1e-12, rtol=0)
 
 
+def test_cpu_face_plan_keeps_the_face_contract():
+    """The CPU face plan goes through gemm_plan's one face-contract check:
+    k must tile both mesh axes (it is A's column face and B's row face)."""
+    mesh = _mesh()
+    with pytest.raises(ValueError, match="k=5 does not tile the 2x2 mesh"):
+        D.gemm_plan(mesh, m=4, k=5, n=4, nq=1, dtype="complex128")
+
+
 def test_cpu_explicit_scalapack_refuses_through_the_probe():
     """No host batched-GEMM handler exists; the probe refuses by name
     (``ProbeResult`` is a tuple, so this needs ``probe.ok``).  A 1x1 mesh
