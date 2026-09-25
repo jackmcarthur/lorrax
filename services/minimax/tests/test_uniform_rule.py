@@ -237,3 +237,22 @@ def test_the_builder_takes_no_budget_argument():
     for dead in ("time_budget", "reduction_steps"):
         with pytest.raises(TypeError):
             build_uniform_rule(box, 1.0e-4, **{dead: 10})
+
+
+def test_the_response_rules_do_not_depend_on_blas_threads():
+    """The chi-side group rules run at the same pinned thread count."""
+    from minimax import complex_response, uniform_rule
+    z = np.array([0.1j, 0.4j, 0.3 + 0.2j, 0.6 + 0.2j])
+    controls = uniform_rule._openblas_controls()
+    saved = [get() for get, _put in controls]
+    times = []
+    try:
+        for threads in (2, 4):
+            for _get, put in controls:
+                put(threads)
+            rules = complex_response.response_group_rules(-0.5, 3.0, z, rel_tol=1e-8)
+            times.append(np.concatenate([r["t"][:r["count"]] for r in rules]))
+    finally:
+        for (_get, put), count in zip(controls, saved):
+            put(count)
+    np.testing.assert_array_equal(times[0], times[1])
