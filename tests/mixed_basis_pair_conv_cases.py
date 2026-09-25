@@ -178,3 +178,50 @@ def children_psi(fx, c_par, par_gvecs, par_ngk, child_gvecs, child_ngk):
         off[flat] = False
         leak = max(leak, float(np.sqrt(np.sum(np.abs(cf[:, :, off]) ** 2) / np.sum(np.abs(cf) ** 2))))
     return out, leak
+
+
+# ---------------------------------------------------------------------------
+# covariant operands: parent band sets closed under their little groups
+# ---------------------------------------------------------------------------
+
+def little_group(rows, ops, n_sym, k):
+    """The rows of ``rows`` that fix ``k``: ``±S^T k ≡ k`` (mod 1), − on an antiunitary row."""
+    out = []
+    for r in np.asarray(rows).tolist():
+        S = np.asarray(ops[r % n_sym], dtype=np.float64)
+        img = (-1.0 if r >= n_sym else 1.0) * (S.T @ np.asarray(k, float))
+        d = img - np.asarray(k, float)
+        if np.max(np.abs(d - np.rint(d))) < 1e-8:
+            out.append(int(r))
+    return out
+
+
+def close_under_little_groups(fx, c_par, par_gvecs, par_ngk, *, rows, spinor_action, ns):
+    """Each parent's bands and their images under every row of its little group, by the
+    r-space typed action (``children_psi`` with the parent as its own child): the parent
+    Green of these bands is little-group invariant, so its typed unfold is covariant.
+
+    ``c_par (n_par, nb, ns, width)``; returns ``(c_closed (n_par, nb·n_max, ns, width), leak)``
+    with zero bands padding the parents whose little group is smaller than the largest."""
+    from types import SimpleNamespace
+    plan = fx["plan"]
+    kpar = np.asarray(plan.k_parent_frac)
+    n_sym = int(plan.n_sym_spatial)
+    n_par, nb, _, w = c_par.shape
+    groups = [little_group(rows, fx["ops"], n_sym, kpar[p]) for p in range(n_par)]
+    n_max = max(len(g) for g in groups)
+    out = np.zeros((n_par, nb * n_max, ns, w), np.complex128)
+    leak = 0.0
+    for p, g in enumerate(groups):
+        U = (np.ones((len(g), 1, 1), np.complex128) if ns == 1
+             else np.asarray(spinor_action(np.asarray(g, np.int32), nspinor=ns)))
+        sub = SimpleNamespace(n_full=len(g), irr_idx=np.full(len(g), p, np.int32),
+                              sym_idx=np.asarray(g, np.int32), k_parent_frac=kpar,
+                              n_sym_spatial=n_sym, spin_action_full=U)
+        img, lk = children_psi(dict(fx, plan=sub, kfull=np.repeat(kpar[p:p + 1], len(g), axis=0)),
+                               c_par, par_gvecs, par_ngk,
+                               np.repeat(par_gvecs[p:p + 1], len(g), axis=0),
+                               np.repeat(np.asarray(par_ngk)[p:p + 1], len(g)))
+        leak = max(leak, lk)
+        out[p, :nb * len(g)] = img.reshape(len(g) * nb, ns, w)
+    return out, leak
