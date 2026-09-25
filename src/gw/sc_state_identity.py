@@ -13,6 +13,8 @@ def assign_qp_identity(reference_u, reference_e_ev, current_u, current_e_ev,
     ----------
     reference_u, current_u : (nk, nb, nb) complex host arrays
         Column rotations ``U[k,m,n] = <DFT_m|QP_n>`` on the same loop k set.
+        ``reference_u=None`` is the DFT basis itself (``U = I``), whose
+        overlaps are ``|current_u|^2`` without a product.
     reference_e_ev, current_e_ev : (nk, nb) real host arrays
         Sorted spectra in eV, paired with the rotation columns.
     trusted_mask : (nb,) or (nk, nb) bool
@@ -48,16 +50,19 @@ def assign_qp_identity(reference_u, reference_e_ev, current_u, current_e_ev,
     ``priority_mask``, when supplied, reserves the original trusted labels'
     optimal assignment before newly tracked labels take the remaining columns.
     """
-    u0, u = np.asarray(reference_u), np.asarray(current_u)
+    u = np.asarray(current_u)
+    u0 = None if reference_u is None else np.asarray(reference_u)
     e0, e = np.asarray(reference_e_ev), np.asarray(current_e_ev)
     mask = np.asarray(trusted_mask, dtype=bool)
     if (e.ndim != 2 or e0.shape != e.shape or
-            u.shape != e.shape + (e.shape[1],) or u0.shape != u.shape or
+            u.shape != e.shape + (e.shape[1],)
+            or (u0 is not None and u0.shape != u.shape) or
             mask.shape not in ((e.shape[1],), e.shape)):
         raise ValueError('SC identity: inconsistent rotation/spectrum/mask shapes')
     if not mask.any():
         raise ValueError('SC identity: empty trusted subspace')
-    if not all(np.isfinite(a).all() for a in (u0, u, e0, e)):
+    if not all(np.isfinite(a).all() for a in (u, e0, e)) or (
+            u0 is not None and not np.isfinite(u0).all()):
         raise ValueError('SC identity: non-finite rotation or spectrum')
     mask = np.broadcast_to(mask, e.shape)
     priority = (mask if priority_mask is None else
@@ -71,7 +76,8 @@ def assign_qp_identity(reference_u, reference_e_ev, current_u, current_e_ev,
         # BGW adjacent-gap grouping, at the SC exact-degeneracy tolerance.
         groups = np.split(np.arange(e.shape[1]),
                           np.flatnonzero(np.diff(e0[k]) > degeneracy_tol_ev) + 1)
-        overlap = np.abs(u0[k].conj().T @ u[k]) ** 2
+        overlap = (np.abs(u[k]) ** 2 if u0 is None
+                   else np.abs(u0[k].conj().T @ u[k]) ** 2)
         score = np.empty((len(labels), e.shape[1]))
         selected_groups = []
         for group in groups:
