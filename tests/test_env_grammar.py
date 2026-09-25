@@ -767,8 +767,8 @@ def test_cuda_async_is_not_caveated_as_under_reporting():
     "cuda_async returns freed transients so the reading under-reports" —
     was not reproduced.
 
-    It is what ``config/frontera/ffi_env.sh:24`` deploys, so getting this
-    wrong caveats (or fails to caveat) the project's own FFI runs.
+    It is the runtime's own allocator, so getting this wrong caveats (or
+    fails to caveat) the project's own runs.
     Transient-heavy kernels were NOT tested, so the note must say that
     rather than claim either way.
     """

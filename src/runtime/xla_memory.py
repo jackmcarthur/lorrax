@@ -63,8 +63,8 @@ from . import _FALSY_TOKENS as _ENV_FALSE
 #  2. ``platform``, ``cuda_async`` and BFC are THREE distinct allocators;
 #     the old comment used the names interchangeably.  ``platform`` is
 #     plain ``cudaMalloc``, NOT cudaMallocAsync.
-#  3. ``config/frontera/ffi_env.sh:24`` deploys ``cuda_async``, which the
-#     ``== "platform"`` test never matched.
+#  3. ``cuda_async`` (the runtime's own default) never matched the
+#     ``== "platform"`` test.
 #  4. jax's preallocate test is case-SENSITIVE, so
 #     ``XLA_PYTHON_CLIENT_PREALLOCATE=FALSE`` leaves preallocation ON
 #     while reading as "off" to a human.  ``unset`` also means ON (the

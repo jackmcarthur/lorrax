@@ -255,7 +255,7 @@ def test_set_default_env_removes_a_blank_allocator(clean_env):
 
 
 def test_set_default_env_keeps_a_legal_allocator(clean_env):
-    """``config/frontera/ffi_env.sh`` exports ``cuda_async``; it must survive."""
+    """A launch environment that exports ``cuda_async`` keeps it."""
     clean_env.setenv("XLA_PYTHON_CLIENT_ALLOCATOR", "cuda_async")
     set_default_env(platform="cpu")
     assert os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] == "cuda_async"

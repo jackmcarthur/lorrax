@@ -295,7 +295,7 @@ variables, not environment variables.
 ### 4b. Frontera staging and MPI build scripts
 
 Read by `config/frontera/stage_runtime.sh`, `build_cpu_runtime_bundle.sh`,
-`build_mpiwrapper.sh`, `build_mpi_overlay.sh` and `ffi_env.sh` at job launch.
+`build_mpiwrapper.sh`, `build_mpi_overlay.sh` and `mpi_transport_env.sh` at job launch.
 
 | var | default | class | grammar and effect |
 |---|---|---|---|
@@ -311,9 +311,8 @@ Read by `config/frontera/stage_runtime.sh`, `build_cpu_runtime_bundle.sh`,
 | `LORRAX_MPIWRAPPER_ROOT` | `$LORRAX_MPIWRAPPER_ROOT_DEFAULT` (Perlmutter) | build | Root holding the builder sentinel, fresh candidates, releases and the `current` symlink. |
 | `LORRAX_MPIWRAPPER_REFERENCE_SO` | unset | build | Optional reference `.so` for the build-note comparison. |
 | `LORRAX_CMAKE` | `command -v cmake` | build | The cmake `build_mpiwrapper.sh` uses. |
-| `LORRAX_FFI_SO_PHDF5` | `$LORRAX_FFI_STAGE/build_phdf5/liblorrax_ffi.so` | launch | The PHDF5-enabled CUDA FFI `.so` that `ffi_env.sh` exports as `LORRAX_FFI_SO`. |
 | `LORRAX_MPI_PROVIDER` | `auto` | launch | `auto` unsets `FI_PROVIDER` and `FI_TCP_IFACE` so Intel MPI picks the native provider (`mlx` on CLX); `tcp` pins IPoIB with `FI_TCP_IFACE=ib0` (the rtx/mlx4 escape); any other value requests that provider (never `verbs` at P ≥ 144). The unset is load-bearing: TACC's default impi module exports `FI_PROVIDER=mlx` into every shell. |
-| `LORRAX_MPI_FABRICS` / `LORRAX_PMI2_LIB` | `shm` / `$WORK/host_pmi/libpmi2.so.0` | launch | `ffi_env.sh` overrides for `I_MPI_FABRICS` (use `shm:ofi` for multi-node) and `I_MPI_PMI_LIBRARY`. |
+| `LORRAX_MPI_FABRICS` / `LORRAX_PMI2_LIB` | `shm` / `$WORK/host_pmi/libpmi2.so.0` | launch | `mpi_transport_env.sh` overrides for `I_MPI_FABRICS` (use `shm:ofi` for multi-node) and `I_MPI_PMI_LIBRARY`. |
 
 ---
 
@@ -345,8 +344,8 @@ Read by `config/frontera/stage_runtime.sh`, `build_cpu_runtime_bundle.sh`,
 | `HDF5_USE_FILE_LOCKING` | `runtime.set_default_env` `setdefault`s `FALSE` before any store opens, and `file_io/hdf5_owner` reports the value. It governs only the serial h5py paths (the MPI-IO VFD takes no POSIX locks); Frontera `/work2` mounts node-local `localflock`, where cross-node locking is incoherent. |
 | `MPLBACKEND` | `setdefault` `Agg` for headless plotting. |
 | `FI_PROVIDER` | Not read by LORRAX. On Frontera CLX leave it unset (`LORRAX_MPI_PROVIDER=auto`) so Intel MPI picks `mlx` (provider costs: [transports §3](../environment/transports.md#3-the-intel-mpi-provider-layer-frontera)). `fi_info` falsely reports `mlx` unavailable; trust the `libfabric provider:` line instead. In apptainer never `--bind /dev`. |
-| `FI_PROVIDER_PATH` | Harnesses and `ffi_env.sh` pin `$IMPI/libfabric/lib/prov`; required in-container, where `mpivars.sh` is not sourced and `PMPI_Init` otherwise finds no provider. |
+| `FI_PROVIDER_PATH` | Harnesses and `mpi_transport_env.sh` pin `$IMPI/libfabric/lib/prov`; required in-container, where `mpivars.sh` is not sourced and `PMPI_Init` otherwise finds no provider. |
 | `I_MPI_FABRICS` | Harnesses export `shm:ofi` (Intel MPI's own default, guarding against an inherited value). |
 | `I_MPI_PMI_LIBRARY` | Required under `srun --mpi=pmi2` and set unconditionally there: TACC's login environment exports a PMI-1 library that is wrong for pmi2 and absent in the container. |
 | `I_MPI_DEBUG` | `4` in every harness; the rank-0 `libfabric provider:` line is the only trustworthy provider observable, and it costs nothing after init. |
-| `UCX_*` (`UCX_TLS` and the RC/DC/UD MLX5 timeout and retry settings) | Harnesses and `ffi_env.sh` `setdefault` the six TACC impi-module values (`UCX_TLS=knem,dc_x,rc` and the retry/timeout bumps); stripping them doubles a 1 MiB 32-rank allreduce (419 → 799 µs). Inherited values win; do not hard-pin (rtx has no `dc_x`). |
+| `UCX_*` (`UCX_TLS` and the RC/DC/UD MLX5 timeout and retry settings) | Harnesses and `mpi_transport_env.sh` `setdefault` the six TACC impi-module values (`UCX_TLS=knem,dc_x,rc` and the retry/timeout bumps); stripping them doubles a 1 MiB 32-rank allreduce (419 → 799 µs). Inherited values win; do not hard-pin (rtx has no `dc_x`). |

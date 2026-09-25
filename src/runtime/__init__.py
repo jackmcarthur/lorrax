@@ -788,9 +788,6 @@ def set_default_gpu_pool() -> None:
     k-convolution is nvidia-mathdx on XLA-owned buffers since 2026-09-24).
     ``cuda_async`` also keeps ``memory_stats()`` populated
     (``runtime.xla_memory``), and reports ``bytes_limit`` once reserved.
-    On sm_75 (Frontera rtx, not a supported GPU target) cudaMallocAsync
-    additionally needs ``config/frontera/gpu_env.sh``'s command-buffer
-    ``XLA_FLAGS``.
     """
     plats = [p.strip().lower()
              for p in os.environ.get("JAX_PLATFORMS", "").split(",") if p.strip()]
