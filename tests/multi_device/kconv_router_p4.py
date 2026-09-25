@@ -61,7 +61,7 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__
 sys.path.insert(0, os.path.join(_ROOT, "src"))
 sys.path.insert(0, os.path.join(_ROOT, "tests"))
 
-from runtime import initialize_communicator_stack, finalize_process  # noqa: E402
+from runtime import initialize_communicator_stack, run_main_and_finalize  # noqa: E402
 
 RUNTIME = initialize_communicator_stack(platform="gpu")
 
@@ -479,12 +479,18 @@ def main() -> int:
         tpc.gpu_main()
     except AssertionError as exc:
         bad.append(f"test_isdf_parent_conv.gpu_main: {exc}")
+    # Every rank computes its own records; the verdict is the union.  A failure on
+    # any rank prints there and turns every rank's return code red.
+    for b in bad:
+        print(TAG, f"FAIL rank{jax.process_index()}: {b}", flush=True)
+    n_bad = np.asarray(multihost_utils.process_allgather(np.asarray([len(bad)], np.int64))).reshape(-1)
     if jax.process_index() == 0:
-        print(TAG, "FAIL: " + "; ".join(bad) if bad else "PASS", flush=True)
-    return 1 if bad else 0
+        print(TAG, f"FAIL: {int(n_bad.sum())} failure(s) over ranks {np.nonzero(n_bad)[0].tolist()}"
+              if n_bad.sum() else "PASS", flush=True)
+    return 1 if n_bad.sum() else 0
 
 
 if __name__ == "__main__":
-    rc = main()
-    finalize_process()
-    sys.exit(rc)
+    # main() returns the gate verdict; run_main_and_finalize carries it into the
+    # process exit (a bare finalize_process call exits 0 whatever main returned).
+    run_main_and_finalize(main)

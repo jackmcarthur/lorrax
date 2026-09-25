@@ -25,7 +25,7 @@ import numpy as np
 _ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.join(_ROOT, "src"))
 
-from runtime import initialize_communicator_stack, finalize_process  # noqa: E402
+from runtime import initialize_communicator_stack, run_main_and_finalize  # noqa: E402
 
 RUNTIME = initialize_communicator_stack(platform="gpu")
 
@@ -98,8 +98,6 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    rc = main()
-    try:
-        finalize_process()
-    finally:
-        sys.exit(rc)
+    # main() returns the gate verdict; run_main_and_finalize carries it into the
+    # process exit (a bare finalize_process call exits 0 whatever main returned).
+    run_main_and_finalize(main)
