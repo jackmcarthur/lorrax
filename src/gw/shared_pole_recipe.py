@@ -890,14 +890,18 @@ def _support_envelope(required, key, session):
         session["reference_complete"] = True
         return dict(version=version, status="initial_reference", epoch=-1,
                     required=dict(required), retained=dict(required), scope=scope)
+    from gw.sigma_box_plan import snap_outward
     previous = session.get("envelope")
     same_policy = previous is not None and session.get("key") == key
-    envelope = dict(required)
+    # Compared and retained on the snap grid: 1 ulp of the census charge
+    # (line_top) otherwise flips hit/expanded, hence the SC sample sites.
+    envelope = {k: snap_outward(v, 1.0, -1 if k == "u_min_ev" else +1)
+                for k, v in required.items()}
     if same_policy:
         envelope = {
-            "line_top_ev": max(previous["line_top_ev"], required["line_top_ev"]),
-            "u_min_ev": min(previous["u_min_ev"], required["u_min_ev"]),
-            "u_max_ev": max(previous["u_max_ev"], required["u_max_ev"]),
+            "line_top_ev": max(previous["line_top_ev"], envelope["line_top_ev"]),
+            "u_min_ev": min(previous["u_min_ev"], envelope["u_min_ev"]),
+            "u_max_ev": max(previous["u_max_ev"], envelope["u_max_ev"]),
         }
     changed = not same_policy or envelope != previous
     status = ("initial" if previous is None else
