@@ -552,10 +552,11 @@ def _probe_kconv_compile(mesh: Mesh) -> None:
     at the first k-convolution.  The cubin is disk-cached like every other."""
     local = [d for d in mesh.devices.flat if d.process_index == jax.process_index()]
     dev = local[0] if local else jax.local_devices()[0]
-    x = jax.device_put(jnp.zeros((2, 1), jnp.complex128), dev)
     try:
-        jax.block_until_ready(jax.jit(lambda x: _rows_kfft_call(
-            KFFT_KLEAD_TARGET, x, (2, 1, 1), forward=True, scale=1.0))(x))
+        with jax.default_device(dev):
+            jax.block_until_ready(jax.jit(lambda: _rows_kfft_call(
+                KFFT_KLEAD_TARGET, jnp.zeros((2, 1), jnp.complex128), (2, 1, 1),
+                forward=True, scale=1.0))())
     except Exception as e:                                          # noqa: BLE001
         from importlib import metadata
         try:
