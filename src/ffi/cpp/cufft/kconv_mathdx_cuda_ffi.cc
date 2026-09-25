@@ -1477,27 +1477,36 @@ extern "C" __global__ void __launch_bounds__(LRX_THREADS, LRX_MINB) lrx_kconv(Ch
     // tile n's gather, then the finish, the inverse transform and the accumulating Mid.
     const ChiMid mid{&a};
     static_assert(TRC == TT_ROWS, "the host passes the tile's pairs and columns together");
-    const TileTabs s{reinterpret_cast<char*>(sm + TRC * lrx_kbox::Geo<NX, NY, NZ>::RS)};
+    // EXPERIMENT (wip/u2c-pipe): two banks.  Tile n + 1's cells go by cp.async right after the
+    // loop-top barrier and stay in flight through tile n's finish, transform and Mid; tile n + 2's
+    // tables load after tile n's finish.  The post-gather barrier merges into the loop top.
+    constexpr int BANK = TRC * lrx_kbox::Geo<NX, NY, NZ>::RS;
+    const TileTabs s{reinterpret_cast<char*>(sm + 2 * BANK)};
     const long long stride = (long long)gridDim.x * TRC;
-    auto npr_of = [&](long long c0) { return (int)min((long long)TP, a.npairs - c0 / GRP); };
+    auto npr_of = [&](long long c0) { return c0 < ncols ? (int)min((long long)TP, a.npairs - c0 / GRP) : 0; };
     long long col0 = (long long)blockIdx.x * TRC;
     tt_fixed(t, s);
     if (col0 < ncols) tt_tile(t, s, 0, a.p0 + col0 / GRP, npr_of(col0), a.my, nullptr, 0);
     lrx_async::commit();
+    lrx_async::wait_all();
+    __syncthreads();
+    if (col0 < ncols) tt_gather(a.gv, a.gvt, a.gc, a.gct, t, s, 0, npr_of(col0), sm);
+    lrx_async::commit();
+    if (col0 + stride < ncols)
+        tt_tile(t, s, 1, a.p0 + (col0 + stride) / GRP, npr_of(col0 + stride), a.my, nullptr, 0);
+    lrx_async::commit();
     for (int b = 0; col0 < ncols; col0 += stride, b ^= 1) {
         lrx_async::wait_all();
-        __syncthreads();                               // tables b in; the previous tile's bank reads done
+        __syncthreads();              // cells n and tables n + 1 in; tile n - 1 is done with bank b ^ 1
+        const long long nxt = col0 + stride;
+        if (nxt < ncols) tt_gather(a.gv, a.gvt, a.gc, a.gct, t, s, b ^ 1, npr_of(nxt), sm + (b ^ 1) * BANK);
+        lrx_async::commit();
         const int npr = npr_of(col0);
-        tt_gather(a.gv, a.gvt, a.gc, a.gct, t, s, b, npr, sm);
+        tt_finish(s, b, npr, sm + b * BANK);
+        if (nxt + stride < ncols) tt_tile(t, s, b, a.p0 + (nxt + stride) / GRP, npr_of(nxt + stride), a.my, nullptr, 0);
         lrx_async::commit();
-        if (col0 + stride < ncols)
-            tt_tile(t, s, b ^ 1, a.p0 + (col0 + stride) / GRP, npr_of(col0 + stride), a.my, nullptr, 0);
-        lrx_async::commit();
-        lrx_async::wait_prior<1>();                     // this tile's cells (not the next tables)
-        __syncthreads();
-        tt_finish(s, b, npr, sm);
-        lrx_kbox::transform3<NX, NY, NZ, TRC, LRX_SM, fft_direction::inverse>(sm);
-        lrx_kbox::mid_group_tile<NX, NY, NZ, TRC, GRP, false>(sm, col0, ncols, mid);   // the loop top syncs
+        lrx_kbox::transform3<NX, NY, NZ, TRC, LRX_SM, fft_direction::inverse>(sm + b * BANK);
+        lrx_kbox::mid_group_tile<NX, NY, NZ, TRC, GRP, false>(sm + b * BANK, col0, ncols, mid);
     }
 #elif LRX_ARM == 0
     (void)phase;
@@ -1799,7 +1808,7 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
             // The tile tables (sm_80+ cp.async; tile_table_plan): bank + UnfoldTiles per block at
             // two or more blocks per SM; none fits: the register load at the plan's tile.
             if (cc_major >= 8 && kplan.threads == kThreads) {
-                const TilePlan tt = tile_table_plan(dev, kplan.tr, static_cast<long long>(chi_grp) * g.rs() * 16,
+                const TilePlan tt = tile_table_plan(dev, kplan.tr, 2LL * chi_grp * g.rs() * 16,   // two banks
                                                     nk, ns, 0, true);
                 if (!tt.err.empty()) return fail("device attributes", tt.err);
                 if (tt.tp > 0) {
