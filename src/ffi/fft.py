@@ -1176,7 +1176,7 @@ def make_kconv_lorentz_unfold(mesh: Mesh, kgrid, tables, *, left_vertices, right
     route.
     """
     from symmetry_maps import apply_unfold_load_tables_local, local_unfold_load_tables
-    kg = _check_kgrid(kgrid)
+    kg = _check_kgrid(kgrid, kconv_backend(mesh))
     nk = kg[0] * kg[1] * kg[2]
     if int(tables.row.shape[0]) != nk:
         raise ValueError(f"k-leading lorentz conv: tables cover {tables.row.shape[0]} k, grid has {nk}")
