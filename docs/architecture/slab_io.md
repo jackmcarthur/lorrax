@@ -55,8 +55,9 @@ two queued writes plus the one in flight, and a further `write_slab` blocks.
 `write_slab` leaves, from the operand's shape, valid extent and sharding and
 the dataset's extent.
 - **Row-block pieces, written independently.** The operand is cut into pieces of
-  one index of each leading axis by `rows` rows of a split axis `k` by every later
-  axis whole. Each piece is redistributed on the device so that rank r holds rows
+  `lead` indices of the lead axis (the last axis before the split axis `k` with
+  more than one valid index) by one index of each other leading axis by `rows`
+  rows of `k` by every later axis whole. Each piece is redistributed on the device so that rank r holds rows
   `[r·rows/P, (r+1)·rows/P)`, then written with `lorrax_phdf5_write_independent`
   (independent `H5Dwrite`). Each rank then writes one contiguous file run per
   leading index. A piece is at most `_FILE_ORDER_PIECE_BYTES` (64 MiB) per rank,
@@ -69,9 +70,10 @@ the dataset's extent.
   (`lorrax_phdf5_write`): P = 1, a tiny slab, a layout that could only be cut by
   slicing a sharded axis (a face `(q, μ_X, ν_Y)` tile too large to take whole),
   or pieces whose per-rank runs would be shorter than 1 MiB.
-- **Why:** at P16 on Lustre, the shared-pole bank shape runs at 2.8 GB/s as row
-  blocks against 2.0 GB/s collective, and a WFN_qp G window at 4.2 against 2.6.
-  Independent writes of short runs lose (76 kB runs: 0.8 GB/s).
+- **Why:** at P16 on Lustre (A100-40GB nodes), the shared-pole bank write at
+  production spread runs at 2.4 GB/s against 2.0 GB/s collective, a WFN_qp G
+  window at 4.1 against 2.8, and the 66 GB CrI3 16×16 WFN_qp write at 30 s
+  against 72 s. Independent writes of short runs lose (76 kB runs: 0.8 GB/s).
 - **Unchanged:** the bytes in the file, the dataset layout and every call
   signature.
 
