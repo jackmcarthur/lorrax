@@ -81,6 +81,43 @@ def test_digest_empty_addressable_shards(monkeypatch):
     assert len(result) == 64
 
 
+def test_digest_ignores_the_panel_split_and_validates_one_shape(monkeypatch):
+    """The model digest is a function of the stored bytes alone, and its
+    validation panels have one shape whatever Kmax and the parent count are
+    (A9: that jit recompiled for every new Kmax and batch remainder)."""
+    from file_io import shared_pole_store as store
+    rng = np.random.default_rng(9)
+    nq, nmu, kmax = 10, 5, 13
+    factor = rng.normal(size=(nq, 8, 1, kmax)) + 1j*rng.normal(size=(nq, 8, 1, kmax))
+    poles = np.sort(rng.uniform(1, 2, size=(nq, kmax)), axis=1)
+    shapes = []
+
+    class IO:
+        def __init__(self, *args, **kwargs): pass
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+        def read_slab(self, name, shape, offset, **kwargs):
+            q0, c0 = offset[0], offset[-1]
+            if name == 'poles2_ry2':
+                return poles[q0:q0+shape[0], c0:c0+shape[1]]
+            data = factor[q0:q0+shape[0], :shape[1], :, c0:c0+shape[3]]
+            return NS(addressable_shards=[NS(replica_id=0, data=data,
+                      index=(slice(None), slice(0, shape[1])))])
+    monkeypatch.setattr(store, 'SlabIO', IO)
+    monkeypatch.setattr(store, '_check_io_capacity', lambda *args: None)
+    monkeypatch.setattr(store, '_admit', lambda *args, **kwargs: None)
+    monkeypatch.setattr(store, '_check_factor', lambda b, p, k: shapes.append(p.shape))
+    monkeypatch.setattr(store, 'psum_replicate', lambda value, mesh: value)
+    header = dict(n_mu_logical=nmu, Kmax=kmax, n_q_irr=nq, K=[kmax] * nq)
+    digests = []
+    for size, x, y in ((1, 1, 1), (4, 2, 2), (8, 2, 4)):
+        shapes.clear()
+        digests.append(store._model_digest('unused', header,
+            NS(size=size, shape={'x': x, 'y': y}), capacity=object()))
+        assert len(set(shapes)) == 1, shapes
+    assert digests[0] == digests[1] == digests[2]
+
+
 def test_pencil_alias_and_distinct_panels():
     import jax.numpy as jnp
     from gw.shared_pole_pencil import finite_pencil_column
