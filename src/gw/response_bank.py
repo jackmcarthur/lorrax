@@ -1418,21 +1418,25 @@ def compute_photon_bank(wfns, wfns_transverse, meta, config, *, mesh_xy, sym,
     from file_io.shared_pole_store import validate_shared_pole_bank
 
     started = time.monotonic()
-    header = validate_shared_pole_bank(bank_io["path"],
-        expected_identity=bank_io["identity"], mesh_xy=mesh_xy)
-    if header.get("photon_layout", {}).get("packed_extent") != layout.packed_extent:
-        raise ValueError("GATE photon_bank_layout: scratch has a different packed photon layout")
-    expected = [hashlib.sha256(np.asarray(b.canonical_indices, dtype="<i4").tobytes()).hexdigest()
-                for b in mu_bases]
-    if expected != header["photon_centroid_digests"]:
-        raise ValueError("GATE photon_bank_centroids: scratch/current endpoint identity differs")
-    bank = dict(bank_io, photon_layout=layout)
-    bank["coulomb"] = dict(path=str(bank["bispinor_v_q_path"]), basis="photon",
-        q_irr_full_idx=np.asarray(sym.q_irr_full_idx).tolist(),
-        sha256=resource_digest(bank["bispinor_v_q_path"]))
-    census = response_weights(wfns, meta)[-1]
-    receipt = _receipt("photon", census, bank)
-    execute = _bank_execution(meta, mesh_xy, receipt, config, photon=True)
+    # The photon bank's head, fenced so it is no longer an unnamed band of
+    # spole.bank (P2-S): scratch validation, the V-file digest, the census.
+    with timing.section("bank.photon_setup"):
+        header = validate_shared_pole_bank(bank_io["path"],
+            expected_identity=bank_io["identity"], mesh_xy=mesh_xy)
+        if header.get("photon_layout", {}).get("packed_extent") != layout.packed_extent:
+            raise ValueError("GATE photon_bank_layout: scratch has a different packed photon layout")
+        expected = [hashlib.sha256(np.asarray(b.canonical_indices, dtype="<i4").tobytes()).hexdigest()
+                    for b in mu_bases]
+        if expected != header["photon_centroid_digests"]:
+            raise ValueError("GATE photon_bank_centroids: scratch/current endpoint identity differs")
+        bank = dict(bank_io, photon_layout=layout)
+        with timing.section("bank.coulomb_digest"):
+            v_digest = resource_digest(bank["bispinor_v_q_path"])
+        bank["coulomb"] = dict(path=str(bank["bispinor_v_q_path"]), basis="photon",
+            q_irr_full_idx=np.asarray(sym.q_irr_full_idx).tolist(), sha256=v_digest)
+        census = response_weights(wfns, meta)[-1]
+        receipt = _receipt("photon", census, bank)
+        execute = _bank_execution(meta, mesh_xy, receipt, config, photon=True)
     ledger = meta.shared_pole_capacity
     ambient = ledger.live_stages
     nq, n = len(sym.q_irr_full_idx), layout.packed_extent
@@ -1457,97 +1461,100 @@ def compute_photon_bank(wfns, wfns_transverse, meta, config, *, mesh_xy, sym,
     before = time.monotonic()
     if jax.process_index() == 0:
         print("photon bank: preparing shared vertex endpoints and bare V", flush=True)
-    vertex = prepare_photon_carriers(wfns, wfns_transverse, mu_bases,
-                                     mesh_xy=mesh_xy, layout=layout)
-    bank["photon_v"] = photon_bare_operator(wfns, wfns_transverse, meta,
-        path=bank["bispinor_v_q_path"], mu_bases=mu_bases, layout=layout, mesh_xy=mesh_xy)
-    from .gw_config import uses_direct_bispinor_shared_pole_head
-    direct_gamma = None
-    if uses_direct_bispinor_shared_pole_head(config):
-        from .photon_direct_head import subtract_bare_tt_from_bank
-        if photon_g0_vectors is None or len(photon_g0_vectors) != 4:
-            raise ValueError("GATE photon_direct_gamma_vectors: expected four authenticated G=0 vectors")
-        # V tiles cross from orbit-packed centroids into PhotonBasisLayout's
-        # canonical family carriers above. Make the same basis conversion for
-        # their G=0 vectors at this bank boundary, using its shared owner.
-        direct_gamma = tuple(
-            basis.unpack_axis(vector, -1)
-            for basis, vector in zip((mu_bases[0],) + (mu_bases[1],) * 3,
-                                     photon_g0_vectors))
-        bank["photon_v"] = subtract_bare_tt_from_bank(
-            bank["photon_v"], direct_gamma,
-            layout=layout, mesh=mesh_xy, wfn=wfn, meta=meta)
+    with timing.section("bank.photon_endpoints"):
+        vertex = prepare_photon_carriers(wfns, wfns_transverse, mu_bases,
+                                         mesh_xy=mesh_xy, layout=layout)
+        bank["photon_v"] = photon_bare_operator(wfns, wfns_transverse, meta,
+            path=bank["bispinor_v_q_path"], mu_bases=mu_bases, layout=layout, mesh_xy=mesh_xy)
+        from .gw_config import uses_direct_bispinor_shared_pole_head
+        direct_gamma = None
+        if uses_direct_bispinor_shared_pole_head(config):
+            from .photon_direct_head import subtract_bare_tt_from_bank
+            if photon_g0_vectors is None or len(photon_g0_vectors) != 4:
+                raise ValueError("GATE photon_direct_gamma_vectors: expected four authenticated G=0 vectors")
+            # V tiles cross from orbit-packed centroids into PhotonBasisLayout's
+            # canonical family carriers above. Make the same basis conversion for
+            # their G=0 vectors at this bank boundary, using its shared owner.
+            direct_gamma = tuple(
+                basis.unpack_axis(vector, -1)
+                for basis, vector in zip((mu_bases[0],) + (mu_bases[1],) * 3,
+                                         photon_g0_vectors))
+            bank["photon_v"] = subtract_bare_tt_from_bank(
+                bank["photon_v"], direct_gamma,
+                layout=layout, mesh=mesh_xy, wfn=wfn, meta=meta)
     receipt["seconds"]["endpoints_and_V"] = time.monotonic()-before
     before = time.monotonic()
     if jax.process_index() == 0:
         print("photon bank: centroid D and static grid reference", flush=True)
-    from file_io.shared_pole_store import (ResidentBankPayload, read_static_reference,
-                                           write_bank_contact, write_static_reference)
-    reference = bank.get("static_reference")
-    initial = None
-    if reference is None:
-        grid, drude, contact = photon_static_contact(wfns, meta, mesh_xy=mesh_xy,
-            layout=layout, vertex=vertex, occupation_state=occupation_state,
-            sample_plan=sample_plan, execute=execute, receipt=receipt)
-        if isinstance(bank["path"], ResidentBankPayload):
-            # The resident payload is released after this map's constructor;
-            # later maps freeze the contact from its own small file.
-            reference = write_static_reference(
-                Path(bank["path"].label).with_name("photon_static_reference.h5"),
-                dict(Pi_grid=grid, Drude=drude, TT_contact=contact),
-                header=header, mesh_xy=mesh_xy)
+    with timing.section("bank.static_contact"):
+        from file_io.shared_pole_store import (ResidentBankPayload, read_static_reference,
+                                               write_bank_contact, write_static_reference)
+        reference = bank.get("static_reference")
+        initial = None
+        if reference is None:
+            grid, drude, contact = photon_static_contact(wfns, meta, mesh_xy=mesh_xy,
+                layout=layout, vertex=vertex, occupation_state=occupation_state,
+                sample_plan=sample_plan, execute=execute, receipt=receipt)
+            if isinstance(bank["path"], ResidentBankPayload):
+                # The resident payload is released after this map's constructor;
+                # later maps freeze the contact from its own small file.
+                reference = write_static_reference(
+                    Path(bank["path"].label).with_name("photon_static_reference.h5"),
+                    dict(Pi_grid=grid, Drude=drude, TT_contact=contact),
+                    header=header, mesh_xy=mesh_xy)
+            else:
+                reference = {key: bank[key] for key in ("path", "identity")}
         else:
-            reference = {key: bank[key] for key in ("path", "identity")}
-    else:
-        initial, (grid, drude, contact) = read_static_reference(reference, n=n, mesh_xy=mesh_xy)
-        for key in ("photon_layout", "photon_centroid_digests"):
-            if initial.get(key) != header[key]:
-                raise ValueError(f"GATE photon_static_reference: initial/current {key} differs")
-    receipt["static_reference"] = reference
-    bank["mirror_operator_provenance"] = dict(coulomb=bank["coulomb"],
-        static_reference=reference,
-        static_reference_commit=(initial["commit"] if initial is not None else None),
-        state_identity=bank["identity"],
-        moments="M0,M1,M2,M3 and constant computed with the identical photon_v and contact arrays")
-    # Persist the contact's two physically defined pieces as bank diagnostics;
-    # the constructor consumes the separately committed constant, not these.
-    write_bank_contact(bank["path"], dict(Pi_grid=grid, Drude=drude, TT_contact=contact),
-                       mesh_xy=mesh_xy)
+            initial, (grid, drude, contact) = read_static_reference(reference, n=n, mesh_xy=mesh_xy)
+            for key in ("photon_layout", "photon_centroid_digests"):
+                if initial.get(key) != header[key]:
+                    raise ValueError(f"GATE photon_static_reference: initial/current {key} differs")
+        receipt["static_reference"] = reference
+        bank["mirror_operator_provenance"] = dict(coulomb=bank["coulomb"],
+            static_reference=reference,
+            static_reference_commit=(initial["commit"] if initial is not None else None),
+            state_identity=bank["identity"],
+            moments="M0,M1,M2,M3 and constant computed with the identical photon_v and contact arrays")
+        # Persist the contact's two physically defined pieces as bank diagnostics;
+        # the constructor consumes the separately committed constant, not these.
+        write_bank_contact(bank["path"], dict(Pi_grid=grid, Drude=drude, TT_contact=contact),
+                           mesh_xy=mesh_xy)
     receipt["seconds"]["static_contact"] = time.monotonic()-before
     del grid, drude
     direct_head = None
-    if uses_direct_bispinor_shared_pole_head(config):
-        from .qsgw_head import read_authenticated_dipole_velocity, _pad_head_band_manifold
-        from .photon_direct_head import build_direct_photon_head, packed_gamma_vectors
-        cache = photon_head_cache if photon_head_cache is not None else {}
-        velocity = cache.get("direct_photon_velocity")
-        if velocity is None:
-            host = read_authenticated_dipole_velocity(
-                os.path.join(config.input_dir, "dipole.h5"), wfn=wfn,
-                meta=meta, config=config,
-                wfn_fingerprint_binding=wfn_fingerprint_binding)
-            nk, nb = int(host.shape[1]), int(host.shape[-1])
-            empty = np.zeros((nk, nb), np.float64)
-            velocity, _, _, _ = _pad_head_band_manifold(
-                host, empty, empty, empty, mesh=mesh_xy)
-            cache["direct_photon_velocity"] = velocity
-            del host
-        if photon_head_rotation is not None:
-            from .qsgw_head import rotate_velocity_active_to_qp
-            velocity = rotate_velocity_active_to_qp(
-                velocity, photon_head_rotation, mesh=mesh_xy)
-        direct_head = build_direct_photon_head(
-            velocity, wfns, occupation_state, contact_packed=contact,
-            photon_g0_vectors=direct_gamma, layout=layout,
-            mesh=mesh_xy, meta=meta, wfn=wfn,
-            frequencies_ry=bank_points(sample_plan), print_fn=print_fn)
-        direct_head["gamma_vectors"] = packed_gamma_vectors(
-            direct_gamma, layout, mesh_xy)
-        receipt["direct_gamma"] = dict(
-            approximation="first_order_dipole_current_fd",
-            sectors="CC_CT_TC_TT", local_fields=False,
-            samples="4x131072 Sobol exterior plus screened sphere",
-            static_limit="Thomas-Fermi at z=0; dynamic Drude for Im(z)>0")
+    with timing.section("bank.direct_head"):
+        if uses_direct_bispinor_shared_pole_head(config):
+            from .qsgw_head import read_authenticated_dipole_velocity, _pad_head_band_manifold
+            from .photon_direct_head import build_direct_photon_head, packed_gamma_vectors
+            cache = photon_head_cache if photon_head_cache is not None else {}
+            velocity = cache.get("direct_photon_velocity")
+            if velocity is None:
+                host = read_authenticated_dipole_velocity(
+                    os.path.join(config.input_dir, "dipole.h5"), wfn=wfn,
+                    meta=meta, config=config,
+                    wfn_fingerprint_binding=wfn_fingerprint_binding)
+                nk, nb = int(host.shape[1]), int(host.shape[-1])
+                empty = np.zeros((nk, nb), np.float64)
+                velocity, _, _, _ = _pad_head_band_manifold(
+                    host, empty, empty, empty, mesh=mesh_xy)
+                cache["direct_photon_velocity"] = velocity
+                del host
+            if photon_head_rotation is not None:
+                from .qsgw_head import rotate_velocity_active_to_qp
+                velocity = rotate_velocity_active_to_qp(
+                    velocity, photon_head_rotation, mesh=mesh_xy)
+            direct_head = build_direct_photon_head(
+                velocity, wfns, occupation_state, contact_packed=contact,
+                photon_g0_vectors=direct_gamma, layout=layout,
+                mesh=mesh_xy, meta=meta, wfn=wfn,
+                frequencies_ry=bank_points(sample_plan), print_fn=print_fn)
+            direct_head["gamma_vectors"] = packed_gamma_vectors(
+                direct_gamma, layout, mesh_xy)
+            receipt["direct_gamma"] = dict(
+                approximation="first_order_dipole_current_fd",
+                sectors="CC_CT_TC_TT", local_fields=False,
+                samples="4x131072 Sobol exterior plus screened sphere",
+                static_limit="Thomas-Fermi at z=0; dynamic Drude for Im(z)>0")
     before = time.monotonic()
     if jax.process_index() == 0:
         print("photon bank: exact moments and W_infinity", flush=True)
