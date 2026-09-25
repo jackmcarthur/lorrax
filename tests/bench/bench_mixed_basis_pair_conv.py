@@ -319,6 +319,7 @@ def main():
             del X
     rec["runs"] = runs
     stats = jax.local_devices()[0].memory_stats() or {}
+    rec["memory_stats"] = {k: int(v) for k, v in stats.items() if isinstance(v, (int, np.integer))}
     rec["peak_bytes_in_use"] = int(stats.get("peak_bytes_in_use", 0))
     rec["bytes_limit"] = int(stats.get("bytes_limit", 0))
     rec["checksum"] = checksum(conv, X)
