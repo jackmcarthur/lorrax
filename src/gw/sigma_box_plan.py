@@ -780,8 +780,13 @@ def _bracket_tasks(specs, costs, world):
     3-6 s setup (CrI3 8x8 SC, val:resonant at 248 and 269 nodes), serial on
     one rank while the other ranks finish their sign-definite windows in a
     few seconds. A window whose predicted cost is a share ``f`` of the plan
-    gets ``floor(f * world)`` tasks: single attempts ``0, 1, ...`` and the
-    tail (the remaining attempts and the fallback), each on its own rank.
+    gets ``floor(f * world)`` tasks, and at least two once ``f * world >= 1``:
+    single attempts ``0, 1, ...`` and the tail (the remaining attempts and
+    the fallback). One dominant window takes three of four ranks and leaves
+    one for the sign-definite windows; two (the SC map-0 one-shot and padded
+    rules) take two each. Rounding half up gave the lone window a fourth,
+    wasted attempt and stacked the small windows on its ranks (CrI3 8x8 SC
+    map 1: 15.7 s against 12.2 s).
     Every task repeats the setup; the window's wall becomes one setup plus
     its longest attempt instead of the sum. Analytic lines and sign-definite
     windows stay whole.
@@ -789,8 +794,9 @@ def _bracket_tasks(specs, costs, world):
     total = float(sum(costs)) or 1.0
     tasks = []
     for index, (spec, cost) in enumerate(zip(specs, costs)):
-        split = (0 if spec.get("analytic_line") or spec["kind"] != "crossing"
-                 else int(world * cost / total))
+        share = world * cost / total
+        split = (1 if world < 2 or share < 1.0 or spec.get("analytic_line")
+                 or spec["kind"] != "crossing" else max(2, int(share)))
         if split < 2:
             tasks.append((index, None, cost))
             continue
