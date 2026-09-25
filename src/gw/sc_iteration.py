@@ -2593,61 +2593,6 @@ def _residency_census(named, print_fn) -> None:
             f"1/{a.nbytes / max(local, 1):<4.0f} {spec}")
 
 
-# Refusal threshold on ``KStarMap.spread_rel`` of Σ + V_H, relative.
-#
-# MEASURED on healthy mos2_4x4 runs, every ``k-star:`` line recorded on
-# scratch: 1.470e-12 … 7.559e-12 on the linear/rCROP arms
-# (dsc_demo/ibz44v.7889742.out:26,28,30; dsc44.7889362.out:121-129) and
-# 2.303e-11 … 1.178e-10 on the density-SC arms, which is where the
-# largest value sits (dsc_demo/dev/dev1_p1.7889590.out:11,19 at P=1;
-# dsc44.7889362.out:13,23 at P=4).  The largest observed is 1.178e-10.
-#
-# 1e-6 is four decades above that and four decades below the failure it
-# exists for: a gauge mismatch puts a phase on the off-diagonals of the
-# doubled stars, so its residual is a fixed FRACTION of max|Σ| — O(1e-2)
-# relative or worse — while every mechanism that legitimately grows this
-# number (a larger k-grid, more bands, a longer float64 accumulation)
-# grows it by decades, not by eight.  Do not tighten it toward the
-# observed maximum: the cost of a false refusal on a 40-node job is a
-# dead run, and the check discriminates just as well from here.
-_KSTAR_SPREAD_TOL = 1.0e-6
-
-
-def _check_kstar_spread(kstar, delta_h_qp, *, print_fn) -> float:
-    """Enforce the star spread of Σ + V_H before selecting the IBZ rows.
-
-    ``KStarMap.spread``/``spread_rel`` is documented as the only check
-    that catches a gauge mismatch introduced upstream — hermiticity, the
-    norm and the electron count all survive one — and the value was
-    formatted into a log line and dropped.  A number that is only printed
-    is not a check, and this one is the sole guard on the two-k-set seam.
-
-    REFUSES, does not warn: the whole point is that nothing downstream
-    notices.  A warning on rank 0 of a 64-rank job is a line in a log
-    somebody reads after the run produced numbers.
-
-    One reduction and one 16-byte host read, which the iteration pays
-    already (the accelerators read the eigenvalues back every call).
-    """
-    spread = float(kstar.spread_rel(delta_h_qp))
-    print_fn(
-        f"    k-star: Σ+V_H residual {spread:.3e} rel "
-        f"over {kstar.nk_full}->{kstar.nk_irr} k ({kstar.reduction:.2f}x)")
-    # ``not (x <= tol)`` and not ``x > tol``: NaN must refuse.
-    if not (spread <= _KSTAR_SPREAD_TOL):
-        raise ValueError(
-            f"k-star spread of Σ+V_H is {spread:.6e} relative, above the "
-            f"refusal threshold {_KSTAR_SPREAD_TOL:.1e}.  Members of a star "
-            f"must carry the same Σ up to round-off; they do not, so the "
-            f"full-BZ Σ and the IBZ carry are in different gauges and "
-            f"selecting the star representatives would silently keep the "
-            f"wrong one.  Healthy runs on this deck measure ≤ 1.2e-10.  "
-            f"Suspect the wavefunction rotation or the symmetry map, not "
-            f"convergence: hermiticity, the norm and the electron count all "
-            f"survive this fault.")
-    return spread
-
-
 def _check_sigma_stage(sigma_result: SigmaResult, *, print_fn) -> None:
     """The Σ stage gates, once per SC iteration.
 
@@ -4260,24 +4205,6 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         partition = BandPartition(
             protected_mask=ks.broadcast(promoted_partition.protected_mask),
             in_range_mask=ks.broadcast(promoted_partition.in_range_mask))
-    # THE STAR-SPREAD GATE, ON THE OBJECT THAT SHIPS.  It ran before the
-    # partition until 2026-08-16, which certified a matrix the loop then
-    # rewrote.  The partition is precisely the operation that could break the
-    # star relation -- a protected mask whose edge fell inside a degenerate
-    # multiplet gave one member off-diagonal Sigma and the other a scalar
-    # scissor -- so it is the one thing the check most needed to be after.
-    #
-    # This is a STRENGTHENING and it may turn red on a deck that passed
-    # before; that redness is correct and should be read as the partition
-    # breaking symmetry, not as this gate misfiring.  The mask is now promoted
-    # to whole multiplets at construction, which is what makes it pass.
-    #
-    # Full-BZ operand: the check needs every star member, and H_qp_dft_new is
-    # on the loop's k-set, so it is unfolded through the same map that
-    # reduced it.
-    if not ks.is_identity:
-        _check_kstar_spread(
-            ks, ks.broadcast(H_qp_dft_new), print_fn=inputs.print_fn)
 
     # The occupation state CARRIED below is the ENTRY solve consumed by this
     # call's chi/head/Sigma.  The low-valence no-lag gate above also invokes

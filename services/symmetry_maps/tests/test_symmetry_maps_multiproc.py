@@ -366,9 +366,8 @@ def test_the_check_body_passes_on_an_emulated_2x2(body):
 def test_a_nan_survives_the_sharded_reduction():
     """S3's remaining half, and it does NOT hold.  Measured, not inferred.
 
-    ``sc_iteration._check_kstar_spread`` refuses on ``not (spread <= tol)``
-    — spelled that way DELIBERATELY (``tests/test_sc_kstar_spread.py`` pins
-    it) so a poisoned Σ cannot pass by comparing False.  That only works if
+    A caller refusing on ``not (spread <= tol)`` — spelled that way so a
+    poisoned Σ cannot pass by comparing False — only works if
     ``KStarMap.spread_rel`` hands NaN back.  On the operand the SC loop
     actually passes — a ``P(None,'x','y')`` sharded ``jax.Array`` — it does
     not.

@@ -1014,9 +1014,8 @@ def sigma_star_spread_stats(values, rows_to_keep, compact_irr, sym_idx_k,
 	    as an upper bound, never as an error.
 	``diag_ev``
 	    Worst per-band ``max − min`` of the REAL diagonal within a star —
-	    ``harness.compare_to_bgw``'s ``_star_spread`` and the quantity
-	    ``sc_iteration._KSTAR_SPREAD_TOL`` is set against, so the stamped
-	    number is comparable to both.  Gauge-free except inside degenerate
+	    ``harness.compare_to_bgw``'s ``_star_spread``, so the stamped
+	    number is comparable to it.  Gauge-free except inside degenerate
 	    manifolds.
 	``frobenius_ev``, ``trace_ev``
 	    Worst ``max − min`` of ``‖A[k]‖_F`` and of ``|Tr A[k]|`` within a
