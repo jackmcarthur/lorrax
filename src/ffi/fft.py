@@ -1512,3 +1512,29 @@ def make_kconv_kminor(mesh: Mesh, kgrid, x_spec: P, k_spec: P, *,
         return sm(X, K_R)
 
     return conv
+
+
+# =============================================================================
+# The local Fourier plan's CUDA leg (``common.fourier_plan.LocalFourierPlan``)
+# =============================================================================
+FOURIER_PLAN_TARGET = "lorrax_fourier_plan"
+
+
+def fourier_plan_ffi(x, *, n, kin, kout, in_idx, out_idx, sup_in, sup_out, gemm, scale,
+                     order, sign):
+    """One ``lorrax_fourier_plan`` custom call over the ``len(n)`` trailing axes
+    of ``x`` (row-major in, row-major out; ``cpp/cufft/fourier_plan_cuda_ffi.cc``).
+
+    Every attribute is per transform axis in physical order: full extent
+    ``n``, compact extents ``kin``/``kout``, the concatenated supports
+    ``in_idx``/``out_idx`` (identity ranges on an axis without one), the 0/1
+    flags ``sup_in``/``sup_out``/``gemm``, the axis' jnp.fft ``scale``, and
+    ``order``: GEMM axes in execution order with -1 where the FFT group runs.
+    """
+    d = len(n)
+    out = jax.ShapeDtypeStruct(tuple(x.shape[:-d]) + tuple(int(k) for k in kout), x.dtype)
+    i64 = lambda v: np.asarray(v, dtype=np.int64)
+    return jax.ffi.ffi_call(FOURIER_PLAN_TARGET, out)(
+        x, n=i64(n), kin=i64(kin), kout=i64(kout), in_idx=i64(in_idx), out_idx=i64(out_idx),
+        sup_in=i64(sup_in), sup_out=i64(sup_out), gemm=i64(gemm),
+        scale=np.asarray(scale, dtype=np.float64), order=i64(order), sign=np.int64(sign))
