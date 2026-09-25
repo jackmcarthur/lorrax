@@ -880,7 +880,10 @@ leg, `cpp/cufft/fourier_plan_cuda_ffi.cc` with the remap kernel in
   per shape cold. A100, whole plan against the cuBLAS chain: Fe 25³, K = 13,
   sphere→box 0.80–0.82, box→sphere 0.64–0.66; 16³–48³ 0.8–0.9; shapes that do
   not fit (64³, 72³, 96²) are unchanged. Boxes whose long axis is an FFT axis
-  (CrI3 80×80×250) never pair.
+  (CrI3 80×80×250) never pair. No production caller builds a separable plan on
+  main (the ζ site uses `in_gather`). The GEMM rows and the pair are kept for
+  real-space GW's sphere↔box transforms at Fe-class boxes; the service page has
+  the estimate and the per-device projection.
 * **CUTLASS under NVRTC.** The nvidia-mathdx 25.6 wheel's CUTLASS 3.9 declares
   `std::tuple_size`/`tuple_element` variadic under NVRTC; CCCL 3 (CUDA 13)
   declares them with one parameter, and NVRTC refuses the pair. The pair's
