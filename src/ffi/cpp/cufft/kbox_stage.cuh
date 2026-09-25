@@ -38,6 +38,27 @@ struct Geometry {
     long long pr() const { return ((long long)ny * zp()) | 1; }  // padded (ky, kz) plane (split arm)
 };
 
+// ---- the unfold tile tables (host and device) ------------------------------------------------
+// A gathered-unfold Load (the raw-parent Green of modes 7/11) keeps its tables in shared memory
+// beside the bank, so the gather issues one cp.async per cell from shared indices and the finish
+// reads no global table.  Per block, once: U_k [ns][ns][nk] (c128, k innermost), the per-k source
+// row offsets [nk] (int64) and flags [nk] (int32).  Per tile of tp pairs, two buffers (the next
+// tile's tables load beside this tile's gather): the phases mph [tp][ns][nk] and nph [tp][nr][nk]
+// (c128) and the endpoint indices lsrc [tp][nk][ns] and rsrc [tp][nk][nr] (int32).  Byte offsets
+// from the table base, which is 16-byte aligned; the host prices bytes() into the block's memory.
+struct UnfoldTiles {
+    long long nk, ns, nr, tp;
+    constexpr long long u() const { return 0; }
+    constexpr long long mp(int b) const { return 16 * (nk * ns * ns + b * tp * ns * nk); }
+    constexpr long long np(int b) const { return 16 * (nk * ns * ns + 2 * tp * ns * nk + b * tp * nr * nk); }
+    constexpr long long off() const { return 16 * (nk * ns * ns + 2 * tp * (ns + nr) * nk); }
+    constexpr long long ints() const { return off() + (8 * nk + 15) / 16 * 16; }   // 16-byte aligned
+    constexpr long long ls(int b) const { return ints() + 4 * b * tp * nk * ns; }
+    constexpr long long rs(int b) const { return ints() + 4 * (2 * tp * nk * ns + b * tp * nk * nr); }
+    constexpr long long flag() const { return ints() + 4 * 2 * tp * nk * (ns + nr); }
+    constexpr long long bytes() const { return (flag() + 4 * nk + 15) / 16 * 16; }
+};
+
 // ---- host: the launch rule ------------------------------------------------------------------
 #if !defined(__CUDACC_RTC__)
 struct Plan {
@@ -218,10 +239,11 @@ __device__ void mid_tile(C* bank, long long col0, long long ncols, const Mid& mi
 }
 
 // Group Mid on the resident tile: GROUP consecutive columns form one group (TR % GROUP == 0; the
-// plan's tr counts groups, so a tile never splits one).  One thread per (group, k) loads the
-// group's GROUP values into vals[], calls mid.group(k, g, vals) (g = the group's global index)
-// which rewrites vals in place, and stores all GROUP back: a Mid that mixes a spin group, or
-// one that reduces it into vals[0] (the Store then skips the other columns).
+// plan's tr counts groups, so a tile never splits one).  One thread per (group, k), consecutive
+// threads on consecutive groups, calls mid.group(k, g, get) (g = the group's global index) with
+// get(q) a reference to the group's column q at k in the bank: the Mid reads what it needs when
+// it needs it (no GROUP-wide register array) and writes what it changes, e.g. a spin-group mix,
+// or a reduction that leaves the tile (mode 11 accumulates chi_R).
 template <int NX, int NY, int NZ, int TR, int GROUP, class C, class Mid>
 __device__ void mid_group_tile(C* bank, long long col0, long long ncols, const Mid& mid) {
     static_assert(TR % GROUP == 0, "a tile holds whole groups");
@@ -230,12 +252,8 @@ __device__ void mid_group_tile(C* bank, long long col0, long long ncols, const M
     for (int i = threadIdx.x; i < ng * G::NK; i += blockDim.x) {
         const int g = i % ng, k = i / ng;
         if (col0 + g * GROUP >= ncols) continue;
-        C vals[GROUP];
-#pragma unroll
-        for (int q = 0; q < GROUP; ++q) vals[q] = bank[(g * GROUP + q) * G::RS + G::at(k)];
-        mid.group(k, (col0 + g * GROUP) / GROUP, vals);
-#pragma unroll
-        for (int q = 0; q < GROUP; ++q) bank[(g * GROUP + q) * G::RS + G::at(k)] = vals[q];
+        mid.group(k, (col0 + g * GROUP) / GROUP,
+                  [&](int q) -> C& { return bank[(g * GROUP + q) * G::RS + G::at(k)]; });
     }
     __syncthreads();
 }
