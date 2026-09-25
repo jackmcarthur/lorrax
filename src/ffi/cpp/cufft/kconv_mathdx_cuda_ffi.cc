@@ -395,8 +395,8 @@ __device__ __forceinline__ void axis_pass(lrx_c2* bank) {
 #pragma unroll
             for (int e = 0; e < N; ++e) { p[e * STRIDE].x = v[e].x; p[e * STRIDE].y = v[e].y; }
         }
+        __syncthreads();                               // a pass that did not run writes nothing to publish
     }
-    __syncthreads();
 }
 
 template <cufftdx::fft_direction Dir>
@@ -1032,8 +1032,7 @@ extern "C" __global__ void __launch_bounds__(256, LRX_MINB) lrx_kconv(
                 const lrx_c2 v = sm[j * SP + k];
                 y[((ko * NS + a) * mx + xx) * (my * NS) + bb * my + yy] = {v.x * scale, v.y * scale};
             }
-        }
-        __syncthreads();                               // the bank is read before the next gather
+        }                                              // the loop top syncs before the next gather
     }
 }
 #elif LRX_MODE == 7
@@ -1498,7 +1497,7 @@ extern "C" __global__ void __launch_bounds__(LRX_THREADS, LRX_MINB) lrx_kconv(Ch
         __syncthreads();
         tt_finish(s, b, npr, sm);
         lrx_kbox::transform3<NX, NY, NZ, TRC, LRX_SM, fft_direction::inverse>(sm);
-        lrx_kbox::mid_group_tile<NX, NY, NZ, TRC, GRP>(sm, col0, ncols, mid);
+        lrx_kbox::mid_group_tile<NX, NY, NZ, TRC, GRP, false>(sm, col0, ncols, mid);   // the loop top syncs
     }
 #elif LRX_ARM == 0
     (void)phase;

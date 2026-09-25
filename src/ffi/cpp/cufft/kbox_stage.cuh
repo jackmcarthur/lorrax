@@ -142,8 +142,9 @@ __device__ __forceinline__ void line_fft(C* p, int stride) {
 }
 
 // The 3-D transform of TR resident padded rows (bank row j at bank + j*RS), axes z, y, x, all
-// threads of the block, one thread FFT per line; ends with __syncthreads().  TR is the plan's
-// tr, a compile-time constant of the embedded program (as the family's rows per block).
+// threads of the block, one thread FFT per line; each pass that runs ends with __syncthreads()
+// (a length-1 axis writes nothing), so the transform ends synchronised whenever it wrote.  TR is
+// the plan's tr, a compile-time constant of the embedded program (as the family's rows per block).
 template <int NX, int NY, int NZ, int TR, int Arch, cufftdx::fft_direction Dir, class C>
 __device__ void transform3(C* bank) {
     constexpr int tr = TR;
@@ -153,22 +154,22 @@ __device__ void transform3(C* bank) {
             const int j = l / (NX * NY), li = l % (NX * NY);
             line_fft<NZ, Arch, Dir>(bank + j * G::RS + li * G::ZP, 1);
         }
+        __syncthreads();
     }
-    __syncthreads();
     if constexpr (NY > 1) {
         for (int l = threadIdx.x; l < tr * NX * NZ; l += blockDim.x) {
             const int j = l / (NX * NZ), li = l % (NX * NZ);
             line_fft<NY, Arch, Dir>(bank + j * G::RS + (li / NZ) * NY * G::ZP + li % NZ, G::ZP);
         }
+        __syncthreads();
     }
-    __syncthreads();
     if constexpr (NX > 1) {
         for (int l = threadIdx.x; l < tr * NY * NZ; l += blockDim.x) {
             const int j = l / (NY * NZ), li = l % (NY * NZ);
             line_fft<NX, Arch, Dir>(bank + j * G::RS + G::plane_at(li), NY * G::ZP);
         }
+        __syncthreads();
     }
-    __syncthreads();
 }
 
 // The staged tile as a direct Load writes it: v(k, j) is element k of tile column j.
@@ -246,7 +247,7 @@ __device__ void mid_tile(C* bank, long long col0, long long ncols, const Mid& mi
 // get(q) a reference to the group's column q at k in the bank: the Mid reads what it needs when
 // it needs it (no GROUP-wide register array) and writes what it changes, e.g. a spin-group mix,
 // or a reduction that leaves the tile (mode 11 accumulates chi_R).
-template <int NX, int NY, int NZ, int TR, int GROUP, class C, class Mid>
+template <int NX, int NY, int NZ, int TR, int GROUP, bool kSync = true, class C, class Mid>
 __device__ void mid_group_tile(C* bank, long long col0, long long ncols, const Mid& mid) {
     static_assert(TR % GROUP == 0, "a tile holds whole groups");
     using G = Geo<NX, NY, NZ>;
@@ -257,7 +258,7 @@ __device__ void mid_group_tile(C* bank, long long col0, long long ncols, const M
         mid.group(k, (col0 + g * GROUP) / GROUP,
                   [&](int q) -> C& { return bank[(g * GROUP + q) * G::RS + G::at(k)]; });
     }
-    __syncthreads();
+    if constexpr (kSync) __syncthreads();              // kSync = false: the caller syncs before reuse
 }
 
 // st.put(k, col, bank) for every stored element (the Store decides the row map and the scale).
