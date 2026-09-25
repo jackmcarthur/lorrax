@@ -473,7 +473,7 @@ def test_producer_and_operator_share_one_sign_validation_owner():
 
 def _deck(tmp_path, body):
     p = tmp_path / "deck.in"
-    p.write_text("[cohsex]\nwfn_file = WFN.h5\n" + body)
+    p.write_text("[cohsex]\nsys_dim = 3\nwfn_file = WFN.h5\n" + body)
     return str(p)
 
 

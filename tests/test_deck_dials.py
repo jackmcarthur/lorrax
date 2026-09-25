@@ -13,7 +13,7 @@ from gw.gw_config import (
 
 def _deck(tmp_path, body: str):
     path = tmp_path / "gw.in"
-    path.write_text("[cohsex]\n" + body, encoding="utf-8")
+    path.write_text("[cohsex]\nsys_dim = 3\n" + body, encoding="utf-8")
     return path
 
 

@@ -64,6 +64,7 @@ def _mesh():
 
 _BASE = """\
 [cohsex]
+sys_dim = 3
 nval = 2
 ncond = 2
 nband = 10

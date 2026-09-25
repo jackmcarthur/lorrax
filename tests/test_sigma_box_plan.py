@@ -977,6 +977,7 @@ def test_box_route_is_default_and_campaign_route_refuses(monkeypatch):
 
 _DECK = """\
 [cohsex]
+sys_dim = 3
 nval = 2
 ncond = 2
 nband = 10

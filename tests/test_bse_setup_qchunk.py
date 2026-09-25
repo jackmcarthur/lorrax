@@ -528,7 +528,7 @@ def test_input_keys_parse(tmp_path):
     from gw.gw_config import read_lorrax_input
     p = tmp_path / "deck.in"
     p.write_text(
-        "[cohsex]\n"
+        "[cohsex]\nsys_dim = 3\n"
         "nval = 4\n"
         "wfn_fi_q_chunk = 12\n"
         "linalg = distributed\n")
@@ -539,7 +539,7 @@ def test_input_keys_parse(tmp_path):
     assert linalg_resolution(params).eigh_backend == "distributed"
     # defaults, when the deck says nothing
     q = tmp_path / "bare.in"
-    q.write_text("[cohsex]\nnval = 4\n")
+    q.write_text("[cohsex]\nsys_dim = 3\nnval = 4\n")
     bare = read_lorrax_input(str(q))
     assert bare["wfn_fi_q_chunk"] == 0        # 0 == "use N_q_co"
     assert linalg_resolution(bare).eigh_backend == "auto"

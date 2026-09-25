@@ -689,6 +689,46 @@ def trivial_plan(nb_padded: int, n_occ: int, nb_logical: int) -> BandBracketPlan
     )
 
 
+def require_extrapolation_band_floor(n_occ: int, nb_logical: int) -> None:
+    """Refuse ``use_band_extrapolation`` when the Σ sum holds fewer unoccupied than occupied bands.
+
+    One owner for the rule: ``gw.gw_jax`` calls it at startup, once the band
+    slices exist and before the ζ fit and the W build, and
+    :func:`plan_band_brackets` calls it again at the Σ stage.
+    """
+    n_occ = int(n_occ)
+    n_cond = int(nb_logical) - n_occ
+    nb_logical = int(nb_logical)
+    if n_cond < n_occ:
+        raise BandExtrapolationRefused(
+            f"use_band_extrapolation is ON, but the Σ_c band sum has "
+            f"n_cond = {n_cond} unoccupied bands against n_occ = {n_occ} "
+            f"occupied ones (number_bands_sigma = {nb_logical}).  The feature "
+            f"extrapolates the UNOCCUPIED tail, and it is only meaningful "
+            f"when that tail is at least as large as the occupied block: it "
+            f"requires n_cond >= n_occ, i.e. number_bands_sigma >= 2*n_occ = "
+            f"{2 * n_occ}.\n"
+            f"  The owner's form of this rule is "
+            f"'nband >= 2*N_electrons'.  It is enforced here in n_occ "
+            f"because that is the SPIN-CONVENTION-INDEPENDENT statement of "
+            f"the same thing: under SOC/noncolin n_occ = N_electrons, "
+            f"without SOC n_occ = N_electrons/2, and in both cases the "
+            f"condition means 'at least as many conduction bands as "
+            f"valence'.\n"
+            f"  THE COUNT THIS GATE IS ABOUT IS THE Σ COUNT (merge ruling, "
+            f"2026-08-16).  The feature extrapolates the Σ band sum, so "
+            f"n_cond and n_occ here are both edges of THAT sum; raising "
+            f"`number_bands_chi` will NOT help, because this planner never "
+            f"reads the χ count.  There is deliberately NO 2*n_occ floor on "
+            f"the χ side: χ0 is a full band sum with no 1/N fit and no "
+            f"occupied/unoccupied ratio for the gate to be a statement "
+            f"about.\n"
+            f"  Raise the deck's `number_bands_sigma` (or the umbrella "
+            f"`number_bands`, which sets both counts) to at least "
+            f"{2 * n_occ} (n_occ is set by the electron count, not by a deck "
+            f"key), or set use_band_extrapolation = false.")
+
+
 def plan_band_brackets(
     *,
     enabled: bool,
@@ -816,34 +856,7 @@ def plan_band_brackets(
     # converged, and the operator would have no way to tell the feature was
     # off (measurement-discipline rule 1: an ignored deck key is how a green
     # A/B comes to measure nothing).
-    if n_cond < n_occ:
-        raise BandExtrapolationRefused(
-            f"use_band_extrapolation is ON, but the Σ_c band sum has "
-            f"n_cond = {n_cond} unoccupied bands against n_occ = {n_occ} "
-            f"occupied ones (number_bands_sigma = {nb_logical}).  The feature "
-            f"extrapolates the UNOCCUPIED tail, and it is only meaningful "
-            f"when that tail is at least as large as the occupied block: it "
-            f"requires n_cond >= n_occ, i.e. number_bands_sigma >= 2*n_occ = "
-            f"{2 * n_occ}.\n"
-            f"  The owner's form of this rule is "
-            f"'nband >= 2*N_electrons'.  It is enforced here in n_occ "
-            f"because that is the SPIN-CONVENTION-INDEPENDENT statement of "
-            f"the same thing: under SOC/noncolin n_occ = N_electrons, "
-            f"without SOC n_occ = N_electrons/2, and in both cases the "
-            f"condition means 'at least as many conduction bands as "
-            f"valence'.\n"
-            f"  THE COUNT THIS GATE IS ABOUT IS THE Σ COUNT (merge ruling, "
-            f"2026-08-16).  The feature extrapolates the Σ band sum, so "
-            f"n_cond and n_occ here are both edges of THAT sum; raising "
-            f"`number_bands_chi` will NOT help, because this planner never "
-            f"reads the χ count.  There is deliberately NO 2*n_occ floor on "
-            f"the χ side: χ0 is a full band sum with no 1/N fit and no "
-            f"occupied/unoccupied ratio for the gate to be a statement "
-            f"about.\n"
-            f"  Raise the deck's `number_bands_sigma` (or the umbrella "
-            f"`number_bands`, which sets both counts) to at least "
-            f"{2 * n_occ} (n_occ is set by the electron count, not by a deck "
-            f"key), or set use_band_extrapolation = false.")
+    require_extrapolation_band_floor(n_occ, nb_logical)
 
     e = np.asarray(enk_ry, dtype=np.float64)[:, :nb_logical]
     if e.ndim != 2 or e.shape[1] != nb_logical:

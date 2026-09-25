@@ -1185,6 +1185,27 @@ def assert_isdf_window_is_the_max(band_slices, band_range_right, zeta_nband,
 				    f"is not checked by any other gate. ***")
 
 
+def check_band_extrapolation_floor(cfg, band_slices, meta):
+	"""Refuse a PPM run whose Σ band sum cannot carry ``use_band_extrapolation``.
+
+	Runs at startup, beside :func:`check_band_sum_degeneracy`, so a deck with
+	``number_bands_sigma < 2 n_occ`` refuses before the ζ fit and the W build
+	rather than at the Σ stage.  The rule and its message have one owner,
+	``gw.band_extrapolation.require_extrapolation_band_floor``; a run with no
+	PPM stage never consumes the key and is not checked.
+	"""
+	from .band_extrapolation import require_extrapolation_band_floor
+	from .gw_config import band_extrapolation_is_consumable, sigma_stage_modes
+	if not bool(cfg.sigma.band_extrapolation):
+		return
+	if not band_extrapolation_is_consumable(sigma_stage_modes(cfg)):
+		return
+	b0 = int(band_slices.b0)
+	require_extrapolation_band_floor(
+		int(band_slices.b2) - b0,
+		int(meta.b_id_4_sigma_user or band_slices.b4) - b0)
+
+
 def check_band_sum_degeneracy(wfn, cfg, band_slices, *, log=print):
 	"""Do the χ and Σ band-sum tops each cut a clean multiplet boundary?
 

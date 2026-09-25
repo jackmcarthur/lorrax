@@ -44,6 +44,7 @@ def test_absent_keys_are_none(tmp_path):
     """Default is OFF: no key, no override, and the caller falls back."""
     f = _deck(tmp_path, """\
         [cohsex]
+        sys_dim = 3
         centroids_file = centroids_frac_480_orbitclosed.txt
         """)
     assert _parse_head_overrides(f) == (None, None)
@@ -52,6 +53,7 @@ def test_absent_keys_are_none(tmp_path):
 def test_plain_values_parse(tmp_path):
     f = _deck(tmp_path, """\
         [cohsex]
+        sys_dim = 3
         vhead = 3303.748102
         whead_0freq = 150.395600
         """)
@@ -71,17 +73,17 @@ def test_inline_comment_is_stripped(tmp_path, line, expected):
     Before the fix these three lines each parsed to ``None`` here and to
     ``3303.748102`` on the GW side.
     """
-    f = _deck(tmp_path, f"[cohsex]\n{line}\n")
+    f = _deck(tmp_path, f"[cohsex]\nsys_dim = 3\n{line}\n")
     vhead, _ = _parse_head_overrides(f)
     assert vhead == complex(expected)
 
 
 @pytest.mark.parametrize("body", [
-    "[cohsex]\nvhead = 3303.748102  # BGW\n",
-    "[cohsex]\nvhead = 3303.748102\nwhead_0freq = 150.3956 # W head\n",
-    "[cohsex]\nvhead = 3303.748102\n",
-    "[cohsex]\nwhead_0freq = 150.395600\n",
-    "[cohsex]\ncentroids_file = c.txt\n",
+    "[cohsex]\nsys_dim = 3\nvhead = 3303.748102  # BGW\n",
+    "[cohsex]\nsys_dim = 3\nvhead = 3303.748102\nwhead_0freq = 150.3956 # W head\n",
+    "[cohsex]\nsys_dim = 3\nvhead = 3303.748102\n",
+    "[cohsex]\nsys_dim = 3\nwhead_0freq = 150.395600\n",
+    "[cohsex]\nsys_dim = 3\ncentroids_file = c.txt\n",
 ])
 def test_agrees_with_the_gw_side_reader(tmp_path, body):
     """The contract itself: both readers see the same value, or neither does.
@@ -112,7 +114,7 @@ def test_malformed_value_refuses_rather_than_falling_back(tmp_path, bad):
     it is exactly the case the old bare ``continue`` turned into a silent
     fallback to the restart's own head.
     """
-    f = _deck(tmp_path, f"[cohsex]\nvhead = {bad}\n")
+    f = _deck(tmp_path, f"[cohsex]\nsys_dim = 3\nvhead = {bad}\n")
     with pytest.raises(ValueError, match="head override"):
         _parse_head_overrides(f)
 
@@ -120,12 +122,13 @@ def test_malformed_value_refuses_rather_than_falling_back(tmp_path, bad):
 def test_refusal_names_the_file_and_line(tmp_path):
     f = _deck(tmp_path, """\
         [cohsex]
+        sys_dim = 3
         centroids_file = c.txt
         whead_0freq = not-a-number
         """)
     with pytest.raises(ValueError) as exc:
         _parse_head_overrides(f)
-    assert "cohsex.in:3" in str(exc.value)
+    assert "cohsex.in:4" in str(exc.value)
     assert "whead_0freq" in str(exc.value)
 
 

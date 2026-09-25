@@ -862,7 +862,7 @@ def test_retired_probe_chi_reuse_key_refuses_at_parse(tmp_path):
     assert not hasattr(screening, "refuse_retired_probe_chi_reuse")
     for value in ("auto", "off"):
         deck = tmp_path / f"probe_{value}.in"
-        deck.write_text("[cohsex]\nnval = 2\nncond = 2\nnband = 10\n"
+        deck.write_text("[cohsex]\nsys_dim = 3\nnval = 2\nncond = 2\nnband = 10\n"
                         "memory_per_device_gb = 4.0\n"
                         f"ppm_probe_chi_reuse = {value}\n")
         with pytest.raises(ValueError, match="ppm_probe_chi_reuse"):

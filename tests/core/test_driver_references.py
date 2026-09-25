@@ -84,6 +84,47 @@ def test_a_zeta_cohsex_gnppm_match_references(
 
 
 @pytest.mark.gpu
+def test_a_gnppm_default_band_extrapolation_runs(core_fixtures):
+    """A GN-PPM deck that omits ``use_band_extrapolation`` runs the kernel.
+
+    The key's default (auto, which resolves to True on a PPM stage) was
+    stated false on every other gated PPM deck, so the bracket sums and the
+    spectral-shell estimator ran in no gated end-to-end cell.  Core A's 7
+    bands against n_occ = 2 pass the startup 2*n_occ floor and resolve three
+    distinct brackets.  The check: the report says ON with three bracket
+    counts, the eqp columns are finite, and Sigma moved against the
+    un-extrapolated reference (a no-op kernel would reproduce it).
+    """
+    if not harness.gpu_available():
+        pytest.skip("tiny driver reference chain is the GPU core cell")
+
+    def prepare(source, target):
+        _stage(source, target)
+        deck = target / "gnppm.in"
+        text = deck.read_text()
+        assert "use_band_extrapolation = false\n" in text
+        deck.write_text(text.replace("use_band_extrapolation = false\n", ""))
+        return target
+
+    source_a = core_fixtures / "A"
+    run_a = rank_session.stage(source_a, prepare)
+    _run(run_a, "cohsex.in")
+    _run(run_a, "gnppm.in", allow_runtime_solve=True)
+    report = (run_a / "gnppm.out").read_text(encoding="utf-8")
+    assert "Band tail      : ON" in report
+    counts = re.search(r"Tail calculations: N1=(\d+) / N2=(\d+) / N3=(\d+)",
+                       report)
+    assert counts is not None, "no bracket counts in the report"
+    assert len({int(c) for c in counts.groups()}) == 3
+    got = harness.eqp_column(run_a / "gnppm_eqp1.dat")
+    ref = harness.eqp_column(source_a / "gnppm_eqp1.dat")
+    assert np.all(np.isfinite(got))
+    assert got.shape == ref.shape
+    assert np.max(np.abs(got - ref)) > 1.0e-6, (
+        "extrapolated Sigma equals the un-extrapolated reference")
+
+
+@pytest.mark.gpu
 def test_b_mpa_one_update_matches_references(core_fixtures):
     if not harness.gpu_available():
         pytest.skip("tiny driver reference chain is the GPU core cell")

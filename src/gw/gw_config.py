@@ -1030,7 +1030,9 @@ _DEFAULTS = {
     # what the IBZ cascade unfolds.  See the ``nband`` entry in
     # docs/input_reference.md and gw.gw_init.fit_zeta.
     "zeta_nband": None,
-    "sys_dim": 2,
+    # REQUIRED, no default (``_require_sys_dim``): a bulk deck that omitted
+    # the key used to get the slab truncation, silently (IC lane 2026-09-25).
+    "sys_dim": None,
     # Rebuild V_H from the CURRENT orbitals each self-consistent iteration
     # instead of rotating the fixed DFT one into the QP basis.  The raw False
     # only lets the envelope tell an omitted key from a named one:
@@ -1934,6 +1936,7 @@ _NULLABLE_BOOL = frozenset({
 #: non-integral value raises out of ``configparser.getint`` by name.
 _NULLABLE_INT = frozenset({
     "zeta_nband",
+    "sys_dim",
     "mpa_sampling_alpha",
     # The band-count family's three "the deck did not say" slots.  They are
     # nullable for the same reason ``zeta_nband`` is — ``None`` has to be
@@ -3170,6 +3173,25 @@ def _parse_input_kpoints(
             params["kpoints_crystal_b"] = {"segments": segments}
 
 
+def _require_sys_dim(params, filename) -> None:
+    """Refuse a deck that does not state ``sys_dim``; there is no default.
+
+    The Coulomb truncation is a property of the cell (vacuum along c or not)
+    that no deck key can be inferred from, and a slab default silently gave a
+    bulk deck the wrong V_q, W and Hartree.
+    """
+    if params.get("sys_dim") is None:
+        raise ValueError(
+            f"GATE sys_dim_required: {filename} does not set sys_dim.\n"
+            "  want: sys_dim = 3 for bulk, 2 for a slab with vacuum along c\n"
+            "  why:  it selects the Coulomb truncation of V_q, W and the "
+            "Hartree term; a wrong value runs to completion with wrong "
+            "numbers\n"
+            "  fix:  add sys_dim = 3 (bulk) or sys_dim = 2 (slab) to the "
+            "[cohsex] section\n"
+            "  doc:  docs/input_reference.md, sys_dim.")
+
+
 def read_lorrax_input(filename: str) -> dict:
     """Produce typed deck values and resolved band counts; see docs/architecture/decisions.md."""
     with open(filename, 'r') as f:
@@ -3189,6 +3211,7 @@ def read_lorrax_input(filename: str) -> dict:
     else:
         params = dict(_DEFAULTS)
         params[_DECK_NAMED_KEYS] = frozenset()
+    _require_sys_dim(params, filename)
     _resolve_shared_pole_inputs(params)
     params[_LINALG_RESOLUTION] = resolve_linalg(params)
     _counts = resolve_band_counts(params, deck_named=params[_DECK_NAMED_KEYS])

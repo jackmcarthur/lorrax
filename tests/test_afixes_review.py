@@ -146,9 +146,9 @@ def test_pencil_alias_and_distinct_panels():
 def test_nullable_integer_none_is_uniform(tmp_path, key):
     from gw.gw_config import read_lorrax_input
     path=tmp_path/'input.in'
-    path.write_text('[cohsex]\n')
+    path.write_text('[cohsex]\nsys_dim = 3\n')
     baseline = read_lorrax_input(str(path))[key]
-    path.write_text('[cohsex]\n'+key+' = none\n')
+    path.write_text('[cohsex]\nsys_dim = 3\n'+key+' = none\n')
     # Band-count fields are subsequently resolved by their existing owner;
     # explicit None must behave like the absent nullable input there too.
     assert read_lorrax_input(str(path))[key] == baseline
@@ -179,7 +179,7 @@ def test_smearing_width_diagnostic_names_family(family, description):
 def test_export_empty_deck_source_refuses_during_parsing(tmp_path):
     from gw.gw_config import read_lorrax_input
     path = tmp_path/'empty_source.in'
-    path.write_text('[cohsex]\ncompute_mode = mpa\nsigma_w_model = shared_pole\nwrite_w = true\nwfn_file =\n')
+    path.write_text('[cohsex]\nsys_dim = 3\ncompute_mode = mpa\nsigma_w_model = shared_pole\nwrite_w = true\nwfn_file =\n')
     with pytest.raises(ValueError, match='nonempty wfn_file'):
         read_lorrax_input(str(path))
 
