@@ -726,9 +726,10 @@ def write_qp_wfn_oneshot(
     band_slices,
     input_dir: str,
     qp_solver,
+    mesh,
     print_fn=print,
 ):
-    """One-shot WFN_qp.h5 dump (drop-in BSE / restart input).
+    """One-shot WFN_qp.h5 dump (drop-in BSE / restart input).  COLLECTIVE.
 
     The one-shot dump is an IBZ-only writer: it rotates the DFT bands the
     WFN carries coefficients for, so it needs Σ (hence U_full/E_full) on the
@@ -737,8 +738,6 @@ def write_qp_wfn_oneshot(
     with a warning rather than crash the whole run (the writer would raise
     ValueError on the k-count mismatch).
     """
-    import jax
-
     if int(U_full.shape[0]) != int(wfn.nkpts):
         print_fn(
             f"  QP WFN (one-shot): skipped — Σ on {int(U_full.shape[0])} "
@@ -749,21 +748,16 @@ def write_qp_wfn_oneshot(
     from .gw_config import qp_solver_semantics
     semantics = qp_solver_semantics(qp_solver)
     _qp_wfn_path = os.path.join(input_dir, "WFN_qp.h5")
-    if jax.process_index() == 0:
-        write_qp_wfn_h5(
-            _qp_wfn_path, wfn=wfn,
-            U_kmn=np.asarray(U_full, dtype=np.complex128),
-            enk_active_qp_ry=np.asarray(E_full, dtype=np.float64),
-            band_start=band_slices.b0, band_stop=band_slices.b3,
-            qp_solver=getattr(qp_solver, "value", qp_solver),
-            qp_energy_definition=semantics.energy_definition,
-            sigma_eval_provenance=semantics.sigma_evaluation_provenance,
-        )
-    try:
-        from jax.experimental import multihost_utils as _mh
-        _mh.sync_global_devices("oneshot_qp_wfn_h5_write")
-    except Exception:
-        pass
+    write_qp_wfn_h5(
+        _qp_wfn_path, wfn=wfn,
+        U_kmn=np.asarray(U_full, dtype=np.complex128),
+        enk_active_qp_ry=np.asarray(E_full, dtype=np.float64),
+        band_start=band_slices.b0, band_stop=band_slices.b3,
+        mesh=mesh,
+        qp_solver=getattr(qp_solver, "value", qp_solver),
+        qp_energy_definition=semantics.energy_definition,
+        sigma_eval_provenance=semantics.sigma_evaluation_provenance,
+    )
     print_fn(f"  QP WFN (one-shot): {_qp_wfn_path}")
 
 

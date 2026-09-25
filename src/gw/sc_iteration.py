@@ -7356,11 +7356,13 @@ def dump_qp_wfn_artifacts(
     ``write_wfn_h5`` controls only the full wavefunction artifact. The small
     canonical U/E file always carries the accepted, partitioned SC state.
 
-    Both files are rank-0-only writes (h5py is single-writer). Each is first
-    written to a same-directory private path, reopened through its format
-    owner, and atomically replaces the final path only after validation.
-    Every rank returns after both publications finish, or raises the same
-    named failure while any prior final file remains untouched.
+    ``WFN_qp.h5`` is written collectively (every rank its own G-slab
+    through ``file_io.slab_io``); the small companion is a rank-0 write.
+    Each is first written to a same-directory private path, reopened
+    through its format owner, and atomically replaces the final path only
+    after validation.  Every rank returns after both publications finish, or
+    raises the same named failure while any prior final file remains
+    untouched.
 
     Returns ``(qp_wfn_path, qp_rotations_path, efermi_ry, enk_loop_ry)``.
     The first path is ``None`` when the full wavefunction file was not
@@ -7508,6 +7510,7 @@ def dump_qp_wfn_artifacts(
             staging_path, wfn=wfn,
             U_kmn=U_wfn, enk_active_qp_ry=enk_wfn_ry,
             band_start=band_slices.b0, band_stop=band_slices.b3,
+            mesh=mesh_xy,
             enk_full_base_ry=enk_full_base_ry,
             occupations_kn=occupations_wfn,
             occupation_state=final_occ_state,
@@ -7521,9 +7524,10 @@ def dump_qp_wfn_artifacts(
             occupations_kn=occupations_wfn,
             occupation_state=final_occ_state)
 
-    from common.collectives import rank0_atomic_file_transaction
+    from common.collectives import (
+        collective_atomic_file_transaction, rank0_atomic_file_transaction)
     if write_wfn_h5:
-        rank0_atomic_file_transaction(
+        collective_atomic_file_transaction(
             qp_wfn_path, stage="qp_wfn_h5_write",
             write=_write_qp_wfn, validate_file=_validate_qp_wfn)
 

@@ -4,10 +4,13 @@ Rotate DFT wavefunctions to QP basis using rotation matrices from COHSEX.
 
 This is a thin command-line adapter around
 ``file_io.qp_wfn.write_qp_wfn_h5``.  The file-format owner performs the
-coefficient rotation, k-streamed WFN read, BGW-compatible write, energy
-replacement, and positive QP-WFN stamping.  This module only authenticates
-the companion artifact and selects its full-BZ rows for the source WFN's
-file wedge.
+coefficient rotation, the sharded read and write, energy replacement, and
+positive QP-WFN stamping.  This module only authenticates the companion
+artifact and selects its full-BZ rows for the source WFN's file wedge.
+
+SPMD like every driver: run it with one process per GPU and every rank
+writes its own slab (``lx run -n P -- python -m postprocess.rotate_wfn_to_qp
+...``).
 
 Usage:
     python rotate_wfn_to_qp.py WFN.h5 qp_wfn_rotations.h5 [--output WFN_qp.h5]
@@ -17,7 +20,6 @@ import argparse
 import os
 from types import SimpleNamespace
 import numpy as np
-from file_io.restart_bundle import read_kirr_to_kfull
 
 
 def _stored_final_state_args(artifact, kirr_to_kfull):
@@ -42,13 +44,20 @@ def _stored_final_state_args(artifact, kirr_to_kfull):
     return result
 
 
-def rotate_wfn_coefficients(wfn_file, rot_file, output_file, verbose=True):
-    """Write one authenticated QP WFN through the canonical format owner."""
+def rotate_wfn_coefficients(wfn_file, rot_file, output_file, verbose=True,
+                            mesh=None):
+    """Write one authenticated QP WFN through the canonical format owner.
+
+    COLLECTIVE over ``mesh`` (default: the run's canonical mesh).
+    """
+    from common.collectives import resolve_mesh
     from file_io.qp_wfn import (authenticate_qp_rotations_source_wfn, write_qp_wfn_h5)
-    from file_io.restart_bundle import (read_qp_rotations_artifact)
+    from file_io.restart_bundle import (read_kirr_to_kfull, read_qp_rotations_artifact)
     from ffi import _services
     _services.ensure_on_path()
     from wfn_loader import WfnLoader
+    mesh = resolve_mesh(mesh)
+    verbose = verbose and _is_rank0()
 
     artifact = read_qp_rotations_artifact(rot_file)
     with WfnLoader(wfn_file) as source_wfn:
@@ -96,12 +105,18 @@ def rotate_wfn_coefficients(wfn_file, rot_file, output_file, verbose=True):
             enk_active_qp_ry=E_wedge_ry,
             band_start=band_start,
             band_stop=band_stop,
+            mesh=mesh,
             **final_state_kwargs,
         )
 
     if verbose:
         print(f"Wrote authenticated QP WFN: {output_file}")
     return kirr_to_kfull
+
+
+def _is_rank0() -> bool:
+    from common.collectives import process_rank
+    return process_rank() == 0
 
 
 def main():
@@ -116,6 +131,10 @@ def main():
                         help='Suppress progress output')
     
     args = parser.parse_args()
+    # The runtime (jax.distributed, one process per GPU) before any jax
+    # import; every import below this line is function-local for that reason.
+    from runtime import initialize_communicator_stack
+    initialize_communicator_stack()
     
     # Resolve paths relative to input file directory (per user preference)
     input_dir = os.path.dirname(os.path.abspath(args.wfn_file))
@@ -136,7 +155,7 @@ def main():
     else:
         output_file = os.path.join(input_dir, args.output)
     
-    verbose = not args.quiet
+    verbose = not args.quiet and _is_rank0()
     
     if verbose:
         print("=" * 60)

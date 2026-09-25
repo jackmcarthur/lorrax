@@ -170,9 +170,9 @@ def announce_tier(mesh) -> None:
     that went through SlabIO** went through this tier.  It says nothing
     about the ~20 writers in the tree that hold their own ``h5py.File``
     and never reach ``file_io.slab_io`` (``file_io.wfn_writer``,
-    ``gw.kin_ion_io``, ``bse.bse_window``, ``bse.absorption_common``,
-    ``file_io.qp_wfn``, …) — those produce HDF5 on an emulated run for a
-    reason that has nothing to do with any tier.
+    ``gw.kin_ion_io``, ``bse.bse_window``, ``bse.absorption_common``, …)
+    — those produce HDF5 on an emulated run for a reason that has nothing
+    to do with any tier.
 
     Still open, and owner-scoped: putting the transport in the driver's
     scientific report beside ``Wavefunctions  : <backend> reader``.  That
