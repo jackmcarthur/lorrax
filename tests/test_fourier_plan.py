@@ -326,3 +326,78 @@ def test_in_gather_plane_from_cylinder():
     assert np.linalg.norm(ys - ref[:, 2:4]) <= RTOL * np.linalg.norm(ref[:, 2:4])
     with pytest.raises(ValueError, match="in_gather"):
         LocalFourierPlan((nb, nc), (-2, -1), sign=1, in_gather=(pfc, n_col), mesh=mesh)
+
+
+# ---- audit 2026-09-25 (reports/new_fft_kernel/audit_portability_safety.md) ----
+
+def test_contract_refused_by_name():
+    """complex128 over 1..3 axes on every platform (finding 6): the CUDA leg serves
+    exactly that, so a plan outside it refuses at construction, not at run time."""
+    with pytest.raises(ValueError, match="GATE fourier-plan-contract"):
+        LocalFourierPlan((8,), (-1,), sign=-1, dtype=jnp.complex64)
+    with pytest.raises(ValueError, match="GATE fourier-plan-contract"):
+        LocalFourierPlan((2, 2, 2, 2), (0, 1, 2, 3), sign=-1)
+
+
+def test_plan_loads_its_cuda_target(monkeypatch):
+    """A plan built where CUDA can lower it probes (loads) lorrax_fourier_plan itself
+    (finding 5): standalone use must not depend on another factory having loaded it."""
+    import ffi.fft as F
+    seen = []
+    monkeypatch.setattr(fourier_plan, "_cuda_present", lambda mesh: True)
+    monkeypatch.setattr(F, "_require_target", lambda target, platform: seen.append((target, platform)))
+    LocalFourierPlan((8,), (-1,), sign=-1, device_kind="__fft__")
+    assert seen == [(F.FOURIER_PLAN_TARGET, "CUDA")], seen
+
+
+@pytest.mark.parametrize("sign", (-1, 1))
+def test_fft_axes_around_a_gemm_axis(sign):
+    """A GEMM axis between two FFT axes (finding 2): the A100 row takes the
+    supported middle axis (N=32) as a GEMM and the full outer axes (N=8) as FFTs,
+    so the CUDA leg's FFT group is two runs."""
+    rng = _rng("noncontig", sign)
+    sup = {1: np.arange(-5, 6) % 32}
+    plan = _check(_crandn(rng, (3, 8, 11, 8)), (8, 32, 8), (1, 2, 3), sign=sign,
+                  in_sup={2: sup[1]}, kind="NVIDIA A100-SXM4-40GB")
+    assert [(ax, how) for ax, how, *_ in plan.stages] == [(1, "fft"), (3, "fft"), (2, "gemm")], plan.stages
+
+
+def test_cpu_operand_in_a_gpu_process(monkeypatch):
+    """The leg follows the platform the call is lowered for (finding 4): a CPU
+    operand in a GPU process takes the XLA leg instead of failing NOT_FOUND."""
+    if jax.default_backend() != "gpu":
+        pytest.skip("needs a GPU process")
+    monkeypatch.setattr(fourier_plan, "_default_leg", lambda: None)
+    cpu = jax.devices("cpu")[0]
+    rng = _rng("cpuop")
+    x = _crandn(rng, (4, 16, 12))
+    plan = LocalFourierPlan((16, 12), (-2, -1), sign=-1, device_kind="__fft__")
+    y = jax.jit(plan)(jax.device_put(jnp.asarray(x), cpu))
+    assert list(y.devices())[0].platform == "cpu"
+    np.testing.assert_allclose(np.asarray(y), np.fft.fftn(x, axes=(-2, -1)), rtol=0, atol=1e-11)
+
+
+def _device_free_bytes():
+    import ctypes
+    rt = ctypes.CDLL("libcudart.so.13")
+    free, total = ctypes.c_size_t(), ctypes.c_size_t()
+    assert rt.cudaMemGetInfo(ctypes.byref(free), ctypes.byref(total)) == 0
+    return int(free.value)
+
+
+def test_cufft_work_area_comes_from_the_pool(leg):
+    """cuFFT plans cached per batch size must not hold work areas outside XLA's
+    pool (finding 3): a Bluestein length (4099) needed ~84 MB per new batch.  Five
+    new batch sizes may not take more than 16 MB of free device memory."""
+    if leg != "ffi":
+        pytest.skip("the CUDA leg's cuFFT plans")
+    plan = LocalFourierPlan((4099,), (-1,), sign=-1, device_kind="__fft__")
+    run = jax.jit(plan)
+    rng = _rng("bluestein")
+    jax.block_until_ready(run(jnp.asarray(_crandn(rng, (1, 4099)))))
+    before = _device_free_bytes()
+    for b in (2, 3, 5, 7, 11):
+        x = _crandn(rng, (b, 4099))
+        y = np.asarray(jax.block_until_ready(run(jnp.asarray(x))))
+        assert np.max(np.abs(y - np.fft.fft(x, axis=-1))) <= 1e-9 * np.max(np.abs(y))
+    assert before - _device_free_bytes() <= 16 << 20, (before, _device_free_bytes())

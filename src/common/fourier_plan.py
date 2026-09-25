@@ -118,9 +118,21 @@ def gemm_crossover(device_kind: str) -> tuple[range, range]:
     return range(0), range(0)
 
 
-def _default_leg() -> str:
-    """``'ffi'`` (one ``lorrax_fourier_plan`` custom call) on CUDA, XLA ops elsewhere."""
-    return "ffi" if jax.default_backend() == "gpu" else "xla"
+def _default_leg():
+    """``None``: the leg follows the platform the call is lowered for.  Tests and
+    the sweep force ``'xla'`` or ``'ffi'`` by patching this."""
+    return None
+
+
+def _cuda_present(mesh) -> bool:
+    """Whether the plan can be lowered for CUDA: the mesh's platform, else any CUDA device."""
+    if mesh is not None:
+        from ffi.gate import mesh_ffi_platform
+        return mesh_ffi_platform(mesh) == "CUDA"
+    try:
+        return len(jax.devices("cuda")) > 0
+    except RuntimeError:
+        return False
 
 
 class LocalFourierPlan:
@@ -132,7 +144,13 @@ class LocalFourierPlan:
     compact extent on every in-support axis, the full extent elsewhere.
     ``out_perm`` returns ``jnp.transpose(y, out_perm)`` instead of ``y``, at no
     cost when the GEMM chain can write that order directly (see ``_route``).
-    ``device_kind`` defaults to ``jax.devices()[0].device_kind``.
+    ``device_kind`` defaults to the kind of ``mesh``'s first device, else
+    ``jax.devices()[0]``'s (it chooses GEMM axes only, never correctness).
+    The leg is chosen when the call is lowered, from the platform it is
+    lowered for (``jax.lax.platform_dependent``): one ``lorrax_fourier_plan``
+    custom call on CUDA, XLA ops elsewhere, so a CPU operand in a GPU process
+    takes the XLA leg.  Contract on every platform: complex128, at most three
+    transform axes (``GATE fourier-plan-contract`` otherwise).
     ``plan.stages`` lists ``(axis, 'gemm'|'fft', n_in, n_out)``; GEMM stages
     of equal ``n_out/n_in`` may execute in either order.  ``in_gather`` (with
     the caller's ``mesh``) is the cylinder-plane form of the module docstring;
@@ -155,8 +173,12 @@ class LocalFourierPlan:
         if norm not in _NORMS:
             raise ValueError(f"LocalFourierPlan: norm must be one of {_NORMS}, got {norm!r}")
         self.dtype = jnp.dtype(dtype)
-        if not jnp.issubdtype(self.dtype, jnp.complexfloating):
-            raise ValueError(f"LocalFourierPlan: dtype must be complex, got {self.dtype}")
+        if self.dtype != jnp.complex128 or not 1 <= len(axes) <= 3:
+            raise ValueError(
+                f"GATE fourier-plan-contract: got dtype {self.dtype} over {len(axes)} axes; "
+                "want complex128 over 1 to 3 transform axes; why: the CUDA leg "
+                "(lorrax_fourier_plan) serves exactly that, and the plan keeps one contract "
+                "on every platform; fix: cast to complex128, or split the transform")
         in_support, out_support = dict(in_support or {}), dict(out_support or {})
         self._gather = None
         if in_gather is not None:
@@ -178,7 +200,7 @@ class LocalFourierPlan:
                 raise ValueError(f"LocalFourierPlan: {name} keys {sorted(sup)} "
                                  f"are not all in axes {axes}")
         if device_kind is None:
-            device_kind = jax.devices()[0].device_kind
+            device_kind = (mesh.devices.flat[0] if mesh is not None else jax.devices()[0]).device_kind
         self.device_kind = str(device_kind)
         n_full, n_sup = gemm_crossover(self.device_kind)
 
@@ -220,7 +242,9 @@ class LocalFourierPlan:
         self._groups = (pre, mid, post)
         self.out_perm = None if out_perm is None else tuple(int(a) for a in out_perm)
         self._routes = {}
-        self._leg = _default_leg()
+        if _cuda_present(mesh):         # the CUDA leg's handler must be loaded before lowering
+            from ffi.fft import FOURIER_PLAN_TARGET, _require_target
+            _require_target(FOURIER_PLAN_TARGET, "CUDA")
         fft_stages = self.stages
         self.stages = ([(ax, "gemm", A.shape[1], A.shape[0]) for _, ax, A in pre]
                        + fft_stages
@@ -239,8 +263,13 @@ class LocalFourierPlan:
             if x.shape[ax] != k:
                 raise ValueError(f"LocalFourierPlan: axis {ax} of x has extent "
                                  f"{x.shape[ax]}, the plan expects {k}")
-        if self._leg == "ffi":
-            return self._call_ffi(x)
+        leg = _default_leg()
+        if leg is not None:
+            return self._call_ffi(x) if leg == "ffi" else self._call_xla(x)
+        return jax.lax.platform_dependent(x, cuda=self._call_ffi, default=self._call_xla)
+
+    def _call_xla(self, x):
+        """The XLA leg: GEMMs as ``dot_general``, the FFT group as one ``jnp.fft`` call."""
         nd = x.ndim
         target = list(range(nd)) if self.out_perm is None else [a % nd for a in self.out_perm]
         if sorted(target) != list(range(nd)):

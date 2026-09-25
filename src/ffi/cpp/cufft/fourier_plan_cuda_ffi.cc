@@ -13,12 +13,17 @@
 //     the matrix); otherwise one cublasZgemmStridedBatched over L with the
 //     matrix's stride 0.  No transposes, the output stays row-major.
 //   * FFT group: one remap pass that zero-fills and gathers the embedded axes
-//     (never a separate zero pass), one cufftPlanMany Z2Z over the group, one
-//     remap pass for the restricted axes.  The FFT axes' scale rides the first
-//     GEMM's alpha, else a remap pass, else a final scale remap.
+//     (never a separate zero pass), one cuFFT Z2Z plan per contiguous run of
+//     FFT axes (a GEMM axis between two FFT axes splits the group; the
+//     transform is separable, so the runs compose to the group's transform),
+//     one remap pass for the restricted axes.  The FFT axes' scale rides the
+//     first GEMM's alpha, else a remap pass, else a final scale remap.
 //
 // Plans (device matrices, remap tables, cuFFT plans) are cached per
-// (device, attributes, shape) for the process lifetime.
+// (device, attributes, shape) for the process lifetime.  cuFFT's work areas
+// are NOT owned by the plans: auto-allocation is off, and each call takes
+// the largest work area from XLA's scratch allocator (inside the pool).
+// Every cuFFT and cuBLAS size is checked against INT_MAX and refused by name.
 #include <cublas_v2.h>
 #include <cuda_runtime_api.h>
 #include <cufft.h>
@@ -26,6 +31,8 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <initializer_list>
+#include <algorithm>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -55,8 +62,9 @@ struct Step {
     cuDoubleComplex* mat = nullptr;        // device (N' × K) row-major
     RemapShape remap{};                    // remap geometry (maps are device pointers)
     double sr = 1.0, si = 0.0;             // remap scale, or GEMM alpha
-    std::vector<cufftHandle> ffts;         // FFT group: one handle, looped `loops` times
+    std::vector<cufftHandle> ffts;         // one contiguous FFT run: one handle, looped `loops` times
     int64_t loops = 1, loop_stride = 0;
+    size_t work = 0;                       // its cuFFT work area, bytes (from XLA scratch per call)
     int64_t in_ext[3]{}, out_ext[3]{};     // current extents before / after the step
 };
 
@@ -66,8 +74,17 @@ struct Plan {
     int sign = -1;
     std::vector<Step> steps;
     int64_t max_elems = 0;                 // largest intermediate
+    size_t max_work = 0;                   // largest cuFFT work area over the steps
     std::vector<void*> owned;              // device allocations
 };
+
+constexpr int64_t kIntMax = 2147483647LL;
+
+// cuFFT's plan API and cuBLAS take int sizes: refuse, by name, anything past INT_MAX.
+static bool fits_int(std::initializer_list<int64_t> v) {
+    for (int64_t x : v) if (x < 0 || x > kIntMax) return false;
+    return true;
+}
 
 constexpr double kPi = 3.14159265358979323846;
 
@@ -205,46 +222,63 @@ static ffi::Error build_plan(Plan& p, int64_t batch, ffi::Span<const int64_t> n,
                 return e;
             fft_scale_pending = false;
         }
-        // cuFFT over the FFT axes: they must be one contiguous run [f0, f1].
-        int f0 = -1, f1 = -1;
-        for (int a = 0; a < d; ++a)
-            if (!gemm[a]) { if (f0 < 0) f0 = a; f1 = a; }
-        for (int a = f0; a <= f1; ++a)
-            if (gemm[a]) return bad("FFT axes must be contiguous");
-        Step st;
-        st.kind = Step::kFft;
-        int rank = f1 - f0 + 1;
-        int nn[3];
-        for (int a = f0; a <= f1; ++a) nn[a - f0] = int(n[a]);
-        const int64_t left = batch * prod(cur, f0);
-        int64_t right = 1;
-        for (int a = f1 + 1; a < d; ++a) right *= cur[a];
-        int64_t box = 1;
-        for (int q = 0; q < rank; ++q) box *= nn[q];
-        cufftHandle h;
-        cufftResult r;
-        if (right == 1) {
-            r = cufftPlanMany(&h, rank, nn, nn, 1, int(box), nn, 1, int(box), CUFFT_Z2Z, int(left));
-            st.loops = 1;
-        } else if (left <= right) {
-            r = cufftPlanMany(&h, rank, nn, nn, int(right), 1, nn, int(right), 1, CUFFT_Z2Z,
-                              int(right));
-            st.loops = left;
-            st.loop_stride = box * right;
-        } else {
-            r = cufftPlanMany(&h, rank, nn, nn, int(right), int(box * right), nn, int(right),
-                              int(box * right), CUFFT_Z2Z, int(left));
-            st.loops = right;
-            st.loop_stride = 1;
+        // cuFFT over each maximal contiguous run [f0, f1] of FFT axes.
+        for (int f0 = 0; f0 < d;) {
+            if (gemm[f0]) { ++f0; continue; }
+            int f1 = f0;
+            while (f1 + 1 < d && !gemm[f1 + 1]) ++f1;
+            Step st;
+            st.kind = Step::kFft;
+            int rank = f1 - f0 + 1;
+            int nn[3];
+            for (int a = f0; a <= f1; ++a) nn[a - f0] = int(n[a]);
+            const int64_t left = batch * prod(cur, f0);
+            int64_t right = 1;
+            for (int a = f1 + 1; a < d; ++a) right *= cur[a];
+            int64_t box = 1;
+            for (int q = 0; q < rank; ++q) box *= nn[q];
+            if (!fits_int({box, left, right, box * right})) {
+                std::ostringstream os;
+                os << "GATE fourier-plan-int32: the FFT run over axes [" << f0 << "," << f1 << "] has box "
+                   << box << ", " << left << " lines before and " << right << " after (box*after "
+                   << box * right << "); want each <= 2^31-1 (cuFFT's plan sizes are int); fix: split "
+                      "the batch";
+                return bad(os.str());
+            }
+            cufftHandle h;
+            if (cufftCreate(&h) != CUFFT_SUCCESS) return err("cufftCreate");
+            // The work area comes from XLA's scratch allocator on every call.
+            if (cufftSetAutoAllocation(h, 0) != CUFFT_SUCCESS) return err("cufftSetAutoAllocation");
+            cufftResult r;
+            size_t work = 0;
+            if (right == 1) {
+                r = cufftMakePlanMany(h, rank, nn, nn, 1, int(box), nn, 1, int(box), CUFFT_Z2Z, int(left),
+                                      &work);
+                st.loops = 1;
+            } else if (left <= right) {
+                r = cufftMakePlanMany(h, rank, nn, nn, int(right), 1, nn, int(right), 1, CUFFT_Z2Z,
+                                      int(right), &work);
+                st.loops = left;
+                st.loop_stride = box * right;
+            } else {
+                r = cufftMakePlanMany(h, rank, nn, nn, int(right), int(box * right), nn, int(right),
+                                      int(box * right), CUFFT_Z2Z, int(left), &work);
+                st.loops = right;
+                st.loop_stride = 1;
+            }
+            if (r != CUFFT_SUCCESS) {
+                cufftDestroy(h);
+                std::ostringstream os;
+                os << "cufftMakePlanMany failed (" << int(r) << ")";
+                return err(os.str());
+            }
+            st.ffts.push_back(h);
+            st.work = work;
+            p.max_work = std::max(p.max_work, work);
+            for (int b = 0; b < d; ++b) st.in_ext[b] = st.out_ext[b] = cur[b];
+            p.steps.push_back(st);
+            f0 = f1 + 1;
         }
-        if (r != CUFFT_SUCCESS) {
-            std::ostringstream os;
-            os << "cufftPlanMany failed (" << int(r) << ")";
-            return err(os.str());
-        }
-        st.ffts.push_back(h);
-        for (int b = 0; b < d; ++b) st.in_ext[b] = st.out_ext[b] = cur[b];
-        p.steps.push_back(st);
         // Restriction of the FFT axes with an output support.
         std::vector<std::vector<int32_t>> tmaps(d);
         int64_t text[3] = {1, 1, 1};
@@ -330,6 +364,13 @@ static ffi::Error run(cudaStream_t stream, ffi::ScratchAllocator scratch, ffi::A
     if (hb == nullptr && cublasCreate(&hb) != CUBLAS_STATUS_SUCCESS) return err("cublasCreate");
     if (cublasSetStream(hb, stream) != CUBLAS_STATUS_SUCCESS) return err("cublasSetStream");
 
+    // cuFFT's work area for this call, from XLA's scratch allocator.
+    void* work = nullptr;
+    if (p->max_work > 0) {
+        auto w = scratch.Allocate(p->max_work);
+        if (!w.has_value()) return err("scratch allocation (cuFFT work area)");
+        work = *w;
+    }
     // Ping-pong through two scratch buffers; the last step writes y.
     const size_t bytes = size_t(p->max_elems) * sizeof(cuDoubleComplex);
     void* buf[2] = {nullptr, nullptr};
@@ -355,6 +396,13 @@ static ffi::Error run(cudaStream_t stream, ffi::ScratchAllocator scratch, ffi::A
             for (int b = 0; b < a; ++b) L *= st.in_ext[b];
             for (int b = a + 1; b < d; ++b) R *= st.in_ext[b];
             const int64_t K = st.in_ext[a], Np = st.out_ext[a];
+            if (!fits_int({L, R, K, Np})) {
+                std::ostringstream os;
+                os << "GATE fourier-plan-int32: the GEMM on axis " << a << " has (L, K, N', R) = (" << L
+                   << ", " << K << ", " << Np << ", " << R << "); want each <= 2^31-1 (cuBLAS sizes are "
+                      "int); fix: split the batch";
+                return bad(os.str());
+            }
             const cuDoubleComplex alpha = make_cuDoubleComplex(st.sr, st.si);
             const cuDoubleComplex beta = make_cuDoubleComplex(0.0, 0.0);
             const auto* X = static_cast<const cuDoubleComplex*>(src);
@@ -379,6 +427,7 @@ static ffi::Error run(cudaStream_t stream, ffi::ScratchAllocator scratch, ffi::A
             const auto dir = p->sign < 0 ? CUFFT_FORWARD : CUFFT_INVERSE;
             cufftHandle h = st.ffts[0];
             if (cufftSetStream(h, stream) != CUFFT_SUCCESS) return err("cufftSetStream");
+            if (st.work > 0 && cufftSetWorkArea(h, work) != CUFFT_SUCCESS) return err("cufftSetWorkArea");
             auto* in = const_cast<cufftDoubleComplex*>(static_cast<const cufftDoubleComplex*>(src));
             auto* out = static_cast<cufftDoubleComplex*>(dst);
             for (int64_t l = 0; l < st.loops; ++l) {
@@ -391,10 +440,11 @@ static ffi::Error run(cudaStream_t stream, ffi::ScratchAllocator scratch, ffi::A
         src = dst;
         which ^= 1;
     }
-    if (p->steps.empty())
+    if (p->steps.empty() &&
         cudaMemcpyAsync(y->untyped_data(), x.untyped_data(), size_t(batch) * prod(kin.begin(), d) *
                                                                  sizeof(cuDoubleComplex),
-                        cudaMemcpyDeviceToDevice, stream);
+                        cudaMemcpyDeviceToDevice, stream) != cudaSuccess)
+        return err("cudaMemcpyAsync");
     return ffi::Error::Success();
 }
 
