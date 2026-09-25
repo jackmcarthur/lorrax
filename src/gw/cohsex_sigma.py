@@ -12,9 +12,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
-from .greens_function_kernel import (build_G, pair_stream_layout, spin_pair_rows,
-                                     spin_pairs_needed, to_pair_stream_layout,
-                                     unfold_parent_faces)
+from .greens_function_kernel import build_G
 from .head_correction import static_head_terms_to_kij
 from .wavefunction_bundle import project as _project
 from .wavefunction_bundle import (SIGMA_CONV_G7D_SPEC, V_FFT5D_SPEC,
@@ -208,8 +206,8 @@ _static_convolution_cache: dict[tuple[object, ...], object] = {}
 
 class StaticConvolution(NamedTuple):
     """The static Σ convolution: ``fn(G_k, V, prefactor)``, or ``prep(V)`` once and
-    ``apply(G_k, prepared, prefactor)`` per Green, for a caller that convolves
-    several Greens with one interaction (the spin-pair stream).  ``V`` is a
+    ``apply(G_k, prepared, prefactor)`` per Green (the full-k face route; the parent
+    route convolves by mathdx mode 7 with the same ``prep``).  ``V`` is a
     ``symmetry_maps.QirrOperator``: its wedge is unfolded on the load of its
     k-transform (``make_kfft_klead_unfold``), never stored at the full zone."""
     prep: object
@@ -370,7 +368,8 @@ def make_lorentz_convolution(mesh_xy: Mesh, kgrid, nk_tot: int, keys, left_plan,
             norm='ortho', mult=-1.0 / np.sqrt(float(nk_tot)))
 
         def convolve(parent_green, interactions):
-            return door(parent_green.G, parent_green.transpose, interactions)
+            return door(parent_green.G, parent_green.transpose, interactions,
+                        conj_partner=parent_green.conj_partner)
         # The entry keeps both plans alive, so their ids cannot be reused.
         _lorentz_convolution_cache[key] = (convolve, left_plan, right)
     return _lorentz_convolution_cache[key][0]
@@ -425,14 +424,15 @@ def _make_cohsex_kernels(mesh_xy: Mesh, kgrid: tuple[int, int, int],
 
     _convolve = _make_static_convolution(mesh_xy, kgrid, nk_tot)
     kernels = _make_cohsex_kernels_face(
-        mesh_xy, face_shape, _convolve, k_unfold_plan=k_unfold_plan, layout=layout)
+        mesh_xy, face_shape, _convolve, k_unfold_plan=k_unfold_plan, layout=layout,
+        kgrid=kgrid)
 
     _cohsex_kernel_cache[cache_key] = kernels
     return kernels
 
 
 def _make_cohsex_kernels_face(mesh_xy: Mesh, face_shape, _convolve,
-                              k_unfold_plan=None, layout="face"):
+                              k_unfold_plan=None, layout="face", *, kgrid=None):
     """Contract static SX/COH and project before selecting the requested output band window."""
     from distrib_la import gemm_plan
     from common.contract_bands import contract_bands_block_reshard
@@ -461,66 +461,35 @@ def _make_cohsex_kernels_face(mesh_xy: Mesh, face_shape, _convolve,
         c = wfns.green_parent
         return c.psi_mun, c.psi_nmu, c
 
-    # Spin-pair streaming (A4) when the whole-spin G_occ, its unfold
-    # transient and Σ_k (~2 G_tile) exceed the device target: each (a, b)
-    # block is built at full k, convolved, and projected on the parents' a
-    # and b spinor rows; the band sum over pairs is the same Σ.
-    stream = (k_unfold_plan is not None and ns_g > 1 and spin_pairs_needed(
-        n_full=k_unfold_plan.n_full, n_rmu=n_rmu_g, ns=ns_g, mesh=mesh_xy,
-        live_green_tiles=2))
-    if stream:
-        pair_layout = pair_stream_layout(n_full=k_unfold_plan.n_full, ns=ns_g, mu=n_rmu_g,
-                                         nb=nb_g, layout=layout, mesh=mesh_xy)
-        pair_plan = gemm_plan(mesh_xy, m=n_rmu_g, k=nb_g, n=n_rmu_g,
-                              nq=k_unfold_plan.n_full, dtype=jnp.complex128,
-                              layout=pair_layout)
-        pair_proj = contract_bands_block_reshard(
-            mesh_xy, layout=layout, face_shape=(nk_g, nb_g, n_rmu_g, 1))
-        _irr = np.asarray(k_unfold_plan.irr_idx, dtype=np.int32)
+    if k_unfold_plan is not None:
+        # The Σ consumer the dynamic route uses (ppm_tau_kernel.get_sigma_spatial_
+        # kernel): the raw-parent Green convolved by mathdx mode 7 with the typed
+        # unfold on its load, only the parent rows stored, in output spin blocks
+        # when the whole block would not fit.  Static weights are real, so the
+        # antiunitary partner is conj(G), read on the load: no partner tile.
+        from .greens_function_kernel import build_G_parents
+        from .ppm_tau_kernel import get_sigma_spatial_kernel
+        spatial = get_sigma_spatial_kernel(
+            mesh_xy=mesh_xy, kgrid=kgrid, merged_x=True, layout=layout,
+            face_shape=tuple(int(v) for v in face_shape), k_unfold_plan=k_unfold_plan,
+            partner_tiles=0)
 
-    def _pair_sigma(wfns, phases_parent, interaction, prefactor):
-        """Σ = Σ_ab ψ*_a [G_ab · interaction] ψ_b on parent rows, one spin block at a time."""
+    def _parent_sigma(wfns, phases_parent, interaction, prefactor, *, real_weights):
+        """Σ on the parent rows from the parent Green, unfolded to the wedge's band operator."""
         from .wavefunction_bundle import parent_sigma_operands
-        carrier = wfns.green_parent
-        psi_mun, psi_nmu = to_pair_stream_layout(*unfold_parent_faces(
-            k_unfold_plan, carrier.psi_mun, carrier.psi_nmu, layout=layout),
-            layout=pair_layout, mesh=mesh_xy)
-        phases = jnp.take(phases_parent, jnp.asarray(_irr), axis=0)
+        g_mun, g_nmu, _ = _g_operands(wfns)
+        pg = build_G_parents(g_mun, g_nmu, phases=phases_parent, layout=layout, gemm=g_plan,
+                             k_unfold_plan=k_unfold_plan, real_weights=real_weights)
         _, _, proj_nmu, proj_mun, _, _ = parent_sigma_operands(wfns)
-        # The interaction is the same for every spin pair: transform it once.
-        prepared = _convolve.prep(interaction)
-
-        def block(acc, index):
-            left, right = spin_pair_rows(psi_mun, psi_nmu, index, ns_g)
-            G_ab = build_G(left, right, phases=phases, layout=pair_layout, gemm=pair_plan)
-            S_ab = jnp.take(_convolve.apply(G_ab, prepared, prefactor),
-                            jnp.asarray(_k_rows), axis=0)
-            proj_left = jax.lax.dynamic_slice_in_dim(proj_nmu, index // ns_g, 1, axis=2)
-            proj_right = jax.lax.dynamic_slice_in_dim(proj_mun, index % ns_g, 1, axis=1)
-            return acc + _project(proj_left, proj_right, S_ab, layout=layout,
-                                  face_project_fn=pair_proj), None
-
-        acc = jax.lax.with_sharding_constraint(
-            jnp.zeros((nk_g, nb_g, nb_g), jnp.complex128),
-            NamedSharding(mesh_xy, P(None, 'x', 'y')))
-        acc, _ = jax.lax.scan(block, acc, jnp.arange(ns_g * ns_g), unroll=1)
-        return unfold_file_wedge_band_operator(_sym, acc, trs_rule="transpose")
+        parent_rows = prefactor * spatial.conv_project(
+            proj_nmu, proj_mun, pg, _convolve.prep(interaction))
+        # Static Σ is Hermitian, so conj and transpose coincide; the dynamic
+        # route's operator rule (unfold_file_wedge_band_operator) is one spelling.
+        return unfold_file_wedge_band_operator(_sym, parent_rows, trs_rule="transpose")
 
     def _project_bands(wfns, sigma_k):
-        if k_unfold_plan is None:
-            return _project(wfns.psi_nmu, wfns.psi_mun, sigma_k,
-                            layout=layout, face_project_fn=proj_fn)
-        from .wavefunction_bundle import parent_sigma_operands
-        _, _, proj_nmu, proj_mun, _, _ = parent_sigma_operands(wfns)
-        parent_rows = _project(
-            proj_nmu, proj_mun,
-            jnp.take(sigma_k, jnp.asarray(_k_rows), axis=0),
-            layout=layout, face_project_fn=proj_fn)
-        # Static Σ is Hermitian, so conj and transpose coincide; use the
-        # operator rule the dynamic route uses (unfold_file_wedge_band_
-        # operator) so the two routes share one spelling.
-        return unfold_file_wedge_band_operator(
-            _sym, parent_rows, trs_rule="transpose")
+        return _project(wfns.psi_nmu, wfns.psi_mun, sigma_k,
+                        layout=layout, face_project_fn=proj_fn)
 
     @jax.jit
     def sigma_sx(wfns, Gij, W_q):
@@ -528,14 +497,12 @@ def _make_cohsex_kernels_face(mesh_xy: Mesh, face_shape, _convolve,
         s = wfns.slices
         g_mun, g_nmu, _ = _g_operands(wfns)
         phases = _occ_diag_full(Gij, s.nb_sigma, nb_full)
+        real = not jnp.issubdtype(phases.dtype, jnp.complexfloating)
         if k_unfold_plan is not None:
-            phases = k_unfold_plan.parent_rows(phases)
-        if stream:
-            return _pair_sigma(wfns, phases, W_q, 1.0)
-        G_occ = build_G(g_mun, g_nmu, phases=phases,
-                        real_weights=not jnp.issubdtype(phases.dtype, jnp.complexfloating),
-                        layout=layout, gemm=g_plan,
-                        k_unfold_plan=k_unfold_plan)
+            return _parent_sigma(wfns, k_unfold_plan.parent_rows(phases), W_q, 1.0,
+                                 real_weights=real)
+        G_occ = build_G(g_mun, g_nmu, phases=phases, real_weights=real,
+                        layout=layout, gemm=g_plan)
         return _project_bands(wfns, _convolve(G_occ, W_q, 1.0))
 
     @partial(jax.jit, static_argnames=("ri_bands",))
@@ -546,11 +513,10 @@ def _make_cohsex_kernels_face(mesh_xy: Mesh, face_shape, _convolve,
         g_mun, g_nmu, owner = _g_operands(wfns)
         mask = owner.band_mask(bands)
         W_minus_V = screened_minus_bare(W_q, V_q)
-        if stream:
-            return _pair_sigma(wfns, mask, W_minus_V, -0.5)
+        if k_unfold_plan is not None:
+            return _parent_sigma(wfns, mask, W_minus_V, -0.5, real_weights=True)
         G_ri = build_G(g_mun, g_nmu, phases=mask, real_weights=True,
-                       layout=layout, gemm=g_plan,
-                       k_unfold_plan=k_unfold_plan)
+                       layout=layout, gemm=g_plan)
         return _project_bands(wfns, _convolve(G_ri, W_minus_V, -0.5))
 
     # The interaction's wedge door is built before the jit traces (see
