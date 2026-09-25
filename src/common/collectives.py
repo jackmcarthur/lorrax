@@ -98,6 +98,7 @@ __all__ = [
     "agree_io_error",
     "rank0_transaction",
     "rank0_atomic_file_transaction",
+    "collective_atomic_file_transaction",
     # mesh construction (and the warm-up that must accompany it)
     "resolve_mesh",
     "single_device_mesh",
@@ -1606,6 +1607,44 @@ def rank0_transaction(path, *, stage, write, validate=None, return_value=False):
         return json.loads(bytes(returned).rstrip(b'\0'))
 
 
+def _reserve_staging_path(destination):
+    """Create and return a private empty sibling of ``destination``.
+
+    O_EXCL gives the writer a private path in the destination directory, so
+    ``os.replace`` onto the destination is one-filesystem atomic; 0666 follows
+    the process umask like a direct h5py ``"w"`` open, where
+    ``tempfile.mkstemp`` would hard-code 0600 and silently change the
+    group-accessible artifact mode (0660 under the production 0007 umask).
+    Both artifact writers truncate or replace an existing path, so the empty
+    file does not constrain them.
+    """
+    import os
+    import secrets
+
+    directory = os.path.dirname(os.path.abspath(destination))
+    basename = os.path.basename(destination)
+    for _ in range(16):
+        candidate = os.path.join(
+            directory, f".{basename}.{os.getpid()}.{secrets.token_hex(8)}.tmp")
+        try:
+            fd = os.open(candidate, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+        except FileExistsError:
+            continue
+        os.close(fd)
+        return candidate
+    raise FileExistsError(
+        f"could not reserve a private staging path for {destination}")
+
+
+def _unlink_if_present(path):
+    import os
+
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+
+
 def rank0_atomic_file_transaction(
         path, *, stage, write, validate_file, validate=None):
     """Publish one rank-0 file only after its closed staging file validates.
@@ -1622,48 +1661,60 @@ def rank0_atomic_file_transaction(
     only for a complete artifact.
     """
     import os
-    import secrets
 
     destination = os.fspath(path)
-    directory = os.path.dirname(os.path.abspath(destination))
-    basename = os.path.basename(destination)
 
     def _publish():
-        temporary = None
+        temporary = _reserve_staging_path(destination)
         try:
-            # O_EXCL gives the writer a private sibling path while 0666
-            # follows the process umask, like a direct h5py ``"w"`` open.
-            # tempfile.mkstemp hard-codes 0600, which would silently change
-            # the established group-accessible artifact mode (0660 under the
-            # production 0007 umask).  The file remains present: both final
-            # artifact writers truncate an existing path and therefore retain
-            # exclusive ownership.
-            for _ in range(16):
-                candidate = os.path.join(
-                    directory,
-                    f".{basename}.{os.getpid()}.{secrets.token_hex(8)}.tmp")
-                try:
-                    fd = os.open(
-                        candidate, os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-                        0o666)
-                except FileExistsError:
-                    continue
-                os.close(fd)
-                temporary = candidate
-                break
-            if temporary is None:
-                raise FileExistsError(
-                    f"could not reserve a private staging path for {destination}")
             write(temporary)
             validate_file(temporary)
             os.replace(temporary, destination)
             temporary = None
         finally:
             if temporary is not None:
-                try:
-                    os.unlink(temporary)
-                except FileNotFoundError:
-                    pass
+                _unlink_if_present(temporary)
 
     rank0_transaction(
         destination, stage=stage, write=_publish, validate=validate)
+
+
+def collective_atomic_file_transaction(path, *, stage, write, validate_file):
+    """Publish one file EVERY rank writes, only after its closed staging file validates.
+
+    The collective twin of :func:`rank0_atomic_file_transaction`, for an
+    artifact written through ``file_io.slab_io``: rank 0 reserves the private
+    staging sibling and broadcasts its name; ``write(staging_path)`` runs on
+    every rank and must close its SlabIO handles (a collective) before
+    returning; the ranks agree on its outcome; rank 0 then runs
+    ``validate_file(staging_path)`` and renames.  Any failure removes only
+    the staging file, leaves a previous destination untouched, and raises
+    the same named failure on every rank.
+    """
+    import os
+
+    destination = os.fspath(path)
+    staging = rank0_transaction(
+        destination, stage=f"{stage}/reserve",
+        write=lambda: _reserve_staging_path(destination), return_value=True)
+    error = None
+    try:
+        write(staging)
+    except BaseException as exc:                              # noqa: BLE001
+        error = exc
+    try:
+        agree_io_error(error, path=destination, stage=f"{stage}/write")
+    except BaseException:
+        if process_rank() == 0:
+            _unlink_if_present(staging)
+        raise
+
+    def _publish():
+        try:
+            validate_file(staging)
+            os.replace(staging, destination)
+        except BaseException:
+            _unlink_if_present(staging)
+            raise
+
+    rank0_transaction(destination, stage=f"{stage}/publish", write=_publish)

@@ -48,6 +48,7 @@ Nothing here weakens the absent-means-full rule: an old file, a
 hand-written test file and a full-BZ file written today are all read
 verbatim, because the discriminator is an attribute no old writer wrote.
 """
+import functools
 import json
 import os
 
@@ -725,12 +726,13 @@ def authenticate_qp_rotations_source_wfn(
 
 def write_qp_wfn_h5(
     output_path: str,
-    wfn,                                    # WFNReader (also serves as `crystal` for the writer)
+    wfn,                                    # WfnLoader (also the header's `crystal`)
     U_kmn: np.ndarray,                      # (nk, nb_active, nb_active)  ⟨DFT_m | QP_n⟩
     enk_active_qp_ry: np.ndarray,           # (nk, nb_active)             E_QP for active block, Ry
     band_start: int,
     band_stop: int,
     *,
+    mesh,
     enk_full_base_ry: np.ndarray | None = None,
     occupations_kn: np.ndarray | None = None,
     occupation_state=None,
@@ -738,39 +740,37 @@ def write_qp_wfn_h5(
     qp_energy_definition=None,
     sigma_eval_provenance=None,
 ) -> None:
-    """Write a BGW-compatible WFN.h5 with QP-rotated ψ and replaced energies.
+    """COLLECTIVE over ``mesh``: a BGW ``WFN.h5`` with QP-rotated ψ and QP energies.
 
-    For each k:
-      * Bands ``[band_start, band_stop)`` (the "active" block):
-          ``c_qp[n, s, G] = Σ_m U[k, m, n] · c_dft[m, s, G]``
-          ``E[n] ← enk_active_qp_ry[k, n - band_start]``
-      * All other coefficients remain DFT.  Their energies default to DFT,
-        or may be supplied through ``enk_full_base_ry`` when a caller owns
-        an explicit energy-only extrapolation such as the SC sum-band tail.
+    For each file-wedge k, on the active bands ``[band_start, band_stop)``::
 
-    The ``wfn`` argument is a :class:`~wfn_loader.WfnLoader` and
-    is reused as the ``crystal`` source for :class:`WFNWriter` (it
-    exposes the same ``nspin``, ``nspinor``, ``nelec``, ``ecutwfc``,
-    ``ecutrho``, ``fft_grid``, ``avec``, ``bdot``, … attributes the
-    writer reads).
+        c_qp[n, s, G] = Σ_m U[k, m, n] · c_dft[m, s, G]
+        E[n]          = enk_active_qp_ry[k, n - band_start]
 
-    Notes
-    -----
-    Symmetry & k-mesh: the rotation is on the irreducible-k WFN —
-    output is on the same irreducible-k grid as the input, with the
-    ``mtrx`` / ``tnp`` blocks copied through.  Symmetry-equivalent
-    full-zone wavefunctions are reconstructed by downstream consumers
-    (BSE, etc.) via the same maps as for the input WFN.
+    Every other coefficient is copied; its energy is the DFT one, or
+    ``enk_full_base_ry`` when the caller owns an energy-only extrapolation
+    (the SC sum-band tail scissor).  The k-set, ``mtrx``/``tnp`` and G-lists
+    are the source file's, so symmetry consumers unfold it exactly as they
+    unfold the source.
 
-    Spinors: handled identically per (k, s) — the rotation is in band
-    space and does not mix spinor components.
+    THE WRITE.  The rotation is local in G, so the slab is G-sharded over
+    every mesh axis: each rank reads its own ``(nbands, nspinor, w, 2)``
+    hyperslab of the source ``wfns/coeffs`` through ``file_io.slab_io``,
+    rotates it, and writes the same hyperslab of the output.  No ψ row is
+    gathered anywhere; per-rank device bytes are ``≈ 5·nbands·nspinor·w·16``
+    with ``w = ⌈ngkmax/P⌉`` unless the device budget forces smaller G
+    windows (:func:`_coefficient_window`).  The ``mf_header`` tables
+    (:func:`file_io.wfn_writer.wfn_header_tables`), ``wfns/gvecs`` and the
+    root stamps are SlabIO deferred metadata, landed by rank 0 at the first
+    handle's close; that close also creates the ``wfns`` group, which the
+    native collective create cannot (it makes no intermediate groups), so
+    the coefficients follow on a second, ``mode="a"`` handle.  At P == 1 on
+    an emulated CPU mesh SlabIO serves the same calls serially.
 
     Occupations: an SC caller supplies ``occupations_kn`` together with the
-    exact ``occupation_state`` that produced it.  The table is written on the
-    file wedge while the state's mesh-invariant hash, fixed-N chemical
-    potential, smearing family/width and electron target are stamped at the
-    root.  Callers which supply neither retain the historical index-step
-    table; supplying only one is refused.
+    exact ``occupation_state`` that produced it; the table is written on the
+    file wedge and the state's hash, μ, smearing and electron target are
+    stamped at the root.  Neither → the index-step table; one alone refuses.
     """
     provenance = _qp_provenance_attrs(
         qp_solver=qp_solver,
@@ -782,26 +782,24 @@ def write_qp_wfn_h5(
             "supplied together.")
     occupation_provenance = _qp_occupation_attrs(occupation_state)
 
-    from .wfn_writer import WFNWriter
-
+    nk, nbands = int(wfn.nkpts), int(wfn.nbands)
     nb_active = int(band_stop - band_start)
-    if U_kmn.shape != (wfn.nkpts, nb_active, nb_active):
+    if U_kmn.shape != (nk, nb_active, nb_active):
         raise ValueError(
             f"write_qp_wfn_h5: U shape {U_kmn.shape} inconsistent with "
-            f"(nk={wfn.nkpts}, nb_active={nb_active}).")
-    if enk_active_qp_ry.shape != (wfn.nkpts, nb_active):
+            f"(nk={nk}, nb_active={nb_active}).")
+    if enk_active_qp_ry.shape != (nk, nb_active):
         raise ValueError(
             f"write_qp_wfn_h5: enk_active_qp_ry shape "
             f"{enk_active_qp_ry.shape} inconsistent with "
-            f"(nk={wfn.nkpts}, nb_active={nb_active}).")
+            f"(nk={nk}, nb_active={nb_active}).")
     occupations = None
     if occupations_kn is not None:
         occupations = np.asarray(occupations_kn, dtype=np.float64)
-        expected = (int(wfn.nkpts), int(wfn.nbands))
-        if occupations.shape != expected:
+        if occupations.shape != (nk, nbands):
             raise ValueError(
                 "write_qp_wfn_h5: occupations_kn shape "
-                f"{occupations.shape} inconsistent with {expected}.")
+                f"{occupations.shape} inconsistent with {(nk, nbands)}.")
         if not np.all(np.isfinite(occupations)):
             raise ValueError(
                 "write_qp_wfn_h5: occupations_kn must be finite.")
@@ -816,63 +814,35 @@ def write_qp_wfn_h5(
                 "write_qp_wfn_h5: file-wedge occupations violate fixed N: "
                 f"realised {realized:.12f}, target {target:.12f}.")
 
-    # All-band IBZ coefficients + per-k G-vectors via the unified loader.
-    # The output writer is already k-streamed, so the input must be too:
-    # materialising ``(nk, nbands, ns, ngkmax)`` first made this optional
-    # end-of-run artifact a whole-WFN device allocation after Sigma.  Keep
-    # exactly one raw IBZ row live and rotate it on the host.
     if enk_full_base_ry is None:
-        enk_full_ry = np.array(
-            wfn.energies[0], dtype=np.float64).copy()  # (nk, nbands)
+        enk_full_ry = np.array(wfn.energies[0], dtype=np.float64).copy()
     else:
         base = np.asarray(enk_full_base_ry, dtype=np.float64)
-        expected = (int(wfn.nkpts), int(wfn.nbands))
-        if base.shape != expected:
+        if base.shape != (nk, nbands):
             raise ValueError(
                 "write_qp_wfn_h5: enk_full_base_ry shape "
-                f"{base.shape} inconsistent with {expected}.")
+                f"{base.shape} inconsistent with {(nk, nbands)}.")
         enk_full_ry = base.copy()
     enk_full_ry[:, band_start:band_stop] = np.asarray(
         enk_active_qp_ry, dtype=np.float64)
 
-    # The top-level WfnLoader carries the device mesh; ``.load`` is a
-    # collective on the phdf5 backend, so it MUST be called by every rank
-    # even though only rank-0 writes the file.  We open a fresh
-    # mesh-less WfnLoader (eager backend) here so the rank-0 write does
-    # not need the other ranks at all — qp_wfn is a one-shot
-    # end-of-run dump and the re-slurp cost is paid once.
-    from ffi import _services
-    _services.ensure_on_path()
-    from wfn_loader import IBZRows, WfnLoader
-    with WfnLoader(wfn.path) as loader:
-        gvecs_full = loader.gvecs(k="ibz")                     # (nk, ngkmax, 3)
-        ngk_v = loader.ngk_valid(k="ibz")                      # (nk,)
-        gvecs_per_k = [gvecs_full[ik, : int(ngk_v[ik])]
-                       for ik in range(int(wfn.nkpts))]
+    from common import timing
+    from .slab_io import SlabIO
+    from .wfn_writer import wfn_header_tables
 
-        with WFNWriter(
-            output_path, wfn,
-            kpoints=np.asarray(wfn.kpoints, dtype=np.float64),
-            weights=np.asarray(wfn.kweights, dtype=np.float64),
-            kgrid=tuple(int(x) for x in wfn.kgrid),
-            nbands=int(wfn.nbands),
-            gvecs_per_k=gvecs_per_k,
-            occupations=occupations,
-            nosym=False,
-            shift=tuple(float(x) for x in wfn.shift),
-        ) as writer:
-            for ik in range(int(wfn.nkpts)):
-                n = int(ngk_v[ik])
-                psi_k = loader.load(
-                    bands=(0, int(wfn.nbands)),
-                    k=IBZRows((ik,)), sharding=None)
-                c_all_dft = np.asarray(psi_k)[0, :, :, :n].copy()
-                del psi_k
-                c_active_dft = c_all_dft[band_start:band_stop]
-                c_all_dft[band_start:band_stop] = np.einsum(
-                    "mn,msg->nsg", U_kmn[ik], c_active_dft,
-                    optimize=True)
-                writer.write_k(ik, enk_full_ry[ik], c_all_dft)
+    ngk = np.asarray(wfn.ngk_valid(k="ibz"), dtype=np.int32)
+    gvecs_ibz = wfn.gvecs(k="ibz")                           # (nk, ngkmax, 3)
+    gvecs = np.concatenate(
+        [gvecs_ibz[ik, :int(ngk[ik])] for ik in range(nk)],
+        axis=0).astype(np.int32)
+    tables = wfn_header_tables(
+        wfn,
+        kpoints=np.asarray(wfn.kpoints, dtype=np.float64),
+        weights=np.asarray(wfn.kweights, dtype=np.float64),
+        kgrid=tuple(int(x) for x in wfn.kgrid),
+        nbands=nbands, ngk=ngk, occupations=occupations, nosym=False,
+        shift=tuple(float(x) for x in wfn.shift))
+    tables["mf_header/kpoints/el"][0] = enk_full_ry
 
     # THE FILE SAYS WHAT IT IS.  ψ and E in here are a MATCHED PAIR: the
     # rotated orbitals carry the QP eigenvalues that produced the rotation,
@@ -883,18 +853,107 @@ def write_qp_wfn_h5(
     # only discriminator available was the filename.  Stamped here, in the one
     # writer, using the same "an absent attr means the old thing" reading the
     # k_storage stamps above use.
-    with h5py.File(str(output_path), "a") as h5:
-        h5.attrs[QP_WFN_ATTR] = QP_WFN_SCHEME
-        h5.attrs["qp_wfn_band_start"] = int(band_start)
-        h5.attrs["qp_wfn_band_stop"] = int(band_stop)
-        h5.attrs["qp_wfn_source"] = str(getattr(wfn, "path", "") or "")
-        for name, value in provenance.items():
-            h5.attrs[name] = value
-        for name, value in occupation_provenance.items():
-            h5.attrs[name] = value
+    stamps = {
+        QP_WFN_ATTR: QP_WFN_SCHEME,
+        "qp_wfn_band_start": int(band_start),
+        "qp_wfn_band_stop": int(band_stop),
+        "qp_wfn_source": str(getattr(wfn, "path", "") or ""),
+        **provenance,
+        **occupation_provenance,
+    }
+
+    with timing.section("qp_wfn.write"):
+        with SlabIO(output_path, mode="w", mesh=mesh) as io:
+            for name, value in tables.items():
+                io.write_attr(name, value)
+            io.write_attr("wfns/gvecs", gvecs)
+            io.stamp_dataset_attrs("/", stamps)
+        with SlabIO(wfn.path, mode="r", mesh=mesh) as src, \
+                SlabIO(output_path, mode="a", mesh=mesh) as dst:
+            _write_rotated_coefficients(
+                src, dst, mesh=mesh, U_kmn=U_kmn,
+                band_start=int(band_start), band_stop=int(band_stop),
+                nbands=nbands, nspinor=int(wfn.nspinor), ngk=ngk,
+                kpt_starts=np.asarray(wfn.kpt_starts, dtype=np.int64))
 
 
+def _write_rotated_coefficients(src, dst, *, mesh, U_kmn, band_start,
+                                band_stop, nbands, nspinor, ngk, kpt_starts):
+    """Stream ``wfns/coeffs`` from ``src`` to ``dst``, rotating the active block.
 
+    One G window at a time: the slab ``(nbands, nspinor, W, 2)`` float64 at
+    file offset ``kpt_starts[k] + g0`` is G-sharded over every mesh axis, so
+    rank r reads and writes columns ``[r·w, (r+1)·w)`` of it (``W = P·w``).
+    ``valid_shape`` clips each window to its own k's ``ngk``: the pad columns
+    past it read as zero and are never written, so a window cannot reach the
+    neighbouring k.  The shape is the same for every window, so the read,
+    the rotation and the write each compile once.
+    """
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    from common.collectives import device_put_process_local
+
+    dst.create_dataset("wfns/coeffs",
+                       shape=(nbands, nspinor, int(np.sum(ngk)), 2),
+                       dtype=np.float64)
+    width = _coefficient_window(mesh, nbands=nbands, nspinor=nspinor,
+                                ngkmax=int(np.max(ngk)))
+    spec = P(None, None, tuple(mesh.axis_names), None)
+    rotate = _qp_rotation_kernel(mesh, band_start, band_stop)
+    replicated = NamedSharding(mesh, P())
+    for ik in range(int(ngk.shape[0])):
+        U = device_put_process_local(
+            np.asarray(U_kmn[ik], dtype=np.complex128), replicated)
+        for g0 in range(0, int(ngk[ik]), width):
+            offset = (0, 0, int(kpt_starts[ik]) + g0, 0)
+            valid = (nbands, nspinor, min(width, int(ngk[ik]) - g0), 2)
+            slab = src.read_slab(
+                "wfns/coeffs", shape=(nbands, nspinor, width, 2),
+                offset=offset, valid_shape=valid, partition_spec=spec,
+                dtype=np.float64)
+            dst.write_slab("wfns/coeffs", rotate(U, slab),
+                           offset=offset, valid_shape=valid)
+
+
+def _coefficient_window(mesh, *, nbands, nspinor, ngkmax) -> int:
+    """G columns per coefficient window, ``P·w``, from the device budget.
+
+    ``w = ⌈ngkmax/P⌉`` (one window per k) whenever
+    ``5·nbands·nspinor·w·16 B`` fits the agreed per-rank budget — the read
+    slab, the active block as complex, its rotation, the output slab and the
+    one queued write — and the largest ``w`` that fits otherwise.
+    """
+    from common.gpu_utils import (
+        bfc_fragmentation_target_utilization, get_device_memory_info,
+        minimum_process_budget_gb)
+
+    p = int(mesh.devices.size)
+    whole_k = -(-int(ngkmax) // p)
+    budget = minimum_process_budget_gb(
+        float(get_device_memory_info()["budget_gb"])) * 1e9
+    per_column = 5 * int(nbands) * int(nspinor) * 16
+    w = int(budget * bfc_fragmentation_target_utilization(4) // per_column)
+    return p * max(1, min(whole_k, w))
+
+
+@functools.lru_cache(maxsize=None)
+def _qp_rotation_kernel(mesh, band_start: int, band_stop: int):
+    """``slab[b0:b3] ← Σ_m U[m, n] · slab[m]`` on G-local ``(nb, ns, w, 2)`` slabs."""
+    import jax
+    import jax.numpy as jnp
+    from jax.sharding import PartitionSpec as P
+    from common.shard_map import shard_map
+
+    spec = P(None, None, tuple(mesh.axis_names), None)
+
+    def local(U, slab):
+        active = jax.lax.complex(slab[band_start:band_stop, ..., 0],
+                                 slab[band_start:band_stop, ..., 1])
+        rotated = jnp.einsum("mn,msg->nsg", U, active)
+        return slab.at[band_start:band_stop].set(
+            jnp.stack([rotated.real, rotated.imag], axis=-1))
+
+    return jax.jit(shard_map(local, mesh=mesh, in_specs=(P(), spec),
+                             out_specs=spec))
 
 
 def validate_qp_wfn_h5(

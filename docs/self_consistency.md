@@ -368,7 +368,10 @@ Insulators keep `parallel_transport` and `dft_velocity`.
 - **Terminal files.** `qp_wfn_rotations.h5` is always written;
   `WFN_qp.h5` is written when `write_wfn_h5` is set (the default). Both come
   from the accepted final map. They hold the complete energy ladder (window
-  plus tail), the occupation table, μ, the smearing and the table hash. Each
+  plus tail), the occupation table, μ, the smearing and the table hash.
+  `WFN_qp.h5` is written collectively: each rank reads, rotates and writes
+  its own G-slab of every k through `file_io.slab_io`, so no rank holds more
+  than $\approx 5\,N_b N_s \lceil N_G^{\max}/P\rceil \cdot 16$ B of ψ. Each
   file is written to a private sibling, validated through its format owner,
   and made visible by `os.replace`. The run-completion manifest requires both
   names. `postprocess.rotate_wfn_to_qp` reapplies the stored ladder and table;
