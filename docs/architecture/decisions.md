@@ -35,6 +35,10 @@ that (owner; sandbox `TASTE.md` 96).
   owners (`16·⌈Q/P⌉·μ²` per rank) and only the right-hand side moves; with
   `Q < P` the ranks past `Q` idle in the solve. The replicated `16·Q·μ²`
   tier and `LORRAX_ZETA_GATHER_CAP_GIB` are gone.
+* **χ₀, Σ_x and the Coulomb hole stream spin pairs for `n_s > 1`.** The
+  step-occupation χ₀ with the charge vertex, Σ_x and the Coulomb hole build
+  one `(a, b)` spinor block of the Green at a time at full k, whatever the
+  budget.
 
 ## 2026-09-24 — NVIDIA k-convolutions run on nvidia-mathdx, behind one platform router
 

@@ -110,18 +110,12 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int],
     if bool(ordered) and not fermi_dirac:
         raise ValueError("_get_chi_minimax_kernel: ordered is a Fermi-Dirac kernel option")
     # The identity-vertex step response traces the spin pairs elementwise,
-    # chi = sum_ab Gc_ab conj(Gv_ab), so when the whole-spin kernel's live
-    # Greens (Gv, Gc and the unfold transient, ~3 G_tile) exceed the device
-    # target it streams one (a, b) block at a time (phase-1 item A4).
+    # chi = sum_ab Gc_ab conj(Gv_ab), so for ns > 1 it streams one (a, b)
+    # block at a time and never holds the ns^2 Greens (phase-1 item A4).
     spin_pairs = (vertex_pairs is None and not fermi_dirac
                   and face_shape is not None and int(face_shape[3]) > 1
                   and right_face_shape is None
                   and not isinstance(k_unfold_plan, tuple))
-    if spin_pairs:
-        from .greens_function_kernel import spin_pairs_needed
-        spin_pairs = spin_pairs_needed(
-            n_full=nk, n_rmu=int(face_shape[2]), ns=int(face_shape[3]),
-            mesh=mesh_xy, live_green_tiles=3)
     cache_key = (_mesh_key(mesh_xy), kgrid, ffi_dial_key(), n_out,
                  complex_contour, layout, face_shape, right_face_shape,
                  vertex_classes, (tuple(id(p) for p in k_unfold_plan)
