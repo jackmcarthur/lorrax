@@ -1316,9 +1316,11 @@ def _file_order_plan(shape, vshape, spec, itemsize, p, mesh_axes, ds_shape,
     all mesh axes in order, nothing else sharded -- with per-rank file runs of
     at least ``min_run``: written independently, no copy.
 
-    ``(k, rows)``: pieces of one index of every axis before ``k`` by ``rows``
-    rows of axis ``k`` (a multiple of ``p``) by every later axis whole, each
-    resharded to rows over all ranks and written independently.  ``k`` is the
+    ``(k, rows, lead)``: pieces of ``lead`` indices of the lead axis (the last
+    axis before ``k`` with more than one valid index), one index of every other
+    axis before ``k``, ``rows`` rows of axis ``k`` (a multiple of ``p``) and
+    every later axis whole, each resharded to rows of ``k`` over all ranks and
+    written independently.  ``k`` is the
     first axis with at least ``p`` valid rows whose row (the later axes) fits
     the per-rank ``budget``; the axes before it are indexed one at a time.
     Only unsharded axes are cut or indexed -- cutting a sharded axis would make
@@ -1353,48 +1355,60 @@ def _file_order_plan(shape, vshape, spec, itemsize, p, mesh_axes, ds_shape,
         block = (1,) * k + (rows_per_rank,) + tuple(vshape[k + 1:])
         if _file_run_bytes(block, ds_shape, itemsize) < min_run:
             return None
-        return k, rows_per_rank * p
+        # Several indices of the lead axis -- the last axis before k with more
+        # than one valid index -- per piece, while the piece stays within
+        # budget: fewer, larger independent writes (each rank's selection is
+        # then ``lead`` runs of the same length).
+        lead = 1
+        lead_axis = max((a for a in range(k) if int(vshape[a]) > 1), default=None)
+        if lead_axis is not None:
+            lead = max(1, min(int(vshape[lead_axis]),
+                              budget // (rows_per_rank * row)))
+        return k, rows_per_rank * p, lead
     return None
 
 
 @functools.lru_cache(maxsize=None)
-def _file_order_take(mesh, shape, dtype, k, real, height, whole):
-    """Jitted ``(A, starts) -> piece``: one file-order piece, rows over all ranks."""
+def _file_order_take(mesh, shape, dtype, k, sizes, height):
+    """Jitted ``(A, starts) -> piece``: one ``sizes`` block, rows of ``k`` over all ranks."""
     n = len(shape)
     axes = tuple(mesh.axis_names)
     target = NamedSharding(mesh, P(*([None] * k), axes, *([None] * (n - k - 1))))
-    take = int(shape[k]) if whole else real
-    sizes = (1,) * k + (take,) + tuple(int(d) for d in shape[k + 1:])
 
     def piece(a, starts):
         out = jax.lax.dynamic_slice(a, [starts[i] for i in range(n)], sizes)
-        if height > take:
+        if height > sizes[k]:
             pad = [(0, 0)] * n
-            pad[k] = (0, height - take)
+            pad[k] = (0, height - sizes[k])
             out = jnp.pad(out, pad)
         return out
     return jax.jit(piece, out_shardings=target)
 
 
 def _file_order_pieces(A, off, vshape, plan, mesh):
-    """Yield ``(piece, offset, valid_shape)`` for a ``(k, rows)`` plan."""
-    k, rows = plan
+    """Yield ``(piece, offset, valid_shape)`` for a ``(k, rows, lead)`` plan."""
+    k, rows, lead = plan
     p = int(mesh.size)
-    spec = _spec_axes(A.sharding.spec, A.ndim)
-    whole = spec[k] is not None
+    whole = _spec_axes(A.sharding.spec, A.ndim)[k] is not None
+    lead_axis = max((a for a in range(k) if int(vshape[a]) > 1), default=None)
     rep = NamedSharding(mesh, P())
-    for idx in itertools.product(*(range(int(vshape[a])) for a in range(k))):
+    steps = [lead if a == lead_axis else 1 for a in range(k)]
+    for idx in itertools.product(*(range(0, int(vshape[a]), steps[a]) for a in range(k))):
+        # A short last lead block starts earlier, so every piece has one
+        # compiled shape and stays inside the valid extent; the rows it
+        # re-covers get the bytes an earlier piece already wrote.
+        idx = tuple(min(i, int(vshape[a]) - steps[a]) for a, i in enumerate(idx))
         for c0 in range(0, int(vshape[k]), rows):
             real = min(rows, int(vshape[k]) - c0)
-            height = -(-(int(A.shape[k]) if whole else real) // p) * p
-            take = _file_order_take(mesh, tuple(int(d) for d in A.shape),
-                                    A.dtype, k, real, height, whole)
+            take_k = int(A.shape[k]) if whole else real
+            sizes = tuple(steps) + (take_k,) + tuple(int(d) for d in A.shape[k + 1:])
+            take = _file_order_take(mesh, tuple(int(d) for d in A.shape), A.dtype, k,
+                                    sizes, -(-take_k // p) * p)
             starts = device_put_process_local(
-                np.asarray(tuple(idx) + (c0,) + (0,) * (A.ndim - k - 1),
-                           dtype=np.int32), rep)
-            p_off = (tuple(int(off[a]) + int(idx[a]) for a in range(k))
+                np.asarray(idx + (c0,) + (0,) * (A.ndim - k - 1), dtype=np.int32), rep)
+            p_off = (tuple(int(off[a]) + idx[a] for a in range(k))
                      + (int(off[k]) + c0,) + tuple(int(o) for o in off[k + 1:]))
-            p_valid = (1,) * k + (real,) + tuple(int(v) for v in vshape[k + 1:])
+            p_valid = tuple(steps) + (real,) + tuple(int(v) for v in vshape[k + 1:])
             yield take(A, starts), p_off, p_valid
 
 
