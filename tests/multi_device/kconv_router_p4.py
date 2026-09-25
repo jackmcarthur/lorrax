@@ -21,21 +21,21 @@ must resolve to ``mathdx`` on this mesh (asserted, TASTE 30).
    Red twin: the phase rolled by one k.
 3c. ``make_kconv_klead_unfold`` (mode 7, the Σ door from the raw-parent
    Green): within 2 ulp of max|ref| of the chain it replaced (the typed
-   unfold, the spin-rotate FFI, sigma_conv_operand, then mode 2; bitwise today,
-   reported) on the glide plans (ns 2, 4; spin mixing, an antiunitary row),
+   unfold, the spin-rotate FFI, sigma_conv_operand, then mode 2; the load's
+   products are fused, so round-off equal, reported) on the glide plans (ns 2, 4; spin mixing, an antiunitary row),
    A-cubic (48 operations, ns 1) and C3 with a general complex U and q = n/3
    (ns 2, 4; plus nk = 196 at ns 4, the per-bank load).  Red twin: the right
    source table rolled by one slot.
 3d. ``make_kconv_lorentz_unfold`` (mode 8, the four-current Σ door): within
    2 ulp of max|ref| of the Lorentz chain it replaced (the typed unfold,
    mode-3 transforms of G and V, the XLA scan over γ̃ blocks, the forward
-   transform; bitwise today, reported) for the CC, CT and TT classes on the
+   transform; round-off equal through mode 7's fused load, reported) for the CC, CT and TT classes on the
    glide plans (ns 2, 4), a rectangular (charge x current) glide class and C3
    with a general complex U (ns 4).  Red twin: the right source table rolled.
 3e. ``make_kfft_klead_unfold`` (mode 9, an interaction's R-space operand read
    from its q wedge): within 2 ulp of max|ref| of the chain it replaces
-   (``unfold_isdf_operator``, then the mode-3 prep; bitwise on exact phases,
-   reported) on both antiunitary rules for the glide, A-cubic and C3 plans,
+   (``unfold_isdf_operator``, then the mode-3 prep; round-off equal through
+   mode 7's fused load, reported) on both antiunitary rules for the glide, A-cubic and C3 plans,
    and a 3x3 Lorentz block against unfold-then-rotate in XLA.  Red twin: the
    right source table rolled.
 4. The stored-kernel doors (modes 2-5) against NumPy ``np.fft`` on sharded
@@ -459,10 +459,10 @@ def main() -> int:
                 bad.append(f"{r['case']}.{k}={v:.2e} > {lim}")
             if k.startswith("red_") and not v > RED:
                 bad.append(f"{r['case']}.{k}={v:.2e} <= {RED} (red twin did not fire)")
-            # The fused kernels spell every product as the chain they replace,
-            # so today they are bitwise (reported); the gate allows 2 ulp of the
-            # largest value so a compiler that re-contracts the OLD chain does
-            # not turn it red without a physics change (audit L2).
+            # Mode 6 spells every product as the chain it replaces (bitwise today,
+            # reported); modes 7/8/9 form the unfold load with fused products
+            # (owner 2026-09-25: round-off equal is fine; 1.8 ulp at most on these
+            # cases, U2c).  The gate is 2 ulp of the largest value (audit L2).
             if k == "ulp_vs_old_chain" and not v <= 2.0:
                 bad.append(f"{r['case']}.{k}={v:.2f} > 2 ulp of max|ref|")
             # Mode 11 transforms ifftn(G) where the chain it replaces transforms fftn(conj G):
