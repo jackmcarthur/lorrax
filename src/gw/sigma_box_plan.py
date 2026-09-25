@@ -496,7 +496,7 @@ def _rule_cache_store(directory, rule, noise_amplification):
 
 #: Relative cell of the logarithmic grid (units of eta) every build box is
 #: snapped outward to.
-_BUILD_GRID_STEP = 1.0e-3
+_BUILD_GRID_STEP = 1.0e-4
 
 
 def _snap_outward(x, eta, outward):
@@ -520,11 +520,13 @@ def _build_box(box, eta, *, widen):
     by round-off (extreme shared-pole edges differ 1e-9-4e-8 relative between
     two exact GEMM orders) otherwise lands on a different rule. Every Fe 4^3
     bispinor window rule differed between low_mem_bands true and false, and
-    eqp1 by 0.32 meV (P2-E, 2026-09-24). On the 0.1% grid a perturbed
+    eqp1 by 0.32 meV (P2-E, 2026-09-24). On the 1e-4 grid a perturbed
     request maps to the same build box, hence the same rule bit for bit,
-    unless it straddles a cell edge (probability ~ perturbation / 1e-3).
-    Near edges set the crossing rank and move by at most one cell (a 3%
-    all-edge widening cost 67 pairs on Na).
+    unless it straddles a cell edge (probability ~ perturbation / 1e-4).
+    The cell is kept that fine because the fixed-N bracket accepts node
+    counts in 10% steps: a marginal certification flips when its box grows,
+    and 0.1% cells added 5% tau pairs on CrI3 8x8 SC (1e-4 cells: see the
+    commit).
     """
     if widen:
         extra = 0.01 * max(box[1] - box[0], eta)
