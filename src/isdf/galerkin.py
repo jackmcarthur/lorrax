@@ -1223,7 +1223,12 @@ def _make_rows_sketch_kernel(
     def _accum(omega, rows, destination, active, acc):
         # Upstream applies a REAL Gaussian left sketch without conjugating
         # the wavefunction columns; each device contracts its own r shard.
-        part = jnp.einsum('asr,csr->ac', omega, rows[0], optimize=True)
+        # Omega is real, so the product is two real GEMMs (half the flops
+        # of the complex GEMM a promoted Omega would take).
+        rr = rows[0]
+        part = jax.lax.complex(
+            jnp.einsum('asr,csr->ac', omega, jnp.real(rr), optimize=True),
+            jnp.einsum('asr,csr->ac', omega, jnp.imag(rr), optimize=True))
         part = jnp.where(active[None, :], part, 0.0)
         return acc.at[:, destination].add(part)
 
