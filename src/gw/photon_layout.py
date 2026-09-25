@@ -184,10 +184,10 @@ def _empty(nq, layout, mesh_xy, dtype):
     return _zero_cache[key]()
 
 
-def _insert_program(layout, mesh_xy, nq, p_left, p_right):
-    """Shape-specialized insert; offsets/valid lengths stay runtime data."""
+def _insert_program(layout, mesh_xy, nq, p_left, p_right, add=False):
+    """Shape-specialized insert (``add``: accumulate); offsets/valid lengths stay runtime data."""
     key = (_mesh_key(mesh_xy), int(nq), layout.packed_extent,
-           int(p_left), int(p_right))
+           int(p_left), int(p_right), bool(add))
     if key in _insert_cache:
         return _insert_cache[key]
     from common.shard_map import shard_map
@@ -208,9 +208,10 @@ def _insert_program(layout, mesh_xy, nq, p_left, p_right):
         valid_right = y0 + jnp.arange(p_right // side) < n_right
         block = jnp.where(
             valid_left[None, :, None] & valid_right[None, None, :], block, 0)
-        return jax.lax.dynamic_update_slice(
-            acc, block, (jnp.asarray(0, dtype=jnp.int32),
-                         off_left, off_right))
+        offsets = (jnp.asarray(0, dtype=jnp.int32), off_left, off_right)
+        if add:
+            block = block + jax.lax.dynamic_slice(acc, offsets, block.shape)
+        return jax.lax.dynamic_update_slice(acc, block, offsets)
 
     @partial(jax.jit,
              in_shardings=(nat, nat, rep0, rep0, rep0, rep0),
@@ -223,14 +224,14 @@ def _insert_program(layout, mesh_xy, nq, p_left, p_right):
     return insert
 
 
-def _insert(packed, block, layout, A, B, mesh_xy):
+def _insert(packed, block, layout, A, B, mesh_xy, *, add=False):
     expected = layout.block_shape(int(packed.shape[0]), A, B)
     if tuple(block.shape) != expected:
         raise ValueError(f"photon block ({A},{B}) shape {block.shape} != {expected}")
     scalar = lambda x: jnp.asarray(int(x), dtype=jnp.int32)
     return _insert_program(
         layout, mesh_xy, int(packed.shape[0]),
-        layout.carrier_extent(A), layout.carrier_extent(B))(
+        layout.carrier_extent(A), layout.carrier_extent(B), add=add)(
             packed, block,
             scalar(layout.local_offset(A)), scalar(layout.local_offset(B)),
             scalar(layout.logical_extent(A)), scalar(layout.logical_extent(B)))

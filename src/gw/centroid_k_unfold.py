@@ -43,6 +43,10 @@ def _readonly(value, dtype) -> np.ndarray:
     return out
 
 
+#: ``id(plan) -> (plan, dirac_halves())``; the plan is held so its id stays unique.
+_DIRAC_HALVES: dict = {}
+
+
 class OperationClasses(NamedTuple):
     """Full-k rows grouped by operation (:meth:`CentroidKUnfoldPlan.operation_classes`).
 
@@ -191,6 +195,40 @@ class CentroidKUnfoldPlan:
             antiunitary=ops >= int(self.n_sym_spatial),
             counts=counts, class_of_row=class_of_row.astype(np.int32),
             local_perm=perm.astype(np.int32), parent_rows=rows.astype(np.int32))
+
+    def dirac_halves(self):
+        """The four-spinor action split into its Pauli halves: ``(plan, parity)``.
+
+        ``symmetry_maps.spinor_rotation_for_sym_row`` builds the bispinor
+        action as ``diag(U, p U)`` with ``p = det R`` per row, so an operator
+        block between spin halves ``h`` and ``h'`` transports with ``U`` on
+        both endpoints and the sign ``p^(h+h')``.  Returns this plan with
+        ``nspinor = 2`` and the ``U`` rows, and ``p`` per full-k row (float);
+        one object per plan, so compiled consumers keep their cache.
+        Refuses a spin table that is not of that form.
+        """
+        hit = _DIRAC_HALVES.get(id(self))
+        if hit is not None and hit[0] is self:
+            return hit[1]
+        if int(self.nspinor) != 4:
+            raise ValueError("dirac_halves: the plan is not four-spinor")
+        four = np.asarray(self.spin_action_full)
+        upper, lower = four[:, :2, :2], four[:, 2:, 2:]
+        norm = np.sum(np.abs(upper) ** 2, axis=(1, 2))
+        parity = np.real(np.sum(lower * np.conj(upper), axis=(1, 2))) / norm
+        if (np.any(np.abs(four[:, :2, 2:]) > 1e-12) or np.any(np.abs(four[:, 2:, :2]) > 1e-12)
+                or not np.allclose(lower, parity[:, None, None] * upper, atol=1e-12)
+                or not np.allclose(np.abs(parity), 1.0, atol=1e-12)):
+            raise ValueError(
+                "GATE dirac_halves: got a four-spinor action that is not diag(U, pU) "
+                "with p = +-1; want the typed bispinor action; why: the spin-half "
+                "blocks of an operator transport independently only under it")
+        import dataclasses
+        half = dataclasses.replace(
+            self, spin_action_full=_readonly(upper, np.complex128), nspinor=2)
+        out = (half, _readonly(np.rint(parity), np.float64))
+        _DIRAC_HALVES[id(self)] = (self, out)
+        return out
 
     @staticmethod
     def transport_classes(values, local_perm, *, class_axis, mu_axis,
