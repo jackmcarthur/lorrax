@@ -2428,7 +2428,7 @@ def _enforce_required_ffi(mesh, *, announce: bool = True) -> None:
     log.  An import failure of the gate modules themselves is a broken
     build and propagates for the same reason.
     """
-    from ffi.fft import GATE as _FFT_GATE, require_kconv
+    from ffi.fft import GATE as _FFT_GATE, require_fourier_plan, require_kconv
     from ffi.gemm import GATE as _GEMM_GATE
 
     for gate in (_FFT_GATE, _GEMM_GATE):
@@ -2437,6 +2437,8 @@ def _enforce_required_ffi(mesh, *, announce: bool = True) -> None:
     # refuses here, at startup, when its backend cannot be served (on CUDA a
     # missing nvidia-mathdx wheel; decisions.md 2026-09-24).
     require_kconv(mesh, announce=announce)
+    # LocalFourierPlan's CUDA leg is one custom call in the same library.
+    require_fourier_plan(mesh, announce=announce)
 
 
 def _ffi_dial_facts() -> list:

@@ -7,8 +7,6 @@ embedding gather and restriction take.  The contract is value-level:
 relative error ≤ 1e-12 in complex128 against ``np.fft`` on the embedded input.
 """
 
-import ctypes
-import os
 import zlib
 
 import numpy as np
@@ -26,30 +24,17 @@ BACKENDS = ("__gemm__", "__fft__")
 
 
 LEGS = ("xla", "ffi") if jax.default_backend() == "gpu" else ("xla",)
-_PROBE = []
-
-
-def _register_ffi_target():
-    """The CUDA leg's target: the bundle's, or a probe .so built by
-    ``tests/bench/build_fourier_plan_probe.sh`` (``LORRAX_FOURIER_PLAN_SO``)."""
-    if _PROBE:
-        return True
-    so = os.environ.get("LORRAX_FOURIER_PLAN_SO")
-    if not so:
-        return False
-    lib = ctypes.CDLL(so)
-    jax.ffi.register_ffi_target("lorrax_fourier_plan",
-                                jax.ffi.pycapsule(lib.LorraxFourierPlanCudaFfi), platform="CUDA")
-    _PROBE.append(lib)
-    return True
 
 
 @pytest.fixture(autouse=True, params=LEGS)
 def leg(request, monkeypatch):
     """Every test runs on each leg the platform has: XLA ops, and on CUDA the
-    one-custom-call leg."""
-    if request.param == "ffi" and not _register_ffi_target():
-        pytest.skip("CUDA leg: set LORRAX_FOURIER_PLAN_SO (the target is not in the bundle yet)")
+    one-custom-call leg (the bundle's ``lorrax_fourier_plan``; a library
+    without it fails here, never skips)."""
+    if request.param == "ffi":
+        from ffi.common import ffi_loader
+        ok, why = ffi_loader.probe_target("lorrax_fourier_plan", "CUDA")
+        assert ok, why
     monkeypatch.setattr(fourier_plan, "_default_leg", lambda: request.param)
     return request.param
 
@@ -316,3 +301,28 @@ def test_refusals():
         LocalFourierPlan((8,), (-1,), sign=0)
     with pytest.raises(ValueError, match="repeats"):
         LocalFourierPlan((8,), (-1,), sign=-1, in_support={-1: np.array([1, 9])})
+
+
+def test_in_gather_plane_from_cylinder():
+    """The cylinder-plane form (the route-G ζ planes): x holds the occupied
+    cells of an (n_b, n_c) plane; plain and slab forms against numpy."""
+    from jax.sharding import Mesh
+    nb, nc = 24, 20
+    h = lambda n: np.where(np.arange(n) < n // 2, np.arange(n), np.arange(n) - n)
+    occ = (h(nb)[:, None] ** 2 + h(nc)[None, :] ** 2 < 40).ravel()
+    n_col = int(occ.sum())
+    pfc = np.full(nb * nc, n_col, np.int32)
+    pfc[occ] = np.arange(n_col)
+    mesh = Mesh(np.array(jax.devices()[:1]).reshape(1, 1), ("x", "y"))
+    plan = LocalFourierPlan((nb, nc), (-2, -1), sign=-1, norm="backward",
+                            in_gather=(pfc, n_col), mesh=mesh)
+    rng = _rng("gather")
+    Fa = _crandn(rng, (2, 5, 3, n_col))
+    plane = np.where(pfc < n_col, Fa[..., np.clip(pfc, 0, n_col - 1)], 0)
+    ref = np.fft.fftn(plane.reshape(Fa.shape[:-1] + (nb, nc)), axes=(-2, -1))
+    y = np.asarray(jax.jit(plan)(jnp.asarray(Fa)))
+    assert np.linalg.norm(y - ref) <= RTOL * np.linalg.norm(ref)
+    ys = np.asarray(jax.jit(lambda a, s: plan(a, s, 2))(jnp.asarray(Fa), jnp.int32(2)))
+    assert np.linalg.norm(ys - ref[:, 2:4]) <= RTOL * np.linalg.norm(ref[:, 2:4])
+    with pytest.raises(ValueError, match="in_gather"):
+        LocalFourierPlan((nb, nc), (-2, -1), sign=1, in_gather=(pfc, n_col), mesh=mesh)

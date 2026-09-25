@@ -41,6 +41,16 @@ bounded constant.
 The matrices are numpy arrays owned by the plan.  Under ``jit`` or inside a
 ``shard_map`` body they become constants of the executable; they are never
 rebuilt per call.
+
+A plane read from a cylinder (``in_gather=(plane_from_col, n_col)``, 2-D,
+forward, ``norm='backward'``) is not separable: ``x (..., n_col)`` holds the
+occupied cells of the ``(n_b, n_c)`` plane, ``plane_from_col[cell]`` the
+column of each cell (``n_col`` on an empty one), and the plan returns
+``fftn(take(x, plane_from_col, mode='fill').reshape(..., n_b, n_c))``.  It is
+served by :func:`ffi.fft.make_plane_fft_gather`: the cuFFTDx gather-on-load
+kernel on CUDA when it serves the plane (the zero plane is never written),
+else the static-run concatenate + one 2-D FFT.  ``plan(Fa, start, size)``
+reads the planes ``[start, start + size)`` of axis 1 of ``Fa`` in place.
 """
 
 from __future__ import annotations
@@ -124,7 +134,9 @@ class LocalFourierPlan:
     cost when the GEMM chain can write that order directly (see ``_route``).
     ``device_kind`` defaults to ``jax.devices()[0].device_kind``.
     ``plan.stages`` lists ``(axis, 'gemm'|'fft', n_in, n_out)``; GEMM stages
-    of equal ``n_out/n_in`` may execute in either order.
+    of equal ``n_out/n_in`` may execute in either order.  ``in_gather`` (with
+    the caller's ``mesh``) is the cylinder-plane form of the module docstring;
+    only it takes ``plan(x, start, size)``.
     """
 
     def __init__(self, extents, axes, *, sign: int, norm: str | None = "backward",
@@ -132,6 +144,7 @@ class LocalFourierPlan:
                  in_support: Mapping[int, np.ndarray] | None = None,
                  out_support: Mapping[int, np.ndarray] | None = None,
                  out_perm: tuple[int, ...] | None = None,
+                 in_gather: tuple | None = None, mesh=None,
                  device_kind: str | None = None):
         extents, axes = tuple(int(n) for n in extents), tuple(int(a) for a in axes)
         if len(extents) != len(axes) or len(set(axes)) != len(axes):
@@ -145,6 +158,21 @@ class LocalFourierPlan:
         if not jnp.issubdtype(self.dtype, jnp.complexfloating):
             raise ValueError(f"LocalFourierPlan: dtype must be complex, got {self.dtype}")
         in_support, out_support = dict(in_support or {}), dict(out_support or {})
+        self._gather = None
+        if in_gather is not None:
+            if (axes != (-2, -1) or sign != -1 or (norm or "backward") != "backward"
+                    or in_support or out_support or out_perm is not None or mesh is None):
+                raise ValueError(
+                    "LocalFourierPlan: in_gather is the forward 'backward'-norm plane "
+                    "transform over axes (-2, -1) with no supports or out_perm, and "
+                    f"needs the caller's mesh; got extents {extents}, axes {axes}, "
+                    f"sign {sign}, norm {norm!r}, mesh {mesh!r}")
+            from ffi.fft import make_plane_fft_gather
+            plane_from_col, n_col = in_gather
+            self._gather = make_plane_fft_gather(mesh, plane_from_col, int(n_col), extents)
+            self.extents, self.axes, self.sign, self.norm = extents, axes, sign, norm
+            self.stages = [(axes, "gather-fft", int(n_col), extents[0] * extents[1])]
+            return
         for name, sup in (("in_support", in_support), ("out_support", out_support)):
             if set(sup) - set(axes):
                 raise ValueError(f"LocalFourierPlan: {name} keys {sorted(sup)} "
@@ -200,7 +228,11 @@ class LocalFourierPlan:
         self._in_extent = {ax: (np.asarray(in_support[ax]).size if ax in in_support else n)
                            for n, ax in zip(extents, axes)}
 
-    def __call__(self, x):
+    def __call__(self, x, start=None, size=None):
+        if self._gather is not None:
+            return self._gather(x) if start is None else self._gather(x, start, size)
+        if start is not None:
+            raise ValueError("LocalFourierPlan: the slab form (start, size) is in_gather only")
         if x.dtype != self.dtype:
             raise TypeError(f"LocalFourierPlan: x.dtype {x.dtype} != plan dtype {self.dtype}")
         for ax, k in self._in_extent.items():
