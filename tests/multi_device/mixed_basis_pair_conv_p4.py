@@ -31,7 +31,7 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__
 sys.path.insert(0, os.path.join(_ROOT, "src"))
 sys.path.insert(0, os.path.join(_ROOT, "tests"))
 
-from runtime import initialize_communicator_stack, finalize_process  # noqa: E402
+from runtime import initialize_communicator_stack, run_main_and_finalize  # noqa: E402
 
 RUNTIME = initialize_communicator_stack(platform="gpu")
 
@@ -152,8 +152,4 @@ def main():
 
 
 if __name__ == "__main__":
-    rc = 1
-    try:
-        rc = main()
-    finally:
-        finalize_process(rc)
+    run_main_and_finalize(main)       # keeps a failure's traceback, then the ordered exit
