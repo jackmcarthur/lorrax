@@ -4,8 +4,9 @@
 multi-GPU/CPU implementation of an $O(N^3)$-scaling GW formalism, accelerated by
 Interpolative Separable Density Fitting (ISDF) and real-frequency-axis integration.
 The main GW driver is **GWJAX** (`gw.gw_jax`): it reads BerkeleyGW-format plane-wave
-DFT wavefunctions (`WFN.h5`) and computes quasiparticle corrections via static COHSEX
-or GN-PPM (Godby–Needs Generalized Plasmon Pole) frequency dependence.
+DFT wavefunctions (`WFN.h5`) and computes quasiparticle corrections using
+static or frequency-dependent screening, including the
+[shared-pole W model](theory/shared-pole-w-model.md).
 
 - **Input**: DFT wavefunctions on a plane-wave grid, symmetry maps, and k-point sampling
 - **Core idea**: replace dense charge-density products with a compact ISDF basis defined by centroids $r_\mu$
@@ -45,12 +46,12 @@ See the [Quickstart](quickstart.md) for the worked example, and
 LORRAX starts from a BerkeleyGW-format `WFN.h5`; producing one from a crystal is
 [Inputs from DFT](preprocessing.md).
 
-1. Charge density from selected bands → choose ISDF points $r_\mu$ via k-means/CVT
-2. Read wavefunctions $c_{nk}(G)$, FFT to real space $\psi_{nk}(r)$
-3. For each $q$, construct $\zeta_{q,\mu}(r)$ by solving $C_q \zeta_q = Z_q$ by least-squares
-4. Compute $V_{q,\mu,\nu}$ from $\zeta_{q,\mu}$ in G-space with the Coulomb kernel $v_q(G)$
+1. [Select ISDF points](theory/centroid-selection.md) from the requested band-pair feature metric.
+2. Load reciprocal wavefunctions and sample their centroid faces.
+3. [Fit $Z_q$ in G space and solve for $\zeta_q$](architecture/zeta_fit_mubatch.md) in centroid batches.
+4. [Build $V_q$](theory/isdf-zeta-vq.md) from the interpolation vectors and Coulomb kernel.
 5. Build the Green's function $G$ and (optionally) $\chi_0$ and screened interaction $W$
-6. Form $\Sigma_{X/SX/COH}$ and project to the band representation $\Sigma_{kij}$
+6. Form the requested self-energy and project to the band representation $\Sigma_{kij}$.
 
 ## Where each fact lives {#register}
 
