@@ -3245,8 +3245,8 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             raise ValueError(
                 f"SC map 0: DFT table {tuple(inputs.e_dft_active_kn_ry.shape)} "
                 f"is not the full-BZ window {tuple(E_full.shape)}")
-        E_full = jax.device_put(
-            jnp.asarray(inputs.e_dft_active_kn_ry, dtype=E_full.dtype),
+        E_full = device_put_process_local(
+            np.asarray(inputs.e_dft_active_kn_ry, dtype=E_full.dtype),
             E_full.sharding)
 
     # ENTRY-SOLVED metallic occupations: one MP1 state per map CALL, from
