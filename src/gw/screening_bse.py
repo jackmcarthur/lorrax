@@ -228,7 +228,7 @@ def _wedge_field(wedge, names, dtype):
 #: exactly 0.0 / 1.0 (or the file's spin convention's 2.0) into
 #: ``mf_header/kpoints/occ``, float64 round-trips through HDF5 exactly, and
 #: LORRAX's own writer sets the array from a step function
-#: (``file_io/wfn_writer.py``:103).  ABOVE it there is only physics: an
+#: (``file_io.wfn_writer.wfn_header_tables``).  ABOVE it there is only physics: an
 #: occupation within 1e-6 of a step value sits more than 13 kT from E_F for
 #: any smearing a GW deck is run at, contributes nothing to a pair basis and
 #: cannot be what makes a system metallic.  So the band between the two is
