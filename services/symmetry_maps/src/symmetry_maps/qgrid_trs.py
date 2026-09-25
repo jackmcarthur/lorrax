@@ -565,11 +565,25 @@ def project_little_group_operator(
         mapped = shard_map(local, mesh=mesh,
                            in_specs=(P(None, "x", "y"),)*2,
                            out_specs=P(None, "x", "y"), check_vma=False)
+        # The (mu, nu) transpose of an ('x','y')-tiled operator: each rank
+        # transposes its tile and sends it to its transpose partner, rank
+        # (i, j) -> (j, i), on the square mesh.  A GSPMD swapaxes on this
+        # layout all-gathers the operator instead.  (LORRAX's twin is
+        # common.collectives.transpose_xy; this service cannot import it.)
+        if px != py:
+            raise ValueError(
+                f"little-group projection: the transpose partner needs a "
+                f"square mesh, got {px}x{py}")
+        transpose_tiles = shard_map(
+            lambda t: jax.lax.ppermute(
+                jnp.swapaxes(t, -2, -1), ("x", "y"),
+                [(i*py + j, j*py + i) for i in range(px) for j in range(py)]),
+            mesh=mesh, in_specs=P(None, "x", "y"), out_specs=P(None, "x", "y"))
         @jax.jit
         def project(plus, partner):
             average = mapped(plus, partner)
             transposed = jax.lax.with_sharding_constraint(
-                jnp.swapaxes(average, -2, -1), sh)
+                transpose_tiles(average), sh)
             return average, transposed
         compiled = _LITTLE_GROUP_PROJECTORS[key] = project
     return compiled(operator, transposed_partner)
