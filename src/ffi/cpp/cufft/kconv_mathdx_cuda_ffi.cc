@@ -883,7 +883,7 @@ struct PlaneGather {
 constexpr int NB = LRX_NX, NC = LRX_NY;
 constexpr int B1 = LRX_NZ, B2 = NB / B1, C1 = LRX_NS, C2 = NC / C1;
 constexpr int LD = NC | 1;             // odd row pitch: the column lines read conflict-free
-constexpr int ROWS = LRX_ROWS;         // occupied-row capacity: the table's rows rounded up to 8 (<= NB)
+constexpr int ROWS = LRX_ROWS;         // the table's occupied rows (the loops also guard the run-time count)
 constexpr bool STAGE = LRX_STAGE;      // a (ROWS, NC) staging block per plane fits beside the planes
 constexpr int PB = LRX_PB;             // planes per block
 
@@ -937,9 +937,8 @@ __device__ __forceinline__ void pfa_line(lrx_c2* base, int es, int i, const unsi
 // resident count).  With STAGE the next group's occupied cells are gathered
 // asynchronously (lrx_async, cp.async) into a (ROWS, NC) staging block per
 // plane while this group's passes run; the first row pass reads them there.
-// The table and its row count are run-time arguments; ROWS is only a capacity
-// (loops run over it with a guard), so the index math divides by constants
-// and one cubin serves every support whose row count rounds to the same class.
+// The table is a run-time argument; its row count ROWS is compiled in, so the
+// index math divides by constants (a run-time count cost 2-15% at 25^2-54^2).
 extern "C" __global__ void __launch_bounds__(LRX_THREADS, LRX_RB) lrx_kconv(
     const lrx_c2* __restrict__ fin, lrx_c2* __restrict__ yout, PlaneGather g) {
     extern __shared__ lrx_c2 buf[];                  // PB planes of (NB, LD), then PB staging (ROWS, NC)
@@ -1198,8 +1197,7 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
     long long plane_minb = 1;                          // mode 10: blocks per SM (LRX_RB)
     long long plane_static = 0;                        // mode 10: its static tables, bytes
     long long plane_stage = 0;                         // mode 10: one plane's staging block, bytes (0 = off)
-    // Mode 10 packs (c1, row capacity) into ns: the handler rounds the table's
-    // occupied rows up to a multiple of 8 (at most n_b).
+    // Mode 10 packs (c1, occupied rows) into ns.
     const int plane_c1 = ns & 255, plane_rows = ns >> 8;
     if (mode == 10) {                                  // whole (n_b, n_c|1) planes per block
         row_bytes = 16LL * nkx * (nky | 1);
@@ -1958,9 +1956,10 @@ static ffi::Error PlaneFftGather(cudaStream_t stream, ffi::AnyBuffer F, ffi::Any
     const long long planes = A * n_pg * inner;
     if (planes == 0) return ffi::Error::Success();
     const Built* k = nullptr;
-    // ns carries (c1, row capacity): the occupied rows rounded up to 8, at most n_b,
-    // so supports whose row counts round alike share one image.
-    const int64_t row_cap = std::max<int64_t>(1, std::min<int64_t>(nb, (gd[0] + 7) / 8 * 8));
+    // ns carries (c1, occupied rows): the passes' trip counts and the staging are
+    // compile-time, so every index divisor is a constant.  A door's table is fixed
+    // for its run, so this is one image per run, as keying on the shape alone was.
+    const int64_t row_cap = std::max<int64_t>(1, gd[0]);
     ffi::Error e = build(10, static_cast<int>(nb), static_cast<int>(nc), static_cast<int>(b1),
                          static_cast<int>(c1 | (row_cap << 8)), false, mathdx_root, cubin_dir, &k);
     if (!e.success()) return e;
