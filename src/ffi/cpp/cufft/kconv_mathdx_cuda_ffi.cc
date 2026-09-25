@@ -811,7 +811,7 @@ struct PlaneGather {
 constexpr int NB = LRX_NX, NC = LRX_NY;
 constexpr int B1 = LRX_NZ, B2 = NB / B1, C1 = LRX_NS, C2 = NC / C1;
 constexpr int LD = NC | 1;             // odd row pitch: the column lines read conflict-free
-constexpr int ROWS = LRX_ROWS;         // occupied rows of the door's table (static per door)
+constexpr int ROWS = LRX_ROWS;         // staging capacity: the table's occupied rows, rounded up to 8
 constexpr bool STAGE = LRX_STAGE;      // a (ROWS, NC) staging block per plane fits beside the planes
 
 template <int M>
@@ -872,9 +872,10 @@ extern "C" __global__ void __launch_bounds__(LRX_THREADS, LRX_RB) lrx_kconv(
     __shared__ unsigned char live[NB];
     __shared__ int rowb[NB];
     __shared__ long long foff[2][PB];
+    const int rows = static_cast<int>(g.rows), rn = rows * NC;   // rows <= ROWS
     for (int b = threadIdx.x; b < NB; b += blockDim.x) live[b] = 0;
     __syncthreads();
-    for (int r = threadIdx.x; r < ROWS; r += blockDim.x) { rowb[r] = g.row_of[r]; live[g.row_of[r]] = 1; }
+    for (int r = threadIdx.x; r < rows; r += blockDim.x) { rowb[r] = g.row_of[r]; live[g.row_of[r]] = 1; }
     // Output plane (a, j, r) of Y (A, n_pg, inner) reads F plane (a, start + j, r)
     // of F (A, s_len, inner): the slab F[:, start:start+n_pg] in place.
     long long st = *g.start;
@@ -891,9 +892,9 @@ extern "C" __global__ void __launch_bounds__(LRX_THREADS, LRX_RB) lrx_kconv(
             foff[fs][threadIdx.x] = ((a * g.s_len + st) * g.inner + rem) * g.n_col;
         }
         __syncthreads();
-        for (int t = threadIdx.x; t < np * SS; t += blockDim.x) {
-            const int q = t / SS, u = t - q * SS, col = g.gidx[u];
-            lrx_c2* dst = STAGE ? stg + t : buf + q * PS + rowb[u / NC] * LD + (u - (u / NC) * NC);
+        for (int t = threadIdx.x; t < np * rn; t += blockDim.x) {
+            const int q = t / rn, u = t - q * rn, col = g.gidx[u];
+            lrx_c2* dst = STAGE ? stg + q * SS + u : buf + q * PS + rowb[u / NC] * LD + (u - (u / NC) * NC);
             lrx_async::cell16(dst, fin + foff[fs][q] + (col >= 0 ? col : 0), col >= 0);
         }
         lrx_async::commit();
@@ -907,8 +908,8 @@ extern "C" __global__ void __launch_bounds__(LRX_THREADS, LRX_RB) lrx_kconv(
         __syncthreads();
         // Row FFTs (along c) on the occupied rows only; with STAGE the first
         // factor pass reads the staged rows and writes the planes.
-        for (int l = threadIdx.x; l < np * ROWS * C2; l += blockDim.x) {
-            const int q = l / (ROWS * C2), u = l - q * ROWS * C2, r = u / C2;
+        for (int l = threadIdx.x; l < np * rows * C2; l += blockDim.x) {
+            const int q = l / (rows * C2), u = l - q * rows * C2, r = u / C2;
             pfa_line<NC, C1, C2, true>(buf + q * PS + rowb[r] * LD, 1, u % C2, nullptr,
                                        STAGE ? stg + q * SS + r * NC : nullptr);
         }
@@ -916,8 +917,8 @@ extern "C" __global__ void __launch_bounds__(LRX_THREADS, LRX_RB) lrx_kconv(
         const long long gn = gi + gridDim.x;
         if (STAGE && gn < groups) { fs ^= 1; issue(gn, fs); }   // staging is free: prefetch
         if constexpr (C2 > 1) {
-            for (int l = threadIdx.x; l < np * ROWS * C1; l += blockDim.x) {
-                const int q = l / (ROWS * C1), u = l - q * ROWS * C1;
+            for (int l = threadIdx.x; l < np * rows * C1; l += blockDim.x) {
+                const int q = l / (rows * C1), u = l - q * rows * C1;
                 pfa_line<NC, C1, C2, false>(buf + q * PS + rowb[u / C1] * LD, 1, u % C1, nullptr);
             }
             __syncthreads();
@@ -1114,7 +1115,9 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
     long long plane_minb = 1;                          // mode 10: blocks per SM (LRX_RB)
     long long plane_static = 0;                        // mode 10: its static tables, bytes
     long long plane_stage = 0;                         // mode 10: one plane's staging block, bytes (0 = off)
-    const int plane_c1 = ns & 255, plane_rows = ns >> 8; // mode 10 packs (c1, occupied rows) into ns
+    // mode 10 packs (c1, staging rows) into ns; the handler rounds the table's
+    // occupied rows up to a multiple of 8 so supports of similar size share a cubin.
+    const int plane_c1 = ns & 255, plane_rows = ns >> 8;
     if (mode == 10) {                                  // whole (n_b, n_c|1) planes per block
         row_bytes = 16LL * nkx * (nky | 1);
         // The kernel's static tables live[n_b] + rowb[n_b] (int) + foff[2][PB] (long long)
@@ -1811,9 +1814,10 @@ static ffi::Error PlaneFftGather(cudaStream_t stream, ffi::AnyBuffer F, ffi::Any
     const long long planes = A * n_pg * inner;
     if (planes == 0) return ffi::Error::Success();
     const Built* k = nullptr;
-    // ns carries (c1, occupied rows): the rows size the staging and unroll the passes.
+    // ns carries (c1, staging rows): the occupied rows rounded up to 8, at most n_b.
+    const int64_t stage_rows = std::min<int64_t>(nb, (gd[0] + 7) / 8 * 8);
     ffi::Error e = build(10, static_cast<int>(nb), static_cast<int>(nc), static_cast<int>(b1),
-                         static_cast<int>(c1 | (gd[0] << 8)), false, mathdx_root, cubin_dir, &k);
+                         static_cast<int>(c1 | (stage_rows << 8)), false, mathdx_root, cubin_dir, &k);
     if (!e.success()) return e;
     PlaneGather g{static_cast<const int*>(gidx.untyped_data()), static_cast<const int*>(row_of.untyped_data()),
                   static_cast<const int*>(start.untyped_data()), gd[0], fd[fd.size() - 1], planes, S, n_pg,
