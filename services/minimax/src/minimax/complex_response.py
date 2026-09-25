@@ -9,6 +9,8 @@ d/d(z^2).
 import numpy as np
 from scipy import linalg as la
 
+from .uniform_rule import _pinned_blas_threads
+
 RESPONSE_RULE_CAPACITY = 192
 # Node slots of one rule: a shared set uses at most one pencil's capacity; a
 # single sample whose forward and reverse poles need separate sets uses two.
@@ -202,6 +204,12 @@ def response_group_rules(lo_ry, hi_ry, z_ry, *, rel_tol=1e-8, previous=None,
                          decay_rate=0.):
     """Shared complex-time rules for a group of response samples.
 
+    Built at the Sigma rule builder's pinned BLAS thread count: the Hankel
+    QR/SVD, eigvals and least squares sum in a thread-count dependent order,
+    and a different order picks different node times (Fe 4^3 map-1 group:
+    one node count, three time digests at 8, 16 and 32 threads, P2-S
+    2026-09-25). The shared-pole W poles inherit these rules.
+
     Every node t is ONE Green-pair evaluation A(t): forward rows use the
     exponential exp[-(d-reference_ry)*t] and fit 1/(d-z); reverse rows use
     conj(A(t)), i.e. the exponential at conj(t), and fit 1/(d+z). A group
@@ -252,4 +260,5 @@ def response_group_rules(lo_ry, hi_ry, z_ry, *, rel_tol=1e-8, previous=None,
         half = len(members)//2
         return build(members[:half]) + build(members[half:])
 
-    return build(list(range(len(z))))
+    with _pinned_blas_threads():
+        return build(list(range(len(z))))
