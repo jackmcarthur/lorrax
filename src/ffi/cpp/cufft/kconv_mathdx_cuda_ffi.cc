@@ -1711,11 +1711,16 @@ using nvrtc::toolkit_include;
 
 // The tile-table plan of modes 7 and 11 (kbox_stage.cuh UnfoldTiles).  A block holds tp pairs'
 // bank (bank_pair bytes each) and the tables; the load needs <= 64 registers at 256 threads, so
-// shared memory sets the residency, up to four blocks per SM.  The plan takes the tile, at most
-// tp_max pairs (a power of two), that keeps the most blocks resident, the larger tile on a tie,
-// and at least two blocks (one block per SM serialises its phases: U2b, ncu); tp = 0: none.
+// shared memory sets the residency, up to four blocks per SM, and never fewer than two (one
+// block per SM serialises its phases: U2b, ncu).  Among the tiles of at most tp_max pairs (a
+// power of two): most_blocks takes the one that keeps the most blocks resident (mode 11: one
+// transform and a reduction per tile), else the largest (mode 7: two transforms and a store per
+// tile, whose axis passes idle a block below ~256 lines); tp = 0: none fits.  Measured on the
+// 6x6 bispinor harnesses (A100): mode 11 96.6 ms at 1 pair x 4 blocks vs 100.7 at 2 x 2;
+// mode 7 74.6 ms at 2 pairs x 2 blocks vs 80.5 at 1 x 4.
 struct TilePlan { int tp = 0, blocks = 0; long long smem = 0; std::string err; };
-static TilePlan tile_table_plan(int dev, int tp_max, long long bank_pair, int nk, int ns, int nw) {
+static TilePlan tile_table_plan(int dev, int tp_max, long long bank_pair, int nk, int ns, int nw,
+                                bool most_blocks) {
     TilePlan p;
     int smem_sm = 0, smem_rsv = 0, optin = 0;
     if (cudaDeviceGetAttribute(&smem_sm, cudaDevAttrMaxSharedMemoryPerMultiprocessor, dev) != cudaSuccess ||
@@ -1728,6 +1733,7 @@ static TilePlan tile_table_plan(int dev, int tp_max, long long bank_pair, int nk
         const long long blk = tp * bank_pair + lrx_kbox::UnfoldTiles{nk, ns, ns, tp, nw}.bytes();
         const int nb = blk <= optin ? static_cast<int>(std::min<long long>(4, smem_sm / (blk + smem_rsv))) : 0;
         if (nb >= 2 && nb > p.blocks) { p.tp = tp; p.blocks = nb; p.smem = blk; }
+        if (!most_blocks && p.tp) break;
     }
     return p;
 }
@@ -1794,7 +1800,7 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
             // two or more blocks per SM; none fits: the register load at the plan's tile.
             if (cc_major >= 8 && kplan.threads == kThreads) {
                 const TilePlan tt = tile_table_plan(dev, kplan.tr, static_cast<long long>(chi_grp) * g.rs() * 16,
-                                                    nk, ns, 0);
+                                                    nk, ns, 0, true);
                 if (!tt.err.empty()) return fail("device attributes", tt.err);
                 if (tt.tp > 0) {
                     chi_tt = tt.tp;
@@ -1866,7 +1872,8 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
     int m7_tp = 0, m7_blocks = 0;
     long long m7_smem = 0;
     if (mode == 7 && blk == ns && nsr == ns && cc_major >= 8 && rb >= grp_rows) {
-        const TilePlan tt = tile_table_plan(dev, static_cast<int>(rb / grp_rows), grp_rows * row_bytes, nk, ns, 1);
+        const TilePlan tt = tile_table_plan(dev, static_cast<int>(rb / grp_rows), grp_rows * row_bytes, nk, ns, 1,
+                                            false);
         if (!tt.err.empty()) return fail("device attributes", tt.err);
         if (tt.tp > 0) {
             m7_tp = tt.tp;
