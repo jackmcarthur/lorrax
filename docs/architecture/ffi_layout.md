@@ -1,16 +1,66 @@
 # The FFI layer
 
-How LORRAX reaches vendor libraries: every native kernel and handler (the
-[kernel catalog](#kernel-catalog)), the layers, the two build legs and their
-acceptance gates, what each machine provides, which cuSOLVERMp selects which
-communication path, which FFT engine the host library binds, the C++ phdf5
-defaults, and how to tell the native-layer failure modes apart.
+How LORRAX reaches vendor libraries: the core kernel operations and the
+engine each has on each hardware class ([kernel operations](#kernel-operations)),
+every native target (the [kernel catalog](#kernel-catalog)), the layers, the
+two build legs and their acceptance gates, which library serves each engine on
+each machine, which cuSOLVERMp selects which communication path, which FFT
+engine the host library binds, the C++ phdf5 defaults, and how to tell the
+native-layer failure modes apart.
 
-This page owns the *native boundary* and the kernel catalog. Owner rulings
-are in [`decisions.md`](decisions.md), the SlabIO contract in
-[`slab_io.md`](slab_io.md), knob spellings and defaults in
+This page owns the *native boundary*, the kernel-operations table and the
+kernel catalog. Owner rulings are in [`decisions.md`](decisions.md), the
+SlabIO contract in [`slab_io.md`](slab_io.md), knob spellings and defaults in
 [`../dev/env_vars.md`](../dev/env_vars.md). See the
 [register](../index.md#register).
+
+## Kernel operations
+
+One row per core operation: what it computes, where the physics uses it, the
+engine on each hardware class, whether a plain-XLA implementation exists, and
+the test that pins it. A plain-XLA route is one built from XLA ops alone, with
+no LORRAX native library; where the column says *none*, a platform without a
+LORRAX library (ROCm today) has no engine for that operation. Verified against
+the code at `origin/main` 9379b694 (2026-09-25).
+
+| operation | where it acts | NVIDIA (CUDA leg) | CPU (host leg) | plain XLA route | gate | code |
+|---|---|---|---|---|---|---|
+| **χ₀ = G ⋆ G**, one τ node: `χ₀(R) += α_τ Σ_ab conj(Gᶜ_ab(R))·Gᵛ_ab(R)`, one FFT_k after the τ sum | gwjax screening (`gw.w_isdf`) → χ₀_q(μ,ν;τ) | mode 11 on the k-box stage for the identity-vertex step response on a raw-parent plan; every other χ₀ kernel (vertex pairs, Fermi–Dirac occupations, distinct left and right centroid sets, the fractional contour) takes mode 3 on unfolded Greens with the spin trace in XLA ([router](#k-convolution-router-and-the-mathdx-family)) | typed unfold and spin trace in XLA, host flat-k transforms | none | `tests/multi_device/kconv_router_p4.py`, `tests/test_kconv_chi_unfold.py` | `ffi.fft.make_kconv_chi_unfold`; `gw.w_isdf._get_chi_minimax_kernel` |
+| **Σ = G ⋆ W**: `Σ_k = FFT_k[IFFT_k Ĝ · W(R)]`, Ĝ the Green unfolded on load | gwjax Σ: `gw.ppm_tau_kernel` (τ stream), `gw.cohsex_sigma` → Σ_k(μ,ν;τ) at the caller's k rows | mode 7 on the raw-parent Green (typed unfold and spin action on load); mode 2 on the k-box stage for a full-k operand ([router](#k-convolution-router-and-the-mathdx-family)) | typed unfold in XLA (a full-k copy), then `lorrax_mklfft_gw_conv` | none | `kconv_router_p4.py`, `tests/test_kconv_klead_unfold.py` | `ffi.fft.make_kconv_klead_unfold`, `make_kconv_klead` |
+| **Four-current Σ**: `Σ = FFT_k Σ_AB γ_A (IFFT_k Ĝ) γ_B† ∘ W_AB(R)` | gwjax bispinor Σ: `gw.cohsex_sigma`, `gw.centroid_k_unfold` | mode 8: resident arm when a whole `ns²` spin group fits the opt-in shared memory, else the k-box split arm | mode 7's host composition, the γ block sum in XLA | none | `kconv_router_p4.py`, `tests/test_kconv_lorentz_unfold.py` | `ffi.fft.make_kconv_lorentz_unfold` |
+| **W, V wedge → R space**: `Y_k = IFFT_k(L_k Ô_k R_k†)`, Ô read from the irreducible q wedge | the W and V operands of the two Σ rows: `gw.screening`, `gw.ppm_tau_kernel`, `gw.cohsex_sigma` | mode 9; a full-zone operand takes mode 3 | unfold in XLA (`apply_unfold_load_tables_local`), then the host flat-k transform | none | `kconv_router_p4.py`, `tests/test_kfft_klead_unfold.py` | `ffi.fft.make_kfft_klead_unfold`; `symmetry_maps.QirrOperator` |
+| **k-axis FFT**: `Y = s·FFT^±_k X`, k leading or trailing | χ₀(R) → χ₀(q) (`gw.w_isdf`), the q→0 head (`gw.qsgw_head`), `gw.wavefunction_bundle`, band interpolation (`bandstructure.htransform`, `.orbital`), BSE (k trailing) | mode 3 on the k-box stage (k leading), mode 5 (k trailing) | `lorrax_mklfft_flat_k`, the FFTW3 advanced interface bound by `dlsym` ([§3c](#3c-which-fft-engine-the-host-library-binds)); k trailing: XLA transposes around it. `LORRAX_FFT_FFI=0` refuses | none | `kconv_router_p4.py`, `tests/test_fft_flat_k_numerics.py`, GATE 5, GATE 8 | `ffi.fft.make_kfft_klead`, `make_kfft_kminor`; `common.fft_helpers.make_flat_k_fft` |
+| **ζ-fit pair Gram** `C_q`: the pair convolution `s·FFT_k Σ_ab φ_a φ_b conj(IFFT_k P^L)·IFFT_k P^R` of the band projectors `P_k(μ,ν)` (mode 0 in the [mode table](#k-convolution-router-and-the-mathdx-family)) | gwjax face-ψ ζ fit (`gw.isdf_fitting`, one C_q per channel), `gw.downfold` | mode 1, the typed parent load ([mode 1](#parent-load-isdf-pair-convolution-mode-1)); mode 0 on full-k operands | typed parent load in XLA (a full-k open-spin copy per side), host transforms, spin contraction in XLA | none | `kconv_router_p4.py`, `tests/test_isdf_parent_conv.py`, `tests/test_isdf_zq_parent_parity.py` | `ffi.fft.make_fused_conv_kparent`, `make_fused_conv_kpair` ← `isdf.core.c_q_from_psi_sm`, `c_q_downfold` |
+| **Route-G plane pair contraction**: mode 0 read from the D-plane FFT output, Bloch phase and L/R split applied on load | gwjax charge ζ fit, route G: `isdf.zeta_mubatch`, `isdf.pair_kernels`, `gw.centroid_k_unfold` → the Z_q store | mode 6 | phase, split and transpose in XLA, then the host pair tail | none | `kconv_router_p4.py`, `tests/test_kconv_plane.py` | `ffi.fft.make_fused_conv_kplane` |
+| **Route-G plane FFT**: `Y = FFT₂(P)`, P the plane scattered from its occupied cylinder | gwjax charge ζ fit, route G (`isdf.zeta_mubatch`) | mode 10 iff both sides split into thread FFTs of ≤ 40 points and plane + row tables fit the opt-in shared memory: squares to 100 on sm_80/87, 78 on sm_86/89/120, 119 on sm_90/100; every other plane takes the XLA route ([mode 10](#plane-fft-with-gather-on-load-mode-10)) | the XLA route | static-run concatenate, then `jnp.fft.fftn` | `tests/multi_device/plane_fft_gather_p4.py`, `tests/test_plane_fft_gather.py` | `LocalFourierPlan(in_gather=…)` → `ffi.fft.make_plane_fft_gather` |
+| **BSE W-term k-convolution**: `U = s·FFT_k(IFFT_k X · K_R)`, k trailing | bse matvecs: `bse.bse_stack_matvec`, `bse.bse_ring_comm` (the W term on trial vectors) | mode 4, with a complex64 image for the fp32-GMRES arm | XLA moves k to the front, host transforms and product, k moves back; complex128 only | none | `kconv_router_p4.py` | `ffi.fft.make_kconv_kminor`, `make_local_kconv_kminor` |
+| **Sphere ↔ box 3-D FFT**: ψ_nk(G) ↔ ψ_nk(r), densities, plane-wave matrix elements | ψ at the centroids (`common.wfn_transforms`), the kmeans valence density (`psp.get_DFT_mtxels`), the V_H, kin_ion and dipole matrix elements (`common.mtxel_sweep`), the QSGW density (`gw.qsgw_density`), DFT operators (`psp.dft_operators`) | XLA `fft` → cuFFT inside jaxlib | XLA:CPU `fft` | this row: `jnp.fft` inside the caller's `shard_map`; no FFI route reaches it | none on numerics; `tests/test_fft_shardmap_context.py` checks only that call sites sit inside a `shard_map` | `common.fft_helpers.local_fftn3`, `local_ifftn3`, `make_sharded_fftn_3d`, `make_sharded_ifftn_3d` |
+| **Separable local DFT with supports**: `y = R_out·F·E_in·x`, ≤ 3 axes | no production caller besides the route-G plane FFT's `in_gather` form | `lorrax_fourier_plan_mathdx`: cuBLAS ZGEMM axes, the fused cuBLASDx pair when it fits the opt-in shared memory, one cuFFT group; startup refuses an nvidia-mathdx other than 25.6.0 (`GATE mathdx-pair-wheel`); cuFFT/cuBLAS sizes below 2³¹ (`GATE fourier-plan-int32`) ([plan](#local-fourier-plan-localfourierplan)) | the XLA leg | `dot_general` GEMM axes and one `jnp.fft` group, on every non-CUDA lowering | `tests/test_fourier_plan.py` (GPU and cpu) | `common.fourier_plan.LocalFourierPlan` ([service](../dev/fourier_plan.md)) |
+| **Green build GEMM**: `G_k(μ,ν;τ) = Σ_n ψ_nk(μ) w_n(τ) ψ*_nk(ν)` at the k parents | every Green of gwjax: χ₀ (`gw.w_isdf`), Σ (`gw.ppm_tau_kernel`, `gw.cohsex_sigma`), the ζ-fit projectors (`gw.isdf_fitting`) → the parent Green `(n_parent, μ, s, ν, s')` | cuBLASMp batched GEMM through `distrib_la.gemm_plan(layout='face')`; an active band range through `cublasmp_[prepared_]active_range_gemm` | none: the face plan resolves `scalapack`, whose batched GEMM handler does not exist, and refuses | `gemm_plan(layout='axis')` (`jnp.matmul`); gwjax builds its ψ carriers in the face layout, so the Green build never takes it | `services/distrib_la/tests/test_distrib_la_multiproc.py`, `test_active_gemm_range.py`, `test_local_active_gemm_range.py`, `tests/multi_device/active_band_sigma_gate.py` | `gw.greens_function_kernel.build_G_parents`; `distrib_la.gemm_plan` ([active GEMM ranges](../dev/active_gemm_ranges.md)) |
+| **Band projection**: `O_k,mn = Σ ψ*_mk(μ) O_k(μ,ν) ψ_nk(ν)` | Σ_mn from Σ_k(μ,ν) (`gw.ppm_tau_kernel`, `gw.cohsex_sigma`, `gw.photon_sigma`, `gw.mpa.sector_sigma`); BSE W decode (`bse.bse_ring_comm`), `common.zeta_projection` | face layout: two planned cuBLASMp GEMMs; legacy body: XLA einsums and two `psum_scatter`s | face layout: none (as the Green build); legacy body: the right contraction on `lorrax_mklblas_gemm_batch` (CBLAS, [§3a](#3a-the-dependency-matrix)) | the legacy body's einsums (`LORRAX_BANDS_GEMM_FFI=0` on cpu) | `tests/test_contract_bands.py`, `active_band_sigma_gate.py` | `common.contract_bands.contract_bands_block_reshard` ([vendor GEMM](../dev/vendor_gemm_service.md)) |
+| **Hermitian eigensolve**, batched local or distributed | the charge ζ factor (rank-truncating eigh of each C_q, dense and replicated under both `linalg` layouts), the QSGW `H_k` (`gw.sc_iteration.qp_eigh`) | local: `jnp.linalg.eigh` (cuSOLVER in jaxlib); `linalg = distributed`: cuSOLVERMp `syevd` | local: LAPACK in jaxlib; distributed: ScaLAPACK `p?heevd`/`p?syevd`; host SLATE eigh always refuses at resolve (bug L-2) | `jnp.linalg.eigh` | `pytest -m distrib_la` contract tests; nothing observes which vendor answered | `distrib_la.plan('eigh')`, `dispatch_batched_eigh`; the charge factor: `isdf.cplus.factor` ([`distrib_la`](../services/distrib_la.md), [deck dial](../dev/linalg_ffi.md)) |
+| **Dyson solve and dense factorizations**: `W_q = (1 − v_q χ₀_q)⁻¹ v_q` by LU; the transverse ζ LU; Cholesky on explicit request | gwjax screening (`gw.w_isdf.solve_w`), the response bank (`gw.response_bank`), the shared-pole head, the transverse ζ factor | local: per-q `jax.scipy.linalg.lu_factor`/`lu_solve` (cuSOLVER in jaxlib); distributed: cuSOLVERMp batched `solve_lu`/`getrf`/`getrs`, Cholesky `potrf`/`potrs`. `LORRAX_LU_NO_PIVOT` turns cuSOLVERMp pivoting off with no gate. The fused `cublasmp_batched_w_solve` has no production caller | local: LAPACK in jaxlib; distributed: ScaLAPACK `p?getrf`/`p?getrs`; Cholesky: host SLATE `potrf`/`trsm` | the local LU; Cholesky `native2d` | contract tests, `tests/test_transverse_factor_hoist.py`, `tests/multi_device/dyson_panel_p4.py`; nothing observes which vendor answered | `distrib_la.plan('solve_lu')`, `plan('cholesky')` ([targets](#dense-linear-algebra-targets)) |
+| **Active-subspace kernels**: store, projected eigh, project, reconstruct, Gram, CGS2 orthogonalization | Davidson (`psp.run_nscf`), Lanczos (`bse.bse_lanczos`, `bse.exciton_bands`) | `lorrax_active_subspace_*` (cuBLAS, cuSOLVER, NCCL) | `CpuSubspacePlan`: NumPy/LAPACK through `jax.pure_callback` | none | `services/distrib_la/tests/test_active_subspace.py`, `tests/test_subspace_orthogonalize.py` | `distrib_la.plan_subspace`, `plan_orthogonalization` ([Davidson](../services/davidson.md)) |
+| **Contour accumulator**: `A[o,q,m,n] += p[o]·c[q,m,n]` | the response bank's Laplace/KMS streams (`gw.w_isdf` with selected q rows) | `lorrax_contour_accumulate`, complex128, at most `4·65535` outputs ([small kernels](#small-cuda-kernels)) | none: refuses (`GATE ffi-handler`) | none | `tests/multi_device/contour_accumulator_p4.py` | `gw.contour_accumulator` |
+| **Spin rotation**: `G ← U_k G U_k†` per `(k, μ, ν)` spin block | the typed unfold of a parent operator to full k (`symmetry_maps.unfold_spin_centroid_operator` ← `gw.greens_function_kernel.build_G`, `gw.photon_sigma`) | `lorrax_symmetry_spin_rotate_centroid` for `ns ∈ {2, 4}`, complex128; otherwise the einsums | the einsums | JAX einsums (`_rotate_open_spin_centroid_operator`) | the mode-7 reference chain of `kconv_router_p4.py` | `symmetry_maps._spin_rotation` |
+| **Parallel HDF5 slab I/O** | every sharded array read or written through `file_io.slab_io` | `phdf5_{read, read_kchunk_union, write, write_independent}`, staged through the CUDA runtime | the same handlers on the host leg | none: one transport, and a deployment that cannot serve it refuses at open | `tests/multi_device/phdf5_*`, `slab_io_*_p4.py`; GATE 7, GATE 10 | `ffi.io` ← `file_io.slab_io` ([§5](#5-parallel-hdf5-the-ffi-side), [SlabIO](slab_io.md)) |
+
+**Every mathdx kernel** (the k-axis rows and mode 10) is NVRTC-built for the
+device's own `sm_<cc>`, and `require_kconv` probe-compiles one at startup. On
+CUDA every k-grid axis of a k-axis operation is at most 40
+(`GATE mathdx-kconv-axis`), and its resident k-row or k-box tile must fit the
+device's opt-in shared memory; the cpu leg has neither limit
+([refusals](#k-convolution-router-and-the-mathdx-family)). Operands are
+complex128; modes 2–5 also take complex64 on CUDA.
+
+**Gaps.**
+
+* No CPU engine: the Green build GEMM and the face-layout band projection
+  (gwjax builds its ψ carriers in the face layout), and the contour
+  accumulator.
+* No plain-XLA route: every k-axis operation, the face-layout GEMMs, the
+  active-subspace kernels, the contour accumulator and slab I/O. A platform
+  without a LORRAX native library has no engine for them.
 
 ## Kernel catalog
 
@@ -33,21 +83,25 @@ the Fourier plan's targets (`require_kconv`, `require_fourier_plan`), the
 contour accumulator and spin rotation symbols (`ffi_loader.require_cuda_handlers`,
 `GATE ffi-handler`), the host FFT and GEMM (their `Gate`s).
 
-| family | source (`src/ffi/cpp/`) | leg; build | targets (`lorrax_…`) | Python door | selected by | gate | detail |
-|---|---|---|---|---|---|---|---|
-| mathdx k-convolution | `cufft/kconv_mathdx_cuda_ffi.cc`, `cufft/kbox_stage.cuh` | CUDA; NVRTC for the device's own `sm_<cc>` at first use, disk-cached | `mathdx_kconv_{pair, parent, plane, klead, klead_unfold_block, klead_lorentz_conj, chi_unfold, kminor}`, `mathdx_kfft_{klead, klead_unfold, kminor}`; older trees: `mathdx_kconv_klead_{unfold, lorentz}[_rows]` | `ffi.fft` router doors | the mesh platform | `tests/multi_device/kconv_router_p4.py` | [router](#k-convolution-router-and-the-mathdx-family) |
-| plane FFT (mode 10) | the same file (`kPlaneSrc`) | CUDA; NVRTC | `mathdx_plane_fft_gather` | `ffi.fft.make_plane_fft_gather` ← `LocalFourierPlan(in_gather=…)` | both axes split into thread FFTs and the plane fits the opt-in shared memory; else the XLA route | `tests/multi_device/plane_fft_gather_p4.py` | [mode 10](#plane-fft-with-gather-on-load-mode-10) |
-| Local Fourier plan | `cufft/fourier_plan_cuda_ffi.cc`, `cufft/fourier_plan.cu` | CUDA; C++ (cuBLAS, cuFFT), nvcc remap kernel, NVRTC cuBLASDx pair | `fourier_plan_mathdx`; older trees: `fourier_plan` | `common.fourier_plan.LocalFourierPlan` → `ffi.fft.fourier_plan_ffi` | the lowering platform; per axis `GEMM_CROSSOVER` and the support fraction; the pair when it fits the opt-in shared memory | `tests/test_fourier_plan.py` on a GPU | [plan](#local-fourier-plan-localfourierplan), [service](../dev/fourier_plan.md) |
-| NVRTC build service | `common/nvrtc_build.{h,cc}`, `common/lrx_async_gather.h`, `cufft/kbox_stage_src.h.in` | CUDA; C++ | — | — | — | `tests/multi_device/kconv_cubin_cache_check.py` | "Disk cubin cache" in the [router](#k-convolution-router-and-the-mathdx-family) |
-| host flat-k FFT | `fftw/fft_flat_k_ffi.cc` | host; C++, the FFTW3 ABI bound by `dlsym` | `mklfft_flat_k`, `mklfft_gw_conv` | the `ffi.fft` cpu leg | a cpu mesh; `LORRAX_FFT_FFI` (on; `0` refuses) | `tests/test_fft_flat_k_numerics.py`, GATE 5, GATE 8 | §3c |
-| host CBLAS GEMM | `cblas/gemm_batch_ffi.cc` | host; C++ | `mklblas_gemm_batch` | `ffi.gemm.gemm_batch` ← `common.contract_bands` | a cpu mesh; `LORRAX_BANDS_GEMM_FFI` | `tests/test_contract_bands.py` | [vendor GEMM](../dev/vendor_gemm_service.md) |
-| distributed dense LA | `cusolvermp/`, `cublasmp/batched_gemm_ffi.cc`, `scalapack/`, `slate/` | CUDA: cuSOLVERMp, cuBLASMp; host: ScaLAPACK, SLATE | [below](#dense-linear-algebra-targets) | `distrib_la` | the deck's `linalg = local \| distributed` → `distrib_la.resolve` | `services/distrib_la/tests/test_distrib_la_contract.py`, `test_distrib_la_multiproc.py` | [distrib_la](../services/distrib_la.md), [linalg FFI](../dev/linalg_ffi.md), §4 |
-| local active-range GEMM | `cublas/local_active_gemm_ffi.cc` | CUDA; C++ | `cublas_local_active_range_gemm`, `cublas_local_prepared_active_range_gemm` | `distrib_la._active_local_cuda` | `gemm_plan(layout='axis')` with an active K interval | `services/distrib_la/tests/test_local_active_gemm_range.py` | [active GEMM ranges](../dev/active_gemm_ranges.md) |
-| active subspace | `active_subspace/active_{eigh,ops}.cc` | CUDA; C++ (cuBLAS, cuSOLVER, NCCL) | `active_subspace_{store, eigh, project, reconstruct, gram, ortho, distributed_ortho, subtract, subtract_gram}` | `distrib_la.active_subspace.LocalSubspacePlan` | `plan_subspace`, `plan_orthogonalization` on a GPU device | `services/distrib_la/tests/test_active_subspace.py`, `tests/test_subspace_orthogonalize.py` | [Davidson](../services/davidson.md), [orthogonalization](../services/orthogonalization.md) |
-| parallel HDF5 | `phdf5/` | both; C++ (HDF5, MPI; CUDA-runtime staging on the CUDA leg) | `phdf5_{read, read_kchunk_union, write, write_independent}`; `phdf5_read_kchunk` has no caller | `ffi.io` ← `file_io.slab_io` | one transport; `write_independent` for file-order row blocks | P4 `tests/multi_device/phdf5_*`, `slab_io_*_p4.py`; GATE 7, GATE 10 | §5–§7, [SlabIO](slab_io.md) |
-| contour accumulator | `response/contour_accumulate{.cu,_ffi.cc}` | CUDA; nvcc | `contour_accumulate` | `gw.contour_accumulator` | the response-bank Laplace/KMS streams of `gw.w_isdf` | `tests/multi_device/contour_accumulator_p4.py` | [below](#small-cuda-kernels) |
-| spin rotation | `symmetry/spin_rotate{.cu,_ffi.cc}` | CUDA; nvcc | `symmetry_spin_rotate_centroid` | `symmetry_maps._spin_rotation` | `unfold_spin_centroid_operator` on a GPU, `ns ∈ {2, 4}`, complex128 | the mode-7 reference chain of `kconv_router_p4.py` | [below](#small-cuda-kernels) |
-| fused W-solve | `cublasmp/batched_w_solve_ffi.cc`, `cublasmp/w_solve_kernels.cu` | CUDA; C++ and nvcc | `cublasmp_batched_w_solve` | `ffi.cublasmp.batched_fused_w_solve` | no production caller yet (the W solve is `distrib_la`'s `solve_lu`) | the `distrib_la` contract W-solve cell; `tests/bench/cublasmp_w_solve_test.py` | [below](#small-cuda-kernels) |
+The [operations table](#kernel-operations) owns what each family computes,
+where it is used, what selects it and its gate; this table maps each family to
+its sources, its build and its target strings.
+
+| family | source (`src/ffi/cpp/`) | leg; build | targets (`lorrax_…`) |
+|---|---|---|---|
+| mathdx k-convolution | `cufft/kconv_mathdx_cuda_ffi.cc`, `cufft/kbox_stage.cuh` | CUDA; NVRTC for the device's own `sm_<cc>` at first use, disk-cached | `mathdx_kconv_{pair, parent, plane, klead, klead_unfold_block, klead_lorentz_conj, chi_unfold, kminor}`, `mathdx_kfft_{klead, klead_unfold, kminor}`; older trees: `mathdx_kconv_klead_{unfold, lorentz}[_rows]` |
+| plane FFT (mode 10) | the same file (`kPlaneSrc`) | CUDA; NVRTC | `mathdx_plane_fft_gather` |
+| Local Fourier plan | `cufft/fourier_plan_cuda_ffi.cc`, `cufft/fourier_plan.cu` | CUDA; C++ (cuBLAS, cuFFT), nvcc remap kernel, NVRTC cuBLASDx pair | `fourier_plan_mathdx`; older trees: `fourier_plan` |
+| NVRTC build service | `common/nvrtc_build.{h,cc}`, `common/lrx_async_gather.h`, `cufft/kbox_stage_src.h.in` | CUDA; C++ | none; gate `tests/multi_device/kconv_cubin_cache_check.py` ("Disk cubin cache" in the [router](#k-convolution-router-and-the-mathdx-family)) |
+| host flat-k FFT | `fftw/fft_flat_k_ffi.cc` | host; C++, the FFTW3 ABI bound by `dlsym` | `mklfft_flat_k`, `mklfft_gw_conv` |
+| host CBLAS GEMM | `cblas/gemm_batch_ffi.cc` | host; C++ | `mklblas_gemm_batch` |
+| distributed dense LA | `cusolvermp/`, `cublasmp/batched_gemm_ffi.cc`, `scalapack/`, `slate/` | CUDA: cuSOLVERMp, cuBLASMp; host: ScaLAPACK, SLATE | [below](#dense-linear-algebra-targets) |
+| local active-range GEMM | `cublas/local_active_gemm_ffi.cc` | CUDA; C++ | `cublas_local_active_range_gemm`, `cublas_local_prepared_active_range_gemm` |
+| active subspace | `active_subspace/active_{eigh,ops}.cc` | CUDA; C++ (cuBLAS, cuSOLVER, NCCL) | `active_subspace_{store, eigh, project, reconstruct, gram, ortho, distributed_ortho, subtract, subtract_gram}` |
+| parallel HDF5 | `phdf5/` | both; C++ (HDF5, MPI; CUDA-runtime staging on the CUDA leg) | `phdf5_{read, read_kchunk_union, write, write_independent}`; `phdf5_read_kchunk` has no caller |
+| contour accumulator | `response/contour_accumulate{.cu,_ffi.cc}` | CUDA; nvcc | `contour_accumulate` |
+| spin rotation | `symmetry/spin_rotate{.cu,_ffi.cc}` | CUDA; nvcc | `symmetry_spin_rotate_centroid` |
+| fused W-solve | `cublasmp/batched_w_solve_ffi.cc`, `cublasmp/w_solve_kernels.cu` | CUDA; C++ and nvcc | `cublasmp_batched_w_solve`; door `ffi.cublasmp.batched_fused_w_solve`, gated by the `distrib_la` contract W-solve cell and `tests/bench/cublasmp_w_solve_test.py` |
 
 **Architectures.** Every nvcc TU carries SASS for sm_80, 86, 89, 90, 100
 and 120 and compute_80/compute_120 PTX (§2); every NVRTC kernel compiles for
@@ -295,46 +349,26 @@ sealed bundle through `LORRAX_FFI_SO` and `LORRAX_FFI_HOST_SO`.
 
 ## 3. What each machine provides
 
-| Service | Perlmutter | Frontera |
-|---|---|---|
-| k-axis FFTs and convolutions, GPU | nvidia-mathdx ([router](#k-convolution-router-and-the-mathdx-family)) | — |
-| k-axis FFTs and convolutions, CPU | FFTW3 ABI → cray-fftw (§3c) | FFTW3 ABI → MKL |
-| spatial 3-D FFT inside `shard_map` | XLA (cuFFT inside jaxlib) | XLA:CPU |
-| host GEMM | Cray LibSci CBLAS | MKL CBLAS |
-| distributed dense solvers | cuSOLVERMp and cuBLASMp (GPU); ScaLAPACK from LibSci and host SLATE (CPU) | ScaLAPACK from MKL; host SLATE |
-| parallel HDF5 | `cray-hdf5-parallel/1.14.3.7` over `cray-mpich/9.0.1` | phdf5 over Intel MPI |
-| runtime | bare-host CUDA 13 (`lorrax_A`); Shifter stages for container sites | apptainer |
-
-Versions and launch recipes: [Perlmutter](../environment/machines/perlmutter.md),
+The [operations table](#kernel-operations) owns which engine serves each
+operation on each hardware class, and its gate. This section owns which
+library satisfies that engine on each machine. Versions and launch recipes:
+[Perlmutter](../environment/machines/perlmutter.md),
 [Frontera](../environment/machines/frontera.md).
 
 ### 3a. The dependency matrix
 
-One row per routine LORRAX does not implement itself: who serves it, what
-else could, and what proves it built right.
+One row per dependency LORRAX does not implement itself: who serves it on
+each machine, what else could, and what proves it built right.
 
-| Routine | Perlmutter | Frontera | Alternatives and refusals | Check |
+| Routine | Perlmutter | Frontera | Alternatives | Check |
 |---|---|---|---|---|
-| **3-D FFT** inside `shard_map` | XLA:GPU `fft` → cuFFT in jaxlib | XLA:CPU `fft` | none: `fft_helpers.local_fftn3` / `local_ifftn3` are `jnp.fft` for code already inside a `shard_map`; no FFI route reaches them | none |
-| **k-axis transforms and convolutions** (ζ fit, Σ, COHSEX, BSE, and the flat-k transform on CUDA) | CUDA: nvidia-mathdx. cpu: the FFTW3-ABI host handlers | host handlers | none on CUDA; a missing wheel refuses at startup (`GATE mathdx-headers`) | `tests/multi_device/kconv_router_p4.py` |
 | **Flat-k FFT, host leg** | FFTW3 ABI by `dlsym` → cray-fftw | MKL's FFTW3 export, already resident | the candidate ladder (§3c) | GATE 5 (load time), GATE 8 (engine identity) |
 | **Host band-block GEMM** (`ffi.gemm`) | LibSci CBLAS; LibSci has no `cblas_?gemm_batch`, so the handler loops plain `cblas_?gemm` | MKL CBLAS, batched entry | any CBLAS provider (MKL, LibSci, OpenBLAS, BLIS); the chosen entry is announced at first use | GATE 2 |
-| **Planned axis GEMM** | full range: XLA `dot` → cuBLAS. Active range: `lorrax_cublas_local_active_range_gemm` and its prepared twin over pointer views | XLA:CPU `dot` panels | K stays local; only output centroid axes are sharded ([active GEMM ranges](../dev/active_gemm_ranges.md)) | `services/distrib_la/tests/test_local_active_gemm_range.py` |
-| **Distributed face GEMM** | cuBLASMp, full and active range | none: a `scalapack` or `slate` face plan refuses by name | `batch_reshard` only through the one-shot `matmul`, when whole matrices fit each device | `test_distrib_la_multiproc.py`, `test_active_gemm_range.py`, `tests/multi_device/active_band_sigma_gate.py` |
-| **`eigh`** | default native `jnp.linalg.eigh` → cuSOLVER (GPU), LAPACK (CPU). Distributed: cuSOLVERMp `syevd` (GPU); ScaLAPACK `p?heevd` / `p?syevd` from LibSci (CPU) | default native → LAPACK. Distributed: ScaLAPACK from MKL | the deck's `linalg = local \| distributed` (`distributed`: ScaLAPACK on cpu, cuSOLVERMp on CUDA); refusals in [`distrib_la`](../services/distrib_la.md) | `pytest -m distrib_la`. Nothing observes which vendor answered |
-| **Cholesky** | cuSOLVERMp batched `potrf`/`potrs` (GPU); host SLATE `potrf`/`trsm` (CPU) | host SLATE | `native2d` (JAX); no ScaLAPACK `potrf` handler exists | contract tests only |
-| **LU** | cuSOLVERMp batched `solve_lu` (GPU); ScaLAPACK `p?getrf`/`p?getrs` (CPU) | ScaLAPACK from MKL | fused `solve_lu` and split `getrf`+`getrs`; resolve refuses if any target is missing | contract tests, `tests/test_transverse_factor_hoist.py`, `tests/multi_device/dyson_panel_p4.py` |
+| **Distributed dense solvers** | cuSOLVERMp and cuBLASMp (GPU); ScaLAPACK from LibSci and host SLATE (CPU) | ScaLAPACK from MKL; host SLATE | — | — |
 | **Distributed transport** | NCCL for cuSOLVERMp (§4) and cuBLASMp; an `MPI_COMM_WORLD` split in mesh order for SLATE and ScaLAPACK | Intel MPI | — | the `[lorrax cusolverMp] … comm path:` banner |
-| **Parallel HDF5** | `libhdf5_parallel_gnu.so.310` over `libmpi_gnu_123.so.12` | phdf5 over Intel MPI | none: one transport; a deployment that cannot serve it refuses at open | GATE 1, GATE 7 |
+| **Parallel HDF5** | `cray-hdf5-parallel/1.14.3.7` (`libhdf5_parallel_gnu.so.310`) over `cray-mpich/9.0.1` (`libmpi_gnu_123.so.12`) | phdf5 over Intel MPI | none: one transport | GATE 1, GATE 7 |
 | **OpenMP runtime** | `libgomp` | `libiomp5` | `libgomp`, `libiomp5`, `libomp` | GATE 6 |
-
-### 3b. Routines with no check
-
-* The spatial 3-D FFT has no build or run check on either machine.
-* No gate observes which vendor answered a distributed `eigh`, Cholesky or
-  LU; only the `distrib_la` contract tests exercise them.
-* `LORRAX_LU_NO_PIVOT` (a *bool*) disables cuSOLVERMp pivoting from the
-  environment with no gate.
+| **Runtime** | bare-host CUDA 13 (`lorrax_A`); Shifter stages for container sites | apptainer | — | — |
 
 ### 3c. Which FFT engine the host library binds
 
@@ -647,19 +681,26 @@ The modes of the one handler file. The target column is the string
   operand 0 to the result (`input_output_aliases={0: 0}`); mode 11 aliases
   `acc`. This is safe because each block reads all `N_k` values of its rows
   before it stores any of them.
-- **Launch geometry (modes 0–9).** One 256-thread block per `rb` rows; a row
-  needs `banks·16·(N_k|1)` bytes of shared memory (8 per element for
-  complex64). Modes 0, 1 and 6 take `rb = min(16, ⌊100 KiB / row⌋)`, the
-  others `rb = min(64, ⌊48 KiB / row⌋)`; when that is 0, `rb` is what the
-  device's opt-in maximum holds. The 100 KiB budget is not clamped to the
-  opt-in maximum, which is 99 KiB on sm_86/89/120. Mode 8 reaches for the
-  opt-in maximum until a whole `ns²` spin group fits. Modes 7, 8 and 9 round
+- **Launch geometry (resident rows: modes 0, 1 and 4–9).** One 256-thread
+  block per `rb` rows; a row needs `banks·16·(N_k|1)` bytes of shared memory
+  (8 per element for complex64). Modes 0, 1 and 6 take
+  `rb = min(16, ⌊B / row⌋)` with `B = min(100 KiB, opt-in)`, the others
+  `rb = min(64, ⌊min(48 KiB, opt-in) / row⌋)`; when that is 0, `rb` is what
+  the device's opt-in maximum holds. Mode 8 reaches for the opt-in maximum
+  until a whole `ns²` spin group fits, and takes the k-box split arm when none
+  does. Modes 2 and 3 run on the k-box stage and have no `rb`. Modes 7, 8 and 9 round
   `rb` down to whole spin groups (`ns·n_r` rows; `d²` for a mode-7 spin
   block) when one fits and then load each pair's sources once for the group;
   below one group each bank loads its own row with the same arithmetic.
-- **The k-box stage (mode 11).** `kbox_stage.cuh` owns the box transform and
-  its launch rule, `kbox_plan(grid, group, operands, elem, opt-in)`, computed
-  from the k-grid and the device's opt-in shared memory. Single pass: `tr`
+- **The k-box stage (modes 2, 3, 11, and mode 8's split arm).**
+  `kbox_stage.cuh` owns the box transform and its launch rule,
+  `kbox_plan(grid, group, operands, elem, opt-in)`, computed from the k-grid
+  and the device's opt-in shared memory. Modes 2 and 3 stage whole columns in
+  padded shared memory, or, where two columns do not fit a block, run plane
+  and pencil passes through the output in place. Mode 8's split arm runs the
+  plane and group-pencil passes chunked over pairs through an
+  `(N_k, chunk·ns²)` intermediate no larger than its output. For mode 11,
+  single pass: `tr`
   whole pairs per block in a padded bank (odd z-line and row strides),
   gathered on load through mode 7's typed unfold, the three axis passes
   (z, y, x) of cuFFTDx thread FFTs, the spin trace, one accumulate. Split arm, when fewer pairs fit: plane passes over
@@ -668,14 +709,15 @@ The modes of the one handler file. The target column is the string
   XLA's scratch allocator grants (at most `scratch_bytes`; the door's default
   is one parent-Green tile).
 - **Cost.** Each transform is `O(rows·N_k log N_k)` flops. HBM traffic is one
-  read of each operand and one write of the result (mode 11's split arm adds
-  one write and one read of its intermediate). Modes 6–9 and 11 read the
+  read of each operand and one write of the result (the split arms of modes 8
+  and 11 add one write and one read of their intermediate). Modes 6–9 and 11 read the
   producer's own buffer (the plane FFT output; the parent Green or the wedge,
   `n_parent/N_k` of the full-k size), so the phased, split or unfolded copy
   that modes 1 and 2 would need is never written. The unfold tables (`lsrc`,
   `rsrc` int32, `mph`, `nph` complex128, each `(N_k, μ·ns)`) are closed-over
-  host constants sliced per rank. Apart from mode 11's intermediate, the
-  kernels allocate no device workspace beyond dynamic shared memory.
+  host constants sliced per rank. Apart from those two intermediates, which
+  XLA's scratch allocator grants, the kernels allocate no device workspace
+  beyond dynamic shared memory.
 - **Host workspace (cpu leg).** `gw_conv` stages `V_R = IFFT_k W` once per
   call in a reused host arena of `N_k·m_x·m_y·16` bytes, invisible to XLA.
 
@@ -689,9 +731,10 @@ The modes of the one handler file. The target column is the string
 | `GATE mathdx-probe` | startup | the mode-3 probe kernel fails to compile or run on this device | an nvidia-mathdx wheel whose cuFFTDx supports the device's compute capability |
 | `GATE kconv-kgrid` | factory | the k-grid is not three positive axes | pass the run's `(nkx, nky, nkz)` |
 | `GATE mathdx-kconv-axis` | factory; handler | on CUDA, a k-grid axis above 40 (`KCONV_AXIS_MAX`, the fp64 cuFFTDx thread-FFT limit); the cpu leg (FFTW) has no cap | a smaller k-grid |
-| `GATE mathdx-kconv-residency` | first call (kernel build) | one resident row, `banks·16·(N_k|1)` bytes (8 per element for complex64), exceeds the device's opt-in shared memory per block. On an A100 (166 912 B) that is `N_k > 3477` for modes 0/1/6 and `N_k > 10431` for the one-bank modes in complex128 | a smaller k-grid; modes 0–9 have no out-of-core arm |
-| `GATE mathdx-kconv-lorentz-residency` | first call | mode 8: one `ns²` spin group of rows, `ns²·16·(N_k|1)` bytes, exceeds the opt-in maximum | a smaller k-grid |
-| `GATE mathdx-kconv-chi-residency` | first call | mode 11: the k-box arm `kbox_plan` picked does not fit the opt-in maximum, or its plane tile splits a spin group | the χ₀ route keeps its XLA path for this grid |
+| `GATE mathdx-kconv-residency` | first call (kernel build) | one resident row, `banks·16·(N_k|1)` bytes (8 per element for complex64), exceeds the device's opt-in shared memory per block. On an A100 (166 912 B) that is `N_k > 3477` for modes 0/1/6 and `N_k > 10431` for the one-bank modes in complex128 | a smaller k-grid; modes 0, 1, 4–7 and 9 have no out-of-core arm |
+| `GATE mathdx-kconv-kbox-residency` | first call | modes 2 and 3, and mode 8's split arm: the k-box tile, or its `(k_y, k_z)` plane or pencil, exceeds the opt-in maximum | a smaller k-grid |
+| `GATE mathdx-kconv-lorentz-scratch` | apply | mode 8's split arm: XLA's scratch allocator refuses the chunk intermediate | none on the door: the chunk is already at most the output's size |
+| `GATE mathdx-kconv-chi-residency` | first call | mode 11: the k-box arm `kbox_plan` picked does not fit the opt-in maximum, or its plane tile splits a spin group | a smaller k-grid; the χ₀ route has no fallback for this grid |
 | `GATE mathdx-kconv-chi-scratch` | apply | mode 11's split arm: XLA's scratch allocator refuses the `(N_k, chunk·2ns²)` intermediate | a smaller `scratch_bytes` |
 | `k-leading unfold conv: …` | factory; apply | tables cut for another mesh shape; `G` whose parent count or endpoint widths differ from the tables; `Gt=None` on a plan with antiunitary rows | build the tables from the same plan and mesh as `G` (`plan.unfold_load_tables()`); pass `ParentGreen.transpose` |
 | `k-conv plane expects …` | trace | `D` or `F` not complex128 `(N_k, g, ns, 2c, ns, p)` / `(N_k, g, p)` | pass the plane FFT output as laid out |
