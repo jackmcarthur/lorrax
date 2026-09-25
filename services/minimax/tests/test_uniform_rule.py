@@ -202,6 +202,35 @@ def test_the_rule_is_a_function_of_the_inputs_alone():
         np.testing.assert_array_equal(first.weights, second.weights)
 
 
+def test_the_rule_does_not_depend_on_threads_or_bracket_split():
+    """The BLAS thread pin and the fixed-N bracket split are both invisible.
+
+    A caller's thread setting is overridden for the build, and attempt
+    ranges that partition the bracket (one per rank in the Sigma planner)
+    return the serial rule from the first range that certifies.
+    """
+    from minimax import uniform_rule
+    box = (-14.0 * ETA, 14.0 * ETA, ETA, 4.0 * ETA)
+    controls = uniform_rule._openblas_controls()
+    saved = [get() for get, _put in controls]
+    rules = []
+    try:
+        for threads in (2, 4):
+            for _get, put in controls:
+                put(threads)
+            rules.append(build_uniform_rule(box, 1.0e-4))
+    finally:
+        for (_get, put), count in zip(controls, saved):
+            put(count)
+    ranges = [build_uniform_rule(box, 1.0e-4, attempts=span)
+              for span in ((0, 1), (1, 2), (2, None))]
+    rules.append(next(rule for rule in ranges if rule is not None))
+    assert ranges[-1] is not None
+    for rule in rules[1:]:
+        np.testing.assert_array_equal(rule.times, rules[0].times)
+        np.testing.assert_array_equal(rule.weights, rules[0].weights)
+
+
 def test_the_builder_takes_no_budget_argument():
     """The retired spelling must fail loudly, not be swallowed by **kwargs."""
     box = (-8.0 * ETA, 8.0 * ETA, ETA, 4.0 * ETA)
