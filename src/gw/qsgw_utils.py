@@ -1132,18 +1132,20 @@ def plot_qp_energy_comparison(
 # ---------------------------------------------------------------------------
 
 def remove_managed(dir_path, pattern, *, keep=(), barrier_tag, print_fn=print):
-    """Rank-0 scan-and-unlink of managed files, then a collective barrier.
+    """Rank-0 scan-and-unlink of managed entries, then a collective barrier.
 
     Removes every entry of ``dir_path`` whose NAME fullmatches ``pattern``
     and whose full path is not in ``keep``, on rank 0 only; all ranks then
     meet at ``barrier_tag`` so the directory looks the same everywhere on
-    return.  Returns the removed names (empty off rank 0).  Shared by
-    ``sc_iteration._clear_sc_eqp_snapshots`` and
-    ``gw.mpa.model.retain_iteration_artifacts``; each caller owns its own
-    regex, keep-set and report line.
+    return.  A matching directory (a per-map scratch generation) is removed
+    with its contents.  Returns the removed names (empty off rank 0).  Shared
+    by ``sc_iteration._clear_sc_eqp_snapshots``,
+    ``gw.mpa.model.retain_iteration_artifacts`` and the shared-pole exports and
+    scratch; each caller owns its own regex, keep-set and report line.
     """
     import os
     import re
+    import shutil
     from common.collectives import barrier, process_rank
 
     managed = re.compile(pattern)
@@ -1154,7 +1156,10 @@ def remove_managed(dir_path, pattern, *, keep=(), barrier_tag, print_fn=print):
         for name in os.listdir(root):
             path = os.path.join(root, name)
             if managed.fullmatch(name) and path not in keep:
-                os.remove(path)
+                if os.path.isdir(path) and not os.path.islink(path):
+                    shutil.rmtree(path)
+                else:
+                    os.remove(path)
                 removed.append(name)
     barrier(barrier_tag, print_fn=print_fn)
     return removed
