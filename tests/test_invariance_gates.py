@@ -33,9 +33,8 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-import jax
-
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from core.rank_session import _resolve_proc_count  # noqa: E402
 from harness import (          # noqa: E402
     REG,
     census_lines,
@@ -53,9 +52,11 @@ _LABELS = ("sigX", "sigC", "sigXC")
 _OUT = "sigma_diag_gnppm_test.dat"
 
 _NEEDS_P4_BISPINOR_MEMORY = pytest.mark.skipif(
-    jax.device_count() < 4,
-    reason=("needs >=4 JAX devices: two fresh bispinor runs exhaust one A100 "
-            "during a 9.84 GiB allocation"),
+    _resolve_proc_count() < 4,
+    reason=("needs 4 pytest ranks, one GPU each (lx run -N 1 -G 4 -n 4 "
+            "python3 -m pytest ...): two fresh bispinor runs exhaust one A100 "
+            "during a 9.84 GiB allocation, and the bispinor driver's 2x2 mesh "
+            "needs one JAX process per mesh cell"),
 )
 
 # The canonical restart-variant input mutations (must match
@@ -160,7 +161,7 @@ def test_mu_pad_flip_invariance_gnppm(gnppm_restart_baseline, tmp_path):
 
 @pytest.mark.regression
 @_NEEDS_P4_BISPINOR_MEMORY
-def test_mu_pad_flip_invariance_bispinor(bispinor_session, tmp_path):
+def test_mu_pad_flip_invariance_bispinor(bispinor_session, bispinor_pad4_session):
     """EXTRA_MU_PAD=4 vs 0, bispinor GN-PPM: Sigma byte identity.
 
     Pins the historically catastrophic transverse pad-extent class
@@ -169,13 +170,8 @@ def test_mu_pad_flip_invariance_bispinor(bispinor_session, tmp_path):
     near-null indefinite modes).  Fresh runs: bispinor restart is not
     yet supported (gw_init.py).
     """
-    ses = bispinor_session
-    run_dir = copy_fixture(REG / "bispinor_debug", tmp_path / "bispinor_pad4")
-    res = run_gw_jax(run_dir, ses.input_name,
-                     extra_env={"LORRAX_EXTRA_MU_PAD": "4"})
-    if res.returncode != 0:
-        pytest.fail(f"bispinor pad4 run failed.\n"
-                    f"stdout:\n{res.stdout}\nstderr:\n{res.stderr}")
+    ses, res = bispinor_session, bispinor_pad4_session
+    run_dir = res.run_dir
     assert census_lines(res.stdout) == census_lines(ses.stdout), (
         "bispinor PPM census changed under the pad flip")
     out = ses.output_name
