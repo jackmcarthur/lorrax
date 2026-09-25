@@ -37,7 +37,7 @@ import numpy as np
 from symmetry_maps.maps import certify_endpoint_locality
 
 __all__ = ["QirrOperator", "DeviceLoadTables", "DEVICE_LOAD_SPECS", "device_load_tables",
-           "UnfoldLoadTables", "unfold_load_tables", "local_unfold_load_tables",
+           "UnfoldLoadTables", "unfold_load_tables", "local_unfold_load_tables", "umklapp_phase",
            "apply_unfold_load_tables_local"]
 
 
@@ -144,20 +144,32 @@ def unfold_load_tables(*, irr_idx, sym_idx, sym_perm, L_table, k_irr_frac, spin_
     L_r = np.asarray(wraps_r, dtype=np.float64)[sym]
 
     conj_arm = trs_rule == "conj"
-
-    @jax.jit
-    def phases():
-        pl = jnp.exp(2j * jnp.pi * jnp.einsum('qi,qmi->qm', q_per, L_l).astype(jnp.complex128))
-        pr = jnp.exp(2j * jnp.pi * jnp.einsum('qi,qmi->qm', q_per, L_r).astype(jnp.complex128))
-        if conj_arm:   # the whole product is conjugated on an antiunitary row
-            return pl, jnp.conj(pr)
-        return (jnp.where(trs[:, None], jnp.conj(pl), pl),
-                jnp.where(trs[:, None], pr, jnp.conj(pr)))
-    mph, nph = (np.asarray(jax.device_get(a)) for a in phases())
+    pl, pr = umklapp_phase(q_per, L_l), umklapp_phase(q_per, L_r)
+    if conj_arm:   # the whole product is conjugated on an antiunitary row
+        mph, nph = pl, np.conj(pr)
+    else:
+        mph = np.where(trs[:, None], np.conj(pl), pl)
+        nph = np.where(trs[:, None], pr, np.conj(pr))
     return UnfoldLoadTables(row=irr, trs=trs.astype(np.int32), lsrc=lsrc, rsrc=rsrc,
                             mph=mph, nph=nph, spin=spin, n_parent=n_parent,
                             mesh_shape=(int(mesh_xy.shape["x"]), int(mesh_xy.shape["y"])),
                             conj_trs=int(conj_arm), spin_r=spin_r)
+
+
+def umklapp_phase(q_per, L):
+    """``exp(2 pi i q . L)`` per ``(q, endpoint)`` on the host, bit for bit the value the
+    unfold kernel's constant-folded ``jnp.exp(2j*pi*einsum('qi,qmi->qm', q, L))`` gets.
+
+    Built on the host because XLA folds that no-argument program on the CPU at
+    compile time (~0.3 s per table on a GPU node, seconds on a login node).
+    The three-term dot is summed in XLA's order (``tests/test_kfft_klead_unfold``
+    pins the equality)."""
+    q = np.asarray(q_per, dtype=np.float64)
+    L = np.asarray(L, dtype=np.float64)
+    s = q[:, None, 0] * L[..., 0]
+    s = s + q[:, None, 1] * L[..., 1]
+    s = s + q[:, None, 2] * L[..., 2]
+    return np.exp(2j * np.pi * s.astype(np.complex128))
 
 
 def local_unfold_load_tables(t: UnfoldLoadTables) -> UnfoldLoadTables:
@@ -308,9 +320,7 @@ class QirrOperator:
         if not self.is_whole_zone():
             raise ValueError("QirrOperator.restrict: only a whole-zone operator restricts "
                              "onto another wedge")
-        import jax.numpy as _jnp
-        return dataclasses.replace(
-            wedge, values=_jnp.take(self.values, _jnp.asarray(wedge.full_rows), axis=0))
+        return dataclasses.replace(wedge, values=_rows_of(self.values, wedge.full_rows))
 
     def at_rows(self, q_full_rows):
         """The values at full-zone rows ``q_full_rows`` (the wedge's representatives, in
@@ -321,8 +331,7 @@ class QirrOperator:
         if not self.is_whole_zone():
             raise ValueError("QirrOperator.at_rows: rows other than the wedge's "
                              "representatives need the unfold")
-        import jax.numpy as _jnp
-        return _jnp.take(self.values, _jnp.asarray(rows), axis=0)
+        return _rows_of(self.values, rows)
 
     @property
     def n_full(self) -> int:
@@ -394,6 +403,17 @@ class QirrOperator:
         if dev is None:
             dev = _device_load_cache[key] = device_load_tables(self.load_tables(mesh_xy), mesh_xy)
         return dataclasses.replace(self, load=dev)
+
+
+def _rows_of(values, rows):
+    """Rows of a ``P(None,'x','y')`` q stack, kept on that sharding (the service's slice);
+    inside a trace the consumer's program owns the placement."""
+    from symmetry_maps.maps import slice_q_full_to_ibz
+    mesh = getattr(getattr(values, "sharding", None), "mesh", None)
+    if isinstance(values, jax.core.Tracer) or mesh is None:
+        return jnp.take(values, jnp.asarray(np.asarray(rows)), axis=0)
+    return slice_q_full_to_ibz(
+        values, np.asarray(rows), out_sharding=_NS(mesh, _P(None, "x", "y")))
 
 
 _device_load_cache: dict = {}

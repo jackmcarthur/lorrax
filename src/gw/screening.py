@@ -340,9 +340,8 @@ def compute_static_w(
                 from symmetry_maps import slice_q_full_to_ibz
                 _nat = NamedSharding(mesh_xy, P(None, 'x', 'y'))
                 with timing.section("W.slice_to_ibz"):
-                    V_q_solve = jax.device_put(
-                        QirrOperator.of(V_q).restrict(
-                            QirrOperator(values=None, **wedge[0])).values, _nat)
+                    V_q_solve = QirrOperator.of(V_q).restrict(
+                        QirrOperator(values=None, **wedge[0])).values
                     chi0_q_solve = slice_q_full_to_ibz(
                         chi0_q, sym.q_irr_full_idx, out_sharding=_nat)
                     del chi0_q

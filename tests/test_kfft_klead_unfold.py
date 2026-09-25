@@ -177,3 +177,17 @@ def test_wedge_door_requires_the_partner_on_the_pair_transpose_rule():
         assert "wedge rows" in str(exc)
     else:
         raise AssertionError("a wedge with a row too few was accepted")
+
+
+def test_host_umklapp_phase_equals_the_folded_xla_phase():
+    """The load tables' phases are built on the host; they must be the bits the unfold
+    kernel's constant-folded ``exp(2j*pi*einsum('qi,qmi->qm', q, L))`` gets, for
+    k/q fractions n/3, n/6, n/7, n/9, n/12, n/16 (red twin: a pairwise-summed dot)."""
+    from symmetry_maps import umklapp_phase
+    rng = np.random.default_rng(7)
+    for den in (3, 6, 7, 9, 12, 16):
+        q = rng.integers(0, den, (24, 3)) / float(den)
+        L = rng.integers(-3, 4, (24, 200, 3)).astype(np.float64)
+        folded = np.asarray(jax.device_get(jax.jit(lambda: jnp.exp(
+            2j * jnp.pi * jnp.einsum('qi,qmi->qm', q, L).astype(jnp.complex128)))()))
+        assert np.array_equal(umklapp_phase(q, L), folded), den
