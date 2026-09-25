@@ -970,6 +970,33 @@ def rotate_bands(psi_G, U_qp, *, mesh: Mesh):
 # ``np.asarray(U_qp)`` a few lines later for the k-star broadcast, so both
 # were being synchronised immediately regardless; E and Z come out of one
 # FFI call, so blocking on the pair is the same wait as blocking on either.
+_HERMITISE_KERNELS: dict = {}
+
+
+def _hermitise_on_band_grid(H, mesh: Mesh):
+    """``0.5 (H + H^H)`` at :func:`band_rotation_spec`, one jitted program.
+
+    The transpose is ``common.collectives.transpose_xy`` -- each rank sends
+    its tile to its transpose partner.  Spelled eagerly, ``swapaxes``
+    relabels the operand ``P(None,'y','x')`` and the add then all-gathers
+    both into a replicated result: 36.9 GB above the resident share at
+    nk 144 / nb 2000 on P4 (four whole stacks).  The values are only moved,
+    so the result is bitwise the eager one.
+    """
+    from common.collectives import transpose_xy
+    fn = _HERMITISE_KERNELS.get(mesh)
+    if fn is None:
+        spec = NamedSharding(mesh, band_rotation_spec())
+
+        @jax.jit
+        def fn(h):
+            h = jax.lax.with_sharding_constraint(h, spec)
+            return jax.lax.with_sharding_constraint(
+                0.5 * (h + jnp.conj(transpose_xy(h, mesh))), spec)
+        _HERMITISE_KERNELS[mesh] = fn
+    return fn(H)
+
+
 def _eigh_pad_sentinel(H):
     """Place an inert pad above every Hermitian k block's spectrum."""
     # The maximum absolute row sum bounds every eigenvalue in magnitude.
@@ -1058,11 +1085,9 @@ def distributed_eigh_bands(H, *, mesh: Mesh,
     H_j = pad_axis(H_j, p_prod, axis=1).array
     H_j = pad_axis(H_j, p_prod, axis=2).array
     nb_pad = int(H_j.shape[1])
-    H_j = jax.lax.with_sharding_constraint(
-        H_j, NamedSharding(mesh, band_rotation_spec()))
     # pXheevd reads ONE triangle, so a non-Hermitian input is silently
     # interpreted rather than refused.  Hermitise here.
-    H_j = 0.5 * (H_j + jnp.conj(jnp.swapaxes(H_j, -1, -2)))
+    H_j = _hermitise_on_band_grid(H_j, mesh)
     if nb_pad != nb:
         # SENTINEL pad, then drop BY COUNT.  ``pad_axis`` zero-fills, so
         # the pad block is [H 0; 0 0] and the pad eigenvalues are exactly
