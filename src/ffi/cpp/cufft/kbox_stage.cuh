@@ -53,10 +53,13 @@ struct Plan {
 // optin_smem: cudaDevAttrMaxSharedMemoryPerBlockOptin.
 // Single pass: tr = the smallest power of two giving 128-byte runs per k (8 c128 columns) and a
 // line for every thread in every axis pass (tr * nk / max axis >= 256), capped by two
-// single-buffered blocks per SM; below two columns the split arm.  Threads: 256, or 512 for a
+// single-buffered blocks per SM; below min_tr instances the split arm.  min_tr = 2 protects
+// the 128-byte contiguous runs of a cp.async load; a gathered direct Load of a spin group
+// (mode 11) has no run to protect and passes min_tr = 1: one instance per block that fits
+// the opt-in memory stays single-pass (one HBM pass, no scratch).  Threads: 256, or 512 for a
 // convolution (transforms = 2: inverse, Mid, forward) whose axis passes have >= 384 lines.
 inline Plan kbox_plan(int nx, int ny, int nz, int group, int n_operands, int elem, long long optin_smem,
-                      int transforms = 1) {
+                      int transforms = 1, int min_tr = 2) {
     const Geometry g{nx, ny, nz};
     int threads = 256;
     const long long per_col = (long long)n_operands * group * g.rs() * elem;
@@ -67,7 +70,7 @@ inline Plan kbox_plan(int nx, int ny, int nz, int group, int n_operands, int ele
     while (2LL * cap * per_col <= optin_smem / 2) cap *= 2;
     const int tr = want < cap ? want : cap;
     if (transforms == 2 && (long long)tr * group * lines >= 384) threads = 512;
-    if (tr >= 2) return Plan{0, tr, threads, 0, tr * per_col};
+    if (tr >= min_tr && tr * per_col <= optin_smem) return Plan{0, tr, threads, 0, tr * per_col};
     threads = 256;
     const int tp = 16;
     return Plan{1, tp, threads, 8, (long long)n_operands * tp * g.pr() * elem};
