@@ -18,9 +18,12 @@ glide, a genuine k reduction, a time-reversed row, SU(2) mixing):
   equal the full-k face bundle: each band tile is unfolded from the packed
   parents inside the scan (``symmetry_maps.unfold_wavefunction_local``).
 * q→0 head wings (``qsgw_head.head_wings_sharded`` and the static wings) on
-  the parents-only bundle equal the full-k face bundle: the children are
-  streamed one parent star at a time from the packed parents
-  (``w_isdf.iter_parent_children_faces``).
+  the parents-only bundle equal the full-k face bundle: each parent is
+  contracted once per operation class and the classes are transported
+  (``CentroidKUnfoldPlan.operation_classes``); no child face exists.  The
+  velocity is the polar time-odd image of its parents' (as the dipole's
+  file-wedge unfold makes it); a velocity without that covariance is shown
+  to disagree, so the check can fail.
 * SC rotation: ``wavefunction_bundle.rotate_wavefunctions`` on the
   parents-only bundle rotates the carrier's faces with U at the parents'
   rows and equals the rotated full-k faces read at those rows.
@@ -119,10 +122,22 @@ def _worker() -> int:
         return spinor_rotation_for_sym_row(
             U_spatial, np.asarray(rows), n_tran, nspinor=nspinor)
 
+    def cartesian_action(rows, *, axial, time_odd):
+        # SymMaps.cartesian_action on this fixture's unit lattice: the
+        # forward action is R^T of the spatial row, negated on antiunitary
+        # rows for a time-odd vector.
+        assert not axial
+        rows = np.asarray(rows)
+        forward = np.swapaxes(ops.astype(np.float64), -1, -2)[rows % n_tran]
+        if time_odd:
+            forward = np.where((rows >= n_tran)[..., None, None], -forward, forward)
+        return forward
+
     sym_mats_k = np.concatenate([ops.transpose(0, 2, 1), -ops.transpose(0, 2, 1)])
     sym_fx = SimpleNamespace(
         sym_matrices=ops, translations=tnp, sym_mats_k=sym_mats_k,
         irr_idx_k=irr, sym_idx_k=sym, spinor_action=spinor_action,
+        cartesian_action=cartesian_action,
         unfolded_kpts=kfrac, kirr_fullids=parent_rows, nk_red=n_parent,
         nk_tot=nk)
 
@@ -311,22 +326,35 @@ def _worker() -> int:
         kminq_rows=kminq, nb_logical=nb - 1)))
     frac_direct = float(np.max(np.abs(d_par - d_full))) / float(np.max(np.abs(d_full)))
     # The q->0 head wings on the parents-only bundle equal the full-k face
-    # bundle: the children are streamed one parent star at a time
-    # (w_isdf.iter_parent_children_faces) with the velocity read at every k.
+    # bundle: parents contracted per operation class and transported, with a
+    # velocity that is its parents' polar time-odd image (conjugated on the
+    # antiunitary row), as symmetry_maps.unfold_file_wedge_polar_matrix
+    # builds the dipole's.  A velocity drawn independently at every k is not
+    # covariant and must disagree (negative control).
     from gw.qsgw_head import head_wings_sharded, static_head_wings_sharded
-    v_np = _crand(rng, 3, nk, nb, nb)
-    v_np = 0.5 * (v_np + np.conj(np.swapaxes(v_np, -1, -2)))
+    v_par = _crand(rng, 3, n_parent, nb, nb)
+    v_par = 0.5 * (v_par + np.conj(np.swapaxes(v_par, -1, -2)))
+    F_rows = cartesian_action(sym, axial=False, time_odd=True)
+    v_np = np.stack([
+        np.einsum("ab,bij->aij", F_rows[k],
+                  np.conj(v_par[:, irr[k]]) if sym[k] >= n_tran else v_par[:, irr[k]])
+        for k in range(nk)], axis=1)
     omegas = np.asarray([0.0, 0.3 + 0.05j])
     wing_kw = dict(mesh=mesh, nb_logical=nb - 1, nk_tot=nk, nspin=1,
                    nspinor=ns, eta_ry=0.02, surface_weight_kn=surf)
-    Yf, Zf = head_wings_sharded(jnp.asarray(v_np), wfns_full, enk_j, f_kn,
-                                omegas, **wing_kw)
-    Yp, Zp = head_wings_sharded(jnp.asarray(v_np), wfns_par, enk_j, f_kn,
-                                omegas, **wing_kw)
-    jax.block_until_ready((Yf, Zf, Yp, Zp))
-    wings_rel = max(
-        float(np.max(np.abs(np.asarray(Yp) - np.asarray(Yf)))) / float(np.max(np.abs(np.asarray(Yf)))),
-        float(np.max(np.abs(np.asarray(Zp) - np.asarray(Zf)))) / float(np.max(np.abs(np.asarray(Zf)))))
+
+    def _wing_rel(v):
+        Yf, Zf = head_wings_sharded(jnp.asarray(v), wfns_full, enk_j, f_kn,
+                                    omegas, **wing_kw)
+        Yp, Zp = head_wings_sharded(jnp.asarray(v), wfns_par, enk_j, f_kn,
+                                    omegas, **wing_kw)
+        jax.block_until_ready((Yf, Zf, Yp, Zp))
+        return max(
+            float(np.max(np.abs(np.asarray(Yp) - np.asarray(Yf)))) / float(np.max(np.abs(np.asarray(Yf)))),
+            float(np.max(np.abs(np.asarray(Zp) - np.asarray(Zf)))) / float(np.max(np.abs(np.asarray(Zf)))))
+    wings_rel = _wing_rel(v_np)
+    v_bad = _crand(rng, 3, nk, nb, nb)
+    wings_noncovariant_rel = _wing_rel(0.5 * (v_bad + np.conj(np.swapaxes(v_bad, -1, -2))))
     sf = static_head_wings_sharded(wfns_full, surf, mesh=mesh, nb_logical=nb - 1,
                                    nk_tot=nk, nspin=1, nspinor=ns)
     sp = static_head_wings_sharded(wfns_par, surf, mesh=mesh, nb_logical=nb - 1,
@@ -361,6 +389,7 @@ def _worker() -> int:
     print(json.dumps({
         "sc_rotation_parents_vs_full_rel": rot_rel,
         "head_wings_parents_vs_full_rel": wings_rel,
+        "head_wings_noncovariant_velocity_rel": wings_noncovariant_rel,
         "static_head_wings_parents_vs_full_rel": static_wings_rel,
         "g_rel": g_rel, "proj_rel": proj_rel,
         "conj_rule_rel_on_tr_rows": conj_rel_trs,
@@ -419,6 +448,8 @@ def test_parent_sigma_route_matches_full_k_and_uses_the_transpose_rule():
     assert out["sc_rotation_parents_vs_full_rel"] < 1.0e-10, out
     assert out["fractional_direct_q_parents_vs_full_rel"] < 1.0e-10, out
     assert out["head_wings_parents_vs_full_rel"] < 1.0e-10, out
+    # Negative control: the parity above needs the velocity's covariance.
+    assert out["head_wings_noncovariant_velocity_rel"] > 1.0e-3, out
     assert out["static_head_wings_parents_vs_full_rel"] < 1.0e-10, out
 
 

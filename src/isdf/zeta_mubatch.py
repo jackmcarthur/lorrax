@@ -117,8 +117,8 @@ def best_owner_orbit_batches(plan, mu_pad: int, n_ranks: int, *, c_max: int):
 
 def typed_child_G_tables(plan, *, fft_grid, sphere_par, gvec_child,
                          ngk_child, k_child):
-    """The r-space typed transport of :func:`typed_children_psi_G` as G-space
-    tables, its exact Fourier image.
+    """The r-space typed ψ action (:func:`symmetry_maps.unfold_wavefunction_local`)
+    as G-space tables, its exact Fourier image.
 
     The typed child is ``ψ_k(x) = U_k T[ψ_p(S x − t)]`` with the snapped
     offset ``t = round(N·S·τ)/N`` (the grid permutation's), so on the child's

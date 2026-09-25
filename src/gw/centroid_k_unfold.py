@@ -43,6 +43,23 @@ def _readonly(value, dtype) -> np.ndarray:
     return out
 
 
+class OperationClasses(NamedTuple):
+    """Full-k rows grouped by operation (:meth:`CentroidKUnfoldPlan.operation_classes`).
+
+    ``ops[c]`` the typed row, ``antiunitary[c]`` its kind, ``counts[c, p]``
+    the number of full-k rows of class ``c`` whose parent is ``p``,
+    ``class_of_row[r]`` the class of full-k row ``r``, ``local_perm[c, mu]``
+    the owner-local source centroid, ``parent_rows[p]`` the parent's own
+    identity row.
+    """
+    ops: np.ndarray
+    antiunitary: np.ndarray
+    counts: np.ndarray
+    class_of_row: np.ndarray
+    local_perm: np.ndarray
+    parent_rows: np.ndarray
+
+
 @dataclass(frozen=True, eq=False)
 class CentroidKUnfoldPlan:
     """Authenticated raw-parent/full-k transport for one centroid basis.
@@ -124,6 +141,88 @@ class CentroidKUnfoldPlan:
         if vertex:
             child = gamma_apply(child, *gamma_perm_phase(vertex), axis=spin_axis)
         return child
+
+    def operation_classes(self) -> "OperationClasses":
+        """The full-k rows grouped by typed operation, for a k-summed consumer.
+
+        A quantity summed over full k whose child value is its parent's value
+        under the row's action (a centroid density, a head wing) is summed
+        per parent, weighted into its operation classes by ``counts``, and
+        transported once per class (:meth:`transport_classes`).  Refuses when
+        a parent with children is not its own identity row: its full-k tables
+        then do not hold the raw parent's value.
+        """
+        irr = np.asarray(self.irr_idx, dtype=np.int64)
+        sym = np.asarray(self.sym_idx, dtype=np.int64)
+        ops, class_of_row = np.unique(sym, return_inverse=True)
+        counts = np.zeros((ops.size, self.n_parent), dtype=np.float64)
+        np.add.at(counts, (class_of_row, irr), 1.0)
+        perm = np.asarray(self.centroid_local_perm)[ops]
+        if np.any(perm < 0):
+            raise ValueError(
+                "CentroidKUnfoldPlan.operation_classes: an operation row the "
+                "plan selects has no centroid action.")
+        rows = self.parent_full_rows
+        used = np.flatnonzero(counts.sum(axis=0) > 0)
+        if rows is None:
+            raise ValueError(
+                "CentroidKUnfoldPlan.operation_classes: the plan names no "
+                "parent full-k rows (hand-assembled plan).")
+        rows = np.asarray(rows, dtype=np.int64)
+        own = sym[rows[used]]
+        eye_mu = np.arange(perm.shape[1]) % int(self.layout.axis_shard_size)
+        bad = ((irr[rows[used]] != used) | (own >= int(self.n_sym_spatial))
+               | ~np.all(np.asarray(self.centroid_local_perm)[own] == eye_mu, axis=1))
+        if self.spatial_ops is not None:
+            spatial = own % int(self.n_sym_spatial)
+            shift = np.asarray(self.translations)[spatial]
+            bad |= ~np.all(np.asarray(self.spatial_ops)[spatial] == np.eye(3), axis=(1, 2))
+            bad |= ~np.all(np.isclose(shift, np.rint(shift)), axis=1)
+        if np.any(bad):
+            p = int(used[np.flatnonzero(bad)[0]])
+            raise ValueError(
+                "GATE parent_identity_row: got parent "
+                f"{p} whose full-k row {int(rows[p])} carries parent "
+                f"{int(irr[rows[p]])} under operation {int(sym[rows[p]])}; "
+                "want every parent with children to be its own identity row; "
+                "why: the per-parent sum reads the parent's value from that row.")
+        return OperationClasses(
+            ops=ops.astype(np.int32),
+            antiunitary=ops >= int(self.n_sym_spatial),
+            counts=counts, class_of_row=class_of_row.astype(np.int32),
+            local_perm=perm.astype(np.int32), parent_rows=rows.astype(np.int32))
+
+    @staticmethod
+    def transport_classes(values, local_perm, *, class_axis, mu_axis,
+                          mesh_axis, mix=None, mix_axis=None):
+        """``sum_c mix_c . values_c[perm_c(mu)]`` on one μ-local shard.
+
+        Inside ``shard_map``: ``local_perm`` is the complete
+        ``OperationClasses.local_perm`` (sliced here by ``mesh_axis``),
+        ``values`` carries the class axis and the local μ axis, and ``mix``
+        ``(C, a, b)`` acts on ``mix_axis`` (``None`` for a scalar density).
+        The class axis is summed away.  The child μ reads its source centroid
+        exactly as :func:`symmetry_maps.unfold_wavefunction_local` does.
+        """
+        ndim = int(values.ndim)
+        class_axis, mu_axis = int(class_axis) % ndim, int(mu_axis) % ndim
+        mu_loc = int(values.shape[mu_axis])
+        perm = jnp.asarray(local_perm, dtype=jnp.int32)
+        if mesh_axis is not None:
+            perm = jax.lax.dynamic_slice_in_dim(
+                perm, jax.lax.axis_index(mesh_axis) * mu_loc, mu_loc, axis=1)
+        shape = [1] * ndim
+        shape[class_axis], shape[mu_axis] = int(perm.shape[0]), mu_loc
+        if class_axis > mu_axis:
+            perm = perm.T
+        moved = jnp.take_along_axis(values, perm.reshape(shape), axis=mu_axis)
+        if mix is not None:
+            mix_axis = int(mix_axis) % ndim
+            moved = jnp.moveaxis(moved, (class_axis, mix_axis), (0, -1))
+            moved = jnp.einsum("cab,c...b->c...a",
+                               jnp.asarray(mix, dtype=moved.dtype), moved)
+            moved = jnp.moveaxis(moved, (0, -1), (class_axis, mix_axis))
+        return jnp.sum(moved, axis=class_axis)
 
     @property
     def n_full(self) -> int:
@@ -499,6 +598,7 @@ def orbit_mu_batches(k_unfold_plan, mu_pad: int, n_ranks: int, *,
 __all__ = [
     "CentroidKUnfoldPlan",
     "MuOrbitBatches",
+    "OperationClasses",
     "build_centroid_k_unfold_plan",
     "mu_batch_tables",
     "orbit_mu_batches",
