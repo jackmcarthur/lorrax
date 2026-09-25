@@ -758,6 +758,54 @@ def normalize_dat(text: str) -> str:
     )
 
 
+_PRINTED_NUMBER = re.compile(r"[+-]?(?:\d+\.\d*|\.\d+|\d+)(?:[eE][+-]?\d+)?")
+
+
+def _printed_quantum(token: str) -> float:
+    """One unit in the last printed digit of ``token``; 0 for an integer."""
+    mantissa, _, exponent = token.lower().partition("e")
+    if "." not in mantissa:
+        return 0.0
+    decimals = len(mantissa.split(".", 1)[1])
+    return 10.0 ** (int(exponent or 0) - decimals)
+
+
+def print_quantum_diff(ref_text: str, out_text: str) -> dict:
+    """Compare two printed tables token by token, in units of the last digit.
+
+    The text with every number blanked (the skeleton: labels, row order,
+    status words) must be identical.  Each decimal token is then scored as
+    ``|out - ref|`` divided by the reference token's printed quantum;
+    integer tokens (k and band indices) must match exactly.  Returns the
+    skeleton verdict, the worst score with its line, and how many tokens
+    moved at all.
+    """
+    ref_lines, out_lines = ref_text.splitlines(), out_text.splitlines()
+
+    def skeleton(lines):
+        # Whitespace collapses so a sign entering a fixed-width field
+        # (0.000000 -> -0.000000) is scored as a number, not as structure.
+        return [" ".join(_PRINTED_NUMBER.sub("#", ln).split()) for ln in lines]
+
+    skeleton_equal = skeleton(ref_lines) == skeleton(out_lines)
+    worst, worst_line, moved, n_tokens = 0.0, "", 0, 0
+    if skeleton_equal:
+        for ref_ln, out_ln in zip(ref_lines, out_lines):
+            for r, o in zip(_PRINTED_NUMBER.findall(ref_ln),
+                            _PRINTED_NUMBER.findall(out_ln)):
+                n_tokens += 1
+                if r == o:
+                    continue
+                moved += 1
+                q = _printed_quantum(r)
+                score = (abs(float(o) - float(r)) / q) if q > 0.0 else np.inf
+                if score > worst:
+                    worst, worst_line = score, f"ref: {ref_ln}\nout: {out_ln}"
+    return {"skeleton_equal": skeleton_equal, "max_quanta": worst,
+            "moved_tokens": moved, "n_tokens": n_tokens,
+            "worst_line": worst_line}
+
+
 def census_lines(log_text: str) -> tuple:
     """PPM census + adaptive-window signature from a run log — the integer
     quantities that must be exactly invariant under μ-pad flips."""
