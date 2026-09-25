@@ -199,6 +199,40 @@ def grow_round(key, states, infinity, *, history, preview, admit):
     return states, tuple(pad(a, width) for a in infinity), admitted
 
 
+# PROTOTYPE (P2-S A-ladder, not for landing): LORRAX_P2S_ALADDER=ladder rounds
+# the round pencil side up to a multiple of _ALADDER_STEP, =max keeps a
+# process-wide high water of it; both stack the state panels into one argument
+# per field so the state count leaves the round program's key.
+_ALADDER_STEP = 512
+_ALADDER_HIGH = {}
+
+
+def _aladder_mode():
+    import os
+    mode = os.environ.get("LORRAX_P2S_ALADDER", "").strip().lower()
+    if mode not in ("", "ladder", "max"):
+        raise ValueError("LORRAX_P2S_ALADDER must be '', 'ladder' or 'max'")
+    return mode
+
+
+def _aladder(value, step, key):
+    target = -(-int(value) // step) * step
+    if _aladder_mode() == "max":
+        target = max(target, _ALADDER_HIGH.get(key, 0))
+        _ALADDER_HIGH[key] = target
+    return target
+
+
+@lru_cache(maxsize=None)
+def _stack_program(sharding, shapes, width):
+    import jax
+    import jax.numpy as jnp
+    total = sum(shape[-1] for shape in shapes)
+    pad = ((0, 0),) * (len(shapes[0]) - 1) + ((0, width - total),)
+    return jax.jit(lambda *parts: jnp.pad(jnp.concatenate(parts, axis=-1), pad),
+                   out_shardings=sharding)
+
+
 def round_tables(counts, widths, nodes, infinity_counts, infinity_width, *, column_extent, ordered,
                  odd_moments, key=None, history=None):
     """Host column tables of one round: each slot's states packed into its pencil columns.
@@ -247,6 +281,11 @@ def round_tables(counts, widths, nodes, infinity_counts, infinity_width, *, colu
         # state count can have less capacity, which only costs a compile.
         old = history.get((key, "extent", len(halves), len(widths)), (extent,))[0]
         extent = min(capacity, max(extent, old))
+    if _aladder_mode():
+        blocks_width = ((2 if odd_moments else 0) if ordered else 1) * int(infinity_width)
+        target = _aladder(extent * len(halves) + blocks_width, _ALADDER_STEP,
+                          ("side", len(halves), blocks_width))
+        extent = (target - blocks_width) // len(halves)
     order = np.full((ranks, extent * len(halves)), offsets[-1], np.int32)
     points = np.zeros(order.shape, np.complex128)
     live = np.zeros(order.shape, bool)
@@ -308,9 +347,13 @@ def reduce_round(states, infinity, tables, *, real, mesh_xy, native_eigh, ordere
     program = round_program(mesh_xy, native_eigh, bool(ordered), bool(odd_moments),
                             None if keep_budget is None else int(keep_budget), bool(retain_span), gram_keep)
     live = np.arange(len(tables["own"])) < int(real)
+    fields = [tuple(st[i] for st in states) for i in (1, 2, 3)]
+    if _aladder_mode():
+        width = _aladder(sum(p.shape[-1] for p in fields[0]), 2 * _ALADDER_STEP, ("stack",))
+        stack = _stack_program(fields[0][0].sharding, tuple(p.shape for p in fields[0]), width)
+        fields = [stack(*panels) for panels in fields]
     return program(put(live), put(tables["points"]), put(tables["order"]), put(tables["active"]),
-                   tuple(st[1] for st in states), tuple(st[2] for st in states),
-                   tuple(st[3] for st in states), tuple(infinity))
+                   *fields, tuple(infinity))
 
 
 def solve_parent_pencil(points, q, o, d, infinity, active, *, eigh, matmul,
@@ -428,7 +471,9 @@ def round_program(mesh_xy, native_eigh, ordered, odd_moments, keep_budget, retai
 
     def body(live, points, order, active, qs, os, ds, infinity):
         def pack(panels):
-            return jnp.take(jnp.concatenate(panels, axis=-1), order[0], axis=-1, mode='fill', fill_value=0)
+            stacked = (jnp.concatenate(panels, axis=-1)
+                       if isinstance(panels, (tuple, list)) else panels)
+            return jnp.take(stacked, order[0], axis=-1, mode='fill', fill_value=0)
         args = (points, pack(qs), pack(os), pack(ds), infinity, active)
 
         def work(args):
