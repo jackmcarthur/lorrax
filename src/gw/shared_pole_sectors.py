@@ -622,7 +622,9 @@ def construct_diagonal_sector_round(samples, moments, meta, config, geometry, *,
         if not np.all(reduction[name][:geometry['real']]):
             raise ValueError(f"GATE shared_pole_sector_{name}: sector={geometry['sector']}, "
                              f"parents={geometry['ids'][:geometry['real']]}, "
-                             f"Gram min/max={reduction['gram_min_relative'][:geometry['real']].tolist()}; no repair")
+                             f"passed={reduction[name][:geometry['real']].tolist()}, "
+                             f"Gram min/max={reduction['gram_min_relative'][:geometry['real']].tolist()}, "
+                             f"paired H_r min/max={reduction['paired_min_relative'][:geometry['real']].tolist()}; no repair")
     if not np.all(zero['zero_policy'][:geometry['real']]):
         raise ValueError(f"GATE shared_pole_sector_zero_ritz: sector={geometry['sector']}")
     # The returned planner must not retain the just-consumed full sample and
