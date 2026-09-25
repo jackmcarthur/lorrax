@@ -1711,7 +1711,17 @@ static ffi::Error KleadUnfoldImpl(
     return ffi::Error::Success();
 }
 
+// The parent-row targets.  `_rows` keeps its historical signature (every older source tree calls
+// it); `_block` adds the conj-on-load partner and the output spin block (U2).
 static ffi::Error KleadUnfoldRowsConv(
+    cudaStream_t stream, ffi::AnyBuffer Gp, ffi::AnyBuffer Gt, ffi::AnyBuffer row, ffi::AnyBuffer trs,
+    ffi::AnyBuffer lsrc, ffi::AnyBuffer rsrc, ffi::AnyBuffer mph, ffi::AnyBuffer nph, ffi::AnyBuffer spin,
+    ffi::AnyBuffer kout, ffi::AnyBuffer V, ffi::Result<ffi::AnyBuffer> U, int64_t nkx, int64_t nky,
+    int64_t nkz, double scale, std::string_view mathdx_root, std::string_view cubin_dir) {
+    return KleadUnfoldImpl(stream, Gp, Gt, row, trs, lsrc, rsrc, mph, nph, spin, &kout, V, U, nkx, nky,
+                           nkz, scale, mathdx_root, cubin_dir);
+}
+static ffi::Error KleadUnfoldBlockConv(
     cudaStream_t stream, ffi::AnyBuffer Gp, ffi::AnyBuffer Gt, ffi::AnyBuffer row, ffi::AnyBuffer trs,
     ffi::AnyBuffer lsrc, ffi::AnyBuffer rsrc, ffi::AnyBuffer mph, ffi::AnyBuffer nph, ffi::AnyBuffer spin,
     ffi::AnyBuffer kout, ffi::AnyBuffer V, ffi::Result<ffi::AnyBuffer> U, int64_t nkx, int64_t nky,
@@ -1820,6 +1830,16 @@ static ffi::Error KleadLorentzImpl(
 }
 
 static ffi::Error KleadLorentzRowsConv(
+    cudaStream_t stream, ffi::AnyBuffer Gp, ffi::AnyBuffer Gt, ffi::AnyBuffer row, ffi::AnyBuffer trs,
+    ffi::AnyBuffer lsrc, ffi::AnyBuffer rsrc, ffi::AnyBuffer mph, ffi::AnyBuffer nph, ffi::AnyBuffer spin,
+    ffi::AnyBuffer kout, ffi::AnyBuffer V, ffi::Result<ffi::AnyBuffer> U, int64_t nkx, int64_t nky,
+    int64_t nkz, double scale_g, double scale_f, double mult, ffi::Span<const int64_t> perm_l,
+    ffi::Span<const int64_t> phase_l, ffi::Span<const int64_t> perm_r, ffi::Span<const int64_t> phase_r,
+    std::string_view mathdx_root, std::string_view cubin_dir) {
+    return KleadLorentzImpl(stream, Gp, Gt, row, trs, lsrc, rsrc, mph, nph, spin, &kout, V, U, nkx, nky, nkz,
+                            scale_g, scale_f, mult, perm_l, phase_l, perm_r, phase_r, mathdx_root, cubin_dir);
+}
+static ffi::Error KleadLorentzConjConv(
     cudaStream_t stream, ffi::AnyBuffer Gp, ffi::AnyBuffer Gt, ffi::AnyBuffer row, ffi::AnyBuffer trs,
     ffi::AnyBuffer lsrc, ffi::AnyBuffer rsrc, ffi::AnyBuffer mph, ffi::AnyBuffer nph, ffi::AnyBuffer spin,
     ffi::AnyBuffer kout, ffi::AnyBuffer V, ffi::Result<ffi::AnyBuffer> U, int64_t nkx, int64_t nky,
@@ -2253,6 +2273,26 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Arg<xla::ffi::AnyBuffer>()   // V (R space)
         .Ret<xla::ffi::AnyBuffer>()
         LRX_KCONV_GRID_ATTRS
+        .Attr<std::string_view>("mathdx_root")
+        .Attr<std::string_view>("cubin_dir"));
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(
+    KConvMathdxKleadUnfoldBlockCudaFfi, lorrax_ffi::kconv_mathdx::KleadUnfoldBlockConv,
+    xla::ffi::Ffi::Bind()
+        .Ctx<xla::ffi::PlatformStream<cudaStream_t>>()
+        .Arg<xla::ffi::AnyBuffer>()   // Gp
+        .Arg<xla::ffi::AnyBuffer>()   // Gt (unread when conj_src)
+        .Arg<xla::ffi::AnyBuffer>()   // row
+        .Arg<xla::ffi::AnyBuffer>()   // trs
+        .Arg<xla::ffi::AnyBuffer>()   // lsrc
+        .Arg<xla::ffi::AnyBuffer>()   // rsrc
+        .Arg<xla::ffi::AnyBuffer>()   // mph
+        .Arg<xla::ffi::AnyBuffer>()   // nph
+        .Arg<xla::ffi::AnyBuffer>()   // spin
+        .Arg<xla::ffi::AnyBuffer>()   // kout
+        .Arg<xla::ffi::AnyBuffer>()   // V (R space)
+        .Ret<xla::ffi::AnyBuffer>()
+        LRX_KCONV_GRID_ATTRS
         .Attr<int64_t>("conj_src")    // 1: the antiunitary partner is conj(Gp); Gt unread
         .Attr<int64_t>("spin_block")  // d: store the (d x d) output spin block at (a0, b0); 0 = all
         .Attr<int64_t>("a0")
@@ -2262,6 +2302,35 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
     KConvMathdxKleadLorentzRowsCudaFfi, lorrax_ffi::kconv_mathdx::KleadLorentzRowsConv,
+    xla::ffi::Ffi::Bind()
+        .Ctx<xla::ffi::PlatformStream<cudaStream_t>>()
+        .Arg<xla::ffi::AnyBuffer>()   // Gp
+        .Arg<xla::ffi::AnyBuffer>()   // Gt
+        .Arg<xla::ffi::AnyBuffer>()   // row
+        .Arg<xla::ffi::AnyBuffer>()   // trs
+        .Arg<xla::ffi::AnyBuffer>()   // lsrc
+        .Arg<xla::ffi::AnyBuffer>()   // rsrc
+        .Arg<xla::ffi::AnyBuffer>()   // mph
+        .Arg<xla::ffi::AnyBuffer>()   // nph
+        .Arg<xla::ffi::AnyBuffer>()   // spin
+        .Arg<xla::ffi::AnyBuffer>()   // kout
+        .Arg<xla::ffi::AnyBuffer>()   // V (nk, mx, nA, my, nB), R space
+        .Ret<xla::ffi::AnyBuffer>()
+        .Attr<int64_t>("nkx")
+        .Attr<int64_t>("nky")
+        .Attr<int64_t>("nkz")
+        .Attr<double>("scale_g")
+        .Attr<double>("scale_f")
+        .Attr<double>("mult")
+        .Attr<xla::ffi::Span<const int64_t>>("perm_l")
+        .Attr<xla::ffi::Span<const int64_t>>("phase_l")
+        .Attr<xla::ffi::Span<const int64_t>>("perm_r")
+        .Attr<xla::ffi::Span<const int64_t>>("phase_r")
+        .Attr<std::string_view>("mathdx_root")
+        .Attr<std::string_view>("cubin_dir"));
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(
+    KConvMathdxKleadLorentzConjCudaFfi, lorrax_ffi::kconv_mathdx::KleadLorentzConjConv,
     xla::ffi::Ffi::Bind()
         .Ctx<xla::ffi::PlatformStream<cudaStream_t>>()
         .Arg<xla::ffi::AnyBuffer>()   // Gp
