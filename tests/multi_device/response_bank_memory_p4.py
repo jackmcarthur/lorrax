@@ -17,6 +17,7 @@ import numpy as np
 from jax.sharding import NamedSharding, PartitionSpec as P
 
 from common.collectives import resolve_mesh, gather_to_host
+from gw.photon_layout import PhotonBasisLayout, PhotonFamilies
 from gw.response_bank import _bank_execution
 from gw.shared_pole_recipe import CapacityLedger
 from gw.w_isdf import _get_chi_fractional_contour_kernel_face
@@ -26,18 +27,21 @@ def main():
     mesh = resolve_mesh()
     assert mesh.size == 4
     root = Path(sys.argv[1])
-    nk, nb, ns, n = 8, 8, 4, 16
+    nk, nb, ns, nc = 8, 8, 4, 4
     rng = np.random.default_rng(477)
-    psi = (rng.normal(size=(nk, ns, n, nb))
-           + 1j*rng.normal(size=(nk, ns, n, nb))) / 16
-    current = psi * np.array([1., -1., 1j, -1j])[None, :, None, None]
+    # Charge and current families, four centroids each (full-k faces).
+    families = [(rng.normal(size=(nk, ns, nc, nb))
+                 + 1j*rng.normal(size=(nk, ns, nc, nb))) / 16 for _ in range(2)]
+    layout = PhotonBasisLayout.from_centroid_extents(nc, nc, mesh, packed=True)
+    stream = PhotonFamilies(plans=(None, None), packed_layout=layout, layout=layout)
+    n = layout.packed_extent
     def put(value, spec):
         value = np.asarray(value)
         return jax.make_array_from_callback(value.shape, NamedSharding(mesh, spec),
                                              lambda ix: value[ix])
-    mun = tuple(put(v, P(None,None,'x','y')) for v in (psi,current))
+    mun = tuple(put(v, P(None,None,'x','y')) for v in families)
     nmu = tuple(put(v.conj().transpose(0,3,1,2), P(None,'x',None,'y'))
-                for v in (psi,current))
+                for v in families)
     energy = np.broadcast_to(np.linspace(-1,2,nb),(nk,nb)).copy()
     f = 1/(1+np.exp(energy/.3))
     args = (put(np.array([0.,.3,1.]),P()),
@@ -47,7 +51,7 @@ def main():
     def zero():
         return put(np.zeros((2,3,n,n),complex),carry_spec)
     kernel = _get_chi_fractional_contour_kernel_face(mesh,(2,2,2),2,
-        (nk,nb,n,ns),selected_q=(0,3,7),ordered=True,vertex=True,bank_carry=True)
+        (nk,nb,n,ns),selected_q=(0,3,7),ordered=True,vertex=stream,bank_carry=True)
     shape_args = (*args,zero())
     compiled = kernel.lower(*shape_args).compile()
     memory = compiled.memory_analysis()

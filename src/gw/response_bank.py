@@ -5,6 +5,7 @@ Photon operators use ``PhotonBasisLayout`` for charge and current endpoints.
 Disk conversion belongs to the scratch writer. Dense products and solves
 enter through ``distrib_la``.
 """
+from dataclasses import dataclass
 from functools import partial
 from functools import lru_cache
 import hashlib
@@ -219,39 +220,42 @@ def response_weights(wfns, meta):
     }
 
 
-@lru_cache(maxsize=None)
-def _parent_face_unfold(plan, mesh_xy, wfn_layout):
-    """Both endpoint faces of one parent family unfolded to full k, once per plan.
+@dataclass(frozen=True, eq=False)
+class PhotonEndpoints:
+    """The four-current stream's endpoints: two families' raw-parent faces.
 
-    SC maps keep the parent plan and rotate only the carrier values, so the
-    same program serves every map.
+    ``families`` is the stream's static description (plans, layouts, order
+    bases); ``mun``/``nmu`` the ``(charge, current)`` parent faces in each
+    family's packed centroid order; ``enk`` the parents' energies.  No psi
+    face is unfolded or vertex-applied: the stream contracts each family
+    pair's Green on the parents and applies ``(1, alpha)`` on its spin
+    indices (``w_isdf._get_chi_fractional_contour_kernel_face``).
     """
-    from common.shard_map import shard_map
-    from common.wfn_layout import psi_specs
-    nmu_spec, mun_spec = psi_specs(wfn_layout)
+    families: object
+    mun: tuple
+    nmu: tuple
+    enk: jax.Array
 
-    @partial(shard_map, mesh=mesh_xy, in_specs=(mun_spec, nmu_spec),
-             out_specs=(mun_spec, nmu_spec), check_vma=False)
-    def unfold(mun, nmu):
-        return (plan.unfold_face(mun, spin_axis=1, mu_axis=2, mesh_axis="x"),
-                plan.unfold_face(nmu, spin_axis=2, mu_axis=3, mesh_axis="y"))
-    return jax.jit(unfold)
+    @property
+    def n(self) -> int:
+        """The canonical photon extent of the stream's output rows."""
+        return int(self.families.layout.packed_extent)
+
+    @property
+    def fixed(self) -> tuple:
+        return (self.mun, self.nmu, self.enk)
 
 
 def prepare_photon_carriers(wfns, wfns_transverse, mu_bases, *,
                             mesh_xy, layout):
-    """Prepare bare/J-applied photon endpoints for the one response stream.
+    """Bind the charge and current families' raw-parent faces for the one response stream.
 
-    Each family is unfolded by its authenticated parent plan before applying
-    ``J=(I,alpha_x,alpha_y,alpha_z)``. Canonical centroid conversion precedes
-    the photon pack. Returned arguments are ``((bare_mun,J_mun),
-    (bare_nmu,J_nmu), energy)``; endpoints have four spin components and
-    ``layout.packed_extent`` centroids, with both face axes distributed.
-    Only linear-size wavefunction carriers are materialized here.
+    Returns :class:`PhotonEndpoints`.  ``layout`` is the bank's canonical
+    photon layout; the stream accumulates in the families' packed layout and
+    converts its rows once per call (``photon_layout.PhotonFamilies``).
+    Only the linear-size parent carriers are referenced; nothing is copied.
     """
-    from common.gamma_matrices import gamma_apply, gamma_perm_phase
-    from common.wfn_layout import psi_specs
-    from .photon_layout import pack_photon_faces
+    from .photon_layout import PhotonBasisLayout, PhotonFamilies
     from .w_isdf import _require_current_chi_endpoints
 
     left, right = _require_current_chi_endpoints(wfns, wfns_transverse)
@@ -262,22 +266,22 @@ def prepare_photon_carriers(wfns, wfns_transverse, mu_bases, *,
         raise ValueError("GATE response_vertex: endpoint energies disagree")
     if not np.array_equal(np.asarray(wfns.occ), np.asarray(wfns_transverse.occ)):
         raise ValueError("GATE response_vertex: endpoint occupations disagree")
-    nmu_spec, mun_spec = psi_specs(wfns.layout)
-    families = []
     for carrier, basis in zip((left, right), mu_bases):
-        mun, nmu = _parent_face_unfold(carrier.plan, mesh_xy, wfns.layout)(
-            carrier.psi_mun, carrier.psi_nmu)
-        families.append((basis.unpack_axis(mun, 2, spec=mun_spec),
-                         basis.unpack_axis(nmu, 3, spec=nmu_spec)))
-    endpoints = []
-    for index, orientation, spin_axis in ((0, "mun", 1), (1, "nmu", 2)):
-        bare = (families[0][index],) + (families[1][index],) * 3
-        current = tuple(gamma_apply(face, *gamma_perm_phase(A), axis=spin_axis,
-                                    is_identity=A == 0)
-                        for A, face in enumerate(bare))
-        endpoints.append(tuple(pack_photon_faces(faces, layout, mesh_xy,
-            orientation=orientation, wfn_layout=wfns.layout) for faces in (bare, current)))
-    return (*endpoints, wfns.enk)
+        if int(carrier.plan.n_centroid_packed) != int(basis.n_packed):
+            raise ValueError(
+                "GATE response_vertex: a family's parent plan and centroid basis "
+                f"disagree on the packed extent ({carrier.plan.n_centroid_packed} "
+                f"vs {basis.n_packed})")
+    packed = PhotonBasisLayout.from_centroid_extents(
+        mu_bases[0].n_packed, mu_bases[1].n_packed, mesh_xy, packed=True)
+    same_order = (all(basis.is_identity for basis in mu_bases)
+                  and packed.carrier_extents == layout.carrier_extents)
+    families = PhotonFamilies(
+        plans=(left.plan, right.plan),
+        packed_layout=layout if same_order else packed, layout=layout,
+        bases=None if same_order else tuple(mu_bases))
+    return PhotonEndpoints(families, (left.psi_mun, right.psi_mun),
+                           (left.psi_nmu, right.psi_nmu), left.enk)
 
 
 def photon_static_contact(wfns, meta, *, mesh_xy, layout, vertex,
@@ -310,8 +314,9 @@ def photon_static_contact(wfns, meta, *, mesh_xy, layout, vertex,
             rel_tol=sample_plan["bank_rule_tolerance"])
         kernel, fixed = response_stream(wfns, meta, mesh_xy=mesh_xy,
             q_ids=(0,), n_outputs=1, pair_mode="kms_static", vertex=vertex)
+        live_rows = stream_weights(wfns, live, mesh_xy)
         raw = execute(kernel, (jnp.asarray(rule["t"]), jnp.asarray(rule["weights"]),
-            *fixed, jnp.asarray(live), jnp.asarray(live), jnp.asarray([beta, mu])), "static_reference")
+            *fixed, live_rows, live_rows, jnp.asarray([beta, mu])), "static_reference")
         currents = photon_diagonal_current_faces(vertex, mesh_xy=mesh_xy,
             layout=layout, wfn_layout=wfns.layout)
         currents = (currents[0] * jnp.asarray(live)[:, None, :],
@@ -337,8 +342,9 @@ def photon_static_contact(wfns, meta, *, mesh_xy, layout, vertex,
             q_ids=(0,), n_outputs=1, pair_mode="laplace_ordered", vertex=vertex)
         projections = np.stack((-quad.alpha*np.exp(-gap*quad.tau), np.zeros_like(quad.tau)))
         raw = execute(kernel, (jnp.asarray(quad.tau), jnp.asarray(projections, dtype=jnp.complex128), *fixed,
-            jnp.asarray(np.stack((f, np.zeros_like(f)))),
-            jnp.asarray(np.stack((u, np.zeros_like(u)))), jnp.asarray([lo, hi])), "static_reference")
+            stream_weights(wfns, np.stack((f, np.zeros_like(f))), mesh_xy),
+            stream_weights(wfns, np.stack((u, np.zeros_like(u))), mesh_xy),
+            jnp.asarray([lo, hi])), "static_reference")
         drude = jax.jit(lambda: jnp.zeros((1, layout.packed_extent, layout.packed_extent), complex),
                         out_shardings=face)()
         receipt["static_rule"] = dict(provenance=quad.provenance, max_error=quad.max_error)
@@ -382,13 +388,14 @@ def response_stream(wfns, meta, *, mesh_xy, q_ids, n_outputs,
     if vertex is not None:
         if pair_mode == "laplace":
             raise ValueError("GATE response_vertex: photon Laplace cells must retain odd rows")
-        n = int(vertex[0][0].shape[2])
+        n_input = (int(meta.nk_tot) if vertex.families.n_parent is None
+                   else vertex.families.n_parent)
         kernel = _response_stream_kernel(
             mesh_xy, (meta.nkx, meta.nky, meta.nkz), n_outputs,
-            (int(meta.nk_tot), int(wfns.slices.nb_full), n, 4),
+            (n_input, int(wfns.slices.nb_full), vertex.n, 4),
             _ffi_key=ffi_dial_key(), layout=wfns.layout, selected_q=tuple(q_ids), pair_mode=pair_mode,
-            bank_carry=bank_carry, ordered=True, vertex=True, band_ranges=band_ranges)
-        return kernel, vertex
+            bank_carry=bank_carry, ordered=True, vertex=vertex.families, band_ranges=band_ranges)
+        return kernel, vertex.fixed
     if not charge_representation(meta):
         raise ValueError("GATE response_representation: want an authenticated "
                          "scalar, two-component, or four-component charge carrier")
@@ -405,12 +412,12 @@ def response_stream(wfns, meta, *, mesh_xy, q_ids, n_outputs,
     return kernel, (source.psi_mun, source.psi_nmu, source.enk)
 
 
-def stream_weights(wfns, weights, mesh_xy, *, parents=True):
+def stream_weights(wfns, weights, mesh_xy):
     """Place small band weights and restrict to existing raw parents."""
     from common.collectives import replicate_to_mesh
 
     result = replicate_to_mesh(np.asarray(weights), mesh_xy)
-    if parents and wfns.green_parent is not None:
+    if wfns.green_parent is not None:
         result = wfns.green_parent.plan.parent_rows(result, axis=result.ndim-2)
     return result
 
@@ -429,7 +436,6 @@ def exact_bare_moments(wfns, meta, *, mesh_xy, q_ids, execute, ordered=False,
 
     energy, f, u, reference, census = response_weights(wfns, meta)
     ordered = ordered or vertex is not None
-    weights = partial(stream_weights, parents=vertex is None)
     erel = energy - reference
     kernel, fixed = response_stream(wfns, meta, mesh_xy=mesh_xy,
                                     q_ids=q_ids, n_outputs=1, ordered=ordered,
@@ -440,8 +446,8 @@ def exact_bare_moments(wfns, meta, *, mesh_xy, q_ids, execute, ordered=False,
     for moment_terms in terms:
         total = None
         for coefficient, a, b in moment_terms:
-            weight_f = weights(wfns, f * erel**a, mesh_xy)
-            weight_u = weights(wfns, -1j * u * erel**b, mesh_xy)
+            weight_f = stream_weights(wfns, f * erel**a, mesh_xy)
+            weight_u = stream_weights(wfns, -1j * u * erel**b, mesh_xy)
             args = (jnp.asarray([0.]), jnp.asarray([[1. + 0j]]), *fixed,
                     weight_f.astype(jnp.complex128), weight_u,
                     jnp.asarray(reference))
@@ -457,8 +463,8 @@ def exact_bare_moments(wfns, meta, *, mesh_xy, q_ids, execute, ordered=False,
     for moment_terms in (((1., 0, 0),), ((1., 2, 0), (-2., 1, 1), (1., 0, 2))):
         total = None
         for coefficient, a, b in moment_terms:
-            weight_f = weights(wfns, f * erel**a, mesh_xy)
-            weight_u = weights(wfns, u * erel**b, mesh_xy)
+            weight_f = stream_weights(wfns, f * erel**a, mesh_xy)
+            weight_u = stream_weights(wfns, u * erel**b, mesh_xy)
             args = (jnp.asarray([0.]), jnp.asarray([[1. + 0j]]), *fixed,
                     weight_f.astype(jnp.complex128), weight_u.astype(jnp.complex128),
                     jnp.asarray(reference))
@@ -786,7 +792,7 @@ def compute_moment_bank(wfns, meta, config, *, mesh_xy, sym, bank_io,
     ledger = meta.shared_pole_capacity
     ambient = ledger.live_stages
     started = time.monotonic()
-    n = meta.mu_basis.n_packed if vertex is None else vertex[0][0].shape[2]
+    n = meta.mu_basis.n_packed if vertex is None else vertex.n
     face_bytes = 16*n**2 // mesh_xy.size
     # Two totals, next correlation, arithmetic temporaries and bounded H/solve.
     ordered = vertex is not None or not bool(sym.trs_allowed)
@@ -1112,15 +1118,14 @@ def integrate_response_group(wfns, meta, mesh_xy, rules, group, *, q_ids,
                              execute, receipt, ordered=False, vertex=None):
     """Donated [value/ds per member, q, mu_X, nu_Y]; one Green/FFT scan per group."""
     times, weights = _group_stream_arguments(rules, group)
-    n = meta.mu_basis.n_packed if vertex is None else vertex[0][0].shape[2]
+    n = meta.mu_basis.n_packed if vertex is None else vertex.n
     kernel, fixed = response_stream(wfns, meta, mesh_xy=mesh_xy,
         q_ids=q_ids, n_outputs=weights.shape[1], pair_mode="direct", bank_carry=True,
         ordered=ordered, vertex=vertex, band_ranges=rules["band_ranges"])
     raw = jax.jit(lambda: jnp.zeros((weights.shape[1],len(q_ids),n,n),jnp.complex128),
         out_shardings=NamedSharding(mesh_xy,P(None,None,"x","y")))()
-    stream = partial(stream_weights, parents=vertex is None)
     args = (jnp.asarray(times), jnp.asarray(weights), *fixed,
-        stream(wfns, rules["f"], mesh_xy), stream(wfns, rules["u"], mesh_xy),
+        stream_weights(wfns, rules["f"], mesh_xy), stream_weights(wfns, rules["u"], mesh_xy),
         jnp.asarray(rules["refs"]), raw)
     raw = execute(kernel, args, "direct")
     receipt["correlation_count"] += int(group["count"])
@@ -1134,15 +1139,15 @@ def _stream_workspace(wfns, meta, mesh_xy, support, *, q_ids, n_outputs, ordered
     this compilation when every sample fits in one group.
     """
     import minimax
-    n = meta.mu_basis.n_packed if vertex is None else vertex[0][0].shape[2]
+    n = meta.mu_basis.n_packed if vertex is None else vertex.n
     kernel, fixed = response_stream(wfns, meta, mesh_xy=mesh_xy, q_ids=q_ids,
         n_outputs=n_outputs, pair_mode="direct", bank_carry=True, ordered=ordered,
         vertex=vertex, band_ranges=support["band_ranges"])
     capacity = minimax.RESPONSE_NODE_CAPACITY
-    weights = partial(stream_weights, parents=vertex is None)
     abstract = (jax.ShapeDtypeStruct((capacity,), jnp.complex128),
                 jax.ShapeDtypeStruct((2, n_outputs, capacity), jnp.complex128),
-                *fixed, weights(wfns, support["f"], mesh_xy), weights(wfns, support["u"], mesh_xy),
+                *fixed, stream_weights(wfns, support["f"], mesh_xy),
+                stream_weights(wfns, support["u"], mesh_xy),
                 jax.ShapeDtypeStruct((2,), jnp.float64),
                 jax.ShapeDtypeStruct((n_outputs, len(q_ids), n, n), jnp.complex128,
                     sharding=NamedSharding(mesh_xy, P(None, None, "x", "y"))))
@@ -1212,7 +1217,7 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                 rows = list(dict.fromkeys(rows+mirror_qids[first:last].tolist()))
             return tuple(rows)
 
-        n = meta.mu_basis.n_packed if vertex is None else vertex[0][0].shape[2]
+        n = meta.mu_basis.n_packed if vertex is None else vertex.n
         if ordered:
             receipt["ordered"] = True
         started = time.monotonic()
@@ -1457,24 +1462,15 @@ def compute_photon_bank(wfns, wfns_transverse, meta, config, *, mesh_xy, sym,
     ledger = meta.shared_pole_capacity
     ambient = ledger.live_stages
     nq, n = len(sym.q_irr_full_idx), layout.packed_extent
-    # Packed V, contact/reference/D and one family-read envelope, all XY tiled.
+    # Packed V, contact/reference/D, all XY tiled.  The stream reads the two
+    # families' resident raw-parent carriers; it prepares no endpoint copy.
     vbytes = 16*(nq+4)*n*n//mesh_xy.size
-    from common.wfn_layout import psi_specs
-    nmu_spec, mun_spec = psi_specs(wfns.layout)
-    nk, nb = wfns.enk.shape
-    ns = wfns.green_parent.psi_mun.shape[1]
-    carrier_shapes = ((nk, ns, n, nb), (nk, nb, ns, n))
-    endpoint_bytes = 2 * sum(16 * int(np.prod(
-        NamedSharding(mesh_xy, spec).shard_shape(shape)))
-        for shape, spec in zip(carrier_shapes, (mun_spec, nmu_spec)))
-    name, row = _reserve(meta, "photon_endpoints_and_V", vbytes + endpoint_bytes)
+    name, row = _reserve(meta, "photon_endpoints_and_V", vbytes)
     ledger.live_stages = ambient+(name,)
     receipt["memory"].append(row)
     receipt["endpoint_memory"] = dict(
-        retained_bytes_per_rank=endpoint_bytes,
-        carrier_shapes=[list(shape) for shape in carrier_shapes],
-        copies_per_orientation=2, layout=wfns.layout,
-        scope="four prepared carriers; preparation intermediates and external native workspace not included")
+        retained_bytes_per_rank=0, layout=wfns.layout,
+        scope="the stream reads the resident raw-parent carriers of both families")
     before = time.monotonic()
     if jax.process_index() == 0:
         print("photon bank: preparing shared vertex endpoints and bare V", flush=True)

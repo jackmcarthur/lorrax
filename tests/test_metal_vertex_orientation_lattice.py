@@ -2,7 +2,9 @@
 
 The small CPU plant uses the same explicitly declared FFT/GEMM stand-ins as
 the charge orientation plant. It tests nonzero real times and all sixteen
-vertex blocks, including a conjugation-error red twin.
+vertex blocks: the stream builds each (charge, current) family pair's Green
+and applies the Dirac vertices on its spin indices.  Red twins: the wrong q
+orientation, and a current family that is not the one the T channels read.
 """
 import numpy as np
 import pytest
@@ -19,6 +21,8 @@ def check_fractional_vertex_stream_supercell(mesh, put):
     from common.collectives import gather_to_host
     from common.wfn_layout import PSI_MUN_SPEC, PSI_NMU_SPEC
     from common.gamma_matrices import _gamma_tables
+    from gw.photon_layout import PhotonBasisLayout, PhotonFamilies
+    from gw.response_bank import PhotonEndpoints
     from gw.w_isdf import _get_chi_fractional_contour_kernel_face
 
     lat = _Lattice(n1=3, n2=1, n_sites=8)
@@ -49,16 +53,15 @@ def check_fractional_vertex_stream_supercell(mesh, put):
             expected[iq, it] = np.einsum("mArnB,r->AmBn", chi, phase).reshape(8, 8)
 
     cell = np.sqrt(lat.nk) * psi[:, :, 0]
-    # Vertex is applied to both endpoint carriers of G^>, before build_G.
-    bare = np.concatenate([cell] * 4, axis=2)
-    current = np.concatenate([
-        np.einsum("ij,knmj->knmi", gamma, cell)
-        for gamma in _gamma_tables], axis=2)
-    mun = tuple(put(x.transpose(0, 3, 2, 1), PSI_MUN_SPEC) for x in (bare, current))
-    nmu = tuple(put(x.transpose(0, 1, 3, 2), PSI_NMU_SPEC) for x in (bare, current))
+    # One site pair serves both centroid families (charge, current); the
+    # packed photon order on a 1x1 mesh is C, T1, T2, T3.
+    layout = PhotonBasisLayout.from_centroid_extents(2, 2, mesh, packed=True)
+    families = PhotonFamilies(plans=(None, None), packed_layout=layout, layout=layout)
+    mun = tuple(put(x.transpose(0, 3, 2, 1), PSI_MUN_SPEC) for x in (cell, cell))
+    nmu = tuple(put(x.transpose(0, 1, 3, 2), PSI_NMU_SPEC) for x in (cell, cell))
     kernel = _get_chi_fractional_contour_kernel_face(
         mesh, (lat.n1, lat.n2, 1), len(times), (lat.nk, 8, 8, 4),
-        ordered=True, vertex=True)
+        ordered=True, vertex=families)
     def evaluate(left, right):
         values = kernel(put(times), put(np.eye(len(times), dtype=complex)),
                         left, right, put(e), put(f.astype(complex)),
@@ -71,12 +74,13 @@ def check_fractional_vertex_stream_supercell(mesh, put):
             block = (slice(None), slice(None), slice(2*A, 2*A+2), slice(2*B, 2*B+2))
             np.testing.assert_allclose(got[block], expected[block], rtol=2e-12, atol=2e-13)
 
-    # Red twins: wrong q orientation, and conjugating alpha_y on just one
-    # endpoint. Each must be rejected by the same known-answer comparison.
+    # Red twins: wrong q orientation, and a current family whose two sites
+    # are exchanged on one endpoint (the T channels must read the current
+    # family, the C channel the charge family). Each must be rejected by the
+    # same known-answer comparison.
     assert np.linalg.norm(got[lat.minus()] - expected) / np.linalg.norm(expected) > 1e-3
-    wrong_current = current.copy()
-    wrong_current[:, :, 4:6] *= -1
-    red = evaluate(mun, (nmu[0], put(wrong_current.transpose(0, 1, 3, 2), PSI_NMU_SPEC)))
+    swapped = put(cell[:, :, ::-1].transpose(0, 1, 3, 2), PSI_NMU_SPEC)
+    red = evaluate(mun, (nmu[0], swapped))
     assert np.linalg.norm(red - expected) / np.linalg.norm(expected) > 1e-3
 
     # The exact coefficients reuse this stream with energy-power weights.
@@ -89,7 +93,7 @@ def check_fractional_vertex_stream_supercell(mesh, put):
         mu_basis=SimpleNamespace(n_packed=8))
     a0, a1, o0, o1, _ = exact_bare_moments(wfns, meta, mesh_xy=mesh,
         q_ids=tuple(range(lat.nk)), execute=lambda kernel,args,label: kernel(*args),
-        vertex=(mun, nmu, put(e)))
+        vertex=PhotonEndpoints(families, mun, nmu, put(e)))
     for power, value in enumerate((o0, a0, o1, a1)):
         coefficient = np.einsum("ab,abmA,abrnB->mArnB",
             df*(-delta)**power, rho[:, :, 0], rho.conj())
@@ -110,7 +114,7 @@ def check_fractional_vertex_stream_supercell(mesh, put):
     projections[6:] = np.eye(2)
     laplace = _get_chi_fractional_contour_kernel_face(mesh, (lat.n1, lat.n2, 1),
         4, (lat.nk, 8, 8, 4), selected_q=tuple(range(lat.nk)),
-        pair_mode="laplace_ordered", vertex=True)
+        pair_mode="laplace_ordered", vertex=families)
     result = laplace(put(tau), put(projections), mun, nmu, put(e),
         put(np.stack([f*lower, (1-f)*lower])),
         put(np.stack([(1-f)*upper, f*upper])), put(refs))
@@ -136,7 +140,7 @@ def check_fractional_vertex_stream_supercell(mesh, put):
     rule = minimax.matsubara_response_rule(1/0.7, float(e.max()-e.min()), (0,))
     static = _get_chi_fractional_contour_kernel_face(mesh, (lat.n1, lat.n2, 1),
         1, (lat.nk, 8, 8, 4), selected_q=(0,), pair_mode="kms_static",
-        ordered=True, vertex=True)
+        ordered=True, vertex=families)
     result = static(put(rule["t"]), put(rule["weights"]), mun, nmu, put(e),
                     put(np.ones_like(f)), put(np.ones_like(f)), put(np.array([1/0.7, mu])))
     weights = np.divide(df, delta, out=np.zeros_like(df), where=delta != 0)
