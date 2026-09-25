@@ -29,8 +29,8 @@
 //     sphere → box chain).  Chosen when the plan is built, from the shape and
 //     the device's opt-in shared memory; a pair that does not fit runs as two
 //     cuBLAS GEMMs.  The kernel is NVRTC-built per (N1', K1, N2', K2) from the
-//     nvidia-mathdx wheel (`mathdx_root`; the version require_fourier_plan
-//     admits, see pair_kernel) through common/nvrtc_build, disk cached under
+//     nvidia-mathdx wheel (`mathdx_root`, passed only on a wheel in
+//     ffi.fft.PAIR_MATHDX_WHEELS, see pair_kernel) through common/nvrtc_build, disk cached under
 //     `cubin_dir` by that service's key rule.
 //
 // Plans (device matrices, remap tables, cuFFT plans) are cached per
@@ -243,8 +243,9 @@ static ffi::Error pair_kernel(int dev, int64_t n1, int64_t k1, int64_t n2, int64
     // variadic under NVRTC, and CCCL 3 (CUDA 13) declares them with one parameter in
     // cuda/std/__tuple_dir/structured_bindings.h: NVRTC refuses the pair.  Its include guard
     // is defined, so CCCL's declarations (structured bindings of cuda::std types, unused
-    // here) drop out and CUTLASS's stand.  The wheel version is checked at startup
-    // (ffi.fft.require_fourier_plan, GATE mathdx-pair-wheel) and keys the cubin.
+    // here) drop out and CUTLASS's stand.  The wheel version is checked where a plan builds
+    // the pair (ffi.fft.pair_build_attrs: another wheel passes no mathdx_root, so the plan runs
+    // the cuBLAS chain) and keys the cubin.
     prog.defs = {"--std=c++17", "--device-as-default-execution-space", "-diag-suppress=1215",
                  "-D_CUDA_STD___TUPLE_STRUCTURED_BINDINGS_H",
                  "--gpu-architecture=sm_" + std::to_string(cc_major) + std::to_string(cc_minor),
