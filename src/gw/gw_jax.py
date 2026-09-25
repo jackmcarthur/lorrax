@@ -1101,6 +1101,28 @@ def _sigma_output_fields(
     return (e_eval_ev, efermi_dft_ev, final_static_head_terms, h_transverse, head_sigma_diag_w_kn_ry, omega_dft_rel_ev, omega_grid_ev, omega_grid_ry, photon_head_sigma_basis, photon_head_sigma_diag_tskn_ry, sig_coh, sig_h, sig_h_scalar, sig_sx, sig_x, sig_x_diag_ry, sigma_c_at_dft_ev, sigma_c_odd_at_dft_ev, sigma_c_omega, sigma_lorentz_skij_ry, sigma_omega_h5_path, sigma_total, sigma_xc_at_dft_ev)
 
 
+def _qp_hamiltonian(kin_ion, sigma_total, mesh_xy):
+    """``H = 0.5 (S + S^H)``, ``S = kin_ion + Σ_total``: one program, replicated.
+
+    Spelled eagerly, ``S`` was formed twice and every op (sum, swapaxes, conj,
+    add, scale) materialised its own replicated ``(nk, nb, nb)`` stack, the
+    add all-gathering the band-sharded Σ.  One jit forms ``S`` once and
+    returns only ``H``, at the replicated layout the eigensolve below reads.
+    """
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    fn = _QP_HAMILTONIAN.get(mesh_xy)
+    if fn is None:
+        @jax.jit(out_shardings=NamedSharding(mesh_xy, P(None, None, None)))
+        def fn(kin, sig):
+            S = kin + sig
+            return 0.5 * (S + jnp.conj(jnp.swapaxes(S, -1, -2)))
+        _QP_HAMILTONIAN[mesh_xy] = fn
+    return fn(kin_ion, sigma_total)
+
+
+_QP_HAMILTONIAN: dict = {}
+
+
 def _diagonalize_qp_hamiltonian(
         band_slices, config, input_dir, kin_ion, mesh_xy, print0, qp_solver, sigma_total, wfn):
     """Produce the QP eigensystem and initialize output timing."""
@@ -1115,7 +1137,7 @@ def _diagonalize_qp_hamiltonian(
                "Σ is a defect in the contraction or in what was handed to "
                "it, not a convergence problem.")
     with timing.section("gw_jax.qp_eigh") as _sec_eigh:
-        H = 0.5 * ((kin_ion + sigma_total) + jnp.conj(jnp.swapaxes(kin_ion + sigma_total, -1, -2)))
+        H = _qp_hamiltonian(kin_ion, sigma_total, mesh_xy)
         E_full, U_full = jax.vmap(jnp.linalg.eigh, in_axes=0)(H)
         _sec_eigh.watch(E_full, U_full)
     sanity.refuse_nonfinite(
