@@ -64,8 +64,9 @@ defining $U$.
 | the lowest `sc_frozen_core_bands` | held at the DFT block $\mathrm{diag}(E_{\rm DFT})$; they stay in the $\Sigma_x$ and $\chi_0$ sums |
 | the sum-band tail `[b3, number_bands)` | DFT orbitals with an energy-only rigid shift from `sc_tail_fit`, refit every map. The default `conduction_mean` is the $Z$-weighted mean QP correction of the window's conduction states that read their own $\Sigma(E)$ (below) |
 
-Every window band keeps its full Σ at its own energy: under the default
-`sigma_out_of_grid = cover` the grid grows over it (§4). Map 0, or an
+Every window band keeps its full Σ. Under the default `sigma_out_of_grid =
+cover` a band the W model treats as active reads Σ at its own energy, and
+the grid grows over it; a deeper band reads $\Sigma(\omega = 0)$ (§4). Map 0, or an
 authenticated seed, classifies the band set once, and the set stays frozen:
 no band enters or leaves it later.
 
@@ -179,13 +180,19 @@ state.
 
   | policy | an off-grid $\Sigma(E)$ reads | error past the edge, median / p90 (eV) | risk | cost |
   |---|---|---|---|---|
-  | `cover` (default) | nothing is off-grid: the grid grows over every protected identity outside `sc_frozen_core_bands` | 0 | unfrozen semicore is covered too: MoS2 to −90 eV costs 19× the quadrature nodes and 9× the wall time, and converges more slowly | Fe 4³, +28 against +8: pair cost 797 against 509, the same steady map time, 2 min more rule build |
+  | `cover` (default) | nothing active is off-grid: the grid grows over every protected identity the W model treats as active; deeper identities read $\Sigma(\omega = 0)$ | 0 for active states | shallow semicore near the active-depth line is covered and stiff: MoS2 S 3s (depth 13.9–15.1 eV) takes 17–18 maps against static's 8 | Fe 4³ with no frozen core: grid to +31 eV (not −98), SC driver 1.33× static on one map |
   | `clamp` | $\Sigma(\omega_{\rm edge})$ | Fe 0.3–0.7 / 0.8–4.7; CrI3 0.05–0.12 / 0.5–2.2; MoS2 0.2–0.3 / 0.6–0.8 | continuous at the edge, but every clamped state inherits Σ there; an edge on a GN-PPM pole gives errors of order $10^3$ eV | none |
   | `static` | $\Sigma(\omega = 0)$ | Fe 1.6–4.4; CrI3 0.4–0.5; MoS2 0.6–0.8 (median) | two fixed points for states within the edge jump (§5) | none |
 
   The numbers are from CLAIMS 2710: truth is the sampled Σ over the 2–6 eV
   beyond a truncated edge. `clamp` and `static` are there to second-guess a
-  hard system; `cover` with the semicore frozen is the production policy.
+  hard system. **Active** is the shared-pole census rule,
+  $\max_k E^{\rm DFT}_{nk} \ge E_F - 15$ eV (`shared_pole_recipe.active_band_mask`),
+  evaluated once on the DFT ladder, so a state never switches between
+  $\Sigma(E)$ and $\Sigma(0)$. Deeper states are the ones the W model carries no
+  plasma charge for; covering Fe 4³'s 3s/3p stretched the grid to −98 eV,
+  ran 5× slower and moved them 16 eV (CLAIMS 2739). An energy-only law for
+  them would sit 11–16 eV from $\Sigma(0)$, which is why they keep it.
   A tail matched to the edge, $C_n/(\omega - \bar\omega_n)$ with the sum
   rule $C_n > 0$, is not offered: Σ at a grid edge is far from its $1/\omega$
   asymptote (Fe: −5 to −7 eV at +28 eV), so the matched pole falls inside
@@ -193,8 +200,8 @@ state.
 - **Growth.** A state that must be covered and moves past the sampled grid
   grows only the outer samples, out to $E \pm \mathrm{pad}(E)$ with
   $\mathrm{pad}(E) = 0.5\ \mathrm{eV} + 0.10\,\lvert E - \mu\rvert$
-  (`scissor.sc_state_pad_ev`). Under `cover` that is every protected identity
-  outside `sc_frozen_core_bands`. Under `clamp` and `static` it is only a
+  (`scissor.sc_state_pad_ev`). Under `cover` that is every protected, active
+  identity outside `sc_frozen_core_bands`. Under `clamp` and `static` it is only a
   state inside the padded window, the solution of
   $E \ge \omega_{\min} - \mathrm{pad}(E)$ and $E \le \omega_{\max} + \mathrm{pad}(E)$
   (`scissor.sc_padded_window_ev`). Old samples do not change, the grown
