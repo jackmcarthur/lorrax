@@ -584,9 +584,9 @@ def compute_screening(
                     iteration_head_response.static_chi_body_gamma
                     if iteration_head_response is not None else None))
             with timing.section("W.gate"):
-                # The reciprocity half of the gate reads W at −q: the
-                # full zone, transient, for this check only.
-                _gate_w(W_static.unfold(mesh_xy), req, print_fn=print_fn,
+                # On the wedge: the reciprocity half reads each wedge row's
+                # -q partner from the unfold tables, not the full zone.
+                _gate_w(W_static, req, mesh_xy=mesh_xy, print_fn=print_fn,
                         kgrid=tuple(meta.kgrid),
                         trs_allowed=_trs_verdict(sym))
             _store_role(req.role, idx, W_static)
@@ -649,7 +649,7 @@ def compute_screening(
             head_channel=head_channel,
             ordered_orientations=bool(_tr_odd and on_imag))
         with timing.section("W.gate"):
-            _gate_w(W.unfold(mesh_xy), req, print_fn=print_fn,
+            _gate_w(W, req, mesh_xy=mesh_xy, print_fn=print_fn,
                     trs_allowed=_trs_verdict(sym))
         _store_role(req.role, idx, W)
         bar.step()
@@ -923,9 +923,15 @@ def _trs_verdict(sym) -> bool:
     return bool(sym.trs_allowed)
 
 
-def _gate_w(W, req: ScreeningRequest, *, print_fn: Callable = print,
+def _gate_w(W_op, req: ScreeningRequest, *, mesh_xy, print_fn: Callable = print,
             kgrid=None, trs_allowed: bool) -> None:
     """Stage gate on one solved W — the Dyson solve is the fragile seam.
+
+    ``W_op`` is the solved ``QirrOperator``; every statistic is read on its
+    wedge rows.  Finiteness of the wedge is finiteness of the full zone
+    (the unfold is a centroid permutation with unit phases), ``W[q=0]`` is
+    a wedge representative, and the reciprocity pairs each wedge row with
+    the unfold's row at -q (``QirrOperator.at_minus_q``).
 
     ``W = (1 − Vχ₀)⁻¹V`` is the only place in the GW flow where a matrix
     *inverse* of a near-singular object is taken at production scale, and
@@ -961,7 +967,9 @@ def _gate_w(W, req: ScreeningRequest, *, print_fn: Callable = print,
             "SymMaps.trs_allowed verdict; got "
             f"{trs_allowed!r}.")
     label = f"W[{req.role}]"
+    W = W_op.values
     sanity.check_finite(label, W, print_fn=print_fn)
+    W_q0 = W_op.representative_row(0)
     if abs(complex(req.omega_ry).real) == 0.0:
         # HERMITICITY, and the one frequency at which it is unconditional.
         #
@@ -1009,10 +1017,10 @@ def _gate_w(W, req: ScreeningRequest, *, print_fn: Callable = print,
         # the χ₀ completion, registered separately; this gate must not
         # assert a property only that defect is supplying.
         if abs(complex(req.omega_ry).imag) == 0.0 or trs_allowed:
-            sanity.check_hermitian(f"{label}[q=0]", W[0], rtol=1e-6,
+            sanity.check_hermitian(f"{label}[q=0]", W_q0, rtol=1e-6,
                                    print_fn=print_fn)
         else:
-            sanity.check_hermitian(f"{label}[q=0]", W[0], rtol=1e-6,
+            sanity.check_hermitian(f"{label}[q=0]", W_q0, rtol=1e-6,
                                    print_fn=print_fn, measurement=True,
                                    cause=_TR_ODD_W_HERMITICITY_CAUSE)
         # The load-bearing property, over ALL q.
@@ -1064,8 +1072,9 @@ def _gate_w(W, req: ScreeningRequest, *, print_fn: Callable = print,
         # independent measurement rather than an identity, which is strictly
         # more informative.
         if kgrid is not None:
-            sanity.check_q_conjugate_reciprocity(
-                f"{label}[all q]", W, kgrid, rtol=1e-5, print_fn=print_fn)
+            sanity.check_q_conjugate_pair(
+                f"{label}[all q]", W, W_op.at_minus_q(kgrid, mesh_xy),
+                rtol=1e-5, print_fn=print_fn)
 
 
 __all__ = [
