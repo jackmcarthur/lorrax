@@ -919,63 +919,71 @@ __device__ __forceinline__ void tt_gather(const lrx_c2* g0, const lrx_c2* g0t, c
 }
 
 // The typed unfold of the staged cells in place, from shared tables only; ends with a barrier.
+// NS consecutive lanes of one warp own one (k, operand group): lane d forms column d's phases and
+// left = U g (pass 1), then, after a warp barrier, lane a forms row a of left U^dagger (pass 2),
+// so the column-to-row exchange never leaves the warp.  Every lane of a warp runs the same number
+// of rounds (the warp barrier needs the whole warp); k is fastest across the groups of a warp.
+static_assert(32 % NS == 0, "a warp holds whole spin groups");
 __device__ __forceinline__ void tt_finish(const TileTabs& s, int b, int npr, lrx_c2* bank) {
     const lrx_c2* u = s.u();
     const lrx_c2* mp = s.mp(b);
     const lrx_c2* np = s.np(b);
     const int* ls = s.ls(b);
     const int* rs = s.rs(b);
-    for (int i = threadIdx.x; i < NK * TT_GT * NR; i += blockDim.x) {
-        const int k = i % NK, q = i / NK, gi = q / NR, d = q % NR, jp = gi / TT_OPS;
-        if (jp >= npr) continue;
-        lrx_c2* col = bank + tt_cell(gi * SS + d, k);                   // cell (c, d) at col[c * CS]
-        constexpr int CS = NR * TT_RSTRIDE;
-        const int f = s.flag()[k];
-        const bool conj_src = f & 2, conj_row = f & 4;
-        const int r = rs[(jp * NK + k) * NR + d];
-        const lrx_c2 nq = np[(jp * NR + d) * NK + k];
-        lrx_c2 g[NS];
-#pragma unroll
-        for (int c = 0; c < NS; ++c) {
-            lrx_c2 v = {0.0, 0.0};
-            if (ls[(jp * NK + k) * NS + c] >= 0 && r >= 0) {
-                lrx_c2 sv = col[c * CS];
-                if (conj_src) sv.y = -sv.y;
-                v = lrx_mul_xla(lrx_mul_xla(mp[(jp * NS + c) * NK + k], sv), nq);
-                if (conj_row) v.y = -v.y;
-            }
-            g[c] = v;
-        }
-#pragma unroll
-        for (int aa = 0; aa < NS; ++aa) {
-            lrx_c2 v = {0.0, 0.0};
+    constexpr int CS = NR * TT_RSTRIDE;            // cell (c, d) of a group at col[c * CS]
+    constexpr int ITEMS = NK * TT_GT * NS;
+    for (int i0 = 0; i0 < ITEMS; i0 += blockDim.x) {
+        const int i = i0 + threadIdx.x, g = i / NS, e = i % NS;
+        const int k = g % NK, gi = g / NK, jp = gi / TT_OPS;
+        const bool live = i < ITEMS && jp < npr;
+        if (live) {                                    // pass 1: column d = e
+            const int d = e;
+            lrx_c2* col = bank + tt_cell(gi * SS + d, k);
+            const int f = s.flag()[k];
+            const bool conj_src = f & 2, conj_row = f & 4;
+            const int r = rs[(jp * NK + k) * NR + d];
+            const lrx_c2 nq = np[(jp * NR + d) * NK + k];
+            lrx_c2 gcol[NS];
 #pragma unroll
             for (int c = 0; c < NS; ++c) {
-                const lrx_c2 p = lrx_rot_mul(u[(aa * NS + c) * NK + k], g[c]);
-                v.x = __dadd_rn(v.x, p.x); v.y = __dadd_rn(v.y, p.y);
+                lrx_c2 v = {0.0, 0.0};
+                if (ls[(jp * NK + k) * NS + c] >= 0 && r >= 0) {
+                    lrx_c2 sv = col[c * CS];
+                    if (conj_src) sv.y = -sv.y;
+                    v = lrx_mul_xla(lrx_mul_xla(mp[(jp * NS + c) * NK + k], sv), nq);
+                    if (conj_row) v.y = -v.y;
+                }
+                gcol[c] = v;
             }
-            col[aa * CS] = v;
-        }
-    }
-    __syncthreads();
-    for (int i = threadIdx.x; i < NK * TT_GT * NS; i += blockDim.x) {
-        const int k = i % NK, q = i / NK, gi = q / NS, ra = q % NS, jp = gi / TT_OPS;
-        if (jp >= npr) continue;
-        lrx_c2* row = bank + tt_cell(gi * SS + ra * NR, k);             // cell (ra, d) at row[d * RS1]
-        constexpr int RS1 = TT_RSTRIDE;
-        lrx_c2 left[NR];
 #pragma unroll
-        for (int d = 0; d < NR; ++d) left[d] = row[d * RS1];
+            for (int aa = 0; aa < NS; ++aa) {
+                lrx_c2 v = {0.0, 0.0};
 #pragma unroll
-        for (int bb = 0; bb < NR; ++bb) {
-            lrx_c2 v = {0.0, 0.0};
-#pragma unroll
-            for (int d = 0; d < NR; ++d) {
-                const lrx_c2 p = lrx_rot_mul_conj(left[d], u[(bb * NR + d) * NK + k]);
-                v.x = __dadd_rn(v.x, p.x); v.y = __dadd_rn(v.y, p.y);
+                for (int c = 0; c < NS; ++c) {
+                    const lrx_c2 p = lrx_rot_mul(u[(aa * NS + c) * NK + k], gcol[c]);
+                    v.x = __dadd_rn(v.x, p.x); v.y = __dadd_rn(v.y, p.y);
+                }
+                col[aa * CS] = v;
             }
-            row[bb * RS1] = v;
         }
+        __syncwarp();
+        if (live) {                                    // pass 2: row a = e
+            lrx_c2* row = bank + tt_cell(gi * SS + e * NR, k);
+            lrx_c2 left[NR];
+#pragma unroll
+            for (int d = 0; d < NR; ++d) left[d] = row[d * TT_RSTRIDE];
+#pragma unroll
+            for (int bb = 0; bb < NR; ++bb) {
+                lrx_c2 v = {0.0, 0.0};
+#pragma unroll
+                for (int d = 0; d < NR; ++d) {
+                    const lrx_c2 p = lrx_rot_mul_conj(left[d], u[(bb * NR + d) * NK + k]);
+                    v.x = __dadd_rn(v.x, p.x); v.y = __dadd_rn(v.y, p.y);
+                }
+                row[bb * TT_RSTRIDE] = v;
+            }
+        }
+        __syncwarp();
     }
     __syncthreads();
 }
