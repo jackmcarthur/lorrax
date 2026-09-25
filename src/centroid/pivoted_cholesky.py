@@ -1,7 +1,7 @@
 """Pivoted-Cholesky pruning of over-sampled ISDF candidate points.
 
 Implements the q=0 candidate-pruning stage described in
-``pivoted_cholesky.md`` (sandbox root). The idea: k-means gives a set of M
+``docs/theory/centroid-selection.md``. K-means gives a set of M
 candidate points ``{r̃_a}`` (M > N_μ); the pair-product rows
 ``z_{a,(vck)} = φ*_{v,k}(r̃_a) ψ_{c,k}(r̃_a)`` define a Hermitian PSD Gram
 matrix ``G^{(0)} ∈ ℂ^{M×M}``.  For the transverse bispinor channel the
@@ -9,9 +9,9 @@ features are stacked over all three current components and the Gram is
 ``G_perp = Σ_i Z_i Z_i†`` with equal component weights. Greedy pivoted
 Cholesky picks the N_μ pivots
 with the largest residual Schur-complement diagonal, and the corresponding
-``r̃_a`` become the final ISDF points. This is strictly better than picking
-on amplitude alone because it targets the coherence structure of the
-valence-conduction pair-product space the ISDF fit will actually use.
+``r̃_a`` become the final ISDF points. This targets unrepresented feature
+weight within the candidate pool; it neither repairs holes outside that
+pool nor guarantees the conditioning or accuracy of every q-dependent fit.
 
 Architectural map to ``gw/isdf_fitting.py``:
 
@@ -29,16 +29,15 @@ collective at all, which is why the Gram is ROW-sharded.
 
 Shapes (following the md):
 
-    phi_val_cand   (nk, nv_eff, M)   complex  φ_{v,k}(r̃_a)
-    psi_cond_cand  (nk, nc_eff, M)   complex  ψ_{c,k}(r̃_a)
+    psi_l_Y        (nk, nb_l, ns, M) complex  left-window spinor faces
+    psi_r_Y        (nk, nb_r, ns, M) complex  right-window spinor faces
     G              (M, M)            complex  Hermitian PSD
     L              (M, k_keep)       complex  Cholesky columns (padded)
     piv            (k_keep,)         int32    pivots (−1 only on pool exhaustion)
     d_final        (M,)              real     Schur-complement residuals
 
-``nv_eff`` / ``nc_eff`` fold the spinor axis into the band axis
-(nv_eff = nv_bands · nspinor), matching the md's "assume spin has already
-been folded" convention.
+Spin stays explicit through the projector and vertex contraction owned by
+``isdf.core``; folding it into the band sum would change this Gram.
 """
 
 from __future__ import annotations

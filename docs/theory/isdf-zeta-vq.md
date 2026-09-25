@@ -7,6 +7,8 @@ identity that lets LORRAX fit \(\zeta\) directly in G space, the Coulomb
 matrix built from \(\zeta\), and what each stage costs. The data movement is
 on [route G](../architecture/zeta_fit_mubatch.md) and in
 [raw-parent ζ fitting](../architecture/zeta_fit_face_psi_cct.md).
+The [centroid selection analysis](centroid-selection.md) distinguishes
+spatial coverage, pair-feature residuals and downstream pencil conditioning.
 
 ## 1. The least-squares fit
 
