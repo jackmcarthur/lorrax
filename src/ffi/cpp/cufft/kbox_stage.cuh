@@ -315,9 +315,12 @@ __device__ void plane_pass(C* sm, long long ncols, const Load& ld, const Store& 
 }
 
 // Pencil pass, columns independent: per (ky, kz, col) the x-line in registers,
-// inverse . mid . forward (CONV) or one transform in Dir (!CONV), in place on the intermediate.
-template <int NX, int NY, int NZ, int Arch, bool CONV, cufftdx::fft_direction Dir, class C, class Mid>
-__device__ void pencil_pass(C* y, long long ncols, const Mid& mid) {
+// inverse . mid . forward (CONV) or the transform in Dir then mid (!CONV), then st.put(k, col, v)
+// (in place on the intermediate unless the Store maps elsewhere).  !CONV with an inverse Dir and
+// a multiplying mid is the first half of a convolution; with a scaling mid, a pass's last axis.
+template <int NX, int NY, int NZ, int Arch, bool CONV, cufftdx::fft_direction Dir, class C, class Mid,
+          class Store>
+__device__ void pencil_pass(C* y, long long ncols, const Mid& mid, const Store& st) {
     const long long total = (long long)NY * NZ * ncols;
     for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x; i < total;
          i += (long long)gridDim.x * blockDim.x) {
@@ -332,10 +335,16 @@ __device__ void pencil_pass(C* y, long long ncols, const Mid& mid) {
             if constexpr (NX > 1) line_fft<NX, Arch, cufftdx::fft_direction::forward>(v, 1);
         } else {
             if constexpr (NX > 1) line_fft<NX, Arch, Dir>(v, 1);
+#pragma unroll
+            for (int kx = 0; kx < NX; ++kx) v[kx] = mid(int(kx * NY * NZ + p), col, v[kx]);
         }
 #pragma unroll
-        for (int kx = 0; kx < NX; ++kx) y[((long long)kx * NY * NZ + p) * ncols + col] = v[kx];
+        for (int kx = 0; kx < NX; ++kx) st.put(int(kx * NY * NZ + p), col, v[kx]);
     }
+}
+template <int NX, int NY, int NZ, int Arch, bool CONV, cufftdx::fft_direction Dir, class C, class Mid>
+__device__ void pencil_pass(C* y, long long ncols, const Mid& mid) {
+    pencil_pass<NX, NY, NZ, Arch, CONV, Dir>(y, ncols, mid, Plain<C>{y, ncols});
 }
 
 // Group pencil pass (a Mid that mixes GROUP columns, e.g. the Lorentz vertex sum over a spin
