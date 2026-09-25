@@ -30,6 +30,8 @@ looks them up by string, so no enum/registry retrofit is needed.
 
 from __future__ import annotations
 
+import dataclasses
+
 from dataclasses import dataclass
 from typing import Callable
 
@@ -157,7 +159,7 @@ def compute_static_w(
     head_channel=None,
     ordered_orientations: bool = False,
 ):
-    """W = (1 − Vχ₀)⁻¹V on the full BZ, solved on the IBZ wedge when legal.
+    """W = (1 − Vχ₀)⁻¹V, solved and KEPT on the IBZ wedge when legal.
 
     ``ordered_orientations`` (probe roles on a measured-broken-TR deck):
     build χ₀ through :func:`gw.w_isdf.compute_chi0_imag_ordered`, which
@@ -175,10 +177,13 @@ def compute_static_w(
 
     IBZ cascade for the Dyson solve: V_q and χ₀_q are sliced to IBZ rows
     before :func:`gw.w_isdf.solve_w` so the per-q Cholesky/LU factor runs
-    only on ``n_q_ibz`` blocks; W_q comes out at IBZ shape and is unfolded
-    back to the full BZ via the SAME helper V_q uses (same physics — W is
-    bilinear in centroids and rotates by centroid double-permute + L-phase
-    + TRS conj under sym).  IBZ activation depends on
+    only on ``n_q_ibz`` blocks; W_q comes out at IBZ shape and STAYS there,
+    returned as a ``symmetry_maps.QirrOperator`` carrying the unfold tables
+    the SAME helper V_q uses (W is bilinear in centroids and rotates by
+    centroid double-permute + L-phase + TRS conj under sym).  The Σ
+    convolutions unfold it on their transform's load
+    (``ffi.fft.make_kfft_klead_unfold``); a consumer that needs the full
+    zone calls ``.unfold(mesh_xy)``.  IBZ activation depends on
     orbit-closure of the centroid set, resolved and ANNOUNCED once per run
     in ``gw.qgrid_symmetry`` (reached through ``_resolve_ibz_q_list``).
     Until 2026-08-08 this site passed ``verbose=False`` into that helper
@@ -211,8 +216,11 @@ def compute_static_w(
 
     Returns
     -------
-    W_q : (nq_full, μ, μ) jax.Array
-        Screened Coulomb on the full BZ, ``P(None, 'x', 'y')``.
+    W_q : symmetry_maps.QirrOperator
+        Screened Coulomb on the IBZ wedge (``values`` ``(n_q_ibz, μ, μ)`` at
+        ``P(None, 'x', 'y')``), or on the whole zone with trivial tables
+        when the q grid does not reduce (``force_full_bz``, an open
+        centroid set).
     """
     from .w_isdf import (
         compute_chi0,
@@ -221,18 +229,18 @@ def compute_static_w(
         solve_w,
     )
 
-    use_ibz_w_requested = not force_full_bz
-    if use_ibz_w_requested and getattr(sym, 'q_irr_full_idx', None) is not None:
-        from .v_q_g_flat import _resolve_ibz_q_list
-        (_, q_irr_frac, full_to_irr_idx, full_to_irr_sym,
-         sym_perm, L_table, use_ibz_w) = _resolve_ibz_q_list(
-            sym=sym, centroid_indices=centroid_indices,
-            kgrid=tuple(meta.kgrid),
-            fft_grid=tuple(meta.fft_grid),
-            context=f"W[{role}] Dyson solve q-grid reduction",
-            mu_basis=getattr(meta, 'mu_basis', None))
-    else:
-        use_ibz_w = False
+    # The run's q wedge (the one bare V is held on), and the measured-TRS
+    # policy that chose its unfold rows.  TIME REVERSAL IS MEASURED, NEVER
+    # ASSUMED — one policy object, shared with bare V and ladder W, and no
+    # TRS branch at this site (``gw.qgrid_symmetry.qgrid_trs_policy_for``).
+    from ffi import _services
+    _services.ensure_on_path()
+    from symmetry_maps import QirrOperator
+    from .v_q_g_flat import q_wedge
+    wedge = (None if force_full_bz else q_wedge(
+        sym=sym, centroid_indices=centroid_indices, meta=meta,
+        context=f"W[{role}] Dyson solve q-grid reduction"))
+    use_ibz_w = wedge is not None
 
     nq_solve = (int(np.asarray(sym.q_irr_full_idx).shape[0]) if use_ibz_w
                 else int(meta.nk_tot))
@@ -326,20 +334,23 @@ def compute_static_w(
                     chi0_q.block_until_ready()
             # IBZ slice on V_q and χ₀_q.  Both retain the canonical
             # ``P(None, 'x', 'y')`` sharding; the helper locks it in.
+            # V is held on the wedge already (its representative rows);
+            # χ₀ is sliced to them.  Both keep ``P(None, 'x', 'y')``.
             if use_ibz_w:
-                from ffi import _services
-                _services.ensure_on_path()
                 from symmetry_maps import slice_q_full_to_ibz
                 _nat = NamedSharding(mesh_xy, P(None, 'x', 'y'))
                 with timing.section("W.slice_to_ibz"):
-                    V_q_solve = slice_q_full_to_ibz(
-                        V_q, sym.q_irr_full_idx, out_sharding=_nat)
+                    V_q_solve = jax.device_put(
+                        QirrOperator.of(V_q).restrict(
+                            QirrOperator(values=None, **wedge[0])).values, _nat)
                     chi0_q_solve = slice_q_full_to_ibz(
                         chi0_q, sym.q_irr_full_idx, out_sharding=_nat)
                     del chi0_q
                     chi0_q_solve.block_until_ready()
             else:
-                V_q_solve = V_q
+                # The full-zone solve (probe roles, an unreduced q grid)
+                # reads V at every q, transient.
+                V_q_solve = QirrOperator.of(V_q).unfold(mesh_xy)
                 chi0_q_solve = chi0_q
             with timing.section("W.compile", announce=True,
                                 label=f"{_w} Dyson compile"):
@@ -412,28 +423,15 @@ def compute_static_w(
                         W_body0, W_bare, head_channel, q_index=q_idx)
                     del W_body0, W_bare
                     W_q_solve.block_until_ready()
-            # IBZ → full-BZ unfold (centroid double-permute + L-phase
-            # + TRS conj) — same helper V_q uses.  Σ_COH/SX still
-            # iterate over the full BZ in the k-q sums.
+            # The wedge W and the tables of its IBZ → full-BZ unfold
+            # (centroid double-permute + L-phase + TRS conj), the same
+            # wedge V is held on; nothing is unfolded here.
             if use_ibz_w:
-                from ffi import _services
-                _services.ensure_on_path()
-                from symmetry_maps import unfold_isdf_operator
-                with timing.section("W.unfold_to_full_bz"):
-                    n_sym_spatial = int(
-                        np.asarray(sym_perm).shape[0]) // 2
-                    # TIME REVERSAL IS MEASURED, NEVER ASSUMED — one
-                    # policy object, shared with bare V and ladder W, and
-                    # no TRS branch at this site.  See
-                    # ``gw.qgrid_symmetry.qgrid_trs_policy_for``.
-                    from .qgrid_symmetry import qgrid_trs_policy_for
-                    policy = qgrid_trs_policy_for(
-                        sym=sym, irr_idx_q=full_to_irr_idx,
-                        sym_idx_q=full_to_irr_sym,
-                        kgrid=tuple(meta.kgrid),
-                        n_sym_spatial=n_sym_spatial,
-                        context=f"W[{_w}] RPA")
-                    unfold_sym = policy.unfold_sym_idx
+                tables, policy = wedge
+                q_irr_frac, full_to_irr_idx = tables["q_irr_frac"], tables["irr_idx"]
+                sym_perm, L_table = tables["sym_perm"], tables["L_table"]
+                unfold_sym, n_sym_spatial = tables["sym_idx"], tables["n_sym_spatial"]
+                with timing.section("W.wedge_tables"):
                     cov = policy.measure_covariance(
                         W_q_solve, q_irr_frac=q_irr_frac,
                         q_irr_full_idx=sym.q_irr_full_idx,
@@ -460,18 +458,10 @@ def compute_static_w(
                         sym_idx_q=unfold_sym, sym_perm=sym_perm,
                         L_table=L_table, n_sym_spatial=n_sym_spatial,
                         mu_basis=getattr(meta, 'mu_basis', None))
-                    W_q = unfold_isdf_operator(
-                        W_q_solve,
-                        irr_idx=full_to_irr_idx,
-                        sym_idx=unfold_sym,
-                        sym_perm=sym_perm, L_table=L_table,
-                        q_irr_frac=q_irr_frac,
-                        mesh_xy=mesh_xy,
-                        n_sym_spatial=n_sym_spatial)
+                    W_q = QirrOperator(values=W_q_solve, **tables)
                     del W_q_solve
-                    W_q.block_until_ready()
             else:
-                W_q = W_q_solve
+                W_q = QirrOperator.whole_zone(W_q_solve)
     return W_q
 
 
@@ -576,7 +566,8 @@ def compute_screening(
         if idx == n_requests - 1:
             W_by_role[role] = W
         else:
-            W_by_role[role] = collectives.spill_to_host(W)
+            W_by_role[role] = dataclasses.replace(
+                W, values=collectives.spill_to_host(W.values))
 
     for idx, req in enumerate(requests):
         _w = f"W[{req.role}]"
@@ -590,7 +581,9 @@ def compute_screening(
                     iteration_head_response.static_chi_body_gamma
                     if iteration_head_response is not None else None))
             with timing.section("W.gate"):
-                _gate_w(W_static, req, print_fn=print_fn,
+                # The reciprocity half of the gate reads W at −q: the
+                # full zone, transient, for this check only.
+                _gate_w(W_static.unfold(mesh_xy), req, print_fn=print_fn,
                         kgrid=tuple(meta.kgrid),
                         trs_allowed=_trs_verdict(sym))
             _store_role(req.role, idx, W_static)
@@ -655,7 +648,7 @@ def compute_screening(
             head_channel=head_channel,
             ordered_orientations=bool(_tr_odd and on_imag))
         with timing.section("W.gate"):
-            _gate_w(W, req, print_fn=print_fn,
+            _gate_w(W.unfold(mesh_xy), req, print_fn=print_fn,
                     trs_allowed=_trs_verdict(sym))
         _store_role(req.role, idx, W)
         bar.step()
@@ -667,8 +660,9 @@ def compute_screening(
     # compute they guard, and zero for a single-role scheme.
     with timing.section("W.restore_spilled_roles"):
         for role, val in W_by_role.items():
-            if isinstance(val, collectives.HostSpill):
-                W_by_role[role] = collectives.restore_from_host(val)
+            if isinstance(val.values, collectives.HostSpill):
+                W_by_role[role] = dataclasses.replace(
+                    val, values=collectives.restore_from_host(val.values))
     return W_by_role
 
 

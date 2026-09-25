@@ -2385,6 +2385,22 @@ def _compute_scalar_vq(
     return V_q_raw, G0_all, head_channel
 
 
+def _coulomb_on_wedge(V_full, *, sym, centroid_indices, meta):
+    """``V_full`` (packed, full zone) as a ``QirrOperator`` on the run's q wedge."""
+    from ffi import _services
+    _services.ensure_on_path()
+    from symmetry_maps import QirrOperator
+    from .v_q_g_flat import q_wedge
+    whole = QirrOperator.of(V_full)
+    wedge = q_wedge(sym=sym, centroid_indices=centroid_indices, meta=meta,
+                    context="bare V on the q wedge")
+    if wedge is None:
+        return whole
+    op = whole.restrict(QirrOperator(values=None, **wedge[0]))
+    jax.block_until_ready(op.values)
+    return op
+
+
 def _finalize_vq_views(
         G0_all, V_q_raw, head_channel, meta, photon_g0_vectors, print_fn):
     """Produce the packed Coulomb operator and validate its physical invariants."""
@@ -3152,6 +3168,11 @@ def prepare_isdf_and_wavefunctions(
 	        WavefunctionBasisReceipt, _basis_band_interval, _to_run_order, band_slices, basis_T,
 	        centroid_indices, cfg, charge_basis_receipt, mesh_xy, meta, photon_g0_vectors, print0,
 	        sym, tensors_filename, tmp_dir, transverse_basis_receipt, wfn)
+	# From here on the bare Coulomb is held on the run's q wedge, the one
+	# screening solves W on: its representative rows, where the unfold is
+	# the identity, so the full zone is not kept past this line.
+	V_qmunu = _coulomb_on_wedge(V_qmunu, sym=sym, centroid_indices=centroid_indices,
+	                            meta=meta)
 	if green_parent_carrier is not None:
 		wfns = replace(wfns, green_parent=green_parent_carrier)
 	for family, bundle in (("charge", wfns), ("current", wfns_transverse)):

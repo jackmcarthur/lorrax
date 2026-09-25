@@ -214,6 +214,9 @@ def test_compute_screening_spills_an_earlier_role_before_a_later_roles_build(
     calls: list = []
 
     def _fake_compute_static_w(wfns, V_q, quad, *, role, **kwargs):
+        # compute_static_w returns W on its q wedge (a QirrOperator); the
+        # stand-ins are one-q whole-zone wedges.
+        from symmetry_maps import QirrOperator
         if role != "static":
             static_w = state["static_w"]
             assert static_w.is_deleted(), (
@@ -225,7 +228,7 @@ def test_compute_screening_spills_an_earlier_role_before_a_later_roles_build(
         calls.append(role)
         if role == "static":
             state["static_w"] = w
-        return w
+        return QirrOperator.whole_zone(w)
 
     monkeypatch.setattr(screening, "compute_static_w", _fake_compute_static_w)
     monkeypatch.setattr(screening, "_gate_w", lambda *a, **k: None)
@@ -246,11 +249,11 @@ def test_compute_screening_spills_an_earlier_role_before_a_later_roles_build(
     assert calls == ["static", "probe"]
     assert set(result) == {"static", "probe"}
     for role, w in result.items():
-        assert not w.is_deleted(), f"W[{role}] came back deleted"
+        assert not w.values.is_deleted(), f"W[{role}] came back deleted"
     np.testing.assert_array_equal(
-        np.asarray(jax.device_get(result["static"])), np.eye(2)[None])
+        np.asarray(jax.device_get(result["static"].values)), np.eye(2)[None])
     np.testing.assert_array_equal(
-        np.asarray(jax.device_get(result["probe"])), 2.0 * np.eye(2)[None])
+        np.asarray(jax.device_get(result["probe"].values)), 2.0 * np.eye(2)[None])
 
 
 def test_a_single_role_scheme_never_spills(monkeypatch):
@@ -268,7 +271,8 @@ def test_a_single_role_scheme_never_spills(monkeypatch):
         return real_spill(arr)
 
     def _fake_compute_static_w(wfns, V_q, quad, *, role, **kwargs):
-        return jnp.eye(2, dtype=jnp.complex128)[None]
+        from symmetry_maps import QirrOperator
+        return QirrOperator.whole_zone(jnp.eye(2, dtype=jnp.complex128)[None])
 
     monkeypatch.setattr(screening, "compute_static_w", _fake_compute_static_w)
     monkeypatch.setattr(screening, "_gate_w", lambda *a, **k: None)
@@ -283,4 +287,4 @@ def test_a_single_role_scheme_never_spills(monkeypatch):
 
     assert spilled == []
     assert set(result) == {"static"}
-    assert not result["static"].is_deleted()
+    assert not result["static"].values.is_deleted()

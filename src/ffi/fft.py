@@ -1473,7 +1473,7 @@ def make_kconv_lorentz_unfold(mesh: Mesh, kgrid, tables, *, left_vertices, right
 
 
 def make_kfft_klead_unfold(mesh: Mesh, kgrid, tables, *, norm: str | None = "ortho") -> Callable:
-    """An interaction's R-space operand read from its q WEDGE: ``fn(Wp, Wt=None) -> Y``.
+    """An interaction's R-space operand read from its q WEDGE: ``fn(Wp, Wt=None, load=None) -> Y``.
 
     ``Wp`` ``(n_wedge, ml, nl)`` c128 at ``P(None,'x','y')`` holds the
     interaction on the wedge rows (merged endpoints ``ml = mx*n_l``,
@@ -1481,7 +1481,9 @@ def make_kfft_klead_unfold(mesh: Mesh, kgrid, tables, *, norm: str | None = "ort
     ``(mx, nA, my, nB)`` flattened); ``Wt`` is its transposed partner, needed
     only when ``tables`` use the pair-transpose rule on antiunitary rows
     (``tables.conj_trs = 0``).  ``tables`` are
-    ``symmetry_maps.unfold_load_tables`` of the q wedge.  Returns ``Y``
+    ``symmetry_maps.unfold_load_tables`` of the q wedge; ``load``, when given,
+    is the same tables on the devices (``symmetry_maps.device_load_tables``),
+    read as operands so a consumer's jit holds no table constants.  Returns ``Y``
     ``(nk, ml, nl)`` at ``P(None,'x','y')``, equal to
     ``make_kconv_klead(...).prep`` of the full-zone interaction
     (``unfold_isdf_operator``, then the endpoint actions): the unfold is the
@@ -1506,8 +1508,7 @@ def make_kfft_klead_unfold(mesh: Mesh, kgrid, tables, *, norm: str | None = "ort
                      scale=np.float64(ffi_fft_scale("ifftn", norm, nk)), conj_trs=np.int64(conj),
                      **_mathdx_common())
 
-        def local(w, wt):
-            t = local_unfold_load_tables(tables)
+        def apply_tables(w, wt, t):
             out = jax.ShapeDtypeStruct((nk, int(w.shape[1]), int(w.shape[2])), w.dtype)
             return jax.ffi.ffi_call(KFFT_KLEAD_UNFOLD_TARGET, out)(
                 w, wt, t.row, t.trs, t.lsrc, t.rsrc, t.mph, t.nph, t.spin, t.spin_r, **attrs)
@@ -1516,16 +1517,25 @@ def make_kfft_klead_unfold(mesh: Mesh, kgrid, tables, *, norm: str | None = "ort
         prep_local = (make_local_kfft_klead(mesh, kg, kind="ifftn", norm=norm)
                       if _cpu_test_arm() else (lambda o: o))
 
-        def local(w, wt):
-            t = local_unfold_load_tables(tables)
+        def apply_tables(w, wt, t):
             O = apply_unfold_load_tables_local(w, wt, t, spin_l,
                                                None if tables.spin_r is None else spin_r)
             return prep_local(O.reshape(nk, int(w.shape[1]), int(w.shape[2])))
 
+    def local(w, wt):
+        return apply_tables(w, wt, local_unfold_load_tables(tables))
+
+    def local_dev(w, wt, row, trs, lsrc, rsrc, mph, nph, spin, spin_r_dev):
+        return apply_tables(w, wt, tables._replace(
+            row=row, trs=trs, lsrc=lsrc, rsrc=rsrc, mph=mph, nph=nph, spin=spin,
+            spin_r=spin_r_dev))
+
+    from symmetry_maps import DEVICE_LOAD_SPECS
     spec = P(None, "x", "y")
     sm = _sharded(local, mesh, (spec, spec), spec)
+    sm_dev = _sharded(local_dev, mesh, (spec, spec, *DEVICE_LOAD_SPECS), spec)
 
-    def fn(Wp, Wt=None):
+    def fn(Wp, Wt=None, load=None):
         _check_complex(Wp)
         if Wp.ndim != 3 or int(Wp.shape[1]) % n_l or int(Wp.shape[2]) % n_r:
             raise ValueError(f"k-leading unfold fft expects Wp (n_wedge, mx*{n_l}, my*{n_r}); "
@@ -1538,7 +1548,7 @@ def make_kfft_klead_unfold(mesh: Mesh, kgrid, tables, *, norm: str | None = "ort
                 raise ValueError("k-leading unfold fft: the tables read the transposed partner on "
                                  "antiunitary rows (pair_transpose), so Wt is required")
             Wt = Wp
-        return sm(Wp, Wt)
+        return sm(Wp, Wt) if load is None else sm_dev(Wp, Wt, *load)
     return fn
 
 

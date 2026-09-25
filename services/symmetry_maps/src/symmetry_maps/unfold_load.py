@@ -27,6 +27,7 @@ is still one definition of the typed action: ``maps.py``.
 """
 from __future__ import annotations
 
+import dataclasses
 from typing import NamedTuple
 
 import jax
@@ -35,7 +36,8 @@ import numpy as np
 
 from symmetry_maps.maps import certify_endpoint_locality
 
-__all__ = ["UnfoldLoadTables", "unfold_load_tables", "local_unfold_load_tables",
+__all__ = ["QirrOperator", "DeviceLoadTables", "DEVICE_LOAD_SPECS", "device_load_tables",
+           "UnfoldLoadTables", "unfold_load_tables", "local_unfold_load_tables",
            "apply_unfold_load_tables_local"]
 
 
@@ -175,6 +177,37 @@ def local_unfold_load_tables(t: UnfoldLoadTables) -> UnfoldLoadTables:
         spin_r=jnp.asarray(t.spin if t.spin_r is None else t.spin_r))
 
 
+class DeviceLoadTables(NamedTuple):
+    """The load tables on the devices, each already cut to the shards that read it.
+
+    A consumer passes them to its jit as ARGUMENTS (a ``QirrOperator`` carries
+    them as pytree leaves), so its program holds no table constants: baked
+    host tables are megabytes of HLO literal per door and cost compile time."""
+    row: object
+    trs: object
+    lsrc: object
+    rsrc: object
+    mph: object
+    nph: object
+    spin: object
+    spin_r: object
+
+
+#: The ``shard_map`` in-specs of :class:`DeviceLoadTables`, in field order.
+from jax.sharding import NamedSharding as _NS, PartitionSpec as _P  # noqa: E402
+DEVICE_LOAD_SPECS = (_P(), _P(), _P(None, "x"), _P(None, "y"), _P(None, "x"), _P(None, "y"),
+                     _P(), _P())
+
+
+def device_load_tables(t: UnfoldLoadTables, mesh_xy) -> DeviceLoadTables:
+    """``t`` placed once: per-k tables replicated, left tables on X, right tables on Y."""
+    from lxkit import device_put_process_local
+    spin_r = t.spin if t.spin_r is None else t.spin_r
+    host = (t.row, t.trs, t.lsrc, t.rsrc, t.mph, t.nph, t.spin, spin_r)
+    return DeviceLoadTables(*(device_put_process_local(np.asarray(a), _NS(mesh_xy, spec))
+                              for a, spec in zip(host, DEVICE_LOAD_SPECS)))
+
+
 def apply_unfold_load_tables_local(G, Gt, t: UnfoldLoadTables, spin_host, spin_r_host=None):
     """The tables applied in XLA on one rank's tiles: ``O`` ``(nk, mx, ns, my, nr)`` centroid-major.
 
@@ -218,3 +251,196 @@ def _rotate_endpoints(spatial, spin_l, spin_r):
     return jnp.stack([sum(left[..., d] * jnp.conj(R[:, b, d])[:, None, None, None]
                          for d in range(nr_s) if np.any(spin_r[:, b, d] != 0))
                       for b in range(nr_s)], axis=4)
+
+
+@dataclasses.dataclass(frozen=True)
+class QirrOperator:
+    """An interaction held on its irreducible q wedge, with the unfold that defines the full zone.
+
+    ``values`` ``(n_wedge, n_left, n_right)`` at ``P(None,'x','y')``; the
+    tables are exactly the arguments :func:`maps.unfold_isdf_operator` takes
+    for it, and ``full_rows[i]`` is the full-zone row of wedge row ``i``,
+    where the unfold is the identity.  A consumer that reads the interaction
+    through a k-convolution takes :meth:`load_tables` (the unfold on the
+    transform's load, ``ffi.fft.make_kfft_klead_unfold``); :meth:`unfold`
+    materializes the full zone for a consumer that needs it whole.
+    """
+    values: object
+    irr_idx: np.ndarray
+    sym_idx: np.ndarray
+    sym_perm: np.ndarray
+    L_table: np.ndarray
+    q_irr_frac: np.ndarray
+    n_sym_spatial: int
+    full_rows: np.ndarray
+    trs_rule: str = "conj"
+    #: The load tables on the devices (:meth:`with_load`), or ``None``.
+    load: object = None
+
+    @classmethod
+    def whole_zone(cls, values, *, trs_rule="conj") -> "QirrOperator":
+        """The trivial wedge: every q its own row (a deck without a reducing q group)."""
+        nq, n_l = int(values.shape[0]), int(values.shape[1])
+        if int(values.shape[2]) != n_l:
+            raise ValueError("QirrOperator.whole_zone: a square operator is required")
+        return cls(values=values, irr_idx=np.arange(nq, dtype=np.int32),
+                   sym_idx=np.zeros(nq, np.int32),
+                   sym_perm=np.arange(n_l, dtype=np.int32)[None, :],
+                   L_table=np.zeros((1, n_l, 3)), q_irr_frac=np.zeros((nq, 3)),
+                   n_sym_spatial=1, full_rows=np.arange(nq, dtype=np.int32), trs_rule=trs_rule)
+
+    @classmethod
+    def of(cls, interaction) -> "QirrOperator":
+        """``interaction`` as an operator: a full-zone array is its own trivial wedge."""
+        return interaction if isinstance(interaction, cls) else cls.whole_zone(interaction)
+
+    def is_whole_zone(self) -> bool:
+        """Whether every q is its own wedge row (the unfold is the identity)."""
+        return (self.n_wedge == self.n_full
+                and np.array_equal(np.asarray(self.irr_idx), np.arange(self.n_full))
+                and not np.any(np.asarray(self.sym_idx)))
+
+    def restrict(self, wedge: "QirrOperator") -> "QirrOperator":
+        """This interaction on ``wedge``'s rows and tables.  Exact: a full-zone row
+        that is a wedge representative is the identity unfold of that wedge row."""
+        if self.same_wedge(wedge):
+            return self
+        if not self.is_whole_zone():
+            raise ValueError("QirrOperator.restrict: only a whole-zone operator restricts "
+                             "onto another wedge")
+        import jax.numpy as _jnp
+        return dataclasses.replace(
+            wedge, values=_jnp.take(self.values, _jnp.asarray(wedge.full_rows), axis=0))
+
+    def at_rows(self, q_full_rows):
+        """The values at full-zone rows ``q_full_rows`` (the wedge's representatives, in
+        order, or any rows of a whole-zone operator): no unfold involved."""
+        rows = np.asarray(q_full_rows).reshape(-1)
+        if np.array_equal(rows, np.asarray(self.full_rows)):
+            return self.values
+        if not self.is_whole_zone():
+            raise ValueError("QirrOperator.at_rows: rows other than the wedge's "
+                             "representatives need the unfold")
+        import jax.numpy as _jnp
+        return _jnp.take(self.values, _jnp.asarray(rows), axis=0)
+
+    @property
+    def n_full(self) -> int:
+        return int(np.asarray(self.irr_idx).shape[0])
+
+    @property
+    def n_wedge(self) -> int:
+        return int(self.values.shape[0])
+
+    def with_values(self, values) -> "QirrOperator":
+        """The same wedge and tables around other values (an elementwise function of these)."""
+        if tuple(values.shape) != tuple(self.values.shape):
+            raise ValueError(f"QirrOperator.with_values: shape {values.shape} != {self.values.shape}")
+        return dataclasses.replace(self, values=values)
+
+    def same_wedge(self, other: "QirrOperator") -> bool:
+        """Whether ``other`` unfolds by the same tables (so the two combine on the wedge)."""
+        pairs = ((self.irr_idx, other.irr_idx), (self.sym_idx, other.sym_idx),
+                 (self.sym_perm, other.sym_perm), (self.L_table, other.L_table),
+                 (self.q_irr_frac, other.q_irr_frac), (self.full_rows, other.full_rows))
+        return (self.trs_rule == other.trs_rule and self.n_sym_spatial == other.n_sym_spatial
+                and all(np.array_equal(np.asarray(a), np.asarray(b)) for a, b in pairs))
+
+    def representative_row(self, q_full: int):
+        """The full-zone row ``q_full`` of a wedge representative (q = 0 always is one)."""
+        hit = np.flatnonzero(np.asarray(self.full_rows) == int(q_full))
+        if hit.size != 1:
+            raise ValueError(f"QirrOperator: q row {q_full} is not a wedge representative")
+        return self.values[int(hit[0])]
+
+    def unfold(self, mesh_xy):
+        """The full-zone interaction ``(n_full, n_left, n_right)``: :func:`maps.unfold_isdf_operator`."""
+        from symmetry_maps.maps import unfold_isdf_operator
+        if self.is_whole_zone():
+            return self.values
+        return unfold_isdf_operator(
+            self.values, irr_idx=self.irr_idx, sym_idx=self.sym_idx, sym_perm=self.sym_perm,
+            L_table=self.L_table, q_irr_frac=self.q_irr_frac, mesh_xy=mesh_xy,
+            n_sym_spatial=self.n_sym_spatial, trs_rule=self.trs_rule)
+
+    def load_tables(self, mesh_xy, *, in_trace: bool = False) -> UnfoldLoadTables:
+        """:meth:`unfold` as load tables (scalar endpoints), for ``make_kfft_klead_unfold``.
+
+        Host tables.  Build them outside any jit (one small phase program);
+        ``in_trace=True`` builds them while a consumer's jit traces, eagerly
+        and op by op, which is correct but compiles each primitive apart."""
+        def build():
+            return unfold_load_tables(
+                irr_idx=self.irr_idx, sym_idx=self.sym_idx, sym_perm=self.sym_perm,
+                L_table=self.L_table, k_irr_frac=self.q_irr_frac,
+                spin_action_full=np.ones((self.n_full, 1, 1), np.complex128),
+                n_sym_spatial=self.n_sym_spatial, mesh_xy=mesh_xy, trs_rule=self.trs_rule)
+        if not in_trace:
+            return build()
+        with jax.ensure_compile_time_eval():
+            return build()
+
+    def wedge_key(self) -> "_WedgeKey":
+        """A hashable key of the tables (not the values): equal keys unfold alike."""
+        return _WedgeKey(self)
+
+    def with_load(self, mesh_xy) -> "QirrOperator":
+        """This operator carrying its load tables on the devices of ``mesh_xy``
+        (built once per mesh and tables, outside any jit)."""
+        if self.load is not None:
+            return self
+        key = (tuple(d.id for d in np.asarray(mesh_xy.devices).flat), self.wedge_key())
+        dev = _device_load_cache.get(key)
+        if dev is None:
+            dev = _device_load_cache[key] = device_load_tables(self.load_tables(mesh_xy), mesh_xy)
+        return dataclasses.replace(self, load=dev)
+
+
+_device_load_cache: dict = {}
+
+
+class _WedgeKey:
+    """The tables of a :class:`QirrOperator`, hashable: the pytree aux data and a cache key."""
+    __slots__ = ("fields", "_hash")
+    _NAMES = ("irr_idx", "sym_idx", "sym_perm", "L_table", "q_irr_frac", "full_rows")
+
+    def __init__(self, op):
+        arrays = tuple(np.ascontiguousarray(getattr(op, n)) for n in self._NAMES)
+        self.fields = arrays + (int(op.n_sym_spatial), str(op.trs_rule))
+        self._hash = hash(tuple(a.tobytes() + str(a.dtype).encode() + str(a.shape).encode()
+                                for a in arrays) + self.fields[len(arrays):])
+
+    def __hash__(self):
+        return self._hash
+
+    def __eq__(self, other):
+        if not isinstance(other, _WedgeKey) or self._hash != other._hash:
+            return False
+        n = len(self._NAMES)
+        return (self.fields[n:] == other.fields[n:]
+                and all(a.dtype == b.dtype and np.array_equal(a, b)
+                        for a, b in zip(self.fields[:n], other.fields[:n])))
+
+    def rebuild(self, values, load=None):
+        n = len(self._NAMES)
+        kw = dict(zip(self._NAMES, self.fields[:n]))
+        return QirrOperator(values=values, n_sym_spatial=self.fields[n],
+                            trs_rule=self.fields[n + 1], load=load, **kw)
+
+
+# A pytree whose leaves are the values (and the device load tables, when
+# attached): a jitted consumer takes the operator as an argument, its host
+# tables as static structure and its device tables as arguments.
+def _flatten(op):
+    if op.load is None:
+        return (op.values,), (_WedgeKey(op), False)
+    return (op.values, *op.load), (_WedgeKey(op), True)
+
+
+def _unflatten(aux, leaves):
+    key, has_load = aux
+    return key.rebuild(leaves[0], DeviceLoadTables(*leaves[1:]) if has_load else None)
+
+
+jax.tree_util.register_pytree_node(QirrOperator, _flatten, _unflatten)
+

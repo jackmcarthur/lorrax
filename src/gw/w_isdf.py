@@ -2288,8 +2288,12 @@ def _screen_static_photon_body(
                 "photon layout padded extents do not match wavefunction "
                 f"bundles: layout C/T=({layout.carrier_extent(0)},"
                 f"{layout.carrier_extent(1)}), wfns C/T=({n_c},{n_t})")
-        W_cc = jnp.take(jnp.asarray(W_charge),
-                        jnp.asarray(sym.q_irr_full_idx), axis=0)
+        # Screening keeps W on its q wedge, the rows of sym.q_irr_full_idx.
+        from .cohsex_sigma import interaction_operator
+        W_op = interaction_operator(W_charge)
+        W_cc = (W_op.values if np.array_equal(np.asarray(W_op.full_rows),
+                                              np.asarray(sym.q_irr_full_idx))
+                else jnp.take(W_op.unfold(mesh_xy), jnp.asarray(sym.q_irr_full_idx), axis=0))
         expected_cc = layout.block_shape(nq, 0, 0)
         if tuple(W_cc.shape) != expected_cc:
             raise ValueError(
