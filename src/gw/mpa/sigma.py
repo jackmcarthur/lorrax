@@ -702,37 +702,52 @@ def _shared_pole_memory_schedule(meta, header, *, mesh_xy, layout="face"):
         workspace_bytes_per_rank=0, concurrent_with=concurrent)
     budget = math.floor(admission["available_device_bytes_per_rank"]
                         - admission["aggregate_bytes_per_rank"])
-    best = None
-    for b in range(1,nq+1):
-        # Byte counts are affine in the column width. Price through the
-        # SAME routine used for the admitted row, including routed scratch.
-        multiple = combined_divisor(px,py)
-        one = _shared_pole_panel_cost(meta,header,b,multiple,mesh_xy=mesh_xy,local=local,layout=layout)
-        projection_rows = b if local else one["children"]
-        # The physical logical-U bound applies to every NEW projector
-        # matrix, even when orbit packing pads the endpoint carrier. The
-        # pre-existing full-q Sigma output is accounted separately above.
-        projection_bytes = 16*projection_rows*meta.mu_basis.n_packed**2/(px*py)
-        if projection_bytes > U:
-            continue
-        two = _shared_pole_panel_cost(meta,header,b,2*multiple,mesh_xy=mesh_xy,local=local,layout=layout)
-        keys = ("resident_bytes_per_rank", "workspace_bytes_per_rank")
-        p1, p2 = sum(one[k] for k in keys), sum(two[k] for k in keys)
-        # price(j column multiples) = intercept + j*slope. Both ends are
-        # ceilinged byte counts, so on a small enough panel they can land on
-        # the same integer: a non-positive slope carries no width information
-        # and must not size c (nor divide by zero). Integer floor division
-        # keeps the sizing exact past 2**53.
-        slope, intercept = p2 - p1, 2*p1 - p2
-        if slope <= 0:
-            continue
-        c = min(kmax, multiple*((budget - intercept)//slope))
-        if c < 1:
-            continue
-        cost = ((nq+b-1)//b)*((kmax+c-1)//c)
-        candidate = (cost,-b*c,b,c)
-        if best is None or candidate[:2] < best[:2]:
-            best = candidate
+
+    def search(layout):
+        best = None
+        for b in range(1,nq+1):
+            # Byte counts are affine in the column width. Price through the
+            # SAME routine used for the admitted row, including routed scratch.
+            multiple = combined_divisor(px,py)
+            one = _shared_pole_panel_cost(meta,header,b,multiple,mesh_xy=mesh_xy,local=local,layout=layout)
+            projection_rows = b if local else one["children"]
+            # The physical logical-U bound applies to every NEW projector
+            # matrix, even when orbit packing pads the endpoint carrier. The
+            # pre-existing full-q Sigma output is accounted separately above.
+            projection_bytes = 16*projection_rows*meta.mu_basis.n_packed**2/(px*py)
+            if projection_bytes > U:
+                continue
+            two = _shared_pole_panel_cost(meta,header,b,2*multiple,mesh_xy=mesh_xy,local=local,layout=layout)
+            keys = ("resident_bytes_per_rank", "workspace_bytes_per_rank")
+            p1, p2 = sum(one[k] for k in keys), sum(two[k] for k in keys)
+            # price(j column multiples) = intercept + j*slope. Both ends are
+            # ceilinged byte counts, so on a small enough panel they can land on
+            # the same integer: a non-positive slope carries no width information
+            # and must not size c (nor divide by zero). Integer floor division
+            # keeps the sizing exact past 2**53.
+            slope, intercept = p2 - p1, 2*p1 - p2
+            if slope <= 0:
+                continue
+            c = min(kmax, multiple*((budget - intercept)//slope))
+            if c < 1:
+                continue
+            cost = ((nq+b-1)//b)*((kmax+c-1)//c)
+            candidate = (cost,-b*c,b,c)
+            if best is None or candidate[:2] < best[:2]:
+                best = candidate
+        return best
+
+    best = search(layout)
+    # The factors do not depend on tau; only the causal weight does. Face
+    # factors make every tau's GEMM a per-q distributed SUMMA that
+    # re-broadcasts the same panels; pole columns replicated (axis
+    # orientation) make it local. Take that placement whenever it needs no
+    # more panel passes than the face schedule (the sector route measured
+    # Fe 4^3 Sigma tau 69.4 -> 42.0 s).
+    if layout == "face":
+        replicated = search("axis")
+        if replicated is not None and (best is None or replicated[0] <= best[0]):
+            layout, best = "axis", replicated
     b,c = (1,1) if best is None else best[2:]
     footprint = _shared_pole_panel_cost(meta,header,b,c,mesh_xy=mesh_xy,local=local,layout=layout)
     projection_rows = b if local else footprint["children"]
@@ -744,6 +759,7 @@ def _shared_pole_memory_schedule(meta, header, *, mesh_xy, layout="face"):
         workspace_bytes_per_rank=footprint["workspace_bytes_per_rank"],
         concurrent_with=concurrent)
     return dict(status=receipt["device_budget_status"], unit_bytes=U,
+                factor_layout=layout,
                 peak_live_bytes_per_rank=receipt["aggregate_bytes_per_rank"],
                 peak_in_U=receipt["aggregate_bytes_per_rank"]/U,
                 parent_capacity=b,column_capacity=c,
@@ -1844,7 +1860,8 @@ def compute_sigma_c_mpa_omega_grid(
                 _band_fence('tau.synthesis_setup', sync_ranks=True)
                 with timing.section('tau.synthesis_setup'):
                     synthesis = (_shared_pole_w_synthesis(
-                        reader, meta, ledger, frequencies, schedule, mesh_xy=mesh_xy, layout=wfns.layout)
+                        reader, meta, ledger, frequencies, schedule, mesh_xy=mesh_xy,
+                        layout=schedule.get("factor_layout", wfns.layout))
                         if sector_context is None else sector_context["synthesis"](
                             reader, ledger, frequencies, schedule))
                 total = _integrate_sigma_batches(
