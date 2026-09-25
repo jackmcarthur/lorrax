@@ -237,7 +237,7 @@ def _raw_read(fh, ds_id, local_shape, mesh, spec, offset, valid, enc):
         return ffi_read_call(
             out_struct, h_l, off_l, vs_l,
             mesh_shape=mesh_shape,
-            axis_count_per_dim=acpd, axis_flat=aflat, independent=False)
+            axis_count_per_dim=acpd, axis_flat=aflat)
 
     out = shard_map(_per_rank, mesh=mesh,
                     in_specs=(P(), P(), P()), out_specs=spec,
