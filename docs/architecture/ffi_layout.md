@@ -486,9 +486,9 @@ specialised per grid when NVRTC compiles the kernel.
 |---|---|
 | 1 consumer | ζ fit: `isdf.core.c_q_downfold` (pair); `isdf.core.c_q_from_psi_sm` (parent); `isdf.zeta_mubatch.make_route_g_kernel` (plane, every channel; the current channels' γ̃ as the load's `(perm, phase)`). Σ: `gw.ppm_tau_kernel.get_sigma_spatial_kernel` (τ sweep and static SX/RI: klead `prep` for W, klead unfold for G), `gw.cohsex_sigma._make_static_convolution` (klead). BSE: `bse_stack_matvec._conv_decode`, `bse_ring_comm._make_ring_rung`, and the W_R transforms in `bse_densify.make_w_densifier`, `bse_lanczos`, `davidson_absorption`, `absorption_haydock`, `bse_nontda`, `exciton_bands`. Flat-k transform: `common.fft_helpers.make_flat_k_fft` and its `make_flat_k_ifftn` / `make_flat_k_fftn` / `make_local_flat_k_fftn` wrappers (`gw.w_isdf`, `gw.qsgw_head`, `gw.cohsex_sigma`, `gw.wavefunction_bundle`, `bandstructure.htransform`, `bandstructure.orbital`) |
 | 2 router | `ffi/fft.py`: `make_fused_conv_kpair`, `make_fused_conv_kparent`, `make_fused_conv_kplane`, `make_kconv_klead` (→ `KConvStored(prep, apply)`), `make_kconv_klead_unfold`, `make_kconv_lorentz_unfold`, `make_kconv_kminor` / `make_local_kconv_kminor`, `make_kfft_klead` / `make_local_kfft_klead`, `make_kfft_kminor` / `make_local_kfft_kminor`. `common.fft_helpers.get_donated_kfft_kminor` is `make_kfft_kminor` jitted with its input donated, memoised per `(mesh, kgrid, spec, kind, norm)`; the caller drops its own reference after the call |
-| 3 gate | `require_kconv`, called by `runtime.initialize_communicator_stack` after the FFT and GEMM gates. CUDA: the wheel's headers and every `ffi.fft.KCONV_TARGETS` target. cpu: `lorrax_mklfft_flat_k`. Each factory re-probes its own target; operand shapes and dtypes are checked at trace time |
-| 4 target | CUDA, in `liblorrax_ffi.so`: the ten `lorrax_mathdx_*` names the router calls (`_kconv_pair`, `_kconv_parent`, `_kconv_plane`, `_kconv_klead`, `_kconv_klead_unfold_rows`, `_kconv_klead_lorentz_rows`, `_kfft_klead`, `_kconv_kminor`, `_kfft_kminor`, `_plane_fft_gather`); the library also keeps `_kconv_klead_unfold` and `_kconv_klead_lorentz`, the same kernels storing every k row, for older source trees. cpu, in `liblorrax_ffi_host.so`: `lorrax_mklfft_flat_k`, `lorrax_mklfft_gw_conv` |
-| 5 handler | CUDA: `cpp/cufft/kconv_mathdx_cuda_ffi.cc`, one embedded cuFFTDx source compiled per (CUDA context, mode, `nkx`, `nky`, `nkz`, `ns`, precision) into an in-process cache, backed by the disk cubin cache below. cpu: `cpp/mklfft/fft_flat_k_ffi.cc` (`MklFftFlatKHostFfi`, `MklFftGwConvHostFfi`) |
+| 3 gate | `require_kconv`, then `require_fourier_plan`, called by `runtime.initialize_communicator_stack` after the FFT and GEMM gates. `require_kconv` on CUDA: the wheel's headers, every `ffi.fft.KCONV_TARGETS` target, and one probe compile (mode 3, k-grid 2×1×1, disk-cached), so a device the installed cuFFTDx cannot compile for refuses at startup (`GATE mathdx-probe`, naming its compute capability and the wheel); cpu: `lorrax_mklfft_flat_k`. `require_fourier_plan` on CUDA: `lorrax_fourier_plan`; cpu: nothing (XLA ops). Each factory re-probes its own target (a `LocalFourierPlan` that CUDA can lower probes `lorrax_fourier_plan` at construction); operand shapes and dtypes are checked at trace time |
+| 4 target | CUDA, in `liblorrax_ffi.so`: the ten `lorrax_mathdx_*` names the router calls (`_kconv_pair`, `_kconv_parent`, `_kconv_plane`, `_kconv_klead`, `_kconv_klead_unfold_rows`, `_kconv_klead_lorentz_rows`, `_kfft_klead`, `_kconv_kminor`, `_kfft_kminor`, `_plane_fft_gather`); the library also keeps `_kconv_klead_unfold` and `_kconv_klead_lorentz`, the same kernels storing every k row, for older source trees. Also `lorrax_fourier_plan` (`cpp/cufft/fourier_plan_cuda_ffi.cc` + `fourier_plan.cu`, nvcc: sm_80 SASS and compute_80 PTX, JIT-compiled by the driver on sm_90 and later). cpu, in `liblorrax_ffi_host.so`: `lorrax_mklfft_flat_k`, `lorrax_mklfft_gw_conv` |
+| 5 handler | CUDA: `cpp/cufft/kconv_mathdx_cuda_ffi.cc`, one embedded cuFFTDx source (`kSrc`; mode 10 has its own, `kPlaneSrc`) compiled by NVRTC for the device's own `sm_<cc>` per (CUDA context, mode, `nkx`, `nky`, `nkz`, `ns`, precision) into an in-process cache, backed by the disk cubin cache below (images keyed per sm); `cpp/cufft/fourier_plan_cuda_ffi.cc`, plans cached per (device, attributes, batch). cpu: `cpp/mklfft/fft_flat_k_ffi.cc` (`MklFftFlatKHostFfi`, `MklFftGwConvHostFfi`) |
 
 **Doors.** Pick the door whose k position matches the tile you hold. A caller
 never transposes to reach another door.
@@ -504,7 +504,8 @@ never transposes to reach another door.
 | `make_kfft_klead` | flat leading `(N_k, …)` | 3 | `lorrax_mklfft_flat_k` |
 | `make_kconv_kminor` | flat trailing `(…, N_k)` | 4 | XLA moves k to the front, then host inverse transform, product, host forward transform, and k moves back |
 | `make_kfft_kminor` | 3-D trailing `(…, nkx, nky, nkz)` | 5 | the same transpose around one host transform |
-| `make_plane_fft_gather` | none: the route-G cylinder `(…, n_col)` → the transformed plane `(…, n_b, n_c)` | 10 | the XLA route: static-run concatenate, then `jnp.fft.fftn` |
+| `common.fourier_plan.LocalFourierPlan` | none: ≤ 3 spatial axes with per-axis supports; the entry point for sphere↔box and plane transforms (§ Local Fourier plan) | `lorrax_fourier_plan`; its `in_gather` form is mode 10 | XLA ops: `dot_general` GEMM axes and one `jnp.fft` group |
+| `make_plane_fft_gather` | the backend of `LocalFourierPlan(in_gather=…)`: the route-G cylinder `(…, n_col)` → the transformed plane `(…, n_b, n_c)` | 10 | the XLA route: static-run concatenate, then `jnp.fft.fftn` |
 
 - **Sharding.** The pair, parent, plane and `make_local_*` doors are rank-local
   callables for use inside the caller's `shard_map`; the others wrap their own
@@ -684,16 +685,69 @@ power `≤ 40`. Block FFTs are not used because cuFFTDx's fp64 database lacks
 45, 54, 75, 90, 150 and 250, which would take Bluestein and a host-built
 workspace.
 
-The door decides once, at build, and announces the route by name. An axis
-with no split (64, 81, 125, 128, 250) or a plane with
-`16·n_b·(n_c|1)` above the device's opt-in shared memory (`n ≥ 108` on
-A100) takes the XLA route instead. `fn(F, start, size)` transforms the slab
+The door decides once, at build, and announces the route by name. Mode 10
+serves a plane iff both axes split and the block fits:
+`16·n_b·(n_c|1) + 5·n_b + 8·PB + 16 ≤` the device's opt-in shared memory per
+block (`ffi.fft.plane_resident_bytes`; the second term is the kernel's static
+row tables, and `build()` applies the same bound, refusing as `GATE
+mathdx-plane-residency`). Every other plane takes the XLA route: an axis with
+no split (a prime above 40 or a prime power above 40: 41, 49, 64, 81, 121,
+125, 128, 250, …) or an oversized block. Largest square served: 100 on
+sm_80/87 (163 KiB), 78 on sm_86/89/120 (99 KiB, so 80² takes the XLA route),
+119 on sm_90/100 (227 KiB). The block runs 512 threads when one block has the
+SM (`⌊smem per SM / (PB·plane + 1 KiB)⌋ = 1`, e.g. 72² and up on A100), else
+256 with two blocks per SM; the register cap this sets holds on every sm_80+.
+F must be complex128 (`GATE plane-fft-dtype`, on both routes) and
+`plane_from_col` in `[0, n_col]`. `fn(F, start, size)` transforms the slab
 `F[:, start:start+size]` of `F (A, S, …, n_col)` in place, so the ζ loop's
 group slice is not copied. The gates are
 `tests/multi_device/plane_fft_gather_p4.py` (GPU parity `≤ 1e-13` over the
 QE sides 24–250, the routes, a red twin, the slab form) and
 `tests/test_plane_fft_gather.py` (a NumPy model of the passes against
 `np.fft.fft2`).
+
+### Local Fourier plan (`LocalFourierPlan`)
+
+`common.fourier_plan.LocalFourierPlan(extents, axes, *, sign, norm,
+in_support, out_support, out_perm, in_gather, mesh)` computes, on one device,
+
+```text
+y = R_out · F_{sign,norm} · E_in · x      over ≤ 3 axes, complex128
+```
+
+with `F` exactly `jnp.fft.fftn` (`sign = -1`) or `ifftn` (`+1`) and `jnp.fft`'s
+`norm`. `E_in` embeds a compact axis (`in_support[ax]`, indices taken `% N`, a
+repeated index refuses); `R_out` restricts one. Supports are separable: a
+sphere enters through its tight bounding box.
+
+* **Per-axis backend.** An axis is a GEMM with a Fourier matrix built once in
+  float64 (exact integer phase reduction) iff `N` lies in
+  `GEMM_CROSSOVER[device kind]` (a full and a supported range); otherwise it
+  joins the FFT group. Unknown devices and CPU take the FFT everywhere
+  (decisions.md 2026-09-25). Stages run shrinking GEMMs, then the FFT group
+  (embed, transform, restrict), then expanding GEMMs.
+* **Legs.** Chosen when the call is lowered (`lax.platform_dependent`): on
+  CUDA one `lorrax_fourier_plan` custom call (cuBLAS ZGEMM with a stride-0
+  matrix, no transposes; one cuFFT Z2Z plan per contiguous run of FFT axes;
+  remap kernels for embed/restrict); elsewhere XLA ops. A CPU operand in a GPU
+  process therefore takes the XLA leg.
+* **Caches.** The CUDA leg caches plans per (device, attributes, batch) for
+  the process: device Fourier matrices (`16·N'·K` bytes per GEMM axis), remap
+  tables and cuFFT plans without work areas. Work areas and the ping-pong
+  intermediates come from XLA's scratch allocator on every call, so nothing
+  the plan uses per call lives outside the pool.
+* **Refusals.** `GATE fourier-plan-contract` (not complex128, or not 1–3
+  axes, at construction on every platform); `GATE fourier-plan-int32` (a cuFFT
+  or cuBLAS size past `2³¹−1`); a missing `lorrax_fourier_plan` at
+  construction when CUDA can lower the plan.
+* **Determinism.** Reruns are bitwise at fixed device and toolkit, and a
+  batch slice equals the same rows of a larger batch; nothing is promised
+  across architectures.
+* **`in_gather=(plane_from_col, n_col)`** is the route-G plane: mode 10
+  (§ above) or its XLA route, with the slab form `plan(F, start, size)`.
+
+The service page is [`../dev/fourier_plan.md`](../dev/fourier_plan.md); the
+gate is `tests/test_fourier_plan.py` (every leg the platform has).
 
 ### Parent-load ISDF pair convolution (mode 1)
 

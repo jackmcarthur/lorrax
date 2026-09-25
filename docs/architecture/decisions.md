@@ -11,6 +11,27 @@ The last two sections are agent-tier: the GW driver's binding invariants and
 the per-function contracts of `gw.gw_config`, whose one-line docstrings point
 here.
 
+## 2026-09-25 — GEMM or FFT per axis is decided by measurement, per device
+
+**Rule (owner).** A local transform axis takes a stored-matrix GEMM instead of
+the library FFT only where it was measured faster on that device: the rows of
+`common.fourier_plan.GEMM_CROSSOVER`, keyed by device kind, give the axis
+lengths `N` (separately for a full `N→N` axis and a supported one) at which the
+GEMM wins. An unknown device, and CPU, take the FFT on every axis. The choice
+is a deterministic function of the device kind, so every rank builds the same
+plan, and there is no runtime autotune. Local transforms enter through
+`LocalFourierPlan` (service page [`../dev/fourier_plan.md`](../dev/fourier_plan.md));
+the route-G plane transform is its `in_gather` form, served by mathdx mode 10
+under the 2026-09-24 platform router.
+
+**Why.** A GEMM axis costs `O(N·K)` per line against the FFT's `O(N log N)`,
+but on a supported axis it fuses the embedding, the transform and the
+restriction into one pass, and at the bounded lengths of a sphere's box that
+pass beats the FFT arm's three (A100: 0.45–0.87 of the FFT arm at 16–128;
+a full axis never wins there). Full-axis DFT-as-matmul remains a scaling
+hazard, `O(N²)` per axis; the table keeps the GEMM to measured, bounded `N`, so
+transforms keep their `O(N log N)` scaling.
+
 ## 2026-09-24 — One memory path per stage; chunk counts come from the budget
 
 A stage that can exceed the device budget derives its chunk count from the
@@ -426,7 +447,6 @@ cite an entry here.
   object may be required to fit on one rank in the large-P limit. Each solve
   family has two plans, a local whole-tile plan and a distributed plan;
   execution schedules of a plan are not new plans.
-- **No DFT-as-matmul.** Transforms go through the FFT services.
 - **Evidence.** Every performance claim carries a CLAIMS row with its job id
   and on-disk artifact.
 
