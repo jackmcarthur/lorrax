@@ -1,7 +1,7 @@
 #include <cuda_runtime.h>
 #include <cstdint>
 #include "xla/ffi/api/ffi.h"
-#include "ffi_helpers.h"
+#include "../common/ffi_helpers.h"
 namespace lorrax_ffi::contour {
 namespace ffi = ::xla::ffi;
 void launch(const void*, const void*, const void*, void*, int64_t, int64_t,

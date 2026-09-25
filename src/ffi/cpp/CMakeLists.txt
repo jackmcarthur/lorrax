@@ -515,8 +515,8 @@ set(LORRAX_FFI_SOURCES
     active_subspace/active_eigh.cc
     active_subspace/active_ops.cc
     cublas/local_active_gemm_ffi.cc
-    common/contour_accumulate.cu
-    common/contour_accumulate_ffi.cc
+    response/contour_accumulate.cu
+    response/contour_accumulate_ffi.cc
     symmetry/spin_rotate.cu
     symmetry/spin_rotate_ffi.cc
     cusolvermp/context.cc

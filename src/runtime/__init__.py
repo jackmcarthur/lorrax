@@ -2439,6 +2439,9 @@ def _enforce_required_ffi(mesh, *, announce: bool = True) -> None:
     require_kconv(mesh, announce=announce)
     # LocalFourierPlan's CUDA leg is one custom call in the same library.
     require_fourier_plan(mesh, announce=announce)
+    # CUDA handlers outside the router (contour accumulator, spin rotation).
+    from ffi.common.ffi_loader import require_cuda_handlers
+    require_cuda_handlers(mesh)
 
 
 def _ffi_dial_facts() -> list:

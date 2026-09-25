@@ -85,7 +85,7 @@ import jax
 import jax.ffi
 from lxkit import native_provider as _native
 
-__all__ = ["get_lib", "has_target", "probe_target", "has_phdf5_read",
+__all__ = ["get_lib", "has_target", "probe_target", "require_cuda_handlers", "has_phdf5_read",
            "has_phdf5_write", "loaded_lib_path",
            "LORRAX_FFI_ABI_VERSION", "FfiAbiMismatch"]
 
@@ -133,6 +133,9 @@ _CUDA_TARGET_SYMBOLS = {
     # fourier_plan_cuda_ffi.cc): cuBLAS Fourier GEMMs + one cuFFT group.
     "lorrax_fourier_plan":          "LorraxFourierPlanCudaFfi",
     "lorrax_fourier_plan_mathdx":   "LorraxFourierPlanMathdxCudaFfi",
+    # gw.contour_accumulator: A[o] += p[o]·c on the response-bank streams
+    # (cpp/response/contour_accumulate*).
+    "lorrax_contour_accumulate":    "ContourAccumulateFfi",
     "lorrax_phdf5_write":           "PhdfWriteFfi",
     "lorrax_phdf5_write_independent": "PhdfWriteIndependentFfi",
     "lorrax_phdf5_read":            "PhdfReadFfi",
@@ -608,6 +611,32 @@ def _register_ffi_targets(lib: ctypes.CDLL, platform: str) -> None:
         except Exception as exc:
             if "already registered" not in str(exc).lower():
                 raise
+
+
+#: CUDA handlers whose doors are not the k-convolution router, checked at
+#: startup by :func:`require_cuda_handlers`: target -> (symbol, door).  The
+#: contour row is registered from ``_CUDA_TARGET_SYMBOLS``; the spin rotation
+#: is registered by its own service, so only its symbol is checked here.
+_CUDA_STARTUP_HANDLERS = {
+    "lorrax_contour_accumulate": ("ContourAccumulateFfi", "gw.contour_accumulator"),
+    "lorrax_symmetry_spin_rotate_centroid": ("SpinRotateCentroidCudaFfi",
+                                             "symmetry_maps._spin_rotation"),
+}
+
+
+def require_cuda_handlers(mesh) -> None:
+    """Refuse at startup, on a CUDA mesh, a provider without one of
+    :data:`_CUDA_STARTUP_HANDLERS`; a no-op on any other platform."""
+    from ffi.gate import mesh_ffi_platform
+    if mesh_ffi_platform(mesh) != "CUDA":
+        return
+    lib = get_lib("CUDA")
+    for target, (symbol, door) in _CUDA_STARTUP_HANDLERS.items():
+        if not hasattr(lib, symbol):
+            raise RuntimeError(
+                f"GATE ffi-handler: got {loaded_lib_path('CUDA')} without {symbol}; want the "
+                f"handler of {target}, which {door} calls on CUDA; fix: use the sealed bundle, or "
+                "rebuild both legs from this tree and pin them (LORRAX_FFI_SO, LORRAX_FFI_HOST_SO).")
 
 
 def probe_target(target_name: str, platform: str) -> tuple[bool, str]:
