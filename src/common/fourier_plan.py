@@ -23,7 +23,8 @@ Each axis is one stage, a GEMM with a Fourier matrix stored in the plan,
 or an FFT.  The integer phase ``idx'·idx mod N`` is reduced exactly before the
 float64 exponential.  The GEMM does the embedding, transform and restriction
 in one pass; it is chosen when ``N`` lies in the device's measured GEMM range
-(:data:`GEMM_CROSSOVER`, separately for full and supported axes).
+(:data:`GEMM_CROSSOVER`, separately for full and supported axes; a supported
+axis also needs ``n_in·n_out/N² ≤`` the row's bound).
 FFT axes go to one ``fft_helpers.local_fftn3``/``local_ifftn3`` call (a single
 multidimensional ``jnp.fft`` transform, so the library keeps its
 multidimensional algorithm), preceded by one gather per embedded axis
@@ -80,8 +81,17 @@ from common.fft_helpers import local_fftn3, local_ifftn3
 # the GEMM does all three in one pass: one way 0.50–0.82 and round trip
 # 0.45–0.87 of the FFT arm on 16³–96³ and 24²–128² boxes.  12³ loses (1.16:
 # launch-bound batched GEMMs), hence the floor at 16.
-GEMM_CROSSOVER: dict[str, tuple[range, range]] = {
-    "NVIDIA A100": (range(0), range(16, 129)),
+#
+# A supported axis also needs a small support.  The GEMM costs K = n_in·n_out/N
+# multiply-adds per grid element and the FFT arm about one pass, so the row's
+# third entry bounds K/N.  Measured on A100 (``runs/runtime/
+# f3_fft_adoption_20260925/sweep_support_fraction.out``: 2-D and 3-D, N 24–128,
+# in and out supports), the GEMM wins 1.08–2.8× at every K/N ≤ 0.54 except 2-D
+# out-support at N = 24 (0.78–0.93×).  The first loss above 0.54 is at N = 128,
+# K/N = 0.55 (out-support, 0.74–0.83×).  The bound 0.54 keeps Fe's 13/25 union
+# box.  A row without a third entry puts no bound on K/N.
+GEMM_CROSSOVER: dict[str, tuple] = {
+    "NVIDIA A100": (range(0), range(16, 129), 0.54),
 }
 
 _NORMS = (None, "backward", "ortho", "forward")
@@ -110,12 +120,12 @@ def dft_matrix(n: int, out_idx, in_idx, *, sign: int, scale: float = 1.0,
     return (scale * a).astype(dtype)
 
 
-def gemm_crossover(device_kind: str) -> tuple[range, range]:
-    """``(full-axis N range, supported-axis N range)`` taking the GEMM."""
+def gemm_crossover(device_kind: str) -> tuple[range, range, float]:
+    """``(full-axis N range, supported-axis N range, max supported K/N)`` taking the GEMM."""
     for prefix, row in GEMM_CROSSOVER.items():
         if device_kind.startswith(prefix):
-            return row
-    return range(0), range(0)
+            return (*row, 1.0)[:3]
+    return range(0), range(0), 1.0
 
 
 def _default_leg():
@@ -209,7 +219,7 @@ class LocalFourierPlan:
         if device_kind is None:
             device_kind = (mesh.devices.flat[0] if mesh is not None else jax.devices()[0]).device_kind
         self.device_kind = str(device_kind)
-        n_full, n_sup = gemm_crossover(self.device_kind)
+        n_full, n_sup, kn_max = gemm_crossover(self.device_kind)
 
         self.extents, self.axes, self.sign, self.norm = extents, axes, sign, norm
         gemm, fft, embed, take, self.stages = [], [], [], [], []
@@ -223,7 +233,7 @@ class LocalFourierPlan:
                 raise ValueError(f"LocalFourierPlan: in_support on axis {ax} repeats an index")
             supported = ax in in_support or ax in out_support
             self._axis[ax] = (n, i_idx, o_idx, ax in in_support, ax in out_support)
-            if n in (n_sup if supported else n_full):
+            if (n in n_sup and i_idx.size * o_idx.size <= kn_max * n * n) if supported else n in n_full:
                 A = dft_matrix(n, o_idx, i_idx, sign=sign,
                                scale=_axis_scale(n, sign, norm), dtype=self.dtype)
                 gemm.append((o_idx.size / i_idx.size, ax, A))
