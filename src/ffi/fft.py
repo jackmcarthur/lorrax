@@ -1638,13 +1638,13 @@ def make_kconv_kminor(mesh: Mesh, kgrid, x_spec: P, k_spec: P, *,
 # =============================================================================
 # The local Fourier plan's CUDA leg (``common.fourier_plan.LocalFourierPlan``)
 # =============================================================================
-FOURIER_PLAN_TARGET = "lorrax_fourier_plan"
+FOURIER_PLAN_TARGET = "lorrax_fourier_plan_mathdx"
 
 
 def require_fourier_plan(mesh: Mesh, *, announce: bool = True) -> str:
     """Startup check of ``LocalFourierPlan``'s leg on this mesh; returns it or refuses.
 
-    CUDA: the ``lorrax_fourier_plan`` handler must be in the loaded library
+    CUDA: the ``lorrax_fourier_plan_mathdx`` handler must be in the loaded library
     (the plan's CUDA leg is that one custom call); cpu: the XLA ops, nothing
     to probe.
     """
@@ -1659,8 +1659,8 @@ def require_fourier_plan(mesh: Mesh, *, announce: bool = True) -> str:
 
 
 def fourier_plan_ffi(x, *, n, kin, kout, in_idx, out_idx, sup_in, sup_out, gemm, scale,
-                     order, sign):
-    """One ``lorrax_fourier_plan`` custom call over the ``len(n)`` trailing axes
+                     order, sign, mathdx_root="", cubin_dir=""):
+    """One ``lorrax_fourier_plan_mathdx`` custom call over the ``len(n)`` trailing axes
     of ``x`` (row-major in, row-major out; ``cpp/cufft/fourier_plan_cuda_ffi.cc``).
 
     Every attribute is per transform axis in physical order: full extent
@@ -1668,6 +1668,9 @@ def fourier_plan_ffi(x, *, n, kin, kout, in_idx, out_idx, sup_in, sup_out, gemm,
     ``in_idx``/``out_idx`` (identity ranges on an axis without one), the 0/1
     flags ``sup_in``/``sup_out``/``gemm``, the axis' jnp.fft ``scale``, and
     ``order``: GEMM axes in execution order with -1 where the FFT group runs.
+    ``mathdx_root``/``cubin_dir`` build the fused supported pair (the two
+    trailing axes' GEMMs back to back as one cuBLASDx kernel, when a block fits
+    it on the device); ``""`` runs every GEMM through cuBLAS.
     """
     d = len(n)
     out = jax.ShapeDtypeStruct(tuple(x.shape[:-d]) + tuple(int(k) for k in kout), x.dtype)
@@ -1675,4 +1678,5 @@ def fourier_plan_ffi(x, *, n, kin, kout, in_idx, out_idx, sup_in, sup_out, gemm,
     return jax.ffi.ffi_call(FOURIER_PLAN_TARGET, out)(
         x, n=i64(n), kin=i64(kin), kout=i64(kout), in_idx=i64(in_idx), out_idx=i64(out_idx),
         sup_in=i64(sup_in), sup_out=i64(sup_out), gemm=i64(gemm),
-        scale=np.asarray(scale, dtype=np.float64), order=i64(order), sign=np.int64(sign))
+        scale=np.asarray(scale, dtype=np.float64), order=i64(order), sign=np.int64(sign),
+        mathdx_root=mathdx_root, cubin_dir=cubin_dir)

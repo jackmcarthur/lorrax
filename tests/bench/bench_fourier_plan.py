@@ -258,7 +258,7 @@ def main():
     a = ap.parse_args()
     if a.leg == "ffi":
         from ffi.common import ffi_loader
-        ok, why = ffi_loader.probe_target("lorrax_fourier_plan", "CUDA")
+        ok, why = ffi_loader.probe_target("lorrax_fourier_plan_mathdx", "CUDA")
         if not ok:
             raise SystemExit(why)
     if a.leg:
