@@ -331,8 +331,8 @@ def _fit_mubatch(
         mesh=mesh_xy, kgrid=kgrid, fft_grid=fft_grid, ns=ns, b=b,
         q_sel=q_irr_full_idx, q_axis=q_axis, q_neg=q_neg_idx, qvec_frac=q_frac,
         n_col=int(cyl[0].shape[1]), n_s=int(cyl[0].shape[2]),
-        n_pg=int(plan.r_sub), axis=axis, n_src=n_par, vertices=vertices, c_out=c_out,
-        n_blk=n_blk)
+        plane_from_col=np.asarray(jax.device_get(cyl[2])), n_pg=int(plan.r_sub),
+        axis=axis, n_src=n_par, vertices=vertices, c_out=c_out, n_blk=n_blk)
     kernel = zmb.make_route_g_kernel(**kern_args)
     split_kernels = {}
     if debug_print_enabled():
@@ -351,7 +351,7 @@ def _fit_mubatch(
     ops = (_device_put_process_local(w_l, rep), _device_put_process_local(w_r, rep),
            _device_put_process_local(kpar, rep))
     rank_sh = NamedSharding(mesh_xy, P(('x', 'y')))
-    tabs = (tuple(_device_put_process_local(np.asarray(a), rep) for a in cyl),
+    tabs = (tuple(_device_put_process_local(np.asarray(a), rep) for a in cyl[:2]),
             tuple(_device_put_process_local(a, rep) for a in zt))
     n_batch = int(mb.n_batch)
     print_fn(f"  μ-batch fit (route G): {n_batch} batches of {b} centroids "

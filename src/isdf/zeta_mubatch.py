@@ -187,6 +187,27 @@ def zeta_plane_tables(gvec_components, ngk_per_q, fft_grid, axis, g_axis):
             np.asarray(pad_to_axis(flat.astype(np.int32), g_axis, axis=1)))
 
 
+def plane_runs(plane_from_col, n_col: int) -> tuple:
+    """The cylinder -> plane zero fill as static runs of the flat plane.
+
+    ``plane_from_col (n_b·n_c,)`` is the column of each in-plane cell,
+    ``n_col`` on an empty one (:func:`common.wfn_transforms.psi_cylinder_tables`).
+    Returns the maximal runs in flat cell order: ``(start, stop)`` for cells
+    holding the consecutive columns ``[start, stop)``, ``(-1, length)`` for
+    empty cells.  Concatenating ``F[..., start:stop]`` and zero blocks gives
+    the plane ``take(F, plane_from_col, mode='fill')`` gives, bit for bit, as
+    contiguous copies; the table lists columns in flat order, so there are
+    about two runs per occupied plane row.
+    """
+    pfc = np.asarray(plane_from_col, dtype=np.int64).ravel()
+    empty = pfc >= int(n_col)
+    brk = np.flatnonzero(np.r_[True, (empty[1:] != empty[:-1])
+                               | (~empty[1:] & (pfc[1:] != pfc[:-1] + 1))])
+    ends = np.r_[brk[1:], pfc.size]
+    return tuple((-1, int(e - s)) if empty[s] else (int(pfc[s]), int(pfc[e - 1]) + 1)
+                 for s, e in zip(brk, ends))
+
+
 def _spin_sandwich(U, d):
     """``(U ⊗ Ū) d`` on the two spin axes (0 and 3) of ``d (s, x, m, s', j)``.
 
@@ -204,7 +225,7 @@ def _spin_sandwich(U, d):
 
 def make_route_g_kernel(*, mesh: Mesh, kgrid, fft_grid, ns: int, b: int,
                         q_sel, q_axis, q_neg, qvec_frac, n_col: int, n_s: int,
-                        n_pg: int, axis: int, n_src: int, vertices=(0,),
+                        plane_from_col, n_pg: int, axis: int, n_src: int, vertices=(0,),
                         c_out: int | None = None, n_blk: int = 1,
                         stop_at: str | None = None):
     """Compile-once executable for one μ batch on route G.
@@ -244,12 +265,13 @@ def make_route_g_kernel(*, mesh: Mesh, kgrid, fft_grid, ns: int, b: int,
     parents, G sharded ``P(None, None, None, ('x','y'))``; ``g3 (n_src,
     ngk_pad, 3)`` Miller index of each parent slot, same G sharding;
     ``kvecs (n_src, 3)``; ``xmu (b, 3)`` fractional coordinates of the batch
-    slots and ``live (b,)`` their mask; ``cyl`` =
-    :func:`common.wfn_transforms.psi_cylinder_tables` of the CHILDREN's
-    spheres; ``zt`` = :func:`zeta_plane_tables`.  ``unf = (irr (nk,), sym
-    (nk,), anti (nk,), U (nk, ns, ns), pslot (nk, ngk_c), phase (nk,
-    ngk_c), k_child (nk, 3))`` is the typed transport in G space
-    (:func:`typed_child_G_tables`) and ``lt = (left_perm (P, n_rows, c),
+    slots and ``live (b,)`` their mask; ``cyl = (cyl_index, cyl_axis)`` of
+    :func:`common.wfn_transforms.psi_cylinder_tables` on the CHILDREN's
+    spheres, whose third output ``plane_from_col`` (host numpy, static) gives
+    the plane fill's :func:`plane_runs`; ``zt`` = :func:`zeta_plane_tables`.
+    ``unf = (irr (nk,), sym (nk,), anti (nk,), U (nk, ns, ns), pslot (nk,
+    ngk_c), phase (nk, ngk_c), k_child (nk, 3))`` is the typed transport in
+    G space (:func:`typed_child_G_tables`) and ``lt = (left_perm (P, n_rows, c),
     left_L (P, n_rows, c, 3))`` each owner's whole-orbit centroid tables,
     sharded over the ranks: the owner unfolds the parents' pair projectors
     ``D̃_k = (U⊗Ū) T[D̃_k̄(perm μ, pslot G) e^{2πi L·k̄} conj(phase)]``,
@@ -298,11 +320,13 @@ def make_route_g_kernel(*, mesh: Mesh, kgrid, fft_grid, ns: int, b: int,
     n_v = len(vertices)
     ib = (np.arange(ps) // n_c).astype(np.float64)
     ic = (np.arange(ps) % n_c).astype(np.float64)
+    pfc = np.asarray(plane_from_col, dtype=np.int32).reshape(ps)
+    runs = plane_runs(pfc, n_col)
     key = ('route_g', _mesh_id(mesh), tuple(kgrid), tuple(fft_grid), ns, b,
            hash(q_sel.tobytes()), q_axis,
            None if q_neg is None else hash(q_neg.tobytes()), hash(qv.tobytes()),
-           int(n_col), int(n_s), int(n_pg), int(axis), int(n_src), vertices, c_out,
-           n_blk, stop_at)
+           int(n_col), int(n_s), hash(pfc.tobytes()), int(n_pg), int(axis), int(n_src),
+           vertices, c_out, n_blk, stop_at)
     hit = _kernel_cache.get(key)
     if hit is not None:
         return hit
@@ -315,7 +339,7 @@ def make_route_g_kernel(*, mesh: Mesh, kgrid, fft_grid, ns: int, b: int,
                        P(), (R_, R_)),
              out_specs=(P(None, _XY, None),) * n_v, check_vma=False)
     def _local(psi_bar, w_l, w_r, kvecs, g3, xmu, live, cyl, zt, unf, lt):
-        ci, cax, pfc = cyl
+        ci, cax = cyl
         zc, za, zflat = zt
         irr, sym, anti, U, pslot, phase, kch = unf
         lperm, lL = lt[0][0], lt[1][0]                    # this owner's orbits
@@ -377,10 +401,12 @@ def make_route_g_kernel(*, mesh: Mesh, kgrid, fft_grid, ns: int, b: int,
                     a0 = (bi * n_gb + gi) * n_pg + jnp.arange(n_pg)
                     on = (a0 < n_a).astype(jnp.float64)
                     F = jax.lax.dynamic_slice_in_dim(Fa, gi * n_pg, n_pg, axis=1)
-                    # Empty plane cells carry the out-of-range column n_col: a zero
-                    # fill in the gather itself, no padded copy of the cylinder.
-                    st = jnp.take(F, pfc, axis=-1, mode='fill', fill_value=0).reshape(
-                        nk, n_pg, ns, 2 * c_out, ns, n_b, n_c)
+                    # Columns -> planes: one concatenate of the static column runs
+                    # and zero runs (plane_runs), contiguous copies with no index
+                    # table; then the 2D FFT Σ_G e^{-iG·r}.
+                    z = lambda n: jnp.zeros(F.shape[:-1] + (n,), F.dtype)
+                    st = jnp.concatenate([F[..., a:e] if a >= 0 else z(e) for a, e in runs],
+                                         axis=-1).reshape(nk, n_pg, ns, 2 * c_out, ns, n_b, n_c)
                     d = local_fftn3(st, axes=(-2, -1), norm='backward')        # Σ e^{-iG·r}
                     bl = jnp.exp(-2j * jnp.pi * (
                         kch[:, axis][:, None, None] * a0[None, :, None] / n_a

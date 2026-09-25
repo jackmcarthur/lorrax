@@ -154,7 +154,7 @@ def run_case(case, fx, mesh, scratch, vertices=(0,)):
     unf = tuple(put_rep(a) for a in (plan.irr_idx.astype(np.int32),
                                      plan.sym_idx.astype(np.int32), anti,
                                      plan.spin_action_full, pslot, phase, kfull))
-    tabs = (tuple(put_rep(a) for a in cyl), tuple(put_rep(a) for a in zt))
+    tabs = (tuple(put_rep(a) for a in cyl[:2]), tuple(put_rep(a) for a in zt))
     rank = NamedSharding(mesh, P(("x", "y")))
 
     def run_g(tabs, placement="host", c_out=None, n_blk=1):
@@ -166,7 +166,8 @@ def run_case(case, fx, mesh, scratch, vertices=(0,)):
         kern = zmb.make_route_g_kernel(
             mesh=mesh, kgrid=kgrid, fft_grid=fg, ns=ns, b=ob.b,
             q_sel=q_sel, q_axis=q_axis, q_neg=q_neg if charge else None, qvec_frac=qf,
-            n_col=int(cyl[0].shape[1]), n_s=int(cyl[0].shape[2]), n_pg=2, axis=axis,
+            n_col=int(cyl[0].shape[1]), n_s=int(cyl[0].shape[2]),
+            plane_from_col=np.asarray(cyl[2]), n_pg=2, axis=axis,
             n_src=n_par, vertices=vertices, c_out=c_out, n_blk=n_blk)
         stores = [zmb.ZStore(mesh=mesh, q_axis=q_axis, mu_pad=mu_pad, g_axis=g_axis,
                              b=ob.b, placement=placement, n_batch=ob.n_batch,
