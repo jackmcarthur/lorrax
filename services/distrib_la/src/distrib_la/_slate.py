@@ -46,8 +46,9 @@ __all__ = [
 """Per-process singleton context for the SLATE FFI.
 
 A SLATE context is cheap to build — just a dup'd (and rank-remapped)
-MPI_Comm plus identity (rank, world, p, q).  We cache one per mesh-shape
-to avoid re-dup'ing the communicator on every call.
+MPI_Comm plus identity (rank, world, p, q).  We cache one per platform and
+mesh shape to avoid re-dup'ing the communicator on every call.  The host
+and CUDA handlers resolve keys in separate native registries.
 
 Bootstrap: SLATE wants ``MPI_Init_thread(MPI_THREAD_MULTIPLE)`` and an
 MPI communicator.  phdf5's ``phdf5_init_mpi()`` already initialises MPI
@@ -71,14 +72,13 @@ Restrictions
 """
 
 MeshKey = Tuple[int, int]  # (p, q)
+ContextKey = Tuple[str, int, int]  # (platform, p, q)
 
 _LOCK = threading.Lock()
-# (p, q) -> (handle, ffi platform that created it).  A SlateCtx is pure MPI
-# and platform-agnostic, so a GPU mesh and a CPU mesh of the same shape share
-# one ctx; the platform is remembered only so teardown goes through a library
-# that is definitely loaded.
-_CACHE: Dict[MeshKey, Tuple[int, str]] = {}
-_SUBROW_CACHE: Dict[MeshKey, Tuple[int, str]] = {}
+# The two platform libraries own separate ctx_key registries and lifetimes.
+# A context created by one library must never be sent to the other.
+_CACHE: Dict[ContextKey, Tuple[int, str]] = {}
+_SUBROW_CACHE: Dict[ContextKey, Tuple[int, str]] = {}
 
 
 def _mesh_platform(mesh: Mesh) -> str:
@@ -183,19 +183,21 @@ def get_or_init_context(mesh: Mesh) -> int:
 
     Thread-safe.  First call collectively dups MPI_COMM_WORLD.
     """
-    key = validate_mesh(mesh)
+    shape = validate_mesh(mesh)
+    plat = _mesh_platform(mesh)
+    key = (plat,) + shape
     with _LOCK:
         entry = _CACHE.get(key)
         if entry is not None:
             return entry[0]
         h = _make_ctx(mesh)
-        plat = _mesh_platform(mesh)
-        _KEYS[("world",) + key] = loader.bind_context(plat, _ctx_config("world", key, plat), h)
+        _KEYS[("world",) + key] = loader.bind_context(
+            plat, _ctx_config("world", shape, plat), h)
         _CACHE[key] = (h, plat)
         return h
 
 
-#: ("world" | "subrow", p, q) -> the context's FFI ``ctx_key``.
+#: ("world" | "subrow", platform, p, q) -> the context's FFI ``ctx_key``.
 _KEYS: dict = {}
 
 
@@ -209,12 +211,12 @@ def context_key(mesh: Mesh) -> int:
     """The FFI ``ctx_key`` attribute of this mesh's SLATE context (see
     ``distrib_la.loader.context_key``): a pure function of the configuration."""
     get_or_init_context(mesh)
-    return _KEYS[("world",) + validate_mesh(mesh)]
+    return _KEYS[("world", _mesh_platform(mesh)) + validate_mesh(mesh)]
 
 
 def _subrow_context_key(mesh: Mesh) -> int:
     _get_or_init_subrow_context(mesh)
-    return _KEYS[("subrow",) + validate_mesh(mesh)]
+    return _KEYS[("subrow", _mesh_platform(mesh)) + validate_mesh(mesh)]
 
 
 def _make_subrow_ctx(mesh: Mesh) -> int:
@@ -242,14 +244,16 @@ def _get_or_init_subrow_context(mesh: Mesh) -> int:
     ``(Nbatch, N, N)`` input distributed along ``'x'`` (batch) and ``'y'``
     (inner matrix).
     """
-    key = validate_mesh(mesh)
+    shape = validate_mesh(mesh)
+    plat = _mesh_platform(mesh)
+    key = (plat,) + shape
     with _LOCK:
         entry = _SUBROW_CACHE.get(key)
         if entry is not None:
             return entry[0]
         h = _make_subrow_ctx(mesh)
-        plat = _mesh_platform(mesh)
-        _KEYS[("subrow",) + key] = loader.bind_context(plat, _ctx_config("subrow", key, plat), h)
+        _KEYS[("subrow",) + key] = loader.bind_context(
+            plat, _ctx_config("subrow", shape, plat), h)
         _SUBROW_CACHE[key] = (h, plat)
         return h
 

@@ -497,6 +497,8 @@ def test_helper_delegates_the_clip():
         ([0, 4, 8], [[4, 7], [4, 7], [4, 7]], 2, "must be a 2-D"),
         # negative extents would reach H5Sselect_hyperslab as huge unsigneds
         ([[0, 0], [4, 0]], [[4, 7], [-1, 7]], 2, "negative entry"),
+        (np.empty((0, 2), dtype=np.int64),
+         np.empty((0, 2), dtype=np.int64), 2, "at least one window"),
     ],
 )
 def test_inconsistent_window_tables_refuse(offsets, valid_shapes, ndim, match):

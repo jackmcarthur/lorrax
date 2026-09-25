@@ -264,8 +264,9 @@ def _locate_so(platform: str) -> Path:
 # ---------------------------------------------------------------------------
 # THE C ABI IS PER-LIBRARY; THE PYTHON NAME IS NOT.
 # ---------------------------------------------------------------------------
-# ``cpp/slate/context.cc`` is pure MPI and compiles into BOTH platform
-# libraries, so until 2026-08-08 both .so files defined these four
+# ``cpp/slate/context.cc`` is pure MPI, but each platform build includes it
+# only when its SLATE or ScaLAPACK capability is present. When included,
+# until 2026-08-08 both .so files defined these four
 # ``extern "C"`` names (and five more from ``cpp/phdf5/api.cc``, which this
 # package does not call).  Both are dlopened RTLD_GLOBAL, one name with two
 # definitions behind it -- the C half of the cross-.so ODR violation
@@ -352,9 +353,11 @@ def _declare_ctx_registry(lib: ctypes.CDLL) -> None:
 
 
 def _declare_slate(lib: ctypes.CDLL) -> None:
-    """SLATE context lifecycle — exported by BOTH platform libraries
-    (``cpp/slate/context.cc`` is pure MPI and compiled into each).  Absent
-    from a build made without SLATE, hence the guard."""
+    """SLATE context lifecycle, when the platform build includes it.
+
+    The CUDA leg can omit SLATE; the host leg includes this MPI context
+    when either SLATE or ScaLAPACK is built.
+    """
     if not hasattr(lib, "lrx_slate_context_create"):
         return
     lib.lrx_slate_context_create.argtypes = [
@@ -770,6 +773,10 @@ def create_slate_context(rank: int, world_size: int, p: int, q: int,
     the CUDA library to load.
     """
     lib = get_lib(platform)
+    if not hasattr(lib, "lrx_slate_context_create"):
+        raise LibraryUnusable(
+            f"SLATE context unavailable on {platform}: the selected FFI "
+            "library does not export lrx_slate_context_create")
     err = ctypes.create_string_buffer(_ERR_CAP)
     h = lib.lrx_slate_context_create(
         int(rank), int(world_size), int(p), int(q), err, _ERR_CAP)
@@ -789,6 +796,10 @@ def create_slate_subrow_context(rank: int, world_size: int,
     ``(Nbatch, N, N)`` input distributed as ``P('x', None, 'y')``.
     """
     lib = get_lib(platform)
+    if not hasattr(lib, "lrx_slate_subrow_context_create"):
+        raise LibraryUnusable(
+            f"SLATE subrow context unavailable on {platform}: the selected "
+            "FFI library does not export lrx_slate_subrow_context_create")
     err = ctypes.create_string_buffer(_ERR_CAP)
     h = lib.lrx_slate_subrow_context_create(
         int(rank), int(world_size), int(Px), int(Py), err, _ERR_CAP)

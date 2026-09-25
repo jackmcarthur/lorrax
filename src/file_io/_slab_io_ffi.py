@@ -1461,6 +1461,8 @@ def _normalize_window_tables(
             f"read_slabs {name!r}: offsets and valid_shapes describe "
             f"different window counts ({off.shape[0]} vs {val.shape[0]}); "
             f"they are two columns of ONE table of windows.")
+    if off.shape[0] == 0:
+        raise ValueError(f"read_slabs {name!r}: at least one window is required")
     if off.shape[1] != ndim or val.shape[1] != ndim:
         raise ValueError(
             f"read_slabs {name!r}: window tables have ndim "
@@ -1866,11 +1868,10 @@ class _CollectiveLane:
     handle's synchronous door must not run beside another handle's writer.
 
     The rule, at every door that touches HDF5 (they all drain first, through
-    :meth:`_LaneSlot.drain`): every handle's queued writes and every OTHER
-    handle's in-flight async union reads finish before this handle's HDF5
-    call.  A read on this same handle must finish too: the native read worker
-    can still be inside HDF5 after ``read_slabs`` returns.  Writer errors
-    stay per handle.
+    :meth:`_LaneSlot.drain`): every handle's queued writes and in-flight
+    async union reads finish before this handle's HDF5 call.  The native read
+    worker can still be inside HDF5 after ``read_slabs`` returns.  Writer
+    errors stay per handle.
     """
 
     def __init__(self):
@@ -2796,6 +2797,14 @@ class _FfiBackend(_DatasetGeometry):
         offsets_t, valid_t = _normalize_window_tables(
             name=name, offsets=offsets, valid_shapes=valid_shapes,
             ndim=len(slab_shape))
+        # Use the single-slab admission rule for each explicit window.  A
+        # valid extent beyond ``shape`` was previously silently truncated by
+        # the per-rank counts, while an extent past the file reached H5Dread.
+        for w, (off, valid) in enumerate(zip(offsets_t, valid_t)):
+            _normalize_valid_shape(
+                op=f"read_slabs window {w}", name=name,
+                valid_shape=valid, slab_shape=slab_shape,
+                offset=off, ds_shape=ds_shape)
 
         sharding = NamedSharding(mesh, partition_spec)
         axis_count_per_dim, axis_flat = _sharding_to_axis_info(
