@@ -247,7 +247,7 @@ def make_route_g_kernel(*, mesh: Mesh, kgrid, fft_grid, ns: int, b: int,
     slots and ``live (b,)`` their mask; ``cyl = (cyl_index, cyl_axis)`` of
     :func:`common.wfn_transforms.psi_cylinder_tables` on the CHILDREN's
     spheres, whose third output ``plane_from_col`` (host numpy, static) builds
-    the plane transform (:func:`ffi.fft.make_plane_fft_gather`); ``zt`` =
+    the plane transform (:class:`common.fourier_plan.LocalFourierPlan`); ``zt`` =
     :func:`zeta_plane_tables`.
     ``unf = (irr (nk,), sym (nk,), anti (nk,), U (nk, ns, ns), pslot (nk,
     ngk_c), phase (nk, ngk_c), k_child (nk, 3))`` is the typed transport in
@@ -263,7 +263,8 @@ def make_route_g_kernel(*, mesh: Mesh, kgrid, fft_grid, ns: int, b: int,
     """
     from isdf.core import _conv_kpair_static_gamma
     from isdf.pair_kernels import pair_projectors_lr
-    from ffi.fft import make_fused_conv_kplane, make_plane_fft_gather
+    from ffi.fft import make_fused_conv_kplane
+    from common.fourier_plan import LocalFourierPlan
     from common.gamma_matrices import gamma_perm_phase
     P_ = _mesh_size(mesh)
     if b % P_:
@@ -301,9 +302,10 @@ def make_route_g_kernel(*, mesh: Mesh, kgrid, fft_grid, ns: int, b: int,
     ib = (np.arange(ps) // n_c).astype(np.float64)
     ic = (np.arange(ps) % n_c).astype(np.float64)
     pfc = np.asarray(plane_from_col, dtype=np.int32).reshape(ps)
-    # Cylinder -> FFT'd planes in one door: the zero plane is never written
-    # (ffi.fft.make_plane_fft_gather; the XLA route is the run concatenate).
-    plane_fft = make_plane_fft_gather(mesh, pfc, n_col, (n_b, n_c))
+    # Cylinder -> FFT'd planes in one plan: the zero plane is never written
+    # (the gather-on-load kernel; its XLA route is the run concatenate).
+    plane_fft = LocalFourierPlan((n_b, n_c), (-2, -1), sign=-1, norm='backward',
+                                 in_gather=(pfc, n_col), mesh=mesh)
     key = ('route_g', _mesh_id(mesh), tuple(kgrid), tuple(fft_grid), ns, b,
            hash(q_sel.tobytes()), q_axis,
            None if q_neg is None else hash(q_neg.tobytes()), hash(qv.tobytes()),

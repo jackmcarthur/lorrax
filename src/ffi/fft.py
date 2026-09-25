@@ -1507,6 +1507,23 @@ def make_kconv_kminor(mesh: Mesh, kgrid, x_spec: P, k_spec: P, *,
 FOURIER_PLAN_TARGET = "lorrax_fourier_plan"
 
 
+def require_fourier_plan(mesh: Mesh, *, announce: bool = True) -> str:
+    """Startup check of ``LocalFourierPlan``'s leg on this mesh; returns it or refuses.
+
+    CUDA: the ``lorrax_fourier_plan`` handler must be in the loaded library
+    (the plan's CUDA leg is that one custom call); cpu: the XLA ops, nothing
+    to probe.
+    """
+    from ffi.gate import announce_once, mesh_ffi_platform
+    if mesh_ffi_platform(mesh) != "CUDA":
+        return "xla"
+    _require_target(FOURIER_PLAN_TARGET, "CUDA")
+    announce_once(("fourier_plan", "cuda"),
+                  f"[fourier_plan] LocalFourierPlan CUDA leg: {FOURIER_PLAN_TARGET} "
+                  "(cuBLAS Fourier GEMMs + one cuFFT group)", scope="rank0", emit=announce)
+    return "ffi"
+
+
 def fourier_plan_ffi(x, *, n, kin, kout, in_idx, out_idx, sup_in, sup_out, gemm, scale,
                      order, sign):
     """One ``lorrax_fourier_plan`` custom call over the ``len(n)`` trailing axes

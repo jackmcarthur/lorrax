@@ -257,13 +257,10 @@ def main():
     ap.add_argument("--out")
     a = ap.parse_args()
     if a.leg == "ffi":
-        so = os.environ["LORRAX_FOURIER_PLAN_SO"]
-        import ctypes
-        lib = ctypes.CDLL(so)
-        jax.ffi.register_ffi_target("lorrax_fourier_plan",
-                                    jax.ffi.pycapsule(lib.LorraxFourierPlanCudaFfi),
-                                    platform="CUDA")
-        main.lib = lib
+        from ffi.common import ffi_loader
+        ok, why = ffi_loader.probe_target("lorrax_fourier_plan", "CUDA")
+        if not ok:
+            raise SystemExit(why)
     if a.leg:
         fourier_plan._default_leg = lambda: a.leg
     dev = jax.devices()[0]
