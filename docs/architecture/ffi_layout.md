@@ -709,9 +709,12 @@ The modes of the one handler file. The target column is the string
   group, chunked over pairs through an `(N_k, chunk·2ns²)` intermediate that
   XLA's scratch allocator grants (at most `scratch_bytes`; the door's default
   is one parent-Green tile).
-- **The tile-table load (modes 7 and 11, sm_80+).** Where the bank and its
-  tables fit two or more blocks per SM, mode 11's single arm and mode 7's
-  whole-spin-group load read no table per cell. A persistent grid (the
+- **The tile-table load (modes 7 and 11, sm_80+).** Where the register load
+  cannot keep two blocks resident (its live `g`, `U`, `Ur` are `12·ns²`
+  registers: 192 at `ns = 4`, 48 at `ns = 2`, which already runs three
+  blocks per SM) and the bank and its tables fit two or more blocks per SM,
+  mode 11's single arm and mode 7's whole-spin-group load read no table per
+  cell. A persistent grid (the
   resident blocks) walks tiles of `tp` pairs; each block stages `U_k` and the
   per-k source rows once, and each tile's `lsrc`/`rsrc` slices, `mph`/`nph`
   and (mode 7) `W_R` go by cp.async one tile ahead into a second table
