@@ -486,8 +486,8 @@ specialised per grid when NVRTC compiles the kernel.
 |---|---|
 | 1 consumer | ζ fit: `isdf.core.c_q_downfold` (pair); `isdf.core.c_q_from_psi_sm` (parent); `isdf.zeta_mubatch.make_route_g_kernel` (plane, every channel; the current channels' γ̃ as the load's `(perm, phase)`). Σ: `gw.ppm_tau_kernel.get_sigma_spatial_kernel` (τ sweep and static SX/RI: klead `prep` for W, klead unfold for G), `gw.cohsex_sigma._make_static_convolution` (klead). BSE: `bse_stack_matvec._conv_decode`, `bse_ring_comm._make_ring_rung`, and the W_R transforms in `bse_densify.make_w_densifier`, `bse_lanczos`, `davidson_absorption`, `absorption_haydock`, `bse_nontda`, `exciton_bands`. Flat-k transform: `common.fft_helpers.make_flat_k_fft` and its `make_flat_k_ifftn` / `make_flat_k_fftn` / `make_local_flat_k_fftn` wrappers (`gw.w_isdf`, `gw.qsgw_head`, `gw.cohsex_sigma`, `gw.wavefunction_bundle`, `bandstructure.htransform`, `bandstructure.orbital`) |
 | 2 router | `ffi/fft.py`: `make_fused_conv_kpair`, `make_fused_conv_kparent`, `make_fused_conv_kplane`, `make_kconv_klead` (→ `KConvStored(prep, apply)`), `make_kconv_klead_unfold`, `make_kconv_lorentz_unfold`, `make_kconv_kminor` / `make_local_kconv_kminor`, `make_kfft_klead` / `make_local_kfft_klead`, `make_kfft_kminor` / `make_local_kfft_kminor`. `common.fft_helpers.get_donated_kfft_kminor` is `make_kfft_kminor` jitted with its input donated, memoised per `(mesh, kgrid, spec, kind, norm)`; the caller drops its own reference after the call |
-| 3 gate | `require_kconv`, called by `runtime.initialize_communicator_stack` after the FFT and GEMM gates. CUDA: the wheel's headers and all eight `lorrax_mathdx_*` targets. cpu: `lorrax_mklfft_flat_k`. Each factory re-probes its own target; operand shapes and dtypes are checked at trace time |
-| 4 target | CUDA, in `liblorrax_ffi.so`: the nine `lorrax_mathdx_*` names the router calls (`_kconv_pair`, `_kconv_parent`, `_kconv_plane`, `_kconv_klead`, `_kconv_klead_unfold_rows`, `_kconv_klead_lorentz_rows`, `_kfft_klead`, `_kconv_kminor`, `_kfft_kminor`); the library also keeps `_kconv_klead_unfold` and `_kconv_klead_lorentz`, the same kernels storing every k row, for older source trees. cpu, in `liblorrax_ffi_host.so`: `lorrax_mklfft_flat_k`, `lorrax_mklfft_gw_conv` |
+| 3 gate | `require_kconv`, called by `runtime.initialize_communicator_stack` after the FFT and GEMM gates. CUDA: the wheel's headers and every `ffi.fft.KCONV_TARGETS` target. cpu: `lorrax_mklfft_flat_k`. Each factory re-probes its own target; operand shapes and dtypes are checked at trace time |
+| 4 target | CUDA, in `liblorrax_ffi.so`: the ten `lorrax_mathdx_*` names the router calls (`_kconv_pair`, `_kconv_parent`, `_kconv_plane`, `_kconv_klead`, `_kconv_klead_unfold_rows`, `_kconv_klead_lorentz_rows`, `_kfft_klead`, `_kconv_kminor`, `_kfft_kminor`, `_plane_fft_gather`); the library also keeps `_kconv_klead_unfold` and `_kconv_klead_lorentz`, the same kernels storing every k row, for older source trees. cpu, in `liblorrax_ffi_host.so`: `lorrax_mklfft_flat_k`, `lorrax_mklfft_gw_conv` |
 | 5 handler | CUDA: `cpp/cufft/kconv_mathdx_cuda_ffi.cc`, one embedded cuFFTDx source compiled per (CUDA context, mode, `nkx`, `nky`, `nkz`, `ns`, precision) into an in-process cache, backed by the disk cubin cache below. cpu: `cpp/mklfft/fft_flat_k_ffi.cc` (`MklFftFlatKHostFfi`, `MklFftGwConvHostFfi`) |
 
 **Doors.** Pick the door whose k position matches the tile you hold. A caller
@@ -504,6 +504,7 @@ never transposes to reach another door.
 | `make_kfft_klead` | flat leading `(N_k, …)` | 3 | `lorrax_mklfft_flat_k` |
 | `make_kconv_kminor` | flat trailing `(…, N_k)` | 4 | XLA moves k to the front, then host inverse transform, product, host forward transform, and k moves back |
 | `make_kfft_kminor` | 3-D trailing `(…, nkx, nky, nkz)` | 5 | the same transpose around one host transform |
+| `make_plane_fft_gather` | none: the route-G cylinder `(…, n_col)` → the transformed plane `(…, n_b, n_c)` | 10 | the XLA route: static-run concatenate, then `jnp.fft.fftn` |
 
 - **Sharding.** The pair, parent, plane and `make_local_*` doors are rank-local
   callables for use inside the caller's `shard_map`; the others wrap their own
@@ -654,6 +655,45 @@ A new mode is added in four steps:
 3. Add a router factory in `ffi/fft.py` that returns the mathdx call on CUDA
    and the plan-route composition on cpu.
 4. Add a case, with a red twin, to `tests/multi_device/kconv_router_p4.py`.
+
+### Plane FFT with gather-on-load (mode 10)
+
+Route G transforms planes whose occupied cells arrive as a compact cylinder
+`F (…, n_col)`; `plane_from_col (n_b·n_c,)` names each flat cell's column
+(`n_col` = empty). The door returns
+
+```text
+Y[…, k_b, k_c] = Σ_{b,c} P[…, b, c] e^{-2πi (b k_b/n_b + c k_c/n_c)},   P = F scattered by plane_from_col, 0 elsewhere
+```
+
+(`fftn(P, axes=(-2,-1), norm='backward')`) without writing `P`. One block
+holds `PB` planes of `(n_b, n_c|1)` in shared memory (`PB ≤ 8` planes within
+64 KiB, else 1). It gathers the occupied rows' cells through `gidx (rows,
+n_c)` and `row_of (rows,)`, runs the row FFTs on those rows only, runs the
+column FFTs on every column with dead rows read as zero, and stores each
+plane once, coalesced. HBM traffic is one read of the cylinder and one write
+of the plane.
+
+Every line FFT is a cuFFTDx thread FFT (`n ≤ 40`). An axis `n = n1·n2` with
+`gcd(n1, n2) = 1` runs as the Good–Thomas two-dimensional DFT: the input sits
+at `(n2·i1 + n1·i2) mod n`, output `(k1, k2)` is `X[k]` for `k ≡ k1 (mod n1)`,
+`k ≡ k2 (mod n2)`, so there are index maps and no twiddles, and frequency `k`
+stays at slot `(n2·(k mod n1) + n1·(k mod n2)) mod n` until the store.
+`plane_fft_split` picks the most balanced split, or `(n, 1)` for a prime
+power `≤ 40`. Block FFTs are not used because cuFFTDx's fp64 database lacks
+45, 54, 75, 90, 150 and 250, which would take Bluestein and a host-built
+workspace.
+
+The door decides once, at build, and announces the route by name. An axis
+with no split (64, 81, 125, 128, 250) or a plane with
+`16·n_b·(n_c|1)` above the device's opt-in shared memory (`n ≥ 108` on
+A100) takes the XLA route instead. `fn(F, start, size)` transforms the slab
+`F[:, start:start+size]` of `F (A, S, …, n_col)` in place, so the ζ loop's
+group slice is not copied. The gates are
+`tests/multi_device/plane_fft_gather_p4.py` (GPU parity `≤ 1e-13` over the
+QE sides 24–250, the routes, a red twin, the slab form) and
+`tests/test_plane_fft_gather.py` (a NumPy model of the passes against
+`np.fft.fft2`).
 
 ### Parent-load ISDF pair convolution (mode 1)
 

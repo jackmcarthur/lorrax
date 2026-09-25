@@ -790,10 +790,10 @@ extern "C" __global__ void __launch_bounds__(256) lrx_kconv(
 //  LRX_NZ = b1, LRX_NS = c1: the Good-Thomas splits n_b = b1*b2 and
 //  n_c = c1*c2 (gcd 1, every factor <= 40, b2 = c2 = 1 for an axis <= 40), so
 //  every line FFT is a cuFFTDx thread FFT and the splits need index maps only,
-//  no twiddle.  One block per plane keeps the whole (n_b, n_c|1) plane in
-//  shared memory: row passes on the occupied rows, column passes on all
-//  columns, one coalesced store.  HBM traffic is one read of the cylinder and
-//  one write of the plane.
+//  no twiddle.  A block keeps LRX_PB whole (n_b, n_c|1) planes in shared
+//  memory: row passes on the occupied rows, column passes on all columns, one
+//  coalesced store.  HBM traffic is one read of the cylinder and one write of
+//  the plane.
 // ---------------------------------------------------------------------------
 static const char* kPlaneSrc = R"__lrx__(
 #include <cufftdx.hpp>
