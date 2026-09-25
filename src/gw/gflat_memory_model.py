@@ -97,7 +97,6 @@ class MuBatchPlan:
     row_chunk: int             # FFT rows per scan step
     g_tile: int                # G slots per store tile (multiple of P)
     placement: str             # 'host' | 'disk' (never the device)
-    finalize_layout: str       # 'q' (q-local solve) | 'g' (G-split)
     hwm_bytes: float
     budget_bytes: float
     target_bytes: float
@@ -112,7 +111,6 @@ class MuBatchPlan:
     runner_up: str | None = None
     store_bytes: float = 0.0        # Z store per rank
     host_budget_bytes: float = 0.0  # host share per rank at plan time
-    zeta_tier: str = "local"        # whole-tile back-solve tier (route G's)
     n_vertex: int = 1               # channels sharing the loop (1 charge, 3 currents)
     # (b_src, n_pg, c_out, n_blk) -> the batch's working-set bytes: whole-
     # orbit source rows b_src, owner plane stage c_out rows x n_blk blocks
@@ -133,13 +131,13 @@ class MuBatchPlan:
             f"{self.t_model_s:.0f} s; runner-up {self.runner_up})",
             f"    r sub-block   = {self.r_sub} "
             f"{'points' if self.route == 'cache' else 'planes per group' if self.route == 'G' else 'plane(s)'}",
-            f"    ζ tier        = {self.zeta_tier} (chosen by route G, which applies "
-            f"the whole-tile factor on each G tile; `linalg` sets the other stages)",
+            f"    ζ back-solve  = whole-tile factor on its q owners, applied on each "
+            f"G tile (`linalg` sets the other stages)",
             f"    channels      = {self.n_vertex} (one k-convolution, accumulator and "
             f"Z store each; every other stage shared)",
             f"    Z store       = {self.placement} ({self.store_bytes / 1e9:.1f} GB/rank; "
             f"host share {self.host_budget_bytes / 1e9:.1f} GB/rank from MemAvailable), "
-            f"G-vector tile {self.g_tile}, finalize {self.finalize_layout}-layout",
+            f"G-vector tile {self.g_tile}, q-local finalize",
             f"    G_tile unit   = {gt / 1e9:.3f} GB/dev (nk·ns²·μ²·16/P); "
             f"feasibility ceiling 4·G_tile = {4 * gt / 1e9:.2f}",
             f"    minimum cfg   = {self.min_config_bytes / 1e9:.2f} GB/dev "
@@ -160,7 +158,7 @@ class MuBatchPlan:
 
 def plan_zeta_route_g(*, meta, mesh_xy, n_q_selected: int, ngkmax: int,
                       psi_ngkmax: int, fit_nb: int, n_col: int, n_s: int,
-                      zeta_tier: str, budget_gb: float,
+                      budget_gb: float,
                       target_utilization: float | None = None,
                       psi_face_bytes: float = 0.0, n_vertex: int = 1,
                       n_parent: int | None = None) -> MuBatchPlan:
@@ -201,11 +199,9 @@ def plan_zeta_route_g(*, meta, mesh_xy, n_q_selected: int, ngkmax: int,
         target_utilization = bfc_fragmentation_target_utilization(ns)
     budget = float(budget_gb) * 1e9
     target = budget * float(target_utilization)
-    finalize_layout = 'q' if str(zeta_tier) == 'local' else 'g'
     n_v = int(n_vertex)
     base = {
-        "C factor": n_v * (_c128(Q_loc, mu, mu) if finalize_layout == 'q'
-                           else _c128(Q, mu, mu)),
+        "C factor": n_v * _c128(Q_loc, mu, mu),
         "centroid faces": float(psi_face_bytes),
         "conj ψ(G) slice": _c128(n_p, nb, ns, Gp),
         "sphere tables": 12.0 * nk * Gp + 4.0 * nk * n_col * n_s + 8.0 * Q * N_G,
@@ -306,8 +302,7 @@ def plan_zeta_route_g(*, meta, mesh_xy, n_q_selected: int, ngkmax: int,
     # The all-to-all floor: every pair projector crosses the network once.
     t_a2a_floor = mu * 2 * _c128(nk, ns, 1, ns, Gp) / comm_model.BETA_BPS
     n_batch = math.ceil(mu / b)
-    per_g = (6.0 * _c128(Q_pad, mu, 1, shard=P_)
-             + (_c128(Q, mu, mu) if finalize_layout == 'g' else 0.0) / max(N_G, 1))
+    per_g = 6.0 * _c128(Q_pad, mu, 1, shard=P_)
     g_tile = int(max(P_, (0.25 * target // max(per_g, 1.0)) // P_ * P_))
     g_tile = min(g_tile, math.ceil(N_G / P_) * P_)
     n_Gt = math.ceil(N_G / g_tile)
@@ -328,14 +323,13 @@ def plan_zeta_route_g(*, meta, mesh_xy, n_q_selected: int, ngkmax: int,
         green_tile_bytes=float(green), min_config_bytes=float(need_min),
         collectives_per_batch=2, t_model_s=float(t_model), runner_up=ru,
         store_bytes=float(store), host_budget_bytes=float(host_budget),
-        zeta_tier=str(zeta_tier),
         min_call_bytes=float(_c128(nk, nb, ns, b)),
         min_efficient_bytes=comm_model.min_efficient_payload(P_ - 1),
         n_vertex=n_v, route='G', source='resident', band_chunk=int(nb), k_chunk=int(nk),
         working_set=lambda b_src, n_pg_, c_out, n_blk: (
             base_total + psi_bytes + sum(ws(b_src, n_pg_, c_out, n_blk).values())),
         b=int(b), n_batch=int(n_batch), r_sub=int(n_pg), row_chunk=0, n_planes=int(n_a),
-        g_tile=int(g_tile), placement=placement, finalize_layout=finalize_layout,
+        g_tile=int(g_tile), placement=placement,
         hwm_bytes=float(sum(br.values())), budget_bytes=float(budget),
         target_bytes=float(target), breakdown=br, transfer=transfer)
 

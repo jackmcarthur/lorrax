@@ -480,8 +480,6 @@ def test_distributed_linalg_lowers_to_gpu_libraries(tmp_path, monkeypatch):
     assert cfg.backend.linalg == "distributed"
     assert cfg.backend.distributed_lu == "cusolvermp"
     assert cfg.backend.distributed_cholesky == "auto"
-    # The ζ tier stays whole-tile: route G chooses it, not `linalg`.
-    assert cfg.backend.distributed_zeta_solve == "auto"
     assert cfg.backend.distrib_la_batched_route == "auto"
     assert cfg.backend.eigh_backend == "distributed"
 

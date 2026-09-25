@@ -1,11 +1,11 @@
-"""The ``local`` ζ back-solve tier's layout primitives (R4, 2026-09-23).
+"""The ζ back-solve's layout primitives (R4, 2026-09-23).
 
-The ``local`` tier keeps each whole-tile factor on the rank that owns its q
+The back-solve keeps each whole-tile factor on the rank that owns its q
 (``distrib_la.batch_layout``, once per channel, through
 ``isdf.core.zeta_factor_resident``) and moves only the right-hand side.
 Route G applies the factor that way on its ``q`` layout
-(``isdf.zeta_mubatch.ZetaG``); the value parity of its two layouts against
-a dense solve is the route-G P4 gate (tests/multi_device/zeta_mubatch_p4.py).
+(``isdf.zeta_mubatch.ZetaG``); its value parity against a dense solve is
+the route-G P4 gate (tests/multi_device/zeta_mubatch_p4.py).
 The r-tile ``solve_zeta`` tiers this file used to compare are retired.
 
 These cells pin the layout contract on a CPU 2x2 mesh.  Geometry is hostile
@@ -68,7 +68,7 @@ def test_factor_residency_puts_whole_q_tiles_on_their_owners(kind, vertex):
     F, piv = F if vertex else (F, None)
     assert (piv is None) == (kind != "lu")
     L_res, piv_res = core.zeta_factor_resident(
-        F, piv, mesh, zeta_gather="local", solver_kind=kind)
+        F, piv, mesh, solver_kind=kind)
     assert is_batch_layout(L_res, mesh), "route receipt: factor not q-local"
     assert L_res.shape[0] == -(-_NQ // 4) * 4, L_res.shape
     if piv is not None:

@@ -30,7 +30,6 @@ from isdf.core import (
     complete_ordered_pair_normal_equations,
     factor_c_q,
     _resolve_solver_kind,
-    _resolve_zeta_gather,
     zeta_factor_resident,
 )
 # The opaque distributed factor.  Re-exported through isdf.core rather than
@@ -215,7 +214,7 @@ def _fit_mubatch(
     *, wfn, meta, centroid_indices, mesh_xy, plan, parent_psi,
     band_range_full, bispinor, bispinor_lift, k_unfold_plan,
     weight_l_face, weight_r_face, channels,
-    zeta_gather, distrib_la_batched_route, n_rmu_solve,
+    distrib_la_batched_route, n_rmu_solve,
     q_irr_full_idx, q_neg_idx, q_frac, sphere_idx, ngk_per_q,
     mu_basis, gvec_components, scratch_dir, print_fn,
 ):
@@ -448,7 +447,7 @@ def _fit_mubatch(
         zeta_g = zmb.ZetaG(
             store, mesh=mesh_xy, L_q=ch.L_q, lu_piv=ch.lu_piv,
             solver_kind=ch.solver_kind,
-            zeta_gather=zeta_gather, batched_route=distrib_la_batched_route,
+            batched_route=distrib_la_batched_route,
             n_rmu_solve=n_rmu_solve, n_rmu=int(meta.n_rmu), mu_basis=mu_basis,
             ngk_per_q=ngk_per_q, gvec_components=gvec_components,
             path=ch.output_file, print_fn=print_fn)
@@ -493,7 +492,6 @@ def fit_zeta_to_h5(
     distributed_lu: str = "auto",
     zeta_ridge: float = 0.0,
     charge_zeta_solve: str = "cholesky",
-    distributed_zeta_solve: str = "auto",
     zeta_rcond: float = ZETA_RCOND_DEFAULT,
     distrib_la_batched_route: str = "batch_reshard",
     write_ibz_only: bool = True,
@@ -696,7 +694,6 @@ def fit_zeta_to_h5(
         warmup=False)
     print_fn(f"  {_face_gemm.describe()}")
     channels = []
-    _resolved_zeta_gather = None
     for v in vertices:
         with timing.section("zeta_fit.CCT"):
             # γ̃^{μ_L} on both endpoints after the typed unfold: C_q is the
@@ -733,10 +730,6 @@ def fit_zeta_to_h5(
             C_q_flat.block_until_ready()
 
         with timing.section("zeta_fit.cholesky"):
-            _resolved_zeta_gather = _resolve_zeta_gather(
-                distributed_zeta_solve,
-                n_rmu=int(n_rmu_padded), nq=int(C_q_flat.shape[0]),
-                mesh_xy=mesh_xy)
             # Route G applies a WHOLE-TILE factor on each G tile, so a current
             # channel always takes the local pivoted LU (a block-cyclic provider
             # token cannot be applied per tile).
@@ -761,11 +754,10 @@ def fit_zeta_to_h5(
             jax.block_until_ready(L_q)
             print_fn(f"  μ_L={v} factor: {_kind} -> "
                      f"{'hoisted pivoted LU' if lu_piv is not None else 'whole-tile'} "
-                     f"{tuple(L_q.shape)}, back-solve tier {_resolved_zeta_gather}")
+                     f"{tuple(L_q.shape)}, back-solve on the q owners")
         with timing.section("zeta_fit.factor_residency"):
             L_q, lu_piv = zeta_factor_resident(
-                L_q, lu_piv, mesh_xy, zeta_gather=_resolved_zeta_gather,
-                solver_kind=_kind, distrib_la_batched_route=_route)
+                L_q, lu_piv, mesh_xy, solver_kind=_kind, distrib_la_batched_route=_route)
         del C_q_flat
         gc.collect()
 
@@ -804,7 +796,6 @@ def fit_zeta_to_h5(
         bispinor_lift=bispinor_lift, k_unfold_plan=k_unfold_plan,
         weight_l_face=weight_l_face, weight_r_face=weight_r_face,
         channels=channels,
-        zeta_gather=_resolved_zeta_gather,
         distrib_la_batched_route=distrib_la_batched_route,
         n_rmu_solve=n_rmu_solve, q_irr_full_idx=q_irr_full_idx,
         q_neg_idx=_q_neg_idx, q_frac=q_irr_frac,

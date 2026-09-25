@@ -18,22 +18,20 @@ def _deck(tmp_path, body: str):
 
 
 @pytest.mark.parametrize(
-    "layout,w_solver,zeta,lu,eigh,sc_eigh",
+    "layout,w_solver,lu,eigh,sc_eigh",
     [
-        ("local", "local", "auto", "auto", "auto", "auto"),
-        # ζ stays whole-tile under both layouts: route G owns its tier.
-        ("distributed", "distributed", "auto", "distributed",
+        ("local", "local", "auto", "auto", "auto"),
+        ("distributed", "distributed", "distributed",
          "distributed", "distributed"),
     ],
 )
 def test_linalg_dial_resolves_one_complete_profile(
-        tmp_path, layout, w_solver, zeta, lu, eigh, sc_eigh):
+        tmp_path, layout, w_solver, lu, eigh, sc_eigh):
     params = read_lorrax_input(_deck(tmp_path, f"linalg = {layout}\n"))
     resolved = linalg_resolution(params)
     assert resolved.layout == layout
     assert resolved.provenance == "deck"
     assert resolved.w_dyson_solver == w_solver
-    assert resolved.distributed_zeta_solve == zeta
     assert resolved.distributed_cholesky == "auto"
     assert resolved.distributed_lu == lu
     assert resolved.batched_route == (

@@ -1476,22 +1476,6 @@ def _resolve_solver_kind(
         charge_zeta_solve=charge_zeta_solve)
 
 
-# Budget for the ζ back-solve's replicated-factor ALL-GATHER, i.e. the
-# transient route G's ``g`` layout puts on every rank when its G-tile kernel
-# takes the (q, μ, μ) factor replicated (``isdf.zeta_mubatch._factor_specs``).
-# It is THE auto boundary between the two whole-tile tiers:
-# at or below it the small stack is gathered (compute balanced over all P,
-# the gather bounded by this cap); above it the ``local`` tier keeps each
-# factor on its q owner and moves only the RHS (R4, 2026-09-23).
-# Deliberately SEPARATE from ``_REPLICATED_CHOL_MAX_STACK_BYTES``: that one
-# gates whether the FACTORIZATION may be replicated (a physics-route
-# decision, and production raises it to 16 GiB to keep rank_truncate
-# reachable), this one gates only the back-solve's data movement, which is
-# numerically free either way.
-_ZETA_GATHER_MAX_BYTES = int(
-    float(os.environ.get("LORRAX_ZETA_GATHER_CAP_GIB", "4")) * 1024 ** 3)
-
-
 # ---------------------------------------------------------------------------
 # DEPRECATED env overrides of input-file keys (scorecard AV; pattern #8).
 #
@@ -1552,53 +1536,6 @@ def _deprecated_env_float(env_name: str, key_name: str, key_value) -> float:
                   f"is loud on purpose (env grants capability; it must not "
                   f"silently select policy).", flush=True)
     return val
-
-
-def _resolve_zeta_gather(
-    override: str = "auto",
-    n_rmu: int | None = None,
-    nq: int | None = None,
-    *,
-    mesh_xy: Mesh | None = None,
-) -> str:
-    """Resolve the whole-tile ζ back-solve tier: ``local`` or ``replicated``.
-
-    ``auto`` is :func:`zeta_auto_tier`.  Both tiers apply the same
-    whole-tile factor (bit-identical); the charge channel's route G reads
-    it on each G tile (docs/architecture/zeta_fit_mubatch.md).
-    """
-    tier = str(override or "auto").strip().lower()
-    if tier in ("replicated", "local"):
-        return tier
-    if tier != "auto":
-        raise ValueError(
-            f"distributed_zeta_solve={override!r} invalid; expected "
-            f"auto / replicated / local.")
-    if nq is None or n_rmu is None:
-        return "replicated"
-    return zeta_auto_tier(
-        int(nq), int(n_rmu),
-        1 if mesh_xy is None else int(mesh_xy.devices.size))
-
-
-def zeta_auto_tier(nq: int, n_rmu: int, ndev: int) -> str:
-    """THE ``auto`` choice between the two whole-tile back-solve tiers — read by the resolver and the memory planner alike.
-
-    ``local`` puts ``ceil(nq/P)`` whole q's (factor AND each chunk's RHS
-    columns) on each rank; the even share is ``nq/P``.  Within a factor of
-    two (``ceil(nq/P)·P <= 2·nq``, i.e. every ``nq >= P/2``) that keeps
-    memory O(total/P) with at most half the ranks idle in the solve, and it
-    moves no factor: ``local``.  Below that (a few q on many ranks, e.g. a
-    Γ-only deck) a small stack is gathered instead (``replicated``: compute
-    and RHS stay balanced over all P), while a stack above the gather cap
-    still takes ``local``, its only whole-tile route, with its RHS residency
-    priced by the memory planner.
-    """
-    nq, ndev = int(nq), max(1, int(ndev))
-    within_even_share = -(-nq // ndev) * ndev <= 2 * nq
-    if within_even_share or nq * int(n_rmu) ** 2 * 16 > _ZETA_GATHER_MAX_BYTES:
-        return "local"
-    return "replicated"
 
 
 _replicated_chol_cache = {}  # replicated dense Cholesky kernel (keyed by shape)
@@ -2238,10 +2175,10 @@ def _qparallel_announce_transverse(nq: int, n_rmu: int, n_log: int,
 # --------------------------------------------------------------------------
 # COLLECTIVE PAYLOAD CHUNKING  (scorecard AF)
 #
-# A memory budget is NOT a transport budget.  ``_ZETA_GATHER_MAX_BYTES``
-# (4 GiB) bounds how much gathered data may be LIVE; it says nothing about
-# how many bytes ONE `all_gather` / `psum_scatter` instruction hands to the
-# interconnect in a single shot.  Those are different quantities, and only
+# A memory budget is NOT a transport budget.  A memory cap bounds how much
+# gathered data may be LIVE; it says nothing about how many bytes ONE
+# `all_gather` / `psum_scatter` instruction hands to the interconnect in a
+# single shot.  Those are different quantities, and only
 # the second one is what a fabric actually has to survive.
 #
 # THIS IS TRANSPORT-AGNOSTIC, AND DELIBERATELY SO.  Nothing below is
@@ -2564,20 +2501,19 @@ def _whole_tile_solve_kind(solver_kind, lu_piv, distrib_la_batched_route):
     return kind if kind in _WHOLE_TILE_KINDS else None
 
 
-def zeta_factor_resident(L_q, lu_piv, mesh_xy, *, zeta_gather, solver_kind,
+def zeta_factor_resident(L_q, lu_piv, mesh_xy, *, solver_kind,
                          distrib_la_batched_route="batch_reshard"):
-    """Lay a whole-tile ζ factor out ONCE where the ``local`` tier reads it (R4); see docs/architecture/zeta_fit_face_psi_cct.md.
+    """Lay a whole-tile ζ factor out ONCE on its q owners, where the back-solve reads it (R4); see docs/architecture/zeta_fit_face_psi_cct.md.
 
-    Returns ``(L_q, lu_piv)``.  Under ``zeta_gather == 'local'`` a whole-tile
-    array factor ``(nq, μ, μ)`` at ``P(None,'x','y')`` moves to the batch
-    layout ``(ceil(nq/P)·P, μ, μ)`` at ``P(('x','y'), None, None)`` — rank
-    ``x·Py + y`` then holds its ``ceil(nq/P)`` q's as whole tiles for the
-    whole G-tile loop — and a replicated pivot table ``(nq, μ_log)`` is
-    sliced to the same rows.  Every other tier, a :class:`FactorToken` and a
-    distributed or fused-provider factor are returned untouched.
+    Returns ``(L_q, lu_piv)``.  A whole-tile array factor ``(nq, μ, μ)`` at
+    ``P(None,'x','y')`` moves to the batch layout ``(ceil(nq/P)·P, μ, μ)`` at
+    ``P(('x','y'), None, None)`` — rank ``x·Py + y`` then holds its
+    ``ceil(nq/P)`` q's as whole tiles for the whole G-tile loop — and a
+    replicated pivot table ``(nq, μ_log)`` is sliced to the same rows.  A
+    :class:`FactorToken` and a distributed or fused-provider factor are
+    returned untouched.
     """
-    if (str(zeta_gather).strip().lower() != 'local'
-            or isinstance(L_q, FactorToken)
+    if (isinstance(L_q, FactorToken)
             or _whole_tile_solve_kind(
                 solver_kind, lu_piv, distrib_la_batched_route) is None):
         return L_q, lu_piv
