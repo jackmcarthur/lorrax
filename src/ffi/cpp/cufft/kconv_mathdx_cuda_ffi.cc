@@ -228,6 +228,7 @@ struct RowGeo {
 // ---------------------------------------------------------------------------
 static const char* kSrc = R"__lrx__(
 #include <cufftdx.hpp>
+#include "lrx_async_gather.cuh"
 
 // LRX_F32: modes 2-5 also serve complex64 tiles (the fp32-GMRES BSE arm).
 #if LRX_F32
@@ -578,10 +579,25 @@ constexpr bool GROUPED = (RB % SSO) == 0;
 // conj_trs selects the rule: 0 reads the partner tile; 1 conjugates the phased
 // product (a Hermitian interaction); 2 reads conj(G) from G itself (a Green of
 // real weights, whose partner IS conj(G): no partner tile exists).
-__device__ __forceinline__ void lrx_unfold_pair(
+// The raw source of element (c, d) of pair (xx, yy) at full k: its address in the parent (or
+// partner) tile, and whether it exists (a -1 source is an exact zero).
+__device__ __forceinline__ const lrx_c2* lrx_unfold_src(
     const lrx_c2* __restrict__ gp, const lrx_c2* __restrict__ gt, const UnfoldTab& t,
-    int k, long long xx, long long yy, lrx_c2 (&g)[NS][NR], lrx_c2 (&u)[NS][NS],
-    lrx_c2 (&ur)[NR][NR]) {
+    int k, long long xx, long long yy, int c, int d, bool* valid) {
+    const int ls = t.lsrc[(long long)k * t.ml + xx * NS + c];
+    const int rs = t.rsrc[(long long)k * t.nl + yy * NR + d];
+    *valid = ls >= 0 && rs >= 0;
+    const bool anti = t.trs[k] != 0;
+    const lrx_c2* src = ((anti && t.conj_trs == 0) ? gt : gp) + (long long)t.row[k] * t.ml * t.nl;
+    return src + (*valid ? (long long)ls * t.nl + rs : 0);
+}
+
+// The typed unfold of one (k, x, y) pair from its raw sources raw[c][d] (read by the caller,
+// from the tile or from shared memory): (mph * G) * nph, a -1 source being an exact zero, and
+// U_k, Ur_k.  Both loads (direct and staged) finish here, so they round alike.
+__device__ __forceinline__ void lrx_unfold_finish(
+    const UnfoldTab& t, int k, long long xx, long long yy, const lrx_c2 (&raw)[NS][NR],
+    lrx_c2 (&g)[NS][NR], lrx_c2 (&u)[NS][NS], lrx_c2 (&ur)[NR][NR]) {
     const lrx_c2* __restrict__ mph = reinterpret_cast<const lrx_c2*>(t.mph);
     const lrx_c2* __restrict__ nph = reinterpret_cast<const lrx_c2*>(t.nph);
     const lrx_c2* __restrict__ spin = reinterpret_cast<const lrx_c2*>(t.spin);
@@ -589,7 +605,6 @@ __device__ __forceinline__ void lrx_unfold_pair(
         reinterpret_cast<const lrx_c2*>(t.spin_r ? t.spin_r : t.spin);
     const bool anti = t.trs[k] != 0, conj_row = anti && t.conj_trs == 1;
     const bool conj_src = anti && t.conj_trs == 2;
-    const lrx_c2* src = ((anti && t.conj_trs == 0) ? gt : gp) + (long long)t.row[k] * t.ml * t.nl;
 #pragma unroll
     for (int c = 0; c < NS; ++c) {
         const long long li = (long long)k * t.ml + xx * NS + c;
@@ -601,7 +616,7 @@ __device__ __forceinline__ void lrx_unfold_pair(
             const int rs = t.rsrc[rj];
             lrx_c2 v = {0.0, 0.0};
             if (ls >= 0 && rs >= 0) {
-                lrx_c2 sv = src[(long long)ls * t.nl + rs];
+                lrx_c2 sv = raw[c][d];
                 if (conj_src) sv.y = -sv.y;
                 v = lrx_mul_xla(lrx_mul_xla(mp, sv), nph[rj]);
                 if (conj_row) v.y = -v.y;
@@ -617,6 +632,26 @@ __device__ __forceinline__ void lrx_unfold_pair(
     for (int a = 0; a < NR; ++a)
 #pragma unroll
         for (int b = 0; b < NR; ++b) ur[a][b] = spin_r[((long long)k * NR + a) * NR + b];
+}
+
+// The typed unfold of one (k, x, y) pair read straight from the tile (symmetry_maps
+// unfold_isdf_operator, axis-local arms).  On an antiunitary row conj_trs selects the rule:
+// 0 reads the partner tile; 1 conjugates the phased product (a Hermitian interaction); 2
+// reads conj(G) from G itself (a Green of real weights, whose partner IS conj(G)).
+__device__ __forceinline__ void lrx_unfold_pair(
+    const lrx_c2* __restrict__ gp, const lrx_c2* __restrict__ gt, const UnfoldTab& t,
+    int k, long long xx, long long yy, lrx_c2 (&g)[NS][NR], lrx_c2 (&u)[NS][NS],
+    lrx_c2 (&ur)[NR][NR]) {
+    lrx_c2 raw[NS][NR];
+#pragma unroll
+    for (int c = 0; c < NS; ++c)
+#pragma unroll
+        for (int d = 0; d < NR; ++d) {
+            bool valid;
+            const lrx_c2* p = lrx_unfold_src(gp, gt, t, k, xx, yy, c, d, &valid);
+            raw[c][d] = valid ? *p : lrx_c2{0.0, 0.0};
+        }
+    lrx_unfold_finish(t, k, xx, yy, raw, g, u, ur);
 }
 
 // Row a of U G Ur^dagger, accumulated exactly as the spin-rotate FFI does
@@ -653,31 +688,67 @@ template <int PB>
 __device__ __forceinline__ void lrx_group_load(
     const lrx_c2* __restrict__ gp, const lrx_c2* __restrict__ gt, const UnfoldTab& t,
     long long p0, long long pairs, long long my, lrx_c2* sm) {
-    for (int i = threadIdx.x; i < PB * NK; i += blockDim.x) {
-        const int k = i / PB, jp = i % PB;
-        const long long pr = p0 + jp;
-        if (pr < pairs) {
+    if constexpr (NA == NS) {
+        // Stage: every raw source (k, pair, c, d) by cp.async into bank cell (jp, c, d) at k,
+        // consecutive threads on consecutive (c, d) (contiguous right sources), a -1 source
+        // zero-filled; no register holds a load in flight.  Then each (k, pair) finishes in
+        // place: its NS*NR raw values, the same arithmetic as the direct load.
+        for (int i = threadIdx.x; i < PB * NK * SS; i += blockDim.x) {
+            const int e = i % SS, rest = i / SS, jp = rest % PB, k = rest / PB;
+            const long long pr = p0 + jp;
+            bool valid = false;
+            const lrx_c2* src = gp;
+            if (pr < pairs) {
+                const long long xx = pr / my, yy = pr - xx * my;
+                src = lrx_unfold_src(gp, gt, t, k, xx, yy, e / NR, e % NR, &valid);
+            }
+            lrx_async::cell16(sm + (jp * SS + e) * SP + k, src, valid);
+        }
+        lrx_async::commit();
+        lrx_async::wait_all();
+        __syncthreads();
+        for (int i = threadIdx.x; i < PB * NK; i += blockDim.x) {
+            const int k = i / PB, jp = i % PB;
+            const long long pr = p0 + jp;
+            if (pr >= pairs) continue;                        // staged as zeros
             const long long xx = pr / my, yy = pr - xx * my;
-            lrx_c2 g[NS][NR], u[NS][NS], ur[NR][NR];
-            lrx_unfold_pair(gp, gt, t, k, xx, yy, g, u, ur);
+            lrx_c2 raw[NS][NR], g[NS][NR], u[NS][NS], ur[NR][NR];
+#pragma unroll
+            for (int c = 0; c < NS; ++c)
+#pragma unroll
+                for (int d = 0; d < NR; ++d) raw[c][d] = sm[(jp * SS + c * NR + d) * SP + k];
+            lrx_unfold_finish(t, k, xx, yy, raw, g, u, ur);
 #pragma unroll
             for (int a = 0; a < NS; ++a) {
-                if constexpr (NA != NS) { if (a < t.a0 || a >= t.a0 + NA) continue; }
                 lrx_c2 out[NR];
                 lrx_spin_row(u, ur, g, a, out);
 #pragma unroll
-                for (int b = 0; b < NR; ++b) {
-                    if constexpr (NA != NS) {
+                for (int b = 0; b < NR; ++b) sm[(jp * SS + a * NR + b) * SP + k] = out[b];
+            }
+        }
+    } else {
+        for (int i = threadIdx.x; i < PB * NK; i += blockDim.x) {
+            const int k = i / PB, jp = i % PB;
+            const long long pr = p0 + jp;
+            if (pr < pairs) {
+                const long long xx = pr / my, yy = pr - xx * my;
+                lrx_c2 g[NS][NR], u[NS][NS], ur[NR][NR];
+                lrx_unfold_pair(gp, gt, t, k, xx, yy, g, u, ur);
+#pragma unroll
+                for (int a = 0; a < NS; ++a) {
+                    if (a < t.a0 || a >= t.a0 + NA) continue;
+                    lrx_c2 out[NR];
+                    lrx_spin_row(u, ur, g, a, out);
+#pragma unroll
+                    for (int b = 0; b < NR; ++b) {
                         if (b < t.b0 || b >= t.b0 + NA) continue;
                         sm[(jp * SSO + (a - t.a0) * NA + (b - t.b0)) * SP + k] = out[b];
-                    } else {
-                        sm[(jp * SS + a * NR + b) * SP + k] = out[b];
                     }
                 }
-            }
-        } else {
+            } else {
 #pragma unroll
-            for (int ab = 0; ab < SSO; ++ab) sm[(jp * SSO + ab) * SP + k] = {0.0, 0.0};
+                for (int ab = 0; ab < SSO; ++ab) sm[(jp * SSO + ab) * SP + k] = {0.0, 0.0};
+            }
         }
     }
 }
