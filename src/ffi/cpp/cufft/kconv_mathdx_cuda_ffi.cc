@@ -1726,6 +1726,14 @@ using nvrtc::toolkit_include;
 // tile, whose axis passes idle a block below ~256 lines); tp = 0: none fits.  Measured on the
 // 6x6 bispinor harnesses (A100, U2c): mode 11 96.6 ms at 1 pair x 4 blocks vs 100.7 at 2 x 2;
 // mode 7 65.6 ms at 2 pairs x 3 blocks vs 80.5 at 1 x 4.
+//
+// The tables pay only where the register load cannot keep two blocks resident: it holds a
+// pair's g, U and Ur live per thread, 3 ns^2 complex values = 12 ns^2 registers, against 128 per
+// thread at two blocks of 256.  At ns = 4 that is 192 (172-254 measured, one block per SM; the
+// tables won 1.7-1.9x); at ns = 2 it is 48 and the register load already runs three blocks per
+// SM, while the tables, O(ns) per pair against an O(ns^2) bank, shrink the tile to two pairs (CrI3
+// 8x8 ns 2: Sigma tau 5.58 -> 6.24 s on the tables).  So: the tables when 12 ns^2 > 64.
+static bool tile_tables_pay(int ns) { return 12 * ns * ns > 64; }
 struct TilePlan { int tp = 0, blocks = 0; long long smem = 0; std::string err; };
 static TilePlan tile_table_plan(int dev, int tp_max, long long bank_pair, int nk, int ns, int nw,
                                 bool most_blocks) {
@@ -1806,7 +1814,7 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
             chi_smem = kplan.smem;
             // The tile tables (sm_80+ cp.async; tile_table_plan): bank + UnfoldTiles per block at
             // two or more blocks per SM; none fits: the register load at the plan's tile.
-            if (cc_major >= 8 && kplan.threads == kThreads) {
+            if (cc_major >= 8 && kplan.threads == kThreads && tile_tables_pay(ns)) {
                 const TilePlan tt = tile_table_plan(dev, kplan.tr, static_cast<long long>(chi_grp) * g.rs() * 16,
                                                     nk, ns, 0, true);
                 if (!tt.err.empty()) return fail("device attributes", tt.err);
@@ -1877,7 +1885,7 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
     // blocks on an SM with the device's per-block reservation; none fits: the register load.
     int m7_tp = 0, m7_blocks = 0;
     long long m7_smem = 0;
-    if (mode == 7 && blk == ns && nsr == ns && cc_major >= 8 && rb >= grp_rows) {
+    if (mode == 7 && blk == ns && nsr == ns && cc_major >= 8 && rb >= grp_rows && tile_tables_pay(ns)) {
         const TilePlan tt = tile_table_plan(dev, static_cast<int>(rb / grp_rows), grp_rows * row_bytes, nk, ns, 1,
                                             false);
         if (!tt.err.empty()) return fail("device attributes", tt.err);
