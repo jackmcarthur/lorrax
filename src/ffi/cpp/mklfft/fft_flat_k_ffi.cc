@@ -5,8 +5,7 @@
 //
 // WHAT THIS IS: MKL's FFT engine driven through the DFTI descriptor API —
 // an O(N log N) fast Fourier transform at ANY k-count (mixed radix,
-// arbitrary lengths).  It is NOT a DFT-as-matmul (that formulation is
-// owner-vetoed); "DFTI" is Intel's descriptor-API name for its FFT, and
+// arbitrary lengths); "DFTI" is Intel's descriptor-API name for its FFT, and
 // every transform below is a genuine FFT.
 //
 // WHY IT EXISTS: XLA:CPU's fft custom-call (DUCC) requires the transformed

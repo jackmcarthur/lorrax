@@ -1201,7 +1201,7 @@ endif()
 # ----------------------------------------------------------------------------
 #  RESOLVE 3/4 — MKL FFT (DFTI API) flat-k batched-FFT host handlers
 #  (cpp/mklfft/fft_flat_k_ffi.cc; FFT-FFI prototype 2026-07-28).  O(N log N)
-#  FFT at any k-count via MKL's DFTI descriptor API — NOT a DFT-as-matmul.
+#  FFT at any k-count via MKL's DFTI descriptor API.
 #  Rides the ScaLAPACK link line already resolved above (DFTI lives inside
 #  libmkl_intel_lp64 / libmkl_core / the threading layer — zero new link
 #  deps); needs only mkl_dfti.h.  The one TU is compiled -fopenmp for its

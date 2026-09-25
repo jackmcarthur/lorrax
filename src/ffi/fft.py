@@ -6,9 +6,8 @@ The Python half of the flat-k FFT handlers:
     cpu   liblorrax_ffi_host.so   the FFTW3 ABI (``fftw_plan_many_dft``, the
                                   advanced-layout planner) in
                                   (``src/ffi/cpp/mklfft/fft_flat_k_ffi.cc``) —
-                                  a genuine O(N log N) FFT at any k-count;
-                                  NOT a DFT-as-matmul (owner-vetoed).  The
-                                  directory is still named ``mklfft`` for the
+                                  a genuine O(N log N) FFT at any k-count.
+                                  The directory is still named ``mklfft`` for the
                                   DFTI implementation it USED to hold; the
                                   DFTI calls were deleted 2026-08-05 and the
                                   library is now bound by ``dlsym`` over a
