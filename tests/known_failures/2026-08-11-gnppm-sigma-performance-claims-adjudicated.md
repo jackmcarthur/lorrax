@@ -160,7 +160,7 @@ preference for deletion over patched half-truths).
 | 4 | "Deleting the FFT outright would return seven parts in ten thousand" | same file | **STALE-BUT-CORRECTABLE.** Deck-conditional. At rung C it would return ~28 % of the driver wall. |
 | 5 | "65 % of the staged tau dispatch (191.9 s of 295.0 s) at nb=128/P=64" + the MIND THE DENOMINATOR note | `src/ffi/fft.py:30-48`, `src/common/fft_helpers.py:363-372`, `docs/dev/flat_k_fft_service.md:87-106` | **TRUE-AS-MEASURED.** The denominator correction those three sites received this morning is right and stays. What they need is the second half: the *post*-FFI numbers they quote (7.6-16.5 %) are themselves deck-conditional, and on a 216-k deck the post-FFI share is 85 %. Corrected in place. |
 | 6 | "the service inside the production Σ driver on GPU — measured 2026-08-11: `GW_conv_ffi` 0.032 s over 155 τ dispatches (16.5 % of `sigma.tau.dispatch`, 0.07 % of the driver wall)" | `docs/dev/flat_k_fft_service.md:279` | **STALE-BUT-CORRECTABLE.** Row now carries all three rungs. |
-| 7 | "#1: replace the 16-pt flat-k FFT round-trip in `ppm_tau_kernel` with a DFT-matrix GEMM, est. 25-45 % of `sigma.exec` at μ=4962/P=64" | `wk_REL/ARTIFACT_MAP.md:93`, `SIGMA_PPM_CAMPAIGN.md:102-105` | **TRUE-AS-MEASURED as an estimate, and better than the record credits.** Both sites label it "estimated / untested on GPU", which is honest. This lane measures the object it was estimating at **83 % of `sigma.exec`** at rung C — the estimate was low, not high. The *proposed remedy* (DFT-as-matmul) remains owner-vetoed and this lane does not reopen it. |
+| 7 | "#1: replace the 16-pt flat-k FFT round-trip in `ppm_tau_kernel` with a DFT-matrix GEMM, est. 25-45 % of `sigma.exec` at μ=4962/P=64" | `wk_REL/ARTIFACT_MAP.md:93`, `SIGMA_PPM_CAMPAIGN.md:102-105` | **TRUE-AS-MEASURED as an estimate, and better than the record credits.** Both sites label it "estimated / untested on GPU", which is honest. This lane measures the object it was estimating at **83 % of `sigma.exec`** at rung C — the estimate was low, not high. |
 
 ### 2.2 The allocator claim — true on one deck, false on another
 
@@ -225,8 +225,7 @@ The owner's real workloads are on the far end of that axis.
 
 What this does **not** say. It does not say the FFI is slow: the FFI is what
 made this affordable at all, and `LORRAX_FFT_FFI_FUSED=0` measures the
-decomposed chain against it on the same deck. It does not name a fix — a
-DFT-as-matmul replacement is owner-vetoed and is not being reopened here. And it
+decomposed chain against it on the same deck. It does not name a fix. And it
 does not say the other rows are free: the ISDF stage at 27.7 % and `persist_w0`
 at 8.3 % are both larger than anything the FFT lane was looking at.
 

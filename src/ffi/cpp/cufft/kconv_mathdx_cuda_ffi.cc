@@ -788,7 +788,7 @@ extern "C" __global__ void __launch_bounds__(256) lrx_kconv(
 //  shares the build, the NVRTC options and the cubin cache with the family,
 //  not its kernels.  Compile-time: LRX_NX = n_b, LRX_NY = n_c (the plane),
 //  LRX_NZ = b1, LRX_NS = c1: the Good-Thomas splits n_b = b1*b2 and
-//  n_c = c1*c2 (gcd 1, every factor <= 40, b2 = c2 = 1 for an axis <= 40), so
+//  n_c = c1*c2 (gcd 1, every factor <= 40; b2 = 1 only for a prime power <= 40), so
 //  every line FFT is a cuFFTDx thread FFT and the splits need index maps only,
 //  no twiddle.  A block keeps LRX_PB whole (n_b, n_c|1) planes in shared
 //  memory: row passes on the occupied rows, column passes on all columns, one
