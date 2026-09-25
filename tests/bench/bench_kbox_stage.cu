@@ -136,29 +136,54 @@ __global__ void __launch_bounds__(256) stage_pencil(C* y, long long n, const C* 
 }
 
 // mode 8: G/U columns ((a*m + x)*4 + b)*m + y, V (nk, m, 4, m, 4) in R space
-__constant__ int c_pl[16], c_pr[16];
+__constant__ int c_pl[16], c_pr[16], c_cl[16], c_cr[16];   // perms and quarter-turn codes
 __constant__ C c_hl[16], c_hr[16];
 __device__ __forceinline__ C cconj(C a) { C z = {a.x, -a.y}; return z; }
 struct Cols8 { long long m; __device__ long long col(long long inst, int member) const {
     const long long x = inst / m, y = inst % m; const int a = member / 4, b = member % 4;
     return ((a * m + x) * 4 + b) * m + y; } };
-template <int TY>
-struct Mid8 { const C* V; long long m;
-    __device__ C operator()(int k, long long inst, int member, const C* grp) const {
-        const long long x = inst / m, y = inst % m; const int a = member / 4, b = member % 4;
-        C acc = {0, 0};
-        for (int A = 0; A < 4; ++A)
-            for (int B = 0; B < 4; ++B) {
-                const C g = grp[(c_pl[A * 4 + a] * 4 + c_pr[B * 4 + b]) * TY];
-                const C t = lrx_mul(lrx_mul(lrx_mul(c_hl[A * 4 + a], cconj(c_hr[B * 4 + b])), g),
-                                    V[((((long long)k * m + x) * 4 + A) * m + y) * 4 + B]);
+// The mode-8 Mid on the header's group pencil: V[k, x, A, y, B] staged per block by cp.async
+// (kAux = 16 per instance), each thread's vertex tables in registers (source member and
+// quarter-turn code per (A, B)): out[a,b] = sum_AB i^(cl-cr) G[pl_A(a), pr_B(b)] V[A, B].
+__device__ __forceinline__ C qturn(C g, int code) {       // g * i^code, exact
+    switch (code & 3) { case 0: return g; case 1: return C{-g.y, g.x}; case 2: return C{-g.x, -g.y}; default: return C{g.y, -g.x}; }
+}
+__constant__ int c_src[256], c_code[256];                 // [out member][A*4+B]: source member, quarter code
+template <int NX, int NY, int NZ, int TY>
+struct Mid8 {
+    static constexpr int kAux = 16;
+    const C* V; long long m, n_inst;
+    __device__ void stage_aux(C* saux, long long p, long long inst0, int ld) const {
+        for (int i = threadIdx.x; i < NX * 16 * TY; i += blockDim.x) {
+            const int B = i & 3, t = (i >> 2) % TY, A = (i / (4 * TY)) & 3, kx = i / (16 * TY);
+            long long inst = inst0 + t; if (inst >= n_inst) inst = inst0;
+            const long long x = inst / m, y = inst % m, k = (long long)kx * NY * NZ + p;
+            lrx_kbox::cp_async<16>(saux + (kx * TY + t) * ld + A * 4 + B, V + ((((k * m + x) * 4 + A) * m + y) * 4 + B));
+        }
+    }
+    struct Bound {
+        int src[16], code[16];
+        __device__ C operator()(const C* grp, const C* aux) const {
+            C acc = {0, 0};
+#pragma unroll
+            for (int e = 0; e < 16; ++e) {
+                const C t = lrx_mul(qturn(grp[src[e] * TY], code[e]), aux[e]);
                 acc.x += t.x; acc.y += t.y;
             }
-        return acc; } };
+            return acc;
+        }
+    };
+    __device__ Bound bind(int member) const {
+        Bound b;
+#pragma unroll
+        for (int e = 0; e < 16; ++e) { b.src[e] = c_src[member * 16 + e]; b.code[e] = c_code[member * 16 + e]; }
+        return b;
+    }
+};
 template <int NX, int NY, int NZ, int TY>
 __global__ void __launch_bounds__(16 * TY) stage_pencil8(C* y, long long n, const C* V, long long m) {
-    __shared__ C sg[NX * 16 * TY];
-    lrx_kbox::pencil_group_pass<NX, NY, NZ, ARCH, 16, TY>(y, sg, n, m * m, Cols8{m}, Mid8<TY>{V, m});
+    extern __shared__ C sm8[];
+    lrx_kbox::pencil_group_pass<NX, NY, NZ, ARCH, 16, TY>(y, sm8, n, m * m, Cols8{m}, Mid8<NX, NY, NZ, TY>{V, m, m * m});
 }
 
 // ---------------- reference ----------------
@@ -237,14 +262,23 @@ static void run(long long m) {
         CK(cudaMemcpy(x, h.data(), len * 16, cudaMemcpyHostToDevice));
         std::vector<C> hv(vlen); for (auto& v : hv) v = C{rnd(), rnd()};
         CK(cudaMemcpy(V, hv.data(), vlen * 16, cudaMemcpyHostToDevice));
-        int pl[16], pr[16]; C hl[16], hr[16]; const C q[4] = {{1, 0}, {0, 1}, {-1, 0}, {0, -1}};
+        int pl[16], pr[16], cl[16], cr[16]; C hl[16], hr[16]; const C q[4] = {{1, 0}, {0, 1}, {-1, 0}, {0, -1}};
         for (int A = 0; A < 4; ++A) {
             int p[4] = {0, 1, 2, 3};
             for (int i = 3; i > 0; --i) std::swap(p[i], p[int((rnd() + 0.5) * (i + 1)) % (i + 1)]);
-            for (int a = 0; a < 4; ++a) { pl[A * 4 + a] = p[a]; hl[A * 4 + a] = q[int((rnd() + 0.5) * 4) % 4]; }
+            for (int a = 0; a < 4; ++a) { pl[A * 4 + a] = p[a]; cl[A * 4 + a] = int((rnd() + 0.5) * 4) % 4; hl[A * 4 + a] = q[cl[A * 4 + a]]; }
             for (int i = 3; i > 0; --i) std::swap(p[i], p[int((rnd() + 0.5) * (i + 1)) % (i + 1)]);
-            for (int a = 0; a < 4; ++a) { pr[A * 4 + a] = p[a]; hr[A * 4 + a] = q[int((rnd() + 0.5) * 4) % 4]; }
+            for (int a = 0; a < 4; ++a) { pr[A * 4 + a] = p[a]; cr[A * 4 + a] = int((rnd() + 0.5) * 4) % 4; hr[A * 4 + a] = q[cr[A * 4 + a]]; }
         }
+        CK(cudaMemcpyToSymbol(c_cl, cl, sizeof cl)); CK(cudaMemcpyToSymbol(c_cr, cr, sizeof cr));
+        int src[256], code[256];
+        for (int o = 0; o < 16; ++o)
+            for (int A = 0; A < 4; ++A)
+                for (int B = 0; B < 4; ++B) {
+                    src[o * 16 + A * 4 + B] = pl[A * 4 + o / 4] * 4 + pr[B * 4 + o % 4];
+                    code[o * 16 + A * 4 + B] = cl[A * 4 + o / 4] - cr[B * 4 + o % 4];
+                }
+        CK(cudaMemcpyToSymbol(c_src, src, sizeof src)); CK(cudaMemcpyToSymbol(c_code, code, sizeof code));
         CK(cudaMemcpyToSymbol(c_pl, pl, sizeof pl)); CK(cudaMemcpyToSymbol(c_pr, pr, sizeof pr));
         CK(cudaMemcpyToSymbol(c_hl, hl, sizeof hl)); CK(cudaMemcpyToSymbol(c_hr, hr, sizeof hr));
     }
@@ -312,9 +346,18 @@ static void run(long long m) {
             fh = [=] { pi<<<gp, 256, psm>>>(PlainLoad{x, n}, PL{yh, n}, n); pc<<<g2, 256>>>(yh, n, V, m0, m1, m2);
                        pfs<<<gp, 256, psm>>>(PlainLoad{yh, n}, ScaleStore{yh, n, s}, n); };
         } else {
-            auto p8 = stage_pencil8<NX, NY, NZ, 8>; const int g2 = grid_of(p8, 128, 0);
-            fh = [=] { pi<<<gp, 256, psm>>>(PlainLoad{x, n}, PL{yh, n}, n); p8<<<g2, 128>>>(yh, n, V, m);
+            constexpr int TY8 = 8;
+            auto p8 = stage_pencil8<NX, NY, NZ, TY8>;
+            const size_t s8 = (size_t(NX) * 16 * TY8 + size_t(NX) * TY8 * 17) * 16;
+            const int g2 = grid_of(p8, 16 * TY8, s8);
+            fh = [=] { pi<<<gp, 256, psm>>>(PlainLoad{x, n}, PL{yh, n}, n); p8<<<g2, 16 * TY8, s8>>>(yh, n, V, m);
                        pfs<<<gp, 256, psm>>>(PlainLoad{yh, n}, ScaleStore{yh, n, s}, n); };
+            const float t1 = time_ms([=] { pi<<<gp, 256, psm>>>(PlainLoad{x, n}, PL{yh, n}, n); });
+            const float t2 = time_ms([=] { p8<<<g2, 16 * TY8, s8>>>(yh, n, V, m); });
+            const float t3 = time_ms([=] { pfs<<<gp, 256, psm>>>(PlainLoad{yh, n}, ScaleStore{yh, n, s}, n); });
+            const double gb = len * 16 / 1e9;
+            std::printf("  split passes: plane_inv %.1f us (%.0f GB/s), pencil8 %.1f us (%.0f GB/s), plane_fwd %.1f us; 3-pass floor %.1f us\n",
+                        t1 * 1e3, 2 * gb / (t1 * 1e-3), t2 * 1e3, 3 * gb / (t2 * 1e-3), t3 * 1e3, 7 * gb * 1e9 / 1.555e12 * 1e6);
         }
     }
     const float th = time_ms(fh); fh(); CK(cudaDeviceSynchronize());
