@@ -124,6 +124,7 @@
 #include <random>
 
 #include "../common/mkl_thread_pin.h"
+#include "../common/lrx_async_gather.h"
 
 #include <cuda.h>
 #include <cuda_runtime.h>
@@ -175,6 +176,7 @@ struct DriverApi {
     CUresult (*CtxGetCurrent)(CUcontext*) = nullptr;
     CUresult (*GetErrorString)(CUresult, const char**) = nullptr;
     CUresult (*FuncSetAttribute)(CUfunction, int, int) = nullptr;
+    CUresult (*OccupancyMaxActiveBlocksPerMultiprocessor)(int*, CUfunction, int, size_t) = nullptr;
     bool ok = false;
     std::string err;
 };
@@ -198,8 +200,11 @@ static const DriverApi& driver_api() {
         a.CtxGetCurrent = reinterpret_cast<decltype(a.CtxGetCurrent)>(need("cuCtxGetCurrent"));
         a.GetErrorString = reinterpret_cast<decltype(a.GetErrorString)>(need("cuGetErrorString"));
         a.FuncSetAttribute = reinterpret_cast<decltype(a.FuncSetAttribute)>(need("cuFuncSetAttribute"));
+        a.OccupancyMaxActiveBlocksPerMultiprocessor = reinterpret_cast<decltype(a.OccupancyMaxActiveBlocksPerMultiprocessor)>(
+            need("cuOccupancyMaxActiveBlocksPerMultiprocessor"));
         a.ok = a.ModuleLoadData && a.ModuleGetFunction && a.LaunchKernel &&
-               a.CtxGetCurrent && a.GetErrorString && a.FuncSetAttribute;
+               a.CtxGetCurrent && a.GetErrorString && a.FuncSetAttribute &&
+               a.OccupancyMaxActiveBlocksPerMultiprocessor;
         return a;
     }();
     return api;
@@ -869,6 +874,7 @@ extern "C" __global__ void __launch_bounds__(256) lrx_kconv(
 // ---------------------------------------------------------------------------
 static const char* kPlaneSrc = R"__lrx__(
 #include <cufftdx.hpp>
+#include "lrx_async_gather.cuh"
 
 struct __align__(16) lrx_c2 { double x, y; };
 struct PlaneGather {
@@ -876,6 +882,7 @@ struct PlaneGather {
     const int* row_of;     // (rows,): the plane row b of occupied row r
     const int* start;      // () slab start on F's axis 1
     long long rows, n_col, planes, s_len, n_pg, inner;
+    int pb, stage;         // planes per block (<= LRX_PB) and staging on/off, chosen at launch
 };
 
 constexpr int NB = LRX_NX, NC = LRX_NY;
@@ -897,9 +904,11 @@ __device__ __forceinline__ int slot(int k) { return (N2 * (k % N1) + N1 * (k % N
 // One factor pass on one line: the M elements at positions (step e + off) mod N
 // (element stride es) of `base`.  FIRST: M = N1, step = N2, off = N1 i; else
 // M = N2, step = N1, off = N2 i.  `live` (the first column pass only) reads a
-// dead plane row as zero.
+// dead plane row as zero; `src` (the first row pass with staging) reads the
+// line from the staging block and writes it to `base`.
 template <int N, int N1, int N2, bool FIRST>
-__device__ __forceinline__ void pfa_line(lrx_c2* base, int es, int i, const unsigned char* live) {
+__device__ __forceinline__ void pfa_line(lrx_c2* base, int es, int i, const unsigned char* live,
+                                         const lrx_c2* src = nullptr) {
     constexpr int M = FIRST ? N1 : N2;
     if constexpr (M > 1) {
         using F = TFFT<M>;
@@ -911,7 +920,8 @@ __device__ __forceinline__ void pfa_line(lrx_c2* base, int es, int i, const unsi
         for (int e = 0; e < M; ++e) {
             const int p = (step * e + off) % N;
             lrx_c2 z = {0.0, 0.0};
-            if (live == nullptr || live[p]) z = base[p * es];
+            if (src != nullptr) z = src[p * es];              // the staged row (es = 1)
+            else if (live == nullptr || live[p]) z = base[p * es];
             v[e].x = z.x; v[e].y = z.y;
         }
         F().execute(v);
@@ -923,17 +933,25 @@ __device__ __forceinline__ void pfa_line(lrx_c2* base, int es, int i, const unsi
     }
 }
 
-// LRX_PB planes per block (small planes share a block, so a pass has enough
-// lines); LRX_RB blocks per SM the shared planes allow (capped at 2), so the
-// register cap lets them all in.
+// g.pb (<= LRX_PB) planes per block (small planes share a block, so a pass has
+// enough lines); LRX_RB blocks per SM the shared planes allow (capped at 2), so
+// the register cap lets them all in.  Blocks are persistent (the host caps the
+// grid at the resident count).  With g.stage the next group's occupied cells
+// are gathered asynchronously (lrx_async, cp.async) into a (rows, NC) staging
+// block per plane while this group's passes run; the first row pass reads them
+// from there.  The table, its row count and the staging choice are run-time
+// arguments: one cubin serves every support of a plane shape.
 extern "C" __global__ void __launch_bounds__(LRX_THREADS, LRX_RB) lrx_kconv(
     const lrx_c2* __restrict__ fin, lrx_c2* __restrict__ yout, PlaneGather g) {
-    extern __shared__ lrx_c2 buf[];                  // LRX_PB planes of (NB, LD)
-    constexpr int PB = LRX_PB, PS = NB * LD;
+    extern __shared__ lrx_c2 buf[];                  // pb planes of (NB, LD), then pb staging (rows, NC)
+    constexpr int PS = NB * LD;
+    const int PB = g.pb;                             // <= LRX_PB (the foff capacity)
+    const bool STAGE = g.stage != 0;
     __shared__ unsigned char live[NB];
     __shared__ int rowb[NB];
-    __shared__ long long foff[PB];
-    const int rows = static_cast<int>(g.rows), rn = rows * NC;
+    __shared__ long long foff[2][LRX_PB];
+    const int rows = static_cast<int>(g.rows), rn = rows * NC, SS = rn;
+    lrx_c2* stg = buf + PB * PS;
     for (int b = threadIdx.x; b < NB; b += blockDim.x) live[b] = 0;
     __syncthreads();
     for (int r = threadIdx.x; r < rows; r += blockDim.x) { rowb[r] = g.row_of[r]; live[g.row_of[r]] = 1; }
@@ -941,29 +959,42 @@ extern "C" __global__ void __launch_bounds__(LRX_THREADS, LRX_RB) lrx_kconv(
     // of F (A, s_len, inner): the slab F[:, start:start+n_pg] in place.
     long long st = *g.start;
     st = st < 0 ? 0 : (st > g.s_len - g.n_pg ? g.s_len - g.n_pg : st);
-    for (long long p0 = static_cast<long long>(blockIdx.x) * PB; p0 < g.planes;
-         p0 += static_cast<long long>(gridDim.x) * PB) {
+    const long long groups = (g.planes + PB - 1) / PB;
+    // The cylinder offsets of group gi's planes into foff[fs], then one async
+    // gather of their occupied cells (zeros implicit) into staging or the planes.
+    auto issue = [&](long long gi, int fs) {
+        const long long p0 = gi * PB;
         const int np = g.planes - p0 < PB ? static_cast<int>(g.planes - p0) : PB;
         if (threadIdx.x < np) {
             const long long plane = p0 + threadIdx.x;
             const long long a = plane / (g.n_pg * g.inner), rem = plane - a * g.n_pg * g.inner;
-            foff[threadIdx.x] = ((a * g.s_len + st) * g.inner + rem) * g.n_col;
+            foff[fs][threadIdx.x] = ((a * g.s_len + st) * g.inner + rem) * g.n_col;
         }
         __syncthreads();
-        // The occupied rows' cells, gathered from the cylinder (zeros implicit).
         for (int t = threadIdx.x; t < np * rn; t += blockDim.x) {
-            const int q = t / rn, u = t - q * rn, r = u / NC, c = u - r * NC, col = g.gidx[u];
-            lrx_c2 z = {0.0, 0.0};
-            if (col >= 0) z = fin[foff[q] + col];
-            buf[q * PS + rowb[r] * LD + c] = z;
+            const int q = t / rn, u = t - q * rn, col = g.gidx[u];
+            lrx_c2* dst = STAGE ? stg + q * SS + u : buf + q * PS + rowb[u / NC] * LD + (u - (u / NC) * NC);
+            lrx_async::cell16(dst, fin + foff[fs][q] + (col >= 0 ? col : 0), col >= 0);
         }
+        lrx_async::commit();
+    };
+    int fs = 0;
+    if (static_cast<long long>(blockIdx.x) < groups) issue(blockIdx.x, fs);
+    for (long long gi = blockIdx.x; gi < groups; gi += gridDim.x) {
+        const long long p0 = gi * PB;
+        const int np = g.planes - p0 < PB ? static_cast<int>(g.planes - p0) : PB;
+        lrx_async::wait_all();
         __syncthreads();
-        // Row FFTs (along c) on the occupied rows only.
+        // Row FFTs (along c) on the occupied rows only; with STAGE the first
+        // factor pass reads the staged rows and writes the planes.
         for (int l = threadIdx.x; l < np * rows * C2; l += blockDim.x) {
-            const int q = l / (rows * C2), u = l - q * rows * C2;
-            pfa_line<NC, C1, C2, true>(buf + q * PS + rowb[u / C2] * LD, 1, u % C2, nullptr);
+            const int q = l / (rows * C2), u = l - q * rows * C2, r = u / C2;
+            pfa_line<NC, C1, C2, true>(buf + q * PS + rowb[r] * LD, 1, u % C2, nullptr,
+                                       STAGE ? stg + q * SS + r * NC : nullptr);
         }
         __syncthreads();
+        const long long gn = gi + gridDim.x;
+        if (STAGE && gn < groups) { fs ^= 1; issue(gn, fs); }   // staging is free: prefetch
         if constexpr (C2 > 1) {
             for (int l = threadIdx.x; l < np * rows * C1; l += blockDim.x) {
                 const int q = l / (rows * C1), u = l - q * rows * C1;
@@ -991,6 +1022,7 @@ extern "C" __global__ void __launch_bounds__(LRX_THREADS, LRX_RB) lrx_kconv(
             y[t] = buf[q * PS + slot<NB, B1, B2>(kb) * LD + slot<NC, C1, C2>(kc)];
         }
         __syncthreads();
+        if (!STAGE && gn < groups) { fs ^= 1; issue(gn, fs); }  // the planes are free
     }
 }
 )__lrx__";
@@ -998,7 +1030,8 @@ extern "C" __global__ void __launch_bounds__(LRX_THREADS, LRX_RB) lrx_kconv(
 // ---------------------------------------------------------------------------
 //  Build and cache
 // ---------------------------------------------------------------------------
-struct Built { CUfunction fn = nullptr; int rb = 1; int smem = 0; double compile_ms = 0.0; int threads = kThreads; };
+struct Built { CUfunction fn = nullptr; int rb = 1; int smem = 0; double compile_ms = 0.0; int threads = kThreads;
+               int sms = 0; long long plane_bytes = 0, smem_cap = 0; };   // mode 10: launch-time sizing
 using Key = std::tuple<CUcontext, int, int, int, int, int, int, int>;  // ctx, mode, nkx, nky, nkz, ns, nsr, f32
 static std::mutex g_mu;
 static std::map<Key, Built> g_cache;
@@ -1164,15 +1197,17 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
     // (fewer rows than one spin group: mode 7 loads per bank, as mode 2 would fit)
     long long plane_minb = 1;                          // mode 10: blocks per SM (LRX_RB)
     long long plane_static = 0;                        // mode 10: its static tables, bytes
-    if (mode == 10) {                                  // one whole (n_b, n_c|1) plane per block
+    if (mode == 10) {                                  // whole (n_b, n_c|1) planes per block
         row_bytes = 16LL * nkx * (nky | 1);
-        // The kernel's static tables live[n_b] + rowb[n_b] (int) + foff[PB] (long long)
+        // The kernel's static tables live[n_b] + rowb[n_b] (int) + foff[2][PB] (long long)
         // share the block's opt-in budget with the dynamic planes; +16 B alignment
-        // slack.  ffi.fft.plane_resident_bytes is the same bound (PB = 1).
-        plane_static = 5LL * nkx + 8 + 16;
-        rb = row_bytes + plane_static <= smem_optin
+        // slack.  ffi.fft.plane_resident_bytes is the same bound (PB = 1, no staging).
+        // PB here is the most planes a block takes; the handler picks the planes
+        // and the asynchronous gather's staging per launch, within the opt-in budget.
+        auto stat = [&](long long pb) { return 5LL * nkx + 16 * pb + 16; };
+        rb = row_bytes + stat(1) <= smem_optin
             ? std::max(1LL, std::min(8LL, kPlaneGroupBytes / row_bytes)) : 0;
-        plane_static = 5LL * nkx + 8 * std::max(1LL, rb) + 16;
+        plane_static = stat(std::max(1LL, rb));
         int smem_sm = 0;
         LRX_CUDA_CHECK(cudaDeviceGetAttribute(&smem_sm, cudaDevAttrMaxSharedMemoryPerMultiprocessor, dev),
                        "shared memory per SM");
@@ -1240,7 +1275,10 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
     int nv_major = 0, nv_minor = 0;
     nvrtcVersion(&nv_major, &nv_minor);
     const char* src = mode == 10 ? kPlaneSrc : kSrc;
+    namespace ag = lorrax_ffi::async_gather;
+    const bool uses_async = std::string_view(src).find(ag::kHeaderName) != std::string_view::npos;
     uint64_t h = fnv1a(src);
+    if (uses_async) h = fnv1a(ag::kHeaderSrc, fnv1a("\x1d", h));   // the embedded header decides the image too
     for (const auto& d : defs) h = fnv1a(d, fnv1a("\x1f", h));
     const std::string cccl = exists(cuda_inc + "/cccl/cuda/std/__cccl/version.h")
         ? cuda_inc + "/cccl/cuda/std/__cccl/version.h" : cuda_inc + "/cuda/std/__cccl/version.h";
@@ -1272,7 +1310,10 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
         std::vector<const char*> opts;
         for (auto& x : o) opts.push_back(x.c_str());
         nvrtcProgram prog = nullptr;
-        nvrtcResult nr = nvrtcCreateProgram(&prog, src, "lrx_kconv_mathdx.cu", 0, nullptr, nullptr);
+        const char* hdr_src[] = {ag::kHeaderSrc};
+        const char* hdr_name[] = {ag::kHeaderName};
+        nvrtcResult nr = nvrtcCreateProgram(&prog, src, "lrx_kconv_mathdx.cu", uses_async ? 1 : 0,
+                                            uses_async ? hdr_src : nullptr, uses_async ? hdr_name : nullptr);
         if (nr != NVRTC_SUCCESS) { *where = "nvrtcCreateProgram"; *err = nvrtcGetErrorString(nr); return false; }
         nr = nvrtcCompileProgram(prog, static_cast<int>(opts.size()), opts.data());
         if (nr != NVRTC_SUCCESS) {
@@ -1324,11 +1365,18 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
     b.rb = static_cast<int>(rb);
     b.threads = plane_threads;
     b.smem = static_cast<int>(rb * row_bytes);
+    if (mode == 10) {
+        // The launch may add staging: allow the dynamic limit the opt-in budget leaves.
+        LRX_CUDA_CHECK(cudaDeviceGetAttribute(&b.sms, cudaDevAttrMultiProcessorCount, dev), "SM count");
+        b.plane_bytes = row_bytes;
+        b.smem_cap = smem_optin - plane_static;
+    }
     b.compile_ms = ms;
     // Mode 10 always sets the dynamic limit: its static tables count against the
     // 48 KiB default too, so a plane just under 48 KiB would fail at launch.
     if (b.smem > 49152 || mode == 10) {
-        cr = api.FuncSetAttribute(b.fn, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, b.smem);
+        cr = api.FuncSetAttribute(b.fn, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                                  mode == 10 ? static_cast<int>(b.smem_cap) : b.smem);
         if (cr != CUDA_SUCCESS && mode == 10) {
             std::ostringstream os;
             os << "GATE mathdx-plane-residency: got plane (" << nkx << "," << nky << "), " << b.smem
@@ -1851,6 +1899,7 @@ struct PlaneGather {
     const int* row_of;     // (rows,) plane row of each occupied row
     const int* start;      // () slab start on F's axis 1 (clamped as lax.dynamic_slice clamps)
     long long rows, n_col, planes, s_len, n_pg, inner;
+    int pb, stage;         // planes per block (<= LRX_PB) and staging on/off, chosen at launch
 };
 
 // Mode 10: Y (A, n_pg, *R, n_b, n_c) = the forward unscaled 2-D FFT of the
@@ -1903,14 +1952,28 @@ static ffi::Error PlaneFftGather(cudaStream_t stream, ffi::AnyBuffer F, ffi::Any
     ffi::Error e = build(10, static_cast<int>(nb), static_cast<int>(nc), static_cast<int>(b1),
                          static_cast<int>(c1), false, mathdx_root, cubin_dir, &k);
     if (!e.success()) return e;
+    // Planes per block and the asynchronous gather's staging, from this table's
+    // occupied rows and the opt-in budget left beside the static tables.
+    const long long stage = 16LL * gd[0] * nc;
+    int pb = k->rb, staged = 0;
+    if (stage > 0) {
+        const long long p2 = std::max(1LL, std::min<long long>(k->rb, kPlaneGroupBytes / (k->plane_bytes + stage)));
+        if (p2 * (k->plane_bytes + stage) <= k->smem_cap) { pb = static_cast<int>(p2); staged = 1; }
+    }
+    const long long smem = pb * (k->plane_bytes + (staged ? stage : 0));
+    int per_sm = 0;
+    CUresult oc = driver_api().OccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, k->fn, k->threads,
+                                                                         static_cast<size_t>(smem));
+    if (oc != CUDA_SUCCESS || per_sm < 1) return fail("cuOccupancyMaxActiveBlocksPerMultiprocessor", cu_err(oc));
     PlaneGather g{static_cast<const int*>(gidx.untyped_data()), static_cast<const int*>(row_of.untyped_data()),
                   static_cast<const int*>(start.untyped_data()), gd[0], fd[fd.size() - 1], planes, S, n_pg,
-                  inner};
+                  inner, pb, staged};
     const void* fp = F.untyped_data();
     void* yp = Y->untyped_data();
     void* args[] = {(void*)&fp, (void*)&yp, (void*)&g};
-    const unsigned blocks = static_cast<unsigned>(std::min<long long>((planes + k->rb - 1) / k->rb, 2147483647LL));
-    CUresult cr = driver_api().LaunchKernel(k->fn, blocks, 1, 1, k->threads, 1, 1, static_cast<unsigned>(k->smem),
+    const long long groups = std::min((planes + pb - 1) / pb, static_cast<long long>(k->sms) * per_sm);
+    const unsigned blocks = static_cast<unsigned>(std::min<long long>(groups, 2147483647LL));
+    CUresult cr = driver_api().LaunchKernel(k->fn, blocks, 1, 1, k->threads, 1, 1, static_cast<unsigned>(smem),
                                             reinterpret_cast<CUstream>(stream), args, nullptr);
     if (cr != CUDA_SUCCESS) return fail("cuLaunchKernel", cu_err(cr));
     return ffi::Error::Success();
