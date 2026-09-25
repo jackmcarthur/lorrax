@@ -21,18 +21,19 @@ def plan(shape, spec, ds, p, itemsize=16, vshape=None):
 
 def test_the_face_bank_sample_splits_its_rows_per_q():
     # Wc at one sample, all 59 q, face (q, s, mu_X, nu_Y) in a 22-sample bank.
-    k, rows = plan((59, 1, 3164, 3164), (None, None, ("x",), ("y",)),
-                   (59, 22, 3164, 3164), 16)
-    assert (k, rows) == (2, 3168)            # one q per piece, whole mu axis
+    k, rows, lead = plan((59, 1, 3164, 3164), (None, None, ("x",), ("y",)),
+                         (59, 22, 3164, 3164), 16)
+    assert (k, rows) == (2, 3168)            # rows of mu, whole nu
+    assert lead == 6                          # six q per piece: 6 x 10 MB per rank
     run = _file_run_bytes((1, 1, rows // 16, 3164), (59, 22, 3164, 3164), 16)
     assert run >= _FILE_ORDER_MIN_RUN and run <= _FILE_ORDER_PIECE_BYTES
 
 
 def test_a_g_windowed_wavefunction_splits_bands_within_the_budget():
     # WFN_qp window: (bands, spinors, G window, re/im) f64, G-sharded.
-    k, rows = plan((900, 2, 76544, 2), (None, None, XY, None),
-                   (900, 2, 2295337, 2), 16, itemsize=8)
-    assert k == 0 and rows % 16 == 0
+    k, rows, lead = plan((900, 2, 76544, 2), (None, None, XY, None),
+                         (900, 2, 2295337, 2), 16, itemsize=8)
+    assert k == 0 and rows % 16 == 0 and lead == 1
     assert (rows // 16) * 2 * 76544 * 2 * 8 <= _FILE_ORDER_PIECE_BYTES
 
 
@@ -64,8 +65,8 @@ def test_every_piece_fits_the_budget(p):
             ((64, 3200, 3200), (None, None, None), (64, 3200, 3200))):
         got = plan(shape, spec, ds, p)
         if isinstance(got, tuple):
-            k, rows = got
+            k, rows, lead = got
             row = 16
             for d in shape[k + 1:]:
                 row *= d
-            assert rows % p == 0 and (rows // p) * row <= _FILE_ORDER_PIECE_BYTES
+            assert rows % p == 0 and lead * (rows // p) * row <= _FILE_ORDER_PIECE_BYTES
