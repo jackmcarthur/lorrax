@@ -71,6 +71,14 @@ def test_cover_grows_over_every_non_frozen_identity_and_nothing_else():
     # Bounded by the spectrum it covers: unfrozen semicore reaches E - pad(E).
     _, grown, _, _ = _sc_sampled_support(_inputs("cover", 0), part, e, 0.0)
     assert -100.0 - 10.5 - 0.25 < grown[0] <= -100.0 - 10.5
+    # ... unless the W model calls it inactive (shared_pole_recipe.active_band_mask):
+    # then no fc key is needed and the semicore keeps Sigma(0) as under static.
+    from gw.shared_pole_recipe import active_band_mask
+    from common.units import RYD_TO_EV
+    active = active_band_mask(e / RYD_TO_EV, 0.0)
+    np.testing.assert_array_equal(active, [False, True, True, True])
+    _, grown, _, _ = _sc_sampled_support(_inputs("cover", 0), part, e, 0.0, active)
+    assert grown[0] == GRID[0] and grown[-1] > 11.7
     for policy in ("static", "clamp"):                   # window rule: +9.8 and +11.7 lie
         _, grown, _, _ = _sc_sampled_support(_inputs(policy, 1), part, e, 0.0)
         np.testing.assert_array_equal(grown, GRID)       # beyond the +9.44 padded top
