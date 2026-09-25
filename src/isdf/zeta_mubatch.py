@@ -29,7 +29,6 @@ import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from common.shard_map import shard_map
-from common.fft_helpers import local_fftn3
 from common.wfn_transforms import _plane_geometry
 from runtime.padding import axis_mask, pad_to_axis, padded_axis
 
@@ -204,7 +203,7 @@ def _spin_sandwich(U, d):
 
 def make_route_g_kernel(*, mesh: Mesh, kgrid, fft_grid, ns: int, b: int,
                         q_sel, q_axis, q_neg, qvec_frac, n_col: int, n_s: int,
-                        plane_from_col, n_pg: int, axis: int, n_src: int, vertices=(0,),
+                        plane_from_col, zeta_cols, n_pg: int, axis: int, n_src: int, vertices=(0,),
                         c_out: int | None = None, n_blk: int = 1,
                         stop_at: str | None = None):
     """Compile-once executable for one μ batch on route G.
@@ -306,10 +305,21 @@ def make_route_g_kernel(*, mesh: Mesh, kgrid, fft_grid, ns: int, b: int,
     # (the gather-on-load kernel; its XLA route is the run concatenate).
     plane_fft = LocalFourierPlan((n_b, n_c), (-2, -1), sign=-1, norm='backward',
                                  in_gather=(pfc, n_col), mesh=mesh)
+    # Z planes -> the ζ cylinder's columns in one plan: its out_support is the
+    # columns' bounding box (b, c), so only that box is transformed out
+    # (supported-axis GEMMs where the device's row takes them); ``zpos`` is
+    # each ζ column's cell in the box.
+    zcol = np.asarray(zeta_cols, dtype=np.int64).reshape(-1)
+    zb, zb_i = np.unique(zcol // n_c, return_inverse=True)
+    zcc, zc_i = np.unique(zcol % n_c, return_inverse=True)
+    zpos = (zb_i * zcc.size + zc_i).astype(np.int32)
+    z_fft = LocalFourierPlan((n_b, n_c), (-2, -1), sign=-1, norm='backward',
+                             out_support={-2: zb, -1: zcc}, mesh=mesh)
     key = ('route_g', _mesh_id(mesh), tuple(kgrid), tuple(fft_grid), ns, b,
            hash(q_sel.tobytes()), q_axis,
            None if q_neg is None else hash(q_neg.tobytes()), hash(qv.tobytes()),
-           int(n_col), int(n_s), hash(pfc.tobytes()), int(n_pg), int(axis), int(n_src),
+           int(n_col), int(n_s), hash(pfc.tobytes()), hash(zcol.tobytes()), int(n_pg),
+           int(axis), int(n_src),
            vertices, c_out, n_blk, stop_at)
     hit = _kernel_cache.get(key)
     if hit is not None:
@@ -324,7 +334,7 @@ def make_route_g_kernel(*, mesh: Mesh, kgrid, fft_grid, ns: int, b: int,
              out_specs=(P(None, _XY, None),) * n_v, check_vma=False)
     def _local(psi_bar, w_l, w_r, kvecs, g3, xmu, live, cyl, zt, unf, lt):
         ci, cax = cyl
-        zc, za, zflat = zt
+        _, za, zflat = zt
         irr, sym, anti, U, pslot, phase, kch = unf
         lperm, lL = lt[0][0], lt[1][0]                    # this owner's orbits
         # 1. X_B = ψ_{nks}(r_μ) = Σ_G c e^{2πi(k+G)·x_μ}/√N, one psum
@@ -412,8 +422,9 @@ def make_route_g_kernel(*, mesh: Mesh, kgrid, fft_grid, ns: int, b: int,
                             Z = Z + jnp.conj(jnp.take(Z, jnp.asarray(q_neg), axis=0))
                         Z = jnp.take(Z, jnp.asarray(q_sel), axis=0).reshape(Q, c_out, n_pg, ps)
                         Z = (Z * qin[:, None, None, :]).reshape(Q, c_out, n_pg, n_b, n_c)
-                        Fz = local_fftn3(Z, axes=(-2, -1), norm='backward').reshape(Q, c_out, n_pg, ps)
-                        out.append(acc_v + jnp.einsum('qcpj,qpg->qcjg', jnp.take(Fz, zc, axis=-1), E))
+                        Fz = z_fft(Z).reshape(Q, c_out, n_pg, zb.size * zcc.size)
+                        out.append(acc_v + jnp.einsum('qcpj,qpg->qcjg',
+                                                      jnp.take(Fz, jnp.asarray(zpos), axis=-1), E))
                     return tuple(out), None
 
                 acc, _ = jax.lax.scan(group, acc, jnp.arange(n_gb, dtype=jnp.int32), unroll=1)

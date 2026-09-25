@@ -171,7 +171,7 @@ def run_case(case, fx, mesh, scratch, vertices=(0,)):
             mesh=mesh, kgrid=kgrid, fft_grid=fg, ns=ns, b=ob.b,
             q_sel=q_sel, q_axis=q_axis, q_neg=q_neg if charge else None, qvec_frac=qf,
             n_col=int(cyl[0].shape[1]), n_s=int(cyl[0].shape[2]),
-            plane_from_col=np.asarray(cyl[2]), n_pg=2, axis=axis,
+            plane_from_col=np.asarray(cyl[2]), zeta_cols=np.asarray(zt[0]), n_pg=2, axis=axis,
             n_src=n_par, vertices=vertices, c_out=c_out, n_blk=n_blk)
         stores = [zmb.ZStore(mesh=mesh, q_axis=q_axis, mu_pad=mu_pad, g_axis=g_axis,
                              b=ob.b, placement=placement, n_batch=ob.n_batch,

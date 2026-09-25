@@ -331,7 +331,8 @@ def _fit_mubatch(
         mesh=mesh_xy, kgrid=kgrid, fft_grid=fft_grid, ns=ns, b=b,
         q_sel=q_irr_full_idx, q_axis=q_axis, q_neg=q_neg_idx, qvec_frac=q_frac,
         n_col=int(cyl[0].shape[1]), n_s=int(cyl[0].shape[2]),
-        plane_from_col=np.asarray(jax.device_get(cyl[2])), n_pg=int(plan.r_sub),
+        plane_from_col=np.asarray(jax.device_get(cyl[2])), zeta_cols=np.asarray(zt[0]),
+        n_pg=int(plan.r_sub),
         axis=axis, n_src=n_par, vertices=vertices, c_out=c_out, n_blk=n_blk)
     kernel = zmb.make_route_g_kernel(**kern_args)
     split_kernels = {}
