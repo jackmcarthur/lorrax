@@ -59,7 +59,6 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-import jax
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from harness import (          # noqa: E402
@@ -73,13 +72,19 @@ from harness import (          # noqa: E402
 
 SI_DIR = REG / "si_cohsex_debug"
 
+from core.rank_session import _resolve_proc_count  # noqa: E402
+
+#: The full Si and hBN decks exhaust one A100 (a 9.84-10.68 GiB allocation),
+#: so they run as the core tier's 4-process driver: four pytest ranks, one GPU
+#: each (``lx run -N 1 -G 4 -n 4 python3 -m pytest ...``).  The old
+#: ``jax.device_count() < 4`` test could never pass: conftest pins every
+#: pytest process to one GPU, so these cells skipped on every leg.
 _NEEDS_P4_E2E_MEMORY = pytest.mark.skipif(
-    jax.device_count() < 4,
-    reason=("needs >=4 JAX devices: the full regression fixture exhausts "
+    _resolve_proc_count() < 4,
+    reason=("needs 4 pytest ranks, one GPU each (lx run -N 1 -G 4 -n 4 "
+            "python3 -m pytest ...): the full regression fixture exhausts "
             "one A100 during a 9.84-10.68 GiB allocation"),
 )
-
-from core.rank_session import _resolve_proc_count  # noqa: E402
 
 #: The bispinor deck runs its driver on a 2x2 mesh whose multi-process
 #: services (the cublasmp matmul, ``distrib_la/matmul.py``) need ONE JAX

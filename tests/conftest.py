@@ -872,10 +872,25 @@ def pytest_sessionstart(session):
                 f"read-only (see harness.protect_fixtures)")
 
 
-def _run_session_case(tmp_path_factory, case_name, input_name, output_name):
+def _run_session_case(tmp_path_factory, case_name, input_name, output_name, *,
+                      mutations=None, extra_env=None, label=None):
+    """One driver run of a regression fixture, in either process geometry.
+
+    ``mutations`` edits the staged deck (``harness.mutate_input``) and
+    ``extra_env`` reaches the driver; ``label`` names the private copy.
+    Under plain P4 pytest the variant is staged once and run as one
+    4-process driver, like the fresh session runs.
+    """
     import pytest as _pytest
     harness.skip_unless_gpu(_pytest)
     case_dir = harness.REG / case_name
+
+    def prepare(source, target):
+        target = harness.copy_fixture(source, target)
+        if mutations:
+            harness.mutate_input(target / input_name, mutations)
+        return target
+
     from core import rank_session
     if rank_session._resolve_proc_count() > 1:
         # PLAIN P4 PYTEST (tests/README.md "Process geometry", the core
@@ -885,17 +900,18 @@ def _run_session_case(tmp_path_factory, case_name, input_name, output_name):
         # on a 2x2 mesh — the geometry the multi-process services
         # (cublasmp) require.  Four private copies would instead be four
         # drivers joining one process group from four directories.
-        run_dir = rank_session.stage(case_dir, harness.copy_fixture)
+        run_dir = rank_session.stage(case_dir, prepare)
         res = rank_session.run_child(
-            lambda: harness.run_gw_jax(run_dir, input_name, platform="gpu"),
+            lambda: harness.run_gw_jax(run_dir, input_name, platform="gpu",
+                                       extra_env=extra_env),
             run_dir / input_name)
         out = run_dir / output_name
         assert out.exists(), f"session run wrote no {out}"
         return _NS(run_dir=run_dir, input_name=input_name,
                    output_name=output_name, stdout=res.stdout)
-    run_dir = harness.copy_fixture(
-        case_dir, tmp_path_factory.mktemp(f"{case_name}_session") / case_name)
-    res = harness.run_gw_jax(run_dir, input_name)
+    run_dir = prepare(case_dir, tmp_path_factory.mktemp(
+        f"{label or case_name}_session") / case_name)
+    res = harness.run_gw_jax(run_dir, input_name, extra_env=extra_env)
     if res.returncode != 0:
         _pytest.fail(
             f"{case_name} session run failed.\n"
@@ -942,39 +958,21 @@ def gnppm_restart_baseline(gnppm_session, tmp_path_factory):
 
 
 @pytest.fixture(scope="session")
-def gnppm_sc_session(gnppm_session, tmp_path_factory):
-    """THE self-consistent run.  There is exactly one, and this is it.
-
-    Every other committed deck is ``qp_solver = one_shot_dft``, which is
-    how ``sc_on_ibz`` rotted into a crash without turning anything red.
-    See ``tests/regression/gnppm_debug/gnppm_sc.in`` for why this fixture
-    and not a smaller one — the short version is that the deck must have
-    a file wedge and a star wedge of DIFFERENT sizes (9 vs 5 here) and an
-    orbit-closed centroid set, and gnppm_debug is the only one with both.
-
-    Restarts from the ``gnppm_session`` state, so it costs one Σ chain
-    rather than an ISDF rebuild: ~25 s at P=4 against ~31 s fresh.
-    """
-    run_dir = harness.copy_fixture(
-        harness.REG / "gnppm_debug",
-        tmp_path_factory.mktemp("gnppm_sc") / "gnppm_debug",
-        tmp_from=gnppm_session.run_dir)
-    res = harness.run_gw_jax(run_dir, "gnppm_sc.in")
-    if res.returncode != 0:
-        pytest.fail(
-            f"gnppm SC session run failed.\n"
-            f"stdout:\n{res.stdout}\nstderr:\n{res.stderr}")
-    return _NS(run_dir=run_dir, input_name="gnppm_sc.in",
-               output_name="sigma_diag_gnppm_sc.dat", stdout=res.stdout,
-               session=gnppm_session)
-
-
-@pytest.fixture(scope="session")
 def bispinor_session(tmp_path_factory):
     """Fresh run of the bispinor GN-PPM fixture; Tier-1 state."""
     return _run_session_case(
         tmp_path_factory, "bispinor_debug", "bispinor_test.in",
         "sigma_diag_bispinor_test.dat")
+
+
+@pytest.fixture(scope="session")
+def bispinor_pad4_session(tmp_path_factory):
+    """The bispinor fixture with ``LORRAX_EXTRA_MU_PAD=4``, fresh (bispinor
+    restart is not supported), for the pad-extent invariance gate."""
+    return _run_session_case(
+        tmp_path_factory, "bispinor_debug", "bispinor_test.in",
+        "sigma_diag_bispinor_test.dat", label="bispinor_pad4",
+        extra_env={"LORRAX_EXTRA_MU_PAD": "4"})
 
 
 @pytest.fixture(scope="session")
@@ -1065,24 +1063,11 @@ def hbn_mcavg_false_session(tmp_path_factory):
 
     Fresh (``restart = false``, as the deck already is), so the mini-BZ head
     average is genuinely rebuilt under the flipped convention.
+    ``mutate_input`` asserts the old string is present, so a deck edit that
+    renamed or dropped this key fails loudly instead of silently producing a
+    second copy of the reference run.
     """
-    import pytest as _pytest
-    harness.skip_unless_gpu(_pytest)
-    run_dir = harness.copy_fixture(
-        harness.REG / "hbn_cohsex_debug",
-        tmp_path_factory.mktemp("hbn_mcavg_false") / "hbn_cohsex_debug")
-    # ``mutate_input`` asserts the old string is present, so a deck edit that
-    # renamed or dropped this key fails here loudly instead of silently
-    # producing a second copy of the reference run.
-    harness.mutate_input(run_dir / "cohsex_hbn_test.in", {
-        "mc_average_vcoul_body = true": "mc_average_vcoul_body = false",
-    })
-    res = harness.run_gw_jax(run_dir, "cohsex_hbn_test.in")
-    if res.returncode != 0:
-        pytest.fail(
-            f"hBN mc_average_vcoul_body=false arm failed.\n"
-            f"stdout:\n{res.stdout}\nstderr:\n{res.stderr}")
-    out = run_dir / "eqp_hbn_test.dat"
-    assert out.exists(), f"control arm wrote no {out}"
-    return _NS(run_dir=run_dir, input_name="cohsex_hbn_test.in",
-               output_name="eqp_hbn_test.dat", stdout=res.stdout)
+    return _run_session_case(
+        tmp_path_factory, "hbn_cohsex_debug", "cohsex_hbn_test.in",
+        "eqp_hbn_test.dat", label="hbn_mcavg_false",
+        mutations={"mc_average_vcoul_body = true": "mc_average_vcoul_body = false"})
