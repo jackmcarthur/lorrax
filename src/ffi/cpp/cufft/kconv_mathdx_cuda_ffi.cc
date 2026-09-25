@@ -46,8 +46,8 @@
 //             (-1: not stored; the Sigma consumers keep only the parent
 //             rows), or one (d x d) output spin block (a0, b0) of it
 //             (LRX_NA = d): every source is read, only the block stored.  The tables are symmetry_maps's (unfold_load_tables);
-//             every product rounds as the XLA unfold and the spin-rotate FFI
-//             it replaces.
+//             the products are fused (lrx_mulf, lrx_cmac): round-off equal to
+//             the XLA unfold and the spin-rotate FFI it replaces.
 //   8 klead lorentz conv   mode 7's load, then the four-current vertex sum in
 //             R space: U = mult * sf * FFT_k( sum_{A,B} gamma_A (si * IFFT_k
 //             G_unfolded) gamma_B^dagger * V[k,x,A,y,B] ) with V (nk, mx, nA,
@@ -56,9 +56,9 @@
 //             as attributes, and U spin-major (n_out, a, mx, b, my) through
 //             mode 7's kout row map.  One
 //             transform of G serves every Lorentz block; the scales and the
-//             product/sum order are those of the XLA chain it replaces (mode-3
-//             transforms and a scan over the blocks), so it is meant to equal
-//             that chain bit for bit.  On the k-box stage's split arm: the
+//             product/sum order of the vertex sum are those of the XLA chain it
+//             replaces (mode-3 transforms and a scan over the blocks); mode 7's
+//             fused load makes it round-off equal to that chain.  On the k-box stage's split arm: the
 //             group pencil forms each (member, pair) on its own thread with V
 //             staged by cp.async; chunked over pairs through an intermediate no
 //             larger than U.
@@ -72,9 +72,9 @@
 //             j = y*nr_s + B: the R-space operand modes 2/7/8 take.  An
 //             antiunitary row either reads the partner tile (pair_transpose)
 //             or conjugates the phased product (conj_trs, a Hermitian
-//             interaction: no partner tile).  The products round as the XLA
-//             unfold (symmetry_maps unfold_isdf_operator) and mode 3 they
-//             replace.
+//             interaction: no partner tile).  The products are the fused
+//             forms of mode 7's load: round-off equal to the XLA unfold
+//             (symmetry_maps unfold_isdf_operator) and mode 3 they replace.
 //  10 plane fft gather   Y[..., kb, kc] = FFT2_{b,c}(plane[..., b, c]) (forward,
 //             unscaled: jnp.fft.fftn(norm='backward') over the last two axes)
 //             where the plane is the route-G cylinder F (..., n_col) scattered
@@ -284,8 +284,8 @@ __device__ __forceinline__ lrx_c2 lrx_mul(lrx_c2 a, lrx_c2 b) {
     return z;
 }
 #if !LRX_F32
-// Products that must round exactly as the chains modes 6 and 7 replace.  Each
-// is spelled with round-to-nearest intrinsics or explicit fma, so NVRTC's own
+// Mode 6 and mode 8's vertex round as the chains they replace.  Each form is
+// spelled with round-to-nearest intrinsics or explicit fma, so NVRTC's own
 // contraction cannot change it (runs/runtime/kconv_fused_load_20260924/fma_forms).
 //
 // (a+bi)(c+di) as XLA:GPU forms an HLO complex multiply: (ac - bd, ad + bc)
@@ -296,36 +296,23 @@ __device__ __forceinline__ lrx_c2 lrx_mul_xla(lrx_c2 a, lrx_c2 b) {
                 __dadd_rn(__dmul_rn(a.x, b.y), __dmul_rn(a.y, b.x))};
     return z;
 }
-// cuCmul(a, b) as nvcc compiles it in cpp/symmetry/spin_rotate.cu (SASS):
-// re = fma(a.x, b.x, -(a.y b.y)), im = fma(a.x, b.y, a.y b.x).
-__device__ __forceinline__ lrx_c2 lrx_mul_cu(lrx_c2 a, lrx_c2 b) {
+// The unfold load (modes 7, 8, 9, 11), its tile finish and the chi trace use fused forms (owner
+// 2026-09-25: round-off equal is fine; the gate is the router's ulp bounds and the reference decks
+// at the print quantum or |dSigma| < 2 meV, TASTE 77): a product in two FMAs and two multiplies,
+// and a product-sum v += a b in four FMAs.  They cut the FP64 pipe's busy time per chi0 tau node
+// from 62 to 45 ms at base clock (6x6 bispinor, A100; U2c).
+__device__ __forceinline__ lrx_c2 lrx_mulf(lrx_c2 a, lrx_c2 b) {
     lrx_c2 z = {fma(a.x, b.x, -__dmul_rn(a.y, b.y)), fma(a.x, b.y, __dmul_rn(a.y, b.x))};
     return z;
 }
-// cuCmul(a, cuConj(u)) as nvcc compiles it there: the negation folds, so
-// re = fma(a.x, u.x, a.y u.y) and im = fma(a.y, u.x, -(a.x u.y)).
-__device__ __forceinline__ lrx_c2 lrx_mul_cu_conj(lrx_c2 a, lrx_c2 u) {
-    lrx_c2 z = {fma(a.x, u.x, __dmul_rn(a.y, u.y)), fma(a.y, u.x, -__dmul_rn(a.x, u.y))};
-    return z;
+// v += a b and v += a conj(b), four fused multiply-adds each.
+__device__ __forceinline__ void lrx_cmac(lrx_c2& v, lrx_c2 a, lrx_c2 b) {
+    v.x = fma(a.x, b.x, v.x); v.x = fma(-a.y, b.y, v.x);
+    v.y = fma(a.x, b.y, v.y); v.y = fma(a.y, b.x, v.y);
 }
-// The spin action U G U^dagger of the chain mode 7 replaces: the
-// spin-rotate FFI (nvcc) for ns = 2, 4; for ns = 1 the unfold rotates in XLA
-// (symmetry_maps._rotate_open_spin_centroid_operator), which does not fuse.
-// Mode 9's endpoint actions replace an XLA rotation, so they round as XLA.
-__device__ __forceinline__ lrx_c2 lrx_rot_mul(lrx_c2 u, lrx_c2 g) {
-#if LRX_NS == 1 || LRX_MODE == 9
-    return lrx_mul_xla(u, g);
-#else
-    return lrx_mul_cu(u, g);
-#endif
-}
-__device__ __forceinline__ lrx_c2 lrx_rot_mul_conj(lrx_c2 l, lrx_c2 u) {
-#if LRX_NS == 1 || LRX_MODE == 9
-    const lrx_c2 uc = {u.x, -u.y};
-    return lrx_mul_xla(l, uc);
-#else
-    return lrx_mul_cu_conj(l, u);
-#endif
+__device__ __forceinline__ void lrx_cmac_conj(lrx_c2& v, lrx_c2 a, lrx_c2 b) {
+    v.x = fma(a.x, b.x, v.x); v.x = fma(a.y, b.y, v.x);
+    v.y = fma(a.y, b.x, v.y); v.y = fma(-a.x, b.y, v.y);
 }
 #endif
 __device__ __forceinline__ lrx_c2 lrx_phase(lrx_c2 z, int code) {
@@ -697,7 +684,7 @@ __device__ __forceinline__ void lrx_unfold_pair(
             if (ls >= 0 && rs >= 0) {
                 lrx_c2 sv = src[(long long)ls * t.nl + rs];
                 if (conj_src) sv.y = -sv.y;
-                v = lrx_mul_xla(lrx_mul_xla(mp, sv), nph[rj]);
+                v = lrx_mulf(lrx_mulf(mp, sv), nph[rj]);
                 if (conj_row) v.y = -v.y;
             }
             g[c][d] = v;
@@ -722,20 +709,14 @@ __device__ __forceinline__ void lrx_spin_row(const lrx_c2 (&u)[NS][NS], const lr
     for (int d = 0; d < NR; ++d) {
         lrx_c2 v = {0.0, 0.0};
 #pragma unroll
-        for (int c = 0; c < NS; ++c) {
-            const lrx_c2 p = lrx_rot_mul(u[a][c], g[c][d]);
-            v.x = __dadd_rn(v.x, p.x); v.y = __dadd_rn(v.y, p.y);
-        }
+        for (int c = 0; c < NS; ++c) lrx_cmac(v, u[a][c], g[c][d]);
         left[d] = v;
     }
 #pragma unroll
     for (int b = 0; b < NR; ++b) {
         lrx_c2 v = {0.0, 0.0};
 #pragma unroll
-        for (int d = 0; d < NR; ++d) {
-            const lrx_c2 p = lrx_rot_mul_conj(left[d], ur[b][d]);
-            v.x = __dadd_rn(v.x, p.x); v.y = __dadd_rn(v.y, p.y);
-        }
+        for (int d = 0; d < NR; ++d) lrx_cmac_conj(v, left[d], ur[b][d]);
         out[b] = v;
     }
 }
@@ -950,7 +931,7 @@ __device__ __forceinline__ void tt_finish(const TileTabs& s, int b, int npr, lrx
                 if (ls[(jp * NK + k) * NS + c] >= 0 && r >= 0) {
                     lrx_c2 sv = col[c * CS];
                     if (conj_src) sv.y = -sv.y;
-                    v = lrx_mul_xla(lrx_mul_xla(mp[(jp * NS + c) * NK + k], sv), nq);
+                    v = lrx_mulf(lrx_mulf(mp[(jp * NS + c) * NK + k], sv), nq);
                     if (conj_row) v.y = -v.y;
                 }
                 gcol[c] = v;
@@ -959,10 +940,7 @@ __device__ __forceinline__ void tt_finish(const TileTabs& s, int b, int npr, lrx
             for (int aa = 0; aa < NS; ++aa) {
                 lrx_c2 v = {0.0, 0.0};
 #pragma unroll
-                for (int c = 0; c < NS; ++c) {
-                    const lrx_c2 p = lrx_rot_mul(u[(aa * NS + c) * NK + k], gcol[c]);
-                    v.x = __dadd_rn(v.x, p.x); v.y = __dadd_rn(v.y, p.y);
-                }
+                for (int c = 0; c < NS; ++c) lrx_cmac(v, u[(aa * NS + c) * NK + k], gcol[c]);
                 col[aa * CS] = v;
             }
         }
@@ -976,10 +954,7 @@ __device__ __forceinline__ void tt_finish(const TileTabs& s, int b, int npr, lrx
             for (int bb = 0; bb < NR; ++bb) {
                 lrx_c2 v = {0.0, 0.0};
 #pragma unroll
-                for (int d = 0; d < NR; ++d) {
-                    const lrx_c2 p = lrx_rot_mul_conj(left[d], u[(bb * NR + d) * NK + k]);
-                    v.x = __dadd_rn(v.x, p.x); v.y = __dadd_rn(v.y, p.y);
-                }
+                for (int d = 0; d < NR; ++d) lrx_cmac_conj(v, left[d], u[(bb * NR + d) * NK + k]);
                 row[bb * TT_RSTRIDE] = v;
             }
         }
@@ -1409,8 +1384,7 @@ __device__ __forceinline__ lrx_c2 lrx_chi_value(const Get& g, double si) {
         const lrx_c2 gv = g(q), gc = g(SS + q);
         const lrx_c2 a = {gc.x * si, -(gc.y * si)};
         const lrx_c2 b = {gv.x * si, gv.y * si};
-        const lrx_c2 p = lrx_mul_xla(a, b);
-        v.x = __dadd_rn(v.x, p.x); v.y = __dadd_rn(v.y, p.y);
+        lrx_cmac(v, a, b);
     }
 #if LRX_COMPLETE
     v = {__dadd_rn(v.x, v.x), __dsub_rn(v.y, v.y)};
@@ -1423,8 +1397,9 @@ __device__ __forceinline__ lrx_c2 lrx_chi_value(const Get& g, double si) {
 __device__ __forceinline__ void lrx_chi_acc(const ChiArgs& a, int k, long long pr, lrx_c2 v) {
     for (int o = 0; o < a.n_out; ++o) {
         lrx_c2* e = a.acc + ((long long)o * NK + k) * a.pairs + pr;
-        const lrx_c2 p = lrx_mul_xla(a.alpha[o], v);
-        *e = {__dadd_rn(e->x, p.x), __dadd_rn(e->y, p.y)};
+        lrx_c2 w = *e;
+        lrx_cmac(w, a.alpha[o], v);
+        *e = w;
     }
 }
 
