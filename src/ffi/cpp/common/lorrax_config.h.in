@@ -1,17 +1,14 @@
-// lorrax_config.h.in — configure-time capability record for the host FFI leg.
+// lorrax_config.h.in — configure-time capability record for both FFI legs.
 //
 // Generated into the build directory by src/ffi/cpp/CMakeLists.txt.  It
 // records WHAT THE BUILD ACTUALLY RESOLVED, not what it hoped to.
 //
 // Why this file exists.  probe_target() can already answer "is handler X
 // present?", but it cannot answer "which library is behind the handlers that
-// ARE present?" or "which vendor won the AUTO FFT race on this machine?".
-// Those questions previously had one answer each: read the configure log, if
-// you still have it.  On a machine where the FFT backend can be MKL DFTI or
-// FFTW3, and the BLAS/ScaLAPACK can be MKL or Cray LibSci or netlib or AOCL,
-// "which one did I actually get" is exactly the question you need answered
-// when a number comes out wrong — and it is the question a silently degraded
-// build makes you unable to ask.
+// ARE present?" or "which FFTW3 hint and which BLAS/ScaLAPACK (MKL, Cray
+// LibSci, netlib, AOCL) did this build resolve?".  That is the question to
+// answer when a number comes out wrong, and a silently degraded build makes
+// it unanswerable.
 //
 // @-substituted by CMake; do not edit the generated copy.
 #pragma once

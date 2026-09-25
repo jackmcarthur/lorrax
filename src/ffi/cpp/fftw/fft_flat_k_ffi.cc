@@ -1,71 +1,41 @@
-// fft_flat_k_ffi.cc — flat-k batched 3-D MKL FFT (DFTI API) host handlers,
-// HOST platform (JAX CPU backend).  PROTOTYPE (FFT-FFI workstream,
-// 2026-07-28) — gated behind LORRAX_FFT_FFI / LORRAX_FFT_FFI_FUSED on the
-// Python side (common/fft_helpers.py); the default XLA path is untouched.
+// fft_flat_k_ffi.cc — the host (cpu) leg of the ffi.fft k-convolution router:
+// flat-k batched 3-D FFTs through the FFTW3 advanced interface
+// (fftw_plan_many_dft), bound at RUN time by dlsym to whichever FFTW3 engine
+// the process has (MKL's FFTW3 export, cray-fftw, FFTW, AOCL; the ladder and
+// its refusal are docs/architecture/ffi_layout.md §3c).  Nothing FFT is
+// linked.  Required on cpu meshes (LORRAX_FFT_FFI, default on; =0 refuses).
 //
-// WHAT THIS IS: MKL's FFT engine driven through the DFTI descriptor API —
-// an O(N log N) fast Fourier transform at ANY k-count (mixed radix,
-// arbitrary lengths); "DFTI" is Intel's descriptor-API name for its FFT, and
-// every transform below is a genuine FFT.
-//
-// WHY IT EXISTS: XLA:CPU's fft custom-call (DUCC) requires the transformed
-// axes minor-most, while the Σ τ-kernel's producers/consumers (G-build
-// einsum, G·W multiply, ψ-projection dots) hold the tile in flat-k
-// "dot layout" — k-major: (nk, s, μ_X, s', μ_Y), c128[16,2,624,2,624]
-// (~398 MB/rank at nb=128/P=64).  XLA therefore transposes the full tile
-// to c128[2,624,2,624,4,4,1] before EVERY fft and back after — measured
-// at ~60-65% of the 1.51 s/τ (G_ifft 79.6 + GW_mult_fft 95.7 + V_ifft
-// 16.5 = 192 s of 272 s sigma.exec; closure in wk_REL/sigma_perf_results.md:
-// the layout anchor is the fft custom-call itself, present in ANY XLA-side
-// re-arrangement).  MKL FFT (DFTI API) has no minor-most requirement:
-// STRIDE DESCRIPTORS read the dot-layout tile exactly where it lies —
-// FFT-axis element strides {nky*nkz*T, nkz*T, T}, batch of T transforms at
-// DISTANCE 1 along the unit-stride trail — so the layout copies vanish
-// instead of being moved around.
+// WHY: XLA:CPU's fft custom call needs the transformed axes minor-most, while
+// the Σ τ tiles live k-major in "dot layout" (nk, s, μ_X, s', μ_Y); XLA would
+// transpose the whole tile around every FFT.  The advanced interface's strides
+// read the tile where it lies: FFT-axis element strides {nky·nkz·T, nkz·T, T},
+// a batch of T transforms at distance 1 along the unit-stride trail.
 //
 // Handlers (registered by ffi_loader.py under platform="cpu"):
 //   MklFftFlatKHostFfi  (target lorrax_mklfft_flat_k)
-//       X (nk, *trail) c128  ->  Y same shape.  One batched 3-D FFT over
-//       the LEADING flat-k axis; direction + total scale are attributes,
-//       so the jnp.fft norm conventions ('ortho'/'backward'/'forward')
-//       live in ONE place, the Python helper.
+//       X (nk, *trail) c128 -> Y same shape: one batched 3-D FFT over the
+//       LEADING flat-k axis; direction and total scale are attributes, so the
+//       jnp.fft norm conventions live in one place, the Python helper.
 //   MklFftGwConvHostFfi (target lorrax_mklfft_gw_conv)
-//       G (nk, a, mx, b, my) c128, W (nk, mx, my) c128 -> S = shape(G).
-//       The fused Σ τ convolution step
+//       G (nk, a, mx, b, my), W (nk, mx, my) c128 -> S = shape(G):
 //           S = FFT[ IFFT[G] * IFFT[W][:,None,:,None,:] * mult ]
-//       chunked over the trail so the big R-space intermediate NEVER
-//       materializes (per-thread compact buffer, ~4 MiB); `mult` is folded
-//       into the forward scale by the Python wrapper.
+//       V_R = IFFT[W] is staged once per call in a reused host arena; the
+//       R-space G tile exists only in per-thread compact chunks.
+// (The target and symbol names keep their historical MKL spelling.)
 //
-// In-place: the Python wrappers alias operand 0 to the result
-// (input_output_aliases={0:0}), so when the operand is dead XLA passes the
-// SAME buffer as input and output — the terminal form of buffer donation
-// (zero extra big tiles).  The DFTI descriptors themselves are ALWAYS
-// committed DFTI_NOT_INPLACE: every chunk is transformed strided-input ->
-// per-thread compact buffer and then scatter-copied out, and under the
-// granted alias each chunk's k-lines are fully read into the compact buffer
-// before the scatter-copy rewrites exactly those locations (see
-// run_flat_batch).  There is deliberately NO DFTI_INPLACE code path — an
-// earlier draft carried one as a dead, never-selected descriptor axis, and
-// the 2026-07-31 audit (P1.8) removed it rather than keep an untested
-// branch documented as tested.
+// In place: the Python wrappers alias operand 0 to the result; every plan is
+// out-of-place into a per-thread compact buffer, then scatter-copied back, and
+// a chunk's k-lines are fully read before the scatter rewrites them.
 //
-// Threading: the handler parallelizes its CHUNK loop with OpenMP (this TU
-// is compiled -fopenmp; the .so already links gomp via mkl_gnu_thread) and
-// pins MKL to ONE thread inside each team member — the MklThreadScope
-// pattern from cpp/scalapack/blacs_grid.h (workstream AW), locally
-// duplicated below WITHOUT the mpi.h/slate deps so this TU stays
-// comms-free; fold into a shared header if the prototype graduates.
-// Team size: LORRAX_FFT_FFI_THREADS (auto/off/N, strict grammar per the AW
-// audit fix; LORRAX_MKLFFT_THREADS is a deprecated alias that announces) —
-// parsed per call (cheap vs the >=10 ms transforms) so the unit gate can
-// sweep it in-process; the measured cap policy is recorded in
-// wk_REL/ffi_fft_proto_notes.md.
+// Threading: an OpenMP team over the trail chunks (this TU is -fopenmp), each
+// member pinning a resident MKL to one thread (common/mkl_thread_pin.h).
+// Team size LORRAX_FFT_FFI_THREADS (auto|off|N; alias LORRAX_MKLFFT_THREADS),
+// chunk LORRAX_FFT_FFI_CHUNK (alias LORRAX_MKLFFT_CHUNK), both parsed per call.
+// Plans are FFTW_ESTIMATE | FFTW_UNALIGNED (MEASURE would overwrite the XLA
+// operand) and cached per shape under one mutex.
 //
-// Envelope-honesty: every extent and stride is taken from the runtime
-// buffer dimensions / attributes; nothing is specialized to a deck.  The
-// FFT is batched over whatever trail the caller shards onto this rank, so
-// no N_mu^2 global tile is ever required (LORRAX scaling target).
+// Every extent and stride comes from the runtime buffer dimensions and
+// attributes; the batch is whatever trail the caller shards onto this rank.
 
 #include <algorithm>
 #include <atomic>
@@ -200,18 +170,12 @@ static bool log_enabled() {
 }
 
 // ---------------------------------------------------------------------------
-//  DFTI descriptor cache — per thread (sidesteps any question of concurrent
-//  DftiCompute* on one handle; each OpenMP team member owns its handles).
-//  A handful of keys per process: (dims, in/out trail strides, transforms
-//  per call, scales, placement).  Handles live for the process.
+//  Plan key: one fftw_plan_many_dft plan per (dims, in/out element stride,
+//  transforms per call, sign), cached for the process under plan_mutex().
+//  Every plan is out-of-place into a compact chunk (see run_flat_batch).
 // ---------------------------------------------------------------------------
-// Every descriptor is DFTI_NOT_INPLACE by construction (compact-chunk
-// staging; see run_flat_batch) — there is no placement axis here.  A dead
-// `inplace` field claiming a live, unit-gated DFTI_INPLACE path was deleted
-// by the 2026-07-31 audit (P1.8): it was 0 at every construction site.
 struct DescKey {
-    // Kept the name: every call site below already speaks it, and the fields
-    // map one-for-one onto fftw_plan_many_dft's advanced-interface
+    // The fields map one-for-one onto fftw_plan_many_dft's advanced-interface
     // parameters.  t_in/t_out ARE istride/ostride; n IS howmany; idist and
     // odist are both 1 (the flat-k layout is ONE uniform batch -- the whole
     // reason the advanced interface is an exact fit and guru buys nothing).
@@ -444,9 +408,7 @@ static fftw_plan_t get_descriptor(const DescKey& k, void* in_hint,
     int n3[3] = {static_cast<int>(k.d0), static_cast<int>(k.d1),
                  static_cast<int>(k.d2)};
     // inembed/onembed NULL => taken as n, so element (i0,i1,i2) of transform
-    // j sits at  base + j*dist + (i0*d1*d2 + i1*d2 + i2)*stride.  That is
-    // byte-for-byte the addressing the old DFTI strides
-    // {0, d1*d2*t, d2*t, t} with INPUT_DISTANCE 1 produced.
+    // j sits at  base + j*dist + (i0*d1*d2 + i1*d2 + i2)*stride.
     fftw_plan_t p = api.plan_many(
         3, n3, static_cast<int>(k.n),
         in_hint,  nullptr, static_cast<int>(k.t_in),  1,
@@ -472,17 +434,13 @@ static inline void execute(fftw_plan_t p, const C128* in, C128* out) {
     // Plans are never FFTW_IN_PLACE, so the transform never writes the input
     // buffer and the const_cast is safe for the XLA (read-only) operand.  The
     // XLA-granted alias (in == out at the HANDLER level) is handled by the
-    // chunk engine's read-before-scatter ordering, exactly as it was under
-    // DFTI's NOT_INPLACE descriptors (P1.8).
+    // chunk engine's read-before-scatter ordering.
     fftw_api().execute_dft(p, const_cast<void*>(static_cast<const void*>(in)),
                            static_cast<void*>(out));
 }
 
-// FFTW normalises NOTHING in either direction (its backward transform is
-// unnormalised), where DFTI folded the scale into the descriptor via
-// FORWARD_SCALE/BACKWARD_SCALE.  The caller's pre-folded jnp-convention
-// scale therefore becomes an explicit pass here.  Same total, one extra
-// streaming multiply over the chunk.
+// FFTW normalises nothing in either direction, so the caller's pre-folded
+// jnp-convention scale is an explicit streaming multiply over the chunk.
 static inline void scale_contig(C128* p, long n, double s) {
     if (s == 1.0) return;
     for (long i = 0; i < n; ++i) p[i] *= s;
@@ -524,10 +482,8 @@ struct ErrSink {
     std::mutex mu;
     std::string msg;
 
-    // Was DFTI status + DftiErrorMessage; FFTW has no status codes at all
-    // (plan creation simply returns NULL), so `where` carries the whole
-    // diagnostic and `status` is retained only so the call sites did not
-    // have to change shape during the engine swap.
+    // FFTW has no status codes (plan creation returns NULL), so `where`
+    // carries the whole diagnostic.
     void record(long status, const char* where) {
         if (failed.exchange(true)) return;
         std::lock_guard<std::mutex> lock(mu);

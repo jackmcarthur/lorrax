@@ -5,7 +5,7 @@
 //
 // Env tunables (all optional; docs/dev/env_vars.md is the registry).
 // Boolean knobs accept the shared writer grammar — see env_flag below
-// (mirrors Python's file_io/_slab_io_mpi_host._env_flag exactly):
+// (mirrors Python's runtime.env_flags.env_bool; tests/test_env_grammar.py):
 //   LORRAX_PHDF5_COLLECTIVE_WRITES (1)  collective vs independent writes
 //   LORRAX_PHDF5_DEDUP_REPLICAS   (1)   one canonical writer per replica
 //   LORRAX_PHDF5_INDEPENDENT      (0)   force independent READS
