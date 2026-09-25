@@ -668,13 +668,25 @@ Route G transforms planes whose occupied cells arrive as a compact cylinder
 Y[…, k_b, k_c] = Σ_{b,c} P[…, b, c] e^{-2πi (b k_b/n_b + c k_c/n_c)},   P = F scattered by plane_from_col, 0 elsewhere
 ```
 
-(`fftn(P, axes=(-2,-1), norm='backward')`) without writing `P`. One block
-holds `PB` planes of `(n_b, n_c|1)` in shared memory (`PB ≤ 8` planes within
-64 KiB, else 1). It gathers the occupied rows' cells through `gidx (rows,
-n_c)` and `row_of (rows,)`, runs the row FFTs on those rows only, runs the
-column FFTs on every column with dead rows read as zero, and stores each
-plane once, coalesced. HBM traffic is one read of the cylinder and one write
-of the plane.
+(`fftn(P, axes=(-2,-1), norm='backward')`) without writing `P`. Persistent
+blocks each hold `PB` planes of `(n_b, n_c|1)` in shared memory (`PB ≤ 8`
+planes within 64 KiB, else 1; the grid is capped at the resident count). A
+block gathers the occupied rows' cells through `gidx (rows, n_c)` and
+`row_of (rows,)`, runs the row FFTs on those rows only, runs the column FFTs
+on every column with dead rows read as zero, and stores each plane once,
+coalesced. HBM traffic is one read of the cylinder and one write of the
+plane.
+
+The kernel is latency-bound, not bandwidth-bound (A100, ncu: one HBM pass at
+36–40 % of peak, 25 % of warps active, long-scoreboard and barrier stalls
+co-dominant). So when a `(rows, n_c)` staging block per plane also fits the
+opt-in budget, the next group's cells are gathered asynchronously
+(`src/ffi/cpp/common/lrx_async_gather.h`, cp.async, sm_80+) while the
+current group's passes run, and the first row pass reads them from the
+staging block. This gives 1.11–1.37× at 25²–80² on A100. The table stays a run-time
+argument. Its row count is compiled in, so every index divisor is a constant
+(one image per door, like the shape key before it; a cold build is about
+6.6 s).
 
 Every line FFT is a cuFFTDx thread FFT (`n ≤ 40`). An axis `n = n1·n2` with
 `gcd(n1, n2) = 1` runs as the Good–Thomas two-dimensional DFT: the input sits
