@@ -15,8 +15,8 @@ an immutable copy of the scalar or per-parent bounds. The returned callable
 has no bounds array among its runtime operands, but retains the same
 alpha/beta, C/out, weighting, shape and sharding contract as `active_range`.
 
-`low_mem_bands=true` selects distributed face operands; `false` selects
-local axis products with replicated bands. Both production tau paths derive
+Face operands take distributed products; band-complete (axis) operands,
+gathered copies with every band on every rank, take local products. Both production tau paths derive
 exact per-parent support intervals after applying energy windows and selector
 weights. There is no numerical threshold. Interior holes still incur arithmetic
 within their enclosing interval. The separate `linalg` profile controls

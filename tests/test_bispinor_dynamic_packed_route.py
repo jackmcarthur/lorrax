@@ -28,7 +28,6 @@ bispinor = true
 bispinor_gw = bare_transverse
 sys_dim = 2
 qp_solver = one_shot_dft
-low_mem_bands = true
 linalg = distributed
 restart = false
 head_correction = full

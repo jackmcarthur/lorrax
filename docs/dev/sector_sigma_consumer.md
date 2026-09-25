@@ -42,9 +42,9 @@ unfolds it once to full q. The current map retains only those transformed
 factors and replicated squared poles until that sector's frequency integration
 finishes. CC/TT each read two orientations from one store; CT/TC each read
 left-X and right-Y from their separate stores and compare pole arrays. The
-configured `low_mem_bands` layout fixes both factor and Green placement: face
-layout distributes centroid and pole axes, while axis layout replicates the
-pole axis and distributes each centroid endpoint over its own axis. The face
+W factors sit on faces (centroid and pole axes distributed) or, when the
+capacity ledger admits the replicated pole columns, in the axis orientation
+(pole axis replicated, each centroid endpoint over its own mesh axis). The face
 Green's narrow band contraction uses bounded panels; W(t) still uses its
 planned factor GEMM. Both form one all-P W(t) rectangle at a time. No W(t)
 history or state/pole-pair sum is retained. Setup routing, resident factors, and compiled

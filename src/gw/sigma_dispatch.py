@@ -52,7 +52,7 @@ from runtime.padding import PaddedAxis
 from .gw_config import (
     BRACKET_SCHEME_DEFAULT, ComputeMode, SigmaChannel,
     band_extrapolation_is_consumable,
-    mode_builds_channels, refuse_explicit_gij_under_low_mem_bands,
+    mode_builds_channels, refuse_explicit_gij,
     refuse_unimplemented_compute_mode,
     packed_photon_replaces_charge_sigma, sigma_stage_modes,
     uses_dynamic_packed_photon_route, uses_static_photon_response)
@@ -832,7 +832,7 @@ def _validate_sigma_stage(
         Gij, config, mode, print_fn):
     """Validate the Sigma stage; see docs/architecture/four_current_wiring.md."""
     refuse_unimplemented_compute_mode(mode, context="compute_sigma_xc")
-    refuse_explicit_gij_under_low_mem_bands(config, Gij)
+    refuse_explicit_gij(Gij)
     validate_band_extrapolation(config, mode, print_fn=print_fn)
 
 

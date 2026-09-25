@@ -15,7 +15,7 @@ impossible).  The output leaves the chain already block-sharded
 as a rank-local shard between the two collectives.
 
 That is the ``layout="legacy"`` (default) body, byte-identical to the
-code this module shipped before ``low_mem_bands`` existed.
+code this module shipped before the face carrier existed.
 ``layout="face"`` (the two-face carrier, ``gw.wavefunction_bundle``)
 solves the SAME projection with a completely different mechanism — two
 planned ``distrib_la.gemm_plan`` N,N GEMMs, no shard_map, no
@@ -29,7 +29,6 @@ replicated going in, sharded only at the output).  See
 dispatch — see this module's :func:`_face_project_kernel` for the
 mechanism.
 
-Current GW also passes ``layout="axis"`` for ``low_mem_bands=false``.
 Face uses the planned two-GEMM projection below (the distributed native
 provider).  Axis operands already carry every band, so each rank holds a
 whole ``(μ_x, ν_y)`` slab of the contraction: :func:`_axis_project_kernel`
@@ -563,12 +562,13 @@ def contract_bands_block_reshard(
         Mesh axis names ``(ax_x, ax_y)``; ax_x shards μ/m, ax_y shards
         ν/n.  Default matches every production mesh.
     layout
-        ``"axis"``: current ``low_mem_bands=false`` carrier. Uses the same
+        ``"axis"``: band-complete operands (every band on every rank, the
+        centroid axis on one mesh axis). Uses the same
         planned projection as face; the service selects local GEMMs and
         centroid reduce-scatter. Requires ``face_shape`` and ``extra="none"``.
         ``"legacy"`` (default): the shard_map + psum_scatter body below,
-        BYTE-IDENTICAL to the code this module shipped before
-        ``low_mem_bands`` existed.
+        BYTE-IDENTICAL to the code this module shipped before the
+        face carrier existed.
         ``"face"``: the two-face carrier's ``psi_nmu``/``psi_mun``
         operands (``gw.wavefunction_bundle``) — a completely different
         mechanism (two planned ``distrib_la.gemm_plan`` N,N GEMMs, no

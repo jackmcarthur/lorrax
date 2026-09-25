@@ -825,12 +825,12 @@ def _transverse_wfn_data(wfn, sym, meta_T, cent_T_idx, cfg, mesh_xy,
 				k_chunk_size=k_chunk_size, bispinor_lift=representation.current_lift,
 				k_domain=sym.parent_k_domain)
 	nmu, mun = parent_faces(psi_y, psi_x, mesh_xy=mesh_xy,
-	                         layout="face" if cfg.memory.low_mem_bands else "axis")
+	                         layout="face")
 	psi_y = psi_x = None
 	enk, _ = get_enk_bandrange(wfn, sym, band_slices.full_range,
 	                         (band_slices.b1, band_slices.b3), nspinor=4)
 	wfns = wavefunctions_face_from_restart(
-		None, None, layout="face" if cfg.memory.low_mem_bands else "axis",
+		None, None, layout="face",
 		enk_full=enk, slices=band_slices, mesh_xy=mesh_xy)
 	carrier = build_packed_parent_green_carrier(
 		wfns, nmu, mun, plan=plan, mesh_xy=mesh_xy)
@@ -1606,8 +1606,7 @@ def _plan_route_g_for_channel(
 	p_x, p_y = int(mesh_xy.shape['x']), int(mesh_xy.shape['y'])
 	mu = int(getattr(meta, "n_rmu_padded", None) or meta.n_rmu)
 	psi_face_bytes = 16.0 * int(n_parent) * int(meta.nspinor) * mu * int(
-		band_slices.b4 - band_slices.b0) * (
-		2.0 / (p_x * p_y) if mem.low_mem_bands else 1.0 / p_x + 1.0 / p_y)
+		band_slices.b4 - band_slices.b0) * 2.0 / (p_x * p_y)
 	_tier = _resolve_zeta_gather(
 		str(cfg.backend.distributed_zeta_solve),
 		n_rmu=int(meta.n_rmu_padded), nq=n_q_selected, mesh_xy=mesh_xy)
@@ -1813,7 +1812,7 @@ def _fit_charge_zeta_channel(
                 zeta_rcond=cfg.backend.zeta_rcond,
                 write_ibz_only=_write_ibz_only_charge,
                 zeta_cutoff_ry=_zeta_cutoff,
-                layout="face" if cfg.memory.low_mem_bands else "axis",
+                layout="face",
                 print_fn=print_fn,
                 bispinor_lift=(representation.charge_lift or "raw"),
                 k_unfold_plan=k_unfold_plan,
@@ -1967,7 +1966,7 @@ def _fit_transverse_zeta_channels(
             bispinor_lift=(representation.current_lift or "raw"),
             write_ibz_only=_write_ibz_only_transverse,
             zeta_cutoff_ry=_zeta_cutoff,
-            layout="face" if cfg.memory.low_mem_bands else "axis",
+            layout="face",
             mubatch_plan=_chunks_T['mubatch'], parent_psi=parent_psi,
             write_zeta_file=write_T, print_fn=print_fn)
     del parent_psi
@@ -2544,7 +2543,7 @@ def _prepare_fresh_parent_faces(
     			k_domain=sym.parent_k_domain)
     from .wavefunction_bundle import parent_faces
     _parent_green_faces = parent_faces(parent_y, parent_x, mesh_xy=mesh_xy,
-        layout="face" if cfg.memory.low_mem_bands else "axis")
+        layout="face")
     del parent_y, parent_x
     print0("  ψ storage: parents only -- "
            f"{_candidate_plan.n_parent} raw WFN parents, "
@@ -2610,7 +2609,7 @@ def _prepare_fresh_carriers(
     	(band_slices.b1, band_slices.b3), nspinor=meta.nspinor)
     with timing.section("gw_jax.wavefunction_setup"):
     	wfns = wavefunctions_face_from_restart(
-    		None, None, layout="face" if cfg.memory.low_mem_bands else "axis", enk_full=_enk_full_face,
+    		None, None, layout="face", enk_full=_enk_full_face,
     		slices=band_slices, mesh_xy=mesh_xy,
     		basis_receipt=charge_basis_receipt)
     from .wavefunction_bundle import (
@@ -2636,7 +2635,7 @@ def _prepare_fresh_carriers(
     	parent_T = transverse_wfn_data['green_parent']
     	with timing.section("gw_jax.wavefunction_setup"):
     		wfns_transverse = wavefunctions_face_from_restart(
-    			None, None, layout="face" if cfg.memory.low_mem_bands else "axis",
+    			None, None, layout="face",
     			enk_full=_enk_full_face,
     			slices=band_slices, mesh_xy=mesh_xy,
     			basis_receipt=transverse_basis_receipt)
@@ -2647,8 +2646,7 @@ def _prepare_fresh_carriers(
     			wfns_transverse, where="fresh current parent faces")
     	print0(f"  [bispinor] σ^B-side Wfns built on "
     	       f"n_rmu_T={transverse_wfn_data['meta'].n_rmu} "
-    	       f"transverse centroids (face layout; "
-    	       f"low_mem_bands=true)")
+    	       f"transverse centroids (face layout)")
     basis_T = (None if transverse_wfn_data is None
                else transverse_wfn_data["meta"].mu_basis)
     return (wfns, wfns_transverse, sigma_parent_carrier, green_parent_carrier, basis_T)
@@ -2805,8 +2803,7 @@ def _read_authenticated_restart(
     """Produce the validated stored tensors and their charge zeta identity."""
     rs = load_restart_state_from_h5(
     	tensors_filename, mesh_xy, band_slices=band_slices,
-    	n_rmu_logical=int(meta.n_rmu),
-    	low_mem_bands=cfg.memory.low_mem_bands)
+    	n_rmu_logical=int(meta.n_rmu))
     charge_zeta_identity_receipt = rs.charge_zeta_identity
     V_qmunu = _to_run_order(rs.V_qmunu, (-2, -1))
     print0("  Loaded restart tensors from H5.")
@@ -3167,17 +3164,16 @@ def prepare_isdf_and_wavefunctions(
 	        sym, tensors_filename, tmp_dir, transverse_basis_receipt, wfn)
 	if green_parent_carrier is not None:
 		wfns = replace(wfns, green_parent=green_parent_carrier)
-	if cfg.memory.low_mem_bands:
-		from .wavefunction_bundle import band_complete_gw_carriers
-		_face_carrier = green_parent_carrier
-		wfns, wfns_transverse = band_complete_gw_carriers(
-			(wfns, wfns_transverse), budget_bytes=float(cfg.memory.per_device_gb) * 1e9,
-			print_fn=print0)
-		if green_parent_carrier is not None:
-			green_parent_carrier = wfns.green_parent
-		if sigma_parent_carrier is _face_carrier and _face_carrier is not None:
-			sigma_parent_carrier = wfns.green_parent
-		del _face_carrier
+	from .wavefunction_bundle import band_complete_gw_carriers
+	_face_carrier = green_parent_carrier
+	wfns, wfns_transverse = band_complete_gw_carriers(
+		(wfns, wfns_transverse), budget_bytes=float(cfg.memory.per_device_gb) * 1e9,
+		print_fn=print0)
+	if green_parent_carrier is not None:
+		green_parent_carrier = wfns.green_parent
+	if sigma_parent_carrier is _face_carrier and _face_carrier is not None:
+		sigma_parent_carrier = wfns.green_parent
+	del _face_carrier
 	for family, bundle in (("charge", wfns), ("current", wfns_transverse)):
 		if bundle is None or bundle.green_parent is None:
 			continue

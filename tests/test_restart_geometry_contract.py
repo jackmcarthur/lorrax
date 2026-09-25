@@ -331,7 +331,9 @@ def test_noncanonical_padded_axis_receipt_refuses_before_slab_read(
 
 @pytest.mark.parametrize("layout", ["face", "axis"])
 def test_four_spinor_parent_families_round_trip(tmp_path, host_transport, layout):
-    """Charge and current parent faces retain their distinct logical centroid axes."""
+    """Charge and current parent faces retain their distinct logical centroid axes.
+
+    The writer records the layout it held; the reader always returns faces."""
     path = str(tmp_path / "parent_families.h5")
     charge = np.arange(2 * 4 * 4 * 8).reshape(2, 4, 4, 8).astype(complex)
     current = (3j + np.arange(2 * 4 * 4 * 6)).reshape(2, 4, 4, 6)
@@ -343,27 +345,25 @@ def test_four_spinor_parent_families_round_trip(tmp_path, host_transport, layout
         psi_parent_y_transverse_mun=current.transpose(0, 2, 3, 1),
         parent_k_rows=np.array([0, 3]), mesh=_mesh_product(1), mode="w")
     canonicalize_fixture(path)
-    result = restart_bundle.read_restart_state_from_h5(
-        path, _mesh_product(1), low_mem_bands=layout == "face")
+    result = restart_bundle.read_restart_state_from_h5(path, _mesh_product(1))
     from gw.wavefunction_bundle import ParentGreenCarrier
     with h5py.File(path) as f:
         assert f["psi_parent_y"].attrs["psi_layout"] == layout
         assert f["psi_parent_y_transverse"].attrs["psi_layout"] == layout
     carrier = ParentGreenCarrier(result.psi_nmu_parent, result.psi_mun_parent, np.zeros((2, 4)),
-                                 np.ones((2, 4)), object(), layout=layout)
+                                 np.ones((2, 4)), object(), layout="face")
     leaves, tree = jax.tree_util.tree_flatten(carrier)
-    assert jax.tree_util.tree_unflatten(tree, leaves).layout == layout
+    assert jax.tree_util.tree_unflatten(tree, leaves).layout == "face"
     np.testing.assert_array_equal(result.psi_nmu_parent, charge)
     np.testing.assert_array_equal(result.psi_mun_parent, charge.transpose(0, 2, 3, 1))
     np.testing.assert_array_equal(result.psi_nmu_parent_transverse, current)
     np.testing.assert_array_equal(result.psi_mun_parent_transverse, current.transpose(0, 2, 3, 1))
-    assert result.layout == layout
+    assert result.layout == "face"
     assert not hasattr(result, "psi_full_y")
     assert not hasattr(result, "psi_full_y_transverse")
     with h5py.File(path, "r+") as f:
         del f["psi_parent_y_transverse_mun"]
     opens_before = len(host_transport.opens)
     with pytest.raises(ValueError, match="torn transverse parent faces"):
-        restart_bundle.read_restart_state_from_h5(
-            path, _mesh_product(1), low_mem_bands=True)
+        restart_bundle.read_restart_state_from_h5(path, _mesh_product(1))
     assert len(host_transport.opens) == opens_before

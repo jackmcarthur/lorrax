@@ -6,9 +6,8 @@ import pytest
 from file_io.restart_bundle import read_restart_state_from_h5
 
 
-@pytest.mark.parametrize("low_mem_bands", [False, True])
 @pytest.mark.parametrize("missing", ["psi_parent_y_transverse", "psi_parent_y_transverse_mun"])
-def test_torn_current_faces_refuse_both_layouts(tmp_path, low_mem_bands, missing):
+def test_torn_current_faces_refuse(tmp_path, missing):
     path = tmp_path / "torn.h5"
     with h5py.File(path, "w") as f:
         f["psi_parent_y"] = np.zeros((1, 2, 4, 4), complex)
@@ -23,4 +22,4 @@ def test_torn_current_faces_refuse_both_layouts(tmp_path, low_mem_bands, missing
             if name != missing:
                 f[name] = np.zeros(shape, complex)
     with pytest.raises(ValueError, match="torn transverse parent faces"):
-        read_restart_state_from_h5(path, None, low_mem_bands=low_mem_bands)
+        read_restart_state_from_h5(path, None)
