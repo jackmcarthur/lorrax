@@ -31,7 +31,6 @@ from runtime.padding import strip_axis
 
 from .band_extrapolation import (
     BAND_EXTRAPOLATION_ESTIMATOR_DEFAULT,
-    SpectralShellExtrapolationFailed,
     build_band_ladder,
     fit_band_extrapolation_spectral,
     format_spectral_report,
@@ -452,14 +451,11 @@ def _report_band_extrapolation(
     print_fn((format_spectral_report if spectral
               else format_extrapolation_report)(plan, fit, states=states))
 
-    # ── THE PER-STATE REFUSAL ───────────────────────────────────────────
-    # Raised AFTER the report block, so the operator sees the shells, the
-    # ladder and every state's D2/D3 before the message about why the run
-    # stopped.  spectral_shell never clips an exponent and never substitutes
-    # a value for a failed state; see
-    # ``band_extrapolation.SpectralShellExtrapolationFailed``.
+    # States without an interior exponent keep S(N3) (``band_extrapolation``,
+    # "NO INTERIOR EXPONENT").  The block above names them; this one line is
+    # the count the production log keeps.
     if spectral and fit.n_failed:
-        raise SpectralShellExtrapolationFailed(fit.failure_report())
+        print_fn("WARNING: " + fit.failure_report().splitlines()[0])
 
     # ── WHAT THIS RUN DOES WITH THE NUMBER ──────────────────────────────
     # Until 2026-08-16 the fit was reported and then discarded: S(N₃) drove

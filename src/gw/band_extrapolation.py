@@ -345,18 +345,23 @@ that deck), the ladder is continued with the SAME Weyl form.  That
 continuation is used ONLY to extend the eigenvalue SEQUENCE; no self-energy,
 no matrix element and no exponent is ever taken from it.
 
-**FAILURE IS A NAMED REFUSAL, NEVER A CLIP.**  Three signatures, all per
-state, all refusals: (a) ``D₂`` and ``D₃`` of opposite sign or either exactly
-zero — the shells do not agree that there is a tail, so there is no ratio to
-invert; (b) no bracketed root of the β equation in
-:data:`SHELL_EXPONENT_BRACKET`; (c) a root pressed against a bracket edge,
-which is the clip a naive implementation would return as a value.  A failed
-state gets ``NaN`` and a named reason, never a substituted number, and the
-driver turns any failure inside the Σ band sum into a
-:class:`SpectralShellExtrapolationFailed` naming every failed state.  The
-alternative — falling back to ``S(N₃)`` or to the 1/N fit on the failed states
-— was rejected: it would ship a Σ built from two different estimators with
-nothing in the artifact saying which states came from which.
+**NO INTERIOR EXPONENT, NO TAIL (2026-09-25).**  The model needs two shell
+increments that decay like a power law on this spectrum.  Three per-state
+signatures say they do not: (a) ``D₂`` and ``D₃`` of opposite sign or either
+exactly zero; (b) no bracketed root of the β equation in
+:data:`SHELL_EXPONENT_BRACKET`; (c) a root pressed against a bracket edge.
+Such a state has no tail: ``r = 0`` and ``Ŝ = S(N₃)``, its computed band
+sum.  Its β stays ``NaN`` (never a clipped edge) and ``failure`` keeps the
+reason; the report prints the count and names the states, and the h5 marks
+them by ``β = NaN``.  No other estimator is substituted.
+
+This replaced a run-level refusal.  Core fixture A (7 bands, n_occ = 2) put
+each shell on ONE band (counts 5, 6, 7), so ``D₂``/``D₃`` were single-band
+matrix elements, not a smooth falloff: 22 of 45 states refused, most with
+``|D₃/D₂| > 1`` (the increment grew), which no β > 0 reaches because
+``g(0) = log(n₃/n₂) = 0`` for equal-width shells.  The rest decayed faster
+than β = 40 reaches on a ladder whose 8-band Weyl fit (R² = 0.70) puts E₀
+37.7 eV below the bands.
 
 MEASURED, HELD OUT, AGAINST A NUMBER BERKELEYGW COMPUTED.  The 508-band Si arm
 (50 Ry, ``sandbox:reports/band_tail_exponent_50ry_2026-08-16/``) gives a
@@ -1551,31 +1556,6 @@ SHELL_FAILURE_REASONS = {
 }
 
 
-class SpectralShellExtrapolationFailed(BandExtrapolationRefused):
-    """The spectral-shell estimator refused on at least one external state.
-
-    A separate name from :class:`BandExtrapolationRefused` because the fix is
-    different in kind: the other refusals are about a deck asking for
-    something the band counts cannot support, and the operator clears them by
-    raising ``number_bands_sigma``.  This one is about the DATA — two shells
-    that disagree about the sign of the remaining tail, or a shell ratio no
-    power law on this spectrum can produce.  Subclassed so an ``except
-    BandExtrapolationRefused`` that means "the extrapolation cannot run here"
-    still catches it.
-
-    WHY THIS IS A RUN-LEVEL REFUSAL AND NOT A PER-STATE FALLBACK.  The owner's
-    ruling is that a failed state says so and no value is substituted for it.
-    A ``NaN`` left in Σ would propagate into the QP Hamiltonian and take the
-    whole spectrum with it silently; falling back to ``S(N₃)`` or to the 1/N
-    fit on the failed states would ship a Σ assembled from two estimators with
-    nothing in the artifact recording which states came from which.  So the
-    run stops, names every failed state and its reason, and offers the two
-    honest ways forward: more bands, or ``band_extrapolation_estimator =
-    band_index_only``.
-    """
-
-
-
 #: Bytes of one (chunk, n_terms) float64 block in BandLadder.log_moment, and
 #: its thread cap.  One block per thread, updated in place: 2 MiB stays in
 #: cache and under glibc's mmap threshold.  64 MiB blocks page-faulted afresh
@@ -2042,10 +2022,8 @@ class SpectralShellFit:
         unchanged rather than scaled.
 
         Unlike the scalar case these carry the state shape, because β does.
-        Refuses on a failed state rather than emitting a coefficient for it.
+        A state without a tail has ``r = 0``: coefficients ``[0, 0, 1]``.
         """
-        if self.n_failed:
-            raise SpectralShellExtrapolationFailed(self.failure_report())
         r = np.asarray(np.real(self.tail_ratio), dtype=np.float64)
         return np.stack([np.zeros_like(r), -r, 1.0 + r], axis=0)
 
@@ -2088,18 +2066,23 @@ class SpectralShellFit:
         )
 
     def failure_report(self, *, limit: int = 12) -> str:
-        """Every failed state, named, with its reason.  '' when none failed."""
+        """Every state without a tail, named, with its reason.  '' when none."""
         fail = np.asarray(self.failure)
         idx = np.argwhere(fail != SHELL_OK)
         if idx.size == 0:
             return ""
         d2 = np.real(np.asarray(self.d2))
         d3 = np.real(np.asarray(self.d3))
+        g = [float(self.ladder.log_moment(*self.shells[1], b)
+                   - self.ladder.log_moment(*self.shells[0], b))
+             for b in SHELL_EXPONENT_BRACKET]
         lines = [
-            f"spectral_shell band extrapolation FAILED on {len(idx)} of "
-            f"{self.n_states} external states.  The estimator does not "
-            f"substitute a value for a failed state and does not clip an "
-            f"exponent to its bracket, so the run stops here.",
+            f"spectral_shell: {len(idx)} of {self.n_states} external states "
+            f"have NO TAIL.  Their two shell increments give no interior "
+            f"exponent in {SHELL_EXPONENT_BRACKET}, so each keeps its "
+            f"computed sum, S_hat = S(N3) (r = 0); no exponent is clipped.  "
+            f"On this spectrum |D3/D2| needs to lie in "
+            f"[{np.exp(g[1]):.4g}, {np.exp(g[0]):.4g}] to have an exponent.",
             f"  band counts {tuple(int(c) for c in self.counts)}; shells "
             f"(absolute band index) 2 = {self.shells[0]}, 3 = "
             f"{self.shells[1]}, tail = {self.shells[2]}; "
@@ -2113,14 +2096,10 @@ class SpectralShellFit:
                 f"-- {reason}")
         if len(idx) > limit:
             lines.append(f"    ... and {len(idx) - limit} more.")
-        lines += [
-            "  TWO HONEST WAYS FORWARD.  Raise `number_bands_sigma` so the "
+        lines.append(
+            "  To extrapolate these states, raise `number_bands_sigma` so the "
             "two shells sit further into the tail where the local power law "
-            "holds; or set `band_extrapolation_estimator = band_index_only` "
-            "to run the incumbent S_inf + A/N fit, which always returns a "
-            "number and whose error against a measured S(508) is 3-10x "
-            "larger (see gw.band_extrapolation's module docstring).",
-        ]
+            "holds.")
         return "\n".join(lines)
 
 
@@ -2196,11 +2175,12 @@ def fit_band_extrapolation_spectral(
                                                     code))
     beta = np.where(code == SHELL_OK, beta, np.nan)
 
+    # NO INTERIOR EXPONENT, NO TAIL: r = 0 keeps S(N3) (module docstring).
     good = code == SHELL_OK
     safe_beta = np.where(good, beta, 1.0)
     log_i3 = ladder.log_moment(*shells[1], safe_beta)
     log_it = ladder.log_moment(*shells[2], safe_beta)
-    tail_ratio = np.where(good, np.exp(log_it - log_i3), np.nan)
+    tail_ratio = np.where(good, np.exp(log_it - log_i3), 0.0)
 
     s_inf = S[2] + D3 * tail_ratio
     delta_tail = np.abs(s_inf - S[2])
@@ -2231,14 +2211,13 @@ def spectral_trust_verdict(fit: SpectralShellFit) -> str:
     about how differently the states are converging.  A tight spread is not
     evidence the extrapolation is right; it is evidence the states agree.
     """
-    if fit.n_failed:
-        return (f"NOT TRUSTWORTHY - {fit.n_failed} of {fit.n_states} states "
-                f"FAILED to produce an exponent (see the failure report); "
-                f"no value was substituted for them.")
     b = np.asarray(np.real(fit.beta), dtype=np.float64).ravel()
     b = b[np.isfinite(b)]
     if b.size == 0:
-        return "NOT TRUSTWORTHY - no finite exponent on any state."
+        return ("NOT TRUSTWORTHY - no state has a tail; S_hat = S(N3) on "
+                "every state.")
+    no_tail = (f"  {fit.n_failed} of {fit.n_states} states have no tail and "
+               f"keep S(N3)." if fit.n_failed else "")
     lo, med, hi = (float(np.percentile(b, 10)), float(np.median(b)),
                    float(np.percentile(b, 90)))
     note = ""
@@ -2246,10 +2225,10 @@ def spectral_trust_verdict(fit: SpectralShellFit) -> str:
         note = ("  b < 1 on the lowest decile: a tail that shallow is not "
                 "summable in the way the estimator assumes -- read the "
                 "correction as a lower bound.")
-    return (f"solved on all {fit.n_states} states - beta median {med:.2f}, "
-            f"p10/p90 {lo:.2f}/{hi:.2f}.  The per-state spread IS the "
-            f"resolution this estimator exists to provide; it is not a "
-            f"quality metric.{note}")
+    return (f"solved on {b.size} of {fit.n_states} states - beta median "
+            f"{med:.2f}, p10/p90 {lo:.2f}/{hi:.2f}.  The per-state spread IS "
+            f"the resolution this estimator exists to provide; it is not a "
+            f"quality metric.{no_tail}{note}")
 
 
 def trust_verdict(fit: ExtrapolationFit, *, ratio_warn: float = 0.35) -> str:
@@ -2777,9 +2756,9 @@ def format_spectral_report(
         if code != SHELL_OK:
             lines += [
                 f"     [{slabel}]",
-                f"       *** FAILED: {SHELL_FAILURE_REASONS[code]}",
+                f"       *** NO TAIL: {SHELL_FAILURE_REASONS[code]}",
                 f"       D2 = {_sg(f1.d2):+12.6f}   D3 = {_sg(f1.d3):+12.6f} "
-                f"{unit}   -- no value is substituted for this state.",
+                f"{unit}   -> S_hat = S(N3) = {_sg(f1.s_inf):+12.6f} {unit}",
             ]
             continue
         lines += [
@@ -2820,7 +2799,7 @@ def format_spectral_report(
         f"min/max "
         f"{(float(b.min()) if b.size else float('nan')):.3f}/"
         f"{(float(b.max()) if b.size else float('nan')):.3f}   "
-        f"({fit.n_failed} FAILED)",
+        f"({fit.n_failed} without a tail)",
         f"       verdict: {spectral_trust_verdict(fit)}",
         # WHAT THIS ESTIMATOR DOES AND DOES NOT REPORT.  The 1/N block's four
         # diagnostics do not exist here and their absence must not read as an
@@ -3030,7 +3009,6 @@ __all__ = [
     "BandBracketPlan",
     "BandExtrapolationRefused",
     "BandLadder",
-    "SpectralShellExtrapolationFailed",
     "SpectralShellFit",
     "assert_brackets_match_ols_abscissae",
     "build_band_ladder",

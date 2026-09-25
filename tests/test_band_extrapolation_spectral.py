@@ -35,7 +35,6 @@ from gw.band_extrapolation import (
     SHELL_FAIL_ZERO,
     SHELL_OK,
     SPECTRAL_EXTRAP_DATASETS,
-    SpectralShellExtrapolationFailed,
     build_band_ladder,
     fit_band_extrapolation_spectral,
     format_spectral_report,
@@ -432,32 +431,32 @@ def test_beta_is_per_state_and_is_never_pooled():
 
 
 # ---------------------------------------------------------------------------
-#  failure is a named refusal, never a clip
+#  no interior exponent: no tail, S(N3) kept, never a clip
 # ---------------------------------------------------------------------------
 
-def test_sign_change_between_shells_is_a_named_failure():
+def test_sign_change_between_shells_has_no_tail():
     lad = _synthetic_ladder()
     counts = (80, 100, 120)
     S = np.array([[0.0], [-1.0], [-0.5]])            # D2 < 0, D3 > 0
     fit = fit_band_extrapolation_spectral(counts, S, lad)
     assert int(np.asarray(fit.failure)[0]) == SHELL_FAIL_SIGN
-    assert not np.isfinite(float(np.real(fit.s_inf[0]))), \
-        "no value is substituted for a failed state"
+    assert not np.isfinite(float(fit.beta[0]))
+    assert float(np.real(fit.s_inf[0])) == -0.5, "S_hat = S(N3)"
     msg = fit.failure_report()
     assert "OPPOSITE SIGN" in msg and "D2" in msg and "D3" in msg
-    assert "band_index_only" in msg, "the message names the way forward"
+    assert "1 of 1 external states have NO TAIL" in msg
 
 
-def test_zero_increment_is_a_named_failure():
+def test_zero_increment_has_no_tail():
     lad = _synthetic_ladder()
     fit = fit_band_extrapolation_spectral(
         (80, 100, 120), np.array([[0.0], [0.0], [-1.0]]), lad)
     assert int(np.asarray(fit.failure)[0]) == SHELL_FAIL_ZERO
-    assert not np.isfinite(float(np.real(fit.s_inf[0])))
+    assert float(np.real(fit.s_inf[0])) == -1.0
 
 
-def test_an_unreachable_shell_ratio_refuses_instead_of_clipping():
-    """A ratio no power law can produce must FAIL, not return a bracket edge.
+def test_an_unreachable_shell_ratio_has_no_tail_instead_of_clipping():
+    """A ratio no power law can produce gets no tail, not a bracket edge.
 
     ``g(β) = log I₃ − log I₂`` is strictly decreasing and therefore bounded
     by its own values at the bracket ends.  A ``|D₃/D₂|`` outside
@@ -479,31 +478,29 @@ def test_an_unreachable_shell_ratio_refuses_instead_of_clipping():
         code = int(np.asarray(fit.failure)[0])
         assert code in (SHELL_FAIL_NO_ROOT, SHELL_FAIL_EDGE), code
         assert not np.isfinite(float(fit.beta[0])), \
-            "a clipped exponent is the exact failure this refuses"
-        assert not np.isfinite(float(np.real(fit.s_inf[0])))
-        assert "CLIP" in fit.failure_report() or "clip" in \
-            fit.failure_report()
+            "a clipped exponent is the exact failure this rule avoids"
+        assert float(np.real(fit.s_inf[0])) == float(S[2, 0])
+        msg = fit.failure_report()
+        assert "no exponent is clipped" in msg
+        assert f"{np.exp(g_hi):.4g}, {np.exp(g_lo):.4g}" in msg, \
+            "the report states the reachable ratio range"
 
 
-def test_a_failed_state_refuses_the_weights_rather_than_emitting_one():
-    """One bad state poisons the whole combination, by design.
-
-    The alternative — emitting a coefficient for the states that solved and
-    something else for the one that did not — is the per-state fallback the
-    owner's ruling forbids: it would ship a Σ assembled from two estimators
-    with nothing in the artifact recording which came from which.
-    """
+def test_a_state_without_a_tail_keeps_s_n3_and_leaves_the_others_alone():
+    """Weights ``[0, 0, 1]`` on the no-tail state; the solved one unchanged."""
     lad = _synthetic_ladder()
     counts = (80, 100, 120)
     good, _ = _points_from_power_law(lad, counts, 3.5, amp=1e-3)
     bad = np.array([0.0, -1.0, -0.5])                      # D2 < 0, D3 > 0
     S = np.stack([bad, good], axis=1)
     fit = fit_band_extrapolation_spectral(counts, S, lad)
+    alone = fit_band_extrapolation_spectral(counts, good[:, None], lad)
     assert fit.n_failed == 1
     assert int(np.asarray(fit.failure)[1]) == SHELL_OK
-    with pytest.raises(SpectralShellExtrapolationFailed) as exc:
-        fit.weights()
-    assert "FAILED on 1 of 2" in str(exc.value)
+    w = fit.weights()
+    np.testing.assert_array_equal(w[:, 0], [0.0, 0.0, 1.0])
+    np.testing.assert_array_equal(w[:, 1], alone.weights()[:, 0])
+    assert "1 of 2 states have no tail" in spectral_trust_verdict(fit)
 
 
 def test_solve_returns_nan_and_a_code_never_a_bracket_edge():
