@@ -87,11 +87,15 @@ from common.fft_helpers import local_fftn3, local_ifftn3
 # third entry bounds K/N.  Measured on A100 (``runs/runtime/
 # f3_fft_adoption_20260925/sweep_support_fraction.out``: 2-D and 3-D, N 24–128,
 # in and out supports), the GEMM wins 1.08–2.8× at every K/N ≤ 0.54 except 2-D
-# out-support at N = 24 (0.78–0.93×).  The first loss above 0.54 is at N = 128,
-# K/N = 0.55 (out-support, 0.74–0.83×).  The bound 0.54 keeps Fe's 13/25 union
-# box.  A row without a third entry puts no bound on K/N.
+# out-support at small N.  The first loss above 0.54 is at N = 128, K/N = 0.55
+# (out-support, 0.74–0.83×).  The bound 0.54 keeps Fe's 13/25 union box.
+# The fourth entry is the supported-axis N range of a plan over one or two
+# axes.  2-D out-supports lose at N 16–30 (0.60–0.97×; N = 27 wins 1.08–1.14×)
+# and win from N = 32 (``sweep_small_n.out``).  3-D supports and 2-D
+# in-supports win from N = 16/20 and keep the third entry's range.
+# Missing entries mean no K/N bound and the same range.
 GEMM_CROSSOVER: dict[str, tuple] = {
-    "NVIDIA A100": (range(0), range(16, 129), 0.54),
+    "NVIDIA A100": (range(0), range(16, 129), 0.54, range(32, 129)),
 }
 
 _NORMS = (None, "backward", "ortho", "forward")
@@ -120,12 +124,13 @@ def dft_matrix(n: int, out_idx, in_idx, *, sign: int, scale: float = 1.0,
     return (scale * a).astype(dtype)
 
 
-def gemm_crossover(device_kind: str) -> tuple[range, range, float]:
-    """``(full-axis N range, supported-axis N range, max supported K/N)`` taking the GEMM."""
-    for prefix, row in GEMM_CROSSOVER.items():
-        if device_kind.startswith(prefix):
-            return (*row, 1.0)[:3]
-    return range(0), range(0), 1.0
+def gemm_crossover(device_kind: str) -> tuple[range, range, float, range]:
+    """``(full-axis N range, supported-axis N range, max supported n_in·n_out/N²,
+    supported-axis N range of a 1- or 2-axis plan)`` taking the GEMM."""
+    row = next((r for p, r in GEMM_CROSSOVER.items() if device_kind.startswith(p)),
+               (range(0), range(0)))
+    return (row[0], row[1], row[2] if len(row) > 2 else 1.0,
+            row[3] if len(row) > 3 else row[1])
 
 
 def _default_leg():
@@ -219,7 +224,9 @@ class LocalFourierPlan:
         if device_kind is None:
             device_kind = (mesh.devices.flat[0] if mesh is not None else jax.devices()[0]).device_kind
         self.device_kind = str(device_kind)
-        n_full, n_sup, kn_max = gemm_crossover(self.device_kind)
+        n_full, n_sup, kn_max, n_sup12 = gemm_crossover(self.device_kind)
+        if len(axes) < 3:
+            n_sup = n_sup12
 
         self.extents, self.axes, self.sign, self.norm = extents, axes, sign, norm
         gemm, fft, embed, take, self.stages = [], [], [], [], []
