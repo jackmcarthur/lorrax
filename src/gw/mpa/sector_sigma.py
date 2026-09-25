@@ -448,7 +448,7 @@ def instantaneous_sector_sigma(handle, families, bases, meta, mesh_xy, *,
     from file_io.shared_pole_store import read_bank_constant_header, read_bank_constant
     header=read_bank_constant_header(handle,mesh_xy=mesh_xy)
     raw_layout=PhotonBasisLayout.from_centroid_extents(bases[0].n_logical,bases[1].n_logical,mesh_xy)
-    layout=PhotonBasisLayout.from_centroid_extents(bases[0].n_packed,bases[1].n_packed,mesh_xy)
+    layout=PhotonBasisLayout.from_centroid_extents(bases[0].n_packed,bases[1].n_packed,mesh_xy,packed=True)
     nq=int(header['bank_shape']['nq'])
     amount=16*nq*max(raw_layout.packed_extent,layout.packed_extent)**2//mesh_xy.size
     meta.shared_pole_capacity.reserve('sigma.sector.constant.pack',
