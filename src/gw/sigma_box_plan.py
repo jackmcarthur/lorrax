@@ -62,7 +62,9 @@ _SC_ONE_SHOT_CALLS = 2
 #: Pad toward zero for a sign-definite SC window: 0.5 of its distance escaped by 1.6% on TaAs 8^3
 #: map 1 and 0.25 again at map 2 (semimetal valence state 30 -> 15 -> 6 meV from E_F); 0.05 floors it below 1 meV.
 _SC_ZERO_SIDE_CAP = 0.05
-_RULE_CACHE_SCHEMA = "sigma-box-ry-v4"
+#: v5: rules are built on outward-snapped boxes (_build_box); v4 entries were
+#: built on the raw request and are not served, so a warm cache equals a cold one.
+_RULE_CACHE_SCHEMA = "sigma-box-ry-v5"
 
 
 def _rule_digest(rule, noise_amplification):
@@ -492,13 +494,44 @@ def _rule_cache_store(directory, rule, noise_amplification):
     return None
 
 
-def _cache_build_box(box, eta):
-    """Widen only far edges so nearby SC iterations hit by containment."""
-    extra = 0.01 * max(box[1] - box[0], eta)
+#: Outward snapping of every build box on a logarithmic grid in units of
+#: eta: ratio 1 + step, far edges (|x| > 3 eta) on the coarse step.
+_BUILD_GRID_FAR, _BUILD_GRID_NEAR = 1.0e-2, 1.0e-3
+
+
+def _snap_outward(x, eta, step, outward):
+    """``x`` moved outward (``outward`` = +1 up, -1 down) to the nearest point
+    of ``sign(x) * eta * (1 + step)**k``, k integer; zero stays zero, and a
+    nonzero edge never changes sign, so a sign-definite box stays so."""
+    if x == 0.0:
+        return 0.0
+    k = np.log(abs(x) / eta) / np.log1p(step)
+    k = np.ceil(k) if outward * np.sign(x) > 0 else np.floor(k)
+    return float(np.sign(x) * eta * np.exp(k * np.log1p(step)))
+
+
+def _build_box(box, eta):
+    """The box a rule is built on: the request snapped outward to a grid.
+
+    The rule builder is a nonlinear fit, so a request moved by round-off
+    (the extreme shared-pole edges differ ~1e-9-4e-8 relative between two
+    exact GEMM orders) otherwise lands in a different certified solution:
+    every Fe 4^3 window rule differed between low_mem_bands true and false,
+    eqp1 by 0.32 meV (P2-E, 2026-09-24). On the grid a perturbed request
+    maps to the same build box, and so to the same rule bit for bit, unless
+    it straddles a cell edge (probability ~ perturbation / step). Far edges
+    use 1% cells, which also let nearby SC maps hit by containment; near
+    edges set the crossing rank and use 0.1% cells (a 3% all-edge widening
+    cost 67 pairs on Na).
+    """
     near = 3.0 * eta
-    lo = box[0] - extra if box[0] < -near else box[0]
-    hi = box[1] + extra if box[1] > near else box[1]
-    return (lo, hi, box[2], box[3] * 1.01)
+
+    def step(x):
+        return _BUILD_GRID_FAR if abs(x) > near else _BUILD_GRID_NEAR
+    lo = _snap_outward(box[0], eta, step(box[0]), -1)
+    hi = _snap_outward(box[1], eta, step(box[1]), +1)
+    return (lo, hi, _snap_outward(box[2], eta, _BUILD_GRID_NEAR, -1),
+            _snap_outward(box[3], eta, _BUILD_GRID_NEAR, +1))
 
 
 def _factor_references(kind, pole_sign, states, pole_stats):
@@ -533,7 +566,7 @@ def _noise_amplification_cap(eps):
     return _RUNTIME_NOISE_SAFETY * eps / _RUNTIME_NOISE_EPSILON
 
 
-def _fit_rule(spec, eps, cache_dir, eta, *, cache_build_widen=True):
+def _fit_rule(spec, eps, cache_dir, eta):
     """Look up or build one window's rule and accept it; never write the cache.
 
     The lookup reads only certificates written before this plan: the plan's
@@ -565,9 +598,7 @@ def _fit_rule(spec, eps, cache_dir, eta, *, cache_build_widen=True):
             rule, cache_name = cached
             cache_status = f"hit:{cache_name}"
         else:
-            build_box = (_cache_build_box(requested_box, eta)
-                         if cache_dir is not None and cache_build_widen
-                         else requested_box)
+            build_box = _build_box(requested_box, eta)
             build_kwargs = {}
             if relative:
                 # For a sign-definite rule the service's kappa is
@@ -754,7 +785,7 @@ def _parallel_fits(specs, worker):
 
 
 def fit_sigma_box_specs(
-    specs, eta_ry, *, eps, cache_dir, cache_build_widen=True,
+    specs, eta_ry, *, eps, cache_dir,
 ):
     """Fit independent route-neutral box specifications across processes.
 
@@ -776,8 +807,7 @@ def fit_sigma_box_specs(
         raise ValueError("sigma_quadrature_eps must lie in (0, 1)")
     fits, fit_rows = _parallel_fits(
         rows, lambda index: _fit_rule(
-            rows[index], tolerance, cache_dir, eta,
-            cache_build_widen=bool(cache_build_widen)))
+            rows[index], tolerance, cache_dir, eta))
     if cache_dir is None:
         return fits, fit_rows
     # Every rank has looked up by now (the gather above), so writing the
@@ -992,7 +1022,7 @@ def _fit_fixed_sc_rules(
         padded = [_sc_padded_box_spec(spec, eta) for spec in rows]
         fits, fit_rows = fit_sigma_box_specs(
             padded, eta, eps=eps,
-            cache_dir=cache_dir, cache_build_widen=False)
+            cache_dir=cache_dir)
         session["rules"] = {
             spec["name"]: {
                 "fit": dict(fit, cache_status=f"init:{fit['cache_status']}"),
@@ -1031,7 +1061,7 @@ def _fit_fixed_sc_rules(
         escaped = [spec for spec in rows if spec["name"] in escape_reasons]
         padded = [_sc_padded_box_spec(spec, eta) for spec in escaped]
         new_fits, fit_rows = fit_sigma_box_specs(
-            padded, eta, eps=eps, cache_dir=cache_dir, cache_build_widen=False)
+            padded, eta, eps=eps, cache_dir=cache_dir)
         for spec, padded_spec, fit in zip(escaped, padded, new_fits):
             rules[spec["name"]] = {
                 "fit": dict(fit, cache_status=f"rebuild:sc-fixed:{fit['cache_status']}"),
@@ -1057,7 +1087,7 @@ def _fit_fixed_sc_rules(
             padded_spec = _sc_padded_box_spec(spec, eta)
             new_fits, new_rows = fit_sigma_box_specs(
                 [padded_spec], eta, eps=eps,
-                cache_dir=cache_dir, cache_build_widen=False)
+                cache_dir=cache_dir)
             rebuilt = dict(new_fits[0])
             rebuilt["cache_status"] = "rebuild:sc-fixed-validity"
             rules[spec["name"]] = {
