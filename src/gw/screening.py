@@ -923,12 +923,15 @@ def _trs_verdict(sym) -> bool:
     return bool(sym.trs_allowed)
 
 
-def _gate_w(W_op, req: ScreeningRequest, *, mesh_xy, print_fn: Callable = print,
-            kgrid=None, trs_allowed: bool) -> None:
+def _gate_w(W_op, req: ScreeningRequest, *, mesh_xy=None,
+            print_fn: Callable = print, kgrid=None, trs_allowed: bool) -> None:
     """Stage gate on one solved W — the Dyson solve is the fragile seam.
 
-    ``W_op`` is the solved ``QirrOperator``; every statistic is read on its
-    wedge rows.  Finiteness of the wedge is finiteness of the full zone
+    ``W_op`` is the solved ``QirrOperator``, or a full-zone ``(nq, μ, μ)``
+    array (the BSE ladder's W), which is its own trivial wedge; every
+    statistic is read on the wedge rows.  ``mesh_xy`` is required only for
+    a reduced wedge, whose -q rows are built by the unfold.  Finiteness of
+    the wedge is finiteness of the full zone
     (the unfold is a centroid permutation with unit phases), ``W[q=0]`` is
     a wedge representative, and the reciprocity pairs each wedge row with
     the unfold's row at -q (``QirrOperator.at_minus_q``).
@@ -966,6 +969,13 @@ def _gate_w(W_op, req: ScreeningRequest, *, mesh_xy, print_fn: Callable = print,
             "GATE W_gate_needs_measured_trs: _gate_w requires the boolean "
             "SymMaps.trs_allowed verdict; got "
             f"{trs_allowed!r}.")
+    from symmetry_maps import QirrOperator
+
+    W_op = QirrOperator.of(W_op)
+    if mesh_xy is None and not W_op.is_whole_zone():
+        raise ValueError(
+            "GATE W_gate_needs_mesh: _gate_w reads a reduced q wedge's -q "
+            "rows through the unfold, which needs the run's mesh_xy.")
     label = f"W[{req.role}]"
     W = W_op.values
     sanity.check_finite(label, W, print_fn=print_fn)

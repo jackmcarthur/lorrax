@@ -789,7 +789,6 @@ def test_the_ladder_stage_composes_exactly_the_steps_the_closure_gate_drives():
         "production composition")
 
 
-@pytest.mark.xfail(strict=True, reason="TR d54680f1: screening_bse._gate_w_or_refuse calls _gate_w without mesh_xy (TypeError); KNOWN_LORRAX_ISSUES")
 @pytest.mark.parametrize("level", [None, "0", "1"])
 def test_w_bse_w_gate_is_a_five_part_refusal_regardless_of_sanity_default(
         monkeypatch, level):
@@ -824,7 +823,6 @@ def test_w_bse_w_gate_is_a_five_part_refusal_regardless_of_sanity_default(
     assert os.environ.get("LORRAX_SANITY") == level
 
 
-@pytest.mark.xfail(strict=True, reason="TR d54680f1: screening_bse._gate_w_or_refuse calls _gate_w without mesh_xy (TypeError); KNOWN_LORRAX_ISSUES")
 def test_w_bse_w_gate_restores_sanity_after_a_healthy_stage(monkeypatch):
     """The stage-local strict pin must not change later global gate policy."""
     import numpy as np
