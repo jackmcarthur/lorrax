@@ -102,20 +102,18 @@ deck before assuming it: at 12×12 with nb=2000 it is ~10× larger.
 THE FFT IS DEVICE-LOCAL, AND THAT IS WHY THE WHOLE SWEEP IS ONE PROGRAM
 ----------------------------------------------------------------------
 A band-layout operator runs inside the sweep's ``shard_map`` on whole
-bands, so its transforms are ``fft_helpers.local_{i,}fftn3`` — the inner
-kernels of ``make_sharded_{i,}fftn_3d`` — and no FFT is distributed.  The
-sphere→box gather is ``wfn_transforms._box_kernel`` fed a traced per-k
-index, so nothing memoises a device G-index (the ``UnexpectedTracerError``
-of job 7888526).  The flat-k FFT FFI is not used: its axis order suits the
-Σ τ kernel's μ² tiles, and on this box it measured 2.0× slower (0.206 s
-against 0.104 s, job 7889250 arm ``fftbench``).  The whole sweep is one
-``jax.jit`` cached in ``_KERNEL_CACHE``, keyed on shapes, plan, mesh and
-the operator's structural identity.
-
-At MoS2 4×4 (nk=16, nb=128, ns=2, 24×24×80) the operator's wall IS the two
-transforms — 5.70 s of 5.74 s at P=1 — and they scale linearly in P
-(``tests/multi_device`` jobs 7889383–7889386); the sphere→box layout copy
-XLA:GPU inserts before ``fft`` is ``_box_kernel``'s, not this module's.
+bands, so its transforms are device-local and no FFT is distributed.  Every
+k's sphere sits in one static box, the spheres' per-axis union
+(``wfn_transforms.union_box_tables``, 2–8× the sphere against the grid's
+20–70×): the operator gathers ψ(G) into that box through a traced per-k cell
+index (nothing memoises a device G-index, the ``UnexpectedTracerError`` of
+job 7888526), and two ``LocalFourierPlan`` s take it to the grid
+(``in_support``) and back onto the box (``out_support``), one gather
+returning the sphere.  On a device whose row takes the supported axes as
+GEMMs the zero box is never written (A100: the fused plane pair on
+Fe-like boxes); elsewhere the plan's FFT group runs.  The whole sweep is one
+``jax.jit`` cached in ``_KERNEL_CACHE``, keyed on shapes, plan, mesh, the
+union box and the operator's structural identity.
 """
 
 from __future__ import annotations
@@ -133,7 +131,8 @@ from common import timing
 # deleted on 2026-09-02; this module now spells only the band-sphere
 # layout, still through the wfn_layout owner.
 from common.wfn_layout import band_sphere_spec
-from common.wfn_transforms import _box_kernel, _cached_jit, _sharding_key
+from common.wfn_transforms import (_cached_jit, _sharding_key, sphere_to_union_box,
+                                   union_box_tables, union_box_to_sphere)
 from runtime.padding import pad_axis
 
 
@@ -220,6 +219,35 @@ class SweepGeometry:
 # The operator protocol
 # ---------------------------------------------------------------------------
 
+class SphereBox(NamedTuple):
+    """This k's sphere in the spheres' union box (``wfn_transforms.union_box_tables``).
+
+    ``index`` ``(1, ngkmax)`` i32 is the flat union-box cell of each G slot
+    (pads out of the box, so a gather reads 0); ``supports`` the box's three
+    per-axis grid index sets, static.  A band-layout FFT operator gathers the
+    sphere into this box and lets ``LocalFourierPlan`` embed it into the grid
+    (``in_support``) and restrict the result back (``out_support``): the
+    supported-axis GEMMs or the FFT group, whichever the device's row takes.
+    """
+    index: jax.Array
+    supports: tuple
+
+    @property
+    def shape(self) -> tuple:
+        return tuple(int(s.size) for s in self.supports)
+
+    def plans(self, geom: "SweepGeometry"):
+        """``(to_r, to_g)``: the 'ortho' inverse from the box onto the grid
+        and the 'ortho' forward from the grid back onto the box."""
+        from common.fourier_plan import LocalFourierPlan
+        axes = (-3, -2, -1)
+        sup = dict(zip(axes, self.supports))
+        return (LocalFourierPlan(geom.fft_grid, axes, sign=1, norm="ortho",
+                                 in_support=sup, mesh=geom.mesh),
+                LocalFourierPlan(geom.fft_grid, axes, sign=-1, norm="ortho",
+                                 out_support=sup, mesh=geom.mesh))
+
+
 class Operator(NamedTuple):
     """``O ∘ ψ`` plus the normalisation that belongs to it.
 
@@ -234,13 +262,13 @@ class Operator(NamedTuple):
       psi_n   (1, nb/P, ns, ngkmax) c128 — this rank's bands, all of G
       gvec    (ngkmax, 3) i32  — this k's G table (D10 fixed shape)
       gmask   (ngkmax,)   f64  — 1 on physical G, 0 on pad columns
-      bidx    (1, ngkmax) i32 — per-k sphere index (flat box cell per G slot)
+      box     :class:`SphereBox` — this k's sphere in the spheres' union box
       kvec    (3,) f64
 
     and returns ``(1, nb/P, ns, ngkmax)`` — or, when ``ncomp > 0``,
     ``(1, nb/P, ns, ngkmax, ncomp)``.  The sweep all-to-alls that ket to
-    the G-split layout.  Anything transforming must use the device-local
-    kernels (``fft_helpers.local_{i,}fftn3``): it already runs per rank.
+    the G-split layout.  Anything transforming must stay device-local (it
+    already runs per rank): ``box.plans(geom)`` gives the union-box plans.
 
     ``apply_g`` — G-SPLIT layout, for an operator diagonal in G (T, p,
     Dirac α).  Called per k on this rank's G slab of EVERY band:
@@ -364,21 +392,18 @@ def local_potential_operator(
 
     ``dirac_vector=True`` consumes ``V_r.shape == (3,nx,ny,nz)`` and applies
     ``F[sum_i alpha_i V_i(r) F⁻¹ψ]`` with the canonical monomial gamma
-    tables.  It is the same scatter/IFFT/FFT/gather and the same
-    normalisation, not a parallel band-projection implementation.
+    tables.  It is the same gather, transforms and normalisation, not a
+    parallel band-projection implementation.
 
     BAND layout (``Operator.apply``): the round trip needs every G of a
     band, and the sweep's ``shard_map`` hands this rank whole bands, so the
-    transforms are the device-local kernels ``fft_helpers.local_{i,}fftn3``
-    — the inner kernels of ``make_sharded_{i,}fftn_3d`` — and no FFT is
-    ever distributed.  Only the scatter and the gather touch G, and both
-    take their index as a traced operand.
+    transforms are device-local (the union-box plans, :class:`SphereBox`)
+    and no FFT is ever distributed.  Only the two union-box gathers touch G,
+    and both take their index as a traced operand.
 
     ``V_r`` is the potential on the FFT grid, replicated.  It rides in as
     an operand (``consts``) because it does not depend on k.
     """
-    from common.fft_helpers import local_fftn3, local_ifftn3
-
     # THE SHARED NORMALISATION.  Same function the local plan's
     # ``_compute_local_V_k_jit`` calls, so the two agree by construction
     # rather than by hand.  Evaluated ONCE here, at factory-build time and
@@ -411,13 +436,11 @@ def local_potential_operator(
             f"{tuple(geom.fft_grid)}; got "
             f"{tuple(int(s) for s in V_r_j.shape)}")
 
-    def op(psi_n, gvec, gmask, bidx, kvec, V_r_j):
-        # sphere → box.  ``_box_kernel`` is reused verbatim: it is pure
-        # jax, band sharding rides through (the gather is over the G
-        # axis, no cross-rank op), and its ngkmax zero-slot makes the
-        # sentinel index gather exact zero.
-        box = _box_kernel(psi_n, bidx, fft_grid=geom.fft_grid)
-        psi_r = local_ifftn3(box, axes=(-3, -2, -1), norm='ortho') * scale
+    def op(psi_n, gvec, gmask, box, kvec, V_r_j):
+        # sphere → union box → grid: one gather on the small box, then the
+        # plan embeds it (its supported axes) and transforms.
+        to_r, to_g = box.plans(geom)
+        psi_r = to_r(sphere_to_union_box(psi_n, box.index, box.shape)) * scale
         if vector:
             phi_r = jnp.zeros_like(psi_r)
             for i, (perm, phase) in enumerate(alpha_vertices):
@@ -425,13 +448,8 @@ def local_potential_operator(
                     psi_r, perm, phase, axis=2)
         else:
             phi_r = psi_r * V_r_j
-        phi_G = local_fftn3(phi_r, axes=(-3, -2, -1), norm='ortho') \
-            * (deltaV * fft_norm)
-        # box → sphere.  Advanced indexing on the three FFT axes only.
-        gx = gvec[:, 0]
-        gy = gvec[:, 1]
-        gz = gvec[:, 2]
-        out = phi_G[..., gx, gy, gz]
+        # grid → union box (the plan restricts) → sphere (one gather).
+        out = union_box_to_sphere(to_g(phi_r) * (deltaV * fft_norm), box.index)
         return out * gmask[None, None, None, :].astype(out.dtype)
 
     # V(r) rides in as an OPERAND, not as a closed-over constant.  It is the
@@ -468,7 +486,6 @@ def four_current_potential_operator(
     scalar operator ket outside that block is algebraically identical to
     slicing both bra and ket because those output spinor rows are exact zero.
     """
-    from common.fft_helpers import local_fftn3, local_ifftn3
     from common.gamma_matrices import gamma_apply, gamma_perm_phase
     from psp.get_DFT_mtxels import local_potential_scalars
 
@@ -501,21 +518,20 @@ def four_current_potential_operator(
         np.arange(4) < charge_ns, dtype=jnp.complex128).reshape(
             1, 1, 4, 1, 1, 1)
 
-    def op(psi_n, gvec, gmask, bidx, kvec, V0, V1):
+    def op(psi_n, gvec, gmask, box, kvec, V0, V1):
         del kvec
-        box = _box_kernel(psi_n, bidx, fft_grid=geom.fft_grid)
-        psi_r = local_ifftn3(box, axes=(-3, -2, -1), norm="ortho") * scale
+        to_r, to_g = box.plans(geom)
+        psi_r = to_r(sphere_to_union_box(psi_n, box.index, box.shape)) * scale
         phi_scalar = psi_r * charge_mask * V0
         phi_vector = jnp.zeros_like(psi_r)
         for i, (perm, phase) in enumerate(alpha_vertices):
             phi_vector = phi_vector + V1[i] * gamma_apply(
                 psi_r, perm, phase, axis=2)
-        # (component, k, band, spinor, x, y, z): one batched forward FFT.
-        phi_G = local_fftn3(jnp.stack((phi_scalar, phi_vector), axis=0),
-                            axes=(-3, -2, -1), norm="ortho") * fft_scale
-        gx, gy, gz = gvec[:, 0], gvec[:, 1], gvec[:, 2]
-        out = phi_G[..., gx, gy, gz]
-        out = jnp.moveaxis(out, 0, -1)
+        # (k, band, spinor, component, x, y, z): one batched forward transform
+        # onto the union box, then one gather to the sphere.
+        phi = jnp.stack((phi_scalar, phi_vector), axis=3)
+        out = union_box_to_sphere(to_g(phi) * fft_scale, box.index)
+        out = jnp.moveaxis(out, 3, -1)
         return out * gmask[None, None, None, :, None].astype(out.dtype)
 
     return Operator(
@@ -1449,7 +1465,7 @@ A2A_BANDWIDTH_BLOCK_BYTES = 1 << 20
 
 
 def _sweep_body(geom: SweepGeometry, operators: tuple, spans: tuple,
-                plan: SweepPlan, *, use_scan: bool):
+                plan: SweepPlan, *, use_scan: bool, supports: tuple = ()):
     """The per-rank program: scan k tiles; per tile, band → G split, GEMM,
     reduce-scatter.
 
@@ -1499,7 +1515,8 @@ def _sweep_body(geom: SweepGeometry, operators: tuple, spans: tuple,
         with K.  (K, nb/P, ns, ngkmax[, c])."""
         def one(xs):
             p, g, m, b, kv = xs
-            return operator.apply(p[None], g, m, b[None], kv, *consts)[0]
+            return operator.apply(p[None], g, m, SphereBox(b[None], supports), kv,
+                                  *consts)[0]
         xs = (t["psi"], t["gvec"], t["gmask"], t["bidx"], t["kvec"])
         if K == 1:
             return one(jax.tree_util.tree_map(lambda a: a[0], xs))[None]
@@ -1712,6 +1729,7 @@ def sweep_matrix_elements(
     # exactly zero -- the product of an exact zero, not "close to zero".
     psi = pad_axis(psi, geom.p_prod, axis=1).array
 
+    from common.fourier_plan import gemm_crossover
     plan = plan_sweep(geom, operators)
     band = any(o.apply is not None for o in operators)
     rep = P()
@@ -1719,9 +1737,13 @@ def sweep_matrix_elements(
     gvecs_j = jnp.asarray(gvecs, dtype=jnp.int32)
     gmask_j = jnp.asarray(gmask, dtype=jnp.float64)
     kvecs_j = jnp.asarray(kvecs, dtype=jnp.float64)
-    # The box index is the largest table here (nk·N_r int32, replicated —
-    # 759 MiB at VI3 12x12) and only a transforming operator reads it.
-    bidx_j = jnp.asarray(box_index, dtype=jnp.int32) if band else None
+    # A transforming operator reads each k's sphere in the spheres' union box
+    # (host tables, cached per box_index): the (nk, ngkmax) cell index rides
+    # in replicated, the box's supports are static.
+    supports, bidx_j = (), None
+    if band:
+        supports, compact = union_box_tables(box_index, geom.fft_grid)
+        bidx_j = jnp.asarray(compact, dtype=jnp.int32)
     # The operator's runtime operands.  They are jit ARGUMENTS, so one
     # executable serves every value of them; anything the operator closes
     # over instead is a jaxpr constant and forces a lowering per value.
@@ -1733,7 +1755,7 @@ def sweep_matrix_elements(
 
     out_spec = tuple(geom.spec_block_for(int(o.ncomp)) for o in operators)
     body = _sweep_body(geom, operators, tuple(spans), plan,
-                       use_scan=bool(use_scan))
+                       use_scan=bool(use_scan), supports=supports)
 
     def _run(psi, gvecs_, gmask_, kvecs_, bidx_, *consts_):
         ops = {"psi": jax.lax.with_sharding_constraint(
@@ -1762,7 +1784,10 @@ def sweep_matrix_elements(
          geom.fft_grid, tuple(plan), mesh, _sharding_key(psi)[1],
          None if bidx_j is None else tuple(bidx_j.shape),
          tuple((tuple(int(d) for d in c.shape), str(c.dtype))
-               for c in op_consts)),
+               for c in op_consts),
+         # the union box and the device's GEMM row are baked into the plans
+         tuple(hash(s.tobytes()) for s in supports),
+         str(gemm_crossover(mesh.devices.flat[0].device_kind)) if band else None),
         lambda: jax.jit(_run))
     blocks = fn(psi, gvecs_j, gmask_j, kvecs_j, bidx_j, *op_consts)
     return blocks[0] if single else blocks
