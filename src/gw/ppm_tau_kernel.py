@@ -183,7 +183,7 @@ def get_sigma_spatial_kernel(
     from .greens_function_kernel import sigma_spin_block
     ns = int(face_shape[3])
     d = sigma_spin_block(n_parent=k_unfold_plan.n_parent, n_rmu=int(face_shape[2]), ns=ns,
-                         mesh=mesh_xy, partner_tiles=partner_tiles)
+                         n_full=nk_tot, mesh=mesh_xy, partner_tiles=partner_tiles)
     unfold_conv = make_kconv_klead_unfold(mesh_xy, kgrid, k_unfold_plan.unfold_load_tables(),
                                           store_rows=k_unfold_plan.parent_full_rows,
                                           norm='ortho', mult=-1.0 / np.sqrt(float(nk_tot)),

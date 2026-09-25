@@ -341,31 +341,33 @@ def build_G_tau(psi_xn, psi_yr, enk, t, *, e_ref=0.0, mask=None,
 # itself stays whole at the parents.
 # ---------------------------------------------------------------------------
 
-def sigma_spin_block(*, n_parent, n_rmu, ns, mesh, partner_tiles):
+def sigma_spin_block(*, n_parent, n_rmu, ns, n_full, mesh, partner_tiles, w_blocks=1):
     """The output spin block ``d`` (a divisor of ``ns``) a parent-row Σ convolution stores per pass.
 
-    Live per rank: the parent Green ``T_p = 16·n_parent·ns²·μ²/P``, ``partner_tiles`` more
-    of it (1 when the antiunitary partner is its own GEMM, 0 when it is read as conj(G)),
-    and the stored block ``T_p·(d/ns)²``; the largest ``d`` whose set fits the agreed
-    device target (the minimum process budget times the spinor's fragmentation
-    utilization) wins, else 1.  Every process computes the same ``d``.
+    Live per rank beside what is already resident: the parent Green ``T_p =
+    16·n_parent·ns²·μ²/P``, ``partner_tiles`` more of it (1 when the antiunitary partner is
+    its own GEMM, 0 when it is read as conj(G)), the stored block ``T_p·(d/ns)²`` and the
+    prepared interaction ``16·w_blocks·N_k·μ²/P``.  The largest ``d`` whose set fits the
+    stage room (``_stage_room_bytes``) wins, else 1.  Every process computes the same ``d``.
     """
     if int(ns) <= 1:
         return 1
     P_ = int(mesh.shape['x']) * int(mesh.shape['y'])
     tile = 16.0 * int(n_parent) * int(ns) ** 2 * int(n_rmu) ** 2 / P_
-    target = _device_target_bytes(ns)
+    w = 16.0 * int(w_blocks) * int(n_full) * int(n_rmu) ** 2 / P_
+    room = _stage_room_bytes(ns)
     for d in sorted((d for d in range(1, int(ns) + 1) if int(ns) % d == 0), reverse=True):
-        if (1.0 + float(partner_tiles) + (d / int(ns)) ** 2) * tile <= target:
+        if (1.0 + float(partner_tiles) + (d / int(ns)) ** 2) * tile + w <= room:
             return d
     return 1
 
 
-def _device_target_bytes(ns: int) -> float:
-    """The run's device budget (``memory_per_device_gb``) times the spinor's fragmentation
-    utilization: the target the Green-side planners share."""
-    from common.gpu_utils import bfc_fragmentation_target_utilization, device_budget_bytes
-    return device_budget_bytes() * bfc_fragmentation_target_utilization(int(ns))
+def _stage_room_bytes(ns: int) -> float:
+    """What a Green-side stage may claim: the run's device budget (``memory_per_device_gb``)
+    less the bytes already live, times the spinor's fragmentation utilization, the minimum
+    over processes (every process must enter)."""
+    from common.gpu_utils import bfc_fragmentation_target_utilization, device_room_bytes
+    return device_room_bytes() * bfc_fragmentation_target_utilization(int(ns))
 
 
 def chi_valence_chunks(*, n_parent, n_rmu, ns, n_full, n_out, n_val, mesh, partner):
@@ -375,15 +377,15 @@ def chi_valence_chunks(*, n_parent, n_rmu, ns, n_full, n_out, n_val, mesh, partn
     built and accumulated in band chunks against one conduction Green.  Live per rank:
     ``(1 + partner)·T_p`` for Gc, the same over ``n`` for a Gv chunk, and the accumulator
     ``16·n_out·N_k·μ²/P``, with ``T_p = 16·n_parent·ns²·μ²/P``; the smallest ``n`` that fits
-    the device target wins (every process computes the same ``n``), capped at ``n_val``.
+    the stage room (``_stage_room_bytes``) wins (every process computes the same ``n``),
+    capped at ``n_val``.
     """
     P_ = int(mesh.shape['x']) * int(mesh.shape['y'])
     tile = 16.0 * int(n_parent) * int(ns) ** 2 * int(n_rmu) ** 2 / P_
     acc = 16.0 * int(n_out) * int(n_full) * int(n_rmu) ** 2 / P_
-    target = _device_target_bytes(ns)
+    room = _stage_room_bytes(ns)
     side = (1.0 + float(bool(partner))) * tile
     for n in range(1, max(1, int(n_val)) + 1):
-        if side * (1.0 + 1.0 / n) + acc <= target:
+        if side * (1.0 + 1.0 / n) + acc <= room:
             return n
     return max(1, int(n_val))
-
