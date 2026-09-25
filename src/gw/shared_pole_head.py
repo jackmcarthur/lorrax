@@ -73,13 +73,14 @@ def _realized_gamma_body(mesh, realize):
     coefficient as well; its same-time transpose is the required partner.
     """
     from jax.sharding import NamedSharding, PartitionSpec as P
+    from common.collectives import transpose_xy
     face = NamedSharding(mesh, P(None, "x", "y"))
     raw = _gamma_body(mesh)
 
     @jax.jit(out_shardings=face)
     def evaluate(s, b, poles, counts, v):
         wc = raw(s, b, poles, counts, jnp.zeros_like(v))
-        partner = jax.lax.with_sharding_constraint(jnp.swapaxes(wc, -2, -1), face)
+        partner = jax.lax.with_sharding_constraint(transpose_xy(wc, mesh), face)
         wc, _ = realize(wc, partner)
         return v + wc
     return evaluate
