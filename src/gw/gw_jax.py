@@ -103,6 +103,7 @@ from .gw_config import (
 	infer_material_class, resolve_mpa_sampling_alpha,
 	validate_material_inputs)
 from .gw_init import (prepare_isdf_and_wavefunctions,
+	                  check_band_extrapolation_floor,
 	                  check_band_sum_degeneracy, resolve_zeta_fit_edge,
 	                  zeta_fit_band_ranges)
 from .compute_vcoul import build_bgw_v_grid_fn
@@ -451,6 +452,7 @@ def _prepare_band_metadata(centroid_indices, config, mesh_xy, n_rmu, print0, sym
                f"[{band_slices.b0}, {band_slices.b4}) "
                f"(padded from {meta.b_id_4_user} to the world size).")
     check_band_sum_degeneracy(wfn, config, band_slices, log=print0)
+    check_band_extrapolation_floor(config, band_slices, meta)
     return (meta, band_slices, zeta_fit_edge)
 
 

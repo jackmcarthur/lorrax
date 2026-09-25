@@ -318,7 +318,7 @@ def test_bracket_scheme_deck_key_is_normalized_and_recorded_explicit(tmp_path):
 
     deck = tmp_path / "scheme.in"
     deck.write_text(
-        "[cohsex]\n"
+        "[cohsex]\nsys_dim = 3\n"
         "band_extrapolation_bracket_scheme = Conduction_Energy_Midpoint\n")
     params = read_lorrax_input(str(deck))
     assert params["band_extrapolation_bracket_scheme"] == \

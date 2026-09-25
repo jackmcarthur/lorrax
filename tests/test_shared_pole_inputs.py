@@ -13,7 +13,7 @@ from gw.shared_pole_recipe import (
     construction_receipt, gate_receipt, shared_real_pole_gates_v1_r3b,
 )
 
-BASE = '[cohsex]\nnval=2\nncond=2\nnumber_bands=10\n'
+BASE = '[cohsex]\nsys_dim = 3\nnval=2\nncond=2\nnumber_bands=10\n'
 
 
 def parse(tmp_path, extra, *, head='off', print_fn=None):

@@ -903,7 +903,7 @@ def test_input_file_refusals(tmp_path, body, needle):
 def test_input_file_refuses_a_gw_deck(tmp_path):
     from gw.downfold_config import DownfoldConfig
     p = tmp_path / "cohsex.in"
-    p.write_text("[cohsex]\nnval = 8\nncond = 52\n")
+    p.write_text("[cohsex]\nsys_dim = 3\nnval = 8\nncond = 52\n")
     with pytest.raises(ValueError) as exc:
         DownfoldConfig.from_input_file(str(p))
     assert "not a downfold input file" in str(exc.value)

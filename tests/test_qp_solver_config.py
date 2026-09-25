@@ -32,6 +32,7 @@ from common.four_current_model import resolve_four_current_representation
 
 BASE_INPUT = """\
 [cohsex]
+sys_dim = 3
 nval = 2
 ncond = 2
 nband = 10
@@ -503,8 +504,8 @@ def test_unknown_keys_always_refuse_in_one_aggregate(tmp_path):
     with pytest.raises(ValueError, match="unrecognized deck key") as exc:
         read_lorrax_input(str(p))
     message = str(exc.value)
-    assert "x_only (line 6)" in message
-    assert "use_chunked_isdf (line 7)" in message
+    assert "x_only (line 7)" in message
+    assert "use_chunked_isdf (line 8)" in message
 
 
 def test_strict_keys_is_retired_even_without_other_unknown_keys(tmp_path):

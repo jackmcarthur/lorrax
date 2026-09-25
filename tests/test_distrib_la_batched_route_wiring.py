@@ -17,17 +17,17 @@ def test_deck_route_defaults_normalizes_and_refuses_unknown(tmp_path):
     )
 
     bare = tmp_path / "bare.in"
-    bare.write_text("[cohsex]\n")
+    bare.write_text("[cohsex]\nsys_dim = 3\n")
     assert resolve_distrib_la_batched_route(
         read_lorrax_input(str(bare))) == "batch_reshard"
 
     low_mem = tmp_path / "low_mem.in"
-    low_mem.write_text("[cohsex]\nlinalg = distributed\n")
+    low_mem.write_text("[cohsex]\nsys_dim = 3\nlinalg = distributed\n")
     assert resolve_distrib_la_batched_route(
         read_lorrax_input(str(low_mem))) == "auto"
 
     opted = tmp_path / "opted.in"
-    opted.write_text("[cohsex]\ndistrib_la_batched_route = batch_reshard\n")
+    opted.write_text("[cohsex]\nsys_dim = 3\ndistrib_la_batched_route = batch_reshard\n")
     with pytest.raises(ValueError, match="retired"):
         read_lorrax_input(str(opted))
 

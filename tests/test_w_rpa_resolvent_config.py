@@ -39,6 +39,7 @@ _REPO = pathlib.Path(__file__).resolve().parents[1]
 
 _BASE = """\
 [cohsex]
+sys_dim = 3
 nval = 2
 ncond = 2
 nband = 10

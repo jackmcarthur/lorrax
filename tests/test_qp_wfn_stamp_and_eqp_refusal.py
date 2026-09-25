@@ -40,7 +40,7 @@ h5py = pytest.importorskip("h5py")
 
 def _deck(tmp_path, wfn_name):
     deck = tmp_path / "cohsex.in"
-    deck.write_text(f"[cohsex]\nnval = 4\nncond = 4\nwfn_file = {wfn_name}\n")
+    deck.write_text(f"[cohsex]\nsys_dim = 3\nnval = 4\nncond = 4\nwfn_file = {wfn_name}\n")
     return str(deck)
 
 

@@ -47,7 +47,7 @@ def test_fixture_a_bulk_vq_matches_the_analytic_gamma_limit(core_fixtures):
 def test_retired_slab_transport_key_is_one_strict_refusal(tmp_path):
     deck = tmp_path / "retired.in"
     deck.write_text(
-        "[cohsex]\n"
+        "[cohsex]\nsys_dim = 3\n"
         "nval = 2\n"
         "ncond = 2\n"
         "nband = 8\n"

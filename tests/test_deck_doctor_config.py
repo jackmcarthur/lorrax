@@ -12,7 +12,7 @@ from gw.gw_config import LorraxConfig, infer_material_class
 def test_hardware_free_config_keeps_auto_memory_and_gpu_request(tmp_path):
     deck = tmp_path / "cohsex.in"
     deck.write_text(
-        "[cohsex]\n"
+        "[cohsex]\nsys_dim = 3\n"
         "memory_per_device_gb = 0\n"
         "linalg = distributed\n"
     )
