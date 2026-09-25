@@ -226,6 +226,11 @@ class ParallelTransportHeadData:
     #: refuse a window edge that cuts a hybridized manifold.  See
     #: ``file_io.parallel_transport.load_link_singular_values``.
     singular_values: np.ndarray
+    #: ``(3, nk, nb_storage, nb_storage)`` position operator of the collapsed
+    #: (one-point, vacuum) k axes, zero on stencil axes; ``None`` when the k
+    #: grid has no collapsed axis.  The connection along a collapsed axis
+    #: (``common.parallel_transport.link_stencil_orders``).
+    collapsed_position: object = None
 
 
 @dataclass(frozen=True)
@@ -306,13 +311,16 @@ def load_parallel_transport_head(
     One handle, one library, one open.
     """
     from file_io.parallel_transport import (
+        COLLAPSED_POSITION_DATASET,
         SCHEMA_VERSION,
         VELOCITY_DFT_DATASET,
         load_full_bz_links,
         load_link_singular_values,
     )
     from file_io.slab_io import SlabIO
-    from common.parallel_transport import band_storage_extent, wfn_fingerprint
+    from common.parallel_transport import (
+        band_storage_extent, collapsed_axes, link_stencil_orders,
+        wfn_fingerprint)
 
     int_names = (
         "schema_version",
@@ -449,6 +457,36 @@ def load_parallel_transport_head(
         # preflight in ``sc_iteration.load_head_velocity_source`` reads it
         # off the returned object.
         singular_values = load_link_singular_values(io, nb_logical=expected_nb)
+        collapsed_position = None
+        if collapsed_axes(expected_kgrid):
+            # A collapsed axis has no link stencil; its connection is the
+            # stored position operator.  An artifact that predates it has
+            # neither the stamp nor the dataset and refuses here by name
+            # instead of reading a short slab.  The reader's own words are
+            # kept so a transport fault is not mistaken for an old file.
+            try:
+                stored_orders = np.asarray(io.read_small(
+                    "link_stencil_orders", dtype=np.int32)).reshape(3)
+            except (KeyError, RuntimeError, OSError, ValueError) as exc:
+                raise ValueError(
+                    f"GATE pt_collapsed_axis_artifact: {path}: the k grid "
+                    f"{tuple(int(n) for n in expected_kgrid)} has a collapsed "
+                    "axis but link_stencil_orders could not be read "
+                    f"({type(exc).__name__}: {exc}).  An artifact that "
+                    "predates the collapsed-axis position operator has no "
+                    "such stamp; regenerate it with get_dipole_mtxels "
+                    "--parallel-transport-out") from exc
+            want_orders = link_stencil_orders(expected_kgrid)
+            if tuple(int(o) for o in stored_orders) != tuple(want_orders):
+                raise ValueError(
+                    f"GATE pt_collapsed_axis_artifact: {path}: stored "
+                    f"link_stencil_orders "
+                    f"{tuple(int(o) for o in stored_orders)} != "
+                    f"{want_orders} for kgrid "
+                    f"{tuple(int(n) for n in expected_kgrid)}")
+            collapsed_position = io.read_slab(
+                COLLAPSED_POSITION_DATASET, shape=large_shape,
+                partition_spec=spec)
 
     expected_prefix = (3, int(meta.nk_tot))
     if (
@@ -493,6 +531,7 @@ def load_parallel_transport_head(
         reciprocal_lattice_cart=reciprocal,
         validation=validation,
         singular_values=singular_values,
+        collapsed_position=collapsed_position,
     )
 
 
@@ -749,28 +788,37 @@ def covariant_link_derivative(
     mesh: Mesh,
     kgrid,
     bvec_cart,
+    collapsed_position=None,
 ):
     """Return the direct finite-link covariant derivative of ``Delta H``.
 
     Neighbouring operators are transported into the central DFT basis before
-    the fourth-order reduced-coordinate stencil is applied.  This is one
-    gauge-covariant discrete object; no separately differentiated Hamiltonian
-    and connection commutator have to cancel on a finite grid.
+    the reduced-coordinate stencil is applied (fourth order on >= 5-point
+    axes, second order on 3- or 4-point axes); a collapsed axis takes
+    ``-i[Z_a, Delta H]`` with the stored position operator
+    ``collapsed_position`` (``common.parallel_transport.link_stencil_orders``
+    owns the per-axis rule).  This is one gauge-covariant discrete object;
+    no separately differentiated Hamiltonian and connection commutator have
+    to cancel on a finite grid.
     """
     from common.parallel_transport import (
         fourth_order_covariant_derivative,
+        link_stencil_orders,
         make_distributed_band_matmul,
     )
 
     delta = jnp.asarray(delta_h_dft, dtype=jnp.complex128)
     links = jnp.asarray(forward_links, dtype=jnp.complex128)
-    spacing = 1.0 / np.asarray(tuple(int(n) for n in kgrid), dtype=np.float64)
+    grid = tuple(int(n) for n in kgrid)
+    spacing = 1.0 / np.asarray(grid, dtype=np.float64)
     reduced = fourth_order_covariant_derivative(
         delta,
         links,
         np.asarray(forward_neighbors, dtype=np.int64),
         spacing,
         band_matmul=make_distributed_band_matmul(mesh, n_batch_axes=1),
+        stencil_orders=link_stencil_orders(grid),
+        collapsed_position=collapsed_position,
     )
     return reduced_covector_to_cartesian(reduced, bvec_cart)
 
@@ -2808,6 +2856,7 @@ def build_iteration_head_response(
     wfns_qp=None,
     eta_ry: float | None = None,
     occupation_state=None,
+    collapsed_position=None,
 ) -> IterationHeadResponse:
     """Build current-basis direct head and, when requested, its wings.
 
@@ -2835,6 +2884,7 @@ def build_iteration_head_response(
             mesh=mesh,
             kgrid=kgrid,
             bvec_cart=bvec_cart,
+            collapsed_position=collapsed_position,
         )
     v_qp = rotate_velocity_active_to_qp(v_dft_basis, U_dft_to_qp, mesh=mesh)
     resolved_eta_ry = (
@@ -3116,6 +3166,7 @@ def build_iteration_head_samples(
     wfn,
     meta,
     config,
+    collapsed_position=None,
 ) -> IterationHeadSamples:
     """Backward-compatible direct-head builder used by small diagnostics."""
     response = build_iteration_head_response(
@@ -3137,6 +3188,7 @@ def build_iteration_head_samples(
         wfn=wfn,
         meta=meta,
         config=config,
+        collapsed_position=collapsed_position,
     )
     return finalize_iteration_head_samples(
         response, wfn=wfn, meta=meta, config=config, mesh=mesh)

@@ -3757,6 +3757,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             wfns_qp=(None if direct_only_shared_pole else wfns_qp),
             eta_ry=(0.0 if mpa_mode else None),
             occupation_state=entry_occ_state,
+            collapsed_position=getattr(pt, "collapsed_position", None),
         )
         velocity_kind = (
             "QSGW finite-link covariant velocity" if forward_links is not None
@@ -6221,9 +6222,9 @@ def _refuse_unsupported_link_stencil(kgrid, *, where: str) -> None:
 
     Mirrors the producer-side gate
     (``file_io.parallel_transport.write_parallel_transport_artifact``) at
-    driver-entry altitude, off the SAME threshold
-    (``common.parallel_transport.undersampled_link_axes`` /
-    ``MIN_STENCIL_POINTS`` — one name, not a second literal ``5`` here) —
+    driver-entry altitude, off the SAME rule
+    (``common.parallel_transport.undersampled_link_axes``, which since the
+    collapsed-axis port names only two-point axes) —
     "before any allocation" (PLAN.md pipeline step 3): a deck whose links
     could never have been written is refused here, before this driver opens
     the artifact at all, rather than surfacing as a shape/refusal deep
@@ -6239,22 +6240,15 @@ def _refuse_unsupported_link_stencil(kgrid, *, where: str) -> None:
         return
     raise ValueError(
         "GATE pt_head_stencil_unsupported: "
-        f"{where} requires the nearest-neighbour link/fourth-order "
-        "connection stencil along every Cartesian mesh direction.\n"
-        f"  got:  kgrid={grid}, undersampled axes {', '.join(bad_axes)}\n"
-        f"  want: >={MIN_STENCIL_POINTS} mesh points on every axis, or a "
-        "head mode that needs no links\n"
-        "  fix:  for a genuinely lower-dimensional deck (a collapsed axis "
-        "with kgrid[i]=1, e.g. a slab), set sc_head_update=dft_velocity — "
-        "it reads the exact DFT p-matrix velocity alone and needs no "
-        "stencil on any axis; for an undersampled but periodic axis "
-        "(1 < kgrid[i] < 5), densify the mesh along it\n"
-        "  why:  the fourth-order +/-2 connection stencil differentiates "
-        "along k; a direction with too few points cannot support it, and "
-        "it is never fabricated as an analytic zero (KNOWN_LORRAX_ISSUES.md, "
-        "file_io/parallel_transport.py row, fix note)\n"
-        "  doc:  reports/metal_head_pt_pipelines_2026-08-23/PLAN.md, "
-        "pipeline step 3(c)")
+        f"{where} needs a derivative rule on every reduced k axis "
+        "(common.parallel_transport.link_stencil_orders: fourth order at "
+        f">= {MIN_STENCIL_POINTS} points, second order at 3-4, the "
+        "real-space position operator on a collapsed 1-point axis).\n"
+        f"  got:  kgrid={grid}, two-point axes {', '.join(bad_axes)}\n"
+        "  want: >= 3 mesh points or exactly 1 on every axis\n"
+        "  fix:  densify the two-point axis or collapse it; "
+        "sc_head_update=dft_velocity needs no stencil at all\n"
+        "  doc:  common.parallel_transport.link_stencil_orders")
 
 
 def _refuse_degenerate_window_edge(
@@ -6454,8 +6448,19 @@ def load_head_velocity_source(
 
     source = load_parallel_transport_head(
         pt_path, mesh=mesh, sym=sym, wfn=wfn, meta=meta)
+    # A collapsed axis's stored "link" is the plane-wave overlap
+    # <psi| e^{-i b.r} |psi> (the neighbour is the point itself through
+    # b_i): its singular values are far below one by construction and say
+    # nothing about window hybridization, which is a property of transport
+    # along the sampled directions only.  The derivative kernels never read
+    # that link (common.parallel_transport.link_stencil_orders).
+    from common.parallel_transport import collapsed_axes
+    singular_values = np.array(
+        source.singular_values, dtype=np.float64, copy=True)
+    for axis in collapsed_axes(wfn.kgrid):
+        singular_values[:, axis, :] = 1.0
     _refuse_hybridized_window_edge(
-        source.singular_values, source.nb_logical,
+        singular_values, source.nb_logical,
         where=f"sc_head_update={mode}")
     vgate = source.validation
     print_fn(
