@@ -2775,68 +2775,6 @@ _PARENT_UNFOLD_SPECS = (P(None), P(None), P(None, None), P(None, None, None),
                         P(None, "y"), P(None, "y", None))
 
 
-_CHILD_FACE_KERNELS: dict = {}
-
-
-def iter_parent_children_faces(carrier, mesh_xy, *, slices, by_parent=True):
-    """Yield typed child faces in parent order, optionally as one full-k batch."""
-    from types import SimpleNamespace
-    from common.shard_map import shard_map
-    from ffi import _services
-    _services.ensure_on_path()
-    from common.wfn_layout import psi_specs
-    PSI_NMU_SPEC, PSI_MUN_SPEC = psi_specs(carrier.layout)
-
-    plan = carrier.plan
-    ops, n_sym_spatial = _parent_face_unfold_operands(plan, mesh_xy)
-    irr, sym_rows, kfrac, U, perm_x, L_x, perm_y, L_y = ops
-    irr_np = np.asarray(plan.irr_idx)
-    host_tables = plan.wavefunction_unfold_tables()
-
-    def _kernel(spec, spin_axis, mu_axis, perm_spec, L_spec, n_rows):
-        key = (plan, _mesh_key(mesh_xy), spec, spin_axis, mu_axis, int(n_rows))
-        hit = _CHILD_FACE_KERNELS.get(key)
-        if hit is None:
-            def body(psi, irr_r, sym_r, kfrac_r, U_r, perm, L):
-                tables = dict(irr_idx=irr_r, sym_idx=sym_r, k_irr_frac=kfrac_r,
-                              spin_action_full=U_r, local_perm=perm, L_table=L,
-                              n_sym_spatial=n_sym_spatial)
-                return plan.unfold_face(
-                    psi, spin_axis=spin_axis, mu_axis=mu_axis, tables=tables)
-            hit = jax.jit(shard_map(
-                body, mesh=mesh_xy,
-                in_specs=(spec, P(None), P(None), P(None, None),
-                          P(None, None, None), perm_spec, L_spec),
-                out_specs=spec, check_vma=False))
-            _CHILD_FACE_KERNELS[key] = hit
-        return hit
-
-    rep = lambda spec: NamedSharding(mesh_xy, spec)
-    groups = [np.flatnonzero(irr_np == parent) for parent in range(int(plan.n_parent))]
-    if not by_parent:
-        groups = [np.concatenate(groups)]
-    for rows in groups:
-        if rows.size == 0:
-            continue
-        irr_r = device_put_process_local(
-            np.asarray(host_tables["irr_idx"], np.int32)[rows], rep(P(None)))
-        sym_r = device_put_process_local(
-            np.asarray(host_tables["sym_idx"], np.int32)[rows], rep(P(None)))
-        U_r = device_put_process_local(
-            np.asarray(host_tables["spin_action_full"], np.complex128)[rows],
-            rep(P(None, None, None)))
-        mun = _kernel(PSI_MUN_SPEC, 1, 2, P(None, "x"), P(None, "x", None),
-                      rows.size)(carrier.psi_mun, irr_r, sym_r, kfrac, U_r,
-                                 perm_x, L_x)
-        nmu = _kernel(PSI_NMU_SPEC, 2, 3, P(None, "y"), P(None, "y", None),
-                      rows.size)(carrier.psi_nmu, irr_r, sym_r, kfrac, U_r,
-                                 perm_y, L_y)
-        yield rows, SimpleNamespace(
-            layout=carrier.layout, psi_mun=mun, psi_nmu=nmu, slices=slices,
-            enk=jnp.take(carrier.enk, irr_np[rows], axis=0),
-            occ=jnp.take(carrier.occ, irr_np[rows], axis=0))
-
-
 def _unfold_tables_from_operands(irr, sym, kfrac, U, perm_x, L_x, perm_y, L_y,
                                  n_sym_spatial):
     common = dict(irr_idx=irr, sym_idx=sym, k_irr_frac=kfrac,

@@ -1142,12 +1142,15 @@ def _head_wing_kernel(
     nb_logical: int,
     include_surface: bool,
     layout: str = "face",
+    classes: int = 0,
+    anti: bool = False,
 ) -> Callable:
     """Build the canonical face head-wing kernel with bounded centroid tiles."""
     if layout not in ("face", "axis"):
         raise ValueError(f"_head_wing_kernel requires face or axis layout, got {layout!r}")
     return _head_wing_kernel_face(
-        mesh, nb_logical=int(nb_logical), include_surface=bool(include_surface), layout=layout)
+        mesh, nb_logical=int(nb_logical), include_surface=bool(include_surface),
+        layout=layout, classes=int(classes), anti=bool(anti))
 
 
 def _head_wing_kernel_face(
@@ -1156,9 +1159,22 @@ def _head_wing_kernel_face(
     nb_logical: int,
     include_surface: bool,
     layout="face",
+    classes: int = 0,
+    anti: bool = False,
 ) -> Callable:
-    """Contract velocity and density vertices in bounded centroid and frequency tiles."""
-    key = ("head_wings_face", id(mesh), int(nb_logical), bool(include_surface), layout)
+    """Contract velocity and density vertices in bounded centroid and frequency tiles.
+
+    ``classes = 0``: one k sum, outputs ``Y (n_omega, n_vertex, mu)`` and
+    ``Z (n_omega, mu, n_vertex)``.  ``classes = C``: the k axis is the raw
+    parents and two ``(C, n_parent)`` count matrices ``class_u``/``class_a``
+    weight each parent's contraction into its operation classes (see
+    :func:`_head_wings_sharded_face`); outputs gain a class axis, ``Y (n_omega,
+    n_vertex, C, mu)`` and ``Z (n_omega, C, mu, n_vertex)``.  ``anti`` adds
+    the antiunitary partner contraction, which reads the transposed pair
+    weight: an antiunitary child's density is ``rho_ji`` of its parent.
+    """
+    key = ("head_wings_face", id(mesh), int(nb_logical), bool(include_surface),
+           layout, int(classes), bool(anti))
     hit = _KERNEL_CACHE.get(key)
     if hit is not None:
         return hit
@@ -1184,8 +1200,21 @@ def _head_wing_kernel_face(
         pref_inter,
         pref_surface,
         eta,
+        class_u=None,
+        class_a=None,
     ):
         nk = v_local.shape[1]
+        n_class = max(int(classes), 1)
+
+        def _k_sum(a, b, a_anti=None):
+            """``sum_{s,j} a b`` per k, weighted into classes (plain k sum
+            when ``classes = 0``; that branch is the incumbent einsum)."""
+            if not classes:
+                return jnp.einsum("ksmj,ksmj->m", a, b)[None]
+            out = class_u @ jnp.einsum("ksmj,ksmj->km", a, b)
+            if a_anti is not None:
+                out = out + class_a @ jnp.einsum("ksmj,ksmj->km", a_anti, b)
+            return out
         v_full = jax.lax.all_gather(v_local, ax_x, axis=2, tiled=True)
         v_full = jax.lax.all_gather(v_full, ax_y, axis=3, tiled=True)
         nb_full = v_full.shape[-1]
@@ -1281,25 +1310,33 @@ def _head_wing_kernel_face(
                 # (nk, ns, mu_block, nb, nb) pair-density outer product,
                 # 214 GiB on TaAs 8x8x8 at nb = 468 (2026-09-21 OOM);
                 # the largest value here is T at nk * nb^2.
+                # An antiunitary child reads rho_ji: its pair weight is
+                # (v W)^T, the conjugations of v and rho cancelling (see
+                # _head_wings_sharded_face).
                 def _one_frequency(_carry, weight_w):
                     rows = []
                     for a in range(int(v_full.shape[0])):
                         t = jnp.conj(v_full[a]) * weight_w
                         u = jnp.einsum("ksmi,kij->ksmj", jnp.conj(bra_full), t)
-                        rows.append(jnp.einsum("ksmj,ksmj->m", u, ket_full))
+                        u_anti = None
+                        if anti:
+                            u_anti = jnp.einsum(
+                                "ksmi,kji->ksmj", jnp.conj(bra_full),
+                                v_full[a] * weight_w)
+                        rows.append(_k_sum(u, ket_full, u_anti))
                     return _carry, jnp.stack(rows, axis=0)
                 _, y = jax.lax.scan(_one_frequency, None, weight, unroll=1)
                 return y
             blocks = _weighted_stack(_contract_left)
             return _carry, blocks.reshape(
-                n_omega_padded, int(v_full.shape[0]), mu_x_block)
+                n_omega_padded, int(v_full.shape[0]), n_class, mu_x_block)
 
         _, y_chunks = jax.lax.scan(
             _x_step, None, jnp.arange(n_x_blocks, dtype=jnp.int32), unroll=1)
         n_vertex = int(v_full.shape[0])
-        Y_x = jnp.moveaxis(y_chunks, 0, 2).reshape(
-            n_omega_padded, n_vertex,
-            mu_x_padded)[:n_omega, :, :mu_x_local]
+        Y_x = jnp.moveaxis(y_chunks, 0, 3).reshape(
+            n_omega_padded, n_vertex, n_class,
+            mu_x_padded)[:n_omega, :, :, :mu_x_local]
 
         # ---- Z_y: mu on Y (psi_nmu's own axis), gather bands over X ----
         mu_y_block = min(_HEAD_WING_MU_BLOCK, int(mu_y_local))
@@ -1338,20 +1375,26 @@ def _head_wing_kernel_face(
                     for b in range(int(v_full.shape[0])):
                         t = weight_w * v_full[b]
                         u = jnp.einsum("ksmi,kij->ksmj", bra_full, t)
-                        cols.append(jnp.einsum("ksmj,ksmj->m", u, jnp.conj(ket_full)))
-                    return _carry, jnp.stack(cols, axis=1)
+                        u_anti = None
+                        if anti:
+                            u_anti = jnp.einsum(
+                                "ksmi,kji->ksmj", bra_full,
+                                weight_w * jnp.conj(v_full[b]))
+                        cols.append(_k_sum(u, jnp.conj(ket_full), u_anti))
+                    return _carry, jnp.stack(cols, axis=-1)
                 _, z = jax.lax.scan(_one_frequency, None, weight, unroll=1)
                 return z
             blocks = _weighted_stack(_contract_right)
             return _carry, blocks.reshape(
-                n_omega_padded, mu_y_block, n_vertex)
+                n_omega_padded, n_class, mu_y_block, n_vertex)
 
         _, z_chunks = jax.lax.scan(
             _y_step, None, jnp.arange(n_y_blocks, dtype=jnp.int32), unroll=1)
-        Z_y = jnp.moveaxis(z_chunks, 0, 1).reshape(
-            n_omega_padded, mu_y_padded,
-            n_vertex)[:n_omega, :mu_y_local, :]
-
+        Z_y = jnp.moveaxis(z_chunks, 0, 2).reshape(
+            n_omega_padded, n_class, mu_y_padded,
+            n_vertex)[:n_omega, :, :mu_y_local, :]
+        if not classes:
+            return Y_x[:, :, 0], Z_y[:, 0]
         return Y_x, Z_y
 
     sm = shard_map(
@@ -1370,8 +1413,9 @@ def _head_wing_kernel_face(
             P(),
             P(),
             P(),
-        ),
-        out_specs=(P(None, None, "x"), P(None, "y", None)),
+        ) + ((P(None, None), P(None, None)) if classes else ()),
+        out_specs=((P(None, None, "x"), P(None, "y", None)) if not classes
+                   else (P(None, None, None, "x"), P(None, None, "y", None))),
         check_vma=False,
     )
     kernel = jax.jit(sm)
@@ -1465,36 +1509,51 @@ def _head_wings_sharded_face(
     surface_weight_kn=None,
     body_bra_wfns=None,
     body_ket_wfns=None,
+    _classes=None,
 ):
-    """Batch parent children and pad response tables to the canonical face band extent."""
+    """Contract the face wings, or on parents-only storage the parents' own.
+
+    Parents-only storage (``wfns.green_parent``, no full-k faces): no child
+    face is formed.  A child's density vertex is its parent's at the source
+    centroid (conjugated, i.e. ``rho_ji``, on an antiunitary row: the spin
+    action and the Bloch phase cancel in ``psi^dagger psi``) and its velocity
+    is the polar time-odd image of its parent's (``symmetry_maps.
+    unfold_file_wedge_polar_matrix``, conjugated on an antiunitary row), so
+    ``Y_child = F Y_parent[perm(mu)]`` with the antiunitary rows' parent
+    contraction reading the transposed pair weight.  Each parent is
+    contracted once per operation class it feeds and the classes are
+    transported once (:meth:`CentroidKUnfoldPlan.operation_classes`).
+    """
     if (getattr(wfns, "layout", None) in ("face", "axis") and wfns.psi_mun is None
             and getattr(wfns, "green_parent", None) is not None):
-        # The linear-size child faces share one head-wing contraction.
         if body_bra_wfns is not None or body_ket_wfns is not None:
             raise ValueError(
                 "head_wings_sharded(layout='face'): separately supplied "
                 "endpoint bundles are not combined with parents-only storage.")
-        from gw.w_isdf import iter_parent_children_faces
+        carrier = wfns.green_parent
+        classes = carrier.plan.operation_classes()
         v_all = jnp.asarray(velocity_cart, dtype=jnp.complex128)
-        e_all = jnp.asarray(energies_kn_ry, dtype=jnp.float64)
-        f_all = jnp.asarray(occupations_kn, dtype=jnp.float64)
-        s_all = (None if surface_weight_kn is None
-                 else jnp.asarray(surface_weight_kn, dtype=jnp.float64))
-        Y_x = Z_y = None
-        for rows, child in iter_parent_children_faces(
-                wfns.green_parent, mesh, slices=wfns.slices, by_parent=False):
-            r = device_put_process_local(
-                np.asarray(rows, np.int32), NamedSharding(mesh, P(None)))
-            y, z = _head_wings_sharded_face(
-                jnp.take(v_all, r, axis=1), child, jnp.take(e_all, r, axis=0),
-                jnp.take(f_all, r, axis=0), omegas_ry, mesh=mesh,
-                nb_logical=nb_logical, nk_tot=nk_tot, nspin=nspin,
-                nspinor=nspinor, eta_ry=eta_ry,
-                surface_weight_kn=(None if s_all is None
-                                   else jnp.take(s_all, r, axis=0)))
-            Y_x = y if Y_x is None else Y_x + y
-            Z_y = z if Z_y is None else Z_y + z
-        return Y_x, Z_y
+        if int(v_all.shape[0]) != 3:
+            raise ValueError(
+                "GATE parent_head_wing_vertex: got a width-"
+                f"{int(v_all.shape[0])} vertex on parents-only storage; want "
+                "the width-3 Cartesian velocity; why: the parent transport "
+                "rotates a polar time-odd vector, and a width-8 (a,I) jet has "
+                "no typed action here.")
+        r = device_put_process_local(
+            classes.parent_rows, NamedSharding(mesh, P(None)))
+        parents = _parent_face(carrier, wfns.slices)
+        take = lambda a: None if a is None else jnp.take(
+            jnp.asarray(a, dtype=jnp.float64), r, axis=0)
+        Y_c, Z_c = _head_wings_sharded_face(
+            jnp.take(v_all, r, axis=1), parents, take(energies_kn_ry),
+            take(occupations_kn), omegas_ry, mesh=mesh, nb_logical=nb_logical,
+            nk_tot=nk_tot, nspin=nspin, nspinor=nspinor, eta_ry=eta_ry,
+            surface_weight_kn=take(surface_weight_kn), _classes=classes)
+        mix = np.asarray(carrier.plan.sym.cartesian_action(
+            classes.ops, axial=False, time_odd=True), dtype=np.float64)
+        return _wing_transport(mesh)(
+            Y_c, Z_c, jnp.asarray(classes.local_perm), jnp.asarray(mix))
 
     bra_wfns = wfns if body_bra_wfns is None else body_bra_wfns
     ket_wfns = wfns if body_ket_wfns is None else body_ket_wfns
@@ -1581,16 +1640,58 @@ def _head_wings_sharded_face(
         float(max(int(nspin), 1)) * float(max(int(nspinor), 1)))
     pref_inter = 4.0 / (float(nk_tot) * spin_denominator)
     pref_surface = 2.0 / (float(nk_tot) * spin_denominator)
+    class_args = ()
+    if _classes is not None:
+        anti = np.asarray(_classes.antiunitary, dtype=bool)[:, None]
+        rep = NamedSharding(mesh, P(None, None))
+        class_args = tuple(device_put_process_local(
+            np.where(mask, _classes.counts, 0.0).astype(np.complex128), rep)
+            for mask in (~anti, anti))
     return _head_wing_kernel(
         mesh, nb_logical=int(nb_logical),
-        include_surface=bool(include_surface), layout=wfns.layout)(
+        include_surface=bool(include_surface), layout=wfns.layout,
+        classes=0 if _classes is None else int(_classes.ops.size),
+        anti=_classes is not None and bool(np.any(_classes.antiunitary)))(
             v, bra_wfns.psi_mun, ket_wfns.psi_mun,
             bra_wfns.psi_nmu, ket_wfns.psi_nmu,
             e, f, surface, omega,
             jnp.asarray(pref_inter, dtype=jnp.complex128),
             jnp.asarray(pref_surface, dtype=jnp.complex128),
             jnp.asarray(float(eta_ry), dtype=jnp.float64),
+            *class_args,
         )
+
+
+def _parent_face(carrier, slices):
+    """The raw-parent carrier as a face bundle whose k axis is the parents."""
+    from types import SimpleNamespace
+    return SimpleNamespace(
+        layout=carrier.layout, psi_mun=carrier.psi_mun, psi_nmu=carrier.psi_nmu,
+        enk=carrier.enk, occ=carrier.occ, slices=slices)
+
+
+def _wing_transport(mesh: Mesh) -> Callable:
+    """``sum_c F_c . {Y,Z}_c[perm_c(mu)]`` on each rank's own centroid shard."""
+    key = ("head_wing_transport", id(mesh))
+    hit = _KERNEL_CACHE.get(key)
+    if hit is not None:
+        return hit
+    from gw.centroid_k_unfold import CentroidKUnfoldPlan
+    move = CentroidKUnfoldPlan.transport_classes
+
+    def _local(Y, Z, perm, mix):
+        return (move(Y, perm, class_axis=2, mu_axis=3, mesh_axis="x",
+                     mix=mix, mix_axis=1),
+                move(Z, perm, class_axis=1, mu_axis=2, mesh_axis="y",
+                     mix=mix, mix_axis=3))
+
+    kernel = jax.jit(shard_map(
+        _local, mesh=mesh,
+        in_specs=(P(None, None, None, "x"), P(None, None, "y", None),
+                  P(None, None), P()),
+        out_specs=(P(None, None, "x"), P(None, "y", None)), check_vma=False))
+    _KERNEL_CACHE[key] = kernel
+    return kernel
 
 
 def static_head_wings_sharded(
@@ -1611,14 +1712,15 @@ def static_head_wings_sharded(
         nk_tot=nk_tot, nspin=nspin, nspinor=nspinor)
 
 
-def _static_head_wings_kernel_face(mesh: Mesh, layout="face") -> Callable:
+def _static_head_wings_kernel_face(mesh: Mesh, layout="face", classes: bool = False) -> Callable:
     """Cached shard_map kernel: a LOCAL density-weighted band sum per
     face orientation, then one ``psum`` over the mesh axis holding the
     summed band index.  No ring, no gather — see
     :func:`_static_head_wings_sharded_face`'s docstring for why the
     static vertex does not need one (it is diagonal in mu, unlike the
-    dynamic wings' genuine (i,j) operator)."""
-    key = ("static_head_wings_face", id(mesh), layout)
+    dynamic wings' genuine (i,j) operator).  ``classes``: the weight is
+    ``(C, n_parent, nb)`` per operation class and the outputs ``(C, mu)``."""
+    key = ("static_head_wings_face", id(mesh), layout, bool(classes))
     hit = _KERNEL_CACHE.get(key)
     if hit is not None:
         return hit
@@ -1632,26 +1734,27 @@ def _static_head_wings_kernel_face(mesh: Mesh, layout="face") -> Callable:
         sum_x = lambda value: jax.lax.psum(value, ax_x)
         sum_y = lambda value: jax.lax.psum(value, ax_y)
 
-    def _local(psi_mun_local, psi_nmu_local, weight_full):
-        nk = psi_mun_local.shape[0]
+    def _band_slice(weight_full, coord, width):
+        zero = jnp.zeros((), dtype=coord.dtype)
+        start = coord * width * distributed_bands
+        lead = weight_full.shape[:-1]
+        return jax.lax.dynamic_slice(
+            weight_full, (zero,) * len(lead) + (start,), lead + (width,))
 
+    def _local(psi_mun_local, psi_nmu_local, weight_full):
+        # ``classes``: one weight row block per operation class, summed per
+        # class (``c``); otherwise the incumbent single k sum.
         n_y_local = psi_mun_local.shape[-1]
-        y_coord = jax.lax.axis_index(ax_y)
-        y_zero = jnp.zeros((), dtype=y_coord.dtype)
-        y_start = y_coord * n_y_local * distributed_bands
-        weight_y = jax.lax.dynamic_slice(
-            weight_full, (y_zero, y_start), (nk, n_y_local))
+        weight_y = _band_slice(weight_full, jax.lax.axis_index(ax_y), n_y_local)
         density_x = jnp.sum(jnp.square(jnp.abs(psi_mun_local)), axis=1)
-        left = sum_y(jnp.einsum("kn,kmn->m", weight_y, density_x))
+        left = sum_y(jnp.einsum("ckn,kmn->cm" if classes else "kn,kmn->m",
+                                weight_y, density_x))
 
         n_x_local = psi_nmu_local.shape[1]
-        x_coord = jax.lax.axis_index(ax_x)
-        x_zero = jnp.zeros((), dtype=x_coord.dtype)
-        x_start = x_coord * n_x_local * distributed_bands
-        weight_x = jax.lax.dynamic_slice(
-            weight_full, (x_zero, x_start), (nk, n_x_local))
+        weight_x = _band_slice(weight_full, jax.lax.axis_index(ax_x), n_x_local)
         density_y = jnp.sum(jnp.square(jnp.abs(psi_nmu_local)), axis=2)
-        right = sum_x(jnp.einsum("kn,knm->m", weight_x, density_y))
+        right = sum_x(jnp.einsum("ckn,knm->cm" if classes else "kn,knm->m",
+                                 weight_x, density_y))
         return left, right
 
     sm = shard_map(
@@ -1660,9 +1763,10 @@ def _static_head_wings_kernel_face(mesh: Mesh, layout="face") -> Callable:
         in_specs=(
             mun_spec,                  # psi_mun_local
             nmu_spec,                  # psi_nmu_local
-            P(None, None),             # weight (nk, nb_full), replicated
+            P() if classes else P(None, None),   # weight, replicated
         ),
-        out_specs=(P("x"), P("y")),
+        out_specs=((P(None, "x"), P(None, "y")) if classes
+                   else (P("x"), P("y"))),
         check_vma=False,
     )
     kernel = jax.jit(sm)
@@ -1695,22 +1799,17 @@ def _static_head_wings_sharded_face(
     if surface.ndim != 2:
         raise ValueError(
             f"static head surface weights must be (nk,nb), got {surface.shape}")
+    classes = plan = None
     if (wfns.psi_mun is None
             and getattr(wfns, "green_parent", None) is not None):
-        # Parents-only storage: stream the children star by star (see
-        # _head_wings_sharded_face); the static wing is a plain k sum.
-        from gw.w_isdf import iter_parent_children_faces
-        left = right = None
-        for rows, child in iter_parent_children_faces(
-                wfns.green_parent, mesh, slices=wfns.slices, by_parent=False):
-            r = jnp.asarray(rows, dtype=jnp.int32)
-            a, b = _static_head_wings_sharded_face(
-                child, jnp.take(surface, r, axis=0), mesh=mesh,
-                nb_logical=nb_logical, nk_tot=nk_tot, nspin=nspin,
-                nspinor=nspinor)
-            left = a if left is None else left + a
-            right = b if right is None else right + b
-        return left, right
+        # Parents-only storage: a child's |psi|^2 is its parent's at the
+        # source centroid (the spin action and Bloch phase cancel, and an
+        # antiunitary row conjugates a real density), so each parent's
+        # density is weighted by its class members' summed weights and
+        # transported once per operation class.
+        plan = wfns.green_parent.plan
+        classes = plan.operation_classes()
+        wfns = _parent_face(wfns.green_parent, wfns.slices)
     if wfns.psi_mun is None or wfns.psi_nmu is None:
         raise ValueError(
             "static_head_wings_sharded(layout='face') requires "
@@ -1723,7 +1822,7 @@ def _static_head_wings_sharded_face(
     nb_full = int(n_mun)
     if not (0 < int(nb_logical) <= nb_full):
         raise ValueError(f"need 0 < nb_logical <= {nb_full}, got {nb_logical}")
-    if int(surface.shape[0]) != nk_mun:
+    if int(surface.shape[0]) != (nk_mun if plan is None else plan.n_full):
         raise ValueError("centroid wavefunctions do not cover static weights")
     width = int(surface.shape[1])
     if width > nb_full:
@@ -1733,17 +1832,47 @@ def _static_head_wings_sharded_face(
     if width < nb_full:
         surface = jnp.pad(surface, ((0, 0), (0, nb_full - width)))
     logical = jnp.arange(nb_full)[None, :] < int(nb_logical)
+    weight = jnp.where(logical, surface, 0.0)
+    if plan is not None:
+        # E[c, p, n]: the summed weights of parent p's class-c rows.
+        member = lambda labels, n: (
+            np.asarray(labels)[None, :] == np.arange(n)[:, None]
+        ).astype(np.float64)
+        weight = jnp.einsum(
+            "cr,pr,rn->cpn", member(classes.class_of_row, classes.ops.size),
+            member(plan.irr_idx, plan.n_parent), weight)
     weight = device_put_process_local(
-        jnp.where(logical, surface, 0.0),
-        NamedSharding(mesh, P(None, None)))
+        weight, NamedSharding(mesh, P()))
     prefactor = -2.0 / (
         float(nk_tot)
         * float(max(int(nspin), 1))
         * float(max(int(nspinor), 1))
     )
-    left, right = _static_head_wings_kernel_face(mesh, layout=wfns.layout)(
-        wfns.psi_mun, wfns.psi_nmu, weight)
+    left, right = _static_head_wings_kernel_face(
+        mesh, layout=wfns.layout, classes=plan is not None)(
+            wfns.psi_mun, wfns.psi_nmu, weight)
+    if plan is not None:
+        left, right = _static_wing_transport(mesh)(
+            left, right, jnp.asarray(classes.local_perm))
     return prefactor * left, prefactor * right
+
+
+def _static_wing_transport(mesh: Mesh) -> Callable:
+    """``sum_c C_c[perm_c(mu)]`` on each rank's own centroid shard."""
+    key = ("static_head_wing_transport", id(mesh))
+    hit = _KERNEL_CACHE.get(key)
+    if hit is not None:
+        return hit
+    from gw.centroid_k_unfold import CentroidKUnfoldPlan
+    move = CentroidKUnfoldPlan.transport_classes
+    kernel = jax.jit(shard_map(
+        lambda left, right, perm: (
+            move(left, perm, class_axis=0, mu_axis=1, mesh_axis="x"),
+            move(right, perm, class_axis=0, mu_axis=1, mesh_axis="y")),
+        mesh=mesh, in_specs=(P(None, "x"), P(None, "y"), P(None, None)),
+        out_specs=(P("x"), P("y")), check_vma=False))
+    _KERNEL_CACHE[key] = kernel
+    return kernel
 
 
 def _drude_tensor_kernel(mesh: Mesh, *, nb_logical: int) -> Callable:
