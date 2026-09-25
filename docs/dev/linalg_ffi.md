@@ -4,7 +4,7 @@
 API, `Plan`/`FactorToken`/`matmul`, backend vocabularies, the guard ladder,
 promise semantics, layouts, donation, refusals and performance. The ζ-fit
 channel policy (charge rank truncation, transverse ridge, the whole-tile
-back-solve tiers) is owned by
+back-solve) is owned by
 [Face-ψ ζ fitting](../architecture/zeta_fit_face_psi_cct.md). This page owns
 the one deck dial, the procedure for adding a backend, and the failure modes
 inside the ScaLAPACK handlers that no Python guard can see.

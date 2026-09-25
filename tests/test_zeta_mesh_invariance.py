@@ -432,72 +432,11 @@ def test_rank_truncate_refuses_above_the_replication_cap():
 
 
 
-def test_zeta_gather_tier_ladder_is_pinned():
-    """``distributed_zeta_solve`` route-pin — the DATA MOVEMENT of the ζ
-    back-solve, orthogonal to ``charge_zeta_solve``'s factorization choice.
-
-    ``auto`` picks ``local`` (R4, 2026-09-23: each whole-tile factor stays on
-    its q owner, only the RHS moves) whenever the q-local batch holds at most
-    twice the even share per rank (``ceil(nq/P)·P <= 2·nq``), and whenever the
-    replicated ``(nq, μ, μ)`` gather would cross ``LORRAX_ZETA_GATHER_CAP_GIB``
-    (4 GiB).  Only a small stack spread over many more ranks than q's keeps
-    ``replicated``.  A memory/movement decision, never a physics one: both
-    tiers run the same per-q logical-extent kernel.  Any other spelling
-    (``per_q``, ``distributed``) refuses.
-    """
-    import numpy as np
-
-    import isdf.core as core
-
-    class _Mesh:                       # the auto rule reads only the count
-        def __init__(self, n):
-            self.devices = np.empty(int(n))
-
-    assert core._ZETA_GATHER_MAX_BYTES == 4 * 1024 ** 3, \
-        f"default gather cap changed: {core._ZETA_GATHER_MAX_BYTES}"
-
-    # q-local batch within twice the even share -> local, at any stack size.
-    for mu, nq_, p in ((64, 9, 4), (640, 144, 16), (1446, 10, 16),
-                       (2016, 144, 64), (3200, 144, 100), (64, 9, 1)):
-        assert core._resolve_zeta_gather(
-            "auto", n_rmu=mu, nq=nq_, mesh_xy=_Mesh(p)) == "local", (mu, nq_, p)
-    # Few q on many ranks with a small stack -> replicated (balanced gather).
-    assert core._resolve_zeta_gather(
-        "auto", n_rmu=1446, nq=10, mesh_xy=_Mesh(64)) == "replicated"
-    assert core._resolve_zeta_gather(
-        "auto", n_rmu=640, nq=1, mesh_xy=_Mesh(4)) == "replicated"
-    # ...unless that stack is over the cap: local is its only whole-tile route.
-    assert core._resolve_zeta_gather(
-        "auto", n_rmu=20000, nq=2, mesh_xy=_Mesh(64)) == "local"
-    # The boundary itself: ceil(nq/P)*P == 2*nq is still local, one q fewer
-    # is not.
-    assert core._resolve_zeta_gather(
-        "auto", n_rmu=64, nq=8, mesh_xy=_Mesh(16)) == "local"
-    assert core._resolve_zeta_gather(
-        "auto", n_rmu=64, nq=7, mesh_xy=_Mesh(16)) == "replicated"
-    # No size info -> the conservative replicated path.
-    assert core._resolve_zeta_gather("auto") == "replicated"
-
-    # Explicit overrides win in both directions.
-    assert core._resolve_zeta_gather(
-        "replicated", n_rmu=2016, nq=144) == "replicated"
-    assert core._resolve_zeta_gather("local", n_rmu=64, nq=1) == "local"
-    with pytest.raises(ValueError, match="local"):
-        core._resolve_zeta_gather("per_q", n_rmu=64, nq=9)
-
-    # There is no distributed ζ tier: every tier is a whole-tile factor.
-    with pytest.raises(ValueError, match="local"):
-        core._resolve_zeta_gather("distributed", n_rmu=2016, nq=144)
-
-    with pytest.raises(ValueError):
-        core._resolve_zeta_gather("nonsense")
-
-
 def test_distributed_tier_collective_payload_is_bounded(monkeypatch):
     """The COLLECTIVE PAYLOAD bound of the `distributed` tier (scorecard AF).
 
-    A memory cap is not a transport cap.  ``LORRAX_ZETA_GATHER_CAP_GIB``
-    bounds how much gathered data may be LIVE; this bounds how many bytes
+    A memory cap is not a transport cap.  A memory cap bounds how much
+    gathered data may be LIVE; this bounds how many bytes
     ONE ``all_gather`` / ``psum_scatter`` instruction hands to the
     transport in a single shot.  Job 7876062 died at P=144 on a 1.15 GB
     single-shot Gloo AllGather in the C⁺ formation with MaxRSS at 12 % of

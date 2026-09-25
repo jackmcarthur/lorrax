@@ -131,7 +131,7 @@ The planner uses the host when the store fits the host share, and disk
 otherwise. The host share is 0.8·MemAvailable at plan time, divided among the
 processes on the node, taking the minimum over processes. The ψ read releases
 its host staging first (`WfnLoader.release_read_staging`). A tile read
-reaches the finalize layout with one all-to-all, then gathers slot order into
+reaches the q-local finalize layout with one all-to-all, then gathers slot order into
 packed centroid order (`OwnerOrbitBatches.slot_of_packed`). Tile t+1 is read
 while tile t is contracted.
 
@@ -169,18 +169,16 @@ for each G tile t:   ζ_t    = C⁻¹ Z_t                 through the seam, at t
 ```
 
 `ZetaG.write_file` is the same pass without V and the shell: it forms and
-writes ζ only, for a file consumer. The back-solve tier ([factor and back-solve](zeta_fit_face_psi_cct.md#factor-and-back-solve))
-fixes the layout. Under `local`, Z tiles are q-local,
-`P(('x','y'), None, None)`, and V accumulates on the q owner. Under
-`replicated`, Z tiles are G-split, and each rank accumulates partial sums over
-its own G columns. Each finished object (V, the shell, or a ζ tile for the file) leaves its
-accumulator in one explicit collective (`_to_mu_owner`: an all-to-all or a
-reduce-scatter), so V lands at `P(None,'x','y')` without being replicated.
+writes ζ only, for a file consumer. The factor sits on its q owners
+([factor and back-solve](zeta_fit_face_psi_cct.md#factor-and-back-solve)), so
+Z tiles are q-local, `P(('x','y'), None, None)`, and V accumulates on the q
+owner. Each finished object (V, the shell, or a ζ tile for the file) leaves
+its accumulator in one all-to-all (`_to_mu_owner`), so V lands at
+`P(None,'x','y')` without being replicated.
 Per rank, C⁺ and V each cost O(Q·μ²·N_G/P). The finalize holds three
 things per rank:
 
-- V: ceil(Q/P)·μ²·16 under `local`, or Q·μ²·16 of partial sums under
-  `replicated`;
+- V: ceil(Q/P)·μ²·16;
 - the factor;
 - about 6·ceil(Q/P)·μ·G_tile·16 bytes of Z and ζ tiles, which the choice of
   G_tile keeps below target/4.
@@ -256,7 +254,7 @@ The planner decides in this order:
    0.65 s·(c+1)/2 of owner work, times the batch count. The cheapest wins,
    and the receipt names the runner-up.
 4. **G tile.** G_tile is the largest multiple of P with
-   G_tile·(6·ceil(Q/P)·μ·16, plus Q·μ²·16/N_G when G-split) ≤ target/4,
+   G_tile·6·ceil(Q/P)·μ·16 ≤ target/4,
    capped at ceil(N_G/P)·P.
 
 The fit then packs whole orbits into bins with the least padded work,
@@ -306,7 +304,7 @@ they contribute nothing to V. Pad batch slots are −1 in
   current vertices in one kernel. Its red twins shift the ζ-sphere axis index
   by one, and compare channel 1 against channel 2's reference; both must miss
   by more than 1e-3. It also checks the current solve seam against a dense
-  (C + δI)⁻¹Z on an indefinite C, on both finalize layouts, with the PSD cut
+  (C + δI)⁻¹Z on an indefinite C, with the PSD cut
   as the red twin.
 - **`tests/test_zeta_mubatch_orbit_tables.py`** checks the whole-orbit batch
   tables against a direct Seitz evaluation, and checks that a split orbit

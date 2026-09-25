@@ -835,7 +835,6 @@ class LinalgResolution:
     eigh_backend: str
     sc_eigh: str
     charge_zeta_solve: str
-    distributed_zeta_solve: str
 
 
 _LINALG_RESOLUTION = "_linalg_resolution"
@@ -861,7 +860,6 @@ def resolve_linalg(params) -> LinalgResolution:
             eigh_backend="auto",
             sc_eigh="auto",
             charge_zeta_solve="rank_truncate",
-            distributed_zeta_solve="auto",
         )
     return LinalgResolution(
         layout=layout,
@@ -877,9 +875,7 @@ def resolve_linalg(params) -> LinalgResolution:
         sc_eigh="distributed",
         charge_zeta_solve="rank_truncate",
         # ζ is a whole-tile solve on every layout: the charge channel's
-        # route G applies the factor B on each G tile, and the planner picks
-        # local/replicated (isdf.core.zeta_auto_tier).
-        distributed_zeta_solve="auto",
+        # route G applies the factor B on each G tile, on its q owners.
     )
 
 
@@ -1435,46 +1431,8 @@ _DEFAULTS = {
     # Σc blow-up / device-count / nband instability).  "cholesky" = the
     # historical replicated/cuSolverMp Cholesky path (kept as an internal
     # implementation arm).
-    # Internal ζ BACK-SOLVE TIER — how much of the (nq, μ, μ) charge factor is ever
-    # replicated.  The first three tiers below are numerically free (same
-    # per-q arithmetic, only the gathered extent differs); `distributed`
-    # replaces the factorization as well and is the only one that scales.
-    #   replicated  = today's path: gather the whole (q_batch, μ, μ) stack
-    #                 onto every rank, nq·μ²·16 B, re-gathered per r-chunk
-    #                 (18.9 GB/rank at MoS2 12×12 / μ=1998).
-    #   per_q       = gather ONE (μ, μ) tile at a time, loop q — the slice
-    #                 is taken inside a shard_map so the partitioner cannot
-    #                 turn it back into the full-stack gather (it did until
-    #                 workstream AA; scorecard Y.2).  μ²·(1+1/p_y)·16 per
-    #                 execution and nq executions per r-chunk, so its TOTAL
-    #                 per-r-chunk traffic is ≈ the replicated tier's while
-    #                 its LIVE gather is nq× smaller: use it when memory,
-    #                 not bandwidth, is the binder and the mesh is not
-    #                 square enough for `distributed`.
-    #   distributed = NOTHING O(μ²) is replicated.  Distributed eigh
-    #                 (ScaLAPACK pzheevd), truncation on the replicated
-    #                 spectrum, 2D-sharded C⁺, and a stacked GEMM C⁺@Z with
-    #                 both operands 2D-sharded.  The ONLY tier whose
-    #                 FACTORIZATION divides by P — the other two run one
-    #                 dense eigh per q redundantly on every rank, O(nq·μ³)
-    #                 with no P-scaling (~86 h at μ=10k).  EXPLICIT opt-in:
-    #                 a block-cyclic eigh picks a different (equally valid)
-    #                 gauge, so ζ matches the other tiers to ~κ·ε, not
-    #                 bit-exactly.  Needs charge_zeta_solve='rank_truncate'
-    #                 and a SQUARE or 1-D mesh (pXheevd descriptor rule);
-    #                 refuses at resolve time otherwise.  On the transverse
-    #                 channels it resolves to per_q (indefinite CCT — its
-    #                 distributed route is distributed_lu=scalapack).
-    #   auto (DEFAULT) = replicated while the gather fits under
-    #                 LORRAX_ZETA_GATHER_CAP_GIB (4 GiB), per_q above it.
-    #                 Never `distributed`.  Fixture-scale stacks stay on
-    #                 replicated, so the default path is bit-identical to
-    #                 the pre-feature one.
-    # A SEPARATE env bound governs the `distributed` tier's TRANSPORT, not
-    # its memory: LORRAX_COLLECTIVE_CHUNK_MB (128 MB) caps ONE emitted
-    # collective's payload.  The 4 GiB gather cap was satisfied when job
-    # 7876062 died at P=144 inside a single 1.15 GB Gloo AllGather; see
-    # isdf/core.py's "COLLECTIVE PAYLOAD CHUNKING" note and scorecard AF.
+    # The ζ back-solve applies each whole-tile factor on its q owners
+    # (isdf.core.zeta_factor_resident); nothing O(Q·μ²) is replicated.
     # Rank-truncation cutoff (relative to λ_max, per q).  DEFAULT 1e-8 —
     # the LOW end of the over-complete recovery plateau.  An over-complete
     # basis needs it: at MoS2 4×4/1204c, 1e-10 only partially recovers (MAE
@@ -2718,7 +2676,6 @@ def _input_backend(
         eigh_backend=_linalg.eigh_backend,
         zeta_ridge=float(params["zeta_ridge"]),
         charge_zeta_solve=_linalg.charge_zeta_solve,
-        distributed_zeta_solve=_linalg.distributed_zeta_solve,
         zeta_rcond=float(params["zeta_rcond"]),
         gamma_contract_mode=str(params["gamma_contract_mode"]).strip().lower(),
     )
@@ -4367,7 +4324,6 @@ class BackendConfig:
     eigh_backend: str          # resolved internal distrib_la backend
     zeta_ridge: float          # charge-CCT Tikhonov ridge ε (rel. to tr/n)
     charge_zeta_solve: str     # "rank_truncate" | "cholesky"
-    distributed_zeta_solve: str  # "auto"|"replicated"|"local"
     zeta_rcond: float          # rank-truncation cutoff (·λ_max)
     gamma_contract_mode: str  # "take" | "einsum" | "scan"
 

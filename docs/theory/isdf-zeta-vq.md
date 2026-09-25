@@ -168,9 +168,9 @@ Symbols: \(n_p\) raw parents, \(N_k\) full-zone k, \(Q\) stored q,
 | stage | arithmetic per rank | memory per rank |
 |---|---|---|
 | \(C_q\) | \(2n_pn_s^2N_\mu^2n_b/P\) GEMM, plus \(O(N_\mu^2n_s^2N_k\log N_k/P)\) correlation | \(N_kN_\mu^2\cdot16/P\) before the IBZ slice |
-| factor | \(O(QN_\mu^3)\), divided by \(\min(P,Q)\) when q-parallel | a replicated q batch of at most 4 GiB, then \(\lceil Q/P\rceil N_\mu^2\cdot16\) or \(QN_\mu^2\cdot16\) |
+| factor | \(O(QN_\mu^3)\), divided by \(\min(P,Q)\) when q-parallel | a replicated q batch of at most 4 GiB, then \(\lceil Q/P\rceil N_\mu^2\cdot16\) on the q owners |
 | \(\tilde Z_q(\mathbf G)\) | \(2n_pn_s^2N_\mu n_bN_{G\psi}/P\) GEMM, plus \(O(N_\mu N_kn_s^2N_r(\log N_r+\log N_k)/P)\) transforms | the batch working set ([route G](../architecture/zeta_fit_mubatch.md#memory-per-rank-and-the-planner)) |
-| \(\tilde\zeta\) and \(V_q\) | \(O(QN_\mu^2N_G/P)\) | \(\tilde Z\) store \(QN_\mu N_G\cdot16/P\) on host or disk; \(V\) \(\lceil Q/P\rceil N_\mu^2\cdot16\) (partial sums \(QN_\mu^2\cdot16\) on the replicated tier) |
+| \(\tilde\zeta\) and \(V_q\) | \(O(QN_\mu^2N_G/P)\) | \(\tilde Z\) store \(QN_\mu N_G\cdot16/P\) on host or disk; \(V\) \(\lceil Q/P\rceil N_\mu^2\cdot16\) |
 
 At a fixed k grid, \(N_\mu\), \(n_b\) and \(N_G\) all grow linearly with
 system size, so the fit is cubic. The all-to-all moves

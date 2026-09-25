@@ -11,7 +11,7 @@ This page owns three parts of the fit:
 
 - the normal equations: C_q, the pad diagonal, the LR+RL completion and the
   q selection;
-- the factor and back-solve tiers;
+- the factor and the back-solve;
 - centroid order in memory and on disk.
 
 Every right-hand side runs on [route G](zeta_fit_mubatch.md), which also owns
@@ -110,19 +110,12 @@ q-parallel instead, with each rank factoring ceil(Q/P) whole matrices. The
 cost is O(Q·μ³), divided by min(P, Q) when q-parallel. A q batch that cannot
 be replicated refuses, and the refusal names the per-batch bytes.
 
-**Back-solve tier** (`_resolve_zeta_gather`):
-
-- **`local`.** Rank p holds ceil(Q/P) whole factors (`zeta_factor_resident`
-  moves them to batch layout once), and only the right-hand side moves.
-- **`replicated`.** The whole stack is replicated on every rank.
-
-The tier is automatic on every layout (`zeta_auto_tier`, read by the resolver
-and the planner alike). It is `local` when ceil(Q/P)·P ≤ 2Q, or when Q·μ²·16
-exceeds `LORRAX_ZETA_GATHER_CAP_GIB` (default 4 GiB), and `replicated`
-otherwise, which covers a few q on many ranks. Both tiers apply the same
-whole-tile factor, bit for bit. `linalg` does not select the tier:
-`linalg = distributed` distributes the W Dyson solve, the transverse LU and
-the eigensolvers, never the ζ back-solve. Route G applies the factor tile
+**Back-solve.** Rank p holds ceil(Q/P) whole factors, `16·⌈Q/P⌉·μ²` bytes
+(`zeta_factor_resident` moves them to the batch layout once), and only the
+right-hand side moves. With Q < P the ranks past Q hold pad rows and idle in
+the solve; nothing O(Q·μ²) is replicated. `linalg = distributed` distributes
+the W Dyson solve, the transverse LU and the eigensolvers, never the ζ
+back-solve. Route G applies the factor tile
 by tile ([finalize](zeta_fit_mubatch.md#finalize-v_q-and-the-head-columns)).
 
 **Current channels.** C_q^i is a Hermitian indefinite, signed Gram. The fit
@@ -133,8 +126,8 @@ the logical extent (`runtime.padding.solve_at_logical`), because pad-extent LU
 round-off is amplified O(1) in the near-null current modes.
 
 Route G applies the factor per G tile, so it is always the local whole-tile
-JAX LU (`factor_c_q` with `batch_reshard`), laid out on the q owners by the
-back-solve tier like the charge factor; a resolved provider LU is hoisted to
+JAX LU (`factor_c_q` with `batch_reshard`), laid out on the q owners like
+the charge factor; a resolved provider LU is hoisted to
 it, and `linalg = distributed` no longer selects a block-cyclic token here.
 The conditioning instrument κ_lb = max|u_ii|/min|u_ii|, a lower bound on κ,
 refuses above 1e12 under the same policy.

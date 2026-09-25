@@ -160,8 +160,8 @@ def test_split_orbit_refuses_by_name(acubic):
 
 
 def test_route_g_plans_the_whole_tile_tier_under_linalg_distributed():
-    """`linalg = distributed` sets the other stages; route G's ζ tier stays
-    the planner's whole-tile choice, stated once in the plan receipt."""
+    """`linalg = distributed` sets the other stages; route G's ζ back-solve
+    stays whole-tile on the q owners, stated once in the plan receipt."""
     from gw.gw_config import resolve_linalg
     from gw.gw_init import _plan_route_g_for_channel
     from gw.wavefunction_bundle import BandSlices
@@ -175,7 +175,6 @@ def test_route_g_plans_the_whole_tile_tier_under_linalg_distributed():
         memory=SimpleNamespace(
             per_device_gb=33.9, chunk_target_utilization=0.0),
         backend=SimpleNamespace(
-            distributed_zeta_solve=prof.distributed_zeta_solve,
             charge_zeta_solve=prof.charge_zeta_solve))
     mesh = SimpleNamespace(shape={'x': 2, 'y': 2},
                            devices=np.empty(4, dtype=object))
@@ -185,9 +184,8 @@ def test_route_g_plans_the_whole_tile_tier_under_linalg_distributed():
         band_slices=BandSlices.from_band_edges(0, 0, 130, 144, 144),
         mesh_xy=mesh, n_q_selected=10, n_parent=10,
         print_fn=lines.append, zeta_ngkmax=8000, psi_ngkmax=12000)
-    assert chunks["mubatch"].zeta_tier == "local"
     receipt = "\n".join(lines).splitlines()
-    assert sum("ζ tier" in line for line in receipt) == 1
+    assert sum("ζ back-solve" in line for line in receipt) == 1
 
 
 def test_best_owner_batching_never_packs_worse_than_the_planned_bin(acubic):
