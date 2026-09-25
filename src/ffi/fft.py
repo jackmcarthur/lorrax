@@ -1057,14 +1057,18 @@ def make_plane_fft_gather(mesh: Mesh, plane_from_col, n_col: int, plane_shape) -
         Y[..., k_b, k_c] = Σ_{b,c} plane[..., b, c] e^{-2πi (b k_b/n_b + c k_c/n_c)},
         plane = take(F, plane_from_col, axis=-1, mode='fill').reshape(..., n_b, n_c)
 
-    i.e. ``fftn(plane, axes=(-2, -1), norm='backward')``.  CUDA: nvidia-mathdx
+    i.e. ``fftn(plane, axes=(-2, -1), norm='backward')``.  ``fn(F, start,
+    size)`` transforms the slab ``F[:, start:start+size]`` of ``F (A, S, ...,
+    n_col)`` in place (``start`` traced, clamped as ``lax.dynamic_slice``
+    clamps; ``size`` static) and returns ``(A, size, ..., n_b, n_c)``.  CUDA: nvidia-mathdx
     mode 10, which never writes the zero plane: the row FFTs run on the
     occupied rows only and gather their cells on load, the column FFTs read
     dead rows as zero, and the plane is stored once.  A plane mode 10 cannot
     serve (an axis with no thread-FFT split, :func:`plane_fft_split`, or a
     plane above the device's opt-in shared memory) takes the XLA route
     (static-run concatenate + cuFFT 2-D), decided here once and announced.
-    cpu: the XLA route.
+    cpu: the XLA route.  The returned function's ``route`` attribute names
+    the one taken (``'mathdx'`` or ``'xla'``).
     """
     nb, nc = (int(v) for v in plane_shape)
     n_col = int(n_col)
@@ -1073,12 +1077,15 @@ def make_plane_fft_gather(mesh: Mesh, plane_from_col, n_col: int, plane_shape) -
         raise ValueError(f"plane_from_col has {pfc.size} cells; want n_b·n_c = {nb * nc}")
     runs = _plane_runs(pfc, n_col)
 
-    def _xla(F):
+    def _xla(F, start=None, size=None):
         _check_complex(F)
+        if start is not None:
+            F = jax.lax.dynamic_slice_in_dim(F, start, int(size), axis=1)
         z = lambda n: jnp.zeros(F.shape[:-1] + (n,), F.dtype)
         st = jnp.concatenate([F[..., a:e] if a >= 0 else z(e) for a, e in runs], axis=-1)
         return jnp.fft.fftn(st.reshape(F.shape[:-1] + (nb, nc)), axes=(-2, -1))
 
+    _xla.route = "xla"
     if kconv_backend(mesh) != "mathdx":
         return _xla
     from ffi.gate import announce_once
@@ -1103,13 +1110,21 @@ def make_plane_fft_gather(mesh: Mesh, plane_from_col, n_col: int, plane_shape) -
                   f"[plane_fft] plane ({nb},{nc}): mathdx mode 10, splits {sb} x {sc}, "
                   f"{rows.size} of {nb} rows occupied", scope="rank0")
 
-    def _mathdx(F):
+    def _mathdx(F, start=None, size=None):
         _check_complex(F)
         if int(F.shape[-1]) != n_col:
             raise ValueError(f"plane FFT expects F (..., n_col={n_col}); got {F.shape}")
-        out = jax.ShapeDtypeStruct(F.shape[:-1] + (nb, nc), F.dtype)
+        lead = F.shape[:-1]
+        if start is not None:
+            if F.ndim < 3 or not 0 < int(size) <= F.shape[1]:
+                raise ValueError(f"slab form needs F (A, S, ..., n_col) and 0 < size <= S; got "
+                                 f"{F.shape}, size={size}")
+            lead = (F.shape[0], int(size)) + F.shape[2:-1]
+        out = jax.ShapeDtypeStruct(lead + (nb, nc), F.dtype)
+        s0 = jnp.asarray(0 if start is None else start, jnp.int32)
         return jax.ffi.ffi_call(PLANE_FFT_GATHER_TARGET, out)(
-            F, jnp.asarray(gidx), jnp.asarray(rows), **attrs)
+            F, jnp.asarray(gidx), jnp.asarray(rows), s0, **attrs)
+    _mathdx.route = "mathdx"
     return _mathdx
 
 def make_kconv_klead(mesh: Mesh, kgrid, t_spec: P, w_spec: P, *,

@@ -800,7 +800,8 @@ struct __align__(16) lrx_c2 { double x, y; };
 struct PlaneGather {
     const int* gidx;       // (rows, n_c): cylinder column of each cell of an occupied row, -1 = empty
     const int* row_of;     // (rows,): the plane row b of occupied row r
-    long long rows, n_col, planes;
+    const int* start;      // () slab start on F's axis 1
+    long long rows, n_col, planes, s_len, n_pg, inner;
 };
 
 constexpr int NB = LRX_NX, NC = LRX_NY;
@@ -858,8 +859,13 @@ extern "C" __global__ void __launch_bounds__(256) lrx_kconv(
     __syncthreads();
     for (int r = threadIdx.x; r < rows; r += blockDim.x) { rowb[r] = g.row_of[r]; live[g.row_of[r]] = 1; }
     __syncthreads();
+    // Output plane (a, j, r) of Y (A, n_pg, inner) reads F plane (a, start + j, r)
+    // of F (A, s_len, inner): the slab F[:, start:start+n_pg] in place.
+    long long st = *g.start;
+    st = st < 0 ? 0 : (st > g.s_len - g.n_pg ? g.s_len - g.n_pg : st);
     for (long long plane = blockIdx.x; plane < g.planes; plane += gridDim.x) {
-        const lrx_c2* __restrict__ f = fin + plane * g.n_col;
+        const long long a = plane / (g.n_pg * g.inner), rem = plane - a * g.n_pg * g.inner;
+        const lrx_c2* __restrict__ f = fin + ((a * g.s_len + st) * g.inner + rem) * g.n_col;
         // The occupied rows' cells, gathered from the cylinder (zeros implicit).
         for (int t = threadIdx.x; t < rows * NC; t += blockDim.x) {
             const int r = t / NC, c = t - r * NC, col = g.gidx[t];
@@ -1655,14 +1661,17 @@ static ffi::Error KminorFft(cudaStream_t s, ffi::AnyBuffer X, ffi::Result<ffi::A
 struct PlaneGather {
     const int* gidx;       // (rows, n_c) cylinder column of each cell of an occupied row, -1 = empty
     const int* row_of;     // (rows,) plane row of each occupied row
-    long long rows, n_col, planes;
+    const int* start;      // () slab start on F's axis 1 (clamped as lax.dynamic_slice clamps)
+    long long rows, n_col, planes, s_len, n_pg, inner;
 };
 
-// Mode 10: Y (..., n_b, n_c) = the forward unscaled 2-D FFT of the plane that
-// F (..., n_col) fills through the static tables; b1 | n_b and c1 | n_c are
-// the Good-Thomas splits ffi.fft.plane_fft_split chose.
+// Mode 10: Y (A, n_pg, *R, n_b, n_c) = the forward unscaled 2-D FFT of the
+// planes that the slab F[:, start:start+n_pg] of F (A, S, *R, n_col) fills
+// through the static tables (the plain form is n_pg = S, start = 0); b1 | n_b
+// and c1 | n_c are the Good-Thomas splits ffi.fft.plane_fft_split chose.
 static ffi::Error PlaneFftGather(cudaStream_t stream, ffi::AnyBuffer F, ffi::AnyBuffer gidx,
-                                 ffi::AnyBuffer row_of, ffi::Result<ffi::AnyBuffer> Y, int64_t nb,
+                                 ffi::AnyBuffer row_of, ffi::AnyBuffer start,
+                                 ffi::Result<ffi::AnyBuffer> Y, int64_t nb,
                                  int64_t nc, int64_t b1, int64_t c1, std::string_view mathdx_root,
                                  std::string_view cubin_dir) {
     auto bad = [](const std::string& why) {
@@ -1685,23 +1694,30 @@ static ffi::Error PlaneFftGather(cudaStream_t stream, ffi::AnyBuffer F, ffi::Any
     const auto C = ffi::DataType::C128, I = ffi::DataType::S32;
     auto fd = F.dimensions(), yd = Y->dimensions(), gd = gidx.dimensions(), rd = row_of.dimensions();
     if (F.element_type() != C || Y->element_type() != C || gidx.element_type() != I ||
-        row_of.element_type() != I || fd.size() < 1 || yd.size() != fd.size() + 1 ||
-        yd[yd.size() - 2] != nb || yd[yd.size() - 1] != nc || gd.size() != 2 || gd[1] != nc ||
-        rd.size() != 1 || rd[0] != gd[0] || gd[0] > nb)
-        return bad("want F (..., n_col) c128, Y (..., n_b, n_c) c128, gidx (rows, n_c) s32 and "
-                   "row_of (rows,) s32 with rows <= n_b");
-    long long planes = 1;
-    for (size_t i = 0; i + 1 < fd.size(); ++i) {
-        if (fd[i] != yd[i]) return bad("F and Y leading dimensions differ");
-        planes *= fd[i];
+        row_of.element_type() != I || start.element_type() != I || start.dimensions().size() != 0 ||
+        fd.size() < 1 || yd.size() != fd.size() + 1 || yd[yd.size() - 2] != nb ||
+        yd[yd.size() - 1] != nc || gd.size() != 2 || gd[1] != nc || rd.size() != 1 || rd[0] != gd[0] ||
+        gd[0] > nb)
+        return bad("want F (A, S, *R, n_col) c128, Y (A, n_pg, *R, n_b, n_c) c128, gidx (rows, n_c) s32, "
+                   "row_of (rows,) s32 with rows <= n_b and start () s32");
+    // F's L batch axes read as (A, S, *R): A, S (F) / n_pg (Y) and inner = prod(R).
+    const size_t L = fd.size() - 1;
+    const long long A = L >= 1 ? fd[0] : 1, S = L >= 2 ? fd[1] : 1, n_pg = L >= 2 ? yd[1] : 1;
+    long long inner = 1;
+    for (size_t i = 2; i < L; ++i) {
+        if (fd[i] != yd[i]) return bad("F and Y trailing batch dimensions differ");
+        inner *= fd[i];
     }
+    if ((L >= 1 && yd[0] != A) || n_pg > S) return bad("want Y (A, n_pg <= S, *R, n_b, n_c)");
+    const long long planes = A * n_pg * inner;
     if (planes == 0) return ffi::Error::Success();
     const Built* k = nullptr;
     ffi::Error e = build(10, static_cast<int>(nb), static_cast<int>(nc), static_cast<int>(b1),
                          static_cast<int>(c1), false, mathdx_root, cubin_dir, &k);
     if (!e.success()) return e;
     PlaneGather g{static_cast<const int*>(gidx.untyped_data()), static_cast<const int*>(row_of.untyped_data()),
-                  gd[0], fd[fd.size() - 1], planes};
+                  static_cast<const int*>(start.untyped_data()), gd[0], fd[fd.size() - 1], planes, S, n_pg,
+                  inner};
     const void* fp = F.untyped_data();
     void* yp = Y->untyped_data();
     void* args[] = {(void*)&fp, (void*)&yp, (void*)&g};
@@ -1933,6 +1949,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
     PlaneFftGatherMathdxCudaFfi, lorrax_ffi::kconv_mathdx::PlaneFftGather,
     xla::ffi::Ffi::Bind()
         .Ctx<xla::ffi::PlatformStream<cudaStream_t>>()
+        .Arg<xla::ffi::AnyBuffer>()
         .Arg<xla::ffi::AnyBuffer>()
         .Arg<xla::ffi::AnyBuffer>()
         .Arg<xla::ffi::AnyBuffer>()
