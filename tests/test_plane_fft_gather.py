@@ -89,7 +89,8 @@ def test_split_covers_qe_axes_and_refuses_large_prime_powers():
         assert n1 * n2 == n and math.gcd(n1, n2) == 1 and 2 <= n1 <= 40 and n2 <= 40, (n, s)
 
 
-@pytest.mark.parametrize("nb,nc", [(n, n) for n in QE if plane_fft_split(n)] + [(54, 45), (72, 80), (24, 100)])
+@pytest.mark.parametrize("nb,nc", [(n, n) for n in QE if plane_fft_split(n)]
+                         + [(54, 45), (72, 80), (24, 100), (75, 138), (105, 99)])
 def test_mode10_model_equals_fft2(nb, nc):
     rng = np.random.default_rng(nb * 1000 + nc)
     for frac, kind in ((0.2, "disk"), (0.45, "disk"), (0.3, "random")):
@@ -98,6 +99,16 @@ def test_mode10_model_equals_fft2(nb, nc):
         ref = _reference(F, pfc, n_col, nb, nc)
         got = _mode10_model(F, pfc, n_col, nb, nc)
         assert np.max(np.abs(got - ref)) <= 1e-12 * np.max(np.abs(ref)), (nb, nc, frac, kind)
+
+
+def test_resident_bytes_count_the_static_tables():
+    """The A100 opt-in edge (166912 B): the FFT audit's planes fit the dynamic
+    plane alone but not with the static tables; 105x99 fits with them."""
+    from ffi.fft import plane_resident_bytes
+    optin = 166912
+    for nb, nc in ((75, 138), (57, 182), (112, 92)):
+        assert 16 * nb * (nc | 1) <= optin < plane_resident_bytes(nb, nc), (nb, nc)
+    assert plane_resident_bytes(105, 99) <= optin
 
 
 def test_cpu_door_is_the_xla_route():

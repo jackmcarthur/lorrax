@@ -9,8 +9,10 @@ on its own GPU (the runtime's cross-rank compile agreement wants identical
 modules).
 
 * A plane whose axes split into cuFFTDx thread FFTs and whose resident plane
-  fits the device's opt-in shared memory must take route ``mathdx``; any
-  other (64, 125, 128, 250; large planes) route ``xla``, both asserted.
+  plus the kernel's static tables (``plane_resident_bytes``) fits the device's
+  opt-in shared memory must take route ``mathdx``; any other (64, 125, 128,
+  250; large planes; the ceiling-edge planes 75x138, 57x182, 112x92 on A100)
+  route ``xla``, both asserted.  105x99 sits just inside the A100 edge.
 * Parity: ``max|Y - ref| <= 1e-13 max|ref|`` (not bitwise vs cuFFT).
 * Red twin: the door built on a support rolled by one cell misses by > 1e-3.
 * The slab form ``fn(F, start, size)`` (traced start, including a clamped
@@ -37,7 +39,8 @@ import jax.numpy as jnp  # noqa: E402
 from jax.experimental import multihost_utils  # noqa: E402
 from jax.sharding import Mesh  # noqa: E402
 
-from ffi.fft import _optin_smem_bytes, kconv_backend, make_plane_fft_gather, plane_fft_split  # noqa: E402
+from ffi.fft import (_optin_smem_bytes, kconv_backend, make_plane_fft_gather,  # noqa: E402
+                    plane_fft_split, plane_resident_bytes)
 
 TAG = "[plane-fft-p4]"
 TOL, RED = 1.0e-13, 1.0e-3
@@ -80,14 +83,19 @@ def main():
         cases.append((n, n, 0.45, "disk", (1,)))
         cases.append((n, n, 0.3, "random", (37,)))
     cases += [(54, 45, 0.2, "disk", (2, 3, 5)), (72, 80, 0.3, "random", (9,)),
-              (24, 100, 0.45, "disk", (4,)), (54, 54, 0.0, "empty", (3,))]
+              (24, 100, 0.45, "disk", (4,)), (54, 54, 0.0, "empty", (3,)),
+              # The opt-in shared-memory edge (A100: 166912 B).  (105, 99) fits with its
+              # static tables (mathdx); the other three fit the plane alone but not with
+              # them, so they must route xla (the FFT audit's failing planes).
+              (105, 99, 0.3, "disk", (2,)), (75, 138, 0.3, "disk", (2,)),
+              (57, 182, 0.3, "disk", (2,)), (112, 92, 0.3, "disk", (2,))]
     worst, fails, n_m10, n_xla = 0.0, [], 0, 0
     for ci, (nb, nc, frac, kind, lead) in enumerate(cases):
         rng = np.random.default_rng(1000 * ci + 17)
         pfc, n_col = support(nb, nc, frac, rng, kind)
         fn = make_plane_fft_gather(mesh, pfc, n_col, (nb, nc))
         want = ("mathdx" if plane_fft_split(nb) and plane_fft_split(nc)
-                and 16 * nb * (nc | 1) <= optin else "xla")
+                and plane_resident_bytes(nb, nc) <= optin else "xla")
         if fn.route != want:
             fails.append(f"({nb},{nc}) route {fn.route} != {want}")
         n_m10 += fn.route == "mathdx"

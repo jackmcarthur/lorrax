@@ -161,7 +161,7 @@ __all__ = [
     "make_kconv_kminor", "kconv_kminor_out_shape",
     "make_kfft_klead", "make_kfft_kminor",
     "make_local_kfft_klead", "make_local_kfft_kminor", "make_local_kconv_kminor",
-    "PLANE_FFT_GATHER_TARGET", "plane_fft_split", "make_plane_fft_gather",
+    "PLANE_FFT_GATHER_TARGET", "plane_fft_split", "plane_resident_bytes", "make_plane_fft_gather",
 ]
 
 FLAT_K_TARGET = "lorrax_mklfft_flat_k"
@@ -1050,6 +1050,19 @@ def _optin_smem_bytes(ordinal: int = 0) -> int | None:
         return None
 
 
+def plane_resident_bytes(nb: int, nc: int) -> int:
+    """Shared memory one mode-10 block needs for an ``(nb, nc)`` plane, static included.
+
+    The dynamic plane ``16·nb·(nc|1)`` plus the kernel's static tables
+    ``live[nb]`` (1 B), ``rowb[nb]`` (4 B) and ``foff[PB]`` (8 B, PB = 1 for
+    any plane near the limit), with 16 B of alignment slack.  Mode 10 serves
+    the plane only when this fits the device's opt-in shared memory per block;
+    the handler's build() applies the same bound.
+    """
+    nb, nc = int(nb), int(nc)
+    return 16 * nb * (nc | 1) + 5 * nb + 8 + 16
+
+
 def make_plane_fft_gather(mesh: Mesh, plane_from_col, n_col: int, plane_shape) -> Callable:
     """Rank-local ``fn(F) -> Y``: the route-G plane transform read straight from the cylinder.
 
@@ -1094,7 +1107,7 @@ def make_plane_fft_gather(mesh: Mesh, plane_from_col, n_col: int, plane_shape) -
         return _xla
     from ffi.gate import announce_once
     sb, sc = plane_fft_split(nb), plane_fft_split(nc)
-    need, have = 16 * nb * (nc | 1), _optin_smem_bytes()
+    need, have = plane_resident_bytes(nb, nc), _optin_smem_bytes()
     why = ("an axis has no coprime split into cuFFTDx thread FFTs (<= "
            f"{KCONV_AXIS_MAX})" if sb is None or sc is None else
            f"the resident plane needs {need} B > {have} B of opt-in shared memory"
