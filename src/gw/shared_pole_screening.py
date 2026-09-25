@@ -224,7 +224,7 @@ def _bank_residence(meta, config, *, mesh_xy, sym, root, label, photon, mu_bases
 _MANAGED_SCRATCH = r"sc_[0-9]{4}_shared_pole"
 
 
-def retain_iteration_scratch(run_dir, label, *, print_fn=print):
+def retain_iteration_scratch(run_dir, label, *, pinned=(), print_fn=print):
     """Collectively keep only map ``label``'s shared-pole scratch generation.
 
     Each SC map screens into its own ``sc_NNNN_shared_pole/``, and a file-tier
@@ -237,14 +237,26 @@ def retain_iteration_scratch(run_dir, label, *, print_fn=print):
     also clears stale later maps of a longer earlier run.  This is
     ``gw.mpa.model.retain_iteration_artifacts``'s rule, through the same
     removal owner.
+
+    ``pinned`` paths are run-lifetime artifacts that live inside an earlier
+    generation, and their generation is kept too: the photon route's static
+    reference, the immutable initial contact every later map freezes, is map
+    0's ``photon_static_reference.h5`` for a resident bank and map 0's
+    ``bank.h5`` itself for a file-tier bank.
     """
     import os
+    import re
     from .qsgw_utils import remove_managed
 
     root = os.path.abspath(os.fspath(run_dir))
+    keep = [os.path.join(root, f"{label}_shared_pole")]
+    for path in pinned:
+        generation = os.path.dirname(os.path.abspath(os.fspath(path)))
+        if (os.path.dirname(generation) == root
+                and re.fullmatch(_MANAGED_SCRATCH, os.path.basename(generation))):
+            keep.append(generation)
     removed = remove_managed(
-        root, _MANAGED_SCRATCH,
-        keep=[os.path.join(root, f"{label}_shared_pole")],
+        root, _MANAGED_SCRATCH, keep=keep,
         barrier_tag=f"shared_pole.scratch.retain.{label}", print_fn=print_fn)
     if removed:
         print_fn(f"  shared-pole scratch: retained {label}; discarded: "
