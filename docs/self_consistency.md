@@ -41,8 +41,8 @@ instead of calling `eigh` on $\mathrm{diag}(E_{\rm DFT})$, so SC map 0 equals th
 one-shot G0W0 bit for bit
 (`tests/test_invariance_gates.py::test_sc_iteration1_equals_one_shot`). Each
 map costs one full $\chi_0 \to W \to \Sigma$ evaluation. Σ rule planning is
-paid on maps 0–2 (two one-shot plans, then the frozen set), and after that
-only for windows that escape (§4).
+paid on map 0 (its one-shot plan and the frozen set), and after that only for
+windows that escape (§4).
 
 The loop is driven by eqp0, which is Σ at the current energies. No Z-factor
 enters the iteration. Each map also writes the BerkeleyGW-shaped linearization
@@ -221,9 +221,9 @@ state.
   `sigma_regularization_ev` is the literal broadening η of every ansatz and
   is not a speed knob. The quadrature page owns η and
   `sigma_quadrature_eps`.
-- **Frozen rules** (`sigma_box_plan`). Maps 0 and 1 use the one-shot planner,
-  because they carry the loop's largest motion. From map 2, one rule per
-  product window is certified on the window's box, padded in two ways: each
+- **Frozen rules** (`sigma_box_plan`). Map 0 is served by the one-shot
+  planner's rules. The same call freezes one rule per product window,
+  certified on the window's box padded in two ways: each
   edge by the pad of the state that sets it, and by 10 % for the poles. The
   zero-side edge of a sign-definite box stops at 5 % of its distance to zero,
   so the box stays sign-definite. Later maps reuse a rule by containment

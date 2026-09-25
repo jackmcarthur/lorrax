@@ -52,13 +52,6 @@ _RUNTIME_NOISE_EPSILON = 6.0e-8
 _RUNTIME_NOISE_SAFETY = 0.05
 _SC_POLE_PAD_FRACTION = 0.10
 _BOX_SIGN_FRACTION = 0.7
-#: SC planner calls served by the one-shot planner before the rule set
-#: freezes (owner 2026-09-24, survey A3). Maps 0 and 1 carry the loop's
-#: largest motion (Si: every state rigidly +0.39 eV at map 1), and the flat
-#: +-2 eV certificate that absorbed it was paid on every later map. The set
-#: now freezes at map 1's output with the classification and pole pads only;
-#: a later escape refits it (see ``_fit_fixed_sc_rules``).
-_SC_ONE_SHOT_CALLS = 2
 #: Pad toward zero for a sign-definite SC window: 0.5 of its distance escaped by 1.6% on TaAs 8^3
 #: map 1 and 0.25 again at map 2 (semimetal valence state 30 -> 15 -> 6 meV from E_F); 0.05 floors it below 1 meV.
 _SC_ZERO_SIDE_CAP = 0.05
@@ -748,11 +741,34 @@ def _serve_from_plan(specs, fits, eps, cache_dir):
     return served
 
 
-def _parallel_fits(specs, worker):
+def _fit_cost(spec, eta):
+    """Predicted builder cost, only to balance ranks: a crossing rule's node
+    count follows its short side in units of eta (CrI3 8x8: 113-129 nodes,
+    4-9 s); a sign-definite rule is a few nodes (0.5-1.5 s)."""
+    if spec["kind"] != "crossing":
+        return 1.0
+    return 1.0 + min(-float(spec["box"][0]), float(spec["box"][1])) / eta
+
+
+def _rank_assignment(costs, world):
+    """Longest predicted fit first, each to the least-loaded rank.
+
+    Equal costs reduce to round-robin. The assignment is a function of the
+    specs, so every rank computes the same one, and a rule does not depend on
+    the rank that fits it."""
+    load, owned = [0.0] * world, [[] for _ in range(world)]
+    for index in sorted(range(len(costs)), key=lambda i: (-costs[i], i)):
+        target = min(range(world), key=lambda r: (load[r], r))
+        owned[target].append(index)
+        load[target] += costs[index]
+    return owned
+
+
+def _parallel_fits(specs, worker, costs):
     """Fit independent windows once across ranks and replicate small rules."""
     rank, world = int(process_rank()), int(process_count())
     local = []
-    for index in range(rank, len(specs), world):
+    for index in _rank_assignment(costs, world)[rank]:
         started = time.perf_counter()
         try:
             value = worker(index)
@@ -795,6 +811,13 @@ def _parallel_fits(specs, worker):
 def fit_sigma_box_specs(
     specs, eta_ry, *, eps, cache_dir, cache_build_widen=True,
 ):
+    """One plan: :func:`fit_sigma_box_spec_groups` with a single group."""
+    (fits, fit_rows), = fit_sigma_box_spec_groups(
+        [(specs, cache_build_widen)], eta_ry, eps=eps, cache_dir=cache_dir)
+    return fits, fit_rows
+
+
+def fit_sigma_box_spec_groups(groups, eta_ry, *, eps, cache_dir):
     """Fit independent route-neutral box specifications across processes.
 
     The input rows must come from :func:`make_sigma_box_spec`.  This function
@@ -806,8 +829,19 @@ def fit_sigma_box_specs(
     builds are stored, and each window is then served the smallest
     compatible rule of the plan in a fixed order (:func:`_serve_from_plan`),
     so the result does not depend on rank timing.
+
+    ``groups`` is a list of ``(specs, cache_build_widen)``; each group is one
+    plan, looked up against the cache as it was before this call and served
+    only from its own builds, but all groups share one balanced parallel pass
+    (the SC map-0 one-shot and padded sets, P2-E 2026-09-24). Returns one
+    ``(fits, fit_rows)`` per group.
     """
-    rows = list(specs)
+    rows, widen, bounds = [], [], []
+    for specs, group_widen in groups:
+        start = len(rows)
+        rows.extend(specs)
+        widen.extend([bool(group_widen)] * (len(rows) - start))
+        bounds.append((start, len(rows)))
     eta, tolerance = float(eta_ry), float(eps)
     if not np.isfinite(eta) or eta <= 0.0:
         raise ValueError("sigma_quadrature requires eta_ry > 0")
@@ -816,9 +850,10 @@ def fit_sigma_box_specs(
     fits, fit_rows = _parallel_fits(
         rows, lambda index: _fit_rule(
             rows[index], tolerance, cache_dir, eta,
-            cache_build_widen=bool(cache_build_widen)))
+            cache_build_widen=widen[index]),
+        [_fit_cost(spec, eta) for spec in rows])
     if cache_dir is None:
-        return fits, fit_rows
+        return [(fits[lo:hi], fit_rows[lo:hi]) for lo, hi in bounds]
     # Every rank has looked up by now (the gather above), so writing the
     # plan's builds cannot change any choice made in it. One writer: the
     # replicated receipts already hold every build.
@@ -837,7 +872,8 @@ def fit_sigma_box_specs(
         # different (within-eps) rule, so the plan would depend on rank
         # timing.  ``fits`` is replicated, so every rank takes this or none.
         all_gather_processes(np.asarray(0, np.int32))
-    return _serve_from_plan(rows, fits, tolerance, cache_dir), fit_rows
+    return [(_serve_from_plan(rows[lo:hi], fits[lo:hi], tolerance, cache_dir),
+             fit_rows[lo:hi]) for lo, hi in bounds]
 
 
 def _box_contains(outer, inner):
@@ -981,12 +1017,19 @@ def _fixed_fit_for_spec(entry, spec):
 def _fit_fixed_sc_rules(
     specs, eta, *, eps, cache_dir, session, material_class=None,
 ):
-    """One-shot rules for the first maps, then one frozen, padded rule set.
+    """One frozen, padded rule set from the first map; map 0 itself one-shot.
 
-    The first ``_SC_ONE_SHOT_CALLS`` planner calls use the ordinary one-shot
-    planner (unpadded, cache-served). The next call freezes a rule set on its
-    own boxes padded by :func:`_sc_padded_box_spec`, and the same tau node
-    map is reused on every later map while it holds. Three events refit:
+    The first call serves its own map with the ordinary one-shot rules, so SC
+    map 0 equals the one-shot G0W0 bit for bit, and on the same call freezes
+    a rule set on those boxes padded by :func:`_sc_padded_box_spec`. Every
+    later map reuses those tau nodes while they hold. The one-shot rules are
+    served only from their own plan, so no padded certificate reaches map 0;
+    both sets are fitted in one balanced parallel pass.
+    Freezing at map 0 rather than map 2 (P2-E, 2026-09-24): Fe 4^3 bispinor
+    SC plan 48.6 -> ~28 s over 4 maps, since a metal's windows barely move and
+    maps 1-2 had refit all 12; on CrI3 8x8, whose gap opens at map 1, the map-1
+    escapes refit around the new boxes, as the map-2 freeze did. Three
+    events refit:
 
     * a window that escapes its certificate box, changes error currency, or
       did not exist when the set froze is refit on this map, alone (owner
@@ -1015,23 +1058,12 @@ def _fit_fixed_sc_rules(
             "SC fixed quadrature session changed currency: "
             f"eta {session['eta_ry']!r}->{eta!r}, "
             f"eps {session['eps']!r}->{eps!r}")
-    if iteration <= _SC_ONE_SHOT_CALLS:
-        fits, fit_rows = fit_sigma_box_specs(
-            rows, eta, eps=eps, cache_dir=cache_dir)
-        return fits, fit_rows, {
-            "iteration": iteration, "mode": "one-shot", "initialized": False,
-            "rebuilt": (), "recompute_reasons": (), "escaped": 0,
-            "rebuild_count_total": int(session.get("rebuild_count", 0)),
-            "material_class": session.get("material_class"),
-            "class_flip": session.pop("class_flip", None),
-        }
     if "rules" not in session:
         session["eta_ry"] = float(eta)
         session["eps"] = float(eps)
         padded = [_sc_padded_box_spec(spec, eta) for spec in rows]
-        fits, fit_rows = fit_sigma_box_specs(
-            padded, eta, eps=eps,
-            cache_dir=cache_dir, cache_build_widen=False)
+        (served, fit_rows), (fits, padded_rows) = fit_sigma_box_spec_groups(
+            [(rows, True), (padded, False)], eta, eps=eps, cache_dir=cache_dir)
         session["rules"] = {
             spec["name"]: {
                 "fit": dict(fit, cache_status=f"init:{fit['cache_status']}"),
@@ -1040,8 +1072,8 @@ def _fit_fixed_sc_rules(
             } for spec, padded_spec, fit in zip(rows, padded, fits)}
         session["initial_window_tau_pairs"] = int(sum(
             fit["node_count"] for fit in fits))
-        return [dict(session["rules"][spec["name"]]["fit"]) for spec in rows], fit_rows, {
-            "iteration": iteration, "mode": "frozen", "initialized": True,
+        return served, list(fit_rows) + list(padded_rows), {
+            "iteration": iteration, "mode": "one-shot", "initialized": True,
             "rebuilt": (), "recompute_reasons": (), "escaped": 0,
             "rebuild_count_total": int(session.get("rebuild_count", 0)),
             "material_class": session.get("material_class"),
@@ -1210,9 +1242,9 @@ def plan_sigma_windows(
         Directory for immutable box-rule certificates, or ``None``.
     fixed_rule_session
         Mutable run-local receipt used only by a multi-map SC calculation.
-        Its first ``_SC_ONE_SHOT_CALLS`` calls use the one-shot planner; the
-        next call certifies boxes padded by the fixed SC policy, and every
-        later map reuses the exact same nodes by containment.  ``None``
+        Its first call serves the one-shot rules and certifies the same
+        boxes padded by the fixed SC policy; every later map reuses those
+        nodes by containment.  ``None``
         preserves the ordinary one-shot planner byte-for-byte.
     fixed_pole_support_ry
         Optional positive real-pole endpoint that the frozen fixed rule

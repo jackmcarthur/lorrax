@@ -13,7 +13,6 @@ from common.units import RYD_TO_EV
 from gw.mpa.sigma import _batch_rows
 from gw.ppm_windows import _SigmaBranch
 from gw.sigma_box_plan import (
-    _SC_ONE_SHOT_CALLS,
     _box_for_window,
     _sc_padded_box_spec,
     make_sigma_box_spec,
@@ -66,8 +65,14 @@ def _fake_rule(box, eps, **_kwargs):
 
 
 def _freezing_session():
-    """An SC session whose one-shot maps are spent: its next call freezes."""
-    return {"call_count": _SC_ONE_SHOT_CALLS}
+    """A fresh SC session: its first call serves map 0 one-shot and freezes."""
+    return {}
+
+
+def _frozen_digests(session, geometry):
+    """Digests of the frozen rules for the windows of ``geometry``."""
+    return [session["rules"][row["name"]]["fit"]["node_digest"]
+            for row in geometry["branches"][0]["windows"]]
 
 
 def _plan(monkeypatch, branch=None, summaries=None, **kwargs):
@@ -305,12 +310,12 @@ def test_sc_fixed_tail_covers_a_state_crossing_the_product_edge(
     # The selector boundary is .65 Ry. A .02 Ry motion introduces a new
     # nearest tail state; its old member at 3 Ry must not set the certificate.
     _, initial = plan(0.64)
+    frozen = _frozen_digests(session, initial)
     calls.clear()
     _, current = plan(0.66)
     assert not calls
     assert current["sc_fixed_total_rebuild_count"] == 0
-    assert [w["node_digest"] for w in initial["branches"][0]["windows"]] == [
-        w["node_digest"] for w in current["branches"][0]["windows"]]
+    assert frozen == [w["node_digest"] for w in current["branches"][0]["windows"]]
 
 
 def test_sc_fixed_session_reuses_identical_nodes_without_refitting(monkeypatch):
@@ -326,11 +331,16 @@ def test_sc_fixed_session_reuses_identical_nodes_without_refitting(monkeypatch):
         eps=1.0e-4, cache_dir=None,
         fixed_rule_session=session,
         print_fn=lambda *_args, **_kwargs: None)
-    first, first_geometry = plan_sigma_windows(
+    _, first_geometry = plan_sigma_windows(
         _summaries(), [_branch_at((0.1, 3.0))],
         np.asarray([0.2, 0.5]), 0.1, **args)
-    assert len(calls) == 3
+    # Map 0: its own one-shot rules, then the padded set it freezes.
+    assert len(calls) == 6
+    frozen = _frozen_digests(session, first_geometry)
     calls.clear()
+    first, _ = plan_sigma_windows(
+        _summaries(), [_branch_at((0.1, 3.0))],
+        np.asarray([0.2, 0.5]), 0.1, **args)
     second, second_geometry = plan_sigma_windows(
         _summaries(), [_branch_at((0.11, 3.01))],
         np.asarray([0.2, 0.5]), 0.1, **args)
@@ -341,13 +351,10 @@ def test_sc_fixed_session_reuses_identical_nodes_without_refitting(monkeypatch):
     assert second_geometry["sc_fixed_total_rebuild_count"] == 0
     assert all(row["cache_status"] == "hit:sc-fixed"
                for row in second_geometry["branches"][0]["windows"])
-    first_digests = [
-        row["node_digest"]
-        for row in first_geometry["branches"][0]["windows"]]
     second_digests = [
         row["node_digest"]
         for row in second_geometry["branches"][0]["windows"]]
-    assert first_digests == second_digests
+    assert frozen == second_digests
     for left, right in zip(first, second):
         np.testing.assert_array_equal(left.window.nodes.t,
                                       right.window.nodes.t)
@@ -366,7 +373,10 @@ def test_sc_fixed_rule_covers_the_declared_pole_support(monkeypatch):
         eps=1.0e-4, cache_dir=None, fixed_rule_session=session,
         fixed_pole_support_ry=5.0,
         print_fn=lambda *_args, **_kwargs: None)
-    first, first_geometry = plan_sigma_windows(
+    _, first_geometry = plan_sigma_windows(
+        _summaries(), [_branch_at((0.1, 3.0))],
+        np.asarray([0.2, 0.5]), 0.1, **args)
+    first, _ = plan_sigma_windows(
         _summaries(), [_branch_at((0.1, 3.0))],
         np.asarray([0.2, 0.5]), 0.1, **args)
     calls.clear()
@@ -382,7 +392,7 @@ def test_sc_fixed_rule_covers_the_declared_pole_support(monkeypatch):
     assert calls == []
     assert session["pole_support_ry"] == 5.0
     assert first_geometry["sc_fixed_pole_support_ry"] == 5.0
-    assert [row["node_digest"] for row in first_geometry["branches"][0]["windows"]] == [
+    assert _frozen_digests(session, first_geometry) == [
         row["node_digest"] for row in second_geometry["branches"][0]["windows"]]
     for left, right in zip(first, second):
         np.testing.assert_array_equal(left.window.nodes.t, right.window.nodes.t)
@@ -407,6 +417,8 @@ def test_sc_fixed_session_rebuilds_an_escaped_window_and_says_so(monkeypatch):
     _, first = plan_sigma_windows(
         _summaries(), [_branch_at((0.1, 3.0))],
         np.asarray([0.2, 0.5]), 0.1, **args)
+    frozen = dict(zip((row["name"] for row in first["branches"][0]["windows"]),
+                      _frozen_digests(session, first)))
     calls.clear()
     # A box that escapes the frozen certificate refits THAT window (owner
     # 2026-09-22; per window since 2026-09-24), and the receipt must say so:
@@ -418,7 +430,6 @@ def test_sc_fixed_session_rebuilds_an_escaped_window_and_says_so(monkeypatch):
     assert calls
     reasons = escaped["sc_fixed_recompute_reasons"]
     rows = {row["name"]: row for row in escaped["branches"][0]["windows"]}
-    before = {row["name"]: row for row in first["branches"][0]["windows"]}
     assert not escaped["sc_fixed_initialized"]
     assert reasons and set(reasons) < set(rows)
     assert all(reason.startswith("escape: ") for reason in reasons.values())
@@ -432,7 +443,7 @@ def test_sc_fixed_session_rebuilds_an_escaped_window_and_says_so(monkeypatch):
         refit = name in reasons
         assert row["cache_status"].startswith("rebuild:sc-fixed") == refit
         if not refit:
-            assert row["node_digest"] == before[name]["node_digest"]
+            assert row["node_digest"] == frozen[name]
     assert (escaped["sc_fixed_initial_window_tau_pairs"]
             == first["sc_fixed_initial_window_tau_pairs"])
 
@@ -454,6 +465,7 @@ def test_sc_fixed_session_keeps_receipt_for_temporarily_empty_window(
     _, first_geometry = plan_sigma_windows(
         _summaries(), [_branch_at((0.1, 3.0))],
         np.asarray([0.2, 0.5]), 0.1, **args)
+    frozen = _frozen_digests(session, first_geometry)
     calls.clear()
     _, subset_geometry = plan_sigma_windows(
         _summaries(), [_branch_at((0.1, 0.12))],
@@ -477,10 +489,8 @@ def test_sc_fixed_session_keeps_receipt_for_temporarily_empty_window(
         "positive conduction:state_tail",
         "positive conduction:pole_tail",
     }
-    first = first_geometry["branches"][0]["windows"]
     restored = restored_geometry["branches"][0]["windows"]
-    assert [row["node_digest"] for row in restored] == [
-        row["node_digest"] for row in first]
+    assert [row["node_digest"] for row in restored] == frozen
 
 
 def test_sc_fixed_session_rebuilds_for_a_window_absent_from_iteration_one(
@@ -537,14 +547,14 @@ def test_sc_fixed_session_refits_only_on_material_class_flip(monkeypatch):
     _, flipped = plan_sigma_windows(
         _summaries(), [_branch_at((0.11, 3.01))],
         np.asarray([0.2, 0.5]), 0.1, material_class="insulator", **args)
-    assert len(calls) == 3
+    assert len(calls) == 6
     assert flipped["sc_fixed_initialized"]
     assert flipped["sc_fixed_material_class"] == "insulator"
     assert flipped["sc_fixed_class_flip"] == "metal->insulator"
 
 
-def test_sc_one_shot_maps_then_freeze_on_the_third_call(monkeypatch, tmp_path):
-    """Maps 0 and 1 are the one-shot plan; the third call freezes padded rules."""
+def test_sc_map0_is_the_one_shot_plan_and_freezes_padded_rules(monkeypatch, tmp_path):
+    """Map 0 serves the one-shot plan and freezes padded rules that map 1 reuses."""
     calls = []
 
     def counted(box, eps, **kwargs):
@@ -558,32 +568,36 @@ def test_sc_one_shot_maps_then_freeze_on_the_third_call(monkeypatch, tmp_path):
         cache_dir=str(tmp_path / "one_shot"), **quiet)
     session = {}
     receipts = []
-    for energies in ((0.1, 3.0), (0.12, 3.05), (0.12, 3.05), (0.125, 3.06)):
+    for energies in ((0.1, 3.0), (0.12, 3.05), (0.125, 3.06)):
         calls.clear()
         plan, geometry = plan_sigma_windows(
             _summaries(), [_branch_at(energies)], np.asarray([0.2, 0.5]),
             0.1, cache_dir=str(tmp_path / "sc"), fixed_rule_session=session,
             **quiet)
         receipts.append((plan, geometry, len(calls)))
-    (map0, first, _), (_, second, _), (_, third, built), (_, fourth, reused) = receipts
-    assert [g["sc_rule_mode"] for g in (first, second, third, fourth)] == [
-        "one-shot", "one-shot", "frozen", "frozen"]
-    # Map 0 is the one-shot planner's plan: same boxes, same nodes, no pad.
+    (map0, first, built), (_, second, reused), (_, third, _) = receipts
+    assert [g["sc_rule_mode"] for g in (first, second, third)] == [
+        "one-shot", "frozen", "frozen"]
+    # Map 0 is the one-shot planner's plan (SC map 0 = one-shot G0W0).
     for left, right in zip(one_shot, map0):
         np.testing.assert_array_equal(left.window.nodes.t, right.window.nodes.t)
-    assert [w["rule_box_ry"] for w in first["branches"][0]["windows"]] == [
+    windows = first["branches"][0]["windows"]
+    assert [w["rule_box_ry"] for w in windows] == [
         w["rule_box_ry"] for w in one_shot_geometry["branches"][0]["windows"]]
-    for geometry in (first, second):
-        assert geometry["sc_fixed_initial_window_tau_pairs"] is None
-        assert not any(w["sc_fixed_rule"] or w["sc_fixed_padded_box_ry"]
-                       for w in geometry["branches"][0]["windows"])
-    assert third["sc_fixed_initialized"] and built == 3
+    assert not any(w["sc_fixed_rule"] or w["sc_fixed_padded_box_ry"] for w in windows)
+    # The same call built the padded set: one-shot and padded fits, 3 each.
+    assert first["sc_fixed_initialized"] and built == 6
+    assert first["sc_fixed_initial_window_tau_pairs"] == 6
+    for w in windows:
+        padded = session["rules"][w["name"]]["padded_box"]
+        assert padded[0] <= w["box_ry"][0] and padded[1] >= w["box_ry"][1]
+    assert reused == 0 and not second["sc_fixed_initialized"]
     assert all(w["sc_fixed_rule"] and w["sc_fixed_padded_box_ry"]
-               for w in third["branches"][0]["windows"])
-    assert "rules" in session and reused == 0
-    assert fourth["sc_fixed_rebuilds_this_iteration"] == 0
-    assert [w["node_digest"] for w in fourth["branches"][0]["windows"]] == [
-        w["node_digest"] for w in third["branches"][0]["windows"]]
+               and w["cache_status"] == "hit:sc-fixed"
+               for w in second["branches"][0]["windows"])
+    assert third["sc_fixed_rebuilds_this_iteration"] == 0
+    assert [w["node_digest"] for w in third["branches"][0]["windows"]] == [
+        w["node_digest"] for w in second["branches"][0]["windows"]]
 
 
 def test_sc_rule_padding_scales_with_state_energy_and_ten_percent_on_poles():
@@ -705,9 +719,9 @@ def test_fixed_sc_refuses_a_rule_above_eps_without_retrying(monkeypatch):
     assert "do not loosen sigma_quadrature_eps" in str(err.value)
     assert not any("time_budget" in kw or "reduction_steps" in kw
                    for kw in calls)
-    # Three windows, three builder calls: one each, nothing tried twice.
-    # The retry this replaced would have made it six.
-    assert len(calls) == 3
+    # Three windows, fitted once for map 0's one-shot plan and once for the
+    # padded set it freezes: six builder calls, nothing tried twice.
+    assert len(calls) == 6
 
 
 def test_sc_pad_keeps_a_sign_definite_support_sign_definite():
@@ -1181,3 +1195,12 @@ def test_changed_domain_rebuilds_even_with_same_input_identity(monkeypatch, tmp_
     escaped, _ = _rule_cache_lookup(str(tmp_path), (-3., -.3, .05, .4), 1e-4, True,
                                    noise_amplification_cap=1e9)
     assert escaped is None
+
+
+def test_rank_assignment_spreads_the_longest_fits_and_reduces_to_round_robin():
+    from gw.sigma_box_plan import _rank_assignment
+    assert _rank_assignment([1.0] * 6, 4) == [[0, 4], [1, 5], [2], [3]]
+    # Two crossing rules per set, adjacent in window order: never on one rank.
+    owned = _rank_assignment([40.0, 1.0, 1.0, 35.0, 42.0, 1.0, 1.0, 37.0], 4)
+    big = [next(r for r, idx in enumerate(owned) if i in idx) for i in (0, 3, 4, 7)]
+    assert sorted(big) == [0, 1, 2, 3]
