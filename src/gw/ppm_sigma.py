@@ -333,16 +333,23 @@ def _prepare_sigma_state(
 # ---------------------------------------------------------------------------
 
 @jax.jit
-def _max_antihermitian_residual(W_q):
-    """``max_q max|W_q - W_q^H|`` over a ``(nq, mu, mu)`` stack, one q at a time.
+def _probe_antihermitian_residual(W_q):
+    """``max_q |(W_q - W_q^H) z|_inf / max_q |W_q z|_inf`` for one fixed probe.
 
-    The whole-array ``W - W^H`` materialized a full ``(nq, mu, mu)``
-    transposed temporary and ran the CrI3 16x16 P64 map out of memory
-    (3.88 GiB, pool 58750500 step .79), hence the per-q map.  Module level so
-    the executable is compiled once per shape, not once per SC map.
+    ``z`` has unit-modulus, golden-ratio phases. ``W^H z`` is
+    ``conj(conj(z)^T W)``, so each q costs two mat-vecs and a row reduction,
+    and W is never transposed.  The exact entrywise ``max|W_q - W_q^H|``
+    transposed every sharded q block and took ~5 s per SC map on CrI3 16x16
+    at P64 (P2-J, 2026-09-24).  An anti-Hermitian part of W is seen at the
+    same relative size: the ratio is 0 for a Hermitian W.
     """
-    return jnp.max(jax.lax.map(
-        lambda wq: jnp.max(jnp.abs(wq - jnp.conj(wq.T))), W_q))
+    n = W_q.shape[-1]
+    phase = jnp.mod(jnp.arange(n, dtype=jnp.float64) * 0.6180339887498949, 1.0)
+    z = jnp.exp(2j * jnp.pi * phase).astype(W_q.dtype)
+    w_z = jnp.einsum("qij,j->qi", W_q, z)
+    wh_z = jnp.conj(jnp.einsum("j,qji->qi", jnp.conj(z), W_q))
+    scale = jnp.max(jnp.abs(w_z))
+    return jnp.where(scale > 0.0, jnp.max(jnp.abs(w_z - wh_z)) / scale, 0.0)
 
 
 def fit_ppm(
@@ -450,16 +457,13 @@ def fit_ppm(
         d_max = float(jax.device_get(jnp.max(jnp.abs(B_odd))))
         b_max = float(jax.device_get(jnp.max(jnp.abs(B))))
         odd_even_residue_ratio = d_max / b_max if b_max > 0.0 else d_max
-        probe_scale = float(jax.device_get(jnp.max(jnp.abs(Wprobe_q))))
-        probe_anti = float(jax.device_get(
-            _max_antihermitian_residual(Wprobe_q)))
-        probe_hermiticity_residual = (
-            probe_anti / probe_scale if probe_scale > 0.0 else probe_anti)
+        probe_hermiticity_residual = float(jax.device_get(
+            _probe_antihermitian_residual(Wprobe_q)))
         if print_fn is not None:
             print_fn(
                 f"  {model_label} ORDERED residues (measured-broken-TR deck): "
                 f"R± = B ± D; max|D|/max|B| = "
-                f"{odd_even_residue_ratio:.3e}; W(iω_p) Hermiticity "
+                f"{odd_even_residue_ratio:.3e}; W(iω_p) probe Hermiticity "
                 f"residual = {probe_hermiticity_residual:.3e}.")
 
     # Deck-level ε_H measurement (env-gated observability; channel-
