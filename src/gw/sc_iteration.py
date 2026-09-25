@@ -1534,7 +1534,26 @@ def qp_eigh(H: jax.Array, *, mesh_xy: Mesh, config, print_fn):
     """
     kind = _resolve_sc_eigh(int(H.shape[1]), mesh_xy, config, print_fn=print_fn)
     E, U = _sc_eigh_bands(H, kind=kind, mesh_xy=mesh_xy, config=config)
-    return E, jax.device_put(U, NamedSharding(mesh_xy, P(None, None, None)))
+    return E, _place(U, mesh_xy)
+
+
+def qp_hamiltonian_sum(kin_ion, sigma_total, mesh_xy):
+    """``S = kin_ion + Σ_total`` in one program, replicated like ``kin_ion``.
+
+    A TASTE 1 replication bounded by the Σ window, 16 nk nb^2 B per device
+    (the kin_ion loader states the production figures).  The QP eigensolver
+    hermitises ``S`` on the band grid itself.
+    """
+    fn = _QP_HAMILTONIAN_SUM.get(mesh_xy)
+    if fn is None:
+        @jax.jit(out_shardings=NamedSharding(mesh_xy, P(None, None, None)))
+        def fn(kin, sig):
+            return kin + sig
+        _QP_HAMILTONIAN_SUM[mesh_xy] = fn
+    return fn(kin_ion, sigma_total)
+
+
+_QP_HAMILTONIAN_SUM: dict = {}
 
 
 def _band_rotation_spec() -> P:
