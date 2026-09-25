@@ -129,6 +129,7 @@ _CUDA_TARGET_SYMBOLS = {
     # common.fourier_plan.LocalFourierPlan's CUDA leg (cpp/cufft/
     # fourier_plan_cuda_ffi.cc): cuBLAS Fourier GEMMs + one cuFFT group.
     "lorrax_fourier_plan":          "LorraxFourierPlanCudaFfi",
+    "lorrax_fourier_plan_mathdx":   "LorraxFourierPlanMathdxCudaFfi",
     "lorrax_phdf5_write":           "PhdfWriteFfi",
     "lorrax_phdf5_read":            "PhdfReadFfi",
     "lorrax_phdf5_read_kchunk":       "PhdfReadKchunkFfi",
