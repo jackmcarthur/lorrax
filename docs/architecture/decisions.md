@@ -24,6 +24,11 @@ that (owner; sandbox `TASTE.md` 96).
   centroid families. Canonical files are processor-grid independent and read
   into these faces. `low_mem_bands` refuses by name. An explicit dense `Gij`
   operand refuses (`GATE explicit_gij_unported`).
+* **Spin pairs always stream for `n_s > 1`.** The step-occupation χ₀ with
+  the charge vertex, Σ_x, the Coulomb hole and Σ_c(τ) build one `(a, b)`
+  spinor block of the Green at a time at full k, whatever the budget. The
+  whole-spin kernels serve `n_s = 1` and the stages with no stream
+  (Fermi-Dirac χ₀, the vertex-pair currents, Σ^B).
 
 ## 2026-09-24 — NVIDIA k-convolutions run on nvidia-mathdx, behind one platform router
 

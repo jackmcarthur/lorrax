@@ -326,14 +326,11 @@ def _get_sigma_kij_kernel(
     g_plan = gemm_plan(mesh_xy, m=mu * ns, k=nb, n=mu * ns,
                        nq=k_unfold_plan.n_parent, dtype=jnp.complex128, layout=layout,
                        enable_active_range=True)
-    from .greens_function_kernel import spin_pairs_needed
-    # A4: stream spin pairs when the whole-spin Σ_k and its convolution
-    # transient (~2 G_tile) exceed the device target.
-    pairs = (None if _stage_timing_enabled() or not spin_pairs_needed(
-        n_full=k_unfold_plan.n_full, n_rmu=mu, ns=ns, mesh=mesh_xy,
-        live_green_tiles=2) else _sigma_spin_pair_stream(
-            mesh_xy=mesh_xy, kgrid=kgrid, layout=layout, face_shape=face_shape,
-            face_band_extent=face_band_extent, k_unfold_plan=k_unfold_plan))
+    # A4: for ns > 1 the spin pairs stream, so no ns² Σ_k or convolution
+    # transient exists.
+    pairs = (None if int(ns) == 1 else _sigma_spin_pair_stream(
+        mesh_xy=mesh_xy, kgrid=kgrid, layout=layout, face_shape=face_shape,
+        face_band_extent=face_band_extent, k_unfold_plan=k_unfold_plan))
 
     def _g_from_selector(xn, yr, E, sel, E_min, E_max, ref, t, band_range=None):
         """Apply boolean identity masks or signed occupation weights without clipping."""
@@ -417,12 +414,13 @@ def _get_sigma_kij_kernel(
         _sigma_kij_kernel_cache[key] = kernel
         return kernel
 
-    if brackets is not None:
+    if brackets is not None or pairs is not None:
         raise NotImplementedError(
             "_get_sigma_kij_kernel(layout='face'): LORRAX_SIGMA_TAU_TIMING "
             "stage-split diagnostic is not ported for bracketed face "
-            "carriers — an opt-in profiling knob, not the production path; "
-            "set LORRAX_SIGMA_TAU_TIMING=0 (the default) for that case.")
+            "carriers or spin-pair streams (ns > 1) — an opt-in profiling "
+            "knob, not the production path; set LORRAX_SIGMA_TAU_TIMING=0 "
+            "(the default) for that case.")
 
     build_g = jax.jit(_g_from_selector)
 
