@@ -333,6 +333,23 @@ def wedge_cases(mesh, rng):
     return recs
 
 
+def chi_cases(mesh, rng):
+    """Mode 11 vs the incumbent chi0 chain (test_kconv_chi_unfold.chi_case), both k-box arms:
+    the single pass on the unit-test plans, the split pass on grids whose pair does not fit."""
+    from test_kconv_chi_unfold import chi_case, chi_cases as cases
+    from test_kconv_klead_unfold import c3_fixture
+    recs = []
+    split = [(c3_fixture(mesh, 4, kgrid=(8, 8, 8)), 1, True, True),
+             (c3_fixture(mesh, 2, kgrid=(12, 12, 9)), 2, False, False)]
+    for fx, n_out, complete, conj_src in cases(mesh, rng) + split:
+        r = chi_case(mesh, fx, n_out=n_out, complete=complete, conj_src=conj_src)
+        recs.append(dict(case=f"kconv_chi_ns{r['ns']}_nk{r['nk']}_o{n_out}"
+                         + ("_real" if complete else "_complex") + ("_conjsrc" if conj_src else "_tile"),
+                         antiunitary=r["antiunitary"], ulp_chi_vs_old_chain=r["rel"] / np.finfo(float).eps,
+                         red_rolled_rsrc=r["red_rel"]))
+    return recs
+
+
 def _np3(x, kg, axis0, kind, norm):
     """np.fft over three consecutive k axes starting at axis0 of the reshaped array."""
     f = np.fft.ifftn if kind == "ifftn" else np.fft.fftn
@@ -418,6 +435,7 @@ def main() -> int:
     rng = np.random.default_rng(20260924)
     recs = ([downfold_case(mesh, rng), face_parent_case(mesh, rng), plane_case(mesh, rng)]
             + unfold_cases(mesh, rng) + lorentz_cases(mesh, rng) + wedge_cases(mesh, rng)
+            + chi_cases(mesh, rng)
             + stored_cases(mesh, rng))
     bad = []
     for r in recs:
@@ -434,6 +452,10 @@ def main() -> int:
             # not turn it red without a physics change (audit L2).
             if k == "ulp_vs_old_chain" and not v <= 2.0:
                 bad.append(f"{r['case']}.{k}={v:.2f} > 2 ulp of max|ref|")
+            # Mode 11 transforms ifftn(G) where the chain it replaces transforms fftn(conj G):
+            # the same number, not the same rounding (test_kconv_chi_unfold).
+            if k == "ulp_chi_vs_old_chain" and not v <= 8.0:
+                bad.append(f"{r['case']}.{k}={v:.2f} > 8 ulp of max|chi|")
             # The parent-row store is the same kernel with fewer stores: bitwise.
             if k == "bitwise_parent_rows" and v != 1:
                 bad.append(f"{r['case']}.{k}=0 (parent-row store differs from those rows)")

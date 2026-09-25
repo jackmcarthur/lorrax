@@ -161,6 +161,7 @@ __all__ = [
     "KConvStored", "make_kconv_klead", "make_kconv_klead_unfold", "KCONV_KLEAD_UNFOLD_TARGET",
     "make_kconv_lorentz_unfold", "KCONV_KLEAD_LORENTZ_TARGET",
     "make_kfft_klead_unfold", "KFFT_KLEAD_UNFOLD_TARGET",
+    "make_kconv_chi_unfold", "KCONV_CHI_UNFOLD_TARGET",
     "make_kconv_kminor", "kconv_kminor_out_shape",
     "make_kfft_klead", "make_kfft_kminor",
     "make_local_kfft_klead", "make_local_kfft_kminor", "make_local_kconv_kminor",
@@ -181,6 +182,8 @@ KCONV_KLEAD_TARGET = "lorrax_mathdx_kconv_klead"
 KCONV_KLEAD_UNFOLD_TARGET = "lorrax_mathdx_kconv_klead_unfold_rows"
 KCONV_KLEAD_LORENTZ_TARGET = "lorrax_mathdx_kconv_klead_lorentz_rows"
 KFFT_KLEAD_UNFOLD_TARGET = "lorrax_mathdx_kfft_klead_unfold"
+#: Mode 11, the chi0 pass read from the raw-parent Green pair (:func:`make_kconv_chi_unfold`).
+KCONV_CHI_UNFOLD_TARGET = "lorrax_mathdx_kconv_chi_unfold"
 KFFT_KLEAD_TARGET = "lorrax_mathdx_kfft_klead"
 KCONV_KMINOR_TARGET = "lorrax_mathdx_kconv_kminor"
 KFFT_KMINOR_TARGET = "lorrax_mathdx_kfft_kminor"
@@ -189,8 +192,8 @@ PLANE_FFT_GATHER_TARGET = "lorrax_mathdx_plane_fft_gather"
 #: Every mathdx target; ``require_kconv`` checks them all at startup.
 KCONV_TARGETS = (KCONV_PAIR_TARGET, KCONV_PARENT_TARGET, KCONV_PLANE_TARGET, KCONV_KLEAD_TARGET,
                  KCONV_KLEAD_UNFOLD_TARGET, KCONV_KLEAD_LORENTZ_TARGET,
-                 KFFT_KLEAD_TARGET, KFFT_KLEAD_UNFOLD_TARGET, KCONV_KMINOR_TARGET,
-                 KFFT_KMINOR_TARGET, PLANE_FFT_GATHER_TARGET)
+                 KFFT_KLEAD_TARGET, KFFT_KLEAD_UNFOLD_TARGET, KCONV_CHI_UNFOLD_TARGET,
+                 KCONV_KMINOR_TARGET, KFFT_KMINOR_TARGET, PLANE_FFT_GATHER_TARGET)
 
 #: The ``LORRAX_FFT_FFI`` dial.  Default ON — the FFI layer is REQUIRED
 #: (owner ruling, ``docs/architecture/decisions.md`` 2026-08-01): the flat-k
@@ -1551,6 +1554,101 @@ def make_kfft_klead_unfold(mesh: Mesh, kgrid, tables, *, norm: str | None = "ort
                                  "antiunitary rows (pair_transpose), so Wt is required")
             Wt = Wp
         return sm(Wp, Wt) if load is None else sm_dev(Wp, Wt, *load)
+    return fn
+
+
+def make_kconv_chi_unfold(mesh: Mesh, kgrid, tables, *, n_out: int, complete: bool,
+                          norm: str | None = "ortho", scratch_bytes: int | None = None) -> Callable:
+    """One tau node of the chi0 response read from the RAW-PARENT Green pair:
+    ``fn(acc, Gv, Gc, alpha, Gvt=None, Gct=None) -> acc``.
+
+    ``Gv``/``Gc`` ``(n_parent, mu, ns, nu, ns)`` c128 at ``P(None,'x',None,'y',None)`` are the
+    centroid-major parent Greens (``gw.greens_function_kernel.build_G_parents``), NOT
+    conjugated; ``tables`` are their plan's ``symmetry_maps.unfold_load_tables``
+    (``trs_rule="pair_transpose"``).  ``Gvt``/``Gct`` are the partner tiles an antiunitary row
+    reads; ``None`` means the partner is ``conj(G)`` (a Green of real weights), which the load
+    forms from ``G`` itself.  ``acc`` ``(n_out, nk, mu, nu)`` c128 at ``P(None,None,'x','y')``
+    is updated in place (donate it) and ``alpha`` ``(n_out,)`` c128 is replicated:
+
+        acc[o] += alpha[o] * chi_tau,   chi_tau = sum_ab conj(Gc'_ab) Gv'_ab  (+ c.c. if complete)
+
+    with ``G' = ifftn_k(U_k G[row(k)] U_k^dagger)`` (``norm``) the unfolded Green in R space:
+    the response the chi0 minimax kernels accumulate (their ``fftn(conj(G))`` pair, whose
+    product is the same) before the one forward transform after the tau sum.  No full-k Green
+    exists.  CUDA: nvidia-mathdx mode 11 on the k-box stage (one pass; a chunked split pass on
+    large grids, its intermediate bounded by ``scratch_bytes``); cpu: the service's reference
+    composition, then the plan route.
+    """
+    from symmetry_maps import apply_unfold_load_tables_local, local_unfold_load_tables
+    kg = _check_kgrid(kgrid, kconv_backend(mesh))
+    nk = kg[0] * kg[1] * kg[2]
+    if int(tables.row.shape[0]) != nk:
+        raise ValueError(f"k-leading chi unfold: tables cover {tables.row.shape[0]} k, grid has {nk}")
+    if int(tables.conj_trs) != 0 or tables.spin_r is not None:
+        raise ValueError("k-leading chi unfold: a Green pair's tables use the pair-transpose rule "
+                         "and one spin action")
+    ns = int(tables.spin.shape[-1])
+    spin_host = np.asarray(tables.spin)
+    mesh_shape = (int(mesh.shape["x"]), int(mesh.shape["y"]))
+    if tuple(tables.mesh_shape) != mesh_shape:
+        raise ValueError(f"k-leading chi unfold: tables were cut for a {tuple(tables.mesh_shape)} "
+                         f"mesh; this mesh is {mesh_shape}")
+    n_out, complete = int(n_out), bool(complete)
+    si = ffi_fft_scale("ifftn", norm, nk)
+    flat = lambda g: g.reshape(g.shape[0], g.shape[1] * ns, g.shape[3] * ns)
+    if kconv_backend(mesh) == "mathdx":
+        _require_target(KCONV_CHI_UNFOLD_TARGET, "CUDA")
+
+        def local(acc, gv, gc, alpha, gvt, gct, conj_src):
+            t = local_unfold_load_tables(tables)
+            budget = (int(scratch_bytes) if scratch_bytes is not None
+                      else int(gv.size) * 16)       # one parent Green tile (the split arm's chunk)
+            call = jax.ffi.ffi_call(KCONV_CHI_UNFOLD_TARGET, jax.ShapeDtypeStruct(acc.shape, acc.dtype),
+                                    input_output_aliases={12: 0})
+            return call(flat(gv), flat(gvt), flat(gc), flat(gct), t.row, t.trs, t.lsrc, t.rsrc,
+                        t.mph, t.nph, t.spin, alpha, acc,
+                        nkx=np.int64(kg[0]), nky=np.int64(kg[1]), nkz=np.int64(kg[2]),
+                        si=np.float64(si), conj_trs=np.int64(2 if conj_src else 0),
+                        complete=np.int64(complete), scratch_bytes=np.int64(budget),
+                        **_mathdx_common())
+    else:
+        _require_plan_route()
+        ifft_local = make_local_kfft_klead(mesh, kg, kind="ifftn", norm=norm)
+
+        def local(acc, gv, gc, alpha, gvt, gct, conj_src):
+            t = local_unfold_load_tables(tables)
+            if conj_src:
+                gvt, gct = jnp.conj(gv), jnp.conj(gc)
+            n_par, mx, _, my, _ = (int(v) for v in gv.shape)
+
+            def unfolded(g, gt):
+                O = apply_unfold_load_tables_local(flat(g), flat(gt), t, spin_host)
+                return ifft_local(O.reshape(nk, mx * ns, my * ns)).reshape(nk, mx, ns, my, ns)
+            chi = jnp.einsum("kxayb,kxayb->kxy", jnp.conj(unfolded(gc, gct)), unfolded(gv, gvt))
+            if complete:
+                chi = chi + jnp.conj(chi)
+            return acc + alpha[:, None, None, None] * chi[None]
+
+    g_spec, acc_spec = P(None, "x", None, "y", None), P(None, None, "x", "y")
+    sm = {conj_src: _sharded(lambda a, gv, gc, al, gvt, gct, _c=conj_src: local(a, gv, gc, al, gvt, gct, _c),
+                             mesh, (acc_spec, g_spec, g_spec, P(None), g_spec, g_spec), acc_spec)
+          for conj_src in (False, True)}
+
+    def fn(acc, Gv, Gc, alpha, Gvt=None, Gct=None):
+        _check_complex(acc, Gv, Gc, alpha)
+        if Gv.ndim != 5 or int(Gv.shape[2]) != ns or int(Gv.shape[4]) != ns or Gc.shape != Gv.shape:
+            raise ValueError(f"k-leading chi unfold expects Gv = Gc (n_parent, mu, {ns}, nu, {ns}); "
+                             f"got {Gv.shape} / {Gc.shape}")
+        if tuple(acc.shape) != (n_out, nk, int(Gv.shape[1]), int(Gv.shape[3])) or alpha.shape != (n_out,):
+            raise ValueError(f"k-leading chi unfold: acc {acc.shape} / alpha {alpha.shape} do not match "
+                             f"n_out={n_out}, nk={nk} and G {Gv.shape}")
+        if (Gvt is None) != (Gct is None):
+            raise ValueError("k-leading chi unfold: pass both partners or neither")
+        if Gvt is None:
+            return sm[True](acc, Gv, Gc, alpha, Gv, Gc)
+        if Gvt.shape != Gv.shape or Gct.shape != Gv.shape:
+            raise ValueError("k-leading chi unfold: the partners must match the Greens' shape")
+        return sm[False](acc, Gv, Gc, alpha, Gvt, Gct)
     return fn
 
 
