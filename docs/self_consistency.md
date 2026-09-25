@@ -157,7 +157,10 @@ $16\,n_k n_b^2$ bytes: 21 MB on CrI3 8×8 (144 bands), and 9.2 GB at
 $n_k = 144$, $n_b = 2000$, where $m = 20$ takes 387 GB globally, or 3.9 GB per
 rank at $P = 100$. Each iteration issues one $(m+1)\times(m+1)$ Gram
 reduction. The map itself needs a replicated carry, so each call gathers one
-$(n_k, n_b, n_b)$ matrix. For scale, CrI3 8×8 GN-PPM reaches
+$(n_k, n_b, n_b)$ matrix. Each map output $F(H_n)$ is diagonalised once, on
+device; the identity readout and the warm seed share that eigensystem, and
+$r_n$ is reduced on device, so no $O(n_k n_b^3)$ eigensolve runs on the host.
+For scale, CrI3 8×8 GN-PPM reaches
 $\max\lvert dE\rvert < 0.1$ meV in 13 map calls (CLAIMS 2686).
 
 **Map gain.** From map 2 the log prints
