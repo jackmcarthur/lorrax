@@ -122,13 +122,27 @@ def test_shared_pole_metadata_from_production_meta_without_kgrid():
     check_metadata_without_kgrid(_test_mesh())
 
 
-def test_ordered_bank_admits_literal_mirror_fields():
-    """Broken TRS is not photon-only: scalar ordered banks carry exact mirrors."""
-    header = {"mirror_mode": "literal_same_operator_v1", "ordered": True}
+def test_minus_q_partner_fields_cover_fitted_line_samples_only():
+    """W_q(-conj z) is stored at fitted line samples; imaginary and held ones are not."""
+    header = {"minus_q_partner": {"sample_span": [0, 2]}, "bank_shape": {"nsample": 5}}
     assert store._bank_sample_fields(header) == (
-        "Wc", "dWc_ds", "Wc_mirror", "dWc_mirror_ds")
-    with pytest.raises(ValueError, match="unsupported mirror contract"):
-        store._bank_sample_fields({"mirror_mode": "literal_same_operator_v1"})
+        "Wc", "dWc_ds", "Wc_minus_q", "dWc_minus_q_ds")
+    assert store._sample_field(header, "Wc_minus_q") == ("minus_q_written", 0, 0, 2)
+    assert store._sample_field(header, "dWc_ds") == ("sample_written", 1, 0, 5)
+    assert store._bank_sample_fields({"bank_shape": {"nsample": 5}}) == ("Wc", "dWc_ds")
+    plan = dict(z_ry=np.asarray([.3+.1j, .5+.1j, .1j, .4+.1j, .2j]),
+                distinct_id=np.arange(5), fit_ids=np.asarray([0, 1, 2]))
+    assert store.minus_q_partner_span(plan) == (0, 2)
+    with pytest.raises(ValueError, match="one contiguous sample span"):
+        store.minus_q_partner_span(dict(plan, fit_ids=np.asarray([0, 2, 3])))
+
+
+def test_retired_all_sample_layout_refuses_by_name(monkeypatch):
+    """A bank from the retired layout names it instead of failing on the schema."""
+    monkeypatch.setattr(store, "_read_header", lambda path: {
+        "mirror_mode": "literal_same_operator_v1", "schema": "lorrax.shared-real-pole-bank.v1"})
+    with pytest.raises(ValueError, match="retired mirror_mode layout"):
+        store.validate_shared_pole_bank("unused.h5", expected_identity={}, mesh_xy=None)
 
 
 def _device(host,mesh,spec):

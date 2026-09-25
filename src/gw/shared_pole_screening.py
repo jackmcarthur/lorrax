@@ -215,7 +215,7 @@ def _bank_residence(meta, config, *, mesh_xy, sym, root, label, photon, mu_bases
     else:
         execution, wanted = constructor_route(
             meta, config, meta.shared_pole_recipe, mesh_xy=mesh_xy, ledger=ledger,
-            upstream=(stage,), ordered=ordered, odd_moments=ordered, mirrored=ordered,
+            upstream=(stage,), ordered=ordered, odd_moments=ordered, minus_q_partner=ordered,
             nq=nq)[0], "local"
     if execution != wanted:
         return pinned("constructor would change route with the payload live")

@@ -1190,32 +1190,42 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
         # conj in R space (the -q orientation); remote cells add the odd kernel.
         # ordered=True stores the physical orientation W_q = FT_q[W].
         ordered = vertex is not None or not bool(sym.trs_allowed)
-        literal_mirrors = ordered
-        if literal_mirrors and header.get("mirror_mode") != "literal_same_operator_v1":
-            raise ValueError("GATE response_mirror_contract: ordered production requires a literal-mirror bank")
-        if literal_mirrors:
+        if ordered != ("minus_q_partner" in header):
+            raise ValueError("GATE response_minus_q_partner: got: a bank whose minus-q partner fields "
+                             "disagree with the ordered route; want: W_q(-conj z) stored exactly when "
+                             "time reversal is broken; fix: rebuild the bank")
+        # W_q(-conj z) = conj(W_{-q}(z)) at each fitted line sample [p0, p1):
+        # the exact -q rows of the same stream, conjugated, through parent q's
+        # own V (and contact). An imaginary node is its own partner.
+        p0, p1 = (int(v) for v in header["minus_q_partner"]["sample_span"]) if ordered else (0, 0)
+        if p1 > p0:
             from symmetry_maps import q_negation_index
             negative = np.asarray(q_negation_index((int(meta.nkx), int(meta.nky), int(meta.nkz))), dtype=np.int64)
-            mirror_qids = negative[qids]
-            mirror_provenance = bank_io.get("mirror_operator_provenance")
-            if mirror_provenance is None:
-                mirror_provenance = dict(
+            partner_qids = negative[qids]
+            partner_provenance = bank_io.get("minus_q_operator_provenance")
+            if partner_provenance is None:
+                partner_provenance = dict(
                     coulomb=bank_io["coulomb"],
                     state_identity=bank_io["identity"],
                     operator="same original parent V and moment operator as Wc and M0..M3")
-            receipt["mirror_contract"] = dict(header["mirror_contract"],
-                mode=header["mirror_mode"], support_count=len(z),
-                operator_provenance=mirror_provenance,
+            receipt["minus_q_partner"] = dict(header["minus_q_partner"],
+                operator_provenance=partner_provenance,
                 original_parent_count=len(qids),
-                full_q_rows=len(set(qids.tolist()+mirror_qids.tolist())),
+                full_q_rows=len(set(qids.tolist()+partner_qids.tolist())),
                 green_stream="union of exact q and minus-q output rows in the same response panel",
-                dyson="original parent V/contact for both orientations; same moment operator")
+                dyson="original parent V/contact for both; same moment operator")
 
         def panel_rows(first, last):
             rows = qids[first:last].tolist()
-            if literal_mirrors:
-                rows = list(dict.fromkeys(rows+mirror_qids[first:last].tolist()))
+            if p1 > p0:
+                rows = list(dict.fromkeys(rows+partner_qids[first:last].tolist()))
             return tuple(rows)
+
+        def committed(sample):
+            done = np.asarray(header["sample_written"], bool)[:, sample].all()
+            if p0 <= sample < p1:
+                done = done and np.asarray(header["minus_q_written"], bool)[:, sample-p0].all()
+            return bool(done)
 
         n = meta.mu_basis.n_packed if vertex is None else vertex.n
         if ordered:
@@ -1256,13 +1266,12 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                                     group_size=group_size, print_fn=print_fn)
     # The group accumulator is all-P sharded. Dense work and slab I/O batch
     # the irreducible parents of one frequency, with their own admission.
-    fields = (("Wc", "dWc_ds"), ("Wc_mirror", "dWc_mirror_ds"))
+    fields = (("Wc", "dWc_ds"), ("Wc_minus_q", "dWc_minus_q_ds"))
     progress = LoopProgress(len(z), print_fn, title="response frequency integration",
                             item_name="frequency", max_updates=len(z)).start()
     for group in rules["plan"]["groups"]:
         members = [int(m) for m in group["members"]]
-        written = np.asarray(header["sample_written"])
-        if written[:, members].all():
+        if all(committed(m) for m in members):
             for _ in members:
                 progress.step()
             continue
@@ -1278,12 +1287,13 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                 expected_identity=bank_io["identity"], mesh_xy=mesh_xy) as (bank_handle, header, write):
             receipt["seconds"]["io"] = receipt["seconds"].get("io",0.)+time.monotonic()-io_started
             for row, sample in enumerate(members):
-                if np.asarray(header["sample_written"])[:,sample].all():
+                if committed(sample):
                     progress.step()
                     continue
                 raw = raw_group[2*row:2*row+2]
-                for mirror in range(2 if literal_mirrors else 1):
-                    marked = np.asarray(header["sample_written"], bool)[:,sample,2*mirror:2*mirror+2]
+                for partner in ((0, 1) if p0 <= sample < p1 else (0,)):
+                    marked = (np.asarray(header["minus_q_written"], bool)[:,sample-p0] if partner
+                              else np.asarray(header["sample_written"], bool)[:,sample])
                     # A fresh frequency is one q_irr slab. Partial restarts keep
                     # contiguous rows with identical value/slope masks together.
                     edges = np.r_[0, 1+np.flatnonzero(np.any(marked[1:] != marked[:-1], axis=1)), len(qids)]
@@ -1292,7 +1302,7 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                         if not (need_value or need_slope):
                             continue
                         span = (int(q0), int(q1))
-                        selected = (mirror_qids if mirror else qids)[q0:q1]
+                        selected = (partner_qids if partner else qids)[q0:q1]
                         rows = np.asarray([row_index[int(q)] for q in selected])
                         h = roots[q0:q1]
                         constant = 0.
@@ -1305,7 +1315,7 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                         if direct_head is not None and q0 == 0:
                             from .photon_direct_head import add_direct_gamma_field
                             head_update = direct_head["constant"] + (
-                                direct_head["Wc_mirror"][sample] if mirror
+                                direct_head["Wc_minus_q"][sample] if partner
                                 else direct_head["Wc"][sample])
                             def gamma_add(packed, coefficient):
                                 return add_direct_gamma_field(packed, coefficient,
@@ -1313,37 +1323,37 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                                     layout=bank_io["photon_layout"], mesh=mesh_xy)
                         if need_value:
                             chi_value = raw[0,rows]
-                            if mirror:
+                            if partner:
                                 chi_value = jnp.conj(chi_value)
                             value = execute(solve_value, (h,chi_value)+(() if vertex is None else (contact,)),
                                             "sample_dyson") - constant
                         else:
                             io_started = time.monotonic()
                             saved = read_shared_pole_bank(bank_handle, span, meta=meta, header=header,
-                                sample_span=(sample,sample+1), fields=(fields[mirror][0],))
+                                sample_span=(sample,sample+1), fields=(fields[partner][0],))
                             receipt["seconds"]["io"] = receipt["seconds"].get("io",0.)+time.monotonic()-io_started
-                            value = saved[fields[mirror][0]][:,0]
+                            value = saved[fields[partner][0]][:,0]
                             del saved
                             if head_update is not None:
                                 value = gamma_add(value, -head_update)
                         if need_slope:
                             chi = raw[1,rows]
-                            if mirror:
+                            if partner:
                                 chi = jnp.conj(chi)
                             w = value if vertex is None else value+constant
                             slope = execute(solve_slope, (h, w, chi), "sample_slope")
                             if head_update is not None:
-                                coefficient = (direct_head["dWc_mirror_ds"][sample]
-                                               if mirror else direct_head["dWc_ds"][sample])
+                                coefficient = (direct_head["dWc_minus_q_ds"][sample]
+                                               if partner else direct_head["dWc_ds"][sample])
                                 slope = gamma_add(slope, coefficient)
                             io_started = time.monotonic()
-                            write(q_span=span, sample_span=(sample,sample+1), **{fields[mirror][1]: slope[:,None]})
+                            write(q_span=span, sample_span=(sample,sample+1), **{fields[partner][1]: slope[:,None]})
                             receipt["seconds"]["io"] = receipt["seconds"].get("io",0.)+time.monotonic()-io_started
                             del chi, w, slope
                         if need_value:
                             if head_update is not None:
                                 value = gamma_add(value, head_update)
-                            if vertex is not None and not mirror:
+                            if vertex is not None and not partner:
                                 _photon_sample_norms(receipt,value,q0,sample,bank_io["photon_layout"],mesh_xy)
                             for iq in range(q0,q1):
                                 part = slice(iq-q0,iq-q0+1)
@@ -1352,7 +1362,7 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                                     if ordered and _self_negative(int(qids[iq]),meta):
                                         _tr_odd_census(receipt,solve_value,h[part],chi_value[part],value[part],z[sample:sample+1],int(qids[iq]))
                             io_started = time.monotonic()
-                            write(q_span=span, sample_span=(sample,sample+1), **{fields[mirror][0]: value[:,None]})
+                            write(q_span=span, sample_span=(sample,sample+1), **{fields[partner][0]: value[:,None]})
                             receipt["seconds"]["io"] = receipt["seconds"].get("io",0.)+time.monotonic()-io_started
                             del chi_value
                         del value, h, constant
@@ -1372,7 +1382,7 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
     receipt["batch_reason"] = ("one stream per sample group; each Green pair serves every member's value, "
                                "derivative and both orientations")
     receipt["io_scope"] = "I/O envelope includes device readiness, packing, and finite checks; not pure storage time"
-    receipt["completion"] = bool(np.asarray(header["sample_written"]).all())
+    receipt["completion"] = all(committed(sample) for sample in range(len(z)))
     return _finish_receipt(receipt,meta,header,started)
 
 
@@ -1522,7 +1532,7 @@ def compute_photon_bank(wfns, wfns_transverse, meta, config, *, mesh_xy, sym,
                 if initial.get(key) != header[key]:
                     raise ValueError(f"GATE photon_static_reference: initial/current {key} differs")
         receipt["static_reference"] = reference
-        bank["mirror_operator_provenance"] = dict(coulomb=bank["coulomb"],
+        bank["minus_q_operator_provenance"] = dict(coulomb=bank["coulomb"],
             static_reference=reference,
             static_reference_commit=(initial["commit"] if initial is not None else None),
             state_identity=bank["identity"],

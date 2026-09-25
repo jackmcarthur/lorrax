@@ -1,4 +1,4 @@
-"""P4 direct-operator mirror actions for diagonal and rectangular photon sectors."""
+"""P4 minus-q partner actions W_q(-conj z) for diagonal and rectangular photon sectors."""
 
 
 def main():
@@ -36,8 +36,8 @@ def main():
         return (l*weight)@adj(r),(l*slope)@adj(r)
     direct=value(z,left,right)
     reverse=value(z,right,left)
-    mirror=value(-z.conjugate(),left,right)
-    mirror_reverse=value(-z.conjugate(),right,left)
+    partner=value(-z.conjugate(),left,right)
+    partner_reverse=value(-z.conjugate(),right,left)
     sharding=NamedSharding(mesh,P(('x','y')))
     def put(a):
         a=np.asarray(a)
@@ -52,10 +52,10 @@ def main():
         indices=np.tile(np.arange(n,dtype=np.int32),(4,1))
         return put(indices[0]),put(indices[0]),put(np.ones(n,np.complex128)),None
     # cross_round_actions expects direct LR, direct RL, their derivatives,
-    # then mirror LR, mirror RL, their derivatives.
+    # then the minus-q partner LR, RL, their derivatives.
     panels=(stack(direct[0]),stack(reverse[0]),stack(direct[1]),stack(reverse[1]),
-            stack(mirror[0]),stack(mirror_reverse[0]),stack(mirror[1]),stack(mirror_reverse[1]))
-    result=cross_round_actions(panels,states,roles,recipe,sample_lo=0,mesh_xy=mesh,
+            stack(partner[0]),stack(partner_reverse[0]),stack(partner[1]),stack(partner_reverse[1]))
+    result=cross_round_actions(panels,states,roles,recipe,sample_lo=0,partner_lo=0,mesh_xy=mesh,
         partner_slots=[0,1,2,3],endpoint_actions=(action(2),action(3)))
     errors=[]
     for k,node in enumerate(nodes):
@@ -66,12 +66,12 @@ def main():
                        float(np.max(np.abs(got[1]-(2*node*derivative)@direction)))))
     assert max(errors)<1e-12,errors
 
-    # Diagonal mirror uses its stored -conj(z) value, adjointed only for
+    # A diagonal mirror state uses the stored -conj(z) value, adjointed only for
     # the original state at -z. Wrongly using the direct +z value is visible.
     square=value(-z.conjugate(),right,right)
     xs=put(q[0])
     scales=rep(np.array([-2*z,-2*z.conjugate()],np.complex128))
-    kernel=_round_kernels(mesh).literal_mirrors((False,True))
+    kernel=_round_kernels(mesh).minus_q_partner((False,True))
     actual=kernel(stack(square[0]),stack(square[1]),xs,rep(np.int32(0)),scales)
     diagonal=[]
     for k,node in enumerate(nodes[2:]):
@@ -89,7 +89,7 @@ def main():
     result=dict(status='PASS',job=os.environ.get('SLURM_JOB_ID'),
         step=os.environ.get('SLURM_STEP_ID'),direct_cross_max=max(errors),
         direct_diagonal_max=max(diagonal),wrong_positive_sample_red=red,
-        scope='P4 literal mirror actions at nonzero complex frequency; no bank producer, moments or material model')
+        scope='P4 minus-q partner actions at nonzero complex frequency; no bank producer, moments or material model')
     if jax.process_index()==0:
         args.output.write_text(json.dumps(result,indent=2)+'\n')
         print(json.dumps(result),flush=True)

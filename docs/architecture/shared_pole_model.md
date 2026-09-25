@@ -116,11 +116,20 @@ each Green branch the other branch's residues,
 $\Sigma[W^{\rm even}]-\Sigma^{\rm odd}$
 (`tests/test_shared_pole_stream_orientation.py`).
 
-**Literal mirrors.** Ordered production requires `mirror_mode =
-literal_same_operator_v1`: the stream's output rows are the union of the parent
-rows and their $-q$ rows in one panel, and `Wc_mirror`/`dWc_mirror_ds` at
-$-\bar z$ are formed from the conjugated $-q$ rows with the **original parent's
-$V$** (and contact), so the mirror state of (W 25) is the same operator.
+**Minus-q partner.** The ordered pencil's state $X(-z)$ acts with
+$W_q(-\bar z)=\overline{W_{-q}(z)}$ on the directions of $X(z)$, and it must be
+the same operator as $W_q(z)$. On an imaginary node $-\bar z=z$, so the stored
+sample is its own partner. At each fitted line sample (`minus_q_partner_span`,
+the contiguous ids $[p_0,p_1)$ in the header's `minus_q_partner`) the bank
+stores `Wc_minus_q`/`dWc_minus_q_ds`. The stream's output rows are the union of
+the parent rows and their $-q$ rows in one panel, and the partner is formed
+from the conjugated $-q$ rows with the **original parent's $V$** (and contact).
+Held samples store none, because the checks read `Wc`/`dWc_ds` only.
+Rebuilding the line-node partner from the $-q$ parent through the symmetry
+tables is not exact: the ISDF $V_q$ is covariant only to about $2\times10^{-6}$,
+and the ordered Gram amplifies that into a refusal
+(sandbox claim 2452, bcc Fe).
+A bank with the retired all-sample layout (`mirror_mode`) is refused by name.
 
 **Dyson and derivative.** Per sample and bounded $q$ span, $W_c$ is solved from
 the roots and $\partial_sW=W(\partial_s\chi)W$ is formed from the committed $W$,
@@ -238,7 +247,7 @@ path past that point.
 | `n_q_irr`, `q_irr_full_idx`, `qirr`, `operations` | raw parents and the authorized symmetry rows |
 | `n_mu_logical`, `nspinor`, `centroid_digest` | basis identity; the operator is the spin-traced $\mu\times\mu$ charge response for `nspinor` 1, 2 and the four-component kinetic-balance carrier |
 | model: `factor [q, μ, components, Kmax]` complex128, `poles2_ry2 [q, Kmax]` float64, `K [q]` int64 | (W 14) per parent, units Ry$^{3/2}$ and Ry²; inactive columns have $b=0$, $\Lambda=1$ Ry² |
-| bank: `Wc`, `dWc_ds [q, a, μ, μ]`; `Wc_mirror`, `dWc_mirror_ds` when ordered; `M1`, `M3` (+ `M0`, `M2` when ordered); `constant` for photon | samples and moments of §2 |
+| bank: `Wc`, `dWc_ds [q, a, μ, μ]`; `Wc_minus_q`, `dWc_minus_q_ds [q, p₁−p₀, μ, μ]` when ordered; `M1`, `M3` (+ `M0`, `M2` when ordered); `constant` for photon | samples and moments of §2 |
 
 `write_poles = true` exports $(b,\Lambda)$, from which a BSE takes
 $W_c(0)=-b\Lambda^{-1}b^\dagger$ exactly. `write_w = true` dumps the whole bank

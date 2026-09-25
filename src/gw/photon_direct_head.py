@@ -312,20 +312,20 @@ def _direct_gamma_chunk(q, bare, weight, interband, slopes, coefficients,
             return value, slope, error
 
         value, slope, error = solve(pi, dpi)
-        # The ordered mirror conjugates the response at -q, then uses the
-        # *same* V and contact. q reversal flips CT/TC, while the bare
+        # The minus-q partner W_q(-conj z) conjugates the response at -q, then
+        # uses the *same* V and contact. q reversal flips CT/TC, while the bare
         # transverse projector is even. Conjugating screened W would also
         # conjugate the Hall contact and break its shared moments.
         parity = jnp.diag(jnp.array((1, -1, -1, -1), dtype=pi.dtype))
-        mirror_value, mirror_slope, mirror_error = solve(
+        partner_value, partner_slope, partner_error = solve(
             jnp.conj(parity @ pi @ parity),
             jnp.conj(parity @ dpi @ parity))
-        return None, (value, slope, mirror_value, mirror_slope,
-                      jnp.maximum(error, mirror_error))
+        return None, (value, slope, partner_value, partner_slope,
+                      jnp.maximum(error, partner_error))
 
-    _, (value, slope, mirror_value, mirror_slope, errors) = jax.lax.scan(
+    _, (value, slope, partner_value, partner_slope, errors) = jax.lax.scan(
         one, None, (frequencies, interband, slopes), unroll=1)
-    return (value, slope, mirror_value, mirror_slope, constant_sum,
+    return (value, slope, partner_value, partner_slope, constant_sum,
             moment_sum, bare_sum, jnp.max(errors))
 
 
@@ -472,6 +472,6 @@ def build_direct_photon_head(velocity_cart, wfns, occupation_state, *,
                  "4×131072 Sobol exterior + 8×12×24 screened sphere; "
                  f"max replicate spread={spread:.3e} Ry, "
                  f"Dyson residual={float(max_error):.3e}", flush=True)
-    return dict(zip(("Wc", "dWc_ds", "Wc_mirror", "dWc_mirror_ds",
+    return dict(zip(("Wc", "dWc_ds", "Wc_minus_q", "dWc_minus_q_ds",
                      "constant", "moments", "bare"),
                     fields_mean))

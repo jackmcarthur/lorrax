@@ -43,9 +43,9 @@ def _round_kernels(mesh, layout="batch"):
     """Selection programs for batch or whole-mesh face round stacks.
 
     Batch arrays carry their parent axis over ('x','y'). Face arrays carry one
-    physical parent at P(None,'x','y'). Scalars are replicated. Batch mirror
-    exchange moves only [n,r] panels between partner ranks; authenticated
-    literal mirrors remove that exchange from face execution.
+    physical parent at P(None,'x','y'). Scalars are replicated. The batch
+    partner exchange moves only [n,r] panels between partner ranks; a bank's
+    stored minus-q partner fields remove that exchange from face execution.
     """
     from types import SimpleNamespace
     from common.shard_map import shard_map
@@ -111,13 +111,13 @@ def _round_kernels(mesh, layout="batch"):
                        (batch,) * (2 * len(flags)))
 
     @lru_cache(maxsize=None)
-    def literal_mirrors(flags):
-        """Act with stored W_q(-conj z) on this parent's original directions.
+    def minus_q_partner(flags):
+        """Act with the stored minus-q partner W_q(-conj z) on this parent's original directions.
 
         The original state at z needs the adjoint to reach -z. Its conjugate
         state at conj z needs the stored value directly at -conj z. Each
-        derivative is with respect to s at that mirror point; ``scales``
-        converts it to the derivative with respect to z there.
+        derivative is with respect to s at -conj z; ``scales`` converts it to
+        the derivative with respect to z there.
         """
         def body(w, dw, xs, j, scales):
             a, d = sample(w, j), sample(dw, j)
@@ -140,7 +140,7 @@ def _round_kernels(mesh, layout="batch"):
     negative_hermitian = program(lambda a: -(a + adjoint(a)) / 2, (batch,), batch)
     return SimpleNamespace(
         take=take, column=column, negative_hermitian=negative_hermitian, exchange=exchange,
-        literal_mirrors=literal_mirrors, act=act, apply=apply,
+        minus_q_partner=minus_q_partner, act=act, apply=apply,
         stack=program(lambda *a:jnp.stack(a,axis=1),batch,batch),
         dedupe=program(dedupe, (batch, batch), (batch, batch)))
 
@@ -161,7 +161,7 @@ def leading_response_directions(matrix, width, **kwargs):
 
 def select_round_states(samples, recipe, *, sample_lo, real, mesh_xy, eigh_plan, svd_plan,
                         column_extent, logical_n, ordered=False, exchange=None,
-                        current_rotation=None):
+                        current_rotation=None, partner_lo=None):
     """Directions, outputs and actions of one round of parents, batched per role (SP 3, SP 13).
 
     ``samples`` holds ``Wc``/``dWc_ds`` as [P,S,n,n] in local batch layout
@@ -173,10 +173,13 @@ def select_round_states(samples, recipe, *, sample_lo, real, mesh_xy, eigh_plan,
     the role state and, when its node is off the real s axis, the conjugate
     state on O = W Q (ordered imaginary or Re z = 0 roles: the partner directions
     of O orthogonal to Q, per-slot widths, 0 allowed); after all originals the
-    ordered mirrors X(-node) on the same directions. A mirror of a Re z = 0
-    sample uses its own sample; any other mirror uses the partner parent's
-    sample through ``exchange = (slots, alpha, inverse, phase)``
-    (``shared_pole_local.partner_realization``): W_q(-conj z) = conj(R_s[W_q(p')](z)).
+    ordered mirror states X(-node) on the same directions. They act with
+    W_q(-conj z) = conj(W_{-q}(z)), the minus-q partner. At Re z = 0,
+    -conj z = z and the partner is the sample itself. Otherwise it is the
+    bank's stored ``Wc_minus_q``/``dWc_minus_q_ds`` (sample ``sid - partner_lo``
+    of those stacks), or, on a bank without them, the partner parent's sample
+    through ``exchange = (slots, alpha, inverse, phase)``
+    (``shared_pole_local.partner_realization``): conj(R_s[W_q(p')](z)).
 
     Returns ``(states, counts, roles)``: panels [P,n,r] in local batch layout
     or [1,n_X,r_Y] in face layout, replicated counts int [P,A], and per-slot
@@ -189,11 +192,11 @@ def select_round_states(samples, recipe, *, sample_lo, real, mesh_xy, eigh_plan,
     k = _round_kernels(eigh_plan.mesh, 'face' if face_layout else 'batch')
     spectral_rows = None if face_layout else real
     W, dW = samples["Wc"], samples["dWc_ds"]
-    literal = "Wc_mirror" in samples or "dWc_mirror_ds" in samples
-    if literal and not all(name in samples for name in ("Wc_mirror", "dWc_mirror_ds")):
-        raise ValueError("GATE shared_pole_literal_mirror: both Wc_mirror and dWc_mirror_ds are required")
-    if literal and not ordered:
-        raise ValueError("GATE shared_pole_literal_mirror: ordered representation required")
+    stored_partner = "Wc_minus_q" in samples or "dWc_minus_q_ds" in samples
+    if stored_partner and not all(name in samples for name in ("Wc_minus_q", "dWc_minus_q_ds")):
+        raise ValueError("GATE shared_pole_minus_q_partner: both Wc_minus_q and dWc_minus_q_ds are required")
+    if stored_partner and (not ordered or partner_lo is None):
+        raise ValueError("GATE shared_pole_minus_q_partner: ordered representation and partner_lo required")
     ranks = int(W.shape[0])
     names = {code: name for name, code in ROLE_CODES.items()}
     fit_ids = [int(i) for i in recipe["fit_ids"]]
@@ -264,25 +267,20 @@ def select_round_states(samples, recipe, *, sample_lo, real, mesh_xy, eigh_plan,
             # W(-z) = W(-conj z)^H on Q; W(-conj z) on the partner's O. dW/dz at the
             # mirror node is -2 node dW/ds(-conj z).
             span = range(first, len(states))
-            if literal and z.real != 0:
+            if stored_partner and z.real != 0:
                 originals = list(span)
                 xs = (k.stack(*[states[index][1] for index in originals])
                       if face_layout else jnp.stack([states[index][1] for index in originals], axis=1))
-                program = k.literal_mirrors(tuple(flags[index] for index in originals))
-                flat = program(samples["Wc_mirror"], samples["dWc_mirror_ds"], xs, j,
+                program = k.minus_q_partner(tuple(flags[index] for index in originals))
+                flat = program(samples["Wc_minus_q"], samples["dWc_minus_q_ds"], xs,
+                               put(np.int32(sid - partner_lo)),
                                put(np.asarray([-2 * states[index][0] for index in originals], np.complex128)))
                 results = [(flat[2 * i], flat[2 * i + 1]) for i in range(len(originals))]
                 del xs
-            elif literal:
-                # An imaginary support's optional partner direction can
-                # have a different carrier width, so act on each separately.
-                results = []
-                for index in span:
-                    node = states[index][0]
-                    results.append(k.act(not flags[index])(
-                        samples["Wc_mirror"], samples["dWc_mirror_ds"], j,
-                        states[index][1], put(np.complex128(-2 * node))))
             elif z.real == 0:
+                # -conj z = z: the sample is its own minus-q partner. An
+                # imaginary support's optional partner direction can have a
+                # different carrier width, so act on each state separately.
                 results = []
                 for index in span:
                     node = states[index][0]

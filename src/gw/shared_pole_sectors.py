@@ -91,7 +91,7 @@ def read_sector_round(io, meta, bank, header, ids, endpoints, *, sample_span=Non
     out={}
     try:
         for field in fields:
-            sample=field in ('Wc','dWc_ds','Wc_mirror','dWc_mirror_ds')
+            sample=field in ('Wc','dWc_ds','Wc_minus_q','dWc_minus_q_ds')
             if sample and (sample_span is None or sample_span[1] <= sample_span[0]):
                 raise ValueError('sector sample reads require a nonempty bounded sample_span')
             size=sum(a.size*a.dtype.itemsize//io.mesh.size for a in keep)
@@ -145,9 +145,11 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output):
 
     header=validate_shared_pole_bank(bank['path'],expected_identity=bank['identity'],
                                     mesh_xy=mesh_xy,require_complete=True)
-    if header.get('mirror_mode')!='literal_same_operator_v1':
-        raise ValueError('GATE shared_pole_sector_mirror: photon bank requires authenticated literal same-operator mirrors')
-    sample_fields=('Wc','dWc_ds','Wc_mirror','dWc_mirror_ds')
+    if 'minus_q_partner' not in header:
+        raise ValueError('GATE shared_pole_minus_q_partner: photon bank requires stored minus-q partner fields')
+    partner_span=tuple(int(v) for v in header['minus_q_partner']['sample_span'])
+    if partner_span[1]<=partner_span[0]:
+        raise ValueError('GATE shared_pole_minus_q_partner: photon recipe has no fitted line sample')
     recipe=meta.shared_pole_recipe
     if header['identity'] != bank['identity']:
         raise ValueError('GATE shared_pole_bank_state: current sector bank identity mismatch')
@@ -159,6 +161,14 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output):
     sector_headers=[_metadata(meta,table,recipe,bank['identity'],True,basis=basis,sector=sector)
                for table,basis,sector in zip(bank['sector_tables'],bank['mu_bases'],('CC','TT'))]
     fit_span=(int(min(recipe['fit_ids'])),int(max(recipe['fit_ids']))+1)
+
+    def read_samples(io,endpoints,retained):
+        # Wc/dWc_ds at every fitted sample, the minus-q partner at the fitted line samples.
+        out=read_sector_round(io,meta,bank,header,ids,endpoints,sample_span=fit_span,
+            fields=('Wc','dWc_ds'),retained=retained,execution=execution)
+        out.update(read_sector_round(io,meta,bank,header,ids,endpoints,sample_span=partner_span,
+            fields=('Wc_minus_q','dWc_minus_q_ds'),retained=(*retained,*out.values()),execution=execution))
+        return out
     receipts=[];stores={};placed=[]
     root=Path(output).parent
     to_face=batch_to_face(mesh_xy)
@@ -190,11 +200,11 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output):
                 with open_shared_pole_bank(bank['path'],mesh_xy=mesh_xy) as io:
                     exact=read_sector_round(io,meta,bank,header,ids,(family,family),
                         fields=('M0','M1','M2','M3'),retained=retained,execution=execution)
-                    samples=read_sector_round(io,meta,bank,header,ids,(family,family),
-                        sample_span=fit_span,fields=sample_fields,retained=(*retained,*exact.values()),execution=execution)
+                    samples=read_samples(io,(family,family),(*retained,*exact.values()))
                 geometry=dict(components=3 if family else 1,basis=bank['mu_bases'][family],
                     ids=ids,real=real,header=sector_headers[family],partner_parent=partner,
                     partner_row=row,slots=slots,sym=bank['tables']['sym'],sample_lo=fit_span[0],
+                    partner_lo=partner_span[0],
                     sector=name)
                 model=construct_diagonal_sector_round(samples,exact,meta,config,geometry,
                     mesh_xy=mesh_xy,retained=retained)
@@ -214,14 +224,12 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output):
                         status='DIAGONAL_SPANS_ONLY',rounds=receipts))+'\n'))
         with timing.section('spole.sector.CT', announce=True):
             with open_shared_pole_bank(bank['path'],mesh_xy=mesh_xy) as io:
-                ct=read_sector_round(io,meta,bank,header,ids,(0,1),sample_span=fit_span,
-                                      fields=sample_fields,retained=retained,execution=execution)
-                tc=read_sector_round(io,meta,bank,header,ids,(1,0),sample_span=fit_span,
-                                      fields=sample_fields,retained=(*retained,*ct.values()),execution=execution)
+                ct=read_samples(io,(0,1),retained)
+                tc=read_samples(io,(1,0),(*retained,*ct.values()))
                 cm=read_sector_round(io,meta,bank,header,ids,(0,1),fields=('M0','M1','M2','M3'),
                                       retained=(*retained,*ct.values(),*tc.values()),execution=execution)
             cross=construct_cross_sector_round(sectors,(ct,tc),cm,meta,config,mesh_xy=mesh_xy,
-                sample_lo=fit_span[0],partner_slots=slots,real=real)
+                sample_lo=fit_span[0],partner_lo=partner_span[0],partner_slots=slots,real=real)
             with open_shared_pole_bank(bank['path'],mesh_xy=mesh_xy) as io:
                 c1=read_sector_round(io,meta,bank,header,ids,(0,0),fields=('M1',),
                     retained=(*retained,*ct.values(),*tc.values(),*cm.values(),*jax.tree.leaves(cross['models'])),execution=execution)['M1']
@@ -571,13 +579,14 @@ def construct_diagonal_sector_round(samples, moments, meta, config, geometry, *,
         real_rows=None if execution=='face' else geometry['real'])
     kernels=_round_kernels(mesh_xy,'face' if execution=='face' else 'batch')
     infinity=(qi,*(kernels.apply(moments[name],qi) for name in ('M0','M1','M2','M3')))
-    # Literal mirrors use the original parent's stored operator directly;
+    # The stored minus-q partner belongs to the original parent's operator;
     # no spatial partner action is needed in either execution layout.
     action=(None,None,None)
     rotation=None
     states,counts,roles=select_round_states(samples,recipe,sample_lo=geometry['sample_lo'],
         real=geometry['real'],mesh_xy=mesh_xy,eigh_plan=eig,svd_plan=svd,column_extent=extent,
-        logical_n=n,ordered=True,exchange=(geometry['slots'],*action),current_rotation=rotation)
+        logical_n=n,ordered=True,exchange=(geometry['slots'],*action),current_rotation=rotation,
+        partner_lo=geometry['partner_lo'])
     # Reuse admitted carrier widths across this model's later SC maps.
     round_key=('sector',geometry['sector'],n)
     # The reduction envelope already includes current Q/O/dO and infinity
@@ -636,7 +645,7 @@ def construct_diagonal_sector_round(samples, moments, meta, config, geometry, *,
 
 
 def construct_cross_sector_round(sectors, samples, moments, meta, config, *,
-                                 mesh_xy, sample_lo, partner_slots, real):
+                                 mesh_xy, sample_lo, partner_lo, partner_slots, real):
     """Run CT on the two current-map diagonal spans, keeping both outputs.
 
     ``samples=(CT,TC)`` contains the native rectangular Wc/dWc_ds rounds;
@@ -689,10 +698,10 @@ def construct_cross_sector_round(sectors, samples, moments, meta, config, *,
             (charge,tc,ct,transverse,charge),
             (transverse,ct,tc,charge,transverse)):
         panels=(forward['Wc'],reverse['Wc'],forward['dWc_ds'],reverse['dWc_ds'],
-                forward['Wc_mirror'],reverse['Wc_mirror'],
-                forward['dWc_mirror_ds'],reverse['dWc_mirror_ds'])
+                forward['Wc_minus_q'],reverse['Wc_minus_q'],
+                forward['dWc_minus_q_ds'],reverse['dWc_minus_q_ds'])
         actions.append(cross_round_actions(panels,source['states'],source['roles'],
-            source['recipe'],sample_lo=sample_lo,mesh_xy=mesh_xy,
+            source['recipe'],sample_lo=sample_lo,partner_lo=partner_lo,mesh_xy=mesh_xy,
             partner_slots=partner_slots,
             endpoint_actions=(left['endpoint_action'],right['endpoint_action'])))
 
@@ -808,11 +817,19 @@ def _positive_cross_equations(left,right,mu,active,*,gates,matrix_sharding=None)
                               charge=checks[0],current=checks[1])
 
 
-def _literal_cross_products(panels,q,node,sample,*,mirror,conjugate,mm):
-    """One literal same-operator CT action for both execution layouts."""
+def _cross_products(panels,q,node,sample,*,mirror,imaginary,conjugate,mm):
+    """One CT action with the parent's own operator, for both execution layouts.
+
+    A mirror state acts with W(-conj z): the stored minus-q partner panels
+    (``sample`` indexes their stack) or, at an imaginary node where
+    -conj z = z, the sample itself.
+    """
     w,wr,d,dr,wm,wrm,dwm,dwrm=panels
-    if mirror:
+    if mirror and not imaginary:
         a,da=(wm,dwm) if conjugate else (wrm,dwrm)
+        adjoint=not conjugate
+    elif mirror:
+        a,da=(w,d) if conjugate else (wr,dr)
         adjoint=not conjugate
     else:
         a,da=(wr,dr) if conjugate else (w,d)
@@ -823,19 +840,20 @@ def _literal_cross_products(panels,q,node,sample,*,mirror,conjugate,mm):
     return mm(a,q),mm(da,q)*(2*node)
 
 
-def cross_round_actions(samples, states, roles, recipe, *, sample_lo, mesh_xy,
+def cross_round_actions(samples, states, roles, recipe, *, sample_lo, partner_lo, mesh_xy,
                         partner_slots, endpoint_actions):
     """Apply rectangular samples to the diagonal sectors' selected directions.
 
     ``samples=(W_LR,W_RL,dW_LR/ds,dW_RL/ds)`` are parent-local
     [P,S,n_L,n_R] (reverse blocks have reversed endpoint extents).
-    With literal mirrors, four matching W/dW panels at ``-conj(z)`` follow.
+    With the stored minus-q partner, four W/dW panels at ``-conj(z)`` over
+    the fitted line samples (first id ``partner_lo``) follow.
     ``states``/``roles`` are the existing selection round's source states.
     ``endpoint_actions`` is ((alpha,inverse,phase,rotation)_L, ..._R);
     a charge endpoint has rotation=None, a current endpoint uses the
     symmetry service's polar time-odd [P,3,3] action and mu-major rows.
-    Literal mirror panels already belong to the original q operator and
-    require no partner-rank exchange or spatial action. The legacy four-panel
+    The partner panels already belong to the original q operator and
+    require no partner-rank exchange or spatial action. The four-panel
     route exchanges only direction/output panels through the authenticated
     partner permutation. Outputs follow the paired state order and the
     derivative is d/dz, report equation 5.3.
@@ -843,30 +861,32 @@ def cross_round_actions(samples, states, roles, recipe, *, sample_lo, mesh_xy,
     from gw.shared_pole_directions import _sample_point
     from gw.shared_pole_execution import is_face,cross_action_program
     face=is_face(samples[0])
-    literal=len(samples)==8
+    stored=len(samples)==8
     if len(samples) not in (4,8):
-        raise ValueError('GATE shared_pole_sector_mirror: expected four direct or eight direct/mirror panels')
-    if face and not literal:
-        raise ValueError('distributed photon CT requires authenticated literal mirrors')
+        raise ValueError('GATE shared_pole_minus_q_partner: expected four direct or eight direct/partner panels')
+    if face and not stored:
+        raise ValueError('GATE shared_pole_minus_q_partner: distributed photon CT requires stored minus-q partner panels')
     outputs=[]
     for state,role in zip(states,roles[0]):
         sid=int(role['sample_id'])
         conjugate=bool(role.get('conjugate',False))
         mirror=bool(role.get('mirror',False))
+        imaginary=_sample_point(recipe,sid).real==0
         node=jnp.asarray(state[0])
-        sample=jnp.asarray(sid-sample_lo,jnp.int32)
+        index=sid-partner_lo if mirror and not imaginary and stored else sid-sample_lo
+        sample=jnp.asarray(index,jnp.int32)
         if face:
-            outputs.append(cross_action_program(mesh_xy,mirror,conjugate)(samples,state[1],node,sample))
+            outputs.append(cross_action_program(mesh_xy,mirror,imaginary,conjugate)(samples,state[1],node,sample))
         else:
-            exchange=mirror and _sample_point(recipe,sid).real!=0 and not literal
+            exchange=mirror and not imaginary and not stored
             perm=tuple((i,int(p)) for i,p in enumerate(partner_slots)) if exchange else ()
-            program=_local_cross_action_program(mesh_xy,literal,mirror,conjugate,exchange,perm)
+            program=_local_cross_action_program(mesh_xy,stored,mirror,imaginary,conjugate,exchange,perm)
             outputs.append(program(samples,state[1],*endpoint_actions,node,sample))
     return tuple(outputs)
 
 
 @lru_cache(maxsize=None)
-def _local_cross_action_program(mesh,literal,mirror,conjugate,exchange,perm):
+def _local_cross_action_program(mesh,stored,mirror,imaginary,conjugate,exchange,perm):
     import jax
     from common.shard_map import shard_map
     from jax.sharding import PartitionSpec as P
@@ -880,9 +900,9 @@ def _local_cross_action_program(mesh,literal,mirror,conjugate,exchange,perm):
         return jnp.einsum('bij,bmir->bmjr' if transpose else 'bij,bmjr->bmir',
                           rotation,panel).reshape(shape)
     def apply(panels,q,left,right,node,sample):
-        if literal:
-            return _literal_cross_products(panels,q,node,sample,
-                mirror=mirror,conjugate=conjugate,mm=_mm)
+        if stored:
+            return _cross_products(panels,q,node,sample,mirror=mirror,
+                imaginary=imaginary,conjugate=conjugate,mm=_mm)
         w,wr,d,dr=panels
         a,b=w[:,sample],wr[:,sample]
         da,db=d[:,sample],dr[:,sample]
