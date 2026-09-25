@@ -1,7 +1,9 @@
 hBN 3x3x2 COHSEX regression fixture — the NON-CUBIC cell
 =========================================================
 
-**RE-FROZEN 2026-08-09, OWNER-AUTHORIZED.**  `eqp_hbn_ref.dat` is the frozen
+**RE-FROZEN 2026-09-25, OWNER-ACCEPTED** ("i'm happy to accept hbn changing a bit", 09:50; landing queue R26).  `eqp_hbn_ref.dat` is now a byte copy of the P4 run of `test_hbn_matches_frozen_reference` on the R26 stack (whole-file md5 `1ebac3ec4c102481a27f746cf567ff61`, data-lines md5 `695f87afaf933a377430236bd234f570`; its data lines equal R25's run byte for byte).  What moved since the 2026-08-09 freeze (1440 cells, test parser, max / MAE in meV): sigSX 102.2 / 22.8, sigCOH 165.6 / 28.4, sigTOT 180.7 / 27.9, VH 0 / 0.  Attribution (P2-S, claim 2771): the q->0 W head moved by dW0 = +78.5 meV since 08-10 (COH +39.23 meV on every band, SX -78.46 meV on occupied bands: the 1/2 dW / -dW head structure; this deck pins no `vhead`/`whead`), and the band-window guard's `zeta_nband` 80 -> 76 adds up to 140 meV on bands 48-79.  The 2026-08-09 section below is history.
+
+**Superseded 2026-09-25:** **RE-FROZEN 2026-08-09, OWNER-AUTHORIZED.**  `eqp_hbn_ref.dat` is the frozen
 reference.  It is a byte copy of the candidate produced by the re-freeze run
 of 2026-08-09 (`/pscratch/sd/j/jackm/refreeze_0809/hbn_run1/eqp_hbn_test.dat`,
 whole-file md5 `ed4726a9b3f25a91b6f9c118516892bb`, data-lines md5
@@ -85,7 +87,7 @@ What is in this directory
 | `dipole.h5` | `24ba16ec14464649f0a679d7800ce106` | dipole matrix elements, **`+1` arm** (re-cut at `9a730da8`; the legacy `-1` file was `a38de4bae19713cb1765570f2bc816c6`) |
 | `centroids_frac_330.txt` | `2bbfee1219eec8091d269a876ba04eed` | the ISDF centroid set |
 | `cohsex_hbn_test.in` | — | the deck (as run, minus the retired `output_file` key) |
-| `eqp_hbn_ref.dat` | `ed4726a9b3f25a91b6f9c118516892bb` | **the frozen reference** (re-frozen 2026-08-09; the superseded one was `14035d12ca40a45e392b54528ee3c76c`) |
+| `eqp_hbn_ref.dat` | `1ebac3ec4c102481a27f746cf567ff61` | **the frozen reference** (re-frozen 2026-09-25; superseded: `ed4726a9b3f25a91b6f9c118516892bb` of 2026-08-09, `14035d12ca40a45e392b54528ee3c76c` of 2026-08-07) |
 | `qe/{scf,nscf,pw2bgw}.in` | — | the mean-field inputs AS RUN |
 | `README_PLAN.md` | — | the plan + the 2026-08-07 execution record |
 
