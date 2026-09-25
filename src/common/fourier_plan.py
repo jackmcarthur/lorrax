@@ -58,7 +58,14 @@ from common.fft_helpers import local_fftn3, local_ifftn3
 # beats the library FFT, for a full N→N axis and for an axis with a support
 # (whose FFT arm pays the embedding gather or the restriction take).  A missing
 # device, and 0, mean FFT.  Sweep: ``tests/bench/bench_fourier_plan.py``.
-GEMM_CROSSOVER: dict[str, tuple[int, int]] = {}
+#
+# A100 (complex128, production XLA flags): a batched cuFFT costs about one HBM
+# pass for every N in 2..256, so a full axis never gains from a GEMM past the
+# launch-latency regime (≤1e3 lines).  A supported axis's FFT arm costs about
+# five passes per sphere→box→sphere round trip (gathers, transform, takes); the
+# rotated GEMM chain replaces them with one GEMM pass per axis and wins up to
+# N = 128 at K = N/2 (0.46–0.90 of the FFT arm on 12³–96³ and 24²–128² boxes).
+GEMM_CROSSOVER: dict[str, tuple[int, int]] = {"NVIDIA A100": (0, 128)}
 
 _NORMS = (None, "backward", "ortho", "forward")
 
