@@ -1086,7 +1086,8 @@ def make_plane_fft_gather(mesh: Mesh, plane_from_col, n_col: int, plane_shape) -
             F = jax.lax.dynamic_slice_in_dim(F, start, int(size), axis=1)
         z = lambda n: jnp.zeros(F.shape[:-1] + (n,), F.dtype)
         st = jnp.concatenate([F[..., a:e] if a >= 0 else z(e) for a, e in runs], axis=-1)
-        return jnp.fft.fftn(st.reshape(F.shape[:-1] + (nb, nc)), axes=(-2, -1))
+        from common.fft_helpers import local_fftn3     # see the import-cycle note
+        return local_fftn3(st.reshape(F.shape[:-1] + (nb, nc)), axes=(-2, -1), norm="backward")
 
     _xla.route = "xla"
     if kconv_backend(mesh) != "mathdx":
