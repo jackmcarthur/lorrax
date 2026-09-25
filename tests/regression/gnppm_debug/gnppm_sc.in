@@ -50,6 +50,13 @@
 # RESTARTS from the `gnppm_test.in` session state (same WFN, same
 # centroids, same zeta) so it costs one Sigma chain and not an ISDF
 # rebuild: ~25 s at P=4 against ~31 s fresh.
+# SEMICORE FROZEN (owner rule, 2026-09-24): under the default
+# `sigma_out_of_grid = cover` every protected band outside
+# `sc_frozen_core_bands` reads its own Sigma(E), and the grid grows over it.
+# Bands 1-12 are Mo 4s/4p and S 3s (-63 to -16 eV rel E_F); covering them
+# costs 19x the quadrature nodes on MoS2 3x3 and slows the loop (CLAIMS 2710,
+# 2725), so they stay at their DFT block.
+sc_frozen_core_bands = 12
 zeta_rcond = 1e-10
 compute_mode = gn_ppm
 restart = true
