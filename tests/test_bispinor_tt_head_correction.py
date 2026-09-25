@@ -231,9 +231,21 @@ def test_incumbent_ppm_uses_bare_tt_gamma_but_packed_does_not(
             "head_correction = full\nlinalg = local\n"
             "use_ppm_sigma = true\nppm_omega_p = 2.0\n")
     cfg = _config(tmp_path, deck, name=f"{mode}_incumbent.in")
-    assert not uses_static_photon_response(cfg)
-    assert uses_bare_tt_gamma_head(cfg)
-    assert "bare TT Gamma-cell average in V" in incumbent_bispinor_head_record(cfg)[1]
+    # One Sigma^B route (02ea27f6, owner 2026-09-24): an in-envelope slab
+    # bispinor deck takes the PACKED route under either `linalg` value, so the
+    # backend dial never chooses the physics route.
+    for linalg in ("local", "distributed"):
+        packed = dataclasses.replace(
+            cfg, backend=dataclasses.replace(cfg.backend, linalg=linalg))
+        assert uses_static_photon_response(packed), linalg
+        assert not uses_bare_tt_gamma_head(packed), linalg
+
+    # The INCUMBENT route (and its bare TT Gamma head) remains for decks
+    # outside the packed envelope: bulk here (the packed route wants sys_dim=2).
+    incumbent = dataclasses.replace(cfg, sys_dim=3)
+    assert not uses_static_photon_response(incumbent)
+    assert uses_bare_tt_gamma_head(incumbent)
+    assert "bare TT Gamma-cell average in V" in incumbent_bispinor_head_record(incumbent)[1]
 
     monkeypatch.setattr(v_q_bispinor, "_tt_head_tensor",
                         lambda **_: np.diag([7., 8., 9.]))
@@ -241,18 +253,14 @@ def test_incumbent_ppm_uses_bare_tt_gamma_but_packed_does_not(
     builder = v_q_bispinor._make_per_q_v_builder_for_tile(
         mu_L=1, nu_L=1, bvec=_BVEC, cell_volume=_CELL_VOLUME,
         sys_dim=_SYS_DIM, vcoul_cutoff_ry=None,
-        kgrid=_KGRID, tt_head_correction=uses_bare_tt_gamma_head(cfg))
+        kgrid=_KGRID, tt_head_correction=uses_bare_tt_gamma_head(incumbent))
     assert np.asarray(builder(q, g))[0, 1] == -7. / _CELL_VOLUME
 
-    packed = dataclasses.replace(
-        cfg, backend=dataclasses.replace(cfg.backend, linalg="distributed"))
-    assert uses_static_photon_response(packed)
-    assert not uses_bare_tt_gamma_head(packed)
     off = dataclasses.replace(
-        cfg, head=dataclasses.replace(cfg.head, correction=HeadCorrection.OFF))
+        incumbent, head=dataclasses.replace(incumbent.head, correction=HeadCorrection.OFF))
     assert not uses_bare_tt_gamma_head(off)
     with pytest.raises(ValueError, match="GATE bare_tt_gamma_restart_unstamped"):
-        refuse_unsupported_bispinor_gw(dataclasses.replace(cfg, restart=True))
+        refuse_unsupported_bispinor_gw(dataclasses.replace(incumbent, restart=True))
 
 
 def test_tt_head_tensor_refuses_box_truncation():
