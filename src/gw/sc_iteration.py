@@ -1297,7 +1297,7 @@ def _make_kshard_eigh(mesh_xy: Mesh, *, eigvalsh_only: bool,
             eigenvalues_only=eigvalsh_only)
         if eigvalsh_only:
             return E
-        return E, (U if placement is None else jax.device_put(U, placement))
+        return E, (U if placement is None else _place(U, mesh_xy, u_spec))
     return _f
 
 
