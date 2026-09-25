@@ -1087,21 +1087,29 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
     if ((mode == 7 || mode == 8) && rb >= ns * ns) rb -= rb % (ns * ns);  // whole spin groups: the grouped load
     // (fewer rows than one spin group: mode 7 loads per bank, as mode 2 would fit)
     long long plane_minb = 1;                          // mode 10: blocks per SM (LRX_RB)
+    long long plane_static = 0;                        // mode 10: its static tables, bytes
     if (mode == 10) {                                  // one whole (n_b, n_c|1) plane per block
         row_bytes = 16LL * nkx * (nky | 1);
-        rb = row_bytes <= smem_optin ? std::max(1LL, std::min(8LL, kPlaneGroupBytes / row_bytes)) : 0;
+        // The kernel's static tables live[n_b] + rowb[n_b] (int) + foff[PB] (long long)
+        // share the block's opt-in budget with the dynamic planes; +16 B alignment
+        // slack.  ffi.fft.plane_resident_bytes is the same bound (PB = 1).
+        plane_static = 5LL * nkx + 8 + 16;
+        rb = row_bytes + plane_static <= smem_optin
+            ? std::max(1LL, std::min(8LL, kPlaneGroupBytes / row_bytes)) : 0;
+        plane_static = 5LL * nkx + 8 * std::max(1LL, rb) + 16;
         int smem_sm = 0;
         LRX_CUDA_CHECK(cudaDeviceGetAttribute(&smem_sm, cudaDevAttrMaxSharedMemoryPerMultiprocessor, dev),
                        "shared memory per SM");
         if (rb < 1) {
             std::ostringstream os;
             os << "GATE mathdx-plane-residency: got plane (" << nkx << "," << nky << ") whose resident "
-                  "plane needs 16*n_b*(n_c|1)=" << row_bytes << " B; want <= " << smem_optin << " B of opt-in "
-                  "shared memory on this device; why: the plane FFT keeps one plane in shared memory; fix: "
+                  "plane needs 16*n_b*(n_c|1) + static tables = " << row_bytes << " + " << plane_static
+               << " B; want <= " << smem_optin << " B of opt-in shared memory on this device; why: the plane "
+                  "FFT keeps one plane and its row tables in shared memory; fix: "
                   "ffi.fft.make_plane_fft_gather routes such a plane to the XLA route at plan build";
             return sticky("residency", os.str(), ffi::ErrorCode::kInvalidArgument);
         }
-        plane_minb = std::max<long long>(1, std::min<long long>(2, smem_sm / (rb * row_bytes + 1024)));
+        plane_minb = std::max<long long>(1, std::min<long long>(2, smem_sm / (rb * row_bytes + plane_static + 1024)));
     }
     if (mode == 8 && rb < ns * ns) {
         std::ostringstream os;
@@ -1240,8 +1248,18 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
     b.threads = plane_threads;
     b.smem = static_cast<int>(rb * row_bytes);
     b.compile_ms = ms;
-    if (b.smem > 49152) {
+    // Mode 10 always sets the dynamic limit: its static tables count against the
+    // 48 KiB default too, so a plane just under 48 KiB would fail at launch.
+    if (b.smem > 49152 || mode == 10) {
         cr = api.FuncSetAttribute(b.fn, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, b.smem);
+        if (cr != CUDA_SUCCESS && mode == 10) {
+            std::ostringstream os;
+            os << "GATE mathdx-plane-residency: got plane (" << nkx << "," << nky << "), " << b.smem
+               << " B of dynamic shared memory (+ ~" << plane_static << " B static) that this device refused ("
+               << cu_err(cr) << "); want <= " << smem_optin << " B in all; fix: "
+                  "ffi.fft.make_plane_fft_gather routes such a plane to the XLA route at plan build";
+            return sticky("cuFuncSetAttribute", os.str(), ffi::ErrorCode::kInvalidArgument);
+        }
         if (cr != CUDA_SUCCESS) return sticky("cuFuncSetAttribute", cu_err(cr));
     }
     if (mklpin::announce_here() || log_enabled()) {

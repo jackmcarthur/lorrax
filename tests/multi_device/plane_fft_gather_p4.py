@@ -15,6 +15,8 @@ modules).
   route ``xla``, both asserted.  105x99 sits just inside the A100 edge.
 * Parity: ``max|Y - ref| <= 1e-13 max|ref|`` (not bitwise vs cuFFT).
 * Red twin: the door built on a support rolled by one cell misses by > 1e-3.
+* The handler refuses a ceiling-edge plane called past the door by name
+  (``GATE mathdx-plane-residency``), not with an INTERNAL abort.
 * The slab form ``fn(F, start, size)`` (traced start, including a clamped
   one) equals the reference on ``lax.dynamic_slice_in_dim(F, start, size, 1)``.
 
@@ -129,6 +131,28 @@ def main():
         err = float(jnp.max(jnp.abs(y - ref)) / jnp.max(jnp.abs(ref)))
         line = f"{TAG} rank{rank} slab ({nb},{nc}) start={start} route={fn.route} shape={tuple(y.shape)} rel={err:.2e}"
         if not (err <= TOL and y.shape == (3, 3, 2, nb, nc)):
+            fails.append(line)
+        print(line, flush=True)
+    # The handler's own residency gate: a plane that fits the device's opt-in shared
+    # memory alone but not with the kernel's static tables, called on the target
+    # directly (past the door), must be refused by name, not die INTERNAL.
+    from ffi.fft import PLANE_FFT_GATHER_TARGET, _mathdx_common
+    for nb, nc in ((75, 138), (57, 182), (112, 92)):
+        if not 16 * nb * (nc | 1) <= optin < plane_resident_bytes(nb, nc):
+            continue
+        (b1, _), (c1, _) = plane_fft_split(nb), plane_fft_split(nc)
+        attrs = dict(nb=np.int64(nb), nc=np.int64(nc), b1=np.int64(b1), c1=np.int64(c1), **_mathdx_common())
+        call = jax.ffi.ffi_call(PLANE_FFT_GATHER_TARGET, jax.ShapeDtypeStruct((1, nb, nc), jnp.complex128))
+        try:
+            jax.block_until_ready(jax.jit(lambda F: call(
+                F, jnp.full((1, nc), -1, jnp.int32), jnp.zeros((1,), jnp.int32), jnp.int32(0), **attrs))(
+                jnp.zeros((1, 1), jnp.complex128)))
+            msg = "ran"
+        except Exception as e:                                 # noqa: BLE001
+            msg = str(e)
+        line = f"{TAG} rank{rank} handler gate ({nb},{nc}): " + ("refused by name" if "GATE mathdx-plane-residency" in msg
+                                                                else "NOT refused by name: " + msg[:200])
+        if "GATE mathdx-plane-residency" not in msg:
             fails.append(line)
         print(line, flush=True)
     nf = multihost_utils.process_allgather(np.array([len(fails), n_m10, n_xla], np.int64))
