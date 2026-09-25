@@ -3,7 +3,8 @@
 ``ffi.fft.make_kconv_klead_unfold(G, Gt, W_prep)`` reads the raw-parent Green
 and must equal, bit for bit, the old Σ chain: the typed unfold
 (``plan.unfold_operator``), the spin action, ``sigma_conv_operand`` and the
-k-leading door ``make_kconv_klead``.  Plans: the order-two glide group with
+k-leading door ``make_kconv_klead``, on every stored row; a door that stores
+only the parent rows must equal those rows of it bit for bit.  Plans: the order-two glide group with
 spin mixing and an antiunitary row (ns = 2, 4), A-cubic (48 operations,
 ns = 1), and a C3 group on a 3x3 k grid whose spin action has general complex
 entries and whose umklapp phases are general (q = n/3), so no product has a
@@ -23,7 +24,7 @@ import zeta_mubatch_fixtures as fixtures
 
 
 def unfold_case(mesh, fx, seed=0):
-    """(bitwise door == old chain, bitwise tables == unfold, rel error of the red twin, max|Δ|)."""
+    """(bitwise door == old chain, bitwise parent-row store == those rows, bitwise tables == unfold, red twin, max|Δ|)."""
     from common.shard_map import shard_map
     from ffi import fft as F
     from gw.wavefunction_bundle import SIGMA_CONV_G7D_SPEC, V_FFT5D_SPEC, sigma_conv_operand
@@ -43,8 +44,13 @@ def unfold_case(mesh, fx, seed=0):
     Gk = plan.unfold_operator(Gd, operator_transpose=Gtd if anti else None)
     ref = fixtures._host(kconv.apply(sigma_conv_operand(Gk), Wp))
     tables = plan.unfold_load_tables()
-    door = F.make_kconv_klead_unfold(mesh, kg, tables, norm="ortho", mult=mult)
+    every = np.arange(nk)
+    door = F.make_kconv_klead_unfold(mesh, kg, tables, store_rows=every, norm="ortho", mult=mult)
     got = fixtures._host(door(Gd, Gtd if anti else None, Wp))
+    rows = np.asarray(plan.parent_full_rows)
+    parent_door = F.make_kconv_klead_unfold(mesh, kg, tables, store_rows=rows, norm="ortho",
+                                            mult=mult)
+    got_rows = fixtures._host(parent_door(Gd, Gtd if anti else None, Wp))
 
     @partial(shard_map, mesh=mesh, in_specs=(s5.spec, s5.spec), out_specs=s5.spec,
              check_vma=False)
@@ -55,10 +61,12 @@ def unfold_case(mesh, fx, seed=0):
     O = fixtures._host(jax.jit(composed)(Gd, Gtd))
     Gk_h = fixtures._host(Gk)
     red_tables = tables._replace(rsrc=np.roll(tables.rsrc, 1, axis=1))
-    red_door = F.make_kconv_klead_unfold(mesh, kg, red_tables, norm="ortho", mult=mult)
+    red_door = F.make_kconv_klead_unfold(mesh, kg, red_tables, store_rows=every, norm="ortho",
+                                         mult=mult)
     red = fixtures._host(red_door(Gd, Gtd if anti else None, Wp))
     return dict(ns=ns, nk=nk, n_parent=n_par, mu=mu, antiunitary=anti,
                 door_bitwise=bool(np.array_equal(got, ref)),
+                rows_bitwise=bool(np.array_equal(got_rows, got[rows])),
                 max_abs=float(np.max(np.abs(got - ref))),
                 rel=float(np.max(np.abs(got - ref)) / np.max(np.abs(ref))),
                 tables_bitwise=bool(np.array_equal(O, Gk_h)),
@@ -133,6 +141,7 @@ def test_unfold_door_matches_old_sigma_chain():
         assert r["tables_rel"] <= 2 * eps and r["rel"] <= 2 * eps, r
         if exact:
             assert r["tables_bitwise"] and r["door_bitwise"], r
+        assert r["rows_bitwise"], r
         assert r["red_rel"] > 1e-3, r
 
 
@@ -144,7 +153,8 @@ def test_unfold_door_refuses_operands_its_tables_were_not_built_for():
     plan, kg = fx["plan"], tuple(fx["kgrid"])
     ns, mu, n_par, nk = 2, int(plan.n_centroid_packed), int(plan.n_parent), int(plan.n_full)
     tables = plan.unfold_load_tables()
-    door = F.make_kconv_klead_unfold(mesh, kg, tables, norm="ortho", mult=1.0)
+    door = F.make_kconv_klead_unfold(mesh, kg, tables, store_rows=plan.parent_full_rows,
+                                     norm="ortho", mult=1.0)
     s5 = NamedSharding(mesh, P(None, "x", None, "y", None))
     short = fixtures._put(np.zeros((n_par - 1, mu, ns, mu, ns), complex), s5)
     W = fixtures._put(np.zeros((nk, mu, mu), complex), NamedSharding(mesh, P(None, "x", "y")))
@@ -156,8 +166,26 @@ def test_unfold_door_refuses_operands_its_tables_were_not_built_for():
         raise AssertionError("a G with too few parent rows was accepted")
     flat = Mesh(np.asarray(jax.devices()[:4]).reshape(4, 1), ("x", "y"))
     try:
-        F.make_kconv_klead_unfold(flat, kg, tables, norm="ortho", mult=1.0)
+        F.make_kconv_klead_unfold(flat, kg, tables, store_rows=plan.parent_full_rows,
+                                  norm="ortho", mult=1.0)
     except ValueError as exc:
         assert "mesh" in str(exc)
     else:
         raise AssertionError("tables cut for a 2x2 mesh were accepted on a 4x1 mesh")
+
+
+def test_store_rows_must_be_distinct_rows_of_the_grid():
+    """Red twins of the row map: a repeated row and a row past the grid refuse by name."""
+    from ffi import fft as F
+    mesh = _mesh()
+    fx = fixtures._glide_fixture(mesh, np.random.default_rng(5), 2)
+    plan, kg = fx["plan"], tuple(fx["kgrid"])
+    tables = plan.unfold_load_tables()
+    nk = int(plan.n_full)
+    for bad in ([0, 0], [nk]):
+        try:
+            F.make_kconv_klead_unfold(mesh, kg, tables, store_rows=bad, norm="ortho", mult=1.0)
+        except ValueError as exc:
+            assert "store_rows" in str(exc)
+        else:
+            raise AssertionError(f"store_rows={bad} was accepted")

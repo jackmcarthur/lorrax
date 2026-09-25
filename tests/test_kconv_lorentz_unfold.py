@@ -101,18 +101,22 @@ def lorentz_case(mesh, fx, cls, *, right_plan=None, prefactor=1.0, seed=0):
     Vd = fixtures._put(V, s5)
     mult = -1.0 / np.sqrt(float(nk))
 
-    def door_for(tables):
+    def door_for(tables, rows):
         door = F.make_kconv_lorentz_unfold(
             mesh, kg, tables, left_vertices=[gamma_perm_phase_host(A) for A in lefts],
-            right_vertices=[gamma_perm_phase_host(B) for B in rights], norm="ortho", mult=mult)
+            right_vertices=[gamma_perm_phase_host(B) for B in rights], store_rows=rows,
+            norm="ortho", mult=mult)
         return fixtures._host(prefactor * door(Gd, Gtd if anti else None, Vd))
     tables = plan.unfold_load_tables(right_plan=right_plan)
-    got = door_for(tables)
-    red = door_for(tables._replace(rsrc=np.roll(tables.rsrc, 1, axis=1)))
+    every, rows = np.arange(nk), np.asarray(plan.parent_full_rows)
+    got = door_for(tables, every)
+    got_rows = door_for(tables, rows)
+    red = door_for(tables._replace(rsrc=np.roll(tables.rsrc, 1, axis=1)), every)
     dmax = float(np.max(np.abs(got - ref)))
     return dict(cls=cls, ns=ns, nk=nk, mx=mx, my=my, antiunitary=anti, prefactor=prefactor,
                 rectangular=right_plan is not None,
                 door_bitwise=bool(np.array_equal(got, ref)), max_abs=dmax,
+                rows_bitwise=bool(np.array_equal(got_rows, got[rows])),
                 rel=dmax / float(np.max(np.abs(ref))),
                 red_rel=float(np.max(np.abs(red - ref)) / np.max(np.abs(ref))))
 
@@ -145,7 +149,7 @@ def test_lorentz_door_matches_old_chain():
     eps = np.finfo(float).eps
     for fx, cls, rplan, pref in cases(mesh, np.random.default_rng(11)):
         r = lorentz_case(mesh, fx, cls, right_plan=rplan, prefactor=pref)
-        assert r["rel"] <= 2 * eps, r
+        assert r["rel"] <= 2 * eps and r["rows_bitwise"], r
         assert r["red_rel"] > 1e-3, r
 
 
@@ -167,7 +171,8 @@ def test_lorentz_door_refuses_non_product_classes_and_bad_operands():
     door = F.make_kconv_lorentz_unfold(
         mesh, kg, plan.unfold_load_tables(),
         left_vertices=[gamma_perm_phase_host(1)],
-        right_vertices=[gamma_perm_phase_host(b) for b in (1, 2, 3)], norm="ortho", mult=1.0)
+        right_vertices=[gamma_perm_phase_host(b) for b in (1, 2, 3)],
+        store_rows=plan.parent_full_rows, norm="ortho", mult=1.0)
     s5 = NamedSharding(mesh, P(None, "x", None, "y", None))
     G = fixtures._put(np.zeros((n_par, mu, 4, mu, 4), complex), s5)
     V = fixtures._put(np.zeros((nk, mu, 1, mu, 2), complex), s5)

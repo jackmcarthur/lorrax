@@ -375,8 +375,11 @@ def test_sigma_spatial_cache_owns_plan_and_selects_each_plans_parent_rows(monkey
     monkeypatch.setattr("common.fft_helpers.make_kconv_klead",
                         lambda *a, **k: SimpleNamespace(prep=lambda w: w,
                                                         apply=lambda g, w: g))
+    # The stubbed door honours its row map, as mode 7 does: it stores only
+    # the rows the plan names.
     monkeypatch.setattr("common.fft_helpers.make_kconv_klead_unfold",
-                        lambda *a, **k: (lambda g, gt, w: g))
+                        lambda *a, store_rows, **k: (
+                            lambda g, gt, w: jnp.take(g, jnp.asarray(store_rows), axis=0)))
     monkeypatch.setattr("common.contract_bands.contract_bands_block_reshard",
                         lambda *a, **k: lambda left, operator, right: operator)
     monkeypatch.setattr("symmetry_maps.unfold_file_wedge_band_operator",
@@ -398,8 +401,8 @@ def test_sigma_spatial_cache_owns_plan_and_selects_each_plans_parent_rows(monkey
     second = factory(bundle([1, 2]))
     assert second is not kernel
     # A Green-shaped stand-in (nk, mu, s, nu, s') handed to the stubbed
-    # unfold convolution as the parent pair; the projection then selects
-    # each plan's own parent rows.
+    # unfold convolution as the parent pair; each kernel's door stores its
+    # own plan's parent rows.
     from gw.greens_function_kernel import ParentGreen
     rows = ParentGreen(jnp.asarray([10., 20., 30.]).reshape(3, 1, 1, 1, 1), None)
     np.testing.assert_array_equal(np.asarray(kernel.conv_project(

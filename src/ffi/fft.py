@@ -88,9 +88,11 @@ variable (decisions.md 2026-09-24, QUALITY #8):
                                              Bloch phase and L/R split applied on load
     make_kconv_klead          flat leading   Σ / COHSEX  fftn(ifftn(T)·ifftn(W))
     make_kconv_klead_unfold   parent Green   the Σ one read from the raw-parent G with
-                                             the typed unfold and spin action on load
+                                             the typed unfold and spin action on load,
+                                             stored at the caller's k rows only
     make_kconv_lorentz_unfold parent Green   the four-current Σ: the same load, then
-                                             the γ_i Ĝ γ_j† · V_ij block sum in R space
+                                             the γ_i Ĝ γ_j† · V_ij block sum in R space,
+                                             stored at the caller's k rows only
     make_kconv_kminor         trailing       BSE rung    fftn(ifftn(X)·K_R)
     make_kfft_klead / _local  flat leading   one transform
     make_kfft_kminor / _local trailing       one transform
@@ -172,8 +174,8 @@ KCONV_PAIR_TARGET = "lorrax_mathdx_kconv_pair"
 KCONV_PARENT_TARGET = "lorrax_mathdx_kconv_parent"
 KCONV_PLANE_TARGET = "lorrax_mathdx_kconv_plane"
 KCONV_KLEAD_TARGET = "lorrax_mathdx_kconv_klead"
-KCONV_KLEAD_UNFOLD_TARGET = "lorrax_mathdx_kconv_klead_unfold"
-KCONV_KLEAD_LORENTZ_TARGET = "lorrax_mathdx_kconv_klead_lorentz"
+KCONV_KLEAD_UNFOLD_TARGET = "lorrax_mathdx_kconv_klead_unfold_rows"
+KCONV_KLEAD_LORENTZ_TARGET = "lorrax_mathdx_kconv_klead_lorentz_rows"
 KFFT_KLEAD_TARGET = "lorrax_mathdx_kfft_klead"
 KCONV_KMINOR_TARGET = "lorrax_mathdx_kconv_kminor"
 KFFT_KMINOR_TARGET = "lorrax_mathdx_kfft_kminor"
@@ -1062,7 +1064,18 @@ def _klead_locals(mesh, kg, norm, mult):
     return prep_local, apply_local
 
 
-def make_kconv_klead_unfold(mesh: Mesh, kgrid, tables, *, norm: str | None = "ortho",
+def _store_row_map(store_rows, nk: int, label: str) -> tuple[np.ndarray, np.ndarray]:
+    """``(rows, kout)``: the stored full-k rows and the (nk,) map k -> output row (-1 = none)."""
+    rows = np.asarray(store_rows, dtype=np.int64).reshape(-1)
+    if rows.size == 0 or rows.min() < 0 or rows.max() >= nk or np.unique(rows).size != rows.size:
+        raise ValueError(f"{label}: store_rows must be distinct full-k rows in [0, {nk}); "
+                         f"got {rows.tolist()}")
+    kout = np.full(nk, -1, dtype=np.int32)
+    kout[rows] = np.arange(rows.size, dtype=np.int32)
+    return rows, kout
+
+
+def make_kconv_klead_unfold(mesh: Mesh, kgrid, tables, *, store_rows, norm: str | None = "ortho",
                             mult: float = 1.0) -> Callable:
     """The Σ k-leading convolution read from the RAW-PARENT Green: ``fn(G, Gt, W_prep) -> U``.
 
@@ -1072,17 +1085,23 @@ def make_kconv_klead_unfold(mesh: Mesh, kgrid, tables, *, norm: str | None = "or
     rows (``None`` when no row is antiunitary); ``tables`` are
     ``symmetry_maps.unfold_load_tables`` of the same plan; ``W_prep`` is
     :func:`make_kconv_klead`'s ``prep(W)`` for the same ``(kgrid, norm, mult)``.
-    Returns ``U`` ``(nk, ns, mu, ns, nu)`` at ``P(None,None,'x',None,'y')``,
+    ``store_rows`` names the full-k rows the caller consumes (the Σ consumers
+    pass the plan's ``parent_full_rows``).  Returns ``U``
+    ``(len(store_rows), ns, mu, ns, nu)`` at ``P(None,None,'x',None,'y')``,
     equal to ``apply(sigma_conv_operand(unfold_spin_centroid_operator(G, Gt)),
-    W_prep)``: the typed unfold, the spin action and the spin-major reorder
-    happen on the convolution's load.  CUDA: nvidia-mathdx mode 7; cpu: the
-    service's reference composition, then the plan route.
+    W_prep)[store_rows]``: the typed unfold, the spin action and the
+    spin-major reorder happen on the convolution's load, and every other k
+    row is transformed but never stored.  CUDA: nvidia-mathdx mode 7; cpu:
+    the service's reference composition, then the plan route and the row
+    selection.
     """
     from symmetry_maps import apply_unfold_load_tables_local, local_unfold_load_tables
     kg = _check_kgrid(kgrid, kconv_backend(mesh))
     nk = kg[0] * kg[1] * kg[2]
     if int(tables.row.shape[0]) != nk:
         raise ValueError(f"k-leading unfold conv: tables cover {tables.row.shape[0]} k, grid has {nk}")
+    rows, kout = _store_row_map(store_rows, nk, "k-leading unfold conv")
+    n_out = int(rows.size)
     ns = int(tables.spin.shape[-1])
     spin_host = np.asarray(tables.spin)
     needs_partner = bool(np.any(np.asarray(tables.trs)))
@@ -1100,9 +1119,10 @@ def make_kconv_klead_unfold(mesh: Mesh, kgrid, tables, *, norm: str | None = "or
             t = local_unfold_load_tables(tables)
             n_par, mx, _, my, _ = (int(v) for v in g.shape)
             flat = lambda a: a.reshape(n_par, mx * ns, my * ns)
-            out = jax.ShapeDtypeStruct((nk, ns, mx, ns, my), g.dtype)
+            out = jax.ShapeDtypeStruct((n_out, ns, mx, ns, my), g.dtype)
             return jax.ffi.ffi_call(KCONV_KLEAD_UNFOLD_TARGET, out)(
-                flat(g), flat(gt), t.row, t.trs, t.lsrc, t.rsrc, t.mph, t.nph, t.spin, v_r, **attrs)
+                flat(g), flat(gt), t.row, t.trs, t.lsrc, t.rsrc, t.mph, t.nph, t.spin,
+                jnp.asarray(kout), v_r, **attrs)
     else:
         _, conv_local = _klead_locals(mesh, kg, norm, mult)
 
@@ -1111,7 +1131,8 @@ def make_kconv_klead_unfold(mesh: Mesh, kgrid, tables, *, norm: str | None = "or
             n_par, mx, _, my, _ = (int(v) for v in g.shape)
             flat = lambda a: a.reshape(n_par, mx * ns, my * ns)
             O = apply_unfold_load_tables_local(flat(g), flat(gt), t, spin_host)
-            return conv_local(jnp.transpose(O, (0, 2, 1, 4, 3)), v_r)
+            return jnp.take(conv_local(jnp.transpose(O, (0, 2, 1, 4, 3)), v_r),
+                            jnp.asarray(rows), axis=0)
 
     g_spec = P(None, "x", None, "y", None)
     sm = _sharded(local, mesh, (g_spec, g_spec, P(None, "x", "y")), P(None, None, "x", None, "y"))
@@ -1154,7 +1175,8 @@ def _vertex_tables(vertices, ns: int, label: str) -> tuple[np.ndarray, np.ndarra
 
 
 def make_kconv_lorentz_unfold(mesh: Mesh, kgrid, tables, *, left_vertices, right_vertices,
-                              norm: str | None = "ortho", mult: float = 1.0) -> Callable:
+                              store_rows, norm: str | None = "ortho",
+                              mult: float = 1.0) -> Callable:
     """The four-current Σ convolution read from the RAW-PARENT Green: ``fn(G, Gt, V) -> U``.
 
     ``U[k,a,x,b,y] = mult · fftn( Σ_ij (γ_i ifftn(Ĝ) γ_j†)[a,x,b,y] · ifftn(V)[k,x,i,y,j] )``
@@ -1166,8 +1188,9 @@ def make_kconv_lorentz_unfold(mesh: Mesh, kgrid, tables, *, left_vertices, right
     (``common.gamma_matrices.gamma_perm_phase``: ``γ[α,β] = phase[α] δ_{β,perm[α]}``),
     and ``V`` ``(nk, mx, nA, my, nB)`` c128 at ``P(None,'x',None,'y',None)`` holds
     the block ``(i, j)`` interaction in k space.  One transform of the Green
-    serves every block.  Returns ``U`` ``(nk, ns, mx, ns, my)`` at
-    ``P(None,None,'x',None,'y')``.
+    serves every block.  Returns ``U`` ``(len(store_rows), ns, mx, ns, my)``
+    at ``P(None,None,'x',None,'y')``, the rows ``store_rows`` of the full-k
+    result (:func:`make_kconv_klead_unfold`).
 
     CUDA: nvidia-mathdx mode 3 on ``V`` then mode 8; each rounds as the XLA
     chain it replaces (the ``norm`` transforms of ``Ĝ`` and ``V``, the vertex
@@ -1180,6 +1203,8 @@ def make_kconv_lorentz_unfold(mesh: Mesh, kgrid, tables, *, left_vertices, right
     nk = kg[0] * kg[1] * kg[2]
     if int(tables.row.shape[0]) != nk:
         raise ValueError(f"k-leading lorentz conv: tables cover {tables.row.shape[0]} k, grid has {nk}")
+    rows, kout = _store_row_map(store_rows, nk, "k-leading lorentz conv")
+    n_out = int(rows.size)
     ns = int(tables.spin.shape[-1])
     spin_host = np.asarray(tables.spin)
     needs_partner = bool(np.any(np.asarray(tables.trs)))
@@ -1203,10 +1228,10 @@ def make_kconv_lorentz_unfold(mesh: Mesh, kgrid, tables, *, left_vertices, right
             t = local_unfold_load_tables(tables)
             n_par, mx, _, my, _ = (int(d) for d in g.shape)
             flat = lambda a: a.reshape(n_par, mx * ns, my * ns)
-            out = jax.ShapeDtypeStruct((nk, ns, mx, ns, my), g.dtype)
+            out = jax.ShapeDtypeStruct((n_out, ns, mx, ns, my), g.dtype)
             return jax.ffi.ffi_call(KCONV_KLEAD_LORENTZ_TARGET, out)(
                 flat(g), flat(gt), t.row, t.trs, t.lsrc, t.rsrc, t.mph, t.nph, t.spin,
-                prep_local(v), **attrs)
+                jnp.asarray(kout), prep_local(v), **attrs)
     else:
         forward_local = make_local_kfft_klead(mesh, kg, kind="fftn", norm=norm)
         quarter = np.asarray([1, 1j, -1, -1j], dtype=np.complex128)
@@ -1230,7 +1255,7 @@ def make_kconv_lorentz_unfold(mesh: Mesh, kgrid, tables, *, left_vertices, right
                     value = (jnp.take(value, jnp.asarray(pr), axis=3)
                              * jnp.asarray(np.conj(hr)).reshape(1, 1, 1, ns, 1))
                     total = total + value * v_r[:, None, :, i, None, :, j]
-            return forward_local(total) * mult
+            return jnp.take(forward_local(total) * mult, jnp.asarray(rows), axis=0)
 
     g_spec = P(None, "x", None, "y", None)
     sm = _sharded(local, mesh, (g_spec, g_spec, g_spec), P(None, None, "x", None, "y"))

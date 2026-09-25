@@ -280,6 +280,7 @@ def unfold_cases(mesh, rng):
         recs.append(dict(case=f"kconv_klead_unfold_ns{r['ns']}_nk{r['nk']}", nk=r["nk"], n_parent=r["n_parent"],
                          antiunitary=r["antiunitary"], bitwise_vs_old_chain=int(r["door_bitwise"]),
                          bitwise_tables_vs_unfold=int(r["tables_bitwise"]),
+                         bitwise_parent_rows=int(r["rows_bitwise"]),
                          max_abs_vs_old_chain=r["max_abs"], rel_vs_old_chain=r["rel"],
                          ulp_vs_old_chain=r["rel"] / np.finfo(float).eps,
                          red_rolled_rsrc=r["red_rel"]))
@@ -295,6 +296,7 @@ def lorentz_cases(mesh, rng):
         recs.append(dict(case=f"kconv_lorentz_{cls}_ns{r['ns']}_nk{r['nk']}"
                          + ("_rect" if r["rectangular"] else ""),
                          antiunitary=r["antiunitary"], bitwise_vs_old_chain=int(r["door_bitwise"]),
+                         bitwise_parent_rows=int(r["rows_bitwise"]),
                          max_abs_vs_old_chain=r["max_abs"], rel_vs_old_chain=r["rel"],
                          ulp_vs_old_chain=r["rel"] / np.finfo(float).eps,
                          red_rolled_rsrc=r["red_rel"]))
@@ -401,6 +403,9 @@ def main() -> int:
             # not turn it red without a physics change (audit L2).
             if k == "ulp_vs_old_chain" and not v <= 2.0:
                 bad.append(f"{r['case']}.{k}={v:.2f} > 2 ulp of max|ref|")
+            # The parent-row store is the same kernel with fewer stores: bitwise.
+            if k == "bitwise_parent_rows" and v != 1:
+                bad.append(f"{r['case']}.{k}=0 (parent-row store differs from those rows)")
         if jax.process_index() == 0:
             print(TAG, json.dumps(r), flush=True)
     import test_isdf_parent_conv as tpc
