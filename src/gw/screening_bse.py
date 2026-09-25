@@ -568,10 +568,12 @@ def prepare_ladder_restart(
                              tensors_filename, include_w=include_w,
                              print_fn=print_fn)
 
+    # The ladder assembly reads W over the full zone (its own wedge
+    # handling is _assemble_full_bz_w's).
     W0_rpa = compute_static_w(
         wfns, V_q, quad, e_ref=e_ref, sym=sym,
         centroid_indices=centroid_indices, config=config, meta=meta,
-        mesh_xy=mesh_xy, role="static", head_channel=None)
+        mesh_xy=mesh_xy, role="static", head_channel=None).unfold(mesh_xy)
     with timing.section("W.gate", announce=True,
                         label="W[static] (RPA, ladder kernel) "
                               "finiteness + hermiticity gate"):

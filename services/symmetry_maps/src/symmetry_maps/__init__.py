@@ -234,6 +234,7 @@ from symmetry_maps.maps import (
     mix_lorentz_blocks,
 )
 from symmetry_maps.unfold_load import (
+    QirrOperator,
     UnfoldLoadTables,
     unfold_load_tables,
     local_unfold_load_tables,
@@ -341,7 +342,7 @@ __all__ = [
     "unfold_operator_local", "open_spin_block_coefficient",
     "certify_endpoint_locality", "endpoint_panel_cost", "unfold_endpoint_panel",
     "unfold_spin_centroid_operator", "unfold_isdf_one_leg",
-    "UnfoldLoadTables", "unfold_load_tables", "local_unfold_load_tables",
+    "QirrOperator", "UnfoldLoadTables", "unfold_load_tables", "local_unfold_load_tables",
     "apply_unfold_load_tables_local",
     "isdf_one_leg_source_slots",
     "mix_lorentz_blocks",

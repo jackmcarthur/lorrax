@@ -609,8 +609,13 @@ def compute_ppm_sigma_pipeline(
         # (``docs/dev/notes/DERIVATION_gnppm_nonhermitian.md`` §6).
         from .screening import _trs_verdict
         ordered = bool((not is_hl) and (_trs_verdict(sym) is False))
+        # The fit is a full-zone pass for now: both roles come from
+        # screening on their q wedge (the probe on the trivial one) and are
+        # unfolded here, for the fit only.
+        from .cohsex_sigma import interaction_operator
         ppm = fit_ppm(
-            W_static_q, W_probe_q, V_q, probe_omega, mesh_xy,
+            interaction_operator(W_static_q).unfold(mesh_xy),
+            interaction_operator(W_probe_q).unfold(mesh_xy), V_q, probe_omega, mesh_xy,
             fallback_omega=config.ppm.fallback_omega,
             n_nodes_static=quad.node_count,
             print_fn=print_fn,

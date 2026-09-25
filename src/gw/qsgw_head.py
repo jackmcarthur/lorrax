@@ -2513,7 +2513,9 @@ def finalize_iteration_head_samples(
                 raise KeyError(
                     f"screening did not return required head role {req.role!r}") \
                     from exc
-            W_gamma.append(W_role[0])
+            # q = 0 is its own orbit: the wedge row is the full-zone row.
+            from .cohsex_sigma import interaction_operator
+            W_gamma.append(interaction_operator(W_role).representative_row(0))
         W_gamma = jnp.stack(W_gamma, axis=0)
         # Hard lifetime boundary (KNOWN_LORRAX_ISSUES.md "the bounded full-
         # head fold still needs a fresh-fit lifetime boundary"): force this

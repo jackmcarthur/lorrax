@@ -209,13 +209,48 @@ _static_convolution_cache: dict[tuple[object, ...], object] = {}
 class StaticConvolution(NamedTuple):
     """The static Σ convolution: ``fn(G_k, V, prefactor)``, or ``prep(V)`` once and
     ``apply(G_k, prepared, prefactor)`` per Green, for a caller that convolves
-    several Greens with one interaction (the spin-pair stream)."""
-    convolve: object
+    several Greens with one interaction (the spin-pair stream).  ``V`` is a
+    ``symmetry_maps.QirrOperator``: its wedge is unfolded on the load of its
+    k-transform (``make_kfft_klead_unfold``), never stored at the full zone."""
     prep: object
     apply: object
 
     def __call__(self, G_k, interaction, prefactor):
-        return self.convolve(G_k, interaction, prefactor)
+        return self.apply(G_k, self.prep(interaction), prefactor)
+
+
+def screened_minus_bare(W_q, V_q):
+    """``W - V`` on W's wedge: V (a full-zone array or an operator on the same
+    wedge) is read at the wedge rows, where its unfold is the identity."""
+    W = interaction_operator(W_q)
+    if isinstance(V_q, type(W)):
+        if not W.same_wedge(V_q):
+            raise ValueError("W - V: W and V are held on different q wedges")
+        return W.with_values(W.values - V_q.values)
+    return W.with_values(W.values - jnp.take(V_q, jnp.asarray(W.full_rows), axis=0))
+
+
+def interaction_operator(interaction):
+    """``interaction`` as a ``QirrOperator``: a full-zone array is its own trivial wedge."""
+    from symmetry_maps import QirrOperator
+    return (interaction if isinstance(interaction, QirrOperator)
+            else QirrOperator.whole_zone(interaction))
+
+
+_wedge_prep_cache: dict[tuple[object, ...], object] = {}
+
+
+def wedge_prep(mesh_xy: Mesh, kgrid, op, *, norm="ortho"):
+    """``make_kconv_klead``'s prep of ``op``'s full-zone interaction, read from its wedge."""
+    from ffi import ffi_dial_key
+    from common.fft_helpers import make_kfft_klead_unfold
+    key = (_mesh_key(mesh_xy), tuple(int(v) for v in kgrid), ffi_dial_key(), norm,
+           op.wedge_key())
+    door = _wedge_prep_cache.get(key)
+    if door is None:
+        door = _wedge_prep_cache[key] = make_kfft_klead_unfold(
+            mesh_xy, kgrid, op.load_tables(mesh_xy), norm=norm)
+    return door(op.values)
 
 
 def _make_static_convolution(mesh_xy: Mesh, kgrid: tuple[int, int, int],
@@ -234,33 +269,32 @@ def _make_static_convolution(mesh_xy: Mesh, kgrid: tuple[int, int, int],
         return _static_convolution_cache[key]
     scale = -1.0 / (float(nk_tot) if q0_only else np.sqrt(float(nk_tot)))
     if q0_only:
-        @jax.jit
-        def convolve(G_k, interaction, prefactor):
-            return (prefactor * sigma_conv_operand(G_k)
-                    * interaction[0][None, None, :, None, :] * scale)
-
         def prep(interaction):
-            return interaction
+            # The q = 0 row: q = 0 is its own orbit, so its wedge row is the
+            # full-zone row, unfolded by the identity.
+            op = interaction_operator(interaction)
+            row = int(np.flatnonzero(np.asarray(op.full_rows) == 0)[0])
+            return op.values[row]
 
         @jax.jit
         def apply(G_k, prepared, prefactor):
-            return convolve(G_k, prepared, prefactor)
+            return (prefactor * sigma_conv_operand(G_k)
+                    * prepared[None, None, :, None, :] * scale)
     else:
         # Σ = scale · fftn(ifftn(G) · ifftn(V)): the k-convolution router
         # (nvidia-mathdx on CUDA, the FFTW gw_conv handler on cpu), one fused
         # pass that bounds the exposed Green lifetime on large scalar decks.
+        # ifftn(V) is read from V's q wedge (mathdx mode 9).
         kconv = make_kconv_klead(mesh_xy, kgrid, SIGMA_CONV_G7D_SPEC, V_FFT5D_SPEC,
                                  norm='ortho', mult=scale)
-        @jax.jit
-        def convolve(G_k, interaction, prefactor):
-            return prefactor * kconv.apply(sigma_conv_operand(G_k), kconv.prep(interaction))
 
-        prep = jax.jit(kconv.prep)
+        def prep(interaction):
+            return wedge_prep(mesh_xy, kgrid, interaction_operator(interaction))
 
         @jax.jit
         def apply(G_k, prepared, prefactor):
             return prefactor * kconv.apply(sigma_conv_operand(G_k), prepared)
-    conv = StaticConvolution(convolve=convolve, prep=prep, apply=apply)
+    conv = StaticConvolution(prep=prep, apply=apply)
     _static_convolution_cache[key] = conv
     return conv
 
@@ -490,12 +524,13 @@ def _make_cohsex_kernels_face(mesh_xy: Mesh, face_shape, _convolve,
                  else slice(int(ri_bands[0]), int(ri_bands[1])))
         g_mun, g_nmu, owner = _g_operands(wfns)
         mask = owner.band_mask(bands)
+        W_minus_V = screened_minus_bare(W_q, V_q)
         if stream:
-            return _pair_sigma(wfns, mask, W_q - V_q, -0.5)
+            return _pair_sigma(wfns, mask, W_minus_V, -0.5)
         G_ri = build_G(g_mun, g_nmu, phases=mask, real_weights=True,
                        layout=layout, gemm=g_plan,
                        k_unfold_plan=k_unfold_plan)
-        return _project_bands(wfns, _convolve(G_ri, W_q - V_q, -0.5))
+        return _project_bands(wfns, _convolve(G_ri, W_minus_V, -0.5))
 
     return sigma_sx, sigma_coh
 

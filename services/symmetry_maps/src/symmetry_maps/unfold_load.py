@@ -27,6 +27,7 @@ is still one definition of the typed action: ``maps.py``.
 """
 from __future__ import annotations
 
+import dataclasses
 from typing import NamedTuple
 
 import jax
@@ -35,7 +36,7 @@ import numpy as np
 
 from symmetry_maps.maps import certify_endpoint_locality
 
-__all__ = ["UnfoldLoadTables", "unfold_load_tables", "local_unfold_load_tables",
+__all__ = ["QirrOperator", "UnfoldLoadTables", "unfold_load_tables", "local_unfold_load_tables",
            "apply_unfold_load_tables_local"]
 
 
@@ -218,3 +219,132 @@ def _rotate_endpoints(spatial, spin_l, spin_r):
     return jnp.stack([sum(left[..., d] * jnp.conj(R[:, b, d])[:, None, None, None]
                          for d in range(nr_s) if np.any(spin_r[:, b, d] != 0))
                       for b in range(nr_s)], axis=4)
+
+
+@dataclasses.dataclass(frozen=True)
+class QirrOperator:
+    """An interaction held on its irreducible q wedge, with the unfold that defines the full zone.
+
+    ``values`` ``(n_wedge, n_left, n_right)`` at ``P(None,'x','y')``; the
+    tables are exactly the arguments :func:`maps.unfold_isdf_operator` takes
+    for it, and ``full_rows[i]`` is the full-zone row of wedge row ``i``,
+    where the unfold is the identity.  A consumer that reads the interaction
+    through a k-convolution takes :meth:`load_tables` (the unfold on the
+    transform's load, ``ffi.fft.make_kfft_klead_unfold``); :meth:`unfold`
+    materializes the full zone for a consumer that needs it whole.
+    """
+    values: object
+    irr_idx: np.ndarray
+    sym_idx: np.ndarray
+    sym_perm: np.ndarray
+    L_table: np.ndarray
+    q_irr_frac: np.ndarray
+    n_sym_spatial: int
+    full_rows: np.ndarray
+    trs_rule: str = "conj"
+
+    @classmethod
+    def whole_zone(cls, values, *, trs_rule="conj") -> "QirrOperator":
+        """The trivial wedge: every q its own row (a deck without a reducing q group)."""
+        nq, n_l = int(values.shape[0]), int(values.shape[1])
+        if int(values.shape[2]) != n_l:
+            raise ValueError("QirrOperator.whole_zone: a square operator is required")
+        return cls(values=values, irr_idx=np.arange(nq, dtype=np.int32),
+                   sym_idx=np.zeros(nq, np.int32),
+                   sym_perm=np.arange(n_l, dtype=np.int32)[None, :],
+                   L_table=np.zeros((1, n_l, 3)), q_irr_frac=np.zeros((nq, 3)),
+                   n_sym_spatial=1, full_rows=np.arange(nq, dtype=np.int32), trs_rule=trs_rule)
+
+    @property
+    def n_full(self) -> int:
+        return int(np.asarray(self.irr_idx).shape[0])
+
+    @property
+    def n_wedge(self) -> int:
+        return int(self.values.shape[0])
+
+    def with_values(self, values) -> "QirrOperator":
+        """The same wedge and tables around other values (an elementwise function of these)."""
+        if tuple(values.shape) != tuple(self.values.shape):
+            raise ValueError(f"QirrOperator.with_values: shape {values.shape} != {self.values.shape}")
+        return dataclasses.replace(self, values=values)
+
+    def same_wedge(self, other: "QirrOperator") -> bool:
+        """Whether ``other`` unfolds by the same tables (so the two combine on the wedge)."""
+        pairs = ((self.irr_idx, other.irr_idx), (self.sym_idx, other.sym_idx),
+                 (self.sym_perm, other.sym_perm), (self.L_table, other.L_table),
+                 (self.q_irr_frac, other.q_irr_frac), (self.full_rows, other.full_rows))
+        return (self.trs_rule == other.trs_rule and self.n_sym_spatial == other.n_sym_spatial
+                and all(np.array_equal(np.asarray(a), np.asarray(b)) for a, b in pairs))
+
+    def representative_row(self, q_full: int):
+        """The full-zone row ``q_full`` of a wedge representative (q = 0 always is one)."""
+        hit = np.flatnonzero(np.asarray(self.full_rows) == int(q_full))
+        if hit.size != 1:
+            raise ValueError(f"QirrOperator: q row {q_full} is not a wedge representative")
+        return self.values[int(hit[0])]
+
+    def unfold(self, mesh_xy):
+        """The full-zone interaction ``(n_full, n_left, n_right)``: :func:`maps.unfold_isdf_operator`."""
+        from symmetry_maps.maps import unfold_isdf_operator
+        if self.n_wedge == self.n_full and np.array_equal(
+                np.asarray(self.irr_idx), np.arange(self.n_full)) and not np.any(
+                np.asarray(self.sym_idx)):
+            return self.values
+        return unfold_isdf_operator(
+            self.values, irr_idx=self.irr_idx, sym_idx=self.sym_idx, sym_perm=self.sym_perm,
+            L_table=self.L_table, q_irr_frac=self.q_irr_frac, mesh_xy=mesh_xy,
+            n_sym_spatial=self.n_sym_spatial, trs_rule=self.trs_rule)
+
+    def load_tables(self, mesh_xy) -> UnfoldLoadTables:
+        """:meth:`unfold` as load tables (scalar endpoints), for ``make_kfft_klead_unfold``.
+
+        Host tables, built eagerly even when called while a jit traces its
+        consumer (their phases are host constants the kernel bakes)."""
+        with jax.ensure_compile_time_eval():
+            return unfold_load_tables(
+                irr_idx=self.irr_idx, sym_idx=self.sym_idx, sym_perm=self.sym_perm,
+                L_table=self.L_table, k_irr_frac=self.q_irr_frac,
+                spin_action_full=np.ones((self.n_full, 1, 1), np.complex128),
+                n_sym_spatial=self.n_sym_spatial, mesh_xy=mesh_xy, trs_rule=self.trs_rule)
+
+    def wedge_key(self) -> "_WedgeKey":
+        """A hashable key of the tables (not the values): equal keys unfold alike."""
+        return _WedgeKey(self)
+
+
+class _WedgeKey:
+    """The tables of a :class:`QirrOperator`, hashable: the pytree aux data and a cache key."""
+    __slots__ = ("fields", "_hash")
+    _NAMES = ("irr_idx", "sym_idx", "sym_perm", "L_table", "q_irr_frac", "full_rows")
+
+    def __init__(self, op):
+        arrays = tuple(np.ascontiguousarray(getattr(op, n)) for n in self._NAMES)
+        self.fields = arrays + (int(op.n_sym_spatial), str(op.trs_rule))
+        self._hash = hash(tuple(a.tobytes() + str(a.dtype).encode() + str(a.shape).encode()
+                                for a in arrays) + self.fields[len(arrays):])
+
+    def __hash__(self):
+        return self._hash
+
+    def __eq__(self, other):
+        if not isinstance(other, _WedgeKey) or self._hash != other._hash:
+            return False
+        n = len(self._NAMES)
+        return (self.fields[n:] == other.fields[n:]
+                and all(a.dtype == b.dtype and np.array_equal(a, b)
+                        for a, b in zip(self.fields[:n], other.fields[:n])))
+
+    def rebuild(self, values):
+        n = len(self._NAMES)
+        kw = dict(zip(self._NAMES, self.fields[:n]))
+        return QirrOperator(values=values, n_sym_spatial=self.fields[n],
+                            trs_rule=self.fields[n + 1], **kw)
+
+
+# A pytree whose leaf is the values: a jitted consumer takes the operator
+# as an argument and bakes its tables as static structure.
+jax.tree_util.register_pytree_node(
+    QirrOperator, lambda op: ((op.values,), _WedgeKey(op)),
+    lambda key, leaves: key.rebuild(leaves[0]))
+
