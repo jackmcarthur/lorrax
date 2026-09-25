@@ -170,9 +170,9 @@ def compute_static_w(
     One cadence for EVERY W role: AOT compile split (chi.compile /
     chi.exec / W.compile / W.exec), ``block_until_ready`` discipline, and
     the χ₀ donation contract are defined here exactly once.  The static
-    role runs the IBZ cascade; the probe roles call this same function
-    with ``force_full_bz=True`` (see :func:`compute_screening`'s
-    frozen-golden note), so the stage rows stay directly comparable and a
+    role runs the IBZ cascade, the GN probe role too, the HL probe with
+    ``force_full_bz=True`` (see :func:`compute_screening`), so the stage
+    rows stay directly comparable and a
     cadence/donation change cannot fork between the two paths.
 
     IBZ cascade for the Dyson solve: V_q and χ₀_q are sliced to IBZ rows
@@ -208,8 +208,8 @@ def compute_static_w(
     role
         Label used in the announced cadence lines (``W[<role>] ...``).
     force_full_bz
-        Skip the IBZ cascade unconditionally (the probe roles' deliberate
-        frozen-golden route).
+        Skip the IBZ cascade unconditionally (the real-axis HL probe, whose
+        W has no unfold rule).
     section
         Timing/trace node name — ``chi0_W`` (static) or ``chi0_W_probe``,
         so the two roles keep separate rows in the end-of-run stage table.
@@ -267,19 +267,11 @@ def compute_static_w(
                 # probe): the kernel's own orientation and its q-negated
                 # conjugate partner each get their own resolvent weight, so
                 # χ₀(iω_p) keeps its anti-Hermitian, magnetisation-odd
-                # channel.  Full BZ only: the q-negation involution is a
-                # full-grid statement.
+                # channel.  The pairing F_q + conj(F_{-q}) is completed inside
+                # χ₀ on the full q grid, before the Dyson solve's wedge slice,
+                # so the solve itself may run on the wedge.
                 from .w_isdf import (
                     compute_chi0_imag_ordered, precompile_chi0_imag_ordered)
-                if use_ibz_w:
-                    raise RuntimeError(
-                        "GATE chi0_imag_ordered_full_bz: ordered response "
-                        "received an IBZ q cascade.\n"
-                        f"  got:  use_ibz_w = true, role = {role!r}\n"
-                        "  want: force_full_bz = true for this role\n"
-                        "  why:  the ordered kernel pairs each q with its "
-                        "explicit -q row; that involution is not present "
-                        "on the irreducible q axis")
                 from ffi import _services
                 _services.ensure_on_path()
                 from symmetry_maps import q_negation_index
@@ -431,14 +423,16 @@ def compute_static_w(
                 sym_perm, L_table = tables["sym_perm"], tables["L_table"]
                 unfold_sym, n_sym_spatial = tables["sym_idx"], tables["n_sym_spatial"]
                 with timing.section("W.wedge_tables"):
-                    cov = policy.measure_covariance(
+                    # The covariance measure applies the Hermitian rule; an
+                    # ordered (TR-odd) W(iω_p) is legitimately non-Hermitian.
+                    cov = None if ordered_orientations else policy.measure_covariance(
                         W_q_solve, q_irr_frac=q_irr_frac,
                         q_irr_full_idx=sym.q_irr_full_idx,
                         sym_mats_k=sym.sym_mats_k, sym_perm=sym_perm,
                         L_table=L_table)
                     W_q_solve, removed = policy.project_fixed_q(
                         W_q_solve, sym.q_irr_full_idx)
-                    if jax.process_index() == 0:
+                    if jax.process_index() == 0 and cov is not None:
                         from common import sanity
                         sanity.report_parent_covariance(
                             f"W[{_w}] IBZ parents", cov, removed=removed)
@@ -449,15 +443,24 @@ def compute_static_w(
                     # the resolution says wedge; slicing the unfolded W
                     # instead would be a different array whose equality to
                     # this one depends on the op-selection policy.
-                    from .restart_q_storage import deposit_pre_unfold
-                    deposit_pre_unfold(
-                        "W0_qmunu", W_q_solve,
-                        n_rmu_logical=int(meta.n_rmu),
-                        q_irr_frac=q_irr_frac, irr_idx_q=full_to_irr_idx,
-                        sym_idx_q=unfold_sym, sym_perm=sym_perm,
-                        L_table=L_table, n_sym_spatial=n_sym_spatial,
-                        mu_basis=getattr(meta, 'mu_basis', None))
-                    W_q = QirrOperator(values=W_q_solve, **tables)
+                    # Only the static role is W0: a probe role on the wedge
+                    # must not overwrite the capture by name.
+                    if role == "static":
+                        from .restart_q_storage import deposit_pre_unfold
+                        deposit_pre_unfold(
+                            "W0_qmunu", W_q_solve,
+                            n_rmu_logical=int(meta.n_rmu),
+                            q_irr_frac=q_irr_frac, irr_idx_q=full_to_irr_idx,
+                            sym_idx_q=unfold_sym, sym_perm=sym_perm,
+                            L_table=L_table, n_sym_spatial=n_sym_spatial,
+                            mu_basis=getattr(meta, 'mu_basis', None))
+                    # An ordered (TR-odd) W(iω_p) is not Hermitian: its
+                    # antiunitary rows follow Onsager, W_{-q}(μ,ν) = W_q(ν,μ),
+                    # the pair-transpose rule, not the conjugate.
+                    W_q = QirrOperator(
+                        values=W_q_solve,
+                        trs_rule="pair_transpose" if ordered_orientations else "conj",
+                        **tables)
                     del W_q_solve
             else:
                 W_q = QirrOperator.whole_zone(W_q_solve)
@@ -492,11 +495,12 @@ def compute_screening(
     Non-static roles build a single-frequency quadrature on the fly
     using the existing :func:`gw.minimax_screening.build_imag_probe_response_rule` (GN probe) /
     :func:`gw.minimax_screening.build_real_quadrature` helpers (chosen by whether
-    ``omega_ry`` is on the imag or real axis) and solve on the full BZ
-    directly: the nonlinear PPM fit downstream has a documented ~0.1 meV
-    q-set path-dependence (see ``test_ibz_full_bz_equivalence``), so the
-    probe W stays on the frozen-golden full-BZ path until that is
-    re-frozen deliberately.
+    ``omega_ry`` is on the imag or real axis).  The imaginary-axis (GN) probe
+    is solved on the q wedge like the static role and the PPM fit runs there
+    (owner, 2026-09-25: W is solved only at q_irr; the goldens re-froze at
+    the fit's q-set dependence, measured at a few µeV).  The real-axis (HL)
+    probe is solved on the full BZ: a real-axis W is not
+    ``W_q = conj(W_{-q})``-reciprocal, so no unfold rule holds for it.
 
     The static minimax interval ``[x_min, x_max]`` is reused for both
     branches — both probe-quad builders take the same ``quad`` argument
@@ -630,20 +634,18 @@ def compute_screening(
         # The probe-ω W runs through the SAME cadence function as the
         # static role (compute_static_w: chi.compile → chi.exec →
         # W.compile → W.exec, with the AOT split, block_until_ready
-        # discipline and χ₀ donation defined once), on the FULL BZ
-        # (force_full_bz=True — not the IBZ wedge; see the docstring's
-        # frozen-golden note) and under its own ``chi0_W_probe`` timing
-        # node so the two roles stay separate-but-comparable rows in the
-        # stage table.  This replaces a statement-for-statement copy of
-        # the static body that had already forced one coordinated
-        # two-site edit (the w_dyson_solver rename) — data-movement-only
-        # consolidation; acceptance criterion is the 785c bit-gate
-        # (run_800c md5 baseline).  (audit fix/zq 2026-07-28)
+        # discipline and χ₀ donation defined once) under its own
+        # ``chi0_W_probe`` timing node.  The imaginary-axis (GN) probe is
+        # solved on the q wedge like the static role, and its fit runs
+        # there (owner, 2026-09-25: W is solved only at q_irr; the fit's
+        # ~0.1 meV q-set dependence is re-frozen).  The real-axis (HL)
+        # probe stays on the full zone: a real-axis W is not
+        # W_q = conj(W_{-q})-reciprocal, so neither unfold rule applies.
         W = compute_static_w(
             wfns, V_q, quad_used, e_ref=e_ref,
             sym=sym, centroid_indices=centroid_indices,
             config=config, meta=meta, mesh_xy=mesh_xy,
-            role=req.role, force_full_bz=True, section="chi0_W_probe",
+            role=req.role, force_full_bz=bool(on_real), section="chi0_W_probe",
             head_channel=head_channel,
             ordered_orientations=bool(_tr_odd and on_imag))
         with timing.section("W.gate"):

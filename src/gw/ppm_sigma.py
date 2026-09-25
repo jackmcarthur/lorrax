@@ -78,6 +78,10 @@ class PPMBuildResult:
     B_odd_q: jax.Array | None = None
     probe_hermiticity_residual: float | None = None
     odd_even_residue_ratio: float | None = None
+    #: The q wedge the fields live on (a ``symmetry_maps.QirrOperator``
+    #: carrying the tables, no values), or ``None``: the full zone (HL, an
+    #: unreduced grid).  Every Sigma consumer unfolds them on load.
+    q_wedge: object = None
 
 
 def _residue_for_space(space: str, B_q, B_odd_q=None):
@@ -368,6 +372,9 @@ def fit_ppm(
     q_neg_index: np.ndarray | None = None,
     coarsen_extreme_tails: bool = False,
     ordered_orientations: bool = False,
+    q_star=None,
+    q_partner=None,
+    q_wedge=None,
 ) -> PPMBuildResult:
     """Fit two-point PPM pole parameters from precomputed W(0) and W(probe).
 
@@ -432,6 +439,7 @@ def fit_ppm(
          n_mu_logical=int(n_mu_logical),
          mu_active_mask=mu_active_mask,
          q_neg_index=q_neg_index,
+         q_star=q_star, q_partner=q_partner,
          coarsen_extreme_tails=bool(coarsen_extreme_tails),
          ordered_orientations=bool(ordered_orientations),
          print_fn=print_fn if print_fn is not None else print)
@@ -533,6 +541,7 @@ def fit_ppm(
         B_odd_q=B_odd,
         probe_hermiticity_residual=probe_hermiticity_residual,
         odd_even_residue_ratio=odd_even_residue_ratio,
+        q_wedge=q_wedge,
     )
 
 
@@ -604,6 +613,18 @@ def strip_sigma_window(
 
 
 
+def _static_interaction_prep(spatial, W_static, q_wedge, meta, mesh_xy):
+    """The static screening operand's R-space prep: read from the q wedge when the
+    fit ran there (mathdx mode 9; the masked ``W^c(0)`` is Hermitian, the
+    conj rule), else the full-zone prep."""
+    if q_wedge is None:
+        return spatial.prep_w(W_static)
+    import dataclasses as _dc
+    from .cohsex_sigma import wedge_prep
+    op = _dc.replace(q_wedge, values=W_static, trs_rule="conj").with_load(mesh_xy)
+    return wedge_prep(mesh_xy, meta.kgrid, op)
+
+
 def _compute_invalid_static_sigma(
     wfns,
     Wc0_q: jax.Array,
@@ -611,6 +632,7 @@ def _compute_invalid_static_sigma(
     meta,
     mesh_xy: Mesh,
     occupation_state=None,
+    q_wedge=None,
 ) -> np.ndarray:
     """Static-COHSEX Σ for the invalid PPM poles (BGW ``invalid_gpp_mode=3``).
 
@@ -671,7 +693,7 @@ def _compute_invalid_static_sigma(
             jnp.asarray(Wc0_q, dtype=jnp.complex128),
             jnp.asarray(0.0 + 0.0j, dtype=jnp.complex128),
         )
-        W_prep = spatial.prep_w(W_static)
+        W_prep = _static_interaction_prep(spatial, W_static, q_wedge, meta, mesh_xy)
 
         psi_xr, psi_yn = proj_xr, proj_yn
         nb_real = sigma_band_axis(
@@ -720,6 +742,7 @@ def _invalid_static_coh_by_bracket(
     meta,
     mesh_xy: Mesh,
     brackets,
+    q_wedge=None,
 ) -> np.ndarray:
     """The static-limit term's OWN band-count series, one point per bracket.
 
@@ -778,7 +801,7 @@ def _invalid_static_coh_by_bracket(
             jnp.asarray(Wc0_q, dtype=jnp.complex128),
             jnp.asarray(0.0 + 0.0j, dtype=jnp.complex128),
         )
-        W_prep = spatial.prep_w(W_static)
+        W_prep = _static_interaction_prep(spatial, W_static, q_wedge, meta, mesh_xy)
         psi_xr, psi_yn = proj_xr, proj_yn
         nb_real = sigma_band_axis(
             int(s.nb_sigma), mesh_xy, ansatz="static face")
@@ -968,14 +991,23 @@ def compute_sigma_c_ppm_omega_grid(
 
     n_total_modes, n_invalid = map(
         int, jax.device_get((state.n_total_modes, state.n_invalid)))
+    stars = None if ppm.q_wedge is None else ppm.q_wedge.star_sizes()
     if n_invalid:
+        n_invalid_q = np.asarray(jax.device_get(
+            jnp.sum(state.invalid_mask, axis=(1, 2), dtype=jnp.int64)))
+        if stars is not None:
+            # The census of the full-zone field: each wedge row counts once
+            # per q of its star.
+            n_total_q = np.asarray(jax.device_get(
+                jnp.sum(state.B_mask | state.invalid_mask, axis=(1, 2),
+                        dtype=jnp.int64)))
+            n_invalid = int(np.dot(n_invalid_q, stars))
+            n_total_modes = int(np.dot(n_total_q, stars))
         print_fn(
             f"  PPM invalid modes: {n_invalid}/{n_total_modes} "
             f"({100.0 * n_invalid / max(n_total_modes, 1):.2f}%)")
-        n_invalid_q = np.asarray(jax.device_get(
-            jnp.sum(state.invalid_mask, axis=(1, 2), dtype=jnp.int64)))
         print_fn(
-            "  PPM invalid modes per q: "
+            f"  PPM invalid modes per {'q' if stars is None else 'wedge q'}: "
             f"min={int(n_invalid_q.min())} max={int(n_invalid_q.max())} "
             f"counts={np.array2string(n_invalid_q, max_line_width=100, threshold=64)}")
 
@@ -984,7 +1016,7 @@ def compute_sigma_c_ppm_omega_grid(
     if invalid_static and n_invalid:
         sigma_static_host = _compute_invalid_static_sigma(
             wfns, ppm.Wc0_q, state.invalid_mask, meta, mesh_xy,
-            occupation_state=occupation_state)
+            occupation_state=occupation_state, q_wedge=ppm.q_wedge)
         print_fn(
             "  PPM invalid modes -> static COHSEX: max|Sigma_static| = "
             f"{float(np.max(np.abs(sigma_static_host))) * RYD_TO_EV:.4f} eV")
@@ -992,7 +1024,7 @@ def compute_sigma_c_ppm_omega_grid(
             static_coh_at_counts = np.cumsum(
                 _invalid_static_coh_by_bracket(
                     wfns, ppm.Wc0_q, state.invalid_mask, meta, mesh_xy,
-                    plan.bounds),
+                    plan.bounds, q_wedge=ppm.q_wedge),
                 axis=0)
 
     Omega_p, B_p, B_odd_p = _ppm_as_one_pole_store_fields(
@@ -1009,7 +1041,7 @@ def compute_sigma_c_ppm_omega_grid(
     # sharded fields a store round trip would have returned.
     poles = MemoryPoleSource(
         Omega_p, B_p, B_odd_p,
-        n_mu_logical=int(meta.n_rmu), mesh_xy=mesh_xy,
+        n_mu_logical=int(meta.n_rmu), mesh_xy=mesh_xy, q_wedge=ppm.q_wedge,
         provenance={
             "fit_protocol": "two_point_ppm",
             "pole_model": ansatz_name,

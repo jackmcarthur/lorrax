@@ -14,6 +14,8 @@ only sequences them.
 
 from __future__ import annotations
 
+import dataclasses
+
 from dataclasses import dataclass
 from functools import lru_cache
 
@@ -609,14 +611,29 @@ def compute_ppm_sigma_pipeline(
         # (``docs/dev/notes/DERIVATION_gnppm_nonhermitian.md`` §6).
         from .screening import _trs_verdict
         ordered = bool((not is_hl) and (_trs_verdict(sym) is False))
-        # The fit is a full-zone pass for now: both roles come from
-        # screening on their q wedge (the probe on the trivial one) and are
-        # unfolded here, for the fit only.
+        # GN fits on the q wedge (owner, 2026-09-25): W(0), W(iω_p) and V
+        # share the run's wedge, every count weights a row by its star and
+        # the tail closure reads -q through the unfold tables.  HL (a
+        # real-axis probe, solved on the full zone) and an unreduced q grid
+        # fit on the full zone.
         from .cohsex_sigma import interaction_operator
+        W0_op = interaction_operator(W_static_q)
+        Wp_op = interaction_operator(W_probe_q)
+        V_op = interaction_operator(V_q)
+        on_wedge = (not is_hl and not W0_op.is_whole_zone()
+                    and Wp_op.same_wedge(W0_op, any_rule=True))
+        if on_wedge:
+            fit_inputs = (W0_op.values, Wp_op.values, V_op.restrict(W0_op).values)
+            q_wedge = dataclasses.replace(W0_op, values=None, load=None)
+            wedge_kw = dict(q_star=W0_op.star_sizes(),
+                            q_partner=W0_op.minus_q_partner(meta.kgrid, mesh_xy),
+                            q_wedge=q_wedge)
+        else:
+            fit_inputs = (W0_op.unfold(mesh_xy), Wp_op.unfold(mesh_xy), V_op.unfold(mesh_xy))
+            wedge_kw = {}
         ppm = fit_ppm(
-            interaction_operator(W_static_q).unfold(mesh_xy),
-            interaction_operator(W_probe_q).unfold(mesh_xy),
-            interaction_operator(V_q).unfold(mesh_xy), probe_omega, mesh_xy,
+            *fit_inputs, probe_omega, mesh_xy,
+            **wedge_kw,
             fallback_omega=config.ppm.fallback_omega,
             n_nodes_static=quad.node_count,
             print_fn=print_fn,

@@ -323,6 +323,8 @@ def fit_gn_ppm_from_wc_pair(
     ordered_orientations: bool = False,
     print_fn=print,
     mu_active_mask=None,
+    q_star=None,
+    q_partner=None,
 ) -> GNPPMFitResult:
     """Fit GN-PPM pole data elementwise on an already-sharded ``(q,mu,nu)`` tensor pair.
 
@@ -366,10 +368,18 @@ def fit_gn_ppm_from_wc_pair(
         (all-true mask) when the inputs are unpadded.
     q_neg_index
         Canonical full-grid ``q -> -q`` row permutation from the public
-        ``symmetry_maps.q_negation_index`` service.  Required only when
-        ``coarsen_extreme_tails`` is true; the GN policy uses it together with
-        ``mu <-> nu`` to keep the physical four-lane partner orbit atomic and
-        never reconstructs the q convention locally.
+        ``symmetry_maps.q_negation_index`` service, for a full-zone fit.
+        Required (or ``q_partner``) only when ``coarsen_extreme_tails`` is
+        true; the GN policy uses it together with ``mu <-> nu`` to keep the
+        physical four-lane partner orbit atomic and never reconstructs the q
+        convention locally.
+    q_star, q_partner
+        The fit on the q WEDGE (owner, 2026-09-25): ``q_star`` ``(nq,)`` is
+        each wedge row's star size (how many full-zone q it unfolds to), so
+        every count, quantile and budget equals the full-zone field's that
+        Sigma consumes; ``q_partner(mask) -> mask`` returns a lane mask at
+        -q (the wedge row and centroid permutation of -q, from the unfold
+        tables).  ``None``: a full-zone fit, unit stars and ``q_neg_index``.
     coarsen_extreme_tails
         Apply the user-ruled GN policy to successfully fitted logical modes:
         replace at most the lowest and highest 0.2% of pole frequencies by
@@ -452,11 +462,17 @@ def fit_gn_ppm_from_wc_pair(
     # of the LOCAL (already-sharded) tile is what sizes the arena.
     _nq = int(_W0.shape[0])
     _qneg = None
-    if coarsen_extreme_tails:
+    _star = (np.ones(_nq, np.int64) if q_star is None
+             else np.asarray(q_star, dtype=np.int64).reshape(-1))
+    if _star.shape != (_nq,) or np.any(_star < 1):
+        raise ValueError(
+            f"fit_gn_ppm_from_wc_pair: q_star must be ({_nq},) positive star sizes")
+    _qneg = None
+    if coarsen_extreme_tails and q_partner is None:
         if q_neg_index is None:
             raise ValueError(
-                "fit_gn_ppm_from_wc_pair: q_neg_index is required when "
-                "coarsen_extreme_tails=True.")
+                "fit_gn_ppm_from_wc_pair: q_neg_index (or q_partner) is required "
+                "when coarsen_extreme_tails=True.")
         _qneg_raw = np.asarray(q_neg_index)
         if (_qneg_raw.shape != (_nq,)
                 or not np.all(np.isfinite(_qneg_raw))
@@ -500,9 +516,15 @@ def fit_gn_ppm_from_wc_pair(
         if ordered:
             _aod.append(_a[0])
         _om.append(_o); _bv.append(_b); _gd.append(_g)
-        # Exact integer counts -> summation order is irrelevant.
-        n_good = n_good + _ng
-        n_modes = n_modes + _nm
+        # Exact integer counts -> summation order is irrelevant.  Each row
+        # counts once per full-zone q of its star (1 on a full-zone fit).
+        _w = _star[_q0:_q1]
+        if np.all(_w == 1):
+            n_good = n_good + _ng
+            n_modes = n_modes + _nm
+        else:
+            n_good = n_good + _star_weighted_count(_g, jnp.asarray(_w, jnp.float64))
+            n_modes = n_modes + (_nm / float(_q1 - _q0)) * float(_w.sum())
         omega_min = jnp.minimum(omega_min, _omin)
         omega_max = jnp.maximum(omega_max, _omax)
         pair_rel_min = jnp.minimum(pair_rel_min, _rmin)
@@ -534,7 +556,9 @@ def fit_gn_ppm_from_wc_pair(
          omega_min_after_j, omega_max_after_j,
          tail_anchor_j) = _coarsen_gn_ppm_extreme_tails(
              omega_vals, B_vals, good, Wc0_qmunu, _qneg, _fb,
-             tail_divisor=GN_PPM_EXTREME_TAIL_DIVISOR, xy_mesh=xy_mesh)
+             tail_divisor=GN_PPM_EXTREME_TAIL_DIVISOR, xy_mesh=xy_mesh,
+             q_star=None if q_star is None else tuple(int(v) for v in _star),
+             q_partner=q_partner)
         n_tail_low = int(_scalar_to_host_float(n_low_j))
         n_tail_high = int(_scalar_to_host_float(n_high_j))
         if n_valid:
@@ -700,9 +724,15 @@ def _gn_ppm_fit_q_block(nq: int, block_bytes_per_q: int, out_bytes_per_q: int,
     return min(int(nq), int(qb))
 
 
+@jax.jit
+def _star_weighted_count(mask, w):
+    """``sum(mask)`` with each q row counted ``w[q]`` times (its star size)."""
+    return jnp.sum(mask.astype(jnp.float64) * w[:, None, None])
+
+
 @partial(
     jax.jit,
-    static_argnames=("tail_divisor", "xy_mesh"),
+    static_argnames=("tail_divisor", "xy_mesh", "q_star", "q_partner"),
     donate_argnums=(0, 1),
 )
 def _coarsen_gn_ppm_extreme_tails(
@@ -715,6 +745,8 @@ def _coarsen_gn_ppm_extreme_tails(
     *,
     tail_divisor: int,
     xy_mesh=None,
+    q_star=None,
+    q_partner=None,
 ):
     """Apply the lossy user-ruled GN tail policy without a tensor gather.
 
@@ -727,7 +759,10 @@ def _coarsen_gn_ppm_extreme_tails(
     ``(q,mu,nu)``, ``(q,nu,mu)``, ``(-q,mu,nu)``, ``(-q,nu,mu)`` (with the
     natural collapses on diagonals and self-negative q; the (mu, nu) swap is
     one X<->Y tile permute, :func:`common.collectives.transpose_xy`, on
-    ``xy_mesh``).  An orbit is changed
+    ``xy_mesh``).  On the q wedge every count weights a row by its star
+    size (``q_star``) and the -q lanes come from ``q_partner`` (the wedge
+    row and centroid permutation of -q), so the budget, the boundaries and
+    the orbit interior are the full-zone field's.  An orbit is changed
     only if every member was already inside the same tail candidate; a
     one-ulp boundary split therefore retains the whole orbit.  This can only
     undershoot the per-tail budget, never exceed it, and all selected lanes
@@ -754,22 +789,34 @@ def _coarsen_gn_ppm_extreme_tails(
     B = jnp.asarray(B_qmunu, dtype=jnp.complex128)
     valid = jnp.asarray(valid_qmunu, dtype=bool)
     Wc0 = jnp.asarray(Wc0_qmunu, dtype=jnp.complex128)
-    q_neg = jnp.asarray(q_neg_index, dtype=jnp.int32)
     fallback = jnp.asarray(fallback_omega, dtype=jnp.float64)
     if omega.ndim != 3 or omega.shape[-2] != omega.shape[-1]:
         raise ValueError(
             "GN tail policy requires flat-q square matrix tiles; got "
             f"shape={omega.shape}.")
-    if q_neg.shape != (omega.shape[0],):
-        raise ValueError(
-            "GN tail policy q_neg_index extent must equal flat q extent; "
-            f"got {q_neg.shape} for shape={omega.shape}.")
+    if q_partner is None:
+        q_neg = jnp.asarray(q_neg_index, dtype=jnp.int32)
+        if q_neg.shape != (omega.shape[0],):
+            raise ValueError(
+                "GN tail policy q_neg_index extent must equal flat q extent; "
+                f"got {q_neg.shape} for shape={omega.shape}.")
+        q_partner = lambda mask: jnp.take(mask, q_neg, axis=0)
+    # ``q_star`` is static (a tuple of star sizes) and ``q_partner`` a
+    # static callable, cached per wedge so a later SC map reuses the program.
+    star = (np.ones(omega.shape[0], np.int64) if q_star is None
+            else np.asarray(q_star, np.int64))
+    unit = bool(np.all(star == 1))
+    w3 = jnp.asarray(star, jnp.int64)[:, None, None]
+
+    def count(mask):
+        return (jnp.sum(mask, dtype=jnp.int64) if unit
+                else jnp.sum(jnp.where(mask, w3, 0), dtype=jnp.int64))
 
     # The valid-fit predicate already proves these are finite and positive.
     # Re-state it here so this owner remains fail-closed if called directly.
     eligible = valid & jnp.isfinite(omega) & (omega > 0.0)
     keys = jax.lax.bitcast_convert_type(omega, jnp.int64)
-    n_valid = jnp.sum(eligible, dtype=jnp.int64)
+    n_valid = count(eligible)
     budget = n_valid // jnp.asarray(tail_divisor, dtype=jnp.int64)
 
     min_key = jnp.min(jnp.where(eligible, keys, jnp.iinfo(jnp.int64).max))
@@ -789,8 +836,8 @@ def _coarsen_gn_ppm_extreme_tails(
     def _bisect(_iteration, bounds):
         lo, hi = bounds
         mid = lo + (hi - lo) // 2
-        count0 = jnp.sum(eligible & (keys <= mid[0]), dtype=jnp.int64)
-        count1 = jnp.sum(eligible & (keys <= mid[1]), dtype=jnp.int64)
+        count0 = count(eligible & (keys <= mid[0]))
+        count1 = count(eligible & (keys <= mid[1]))
         counts = jnp.stack((count0, count1))
         go_left = counts >= targets
         return (
@@ -801,8 +848,8 @@ def _coarsen_gn_ppm_extreme_tails(
     boundaries, _ = jax.lax.fori_loop(0, 63, _bisect, (lo0, hi0))
     lower_key, upper_key = boundaries[0], boundaries[1]
 
-    n_lower_le = jnp.sum(eligible & (keys <= lower_key), dtype=jnp.int64)
-    n_upper_ge = jnp.sum(eligible & (keys >= upper_key), dtype=jnp.int64)
+    n_lower_le = count(eligible & (keys <= lower_key))
+    n_upper_ge = count(eligible & (keys >= upper_key))
     lower = eligible & jnp.where(
         n_lower_le <= budget, keys <= lower_key, keys < lower_key)
     upper = eligible & jnp.where(
@@ -813,7 +860,7 @@ def _coarsen_gn_ppm_extreme_tails(
     # orbit is already present.  This is an interior, never an expansion:
     # counts cannot grow and no new per-orbit ordering/weight policy appears.
     def _orbit_interior(mask):
-        mask_mq = jnp.take(mask, q_neg, axis=0)
+        mask_mq = q_partner(mask)
         return (
             mask & transpose_xy(mask, xy_mesh) & mask_mq
             & transpose_xy(mask_mq, xy_mesh)
@@ -846,8 +893,8 @@ def _coarsen_gn_ppm_extreme_tails(
     anchor = jnp.where(has_budget & (n_valid > 0), anchor, nan)
     return (
         omega_out, B_out,
-        jnp.sum(lower, dtype=jnp.int64),
-        jnp.sum(upper, dtype=jnp.int64),
+        count(lower),
+        count(upper),
         omega_min_after, omega_max_after,
         anchor,
     )
