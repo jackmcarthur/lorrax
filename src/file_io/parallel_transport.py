@@ -1562,6 +1562,14 @@ def complete_velocity_validation(
         jax.device_get(response_relative))
     metrics["head_response_trace_ratio"] = float(
         jax.device_get(response_trace_ratio))
+    # Per Cartesian axis, the diagonal head component reconstructed over
+    # exact (diagnostic): which axis's rule the Frobenius gate is failing on.
+    diag_ratio = jax.device_get(
+        jnp.real(jnp.diagonal(reconstructed_response))
+        / jnp.where(jnp.abs(jnp.real(jnp.diagonal(exact_response))) > 1.0e-30,
+                    jnp.real(jnp.diagonal(exact_response)), 1.0e-30))
+    metrics["head_response_ratio_by_axis"] = tuple(
+        float(v) for v in diag_ratio)
     metrics["passed"] = bool(
         np.isfinite(metrics["head_response_relative_frobenius"])
         and np.isfinite(metrics["transition_overlap_real"])
@@ -1574,11 +1582,13 @@ def complete_velocity_validation(
         rule = {COLLAPSED_AXIS: "position", 2: "order-2", 4: "order-4"}
         print("  finite-link velocity rule per axis: "
               + ", ".join(
-                  f"{a}={rule[o]} (max|dv|={e:.3e} of {x:.3e})"
-                  for a, o, e, x in zip(
+                  f"{a}={rule[o]} (max|dv|={e:.3e} of {x:.3e}, head "
+                  f"S_{a}{a} reconstructed/exact {r:.4f})"
+                  for a, o, e, x, r in zip(
                       "xyz", metrics["stencil_orders"],
                       metrics["max_abs_by_axis"],
-                      metrics["exact_max_abs_by_axis"])))
+                      metrics["exact_max_abs_by_axis"],
+                      metrics["head_response_ratio_by_axis"])))
     if blocks:
         metrics["blocks"] = _block_scoped_metrics(
             reconstructed, exact, blocks, atol=float(atol), rtol=float(rtol))
@@ -1602,14 +1612,15 @@ def complete_velocity_validation(
             f"required response <= {float(rtol):.6e} and overlap real >= "
             f"{1.0 - float(rtol):.6e}; full-matrix diagnostic max_abs="
             f"{metrics['max_abs']:.6e}; per Cartesian axis (rule, max|dv| of "
-            "max|v|): "
+            "max|v|, head S_aa reconstructed/exact): "
             + ", ".join(
                 f"{a}={ {COLLAPSED_AXIS: 'position', 2: 'order-2', 4: 'order-4'}[o] }"
-                f" {e:.3e} of {x:.3e}"
-                for a, o, e, x in zip(
+                f" {e:.3e} of {x:.3e}, {r:.4f}"
+                for a, o, e, x, r in zip(
                     "xyz", metrics["stencil_orders"],
                     metrics["max_abs_by_axis"],
-                    metrics["exact_max_abs_by_axis"])))
+                    metrics["exact_max_abs_by_axis"],
+                    metrics["head_response_ratio_by_axis"])))
         # A refusal that carries its own numbers: a caller scanning band
         # windows or tolerances should never have to re-run to read them.
         refusal.metrics = metrics

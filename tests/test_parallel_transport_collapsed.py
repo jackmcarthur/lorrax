@@ -154,7 +154,7 @@ def test_default_call_is_the_historical_fourth_order_stencil():
     np.testing.assert_array_equal(c, d)
 
 
-def _fixture_blocks(nb, *, shift=0.0, center_override=None):
+def _fixture_blocks(nb, *, shift=0.0, center_override=None, velocity=True):
     """Z (production sawtooth), the cut-window diagonal, v, e on the MoS2
     fixture's file wedge.  ``shift`` translates the slab by that fraction of
     the cell along z (psi(G) e^{-2 pi i G_z shift}, atoms + shift): an exact
@@ -204,13 +204,15 @@ def _fixture_blocks(nb, *, shift=0.0, center_override=None):
             Z = np.asarray(Z)[:, :nb, :nb]
             win = np.real(np.diagonal(np.asarray(win), axis1=-2, axis2=-1))[:, :nb]
             one = np.asarray(one)[:, :nb, :nb]
-            setup = vnl_ops.build_vnl_setup(
-                wfn, sym, None, load_pseudopotentials(str(FIXTURE_DIR)),
-                nspinor=2)
-            v = np.asarray(sweep_matrix_elements(
-                psi_G, operator=dipole_operator(
-                    geom, bvec=wfn.bvec, blat=wfn.blat,
-                    vnl_setup=setup), **kw))[:, :, :nb, :nb]
+            v = None
+            if velocity:
+                setup = vnl_ops.build_vnl_setup(
+                    wfn, sym, None, load_pseudopotentials(str(FIXTURE_DIR)),
+                    nspinor=2)
+                v = np.asarray(sweep_matrix_elements(
+                    psi_G, operator=dipole_operator(
+                        geom, bvec=wfn.bvec, blat=wfn.blat,
+                        vnl_setup=setup), **kw))[:, :, :nb, :nb]
         e = np.asarray(wfn.energies)
         e = (e[0] if e.ndim == 3 else e)[:Z.shape[0], :nb]
         occ = np.asarray(wfn.occs)
@@ -273,17 +275,24 @@ def test_half_cell_translation_leaves_the_position_operator_unchanged():
     _need_fixture()
     nb = 12
     base = _fixture_blocks(nb)
-    moved = _fixture_blocks(nb, shift=0.5)
+    # The translated slab's velocity is the base one (a translation does not
+    # change v); only psi, the atoms and hence the cut move.
+    moved = _fixture_blocks(nb, shift=0.5, velocity=False)
     scale = np.max(np.abs(base["Z"]))
+    assert abs(np.mod(moved["center"] - base["center"], 1.0) - 0.5) < 1e-12
     assert np.max(np.abs(moved["Z"] - base["Z"])) < 1e-10 * max(scale, 1.0)
+    np.testing.assert_allclose(moved["win"], base["win"], atol=1e-12)
     rel_base, _ = _z_identity(base)
-    rel_moved, _ = _z_identity(moved)
+    rel_moved, _ = _z_identity({**base, "Z": moved["Z"]})
     assert abs(rel_moved - rel_base) < 1e-10
-    red = _fixture_blocks(nb, center_override=np.mod(base["center"] + 0.5, 1.0))
-    rel_red, _ = _z_identity(red)
+    red = _fixture_blocks(nb, center_override=np.mod(base["center"] + 0.5, 1.0),
+                          velocity=False)
+    rel_red, _ = _z_identity({**base, "Z": red["Z"]})
     occupied_red = float(np.sum(red["occ"] * red["win"]) / np.sum(red["occ"]))
-    print(f"cut through the slab: identity {rel_red:.3e}, occupied density "
-          f"at the cut {occupied_red:.3e}")
+    print(f"half-cell translation: max|dZ| "
+          f"{np.max(np.abs(moved['Z'] - base['Z'])):.3e}; cut through the "
+          f"slab: identity {rel_red:.3e}, occupied density at the cut "
+          f"{occupied_red:.3e}")
     assert rel_red > 0.3, rel_red
     assert occupied_red > 100.0 * COLLAPSED_CUT_DENSITY_MAX, occupied_red
 

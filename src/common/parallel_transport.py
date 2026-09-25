@@ -134,13 +134,14 @@ def undersampled_link_axes(kgrid) -> list[str]:
 
 
 #: Width of the density probe around a collapsed axis's branch cut, as a
-#: fraction of the largest vacuum gap (the middle half of the gap, so the
-#: probe stays a quarter-gap from the nearest atom plane).
-COLLAPSED_CUT_PROBE_GAP_FRACTION: float = 0.5
-#: Refusal threshold on the fraction of the OCCUPIED window bands' density
-#: inside that probe (``GATE pt_collapsed_axis_cut_density``).  A cut
-#: through the slab puts O(0.1) there; a cut in a converged vacuum puts
-#: O(1e-6) there (the measurements are in the port's report).
+#: fraction of the largest vacuum gap (its middle tenth: the density the
+#: sawtooth's jump actually wraps, not the tails near the atom planes).
+COLLAPSED_CUT_PROBE_GAP_FRACTION: float = 0.1
+#: Refusal threshold on the fraction of the OCCUPIED window bands' charge
+#: inside that probe (``GATE pt_collapsed_axis_cut_density``).  Measured on
+#: MoS2 in a 12 A cell (vacuum 0.74 of it) and with the cut forced through
+#: the slab, in the port's report (reports/phase2_bispinor_2026-09-24/
+#: PT2D_port.md).
 COLLAPSED_CUT_DENSITY_MAX: float = 1.0e-3
 
 
