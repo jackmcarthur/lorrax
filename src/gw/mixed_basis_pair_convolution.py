@@ -876,9 +876,8 @@ class MixedBasisPairConvolution:
         plan_col_out = self._plan(sign=+1, norm="forward", out_support=self.sup_out)
         qc = c.qc
         mo_loc = self.mo_axis.carrier // P_
-        n_qc = nq // qc
-
-        nq = self.nq
+        nq_o, nbo_o = self.nq, int(np.prod(self.kbox_out))      # the output rows and their box
+        n_qc = nq_o // qc
         wedge = self._wt is not None
 
         def final(T, qf, ocell, c2p):
@@ -889,13 +888,13 @@ class MixedBasisPairConvolution:
                 # the columns in box order: a slice, or the orbit-packed view's gather
                 Tq = jnp.take(Tq, c2p, axis=2) if wedge else Tq[..., :nr]
                 Tq = Tq * _grid_phase(q_i, +1, fg, box)[:, None, :]
-                Z = plan_col_out(Tq.reshape((qc, mo_loc) + fg)).reshape(qc, mo_loc, nbo)
+                Z = plan_col_out(Tq.reshape((qc, mo_loc) + fg)).reshape(qc, mo_loc, nbo_o)
                 oc = jax.lax.dynamic_slice_in_dim(ocell, i * qc, qc, axis=0)
                 idx = jnp.broadcast_to(oc[:, None, :], (qc, mo_loc, oc.shape[1]))
                 return None, jnp.take_along_axis(Z, idx, axis=2, mode="fill", fill_value=0)
 
             _, X = jax.lax.scan(step, None, jnp.arange(n_qc), unroll=1)
-            X = X.reshape(nq, mo_loc, -1)
+            X = X.reshape(nq_o, mo_loc, -1)
             return jax.lax.all_to_all(X, "y", split_axis=2, concat_axis=1, tiled=True)
 
         self._final = jax.jit(shard_map(final, mesh=mesh, in_specs=(P(None, None, _XY), rep, rep, rep),

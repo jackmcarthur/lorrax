@@ -16,7 +16,14 @@ processes, one GPU each:
   per slab and expand, two in the final stage, none in the streamed middle;
 * ``--wfn WFN.h5`` adds a real magnetic crystal (Fe, n_s = 2, antiunitary rows): its
   SymMaps with metric spheres at a reduced cutoff on a 6^3 box, parents against the
-  full grid from the r-space action.
+  full grid from the r-space action;
+* the r'-column wedge (``ColumnWedge``) on covariant operands (parent band sets closed
+  under their little groups), both backends: glide n_s = 2 (full group; {E, Θ·glide},
+  whose antiunitary branch carries every non-identity column), A-cubic (48 operations),
+  complex weights with partners on the unitary rows, and with ``--wfn`` Fe's 16 rows
+  (8 antiunitary) and its 8 unitary rows at n_s = 1 and 2; each against the dense
+  reference and against the dense-column plan at 1e-11, with red twins (the antiunitary
+  conjugation or the lattice-wrap phase dropped) missing by > 1e-3.
 
 Run: ``lx run -N 1 -G 4 -n 4 python3 -u tests/multi_device/mixed_basis_pair_conv_p4.py [--wfn PATH]``.
 Prints one ``[pairconv-p4] PASS``/``FAIL`` line per check and ``ALL PASS`` at the end.
@@ -56,6 +63,25 @@ def check(name, ok, detail):
     say(f"{'PASS' if ok else 'FAIL'} {name}: {detail}")
     if not ok:
         FAILS.append(name)
+
+
+def fe_fixture(mesh, wfn_path, ns_box=(6, 6, 6), ns=None):
+    """Fe's magnetic SymMaps on a 6^3 grid as a fixture dict (``ns`` overrides the spinor width)."""
+    from file_io import WfnLoader
+    from gw.centroid_k_unfold import build_centroid_k_unfold_plan
+    import zeta_mubatch_fixtures as fixtures
+    with WfnLoader(wfn_path, backend="eager") as w:
+        sym = w.symmetry()
+        b = np.asarray(w.bvec, dtype=np.float64)
+        kgrid = tuple(int(v) for v in w.kgrid)
+        kpar = np.asarray(w.kvecs(k=sym.parent_k_domain))
+        ns = int(w.nspinor) if ns is None else int(ns)
+    grid = fixtures._grid_points(ns_box)
+    n_sp = int(np.asarray(sym.sym_matrices).shape[0])
+    plan = build_centroid_k_unfold_plan(sym, grid, ns_box, mesh, nspinor=ns, parent_k_frac=kpar)
+    return dict(plan=plan, fft_grid=ns_box, kgrid=kgrid, kfull=np.asarray(sym.unfolded_kpts),
+                ops=np.asarray(sym.sym_matrices)[:n_sp], tnp=np.asarray(sym.translations)[:n_sp],
+                rows=np.asarray(sym.active_symmetry_rows), spinor_action=sym.spinor_action), b
 
 
 def fe_case(mesh, wfn_path, ns_box=(6, 6, 6)):
@@ -139,6 +165,49 @@ def main():
             say(conv.describe())
         e = cases.rel(got["router"], got["xla"])
         check(f"fast vs fallback ns={ns} k 4^3 box 12^3 M={sph.shape[1]}", e <= 1e-12, f"rel {e:.2e}")
+
+    # ---- the r'-column wedge on covariant operands ---------------------------
+    import zeta_mubatch_fixtures as fixtures
+    wcases = []
+    fxg = fixtures._glide_fixture(mesh, np.random.default_rng(2), 2, translated_anti=True)
+    cg = t.covariant_case(fxg, ecut=1.3, metric=np.eye(3), box=(6, 6, 5))
+    wcases += [("glide ns=2 full group", cg, (0, 1, 2, 3), ("no_wrap",)),
+               ("glide ns=2 {E, anti glide}", cg, (0, 3), ("no_conj",))]
+    fxa = fixtures._acubic_fixture(mesh, np.random.default_rng(1))
+    from file_io import WfnLoader
+    root = fixtures._HERE / "core" / "fixtures" / "A-cubic"
+    with WfnLoader(root / "WFN.h5", backend="eager", qe_schema=root / "data-file-schema.xml") as w:
+        ba = np.asarray(w.bvec, dtype=np.float64)
+    ca = t.covariant_case(fxa, ecut=1.05 * float(np.min(np.einsum("ij,ij->i", ba, ba))),
+                          metric=ba @ ba.T, box=(8, 8, 8), nb=2)
+    wcases.append(("A-cubic ns=1", ca, fxa["rows"], ("no_wrap",)))
+    cp = t.covariant_case(fxg, ecut=1.3, metric=np.eye(3), box=(6, 6, 5), complex_weights=True)
+    wcases.append(("glide ns=2 complex weights + partners, unitary rows", cp, (0, 1), ()))
+    if args.wfn:
+        for ns_fe in (1, 2):
+            fxf, bf = fe_fixture(mesh, args.wfn, ns=ns_fe)
+            cf = t.covariant_case(fxf, ecut=1.05 * float(np.min(np.einsum("ij,ij->i", bf, bf))),
+                                  metric=bf @ bf.T, box=(6, 6, 6), nb=2)
+            n_sp = len(fxf["ops"])
+            rows = np.asarray(fxf["rows"])
+            wcases += [(f"Fe ns={ns_fe} all {len(rows)} rows", cf, rows, ("no_conj", "no_wrap")),
+                       (f"Fe ns={ns_fe} unitary rows", cf, rows[rows < n_sp], ())]
+    for name, c, rows, twins in wcases:
+        for backend in ("router", "xla"):
+            r = t._wedge_check(mesh, c, backend, rows, twins=twins)
+            ok = (r["ref"] <= t.TOL and r["dense"] <= t.TOL and r["dense_ref"] <= t.TOL
+                  and all(v > 1e-3 for v in r["red"].values()))
+            check(f"wedge {name} {backend}", ok,
+                  f"vs dense ref {r['ref']:.2e}, vs dense-column plan {r['dense']:.2e} "
+                  f"(dense plan vs ref {r['dense_ref']:.2e}); {r['orbits']} orbits of {r['nr']} "
+                  f"columns; red twins {', '.join(f'{k} {v:.1e}' for k, v in r['red'].items()) or '-'}; "
+                  f"leak {c['leak']:.1e}")
+    try:
+        t._wedge_check(mesh, cp, "xla", (0, 3))
+        check("wedge refuses partners on antiunitary rows", False, "no refusal")
+    except ValueError as e:
+        check("wedge refuses partners on antiunitary rows", "GATE pairconv-wedge-partner" in str(e),
+              str(e)[:80])
 
     # ---- collective census of the fast path's compiled stages ---------------
     census = conv.collective_census()
