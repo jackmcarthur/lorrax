@@ -1,11 +1,11 @@
-"""The GN-PPM fit's q-chunk sizer prices the LOCAL tile, and chunking is bit-exact.
+"""The GN-PPM fit's q block comes from the device pool, and chunking is bit-exact.
 
-``_gn_ppm_fit_q_block`` budgets a per-device arena, so the caller must hand
-it one q-slice of the device's own shard.  Handing it the global ``(mu, nu)``
-slice over-chunked by the device count (VI3 12x12, mu 3200: q_block 1 at P16
-and P100, i.e. 144 eager slice/fit/reshard rounds instead of 6 and 1).  The
-second cell is the parity half: the fit is elementwise in q and its census
-is exact counts and extrema, so every q_block gives identical bits.
+The sizer prices one q from the kernel compiled at q = 1 on the inputs' own
+sharding (the LOCAL tile, whatever the kernel's layout costs; a constant
+multiple of the tile read 6x LOW on the ordered kernel, CrI3 16x16 P64), and
+refuses by name when one q does not fit.  The parity half: the fit is
+elementwise in q and its census is exact counts and extrema, so every
+q_block gives identical bits.
 """
 from __future__ import annotations
 
@@ -52,16 +52,25 @@ def test_fit_q_block_prices_the_local_tile(monkeypatch):
     mesh = _mesh()
     Wc0, Wprobe = _inputs(mesh)
     seen = []
-    real = ms._gn_ppm_fit_q_block
-
-    def spy(nq, tile_bytes_per_q):
-        seen.append((nq, tile_bytes_per_q))
-        return real(nq, tile_bytes_per_q)
-
-    monkeypatch.setattr(ms, "_gn_ppm_fit_q_block", spy)
+    real = ms._gn_ppm_fit_bytes_per_q
+    monkeypatch.setattr(ms, "_gn_ppm_fit_bytes_per_q",
+                        lambda *a: seen.append(real(*a)) or seen[-1])
     _fit(Wc0, Wprobe, ordered=False)
-    # One q-slice of a 2x2-sharded (16, 16) c128 tile: 8 * 8 * 16 bytes.
-    assert seen == [(NQ, (MU // 2) * (MU // 2) * 16)]
+    block, out = seen[0]
+    local = (MU // 2) * (MU // 2) * 16          # one q of a 2x2-sharded c128 tile
+    # Two input slices and the outputs at least; a few local tiles at most --
+    # never the global (mu, nu) slice times the device count.
+    assert 2 * local <= block <= 16 * local, (block, local)
+    assert 0 < out < block
+
+
+@pytest.mark.mesh(4)
+def test_fit_refuses_when_one_q_does_not_fit(monkeypatch):
+    mesh = _mesh()
+    Wc0, Wprobe = _inputs(mesh)
+    monkeypatch.setattr(ms, "_gn_ppm_fit_free_bytes", lambda: 1)
+    with pytest.raises(ValueError, match="GATE gn_ppm_fit_capacity"):
+        _fit(Wc0, Wprobe, ordered=False)
 
 
 @pytest.mark.mesh(4)
@@ -72,16 +81,15 @@ def test_fit_is_bit_identical_at_every_q_block(monkeypatch, ordered):
     real = ms._gn_ppm_fit_q_block
     blocks = {}
     results = {}
-    for label, budget in (("single_shot", 1 << 40), ("q_block_1", 1)):
-        monkeypatch.setattr(ms, "_GN_PPM_FIT_ARENA_BUDGET_BYTES", budget)
+    for label, force in (("one_block", None), ("q_block_1", 1)):
         monkeypatch.setattr(
             ms, "_gn_ppm_fit_q_block",
-            lambda nq, tile, _label=label: blocks.setdefault(
-                _label, real(nq, tile)))
+            lambda nq, *a, _label=label, _force=force: blocks.setdefault(
+                _label, real(nq, *a) if _force is None else _force))
         results[label] = _fit(Wc0, Wprobe, ordered=ordered)
-    # The two arms really took the two code paths.
-    assert blocks == {"single_shot": NQ, "q_block_1": 1}
-    a, b = results["single_shot"], results["q_block_1"]
+    # The two arms really took one block and NQ blocks.
+    assert blocks == {"one_block": NQ, "q_block_1": 1}
+    a, b = results["one_block"], results["q_block_1"]
     for name in ("omega_qmunu", "B_qmunu", "valid_qmunu", "B_odd_qmunu"):
         x, y = getattr(a, name), getattr(b, name)
         if x is None or y is None:
