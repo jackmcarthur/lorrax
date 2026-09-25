@@ -209,13 +209,61 @@ _static_convolution_cache: dict[tuple[object, ...], object] = {}
 class StaticConvolution(NamedTuple):
     """The static Σ convolution: ``fn(G_k, V, prefactor)``, or ``prep(V)`` once and
     ``apply(G_k, prepared, prefactor)`` per Green, for a caller that convolves
-    several Greens with one interaction (the spin-pair stream)."""
-    convolve: object
+    several Greens with one interaction (the spin-pair stream).  ``V`` is a
+    ``symmetry_maps.QirrOperator``: its wedge is unfolded on the load of its
+    k-transform (``make_kfft_klead_unfold``), never stored at the full zone."""
     prep: object
     apply: object
+    warm: object = None
 
     def __call__(self, G_k, interaction, prefactor):
-        return self.convolve(G_k, interaction, prefactor)
+        return self.apply(G_k, self.prep(interaction), prefactor)
+
+    def warmed(self, interaction):
+        """``interaction`` as an operator whose wedge door is already built: call
+        OUTSIDE a jit, so the door's host tables are made once as ordinary
+        programs rather than traced op by op into the consumer's trace."""
+        op = interaction_operator(interaction)
+        if self.warm is not None:
+            op = self.warm(op)
+        return op
+
+
+def screened_minus_bare(W_q, V_q):
+    """``W - V`` on W's wedge: V (a full-zone array or an operator on the same
+    wedge) is read at the wedge rows, where its unfold is the identity."""
+    W = interaction_operator(W_q)
+    V = interaction_operator(V_q).restrict(W)
+    return W.with_values(W.values - V.values)
+
+
+def interaction_operator(interaction):
+    """``interaction`` as a ``QirrOperator``: a full-zone array is its own trivial wedge."""
+    from symmetry_maps import QirrOperator
+    return QirrOperator.of(interaction)
+
+
+_wedge_prep_cache: dict[tuple[object, ...], object] = {}
+
+
+def wedge_door(mesh_xy: Mesh, kgrid, op, *, norm="ortho", in_trace=False):
+    """The mode-9 door for ``op``'s wedge, built once per (mesh, grid, tables);
+    build it before the consumer's jit traces (``in_trace=False``)."""
+    from ffi import ffi_dial_key
+    from common.fft_helpers import make_kfft_klead_unfold
+    key = (_mesh_key(mesh_xy), tuple(int(v) for v in kgrid), ffi_dial_key(), norm,
+           op.wedge_key())
+    door = _wedge_prep_cache.get(key)
+    if door is None:
+        door = _wedge_prep_cache[key] = make_kfft_klead_unfold(
+            mesh_xy, kgrid, op.load_tables(mesh_xy, in_trace=in_trace), norm=norm)
+    return door
+
+
+def wedge_prep(mesh_xy: Mesh, kgrid, op, *, norm="ortho"):
+    """``make_kconv_klead``'s prep of ``op``'s full-zone interaction, read from its wedge
+    (inside a consumer's jit: the door is normally built already, see ``warmed``)."""
+    return wedge_door(mesh_xy, kgrid, op, norm=norm, in_trace=True)(op.values, None, op.load)
 
 
 def _make_static_convolution(mesh_xy: Mesh, kgrid: tuple[int, int, int],
@@ -234,33 +282,41 @@ def _make_static_convolution(mesh_xy: Mesh, kgrid: tuple[int, int, int],
         return _static_convolution_cache[key]
     scale = -1.0 / (float(nk_tot) if q0_only else np.sqrt(float(nk_tot)))
     if q0_only:
-        @jax.jit
-        def convolve(G_k, interaction, prefactor):
-            return (prefactor * sigma_conv_operand(G_k)
-                    * interaction[0][None, None, :, None, :] * scale)
-
         def prep(interaction):
-            return interaction
+            # The q = 0 row: q = 0 is its own orbit, so its wedge row is the
+            # full-zone row, unfolded by the identity.
+            op = interaction_operator(interaction)
+            row = int(np.flatnonzero(np.asarray(op.full_rows) == 0)[0])
+            return op.values[row]
 
         @jax.jit
         def apply(G_k, prepared, prefactor):
-            return convolve(G_k, prepared, prefactor)
+            return (prefactor * sigma_conv_operand(G_k)
+                    * prepared[None, None, :, None, :] * scale)
     else:
         # Σ = scale · fftn(ifftn(G) · ifftn(V)): the k-convolution router
         # (nvidia-mathdx on CUDA, the FFTW gw_conv handler on cpu), one fused
         # pass that bounds the exposed Green lifetime on large scalar decks.
+        # ifftn(V) is read from V's q wedge (mathdx mode 9).
         kconv = make_kconv_klead(mesh_xy, kgrid, SIGMA_CONV_G7D_SPEC, V_FFT5D_SPEC,
                                  norm='ortho', mult=scale)
-        @jax.jit
-        def convolve(G_k, interaction, prefactor):
-            return prefactor * kconv.apply(sigma_conv_operand(G_k), kconv.prep(interaction))
 
-        prep = jax.jit(kconv.prep)
+        def prep(interaction):
+            return wedge_prep(mesh_xy, kgrid, interaction_operator(interaction))
+
+        def warm(op):
+            # The door, and the operator carrying its tables on the devices:
+            # the static-Sigma jits then take them as arguments.
+            wedge_door(mesh_xy, kgrid, op)
+            return op.with_load(mesh_xy)
 
         @jax.jit
         def apply(G_k, prepared, prefactor):
             return prefactor * kconv.apply(sigma_conv_operand(G_k), prepared)
-    conv = StaticConvolution(convolve=convolve, prep=prep, apply=apply)
+        conv = StaticConvolution(prep=prep, apply=apply, warm=warm)
+        _static_convolution_cache[key] = conv
+        return conv
+    conv = StaticConvolution(prep=prep, apply=apply)
     _static_convolution_cache[key] = conv
     return conv
 
@@ -490,14 +546,24 @@ def _make_cohsex_kernels_face(mesh_xy: Mesh, face_shape, _convolve,
                  else slice(int(ri_bands[0]), int(ri_bands[1])))
         g_mun, g_nmu, owner = _g_operands(wfns)
         mask = owner.band_mask(bands)
+        W_minus_V = screened_minus_bare(W_q, V_q)
         if stream:
-            return _pair_sigma(wfns, mask, W_q - V_q, -0.5)
+            return _pair_sigma(wfns, mask, W_minus_V, -0.5)
         G_ri = build_G(g_mun, g_nmu, phases=mask, real_weights=True,
                        layout=layout, gemm=g_plan,
                        k_unfold_plan=k_unfold_plan)
-        return _project_bands(wfns, _convolve(G_ri, W_q - V_q, -0.5))
+        return _project_bands(wfns, _convolve(G_ri, W_minus_V, -0.5))
 
-    return sigma_sx, sigma_coh
+    # The interaction's wedge door is built before the jit traces (see
+    # StaticConvolution.warmed); W - V unfolds by W's tables, so one door
+    # serves COH.
+    def warmed_sx(wfns, Gij, W_q):
+        return sigma_sx(wfns, Gij, _convolve.warmed(W_q))
+
+    def warmed_coh(wfns, W_q, V_q, *, ri_bands=None):
+        return sigma_coh(wfns, _convolve.warmed(W_q), V_q, ri_bands=ri_bands)
+
+    return warmed_sx, warmed_coh
 
 
 # ---------------------------------------------------------------------------

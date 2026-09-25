@@ -91,6 +91,11 @@ def test_static_convolution_uses_certified_fused_owner(monkeypatch):
 
     monkeypatch.setattr(
         "common.fft_helpers.make_kconv_klead", fake_factory)
+    # The interaction's prep is read from its q wedge (mathdx mode 9); the
+    # stand-in door hands the whole-zone values through, as the fake prep did.
+    monkeypatch.setattr(
+        "common.fft_helpers.make_kfft_klead_unfold",
+        lambda mesh_arg, kgrid, tables, *, norm: (lambda W, Wt=None, load=None: W))
     conv = _make_static_convolution(mesh, (1, 1, 2), 2)
 
     G = _put(np.ones((2, 2, 1, 2, 1), np.complex128),

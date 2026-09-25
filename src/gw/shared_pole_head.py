@@ -220,7 +220,9 @@ def build_shared_pole_head(handle, header, V_q, wfns, meta, config, *,
         # workspace estimate. No q-local whole-matrix copy is introduced.
         algebra = distrib_la.plan("solve_lu", mesh_xy, backend="distributed", n=b.shape[1])
         evaluate = _realized_gamma_body(mesh_xy, realize)
-        args = (b, poles, counts, V_q[:1])
+        from symmetry_maps import QirrOperator
+        # q = 0 is its own orbit: its wedge row is the full-zone row.
+        args = (b, poles, counts, QirrOperator.of(V_q).representative_row(0)[None])
         stats = evaluate.lower(jnp.asarray(1j, jnp.complex128), *args).compile().memory_analysis()
         if stats is None:
             raise ValueError("GATE shared_pole_head: matrix evaluation memory unavailable")
