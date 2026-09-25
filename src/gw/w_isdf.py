@@ -246,18 +246,11 @@ def _get_chi_minimax_kernel_face(mesh_xy, kgrid, nk, n_out, complex_contour,
     # with zero phases, which spent twice the flops of the two supports.
     g_plan = gemm_plan(
         mesh_xy, m=n_rmu_left * ns, k=nb_full,
-        n=n_rmu_right * ns, nq=nk if paired else expected_input_nk,
+        n=n_rmu_right * ns, nq=expected_input_nk,
         dtype=jnp.complex128, layout=layout, enable_active_range=True)
-    if paired:
-        from common.shard_map import shard_map
-        def unfold_pair(psi_left, psi_right):
-            return (left_plan.unfold_face(psi_left, spin_axis=1, mu_axis=2,
-                                         mesh_axis="x"),
-                    right_plan.unfold_face(psi_right, spin_axis=2, mu_axis=3,
-                                          mesh_axis="y"))
-        unfold_pair = shard_map(unfold_pair, mesh=mesh_xy,
-            in_specs=(_psi_mun_spec, _psi_nmu_spec),
-            out_specs=(_psi_mun_spec, _psi_nmu_spec), check_vma=False)
+    # Two centroid families (charge x current): the Green is contracted on
+    # the raw parents and its endpoints transported by their own plans.
+    right_green_plan = right_plan if paired and right_plan is not left_plan else None
 
     @partial(jax.jit,
              in_shardings=(_psi_mun_shard, _psi_nmu_shard,
@@ -271,12 +264,6 @@ def _get_chi_minimax_kernel_face(mesh_xy, kgrid, nk, n_out, complex_contour,
     def _build_Gv_Gc(psi_mun_left, psi_nmu_right,
                     mask_v, mask_c, enk_full,
                     tau_scalar, vmax, cmin):
-        if paired:
-            psi_mun_left, psi_nmu_right = unfold_pair(
-                psi_mun_left, psi_nmu_right)
-            rows = jnp.asarray(left_plan.irr_idx)
-            mask_v, mask_c, enk_full = (jnp.take(v, rows, axis=0)
-                                       for v in (mask_v, mask_c, enk_full))
         t_c = jnp.conj(tau_scalar) if complex_contour else tau_scalar
         # The pair leaves conjugated; the unfold writes the conjugate in its
         # own gather pass (no second full-k copy after the spin rotation).
@@ -284,14 +271,16 @@ def _get_chi_minimax_kernel_face(mesh_xy, kgrid, nk, n_out, complex_contour,
             build_G_tau(psi_mun_left, psi_nmu_right, enk_full,
                        -tau_scalar, e_ref=vmax,
                        mask=mask_v, layout=layout, gemm=g_plan,
-                       k_unfold_plan=None if paired else k_unfold_plan,
+                       k_unfold_plan=left_plan,
+                       right_k_unfold_plan=right_green_plan,
                        trim_zero_bands=True, conjugate=True),
             _G_k_shard)
         Gc_k = jax.lax.with_sharding_constraint(
             build_G_tau(psi_mun_left, psi_nmu_right, enk_full,
                        t_c, e_ref=cmin,
                        mask=mask_c, layout=layout, gemm=g_plan,
-                       k_unfold_plan=None if paired else k_unfold_plan,
+                       k_unfold_plan=left_plan,
+                       right_k_unfold_plan=right_green_plan,
                        trim_zero_bands=True, conjugate=True),
             _G_k_shard)
         return Gv_k, Gc_k
@@ -322,7 +311,8 @@ def _get_chi_minimax_kernel_face(mesh_xy, kgrid, nk, n_out, complex_contour,
             factors.append(jax.lax.with_sharding_constraint(
                 build_G_tau(psi_mun_left, psi_nmu_right, enk, zero_t,
                             band_weight=weight, layout=layout, gemm=g_plan,
-                            k_unfold_plan=k_unfold_plan,
+                            k_unfold_plan=left_plan,
+                            right_k_unfold_plan=right_green_plan,
                             conjugate=not ordered),
                 _G_k_shard))
         return factors[0], factors[1]
