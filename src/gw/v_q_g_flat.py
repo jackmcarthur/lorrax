@@ -795,32 +795,42 @@ def _compute_V_q_g_flat_tiles(
     v_rows_sh = NamedSharding(mesh_xy, P(None, None))
     take_cols, stack_cols = _one_leg_take(mesh_xy) if one_leg_any else (None, None)
 
-    if len(specs) == 1 and hasattr(specs[0]['L'], 'contract_v'):
+    if all(hasattr(ld, 'contract_v') for ld in loaders):
         # The μ-batch fit's ζ (Z store + C⁺, isdf.zeta_mubatch.ZetaG): V is
         # accumulated tile by tile as ζ is formed, and the pass keeps ζ at
         # exactly the columns the head consumers name: the one-leg sources
-        # and the head channel's slots.
-        s = specs[0]
-        if not s['same_zeta']:
-            raise ValueError(
-                f"_compute_V_q_g_flat_tiles[{label}]: the in-memory "
-                "ζ serves only the same-ζ charge tile.")
-        head_sel = (None if s.get('head_slots') is None
-                    else s['head_slots'](q_irr_frac, gvec_components))
-        s['V'] = s['L'].contract_v(s['v'], keep=_head_shell(
-            n_q_ibz, one_leg_cols if s['one_leg'] else None, head_sel))
-        if tuple(int(v) for v in s['V'].shape) != (n_q_ibz, s['nL'], s['nL']):
-            raise ValueError(
-                f"_compute_V_q_g_flat_tiles[{label}]: in-memory V "
-                f"{tuple(s['V'].shape)} != {(n_q_ibz, s['nL'], s['nL'])}")
-        s['V'] = jax.lax.with_sharding_constraint(s['V'], V_sh)
-        shell = s['L'].shell                          # (n_q_ibz, μ_pad, n_shell)
-        if s['one_leg']:
-            s['parts'] = [take_cols(shell, device_put_process_local(
-                s['L'].head_columns(one_leg_cols),
-                NamedSharding(mesh_xy, P(None, None))))]
-        elif s['write_g0'] and not use_ibz:
-            s['g0'] = jax.lax.with_sharding_constraint(shell[:, :, 0], g0_sh)
+        # and the head channel's slots.  Several ζ of one fit (the current
+        # family's three channels) are formed together, each once per G tile,
+        # and every tile of ``specs`` is contracted from them in the same pass.
+        head_sel = [None if s.get('head_slots') is None
+                    else s['head_slots'](q_irr_frac, gvec_components)
+                    for s in specs]
+        keep = _head_shell(n_q_ibz, one_leg_cols if one_leg_any else None,
+                           *head_sel)
+        if len(loaders) == 1 and len(specs) == 1:
+            specs[0]['V'] = loaders[0].contract_v(specs[0]['v'], keep=keep)
+        else:
+            from isdf.zeta_mubatch import contract_v_group
+            Vs = contract_v_group(
+                loaders, [(slot(s['L']), slot(s['L'] if s['same_zeta'] else s['R']))
+                          for s in specs],
+                [s['v'] for s in specs], keep=keep)
+            for s, V in zip(specs, Vs):
+                s['V'] = V
+            del Vs
+        for s in specs:
+            if tuple(int(v) for v in s['V'].shape) != (n_q_ibz, s['nL'], s['nR']):
+                raise ValueError(
+                    f"_compute_V_q_g_flat_tiles[{label}]: in-memory V "
+                    f"{tuple(s['V'].shape)} != {(n_q_ibz, s['nL'], s['nR'])}")
+            s['V'] = jax.lax.with_sharding_constraint(s['V'], V_sh)
+            shell = s['L'].shell                      # (n_q_ibz, μ_pad, n_shell)
+            if s['one_leg']:
+                s['parts'] = [take_cols(shell, device_put_process_local(
+                    s['L'].head_columns(one_leg_cols),
+                    NamedSharding(mesh_xy, P(None, None))))]
+            elif s['write_g0'] and not use_ibz:
+                s['g0'] = jax.lax.with_sharding_constraint(shell[:, :, 0], g0_sh)
     else:
         reads = [_make_read_q_tile(ld, n, mesh_xy) for ld, n in zip(loaders, mu_pad)]
 
