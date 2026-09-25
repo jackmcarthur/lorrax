@@ -5,10 +5,10 @@ cmake_minimum_required(VERSION 3.22)
 # behind this file (layout: docs/architecture/ffi_layout.md):
 #
 #   cmake -S src/ffi/cpp -DLORRAX_FFI_PLATFORM=cuda ...  -> liblorrax_ffi.so
-#       (cuSOLVERMp/cuBLASMp/cuFFT/NCCL + phdf5 + SLATE; runs in the CUDA
-#        container; entry scripts: build.sh, config/frontera/build_ffi.sh)
+#       (the complete NVIDIA stack: cuSOLVERMp/cuBLASMp/cuBLAS/cuFFT/NVRTC/NCCL,
+#        + phdf5; entry scripts: build.sh, the lorrax_A runtime recipe)
 #   cmake -S src/ffi/cpp -DLORRAX_FFI_PLATFORM=host ...  -> liblorrax_ffi_host.so
-#       (CUDA-free by construction: phdf5 + ScaLAPACK + MKL FFT/GEMM + SLATE
+#       (CUDA-free by construction: phdf5 + ScaLAPACK + FFTW3-ABI FFT + CBLAS GEMM + SLATE
 #        gpu_backend=none; entry scripts: build_host.sh,
 #        config/frontera/build_ffi_host.sh)
 #
@@ -40,10 +40,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 # ----------------------------------------------------------------------------
-# Optional-target switches.  Both default ON so every existing (Perlmutter /
-# Cray) invocation is byte-identical — this block is a no-op there.  A
-# port that lacks a dependency turns the relevant target OFF from its own
-# build script (see config/frontera/):
+# Optional-target switches, both default ON:
 #   -DLORRAX_FFI_HAVE_CAL=OFF     cuSOLVERMp >= 0.7 is NCCL-native and needs
 #                                 no CAL (libcal / cal.h absent from the pip
 #                                 wheels).  OFF drops the cal.h include, the
@@ -58,21 +55,22 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 #                                 phdf5 handler symbols.
 option(LORRAX_FFI_HAVE_CAL   "Build the CAL (<=0.6.x cuSOLVERMp) comm path"      ON)
 option(LORRAX_FFI_HAVE_PHDF5 "Build the phdf5 subpackage (needs parallel HDF5)" ON)
-# The cuBLASMp GEMM and fused W-solve handlers.  This option is also the one
-# that enables the CUDA language below, which every CUDA-leg build needs: the
-# base sources include nvcc TUs (response/contour_accumulate.cu,
-# symmetry/spin_rotate.cu), and so do cublasmp/w_solve_kernels.cu and
-# cufft/fourier_plan.cu.  libcublasmp is linked either way (cuSOLVERMp's own
-# runtime dependency).
-option(LORRAX_FFI_HAVE_CUBLASMP "Build the cuBLASMp handlers; enables the CUDA language (nvcc)" ON)
-# The NVIDIA k-convolution family (cufft/kconv_mathdx_cuda_ffi.cc: nvidia-mathdx
-# kernels NVRTC-built at run time) and LocalFourierPlan's CUDA leg
-# (cufft/fourier_plan_cuda_ffi.cc: cuBLAS, cuFFT, the NVRTC cuBLASDx pair).
-# Built when cufft.h, libcufft, nvrtc.h and libnvrtc are found; otherwise a
-# loud skip, and startup refuses (GATE kconv-target).  The option keeps its
-# historical spelling (it is build-contract vocabulary: the cufft= stamp and
-# the verify backend).
-option(LORRAX_FFI_HAVE_CUFFT "Build the mathdx k-convolution family and the Fourier plan (needs cuFFT, NVRTC)" ON)
+# The CUDA leg is the complete NVIDIA stack (owner, 2026-09-25): nvcc, cuBLAS,
+# cuBLASMp, cuSOLVERMp, cuFFT and NVRTC; nvidia-mathdx is a run-time wheel,
+# checked at startup (GATE mathdx-headers).  No partial CUDA leg is built: the
+# former switches LORRAX_FFI_HAVE_CUBLASMP and LORRAX_FFI_HAVE_CUFFT refuse
+# OFF by name, and a missing cuFFT or NVRTC is a FATAL_ERROR at configure.
+foreach(_lrx_retired LORRAX_FFI_HAVE_CUBLASMP LORRAX_FFI_HAVE_CUFFT)
+    if(DEFINED ${_lrx_retired} AND NOT ${_lrx_retired})
+        message(FATAL_ERROR
+            "${_lrx_retired}=OFF: got a request for a partial CUDA leg; want the "
+            "complete stack (nvcc, cuBLAS, cuBLASMp, cuSOLVERMp, cuFFT, NVRTC); "
+            "fix: drop -D${_lrx_retired}=OFF, or build the CPU leg with "
+            "-DLORRAX_FFI_PLATFORM=host")
+    endif()
+endforeach()
+set(LORRAX_FFI_HAVE_CUBLASMP ON)
+set(LORRAX_FFI_HAVE_CUFFT ON)
 
 # ----------------------------------------------------------------------------
 # CUDA language (for the .cu translation units compiled by nvcc).
@@ -85,23 +83,21 @@ option(LORRAX_FFI_HAVE_CUFFT "Build the mathdx k-convolution family and the Four
 # The NVRTC kernels are not affected: they compile for the device's own
 # sm_<cc> at run time.
 # ----------------------------------------------------------------------------
-if(LORRAX_FFI_HAVE_CUBLASMP)
-    # Set the targets before enable_language(CUDA): CMake otherwise probes
-    # nvcc and seeds its cache with the compiler's default, after which a
-    # post-enable ``NOT DEFINED`` check is already too late.
-    if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-        set(CMAKE_CUDA_ARCHITECTURES "80;86-real;89-real;90-real;100-real;120" CACHE STRING
-            "CUDA architectures of the nvcc TUs: SASS sm_80..sm_120, PTX compute_80 and compute_120")
-    endif()
-    if(NOT DEFINED CMAKE_CUDA_COMPILER)
-        if(EXISTS "/usr/local/cuda/bin/nvcc")
-            set(CMAKE_CUDA_COMPILER "/usr/local/cuda/bin/nvcc")
-        endif()
-    endif()
-    enable_language(CUDA)
-    set(CMAKE_CUDA_STANDARD 17)
-    set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+# Set the targets before enable_language(CUDA): CMake otherwise probes
+# nvcc and seeds its cache with the compiler's default, after which a
+# post-enable ``NOT DEFINED`` check is already too late.
+if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+    set(CMAKE_CUDA_ARCHITECTURES "80;86-real;89-real;90-real;100-real;120" CACHE STRING
+        "CUDA architectures of the nvcc TUs: SASS sm_80..sm_120, PTX compute_80 and compute_120")
 endif()
+if(NOT DEFINED CMAKE_CUDA_COMPILER)
+    if(EXISTS "/usr/local/cuda/bin/nvcc")
+        set(CMAKE_CUDA_COMPILER "/usr/local/cuda/bin/nvcc")
+    endif()
+endif()
+enable_language(CUDA)
+set(CMAKE_CUDA_STANDARD 17)
+set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
 # ----------------------------------------------------------------------------
 #  Locate cuSOLVERMp + libcal.  BGW-style: prefer -D options, else env vars,
@@ -334,10 +330,8 @@ if(NOT NCCL_LIBRARY)
 endif()
 
 # ----------------------------------------------------------------------------
-#  cuFFT + NVRTC — for the LORRAX_FFI_HAVE_CUFFT flat-k handlers.  All four
-#  pieces ship in the container toolkit (/usr/local/cuda) AND in the pip
-#  nvidia-cufft-cu12 / nvidia-cuda-nvrtc-cu12 wheels staged into the Frontera
-#  cuda_root by config/frontera/stage_ffi_deps.sh.
+#  cuFFT + NVRTC — for the mathdx k-convolution family (NVRTC) and the
+#  Fourier plan (cuFFT, NVRTC).  Required: the CUDA leg is the complete stack.
 # ----------------------------------------------------------------------------
 set(LORRAX_CUFFT_ON 0)
 if(LORRAX_FFI_HAVE_CUFFT)
@@ -361,17 +355,16 @@ if(LORRAX_FFI_HAVE_CUFFT)
         NO_DEFAULT_PATH)
     if(CUFFT_LIBRARY AND NVRTC_LIBRARY AND CUFFT_INCLUDE_DIR AND NVRTC_INCLUDE_DIR)
         set(LORRAX_CUFFT_ON 1)
-        message(STATUS "cufft: strided flat-k FFT handlers ON "
+        message(STATUS "cufft: mathdx k-convolution family and Fourier plan ON "
                        "(${CUFFT_LIBRARY}; nvrtc=${NVRTC_LIBRARY})")
     else()
-        message(WARNING
-            "cufft: cufft.h/libcufft/nvrtc.h/libnvrtc not all found under "
-            "${CUDA_TOOLKIT_ROOT} (cufft.h=${CUFFT_INCLUDE_DIR} "
-            "lib=${CUFFT_LIBRARY} nvrtc.h=${NVRTC_INCLUDE_DIR} "
-            "libnvrtc=${NVRTC_LIBRARY}) — the flat-k FFT handlers are "
-            "SKIPPED and LORRAX_FFT_FFI on CUDA meshes will refuse at "
-            "runtime.  On Frontera re-run config/frontera/stage_ffi_deps.sh "
-            "(it merges the nvidia-cufft/nvrtc wheels into cuda_root).")
+        message(FATAL_ERROR
+            "cufft: got cufft.h=${CUFFT_INCLUDE_DIR} lib=${CUFFT_LIBRARY} "
+            "nvrtc.h=${NVRTC_INCLUDE_DIR} libnvrtc=${NVRTC_LIBRARY} under "
+            "${CUDA_TOOLKIT_ROOT}; want all four (the CUDA leg is the complete "
+            "stack: the k-convolution family and the Fourier plan need them); "
+            "fix: point -DCUFFT_LIBRARY/-DCUFFT_INCLUDE_DIR/-DNVRTC_LIBRARY/"
+            "-DNVRTC_INCLUDE_DIR (or CUDA_TOOLKIT_ROOT) at the toolkit")
     endif()
 endif()
 
@@ -712,9 +705,9 @@ if(LORRAX_FFI_HAVE_CAL)
     target_link_libraries(lorrax_ffi PRIVATE "${CUSOLVERMP_LIBDIR}/libcal.so")
 endif()
 if(LORRAX_CUFFT_ON)
-    # ${CMAKE_DL_LIBS}: the cufft TU resolves the driver API (cuModule*/
-    # cuLaunchKernel) via dlsym — no link-time libcuda (absent on
-    # build/login nodes); NVRTC compiles its two device kernels at runtime.
+    # ${CMAKE_DL_LIBS}: the NVRTC build service resolves the driver API
+    # (cuModule*/cuLaunchKernel) via dlsym, so no link-time libcuda (absent on
+    # build/login nodes).  libcufft: the Fourier plan's FFT group.
     target_link_libraries(lorrax_ffi PRIVATE
         "${CUFFT_LIBRARY}" "${NVRTC_LIBRARY}" ${CMAKE_DL_LIBS})
     target_include_directories(lorrax_ffi PRIVATE
@@ -802,11 +795,6 @@ add_compile_definitions(OMPI_SKIP_MPICXX=1)
 # found, so a phdf5-only host lib still builds on a cluster with neither a
 # SLATE install nor a ScaLAPACK.
 #
-# The full 11-target lib (phdf5×4, slate×5, scalapack×2) is built by
-# config/frontera/build_ffi_host.sh (9 targets first built 2026-07-25;
-# scalapack eigh added 2026-07-26, workstream V; the phdf5 WRITE handler
-# added 2026-07-26, workstream AE — it is what makes the mpi4py +
-# h5py-parallel overlay unnecessary on CPU).
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -928,30 +916,28 @@ endif()
 #            cpp/blacs_grid.h)         ScaLAPACK, AMD AOCL.  NOT SLATE's
 #                                      libslate_scalapack_api: 6/11, and
 #                                      refused -- see RESOLVE 1/4 below.
-#  mklblas   CBLAS (cblas_dgemm /      Intel MKL, Cray LibSci, OpenBLAS,
+#  cblas     CBLAS (cblas_dgemm /      Intel MKL, Cray LibSci, OpenBLAS,
 #            cblas_zgemm; the batched  BLIS, ATLAS.  Only the *_batch entry
 #            entry is an extension)    is vendor-variable, and that is asked
 #                                      at RUNTIME, never here.
-#  mklfft    Intel DFTI descriptor     Intel MKL ONLY.  This is the one host
-#            API (DftiCreateDescriptor family whose API has a single vendor;
-#            / DftiSetValue / ...)     see the note in the mklfft block.
+#  fftw      FFTW3 advanced interface  FFTW, cray-fftw, MKL's FFTW3 export,
+#            (fftw_plan_many_dft),     AOCL.  Bound at RUNTIME, never linked
+#            bound by dlsym            (RESOLVE 3/4).
 #  slate     slate:: C++ templates     ICL SLATE ONLY (a C++ library, not an
 #                                      ABI — no second implementation exists)
 #
-#  THE THREE FAMILY NAMES ARE HISTORICAL, NOT VENDOR ASSERTIONS.  `mklblas`
-#  builds and runs against any CBLAS; `mklfft`'s Python module also drives the
-#  cuFFT handlers on the CUDA platform under the SAME jax.ffi target names.
-#  Nothing at runtime can observe which vendor supplied ScaLAPACK or CBLAS —
-#  see src/ffi/common/ffi_loader.py, which keys only on LORRAX's own handler
-#  symbol names (ScalapackEighHostFfi, ...).
+#  The target names keep their historical spellings (lorrax_mklblas_*,
+#  lorrax_mklfft_*); nothing at runtime can observe which vendor supplied
+#  ScaLAPACK or CBLAS — src/ffi/common/ffi_loader.py keys only on LORRAX's
+#  own handler symbol names (ScalapackEighHostFfi, ...).
 #
 #  RESOLUTION IS ONE BLOCK, FOUR CONSUMERS.  Before 2026-07-31 the ScaLAPACK,
-#  CBLAS and DFTI resolutions were all nested inside `if(slate_FOUND)`, and
-#  the DFTI one additionally inside the MKL branch of the ScaLAPACK probe.
+#  CBLAS and FFT resolutions were all nested inside `if(slate_FOUND)`, and
+#  the FFT one additionally inside the MKL branch of the ScaLAPACK probe.
 #  Two capabilities were silently lost as a result:
 #    * no SLATE install  ->  ScaLAPACK eigh/LU, GEMM and FFT handlers ALL
 #      dropped, though none of them calls SLATE (proved by compiling
-#      cpp/scalapack/{eigh,solve_lu}_ffi.cc and mkl{fft,blas}/cpp/*.cc with
+#      cpp/scalapack/{eigh,solve_lu}_ffi.cc and cpp/{fftw,cblas}/*.cc with
 #      only the XLA-FFI and MPI header paths — they need no SLATE header, and
 #      the resulting objects reference no slate symbol);
 #    * ScaLAPACK given explicitly via -DLORRAX_SCALAPACK_LIBRARIES  ->  the
@@ -979,10 +965,6 @@ endif()
 #      -> the CBLAS came from a header-only prefix with no library on the
 #         link line.  cblas_?gemm_batch will NEVER appear here: it is looked
 #         up at runtime and its absence selects the plain-GEMM loop.
-#  unresolved at load: Dfti*
-#      -> the MKL runtime is not on the load path.  DFTI lives inside
-#         libmkl_intel_lp64/libmkl_core, which the ScaLAPACK link line
-#         already brings in, so this can only mean a load-path problem.
 #  unresolved at load: slate::* (mangled _ZN5slate...)
 #      -> libslate.so is not on the load path.  Note this is the ONLY family
 #         whose absence cannot be worked around with another vendor.
@@ -1211,71 +1193,18 @@ if(NOT _mklblas_on AND NOT _gemm_cblas_header)
 endif()
 
 # ----------------------------------------------------------------------------
-#  RESOLVE 3/4 — MKL FFT (DFTI API) flat-k batched-FFT host handlers
-#  (cpp/fftw/fft_flat_k_ffi.cc; FFT-FFI prototype 2026-07-28).  O(N log N)
-#  FFT at any k-count via MKL's DFTI descriptor API.
-#  Rides the ScaLAPACK link line already resolved above (DFTI lives inside
-#  libmkl_intel_lp64 / libmkl_core / the threading layer — zero new link
-#  deps); needs only mkl_dfti.h.  The one TU is compiled -fopenmp for its
-#  chunk-loop threading.
-#
-#  THIS IS THE ONE HOST FAMILY WITH A SINGLE-VENDOR API.  DFTI is Intel's,
-#  and Cray LibSci does not implement it, so a LibSci-only site gets no host
-#  FFT handler and LORRAX_FFT_FFI refuses at runtime (the default XLA lowering
-#  is untouched — this is a lost optimisation, never a wrong answer).  If that
-#  ever needs fixing, the portable target is the FFTW3 ADVANCED interface
-#  (fftw_plan_many_dft): the flat-k layout is one uniform batch —
-#  istride = howmany, idist = 1 — which that call expresses directly (the
-#  guru interface's arbitrary nested loops are not needed; this comment
-#  used to name fftw_plan_guru_dft — corrected 2026-07-31 to match
-#  docs/architecture/ffi_layout.md §7).  fftw_plan_many_dft is implemented
-#  by FFTW, cray-fftw, AOCL — and by MKL itself, whose libmkl_intel_lp64
-#  exports fftw_plan_many_dft / fftw_execute alongside the Dfti* entry
-#  points.  That is a rewrite of the descriptor construction, not a
-#  link-line change, and it is unmeasured.
+#  RESOLVE 3/4 — the FFTW3-ABI flat-k host handlers (cpp/fftw/fft_flat_k_ffi.cc).
+#  The TU calls the FFTW3 advanced interface (fftw_plan_many_dft), bound at
+#  RUN time by dlsym: the engine already resident (MKL exports it from the
+#  ScaLAPACK link line), else a dlopen ladder (docs/architecture/ffi_layout.md
+#  §3c).  Nothing FFTW is linked: a DT_NEEDED fftw would make the whole
+#  library unloadable where that SONAME is not visible (GATE 5 checks zero
+#  fftw in DT_NEEDED).  This leg only records a found FFTW3 as the
+#  compile-time absolute-path hint that heads the ladder.  A process with no
+#  engine refuses at its first host FFT, naming every candidate tried; the
+#  startup gate (LORRAX_FFT_FFI, Gate.enforce) checks only the exported
+#  handler symbol.  The TU is compiled -fopenmp for its chunk-loop threading.
 # ----------------------------------------------------------------------------
-#  UPDATED 2026-08-05: the flat-k TU no longer calls DFTI.  It calls the
-#  FFTW3 ADVANCED interface (fftw_plan_many_dft), resolved at RUN time by
-#  dlsym — the pattern the GEMM service proved.  So there is nothing to
-#  detect for MKL sites at all: MKL exports the FFTW3 C interface natively
-#  from libmkl_intel_lp64, which the ScaLAPACK link line already carries, and
-#  the same dlsym finds it.  ONE source serves both engines; there is no
-#  build-time engine selector and no environment variable, because "which
-#  FFT am I running" must be answerable from what the .so links (invariant 2,
-#  ffi_layout.md §2) rather than from a knob somebody set three months ago.
-#
-#  CORRECTED 2026-08-06 — THIS LEG USED TO LINK FFTW3, AND THAT WAS THE BUG.
-#  ------------------------------------------------------------------------
-#  Until today this leg put a real FFTW3 into the library's DT_NEEDED "so the
-#  runtime dlsym has something to find".  That defeats the entire point of
-#  resolving at run time.  A DT_NEEDED entry is a LOAD-TIME dependency: the
-#  dynamic linker must find that exact SONAME before a single byte of this
-#  library runs.  So the .so became unloadable on any machine that could not
-#  see `libfftw3.so.mpi31.3` — and cray-fftw's SONAME is not merely versioned,
-#  it is MPI-flavour-stamped, so it is not even the same string on two Cray
-#  sites.  Measured consequence (2026-08-06): the Shifter container does not
-#  bind-mount /opt/cray/pe/fftw at all, so `dlopen` of this library failed at
-#  DT_NEEDED resolution and NINETEEN ScaLAPACK/SLATE/GEMM contract tests —
-#  none of which touch FFT — turned into skips.  A lost FFT optimisation
-#  silently became a lost linear-algebra test suite.
-#
-#  The invariant recorded as proof that "nothing is link-bound"
-#  (`nm -D --undefined-only | grep -c fftw_` -> 0) was TRUE THROUGHOUT and did
-#  not catch it: it counts undefined SYMBOL references, and dlsym'ing every
-#  entry point correctly drives that to zero.  It says nothing about
-#  DT_NEEDED, which is what actually gates loading.  Necessary, not
-#  sufficient.  The sufficient check is now GATE 5 in
-#  config/perlmutter/build_ffi_host.sh: zero fftw in DT_NEEDED.
-#
-#  So this leg no longer contributes to the link line.  What it contributes
-#  instead is a compile-time ABSOLUTE-PATH HINT that heads the runtime dlopen
-#  candidate ladder in fftw/fft_flat_k_ffi.cc.  The build still names the
-#  engine it was configured against — invariant 2 is preserved, and the answer
-#  to "which FFT am I running" is still baked into the artifact rather than
-#  set by a knob — but naming it can no longer prevent the library loading.
-#  Absence of the engine remains a STARTUP refusal from LORRAX_FFT_FFI
-#  (Gate.enforce) naming the unresolved symbol, which is the loud failure this
-#  was always supposed to have.
 option(LORRAX_HOST_HAVE_FFTW3
        "Record a system FFTW3 as the runtime dlopen hint (NOT linked; not needed on MKL sites)"
        ON)
