@@ -1229,15 +1229,17 @@ __device__ __forceinline__ void chi_tt_tile(const UnfoldTab& t, const ChiTiles& 
     }
 }
 
-// One cp.async per cell of the tile (consecutive threads on consecutive columns of one k: the
-// right sources of a centroid are contiguous), a -1 source or a pair past npr an exact zero.
+// One cp.async per cell of the tile, a -1 source or a pair past npr an exact zero.  Consecutive
+// threads take consecutive k of one column, so a warp's copies land in contiguous shared memory:
+// a cp.async moves one sector per thread either way (the sources of consecutive columns are
+// contiguous, but their bank cells are a padded row apart, 31 wavefronts per copy; ncu, A100).
 __device__ __forceinline__ void chi_tt_gather(const ChiArgs& a, const UnfoldTab& t, const ChiTiles& s, int b,
                                               int npr, lrx_c2* bank) {
     using G = lrx_kbox::Geo<NX, NY, NZ>;
     const int* ls = s.ls(b);
     const int* rs = s.rs(b);
     for (int i = threadIdx.x; i < NK * TRC; i += blockDim.x) {
-        const int j = i % TRC, k = i / TRC;
+        const int k = i % NK, j = i / NK;
         const int jp = j / GRP, op = (j % GRP) / SS, e = j % SS;
         bool valid = false;
         const lrx_c2* src = a.gv;
