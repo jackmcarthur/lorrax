@@ -1868,8 +1868,9 @@ class _CollectiveLane:
     The rule, at every door that touches HDF5 (they all drain first, through
     :meth:`_LaneSlot.drain`): every handle's queued writes and every OTHER
     handle's in-flight async union reads finish before this handle's HDF5
-    call.  One handle's writes still overlap the caller's compute as before;
-    only a switch between handles waits.  Writer errors stay per handle.
+    call.  A read on this same handle must finish too: the native read worker
+    can still be inside HDF5 after ``read_slabs`` returns.  Writer errors
+    stay per handle.
     """
 
     def __init__(self):
@@ -1884,22 +1885,25 @@ class _CollectiveLane:
                 name="phdf5-collective-lane", maxsize=2)
         return self._dispatcher
 
-    def _finish_reads(self, slot) -> None:
-        for key in [k for k in self._reads if k != id(slot)]:
+    def _finish_reads(self) -> None:
+        # HDF5 calls may not overlap even on the same file.  The native
+        # union reader is asynchronous, so a following metadata operation,
+        # synchronous read or write must wait for its Promise as well.
+        for key in list(self._reads):
             jax.block_until_ready(self._reads.pop(key))
 
     def quiesce(self, slot) -> None:
-        """Every queued write (any handle) and every other handle's read is done."""
+        """Every queued write and in-flight read is done before HDF5 entry."""
         if self._owner is not None:
             self._worker().drain()
             self._owner = None
-        self._finish_reads(slot)
+        self._finish_reads()
 
     def submit(self, slot, task) -> None:
         """Queue ``slot``'s collective ``task`` behind every earlier one."""
         if self._owner is not None and self._owner is not slot:
             self._worker().drain()
-        self._finish_reads(slot)
+        self._finish_reads()
         self._owner = slot
         self._worker().submit(slot._run(task))
 
@@ -1907,7 +1911,7 @@ class _CollectiveLane:
         return self._worker().pending if self._owner is slot else 0
 
     def track_read(self, slot, result) -> None:
-        """Remember an async union read on ``slot`` until another handle waits.
+        """Remember an async union read until the next HDF5 door waits.
 
         What is kept is one element per local shard, sliced from the result:
         it becomes ready only when the read has landed, and it does not keep

@@ -54,10 +54,11 @@ two queued writes plus the one in flight, and a further `write_slab` blocks.
 **One collective lane per process.** Every handle's asynchronous writes go
 through one queue and one worker (`_slab_io_ffi._CollectiveLane`), so
 collective HDF5 calls leave in program order, which is the same on every
-rank. Before any handle's next HDF5 call (open, create, read, a write to a
-different handle, close), every handle's queued writes and every other
-handle's in-flight `read_slabs` finish. One handle's writes still overlap the
-caller's compute; only a switch between handles waits. With one writer thread
+rank. Before any handle's next HDF5 call (open, create, read, write, close),
+every handle's queued writes and in-flight `read_slabs` finish, including
+reads on that same handle. An async union read can overlap compute until the
+next HDF5 call; a same-handle metadata call also needs the native reader to
+leave HDF5 first. With one writer thread
 per handle, three files with queued writes deadlocked a CrI3 run: each rank
 matched the three files' collectives in its own order.
 
