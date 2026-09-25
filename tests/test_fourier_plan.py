@@ -387,16 +387,17 @@ def _device_free_bytes():
 
 def test_cufft_work_area_comes_from_the_pool(leg):
     """cuFFT plans cached per batch size must not hold work areas outside XLA's
-    pool (finding 3): a Bluestein length (4099) needed ~84 MB per new batch.  Five
-    new batch sizes may not take more than 16 MB of free device memory."""
+    pool (finding 3): a Bluestein length (4099) at batch ~300 held ~84 MB per new
+    batch size.  Three new batch sizes may not take more than 16 MB of free
+    device memory."""
     if leg != "ffi":
         pytest.skip("the CUDA leg's cuFFT plans")
     plan = LocalFourierPlan((4099,), (-1,), sign=-1, device_kind="__fft__")
     run = jax.jit(plan)
     rng = _rng("bluestein")
-    jax.block_until_ready(run(jnp.asarray(_crandn(rng, (1, 4099)))))
+    jax.block_until_ready(run(jnp.asarray(_crandn(rng, (300, 4099)))))
     before = _device_free_bytes()
-    for b in (2, 3, 5, 7, 11):
+    for b in (301, 302, 303):
         x = _crandn(rng, (b, 4099))
         y = np.asarray(jax.block_until_ready(run(jnp.asarray(x))))
         assert np.max(np.abs(y - np.fft.fft(x, axis=-1))) <= 1e-9 * np.max(np.abs(y))
