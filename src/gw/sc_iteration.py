@@ -3049,6 +3049,7 @@ def _classify_sc_partition(
 
 
 def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
+    map0_dft_table = None
     """One self-consistent QSGW step in the DFT basis.
 
     Pure function — no side effects on ``inputs.wfns_dft``.  The current
@@ -3107,6 +3108,15 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         diag = np.diagonal(H_np, axis1=1, axis2=2)
         if not np.any(H_np - diag[:, :, None] * np.eye(nb)[None]):
             E_np = np.ascontiguousarray(diag.real)
+            # Map 0 started from DFT, not from an external QP seed, IS the
+            # one-shot: its full-BZ energies are the DFT table itself (used
+            # below), not the star broadcast of it.  Exact test: the carried
+            # diagonal is the DFT table's selection bit for bit.
+            e_dft_full = np.asarray(inputs.e_dft_active_kn_ry, dtype=np.float64)
+            ks0 = _kstar(inputs)
+            if np.array_equal(E_np, e_dft_full if ks0.is_identity
+                              else np.asarray(ks0.select(e_dft_full))):
+                map0_dft_table = e_dft_full
             vbm = E_np[:, :n_occ].max()
             cbm = E_np[:, n_occ:].min() if n_occ < nb else vbm
             efermi_ry = 0.5 * (vbm + cbm)
@@ -3237,17 +3247,12 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     ks = _kstar(inputs)
     U_full = U_qp if ks.is_identity else ks.broadcast(U_qp)
     E_full = E_qp_ry if ks.is_identity else ks.broadcast(E_qp_ry)
-    if state.iteration == 0 and not ks.is_identity:
-        # Map 0 IS the one-shot: its energies are the DFT table, not the star
-        # broadcast of it, whose time-reversed rows differ from their own DFT
-        # values by up to 2e-14 Ry (gnppm_debug; owner 2026-09-24).
-        if tuple(inputs.e_dft_active_kn_ry.shape) != tuple(E_full.shape):
-            raise ValueError(
-                f"SC map 0: DFT table {tuple(inputs.e_dft_active_kn_ry.shape)} "
-                f"is not the full-BZ window {tuple(E_full.shape)}")
+    if map0_dft_table is not None and not ks.is_identity:
+        # The DFT table, not the star broadcast of it, whose time-reversed
+        # rows differ from their own DFT values by up to 2e-14 Ry
+        # (gnppm_debug; owner 2026-09-24).  A seeded map 0 keeps its seed.
         E_full = device_put_process_local(
-            np.asarray(inputs.e_dft_active_kn_ry, dtype=E_full.dtype),
-            E_full.sharding)
+            map0_dft_table.astype(E_full.dtype), E_full.sharding)
 
     # ENTRY-SOLVED metallic occupations: one MP1 state per map CALL, from
     # the spectrum of the H actually being mapped.  This makes the
