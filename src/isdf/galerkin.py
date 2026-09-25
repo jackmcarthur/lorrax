@@ -732,9 +732,11 @@ def fit_galerkin_basis(
     Each pass transforms only the rows it uses, and each row once: the
     sketch transforms the candidate states, the selected-row pass the
     pivots (``X`` stays resident, r-sharded), and the projection streams
-    every state once for ``Psi X^H``.  ``B`` is never materialized over the
-    full FFT grid.  Centroids are used only to evaluate ``B(r_mu)`` after
-    the global basis has been selected.  No centroid weighting, state-space
+    every state once for ``Psi X^H``.  The pivots are rows of ``Psi``, so
+    ``X X^H`` is read off ``Psi X^H`` and ``L`` is factored after the
+    projection.  ``B`` is never materialized over the full FFT grid.
+    Centroids are used only to evaluate ``B(r_mu)`` after the global basis
+    has been selected.  No centroid weighting, state-space
     SVD, or per-k gauge repair participates in basis construction.
 
     ``qr_eps`` is the sole rank-revealing tolerance.  Every stream size comes
@@ -965,12 +967,22 @@ def fit_galerkin_basis(
             f"{x_fft}-row FFT batches, projection k_tile={k_tile}; "
             + ", ".join(f"{k}={v/2**30:.2f} GiB" for k, v in
                         basis_live.items()) + "/device")
-        selected_gram, x_chunks = _build_selected_state_gram(
+        x_chunks = _build_selected_rows(
             source=source, meta=meta, mesh_xy=mesh_xy,
             band_start=b_start, band_count=nb,
             selected_states=selected, rank_carrier=rank,
             stream=basis_stream, groups=x_groups, fft_rows=x_fft,
             log_fn=log_fn)
+        projection = _build_physical_projection(
+            source=source, meta=meta, mesh_xy=mesh_xy,
+            rank_carrier=rank, x_chunks=x_chunks,
+            stream=basis_stream, k_tile=k_tile, log_fn=log_fn)
+        del x_chunks
+        # The pivots are states of Psi, so their rows of Psi X^H are X X^H:
+        # the Gram needs no pass of its own.
+        selected_gram = _selected_gram_from_projection(
+            projection, selected_states=selected, rank_carrier=rank,
+            mesh_xy=mesh_xy)
 
         batch_face = NamedSharding(mesh_xy, P(None, 'x', 'y'))
 
@@ -1010,11 +1022,10 @@ def fit_galerkin_basis(
             f"  [qrcp] selected-state min diag(L)="
             f"{float(min_chol_diag):.6e}")
 
-        ctilde = _build_physical_coefficients(
-            source=source, meta=meta, mesh_xy=mesh_xy, band_count=nb,
-            rank_carrier=rank, factor=L, x_chunks=x_chunks,
-            stream=basis_stream, k_tile=k_tile, log_fn=log_fn)
-        del x_chunks
+        ctilde = jax.jit(_coefficients_from_projection,
+                         in_shardings=(rep, rep), out_shardings=rep)(
+                             projection, L)
+        del projection
 
     # Centroids enter only here, as evaluation points of the already-fixed
     # global basis.  This is the canonical WFN centroid loader and therefore
@@ -1061,56 +1072,6 @@ def fit_galerkin_basis(
     return basis
 
 
-
-
-def _make_fold_G_kernel(rank_, mesh_, sharding_q_, grid_xy_):
-    """Add one already-bounded, r-sharded ``Q_chunk Q_chunk†`` to G.
-
-    The caller owns the zeta-style outer-r loop and therefore never hands this
-    executable Q over all ``r_tot``.  Each device forms the Gram contribution
-    from its unique local-r shard; the established two-stage
-    ``psum_scatter`` sums those shards while distributing matrix rows and
-    columns onto ``P('x','y')``.
-    """
-    key = (id(mesh_), int(rank_), tuple(sharding_q_.spec),
-           tuple(grid_xy_.spec))
-    fn = _FOLD_G_KERNELS.get(key)
-    if fn is not None:
-        return fn
-
-    from runtime.padding import authenticate_padded_axis
-    authenticate_padded_axis(
-        rank_, rank_, mesh_, name="Galerkin rank carrier",
-        specs=((P('x', None), 0), (P(None, 'y'), 1)))
-
-    @partial(
-        shard_map,
-        mesh=mesh_,
-        in_specs=(sharding_q_.spec, P('x', 'y')),
-        out_specs=P('x', 'y'),
-        check_vma=False,
-    )
-    def _fold_local(Q_local, G_local):
-        partial = jnp.einsum(
-            'asr,bsr->ab', Q_local, jnp.conj(Q_local),
-            optimize=True)
-        partial = jax.lax.psum_scatter(
-            partial, 'x', scatter_dimension=0, tiled=True)
-        partial = jax.lax.psum_scatter(
-            partial, 'y', scatter_dimension=1, tiled=True)
-        return G_local + partial
-
-    fn = jax.jit(
-        _fold_local,
-        donate_argnums=(1,),
-        in_shardings=(sharding_q_, grid_xy_),
-        out_shardings=grid_xy_,
-    )
-    _FOLD_G_KERNELS[key] = fn
-    return fn
-
-
-_FOLD_G_KERNELS: dict = {}
 _SELECTED_FILL_KERNELS: dict = {}
 _SELECTED_ZERO_KERNELS: dict = {}
 _SKETCH_RANDOM_KERNELS: dict = {}
@@ -1413,20 +1374,19 @@ def _make_rows_place_kernel(
     return fn
 
 
-def _build_selected_state_gram(
+def _build_selected_rows(
         *, source, meta, mesh_xy: Mesh, band_start: int, band_count: int,
         selected_states, rank_carrier: int, stream, groups: int,
         fft_rows: int, log_fn):
-    """Exact physical ``X X^H`` and the resident r-chunked rows ``X``.
+    """The resident r-chunked selected rows ``X``.
 
     Only the pivots are read, each transformed once.  ``X`` chunks (rows in
     pivot order, exact-null carrier rows) stay on the product-r layout for
-    the projection pass.
+    the projection pass, whose pivot rows are ``X X^H``.
     """
     nspinor = int(meta.nspinor)
     product_r_spec = P(None, None, None, ('y', 'x'))
     row_layout = NamedSharding(mesh_xy, P(None, None, ('y', 'x')))
-    face = NamedSharding(mesh_xy, P('x', 'y'))
     rep = NamedSharding(mesh_xy, P())
     r_divisor = spec_divisor(mesh_xy, row_layout.spec, axis=2)
     selected = np.asarray(selected_states, dtype=np.int64)
@@ -1458,22 +1418,37 @@ def _build_selected_state_gram(
                     slab, dest, active, x_chunks[r_idx])
             del slab
         del rows, row_k
-
-    @partial(jax.jit, out_shardings=face)
-    def _zeros_face():
-        return jnp.zeros(
-            (int(rank_carrier), int(rank_carrier)), dtype=jnp.complex128)
-
-    gram = _zeros_face()
-    fold = _make_fold_G_kernel(rank_carrier, mesh_xy, row_layout, face)
-    for x in x_chunks:
-        gram = fold(x, gram)
-    jax.block_until_ready(gram)
+    jax.block_until_ready(x_chunks)
     log_fn(
-        f"  Exact selected-state Gram: {len(selected)} selected rows in "
+        f"  Selected rows X: {len(selected)} selected rows in "
         f"{groups} group(s), {len(x_chunks)} r chunk(s): "
         f"{time.time()-t0:.2f}s")
-    return gram, x_chunks
+    return x_chunks
+
+
+def _selected_gram_from_projection(projection, *, selected_states,
+                                   rank_carrier: int, mesh_xy: Mesh):
+    """``X X^H`` as the pivot rows of ``Psi X^H``, on the matrix face.
+
+    Row ``s = k*nb + b`` of the stacked projection is ``<psi_s, x_a>`` and
+    the pivots are such states, so ``(Psi X^H)[selected] = X X^H`` up to
+    summation order.  Carrier pad rows are exact zeros, as in ``X``.
+    """
+    selected = np.asarray(selected_states, dtype=np.int64)
+    nk, nb, rank = (int(v) for v in projection.shape)
+    if rank != int(rank_carrier):
+        raise ValueError(
+            f"_selected_gram_from_projection: projection rank {rank} is not "
+            f"the carrier {rank_carrier}")
+    face = NamedSharding(mesh_xy, P('x', 'y'))
+
+    @partial(jax.jit, in_shardings=NamedSharding(mesh_xy, P()),
+             out_shardings=face)
+    def _pick(proj):
+        rows = proj.reshape(nk * nb, rank)[jnp.asarray(selected)]
+        return jnp.pad(rows, ((0, rank - selected.size), (0, 0)))
+
+    return _pick(projection)
 
 
 def _solve_selected_basis_rows(factor, selected_rows):
@@ -1911,10 +1886,10 @@ def _coefficients_from_projection(projection, factor):
     return jnp.conj(c_h).T.reshape(nk, nb, rank)
 
 
-def _build_physical_coefficients(
-        *, source, meta, mesh_xy: Mesh, band_count: int, rank_carrier: int,
-        factor, x_chunks, stream, k_tile: int, log_fn):
-    """Stream every state once for ``C = (Psi X^H) L^-H``.
+def _build_physical_projection(
+        *, source, meta, mesh_xy: Mesh, rank_carrier: int,
+        x_chunks, stream, k_tile: int, log_fn):
+    """Stream every state once for the replicated ``Psi X^H``.
 
     Band chunks outside, r chunks inside: each band chunk is transformed
     once over the whole grid and contracted chunk by chunk against the
@@ -1924,7 +1899,6 @@ def _build_physical_coefficients(
     nspinor = int(meta.nspinor)
     p = int(mesh_xy.size)
     band_carrier = int(source.band_chunk_carrier)
-    rep = NamedSharding(mesh_xy, P())
     acc_layout = NamedSharding(mesh_xy, P(('x', 'y'), None, None))
 
     @partial(jax.jit, out_shardings=acc_layout)
@@ -1954,16 +1928,13 @@ def _build_physical_coefficients(
         tuple(chunks), logical_widths=widths, nk=nk,
         rank=rank_carrier, mesh_xy=mesh_xy)
     del chunks
-    out = jax.jit(_coefficients_from_projection,
-                  in_shardings=(rep, rep), out_shardings=rep)(
-                      projection, factor)
-    jax.block_until_ready(out)
+    jax.block_until_ready(projection)
     log_fn(
-        f"  Physical C=(Psi X^H) L^-H projection: "
+        f"  Physical projection Psi X^H: "
         f"{len(source.band_chunk_ranges)} band chunk(s) x "
         f"{len(stream.r_chunk_ranges)} r chunk(s), k_tile={k_tile}: "
         f"{time.time()-t0:.2f}s")
-    return out
+    return projection
 
 
 def _basis_at_nodes_from_selected_states(
