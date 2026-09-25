@@ -235,6 +235,10 @@ def test_stage_order_and_backend_choice(monkeypatch):
     plan = _check(x, (54, 54, 9), (1, 2, 3), sign=-1, in_sup=sup,
                   kind="NVIDIA A100-SXM4-40GB")
     assert plan.stages == [(3, "fft", 9, 9), (2, "gemm", 27, 54), (1, "gemm", 27, 54)]
+    # a support that lists the whole axis in order is a full axis (the FFT on A100)
+    full = LocalFourierPlan((54, 80), (-2, -1), sign=-1, out_support={-2: np.arange(54), -1: np.arange(80)},
+                            device_kind="NVIDIA A100-SXM4-40GB")
+    assert [s[1] for s in full.stages] == ["fft", "fft"]
 
 
 @pytest.mark.parametrize("kind", BACKENDS)

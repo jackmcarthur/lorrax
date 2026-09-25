@@ -199,6 +199,13 @@ class LocalFourierPlan:
             if set(sup) - set(axes):
                 raise ValueError(f"LocalFourierPlan: {name} keys {sorted(sup)} "
                                  f"are not all in axes {axes}")
+        # A support listing the whole axis in order is no support: that axis
+        # is full, and a full axis takes the full-axis row (A100: the FFT).
+        n_of = dict(zip(axes, extents))
+        for sup in (in_support, out_support):
+            for ax in [a for a, idx in sup.items()
+                       if np.array_equal(np.asarray(idx).ravel() % n_of[a], np.arange(n_of[a]))]:
+                del sup[ax]
         if device_kind is None:
             device_kind = (mesh.devices.flat[0] if mesh is not None else jax.devices()[0]).device_kind
         self.device_kind = str(device_kind)
