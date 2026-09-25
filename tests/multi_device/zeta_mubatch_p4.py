@@ -157,16 +157,17 @@ def run_case(case, fx, mesh, scratch, vertices=(0,)):
     tabs = (tuple(put_rep(a) for a in cyl), tuple(put_rep(a) for a in zt))
     rank = NamedSharding(mesh, P(("x", "y")))
 
-    def run_g(tabs, placement="host", c_out=None):
+    def run_g(tabs, placement="host", c_out=None, n_blk=1):
         """One store per channel; returns [{layout: Z}] in ``vertices`` order.
-        ``c_out=1`` streams each owner's rows through the planes one at a time."""
+        ``c_out=1, n_blk=2`` streams each owner's rows through the planes one
+        at a time, the plane axis in two blocks."""
         ob = zmb.owner_orbit_batches(plan, mu_pad, 4,
                                      c_target=max(1, int(fx["b_target"]) // 4))
         kern = zmb.make_route_g_kernel(
             mesh=mesh, kgrid=kgrid, fft_grid=fg, ns=ns, b=ob.b,
             q_sel=q_sel, q_axis=q_axis, q_neg=q_neg if charge else None, qvec_frac=qf,
             n_col=int(cyl[0].shape[1]), n_s=int(cyl[0].shape[2]), n_pg=2, axis=axis,
-            n_src=n_par, vertices=vertices, c_out=c_out)
+            n_src=n_par, vertices=vertices, c_out=c_out, n_blk=n_blk)
         stores = [zmb.ZStore(mesh=mesh, q_axis=q_axis, mu_pad=mu_pad, g_axis=g_axis,
                              b=ob.b, placement=placement, n_batch=ob.n_batch,
                              packed_from_slot=ob.slot_of_packed,
@@ -187,17 +188,17 @@ def run_case(case, fx, mesh, scratch, vertices=(0,)):
             zs.close()
         return out
 
-    for placement, c_out in (("host", None), ("disk", None), ("host", 1)):
-        for v, ref, got_v in zip(vertices, refs, run_g(tabs, placement, c_out)):
+    for placement, c_out, n_blk in (("host", None, 1), ("disk", None, 1), ("host", 1, 2)):
+        for v, ref, got_v in zip(vertices, refs, run_g(tabs, placement, c_out, n_blk)):
             for lay, got in got_v.items():
                 e = parity._rel(got, ref)
                 worst = max(worst, e)
                 if jax.process_index() == 0:
                     print(f"{TAG} {case:<11s} μ_L={v} store={placement:<5s} read={lay} "
-                          f"c_out={c_out}  rel={e:.2e}", flush=True)
+                          f"c_out={c_out} n_blk={n_blk}  rel={e:.2e}", flush=True)
                 if not e <= TOL:
                     raise SystemExit(f"{TAG} FAIL {case} μ_L={v} {placement}/{lay} "
-                                     f"c_out={c_out}: {e:.3e}")
+                                     f"c_out={c_out} n_blk={n_blk}: {e:.3e}")
     bad = (tabs[0], (tabs[1][0], put_rep(zt[1] + 1), tabs[1][2]))   # axis index off by one
     red_g = parity._rel(run_g(bad)[0]["q"], refs[0])
     if jax.process_index() == 0:

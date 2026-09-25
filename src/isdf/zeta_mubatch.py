@@ -205,7 +205,8 @@ def _spin_sandwich(U, d):
 def make_route_g_kernel(*, mesh: Mesh, kgrid, fft_grid, ns: int, b: int,
                         q_sel, q_axis, q_neg, qvec_frac, n_col: int, n_s: int,
                         n_pg: int, axis: int, n_src: int, vertices=(0,),
-                        c_out: int | None = None, stop_at: str | None = None):
+                        c_out: int | None = None, n_blk: int = 1,
+                        stop_at: str | None = None):
     """Compile-once executable for one μ batch on route G.
 
     Returns ``fn(psi_bar, w_l, w_r, kvecs, g3, xmu, live, cyl, zt, unf, lt) -> rows``,
@@ -235,7 +236,9 @@ def make_route_g_kernel(*, mesh: Mesh, kgrid, fft_grid, ns: int, b: int,
     group, the k-convolution) scales with ``c_out``, the planned width
     (:func:`gw.gflat_memory_model.route_g_plane_chunk`).  A chunk unfolds its
     rows from the owner's whole-orbit pair projectors, so no row crosses an
-    owner.
+    owner.  The D cylinder is built ``n_blk`` blocks of planes at a time
+    (default 1: all planes); each block's axis DFT lands on its own planes,
+    and the unfold and cylinder gather are redone per block.
 
     Operands: ``psi_bar (n_src, nb, ns, ngk_pad)`` = conj ψ(G) of the raw
     parents, G sharded ``P(None, None, None, ('x','y'))``; ``g3 (n_src,
@@ -273,7 +276,9 @@ def make_route_g_kernel(*, mesh: Mesh, kgrid, fft_grid, ns: int, b: int,
     n_a, (n_b, n_c), (b_ax, c_ax) = _plane_geometry(fft_grid, axis)
     ps = n_b * n_c
     pl_ax = padded_axis(n_a, int(n_pg), name="route-G plane groups")
-    n_grp = pl_ax.carrier // int(n_pg)
+    n_blk = int(n_blk)
+    n_gb = -(-(pl_ax.carrier // int(n_pg)) // n_blk)      # plane groups per block
+    n_pb = n_gb * int(n_pg)                              # planes per block
     q_sel = np.asarray(q_sel, dtype=np.int32)
     Q = int(q_axis.logical)
     # None: equal L/R windows, the pair equations are already symmetric.
@@ -297,7 +302,7 @@ def make_route_g_kernel(*, mesh: Mesh, kgrid, fft_grid, ns: int, b: int,
            hash(q_sel.tobytes()), q_axis,
            None if q_neg is None else hash(q_neg.tobytes()), hash(qv.tobytes()),
            int(n_col), int(n_s), int(n_pg), int(axis), int(n_src), vertices, c_out,
-           stop_at)
+           n_blk, stop_at)
     hit = _kernel_cache.get(key)
     if hit is not None:
         return hit
@@ -337,78 +342,82 @@ def make_route_g_kernel(*, mesh: Mesh, kgrid, fft_grid, ns: int, b: int,
         D = jnp.concatenate([D, jnp.zeros(D.shape[:4] + (1,), D.dtype)], axis=-1)
         ngk1 = int(D.shape[-1])
 
-        # The axis DFT of every k onto all planes, once per batch: the D
-        # cylinder (k, plane, s, μ, s, column), plane axis padded to whole groups.
+        # The axis DFT of every k onto the planes, a block at a time: the D
+        # cylinder (k, plane, s, μ, s, column), plane axis padded to whole blocks.
         pa_all = jnp.exp(-2j * jnp.pi * cax.astype(jnp.float64)[:, None]
-                         * jnp.arange(pl_ax.carrier)[None, :] / n_a)
-        pa_all = pa_all * (jnp.arange(pl_ax.carrier) < n_a)[None, :]
+                         * jnp.arange(n_blk * n_pb)[None, :] / n_a)
+        pa_all = pa_all * (jnp.arange(n_blk * n_pb) < n_a)[None, :]
         n_zc, n_za = int(zc.shape[0]), int(za.shape[0])
 
         def owner_rows(lperm, lL):
             """Z rows of ``c_out`` owned slots from the whole-orbit D."""
-            chk = lambda a: (jnp.zeros((Q, c_out, n_g), jnp.complex128) + jnp.sum(jnp.abs(a)),) * n_v
+            def block(acc, bi):
+                pa = jax.lax.dynamic_slice_in_dim(pa_all, bi * n_pb, n_pb, axis=1)
 
-            def cyl_k(_, k):
-                # the typed unfold of the parent's pair projectors to child k
-                p, s_ = irr[k], sym[k]
-                d = D[p].reshape(ns, 2, c, ns, ngk1)
-                wl = jnp.exp(2j * jnp.pi * (lL[s_].astype(jnp.float64) @ kvecs[p]))
-                d = jnp.take(d, lperm[s_], axis=2) * wl[None, None, :, None, None]
-                d = jnp.take(d, pslot[k], axis=-1) * jnp.conj(phase[k])
-                d = jnp.where(anti[k], jnp.conj(d), d)
-                d = _spin_sandwich(U[k], d)
-                d = jnp.concatenate([d.reshape(ns, 2 * c_out, ns, -1),
-                                     jnp.zeros((ns, 2 * c_out, ns, 1), d.dtype)], -1)
-                cy = jnp.take(d, jnp.clip(ci[k], 0, int(d.shape[-1]) - 1).reshape(-1), axis=-1)
-                cy = cy.reshape(ns, 2 * c_out, ns, n_col, n_s)
-                return None, jnp.einsum('asbcj,jp->pasbc', cy, pa_all)
+                def cyl_k(_, k):
+                    # the typed unfold of the parent's pair projectors to child k
+                    p, s_ = irr[k], sym[k]
+                    d = D[p].reshape(ns, 2, c, ns, ngk1)
+                    wl = jnp.exp(2j * jnp.pi * (lL[s_].astype(jnp.float64) @ kvecs[p]))
+                    d = jnp.take(d, lperm[s_], axis=2) * wl[None, None, :, None, None]
+                    d = jnp.take(d, pslot[k], axis=-1) * jnp.conj(phase[k])
+                    d = jnp.where(anti[k], jnp.conj(d), d)
+                    d = _spin_sandwich(U[k], d)
+                    d = jnp.concatenate([d.reshape(ns, 2 * c_out, ns, -1),
+                                         jnp.zeros((ns, 2 * c_out, ns, 1), d.dtype)], -1)
+                    cy = jnp.take(d, jnp.clip(ci[k], 0, int(d.shape[-1]) - 1).reshape(-1), axis=-1)
+                    cy = cy.reshape(ns, 2 * c_out, ns, n_col, n_s)
+                    return None, jnp.einsum('asbcj,jp->pasbc', cy, pa)
 
-            _, Fa = jax.lax.scan(cyl_k, None, jnp.arange(nk, dtype=jnp.int32), unroll=1)
-            if stop_at == 'planes':
-                return chk(Fa)
+                _, Fa = jax.lax.scan(cyl_k, None, jnp.arange(nk, dtype=jnp.int32), unroll=1)
+                if stop_at == 'planes':
+                    return tuple(a + jnp.sum(jnp.abs(Fa)) for a in acc), None
 
-            def group(acc, gi):
-                a0 = gi * n_pg + jnp.arange(n_pg)
-                on = (a0 < n_a).astype(jnp.float64)
-                F = jax.lax.dynamic_slice_in_dim(Fa, gi * n_pg, n_pg, axis=1)
-                # Empty plane cells carry the out-of-range column n_col: a zero
-                # fill in the gather itself, no padded copy of the cylinder.
-                st = jnp.take(F, pfc, axis=-1, mode='fill', fill_value=0).reshape(
-                    nk, n_pg, ns, 2 * c_out, ns, n_b, n_c)
-                d = local_fftn3(st, axes=(-2, -1), norm='backward')        # Σ e^{-iG·r}
-                bl = jnp.exp(-2j * jnp.pi * (
-                    kch[:, axis][:, None, None] * a0[None, :, None] / n_a
-                    + kch[:, b_ax][:, None, None] * ib[None, None, :] / n_b
-                    + kch[:, c_ax][:, None, None] * ic[None, None, :] / n_c)) / np.sqrt(N)
-                qin = jnp.exp(-2j * jnp.pi * (jnp.asarray(qv[:, b_ax])[:, None] * ib[None, :] / n_b
-                                              + jnp.asarray(qv[:, c_ax])[:, None] * ic[None, :] / n_c))
-                # The axis transform onto the ζ cylinder: one matmul over the
-                # group's planes, e^{-2πi (q_a + G_a) a/n_a}.
-                E = jnp.exp(-2j * jnp.pi * (jnp.asarray(qv[:, axis])[:, None, None]
-                                            + za.astype(jnp.float64)[None, None, :])
-                            * a0[None, :, None] / n_a) * on[None, :, None]   # (Q, n_pg, n_za)
-                d = d.reshape(nk, n_pg, ns, 2 * c_out, ns, ps)
-                out = []
-                for pair_kernel, acc_v in zip(pair_kernels, acc):
-                    # The k-convolution reads d where the FFT left it: the Bloch
-                    # phase, the L | R split of the 2c slots and the vertex happen
-                    # on its load.
-                    Z = pair_kernel(d, bl)                                  # (nk, c, n_pg·ps)
-                    if stop_at == 'kconv':
-                        out.append(acc_v + jnp.sum(jnp.abs(Z)))
-                        continue
-                    if q_neg is not None:
-                        Z = Z + jnp.conj(jnp.take(Z, jnp.asarray(q_neg), axis=0))
-                    Z = jnp.take(Z, jnp.asarray(q_sel), axis=0).reshape(Q, c_out, n_pg, ps)
-                    Z = (Z * qin[:, None, None, :]).reshape(Q, c_out, n_pg, n_b, n_c)
-                    Fz = local_fftn3(Z, axes=(-2, -1), norm='backward').reshape(Q, c_out, n_pg, ps)
-                    out.append(acc_v + jnp.einsum('qcpj,qpg->qcjg', jnp.take(Fz, zc, axis=-1), E))
-                return tuple(out), None
+                def group(acc, gi):
+                    a0 = (bi * n_gb + gi) * n_pg + jnp.arange(n_pg)
+                    on = (a0 < n_a).astype(jnp.float64)
+                    F = jax.lax.dynamic_slice_in_dim(Fa, gi * n_pg, n_pg, axis=1)
+                    # Empty plane cells carry the out-of-range column n_col: a zero
+                    # fill in the gather itself, no padded copy of the cylinder.
+                    st = jnp.take(F, pfc, axis=-1, mode='fill', fill_value=0).reshape(
+                        nk, n_pg, ns, 2 * c_out, ns, n_b, n_c)
+                    d = local_fftn3(st, axes=(-2, -1), norm='backward')        # Σ e^{-iG·r}
+                    bl = jnp.exp(-2j * jnp.pi * (
+                        kch[:, axis][:, None, None] * a0[None, :, None] / n_a
+                        + kch[:, b_ax][:, None, None] * ib[None, None, :] / n_b
+                        + kch[:, c_ax][:, None, None] * ic[None, None, :] / n_c)) / np.sqrt(N)
+                    qin = jnp.exp(-2j * jnp.pi * (jnp.asarray(qv[:, b_ax])[:, None] * ib[None, :] / n_b
+                                                  + jnp.asarray(qv[:, c_ax])[:, None] * ic[None, :] / n_c))
+                    # The axis transform onto the ζ cylinder: one matmul over the
+                    # group's planes, e^{-2πi (q_a + G_a) a/n_a}.
+                    E = jnp.exp(-2j * jnp.pi * (jnp.asarray(qv[:, axis])[:, None, None]
+                                                + za.astype(jnp.float64)[None, None, :])
+                                * a0[None, :, None] / n_a) * on[None, :, None]   # (Q, n_pg, n_za)
+                    d = d.reshape(nk, n_pg, ns, 2 * c_out, ns, ps)
+                    out = []
+                    for pair_kernel, acc_v in zip(pair_kernels, acc):
+                        # The k-convolution reads d where the FFT left it: the Bloch
+                        # phase, the L | R split of the 2c slots and the vertex happen
+                        # on its load.
+                        Z = pair_kernel(d, bl)                                  # (nk, c, n_pg·ps)
+                        if stop_at == 'kconv':
+                            out.append(acc_v + jnp.sum(jnp.abs(Z)))
+                            continue
+                        if q_neg is not None:
+                            Z = Z + jnp.conj(jnp.take(Z, jnp.asarray(q_neg), axis=0))
+                        Z = jnp.take(Z, jnp.asarray(q_sel), axis=0).reshape(Q, c_out, n_pg, ps)
+                        Z = (Z * qin[:, None, None, :]).reshape(Q, c_out, n_pg, n_b, n_c)
+                        Fz = local_fftn3(Z, axes=(-2, -1), norm='backward').reshape(Q, c_out, n_pg, ps)
+                        out.append(acc_v + jnp.einsum('qcpj,qpg->qcjg', jnp.take(Fz, zc, axis=-1), E))
+                    return tuple(out), None
+
+                acc, _ = jax.lax.scan(group, acc, jnp.arange(n_gb, dtype=jnp.int32), unroll=1)
+                return acc, None
 
             acc, _ = jax.lax.scan(
-                group, (jnp.zeros((Q, c_out, n_zc, n_za), jnp.complex128),) * n_v,
-                jnp.arange(n_grp, dtype=jnp.int32), unroll=1)
-            if stop_at == 'kconv':
+                block, (jnp.zeros((Q, c_out, n_zc, n_za), jnp.complex128),) * n_v,
+                jnp.arange(n_blk, dtype=jnp.int32), unroll=1)
+            if stop_at in ('planes', 'kconv'):
                 return tuple(jnp.zeros((Q, c_out, n_g), jnp.complex128) + jnp.sum(jnp.abs(a))
                              for a in acc)
             return tuple(jnp.take_along_axis(a.reshape(Q, c_out, n_zc * n_za),
