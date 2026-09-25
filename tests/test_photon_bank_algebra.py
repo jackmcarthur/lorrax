@@ -207,13 +207,14 @@ def check_photon_bank_store(mesh, path, *, resident=False):
             rows=raw[ids][...,indices(sector[0]),:][...,indices(sector[1])]
             np.testing.assert_array_equal(gather_to_host(got['Wc']),rows)
             np.testing.assert_array_equal(gather_to_host(got['M1']),2*rows[:,0])
-    # Static contact: stored beside the payload, and (resident) published for later maps.
+    # Static contact: stored beside the payload, and published for later maps in
+    # its own small file on both tiers (never the bank itself).
     contact = {name: put(raw[:1,0]*(k+2)) for k, name in enumerate(('Pi_grid','Drude','TT_contact'))}
     store.write_bank_contact(path, contact, mesh_xy=mesh)
-    if resident:
-        reference = store.write_static_reference(reference_path, contact, header=header, mesh_xy=mesh)
-    else:
-        reference = dict(path=str(path), identity=identity)
+    if not resident:
+        from pathlib import Path
+        reference_path = Path(reference_path).with_name("photon_static_reference.h5")
+    reference = store.write_static_reference(reference_path, contact, header=header, mesh_xy=mesh)
     record, arrays = store.read_static_reference(reference, n=n, mesh_xy=mesh)
     assert record['photon_layout'] == header['photon_layout'] and record['commit']
     for array, name in zip(arrays, ('Pi_grid','Drude','TT_contact')):

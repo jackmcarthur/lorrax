@@ -1507,15 +1507,14 @@ def compute_photon_bank(wfns, wfns_transverse, meta, config, *, mesh_xy, sym,
             grid, drude, contact = photon_static_contact(wfns, meta, mesh_xy=mesh_xy,
                 layout=layout, vertex=vertex, occupation_state=occupation_state,
                 sample_plan=sample_plan, execute=execute, receipt=receipt)
-            if isinstance(bank["path"], ResidentBankPayload):
-                # The resident payload is released after this map's constructor;
-                # later maps freeze the contact from its own small file.
-                reference = write_static_reference(
-                    Path(bank["path"].label).with_name("photon_static_reference.h5"),
-                    dict(Pi_grid=grid, Drude=drude, TT_contact=contact),
-                    header=header, mesh_xy=mesh_xy)
-            else:
-                reference = {key: bank[key] for key in ("path", "identity")}
+            # Later maps freeze this contact from its own small file, written on
+            # both tiers beside (not inside) this map's scratch generation.
+            generation = Path(bank["path"].label if isinstance(bank["path"], ResidentBankPayload)
+                              else bank["path"]).parent
+            reference = write_static_reference(
+                generation.with_name(generation.name + "_photon_static_reference.h5"),
+                dict(Pi_grid=grid, Drude=drude, TT_contact=contact),
+                header=header, mesh_xy=mesh_xy)
         else:
             initial, (grid, drude, contact) = read_static_reference(reference, n=n, mesh_xy=mesh_xy)
             for key in ("photon_layout", "photon_centroid_digests"):
