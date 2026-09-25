@@ -156,9 +156,11 @@ class LocalFourierPlan:
                 take.append(("take", ax, o_idx.astype(np.int32)))
             self.stages.append((ax, "fft", i_idx.size, o_idx.size))
         # Shrinking GEMMs first, then the FFT group (its embeddings, one
-        # multidimensional transform, its restrictions), expanding GEMMs last:
-        # stable in the given axis order within a ratio.
-        order = sorted(range(len(gemm)), key=lambda s: gemm[s][0])
+        # multidimensional transform, its restrictions), expanding GEMMs last;
+        # within a ratio the last-listed axis first, so a chain of GEMMs
+        # rotates through the trailing axes without transposes (__call__).
+        rank = {ax: -i for i, ax in enumerate(axes)}       # minor-most listed axis first
+        order = sorted(range(len(gemm)), key=lambda s: (gemm[s][0], rank[gemm[s][1]]))
         pre = [("gemm", gemm[s][1], gemm[s][2]) for s in order if gemm[s][0] < 1]
         post = [("gemm", gemm[s][1], gemm[s][2]) for s in order if gemm[s][0] >= 1]
         mid = embed + ([("fft", tuple(fft), None)] if fft else []) + take
@@ -178,23 +180,41 @@ class LocalFourierPlan:
                 raise ValueError(f"LocalFourierPlan: axis {ax} of x has extent "
                                  f"{x.shape[ax]}, the plan expects {k}")
         fft = local_fftn3 if self.sign < 0 else local_ifftn3
-        for kind, ax, A in self._ops:
-            if kind == "gemm":
-                x = _apply_axis_matrix(x, A, ax)
-            elif kind == "fft":
-                x = fft(x, axes=ax, norm=self.norm)
-            elif kind == "embed":       # one gather; out-of-range K reads zero
-                x = jnp.take(x, jnp.asarray(A), axis=ax, mode="fill", fill_value=0)
+        nd = x.ndim
+        phys = list(range(nd))          # phys[p]: the logical axis stored at position p
+        for i, (kind, ax, A) in enumerate(self._ops):
+            if kind == "fft":
+                x = fft(x, axes=tuple(phys.index(a % nd) for a in ax), norm=self.norm)
+                continue
+            a = ax % nd
+            p = phys.index(a)
+            if kind == "embed":         # one gather; out-of-range K reads zero
+                x = jnp.take(x, jnp.asarray(A), axis=p, mode="fill", fill_value=0)
+            elif kind == "take":
+                x = jnp.take(x, jnp.asarray(A), axis=p)
             else:
-                x = jnp.take(x, jnp.asarray(A), axis=ax)
+                later = any(k == "gemm" for k, _, _ in self._ops[i + 1:])
+                x, phys = _apply_axis_matrix(x, jnp.asarray(A), p, phys, rotate=later)
+        if phys != sorted(phys):
+            x = jnp.transpose(x, [phys.index(a) for a in range(nd)])
         return x
 
 
-def _apply_axis_matrix(x, A: np.ndarray, ax: int):
-    """``y[..., j', ...] = Σ_j A[j', j] x[..., j, ...]`` on axis ``ax``."""
-    ax = ax % x.ndim
-    A = jnp.asarray(A)
-    if ax == x.ndim - 1:        # (rest, K) @ Aᵀ: output axis stays minor
-        return jax.lax.dot_general(x, A, (((ax,), (1,)), ((), ())))
-    y = jax.lax.dot_general(A, x, (((1,), (ax,)), ((), ())))   # (N', rest...)
-    return y if ax == 0 else jnp.moveaxis(y, 0, ax)
+def _apply_axis_matrix(x, A, p: int, phys: list, *, rotate: bool):
+    """``Σ_j A[j', j] x[..., j, ...]`` over physical axis ``p`` as ONE GEMM.
+
+    Contracting the major or the minor axis needs no transpose; the new axis
+    is written major (``A · Xᵀ``), so the next-minor axis becomes minor for the
+    following stage, unless this is the last GEMM on the minor axis, which
+    writes it back in place (``X · Aᵀ``).  A middle axis is first moved minor.
+    Returns the result and its physical axis order.
+    """
+    nd = x.ndim
+    if 0 < p < nd - 1:
+        x = jnp.moveaxis(x, p, -1)
+        phys = phys[:p] + phys[p + 1:] + [phys[p]]
+        p = nd - 1
+    if p == nd - 1 and not rotate:
+        return jax.lax.dot_general(x, A, (((p,), (1,)), ((), ()))), phys
+    y = jax.lax.dot_general(A, x, (((1,), (p,)), ((), ())))
+    return y, [phys[p]] + phys[:p] + phys[p + 1:]

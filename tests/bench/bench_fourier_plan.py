@@ -12,8 +12,10 @@ Parts (``--part``):
   1d      full N→N on one axis, last axis (contiguous lines) and first axis
           (batch minor), library FFT vs stored-matrix GEMM, three batches.
   comp    full 2-D/3-D composites: one multidimensional jnp.fft vs all-GEMM.
-  sparse  restricted axes: K→N GEMM vs zero-embed + FFT (+ restrict), 1-D and
-          composite box sphere→box / box→sphere.
+  sparse  one restricted axis (K = N/2, N/4): round trips K→N→K, the plan's FFT
+          arm (gather embed + FFT, FFT + take) vs its GEMM arm.
+  sparse_comp  2-D/3-D sphere-box round trips: box FFT, staged FFTs, GEMM
+          first stage, all-GEMM.
 Output: one JSON object per arm on stdout (and ``--out`` file).
 """
 
@@ -27,6 +29,9 @@ import sys
 import time
 
 os.environ.setdefault("JAX_ENABLE_X64", "1")
+# Production XLA flags (the runtime's GPU autotune level), set before jax loads.
+from runtime import _gpu_is_present, set_default_xla_gpu_autotune  # noqa: E402
+set_default_xla_gpu_autotune(platform="gpu" if _gpu_is_present() else "cpu")
 
 import numpy as np
 import jax
@@ -161,16 +166,21 @@ def _round_trip(f_in, f_out):
     return lambda xc: f_out(f_in(xc))
 
 
-def part_sparse(fh):
-    """Round trips compact → full → compact through the plan (in_support, then
-    out_support), FFT arm (gather-embed + FFT, FFT + take) against GEMM arm.
-    ``us`` is per round trip."""
+def _sparse_arms(fh):
     def arms(extents, axes, sup, xc, rec):
         for kind, key in ((FFT, "fft"), (GEMM, "gemm")):
             rec[key] = timeit(chain(_round_trip(plan(extents, axes, kind, in_support=sup),
                                                 plan(extents, axes, kind, out_support=sup))), xc)
         rec["ratio_gemm_over_fft"] = rec["gemm"]["us"] / rec["fft"]["us"]
         emit(rec, fh)
+    return arms
+
+
+def part_sparse(fh):
+    """Round trips compact → full → compact through the plan (in_support, then
+    out_support), FFT arm (gather-embed + FFT, FFT + take) against GEMM arm.
+    ``us`` is per round trip."""
+    arms = _sparse_arms(fh)
 
     for n in SIZES:
         if n < 4:
@@ -182,8 +192,16 @@ def part_sparse(fh):
                 arms((n,), (1,), {1: _centred(n, k)}, xc,
                      {"part": "sparse1d", "n": n, "k": k, "lines": lines,
                       "pass_full": pass_us(xc) * n / k})
-    # composite sphere-box geometry, K = N/2 on every axis
-    for extents, batch in [((24, 24, 24), 64), ((32, 32, 32), 32), ((48, 48, 48), 8),
+
+
+def part_sparse_comp(fh):
+    """Composite sphere-box geometry, K = N/2 on every axis: box FFT (gather
+    embed + one multidimensional FFT + take), tight-box staged FFTs, a GEMM
+    first stage on the minor axis, and all-GEMM.  ``us`` is per round trip."""
+    arms = _sparse_arms(fh)
+    for extents, batch in [((12, 12, 12), 500), ((16, 16, 16), 200), ((24, 24), 5_000),
+                           ((32, 32), 3_000), ((24, 24, 24), 64), ((32, 32, 32), 32),
+                           ((48, 48, 48), 8),
                            ((54, 54), 27_648), ((54, 54), 2_000), ((72, 72), 1_000),
                            ((80, 80), 12_000), ((80, 80), 1_000), ((96, 96, 96), 4),
                            ((128, 128), 500), ((64, 64, 64), 8)]:
@@ -211,14 +229,16 @@ def part_sparse(fh):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--part", required=True, choices=["1d", "comp", "sparse"])
+    ap.add_argument("--part", required=True, choices=["1d", "comp", "sparse", "sparse_comp"])
     ap.add_argument("--out")
     a = ap.parse_args()
     dev = jax.devices()[0]
     print(json.dumps({"device_kind": dev.device_kind, "platform": dev.platform,
-                      "jax": jax.__version__}), flush=True)
+                      "jax": jax.__version__, "XLA_FLAGS": os.environ.get("XLA_FLAGS")}),
+          flush=True)
     fh = open(a.out, "a") if a.out else None
-    {"1d": part_1d, "comp": part_comp, "sparse": part_sparse}[a.part](fh)
+    {"1d": part_1d, "comp": part_comp, "sparse": part_sparse,
+     "sparse_comp": part_sparse_comp}[a.part](fh)
 
 
 if __name__ == "__main__":
