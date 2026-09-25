@@ -1266,53 +1266,38 @@ def _assert_index_mask_matches_classes(inputs: SCInputs, classes) -> None:
 
 def _make_kshard_eigh(mesh_xy: Mesh, *, eigvalsh_only: bool,
                       u_spec: P | None = None):
-    """Return a jit'd eigh that briefly k-shards the input over the mesh
-    so each device only does its slice of the per-k diagonalisations,
-    then allgathers the eigenvalues (and U if requested) back to
-    replicated.  Pure perf hint — the math is identical to running
-    ``vmap(eigh)`` on the replicated input.
+    """Return the SC's per-k eigensolver on ``mesh_xy``.
 
-    ``nk`` NEED NOT divide ``mesh_xy.size``.  ``with_sharding_constraint``
-    is a layout hint and GSPMD shards the k axis unevenly when it has to —
-    some devices simply get one fewer k.  (This docstring previously
-    asserted the opposite; job 7889742 ran the ``sc_on_ibz`` arm green at
-    P=4 with ``nk_irr = 10``, and ``_run_linear_mixing`` calls the
-    eigvalsh kernel on that ``(10, nb, nb)`` carry — ``10 % 4 != 0``.
-    ``dsc_demo/ibz44v.7889742.out:26``.)  What it costs at ``nk <
-    mesh.size`` is idle devices, not a failure.
+    ``E`` returns replicated ascending, and ``U`` (unless
+    ``eigvalsh_only``) at ``u_spec`` — ``None`` replicates it for the host
+    writers, ``qsgw_density.band_rotation_spec()`` keeps it on the 2-D band
+    grid.  The k batch goes through ``distrib_la``'s ``batch_reshard`` route
+    (``qsgw_density.distributed_eigh_bands`` with the distributed backend
+    off): two ``all_to_all`` stage whole matrices over the mesh, each device
+    solves ``nk / P`` of them, and the eigenvalues come back through one
+    all-gather.  No device assembles the whole ``(nk, nb, nb)`` stack of
+    ``H`` whatever layout it arrives in; ``nk`` need not divide the mesh and
+    an indivisible ``nb`` is padded with an inert sentinel and sliced back.
+
+    The eigenvalues are the eigenvalues of the band-grid staged solve, so
+    they can differ from a solve of the unpadded tile in the last ulp.  The
+    replication of ``E`` is the route's enforced output contract (its
+    ``shard_map`` returns it through ``all_gather`` at ``P()``), which the
+    host readers rely on.
     """
-    rep_E = NamedSharding(mesh_xy, P(None, None))
-    # ``u_spec`` chooses where U LANDS.  The SC loop asks for
-    # ``qsgw_density.band_rotation_spec`` (``P(None,'x','y')``, so no rank
-    # holds a full (nb, nb)); the default replicates it and is kept for
-    # ``final_qp_eigenstates``, whose only consumers are host writers.
-    # Parametrised rather than copied: the eigh itself, the k-shard hint
-    # and the hermitisation are identical and must not drift.
-    rep_U = NamedSharding(mesh_xy,
-                          P(None, None, None) if u_spec is None else u_spec)
-    k_shard_3d = NamedSharding(mesh_xy, P(('x', 'y'), None, None))
+    from .qsgw_density import band_rotation_spec, distributed_eigh_bands
 
-    # Replication is an ENFORCED output contract (out_shardings), not a
-    # body hint: at P=4 the trailing with_sharding_constraint was dropped
-    # by the partitioner and the host read local-shard-plus-zeros — 22 of
-    # 29 IBZ rows exactly 0.0 in every eqp snapshot, max|dE| = VBM to six
-    # decimals, and the MP1 mu solved on a three-quarters-zero table
-    # (QUALITY_PATTERNS §4: the optimized HLO is the only ground truth).
-    if eigvalsh_only:
-        @_functools.partial(jax.jit, out_shardings=rep_E)
-        def _f(H):
-            H_k = jax.lax.with_sharding_constraint(H, k_shard_3d)
-            H_h = 0.5 * (H_k + jnp.conj(jnp.swapaxes(H_k, -1, -2)))
-            return jax.vmap(jnp.linalg.eigvalsh)(H_h)
-        return _f
-    else:
-        @_functools.partial(jax.jit, out_shardings=(rep_E, rep_U))
-        def _f(H):
-            H_k = jax.lax.with_sharding_constraint(H, k_shard_3d)
-            H_h = 0.5 * (H_k + jnp.conj(jnp.swapaxes(H_k, -1, -2)))
-            E, U = jax.vmap(jnp.linalg.eigh)(H_h)
-            return E, U
-        return _f
+    placement = (None if u_spec == band_rotation_spec() else NamedSharding(
+        mesh_xy, P(None, None, None) if u_spec is None else u_spec))
+
+    def _f(H):
+        E, U = distributed_eigh_bands(
+            H, mesh=mesh_xy, distrib_la_backend="off",
+            distrib_la_batched_route="batch_reshard")
+        if eigvalsh_only:
+            return E
+        return E, (U if placement is None else jax.device_put(U, placement))
+    return _f
 
 
 # Kernel cache.  The eigh is keyed by ``(mesh, u_spec)`` because ``u_spec``
