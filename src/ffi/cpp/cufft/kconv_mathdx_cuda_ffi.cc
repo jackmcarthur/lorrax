@@ -115,6 +115,8 @@
 #include "../common/mkl_thread_pin.h"
 #include "../common/lrx_async_gather.h"
 #include "../common/nvrtc_build.h"
+#include "kbox_stage.cuh"          // the host half: the k-box launch rule (kbox_plan)
+#include "kbox_stage_src.h"       // the same file as text, embedded into mode 11's NVRTC program
 
 #include <cuda.h>
 #include <cuda_runtime.h>
@@ -529,8 +531,8 @@ extern "C" __global__ void __launch_bounds__(256) lrx_kconv(
         }
     }
 }
-#elif LRX_MODE <= 9
-// Modes 7, 8 and 9 share the unfold load below.
+#elif LRX_MODE <= 9 || LRX_MODE == 11
+// Modes 7, 8, 9 and 11 share the unfold load below.
 // Mode 7: mode 2 on the full-k Green read from its raw parents.  Row r of the
 // convolution is (pair, a, b) = (r / NS^2, (r % NS^2) / NS, r % NS) with pair =
 // x*my + y; U[k, a, x, b, y] is stored spin-major.  When RB holds whole spin
@@ -549,8 +551,10 @@ constexpr bool GROUPED = (RB % SS) == 0;
 // The typed unfold of one (k, x, y) pair (symmetry_maps unfold_isdf_operator,
 // axis-local pair_transpose arm): source row, both endpoint gathers, then
 // (mph * G) * nph, a -1 source being an exact zero; and U_k.
-// (mph * G) * nph, a -1 source being an exact zero; on an antiunitary row the
-// source is the partner tile, or (conj_trs) the product is conjugated.
+// (mph * G) * nph, a -1 source being an exact zero.  On an antiunitary row
+// conj_trs selects the rule: 0 reads the partner tile; 1 conjugates the phased
+// product (a Hermitian interaction); 2 reads conj(G) from G itself (a Green of
+// real weights, whose partner IS conj(G): no partner tile exists).
 __device__ __forceinline__ void lrx_unfold_pair(
     const lrx_c2* __restrict__ gp, const lrx_c2* __restrict__ gt, const UnfoldTab& t,
     int k, long long xx, long long yy, lrx_c2 (&g)[NS][NR], lrx_c2 (&u)[NS][NS],
@@ -560,8 +564,9 @@ __device__ __forceinline__ void lrx_unfold_pair(
     const lrx_c2* __restrict__ spin = reinterpret_cast<const lrx_c2*>(t.spin);
     const lrx_c2* __restrict__ spin_r =
         reinterpret_cast<const lrx_c2*>(t.spin_r ? t.spin_r : t.spin);
-    const bool anti = t.trs[k] != 0, conj_row = anti && t.conj_trs;
-    const lrx_c2* src = ((anti && !t.conj_trs) ? gt : gp) + (long long)t.row[k] * t.ml * t.nl;
+    const bool anti = t.trs[k] != 0, conj_row = anti && t.conj_trs == 1;
+    const bool conj_src = anti && t.conj_trs == 2;
+    const lrx_c2* src = ((anti && t.conj_trs == 0) ? gt : gp) + (long long)t.row[k] * t.ml * t.nl;
 #pragma unroll
     for (int c = 0; c < NS; ++c) {
         const long long li = (long long)k * t.ml + xx * NS + c;
@@ -573,7 +578,9 @@ __device__ __forceinline__ void lrx_unfold_pair(
             const int rs = t.rsrc[rj];
             lrx_c2 v = {0.0, 0.0};
             if (ls >= 0 && rs >= 0) {
-                v = lrx_mul_xla(lrx_mul_xla(mp, src[(long long)ls * t.nl + rs]), nph[rj]);
+                lrx_c2 sv = src[(long long)ls * t.nl + rs];
+                if (conj_src) sv.y = -sv.y;
+                v = lrx_mul_xla(lrx_mul_xla(mp, sv), nph[rj]);
                 if (conj_row) v.y = -v.y;
             }
             g[c][d] = v;
@@ -775,7 +782,7 @@ extern "C" __global__ void __launch_bounds__(256) lrx_kconv(
         }
     }
 }
-#else
+#elif LRX_MODE == 9
 // Mode 9: mode 3's inverse transform of the interaction unfolded on its load
 // from the wedge tiles; Y k-LEADING (nk, ml, nl), the row (pair, A, B) stored
 // at merged endpoints (x*NS + A, y*NR + B), scaled as mode 3 scales.
@@ -799,6 +806,151 @@ extern "C" __global__ void __launch_bounds__(256) lrx_kconv(
             y[((long long)k * t.ml + xx * NS + a) * t.nl + yy * NR + b] = {v.x * scale, v.y * scale};
         }
     }
+}
+#else
+// Mode 11: the chi0 two-operand pass on the k-box stage (kbox_stage.cuh).
+// Tile column c of pair p = c / GRP: operand c % GRP / SS (0 = Gv, 1 = Gc) and
+// spin element (a, b) = (c % SS) / NS, c % NS, the unfolded parent Green
+// U_k G[row(k)] U_k^dagger of that operand (mode 7's load; conj_trs = 2 reads
+// the antiunitary partner as conj(G)).  Inverse k-transform, then per (k, pair)
+//     v = sum_ab conj(si Gc'_ab) * (si Gv'_ab)          (a-major, as the spin-pair stream)
+//     v = v + conj(v)                                   (LRX_COMPLETE: a real contour)
+//     acc[o, k, x, y] += alpha[o] * v                   (o < n_out)
+// chi_R accumulates in R space; one forward transform follows the tau sum.
+#include "kbox_stage.cuh"
+static_assert(NR == NS, "mode 11 loads Greens: one spin width");
+constexpr int GRP = 2 * SS;                    // columns per pair
+constexpr int TRC = LRX_TR;                    // tile columns (the plan's tr groups * GRP)
+
+struct ChiArgs {
+    const lrx_c2 *gv, *gvt, *gc, *gct;         // parent Greens and partners (unread for conj_trs 1, 2)
+    lrx_c2* acc;                               // (n_out, nk, mx, my), accumulated in place
+    const lrx_c2* alpha;                       // (n_out,)
+    lrx_c2* y;                                 // split arm: the (nk, ncols) intermediate
+    long long p0, npairs, pairs, my;           // this launch's pairs [p0, p0 + npairs) of pairs
+    int n_out;
+    double si;                                 // the inverse transform's scale
+};
+
+struct ChiLoad {
+    static constexpr bool kDirect = true, kFinish = false;
+    const ChiArgs* a;
+    const UnfoldTab* t;
+    // Every (k, operand group) of the tile: the NS*NS spin elements of one operand of one pair.
+    template <class View>
+    __device__ void direct(const View& view, int k0, int k1, long long col0, int width,
+                           long long ncols) const {
+        constexpr int og = SS;
+        const int groups = width / og;
+        for (int i = threadIdx.x; i < (k1 - k0) * groups; i += blockDim.x) {
+            const int k = k0 + i / groups, j = i % groups;
+            const long long c0 = col0 + (long long)j * og;
+            const long long pr = a->p0 + c0 / GRP;
+            const int op = int((c0 % GRP) / og);
+            if (c0 < ncols) {
+                const long long xx = pr / a->my, yy = pr - xx * a->my;
+                lrx_c2 g[NS][NR], u[NS][NS], ur[NR][NR];
+                lrx_unfold_pair(op ? a->gc : a->gv, op ? a->gct : a->gvt, *t, k, xx, yy, g, u, ur);
+#pragma unroll
+                for (int r = 0; r < NS; ++r) {
+                    lrx_c2 out[NR];
+                    lrx_spin_row(u, ur, g, r, out);
+#pragma unroll
+                    for (int b = 0; b < NR; ++b) view(k, j * og + r * NR + b) = out[b];
+                }
+            } else {
+#pragma unroll
+                for (int e = 0; e < og; ++e) view(k, j * og + e) = {0.0, 0.0};
+            }
+        }
+    }
+};
+
+// The pair's R-space value from its GRP transformed values g(q) (q < SS: Gv, else Gc).
+template <class Get>
+__device__ __forceinline__ lrx_c2 lrx_chi_value(const Get& g, double si) {
+    lrx_c2 v = {0.0, 0.0};
+#pragma unroll
+    for (int q = 0; q < SS; ++q) {
+        const lrx_c2 gv = g(q), gc = g(SS + q);
+        const lrx_c2 a = {gc.x * si, -(gc.y * si)};
+        const lrx_c2 b = {gv.x * si, gv.y * si};
+        const lrx_c2 p = lrx_mul_xla(a, b);
+        v.x = __dadd_rn(v.x, p.x); v.y = __dadd_rn(v.y, p.y);
+    }
+#if LRX_COMPLETE
+    v = {__dadd_rn(v.x, v.x), __dsub_rn(v.y, v.y)};
+#endif
+    return v;
+}
+
+struct ChiMid {                                // single arm: reduce the group into vals[0]
+    double si;
+    __device__ void group(int, long long, lrx_c2 (&vals)[GRP]) const {
+        vals[0] = lrx_chi_value([&](int q) { return vals[q]; }, si);
+    }
+};
+
+struct ChiStore {                              // acc[o, k, pair] += alpha[o] * v, leading column only
+    const ChiArgs* a;
+    long long nk;
+    __device__ void put(int k, long long col, lrx_c2 v) const {
+        if (col % GRP) return;
+        const long long pr = a->p0 + col / GRP;
+        const long long xx = pr / a->my, yy = pr - xx * a->my;
+        for (int o = 0; o < a->n_out; ++o) {
+            lrx_c2* e = a->acc + ((o * nk + k) * (a->pairs / a->my) + xx) * a->my + yy;
+            const lrx_c2 p = lrx_mul_xla(a->alpha[o], v);
+            *e = {__dadd_rn(e->x, p.x), __dadd_rn(e->y, p.y)};
+        }
+    }
+};
+
+#if LRX_ARM == 1
+// Split arm, pencil pass: the x-line inverse of every member, then member 0 forms the pair.
+struct ChiCols {
+    __device__ long long col(long long inst, int member) const { return inst * GRP + member; }
+};
+struct ChiPencilMid {
+    static constexpr int kAux = 0;
+    double si;
+    __device__ void stage_aux(lrx_c2*, long long, long long, int) const {}
+    struct F {
+        int member;
+        double si;
+        __device__ lrx_c2 operator()(const lrx_c2* grp, const lrx_c2*) const {
+            if (member != 0) return grp[member * LRX_TY];
+            return lrx_chi_value([&](int q) { return grp[q * LRX_TY]; }, si);
+        }
+    };
+    __device__ F bind(int member) const { return F{member, si}; }
+};
+#endif
+
+extern "C" __global__ void __launch_bounds__(LRX_THREADS) lrx_kconv(ChiArgs a, UnfoldTab t, int phase) {
+    extern __shared__ lrx_c2 sm[];
+    using namespace cufftdx;
+    const long long ncols = a.npairs * GRP;
+    const ChiLoad ld{&a, &t};
+    const ChiStore st{&a, (long long)NK};
+#if LRX_ARM == 0
+    (void)phase;
+    const ChiMid mid{a.si};
+    for (long long col0 = (long long)blockIdx.x * TRC; col0 < ncols; col0 += (long long)gridDim.x * TRC) {
+        lrx_kbox::stage_tile<NX, NY, NZ, TRC>(sm, col0, ncols, ld);
+        lrx_kbox::transform3<NX, NY, NZ, TRC, LRX_SM, fft_direction::inverse>(sm);
+        lrx_kbox::mid_group_tile<NX, NY, NZ, TRC, GRP>(sm, col0, ncols, mid);
+        lrx_kbox::store_tile<NX, NY, NZ, TRC>(sm, col0, ncols, st);
+    }
+#else
+    if (phase == 0) {
+        lrx_kbox::plane_pass<NX, NY, NZ, LRX_SM, fft_direction::inverse, TRC>(
+            sm, ncols, ld, lrx_kbox::Plain<lrx_c2>{a.y, ncols});
+    } else {
+        lrx_kbox::pencil_group_pass<NX, NY, NZ, LRX_SM, GRP, LRX_TY, false>(
+            a.y, sm, ncols, a.npairs, ChiCols{}, ChiPencilMid{a.si}, st);
+    }
+#endif
 }
 #endif
 #endif
@@ -978,8 +1130,12 @@ extern "C" __global__ void __launch_bounds__(LRX_THREADS, LRX_RB) lrx_kconv(
 //  Build and cache
 // ---------------------------------------------------------------------------
 struct Built { CUfunction fn = nullptr; int rb = 1; int smem = 0; double compile_ms = 0.0; int threads = kThreads;
-               long long grid_cap = 0; };   // grid_cap: mode 10's resident blocks (0 = none)
-using Key = std::tuple<CUcontext, int, int, int, int, int, int, int>;  // ctx, mode, nkx, nky, nkz, ns, nsr, f32
+               long long grid_cap = 0;     // grid_cap: mode 10's resident blocks (0 = none)
+               // Mode 11 (k-box stage): arm 0 single pass (tr tile columns, smem), arm 1 split:
+               // the plane pass (tr = its tile columns, smem) and the group pencil (threads2, smem2).
+               int arm = 0, tr = 0, ty = 0, threads2 = 0, smem2 = 0, sms = 0; };
+// ctx, mode, nkx, nky, nkz, ns, nsr, f32, variant (mode 11: the static completion)
+using Key = std::tuple<CUcontext, int, int, int, int, int, int, int, int>;
 static std::mutex g_mu;
 static std::map<Key, Built> g_cache;
 static std::map<Key, std::string> g_fail;
@@ -990,7 +1146,7 @@ using nvrtc::toolkit_include;
 // nsr: the right endpoint width of mode 9 (0 = ns, every other mode).
 static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
                         std::string_view mathdx_root, std::string_view cubin_dir, const Built** out,
-                        int nsr = 0) {
+                        int nsr = 0, int variant = 0) {
     if (nsr == 0) nsr = ns;
     const DriverApi& api = driver_api();
     if (!api.ok) return fail("driver-api resolve", api.err);
@@ -1001,7 +1157,7 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
         cr = api.CtxGetCurrent(&ctx);
         if (cr != CUDA_SUCCESS || ctx == nullptr) return fail("cuCtxGetCurrent", cu_err(cr));
     }
-    const Key key{ctx, mode, nkx, nky, nkz, ns, nsr, f32 ? 1 : 0};
+    const Key key{ctx, mode, nkx, nky, nkz, ns, nsr, f32 ? 1 : 0, variant};
     std::lock_guard<std::mutex> lock(g_mu);
     if (auto it = g_cache.find(key); it != g_cache.end()) { *out = &it->second; return ffi::Error::Success(); }
     if (auto it = g_fail.find(key); it != g_fail.end()) return fail("kernel build (cached failure)", it->second);
@@ -1026,6 +1182,28 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
     // Mode 8 sums the Lorentz blocks across a pair's spin rows, so it needs a
     // whole spin group resident: reach for the opt-in shared memory first.
     if (rb < 1 || (mode == 8 && rb < ns * ns)) rb = std::min<long long>(rows_max, smem_optin / row_bytes);
+    // Mode 11 runs on the k-box stage: its launch rule (kbox_plan) decides the arm, the tile and
+    // the shared memory from the grid and this device's opt-in budget; RB is unused.
+    const int chi_grp = 2 * ns * ns;
+    lrx_kbox::Plan kplan{};
+    int chi_trc = 0, chi_ty = 0, chi_threads = 0;
+    long long chi_smem = 0, chi_smem2 = 0;
+    if (mode == 11) {
+        kplan = lrx_kbox::kbox_plan(nkx, nky, nkz, ns * ns, 2, 16, smem_optin, 1, 1);  // min_tr 1: a gathered group load
+        const lrx_kbox::Geometry g{nkx, nky, nkz};
+        rb = 1;
+        chi_ty = std::max(1, kThreads / chi_grp);
+        if (kplan.arm == 0) {
+            chi_trc = kplan.tr * chi_grp;                  // the plan counts whole pairs
+            chi_threads = kplan.threads;
+            chi_smem = kplan.smem;
+        } else {
+            chi_trc = kplan.tr;                            // plane tiles of tr columns (whole spin groups)
+            chi_threads = kThreads;
+            chi_smem = static_cast<long long>(chi_trc) * g.pr() * 16;
+            chi_smem2 = (static_cast<long long>(nkx) * chi_grp * chi_ty + static_cast<long long>(nkx) * chi_ty) * 16;
+        }
+    }
     if ((mode == 7 || mode == 8 || mode == 9) && rb >= ns * nsr)
         rb -= rb % (ns * nsr);                         // whole spin groups: the grouped load
     // (fewer rows than one spin group: mode 7 loads per bank, as mode 2 would fit)
@@ -1064,6 +1242,16 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
         }
         plane_minb = std::max<long long>(
             1, std::min<long long>(2, smem_sm / (rb * (row_bytes + plane_stage) + plane_static + 1024)));
+    }
+    if (mode == 11 && (kplan.arm == 1 ? (chi_trc % (ns * ns) != 0 || chi_smem > smem_optin || chi_smem2 > smem_optin)
+                                      : chi_smem > smem_optin)) {
+        std::ostringstream os;
+        os << "GATE mathdx-kconv-chi-residency: got k-grid (" << nkx << "," << nky << "," << nkz << ") with ns="
+           << ns << ", whose k-box " << (kplan.arm ? "split" : "single") << " arm needs " << chi_smem << " / "
+           << chi_smem2 << " B; want <= " << smem_optin << " B of opt-in shared memory and plane tiles of whole "
+              "spin groups; why: mode 11 forms each pair from its 2*ns^2 transformed columns; fix: the chi0 "
+              "route keeps its XLA path for this grid (ffi.fft.chi_unfold_supported)";
+        return sticky("residency", os.str(), ffi::ErrorCode::kInvalidArgument);
     }
     if (mode == 8 && rb < ns * ns) {
         std::ostringstream os;
@@ -1106,6 +1294,13 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
         "-DLRX_SM=" + std::to_string(cc_major * 100 + cc_minor * 10)};
     // Mode 10: planes per block; a block that has its SM alone runs 512 threads.
     const int plane_threads = mode == 10 && plane_minb == 1 ? 512 : kThreads;
+    if (mode == 11) {
+        defs.push_back("-DLRX_ARM=" + std::to_string(kplan.arm));
+        defs.push_back("-DLRX_TR=" + std::to_string(chi_trc));
+        defs.push_back("-DLRX_TY=" + std::to_string(chi_ty));
+        defs.push_back("-DLRX_THREADS=" + std::to_string(chi_threads));
+        defs.push_back("-DLRX_COMPLETE=" + std::to_string(variant));
+    }
     if (mode == 10) {
         defs.push_back("-DLRX_PB=" + std::to_string(rb));
         defs.push_back("-DLRX_ROWS=" + std::to_string(std::max(1, plane_rows)));
@@ -1120,6 +1315,7 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
     prog.name = "lrx_kconv_mathdx.cu";
     if (std::string_view(prog.src).find(ag::kHeaderName) != std::string_view::npos)
         prog.headers = {{ag::kHeaderName, ag::kHeaderSrc}};
+    if (mode == 11) prog.headers.push_back({kbox::kHeaderName, kbox::kHeaderSrc});
     prog.defs = defs;
     nvrtc::mathdx_toolchain(root, cuda_inc, "cufftdx", &prog);
     prog.kernel = "lrx_kconv";
@@ -1146,6 +1342,19 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
     b.rb = static_cast<int>(rb);
     b.threads = plane_threads;
     b.smem = static_cast<int>(rb * (row_bytes + plane_stage));
+    if (mode == 11) {
+        int sms = 0;
+        LRX_CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev), "SM count");
+        b.arm = kplan.arm;
+        b.tr = chi_trc;
+        b.rb = chi_trc;                                // logged as the tile's columns
+        b.ty = chi_ty;
+        b.threads = chi_threads;
+        b.smem = static_cast<int>(chi_smem);
+        b.threads2 = chi_grp * chi_ty;
+        b.smem2 = static_cast<int>(chi_smem2);
+        b.sms = sms;
+    }
     if (mode == 10) {                                  // persistent blocks: the resident count
         int sms = 0;
         LRX_CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev), "SM count");
@@ -1154,8 +1363,8 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
     b.compile_ms = ms;
     // Mode 10 always sets the dynamic limit: its static tables count against the
     // 48 KiB default too, so a plane just under 48 KiB would fail at launch.
-    if (b.smem > 49152 || mode == 10) {
-        cr = api.FuncSetAttribute(b.fn, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, b.smem);
+    if (b.smem > 49152 || b.smem2 > 49152 || mode == 10) {
+        cr = api.FuncSetAttribute(b.fn, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, std::max(b.smem, b.smem2));
         if (cr != CUDA_SUCCESS && mode == 10) {
             std::ostringstream os;
             os << "GATE mathdx-plane-residency: got plane (" << nkx << "," << nky << "), " << b.smem
@@ -1651,6 +1860,107 @@ static ffi::Error KleadUnfoldFft(
     return ffi::Error::Success();
 }
 
+// Mode 11 geometry, as the embedded source declares it (ChiArgs).
+struct ChiArgs {
+    const void *gv, *gvt, *gc, *gct;
+    void* acc;
+    const void* alpha;
+    void* y;
+    long long p0, npairs, pairs, my;
+    int n_out;
+    double si;
+};
+
+// Mode 11: chi_R accumulation from the raw-parent Green pair.  acc (n_out, nk, mx, my) in place.
+static ffi::Error KleadChiUnfold(
+    cudaStream_t stream, ffi::ScratchAllocator scratch, ffi::AnyBuffer Gv, ffi::AnyBuffer Gvt,
+    ffi::AnyBuffer Gc, ffi::AnyBuffer Gct, ffi::AnyBuffer row, ffi::AnyBuffer trs, ffi::AnyBuffer lsrc,
+    ffi::AnyBuffer rsrc, ffi::AnyBuffer mph, ffi::AnyBuffer nph, ffi::AnyBuffer spin, ffi::AnyBuffer alpha,
+    ffi::AnyBuffer acc_in, ffi::Result<ffi::AnyBuffer> acc, int64_t nkx, int64_t nky, int64_t nkz, double si,
+    int64_t conj_trs, int64_t complete, int64_t scratch_bytes, std::string_view mathdx_root,
+    std::string_view cubin_dir) {
+    auto bad = [](const std::string& why) {
+        return fail("klead chi unfold", why, ffi::ErrorCode::kInvalidArgument);
+    };
+    if (nkx < 1 || nky < 1 || nkz < 1 || nkx > kAxisMax || nky > kAxisMax || nkz > kAxisMax) {
+        std::ostringstream os;
+        os << "GATE mathdx-kconv-axis: got k-grid (" << nkx << "," << nky << "," << nkz
+           << "); want every axis in [1, " << kAxisMax << "] (the fp64 cuFFTDx thread-FFT limit)";
+        return bad(os.str());
+    }
+    const int64_t nk = nkx * nky * nkz;
+    auto is = [](ffi::AnyBuffer x, ffi::DataType t, std::vector<int64_t> dims) {
+        auto d = x.dimensions();
+        return x.element_type() == t && d.size() == dims.size() && std::equal(d.begin(), d.end(), dims.begin());
+    };
+    const auto gd = Gv.dimensions(), sd = spin.dimensions(), ad = acc_in.dimensions();
+    if (gd.size() != 3 || sd.size() != 3 || ad.size() != 4)
+        return bad("want Gv (n_parent, ml, nl), spin (nk, ns, ns) and acc (n_out, nk, mx, my)");
+    const int64_t np = gd[0], ml = gd[1], nl = gd[2], ns = sd[1], n_out = ad[0];
+    const auto C = ffi::DataType::C128, I = ffi::DataType::S32;
+    if ((ns != 1 && ns != 2 && ns != 4) || ml % ns || nl % ns || np < 1 || n_out < 1 ||
+        (conj_trs != 0 && conj_trs != 2) || (complete != 0 && complete != 1) ||
+        !is(Gv, C, {np, ml, nl}) || !is(Gvt, C, {np, ml, nl}) || !is(Gc, C, {np, ml, nl}) ||
+        !is(Gct, C, {np, ml, nl}) || !is(row, I, {nk}) || !is(trs, I, {nk}) || !is(lsrc, I, {nk, ml}) ||
+        !is(rsrc, I, {nk, nl}) || !is(mph, C, {nk, ml}) || !is(nph, C, {nk, nl}) || !is(spin, C, {nk, ns, ns}) ||
+        !is(alpha, C, {n_out}) || !is(acc_in, C, {n_out, nk, ml / ns, nl / ns}) ||
+        !is(*acc, C, {n_out, nk, ml / ns, nl / ns}))
+        return bad("want c128 Gv=Gvt=Gc=Gct (np,ml,nl); s32 row,trs (nk), lsrc (nk,ml), rsrc (nk,nl); c128 "
+                   "mph (nk,ml), nph (nk,nl), spin (nk,ns,ns), alpha (n_out,), acc (n_out,nk,ml/ns,nl/ns); "
+                   "conj_trs 0 (partner tiles) | 2 (the partner is conj(G)); complete 0|1");
+    const int64_t my = nl / ns, pairs = (ml / ns) * my;
+    if (pairs == 0) return ffi::Error::Success();
+    const Built* k = nullptr;
+    ffi::Error e = build(11, static_cast<int>(nkx), static_cast<int>(nky), static_cast<int>(nkz),
+                         static_cast<int>(ns), false, mathdx_root, cubin_dir, &k, 0, static_cast<int>(complete));
+    if (!e.success()) return e;
+    UnfoldTab t{static_cast<const int*>(row.untyped_data()), static_cast<const int*>(trs.untyped_data()),
+                static_cast<const int*>(lsrc.untyped_data()), static_cast<const int*>(rsrc.untyped_data()),
+                static_cast<const double*>(mph.untyped_data()), static_cast<const double*>(nph.untyped_data()),
+                static_cast<const double*>(spin.untyped_data()), ml, nl, nullptr, static_cast<int>(conj_trs),
+                nullptr};
+    // acc is aliased to acc_in (input_output_aliases); a copy only if XLA did not alias.
+    if (acc->untyped_data() != acc_in.untyped_data())
+        LRX_CUDA_CHECK(cudaMemcpyAsync(acc->untyped_data(), acc_in.untyped_data(), acc_in.size_bytes(),
+                                       cudaMemcpyDeviceToDevice, stream), "acc copy");
+    const long long grp = 2 * ns * ns;
+    ChiArgs a{Gv.untyped_data(), Gvt.untyped_data(), Gc.untyped_data(), Gct.untyped_data(),
+              acc->untyped_data(), alpha.untyped_data(), nullptr, 0, pairs, pairs, my,
+              static_cast<int>(n_out), si};
+    auto launch = [&](int phase, long long blocks, int threads, int smem) -> ffi::Error {
+        blocks = std::max(1LL, std::min(blocks, 2147483647LL));
+        void* args[] = {(void*)&a, (void*)&t, (void*)&phase};
+        CUresult cr = driver_api().LaunchKernel(k->fn, static_cast<unsigned>(blocks), 1, 1, threads, 1, 1,
+                                                static_cast<unsigned>(smem),
+                                                reinterpret_cast<CUstream>(stream), args, nullptr);
+        if (cr != CUDA_SUCCESS) return fail("cuLaunchKernel", cu_err(cr));
+        return ffi::Error::Success();
+    };
+    if (k->arm == 0) return launch(2, (pairs * grp + k->tr - 1) / k->tr, k->threads, k->smem);
+    // Split arm: chunks of pairs through a (nk, chunk * GRP) intermediate of at most scratch_bytes.
+    const long long per_pair = nk * grp * 16;
+    const long long chunk = std::max(1LL, std::min<long long>(pairs, std::max<int64_t>(scratch_bytes, 0) / per_pair));
+    auto y = scratch.Allocate(static_cast<size_t>(chunk * per_pair));
+    if (!y.has_value()) {
+        std::ostringstream os;
+        os << "GATE mathdx-kconv-chi-scratch: got a refused " << chunk * per_pair << " B intermediate ("
+           << chunk << " pairs); want the XLA scratch allocator to grant it; fix: a smaller scratch_bytes";
+        return fail("scratch", os.str(), ffi::ErrorCode::kResourceExhausted);
+    }
+    a.y = *y;
+    const long long cap = static_cast<long long>(k->sms) * 8;
+    for (long long p0 = 0; p0 < pairs; p0 += chunk) {
+        a.p0 = p0;
+        a.npairs = std::min(chunk, pairs - p0);
+        const long long ncols = a.npairs * grp;
+        const long long plane_items = nkx * ((ncols + k->tr - 1) / k->tr);
+        const long long pencil_items = nky * nkz * ((a.npairs + k->ty - 1) / k->ty);
+        if (auto e0 = launch(0, std::min(plane_items, cap), k->threads, k->smem); !e0.success()) return e0;
+        if (auto e1 = launch(1, std::min(pencil_items, cap), k->threads2, k->smem2); !e1.success()) return e1;
+    }
+    return ffi::Error::Success();
+}
+
 static ffi::Error KleadConv(cudaStream_t s, ffi::AnyBuffer T, ffi::AnyBuffer V, ffi::Result<ffi::AnyBuffer> U,
                             int64_t nkx, int64_t nky, int64_t nkz, double scale,
                             std::string_view mathdx_root, std::string_view cubin_dir) {
@@ -1952,6 +2262,35 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Attr<int64_t>("nkz")
         .Attr<double>("scale")
         .Attr<int64_t>("conj_trs")
+        .Attr<std::string_view>("mathdx_root")
+        .Attr<std::string_view>("cubin_dir"));
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(
+    KConvMathdxChiUnfoldCudaFfi, lorrax_ffi::kconv_mathdx::KleadChiUnfold,
+    xla::ffi::Ffi::Bind()
+        .Ctx<xla::ffi::PlatformStream<cudaStream_t>>()
+        .Ctx<xla::ffi::ScratchAllocator>()
+        .Arg<xla::ffi::AnyBuffer>()   // Gv (raw-parent valence Green)
+        .Arg<xla::ffi::AnyBuffer>()   // Gvt (its partner tiles; unread when conj_trs = 2)
+        .Arg<xla::ffi::AnyBuffer>()   // Gc (raw-parent conduction Green)
+        .Arg<xla::ffi::AnyBuffer>()   // Gct
+        .Arg<xla::ffi::AnyBuffer>()   // row
+        .Arg<xla::ffi::AnyBuffer>()   // trs
+        .Arg<xla::ffi::AnyBuffer>()   // lsrc
+        .Arg<xla::ffi::AnyBuffer>()   // rsrc
+        .Arg<xla::ffi::AnyBuffer>()   // mph
+        .Arg<xla::ffi::AnyBuffer>()   // nph
+        .Arg<xla::ffi::AnyBuffer>()   // spin
+        .Arg<xla::ffi::AnyBuffer>()   // alpha (n_out,)
+        .Arg<xla::ffi::AnyBuffer>()   // acc (n_out, nk, mx, my), aliased to the result
+        .Ret<xla::ffi::AnyBuffer>()
+        .Attr<int64_t>("nkx")
+        .Attr<int64_t>("nky")
+        .Attr<int64_t>("nkz")
+        .Attr<double>("si")
+        .Attr<int64_t>("conj_trs")
+        .Attr<int64_t>("complete")
+        .Attr<int64_t>("scratch_bytes")
         .Attr<std::string_view>("mathdx_root")
         .Attr<std::string_view>("cubin_dir"));
 
