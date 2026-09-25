@@ -130,8 +130,16 @@ def test_b_mpa_one_update_matches_references(core_fixtures):
 
 
 @pytest.mark.gpu
-def test_b_retained_escape_grows_grid_in_the_same_map(core_fixtures):
-    """He band 2 leaves the requested top but retains its live Sigma curve."""
+@pytest.mark.parametrize("policy", ["cover", "static"])
+def test_b_retained_escape_grows_grid_in_the_same_map(core_fixtures, policy):
+    """He band 2 leaves the requested top but retains its live Sigma curve.
+
+    ``cover`` (the default, owner 2026-09-24) grows the grid over every
+    protected identity at map 0, so band 3 (+13.7 eV) is covered before the
+    first map and band 2's escape needs no later growth.  ``static`` keeps
+    the padded-window rule: band 3 lies past it and reads Sigma(0), and
+    band 2 grows the grid in the map where it escapes.
+    """
     if not harness.gpu_available():
         pytest.skip("retained-state escape uses the GPU driver")
 
@@ -144,7 +152,7 @@ def test_b_retained_escape_grows_grid_in_the_same_map(core_fixtures):
             "sigma_omega_patches_ev = -12:0, 1:12",
             "sigma_omega_patches_ev = -12:0, 0.1:9.4")
         text = text.replace("sigma_omega_step_ev = 1", "sigma_omega_step_ev = 0.1")
-        deck.write_text(text)
+        deck.write_text(text + f"\nsigma_out_of_grid = {policy}\n")
         return target
 
     run = rank_session.stage(core_fixtures / "B", prepare)
@@ -157,17 +165,22 @@ def test_b_retained_escape_grows_grid_in_the_same_map(core_fixtures):
     # sc_accelerator_anderson_only refuses.  Everything this cell asserts
     # after the split is structural, so only the anchor moves.
     first, second = report.split("SC iteration: call=0000 role=initial", 1)
-    assert "SC sampled-support growth" not in first
-    growth = second.index("SC sampled-support growth: band=2, k=0")
-    assert growth < second.index("Started Sigma tau sweep")
-    # d7f556fc (owner rule 2026-09-22): every QP-window band stays protected
-    # and off-grid energies take Sigma(omega=0); no scissor for leaving the
-    # grid, so band 3 is protected too (was "protected=1-2 in_range=1").
+    # d7f556fc (owner rule 2026-09-22): every QP-window band stays protected;
+    # no scissor for leaving the grid (was "protected=1-2 in_range=1").
     assert "protected=1-3 in_range=1-3" in second
     from file_io.restart_bundle import (read_eqp_assembly_receipt)
     receipt = read_eqp_assembly_receipt(str(run / "mpa_sc1_sigma.h5"))
     grid = np.asarray(receipt['omega_rel_ev'])
+    assert np.any(np.isclose(grid, 9.4))          # grown support keeps old samples
+    if policy == "cover":
+        assert "SC sampled-support growth: band=3, k=0" in first
+        assert "SC sampled-support growth: band=2" not in second
+        # Every protected identity stays on the grid through the final writer.
+        assert np.max(receipt['eval_energies_rel_ev'][:, :3]) < grid[-1]
+        return
+    assert "SC sampled-support growth" not in first
+    growth = second.index("SC sampled-support growth: band=2, k=0")
+    assert growth < second.index("Started Sigma tau sweep")
     assert grid[-1] > 9.7
-    assert np.any(np.isclose(grid, 9.4))
     # The final writer must retain the same grown support used by map 1.
     assert np.max(receipt['eval_energies_rel_ev'][:, :2]) < grid[-1]
