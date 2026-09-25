@@ -51,7 +51,8 @@ def say(*a):
 
 
 def _filter(gvecs, ngk, frac, bvec, cut):
-    """Keep the live slots with |k+G|² ≤ cut (Cartesian), in their order."""
+    """Keep the live slots with |k+G|² ≤ cut (Cartesian), in their order (``cut`` sits in a gap
+    of the norm spectrum, see ``_gap_cut``, so rotated images agree on membership)."""
     out = np.full_like(gvecs, 0)
     n = np.zeros(len(ngk), np.int64)
     for i in range(len(ngk)):
@@ -85,6 +86,11 @@ def setup(args, mesh):
         gp, npar = np.asarray(w.gvecs(k=sym.parent_k_domain)), np.asarray(w.ngk_valid(k=sym.parent_k_domain))
     cut = args.ecut_scale * ecut
     if args.ecut_scale < 1.0:
+        norms = np.concatenate([np.einsum("gi,gi->g", *(2 * [(kf[i][None, :] + gf[i, :nf[i]]) @ bvec]))
+                                for i in range(len(nf))])
+        u = np.unique(np.round(norms, 8))
+        j = int(np.searchsorted(u, cut))
+        cut = 0.5 * (u[max(j - 1, 0)] + u[min(j, len(u) - 1)])        # mid-gap: no shell on the edge
         gf, nf = _filter(gf, nf, kf, bvec, cut)
         gp, npar = _filter(gp, npar, kp, bvec, cut)
         wdt = max(gf.shape[1], gp.shape[1])
@@ -340,5 +346,9 @@ if __name__ == "__main__":
     rc = 1
     try:
         rc = main()
+    except Exception:                                   # noqa: BLE001 — print before the exit
+        import traceback
+        traceback.print_exc()
+        sys.stderr.flush()
     finally:
         finalize_process(rc)
