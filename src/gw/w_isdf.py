@@ -715,10 +715,18 @@ def _get_chi_fractional_contour_kernel_face(
         raise ValueError("prepared response band ranges require the axis direct stream")
     if photon is not None:
         g_plan = partial(face_band_gather_product, mesh=mesh_xy, phases=None, band_range=None)
-        if n_rmu != photon.layout.packed_extent:
+        if n_rmu != photon.layout.packed_extent or ns != 4:
             raise ValueError(
-                f"four-current stream: face_shape extent {n_rmu} is not the "
-                f"canonical photon extent {photon.layout.packed_extent}")
+                f"four-current stream: face_shape extent {n_rmu}, spin {ns}; want "
+                f"the canonical photon extent {photon.layout.packed_extent} and "
+                "four spinor components")
+    # The four-current stream transports Dirac-half quadrants (plan.dirac_halves).
+    half_plans, half_parity = (None, None), None
+    if photon is not None and photon.plans[0] is not None:
+        halves = tuple(plan.dirac_halves() for plan in photon.plans)
+        if not np.array_equal(halves[0][1], halves[1][1]):
+            raise ValueError("four-current stream: the family plans disagree on spatial parity")
+        half_plans, half_parity = tuple(h[0] for h in halves), halves[0][1]
     else:
         g_plan = gemm_plan(mesh_xy, m=n_rmu * ns, k=nb_full, n=n_rmu * ns,
                            nq=nk_shape, dtype=jnp.complex128, layout=layout,
@@ -773,13 +781,21 @@ def _get_chi_fractional_contour_kernel_face(
         if bank_carry:
             initial = carry[0]
 
-        def green_k(weight, t, ref, *, current=False, family_pair=None):
+        def green_k(weight, t, ref, *, current=False, family_pair=None, halves=None):
             left, right, plan, right_plan = psi_mun, psi_nmu, k_unfold_plan, None
+            sign = None
             if family_pair is not None:
+                # One Dirac-half quadrant (h, g) of the family pair's Green:
+                # the typed bispinor action is diag(U, pU), so the quadrant
+                # transports with U and the sign p on h != g.
                 L, R = family_pair
-                left, right = psi_mun[L], psi_nmu[R]
-                plan, right_plan = photon.plans[L], photon.plans[R]
+                h, g = halves
+                left = jax.lax.dynamic_slice_in_dim(psi_mun[L], 2 * h, 2, axis=1)
+                right = jax.lax.dynamic_slice_in_dim(psi_nmu[R], 2 * g, 2, axis=2)
+                plan, right_plan = half_plans[L], half_plans[R]
                 right_plan = None if right_plan is plan else right_plan
+                if half_parity is not None:
+                    sign = jnp.where(h == g, 1.0, jnp.asarray(half_parity))
             # Incumbent: conj(G(w, t)) = G(conj w, conj t)^T. Physical: G(conj w, conj t).
             if physical:
                 g = build_G_tau(left, right, enk_full, jnp.conj(t), e_ref=ref,
@@ -792,15 +808,20 @@ def _get_chi_fractional_contour_kernel_face(
                                          band_weight=weight, layout=layout,
                                          gemm=g_plan, k_unfold_plan=plan,
                                          prepared_active_gemm=active_gemms[int(current)]))
+            if sign is not None:
+                g = g * sign[:, None, None, None, None]
             return jax.lax.with_sharding_constraint(g, G_shard)
 
         def spin_correlation(lower_weight, lower_time, lower_ref,
                              upper_weight, upper_time, upper_ref):
             """Exact spin trace of one Green pair; the four-current trace is per family pair.
 
-            Four-current: one family pair's two Greens are live at a time;
-            each of its Lorentz blocks traces ``(J_A G^> J_B^dagger) conj(G^<)``
-            over both spin indices and lands in its packed-layout block.
+            Four-current: per family pair, a scan over the four Dirac-half
+            quadrants (h, g) of the lower Green; the vertices of a current
+            channel exchange the halves, so each quadrant meets exactly one
+            upper quadrant.  Two quarter Greens are live at a time; each
+            Lorentz block accumulates its quadrant's share of
+            ``(J_A G^> J_B^dagger) conj(G^<)`` in its packed-layout block.
             """
             if photon is None:
                 gf = G_fftn(green_k(lower_weight, lower_time, lower_ref))
@@ -815,19 +836,32 @@ def _get_chi_fractional_contour_kernel_face(
             from .photon_layout import FAMILY_PAIRS, _insert, family_channels
             total = jax.lax.with_sharding_constraint(
                 jnp.zeros((nk, n_mu, n_mu), jnp.complex128), chi_R_shard)
+            quadrants = jnp.asarray(((0, 0), (0, 1), (1, 0), (1, 1)), jnp.int32)
             for pair in FAMILY_PAIRS:
-                # The previous pair's blocks finish before this pair's Greens.
-                total, lower = jax.lax.optimization_barrier((total, lower_weight))
-                gf = G_fftn(green_k(lower, lower_time, lower_ref, family_pair=pair))
-                gf, next_weight = jax.lax.optimization_barrier((gf, upper_weight))
-                gu = G_fftn(green_k(next_weight, upper_time, upper_ref,
-                                    current=True, family_pair=pair))
-                for A in family_channels(pair[0]):
-                    for B in family_channels(pair[1]):
-                        block = gamma_vertex_trace(gf, gu, A, B, spin_axes=(2, 4))
-                        total = _insert(
-                            total, jax.lax.with_sharding_constraint(block, chi_R_shard),
-                            photon.packed_layout, A, B, mesh_xy)
+                # A current channel's vertex maps half h to 1 - h.
+                flip = jnp.asarray(tuple(int(f == 1) for f in pair), jnp.int32)
+
+                def quadrant(total, hg, pair=pair, flip=flip):
+                    # The previous quadrant's blocks finish before these Greens.
+                    total, lower = jax.lax.optimization_barrier((total, lower_weight))
+                    gf = G_fftn(green_k(lower, lower_time, lower_ref,
+                                        family_pair=pair, halves=(hg[0], hg[1])))
+                    gf, next_weight = jax.lax.optimization_barrier((gf, upper_weight))
+                    up = hg ^ flip
+                    gu = G_fftn(green_k(next_weight, upper_time, upper_ref, current=True,
+                                        family_pair=pair, halves=(up[0], up[1])))
+                    for A in family_channels(pair[0]):
+                        for B in family_channels(pair[1]):
+                            block = gamma_vertex_trace(
+                                gf, gu, A, B, spin_axes=(2, 4),
+                                lower_offset=(2 * hg[0], 2 * hg[1]),
+                                upper_offset=(2 * up[0], 2 * up[1]))
+                            total = _insert(
+                                total, jax.lax.with_sharding_constraint(block, chi_R_shard),
+                                photon.packed_layout, A, B, mesh_xy, add=True)
+                    return total, None
+
+                total, _ = jax.lax.scan(quadrant, total, quadrants, unroll=1)
             return total
 
         def retarded_correlation(time, lower=occ_f, upper=occ_u, reference=energy_reference):

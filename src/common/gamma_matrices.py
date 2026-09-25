@@ -357,29 +357,31 @@ def gamma_double_contract(
 
 
 def gamma_vertex_trace(G_lower, G_upper, left: int, right: int,
-                       spin_axes: tuple[int, int] = (2, 4)) -> jax.Array:
+                       spin_axes: tuple[int, int] = (2, 4), *,
+                       lower_offset=(0, 0), upper_offset=(0, 0)) -> jax.Array:
     """``sum_ab (J_L G_upper J_R^dagger)_ab conj(G_lower)_ab`` for static vertices.
 
-    ``J = gamma~^{left}``, ``gamma~^{right}`` (monomial, host tables), so the
-    trace is ``sum_ab phase_L[a] conj(phase_R[b]) G_upper[.., perm_L a, ..,
-    perm_R b] conj(G_lower[.., a, .., b])``: sixteen static spin slices summed
-    in one fusion, no permuted copy of either Green.  The two spin axes
-    are dropped.
+    ``J = gamma~^{left}``, ``gamma~^{right}`` (monomial), so the trace is
+    ``sum_ab phase_L[a] conj(phase_R[b]) G_upper[.., perm_L a, .., perm_R b]
+    conj(G_lower[.., a, .., b])``: spin slices summed in one fusion, no
+    permuted copy of either Green.  The two spin axes are dropped.  A Green
+    may hold a contiguous block of spin indices: ``lower_offset`` /
+    ``upper_offset`` = ``(row, col)`` are the first spin index of each Green's
+    two spin axes (ints or traced scalars); the sum runs over the lower
+    Green's block, whose vertex images must lie in the upper Green's.
     """
-    (perm_l, phase_l), (perm_r, phase_r) = (
-        _perm_phase[int(left)], _perm_phase[int(right)])
+    perm_l, phase_l = (jnp.asarray(t) for t in _perm_phase[int(left)])
+    perm_r, phase_r = (jnp.asarray(t) for t in _perm_phase[int(right)])
     a_axis, b_axis = spin_axes
-    ns = int(G_upper.shape[a_axis])
-
-    def spin(G, a, b):
-        return jnp.take(jnp.take(G, b, axis=b_axis), a, axis=a_axis)
-
+    take = jax.lax.dynamic_index_in_dim
     total = None
-    for a in range(ns):
-        for b in range(ns):
-            coefficient = complex(phase_l[a] * _np.conj(phase_r[b]))
-            term = coefficient * spin(G_upper, int(perm_l[a]), int(perm_r[b])) \
-                * jnp.conj(spin(G_lower, a, b))
+    for i in range(int(G_lower.shape[a_axis])):
+        for j in range(int(G_lower.shape[b_axis])):
+            a, b = lower_offset[0] + i, lower_offset[1] + j
+            upper = take(take(G_upper, perm_r[b] - upper_offset[1], b_axis, keepdims=False),
+                         perm_l[a] - upper_offset[0], a_axis, keepdims=False)
+            lower = take(take(G_lower, j, b_axis, keepdims=False), i, a_axis, keepdims=False)
+            term = (phase_l[a] * jnp.conj(phase_r[b])) * upper * jnp.conj(lower)
             total = term if total is None else total + term
     return total
 
