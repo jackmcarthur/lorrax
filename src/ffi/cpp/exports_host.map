@@ -8,7 +8,7 @@
  * -- with one exception, spelled out below.
  *
  * The other half of the L1 fix is not in this file, because it cannot be:
- * the nine `lrx_*` ctypes entry points that cpp/phdf5/api.cc and
+ * the thirteen `lrx_*` ctypes entry points that cpp/phdf5/api.cc and
  * cpp/slate/context.cc compile into BOTH libraries have to stay in `.dynsym`
  * for Python to bind them, so hiding is not available.  They are
  * disambiguated by RENAMING instead -- cpp/common/c_abi.h's LRX_C_ENTRY
@@ -19,11 +19,10 @@
 {
   global:
     /* EXCEPTION to the pattern below, and the reason this file has a
-       `global:` clause at all: the build-config stamp is host-only by
-       construction (cpp/common/build_config.cc is in
-       LORRAX_FFI_HOST_SOURCES and nowhere else), so it collides with
-       nothing -- but its NAME contains `lorrax_ffi`, so the denylist would
-       take it.  An exact name beats a wildcard in a version script.
+       `global:` clause at all: the build-config stamp and ABI stamp carry
+       the leg's suffix (lorrax_ffi_host_*; the CUDA leg's twins end in
+       _cuda), so they collide with nothing -- but their NAMES contain
+       `lorrax_ffi`, so the denylist would take them.  An exact name beats a wildcard in a version script.
        Exported because it is declared as an API: today its
        `scalapack=<0|1>` stamp is read out of .rodata by
        test_so_acceptance.py's check 1, and hiding the symbol would make the
