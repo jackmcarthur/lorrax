@@ -896,12 +896,13 @@ def test_odd_kernel_rule_meets_the_even_rules_gate_and_leaves_it_untouched(
 
 
 def test_ordered_odd_residue_shares_the_omega_layout_and_values():
-    """CRIU 2026-09-22: the anti-Hermitian half is resharded per q block onto Omega's layout.
+    """The ordered adjoint is one X<->Y tile permute (``transpose_xy``).
 
-    On a sharded (q, mu, nu) input the ordered kernel's ``a`` comes out of an
-    X<->Y transpose; ``_match_layout`` moves it onto ``Omega``'s sharding so the
-    odd-residue product no longer reshards the whole array at once (CrI3 16x16 P64
-    OOM, 4161798144 B).  Values must be bit-identical to the unsharded fit.
+    On a sharded (q, mu, nu) input the anti-Hermitian half keeps Omega's
+    layout (no whole-array reshard: CrI3 16x16 P64 OOM, 4161798144 B) and no
+    (mu, nu) slice is all-gathered.  Values must be bit-identical to the
+    unsharded fit, and the permute must equal ``swapaxes`` on complex and
+    boolean tiles.
     """
     rng = np.random.default_rng(922)
     _Om, _R_plus, _R_minus, Wc0, Wcp = _pole_model(rng)
@@ -922,5 +923,8 @@ def test_ordered_odd_residue_shares_the_omega_layout_and_values():
     for name in ("omega_qmunu", "B_qmunu", "B_odd_qmunu"):
         np.testing.assert_array_equal(np.asarray(jax.device_get(getattr(got, name))),
                                       np.asarray(jax.device_get(getattr(ref, name))))
-    a = jnp.arange(8.0).reshape(2, 2, 2)
-    assert ms._match_layout(a, a) is a
+    from common.collectives import transpose_xy
+    for x in (jnp.asarray(Wcp), jnp.asarray(np.abs(Wcp) > np.median(np.abs(Wcp)))):
+        np.testing.assert_array_equal(
+            np.asarray(jax.device_get(transpose_xy(jax.device_put(x, sh), mesh))),
+            np.swapaxes(np.asarray(x), -1, -2))
