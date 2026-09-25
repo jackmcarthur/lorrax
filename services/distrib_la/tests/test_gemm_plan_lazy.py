@@ -13,8 +13,9 @@ from distrib_la import gemm_plan
 @pytest.mark.parametrize('active', [False,True])
 @pytest.mark.parametrize('beta', [0.,.3])
 def test_no_dummy_allocations_first_scan_and_donation(monkeypatch,layout,active,beta):
-    if jax.device_count()!=4 or (layout=='face' and jax.process_count()!=4):
-        pytest.skip('requires P4 CUDA or four-device CPU for axis')
+    cpu=jax.devices()[0].platform=='cpu'
+    if jax.device_count()!=4 or (layout=='face' and jax.process_count()!=4 and not cpu):
+        pytest.skip('requires P4 CUDA or a four-device CPU mesh')
     mesh=Mesh(np.asarray(jax.devices()).reshape(2,2),('x','y'))
     module=importlib.import_module('distrib_la.matmul_plan')
     def forbidden(*args,**kwargs):
