@@ -1639,22 +1639,41 @@ def make_kconv_kminor(mesh: Mesh, kgrid, x_spec: P, k_spec: P, *,
 # The local Fourier plan's CUDA leg (``common.fourier_plan.LocalFourierPlan``)
 # =============================================================================
 FOURIER_PLAN_TARGET = "lorrax_fourier_plan_mathdx"
+# The nvidia-mathdx wheels the plan's fused pair is validated with: its NVRTC build
+# defines CCCL's structured-bindings include guard to reconcile the wheel's CUTLASS
+# with CUDA 13's CCCL (fourier_plan_cuda_ffi.cc, pair_kernel).  Another version refuses
+# at startup until the pair is rebuilt and re-validated against it.
+PAIR_MATHDX_WHEELS = ("25.6.0",)
 
 
 def require_fourier_plan(mesh: Mesh, *, announce: bool = True) -> str:
     """Startup check of ``LocalFourierPlan``'s leg on this mesh; returns it or refuses.
 
     CUDA: the ``lorrax_fourier_plan_mathdx`` handler must be in the loaded library
-    (the plan's CUDA leg is that one custom call); cpu: the XLA ops, nothing
-    to probe.
+    (the plan's CUDA leg is that one custom call) and the nvidia-mathdx wheel one
+    of :data:`PAIR_MATHDX_WHEELS`; cpu: the XLA ops, nothing to probe.
     """
+    from importlib.metadata import PackageNotFoundError, version
     from ffi.gate import announce_once, mesh_ffi_platform
     if mesh_ffi_platform(mesh) != "CUDA":
         return "xla"
     _require_target(FOURIER_PLAN_TARGET, "CUDA")
+    try:
+        wheel = version("nvidia-mathdx")
+    except PackageNotFoundError:
+        wheel = None
+    if wheel not in PAIR_MATHDX_WHEELS:
+        raise RuntimeError(
+            f"GATE mathdx-pair-wheel: got nvidia-mathdx {wheel}; want one of "
+            f"{PAIR_MATHDX_WHEELS}; why: the Fourier plan's fused pair is NVRTC-built from the "
+            "wheel's cuBLASDx/CUTLASS with a CCCL include-guard define validated for those "
+            "versions only; fix: install nvidia-mathdx==25.6.0, or rebuild the pair against the "
+            "new wheel (tests/test_fourier_plan.py on the ffi leg) and add it to "
+            "ffi.fft.PAIR_MATHDX_WHEELS")
     announce_once(("fourier_plan", "cuda"),
                   f"[fourier_plan] LocalFourierPlan CUDA leg: {FOURIER_PLAN_TARGET} "
-                  "(cuBLAS Fourier GEMMs + one cuFFT group)", scope="rank0", emit=announce)
+                  f"(cuBLAS Fourier GEMMs, the fused cuBLASDx pair on nvidia-mathdx {wheel}, one "
+                  "cuFFT group)", scope="rank0", emit=announce)
     return "ffi"
 
 

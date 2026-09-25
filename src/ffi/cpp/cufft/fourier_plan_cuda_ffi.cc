@@ -29,8 +29,9 @@
 //     sphere → box chain).  Chosen when the plan is built, from the shape and
 //     the device's opt-in shared memory; a pair that does not fit runs as two
 //     cuBLAS GEMMs.  The kernel is NVRTC-built per (N1', K1, N2', K2) from the
-//     nvidia-mathdx wheel (`mathdx_root`) through common/nvrtc_build, disk
-//     cached under `cubin_dir` by that service's key rule.
+//     nvidia-mathdx wheel (`mathdx_root`; the version require_fourier_plan
+//     admits, see pair_kernel) through common/nvrtc_build, disk cached under
+//     `cubin_dir` by that service's key rule.
 //
 // Plans (device matrices, remap tables, cuFFT plans) are cached per
 // (device, attributes, shape) for the process lifetime.  cuFFT's work areas
@@ -194,34 +195,6 @@ lrx_plan_pair(const T* __restrict__ X, T* __restrict__ Y, const T* __restrict__ 
 }
 )__lrx__";
 
-// The wheel's CUTLASS (3.9) forward-declares std::tuple_size/tuple_element as
-// variadic under NVRTC; CCCL 3 (CUDA 13) declares them with one type
-// parameter, and NVRTC refuses the redeclaration.  When the toolkit's CCCL has
-// the one-parameter form, these headers go to NVRTC as embedded headers with
-// CCCL's form (an embedded header shadows the include path; its text is keyed).
-static const char* const kCuteRtcHeaders[] = {
-    "cute/container/array.hpp", "cute/container/array_subbyte.hpp", "cute/container/tuple.hpp",
-    "cute/container/type_list.hpp", "cute/numeric/arithmetic_tuple.hpp"};
-
-static bool cute_rtc_headers(const std::string& cutlass, const std::string& cuda_inc,
-                             std::vector<std::pair<std::string, std::string>>* out) {
-    static const std::string variadic =
-        "template <class... _Tp>\nstruct tuple_size;\n\ntemplate <size_t _Ip, class... _Tp>\nstruct tuple_element;\n";
-    static const std::string single =
-        "template <class _Tp>\nstruct tuple_size;\n\ntemplate <size_t _Ip, class _Tp>\nstruct tuple_element;\n";
-    std::string sb = nvrtc::read_file(cuda_inc + "/cccl/cuda/std/__tuple_dir/structured_bindings.h");
-    if (sb.empty()) sb = nvrtc::read_file(cuda_inc + "/cuda/std/__tuple_dir/structured_bindings.h");
-    if (sb.find("template <class _Tp>\nstruct tuple_size;") == std::string::npos) return true;
-    for (const char* name : kCuteRtcHeaders) {
-        std::string text = nvrtc::read_file(cutlass + "/" + name);
-        if (text.empty()) return false;
-        const size_t at = text.find(variadic);
-        if (at != std::string::npos) text.replace(at, variadic.size(), single);
-        out->emplace_back(name, std::move(text));
-    }
-    return true;
-}
-
 struct PairKernel {
     CUfunction fn = nullptr;
     int threads = 0, smem = 0, grid = 0;
@@ -256,17 +229,22 @@ static ffi::Error pair_kernel(int dev, int64_t n1, int64_t k1, int64_t n2, int64
                               "from its cuBLASDx headers); fix: pip install nvidia-mathdx");
     PairKernel k;
     k.smem = int(pair_smem(n1, k1, n2, k2));
-    k.threads = std::max(n1 * n2, k1 * k2) >= 1024 ? 256 : 128;
+    // A warp when the smaller GEMM output has < 128 elements (16³ box → sphere, (8,16)x(8,16):
+    // 20 µs at 32 threads against 82 µs at 128), else 128 (best or within 5% from 12 to 48).
+    k.threads = std::min(n1 * k2, n1 * n2) < 128 ? 32 : 128;
     const int per_sm = std::max(1, std::min(smem_sm / (k.smem + 1024), 2048 / k.threads));
     k.grid = sms * per_sm;
-    std::vector<std::pair<std::string, std::string>> hdrs;
-    if (!cute_rtc_headers(root + "/external/cutlass/include", cuda_inc, &hdrs))
-        return err("pair: unreadable CUTLASS header under " + root + "/external/cutlass/include");
     nvrtc::Program prog;
     prog.src = kPairSrc;
     prog.name = "lrx_plan_pair.cu";
-    for (const auto& h : hdrs) prog.headers.emplace_back(h.first.c_str(), h.second.c_str());
+    // The nvidia-mathdx 25.6 wheel's CUTLASS 3.9 declares std::tuple_size/tuple_element
+    // variadic under NVRTC, and CCCL 3 (CUDA 13) declares them with one parameter in
+    // cuda/std/__tuple_dir/structured_bindings.h: NVRTC refuses the pair.  Its include guard
+    // is defined, so CCCL's declarations (structured bindings of cuda::std types, unused
+    // here) drop out and CUTLASS's stand.  The wheel version is checked at startup
+    // (ffi.fft.require_fourier_plan, GATE mathdx-pair-wheel) and keys the cubin.
     prog.defs = {"--std=c++17", "--device-as-default-execution-space", "-diag-suppress=1215",
+                 "-D_CUDA_STD___TUPLE_STRUCTURED_BINDINGS_H",
                  "--gpu-architecture=sm_" + std::to_string(cc_major) + std::to_string(cc_minor),
                  "-DLRX_N1=" + std::to_string(n1), "-DLRX_K1=" + std::to_string(k1),
                  "-DLRX_N2=" + std::to_string(n2), "-DLRX_K2=" + std::to_string(k2),
