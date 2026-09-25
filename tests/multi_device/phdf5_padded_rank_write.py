@@ -214,7 +214,7 @@ def _raw_write(fh, ds_id, A, mesh, spec, offset, valid, enc):
         return ffi_write_call(
             A_local, h_l, off_l, vs_l,
             mesh_shape=mesh_shape,
-            axis_count_per_dim=acpd, axis_flat=aflat)
+            axis_count_per_dim=acpd, axis_flat=aflat, independent=False)
 
     tok = shard_map(_per_rank, mesh=mesh,
                     in_specs=(spec, P(), P(), P()), out_specs=P(),
@@ -237,7 +237,7 @@ def _raw_read(fh, ds_id, local_shape, mesh, spec, offset, valid, enc):
         return ffi_read_call(
             out_struct, h_l, off_l, vs_l,
             mesh_shape=mesh_shape,
-            axis_count_per_dim=acpd, axis_flat=aflat)
+            axis_count_per_dim=acpd, axis_flat=aflat, independent=False)
 
     out = shard_map(_per_rank, mesh=mesh,
                     in_specs=(P(), P(), P()), out_specs=spec,

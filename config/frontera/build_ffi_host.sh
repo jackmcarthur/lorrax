@@ -248,7 +248,7 @@ echo "[build_host] CUDA-free OK."
 # ScaLAPACK group carries the two GEMM/FFT handlers because they ride its
 # link line, not because they call ScaLAPACK.
 WANT="PhdfReadHostFfi PhdfReadKchunkHostFfi PhdfReadKchunkUnionHostFfi \
-PhdfWriteHostFfi"
+PhdfWriteHostFfi PhdfWriteIndependentHostFfi"
 if [ -n "$LORRAX_SLATE_HOST_INSTALL_DIR" ]; then
     # SLATE group.
     WANT="$WANT SlateEighHostFfi SlatePotrfHostFfi SlateTrsmHostFfi \
