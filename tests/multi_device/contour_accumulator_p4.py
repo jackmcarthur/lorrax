@@ -1,4 +1,8 @@
-"""P4 native/JAX stream byte parity, including ragged output tiles."""
+"""P4 gate: the CUDA contour accumulator (``lorrax_contour_accumulate``) against the
+XLA stream it replaces, byte for byte, including ragged output tiles.
+
+Run: ``lx run -N 1 -G 4 -n 4 python3 -u tests/multi_device/contour_accumulator_p4.py <out_dir>``.
+"""
 from pathlib import Path
 import json
 import os

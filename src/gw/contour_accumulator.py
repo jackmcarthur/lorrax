@@ -5,15 +5,20 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import PartitionSpec as P
 
-from ffi.common.ffi_loader import get_lib
+from ffi.common.ffi_loader import probe_target
+
+TARGET = "lorrax_contour_accumulate"
 
 
 @lru_cache(maxsize=None)
-def _register():
-    lib = get_lib("CUDA")
-    jax.ffi.register_ffi_target(
-        "lorrax_contour_accumulate", jax.ffi.pycapsule(lib.ContourAccumulateFfi),
-        platform="CUDA", api_version=1)
+def _require():
+    """The loader registers the target from its CUDA table; refuse by name if unusable."""
+    ok, why = probe_target(TARGET, "CUDA")
+    if not ok:
+        raise RuntimeError(
+            f"GATE ffi-handler: got no usable {TARGET} ({why}); want the CUDA contour "
+            "accumulator; fix: use the sealed bundle, or rebuild both legs from this tree "
+            "and pin them (LORRAX_FFI_SO, LORRAX_FFI_HOST_SO).")
 
 
 def contour_accumulator(mesh):
@@ -36,7 +41,7 @@ def contour_accumulator(mesh):
         to the accumulator. XLA may copy a non-donated input; account for
         that in compiled memory. CUDA complex128 only; no collectives.
     """
-    _register()
+    _require()
 
     @partial(jax.shard_map, mesh=mesh,
              in_specs=(P(None, None, 'x', 'y'), P(None, 'x', 'y'), P()),
@@ -51,7 +56,7 @@ def contour_accumulator(mesh):
                 or any(n < 1 for n in accumulator.shape)):
             raise ValueError("contour accumulator shape mismatch")
         return jax.ffi.ffi_call(
-            "lorrax_contour_accumulate",
+            TARGET,
             jax.ShapeDtypeStruct(accumulator.shape, accumulator.dtype),
             input_output_aliases={0: 0},
             vmap_method="sequential",
