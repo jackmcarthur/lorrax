@@ -4879,6 +4879,10 @@ def _map_output_eigensystem(inputs, state_out):
     (:func:`_write_sc_seed`) both read the output eigenvectors, so one device
     eigh serves both: per-k solves k-sharded over the mesh, ``U`` replicated
     (:func:`final_qp_eigenstates`, the seed's kernel), no host eigensolve.
+    The replicated ``U`` is 16 * nk * nb^2 B per device and per host, the
+    same bound and figures as the SC carry (TASTE 1, Sigma window); at the
+    nk 144 / nb 2000 envelope point this eigh peaks 25.3 GB above the
+    resident H share on P4 (the staged solve plus the replicated U).
     """
     return final_qp_eigenstates(
         state_out, n_occ=int(inputs.meta.nelec), mesh_xy=inputs.mesh_xy)
@@ -5887,6 +5891,10 @@ def _run_anderson(
     # thing that crosses this seam — nk never changes, and at nb_pad == nb
     # both directions collapse to exactly the pre-pad spelling.
     def _to_carry(A):
+        # REPLICATED BY DESIGN (TASTE 1: bounded by the Sigma window): one
+        # 16 * nk * nb^2 B carry per device on the loop's k-set -- 16 MB at
+        # CrI3 16x16 (star wedge 30, nb 183), 33 MB at VI3 12x12 (144, 120),
+        # 9.2 GB at the nk 144 / nb 2000 envelope point.
         return _place(A if nb_pad == nb else A[:, :nb, :nb], mesh)
 
     def _to_entry(A):
