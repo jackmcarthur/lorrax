@@ -12,7 +12,7 @@ children) is sharded over G slots; the kernel's Z_q(μ, G) -- G-space pair
 GEMM, one all-to-all to the μ owners, planes (cylinder, axis DFT, 2D FFT),
 the plane k-convolution (the identity plan, phase and L/R split on load), LR+RL completion, forward plane FFT
 and axis-phase accumulation -- goes through the write-once store (pinned host
-tiles and a slab_io file) and both read layouts, and must match the dense sum
+tiles and a slab_io file) and its q-local read, and must match the dense sum
 over the full-BZ children,
 
     Z_q(μ, G) = FFT_r[e^{-iq·r} (Z_q + conj Z_{-q})(μ, r)],
@@ -23,7 +23,7 @@ for a current channel.  Red twin (TASTE 21): the ζ-sphere axis index shifted
 by one must miss by more than 1e-3; for the currents, channel 1 compared
 against the γ̃^2 reference must miss too.  The transverse solve seam
 (``_logical_solve('lu')``: the sign-aware ridged LU of an indefinite C) is
-checked against a dense solve on both finalize layouts.
+checked against a dense solve.
 Run: ``lx run -N 1 -G 4 -n 4 python3 -u tests/multi_device/zeta_mubatch_p4.py``.
 """
 from __future__ import annotations
@@ -158,7 +158,7 @@ def run_case(case, fx, mesh, scratch, vertices=(0,)):
     rank = NamedSharding(mesh, P(("x", "y")))
 
     def run_g(tabs, placement="host", c_out=None, n_blk=1):
-        """One store per channel; returns [{layout: Z}] in ``vertices`` order.
+        """One store per channel; returns [{"q": Z}] in ``vertices`` order.
         ``c_out=1, n_blk=2`` streams each owner's rows through the planes one
         at a time, the plane axis in two blocks."""
         ob = zmb.owner_orbit_batches(plan, mu_pad, 4,
@@ -181,9 +181,9 @@ def run_case(case, fx, mesh, scratch, vertices=(0,)):
             rows = kern(cbar_d, *ops, g3_d, put_rep(xmu), put_rep(live), *tabs, unf, lt)
             for zs, r in zip(stores, rows):
                 zs.write_batch(beta, r)
-        out = [{lay: np.concatenate([parity._host(zs.read_tile(i, layout=lay))
-                                     for i in range(zs.n_Gt)], axis=2)[:len(q_sel), :, :ngk]
-                for lay in ("q", "g")} for zs in stores]
+        out = [{"q": np.concatenate([parity._host(zs.read_tile(i))
+                                     for i in range(zs.n_Gt)], axis=2)[:len(q_sel), :, :ngk]}
+               for zs in stores]
         for zs in stores:
             zs.close()
         return out
@@ -219,32 +219,31 @@ def run_case(case, fx, mesh, scratch, vertices=(0,)):
 
 
 def _check_finish(mesh):
-    """The finalize's one-collective reshards (q-local all-to-all, partial-sum
-    reduce-scatter) against the host reference, both μ splits."""
+    """The finalize's one-collective reshard (q-local all-to-all) against the
+    host reference, both μ splits."""
     from isdf import zeta_mubatch as zmb
     rng = np.random.default_rng(7)
     Q, Q_pad, a, b = 3, 4, 8, 4
     worst = 0.0
-    for layout, shape, spec in (("q", (Q_pad, a, b), P(("x", "y"), None, None)),
-                                ("g", (4, Q, a, b), P(("x", "y"), None, None, None))):
-        x = rng.standard_normal(shape) + 1j * rng.standard_normal(shape)
-        want = x[:Q] if layout == "q" else x.sum(axis=0)
-        for split in ("xy", "mu"):
-            got = parity._host(zmb._to_mu_owner(mesh, layout, Q, split)(
-                parity._put(x, NamedSharding(mesh, spec))))
-            e = parity._rel(got, want)
-            worst = max(worst, e)
-            if jax.process_index() == 0:
-                print(f"{TAG} finish layout={layout} split={split}  rel={e:.2e}", flush=True)
-            if not e <= TOL:
-                raise SystemExit(f"{TAG} FAIL finish {layout}/{split}: {e:.3e}")
+    shape, spec = (Q_pad, a, b), P(("x", "y"), None, None)
+    x = rng.standard_normal(shape) + 1j * rng.standard_normal(shape)
+    want = x[:Q]
+    for split in ("xy", "mu"):
+        got = parity._host(zmb._to_mu_owner(mesh, Q, split)(
+            parity._put(x, NamedSharding(mesh, spec))))
+        e = parity._rel(got, want)
+        worst = max(worst, e)
+        if jax.process_index() == 0:
+            print(f"{TAG} finish split={split}  rel={e:.2e}", flush=True)
+        if not e <= TOL:
+            raise SystemExit(f"{TAG} FAIL finish {split}: {e:.3e}")
     return worst
 
 
 def _check_transverse_seam(mesh):
     """Route G's current-channel solve, ζ = (C + δI)⁻¹ Z for an INDEFINITE C,
     through the hoisted LU factor and ``zeta_mubatch._v_tile_kernel``'s
-    ``'lu'`` seam, on both finalize layouts, against a dense solve."""
+    ``'lu'`` seam, against a dense solve."""
     from isdf import zeta_mubatch as zmb
     from isdf.core import (_factor_c_q_transverse_lu, _transverse_lu_ridge,
                            zeta_factor_resident)
@@ -261,37 +260,26 @@ def _check_transverse_seam(mesh):
     LU, piv = _factor_c_q_transverse_lu(
         parity._put(C, NamedSharding(mesh, P(None, "x", "y"))), mesh, mu)
     worst = 0.0
-    for tier, layout in (("local", "q"), ("replicated", "g")):
-        F = zeta_factor_resident(LU, piv, mesh, zeta_gather=tier, solver_kind="lu")
-        if layout == "g":
-            F = tuple(jax.lax.with_sharding_constraint(a, NamedSharding(mesh, P()))
-                      for a in F)
-        q_axis = padded_axis(Q, 4, name="seam q rows")
-        if layout == "q":
-            Zt = parity._put(np.concatenate([Z, np.zeros((q_axis.carrier - Q, mu, g))]),
-                             NamedSharding(mesh, P(("x", "y"), None, None)))
-            ngk = np.r_[np.full(Q, g), np.zeros(q_axis.carrier - Q)].astype(np.int32)
-            ops = (parity._put(np.zeros((q_axis.carrier, g), complex),
-                               NamedSharding(mesh, P(("x", "y"), None))),
-                   parity._put(ngk, NamedSharding(mesh, P(("x", "y")))),
-                   parity._put(np.zeros((q_axis.carrier, 1), np.int32),
-                               NamedSharding(mesh, P(("x", "y"), None))))
-        else:
-            Zt = parity._put(Z, NamedSharding(mesh, P(None, None, ("x", "y"))))
-            rep = NamedSharding(mesh, P())
-            ops = (parity._put(np.zeros((Q, g), complex), rep),
-                   parity._put(np.full(Q, g, np.int32), rep),
-                   parity._put(np.zeros((Q, 1), np.int32), rep))
-        step = zmb._v_tile_kernel(mesh, layout, "lu", mu, g, debug_m=False, with_v=False)
-        acc = zmb._zero_accumulators(mesh, layout, q_axis.carrier, Q, mu, 1,
-                                     debug_m=False, with_v=False)
-        got = parity._host(step(F, Zt, *ops, jnp.int32(0), *acc)[3])[:Q]
-        e = parity._rel(got, want)
-        worst = max(worst, e)
-        if jax.process_index() == 0:
-            print(f"{TAG} transverse seam layout={layout}  rel={e:.2e}", flush=True)
-        if not e <= 1e-10:
-            raise SystemExit(f"{TAG} FAIL transverse seam {layout}: {e:.3e}")
+    F = zeta_factor_resident(LU, piv, mesh, solver_kind="lu")
+    q_axis = padded_axis(Q, 4, name="seam q rows")
+    Zt = parity._put(np.concatenate([Z, np.zeros((q_axis.carrier - Q, mu, g))]),
+                     NamedSharding(mesh, P(("x", "y"), None, None)))
+    ngk = np.r_[np.full(Q, g), np.zeros(q_axis.carrier - Q)].astype(np.int32)
+    ops = (parity._put(np.zeros((q_axis.carrier, g), complex),
+                       NamedSharding(mesh, P(("x", "y"), None))),
+           parity._put(ngk, NamedSharding(mesh, P(("x", "y")))),
+           parity._put(np.zeros((q_axis.carrier, 1), np.int32),
+                       NamedSharding(mesh, P(("x", "y"), None))))
+    step = zmb._v_tile_kernel(mesh, "lu", mu, g, debug_m=False, with_v=False)
+    acc = zmb._zero_accumulators(mesh, q_axis.carrier, mu, 1,
+                                 debug_m=False, with_v=False)
+    got = parity._host(step(F, Zt, *ops, jnp.int32(0), *acc)[3])[:Q]
+    e = parity._rel(got, want)
+    worst = max(worst, e)
+    if jax.process_index() == 0:
+        print(f"{TAG} transverse seam  rel={e:.2e}", flush=True)
+    if not e <= 1e-10:
+        raise SystemExit(f"{TAG} FAIL transverse seam: {e:.3e}")
     # Red twin: the PSD seam (cplus) on the same indefinite C drops half of it.
     from isdf import cplus
     lam_c, V = np.linalg.eigh(C)

@@ -367,11 +367,11 @@ def _zeta_fit_provenance(*, wfn, meta, cfg, band_range_left, band_range_right,
 		'zeta_rcond':           _dep_env_record(
 			"LORRAX_ZETA_RCOND", cfg.backend.zeta_rcond),
 		'charge_zeta_solve':    str(cfg.backend.charge_zeta_solve),
-		# GAUGE tier of the charge-channel factor.  Every ζ tier is a
-		# whole-tile factor (`local`/`replicated` are bit-identical gather
-		# granularities), so a fresh fit stamps `replicated`; a stamp from
-		# the deleted distributed tier (block-cyclic pzheevd, a different
-		# gauge) therefore refits.  A stamp MISSING this key is whole-tile.
+		# GAUGE of the charge-channel factor.  Every ζ fit applies a
+		# whole-tile factor, stamped with its historical spelling
+		# `replicated` so stored ζ stay reusable; a stamp from the deleted
+		# distributed tier (block-cyclic pzheevd, a different gauge)
+		# therefore refits.  A stamp MISSING this key is whole-tile.
 		'distributed_zeta_solve': 'replicated',
 		# TRANSVERSE solve family + cut: the ridge LU family is the only one,
 		# so a fresh fit stamps ('ridge', None); a stamp from the deleted
@@ -1582,13 +1582,11 @@ def _plan_route_g_for_channel(
 
 	Resolves the planner's inputs once for both families: the fit-window
 	band union, the ζ sphere, and the resident raw-parent ψ carrier the fit
-	runs beside (``16·n_parent·n_s·μ·N_b`` over ``P/2`` in the face layout,
-	over ``1/p_x + 1/p_y`` band-complete).  Returns the dict ``fit_zeta``
+	runs beside (``16·n_parent·n_s·μ·N_b`` over ``P/2``, the face layout).  Returns the dict ``fit_zeta``
 	reads: ``mubatch`` (the :class:`gw.gflat_memory_model.MuBatchPlan`),
 	its ``band_chunk`` / ``centroid_k_chunk``, and ``memory_estimate``.
 	"""
 	from gw.gflat_memory_model import plan_zeta_route_g
-	from isdf.core import _resolve_zeta_gather
 	mem = cfg.memory
 	_zeta_left, _zeta_right = zeta_fit_band_ranges(
 		band_slices,
@@ -1607,16 +1605,13 @@ def _plan_route_g_for_channel(
 	mu = int(getattr(meta, "n_rmu_padded", None) or meta.n_rmu)
 	psi_face_bytes = 16.0 * int(n_parent) * int(meta.nspinor) * mu * int(
 		band_slices.b4 - band_slices.b0) * 2.0 / (p_x * p_y)
-	_tier = _resolve_zeta_gather(
-		str(cfg.backend.distributed_zeta_solve),
-		n_rmu=int(meta.n_rmu_padded), nq=n_q_selected, mesh_xy=mesh_xy)
 	_psi_ng = int(psi_ngkmax) if psi_ngkmax else _ngkmax
 	_r = (3.0 * _psi_ng / (4.0 * math.pi)) ** (1.0 / 3.0)
 	_n_a = max(int(v) for v in meta.fft_grid)
 	mubatch_plan = plan_zeta_route_g(
 		meta=meta, mesh_xy=mesh_xy, n_q_selected=n_q_selected,
 		ngkmax=_ngkmax, psi_ngkmax=_psi_ng, fit_nb=_zeta_fit_nb,
-		zeta_tier=_tier, budget_gb=float(mem.per_device_gb),
+		budget_gb=float(mem.per_device_gb),
 		target_utilization=(mem.chunk_target_utilization
 		                    if mem.chunk_target_utilization > 0 else None),
 		psi_face_bytes=float(psi_face_bytes),
@@ -1808,7 +1803,6 @@ def _fit_charge_zeta_channel(
                 distrib_la_batched_route=cfg.backend.distrib_la_batched_route,
                 zeta_ridge=cfg.backend.zeta_ridge,
                 charge_zeta_solve=cfg.backend.charge_zeta_solve,
-                distributed_zeta_solve=cfg.backend.distributed_zeta_solve,
                 zeta_rcond=cfg.backend.zeta_rcond,
                 write_ibz_only=_write_ibz_only_charge,
                 zeta_cutoff_ry=_zeta_cutoff,
@@ -1937,14 +1931,11 @@ def _fit_transverse_zeta_channels(
         return transverse_wfn_data, None
     parent_T = transverse_wfn_data['green_parent']
     print_fn(f"  [bispinor] μ_L={missing} → one route-G loop")
-    # Every channel fresh on the q-local tier: the six TT tiles are formed
-    # from the three live ζ in one pass (q-sharded accumulators), and a ζ_T
-    # file is written only for restart or reuse.  With a channel accepted for
-    # reuse, or on the G-split tier (six whole (Q, μ, μ) accumulators per
-    # rank), the V_q forms the TT tiles from files, so the fresh channels
-    # write theirs.
-    tt_from_fit = (len(missing) == 3
-                   and _chunks_T['mubatch'].finalize_layout == 'q')
+    # Every channel fresh: the six TT tiles are formed from the three live ζ
+    # in one pass (q-sharded accumulators), and a ζ_T file is written only
+    # for restart or reuse.  With a channel accepted for reuse, the V_q forms
+    # the TT tiles from files, so the fresh channels write theirs.
+    tt_from_fit = len(missing) == 3
     write_T = (bool(getattr(cfg, 'write_restart_tensors', True))
                or not tt_from_fit)
     with timing.section("gw_jax.zeta_fit_transverse"), \
@@ -1962,7 +1953,6 @@ def _fit_transverse_zeta_channels(
             distributed_lu=cfg.backend.distributed_lu,
             distrib_la_batched_route=cfg.backend.distrib_la_batched_route,
             zeta_ridge=cfg.backend.zeta_ridge,
-            distributed_zeta_solve=cfg.backend.distributed_zeta_solve,
             bispinor_lift=(representation.current_lift or "raw"),
             write_ibz_only=_write_ibz_only_transverse,
             zeta_cutoff_ry=_zeta_cutoff,

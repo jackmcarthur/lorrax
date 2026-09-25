@@ -31,6 +31,10 @@ that (owner; sandbox `TASTE.md` 96).
   its projected bands for the call. The post-fit band-complete view and its
   `4·G_tile` admission are gone, so no resident copy competes with the GN
   fit, the GN tail or a second (SC) ψ bundle.
+* **The ζ back-solve is q-local.** Each whole-tile factor stays on its q
+  owners (`16·⌈Q/P⌉·μ²` per rank) and only the right-hand side moves; with
+  `Q < P` the ranks past `Q` idle in the solve. The replicated `16·Q·μ²`
+  tier and `LORRAX_ZETA_GATHER_CAP_GIB` are gone.
 * **Spin pairs always stream for `n_s > 1`.** The step-occupation χ₀ with
   the charge vertex, Σ_x, the Coulomb hole and Σ_c(τ) build one `(a, b)`
   spinor block of the Green at a time at full k, whatever the budget. The
@@ -579,8 +583,7 @@ keys themselves are in the [input reference](../input_reference.md).
 - **`resolve_linalg`** interprets `linalg = local | distributed` exactly once
   into `LinalgResolution`; no stage reinterprets the dial. `distributed`
   distributes the W Dyson solve, the transverse LU and the eigensolvers; the ζ
-  back-solve is always a whole-tile factor whose `local`/`replicated` tier the
-  planner chooses (`zeta_auto_tier`). The internal
+  back-solve is always a whole-tile factor applied on its q owners. The internal
   `distributed_lu = 'distributed'` sentinel lowers to cuSolverMp on CUDA and
   ScaLAPACK on CPU.
 - **`eigh_backend_choices`** reads `distrib_la.BACKEND_CHOICES`, importable

@@ -150,7 +150,7 @@ per-object byte table). The charge channel is one fit; the three bispinor
 current channels are one fit with `n_v = 3` channels at μ_T. Per rank:
 
 ```text
-fixed    = n_v · C factor (16·⌈Q/P⌉·μ², q-local tier; 16·Q·μ², replicated tier)
+fixed    = n_v · C factor (16·⌈Q/P⌉·μ², whole tiles on their q owners)
          + centroid faces + sphere and cylinder index tables
 Ψ        = 16·N_k·N_b·n_s·⌈N_Gψ/P⌉                        ψ(G), device-resident
 work(b)  = max over the batch's three stages (GEMM + all-to-all;

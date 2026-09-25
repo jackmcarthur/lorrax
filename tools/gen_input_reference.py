@@ -58,7 +58,6 @@ KEYS: dict[str, tuple[str, str]] = {
     "centroids_file_current": ("ISDF / zeta", "Second centroid table (Gordon-current weight) for the bispinor transverse channels; empty = not set."),
     "zeta_ridge": ("ISDF / zeta", "Opt-in Tikhonov ridge epsilon on the charge CCT (fraction of mean diagonal); 0 = bit-identical historical factor. Env LORRAX_ZETA_RIDGE."),
     "charge_zeta_solve": ("ISDF / zeta", "Charge zeta conditioner: rank_truncate (default; rank-revealing eigh pseudo-inverse) or the historical cholesky."),
-    "distributed_zeta_solve": ("ISDF / zeta", "Zeta back-solve tier: replicated | per_q | distributed (nothing O(mu^2) replicated); auto = replicated under the 4 GiB gather cap, else per_q."),
     "zeta_rcond": ("ISDF / zeta", "Rank-truncation cutoff relative to lambda_max (default 1e-8, low end of the recovery plateau). Env LORRAX_ZETA_RCOND."),
     "zeta_cutoff": ("ISDF / zeta", "Zeta-sphere G-cutoff (Ry) for per-q zeta_q_G writes; None = ecutwfc; must be >= bare_coulomb_cutoff."),
     "gamma_contract_mode": ("ISDF / zeta", "HLO variant of the gamma-tilde double contraction: take (default) | einsum | scan; math-identical."),
