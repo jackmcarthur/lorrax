@@ -476,9 +476,8 @@ the file at once:
 Refused before any tensor bytes move: a spinor extent outside {1, 2, 4}, a
 torn transverse pair, charge and transverse faces with different
 parent-row counts, and a stamped `n_rmu_transverse_logical` that differs
-from the dataset's μ extent. The read is an element selection. Face and
-axis layouts agree bit for bit
-(`tests/multi_device/restart_bundle_consumers_gate.py`).
+from the dataset's μ extent. The read is an element selection into the
+band-distributed face specs.
 
 ---
 

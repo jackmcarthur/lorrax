@@ -106,9 +106,8 @@ select the charge and transverse tables; ζ and restart provenance bind each
 role to the content hash of its FFT-index table. The loader does not infer a
 table's role by parsing comment text. $N$ and $M$ may differ because orbit
 closure and pivoted-Cholesky pruning act on different weights. Wavefunctions
-are sampled once per centroid set. Under
-`low_mem_bands=true`, each sample is immediately converted to its own
-two-face carrier; charge and transverse carriers remain separate because
+are sampled once per centroid set, and each
+sample is immediately converted to its own two-face carrier; charge and transverse carriers remain separate because
 their centroid axes have different meanings and extents. The resulting
 $\zeta^{\mu_L}_q$ files must stay paired with the centroid identity in their
 fit provenance.

@@ -27,13 +27,8 @@ faces sampled at the raw parents k̄:
 psi_mun[parent, spin, mu, band]        psi_nmu[parent, band, spin, mu]
 ```
 
-`low_mem_bands` ([input reference](../input_reference.md)) selects between two
-layouts that solve the same equations:
-
-- **`true`, the face layout (default).** The fit keeps mesh-face copies and
-  distributes the band contraction.
-- **`false`, the axis layout.** The fit keeps single-axis centroid copies
-  with complete bands and contracts bands locally.
+The fit keeps the band-distributed mesh-face copies (bands on one mesh
+axis, centroids on the other) and distributes the band contraction.
 
 Canonical ζ files do not encode the layout. The left and right band windows
 are 0/1 weights over the loaded, mesh-padded band extent, so a window edge

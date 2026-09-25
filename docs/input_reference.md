@@ -61,16 +61,16 @@ The material class is inferred from the WFN occupations; no deck key selects it.
 | `zeta_rcond` | float | `1e-8` | Rank-truncation cutoff of the charge CCT, relative to λ_max. A cut that discards directions while the achieved κ_eff exceeds the certified 1e8 refuses ([rank-truncation policy](dev/rank_truncation_policy.md)). |
 | `zeta_ridge` | float | `0.0` | Tikhonov ridge on the charge CCT, as a fraction of the mean diagonal; `0` means no ridge. Only the `cholesky` charge family reads it; the `rank_truncate` factor that both `linalg` layouts resolve does not. |
 | `zeta_cutoff` | float | unset (= ecutwfc) | G-sphere cutoff (Ry) of the per-q ζ_q(G) writes. It must be ≥ `bare_coulomb_cutoff`. |
-| `low_mem_bands` | bool | `true` | Raw-parent ψ layout. `true`: two mesh-face copies with distributed band contractions. `false`: two single-axis centroid copies with complete bands and local band contractions, which use more memory. The Green's-function, screening and projection algorithms are the same for both. |
 | `linalg` | str | `local` | Dense linear-algebra layout. `local`: each task factors ⌈N_q,irr/P⌉ whole N_μ×N_μ matrices (the startup report prints the complex128 GiB per task). `distributed`: 2-D block-distributed matrices through the `distrib_la` providers (cuSOLVERMp/cuBLASMp on CUDA, ScaLAPACK on CPU) for the W Dyson solve, the transverse ζ LU and the eigensolvers; the charge ζ solve stays whole-tile (route G). The value does not invalidate a restart. |
 | `memory_per_device_gb` | float | `0.0` | Per-device budget for the chunk planners; `0` auto-detects it. |
 | `vq_g_chunk_size` | int | `0` | G-axis tile of the V_q GEMM. `0` lets `v_q_g_flat._plan_vq_tiles` choose. |
 | `gamma_contract_mode` | str | `take` | HLO variant of the γ̃ double contraction: `take`, `einsum` or `scan`. All three are mathematically identical. |
 
-**Raw-parent GW.** The Green's-function contraction consumes diagonal band
-occupations (`occupation_state`); an explicit dense `Gij` passed to
-`compute_sigma_xc` refuses under either `low_mem_bands` layout
-(`GATE low_mem_bands_explicit_gij_unported`).
+**Raw-parent GW.** ψ is stored band-distributed, bands on one mesh axis and
+centroids on the other ([memory model](architecture/memory-model.md)). The
+Green's-function contraction consumes diagonal band occupations
+(`occupation_state`); an explicit dense `Gij` passed to `compute_sigma_xc`
+refuses (`GATE explicit_gij_unported`).
 
 A centroid set that is not closed under the symmetry orbits runs unreduced: a
 WARNING names the set, `SymMaps.trivial_view()` selects loader-unfolded full-k

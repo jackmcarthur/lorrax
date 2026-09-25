@@ -176,8 +176,8 @@ def _shared_pole_factor_specs(layout):
 def _shared_pole_contract(b_X, b_Y, weights, *, gemm, layout="face"):
     """W(τ) = b d b† through G's configured face or axis contraction.
 
-    Factors [q,mu,spin,K] use G's face placement when low_mem_bands is
-    enabled; the axis layout keeps K replicated and divides each centroid
+    Factors [q,mu,spin,K] use G's face placement under ``layout='face'``;
+    the axis layout keeps K replicated and divides each centroid
     endpoint over its assigned mesh axis.  The result always uses both axes.
     The causal weight [q,K] is separate and replicated. The permutations
     below are local axis views, giving exactly psi_mun and psi_nmu layouts.

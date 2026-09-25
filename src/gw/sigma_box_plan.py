@@ -512,7 +512,8 @@ def _build_box(box, eta, *, widen):
     a nonlinear fit with many certified local solutions, so a request moved
     by round-off (extreme shared-pole edges differ 1e-9-4e-8 relative between
     two exact GEMM orders) otherwise lands on a different rule. Every Fe 4^3
-    bispinor window rule differed between low_mem_bands true and false, and
+    bispinor window rule differed between the face and band-complete ψ
+    contraction orders, and
     eqp1 by 0.32 meV (P2-E, 2026-09-24). On the 1e-4 grid a perturbed
     request maps to the same build box, hence the same rule bit for bit,
     unless it straddles a cell edge (probability ~ perturbation / 1e-4).
