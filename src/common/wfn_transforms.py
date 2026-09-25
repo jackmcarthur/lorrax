@@ -295,14 +295,14 @@ def box_to_sphere(box: jax.Array, index: jax.Array) -> jax.Array:
     """Box ``(n_k, ..., Bx, By, Bz)`` → sphere ``(n_k, ..., ngk)``: slot ``g``
     reads the box's flat C-order cell ``index[k, g]``; a pad slot (out of the
     box) reads 0.  The union box with its compact index, or the grid with the
-    sphere index: one gather either way.
+    sphere index: one gather either way.  With one k (``index (1, ngk)``)
+    the box may carry any leading axes, e.g. ``(c, 1, ..., Bx, By, Bz)``.
     """
     flat = box.reshape(box.shape[:-3] + (-1,))
-    # Per k, one take of whole slices along the flat cell axis (a broadcast
-    # take_along_axis builds an index per output element: 1.6x the ket at
-    # CrI3 16x16 ns 4).
-    return jax.vmap(lambda b, i: jnp.take(b, i, axis=-1, mode='fill', fill_value=0))(
-        flat, index)
+    take = lambda b, i: jnp.take(b, i, axis=-1, mode='fill', fill_value=0)
+    if int(index.shape[0]) == 1:        # one k: any leading axes, one take
+        return take(flat, index[0])
+    return jax.vmap(take)(flat, index)
 
 
 def sphere_transforms(fft_grid, supports, *, mesh, norm: str = "ortho"):

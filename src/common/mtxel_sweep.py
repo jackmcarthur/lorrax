@@ -519,9 +519,9 @@ def four_current_potential_operator(
         for i, (perm, phase) in enumerate(alpha_vertices):
             phi_vector = phi_vector + V1[i] * gamma_apply(
                 psi_r, perm, phase, axis=2)
-        # (k, band, spinor, component, x, y, z): one batched forward transform.
-        out = to_sphere(jnp.stack((phi_scalar, phi_vector), axis=3)) * fft_scale
-        out = jnp.moveaxis(out, 3, -1)
+        # (component, k, band, spinor, x, y, z): one batched forward transform.
+        out = to_sphere(jnp.stack((phi_scalar, phi_vector), axis=0)) * fft_scale
+        out = jnp.moveaxis(out, 0, -1)
         return out * gmask[None, None, None, :, None].astype(out.dtype)
 
     return Operator(
