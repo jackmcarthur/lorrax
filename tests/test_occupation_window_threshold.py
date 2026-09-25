@@ -646,3 +646,29 @@ def test_the_static_occupation_projector_is_not_thresholded():
     assert "Gij[:, idx, idx] = f_win" in src
     assert "hartree density would be missing weight carried by bands" in (
         src.lower())
+
+
+@pytest.mark.parametrize("solver,explicit,expected", [
+    ("self_consistent", "", 1.0-np.finfo(np.float64).eps),
+    ("self_consistent", "occupation_window_threshold = 0.995", 0.995),
+    ("one_shot_dft", "", 0.995),
+])
+def test_sc_default_keeps_states_across_old_cutoff(tmp_path, solver, explicit, expected):
+    from gw.gw_config import LorraxConfig
+    from gw.ppm_windows import branches_for_omega_grid
+    deck = tmp_path / "gw.in"
+    deck.write_text(f"[cohsex]\nsys_dim = 3\ncompute_mode = mpa\n"
+                    f"sigma_w_model = shared_pole\nnval = 4\nncond = 20\n"
+                    f"number_bands = 40\nqp_solver = {solver}\n{explicit}\n")
+    config = LorraxConfig.from_input_file(str(deck), print_fn=lambda _: None)
+    assert config.mpa.occupation_window_threshold == expected
+    weights = jnp.asarray([[0.00499944814812, 0.00500410083235, 1e-18]])
+    branches = branches_for_omega_grid(
+        np.asarray([0.1]), E_cond=weights*0+1, H_val=weights*0-1,
+        cond_mask=weights != 1, val_mask=weights != 0,
+        cond_weight=1-weights, val_weight=weights,
+        occupation_window_threshold=config.mpa.occupation_window_threshold)
+    val = next(b for b in branches if b.space == "val")
+    np.testing.assert_array_equal(np.asarray(val.base_mask_A),
+                                  [[expected > 0.995, True, False]])
+    np.testing.assert_array_equal(np.asarray(val.band_weight), np.asarray(weights))
