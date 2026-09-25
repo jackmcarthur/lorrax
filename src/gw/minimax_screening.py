@@ -469,69 +469,46 @@ def fit_gn_ppm_from_wc_pair(
             raise ValueError(
                 "fit_gn_ppm_from_wc_pair: q_neg_index must be an involution "
                 f"over [0,{_nq}).")
-    # ONE q-slice of the LOCAL tile, which is what the sizer prices (its
-    # arena is per device).  Pricing the global (mu, nu) slice over-chunked
-    # by the device count: VI3 12x12, mu 3200, forced q_block = 1 at P16 and
-    # at P100, i.e. 144 eager slice/fit/reshard rounds per map instead of 6
-    # and 1.  The chunking is movement-only (see the sizer), so the fitted
-    # values are bit-identical at any q_block.
-    _sharding = getattr(_W0, "sharding", None)
-    _local_shape = (tuple(_sharding.shard_shape(tuple(_W0.shape)))
-                    if _sharding is not None else tuple(_W0.shape))
-    _per_q = int(_W0.dtype.itemsize)
-    for _d in _local_shape[1:]:
-        _per_q *= int(_d)
-    _qb = _gn_ppm_fit_q_block(_nq, _per_q)
+    # The q block from the device pool: one q's compiled footprint on the
+    # LOCAL (already-sharded) tile against the free bytes, the same on every
+    # process.  The chunking is movement-only (see the sizer), so the fitted
+    # values are bit-identical at any q_block; one block when it all fits.
+    kernel = _gn_ppm_fit_kernel_ordered if ordered else _gn_ppm_fit_kernel
+    _qb = _gn_ppm_fit_q_block(
+        _nq, *_gn_ppm_fit_bytes_per_q(kernel, Wc0_qmunu, Wc_probe_qmunu,
+                                      _z, _fb, n_log, _mask),
+        _gn_ppm_fit_free_bytes())
 
     # The anti-Hermitian half of the probe, kept only on the ordered path
     # (one extra (nq, mu, nu) c128 tile, needed again after the tail policy
     # has fixed the final Omega).
     a_odd = None
-    if _qb >= _nq:
+    _om, _bv, _gd, _aod = [], [], [], []
+    n_good = jnp.asarray(0.0, dtype=jnp.float64)
+    n_modes = jnp.asarray(0.0, dtype=jnp.float64)
+    omega_min = jnp.asarray(jnp.inf, dtype=jnp.float64)
+    omega_max = jnp.asarray(-jnp.inf, dtype=jnp.float64)
+    pair_rel_min = jnp.asarray(jnp.inf, dtype=jnp.float64)
+    for _q0 in range(0, _nq, _qb):
+        _q1 = min(_q0 + _qb, _nq)
+        _blk = ((Wc0_qmunu, Wc_probe_qmunu) if _qb >= _nq else
+                (Wc0_qmunu[_q0:_q1], Wc_probe_qmunu[_q0:_q1]))
+        (_o, _b, _g, _ng, _nm, _omin, _omax, _rmin, *_a) = kernel(
+            *_blk, _z, _fb, n_log, _mask)
         if ordered:
-            (omega_vals, B_vals, good, n_good, n_modes,
-             omega_min, omega_max, pair_rel_min,
-             a_odd) = _gn_ppm_fit_kernel_ordered(
-                Wc0_qmunu, Wc_probe_qmunu, _z, _fb, n_log, _mask)
-            a_odd = _match_layout(a_odd, omega_vals)
-        else:
-            # Whole thing fits: the historical single-shot call, untouched.
-            (omega_vals, B_vals, good, n_good, n_modes,
-             omega_min, omega_max, pair_rel_min) = _gn_ppm_fit_kernel(
-                Wc0_qmunu, Wc_probe_qmunu, _z, _fb, n_log, _mask)
-    else:
-        _om, _bv, _gd, _aod = [], [], [], []
-        n_good = jnp.asarray(0.0, dtype=jnp.float64)
-        n_modes = jnp.asarray(0.0, dtype=jnp.float64)
-        omega_min = jnp.asarray(jnp.inf, dtype=jnp.float64)
-        omega_max = jnp.asarray(-jnp.inf, dtype=jnp.float64)
-        pair_rel_min = jnp.asarray(jnp.inf, dtype=jnp.float64)
-        for _q0 in range(0, _nq, _qb):
-            _q1 = min(_q0 + _qb, _nq)
-            if ordered:
-                (_o, _b, _g, _ng, _nm,
-                 _omin, _omax, _rmin, _a) = _gn_ppm_fit_kernel_ordered(
-                     Wc0_qmunu[_q0:_q1], Wc_probe_qmunu[_q0:_q1],
-                     _z, _fb, n_log, _mask)
-                _aod.append(_match_layout(_a, _o))
-            else:
-                (_o, _b, _g, _ng, _nm,
-                 _omin, _omax, _rmin) = _gn_ppm_fit_kernel(
-                     Wc0_qmunu[_q0:_q1], Wc_probe_qmunu[_q0:_q1],
-                     _z, _fb, n_log, _mask)
-            _om.append(_o); _bv.append(_b); _gd.append(_g)
-            # Exact integer counts -> summation order is irrelevant.
-            n_good = n_good + _ng
-            n_modes = n_modes + _nm
-            omega_min = jnp.minimum(omega_min, _omin)
-            omega_max = jnp.maximum(omega_max, _omax)
-            pair_rel_min = jnp.minimum(pair_rel_min, _rmin)
-        omega_vals = jnp.concatenate(_om, axis=0)
-        B_vals = jnp.concatenate(_bv, axis=0)
-        good = jnp.concatenate(_gd, axis=0)
-        if ordered:
-            a_odd = jnp.concatenate(_aod, axis=0)
-        del _om, _bv, _gd, _aod
+            _aod.append(_match_layout(_a[0], _o))
+        _om.append(_o); _bv.append(_b); _gd.append(_g)
+        # Exact integer counts -> summation order is irrelevant.
+        n_good = n_good + _ng
+        n_modes = n_modes + _nm
+        omega_min = jnp.minimum(omega_min, _omin)
+        omega_max = jnp.maximum(omega_max, _omax)
+        pair_rel_min = jnp.minimum(pair_rel_min, _rmin)
+    cat = lambda xs: xs[0] if len(xs) == 1 else jnp.concatenate(xs, axis=0)
+    omega_vals, B_vals, good = cat(_om), cat(_bv), cat(_gd)
+    if ordered:
+        a_odd = cat(_aod)
+    del _om, _bv, _gd, _aod
 
     fulfilled = n_good / jnp.maximum(n_modes, 1.0)
     # Every host transfer in the fit is a scalar and deliberately outside
@@ -642,28 +619,76 @@ def fit_gn_ppm_from_wc_pair(
 # changes -- and the guards are deliberately NOT touched (see R33 note: a
 # finiteness/branch guard that costs scratch is an owner question, not
 # something to quietly restructure).
-_GN_PPM_FIT_ARENA_BUDGET_BYTES = int(
-    float(os.environ.get("LORRAX_PPM_FIT_ARENA_GIB", "8")) * 1024 ** 3)
-#: Live-footprint multiple of one (q-block, mu, nu) c128 tile.
-#: DELIBERATELY CONSERVATIVE.  Once the replicated mode-count mask is gone
-#: (R37) the measured multiple is ~4 (params + outputs + a half-tile temp), so
-#: 32 over-estimates by ~8x and therefore over-chunks.  Campaign doctrine (R5,
-#: R30.3) is that a sizer which reads HIGH is safe and one that reads LOW is
-#: not, so the value is left high on purpose; lowering it is a measured,
-#: separately-gated change, not a comment edit.  It does not affect the
-#: reference deck, which takes the single-shot path either way.
-_GN_PPM_FIT_LIVE_TILES = 32
+#
+# THE BLOCK IS SIZED FROM THE DEVICE POOL (2026-09-24).  A constant multiple
+# of the local tile read LOW on the ordered kernel: its X<->Y adjoint costs
+# ~194 local tiles per q (CrI3 16x16, mu 3998, P64: q_block 66 of an 8 GiB
+# arena compiled to 50.9 GiB and the map ran out of memory).  The footprint of
+# one q is now XLA's own memory analysis of the kernel compiled at q = 1, so
+# whatever layout the kernel lowers to is priced.
+#: Fraction of the pool's free bytes a q block may claim (fragmentation).
+_GN_PPM_FIT_POOL_FRACTION = 0.8
 
 
-def _gn_ppm_fit_q_block(nq: int, tile_bytes_per_q: int) -> int:
-    """Largest q-block whose temp arena fits the budget.  Floor 1, cap nq.
+_GN_PPM_FIT_BYTES_PER_Q: dict = {}
 
-    ``tile_bytes_per_q`` is ONE q-slice of the local (already-sharded) tile.
-    Returns ``nq`` (the historical single-shot path, bit-identical) whenever
-    the whole thing already fits.
+
+def _gn_ppm_fit_bytes_per_q(kernel, Wc0, Wprobe, *args) -> tuple[int, int]:
+    """Per-device ``(block_bytes, output_bytes)`` of ONE q through ``kernel``.
+
+    ``block_bytes`` is what a q block holds while it runs (its sliced inputs,
+    its temp arena and its outputs); ``output_bytes`` the part that stays
+    live until the blocks are concatenated.  From the kernel compiled at
+    q = 1 on the inputs' own sharding, once per (kernel, tile, layout).
     """
-    per_q = max(1, int(tile_bytes_per_q) * _GN_PPM_FIT_LIVE_TILES)
-    return max(1, min(int(nq), _GN_PPM_FIT_ARENA_BUDGET_BYTES // per_q))
+    def one_q(x):
+        return jax.ShapeDtypeStruct((1,) + tuple(x.shape[1:]), x.dtype,
+                                    sharding=getattr(x, "sharding", None))
+    key = (kernel.__name__, tuple(Wc0.shape[1:]), str(getattr(Wc0, "sharding", None)),
+           str(getattr(Wprobe, "sharding", None)), args[2], args[3] is None)
+    if key not in _GN_PPM_FIT_BYTES_PER_Q:
+        ma = kernel.lower(one_q(Wc0), one_q(Wprobe), *args).compile().memory_analysis()
+        out = int(ma.output_size_in_bytes)
+        _GN_PPM_FIT_BYTES_PER_Q[key] = (
+            int(ma.argument_size_in_bytes) + int(ma.temp_size_in_bytes) + out, out)
+    return _GN_PPM_FIT_BYTES_PER_Q[key]
+
+
+def _gn_ppm_fit_free_bytes() -> int:
+    """The device pool's free bytes, the minimum over processes.
+
+    ``LORRAX_PPM_FIT_ARENA_GIB`` overrides it (a resource cap).  A backend
+    without pool statistics (CPU) is unbounded here.
+    """
+    env = os.environ.get("LORRAX_PPM_FIT_ARENA_GIB", "").strip()
+    if env:
+        free = float(env) * 1024 ** 3
+    else:
+        st = jax.local_devices()[0].memory_stats() or {}
+        limit = st.get("bytes_limit")
+        free = (float(1 << 62) if not limit else
+                _GN_PPM_FIT_POOL_FRACTION * (limit - st.get("bytes_in_use", 0)))
+    from common.collectives import all_gather_processes
+    return int(np.min(all_gather_processes(np.asarray(int(free), dtype=np.int64))))
+
+
+def _gn_ppm_fit_q_block(nq: int, block_bytes_per_q: int, out_bytes_per_q: int,
+                        free_bytes: int) -> int:
+    """Largest q block that fits ``free_bytes``, cap ``nq``; refuses below one q.
+
+    Every block's outputs stay live until the concatenation, which writes
+    them once more, so ``2·nq·out`` is reserved before the block is priced.
+    """
+    room = int(free_bytes) - 2 * int(nq) * int(out_bytes_per_q)
+    qb = room // max(1, int(block_bytes_per_q))
+    if qb < 1:
+        raise ValueError(
+            "GATE gn_ppm_fit_capacity: one q of the GN-PPM fit needs "
+            f"{block_bytes_per_q / 1e9:.2f} GB/dev beside {nq} q of outputs "
+            f"({2 * nq * out_bytes_per_q / 1e9:.2f} GB/dev), the pool has "
+            f"{free_bytes / 1e9:.2f} GB/dev free.  Fix: more memory per "
+            "device or more ranks (the (mu, nu) tile shrinks as 1/P).")
+    return min(int(nq), int(qb))
 
 
 @partial(
