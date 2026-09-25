@@ -284,18 +284,36 @@ __device__ void pencil_pass(C* y, long long ncols, const Mid& mid) {
 
 // Group pencil pass (a Mid that mixes GROUP columns, e.g. the Lorentz vertex sum over a spin
 // group): block work item (p = (ky,kz), TY consecutive group instances); thread (member, t).
-// cols.col(inst, member) is the column of a member; mid(k, inst, member, grp) gets the group's
-// values at this k through grp[q * TY] (q = member) and returns the member's new value.
-// Shared memory: NX * GROUP * TY elements (static in the caller's kernel).
+// Each thread loads and inverse-transforms its column's x-line into shared memory, then forms
+// its own member's output from the group's values at every kx, forward-transforms and stores.
+//   cols.col(inst, member)            the column of a member;
+//   Mid::kAux                         per-(k, instance) operand elements (the 16 V[k,x,A,y,B] of a
+//                                     Lorentz block), 0 for none;
+//   mid.stage_aux(saux, p, inst0, ld) block-cooperative cp.async of those operands for every kx
+//                                     into saux[(kx*TY + t)*ld + e] (the header commits and waits);
+//   mid.bind(member)                  a per-thread functor holding the member's vertex tables in
+//                                     registers; f(grp, aux) returns the member's value from the
+//                                     group's values grp[q*TY] (q < GROUP) and the operands aux[e].
+// Shared memory (the caller's dynamic smem): NX*GROUP*TY + NX*TY*(kAux|1) elements; the odd
+// operand stride keeps the TY instances of a warp on different banks.
 template <int NX, int NY, int NZ, int Arch, int GROUP, int TY, class C, class Cols, class Mid>
-__device__ void pencil_group_pass(C* y, C* sg, long long ncols, long long n_inst, const Cols& cols,
+__device__ void pencil_group_pass(C* y, C* smem, long long ncols, long long n_inst, const Cols& cols,
                                   const Mid& mid) {
+    constexpr int LD = Mid::kAux | 1;
+    C* sg = smem;
+    C* saux = smem + NX * GROUP * TY;
     const int member = threadIdx.x / TY, t = threadIdx.x % TY;
+    const auto f = mid.bind(member);
     const long long nit = (n_inst + TY - 1) / TY;
     for (long long w = blockIdx.x; w < (long long)NY * NZ * nit; w += gridDim.x) {
-        const long long p = w / nit, inst = (w % nit) * TY + t;
+        const long long p = w / nit, inst0 = (w % nit) * TY, inst = inst0 + t;
         const bool live = inst < n_inst;
         const long long col = live ? cols.col(inst, member) : 0;
+        __syncthreads();                                  // the previous item's smem reads are done
+        if constexpr (Mid::kAux > 0) {
+            mid.stage_aux(saux, p, inst0, LD);
+            cp_async_commit();
+        }
         C v[NX];
 #pragma unroll
         for (int kx = 0; kx < NX; ++kx) {
@@ -303,13 +321,12 @@ __device__ void pencil_group_pass(C* y, C* sg, long long ncols, long long n_inst
             else { v[kx].x = 0; v[kx].y = 0; }
         }
         if constexpr (NX > 1) line_fft<NX, Arch, cufftdx::fft_direction::inverse>(v, 1);
-        __syncthreads();
 #pragma unroll
         for (int kx = 0; kx < NX; ++kx) sg[(kx * GROUP + member) * TY + t] = v[kx];
+        if constexpr (Mid::kAux > 0) cp_async_wait_all();
         __syncthreads();
 #pragma unroll
-        for (int kx = 0; kx < NX; ++kx)
-            v[kx] = mid(int(kx * NY * NZ + p), live ? inst : 0, member, sg + kx * GROUP * TY + t);
+        for (int kx = 0; kx < NX; ++kx) v[kx] = f(sg + kx * GROUP * TY + t, saux + (kx * TY + t) * LD);
         if constexpr (NX > 1) line_fft<NX, Arch, cufftdx::fft_direction::forward>(v, 1);
         if (live) {
 #pragma unroll
