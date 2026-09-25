@@ -10,7 +10,7 @@ don't.
 **MPI stack**: unified on Cray MPICH as of 2026-04-20 (was OpenMPI
 earlier in the investigation). Section 2.6 below refers to the first
 `MPI_Init_thread` cost; the number scales similarly on both stacks.
-Stack-specific tuning is in [`PORTING.md`](../PORTING.md).
+Stack-specific tuning is in [`docs/dev/env_vars.md`](../../../docs/dev/env_vars.md).
 
 **CPU: this FFI is NOT CUDA-only any more.**  It was, until workstreams
 A (read, 2026-07-25) and AE (write, 2026-07-26) made every phdf5 TU

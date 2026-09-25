@@ -242,7 +242,6 @@ def test_active_launch_recipes_never_select_the_retired_j070_lane():
         "src/ffi/cpp/gate_one_odr.py",
         "docs/installation/index.md",
         "docs/environment/machines/perlmutter.md",
-        "src/ffi/PORTING.md",
     )
     offenders = [
         relative for relative in active

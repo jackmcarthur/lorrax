@@ -12,7 +12,7 @@ two things: the kernel driver and `/dev/nvidia*`.
 
 Unlike the Perlmutter lane this one builds the **phdf5 handlers too**
 (OpenMPI + own-built parallel HDF5 1.14.6; Ubuntu's packaged HDF5 is 1.10,
-below the 1.12 floor in `src/ffi/PORTING.md`). SLATE stays out, as on every
+below the 1.12 floor in `docs/installation/ffi-native-libs.md`). SLATE stays out, as on every
 CUDA-13 lane.
 
 ## Verified (2026-08-26)

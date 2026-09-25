@@ -2,9 +2,9 @@
 
 The Python half of ``src/ffi/cpp/cblas/gemm_batch_ffi.cc``: the gate that
 decides whether the dial is on, and the single ``jax.ffi.ffi_call`` that
-issues the handler.  Per ``src/ffi/AGENTS.md:149-150`` and
-``TEMPLATE.md:10-20`` this is where an FFI target's Python lives; it used to
-live in ``common/contract_bands.py``, which is a *physics* module.
+issues the handler.  The Python half of an FFI target lives in ``src/ffi``
+beside its loader row; it used to live in ``common/contract_bands.py``,
+which is a *physics* module.
 
 Scope, stated up front so nobody "adopts" this everywhere: this is NOT a
 general GEMM service.  It is the body of ONE contraction — the large right

@@ -4,7 +4,7 @@
 # bind-mount.  Pair with `shifter --module=gpu` (no --module=mpich) so
 # the container's HPC-X OpenMPI at /opt/hpcx/ompi satisfies libmpi.
 #
-# This is the default / verified stack.  See src/ffi/PORTING.md for
+# An OpenMPI-site stage (Perlmutter pins Cray MPICH, config/perlmutter/ffi_mpi.sh).  See docs/installation/ffi-native-libs.md for
 # the Cray MPICH alternative (stage_cray.sh), which is currently
 # unstable for large collective writes.
 #

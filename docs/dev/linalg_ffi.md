@@ -107,7 +107,7 @@ environmental.
   on `mx·q + my`, and its shims hard-wire `info = 0`. `blacs_grid.h` resolves
   the provider of each routine (`dlsym` + `dladdr`) and refuses naming it;
   `LORRAX_SCALAPACK_ALLOW_SLATE_API=1` downgrades the refusal to one stderr
-  line for deliberate measurement. Detail: [`src/ffi/PORTING.md`](../../src/ffi/PORTING.md) §0b.
+  line for deliberate measurement.
 * **MKL thread team.** At production grids `pzheevd`/`pzgetrf` issue thousands
   of small BLAS calls between latency-bound BLACS collectives, and a wide MKL
   team starves MPI progress (24× at a 12×12 grid, n = 2448). The handlers pin

@@ -7,7 +7,7 @@
 // cpp/slate/context.cc and cpp/phdf5/context.cc — differing only in the tag
 // and one hazard sentence, and slate's copy carried a note deferring
 // extraction until "a THIRD library would copy it a third time"
-// (TEMPLATE.md:194-195).  The dedup was pulled forward: the two copies had
+// (the retired FFI template).  The dedup was pulled forward: the two copies had
 // already begun to drift textually, and the mechanism ("query on BOTH paths,
 // after we initialise AND after an early return because someone else already
 // did") is precisely the kind of load-bearing subtlety a divergent copy

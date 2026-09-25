@@ -21,7 +21,7 @@ LORRAX_CLOUD_STAGE="${LORRAX_CLOUD_STAGE:-$LORRAX_CLOUD_NATIVE/cusolvermp-0.9.1_
 LORRAX_CLOUD_BUILD="${LORRAX_CLOUD_BUILD:-$LORRAX_CLOUD_ROOT/src/ffi/cpp/build_cloud}"
 
 # Parallel HDF5 is built from source against the distro OpenMPI (Ubuntu's
-# libhdf5-openmpi-dev is 1.10, below the 1.12 floor in src/ffi/PORTING.md).
+# libhdf5-openmpi-dev is 1.10, below the 1.12 floor in docs/installation/ffi-native-libs.md).
 LORRAX_CLOUD_PHDF5_VERSION="${LORRAX_CLOUD_PHDF5_VERSION:-1.14.6}"
 LORRAX_CLOUD_PHDF5="${LORRAX_CLOUD_PHDF5:-$LORRAX_CLOUD_NATIVE/phdf5-$LORRAX_CLOUD_PHDF5_VERSION}"
 

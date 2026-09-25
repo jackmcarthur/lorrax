@@ -2,7 +2,7 @@
 
 LORRAX calls vendor libraries through two shared objects built from the one
 C++ tree `src/ffi/cpp/` ([ffi_layout.md §2](architecture/ffi_layout.md#2-the-one-c-tree)).
-They are deployed as one sealed pair ([§2a](architecture/ffi_layout.md#2c-the-deployable-unit-is-one-sealed-pair)).
+They are deployed as one sealed pair ([§2c](architecture/ffi_layout.md#2c-the-deployable-unit-is-one-sealed-pair)).
 This page owns how a pair is built, verified and sealed on each site, and the
 ABI rule that pairs it with a Python tree.
 
@@ -13,10 +13,13 @@ the wrong HDF5. The verifier below exists to make each of those a build failure.
 ## The two legs
 
 - `liblorrax_ffi_host.so` (host leg) is CUDA-free and built bare-metal against
-  the site compiler environment. It carries the ScaLAPACK, SLATE-CPU, CBLAS
-  GEMM, FFTW and parallel-HDF5 handlers.
-- `liblorrax_ffi.so` (CUDA leg) carries cuSOLVERMp, cuBLASMp, SLATE-CUDA,
-  parallel HDF5 and the mathdx k-convolution router.
+  the site compiler environment. It carries the ScaLAPACK, SLATE, CBLAS
+  GEMM, FFTW3-ABI FFT and parallel-HDF5 handlers.
+- `liblorrax_ffi.so` (CUDA leg) is the complete NVIDIA stack: cuSOLVERMp,
+  cuBLASMp, local cuBLAS, the active subspace, the mathdx k-convolution
+  family, the Fourier plan, the contour and spin-rotation kernels, and
+  parallel HDF5. The [kernel catalog](architecture/ffi_layout.md#kernel-catalog)
+  lists every target.
 
 In a GPU run both legs are dlopened `RTLD_GLOBAL` into one process. They
 therefore share SONAMEs (`libslate.so.2`, `libblaspp.so.2`), must link the same
@@ -50,6 +53,9 @@ manifest beside the libraries; no environment variable names it.
 Every build path ends at `scripts/verify_ffi_build.sh`, and
 `services/distrib_la/tests/test_so_acceptance.py` runs the same script as
 pytest cells, so the suite and the build agree on what a good library is.
+Its handler-name cells read `distrib_la.loader`'s tables only, and seven of
+them (both name cells and check 6) are skipped until the loader's rows
+without a C++ handler go.
 
 ```bash
 scripts/verify_ffi_build.sh --leg host build_host/liblorrax_ffi_host.so
@@ -72,7 +78,7 @@ Two further gates are properties of the pair, not of one artifact:
 
 | gate | property | where it runs |
 |---|---|---|
-| 9 | nothing LORRAX-owned is on the dynamic table, and every shared `lrx_*` entry point carries its leg's suffix | at link time in `config/perlmutter/build_ffi_host.sh` and `src/ffi/cpp/build.sh`; check 6 of `test_so_acceptance.py` intersects the two libraries |
+| 9 | nothing LORRAX-owned is on the dynamic table, and every shared `lrx_*` entry point carries its leg's suffix | at link time in `config/perlmutter/build_ffi_host.sh` and `src/ffi/cpp/build.sh`; check 6 of `test_so_acceptance.py`, skipped today, intersects the two libraries |
 | 10 | a CUDA-capable process with both libraries open does host phdf5 work | `src/ffi/cpp/gate_one_odr.py`, inside a GPU allocation |
 
 A gate that cannot run reports `COULD NOT RUN` and is counted separately; GATE
@@ -138,7 +144,7 @@ are parallel, so `diff` shows only values.
 | the SLATE install | SLATE + blaspp + lapackpp | the host leg needs `gpu_backend=none`; a CUDA blaspp makes `get_device_count()` disagree across the legs |
 | the cuSOLVERMp stage (CUDA leg) | comm path and correctness | every stage exports the same SONAME; 0.6.0 returns wrong `getrf`/`getrs` on any mesh with both P_x > 1 and P_y > 1; ≥ 0.7 is NCCL-native and needs `-DLORRAX_FFI_HAVE_CAL=OFF` |
 | the MPI include/lib dirs (CUDA leg) | which MPI the library requests | unset, CMake falls back to HPC-X OpenMPI and requests `libmpi.so.40` |
-| `CMAKE_CUDA_ARCHITECTURES` (CUDA leg) | the SASS/PTX of the nvcc translation units | defaults to `80` (A100) |
+| `CMAKE_CUDA_ARCHITECTURES` (CUDA leg) | the SASS/PTX of the nvcc translation units | defaults to SASS for sm_80/86/89/90/100/120 plus compute_80 and compute_120 PTX; NVRTC kernels compile for the device at run time |
 
 ## The ABI pairing rule
 

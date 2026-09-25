@@ -83,7 +83,7 @@ done
 
 # ---------------------------------------------------------------------------
 # Parallel HDF5 from source, against the distro OpenMPI.  Ubuntu's packaged
-# libhdf5-openmpi-dev is 1.10.x — below the 1.12 floor (src/ffi/PORTING.md).
+# libhdf5-openmpi-dev is 1.10.x — below the 1.12 floor (docs/installation/ffi-native-libs.md).
 # ---------------------------------------------------------------------------
 if [[ ! -e "$LORRAX_CLOUD_PHDF5/lib/libhdf5.so" ]]; then
     echo "[cloud setup] building parallel HDF5 $LORRAX_CLOUD_PHDF5_VERSION (once, ~5 min)"

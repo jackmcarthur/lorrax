@@ -101,7 +101,7 @@ set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
 # ----------------------------------------------------------------------------
 #  Locate cuSOLVERMp + libcal.  BGW-style: prefer -D options, else env vars,
-#  else well-known paths.  See src/ffi/PORTING.md for per-cluster notes.
+#  else well-known paths.  See docs/building_ffi.md for per-site notes.
 # ----------------------------------------------------------------------------
 set(NVHPC_ROOT "" CACHE PATH
     "Explicit NVHPC root (leave empty to autodetect from env vars and standard paths)")
@@ -196,14 +196,14 @@ else()
             "  -DCUSOLVERMP_INCLUDE_DIR=<dir with cusolverMp.h> "
             "-DCUSOLVERMP_LIB_DIR=<dir with libcusolverMp.so>\n"
             "or set \$NVHPC_ROOT / \$HPCSDK_ROOT, or install "
-            "cuda-cusolvermp-12-X.  See src/ffi/PORTING.md.")
+            "cuda-cusolvermp-12-X.  See docs/installation/ffi-native-libs.md.")
     endif()
 endif()
 
 if(NOT EXISTS "${CUSOLVERMP_INCLUDE}/cusolverMp.h")
     message(FATAL_ERROR
         "cusolverMp.h not found at ${CUSOLVERMP_INCLUDE}/.\n"
-        "See src/ffi/PORTING.md for where cuSOLVERMp usually lives and how "
+        "See docs/installation/ffi-native-libs.md for where cuSOLVERMp usually lives and how "
         "to point the build at it on a new cluster.")
 endif()
 if(NOT EXISTS "${CUSOLVERMP_LIBDIR}/libcusolverMp.so")
@@ -392,7 +392,7 @@ if(NOT HDF5_IS_PARALLEL)
         "HDF5 found at ${HDF5_INCLUDE_DIRS} is NOT built with MPI-IO.\n"
         "Load a parallel module (cray-hdf5-parallel, hdf5/1.14-openmpi, ...)\n"
         "or set HDF5_ROOT / -DHDF5_DIR=... to a parallel install.\n"
-        "See src/ffi/PORTING.md for per-cluster notes.")
+        "See docs/building_ffi.md for per-site notes.")
 endif()
 message(STATUS "HDF5: ${HDF5_VERSION} at ${HDF5_INCLUDE_DIRS} (parallel)")
 
@@ -1016,7 +1016,7 @@ set(_mklblas_on       0)
 #      It is an OVERLAY on a real ScaLAPACK, never a provider.  LORRAX
 #      REFUSES it at run time (cpp/scalapack/blacs_grid.h) because its
 #      pXheevd is bug L-2, its shims hard-code MPI_COMM_WORLD, and they
-#      hard-wire info=0.  Full measurement: src/ffi/PORTING.md §0b.
+#      hard-wire info=0.  Refusal: docs/dev/linalg_ffi.md.
 #  Workstream L (2026-07-25) had to hand-inject the link line via
 #  -DCMAKE_SHARED_LINKER_FLAGS on every configure — that gap is closed here.
 #

@@ -49,7 +49,7 @@
 // resolver is the entire point.
 //
 // `docs/dev/vendor_gemm_service.md:174-186` proposed exactly this file and
-// recorded it as "Not done in this wave"; TEMPLATE.md:194-195's own
+// recorded it as "Not done in this wave"; the retired FFI template's own
 // threshold ("extract when a THIRD library would copy it a third time") was
 // already met.  This is that extraction.
 //

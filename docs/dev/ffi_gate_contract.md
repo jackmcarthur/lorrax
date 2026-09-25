@@ -17,6 +17,8 @@ k-convolution router. The router is not a `Gate`: `ffi.fft.kconv_backend(mesh)`
 returns `mathdx` on CUDA and `plan` on cpu and refuses any other platform, and
 `require_kconv(mesh)` checks the nvidia-mathdx wheel and its targets (CUDA) or
 the flat-k plan target (cpu) at startup ([FFI layout](../architecture/ffi_layout.md)).
+Every handler, its gate and its door: the
+[kernel catalog](../architecture/ffi_layout.md#kernel-catalog).
 
 ## API
 

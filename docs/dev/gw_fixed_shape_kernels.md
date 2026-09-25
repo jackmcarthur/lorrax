@@ -52,5 +52,6 @@ Validation is split:
 
 For changes to the loop or layouts, inspect optimized P4 HLO and compiled
 memory statistics as well as numerical outputs. The distributed GEMM and
-FFT custom calls must still consume rank-local tiles. HLO collective counts
+FFT custom calls ([kernel catalog](../architecture/ffi_layout.md#kernel-catalog))
+must still consume rank-local tiles. HLO collective counts
 do not describe communication or private workspace inside native providers.
