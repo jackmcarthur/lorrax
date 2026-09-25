@@ -56,8 +56,6 @@ reads the planes ``[start, start + size)`` of axis 1 of ``Fa`` in place.
 
 from __future__ import annotations
 
-from itertools import permutations, product
-from math import prod
 from typing import Mapping
 
 import numpy as np
@@ -157,8 +155,7 @@ class LocalFourierPlan:
     ``in_support``/``out_support`` map an axis (as written in ``axes``) to an
     integer index array.  ``plan(x)`` requires ``x.dtype == dtype`` and the
     compact extent on every in-support axis, the full extent elsewhere.
-    ``out_perm`` returns ``jnp.transpose(y, out_perm)`` instead of ``y``, at no
-    cost when the GEMM chain can write that order directly (see ``_route``).
+    ``out_perm`` returns ``jnp.transpose(y, out_perm)`` instead of ``y``.
     ``device_kind`` defaults to the kind of ``mesh``'s first device, else
     ``jax.devices()[0]``'s (it chooses GEMM axes only, never correctness).
     The leg is chosen when the call is lowered, from the platform it is
@@ -166,8 +163,8 @@ class LocalFourierPlan:
     custom call on CUDA, XLA ops elsewhere, so a CPU operand in a GPU process
     takes the XLA leg.  Contract on every platform: complex128, at most three
     transform axes (``GATE fourier-plan-contract`` otherwise).
-    ``plan.stages`` lists ``(axis, 'gemm'|'fft', n_in, n_out)``; GEMM stages
-    of equal ``n_out/n_in`` may execute in either order.  ``in_gather`` (with
+    ``plan.stages`` lists ``(axis, 'gemm'|'fft', n_in, n_out)`` in execution
+    order on both legs.  ``in_gather`` (with
     the caller's ``mesh``) is the cylinder-plane form of the module docstring;
     only it takes ``plan(x, start, size)``.
     """
@@ -255,17 +252,14 @@ class LocalFourierPlan:
             self.stages.append((ax, "fft", i_idx.size, o_idx.size))
         # Shrinking GEMMs first, then the FFT group (its embeddings, one
         # multidimensional transform, its restrictions), expanding GEMMs last;
-        # within a ratio the last-listed axis first (``_route`` may reorder
-        # equal ratios and chooses where each GEMM writes its new axis).
+        # within a ratio the last-listed axis first.
         rank = {ax: -i for i, ax in enumerate(axes)}       # minor-most listed axis first
         order = sorted(range(len(gemm)), key=lambda s: (gemm[s][0], rank[gemm[s][1]]))
         pre = [("gemm", gemm[s][1], gemm[s][2]) for s in order if gemm[s][0] < 1]
         post = [("gemm", gemm[s][1], gemm[s][2]) for s in order if gemm[s][0] >= 1]
         mid = embed + ([("fft", tuple(fft), None)] if fft else []) + take
         self._ops = pre + mid + post
-        self._groups = (pre, mid, post)
         self.out_perm = None if out_perm is None else tuple(int(a) for a in out_perm)
-        self._routes = {}
         if _cuda_present(mesh):         # the CUDA leg's handler must be loaded before lowering
             from ffi.fft import FOURIER_PLAN_TARGET, _require_target
             _require_target(FOURIER_PLAN_TARGET, "CUDA")
@@ -293,43 +287,29 @@ class LocalFourierPlan:
         return jax.lax.platform_dependent(x, cuda=self._call_ffi, default=self._call_xla)
 
     def _call_xla(self, x):
-        """The XLA leg: GEMMs as ``dot_general``, the FFT group as one ``jnp.fft`` call."""
+        """The XLA leg: each GEMM contracts its axis in place (``tensordot``, the new
+        axis moved back to that position), the FFT group is one ``jnp.fft`` call.
+
+        A transpose-minimising route search over GEMM orders and output placements
+        (1.13-1.40x on this leg's GEMM chains, claim 2745) was removed 2026-09-25:
+        <4% of FFT time on every NVIDIA platform we target, because GEMM axes run
+        on the CUDA leg there and cpu, the XLA leg's platform, has no GEMM row.
+        """
         nd = x.ndim
-        target = list(range(nd)) if self.out_perm is None else [a % nd for a in self.out_perm]
-        if sorted(target) != list(range(nd)):
-            raise ValueError(f"LocalFourierPlan: out_perm {self.out_perm} is not a "
-                             f"permutation of {nd} axes")
-        key = (x.shape, tuple(target))
-        if key not in self._routes:
-            self._routes[key] = self._route(x.shape, target)
-        _, ops, places = self._routes[key]
         fft = local_fftn3 if self.sign < 0 else local_ifftn3
-        phys = list(range(nd))          # phys[p]: the logical axis stored at position p
-        places = iter(places)
-        for kind, ax, A in ops:
+        for kind, ax, A in self._ops:
             if kind == "fft":
-                x = fft(x, axes=tuple(phys.index(a % nd) for a in ax), norm=self.norm)
+                x = fft(x, axes=tuple(a % nd for a in ax), norm=self.norm)
                 continue
-            a = ax % nd
-            p = phys.index(a)
+            p = ax % nd
             if kind == "embed":         # one gather; out-of-range K reads zero
                 x = jnp.take(x, jnp.asarray(A), axis=p, mode="fill", fill_value=0)
             elif kind == "take":
                 x = jnp.take(x, jnp.asarray(A), axis=p)
-            else:
-                if 0 < p < nd - 1:      # a middle axis: one transpose to make it minor
-                    x = jnp.moveaxis(x, p, -1)
-                    phys.append(phys.pop(p))
-                    p = nd - 1
-                phys.remove(a)
-                if next(places):        # (rest, N'): the new axis minor
-                    x = jax.lax.dot_general(x, jnp.asarray(A), (((p,), (1,)), ((), ())))
-                    phys.append(a)
-                else:                   # (N', rest): the new axis major
-                    x = jax.lax.dot_general(jnp.asarray(A), x, (((1,), (p,)), ((), ())))
-                    phys.insert(0, a)
-        if phys != target:
-            x = jnp.transpose(x, [phys.index(a) for a in target])
+            else:                       # A (N', K) against axis p (K)
+                x = jnp.moveaxis(jnp.tensordot(x, jnp.asarray(A), axes=((p,), (1,))), -1, p)
+        if self.out_perm is not None:
+            x = jnp.transpose(x, [a % nd for a in self.out_perm])
         return x
 
     def _call_ffi(self, x):
@@ -368,47 +348,3 @@ class LocalFourierPlan:
         if self.out_perm is not None:
             y = jnp.transpose(y, [a % nd for a in self.out_perm])
         return y
-
-    def _route(self, shape, target):
-        """The GEMM order (within equal ratios) and output placements that
-        move the fewest elements through explicit transposes.
-
-        A GEMM contracts its axis where it lies when that axis is major or
-        minor, and writes the new axis major or minor for free (the operand
-        transposes live inside the GEMM); a middle axis costs one transpose,
-        and so does a final order other than ``target``.  At most
-        ``3!·2³ = 48`` candidates; the first minimum wins, so every rank
-        chooses the same route.
-        """
-        nd = len(shape)
-        pre, mid, post = self._groups
-
-        def orders(group):              # permutations within runs of equal ratio
-            runs = {}
-            for op in group:
-                runs.setdefault(op[2].shape[0] / op[2].shape[1], []).append(op)
-            return [sum(c, []) for c in product(*[[list(q) for q in permutations(r)]
-                                                  for r in runs.values()])]
-
-        best = None
-        for ops in (a + mid + b for a in orders(pre) for b in orders(post)):
-            n_g = sum(op[0] == "gemm" for op in ops)
-            for places in product((0, 1), repeat=n_g):
-                dims, phys, cost, it = list(shape), list(range(nd)), 0, iter(places)
-                for kind, ax, A in ops:
-                    if kind == "fft":
-                        continue
-                    a = ax % nd
-                    if kind != "gemm":
-                        dims[a] = len(A)
-                        continue
-                    if 0 < phys.index(a) < nd - 1:
-                        cost += prod(dims)
-                    phys.remove(a)
-                    dims[a] = A.shape[0]
-                    phys = phys + [a] if next(it) else [a] + phys
-                if phys != target:
-                    cost += prod(dims)
-                if best is None or cost < best[0]:
-                    best = (cost, ops, places)
-        return best
