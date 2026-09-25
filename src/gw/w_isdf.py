@@ -109,24 +109,18 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int],
             "why: the finite-temperature vertex columns are not gated yet")
     if bool(ordered) and not fermi_dirac:
         raise ValueError("_get_chi_minimax_kernel: ordered is a Fermi-Dirac kernel option")
-    # The identity-vertex step response traces the spin pairs elementwise,
-    # chi = sum_ab Gc_ab conj(Gv_ab), so when the whole-spin kernel's live
-    # Greens (Gv, Gc and the unfold transient, ~3 G_tile) exceed the device
-    # target it streams one (a, b) block at a time (phase-1 item A4).
-    spin_pairs = (vertex_pairs is None and not fermi_dirac
-                  and face_shape is not None and int(face_shape[3]) > 1
-                  and right_face_shape is None
-                  and not isinstance(k_unfold_plan, tuple))
-    if spin_pairs:
-        from .greens_function_kernel import spin_pairs_needed
-        spin_pairs = spin_pairs_needed(
-            n_full=nk, n_rmu=int(face_shape[2]), ns=int(face_shape[3]),
-            mesh=mesh_xy, live_green_tiles=3)
+    # The identity-vertex step response on a raw-parent plan reads the two parent
+    # Greens straight into the chi0 pass (ffi.fft.make_kconv_chi_unfold, mathdx
+    # mode 11): the unfold is the transform's load, the spin trace its Mid, and no
+    # full-k Green exists, so the live set is the two parent Greens.
+    fused = (vertex_pairs is None and not fermi_dirac and face_shape is not None
+             and right_face_shape is None and k_unfold_plan is not None
+             and not isinstance(k_unfold_plan, tuple))
     cache_key = (_mesh_key(mesh_xy), kgrid, ffi_dial_key(), n_out,
                  complex_contour, layout, face_shape, right_face_shape,
                  vertex_classes, (tuple(id(p) for p in k_unfold_plan)
                                if isinstance(k_unfold_plan, tuple) else id(k_unfold_plan)),
-                 spin_pairs)
+                 fused)
     if fermi_dirac:
         cache_key = cache_key + ("fermi_dirac", bool(ordered))
     if cache_key in _chi_minimax_kernel_cache:
@@ -136,8 +130,8 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int],
         raise ValueError(
             "_get_chi_minimax_kernel(layout='face') requires "
             "face_shape=(nk, nb_full, n_rmu, nspinor)")
-    if spin_pairs:
-        kernel = _get_chi_minimax_kernel_spin_pairs(
+    if fused:
+        kernel = _get_chi_minimax_kernel_fused(
             mesh_xy, kgrid, nk, n_out, complex_contour, face_shape,
             k_unfold_plan=k_unfold_plan, layout=layout)
     else:
@@ -469,95 +463,63 @@ def _get_chi_minimax_kernel_face(mesh_xy, kgrid, nk, n_out, complex_contour,
     return minimax_tau_integrate_chi
 
 
-def _get_chi_minimax_kernel_spin_pairs(mesh_xy, kgrid, nk, n_out, complex_contour,
-                                       face_shape, *, k_unfold_plan=None,
-                                       layout="face"):
-    """The step-occupation, identity-vertex response streamed over spin pairs.
+def _get_chi_minimax_kernel_fused(mesh_xy, kgrid, nk, n_out, complex_contour,
+                                  face_shape, *, k_unfold_plan, layout="face"):
+    """The step-occupation, identity-vertex response read from the raw-parent Green pair.
 
-        chi_R(mu, nu) = sum_tau alpha_tau sum_ab Gc_ab(R; tau) conj(Gv_ab(R; tau))
+        chi_R(mu, nu) = sum_tau alpha_tau sum_ab conj(Gc'_ab) Gv'_ab   (+ c.c., real contour)
 
-    The spin trace is elementwise in ``(mu, nu)``, so each ``(a, b)`` block is
-    built, transformed and accumulated on its own.  The parents are unfolded
-    to full k once per call (the typed ψ action, whose Green equals the
-    operator unfold of the parent Green), so a block Green is one GEMM of the
-    ``a`` and ``b`` spinor rows at full k.  No full ``ns^2`` Green exists: the
-    live Green set is four ``16·N_k·μ²/P`` blocks, ``ns^2`` times smaller than
-    the whole-spin kernel's (phase-1 item A4).  Same signature and output as
+    with ``G' = ifftn_k`` of the typed unfold of each parent Green: one GEMM per Green at
+    the parents, then ``ffi.fft.make_kconv_chi_unfold`` (mathdx mode 11) unfolds both on
+    its load, transforms, traces the spins and accumulates chi_R in place.  The live set
+    is the two parent Greens and the accumulator; a real contour reads the antiunitary
+    partner as ``conj(G)`` on the load, a complex one reads the conjugate-face parent
+    Green.  One forward transform after the tau sum.  Same signature and output as
     :func:`_get_chi_minimax_kernel_face` for ``vertex_pairs=None``.
     """
-    from common.fft_helpers import make_flat_k_fftn
+    from common.fft_helpers import make_flat_k_fftn, make_kconv_chi_unfold
     from common.wfn_layout import psi_specs
     from distrib_la import gemm_plan
-    from .greens_function_kernel import (build_G_tau, pair_stream_layout, spin_pair_rows,
-                                         to_pair_stream_layout, unfold_parent_faces)
+    from .greens_function_kernel import build_G_tau
     from .wavefunction_bundle import CHI_Q_SPEC as _chi_spec, CHI_R_SPEC as _chi_R_spec
 
     psi_nmu_spec, psi_mun_spec = psi_specs(layout)
     nk_in, nb_full, n_rmu, ns = (int(v) for v in face_shape)
-    pair_layout = pair_stream_layout(n_full=nk, ns=ns, mu=n_rmu, nb=nb_full,
-                                     layout=layout, mesh=mesh_xy)
-    expected_input_nk = nk if k_unfold_plan is None else k_unfold_plan.n_parent
-    if nk_in != expected_input_nk:
-        raise ValueError("chi spin pairs: face k extent disagrees with its parent plan.")
-    if k_unfold_plan is not None and k_unfold_plan.n_full != nk:
-        raise ValueError("chi parent plan full-k extent disagrees with kgrid.")
+    if nk_in != k_unfold_plan.n_parent or k_unfold_plan.n_full != nk:
+        raise ValueError("chi parent plan: face k extent or full-k extent disagrees with its plan.")
+    door = make_kconv_chi_unfold(mesh_xy, kgrid, k_unfold_plan.unfold_load_tables(),
+                                 n_out=n_out, complete=not complex_contour, norm="ortho")
     chi_fftn = make_flat_k_fftn(mesh_xy, kgrid, _chi_spec, norm='ortho')
     chi_R_shard = NamedSharding(mesh_xy, _chi_R_spec)
-    psi_mun_shard = NamedSharding(mesh_xy, psi_mun_spec)
-    psi_nmu_shard = NamedSharding(mesh_xy, psi_nmu_spec)
+    acc_shard = NamedSharding(mesh_xy, P(None, None, "x", "y"))
     rep0, rep1, rep2 = (NamedSharding(mesh_xy, s) for s in (P(), P(None), P(None, None)))
-    # One planned block GEMM at full k, shared by every Gv/Gc block build.
-    g_plan = gemm_plan(mesh_xy, m=n_rmu, k=nb_full, n=n_rmu, nq=nk,
-                       dtype=jnp.complex128, layout=pair_layout, enable_active_range=True)
-
-    def to_full_k(psi_mun, psi_nmu, tables):
-        if k_unfold_plan is None:
-            return (psi_mun, psi_nmu) + tuple(tables)
-        rows = jnp.asarray(k_unfold_plan.irr_idx)
-        return (unfold_parent_faces(k_unfold_plan, psi_mun, psi_nmu, layout=layout)
-                + tuple(jnp.take(v, rows, axis=0) for v in tables))
-
+    # One planned GEMM at the parents, shared by every Gv and Gc build.
+    g_plan = gemm_plan(mesh_xy, m=n_rmu * ns, k=nb_full, n=n_rmu * ns, nq=nk_in,
+                       dtype=jnp.complex128, layout=layout, enable_active_range=True)
     nodes_shard = MinimaxNodes(t=rep1, alpha=rep1 if n_out == 1 else rep0)
 
     def integrate(nodes, psi_mun, psi_nmu, mask_v, mask_c, enk_full, vmax, cmin):
-        psi_mun, psi_nmu, mask_v, mask_c, enk_full = to_full_k(
-            psi_mun, psi_nmu, (mask_v, mask_c, enk_full))
-        psi_mun, psi_nmu = to_pair_stream_layout(psi_mun, psi_nmu, layout=pair_layout,
-                                                 mesh=mesh_xy)
-        zero = jax.lax.with_sharding_constraint(
-            jnp.zeros((nk, n_rmu, n_rmu), dtype=jnp.complex128), chi_R_shard)
+        acc0 = jax.lax.with_sharding_constraint(
+            jnp.zeros((n_out, nk, n_rmu, n_rmu), dtype=jnp.complex128), acc_shard)
         alpha_rows = (nodes.alpha[:, None] if n_out == 1 else jnp.transpose(nodes.alpha))
-
-        def block_green(left, right, t, ref, mask):
-            G = build_G_tau(left, right, enk_full, t, e_ref=ref, mask=mask,
-                            layout=pair_layout, gemm=g_plan, trim_zero_bands=True,
-                            conjugate=True)
-            return chi_fftn(jax.lax.with_sharding_constraint(
-                G.reshape(nk, n_rmu, n_rmu), chi_R_shard))
 
         def node(acc, xs):
             t_scalar, alpha_col = xs
             tau = t_scalar if complex_contour else jnp.real(t_scalar).astype(jnp.float64)
             t_c = jnp.conj(tau) if complex_contour else tau
+            green = lambda t, ref, mask: build_G_tau(
+                psi_mun, psi_nmu, enk_full, t, e_ref=ref, mask=mask, layout=layout,
+                gemm=g_plan, k_unfold_plan=k_unfold_plan, trim_zero_bands=True, unfold=False)
+            Gv = green(-tau, vmax, mask_v)
+            Gc = green(t_c, cmin, mask_c)
+            partners = (Gv.transpose, Gc.transpose) if complex_contour else ()
+            return door(acc, Gv.G, Gc.G, alpha_col.astype(jnp.complex128), *partners), None
 
-            def pair(chi, index):
-                left, right = spin_pair_rows(psi_mun, psi_nmu, index, ns)
-                Gv_R = block_green(left, right, -tau, vmax, mask_v)
-                # Finish the valence block before the conduction GEMM starts.
-                Gv_R, left = jax.lax.optimization_barrier((Gv_R, left))
-                Gc_R = block_green(left, right, t_c, cmin, mask_c)
-                return jax.lax.with_sharding_constraint(
-                    chi + Gc_R * jnp.conj(Gv_R), chi_R_shard), None
+        acc, _ = jax.lax.scan(node, acc0, (nodes.t, alpha_rows), unroll=1)
+        return tuple(chi_fftn(acc[o]) for o in range(n_out))
 
-            chi_tau, _ = jax.lax.scan(pair, zero, jnp.arange(ns * ns), unroll=1)
-            if not complex_contour:
-                chi_tau = _complete_static_vertex_orientations(chi_tau)
-            return tuple(a + alpha_col[i] * chi_tau for i, a in enumerate(acc)), None
-
-        final_R, _ = jax.lax.scan(node, (zero,) * n_out, (nodes.t, alpha_rows), unroll=1)
-        return tuple(chi_fftn(value) for value in final_R)
-
-    in_shardings = (nodes_shard, psi_mun_shard, psi_nmu_shard, rep2, rep2, rep2, rep0, rep0)
+    in_shardings = (nodes_shard, NamedSharding(mesh_xy, psi_mun_spec),
+                    NamedSharding(mesh_xy, psi_nmu_spec), rep2, rep2, rep2, rep0, rep0)
     if n_out >= 2:
         return jax.jit(integrate, in_shardings=in_shardings,
                        out_shardings=tuple(chi_R_shard for _ in range(n_out)))

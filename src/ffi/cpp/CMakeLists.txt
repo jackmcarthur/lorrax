@@ -549,7 +549,15 @@ if(LORRAX_CUFFT_ON)
         "${NVRTC_INCLUDE_DIR}")
     target_include_directories(build_kconv_mathdx_cuda PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}"
-        "${CMAKE_CURRENT_SOURCE_DIR}/common")
+        "${CMAKE_CURRENT_SOURCE_DIR}/common"
+        "${CMAKE_CURRENT_BINARY_DIR}/generated")
+    # The k-box stage's text for NVRTC (cufft/kbox_stage_src.h.in): regenerated whenever
+    # kbox_stage.cuh changes, so the embedded header and the host launch rule are one file.
+    file(READ "${CMAKE_CURRENT_SOURCE_DIR}/cufft/kbox_stage.cuh" LRX_KBOX_SRC)
+    configure_file("${CMAKE_CURRENT_SOURCE_DIR}/cufft/kbox_stage_src.h.in"
+                   "${CMAKE_CURRENT_BINARY_DIR}/generated/kbox_stage_src.h" @ONLY)
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+                 "${CMAKE_CURRENT_SOURCE_DIR}/cufft/kbox_stage.cuh")
     target_compile_options(build_kconv_mathdx_cuda PRIVATE
         -Wall -Wextra)
     # The CUDA FFT leg: the nvidia-mathdx k-convolution family (the cuFFT
