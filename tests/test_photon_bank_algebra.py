@@ -171,7 +171,7 @@ def check_photon_bank_store(mesh, path, *, resident=False):
     raw = np.arange(nq*ns*n*n).reshape(nq,ns,n,n).astype(complex)*(1+.3j)
     w, moment = put(raw), put(raw[:,0])
     header = store.write_shared_pole_bank(path,q_span=(0,nq),sample_span=(0,ns),
-        Wc=w,dWc_ds=2*w,Wc_mirror=3*w,dWc_mirror_ds=4*w,
+        Wc=w,dWc_ds=2*w,
         M0=moment,M1=2*moment,M2=3*moment,M3=4*moment,constant=-moment,
         meta=meta,expected_identity=identity,mesh_xy=mesh)
     assert header['complete']

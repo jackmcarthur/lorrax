@@ -555,8 +555,10 @@ def run_store_checks(mesh,root):
     raw=np.arange(nq*2*n*n).reshape(nq,2,n,n).astype(complex)*(1+.2j)
     device=fixture._device(raw,mesh,P(None,None,'x','y'))
     moment=fixture._device(raw[:,0],mesh,P(None,'x','y'))
+    header=store.write_shared_pole_bank(path,q_span=(0,nq),sample_span=(0,1),
+        Wc_minus_q=3*device[:,:1],dWc_minus_q_ds=4*device[:,:1],
+        meta=meta,expected_identity=identity,mesh_xy=mesh)
     header=store.write_shared_pole_bank(path,q_span=(0,nq),sample_span=(0,2),Wc=device,dWc_ds=2*device,
-        Wc_mirror=3*device,dWc_mirror_ds=4*device,
         M0=moment,M1=moment,M2=moment,M3=moment,constant=moment,
         meta=meta,expected_identity=identity,mesh_xy=mesh)
     for endpoints in ((0,0),(1,1),(0,1),(1,0)):
@@ -568,9 +570,11 @@ def run_store_checks(mesh,root):
         with patch.object(SlabIO,'read_slabs',count_read):
             with SlabIO(path,mode='r',mesh=mesh) as io:
                 got=read_sector_round(io,meta,bank,header,[0,1,2,2],endpoints,
-                    sample_span=(0,2),fields=('Wc','dWc_ds','Wc_mirror','dWc_mirror_ds'))
+                    sample_span=(0,2),fields=('Wc','dWc_ds'))
+                got.update(read_sector_round(io,meta,bank,header,[0,1,2,2],endpoints,
+                    sample_span=(0,1),fields=('Wc_minus_q','dWc_minus_q_ds')))
         assert len(native_reads)==4*layout.mesh_side,native_reads
-        assert all(shape[1]==2 for shape in native_reads),native_reads
+        assert sorted(shape[1] for shape in native_reads)==[1]*(2*layout.mesh_side)+[2]*(2*layout.mesh_side),native_reads
         endpoint_indices=[];endpoint_valid=[]
         for family in endpoints:
             basis=bank['mu_bases'][family]
@@ -585,8 +589,8 @@ def run_store_checks(mesh,root):
         expected=np.where(np.array(endpoint_valid[0])[:,None]&np.array(endpoint_valid[1])[None,:],expected,0)
         expected=fixture._device(expected,mesh,P(('x','y')))
         assert (bool(jnp.all(got['Wc']==expected)) and bool(jnp.all(got['dWc_ds']==2*expected))
-                and bool(jnp.all(got['Wc_mirror']==3*expected))
-                and bool(jnp.all(got['dWc_mirror_ds']==4*expected)))
+                and bool(jnp.all(got['Wc_minus_q']==3*expected[:,:1]))
+                and bool(jnp.all(got['dWc_minus_q_ds']==4*expected[:,:1])))
         rows.append(dict(name=f'photon_sector_read_{endpoints[0]}_{endpoints[1]}',
                          bitwise=True,native_reads=len(native_reads),sample_span=2))
     headers={}

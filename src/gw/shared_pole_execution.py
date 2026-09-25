@@ -259,8 +259,8 @@ def sector_round_schedule(bank,header,meta,config,mesh,partner,*,execution=None,
         return [(*row,'local') for row in parent_rounds(header['n_q_irr'],mesh.size,partner)]
     if execution not in ('distributed', 'face'):
         raise ValueError('unsupported resolved constructor linalg layout')
-    # Literal mirrors already contain the same operator; face parents need
-    # neither simultaneous partner parents nor artificial rank padding.
+    # The stored minus-q partner belongs to the same operator; face parents
+    # need neither simultaneous partner parents nor artificial rank padding.
     nq = int(header['n_q_irr'])
     return [(list(range(q, min(q + batch_width, nq))), min(batch_width, nq-q),
              np.arange(min(batch_width, nq-q), dtype=np.int64), 'face')
@@ -363,9 +363,9 @@ def cross_parent_program(mesh, side):
 
 
 @lru_cache(maxsize=None)
-def cross_action_program(mesh,mirror,conjugate):
-    from gw.shared_pole_sectors import _literal_cross_products
-    return face_program(partial(_literal_cross_products,mirror=mirror,
+def cross_action_program(mesh,mirror,imaginary,conjugate):
+    from gw.shared_pole_sectors import _cross_products
+    return face_program(partial(_cross_products,mirror=mirror,imaginary=imaginary,
         conjugate=conjugate,mm=face_matmul(mesh)),mesh)
 
 

@@ -115,8 +115,10 @@ def check(mesh, root, layout, resident=False):
     store.initialize_shared_pole_bank(bank,meta=meta,tables=tables[0],recipe=bank_recipe,
         identity=identity,mesh_xy=mesh,photon_layout=photon_layout,mu_bases=tuple(bases))
     zero=jnp.zeros_like(packed);samples=jnp.stack((zero,zero),axis=1)
+    store.write_shared_pole_bank(bank,q_span=(0,nk),sample_span=(0,1),
+        Wc_minus_q=samples[:,:1],dWc_minus_q_ds=samples[:,:1],
+        meta=meta,expected_identity=identity,mesh_xy=mesh)
     store.write_shared_pole_bank(bank,q_span=(0,nk),sample_span=(0,2),Wc=samples,dWc_ds=samples,
-        Wc_mirror=samples,dWc_mirror_ds=samples,
         M0=zero,M1=zero,M2=zero,M3=zero,constant=packed,meta=meta,expected_identity=identity,mesh_xy=mesh)
     handle=store.write_shared_pole_sector_manifest(root/'manifest.json',models=models,
         bank=dict(path=bank),identity=identity,receipts=dict(scope='synthetic oracle'),mesh_xy=mesh)

@@ -20,13 +20,17 @@ from gw.shared_pole_reduction import ORIENTATION_PAIR_REFUSAL
 
 
 def constructor_route(meta, config, recipe, *, mesh_xy, ledger, upstream, ordered,
-                      odd_moments, mirrored, nq):
+                      odd_moments, minus_q_partner, nq):
     """Resolve local or whole-mesh parent execution for one map's bank.
 
     The single admission the constructor applies before its first bank read,
     also consulted by the map owner before the bank exists (bank residence).
     Returns ``(execution, receipt, column_extent, sample_fields,
     moment_fields)``; ``upstream`` names the accepted live reservations.
+    ``sample_fields`` include the stored minus-q partner fields when
+    ``minus_q_partner``; the selection price keeps four faces per fitted
+    sample, an upper bound on the actual two per sample plus two per fitted
+    line sample.
     """
     from jax.sharding import PartitionSpec as P
     from runtime.padding import ladder_extent, padded_axis
@@ -39,8 +43,8 @@ def constructor_route(meta, config, recipe, *, mesh_xy, ledger, upstream, ordere
     column_extent = lambda width: padded_axis(
         ladder_extent(width), mesh_xy, name="shared_pole_port",
         specs=((P("x", "y"), 0), (P("x", "y"), 1))).carrier
-    sample_fields = (("Wc", "dWc_ds", "Wc_mirror", "dWc_mirror_ds")
-                     if mirrored else ("Wc", "dWc_ds"))
+    sample_fields = (("Wc", "dWc_ds", "Wc_minus_q", "dWc_minus_q_ds")
+                     if minus_q_partner else ("Wc", "dWc_ds"))
     moment_fields = ("M0", "M1", "M2", "M3") if odd_moments else ("M1", "M3")
     execution, receipt = constructor_execution(
         meta, linalg_resolution({"linalg": config.backend.linalg}), recipe,
@@ -155,8 +159,9 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
         # ordered bank builds without it and records the moments NOT_MEASURED.
         odd_moments = ordered and bool(header.get("odd_moments", False))
         if ordered:
-            # The mirror of parent p reads the -q parent p' through a unitary row s,
-            # S_s q(p') = -q(p) (symmetry service; antiunitary-only routes refuse there).
+            # The -q parent p' of parent p through a unitary row s, S_s q(p') = -q(p)
+            # (symmetry service; antiunitary-only routes refuse there). It schedules
+            # partner-closed local rounds; the partner values come from the bank.
             from symmetry_maps import minus_q_parent_partners
             qt, operations = header["qirr"], header["operations"]
             partner_parent, partner_row = minus_q_parent_partners(
@@ -172,10 +177,12 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
         execution, execution_receipt, column_extent, sample_fields, moment_fields = constructor_route(
             meta, config, recipe, mesh_xy=mesh_xy, ledger=ledger, upstream=upstream,
             ordered=ordered, odd_moments=odd_moments,
-            mirrored=header.get("mirror_mode") is not None,
+            minus_q_partner="minus_q_partner" in header,
             nq=int(header['bank_shape']['nq']))
-        if execution == 'face' and ordered and header.get('mirror_mode') is None:
-            raise ValueError('GATE shared_pole_constructor_execution: ordered whole-mesh parents require authenticated literal mirror fields')
+        if ordered and "minus_q_partner" not in header:
+            raise ValueError('GATE shared_pole_minus_q_partner: got: an ordered bank without stored minus-q partner fields; want: Wc_minus_q/dWc_minus_q_ds at every fitted line sample; fix: rebuild the bank')
+        partner_span = (tuple(int(v) for v in header["minus_q_partner"]["sample_span"])
+                        if ordered else (0, 0))
         budget = ConstructorCapacity(meta, resolution, mesh_xy=mesh_xy,
                                      ledger=ledger, upstream=upstream,
                                      execution=execution)
@@ -199,7 +206,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
         # A local round runs one parent per rank from its sample read to its
         # sorted model. A face round runs a budget-sized batch of physical
         # parents over all ranks (one schedule owner for both constructors).
-        # Ordered local rounds remain partner-closed for their mirror exchange.
+        # Ordered local rounds stay partner-closed (a parent enters with its -q parent).
         ranks = mesh_divisor(mesh_xy)
         face_batch = 1
         if execution == 'face':
@@ -247,7 +254,12 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
                 samples = read_shared_pole_bank(
                     bank_io, meta=meta, header=header, q_ids=ids,
                     partition_spec=read_spec, sample_span=(fit_lo, fit_hi),
-                    fields=sample_fields)
+                    fields=sample_fields[:2])
+                if partner_span[1] > partner_span[0]:
+                    samples.update(read_shared_pole_bank(
+                        bank_io, meta=meta, header=header, q_ids=ids,
+                        partition_spec=read_spec, sample_span=partner_span,
+                        fields=sample_fields[2:]))
             # The store admits this complete bounded scratch batch before
             # allocation. Charge it while directions/actions are selected;
             # release it before admitting the dense pencil.
@@ -259,7 +271,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
             round_states, round_counts, round_roles = select_round_states(
                 samples, recipe, sample_lo=fit_lo, real=real, mesh_xy=mesh_xy, eigh_plan=eig,
                 svd_plan=svd, column_extent=column_extent, logical_n=logical_n, ordered=ordered,
-                exchange=exchange)
+                exchange=exchange, partner_lo=partner_span[0] if ordered else None)
             del samples, exchange, qi
         with timing.section("spole.reduction_admission"):
             infinity_counts = [int(v.shape[-1]) for v in round_infinity_values]

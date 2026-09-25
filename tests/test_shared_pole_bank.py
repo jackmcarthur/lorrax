@@ -148,30 +148,43 @@ def test_bank_stale_identity_and_invalid_spans(tmp_path):
         validate_shared_pole_bank(path, expected_identity=identity, mesh_xy=mesh)
 
 
-def test_ordered_scalar_bank_roundtrips_literal_mirrors(tmp_path):
-    """A scalar broken-TRS bank stores exact -conj(z) mirror samples."""
+def test_ordered_scalar_bank_stores_minus_q_partner_at_line_samples(tmp_path):
+    """A broken-TRS bank stores W_q(-conj z) at its fitted line samples only."""
     mesh, meta, tables, recipe, identity = _bank_fixture()
+    recipe.update(
+        z_ry=np.asarray([0.3+0.1j, 0.1j, 0.2+0.1j], dtype=np.complex128),
+        role=np.asarray([0, 1, 3], dtype=np.int8),
+        distinct_id=np.asarray([0, 1, 2], dtype=np.int64),
+        held=np.asarray([False, False, True], dtype=np.bool_),
+        support_pair=np.asarray([[-1,-1],[-1,-1],[0,1]], dtype=np.int64),
+        fit_ids=np.asarray([0, 1], dtype=np.int64),
+        held_ids=np.asarray([2], dtype=np.int64))
     tables["sym"].trs_allowed = False
     path = tmp_path / "ordered_scalar_bank.h5"
     header = initialize_shared_pole_bank(
         path, meta=meta, tables=tables, recipe=recipe,
         identity=identity, mesh_xy=mesh)
     assert header["ordered"] is True
-    assert header["mirror_mode"] == "literal_same_operator_v1"
-    fields = store._bank_sample_fields(header)
-    assert "Wc_mirror" in fields and "dWc_mirror_ds" in fields
+    assert header["minus_q_partner"]["sample_span"] == [0, 1]
+    nq = header["bank_shape"]["nq"]
+    assert np.asarray(header["minus_q_written"]).shape == (nq, 1, 2)
     W = _matrix(meta, mesh, samples=True, value=3)
     D = _matrix(meta, mesh, samples=True, value=-5)
     header = write_shared_pole_bank(
         path, q_span=(0, 1), sample_span=(0, 1), Wc=W, dWc_ds=D,
-        Wc_mirror=W, dWc_mirror_ds=D,
+        Wc_minus_q=W, dWc_minus_q_ds=D,
         meta=meta, expected_identity=identity, mesh_xy=mesh)
     with SlabIO(path, mode="r", mesh=mesh) as io:
         got = read_shared_pole_bank(
             io, (0, 1), meta=meta, header=header, sample_span=(0, 1),
-            fields=("Wc_mirror", "dWc_mirror_ds"))
-    assert bool(jnp.all(got["Wc_mirror"] == W))
-    assert bool(jnp.all(got["dWc_mirror_ds"] == D))
+            fields=("Wc_minus_q", "dWc_minus_q_ds"))
+    assert bool(jnp.all(got["Wc_minus_q"] == W))
+    assert bool(jnp.all(got["dWc_minus_q_ds"] == D))
+    # The imaginary sample (-conj z = z) has no stored partner.
+    with pytest.raises(ValueError, match="outside its stored samples"):
+        write_shared_pole_bank(
+            path, q_span=(1, 2), sample_span=(1, 2), Wc_minus_q=W,
+            meta=meta, expected_identity=identity, mesh_xy=mesh)
 
 
 def check_bank_roundtrip(mesh, path):

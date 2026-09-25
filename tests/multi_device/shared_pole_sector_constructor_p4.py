@@ -116,13 +116,16 @@ def check_sector_constructor(mesh, root, *, linalg="local", parents=16, return_o
         spec=P(None,None,'x','y') if samples else P(None,'x','y')
         return jax.make_array_from_callback(a.shape,NamedSharding(mesh,spec),lambda ix:a[ix])
     values=[value(z) for z in recipe['z_ry']]
-    mirrors=[value(-z.conjugate()) for z in recipe['z_ry']]
+    # W_q(-conj z) at the one fitted line sample (id 0); imaginary and held samples store none.
+    partners=[value(-recipe['z_ry'][0].conjugate())]
     moments=[out@np.linalg.matrix_power(j@h,k)@j@adj(out)/2 for k in range(4)]
     store.write_shared_pole_bank(path,q_span=(0,nq),sample_span=(0,4),
         Wc=packed(np.stack([a[0] for a in values],axis=1),True),dWc_ds=packed(np.stack([a[1] for a in values],axis=1),True),
-        Wc_mirror=packed(np.stack([a[0] for a in mirrors],axis=1),True),
-        dWc_mirror_ds=packed(np.stack([a[1] for a in mirrors],axis=1),True),
         constant=packed(u-v),**{f'M{k}':packed(m) for k,m in enumerate(moments)},
+        meta=meta,expected_identity=identity,mesh_xy=mesh)
+    store.write_shared_pole_bank(path,q_span=(0,nq),sample_span=(0,1),
+        Wc_minus_q=packed(np.stack([a[0] for a in partners],axis=1),True),
+        dWc_minus_q_ds=packed(np.stack([a[1] for a in partners],axis=1),True),
         meta=meta,expected_identity=identity,mesh_xy=mesh)
     # Sector models stay on the devices for Sigma whenever they fit; the file
     # arm forces the fallback so the two routes can be compared bit for bit.
