@@ -99,3 +99,8 @@ mc_average_vcoul_body = true
 # pin every drift-prone knob; the deck-level default question is the
 # owner's, not a fixture's).
 zeta_rcond = 1e-10
+
+# zeta_nband = 76 (2026-09-25): nband = 80 is the WFN extent, whose top gap cannot be
+# measured; 76 is the nearest clean boundary below it (min gap 622 meV; 77-79 are
+# degenerate).  Only the zeta fit narrows; the band sum keeps nband = 80.
+zeta_nband = 76

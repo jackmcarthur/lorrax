@@ -873,11 +873,13 @@ def pytest_sessionstart(session):
 
 
 def _run_session_case(tmp_path_factory, case_name, input_name, output_name, *,
-                      mutations=None, extra_env=None, label=None):
+                      mutations=None, extra_env=None, label=None, rename=None):
     """One driver run of a regression fixture, in either process geometry.
 
     ``mutations`` edits the staged deck (``harness.mutate_input``) and
-    ``extra_env`` reaches the driver; ``label`` names the private copy.
+    ``extra_env`` reaches the driver; ``label`` names the private copy;
+    ``rename`` maps a fixture file onto the name the driver reads (a deck
+    whose dipole window differs from its directory's shared ``dipole.h5``).
     Under plain P4 pytest the variant is staged once and run as one
     4-process driver, like the fresh session runs.
     """
@@ -887,6 +889,8 @@ def _run_session_case(tmp_path_factory, case_name, input_name, output_name, *,
 
     def prepare(source, target):
         target = harness.copy_fixture(source, target)
+        for name, source_name in (rename or {}).items():
+            os.replace(target / source_name, target / name)
         if mutations:
             harness.mutate_input(target / input_name, mutations)
         return target
@@ -1026,7 +1030,7 @@ def si_fast_session(tmp_path_factory):
     """
     return _run_session_case(
         tmp_path_factory, "si_cohsex_debug", "cohsex_si_fast.in",
-        "eqp_si_fast.dat")
+        "eqp_si_fast.dat", rename={"dipole.h5": "dipole_fast.h5"})
 
 
 # ---------------------------------------------------------------------------

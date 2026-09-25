@@ -437,3 +437,7 @@ Copy, never symlink — the driver writes its outputs into the run directory,
 and a write through a stray symlink destroyed a checked-in fixture on
 2026-07-25.  That is why `harness.protect_fixtures` keeps everything here
 `a-w` at rest.
+
+**Dipole re-cut 2026-09-25**: `python -m psp.get_dipole_mtxels -i cohsex_hbn_test.in
+--vnl-velocity-sign +1` with the SG15 UPFs above (md5s verified). It reproduces the 08-09
+`dipole_cart` to 2.9e-8 max-relative and adds the current provenance stamps.
