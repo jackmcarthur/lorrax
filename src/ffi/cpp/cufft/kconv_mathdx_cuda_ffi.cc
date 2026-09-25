@@ -234,6 +234,8 @@ struct RowGeo {
 static const char* kSrc = R"__lrx__(
 #include <cufftdx.hpp>
 #include "lrx_async_gather.cuh"
+// EXPERIMENT (wip/u2c-fma-floor, not for landing): every bit-exact complex product form fused.
+#define LRX_FUSED 1
 
 // LRX_F32: modes 2-5 also serve complex64 tiles (the fp32-GMRES BSE arm).
 #if LRX_F32
@@ -292,10 +294,25 @@ __device__ __forceinline__ lrx_c2 lrx_mul(lrx_c2 a, lrx_c2 b) {
 // with NO fused multiply-add (measured 4096/4096 against exact emulation,
 // tests/multi_device/kconv_router_p4.py xla_cmul_form).
 __device__ __forceinline__ lrx_c2 lrx_mul_xla(lrx_c2 a, lrx_c2 b) {
+#if LRX_FUSED
+    lrx_c2 z = {fma(a.x, b.x, -__dmul_rn(a.y, b.y)), fma(a.x, b.y, __dmul_rn(a.y, b.x))};
+#else
     lrx_c2 z = {__dsub_rn(__dmul_rn(a.x, b.x), __dmul_rn(a.y, b.y)),
                 __dadd_rn(__dmul_rn(a.x, b.y), __dmul_rn(a.y, b.x))};
+#endif
     return z;
 }
+#if LRX_FUSED
+// v += a b and v += a conj(b), four fused multiply-adds each.
+__device__ __forceinline__ void lrx_cmac(lrx_c2& v, lrx_c2 a, lrx_c2 b) {
+    v.x = fma(a.x, b.x, v.x); v.x = fma(-a.y, b.y, v.x);
+    v.y = fma(a.x, b.y, v.y); v.y = fma(a.y, b.x, v.y);
+}
+__device__ __forceinline__ void lrx_cmac_conj(lrx_c2& v, lrx_c2 a, lrx_c2 b) {
+    v.x = fma(a.x, b.x, v.x); v.x = fma(a.y, b.y, v.x);
+    v.y = fma(a.y, b.x, v.y); v.y = fma(-a.x, b.y, v.y);
+}
+#endif
 // cuCmul(a, b) as nvcc compiles it in cpp/symmetry/spin_rotate.cu (SASS):
 // re = fma(a.x, b.x, -(a.y b.y)), im = fma(a.x, b.y, a.y b.x).
 __device__ __forceinline__ lrx_c2 lrx_mul_cu(lrx_c2 a, lrx_c2 b) {
@@ -723,8 +740,12 @@ __device__ __forceinline__ void lrx_spin_row(const lrx_c2 (&u)[NS][NS], const lr
         lrx_c2 v = {0.0, 0.0};
 #pragma unroll
         for (int c = 0; c < NS; ++c) {
+#if LRX_FUSED
+            lrx_cmac(v, u[a][c], g[c][d]);
+#else
             const lrx_c2 p = lrx_rot_mul(u[a][c], g[c][d]);
             v.x = __dadd_rn(v.x, p.x); v.y = __dadd_rn(v.y, p.y);
+#endif
         }
         left[d] = v;
     }
@@ -733,8 +754,12 @@ __device__ __forceinline__ void lrx_spin_row(const lrx_c2 (&u)[NS][NS], const lr
         lrx_c2 v = {0.0, 0.0};
 #pragma unroll
         for (int d = 0; d < NR; ++d) {
+#if LRX_FUSED
+            lrx_cmac_conj(v, left[d], ur[b][d]);
+#else
             const lrx_c2 p = lrx_rot_mul_conj(left[d], ur[b][d]);
             v.x = __dadd_rn(v.x, p.x); v.y = __dadd_rn(v.y, p.y);
+#endif
         }
         out[b] = v;
     }
@@ -951,8 +976,12 @@ __device__ __forceinline__ void tt_finish(const TileTabs& s, int b, int npr, lrx
             lrx_c2 v = {0.0, 0.0};
 #pragma unroll
             for (int c = 0; c < NS; ++c) {
+#if LRX_FUSED
+                lrx_cmac(v, u[(aa * NS + c) * NK + k], g[c]);
+#else
                 const lrx_c2 p = lrx_rot_mul(u[(aa * NS + c) * NK + k], g[c]);
                 v.x = __dadd_rn(v.x, p.x); v.y = __dadd_rn(v.y, p.y);
+#endif
             }
             col[aa * CS] = v;
         }
@@ -971,8 +1000,12 @@ __device__ __forceinline__ void tt_finish(const TileTabs& s, int b, int npr, lrx
             lrx_c2 v = {0.0, 0.0};
 #pragma unroll
             for (int d = 0; d < NR; ++d) {
+#if LRX_FUSED
+                lrx_cmac_conj(v, left[d], u[(bb * NR + d) * NK + k]);
+#else
                 const lrx_c2 p = lrx_rot_mul_conj(left[d], u[(bb * NR + d) * NK + k]);
                 v.x = __dadd_rn(v.x, p.x); v.y = __dadd_rn(v.y, p.y);
+#endif
             }
             row[bb * RS1] = v;
         }
@@ -1402,8 +1435,12 @@ __device__ __forceinline__ lrx_c2 lrx_chi_value(const Get& g, double si) {
         const lrx_c2 gv = g(q), gc = g(SS + q);
         const lrx_c2 a = {gc.x * si, -(gc.y * si)};
         const lrx_c2 b = {gv.x * si, gv.y * si};
+#if LRX_FUSED
+        lrx_cmac(v, a, b);
+#else
         const lrx_c2 p = lrx_mul_xla(a, b);
         v.x = __dadd_rn(v.x, p.x); v.y = __dadd_rn(v.y, p.y);
+#endif
     }
 #if LRX_COMPLETE
     v = {__dadd_rn(v.x, v.x), __dsub_rn(v.y, v.y)};
@@ -1416,8 +1453,14 @@ __device__ __forceinline__ lrx_c2 lrx_chi_value(const Get& g, double si) {
 __device__ __forceinline__ void lrx_chi_acc(const ChiArgs& a, int k, long long pr, lrx_c2 v) {
     for (int o = 0; o < a.n_out; ++o) {
         lrx_c2* e = a.acc + ((long long)o * NK + k) * a.pairs + pr;
+#if LRX_FUSED
+        lrx_c2 w = *e;
+        lrx_cmac(w, a.alpha[o], v);
+        *e = w;
+#else
         const lrx_c2 p = lrx_mul_xla(a.alpha[o], v);
         *e = {__dadd_rn(e->x, p.x), __dadd_rn(e->y, p.y)};
+#endif
     }
 }
 
