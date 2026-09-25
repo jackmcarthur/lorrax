@@ -370,6 +370,24 @@ class QirrOperator:
         _partner_cache[key] = partner
         return partner
 
+    def at_minus_q(self, kgrid, mesh_xy):
+        """``(n_wedge, n_left, n_right)``: the interaction at -q of every wedge row.
+
+        Row ``i`` is :meth:`unfold`'s row ``q_negation_index[full_rows[i]]``,
+        built from the wedge by the same tables and antiunitary rule, so the
+        full zone is never materialized.  A whole-zone operator gathers the
+        rows."""
+        from symmetry_maps.maps import q_negation_index, unfold_isdf_operator
+        q_neg = np.asarray(q_negation_index(tuple(int(v) for v in kgrid)), np.int64)
+        qn = q_neg[np.asarray(self.full_rows, np.int64)]
+        if self.is_whole_zone():
+            return _rows_of(self.values, qn)
+        return unfold_isdf_operator(
+            self.values, irr_idx=np.asarray(self.irr_idx)[qn].astype(np.int32),
+            sym_idx=np.asarray(self.sym_idx)[qn].astype(np.int32), sym_perm=self.sym_perm,
+            L_table=self.L_table, q_irr_frac=self.q_irr_frac, mesh_xy=mesh_xy,
+            n_sym_spatial=self.n_sym_spatial, trs_rule=self.trs_rule)
+
     @property
     def n_full(self) -> int:
         return int(np.asarray(self.irr_idx).shape[0])

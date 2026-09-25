@@ -84,6 +84,7 @@ __all__ = [
     "report_hermitian_residual",
     "neg_q_index",
     "check_q_conjugate_reciprocity",
+    "check_q_conjugate_pair",
     "report_q_conjugate_residual",
     "report_parent_covariance",
     "check_positive",
@@ -712,6 +713,65 @@ def check_q_conjugate_reciprocity(
     else:
         arr = np.asarray(a)
         dev = float(np.max(np.abs(arr - np.conj(arr[neg]))))
+        scale = float(np.max(np.abs(arr)))
+    return report_q_conjugate_residual(
+        name, dev, scale, print_fn=print_fn, rtol=rtol, verbose=verbose)
+
+
+def _pair_stats(a, b):
+    """``[max|A_q − conj(B_q)|, max|A|]`` over matching rows — ONE compiled module,
+    cached like :func:`_negq_stats`."""
+    import jax
+    import jax.numpy as jnp
+
+    key = ("pair", a.shape, str(a.dtype), getattr(a, "sharding", None),
+           getattr(b, "sharding", None))
+    fn = _NEGQ_STATS_CACHE.get(key)
+    if fn is None:
+        @jax.jit
+        def fn(m, mirror):
+            return jnp.stack([
+                jnp.max(jnp.abs(m - jnp.conj(mirror))).astype(jnp.float64),
+                jnp.max(jnp.abs(m)).astype(jnp.float64),
+            ])
+
+        _NEGQ_STATS_CACHE[key] = fn
+    return fn(a, b)
+
+
+def check_q_conjugate_pair(
+    name: str,
+    tensor: Any,
+    tensor_at_minus_q: Any,
+    *,
+    print_fn: Callable[..., Any] = print,
+    rtol: float = 1e-8,
+    verbose: bool = False,
+) -> bool:
+    """:func:`check_q_conjugate_reciprocity` on the rows of a q wedge.
+
+    ``tensor`` holds the wedge rows ``A_q`` and ``tensor_at_minus_q`` the
+    same operator's rows at −q, as the unfold builds them
+    (``QirrOperator.at_minus_q``).  An unfolded row ``S q`` is ``A_q``
+    permuted over centroids with unit phases, and its −q partner is
+    ``A_{−q}`` under the same action, so the full-zone maximum is taken on
+    the representatives; nothing the full-zone gate reads is lost, and the
+    full zone is never materialized.  Same verdict, message and ``rtol``.
+    """
+    if not sanity_enabled():
+        return True
+    if tuple(tensor.shape) != tuple(tensor_at_minus_q.shape):
+        raise ValueError(
+            f"check_q_conjugate_pair: {name} rows {tuple(tensor.shape)} and "
+            f"-q rows {tuple(tensor_at_minus_q.shape)} differ")
+    if _is_jax(tensor):
+        import jax
+
+        dev, scale = (float(v) for v in np.asarray(
+            jax.device_get(_pair_stats(tensor, tensor_at_minus_q))))
+    else:
+        arr, mirror = np.asarray(tensor), np.asarray(tensor_at_minus_q)
+        dev = float(np.max(np.abs(arr - np.conj(mirror))))
         scale = float(np.max(np.abs(arr)))
     return report_q_conjugate_residual(
         name, dev, scale, print_fn=print_fn, rtol=rtol, verbose=verbose)
