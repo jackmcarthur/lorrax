@@ -97,3 +97,9 @@ sigma_omega_max_ev = 4.0
 sigma_omega_step_ev = 1.0
 sigma_regularization_ev = 0.25
 fermi_reference = midgap
+
+# sc_frozen_core_bands = 12 (owner 2026-09-25): Mo 4s/4p and S 3s, the SC fixture's
+# semicore rule.  Under the one-shot's `cover` growth (55821baca, option (b)) the
+# semicore at Eo -19..-17 eV is otherwise evaluated resonantly and 34 rows carry an
+# unphysical Z; frozen, they stay in the Sigma_x/chi0 sums and read Sigma(omega=0).
+sc_frozen_core_bands = 12

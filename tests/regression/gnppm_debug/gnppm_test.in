@@ -59,3 +59,9 @@ wfn_file = WFN.h5
 output_file = sigma_diag_gnppm_test.dat
 sigma_diag_file = sigma_diag_gnppm_test.dat
 sigma_omega_h5_file = sigma_mnk.h5
+
+# sc_frozen_core_bands = 12 (owner 2026-09-25, as the bispinor fixture): Mo 4s/4p and
+# S 3s.  Under the one-shot's `cover` growth the semicore (Eo -65..-18 eV) is otherwise
+# evaluated resonantly; frozen, it stays in the Sigma_x/chi0 sums and reads
+# Sigma(omega=0).  On this deck the output is byte-identical to sigma_out_of_grid = static.
+sc_frozen_core_bands = 12
