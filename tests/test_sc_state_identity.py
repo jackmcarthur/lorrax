@@ -97,20 +97,16 @@ def test_map_readout_freezes_output_reference_and_does_not_change_carry(monkeypa
     logs = []
     monkeypatch.setattr(collectives, 'gather_to_host', np.asarray)
     monkeypatch.setattr(sc, '_record_sc', lambda inputs, text: logs.append(text))
-    output_rotation = [u]
-    # The readout diagonalises the gathered carry on the host (5f432bb3:
-    # the band-sharded kernel refused indivisible band counts); patch that
-    # seam to hand back the rotated eigenvectors this test exercises.
-    monkeypatch.setattr(sc, '_identity_eigh',
-                        lambda h: (e, output_rotation[0]))
+    # The readout receives the map output's eigenvectors
+    # (_map_output_eigensystem); hand it the rotated ones this test exercises.
     outputs = sc.SCOutputs(None, u, None, None, None)
     state = sc.SCState(np.diag(e[0])[None], 1, partition, outputs=outputs)
     history = {}
-    v0, _ = sc._sc_identity_for_call(inputs, state, e, e, history, cutoff_ev=.01)
+    v0, _ = sc._sc_identity_for_call(inputs, state, e, e, history,
+                                     cutoff_ev=.01, u_out=u)
     assert v0.converged
-    output_rotation[0] = u[:, :, [0, 2, 1]]
     verdict, updated = sc._sc_identity_for_call(
-        inputs, state, e, e, history, cutoff_ev=.01)
+        inputs, state, e, e, history, cutoff_ev=.01, u_out=u[:, :, [0, 2, 1]])
     assert not verdict.converged and verdict.max_abs_ev == 2.
     assert verdict.rms_all_ev == 0.  # explicitly the legacy sorted diagnostic
     assert updated.H_qp_dft is state.H_qp_dft
@@ -134,7 +130,6 @@ def _identity_call_fixture(monkeypatch, e_out, u_out):
     monkeypatch.setattr(collectives, 'gather_to_host', np.asarray)
     monkeypatch.setattr(sc, '_record_sc', lambda inputs, text: None)
     rotation = [u_out]
-    monkeypatch.setattr(sc, '_identity_eigh', lambda h: (e_out, rotation[0]))
     u_dft = np.eye(nb)[None].astype(complex)
     outputs = sc.SCOutputs(None, u_dft, None, None, None)
     state = sc.SCState(np.diag(e_out[0])[None], 1, partition, outputs=outputs)
@@ -152,7 +147,7 @@ def test_map0_labels_follow_dft_overlap_across_a_scissored_crossing(monkeypatch)
     sc, inputs, state, rotation = _identity_call_fixture(monkeypatch, e_out, u_out)
     history = {}
     v0, updated = sc._sc_identity_for_call(
-        inputs, state, e_dft, e_out, history, cutoff_ev=.01)
+        inputs, state, e_dft, e_out, history, cutoff_ev=.01, u_out=rotation[0])
     ident = updated.outputs.identity
     np.testing.assert_array_equal(ident['output_indices'][0], [0, 3, -1, -1])
     np.testing.assert_array_equal(history['labels'][0], [True, False, False, True])
@@ -162,7 +157,7 @@ def test_map0_labels_follow_dft_overlap_across_a_scissored_crossing(monkeypatch)
     rotation[0] = np.eye(4)[None].astype(complex)
     e_later = np.array([[0., 2., 3., 3.]])
     verdict, updated = sc._sc_identity_for_call(
-        inputs, state, e_later, e_later, history, cutoff_ev=.01)
+        inputs, state, e_later, e_later, history, cutoff_ev=.01, u_out=rotation[0])
     np.testing.assert_array_equal(updated.outputs.identity['output_indices'][0], [0, 1, -1, -1])
     assert updated.outputs.identity['output_ev'][0, 1] == 2.
     np.testing.assert_array_equal(updated.outputs.identity['motion_ev'][0, :2], [0., 0.])
@@ -182,7 +177,7 @@ def test_warm_map0_labels_start_from_dft_identities_across_seed_crossing(monkeyp
     u_warm = np.eye(4)[None].astype(complex)[:, :, order]
     e_warm = np.array([[0., 1., 2., 4.]])
     e_out = np.array([[0., 1., 2.5, 4.]])
-    sc, inputs, state, _ = _identity_call_fixture(monkeypatch, e_out, u_warm)
+    sc, inputs, state, rotation = _identity_call_fixture(monkeypatch, e_out, u_warm)
     inputs.initial_state_role = 'external_qp_seed'
     inputs.e_dft_active_kn_ry = e_dft / RYD_TO_EV
     inputs.kstar = SimpleNamespace(is_identity=True)
@@ -192,7 +187,7 @@ def test_warm_map0_labels_start_from_dft_identities_across_seed_crossing(monkeyp
     )
 
     verdict, updated = sc._sc_identity_for_call(
-        inputs, state, e_warm, e_out, {}, cutoff_ev=.1)
+        inputs, state, e_warm, e_out, {}, cutoff_ev=.1, u_out=rotation[0])
     ident = updated.outputs.identity
     np.testing.assert_array_equal(ident['input_indices'][0], [0, 2, -1, -1])
     np.testing.assert_array_equal(ident['output_indices'][0], [0, 2, -1, -1])
@@ -204,10 +199,10 @@ def test_warm_map0_labels_start_from_dft_identities_across_seed_crossing(monkeyp
 def test_map0_dft_multiplet_cut_by_the_band_mask_still_refuses(monkeypatch):
     e_dft = np.array([[0., 1., 1., 3.]])  # trusted 0,1 cuts the DFT doublet 1,2
     e_out = np.array([[0., 1., 1., 3.]])
-    sc, inputs, state, _ = _identity_call_fixture(
+    sc, inputs, state, rotation = _identity_call_fixture(
         monkeypatch, e_out, np.eye(4)[None].astype(complex))
     with pytest.raises(ValueError, match='cuts a multiplet'):
-        sc._sc_identity_for_call(inputs, state, e_dft, e_out, {}, cutoff_ev=.01)
+        sc._sc_identity_for_call(inputs, state, e_dft, e_out, {}, cutoff_ev=.01, u_out=rotation[0])
 
 
 
@@ -218,10 +213,10 @@ def test_reference_groups_are_the_dft_multiplets_even_when_the_map_splits_them(m
     # its block label is the DFT band 0 for both members.
     e_dft = np.array([[1., 1., 3., 4.]])
     e_out = np.array([[0.9998, 1.0001, 3., 4.]])
-    sc, inputs, state, _ = _identity_call_fixture(
+    sc, inputs, state, rotation = _identity_call_fixture(
         monkeypatch, e_out, np.eye(4)[None].astype(complex))
     history = {}
-    _, updated = sc._sc_identity_for_call(inputs, state, e_dft, e_out, history, cutoff_ev=.01)
+    _, updated = sc._sc_identity_for_call(inputs, state, e_dft, e_out, history, cutoff_ev=.01, u_out=rotation[0])
     ident = updated.outputs.identity
     np.testing.assert_allclose(ident['output_ev'][0, :2], [0.99995, 0.99995])
     np.testing.assert_array_equal(ident['blocks'][0], [0, 0, -1, -1])
