@@ -4,8 +4,8 @@
 // WHY THIS FILE EXISTS (extraction, 2026-07-30 FFI divergence audit).
 // The same ~60-line block had been copied THREE times:
 //     cpp/scalapack/blacs_grid.h : ~152-238   (inline, header)
-//     cpp/mklblas/gemm_batch_ffi.cc : ~277-303
-//     cpp/mklfft/fft_flat_k_ffi.cc  : ~96-122
+//     cpp/cblas/gemm_batch_ffi.cc : ~277-303
+//     cpp/fftw/fft_flat_k_ffi.cc  : ~96-122
 // and the copies had DRIFTED: mklblas resolved through `resolve_sym`
 // (RTLD_DEFAULT then RTLD_NEXT), the other two through a bare
 // `dlsym(RTLD_DEFAULT, ...)`.  Measured evidence that the three copies are

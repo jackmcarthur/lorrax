@@ -75,7 +75,7 @@
 // LORRAX_MKLBLAS_THREADS (auto = ambient omp_get_max_threads(), i.e. the
 // harness's OMP_NUM_THREADS under taskset; strict grammar per the AW audit
 // fix) via MKL_Set_Num_Threads_Local — the same dlsym'd MklThreadScope
-// pattern as cpp/scalapack/blacs_grid.h and cpp/mklfft, duplicated here so
+// pattern as cpp/scalapack/blacs_grid.h and cpp/fftw, duplicated here so
 // this TU stays MPI-free.  The AW cliff (cap MKL threads INSIDE ScaLAPACK
 // handlers) does not apply: this is a rank-LOCAL BLAS call, the same class
 // as the plan-A local eigh that NEEDS the full thread count.
@@ -158,7 +158,7 @@ using blas_int = int;
 //  link-map scope, which already includes this .so's DT_NEEDED closure.  The
 //  RTLD_GLOBAL load mode is therefore NOT what makes the pin resolve here,
 //  and the difference between this file's resolver and the bare-RTLD_DEFAULT
-//  copies in mklfft/scalapack was never behavioural.  Measured table is in
+//  copies in fftw/scalapack was never behavioural.  Measured table is in
 //  the mkl_thread_pin.h header; the probe is
 //  tests/test_ffi_thread_pin_resolution.py.
 // ---------------------------------------------------------------------------

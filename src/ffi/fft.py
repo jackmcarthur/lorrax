@@ -5,7 +5,7 @@ The Python half of the flat-k FFT handlers:
 
     cpu   liblorrax_ffi_host.so   the FFTW3 ABI (``fftw_plan_many_dft``, the
                                   advanced-layout planner) in
-                                  (``src/ffi/cpp/mklfft/fft_flat_k_ffi.cc``) —
+                                  (``src/ffi/cpp/fftw/fft_flat_k_ffi.cc``) —
                                   a genuine O(N log N) FFT at any k-count.
                                   The directory is still named ``mklfft`` for the
                                   DFTI implementation it USED to hold; the
@@ -231,7 +231,7 @@ GATE = Gate(
         "debugging build."),
     # NOTE the platform names below are ABIs, not products.  The host handler
     # calls the FFTW3 ABI (`fftw_plan_many_dft` ×4 in
-    # cpp/mklfft/fft_flat_k_ffi.cc; zero `DftiCreateDescriptor` since
+    # cpp/fftw/fft_flat_k_ffi.cc; zero `DftiCreateDescriptor` since
     # 2026-08-05) and binds it by dlsym against whatever the process links —
     # cray-fftw, a system FFTW3, or MKL's FFTW3 wrappers via `libmkl_rt.so`.
     # These strings said "MKL FFT (DFTI API)" for the five days after the

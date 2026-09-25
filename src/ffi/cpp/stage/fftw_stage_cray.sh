@@ -6,7 +6,7 @@
 #
 # WHY THIS EXISTS
 # ---------------
-# `src/ffi/cpp/mklfft/fft_flat_k_ffi.cc` resolves the FFTW3 advanced
+# `src/ffi/cpp/fftw/fft_flat_k_ffi.cc` resolves the FFTW3 advanced
 # interface at RUN time: stage 1 dlsym against an already-loaded provider
 # (that is the MKL site — Frontera), stage 2 dlopen a candidate ladder, stage
 # 3 refuse loudly.  Nothing reaches DT_NEEDED, which is the point (GATE 5 in

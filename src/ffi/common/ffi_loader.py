@@ -180,11 +180,11 @@ _HOST_TARGET_SYMBOLS = {
     "lorrax_scalapack_batched_getrf": "ScalapackBatchedGetrfHostFfi",
     "lorrax_scalapack_batched_getrs": "ScalapackBatchedGetrsHostFfi",
     "lorrax_scalapack_eigh":          "ScalapackEighHostFfi",
-    # FFTW3-ABI flat-k batched-FFT handlers (cpp/mklfft; the directory keeps
-    # its historical name) — the cpu leg of the ffi.fft router.
+    # FFTW3-ABI flat-k batched-FFT handlers (cpp/fftw; the target names keep
+    # their historical mklfft spelling) — the cpu leg of the ffi.fft router.
     "lorrax_mklfft_flat_k":           "MklFftFlatKHostFfi",
     "lorrax_mklfft_gw_conv":          "MklFftGwConvHostFfi",
-    # MKL batched-GEMM handler (cpp/mklblas) — the LORRAX_BANDS_GEMM_FFI
+    # CBLAS batched-GEMM handler (cpp/cblas) — the LORRAX_BANDS_GEMM_FFI
     # body of common.contract_bands (contract_bands_block_reshard).
     "lorrax_mklblas_gemm_batch":      "MklBlasGemmBatchHostFfi",
     "lorrax_phdf5_read":              "PhdfReadHostFfi",

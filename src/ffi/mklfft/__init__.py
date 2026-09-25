@@ -4,7 +4,7 @@ Retained one wave so existing ``ffi.mklfft`` imports keep working
 (docs/architecture/ffi_layout.md §4); new code imports ``ffi.fft``.  The
 vendor name was historical anyway: ONE python module serves BOTH platforms
 (MKL DFTI on cpu, cuFFT on CUDA) under the same jax.ffi target names —
-see ``ffi/fft.py``'s docstring.  C++ handlers: ``src/ffi/cpp/mklfft/`` and
+see ``ffi/fft.py``'s docstring.  C++ handlers: ``src/ffi/cpp/fftw/`` and
 ``src/ffi/cpp/cufft/``.
 """
 import sys as _sys
