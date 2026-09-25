@@ -274,12 +274,13 @@ def _divisors(n: int) -> list[int]:
 
 def plan_pair_convolution_chunks(*, n_ranks, n_k, n_s, widths, width_out, n_q, n_r,
                                  kboxes, kbox_out, n_parent_tiles, target_bytes,
-                                 j_cap=64, n_c=None, J=None) -> PairConvChunks:
+                                 j_cap=64, n_c=None, J=None, kc=None, qc=None) -> PairConvChunks:
     """The schedule for one τ node (every count one when everything fits).
 
     ``widths``/``kboxes``: the two operands' slot carriers and union-box cells;
     ``n_parent_tiles``: the slab copies' element count per rank (inputs held).
-    ``n_c``/``J`` pin those counts (tests and the benchmark); the rest follow.
+    ``n_c``/``J``/``kc``/``qc`` pin those counts (tests and the benchmark); the rest follow
+    (``kc`` must divide ``n_k`` and ``qc`` must divide ``n_q``).
     Refuses ``GATE pairconv-capacity`` when even n_c at one batch column per rank
     per chunk and unit k and q chunks exceeds ``target_bytes``.
     """
@@ -327,10 +328,14 @@ def plan_pair_convolution_chunks(*, n_ranks, n_k, n_s, widths, width_out, n_q, n
                 J = j
                 break
     J = int(J)
-    kc = max([d for d in _divisors(nk)
-              if resident(nc, J) + expand(d, nc, J) <= target] or [1])
-    qc = max([d for d in _divisors(nq)
-              if resident(nc, J) + final(d, nc, J) <= target] or [1])
+    if kc is None:
+        kc = max([d for d in _divisors(nk)
+                  if resident(nc, J) + expand(d, nc, J) <= target] or [1])
+    if qc is None:
+        qc = max([d for d in _divisors(nq)
+                  if resident(nc, J) + final(d, nc, J) <= target] or [1])
+    if nk % int(kc) or nq % int(qc):
+        raise ValueError(f"pair-conv chunks: kc={kc} must divide n_k={nk} and qc={qc} n_q={nq}")
     return PairConvChunks(n_c=int(nc), J=J, kc=int(kc), qc=int(qc),
                           n_r_carrier=carrier(nc, J), bytes_resident=resident(nc, J),
                           bytes_expand=expand(kc, nc, J), bytes_middle=middle(J),
@@ -430,7 +435,7 @@ class MixedBasisPairConvolution:
 
     ``out`` holds the output rows (q-points, any subset of the grid, e.g. the IBZ).
     ``budget_bytes`` overrides the device budget (the planner's target);
-    ``chunks = (n_c, J)`` pins those two counts.
+    ``chunks = (n_c, J[, kc, qc])`` pins those counts (tests, the benchmark).
     """
 
     def __init__(self, mesh: Mesh, *, kgrid, fft_grid, left: PairOperand, right: PairOperand,
@@ -519,7 +524,7 @@ class MixedBasisPairConvolution:
             width_out=self.mo_axis.carrier, n_q=self.nq, n_r=self.nr,
             kboxes=[int(np.prod(k)) for k in self.kbox], kbox_out=int(np.prod(self.kbox_out)),
             n_parent_tiles=n_par, target_bytes=target,
-            n_c=None if chunks is None else chunks[0], J=None if chunks is None else chunks[1])
+            **dict(zip(("n_c", "J", "kc", "qc"), chunks or ())))
         c = self.chunks
         self.nr_carrier = c.n_r_carrier
         self.cols_rank = self.nr_carrier // self.P

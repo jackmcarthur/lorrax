@@ -95,11 +95,11 @@ def test_random_operands_match_the_dense_reference(n_mesh, ns, backend):
     assert conv.chunks.n_c == 1 and conv.backend == backend
     got = _run(conv, c["A"], c["C"])
     assert cases.rel(got, ref) <= TOL, cases.rel(got, ref)
-    # r' chunks with a batch tail, and k / q chunks from a tight budget
+    # r' chunks with a batch tail, k and q chunks
     tight = _conv(mesh, c["kgrid"], c["fft_grid"], c["sph"], c["ngk"], c["kfrac"], c["out"],
-                  transport=tr, backend=backend, chunks=(3, 4),
-                  budget_bytes=int(conv.chunks.bytes_resident * 0.1 + 2e6))
-    assert tight.chunks.n_c == 3 and tight.n_batch >= 2, tight.describe()
+                  transport=tr, backend=backend, chunks=(3, 4, 2, 1), budget_bytes=int(1e10))
+    assert (tight.chunks.n_c, tight.chunks.kc, tight.chunks.qc) == (3, 2, 1) \
+        and tight.n_batch >= 2, tight.describe()
     got = _run(tight, c["A"], c["C"])
     assert cases.rel(got, ref) <= TOL, (cases.rel(got, ref), tight.describe())
 
