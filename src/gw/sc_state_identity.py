@@ -71,44 +71,57 @@ def assign_qp_identity(reference_u, reference_e_ev, current_u, current_e_ev,
     blocks = np.full(e.shape, -1, dtype=int)
     energies = np.full(e.shape, np.nan)
     weights = np.full(e.shape, np.nan)
+    nb = e.shape[1]
     for k in range(e.shape[0]):
         labels = np.flatnonzero(mask[k])
-        # BGW adjacent-gap grouping, at the SC exact-degeneracy tolerance.
-        groups = np.split(np.arange(e.shape[1]),
-                          np.flatnonzero(np.diff(e0[k]) > degeneracy_tol_ev) + 1)
+        # BGW adjacent-gap grouping, at the SC exact-degeneracy tolerance:
+        # contiguous blocks [start, start + size) of the sorted spectrum.
+        starts = np.r_[0, np.flatnonzero(np.diff(e0[k]) > degeneracy_tol_ev) + 1]
+        sizes = np.diff(np.r_[starts, nb])
+        n_trusted = np.add.reduceat(mask[k].astype(np.intp), starts)
+        cut = np.flatnonzero((n_trusted > 0) & (n_trusted < sizes))
+        if cut.size:
+            group = np.arange(starts[cut[0]], starts[cut[0]] + sizes[cut[0]])
+            raise ValueError(f'SC identity: the reference label set cuts a '
+                             f'multiplet at k={k}, columns={group.tolist()}')
         overlap = (np.abs(u[k]) ** 2 if u0 is None
                    else np.abs(u0[k].conj().T @ u[k]) ** 2)
-        score = np.empty((len(labels), e.shape[1]))
-        selected_groups = []
-        for group in groups:
-            if not mask[k, group].any():
-                continue
-            if not mask[k, group].all():
-                raise ValueError(f'SC identity: the reference label set cuts a '
-                                 f'multiplet at k={k}, columns={group.tolist()}')
-            rows = np.searchsorted(labels, group)
-            score[rows] = overlap[group].sum(axis=0)
-            selected_groups.append((group, rows))
-        current_groups = np.split(np.arange(e.shape[1]),
-                                  np.flatnonzero(np.diff(e[k]) > degeneracy_tol_ev) + 1)
-        for group in current_groups:
-            if len(group) > 1:
-                score[:, group] = score[:, group].mean(axis=1, keepdims=True)
+        # Every member of a trusted reference multiplet scores the
+        # multiplet's summed overlap; a singleton's sum is its own row.
+        score = overlap[labels]
+        selected = n_trusted > 0
+        multiplets = [np.arange(s0, s0 + g) for s0, g in
+                      zip(starts[selected & (sizes > 1)], sizes[selected & (sizes > 1)])]
+        for group in multiplets:
+            score[np.searchsorted(labels, group)] = overlap[group].sum(axis=0)
+        current = np.r_[0, np.flatnonzero(np.diff(e[k]) > degeneracy_tol_ev) + 1]
+        current_sizes = np.diff(np.r_[current, nb])
+        for c0, g in zip(current[current_sizes > 1], current_sizes[current_sizes > 1]):
+            group = np.arange(c0, c0 + g)
+            score[:, group] = score[:, group].mean(axis=1, keepdims=True)
         # Keep established readout identities' original optimization intact.
         # Newly tracked labels receive the remaining columns; admitting a
         # state must not relabel an already reported multiplet.
         first = np.flatnonzero(priority[k, labels])
         later = np.flatnonzero(~priority[k, labels])
         assigned = np.empty(len(labels), dtype=int)
-        available = np.arange(e.shape[1])
-        for selected in (first, later):
-            if not selected.size:
+        available = np.arange(nb)
+        for chosen in (first, later):
+            if not chosen.size:
                 continue
             rows, columns = linear_sum_assignment(
-                score[np.ix_(selected, available)], maximize=True)
-            assigned[selected[rows]] = available[columns]
+                score[np.ix_(chosen, available)], maximize=True)
+            assigned[chosen[rows]] = available[columns]
             available = np.setdiff1d(available, available[columns])
-        for group, rows in selected_groups:
+        singles = starts[selected & (sizes == 1)]
+        rows = np.searchsorted(labels, singles)
+        members = assigned[rows]
+        indices[k, singles] = members
+        blocks[k, singles] = singles
+        energies[k, singles] = e[k, members]
+        weights[k, singles] = score[rows, members]
+        for group in multiplets:
+            rows = np.searchsorted(labels, group)
             members = np.sort(assigned[rows])
             indices[k, group] = members
             blocks[k, group] = group[0]
