@@ -105,7 +105,7 @@ def test_gap_shrink_expands_once_then_growth_stays_enclosed():
     expanded = resolve(args, session)
     assert expanded["support_envelope"]["status"] == "expanded"
     assert expanded["support_envelope"]["epoch"] == 1
-    assert expanded["u_min_ev"] == pytest.approx(1.2)
+    assert expanded["u_min_ev"] == pytest.approx(1.2, rel=1e-4)  # snapped down onto the 1e-4 grid
     assert expanded["kappa"] > first["kappa"]
     assert not np.array_equal(first["imaginary_ev"], expanded["imaginary_ev"])
     args[1].enk[:, 1:3] = np.array([-.8, .8])/RYD_TO_EV
