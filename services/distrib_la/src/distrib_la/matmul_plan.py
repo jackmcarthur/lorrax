@@ -43,15 +43,9 @@ Contract, deliberately narrower than :func:`distrib_la.matmul`:
   itself — cuBLASMp's own per-slice loop makes ``nq=1`` a legitimate,
   zero-overhead special case, the same way ``distrib_la.matmul`` lifts
   rank-2 internally (``matmul.py:402-406,438``).
-* **cuBLASMp only, today.**  ``lorrax_scalapack_batched_gemm`` and
-  ``lorrax_slate_batched_gemm`` are claimed by ``distrib_la.loader``'s
-  target table but have no C++ definition anywhere in this tree
-  (``KNOWN_LORRAX_ISSUES.md``, "services/distrib_la loader vs src/ffi"
-  row) — confirmed again here by `nm -D` on the pinned CUDA library, which
-  exports only ``CublasMpBatchedGemmFfi``.  A request that resolves to
-  either provider refuses at :func:`gemm_plan` construction, by name, using
-  the SAME capability probe ``distrib_la.matmul`` already runs — this
-  module adds no leniency and no second probe path.
+* **cuBLASMp only.**  It is the one distributed GEMM handler;
+  :func:`distrib_la.matmul`'s resolver refuses every other provider by
+  name, and this module adds no leniency and no second probe path.
 * **Provider route only.**  ``batch_reshard`` materializes complete A, B,
   C and D on every device (``matmul.py:377-384``); the whole reason a
   caller reaches for a *planned* GEMM is a G/Sigma-sized object that must
@@ -940,12 +934,9 @@ def gemm_plan(
         handler compiles for.
     backend
         A name from ``distrib_la.MATMUL_BACKEND_CHOICES`` other than
-        ``'off'``.  ``'auto'``/``'distributed'`` resolve to the platform's
-        provider exactly as ``distrib_la.matmul`` does; only
-        ``cublasmp``/``cusolvermp`` have a warmed kernel in this module
-        today (see the module docstring) — a resolved ``scalapack``/
-        ``slate`` refuses BY NAME rather than silently falling back to a
-        route this module does not implement.
+        ``'off'``.  ``'auto'``/``'distributed'`` resolve exactly as
+        ``distrib_la.matmul`` does: cuBLASMp on CUDA, a named refusal
+        elsewhere.
     alpha, beta
         Fixed GEMM scalars, baked into the compiled kernel — cuBLASMp
         takes them as FFI attributes, not array arguments, so they cannot

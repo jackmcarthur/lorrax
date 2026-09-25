@@ -11,9 +11,11 @@ its cpu (lapack) vs CUDA (cusolver) kernels, so ``jax.ffi.ffi_call``
 sites resolve the right handler from the lowering platform and never
 mention a platform themselves:
 
-    CUDA  liblorrax_ffi.so       cuSOLVERMp/cuBLASMp/phdf5/slate/mathdx k-conv
-    cpu   liblorrax_ffi_host.so  phdf5 read+write / slate (Target::HostTask)
-                                 / ScaLAPACK / FFTW3-ABI flat-k / MKL GEMM
+    CUDA  liblorrax_ffi.so       mathdx k-conv, Fourier plan, contour, phdf5
+    cpu   liblorrax_ffi_host.so  FFTW3-ABI flat-k, CBLAS GEMM, phdf5
+
+This module registers LORRAX's own targets; the same two libraries carry the
+distributed-linear-algebra targets, which ``distrib_la.loader`` registers.
 
 Public API
 ----------
@@ -96,25 +98,18 @@ _LIB_PATHS: Dict[str, str] = {}
 # Symbols the XLA FFI side exports (plain C via XLA_FFI_DEFINE_HANDLER_SYMBOL),
 # per platform.  One handler per routine covers all supported dtypes —
 # dispatch is done inside the .so based on the input buffer's element type.
+# The distributed linear algebra and active-subspace targets (cuSOLVERMp,
+# cuBLASMp GEMM, local cuBLAS, ScaLAPACK, SLATE) are distrib_la's:
+# distrib_la.loader is their one table.  docs/architecture/ffi_layout.md
+# "Kernel catalog" lists every target and its owner.
 _CUDA_TARGET_SYMBOLS = {
-    "lorrax_cusolvermp_eigh":       "EighMpFfi",
-    "lorrax_cusolvermp_batched_potrf":    "CusolverMpBatchedPotrfFfi",
-    "lorrax_cusolvermp_batched_potrs":    "CusolverMpBatchedPotrsFfi",
-    "lorrax_cusolvermp_batched_solve_lu": "CusolverMpBatchedSolveLuFfi",
-    "lorrax_cublas_local_active_range_gemm": "CublasLocalActiveRangeGemmFfi",
-    "lorrax_cublas_local_prepared_active_range_gemm": "CublasLocalPreparedActiveRangeGemmFfi",
-    "lorrax_cublasmp_batched_gemm":       "CublasMpBatchedGemmFfi",
-    "lorrax_cublasmp_active_range_gemm":  "CublasMpActiveRangeGemmFfi",
-    "lorrax_cublasmp_prepared_active_range_gemm": "CublasMpPreparedActiveRangeGemmFfi",
+    # ffi.cublasmp's fused W solve (no production caller yet).
     "lorrax_cublasmp_batched_w_solve":    "CublasMpBatchedWSolveFfi",
     # The NVIDIA k-convolution family on nvidia-mathdx (cpp/cufft/
     # kconv_mathdx_cuda_ffi.cc): cuFFTDx transforms, NVRTC-built per
-    # (mode, grid, ns, context) and disk-cached.  CUDA-only; the ffi.fft router
-    # returns the MKL plan route on cpu and never these targets (decisions.md
-    # 2026-09-24).  The Sigma k-leading convolution, the BSE k-minor one and
-    # both transform-only modes replaced the cuFFT strided flat_k/gw_conv
-    # handlers and the direct-DFT conv_klead/conv_kminor handlers; the
-    # flat-k transform (lorrax_mklfft_flat_k) is host-only now.
+    # (mode, grid, ns, context) and disk-cached.  CUDA-only; on cpu the
+    # ffi.fft router takes the FFTW3-ABI host handlers (decisions.md
+    # 2026-09-24).  The _rows targets serve older source trees.
     "lorrax_mathdx_kconv_pair":     "KConvMathdxPairCudaFfi",
     "lorrax_mathdx_kconv_parent":   "KConvMathdxParentCudaFfi",
     "lorrax_mathdx_kconv_plane":    "KConvMathdxPlaneCudaFfi",
@@ -139,47 +134,17 @@ _CUDA_TARGET_SYMBOLS = {
     "lorrax_phdf5_write":           "PhdfWriteFfi",
     "lorrax_phdf5_write_independent": "PhdfWriteIndependentFfi",
     "lorrax_phdf5_read":            "PhdfReadFfi",
-    "lorrax_phdf5_read_kchunk":       "PhdfReadKchunkFfi",
     "lorrax_phdf5_read_kchunk_union": "PhdfReadKchunkUnionFfi",
-    "lorrax_slate_eigh":              "SlateEighFfi",
-    "lorrax_slate_potrf":             "SlatePotrfFfi",
-    "lorrax_slate_trsm":              "SlateTrsmFfi",
-    "lorrax_slate_batched_potrf":     "SlateBatchedPotrfFfi",
-    "lorrax_slate_batched_trsm":      "SlateBatchedTrsmFfi",
 }
 
-# Host variants of the slate targets (src/ffi/cpp/slate/host_ffi.cc) —
-# same target names as the CUDA table, registered under platform="cpu" —
-# plus the host-only ScaLAPACK targets (src/ffi/cpp/scalapack/, MKL/LibSci;
-# their python side is services/distrib_la now, but the SYMBOLS are in both
-# loaders' tables because both loaders open the same .so),
-# plus the phdf5 read AND write handlers (src/ffi/cpp/phdf5/{read,write}_ffi.cc
-# compiled with -DLORRAX_FFI_NO_CUDA).  The phdf5 target STRINGS are identical
-# to the CUDA table so the ffi.phdf5.{read,write} ffi_call sites resolve by
-# lowering platform; only the C++ SYMBOL names differ (Phdf*HostFfi vs
-# Phdf*Ffi) so the two platform .so's can co-exist under RTLD_GLOBAL.
-#
-# ``lorrax_phdf5_write`` is what makes SlabIO's tile path reachable on
-# the CPU backend (workstream AE) — a host lib built before that port exports
-# the three read symbols only, and ``has_phdf5_write('cpu')`` is False, which
-# means the tile path is unavailable, and SlabIO then REFUSES rather than
-# moving the bytes some other way.  There is no demotion: the tiers this
-# comment used to name (PHDF5_HOST, H5PY_ALLGATHER) and the gw_config
-# router that chose between them were deleted in the one-backend port.
-# An allgather is a refusal, not a fallback -- owner ruling 2026-08-05 --
-# because the design envelope is arrays needing hundreds of GPUs to hold,
-# where a rank-0 gather is an OOM and not a slow path.  A host lib without
-# the write symbol is a BUILD defect to fix, not a routing condition.
+# The host leg's targets: the FFTW3-ABI flat-k handlers, the CBLAS batched
+# GEMM and the phdf5 read and write handlers (src/ffi/cpp/phdf5/*_ffi.cc
+# compiled with -DLORRAX_FFI_NO_CUDA).  The phdf5 target STRINGS are those of
+# the CUDA table, so the ffi.io ffi_call sites resolve by lowering platform;
+# only the C++ SYMBOL names differ (Phdf*HostFfi vs Phdf*Ffi) so the two
+# platform .so's can co-exist under RTLD_GLOBAL.  A host library without the
+# phdf5 write symbol is a build defect: SlabIO refuses, it never demotes.
 _HOST_TARGET_SYMBOLS = {
-    "lorrax_slate_eigh":              "SlateEighHostFfi",
-    "lorrax_slate_potrf":             "SlatePotrfHostFfi",
-    "lorrax_slate_trsm":              "SlateTrsmHostFfi",
-    "lorrax_slate_batched_potrf":     "SlateBatchedPotrfHostFfi",
-    "lorrax_slate_batched_trsm":      "SlateBatchedTrsmHostFfi",
-    "lorrax_scalapack_batched_solve_lu": "ScalapackBatchedSolveLuHostFfi",
-    "lorrax_scalapack_batched_getrf": "ScalapackBatchedGetrfHostFfi",
-    "lorrax_scalapack_batched_getrs": "ScalapackBatchedGetrsHostFfi",
-    "lorrax_scalapack_eigh":          "ScalapackEighHostFfi",
     # FFTW3-ABI flat-k batched-FFT handlers (cpp/fftw; the target names keep
     # their historical mklfft spelling) — the cpu leg of the ffi.fft router.
     "lorrax_mklfft_flat_k":           "MklFftFlatKHostFfi",
@@ -188,7 +153,6 @@ _HOST_TARGET_SYMBOLS = {
     # body of common.contract_bands (contract_bands_block_reshard).
     "lorrax_mklblas_gemm_batch":      "MklBlasGemmBatchHostFfi",
     "lorrax_phdf5_read":              "PhdfReadHostFfi",
-    "lorrax_phdf5_read_kchunk":       "PhdfReadKchunkHostFfi",
     "lorrax_phdf5_read_kchunk_union": "PhdfReadKchunkUnionHostFfi",
     "lorrax_phdf5_write":             "PhdfWriteHostFfi",
     "lorrax_phdf5_write_independent": "PhdfWriteIndependentHostFfi",
@@ -423,62 +387,17 @@ def _bind_c_abi(lib: ctypes.CDLL, platform: str) -> None:
             continue
         # ctypes.CDLL.__getattr__ only fires when normal lookup fails, so an
         # instance attribute wins from here on -- including for the
-        # ``hasattr`` guards in _declare_phdf5 / _declare_slate below.
+        # ``hasattr`` guards in _declare_phdf5 below.
         setattr(lib, base, fn)
 
 
 def _set_argtypes(lib: ctypes.CDLL, platform: str) -> None:
     """Declare argtypes/restype for the lrx_* entry points ``lib`` exports."""
     _bind_c_abi(lib, platform)
-    if platform == "CUDA":
-        _declare_cuda_stack(lib)
-    # phdf5 lifecycle (CUDA-free) + slate lifecycle (pure MPI) are exported by
-    # WHICHEVER platform library was built with them — the phdf5 host read
-    # path drives lrx_phdf5_* through liblorrax_ffi_host.so.  Both declare
-    # under hasattr guards so a partial build is fine.
+    # The phdf5 lifecycle (CUDA-free) is exported by both platform libraries;
+    # the host read path drives lrx_phdf5_* through liblorrax_ffi_host.so.
+    # The cuSOLVERMp and SLATE context entry points are distrib_la.loader's.
     _declare_phdf5(lib)
-    _declare_slate(lib)
-
-
-def _declare_cuda_stack(lib: ctypes.CDLL) -> None:
-    """NCCL / cuSOLVERMp / phdf5 lifecycle — liblorrax_ffi.so only."""
-
-    lib.lrx_nccl_unique_id_bytes.argtypes = []
-    lib.lrx_nccl_unique_id_bytes.restype  = ctypes.c_int
-
-    lib.lrx_fill_nccl_unique_id.argtypes = [
-        ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int,
-    ]
-    lib.lrx_fill_nccl_unique_id.restype = ctypes.c_int
-
-    lib.lrx_create_cusolvermp_context.argtypes = [
-        ctypes.c_int,                       # rank
-        ctypes.c_int,                       # world_size
-        ctypes.c_void_p,                    # nccl_unique_id_addr
-        ctypes.c_int,                       # nccl_unique_id_nbytes
-        ctypes.c_int,                       # p
-        ctypes.c_int,                       # q
-        ctypes.c_int,                       # grid_layout_col_major
-        ctypes.POINTER(ctypes.c_int64),     # ctx_out
-        ctypes.c_char_p,                    # err_out
-        ctypes.c_int,                       # err_cap
-    ]
-    lib.lrx_create_cusolvermp_context.restype = ctypes.c_int
-
-    lib.lrx_destroy_cusolvermp_context.argtypes = [ctypes.c_int64]
-    lib.lrx_destroy_cusolvermp_context.restype  = None
-
-    lib.lrx_smoke_allreduce_sum.argtypes = [
-        ctypes.c_int64, ctypes.c_void_p, ctypes.c_int,
-    ]
-    lib.lrx_smoke_allreduce_sum.restype = ctypes.c_int
-
-    lib.lrx_version_info.argtypes = [
-        ctypes.POINTER(ctypes.c_int),
-        ctypes.POINTER(ctypes.c_int),
-        ctypes.POINTER(ctypes.c_int),
-    ]
-    lib.lrx_version_info.restype = ctypes.c_int
 
 
 def _declare_phdf5(lib: ctypes.CDLL) -> None:
@@ -559,37 +478,6 @@ def _declare_phdf5(lib: ctypes.CDLL) -> None:
         lib.lrx_phdf5_close_timed.argtypes = [
             ctypes.c_int64, ctypes.POINTER(ctypes.c_int64)]
         lib.lrx_phdf5_close_timed.restype = None
-
-
-def _declare_slate(lib: ctypes.CDLL) -> None:
-    """SLATE context lifecycle — exported by BOTH platform libraries
-    (cpp/slate/context.cc is pure MPI and compiled into each).  Absent
-    from a build made without SLATE (e.g. the Frontera eigh-only .so)."""
-
-    if not hasattr(lib, "lrx_slate_context_create"):
-        return
-    lib.lrx_slate_context_create.argtypes = [
-        ctypes.c_int,           # rank
-        ctypes.c_int,           # world_size
-        ctypes.c_int,           # p
-        ctypes.c_int,           # q
-        ctypes.c_char_p,        # err_buf
-        ctypes.c_int,           # err_buf_len
-    ]
-    lib.lrx_slate_context_create.restype  = ctypes.c_int64
-    lib.lrx_slate_subrow_context_create.argtypes = [
-        ctypes.c_int,           # rank (full-world)
-        ctypes.c_int,           # world_size
-        ctypes.c_int,           # Px
-        ctypes.c_int,           # Py
-        ctypes.c_char_p,        # err_buf
-        ctypes.c_int,           # err_buf_len
-    ]
-    lib.lrx_slate_subrow_context_create.restype  = ctypes.c_int64
-    lib.lrx_slate_context_destroy.argtypes = [ctypes.c_int64]
-    lib.lrx_slate_context_destroy.restype  = None
-    lib.lrx_slate_init_mpi.argtypes = []
-    lib.lrx_slate_init_mpi.restype  = None
 
 
 def _register_ffi_targets(lib: ctypes.CDLL, platform: str) -> None:
@@ -1039,54 +927,6 @@ def _check_err(rc: int, err_buf: ctypes.Array) -> None:
         raise RuntimeError(f"lorrax_ffi error ({rc}): {msg}")
 
 
-def nccl_unique_id_bytes() -> int:
-    return int(get_lib("CUDA").lrx_nccl_unique_id_bytes())
-
-
-def fill_nccl_unique_id(addr: int) -> None:
-    err = ctypes.create_string_buffer(_ERR_CAP)
-    rc = get_lib("CUDA").lrx_fill_nccl_unique_id(addr, err, _ERR_CAP)
-    _check_err(rc, err)
-
-
-def create_cusolvermp_context(
-    rank: int, world_size: int,
-    nccl_unique_id_addr: int, nccl_unique_id_nbytes: int,
-    p: int, q: int, grid_layout_col_major: bool = True,
-) -> int:
-    lib = get_lib("CUDA")
-    ctx_out = ctypes.c_int64(0)
-    err = ctypes.create_string_buffer(_ERR_CAP)
-    rc = lib.lrx_create_cusolvermp_context(
-        int(rank), int(world_size),
-        int(nccl_unique_id_addr), int(nccl_unique_id_nbytes),
-        int(p), int(q),
-        1 if grid_layout_col_major else 0,
-        ctypes.byref(ctx_out),
-        err, _ERR_CAP,
-    )
-    _check_err(rc, err)
-    return int(ctx_out.value)
-
-
-def destroy_cusolvermp_context(ctx_handle: int) -> None:
-    get_lib("CUDA").lrx_destroy_cusolvermp_context(int(ctx_handle))
-
-
-def smoke_allreduce_sum(ctx_handle: int, device_ptr: int, nelems: int) -> int:
-    return int(get_lib("CUDA").lrx_smoke_allreduce_sum(
-        int(ctx_handle), int(device_ptr), int(nelems)))
-
-
-def version_info() -> dict:
-    lib = get_lib("CUDA")
-    rt   = ctypes.c_int(0)
-    drv  = ctypes.c_int(0)
-    nccl = ctypes.c_int(0)
-    lib.lrx_version_info(ctypes.byref(rt), ctypes.byref(drv), ctypes.byref(nccl))
-    return {"cuda_runtime": rt.value, "cuda_driver": drv.value, "nccl": nccl.value}
-
-
 # ---- phdf5 ----------------------------------------------------------------
 # ``platform`` selects the library that owns the collective context: "CUDA"
 # for the GPU MPI-IO path, "cpu" for the host read path (liblorrax_ffi_host.so
@@ -1325,60 +1165,3 @@ def phdf5_read_whole(ctx_handle: int, ds_name: str, *, shape, dtype_name: str,
     )
     _check_err(rc, err)
     return out
-
-
-# ---- slate ----------------------------------------------------------------
-# The slate lifecycle exists in BOTH platform libraries (context.cc is pure
-# MPI); ``platform`` selects which one serves the call.  A SlateCtx handle is
-# platform-agnostic — pass the platform of the mesh being operated on so the
-# call never forces the OTHER platform's library to load (e.g. a CPU-mesh op
-# on a machine whose CUDA library is absent).
-def create_slate_context(rank: int, world_size: int, p: int, q: int,
-                         platform: Optional[str] = None) -> int:
-    """Collective create of a SLATE context; returns opaque int64 handle.
-
-    Inits MPI_THREAD_MULTIPLE if not already inited, then dups
-    MPI_COMM_WORLD for SLATE's exclusive use.  Raises RuntimeError on
-    failure with a message from the .so's error buffer.
-    """
-    lib = get_lib(platform)
-    err = ctypes.create_string_buffer(_ERR_CAP)
-    h = lib.lrx_slate_context_create(
-        int(rank), int(world_size), int(p), int(q), err, _ERR_CAP)
-    if int(h) == 0:
-        msg = err.value.decode("utf-8", errors="replace")
-        raise RuntimeError(f"lorrax_ffi slate.context_create failed: {msg}")
-    return int(h)
-
-
-def create_slate_subrow_context(rank: int, world_size: int,
-                                Px: int, Py: int,
-                                platform: Optional[str] = None) -> int:
-    """Collective create of a SLATE sub-row context; returns int64 handle.
-
-    The sub-comm is MPI_COMM_WORLD split by x-coordinate (color=x_rank,
-    key=y_rank), producing one comm of size ``Py`` per X-row.  Intended
-    for batched ops where each X-row independently processes a slice of
-    a 3-D (Nbatch, N, N) input distributed as P('x', None, 'y').
-    """
-    lib = get_lib(platform)
-    err = ctypes.create_string_buffer(_ERR_CAP)
-    h = lib.lrx_slate_subrow_context_create(
-        int(rank), int(world_size), int(Px), int(Py), err, _ERR_CAP)
-    if int(h) == 0:
-        msg = err.value.decode("utf-8", errors="replace")
-        raise RuntimeError(
-            f"lorrax_ffi slate.subrow_context_create failed: {msg}")
-    return int(h)
-
-
-def destroy_slate_context(ctx_handle: int,
-                          platform: Optional[str] = None) -> None:
-    get_lib(platform).lrx_slate_context_destroy(int(ctx_handle))
-
-
-def slate_init_mpi(platform: Optional[str] = None) -> None:
-    """Eagerly init MPI_THREAD_MULTIPLE from outside SLATE's hot path.
-    Idempotent; no-op if MPI is already initialized.
-    """
-    get_lib(platform).lrx_slate_init_mpi()

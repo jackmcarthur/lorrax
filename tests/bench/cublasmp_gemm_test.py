@@ -1,4 +1,5 @@
-"""Correctness test for cuBLASMp-backed batched_distributed_gemm.
+"""Correctness test for the cuBLASMp batched GEMM through ``distrib_la.matmul``
+(``backend="cublasmp"``, ``batched_route="auto"``: the provider call).
 
 Usage::
     export LX_BASE_MODULE=lorrax_A LORRAX_CHECKOUT=$PWD
@@ -34,7 +35,9 @@ _init()
 
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from jax.experimental import multihost_utils
-from ffi.cublasmp import batched_distributed_gemm
+from ffi import _services  # noqa: F401  (service path bootstrap)
+_services.ensure_on_path()
+from distrib_la import matmul  # noqa: E402
 
 
 def _log(s):
@@ -94,9 +97,9 @@ def main():
          f"transa={args.transa} transb={args.transb} dtype={args.dtype} ===")
 
     t0 = time.perf_counter()
-    D = batched_distributed_gemm(A, B, C, mesh=mesh,
-                                  alpha=alpha, beta=beta,
-                                  transa=args.transa, transb=args.transb)
+    D = matmul(A, B, C, mesh=mesh, alpha=alpha, beta=beta,
+               transa=args.transa, transb=args.transb,
+               backend="cublasmp", batched_route="auto")
     jax.block_until_ready(D)
     dt = time.perf_counter() - t0
     _log(f"  gemm wall: {dt*1000:.1f} ms")

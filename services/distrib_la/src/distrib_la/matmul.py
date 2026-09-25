@@ -1,11 +1,10 @@
 """Top-level distributed GEMM across the :mod:`distrib_la` providers.
 
-The explicit ``batched_route='auto'`` route calls an actual 2-D provider
-operation: cuBLASMp next to
-cuSOLVERMp, PBLAS ``pdgemm``/``pzgemm`` next to ScaLAPACK, or
-``slate::multiply`` next to SLATE.  Unlike :func:`distrib_la.plan`,
-``backend='auto'`` here selects that platform provider; it does not select a
-native JAX floor.
+The explicit ``batched_route='auto'`` route calls the one 2-D provider
+operation there is, cuBLASMp (CUDA).  Unlike :func:`distrib_la.plan`,
+``backend='auto'`` here selects that provider; it does not select a native
+JAX floor.  ``scalapack`` and ``slate`` have no GEMM handler and refuse by
+name, as does ``auto`` off CUDA.
 
 The default ``batched_route='batch_reshard'`` route performs x-then-y staged
 face-to-batch exchanges for A, B, and C, runs local ``jnp.matmul``, then
@@ -40,8 +39,6 @@ MATMUL_BACKEND_CHOICES = (
 
 _TARGETS = {
     "cublasmp": "lorrax_cublasmp_batched_gemm",
-    "scalapack": "lorrax_scalapack_batched_gemm",
-    "slate": "lorrax_slate_batched_gemm",
 }
 _OP_CODE = {"N": 0, "T": 1, "C": 2}
 _CUBLASMP_CACHE: dict = {}
@@ -143,18 +140,12 @@ def _provider_platform(provider: str, mesh: Mesh) -> str:
     if provider == "cublasmp" and platform != "CUDA":
         raise RuntimeError(
             f"matmul backend 'cublasmp' is CUDA-only; mesh is {platform!r}")
-    if provider == "scalapack" and platform != "cpu":
-        raise RuntimeError(
-            f"matmul backend 'scalapack' is host-only; mesh is {platform!r}")
-    if provider == "slate" and platform not in ("CUDA", "cpu", "rocm"):
-        raise RuntimeError(
-            f"matmul backend 'slate' has no provider on {platform!r}")
     return platform
 
 
 def _require_provider(provider: str, mesh: Mesh) -> None:
     px, py = _mesh_shape(mesh)
-    if provider in ("cublasmp", "slate") and px != py:
+    if px != py:
         raise ValueError(
             f"matmul backend {provider!r} needs a square mesh: its "
             f"one-face GEMM layout is invalid on a {px}x{py} grid")
@@ -185,11 +176,12 @@ def resolve_matmul_backend(requested: str, mesh: Mesh, *,
     """Resolve a public request to an actual GEMM provider.
 
     ``cusolvermp`` maps to its matrix-multiply sibling ``cublasmp``.
-    ``auto`` and ``distributed`` select cuBLASMp on CUDA and ScaLAPACK on
-    CPU, and SLATE on ROCm.  Explicit requests never demote.  ``off`` is
+    ``auto`` and ``distributed`` select cuBLASMp on CUDA and refuse on any
+    other platform, as do ``scalapack`` and ``slate``: cuBLASMp is the only
+    distributed GEMM handler.  Explicit requests never demote.  ``off`` is
     legal only with the local ``batch_reshard`` route, where no provider call
     is made. Every other result has already passed platform,
-    provider-specific mesh geometry (including cuBLASMp/SLATE square grids),
+    provider-specific mesh geometry (the square grid cuBLASMp needs),
     one-process-per-cell, shared-library, and handler-symbol guards.
 
     Route selection is orthogonal to provider selection: an explicit or
@@ -213,21 +205,15 @@ def resolve_matmul_backend(requested: str, mesh: Mesh, *,
                 "matmul backend 'off' has no distributed provider; select "
                 "batched_route='batch_reshard' for all-to-all/local GEMM")
         return "off"
-    if requested in ("auto", "distributed"):
-        platform = mesh_platform(mesh)
-        if platform == "CUDA":
-            provider = "cublasmp"
-        elif platform == "cpu":
-            provider = "scalapack"
-        elif platform == "rocm":
-            provider = "slate"
-        else:
-            raise RuntimeError(
-                f"matmul has no distributed provider for platform {platform!r}")
-    elif requested == "cusolvermp":
-        provider = "cublasmp"
-    else:
-        provider = requested
+    platform = mesh_platform(mesh)
+    if requested in ("scalapack", "slate") or (
+            requested in ("auto", "distributed") and platform != "CUDA"):
+        raise RuntimeError(
+            f"matmul backend {requested!r}: got a {platform!r} mesh; want CUDA, "
+            "where cuBLASMp is the only distributed GEMM handler (PBLAS and "
+            "SLATE have none); fix: backend='off' with "
+            "batched_route='batch_reshard' (a staged reshard and a local GEMM)")
+    provider = "cublasmp"
     # Match Plan semantics: even the local route honours an explicit provider
     # request and proves its capability at construction/call entry.
     _require_provider(provider, mesh)
@@ -342,13 +328,8 @@ def _cublasmp(mesh, A, B, C, *, alpha: complex, beta: complex,
 
 def _provider_matmul(provider, mesh, A, B, C, *, alpha, beta,
                      transa, transb):
-    if provider == "cublasmp":
-        return _cublasmp(
-            mesh, A, B, C, alpha=alpha, beta=beta,
-            transa=transa, transb=transb)
-    module = (__import__(f"distrib_la._{provider}", fromlist=["x"]))
-    return module.batched_distributed_matmul(
-        A, B, C, mesh=mesh, alpha=alpha, beta=beta,
+    return _cublasmp(
+        mesh, A, B, C, alpha=alpha, beta=beta,
         transa=transa, transb=transb)
 
 
@@ -457,9 +438,10 @@ def matmul(
         transpose).
     backend
         A name in :data:`MATMUL_BACKEND_CHOICES`. ``'auto'`` and
-        ``'distributed'`` choose cuBLASMp on CUDA, ScaLAPACK/PBLAS on CPU,
-        and SLATE on ROCm. ``'cusolvermp'`` is an alias for its cuBLASMp
-        sibling. ``'off'`` is provider-free and requires the staged route.
+        ``'distributed'`` choose cuBLASMp on CUDA and refuse elsewhere, as do
+        ``'scalapack'`` and ``'slate'`` (no GEMM handler). ``'cusolvermp'``
+        is an alias for its cuBLASMp sibling. ``'off'`` is provider-free and
+        requires the staged route.
     batched_route
         ``'batch_reshard'`` (the default) pads a ragged leading batch with
         zero matrices, exchanges each face x then y into whole per-device
@@ -483,7 +465,7 @@ def matmul(
     -----
     Provider routes require float64 or complex128, one JAX process per mesh
     cell in y-minor order, exact face tiling, and an available handler.
-    cuBLASMp and SLATE additionally require a square mesh; multi-rank
+    cuBLASMp additionally requires a square mesh; multi-rank
     cuBLASMp implements transpose/adjoint modes by a device face transpose
     followed by its N,N provider call. Its native transpose descriptors are
     never used: transpose-A returned wrong answers and transpose-B could

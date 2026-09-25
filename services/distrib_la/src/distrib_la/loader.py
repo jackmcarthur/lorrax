@@ -152,7 +152,6 @@ _CUDA_TARGET_SYMBOLS = {
     "lorrax_slate_trsm":                  "SlateTrsmFfi",
     "lorrax_slate_batched_potrf":         "SlateBatchedPotrfFfi",
     "lorrax_slate_batched_trsm":          "SlateBatchedTrsmFfi",
-    "lorrax_slate_batched_gemm":          "SlateBatchedGemmFfi",
 }
 
 # The host variants: the SAME target names registered under platform="cpu"
@@ -168,12 +167,10 @@ _HOST_TARGET_SYMBOLS = {
     "lorrax_slate_trsm":                    "SlateTrsmHostFfi",
     "lorrax_slate_batched_potrf":           "SlateBatchedPotrfHostFfi",
     "lorrax_slate_batched_trsm":            "SlateBatchedTrsmHostFfi",
-    "lorrax_slate_batched_gemm":            "SlateBatchedGemmHostFfi",
     "lorrax_scalapack_eigh":                "ScalapackEighHostFfi",
     "lorrax_scalapack_batched_solve_lu":    "ScalapackBatchedSolveLuHostFfi",
     "lorrax_scalapack_batched_getrf":       "ScalapackBatchedGetrfHostFfi",
     "lorrax_scalapack_batched_getrs":       "ScalapackBatchedGetrsHostFfi",
-    "lorrax_scalapack_batched_gemm":        "ScalapackBatchedGemmHostFfi",
 }
 
 #: Per-platform library spec.  ``build_subdir`` is relative to
