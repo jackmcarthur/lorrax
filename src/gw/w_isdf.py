@@ -474,17 +474,23 @@ def _get_chi_minimax_kernel_fused(mesh_xy, kgrid, nk, n_out, complex_contour,
     its load, transforms, traces the spins and accumulates chi_R in place.  The live set
     is the two parent Greens and the accumulator; a real contour reads the antiunitary
     partner as ``conj(G)`` on the load, a complex one reads the conjugate-face parent
-    Green.  One forward transform after the tau sum.  Same signature and output as
-    :func:`_get_chi_minimax_kernel_face` for ``vertex_pairs=None``.
+    Green.  When that set exceeds the device target the valence Green is built and
+    accumulated in band chunks (chi_tau is linear in it;
+    ``greens_function_kernel.chi_valence_chunks``).  One forward transform after the tau
+    sum.  Same signature and output as :func:`_get_chi_minimax_kernel_face` for
+    ``vertex_pairs=None``.
     """
     from common.fft_helpers import make_flat_k_fftn, make_kconv_chi_unfold
     from common.wfn_layout import psi_specs
     from distrib_la import gemm_plan
-    from .greens_function_kernel import build_G_tau
+    from .greens_function_kernel import build_G_tau, chi_valence_chunks
     from .wavefunction_bundle import CHI_Q_SPEC as _chi_spec, CHI_R_SPEC as _chi_R_spec
 
     psi_nmu_spec, psi_mun_spec = psi_specs(layout)
     nk_in, nb_full, n_rmu, ns = (int(v) for v in face_shape)
+    anti = bool(np.any(np.asarray(k_unfold_plan.sym_idx) >= k_unfold_plan.n_sym_spatial))
+    n_vc = chi_valence_chunks(n_parent=nk_in, n_rmu=n_rmu, ns=ns, n_full=nk, n_out=n_out,
+                              n_val=nb_full, mesh=mesh_xy, partner=complex_contour and anti)
     if nk_in != k_unfold_plan.n_parent or k_unfold_plan.n_full != nk:
         raise ValueError("chi parent plan: face k extent or full-k extent disagrees with its plan.")
     door = make_kconv_chi_unfold(mesh_xy, kgrid, k_unfold_plan.unfold_load_tables(),
@@ -507,14 +513,27 @@ def _get_chi_minimax_kernel_fused(mesh_xy, kgrid, nk, n_out, complex_contour,
             t_scalar, alpha_col = xs
             tau = t_scalar if complex_contour else jnp.real(t_scalar).astype(jnp.float64)
             t_c = jnp.conj(tau) if complex_contour else tau
-            green = lambda t, ref, mask: build_G_tau(
+            green = lambda t, ref, mask, band_range=None: build_G_tau(
                 psi_mun, psi_nmu, enk_full, t, e_ref=ref, mask=mask, layout=layout,
-                gemm=g_plan, k_unfold_plan=k_unfold_plan, trim_zero_bands=True, unfold=False)
-            Gv = green(-tau, vmax, mask_v)
+                gemm=g_plan, k_unfold_plan=k_unfold_plan, trim_zero_bands=True, unfold=False,
+                band_range=band_range)
+            alpha = alpha_col.astype(jnp.complex128)
             Gc = green(t_c, cmin, mask_c)
-            # A Green of real weights reads its partner as conj(G) on the load.
-            partners = () if Gv.conj_partner else (Gv.transpose, Gc.transpose)
-            return door(acc, Gv.G, Gc.G, alpha_col.astype(jnp.complex128), *partners), None
+            if n_vc == 1:
+                chunks = (None,)
+            else:
+                # The valence support's band interval, split into n_vc ranges.
+                occupied = jnp.any(mask_v, axis=0)
+                lo = jnp.argmax(occupied)
+                hi = nb_full - jnp.argmax(occupied[::-1])
+                edges = [lo + ((hi - lo) * c) // n_vc for c in range(n_vc + 1)]
+                chunks = tuple(zip(edges[:-1], edges[1:]))
+            for band_range in chunks:
+                Gv = green(-tau, vmax, mask_v, band_range)
+                # A Green of real weights reads its partner as conj(G) on the load.
+                partners = () if Gv.conj_partner else (Gv.transpose, Gc.transpose)
+                acc = door(acc, Gv.G, Gc.G, alpha, *partners)
+            return acc, None
 
         acc, _ = jax.lax.scan(node, acc0, (nodes.t, alpha_rows), unroll=1)
         return tuple(chi_fftn(acc[o]) for o in range(n_out))

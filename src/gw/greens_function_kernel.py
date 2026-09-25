@@ -352,14 +352,41 @@ def sigma_spin_block(*, n_parent, n_rmu, ns, mesh, partner_tiles):
     """
     if int(ns) <= 1:
         return 1
-    from common.gpu_utils import (bfc_fragmentation_target_utilization,
-                                  get_device_memory_gb,
-                                  minimum_process_budget_gb)
     P_ = int(mesh.shape['x']) * int(mesh.shape['y'])
     tile = 16.0 * int(n_parent) * int(ns) ** 2 * int(n_rmu) ** 2 / P_
-    target = (minimum_process_budget_gb(get_device_memory_gb()) * 1e9
-              * bfc_fragmentation_target_utilization(int(ns)))
+    target = _device_target_bytes(ns)
     for d in sorted((d for d in range(1, int(ns) + 1) if int(ns) % d == 0), reverse=True):
         if (1.0 + float(partner_tiles) + (d / int(ns)) ** 2) * tile <= target:
             return d
     return 1
+
+
+def _device_target_bytes(ns: int) -> float:
+    """The agreed per-process device target: the minimum process budget times the spinor's
+    fragmentation utilization (the one target the Green-side planners share)."""
+    from common.gpu_utils import (bfc_fragmentation_target_utilization,
+                                  get_device_memory_gb,
+                                  minimum_process_budget_gb)
+    return (minimum_process_budget_gb(get_device_memory_gb()) * 1e9
+            * bfc_fragmentation_target_utilization(int(ns)))
+
+
+def chi_valence_chunks(*, n_parent, n_rmu, ns, n_full, n_out, n_val, mesh, partner):
+    """Valence-band passes of the fused chi0 node (``w_isdf._get_chi_minimax_kernel_fused``).
+
+    chi_tau = sum_ab conj(Gc'_ab) Gv'_ab is linear in Gv, so the valence Green may be
+    built and accumulated in band chunks against one conduction Green.  Live per rank:
+    ``(1 + partner)·T_p`` for Gc, the same over ``n`` for a Gv chunk, and the accumulator
+    ``16·n_out·N_k·μ²/P``, with ``T_p = 16·n_parent·ns²·μ²/P``; the smallest ``n`` that fits
+    the device target wins (every process computes the same ``n``), capped at ``n_val``.
+    """
+    P_ = int(mesh.shape['x']) * int(mesh.shape['y'])
+    tile = 16.0 * int(n_parent) * int(ns) ** 2 * int(n_rmu) ** 2 / P_
+    acc = 16.0 * int(n_out) * int(n_full) * int(n_rmu) ** 2 / P_
+    target = _device_target_bytes(ns)
+    side = (1.0 + float(bool(partner))) * tile
+    for n in range(1, max(1, int(n_val)) + 1):
+        if side * (1.0 + 1.0 / n) + acc <= target:
+            return n
+    return max(1, int(n_val))
+
