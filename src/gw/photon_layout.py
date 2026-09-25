@@ -48,7 +48,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
-from runtime.padding import PaddedAxis, padded_mu_axis
+from runtime.padding import PaddedAxis, padded_axis, padded_mu_axis
 
 
 N_LORENTZ = 4
@@ -88,8 +88,15 @@ class PhotonBasisLayout:
 
     @classmethod
     def from_centroid_extents(
-        cls, n_charge: int, n_transverse: int, mesh_xy: Mesh,
+        cls, n_charge: int, n_transverse: int, mesh_xy: Mesh, *,
+        packed: bool = False,
     ) -> "PhotonBasisLayout":
+        """Layout for logical centroid extents, padded here; or, with
+        ``packed=True``, for extents that are already packed carriers
+        (``PackedCentroidBasis.n_packed``: orbit packing and the test-only
+        ``LORRAX_EXTRA_MU_PAD`` rows included), which are not padded again.
+        Without the knob the two agree whenever the extent divides the mesh.
+        """
         px = int(mesh_xy.shape['x'])
         py = int(mesh_xy.shape['y'])
         if px != py:
@@ -97,8 +104,9 @@ class PhotonBasisLayout:
                 "full photon response requires a square ('x','y') mesh so "
                 "row/column interleaving is one identical permutation; got "
                 f"{px}x{py}")
-        p_c = padded_mu_axis(int(n_charge), mesh_xy)
-        p_t = padded_mu_axis(int(n_transverse), mesh_xy)
+        axis = ((lambda n: padded_axis(int(n), mesh_xy, name="centroid mu"))
+                if packed else (lambda n: padded_mu_axis(int(n), mesh_xy)))
+        p_c, p_t = axis(n_charge), axis(n_transverse)
         return cls(
             channel_axes=(p_c, p_t, p_t, p_t),
             mesh_side=px)
