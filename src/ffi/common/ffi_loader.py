@@ -131,6 +131,7 @@ _CUDA_TARGET_SYMBOLS = {
     "lorrax_fourier_plan":          "LorraxFourierPlanCudaFfi",
     "lorrax_fourier_plan_mathdx":   "LorraxFourierPlanMathdxCudaFfi",
     "lorrax_phdf5_write":           "PhdfWriteFfi",
+    "lorrax_phdf5_write_independent": "PhdfWriteIndependentFfi",
     "lorrax_phdf5_read":            "PhdfReadFfi",
     "lorrax_phdf5_read_kchunk":       "PhdfReadKchunkFfi",
     "lorrax_phdf5_read_kchunk_union": "PhdfReadKchunkUnionFfi",
@@ -184,6 +185,7 @@ _HOST_TARGET_SYMBOLS = {
     "lorrax_phdf5_read_kchunk":       "PhdfReadKchunkHostFfi",
     "lorrax_phdf5_read_kchunk_union": "PhdfReadKchunkUnionHostFfi",
     "lorrax_phdf5_write":             "PhdfWriteHostFfi",
+    "lorrax_phdf5_write_independent": "PhdfWriteIndependentHostFfi",
 }
 
 # Per-platform library spec: .so filename, env-var override, in-tree build

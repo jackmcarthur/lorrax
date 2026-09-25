@@ -561,6 +561,7 @@ def read_sharded_slab(
             mesh_shape=(p, q),
             axis_count_per_dim=(1, 1),
             axis_flat=(0, 1),
+            independent=False,    # a 2-D block tile: strided per rank
         )
 
     return shard_map(
@@ -809,6 +810,10 @@ The underlying C++ handler is N-D and derives per-rank hyperslab
 offsets from ``ctx->rank`` + the mesh_shape / axis_for_dim attrs.
 """
 _FFI_TARGET = "lorrax_phdf5_write"
+#: Same handler body with an independent (not two-phase) H5Dwrite, for slabs
+#: whose per-rank selection is one long file-order run; see
+#: ``file_io._slab_io_ffi._file_order_plan``.
+_FFI_TARGET_INDEPENDENT = "lorrax_phdf5_write_independent"
 
 
 # Low-level padding contract: A_local is the physical equal-block shard;
@@ -822,8 +827,13 @@ def ffi_write_call(
     mesh_shape: Sequence[int],
     axis_count_per_dim: Sequence[int],
     axis_flat: Sequence[int],
+    independent: bool,
 ) -> jax.Array:
     """Low-level FFI call for one rank's local shard.  Returns token.
+
+    ``independent`` selects the transfer mode, and it has no default because
+    neither is right in general: independent MPI-IO for a file-order row-block
+    slab (one long run per rank), two-phase collective for anything strided.
 
     ``handle``, ``offset_base`` and ``valid_shape`` are jax.Arrays of
     dtype int64 — passed as traced Buffer inputs (not FFI Attrs) so that
@@ -855,7 +865,8 @@ def ffi_write_call(
     require_control_i64("write offset_base", offset_base, ndim=1)
     require_control_i64("write valid_shape", valid_shape, ndim=1)
     token_spec = jax.ShapeDtypeStruct((1,), jnp.int32)
-    return jax.ffi.ffi_call(_FFI_TARGET, token_spec, has_side_effect=True)(
+    target = _FFI_TARGET_INDEPENDENT if independent else _FFI_TARGET
+    return jax.ffi.ffi_call(target, token_spec, has_side_effect=True)(
         A_local,
         handle,
         offset_base,
@@ -926,6 +937,7 @@ def write_sharded_slab(
             mesh_shape=(p, q),
             axis_count_per_dim=(1, 1),
             axis_flat=(0, 1),
+            independent=False,    # a 2-D block tile: strided per rank
         )
 
     return shard_map(

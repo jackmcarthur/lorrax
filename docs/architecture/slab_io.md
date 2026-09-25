@@ -51,6 +51,30 @@ show in `/proc`; `ffi.io.staging_totals()` returns
 operand's `H5Dwrite` completes. The process's one writer queue holds at most
 two queued writes plus the one in flight, and a further `write_slab` blocks.
 
+**Writes leave in file order.** `_file_order_plan` decides how each
+`write_slab` leaves, from the operand's shape, valid extent and sharding and
+the dataset's extent.
+- **Row-block pieces, written independently.** The operand is cut into pieces of
+  one index of each leading axis by `rows` rows of a split axis `k` by every later
+  axis whole. Each piece is redistributed on the device so that rank r holds rows
+  `[r·rows/P, (r+1)·rows/P)`, then written with `lorrax_phdf5_write_independent`
+  (independent `H5Dwrite`). Each rank then writes one contiguous file run per
+  leading index. A piece is at most `_FILE_ORDER_PIECE_BYTES` (64 MiB) per rank,
+  so with the queue below the redistribution adds about 256 MiB of staging per
+  rank. Only unsharded axes are cut or indexed; a sharded split axis is taken
+  whole, because cutting a sharded axis would make XLA gather it.
+- **As-is, independent.** An operand that already is such row blocks is written
+  independently, with no copy.
+- **As-is, collective.** Everything else keeps two-phase collective `H5Dwrite`
+  (`lorrax_phdf5_write`): P = 1, a tiny slab, a layout that could only be cut by
+  slicing a sharded axis (a face `(q, μ_X, ν_Y)` tile too large to take whole),
+  or pieces whose per-rank runs would be shorter than 1 MiB.
+- **Why:** at P16 on Lustre, the shared-pole bank shape runs at 2.8 GB/s as row
+  blocks against 2.0 GB/s collective, and a WFN_qp G window at 4.2 against 2.6.
+  Independent writes of short runs lose (76 kB runs: 0.8 GB/s).
+- **Unchanged:** the bytes in the file, the dataset layout and every call
+  signature.
+
 **One collective lane per process.** Every handle's asynchronous writes go
 through one queue and one worker (`_slab_io_ffi._CollectiveLane`), so
 collective HDF5 calls leave in program order, which is the same on every
