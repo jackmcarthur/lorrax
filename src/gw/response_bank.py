@@ -1014,25 +1014,30 @@ def response_quadrature(meta, sample_plan, receipt, support, *, group_size, prin
     member's forward and reverse orientation (see ``minimax.response_group_rules``).
     """
     import minimax
+    from .sigma_box_plan import snap_outward
     z = bank_points(sample_plan)
     f, u, refs = support["f"], support["u"], support["refs"].copy()
-    lo, hi, mu = support["lo"], support["hi"], support["mu"]
-    decay_rate, amplitude = support["decay_rate"], support["amplitude"]
+    mu = support["mu"]
+    # Rule and reuse decision are functions of grid cells, not of the exact
+    # support: a round-off change otherwise flips reuse and moves SC eqp.
+    lo, hi = snap_outward(support["lo"], 1., -1), snap_outward(support["hi"], 1., +1)
+    decay_rate = snap_outward(support["decay_rate"], 1., -1)
+    amplitude = snap_outward(support["amplitude"], 1., +1)
     session = getattr(meta, "shared_pole_response_rules", None)
     old = None if session is None else session.get("frequency")
     metallic = sample_plan["census"]["partial_at_mu"]
     reuse = (old is not None and old["lo"] <= lo and hi <= old["hi"]
-             and old.get("decay_rate", 0.) <= decay_rate
-             and old.get("amplitude", 0.) >= amplitude
+             and old["decay_rate"] <= decay_rate and old["amplitude"] >= amplitude
              and old["metallic"] == metallic and np.array_equal(old["z"], z)
-             and old.get("group_size") == group_size)
+             and old["group_size"] == group_size)
     if reuse:
         plan = old
     else:
         pad = 4./RYD_TO_EV if session is not None else 0.
-        plan = dict(lo=lo-pad, hi=hi+pad, z=z, metallic=metallic, group_size=group_size,
-                    decay_rate=decay_rate, amplitude=amplitude,
-                    reference=0. if decay_rate else lo-pad)
+        plan = dict(lo=snap_outward(support["lo"]-pad, 1., -1),
+                    hi=snap_outward(support["hi"]+pad, 1., +1), z=z, metallic=metallic,
+                    group_size=group_size, decay_rate=decay_rate, amplitude=amplitude)
+        plan["reference"] = 0. if decay_rate else plan["lo"]
         requests = response_groups(z, group_size)
         previous = [] if old is None else old["groups"]
 

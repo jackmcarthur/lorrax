@@ -488,20 +488,24 @@ def _rule_cache_store(directory, rule, noise_amplification):
     return None
 
 
-#: Relative cell of the logarithmic grid (units of eta) every build box is
-#: snapped outward to.
+#: Relative cell of the logarithmic grid every build box is snapped outward to.
 _BUILD_GRID_STEP = 1.0e-4
 
 
-def _snap_outward(x, eta, outward):
+def snap_outward(x, scale, outward):
     """``x`` moved outward (``outward`` = +1 up, -1 down) to the nearest point
-    of ``sign(x) * eta * (1 + _BUILD_GRID_STEP)**k``, k integer; zero stays
-    zero and a nonzero edge never changes sign (a sign-definite box stays so)."""
+    of ``sign(x) * scale * (1 + _BUILD_GRID_STEP)**k``, k integer; zero stays
+    zero and a nonzero edge never changes sign (a sign-definite box stays so).
+
+    The one grid for every quantity a rule is built from or a reuse decision
+    compares: Sigma build boxes (scale eta), the chi response rule support and
+    the SC shared-pole sampling envelope (scale 1). A round-off-perturbed
+    input lands on the same grid point unless it straddles a cell edge."""
     if x == 0.0:
         return 0.0
-    k = np.log(abs(x) / eta) / np.log1p(_BUILD_GRID_STEP)
+    k = np.log(abs(x) / scale) / np.log1p(_BUILD_GRID_STEP)
     k = np.ceil(k) if outward * np.sign(x) > 0 else np.floor(k)
-    return float(np.sign(x) * eta * np.exp(k * np.log1p(_BUILD_GRID_STEP)))
+    return float(np.sign(x) * scale * np.exp(k * np.log1p(_BUILD_GRID_STEP)))
 
 
 def _build_box(box, eta, *, widen):
@@ -529,8 +533,8 @@ def _build_box(box, eta, *, widen):
         box = (box[0] - extra if box[0] < -near else box[0],
                box[1] + extra if box[1] > near else box[1],
                box[2], box[3] * 1.01)
-    return (_snap_outward(box[0], eta, -1), _snap_outward(box[1], eta, +1),
-            _snap_outward(box[2], eta, -1), _snap_outward(box[3], eta, +1))
+    return (snap_outward(box[0], eta, -1), snap_outward(box[1], eta, +1),
+            snap_outward(box[2], eta, -1), snap_outward(box[3], eta, +1))
 
 
 def _factor_references(kind, pole_sign, states, pole_stats):
