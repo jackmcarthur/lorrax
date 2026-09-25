@@ -9,7 +9,7 @@ import jax.numpy as jnp
 from common.contract_bands import merge_spin_centroid
 
 
-def _face_band_gather_product(A, B, mesh, phases, band_range, n_full=None):
+def face_band_gather_product(A, B, mesh, phases, band_range, n_full=None):
     """``A·diag(w)·B`` on band-distributed faces by gathered band panels.
 
     ``A`` ``(nq, M, N_b)`` and ``B`` ``(nq, N_b, N)`` are both
@@ -82,7 +82,7 @@ def _build_G_face(psi_mun, psi_nmu, *, gemm, Gij=None, phases=None, mesh=None,
         G_flat = prepared_active_gemm(A, B, weights=phases)
     elif getattr(gemm, "backend", "local") != "local":
         # A already carries the phases when there is no band range (above).
-        G_flat = _face_band_gather_product(
+        G_flat = face_band_gather_product(
             A, B, gemm.mesh, None if band_range is None else phases, band_range,
             n_full=n_full)
     else:

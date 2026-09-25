@@ -638,7 +638,7 @@ def _get_chi_fractional_contour_kernel_face(
     """
     from common.fft_helpers import make_flat_k_fftn
     from distrib_la import gemm_plan
-    from .greens_function_kernel import build_G_tau
+    from .greens_function_kernel import build_G_tau, face_band_gather_product
     from .wavefunction_bundle import (
         G_FFT7D_SPEC,
         G_FLATK_SPEC,
@@ -728,9 +728,12 @@ def _get_chi_fractional_contour_kernel_face(
     green_spin = 1 if vertex else ns
     if band_ranges is not None and (layout != "axis" or pair_mode != "direct"):
         raise ValueError("prepared response band ranges require the axis direct stream")
-    g_plan = gemm_plan(mesh_xy, m=n_rmu * green_spin, k=nb_full, n=n_rmu * green_spin,
-                       nq=nk_shape, dtype=jnp.complex128, layout=layout,
-                       enable_active_range=band_ranges is not None)
+    if vertex and layout == "face":
+        g_plan = partial(face_band_gather_product, mesh=mesh_xy, phases=None, band_range=None)
+    else:
+        g_plan = gemm_plan(mesh_xy, m=n_rmu * green_spin, k=nb_full, n=n_rmu * green_spin,
+                           nq=nk_shape, dtype=jnp.complex128, layout=layout,
+                           enable_active_range=band_ranges is not None)
     active_gemms = (tuple(g_plan.prepare_active_range(*bounds) for bounds in band_ranges)
                    if band_ranges is not None else (None, None))
     def _finish(value):
