@@ -61,7 +61,8 @@ def test_fit_q_block_prices_the_local_tile(monkeypatch):
     # Two input slices and the outputs at least; a few local tiles at most --
     # never the global (mu, nu) slice times the device count.
     assert 2 * local <= block <= 16 * local, (block, local)
-    assert 0 < out < block
+    # The kept outputs (Omega f64, B c128, valid bool) on the local tile.
+    assert out == (8 + 16 + 1) * (MU // 2) * (MU // 2)
 
 
 @pytest.mark.mesh(4)
