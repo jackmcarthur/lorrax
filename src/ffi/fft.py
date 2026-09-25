@@ -180,8 +180,9 @@ KCONV_PAIR_TARGET = "lorrax_mathdx_kconv_pair"
 KCONV_PARENT_TARGET = "lorrax_mathdx_kconv_parent"
 KCONV_PLANE_TARGET = "lorrax_mathdx_kconv_plane"
 KCONV_KLEAD_TARGET = "lorrax_mathdx_kconv_klead"
-KCONV_KLEAD_UNFOLD_TARGET = "lorrax_mathdx_kconv_klead_unfold_rows"
-KCONV_KLEAD_LORENTZ_TARGET = "lorrax_mathdx_kconv_klead_lorentz_rows"
+#: Modes 7/8 on the parent rows, with the conj-on-load partner and (mode 7) the output spin block.
+KCONV_KLEAD_UNFOLD_TARGET = "lorrax_mathdx_kconv_klead_unfold_block"
+KCONV_KLEAD_LORENTZ_TARGET = "lorrax_mathdx_kconv_klead_lorentz_conj"
 KFFT_KLEAD_UNFOLD_TARGET = "lorrax_mathdx_kfft_klead_unfold"
 #: Mode 11, the chi0 pass read from the raw-parent Green pair (:func:`make_kconv_chi_unfold`).
 KCONV_CHI_UNFOLD_TARGET = "lorrax_mathdx_kconv_chi_unfold"
