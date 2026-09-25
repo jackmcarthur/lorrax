@@ -637,9 +637,10 @@ def _gn_ppm_fit_bytes_per_q(kernel, Wc0, Wprobe, *args) -> tuple[int, int]:
     """Per-device ``(block_bytes, output_bytes)`` of ONE q through ``kernel``.
 
     ``block_bytes`` is what a q block holds while it runs (its sliced inputs,
-    its temp arena and its outputs); ``output_bytes`` the part that stays
-    live until the blocks are concatenated.  From the kernel compiled at
-    q = 1 on the inputs' own sharding, once per (kernel, tile, layout).
+    its temp arena and its outputs), from the kernel compiled at q = 1 on the
+    inputs' own sharding; ``output_bytes`` the (q, mu, nu) outputs that stay
+    live until the blocks are concatenated, on the inputs' LOCAL tile (the
+    outputs keep the input layout).  Once per (kernel, tile, layout).
     """
     def one_q(x):
         return jax.ShapeDtypeStruct((1,) + tuple(x.shape[1:]), x.dtype,
@@ -648,9 +649,15 @@ def _gn_ppm_fit_bytes_per_q(kernel, Wc0, Wprobe, *args) -> tuple[int, int]:
            str(getattr(Wprobe, "sharding", None)), args[2], args[3] is None)
     if key not in _GN_PPM_FIT_BYTES_PER_Q:
         ma = kernel.lower(one_q(Wc0), one_q(Wprobe), *args).compile().memory_analysis()
-        out = int(ma.output_size_in_bytes)
+        sh = getattr(Wc0, "sharding", None)
+        local = int(np.prod((sh.shard_shape(tuple(Wc0.shape)) if sh is not None
+                             else tuple(Wc0.shape))[1:]))
+        outs = jax.eval_shape(kernel, one_q(Wc0), one_q(Wprobe), *args)
+        out = local * sum(int(o.dtype.itemsize) for o in jax.tree_util.tree_leaves(outs)
+                          if len(o.shape) == 3)
         _GN_PPM_FIT_BYTES_PER_Q[key] = (
-            int(ma.argument_size_in_bytes) + int(ma.temp_size_in_bytes) + out, out)
+            int(ma.argument_size_in_bytes) + int(ma.temp_size_in_bytes)
+            + int(ma.output_size_in_bytes), out)
     return _GN_PPM_FIT_BYTES_PER_Q[key]
 
 
