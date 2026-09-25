@@ -95,8 +95,10 @@ def test_scalar_and_bispinor_callers_supply_the_same_charge_semantics():
 
     bispinor_tree = _tree(BISPINOR)
     # The bispinor build contracts its tiles in groups (CC; the six TT) and
-    # hands each tile's charge role in its spec.
-    assert len(_calls(bispinor_tree, "_compute_V_q_g_flat_tiles")) == 1
+    # hands each tile's charge role in its spec.  Each group is contracted
+    # either at fit time from the in-memory ζ (compute_bispinor_cc_tile,
+    # compute_bispinor_tt_tiles) or by the orchestrator from the ζ files.
+    assert len(_calls(bispinor_tree, "_compute_V_q_g_flat_tiles")) == 3
     roles = [kw.value for node in ast.walk(bispinor_tree)
              if isinstance(node, ast.Call) for kw in node.keywords
              if kw.arg == "is_charge_cc"]
@@ -105,8 +107,7 @@ def test_scalar_and_bispinor_callers_supply_the_same_charge_semantics():
     assert isinstance(bispinor_role, ast.Name)
     assert bispinor_role.id == "is_CC"
 
-    orchestrator = _function(
-        bispinor_tree, "compute_V_q_bispinor_g_flat_to_h5")
+    orchestrator = _function(bispinor_tree, "_bispinor_tile_spec")
     assignments = [
         node for node in ast.walk(orchestrator)
         if isinstance(node, ast.Assign)

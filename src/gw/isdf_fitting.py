@@ -675,9 +675,10 @@ def fit_zeta_to_h5(
         raise ValueError(
             f"fit_zeta_to_h5: centroid_indices has shape "
             f"{_cent_idx_np.shape}, expected ({n_rmu}, 3).")
-    # The charge fit writes zeta_q.h5 only for a consumer that reads it
-    # (write_restart_tensors, bispinor); the currents' V_q always reads theirs.
-    _write_file = bool(write_zeta_file) or transverse
+    # A ζ file is written only for a consumer that reads it: restart / reuse
+    # (write_restart_tensors), or a four-current V_q that forms some tiles
+    # from files (a family accepted for reuse).  The caller decides.
+    _write_file = bool(write_zeta_file)
 
     # ========== per channel: C_q, its factor, its file ==========
     from distrib_la import gemm_plan as _gemm_plan

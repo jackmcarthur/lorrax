@@ -1915,9 +1915,9 @@ def _fit_charge_zeta_channel(
     peak_bytes = 0
     zeta_g = None
     # zeta_q.h5 is written for the consumers that read it back: the restart /
-    # reuse / BSE bundle (write_restart_tensors) and the four-current V_q.
-    _write_zeta_file = bool(getattr(cfg, 'write_restart_tensors', True)
-                            or cfg.bispinor)
+    # reuse / BSE bundle (write_restart_tensors).  The four-current V_q takes
+    # its CC tile from the in-memory ζ (``_bispinor_charge_tile``).
+    _write_zeta_file = bool(getattr(cfg, 'write_restart_tensors', True))
     if _reuse_charge:
         print_fn(f"  [zeta reuse] charge ζ accepted at {zeta_h5_path}; "
                  "charge fit skipped independently.")
@@ -2064,9 +2064,19 @@ def _fit_transverse_zeta_channels(
         faces=faces)
     del faces
     if not missing:
-        return transverse_wfn_data
+        return transverse_wfn_data, None
     parent_T = transverse_wfn_data['green_parent']
     print_fn(f"  [bispinor] μ_L={missing} → one route-G loop")
+    # Every channel fresh on the q-local tier: the six TT tiles are formed
+    # from the three live ζ in one pass (q-sharded accumulators), and a ζ_T
+    # file is written only for restart or reuse.  With a channel accepted for
+    # reuse, or on the G-split tier (six whole (Q, μ, μ) accumulators per
+    # rank), the V_q forms the TT tiles from files, so the fresh channels
+    # write theirs.
+    tt_from_fit = (len(missing) == 3
+                   and _chunks_T['mubatch'].finalize_layout == 'q')
+    write_T = (bool(getattr(cfg, 'write_restart_tensors', True))
+               or not tt_from_fit)
     with timing.section("gw_jax.zeta_fit_transverse"), \
          jax_profile.trace_section("zeta_fit_transverse"):
         _, zetas = fit_zeta_to_h5(
@@ -2088,16 +2098,23 @@ def _fit_transverse_zeta_channels(
             zeta_cutoff_ry=_zeta_cutoff,
             layout="face" if cfg.memory.low_mem_bands else "axis",
             mubatch_plan=_chunks_T['mubatch'], parent_psi=parent_psi,
-            print_fn=print_fn)
+            write_zeta_file=write_T, print_fn=print_fn)
     del parent_psi
-    # The four-current V_q reads the ζ_T files; the Z stores are done.
-    for zeta_g in zetas.values():
-        zeta_g.close()
+    tt_tiles = None
+    try:
+        if tt_from_fit:
+            tt_tiles = _bispinor_current_tiles(
+                [zetas[mu] for mu in (1, 2, 3)], cfg=cfg, meta_T=_meta_T,
+                wfn=wfn, sym=sym, centroid_T_idx=_cent_T_idx, mesh_xy=mesh_xy,
+                print_fn=print_fn)
+    finally:
+        for zeta_g in zetas.values():
+            zeta_g.close()
     for mu in missing:
         _gate_fresh_zeta_rank_findings(
             f"the μ_L={mu} transverse ζ fit's rank truncation",
             transverse=True, print_fn=print_fn)
-        if not _trunc and jax.process_index() == 0:
+        if write_T and not _trunc and jax.process_index() == 0:
             try:
                 from file_io.isdf_header import stamp_fit_provenance
                 stamp_fit_provenance(_zeta_T_paths[mu], _provenance_T(mu))
@@ -2106,7 +2123,7 @@ def _fit_transverse_zeta_channels(
                          f"({exc}); this ζ_T will be refit on the next "
                          f"run.")
         barrier(f"zeta_provenance_mu{mu}")
-    return transverse_wfn_data
+    return transverse_wfn_data, tt_tiles
 
 
 def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_dir,
@@ -2161,20 +2178,34 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 	    zeta_h5_path)
 	_report_zeta_fit_peak(
 	    cfg, mem_est, peak_bytes, print_fn)
+	fit_v = None
 	if cfg.bispinor and zeta_g is not None:
-	    # The four-current V_q reads the charge ζ file the fit wrote
-	    # (compute_V_q), so free the charge Z store before the current fit
-	    # fills its own.
-	    zeta_g.close()
+	    # The four-current V_q's CC tile is contracted from this ζ now, while
+	    # its Z store is live; the store is freed before the current fit
+	    # fills its own, and the tile waits on host (v_q_bispinor.ParkedVTiles).
+	    from .v_q_bispinor import BispinorFitV
+	    fit_v = BispinorFitV(zeta_g.path)
+	    fit_v.cc = _bispinor_charge_tile(
+	        zeta_g, cfg=cfg, meta=meta, wfn=wfn, sym=sym,
+	        centroid_indices=centroid_indices, mesh_xy=mesh_xy,
+	        print_fn=print_fn)
 	    zeta_g = None
 	transverse_wfn_data = None
 	if cfg.bispinor and getattr(cfg.paths, "centroids_file_current", None):
-	    transverse_wfn_data = _fit_transverse_zeta_channels(
+	    transverse_wfn_data, tt_tiles = _fit_transverse_zeta_channels(
 	        _band_norms, _cent_T_idx, _chunks_T, _meta_T, _provenance_T,
 	        _reuse_T, _trunc, _write_ibz_only_transverse, _zeta_T_paths,
 	        _zeta_cutoff, band_range_left, band_range_right, band_slices, cfg, mesh_xy, print_fn,
 	        representation, sym, wfn, zeta_contract)
-	# The μ-batch fit hands V_q its ζ as (Z store, C⁺); a file path otherwise.
+	    if tt_tiles is not None:
+	        from .v_q_bispinor import BispinorFitV
+	        fit_v = fit_v or BispinorFitV(zeta_h5_path)
+	        fit_v.tt = tt_tiles
+	        fit_v.n_rmu_T = int(_meta_T.n_rmu)
+	# The μ-batch fit hands V_q its ζ as (Z store, C⁺), a four-current V_q
+	# the tiles its fits formed; a file path otherwise.
+	if fit_v is not None:
+	    return fit_v, mem_est, transverse_wfn_data
 	return (zeta_g if zeta_g is not None else zeta_h5_path), mem_est, transverse_wfn_data
 
 
@@ -2247,10 +2278,69 @@ def _build_head_channel(zeta_io, *, cfg, meta, wfn, bvec, mesh_xy, sym,
 	return hc
 
 
+def _vcoul_bvec_and_cutoff(cfg, wfn):
+    """The Coulomb geometry's ``bvec`` and the bare-Coulomb cutoff (Ry)."""
+    bvec = CoulombGeometry.from_wfn(wfn).bvec
+    if cfg.head.bare_coulomb_cutoff is None:
+        return bvec, float(wfn.ecutwfc)
+    return bvec, float(cfg.head.bare_coulomb_cutoff)
+
+
+def _bispinor_charge_tile(zeta_g, *, cfg, meta, wfn, sym, centroid_indices,
+                          mesh_xy, print_fn=print):
+    """The four-current V_q's CC tile from the charge fit's live ζ; closes it."""
+    from .v_q_bispinor import compute_bispinor_cc_tile
+    bvec, vcoul_cutoff_ry = _vcoul_bvec_and_cutoff(cfg, wfn)
+    try:
+        with timing.section("gw_jax.V_q_compute_cc"):
+            return compute_bispinor_cc_tile(
+                zeta_g, mesh_xy=mesh_xy, kgrid=meta.kgrid,
+                fft_grid=meta.fft_grid, bvec=bvec,
+                cell_volume=meta.cell_volume, sys_dim=meta.sys_dim,
+                n_rmu_C=int(meta.n_rmu),
+                bare_coulomb_cutoff_ry=vcoul_cutoff_ry,
+                bdot=(np.asarray(wfn.bdot, dtype=np.float64)
+                      if meta.sys_dim == 0 else None),
+                g_chunk=(int(cfg.memory.vq_g_chunk_size)
+                         if cfg.memory.vq_g_chunk_size > 0 else None),
+                sym=sym,
+                centroid_C_idx=(np.asarray(jax.device_get(centroid_indices),
+                                           dtype=np.int32)
+                                if centroid_indices is not None else None),
+                print_fn=print_fn)
+    finally:
+        zeta_g.close()
+
+
+def _bispinor_current_tiles(zetas_T, *, cfg, meta_T, wfn, sym, centroid_T_idx,
+                            mesh_xy, print_fn=print):
+    """The four-current V_q's six TT tiles from the current fit's live ζ."""
+    from .v_q_bispinor import compute_bispinor_tt_tiles
+    bvec, vcoul_cutoff_ry = _vcoul_bvec_and_cutoff(cfg, wfn)
+    with timing.section("gw_jax.V_q_compute_tt"):
+        return compute_bispinor_tt_tiles(
+            zetas_T, mesh_xy=mesh_xy, kgrid=meta_T.kgrid,
+            fft_grid=meta_T.fft_grid, bvec=bvec,
+            cell_volume=meta_T.cell_volume, sys_dim=meta_T.sys_dim,
+            n_rmu_T=int(meta_T.n_rmu),
+            bare_coulomb_cutoff_ry=vcoul_cutoff_ry,
+            bdot=(np.asarray(wfn.bdot, dtype=np.float64)
+                  if meta_T.sys_dim == 0 else None),
+            g_chunk=(int(cfg.memory.vq_g_chunk_size)
+                     if cfg.memory.vq_g_chunk_size > 0 else None),
+            sym=sym,
+            centroid_T_idx=np.asarray(jax.device_get(centroid_T_idx),
+                                      dtype=np.int32),
+            tt_head_correction=(uses_bare_tt_gamma_head(cfg)
+                                or bool(cfg.head.bispinor_tt_head_correction)
+                                or uses_direct_bispinor_shared_pole_head(cfg)),
+            print_fn=print_fn)
+
+
 def _vcoul_geometry_and_budget(
         cfg, mem_est, print_fn, wfn):
     """Produce the existing Coulomb geometry, cutoff and memory allowance."""
-    bvec = CoulombGeometry.from_wfn(wfn).bvec
+    bvec, vcoul_cutoff_ry = _vcoul_bvec_and_cutoff(cfg, wfn)
     if mem_est is None:
         mem_est = {}
     budget_gb = float(mem_est.get('available_vcoul_gb', cfg.memory.per_device_gb))
@@ -2259,10 +2349,6 @@ def _vcoul_geometry_and_budget(
         budget_gb = min(budget_gb, float(get_device_memory_info().get('budget_gb', budget_gb)))
     except Exception:
         pass
-    if cfg.head.bare_coulomb_cutoff is None:
-        vcoul_cutoff_ry = float(wfn.ecutwfc)
-    else:
-        vcoul_cutoff_ry = float(cfg.head.bare_coulomb_cutoff)
     print_fn(f"    V_q bare cutoff: {vcoul_cutoff_ry:.1f} Ry")
     print_fn(f"    V_q budget:    {budget_gb:.2f} GB")
     return bvec, vcoul_cutoff_ry
@@ -2275,8 +2361,10 @@ def _vcoul_transverse_inputs(
     zeta_T_paths = [
         os.path.join(zeta_dir, f"zeta_q_mu{mu_L}.h5") for mu_L in (1, 2, 3)
     ]
+    tt_from_fit = getattr(zeta_h5_path, 'tt', None) is not None
     bispinor_ready = (
-        cfg.bispinor and all(os.path.exists(p) for p in zeta_T_paths)
+        cfg.bispinor
+        and (tt_from_fit or all(os.path.exists(p) for p in zeta_T_paths))
     )
     if cfg.bispinor and not bispinor_ready:
         _missing = [p for p in zeta_T_paths if not os.path.exists(p)]
@@ -2314,20 +2402,29 @@ def _compute_photon_vq(
         if centroid_indices is not None else None)
     bispinor_h5_path = os.path.join(zeta_dir, "v_q_bispinor.h5")
     print_fn(f"\n  [bispinor] V_q^{{μ_L,ν_L}} → {bispinor_h5_path}")
-    with ZetaLoader(zeta_T_paths[0]) as _z_T0:
-        n_rmu_T = int(_z_T0.n_rmu_disk)
+    from contextlib import nullcontext
+    from .v_q_bispinor import BispinorFitV
+    # Tiles the fits formed from their live ζ; a family accepted for reuse is
+    # read from its ζ files.
+    fit_v = zeta_h5_path if isinstance(zeta_h5_path, BispinorFitV) else None
+    cc_tile = None if fit_v is None else fit_v.cc
+    tt_tiles = None if fit_v is None else fit_v.tt
+    zeta_C_path = getattr(zeta_h5_path, 'path', zeta_h5_path)
+    if tt_tiles is not None:
+        n_rmu_T = int(fit_v.n_rmu_T)
+    else:
+        with ZetaLoader(zeta_T_paths[0]) as _z_T0:
+            n_rmu_T = int(_z_T0.n_rmu_disk)
     n_rmu_C = int(meta.n_rmu)
+    opened = lambda path, skip: (nullcontext() if skip
+                                 else ZetaLoader(path, mesh=mesh_xy))
     with timing.section("gw_jax.V_q_compute"), \
          jax_profile.trace_section("V_q_compute_bispinor"):
         from .v_q_bispinor import compute_V_q_bispinor_g_flat_to_h5
-        with ZetaLoader(zeta_h5_path, mesh=mesh_xy,
-                        ) as zc, \
-             ZetaLoader(zeta_T_paths[0], mesh=mesh_xy,
-                        ) as zt1, \
-             ZetaLoader(zeta_T_paths[1], mesh=mesh_xy,
-                        ) as zt2, \
-             ZetaLoader(zeta_T_paths[2], mesh=mesh_xy,
-                        ) as zt3:
+        with opened(zeta_C_path, cc_tile is not None) as zc, \
+             opened(zeta_T_paths[0], tt_tiles is not None) as zt1, \
+             opened(zeta_T_paths[1], tt_tiles is not None) as zt2, \
+             opened(zeta_T_paths[2], tt_tiles is not None) as zt3:
             with mesh_xy:
                 _, photon_g0_vectors = compute_V_q_bispinor_g_flat_to_h5(
                     zeta_C_loader=zc,
@@ -2354,6 +2451,7 @@ def _compute_photon_vq(
                     bispinor_gw_mode=None,
                     charge_representation=None,
                     spatial_current_representation=None,
+                    cc_tile=cc_tile, tt_tiles=tt_tiles,
                 )
     from file_io.restart_bundle import read_photon_charge
     V_q_raw = read_photon_charge(bispinor_h5_path, mesh_xy)

@@ -391,6 +391,256 @@ def _make_per_q_v_builder_for_tile(
 # ---------------------------------------------------------------------------
 
 
+def _bispinor_qgrid_policy(*, sym, kgrid):
+    """ONE measured q-row policy for every bispinor consumer (CC, TT, one-leg).
+
+    A ferromagnet's policy contains no antiunitary rows; no tile may fall
+    back to the raw ``sym.sym_idx_q`` table and take a second TRS decision.
+    A pure function of ``sym`` and the q-grid, so the CC tile computed at
+    fit time and the TT tiles computed at V_q time share it exactly.
+    """
+    from .qgrid_symmetry import qgrid_trs_policy_for
+    return qgrid_trs_policy_for(
+        sym=sym,
+        irr_idx_q=np.asarray(sym.irr_idx_q, dtype=np.int32),
+        sym_idx_q=np.asarray(sym.sym_idx_q, dtype=np.int32),
+        kgrid=tuple(kgrid),
+        n_sym_spatial=int(np.asarray(sym.sym_matrices).shape[0]),
+        context="bispinor V / one-leg",
+    )
+
+
+def _bispinor_tile_spec(mu_L, nu_L, *, zeta_C, zeta_T, use_ibz_C, use_ibz_T,
+                        bvec, cell_volume, sys_dim, vcoul_cutoff_ry, bdot,
+                        kgrid, fft_grid, tt_head_correction, tt_head_tensor,
+                        bgw_v_grid_fn, n_rmu_C, n_rmu_T, verbose, print_fn):
+    """One unique tile's ζ sources, v(q+G) builder and one-leg action.
+
+    ``zeta_C``/``zeta_T[i]`` are ζ sources: a ``ZetaLoader`` on the ζ file, or
+    the fit's in-memory ``isdf.zeta_mubatch.ZetaG`` (the CC tile only).
+    """
+    same_zeta = (mu_L == nu_L)
+    is_CC = (mu_L == 0 and nu_L == 0)
+    # CC tile: charge-centroid orbit closure.  TT tiles: transverse-
+    # centroid orbit closure.  These are independent; either may
+    # fall back to full-BZ if its centroid set isn't orbit-closed.
+    use_ibz = use_ibz_C if is_CC else use_ibz_T
+    v_builder = _make_per_q_v_builder_for_tile(
+        mu_L=mu_L, nu_L=nu_L,
+        bvec=bvec, cell_volume=cell_volume, sys_dim=sys_dim,
+        vcoul_cutoff_ry=vcoul_cutoff_ry, bdot=bdot,
+        kgrid=kgrid, tt_head_correction=tt_head_correction,
+        tt_head_tensor=tt_head_tensor,
+    )
+    # BGW vcoul overlay only meaningful on the CC tile; transverse
+    # tiles are pure projector applications.  Wrap the builder.
+    if is_CC and bgw_v_grid_fn is not None:
+        _base = v_builder
+        nx, ny, nz = (int(s) for s in fft_grid)
+
+        def _v_builder_with_bgw(q_irr_frac, gvec_components,
+                                 _base=_base, nx=nx, ny=ny, nz=nz):
+            v = np.asarray(_base(q_irr_frac, gvec_components))
+            for qi in range(q_irr_frac.shape[0]):
+                v_full = np.asarray(
+                    bgw_v_grid_fn(tuple(q_irr_frac[qi]))).reshape(-1)
+                miller = gvec_components[qi]
+                flat = ((miller[0] % nx) * ny * nz
+                          + (miller[1] % ny) * nz
+                          + (miller[2] % nz))
+                v_at = v_full[flat]
+                v[qi] = np.where(v_at != 0.0, v_at, v[qi])
+            return v
+        v_builder = _v_builder_with_bgw
+
+    if verbose and jax.process_index() == 0:
+        print_fn(f"  [bispinor g-flat] tile "
+                 f"{UNIQUE_TILES.index((mu_L, nu_L)) + 1}/{len(UNIQUE_TILES)} "
+                 f"(μ_L={mu_L}, ν_L={nu_L})  "
+                 f"n_rmu_L={n_rmu_C if mu_L == 0 else n_rmu_T} "
+                 f"n_rmu_R={n_rmu_C if nu_L == 0 else n_rmu_T}  "
+                 f"same_zeta={same_zeta}  use_ibz={use_ibz}")
+    polar = same_zeta and mu_L != 0 and use_ibz
+    return dict(
+        L=zeta_C if mu_L == 0 else zeta_T[mu_L - 1],
+        R=(None if same_zeta
+           else (zeta_C if nu_L == 0 else zeta_T[nu_L - 1])),
+        v_per_G_builder=v_builder, is_charge_cc=is_CC,
+        # g0 is a one-leg zeta coefficient, so diagonal tiles are its sole
+        # producer.  On the transverse IBZ path each streamed source
+        # component returns its contributions to all three target
+        # Cartesian channels; only those three small carriers are
+        # accumulated.
+        write_g0=same_zeta,
+        one_leg_action="polar" if polar else "scalar",
+        source_component=mu_L - 1 if polar else None,
+        timing_label=tile_dataset_name(mu_L, nu_L),
+        use_ibz=use_ibz)
+
+
+class ParkedVTiles:
+    """V tiles formed from a fit's in-memory ζ, parked on host until V_q.
+
+    The four-current V_q used to close each Z store after its fit, write the
+    ζ file for it and read the file back (CrI3 6×6 40 Ry: 6.3 s of a 217 s
+    run for the charge alone; VI3 12×12 bispinor: 535 GB of charge ζ and
+    3 × 187 GB of ζ_T).  Instead the tiles are contracted from the Z stores
+    while they are live and wait on host across the rest of the ISDF stage,
+    so the device budget the next fit was planned with is untouched.  The
+    host bytes are committed before the next fit measures MemAvailable for
+    its own Z stores, and refused here by name if this rank's share cannot
+    hold them (the CC tile is Q·μ²·16/P per rank: 1.5 GB/rank at VI3 12×12
+    P16, μ 3200).  ``capture`` names the restart pre-unfold offer the tile's
+    producer made (``restart_q_storage``); :meth:`restore` re-offers it, so
+    the restart writer sees the hand-off it sees on the file route.
+    """
+
+    def __init__(self, results, *, capture=None, what="V tiles", print_fn=print):
+        from common.collectives import HostSpill
+        from common.gpu_utils import host_bytes_per_process
+        from .restart_q_storage import take_pre_unfold
+
+        def park(arr):
+            return None if arr is None else HostSpill(
+                shape=tuple(arr.shape), sharding=arr.sharding,
+                shards=[(sh.device, np.asarray(sh.data))
+                        for sh in arr.addressable_shards])
+
+        def local_bytes(arr):
+            return 0 if arr is None else sum(
+                int(sh.data.nbytes) for sh in arr.addressable_shards)
+
+        cap = None if capture is None else take_pre_unfold(capture)
+        # The capture's block is the first tile's V itself on this path;
+        # park it separately only when it is not.
+        same = [cap is not None and cap.X_ibz is V for V, _ in results]
+        need = sum(local_bytes(V) + local_bytes(g0) for V, g0 in results) + (
+            0 if cap is None or any(same) else local_bytes(cap.X_ibz))
+        have = host_bytes_per_process()
+        if need > have:
+            raise RuntimeError(
+                f"GATE bispinor-v-host-park: got {what} of {need / 1e9:.2f} "
+                f"GB/rank, want at most this rank's host share "
+                f"{have / 1e9:.2f} GB; why: the four-current V_q parks its "
+                "tiles on host between the fits and V_q.  Run on more ranks, "
+                "or with more host memory per rank.")
+        if jax.process_index() == 0:
+            print_fn(f"  μ-batch V_q: {what} parked on host, {need / 1e9:.2f} "
+                     f"GB/rank of a {have / 1e9:.1f} GB host share")
+        self._tiles = [(park(V), park(g0)) for V, g0 in results]
+        self._cap = cap
+        self._cap_tile = next((i for i, hit in enumerate(same) if hit), None)
+        self._X = (None if cap is None or self._cap_tile is not None
+                   else park(cap.X_ibz))
+
+    def restore(self):
+        """``[(V, g0 or None), ...]`` back on device; the capture re-offered."""
+        import dataclasses
+        from common.collectives import restore_from_host
+        from .restart_q_storage import _SINK
+        back = lambda h: None if h is None else restore_from_host(h)
+        out = [(back(V), back(g0)) for V, g0 in self._tiles]
+        if self._cap is not None:
+            X = (out[self._cap_tile][0] if self._cap_tile is not None
+                 else back(self._X))
+            _SINK[-1][self._cap.name] = dataclasses.replace(self._cap, X_ibz=X)
+        self._tiles = self._X = self._cap = None
+        return out
+
+
+class BispinorFitV:
+    """What the fits hand the four-current V_q in place of the ζ files.
+
+    ``cc`` is the CC tile formed from the charge fit's live ζ, ``tt`` the six
+    TT tiles formed from the current fit's three live ζ in one pass; either
+    is ``None`` when that family was accepted for reuse, and its tiles are
+    then formed from its ζ files.  ``path`` is the charge ζ file's path
+    (written only for restart or reuse).
+    """
+
+    def __init__(self, path):
+        self.path = str(path)
+        self.cc: ParkedVTiles | None = None
+        self.tt: ParkedVTiles | None = None
+        self.n_rmu_T: int | None = None
+
+
+def _bispinor_ibz(sym, centroid_idx, kgrid, fft_grid, context):
+    from .v_q_g_flat import _resolve_ibz_q_list
+    if sym is None:
+        raise ValueError("Bispinor V requires q-IBZ storage; rerun with symmetry enabled.")
+    use_ibz = _resolve_ibz_q_list(
+        sym=sym, centroid_indices=centroid_idx, kgrid=kgrid, fft_grid=fft_grid,
+        context=context, return_resolution=True)[6]
+    if not use_ibz:
+        raise ValueError("Bispinor V requires two orbit-closed centroid families.")
+    return use_ibz
+
+
+def compute_bispinor_cc_tile(
+    zeta_C, *, mesh_xy: Mesh, kgrid, fft_grid, bvec: np.ndarray,
+    cell_volume: float, sys_dim: int, n_rmu_C: int,
+    bare_coulomb_cutoff_ry: float | None = None,
+    bdot: np.ndarray | None = None, g_chunk: int | None = None,
+    sym=None, centroid_C_idx: np.ndarray | None = None,
+    print_fn=print, verbose: bool = True,
+) -> ParkedVTiles:
+    """The CC tile of :func:`compute_V_q_bispinor_g_flat_to_h5`, from the
+    charge fit's in-memory ζ (``zeta_C``: a ``ZetaG``), parked on host."""
+    from .v_q_g_flat import _compute_V_q_g_flat_tiles
+    use_ibz_C = _bispinor_ibz(sym, centroid_C_idx, kgrid, fft_grid,
+                              "bispinor charge V")
+    spec = _bispinor_tile_spec(
+        0, 0, zeta_C=zeta_C, zeta_T=(None, None, None),
+        use_ibz_C=use_ibz_C, use_ibz_T=False, bvec=bvec,
+        cell_volume=cell_volume, sys_dim=sys_dim,
+        vcoul_cutoff_ry=bare_coulomb_cutoff_ry, bdot=bdot, kgrid=kgrid,
+        fft_grid=fft_grid, tt_head_correction=False, tt_head_tensor=None,
+        bgw_v_grid_fn=None, n_rmu_C=n_rmu_C, n_rmu_T=0, verbose=verbose,
+        print_fn=print_fn)
+    results = _compute_V_q_g_flat_tiles(
+        [spec], kgrid=kgrid, fft_grid=fft_grid, mesh_xy=mesh_xy,
+        g_chunk=g_chunk, sym=sym, centroid_indices=centroid_C_idx,
+        qgrid_policy=_bispinor_qgrid_policy(sym=sym, kgrid=kgrid),
+        verbose=verbose)
+    return ParkedVTiles(results, capture="V_qmunu", what="the CC tile",
+                        print_fn=print_fn)
+
+
+def compute_bispinor_tt_tiles(
+    zeta_T, *, mesh_xy: Mesh, kgrid, fft_grid, bvec: np.ndarray,
+    cell_volume: float, sys_dim: int, n_rmu_T: int,
+    bare_coulomb_cutoff_ry: float | None = None,
+    bdot: np.ndarray | None = None, g_chunk: int | None = None,
+    sym=None, centroid_T_idx: np.ndarray | None = None,
+    tt_head_correction: bool = False,
+    print_fn=print, verbose: bool = True,
+) -> ParkedVTiles:
+    """The six TT tiles of :func:`compute_V_q_bispinor_g_flat_to_h5`, from the
+    current fit's three in-memory ζ (``ZetaG``) in ONE pass over the G tiles
+    (``isdf.zeta_mubatch.contract_v_group``), parked on host."""
+    from .v_q_g_flat import _compute_V_q_g_flat_tiles
+    use_ibz_T = _bispinor_ibz(sym, centroid_T_idx, kgrid, fft_grid,
+                              "bispinor current V")
+    tt_head_tensor = (_tt_head_tensor(
+        bvec=bvec, cell_volume=cell_volume, sys_dim=sys_dim, kgrid=kgrid)
+        if tt_head_correction else None)
+    specs = [_bispinor_tile_spec(
+        mu_L, nu_L, zeta_C=None, zeta_T=tuple(zeta_T), use_ibz_C=False,
+        use_ibz_T=use_ibz_T, bvec=bvec, cell_volume=cell_volume,
+        sys_dim=sys_dim, vcoul_cutoff_ry=bare_coulomb_cutoff_ry, bdot=bdot,
+        kgrid=kgrid, fft_grid=fft_grid, tt_head_correction=tt_head_correction,
+        tt_head_tensor=tt_head_tensor, bgw_v_grid_fn=None, n_rmu_C=0,
+        n_rmu_T=n_rmu_T, verbose=verbose, print_fn=print_fn)
+        for (mu_L, nu_L) in UNIQUE_TILES[1:]]
+    results = _compute_V_q_g_flat_tiles(
+        specs, kgrid=kgrid, fft_grid=fft_grid, mesh_xy=mesh_xy,
+        g_chunk=g_chunk, sym=sym, centroid_indices=centroid_T_idx,
+        qgrid_policy=_bispinor_qgrid_policy(sym=sym, kgrid=kgrid),
+        verbose=verbose)
+    return ParkedVTiles(results, what="the six TT tiles", print_fn=print_fn)
+
+
 def compute_V_q_bispinor_g_flat_to_h5(
     *,
     zeta_C_loader,                              # ZetaLoader, charge ζ (G-flat)
@@ -424,6 +674,8 @@ def compute_V_q_bispinor_g_flat_to_h5(
     bispinor_gw_mode: str | None = None,
     charge_representation: str | None = None,
     spatial_current_representation: str | None = None,
+    cc_tile: "ParkedVTiles | None" = None,
+    tt_tiles: "ParkedVTiles | None" = None,
 ) -> tuple[Path, tuple[jax.Array, jax.Array, jax.Array, jax.Array]]:
     """Stream the 7 unique bispinor V_q^{μ_L, ν_L} tiles to HDF5 via the
     G-flat per-q + G-chunked path.
@@ -444,13 +696,17 @@ def compute_V_q_bispinor_g_flat_to_h5(
     action or Cartesian rotation.
 
     The reader :class:`BispinorVqReader` opens this on-disk format.
+
+    ``cc_tile`` (:func:`compute_bispinor_cc_tile`) and ``tt_tiles``
+    (:func:`compute_bispinor_tt_tiles`) supply tiles formed from the fits'
+    in-memory ζ; the matching loaders are then unused.
     """
     from file_io.slab_io import SlabIO
     import h5py
     from .v_q_g_flat import _compute_V_q_g_flat_tiles
 
     output_h5_path = Path(output_h5_path)
-    if len(zeta_T_loaders) != 3:
+    if tt_tiles is None and len(zeta_T_loaders) != 3:
         raise ValueError(
             f"zeta_T_loaders must be length 3 (μ_L=1,2,3); "
             f"got {len(zeta_T_loaders)}.")
@@ -477,21 +733,9 @@ def compute_V_q_bispinor_g_flat_to_h5(
         io.write_attr("n_rmu_T", np.int64(n_rmu_T))
         io.write_attr("n_q_total", np.int64(nq_total))
 
-    # ONE measured q-row policy for every bispinor consumer: CC, TT operator
-    # mixing and all four one-leg vectors.  In particular, a ferromagnet's
-    # policy contains no antiunitary rows; no tile may fall back to the raw
-    # ``sym.sym_idx_q`` table and take a second TRS decision.
-    qgrid_policy = None
-    if (_use_ibz_C or _use_ibz_T) and sym is not None:
-        from .qgrid_symmetry import qgrid_trs_policy_for
-        qgrid_policy = qgrid_trs_policy_for(
-            sym=sym,
-            irr_idx_q=np.asarray(sym.irr_idx_q, dtype=np.int32),
-            sym_idx_q=np.asarray(sym.sym_idx_q, dtype=np.int32),
-            kgrid=tuple(kgrid),
-            n_sym_spatial=int(np.asarray(sym.sym_matrices).shape[0]),
-            context="bispinor V / one-leg",
-        )
+    # ONE measured q-row policy for every bispinor consumer (the CC tile of
+    # ``cc_tile`` was formed under the same one: a pure function of sym).
+    qgrid_policy = _bispinor_qgrid_policy(sym=sym, kgrid=kgrid)
 
     tt_g0 = None
     g0_by_channel: list[jax.Array | None] = [None, None, None, None]
@@ -500,64 +744,15 @@ def compute_V_q_bispinor_g_flat_to_h5(
         if tt_head_correction else None)
 
     def _tile_spec(mu_L, nu_L):
-        """One unique tile's loaders, v(q+G) builder and one-leg action."""
-        same_zeta = (mu_L == nu_L)
-        is_CC = (mu_L == 0 and nu_L == 0)
-        # CC tile: charge-centroid orbit closure.  TT tiles: transverse-
-        # centroid orbit closure.  These are independent; either may
-        # fall back to full-BZ if its centroid set isn't orbit-closed.
-        use_ibz = _use_ibz_C if is_CC else _use_ibz_T
-        v_builder = _make_per_q_v_builder_for_tile(
-            mu_L=mu_L, nu_L=nu_L,
-            bvec=bvec, cell_volume=cell_volume, sys_dim=sys_dim,
-            vcoul_cutoff_ry=bare_coulomb_cutoff_ry, bdot=bdot,
-            kgrid=kgrid, tt_head_correction=tt_head_correction,
-            tt_head_tensor=tt_head_tensor,
-        )
-        # BGW vcoul overlay only meaningful on the CC tile; transverse
-        # tiles are pure projector applications.  Wrap the builder.
-        if is_CC and bgw_v_grid_fn is not None:
-            _base = v_builder
-            nx, ny, nz = (int(s) for s in fft_grid)
-
-            def _v_builder_with_bgw(q_irr_frac, gvec_components,
-                                     _base=_base, nx=nx, ny=ny, nz=nz):
-                v = np.asarray(_base(q_irr_frac, gvec_components))
-                for qi in range(q_irr_frac.shape[0]):
-                    v_full = np.asarray(
-                        bgw_v_grid_fn(tuple(q_irr_frac[qi]))).reshape(-1)
-                    miller = gvec_components[qi]
-                    flat = ((miller[0] % nx) * ny * nz
-                              + (miller[1] % ny) * nz
-                              + (miller[2] % nz))
-                    v_at = v_full[flat]
-                    v[qi] = np.where(v_at != 0.0, v_at, v[qi])
-                return v
-            v_builder = _v_builder_with_bgw
-
-        if verbose and jax.process_index() == 0:
-            print_fn(f"  [bispinor g-flat] tile "
-                     f"{UNIQUE_TILES.index((mu_L, nu_L)) + 1}/{len(UNIQUE_TILES)} "
-                     f"(μ_L={mu_L}, ν_L={nu_L})  "
-                     f"n_rmu_L={n_rmu_C if mu_L == 0 else n_rmu_T} "
-                     f"n_rmu_R={n_rmu_C if nu_L == 0 else n_rmu_T}  "
-                     f"same_zeta={same_zeta}  use_ibz={use_ibz}")
-        polar = same_zeta and mu_L != 0 and use_ibz
-        return dict(
-            L=zeta_C_loader if mu_L == 0 else zeta_T_loaders[mu_L - 1],
-            R=(None if same_zeta
-               else (zeta_C_loader if nu_L == 0 else zeta_T_loaders[nu_L - 1])),
-            v_per_G_builder=v_builder, is_charge_cc=is_CC,
-            # g0 is a one-leg zeta coefficient, so diagonal tiles are its sole
-            # producer.  On the transverse IBZ path each streamed source
-            # component returns its contributions to all three target
-            # Cartesian channels; only those three small carriers are
-            # accumulated.
-            write_g0=same_zeta,
-            one_leg_action="polar" if polar else "scalar",
-            source_component=mu_L - 1 if polar else None,
-            timing_label=tile_dataset_name(mu_L, nu_L),
-            use_ibz=use_ibz)
+        return _bispinor_tile_spec(
+            mu_L, nu_L, zeta_C=zeta_C_loader, zeta_T=zeta_T_loaders,
+            use_ibz_C=_use_ibz_C, use_ibz_T=_use_ibz_T, bvec=bvec,
+            cell_volume=cell_volume, sys_dim=sys_dim,
+            vcoul_cutoff_ry=bare_coulomb_cutoff_ry, bdot=bdot, kgrid=kgrid,
+            fft_grid=fft_grid, tt_head_correction=tt_head_correction,
+            tt_head_tensor=tt_head_tensor, bgw_v_grid_fn=bgw_v_grid_fn,
+            n_rmu_C=n_rmu_C, n_rmu_T=n_rmu_T, verbose=verbose,
+            print_fn=print_fn)
 
     # CC alone, then the six TT tiles as ONE group: each ζ_T is read once
     # per q-tile instead of once per tile that uses it (three times).
@@ -565,17 +760,21 @@ def compute_V_q_bispinor_g_flat_to_h5(
         specs = [_tile_spec(mu_L, nu_L) for (mu_L, nu_L) in group]
         is_CC_group = group == ((0, 0),)
         use_ibz = specs[0]['use_ibz']
-        results = _compute_V_q_g_flat_tiles(
-            specs,
-            kgrid=kgrid, fft_grid=fft_grid,
-            mesh_xy=mesh_xy,
-            g_chunk=g_chunk,
-            sym=sym if use_ibz else None,
-            centroid_indices=((centroid_C_idx if is_CC_group else centroid_T_idx)
-                              if use_ibz else None),
-            qgrid_policy=qgrid_policy,
-            verbose=verbose,
-        )
+        parked = cc_tile if is_CC_group else tt_tiles
+        if parked is not None:
+            results = parked.restore()
+        else:
+            results = _compute_V_q_g_flat_tiles(
+                specs,
+                kgrid=kgrid, fft_grid=fft_grid,
+                mesh_xy=mesh_xy,
+                g_chunk=g_chunk,
+                sym=sym if use_ibz else None,
+                centroid_indices=((centroid_C_idx if is_CC_group else centroid_T_idx)
+                                  if use_ibz else None),
+                qgrid_policy=qgrid_policy,
+                verbose=verbose,
+            )
         for (mu_L, nu_L), s_tile, (V_acc, g0_acc) in zip(group, specs, results):
             same_zeta = (mu_L == nu_L)
             if (same_zeta and mu_L != 0 and _use_ibz_T

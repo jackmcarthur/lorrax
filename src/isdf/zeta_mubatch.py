@@ -944,6 +944,154 @@ def _v_tile_kernel(mesh, layout, solver_kind, n_log, g_tile, *, debug_m, with_v=
     return fn
 
 
+def _pair_tile_kernel(mesh, layout, g_tile, pairs):
+    """One G tile of several ζ's: ``V^{ab} += conj(ζ^a) v^{ab} ζ^bᵀ`` per pair,
+    and each ζ's shell gather — the accumulation half of :func:`_v_tile_kernel`
+    over ζ tiles it formed with ``with_v=False``."""
+    pairs = tuple((int(a), int(b)) for a, b in pairs)
+    key = ('pair_tile', _mesh_id(mesh), layout, int(g_tile), pairs)
+    fn = _kernel_cache.get(key)
+    if fn is not None:
+        return fn
+    n_z = 1 + max(max(p) for p in pairs)
+    acc = _acc_specs(layout)
+    if layout == 'q':
+        z_spec, v_spec, n_spec, s_spec = (P(_XY, None, None), P(None, _XY, None),
+                                          P(_XY), P(_XY, None))
+    else:
+        z_spec, v_spec, n_spec, s_spec = P(None, None, _XY), P(), P(), P()
+    in_specs = ((z_spec,) * n_z, v_spec, n_spec, s_spec, P(),
+                (acc,) * len(pairs), (acc,) * n_z)
+
+    @partial(shard_map, mesh=mesh, in_specs=in_specs,
+             out_specs=((acc,) * len(pairs), (acc,) * n_z), check_vma=False)
+    def k(Z, v, ngk, sl, t, V, S):
+        n_g = Z[0].shape[-1]
+        g_idx = t * g_tile + jnp.arange(n_g, dtype=jnp.int32)
+        if layout == 'g':
+            g_idx = g_idx + jax.lax.axis_index(_XY) * n_g
+        mask = g_idx[None, :] < ngk[:, None]                    # (q, g)
+        cols = jnp.clip(g_idx, 0, v.shape[-1] - 1)
+        V_out = []
+        for i, (a, b) in enumerate(pairs):
+            vt = jnp.where(mask, jnp.take(v[i], cols, axis=1), 0)
+            dV = jnp.einsum('qmg,qg,qng->qmn', jnp.conj(Z[a]), vt, Z[b])
+            V_out.append(V[i] + (dV[None] if layout == 'g' else dV))
+        hit = (sl[:, None, :] == g_idx[None, :, None]).astype(Z[0].dtype)
+        S_out = []
+        for a in range(n_z):
+            dS = jnp.einsum('qmg,qgs->qms', Z[a], hit)
+            S_out.append(S[a] + (dS[None] if layout == 'g' else dS))
+        return tuple(V_out), tuple(S_out)
+
+    fn = jax.jit(k, donate_argnums=(5, 6))
+    _kernel_cache[key] = fn
+    return fn
+
+
+def contract_v_group(zetas, pairs, v_tables, *, keep, print_fn=None):
+    """Several V tiles over several ζ's in ONE pass over the G tiles.
+
+    ``zetas`` are :class:`ZetaG` of one fit (one store geometry and centroid
+    basis: the current family's three channels).  On each G tile every ζ^a =
+    C_a⁺ Z^a is formed once (the ``with_v=False`` half of
+    :meth:`ZetaG.contract_v`), then ``V^{ab}_q += conj(ζ^a) diag(v^{ab}_q)
+    ζ^{bT}`` for every ``(a, b)`` in ``pairs`` with its own ``v_tables[i]``
+    ``(Q, ngkmax)``, and each ζ keeps its ``keep`` columns (``.shell``), as
+    :meth:`ZetaG.contract_v` does.  Returns ``[V^{ab}]`` in ``pairs`` order,
+    ``(Q, μ_pad, μ_pad)`` at ``P(None,'x','y')`` in canonical centroid order.
+    This is what spares the four-current V_q the three ζ_T files: the file
+    route wrote each ζ^a and read it back to form the same sums.
+    """
+    t0 = time.perf_counter()
+    z0 = zetas[0]
+    print_fn = print_fn or z0.print_fn
+    st0 = z0.store
+    for z in zetas[1:]:
+        st = z.store
+        if (st.Q, st.mu_pad, st.g_tile, st.n_Gt) != (st0.Q, st0.mu_pad, st0.g_tile, st0.n_Gt) \
+                or z.q_local != z0.q_local or z.mu_basis is not z0.mu_basis:
+            raise ValueError(
+                "contract_v_group: every ζ must share one store geometry, "
+                "solve tier and centroid basis (one fit's channels).")
+    if not z0.q_local:
+        # G-split accumulators are whole (Q, μ, μ) per rank: one per pair is
+        # what the fit's plan priced, not six (VI3 12×12 current: 2.9 GB each).
+        raise ValueError(
+            "contract_v_group: needs the q-local solve tier (q-sharded V "
+            "accumulators); the G-split tier forms its tiles from ζ files.")
+    qa, ga = st0.q_axis, st0.g_axis
+    v = np.stack([np.asarray(pad_to_axis(pad_to_axis(
+        jnp.asarray(t, dtype=jnp.complex128), qa, axis=0), ga, axis=1))
+        for t in v_tables])                               # (n_pair, Q_pad, G)
+    ngk = np.asarray(pad_to_axis(jnp.asarray(z0.ngk_per_q, jnp.int32), qa, axis=0))
+    keep = np.asarray(keep, dtype=np.int32)
+    if keep.ndim != 2 or keep.shape[0] != st0.Q:
+        raise ValueError(
+            f"contract_v_group: keep must be (Q={st0.Q}, n) slots; got {keep.shape}.")
+    sl = np.asarray(pad_to_axis(jnp.asarray(keep, jnp.int32), qa, axis=0))
+    from common.collectives import device_put_process_local
+    mesh = z0.mesh
+    if z0.q_local:
+        layout = 'q'
+        v_dev = device_put_process_local(v, NamedSharding(mesh, P(None, _XY, None)))
+        ngk_dev = device_put_process_local(ngk, NamedSharding(mesh, P(_XY)))
+        sl_dev = device_put_process_local(sl, NamedSharding(mesh, P(_XY, None)))
+    else:
+        layout = 'g'
+        rep = NamedSharding(mesh, P())
+        v_dev = device_put_process_local(np.asarray(strip_axis(v, qa, axis=1)), rep)
+        ngk_dev = device_put_process_local(np.asarray(strip_axis(ngk, qa, axis=0)), rep)
+        sl_dev = device_put_process_local(np.asarray(strip_axis(sl, qa, axis=0)), rep)
+    form = [_v_tile_kernel(mesh, layout, z.solver_kind, z.n_rmu_solve, st0.g_tile,
+                           debug_m=False, with_v=False) for z in zetas]
+    stub = [_zero_accumulators(mesh, layout, st0.Q_pad, st0.Q, int(st0.mu_pad), 1,
+                               debug_m=False, with_v=False) for _ in zetas]
+    step = _pair_tile_kernel(mesh, layout, st0.g_tile, pairs)
+    mu = int(st0.mu_pad)
+    V = tuple(_zero_accumulators(mesh, layout, st0.Q_pad, st0.Q, mu, 1,
+                                 debug_m=False)[0] for _ in pairs)
+    S = tuple(_zero_accumulators(mesh, layout, st0.Q_pad, st0.Q, mu,
+                                 int(sl.shape[1]), debug_m=False)[2] for _ in zetas)
+    factors = []
+    for z in zetas:
+        f = z.factor
+        if layout == 'g':
+            f = jax.tree.map(lambda a: jax.lax.with_sharding_constraint(
+                a, NamedSharding(mesh, P())), f)
+        factors.append(f)
+    v_form = v_dev[0]                  # unread by the ζ-forming half
+    # No look-ahead: each Z tile is read just before its ζ is formed and
+    # dropped after, so a G tile holds one Z tile and the ζ tiles — the six
+    # tile-sized buffers the fit's plan sized g_tile for (MuBatchPlan).
+    for t in range(st0.n_Gt):
+        zt = []
+        for i, z in enumerate(zetas):
+            Zt = z.store.read_tile(t, layout=layout)
+            a, m, sh, zi = form[i](factors[i], Zt, v_form, ngk_dev, sl_dev,
+                                   jnp.int32(t), *stub[i])
+            stub[i] = (a, m, sh)
+            zt.append(zi)
+            del Zt
+        V, S = step(tuple(zt), v_dev, ngk_dev, sl_dev, jnp.int32(t), V, S)
+        del zt
+    out = []
+    for Vp in V:
+        Vp = _finish_v(mesh, layout, st0.Q)(Vp)
+        out.append(z0.mu_basis.unpack_operator(Vp) if z0.mu_basis is not None else Vp)
+    for z, Sa in zip(zetas, S):
+        Sa = _finish_shell(mesh, layout, st0.Q)(Sa)
+        z.shell = z0.mu_basis.unpack_axis(Sa, 1) if z0.mu_basis is not None else Sa
+        z.shell_slots = keep
+    receipt = (f"  μ-batch V_q group: {len(zetas)} ζ, {len(pairs)} tiles, "
+               f"{st0.n_Gt} G tiles, {layout}-layout, "
+               f"{time.perf_counter() - t0:.2f}s (store read "
+               f"{sum(z.store.t_read for z in zetas):.2f}s); no ζ file")
+    if jax.process_index() == 0:
+        print_fn(receipt)
+    return out
+
+
 def _zero_accumulators(mesh, layout, Q_pad, Q, mu, n_sh, *, debug_m, with_v=True):
     P_ = _mesh_size(mesh)
     sh = NamedSharding(mesh, _acc_specs(layout))
