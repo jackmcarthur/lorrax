@@ -379,7 +379,7 @@ def test_sigma_spatial_cache_owns_plan_and_selects_each_plans_parent_rows(monkey
     # the rows the plan names.
     monkeypatch.setattr("common.fft_helpers.make_kconv_klead_unfold",
                         lambda *a, store_rows, **k: (
-                            lambda g, gt, w: jnp.take(g, jnp.asarray(store_rows), axis=0)))
+                            lambda g, gt, w, **kw: jnp.take(g, jnp.asarray(store_rows), axis=0)))
     monkeypatch.setattr("common.contract_bands.contract_bands_block_reshard",
                         lambda *a, **k: lambda left, operator, right: operator)
     monkeypatch.setattr("symmetry_maps.unfold_file_wedge_band_operator",

@@ -157,7 +157,7 @@ def _make_photon_static_class_kernel(
         result = project(left.projection_faces()[0], sigma, right.projection_faces()[1])
         if with_head:
             # The q -> 0 head is a pointwise product on the unfolded Green.
-            G = plans[0].unfold_operator(green.G, operator_transpose=green.transpose,
+            G = plans[0].unfold_operator(green.G, operator_transpose=green.partner(),
                                          right_plan=plans[1])
             head_sigma = head_product(G, head_interaction, factor, head_vertices)
             head = project(left.projection_faces()[0], jnp.take(head_sigma, jnp.asarray(rows), axis=0), right.projection_faces()[1])

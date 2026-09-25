@@ -1,14 +1,13 @@
-"""Every name the face COHSEX kernels read is bound (the spin-pair stream branch included).
+"""Every name the face COHSEX kernels read is bound, on every branch.
 
-The Sigma_x / COH spin-pair stream (``stream``) engages only when the
-whole-spin G_occ exceeds the device target (2 G_tile), e.g. the CrI3 6x6
-mu3088 bispinor on 40 GB, so no small deck executes it.  After P2-C deleted
-the dead ``wfns_g`` path, ``sigma_sx`` still read ``if stream and wfns_g is
-None`` and every rank died with NameError at Sigma_x on exactly those decks.
-This cell resolves, statically, every name loaded inside
-``_make_cohsex_kernels_face`` and its nested kernels against the Python
-scoping rules (parameters, locals, enclosing locals, module globals,
-builtins), so a stale reference on a branch no test reaches still fails here.
+A branch no small deck executes can still hold a stale reference: after P2-C
+deleted the dead ``wfns_g`` path, the (since deleted) Sigma_x spin-pair
+stream still read ``wfns_g`` and every rank died with NameError at Sigma_x on
+exactly the decks that reached it.  This cell resolves, statically, every
+name loaded inside ``_make_cohsex_kernels_face`` and its nested kernels
+against the Python scoping rules (parameters, locals, enclosing locals,
+module globals, builtins), so a stale reference on a branch no test reaches
+still fails here.
 """
 import ast
 import builtins
@@ -71,20 +70,3 @@ def test_face_cohsex_kernels_read_only_bound_names():
     assert not unbound, (
         f"{FACTORY} reads names bound nowhere in scope: {unbound} "
         f"(a stale reference on a branch such as the spin-pair stream)")
-
-
-def test_the_stream_branch_is_guarded_by_stream_alone():
-    """sigma_sx and sigma_coh take the pair stream exactly when ``stream`` is set."""
-    tree = ast.parse(SRC.read_text())
-    factory = next(n for n in tree.body
-                   if isinstance(n, ast.FunctionDef) and n.name == FACTORY)
-    kernels = {n.name: n for n in ast.walk(factory)
-               if isinstance(n, ast.FunctionDef) and n.name in ("sigma_sx", "sigma_coh")}
-    assert set(kernels) == {"sigma_sx", "sigma_coh"}
-    for name, fn in kernels.items():
-        guards = [n.test for n in ast.walk(fn) if isinstance(n, ast.If)
-                  and any(isinstance(c, ast.Call) and getattr(c.func, "id", "") == "_pair_sigma"
-                          for s in n.body for c in ast.walk(s))]
-        assert len(guards) == 1, name
-        assert isinstance(guards[0], ast.Name) and guards[0].id == "stream", (
-            name, ast.unparse(guards[0]))

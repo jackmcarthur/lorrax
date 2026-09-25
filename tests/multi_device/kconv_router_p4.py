@@ -333,6 +333,19 @@ def wedge_cases(mesh, rng):
     return recs
 
 
+def block_cases(mesh, rng):
+    """Mode 7's output spin blocks and conj-on-load partner vs the whole door (bitwise)."""
+    import zeta_mubatch_fixtures as fixtures
+    from test_kconv_klead_unfold import block_case, c3_fixture
+    recs = []
+    for fx in [fixtures._glide_fixture(mesh, rng, ns) for ns in (2, 4)] + [c3_fixture(mesh, 4)]:
+        r = block_case(mesh, fx)
+        recs.append(dict(case=f"kconv_unfold_blocks_ns{r['ns']}", antiunitary=r["antiunitary"],
+                         bitwise_parent_rows=int(r["conj_bitwise"] and r["blocks_max_abs"] == 0.0),
+                         blocks_max_abs=r["blocks_max_abs"]))
+    return recs
+
+
 def chi_cases(mesh, rng):
     """Mode 11 vs the incumbent chi0 chain (test_kconv_chi_unfold.chi_case), both k-box arms:
     the single pass on the unit-test plans, the split pass on grids whose pair does not fit."""
@@ -435,7 +448,7 @@ def main() -> int:
     rng = np.random.default_rng(20260924)
     recs = ([downfold_case(mesh, rng), face_parent_case(mesh, rng), plane_case(mesh, rng)]
             + unfold_cases(mesh, rng) + lorentz_cases(mesh, rng) + wedge_cases(mesh, rng)
-            + chi_cases(mesh, rng)
+            + chi_cases(mesh, rng) + block_cases(mesh, rng)
             + stored_cases(mesh, rng))
     bad = []
     for r in recs:

@@ -512,7 +512,8 @@ def _get_chi_minimax_kernel_fused(mesh_xy, kgrid, nk, n_out, complex_contour,
                 gemm=g_plan, k_unfold_plan=k_unfold_plan, trim_zero_bands=True, unfold=False)
             Gv = green(-tau, vmax, mask_v)
             Gc = green(t_c, cmin, mask_c)
-            partners = (Gv.transpose, Gc.transpose) if complex_contour else ()
+            # A Green of real weights reads its partner as conj(G) on the load.
+            partners = () if Gv.conj_partner else (Gv.transpose, Gc.transpose)
             return door(acc, Gv.G, Gc.G, alpha_col.astype(jnp.complex128), *partners), None
 
         acc, _ = jax.lax.scan(node, acc0, (nodes.t, alpha_rows), unroll=1)
