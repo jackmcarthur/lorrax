@@ -62,6 +62,8 @@ def support(nb, nc, frac, rng, kind):
 
 
 def reference(F, pfc, n_col, nb, nc):
+    if n_col == 0:
+        return jnp.zeros(F.shape[:-1] + (nb, nc), F.dtype)
     x = jnp.take(F, jnp.asarray(pfc), axis=-1, mode="fill", fill_value=0)
     return jnp.fft.fftn(x.reshape(F.shape[:-1] + (nb, nc)), axes=(-2, -1))
 

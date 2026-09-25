@@ -849,7 +849,9 @@ __device__ __forceinline__ void pfa_line(lrx_c2* base, int es, int i, const unsi
     }
 }
 
-extern "C" __global__ void __launch_bounds__(256) lrx_kconv(
+// LRX_RB: resident blocks per SM the shared plane allows (host, capped at 2), so
+// the register cap lets them all in.
+extern "C" __global__ void __launch_bounds__(256, LRX_RB) lrx_kconv(
     const lrx_c2* __restrict__ fin, lrx_c2* __restrict__ yout, PlaneGather g) {
     extern __shared__ lrx_c2 buf[];                  // (NB, LD): the plane
     __shared__ unsigned char live[NB];
@@ -1066,9 +1068,13 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
     if (rb < 1 || (mode == 8 && rb < ns * ns)) rb = std::min<long long>(rows_max, smem_optin / row_bytes);
     if ((mode == 7 || mode == 8) && rb >= ns * ns) rb -= rb % (ns * ns);  // whole spin groups: the grouped load
     // (fewer rows than one spin group: mode 7 loads per bank, as mode 2 would fit)
+    long long plane_minb = 1;                          // mode 10: blocks per SM (LRX_RB)
     if (mode == 10) {                                  // one whole (n_b, n_c|1) plane per block
         row_bytes = 16LL * nkx * (nky | 1);
         rb = row_bytes <= smem_optin ? 1 : 0;
+        int smem_sm = 0;
+        LRX_CUDA_CHECK(cudaDeviceGetAttribute(&smem_sm, cudaDevAttrMaxSharedMemoryPerMultiprocessor, dev),
+                       "shared memory per SM");
         if (rb < 1) {
             std::ostringstream os;
             os << "GATE mathdx-plane-residency: got plane (" << nkx << "," << nky << ") whose resident "
@@ -1077,6 +1083,7 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
                   "ffi.fft.make_plane_fft_gather routes such a plane to the XLA route at plan build";
             return sticky("residency", os.str(), ffi::ErrorCode::kInvalidArgument);
         }
+        plane_minb = std::max<long long>(1, std::min<long long>(2, smem_sm / (row_bytes + 1024)));
     }
     if (mode == 8 && rb < ns * ns) {
         std::ostringstream os;
@@ -1113,7 +1120,7 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
         "--gpu-architecture=sm_" + std::to_string(cc_major) + std::to_string(cc_minor),
         "-DLRX_MODE=" + std::to_string(mode), "-DLRX_NX=" + std::to_string(nkx),
         "-DLRX_NY=" + std::to_string(nky), "-DLRX_NZ=" + std::to_string(nkz),
-        "-DLRX_NS=" + std::to_string(ns), "-DLRX_RB=" + std::to_string(rb),
+        "-DLRX_NS=" + std::to_string(ns), "-DLRX_RB=" + std::to_string(mode == 10 ? plane_minb : rb),
         "-DLRX_F32=" + std::string(f32 ? "1" : "0"),
         "-DLRX_SM=" + std::to_string(cc_major * 100 + cc_minor * 10)};
     std::vector<std::string> o = defs;
