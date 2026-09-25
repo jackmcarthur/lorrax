@@ -55,12 +55,11 @@
 //
 // HARD CONSTRAINT — this header must include NO <mpi.h> and NO CUDA header.
 // That is the entire reason the logic could not simply live in
-// cpp/scalapack/blacs_grid.h, which includes <mpi.h> at line 40: mklblas
-// and mklfft are comms-free TUs by design and must not acquire an MPI link
-// dependency to pin a thread.  `cpp/common/scalapack_descriptor.h` is the
-// precedent for a dependency-free shared header in this directory; the
-// include is a plain relative path ("../common/mkl_thread_pin.h"),
-// so no build-system change is required to consume it.
+// cpp/scalapack/blacs_grid.h, which includes <mpi.h> at line 40: cblas/
+// and fftw/ are comms-free TUs by design and must not acquire an MPI link
+// dependency to pin a thread.  The include is a plain relative path
+// ("../common/mkl_thread_pin.h"), so no build-system change is required to
+// consume it.
 //
 // WHAT IS DELIBERATELY *NOT* HERE.  Each family's thread-count POLICY stays
 // in that family, because the policies are genuinely different and the
