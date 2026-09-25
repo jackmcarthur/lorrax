@@ -157,5 +157,6 @@ Decide explicitly whether the caller picks the backend, and record why.
 Default to *no*: a dial whose settings are "correct" and "worse in every
 measured respect" is not a choice, and each one costs a router, a vocabulary,
 a deck key and a refusal per door. Add the row to the
-[inventory](#inventory), and the vendor and gate facts to
-[the FFI layer §3](ffi_layout.md).
+[inventory](#inventory), the operation and its gate to the
+[kernel operations](ffi_layout.md#kernel-operations) table, and each
+machine's library to [the FFI layer §3a](ffi_layout.md#3a-the-dependency-matrix).

@@ -217,7 +217,8 @@ reduction shrinks the ζ store and the fit's accumulator by `N_k/Q`, not the
 ### Native handlers
 
 The nvidia-mathdx k-convolution kernels allocate no device workspace beyond
-shared memory ([FFI layer](ffi_layout.md#k-convolution-router-and-the-mathdx-family)).
+shared memory, except the split-arm intermediates of modes 8 and 11, which
+XLA's scratch allocator grants ([FFI layer](ffi_layout.md#k-convolution-router-and-the-mathdx-family)).
 On CPU the host `gw_conv` handler keeps a reused host arena of
 `16·N_k·m_x·m_y` bytes and per-thread compact chunks, outside XLA.
 

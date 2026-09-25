@@ -113,5 +113,7 @@ options. Then seal the two legs
 
 ## See also
 
+- [Kernel operations](../architecture/ffi_layout.md#kernel-operations): every
+  core operation, its engine per hardware class, its gate and its code.
 - [Kernel catalog](../architecture/ffi_layout.md#kernel-catalog): every
-  target, its source file, door, selection rule and gate.
+  target and its source file.
