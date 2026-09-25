@@ -246,20 +246,26 @@ def union_box_tables(sphere_index, fft_grid) -> tuple:
         return hit[2]
     grid = tuple(int(v) for v in fft_grid)
     n_rtot = int(np.prod(grid))
-    idx = np.asarray(sphere_index, dtype=np.int64)
+    idx = np.asarray(sphere_index)
     valid = idx < n_rtot
-    cell = np.where(valid, idx, 0)
-    xyz = (cell // (grid[1] * grid[2]), (cell // grid[2]) % grid[1], cell % grid[2])
-    supports = tuple(np.unique(c[valid]) for c in xyz)
-    pos = []
-    for n, sup in zip(grid, supports):
-        p = np.full(n, -1, dtype=np.int64)
-        p[sup] = np.arange(sup.size)
-        pos.append(p)
+    # The occupied cells as one grid mask, then each axis's union as the
+    # mask's projection: O(n_k·ngk + n_rtot), no sort of the whole table.
+    occ = np.zeros(n_rtot, dtype=bool)
+    occ[idx[valid]] = True
+    occ = occ.reshape(grid)
+    supports = (np.flatnonzero(occ.any(axis=(1, 2))), np.flatnonzero(occ.any(axis=(0, 2))),
+                np.flatnonzero(occ.any(axis=(0, 1))))
+    # Each grid cell's position in the box (grid-sized int32 table), gathered
+    # at every slot; pads land on the distinct out-of-box value kbox + g.
     ky, kz = supports[1].size, supports[2].size
     kbox = supports[0].size * ky * kz
-    flat = (pos[0][xyz[0]] * ky + pos[1][xyz[1]]) * kz + pos[2][xyz[2]]
-    pads = kbox + np.broadcast_to(np.arange(idx.shape[1]), idx.shape)
+    pos = [np.full(n, -1, dtype=np.int32) for n in grid]
+    for p, sup in zip(pos, supports):
+        p[sup] = np.arange(sup.size, dtype=np.int32)
+    cell_pos = ((pos[0][:, None, None] * ky + pos[1][None, :, None]) * kz
+                + pos[2][None, None, :]).reshape(-1)
+    flat = cell_pos[np.where(valid, idx, 0)]
+    pads = kbox + np.arange(idx.shape[1], dtype=np.int32)[None, :]
     out = (supports, np.where(valid, flat, pads).astype(np.int32))
     try:
         _UNION_BOX_CACHE[id(sphere_index)] = (weakref.ref(sphere_index), grid, out)
