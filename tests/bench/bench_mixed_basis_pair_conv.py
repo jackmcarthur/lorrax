@@ -71,7 +71,6 @@ def _filter(gvecs, ngk, frac, bvec, cut):
 
 def setup(args, mesh):
     from file_io import WfnLoader
-    from common.coulomb_sphere import compute_per_q_bare_coulomb_components
     from common.gvec_fft_box import build_sphere_box_index
     from symmetry_maps import bgw_integer_q_to_fractional
     from vcoul import CoulombGeometry
@@ -103,18 +102,24 @@ def setup(args, mesh):
     if args.box:
         box = tuple(int(v) for v in args.box.split(","))
     q_frac = bgw_integer_q_to_fractional(sym.q_irr_kgrid_int, kgrid)
-    pkg = compute_per_q_bare_coulomb_components(fft_grid=box, bvec=bvec, q_irr_frac=q_frac,
-                                                vcoul_cutoff_ry=cut, sys_dim=3)
-    out = SphereSet(np.asarray(pkg["gvec_components_padded"]).transpose(0, 2, 1),
-                    np.asarray(pkg["ngk_per_q"]), q_frac)
+    # the χ sphere from the deck key (screened_coulomb_cutoff; unset = ecutwfc), refusing past
+    # the box's alias cap; the cutoff sits mid-gap of the spectrum over every full-grid q, so
+    # the IBZ rows and the wedge's full-grid rows hold the same shells
+    from gw.mixed_basis_pair_convolution import (ColumnWedge, screened_coulomb_cutoff_cap,
+                                                 screened_sphere_set)
+    psi = SphereSet(gf, nf, kf)
+    chi_cut = cut if args.screened_coulomb_cutoff is None else args.screened_coulomb_cutoff
+    s_full = screened_sphere_set(fft_grid=box, psi=psi, bvec=bvec, q_frac=kf, ecutwfc=ecut,
+                                 screened_coulomb_cutoff=chi_cut)
+    s_ibz = screened_sphere_set(fft_grid=box, psi=psi, bvec=bvec, q_frac=np.concatenate([kf, q_frac]),
+                                ecutwfc=ecut, screened_coulomb_cutoff=chi_cut)
+    out = SphereSet(s_ibz.gvecs[len(kf):], s_ibz.ngk[len(kf):], q_frac)
+    cap = screened_coulomb_cutoff_cap(box, psi, bvec=bvec, q_frac=kf)
+    print(f"[pairconv-bench] chi sphere: screened_coulomb_cutoff {chi_cut:g} Ry; alias cap of box "
+          f"{box}: {cap:.4f} Ry = {cap / ecut:.4f} x ecutwfc", flush=True)
     wedge = None
     if args.wedge != "off":
-        from gw.mixed_basis_pair_convolution import ColumnWedge
-        pkf = compute_per_q_bare_coulomb_components(fft_grid=box, bvec=bvec, q_irr_frac=kf,
-                                                    vcoul_cutoff_ry=cut, sys_dim=3)
-        out_full = SphereSet(np.asarray(pkf["gvec_components_padded"]).transpose(0, 2, 1),
-                             np.asarray(pkf["ngk_per_q"]), kf)
-        wedge = ColumnWedge.from_symmaps(sym, out_full, unitary_only=args.wedge == "unitary")
+        wedge = ColumnWedge.from_symmaps(sym, s_full, unitary_only=args.wedge == "unitary")
     ns = int(args.ns)
     n_sp = int(np.asarray(sym.sym_matrices).shape[0])
     sidx = np.asarray(sym.sym_idx_k, np.int32)
@@ -289,6 +294,7 @@ def main():
     ap.add_argument("--warm", type=int, default=1)
     ap.add_argument("--stages", action="store_true")
     ap.add_argument("--wedge", choices=("off", "full", "unitary"), default="off")
+    ap.add_argument("--screened-coulomb-cutoff", type=float, default=None)
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
     from gw.mixed_basis_pair_convolution import MixedBasisPairConvolution
