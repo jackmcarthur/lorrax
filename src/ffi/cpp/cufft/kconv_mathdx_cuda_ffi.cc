@@ -933,6 +933,17 @@ __device__ __forceinline__ void pfa_line(lrx_c2* base, int es, int i, const unsi
     }
 }
 
+// Division by a run-time divisor d (1 <= d < 2^16) of n < 2^20 as one high
+// multiply and one correction: the index math of a latency-bound kernel.
+struct lrx_fastdiv {
+    unsigned d, m;
+    __device__ explicit lrx_fastdiv(unsigned dd) : d(dd), m(0xffffffffu / dd + 1u) {}
+    __device__ __forceinline__ unsigned div(unsigned n) const {
+        unsigned q = __umulhi(n, m);
+        return q * d > n ? q - 1u : q;
+    }
+};
+
 // g.pb (<= LRX_PB) planes per block (small planes share a block, so a pass has
 // enough lines); LRX_RB blocks per SM the shared planes allow (capped at 2), so
 // the register cap lets them all in.  Blocks are persistent (the host caps the
@@ -951,6 +962,8 @@ extern "C" __global__ void __launch_bounds__(LRX_THREADS, LRX_RB) lrx_kconv(
     __shared__ int rowb[NB];
     __shared__ long long foff[2][LRX_PB];
     const int rows = static_cast<int>(g.rows), rn = rows * NC, SS = rn;
+    const lrx_fastdiv div_rn(rn > 0 ? rn : 1), div_r2(rows * C2 > 0 ? rows * C2 : 1),
+        div_r1(rows * C1 > 0 ? rows * C1 : 1);
     lrx_c2* stg = buf + PB * PS;
     for (int b = threadIdx.x; b < NB; b += blockDim.x) live[b] = 0;
     __syncthreads();
@@ -972,7 +985,7 @@ extern "C" __global__ void __launch_bounds__(LRX_THREADS, LRX_RB) lrx_kconv(
         }
         __syncthreads();
         for (int t = threadIdx.x; t < np * rn; t += blockDim.x) {
-            const int q = t / rn, u = t - q * rn, col = g.gidx[u];
+            const int q = div_rn.div(t), u = t - q * rn, col = g.gidx[u];
             lrx_c2* dst = STAGE ? stg + q * SS + u : buf + q * PS + rowb[u / NC] * LD + (u - (u / NC) * NC);
             lrx_async::cell16(dst, fin + foff[fs][q] + (col >= 0 ? col : 0), col >= 0);
         }
@@ -988,7 +1001,7 @@ extern "C" __global__ void __launch_bounds__(LRX_THREADS, LRX_RB) lrx_kconv(
         // Row FFTs (along c) on the occupied rows only; with STAGE the first
         // factor pass reads the staged rows and writes the planes.
         for (int l = threadIdx.x; l < np * rows * C2; l += blockDim.x) {
-            const int q = l / (rows * C2), u = l - q * rows * C2, r = u / C2;
+            const int q = div_r2.div(l), u = l - q * rows * C2, r = u / C2;
             pfa_line<NC, C1, C2, true>(buf + q * PS + rowb[r] * LD, 1, u % C2, nullptr,
                                        STAGE ? stg + q * SS + r * NC : nullptr);
         }
@@ -997,7 +1010,7 @@ extern "C" __global__ void __launch_bounds__(LRX_THREADS, LRX_RB) lrx_kconv(
         if (STAGE && gn < groups) { fs ^= 1; issue(gn, fs); }   // staging is free: prefetch
         if constexpr (C2 > 1) {
             for (int l = threadIdx.x; l < np * rows * C1; l += blockDim.x) {
-                const int q = l / (rows * C1), u = l - q * rows * C1;
+                const int q = div_r1.div(l), u = l - q * rows * C1;
                 pfa_line<NC, C1, C2, false>(buf + q * PS + rowb[u / C1] * LD, 1, u % C1, nullptr);
             }
             __syncthreads();

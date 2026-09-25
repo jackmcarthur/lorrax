@@ -10,6 +10,8 @@
 //       reading global memory.  sm_80+: cp.async.cg (L2 only, bypassing L1),
 //       so the copy is in flight while the block computes; older archs: a
 //       plain load and store (same result, no overlap).
+//   lrx_async::copy<B>(dst_smem, src_gmem)
+//       one B-byte (4, 8, 16) copy global -> shared, L1-cached (cp.async.ca).
 //   lrx_async::commit()           close the current group of issued copies
 //   lrx_async::wait_all()         wait for every issued copy of this thread
 //   lrx_async::wait_prior<N>()    wait until at most N groups are pending
@@ -44,6 +46,21 @@ __device__ __forceinline__ void cell16(void* dst, const void* src, bool valid) {
 #else
     double2 v = valid ? *static_cast<const double2*>(src) : make_double2(0.0, 0.0);
     *static_cast<double2*>(dst) = v;
+#endif
+}
+
+// One BYTES-sized copy (4, 8 or 16) global -> shared, cached in L1 (cp.async.ca);
+// the strided/tile loaders of the k-box stage use it.
+template <int BYTES>
+__device__ __forceinline__ void copy(void* dst, const void* src) {
+    static_assert(BYTES == 4 || BYTES == 8 || BYTES == 16, "cp.async copies 4, 8 or 16 bytes");
+#if __CUDA_ARCH__ >= 800
+    const unsigned s = static_cast<unsigned>(__cvta_generic_to_shared(dst));
+    asm volatile("cp.async.ca.shared.global [%0], [%1], %2;\n" :: "r"(s), "l"(src), "n"(BYTES) : "memory");
+#else
+    if constexpr (BYTES == 16) *static_cast<double2*>(dst) = *static_cast<const double2*>(src);
+    else if constexpr (BYTES == 8) *static_cast<double*>(dst) = *static_cast<const double*>(src);
+    else *static_cast<float*>(dst) = *static_cast<const float*>(src);
 #endif
 }
 
