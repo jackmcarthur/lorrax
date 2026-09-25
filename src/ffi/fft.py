@@ -1004,18 +1004,21 @@ def make_kfft_kminor(mesh: Mesh, kgrid, spec: P, *, kind: str, norm: str | None)
 def plane_fft_split(n: int) -> tuple[int, int] | None:
     """The Good-Thomas split ``n = n1·n2`` mode 10 transforms an axis of ``n`` points as.
 
-    ``(n, 1)`` for ``2 <= n <= KCONV_AXIS_MAX`` (one cuFFTDx thread FFT); else
-    coprime ``n1, n2`` in ``[2, KCONV_AXIS_MAX]``, the largest ``n1`` first;
-    ``None`` when no split exists: a prime power above the thread-FFT limit
-    (64, 81, 125, 128, …) or a prime factor above it.
+    The most balanced coprime ``n1 >= n2 >= 2`` with ``n1 <= KCONV_AXIS_MAX``
+    (shorter cuFFTDx thread FFTs and more lines per pass); ``(n, 1)`` for a
+    prime power ``2 <= n <= KCONV_AXIS_MAX`` (one thread FFT); ``None`` when
+    neither exists: a prime power above the thread-FFT limit (64, 81, 125,
+    128, …) or a prime factor above it.
     """
     n = int(n)
-    if 2 <= n <= KCONV_AXIS_MAX:
-        return n, 1
-    for n1 in range(KCONV_AXIS_MAX, 1, -1):
-        if n % n1 == 0 and 2 <= n // n1 <= KCONV_AXIS_MAX and math.gcd(n1, n // n1) == 1:
-            return n1, n // n1
-    return None
+    best = None
+    for n1 in range(2, min(n, KCONV_AXIS_MAX + 1)):
+        n2 = n // n1
+        if n % n1 == 0 and 2 <= n2 <= n1 and math.gcd(n1, n2) == 1 and (best is None or n1 < best[0]):
+            best = (n1, n2)
+    if best is None and 2 <= n <= KCONV_AXIS_MAX:
+        best = (n, 1)
+    return best
 
 
 def _plane_runs(pfc: np.ndarray, n_col: int) -> tuple:

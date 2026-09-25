@@ -130,6 +130,8 @@ static constexpr long long kSmemBudget = 100 * 1024;
 // an A100 SM.  ponytail: rows-per-block is a fixed heuristic, not tuned per grid.
 static constexpr int kRowsMax1 = 64;
 static constexpr long long kSmemBudget1 = 48 * 1024;
+// Mode 10 packs small planes into one block up to this much shared memory.
+static constexpr long long kPlaneGroupBytes = 64 * 1024;
 
 static bool log_enabled() {
     static const bool on = [] { return mklpin::debug_print_here(); }();
@@ -849,56 +851,72 @@ __device__ __forceinline__ void pfa_line(lrx_c2* base, int es, int i, const unsi
     }
 }
 
-// LRX_RB: resident blocks per SM the shared plane allows (host, capped at 2), so
-// the register cap lets them all in.
+// LRX_PB planes per block (small planes share a block, so a pass has enough
+// lines); LRX_RB blocks per SM the shared planes allow (capped at 2), so the
+// register cap lets them all in.
 extern "C" __global__ void __launch_bounds__(256, LRX_RB) lrx_kconv(
     const lrx_c2* __restrict__ fin, lrx_c2* __restrict__ yout, PlaneGather g) {
-    extern __shared__ lrx_c2 buf[];                  // (NB, LD): the plane
+    extern __shared__ lrx_c2 buf[];                  // LRX_PB planes of (NB, LD)
+    constexpr int PB = LRX_PB, PS = NB * LD;
     __shared__ unsigned char live[NB];
     __shared__ int rowb[NB];
-    const int rows = static_cast<int>(g.rows);
+    __shared__ long long foff[PB];
+    const int rows = static_cast<int>(g.rows), rn = rows * NC;
     for (int b = threadIdx.x; b < NB; b += blockDim.x) live[b] = 0;
     __syncthreads();
     for (int r = threadIdx.x; r < rows; r += blockDim.x) { rowb[r] = g.row_of[r]; live[g.row_of[r]] = 1; }
-    __syncthreads();
     // Output plane (a, j, r) of Y (A, n_pg, inner) reads F plane (a, start + j, r)
     // of F (A, s_len, inner): the slab F[:, start:start+n_pg] in place.
     long long st = *g.start;
     st = st < 0 ? 0 : (st > g.s_len - g.n_pg ? g.s_len - g.n_pg : st);
-    for (long long plane = blockIdx.x; plane < g.planes; plane += gridDim.x) {
-        const long long a = plane / (g.n_pg * g.inner), rem = plane - a * g.n_pg * g.inner;
-        const lrx_c2* __restrict__ f = fin + ((a * g.s_len + st) * g.inner + rem) * g.n_col;
+    for (long long p0 = static_cast<long long>(blockIdx.x) * PB; p0 < g.planes;
+         p0 += static_cast<long long>(gridDim.x) * PB) {
+        const int np = g.planes - p0 < PB ? static_cast<int>(g.planes - p0) : PB;
+        if (threadIdx.x < np) {
+            const long long plane = p0 + threadIdx.x;
+            const long long a = plane / (g.n_pg * g.inner), rem = plane - a * g.n_pg * g.inner;
+            foff[threadIdx.x] = ((a * g.s_len + st) * g.inner + rem) * g.n_col;
+        }
+        __syncthreads();
         // The occupied rows' cells, gathered from the cylinder (zeros implicit).
-        for (int t = threadIdx.x; t < rows * NC; t += blockDim.x) {
-            const int r = t / NC, c = t - r * NC, col = g.gidx[t];
+        for (int t = threadIdx.x; t < np * rn; t += blockDim.x) {
+            const int q = t / rn, u = t - q * rn, r = u / NC, c = u - r * NC, col = g.gidx[u];
             lrx_c2 z = {0.0, 0.0};
-            if (col >= 0) z = f[col];
-            buf[rowb[r] * LD + c] = z;
+            if (col >= 0) z = fin[foff[q] + col];
+            buf[q * PS + rowb[r] * LD + c] = z;
         }
         __syncthreads();
         // Row FFTs (along c) on the occupied rows only.
-        for (int l = threadIdx.x; l < rows * C2; l += blockDim.x)
-            pfa_line<NC, C1, C2, true>(buf + rowb[l / C2] * LD, 1, l % C2, nullptr);
+        for (int l = threadIdx.x; l < np * rows * C2; l += blockDim.x) {
+            const int q = l / (rows * C2), u = l - q * rows * C2;
+            pfa_line<NC, C1, C2, true>(buf + q * PS + rowb[u / C2] * LD, 1, u % C2, nullptr);
+        }
         __syncthreads();
         if constexpr (C2 > 1) {
-            for (int l = threadIdx.x; l < rows * C1; l += blockDim.x)
-                pfa_line<NC, C1, C2, false>(buf + rowb[l / C1] * LD, 1, l % C1, nullptr);
+            for (int l = threadIdx.x; l < np * rows * C1; l += blockDim.x) {
+                const int q = l / (rows * C1), u = l - q * rows * C1;
+                pfa_line<NC, C1, C2, false>(buf + q * PS + rowb[u / C1] * LD, 1, u % C1, nullptr);
+            }
             __syncthreads();
         }
         // Column FFTs (along b) on every column; a dead row loads as zero.
-        for (int l = threadIdx.x; l < NC * B2; l += blockDim.x)
-            pfa_line<NB, B1, B2, true>(buf + l % NC, LD, l / NC, live);
+        for (int l = threadIdx.x; l < np * NC * B2; l += blockDim.x) {
+            const int q = l / (NC * B2), u = l - q * NC * B2;
+            pfa_line<NB, B1, B2, true>(buf + q * PS + u % NC, LD, u / NC, live);
+        }
         __syncthreads();
         if constexpr (B2 > 1) {
-            for (int l = threadIdx.x; l < NC * B1; l += blockDim.x)
-                pfa_line<NB, B1, B2, false>(buf + l % NC, LD, l / NC, nullptr);
+            for (int l = threadIdx.x; l < np * NC * B1; l += blockDim.x) {
+                const int q = l / (NC * B1), u = l - q * NC * B1;
+                pfa_line<NB, B1, B2, false>(buf + q * PS + u % NC, LD, u / NC, nullptr);
+            }
             __syncthreads();
         }
-        // The plane in natural (kb, kc) order, one coalesced store.
-        lrx_c2* __restrict__ y = yout + plane * static_cast<long long>(NB * NC);
-        for (int t = threadIdx.x; t < NB * NC; t += blockDim.x) {
-            const int kb = t / NC, kc = t - kb * NC;
-            y[t] = buf[slot<NB, B1, B2>(kb) * LD + slot<NC, C1, C2>(kc)];
+        // The planes in natural (kb, kc) order, one coalesced store.
+        lrx_c2* __restrict__ y = yout + p0 * static_cast<long long>(NB * NC);
+        for (int t = threadIdx.x; t < np * NB * NC; t += blockDim.x) {
+            const int q = t / (NB * NC), u = t - q * NB * NC, kb = u / NC, kc = u - kb * NC;
+            y[t] = buf[q * PS + slot<NB, B1, B2>(kb) * LD + slot<NC, C1, C2>(kc)];
         }
         __syncthreads();
     }
@@ -1071,7 +1089,7 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
     long long plane_minb = 1;                          // mode 10: blocks per SM (LRX_RB)
     if (mode == 10) {                                  // one whole (n_b, n_c|1) plane per block
         row_bytes = 16LL * nkx * (nky | 1);
-        rb = row_bytes <= smem_optin ? 1 : 0;
+        rb = row_bytes <= smem_optin ? std::max(1LL, std::min(8LL, kPlaneGroupBytes / row_bytes)) : 0;
         int smem_sm = 0;
         LRX_CUDA_CHECK(cudaDeviceGetAttribute(&smem_sm, cudaDevAttrMaxSharedMemoryPerMultiprocessor, dev),
                        "shared memory per SM");
@@ -1083,7 +1101,7 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
                   "ffi.fft.make_plane_fft_gather routes such a plane to the XLA route at plan build";
             return sticky("residency", os.str(), ffi::ErrorCode::kInvalidArgument);
         }
-        plane_minb = std::max<long long>(1, std::min<long long>(2, smem_sm / (row_bytes + 1024)));
+        plane_minb = std::max<long long>(1, std::min<long long>(2, smem_sm / (rb * row_bytes + 1024)));
     }
     if (mode == 8 && rb < ns * ns) {
         std::ostringstream os;
@@ -1115,7 +1133,7 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
     }
     // Options that decide the cubin (include paths do not: two installs of one
     // wheel version compile the same image).
-    const std::vector<std::string> defs = {
+    std::vector<std::string> defs = {
         "--std=c++17", "--device-as-default-execution-space",
         "--gpu-architecture=sm_" + std::to_string(cc_major) + std::to_string(cc_minor),
         "-DLRX_MODE=" + std::to_string(mode), "-DLRX_NX=" + std::to_string(nkx),
@@ -1123,6 +1141,7 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
         "-DLRX_NS=" + std::to_string(ns), "-DLRX_RB=" + std::to_string(mode == 10 ? plane_minb : rb),
         "-DLRX_F32=" + std::string(f32 ? "1" : "0"),
         "-DLRX_SM=" + std::to_string(cc_major * 100 + cc_minor * 10)};
+    if (mode == 10) defs.push_back("-DLRX_PB=" + std::to_string(rb));   // planes per block
     std::vector<std::string> o = defs;
     for (const std::string& d : {"-I" + inc, "-I" + cutlass, "-I" + cuda_inc, "-I" + cuda_inc + "/cccl"})
         o.push_back(d);
@@ -1728,7 +1747,7 @@ static ffi::Error PlaneFftGather(cudaStream_t stream, ffi::AnyBuffer F, ffi::Any
     const void* fp = F.untyped_data();
     void* yp = Y->untyped_data();
     void* args[] = {(void*)&fp, (void*)&yp, (void*)&g};
-    const unsigned blocks = static_cast<unsigned>(std::min<long long>(planes, 2147483647LL));
+    const unsigned blocks = static_cast<unsigned>(std::min<long long>((planes + k->rb - 1) / k->rb, 2147483647LL));
     CUresult cr = driver_api().LaunchKernel(k->fn, blocks, 1, 1, kThreads, 1, 1, static_cast<unsigned>(k->smem),
                                             reinterpret_cast<CUstream>(stream), args, nullptr);
     if (cr != CUDA_SUCCESS) return fail("cuLaunchKernel", cu_err(cr));
