@@ -197,10 +197,13 @@ def _reference(case, psi, gv, gmask, bidx, kvecs, extra):
             # The band-layout operator's OWN ket at one k on one device:
             # this arm isolates the sweep's layout and collectives for a
             # component-carrying FFT ket, not the operator physics.
+            from common.wfn_transforms import union_box_tables
             op = extra["op"]
+            sup, comp = union_box_tables(bidx, GRID)
             ket = np.asarray(op.apply(
                 jnp.asarray(psi[ik])[None], jnp.asarray(gv[ik]),
-                jnp.asarray(gmask[ik]), jnp.asarray(bidx[ik])[None],
+                jnp.asarray(gmask[ik]),
+                mtxel_sweep.SphereBox(jnp.asarray(comp[ik])[None], sup),
                 jnp.asarray(kvecs[ik]), *op.consts))[0]
             out.append(np.einsum("msg,nsgc->cmn", np.conj(psi_m), ket)
                        * op.post)
@@ -304,6 +307,20 @@ def test_sweep_matches_independent_reference(case, ns):
     # far more than the tolerance, or the pass above proves nothing.
     assert _rel(np.conj(logical), ref) > 1e-3
     assert _rel(np.swapaxes(logical, -1, -2), ref) > 1e-3
+
+
+@pytest.mark.mesh(4)
+@pytest.mark.parametrize("case,ns", [("vh", 2), ("four_current", 4)])
+def test_union_box_gemm_route_agrees(case, ns, monkeypatch):
+    """The FFT operators' union-box plans with every supported axis on the
+    stored-matrix GEMM (on CUDA: cuBLAS and the fused plane pair) give the
+    blocks of the FFT route, at nspinor 2 (V_H) and 4 (four-current)."""
+    from common import fourier_plan
+    got_fft, _, _, _ = _run(case, ns)
+    monkeypatch.setattr(fourier_plan, "gemm_crossover",
+                        lambda kind: (range(0), range(1 << 30)))
+    got_gemm, _, _, _ = _run(case, ns)
+    assert _rel(got_gemm, got_fft) <= RTOL
 
 
 @pytest.mark.mesh(4)
