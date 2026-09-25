@@ -252,6 +252,21 @@ def assert_gapped_occupations_for_ppm(occ_full, *, print_fn=print) -> int:
         f"  doc:  docs/theory/metallic-mpa-screening.md")
 
 
+def ppm_fermi_frame(enk_full, occ_full, use_midgap):
+    """The origin of the PPM Sigma(omega) grid: the current spectrum's VBM, or
+    ``0.5*(VBM + CBM)`` when ``use_midgap`` and a state is empty.
+
+    The one owner of that rule: ``_prepare_sigma_state`` builds the Sigma
+    frame with it, and the SC loop (``sc_iteration._sigma_frame_mu_ev``) calls
+    it on the same energies to judge grid coverage in that frame.
+    """
+    occ_mask = occ_full > 0.5
+    vbm = jnp.max(jnp.where(occ_mask, enk_full, -1.0e30))
+    cbm = jnp.min(jnp.where(~occ_mask, enk_full, 1.0e30))
+    midgap_candidate = jnp.where(jnp.any(~occ_mask), 0.5 * (vbm + cbm), vbm)
+    return jnp.where(use_midgap, midgap_candidate, vbm)
+
+
 @jax.jit
 def _prepare_sigma_state(
     enk_full: jax.Array,
@@ -288,12 +303,7 @@ def _prepare_sigma_state(
     # decomposition needs particle/hole weights f and 1-f, not f > 0.5.
     occ_mask = occ_full > 0.5
     unocc_mask = ~occ_mask
-
-    vbm = jnp.max(jnp.where(occ_mask, enk_full, -1.0e30))
-    cbm = jnp.min(jnp.where(unocc_mask, enk_full, 1.0e30))
-    has_unocc = jnp.any(unocc_mask)
-    midgap_candidate = jnp.where(has_unocc, 0.5 * (vbm + cbm), vbm)
-    efermi = jnp.where(use_midgap, midgap_candidate, vbm)
+    efermi = ppm_fermi_frame(enk_full, occ_full, use_midgap)
 
     E_cond = jnp.maximum(enk_full - efermi, 0.0)
     H_val = jnp.maximum(efermi - enk_full, 0.0)
