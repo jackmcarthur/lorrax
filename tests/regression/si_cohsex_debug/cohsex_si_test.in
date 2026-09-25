@@ -90,3 +90,10 @@ mc_average_vcoul_body = false
 # centroids the 1e-10 / 1e-9 / 1e-8 / unset arms are BYTE-IDENTICAL, so it can
 # exercise the shipping default for free.  See cohsex_si_fast.in.
 zeta_rcond = 1e-10
+
+# zeta_nband = 40 (2026-09-25): the ISDF fit window [0, 60) cuts a degenerate multiplet
+# at k=3 (gap 0 meV) and every cut from 42 to 61 is degenerate somewhere on this 8-k wedge;
+# 40 is the nearest clean boundary below 60 (min gap 818 meV at k=4; 62 is the WFN
+# extent and cannot be checked).  Only the zeta fit narrows: the chi0/Sigma band sum
+# keeps nband = 60, the BerkeleyGW run's band count.
+zeta_nband = 40

@@ -257,3 +257,21 @@ a write through a stray symlink destroyed a checked-in fixture on 2026-07-25.
 That is why `harness.protect_fixtures` keeps everything here `a-w` at rest.
 
 CLOSURE (2026-08-08): this deck stays on its free set at current pins; closure at matched rank measured RED on the BGW anchor — see the frontier record.
+
+
+Dipoles (re-cut 2026-09-25)
+---------------------------
+
+`dipole.h5` (nband 60, `cohsex_si_test.in`) and `dipole_fast.h5` (nband 20,
+`cohsex_si_fast.in`; staged as `dipole.h5` by `si_fast_session`) are cut with
+`python -m psp.get_dipole_mtxels -i DECK --vnl-velocity-sign +1 --pseudo-dir DIR`,
+with the sandbox's PseudoDojo FR `Si.upf` (md5 d8e8ea3dd55db7858206a05f373c9c65).
+The 2026-08-09 pseudo directory was purged and its UPF never recorded. That UPF
+reproduces the 08-09 `dipole_cart` to 5.6e-4 max-relative with `deltaE` bit-identical;
+SG15 `Si_ONCV_PBE-1.2` gives 9.3e-3. The dipole provenance gate requires one file per
+deck window, because `prov_nband` must equal the deck's `nband`.
+
+`kin_ion.h5` is re-cut the same way (`python -m gw.kin_ion_io -i cohsex_si_test.in
+--pseudo_dir DIR`, same UPF). It now carries the provenance attributes (`bispinor`,
+WFN fingerprint, IBZ storage) that `validate_kin_ion_against_run` requires; the old
+file had none.
