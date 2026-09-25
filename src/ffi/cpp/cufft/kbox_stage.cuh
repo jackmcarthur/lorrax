@@ -145,23 +145,49 @@ __device__ void transform3(C* bank) {
     __syncthreads();
 }
 
-// Stage columns [col0, col0 + tr) into the bank: element (k, col) from ld.stage(k, col) (a global
-// pointer) by cp.async, columns past ncols zero; then, when the Load has a finish step,
-// bank = ld.finish(k, col, bank) in place.  Consecutive threads take consecutive columns.
+// The staged tile as a direct Load writes it: v(k, j) is element k of tile column j.
+template <int NX, int NY, int NZ, class C>
+struct BankView {                       // single arm: k over the whole box
+    C* bank;
+    __device__ C& operator()(int k, int j) const {
+        return bank[j * Geo<NX, NY, NZ>::RS + Geo<NX, NY, NZ>::at(k)];
+    }
+};
+template <int NX, int NY, int NZ, class C>
+struct PlaneView {                      // plane pass: k in plane kx only
+    C* sm;
+    int kx;
+    __device__ C& operator()(int k, int j) const {
+        using G = Geo<NX, NY, NZ>;
+        return sm[j * G::PR + G::plane_at(k - kx * NY * NZ)];
+    }
+};
+
+// Stage columns [col0, col0 + tr) into the bank.  A Load with kDirect writes the tile itself,
+// block-cooperatively: ld.direct(view, k0, k1, col0, width, ncols) sets view(k, j) for k in
+// [k0, k1) and j < width, zero where col0 + j >= ncols (a gathered, mixed load such as the
+// Green unfold's U G U^dagger over a spin group; no cp.async).  Otherwise element (k, col)
+// comes from ld.stage(k, col) (a global pointer) by cp.async, columns past ncols zero; then,
+// when the Load has a finish step, bank = ld.finish(k, col, bank) in place.  Consecutive
+// threads take consecutive columns.  Every Load declares kDirect and kFinish.
 template <int NX, int NY, int NZ, int TR, class C, class Load>
 __device__ void stage_tile(C* bank, long long col0, long long ncols, const Load& ld) {
     using G = Geo<NX, NY, NZ>;
     constexpr int tr = TR;
-    for (int i = threadIdx.x; i < tr * G::NK; i += blockDim.x) {
-        const int j = i % tr, k = i / tr;
-        C* dst = bank + j * G::RS + G::at(k);
-        if (col0 + j < ncols) cp_async<sizeof(C)>(dst, ld.stage(k, col0 + j));
-        else { dst->x = 0; dst->y = 0; }
+    if constexpr (Load::kDirect) {
+        ld.direct(BankView<NX, NY, NZ, C>{bank}, 0, G::NK, col0, tr, ncols);
+    } else {
+        for (int i = threadIdx.x; i < tr * G::NK; i += blockDim.x) {
+            const int j = i % tr, k = i / tr;
+            C* dst = bank + j * G::RS + G::at(k);
+            if (col0 + j < ncols) cp_async<sizeof(C)>(dst, ld.stage(k, col0 + j));
+            else { dst->x = 0; dst->y = 0; }
+        }
+        cp_async_commit();
+        cp_async_wait_all();
     }
-    cp_async_commit();
-    cp_async_wait_all();
     __syncthreads();
-    if constexpr (Load::kFinish) {
+    if constexpr (!Load::kDirect && Load::kFinish) {
         for (int i = threadIdx.x; i < tr * G::NK; i += blockDim.x) {
             const int j = i % tr, k = i / tr;
             if (col0 + j < ncols) {
@@ -188,6 +214,29 @@ __device__ void mid_tile(C* bank, long long col0, long long ncols, const Mid& mi
     __syncthreads();
 }
 
+// Group Mid on the resident tile: GROUP consecutive columns form one group (TR % GROUP == 0; the
+// plan's tr counts groups, so a tile never splits one).  One thread per (group, k) loads the
+// group's GROUP values into vals[], calls mid.group(k, g, vals) (g = the group's global index)
+// which rewrites vals in place, and stores all GROUP back: a Mid that mixes a spin group, or
+// one that reduces it into vals[0] (the Store then skips the other columns).
+template <int NX, int NY, int NZ, int TR, int GROUP, class C, class Mid>
+__device__ void mid_group_tile(C* bank, long long col0, long long ncols, const Mid& mid) {
+    static_assert(TR % GROUP == 0, "a tile holds whole groups");
+    using G = Geo<NX, NY, NZ>;
+    constexpr int ng = TR / GROUP;
+    for (int i = threadIdx.x; i < ng * G::NK; i += blockDim.x) {
+        const int g = i % ng, k = i / ng;
+        if (col0 + g * GROUP >= ncols) continue;
+        C vals[GROUP];
+#pragma unroll
+        for (int q = 0; q < GROUP; ++q) vals[q] = bank[(g * GROUP + q) * G::RS + G::at(k)];
+        mid.group(k, (col0 + g * GROUP) / GROUP, vals);
+#pragma unroll
+        for (int q = 0; q < GROUP; ++q) bank[(g * GROUP + q) * G::RS + G::at(k)] = vals[q];
+    }
+    __syncthreads();
+}
+
 // st.put(k, col, bank) for every stored element (the Store decides the row map and the scale).
 template <int NX, int NY, int NZ, int TR, class C, class Store>
 __device__ void store_tile(const C* bank, long long col0, long long ncols, const Store& st) {
@@ -204,7 +253,7 @@ __device__ void store_tile(const C* bank, long long col0, long long ncols, const
 // Plain k-leading access to the intermediate buffer between split passes.
 template <class C>
 struct Plain {
-    static constexpr bool kFinish = false;
+    static constexpr bool kDirect = false, kFinish = false;
     C* p;
     long long ncols;
     __device__ const C* stage(int k, long long col) const { return p + (long long)k * ncols + col; }
@@ -222,16 +271,20 @@ __device__ void plane_pass(C* sm, long long ncols, const Load& ld, const Store& 
         const int kx = int(w / nct);
         const long long c0 = (w % nct) * TP;
         __syncthreads();
-        for (int i = threadIdx.x; i < NY * NZ * TP; i += blockDim.x) {
-            const int t = i % TP, p = i / TP, k = kx * NY * NZ + p;
-            C* dst = sm + t * G::PR + G::plane_at(p);
-            if (c0 + t < ncols) cp_async<sizeof(C)>(dst, ld.stage(k, c0 + t));
-            else { dst->x = 0; dst->y = 0; }
+        if constexpr (Load::kDirect) {
+            ld.direct(PlaneView<NX, NY, NZ, C>{sm, kx}, kx * NY * NZ, (kx + 1) * NY * NZ, c0, TP, ncols);
+        } else {
+            for (int i = threadIdx.x; i < NY * NZ * TP; i += blockDim.x) {
+                const int t = i % TP, p = i / TP, k = kx * NY * NZ + p;
+                C* dst = sm + t * G::PR + G::plane_at(p);
+                if (c0 + t < ncols) cp_async<sizeof(C)>(dst, ld.stage(k, c0 + t));
+                else { dst->x = 0; dst->y = 0; }
+            }
+            cp_async_commit();
+            cp_async_wait_all();
         }
-        cp_async_commit();
-        cp_async_wait_all();
         __syncthreads();
-        if constexpr (Load::kFinish) {
+        if constexpr (!Load::kDirect && Load::kFinish) {
             for (int i = threadIdx.x; i < NY * NZ * TP; i += blockDim.x) {
                 const int t = i % TP, p = i / TP;
                 if (c0 + t < ncols) {
@@ -296,9 +349,13 @@ __device__ void pencil_pass(C* y, long long ncols, const Mid& mid) {
 //                                     group's values grp[q*TY] (q < GROUP) and the operands aux[e].
 // Shared memory (the caller's dynamic smem): NX*GROUP*TY + NX*TY*(kAux|1) elements; the odd
 // operand stride keeps the TY instances of a warp on different banks.
-template <int NX, int NY, int NZ, int Arch, int GROUP, int TY, class C, class Cols, class Mid>
+// kForward = false skips the forward x transform and hands the R-space value to
+// st.put(k, col, v) (k = kx*NY*NZ + p) instead of writing y: a pass that ends in R space
+// (mode 11 accumulates chi_R and transforms once after the tau sum).
+template <int NX, int NY, int NZ, int Arch, int GROUP, int TY, bool kForward, class C, class Cols, class Mid,
+          class Store>
 __device__ void pencil_group_pass(C* y, C* smem, long long ncols, long long n_inst, const Cols& cols,
-                                  const Mid& mid) {
+                                  const Mid& mid, const Store& st) {
     constexpr int LD = Mid::kAux | 1;
     C* sg = smem;
     C* saux = smem + NX * GROUP * TY;
@@ -327,12 +384,19 @@ __device__ void pencil_group_pass(C* y, C* smem, long long ncols, long long n_in
         __syncthreads();
 #pragma unroll
         for (int kx = 0; kx < NX; ++kx) v[kx] = f(sg + kx * GROUP * TY + t, saux + (kx * TY + t) * LD);
-        if constexpr (NX > 1) line_fft<NX, Arch, cufftdx::fft_direction::forward>(v, 1);
+        if constexpr (kForward && NX > 1) line_fft<NX, Arch, cufftdx::fft_direction::forward>(v, 1);
         if (live) {
 #pragma unroll
-            for (int kx = 0; kx < NX; ++kx) y[((long long)kx * NY * NZ + p) * ncols + col] = v[kx];
+            for (int kx = 0; kx < NX; ++kx) st.put(kx * NY * NZ + int(p), col, v[kx]);
         }
     }
+}
+
+// The in-place form: forward-transform and write back to y (the mode-8 vertex pencil).
+template <int NX, int NY, int NZ, int Arch, int GROUP, int TY, class C, class Cols, class Mid>
+__device__ void pencil_group_pass(C* y, C* smem, long long ncols, long long n_inst, const Cols& cols,
+                                  const Mid& mid) {
+    pencil_group_pass<NX, NY, NZ, Arch, GROUP, TY, true>(y, smem, ncols, n_inst, cols, mid, Plain<C>{y, ncols});
 }
 
 }  // namespace lrx_kbox
