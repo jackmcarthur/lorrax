@@ -61,6 +61,21 @@ Backends, chosen when the plan is built:
 ``backend='xla'`` on a CUDA mesh is the parity and benchmark arm; production
 passes nothing.  n_s is 1, 2 or 4 (the bispinor width; mode 6 takes n_s ≤ 4): the
 spin blocks ride as axes of every stage and meet only in the step-5 trace.
+
+The r'-column wedge (``wedge=ColumnWedge``; ``None`` computes every column).  For
+operands covariant under a space group (every parent invariant under its little
+group, as a Green of complete multiplets is), X(gx, gx') = X(x, x') on a unitary row
+and conj X(x, x') on an antiunitary one (real weights).  With ``x_μ = g(x_α + L)``
+(``symmetry_maps.centroid_source_map_and_wrap``) and ``q' + G'' = ±S⁻ᵀ(q + G)``
+(``isdf.zeta_mubatch.typed_child_G_tables``, q the child, q' the parent)::
+
+    T_q(G, x_μ) = e^{-2πi q·(S⁻¹L)} · 𝒯[ e^{-2πi (q'+G'')·Sτ} T_{q'}(G'', x_α) ]     𝒯 = conj on antiunitary rows
+
+so steps 2–5 run on one representative column per grid-point orbit (N_w ≈ N_r/|G|),
+with every full-grid q as the middle's output rows (N_k·N_w q-columns, no more than
+n_q·N_r), and a rank-local rebuild fills T_q(G, r') on whole orbits (the orbit-packed
+``common.grouped_layout`` view of r') before step 6.  H exists only on the
+representatives, so the r' chunk count and the all-to-all shrink by N_r/N_w too.
 """
 from __future__ import annotations
 
@@ -76,7 +91,7 @@ from common.fourier_plan import LocalFourierPlan
 from common.shard_map import shard_map
 from runtime.padding import padded_axis
 
-__all__ = ["SphereSet", "SphereTransport", "PairOperand", "MixedBasisPairConvolution",
+__all__ = ["SphereSet", "SphereTransport", "PairOperand", "ColumnWedge", "MixedBasisPairConvolution",
            "PairConvChunks", "plan_pair_convolution_chunks", "alias_free_margin"]
 
 _XY = ("x", "y")
@@ -233,6 +248,63 @@ class PairOperand:
                              f"match the sphere ({self.sphere.n}, {self.sphere.width})")
 
 
+@dataclasses.dataclass(frozen=True, eq=False)
+class ColumnWedge:
+    """The space group on the column coordinate r' (module docstring, "The r'-column wedge").
+
+    ``sym_matrices (n_sym, 3, 3)`` BGW ``mtrx``, ``translations (n_sym, 3)`` BGW ``tnp``
+    (2π·τ), ``rows`` canonical operation rows in ``[0, 2·n_sym)`` (a row ≥ n_sym is
+    antiunitary with spatial part ``row − n_sym``, ``SymMaps.operation_rows``);
+    one row per spatial part is kept, the unitary one when both are present.
+    ``out_full``: the output sphere at every full-grid q in C order, the middle's
+    rows on the wedge.  Antiunitary rows need operands of real weights (no
+    partners); ``from_symmaps(..., unitary_only=True)`` is the partner path.
+    """
+    sym_matrices: np.ndarray
+    translations: np.ndarray
+    rows: np.ndarray
+    out_full: SphereSet
+
+    def __post_init__(self):
+        S = np.asarray(self.sym_matrices, dtype=np.int64)
+        t = np.asarray(self.translations, dtype=np.float64)
+        rows = np.asarray(self.rows, dtype=np.int64).reshape(-1)
+        n = int(S.shape[0]) if S.ndim == 3 else -1
+        if S.ndim != 3 or S.shape[1:] != (3, 3) or t.shape != (n, 3) or rows.size < 1:
+            raise ValueError(f"ColumnWedge: want sym_matrices (n, 3, 3), translations (n, 3) and "
+                             f"at least one row; got {S.shape}, {t.shape}, {rows.shape}")
+        if rows.min() < 0 or rows.max() >= 2 * n:
+            raise ValueError(f"ColumnWedge: rows must lie in [0, {2 * n})")
+        keep = {}
+        for r in sorted(rows.tolist(), key=lambda r: (r % n, r >= n)):
+            keep.setdefault(r % n, r)
+        object.__setattr__(self, "sym_matrices", S)
+        object.__setattr__(self, "translations", t)
+        object.__setattr__(self, "rows", np.asarray(sorted(keep.values()), dtype=np.int32))
+
+    @property
+    def n_sym(self) -> int:
+        return int(self.sym_matrices.shape[0])
+
+    @property
+    def spatial(self) -> np.ndarray:
+        return self.rows % self.n_sym
+
+    @property
+    def anti(self) -> np.ndarray:
+        return self.rows >= self.n_sym
+
+    @classmethod
+    def from_symmaps(cls, sym, out_full: SphereSet, *, unitary_only: bool = False) -> "ColumnWedge":
+        """The authorized rows of a ``SymMaps`` (``active_symmetry_rows``); ``unitary_only``
+        keeps the unitary ones (operands with transposed partners)."""
+        S = np.asarray(sym.sym_matrices)
+        rows = np.asarray(sym.active_symmetry_rows)
+        if unitary_only:
+            rows = rows[rows < S.shape[0]]
+        return cls(S, np.asarray(sym.translations)[:S.shape[0]], rows, out_full)
+
+
 # ---------------------------------------------------------------------------
 # Box, aliasing and chunk planning (host)
 # ---------------------------------------------------------------------------
@@ -270,10 +342,12 @@ class PairConvChunks:
     bytes_middle: int
     bytes_final: int
     target: int
+    bytes_rebuild: int = 0
 
     @property
     def hwm(self) -> int:
-        return self.bytes_resident + max(self.bytes_expand, self.bytes_middle, self.bytes_final)
+        return self.bytes_resident + max(self.bytes_expand, self.bytes_middle, self.bytes_final,
+                                         self.bytes_rebuild)
 
 
 def _divisors(n: int) -> list[int]:
@@ -282,27 +356,45 @@ def _divisors(n: int) -> list[int]:
 
 def plan_pair_convolution_chunks(*, n_ranks, n_k, n_s, widths, width_out, n_q, n_r,
                                  kboxes, kbox_out, n_parent_tiles, target_bytes,
-                                 j_cap=64, n_c=None, J=None, kc=None, qc=None) -> PairConvChunks:
+                                 j_cap=64, n_c=None, J=None, kc=None, qc=None,
+                                 wedge=None) -> PairConvChunks:
     """The schedule for one τ node (every count one when everything fits).
 
     ``widths``/``kboxes``: the two operands' slot carriers and union-box cells;
     ``n_parent_tiles``: the slab copies' element count per rank (inputs held).
     ``n_c``/``J``/``kc``/``qc`` pin those counts (tests and the benchmark); the rest follow
     (``kc`` must divide ``n_k`` and ``qc`` must divide ``n_q``).
+    ``wedge`` (the r'-column wedge; ``None``: every column) is
+    ``dict(n_cols, n_q_mid, width_mid, kbox_mid, t_cols, n_rows)``: the middle's columns
+    (P × the most representatives one rank owns), its output rows (every full-grid q),
+    their slot carrier and union-box cells, the rebuilt T's columns per rank (whole
+    orbits, padded) and the operation rows the rebuild gathers.
     Refuses ``GATE pairconv-capacity`` when even n_c at one batch column per rank
     per chunk and unit k and q chunks exceeds ``target_bytes``.
     """
     Pn, nk, ns = int(n_ranks), int(n_k), int(n_s)
     Mw, Mo, nq, nr = [int(w) for w in widths], int(width_out), int(n_q), int(n_r)
+    wd = (dict(n_cols=nr, n_q_mid=nq, width_mid=Mo, kbox_mid=kbox_out, t_cols=0, n_rows=0)
+          if wedge is None else dict(wedge))
+    ncol, nqm, Mm, kbm = (int(wd[k]) for k in ("n_cols", "n_q_mid", "width_mid", "kbox_mid"))
+    tcol, nrow = int(wd["t_cols"]), int(wd["n_rows"])
 
     def carrier(nc, j):
-        return padded_axis(nr, Pn * nc * j, name="mixed-basis r' columns").carrier
+        return padded_axis(ncol, Pn * nc * j, name="mixed-basis r' columns").carrier
+
+    def t_total(nc, j):             # columns of the T the final stage reads, all ranks
+        return carrier(nc, j) if wedge is None else Pn * tcol
 
     def resident(nc, j):
         cols = carrier(nc, j) // Pn
         H = nk * ns * ns * sum(Mw) * (cols // nc)
-        T = nq * Mo * cols
-        return _C16 * (H + T + int(n_parent_tiles) + nq * Mo * Mo // Pn)
+        Tm = nqm * Mm * cols
+        T = 0 if wedge is None else nq * Mo * tcol
+        return _C16 * (H + Tm + T + int(n_parent_tiles) + nq * Mo * Mo // Pn)
+
+    def rebuild(nc, j):             # one q row: the gathered operation rows and the rebuilt columns
+        cols = carrier(nc, j) // Pn
+        return 0 if wedge is None else _C16 * (3 * nrow * Mm * cols + 2 * Mo * tcol)
 
     def expand(kc, nc, j):          # the full r' transform of one k chunk, its phased gather, the all-to-all
         cols = carrier(nc, j) // Pn // nc
@@ -311,28 +403,30 @@ def plan_pair_convolution_chunks(*, n_ranks, n_k, n_s, widths, width_out, n_q, n
 
     def middle(j):                  # compact gathers, the p→r output and its workspace, F, U, Y, the r→G box
         return _C16 * (nk * j * ns * ns * sum(kboxes) + 2 * nk * j * ns * ns * 2 * nr + nk * nr
-                       + nk * j * nr + 2 * nq * j * nr + 2 * nq * j * kbox_out + 2 * nq * Mo * j)
+                       + nk * j * nr + 2 * nqm * j * nr + 2 * nqm * j * kbm + 2 * nqm * Mm * j)
 
     def final(qc, nc, j):           # the all-to-all output, the phased box, its transform and gather
-        return _C16 * (3 * qc * (Mo // Pn) * carrier(nc, j) + 2 * qc * (Mo // Pn) * (kbox_out + Mo))
+        return _C16 * (3 * qc * (Mo // Pn) * max(t_total(nc, j), nr)
+                       + 2 * qc * (Mo // Pn) * (kbox_out + Mo))
 
     target = int(target_bytes)
-    nc_range = [int(n_c)] if n_c is not None else range(1, nr + 1)
+    nc_range = [int(n_c)] if n_c is not None else range(1, ncol + 1)
     for nc in nc_range:
-        if resident(nc, 1) + max(expand(1, nc, 1), middle(1), final(1, nc, 1)) <= target \
-                or n_c is not None:
+        if resident(nc, 1) + max(expand(1, nc, 1), middle(1), final(1, nc, 1),
+                                 rebuild(nc, 1)) <= target or n_c is not None:
             break
     else:
         raise RuntimeError(
-            f"GATE pairconv-capacity: got {resident(nr, 1) + middle(1)} B per rank at the smallest "
+            f"GATE pairconv-capacity: got {resident(ncol, 1) + middle(1)} B per rank at the smallest "
             f"schedule; want at most {target} B; why: the mixed-basis pair convolution keeps "
             "H_k(p, r') for one r' chunk and T_q(G, r') resident on all P ranks; fix: more ranks "
             "or more memory per device")
-    cols_chunk = padded_axis(nr, Pn * nc, name="mixed-basis r' columns").carrier // Pn // nc
+    cols_chunk = padded_axis(ncol, Pn * nc, name="mixed-basis r' columns").carrier // Pn // nc
     if J is None:
         J = 1
         for j in range(min(int(j_cap), cols_chunk), 0, -1):
-            if resident(nc, j) + max(middle(j), expand(1, nc, j), final(1, nc, j)) <= target:
+            if resident(nc, j) + max(middle(j), expand(1, nc, j), final(1, nc, j),
+                                     rebuild(nc, j)) <= target:
                 J = j
                 break
     J = int(J)
@@ -347,7 +441,8 @@ def plan_pair_convolution_chunks(*, n_ranks, n_k, n_s, widths, width_out, n_q, n
     return PairConvChunks(n_c=int(nc), J=J, kc=int(kc), qc=int(qc),
                           n_r_carrier=carrier(nc, J), bytes_resident=resident(nc, J),
                           bytes_expand=expand(kc, nc, J), bytes_middle=middle(J),
-                          bytes_final=final(qc, nc, J), target=target)
+                          bytes_final=final(qc, nc, J), target=target,
+                          bytes_rebuild=rebuild(nc, J))
 
 
 def _budget_target(ns: int) -> int:
@@ -442,13 +537,15 @@ class MixedBasisPairConvolution:
     and columns are zero).
 
     ``out`` holds the output rows (q-points, any subset of the grid, e.g. the IBZ).
+    ``wedge``: the r'-column wedge (``ColumnWedge``); ``None`` computes every column
+    (the validation arm, and the only schedule for operands that are not covariant).
     ``budget_bytes`` overrides the device budget (the planner's target);
     ``chunks = (n_c, J[, kc, qc])`` pins those counts (tests, the benchmark).
     """
 
     def __init__(self, mesh: Mesh, *, kgrid, fft_grid, left: PairOperand, right: PairOperand,
                  out: SphereSet, backend: str | None = None, budget_bytes: int | None = None,
-                 chunks: tuple[int, int] | None = None):
+                 chunks: tuple[int, int] | None = None, wedge: ColumnWedge | None = None):
         if backend not in _BACKENDS:
             raise ValueError(f"MixedBasisPairConvolution: backend must be one of {_BACKENDS}, "
                              f"got {backend!r}")
@@ -457,6 +554,8 @@ class MixedBasisPairConvolution:
         left = PairOperand(left.sphere.recentred(), left.transport)
         right = PairOperand(right.sphere.recentred(), right.transport)
         out = out.recentred()
+        self.wedge = wedge
+        mid = out if wedge is None else wedge.out_full.recentred()   # the middle's output rows
         self.mesh = mesh
         self.px, self.py = int(mesh.shape["x"]), int(mesh.shape["y"])
         self.P = self.px * self.py
@@ -485,18 +584,28 @@ class MixedBasisPairConvolution:
             raise NotImplementedError(
                 "MixedBasisPairConvolution: the two operands use different k representatives; "
                 "one row phase serves both on the fused load (the Σ caller, lane K2)")
-        qin = np.rint(out.frac * np.asarray(self.kgrid)).astype(np.int64)
-        if np.max(np.abs(out.frac * np.asarray(self.kgrid) - qin), initial=0.0) > 1e-8:
-            raise ValueError("MixedBasisPairConvolution: output q-points are off the k-grid")
         kg = np.asarray(self.kgrid)
+        for name, s in (("output", out), ("wedge output", mid)):
+            qin = np.rint(s.frac * kg).astype(np.int64)
+            if np.max(np.abs(s.frac * kg - qin), initial=0.0) > 1e-8:
+                raise ValueError(f"MixedBasisPairConvolution: {name} q-points are off the k-grid")
+        if wedge is not None and not np.array_equal(np.ravel_multi_index(
+                (np.rint(mid.frac * kg).astype(np.int64) % kg).T, self.kgrid), np.arange(self.nk)):
+            raise ValueError("MixedBasisPairConvolution: the wedge's out_full rows are not the "
+                             "C-order k-grid")
+        self.nq = int(out.n)
+        self.out_mid = mid
+        self.nq_mid = int(mid.n)
+        qin = np.rint(mid.frac * kg).astype(np.int64)
         self.q_rows = np.ravel_multi_index((qin % kg).T, self.kgrid).astype(np.int32)
         self.q_neg_rows = np.ravel_multi_index(((-qin) % kg).T, self.kgrid).astype(np.int32)
-        self.nq = int(out.n)
 
         # ---- supports, aliasing, carriers ------------------------------------
         self.sup = tuple(op.sphere.union_support() for op in self.ops)
         self.sup_out = out.union_support()
-        margin = alias_free_margin(self.fft_grid, self.sup[0], self.sup[1], self.sup_out)
+        self.sup_mid = mid.union_support()
+        margin = np.minimum(alias_free_margin(self.fft_grid, self.sup[0], self.sup[1], self.sup_out),
+                            alias_free_margin(self.fft_grid, self.sup[0], self.sup[1], self.sup_mid))
         if np.any(margin < 1):
             raise ValueError(
                 f"GATE pairconv-alias: got box {self.fft_grid} with margins {margin.tolist()}; want "
@@ -504,18 +613,19 @@ class MixedBasisPairConvolution:
                 "onto it; fix: a larger FFT box (alias_free_margin names the deficit per axis)")
         self.kbox = tuple(tuple(len(s) for s in sup) for sup in self.sup)
         self.kbox_out = tuple(len(s) for s in self.sup_out)
+        self.kbox_mid = tuple(len(s) for s in self.sup_mid)
         self.m_axis = tuple(padded_axis(op.sphere.width, self.P, name=f"pair-conv {nm} slots")
                             for op, nm in zip(self.ops, ("left", "right")))
         self.mo_axis = padded_axis(out.width, self.P, name="pair-conv output slots")
+        self.mm_axis = padded_axis(mid.width, self.P, name="pair-conv wedge output slots")
         self.width_carrier = tuple(a.carrier for a in self.m_axis)
 
         # ---- host tables -----------------------------------------------------
         self._tables = [self._operand_tables(op, sup, ax.carrier)
                         for op, sup, ax in zip(self.ops, self.sup, self.m_axis)]
-        cells = out.box_cells(self.sup_out)
-        ocell = np.full((self.nq, self.mo_axis.carrier), int(np.prod(self.kbox_out)), np.int32)
-        ocell[:, :out.width] = np.where(cells >= 0, cells, int(np.prod(self.kbox_out)))
-        self._ocell = ocell
+        self._ocell = self._out_cells(out, self.sup_out, self.mo_axis.carrier)
+        self._ocell_mid = self._out_cells(mid, self.sup_mid, self.mm_axis.carrier)
+        self._wt = None if wedge is None else self._wedge_tables(wedge, out, mid)
 
         # ---- backend ---------------------------------------------------------
         if backend is None:
@@ -532,20 +642,112 @@ class MixedBasisPairConvolution:
                     * ax.carrier * ax.carrier * ns * ns // self.P
                     for op, ax in zip(self.ops, self.m_axis))
         target = (int(budget_bytes) if budget_bytes is not None else _budget_target(ns))
+        wt = self._wt
         self.chunks = plan_pair_convolution_chunks(
             n_ranks=self.P, n_k=self.nk, n_s=ns, widths=self.width_carrier,
             width_out=self.mo_axis.carrier, n_q=self.nq, n_r=self.nr,
             kboxes=[int(np.prod(k)) for k in self.kbox], kbox_out=int(np.prod(self.kbox_out)),
             n_parent_tiles=n_par, target_bytes=target,
+            wedge=None if wt is None else dict(
+                n_cols=self.P * wt["n_rep_rank"], n_q_mid=self.nq_mid,
+                width_mid=self.mm_axis.carrier, kbox_mid=int(np.prod(self.kbox_mid)),
+                t_cols=wt["layout"].shard_size, n_rows=len(wedge.rows)),
             **dict(zip(("n_c", "J", "kc", "qc"), chunks or ())))
         c = self.chunks
         self.nr_carrier = c.n_r_carrier
         self.cols_rank = self.nr_carrier // self.P
         self.cols_chunk = self.cols_rank // c.n_c
         self.n_batch = self.cols_chunk // c.J
+        # the r' column each (rank, slot) carries: the box in order, or each rank's orbit
+        # representatives; a value ≥ N_r is a pad column (its H reads zero)
+        if wt is None:
+            self._coltab = np.arange(self.nr_carrier, dtype=np.int32).reshape(self.P, self.cols_rank)
+        else:
+            self._coltab = np.full((self.P, self.cols_rank), self.nr, np.int32)
+            for r, reps in enumerate(wt["reps"]):
+                self._coltab[r, :len(reps)] = reps
         self._build()
 
     # ------------------------------------------------------------------ tables
+    @staticmethod
+    def _out_cells(s: SphereSet, sup, carrier):
+        """``(n, carrier)`` int32: each output slot's cell in the ``sup`` box (pads: past the box)."""
+        nbo = int(np.prod([len(v) for v in sup]))
+        cells = s.box_cells(sup)
+        ocell = np.full((s.n, carrier), nbo, np.int32)
+        ocell[:, :s.width] = np.where(cells >= 0, cells, nbo)
+        return ocell
+
+    def _wedge_tables(self, wedge: ColumnWedge, out: SphereSet, mid: SphereSet) -> dict:
+        """The r'-orbit tables, host side; the one owner of the wedge's index algebra.
+
+        r' side: ``centroid_source_map_and_wrap`` over every box cell gives, per row j,
+        ``x_μ = g_j(x_α + L)``; ``permutation_orbit_labels`` the orbits; the lowest-index
+        cell is each orbit's representative; each member takes the lowest row that
+        sources it from the representative.  ``build_grouped_shard_layout`` packs whole
+        orbits on one rank (LPT on member counts).  G side: ``typed_child_G_tables`` with
+        the output q as children of the full-grid q' = ±S⁻ᵀq under each row.
+        """
+        from types import SimpleNamespace
+        from common.grouped_layout import build_grouped_shard_layout
+        from common.gvec_fft_box import build_sphere_box_index
+        from isdf.zeta_mubatch import typed_child_G_tables
+        from symmetry_maps import centroid_source_map_and_wrap, permutation_orbit_labels
+        nr, P_, fg = self.nr, self.P, np.asarray(self.fft_grid)
+        S = wedge.sym_matrices[wedge.spatial]
+        grid = np.stack(np.unravel_index(np.arange(nr), self.fft_grid), axis=-1).astype(np.int32)
+        alpha, L = centroid_source_map_and_wrap(grid, S, wedge.translations[wedge.spatial], fg)
+        labels = permutation_orbit_labels(alpha)
+        n_orb = int(labels.max()) + 1
+        rep = np.full(n_orb, nr, np.int64)
+        np.minimum.at(rep, labels, np.arange(nr))
+        hit = alpha == rep[labels][None, :]                               # (n_rows, N_r)
+        if not np.all(hit.any(axis=0)):
+            raise AssertionError("ColumnWedge: an orbit member no row sources from its representative")
+        jrow = np.argmax(hit, axis=0)                                     # lowest row per member
+        Lm = L[jrow, np.arange(nr)].astype(np.float64)                    # (N_r, 3)
+        layout = build_grouped_shard_layout(labels, P_)
+        reps, rep_loc = [], np.empty(n_orb, np.int64)
+        for r in range(P_):
+            orbs = np.flatnonzero(layout.group_owner == r)
+            orbs = orbs[np.argsort(layout.group_start[orbs])]
+            reps.append(rep[orbs].astype(np.int32))
+            rep_loc[orbs] = np.arange(orbs.size)
+        # per packed column: (row, local representative) and the lattice-wrap phase
+        p2c = layout.packed_to_canonical
+        live = p2c >= 0
+        mu = np.where(live, p2c, 0)
+        Rinv = np.rint(np.linalg.inv(S.astype(np.float64))).astype(np.int64)   # (n_rows, 3, 3)
+        wrap = np.einsum("mab,mb->ma", Rinv[jrow[mu]], Lm[mu])                # S⁻¹ L per column
+        phl = np.where(live[None, :], np.exp(-2j * np.pi * out.frac @ wrap.T), 0.0)
+        # G side: children (q_i, row j) of parents q' = ±S⁻ᵀ q_i on the full grid
+        nrow, kg = len(wedge.rows), np.asarray(self.kgrid)
+        sign = np.where(wedge.anti, -1.0, 1.0)
+        kbar = sign[None, :, None] * np.einsum("jba,ib->ija", np.linalg.inv(S.astype(np.float64)),
+                                               out.frac)                 # S⁻ᵀ q, (n_q, n_rows, 3)
+        kint = np.rint(kbar * kg)
+        if np.max(np.abs(kbar * kg - kint)) > 1e-6:
+            raise ValueError("ColumnWedge: a row does not map the output q onto the k-grid")
+        par = np.ravel_multi_index((kint.astype(np.int64) % kg).reshape(-1, 3).T, self.kgrid)
+        plan = SimpleNamespace(irr_idx=par, sym_idx=np.tile(wedge.rows, self.nq),
+                               spatial_ops=wedge.sym_matrices, translations=wedge.translations,
+                               n_sym_spatial=wedge.n_sym, k_parent_frac=mid.frac)
+        sidx = build_sphere_box_index(mid.gvecs, self.fft_grid, mid.width, ngk_valid=mid.ngk)
+        pslot, gph, _ = typed_child_G_tables(
+            plan, fft_grid=self.fft_grid, sphere_par=sidx,
+            gvec_child=np.repeat(out.gvecs, nrow, axis=0), ngk_child=np.repeat(out.ngk, nrow),
+            k_child=np.repeat(out.frac, nrow, axis=0))
+        mo, mm = self.mo_axis.carrier, self.mm_axis.carrier
+        ps = np.full((self.nq * nrow, mo), mm, np.int32)
+        ps[:, :out.width] = np.where(pslot < mid.width, pslot, mm)
+        ph = np.zeros((self.nq * nrow, mo), np.complex128)
+        ph[:, :out.width] = gph
+        return dict(layout=layout, reps=reps, rep_loc=rep_loc, labels=labels, jrow=jrow,
+                    n_orbits=n_orb, n_rep_rank=max(len(r) for r in reps), phl=phl,
+                    par=par.reshape(self.nq, nrow).astype(np.int32),
+                    pslot=ps.reshape(self.nq, nrow, mo), gph=ph.reshape(self.nq, nrow, mo),
+                    anti=wedge.anti.copy())
+
     def _operand_tables(self, op: PairOperand, sup, m_carrier):
         """Per full-grid k and union-box cell: the parent slot (``m_carrier`` = empty), the
         row-half phase and the column-half phase."""
@@ -566,9 +768,9 @@ class MixedBasisPairConvolution:
                     csrc=csrc, mph=mph, nph=nph, n_parent=tr.n_parent,
                     has_anti=bool(np.any(tr.anti)))
 
-    def _put(self, a):
+    def _put(self, a, spec=P()):
         from lxkit import device_put_process_local
-        return device_put_process_local(np.asarray(a), NamedSharding(self.mesh, P()))
+        return device_put_process_local(np.asarray(a), NamedSharding(self.mesh, spec))
 
     # ------------------------------------------------------------------ build
     def _plan(self, *, sign, norm, in_support=None, out_support=None):
@@ -592,8 +794,11 @@ class MixedBasisPairConvolution:
                      for t in self._tables]
         self._dev_k = self._put(kfrac)
         self._dev_q = self._put(self.out.frac)
+        self._dev_qmid = self._put(self.out_mid.frac)
         self._dev_ocell = self._put(self._ocell)
+        self._dev_ocell_mid = self._put(self._ocell_mid)
         self._dev_qrows = self._put(self.q_neg_rows if self.backend == "router" else self.q_rows)
+        self._dev_cols = self._put(self._coltab)
 
         # ---- 1: 2-D tile → slab ----------------------------------------------
         def slab(a):
@@ -609,9 +814,9 @@ class MixedBasisPairConvolution:
         # ---- 5: the streamed middle ------------------------------------------
         same_support = all(np.array_equal(a, b) for a, b in zip(*self.sup))
         plan_row = [self._plan(sign=+1, norm="forward", in_support=s) for s in self.sup]
-        plan_out = self._plan(sign=-1, norm="backward", out_support=self.sup_out)
-        J, nq, nb = c.J, self.nq, self.n_batch
-        kbox, kbo = self.kbox, self.kbox_out
+        plan_out = self._plan(sign=-1, norm="backward", out_support=self.sup_mid)
+        J, nq, nb = c.J, self.nq_mid, self.n_batch
+        kbox, kbo = self.kbox, self.kbox_mid
         nbo = int(np.prod(kbo))
         cols_chunk = self.cols_chunk
         backend = self.backend
@@ -673,12 +878,17 @@ class MixedBasisPairConvolution:
         mo_loc = self.mo_axis.carrier // P_
         n_qc = nq // qc
 
-        def final(T, qf, ocell):
+        nq = self.nq
+        wedge = self._wt is not None
+
+        def final(T, qf, ocell, c2p):
             def step(_, i):
                 Tq = jax.lax.dynamic_slice_in_dim(T, i * qc, qc, axis=0)
                 Tq = jax.lax.all_to_all(Tq, _XY, split_axis=1, concat_axis=2, tiled=True)
                 q_i = jax.lax.dynamic_slice_in_dim(qf, i * qc, qc, axis=0)
-                Tq = Tq[..., :nr] * _grid_phase(q_i, +1, fg, box)[:, None, :]
+                # the columns in box order: a slice, or the orbit-packed view's gather
+                Tq = jnp.take(Tq, c2p, axis=2) if wedge else Tq[..., :nr]
+                Tq = Tq * _grid_phase(q_i, +1, fg, box)[:, None, :]
                 Z = plan_col_out(Tq.reshape((qc, mo_loc) + fg)).reshape(qc, mo_loc, nbo)
                 oc = jax.lax.dynamic_slice_in_dim(ocell, i * qc, qc, axis=0)
                 idx = jnp.broadcast_to(oc[:, None, :], (qc, mo_loc, oc.shape[1]))
@@ -688,12 +898,47 @@ class MixedBasisPairConvolution:
             X = X.reshape(nq, mo_loc, -1)
             return jax.lax.all_to_all(X, "y", split_axis=2, concat_axis=1, tiled=True)
 
-        self._final = jax.jit(shard_map(final, mesh=mesh, in_specs=(P(None, None, _XY), rep, rep),
+        self._final = jax.jit(shard_map(final, mesh=mesh, in_specs=(P(None, None, _XY), rep, rep, rep),
                                         out_specs=P(None, "x", "y"), check_vma=False))
+        self._dev_c2p = self._put(np.arange(nr, dtype=np.int32) if not wedge else
+                                  self._wt["layout"].canonical_to_packed.astype(np.int32))
 
         def zeros_T():
-            return jnp.zeros((nq, self.mo_axis.carrier, self.nr_carrier), jnp.complex128)
+            return jnp.zeros((self.nq_mid, self.mm_axis.carrier, self.nr_carrier), jnp.complex128)
         self._zeros_T = jax.jit(zeros_T, out_shardings=NamedSharding(mesh, P(None, None, _XY)))
+        if wedge:
+            self._build_rebuild()
+
+    def _build_rebuild(self):
+        """The wedge's rank-local rebuild: T_w(q', G'', rep) on every full-grid q' →
+        T_q(G, r') on whole orbits at the output q (module docstring)."""
+        wt, mesh = self._wt, self.mesh
+        nq, nrow, mo = self.nq, len(self.wedge.rows), self.mo_axis.carrier
+        R = self.cols_rank
+        lay = wt["layout"]
+        live = lay.packed_to_canonical >= 0
+        mu = np.where(live, lay.packed_to_canonical, 0)
+        sel = np.where(live, wt["jrow"][mu] * R + wt["rep_loc"][wt["labels"][mu]], 0).astype(np.int32)
+        self._dev_rebuild = (self._put(wt["par"]), self._put(wt["pslot"]), self._put(wt["gph"]),
+                             self._put(wt["anti"]),
+                             self._put(sel, P(_XY)),
+                             self._put(wt["phl"], P(None, _XY)))
+
+        def rebuild(Tm, par, pslot, gph, anti, sel, phl):
+            def step(_, i):
+                g = jnp.take(Tm, par[i], axis=0)                          # (rows, M_mid, R)
+                idx = jnp.broadcast_to(pslot[i][:, :, None], (nrow, mo, R))
+                g = jnp.take_along_axis(g, idx, axis=1, mode="fill", fill_value=0) * gph[i][:, :, None]
+                g = jnp.where(anti[:, None, None], jnp.conj(g), g)
+                flat = jnp.transpose(g, (1, 0, 2)).reshape(mo, nrow * R)
+                return None, jnp.take(flat, sel, axis=1) * phl[i][None, :]
+            _, T = jax.lax.scan(step, None, jnp.arange(nq), unroll=1)
+            return T
+
+        rep = P()
+        self._rebuild = jax.jit(shard_map(
+            rebuild, mesh=mesh, in_specs=(P(None, None, _XY), rep, rep, rep, rep, P(_XY), P(None, _XY)),
+            out_specs=P(None, None, _XY), check_vma=False))
 
     def _build_expand(self, t, sup, m_carrier):
         """Steps 2–4 for one operand: ``fn(S, St, j) -> H`` for r' chunk ``j``."""
@@ -706,13 +951,11 @@ class MixedBasisPairConvolution:
         plan_col = self._plan(sign=-1, norm="backward", in_support=sup)
         cols_rank, cols_chunk = self.cols_rank, self.cols_chunk
         n_par, conj_partner = t["n_parent"], True
-        o = jnp.arange(cols_chunk, dtype=jnp.int32)
-        rho = jnp.arange(P_, dtype=jnp.int32)
 
-        def expand(S, St, j, row, anti, spin, csrc, nph, kf, *, partner):
+        def expand(S, St, j, row, anti, spin, csrc, nph, kf, coltab, *, partner):
             src = jnp.concatenate([S, St], axis=0) if partner else S
             # the r' columns of chunk j that each destination rank owns (≥ N_r: pad, reads 0)
-            cols = rho[:, None] * cols_rank + j * cols_chunk + o[None, :]      # (P, cols_chunk)
+            cols = jax.lax.dynamic_slice_in_dim(coltab, j * cols_chunk, cols_chunk, axis=1)
 
             def step(_, i):
                 k0 = i * kc
@@ -741,7 +984,7 @@ class MixedBasisPairConvolution:
         fns = {}
         for partner in (False, True):
             f = (lambda S, St, j, *tb, _p=partner: expand(S, St, j, *tb, partner=_p))
-            fns[partner] = jax.jit(shard_map(f, mesh=mesh, in_specs=(sspec, sspec) + (rep,) * 7,
+            fns[partner] = jax.jit(shard_map(f, mesh=mesh, in_specs=(sspec, sspec) + (rep,) * 8,
                                              out_specs=out, check_vma=False))
         return fns
 
@@ -765,6 +1008,13 @@ class MixedBasisPairConvolution:
                 raise ValueError(f"MixedBasisPairConvolution: {name} must be complex128 "
                                  f"(n_parent, {ax.carrier}, {self.ns}, {ax.carrier}, {self.ns}); "
                                  f"got {x.shape} {x.dtype}")
+        if self.wedge is not None and bool(np.any(self.wedge.anti)) \
+                and (A_partner is not None or C_partner is not None):
+            raise ValueError(
+                "GATE pairconv-wedge-partner: got transposed partners with antiunitary wedge rows; "
+                "want real weights (no partners) or a unitary-only wedge; why: on an antiunitary "
+                "row X(gx, gx') is conj of the partners' product, not of X; fix: "
+                "ColumnWedge.from_symmaps(..., unitary_only=True)")
         t0 = time.perf_counter()
         slabs = []
         for x, xt, t in ((A, A_partner, self._tables[0]), (C, C_partner, self._tables[1])):
@@ -780,14 +1030,18 @@ class MixedBasisPairConvolution:
             H = []
             for (s, st), fns, dv in zip(slabs, self._expand, d):
                 H.append(fns[st is not None](s, s if st is None else st, jj, dv["row"], dv["anti"],
-                                             dv["spin"], dv["csrc"], dv["nph"], self._dev_k))
+                                             dv["spin"], dv["csrc"], dv["nph"], self._dev_k,
+                                             self._dev_cols))
             t0 = mark("expand", H, t0)
-            T = self._middle(H[0], H[1], T, jj, self._dev_k, self._dev_q, self._dev_qrows,
-                             self._dev_ocell, d[0]["csrc"], d[0]["mph"], d[0]["spin"],
+            T = self._middle(H[0], H[1], T, jj, self._dev_k, self._dev_qmid, self._dev_qrows,
+                             self._dev_ocell_mid, d[0]["csrc"], d[0]["mph"], d[0]["spin"],
                              d[1]["csrc"], d[1]["mph"], d[1]["spin"])
             del H
             t0 = mark("middle", T, t0)
-        X = self._final(T, self._dev_q, self._dev_ocell)
+        if self._wt is not None:
+            T = self._rebuild(T, *self._dev_rebuild)
+            t0 = mark("rebuild", T, t0)
+        X = self._final(T, self._dev_q, self._dev_ocell, self._dev_c2p)
         mark("final", X, t0)
         return X
 
@@ -808,16 +1062,26 @@ class MixedBasisPairConvolution:
             ops[f"slab {name}"] = self._slab.lower(tile)
             ops[f"expand {name}"] = self._expand[0 if name == "left" else 1][False].lower(
                 slab, slab, rep((), i32), rep((nk,), i32), rep((nk,), i32), rep((nk, ns, ns), c128),
-                rep((nk, nbox), i32), rep((nk, nbox), c128), rep((nk, 3), f64))
+                rep((nk, nbox), i32), rep((nk, nbox), c128), rep((nk, 3), f64),
+                rep(self._coltab.shape, i32))
         H = [sd((nk, M, ns, ns, self.P * self.cols_chunk), c128, P(None, None, None, None, _XY))
              for M in self.width_carrier]
-        T = sd((nq, self.mo_axis.carrier, self.nr_carrier), c128, P(None, None, _XY))
+        nqm, mm = self.nq_mid, self.mm_axis.carrier
+        Tm = sd((nqm, mm, self.nr_carrier), c128, P(None, None, _XY))
         tb = [(rep((nk, t["csrc"].shape[1]), i32), rep((nk, t["csrc"].shape[1]), c128),
                rep((nk, ns, ns), c128)) for t in self._tables]
-        ops["middle"] = self._middle.lower(H[0], H[1], T, rep((), i32), rep((nk, 3), f64),
-                                           rep((nq, 3), f64), rep((nq,), i32),
-                                           rep((nq, self.mo_axis.carrier), i32), *tb[0], *tb[1])
-        ops["final"] = self._final.lower(T, rep((nq, 3), f64), rep((nq, self.mo_axis.carrier), i32))
+        ops["middle"] = self._middle.lower(H[0], H[1], Tm, rep((), i32), rep((nk, 3), f64),
+                                           rep((nqm, 3), f64), rep((nqm,), i32),
+                                           rep((nqm, mm), i32), *tb[0], *tb[1])
+        T = Tm
+        if self._wt is not None:
+            n_pad = self._wt["layout"].n_padded
+            T = sd((nq, self.mo_axis.carrier, n_pad), c128, P(None, None, _XY))
+            ops["rebuild"] = self._rebuild.lower(
+                Tm, *(rep(np.shape(a), a.dtype) for a in self._dev_rebuild[:4]),
+                sd((n_pad,), i32, P(_XY)), sd((nq, n_pad), c128, P(None, _XY)))
+        ops["final"] = self._final.lower(T, rep((nq, 3), f64), rep((nq, self.mo_axis.carrier), i32),
+                                         rep((self.nr,), i32))
         pat = re.compile(r"\b(all-to-all|all-gather|all-reduce|reduce-scatter|collective-permute)"
                          r"(-start)?\(")
         out = {}
@@ -843,8 +1107,20 @@ class MixedBasisPairConvolution:
                 f"[pair-conv] memory law per rank: resident {gb(c.bytes_resident)} "
                 f"(H {gb(_C16 * self.nk * self.ns ** 2 * sum(self.width_carrier) * self.cols_chunk)}, "
                 f"T {gb(_C16 * self.nq * self.mo_axis.carrier * self.cols_rank)}); transients expand "
-                f"{gb(c.bytes_expand)}, middle {gb(c.bytes_middle)}, final {gb(c.bytes_final)}; "
-                f"HWM {gb(c.hwm)} against target {gb(c.target)}")
+                f"{gb(c.bytes_expand)}, middle {gb(c.bytes_middle)}, final {gb(c.bytes_final)}"
+                f"{'' if self._wt is None else ', rebuild ' + gb(c.bytes_rebuild)}; "
+                f"HWM {gb(c.hwm)} against target {gb(c.target)}" + self._describe_wedge())
+
+    def _describe_wedge(self) -> str:
+        wt = self._wt
+        if wt is None:
+            return "\n[pair-conv] r'-column wedge: off (every column)"
+        w = self.wedge
+        return (f"\n[pair-conv] r'-column wedge: {len(w.rows)} rows ({int(w.anti.sum())} antiunitary); "
+                f"{wt['n_orbits']} orbits of {self.nr} columns ({self.nr / wt['n_orbits']:.2f}x); "
+                f"representatives per rank {wt['n_rep_rank']} (max), orbit members per rank "
+                f"{wt['layout'].shard_size} (pad {wt['layout'].pad_fraction:.1%}); middle rows "
+                f"{self.nq_mid} (every q), union box {self.kbox_mid}")
 
     def strip(self, X):
         """The logical output ``(n_q, width, width)`` on the host (gathers; small outputs only)."""

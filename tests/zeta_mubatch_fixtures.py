@@ -74,7 +74,8 @@ def _acubic_fixture(mesh, rng):
                 ops=np.asarray(sym.sym_matrices)[:plan.n_sym_spatial],
                 tnp=np.asarray(sym.translations)[:plan.n_sym_spatial],
                 band_chunks=((0, nb),), left=(0, 5), right=(2, 8), b_target=24,
-                r_s_target=160, tile_width=192)
+                r_s_target=160, tile_width=192,
+                rows=np.asarray(sym.active_symmetry_rows), spinor_action=sym.spinor_action)
 
 
 def _glide_fixture(mesh, rng, ns, *, translated_anti=False):
@@ -127,7 +128,8 @@ def _glide_fixture(mesh, rng, ns, *, translated_anti=False):
     return dict(plan=plan, fft_grid=fft_grid, kgrid=kgrid, cent_flat=cent_flat,
                 psi_parent=psi_parent, kfull=kfrac, ops=ops, tnp=tnp,
                 band_chunks=((0, nb),), left=(0, 5), right=(2, 8), b_target=4,
-                r_s_target=6, tile_width=16)
+                r_s_target=6, tile_width=16,
+                rows=np.arange(4, dtype=np.int32), spinor_action=spinor_action)
 
 
 def _children(fx):
