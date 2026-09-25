@@ -10,7 +10,7 @@ the shim is the gate that the migration is complete.
 
 Each process reads/writes its local shard directly to a hyperslab of the
 shared HDF5 file via MPI-IO — no gather through rank 0.  See
-``src/ffi/AGENTS.md`` for required environment and ``src/ffi/PORTING.md``
+``docs/building_ffi.md`` for the build and ``docs/installation/ffi-native-libs.md``
 for per-cluster setup.
 
 Section docstrings from the merged modules follow inline.

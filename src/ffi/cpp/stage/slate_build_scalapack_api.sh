@@ -15,7 +15,7 @@
 # SLATE's overlay; a guard whose failing case cannot be produced is void
 # (wk_REL/README.md §5 lesson 1), and this script produces it.
 #
-# It is ALSO the measurement behind PORTING.md §0's "SLATE's own optional
+# It is ALSO the measurement behind docs/dev/linalg_ffi.md ("SLATE's own optional
 # libslate_scalapack_api" row.  Run `nm -D` on the artifact and you get, for
 # LORRAX's eleven ScaLAPACK/BLACS names (SLATE v2025.05.28, measured
 # 2026-07-31):
@@ -155,7 +155,7 @@ for s in pzheevd_ pdsyevd_ pzgetrf_ pdgetrf_ pzgetrs_ pdgetrs_; do
 done
 for s in numroc_ descinit_ Csys2blacs_handle Cblacs_gridinit Cblacs_gridinfo; do
     if grep -qE "^[0-9a-f]+ [TWBDVi] $s\$" <<< "$DYN"; then
-        echo "  DEFINED  $s  <- UNEXPECTED: upstream drift, re-read PORTING.md §0"; bad=1
+        echo "  DEFINED  $s  <- UNEXPECTED: upstream drift, re-read docs/dev/linalg_ffi.md"; bad=1
     elif grep -qE "^ +U $s\$" <<< "$DYN"; then echo "  UNDEF    $s  (the overlay CALLS it)"
     else echo "  absent   $s"; fi
 done

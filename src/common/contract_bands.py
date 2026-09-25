@@ -324,8 +324,8 @@ def split_spin_centroid(x, axis: int, spin_size: int, centroid_size: int):
 # ---------------------------------------------------------------------------
 # The dial's grammar, platform resolution, capability probe, announcements
 # and refusals are the microservice's (``src/ffi/gemm.py``, on the
-# shared ``ffi.gate.Gate``); its ``ffi_call`` is there too, per
-# ``src/ffi/AGENTS.md:149-150``.  This module keeps only the two things that
+# shared ``ffi.gate.Gate``); its ``ffi_call`` is there too.  This module keeps
+# only the two things that
 # are genuinely ITS policy and cannot live in a GEMM service: WHICH
 # contraction is routed (the large right one, never the left dots), and the
 # ``extra="minor"`` structural exclusion, which is a fact about this

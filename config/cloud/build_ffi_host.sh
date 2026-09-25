@@ -6,7 +6,7 @@
 # scalapack (distro netlib libscalapack-openmpi — exports all eleven required
 # symbols including the C-BLACS interface, measured 2026-08-26), and the
 # CBLAS GEMM handlers (distro OpenBLAS).  SLATE stays OFF (no SLATE install);
-# mklfft self-disables (DFTI is Intel-only, src/ffi/PORTING.md §0) and the
+# the FFTW3-ABI host FFT binds its engine at run time (docs/architecture/ffi_layout.md §3c) and the
 # XLA FFT lowering stands.
 #
 # Extra apt prerequisites beyond setup_env.sh's list:

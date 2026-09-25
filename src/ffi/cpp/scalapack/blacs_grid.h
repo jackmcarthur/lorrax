@@ -421,7 +421,7 @@ inline std::string scalapack_slate_api_refusal(const char* op,
           "covers a non-converged eigh.  (3) SLATE's heev additionally "
           "requires a SQUARE process grid and refuses a 4x1 outright.  "
           "Fix: drop it from LD_PRELOAD / the link line.  The route to "
-          "making it work is src/ffi/PORTING.md §0b.  To measure it anyway, "
+          "making it work is docs/dev/linalg_ffi.md.  To measure it anyway, "
           "set LORRAX_SCALAPACK_ALLOW_SLATE_API=1.";
 }
 

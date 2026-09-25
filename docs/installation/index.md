@@ -16,7 +16,7 @@ pins; [ffi_layout.md](../architecture/ffi_layout.md) owns the native design.
 |---|---|---|
 | NERSC Perlmutter (A100, CUDA 13.2, JAX 0.9.1) | the `lorrax_A` base module, which supplies the runtime and one sealed FFI bundle; launch with `lx` | [Perlmutter](perlmutter.md) |
 | TACC Frontera (CPU) | build the host leg with `config/frontera/build_ffi_host.sh` | [Frontera](../environment/machines/frontera.md), `config/frontera/README.md` |
-| another site | build both legs from the stage scripts and seal them | [Building the FFI libraries](../building_ffi.md), [FFI native libraries](ffi-native-libs.md), `src/ffi/PORTING.md` |
+| another site | build both legs from the stage scripts and seal them | [Building the FFI libraries](../building_ffi.md), [FFI native libraries](ffi-native-libs.md) |
 
 ## Startup refusals and their fix
 

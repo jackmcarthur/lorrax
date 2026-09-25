@@ -6,6 +6,15 @@ first: it owns the verify contract, the sealing step and the porting levers.
 None of these dependencies are declared in `pyproject.toml` except
 `nvidia-mathdx`.
 
+| dependency | minimum |
+|---|---|
+| NVIDIA GPU | sm_80 (the CUDA leg's nvcc TUs carry SASS through sm_120) |
+| CUDA toolkit | 13.0; the library's CUDA major must match the JAX wheel's |
+| JAX and jaxlib | 0.9.x, one generation (`pyproject.toml`) |
+| cuSOLVERMp | 0.7 (NCCL-native); 0.8 and later need NCCL 2.27 |
+| parallel HDF5 | 1.12 |
+| nvidia-mathdx | 25.6.0 (the wheel; not a build dependency) |
+
 ## 1. cuSOLVERMp and cuBLASMp (CUDA leg)
 
 Stage scripts, one per source:
@@ -39,8 +48,9 @@ The host leg must link the same HDF5 SOVERSION the runtime provides (GATE 7).
 
 Build SLATE from source; BLAS++ and LAPACK++ install under the same prefix. The
 host leg needs a `gpu_backend=none` install (`LORRAX_SLATE_HOST_INSTALL_DIR`,
-default `$HOME/software/slate_builds/cpu/install`). The CUDA leg needs a
-`gpu_backend=cuda` install (`LORRAX_SLATE_INSTALL_DIR`). On a Cray PE,
+default `$HOME/software/slate_builds/cpu/install`). The CUDA leg builds
+without SLATE (the `lorrax_A` bundle has none); a `gpu_backend=cuda` install
+at `LORRAX_SLATE_INSTALL_DIR` adds its CUDA handlers. On a Cray PE,
 `src/ffi/cpp/stage/slate_build_perlmutter.sh cpu|gpu` builds both
 reproducibly. Elsewhere:
 
@@ -103,5 +113,5 @@ options. Then seal the two legs
 
 ## See also
 
-- `src/ffi/PORTING.md`: the FFI porting checklist.
-- `src/ffi/AGENTS.md`: the FFI subpackage entry points.
+- [Kernel catalog](../architecture/ffi_layout.md#kernel-catalog): every
+  target, its source file, door, selection rule and gate.
