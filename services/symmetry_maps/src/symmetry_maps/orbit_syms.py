@@ -22,6 +22,7 @@ for the canonical example.
 from __future__ import annotations
 
 import dataclasses
+import functools
 import hashlib
 
 import numpy as np
@@ -1899,7 +1900,7 @@ def project_polar_fft_field(field, sym) -> PolarFFTFieldProjection:
             f"{int(grid_action_numerator[row, out_axis, in_axis])} is not "
             f"divisible by N[{in_axis}]={int(fft_grid[in_axis])}.")
 
-    pullback = fft_grid_pullback_perm(
+    pullback = fft_grid_pullback_cached(
         spatial, translations[:n_spatial], fft_grid, validate=True)
     common_denominator = int(np.lcm.reduce(fft_grid))
     tau_common = (
@@ -2190,6 +2191,34 @@ def fft_grid_pullback_perm(
                 )
 
     return sym_perm.astype(np.int32)
+
+
+@functools.lru_cache(maxsize=4)
+def _fft_grid_pullback_memo(matrices, matrices_shape, translations,
+                            translations_shape, grid, validate):
+    table = fft_grid_pullback_perm(
+        np.frombuffer(matrices, dtype=np.int64).reshape(matrices_shape),
+        np.frombuffer(translations, dtype=np.float64).reshape(translations_shape),
+        np.asarray(grid, dtype=np.int64), validate=validate)
+    table.flags.writeable = False
+    return table
+
+
+def fft_grid_pullback_cached(sym_matrices, translations, fft_grid, *,
+                             validate: bool = True) -> np.ndarray:
+    """:func:`fft_grid_pullback_perm`, memoised on its exact inputs; READ-ONLY.
+
+    The table depends only on the operations and the grid, and every
+    self-consistent map asks for it again (scalar density and the polar
+    current projection).  Keyed on the int64 matrices, float64 translations
+    and grid by content, so a hit returns the very table a rebuild would.
+    """
+    matrices = np.ascontiguousarray(sym_matrices, dtype=np.int64)
+    taus = np.ascontiguousarray(translations, dtype=np.float64)
+    grid = tuple(int(v) for v in np.asarray(fft_grid).reshape(-1))
+    return _fft_grid_pullback_memo(
+        matrices.tobytes(), matrices.shape, taus.tobytes(), taus.shape,
+        grid, bool(validate))
 
 
 # ─────────────────────────────────────────────────────────────────────────
