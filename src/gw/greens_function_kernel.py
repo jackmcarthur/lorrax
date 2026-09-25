@@ -16,12 +16,14 @@ def _face_band_gather_product(A, B, mesh, phases, band_range, n_full=None):
     ``P(None,'x','y')``.  ``w`` is the phase row, zero outside the per-row
     ``band_range``.  ``distrib_la.panel_matmul`` all-gathers the band panels
     (A over y, B over x) and multiplies them locally into the rank's own
-    output tile, so no reduction follows.  The gathered panels are bounded
-    by one full-k Green tile, ``16·N_k·(M/p_x)·(N/p_y)`` bytes (``N_k =
-    n_full``, the parents' full zone; ``nq`` when the faces are already at
-    full k), the unit the GW feasibility floor is counted in: one full band
-    gather whenever that holds the whole band extent, streamed chunks
-    otherwise.
+    output tile, so no reduction follows.  Every Green-building stage
+    reserves one full-k Green tile, ``16·N_k·(M/p_x)·(N/p_y)`` bytes
+    (``N_k = n_full``, the parents' full zone; ``nq`` when the faces are
+    already at full k), for these transient panels, so the panel count is
+    derived from that reservation: one panel, the complete band extent
+    (every band on every rank, for this call only), when it fits; otherwise
+    interleaved band chunks, two live at a time (one prefetched), sized so
+    that pair fits the tile.  Nothing band-complete outlives the call.
     """
     from distrib_la import panel_matmul
 

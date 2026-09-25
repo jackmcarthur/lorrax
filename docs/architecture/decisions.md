@@ -24,6 +24,13 @@ that (owner; sandbox `TASTE.md` 96).
   centroid families. Canonical files are processor-grid independent and read
   into these faces. `low_mem_bands` refuses by name. An explicit dense `Gij`
   operand refuses (`GATE explicit_gij_unported`).
+* **Band contractions gather panels per call.** No band-complete ψ copy
+  outlives one contraction. A Green build reserves one full-k Green tile for
+  its gathered band panels and takes one panel, the complete band extent,
+  when it fits, interleaved band chunks otherwise; the Σ projector reshards
+  its projected bands for the call. The post-fit band-complete view and its
+  `4·G_tile` admission are gone, so no resident copy competes with the GN
+  fit, the GN tail or a second (SC) ψ bundle.
 * **Spin pairs always stream for `n_s > 1`.** The step-occupation χ₀ with
   the charge vertex, Σ_x, the Coulomb hole and Σ_c(τ) build one `(a, b)`
   spinor block of the Green at a time at full k, whatever the budget. The

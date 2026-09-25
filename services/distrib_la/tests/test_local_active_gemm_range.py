@@ -1,8 +1,8 @@
 """Exact active-band ranges for the platform-independent local GEMM plan.
 
 These cells run both on a four-device emulated CPU mesh and on a real
-four-process CUDA mesh.  ``low_mem_bands=false`` uses this axis-layout
-contraction on GPU, while the same pure-JAX kernel is the planned
+four-process CUDA mesh.  A spin-pair stream's band-complete copies use
+this axis-layout contraction on GPU, while the same pure-JAX kernel is the planned
 active-range implementation available on CPU.  The distributed face plan
 remains a CUDA/cuBLASMp service and is covered separately.
 """
