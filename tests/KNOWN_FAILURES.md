@@ -51,7 +51,6 @@ do not implicitly suppress tests.
 {"nodeid":"tests/test_dft_gauge_vertices.py::test_icl_kminusq_jet_reuses_uniform_current_and_contact_exactly","reason":"finite-q jet does not exactly reuse the uniform current/contact payload","owner":"GW/head"}
 {"nodeid":"tests/test_exciton_bands_refit_window.py::test_the_refusal_names_the_window_and_the_basis_not_the_tolerance","reason":"the refusal text no longer names the required orthonormality condition","owner":"BSE/exciton-bands"}
 {"nodeid":"tests/test_ff_compute_mode.py::test_no_module_dispatches_on_the_mode_through_a_bare_else","reason":"compute-mode exhaustiveness/source-documentation contract is violated","owner":"GW/config"}
-{"nodeid":"tests/test_gw_jax_regression.py::test_gnppm_matches_reference","reason":"frozen GW reference differs from the current computed result","owner":"GW/physics"}
 {"nodeid":"tests/test_invariance_gates.py::test_fixed_point_frozen_qp_rotations","reason":"restart/IBZ/fixed-point invariance remains outside its pinned contract","owner":"GW/physics"}
 {"nodeid":"tests/test_invariance_gates.py::test_restart_equals_fresh","reason":"restart/IBZ/fixed-point invariance remains outside its pinned contract","owner":"GW/physics"}
 {"nodeid":"tests/test_minimax_beta_selector.py::test_a_refused_request_is_byte_identical_to_the_runtime_solve","reason":"runtime minimax refusal and offline solve are not byte-identical","owner":"minimax/quadrature"}
