@@ -169,7 +169,8 @@ struct PlaneView {                      // plane pass: k in plane kx only
 // Stage columns [col0, col0 + tr) into the bank.  A Load with kDirect writes the tile itself,
 // block-cooperatively: ld.direct(view, k0, k1, col0, width, ncols) sets view(k, j) for k in
 // [k0, k1) and j < width, zero where col0 + j >= ncols (a gathered, mixed load such as the
-// Green unfold's U G U^dagger over a spin group; no cp.async).  Otherwise element (k, col)
+// Green unfold's U G U^dagger over a spin group, which may stage by cp.async and finish in place
+// with its own barriers; every thread of the block calls it).  Otherwise element (k, col)
 // comes from ld.stage(k, col) (a global pointer) by cp.async, columns past ncols zero; then,
 // when the Load has a finish step, bank = ld.finish(k, col, bank) in place.  Consecutive
 // threads take consecutive columns.  Every Load declares kDirect and kFinish.
@@ -218,10 +219,11 @@ __device__ void mid_tile(C* bank, long long col0, long long ncols, const Mid& mi
 }
 
 // Group Mid on the resident tile: GROUP consecutive columns form one group (TR % GROUP == 0; the
-// plan's tr counts groups, so a tile never splits one).  One thread per (group, k) loads the
-// group's GROUP values into vals[], calls mid.group(k, g, vals) (g = the group's global index)
-// which rewrites vals in place, and stores all GROUP back: a Mid that mixes a spin group, or
-// one that reduces it into vals[0] (the Store then skips the other columns).
+// plan's tr counts groups, so a tile never splits one).  One thread per (group, k), consecutive
+// threads on consecutive groups, calls mid.group(k, g, get) (g = the group's global index) with
+// get(q) a reference to the group's column q at k in the bank: the Mid reads what it needs when
+// it needs it (no GROUP-wide register array) and writes what it changes, e.g. a spin-group mix,
+// or a reduction that leaves the tile (mode 11 accumulates chi_R).
 template <int NX, int NY, int NZ, int TR, int GROUP, class C, class Mid>
 __device__ void mid_group_tile(C* bank, long long col0, long long ncols, const Mid& mid) {
     static_assert(TR % GROUP == 0, "a tile holds whole groups");
@@ -230,12 +232,8 @@ __device__ void mid_group_tile(C* bank, long long col0, long long ncols, const M
     for (int i = threadIdx.x; i < ng * G::NK; i += blockDim.x) {
         const int g = i % ng, k = i / ng;
         if (col0 + g * GROUP >= ncols) continue;
-        C vals[GROUP];
-#pragma unroll
-        for (int q = 0; q < GROUP; ++q) vals[q] = bank[(g * GROUP + q) * G::RS + G::at(k)];
-        mid.group(k, (col0 + g * GROUP) / GROUP, vals);
-#pragma unroll
-        for (int q = 0; q < GROUP; ++q) bank[(g * GROUP + q) * G::RS + G::at(k)] = vals[q];
+        mid.group(k, (col0 + g * GROUP) / GROUP,
+                  [&](int q) -> C& { return bank[(g * GROUP + q) * G::RS + G::at(k)]; });
     }
     __syncthreads();
 }
