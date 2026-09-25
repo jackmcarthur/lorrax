@@ -872,12 +872,22 @@ def _census_scalars(chi, w, w_even):
                       mx(w - w.T)/mx(w)])
 
 
-@jax.jit
 def _reciprocity_scalars(value):
     """``max|W - W^T| / max|W|`` for each sample of one parent's batch."""
-    defect = jnp.max(jnp.abs(value - jnp.swapaxes(value, -1, -2)), axis=(-2, -1))
-    scale = jnp.max(jnp.abs(value), axis=(-2, -1))
-    return defect / jnp.where(scale > 0, scale, 1)
+    from common.collectives import xy_tile_mesh
+    return _reciprocity_scalars_kernel(xy_tile_mesh(value))(value)
+
+
+@lru_cache(maxsize=None)
+def _reciprocity_scalars_kernel(mesh):
+    from common.collectives import transpose_xy
+
+    @jax.jit
+    def kernel(value):
+        defect = jnp.max(jnp.abs(value - transpose_xy(value, mesh)), axis=(-2, -1))
+        scale = jnp.max(jnp.abs(value), axis=(-2, -1))
+        return defect / jnp.where(scale > 0, scale, 1)
+    return kernel
 
 
 def _reciprocity_census(receipt, value, z_batch, q_full, parent, meta):
@@ -932,7 +942,9 @@ def _tr_odd_census(receipt, solve_value, h, chi, value, z, q_full):
     names = ("chi_odd_max_rel", "chi_odd_fro_rel", "chi_hermiticity_rel",
              "w_hermiticity_rel", "w_even_route_hermiticity_rel", "w_transpose_rel")
     # The Dyson owner requires face-sharded [1,n,n] operands.
-    symmetric = jax.jit(lambda c: 0.5*(c + jnp.swapaxes(c, -1, -2)),
+    from common.collectives import transpose_xy, xy_tile_mesh
+    mesh = xy_tile_mesh(chi)
+    symmetric = jax.jit(lambda c: 0.5*(c + transpose_xy(c, mesh)),
                         out_shardings=h.sharding)
     for s in imaginary.tolist():
         sym = symmetric(chi[s:s+1])

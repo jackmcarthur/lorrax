@@ -578,7 +578,8 @@ def _solve_wc(
             # The ordered sweep supplies W(-conj(z)) in the upper half
             # plane.  Causality gives W(-z)=W(-conj(z))^dagger.  This is an
             # independently sampled partner, not a Hermitisation of W(z).
-            Wc_negative = jnp.conj(jnp.swapaxes(W_reflected - V, -1, -2))
+            from common.collectives import transpose_xy
+            Wc_negative = jnp.conj(transpose_xy(W_reflected - V, mesh_xy))
             Wc_negative = _to_store_order(jax.lax.with_sharding_constraint(
                 Wc_negative,
                 NamedSharding(mesh_xy, P(None, "x", "y"))), meta)

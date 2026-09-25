@@ -164,8 +164,9 @@ def synthesize_shared_pole_parents(
     # Both faces store the same physical b. Thus (b d b†)^T = b* d b^T
     # even for complex d: transpose the all-mesh operator, never conjugate
     # its causal phase or contract the same pole columns a second time.
+    from common.collectives import transpose_xy
     transposed = jax.lax.with_sharding_constraint(
-        jnp.swapaxes(plus, -1, -2), NamedSharding(mesh_xy, P(None, "x", "y")))
+        transpose_xy(plus, mesh_xy), NamedSharding(mesh_xy, P(None, "x", "y")))
     return plus, transposed
 
 
@@ -206,7 +207,8 @@ def shared_pole_hole_kernel(mesh_xy):
     W_+ gathered at -q on the replicated q axis and transposed in its endpoint
     faces. No residue contraction is repeated; q = -q rows give W_+(q)^T.
     """
-    return jax.jit(lambda w_full, minus_q: jnp.swapaxes(w_full[minus_q], -1, -2),
+    from common.collectives import transpose_xy
+    return jax.jit(lambda w_full, minus_q: transpose_xy(w_full[minus_q], mesh_xy),
                    out_shardings=NamedSharding(mesh_xy, P(None, "x", "y")))
 
 
@@ -241,8 +243,10 @@ def shared_pole_even_part_kernel(mesh_xy, *, exclude_q0):
     side, W^even_+(-q)^T, is the same matrix, so one full-q tile serves both branches. ``exclude_q0``
     keeps the ordered W at q = 0 (canonical row 0): W_+(0) for conduction windows, W_+(0)^T for valence.
     """
+    from common.collectives import transpose_xy
+
     def even(w_full, minus_q, valence):
-        mirrored = jnp.swapaxes(w_full[minus_q], -1, -2)
+        mirrored = transpose_xy(w_full[minus_q], mesh_xy)
         half = 0.5 * (w_full + mirrored)
         if not exclude_q0:
             return half
@@ -379,8 +383,9 @@ def _shared_pole_routed_synthesis(
     # averaging the parent before unfolding. This avoids enlarging the
     # routed factors by a symmetry axis. Both operator orientations remain
     # distributed over the complete mesh, including the transpose exchange.
+    from common.collectives import transpose_xy
     transposed = jax.lax.with_sharding_constraint(
-        jnp.swapaxes(plus, -1, -2), NamedSharding(mesh_xy, P(None, "x", "y")))
+        transpose_xy(plus, mesh_xy), NamedSharding(mesh_xy, P(None, "x", "y")))
     return realize(plus, transposed)[0]
 
 

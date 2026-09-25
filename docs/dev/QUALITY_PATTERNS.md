@@ -49,6 +49,17 @@ distributed kernel lands with its collective table. Make a constraint
 structural (slice inside `shard_map`, where the partitioner cannot hoist)
 rather than fighting the optimizer.
 
+**Transpose a 2-D-tiled matrix with `common.collectives.transpose_xy`, never
+`swapaxes`.** A `swapaxes` of a `P(..., 'x', 'y')` operand is a collective
+permute only while a jit pins its result back to `P(..., 'x', 'y')`. Eagerly
+the result is relabelled `P(..., 'y', 'x')` and the next binary op with the
+original all-gathers both into a replicated output; inside an unconstrained
+expression (`max|v - v^T|`) GSPMD all-gathers too. The SC eigh's eager
+hermitisation held four whole `(n_k, n_b, n_b)` stacks per device that way.
+`transpose_xy` sends each transposed tile to its transpose partner, one
+collective permute whose bytes fall as 1/P, whatever surrounds it; it moves
+values, so the result is bitwise the same.
+
 ## 5. Hidden framework cost: the stack below has unpriced O(P) costs
 
 `device_put` onto a multi-process sharding all-gathers to assert equality
