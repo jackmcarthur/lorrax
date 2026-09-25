@@ -53,8 +53,7 @@ def _run(conv, A, C, At=None, Ct=None):
     return conv.strip(X)
 
 
-def random_case(ns, *, seed=0):
-    kgrid, fft_grid = (2, 2, 1), (6, 5, 5)
+def random_case(ns, *, seed=0, kgrid=(2, 2, 1), fft_grid=(6, 5, 5)):
     kfrac = cases.kgrid_frac(kgrid)
     sph, ngk = cases.spheres(kfrac, np.eye(3), 1.3)
     rng = np.random.default_rng(seed + ns)
@@ -117,6 +116,19 @@ def test_collective_census():
     assert census["final"] == {"all-to-all": 2}, census
     for k in ("slab left", "slab right", "expand left", "expand right"):
         assert census[k] == {"all-to-all": 1}, census
+
+
+def test_recentred_representatives():
+    """k in [0, 1) on a 3x1x2 grid (2/3 recentres to -1/3 inside the plan): still the reference."""
+    from gw.mixed_basis_pair_convolution import SphereSet, SphereTransport
+    c = random_case(2, kgrid=(3, 1, 2), fft_grid=(7, 6, 6))
+    assert np.any(np.rint(c["kfrac"]) != 0)
+    ref, _ = _references(c)
+    tr = SphereTransport.identity(SphereSet(c["sph"], c["ngk"], c["kfrac"]), 2)
+    for backend in ("xla", "router"):
+        conv = _conv(_mesh(4), c["kgrid"], c["fft_grid"], c["sph"], c["ngk"], c["kfrac"], c["out"],
+                     transport=tr, backend=backend, budget_bytes=int(1e10))
+        assert cases.rel(_run(conv, c["A"], c["C"]), ref) <= TOL
 
 
 def test_rolled_transport_misses():

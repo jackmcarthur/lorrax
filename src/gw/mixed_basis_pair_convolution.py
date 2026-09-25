@@ -131,6 +131,14 @@ class SphereSet:
         live = self.live()
         return tuple(np.unique(self.gvecs[..., a][live]) for a in range(3))
 
+    def recentred(self) -> "SphereSet":
+        """The same spheres with each row's k taken in [-½, ½) per axis (``k → k − n``,
+        ``G → G + n``, n = round(k)): ``k + G`` and every Bloch factor are unchanged, and the
+        union of the rows' spheres is as tight as one sphere allows (a k in [0, 1) widens it
+        by one plane per axis: Fe 8³ at 70 Ry, 14 against 13)."""
+        n = np.rint(self.frac).astype(np.int64)
+        return SphereSet(self.gvecs + n[:, None, :], self.ngk, self.frac - n)
+
     def box_cells(self, support) -> np.ndarray:
         """``(n, width)`` int64: each live slot's flat cell in the ``support`` box, −1 on a pad slot."""
         pos = [np.searchsorted(s, self.gvecs[..., a]) for a, s in enumerate(support)]
@@ -444,6 +452,11 @@ class MixedBasisPairConvolution:
         if backend not in _BACKENDS:
             raise ValueError(f"MixedBasisPairConvolution: backend must be one of {_BACKENDS}, "
                              f"got {backend!r}")
+        # Internally every sphere is recentred (k in [-½, ½)): the union boxes, and with
+        # them the box transforms' supports, are as small as the spheres allow.
+        left = PairOperand(left.sphere.recentred(), left.transport)
+        right = PairOperand(right.sphere.recentred(), right.transport)
+        out = out.recentred()
         self.mesh = mesh
         self.px, self.py = int(mesh.shape["x"]), int(mesh.shape["y"])
         self.P = self.px * self.py
