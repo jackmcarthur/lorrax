@@ -662,7 +662,8 @@ The modes of the one handler file. The target column is the string
   from the k-grid and the device's opt-in shared memory. Single pass: `tr`
   whole pairs per block in a padded bank (odd z-line and row strides),
   gathered on load through mode 7's typed unfold, the three axis passes
-  (z, y, x) of cuFFTDx thread FFTs, the spin trace, one accumulate. Split arm, when fewer pairs fit: plane passes over
+  (z, y, x) of cuFFTDx thread FFTs, then the spin trace and its accumulation
+  into χ_R in the group Mid, one thread per (k, pair). Split arm, when fewer pairs fit: plane passes over
   `(k_y, k_z)` on column tiles, then an R-space x-pencil pass for each spin
   group, chunked over pairs through an `(N_k, chunk·2ns²)` intermediate that
   XLA's scratch allocator grants (at most `scratch_bytes`; the door's default
@@ -672,7 +673,10 @@ The modes of the one handler file. The target column is the string
   one write and one read of its intermediate). Modes 6–9 and 11 read the
   producer's own buffer (the plane FFT output; the parent Green or the wedge,
   `n_parent/N_k` of the full-k size), so the phased, split or unfolded copy
-  that modes 1 and 2 would need is never written. The unfold tables (`lsrc`,
+  that modes 1 and 2 would need is never written. Their gather still reads
+  one full tile per full k: the parent tiles are `n_parent/N_k` of the
+  full-k footprint, not of the traffic (mode 11 on the 6×6 bispinor reads
+  47 GB per τ node against 8.6 GB of parent Greens). The unfold tables (`lsrc`,
   `rsrc` int32, `mph`, `nph` complex128, each `(N_k, μ·ns)`) are closed-over
   host constants sliced per rank. Apart from mode 11's intermediate, the
   kernels allocate no device workspace beyond dynamic shared memory.

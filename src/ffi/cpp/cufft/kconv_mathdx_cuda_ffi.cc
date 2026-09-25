@@ -1177,25 +1177,31 @@ __device__ __forceinline__ lrx_c2 lrx_chi_value(const Get& g, double si) {
     return v;
 }
 
-struct ChiMid {                                // single arm: reduce the group into vals[0]
-    double si;
-    __device__ void group(int, long long, lrx_c2 (&vals)[GRP]) const {
-        vals[0] = lrx_chi_value([&](int q) { return vals[q]; }, si);
+// acc[o, k, pair] += alpha[o] * v for every output o.  acc is (n_out, nk, mx, my) and a pair is
+// x*my + y, so the element sits at (o*nk + k)*pairs + pair.
+__device__ __forceinline__ void lrx_chi_acc(const ChiArgs& a, int k, long long pr, lrx_c2 v) {
+    for (int o = 0; o < a.n_out; ++o) {
+        lrx_c2* e = a.acc + ((long long)o * NK + k) * a.pairs + pr;
+        const lrx_c2 p = lrx_mul_xla(a.alpha[o], v);
+        *e = {__dadd_rn(e->x, p.x), __dadd_rn(e->y, p.y)};
+    }
+}
+
+// Single arm: the group Mid reduces the pair's GRP transformed values and accumulates them.
+// mid_group_tile runs one thread per (k, pair) of the tile, so every thread of the block takes
+// part in the accumulation (a column-wise Store would leave it to the pairs' leading columns).
+struct ChiMid {
+    const ChiArgs* a;
+    __device__ void group(int k, long long g, lrx_c2 (&vals)[GRP]) const {
+        lrx_chi_acc(*a, k, a->p0 + g, lrx_chi_value([&](int q) { return vals[q]; }, a->si));
     }
 };
 
-struct ChiStore {                              // acc[o, k, pair] += alpha[o] * v, leading column only
+struct ChiStore {                              // split arm: the pair's leading column accumulates
     const ChiArgs* a;
-    long long nk;
     __device__ void put(int k, long long col, lrx_c2 v) const {
         if (col % GRP) return;
-        const long long pr = a->p0 + col / GRP;
-        const long long xx = pr / a->my, yy = pr - xx * a->my;
-        for (int o = 0; o < a->n_out; ++o) {
-            lrx_c2* e = a->acc + ((o * nk + k) * (a->pairs / a->my) + xx) * a->my + yy;
-            const lrx_c2 p = lrx_mul_xla(a->alpha[o], v);
-            *e = {__dadd_rn(e->x, p.x), __dadd_rn(e->y, p.y)};
-        }
+        lrx_chi_acc(*a, k, a->p0 + col / GRP, v);
     }
 };
 
@@ -1225,17 +1231,16 @@ extern "C" __global__ void __launch_bounds__(LRX_THREADS) lrx_kconv(ChiArgs a, U
     using namespace cufftdx;
     const long long ncols = a.npairs * GRP;
     const ChiLoad ld{&a, &t};
-    const ChiStore st{&a, (long long)NK};
 #if LRX_ARM == 0
     (void)phase;
-    const ChiMid mid{a.si};
+    const ChiMid mid{&a};
     for (long long col0 = (long long)blockIdx.x * TRC; col0 < ncols; col0 += (long long)gridDim.x * TRC) {
         lrx_kbox::stage_tile<NX, NY, NZ, TRC>(sm, col0, ncols, ld);
         lrx_kbox::transform3<NX, NY, NZ, TRC, LRX_SM, fft_direction::inverse>(sm);
         lrx_kbox::mid_group_tile<NX, NY, NZ, TRC, GRP>(sm, col0, ncols, mid);
-        lrx_kbox::store_tile<NX, NY, NZ, TRC>(sm, col0, ncols, st);
     }
 #else
+    const ChiStore st{&a};
     if (phase == 0) {
         lrx_kbox::plane_pass<NX, NY, NZ, LRX_SM, fft_direction::inverse, TRC>(
             sm, ncols, ld, lrx_kbox::Plain<lrx_c2>{a.y, ncols});
