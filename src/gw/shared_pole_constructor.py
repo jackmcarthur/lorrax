@@ -94,7 +94,8 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
         from common.staged_reshard import face_to_batch_reshard
         from gw.shared_pole_local import (batch_to_face, canonical_factors, check_round, face_rows,
                                           own_extent_receipts, parent_rounds, partner_realization,
-                                          reduce_round, round_tables, grow_round)
+                                          reduce_round, round_tables, grow_round,
+                                          carrier_history)
         from gw.shared_pole_recipe import (
             build_construction_row, charge4_gates, construction_receipt,
             shared_real_pole_gates_v1_r3b as gates,
@@ -261,28 +262,50 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
             del samples, exchange, qi
         with timing.section("spole.reduction_admission"):
             infinity_counts = [int(v.shape[-1]) for v in round_infinity_values]
-            # Grow-only carriers: later rounds and SC maps reuse the round program.
+            # Reuse widths only when the current ledger admits them.  The
+            # table is host metadata, so its side is known before any panel
+            # padding is allocated.
             round_key = ("scalar", logical_n, ordered, odd_moments)
-            round_states, infinity = grow_round(round_key, round_states, infinity)
-            tables = round_tables(round_counts, [st[1].shape[-1] for st in round_states],
-                                  [st[0] for st in round_states], infinity_counts, infinity[0].shape[-1],
-                                  column_extent=column_extent, ordered=ordered, odd_moments=odd_moments,
-                                  key=round_key)
-            side = int(tables["active"].shape[-1])
-            # Resolve before either reduction program is traced. Local mode
-            # uses the plan's pure trace-safe native closure; face mode uses
-            # the public eager plan through the whole-mesh adapter.
-            local_eigh = budget.eigenplan(side)
-            if execution == 'local' and not distrib_la.fits_local(
-                    local_eigh, "eigh", ((1, side, side),) * 8,
-                    np.complex128, ledger.device_budget_bytes_per_rank):
-                raise ValueError(f"GATE shared_pole_round_capacity: got: pencil side {side} at parents {ids[:real]}; want: eight [side, side] complex blocks and the eigh workspace within {ledger.device_budget_bytes_per_rank} bytes on one device; why: every parent reduces on its own rank")
-            # The reduction envelope already includes this parent's Q/O/dO,
-            # infinity actions, result arrays and sort scratch. Only completed
-            # earlier parents are additional retained storage.
+            history = carrier_history(meta)
             budget.retained_panels = tuple(factors)
             budget.batch_width = ranks if execution == 'local' else real
-            budget.plan(side, phase="reduction")
+            def _tables(widths, infinity_width, reuse):
+                return round_tables(
+                    round_counts, widths, [st[0] for st in round_states],
+                    infinity_counts, infinity_width,
+                    column_extent=column_extent, ordered=ordered,
+                    odd_moments=odd_moments,
+                    key=round_key if reuse else None,
+                    history=history if reuse else None)
+
+            def _preview(widths, infinity_width, reuse):
+                table = _tables(widths, infinity_width, reuse)
+                side = int(table["active"].shape[-1])
+                if execution == 'local' and not distrib_la.fits_local(
+                        budget.eigenplan(side), "eigh", ((1, side, side),) * 8,
+                        np.complex128, ledger.device_budget_bytes_per_rank):
+                    return False
+                return budget.preview(side, phase="reduction")["device_budget_status"] == "PASS"
+
+            def _admit(widths, infinity_width, reuse):
+                table = _tables(widths, infinity_width, reuse)
+                side = int(table["active"].shape[-1])
+                # Resolve before either reduction program is traced. Local
+                # mode's native route still has its own workspace guard.
+                local_eigh = budget.eigenplan(side)
+                if execution == 'local' and not distrib_la.fits_local(
+                        local_eigh, "eigh", ((1, side, side),) * 8,
+                        np.complex128, ledger.device_budget_bytes_per_rank):
+                    raise ValueError(f"GATE shared_pole_round_capacity: got: pencil side {side} at parents {ids[:real]}; want: eight [side, side] complex blocks and the eigh workspace within {ledger.device_budget_bytes_per_rank} bytes on one device; why: every parent reduces on its own rank")
+                budget.plan(side, phase="reduction")
+                if reuse:
+                    extent_key = (round_key, "extent", 2 if ordered else 1, len(widths))
+                    history[extent_key] = (table["order"].shape[1] // (2 if ordered else 1),)
+                return table, side, local_eigh
+
+            round_states, infinity, (tables, side, local_eigh) = grow_round(
+                round_key, round_states, infinity, history=history,
+                preview=_preview, admit=_admit)
         with timing.section("spole.gram_reduction"):
             if execution == 'face':
                 from gw.shared_pole_execution import face_reduce_round

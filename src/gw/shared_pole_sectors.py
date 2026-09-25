@@ -522,7 +522,8 @@ def construct_diagonal_sector_round(samples, moments, meta, config, geometry, *,
     from gw.gw_config import linalg_resolution
     from gw.shared_pole_capacity import ConstructorCapacity
     from gw.shared_pole_directions import _round_kernels,select_round_states,leading_response_directions
-    from gw.shared_pole_local import partner_realization,round_tables,reduce_round,_batch_put,grow_round
+    from gw.shared_pole_local import (partner_realization,round_tables,reduce_round,
+                                      _batch_put,grow_round,carrier_history)
     from gw.shared_pole_recipe import shared_real_pole_v1_r3b
 
     from gw.shared_pole_execution import is_face, face_program, face_reduce_round
@@ -572,25 +573,38 @@ def construct_diagonal_sector_round(samples, moments, meta, config, geometry, *,
     states,counts,roles=select_round_states(samples,recipe,sample_lo=geometry['sample_lo'],
         real=geometry['real'],mesh_xy=mesh_xy,eigh_plan=eig,svd_plan=svd,column_extent=extent,
         logical_n=n,ordered=True,exchange=(geometry['slots'],*action),current_rotation=rotation)
-    # Grow-only carriers: later rounds and SC maps reuse this sector's programs.
+    # Reuse admitted carrier widths across this model's later SC maps.
     round_key=('sector',geometry['sector'],n)
-    states,infinity=grow_round(round_key,states,infinity)
-    tables=round_tables(counts,[s[1].shape[-1] for s in states],[s[0] for s in states],
-        [v.shape[-1] for v in values],infinity[0].shape[-1],column_extent=extent,ordered=True,
-        odd_moments=True,key=round_key)
-    side=tables['active'].shape[-1]
     # The reduction envelope already includes current Q/O/dO and infinity
     # panels. Full sample/moment stacks remain caller-live through this call,
     # so those and earlier-sector outputs are the only additional arrays.
     budget.retained_panels=(*retained,*samples.values(),*moments.values())
+    history=carrier_history(meta)
+    def _tables(widths,infinity_width,reuse):
+        return round_tables(counts,widths,[s[0] for s in states],
+            [v.shape[-1] for v in values],infinity_width,column_extent=extent,
+            ordered=True,odd_moments=True,key=round_key if reuse else None,
+            history=history if reuse else None)
+    def _preview(widths,infinity_width,reuse):
+        table=_tables(widths,infinity_width,reuse)
+        return budget.preview(table['active'].shape[-1],phase='reduction')[
+            'device_budget_status']=='PASS'
+    def _admit(widths,infinity_width,reuse):
+        table=_tables(widths,infinity_width,reuse)
+        side=table['active'].shape[-1]
+        budget.plan(side,phase='reduction')
+        if reuse:
+            history[(round_key,'extent',2,len(widths))]=(table['order'].shape[1]//2,)
+        return table,side
+    states,infinity,(tables,side)=grow_round(
+        round_key,states,infinity,history=history,preview=_preview,admit=_admit)
     from gw.shared_pole_recipe import shared_real_pole_gates_ordered_v1
     gram_keep = shared_real_pole_gates_ordered_v1['normalized_gram_keep']['sector_threshold']
     if execution == 'face':
         reduced=face_reduce_round(states,infinity,tables,real=geometry['real'],mesh=mesh_xy,
             budget=budget,ordered=True,odd_moments=True,keep_budget=recipe['pole_budget'],retain_span=True,
-            gram_keep=gram_keep)
+            gram_keep=gram_keep,admit=False)
     else:
-        budget.plan(side,phase='reduction')
         reduced=reduce_round(states,infinity,tables,real=geometry['real'],mesh_xy=mesh_xy,
             native_eigh=budget.eigenplan(side).native_fn,ordered=True,odd_moments=True,
             keep_budget=recipe['pole_budget'],retain_span=True,gram_keep=gram_keep)
@@ -647,15 +661,13 @@ def construct_cross_sector_round(sectors, samples, moments, meta, config, *,
     # retained pair is square. Keep those two extents distinct in the ledger.
     original_sides = tuple(s['coefficients'].shape[-2] for s in sectors)
     # The compacted span is the round's largest retained count on the extent
-    # ladder, so rounds and SC maps share the compaction and cross-reduction
-    # executables; the extra columns are inactive, as they already are for a
-    # parent below the round's maximum.
+    # ladder.  A wider historical span is optional but the second cross
+    # capacity admission includes actions that do not exist yet at this
+    # point, so only this round's admitted span is used.
     from runtime.padding import ladder_extent
-    from gw.shared_pole_local import grow_only
-    widths = [ladder_extent(int(jnp.max(jnp.sum(s['signed'][2],axis=-1))), s['signed'][2].shape[-1])
+    widths = [min(s['signed'][2].shape[-1],
+                  ladder_extent(int(jnp.max(jnp.sum(s['signed'][2],axis=-1)))))
               for s in sectors]
-    widths = [min(s['signed'][2].shape[-1], w) for s, w in
-              zip(sectors, grow_only(('cross_compact', tuple(s['signed'][2].shape[-1] for s in sectors)), widths))]
     if execution == 'face':
         from runtime.padding import padded_axis
         widths = [padded_axis(width,mesh_xy,name='shared_pole_port',
