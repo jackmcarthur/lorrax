@@ -2354,9 +2354,12 @@ def load_kin_ion_submatrix(
 	Stored dataset is the pristine ``T + V_loc + V_NL`` operator.  Folded
 	Hartree files are rejected by :func:`validate_kin_ion_against_run`.
 
-	The full kin_ion sub-block ``(nk, nb, nb)`` fits comfortably on a single
-	device — it is loaded **fully replicated** on ``mesh`` so the
-	post-self-energy plumbing can operate on replicated arrays uniformly.
+	The kin_ion sub-block ``(nk, nb, nb)`` is loaded **fully replicated** on
+	``mesh`` so the post-self-energy plumbing can operate on replicated
+	arrays uniformly.  That is a replication bounded by the Sigma window
+	(TASTE 1): 16 * nk * nb^2 B per device on the full BZ -- 21 MB at CrI3
+	8x8 (nk 64, nb 144), 137 MB at CrI3 16x16 (256, 183), 33 MB at VI3
+	12x12 (144, 120), 9.2 GB at the nk 144 / nb 2000 envelope point.
 	Goes through :class:`SlabIO` for backend parity with the rest of the
 	GW input stack (``zeta_q.h5``, ``sigma_omega.h5``).
 
