@@ -444,7 +444,7 @@ def _make_cohsex_kernels_face(mesh_xy: Mesh, face_shape, _convolve,
         phases = _occ_diag_full(Gij, s.nb_sigma, nb_full)
         if k_unfold_plan is not None:
             phases = k_unfold_plan.parent_rows(phases)
-        if stream and wfns_g is None:
+        if stream:
             return _pair_sigma(wfns, phases, W_q, 1.0)
         G_occ = build_G(g_mun, g_nmu, phases=phases,
                         real_weights=not jnp.issubdtype(phases.dtype, jnp.complexfloating),
