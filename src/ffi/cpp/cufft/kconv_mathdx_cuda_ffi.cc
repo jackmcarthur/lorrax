@@ -1724,8 +1724,8 @@ using nvrtc::toolkit_include;
 // power of two): most_blocks takes the one that keeps the most blocks resident (mode 11: one
 // transform and a reduction per tile), else the largest (mode 7: two transforms and a store per
 // tile, whose axis passes idle a block below ~256 lines); tp = 0: none fits.  Measured on the
-// 6x6 bispinor harnesses (A100): mode 11 96.6 ms at 1 pair x 4 blocks vs 100.7 at 2 x 2;
-// mode 7 74.6 ms at 2 pairs x 2 blocks vs 80.5 at 1 x 4.
+// 6x6 bispinor harnesses (A100, U2c): mode 11 96.6 ms at 1 pair x 4 blocks vs 100.7 at 2 x 2;
+// mode 7 65.6 ms at 2 pairs x 3 blocks vs 80.5 at 1 x 4.
 struct TilePlan { int tp = 0, blocks = 0; long long smem = 0; std::string err; };
 static TilePlan tile_table_plan(int dev, int tp_max, long long bank_pair, int nk, int ns, int nw,
                                 bool most_blocks) {
