@@ -550,13 +550,13 @@ def test_the_scissor_weight_orderings_hold_on_the_real_class():
 
 
 # ---------------------------------------------------------------------------
-# S3 — the contract sc_iteration._check_kstar_spread depends on
+# S3 — spread_rel's float-and-NaN contract
 # ---------------------------------------------------------------------------
 
 def test_spread_rel_returns_a_float_and_propagates_nan():
-    """S3.  ``sc_iteration.py:780`` is written ``not (spread <= tol)``.
+    """S3.  A caller that refuses on ``not (spread <= tol)`` does so,
 
-    Deliberately, so that NaN REFUSES rather than passing: ``nan > tol`` is
+    deliberately, so that NaN REFUSES rather than passing: ``nan > tol`` is
     False and would let a poisoned operand through.  That only works if
     ``spread_rel`` returns a real float and does not sanitize NaN, on host
     AND device operands — the driver hands it a sharded ``jax.Array``.  The
