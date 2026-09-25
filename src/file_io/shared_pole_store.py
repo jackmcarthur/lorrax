@@ -1474,12 +1474,13 @@ _STATIC_REFERENCE_KIND = "photon_static_contact_v1"
 
 
 def write_static_reference(path, fields, *, header, mesh_xy):
-    """Publish a device-resident map's static contact for later SC maps.
+    """Publish map 0's static contact, the run-wide reference later SC maps freeze.
 
-    A resident bank is released after its constructor, so the three small
-    [1,d,d] contact arrays that later maps freeze are written to their own
-    file with the bank identity, photon layout and centroid digests. Returns
-    the JSON-safe reference ``dict(path, identity, kind, commit)``.
+    Both bank tiers write the three small [1,d,d] contact arrays (48 d^2 bytes)
+    to this file with the bank identity, photon layout and centroid digests, at
+    the run level beside the per-map scratch generations, so retention of those
+    generations never keeps a bank for it. Returns the JSON-safe reference
+    ``dict(path, identity, kind, commit)``.
     """
     record = dict(identity=header["identity"], photon_layout=header["photon_layout"],
                   photon_centroid_digests=header["photon_centroid_digests"],
@@ -1495,25 +1496,31 @@ def write_static_reference(path, fields, *, header, mesh_xy):
                 commit=commit)
 
 
-def read_static_reference(reference, *, n, mesh_xy):
-    """Authenticated static-contact header and (Pi_grid, Drude, TT_contact) of a reference.
+def static_reference_record(reference):
+    """Authenticate a static reference by its committed record; host h5py only.
 
-    ``reference`` is either an initial file bank (``path``, ``identity``) or a
-    record from :func:`write_static_reference`. Returns ``(record, arrays)``;
-    the record carries photon_layout, photon_centroid_digests and ``commit``.
+    Refuses anything but a :func:`write_static_reference` record whose stored
+    identity and commit match ``reference``. Safe on one rank (no collective).
+    """
+    if reference.get("kind") != _STATIC_REFERENCE_KIND:
+        _refuse("photon static reference is not a static-contact record")
+    with h5py.File(reference["path"], "r") as f:
+        raw = f["static_reference_json"][()]
+    record = json.loads(raw.decode() if isinstance(raw, bytes) else str(raw))
+    _check_identity(record["identity"], reference["identity"])
+    if record.get("commit") != reference.get("commit"):
+        _refuse("photon static reference commit mismatch")
+    return record
+
+
+def read_static_reference(reference, *, n, mesh_xy):
+    """Authenticated static-contact record and (Pi_grid, Drude, TT_contact) of a reference.
+
+    COLLECTIVE over ``mesh_xy``. Returns ``(record, arrays)``; the record
+    carries photon_layout, photon_centroid_digests and ``commit``.
     """
     names = ("Pi_grid", "Drude", "TT_contact")
-    if reference.get("kind") == _STATIC_REFERENCE_KIND:
-        with h5py.File(reference["path"], "r") as f:
-            raw = f["static_reference_json"][()]
-        record = json.loads(raw.decode() if isinstance(raw, bytes) else str(raw))
-        _check_identity(record["identity"], reference["identity"])
-        if record.get("commit") != reference.get("commit"):
-            _refuse("photon static reference commit mismatch")
-    else:
-        record = validate_shared_pole_bank(reference["path"],
-            expected_identity=reference["identity"], mesh_xy=mesh_xy, require_complete=True)
-        record = dict(record, commit=record["final_commit"])
+    record = static_reference_record(reference)
     with SlabIO(reference["path"], mode="r", mesh=mesh_xy) as io:
         arrays = tuple(io.read_slab(key, shape=(1, n, n), partition_spec=P(None, "x", "y"),
                                     dtype=np.complex128) for key in names)
