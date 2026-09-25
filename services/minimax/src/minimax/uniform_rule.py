@@ -76,6 +76,7 @@ from __future__ import annotations
 
 import os
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 
 import numpy as np
@@ -89,6 +90,68 @@ __all__ = [
     "UniformRule", "build_uniform_rule", "box_samples",
     "rule_roundoff_amplification", "rule_sup_error",
 ]
+
+
+# ----------------------------------------------------------------- BLAS threads
+#: The thread count every rule build runs its BLAS at, whatever the launch
+#: environment. The crossing fit is a nonlinear least squares with many
+#: certified local solutions, and OpenBLAS sums in a thread-count dependent
+#: order, so the environment chose the rule: CrI3 8x8 val:resonant certified
+#: at 188 nodes with 4 threads and 207 with 16 on one host, and at 8 against
+#: 16 threads a Perlmutter node returned the same count with a different rule
+#: (P2-S, 2026-09-25). 16 is what every Perlmutter GPU rank used before the
+#: pin (``runtime.default_blas_threads``: the 16 physical cores of a rank's
+#: 32-hyperthread mask), so the rules that ran there are unchanged.
+_BLAS_THREADS = 16
+_BLAS_CONTROLS = None
+
+
+def _openblas_controls():
+    """``(get, set)`` for each OpenBLAS in this process; empty if none.
+
+    numpy's and scipy's wheels each bundle one (``scipy_openblas64_`` and
+    ``scipy_openblas``), and the builder calls both. They are found by path
+    in ``/proc/self/maps``, since threadpoolctl is not in the runtime, once
+    per process: both are loaded by the imports above.
+    """
+    global _BLAS_CONTROLS
+    if _BLAS_CONTROLS is None:
+        import ctypes
+        try:
+            with open("/proc/self/maps", encoding="ascii") as maps:
+                paths = sorted({line.split()[-1] for line in maps
+                                if "openblas" in line.rsplit("/", 1)[-1].lower()})
+        except OSError:
+            paths = []
+        controls = []
+        for path in paths:
+            lib = ctypes.CDLL(path)
+            for suffix in ("64_", ""):
+                get = getattr(lib, f"scipy_openblas_get_num_threads{suffix}", None)
+                put = getattr(lib, f"scipy_openblas_set_num_threads{suffix}", None)
+                if get is None or put is None:
+                    get = getattr(lib, f"openblas_get_num_threads{suffix}", None)
+                    put = getattr(lib, f"openblas_set_num_threads{suffix}", None)
+                if get is not None and put is not None:
+                    get.restype, put.argtypes, put.restype = ctypes.c_int, [ctypes.c_int], None
+                    controls.append((get, put))
+                    break
+        _BLAS_CONTROLS = tuple(controls)
+    return _BLAS_CONTROLS
+
+
+@contextmanager
+def _pinned_blas_threads():
+    """Run the enclosed rule build at ``_BLAS_THREADS``, then restore."""
+    controls = _openblas_controls()
+    saved = [get() for get, _put in controls]
+    for _get, put in controls:
+        put(_BLAS_THREADS)
+    try:
+        yield
+    finally:
+        for (_get, put), count in zip(controls, saved):
+            put(count)
 
 
 # ----------------------------------------------------------------- support cloud
@@ -1320,8 +1383,19 @@ def _select_backend(backend, n_start, cloud_size):
     return "jax" if (accelerator and n_start >= 40 and cloud_size >= 2000) else "numpy"
 
 
-def build_uniform_rule(box, eps, *, im_cap=3.0, kappa_cap=1.0e4, trunc=10.0,
-                       reduce=True, relative=None, backend=None, attempts=None):
+def build_uniform_rule(box, eps, **options):
+    """Rule for ``1/d`` on ``box``; see :func:`_build_uniform_rule`.
+
+    Every build runs its BLAS at ``_BLAS_THREADS`` threads, so the rule is a
+    function of the box and ``eps`` on a given machine, not of the launch's
+    thread environment.
+    """
+    with _pinned_blas_threads():
+        return _build_uniform_rule(box, eps, **options)
+
+
+def _build_uniform_rule(box, eps, *, im_cap=3.0, kappa_cap=1.0e4, trunc=10.0,
+                        reduce=True, relative=None, backend=None, attempts=None):
     """Rule for ``1/d`` on ``box = (re_lo, re_hi, im_lo, im_hi)`` with
     ``Im d > 0``.
 
