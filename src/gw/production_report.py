@@ -734,7 +734,11 @@ class GWProductionReport:
         # under gw_jax.sc_driver. Shared finalization and the fenced setup
         # phases below are disjoint from the plan and sweep.
         sigma_total = top_level("gw_jax.sigma", "gw_jax.sc_driver")
-        sigma_plan = outer_prefixed("sigma.rule_plan")
+        # An SC map's W and its Sigma rule refit (nested in the plan) are
+        # their own rows, so an SC table sums to the wall with named stages.
+        sc_w_response = outer_prefixed("sc.w_response")
+        sigma_refit = outer_prefixed("sigma.rule_refit")
+        sigma_plan = outer_prefixed("sigma.rule_plan") - sigma_refit
         sigma_sweep = outer_prefixed("sigma.tau_sweep")
         sigma_details = [
             ("Sigma pending inputs", outer_prefixed("sigma.input_wait")
@@ -747,7 +751,8 @@ class GWProductionReport:
             ("Sigma census", outer_prefixed("sigma.census")),
             ("Sigma finalize + writes", outer_prefixed("gw_jax.dynamic_sigma_finalize")),
         ]
-        sigma_other = max(sigma_total - sigma_plan - sigma_sweep
+        sigma_other = max(sigma_total - sc_w_response - sigma_refit
+                          - sigma_plan - sigma_sweep
                           - sum(value for _, value in sigma_details), 0.0)
 
         stages = [
@@ -767,7 +772,9 @@ class GWProductionReport:
             ("spole other" if spole_rows else "screening support", screening_support),
             ("W persist + q0 head", top_level(
                 "gw_jax.persist_w0", "gw_jax.static_head")),
+            ("SC W response", sc_w_response),
             ("Sigma rule plan", sigma_plan),
+            ("SC Sigma rule refit", sigma_refit),
             *(partition("sigma.tau_sweep", ("tau.",), "Sigma tau")
               if any(r["name"].startswith("tau.") for r in rows)
               else [("Sigma tau sweep", sigma_sweep)]),
