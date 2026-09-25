@@ -709,6 +709,24 @@ The modes of the one handler file. The target column is the string
   group, chunked over pairs through an `(N_k, chunk·2ns²)` intermediate that
   XLA's scratch allocator grants (at most `scratch_bytes`; the door's default
   is one parent-Green tile).
+- **The tile-table load (modes 7 and 11, sm_80+).** Where the bank and its
+  tables fit two or more blocks per SM, mode 11's single arm and mode 7's
+  whole-spin-group load read no table per cell. A persistent grid (the
+  resident blocks) walks tiles of `tp` pairs; each block stages `U_k` and the
+  per-k source rows once, and each tile's `lsrc`/`rsrc` slices, `mph`/`nph`
+  and (mode 7) `W_R` go by cp.async one tile ahead into a second table
+  buffer (`kbox_stage.cuh` `UnfoldTiles` prices the bytes). The gather is one
+  cp.async per cell from shared indices; the finish runs in shared memory,
+  `ns` lanes of one warp per (k, operand spin group): phases and `U g` per
+  column, a warp barrier, `left U†` per row, with the products and order of
+  the register load, so the result is bitwise. `tile_table_plan` picks the
+  tile from device attributes (shared memory per SM, the per-block
+  reservation, the opt-in maximum; the load needs ≤ 64 registers, so shared
+  memory sets residency, at most four blocks): mode 11 the tile that keeps
+  the most blocks resident, mode 7 the largest tile at two or more (its two
+  transforms idle a block below ~256 lines per axis pass). No fit: the
+  register load. An axis pass synchronises only when it ran (a length-1 axis
+  writes nothing).
 - **Cost.** Each transform is `O(rows·N_k log N_k)` flops. HBM traffic is one
   read of each operand and one write of the result (the split arms of modes 8
   and 11 add one write and one read of their intermediate). Modes 6–9 and 11 read the
