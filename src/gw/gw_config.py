@@ -1770,7 +1770,10 @@ _DEFAULTS = {
     # Where a QSGW Sigma(E) evaluation outside the sampled grid reads
     # (owner 2026-09-24): cover (grow the grid over every protected
     # identity), clamp (the nearest grid edge), static (omega = 0).
-    "sigma_out_of_grid": "cover",
+    # static stays the default until cover's growth step is continuous:
+    # on MoS2 3x3 a protected state crossing the grid edge moved its map
+    # output 2.8 eV and stalled the loop (CLAIMS 2725).
+    "sigma_out_of_grid": "static",
     "sigma_w_model": "mpa",
     "sigma_w_accuracy": "production",
     # "" = the shared-pole resolver's own line and imaginary ladders.
@@ -4023,7 +4026,7 @@ class DynamicSigmaConfig:
     #: cache spelling is "auto" (run tmp), "off", or a deck-relative path.
     #: ``sigma_out_of_grid``: cover | clamp | static, the QSGW Sigma(E)
     #: rule outside the sampled grid (``qsgw_utils.sigma_eval_omega``).
-    out_of_grid: str = "cover"
+    out_of_grid: str = "static"
     w_model: str = "mpa"
     w_accuracy: str = "production"
     #: ``sigma_w_support_sites_ev``: "" (default, the shared-pole

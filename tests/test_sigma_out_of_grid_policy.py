@@ -76,12 +76,12 @@ def test_cover_grows_over_every_non_frozen_identity_and_nothing_else():
         np.testing.assert_array_equal(grown, GRID)       # beyond the +9.44 padded top
 
 
-def test_the_deck_key_defaults_to_cover_and_refuses_anything_else():
+def test_the_deck_key_defaults_to_static_and_refuses_anything_else():
     from gw.gw_config import DynamicSigmaConfig
     base = dict(omega_min_ev=-5.0, omega_max_ev=5.0, omega_step_ev=0.25,
                 regularization_ev=0.25, window_edge_factor=1.0,
                 fermi_reference="vbm", sigma_at_dft_extrapolate=False,
                 sigma_at_dft_energies=False)
-    assert DynamicSigmaConfig(**base).out_of_grid == "cover"
+    assert DynamicSigmaConfig(**base).out_of_grid == "static"
     with pytest.raises(ValueError, match="sigma_out_of_grid"):
         DynamicSigmaConfig(**base, out_of_grid="matched_tail")

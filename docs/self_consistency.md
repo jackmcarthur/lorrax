@@ -64,8 +64,9 @@ defining $U$.
 | the lowest `sc_frozen_core_bands` | held at the DFT block $\mathrm{diag}(E_{\rm DFT})$; they stay in the $\Sigma_x$ and $\chi_0$ sums |
 | the sum-band tail `[b3, number_bands)` | DFT orbitals with an energy-only rigid shift from `sc_tail_fit`, refit every map. The default `conduction_mean` is the $Z$-weighted mean QP correction of the window's conduction states that read their own $\Sigma(E)$ (below) |
 
-Every window band keeps its full Σ at its own energy: under the default
-`sigma_out_of_grid = cover` the grid grows over it (§4). Map 0, or an
+Every window band keeps its full Σ. Under the default
+`sigma_out_of_grid = static` a band outside the sampled grid reads
+$\Sigma(\omega = 0)$; `cover` grows the grid over it instead (§4). Map 0, or an
 authenticated seed, classifies the band set once, and the set stays frozen:
 no band enters or leaves it later.
 
@@ -179,13 +180,16 @@ state.
 
   | policy | an off-grid $\Sigma(E)$ reads | error past the edge, median / p90 (eV) | risk | cost |
   |---|---|---|---|---|
-  | `cover` (default) | nothing is off-grid: the grid grows over every protected identity outside `sc_frozen_core_bands` | 0 | unfrozen semicore is covered too: MoS2 to −90 eV costs 19× the quadrature nodes and 9× the wall time, and converges more slowly | Fe 4³, +28 against +8: pair cost 797 against 509, the same steady map time, 2 min more rule build |
+  | `cover` | nothing is off-grid: the grid grows over every protected identity outside `sc_frozen_core_bands` | 0 | unfrozen semicore is covered too: MoS2 to −90 eV costs 19× the quadrature nodes and 9× the wall time, and converges more slowly | Fe 4³, +28 against +8: pair cost 797 against 509, the same steady map time, 2 min more rule build |
   | `clamp` | $\Sigma(\omega_{\rm edge})$ | Fe 0.3–0.7 / 0.8–4.7; CrI3 0.05–0.12 / 0.5–2.2; MoS2 0.2–0.3 / 0.6–0.8 | continuous at the edge, but every clamped state inherits Σ there; an edge on a GN-PPM pole gives errors of order $10^3$ eV | none |
-  | `static` | $\Sigma(\omega = 0)$ | Fe 1.6–4.4; CrI3 0.4–0.5; MoS2 0.6–0.8 (median) | two fixed points for states within the edge jump (§5) | none |
+  | `static` (default) | $\Sigma(\omega = 0)$ | Fe 1.6–4.4; CrI3 0.4–0.5; MoS2 0.6–0.8 (median) | two fixed points for states within the edge jump (§5) | none |
 
   The numbers are from CLAIMS 2710: truth is the sampled Σ over the 2–6 eV
-  beyond a truncated edge. `clamp` and `static` are there to second-guess a
-  hard system; `cover` with the semicore frozen is the production policy.
+  beyond a truncated edge. `cover` removes the edge bistability (Fe 4³:
+  both seeds on one branch) but is not yet the default: when a protected
+  state crosses the grid edge, the growth and the rule rebuild move that
+  state's map output discontinuously (MoS2 3×3, Γ band 13 at −10 eV: 2.8 eV
+  for a 30 meV input change), and the loop stalls (CLAIMS 2725).
   A tail matched to the edge, $C_n/(\omega - \bar\omega_n)$ with the sum
   rule $C_n > 0$, is not offered: Σ at a grid edge is far from its $1/\omega$
   asymptote (Fe: −5 to −7 eV at +28 eV), so the matched pole falls inside
