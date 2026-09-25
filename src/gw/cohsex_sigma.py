@@ -5,6 +5,7 @@ from ffi import _services
 _services.ensure_on_path()
 from distrib_la import mesh_key as _mesh_key
 from functools import partial
+from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -205,6 +206,18 @@ _cohsex_kernel_cache: dict[tuple[object, ...], tuple] = {}
 _static_convolution_cache: dict[tuple[object, ...], object] = {}
 
 
+class StaticConvolution(NamedTuple):
+    """The static Σ convolution: ``fn(G_k, V, prefactor)``, or ``prep(V)`` once and
+    ``apply(G_k, prepared, prefactor)`` per Green, for a caller that convolves
+    several Greens with one interaction (the spin-pair stream)."""
+    convolve: object
+    prep: object
+    apply: object
+
+    def __call__(self, G_k, interaction, prefactor):
+        return self.convolve(G_k, interaction, prefactor)
+
+
 def _make_static_convolution(mesh_xy: Mesh, kgrid: tuple[int, int, int],
                              nk_tot: int, *, q0_only=False):
     """Own the normalized flat-k convolution of the scalar static sums.
@@ -225,6 +238,13 @@ def _make_static_convolution(mesh_xy: Mesh, kgrid: tuple[int, int, int],
         def convolve(G_k, interaction, prefactor):
             return (prefactor * sigma_conv_operand(G_k)
                     * interaction[0][None, None, :, None, :] * scale)
+
+        def prep(interaction):
+            return interaction
+
+        @jax.jit
+        def apply(G_k, prepared, prefactor):
+            return convolve(G_k, prepared, prefactor)
     else:
         # Σ = scale · fftn(ifftn(G) · ifftn(V)): the k-convolution router
         # (nvidia-mathdx on CUDA, the FFTW gw_conv handler on cpu), one fused
@@ -234,8 +254,15 @@ def _make_static_convolution(mesh_xy: Mesh, kgrid: tuple[int, int, int],
         @jax.jit
         def convolve(G_k, interaction, prefactor):
             return prefactor * kconv.apply(sigma_conv_operand(G_k), kconv.prep(interaction))
-    _static_convolution_cache[key] = convolve
-    return convolve
+
+        prep = jax.jit(kconv.prep)
+
+        @jax.jit
+        def apply(G_k, prepared, prefactor):
+            return prefactor * kconv.apply(sigma_conv_operand(G_k), prepared)
+    conv = StaticConvolution(convolve=convolve, prep=prep, apply=apply)
+    _static_convolution_cache[key] = conv
+    return conv
 
 
 _lorentz_convolution_cache: dict[tuple[object, ...], object] = {}
@@ -405,11 +432,13 @@ def _make_cohsex_kernels_face(mesh_xy: Mesh, face_shape, _convolve,
             layout=pair_layout, mesh=mesh_xy)
         phases = jnp.take(phases_parent, jnp.asarray(_irr), axis=0)
         _, _, proj_nmu, proj_mun, _, _ = parent_sigma_operands(wfns)
+        # The interaction is the same for every spin pair: transform it once.
+        prepared = _convolve.prep(interaction)
 
         def block(acc, index):
             left, right = spin_pair_rows(psi_mun, psi_nmu, index, ns_g)
             G_ab = build_G(left, right, phases=phases, layout=pair_layout, gemm=pair_plan)
-            S_ab = jnp.take(_convolve(G_ab, interaction, prefactor),
+            S_ab = jnp.take(_convolve.apply(G_ab, prepared, prefactor),
                             jnp.asarray(_k_rows), axis=0)
             proj_left = jax.lax.dynamic_slice_in_dim(proj_nmu, index // ns_g, 1, axis=2)
             proj_right = jax.lax.dynamic_slice_in_dim(proj_mun, index % ns_g, 1, axis=1)
