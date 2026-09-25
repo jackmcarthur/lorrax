@@ -885,7 +885,7 @@ def _assemble_full_bz_w(wc_wedge, V_q, *, sym, centroid_indices, meta,
     _nat = NamedSharding(mesh_xy, P(None, 'x', 'y'))
     mu_target = int(np.asarray(sym_perm).shape[-1])
     from symmetry_maps import QirrOperator
-    V_wedge = jax.device_put(QirrOperator.of(V_q).at_rows(sym.q_irr_full_idx), _nat)
+    V_wedge = QirrOperator.of(V_q).at_rows(sym.q_irr_full_idx)
     W_wedge = _assert_mu_width(
         wc_wedge, mu_target, where=f"W[{label}] wedge -> full BZ") + V_wedge
     n_sym_spatial = int(np.asarray(sym_perm).shape[0]) // 2
