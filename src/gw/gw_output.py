@@ -227,6 +227,7 @@ def _result_matrix_diag(results: GWResults, name: str):
 
 def sigma_table_to_file_wedge(
     sym, table, *, source_kset: str, k_axis: int = 0, file_sym=None,
+    time_ordered_diagonal: bool = False,
 ) -> np.ndarray:
     """Put a tagged Sigma/result table on the WFN file wedge.
 
@@ -242,7 +243,16 @@ def sigma_table_to_file_wedge(
     values = np.asarray(table)
     if k_axis:
         values = np.moveaxis(values, k_axis, 0)
-    if source_kset == SIGMA_KSET_STAR_WEDGE:
+    if source_kset == SIGMA_KSET_STAR_WEDGE and time_ordered_diagonal:
+        # The diagonal of a time-ordered Sigma_c is EVEN under time reversal:
+        # Sigma(r,r') = Sigma(r',r) gives <Tm|Sigma|Tn> = Sigma_nm, the
+        # transpose, not the conjugate that Theta-commuting operators take.
+        # A time-reversed row copies its parent's diagonal; conjugating it
+        # flipped Im Sigma_c on every such k (gnppm_debug k = 2, 6, 7, 8;
+        # owner 2026-09-24: time-ordered, Im > 0 below mu).
+        values = (np.asarray(unfold_star_wedge_to_full_bz(sym, values.real))
+                  + 1j * np.asarray(unfold_star_wedge_to_full_bz(sym, values.imag)))
+    elif source_kset == SIGMA_KSET_STAR_WEDGE:
         values = unfold_star_wedge_to_full_bz(sym, values)
     elif source_kset != SIGMA_KSET_FULL_BZ:
         raise ValueError(
@@ -1662,6 +1672,13 @@ def write_results(
         return sigma_table_to_file_wedge(
             sym, a, source_kset=results.sigma_kset, file_sym=wfn.symmetry())
 
+    def _wedge_sigma_c(a):
+        """A diagonal of the dynamic, time-ordered Sigma_c -> file wedge."""
+        return sigma_table_to_file_wedge(
+            sym, np.asarray(a, dtype=np.complex128),
+            source_kset=results.sigma_kset, file_sym=wfn.symmetry(),
+            time_ordered_diagonal=True)
+
     def _wedge_sectors(a):
         """Apply the canonical k reduction to each Lorentz sector."""
         return np.stack([_wedge(sector) for sector in np.asarray(a)])
@@ -1762,7 +1779,7 @@ def write_results(
     # diagonal (post-degen-averaging if enabled).
     if results.use_ppm and results.sigma_c_diag_at_dft_ry is not None:
         sigma_c_at_dft_diag_ev = (
-            _wedge(np.asarray(results.sigma_c_diag_at_dft_ry, dtype=np.complex128)) * r2e
+            _wedge_sigma_c(results.sigma_c_diag_at_dft_ry) * r2e
         )
     else:
         sigma_c_at_dft_diag_ev = _wedge(corr_out)
@@ -1782,7 +1799,7 @@ def write_results(
             results.sigma_c_omega_diag_ev, dtype=np.complex128
         ).transpose(1, 0, 2)
         # k axis is 1 on the omega cube; reduce on axis 0 and put it back.
-        sigma_c_omega_diag_ev_irr = _wedge(
+        sigma_c_omega_diag_ev_irr = _wedge_sigma_c(
             sigma_c_omega_diag_ev_irr).transpose(1, 0, 2)
         if results.efermi_ev is None:
             raise ValueError(
@@ -1839,7 +1856,11 @@ def write_results(
         # SC is an eqp0-type fixed-point map.  Its central-difference Z is
         # output-only in the BGW-style eqp1 column; it must never select a
         # fallback value or feed an iteration.
-        guard_pathological_z=not results.self_consistent,
+        # SC map 0 is evaluated at E_DFT: it IS the one-shot and takes its guard.
+        guard_pathological_z=(
+            not results.self_consistent
+            or (e_eval_ev_irr is not None
+                and np.array_equal(e_eval_ev_irr, e_dft_ev_irr))),
         print_fn=print_fn,
     )
 

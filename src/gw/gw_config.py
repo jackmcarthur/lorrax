@@ -4818,10 +4818,9 @@ class LorraxConfig:
     @property
     def omega_grid_ev(self):
         """Σ_c(ω) frequency grid in eV (length-stable single formula); see docs/architecture/decisions.md."""
-        if (getattr(self, "qp_solver", None) is QPSolver.SELF_CONSISTENT
-                and getattr(self, "sc_omega_grid_ev", None) is not None):
-            # The SC session's sampled support, grown only when a retained
-            # state escaped the requested window (extend_sc_omega_grid_ev).
+        if getattr(self, "sc_omega_grid_ev", None) is not None:
+            # The sampled support grown by ``scissor.grow_sigma_support_ev``:
+            # by the one-shot, and by every SC map, under one rule.
             return np.asarray(self.sc_omega_grid_ev, dtype=np.float64)
         p = self.sigma
         patches = p.parsed_omega_patches_ev()
@@ -4842,11 +4841,9 @@ class LorraxConfig:
             raise ValueError(
                 "sigma_omega_patches_ev produced a non-increasing grid; "
                 "patches must be ascending and disjoint")
-        # The requested grid is the evaluation grid at map 0 for every
-        # state, so SC iteration 1 equals the one-shot and states outside
-        # the requested window keep the one-shot treatment.  The SC pad
-        # widens the quadrature support and the hysteresis bounds; the
-        # sampled grid grows only when a retained state escapes.
+        # The requested grid.  The one-shot and every SC map grow it by one
+        # rule (scissor.grow_sigma_support_ev) into ``sc_omega_grid_ev``,
+        # so SC map 0 is the one-shot calculation.
         return grid
 
     @property

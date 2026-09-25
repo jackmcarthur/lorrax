@@ -207,6 +207,7 @@ Refusals:
 | `unfold_isdf_one_leg` | ζ \((N_q^{\rm irr},M,n_G)\) `P(None,('x','y'),None)`, or preselected \((N_q^{\rm irr},M)\) → \((N_q,M)\) `P(None,'x')`; polar \((3,N_q,M)\) | conjugate the whole leg | gather and phases | head columns (`v_q_g_flat`) |
 | `mix_lorentz_blocks` | dict of charge/current blocks | none: Λ is real | after scalar transport | `w_isdf.photon_blocks_full_q` |
 | `unfold_psi`, loader `k="full_bz"` | \((n_b,n_s,n_G)\), host | plane-wave rule | host | trivial-view parents; full-grid readers of the loader |
+| `gw_output.sigma_table_to_file_wedge(time_ordered_diagonal=True)` | star-wedge diagonal of the dynamic Σ_c, \((N_k^{\rm star},n_b)\) or \((n_\omega,N_k^{\rm star},n_b)\), host → file wedge | `pair_transpose`, which on a diagonal is a copy: the time-ordered Σ_c is symmetric, Σ(r,r′)=Σ(r′,r), so it does not commute with Θ and ⟨Θm|Σ|Θn⟩ = Σ_nm. `conj` flipped Im Σ_c on every time-reversed k | host | SC `sigma_diag` and eqp assembly |
 
 In `unfold_spin_centroid_operator` the spin action runs as a CUDA FFI kernel
 (`SpinRotateCentroidCudaFfi`: one thread per \((k,\mu,\nu)\) spin block, in

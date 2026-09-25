@@ -358,6 +358,34 @@ def sc_padded_window_ev(lower_ev, upper_ev):
             upper / (1.0 - _SC_PAD_FRACTION * np.sign(upper)))
 
 
+def grow_sigma_support_ev(sigma, frozen_core_bands, sampled_grid_ev,
+                          energy_relative_ev, required_kn, active_n=None):
+    """The sampled Sigma(omega) support grown over the states that read their
+    own Sigma(E): ``(grown_grid_ev, required_kn)``.
+
+    ONE rule for the one-shot and every SC map (owner 2026-09-24), so SC map 0
+    is the one-shot calculation and no state switches between Sigma(0) and
+    Sigma(E) between them. ``sigma_out_of_grid = cover`` grows over every
+    required identity the W model treats as active (``active_n``) and not in
+    ``sc_frozen_core_bands``; ``clamp``/``static`` only over a required state
+    inside the requested window plus the SC pad.
+    """
+    energy = np.asarray(energy_relative_ev, dtype=np.float64)
+    required = np.array(np.broadcast_to(
+        np.asarray(required_kn, dtype=bool), energy.shape))
+    if sigma.out_of_grid == "cover":
+        required[:, :int(frozen_core_bands)] = False
+        if active_n is not None:
+            required &= np.asarray(active_n, dtype=bool)[None, :]
+    else:
+        win_lo, win_hi = sc_padded_window_ev(
+            float(sigma.omega_min_ev), float(sigma.omega_max_ev))
+        required &= (energy >= win_lo) & (energy <= win_hi)
+    return (extend_sc_omega_grid_ev(sampled_grid_ev, energy, required,
+                                    float(sigma.omega_step_ev)),
+            required)
+
+
 def extend_sc_omega_grid_ev(omega_grid_ev, energy_kn_ev, required_kn, step_ev):
     """Cover retained raw SC energies by extending only outer samples.
 
