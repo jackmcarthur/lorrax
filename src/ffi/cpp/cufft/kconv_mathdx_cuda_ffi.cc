@@ -854,7 +854,7 @@ __device__ __forceinline__ void pfa_line(lrx_c2* base, int es, int i, const unsi
 // LRX_PB planes per block (small planes share a block, so a pass has enough
 // lines); LRX_RB blocks per SM the shared planes allow (capped at 2), so the
 // register cap lets them all in.
-extern "C" __global__ void __launch_bounds__(256, LRX_RB) lrx_kconv(
+extern "C" __global__ void __launch_bounds__(LRX_THREADS, LRX_RB) lrx_kconv(
     const lrx_c2* __restrict__ fin, lrx_c2* __restrict__ yout, PlaneGather g) {
     extern __shared__ lrx_c2 buf[];                  // LRX_PB planes of (NB, LD)
     constexpr int PB = LRX_PB, PS = NB * LD;
@@ -926,7 +926,7 @@ extern "C" __global__ void __launch_bounds__(256, LRX_RB) lrx_kconv(
 // ---------------------------------------------------------------------------
 //  Build and cache
 // ---------------------------------------------------------------------------
-struct Built { CUfunction fn = nullptr; int rb = 1; int smem = 0; double compile_ms = 0.0; };
+struct Built { CUfunction fn = nullptr; int rb = 1; int smem = 0; double compile_ms = 0.0; int threads = kThreads; };
 using Key = std::tuple<CUcontext, int, int, int, int, int, int>;  // ctx, mode, nkx, nky, nkz, ns, f32
 static std::mutex g_mu;
 static std::map<Key, Built> g_cache;
@@ -1141,7 +1141,12 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
         "-DLRX_NS=" + std::to_string(ns), "-DLRX_RB=" + std::to_string(mode == 10 ? plane_minb : rb),
         "-DLRX_F32=" + std::string(f32 ? "1" : "0"),
         "-DLRX_SM=" + std::to_string(cc_major * 100 + cc_minor * 10)};
-    if (mode == 10) defs.push_back("-DLRX_PB=" + std::to_string(rb));   // planes per block
+    // Mode 10: planes per block; a block that has its SM alone runs 512 threads.
+    const int plane_threads = mode == 10 && plane_minb == 1 ? 512 : kThreads;
+    if (mode == 10) {
+        defs.push_back("-DLRX_PB=" + std::to_string(rb));
+        defs.push_back("-DLRX_THREADS=" + std::to_string(plane_threads));
+    }
     std::vector<std::string> o = defs;
     for (const std::string& d : {"-I" + inc, "-I" + cutlass, "-I" + cuda_inc, "-I" + cuda_inc + "/cccl"})
         o.push_back(d);
@@ -1232,6 +1237,7 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
     cr = api.ModuleGetFunction(&b.fn, module, "lrx_kconv");
     if (cr != CUDA_SUCCESS) return sticky("cuModuleGetFunction", cu_err(cr));
     b.rb = static_cast<int>(rb);
+    b.threads = plane_threads;
     b.smem = static_cast<int>(rb * row_bytes);
     b.compile_ms = ms;
     if (b.smem > 49152) {
@@ -1748,7 +1754,7 @@ static ffi::Error PlaneFftGather(cudaStream_t stream, ffi::AnyBuffer F, ffi::Any
     void* yp = Y->untyped_data();
     void* args[] = {(void*)&fp, (void*)&yp, (void*)&g};
     const unsigned blocks = static_cast<unsigned>(std::min<long long>((planes + k->rb - 1) / k->rb, 2147483647LL));
-    CUresult cr = driver_api().LaunchKernel(k->fn, blocks, 1, 1, kThreads, 1, 1, static_cast<unsigned>(k->smem),
+    CUresult cr = driver_api().LaunchKernel(k->fn, blocks, 1, 1, k->threads, 1, 1, static_cast<unsigned>(k->smem),
                                             reinterpret_cast<CUstream>(stream), args, nullptr);
     if (cr != CUDA_SUCCESS) return fail("cuLaunchKernel", cu_err(cr));
     return ffi::Error::Success();
