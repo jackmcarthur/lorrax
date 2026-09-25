@@ -331,6 +331,10 @@ receipts certify the unprojected model only.
 - Occupations are Fermi-Dirac only, and `occ_smearing_width_ry` is $k_BT$.
   Each map solves μ at a fixed electron count from its input spectrum
   (`_solve_occupation_state`); μ is never mixed.
+- SC defaults to `occupation_window_threshold = 1.0`: every nonzero
+  occupation weight enters its Σ branch. A finite weight cutoff introduces
+  a jump in Σ when a moving state crosses it, even though Fermi-Dirac
+  occupations themselves are smooth. Explicit deck values remain honored.
 - The energy-only tail above the QP window has exact-zero occupations. It
   still enters G and the response at its current shifted energies, and the
   window alone sets μ. A tail state that enters the fractional manifold

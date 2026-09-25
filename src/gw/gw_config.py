@@ -2812,6 +2812,14 @@ def _assemble_input_config(
 def _apply_input_envelope(
         _named_keys, print_fn, resolved):
     """Produce the final configuration after cross-key refusals and provenance."""
+    # A finite occupation support cut makes Sigma discontinuous as a state
+    # crosses it. SC keeps every nonzero weight; one-shot defaults are unchanged.
+    if (resolved.qp_solver is QPSolver.SELF_CONSISTENT
+            and "occupation_window_threshold" not in _named_keys):
+        resolved = _dc_replace(resolved, mpa=_dc_replace(
+            resolved.mpa, occupation_window_threshold=1.0))
+        print_fn("  [config provenance] qp_solver=self_consistent: "
+                 "occupation_window_threshold=1.0 (all nonzero branch weights)")
     # Every QSGW map rebuilds V_H from its own orbitals unless the deck says
     # otherwise (owner 2026-09-23).  A fixed DFT V_H is a comparison mode:
     # on VI3 it moved the gap 2.657 -> 1.916 eV once V_H went live (claim 2637).
