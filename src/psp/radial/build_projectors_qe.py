@@ -25,6 +25,8 @@ from typing import Dict, Tuple, List, Sequence, Mapping
 
 import jax.numpy as jnp
 
+from common.fft_helpers import local_fftn3, local_ifftn3  # 3-D fields: all three axes
+
 from .radial_jax import (
     RadialTable,
     make_local_sr_table,
@@ -619,7 +621,7 @@ def build_local_ionic_potential_on_G_total(
 
     # Total to real
     V_tot = Vloc_G_sr + Vloc_G_lr
-    V_r = jnp.real(jnp.fft.ifftn(jnp.asarray(V_tot), norm='ortho'))
+    V_r = jnp.real(local_ifftn3(jnp.asarray(V_tot), norm='ortho'))
     return jnp.asarray(V_r, dtype=jnp.float64)
 
 # --------------------------

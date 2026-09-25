@@ -55,6 +55,8 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 
+from common.fft_helpers import local_fftn3, local_ifftn3  # 3-D fields: all three axes
+
 from common.fft_helpers import local_fftn3, local_ifftn3
 
 
@@ -584,15 +586,15 @@ def compute_V_H_and_V_xc(
     from psp.xc import compute_V_xc, pbe_functional
 
     # ── V_H via Poisson ──
-    rho_G_ortho = jnp.fft.fftn(rho_val, norm='ortho')
+    rho_G_ortho = local_fftn3(rho_val, norm='ortho')
     V_H_r = jnp.real(poisson_potential_from_rhoG(
         rho_G_ortho, bdot, bvec, blat, truncation_2d=truncation_2d))
 
     # ── V_xc ──
     rho_total = rho_val + rho_core
     # Precise G-space total density (analytic core + FFT valence)
-    rho_core_gridded = jnp.real(jnp.fft.ifftn(rhog_core))
-    rho_G_total = jnp.fft.fftn(rho_total - rho_core_gridded) + rhog_core
+    rho_core_gridded = jnp.real(local_ifftn3(rhog_core))
+    rho_G_total = local_fftn3(rho_total - rho_core_gridded) + rhog_core
 
     xc_fn, level = pbe_functional()
     V_xc_r = compute_V_xc(rho_total, rho_G_total, G_cart, xc_fn, level)

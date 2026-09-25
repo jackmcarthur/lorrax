@@ -20,6 +20,8 @@ import functools
 
 import jax
 import jax.numpy as jnp
+
+from common.fft_helpers import local_fftn3, local_ifftn3  # 3-D fields: all three axes
 import numpy as np
 
 from psp.radial.radial_jax import interp_uniform_jax
@@ -264,7 +266,7 @@ def _ionic_gspace_jit(
     rho_core_G_flat = accumulate_species_on_G(
         tables_nlcc, nlcc_pf, S_species, G_norm, q0, dq)
     rho_core_G = rho_core_G_flat.reshape(nx, ny, nz)
-    rho_core_r = jnp.real(jnp.fft.ifftn(rho_core_G)) * N
+    rho_core_r = jnp.real(local_ifftn3(rho_core_G)) * N
     rho_core_G_scaled = rho_core_G * N
 
     # V_loc short-range
@@ -287,7 +289,7 @@ def _ionic_gspace_jit(
 
     Vloc_lr_G_flat = Vloc_lr_G_flat.at[0].set(0.0)
     V_tot_G = (Vloc_sr_G_flat + Vloc_lr_G_flat).reshape(nx, ny, nz)
-    V_loc_r = jnp.real(jnp.fft.ifftn(V_tot_G, norm="ortho"))
+    V_loc_r = jnp.real(local_ifftn3(V_tot_G, norm="ortho"))
 
     return V_loc_r, rho_core_r, rho_core_G_scaled
 

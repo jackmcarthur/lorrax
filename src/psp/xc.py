@@ -24,6 +24,8 @@ from typing import Callable
 import jax
 import jax.numpy as jnp
 
+from common.fft_helpers import local_fftn3, local_ifftn3  # 3-D fields: all three axes
+
 
 # ═══════════════════════════════════════════════════════════════════════
 #  Functional registry
@@ -69,14 +71,14 @@ def _compute_sigma(rho_G_total, G_cart):
     """σ = |∇ρ|² via G-space derivatives."""
     sigma = jnp.zeros(rho_G_total.shape, dtype=jnp.float64)
     for i in range(3):
-        drho = jnp.real(jnp.fft.ifftn(1j * G_cart[..., i] * rho_G_total))
+        drho = jnp.real(local_ifftn3(1j * G_cart[..., i] * rho_G_total))
         sigma = sigma + drho ** 2
     return jnp.maximum(sigma, 0.0)
 
 
 def _compute_grad_components(rho_G_total, G_cart):
     """∂ρ/∂r_i for each Cartesian direction.  Returns list of 3 arrays."""
-    return [jnp.real(jnp.fft.ifftn(1j * G_cart[..., i] * rho_G_total))
+    return [jnp.real(local_ifftn3(1j * G_cart[..., i] * rho_G_total))
             for i in range(3)]
 
 
@@ -156,9 +158,9 @@ def _vxc_gga(rho, rho_raw, sigma, rho_G, G_cart, xc_fn):
     # GGA divergence: −2 ∇·(df/dσ · ∇ρ)
     div = jnp.zeros_like(rho)
     for i in range(3):
-        drho_i = jnp.real(jnp.fft.ifftn(1j * G_cart[..., i] * rho_G))
-        h_G = jnp.fft.fftn(df_dsigma * drho_i)
-        div = div + jnp.real(jnp.fft.ifftn(1j * G_cart[..., i] * h_G))
+        drho_i = jnp.real(local_ifftn3(1j * G_cart[..., i] * rho_G))
+        h_G = local_fftn3(df_dsigma * drho_i)
+        div = div + jnp.real(local_ifftn3(1j * G_cart[..., i] * h_G))
 
     return df_drho - 2.0 * div
 
@@ -175,9 +177,9 @@ def _vxc_mgga(rho, rho_raw, sigma, tau, rho_G, G_cart, xc_fn):
     # GGA divergence (same as GGA)
     div = jnp.zeros_like(rho)
     for i in range(3):
-        drho_i = jnp.real(jnp.fft.ifftn(1j * G_cart[..., i] * rho_G))
-        h_G = jnp.fft.fftn(df_dsigma * drho_i)
-        div = div + jnp.real(jnp.fft.ifftn(1j * G_cart[..., i] * h_G))
+        drho_i = jnp.real(local_ifftn3(1j * G_cart[..., i] * rho_G))
+        h_G = local_fftn3(df_dsigma * drho_i)
+        div = div + jnp.real(local_ifftn3(1j * G_cart[..., i] * h_G))
 
     # meta-GGA: V_xc += dE/dτ (applied to KE density, needs −½∇² on ψ)
     # For now this is the potential part; the τ-dependent Hamiltonian
