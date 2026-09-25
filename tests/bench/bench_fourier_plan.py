@@ -227,18 +227,52 @@ def part_sparse_comp(fh):
         del xc
 
 
+def part_oneway(fh):
+    """One-way sphere→box into row-major output (no round trip to fold the
+    layout away): the plane sites and 3-D boxes, K = N/2; the FFT arm, the
+    GEMM arm from the natural (B, K, …) layout, and cuFFT alone on a filled box."""
+    for extents, batch in [((54, 54), 27_648), ((80, 80), 12_288), ((24, 24), 5_000),
+                           ((24, 24, 24), 64), ((32, 32, 32), 32), ((64, 64, 64), 8)]:
+        d = len(extents)
+        axes = tuple(range(1, d + 1))
+        sup = {a: _centred(n, n // 2) for n, a in zip(extents, axes)}
+        xc = crandn((batch,) + tuple(n // 2 for n in extents))
+        rec = {"part": "oneway", "extents": extents, "batch": batch}
+        for kind, key in ((FFT, "fft"), (GEMM, "gemm")):
+            rec[key] = timeit(jax.jit(plan(extents, axes, kind, in_support=sup)), xc, per=1)
+        rec["ratio_gemm_over_fft"] = rec["gemm"]["us"] / rec["fft"]["us"]
+        del xc
+        xf = crandn((batch,) + extents)
+        rec["fft_only_full_box"] = timeit(jax.jit(plan(extents, axes, FFT)), xf, per=1)
+        emit(rec, fh)
+        del xf
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--part", required=True, choices=["1d", "comp", "sparse", "sparse_comp"])
+    ap.add_argument("--part", required=True,
+                    choices=["1d", "comp", "sparse", "sparse_comp", "oneway"])
+    ap.add_argument("--leg", choices=["xla", "ffi"], default=None,
+                    help="force the plan's leg (default: the platform's)")
     ap.add_argument("--out")
     a = ap.parse_args()
+    if a.leg == "ffi":
+        so = os.environ["LORRAX_FOURIER_PLAN_SO"]
+        import ctypes
+        lib = ctypes.CDLL(so)
+        jax.ffi.register_ffi_target("lorrax_fourier_plan",
+                                    jax.ffi.pycapsule(lib.LorraxFourierPlanCudaFfi),
+                                    platform="CUDA")
+        main.lib = lib
+    if a.leg:
+        fourier_plan._default_leg = lambda: a.leg
     dev = jax.devices()[0]
     print(json.dumps({"device_kind": dev.device_kind, "platform": dev.platform,
-                      "jax": jax.__version__, "XLA_FLAGS": os.environ.get("XLA_FLAGS")}),
-          flush=True)
+                      "jax": jax.__version__, "XLA_FLAGS": os.environ.get("XLA_FLAGS"),
+                      "leg": a.leg or fourier_plan._default_leg()}), flush=True)
     fh = open(a.out, "a") if a.out else None
     {"1d": part_1d, "comp": part_comp, "sparse": part_sparse,
-     "sparse_comp": part_sparse_comp}[a.part](fh)
+     "sparse_comp": part_sparse_comp, "oneway": part_oneway}[a.part](fh)
 
 
 if __name__ == "__main__":

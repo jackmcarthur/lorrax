@@ -7,6 +7,8 @@ embedding gather and restriction take.  The contract is value-level:
 relative error ≤ 1e-12 in complex128 against ``np.fft`` on the embedded input.
 """
 
+import ctypes
+import os
 import zlib
 
 import numpy as np
@@ -21,6 +23,35 @@ RTOL = 1e-12
 SIZES = list(range(2, 33)) + [36, 45, 48, 54, 60, 64, 72, 75, 80, 96, 100, 125, 128,
                               150, 180, 216, 256]
 BACKENDS = ("__gemm__", "__fft__")
+
+
+LEGS = ("xla", "ffi") if jax.default_backend() == "gpu" else ("xla",)
+_PROBE = []
+
+
+def _register_ffi_target():
+    """The CUDA leg's target: the bundle's, or a probe .so built by
+    ``tests/bench/build_fourier_plan_probe.sh`` (``LORRAX_FOURIER_PLAN_SO``)."""
+    if _PROBE:
+        return True
+    so = os.environ.get("LORRAX_FOURIER_PLAN_SO")
+    if not so:
+        return False
+    lib = ctypes.CDLL(so)
+    jax.ffi.register_ffi_target("lorrax_fourier_plan",
+                                jax.ffi.pycapsule(lib.LorraxFourierPlanCudaFfi), platform="CUDA")
+    _PROBE.append(lib)
+    return True
+
+
+@pytest.fixture(autouse=True, params=LEGS)
+def leg(request, monkeypatch):
+    """Every test runs on each leg the platform has: XLA ops, and on CUDA the
+    one-custom-call leg."""
+    if request.param == "ffi" and not _register_ffi_target():
+        pytest.skip("CUDA leg: set LORRAX_FOURIER_PLAN_SO (the target is not in the bundle yet)")
+    monkeypatch.setattr(fourier_plan, "_default_leg", lambda: request.param)
+    return request.param
 
 
 @pytest.fixture(autouse=True)
