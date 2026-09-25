@@ -122,16 +122,23 @@ def _rel(a, b):
 
 
 @pytest.mark.mesh(4)
+@pytest.mark.parametrize("backend", ["fft", "gemm"])
 @pytest.mark.parametrize("current", [False, True],
                          ids=["charge", "four_current"])
-def test_every_route_matches_the_independent_host_density(current,
+def test_every_route_matches_the_independent_host_density(current, backend,
                                                           monkeypatch):
     """g_split (tiled k), band_2d and local agree with NumPy at 1e-12.
 
     The route predicate is asserted from the plan the call used, so a
     fixture that silently fell back to another route cannot pass as this
-    one (TASTE 30).
+    one (TASTE 30).  ``backend``: the union-box transform's per-axis choice,
+    the library FFT (CPU's row) or the stored-matrix GEMM on every
+    supported axis (a forced row), both at nspinor 2 and 4.
     """
+    if backend == "gemm":
+        from common import fourier_plan
+        kind = jax.devices()[0].device_kind
+        monkeypatch.setitem(fourier_plan.GEMM_CROSSOVER, kind, (range(0), range(1 << 30)))
     mesh = _mesh()
     ns = 4 if current else 2
     psi, bidx, cells, U, occ, kw = _fixture(ns)
@@ -255,12 +262,15 @@ def test_the_scan_body_moves_no_field_and_no_k_stack():
     psi_j = _put(psi, mesh, band_sphere_spec())
     U_j = _put(U, mesh, band_rotation_spec())
     rho_from_wfns(psi_j, occ, kw, U=U_j, **args)
+    from common.fourier_plan import gemm_crossover
     from common.wfn_transforms import _KERNEL_CACHE
     # Key: (name, psi.shape, grid, volume, f_spin, have_U, current,
-    # charge_ns, spin_matrix, per_k, sym_perm shape, plan, mesh, psi spec).
+    # charge_ns, spin_matrix, per_k, sym_perm shape, plan, mesh, psi spec,
+    # union-box hashes, GEMM row); this call's row is the device's own.
+    row = str(gemm_crossover(mesh.devices.flat[0].device_kind))
     hits = [(k[11], v) for k, v in _KERNEL_CACHE.items()
             if k[0] == "rho_density_scan" and k[1] == psi.shape
-            and k[5] and k[6] and k[11][0] == "g_split"]
+            and k[5] and k[6] and k[11][0] == "g_split" and k[-1] == row]
     assert len(hits) == 1, "exactly one g_split four-current executable"
     (plan, fn), = hits
     k_tile = int(plan[2])
@@ -286,3 +296,35 @@ def test_the_scan_body_moves_no_field_and_no_k_stack():
             flags=re.S))
         assert "all-reduce" not in comps[body.group(1)], (
             "the field is reduced inside the scan")
+
+
+def test_union_box_embeds_every_sphere_exactly():
+    """The union box's index sets are the per-axis union of the spheres'
+    cells; scattering a sphere into the box and the box into the grid is the
+    sphere's own grid scatter (nspinor 4, pads read zero)."""
+    from common.wfn_transforms import sphere_to_union_box, union_box_tables
+    rng = np.random.default_rng(7)
+    grid, nk, ngk, ns = (6, 5, 7), 3, 11, 4
+    n = int(np.prod(grid))
+    # spheres inside a strict sub-box, one pad slot per k
+    sub = np.stack(np.meshgrid([0, 1, 5], [0, 2, 3, 4], [0, 1, 6], indexing="ij"), -1).reshape(-1, 3)
+    bidx = np.empty((nk, ngk), np.int32)
+    for k in range(nk):
+        c = sub[rng.choice(len(sub), ngk - 1, replace=False)]
+        bidx[k, :-1] = np.ravel_multi_index(c.T, grid)
+        bidx[k, -1] = n + ngk - 1
+    sup, cidx = union_box_tables(bidx, grid)
+    used = np.unravel_index(bidx[bidx < n], grid)
+    for a in range(3):
+        assert np.array_equal(sup[a], np.unique(used[a]))
+    psi = rng.standard_normal((nk, 2, ns, ngk)) + 1j * rng.standard_normal((nk, 2, ns, ngk))
+    box = np.asarray(sphere_to_union_box(jnp.asarray(psi), jnp.asarray(cidx), tuple(s.size for s in sup)))
+    full = np.zeros((nk, 2, ns, n), np.complex128)
+    full[..., np.ix_(*sup)[0] * 0] = 0                 # shape check only
+    embedded = np.zeros((nk, 2, ns) + grid, np.complex128)
+    embedded[..., sup[0][:, None, None], sup[1][None, :, None], sup[2][None, None, :]] = box
+    ref = np.zeros((nk, 2, ns, n), np.complex128)
+    for k in range(nk):
+        v = bidx[k] < n
+        ref[k][..., bidx[k][v]] = psi[k][..., v]
+    assert np.array_equal(embedded.reshape(nk, 2, ns, n), ref)

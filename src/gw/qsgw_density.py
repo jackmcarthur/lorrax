@@ -106,7 +106,7 @@ from jax.experimental.layout import Layout, with_layout_constraint
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from common import timing
-from common.wfn_transforms import _box_kernel, _cached_jit, _sharding_key
+from common.wfn_transforms import _cached_jit, _sharding_key
 from runtime.padding import pad_axis, spec_divisor
 
 
@@ -533,7 +533,7 @@ def plan_density_scan(*, mesh: Mesh, n_k: int, nb_carrier: int,
 def _density_scan_body(mesh: Mesh, plan: DensityScanPlan, *, n_k: int,
                        nb_carrier: int, ns: int, ngkmax: int, grid, scale,
                        f_spin, include_current, charge_ns,
-                       return_spin_matrix, per_k=False):
+                       return_spin_matrix, supports, per_k=False):
     """The per-rank body: scan k tiles, accumulate MY bands, psum once.
 
     ``per_k`` (``local`` route only, where a tile is one k) emits each k's
@@ -541,8 +541,12 @@ def _density_scan_body(mesh: Mesh, plan: DensityScanPlan, *, n_k: int,
     then reduces the stacked ``(n_k, ...)`` fields.
 
     Local operands: ψ ``(n_k, nb/P, ns, ngkmax)``; U ``(n_k, nb/p_x,
-    nb/p_y)`` (rotated routes); occ ``(n_k, nb)``, w ``(n_k,)`` and the box
-    index ``(n_k, nx, ny, nz)`` replicated.  Returns the replicated field.
+    nb/p_y)`` (rotated routes); occ ``(n_k, nb)``, w ``(n_k,)`` and the
+    union-box index ``(n_k, ngkmax)`` (:func:`common.wfn_transforms.
+    union_box_tables`) replicated.  Each k tile's sphere is gathered into the
+    static union box and ``LocalFourierPlan`` (its ``supports`` as the
+    per-axis ``in_support``) takes it to the grid.  Returns the replicated
+    field.
 
     Band ownership after each route (``r`` = linear rank over ('x','y'),
     the band_sphere_spec block order):
@@ -552,8 +556,17 @@ def _density_scan_body(mesh: Mesh, plan: DensityScanPlan, *, n_k: int,
     * ``band_2d`` : rotated bands ``y·nb/p_y + x·nb/P + [0, nb/P)`` — the
       reduce-scatter over 'x' splits the 'y' block U's columns put there.
     """
-    from common.fft_helpers import local_ifftn3
+    from common.fourier_plan import LocalFourierPlan
+    from common.wfn_transforms import sphere_to_union_box
     from psp.get_DFT_mtxels import density_components_from_psi_r
+
+    # ψ̃(r) = ifftn over the grid, 'ortho', of the sphere embedded in the grid:
+    # the plan embeds the union box and transforms (supported-axis GEMMs where
+    # the device's row takes them, else one FFT group).
+    box = tuple(int(sup.size) for sup in supports)
+    to_r = LocalFourierPlan(tuple(grid), (-3, -2, -1), sign=1, norm="ortho",
+                            in_support={-3: supports[0], -2: supports[1], -1: supports[2]},
+                            mesh=mesh)
 
     band_axes = ("x", "y")
     p_y = int(mesh.shape["y"])
@@ -607,8 +620,7 @@ def _density_scan_body(mesh: Mesh, plan: DensityScanPlan, *, n_k: int,
             phi, n0 = my_bands(psi_t, U_t)
             f = jax.lax.dynamic_slice_in_dim(occ_t, n0, n_loc, axis=1)
             f = f * (f_spin * w_t)[:, None]
-            box = _box_kernel(phi, bidx_t, fft_grid=grid)
-            psi_r = local_ifftn3(box, axes=(-3, -2, -1), norm="ortho") * scale
+            psi_r = to_r(sphere_to_union_box(phi, bidx_t, box)) * scale
             dens = density_components_from_psi_r(
                 psi_r.reshape(K * n_loc, ns, *grid), f.reshape(K * n_loc),
                 include_dirac_current=include_current,
@@ -816,7 +828,10 @@ def rho_from_wfns(psi_G, occ, kweights, *, mesh: Mesh, box_index,
             f"check here would catch it.  Pass "
             f"symmetry_maps.fft_grid_pullback_perm(...).")
     w_j = jnp.asarray(kweights, dtype=jnp.float64)
-    bidx_j = jnp.asarray(box_index, dtype=jnp.int32)
+    from common.fourier_plan import gemm_crossover
+    from common.wfn_transforms import union_box_tables
+    supports, compact_index = union_box_tables(box_index, grid)
+    bidx_j = jnp.asarray(compact_index, dtype=jnp.int32)
 
     plan = plan_density_scan(
         mesh=mesh, n_k=nk, nb_carrier=nb_pad,
@@ -835,7 +850,7 @@ def rho_from_wfns(psi_G, occ, kweights, *, mesh: Mesh, box_index,
             mesh, plan, n_k=nk, nb_carrier=nb_pad, ns=ns, ngkmax=ngkmax,
             grid=grid, scale=scale, f_spin=f_spin,
             include_current=include_current, charge_ns=charge_ns,
-            return_spin_matrix=return_spin_matrix, per_k=per_k)
+            return_spin_matrix=return_spin_matrix, supports=supports, per_k=per_k)
         rep = P()
         per_rank = shard_map(
             body if have_U else (lambda p, o, w, b: body(p, None, o, w, b)),
@@ -861,7 +876,10 @@ def rho_from_wfns(psi_G, occ, kweights, *, mesh: Mesh, box_index,
         (psi.shape, grid, float(cell_volume), f_spin, have_U,
          include_current, charge_ns, return_spin_matrix, per_k,
          None if sym_perm is None else tuple(np.shape(sym_perm)),
-         tuple(plan), mesh, _sharding_key(psi)[1]),
+         tuple(plan), mesh, _sharding_key(psi)[1],
+         # the union box and the per-axis GEMM row are baked into the plan
+         tuple(hash(sup.tobytes()) for sup in supports),
+         str(gemm_crossover(mesh.devices.flat[0].device_kind))),
         build)
     # sym_perm is an OPERAND, not a closure.  The cache key can only carry
     # its SHAPE, so two different permutation tables of the same

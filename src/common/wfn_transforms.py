@@ -219,6 +219,72 @@ def _box_kernel(psi: jax.Array, sphere_index: jax.Array, *,
                        fft_grid=fft_grid)
 
 
+# The union box: the tight bounding box of every k's sphere, one index set per
+# axis (the per-axis union of the spheres' cells).  A transform that starts
+# from ψ(G) embeds each k's sphere into this static box (one gather through a
+# per-call ``(n_k, Kbox)`` inverse, ``Kbox`` ≈ 2–8× the sphere against the
+# full box's ~20–70×) and hands it to ``LocalFourierPlan`` with the box as
+# its per-axis ``in_support``, so the plan's supported-axis GEMMs or its FFT
+# group do the embedding into the grid.
+_UNION_BOX_CACHE: dict = {}
+
+
+def union_box_tables(sphere_index, fft_grid) -> tuple:
+    """Host: the spheres' union box and each sphere slot's cell in it.
+
+    ``sphere_index`` ``(n_k, ngk)`` is the loader's per-k sphere index (numpy
+    or a device array; see the block comment above).  Returns ``(supports,
+    compact_index)``: ``supports`` the three sorted int64 index sets (the
+    box's extent ``(Kx, Ky, Kz)`` along the grid axes), and ``compact_index``
+    ``(n_k, ngk)`` int32, the flat C-order cell of each slot in the box, with
+    pad slots at the distinct out-of-box value ``Kx·Ky·Kz + g``.  Cached per
+    table object (a device array is copied to the host once).
+    """
+    import weakref
+    hit = _UNION_BOX_CACHE.get(id(sphere_index))
+    if hit is not None and hit[0]() is sphere_index and hit[1] == tuple(fft_grid):
+        return hit[2]
+    grid = tuple(int(v) for v in fft_grid)
+    n_rtot = int(np.prod(grid))
+    idx = np.asarray(sphere_index, dtype=np.int64)
+    valid = idx < n_rtot
+    cell = np.where(valid, idx, 0)
+    xyz = (cell // (grid[1] * grid[2]), (cell // grid[2]) % grid[1], cell % grid[2])
+    supports = tuple(np.unique(c[valid]) for c in xyz)
+    pos = []
+    for n, sup in zip(grid, supports):
+        p = np.full(n, -1, dtype=np.int64)
+        p[sup] = np.arange(sup.size)
+        pos.append(p)
+    ky, kz = supports[1].size, supports[2].size
+    kbox = supports[0].size * ky * kz
+    flat = (pos[0][xyz[0]] * ky + pos[1][xyz[1]]) * kz + pos[2][xyz[2]]
+    pads = kbox + np.broadcast_to(np.arange(idx.shape[1]), idx.shape)
+    out = (supports, np.where(valid, flat, pads).astype(np.int32))
+    try:
+        _UNION_BOX_CACHE[id(sphere_index)] = (weakref.ref(sphere_index), grid, out)
+    except TypeError:                              # not weak-referenceable
+        pass
+    return out
+
+
+def sphere_to_union_box(psi: jax.Array, compact_index: jax.Array, box) -> jax.Array:
+    """ψ(G) ``(n_k, nb, ns, ngk)`` → union box ``(n_k, nb, ns, Kx, Ky, Kz)``.
+
+    ``compact_index`` ``(n_k, ngk)`` from :func:`union_box_tables`.  The
+    per-call inverse ``(n_k, Kbox)`` is one unique scatter; the box is one
+    zero-sentinel gather (the :func:`_gather_box` recipe on the small box).
+    """
+    n_k, _, _, ngk = (int(v) for v in psi.shape)
+    kbox = int(np.prod(box))
+    slots = jnp.arange(ngk, dtype=jnp.int32)
+    inverse = jax.vmap(lambda i: jnp.full((kbox,), ngk, jnp.int32).at[i].set(
+        slots, mode='drop', unique_indices=True))(compact_index)
+    z = jnp.concatenate([psi, jnp.zeros(psi.shape[:-1] + (1,), psi.dtype)], axis=-1)
+    return jnp.take_along_axis(z, inverse[:, None, None, :], axis=-1, mode='clip').reshape(
+        psi.shape[:3] + tuple(int(b) for b in box))
+
+
 def _sphere_gather(box: jax.Array, sphere_index: jax.Array) -> jax.Array:
     """Box ``(n_k, nb, ns, nx, ny, nz)`` → sphere ``(n_k, nb, ns, ngk)``.
 
