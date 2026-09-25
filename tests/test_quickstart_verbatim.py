@@ -82,6 +82,7 @@ from harness import (          # noqa: E402
     REG,
     REPO_ROOT,
     copy_fixture,
+    parse_eqp_rows,
     run_gw_jax,
     skip_unless_gpu,
 )
@@ -132,6 +133,43 @@ def test_the_documented_quickstart_deck_completes_on_the_shipped_fixture(
         f"stderr tail:\n{result.stderr[-2000:]}")
     for name in EXPECTED_OUTPUTS:
         assert (run_dir / name).stat().st_size > 0, f"{name} is empty"
+
+
+#: CPU vs the GPU-frozen ``eqp_ref.dat``: measured max |Δ| 1.0e-6 eV (one unit
+#: in the 6th printed decimal, 2026-09-25).  Cross-machine comparisons are
+#: judged at the micro-eV level (owner ruling 2026-08-07).
+_CPU_VS_GPU_ATOL_EV = 1e-5
+
+
+@pytest.mark.regression
+def test_the_quickstart_runs_on_cpu_and_matches_the_reference(tmp_path):
+    """The docs say this deck needs no GPU: run it with JAX_PLATFORMS=cpu.
+
+    SCOPE: one process.  A multi-process CPU run needs the MPI launch recipe
+    (``docs/dev/mpi_collectives.md``) and is not exercised here.  The child
+    takes the production host k-convolution route, not the in-process test
+    XLA arm that ``conftest.py`` selects.
+    """
+    import os
+    run_dir = copy_fixture(CASE_DIR, tmp_path / "cohsex_debug")
+    # One CPU device, whatever host device count a test module exported.
+    xla_flags = " ".join(f for f in os.environ.get("XLA_FLAGS", "").split()
+                         if "xla_force_host_platform_device_count" not in f)
+    result = run_gw_jax(tmp_path, f"{run_dir.name}/{DECK}", platform="cpu",
+                        extra_env={"LORRAX_KFFT_CPU_TEST_XLA": "0",
+                                   "XLA_FLAGS": xla_flags})
+    out = run_dir / "eqp_test.dat"
+    assert out.is_file() and COMPLETION_MARKER in result.stdout, (
+        f"the CPU quickstart did not complete.\n"
+        f"stdout tail:\n{result.stdout[-4000:]}\n"
+        f"stderr tail:\n{result.stderr[-2000:]}")
+    import numpy as np
+    labels = ("sigSX", "sigCOH", "sigTOT")
+    got = parse_eqp_rows(out, labels)
+    ref = parse_eqp_rows(CASE_DIR / "eqp_ref.dat", labels)
+    assert got.shape == ref.shape
+    np.testing.assert_allclose(got[:, :6], ref[:, :6], rtol=0.0,
+                               atol=_CPU_VS_GPU_ATOL_EV)
 
 
 def test_the_head_policy_the_quickstart_runs_under_is_the_default():

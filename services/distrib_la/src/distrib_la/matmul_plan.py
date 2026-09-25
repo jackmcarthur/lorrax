@@ -43,15 +43,16 @@ Contract, deliberately narrower than :func:`distrib_la.matmul`:
   itself — cuBLASMp's own per-slice loop makes ``nq=1`` a legitimate,
   zero-overhead special case, the same way ``distrib_la.matmul`` lifts
   rank-2 internally (``matmul.py:402-406,438``).
-* **cuBLASMp only, today.**  ``lorrax_scalapack_batched_gemm`` and
-  ``lorrax_slate_batched_gemm`` are claimed by ``distrib_la.loader``'s
-  target table but have no C++ definition anywhere in this tree
-  (``KNOWN_LORRAX_ISSUES.md``, "services/distrib_la loader vs src/ffi"
-  row) — confirmed again here by `nm -D` on the pinned CUDA library, which
-  exports only ``CublasMpBatchedGemmFfi``.  A request that resolves to
-  either provider refuses at :func:`gemm_plan` construction, by name, using
-  the SAME capability probe ``distrib_la.matmul`` already runs — this
-  module adds no leniency and no second probe path.
+* **cuBLASMp on CUDA; a gathered XLA dot on CPU.**  On a CPU mesh an
+  ``auto``/``distributed`` face plan gathers the contraction axis (A over
+  ``'y'``, B over ``'x'``) inside its ``shard_map`` and contracts with the
+  local plan's XLA dot; the output keeps ``P(None,'x','y')``.  Each rank
+  holds the ``(nq, m/px, k)`` and ``(nq, k, n/py)`` panels for one call.
+  ``lorrax_scalapack_batched_gemm`` and ``lorrax_slate_batched_gemm`` are
+  claimed by ``distrib_la.loader``'s target table but have no C++
+  definition, so an explicit request for either refuses at
+  :func:`gemm_plan` construction through ``distrib_la.matmul``'s own
+  capability probe.
 * **Provider route only.**  ``batch_reshard`` materializes complete A, B,
   C and D on every device (``matmul.py:377-384``); the whole reason a
   caller reaches for a *planned* GEMM is a G/Sigma-sized object that must
@@ -166,7 +167,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from distrib_la._shard_map import shard_map
 from distrib_la.matmul import (_CUBLASMP_CACHE, _OP_CODE, _TARGETS, _mesh_shape, _zeros,
                                resolve_matmul_backend)
-from distrib_la.resolve import mesh_key
+from distrib_la.resolve import mesh_key, mesh_platform
 
 __all__ = ["GemmPlan", "gemm_plan", "local_gemm_plan"]
 
@@ -458,11 +459,15 @@ class GemmPlan:
     #: plans): a pure function of the configuration, unlike ``ctx_handle``
     #: (the live address, for the ctypes workspace queries only).
     ctx_key: int = 0
+    #: CPU face plan: A and B arrive at ``P(None,'x','y')`` and the local
+    #: body gathers the contraction axis before the XLA dot.
+    face_gather: bool = False
 
     def describe(self) -> str:
         """One line for a run banner: what resolved, and to what shape."""
         px, py = _mesh_shape(self.mesh)
-        return (f"gemm_plan: {self.backend} N,N on {px}x{py}, "
+        backend = f"{self.backend} (face, K gathered)" if self.face_gather else self.backend
+        return (f"gemm_plan: {backend} N,N on {px}x{py}, "
                 f"shape (nq={self.nq}, m={self.m}, k={self.k}, n={self.n}), "
                 f"dtype={self.dtype}, alpha={self.alpha}, beta={self.beta}")
 
@@ -612,6 +617,8 @@ class GemmPlan:
                 local_impl = partial(
                     active_local_matmul, bounds=constant_bounds,
                     alpha=self.alpha, beta=self.beta)
+                if self.face_gather:
+                    local_impl = _face_gathered(local_impl)
 
             prepared_no_c = None
             if self.beta == 0:
@@ -742,8 +749,9 @@ class GemmPlan:
                 c_shape = tuple(size // (self.mesh.shape[axis] if axis else 1)
                                 for size, axis in zip((self.nq, self.m, self.n), self.out_sharding.spec))
                 _check_local_operand(self, "C/out", c, c_shape)
-            return _axis_matmul(A, B, c, alpha=self.alpha, beta=self.beta,
-                                reduction_axis=self.reduction_axis)
+            body = _face_gathered(_axis_matmul) if self.face_gather else _axis_matmul
+            return body(A, B, c, alpha=self.alpha, beta=self.beta,
+                        reduction_axis=self.reduction_axis)
         _check_local_operand(self, "A", A, (self.nq, self.m // px, self.k // py))
         _check_local_operand(self, "B", B, (self.nq, self.k // px, self.n // py))
         c_or_out = C if C is not None else out
@@ -781,6 +789,15 @@ def _axis_matmul(a, b, c=None, *, alpha, beta, reduction_axis=None):
     return result
 
 
+def _face_gathered(fn):
+    """Give a local body face operands: gather K (A over 'y', B over 'x')."""
+    def body(a, b, *rest, **kw):
+        a = jax.lax.all_gather(a, "y", axis=2, tiled=True)
+        b = jax.lax.all_gather(b, "x", axis=1, tiled=True)
+        return fn(a, b, *rest, **kw)
+    return body
+
+
 def local_gemm_plan(mesh: Mesh, *, m: int, k: int, n: int, nq: int,
                     dtype, alpha=1.0, beta=0.0, reduction_axis=None, out_spec=None,
                     enable_active_range=False, warmup: bool = True) -> GemmPlan:
@@ -790,6 +807,17 @@ def local_gemm_plan(mesh: Mesh, *, m: int, k: int, n: int, nq: int,
     the same ``GemmPlan.active_range`` API as the distributed face backend.
     Reduction-axis and single-axis-output plans retain dense behavior only.
     """
+    return _local_plan(mesh, m=m, k=k, n=n, nq=nq, dtype=dtype, alpha=alpha,
+                       beta=beta, reduction_axis=reduction_axis,
+                       out_spec=out_spec,
+                       enable_active_range=enable_active_range,
+                       warmup=warmup, face_gather=False)
+
+
+def _local_plan(mesh: Mesh, *, m, k, n, nq, dtype, alpha, beta,
+                reduction_axis, out_spec, enable_active_range, warmup,
+                face_gather) -> GemmPlan:
+    """:func:`local_gemm_plan`; ``face_gather`` is the CPU face plan."""
     m, k, n, nq = (_as_extent(label, value) for label, value in
                    (("m", m), ("k", k), ("n", n), ("nq", nq)))
     dtype = jnp.dtype(dtype)
@@ -805,6 +833,12 @@ def local_gemm_plan(mesh: Mesh, *, m: int, k: int, n: int, nq: int,
         if axis is not None and extent % mesh.shape[axis]:
             raise ValueError("local_gemm_plan: output extent does not tile its mesh axis")
     a_spec, b_spec = P(None, out_spec[1], None), P(None, None, out_spec[2])
+    if face_gather:
+        if reduction_axis is not None or out_spec != P(None, "x", "y"):
+            raise ValueError("face plan: two-axis output, no centroid reduction")
+        if k % px or k % py:
+            raise ValueError(f"gemm_plan: k={k} does not tile the {px}x{py} mesh")
+        a_spec = b_spec = P(None, "x", "y")
     if reduction_axis is not None and out_spec != P(None, "x", "y"):
         raise ValueError("local_gemm_plan: centroid reduction requires the two-axis output")
     if reduction_axis == "y":
@@ -832,6 +866,8 @@ def local_gemm_plan(mesh: Mesh, *, m: int, k: int, n: int, nq: int,
     a_sh, b_sh, out_sh = (NamedSharding(mesh, spec)
                            for spec in (a_spec, b_spec, out_spec))
     local = partial(_axis_matmul, alpha=alpha, beta=beta, reduction_axis=reduction_axis)
+    if face_gather:
+        local = _face_gathered(local)
     with_c = jax.jit(shard_map(local, mesh=mesh,
         in_specs=(a_spec, b_spec, out_spec), out_specs=out_spec,
         check_vma=False), donate_argnums=(2,) if beta != 0 else ())
@@ -848,11 +884,14 @@ def local_gemm_plan(mesh: Mesh, *, m: int, k: int, n: int, nq: int,
     plan = GemmPlan(mesh=mesh, backend="local", m=m, k=k, n=n, nq=nq,
                     dtype=dtype, alpha=alpha, beta=beta,
                     in_sharding_a=a_sh, in_sharding_b=b_sh, out_sharding=out_sh,
-                    ctx_handle=0, _fn_with_c=with_c, _fn_no_c=no_c, reduction_axis=reduction_axis)
+                    ctx_handle=0, _fn_with_c=with_c, _fn_no_c=no_c, reduction_axis=reduction_axis,
+                    face_gather=face_gather)
     if not enable_active_range:
         return plan
     from dataclasses import replace
     active = partial(active_impl, alpha=alpha, beta=beta)
+    if face_gather:
+        active = _face_gathered(active)
     # Exercise a genuine partial interval before returning the plan. Full
     # ranges deliberately bypass the active CUDA target and would not warm it.
     warm_hi = k - 1 if k > 1 else k
@@ -940,12 +979,11 @@ def gemm_plan(
         handler compiles for.
     backend
         A name from ``distrib_la.MATMUL_BACKEND_CHOICES`` other than
-        ``'off'``.  ``'auto'``/``'distributed'`` resolve to the platform's
-        provider exactly as ``distrib_la.matmul`` does; only
-        ``cublasmp``/``cusolvermp`` have a warmed kernel in this module
-        today (see the module docstring) — a resolved ``scalapack``/
-        ``slate`` refuses BY NAME rather than silently falling back to a
-        route this module does not implement.
+        ``'off'``.  On a CPU mesh ``'auto'``/``'distributed'`` build the
+        gathered face plan (module docstring); elsewhere they resolve to the
+        platform's provider exactly as ``distrib_la.matmul`` does.  Only
+        ``cublasmp``/``cusolvermp`` have a warmed provider kernel here; an
+        explicit ``scalapack``/``slate`` refuses BY NAME.
     alpha, beta
         Fixed GEMM scalars, baked into the compiled kernel — cuBLASMp
         takes them as FFI attributes, not array arguments, so they cannot
@@ -985,6 +1023,12 @@ def gemm_plan(
             "GEMM exists to avoid for a G/Sigma-sized operand.  Use "
             "distrib_la.matmul(..., batched_route='batch_reshard') "
             "directly for that route.")
+    if requested.strip().lower() in ("auto", "distributed") and mesh_platform(mesh) == "cpu":
+        return _local_plan(mesh, m=m, k=k, n=n, nq=nq, dtype=dtype,
+                           alpha=alpha_c, beta=beta_c, reduction_axis=None,
+                           out_spec=None,
+                           enable_active_range=enable_active_range,
+                           warmup=warmup, face_gather=True)
     resolved = resolve_matmul_backend(requested, mesh, batched_route="auto")
     if resolved != "cublasmp":
         raise NotImplementedError(

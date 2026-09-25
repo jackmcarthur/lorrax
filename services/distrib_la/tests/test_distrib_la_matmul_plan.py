@@ -3,9 +3,10 @@
 Real cuBLASMp execution needs a CUDA mesh with one process per device, so
 none of it is reachable here: every cell in this file either exercises a
 pure-Python helper directly, or drives ``gemm_plan()`` on an emulated CPU
-mesh far enough to observe its EAGER refusal ladder (backend='off', a
-resolved non-cuBLASMp provider, mesh topology, shape divisibility, dtype)
-BEFORE it would reach ``get_or_init_context``/the FFI call.  Numerics
+mesh far enough to observe its EAGER refusal ladder (backend='off', an
+explicit non-cuBLASMp provider, mesh topology, shape divisibility, dtype)
+BEFORE it would reach ``get_or_init_context``/the FFI call.  The CPU face
+plan (K gathered, XLA dot) is executed here against a dense reference.  Numerics
 inside nested ``jit``/``lax.scan``, the donated-``out=`` path, and the
 internal-zero-``C`` kernel are the real four-rank CUDA gate,
 ``check_gemm_plan_cublasmp`` in ``test_distrib_la_multiproc.py``
@@ -70,16 +71,75 @@ def test_backend_off_refuses_by_name():
                    backend="off")
 
 
-def test_cpu_mesh_resolves_scalapack_and_gemm_plan_refuses_by_name():
-    """cuBLASMp is CUDA-only, so 'auto' on a CPU mesh resolves to
-    scalapack -- for which this module has no warmed kernel (the GEMM FFI
-    symbol itself does not exist in the tree either, per
-    KNOWN_LORRAX_ISSUES.md).  Either way the caller gets a NAMED refusal,
-    never a silent construction of something unusable."""
-    mesh = _mesh()
-    with pytest.raises((RuntimeError, NotImplementedError)):
+def _dense(rng, shape):
+    return rng.normal(size=shape) + 1j * rng.normal(size=shape)
+
+
+@pytest.mark.parametrize("grid", [(1, 1), (2, 2)])
+@pytest.mark.parametrize("beta", [0.0, 0.3 - 0.1j])
+def test_cpu_face_plan_matches_dense(grid, beta):
+    """On a CPU mesh the face plan gathers K and matches the dense GEMM:
+    __call__, active_range (per-q bounds, weights), prepare_active_range and
+    local_call inside a manual shard_map.  The output stays P(None,'x','y')."""
+    import jax
+    import jax.numpy as jnp
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    from distrib_la._shard_map import shard_map
+    mesh = _mesh(*grid)
+    nq, m, k, n = 3, 8, 12, 6
+    alpha = 0.7 + 0.2j
+    rng = np.random.default_rng(20260925)
+    a, b, c = _dense(rng, (nq, m, k)), _dense(rng, (nq, k, n)), _dense(rng, (nq, m, n))
+    w = _dense(rng, (nq, k))
+    plan = D.gemm_plan(mesh, m=m, k=k, n=n, nq=nq, dtype="complex128",
+                       alpha=alpha, beta=beta, enable_active_range=True)
+    face = NamedSharding(mesh, P(None, "x", "y"))
+    assert plan.face_gather and "K gathered" in plan.describe()
+    assert plan.in_sharding_a == face and plan.in_sharding_b == face
+    assert plan.out_sharding == face
+    aa, bb, cc = (jax.device_put(v, face) for v in (a, b, c))
+
+    def want(prod):
+        return alpha * prod + (beta * c if beta else 0)
+
+    got = plan(aa, bb, C=cc) if beta else plan(aa, bb)
+    assert got.sharding == face
+    np.testing.assert_allclose(np.asarray(got), want(a @ b), atol=1e-12, rtol=0)
+
+    lo = np.asarray([0, 3, 5], np.int32)
+    hi = np.asarray([12, 9, 5], np.int32)
+    mask = (np.arange(k)[None, :] >= lo[:, None]) & (np.arange(k)[None, :] < hi[:, None])
+    active_want = want((a * (w * mask)[:, None, :]) @ b)
+    rep = NamedSharding(mesh, P())
+    lo_d, hi_d = jax.device_put(lo, rep), jax.device_put(hi, rep)
+    kw = dict(C=jax.device_put(c, face)) if beta else {}
+    got = jax.jit(lambda x, y, l, h: plan.active_range(x, y, l, h, weights=w, **kw))(
+        aa, bb, lo_d, hi_d)
+    np.testing.assert_allclose(np.asarray(got), active_want, atol=1e-12, rtol=0)
+
+    prepared = plan.prepare_active_range(3, 9)
+    band = np.zeros(k, bool)
+    band[3:9] = True
+    got = prepared(aa, bb, weights=w, **kw)
+    np.testing.assert_allclose(np.asarray(got), want((a * (w * band)[:, None, :]) @ b),
+                               atol=1e-12, rtol=0)
+
+    def body(x, y, z):
+        return plan.local_call(x, y, C=z) if beta else plan.local_call(x, y)
+    manual = jax.jit(shard_map(body, mesh=mesh, in_specs=(P(None, "x", "y"),) * 3,
+                               out_specs=P(None, "x", "y"), check_vma=False))
+    got = manual(aa, bb, jax.device_put(c, face))
+    np.testing.assert_allclose(np.asarray(got), want(a @ b), atol=1e-12, rtol=0)
+
+
+def test_cpu_explicit_scalapack_refuses_through_the_probe():
+    """No host batched-GEMM handler exists; the probe refuses by name
+    (``ProbeResult`` is a tuple, so this needs ``probe.ok``).  A 1x1 mesh
+    passes the one-process-per-cell guard, so the probe is what refuses."""
+    mesh = _mesh(1, 1)
+    with pytest.raises(RuntimeError, match="'scalapack' is unavailable"):
         D.gemm_plan(mesh, m=4, k=4, n=4, nq=2, dtype="complex128",
-                   backend="auto")
+                   backend="scalapack")
 
 
 def test_explicit_cublasmp_refuses_off_cuda():
