@@ -1065,6 +1065,9 @@ def _plane_runs(pfc: np.ndarray, n_col: int) -> tuple:
     ``(start, stop)`` for cells holding the consecutive columns ``[start,
     stop)``, ``(-1, length)`` for empty cells; concatenating ``F[...,
     start:stop]`` and zero blocks is ``take(F, pfc, mode='fill')`` bit for bit.
+    Kept 2026-09-25 (FP, close call): the XLA route serves every plane mode 10
+    cannot, among them the 80² production planes on sm_86/89/120 (99 KiB), and the
+    runs cut that plane stage 5.54 -> 4.98 ms on A100 (claim 2746), ~2-5% of FFT time.
     """
     empty = pfc >= n_col
     brk = np.flatnonzero(np.r_[True, (empty[1:] != empty[:-1])
