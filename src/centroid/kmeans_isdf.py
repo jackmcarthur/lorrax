@@ -2,9 +2,8 @@
 
 Distances use the metric tensor ``G = avec @ avec.T`` (rows-of-avec are
 lattice vectors) and the min image of ``df + n`` over a precomputed
-integer-offset table — exact for any Bravais lattice, not just
-orthorhombic. Sizes for the table are 1 / 5 / 7 for cubic / 2D-hex /
-primitive FCC. See ``build_min_image_offsets``.
+integer-offset table. Its bounds are derived from the metric, so a skew
+or unreduced cell can require offsets beyond the adjacent images.
 
 Public surface:
 
@@ -43,42 +42,90 @@ BOHR_TO_ANG = 0.529177210544
 # ─────────────────────────────────────────────────────────────────────────
 
 def build_min_image_offsets(metric_tensor, search_radius: int = 1) -> np.ndarray:
-    """Minimal integer-offset table such that ``min_n (df+n)^T G (df+n)``
-    over ``df ∈ [-0.5, 0.5]^3`` agrees with the brute-force search over
-    ``Z^3``. Greedy set cover over candidates in ``{-R,...,R}^3``.
+    """Complete offset table for the closest image of a centred displacement.
 
     Returns ``(M, 3)`` int32 with identity at ``[0]``. Typical M: 1 for
     cubic / orthorhombic, 5 for 2D-hex-with-orthogonal-c, 7 for primitive
-    FCC.
+    FCC. ``search_radius`` is a lower bound on the enumerated range, never
+    a cap that can silently omit a winning image.
+
+    A winner ``x = df+n`` has ``x.T@G@x <= df.T@G@df <= D``, where ``D`` is
+    the largest value at the eight vertices of the centred unit cube.
+    Cauchy--Schwarz gives ``|x_i| <= sqrt(D * (G^-1)[i,i])``. Hence every
+    possible winner lies in a finite integer box. Within that box, discard
+    an offset ``n`` only if another ``m`` is no farther *everywhere* in the
+    cube: ``n.T@G@n - m.T@G@m >= ||G@(n-m)||_1``. This is an exact linear
+    inequality over the cube, unlike sampling displacements on a mesh.
     """
     import itertools as _it
     G = np.asarray(metric_tensor, dtype=np.float64)
+    if (G.shape != (3, 3) or not np.all(np.isfinite(G))
+            or not np.allclose(G, G.T, rtol=1e-12, atol=0.0)):
+        raise ValueError("min-image metric must be a finite symmetric 3x3 matrix")
+    G = (G + G.T) / 2
+    if np.linalg.eigvalsh(G)[0] <= 0:
+        raise ValueError("min-image metric must be positive definite")
     R = int(search_radius)
-    s = np.linspace(-0.5, 0.5, 11)
-    df = np.stack(np.meshgrid(s, s, s, indexing="ij"), axis=-1).reshape(-1, 3)
-    all_offs = np.array(list(_it.product(range(-R, R + 1), repeat=3)),
-                        dtype=np.float64)
-    df_all = df[:, None, :] + all_offs[None, :, :]
-    d2 = np.einsum("koi,ij,koj->ko", df_all, G, df_all)
-    d2_min = d2.min(axis=1)
+    if R < 0:
+        raise ValueError("search_radius must be nonnegative")
 
-    tol = 1e-12 * (np.abs(d2).max() + 1.0)
-    is_min = d2 <= d2_min[:, None] + tol
-    identity_i = int(np.argmax(np.all(all_offs == 0, axis=1)))
-    kept = [identity_i]
-    covered = is_min[:, identity_i].copy()
-    while not covered.all():
-        gain = (is_min & ~covered[:, None]).sum(axis=0)
-        gain[kept] = -1
-        best = int(np.argmax(gain))
-        if gain[best] <= 0:
-            raise RuntimeError(
-                f"build_min_image_offsets: R={R} candidates did not cover "
-                "all df. Increase search_radius."
-            )
-        kept.append(best)
-        covered |= is_min[:, best]
-    return np.asarray([all_offs[i] for i in kept], dtype=np.int32)
+    # Long double reduces cancellation at a nearly coincident Voronoi face.
+    # The 3x3 adjugate also keeps the bound in that precision; NumPy's
+    # general inverse currently drops long double back to float64.
+    G = G.astype(np.longdouble)
+    vertices = np.asarray(list(_it.product((-0.5, 0.5), repeat=3)),
+                          dtype=np.longdouble)
+    D = max(v @ G @ v for v in vertices)
+    cof_diag = np.array([
+        G[1, 1] * G[2, 2] - G[1, 2] ** 2,
+        G[0, 0] * G[2, 2] - G[0, 2] ** 2,
+        G[0, 0] * G[1, 1] - G[0, 1] ** 2,
+    ], dtype=np.longdouble)
+    determinant = (G[0, 0] * cof_diag[0]
+                   - G[0, 1] * (G[0, 1] * G[2, 2] - G[0, 2] * G[1, 2])
+                   + G[0, 2] * (G[0, 1] * G[1, 2] - G[0, 2] * G[1, 1]))
+    if determinant <= 0 or np.any(cof_diag <= 0):
+        raise ValueError("min-image metric is too ill-conditioned to bound images")
+    radius_bound = np.longdouble(0.5) + np.sqrt(D * cof_diag / determinant)
+    if (np.any(~np.isfinite(radius_bound))
+            or np.any(radius_bound >= np.iinfo(np.int32).max - 2)
+            or R >= np.iinfo(np.int32).max - 2):
+        raise ValueError("min-image metric requires offsets beyond int32 range")
+    radius = np.maximum(R, np.ceil(np.nextafter(
+        radius_bound, np.longdouble(np.inf))).astype(np.int64))
+    candidate_count = int(np.prod(2 * radius + 1, dtype=object))
+    if candidate_count > 1_000_000:
+        raise ValueError(
+            "min-image metric requires more than one million translation "
+            "candidates; use a reduced lattice basis")
+
+    candidates = np.asarray(list(_it.product(*(
+        range(-int(r), int(r) + 1) for r in radius))), dtype=np.longdouble)
+    zero = np.all(candidates == 0, axis=1)
+    Gn = candidates @ G
+    q = np.sum(Gn * candidates, axis=1)
+    # If zero dominates n throughout the cube, n cannot change the minimum.
+    possible = zero | (q < np.sum(np.abs(Gn), axis=1))
+    candidates, q = candidates[possible], q[possible]
+    if len(candidates) > 10_000:
+        raise ValueError(
+            "min-image metric has more than 10000 potentially relevant "
+            "translations; use a reduced lattice basis")
+
+    keep = np.ones(len(candidates), dtype=bool)
+    for i, n in enumerate(candidates):
+        if np.all(n == 0):
+            continue
+        # The minimum of d_n²-d_m² over df in [-1/2,1/2]^3 is the
+        # quadratic difference minus the L1 norm of G(n-m).
+        min_difference = q[i] - q - np.sum(
+            np.abs((n - candidates) @ G), axis=1)
+        min_difference[i] = -np.inf
+        if np.any(min_difference >= 0):
+            keep[i] = False
+    kept = candidates[keep].astype(np.int32)
+    return np.concatenate((np.zeros((1, 3), dtype=np.int32),
+                           kept[np.any(kept != 0, axis=1)]), axis=0)
 
 
 def _quadform_G(dx, dy, dz, g00, g01, g02, g11, g12, g22):
@@ -238,10 +285,10 @@ def assign_labels_orbit_chunked(
     contains the closest image, plus a boolean tie mask of the symmetry
     operations that achieve that minimum (for the winning rep only).
 
-    Two-pass scan body: pass 1 computes orbit distance via
-    fori_loop(sym, fori_loop(offset, ...)) — peak buffer (P, c_block).
-    Pass 2 builds the (P, n_sym) tie mask only for the winning rep —
-    one extra fori_loop over sym, peak buffer (P,).
+    The scan computes orbit distances via fori_loop(sym,
+    fori_loop(offset, ...)) with a peak buffer of (P, c_block). Once the
+    globally winning rep is known, one final symmetry loop builds its
+    (P, n_sym) tie mask. A losing chunk never needs a tie mask.
 
     Returns
     -------
@@ -267,7 +314,7 @@ def assign_labels_orbit_chunked(
     P = positions.shape[0]
 
     def body(carry, rep_chunk):
-        best_d, best_label, best_tie, chunk_idx = carry
+        best_d, best_label, chunk_idx = carry
 
         # Pass 1: orbit distance per (point, rep-in-chunk).
         def sym_loop(s, orbit_d):
@@ -289,35 +336,30 @@ def assign_labels_orbit_chunked(
         local_c = orbit_d.argmin(axis=1).astype(jnp.int32)        # (P,)
         local_d = jnp.take_along_axis(orbit_d, local_c[:, None], axis=1)[:, 0]
 
-        # Pass 2: tie mask for the winning rep only, per point.
-        winning_rep = rep_chunk[local_c]                           # (P, 3)
-
-        def tie_sym_loop(s, tie_mask):
-            image_p = _sym.r_action_forward_one(                   # (P, 3)
-                winning_rep, Rinv[s], tau[s], wrap=False)   # min-image metric
-            d2_s = _orbit_d2_per_point(positions, image_p, metric, offsets)
-            is_tied = d2_s <= local_d + tie_tol
-            return tie_mask.at[:, s].set(is_tied)
-
-        local_tie = lax.fori_loop(
-            0, n_sym, tie_sym_loop, jnp.zeros((P, n_sym), dtype=bool)
-        )
-
         better = local_d < best_d
         return (
             jnp.where(better, local_d, best_d),
             jnp.where(better, chunk_idx * c_block + local_c, best_label),
-            jnp.where(better[:, None], local_tie, best_tie),
             chunk_idx + 1,
         ), None
 
     init = (
         jnp.full((P,), jnp.inf, dtype=metric.dtype),
         jnp.zeros((P,), dtype=jnp.int32),
-        jnp.zeros((P, n_sym), dtype=bool),
         jnp.int32(0),
     )
-    (best_d2, labels, tie_mask, _), _ = lax.scan(body, init, reps_blocked, unroll=1)
+    (best_d2, labels, _), _ = lax.scan(body, init, reps_blocked, unroll=1)
+    winning_rep = reps[labels]
+
+    def tie_sym_loop(s, tie_mask):
+        image_p = _sym.r_action_forward_one(
+            winning_rep, Rinv[s], tau[s], wrap=False)
+        d2_s = _orbit_d2_per_point(positions, image_p, metric, offsets)
+        return tie_mask.at[:, s].set(d2_s <= best_d2 + tie_tol)
+
+    tie_mask = lax.fori_loop(
+        0, n_sym, tie_sym_loop, jnp.zeros((P, n_sym), dtype=bool)
+    )
     return labels, best_d2, tie_mask
 
 
@@ -888,9 +930,9 @@ def ensure_unique_centroids(
 # Init-method heuristics (host-side)
 # ─────────────────────────────────────────────────────────────────────────
 #
-# When N_c is a sizeable fraction of the FFT grid, kmeans++ init becomes
-# both expensive (O(N_c · P)) and unnecessary (Lloyd converges to the same
-# answer as a density-weighted i.i.d. seed).
+# When N_c is a sizeable fraction of the FFT grid, kmeans++ init costs
+# O(N_c · P). The density-weighted random fallback avoids that seeding cost;
+# it can reach a different Lloyd local minimum.
 
 _KPP_SKIP_FRACTION = 0.10
 _DENSE_WARN_FRACTION = 0.25
@@ -911,7 +953,7 @@ def _warn_dense_grid_regime(m_cand: int, n_c: int, n_rtot: int,
                             ) -> str | None:
     if n_c > int(n_rtot * threshold):
         return (f"WARNING: N_c = {n_c} > {int(n_rtot * threshold)} = "
-                f"n_rtot · {threshold:g}; pivoted Cholesky on the *full* "
-                f"real-space grid would be the right algorithm here but is "
-                f"not implemented. Proceeding with k-means + prune.")
+                f"n_rtot · {threshold:g}; the requested selection is dense "
+                f"on the FFT grid, so check candidate coverage and Gram "
+                f"conditioning. Proceeding with k-means + prune.")
     return None
