@@ -608,9 +608,9 @@ def _get_chi_fractional_contour_kernel_face(
     the Dirac vertices act on its spin indices,
     ``chi^AB = sum_ab (J_A G^> J_B^dagger)_ab conj(G^<)_ab``
     (``common.gamma_matrices.gamma_vertex_trace``).  One family
-    pair's two Greens are live at a time.  The rows accumulate in the
-    families' packed photon layout and cross into the canonical layout once
-    at the end of the call.  No psi face is unfolded.
+    pair's two Greens are live at a time.  Each node's correlation is formed
+    in the families' packed photon layout and its selected q rows cross into
+    the canonical layout before they accumulate.  No psi face is unfolded.
     """
     from common.fft_helpers import make_flat_k_fftn
     from distrib_la import gemm_plan
@@ -759,15 +759,18 @@ def _get_chi_fractional_contour_kernel_face(
         n_mu = (psi_mun.shape[2] if photon is None
                 else photon.packed_layout.packed_extent)
         q_count = nk if selected_q is None else len(selected_q)
+        # Selected rows accumulate in the output order (``rows``); a full
+        # grid accumulates R-space correlations, converted when finished.
+        n_acc = n_mu if photon is None or selected_q is None else n_rmu
         zero = jax.lax.with_sharding_constraint(
-            jnp.zeros((q_count, n_mu, n_mu), dtype=jnp.complex128),
+            jnp.zeros((q_count, n_acc, n_acc), dtype=jnp.complex128),
             chi_R_shard,
         )
         initial = (tuple(zero for _ in range(n_out)) if selected_q is None
                    else jax.lax.with_sharding_constraint(
                        jnp.broadcast_to(zero, (n_out,) + zero.shape),
                        selected_shard))
-        if bank_carry and photon is None:
+        if bank_carry:
             initial = carry[0]
 
         def green_k(weight, t, ref, *, current=False, family_pair=None):
@@ -868,8 +871,21 @@ def _get_chi_fractional_contour_kernel_face(
                 jnp.exp(-eps*time-jnp.logaddexp(0., -beta*eps)), 0.)
             return spin_correlation(lower, 0., mu, upper, 0., mu)
 
+        def rows(value, q):
+            """The q rows of a transformed correlation, in the output's centroid order.
+
+            A four-current stream accumulates each node's rows in canonical
+            order: the conversion acts on ``(q, N, N)``, never on the
+            ``(n_out, q, N, N)`` accumulator.
+            """
+            value = jnp.take(value, jnp.asarray(q), axis=0)
+            if photon is None:
+                return value
+            from .photon_layout import photon_family_order
+            return photon_family_order(value, photon, mesh_xy, P(None, "x", "y"))
+
         def selected(value):
-            return jnp.take(chi_fftn(value), jnp.asarray(gather_q), axis=0)
+            return rows(chi_fftn(value), gather_q)
 
         def add_laplace(accumulators, even, odd, projection):
             contribution = selected(even + jnp.conj(even))
@@ -905,10 +921,8 @@ def _get_chi_fractional_contour_kernel_face(
                 # green_k owns its own physical/incumbent conjugation.
                 value = chi_fftn(spin_correlation(occ_f, -time, energy_reference[0],
                     occ_u, jnp.conj(time), energy_reference[1]))
-                acc = accumulate_selected(
-                    acc, jnp.take(value, jnp.asarray(gather_q), axis=0), forward)
-                return accumulate_selected(
-                    acc, jnp.conj(jnp.take(value, jnp.asarray(reverse_q), axis=0)), reverse)
+                acc = accumulate_selected(acc, rows(value, gather_q), forward)
+                return accumulate_selected(acc, jnp.conj(rows(value, reverse_q)), reverse)
             return jax.lax.cond(jnp.any(forward != 0) | jnp.any(reverse != 0), add,
                                 lambda acc: acc, accumulators), None
 
@@ -948,11 +962,6 @@ def _get_chi_fractional_contour_kernel_face(
                 finished = tuple(photon_family_order(value, photon, mesh_xy, CHI_Q_SPEC)
                                  for value in finished)
             return finished
-        if photon is not None:
-            from .photon_layout import photon_family_order
-            final_R = photon_family_order(final_R, photon, mesh_xy, P(None, None, "x", "y"))
-            if bank_carry:
-                final_R = carry[0] + final_R
         if bank_carry:
             return final_R
         # Public bank order [parent, sample, mu_x, mu_y].
