@@ -775,6 +775,43 @@ class MixedBasisPairConvolution:
         return X
 
     # ------------------------------------------------------------------ receipts
+    def collective_census(self) -> dict:
+        """Collectives in each stage's compiled HLO, lowered on abstract operands:
+        ``{stage: {op: count}}`` (the structural claim: the streamed middle moves nothing)."""
+        import re
+        ns, nk, nq = self.ns, self.nk, self.nq
+        sd = lambda shape, dt, spec: jax.ShapeDtypeStruct(shape, dt, sharding=NamedSharding(self.mesh, spec))
+        rep = lambda shape, dt: sd(shape, dt, P())
+        i32, c128, f64 = jnp.int32, jnp.complex128, jnp.float64
+        ops = {}
+        for name, (t, M) in zip(("left", "right"), zip(self._tables, self.width_carrier)):
+            tile = sd((t["n_parent"], M, ns, M, ns), c128, P(None, "x", None, "y", None))
+            slab = sd((t["n_parent"], M, ns, M, ns), c128, P(None, _XY, None, None, None))
+            nbox = t["csrc"].shape[1]
+            ops[f"slab {name}"] = self._slab.lower(tile)
+            ops[f"expand {name}"] = self._expand[0 if name == "left" else 1][False].lower(
+                slab, slab, rep((), i32), rep((nk,), i32), rep((nk,), i32), rep((nk, ns, ns), c128),
+                rep((nk, nbox), i32), rep((nk, nbox), c128), rep((nk, 3), f64))
+        H = [sd((nk, M, ns, ns, self.P * self.cols_chunk), c128, P(None, None, None, None, _XY))
+             for M in self.width_carrier]
+        T = sd((nq, self.mo_axis.carrier, self.nr_carrier), c128, P(None, None, _XY))
+        tb = [(rep((nk, t["csrc"].shape[1]), i32), rep((nk, t["csrc"].shape[1]), c128),
+               rep((nk, ns, ns), c128)) for t in self._tables]
+        ops["middle"] = self._middle.lower(H[0], H[1], T, rep((), i32), rep((nk, 3), f64),
+                                           rep((nq, 3), f64), rep((nq,), i32),
+                                           rep((nq, self.mo_axis.carrier), i32), *tb[0], *tb[1])
+        ops["final"] = self._final.lower(T, rep((nq, 3), f64), rep((nq, self.mo_axis.carrier), i32))
+        pat = re.compile(r"\b(all-to-all|all-gather|all-reduce|reduce-scatter|collective-permute)"
+                         r"(-start)?\(")
+        out = {}
+        for name, low in ops.items():
+            text = low.compile().as_text()
+            counts = {}
+            for m in pat.finditer(text):
+                counts[m.group(1)] = counts.get(m.group(1), 0) + 1
+            out[name] = counts
+        return out
+
     def describe(self) -> str:
         """The plan receipt: backend, box, carriers, schedule and the memory law."""
         c = self.chunks

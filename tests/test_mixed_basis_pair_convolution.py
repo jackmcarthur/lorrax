@@ -104,6 +104,21 @@ def test_random_operands_match_the_dense_reference(n_mesh, ns, backend):
     assert cases.rel(got, ref) <= TOL, (cases.rel(got, ref), tight.describe())
 
 
+def test_collective_census():
+    """The streamed middle compiles to no collective; each redistribution is one all-to-all
+    (the census counts nonzero where collectives exist, so an empty middle is a measurement)."""
+    from gw.mixed_basis_pair_convolution import SphereSet, SphereTransport
+    c = random_case(2)
+    tr = SphereTransport.identity(SphereSet(c["sph"], c["ngk"], c["kfrac"]), 2)
+    conv = _conv(_mesh(4), c["kgrid"], c["fft_grid"], c["sph"], c["ngk"], c["kfrac"], c["out"],
+                 transport=tr, backend="xla", budget_bytes=int(1e10), chunks=(2, 3, 2, 1))
+    census = conv.collective_census()
+    assert census["middle"] == {}, census
+    assert census["final"] == {"all-to-all": 2}, census
+    for k in ("slab left", "slab right", "expand left", "expand right"):
+        assert census[k] == {"all-to-all": 1}, census
+
+
 def test_rolled_transport_misses():
     from gw.mixed_basis_pair_convolution import SphereSet, SphereTransport
     c = random_case(1)

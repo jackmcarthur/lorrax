@@ -12,6 +12,8 @@ processes, one GPU each:
   k-convolution (``kconv_backend == 'mathdx'``), ``'xla'`` must be the forced fallback;
 * fast path against fallback on a larger random case (k-grid 4x4x4, box 12^3, no
   dense reference): 1e-12 of max|X|;
+* the router plan's compiled stages hold only the planned collectives: one all-to-all
+  per slab and expand, two in the final stage, none in the streamed middle;
 * ``--wfn WFN.h5`` adds a real magnetic crystal (Fe, n_s = 2, antiunitary rows): its
   SymMaps with metric spheres at a reduced cutoff on a 6^3 box, parents against the
   full grid from the r-space action.
@@ -130,13 +132,20 @@ def main():
         out = (*cases.spheres(kfrac[qsel], metric, 3.0, span=4), kfrac[qsel])
         tr = SphereTransport.identity(SphereSet(sph, ngk, kfrac), ns)
         got = {}
-        for backend in ("router", "xla"):
+        for backend in ("xla", "router"):
             conv = t._conv(mesh, kgrid, box, sph, ngk, kfrac, out, transport=tr, backend=backend,
                            budget_bytes=int(8e9))
             got[backend] = t._run(conv, A, C)
             say(conv.describe())
         e = cases.rel(got["router"], got["xla"])
         check(f"fast vs fallback ns={ns} k 4^3 box 12^3 M={sph.shape[1]}", e <= 1e-12, f"rel {e:.2e}")
+
+    # ---- collective census of the fast path's compiled stages ---------------
+    census = conv.collective_census()
+    want = {"middle": {}, "final": {"all-to-all": 2}, "slab left": {"all-to-all": 1},
+            "slab right": {"all-to-all": 1}, "expand left": {"all-to-all": 1},
+            "expand right": {"all-to-all": 1}}
+    check("collective census (router, compiled HLO)", census == want, str(census))
 
     say("ALL PASS" if not FAILS else f"FAILED: {FAILS}")
     return 0 if not FAILS else 1
