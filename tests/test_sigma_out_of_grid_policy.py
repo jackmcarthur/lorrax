@@ -84,6 +84,22 @@ def test_cover_grows_over_every_non_frozen_identity_and_nothing_else():
         np.testing.assert_array_equal(grown, GRID)       # beyond the +9.44 padded top
 
 
+@pytest.mark.parametrize("policy", ("clamp", "static"))
+def test_frozen_core_cannot_extend_the_sampled_grid(policy):
+    part = BandPartition(protected_mask=np.ones(2, bool),
+                         in_range_mask=np.ones(2, bool))
+    # The core is just outside the sampled grid, inside the SC pad.  Only
+    # the valence identity can request a new Sigma sample.
+    e = np.array([[-12.25, -1.0]])
+    _, frozen_grid, _, required = _sc_sampled_support(
+        _inputs(policy, 1), part, e, 0.0)
+    np.testing.assert_array_equal(frozen_grid, GRID)
+    np.testing.assert_array_equal(required, [[False, True]])
+    _, live_grid, _, _ = _sc_sampled_support(
+        _inputs(policy, 0), part, e, 0.0)
+    assert live_grid[0] < GRID[0]
+
+
 def test_the_deck_key_defaults_to_cover_and_refuses_anything_else():
     from gw.gw_config import DynamicSigmaConfig
     base = dict(omega_min_ev=-5.0, omega_max_ev=5.0, omega_step_ev=0.25,

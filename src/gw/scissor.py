@@ -373,8 +373,10 @@ def grow_sigma_support_ev(sigma, frozen_core_bands, sampled_grid_ev,
     energy = np.asarray(energy_relative_ev, dtype=np.float64)
     required = np.array(np.broadcast_to(
         np.asarray(required_kn, dtype=bool), energy.shape))
+    # Frozen core blocks stay at DFT in the SC Hamiltonian.  They cannot
+    # require new Sigma samples under any out-of-grid policy.
+    required[:, :int(frozen_core_bands)] = False
     if sigma.out_of_grid == "cover":
-        required[:, :int(frozen_core_bands)] = False
         if active_n is not None:
             required &= np.asarray(active_n, dtype=bool)[None, :]
     else:
