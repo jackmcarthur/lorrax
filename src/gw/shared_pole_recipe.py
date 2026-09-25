@@ -765,6 +765,21 @@ def shared_pole_restart_handle(restart_path, *, expected_identity, meta,
                 digest=member['digest'], K=list(header['K']))
 
 
+def active_band_mask(energies_kn_ry, mu_ry, recipe=None):
+    """Bands the W model treats as dynamically active: ``max_k E_nk >= mu -
+    active_depth_ev``.  Deeper bands (semicore) carry no plasma charge.
+
+    The one owner of that rule: the shared-pole census counts the plasma
+    charge with it, and the SC ``cover`` policy grows the Sigma grid only
+    over identities it calls active (``sc_iteration._sc_sampled_support``).
+    """
+    from common.units import RYD_TO_EV
+    recipe = shared_real_pole_v1_r3b if recipe is None else recipe
+    depth = (float(mu_ry) - np.max(np.asarray(energies_kn_ry, dtype=np.float64),
+                                   axis=0)) * RYD_TO_EV
+    return depth <= recipe['active_depth_ev']
+
+
 def bind_shared_pole_census(wfns, meta, *, occupation_state, trs_allowed, state_capacity, kweights):
     """Bind the current physical charge census to the existing metadata bundle.
 
@@ -834,7 +849,7 @@ def bind_shared_pole_census(wfns, meta, *, occupation_state, trs_allowed, state_
     partial_at_mu = bool(np.any(np.any(partial, axis=0) & crossing))
     depth = (mu - np.max(energies, axis=0)) * RYD_TO_EV
     recipe = shared_real_pole_v1_r3b
-    active = depth <= recipe['active_depth_ev']
+    active = active_band_mask(energies, mu)
     borderline = ((depth > recipe['active_depth_ev'])
                   & (depth <= recipe['borderline_depth_ev']))
     electrons = float(capacity * np.sum(weights[:, None] * np.where(active, occupations, 0.0)))

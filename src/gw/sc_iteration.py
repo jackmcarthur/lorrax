@@ -2859,7 +2859,7 @@ def _capture_frozen_scissor_fits(outputs):
     return (active, getattr(outputs, "tail_scissor_fit", None))
 
 
-def _sc_sampled_support(inputs, partition, energies_loop, mu_ev):
+def _sc_sampled_support(inputs, partition, energies_loop, mu_ev, active_n=None):
     """This map's sampled Sigma(omega) support: ``(sampled, grown, E - mu,
     required)``, or None for a static Sigma (no grid, no fallback).  Pure;
     the caller logs the growth and writes the session once."""
@@ -2878,11 +2878,18 @@ def _sc_sampled_support(inputs, partition, energies_loop, mu_ev):
         dtype=bool), energies_loop.shape)
     energy_relative_ev = energies_loop - mu_ev
     if inputs.config.sigma.out_of_grid == "cover":
-        # Owner 2026-09-24: every protected identity reads its own Sigma(E);
-        # the grid grows over it, bounded by the spectrum it covers.  Frozen
-        # core is decoupled from H and never grows the grid.
+        # Owner 2026-09-24: every protected identity the W model treats as
+        # active (``active_n``: shared_pole_recipe.active_band_mask on the
+        # fixed DFT ladder) reads its own Sigma(E), and the grid grows over
+        # it.  Deeper identities (semicore) keep Sigma(0) as under static;
+        # covering them stretched Fe's grid to -98 eV and moved its semicore
+        # 16 eV (owner hold, 2026-09-24).  The mask is by identity and fixed,
+        # so no state switches between Sigma(E) and Sigma(0).  Frozen core is
+        # decoupled from H and never grows the grid.
         required_kn = np.array(required_kn)
         required_kn[:, :int(inputs.config.sc.frozen_core_bands)] = False
+        if active_n is not None:
+            required_kn &= np.asarray(active_n, dtype=bool)[None, :]
     else:
         # clamp/static: only states inside the requested window plus the SC
         # pad grow the grid; the rest read the edge or omega = 0.
@@ -2923,6 +2930,16 @@ def _sigma_frame_mu_ev(inputs, E_full_ry, efermi_ry, occupation_state):
         config.sigma.fermi_reference, occupation_state=occupation_state,
         wfn=inputs.wfn)
     return float(ref_ry) * RYD_TO_EV
+
+
+def _sc_active_identities(inputs):
+    """Per DFT identity of the QP window: does the W model treat it as
+    active (``shared_pole_recipe.active_band_mask`` on the DFT ladder about
+    the DFT Fermi level)?  Fixed for the run, so ``cover`` never switches a
+    state between Sigma(E) and Sigma(0)."""
+    from .shared_pole_recipe import active_band_mask
+    return active_band_mask(np.asarray(inputs.e_dft_active_kn_ry, dtype=np.float64),
+                            float(inputs.wfn.efermi))
 
 
 def _fit_sum_band_tail(fit_kwargs, fit_mask_kn, sigma0_kn, z_kn=None):
@@ -3422,7 +3439,8 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     sc_support = (None if not inputs.config.compute_mode.is_dynamic else
                   _sc_sampled_support(inputs, partition, energies_loop, _sigma_frame_mu_ev(
                       inputs, E_full, efermi_ry,
-                      entry_occ_state if inputs.material_class == "metal" else None)))
+                      entry_occ_state if inputs.material_class == "metal" else None),
+                      _sc_active_identities(inputs)))
     sigma0_kn = (np.zeros(energies_loop.shape, dtype=bool) if sc_support is None
                  else ~omega_coverage(sc_support[1], sc_support[2])[0])
 
