@@ -831,10 +831,12 @@ covers modes 0–9 and 11 at P4 (mode 10 has its own gate, below), including an
 odd grid, 8×8×8, the complex64 k-minor image and both k-box arms of mode 11. The tolerance is 1e-13 against the cpu composition and 1e-12
 against dense sums or `np.fft`; every check has a red twin that must miss by
 more than 1e-3. Modes 6 and 7 must also equal the XLA chains they replace
-within 2 ulp of the largest value (bitwise today, reported): mode 6 forms
-`F·D` as an XLA:GPU complex multiply (no FMA), and mode 7 spells
-`(mph·G)·nph` and `U·G·U†` as the XLA unfold and the spin-rotate kernel
-round them. The mode-7 cases include a C3 plan with a general complex spin
+within 2 ulp of the largest value: mode 6 forms `F·D` as an XLA:GPU complex
+multiply (no FMA; bitwise today, reported), and modes 7/8/9/11 form
+`(mph·G)·nph`, `U·G·U†`, the χ trace and its accumulation with fused
+products (two FMAs and two multiplies per product, four FMAs per
+product-sum term; owner 2026-09-25, round-off equal), which lowers the FP64
+floor of the χ₀ node by a quarter. The mode-7 cases include a C3 plan with a general complex spin
 action and `q = n/3` phases (`ns` 2 and 4) and `N_k = 196` at `ns = 4`, the
 per-bank load. Mode 11 is held within 8 ulp of `max|χ|` of the chain it
 replaced (`fftn(conj x) = conj(ifftn x)` makes them equal up to rounding).
