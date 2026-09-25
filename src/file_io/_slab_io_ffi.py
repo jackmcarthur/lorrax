@@ -30,6 +30,8 @@ sharded dim.  See ``ffi/cpp/phdf5/write_ffi.cc`` for the C++ side.
 from __future__ import annotations
 
 import functools
+import itertools
+import math
 import os
 import threading
 import time
@@ -926,7 +928,10 @@ def probe_availability(platform: str | None = None) -> tuple[bool, str, str]:
     Two things must hold, and they fail for unrelated reasons, so the
     stage is reported alongside the verdict:
 
-    1. this platform's FFI library exports ``lorrax_phdf5_write``.  Probed
+    1. this platform's FFI library exports ``lorrax_phdf5_write`` and
+       ``lorrax_phdf5_write_independent`` (the file-order row-block write,
+       :func:`_file_order_plan`; a library built before 2026-09-25 lacks it
+       and is refused by name here rather than at the first write).  Probed
        with :func:`ffi_loader.probe_target`, not a bare ``has_target``:
        its three-state reason separates "never built with the handler"
        (rebuild) from "could not be loaded" (``LD_LIBRARY_PATH``) from
@@ -951,6 +956,8 @@ def probe_availability(platform: str | None = None) -> tuple[bool, str, str]:
     try:
         from ffi.common.ffi_loader import probe_target
         ok, reason = probe_target("lorrax_phdf5_write", platform)
+        if ok:
+            ok, reason = probe_target("lorrax_phdf5_write_independent", platform)
     except Exception as exc:                          # pragma: no cover
         ok, stage, reason = False, "loader", f"{type(exc).__name__}: {exc}"
     if ok:
@@ -1026,7 +1033,8 @@ def assert_available(platform: str | None = None) -> None:
         f"  got     probe stage '{stage}': {reason}\n"
         f"          [{_slab_io_geometry()}]\n"
         f"  wanted  the platform FFI library exports 'lorrax_phdf5_write' "
-        f"AND MPI_Init_thread succeeds in this process.\n"
+        f"and 'lorrax_phdf5_write_independent' AND MPI_Init_thread succeeds "
+        f"in this process.\n"
         f"  fix     {_SLAB_IO_FIX.get(stage, _SLAB_IO_FIX['probe'])}\n"
         f"  doc     {_SLAB_IO_DOC}")
 
@@ -1252,6 +1260,142 @@ def _replicated_i64_vector(values: Sequence[int], mesh: Mesh) -> jax.Array:
         np.asarray(tuple(int(v) for v in values), dtype=np.int64),
         NamedSharding(mesh, P()),
     )
+
+
+# ---------------------------------------------------------------------------
+# File-order writes -- how every slab leaves this process
+# ---------------------------------------------------------------------------
+#
+# A rank's share of a tile-sharded slab (a face (q, mu_X, nu_Y) block, a
+# G-sharded wavefunction window) is thousands of short strided runs, which
+# only two-phase collective MPI-IO writes efficiently -- and two-phase
+# aggregation is itself the ceiling (A2, 2026-09-25, P16 on Lustre: the
+# production bank shape 2.0 GB/s collective vs 2.8 GB/s as file-order row
+# blocks written independently; a WFN_qp window 2.6 vs 4.2 GB/s).  So each
+# write is redistributed on device into file-order row blocks -- rank r holds
+# rows [r*h, (r+1)*h) of a split axis, every later axis whole, one long
+# contiguous file run per rank -- and written independently.  Bounded: the
+# redistribution goes one piece at a time, each at most
+# ``_FILE_ORDER_PIECE_BYTES`` per rank, so with the lane's queued writes and
+# XLA's reshard transient the added staging stays near 256 MiB per rank.
+# The bytes that reach the file are the same.
+
+#: Per-rank bytes of one file-order piece.
+_FILE_ORDER_PIECE_BYTES = 64 << 20
+#: Shortest contiguous file run per rank that is written independently.  The
+#: P16 bench: 1.2 MB runs 4.2 GB/s independent vs 2.6 collective; 76 kB runs
+#: 0.8 vs 2.6; 12.6 kB runs 0.5 vs 4.1.
+_FILE_ORDER_MIN_RUN = 1 << 20
+
+
+def _spec_axes(spec, ndim: int) -> tuple:
+    """A PartitionSpec as one entry per axis: ``None`` or a tuple of mesh axes."""
+    out = []
+    for i in range(ndim):
+        e = spec[i] if i < len(spec) else None
+        out.append(None if e is None else (e,) if isinstance(e, str) else tuple(e))
+    return tuple(out)
+
+
+def _file_run_bytes(block, ds_shape, itemsize):
+    """Longest contiguous file run of a row-major ``block`` inside ``ds_shape``."""
+    run = itemsize
+    for b, d in zip(reversed(block), reversed(ds_shape)):
+        run *= int(b)
+        if int(b) < int(d):
+            break
+    return run
+
+
+def _file_order_plan(shape, vshape, spec, itemsize, p, mesh_axes, ds_shape,
+                     budget=_FILE_ORDER_PIECE_BYTES,
+                     min_run=_FILE_ORDER_MIN_RUN):
+    """How one slab write leaves: ``None``, ``"as-is"`` or ``(k, rows)``.
+
+    ``"as-is"``: the operand already is file-order row blocks -- one axis over
+    all mesh axes in order, nothing else sharded -- with per-rank file runs of
+    at least ``min_run``: written independently, no copy.
+
+    ``(k, rows)``: pieces of one index of every axis before ``k`` by ``rows``
+    rows of axis ``k`` (a multiple of ``p``) by every later axis whole, each
+    resharded to rows over all ranks and written independently.  ``k`` is the
+    first axis with at least ``p`` valid rows whose row (the later axes) fits
+    the per-rank ``budget``; the axes before it are indexed one at a time.
+    Only unsharded axes are cut or indexed -- cutting a sharded axis would make
+    XLA gather it -- so a sharded axis ``k`` is taken whole (its full carrier
+    extent, clipped by the valid shape) or not at all.
+
+    ``None``: written as it is, collectively -- one rank, a tiny slab, a sharded axis
+    that would have to be cut or indexed, or pieces whose per-rank file runs
+    would be shorter than ``min_run`` (independent MPI-IO loses there).
+    """
+    n = len(shape)
+    if p == 1:
+        return None                  # one rank's write is already one run
+    sharded = [i for i in range(n) if spec[i] is not None]
+    if len(sharded) == 1 and spec[sharded[0]] == tuple(mesh_axes):
+        j = sharded[0]
+        block = (1,) * j + (-(-int(shape[j]) // p),) + tuple(vshape[j + 1:])
+        if _file_run_bytes(block, ds_shape, itemsize) >= min_run:
+            return "as-is"
+    for k in range(n):
+        row = itemsize * math.prod(int(d) for d in shape[k + 1:])
+        if int(vshape[k]) < p or row > budget:
+            if spec[k] is not None:
+                return None          # would index a sharded axis
+            continue                 # index this axis, split a later one
+        extent = int(shape[k]) if spec[k] is not None else int(vshape[k])
+        rows_per_rank = -(-extent // p)
+        if rows_per_rank * row > budget:
+            if spec[k] is not None:
+                return None          # would cut a sharded axis
+            rows_per_rank = budget // row
+        block = (1,) * k + (rows_per_rank,) + tuple(vshape[k + 1:])
+        if _file_run_bytes(block, ds_shape, itemsize) < min_run:
+            return None
+        return k, rows_per_rank * p
+    return None
+
+
+@functools.lru_cache(maxsize=None)
+def _file_order_take(mesh, shape, dtype, k, real, height, whole):
+    """Jitted ``(A, starts) -> piece``: one file-order piece, rows over all ranks."""
+    n = len(shape)
+    axes = tuple(mesh.axis_names)
+    target = NamedSharding(mesh, P(*([None] * k), axes, *([None] * (n - k - 1))))
+    take = int(shape[k]) if whole else real
+    sizes = (1,) * k + (take,) + tuple(int(d) for d in shape[k + 1:])
+
+    def piece(a, starts):
+        out = jax.lax.dynamic_slice(a, [starts[i] for i in range(n)], sizes)
+        if height > take:
+            pad = [(0, 0)] * n
+            pad[k] = (0, height - take)
+            out = jnp.pad(out, pad)
+        return out
+    return jax.jit(piece, out_shardings=target)
+
+
+def _file_order_pieces(A, off, vshape, plan, mesh):
+    """Yield ``(piece, offset, valid_shape)`` for a ``(k, rows)`` plan."""
+    k, rows = plan
+    p = int(mesh.size)
+    spec = _spec_axes(A.sharding.spec, A.ndim)
+    whole = spec[k] is not None
+    rep = NamedSharding(mesh, P())
+    for idx in itertools.product(*(range(int(vshape[a])) for a in range(k))):
+        for c0 in range(0, int(vshape[k]), rows):
+            real = min(rows, int(vshape[k]) - c0)
+            height = -(-(int(A.shape[k]) if whole else real) // p) * p
+            take = _file_order_take(mesh, tuple(int(d) for d in A.shape),
+                                    A.dtype, k, real, height, whole)
+            starts = device_put_process_local(
+                np.asarray(tuple(idx) + (c0,) + (0,) * (A.ndim - k - 1),
+                           dtype=np.int32), rep)
+            p_off = (tuple(int(off[a]) + int(idx[a]) for a in range(k))
+                     + (int(off[k]) + c0,) + tuple(int(o) for o in off[k + 1:]))
+            p_valid = (1,) * k + (real,) + tuple(int(v) for v in vshape[k + 1:])
+            yield take(A, starts), p_off, p_valid
 
 
 def _normalize_slab_request(
@@ -1755,10 +1899,12 @@ def _compiled_write(sm, *args):
 
 @functools.lru_cache(maxsize=None)
 def _get_write_sm(mesh, in_specs, *,
-                  mesh_shape, axis_count_per_dim, axis_flat, no_jit):
+                  mesh_shape, axis_count_per_dim, axis_flat, no_jit,
+                  independent):
     """One H5Dwrite per rank.  ``LORRAX_WRITE_NO_JIT=1`` (passed via
     ``no_jit``) skips the jit wrapper — diagnostic for chasing the
-    jit-argument-retention buffer leak on long write loops."""
+    jit-argument-retention buffer leak on long write loops.
+    ``independent`` is the transfer mode (:func:`_file_order_plan`)."""
     from ffi.phdf5.write import ffi_write_call
 
     def _per_rank(A_local, handle_local, offset_local, valid_shape_local):
@@ -1767,6 +1913,7 @@ def _get_write_sm(mesh, in_specs, *,
             mesh_shape=mesh_shape,
             axis_count_per_dim=axis_count_per_dim,
             axis_flat=axis_flat,
+            independent=independent,
         )
     sm_bare = shard_map(
         _per_rank, mesh=mesh,
@@ -2568,8 +2715,35 @@ class _FfiBackend(_DatasetGeometry):
         vshape = _normalize_valid_shape(
             op="write_slab", name=name, valid_shape=valid_shape,
             slab_shape=slab_shape, offset=off, ds_shape=ds_shape)
-        gshape = ds_shape
+        # File order.  Each write leaves as file-order row blocks, written
+        # independently, or -- when no bounded way to cut it exists -- as it
+        # is, collectively (_file_order_plan says which and why).
+        plan = _file_order_plan(tuple(A.shape), vshape,
+                                _spec_axes(A.sharding.spec, A.ndim),
+                                jnp.dtype(A.dtype).itemsize, int(self.mesh.size),
+                                tuple(self.mesh.axis_names), ds_shape)
+        if plan is None:
+            self._dispatch_write(name, A, off, vshape, ds_shape, mesh_shape,
+                                 independent=False)
+            return
+        if plan == "as-is":
+            self._dispatch_write(name, A, off, vshape, ds_shape, mesh_shape,
+                                 independent=True)
+            return
+        for piece, p_off, p_valid in _file_order_pieces(A, off, vshape, plan,
+                                                        self.mesh):
+            self._dispatch_write(name, piece, p_off, p_valid, ds_shape,
+                                 mesh_shape, independent=True)
 
+    def _dispatch_write(self, name, A, off, vshape, gshape, mesh_shape, *,
+                        independent):
+        """Queue one collective write call of ``A`` (already on this mesh)."""
+        axis_count_per_dim, axis_flat = _sharding_to_axis_info(
+            A.sharding, A.ndim)
+        _validate_block_divisible(
+            op="write_slab", name=name, shape=tuple(int(s) for s in A.shape),
+            axis_count_per_dim=axis_count_per_dim,
+            axis_flat=axis_flat, mesh_shape=mesh_shape)
         if debug_print_enabled():
             import sys
             local_shapes = [tuple(s.data.shape) for s in A.addressable_shards]
@@ -2578,7 +2752,7 @@ class _FfiBackend(_DatasetGeometry):
                 f"name={name} shape={tuple(A.shape)} dtype={A.dtype} "
                 f"spec={getattr(A.sharding, 'spec', None)} "
                 f"offset={off} valid_shape={vshape} gshape={gshape} "
-                f"local_shapes={local_shapes}\n")
+                f"independent={independent} local_shapes={local_shapes}\n")
             sys.__stdout__.flush()
 
 
@@ -2596,6 +2770,7 @@ class _FfiBackend(_DatasetGeometry):
             axis_count_per_dim=axis_count_per_dim,
             axis_flat=axis_flat,
             no_jit=bool(os.environ.get('LORRAX_WRITE_NO_JIT')),
+            independent=bool(independent),
         )
 
         # Enqueue dispatch onto the Python worker thread.  Main thread

@@ -17,8 +17,11 @@ A (read, 2026-07-25) and AE (write, 2026-07-26) made every phdf5 TU
 compile into BOTH platform libraries from the same source under one
 flag, `LORRAX_FFI_NO_CUDA`:
 
-    liblorrax_ffi.so       CUDA   PhdfRead*Ffi     / PhdfWriteFfi
-    liblorrax_ffi_host.so  cpu    PhdfRead*HostFfi / PhdfWriteHostFfi
+    liblorrax_ffi.so       CUDA   PhdfRead*Ffi     / PhdfWrite{,Independent}Ffi
+    liblorrax_ffi_host.so  cpu    PhdfRead*HostFfi / PhdfWrite{,Independent}HostFfi
+
+(The two write handlers share one body; the Independent one issues its
+H5Dwrite independently, for file-order row-block slabs.)
 
 The collective MPI-IO core — hyperslab arithmetic, `valid_shape`
 clipping, the FIFO writer thread, `H5Dread`/`H5Dwrite` — is byte-identical

@@ -174,6 +174,7 @@ static void async_worker(
     void* src_buf,
     bool wait_for_d2h,
     size_t bytes,                        // per-rank payload, for the timing line
+    bool collective,                     // two-phase collective vs independent
     ffi::Promise promise)
 {
     // Diagnostic timing, symmetric with read_ffi.cc's two do_time sites.
@@ -289,7 +290,7 @@ static void async_worker(
             vec_to_string(file_count).c_str(), vec_to_string(mem_dims).c_str(),
             vec_to_string(offset_base).c_str(),
             vec_to_string(valid_shape).c_str(),
-            ctx->use_collective_write ? 1 : 0,
+            collective ? 1 : 0,
             out_of_bounds ? 1 : 0, empty_selection ? 1 : 0);
         std::fflush(stderr);
     }
@@ -351,7 +352,7 @@ static void async_worker(
 
     auto t_select = now();
 
-    hid_t dxpl = ctx->use_collective_write ? ctx->dxpl_coll : ctx->dxpl_indep;
+    hid_t dxpl = collective ? ctx->dxpl_coll : ctx->dxpl_indep;
     herr_t st = H5Dwrite(ds_id, native_type, memspace, filespace, dxpl,
                          src_buf);
     if (st < 0 && debug) H5Eprint2(H5E_DEFAULT, stderr);
@@ -388,7 +389,7 @@ static void async_worker(
             "d2h_wait=%.2f  spaces=%.2f  select=%.2f  write=%.2f  "
             "total=%.2f (ms)  %.0f MB/s\n",
             h5_object_name(ds_id).c_str(), bytes,
-            ctx->use_collective_write ? 1 : 0, empty_selection ? 1 : 0,
+            collective ? 1 : 0, empty_selection ? 1 : 0,
             ms(t0, t_d2h), ms(t_d2h, t_spaces), ms(t_spaces, t_select),
             wr_ms, ms(t0, t_write),
             (wr_ms > 0.0 ? (double)bytes / 1e3 / wr_ms : 0.0));
@@ -418,7 +419,8 @@ static void async_worker(
 // control stayed at 1; the shared np1 cache had accumulated 6813 such
 // corpses out of 14443 entries.  Moving ds_id out too collapses the module
 // count from O(files x datasets) to O(ndim, dtype, sharding).
-static ffi::Future WriteDispatch(
+static ffi::Future WriteDispatchImpl(
+    bool independent,
     LRX_STREAM_PARAM
     ffi::AnyBuffer A,
     ffi::Buffer<ffi::DataType::S64> handle_buf,   // shape (2,) {ctx_handle, ds_id}
@@ -750,20 +752,27 @@ static ffi::Future WriteDispatch(
     ffi::Promise promise;
     ffi::Future future(promise);
 
+    // The transfer mode is the CALLER's: ``lorrax_phdf5_write_independent``
+    // is issued only for file-order row-block slabs (one long contiguous run
+    // per rank, file_io._slab_io_ffi), where independent MPI-IO beats
+    // two-phase aggregation; every other layout keeps the ctx's collective
+    // default, because an independent write of a strided tile decomposes into
+    // millions of small writes (docs/dev/env_vars.md, COLLECTIVE_WRITES).
+    const bool collective = !independent && ctx->use_collective_write;
     auto task = [ctx, dset, native_type,
                  offset = std::move(offset),
                  file_count = std::move(file_count),
                  mem_dims = std::move(mem_dims),
                  offset_base = std::move(offset_host),
                  valid_shape = std::move(valid_shape_host),
-                 src_buf, wait_for_d2h, bytes,
+                 src_buf, wait_for_d2h, bytes, collective,
                  promise = std::move(promise)]() mutable
     {
         async_worker(ctx, dset, native_type,
                      std::move(offset), std::move(file_count),
                      std::move(mem_dims),
                      std::move(offset_base), std::move(valid_shape),
-                     src_buf, wait_for_d2h, bytes,
+                     src_buf, wait_for_d2h, bytes, collective,
                      std::move(promise));
     };
 
@@ -777,6 +786,41 @@ static ffi::Future WriteDispatch(
     return future;
 }
 
+// The two entry points differ only in the transfer mode.  A second HANDLER
+// rather than a new operand, so every existing binding keeps its signature
+// (cpp/common/lorrax_ffi_abi.h: a new handler is not an ABI change).
+static ffi::Future WriteDispatch(
+    LRX_STREAM_PARAM
+    ffi::AnyBuffer A,
+    ffi::Buffer<ffi::DataType::S64> handle_buf,
+    ffi::Buffer<ffi::DataType::S64> offset_buf,
+    ffi::Buffer<ffi::DataType::S64> valid_shape_buf,
+    ffi::Result<ffi::Buffer<ffi::DataType::S32>> token_out,
+    ffi::Span<const int64_t> mesh_shape,
+    ffi::Span<const int64_t> axis_count_per_dim,
+    ffi::Span<const int64_t> axis_flat)
+{
+    return WriteDispatchImpl(false, LRX_STREAM_ARG A, handle_buf, offset_buf,
+                             valid_shape_buf, token_out, mesh_shape,
+                             axis_count_per_dim, axis_flat);
+}
+
+static ffi::Future WriteIndependentDispatch(
+    LRX_STREAM_PARAM
+    ffi::AnyBuffer A,
+    ffi::Buffer<ffi::DataType::S64> handle_buf,
+    ffi::Buffer<ffi::DataType::S64> offset_buf,
+    ffi::Buffer<ffi::DataType::S64> valid_shape_buf,
+    ffi::Result<ffi::Buffer<ffi::DataType::S32>> token_out,
+    ffi::Span<const int64_t> mesh_shape,
+    ffi::Span<const int64_t> axis_count_per_dim,
+    ffi::Span<const int64_t> axis_flat)
+{
+    return WriteDispatchImpl(true, LRX_STREAM_ARG A, handle_buf, offset_buf,
+                             valid_shape_buf, token_out, mesh_shape,
+                             axis_count_per_dim, axis_flat);
+}
+
 }  // namespace lorrax_ffi::phdf5
 
 // ---- FFI binding ---------------------------------------------------------
@@ -787,6 +831,22 @@ static ffi::Future WriteDispatch(
 // jax.ffi target string ``lorrax_phdf5_write`` — see platform_seam.h.
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
     LRX_PHDF_HANDLER(PhdfWrite), lorrax_ffi::phdf5::WriteDispatch,
+    xla::ffi::Ffi::Bind()
+        LRX_PHDF_STREAM_CTX
+        .Arg<xla::ffi::AnyBuffer>()
+        .Arg<xla::ffi::Buffer<xla::ffi::DataType::S64>>()   // handle {ctx, ds}
+        .Arg<xla::ffi::Buffer<xla::ffi::DataType::S64>>()   // offset_base
+        .Arg<xla::ffi::Buffer<xla::ffi::DataType::S64>>()   // valid_shape
+        .Ret<xla::ffi::Buffer<xla::ffi::DataType::S32>>()
+        .Attr<xla::ffi::Span<const int64_t>>("mesh_shape")
+        .Attr<xla::ffi::Span<const int64_t>>("axis_count_per_dim")
+        .Attr<xla::ffi::Span<const int64_t>>("axis_flat"));
+
+// Same signature and body; the H5Dwrite is independent (see WriteDispatchImpl).
+// Target string ``lorrax_phdf5_write_independent``.
+XLA_FFI_DEFINE_HANDLER_SYMBOL(
+    LRX_PHDF_HANDLER(PhdfWriteIndependent),
+    lorrax_ffi::phdf5::WriteIndependentDispatch,
     xla::ffi::Ffi::Bind()
         LRX_PHDF_STREAM_CTX
         .Arg<xla::ffi::AnyBuffer>()
