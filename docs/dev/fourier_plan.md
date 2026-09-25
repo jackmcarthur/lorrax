@@ -12,7 +12,7 @@ y = LocalFourierPlan(N, axes, sign=+1, norm=n)(x)      # ≡ jnp.fft.ifftn(x, ax
 y = R_out · F_{sign,norm} · E_in · x
 ```
 
-- **Supports.** `in_support={ax: idx}` means `x` holds only the indices `idx mod N` on that axis, and every other index is zero. `out_support={ax: idx'}` returns only the indices `idx'`. A sphere enters through its tight bounding box, one index set per axis. An index repeated in an input support refuses.
+- **Supports.** `in_support={ax: idx}` means `x` holds only the indices `idx mod N` on that axis, and every other index is zero. `out_support={ax: idx'}` returns only the indices `idx'`. A sphere enters through its tight bounding box, one index set per axis. An index repeated in an input support refuses. A support that lists the whole axis in order is no support: that axis is full.
 - **`out_perm`** returns `jnp.transpose(y, out_perm)`, and is free when the GEMM chain can write that order.
 - **`in_gather=(plane_from_col, n_col)`** (with `mesh`, over axes `(-2, -1)`, forward, `'backward'`) takes a cylinder `x (…, n_col)` and returns the `(n_b, n_c)` plane's transform without writing the zero plane. The slab form `plan(F, start, size)` reads `F[:, start:start+size]` in place. On CUDA this is mathdx mode 10; its rules are in [`ffi_layout.md`](../architecture/ffi_layout.md#plane-fft-with-gather-on-load-mode-10).
 
