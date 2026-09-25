@@ -199,7 +199,9 @@ def test_qp_seed_reconstruction_partition_enters_real_anderson_seam(
     monkeypatch.setattr(sc, "gw_iteration_map", fake_map)
     monkeypatch.setattr(
         sc, "_sc_identity_for_call",
-        lambda _i, state, _ein, _eout, _hist, cutoff_ev: (verdict, state))
+        lambda _i, state, _ein, _eout, _hist, cutoff_ev, u_out: (verdict, state))
+    monkeypatch.setattr(
+        sc, "_map_output_eigensystem", lambda _i, _state: (None, None, None))
     monkeypatch.setattr(
         sc, "_sc_map_gain_for_call",
         lambda _i, _s, _e, previous: (None, previous))

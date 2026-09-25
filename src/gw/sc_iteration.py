@@ -2972,20 +2972,16 @@ def _classify_sc_partition(
     """
     from common.collectives import gather_to_host
     from .sc_state_identity import assign_qp_identity
-    from symmetry_maps import unfold_file_wedge_to_full_bz
 
     ks = _kstar(inputs)
-    reference_full = np.asarray(unfold_file_wedge_to_full_bz(
-        inputs.sym, np.asarray(inputs.wfn.energies[0], dtype=np.float64)))
     e_reference = np.asarray(inputs.e_dft_active_kn_ry) * RYD_TO_EV
     e_reference_loop = (
         e_reference if ks.is_identity else np.asarray(ks.select(e_reference)))
     e_current_loop = np.asarray(E_qp_ry) * RYD_TO_EV
     nb_identity = e_current_loop.shape[1]
-    reference_u = np.broadcast_to(
-        np.eye(nb_identity), e_current_loop.shape + (nb_identity,))
+    # The reference is the DFT basis itself (U = I): its overlaps are |U|^2.
     indices_loop, _, _, _ = assign_qp_identity(
-        reference_u, e_reference_loop,
+        None, e_reference_loop,
         np.asarray(gather_to_host(U_qp)), e_current_loop,
         np.ones(nb_identity, dtype=bool),
         degeneracy_tol_ev=float(inputs.config.sc.exact_degeneracy_tol_ev))
@@ -4880,13 +4876,40 @@ def _band_ranges(mask, *, band_offset: int) -> str:
         str(lo) if lo == hi else f"{lo}-{hi}" for lo, hi in ranges)
 
 
-def _identity_eigh(h_host):
-    """Host eigensolve for the identity readout (a seam the tests patch)."""
-    return np.linalg.eigh(h_host)
+def _map_output_eigensystem(inputs, state_out):
+    """``(E_ry, U, E_F)`` of one map's output H, on the host: its one eigensolve.
+
+    The identity readout (:func:`_sc_identity_for_call`) and the warm seed
+    (:func:`_write_sc_seed`) both read the output eigenvectors, so one device
+    eigh serves both: per-k solves k-sharded over the mesh, ``U`` replicated
+    (:func:`final_qp_eigenstates`, the seed's kernel), no host eigensolve.
+    """
+    return final_qp_eigenstates(
+        state_out, n_occ=int(inputs.meta.nelec), mesh_xy=inputs.mesh_xy)
+
+
+@jax.jit
+def _masked_residual_mev(H_out, H_in, mask_kn):
+    """``P (H_out - H_in) P`` in meV, ``P`` the per-k block of ``mask_kn``."""
+    f = (H_out - H_in) * RYD_TO_EV * 1e3
+    keep = mask_kn[:, :, None] & mask_kn[:, None, :]
+    return jnp.where(keep, f, 0.0)
+
+
+def _protected_residual_norms(H_out, H_in, mask_kn, eigvalsh_kshard):
+    """``max_k ||P f_k P||_2`` and ``||P f P||_F`` in meV, ``f = F(H) - H``.
+
+    Computed on device; only the two scalars reach the host.
+    ``eigvalsh_kshard`` Hermitises ``P f P`` before it solves.
+    """
+    fp = _masked_residual_mev(H_out, H_in, jnp.asarray(mask_kn, dtype=bool))
+    spec = float(np.abs(np.asarray(eigvalsh_kshard(fp))).max())
+    frob = float(jnp.sqrt(jnp.sum(jnp.abs(fp) ** 2)))
+    return spec, frob
 
 
 def _sc_identity_for_call(inputs, state_out, e_input_ev, e_output_ev,
-                          history, *, cutoff_ev):
+                          history, *, cutoff_ev, u_out):
     """Read a map in frozen QP identities; retain only small host diagnostics.
 
     The reference is the first map OUTPUT. Its labels are the trusted DFT
@@ -4897,10 +4920,10 @@ def _sc_identity_for_call(inputs, state_out, e_input_ev, e_output_ev,
     triplet 11-13 lands below the protected doublet at sorted 9-11, so a
     sorted-band mask cut an exact multiplet and the readout refused
     (arms N1/N2, 2026-09-05). Every returned table is indexed by DFT
-    band. Output eigenvectors come from the host eigensolve of the
-    gathered carry; the map's retained ``sigma_basis_U`` supplies its
-    input eigenvectors. Neither eigenvectors nor assignments replace the
-    Hamiltonian carry.
+    band. ``u_out`` is the output's eigenvectors from
+    :func:`_map_output_eigensystem`; the map's retained ``sigma_basis_U``
+    supplies its input eigenvectors. Neither eigenvectors nor assignments
+    replace the Hamiltonian carry.
     """
     from common.collectives import gather_to_host
     from .sc_state_identity import assign_qp_identity
@@ -4909,15 +4932,6 @@ def _sc_identity_for_call(inputs, state_out, e_input_ev, e_output_ev,
     protected = np.asarray(partition.protected_mask, dtype=bool)
     in_range = np.asarray(partition.in_range_mask, dtype=bool)
     mask = np.broadcast_to(protected | in_range, e_output_ev.shape)
-    # HOST EIGENVECTORS FOR A HOST READOUT.  The band-sharded eigh kernel
-    # requires the band count to divide both mesh axes; the carry is not
-    # padded here (the core tier's 3-band fixture on a 2x2 mesh raised
-    # IndivisibleError, 2026-09-05).  The identity is a diagnostic over
-    # |overlap|^2, phase-free, and (nk_loop, nb, nb) is small: diagonalise
-    # the gathered carry on the host.
-    h_host = np.asarray(gather_to_host(state_out.H_qp_dft))
-    h_host = 0.5 * (h_host + np.conj(np.swapaxes(h_host, -1, -2)))
-    _, u_out = _identity_eigh(h_host)
     u_out = np.asarray(u_out)
     u_in = np.asarray(gather_to_host(state_out.outputs.sigma_basis_U))
     nb = e_output_ev.shape[1]
@@ -5127,6 +5141,7 @@ def _write_sc_eqp_snapshot(
     prev_output_role: str,
     verdict: ConvergenceVerdict,
     map_gain: SCMapGain | None,
+    output_eigensystem,
 ) -> str | None:
     """Write one small BGW-shaped record of a completed SC map call.
 
@@ -5217,7 +5232,7 @@ def _write_sc_eqp_snapshot(
         inputs, state_out, call_index=call_index, role=role)
 
     if role != "trial" and not verdict.converged:
-        _write_sc_seed(inputs, state_out)
+        _write_sc_seed(inputs, state_out, eigensystem=output_eigensystem)
 
     if process_rank() != 0:
         return None
@@ -5399,8 +5414,12 @@ def _write_sc_eqp_snapshot(
     return path
 
 
-def _write_sc_seed(inputs, state):
-    """Publish a compact warm seed; accelerator history is deliberately absent."""
+def _write_sc_seed(inputs, state, *, eigensystem=None):
+    """Publish a compact warm seed; accelerator history is deliberately absent.
+
+    ``eigensystem`` is the map's :func:`_map_output_eigensystem` when the
+    loop already holds it; the writer diagonalises otherwise.
+    """
     from common.collectives import rank0_transaction
     path = os.path.join(inputs.input_dir, "sc_seed")
     rank0_transaction(path, stage="sc_seed_directory",
@@ -5412,7 +5431,8 @@ def _write_sc_seed(inputs, state):
         kgrid=inputs.meta.kgrid, logical_band_stop=int(inputs.meta.b_id_4_user),
         output_dir=path, qp_rotations_k_storage=inputs.config.qp_rotations_k_storage,
         write_wfn_h5=False, print_fn=inputs.print_fn,
-        clamp_tol=float(inputs.config.occupation_clamp_tol))
+        clamp_tol=float(inputs.config.occupation_clamp_tol),
+        eigensystem=eigensystem)
     _record_sc(inputs, f"  SC warm seed: {path}/qp_wfn_rotations.h5; "
                "map output, not a convergence receipt or accelerator checkpoint")
 
@@ -5518,8 +5538,10 @@ def run_self_consistency(
         e_new_ev = (
             np.asarray(eigvalsh_kshard(state_new.H_qp_dft)) * RYD_TO_EV)
         rms = float(np.sqrt(np.mean((e_new_ev - e_initial_ev) ** 2)))
+        out_eig = _map_output_eigensystem(inputs, state_new)
         verdict, state_new = _sc_identity_for_call(
-            inputs, state_new, e_initial_ev, e_new_ev, {}, cutoff_ev=tol_ev)
+            inputs, state_new, e_initial_ev, e_new_ev, {}, cutoff_ev=tol_ev,
+            u_out=out_eig[1])
         state_new = replace(state_new, convergence_verdict=verdict)
         _write_sc_eqp_snapshot(
             inputs, state_new, e_new_ev,
@@ -5532,6 +5554,7 @@ def run_self_consistency(
                 inputs, "initial_state_role", "dft_seed"),
             verdict=verdict,
             map_gain=None,
+            output_eigensystem=out_eig,
         )
         _record_sc(inputs, f"    SC convergence: {verdict.summary()}")
         return state_new, []
@@ -5610,6 +5633,7 @@ def _run_linear_mixing(
             _frozen_fits = map_input.frozen_scissor_fits
         E_candidate_ev = (
             np.asarray(eigvalsh_kshard(state_map.H_qp_dft)) * RYD_TO_EV)
+        out_eig = _map_output_eigensystem(inputs, state_map)
         # Outputs, W and head all describe the MAP INPUT.  Record that exact
         # evaluated point before constructing an unevaluated mixed candidate.
         # This is the state returned on convergence or budget exhaustion.
@@ -5658,7 +5682,7 @@ def _run_linear_mixing(
         # different set.
         verdict, state_map = _sc_identity_for_call(
             inputs, state_map, E_prev_ev, E_candidate_ev, identity_history,
-            cutoff_ev=tol_ev)
+            cutoff_ev=tol_ev, u_out=out_eig[1])
         # THE SNAPSHOT'S STAMPS COME FROM THE MAP-OUTPUT HISTORY, NOT THE
         # MIXED ONE.  The column written is ``E_candidate_ev`` (pre-mix), so
         # a stamp computed from ``E_new_ev`` (post-mix) described a
@@ -5683,7 +5707,9 @@ def _run_linear_mixing(
                 if it == 0 else "linear"),
             verdict=verdict,
             map_gain=map_gain,
+            output_eigensystem=out_eig,
         )
+        out_eig = None
         _record_sc(inputs, f"    SC convergence: {verdict.summary()}")
         last_evaluated = replace(
             last_evaluated, convergence_verdict=verdict)
@@ -5960,6 +5986,7 @@ def _run_anderson(
         # Track per-call eigenvalue RMS so the user sees progress in the
         # same shape the linear path prints.
         E_new = np.asarray(eigvalsh_kshard(state_out.H_qp_dft)) * RYD_TO_EV
+        _out_eig = _map_output_eigensystem(inputs, state_out)
         # THE CRITERION: the fixed-point residual of THIS call, output
         # against that same call's input.  Not the difference between
         # successive accepted iterates -- under Anderson the accepted
@@ -5968,7 +5995,8 @@ def _run_anderson(
         # fixed point.  ||F(H) - H|| makes no reference to the iteration
         # that produced H, so the accelerator cannot flatter it.
         _verdict, state_out = _sc_identity_for_call(
-            inputs, state_out, E_in, E_new, _identity_history, cutoff_ev=tol_ev)
+            inputs, state_out, E_in, E_new, _identity_history, cutoff_ev=tol_ev,
+            u_out=_out_eig[1])
         _n_edge, _edge_detail = _sc_edge_ambiguity(inputs, state_out)
         if _n_edge:
             _verdict = replace(_verdict, edge_ambiguous=_n_edge,
@@ -6011,23 +6039,20 @@ def _run_anderson(
                 if call_index == 0 else _role_of(call_index - 1)),
             verdict=_verdict,
             map_gain=map_gain,
+            output_eigensystem=_out_eig,
         )
+        _out_eig = None
         _record_sc(inputs, f"    SC convergence: {_verdict.summary()}")
         # LABEL-FREE MATRIX RESIDUAL.  The per-k spectral norm bounds every
         # sorted-eigenvalue residual (Weyl) and also sees eigenvector
         # (off-diagonal) error, so identity relabelling of hybridized pairs
         # cannot move it; Frobenius is what the accelerator's Gram
         # minimizes.  Protected block = the metric mask.
-        from common.collectives import gather_to_host as _gth
-        _fh = (np.asarray(_gth(state_out.H_qp_dft))
-               - np.asarray(_gth(H))) * RYD_TO_EV * 1e3
-        _pm = _metric_np[:, :nb, :nb] > 0
-        _fp = np.where(_pm, _fh, 0.0)
-        _spec = np.abs(np.linalg.eigvalsh(
-            0.5 * (_fp + np.conj(np.swapaxes(_fp, -1, -2))))).max()
+        _spec, _frob = _protected_residual_norms(
+            state_out.H_qp_dft, H, metric_mask, eigvalsh_kshard)
         _record_sc(inputs, f"    SC matrix residual: call={call_index} "
                            f"max_k ||f_k||_2 = {_spec:.6e} meV; ||f||_F = "
-                           f"{np.linalg.norm(_fp):.6e} meV (protected block)")
+                           f"{_frob:.6e} meV (protected block)")
         _iter_idx[0] += 1
         if call_index > 0:
             _floor_history.append(float(_spec))
@@ -7329,6 +7354,7 @@ def dump_qp_wfn_artifacts(
     write_wfn_h5: bool = True,
     print_fn: Callable = print,
     clamp_tol: float = _OCCUPATION_CLAMP_TOL_DEFAULT,
+    eigensystem=None,
 ) -> tuple[str | None, str, float, np.ndarray]:
     """Write canonical SC U/E and optionally the full ``WFN_qp.h5``.
 
@@ -7423,10 +7449,11 @@ def dump_qp_wfn_artifacts(
     from file_io.restart_bundle import validate_qp_rotations_artifact
 
     from psp.get_DFT_mtxels import spin_degeneracy_factor
-    enk_loop_ry, U_loop, efermi_ry = final_qp_eigenstates(
-        state, n_occ=n_occ, mesh_xy=mesh_xy,
-        state_capacity=float(spin_degeneracy_factor(wfn)),
-        clamp_tol=float(clamp_tol))
+    enk_loop_ry, U_loop, efermi_ry = (
+        eigensystem if eigensystem is not None else final_qp_eigenstates(
+            state, n_occ=n_occ, mesh_xy=mesh_xy,
+            state_capacity=float(spin_degeneracy_factor(wfn)),
+            clamp_tol=float(clamp_tol)))
     enk_full_ry, U_full = _loop_arrays_on_full_bz(
         (enk_loop_ry, U_loop), kstar=kstar, state_on_ibz=state_on_ibz)
     # Full BZ → file wedge, by name.  One reduction, two arrays; the k
