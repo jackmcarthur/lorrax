@@ -25,7 +25,7 @@ BACKENDS = ("__gemm__", "__fft__")
 
 @pytest.fixture(autouse=True)
 def _forced_gemm_kind(monkeypatch):
-    monkeypatch.setitem(fourier_plan.GEMM_CROSSOVER, "__gemm__", (1 << 30, 1 << 30))
+    monkeypatch.setitem(fourier_plan.GEMM_CROSSOVER, "__gemm__", (range(1 << 30),) * 2)
 
 
 def _rng(*key):
@@ -209,16 +209,39 @@ def test_stage_order_and_backend_choice(monkeypatch):
     assert plan.stages == [(0, "fft", 4, 8), (1, "fft", 10, 10), (2, "fft", 12, 3)]
     assert [op[0] for op in plan._ops] == ["embed", "fft", "take"]
     # a mixed table: supported axes up to 8 on the GEMM, full axes on the FFT
-    monkeypatch.setitem(fourier_plan.GEMM_CROSSOVER, "__mixed__", (0, 8))
+    monkeypatch.setitem(fourier_plan.GEMM_CROSSOVER, "__mixed__", (range(0), range(9)))
     plan = LocalFourierPlan((8, 10, 12), (0, 1, 2), device_kind="__mixed__", **kw)
     assert plan.stages == [(1, "fft", 10, 10), (2, "fft", 12, 3), (0, "gemm", 4, 8)]
-    assert fourier_plan.gemm_crossover("an unknown accelerator") == (0, 0)
+    assert fourier_plan.gemm_crossover("an unknown accelerator") == (range(0), range(0))
     # the A100 row: supported plane axes on the GEMM, a full axis on the FFT
     sup = {1: np.arange(-13, 14) % 54, 2: np.arange(27)}
     x = _crandn(_rng("a100"), (2, 27, 27, 9))
     plan = _check(x, (54, 54, 9), (1, 2, 3), sign=-1, in_sup=sup,
                   kind="NVIDIA A100-SXM4-40GB")
     assert plan.stages == [(3, "fft", 9, 9), (2, "gemm", 27, 54), (1, "gemm", 27, 54)]
+
+
+@pytest.mark.parametrize("kind", BACKENDS)
+def test_out_perm_and_transpose_free_route(kind):
+    """``out_perm`` transposes the result; from a (Kc, B, Kb) input the GEMM
+    chain writes (B, n_b, n_c) directly, with no transpose at all."""
+    n_b, n_c = 18, 20
+    sb, sc = np.arange(-4, 5) % n_b, np.arange(-5, 5) % n_c
+    rng = _rng("perm", kind)
+    x = _crandn(rng, (sc.size, 6, sb.size))                     # (Kc, B, Kb)
+    plan = LocalFourierPlan((n_b, n_c), (2, 0), sign=-1, in_support={2: sb, 0: sc},
+                            out_perm=(1, 2, 0), device_kind=kind)
+    y = np.asarray(jax.jit(plan)(jnp.asarray(x)))
+    ref = _reference(x, (n_b, n_c), (2, 0), -1, "backward", {2: sb, 0: sc}, {})
+    ref = np.transpose(ref, (1, 2, 0))
+    assert y.shape == (6, n_b, n_c)
+    assert np.linalg.norm(y - ref) <= RTOL * np.linalg.norm(ref)
+    if kind == "__gemm__":
+        assert plan._route(x.shape, [1, 2, 0])[0] == 0
+        # from the natural (B, Kb, Kc) layout the cheapest route still moves data
+        plan2 = LocalFourierPlan((n_b, n_c), (1, 2), sign=-1, in_support={1: sb, 2: sc},
+                                 device_kind=kind)
+        assert 0 < plan2._route((6, sb.size, sc.size), [0, 1, 2])[0] < 6 * n_b * n_c
 
 
 def test_plan_inside_shard_map():
