@@ -116,6 +116,17 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int],
     fused = (vertex_pairs is None and not fermi_dirac and face_shape is not None
              and right_face_shape is None and k_unfold_plan is not None
              and not isinstance(k_unfold_plan, tuple))
+    if fused:
+        # A grid mode 11 cannot hold (ffi.fft.chi_unfold_refusal) keeps the face kernel.
+        from ffi import fft as _F
+        why = (_F.chi_unfold_refusal(kgrid, int(face_shape[3]))
+               if _F.kconv_backend(mesh_xy) == "mathdx" else "")
+        if why:
+            from ffi.gate import announce_once
+            announce_once(("chi_unfold", tuple(kgrid), int(face_shape[3])),
+                          f"[chi0] k-grid {tuple(kgrid)} ns={int(face_shape[3])}: the face kernel, "
+                          f"not mathdx mode 11: {why}", scope="rank0")
+            fused = False
     cache_key = (_mesh_key(mesh_xy), kgrid, ffi_dial_key(), n_out,
                  complex_contour, layout, face_shape, right_face_shape,
                  vertex_classes, (tuple(id(p) for p in k_unfold_plan)

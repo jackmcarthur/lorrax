@@ -162,7 +162,7 @@ __all__ = [
     "KConvStored", "make_kconv_klead", "make_kconv_klead_unfold", "KCONV_KLEAD_UNFOLD_TARGET",
     "make_kconv_lorentz_unfold", "KCONV_KLEAD_LORENTZ_TARGET",
     "make_kfft_klead_unfold", "KFFT_KLEAD_UNFOLD_TARGET",
-    "make_kconv_chi_unfold", "KCONV_CHI_UNFOLD_TARGET",
+    "make_kconv_chi_unfold", "KCONV_CHI_UNFOLD_TARGET", "chi_unfold_refusal",
     "make_kconv_kminor", "kconv_kminor_out_shape",
     "make_kfft_klead", "make_kfft_kminor",
     "make_local_kfft_klead", "make_local_kfft_kminor", "make_local_kconv_kminor",
@@ -1588,6 +1588,33 @@ def make_kfft_klead_unfold(mesh: Mesh, kgrid, tables, *, norm: str | None = "ort
             Wt = Wp
         return sm(Wp, Wt) if load is None else sm_dev(Wp, Wt, *load)
     return fn
+
+
+def chi_unfold_refusal(kgrid, ns: int, optin: int | None = None) -> str:
+    """Why mathdx mode 11 cannot serve this grid ("" when it can): the k-box residency rule.
+
+    The handler's build() refuses the same cases (GATE mathdx-kconv-chi-residency): the
+    single pass needs one pair's ``2 ns^2`` columns of ``16·((nx·ny·(nz|1))|1)`` B within
+    the opt-in shared memory per block; the split arm needs a 16-column plane tile of
+    ``16·((ny·(nz|1))|1)`` B each and a group pencil of ``16·nx·(2 ns^2 + 1)·TY`` B,
+    ``TY = 256 / (2 ns^2)``.  ``optin`` defaults to the device's attribute.
+    """
+    nx, ny, nz = (int(v) for v in kgrid)
+    ns = int(ns)
+    have = _optin_smem_bytes() if optin is None else int(optin)
+    if have is None:
+        return "no CUDA driver to read the opt-in shared memory"
+    zp = nz | 1
+    rs, pr = (nx * ny * zp) | 1, (ny * zp) | 1
+    grp = 2 * ns * ns
+    if grp * rs * 16 <= have:
+        return ""
+    ty = max(1, 256 // grp)
+    plane, pencil = 16 * pr * 16, 16 * nx * (grp + 1) * ty
+    if plane <= have and pencil <= have:
+        return ""
+    return (f"a pair's {grp} columns need {grp * rs * 16} B resident, and the split arm's plane tile "
+            f"{plane} B / group pencil {pencil} B; the device has {have} B of opt-in shared memory")
 
 
 def make_kconv_chi_unfold(mesh: Mesh, kgrid, tables, *, n_out: int, complete: bool,
