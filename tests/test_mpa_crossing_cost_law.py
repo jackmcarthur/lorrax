@@ -111,7 +111,7 @@ def test_patched_deck_hull_fields_are_the_patch_hull(tmp_path):
     arm 21: SC partition 2/48 instead of 10/48)."""
     from gw.gw_config import LorraxConfig
     deck = tmp_path / "mpa.in"
-    deck.write_text("[lorrax]\nwfn_file = /dev/null\n"
+    deck.write_text("[lorrax]\nwfn_file = /dev/null\nsys_dim = 2\n"
                     "sigma_omega_patches_ev = -66:-48, -32:-20, -7:7\n")
     cfg = LorraxConfig.from_input_file(str(deck))
     assert cfg.sigma.omega_min_ev == -66.0

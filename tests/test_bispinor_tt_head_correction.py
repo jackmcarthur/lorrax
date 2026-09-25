@@ -439,7 +439,8 @@ memory_per_device_gb = 4.0
 def _config(tmp_path, extra="", name="bispinor_tt_head.in"):
     from gw.gw_config import LorraxConfig
     path = tmp_path / name
-    path.write_text(_BASE + extra)
+    # sys_dim is required (IC bba085a7); 2 was the implicit default these decks ran with.
+    path.write_text(_BASE + ("" if "sys_dim" in extra else "sys_dim = 2\n") + extra)
     return LorraxConfig.from_input_file(
         str(path), print_fn=lambda *a, **k: None)
 
