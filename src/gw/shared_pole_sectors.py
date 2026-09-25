@@ -520,7 +520,7 @@ def construct_diagonal_sector_round(samples, moments, meta, config, geometry, *,
     from runtime.padding import padded_axis
     from jax.sharding import PartitionSpec as P
     from gw.gw_config import linalg_resolution
-    from gw.shared_pole_capacity import ConstructorCapacity
+    from gw.shared_pole_capacity import ConstructorCapacity,round_padding_output_bytes
     from gw.shared_pole_directions import _round_kernels,select_round_states,leading_response_directions
     from gw.shared_pole_local import (partner_realization,round_tables,reduce_round,
                                       _batch_put,grow_round,carrier_history)
@@ -587,12 +587,15 @@ def construct_diagonal_sector_round(samples, moments, meta, config, geometry, *,
             history=history if reuse else None)
     def _preview(widths,infinity_width,reuse):
         table=_tables(widths,infinity_width,reuse)
-        return budget.preview(table['active'].shape[-1],phase='reduction')[
+        padding_bytes=round_padding_output_bytes(states,infinity,widths,infinity_width)
+        return budget.preview(table['active'].shape[-1],phase='reduction',
+            padding_output_bytes_per_rank=padding_bytes)[
             'device_budget_status']=='PASS'
     def _admit(widths,infinity_width,reuse):
         table=_tables(widths,infinity_width,reuse)
         side=table['active'].shape[-1]
-        budget.plan(side,phase='reduction')
+        padding_bytes=round_padding_output_bytes(states,infinity,widths,infinity_width)
+        budget.plan(side,phase='reduction',padding_output_bytes_per_rank=padding_bytes)
         if reuse:
             history[(round_key,'extent',2,len(widths))]=(table['order'].shape[1]//2,)
         return table,side

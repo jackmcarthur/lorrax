@@ -20,7 +20,8 @@ import numpy as np
 
 def shared_pole_byte_terms(meta, *, mesh_xy, resolution, pencil_side,
                            parent_batch, sample_batch, phase="reduction",
-                           selection_faces=None, cross_original_sides=None):
+                           selection_faces=None, cross_original_sides=None,
+                           padding_output_bytes_per_rank=0):
     """Price constructor carriers; the map CapacityLedger owns admission.
 
     Selection holds samples, current narrow actions and the n/2n direction
@@ -37,6 +38,9 @@ def shared_pole_byte_terms(meta, *, mesh_xy, resolution, pencil_side,
     b, a, r = int(parent_batch), int(sample_batch), int(pencil_side)
     if min(packed, b, a) <= 0 or r < 0:
         raise ValueError("GATE shared_pole_capacity: got: invalid extents; want: positive basis/batches and nonnegative pencil; why: live-set pricing")
+    padding_output_bytes_per_rank = int(padding_output_bytes_per_rank)
+    if padding_output_bytes_per_rank < 0 or (phase != "reduction" and padding_output_bytes_per_rank):
+        raise ValueError("GATE shared_pole_capacity: round padding outputs require reduction and nonnegative bytes")
     dense_copies = math.ceil(b / p) if resolution.layout == "local" else b / p
     if phase == "selection":
         dense = 24 * packed**2
@@ -81,6 +85,9 @@ def shared_pole_byte_terms(meta, *, mesh_xy, resolution, pencil_side,
     terms = {
         "sample_or_moment_batch": math.ceil(16*b*sample_faces*packed**2/p),
         "narrow_actions": math.ceil(16*b*3*packed*action_side/p),
+        # jnp.pad creates new arrays while all source panels still live. The
+        # reduction envelope covers the old actions, not these new outputs.
+        "round_padding_outputs": padding_output_bytes_per_rank,
         "replicated_scalars": 8*b*(12*action_side+4*packed),
         "phase_dense_temporaries": math.ceil(16*dense_copies*dense),
     }
@@ -93,6 +100,19 @@ def shared_pole_byte_terms(meta, *, mesh_xy, resolution, pencil_side,
 
 def _shard_bytes(array):
     return int(np.prod(array.sharding.shard_shape(array.shape))) * array.dtype.itemsize
+
+
+def round_padding_output_bytes(states, infinity, widths, infinity_width):
+    """Per-rank bytes of new padded panels while every input remains live."""
+    def output_bytes(array, width):
+        if int(array.shape[-1]) == int(width):
+            return 0
+        shape = (*array.shape[:-1], int(width))
+        return int(np.prod(array.sharding.shard_shape(shape))) * array.dtype.itemsize
+
+    return (sum(output_bytes(array, width)
+                for state, width in zip(states, widths) for array in state[1:])
+            + sum(output_bytes(array, infinity_width) for array in infinity))
 
 
 class ConstructorCapacity:
@@ -163,7 +183,8 @@ class ConstructorCapacity:
         return self.native_queries[key]
 
     def plan(self, side=None, *, phase=None, sample_batch=1,
-             selection_faces=None, eigen_side=None, cross_original_sides=None):
+             selection_faces=None, eigen_side=None, cross_original_sides=None,
+             padding_output_bytes_per_rank=0):
         """Admit this phase's actual live set before allocating it.
 
         ``side`` is the pencil side this price is for; omit it to reprice the
@@ -177,20 +198,22 @@ class ConstructorCapacity:
         price, native = self.quote(side, phase=self._phase,
                                    sample_batch=sample_batch,
                                    selection_faces=selection_faces, eigen_side=eigen_side,
-                                   cross_original_sides=cross_original_sides)
+                                   cross_original_sides=cross_original_sides,
+                                   padding_output_bytes_per_rank=padding_output_bytes_per_rank)
         self._workspace = sum(native.values())
         row = self._reserve("constructor.plan", price["resident_bytes_per_rank"])
         row['execution'] = self.execution
         return dict(row, price=price, native_workspace=dict(native))
 
     def quote(self, side, *, phase, sample_batch=1, selection_faces=None, eigen_side=None,
-              cross_original_sides=None):
+              cross_original_sides=None, padding_output_bytes_per_rank=0):
         """Return an unrecorded phase price for route selection/preflight."""
         side = int(side)
         n = self._n
         price = self.resident_quote(
             side, phase=phase, sample_batch=sample_batch,
-            selection_faces=selection_faces, cross_original_sides=cross_original_sides)
+            selection_faces=selection_faces, cross_original_sides=cross_original_sides,
+            padding_output_bytes_per_rank=padding_output_bytes_per_rank)
         extents = {n, 2*n} if phase == "selection" else (
             {side if eigen_side is None else int(eigen_side)} if phase in ("reduction", "cross_reduction") else {n})
         # Eigh scratch is transient: replace it at each phase boundary.
@@ -213,7 +236,8 @@ class ConstructorCapacity:
         return price, dict(self._native_maxima)
 
     def resident_quote(self, side, *, phase, sample_batch=1,
-                       selection_faces=None, cross_original_sides=None):
+                       selection_faces=None, cross_original_sides=None,
+                       padding_output_bytes_per_rank=0):
         """Price the live arrays without invoking a native workspace query.
 
         This is an optimistic admission bound. Route selection uses it first
@@ -229,7 +253,8 @@ class ConstructorCapacity:
             pencil_side=side, parent_batch=self.batch_width,
             sample_batch=sample_batch, phase=phase,
             selection_faces=selection_faces,
-            cross_original_sides=cross_original_sides)
+            cross_original_sides=cross_original_sides,
+            padding_output_bytes_per_rank=padding_output_bytes_per_rank)
         # Other parents' narrow inputs survive selection and each model's
         # checks; they are additional live storage, never hidden in a limit.
         extra = sum(_shard_bytes(a)
@@ -238,7 +263,8 @@ class ConstructorCapacity:
         price["resident_bytes_per_rank"] += extra
         return price
 
-    def preview(self, side, *, phase, sample_batch=1, selection_faces=None):
+    def preview(self, side, *, phase, sample_batch=1, selection_faces=None,
+                padding_output_bytes_per_rank=0):
         """Preview device admission without appending a ledger row."""
         # A candidate carrier may be rejected in favour of the current
         # round's smaller one.  Its workspace must not become a high-water
@@ -246,7 +272,8 @@ class ConstructorCapacity:
         maxima, workspace = dict(self._native_maxima), self._workspace
         try:
             price, native = self.quote(side, phase=phase, sample_batch=sample_batch,
-                                       selection_faces=selection_faces)
+                                       selection_faces=selection_faces,
+                                       padding_output_bytes_per_rank=padding_output_bytes_per_rank)
         finally:
             self._native_maxima, self._workspace = maxima, workspace
         return self._ledger.preview(

@@ -2,6 +2,7 @@
 
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 
@@ -94,3 +95,50 @@ def test_capacity_preview_does_not_charge_a_rejected_candidate():
     assert budget.preview(20, phase="reduction")["device_budget_status"] == "FAIL"
     assert budget._native_maxima == {"eigh": 5}
     assert budget._workspace == 5
+
+
+def test_wider_panels_change_admission_at_the_same_pencil_side():
+    from gw.shared_pole_capacity import ConstructorCapacity, round_padding_output_bytes
+
+    class Sharding:
+        def shard_shape(self, shape):
+            return shape
+
+    class Panel:
+        def __init__(self, width):
+            self.shape = (4, 8, width)
+            self.sharding = Sharding()
+            self.dtype = np.dtype("complex128")
+
+    states = [(1j, Panel(2), Panel(2), Panel(2))]
+    infinity = (Panel(2), Panel(2), Panel(2), Panel(2))
+    padded = round_padding_output_bytes(states, infinity, (32,), 32)
+    assert padded == 7 * 4 * 8 * 32 * 16
+    assert round_padding_output_bytes(states, infinity, (2,), 2) == 0
+
+    budget = ConstructorCapacity.__new__(ConstructorCapacity)
+    budget.execution = "local"
+    budget._meta = SimpleNamespace(n_rmu_padded=8)
+    budget._mesh_xy = SimpleNamespace(shape={"x": 2, "y": 2})
+    budget._resolution = SimpleNamespace(layout="local")
+    budget._n = 8
+    budget._native_maxima = {"eigh": 0}
+    budget._workspace = 0
+    budget._upstream = ()
+    budget.retained_panels = ()
+    budget.batch_width = 4
+    budget.eigenplan = lambda _side: None
+    budget.query_workspace = lambda *_args: 0
+    side = 8
+    base, _ = budget.quote(side, phase="reduction")
+    limit = base["resident_bytes_per_rank"] + padded // 2
+    budget._ledger = SimpleNamespace(preview=lambda **price: {
+        "device_budget_status": "PASS" if price["resident_bytes_per_rank"]
+        + price["workspace_bytes_per_rank"] <= limit else "FAIL"})
+
+    assert budget.preview(side, phase="reduction")["device_budget_status"] == "PASS"
+    assert budget.preview(side, phase="reduction",
+        padding_output_bytes_per_rank=padded)["device_budget_status"] == "FAIL"
+    charged, _ = budget.quote(side, phase="reduction",
+        padding_output_bytes_per_rank=padded)
+    assert charged["terms_bytes_per_rank"]["round_padding_outputs"] == padded

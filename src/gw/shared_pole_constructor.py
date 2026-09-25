@@ -96,6 +96,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
                                           own_extent_receipts, parent_rounds, partner_realization,
                                           reduce_round, round_tables, grow_round,
                                           carrier_history)
+        from gw.shared_pole_capacity import round_padding_output_bytes
         from gw.shared_pole_recipe import (
             build_construction_row, charge4_gates, construction_receipt,
             shared_real_pole_gates_v1_r3b as gates,
@@ -281,15 +282,20 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
             def _preview(widths, infinity_width, reuse):
                 table = _tables(widths, infinity_width, reuse)
                 side = int(table["active"].shape[-1])
+                padding_bytes = round_padding_output_bytes(
+                    round_states, infinity, widths, infinity_width)
                 if execution == 'local' and not distrib_la.fits_local(
                         budget.eigenplan(side), "eigh", ((1, side, side),) * 8,
                         np.complex128, ledger.device_budget_bytes_per_rank):
                     return False
-                return budget.preview(side, phase="reduction")["device_budget_status"] == "PASS"
+                return budget.preview(side, phase="reduction",
+                    padding_output_bytes_per_rank=padding_bytes)["device_budget_status"] == "PASS"
 
             def _admit(widths, infinity_width, reuse):
                 table = _tables(widths, infinity_width, reuse)
                 side = int(table["active"].shape[-1])
+                padding_bytes = round_padding_output_bytes(
+                    round_states, infinity, widths, infinity_width)
                 # Resolve before either reduction program is traced. Local
                 # mode's native route still has its own workspace guard.
                 local_eigh = budget.eigenplan(side)
@@ -297,7 +303,8 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
                         local_eigh, "eigh", ((1, side, side),) * 8,
                         np.complex128, ledger.device_budget_bytes_per_rank):
                     raise ValueError(f"GATE shared_pole_round_capacity: got: pencil side {side} at parents {ids[:real]}; want: eight [side, side] complex blocks and the eigh workspace within {ledger.device_budget_bytes_per_rank} bytes on one device; why: every parent reduces on its own rank")
-                budget.plan(side, phase="reduction")
+                budget.plan(side, phase="reduction",
+                    padding_output_bytes_per_rank=padding_bytes)
                 if reuse:
                     extent_key = (round_key, "extent", 2 if ordered else 1, len(widths))
                     history[extent_key] = (table["order"].shape[1] // (2 if ordered else 1),)
