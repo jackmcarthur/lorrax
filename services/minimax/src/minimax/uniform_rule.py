@@ -1321,7 +1321,7 @@ def _select_backend(backend, n_start, cloud_size):
 
 
 def build_uniform_rule(box, eps, *, im_cap=3.0, kappa_cap=1.0e4, trunc=10.0,
-                       reduce=True, relative=None, backend=None):
+                       reduce=True, relative=None, backend=None, attempts=None):
     """Rule for ``1/d`` on ``box = (re_lo, re_hi, im_lo, im_hi)`` with
     ``Im d > 0``.
 
@@ -1358,6 +1358,16 @@ def build_uniform_rule(box, eps, *, im_cap=3.0, kappa_cap=1.0e4, trunc=10.0,
     run the same algorithm with the same acceptance; the jax one differs in
     floating-point detail only.
 
+    ``attempts = (first, stop)`` runs only fixed-N attempts ``first <= j <
+    stop`` of a crossing box (``stop=None``: to the bracket's end, then the
+    rank-``r`` fallback) and returns ``None`` when none of them certifies and
+    ``stop`` is finite. Each attempt is a fresh solve at its own node count,
+    and the count sequence does not depend on the solves, so ranges that
+    partition the bracket can run in different processes: the first range, in
+    attempt order, that returns a rule returns the rule of the whole bracket,
+    bit for bit when the processes share one BLAS configuration. The skipped
+    attempts are taken as not certified, which the caller guarantees.
+
     Tempting, and why not: judge acceptance on the fit cloud ``d`` itself
     (17 of 80 random boxes passed there and failed on a finer cloud), or skip
     the ``ok`` polish of the start (an unpolished start inherits the
@@ -1370,6 +1380,9 @@ def build_uniform_rule(box, eps, *, im_cap=3.0, kappa_cap=1.0e4, trunc=10.0,
     t0 = time.perf_counter()
     if relative is None:
         relative = re_lo > 0.0 or re_hi < 0.0
+    if attempts is not None and (relative or not reduce):
+        raise ValueError("attempts splits only the fixed-N bracket of a crossing box")
+    first, stop = (0, None) if attempts is None else attempts
     # rho_of: the acceptance currency (sup); fit_of: the same currency with
     # the cloud's log-density folded in, for the basis and the least squares
     rho_of = (lambda x: np.abs(x)) if relative else (lambda x: np.full(x.size, im_lo))
@@ -1454,25 +1467,28 @@ def build_uniform_rule(box, eps, *, im_cap=3.0, kappa_cap=1.0e4, trunc=10.0,
         red = None
         if not relative:
             n_k = predict_nodes(bx, eps, relative)
-            for _attempt in range(_FIXED_N_BRACKET):
+            for attempt in range(_FIXED_N_BRACKET):
                 n_k = int(min(n_k, fam.r))
                 if n_k < 2:
                     break
-                # w_ref sets the Tikhonov scale, so it must be the weights of
-                # an n_k-node rule (see the note above).
-                _s_ref, w_ref_n = fam.interpolatory(n_k)
-                fit = _CloudFit(d, fam.phase, S, im_lo_s, im_hi_s, eps,
-                                w_ref=w_ref_n, rho=rho)
-                s_k, w_k, accepted = fit.polish(
-                    start_param(bx, eps, theta, S, im_lo_s, im_hi_s, n_k), ok,
-                    nstep=_FIXED_N_STEPS, rounds=_FIXED_N_ROUNDS,
-                    gate=(sup_ratio, _FIXED_N_GATE))
-                if accepted:
-                    red = (s_k, w_k)
-                    break
+                if attempt >= first and (stop is None or attempt < stop):
+                    # w_ref sets the Tikhonov scale, so it must be the weights
+                    # of an n_k-node rule (see the note above).
+                    _s_ref, w_ref_n = fam.interpolatory(n_k)
+                    fit = _CloudFit(d, fam.phase, S, im_lo_s, im_hi_s, eps,
+                                    w_ref=w_ref_n, rho=rho)
+                    s_k, w_k, accepted = fit.polish(
+                        start_param(bx, eps, theta, S, im_lo_s, im_hi_s, n_k), ok,
+                        nstep=_FIXED_N_STEPS, rounds=_FIXED_N_ROUNDS,
+                        gate=(sup_ratio, _FIXED_N_GATE))
+                    if accepted:
+                        red = (s_k, w_k)
+                        break
                 if n_k >= fam.r:
                     break
                 n_k = int(np.ceil(n_k * _FIXED_N_GROWTH))
+            if red is None and stop is not None:
+                return None
             if red is None:
                 # The bracket is the whole crossing path: the reduction is NOT
                 # its fallback.  Removing one node at a time with a

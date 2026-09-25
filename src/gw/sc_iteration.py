@@ -3048,7 +3048,45 @@ def _classify_sc_partition(
     return partition, indices_loop, energies_loop, mu_ev, frozen_partition
 
 
+#: One SC map's named stages (label, outermost timing row). The per-map line
+#: reports each one's seconds in this map, the rule plan net of the refit
+#: nested in it, and the remainder against the map's wall.
+_SC_MAP_STAGES = (
+    ("W response", "sc.w_response"),
+    ("Sigma rule refit", "sigma.rule_refit"),
+    ("Sigma rule plan", "sigma.rule_plan"),
+    ("Sigma tau sweep", "sigma.tau_sweep"),
+    ("Sigma exchange", "sigma.exchange"),
+    ("Sigma Hartree", "sigma.hartree"),
+)
+
+
+def _sc_stage_seconds() -> dict:
+    """Accumulated inclusive seconds of every ``_SC_MAP_STAGES`` row so far."""
+    totals = dict.fromkeys((name for _, name in _SC_MAP_STAGES), 0.0)
+    for row in timing.records():
+        name = row["name"]
+        if name in totals and name not in row["path"][:-1]:
+            totals[name] += float(row["inclusive"])
+    return totals
+
+
+def _record_sc_map_stages(inputs, iteration, started, before) -> None:
+    """One line per SC map whose stages sum to its wall (``other`` is the rest)."""
+    wall = time.perf_counter() - started
+    after = _sc_stage_seconds()
+    delta = {name: after[name] - before[name] for name in after}
+    delta["sigma.rule_plan"] -= delta["sigma.rule_refit"]
+    parts = [(label, delta[name]) for label, name in _SC_MAP_STAGES]
+    _record_sc(
+        inputs, f"    SC map {int(iteration)} stages (s): "
+        + " | ".join(f"{label} {seconds:.1f}" for label, seconds in parts)
+        + f" | other {wall - sum(seconds for _, seconds in parts):.1f}"
+        + f" | wall {wall:.1f}")
+
+
 def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
+    _map_started, _map_stages_before = time.perf_counter(), _sc_stage_seconds()
     map0_dft_table = None
     """One self-consistent QSGW step in the DFT basis.
 
@@ -3611,34 +3649,37 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         used_producer = (inputs.screening_model_fn
                          if producer is None else producer)
         used_quad = inputs.quad if quad_override is None else quad_override
-        produced = used_producer(
-            inputs.config.compute_mode, wfns_qp, inputs.V_q,
-            quad=used_quad, e_ref=inputs.e_ref, sym=inputs.sym,
-            centroid_indices=inputs.centroid_indices, config=inputs.config,
-            meta=inputs.meta, mesh_xy=inputs.mesh_xy,
-            run_dir=os.path.join(inputs.input_dir, "tmp", "mpa"),
-            label=f"sc_{state.iteration:04d}",
-            head_resolver=inputs.head_resolver,
-            head_channel=getattr(inputs, 'head_channel', None),
-            wfn=inputs.wfn,
-            wfn_fingerprint_binding=inputs.wfn_fingerprint_binding,
-            charge_zeta_identity=inputs.charge_zeta_identity,
-            tensors_filename=inputs.tensors_filename,
-            mpa_plan=mpa_plan,
-            iteration_head_response=iteration_head_response,
-            occupation_state=metal_occ_state,
-            material_class=inputs.material_class,
-            **(dict(wfns_transverse=wfns_transverse_qp,
-                    bispinor_v_q_path=inputs.bispinor_v_q_path,
-                    mu_bases=inputs.mu_bases,
-                    photon_g0_vectors=inputs.photon_g0_vectors,
-                    photon_head_cache=inputs.screening_seed_cache,
-                    photon_head_rotation=U_full,
-                    photon_static_reference=(None if inputs.screening_seed_cache is None else
-                        inputs.screening_seed_cache.get('photon_static_reference')))
-               if inputs.config.sigma.w_model == "shared_pole"
-               and wfns_transverse_qp is not None else {}),
-            print_fn=inputs.print_fn)
+        # One named SC stage: the map's W, GPU work the Sigma refit follows.
+        with timing.section("sc.w_response", announce=True,
+                            label="SC W response"):
+            produced = used_producer(
+                inputs.config.compute_mode, wfns_qp, inputs.V_q,
+                quad=used_quad, e_ref=inputs.e_ref, sym=inputs.sym,
+                centroid_indices=inputs.centroid_indices, config=inputs.config,
+                meta=inputs.meta, mesh_xy=inputs.mesh_xy,
+                run_dir=os.path.join(inputs.input_dir, "tmp", "mpa"),
+                label=f"sc_{state.iteration:04d}",
+                head_resolver=inputs.head_resolver,
+                head_channel=getattr(inputs, 'head_channel', None),
+                wfn=inputs.wfn,
+                wfn_fingerprint_binding=inputs.wfn_fingerprint_binding,
+                charge_zeta_identity=inputs.charge_zeta_identity,
+                tensors_filename=inputs.tensors_filename,
+                mpa_plan=mpa_plan,
+                iteration_head_response=iteration_head_response,
+                occupation_state=metal_occ_state,
+                material_class=inputs.material_class,
+                **(dict(wfns_transverse=wfns_transverse_qp,
+                        bispinor_v_q_path=inputs.bispinor_v_q_path,
+                        mu_bases=inputs.mu_bases,
+                        photon_g0_vectors=inputs.photon_g0_vectors,
+                        photon_head_cache=inputs.screening_seed_cache,
+                        photon_head_rotation=U_full,
+                        photon_static_reference=(None if inputs.screening_seed_cache is None else
+                            inputs.screening_seed_cache.get('photon_static_reference')))
+                   if inputs.config.sigma.w_model == "shared_pole"
+                   and wfns_transverse_qp is not None else {}),
+                print_fn=inputs.print_fn)
         if (inputs.screening_seed_cache is not None and isinstance(produced, dict)
                 and produced.get('photon_static_reference') is not None):
             # Only the immutable initial contact survives. Current samples,
@@ -4285,14 +4326,17 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             exact_hartree_dft=exact_hartree_dft,
         ),
     )
-    if tail_fit is None:
-        return state_out
-    # This map's Z at each identity's own input energy: the next map's tail
-    # weights.  Sigma was built in the input carry's eigenbasis, whose sorted
-    # columns indices_loop maps to identities.  Collective, every rank.
-    z_sorted = _sc_z_factors(inputs, state_out, energies_loop)
-    return replace(state_out, tail_z_kn=np.take_along_axis(
-        np.asarray(z_sorted, dtype=np.float64), indices_loop, axis=1))
+    if tail_fit is not None:
+        # This map's Z at each identity's own input energy: the next map's
+        # tail weights.  Sigma was built in the input carry's eigenbasis,
+        # whose sorted columns indices_loop maps to identities.  Collective,
+        # every rank.
+        z_sorted = _sc_z_factors(inputs, state_out, energies_loop)
+        state_out = replace(state_out, tail_z_kn=np.take_along_axis(
+            np.asarray(z_sorted, dtype=np.float64), indices_loop, axis=1))
+    _record_sc_map_stages(inputs, state.iteration, _map_started,
+                          _map_stages_before)
+    return state_out
 
 
 # ---------------------------------------------------------------------------
