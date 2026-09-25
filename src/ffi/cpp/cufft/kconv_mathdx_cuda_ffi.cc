@@ -1617,9 +1617,10 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
                       "pip install nvidia-mathdx", ffi::ErrorCode::kFailedPrecondition);
     }
     // Options that decide the cubin (include paths do not: two installs of one
-    // wheel version compile the same image).
+    // wheel version compile the same image).  Line info adds source tables for
+    // ncu's source counters and leaves the SASS unchanged.
     std::vector<std::string> defs = {
-        "--std=c++17", "--device-as-default-execution-space",
+        "--std=c++17", "--device-as-default-execution-space", "--generate-line-info",
         "--gpu-architecture=sm_" + std::to_string(cc_major) + std::to_string(cc_minor),
         "-DLRX_MODE=" + std::to_string(mode), "-DLRX_NX=" + std::to_string(nkx),
         "-DLRX_NY=" + std::to_string(nky), "-DLRX_NZ=" + std::to_string(nkz),
