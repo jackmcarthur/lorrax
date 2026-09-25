@@ -198,7 +198,13 @@ state.
   state inside the padded window, the solution of
   $E \ge \omega_{\min} - \mathrm{pad}(E)$ and $E \le \omega_{\max} + \mathrm{pad}(E)$
   (`scissor.sc_padded_window_ev`). Old samples do not change, the grown
-  support persists, and an interior hole refuses. Growth is monotone and
+  support persists, and an interior hole refuses. Coverage is judged in the
+  frame the Σ build measures from: the current spectrum's VBM or midgap for
+  GN/HL-PPM (`ppm_sigma.ppm_fermi_frame`), `efermi.resolve_sigma_efermi_ry`
+  for MPA. On MoS2 3×3 the PPM frame sat 1.4 eV above the DFT midgap, and
+  judging coverage in the wrong one left a "covered" state on $\Sigma(0)$
+  until a later growth switched it, a 2.8 eV jump of its map output
+  (CLAIMS 2726). Growth is monotone and
   bounded by the covered spectrum; in practice it stops after map 1, so
   growth late in a run marks a state that is still running away.
 - **Width.** The crossing-rule node count grows linearly in bandwidth$/\eta$,
