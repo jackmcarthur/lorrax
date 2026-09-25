@@ -365,7 +365,7 @@ def make_route_g_kernel(*, mesh: Mesh, kgrid, fft_grid, ns: int, b: int,
         pa_all = jnp.exp(-2j * jnp.pi * cax.astype(jnp.float64)[:, None]
                          * jnp.arange(n_blk * n_pb)[None, :] / n_a)
         pa_all = pa_all * (jnp.arange(n_blk * n_pb) < n_a)[None, :]
-        n_zc, n_za = int(zc.shape[0]), int(za.shape[0])
+        n_zc, n_za = int(zcol.size), int(za.shape[0])
 
         def owner_rows(lperm, lL):
             """Z rows of ``c_out`` owned slots from the whole-orbit D."""
