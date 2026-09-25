@@ -92,6 +92,9 @@ variable (decisions.md 2026-09-24, QUALITY #8):
     make_kconv_lorentz_unfold parent Green   the four-current Σ: the same load, then
                                              the γ_i Ĝ γ_j† · V_ij block sum in R space,
                                              stored at the caller's k rows only
+    make_kfft_klead_unfold    wedge interaction  make_kconv_klead's prep (ifftn into R
+                                             space) read from the q wedge with the
+                                             typed unfold on load
     make_kconv_kminor         trailing       BSE rung    fftn(ifftn(X)·K_R)
     make_kfft_klead / _local  flat leading   one transform
     make_kfft_kminor / _local trailing       one transform
@@ -157,6 +160,7 @@ __all__ = [
     "KCONV_PLANE_TARGET",
     "KConvStored", "make_kconv_klead", "make_kconv_klead_unfold", "KCONV_KLEAD_UNFOLD_TARGET",
     "make_kconv_lorentz_unfold", "KCONV_KLEAD_LORENTZ_TARGET",
+    "make_kfft_klead_unfold", "KFFT_KLEAD_UNFOLD_TARGET",
     "make_kconv_kminor", "kconv_kminor_out_shape",
     "make_kfft_klead", "make_kfft_kminor",
     "make_local_kfft_klead", "make_local_kfft_kminor", "make_local_kconv_kminor",
@@ -176,6 +180,7 @@ KCONV_PLANE_TARGET = "lorrax_mathdx_kconv_plane"
 KCONV_KLEAD_TARGET = "lorrax_mathdx_kconv_klead"
 KCONV_KLEAD_UNFOLD_TARGET = "lorrax_mathdx_kconv_klead_unfold_rows"
 KCONV_KLEAD_LORENTZ_TARGET = "lorrax_mathdx_kconv_klead_lorentz_rows"
+KFFT_KLEAD_UNFOLD_TARGET = "lorrax_mathdx_kfft_klead_unfold"
 KFFT_KLEAD_TARGET = "lorrax_mathdx_kfft_klead"
 KCONV_KMINOR_TARGET = "lorrax_mathdx_kconv_kminor"
 KFFT_KMINOR_TARGET = "lorrax_mathdx_kfft_kminor"
@@ -184,8 +189,8 @@ PLANE_FFT_GATHER_TARGET = "lorrax_mathdx_plane_fft_gather"
 #: Every mathdx target; ``require_kconv`` checks them all at startup.
 KCONV_TARGETS = (KCONV_PAIR_TARGET, KCONV_PARENT_TARGET, KCONV_PLANE_TARGET, KCONV_KLEAD_TARGET,
                  KCONV_KLEAD_UNFOLD_TARGET, KCONV_KLEAD_LORENTZ_TARGET,
-                 KFFT_KLEAD_TARGET, KCONV_KMINOR_TARGET, KFFT_KMINOR_TARGET,
-                 PLANE_FFT_GATHER_TARGET)
+                 KFFT_KLEAD_TARGET, KFFT_KLEAD_UNFOLD_TARGET, KCONV_KMINOR_TARGET,
+                 KFFT_KMINOR_TARGET, PLANE_FFT_GATHER_TARGET)
 
 #: The ``LORRAX_FFT_FFI`` dial.  Default ON — the FFI layer is REQUIRED
 #: (owner ruling, ``docs/architecture/decisions.md`` 2026-08-01): the flat-k
@@ -1465,6 +1470,76 @@ def make_kconv_lorentz_unfold(mesh: Mesh, kgrid, tables, *, left_vertices, right
                 f"merged over ns={ns})")
         return sm(G, Gt, V)
     return apply
+
+
+def make_kfft_klead_unfold(mesh: Mesh, kgrid, tables, *, norm: str | None = "ortho") -> Callable:
+    """An interaction's R-space operand read from its q WEDGE: ``fn(Wp, Wt=None) -> Y``.
+
+    ``Wp`` ``(n_wedge, ml, nl)`` c128 at ``P(None,'x','y')`` holds the
+    interaction on the wedge rows (merged endpoints ``ml = mx*n_l``,
+    ``nl = my*n_r``; a scalar W has ``n_l = n_r = 1``, a Lorentz block
+    ``(mx, nA, my, nB)`` flattened); ``Wt`` is its transposed partner, needed
+    only when ``tables`` use the pair-transpose rule on antiunitary rows
+    (``tables.conj_trs = 0``).  ``tables`` are
+    ``symmetry_maps.unfold_load_tables`` of the q wedge.  Returns ``Y``
+    ``(nk, ml, nl)`` at ``P(None,'x','y')``, equal to
+    ``make_kconv_klead(...).prep`` of the full-zone interaction
+    (``unfold_isdf_operator``, then the endpoint actions): the unfold is the
+    transform's load, so the full-zone interaction is never stored.  CUDA:
+    nvidia-mathdx mode 9; cpu: the service's reference composition, then the
+    prep of the plan route (``ifftn``; the identity on the host-conv arm,
+    whose apply transforms W itself).
+    """
+    from symmetry_maps import apply_unfold_load_tables_local, local_unfold_load_tables
+    kg = _check_kgrid(kgrid, kconv_backend(mesh))
+    nk = kg[0] * kg[1] * kg[2]
+    if int(tables.row.shape[0]) != nk:
+        raise ValueError(f"k-leading unfold fft: tables cover {tables.row.shape[0]} k, grid has {nk}")
+    spin_l = np.asarray(tables.spin)
+    spin_r = spin_l if tables.spin_r is None else np.asarray(tables.spin_r)
+    n_l, n_r = int(spin_l.shape[-1]), int(spin_r.shape[-1])
+    conj = int(tables.conj_trs)
+    needs_partner = bool(np.any(np.asarray(tables.trs))) and not conj
+    if kconv_backend(mesh) == "mathdx":
+        _require_target(KFFT_KLEAD_UNFOLD_TARGET, "CUDA")
+        attrs = dict(nkx=np.int64(kg[0]), nky=np.int64(kg[1]), nkz=np.int64(kg[2]),
+                     scale=np.float64(ffi_fft_scale("ifftn", norm, nk)), conj_trs=np.int64(conj),
+                     **_mathdx_common())
+
+        def local(w, wt):
+            t = local_unfold_load_tables(tables)
+            out = jax.ShapeDtypeStruct((nk, int(w.shape[1]), int(w.shape[2])), w.dtype)
+            return jax.ffi.ffi_call(KFFT_KLEAD_UNFOLD_TARGET, out)(
+                w, wt, t.row, t.trs, t.lsrc, t.rsrc, t.mph, t.nph, t.spin, t.spin_r, **attrs)
+    else:
+        _require_plan_route()
+        prep_local = (make_local_kfft_klead(mesh, kg, kind="ifftn", norm=norm)
+                      if _cpu_test_arm() else (lambda o: o))
+
+        def local(w, wt):
+            t = local_unfold_load_tables(tables)
+            O = apply_unfold_load_tables_local(w, wt, t, spin_l,
+                                               None if tables.spin_r is None else spin_r)
+            return prep_local(O.reshape(nk, int(w.shape[1]), int(w.shape[2])))
+
+    spec = P(None, "x", "y")
+    sm = _sharded(local, mesh, (spec, spec), spec)
+
+    def fn(Wp, Wt=None):
+        _check_complex(Wp)
+        if Wp.ndim != 3 or int(Wp.shape[1]) % n_l or int(Wp.shape[2]) % n_r:
+            raise ValueError(f"k-leading unfold fft expects Wp (n_wedge, mx*{n_l}, my*{n_r}); "
+                             f"got {Wp.shape}")
+        if int(Wp.shape[0]) != int(tables.n_parent):
+            raise ValueError(f"k-leading unfold fft: Wp has {Wp.shape[0]} wedge rows, the "
+                             f"tables {tables.n_parent}")
+        if Wt is None:
+            if needs_partner:
+                raise ValueError("k-leading unfold fft: the tables read the transposed partner on "
+                                 "antiunitary rows (pair_transpose), so Wt is required")
+            Wt = Wp
+        return sm(Wp, Wt)
+    return fn
 
 
 def kconv_kminor_out_shape(x_shape, out_layout: int) -> tuple[int, ...]:
