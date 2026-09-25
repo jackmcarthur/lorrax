@@ -15,11 +15,12 @@ Write the feature at position r as
 
 \[
  f_{kmni}(r)=\sqrt{w_k}\,
-       \psi^\dagger_{mk}(r)\Gamma_i\psi_{nk}(r),\qquad
+       \psi^\dagger_{nk}(r)\Gamma_i\psi_{mk}(r),\qquad
  K(r,r')=\sum_{kmni}f_{kmni}(r)f_{kmni}(r')^*.
 \]
 
-The windows m in L and n in R are explicit. Charge has one vertex I;
+The windows m in L and n in R are explicit; this uses the R-dagger/L
+orientation of `isdf.core._gram_q0_fold_local`. Charge has one vertex I;
 current selection stacks the three Hermitian vertices alpha_i/alpha_fs.
 This **positive feature Gram** is not the signed transverse fit matrix.
 Nor is it the frequency-dependent Gram of the W interpolation pencil.
@@ -92,11 +93,11 @@ psi_nk(r) psi_nk(r')^dagger. Then the feature Gram above is
 
 \[
  K(r,r')=\sum_{ki} w_k\,
- \operatorname{Tr}[\Gamma_i D_{R,k}(r,r')
-                    \Gamma_i^\dagger D_{L,k}(r',r)].
+ \operatorname{Tr}[\Gamma_i D_{L,k}(r,r')
+                    \Gamma_i^\dagger D_{R,k}(r',r)].
 \]
 
-For scalar wavefunctions this reduces to D_R(r,r') D_L(r,r')*.
+For scalar wavefunctions this reduces to D_L(r,r') D_R(r,r')*.
 For spinors it is an open-spin contraction, not the product of two scalar
 densities. The imaginary current vertex needs the conjugated endpoint;
 `isdf.core` already owns that positive-Gram contraction. Do not substitute
