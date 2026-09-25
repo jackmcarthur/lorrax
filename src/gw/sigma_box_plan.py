@@ -31,6 +31,7 @@ _services.ensure_on_path()
 import jax.numpy as jnp
 import numpy as np
 
+from common import timing
 from common.collectives import (all_gather_processes, gather_to_host,
                                 process_count, process_rank)
 from common.units import RYD_TO_EV
@@ -564,13 +565,16 @@ def _noise_amplification_cap(eps):
     return _RUNTIME_NOISE_SAFETY * eps / _RUNTIME_NOISE_EPSILON
 
 
-def _fit_rule(spec, eps, cache_dir, eta, *, cache_build_widen=True):
+def _fit_rule(spec, eps, cache_dir, eta, *, cache_build_widen=True,
+              attempts=None):
     """Look up or build one window's rule and accept it; never write the cache.
 
     The lookup reads only certificates written before this plan: the plan's
     own builds are stored after every rank has looked up (see
     :func:`fit_sigma_box_specs`), so no window's choice depends on how far
-    another rank has got.
+    another rank has got. ``attempts`` restricts a crossing build to one
+    range of its fixed-N bracket (``build_uniform_rule``); ``None`` is
+    returned when that range does not certify.
     """
     requested_box = spec["box"]
     # This is exactly the builder's default currency predicate.  It is used
@@ -609,7 +613,11 @@ def _fit_rule(spec, eps, cache_dir, eta, *, cache_build_widen=True):
                 # service's ordinary cancellation cap.
                 build_kwargs["kappa_cap"] = (
                     noise_amplification_cap / (1.0 + eps))
+            if attempts is not None and not relative:
+                build_kwargs["attempts"] = attempts
             rule = build_uniform_rule(build_box, eps, **build_kwargs)
+            if rule is None:
+                return None
             built = True
             cache_status = "miss" if cache_dir is not None else "off"
         # There is no retry.  The builder takes no clock and no pass count,
@@ -765,20 +773,55 @@ def _rank_assignment(costs, world):
     return owned
 
 
+def _bracket_tasks(specs, costs, world):
+    """``(window, attempts, cost)`` tasks: crossing builds split across ranks.
+
+    A crossing rule is a fixed-N bracket of 2-3 solves of 3-10 s each after a
+    3-6 s setup (CrI3 8x8 SC, val:resonant at 248 and 269 nodes), serial on
+    one rank while the other ranks finish their sign-definite windows in a
+    few seconds. A window whose predicted cost is a share ``f`` of the plan
+    gets ``floor(f * world)`` tasks: single attempts ``0, 1, ...`` and the
+    tail (the remaining attempts and the fallback), each on its own rank.
+    Every task repeats the setup; the window's wall becomes one setup plus
+    its longest attempt instead of the sum. Analytic lines and sign-definite
+    windows stay whole.
+    """
+    total = float(sum(costs)) or 1.0
+    tasks = []
+    for index, (spec, cost) in enumerate(zip(specs, costs)):
+        split = (0 if spec.get("analytic_line") or spec["kind"] != "crossing"
+                 else int(world * cost / total))
+        if split < 2:
+            tasks.append((index, None, cost))
+            continue
+        ranges = [(j, j + 1) for j in range(split - 1)] + [(split - 1, None)]
+        tasks.extend((index, attempts, cost / split) for attempts in ranges)
+    return tasks
+
+
 def _parallel_fits(specs, worker, costs):
-    """Fit independent windows once across ranks and replicate small rules."""
+    """Fit independent windows once across ranks and replicate small rules.
+
+    A crossing build may run as several attempt ranges
+    (:func:`_bracket_tasks`); its window takes the first range, in attempt
+    order, that returns a rule or refuses, which is the serial build's
+    result: the node-count sequence does not depend on the solves and every
+    rank runs the same BLAS configuration. ``worker(index, attempts)``.
+    """
     rank, world = int(process_rank()), int(process_count())
+    tasks = _bracket_tasks(specs, costs, world)
     local = []
-    for index in _rank_assignment(costs, world)[rank]:
+    for task in _rank_assignment([cost for _, _, cost in tasks], world)[rank]:
+        index, attempts, _cost = tasks[task]
         started = time.perf_counter()
         try:
-            value = worker(index)
+            value = worker(index, attempts)
             error = None
         except Exception as exc:  # refusals cross ranks as data, then raise
             value = None
             error = f"{type(exc).__name__}: {exc}"
         local.append({
-            "index": index, "source_rank": rank, "value": value,
+            "index": index, "task": task, "source_rank": rank, "value": value,
             "error": error, "wall_seconds": time.perf_counter() - started,
         })
     if world == 1:
@@ -799,10 +842,18 @@ def _parallel_fits(specs, worker, costs):
         shards = [pickle.loads(np.ascontiguousarray(
             gathered[source, :int(length)]).tobytes())
                   for source, length in enumerate(lengths)]
-    rows = sorted((row for shard in shards for row in shard),
-                  key=lambda row: row["index"])
-    if [row["index"] for row in rows] != list(range(len(specs))):
+    done = sorted((row for shard in shards for row in shard),
+                  key=lambda row: row["task"])
+    if [row["task"] for row in done] != list(range(len(tasks))):
         raise RuntimeError("Sigma box planner did not gather every window")
+    rows = []
+    for index in range(len(specs)):
+        ranges = [row for row in done if row["index"] == index]
+        # Tasks are in attempt order; the tail always decides.
+        decided = next(row for row in ranges
+                       if row["error"] is not None or row["value"] is not None)
+        rows.append(dict(decided, wall_seconds=max(
+            row["wall_seconds"] for row in ranges)))
     refusal = next((row for row in rows if row["error"] is not None), None)
     if refusal is not None:
         raise RuntimeError(refusal["error"])
@@ -849,9 +900,9 @@ def fit_sigma_box_spec_groups(groups, eta_ry, *, eps, cache_dir):
     if not 0.0 < tolerance < 1.0:
         raise ValueError("sigma_quadrature_eps must lie in (0, 1)")
     fits, fit_rows = _parallel_fits(
-        rows, lambda index: _fit_rule(
+        rows, lambda index, attempts: _fit_rule(
             rows[index], tolerance, cache_dir, eta,
-            cache_build_widen=widen[index]),
+            cache_build_widen=widen[index], attempts=attempts),
         [_fit_cost(spec, eta) for spec in rows])
     if cache_dir is None:
         return [(fits[lo:hi], fit_rows[lo:hi]) for lo, hi in bounds]
@@ -1102,8 +1153,13 @@ def _fit_fixed_sc_rules(
     if escape_reasons:
         escaped = [spec for spec in rows if spec["name"] in escape_reasons]
         padded = [_sc_padded_box_spec(spec, eta) for spec in escaped]
-        new_fits, fit_rows = fit_sigma_box_specs(
-            padded, eta, eps=eps, cache_dir=cache_dir, cache_build_widen=False)
+        # Its own stage: a refit is host work between the W response and the
+        # Sigma tau sweep, 2-27 s per CrI3 8x8 SC map (P2-S, 2026-09-25).
+        with timing.section("sigma.rule_refit", announce=True,
+                            label=f"Sigma rule refit ({len(padded)} escaped windows)"):
+            new_fits, fit_rows = fit_sigma_box_specs(
+                padded, eta, eps=eps, cache_dir=cache_dir,
+                cache_build_widen=False)
         for spec, padded_spec, fit in zip(escaped, padded, new_fits):
             rules[spec["name"]] = {
                 "fit": dict(fit, cache_status=f"rebuild:sc-fixed:{fit['cache_status']}"),
@@ -1127,9 +1183,11 @@ def _fit_fixed_sc_rules(
             fits.append(_fixed_fit_for_spec(entry, spec))
         except _RuleValidityFailure as exc:
             padded_spec = _sc_padded_box_spec(spec, eta)
-            new_fits, new_rows = fit_sigma_box_specs(
-                [padded_spec], eta, eps=eps,
-                cache_dir=cache_dir, cache_build_widen=False)
+            with timing.section("sigma.rule_refit", announce=True,
+                                label="Sigma rule refit (validity)"):
+                new_fits, new_rows = fit_sigma_box_specs(
+                    [padded_spec], eta, eps=eps,
+                    cache_dir=cache_dir, cache_build_widen=False)
             rebuilt = dict(new_fits[0])
             rebuilt["cache_status"] = "rebuild:sc-fixed-validity"
             rules[spec["name"]] = {
