@@ -1710,6 +1710,29 @@ static std::map<Key, std::string> g_fail;
 using nvrtc::exists;
 using nvrtc::toolkit_include;
 
+// The tile-table plan of modes 7 and 11 (kbox_stage.cuh UnfoldTiles).  A block holds tp pairs'
+// bank (bank_pair bytes each) and the tables; the load needs <= 64 registers at 256 threads, so
+// shared memory sets the residency, up to four blocks per SM.  The plan takes the tile, at most
+// tp_max pairs (a power of two), that keeps the most blocks resident, the larger tile on a tie,
+// and at least two blocks (one block per SM serialises its phases: U2b, ncu); tp = 0: none.
+struct TilePlan { int tp = 0, blocks = 0; long long smem = 0; std::string err; };
+static TilePlan tile_table_plan(int dev, int tp_max, long long bank_pair, int nk, int ns, int nw) {
+    TilePlan p;
+    int smem_sm = 0, smem_rsv = 0, optin = 0;
+    if (cudaDeviceGetAttribute(&smem_sm, cudaDevAttrMaxSharedMemoryPerMultiprocessor, dev) != cudaSuccess ||
+        cudaDeviceGetAttribute(&smem_rsv, cudaDevAttrReservedSharedMemoryPerBlock, dev) != cudaSuccess ||
+        cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev) != cudaSuccess) {
+        p.err = "shared memory per SM / reserved per block / opt-in per block";
+        return p;
+    }
+    for (int tp = std::max(1, tp_max); tp >= 1; tp /= 2) {
+        const long long blk = tp * bank_pair + lrx_kbox::UnfoldTiles{nk, ns, ns, tp, nw}.bytes();
+        const int nb = blk <= optin ? static_cast<int>(std::min<long long>(4, smem_sm / (blk + smem_rsv))) : 0;
+        if (nb >= 2 && nb > p.blocks) { p.tp = tp; p.blocks = nb; p.smem = blk; }
+    }
+    return p;
+}
+
 // nsr: the right endpoint width of mode 9 (0 = ns, every other mode).
 static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
                         std::string_view mathdx_root, std::string_view cubin_dir, const Built** out,
@@ -1768,23 +1791,17 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
             chi_trc = kplan.tr * chi_grp;                  // the plan counts whole pairs
             chi_threads = kplan.threads;
             chi_smem = kplan.smem;
-            // The tile tables (sm_80+ cp.async): the largest tile, at most the plan's, whose bank
-            // and tables (UnfoldTiles) fit two blocks on an SM with the device's per-block
-            // reservation; none fits: the register load at the plan's tile.
-            int smem_sm = 0, smem_rsv = 0;
-            LRX_CUDA_CHECK(cudaDeviceGetAttribute(&smem_sm, cudaDevAttrMaxSharedMemoryPerMultiprocessor, dev),
-                           "max shared memory per SM");
-            LRX_CUDA_CHECK(cudaDeviceGetAttribute(&smem_rsv, cudaDevAttrReservedSharedMemoryPerBlock, dev),
-                           "reserved shared memory per block");
-            for (int tp = kplan.tr; cc_major >= 8 && tp >= 1 && kplan.threads == kThreads; tp /= 2) {
-                const long long blk = static_cast<long long>(tp) * chi_grp * g.rs() * 16 +
-                                      lrx_kbox::UnfoldTiles{nk, ns, ns, tp, 0}.bytes();
-                if (blk <= smem_optin && 2 * (blk + smem_rsv) <= smem_sm) {
-                    chi_tt = tp;
-                    chi_minb = 2;
-                    chi_trc = tp * chi_grp;
-                    chi_smem = blk;
-                    break;
+            // The tile tables (sm_80+ cp.async; tile_table_plan): bank + UnfoldTiles per block at
+            // two or more blocks per SM; none fits: the register load at the plan's tile.
+            if (cc_major >= 8 && kplan.threads == kThreads) {
+                const TilePlan tt = tile_table_plan(dev, kplan.tr, static_cast<long long>(chi_grp) * g.rs() * 16,
+                                                    nk, ns, 0);
+                if (!tt.err.empty()) return fail("device attributes", tt.err);
+                if (tt.tp > 0) {
+                    chi_tt = tt.tp;
+                    chi_minb = tt.blocks;
+                    chi_trc = tt.tp * chi_grp;
+                    chi_smem = tt.smem;
                 }
             }
         } else {
@@ -1847,23 +1864,16 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
     // Mode 7 on the tile tables (whole spin groups, sm_80+ cp.async): the largest tile of whole
     // pairs, at most the grouped load's, whose bank and tables (UnfoldTiles, W_R staged) fit two
     // blocks on an SM with the device's per-block reservation; none fits: the register load.
-    int m7_tp = 0;
+    int m7_tp = 0, m7_blocks = 0;
     long long m7_smem = 0;
     if (mode == 7 && blk == ns && nsr == ns && cc_major >= 8 && rb >= grp_rows) {
-        int smem_sm = 0, smem_rsv = 0;
-        LRX_CUDA_CHECK(cudaDeviceGetAttribute(&smem_sm, cudaDevAttrMaxSharedMemoryPerMultiprocessor, dev),
-                       "max shared memory per SM");
-        LRX_CUDA_CHECK(cudaDeviceGetAttribute(&smem_rsv, cudaDevAttrReservedSharedMemoryPerBlock, dev),
-                       "reserved shared memory per block");
-        for (int tp = static_cast<int>(rb / grp_rows); tp >= 1; tp /= 2) {
-            const long long bytes = static_cast<long long>(tp) * grp_rows * row_bytes +
-                                    lrx_kbox::UnfoldTiles{nk, ns, ns, tp, 1}.bytes();
-            if (bytes <= smem_optin && 2 * (bytes + smem_rsv) <= smem_sm) {
-                m7_tp = tp;
-                m7_smem = bytes;
-                rb = static_cast<long long>(tp) * grp_rows;
-                break;
-            }
+        const TilePlan tt = tile_table_plan(dev, static_cast<int>(rb / grp_rows), grp_rows * row_bytes, nk, ns, 1);
+        if (!tt.err.empty()) return fail("device attributes", tt.err);
+        if (tt.tp > 0) {
+            m7_tp = tt.tp;
+            m7_blocks = tt.blocks;
+            m7_smem = tt.smem;
+            rb = static_cast<long long>(tt.tp) * grp_rows;
         }
     }
     // (fewer rows than one spin group: mode 7 loads per bank, as mode 2 would fit)
@@ -1954,7 +1964,7 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
     if (mode == 7) {
         defs.push_back("-DLRX_TT=" + std::string(m7_tp ? "1" : "0"));
         defs.push_back("-DLRX_TP=" + std::to_string(m7_tp));
-        defs.push_back("-DLRX_MINB=" + std::string(m7_tp ? "2" : "1"));
+        defs.push_back("-DLRX_MINB=" + std::to_string(m7_tp ? m7_blocks : 1));
     }
     if (mode == 8 && !lor_split) defs.push_back("-DLRX_ARM=0");
     if (kbox_rows || lor_split) {
@@ -2042,11 +2052,11 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
         b.sms = sms;
         if (chi_tt) b.grid_cap = static_cast<long long>(sms) * chi_minb;   // a persistent grid
     }
-    if (m7_tp) {                                       // a persistent grid of two blocks per SM
+    if (m7_tp) {                                       // a persistent grid of the resident blocks
         int sms = 0;
         LRX_CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev), "SM count");
         b.smem = static_cast<int>(m7_smem);
-        b.grid_cap = static_cast<long long>(sms) * 2;
+        b.grid_cap = static_cast<long long>(sms) * m7_blocks;
     }
     if (mode == 10) {                                  // persistent blocks: the resident count
         int sms = 0;
