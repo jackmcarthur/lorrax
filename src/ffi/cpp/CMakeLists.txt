@@ -58,38 +58,40 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 #                                 phdf5 handler symbols.
 option(LORRAX_FFI_HAVE_CAL   "Build the CAL (<=0.6.x cuSOLVERMp) comm path"      ON)
 option(LORRAX_FFI_HAVE_PHDF5 "Build the phdf5 subpackage (needs parallel HDF5)" ON)
-# cuBLASMp fused gemm / W-solve carry the only .cu translation unit
-# (w_solve_kernels.cu), so they need a full nvcc.  OFF builds an eigh-only
-# .so with NO CUDA-language step — the Frontera pip toolchain ships ptxas
-# but not the nvcc driver, and the distributed eigensolver needs neither.
-# libcublasmp is still linked (cuSOLVERMp's own runtime dependency) and
-# ensure_cublasmp (pure host C++) still compiles.
-option(LORRAX_FFI_HAVE_CUBLASMP "Build cuBLASMp fused-kernel FFIs (needs nvcc)" ON)
-# cuFFT strided flat-k FFT handlers (cpp/cufft/fft_flat_k_cuda_ffi.cc) — the
-# CUDA platform mirror of the mklfft host handlers (FFT-FFI, 2026-07-29).
-# Plain C++ TU compiled by the host compiler against the CUDA headers (its
-# two device kernels are NVRTC-compiled at runtime), so it needs NO nvcc —
-# it builds in the Frontera pip toolchain where LORRAX_FFI_HAVE_CUBLASMP is
-# OFF.  Auto-downgrades to a loud skip if cufft.h / libcufft / nvrtc are
-# absent (LORRAX_FFT_FFI on CUDA then refuses at runtime via probe_target).
-option(LORRAX_FFI_HAVE_CUFFT "Build the cuFFT strided flat-k FFT handlers" ON)
+# The cuBLASMp GEMM and fused W-solve handlers.  This option is also the one
+# that enables the CUDA language below, which every CUDA-leg build needs: the
+# base sources include nvcc TUs (response/contour_accumulate.cu,
+# symmetry/spin_rotate.cu), and so do cublasmp/w_solve_kernels.cu and
+# cufft/fourier_plan.cu.  libcublasmp is linked either way (cuSOLVERMp's own
+# runtime dependency).
+option(LORRAX_FFI_HAVE_CUBLASMP "Build the cuBLASMp handlers; enables the CUDA language (nvcc)" ON)
+# The NVIDIA k-convolution family (cufft/kconv_mathdx_cuda_ffi.cc: nvidia-mathdx
+# kernels NVRTC-built at run time) and LocalFourierPlan's CUDA leg
+# (cufft/fourier_plan_cuda_ffi.cc: cuBLAS, cuFFT, the NVRTC cuBLASDx pair).
+# Built when cufft.h, libcufft, nvrtc.h and libnvrtc are found; otherwise a
+# loud skip, and startup refuses (GATE kconv-target).  The option keeps its
+# historical spelling (it is build-contract vocabulary: the cufft= stamp and
+# the verify backend).
+option(LORRAX_FFI_HAVE_CUFFT "Build the mathdx k-convolution family and the Fourier plan (needs cuFFT, NVRTC)" ON)
 
 # ----------------------------------------------------------------------------
-# CUDA language (for .cu kernel translation units compiled by nvcc).  We
-# point CMAKE_CUDA_COMPILER at the container's nvcc so it matches the
-# toolkit whose headers/runtime we already use for the C++ TUs.  A100 =
-# compute_80 / sm_80; the Shifter container on Perlmutter is A100-only.
-# Gated on LORRAX_FFI_HAVE_CUBLASMP: the eigh-only build has no .cu sources
-# and must not require an nvcc.
+# CUDA language (for the .cu translation units compiled by nvcc).
+# CMAKE_CUDA_COMPILER defaults to /usr/local/cuda's nvcc when that exists, so
+# it matches the toolkit whose headers/runtime the C++ TUs use.
+# Architectures: SASS for sm_80, 86, 89, 90, 100 and 120 (A100/A30, GA10x,
+# AD10x, H100/H200, B200, GB20x; a minor revision of one of these runs its
+# major's SASS), plus compute_80 and compute_120 PTX, which the driver
+# JIT-compiles on a device with no matching SASS (sm_110; anything newer).
+# The NVRTC kernels are not affected: they compile for the device's own
+# sm_<cc> at run time.
 # ----------------------------------------------------------------------------
 if(LORRAX_FFI_HAVE_CUBLASMP)
-    # Set the A100 target before enable_language(CUDA): CMake otherwise
-    # probes nvcc and seeds its cache with the compiler's legacy default
-    # (sm_52 in the current container), after which a post-enable
-    # ``NOT DEFINED`` check is already too late.
+    # Set the targets before enable_language(CUDA): CMake otherwise probes
+    # nvcc and seeds its cache with the compiler's default, after which a
+    # post-enable ``NOT DEFINED`` check is already too late.
     if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-        set(CMAKE_CUDA_ARCHITECTURES 80 CACHE STRING
-            "CUDA architectures for the Perlmutter A100 build")
+        set(CMAKE_CUDA_ARCHITECTURES "80;86-real;89-real;90-real;100-real;120" CACHE STRING
+            "CUDA architectures of the nvcc TUs: SASS sm_80..sm_120, PTX compute_80 and compute_120")
     endif()
     if(NOT DEFINED CMAKE_CUDA_COMPILER)
         if(EXISTS "/usr/local/cuda/bin/nvcc")
