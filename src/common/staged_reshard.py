@@ -199,6 +199,10 @@ __all__ = [
 ]
 
 
+# ``band_to_product_r_reshard``'s one mover per ``(mesh, axes)``.
+_PRODUCT_R_RESHARD: dict[tuple, tuple[Mesh, Callable]] = {}
+
+
 def band_to_product_r_reshard(
     mesh: Mesh, *, axes: tuple[str, str] = ("x", "y")
 ) -> Callable:
@@ -227,7 +231,18 @@ def band_to_product_r_reshard(
     Callers must zero-pad the free r extent through :mod:`runtime.padding`
     before this service.  This routine owns movement only; it neither pads
     nor changes values.
+
+    One program per ``(mesh, axes)``: the returned mover is memoised, and
+    jax's own dispatch cache serves every chunk shape through it.  A fresh
+    ``jax.jit`` per call made each r chunk of the Galerkin fit retrace and
+    recompile (or re-fetch) the same exchange, ~0.12 s cold and ~0.06 s
+    warm with the device idle, on every one of its ~37 chunks.
     """
+    # Keyed by value, served only to the same Mesh object: the mover's
+    # source-layout guard below requires ``a.sharding.mesh is mesh``.
+    hit = _PRODUCT_R_RESHARD.get((mesh, tuple(axes)))
+    if hit is not None and hit[0] is mesh:
+        return hit[1]
     from common.shard_map import shard_map
 
     ax_x, ax_y = axes
@@ -305,6 +320,7 @@ def band_to_product_r_reshard(
     _reshard.lower = compiled.lower
 
     warm_mesh_cliques(mesh)
+    _PRODUCT_R_RESHARD[(mesh, tuple(axes))] = (mesh, _reshard)
     return _reshard
 
 
