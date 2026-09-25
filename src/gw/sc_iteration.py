@@ -3770,18 +3770,21 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             # ``plan_z`` excludes the separately appended exact-static
             # G=0 head sample, which is exactly the count meant here.
             from .mpa import sample_plan as _sample_plan
-            inputs.print_fn(
+            _record_sc(
+                inputs,
                 "    SC head: occupation-aware QSGW response plus sharded "
                 f"ISDF wings on the exact MPA z grid ({velocity_kind}, "
                 f"nb={pt.nb_logical}, "
                 f"fit samples={len(_sample_plan.plan_z(mpa_plan))})")
         elif direct_only_shared_pole:
-            inputs.print_fn(
+            _record_sc(
+                inputs,
                 f"    SC head: {velocity_kind} + live Fermi-surface Drude "
                 f"and static Thomas-Fermi direct head "
                 f"(nb={pt.nb_logical}, samples={len(head_omegas)}; no wings)")
         else:
-            inputs.print_fn(
+            _record_sc(
+                inputs,
                 f"    SC head: {velocity_kind} + current-basis wings "
                 "from saved parallel transport/current centroid bundle "
                 f"(nb={pt.nb_logical}, samples={len(head_omegas)})")
