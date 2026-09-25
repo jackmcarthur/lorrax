@@ -411,22 +411,20 @@ class QirrOperator:
             L_table=self.L_table, q_irr_frac=self.q_irr_frac, mesh_xy=mesh_xy,
             n_sym_spatial=self.n_sym_spatial, trs_rule=self.trs_rule)
 
-    def load_tables(self, mesh_xy, *, in_trace: bool = False) -> UnfoldLoadTables:
+    def load_tables(self, mesh_xy) -> UnfoldLoadTables:
         """:meth:`unfold` as load tables (scalar endpoints), for ``make_kfft_klead_unfold``.
 
-        Host tables.  Build them outside any jit (one small phase program);
-        ``in_trace=True`` builds them while a consumer's jit traces, eagerly
-        and op by op, which is correct but compiles each primitive apart."""
-        def build():
-            return unfold_load_tables(
+        Host tables (numpy, no program), built once per mesh and wedge: the
+        door and the device copy (:meth:`with_load`) share them."""
+        key = (tuple(d.id for d in np.asarray(mesh_xy.devices).flat), self.wedge_key())
+        tables = _host_load_cache.get(key)
+        if tables is None:
+            tables = _host_load_cache[key] = unfold_load_tables(
                 irr_idx=self.irr_idx, sym_idx=self.sym_idx, sym_perm=self.sym_perm,
                 L_table=self.L_table, k_irr_frac=self.q_irr_frac,
                 spin_action_full=np.ones((self.n_full, 1, 1), np.complex128),
                 n_sym_spatial=self.n_sym_spatial, mesh_xy=mesh_xy, trs_rule=self.trs_rule)
-        if not in_trace:
-            return build()
-        with jax.ensure_compile_time_eval():
-            return build()
+        return tables
 
     def wedge_key(self) -> "_WedgeKey":
         """A hashable key of the tables (not the values): equal keys unfold alike."""
@@ -456,6 +454,7 @@ def _rows_of(values, rows):
 
 
 _device_load_cache: dict = {}
+_host_load_cache: dict = {}
 _partner_cache: dict = {}
 
 

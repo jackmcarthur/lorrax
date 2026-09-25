@@ -220,9 +220,9 @@ class StaticConvolution(NamedTuple):
         return self.apply(G_k, self.prep(interaction), prefactor)
 
     def warmed(self, interaction):
-        """``interaction`` as an operator whose wedge door is already built: call
-        OUTSIDE a jit, so the door's host tables are made once as ordinary
-        programs rather than traced op by op into the consumer's trace."""
+        """``interaction`` as an operator whose wedge door is built and whose load
+        tables are on the devices: call OUTSIDE a jit, so the consumer's jit
+        takes the tables as arguments rather than as embedded constants."""
         op = interaction_operator(interaction)
         if self.warm is not None:
             op = self.warm(op)
@@ -246,9 +246,8 @@ def interaction_operator(interaction):
 _wedge_prep_cache: dict[tuple[object, ...], object] = {}
 
 
-def wedge_door(mesh_xy: Mesh, kgrid, op, *, norm="ortho", in_trace=False):
-    """The mode-9 door for ``op``'s wedge, built once per (mesh, grid, tables);
-    build it before the consumer's jit traces (``in_trace=False``)."""
+def wedge_door(mesh_xy: Mesh, kgrid, op, *, norm="ortho"):
+    """The mode-9 door for ``op``'s wedge, built once per (mesh, grid, tables)."""
     from ffi import ffi_dial_key
     from common.fft_helpers import make_kfft_klead_unfold
     key = (_mesh_key(mesh_xy), tuple(int(v) for v in kgrid), ffi_dial_key(), norm,
@@ -256,14 +255,14 @@ def wedge_door(mesh_xy: Mesh, kgrid, op, *, norm="ortho", in_trace=False):
     door = _wedge_prep_cache.get(key)
     if door is None:
         door = _wedge_prep_cache[key] = make_kfft_klead_unfold(
-            mesh_xy, kgrid, op.load_tables(mesh_xy, in_trace=in_trace), norm=norm)
+            mesh_xy, kgrid, op.load_tables(mesh_xy), norm=norm)
     return door
 
 
 def wedge_prep(mesh_xy: Mesh, kgrid, op, *, norm="ortho"):
     """``make_kconv_klead``'s prep of ``op``'s full-zone interaction, read from its wedge
     (inside a consumer's jit: the door is normally built already, see ``warmed``)."""
-    return wedge_door(mesh_xy, kgrid, op, norm=norm, in_trace=True)(op.values, None, op.load)
+    return wedge_door(mesh_xy, kgrid, op, norm=norm)(op.values, None, op.load)
 
 
 def _make_static_convolution(mesh_xy: Mesh, kgrid: tuple[int, int, int],
