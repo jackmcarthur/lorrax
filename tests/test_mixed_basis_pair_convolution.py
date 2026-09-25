@@ -241,3 +241,147 @@ def test_glide_parents_equal_full_grid(ns, backend):
     assert r["anti"], "the glide fixture must carry an antiunitary row"
     assert r["full"] <= TOL and r["parent"] <= TOL, r
     assert r["red"]["no_anti"] > 1e-3, r            # the antiunitary row is live here
+
+
+# ---------------------------------------------------------------------------
+# the r'-column wedge: covariant operands, against the dense reference and the dense-column plan
+# ---------------------------------------------------------------------------
+
+def covariant_case(fx, *, ecut, metric, box, nb=4, seed=7, complex_weights=False):
+    """Parent ψ closed under each parent's little group (``close_under_little_groups``), so the
+    Greens are covariant under the whole group; the full grid through the r-space action.
+    ``out_full``: the output sphere at every full-grid q (the wedge's middle rows)."""
+    from common.gvec_fft_box import build_sphere_box_index
+    plan = fx["plan"]
+    ns = int(plan.nspinor)
+    kpar, kful = np.asarray(plan.k_parent_frac), np.asarray(fx["kfull"])
+    kgrid = tuple(int(v) for v in fx["kgrid"])
+    psph, pngk = cases.spheres(kpar, metric, ecut)
+    csph, cngk = cases.spheres(kful, metric, ecut, width=psph.shape[1])
+    rng = np.random.default_rng(seed)
+    c0 = (rng.standard_normal((len(kpar), nb, ns, psph.shape[1]))
+          + 1j * rng.standard_normal((len(kpar), nb, ns, psph.shape[1])))
+    c0 *= (np.arange(psph.shape[1])[None, :] < pngk[:, None])[:, None, None, :]
+    cpar, leak0 = cases.close_under_little_groups(fx, c0, psph, pngk, rows=fx["rows"],
+                                                  spinor_action=fx["spinor_action"], ns=ns)
+    cchild, leak = cases.children_psi(fx, cpar, psph, pngk, csph, cngk)
+    n_img = cpar.shape[1] // nb
+    if complex_weights:
+        wA = np.tile(rng.standard_normal(nb) + 1j * rng.standard_normal(nb), n_img)
+        wC = np.tile(rng.standard_normal(nb) + 1j * rng.standard_normal(nb), n_img)
+    else:
+        wA, wC = np.tile(rng.standard_normal(nb), n_img), np.tile(rng.standard_normal(nb), n_img)
+    sidx = build_sphere_box_index(psph, tuple(fx["fft_grid"]), psph.shape[1], ngk_valid=pngk)
+    qsel = [0, 1, len(kful) - 1]
+    osph, ongk = cases.spheres(kful[qsel], metric, 0.8 * ecut)
+    fsph, fngk = cases.spheres(kful, metric, 0.8 * ecut)
+    A_par, C_par = cases.green_from_psi(cpar, wA), cases.green_from_psi(cpar, wC)
+    return dict(plan=plan, ns=ns, kgrid=kgrid, fft_grid=box, kfrac=kful, sph=csph, ngk=cngk,
+                psph=psph, pngk=pngk, sidx=sidx, leak=max(leak0, leak), fx=fx,
+                A_par=A_par, C_par=C_par,
+                At_par=np.transpose(A_par, (0, 3, 4, 1, 2)) if complex_weights else None,
+                Ct_par=np.transpose(C_par, (0, 3, 4, 1, 2)) if complex_weights else None,
+                A=cases.green_from_psi(cchild, wA), C=cases.green_from_psi(cchild, wC),
+                out=(osph, ongk, kful[qsel]), out_full=(fsph, fngk, kful))
+
+
+def _wedge(c, rows):
+    from gw.mixed_basis_pair_convolution import ColumnWedge, SphereSet
+    fx = c["fx"]
+    return ColumnWedge(np.asarray(fx["ops"]), np.asarray(fx["tnp"]), np.asarray(rows),
+                       SphereSet(*c["out_full"]))
+
+
+def _wedge_check(mesh, c, backend, rows, *, twins=()):
+    """Wedge on typed parents against the dense reference (full-grid operands) and against the
+    dense-column plan on the same parents; ``twins`` names red twins to measure."""
+    from gw.mixed_basis_pair_convolution import SphereSet, SphereTransport
+    assert c["leak"] <= 1e-13, c["leak"]
+    children = SphereSet(c["sph"], c["ngk"], c["kfrac"])
+    typed = SphereTransport.typed(c["plan"], fft_grid=c["fx"]["fft_grid"],
+                                  parent_sphere_index=c["sidx"], children=children)
+    ref = cases.dense_reference(c["A"], c["C"], c["sph"], c["ngk"], c["kfrac"], c["kgrid"],
+                                c["fft_grid"], *c["out"])
+    kw = dict(backend=backend, budget_bytes=int(1e10), transport=typed)
+    args = (c["kgrid"], c["fft_grid"], c["sph"], c["ngk"], c["kfrac"], c["out"])
+    pa = (c["A_par"], c["C_par"], c["At_par"], c["Ct_par"])
+    dense = _run(_conv(mesh, *args, **kw), *pa)
+    conv = _conv(mesh, *args, wedge=_wedge(c, rows), **kw)
+    got = _run(conv, *pa)
+    red = {}
+    for name in twins:
+        tw = _conv(mesh, *args, wedge=_wedge(c, rows), **kw)
+        par, pslot, gph, anti, sel, phl = tw._dev_rebuild
+        if name == "no_conj":             # antiunitary rows read without the conjugation
+            anti = tw._put(np.zeros_like(tw._wt["anti"]))
+        elif name == "no_wrap":           # the lattice-wrap phase e^{-2πi q·S⁻¹L} dropped
+            phl = tw._put(np.where(np.abs(tw._wt["phl"]) > 0, 1.0 + 0j, 0j), P(None, ("x", "y")))
+        tw._dev_rebuild = (par, pslot, gph, anti, sel, phl)
+        red[name] = cases.rel(_run(tw, *pa), ref)
+    return dict(ref=cases.rel(got, ref), dense=cases.rel(got, dense), dense_ref=cases.rel(dense, ref),
+                orbits=conv._wt["n_orbits"], nr=conv.nr, red=red, conv=conv)
+
+
+@pytest.mark.parametrize("backend", ["xla", "router"])
+@pytest.mark.parametrize("rows,twins", [((0, 1, 2, 3), ("no_wrap",)), ((0, 3), ("no_conj",))])
+def test_wedge_glide_equals_dense(backend, rows, twins):
+    """Glide group, n_s = 2, spin mixing: the full group (unitary rows kept per spatial part) and
+    {E, Θ·glide} (the antiunitary branch carries every non-identity column)."""
+    mesh = _mesh(4)
+    fx = fixtures._glide_fixture(mesh, np.random.default_rng(2), 2, translated_anti=True)
+    c = covariant_case(fx, ecut=1.3, metric=np.eye(3), box=(6, 6, 5))
+    r = _wedge_check(mesh, c, backend, rows, twins=twins)
+    assert r["ref"] <= TOL and r["dense"] <= TOL and r["dense_ref"] <= TOL, r
+    assert r["orbits"] < r["nr"], r
+    for name in twins:
+        assert r["red"][name] > 1e-3, r
+
+
+@pytest.mark.parametrize("backend", ["xla", "router"])
+def test_wedge_acubic_equals_dense(backend):
+    """A-cubic: 48 spatial operations with glides, n_s = 1."""
+    mesh = _mesh(4)
+    fx = fixtures._acubic_fixture(mesh, np.random.default_rng(1))
+    from file_io import WfnLoader
+    root = fixtures._HERE / "core" / "fixtures" / "A-cubic"
+    with WfnLoader(root / "WFN.h5", backend="eager", qe_schema=root / "data-file-schema.xml") as w:
+        b = np.asarray(w.bvec, dtype=np.float64)
+    c = covariant_case(fx, ecut=1.05 * float(np.min(np.einsum("ij,ij->i", b, b))), metric=b @ b.T,
+                       box=(8, 8, 8), nb=2)
+    r = _wedge_check(mesh, c, backend, fx["rows"], twins=("no_wrap",))
+    assert r["ref"] <= TOL and r["dense"] <= TOL, r
+    assert r["orbits"] * 8 < r["nr"], r
+    assert r["red"]["no_wrap"] > 1e-3, r
+
+
+@pytest.mark.parametrize("n_mesh", [1, 4])
+def test_wedge_partners_unitary_only(n_mesh):
+    """Complex weights with transposed partners: the unitary rows are exact, antiunitary rows refuse."""
+    mesh = _mesh(n_mesh)
+    fx = fixtures._glide_fixture(mesh, np.random.default_rng(2), 2, translated_anti=True)
+    c = covariant_case(fx, ecut=1.3, metric=np.eye(3), box=(6, 6, 5), complex_weights=True)
+    r = _wedge_check(mesh, c, "xla", (0, 1))
+    assert r["ref"] <= TOL and r["dense"] <= TOL, r
+    with pytest.raises(ValueError, match="GATE pairconv-wedge-partner"):
+        _wedge_check(mesh, c, "xla", (0, 3))
+
+
+def test_wedge_census_and_chunks():
+    """The rebuild compiles to no collective; forced r'/batch/k/q chunks on the wedge agree."""
+    mesh = _mesh(4)
+    fx = fixtures._glide_fixture(mesh, np.random.default_rng(2), 2, translated_anti=True)
+    c = covariant_case(fx, ecut=1.3, metric=np.eye(3), box=(6, 6, 5))
+    r = _wedge_check(mesh, c, "xla", (0, 1, 2, 3))
+    census = r["conv"].collective_census()
+    assert census["rebuild"] == {} and census["middle"] == {}, census
+    assert census["final"] == {"all-to-all": 2}, census
+    from gw.mixed_basis_pair_convolution import SphereSet, SphereTransport
+    typed = SphereTransport.typed(c["plan"], fft_grid=fx["fft_grid"], parent_sphere_index=c["sidx"],
+                                  children=SphereSet(c["sph"], c["ngk"], c["kfrac"]))
+    tight = _conv(mesh, c["kgrid"], c["fft_grid"], c["sph"], c["ngk"], c["kfrac"], c["out"],
+                  transport=typed, backend="xla", budget_bytes=int(1e10), chunks=(2, 3, 2, 1),
+                  wedge=_wedge(c, (0, 1, 2, 3)))
+    ref = cases.dense_reference(c["A"], c["C"], c["sph"], c["ngk"], c["kfrac"], c["kgrid"],
+                                c["fft_grid"], *c["out"])
+    assert tight.chunks.n_c == 2 and tight.n_batch >= 2, tight.describe()
+    assert cases.rel(_run(tight, c["A_par"], c["C_par"]), ref) <= TOL
