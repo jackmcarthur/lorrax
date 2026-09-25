@@ -291,6 +291,19 @@ def sphere_to_union_box(psi: jax.Array, compact_index: jax.Array, box) -> jax.Ar
         psi.shape[:3] + tuple(int(b) for b in box))
 
 
+def union_box_to_sphere(box: jax.Array, compact_index: jax.Array) -> jax.Array:
+    """Union box ``(n_k, ..., Kx, Ky, Kz)`` → sphere ``(n_k, ..., ngk)``.
+
+    The inverse of :func:`sphere_to_union_box` on each k's cells: slot ``g``
+    reads the box's flat cell ``compact_index[k, g]``; a pad slot (out of
+    the box) reads 0.  One gather on the small box.
+    """
+    flat = box.reshape(box.shape[:-3] + (-1,))
+    idx = compact_index.reshape((compact_index.shape[0],) + (1,) * (flat.ndim - 2)
+                                + (compact_index.shape[-1],))
+    return jnp.take_along_axis(flat, idx, axis=-1, mode='fill', fill_value=0)
+
+
 def _sphere_gather(box: jax.Array, sphere_index: jax.Array) -> jax.Array:
     """Box ``(n_k, nb, ns, nx, ny, nz)`` → sphere ``(n_k, nb, ns, ngk)``.
 
