@@ -37,3 +37,21 @@ def test_shared_pole_scratch_retains_only_the_current_map(tmp_path, monkeypatch)
     assert all(path.exists() for path in unrelated)
     assert (outside / "keep.h5").exists(), "a symlinked generation is unlinked, never followed"
     assert barriers == ["shared_pole.scratch.retain.sc_0002"]
+
+
+def test_the_run_wide_photon_reference_pins_its_generation(tmp_path, monkeypatch):
+    """Map 0 holds the photon static reference every later map freezes."""
+    root = tmp_path / "mpa"
+    for label in ("sc_0000", "sc_0001", "sc_0002"):
+        (root / f"{label}_shared_pole").mkdir(parents=True)
+    reference = root / "sc_0000_shared_pole" / "photon_static_reference.h5"
+    reference.touch()
+    monkeypatch.setattr("common.collectives.process_rank", lambda: 0)
+    monkeypatch.setattr("common.collectives.barrier", lambda *a, **k: None)
+
+    removed = shared_pole_screening.retain_iteration_scratch(
+        root, "sc_0002", pinned=(str(reference), str(tmp_path / "not_managed.h5")),
+        print_fn=lambda *_: None)
+
+    assert removed == ("sc_0001_shared_pole",)
+    assert reference.exists()

@@ -4284,9 +4284,13 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     # modes never enter these branches.
     if mpa_mode and inputs.config.sigma.w_model == "shared_pole":
         from .shared_pole_screening import retain_iteration_scratch
+        reference = (None if inputs.screening_seed_cache is None else
+                     inputs.screening_seed_cache.get("photon_static_reference"))
         retain_iteration_scratch(
             os.path.join(inputs.input_dir, "tmp", "mpa"),
-            f"sc_{state.iteration:04d}", print_fn=inputs.print_fn)
+            f"sc_{state.iteration:04d}",
+            pinned=() if reference is None else (reference["path"],),
+            print_fn=inputs.print_fn)
     if elementwise_mpa:
         from .mpa.model import retain_iteration_artifacts
         retain_iteration_artifacts(
