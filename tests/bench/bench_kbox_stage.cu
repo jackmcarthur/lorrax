@@ -118,6 +118,7 @@ struct VMid { const C* V; long long m0, m1, m2;
     __device__ C operator()(int k, long long r, C a) const {
         return lrx_mul(a, V[(long long)k * (m2 * m0) + ((r / m1) % m2) * m0 + r % m0]); } };
 struct IdMid { __device__ C operator()(int, long long, C a) const { return a; } };
+struct ScaleMid { double s; __device__ C operator()(int, long long, C a) const { return C{a.x * s, a.y * s}; } };
 
 template <int MODE, int NX, int NY, int NZ, int TR, int THREADS = 256>
 __global__ void __launch_bounds__(THREADS) stage_single(const C* x, C* y, const C* V, long long n,
@@ -151,6 +152,16 @@ template <int NX, int NY, int NZ, cufftdx::fft_direction Dir, class Ld, class St
 __global__ void __launch_bounds__(256) stage_plane(Ld ld, St st, long long n) {
     extern __shared__ C sm[];
     lrx_kbox::plane_pass<NX, NY, NZ, ARCH, Dir, 16>(sm, n, ld, st);
+}
+// the order-preserving split: x inverse then the multiply (!CONV, inverse, VMid), or x forward
+// then the scale (!CONV, forward, ScaleMid): with the plane passes, z,y,x each way as today.
+template <int NX, int NY, int NZ>
+__global__ void __launch_bounds__(256) stage_pencil_invmid(C* y, long long n, const C* V, long long m0, long long m1, long long m2) {
+    lrx_kbox::pencil_pass<NX, NY, NZ, ARCH, false, cufftdx::fft_direction::inverse>(y, n, VMid{V, m0, m1, m2});
+}
+template <int NX, int NY, int NZ>
+__global__ void __launch_bounds__(256) stage_pencil_fwdscale(C* y, long long n, double s) {
+    lrx_kbox::pencil_pass<NX, NY, NZ, ARCH, false, cufftdx::fft_direction::forward>(y, n, ScaleMid{s});
 }
 template <int NX, int NY, int NZ, bool CONV>
 __global__ void __launch_bounds__(256) stage_pencil(C* y, long long n, const C* V, long long m0, long long m1, long long m2) {
@@ -204,9 +215,64 @@ struct Mid8 {
     }
 };
 template <int NX, int NY, int NZ, int TY>
+__global__ void __launch_bounds__(16 * TY) stage_pencil8_inv(C* y, long long n, const C* V, long long m) {
+    extern __shared__ C sm8[];
+    lrx_kbox::pencil_group_pass<NX, NY, NZ, ARCH, 16, TY, false>(y, sm8, n, m * m, Cols8{m},
+        Mid8<NX, NY, NZ, TY>{V, m, m * m}, lrx_kbox::Plain<C>{y, n});
+}
+template <int NX, int NY, int NZ, int TY>
 __global__ void __launch_bounds__(16 * TY) stage_pencil8(C* y, long long n, const C* V, long long m) {
     extern __shared__ C sm8[];
     lrx_kbox::pencil_group_pass<NX, NY, NZ, ARCH, 16, TY>(y, sm8, n, m * m, Cols8{m}, Mid8<NX, NY, NZ, TY>{V, m, m * m});
+}
+
+// mode 8 on the single arm, one tile of G whole spin groups (tile column = inst*16 + member):
+// gathered direct load, inverse transform, the Lorentz group Mid (V from global), forward, store.
+struct Load8 { static constexpr bool kDirect = true, kFinish = false; const C* x; long long n, m;
+    template <class View>
+    __device__ void direct(const View& v, int k0, int k1, long long c0, int width, long long nc) const {
+        for (int i = threadIdx.x; i < (k1 - k0) * width; i += blockDim.x) {
+            const int j = i % width, k = k0 + i / width;
+            const long long c = c0 + j;
+            C z = {0, 0};
+            if (c < nc) z = x[(long long)k * n + Cols8{m}.col(c / 16, int(c % 16))];
+            v(k, j) = z;
+        }
+    } };
+struct Store8 { C* y; long long n, m; double s;
+    __device__ void put(int k, long long c, C v) const {
+        y[(long long)k * n + Cols8{m}.col(c / 16, int(c % 16))] = C{v.x * s, v.y * s}; } };
+struct Group8 { const C* V; long long m;
+    __device__ void group(int k, long long inst, C (&g)[16]) const {
+        const long long x = inst / m, yy = inst % m;
+        C w[16];
+#pragma unroll
+        for (int e = 0; e < 16; ++e) w[e] = V[((((long long)k * m + x) * 4 + (e >> 2)) * m + yy) * 4 + (e & 3)];
+        C out[16];
+#pragma unroll
+        for (int o = 0; o < 16; ++o) {
+            C acc = {0, 0};
+#pragma unroll
+            for (int e = 0; e < 16; ++e) {
+                const C t = lrx_mul(qturn(g[c_src[o * 16 + e]], c_code[o * 16 + e]), w[e]);
+                acc.x += t.x; acc.y += t.y;
+            }
+            out[o] = acc;
+        }
+#pragma unroll
+        for (int o = 0; o < 16; ++o) g[o] = out[o];
+    } };
+template <int NX, int NY, int NZ, int G, int THREADS>
+__global__ void __launch_bounds__(THREADS) stage_single8(const C* x, C* y, const C* V, long long n, long long m, double s) {
+    extern __shared__ C bank[];
+    constexpr int TR = 16 * G;
+    for (long long c0 = (long long)blockIdx.x * TR; c0 < n; c0 += (long long)gridDim.x * TR) {
+        lrx_kbox::stage_tile<NX, NY, NZ, TR>(bank, c0, n, Load8{x, n, m});
+        lrx_kbox::transform3<NX, NY, NZ, TR, ARCH, cufftdx::fft_direction::inverse>(bank);
+        lrx_kbox::mid_group_tile<NX, NY, NZ, TR, 16>(bank, c0, n, Group8{V, m});
+        lrx_kbox::transform3<NX, NY, NZ, TR, ARCH, cufftdx::fft_direction::forward>(bank);
+        lrx_kbox::store_tile<NX, NY, NZ, TR>(bank, c0, n, Store8{y, n, m, s});
+    }
 }
 
 // ---------------- reference ----------------
@@ -377,15 +443,25 @@ static void run(long long m) {
             fd = [=] { pd<<<gp, 256, psm>>>(DirectLoad{x, n}, PL{yd, n}, n); pc<<<g2, 256>>>(yd, n, V, m0, m1, m2); };
         } else if (MODE == 2) {
             auto pc = stage_pencil<NX, NY, NZ, true>; const int g2 = grid_of(pc, 256, 0);
-            fh = [=] { pi<<<gp, 256, psm>>>(PlainLoad{x, n}, PL{yh, n}, n); pc<<<g2, 256>>>(yh, n, V, m0, m1, m2);
-                       pfs<<<gp, 256, psm>>>(PlainLoad{yh, n}, ScaleStore{yh, n, s}, n); };
+            auto pim = stage_pencil_invmid<NX, NY, NZ>; auto pfw = stage_pencil_fwdscale<NX, NY, NZ>;
+            const int g3 = grid_of(pim, 256, 0); grid_of(pfw, 256, 0);
+            const float t3 = time_ms([=] { pi<<<gp, 256, psm>>>(PlainLoad{x, n}, PL{yh, n}, n); pc<<<g2, 256>>>(yh, n, V, m0, m1, m2);
+                       pfs<<<gp, 256, psm>>>(PlainLoad{yh, n}, ScaleStore{yh, n, s}, n); });
+            std::printf("  split 3-pass (x,z,y forward): %9.1f us\n", t3 * 1e3);
+            fh = [=] { pi<<<gp, 256, psm>>>(PlainLoad{x, n}, PL{yh, n}, n); pim<<<g3, 256>>>(yh, n, V, m0, m1, m2);
+                       pf<<<gp, 256, psm>>>(PlainLoad{yh, n}, PL{yh, n}, n); pfw<<<g3, 256>>>(yh, n, s); };
         } else {
             constexpr int TY8 = 8;
             auto p8 = stage_pencil8<NX, NY, NZ, TY8>;
             const size_t s8 = (size_t(NX) * 16 * TY8 + size_t(NX) * TY8 * 17) * 16;
             const int g2 = grid_of(p8, 16 * TY8, s8);
-            fh = [=] { pi<<<gp, 256, psm>>>(PlainLoad{x, n}, PL{yh, n}, n); p8<<<g2, 16 * TY8, s8>>>(yh, n, V, m);
-                       pfs<<<gp, 256, psm>>>(PlainLoad{yh, n}, ScaleStore{yh, n, s}, n); };
+            auto p8i = stage_pencil8_inv<NX, NY, NZ, TY8>; grid_of(p8i, 16 * TY8, s8);
+            auto pfw = stage_pencil_fwdscale<NX, NY, NZ>; const int g3 = grid_of(pfw, 256, 0);
+            const float t3p = time_ms([=] { pi<<<gp, 256, psm>>>(PlainLoad{x, n}, PL{yh, n}, n); p8<<<g2, 16 * TY8, s8>>>(yh, n, V, m);
+                       pfs<<<gp, 256, psm>>>(PlainLoad{yh, n}, ScaleStore{yh, n, s}, n); });
+            std::printf("  split 3-pass (x,z,y forward): %9.1f us\n", t3p * 1e3);
+            fh = [=] { pi<<<gp, 256, psm>>>(PlainLoad{x, n}, PL{yh, n}, n); p8i<<<g2, 16 * TY8, s8>>>(yh, n, V, m);
+                       pf<<<gp, 256, psm>>>(PlainLoad{yh, n}, PL{yh, n}, n); pfw<<<g3, 256>>>(yh, n, s); };
             const float t1 = time_ms([=] { pi<<<gp, 256, psm>>>(PlainLoad{x, n}, PL{yh, n}, n); });
             const float t2 = time_ms([=] { p8<<<g2, 16 * TY8, s8>>>(yh, n, V, m); });
             const float t3 = time_ms([=] { pfs<<<gp, 256, psm>>>(PlainLoad{yh, n}, ScaleStore{yh, n, s}, n); });
@@ -393,6 +469,20 @@ static void run(long long m) {
             std::printf("  split passes: plane_inv %.1f us (%.0f GB/s), pencil8 %.1f us (%.0f GB/s), plane_fwd %.1f us; 3-pass floor %.1f us\n",
                         t1 * 1e3, 2 * gb / (t1 * 1e-3), t2 * 1e3, 3 * gb / (t2 * 1e-3), t3 * 1e3, 7 * gb * 1e9 / 1.555e12 * 1e6);
         }
+    }
+    if (MODE == 8) {                   // the single arm at one instance (min_tr 1), and two where they fit
+        const long long g1 = 16LL * lrx_kbox::Geometry{NX, NY, NZ}.rs() * 16;
+        auto one = [&](auto k, int G) {
+            const size_t sm = size_t(G) * g1;
+            if (sm > size_t(optin)) { std::printf("  single8 G=%d: %zu B > opt-in\n", G, sm); return; }
+            const int gr = grid_of(k, 256, sm);
+            auto f = [=] { k<<<gr, 256, sm>>>(x, yh, V, n, m, s); };
+            const float t = time_ms(f); f(); CK(cudaDeviceSynchronize());
+            std::printf("  single8 G=%d (smem %zu B, %d blocks): %9.1f us (rel %.1e vs cuFFT chain)\n", G, sm,
+                        gr, t * 1e3, rel(yh, yr, len));
+        };
+        one(stage_single8<NX, NY, NZ, 1, 256>, 1);
+        one(stage_single8<NX, NY, NZ, 2, 256>, 2);
     }
     const float th = time_ms(fh); fh(); CK(cudaDeviceSynchronize());
     if (fd) {
@@ -422,7 +512,7 @@ int main(int argc, char** argv) {
 #define G(MD, X, Y, Z) if (mode == MD && nx == X && ny == Y && nz == Z) { run<MD, X, Y, Z>(m); return 0; }
     G(3, 8, 8, 8) G(3, 10, 10, 10) G(3, 12, 12, 12) G(3, 16, 16, 16) G(3, 6, 6, 1) G(3, 8, 8, 1) G(3, 4, 4, 4)
     G(2, 8, 8, 8) G(2, 10, 10, 10) G(2, 12, 12, 12) G(2, 16, 16, 16) G(2, 6, 6, 1) G(2, 8, 8, 1) G(2, 4, 4, 4)
-    G(8, 8, 8, 8) G(8, 10, 10, 10) G(8, 12, 12, 12) G(8, 16, 16, 16) G(8, 4, 4, 4)
+    G(8, 8, 8, 8) G(8, 10, 10, 10) G(8, 12, 12, 12) G(8, 16, 16, 16) G(8, 4, 4, 4) G(8, 6, 6, 1)
     std::printf("case not instantiated\n");
     return 1;
 }
