@@ -4279,8 +4279,14 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     # Keep at most one complete MPA screening model on disk.  The current
     # map has now built its replacement, consumed it through Sigma, passed
     # the Sigma gates and assembled H.  Only at this point is the preceding
-    # map's pair safe to unlink.  The newest pair survives convergence for
-    # restart/debugging; ordinary screening modes never enter this branch.
+    # map's pair (or shared-pole scratch generation) safe to unlink.  The
+    # newest survives convergence for restart/debugging; ordinary screening
+    # modes never enter these branches.
+    if mpa_mode and inputs.config.sigma.w_model == "shared_pole":
+        from .shared_pole_screening import retain_iteration_scratch
+        retain_iteration_scratch(
+            os.path.join(inputs.input_dir, "tmp", "mpa"),
+            f"sc_{state.iteration:04d}", print_fn=inputs.print_fn)
     if elementwise_mpa:
         from .mpa.model import retain_iteration_artifacts
         retain_iteration_artifacts(
