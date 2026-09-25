@@ -122,6 +122,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <map>
 #include <mutex>
 #include <sstream>
@@ -1788,6 +1789,10 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
     // Mode 8's resident arm sums the Lorentz blocks across a pair's spin rows, so it needs a
     // whole spin group per block: reach for the opt-in shared memory first.
     if (rb < 1 || (mode == 8 && rb < ns * ns)) rb = std::min<long long>(rows_max, smem_optin / row_bytes);
+    // WIP (SYMK measurement only, never for landing): cap mode 6's rows per block.
+    if (mode == 6)
+        if (const char* e = std::getenv("LRX_WIP_M6_RB"); e && std::atoll(e) >= 1)
+            rb = std::min<long long>(rb, std::atoll(e));
     const bool lor_split = mode == 8 && rb < ns * ns;   // no resident spin group: the split arm
     // Mode 11 runs on the k-box stage: its launch rule (kbox_plan) decides the arm, the tile and
     // the shared memory from the grid and this device's opt-in budget; RB is unused.
