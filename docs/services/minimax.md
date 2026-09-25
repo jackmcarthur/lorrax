@@ -100,7 +100,10 @@ or response arrays, and none certifies W or Σ accuracy.
   `reference_ry`; zero coefficients mark inactive slots. Errors are sampled,
   not proven. A positive `decay_rate` bounds occupation products by
   min(1, e^{decay_rate·d}) and restricts 0 ≤ Re t ≤ decay_rate. `previous`
-  rules with matching members are tried first.
+  rules with matching members are tried first. The build runs every loaded
+  OpenBLAS at 16 threads (the pin of `build_uniform_rule`): the pencil's QR,
+  SVD and least squares pick different times at different thread counts, and
+  the shared-pole W poles inherit them.
 * **`response_laplace_rule(delta_lo_ry, delta_hi_ry, z_ry, *, rel_tol=1e-8,
   previous=None, domain_pad_ry=0, ordered=False, reference_ry=None)`** (remote
   noncrossing cells). Elliptic decay rates, a small Lyapunov solve and a
