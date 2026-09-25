@@ -102,6 +102,7 @@ the QE-schema receipt and the occupied two-component DFT states
 | `w_av_first_neighbors` | bool | `false` | Preprocessing: write the symmetry-reduced finite-q density vertices for the first ± reciprocal-grid neighbours (`get_dipole_mtxels --w-av-only --parallel-transport-out FILE`). |
 | `w_av_second_neighbors` | bool | `false` | Preprocessing: also write the second axial and mixed neighbours of the 3-D quadratic W-av stencil. It requires at least 5 grid points on each active axis. |
 | `bare_coulomb_cutoff` | float | unset (= ecutwfc) | G cutoff (Ry) of the bare V_q build. |
+| `screened_coulomb_cutoff` | float | unset (= ecutwfc) | Real-space (non-ISDF) GW: the cutoff (Ry) of the χ_q(G,G′)/W_q(G,G′) sphere, \|q+G\|² ≤ cutoff, on the WFN's FFT box. It refuses at or above the box's alias cap, the smallest \|q+G\|² whose Miller index lies outside the window that products of two ψ spheres leave alias-free (`gw.mixed_basis_pair_convolution.screened_coulomb_cutoff_cap`). The cap is below 4·ecutwfc, the reach of a pair product; on Fe's 25³ box at 70 Ry it is CAP_PLACEHOLDER. No driver reads the key yet. |
 | `use_bgw_vcoul` | bool | `false` | Read v(q, G) from a BerkeleyGW vcoul file instead of building it. |
 | `bgw_vcoul_file` | str | `""` | The BerkeleyGW vcoul file for `use_bgw_vcoul`. |
 | `bgw_vcoul_sym_wfn` | str | `""` | Auxiliary WFN supplying the full symmetry group that folds LORRAX q-points onto BerkeleyGW's IBZ q list. |
