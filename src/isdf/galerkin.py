@@ -12,6 +12,7 @@ passes explicit values here.
 """
 from __future__ import annotations
 
+import contextlib
 from dataclasses import dataclass
 from functools import partial
 import hashlib
@@ -667,6 +668,28 @@ def _plan_basis_passes(geom: dict, *, band_carrier: int, rank: int,
     return _r_stream(geom["n_rtot"], p, cols), k_tile, groups, fft, live
 
 
+def _fit_band_carrier(geom: dict, *, carrier: int, divisor: int, rank: int,
+                      capacity: float, log_fn) -> int:
+    """Largest band carrier (a ``divisor`` multiple, at most ``carrier``)
+    whose projection stream fits beside ``rank`` resident selected rows."""
+    carrier = int(carrier)
+    while True:
+        try:
+            _plan_basis_passes(geom, band_carrier=carrier, rank=rank,
+                               rows=1, capacity=capacity)
+            return carrier
+        except MemoryError as exc:
+            if carrier <= divisor:
+                raise
+            nxt = max(divisor, (carrier // (2 * divisor)) * divisor)
+            if nxt >= carrier:
+                nxt = carrier - divisor
+            log_fn(
+                f"  Whole-state planner reduces the canonical WFN band "
+                f"carrier {carrier} -> {nxt} at rank {rank}: {exc}")
+            carrier = nxt
+
+
 def _whole_state_geometry(*, meta, mesh_xy: Mesh, nk: int, nspinor: int,
                           ngkmax: int, band_divisor: int, band_range,
                           device_pool_limit: float | None):
@@ -811,26 +834,11 @@ def fit_galerkin_basis(
         ngkmax=int(wfn.ngkmax), band_divisor=p_band,
         band_range=(b_start, b_end), device_pool_limit=device_pool_limit)
     # The band carrier bounds the one live full-grid band-chunk slab of the
-    # projection stream; the selected rows are priced after the pivots.
-    while True:
-        try:
-            _plan_basis_passes(geom, band_carrier=bc_carrier, rank=0,
-                               rows=1, capacity=capacity)
-            break
-        except MemoryError as exc:
-            if bc_carrier <= p_band:
-                raise
-            next_carrier = max(
-                p_band, (bc_carrier // (2 * p_band)) * p_band)
-            if next_carrier >= bc_carrier:
-                next_carrier = bc_carrier - p_band
-            log_fn(
-                f"  Whole-state planner reduces the canonical WFN band "
-                f"carrier {bc_carrier} -> {next_carrier}: {exc}")
-            bc_carrier = next_carrier
-    band_chunk_ranges = tuple(
-        (b0, min(b0 + bc_carrier, b_end))
-        for b0 in range(b_start, b_end, bc_carrier))
+    # projection stream; it is planned here without the selected rows and
+    # re-planned once the pivots fix the rank.
+    bc_carrier = _fit_band_carrier(
+        geom, carrier=bc_carrier, divisor=p_band, rank=0,
+        capacity=capacity, log_fn=log_fn)
 
     log_fn(
         f"  Whole-state randomized QRCP: states={m_states} "
@@ -849,10 +857,16 @@ def fit_galerkin_basis(
     face = NamedSharding(mesh_xy, P('x', 'y'))
     row = NamedSharding(mesh_xy, P(('x', 'y'), None))
 
-    with build_psi_G_store(
+    def _store(carrier):
+        return build_psi_G_store(
             wfn=wfn, mesh_xy=mesh_xy, meta=meta,
-            band_chunk_ranges=band_chunk_ranges, bispinor=bispinor,
-            band_pad_to=bc_carrier) as source:
+            band_chunk_ranges=tuple(
+                (b0, min(b0 + carrier, b_end))
+                for b0 in range(b_start, b_end, carrier)),
+            bispinor=bispinor, band_pad_to=carrier)
+
+    with contextlib.ExitStack() as stores:
+        source = stores.enter_context(_store(bc_carrier))
         sketch = _build_randomized_state_sketch(
             source=source, meta=meta, mesh_xy=mesh_xy, geom=geom,
             capacity=capacity, band_start=b_start, band_count=nb,
@@ -955,6 +969,16 @@ def fit_galerkin_basis(
             f"{d_taken_host[rank_qr-1]:.6e}; terminal trace residual="
             f"{tr_residual_host[rank_qr]:.6e}")
 
+        # The resident rows X sit beside one band chunk's full-grid slab in
+        # the projection.  If the rank-0 carrier no longer fits beside them,
+        # re-read the window at the carrier this rank allows.
+        fit_carrier = _fit_band_carrier(
+            geom, carrier=bc_carrier, divisor=p_band, rank=rank,
+            capacity=capacity, log_fn=log_fn)
+        if fit_carrier < bc_carrier:
+            source.release_host_tiles()
+            bc_carrier = fit_carrier
+            source = stores.enter_context(_store(bc_carrier))
         owner, _, _ = source.state_row_owners(
             selected, band_start=b_start, band_count=nb)
         basis_stream, k_tile, x_groups, x_fft, basis_live = \
