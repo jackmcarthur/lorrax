@@ -486,8 +486,8 @@ specialised per grid when NVRTC compiles the kernel.
 |---|---|
 | 1 consumer | ζ fit: `isdf.core.c_q_downfold` (pair); `isdf.core.c_q_from_psi_sm` (parent); `isdf.zeta_mubatch.make_route_g_kernel` (plane, every channel; the current channels' γ̃ as the load's `(perm, phase)`). Σ: `gw.ppm_tau_kernel.get_sigma_spatial_kernel` (τ sweep and static SX/RI: klead `prep` for W, klead unfold for G), `gw.cohsex_sigma._make_static_convolution` (klead). BSE: `bse_stack_matvec._conv_decode`, `bse_ring_comm._make_ring_rung`, and the W_R transforms in `bse_densify.make_w_densifier`, `bse_lanczos`, `davidson_absorption`, `absorption_haydock`, `bse_nontda`, `exciton_bands`. Flat-k transform: `common.fft_helpers.make_flat_k_fft` and its `make_flat_k_ifftn` / `make_flat_k_fftn` / `make_local_flat_k_fftn` wrappers (`gw.w_isdf`, `gw.qsgw_head`, `gw.cohsex_sigma`, `gw.wavefunction_bundle`, `bandstructure.htransform`, `bandstructure.orbital`) |
 | 2 router | `ffi/fft.py`: `make_fused_conv_kpair`, `make_fused_conv_kparent`, `make_fused_conv_kplane`, `make_kconv_klead` (→ `KConvStored(prep, apply)`), `make_kconv_klead_unfold`, `make_kconv_lorentz_unfold`, `make_kfft_klead_unfold`, `make_kconv_kminor` / `make_local_kconv_kminor`, `make_kfft_klead` / `make_local_kfft_klead`, `make_kfft_kminor` / `make_local_kfft_kminor`. `common.fft_helpers.get_donated_kfft_kminor` is `make_kfft_kminor` jitted with its input donated, memoised per `(mesh, kgrid, spec, kind, norm)`; the caller drops its own reference after the call |
-| 3 gate | `require_kconv`, then `require_fourier_plan`, called by `runtime.initialize_communicator_stack` after the FFT and GEMM gates. `require_kconv` on CUDA: the wheel's headers, every `ffi.fft.KCONV_TARGETS` target, and one probe compile (mode 3, k-grid 2×1×1, disk-cached), so a device the installed cuFFTDx cannot compile for refuses at startup (`GATE mathdx-probe`, naming its compute capability and the wheel); cpu: `lorrax_mklfft_flat_k`. `require_fourier_plan` on CUDA: `lorrax_fourier_plan`; cpu: nothing (XLA ops). Each factory re-probes its own target (a `LocalFourierPlan` that CUDA can lower probes `lorrax_fourier_plan` at construction); operand shapes and dtypes are checked at trace time |
-| 4 target | CUDA, in `liblorrax_ffi.so`: the eleven `lorrax_mathdx_*` names the router calls (`_kconv_pair`, `_kconv_parent`, `_kconv_plane`, `_kconv_klead`, `_kconv_klead_unfold_rows`, `_kconv_klead_lorentz_rows`, `_kfft_klead`, `_kfft_klead_unfold`, `_kconv_kminor`, `_kfft_kminor`, `_plane_fft_gather`); the library also keeps `_kconv_klead_unfold` and `_kconv_klead_lorentz`, the same kernels storing every k row, for older source trees. Also `lorrax_fourier_plan` (`cpp/cufft/fourier_plan_cuda_ffi.cc` + `fourier_plan.cu`, nvcc: sm_80 SASS and compute_80 PTX, JIT-compiled by the driver on sm_90 and later). cpu, in `liblorrax_ffi_host.so`: `lorrax_mklfft_flat_k`, `lorrax_mklfft_gw_conv` |
+| 3 gate | `require_kconv`, then `require_fourier_plan`, called by `runtime.initialize_communicator_stack` after the FFT and GEMM gates. `require_kconv` on CUDA: the wheel's headers, every `ffi.fft.KCONV_TARGETS` target, and one probe compile (mode 3, k-grid 2×1×1, disk-cached), so a device the installed cuFFTDx cannot compile for refuses at startup (`GATE mathdx-probe`, naming its compute capability and the wheel); cpu: `lorrax_mklfft_flat_k`. `require_fourier_plan` on CUDA: `lorrax_fourier_plan_mathdx` and an nvidia-mathdx wheel in `PAIR_MATHDX_WHEELS` (`GATE mathdx-pair-wheel`); cpu: nothing (XLA ops). Each factory re-probes its own target (a `LocalFourierPlan` that CUDA can lower probes `lorrax_fourier_plan_mathdx` at construction); operand shapes and dtypes are checked at trace time |
+| 4 target | CUDA, in `liblorrax_ffi.so`: the eleven `lorrax_mathdx_*` names the router calls (`_kconv_pair`, `_kconv_parent`, `_kconv_plane`, `_kconv_klead`, `_kconv_klead_unfold_rows`, `_kconv_klead_lorentz_rows`, `_kfft_klead`, `_kfft_klead_unfold`, `_kconv_kminor`, `_kfft_kminor`, `_plane_fft_gather`); the library also keeps `_kconv_klead_unfold` and `_kconv_klead_lorentz`, the same kernels storing every k row, for older source trees. Also `lorrax_fourier_plan_mathdx` and, for older trees, `lorrax_fourier_plan` (`cpp/cufft/fourier_plan_cuda_ffi.cc` + `fourier_plan.cu`; the fused pair NVRTC-built at run time; nvcc: sm_80 SASS and compute_80 PTX, JIT-compiled by the driver on sm_90 and later). cpu, in `liblorrax_ffi_host.so`: `lorrax_mklfft_flat_k`, `lorrax_mklfft_gw_conv` |
 | 5 handler | CUDA: `cpp/cufft/kconv_mathdx_cuda_ffi.cc`, one embedded cuFFTDx source (`kSrc`; mode 10 has its own, `kPlaneSrc`) compiled by NVRTC for the device's own `sm_<cc>` per (CUDA context, mode, `nkx`, `nky`, `nkz`, `ns`, precision) into an in-process cache, backed by the disk cubin cache below (images keyed per sm); `cpp/cufft/fourier_plan_cuda_ffi.cc`, plans cached per (device, attributes, batch). cpu: `cpp/mklfft/fft_flat_k_ffi.cc` (`MklFftFlatKHostFfi`, `MklFftGwConvHostFfi`) |
 
 **Doors.** Pick the door whose k position matches the tile you hold. A caller
@@ -505,7 +505,7 @@ never transposes to reach another door.
 | `make_kfft_klead` | flat leading `(N_k, …)` | 3 | `lorrax_mklfft_flat_k` |
 | `make_kconv_kminor` | flat trailing `(…, N_k)` | 4 | XLA moves k to the front, then host inverse transform, product, host forward transform, and k moves back |
 | `make_kfft_kminor` | 3-D trailing `(…, nkx, nky, nkz)` | 5 | the same transpose around one host transform |
-| `common.fourier_plan.LocalFourierPlan` | none: ≤ 3 spatial axes with per-axis supports; the entry point for sphere↔box and plane transforms (§ Local Fourier plan) | `lorrax_fourier_plan`; its `in_gather` form is mode 10 | XLA ops: `dot_general` GEMM axes and one `jnp.fft` group |
+| `common.fourier_plan.LocalFourierPlan` | none: ≤ 3 spatial axes with per-axis supports; the entry point for sphere↔box and plane transforms (§ Local Fourier plan) | `lorrax_fourier_plan_mathdx`; its `in_gather` form is mode 10 | XLA ops: `dot_general` GEMM axes and one `jnp.fft` group |
 | `make_plane_fft_gather` | the backend of `LocalFourierPlan(in_gather=…)`: the route-G cylinder `(…, n_col)` → the transformed plane `(…, n_b, n_c)` | 10 | the XLA route: static-run concatenate, then `jnp.fft.fftn` |
 
 - **Sharding.** The pair, parent, plane and `make_local_*` doors are rank-local
@@ -740,10 +740,34 @@ sphere enters through its tight bounding box.
   (decisions.md 2026-09-25). Stages run shrinking GEMMs, then the FFT group
   (embed, transform, restrict), then expanding GEMMs.
 * **Legs.** Chosen when the call is lowered (`lax.platform_dependent`): on
-  CUDA one `lorrax_fourier_plan` custom call (cuBLAS ZGEMM with a stride-0
-  matrix, no transposes; one cuFFT Z2Z plan per contiguous run of FFT axes;
-  remap kernels for embed/restrict); elsewhere XLA ops. A CPU operand in a GPU
-  process therefore takes the XLA leg.
+  CUDA one `lorrax_fourier_plan_mathdx` custom call (cuBLAS ZGEMM with a stride-0
+  matrix, no transposes; the fused pair below; one cuFFT Z2Z plan per contiguous
+  run of FFT axes; remap kernels for embed/restrict); elsewhere XLA ops. A CPU
+  operand in a GPU process therefore takes the XLA leg. `lorrax_fourier_plan`
+  (the same handler without the pair's two string attributes) stays in the
+  library for older trees.
+* **Fused pair.** When the two trailing axes are GEMM axes executed back to
+  back, one cuBLASDx kernel per plane does both,
+  `Q (N1'×N2') = α·A1 (N1'×K1)·P (K1×K2)·A2ᵀ (K2×N2')`, with the plane, both
+  matrices and the intermediate in shared memory: the intermediate never
+  reaches HBM and both GEMMs run on DMMA. Chosen when the plan is built, iff
+  `16·(N1'K1 + N2'K2 + K1K2 + N1'K2 + N1'N2')` bytes fit the device's opt-in
+  shared memory (else two cuBLAS GEMMs); a warp per block when the smaller
+  GEMM output has < 128 elements, else 128 threads. NVRTC-built per
+  `(N1', K1, N2', K2)` through `common/nvrtc_build` (the mathdx key rule with
+  `cublasdx_version.hpp`), disk-cached with the k-convolution images; 8–13 s
+  per shape cold. A100, whole plan against the cuBLAS chain: Fe 25³, K = 13,
+  sphere→box 0.80–0.82, box→sphere 0.64–0.66; 16³–48³ 0.8–0.9; shapes that do
+  not fit (64³, 72³, 96²) are unchanged. Boxes whose long axis is an FFT axis
+  (CrI3 80×80×250) never pair.
+* **CUTLASS under NVRTC.** The nvidia-mathdx 25.6 wheel's CUTLASS 3.9 declares
+  `std::tuple_size`/`tuple_element` variadic under NVRTC; CCCL 3 (CUDA 13)
+  declares them with one parameter, and NVRTC refuses the pair. The pair's
+  build defines CCCL's include guard `_CUDA_STD___TUPLE_STRUCTURED_BINDINGS_H`
+  (CCCL's structured bindings of `cuda::std` types drop out; nothing here uses
+  them), no header is patched. Validated for the wheels in
+  `ffi.fft.PAIR_MATHDX_WHEELS`; any other version refuses at startup in
+  `require_fourier_plan` (`GATE mathdx-pair-wheel`, naming the version).
 * **Caches.** The CUDA leg caches plans per (device, attributes, batch) for
   the process: device Fourier matrices (`16·N'·K` bytes per GEMM axis), remap
   tables and cuFFT plans without work areas. Work areas and the ping-pong
@@ -751,7 +775,7 @@ sphere enters through its tight bounding box.
   the plan uses per call lives outside the pool.
 * **Refusals.** `GATE fourier-plan-contract` (not complex128, or not 1–3
   axes, at construction on every platform); `GATE fourier-plan-int32` (a cuFFT
-  or cuBLAS size past `2³¹−1`); a missing `lorrax_fourier_plan` at
+  or cuBLAS size past `2³¹−1`); a missing `lorrax_fourier_plan_mathdx` at
   construction when CUDA can lower the plan.
 * **Determinism.** Reruns are bitwise at fixed device and toolkit, and a
   batch slice equals the same rows of a larger batch; nothing is promised
