@@ -606,7 +606,8 @@ def _get_chi_fractional_contour_kernel_face(
     on the parents and transported by the two families' plans (``build_G_tau``
     with ``right_k_unfold_plan``, the route of the static current response);
     the Dirac vertices act on its spin indices,
-    ``chi^AB = sum_ab (J_A G^> J_B^dagger)_ab conj(G^<)_ab``.  One family
+    ``chi^AB = sum_ab (J_A G^> J_B^dagger)_ab conj(G^<)_ab``
+    (``common.gamma_matrices.gamma_vertex_trace``).  One family
     pair's two Greens are live at a time.  The rows accumulate in the
     families' packed photon layout and cross into the canonical layout once
     at the end of the call.  No psi face is unfolded.
@@ -807,7 +808,7 @@ def _get_chi_fractional_contour_kernel_face(
                 # pairs elementwise in mu, nu.
                 return jax.lax.with_sharding_constraint(
                     jnp.einsum("Rmanb,Rmanb->Rmn", gu, gf.conj()), chi_R_shard)
-            from common.gamma_matrices import gamma_double_contract, gamma_perm_phase
+            from common.gamma_matrices import gamma_vertex_trace
             from .photon_layout import FAMILY_PAIRS, _insert, family_channels
             total = jax.lax.with_sharding_constraint(
                 jnp.zeros((nk, n_mu, n_mu), jnp.complex128), chi_R_shard)
@@ -820,15 +821,7 @@ def _get_chi_fractional_contour_kernel_face(
                                     current=True, family_pair=pair))
                 for A in family_channels(pair[0]):
                     for B in family_channels(pair[1]):
-                        perm_a, phase_a = gamma_perm_phase(A)
-                        perm_b, phase_b = gamma_perm_phase(B)
-                        block = gamma_double_contract(
-                            jnp.conj(gf), gu,
-                            perm_L=None if A == 0 else perm_a,
-                            phase_L=None if A == 0 else phase_a,
-                            perm_R=None if B == 0 else perm_b,
-                            phase_R=None if B == 0 else jnp.conj(phase_b),
-                            spin_axes=(2, 4))
+                        block = gamma_vertex_trace(gf, gu, A, B, spin_axes=(2, 4))
                         total = _insert(
                             total, jax.lax.with_sharding_constraint(block, chi_R_shard),
                             photon.packed_layout, A, B, mesh_xy)
