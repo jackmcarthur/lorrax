@@ -228,7 +228,7 @@ def test_stage_order_and_backend_choice(monkeypatch):
     monkeypatch.setitem(fourier_plan.GEMM_CROSSOVER, "__mixed__", (range(0), range(9)))
     plan = LocalFourierPlan((8, 10, 12), (0, 1, 2), device_kind="__mixed__", **kw)
     assert plan.stages == [(1, "fft", 10, 10), (2, "fft", 12, 3), (0, "gemm", 4, 8)]
-    assert fourier_plan.gemm_crossover("an unknown accelerator") == (range(0), range(0))
+    assert fourier_plan.gemm_crossover("an unknown accelerator") == (range(0), range(0), 1.0)
     # the A100 row: supported plane axes on the GEMM, a full axis on the FFT
     sup = {1: np.arange(-13, 14) % 54, 2: np.arange(27)}
     x = _crandn(_rng("a100"), (2, 27, 27, 9))
@@ -239,6 +239,10 @@ def test_stage_order_and_backend_choice(monkeypatch):
     full = LocalFourierPlan((54, 80), (-2, -1), sign=-1, out_support={-2: np.arange(54), -1: np.arange(80)},
                             device_kind="NVIDIA A100-SXM4-40GB")
     assert [s[1] for s in full.stages] == ["fft", "fft"]
+    # a supported axis takes the A100 GEMM only while n_in·n_out/N² ≤ 0.54
+    frac = LocalFourierPlan((80, 80), (-2, -1), sign=+1, in_support={-2: np.arange(43), -1: np.arange(44)},
+                            device_kind="NVIDIA A100-SXM4-40GB")
+    assert sorted((s[0], s[1]) for s in frac.stages) == [(-2, "gemm"), (-1, "fft")]
 
 
 @pytest.mark.parametrize("kind", BACKENDS)
