@@ -65,7 +65,7 @@ from common.fft_helpers import local_fftn3, local_ifftn3
 # A100, complex128, measured through the CUDA leg (one custom call): a batched
 # cuFFT costs about one HBM pass for every N in 2..256, and the Fourier ZGEMMs
 # (DMMA tensor cores, ~7 TFLOP/s at K ≈ 27–40) cost more than a pass, so a full
-# axis never takes the GEMM (1D 1.6–6×, 2-D/3-D grids 1.2–82×).  A supported
+# axis never takes the GEMM (1-D 1.14–6.1× at 1e3–1e5 lines, 2-D/3-D grids 1.2–82×).  A supported
 # axis's FFT arm pays the zero-fill embed, the transform and the restriction;
 # the GEMM does all three in one pass: one way 0.50–0.82 and round trip
 # 0.45–0.87 of the FFT arm on 16³–96³ and 24²–128² boxes.  12³ loses (1.16:
