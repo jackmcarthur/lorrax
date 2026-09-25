@@ -9,8 +9,8 @@ previous behaviour):
   `option(LORRAX_FFI_HAVE_PHDF5 ON)`.
 * `src/ffi/cpp/cusolvermp/{ctx.h,context.cc}` — `#if LORRAX_FFI_HAVE_CAL`
   around the CAL comm path (cuSOLVERMp ≥ 0.7 is NCCL-native).
-* `src/ffi/cpp/common/api.cc` — `#if LORRAX_FFI_HAVE_PHDF5` around the phdf5
-  lifecycle entry points.
+* `src/ffi/cpp/phdf5/api.cc` — the phdf5 lifecycle entry points, compiled
+  only under `LORRAX_FFI_HAVE_PHDF5`.
 * `src/ffi/common/ffi_loader.py` — skips FFI handler / lifecycle symbols a
   partial build doesn't export.
 
