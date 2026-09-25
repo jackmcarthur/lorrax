@@ -554,8 +554,9 @@ if(LORRAX_CUFFT_ON)
         -Wall -Wextra)
     # The CUDA FFT leg: the nvidia-mathdx k-convolution family (the cuFFT
     # strided flat-k handler was replaced 2026-09-24, measured) and
-    # lorrax_fourier_plan, the LocalFourierPlan's one custom call (cuBLAS
-    # Fourier GEMMs + one cufftPlanMany group + its remap kernel).
+    # lorrax_fourier_plan_mathdx, the LocalFourierPlan's one custom call
+    # (cuBLAS Fourier GEMMs, the fused cuBLASDx pair, one cufftPlanMany group
+    # and its remap kernel; lorrax_fourier_plan, pair-less, for older trees).
     list(APPEND LORRAX_FFI_SOURCES
         $<TARGET_OBJECTS:build_kconv_mathdx_cuda>
         cufft/fourier_plan.cu

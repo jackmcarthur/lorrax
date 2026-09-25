@@ -1,5 +1,7 @@
-// lorrax_fourier_plan: one local separable DFT with per-axis supports, as ONE
-// custom call (the CUDA leg of ffi.fft.make_fourier_plan).
+// lorrax_fourier_plan_mathdx: one local separable DFT with per-axis supports,
+// as ONE custom call (the CUDA leg of common.fourier_plan.LocalFourierPlan).
+// `lorrax_fourier_plan` is the same handler without the fused pair's build
+// attributes, kept for older source trees (they never build a pair).
 //
 //   y = R_out · F_{sign} · E_in · x   over the d ≤ 3 trailing axes of x,
 //
@@ -18,6 +20,17 @@
 //     transform is separable, so the runs compose to the group's transform),
 //     one remap pass for the restricted axes.  The FFT axes' scale rides the
 //     first GEMM's alpha, else a remap pass, else a final scale remap.
+//   * Fused pair: when the two trailing axes are GEMM axes that run one
+//     after the other, one cuBLASDx kernel does both per plane,
+//     Q (N1' × N2') = α · A1 (N1' × K1) · P (K1 × K2) · A2ᵀ (K2 × N2'), with
+//     the plane, both matrices and the intermediate in shared memory: the
+//     intermediate never reaches HBM and the GEMMs run on the tensor cores
+//     at plane size (A100, Fe 25³ × 256, K = 13: 207 → 165 µs for the whole
+//     sphere → box chain).  Chosen when the plan is built, from the shape and
+//     the device's opt-in shared memory; a pair that does not fit runs as two
+//     cuBLAS GEMMs.  The kernel is NVRTC-built per (N1', K1, N2', K2) from the
+//     nvidia-mathdx wheel (`mathdx_root`) through common/nvrtc_build, disk
+//     cached under `cubin_dir` by that service's key rule.
 //
 // Plans (device matrices, remap tables, cuFFT plans) are cached per
 // (device, attributes, shape) for the process lifetime.  cuFFT's work areas
@@ -38,11 +51,18 @@
 #include <mutex>
 #include <sstream>
 #include <string>
+#include <string_view>
+#include <tuple>
+#include <utility>
 #include <vector>
+
+#include <cuda.h>
 
 #include "xla/ffi/api/ffi.h"
 
 #include "fourier_plan.h"
+#include "../common/mkl_thread_pin.h"
+#include "../common/nvrtc_build.h"
 
 namespace lorrax_ffi::fourier_plan {
 
@@ -57,9 +77,12 @@ static ffi::Error bad(const std::string& what) {
 
 // One executable step of a plan.
 struct Step {
-    enum Kind { kGemm, kRemap, kFft } kind;
+    enum Kind { kGemm, kRemap, kFft, kPair } kind;
     int axis = -1;                         // GEMM axis
-    cuDoubleComplex* mat = nullptr;        // device (N' × K) row-major
+    cuDoubleComplex* mat = nullptr;        // device (N' × K) row-major; pair: axis d-2's
+    cuDoubleComplex* mat2 = nullptr;       // pair: axis d-1's (N2' × K2)
+    CUfunction fn = nullptr;               // pair: the plane kernel
+    int threads = 0, smem = 0, grid = 0;   // pair: its launch
     RemapShape remap{};                    // remap geometry (maps are device pointers)
     double sr = 1.0, si = 0.0;             // remap scale, or GEMM alpha
     std::vector<cufftHandle> ffts;         // one contiguous FFT run: one handle, looped `loops` times
@@ -123,17 +146,174 @@ static int64_t prod(const int64_t* e, int d) {
     return r;
 }
 
+// ---- the fused supported pair ------------------------------------------------
+// One block per plane (grid-stride): load P, T = α·A1·P, Q = T·A2ᵀ, store Q.
+static const char* kPairSrc = R"__lrx__(
+#include <cublasdx.hpp>
+constexpr int N1 = LRX_N1, K1 = LRX_K1, N2 = LRX_N2, K2 = LRX_K2;
+using G1 = decltype(cublasdx::Size<N1, K2, K1>() + cublasdx::Precision<double>() +
+                    cublasdx::Type<cublasdx::type::complex>() + cublasdx::Function<cublasdx::function::MM>() +
+                    cublasdx::Arrangement<cublasdx::row_major, cublasdx::row_major, cublasdx::row_major>() +
+                    cublasdx::SM<LRX_SM>() + cublasdx::Block() + cublasdx::BlockDim<LRX_THREADS>());
+using G2 = decltype(cublasdx::Size<N1, N2, K2>() + cublasdx::Precision<double>() +
+                    cublasdx::Type<cublasdx::type::complex>() + cublasdx::Function<cublasdx::function::MM>() +
+                    cublasdx::Arrangement<cublasdx::row_major, cublasdx::col_major, cublasdx::row_major>() +
+                    cublasdx::SM<LRX_SM>() + cublasdx::Block() + cublasdx::BlockDim<LRX_THREADS>());
+using T = typename G1::c_value_type;
+
+extern "C" __global__ void __launch_bounds__(LRX_THREADS)
+lrx_plan_pair(const T* __restrict__ X, T* __restrict__ Y, const T* __restrict__ A1,
+              const T* __restrict__ A2, long long n_planes, double ar, double ai) {
+    extern __shared__ __align__(16) unsigned char smem[];
+    T* s1 = reinterpret_cast<T*>(smem);
+    T* s2 = s1 + N1 * K1;
+    T* sP = s2 + N2 * K2;
+    T* sT = sP + K1 * K2;
+    T* sQ = sT + N1 * K2;
+    for (int i = threadIdx.x; i < N1 * K1; i += LRX_THREADS) s1[i] = A1[i];
+    for (int i = threadIdx.x; i < N2 * K2; i += LRX_THREADS) s2[i] = A2[i];
+    const T alpha{ar, ai}, one{1.0, 0.0}, zero{0.0, 0.0};
+    auto a1 = cublasdx::make_tensor(s1, G1::get_layout_smem_a());
+    auto b1 = cublasdx::make_tensor(sP, G1::get_layout_smem_b());
+    auto c1 = cublasdx::make_tensor(sT, G1::get_layout_smem_c());
+    auto a2 = cublasdx::make_tensor(sT, G2::get_layout_smem_a());
+    auto b2 = cublasdx::make_tensor(s2, G2::get_layout_smem_b());
+    auto c2 = cublasdx::make_tensor(sQ, G2::get_layout_smem_c());
+    for (long long p = blockIdx.x; p < n_planes; p += gridDim.x) {
+        const T* src = X + p * (K1 * K2);
+        __syncthreads();
+        for (int i = threadIdx.x; i < K1 * K2; i += LRX_THREADS) sP[i] = src[i];
+        __syncthreads();
+        G1().execute(alpha, a1, b1, zero, c1);
+        __syncthreads();
+        G2().execute(one, a2, b2, zero, c2);
+        __syncthreads();
+        T* dst = Y + p * (N1 * N2);
+        for (int i = threadIdx.x; i < N1 * N2; i += LRX_THREADS) dst[i] = sQ[i];
+    }
+}
+)__lrx__";
+
+// The wheel's CUTLASS (3.9) forward-declares std::tuple_size/tuple_element as
+// variadic under NVRTC; CCCL 3 (CUDA 13) declares them with one type
+// parameter, and NVRTC refuses the redeclaration.  When the toolkit's CCCL has
+// the one-parameter form, these headers go to NVRTC as embedded headers with
+// CCCL's form (an embedded header shadows the include path; its text is keyed).
+static const char* const kCuteRtcHeaders[] = {
+    "cute/container/array.hpp", "cute/container/array_subbyte.hpp", "cute/container/tuple.hpp",
+    "cute/container/type_list.hpp", "cute/numeric/arithmetic_tuple.hpp"};
+
+static bool cute_rtc_headers(const std::string& cutlass, const std::string& cuda_inc,
+                             std::vector<std::pair<std::string, std::string>>* out) {
+    static const std::string variadic =
+        "template <class... _Tp>\nstruct tuple_size;\n\ntemplate <size_t _Ip, class... _Tp>\nstruct tuple_element;\n";
+    static const std::string single =
+        "template <class _Tp>\nstruct tuple_size;\n\ntemplate <size_t _Ip, class _Tp>\nstruct tuple_element;\n";
+    std::string sb = nvrtc::read_file(cuda_inc + "/cccl/cuda/std/__tuple_dir/structured_bindings.h");
+    if (sb.empty()) sb = nvrtc::read_file(cuda_inc + "/cuda/std/__tuple_dir/structured_bindings.h");
+    if (sb.find("template <class _Tp>\nstruct tuple_size;") == std::string::npos) return true;
+    for (const char* name : kCuteRtcHeaders) {
+        std::string text = nvrtc::read_file(cutlass + "/" + name);
+        if (text.empty()) return false;
+        const size_t at = text.find(variadic);
+        if (at != std::string::npos) text.replace(at, variadic.size(), single);
+        out->emplace_back(name, std::move(text));
+    }
+    return true;
+}
+
+struct PairKernel {
+    CUfunction fn = nullptr;
+    int threads = 0, smem = 0, grid = 0;
+};
+
+// Shared memory of one pair block: A1, A2, P, T, Q (complex128).
+static int64_t pair_smem(int64_t n1, int64_t k1, int64_t n2, int64_t k2) {
+    return 16 * (n1 * k1 + n2 * k2 + k1 * k2 + n1 * k2 + n1 * n2);
+}
+
+// Build (or reuse) the pair kernel for (N1', K1, N2', K2) on the current device.
+static ffi::Error pair_kernel(int dev, int64_t n1, int64_t k1, int64_t n2, int64_t k2,
+                              const std::string& root, const std::string& cubin_dir, PairKernel* out) {
+    static std::map<std::tuple<int, int64_t, int64_t, int64_t, int64_t>, PairKernel> built;
+    const auto key = std::make_tuple(dev, n1, k1, n2, k2);
+    if (auto it = built.find(key); it != built.end()) { *out = it->second; return ffi::Error::Success(); }
+    const nvrtc::DriverApi& api = nvrtc::driver_api();
+    if (!api.ok) return err("pair: driver API: " + api.err);
+    int cc_major = 0, cc_minor = 0, sms = 0, smem_sm = 0;
+    if (cudaDeviceGetAttribute(&cc_major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess ||
+        cudaDeviceGetAttribute(&cc_minor, cudaDevAttrComputeCapabilityMinor, dev) != cudaSuccess ||
+        cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev) != cudaSuccess ||
+        cudaDeviceGetAttribute(&smem_sm, cudaDevAttrMaxSharedMemoryPerMultiprocessor, dev) != cudaSuccess)
+        return err("pair: cudaDeviceGetAttribute");
+    std::string why;
+    const std::string cuda_inc = nvrtc::toolkit_include(&why);
+    if (cuda_inc.empty()) return err("pair: CUDA toolkit headers for NVRTC: " + why);
+    if (!nvrtc::exists(root + "/include/cublasdx.hpp"))
+        return ffi::Error(ffi::ErrorCode::kFailedPrecondition,
+                          "lorrax_fourier_plan: GATE mathdx-headers: got no cublasdx.hpp under " + root +
+                              "/include; want the nvidia-mathdx wheel (the fused supported pair is built "
+                              "from its cuBLASDx headers); fix: pip install nvidia-mathdx");
+    PairKernel k;
+    k.smem = int(pair_smem(n1, k1, n2, k2));
+    k.threads = std::max(n1 * n2, k1 * k2) >= 1024 ? 256 : 128;
+    const int per_sm = std::max(1, std::min(smem_sm / (k.smem + 1024), 2048 / k.threads));
+    k.grid = sms * per_sm;
+    std::vector<std::pair<std::string, std::string>> hdrs;
+    if (!cute_rtc_headers(root + "/external/cutlass/include", cuda_inc, &hdrs))
+        return err("pair: unreadable CUTLASS header under " + root + "/external/cutlass/include");
+    nvrtc::Program prog;
+    prog.src = kPairSrc;
+    prog.name = "lrx_plan_pair.cu";
+    for (const auto& h : hdrs) prog.headers.emplace_back(h.first.c_str(), h.second.c_str());
+    prog.defs = {"--std=c++17", "--device-as-default-execution-space", "-diag-suppress=1215",
+                 "--gpu-architecture=sm_" + std::to_string(cc_major) + std::to_string(cc_minor),
+                 "-DLRX_N1=" + std::to_string(n1), "-DLRX_K1=" + std::to_string(k1),
+                 "-DLRX_N2=" + std::to_string(n2), "-DLRX_K2=" + std::to_string(k2),
+                 "-DLRX_THREADS=" + std::to_string(k.threads),
+                 "-DLRX_SM=" + std::to_string(cc_major * 100 + cc_minor * 10)};
+    nvrtc::mathdx_toolchain(root, cuda_inc, "cublasdx", &prog);
+    prog.kernel = "lrx_plan_pair";
+    std::string missing;
+    const std::string key_hex = nvrtc::hex16(nvrtc::key(prog, &missing));
+    const std::string dir = missing.empty() ? cubin_dir : std::string();
+    std::string path;
+    if (!dir.empty()) {
+        std::ostringstream name;
+        name << dir << "/plan_pair_" << n1 << "x" << k1 << "_" << n2 << "x" << k2 << "_sm" << cc_major
+             << cc_minor << "_" << key_hex << ".cubin";
+        path = name.str();
+    }
+    nvrtc::Image img;
+    std::string where, e;
+    if (!nvrtc::build(prog, dir, path, key_hex, &img, &where, &e)) return err("pair: " + where + ": " + e);
+    k.fn = img.fn;
+    if (k.smem > 49152) {
+        const CUresult cr = api.FuncSetAttribute(k.fn, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, k.smem);
+        if (cr != CUDA_SUCCESS) return err("pair: cuFuncSetAttribute: " + nvrtc::cu_err(cr));
+    }
+    if (mklpin::announce_here())
+        std::fprintf(stderr, "[fourier_plan] fused pair (%lld,%lld)x(%lld,%lld) sm_%d%d: %s in %.1f ms (%s)\n",
+                     (long long)n1, (long long)k1, (long long)n2, (long long)k2, cc_major, cc_minor,
+                     img.from_disk ? "disk-cache hit" : "NVRTC built", img.ms,
+                     path.empty() ? "not cached" : (img.from_disk || img.stored ? path.c_str() : "store FAILED"));
+    *out = built[key] = k;
+    return ffi::Error::Success();
+}
+
 // Build a plan.  Attributes (per transform axis a = 0..d-1):
 //   n[a] full extent; kin[a], kout[a] compact extents; in_idx/out_idx the
 //   supports concatenated (identity ranges where an axis has none);
 //   sup_in/sup_out 0/1; gemm 0/1; scale[a] the axis' jnp.fft scale;
-//   order: GEMM axes in execution order with -1 where the FFT group runs.
-static ffi::Error build_plan(Plan& p, int64_t batch, ffi::Span<const int64_t> n,
+//   order: GEMM axes in execution order with -1 where the FFT group runs;
+//   mathdx_root, cubin_dir: the fused pair's build ("" = no pair).
+static ffi::Error build_plan(Plan& p, int dev, int64_t batch, ffi::Span<const int64_t> n,
                              ffi::Span<const int64_t> kin, ffi::Span<const int64_t> kout,
                              ffi::Span<const int64_t> in_idx, ffi::Span<const int64_t> out_idx,
                              ffi::Span<const int64_t> sup_in, ffi::Span<const int64_t> sup_out,
                              ffi::Span<const int64_t> gemm, ffi::Span<const double> scale,
-                             ffi::Span<const int64_t> order, int sign) {
+                             ffi::Span<const int64_t> order, int sign, const std::string& mathdx_root,
+                             const std::string& cubin_dir) {
     const int d = int(n.size());
     p.d = d;
     p.batch = batch;
@@ -183,7 +363,44 @@ static ffi::Error build_plan(Plan& p, int64_t batch, ffi::Span<const int64_t> n,
         return ffi::Error::Success();
     };
 
-    for (int64_t ax : order) {
+    int optin = 0;
+    if (cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev) != cudaSuccess)
+        return err("cudaDeviceGetAttribute(max opt-in shared memory)");
+    for (size_t oi = 0; oi < order.size(); ++oi) {
+        const int64_t ax = order[oi];
+        // The fused pair: the two trailing axes' GEMMs back to back, fitting one block.
+        if (d >= 2 && !mathdx_root.empty() && ax >= 0 && oi + 1 < order.size() && order[oi + 1] >= 0 &&
+            ax + order[oi + 1] == 2 * d - 3 && std::min(ax, order[oi + 1]) == d - 2 &&
+            pair_smem(kout[d - 2], cur[d - 2], kout[d - 1], cur[d - 1]) <= optin) {
+            Step st;
+            st.kind = Step::kPair;
+            PairKernel k;
+            if (auto e = pair_kernel(dev, kout[d - 2], cur[d - 2], kout[d - 1], cur[d - 1], mathdx_root,
+                                     cubin_dir, &k);
+                e.failure())
+                return e;
+            st.fn = k.fn;
+            st.threads = k.threads;
+            st.smem = k.smem;
+            st.grid = k.grid;
+            for (int a : {d - 2, d - 1}) {
+                auto h = fourier_matrix(n[a], out_idx.begin() + ooff[a], kout[a],
+                                        in_idx.begin() + ioff[a], kin[a], sign, scale[a]);
+                if (auto e = upload(p, h, a == d - 2 ? &st.mat : &st.mat2); e.failure()) return e;
+            }
+            if (alpha_pending) {
+                st.sr = fft_scale;
+                alpha_pending = false;
+            }
+            for (int b = 0; b < d; ++b) st.in_ext[b] = cur[b];
+            cur[d - 2] = kout[d - 2];
+            cur[d - 1] = kout[d - 1];
+            for (int b = 0; b < d; ++b) st.out_ext[b] = cur[b];
+            p.steps.push_back(st);
+            p.max_elems = std::max(p.max_elems, batch * prod(cur, d));
+            ++oi;
+            continue;
+        }
         if (ax >= 0) {                                    // one GEMM axis
             const int a = int(ax);
             Step st;
@@ -307,7 +524,8 @@ static std::string plan_key(int dev, int64_t batch, ffi::Span<const int64_t> n,
                             ffi::Span<const int64_t> in_idx, ffi::Span<const int64_t> out_idx,
                             ffi::Span<const int64_t> sup_in, ffi::Span<const int64_t> sup_out,
                             ffi::Span<const int64_t> gemm, ffi::Span<const double> scale,
-                            ffi::Span<const int64_t> order, int64_t sign) {
+                            ffi::Span<const int64_t> order, int64_t sign, std::string_view mathdx_root,
+                            std::string_view cubin_dir) {
     std::string k;
     auto add = [&](const void* p, size_t bytes) { k.append(static_cast<const char*>(p), bytes); };
     add(&dev, sizeof dev);
@@ -319,6 +537,11 @@ static std::string plan_key(int dev, int64_t batch, ffi::Span<const int64_t> n,
         add(s.begin(), s.size() * sizeof(int64_t));
     }
     add(scale.begin(), scale.size() * sizeof(double));
+    for (std::string_view v : {mathdx_root, cubin_dir}) {
+        const int64_t len = int64_t(v.size());
+        add(&len, sizeof len);
+        add(v.data(), v.size());
+    }
     return k;
 }
 
@@ -328,7 +551,8 @@ static ffi::Error run(cudaStream_t stream, ffi::ScratchAllocator scratch, ffi::A
                       ffi::Span<const int64_t> in_idx, ffi::Span<const int64_t> out_idx,
                       ffi::Span<const int64_t> sup_in, ffi::Span<const int64_t> sup_out,
                       ffi::Span<const int64_t> gemm, ffi::Span<const double> scale,
-                      ffi::Span<const int64_t> order, int64_t sign) {
+                      ffi::Span<const int64_t> order, int64_t sign, std::string_view mathdx_root,
+                      std::string_view cubin_dir) {
     if (x.element_type() != ffi::DataType::C128 || y->element_type() != ffi::DataType::C128)
         return bad("complex128 only");
     const int d = int(n.size());
@@ -343,15 +567,17 @@ static ffi::Error run(cudaStream_t stream, ffi::ScratchAllocator scratch, ffi::A
     int dev = 0;
     if (cudaGetDevice(&dev) != cudaSuccess) return err("cudaGetDevice");
     const std::string key =
-        plan_key(dev, batch, n, kin, kout, in_idx, out_idx, sup_in, sup_out, gemm, scale, order, sign);
+        plan_key(dev, batch, n, kin, kout, in_idx, out_idx, sup_in, sup_out, gemm, scale, order, sign,
+                 mathdx_root, cubin_dir);
     Plan* p = nullptr;
     {
         std::lock_guard<std::mutex> lock(g_mu);
         auto it = g_plans.find(key);
         if (it == g_plans.end()) {
             auto np = std::make_unique<Plan>();
-            if (auto e = build_plan(*np, batch, n, kin, kout, in_idx, out_idx, sup_in, sup_out,
-                                    gemm, scale, order, int(sign));
+            if (auto e = build_plan(*np, dev, batch, n, kin, kout, in_idx, out_idx, sup_in, sup_out,
+                                    gemm, scale, order, int(sign), std::string(mathdx_root),
+                                    std::string(cubin_dir));
                 e.failure())
                 return e;
             it = g_plans.emplace(key, std::move(np)).first;
@@ -421,6 +647,18 @@ static ffi::Error run(cudaStream_t stream, ffi::ScratchAllocator scratch, ffi::A
                 os << "cuBLAS failed (" << int(s) << ") on axis " << a;
                 return err(os.str());
             }
+        } else if (st.kind == Step::kPair) {
+            long long planes = batch;
+            for (int b = 0; b < d - 2; ++b) planes *= st.in_ext[b];
+            const void* X = src;
+            void* Y = dst;
+            double ar = st.sr, ai = st.si;
+            void* args[] = {&X, &Y, &st.mat, &st.mat2, &planes, &ar, &ai};
+            const unsigned grid = unsigned(std::min<long long>(planes, st.grid));
+            const CUresult cr = nvrtc::driver_api().LaunchKernel(
+                st.fn, grid, 1, 1, unsigned(st.threads), 1, 1, unsigned(st.smem),
+                reinterpret_cast<CUstream>(stream), args, nullptr);
+            if (cr != CUDA_SUCCESS) return err("pair launch: " + nvrtc::cu_err(cr));
         } else if (st.kind == Step::kRemap) {
             launch_remap(src, dst, st.remap, st.sr, st.si, stream);
         } else {
@@ -450,8 +688,21 @@ static ffi::Error run(cudaStream_t stream, ffi::ScratchAllocator scratch, ffi::A
 
 }  // namespace lorrax_ffi::fourier_plan
 
+namespace lorrax_ffi::fourier_plan {
+static ffi::Error run_no_pair(cudaStream_t stream, ffi::ScratchAllocator scratch, ffi::AnyBuffer x,
+                              ffi::Result<ffi::AnyBuffer> y, ffi::Span<const int64_t> n,
+                              ffi::Span<const int64_t> kin, ffi::Span<const int64_t> kout,
+                              ffi::Span<const int64_t> in_idx, ffi::Span<const int64_t> out_idx,
+                              ffi::Span<const int64_t> sup_in, ffi::Span<const int64_t> sup_out,
+                              ffi::Span<const int64_t> gemm, ffi::Span<const double> scale,
+                              ffi::Span<const int64_t> order, int64_t sign) {
+    return run(stream, std::move(scratch), x, y, n, kin, kout, in_idx, out_idx, sup_in, sup_out, gemm, scale,
+               order, sign, "", "");
+}
+}  // namespace lorrax_ffi::fourier_plan
+
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
-    LorraxFourierPlanCudaFfi, lorrax_ffi::fourier_plan::run,
+    LorraxFourierPlanCudaFfi, lorrax_ffi::fourier_plan::run_no_pair,
     xla::ffi::Ffi::Bind()
         .Ctx<xla::ffi::PlatformStream<cudaStream_t>>()
         .Ctx<xla::ffi::ScratchAllocator>()
@@ -468,3 +719,24 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Attr<xla::ffi::Span<const double>>("scale")
         .Attr<xla::ffi::Span<const int64_t>>("order")
         .Attr<int64_t>("sign"));
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(
+    LorraxFourierPlanMathdxCudaFfi, lorrax_ffi::fourier_plan::run,
+    xla::ffi::Ffi::Bind()
+        .Ctx<xla::ffi::PlatformStream<cudaStream_t>>()
+        .Ctx<xla::ffi::ScratchAllocator>()
+        .Arg<xla::ffi::AnyBuffer>()
+        .Ret<xla::ffi::AnyBuffer>()
+        .Attr<xla::ffi::Span<const int64_t>>("n")
+        .Attr<xla::ffi::Span<const int64_t>>("kin")
+        .Attr<xla::ffi::Span<const int64_t>>("kout")
+        .Attr<xla::ffi::Span<const int64_t>>("in_idx")
+        .Attr<xla::ffi::Span<const int64_t>>("out_idx")
+        .Attr<xla::ffi::Span<const int64_t>>("sup_in")
+        .Attr<xla::ffi::Span<const int64_t>>("sup_out")
+        .Attr<xla::ffi::Span<const int64_t>>("gemm")
+        .Attr<xla::ffi::Span<const double>>("scale")
+        .Attr<xla::ffi::Span<const int64_t>>("order")
+        .Attr<int64_t>("sign")
+        .Attr<std::string_view>("mathdx_root")
+        .Attr<std::string_view>("cubin_dir"));

@@ -29,11 +29,11 @@ LEGS = ("xla", "ffi") if jax.default_backend() == "gpu" else ("xla",)
 @pytest.fixture(autouse=True, params=LEGS)
 def leg(request, monkeypatch):
     """Every test runs on each leg the platform has: XLA ops, and on CUDA the
-    one-custom-call leg (the bundle's ``lorrax_fourier_plan``; a library
+    one-custom-call leg (the bundle's ``lorrax_fourier_plan_mathdx``; a library
     without it fails here, never skips)."""
     if request.param == "ffi":
         from ffi.common import ffi_loader
-        ok, why = ffi_loader.probe_target("lorrax_fourier_plan", "CUDA")
+        ok, why = ffi_loader.probe_target("lorrax_fourier_plan_mathdx", "CUDA")
         assert ok, why
     monkeypatch.setattr(fourier_plan, "_default_leg", lambda: request.param)
     return request.param
@@ -340,7 +340,7 @@ def test_contract_refused_by_name():
 
 
 def test_plan_loads_its_cuda_target(monkeypatch):
-    """A plan built where CUDA can lower it probes (loads) lorrax_fourier_plan itself
+    """A plan built where CUDA can lower it probes (loads) lorrax_fourier_plan_mathdx itself
     (finding 5): standalone use must not depend on another factory having loaded it."""
     import ffi.fft as F
     seen = []

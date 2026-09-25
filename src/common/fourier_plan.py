@@ -147,7 +147,7 @@ class LocalFourierPlan:
     ``device_kind`` defaults to the kind of ``mesh``'s first device, else
     ``jax.devices()[0]``'s (it chooses GEMM axes only, never correctness).
     The leg is chosen when the call is lowered, from the platform it is
-    lowered for (``jax.lax.platform_dependent``): one ``lorrax_fourier_plan``
+    lowered for (``jax.lax.platform_dependent``): one ``lorrax_fourier_plan_mathdx``
     custom call on CUDA, XLA ops elsewhere, so a CPU operand in a GPU process
     takes the XLA leg.  Contract on every platform: complex128, at most three
     transform axes (``GATE fourier-plan-contract`` otherwise).
@@ -177,7 +177,7 @@ class LocalFourierPlan:
             raise ValueError(
                 f"GATE fourier-plan-contract: got dtype {self.dtype} over {len(axes)} axes; "
                 "want complex128 over 1 to 3 transform axes; why: the CUDA leg "
-                "(lorrax_fourier_plan) serves exactly that, and the plan keeps one contract "
+                "(lorrax_fourier_plan_mathdx) serves exactly that, and the plan keeps one contract "
                 "on every platform; fix: cast to complex128, or split the transform")
         in_support, out_support = dict(in_support or {}), dict(out_support or {})
         self._gather = None
@@ -311,8 +311,10 @@ class LocalFourierPlan:
     def _call_ffi(self, x):
         """The CUDA leg: the transform axes are moved trailing (free when they
         already are), then one custom call executes the same stages row-major
-        (GEMMs by cuBLAS with the matrix broadcast, the FFT group by cuFFT)."""
-        from ffi.fft import fourier_plan_ffi
+        (GEMMs by cuBLAS with the matrix broadcast, the FFT group by cuFFT; the
+        two trailing axes' GEMMs, back to back, as one cuBLASDx plane kernel
+        when a block fits it on the device)."""
+        from ffi.fft import cubin_cache_dir, fourier_plan_ffi, mathdx_root
         nd = x.ndim
         phys = sorted(a % nd for a in self.axes)
         trailing = list(range(nd - len(phys), nd))
@@ -335,7 +337,8 @@ class LocalFourierPlan:
             sup_out=[int(c[4]) for c in cols],
             gemm=[int(by_pos[p] in gemm_axes) for p in phys],
             scale=[_axis_scale(c[0], self.sign, self.norm) for c in cols], order=order,
-            sign=self.sign)
+            sign=self.sign, **(dict(mathdx_root=mathdx_root(), cubin_dir=cubin_cache_dir())
+                               if len(gemm_axes) >= 2 else {}))
         if phys != trailing:
             y = jnp.moveaxis(y, trailing, phys)
         if self.out_perm is not None:
