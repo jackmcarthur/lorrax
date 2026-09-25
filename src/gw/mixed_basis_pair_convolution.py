@@ -737,9 +737,13 @@ class MixedBasisPairConvolution:
         import time
 
         def mark(name, x, t0):
+            """Stage walls (``timings[name]``, summed over r' chunks; ``timings[name + '_chunks']``
+            per chunk) when the caller asks for them: each stage is then fenced."""
             if timings is not None:
                 jax.block_until_ready(x)
-                timings[name] = timings.get(name, 0.0) + time.perf_counter() - t0
+                dt = time.perf_counter() - t0
+                timings[name] = timings.get(name, 0.0) + dt
+                timings.setdefault(name + "_chunks", []).append(dt)
             return time.perf_counter()
 
         for name, x, ax in (("A", A, self.m_axis[0]), ("C", C, self.m_axis[1])):
