@@ -73,8 +73,8 @@ step 6b), naming the `.so`, the env var, and `docs/environment/overview.md`
 — never a silent demotion. Practical consequence: you must build the FFI
 library before running — `src/ffi/cpp/build_host.sh` (generic host) or
 `config/frontera/build_ffi_host.sh` (Frontera MKL/ScaLAPACK), pointed at by
-`LORRAX_FFI_HOST_SO`; the CUDA library via `config/frontera/build_ffi.sh` and
-`LORRAX_FFI_SO`. Per-knob semantics:
+`LORRAX_FFI_HOST_SO`; the CUDA library from the complete CUDA 13 stack
+(`docs/building_ffi.md`), pointed at by `LORRAX_FFI_SO`. Per-knob semantics:
 
 - `LORRAX_FFT_FFI=0` **refuses**: the XLA flat-k twin inside
   `make_flat_k_fft` was deleted, there is nothing to opt out to (recover the

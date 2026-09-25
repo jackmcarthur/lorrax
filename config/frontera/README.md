@@ -30,30 +30,12 @@ production-certified (2026-07 campaign, scorecard AM-AU).
 | cuSOLVERMp source | NVHPC SDK (+ CAL) | **pip** `nvidia-cusolvermp-cu12` 0.9 (**NCCL-native, no CAL**) |
 | MPI | Cray MPICH | Intel MPI / MVAPICH2-X (host, hybrid-mounted); `module load phdf5` |
 
-## Distributed eigh (cuSOLVERMp) — the built path
+## GPUs: not a target
 
-cuSOLVERMp bootstraps via JAX's KV-store + NCCL (no MPI), so distributed
-`eigh` needs no MPI/IB — single-node 4-GPU aggregates 64 GB for matrices too
-big for one card. NCCL runs over PCIe P2P (intra-socket) / host memory
-(cross-socket); set `CUSOLVERMP_FORCE_NCCL=1`.
-
-```bash
-# On a compute node (apptainer is blocked on login nodes):
-export LORRAX_SIF=$SCRATCH/lorrax_setup/py312.sif
-EXEC="apptainer exec --bind /home1,/work2,/scratch1,/scratch2 $LORRAX_SIF"
-
-$EXEC bash config/frontera/stage_ffi_deps.sh      # once: pip wheels + CUDA root
-$EXEC bash config/frontera/build_ffi.sh --fresh   # build liblorrax_ffi.so
-# 4 ranks x 1 GPU, 2x2 mesh:
-srun -n 4 apptainer exec --nv --bind /home1,/work2,/scratch1,/scratch2 $LORRAX_SIF \
-    bash -lc 'source config/frontera/ffi_env.sh; export CUDA_VISIBLE_DEVICES=$SLURM_LOCALID;
-              $LORRAX_VENV/bin/python tests/bench/cusolvermp_eigh_test.py --grid 2 2'
-```
-`$SCRATCH/lorrax_setup/ffi_build_test.sbatch` wraps all three as one job.
-
-Build flags: `-DLORRAX_FFI_HAVE_CAL=OFF -DLORRAX_FFI_HAVE_PHDF5=OFF`,
-`-DCMAKE_CUDA_ARCHITECTURES=75`, CUDA toolkit assembled from the venv's pip
-`nvidia-*-cu12` packages (see `stage_ffi_deps.sh`).
+The rtx partition's RTX 5000 (Turing sm_75, CUDA 12.2 driver) is below the
+CUDA leg's floor (sm_80 and the complete CUDA 13 stack,
+`docs/architecture/ffi_layout.md`). Frontera builds and runs the CPU leg only
+(`build_ffi_host.sh`).
 
 ## Multi-process CPU runs: collectives on MPI
 
@@ -159,7 +141,7 @@ never `fi_info` (it false-negatives on mlx).
 | `gpu_env.sh` | rtx CUDA env: FFI `.so`, venv nvidia libs, the sm_75 `XLA_FLAGS` that the runtime's `cuda_async` pool needs |
 | `mpi_transport_env.sh` | Intel-MPI transport hygiene, **unconditional**: PMI2 glue, `I_MPI_FABRICS` (default `shm:ofi`; `LORRAX_MPI_FABRICS=shm` = rtx hatch), `LORRAX_MPI_PROVIDER` case-block, UCX setdefaults, `I_MPI_DEBUG` |
 | `ffi_env.sh` | **deprecated back-compat shim**: sources the two above + the `LORRAX_FFI_PHDF5=1` staging block |
-| `stage_ffi_deps.sh` / `build_ffi.sh` | GPU FFI: pip CUDA root staging + `liblorrax_ffi.so` build (in-container) |
+| `stage_ffi_deps.sh` | the venv's pip wheels (cmake, ninja) and the former GPU CUDA root |
 | `build_ffi_host.sh` | CPU host FFI: phdf5 + SLATE/ScaLAPACK `liblorrax_ffi_host.so` |
 | `build_mpiwrapper.sh` + `mpiwrapper/` | the patched MPIwrapper for `impl=mpi` (login node) |
 | `build_mpi_overlay.sh` + `sitecustomize.py` | the mpi4py 4.1.2 / parallel-h5py 3.16.0 PYTHONPATH overlay, pinned + verified (`fetch` on login, `build` in-container) |
