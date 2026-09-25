@@ -91,10 +91,10 @@ def main():
         ref, ks = t._references(c)
         tr = SphereTransport.identity(SphereSet(c["sph"], c["ngk"], c["kfrac"]), ns)
         for backend in ("router", "xla"):
-            for chunks in (None, (3, 4)):
+            for chunks in (None, (3, 4, 2, 1)):
                 conv = t._conv(mesh, c["kgrid"], c["fft_grid"], c["sph"], c["ngk"], c["kfrac"],
                                c["out"], transport=tr, backend=backend, chunks=chunks,
-                               budget_bytes=int(1e10) if chunks is None else int(2e6))
+                               budget_bytes=int(1e10))
                 e = cases.rel(t._run(conv, c["A"], c["C"]), ref)
                 check(f"random ns={ns} {backend} chunks={chunks}",
                       e <= t.TOL and conv.backend == backend,
