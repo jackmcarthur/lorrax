@@ -228,7 +228,6 @@ def sector_tau_factory(left, right, keys, meta, mesh_xy):
                          dtype=jnp.complex128, layout=a.layout)
     convolve = make_lorentz_convolution(mesh_xy, meta.kgrid, meta.nk_tot, keys,
                                         plans[0], plans[1])
-    rows = jnp.asarray(plans[0].parent_full_rows)
 
     def factory(synthesis, band_axis):
         project = contract_bands_block_reshard(mesh_xy, layout=a.layout,
@@ -242,8 +241,7 @@ def sector_tau_factory(left, right, keys, meta, mesh_xy):
                                          band_weight=weight)
             green = build_G_parents(xn, yr, phases=phases, layout=a.layout,
                                     gemm=gemm, k_unfold_plan=plans[0])
-            sigma = convolve(green, interactions)
-            return project(xr, jnp.take(sigma, rows, axis=0), yn)
+            return project(xr, convolve(green, interactions), yn)
 
         b=band_axis.padded
         projector_shapes=(((q,b,m),(q,m,n)),((q,b,n),(q,n,b)))

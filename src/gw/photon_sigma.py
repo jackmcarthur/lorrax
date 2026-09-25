@@ -154,7 +154,7 @@ def _make_photon_static_class_kernel(
                                 layout=layout, gemm=g_plan, k_unfold_plan=plans[0])
         # The prefactor is -1/2 or 1: an exact power of two, applied after the door.
         sigma = factor * convolve(green, interaction)
-        result = project(left.projection_faces()[0], jnp.take(sigma, jnp.asarray(rows), axis=0), right.projection_faces()[1])
+        result = project(left.projection_faces()[0], sigma, right.projection_faces()[1])
         if with_head:
             # The q -> 0 head is a pointwise product on the unfolded Green.
             G = plans[0].unfold_operator(green.G, operator_transpose=green.transpose,

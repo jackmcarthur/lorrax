@@ -25,8 +25,9 @@ glide, a genuine k reduction, a time-reversed row, SU(2) mixing):
   parents-only bundle rotates the carrier's faces with U at the parents'
   rows and equals the rotated full-k faces read at those rows.
 * Σ projection: ``ppm_tau_kernel._make_project_ri_reduce_scatter(k_unfold_plan)``
-  — select the parents' rows of a full-k operator, project with the parent
-  faces, then unfold the final band matrix — equals the full-k face projector on an
+  — project the parents' rows of a full-k operator (the rows the Σ
+  convolution stores) with the parent faces, then unfold the final band
+  matrix — equals the full-k face projector on an
   operator that transforms like a Green function (``plan.unfold_operator``
   of a NON-Hermitian parent operator).  Every face is in the run's packed
   centroid order, the one in-memory order.  The
@@ -208,7 +209,7 @@ def _worker() -> int:
     project = _make_project_ri_reduce_scatter(
         mesh, merged_x=True, layout="face", face_shape=(nk, nb, n_pk, ns),
         k_unfold_plan=plan)
-    projected_parents = jax.jit(project)(psi_nmu_pk, sigma_full, psi_mun_pk)
+    projected_parents = jax.jit(project)(psi_nmu_pk, sigma_full[parent_rows], psi_mun_pk)
     assert projected_parents.shape == (n_parent, nb, nb)
     got = np.asarray(jax.block_until_ready(unfold_file_wedge_band_operator(
         sym_fx, projected_parents, trs_rule="transpose")))

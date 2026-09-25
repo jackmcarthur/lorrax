@@ -266,8 +266,9 @@ def make_lorentz_convolution(mesh_xy: Mesh, kgrid, nk_tot: int, keys, left_plan,
     same) and ``V`` ``(nk, mx, nA, my, nB)`` the class's blocks in k space;
     ``Ĝ`` is its typed unfold, done on the convolution's load
     (``common.fft_helpers.make_kconv_lorentz_unfold``: nvidia-mathdx mode 8 on
-    CUDA).  Σ_k leaves spin-major ``(nk, s, mu, s', nu)``, the face
-    projector's order.
+    CUDA).  Σ_k leaves spin-major ``(n_parent, s, mu, s', nu)`` on the left
+    plan's parent rows (``parent_full_rows``), the face projector's order;
+    the other full-k rows are never stored.
     """
     from ffi import ffi_dial_key
     from common.fft_helpers import make_kconv_lorentz_unfold
@@ -283,6 +284,7 @@ def make_lorentz_convolution(mesh_xy: Mesh, kgrid, nk_tot: int, keys, left_plan,
             mesh_xy, kgrid, tables,
             left_vertices=[gamma_perm_phase_host(A) for A in lefts],
             right_vertices=[gamma_perm_phase_host(B) for B in rights],
+            store_rows=left_plan.parent_full_rows,
             norm='ortho', mult=-1.0 / np.sqrt(float(nk_tot)))
 
         def convolve(parent_green, interactions):

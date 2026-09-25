@@ -16,7 +16,7 @@ reader arriving here can confirm the table without opening the loader.
 #: host-only since the cuFFT strided handler was replaced (same date).
 CUDA_TARGETS = ("lorrax_mathdx_kconv_pair", "lorrax_mathdx_kconv_parent",
                 "lorrax_mathdx_kconv_plane", "lorrax_mathdx_kconv_klead",
-                "lorrax_mathdx_kconv_klead_unfold", "lorrax_mathdx_kconv_klead_lorentz",
+                "lorrax_mathdx_kconv_klead_unfold_rows", "lorrax_mathdx_kconv_klead_lorentz_rows",
                 "lorrax_mathdx_kfft_klead",
                 "lorrax_mathdx_kconv_kminor", "lorrax_mathdx_kfft_kminor")
 
@@ -27,8 +27,8 @@ CUDA_SYMBOLS = {
     "lorrax_mathdx_kconv_parent": "KConvMathdxParentCudaFfi",
     "lorrax_mathdx_kconv_plane":  "KConvMathdxPlaneCudaFfi",
     "lorrax_mathdx_kconv_klead":  "KConvMathdxKleadCudaFfi",
-    "lorrax_mathdx_kconv_klead_unfold": "KConvMathdxKleadUnfoldCudaFfi",
-    "lorrax_mathdx_kconv_klead_lorentz": "KConvMathdxKleadLorentzCudaFfi",
+    "lorrax_mathdx_kconv_klead_unfold_rows": "KConvMathdxKleadUnfoldRowsCudaFfi",
+    "lorrax_mathdx_kconv_klead_lorentz_rows": "KConvMathdxKleadLorentzRowsCudaFfi",
     "lorrax_mathdx_kfft_klead":   "KFftMathdxKleadCudaFfi",
     "lorrax_mathdx_kconv_kminor": "KConvMathdxKminorCudaFfi",
     "lorrax_mathdx_kfft_kminor":  "KFftMathdxKminorCudaFfi",

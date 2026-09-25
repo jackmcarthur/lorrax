@@ -98,7 +98,7 @@ def _make_project_ri_reduce_scatter(
     layout: str = "face", face_shape=None, face_band_extent=None,
     k_unfold_plan=None,
 ) -> Callable[..., jax.Array]:
-    """Project raw-parent rows; the completed frequency sum owns the band unfold."""
+    """Project Σ on the raw-parent rows (``(n_parent, ns, μ, ns, ν)`` in); the completed frequency sum owns the band unfold."""
     from common.contract_bands import contract_bands_block_reshard
 
     if k_unfold_plan is None or face_shape is None:
@@ -111,13 +111,7 @@ def _make_project_ri_reduce_scatter(
         mesh_xy, channels="none", layout=layout,
         face_shape=(k_unfold_plan.n_parent, *face_shape[1:]),
         face_band_extent=face_band_extent)
-    k_rows = np.asarray(k_unfold_plan.parent_full_rows, dtype=np.int32)
-
-    def project(psi_xr, sigma_k, psi_yn):
-        sigma_parent = jnp.take(sigma_k, jnp.asarray(k_rows), axis=0)
-        return inner(psi_xr, sigma_parent, psi_yn)
-
-    return project
+    return inner
 
 
 class SpatialKernel(NamedTuple):
@@ -178,6 +172,7 @@ def get_sigma_spatial_kernel(
     if k_unfold_plan is None:
         raise ValueError("Sigma spatial kernel requires the typed parent unfold plan.")
     unfold_conv = make_kconv_klead_unfold(mesh_xy, kgrid, k_unfold_plan.unfold_load_tables(),
+                                          store_rows=k_unfold_plan.parent_full_rows,
                                           norm='ortho', mult=-1.0 / np.sqrt(float(nk_tot)))
     project = _make_project_ri_reduce_scatter(
         mesh_xy, merged_x=merged_x, layout=layout, face_shape=face_shape,
@@ -190,10 +185,11 @@ def get_sigma_spatial_kernel(
 
     @partial(jax.jit, donate_argnums=(2,))
     def conv_project(psi_proj_xr, psi_proj_yn, G_parents, W_prep):
-        # Raw-parent Green in, spin-major full-k Σ_k out: the typed unfold,
-        # spin action and reorder are the convolution's load.
-        sigma_k = unfold_conv(G_parents.G, G_parents.transpose, W_prep)
-        return project(psi_proj_xr, sigma_k, psi_proj_yn)
+        # Raw-parent Green in, spin-major Σ_k out on the parent rows only: the
+        # typed unfold, spin action and reorder are the convolution's load,
+        # and the other full-k rows are never stored.
+        sigma_parent = unfold_conv(G_parents.G, G_parents.transpose, W_prep)
+        return project(psi_proj_xr, sigma_parent, psi_proj_yn)
     if not _stage_timing_enabled():
         pair = SpatialKernel(prep_w=prep_w, conv_project=conv_project)
         _sigma_spatial_kernel_cache[key] = pair
@@ -267,6 +263,7 @@ def _sigma_spin_pair_stream(*, mesh_xy, kgrid, layout, face_shape,
         mesh_xy, merged_x=True, layout=layout, face_shape=(n_full, nb, mu, 1),
         face_band_extent=face_band_extent, k_unfold_plan=k_unfold_plan)
     irr = np.asarray(k_unfold_plan.irr_idx, dtype=np.int32)
+    parent_rows = np.asarray(k_unfold_plan.parent_full_rows, dtype=np.int32)
 
     def stream(psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
                E_A, sel, E_min, E_max, E_ref_A, t_node, W_prep):
@@ -283,7 +280,8 @@ def _sigma_spin_pair_stream(*, mesh_xy, kgrid, layout, face_shape,
             left, right = spin_pair_rows(psi_mun, psi_nmu, index, ns)
             G_ab = build_G(left, right, phases=phases, layout=pair_layout,
                            gemm=pair_plan, band_range=(jnp.minimum(lo, hi), hi))
-            S_ab = kconv.apply(sigma_conv_operand(G_ab), W_prep)
+            S_ab = jnp.take(kconv.apply(sigma_conv_operand(G_ab), W_prep),
+                            jnp.asarray(parent_rows), axis=0)
             proj_left = jax.lax.dynamic_slice_in_dim(psi_proj_xr, index // ns, 1, axis=2)
             proj_right = jax.lax.dynamic_slice_in_dim(psi_proj_yn, index % ns, 1, axis=1)
             return project(proj_left, S_ab, proj_right)
