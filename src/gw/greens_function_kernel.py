@@ -362,13 +362,10 @@ def sigma_spin_block(*, n_parent, n_rmu, ns, mesh, partner_tiles):
 
 
 def _device_target_bytes(ns: int) -> float:
-    """The agreed per-process device target: the minimum process budget times the spinor's
-    fragmentation utilization (the one target the Green-side planners share)."""
-    from common.gpu_utils import (bfc_fragmentation_target_utilization,
-                                  get_device_memory_gb,
-                                  minimum_process_budget_gb)
-    return (minimum_process_budget_gb(get_device_memory_gb()) * 1e9
-            * bfc_fragmentation_target_utilization(int(ns)))
+    """The run's device budget (``memory_per_device_gb``) times the spinor's fragmentation
+    utilization: the target the Green-side planners share."""
+    from common.gpu_utils import bfc_fragmentation_target_utilization, device_budget_bytes
+    return device_budget_bytes() * bfc_fragmentation_target_utilization(int(ns))
 
 
 def chi_valence_chunks(*, n_parent, n_rmu, ns, n_full, n_out, n_val, mesh, partner):

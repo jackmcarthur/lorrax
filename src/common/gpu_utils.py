@@ -88,6 +88,69 @@ def minimum_process_budget_gb(local_gb: float) -> float:
     return float(np.min(budgets))
 
 
+# ============================================================================
+# The run's device budget: ONE number every planner prices against
+# ============================================================================
+
+#: The run's per-device budget in decimal GB, set once when the deck's
+#: ``memory_per_device_gb`` resolves (``gw.gw_config``); None until then.
+_RUN_DEVICE_BUDGET_GB: float | None = None
+
+
+def set_device_budget_gb(gb: float) -> None:
+    """Record the run's per-device budget (``memory_per_device_gb``, decimal GB).
+
+    Called once by the config when the deck value (or the collective
+    auto-detection, when the deck says 0) resolves; every later planner reads
+    it through :func:`device_budget_bytes`.
+    """
+    global _RUN_DEVICE_BUDGET_GB
+    value = float(gb)
+    if not value > 0:
+        raise ValueError(f"the device budget must be positive GB, got {gb!r}")
+    _RUN_DEVICE_BUDGET_GB = value
+
+
+def device_budget_bytes() -> float:
+    """THE per-device budget in bytes (1 GB = 1e9 B) every planner prices against.
+
+    ``memory_per_device_gb`` as the config resolved it: the deck's value, or
+    the collective auto-detection (:func:`get_device_memory_gb`, agreed across
+    processes) when the deck gives none.  A caller that has not resolved a
+    config (a tool, a unit test) gets that auto-detection directly; every
+    process must then enter this call.
+    """
+    if _RUN_DEVICE_BUDGET_GB is not None:
+        return _RUN_DEVICE_BUDGET_GB * 1e9
+    return minimum_process_budget_gb(get_device_memory_gb()) * 1e9
+
+
+def device_room_bytes(*, pool_fraction: float = 1.0) -> int:
+    """Bytes a stage may still claim now: the budget less the live bytes in use,
+    the minimum over processes (every process must enter).
+
+    ``pool_fraction`` further caps it at that fraction of the allocator's free
+    pool when the budget exceeds the pool.  A backend without pool statistics
+    (CPU) reports the whole budget.
+    """
+    import jax
+    import numpy as np
+    from common.collectives import all_gather_processes
+
+    room = device_budget_bytes()
+    try:
+        st = jax.local_devices()[0].memory_stats() or {}
+    except Exception:                                          # noqa: BLE001
+        st = {}
+    in_use = float(st.get("bytes_in_use", 0))
+    room -= in_use
+    limit = st.get("bytes_limit")
+    if limit:
+        room = min(room, float(pool_fraction) * (float(limit) - in_use))
+    local = np.asarray(int(max(room, 0.0)), dtype=np.int64)
+    return int(np.min(all_gather_processes(local)))
+
+
 def _query_nvidia_smi_memory(field: str) -> int | None:
     """Query this rank's visible GPU memory field, returned in bytes."""
     try:

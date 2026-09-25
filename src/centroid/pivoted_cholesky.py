@@ -1563,10 +1563,10 @@ def build_gram_q0_via_loadwfns(
     # is using.
     if memory_per_device_gb is None or memory_per_device_gb <= 0:
         try:
-            from common.gpu_utils import get_device_memory_gb
-            memory_per_device_gb = float(get_device_memory_gb())
+            from common.gpu_utils import device_budget_bytes
+            memory_per_device_gb = float(device_budget_bytes()) / 1e9
         except Exception:
-            memory_per_device_gb = 0.0  # the loader then asks get_device_memory_gb
+            memory_per_device_gb = 0.0  # the loader then asks the device
     meta.memory_per_device_gb = minimum_process_budget_gb(memory_per_device_gb)
 
     # Prune must not retain the full-k G-flat WFN beside both final centroid

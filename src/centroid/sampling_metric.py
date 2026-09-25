@@ -337,8 +337,8 @@ def build_feature_metric_diagonal(
     union_lo = min(left_range[0], right_range[0])
     union_hi = max(left_range[1], right_range[1])
     try:
-        from common.gpu_utils import get_device_memory_gb
-        device_memory_bytes = int(float(get_device_memory_gb()) * 1e9)
+        from common.gpu_utils import device_budget_bytes
+        device_memory_bytes = int(device_budget_bytes())
     except Exception:
         device_memory_bytes = None
     k_chunk, band_chunk, budget = _metric_chunk_plan(

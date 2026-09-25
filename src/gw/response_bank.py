@@ -1110,12 +1110,8 @@ def integrate_response_group(wfns, meta, mesh_xy, rules, group, *, q_ids,
     return raw
 
 
-def _stream_workspace(wfns, meta, mesh_xy, support, *, q_ids, n_outputs, ordered, vertex):
-    """Compiled temporaries of the group stream; nothing is allocated.
-
-    Lowered with the production shapes, so the first group's dispatch reuses
-    this compilation when every sample fits in one group.
-    """
+def _stream_temp_bytes(wfns, meta, mesh_xy, support, *, q_ids, n_outputs, ordered, vertex):
+    """Compiled temporaries of the group stream at ``n_outputs``; nothing is allocated."""
     import minimax
     n = meta.mu_basis.n_packed if vertex is None else vertex[0][0].shape[2]
     kernel, fixed = response_stream(wfns, meta, mesh_xy=mesh_xy, q_ids=q_ids,
@@ -1129,11 +1125,24 @@ def _stream_workspace(wfns, meta, mesh_xy, support, *, q_ids, n_outputs, ordered
                 jax.ShapeDtypeStruct((2,), jnp.float64),
                 jax.ShapeDtypeStruct((n_outputs, len(q_ids), n, n), jnp.complex128,
                     sharding=NamedSharding(mesh_xy, P(None, None, "x", "y"))))
-    with timing.section('bank.compile.direct', announce=True):
-        memory = kernel.lower(*abstract).compile().memory_analysis()
+    memory = kernel.lower(*abstract).compile().memory_analysis()
     if memory is None:
         raise ValueError("GATE response_capacity: compiled memory unavailable")
     return int(memory.temp_size_in_bytes)
+
+
+def _stream_workspace(wfns, meta, mesh_xy, support, *, q_ids, ordered, vertex):
+    """``workspace(g)``: the group stream's compiled temporaries for a group of ``g``
+    samples (two outputs each), from probes at one and two samples fitted linearly.
+
+    The stream is never lowered at every sample at once: that module is the size the
+    planner exists to avoid (a 204 GB advisory on Fe 8^3 against a 74 GB budget)."""
+    probe = partial(_stream_temp_bytes, wfns, meta, mesh_xy, support, q_ids=q_ids,
+                    ordered=ordered, vertex=vertex)
+    with timing.section('bank.compile.direct', announce=True):
+        one, two = probe(n_outputs=2), probe(n_outputs=4)
+    slope = max(0, two - one)
+    return lambda g: int(one + slope * (int(g) - 1))
 
 
 def response_group_size(meta, mesh_xy, *, n_samples, carry_per_sample, stream_workspace):
@@ -1142,10 +1151,11 @@ def response_group_size(meta, mesh_xy, *, n_samples, carry_per_sample, stream_wo
     One route and no dial: every sample in one group when it fits (symmetric
     decks), otherwise the largest group that does (about four on a
     two-component deck without q symmetry, where the carry is G/2 Green tiles).
+    ``stream_workspace(g)`` prices the compiled temporaries of a ``g``-sample group.
     """
     ledger = meta.shared_pole_capacity
     fits = lambda g: ledger.preview(resident_bytes_per_rank=g*carry_per_sample,
-        workspace_bytes_per_rank=stream_workspace,
+        workspace_bytes_per_rank=stream_workspace(g),
         concurrent_with=ledger.live_stages)["device_budget_status"] == "PASS"
     if not fits(1):
         return 1   # admission refuses with the actual compiled bytes
@@ -1224,10 +1234,10 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
             mesh_xy=mesh_xy,n=n,photon=vertex is not None)
         support = response_support(wfns, meta, sample_plan, receipt, print_fn=print_fn)
         ledger.live_stages = ambient
-        # Price the stream once at "every sample in one group"; the compiled
-        # temporaries do not grow with the group, only the donated carry does.
+        # Price the stream's temporaries per group size from two small probes;
+        # the donated carry grows with the group as well.
         workspace = _stream_workspace(wfns, meta, mesh_xy, support, q_ids=response_rows,
-            n_outputs=2*len(z), ordered=ordered, vertex=vertex)
+            ordered=ordered, vertex=vertex)
         group_size = response_group_size(meta, mesh_xy, n_samples=len(z),
             carry_per_sample=carry_per_sample, stream_workspace=workspace)
         rules = response_quadrature(meta, sample_plan, receipt, support,
