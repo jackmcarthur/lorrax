@@ -2206,7 +2206,7 @@ def _read_static_photon_body(
         if reader.n_q_total != nq:
             raise ValueError("Photon V and response disagree on q-IBZ extent.")
         layout = PhotonBasisLayout.from_centroid_extents(
-            plans[0].n_centroid_packed, plans[1].n_centroid_packed, mesh_xy)
+            plans[0].n_centroid_logical, plans[1].n_centroid_logical, mesh_xy)
         V_packed = pack_photon_operator(
             lambda A, B: None if (A, B) in ZERO_TILES else reader.get_tile(A, B),
             nq, layout, mesh_xy)
