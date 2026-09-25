@@ -364,10 +364,22 @@ def screened_sphere_set(*, fft_grid, psi: SphereSet, bvec, q_frac, ecutwfc: floa
 
     Refuses ``GATE screened-coulomb-cutoff`` at or above the box's measured alias cap
     (``screened_coulomb_cutoff_cap``).  The sphere is ``common.coulomb_sphere``'s
-    ``|q + G|² ≤ cutoff`` in its padded layout."""
+    ``|q + G|² ≤ cutoff`` in its padded layout, with the cutoff moved to the middle of
+    the gap of the |q + G|² spectrum (over the ``q_frac`` rows) it falls in: a shell
+    within 1e-9 of the cutoff is kept, and every row's sphere holds whole shells, so the
+    rotated images of a sphere agree on membership (the wedge's G tables need that)."""
     from common.coulomb_sphere import compute_per_q_bare_coulomb_components
+    from vcoul import fft_box_miller
     cut = float(ecutwfc if screened_coulomb_cutoff is None else screened_coulomb_cutoff)
     cap = screened_coulomb_cutoff_cap(fft_grid, psi, bvec=bvec, q_frac=q_frac)
+    if 0.0 < cut < cap:
+        _, G = fft_box_miller(tuple(int(v) for v in fft_grid))
+        b = np.asarray(bvec, np.float64)
+        e = np.unique(np.concatenate([np.sum(((qi[None, :] + G) @ b) ** 2, axis=1)
+                                      for qi in np.asarray(q_frac, np.float64)]))
+        j = int(np.searchsorted(e, cut * (1.0 + 1e-9), side="right"))
+        if 0 < j < e.size:
+            cut = 0.5 * (e[j - 1] + e[j])
     if not 0.0 < cut < cap:
         raise ValueError(
             f"GATE screened-coulomb-cutoff: got {cut:g} Ry ({cut / ecutwfc:.3f}·ecutwfc); want "

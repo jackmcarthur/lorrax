@@ -169,7 +169,8 @@ def main():
     # ---- the r'-column wedge on covariant operands ---------------------------
     import zeta_mubatch_fixtures as fixtures
     wcases = []
-    fxg = fixtures._glide_fixture(mesh, np.random.default_rng(2), 2, translated_anti=True)
+    fxg = fixtures._glide_fixture(mesh, np.random.default_rng(2), 2, translated_anti=True,
+                                  theta=np.pi / 2)     # a spin representation: glide² = E
     cg = t.covariant_case(fxg, ecut=1.3, metric=np.eye(3), box=(6, 6, 5))
     wcases += [("glide ns=2 full group", cg, (0, 1, 2, 3), ("no_wrap",)),
                ("glide ns=2 {E, anti glide}", cg, (0, 3), ("no_conj",))]

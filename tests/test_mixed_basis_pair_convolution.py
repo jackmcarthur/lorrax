@@ -250,6 +250,7 @@ def test_glide_parents_equal_full_grid(ns, backend):
 def covariant_case(fx, *, ecut, metric, box, nb=4, seed=7, complex_weights=False):
     """Parent ψ closed under each parent's little group (``close_under_little_groups``), so the
     Greens are covariant under the whole group; the full grid through the r-space action.
+    The spin actions must form a representation (the glide fixture at θ = π/2).
     ``out_full``: the output sphere at every full-grid q (the wedge's middle rows)."""
     from common.gvec_fft_box import build_sphere_box_index
     plan = fx["plan"]
@@ -328,7 +329,8 @@ def test_wedge_glide_equals_dense(backend, rows, twins):
     """Glide group, n_s = 2, spin mixing: the full group (unitary rows kept per spatial part) and
     {E, Θ·glide} (the antiunitary branch carries every non-identity column)."""
     mesh = _mesh(4)
-    fx = fixtures._glide_fixture(mesh, np.random.default_rng(2), 2, translated_anti=True)
+    fx = fixtures._glide_fixture(mesh, np.random.default_rng(2), 2, translated_anti=True,
+                                   theta=np.pi / 2)
     c = covariant_case(fx, ecut=1.3, metric=np.eye(3), box=(6, 6, 5))
     r = _wedge_check(mesh, c, backend, rows, twins=twins)
     assert r["ref"] <= TOL and r["dense"] <= TOL and r["dense_ref"] <= TOL, r
@@ -358,7 +360,8 @@ def test_wedge_acubic_equals_dense(backend):
 def test_wedge_partners_unitary_only(n_mesh):
     """Complex weights with transposed partners: the unitary rows are exact, antiunitary rows refuse."""
     mesh = _mesh(n_mesh)
-    fx = fixtures._glide_fixture(mesh, np.random.default_rng(2), 2, translated_anti=True)
+    fx = fixtures._glide_fixture(mesh, np.random.default_rng(2), 2, translated_anti=True,
+                                   theta=np.pi / 2)
     c = covariant_case(fx, ecut=1.3, metric=np.eye(3), box=(6, 6, 5), complex_weights=True)
     r = _wedge_check(mesh, c, "xla", (0, 1))
     assert r["ref"] <= TOL and r["dense"] <= TOL, r
@@ -369,7 +372,8 @@ def test_wedge_partners_unitary_only(n_mesh):
 def test_wedge_census_and_chunks():
     """The rebuild compiles to no collective; forced r'/batch/k/q chunks on the wedge agree."""
     mesh = _mesh(4)
-    fx = fixtures._glide_fixture(mesh, np.random.default_rng(2), 2, translated_anti=True)
+    fx = fixtures._glide_fixture(mesh, np.random.default_rng(2), 2, translated_anti=True,
+                                   theta=np.pi / 2)
     c = covariant_case(fx, ecut=1.3, metric=np.eye(3), box=(6, 6, 5))
     r = _wedge_check(mesh, c, "xla", (0, 1, 2, 3))
     census = r["conv"].collective_census()
@@ -385,3 +389,26 @@ def test_wedge_census_and_chunks():
                                 c["fft_grid"], *c["out"])
     assert tight.chunks.n_c == 2 and tight.n_batch >= 2, tight.describe()
     assert cases.rel(_run(tight, c["A_par"], c["C_par"]), ref) <= TOL
+
+
+def test_screened_sphere_set_and_alias_cap():
+    """``screened_coulomb_cutoff``: the default is ecutwfc, the sphere is |q+G|² ≤ cutoff on whole
+    shells, and a cutoff at or above the box's measured alias cap refuses by name."""
+    from gw.mixed_basis_pair_convolution import (SphereSet, alias_free_margin,
+                                                screened_coulomb_cutoff_cap, screened_sphere_set)
+    c = random_case(1, kgrid=(2, 2, 2), fft_grid=(8, 8, 8))
+    psi = SphereSet(c["sph"], c["ngk"], c["kfrac"])
+    ecut = 1.3
+    cap = screened_coulomb_cutoff_cap((8, 8, 8), psi, bvec=np.eye(3), q_frac=c["kfrac"])
+    s = screened_sphere_set(fft_grid=(8, 8, 8), psi=psi, bvec=np.eye(3), q_frac=c["kfrac"], ecutwfc=ecut)
+    want, wngk = cases.spheres(c["kfrac"], np.eye(3), ecut, span=4)
+    for i in range(len(c["kfrac"])):
+        assert {tuple(g) for g in s.gvecs[i, :s.ngk[i]]} == {tuple(g) for g in want[i, :wngk[i]]}
+    below = screened_sphere_set(fft_grid=(8, 8, 8), psi=psi, bvec=np.eye(3), q_frac=c["kfrac"],
+                                ecutwfc=ecut, screened_coulomb_cutoff=0.999 * cap)
+    m = alias_free_margin((8, 8, 8), *(psi.recentred().union_support(),) * 2,
+                          below.recentred().union_support())
+    assert np.all(m >= 1), m
+    with pytest.raises(ValueError, match="GATE screened-coulomb-cutoff"):
+        screened_sphere_set(fft_grid=(8, 8, 8), psi=psi, bvec=np.eye(3), q_frac=c["kfrac"],
+                            ecutwfc=ecut, screened_coulomb_cutoff=1.0001 * cap)
