@@ -2896,6 +2896,35 @@ def _sc_sampled_support(inputs, partition, energies_loop, mu_ev):
     return sampled_grid, expanded_grid, energy_relative_ev, required_kn
 
 
+def _sigma_frame_mu_ev(inputs, E_full_ry, efermi_ry, occupation_state):
+    """The E_F the Sigma build measures its omega grid from, in eV.
+
+    Grid growth and the tail mask must judge coverage in THIS frame.  The
+    GN/HL-PPM Sigma is built about the current spectrum's VBM or midgap
+    (``ppm_sigma.ppm_fermi_frame`` on the step occupations the QP bundle
+    gets at ``efermi_ry``), which on MoS2 3x3 QSGW sat 1.4 eV above the
+    DFT midgap the partition uses; judged in the partition frame, a state
+    the grid "covered" still read Sigma(0), and the growth that finally
+    covered it moved its map output 2.8 eV (CLAIMS 2725).  MPA measures
+    from ``gw.efermi.resolve_sigma_efermi_ry``.
+    """
+    config = inputs.config
+    if config.compute_mode.ppm_model is not None:
+        from .ppm_sigma import ppm_fermi_frame
+        if efermi_ry is None:
+            raise ValueError("the PPM Sigma frame needs this map's occupation step")
+        e = jnp.asarray(E_full_ry, dtype=jnp.float64)
+        frame = ppm_fermi_frame(
+            e, (e < float(efermi_ry)).astype(jnp.float64),
+            jnp.asarray(config.sigma.fermi_reference == "midgap"))
+        return float(jax.device_get(frame)) * RYD_TO_EV
+    from .efermi import resolve_sigma_efermi_ry
+    ref_ry, _ = resolve_sigma_efermi_ry(
+        config.sigma.fermi_reference, occupation_state=occupation_state,
+        wfn=inputs.wfn)
+    return float(ref_ry) * RYD_TO_EV
+
+
 def _fit_sum_band_tail(fit_kwargs, fit_mask_kn, sigma0_kn, z_kn=None):
     """Owner ruling 2026-09-24: the sum-band tail law averages only states
     that consume Sigma(E_nk).  A state off the sampled grid this map
@@ -3390,7 +3419,10 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     # below uses and qsgw_utils.omega_coverage, the classification
     # build_qsgw_sigma_xc reads (sigma_eval_omega).  The tail law excludes it.
     from .qsgw_utils import omega_coverage
-    sc_support = _sc_sampled_support(inputs, partition, energies_loop, _mu_ev)
+    sc_support = (None if not inputs.config.compute_mode.is_dynamic else
+                  _sc_sampled_support(inputs, partition, energies_loop, _sigma_frame_mu_ev(
+                      inputs, E_full, efermi_ry,
+                      entry_occ_state if inputs.material_class == "metal" else None)))
     sigma0_kn = (np.zeros(energies_loop.shape, dtype=bool) if sc_support is None
                  else ~omega_coverage(sc_support[1], sc_support[2])[0])
 
