@@ -3164,16 +3164,6 @@ def prepare_isdf_and_wavefunctions(
 	        sym, tensors_filename, tmp_dir, transverse_basis_receipt, wfn)
 	if green_parent_carrier is not None:
 		wfns = replace(wfns, green_parent=green_parent_carrier)
-	from .wavefunction_bundle import band_complete_gw_carriers
-	_face_carrier = green_parent_carrier
-	wfns, wfns_transverse = band_complete_gw_carriers(
-		(wfns, wfns_transverse), budget_bytes=float(cfg.memory.per_device_gb) * 1e9,
-		print_fn=print0)
-	if green_parent_carrier is not None:
-		green_parent_carrier = wfns.green_parent
-	if sigma_parent_carrier is _face_carrier and _face_carrier is not None:
-		sigma_parent_carrier = wfns.green_parent
-	del _face_carrier
 	for family, bundle in (("charge", wfns), ("current", wfns_transverse)):
 		if bundle is None or bundle.green_parent is None:
 			continue
