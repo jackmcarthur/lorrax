@@ -291,17 +291,47 @@ def sphere_to_union_box(psi: jax.Array, compact_index: jax.Array, box) -> jax.Ar
         psi.shape[:3] + tuple(int(b) for b in box))
 
 
-def union_box_to_sphere(box: jax.Array, compact_index: jax.Array) -> jax.Array:
-    """Union box ``(n_k, ..., Kx, Ky, Kz)`` → sphere ``(n_k, ..., ngk)``.
-
-    The inverse of :func:`sphere_to_union_box` on each k's cells: slot ``g``
-    reads the box's flat cell ``compact_index[k, g]``; a pad slot (out of
-    the box) reads 0.  One gather on the small box.
+def box_to_sphere(box: jax.Array, index: jax.Array) -> jax.Array:
+    """Box ``(n_k, ..., Bx, By, Bz)`` → sphere ``(n_k, ..., ngk)``: slot ``g``
+    reads the box's flat C-order cell ``index[k, g]``; a pad slot (out of the
+    box) reads 0.  The union box with its compact index, or the grid with the
+    sphere index: one gather either way.
     """
     flat = box.reshape(box.shape[:-3] + (-1,))
-    idx = compact_index.reshape((compact_index.shape[0],) + (1,) * (flat.ndim - 2)
-                                + (compact_index.shape[-1],))
+    idx = index.reshape((index.shape[0],) + (1,) * (flat.ndim - 2) + (index.shape[-1],))
     return jnp.take_along_axis(flat, idx, axis=-1, mode='fill', fill_value=0)
+
+
+def sphere_transforms(fft_grid, supports, *, mesh, norm: str = "ortho"):
+    """ψ(G) sphere ↔ grid for spheres that share one union box, as
+    ``(to_r, to_sphere)``.
+
+    ``to_r(psi (n_k, nb, ns, ngk), compact, cells)`` is the inverse transform
+    onto the grid ``(n_k, nb, ns, *grid)``; ``to_sphere(phi (n_k, ..., *grid),
+    compact, cells)`` the forward one back onto each k's sphere; ``compact``
+    and ``cells`` ``(n_k, ngk)`` are the union-box and grid cells of every
+    slot (:func:`union_box_tables`, the loader's sphere index).  Chosen once,
+    from ``LocalFourierPlan``'s axis choice for the box on this mesh's
+    device: when a supported axis takes the stored-matrix GEMM the sphere goes
+    through the union box and the plans embed and restrict (the zero grid is
+    never written); when none does, the union box would only add a gather,
+    so the sphere is gathered into the grid around one FFT each way.
+    """
+    from common.fft_helpers import local_fftn3, local_ifftn3
+    from common.fourier_plan import LocalFourierPlan
+    grid = tuple(int(n) for n in fft_grid)
+    axes = (-3, -2, -1)
+    sup = dict(zip(axes, supports))
+    inv = LocalFourierPlan(grid, axes, sign=1, norm=norm, in_support=sup, mesh=mesh)
+    if any(kind == "gemm" for _, kind, _, _ in inv.stages):
+        fwd = LocalFourierPlan(grid, axes, sign=-1, norm=norm, out_support=sup, mesh=mesh)
+        shape = tuple(int(s.size) for s in supports)
+        return (lambda psi, compact, cells: inv(sphere_to_union_box(psi, compact, shape)),
+                lambda phi, compact, cells: box_to_sphere(fwd(phi), compact))
+    return (lambda psi, compact, cells: local_ifftn3(
+                _box_kernel(psi, cells, fft_grid=grid), axes=axes, norm=norm),
+            lambda phi, compact, cells: box_to_sphere(
+                local_fftn3(phi, axes=axes, norm=norm), cells))
 
 
 def _sphere_gather(box: jax.Array, sphere_index: jax.Array) -> jax.Array:

@@ -109,9 +109,11 @@ k's sphere sits in one static box, the spheres' per-axis union
 index (nothing memoises a device G-index, the ``UnexpectedTracerError`` of
 job 7888526), and two ``LocalFourierPlan`` s take it to the grid
 (``in_support``) and back onto the box (``out_support``), one gather
-returning the sphere.  On a device whose row takes the supported axes as
-GEMMs the zero box is never written (A100: the fused plane pair on
-Fe-like boxes); elsewhere the plan's FFT group runs.  The whole sweep is one
+returning the sphere, when the device's row takes a supported axis as a
+GEMM (A100; the zero grid is never written, and Fe-like boxes run the fused
+plane pair).  Where no axis does, the union box would only add a gather:
+the sphere is gathered into the grid around one FFT each way
+(``wfn_transforms.sphere_transforms`` makes the choice once).  The whole sweep is one
 ``jax.jit`` cached in ``_KERNEL_CACHE``, keyed on shapes, plan, mesh, the
 union box and the operator's structural identity.
 """
@@ -131,8 +133,8 @@ from common import timing
 # deleted on 2026-09-02; this module now spells only the band-sphere
 # layout, still through the wfn_layout owner.
 from common.wfn_layout import band_sphere_spec
-from common.wfn_transforms import (_cached_jit, _sharding_key, sphere_to_union_box,
-                                   union_box_tables, union_box_to_sphere)
+from common.wfn_transforms import (_cached_jit, _sharding_key, sphere_transforms,
+                                   union_box_tables)
 from runtime.padding import pad_axis
 
 
@@ -220,32 +222,25 @@ class SweepGeometry:
 # ---------------------------------------------------------------------------
 
 class SphereBox(NamedTuple):
-    """This k's sphere in the spheres' union box (``wfn_transforms.union_box_tables``).
+    """This k's sphere, as a band-layout FFT operator receives it.
 
-    ``index`` ``(1, ngkmax)`` i32 is the flat union-box cell of each G slot
-    (pads out of the box, so a gather reads 0); ``supports`` the box's three
-    per-axis grid index sets, static.  A band-layout FFT operator gathers the
-    sphere into this box and lets ``LocalFourierPlan`` embed it into the grid
-    (``in_support``) and restrict the result back (``out_support``): the
-    supported-axis GEMMs or the FFT group, whichever the device's row takes.
+    ``index`` ``(1, ngkmax)`` i32: each G slot's cell in the spheres' union
+    box (``wfn_transforms.union_box_tables``; pads out of the box); ``cells``
+    ``(1, ngkmax)`` i32: its grid cell (the loader's sphere index; pads out
+    of the grid); ``supports``: the union box's three per-axis index sets,
+    static.  :meth:`transforms` gives the 'ortho' ψ(G) → grid inverse and
+    grid → ψ(G) forward (``wfn_transforms.sphere_transforms``: through the
+    union box when the device's row takes a supported axis as a GEMM, else
+    one grid gather around one FFT each way).
     """
     index: jax.Array
+    cells: jax.Array
     supports: tuple
 
-    @property
-    def shape(self) -> tuple:
-        return tuple(int(s.size) for s in self.supports)
-
-    def plans(self, geom: "SweepGeometry"):
-        """``(to_r, to_g)``: the 'ortho' inverse from the box onto the grid
-        and the 'ortho' forward from the grid back onto the box."""
-        from common.fourier_plan import LocalFourierPlan
-        axes = (-3, -2, -1)
-        sup = dict(zip(axes, self.supports))
-        return (LocalFourierPlan(geom.fft_grid, axes, sign=1, norm="ortho",
-                                 in_support=sup, mesh=geom.mesh),
-                LocalFourierPlan(geom.fft_grid, axes, sign=-1, norm="ortho",
-                                 out_support=sup, mesh=geom.mesh))
+    def transforms(self, geom: "SweepGeometry"):
+        to_r, to_sphere = sphere_transforms(geom.fft_grid, self.supports, mesh=geom.mesh)
+        return (lambda psi: to_r(psi, self.index, self.cells),
+                lambda phi: to_sphere(phi, self.index, self.cells))
 
 
 class Operator(NamedTuple):
@@ -268,7 +263,7 @@ class Operator(NamedTuple):
     and returns ``(1, nb/P, ns, ngkmax)`` — or, when ``ncomp > 0``,
     ``(1, nb/P, ns, ngkmax, ncomp)``.  The sweep all-to-alls that ket to
     the G-split layout.  Anything transforming must stay device-local (it
-    already runs per rank): ``box.plans(geom)`` gives the union-box plans.
+    already runs per rank): ``box.transforms(geom)`` gives them.
 
     ``apply_g`` — G-SPLIT layout, for an operator diagonal in G (T, p,
     Dirac α).  Called per k on this rank's G slab of EVERY band:
@@ -397,7 +392,7 @@ def local_potential_operator(
 
     BAND layout (``Operator.apply``): the round trip needs every G of a
     band, and the sweep's ``shard_map`` hands this rank whole bands, so the
-    transforms are device-local (the union-box plans, :class:`SphereBox`)
+    transforms are device-local (:class:`SphereBox`)
     and no FFT is ever distributed.  Only the two union-box gathers touch G,
     and both take their index as a traced operand.
 
@@ -437,10 +432,8 @@ def local_potential_operator(
             f"{tuple(int(s) for s in V_r_j.shape)}")
 
     def op(psi_n, gvec, gmask, box, kvec, V_r_j):
-        # sphere → union box → grid: one gather on the small box, then the
-        # plan embeds it (its supported axes) and transforms.
-        to_r, to_g = box.plans(geom)
-        psi_r = to_r(sphere_to_union_box(psi_n, box.index, box.shape)) * scale
+        to_r, to_sphere = box.transforms(geom)
+        psi_r = to_r(psi_n) * scale
         if vector:
             phi_r = jnp.zeros_like(psi_r)
             for i, (perm, phase) in enumerate(alpha_vertices):
@@ -448,8 +441,7 @@ def local_potential_operator(
                     psi_r, perm, phase, axis=2)
         else:
             phi_r = psi_r * V_r_j
-        # grid → union box (the plan restricts) → sphere (one gather).
-        out = union_box_to_sphere(to_g(phi_r) * (deltaV * fft_norm), box.index)
+        out = to_sphere(phi_r) * (deltaV * fft_norm)
         return out * gmask[None, None, None, :].astype(out.dtype)
 
     # V(r) rides in as an OPERAND, not as a closed-over constant.  It is the
@@ -520,17 +512,15 @@ def four_current_potential_operator(
 
     def op(psi_n, gvec, gmask, box, kvec, V0, V1):
         del kvec
-        to_r, to_g = box.plans(geom)
-        psi_r = to_r(sphere_to_union_box(psi_n, box.index, box.shape)) * scale
+        to_r, to_sphere = box.transforms(geom)
+        psi_r = to_r(psi_n) * scale
         phi_scalar = psi_r * charge_mask * V0
         phi_vector = jnp.zeros_like(psi_r)
         for i, (perm, phase) in enumerate(alpha_vertices):
             phi_vector = phi_vector + V1[i] * gamma_apply(
                 psi_r, perm, phase, axis=2)
-        # (k, band, spinor, component, x, y, z): one batched forward transform
-        # onto the union box, then one gather to the sphere.
-        phi = jnp.stack((phi_scalar, phi_vector), axis=3)
-        out = union_box_to_sphere(to_g(phi) * fft_scale, box.index)
+        # (k, band, spinor, component, x, y, z): one batched forward transform.
+        out = to_sphere(jnp.stack((phi_scalar, phi_vector), axis=3)) * fft_scale
         out = jnp.moveaxis(out, 3, -1)
         return out * gmask[None, None, None, :, None].astype(out.dtype)
 
@@ -1515,7 +1505,8 @@ def _sweep_body(geom: SweepGeometry, operators: tuple, spans: tuple,
         with K.  (K, nb/P, ns, ngkmax[, c])."""
         def one(xs):
             p, g, m, b, kv = xs
-            return operator.apply(p[None], g, m, SphereBox(b[None], supports), kv,
+            return operator.apply(p[None], g, m,
+                                  SphereBox(b[0][None], b[1][None], supports), kv,
                                   *consts)[0]
         xs = (t["psi"], t["gvec"], t["gmask"], t["bidx"], t["kvec"])
         if K == 1:
@@ -1743,7 +1734,8 @@ def sweep_matrix_elements(
     supports, bidx_j = (), None
     if band:
         supports, compact = union_box_tables(box_index, geom.fft_grid)
-        bidx_j = jnp.asarray(compact, dtype=jnp.int32)
+        bidx_j = jnp.stack([jnp.asarray(compact, dtype=jnp.int32),
+                            jnp.asarray(box_index, dtype=jnp.int32)], axis=1)
     # The operator's runtime operands.  They are jit ARGUMENTS, so one
     # executable serves every value of them; anything the operator closes
     # over instead is a jaxpr constant and forces a lowering per value.
