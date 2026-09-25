@@ -138,10 +138,12 @@ def undersampled_link_axes(kgrid) -> list[str]:
 #: sawtooth's jump actually wraps, not the tails near the atom planes).
 COLLAPSED_CUT_PROBE_GAP_FRACTION: float = 0.1
 #: Refusal threshold on the fraction of the OCCUPIED window bands' charge
-#: inside that probe (``GATE pt_collapsed_axis_cut_density``).  Measured on
-#: MoS2 in a 12 A cell (vacuum 0.74 of it) and with the cut forced through
-#: the slab, in the port's report (reports/phase2_bispinor_2026-09-24/
-#: PT2D_port.md).
+#: inside that probe (``GATE pt_collapsed_axis_cut_density``).  A share ``s``
+#: wrapped by the cut moves ``Z`` by at most ``2 pi s``, so at the threshold
+#: the cut costs 0.2 % of ``max|Z| ~ pi``, an order below the 1.6 % plane-wave
+#: floor of the velocity identity.  Measured on MoS2 in a 12 A cell: 1.2e-5
+#: (3x3x1 fixture, 16 Ry) and 2.0e-6 (6x6x1, 30 Ry) with the cut in the
+#: vacuum, 0.33 with the cut forced through the slab.
 COLLAPSED_CUT_DENSITY_MAX: float = 1.0e-3
 
 
