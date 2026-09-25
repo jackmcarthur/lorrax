@@ -31,14 +31,14 @@ import sys
 import time
 from types import SimpleNamespace
 
-import numpy as np
-
 _ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.join(_ROOT, "src"))
 
 from runtime import initialize_communicator_stack, finalize_process  # noqa: E402
 
 RUNTIME = initialize_communicator_stack(platform="gpu")
+
+import numpy as np  # noqa: E402  (after the runtime: its BLAS thread setting must come first)
 
 import jax  # noqa: E402
 import jax.numpy as jnp  # noqa: E402
