@@ -803,7 +803,240 @@ __device__ __forceinline__ void lrx_unfold_load(
     }
 }
 
-#if LRX_MODE == 7
+#if LRX_TT
+// The tile-table load of modes 7 and 11 (the host sets LRX_TT when two blocks of bank + tables
+// fit an SM; kbox_stage.cuh UnfoldTiles prices them).  The block stages U_k and the per-k source
+// rows once; per tile of TP pairs the endpoint tables (lsrc/rsrc slices, the phases mph/nph and,
+// for mode 7, the pairs' kernel W_R[k, x, y]) go by cp.async one tile ahead (two buffers).  The
+// raw sources go by cp.async straight into the bank cells that finish them, one per cell with
+// indices from shared memory, then two shared-memory passes finish the typed unfold: per (k,
+// operand group, column d) the phases (mph * G) * nph and left = U g; per (k, operand group, row
+// a) left U^dagger.  The products and their order are lrx_unfold_pair's and lrx_spin_row's, so
+// the tile is the register load's bit for bit.  The right action is U itself (neither door passes
+// spin_r) and the whole spin group is loaded (NA == NS).
+#include "kbox_stage.cuh"
+static_assert(NR == NS && NA == NS, "the tile tables load whole Green spin groups");
+#if LRX_MODE == 11
+constexpr int TT_OPS = 2, TT_NW = 0;           // Gv and Gc per pair, no staged kernel
+#else
+constexpr int TT_OPS = 1, TT_NW = 1;           // one Green per pair, W_R[k, x, y] staged
+#endif
+constexpr int TP = LRX_TP;                     // pairs per tile
+constexpr int TT_GRP = TT_OPS * SS;            // bank rows per pair
+constexpr int TT_ROWS = TP * TT_GRP;           // bank rows per tile
+constexpr int TT_GT = TP * TT_OPS;             // operand groups per tile
+constexpr lrx_kbox::UnfoldTiles kTT{NK, NS, NR, TP, TT_NW};
+constexpr long long TT_U = kTT.u(), TT_MP = kTT.mp(0), TT_NP = kTT.np(0), TT_W = kTT.w(0),
+                    TT_OFF = kTT.off(), TT_LS = kTT.ls(0), TT_RS = kTT.rs(0), TT_FLAG = kTT.flag();
+// Bank cell of row j at flat k: mode 11 the k-box stage's padded row, mode 7 the family's.
+#if LRX_MODE == 11
+constexpr int TT_RSTRIDE = lrx_kbox::Geo<NX, NY, NZ>::RS;
+__device__ __forceinline__ int tt_cell(int j, int k) { return j * TT_RSTRIDE + lrx_kbox::Geo<NX, NY, NZ>::at(k); }
+#else
+constexpr int TT_RSTRIDE = SP;
+__device__ __forceinline__ int tt_cell(int j, int k) { return j * TT_RSTRIDE + k; }
+#endif
+struct TileTabs {
+    char* s;
+    __device__ lrx_c2* u() const { return reinterpret_cast<lrx_c2*>(s + TT_U); }
+    __device__ lrx_c2* mp(int b) const { return reinterpret_cast<lrx_c2*>(s + TT_MP) + b * (TP * NS * NK); }
+    __device__ lrx_c2* np(int b) const { return reinterpret_cast<lrx_c2*>(s + TT_NP) + b * (TP * NR * NK); }
+    __device__ lrx_c2* w(int b) const { return reinterpret_cast<lrx_c2*>(s + TT_W) + b * (TP * TT_NW * NK); }
+    __device__ long long* off() const { return reinterpret_cast<long long*>(s + TT_OFF); }
+    __device__ int* ls(int b) const { return reinterpret_cast<int*>(s + TT_LS) + b * (TP * NK * NS); }
+    __device__ int* rs(int b) const { return reinterpret_cast<int*>(s + TT_RS) + b * (TP * NK * NR); }
+    __device__ int* flag() const { return reinterpret_cast<int*>(s + TT_FLAG); }
+};
+
+// Once per block: U_k (k innermost) by cp.async; the per-k source row offsets and the flags
+// (bit 0 the partner tile, bit 1 conj(G), bit 2 conj the phased product) by plain stores.
+__device__ __forceinline__ void tt_fixed(const UnfoldTab& t, const TileTabs& s) {
+    const lrx_c2* spin = reinterpret_cast<const lrx_c2*>(t.spin);
+    for (int i = threadIdx.x; i < NK * NS * NS; i += blockDim.x) {
+        const int k = i % NK, e = i / NK;
+        lrx_async::copy<16>(s.u() + i, spin + (long long)k * NS * NS + e);
+    }
+    for (int k = threadIdx.x; k < NK; k += blockDim.x) {
+        const bool anti = t.trs[k] != 0;
+        s.off()[k] = (long long)t.row[k] * t.ml * t.nl;
+        s.flag()[k] = (anti && t.conj_trs == 0 ? 1 : 0) | (anti && t.conj_trs == 2 ? 2 : 0) |
+                      (anti && t.conj_trs == 1 ? 4 : 0);
+    }
+}
+
+// The tables of pairs [pr0, pr0 + npr) (npr <= TP; pair = x*my + y) into buffer b by cp.async
+// (the caller commits): lsrc/rsrc slices [jp][k][c] (one copy of NS or NR indices), mph/nph
+// [jp][c][k], and with TT_NW the kernel kern[(k*mx + x)*my + y] as w [jp][k].
+__device__ __forceinline__ void tt_tile(const UnfoldTab& t, const TileTabs& s, int b, long long pr0, int npr,
+                                        long long my, const lrx_c2* kern, long long mx) {
+    const lrx_c2* mph = reinterpret_cast<const lrx_c2*>(t.mph);
+    const lrx_c2* nph = reinterpret_cast<const lrx_c2*>(t.nph);
+    const long long x0 = pr0 / my, y0 = pr0 - x0 * my;
+    for (int i = threadIdx.x; i < TP * NK; i += blockDim.x) {
+        const int jp = i / NK, k = i % NK;
+        if (jp >= npr) continue;
+        long long xx = x0, yy = y0 + jp;
+        while (yy >= my) { yy -= my; ++xx; }
+        lrx_async::copy<4 * NS>(s.ls(b) + i * NS, t.lsrc + (long long)k * t.ml + xx * NS);
+        lrx_async::copy<4 * NR>(s.rs(b) + i * NR, t.rsrc + (long long)k * t.nl + yy * NR);
+        if constexpr (TT_NW > 0) lrx_async::copy<16>(s.w(b) + i, kern + ((long long)k * mx + xx) * my + yy);
+    }
+    for (int i = threadIdx.x; i < TP * (NS + NR) * NK; i += blockDim.x) {
+        const int k = i % NK, q = i / NK, jp = q / (NS + NR), e = q % (NS + NR);
+        if (jp >= npr) continue;
+        long long xx = x0, yy = y0 + jp;
+        while (yy >= my) { yy -= my; ++xx; }
+        if (e < NS)
+            lrx_async::copy<16>(s.mp(b) + (jp * NS + e) * NK + k, mph + (long long)k * t.ml + xx * NS + e);
+        else
+            lrx_async::copy<16>(s.np(b) + (jp * NR + e - NS) * NK + k, nph + (long long)k * t.nl + yy * NR + (e - NS));
+    }
+}
+
+// One cp.async per cell of the tile, a -1 source or a pair past npr an exact zero; bank row j is
+// (pair j / TT_GRP, operand (j / SS) % TT_OPS: g0 or g1, element j % SS).  Consecutive threads
+// take consecutive rows of one k (the right sources of a centroid are contiguous); k fastest,
+// which makes a warp's shared destinations contiguous, measured 6% slower (mode 11, A100).
+__device__ __forceinline__ void tt_gather(const lrx_c2* g0, const lrx_c2* g0t, const lrx_c2* g1,
+                                          const lrx_c2* g1t, const UnfoldTab& t, const TileTabs& s, int b,
+                                          int npr, lrx_c2* bank) {
+    const int* ls = s.ls(b);
+    const int* rs = s.rs(b);
+    for (int i = threadIdx.x; i < NK * TT_ROWS; i += blockDim.x) {
+        const int j = i % TT_ROWS, k = i / TT_ROWS;
+        const int jp = j / TT_GRP, op = (j / SS) % TT_OPS, e = j % SS;
+        bool valid = false;
+        const lrx_c2* src = g0;
+        if (jp < npr) {
+            const int l = ls[(jp * NK + k) * NS + e / NR], r = rs[(jp * NK + k) * NR + e % NR];
+            const int f = s.flag()[k];
+            valid = l >= 0 && r >= 0;
+            if (valid)
+                src = (op ? ((f & 1) ? g1t : g1) : ((f & 1) ? g0t : g0)) + s.off()[k] + (long long)l * t.nl + r;
+        }
+        lrx_async::cell16(bank + tt_cell(j, k), src, valid);
+    }
+}
+
+// The typed unfold of the staged cells in place, from shared tables only; ends with a barrier.
+__device__ __forceinline__ void tt_finish(const TileTabs& s, int b, int npr, lrx_c2* bank) {
+    const lrx_c2* u = s.u();
+    const lrx_c2* mp = s.mp(b);
+    const lrx_c2* np = s.np(b);
+    const int* ls = s.ls(b);
+    const int* rs = s.rs(b);
+    for (int i = threadIdx.x; i < NK * TT_GT * NR; i += blockDim.x) {
+        const int k = i % NK, q = i / NK, gi = q / NR, d = q % NR, jp = gi / TT_OPS;
+        if (jp >= npr) continue;
+        lrx_c2* col = bank + tt_cell(gi * SS + d, k);                   // cell (c, d) at col[c * CS]
+        constexpr int CS = NR * TT_RSTRIDE;
+        const int f = s.flag()[k];
+        const bool conj_src = f & 2, conj_row = f & 4;
+        const int r = rs[(jp * NK + k) * NR + d];
+        const lrx_c2 nq = np[(jp * NR + d) * NK + k];
+        lrx_c2 g[NS];
+#pragma unroll
+        for (int c = 0; c < NS; ++c) {
+            lrx_c2 v = {0.0, 0.0};
+            if (ls[(jp * NK + k) * NS + c] >= 0 && r >= 0) {
+                lrx_c2 sv = col[c * CS];
+                if (conj_src) sv.y = -sv.y;
+                v = lrx_mul_xla(lrx_mul_xla(mp[(jp * NS + c) * NK + k], sv), nq);
+                if (conj_row) v.y = -v.y;
+            }
+            g[c] = v;
+        }
+#pragma unroll
+        for (int aa = 0; aa < NS; ++aa) {
+            lrx_c2 v = {0.0, 0.0};
+#pragma unroll
+            for (int c = 0; c < NS; ++c) {
+                const lrx_c2 p = lrx_rot_mul(u[(aa * NS + c) * NK + k], g[c]);
+                v.x = __dadd_rn(v.x, p.x); v.y = __dadd_rn(v.y, p.y);
+            }
+            col[aa * CS] = v;
+        }
+    }
+    __syncthreads();
+    for (int i = threadIdx.x; i < NK * TT_GT * NS; i += blockDim.x) {
+        const int k = i % NK, q = i / NK, gi = q / NS, ra = q % NS, jp = gi / TT_OPS;
+        if (jp >= npr) continue;
+        lrx_c2* row = bank + tt_cell(gi * SS + ra * NR, k);             // cell (ra, d) at row[d * RS1]
+        constexpr int RS1 = TT_RSTRIDE;
+        lrx_c2 left[NR];
+#pragma unroll
+        for (int d = 0; d < NR; ++d) left[d] = row[d * RS1];
+#pragma unroll
+        for (int bb = 0; bb < NR; ++bb) {
+            lrx_c2 v = {0.0, 0.0};
+#pragma unroll
+            for (int d = 0; d < NR; ++d) {
+                const lrx_c2 p = lrx_rot_mul_conj(left[d], u[(bb * NR + d) * NK + k]);
+                v.x = __dadd_rn(v.x, p.x); v.y = __dadd_rn(v.y, p.y);
+            }
+            row[bb * RS1] = v;
+        }
+    }
+    __syncthreads();
+}
+#endif
+
+#if LRX_MODE == 7 && LRX_TT
+// Mode 7 on the tile tables: a persistent grid over tiles of TP pairs (RB = TP * SS rows); tile
+// n + 1's tables (with its W_R values) load beside tile n's gather, then the finish, the inverse
+// transform, the Mid from shared W_R, the forward transform and the store, as below.
+#ifndef LRX_MINB
+#define LRX_MINB 1
+#endif
+extern "C" __global__ void __launch_bounds__(256, LRX_MINB) lrx_kconv(
+    const lrx_c2* __restrict__ gp, const lrx_c2* __restrict__ gt,
+    const lrx_c2* __restrict__ kern, lrx_c2* __restrict__ y, UnfoldTab t, double scale) {
+    static_assert(RB == TT_ROWS, "the host passes the tile's pairs and rows together");
+    extern __shared__ lrx_c2 sm[];
+    using namespace cufftdx;
+    const long long mx = t.ml / NS, my = t.nl / NS, pairs = mx * my;
+    const TileTabs s{reinterpret_cast<char*>(sm + RB * SP)};
+    const long long stride = (long long)gridDim.x * TP;
+    auto npr_of = [&](long long q) { return (int)min((long long)TP, pairs - q); };
+    long long p0 = (long long)blockIdx.x * TP;
+    tt_fixed(t, s);
+    if (p0 < pairs) tt_tile(t, s, 0, p0, npr_of(p0), my, kern, mx);
+    lrx_async::commit();
+    for (int b = 0; p0 < pairs; p0 += stride, b ^= 1) {
+        lrx_async::wait_all();
+        __syncthreads();                               // tables b in; the previous tile's bank reads done
+        const int npr = npr_of(p0);
+        tt_gather(gp, gt, gp, gt, t, s, b, npr, sm);
+        lrx_async::commit();
+        if (p0 + stride < pairs) tt_tile(t, s, b ^ 1, p0 + stride, npr_of(p0 + stride), my, kern, mx);
+        lrx_async::commit();
+        lrx_async::wait_prior<1>();                     // this tile's cells (not the next tables)
+        __syncthreads();
+        tt_finish(s, b, npr, sm);
+        transform3<fft_direction::inverse>(sm);
+        const lrx_c2* w = s.w(b);
+        for (int i = threadIdx.x; i < RB * NK; i += blockDim.x) {
+            const int k = i / RB, j = i % RB;
+            if (j / SS < npr) sm[j * SP + k] = lrx_mul(sm[j * SP + k], w[(j / SS) * NK + k]);
+        }
+        __syncthreads();
+        transform3<fft_direction::forward>(sm);
+        const long long x0 = p0 / my, y0 = p0 - x0 * my;
+        for (int i = threadIdx.x; i < RB * NK; i += blockDim.x) {
+            const int k = i / RB, j = i % RB, jp = j / SS;
+            const long long ko = lrx_out_row(t, k);
+            if (jp < npr && ko >= 0) {
+                long long xx = x0, yy = y0 + jp;
+                while (yy >= my) { yy -= my; ++xx; }
+                const int a = (j % SS) / NS, bb = j % NS;
+                const lrx_c2 v = sm[j * SP + k];
+                y[((ko * NS + a) * mx + xx) * (my * NS) + bb * my + yy] = {v.x * scale, v.y * scale};
+            }
+        }
+        __syncthreads();                               // the bank is read before the next gather
+    }
+}
+#elif LRX_MODE == 7
 extern "C" __global__ void __launch_bounds__(256) lrx_kconv(
     const lrx_c2* __restrict__ gp, const lrx_c2* __restrict__ gt,
     const lrx_c2* __restrict__ kern, lrx_c2* __restrict__ y, UnfoldTab t, double scale) {
@@ -1160,163 +1393,6 @@ struct ChiLoad {
     }
 };
 
-#if LRX_TT
-// The tile-table load (single arm; the host sets LRX_TT when two blocks of bank + tables fit an
-// SM): ChiLoad's gather with its tables in shared memory (kbox_stage.cuh UnfoldTiles).  The block
-// stages U_k and the per-k source rows once; per tile the endpoint tables of its TP pairs go by
-// cp.async one tile ahead (two buffers), the raw sources go by cp.async straight into the bank
-// cells that finish them (one per cell, indices from shared memory), then two shared-memory
-// passes finish the typed unfold: per (k, operand group, column d) the phases (mph * G) * nph and
-// left = U g; per (k, operand group, row a) left U^dagger.  The products and their order are
-// lrx_unfold_pair's and lrx_spin_row's, so the tile is ChiLoad's bit for bit.  Mode 11's right
-// action is U itself (the host passes no spin_r).
-constexpr int TP = TRC / GRP;                  // pairs per tile
-constexpr int GT = TRC / SS;                   // operand groups per tile
-constexpr lrx_kbox::UnfoldTiles kTT{NK, NS, NR, TP};
-constexpr long long TT_U = kTT.u(), TT_MP = kTT.mp(0), TT_NP = kTT.np(0), TT_OFF = kTT.off(),
-                    TT_LS = kTT.ls(0), TT_RS = kTT.rs(0), TT_FLAG = kTT.flag();
-struct ChiTiles {
-    char* s;
-    __device__ lrx_c2* u() const { return reinterpret_cast<lrx_c2*>(s + TT_U); }
-    __device__ lrx_c2* mp(int b) const { return reinterpret_cast<lrx_c2*>(s + TT_MP) + b * (TP * NS * NK); }
-    __device__ lrx_c2* np(int b) const { return reinterpret_cast<lrx_c2*>(s + TT_NP) + b * (TP * NR * NK); }
-    __device__ long long* off() const { return reinterpret_cast<long long*>(s + TT_OFF); }
-    __device__ int* ls(int b) const { return reinterpret_cast<int*>(s + TT_LS) + b * (TP * NK * NS); }
-    __device__ int* rs(int b) const { return reinterpret_cast<int*>(s + TT_RS) + b * (TP * NK * NR); }
-    __device__ int* flag() const { return reinterpret_cast<int*>(s + TT_FLAG); }
-};
-
-// Once per block: U_k (k innermost) by cp.async; the per-k source row offsets and the flags
-// (bit 0 the partner tile, bit 1 conj(G), bit 2 conj the phased product) by plain stores.
-__device__ __forceinline__ void chi_tt_fixed(const UnfoldTab& t, const ChiTiles& s) {
-    const lrx_c2* spin = reinterpret_cast<const lrx_c2*>(t.spin);
-    for (int i = threadIdx.x; i < NK * NS * NS; i += blockDim.x) {
-        const int k = i % NK, e = i / NK;
-        lrx_async::copy<16>(s.u() + i, spin + (long long)k * NS * NS + e);
-    }
-    for (int k = threadIdx.x; k < NK; k += blockDim.x) {
-        const bool anti = t.trs[k] != 0;
-        s.off()[k] = (long long)t.row[k] * t.ml * t.nl;
-        s.flag()[k] = (anti && t.conj_trs == 0 ? 1 : 0) | (anti && t.conj_trs == 2 ? 2 : 0) |
-                      (anti && t.conj_trs == 1 ? 4 : 0);
-    }
-}
-
-// The endpoint tables of pairs [pr0, pr0 + npr) (npr <= TP) into buffer b by cp.async (the caller
-// commits): lsrc/rsrc slices [jp][k][c] (one copy of NS or NR indices), mph/nph [jp][c][k].
-__device__ __forceinline__ void chi_tt_tile(const UnfoldTab& t, const ChiTiles& s, int b, long long pr0,
-                                            int npr, long long my) {
-    const lrx_c2* mph = reinterpret_cast<const lrx_c2*>(t.mph);
-    const lrx_c2* nph = reinterpret_cast<const lrx_c2*>(t.nph);
-    const long long x0 = pr0 / my, y0 = pr0 - x0 * my;
-    for (int i = threadIdx.x; i < TP * NK; i += blockDim.x) {
-        const int jp = i / NK, k = i % NK;
-        if (jp >= npr) continue;
-        long long xx = x0, yy = y0 + jp;
-        while (yy >= my) { yy -= my; ++xx; }
-        lrx_async::copy<4 * NS>(s.ls(b) + i * NS, t.lsrc + (long long)k * t.ml + xx * NS);
-        lrx_async::copy<4 * NR>(s.rs(b) + i * NR, t.rsrc + (long long)k * t.nl + yy * NR);
-    }
-    for (int i = threadIdx.x; i < TP * (NS + NR) * NK; i += blockDim.x) {
-        const int k = i % NK, q = i / NK, jp = q / (NS + NR), e = q % (NS + NR);
-        if (jp >= npr) continue;
-        long long xx = x0, yy = y0 + jp;
-        while (yy >= my) { yy -= my; ++xx; }
-        if (e < NS)
-            lrx_async::copy<16>(s.mp(b) + (jp * NS + e) * NK + k, mph + (long long)k * t.ml + xx * NS + e);
-        else
-            lrx_async::copy<16>(s.np(b) + (jp * NR + e - NS) * NK + k, nph + (long long)k * t.nl + yy * NR + (e - NS));
-    }
-}
-
-// One cp.async per cell of the tile, a -1 source or a pair past npr an exact zero.  Consecutive
-// threads take consecutive k of one column, so a warp's copies land in contiguous shared memory:
-// a cp.async moves one sector per thread either way (the sources of consecutive columns are
-// contiguous, but their bank cells are a padded row apart, 31 wavefronts per copy; ncu, A100).
-__device__ __forceinline__ void chi_tt_gather(const ChiArgs& a, const UnfoldTab& t, const ChiTiles& s, int b,
-                                              int npr, lrx_c2* bank) {
-    using G = lrx_kbox::Geo<NX, NY, NZ>;
-    const int* ls = s.ls(b);
-    const int* rs = s.rs(b);
-    for (int i = threadIdx.x; i < NK * TRC; i += blockDim.x) {
-        const int k = i % NK, j = i / NK;
-        const int jp = j / GRP, op = (j % GRP) / SS, e = j % SS;
-        bool valid = false;
-        const lrx_c2* src = a.gv;
-        if (jp < npr) {
-            const int l = ls[(jp * NK + k) * NS + e / NR], r = rs[(jp * NK + k) * NR + e % NR];
-            const int f = s.flag()[k];
-            valid = l >= 0 && r >= 0;
-            if (valid)
-                src = (op ? ((f & 1) ? a.gct : a.gc) : ((f & 1) ? a.gvt : a.gv)) + s.off()[k] +
-                      (long long)l * t.nl + r;
-        }
-        lrx_async::cell16(bank + j * G::RS + G::at(k), src, valid);
-    }
-}
-
-// The typed unfold of the staged cells in place, from shared tables only; ends with a barrier.
-__device__ __forceinline__ void chi_tt_finish(const ChiTiles& s, int b, int npr, lrx_c2* bank) {
-    using G = lrx_kbox::Geo<NX, NY, NZ>;
-    const lrx_c2* u = s.u();
-    const lrx_c2* mp = s.mp(b);
-    const lrx_c2* np = s.np(b);
-    const int* ls = s.ls(b);
-    const int* rs = s.rs(b);
-    for (int i = threadIdx.x; i < NK * GT * NR; i += blockDim.x) {
-        const int k = i % NK, q = i / NK, gi = q / NR, d = q % NR, jp = gi / 2;
-        if (jp >= npr) continue;
-        lrx_c2* col = bank + (gi * SS + d) * G::RS + G::at(k);          // cell (c, d) at col[c * NR * RS]
-        const int f = s.flag()[k];
-        const bool conj_src = f & 2, conj_row = f & 4;
-        const int r = rs[(jp * NK + k) * NR + d];
-        const lrx_c2 nq = np[(jp * NR + d) * NK + k];
-        lrx_c2 g[NS];
-#pragma unroll
-        for (int c = 0; c < NS; ++c) {
-            lrx_c2 v = {0.0, 0.0};
-            if (ls[(jp * NK + k) * NS + c] >= 0 && r >= 0) {
-                lrx_c2 sv = col[c * NR * G::RS];
-                if (conj_src) sv.y = -sv.y;
-                v = lrx_mul_xla(lrx_mul_xla(mp[(jp * NS + c) * NK + k], sv), nq);
-                if (conj_row) v.y = -v.y;
-            }
-            g[c] = v;
-        }
-#pragma unroll
-        for (int aa = 0; aa < NS; ++aa) {
-            lrx_c2 v = {0.0, 0.0};
-#pragma unroll
-            for (int c = 0; c < NS; ++c) {
-                const lrx_c2 p = lrx_rot_mul(u[(aa * NS + c) * NK + k], g[c]);
-                v.x = __dadd_rn(v.x, p.x); v.y = __dadd_rn(v.y, p.y);
-            }
-            col[aa * NR * G::RS] = v;
-        }
-    }
-    __syncthreads();
-    for (int i = threadIdx.x; i < NK * GT * NS; i += blockDim.x) {
-        const int k = i % NK, q = i / NK, gi = q / NS, ra = q % NS, jp = gi / 2;
-        if (jp >= npr) continue;
-        lrx_c2* row = bank + (gi * SS + ra * NR) * G::RS + G::at(k);    // cell (ra, d) at row[d * RS]
-        lrx_c2 left[NR];
-#pragma unroll
-        for (int d = 0; d < NR; ++d) left[d] = row[d * G::RS];
-#pragma unroll
-        for (int bb = 0; bb < NR; ++bb) {
-            lrx_c2 v = {0.0, 0.0};
-#pragma unroll
-            for (int d = 0; d < NR; ++d) {
-                const lrx_c2 p = lrx_rot_mul_conj(left[d], u[(bb * NR + d) * NK + k]);
-                v.x = __dadd_rn(v.x, p.x); v.y = __dadd_rn(v.y, p.y);
-            }
-            row[bb * G::RS] = v;
-        }
-    }
-    __syncthreads();
-}
-#endif
-
 // The pair's R-space value from its GRP transformed values g(q) (q < SS: Gv, else Gc).
 template <class Get>
 __device__ __forceinline__ lrx_c2 lrx_chi_value(const Get& g, double si) {
@@ -1401,25 +1477,26 @@ extern "C" __global__ void __launch_bounds__(LRX_THREADS, LRX_MINB) lrx_kconv(Ch
     // A persistent grid (the host launches the resident blocks): tile n + 1's tables load beside
     // tile n's gather, then the finish, the inverse transform and the accumulating Mid.
     const ChiMid mid{&a};
-    const ChiTiles s{reinterpret_cast<char*>(sm + TRC * lrx_kbox::Geo<NX, NY, NZ>::RS)};
+    static_assert(TRC == TT_ROWS, "the host passes the tile's pairs and columns together");
+    const TileTabs s{reinterpret_cast<char*>(sm + TRC * lrx_kbox::Geo<NX, NY, NZ>::RS)};
     const long long stride = (long long)gridDim.x * TRC;
     auto npr_of = [&](long long c0) { return (int)min((long long)TP, a.npairs - c0 / GRP); };
     long long col0 = (long long)blockIdx.x * TRC;
-    chi_tt_fixed(t, s);
-    if (col0 < ncols) chi_tt_tile(t, s, 0, a.p0 + col0 / GRP, npr_of(col0), a.my);
+    tt_fixed(t, s);
+    if (col0 < ncols) tt_tile(t, s, 0, a.p0 + col0 / GRP, npr_of(col0), a.my, nullptr, 0);
     lrx_async::commit();
     for (int b = 0; col0 < ncols; col0 += stride, b ^= 1) {
         lrx_async::wait_all();
         __syncthreads();                               // tables b in; the previous tile's bank reads done
         const int npr = npr_of(col0);
-        chi_tt_gather(a, t, s, b, npr, sm);
+        tt_gather(a.gv, a.gvt, a.gc, a.gct, t, s, b, npr, sm);
         lrx_async::commit();
         if (col0 + stride < ncols)
-            chi_tt_tile(t, s, b ^ 1, a.p0 + (col0 + stride) / GRP, npr_of(col0 + stride), a.my);
+            tt_tile(t, s, b ^ 1, a.p0 + (col0 + stride) / GRP, npr_of(col0 + stride), a.my, nullptr, 0);
         lrx_async::commit();
         lrx_async::wait_prior<1>();                     // this tile's cells (not the next tables)
         __syncthreads();
-        chi_tt_finish(s, b, npr, sm);
+        tt_finish(s, b, npr, sm);
         lrx_kbox::transform3<NX, NY, NZ, TRC, LRX_SM, fft_direction::inverse>(sm);
         lrx_kbox::mid_group_tile<NX, NY, NZ, TRC, GRP>(sm, col0, ncols, mid);
     }
@@ -1701,9 +1778,9 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
                            "reserved shared memory per block");
             for (int tp = kplan.tr; cc_major >= 8 && tp >= 1 && kplan.threads == kThreads; tp /= 2) {
                 const long long blk = static_cast<long long>(tp) * chi_grp * g.rs() * 16 +
-                                      lrx_kbox::UnfoldTiles{nk, ns, ns, tp}.bytes();
+                                      lrx_kbox::UnfoldTiles{nk, ns, ns, tp, 0}.bytes();
                 if (blk <= smem_optin && 2 * (blk + smem_rsv) <= smem_sm) {
-                    chi_tt = 1;
+                    chi_tt = tp;
                     chi_minb = 2;
                     chi_trc = tp * chi_grp;
                     chi_smem = blk;
@@ -1767,6 +1844,28 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
     const int grp_rows = (mode == 7 && blk != ns) ? blk * blk : ns * nsr;
     if ((mode == 7 || mode == 8 || mode == 9) && rb >= grp_rows)
         rb -= rb % grp_rows;                           // whole spin groups: the grouped load
+    // Mode 7 on the tile tables (whole spin groups, sm_80+ cp.async): the largest tile of whole
+    // pairs, at most the grouped load's, whose bank and tables (UnfoldTiles, W_R staged) fit two
+    // blocks on an SM with the device's per-block reservation; none fits: the register load.
+    int m7_tp = 0;
+    long long m7_smem = 0;
+    if (mode == 7 && blk == ns && nsr == ns && cc_major >= 8 && rb >= grp_rows) {
+        int smem_sm = 0, smem_rsv = 0;
+        LRX_CUDA_CHECK(cudaDeviceGetAttribute(&smem_sm, cudaDevAttrMaxSharedMemoryPerMultiprocessor, dev),
+                       "max shared memory per SM");
+        LRX_CUDA_CHECK(cudaDeviceGetAttribute(&smem_rsv, cudaDevAttrReservedSharedMemoryPerBlock, dev),
+                       "reserved shared memory per block");
+        for (int tp = static_cast<int>(rb / grp_rows); tp >= 1; tp /= 2) {
+            const long long bytes = static_cast<long long>(tp) * grp_rows * row_bytes +
+                                    lrx_kbox::UnfoldTiles{nk, ns, ns, tp, 1}.bytes();
+            if (bytes <= smem_optin && 2 * (bytes + smem_rsv) <= smem_sm) {
+                m7_tp = tp;
+                m7_smem = bytes;
+                rb = static_cast<long long>(tp) * grp_rows;
+                break;
+            }
+        }
+    }
     // (fewer rows than one spin group: mode 7 loads per bank, as mode 2 would fit)
     long long plane_minb = 1;                          // mode 10: blocks per SM (LRX_RB)
     long long plane_static = 0;                        // mode 10: its static tables, bytes
@@ -1852,6 +1951,11 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
     // 3.26 -> 2.60 ms; kept 2026-09-25, FP: the 80^2 production planes).
     const int plane_threads = mode == 10 && plane_minb == 1 ? 512 : kThreads;
     if (mode == 7 && blk != ns) defs.push_back("-DLRX_NA=" + std::to_string(blk));
+    if (mode == 7) {
+        defs.push_back("-DLRX_TT=" + std::string(m7_tp ? "1" : "0"));
+        defs.push_back("-DLRX_TP=" + std::to_string(m7_tp));
+        defs.push_back("-DLRX_MINB=" + std::string(m7_tp ? "2" : "1"));
+    }
     if (mode == 8 && !lor_split) defs.push_back("-DLRX_ARM=0");
     if (kbox_rows || lor_split) {
         defs.push_back("-DLRX_ARM=" + std::to_string(kb_arm));
@@ -1865,7 +1969,8 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
         defs.push_back("-DLRX_TY=" + std::to_string(chi_ty));
         defs.push_back("-DLRX_THREADS=" + std::to_string(chi_threads));
         defs.push_back("-DLRX_COMPLETE=" + std::to_string(variant));
-        defs.push_back("-DLRX_TT=" + std::to_string(chi_tt));
+        defs.push_back("-DLRX_TT=" + std::to_string(chi_tt ? 1 : 0));
+        defs.push_back("-DLRX_TP=" + std::to_string(chi_tt));
         defs.push_back("-DLRX_MINB=" + std::to_string(chi_minb));
     }
     if (mode == 10) {
@@ -1882,7 +1987,8 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
     prog.name = "lrx_kconv_mathdx.cu";
     if (std::string_view(prog.src).find(ag::kHeaderName) != std::string_view::npos)
         prog.headers = {{ag::kHeaderName, ag::kHeaderSrc}};
-    if (mode == 11 || kbox_rows || lor_split) prog.headers.push_back({kbox::kHeaderName, kbox::kHeaderSrc});
+    if (mode == 11 || kbox_rows || lor_split || m7_tp)
+        prog.headers.push_back({kbox::kHeaderName, kbox::kHeaderSrc});
     prog.defs = defs;
     nvrtc::mathdx_toolchain(root, cuda_inc, "cufftdx", &prog);
     prog.kernel = "lrx_kconv";
@@ -1936,6 +2042,12 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
         b.sms = sms;
         if (chi_tt) b.grid_cap = static_cast<long long>(sms) * chi_minb;   // a persistent grid
     }
+    if (m7_tp) {                                       // a persistent grid of two blocks per SM
+        int sms = 0;
+        LRX_CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev), "SM count");
+        b.smem = static_cast<int>(m7_smem);
+        b.grid_cap = static_cast<long long>(sms) * 2;
+    }
     if (mode == 10) {                                  // persistent blocks: the resident count
         int sms = 0;
         LRX_CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev), "SM count");
@@ -1958,7 +2070,7 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
     }
     // Mode 11 at two blocks per SM: the largest shared-memory carveout, so the driver does not
     // pick a split that holds one block (a hint; residency is unchanged if it declines).
-    if (mode == 11 && chi_minb > 1) {
+    if ((mode == 11 && chi_minb > 1) || m7_tp) {
         cr = api.FuncSetAttribute(b.fn, CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT, 100);
         if (cr != CUDA_SUCCESS) return sticky("cuFuncSetAttribute(carveout)", cu_err(cr));
     }
@@ -2279,7 +2391,8 @@ static ffi::Error KleadUnfoldImpl(
     double sc = scale;
     void* args[] = {(void*)&gpp, (void*)&gtp, (void*)&vp, (void*)&up, (void*)&t, (void*)&sc};
     const long long rows = pairs * d * d;
-    const long long blocks = (rows + k->rb - 1) / k->rb;
+    long long blocks = (rows + k->rb - 1) / k->rb;
+    if (k->grid_cap > 0) blocks = std::min(blocks, k->grid_cap);   // the tile tables' persistent grid
     if (blocks > 2147483647LL) return bad("grid.x overflow");
     CUresult cr = driver_api().LaunchKernel(k->fn, static_cast<unsigned>(blocks), 1, 1, kThreads, 1, 1,
                                             static_cast<unsigned>(k->smem),

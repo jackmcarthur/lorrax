@@ -43,15 +43,17 @@ struct Geometry {
 // beside the bank, so the gather issues one cp.async per cell from shared indices and the finish
 // reads no global table.  Per block, once: U_k [ns][ns][nk] (c128, k innermost), the per-k source
 // row offsets [nk] (int64) and flags [nk] (int32).  Per tile of tp pairs, two buffers (the next
-// tile's tables load beside this tile's gather): the phases mph [tp][ns][nk] and nph [tp][nr][nk]
-// (c128) and the endpoint indices lsrc [tp][nk][ns] and rsrc [tp][nk][nr] (int32).  Byte offsets
-// from the table base, which is 16-byte aligned; the host prices bytes() into the block's memory.
+// tile's tables load beside this tile's gather): the phases mph [tp][ns][nk] and nph [tp][nr][nk],
+// nw per-(pair, k) kernel values [tp][nw][nk] (c128; mode 7's W_R) and the endpoint indices lsrc
+// [tp][nk][ns] and rsrc [tp][nk][nr] (int32).  Byte offsets from the table base, which is 16-byte
+// aligned; the host prices bytes() into the block's shared memory.
 struct UnfoldTiles {
-    long long nk, ns, nr, tp;
+    long long nk, ns, nr, tp, nw;
     constexpr long long u() const { return 0; }
     constexpr long long mp(int b) const { return 16 * (nk * ns * ns + b * tp * ns * nk); }
     constexpr long long np(int b) const { return 16 * (nk * ns * ns + 2 * tp * ns * nk + b * tp * nr * nk); }
-    constexpr long long off() const { return 16 * (nk * ns * ns + 2 * tp * (ns + nr) * nk); }
+    constexpr long long w(int b) const { return 16 * (nk * ns * ns + 2 * tp * (ns + nr) * nk + b * tp * nw * nk); }
+    constexpr long long off() const { return 16 * (nk * ns * ns + 2 * tp * (ns + nr + nw) * nk); }
     constexpr long long ints() const { return off() + (8 * nk + 15) / 16 * 16; }   // 16-byte aligned
     constexpr long long ls(int b) const { return ints() + 4 * b * tp * nk * ns; }
     constexpr long long rs(int b) const { return ints() + 4 * (2 * tp * nk * ns + b * tp * nk * nr); }
