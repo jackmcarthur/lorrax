@@ -204,7 +204,7 @@ state.
   for MPA. On MoS2 3×3 the PPM frame sat 1.4 eV above the DFT midgap, and
   judging coverage in the wrong one left a "covered" state on $\Sigma(0)$
   until a later growth switched it, a 2.8 eV jump of its map output
-  (CLAIMS 2726). Growth is monotone and
+  (CLAIMS 2736). Growth is monotone and
   bounded by the covered spectrum; in practice it stops after map 1, so
   growth late in a run marks a state that is still running away.
 - **Width.** The crossing-rule node count grows linearly in bandwidth$/\eta$,
