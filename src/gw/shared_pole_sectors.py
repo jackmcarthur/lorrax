@@ -415,12 +415,17 @@ def _host_sector_census(poles,mask,mesh_xy,real,*,common=None):
     import numpy as np
     from common.collectives import device_put_process_local
     from jax.sharding import NamedSharding,PartitionSpec as P
-    from runtime.padding import padded_axis
+    from runtime.padding import ladder_extent, padded_axis
 
     poles,active=jax.tree.map(lambda a:np.asarray(device_put_process_local(
         a,NamedSharding(mesh_xy,P()))),(poles,mask))
     counts=active.sum(axis=-1,dtype=np.int64)
-    width=padded_axis(int(counts[:real].max()),mesh_xy,name='shared_pole_port',
+    # The writer carrier sits on the extent ladder, as the scalar
+    # constructor's export does: K moves every SC map, and every program keyed
+    # by this width (the store's factor check, the face and canonical
+    # handoffs) then repeats across maps. The file keeps K.max columns.
+    width=padded_axis(ladder_extent(int(counts[:real].max()),poles.shape[-1]),
+        mesh_xy,name='shared_pole_port',
         specs=((P('x','y'),0),(P('x','y'),1))).carrier
     # The factor carrier is Py aligned; only inactive pole columns are added.
     if poles.shape[-1] < width:
