@@ -1554,6 +1554,10 @@ _DEFAULTS = {
     # max value is ecutrho.  Must be ≥ bare_coulomb_cutoff (V_q can't
     # use ζ̃(q+G) at G's the writer didn't store).
     "zeta_cutoff": None,
+    # χ_q(G, G') output-sphere cutoff (Ry) of the real-space (non-ISDF) path;
+    # unset = ecutwfc.  Read by gw.mixed_basis_pair_convolution.screened_sphere_set,
+    # which refuses at or above the WFN box's measured alias cap.  No driver reads it yet.
+    "screened_coulomb_cutoff": None,
     # BGW vcoul override (for diagnostic BGW-vs-LORRAX comparison)
     "use_bgw_vcoul": False,
     "bgw_vcoul_file": "",

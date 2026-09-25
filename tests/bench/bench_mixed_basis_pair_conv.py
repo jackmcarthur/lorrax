@@ -17,6 +17,10 @@ Every arm runs in its own process (per-GPU peak memory is the process's):
 * arms: ``router`` (LocalFourierPlan CUDA leg + mathdx mode 6), ``xla`` (the gather
   + jnp.fft fallback), ``naive`` (the fallback with every column of the rank in one
   batch: A_k(r, r') and C_k(r, r') for all k materialized, N_k·N_r²/P per rank);
+  ``--wedge full|unitary`` adds the r'-column wedge on the WFN's authorized rows (or
+  its unitary ones), with the χ spheres at every full-grid q as the middle's rows.
+  The synthetic operands are not covariant, so the wedge's values differ from the
+  dense-column plan's here by design; correctness is the P4 gate's (covariant operands);
 * reports: plan receipt, compact-build wall (cold, warm), kernel wall by stage
   (cold one-shot including compiles, then warm one-shot), per-GPU peak bytes, a
   checksum for cross-arm parity; ``--stages`` adds warm per-sub-stage timings of one
@@ -103,6 +107,14 @@ def setup(args, mesh):
                                                 vcoul_cutoff_ry=cut, sys_dim=3)
     out = SphereSet(np.asarray(pkg["gvec_components_padded"]).transpose(0, 2, 1),
                     np.asarray(pkg["ngk_per_q"]), q_frac)
+    wedge = None
+    if args.wedge != "off":
+        from gw.mixed_basis_pair_convolution import ColumnWedge
+        pkf = compute_per_q_bare_coulomb_components(fft_grid=box, bvec=bvec, q_irr_frac=kf,
+                                                    vcoul_cutoff_ry=cut, sys_dim=3)
+        out_full = SphereSet(np.asarray(pkf["gvec_components_padded"]).transpose(0, 2, 1),
+                             np.asarray(pkf["ngk_per_q"]), kf)
+        wedge = ColumnWedge.from_symmaps(sym, out_full, unitary_only=args.wedge == "unitary")
     ns = int(args.ns)
     n_sp = int(np.asarray(sym.sym_matrices).shape[0])
     sidx = np.asarray(sym.sym_idx_k, np.int32)
@@ -118,7 +130,7 @@ def setup(args, mesh):
     tr = SphereTransport.typed(plan, fft_grid=box, parent_sphere_index=sidx_par, children=children)
     op = PairOperand(children, tr)
     return dict(op=op, out=out, kgrid=kgrid, box=box, plan=plan, npar=npar, gp=gp, ns=ns,
-                ecut=ecut, cut=cut)
+                ecut=ecut, cut=cut, wedge=wedge)
 
 
 def compact_build(s, mesh, M, nb, nv, seed=5):
@@ -182,7 +194,7 @@ def stages(conv, reps=3):
     kb = conv.kbox[0]
     nbox = int(np.prod(kb))
     M = conv.width_carrier[0]
-    nq = conv.nq
+    nq = conv.nq_mid                      # the middle's output rows (every q on the wedge)
     t = conv._tables[0]
     put = lambda a: jax.device_put(np.asarray(a), dev)
     zc = lambda shape: jax.device_put(jnp.zeros(shape, jnp.complex128), dev)
@@ -227,7 +239,7 @@ def stages(conv, reps=3):
     rows = put(conv.q_rows)
     sel = jax.jit(lambda u, q, r: (jnp.take(u, r, axis=0) * q[:, None, :]).reshape((nq, J) + conv.fft_grid))
     res["q_select_phase"] = timeit(sel, U, Q, rows)
-    plan_out = conv._plan(sign=-1, norm="backward", out_support=conv.sup_out)
+    plan_out = conv._plan(sign=-1, norm="backward", out_support=conv.sup_mid)
     Y = zc((nq, J) + conv.fft_grid)
     res["plan_r2G"] = timeit(jax.jit(plan_out), Y)
     # expand: one k chunk of the column half and p'->r' for this rank's rows
@@ -276,6 +288,7 @@ def main():
     ap.add_argument("--nv", type=int, default=16)
     ap.add_argument("--warm", type=int, default=1)
     ap.add_argument("--stages", action="store_true")
+    ap.add_argument("--wedge", choices=("off", "full", "unitary"), default="off")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
     from gw.mixed_basis_pair_convolution import MixedBasisPairConvolution
@@ -286,7 +299,7 @@ def main():
     backend = "router" if args.arm == "router" else "xla"
     t0 = time.perf_counter()
     kw = dict(kgrid=s["kgrid"], fft_grid=s["box"], left=s["op"], right=s["op"], out=s["out"],
-              backend=backend)
+              backend=backend, wedge=s["wedge"])
     if args.arm == "naive":
         probe = MixedBasisPairConvolution(mesh, **kw, budget_bytes=int(1e15), chunks=(1, 1))
         conv = MixedBasisPairConvolution(mesh, **kw, budget_bytes=int(1e15),
@@ -297,7 +310,9 @@ def main():
         conv = MixedBasisPairConvolution(mesh, **kw)
     t_plan = time.perf_counter() - t0
     say(conv.describe())
-    rec = dict(arm=args.arm, ns=args.ns, wfn=args.wfn, ecut_scale=args.ecut_scale, box=list(s["box"]),
+    rec = dict(arm=args.arm, wedge=args.wedge,
+               orbits=None if conv._wt is None else conv._wt["n_orbits"],
+               wedge_rows=None if conv.wedge is None else conv.wedge.rows.tolist(), ns=args.ns, wfn=args.wfn, ecut_scale=args.ecut_scale, box=list(s["box"]),
                kgrid=list(s["kgrid"]), n_parent=len(s["npar"]), nq=conv.nq, P=conv.P,
                widths=list(conv.width_carrier), width_out=conv.mo_axis.carrier,
                kbox=[list(k) for k in conv.kbox], kbox_out=list(conv.kbox_out),

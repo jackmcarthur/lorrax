@@ -78,11 +78,13 @@ def _acubic_fixture(mesh, rng):
                 rows=np.asarray(sym.active_symmetry_rows), spinor_action=sym.spinor_action)
 
 
-def _glide_fixture(mesh, rng, ns, *, translated_anti=False):
+def _glide_fixture(mesh, rng, ns, *, translated_anti=False, theta=0.7):
     """The order-two glide group with spin mixing and an antiunitary row.
 
     ``translated_anti`` sends k2 through glide followed by time reversal,
     so the Fourier transport must conjugate the nonzero glide phase.
+    ``theta`` is the glide's spin rotation exp(-iθσ_x); only θ = π/2 makes it a
+    representation (glide² = E needs U² = ±1), which covariant operands require.
     """
     import numpy as np
     from types import SimpleNamespace
@@ -99,7 +101,6 @@ def _glide_fixture(mesh, rng, ns, *, translated_anti=False):
     irr = np.asarray([0, 1, 1, 2], dtype=np.int32)
     sym_rows = np.asarray([0, 0, 3 if translated_anti else 1, 2], dtype=np.int32)
     parent_k = kfrac[[0, 1, 3]]
-    theta = 0.7
     U1 = np.asarray([[np.cos(theta), -1j * np.sin(theta)],
                      [-1j * np.sin(theta), np.cos(theta)]])
     U_spatial = np.stack([np.eye(2, dtype=np.complex128), U1])
