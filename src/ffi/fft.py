@@ -533,6 +533,7 @@ def require_kconv(mesh: Mesh, *, announce: bool = True) -> str:
         root = mathdx_root()
         for target in KCONV_TARGETS:
             _require_target(target, "CUDA")
+        _probe_kconv_compile(mesh)
         announce_once(("kconv", "backend", backend),
                       f"[kconv] k-convolution router: CUDA -> nvidia-mathdx ({root}); "
                       f"cubin cache {_cubin_cache_summary()}",
@@ -543,6 +544,32 @@ def require_kconv(mesh: Mesh, *, announce: bool = True) -> str:
                       "[kconv] k-convolution router: cpu -> MKL flat-k plan route",
                       scope="rank0", emit=announce)
     return backend
+
+
+def _probe_kconv_compile(mesh: Mesh) -> None:
+    """Compile and run one tiny mathdx kernel (mode 3, k-grid 2x1x1) on this
+    process's first mesh device (else its first local device), so a device the installed cuFFTDx cannot
+    compile for refuses at startup, naming its compute capability, rather than
+    at the first k-convolution.  The cubin is disk-cached like every other."""
+    local = [d for d in mesh.devices.flat if d.process_index == jax.process_index()]
+    dev = local[0] if local else jax.local_devices()[0]
+    x = jax.device_put(jnp.zeros((2, 1), jnp.complex128), dev)
+    try:
+        jax.block_until_ready(jax.jit(lambda x: _rows_kfft_call(
+            KFFT_KLEAD_TARGET, x, (2, 1, 1), forward=True, scale=1.0))(x))
+    except Exception as e:                                          # noqa: BLE001
+        from importlib import metadata
+        try:
+            wheel = metadata.version("nvidia-mathdx")
+        except metadata.PackageNotFoundError:
+            wheel = "?"
+        cc = getattr(dev, "compute_capability", "?")
+        raise RuntimeError(
+            f"GATE mathdx-probe: got a probe compile failure on {dev.device_kind} (compute "
+            f"capability {cc}) with nvidia-mathdx {wheel}; want every mathdx kernel to compile "
+            "for this device; why: cuFFTDx defines a fixed list of SM targets and the kernels "
+            "are built by NVRTC for the device's own; fix: a nvidia-mathdx wheel that supports "
+            f"this architecture. Cause: {e}") from e
 
 
 def _cubin_cache_summary() -> str:
@@ -1091,10 +1118,18 @@ def make_plane_fft_gather(mesh: Mesh, plane_from_col, n_col: int, plane_shape) -
     pfc = np.asarray(plane_from_col, dtype=np.int64).reshape(-1)
     if pfc.size != nb * nc:
         raise ValueError(f"plane_from_col has {pfc.size} cells; want n_b·n_c = {nb * nc}")
+    if pfc.size and not (0 <= int(pfc.min()) and int(pfc.max()) <= n_col):
+        raise ValueError(f"plane_from_col entries must lie in [0, n_col={n_col}] (n_col = "
+                         f"empty); got [{int(pfc.min())}, {int(pfc.max())}]")
     runs = _plane_runs(pfc, n_col)
 
+    def _check_c128(F):
+        if jnp.dtype(F.dtype) != jnp.dtype(jnp.complex128):
+            raise TypeError(f"GATE plane-fft-dtype: got F {F.dtype}; want complex128 (mode 10 and "
+                            "its XLA route keep one contract; the kernel is fp64); fix: pass complex128")
+
     def _xla(F, start=None, size=None):
-        _check_complex(F)
+        _check_c128(F)
         if start is not None:
             F = jax.lax.dynamic_slice_in_dim(F, start, int(size), axis=1)
         z = lambda n: jnp.zeros(F.shape[:-1] + (n,), F.dtype)
@@ -1128,7 +1163,7 @@ def make_plane_fft_gather(mesh: Mesh, plane_from_col, n_col: int, plane_shape) -
                   f"{rows.size} of {nb} rows occupied", scope="rank0")
 
     def _mathdx(F, start=None, size=None):
-        _check_complex(F)
+        _check_c128(F)
         if int(F.shape[-1]) != n_col:
             raise ValueError(f"plane FFT expects F (..., n_col={n_col}); got {F.shape}")
         lead = F.shape[:-1]

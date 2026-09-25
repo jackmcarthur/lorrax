@@ -122,3 +122,35 @@ def test_cpu_door_is_the_xla_route():
         got = np.asarray(jax.jit(make_plane_fft_gather(mesh, pfc, n_col, (nb, nc)))(F))
         ref = _reference(F, pfc, n_col, nb, nc)
         assert np.max(np.abs(got - ref)) <= 1e-13 * np.max(np.abs(ref))
+
+
+def test_door_refuses_c64_and_out_of_range_tables():
+    """One contract on both routes (audit findings 6, 10): complex128 only, and
+    plane_from_col in [0, n_col]."""
+    import jax
+    import jax.numpy as jnp
+    from jax.sharding import Mesh
+    mesh = Mesh(np.array(jax.devices("cpu")[:1]).reshape(1, 1), ("x", "y"))
+    pfc, n_col = _support(24, 24, 0.2, np.random.default_rng(3), "disk")
+    fn = make_plane_fft_gather(mesh, pfc, n_col, (24, 24))
+    with pytest.raises(TypeError, match="GATE plane-fft-dtype"):
+        fn(jnp.zeros((2, n_col), jnp.complex64))
+    bad = pfc.copy()
+    bad[0] = -1
+    with pytest.raises(ValueError, match="plane_from_col entries"):
+        make_plane_fft_gather(mesh, bad, n_col, (24, 24))
+
+
+def test_require_kconv_probes_a_compile(monkeypatch):
+    """require_kconv compiles one tiny kernel at startup (audit finding 7), so a
+    device cuFFTDx cannot compile for refuses there, not at the first call."""
+    import ffi.fft as F
+    monkeypatch.setattr(F, "kconv_backend", lambda mesh: "mathdx")
+    monkeypatch.setattr(F, "mathdx_root", lambda: "/nonexistent")
+    monkeypatch.setattr(F, "_require_target", lambda target, platform: None)
+
+    def probe(mesh):
+        raise RuntimeError("GATE mathdx-probe: test")
+    monkeypatch.setattr(F, "_probe_kconv_compile", probe)
+    with pytest.raises(RuntimeError, match="GATE mathdx-probe"):
+        F.require_kconv(None, announce=False)
