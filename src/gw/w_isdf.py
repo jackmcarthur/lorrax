@@ -130,8 +130,7 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int],
             ns_ = int(face_shape[3])
             parent_blocks = not spin_pairs_needed(
                 n_full=nk, n_rmu=int(face_shape[2]), ns=ns_, mesh=mesh_xy,
-                live_green_tiles=(4.0 * k_unfold_plan.n_parent / nk + 8.0 / ns_ ** 2),
-                resident=True)
+                live_green_tiles=(4.0 * k_unfold_plan.n_parent / nk + 8.0 / ns_ ** 2))
     cache_key = (_mesh_key(mesh_xy), kgrid, ffi_dial_key(), n_out,
                  complex_contour, layout, face_shape, right_face_shape,
                  vertex_classes, (tuple(id(p) for p in k_unfold_plan)
