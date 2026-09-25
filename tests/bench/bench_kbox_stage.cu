@@ -98,8 +98,20 @@ __global__ void __launch_bounds__(256) today_kernel(const C* x, const C* kern, C
 }
 
 // ---------------- the header's arms, wrapped as the family's modes would ----------------
-struct PlainLoad { static constexpr bool kFinish = false; const C* x; long long n;
+struct PlainLoad { static constexpr bool kDirect = false, kFinish = false; const C* x; long long n;
     __device__ const C* stage(int k, long long c) const { return x + (long long)k * n + c; } };
+// The same elements through the direct-load contract (plain loads, no cp.async): must be bitwise.
+struct DirectLoad { static constexpr bool kDirect = true, kFinish = false; const C* x; long long n;
+    template <class View>
+    __device__ void direct(const View& v, int k0, int k1, long long c0, int width, long long nc) const {
+        for (int i = threadIdx.x; i < (k1 - k0) * width; i += blockDim.x) {
+            const int j = i % width, k = k0 + i / width;
+            C z; z.x = 0; z.y = 0;
+            if (c0 + j < nc) z = x[(long long)k * n + c0 + j];
+            v(k, j) = z;
+        }
+    } };
+struct IdGroup { __device__ void group(int, long long, C*) const {} };
 struct ScaleStore { C* y; long long n; double s;
     __device__ void put(int k, long long c, C v) const { C w; w.x = v.x * s; w.y = v.y * s; y[(long long)k * n + c] = w; } };
 struct VMid { const C* V; long long m0, m1, m2;
@@ -121,6 +133,17 @@ __global__ void __launch_bounds__(THREADS) stage_single(const C* x, C* y, const 
             lrx_kbox::mid_tile<NX, NY, NZ, TR>(bank, c0, n, VMid{V, m0, m1, m2});
             lrx_kbox::transform3<NX, NY, NZ, TR, ARCH, fft_direction::forward>(bank);
         }
+        lrx_kbox::store_tile<NX, NY, NZ, TR>(bank, c0, n, ScaleStore{y, n, s});
+    }
+}
+// Mode 3 through the direct Load and an identity group Mid (GROUP 2): the new contracts' gate.
+template <int NX, int NY, int NZ, int TR, int THREADS = 256>
+__global__ void __launch_bounds__(THREADS) stage_direct3(const C* x, C* y, long long n, double s) {
+    extern __shared__ C bank[];
+    for (long long c0 = (long long)blockIdx.x * TR; c0 < n; c0 += (long long)gridDim.x * TR) {
+        lrx_kbox::stage_tile<NX, NY, NZ, TR>(bank, c0, n, DirectLoad{x, n});
+        lrx_kbox::transform3<NX, NY, NZ, TR, ARCH, cufftdx::fft_direction::forward>(bank);
+        lrx_kbox::mid_group_tile<NX, NY, NZ, TR, 2>(bank, c0, n, IdGroup{});
         lrx_kbox::store_tile<NX, NY, NZ, TR>(bank, c0, n, ScaleStore{y, n, s});
     }
 }
@@ -316,8 +339,10 @@ static void run(long long m) {
         tt = time_ms(ft); ft(); CK(cudaDeviceSynchronize());
         rt = rel(yt, yr, len);
     }
-    // the header's arm
-    std::function<void()> fh;
+    // the header's arm (fd: mode 3 through the direct Load (+ identity group Mid on the single arm))
+    std::function<void()> fh, fd;
+    C* yd = nullptr;
+    if (MODE == 3) CK(cudaMalloc(&yd, len * sizeof(C)));
     if (P.arm == 0 && MODE != 8) {
         constexpr int MD = MODE == 8 ? 3 : MODE;
         auto launch = [&](auto k, int T) {
@@ -331,6 +356,13 @@ static void run(long long m) {
             default: std::printf("  tr %d not instantiated\n", P.tr); return;
         }
 #undef TRC
+        if (MODE == 3) {
+            auto ld = [&](auto k, int T) { const int g = grid_of(k, T, size_t(P.smem));
+                                           fd = [=] { k<<<g, T, size_t(P.smem)>>>(x, yd, n, s); }; };
+#define TRD(TRV) case TRV: ld(stage_direct3<NX, NY, NZ, TRV>, 256); break;
+            switch (P.tr) { TRD(2) TRD(4) TRD(8) TRD(16) TRD(32) TRD(64) default: break; }
+#undef TRD
+        }
     } else {
         const size_t psm = size_t(16) * lrx_kbox::Geo<NX, NY, NZ>::PR * 16;
         using PL = lrx_kbox::Plain<C>;
@@ -341,6 +373,8 @@ static void run(long long m) {
         if (MODE == 3) {
             auto pc = stage_pencil<NX, NY, NZ, false>; const int g2 = grid_of(pc, 256, 0);
             fh = [=] { pf<<<gp, 256, psm>>>(PlainLoad{x, n}, PL{yh, n}, n); pc<<<g2, 256>>>(yh, n, V, m0, m1, m2); };
+            auto pd = stage_plane<NX, NY, NZ, cufftdx::fft_direction::forward, DirectLoad, PL>; grid_of(pd, 256, psm);
+            fd = [=] { pd<<<gp, 256, psm>>>(DirectLoad{x, n}, PL{yd, n}, n); pc<<<g2, 256>>>(yd, n, V, m0, m1, m2); };
         } else if (MODE == 2) {
             auto pc = stage_pencil<NX, NY, NZ, true>; const int g2 = grid_of(pc, 256, 0);
             fh = [=] { pi<<<gp, 256, psm>>>(PlainLoad{x, n}, PL{yh, n}, n); pc<<<g2, 256>>>(yh, n, V, m0, m1, m2);
@@ -361,6 +395,14 @@ static void run(long long m) {
         }
     }
     const float th = time_ms(fh); fh(); CK(cudaDeviceSynchronize());
+    if (fd) {
+        const float td = time_ms(fd); fd(); CK(cudaDeviceSynchronize());
+        bool bd = false;
+        const double dd = rel(yd, yh, len, &bd);
+        std::printf("  direct Load%s: %9.1f us, vs the cp.async stage: %s (%.1e)\n",
+                    P.arm == 0 ? " + group Mid" : "", td * 1e3, bd ? "BITWISE" : "DIFFERS", dd);
+    }
+    if (yd) cudaFree(yd);
     bool bw = false;
     const double rh = rel(yh, yr, len);
     double dht = 0;
