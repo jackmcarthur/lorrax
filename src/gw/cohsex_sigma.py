@@ -12,8 +12,7 @@ import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from .greens_function_kernel import (build_G, pair_stream_layout, spin_pair_rows,
-                                     spin_pairs_needed, to_pair_stream_layout,
-                                     unfold_parent_faces)
+                                     to_pair_stream_layout, unfold_parent_faces)
 from .head_correction import static_head_terms_to_kij
 from .wavefunction_bundle import project as _project
 from .wavefunction_bundle import (SIGMA_CONV_G7D_SPEC, V_FFT5D_SPEC,
@@ -377,13 +376,11 @@ def _make_cohsex_kernels_face(mesh_xy: Mesh, face_shape, _convolve,
         c = wfns.green_parent
         return c.psi_mun, c.psi_nmu, c
 
-    # Spin-pair streaming (A4) when the whole-spin G_occ, its unfold
-    # transient and Σ_k (~2 G_tile) exceed the device target: each (a, b)
-    # block is built at full k, convolved, and projected on the parents' a
-    # and b spinor rows; the band sum over pairs is the same Σ.
-    stream = (k_unfold_plan is not None and ns_g > 1 and spin_pairs_needed(
-        n_full=k_unfold_plan.n_full, n_rmu=n_rmu_g, ns=ns_g, mesh=mesh_xy,
-        live_green_tiles=2))
+    # Spin-pair streaming (A4), the one route for ns > 1: each (a, b) block
+    # is built at full k, convolved, and projected on the parents' a and b
+    # spinor rows; the band sum over pairs is the same Σ, and no ns² G_occ
+    # or Σ_k exists.
+    stream = k_unfold_plan is not None and ns_g > 1
     if stream:
         pair_layout = pair_stream_layout(n_full=k_unfold_plan.n_full, ns=ns_g, mu=n_rmu_g,
                                          nb=nb_g, layout=layout, mesh=mesh_xy)

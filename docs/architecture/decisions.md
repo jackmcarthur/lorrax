@@ -31,6 +31,10 @@ that (owner; sandbox `TASTE.md` 96).
   its projected bands for the call. The post-fit band-complete view and its
   `4·G_tile` admission are gone, so no resident copy competes with the GN
   fit, the GN tail or a second (SC) ψ bundle.
+* **χ₀, Σ_x and the Coulomb hole stream spin pairs for `n_s > 1`.** The
+  step-occupation χ₀ with the charge vertex, Σ_x and the Coulomb hole build
+  one `(a, b)` spinor block of the Green at a time at full k, whatever the
+  budget.
 
 ## 2026-09-24 — NVIDIA k-convolutions run on nvidia-mathdx, behind one platform router
 

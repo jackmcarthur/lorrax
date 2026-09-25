@@ -110,11 +110,15 @@ full-k band-complete copies fit one Green tile it gathers them once and the
 `2·n_s²` block GEMMs are local; otherwise every block GEMM gathers its own
 band panels (`gw.greens_function_kernel.pair_stream_layout`).
 
-`gw.greens_function_kernel.spin_pairs_needed` streams a stage only when its
-whole-spin live set exceeds the target: `3·G_tile` for χ₀ (Gv, Gc and the
-unfold transient), `2·G_tile` for Σ_x, the Coulomb hole and Σ_c(τ) (Σ_k and
-its convolution transient). Otherwise the stage keeps the parent Green and
-the fused unfold convolution.
+The step-occupation χ₀ with the charge vertex, Σ_x and the Coulomb hole
+always stream for `n_s > 1`. Their floor drops from the whole-spin
+`3·G_tile` (χ₀: Gv, Gc and the unfold transient) or `2·G_tile` (Σ_k and its
+convolution transient) to a few `G_tile/n_s²` blocks plus the full-k ψ, at
+`N_k/n_par` times the parent-Green GEMM work. Σ_c(τ) streams only when its
+whole-spin live set, `2·G_tile`, exceeds the target
+(`gw.greens_function_kernel.spin_pairs_needed`); otherwise it keeps the
+parent Green and the fused unfold convolution. Fermi-Dirac χ₀, the
+vertex-pair currents and Σ^B have no stream and hold the whole-spin set.
 
 ## Stage inventory
 
@@ -126,7 +130,7 @@ the fused unfold convolution.
 | V_q | `V_acc` `16·Q·μ_L·μ_R/P`, one q-tile of ζ rows, G panels | `vq_tile_bytes` ([§ V_q](#vq-g-panels-and-q-tiles)) | `GATE vq_tile_budget` |
 | V_q unfold | `16·N_k·μ²/P`, sharded `P(None,'x','y')` | — | — |
 | shared-pole screening and Σ | response-bank faces, pencils, eigh workspace, then G and W tiles | the capacity ledger ([shared-pole model](shared_pole_model.md), byte model) | before allocating, when a stage and its named concurrent stages exceed the budget |
-| static / GN-PPM screening | χ₀ τ-scan: whole-spin `≈3·G_tile`; when that exceeds the target the spin pairs stream ([§ spin pairs](#spin-pair-streaming)), four `(a,b)` blocks `16·N_k·μ²/P` (Gv, Gc and their transforms) plus the parents unfolded to full k (`M_face·N_k/n_par` or `M_axis·N_k/n_par`) and the `16·N_k·μ²/P` accumulator; unchunked over q | nothing | — |
+| static / GN-PPM screening | χ₀ τ-scan: `≈3·G_tile` at `n_s = 1`; for `n_s > 1` the spin pairs stream ([§ spin pairs](#spin-pair-streaming)), four `(a,b)` blocks `16·N_k·μ²/P` (Gv, Gc and their transforms) plus the parents unfolded to full k (`M_face·N_k/n_par` or `M_axis·N_k/n_par`) and the `16·N_k·μ²/P` accumulator; unchunked over q | nothing | — |
 | restart write | one sharded tile, `max(16·Q·μ²/P, 16·Q·μ·N_G/P)` (SlabIO writes per-rank hyperslabs) | — | — |
 
 Replicated per-process metadata (the TRS-augmented centroid permutation and
