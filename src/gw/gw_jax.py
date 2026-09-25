@@ -1102,7 +1102,7 @@ def _sigma_output_fields(
 
 
 def _diagonalize_qp_hamiltonian(
-        band_slices, config, input_dir, kin_ion, print0, qp_solver, sigma_total, wfn):
+        band_slices, config, input_dir, kin_ion, mesh_xy, print0, qp_solver, sigma_total, wfn):
     """Produce the QP eigensystem and initialize output timing."""
     from common import sanity
     sanity.refuse_nonfinite("kin_ion (from kin_ion.h5)", kin_ion,
@@ -1127,7 +1127,8 @@ def _diagonalize_qp_hamiltonian(
     if config.debug.write_wfn_h5 and qp_solver is not QPSolver.SELF_CONSISTENT:
         write_qp_wfn_oneshot(
             U_full, E_full, wfn=wfn, band_slices=band_slices,
-            input_dir=input_dir, qp_solver=qp_solver, print_fn=print0)
+            input_dir=input_dir, qp_solver=qp_solver, mesh=mesh_xy,
+            print_fn=print0)
     return (E_full, U_full, _t_out)
 
 
@@ -1588,7 +1589,7 @@ def main(argv=None):
 	    sigma_total)
 	(
 	    E_full, U_full, _t_out) = _diagonalize_qp_hamiltonian(
-	    band_slices, config, input_dir, kin_ion, print0, qp_solver, sigma_total, wfn)
+	    band_slices, config, input_dir, kin_ion, mesh_xy, print0, qp_solver, sigma_total, wfn)
 	(
 	    h_transverse_diag_ry, head_sigma_split_skn_ry, omega_rel_ev, sig_coh_diag_ry,
 	    sig_h_diag_ry, sig_h_scalar_diag_ry, sig_sx_diag_ry, sigma_c_diag_at_dft_ry,
