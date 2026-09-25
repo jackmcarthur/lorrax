@@ -110,3 +110,14 @@ def test_chi_door_refuses_one_partner():
         assert "both partners" in str(exc)
     else:
         raise AssertionError("a chi door with one partner tile was accepted")
+
+
+def test_chi_unfold_refusal_matches_the_handler_residency_rule():
+    """The route's predicate reproduces the arms the handler built on an A100 (opt-in 166912 B)
+    and refuses a grid neither arm holds."""
+    from ffi.fft import chi_unfold_refusal
+    a100 = 166912
+    assert chi_unfold_refusal((6, 6, 1), 4, a100) == ""       # single pass (75776 B at tr = 4)
+    assert chi_unfold_refusal((12, 12, 9), 2, a100) == ""     # single pass at one pair, 166016 B
+    assert chi_unfold_refusal((8, 8, 8), 4, a100) == ""       # split: plane 18688 B, pencil 33792 B
+    assert "opt-in" in chi_unfold_refusal((40, 40, 40), 4, a100)

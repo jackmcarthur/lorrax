@@ -1304,8 +1304,9 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
         os << "GATE mathdx-kconv-chi-residency: got k-grid (" << nkx << "," << nky << "," << nkz << ") with ns="
            << ns << ", whose k-box " << (kplan.arm ? "split" : "single") << " arm needs " << chi_smem << " / "
            << chi_smem2 << " B; want <= " << smem_optin << " B of opt-in shared memory and plane tiles of whole "
-              "spin groups; why: mode 11 forms each pair from its 2*ns^2 transformed columns; fix: the chi0 "
-              "route keeps its XLA path for this grid (ffi.fft.chi_unfold_supported)";
+              "spin groups; why: mode 11 forms each pair from its 2*ns^2 transformed columns; fix: none here -- "
+              "the chi0 route asks ffi.fft.chi_unfold_refusal first and keeps its face kernel for such a grid, "
+              "so reaching this gate means that predicate and this rule disagree";
         return sticky("residency", os.str(), ffi::ErrorCode::kInvalidArgument);
     }
     if (mode == 8 && rb < ns * ns) {
@@ -1841,7 +1842,7 @@ static ffi::Error KleadLorentzImpl(
                 static_cast<const int*>(lsrc.untyped_data()), static_cast<const int*>(rsrc.untyped_data()),
                 static_cast<const double*>(mph.untyped_data()), static_cast<const double*>(nph.untyped_data()),
                 static_cast<const double*>(spin.untyped_data()), ml, nl,
-                kout ? static_cast<const int*>(kout->untyped_data()) : nullptr, conj_src ? 2 : 0, nullptr};
+                kout ? static_cast<const int*>(kout->untyped_data()) : nullptr, conj_src ? 2 : 0, nullptr, 0, 0};
     const void* gpp = Gp.untyped_data();
     const void* gtp = Gt.untyped_data();
     const void* vp = V.untyped_data();
@@ -1935,7 +1936,7 @@ static ffi::Error KleadUnfoldFft(
                 static_cast<const int*>(lsrc.untyped_data()), static_cast<const int*>(rsrc.untyped_data()),
                 static_cast<const double*>(mph.untyped_data()), static_cast<const double*>(nph.untyped_data()),
                 static_cast<const double*>(spin_l.untyped_data()), ml, nl, nullptr,
-                static_cast<int>(conj_trs), static_cast<const double*>(spin_r.untyped_data())};
+                static_cast<int>(conj_trs), static_cast<const double*>(spin_r.untyped_data()), 0, 0};
     const void* wpp = Wp.untyped_data();
     const void* wtp = Wt.untyped_data();
     void* yp = Y->untyped_data();
@@ -2009,7 +2010,7 @@ static ffi::Error KleadChiUnfold(
                 static_cast<const int*>(lsrc.untyped_data()), static_cast<const int*>(rsrc.untyped_data()),
                 static_cast<const double*>(mph.untyped_data()), static_cast<const double*>(nph.untyped_data()),
                 static_cast<const double*>(spin.untyped_data()), ml, nl, nullptr, static_cast<int>(conj_trs),
-                nullptr};
+                nullptr, 0, 0};
     // acc is aliased to acc_in (input_output_aliases); a copy only if XLA did not alias.
     if (acc->untyped_data() != acc_in.untyped_data())
         LRX_CUDA_CHECK(cudaMemcpyAsync(acc->untyped_data(), acc_in.untyped_data(), acc_in.size_bytes(),
