@@ -133,14 +133,14 @@ the fused unfold convolution.
 
 | stage | resident per rank (leading terms) | priced by | refuses |
 |---|---|---|---|
-| ψ(G) and centroid faces | charge fit: conj ψ(G) on the rank's G slots, `16·N_k·N_b·n_s·N_Gψ/P`. Centroid carrier `ψ(r_μ)`: `M_face` during the fit, then `M_axis` for the GW stages when admitted ([§ ψ carriers](#ψ-carriers-face-and-band-complete)) | the ζ-fit planners below; `band_complete_gw_carriers` | with the fit |
+| ψ(G) and centroid faces | charge fit: conj ψ(G) on the rank's G slots, `16·N_k·N_b·n_s·N_Gψ/P`. Centroid carrier `ψ(r_μ)`: `M_face` during the fit, then `M_axis` for the GW stages when admitted ([§ ψ carriers](#ψ-carriers-face-and-band-complete)) | `plan_zeta_route_g`; `band_complete_gw_carriers` | with the fit |
 | ζ fit, charge channel (route G) | C factor, one μ-batch working set, the ψ(G) slice; the Z store `16·Q·μ·N_G/P` lives on host or disk | `plan_zeta_route_g` ([§ route G](#route-g-every-ζ-fit)) | `GATE zeta-mubatch-capacity` |
 | ζ fit, current channels (bispinor) | the same, at μ_T, with three factors, accumulators and Z stores | `plan_zeta_route_g(n_vertex=3)` ([§ route G](#route-g-every-ζ-fit)) | `GATE zeta-mubatch-capacity` |
 | V_q | `V_acc` `16·Q·μ_L·μ_R/P`, one q-tile of ζ rows, G panels | `vq_tile_bytes` ([§ V_q](#vq-g-panels-and-q-tiles)) | `GATE vq_tile_budget` |
 | V_q unfold | `16·N_k·μ²/P`, sharded `P(None,'x','y')` | — | — |
 | shared-pole screening and Σ | response-bank faces, pencils, eigh workspace, then G and W tiles | the capacity ledger ([shared-pole model](shared_pole_model.md), byte model) | before allocating, when a stage and its named concurrent stages exceed the budget |
 | static / GN-PPM screening | χ₀ τ-scan: whole-spin `≈3·G_tile`; when that exceeds the target the spin pairs stream ([§ spin pairs](#spin-pair-streaming)), four `(a,b)` blocks `16·N_k·μ²/P` (Gv, Gc and their transforms) plus the parents unfolded to full k (`M_face·N_k/n_par` or `M_axis·N_k/n_par`) and the `16·N_k·μ²/P` accumulator; unchunked over q | nothing | — |
-| restart write | one sharded tile, `max(16·Q·μ²/P, 16·Q·μ·N_G/P)` | stage F | — |
+| restart write | one sharded tile, `max(16·Q·μ²/P, 16·Q·μ·N_G/P)` (SlabIO writes per-rank hyperslabs) | — | — |
 
 Replicated per-process metadata (the TRS-augmented centroid permutation and
 lattice-wrap tables, `O(n_sym·μ)`; the q-folding tables, `O(N_k)`) is
@@ -226,87 +226,12 @@ reduction shrinks the ζ store and the fit's accumulator by `N_k/Q`, not the
 
 ## What the closed forms cannot see
 
-### cuFFT plan scratch
-
-XLA's FFT thunk takes the cuFFT plan workspace from a runtime scratch
-allocator, outside buffer assignment, so `compiled.memory_analysis()` and
-`jax.live_arrays()` both miss it. It is shape-dependent: at a mixed-radix
-`(75, 75, 200)` grid the scratch equals the data, while at `(60, 60, 200)`,
-`64³` and `32³` it is zero. The spatial FFT terms are therefore measured, not
-assumed:
-
-```text
-gflat_memory_model._fft_box_bytes
-  → common.fft_helpers.query_fft_peak_bytes     compiles the production helper at the exact kind and norm
-    → runtime.aot_memory.aot_kernel_peak_bytes
-        compiled.memory_analysis()               → compiled_peak
-        cufftMakePlanMany on jaxlib's libcufft   → cufft_scratch
-        total = compiled_peak + cufft_scratch
-```
-
-On XLA:CPU the scratch is exactly zero, decided from the platform. Each
-weaker path announces itself once: a failed probe compile gives a 3× data
-bound, no real `Mesh` gives the analytic 4× box bound below, and an
-unavailable libcufft gives `cufft_scratch = 0` with `cufft_measured = False`.
-
-### FFT peak memory
-
-The analytic fallback prices one ψ(G)→ψ(r) transform at four copies of the
-shard `(N_k, B_b/P, n_s, N_r)`: the input, the output and two staging buffers
-of the three 1-D passes. The count is exact for shards above ~0.3 GB and runs
-10–15 % low below that, where plan and phase-table overheads show.
-
 ### Native handlers
 
 The nvidia-mathdx k-convolution kernels allocate no device workspace beyond
 shared memory ([FFI layer](ffi_layout.md#k-convolution-router-and-the-mathdx-family)).
 On CPU the host `gw_conv` handler keeps a reused host arena of
 `16·N_k·m_x·m_y` bytes and per-thread compact chunks, outside XLA.
-
-## Measured corrections behind the G-flat terms
-
-Each term below exists because a run failed without it; do not remove one
-without re-measuring.
-
-1. **`loader_tables`, a P-independent floor.** The WFN loader keeps two
-   replicated per-k arrays for its lifetime: an int32 index table and the
-   τ-phase row `(N_k, N_Gψ)`. The planner prices them at
-   `4·N_k·N_r + 16·N_k·N_Gψ` bytes, whose first term is the dense-box size
-   and bounds the `(N_k, N_Gψ)` sphere index from above. They are in the
-   floor because adding ranks never shrinks them.
-2. **Stage C's gathered ψ(r) slab carries two mesh divisions** (both
-   layouts). Each rank computes its `1/P` band block over the full r-chunk,
-   then runs `all_to_all('y')` (split r, concatenate bands) and
-   `all_gather('x')` (bands). Each rank holds `(n_k, band_chunk, n_s,
-   r_chunk/p_y)` (all bands, its r block), twice to cover the short-final-chunk
-   compaction, plus its own `band_chunk/P` bands over the full r-chunk, the
-   all-to-all source (`n_k` the parents on the parent route). The planner prices
-   both divisions, so no r-tile width is admitted whose slab is undivided by the
-   mesh.
-3. **Stage F takes the larger of two tensors.** The restart write carries
-   `V_qμν`/`W0_qμν` `(Q, μ, μ)` and the G-flat ζ tensor `(Q, μ, N_G)`. SlabIO
-   writes per-rank hyperslabs, so each costs one sharded tile, and the ζ
-   tensor binds whenever `N_G > μ`.
-
-**Pair-density slots.** The Stage-C arena is a BufferAssignment fact, not
-shape algebra; do not lower it by inspecting the kernel.
-
-- **Face layout** (`_face_pair_density_slots`): 4 rank-3 equivalents for the
-  identity-vertex executable, namely the old and new `Z_R` and the two
-  k-IFFT outputs. The current-vertex executable gets `n_s²`, because XLA
-  places its scalar spin-pair loop as one open-spin
-  `(N_k, n_s, n_s, μ/p_x, r/p_y)` arena.
-- **Axis layout** (`_pair_density_slots`): 3 rank-5 buffers on GPU XLA (two
-  pair carries and one scratch slot), 4 on CPU XLA.
-
-Re-read the count after any Stage-C kernel change, as the number of distinct
-preallocated-temp slots holding a pair-shaped value:
-
-```bash
-XLA_FLAGS="--xla_dump_to=./hlo --xla_dump_hlo_pass_re=memory-usage-report" \
-  python -m gw.gw_jax -i cohsex.in
-ls ./hlo/module_*.memory-usage-report.txt
-```
 
 ## Communication cost model
 
@@ -349,16 +274,12 @@ per batch against rule 1. All planners stay single-stage and generic.
 2. **Mesh.** Use a square mesh. Every chunked term and the default
    face-layout centroid copies fall as `1/P`.
 3. **Read the receipts** in `gwjax.out`: `ISDF μ-batch plan` for each ζ
-   fit (the charge channel, and the current channels with `channels = 3`).
-   The `ISDF memory model` A–F receipt prices only dict fields the fits
-   still read and is marked not binding. Each names its binder.
+   fit (the charge channel, and the current channels with `channels = 3`),
+   which names its binder, and `GW ψ carriers` for the GW stages.
 4. **On a refusal**, add ranks or memory per device: `GATE
    zeta-mubatch-capacity` names ψ(G) and the smallest batch. For V_q, more
    ranks, fewer centroids, or a smaller ζ sphere; `vq_g_chunk_size` shrinks
    only the panel workspace.
 5. **Compare with the run.** Define `γ = runtime peak / planner HWM`; `γ > 1`
-   is an under-estimate to investigate. Count Stage-C slots in the HLO
-   memory-usage report before changing `_pair_density_slots`, and check the
-   log for a `[memory-model]` announcement, which means a term fell back to
-   an analytic bound. `tools/profile_gw_xprof.py` captures an XProf trace
-   whose modules map onto the stages above.
+   is an under-estimate to investigate. `tools/profile_gw_xprof.py` captures
+   an XProf trace whose modules map onto the stages above.

@@ -64,8 +64,6 @@ The material class is inferred from the WFN occupations; no deck key selects it.
 | `low_mem_bands` | bool | `true` | Raw-parent ψ layout. `true`: two mesh-face copies with distributed band contractions. `false`: two single-axis centroid copies with complete bands and local band contractions, which use more memory. The Green's-function, screening and projection algorithms are the same for both. |
 | `linalg` | str | `local` | Dense linear-algebra layout. `local`: each task factors ⌈N_q,irr/P⌉ whole N_μ×N_μ matrices (the startup report prints the complex128 GiB per task). `distributed`: 2-D block-distributed matrices through the `distrib_la` providers (cuSOLVERMp/cuBLASMp on CUDA, ScaLAPACK on CPU) for the W Dyson solve, the transverse ζ LU and the eigensolvers; the charge ζ solve stays whole-tile (route G). The value does not invalidate a restart. |
 | `memory_per_device_gb` | float | `0.0` | Per-device budget for the chunk planners; `0` auto-detects it. |
-| `r_chunk_size` | int | `0` | Real-space tile width of the bispinor current-channel (transverse) ζ fits. `0` lets the planner size it from the memory budget; an explicit value overrides the budget cap and turns the planner's over-budget refusal into a warning. The charge channel runs route G, whose own planner sizes its tiles. |
-| `gflat_chunk_size` | int | `0` | Stage-D flat-axis chunk of the ζ-fit accumulation. `0` lets the planner choose. |
 | `vq_g_chunk_size` | int | `0` | G-axis tile of the V_q GEMM. `0` lets `v_q_g_flat._plan_vq_tiles` choose. |
 | `gamma_contract_mode` | str | `take` | HLO variant of the γ̃ double contraction: `take`, `einsum` or `scan`. All three are mathematically identical. |
 

@@ -48,7 +48,6 @@ import jax.numpy as jnp                                         # noqa: E402
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P  # noqa: E402
 
 import common.fft_helpers as fft_helpers                        # noqa: E402
-import gw.gflat_memory_model as gmm                             # noqa: E402
 import runtime.aot_memory as aot                                # noqa: E402
 
 
@@ -101,48 +100,6 @@ def _fake_compiled(*, temp=0, arg=0, out=0, alias=0, hlo=_HLO_WITH_FFT):
 # ---------------------------------------------------------------------------
 
 
-def test_planner_fft_term_flows_through_aot_kernel_peak_bytes(monkeypatch):
-    """``_fft_box_bytes`` must obtain its number from the cuFFT-aware
-    microservice, not from a private ``memory_analysis()`` of its own.
-
-    Proof by sentinel: we replace ``aot_kernel_peak_bytes`` with a wrapper
-    that adds a value no shape algebra could produce.  If the planner's FFT
-    term contains that value, it went through the wrapper.
-    """
-    sentinel = 777_000_111  # not a multiple of 16; no byte formula yields it
-    calls = []
-    real = aot.aot_kernel_peak_bytes
-
-    def spy(compiled, **kw):
-        got = real(compiled, **kw)
-        calls.append((got, kw))
-        return aot.AotPeakBreakdown(
-            compiled_peak=got.compiled_peak,
-            cufft_scratch=got.cufft_scratch + sentinel,
-            total=got.total + sentinel,
-            cufft_measured=got.cufft_measured,
-            fft_specs=got.fft_specs,
-        )
-
-    monkeypatch.setattr(aot, "aot_kernel_peak_bytes", spy)
-
-    box = gmm._fft_box_bytes(nk=_NK, bc=_BC, ns=_NS, fft_grid=_GRID,
-                             mesh_xy=_unit_mesh(), p_xy=1)
-
-    assert calls, (
-        "gflat_memory_model._fft_box_bytes did not call "
-        "runtime.aot_memory.aot_kernel_peak_bytes.  The FFT-box term is back "
-        "to a peak that cannot include cuFFT plan workspace.")
-    assert box >= sentinel, (
-        f"FFT-box term {box} does not carry the sentinel {sentinel}: the "
-        f"planner is not using the value the cuFFT-aware path returned.")
-    assert calls[0][1].get("platform") in ("cpu", "gpu", "cuda"), (
-        "the caller must DECLARE the mesh platform: XLA:CPU also emits a "
-        "parseable fft op, so the microservice cannot infer from the HLO "
-        f"whether 0 cuFFT scratch is a fact or a gap.  Got kwargs "
-        f"{calls[0][1]!r}.")
-
-
 @pytest.mark.parametrize(
     ("kind", "norm", "factory_name"),
     (("fftn", None, "make_sharded_fftn_3d"),
@@ -180,25 +137,6 @@ def test_probe_compiles_the_exact_helper_production_uses(
         f"query_fft_peak_bytes did not compile {factory_name} — the memory "
         "model is probing an FFT form production does not run.")
     assert seen[0][1]["norm"] == norm
-
-
-def test_gflat_prices_the_production_wfn_spatial_ifft(monkeypatch):
-    """Stage A must request the WFN path's inverse, orthonormal transform."""
-    seen = []
-
-    def fake_query(**kwargs):
-        seen.append(kwargs)
-        return 123_456_789
-
-    monkeypatch.setattr(fft_helpers, "query_fft_peak_bytes", fake_query)
-    got = gmm._fft_box_bytes(
-        nk=_NK, bc=_BC, ns=_NS, fft_grid=_GRID,
-        mesh_xy=_unit_mesh(), p_xy=1)
-
-    assert got == 123_456_789
-    assert len(seen) == 1
-    assert seen[0]["kind"] == "ifftn"
-    assert seen[0]["norm"] == "ortho"
 
 
 def test_query_result_is_the_breakdown_total(monkeypatch):
@@ -363,32 +301,6 @@ def test_hlo_format_drift_raises_rather_than_reporting_zero():
 # ---------------------------------------------------------------------------
 # The announcement machinery itself (an instrument that must be able to fail)
 # ---------------------------------------------------------------------------
-
-
-def test_no_mesh_fallback_announces(capsys):
-    """Without a real ``Mesh`` the FFT box falls back to the analytic 4.0x
-    box-copy bound — which does not model cuFFT workspace — and says so."""
-    fake_mesh = SimpleNamespace(shape={'x': 4, 'y': 4})
-    box = gmm._fft_box_bytes(nk=8, bc=16, ns=2, fft_grid=(10, 10, 10),
-                             mesh_xy=fake_mesh, p_xy=16)
-    # 16 bytes * nk * bc * ns * n_rtot / p_xy * 4.0
-    assert box == pytest.approx(16 * 8 * 16 * 2 * 1000 / 16 * 4.0)
-    out = capsys.readouterr().out
-    assert "memory-model" in out and "UNDER-predict" in out, (
-        f"the analytic fallback was silent; stdout was {out!r}")
-
-
-def test_no_mesh_fallback_scales_linearly_with_nk(capsys):
-    """The k axis is replicated, not absent from the FFT box."""
-    fake_mesh = SimpleNamespace(shape={'x': 2, 'y': 2})
-    one_k = gmm._fft_box_bytes(
-        nk=1, bc=8, ns=1, fft_grid=(8, 8, 8),
-        mesh_xy=fake_mesh, p_xy=4)
-    seven_k = gmm._fft_box_bytes(
-        nk=7, bc=8, ns=1, fft_grid=(8, 8, 8),
-        mesh_xy=fake_mesh, p_xy=4)
-    assert seven_k == pytest.approx(7 * one_k)
-    capsys.readouterr()
 
 
 def test_announce_once_speaks_then_dedupes(capsys):

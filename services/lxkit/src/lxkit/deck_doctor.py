@@ -341,8 +341,7 @@ def inspect_deck(args) -> None:
     print("MEMORY_DIALS "
           f"per_device={memory_value}; chunk_utilization="
           f"{memory.chunk_target_utilization:g}; "
-          f"band={memory.band_chunk_size}; r={memory.r_chunk_override}; "
-          f"gflat={memory.gflat_chunk_size}; vq_g={memory.vq_g_chunk_size}; "
+          f"band={memory.band_chunk_size}; vq_g={memory.vq_g_chunk_size}; "
           f"low_mem_bands={memory.low_mem_bands}")
     print(f"LINALG_DIALS {config.backend.summary()}")
 

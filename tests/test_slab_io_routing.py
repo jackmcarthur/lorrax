@@ -130,7 +130,6 @@ def test_deleted_hdf5_selectors_do_not_survive_in_neighbouring_apis():
     import ast
     import inspect
     from common.wfn_transforms import load_centroids_band_chunked
-    from gw.gflat_memory_model import plan_gflat_chunks
 
     # kmeans_cli initializes the communicator stack at import time, so parser
     # vocabulary is intentionally checked without importing the driver on a
@@ -150,8 +149,6 @@ def test_deleted_hdf5_selectors_do_not_survive_in_neighbouring_apis():
     assert "--use-phdf5" not in options
     assert "use_phdf5" not in inspect.signature(
         load_centroids_band_chunked).parameters
-    assert "slab_io_replicates" not in inspect.signature(
-        plan_gflat_chunks).parameters
 
 
 @pytest.mark.parametrize("value, expected", [
