@@ -599,6 +599,19 @@ def _finalize_model(path, *, meta, header, basis=None):
         return _read_header(path)
 
 
+def _covering_windows(total, span):
+    """``(start, first_new)`` of ``span``-wide windows covering ``range(total)``.
+
+    The last window is shifted back to end at ``total``, so every window has
+    one shape; ``first_new`` is its first index no earlier window covered.
+    """
+    starts = list(range(0, total, span))
+    if total > span:
+        starts[-1] = total - span
+    return [(start, 0 if i == 0 else starts[i - 1] + span - start)
+            for i, start in enumerate(starts)]
+
+
 @timing.timed("shared_pole_store.digest")
 def _model_digest(path, header, mesh, *, capacity):
     """Grid-independent SHA256 of metadata and canonical row digests.
@@ -615,21 +628,27 @@ def _model_digest(path, header, mesh, *, capacity):
     components = header.get("factor_components", 1)
     ncan = ((nmu + int(mesh.size)-1)//int(mesh.size))*int(mesh.size)
     column_cap = max(1, (kmax + int(mesh.shape["y"])-1)//int(mesh.shape["y"]))
-    panel = 16*components*ncan*min(kmax,column_cap)//int(mesh.shape["x"])
+    # One panel shape per map series (A9): Kmax and the last q batch move
+    # every SC map and the validation program is keyed by the panel, so the
+    # panel width sits on the extent ladder and the last parent batch and
+    # column panel are shifted back to overlap their predecessors. An
+    # overlapped parent or column is validated twice and hashed once.
+    width = min(kmax, ladder_extent(column_cap))
+    panel = 16*components*ncan*width//int(mesh.shape["x"])
     batch_limit = min(int(mesh.size), header["n_q_irr"])
     _admit(capacity, "digest", batch_limit*(panel+8*kmax+256*nmu*components),
            batch_limit*(panel+24*kmax), host_payload=batch_limit*panel,
            device_panel=batch_limit*panel,
            host_metadata=batch_limit*(256*nmu*components+8*kmax), native_host=True)
     with open_shared_pole_model(path, mesh_xy=mesh) as io:
-        for q0 in range(0, header["n_q_irr"], batch_limit):
-            q1 = min(q0+batch_limit, header["n_q_irr"])
+        for q0, q_new in _covering_windows(header["n_q_irr"], batch_limit):
+            q1 = q0+batch_limit
             batch = q1-q0
             active_counts = np.asarray(header["K"][q0:q1], np.int64)
             if kmax == 0:
                 if np.any(active_counts != 0):
                     _refuse("nonzero K in empty model")
-                for _ in range(batch):
+                for _ in range(q_new, batch):
                     digest.update(hashlib.sha256(b"").digest() * (nmu*components))
                 continue
             with timing.section('pole_read'):
@@ -639,25 +658,25 @@ def _model_digest(path, header, mesh, *, capacity):
                 if np.any(np.diff(row[:count]) < 0):
                     _refuse("active poles are unsorted across column panels")
             hashers = [{} for _ in range(batch)]
-            for c0 in range(0, kmax, column_cap):
-                c1 = min(kmax, c0+column_cap)
+            for c0, c_new in _covering_windows(kmax, width):
+                c1 = c0+width
                 with timing.section('factor_read_and_validation'):
-                    b = io.read_slab("factor", shape=(batch,ncan,components,c1-c0), offset=(q0,0,0,c0),
+                    b = io.read_slab("factor", shape=(batch,ncan,components,width), offset=(q0,0,0,c0),
                                      partition_spec=P(None,"x",None,None))
-                    counts = np.clip(active_counts-c0, 0, c1-c0)
-                    _check_factor(b, poles[:,c0:c1], counts)
+                    counts = np.clip(active_counts-c0, 0, width)
+                    _check_factor(b, host_poles[:,c0:c1], counts)
                 with timing.section('host_digest_hashing'):
                     for shard in b.addressable_shards:
                         if shard.replica_id != 0:
                             continue
                         start = shard.index[1].start or 0
                         local = np.asarray(shard.data)
-                        for q in range(batch):
+                        for q in range(q_new, batch):
                             for i in range(min(local.shape[1], nmu-start)):
                                 for component in range(components):
                                     row = (start+i)*components+component
                                     hasher = hashers[q].setdefault(row, hashlib.sha256())
-                                    hasher.update(np.asarray(local[q,i,component], dtype="<c16").tobytes())
+                                    hasher.update(np.asarray(local[q,i,component,c_new:], dtype="<c16").tobytes())
                     shard = local = None
                     del b
             row_hash = np.zeros((batch,nmu*components,32), np.uint32)
@@ -667,7 +686,7 @@ def _model_digest(path, header, mesh, *, capacity):
             with timing.section('digest_reduction'):
                 row_hash = psum_replicate(row_hash, mesh)
                 # Preserve the original q-major row-hashes then poles byte stream.
-                for q in range(batch):
+                for q in range(q_new, batch):
                     digest.update(row_hash[q].astype(np.uint8).tobytes())
                     digest.update(np.asarray(host_poles[q:q+1], dtype="<f8").tobytes())
     return digest.hexdigest()
