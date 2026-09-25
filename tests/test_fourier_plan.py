@@ -213,6 +213,12 @@ def test_stage_order_and_backend_choice(monkeypatch):
     plan = LocalFourierPlan((8, 10, 12), (0, 1, 2), device_kind="__mixed__", **kw)
     assert plan.stages == [(1, "fft", 10, 10), (2, "fft", 12, 3), (0, "gemm", 4, 8)]
     assert fourier_plan.gemm_crossover("an unknown accelerator") == (0, 0)
+    # the A100 row: supported plane axes on the GEMM, a full axis on the FFT
+    sup = {1: np.arange(-13, 14) % 54, 2: np.arange(27)}
+    x = _crandn(_rng("a100"), (2, 27, 27, 9))
+    plan = _check(x, (54, 54, 9), (1, 2, 3), sign=-1, in_sup=sup,
+                  kind="NVIDIA A100-SXM4-40GB")
+    assert plan.stages == [(3, "fft", 9, 9), (2, "gemm", 27, 54), (1, "gemm", 27, 54)]
 
 
 def test_plan_inside_shard_map():
