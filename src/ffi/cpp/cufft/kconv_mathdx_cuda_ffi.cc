@@ -112,9 +112,6 @@
 #include <tuple>
 #include <vector>
 
-#include <dirent.h>
-
-
 #include "../common/mkl_thread_pin.h"
 #include "../common/lrx_async_gather.h"
 #include "../common/nvrtc_build.h"
@@ -990,26 +987,6 @@ static std::map<Key, std::string> g_fail;
 using nvrtc::exists;
 using nvrtc::toolkit_include;
 
-// The nvidia-mathdx wheel's dist-info directory name(s) beside `root`
-// (<site>/nvidia/mathdx -> <site>/nvidia_mathdx-<version>.dist-info): one
-// listing of one directory; "" when the headers are not a wheel install.
-static std::string mathdx_dist_info(const std::string& root) {
-    const std::string site = root + "/../..";
-    DIR* d = opendir(site.c_str());
-    if (!d) return "";
-    std::vector<std::string> names;
-    while (dirent* e = readdir(d)) {
-        const std::string n(e->d_name);
-        if (n.rfind("nvidia_mathdx-", 0) == 0 && n.size() > 10 && n.substr(n.size() - 10) == ".dist-info")
-            names.push_back(n);
-    }
-    closedir(d);
-    std::sort(names.begin(), names.end());
-    std::string out;
-    for (const auto& n : names) out += n + ";";
-    return out;
-}
-
 // nsr: the right endpoint width of mode 9 (0 = ns, every other mode).
 static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
                         std::string_view mathdx_root, std::string_view cubin_dir, const Built** out,
@@ -1110,7 +1087,7 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
     const std::string cuda_inc = toolkit_include(&why);
     if (cuda_inc.empty()) return sticky("CUDA toolkit headers for NVRTC", why);
     const std::string root(mathdx_root);
-    const std::string inc = root + "/include", cutlass = root + "/external/cutlass/include";
+    const std::string inc = root + "/include";
     if (!exists(inc + "/cufftdx.hpp")) {
         return sticky("GATE mathdx-headers",
                       "got no cufftdx.hpp under " + inc + "; want the nvidia-mathdx wheel; fix: "
@@ -1144,12 +1121,7 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
     if (std::string_view(prog.src).find(ag::kHeaderName) != std::string_view::npos)
         prog.headers = {{ag::kHeaderName, ag::kHeaderSrc}};
     prog.defs = defs;
-    prog.includes = {inc, cutlass, cuda_inc, cuda_inc + "/cccl"};
-    const std::string cccl = exists(cuda_inc + "/cccl/cuda/std/__cccl/version.h")
-        ? cuda_inc + "/cccl/cuda/std/__cccl/version.h" : cuda_inc + "/cuda/std/__cccl/version.h";
-    prog.version_files = {inc + "/cufftdx/cufftdx_version.hpp", inc + "/commondx/commondx_version.hpp",
-                          cutlass + "/cutlass/version.h", cccl};
-    prog.extra_key = "mathdx-dist:" + mathdx_dist_info(root);
+    nvrtc::mathdx_toolchain(root, cuda_inc, "cufftdx", &prog);
     prog.kernel = "lrx_kconv";
     std::string missing;
     const std::string key_hex = nvrtc::hex16(nvrtc::key(prog, &missing));

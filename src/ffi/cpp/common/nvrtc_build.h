@@ -62,6 +62,13 @@ bool exists(const std::string& path);
 std::string read_file(const std::string& path);
 std::string toolkit_include(std::string* why);                   // CUDA include beside libnvrtc
 
+// An nvidia-mathdx program: the wheel at `root` (its nvidia/mathdx directory) and the CUDA
+// toolkit include `cuda_inc` as -I paths; as version files `dx`'s own header
+// (include/<dx>/<dx>_version.hpp), commonDx's, CUTLASS's and CCCL's; the wheel's dist-info
+// name as the extra key.  Every mathdx kernel (cuFFTDx, cuBLASDx) is keyed by this one rule.
+void mathdx_toolchain(const std::string& root, const std::string& cuda_inc, const char* dx,
+                      Program* p);
+
 // The program's key; `missing` lists version files that read empty.
 uint64_t key(const Program& p, std::string* missing);
 

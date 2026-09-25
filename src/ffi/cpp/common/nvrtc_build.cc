@@ -1,12 +1,14 @@
 // nvrtc_build.cc -- see nvrtc_build.h.
 #include "nvrtc_build.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <fstream>
 #include <random>
 #include <sstream>
 
+#include <dirent.h>
 #include <dlfcn.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -92,6 +94,37 @@ static std::string nvrtc_library_realpath() {
     if (!dladdr(reinterpret_cast<void*>(&nvrtcVersion), &info) || !info.dli_fname) return "";
     char buf[4096];
     return realpath(info.dli_fname, buf) ? std::string(buf) : std::string(info.dli_fname);
+}
+
+// The nvidia-mathdx wheel's dist-info directory name(s) beside `root`
+// (<site>/nvidia/mathdx -> <site>/nvidia_mathdx-<version>.dist-info): one
+// listing of one directory; "" when the headers are not a wheel install.
+static std::string mathdx_dist_info(const std::string& root) {
+    const std::string site = root + "/../..";
+    DIR* d = opendir(site.c_str());
+    if (!d) return "";
+    std::vector<std::string> names;
+    while (dirent* e = readdir(d)) {
+        const std::string n(e->d_name);
+        if (n.rfind("nvidia_mathdx-", 0) == 0 && n.size() > 10 && n.substr(n.size() - 10) == ".dist-info")
+            names.push_back(n);
+    }
+    closedir(d);
+    std::sort(names.begin(), names.end());
+    std::string out;
+    for (const auto& n : names) out += n + ";";
+    return out;
+}
+
+void mathdx_toolchain(const std::string& root, const std::string& cuda_inc, const char* dx,
+                      Program* p) {
+    const std::string inc = root + "/include", cutlass = root + "/external/cutlass/include";
+    p->includes = {inc, cutlass, cuda_inc, cuda_inc + "/cccl"};
+    const std::string cccl = exists(cuda_inc + "/cccl/cuda/std/__cccl/version.h")
+        ? cuda_inc + "/cccl/cuda/std/__cccl/version.h" : cuda_inc + "/cuda/std/__cccl/version.h";
+    p->version_files = {inc + "/" + dx + "/" + dx + "_version.hpp", inc + "/commondx/commondx_version.hpp",
+                        cutlass + "/cutlass/version.h", cccl};
+    p->extra_key = "mathdx-dist:" + mathdx_dist_info(root);
 }
 
 uint64_t key(const Program& p, std::string* missing) {
