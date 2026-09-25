@@ -528,8 +528,17 @@ def _get_chi_minimax_kernel_fused(mesh_xy, kgrid, nk, n_out, complex_contour,
                 hi = nb_full - jnp.argmax(occupied[::-1])
                 edges = [lo + ((hi - lo) * c) // n_vc for c in range(n_vc + 1)]
                 chunks = tuple(zip(edges[:-1], edges[1:]))
-            for band_range in chunks:
-                Gv = green(-tau, vmax, mask_v, band_range)
+            for c, band_range in enumerate(chunks):
+                if c:
+                    # Serialize the chunks: the next valence Green is built only after the
+                    # previous one is consumed, so one chunk is live at a time.
+                    acc, psi_c = jax.lax.optimization_barrier((acc, (psi_mun, psi_nmu)))
+                else:
+                    psi_c = (psi_mun, psi_nmu)
+                Gv = build_G_tau(
+                    psi_c[0], psi_c[1], enk_full, -tau, e_ref=vmax, mask=mask_v, layout=layout,
+                    gemm=g_plan, k_unfold_plan=k_unfold_plan, trim_zero_bands=True,
+                    unfold=False, band_range=band_range)
                 # A Green of real weights reads its partner as conj(G) on the load.
                 partners = () if Gv.conj_partner else (Gv.transpose, Gc.transpose)
                 acc = door(acc, Gv.G, Gc.G, alpha, *partners)
