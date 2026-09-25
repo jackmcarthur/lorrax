@@ -1765,7 +1765,10 @@ class PolarFFTFieldProjection:
 def project_polar_fft_field(field, sym) -> PolarFFTFieldProjection:
     r"""Project a Cartesian polar field on an FFT grid onto crystal symmetry.
 
-    ``field`` is ``(3,nx,ny,nz)``.  Every permitted row acts through the
+    ``field`` is ``(3,nx,ny,nz)``, a host array or a ``jax.Array``; a device
+    field is projected on its device (the pullback table uploaded once) and
+    returned there, with only the receipt scalars read back.  Every permitted
+    row acts through the
     canonical real-space pullback from :func:`fft_grid_pullback_perm` and
     the polar, time-odd :meth:`SymMaps.cartesian_action`::
 
@@ -1806,12 +1809,16 @@ def project_polar_fft_field(field, sym) -> PolarFFTFieldProjection:
     local ``alpha·A`` operator built from the result is therefore eligible
     for the incumbent star-wedge matrix sweep without another symmetry rule.
     """
-    value = np.asarray(field)
+    # A device field is projected where it lives (the arithmetic below is
+    # written once for both array modules); a host field stays on the host.
+    on_device = isinstance(field, jax.Array)
+    xp = jnp if on_device else np
+    value = field if on_device else np.asarray(field)
     if value.ndim != 4 or value.shape[0] != 3:
         raise ValueError(
             "project_polar_fft_field: field must have shape "
             f"(3,nx,ny,nz); got {value.shape}.")
-    if not np.all(np.isfinite(value)):
+    if not bool(xp.all(xp.isfinite(value))):
         raise ValueError("project_polar_fft_field: field contains non-finite values.")
 
     spatial_raw = np.asarray(sym.sym_matrices)
@@ -1978,23 +1985,26 @@ def project_polar_fft_field(field, sym) -> PolarFFTFieldProjection:
     residual_tolerance = float(
         rotation_table_closure_defect + floating_point_residual_bound)
 
+    table = _device_pullback(pullback) if on_device else pullback
+    rotation_rows = xp.asarray(rotations)
+
     def _act(row, operand):
         spatial_row = int(row) % n_spatial
-        source = operand[:, pullback[spatial_row]]
+        source = operand[:, table[spatial_row]]
         if int(row) >= n_spatial:
-            source = np.conj(source)
-        return rotations[int(row)] @ source
+            source = xp.conj(source)
+        return rotation_rows[int(row)] @ source
 
-    projected = np.zeros_like(flat, dtype=np.result_type(value.dtype, np.float64))
+    projected = xp.zeros_like(flat, dtype=np.result_type(value.dtype, np.float64))
     for row in active_rows:
-        projected += _act(int(row), flat)
-    projected /= float(n_rows)
+        projected = projected + _act(int(row), flat)
+    projected = projected / float(n_rows)
 
     tiny = np.finfo(np.float64).tiny
-    raw_norm = max(float(np.linalg.norm(flat)), tiny)
-    movement = float(np.linalg.norm(projected - flat) / raw_norm)
+    raw_norm = max(float(xp.linalg.norm(flat)), tiny)
+    movement = float(xp.linalg.norm(projected - flat) / raw_norm)
     residual = max(
-        float(np.linalg.norm(_act(row, projected) - projected) / raw_norm)
+        float(xp.linalg.norm(_act(row, projected) - projected) / raw_norm)
         for row in active_rows)
     if not np.isfinite(residual) or residual > residual_tolerance:
         raise RuntimeError(
@@ -2191,6 +2201,17 @@ def fft_grid_pullback_perm(
                 )
 
     return sym_perm.astype(np.int32)
+
+
+_DEVICE_PULLBACKS: dict = {}
+
+
+def _device_pullback(table):
+    """The memoised host pullback table, uploaded once per process."""
+    hit = _DEVICE_PULLBACKS.get(id(table))
+    if hit is None or hit[0] is not table:
+        hit = _DEVICE_PULLBACKS[id(table)] = (table, jnp.asarray(table))
+    return hit[1]
 
 
 @functools.lru_cache(maxsize=4)

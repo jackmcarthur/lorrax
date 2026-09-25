@@ -2464,20 +2464,20 @@ def rebuild_hartree_dft_basis(inputs, U_qp, occupations_full,
         from psp.dft_operators import transverse_potential_from_current
         from vcoul import COULOMB_GAUGE_TT_SIGN
 
-        current_projected = np.asarray(fields[1:], dtype=np.float64)
+        current_projected = jnp.asarray(fields[1:], dtype=jnp.float64)
         ngrid = int(np.prod(grid))
-        current_g0 = np.sum(current_projected, axis=(-3, -2, -1)) / np.sqrt(ngrid)
+        current_g0 = jnp.sum(current_projected, axis=(-3, -2, -1)) / np.sqrt(ngrid)
         current_scale = max(
-            float(np.linalg.norm(current_projected)), np.finfo(np.float64).tiny)
+            float(jnp.linalg.norm(current_projected)), np.finfo(np.float64).tiny)
         inputs.print_fn(
             "    SC projected Dirac-current G=0 diagnostic (J=j/c): "
-            f"||J0||={float(np.linalg.norm(current_g0)):.6e}, "
+            f"||J0||={float(jnp.linalg.norm(current_g0)):.6e}, "
             f"||J||={current_scale:.6e}, "
-            f"ratio={float(np.linalg.norm(current_g0)) / current_scale:.6e}; "
+            f"ratio={float(jnp.linalg.norm(current_g0)) / current_scale:.6e}; "
             "periodic TT sets G=0 to zero")
         with timing.section("vh.transverse_field"):
             V_T_r = transverse_potential_from_current(
-                jnp.asarray(current_projected, dtype=jnp.float64),
+                current_projected,
                 jnp.asarray(inputs.wfn.bdot, dtype=jnp.float64),
                 jnp.asarray(inputs.wfn.bvec, dtype=jnp.float64),
                 float(inputs.wfn.blat),
