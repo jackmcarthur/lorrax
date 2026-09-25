@@ -1402,11 +1402,6 @@ _DEFAULTS = {
     # 2026-08-06 — see ``_LEGACY_DECK_KEYS``.  There is one sharded-slab
     # transport and the deck does not choose it.
     # ``accumulate_rchunk_to_gflat`` flat-axis chunker.  Bounds the
-    # per-scan-iter FFT box ``chunk_size · n_rtot``.
-    # 0 (default) = one-shot; the gflat memory model overrides this
-    # at runtime when its planner picks a smaller value, but cohsex.in
-    # > 0 wins over the planner.
-    "gflat_chunk_size": 0,
     # V_q G-panel width: the columns gathered per step of the V_q kernel's
     # G scan.  Any positive value (a G tail it does not divide is masked).
     # 0 (default) = auto (``v_q_g_flat._plan_vq_tiles``: ≤ 4096, capped by
@@ -1503,9 +1498,6 @@ _DEFAULTS = {
     "gamma_contract_mode": "take",
     # Memory / chunking
     "memory_per_device_gb": 0.0,  # 0 = auto-detect
-    # The automatic band chunk request is ``AUTOMATIC_BAND_CHUNK_SIZE``;
-    # the planner mesh-rounds and caps it at the logical zeta window.
-    "r_chunk_size": 0,
     # One raw-parent carrier: face (default) shards bands and centroids,
     # 2*S/(Px*Py) per rank; axis keeps full bands, S/Px + S/Py.
     # Both layouts share the Green, screening and self-energy algorithms.
@@ -2688,8 +2680,6 @@ def _input_memory_group(
         per_device_gb=memory_per_device_gb,
         chunk_target_utilization=chunk_utilization,
         band_chunk_size=AUTOMATIC_BAND_CHUNK_SIZE,
-        r_chunk_override=int(params["r_chunk_size"]),
-        gflat_chunk_size=int(params["gflat_chunk_size"]),
         vq_g_chunk_size=int(params["vq_g_chunk_size"]),
         low_mem_bands=bool(params["low_mem_bands"]),
         low_mem_bands_provenance=(
@@ -2961,13 +2951,13 @@ def _report_early_retired_keys(
         warnings.warn(
             "Input key 'chunk_size' is no longer supported and will be "
             "ignored (it was a no-op; chunk sizing is planner-owned — "
-            "see 'gflat_chunk_size' / 'low_mem_bands').",
+            "see 'memory_per_device_gb' / 'low_mem_bands').",
             DeprecationWarning, stacklevel=2,
         )
         retired.append((
             "chunk_size",
             "IGNORED — it was a no-op; chunk sizing is planner-owned "
-            "(see 'gflat_chunk_size' / 'low_mem_bands')"))
+            "(see 'memory_per_device_gb' / 'low_mem_bands')"))
     for legacy_key in ("output_file", "eqp_output_file"):
         if section.get(legacy_key, fallback=None) is not None:
             import warnings
@@ -3111,6 +3101,12 @@ def _report_remaining_retired_keys(
         raise ValueError(
             "Input key 'band_chunk_size' is retired; use "
             "'low_mem_bands = true | false' (chunk size is automatic).")
+    for legacy_key in ("r_chunk_size", "gflat_chunk_size"):
+        if section.get(legacy_key, fallback=None) is not None:
+            raise ValueError(
+                f"Input key '{legacy_key}' is retired with the r-tile ζ fit; "
+                "every ζ channel runs route G, whose planner sizes its own "
+                "batches from memory_per_device_gb.  Remove the key.")
     if section.get("strict_keys", fallback=None) is not None:
         raise ValueError(
             "Input key 'strict_keys' is retired; remove it (unknown "
@@ -4345,8 +4341,6 @@ class MemoryConfig:
     per_device_gb: float
     chunk_target_utilization: float
     band_chunk_size: int
-    r_chunk_override: int         # 0 = auto
-    gflat_chunk_size: int         # 0 = planner-picked
     vq_g_chunk_size: int          # 0 = auto v_q_g_flat._plan_vq_tiles
     low_mem_bands: bool           # parent ψ layout: face=True, axis=False
     low_mem_bands_provenance: str  # deck | default | derived for packed mode

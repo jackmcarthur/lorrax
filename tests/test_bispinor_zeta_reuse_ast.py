@@ -121,12 +121,12 @@ def test_every_reuse_check_probes_the_dataset_extent():
 def test_reuse_contract_precedes_and_bypasses_fit_only_planners():
     """A complete cache never enters either charge or transverse fit HWM."""
     _, contract = _function_tree("_resolve_zeta_fit_contract")
-    assert not _calls(contract, "_plan_gflat_chunks_for_channel")
+    assert not _calls(contract, "_plan_route_g_for_channel")
     assert not _calls(contract, "load_centroids_band_chunked")
 
     _, prepare = _function_tree("_prepare_fresh_parent_faces")
     resolves = _calls(prepare, "_resolve_zeta_fit_contract")
-    plans = _calls(prepare, "_plan_gflat_chunks_for_channel")
+    plans = _calls(prepare, "_plan_route_g_for_channel")
     assert len(resolves) == 1 and len(plans) == 1
     assert resolves[0].lineno < plans[0].lineno
     guarded = [n for n in ast.walk(prepare)
@@ -137,7 +137,7 @@ def test_reuse_contract_precedes_and_bypasses_fit_only_planners():
     assert ast.unparse(guarded[0].test) == "not charge_zeta_reused"
 
     _, fit_zeta = _fit_zeta_tree()
-    transverse_plans = _calls(fit_zeta, "_plan_gflat_chunks_for_channel")
+    transverse_plans = _calls(fit_zeta, "_plan_route_g_for_channel")
     assert len(transverse_plans) == 1
     reuse_if = next(n for n in ast.walk(fit_zeta)
                     if isinstance(n, ast.If)
@@ -146,7 +146,7 @@ def test_reuse_contract_precedes_and_bypasses_fit_only_planners():
     stage = _calls(entry, "_plan_transverse_zeta")
     assert len(stage) == 1 and reuse_if.lineno < stage[0].lineno
     _, planner = _function_tree("_plan_transverse_zeta")
-    assert len(_calls(planner, "_plan_gflat_chunks_for_channel")) == 1
+    assert len(_calls(planner, "_plan_route_g_for_channel")) == 1
     assert any(isinstance(n, ast.Return) for n in ast.walk(reuse_if))
     transverse_plan_guard = [n for n in ast.walk(fit_zeta)
                              if isinstance(n, ast.If)

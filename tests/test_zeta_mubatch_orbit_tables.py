@@ -163,7 +163,7 @@ def test_route_g_plans_the_whole_tile_tier_under_linalg_distributed():
     """`linalg = distributed` sets the other stages; route G's ζ tier stays
     the planner's whole-tile choice, stated once in the plan receipt."""
     from gw.gw_config import resolve_linalg
-    from gw.gw_init import _plan_gflat_chunks_for_channel
+    from gw.gw_init import _plan_route_g_for_channel
     from gw.wavefunction_bundle import BandSlices
     prof = resolve_linalg({"linalg": "distributed"})
     assert (prof.w_dyson_solver, prof.eigh_backend, prof.distributed_lu) == (
@@ -174,7 +174,6 @@ def test_route_g_plans_the_whole_tile_tier_under_linalg_distributed():
         zeta_nband=144,
         memory=SimpleNamespace(
             per_device_gb=33.9, chunk_target_utilization=0.0,
-            band_chunk_size=16, r_chunk_override=0, gflat_chunk_size=0,
             low_mem_bands=False),
         backend=SimpleNamespace(
             distributed_zeta_solve=prof.distributed_zeta_solve,
@@ -182,13 +181,11 @@ def test_route_g_plans_the_whole_tile_tier_under_linalg_distributed():
     mesh = SimpleNamespace(shape={'x': 2, 'y': 2},
                            devices=np.empty(4, dtype=object))
     lines = []
-    chunks, _ = _plan_gflat_chunks_for_channel(
+    chunks = _plan_route_g_for_channel(
         meta=meta, cfg=cfg,
         band_slices=BandSlices.from_band_edges(0, 0, 130, 144, 144),
-        mesh_xy=mesh, is_bispinor=False, n_q_selected=10,
-        parent_route=dict(n_parent=10, parents_only=True),
-        print_fn=lines.append, zeta_ngkmax=8000, psi_ngkmax=12000,
-        mubatch=True)
+        mesh_xy=mesh, n_q_selected=10, n_parent=10,
+        print_fn=lines.append, zeta_ngkmax=8000, psi_ngkmax=12000)
     assert chunks["mubatch"].zeta_tier == "local"
     receipt = "\n".join(lines).splitlines()
     assert sum("ζ tier" in line for line in receipt) == 1

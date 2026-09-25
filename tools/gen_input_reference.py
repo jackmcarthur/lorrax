@@ -62,10 +62,8 @@ KEYS: dict[str, tuple[str, str]] = {
     "zeta_rcond": ("ISDF / zeta", "Rank-truncation cutoff relative to lambda_max (default 1e-8, low end of the recovery plateau). Env LORRAX_ZETA_RCOND."),
     "zeta_cutoff": ("ISDF / zeta", "Zeta-sphere G-cutoff (Ry) for per-q zeta_q_G writes; None = ecutwfc; must be >= bare_coulomb_cutoff."),
     "gamma_contract_mode": ("ISDF / zeta", "HLO variant of the gamma-tilde double contraction: take (default) | einsum | scan; math-identical."),
-    "gflat_chunk_size": ("ISDF / zeta", "Flat-axis chunk of the r-chunk G-accumulation; 0 = planner-chosen, explicit > 0 wins."),
     "vq_g_chunk_size": ("ISDF / zeta", "V_q inner G-axis GEMM chunk; 0 = auto (largest divisor of ngkmax <= 4096)."),
     "band_chunk_size": ("ISDF / zeta", "Bands per chunk in the band-chunked FFT/pair-density loops."),
-    "r_chunk_size": ("ISDF / zeta", "Real-space columns per zeta-fit chunk; 0 = auto from the memory model."),
     "memory_per_device_gb": ("ISDF / zeta", "Per-device memory budget for the chunk planners; 0 = auto-detect."),
     "low_mem_bands": ("ISDF / zeta", "Two-face 2-D-sharded psi carrier (gw.wavefunction_bundle layout=\"face\": psi_nmu/psi_mun, both P(None,'x','y') at the (s,mu) GEMM seam) in place of the legacy four single-axis copies. 2*S/(Px*Py) per-rank psi residency instead of 2*S/Px + 2*S/Py. Default false = layout=\"legacy\", bit-identical to every deck written before this key existed. Narrow envelope while consumers are ported one at a time; an unsupported combination (head_correction=full, qp_solver=self_consistent, mpa_material_class=metal, bispinor=true, explicit dense Gij) refuses by name rather than silently falling back to legacy."),
     # ---- Screening ----

@@ -1998,8 +1998,7 @@ def _factor_c_q_replicated_qparallel(
 # no factor stage to schedule.  The functions below hoist the factor so
 # the transverse channels have the SAME two plans as the charge family:
 #
-# * LOCAL plan ('lu', including the ``batch_reshard`` execution selected by
-#   a provider LU kind) — per-q pivoted LU on the whole ridged LOGICAL
+# * LOCAL plan ('lu') — per-q pivoted LU on the whole ridged LOGICAL
 #   tile, computed ONCE per channel (q-parallel over devices at P>1 under
 #   the charge fold's policy), stored as (LU, perm) with the LU factors
 #   identity-re-embedded at the padded extent so every downstream whole-tile
@@ -2009,27 +2008,15 @@ def _factor_c_q_replicated_qparallel(
 #   lax.linalg.lu_solve(lu, perm, b, 0) (jax _solve), and this stage runs
 #   exactly those two ops with the factor cached between r-chunks.
 #   Gate: tests/test_transverse_factor_hoist.py (exact equality).
-# * DISTRIBUTED plan ('scalapack_lu', host mesh) — per-q ScaLAPACK
-#   pXgetrf run ONCE per channel at the LOGICAL extent, factors kept 2-D
-#   block-cyclic, per-rank ipiv threaded alongside.  Route G cannot apply
-#   that token per G tile, so fit_zeta_to_h5 factors the current channels
-#   under ``batch_reshard`` (the LOCAL plan).  getrf on the ridged logical tile is
-#   bit-identical whether or not the getrs follows immediately (same
-#   descriptors, same grid — the fused handler runs the same two calls
-#   back to back), so this differs from the fused path only in WHEN the
-#   factor work happens.
-#
-# Both distributed LU providers now use the same opaque factor token:
-# ScaLAPACK pXgetrf/pXgetrs on host and cuSOLVERMp getrf/getrs on CUDA.
-# The service owns each provider's pivot dtype and rank-private layout;
-# this physics module never sees or reshards a pivot vector.
+# Route G applies a whole-tile factor on each G tile, so this LOCAL plan is
+# the only transverse factor: a block-cyclic provider LU token cannot be
+# applied per tile, and ``factor_c_q`` refuses any other kind.
 
 # Equal-current C and Z carry the same signed-Gram convention; the shared
 # ridge owner preserves that sign in every hoisted and fused LU preparation.
 _TRANSVERSE_LU_RIDGE = 1e-12
 
 _transverse_lu_cache: dict = {}      # hoisted local LU factor kernels
-_transverse_distributed_lu_cache: dict = {}  # ridged inputs to service getrf
 
 
 def _transverse_lu_ridge(trace, n_log):
@@ -2248,44 +2235,6 @@ def _qparallel_announce_transverse(nq: int, n_rmu: int, n_log: int,
               f"different gauge, not bit-identical.", flush=True)
 
 
-def _factor_c_q_transverse_distributed_lu(
-    C_q: jax.Array, mesh_xy: Mesh, n_rmu_logical: int, *, backend: str,
-    trace_per_q: jax.Array | None = None,
-) -> FactorToken:
-    """DISTRIBUTED-plan hoisted transverse LU on the ridged logical block; see docs/architecture/zeta_fit_face_psi_cct.md."""
-    nq, n_rmu, _ = C_q.shape
-    n_log = int(n_rmu_logical)
-    xy_shard = NamedSharding(mesh_xy, P(None, 'x', 'y'))
-
-    key = (_mesh_key(mesh_xy), int(nq), int(n_rmu), n_log, str(backend))
-    if key not in _transverse_distributed_lu_cache:
-        @jax.jit
-        def _prep(C, trace):
-            # Slice to the LOGICAL extent (load-bearing: pad-extent LU
-            # roundoff is amplified O(1) in the near-null transverse
-            # modes — ROOT_CAUSE.md 2026-07-08) and add the per-q ridge.
-            C_log = jax.lax.with_sharding_constraint(
-                C[:, :n_log, :n_log], xy_shard)
-            ridge = _transverse_lu_ridge(trace, n_log)[:, None, None]
-            eye_n = jnp.eye(n_log, dtype=C.dtype)[None, :, :]
-            return jax.lax.with_sharding_constraint(
-                C_log + ridge * eye_n, xy_shard)
-        _transverse_distributed_lu_cache[key] = _prep
-    if trace_per_q is None:
-        trace_per_q = jnp.einsum('qii->q', C_q[:, :n_log, :n_log])
-        trace_per_q.block_until_ready()
-    if trace_per_q.shape != (nq,):
-        raise ValueError(
-            f"transverse trace must have shape ({nq},), got "
-            f"{trace_per_q.shape}")
-    C_reg = _transverse_distributed_lu_cache[key](C_q, trace_per_q)
-    # ``n=n_log`` is redundant with C_reg's own extent and passed anyway:
-    # it is what makes the divisibility guard fire HERE rather than inside
-    # the descriptor build.
-    return linalg_factor('solve_lu', C_reg, mesh_xy,
-                         backend=backend, n=n_log)
-
-
 # --------------------------------------------------------------------------
 # COLLECTIVE PAYLOAD CHUNKING  (scorecard AF)
 #
@@ -2419,7 +2368,6 @@ def factor_c_q(
     zeta_ridge: float = 0.0,
     zeta_rcond: float = ZETA_RCOND_DEFAULT,
     distrib_la_batched_route: str = "batch_reshard",
-    transverse_trace_per_q: jax.Array | None = None,
 ) -> jax.Array:
     """Compute system-matrix L_q from CCT matrix; see docs/architecture/zeta_fit_face_psi_cct.md."""
     nq, n_rmu, n_rmu2 = C_q.shape
@@ -2437,54 +2385,13 @@ def factor_c_q(
     C_q = _identity_pad_block_diagonal(
         C_q, n_rmu_logical=n_rmu_logical, mesh_xy=mesh_xy)
 
-    # Indefinite-CCT path: no Cholesky.  The ridge (LU) family is hoisted
-    # (factored ONCE per channel, applied per r-chunk): per-q pivoted LU +
-    # 1e-12 ridge (see the "hoisted TRANSVERSE factor stage" section above).
-    # Returns a (factor, piv) PAIR:
-    #   'lu'           -> (LU embedded at padded extent, perm)  [local]
-    #   'scalapack_lu' -> (FactorToken, None)   [the ipiv is INSIDE it]
-    #   'cusolvermp_lu'-> (FactorToken, None)   [CUDA pivots INSIDE it]
-    # The piv SLOT survives for the local 'lu' plan, whose (LU, perm) is
-    # jax's own ``lax.linalg.lu_solve`` pair and not a library handle at
-    # all.  Every DISTRIBUTED factor now travels in the token instead, so
-    # ``piv is None`` no longer means "fused": ask the type.
+    # Indefinite-CCT path: no Cholesky.  A current channel runs route G,
+    # which applies a whole-tile factor on each G tile, so its factor is the
+    # local per-q pivoted LU with the 1e-12 ridge, factored ONCE per channel
+    # and returned as jax's own ``(LU, perm)`` pair.
     if int(vertex_mu_L) != 0:
         t_kind = _resolve_solver_kind(
             mesh_xy, int(vertex_mu_L), solver_kind, n_rmu=n_rmu_logical)
-        if t_kind in ('scalapack_lu', 'cusolvermp_lu'):
-            # A block-cyclic token cannot enter distrib_la's face-to-batch
-            # schedule.  Factor ONCE with the existing local-JAX kernel and
-            # keep its (LU, pivots) across r chunks.  The former route kept
-            # raw C here and called the fused factor+solve plan in every
-            # r chunk: 3*(J-1)*Q*(8/3)*mu_T^3 avoidable real FLOPs across the
-            # three transverse channels, including factors of phantom q
-            # rows.  The local kernel is the arithmetic that route already
-            # used after face-to-batch movement, so this changes lifetime,
-            # not numerics.
-            if distrib_la_batched_route == 'batch_reshard':
-                if jax.process_index() == 0:
-                    print("  [zeta transverse ridge] batch_reshard hoists "
-                          f"the local-JAX LU: {nq} factorization(s) once per "
-                          "channel; 0 factorizations/r-chunk; "
-                          f"{nq} lu_solve application(s)/r-chunk", flush=True)
-                t_kind = 'lu'
-            else:
-                # The factor is an opaque FactorToken with no public buffer,
-                # so the |diag U| instrument cannot reach it.  Say that rather
-                # than skipping silently: an unmeasured path and a clean one
-                # must not look alike in a log.
-                if jax.process_index() == 0:
-                    print(f"  [zeta transverse ridge ({t_kind})] conditioning "
-                          "NOT MEASURED: the block-cyclic provider LU factor "
-                          "is inside a FactorToken with no public buffer, so "
-                          "the |diag U| kappa bound is unreachable here.  "
-                          "That is an absence, not a pass.",
-                          flush=True)
-                return _factor_c_q_transverse_distributed_lu(
-                    C_q, mesh_xy, n_rmu_logical,
-                    backend=('scalapack' if t_kind == 'scalapack_lu'
-                             else 'cusolvermp'),
-                    trace_per_q=transverse_trace_per_q), None
         if t_kind != 'lu':
             raise ValueError(
                 f"factor_c_q: unknown transverse solver_kind {t_kind!r}")

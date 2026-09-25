@@ -16,8 +16,9 @@ FLAT_K_FFT_VALUE_RTOL = 1.0e-12
 # =============================================================================
 # FFT peak-memory query (for memory-model sizing)
 # =============================================================================
-# ``gflat_memory_model._fft_box_bytes`` needs the per-rank peak HBM a batched
-# 3-D FFT will actually take.  Nominal ``N_copies × data_size`` fudge factors
+# A memory model that prices a spatial FFT needs the per-rank peak HBM a
+# batched 3-D FFT will actually take (no production planner calls this since
+# the r-tile ζ fit's planner was deleted).  Nominal ``N_copies × data_size`` fudge factors
 # under-predict badly for mixed-radix boxes (24 = 2³·3, 10 = 2·5) at small
 # batch sizes — cuFFT picks different algorithms there, with non-linear
 # workspace growth.

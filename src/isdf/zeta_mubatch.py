@@ -684,7 +684,7 @@ class ZetaG:
 
     zeta_layout = 'G_flat'
 
-    def __init__(self, store, *, mesh, L_q, lu_piv, q_chunk_size, solver_kind,
+    def __init__(self, store, *, mesh, L_q, lu_piv, solver_kind,
                  zeta_gather, batched_route, n_rmu_solve, n_rmu, mu_basis,
                  ngk_per_q, gvec_components, path, print_fn=print):
         from isdf.core import FactorToken
@@ -697,7 +697,6 @@ class ZetaG:
         self.print_fn = print_fn        # the fit's report sink (V_q receipt)
         self.mesh = mesh
         self.L_q, self.lu_piv = L_q, lu_piv
-        self.q_chunk_size = int(q_chunk_size)
         # The hoisted transverse LU travels as (LU, pivots): the 'lu' seam.
         self.solver_kind = 'lu' if lu_piv is not None else str(solver_kind)
         self.zeta_gather = str(zeta_gather)

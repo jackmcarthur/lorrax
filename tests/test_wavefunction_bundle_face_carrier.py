@@ -97,18 +97,6 @@ def test_face_matches_input_transposes():
     assert face.layout == "face"
 
 
-def test_memory_model_prices_resolved_layout():
-    from gw.gflat_memory_model import _persistent_bytes
-
-    values = dict(nk=4, ns=2, nq=1, nq_disk=1, mu=512, nb=64,
-                  ngkmax=1, n_rtot=1, p_x=2, p_y=2,
-                  parent_route={"n_parent": 2, "parents_only": True})
-    axis = _persistent_bytes(**values, low_mem_bands=False)
-    face = _persistent_bytes(**values, low_mem_bands=True)
-    assert axis["psi_copies"] == 2097152
-    assert face["psi_copies"] == 1048576
-
-
 def test_face_carrier_addressable_bytes_match_2s_over_p():
     mesh = _mesh_xy()
     px, py = mesh.devices.shape

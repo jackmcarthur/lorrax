@@ -214,7 +214,7 @@ class ZetaChannel(NamedTuple):
 def _fit_mubatch(
     *, wfn, meta, centroid_indices, mesh_xy, plan, parent_psi,
     band_range_full, bispinor, bispinor_lift, k_unfold_plan,
-    weight_l_face, weight_r_face, channels, q_chunk_size,
+    weight_l_face, weight_r_face, channels,
     zeta_gather, distrib_la_batched_route, n_rmu_solve,
     q_irr_full_idx, q_neg_idx, q_frac, sphere_idx, ngk_per_q,
     mu_basis, gvec_components, scratch_dir, print_fn,
@@ -441,7 +441,7 @@ def _fit_mubatch(
     for ch, store in zip(channels, stores):
         zeta_g = zmb.ZetaG(
             store, mesh=mesh_xy, L_q=ch.L_q, lu_piv=ch.lu_piv,
-            q_chunk_size=q_chunk_size, solver_kind=ch.solver_kind,
+            solver_kind=ch.solver_kind,
             zeta_gather=zeta_gather, batched_route=distrib_la_batched_route,
             n_rmu_solve=n_rmu_solve, n_rmu=int(meta.n_rmu), mu_basis=mu_basis,
             ngk_per_q=ngk_per_q, gvec_components=gvec_components,
@@ -480,7 +480,6 @@ def fit_zeta_to_h5(
     band_range_left: tuple[int, int] | None = None,
     band_range_right: tuple[int, int] | None = None,
     band_norms: np.ndarray | None = None,
-    q_chunk_size: int = 1,
     bispinor: bool = False,
     bispinor_lift: str = "raw",
     solver_kind: str = 'auto',
@@ -798,7 +797,7 @@ def fit_zeta_to_h5(
         band_range_full=band_range_full, bispinor=bispinor,
         bispinor_lift=bispinor_lift, k_unfold_plan=k_unfold_plan,
         weight_l_face=weight_l_face, weight_r_face=weight_r_face,
-        channels=channels, q_chunk_size=q_chunk_size,
+        channels=channels,
         zeta_gather=_resolved_zeta_gather,
         distrib_la_batched_route=distrib_la_batched_route,
         n_rmu_solve=n_rmu_solve, q_irr_full_idx=q_irr_full_idx,
