@@ -1934,6 +1934,46 @@ def allocate_fit_store_collective(
     return fit_completion_ledger(dest)
 
 
+#: The one jitted reduction behind :func:`refuse_bad_pole_fields`, built on
+#: first use because this module imports no jax at import time.
+_POLE_FIELD_COUNTS: list = []
+
+
+def _pole_field_counts():
+    """``(n_nonfinite, n_bad_causal)`` of a pole field, as one program.
+
+    Traced once per shape and sharding: the elementwise tests fuse into
+    the two sums, so no field-sized temporary is allocated.  The eager
+    form allocated one per ``jnp`` op and died at 6.44 GiB on CrI3 8x8
+    GN-PPM SC (KNOWN_LORRAX_ISSUES, ``mpa_store.py`` row).
+    """
+    if not _POLE_FIELD_COUNTS:
+        import jax
+        import jax.numpy as jnp
+
+        @jax.jit
+        def counts(Omega, residue, odd_residue):
+            finite = (jnp.isfinite(jnp.real(Omega))
+                      & jnp.isfinite(jnp.imag(Omega))
+                      & jnp.isfinite(jnp.real(residue))
+                      & jnp.isfinite(jnp.imag(residue)))
+            if odd_residue is None:
+                live = jnp.abs(residue) > 0.0
+            else:
+                finite = (finite
+                          & jnp.isfinite(jnp.real(odd_residue))
+                          & jnp.isfinite(jnp.imag(odd_residue)))
+                live = ((jnp.abs(residue + odd_residue) > 0.0)
+                        | (jnp.abs(residue - odd_residue) > 0.0))
+            bad_causal = live & ((jnp.real(Omega) <= 0.0)
+                                 | (jnp.imag(Omega) > 0.0))
+            return (jnp.sum(~finite, dtype=jnp.int64),
+                    jnp.sum(bad_causal, dtype=jnp.int64))
+
+        _POLE_FIELD_COUNTS.append(counts)
+    return _POLE_FIELD_COUNTS[0]
+
+
 def refuse_bad_pole_fields(Omega, residue, odd_residue=None, *, where):
     """Refuse non-finite elements and live poles off the MPA causal half-plane.
 
@@ -1941,25 +1981,9 @@ def refuse_bad_pole_fields(Omega, residue, odd_residue=None, *, where):
     every element must be finite, dormant ones included.
     """
     import jax
-    import jax.numpy as jnp
 
-    finite = (jnp.isfinite(jnp.real(Omega))
-              & jnp.isfinite(jnp.imag(Omega))
-              & jnp.isfinite(jnp.real(residue))
-              & jnp.isfinite(jnp.imag(residue)))
-    if odd_residue is None:
-        live = jnp.abs(residue) > 0.0
-    else:
-        finite = (finite
-                  & jnp.isfinite(jnp.real(odd_residue))
-                  & jnp.isfinite(jnp.imag(odd_residue)))
-        live = ((jnp.abs(residue + odd_residue) > 0.0)
-                | (jnp.abs(residue - odd_residue) > 0.0))
-    bad_causal = live & ((jnp.real(Omega) <= 0.0)
-                         | (jnp.imag(Omega) > 0.0))
-    n_nonfinite, n_bad_causal = map(
-        int, jax.device_get((jnp.sum(~finite, dtype=jnp.int64),
-                             jnp.sum(bad_causal, dtype=jnp.int64))))
+    n_nonfinite, n_bad_causal = map(int, jax.device_get(
+        _pole_field_counts()(Omega, residue, odd_residue)))
     if n_nonfinite:
         raise ValueError(
             f"{where} refuses {n_nonfinite} non-finite pole/residue elements")
