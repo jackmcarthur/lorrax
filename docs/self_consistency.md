@@ -170,8 +170,11 @@ not a failure of the accelerator.
 
 ## 4 Σ grid and quadrature across maps
 
-The ω grid is measured from $E_F$. Map 0 samples the requested grid for every
-state.
+The ω grid is measured from $E_F$. The one-shot and every SC map grow the
+requested grid by one rule (`scissor.grow_sigma_support_ev`, below), so SC map 0
+is the one-shot calculation: the same grid, the same rules and the same
+out-of-grid set (owner, 2026-09-24). Under `cover` the one-shot therefore reads
+$\Sigma(E)$, not $\Sigma(0)$, for an active state outside the requested grid.
 
 - **Out-of-grid policy** (`sigma_out_of_grid`, owner 2026-09-24). One
   classification, `qsgw_utils.omega_coverage`, decides which energies are

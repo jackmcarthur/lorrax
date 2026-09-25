@@ -2859,13 +2859,16 @@ def _capture_frozen_scissor_fits(outputs):
     return (active, getattr(outputs, "tail_scissor_fit", None))
 
 
+from .efermi import sigma_frame_mu_ev  # noqa: E402  (shared with the one-shot)
+
+
 def _sc_sampled_support(inputs, partition, energies_loop, mu_ev, active_n=None):
     """This map's sampled Sigma(omega) support: ``(sampled, grown, E - mu,
     required)``, or None for a static Sigma (no grid, no fallback).  Pure;
     the caller logs the growth and writes the session once."""
     if not inputs.config.compute_mode.is_dynamic:
         return None
-    from .scissor import extend_sc_omega_grid_ev, sc_padded_window_ev
+    from .scissor import grow_sigma_support_ev
 
     session = inputs.fixed_quadrature_session
     sampled_grid = np.asarray(
@@ -2877,59 +2880,15 @@ def _sc_sampled_support(inputs, partition, energies_loop, mu_ev, active_n=None):
         support_partition.protected_mask | support_partition.in_range_mask,
         dtype=bool), energies_loop.shape)
     energy_relative_ev = energies_loop - mu_ev
-    if inputs.config.sigma.out_of_grid == "cover":
-        # Owner 2026-09-24: every protected identity the W model treats as
-        # active (``active_n``: shared_pole_recipe.active_band_mask on the
-        # fixed DFT ladder) reads its own Sigma(E), and the grid grows over
-        # it.  Deeper identities (semicore) keep Sigma(0) as under static;
-        # covering them stretched Fe's grid to -98 eV and moved its semicore
-        # 16 eV (owner hold, 2026-09-24).  The mask is by identity and fixed,
-        # so no state switches between Sigma(E) and Sigma(0).  Frozen core is
-        # decoupled from H and never grows the grid.
-        required_kn = np.array(required_kn)
-        required_kn[:, :int(inputs.config.sc.frozen_core_bands)] = False
-        if active_n is not None:
-            required_kn &= np.asarray(active_n, dtype=bool)[None, :]
-    else:
-        # clamp/static: only states inside the requested window plus the SC
-        # pad grow the grid; the rest read the edge or omega = 0.
-        win_lo, win_hi = sc_padded_window_ev(
-            float(inputs.config.sigma.omega_min_ev),
-            float(inputs.config.sigma.omega_max_ev))
-        required_kn = required_kn & (energy_relative_ev >= win_lo) & (energy_relative_ev <= win_hi)
-    expanded_grid = extend_sc_omega_grid_ev(
-        sampled_grid, energy_relative_ev, required_kn,
-        float(inputs.config.sigma.omega_step_ev))
+    # Owner 2026-09-24: cover grows over every protected identity the W
+    # model treats as active (``active_n``: shared_pole_recipe.active_band_mask
+    # on the fixed DFT ladder), never over frozen core; the mask is by
+    # identity and fixed, so no state switches between Sigma(E) and Sigma(0).
+    # The one-shot applies the same rule, so SC map 0 is the one-shot.
+    expanded_grid, required_kn = grow_sigma_support_ev(
+        inputs.config.sigma, inputs.config.sc.frozen_core_bands, sampled_grid,
+        energy_relative_ev, required_kn, active_n)
     return sampled_grid, expanded_grid, energy_relative_ev, required_kn
-
-
-def _sigma_frame_mu_ev(inputs, E_full_ry, efermi_ry, occupation_state):
-    """The E_F the Sigma build measures its omega grid from, in eV.
-
-    Grid growth and the tail mask must judge coverage in THIS frame.  The
-    GN/HL-PPM Sigma is built about the current spectrum's VBM or midgap
-    (``ppm_sigma.ppm_fermi_frame`` on the step occupations the QP bundle
-    gets at ``efermi_ry``), which on MoS2 3x3 QSGW sat 1.4 eV above the
-    DFT midgap the partition uses; judged in the partition frame, a state
-    the grid "covered" still read Sigma(0), and the growth that finally
-    covered it moved its map output 2.8 eV (CLAIMS 2725).  MPA measures
-    from ``gw.efermi.resolve_sigma_efermi_ry``.
-    """
-    config = inputs.config
-    if config.compute_mode.ppm_model is not None:
-        from .ppm_sigma import ppm_fermi_frame
-        if efermi_ry is None:
-            raise ValueError("the PPM Sigma frame needs this map's occupation step")
-        e = jnp.asarray(E_full_ry, dtype=jnp.float64)
-        frame = ppm_fermi_frame(
-            e, (e < float(efermi_ry)).astype(jnp.float64),
-            jnp.asarray(config.sigma.fermi_reference == "midgap"))
-        return float(jax.device_get(frame)) * RYD_TO_EV
-    from .efermi import resolve_sigma_efermi_ry
-    ref_ry, _ = resolve_sigma_efermi_ry(
-        config.sigma.fermi_reference, occupation_state=occupation_state,
-        wfn=inputs.wfn)
-    return float(ref_ry) * RYD_TO_EV
 
 
 def _sc_active_identities(inputs):
@@ -3278,6 +3237,17 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     ks = _kstar(inputs)
     U_full = U_qp if ks.is_identity else ks.broadcast(U_qp)
     E_full = E_qp_ry if ks.is_identity else ks.broadcast(E_qp_ry)
+    if state.iteration == 0 and not ks.is_identity:
+        # Map 0 IS the one-shot: its energies are the DFT table, not the star
+        # broadcast of it, whose time-reversed rows differ from their own DFT
+        # values by up to 2e-14 Ry (gnppm_debug; owner 2026-09-24).
+        if tuple(inputs.e_dft_active_kn_ry.shape) != tuple(E_full.shape):
+            raise ValueError(
+                f"SC map 0: DFT table {tuple(inputs.e_dft_active_kn_ry.shape)} "
+                f"is not the full-BZ window {tuple(E_full.shape)}")
+        E_full = jax.device_put(
+            jnp.asarray(inputs.e_dft_active_kn_ry, dtype=E_full.dtype),
+            E_full.sharding)
 
     # ENTRY-SOLVED metallic occupations: one MP1 state per map CALL, from
     # the spectrum of the H actually being mapped.  This makes the
@@ -3437,8 +3407,8 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     # build_qsgw_sigma_xc reads (sigma_eval_omega).  The tail law excludes it.
     from .qsgw_utils import omega_coverage
     sc_support = (None if not inputs.config.compute_mode.is_dynamic else
-                  _sc_sampled_support(inputs, partition, energies_loop, _sigma_frame_mu_ev(
-                      inputs, E_full, efermi_ry,
+                  _sc_sampled_support(inputs, partition, energies_loop, sigma_frame_mu_ev(
+                      inputs.config, inputs.wfn, E_full, efermi_ry,
                       entry_occ_state if inputs.material_class == "metal" else None),
                       _sc_active_identities(inputs)))
     sigma0_kn = (np.zeros(energies_loop.shape, dtype=bool) if sc_support is None

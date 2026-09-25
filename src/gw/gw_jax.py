@@ -839,6 +839,41 @@ def _prepare_static_head(config, do_screened, head_resolver, meta, mode, print0,
     return (static_head_terms)
 
 
+def _oneshot_sampled_support(config, enk_dft, wfn, occupation_state,
+                             material_class, print_fn):
+    """The one-shot's sampled Sigma(omega) support, grown by the rule every
+    SC map uses (``scissor.grow_sigma_support_ev``; owner 2026-09-24).
+
+    Every requested band is required, as on SC map 0, and it is judged in the
+    frame the Sigma build measures from (``efermi.sigma_frame_mu_ev``), so SC
+    map 0 is this calculation: the same grid, rules and out-of-grid set.
+    Under ``cover`` an active state outside the requested grid now reads its
+    own Sigma(E) here too, where it used to read Sigma(0).
+    """
+    from dataclasses import replace
+
+    from .efermi import sigma_frame_mu_ev
+    from .scissor import grow_sigma_support_ev
+    from .shared_pole_recipe import active_band_mask
+    e_ry = np.asarray(enk_dft, dtype=np.float64)
+    metal = material_class == "metal" and occupation_state is not None
+    mu_ev = sigma_frame_mu_ev(
+        config, wfn, e_ry,
+        float(occupation_state.mu_ry) if metal else float(wfn.efermi),
+        occupation_state if metal else None)
+    requested = np.asarray(config.omega_grid_ev, dtype=np.float64)
+    grown, _ = grow_sigma_support_ev(
+        config.sigma, config.sc.frozen_core_bands, requested,
+        e_ry * RYD_TO_EV - mu_ev, np.ones(e_ry.shape, dtype=bool),
+        active_band_mask(e_ry, float(wfn.efermi)))
+    if grown.size == requested.size:
+        return config
+    print_fn(f"  Sigma sampled support ({config.sigma.out_of_grid}): "
+             f"[{requested[0]:+.6f}, {requested[-1]:+.6f}] -> "
+             f"[{grown[0]:+.6f}, {grown[-1]:+.6f}] eV")
+    return replace(config, sc_omega_grid_ev=tuple(float(x) for x in grown))
+
+
 def _run_oneshot_sigma(
         V_q, W_by_role, band_slices, bispinor_v_q_path, config, enk_dft, head_resolver,
         input_dir, isdf, material_class, mesh_xy, meta, mode, oneshot_occupation_state,
@@ -848,6 +883,10 @@ def _run_oneshot_sigma(
     gc.collect()   # drop ISDF-stage temporaries before the Σ build
     sigma_result = None
     if qp_solver is not QPSolver.SELF_CONSISTENT:
+        if mode.is_dynamic:
+            config = _oneshot_sampled_support(
+                config, enk_dft, wfn, oneshot_occupation_state,
+                material_class, print0)
         with timing.section("gw_jax.sigma"):
             sigma_result = compute_sigma_xc(
                 mode,

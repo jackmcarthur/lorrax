@@ -77,6 +77,8 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 
+from common.units import RYD_TO_EV
+
 
 __all__ = [
     "OCCUPATION_CLAMP_TOL_DEFAULT",
@@ -170,6 +172,33 @@ def resolve_sigma_efermi_ry(fermi_reference, *, occupation_state, wfn):
 #: :func:`occupation_weight_floor` for the occupancy→weight mapping and
 #: :func:`band_in_occupation_window` for the rule itself.
 OCCUPATION_WINDOW_THRESHOLD_DEFAULT = 0.995
+
+
+def sigma_frame_mu_ev(config, wfn, E_full_ry, efermi_ry, occupation_state):
+    """The E_F the Sigma build measures its omega grid from, in eV.
+
+    Grid growth and the tail mask must judge coverage in THIS frame.  The
+    GN/HL-PPM Sigma is built about the current spectrum's VBM or midgap
+    (``ppm_sigma.ppm_fermi_frame`` on the step occupations the QP bundle
+    gets at ``efermi_ry``), which on MoS2 3x3 QSGW sat 1.4 eV above the
+    DFT midgap the partition uses; judged in the partition frame, a state
+    the grid "covered" still read Sigma(0), and the growth that finally
+    covered it moved its map output 2.8 eV (CLAIMS 2725).  MPA measures
+    from ``gw.efermi.resolve_sigma_efermi_ry``.
+    """
+    if config.compute_mode.ppm_model is not None:
+        from .ppm_sigma import ppm_fermi_frame
+        if efermi_ry is None:
+            raise ValueError("the PPM Sigma frame needs this map's occupation step")
+        e = jnp.asarray(E_full_ry, dtype=jnp.float64)
+        frame = ppm_fermi_frame(
+            e, (e < float(efermi_ry)).astype(jnp.float64),
+            jnp.asarray(config.sigma.fermi_reference == "midgap"))
+        return float(jax.device_get(frame)) * RYD_TO_EV
+    ref_ry, _ = resolve_sigma_efermi_ry(
+        config.sigma.fermi_reference, occupation_state=occupation_state,
+        wfn=wfn)
+    return float(ref_ry) * RYD_TO_EV
 
 
 def occupation_weight_floor(occupation_window_threshold):
