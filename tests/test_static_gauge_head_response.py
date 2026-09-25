@@ -448,7 +448,6 @@ def _packed_deck(*, sys_dim=2, extra=""):
         "bispinor = true\n"
         "bispinor_gw = full_static_cohsex\n"
         "compute_mode = cohsex\n"
-        "low_mem_bands = true\n"
         "linalg = distributed\n"
         "restart = false\n"
         + extra
@@ -574,38 +573,22 @@ def test_the_eight_scalar_head_overrides_are_one_conjunct(tmp_path):
 def test_mode_required_settings_are_derived_from_the_envelope_table(tmp_path):
     """The packed kernel derives its band carrier, not the public LA dial."""
     lines = []
-    deck = _packed_deck().replace("low_mem_bands = true\n", "")
+    deck = _packed_deck()
     path = tmp_path / "derived.in"
     path.write_text(deck)
     config = LorraxConfig.from_input_file(
         str(path), print_fn=lambda *a, **k: lines.append(" ".join(map(str, a))))
-    assert config.memory.low_mem_bands is True
     assert str(config.backend.linalg) == "distributed"
     assert uses_static_photon_response(config)
     assert not any("WARNING" in ln for ln in lines), lines
     assert not any("linalg was not named" in ln for ln in lines), lines
 
 
-def test_axis_parent_key_is_preserved_without_coercion(tmp_path):
-    """False selects axis parents without changing the requested deck value."""
-    deck = _packed_deck().replace(
-        "low_mem_bands = true", "low_mem_bands = false")
-    path = tmp_path / "retired.in"
-    path.write_text(deck)
-    lines = []
-    config = LorraxConfig.from_input_file(str(path), print_fn=lines.append)
-    assert config.memory.low_mem_bands is False
-    assert uses_static_photon_response(config)
-    assert not any("WARNING: low_mem_bands = false" in line for line in lines)
-
-
 def test_a_deck_outside_the_envelope_still_sees_its_own_reason(tmp_path):
     """The promotion must not fire for a deck that is outside the envelope
     for some OTHER reason, or a bad deck would be told about a key it
     never wrote."""
-    deck = (_packed_deck()
-            .replace("low_mem_bands = true\n", "")
-            .replace("compute_mode = cohsex", "compute_mode = mpa"))
+    deck = _packed_deck().replace("compute_mode = cohsex", "compute_mode = mpa")
     # ``mpa`` is the one dynamic mode OUTSIDE PACKED_PHOTON_COMPUTE_MODES
     # (the plasmon-pole pair joined it with the dynamic packed route, lane N).
     with pytest.raises(ValueError) as exc:

@@ -206,8 +206,7 @@ def test_indivisible_sigma_window_reports_the_driver_carrier(
     config.bispinor = False
     config.memory = SimpleNamespace(
         per_device_gb=0, chunk_target_utilization=0.85, band_chunk_size=0,
-        vq_g_chunk_size=0,
-        low_mem_bands=False)
+        vq_g_chunk_size=0)
     config.backend = SimpleNamespace(summary=lambda: "auto")
     monkeypatch.setattr(doctor, "_source_root_and_runtime",
                         lambda *a, **k: (tmp_path, tmp_path / "runtime.py"))

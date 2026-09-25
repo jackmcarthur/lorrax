@@ -173,8 +173,7 @@ def test_route_g_plans_the_whole_tile_tier_under_linalg_distributed():
     cfg = SimpleNamespace(
         zeta_nband=144,
         memory=SimpleNamespace(
-            per_device_gb=33.9, chunk_target_utilization=0.0,
-            low_mem_bands=False),
+            per_device_gb=33.9, chunk_target_utilization=0.0),
         backend=SimpleNamespace(
             distributed_zeta_solve=prof.distributed_zeta_solve,
             charge_zeta_solve=prof.charge_zeta_solve))

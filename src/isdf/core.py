@@ -24,7 +24,7 @@ from common.gamma_matrices import (
 )
 from common.fft_helpers import compute_block_size_for_2d_cholesky
 from common.wfn_transforms import take_rchunk_padded
-# Face-layout CCT (low_mem_bands=True): the (s,mu) GEMM-seam merge/split the
+# Face-layout CCT: the (s,mu) GEMM-seam merge/split the
 # two-face carrier and the face G-build already use.  ``common/`` layer,
 # same as everything else this module imports -- no ``gw`` dependency.
 from common.contract_bands import merge_spin_centroid
@@ -1088,7 +1088,7 @@ def c_q_downfold(
 
 
 # ============================================================================
-# Face-layout CCT (low_mem_bands=True) — band contraction as a distributed
+# Face-layout CCT — band contraction as a distributed
 # SUMMA GEMM, band-WEIGHTED rather than band-WINDOWED, so the L/R sigma
 # window edge (BandSlices.b3, generally NOT mesh-divisible) never needs its
 # own pad: the shared plan's ``k`` is the array's own full band extent

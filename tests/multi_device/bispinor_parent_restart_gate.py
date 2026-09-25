@@ -34,7 +34,7 @@ def main():
     sym = wfn.symmetry()
     bases, packed, disk = [], [], []
     incoming = (None if args.input is None else
-                read_restart_state_from_h5(args.input, mesh, low_mem_bands=True))
+                read_restart_state_from_h5(args.input, mesh))
     for family, path in enumerate((args.charge, args.current)):
         _, points, count = load_centroids(path, wfn.fft_grid)
         basis = PackedCentroidBasis.build(points, sym, wfn.fft_grid, mesh)
@@ -63,7 +63,7 @@ def main():
         psi_parent_y=disk[0][0], psi_parent_y_mun=disk[0][1],
         psi_parent_y_transverse=disk[1][0], psi_parent_y_transverse_mun=disk[1][1],
         parent_k_rows=sym.kirr_fullids, mesh=mesh, mode="w")
-    read = read_restart_state_from_h5("parent_restart.h5", mesh, low_mem_bands=True)
+    read = read_restart_state_from_h5("parent_restart.h5", mesh)
     errors = []
     for basis, faces, restored in zip(bases, packed, ((read.psi_nmu_parent, read.psi_mun_parent), (read.psi_nmu_parent_transverse, read.psi_mun_parent_transverse))):
         for face, value, axis in zip(faces, restored, (3, 2)):

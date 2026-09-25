@@ -724,7 +724,7 @@ def test_dynamic_dispatch_books_static_current_once_in_x(tmp_path, monkeypatch, 
     path = tmp_path/'dynamic.in'
     path.write_text('[cohsex]\nnval=2\nncond=2\nnband=10\nmemory_per_device_gb=4\n'
         'bispinor=true\nbispinor_gw=bare_transverse\nsys_dim=2\nqp_solver=one_shot_dft\n'
-        'low_mem_bands=true\nlinalg=distributed\nrestart=false\nhead_correction=full\n'
+        'linalg=distributed\nrestart=false\nhead_correction=full\n'
         'use_ppm_sigma=true\nppm_omega_p=2\nuse_band_extrapolation=false\ncompute_mode=gn_ppm\n')
     config = LorraxConfig.from_input_file(str(path),print_fn=lambda *a:None)
     charge = jnp.array([[[2.,1j],[-1j,3.]]])

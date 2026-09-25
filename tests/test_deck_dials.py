@@ -78,10 +78,10 @@ def test_retired_linalg_keys_refuse_by_name_with_migration_hint(
     assert "linalg = local | distributed" in message
 
 
-def test_band_chunk_size_is_folded_under_low_mem_bands(tmp_path):
+def test_band_chunk_size_is_retired(tmp_path):
     with pytest.raises(ValueError, match="band_chunk_size.*retired") as exc:
         read_lorrax_input(_deck(tmp_path, "band_chunk_size = 8\n"))
-    assert "low_mem_bands = true | false" in str(exc.value)
+    assert "memory_per_device_gb" in str(exc.value)
 
 
 def test_strict_keys_is_retired_and_unknown_keys_always_refuse(tmp_path):

@@ -77,19 +77,10 @@ def layout_dial_record_lines(
             "linalg = distributed: dense N_mu x N_mu matrices are 2D "
             f"distributed across the process mesh (N_mu = {n_mu})")
 
-    low_mem = bool(config.memory.low_mem_bands)
-    provenance = getattr(
-        config.memory, "low_mem_bands_provenance",
-        "deck" if "low_mem_bands" in config.raw_input_keys else "default")
     lines.append(
-        f"[config provenance] low_mem_bands = {str(low_mem).lower()} "
-        f"({provenance})")
-    psi_layout = "face" if low_mem else "axis"
-    contraction = "distributed GEMM" if low_mem else "local GEMM with complete bands"
-    lines.append(
-        f"low_mem_bands = {str(low_mem).lower()}: {psi_layout} parent carrier; "
-        f"{contraction}; band chunks of {int(config.memory.band_chunk_size)}. "
-        "Both layouts contract G and ISDF pair densities on the same parent rows.")
+        "ψ parent carrier: band-distributed faces; band contractions gather "
+        "their band panels in memory-sized chunks; band chunks of "
+        f"{int(config.memory.band_chunk_size)}.")
     return tuple(lines)
 
 

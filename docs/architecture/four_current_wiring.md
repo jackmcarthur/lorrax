@@ -553,7 +553,7 @@ roles in `screening.screening_requests_for`, a row in
 `gw_config.MODE_SIGMA_CHANNELS` and a branch here; until then it refuses by
 name. `wfns_transverse` and `bispinor_v_q_path` are both-or-neither.
 `photon_response` is used only on P. `_validate_sigma_stage` refuses an
-unimplemented mode, an explicit `Gij` (`GATE low_mem_bands_explicit_gij_unported`),
+unimplemented mode, an explicit `Gij` (`GATE explicit_gij_unported`),
 and an explicitly configured band extrapolation that no stage of the run
 consumes (it is GN/HL-only; a defaulted request is disabled for the stage
 and announced).

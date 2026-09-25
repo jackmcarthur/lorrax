@@ -33,7 +33,7 @@ the wiring is wrong (TASTE.md pattern 1):
    slab_reference_ratio``).
 
 Plus the parse-time refusal envelope (rule id, all five message parts,
-no-op at the default) mirroring ``tests/test_low_mem_bands_envelope.py``'s
+no-op at the default) mirroring ``tests/test_face_carrier_config.py``'s
 own shape.
 """
 from __future__ import annotations
@@ -424,7 +424,7 @@ def test_packed_completion_charge_only_R_returns_diag_W00_and_bare_D_TT():
 
 
 # ---------------------------------------------------------------------------
-# Refusal envelope (parse time), mirroring test_low_mem_bands_envelope.py
+# Refusal envelope (parse time), mirroring test_face_carrier_config.py
 # ---------------------------------------------------------------------------
 
 _BASE = """\
@@ -515,8 +515,7 @@ def test_bispinor_false_decks_are_untouched(tmp_path):
 
 def test_gw_init_calls_the_canonical_refusal():
     """The driver-entry mirror call exists (parser-altitude coverage
-    duplicated for a hand-built cfg), same shape as low_mem_bands's own
-    ``test_gw_init_calls_the_canonical_envelope_function_once``."""
+    duplicated for a hand-built cfg)."""
     import inspect
     from gw import gw_init
     src = inspect.getsource(gw_init.prepare_isdf_and_wavefunctions)
@@ -566,7 +565,6 @@ bispinor_gw = bare_transverse
 sys_dim = 2
 compute_mode = cohsex
 qp_solver = one_shot_dft
-low_mem_bands = true
 linalg = distributed
 restart = false
 head_correction = full
