@@ -40,7 +40,8 @@
 //             U_k in registers, and the store writes U spin-major
 //             (n_out, a, mx, b, my), full-k row k at output row kout(k)
 //             (-1: not stored; the Sigma consumers keep only the parent
-//             rows).  The tables are symmetry_maps's (unfold_load_tables);
+//             rows), or one (d x d) output spin block (a0, b0) of it
+//             (LRX_NA = d): every source is read, only the block stored.  The tables are symmetry_maps's (unfold_load_tables);
 //             every product rounds as the XLA unfold and the spin-rotate FFI
 //             it replaces.
 //   8 klead lorentz conv   mode 7's load, then the four-current vertex sum in
@@ -74,6 +75,15 @@
 //             written: the row FFTs run on the occupied rows only, gathering
 //             their cells on load, then the column FFTs read dead rows as zero.
 //             Its own embedded source, kPlaneSrc (see there).
+//  11 klead chi unfold   one tau node of chi0 from the RAW-PARENT Green pair on
+//             the k-box stage (kbox_stage.cuh, embedded as a named header): the
+//             load gathers mode 7's typed unfold of Gv and Gc (every spin element
+//             of a pair; conj_trs = 2 reads the antiunitary partner as conj(G)),
+//             one inverse transform, then per (k, pair) the spin trace
+//             v = sum_ab conj(si Gc'_ab) (si Gv'_ab) (+ conj(v) on a real contour)
+//             and acc[o, k, x, y] += alpha[o] v in place.  The forward transform
+//             follows the tau sum.  Single pass when a pair's 2*ns^2 columns fit,
+//             else the plane pass and an R-space group pencil, chunked over pairs.
 // A new mode adds (1) an entry under its LRX_MODE value in kSrc, (2) a mode
 // code and a handler below, (3) a router factory in ffi/fft.py.
 //
@@ -185,9 +195,10 @@ struct UnfoldTab {
     long long ml, nl;                            // merged local endpoints mx*ns, my*ns
     const int* kout;                             // (nk) output row of full k, -1 = none;
                                                  // null = every k at its own row
-    int conj_trs;                                // 1: an antiunitary row conjugates the
-                                                 // phased product (no partner tile)
+    int conj_trs;                                // antiunitary rows: 0 read the partner tile,
+                                                 // 1 conjugate the phased product, 2 read conj(G)
     const double* spin_r;                        // (nk,nr_s,nr_s) right action; null = spin
+    int a0, b0;                                  // mode 7: first rows of the output spin block
 };
 
 // Mode 8 vertex tables and scales (the embedded source declares the same struct).
@@ -242,6 +253,7 @@ struct UnfoldTab {
     const int* kout;
     int conj_trs;
     const double* spin_r;
+    int a0, b0;
 };
 // The output row of full k: kout[k] (-1 = not stored), or k itself.
 __device__ __forceinline__ long long lrx_out_row(const UnfoldTab& t, int k) {
@@ -549,7 +561,15 @@ extern "C" __global__ void __launch_bounds__(256) lrx_kconv(
 #endif
 constexpr int NR = LRX_NSR;
 constexpr int SS = NS * NR;
-constexpr bool GROUPED = (RB % SS) == 0;
+// Mode 7's output spin block: rows (a, b) in [a0, a0 + NA) x [b0, b0 + NA) of U G U^dagger
+// (NA = NS: the whole spin group, every other mode).  A pass reads every source of a pair and
+// transforms and stores only its block, so a caller bounds the output tile by passes.
+#ifndef LRX_NA
+#define LRX_NA LRX_NS
+#endif
+constexpr int NA = LRX_NA;
+constexpr int SSO = (NA == NS) ? SS : NA * NA;   // rows per pair
+constexpr bool GROUPED = (RB % SSO) == 0;
 
 // The typed unfold of one (k, x, y) pair (symmetry_maps unfold_isdf_operator,
 // axis-local pair_transpose arm): source row, both endpoint gathers, then
@@ -642,14 +662,22 @@ __device__ __forceinline__ void lrx_group_load(
             lrx_unfold_pair(gp, gt, t, k, xx, yy, g, u, ur);
 #pragma unroll
             for (int a = 0; a < NS; ++a) {
+                if constexpr (NA != NS) { if (a < t.a0 || a >= t.a0 + NA) continue; }
                 lrx_c2 out[NR];
                 lrx_spin_row(u, ur, g, a, out);
 #pragma unroll
-                for (int b = 0; b < NR; ++b) sm[(jp * SS + a * NR + b) * SP + k] = out[b];
+                for (int b = 0; b < NR; ++b) {
+                    if constexpr (NA != NS) {
+                        if (b < t.b0 || b >= t.b0 + NA) continue;
+                        sm[(jp * SSO + (a - t.a0) * NA + (b - t.b0)) * SP + k] = out[b];
+                    } else {
+                        sm[(jp * SS + a * NR + b) * SP + k] = out[b];
+                    }
+                }
             }
         } else {
 #pragma unroll
-            for (int ab = 0; ab < SS; ++ab) sm[(jp * SS + ab) * SP + k] = {0.0, 0.0};
+            for (int ab = 0; ab < SSO; ++ab) sm[(jp * SSO + ab) * SP + k] = {0.0, 0.0};
         }
     }
 }
@@ -661,15 +689,16 @@ __device__ __forceinline__ void lrx_unfold_load(
     long long r0, lrx_c2* sm) {
     const long long my = t.nl / NR, pairs = (t.ml / NS) * my;
     if constexpr (GROUPED) {
-        lrx_group_load<RB / SS>(gp, gt, t, r0 / SS, pairs, my, sm);
+        lrx_group_load<RB / SSO>(gp, gt, t, r0 / SSO, pairs, my, sm);
     } else {
         for (int i = threadIdx.x; i < RB * NK; i += blockDim.x) {
             const int k = i / RB, j = i % RB;
-            const long long r = r0 + j, pr = r / SS;
+            const long long r = r0 + j, pr = r / SSO;
             lrx_c2 v = {0.0, 0.0};
             if (pr < pairs) {
                 const long long xx = pr / my, yy = pr - xx * my;
-                const int a = (int)((r % SS) / NR), b = (int)(r % NR);
+                const int a = (NA == NS) ? (int)((r % SS) / NR) : t.a0 + (int)((r % SSO) / NA);
+                const int b = (NA == NS) ? (int)(r % NR) : t.b0 + (int)((r % SSO) % NA);
                 lrx_c2 g[NS][NR], u[NS][NS], ur[NR][NR], out[NR];
                 lrx_unfold_pair(gp, gt, t, k, xx, yy, g, u, ur);
                 lrx_spin_row(u, ur, g, a, out);
@@ -693,7 +722,7 @@ extern "C" __global__ void __launch_bounds__(256) lrx_kconv(
     transform3<fft_direction::inverse>(sm);
     for (int i = threadIdx.x; i < RB * NK; i += blockDim.x) {
         const int k = i / RB, j = i % RB;
-        const long long pr = (r0 + j) / SS;
+        const long long pr = (r0 + j) / SSO;
         if (pr < pairs) {
             const long long xx = pr / my, yy = pr - xx * my;
             sm[j * SP + k] = lrx_mul(sm[j * SP + k], kern[((long long)k * mx + xx) * my + yy]);
@@ -703,13 +732,14 @@ extern "C" __global__ void __launch_bounds__(256) lrx_kconv(
     transform3<fft_direction::forward>(sm);
     for (int i = threadIdx.x; i < RB * NK; i += blockDim.x) {
         const int k = i / RB, j = i % RB;
-        const long long r = r0 + j, pr = r / SS;
+        const long long r = r0 + j, pr = r / SSO;
         const long long ko = lrx_out_row(t, k);
         if (pr < pairs && ko >= 0) {
             const long long xx = pr / my, yy = pr - xx * my;
-            const int a = (int)((r % SS) / NS), b = (int)(r % NS);
+            // (a, b) within the stored block: U is (n_out, NA, mx, NA, my).
+            const int a = (int)((r % SSO) / NA), b = (int)(r % NA);
             const lrx_c2 v = sm[j * SP + k];
-            y[((ko * NS + a) * mx + xx) * t.nl + b * my + yy] = {v.x * scale, v.y * scale};
+            y[((ko * NA + a) * mx + xx) * (my * NA) + b * my + yy] = {v.x * scale, v.y * scale};
         }
     }
 }
@@ -1137,7 +1167,7 @@ struct Built { CUfunction fn = nullptr; int rb = 1; int smem = 0; double compile
                // Mode 11 (k-box stage): arm 0 single pass (tr tile columns, smem), arm 1 split:
                // the plane pass (tr = its tile columns, smem) and the group pencil (threads2, smem2).
                int arm = 0, tr = 0, ty = 0, threads2 = 0, smem2 = 0, sms = 0; };
-// ctx, mode, nkx, nky, nkz, ns, nsr, f32, variant (mode 11: the static completion)
+// ctx, mode, nkx, nky, nkz, ns, nsr, f32, variant (mode 11: the static completion; mode 7: its output spin block)
 using Key = std::tuple<CUcontext, int, int, int, int, int, int, int, int>;
 static std::mutex g_mu;
 static std::map<Key, Built> g_cache;
@@ -1227,8 +1257,10 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
             chi_smem2 = (static_cast<long long>(nkx) * chi_grp * chi_ty + static_cast<long long>(nkx) * chi_ty) * 16;
         }
     }
-    if ((mode == 7 || mode == 8 || mode == 9) && rb >= ns * nsr)
-        rb -= rb % (ns * nsr);                         // whole spin groups: the grouped load
+    const int blk = (mode == 7 && variant > 0) ? variant : ns;    // mode 7's output spin block
+    const int grp_rows = (mode == 7 && blk != ns) ? blk * blk : ns * nsr;
+    if ((mode == 7 || mode == 8 || mode == 9) && rb >= grp_rows)
+        rb -= rb % grp_rows;                           // whole spin groups: the grouped load
     // (fewer rows than one spin group: mode 7 loads per bank, as mode 2 would fit)
     long long plane_minb = 1;                          // mode 10: blocks per SM (LRX_RB)
     long long plane_static = 0;                        // mode 10: its static tables, bytes
@@ -1317,6 +1349,7 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
         "-DLRX_SM=" + std::to_string(cc_major * 100 + cc_minor * 10)};
     // Mode 10: planes per block; a block that has its SM alone runs 512 threads.
     const int plane_threads = mode == 10 && plane_minb == 1 ? 512 : kThreads;
+    if (mode == 7 && blk != ns) defs.push_back("-DLRX_NA=" + std::to_string(blk));
     if (mode == 11) {
         defs.push_back("-DLRX_ARM=" + std::to_string(kplan.arm));
         defs.push_back("-DLRX_TR=" + std::to_string(chi_trc));
@@ -1641,7 +1674,8 @@ static ffi::Error KleadUnfoldImpl(
     cudaStream_t stream, ffi::AnyBuffer Gp, ffi::AnyBuffer Gt, ffi::AnyBuffer row, ffi::AnyBuffer trs,
     ffi::AnyBuffer lsrc, ffi::AnyBuffer rsrc, ffi::AnyBuffer mph, ffi::AnyBuffer nph, ffi::AnyBuffer spin,
     const ffi::AnyBuffer* kout, ffi::AnyBuffer V, ffi::Result<ffi::AnyBuffer> U, int64_t nkx,
-    int64_t nky, int64_t nkz, double scale, std::string_view mathdx_root, std::string_view cubin_dir) {
+    int64_t nky, int64_t nkz, double scale, std::string_view mathdx_root, std::string_view cubin_dir,
+    int64_t conj_src = 0, int64_t spin_block = 0, int64_t a0 = 0, int64_t b0 = 0) {
     auto bad = [](const std::string& why) {
         return fail("klead unfold conv", why, ffi::ErrorCode::kInvalidArgument);
     };
@@ -1667,29 +1701,35 @@ static ffi::Error KleadUnfoldImpl(
         (kout != nullptr && !is(*kout, I, {nk})) ||
         !(U->element_type() == C && U->dimensions().size() == 5 && U->dimensions()[0] >= 1 &&
           (kout != nullptr || U->dimensions()[0] == nk) &&
-          U->dimensions()[1] == ns && U->dimensions()[2] == ml / ns && U->dimensions()[3] == ns &&
-          U->dimensions()[4] == nl / ns))
+          U->dimensions()[1] == (spin_block ? spin_block : ns) && U->dimensions()[2] == ml / ns &&
+          U->dimensions()[3] == (spin_block ? spin_block : ns) && U->dimensions()[4] == nl / ns))
         return bad("want c128 Gp=Gt (np,ml,nl); s32 row,trs,kout (nk), lsrc (nk,ml), rsrc (nk,nl); c128 "
                    "mph (nk,ml), nph (nk,nl), spin (nk,ns,ns), V (nk,ml/ns,nl/ns); U "
                    "(n_out,ns,ml/ns,ns,nl/ns), n_out = nk without kout");
+    // The output spin block: rows [a0, a0 + d) x [b0, b0 + d) of the spin group (d = ns: all).
+    const int64_t d = spin_block ? spin_block : ns;
+    if (d < 1 || ns % d || a0 < 0 || b0 < 0 || a0 % d || b0 % d || a0 >= ns || b0 >= ns)
+        return bad("want spin_block d dividing ns and block origins a0, b0 in [0, ns), multiples of d");
     const int64_t pairs = (ml / ns) * (nl / ns);
     if (pairs == 0) return ffi::Error::Success();
     const Built* k = nullptr;
     ffi::Error e = build(7, static_cast<int>(nkx), static_cast<int>(nky), static_cast<int>(nkz),
-                         static_cast<int>(ns), false, mathdx_root, cubin_dir, &k);
+                         static_cast<int>(ns), false, mathdx_root, cubin_dir, &k, 0,
+                         d == ns ? 0 : static_cast<int>(d));
     if (!e.success()) return e;
     UnfoldTab t{static_cast<const int*>(row.untyped_data()), static_cast<const int*>(trs.untyped_data()),
                 static_cast<const int*>(lsrc.untyped_data()), static_cast<const int*>(rsrc.untyped_data()),
                 static_cast<const double*>(mph.untyped_data()), static_cast<const double*>(nph.untyped_data()),
                 static_cast<const double*>(spin.untyped_data()), ml, nl,
-                kout ? static_cast<const int*>(kout->untyped_data()) : nullptr, 0, nullptr};
+                kout ? static_cast<const int*>(kout->untyped_data()) : nullptr, conj_src ? 2 : 0, nullptr,
+                static_cast<int>(a0), static_cast<int>(b0)};
     const void* gpp = Gp.untyped_data();
     const void* gtp = Gt.untyped_data();
     const void* vp = V.untyped_data();
     void* up = U->untyped_data();
     double sc = scale;
     void* args[] = {(void*)&gpp, (void*)&gtp, (void*)&vp, (void*)&up, (void*)&t, (void*)&sc};
-    const long long rows = pairs * ns * ns;
+    const long long rows = pairs * d * d;
     const long long blocks = (rows + k->rb - 1) / k->rb;
     if (blocks > 2147483647LL) return bad("grid.x overflow");
     CUresult cr = driver_api().LaunchKernel(k->fn, static_cast<unsigned>(blocks), 1, 1, kThreads, 1, 1,
@@ -1703,9 +1743,10 @@ static ffi::Error KleadUnfoldRowsConv(
     cudaStream_t stream, ffi::AnyBuffer Gp, ffi::AnyBuffer Gt, ffi::AnyBuffer row, ffi::AnyBuffer trs,
     ffi::AnyBuffer lsrc, ffi::AnyBuffer rsrc, ffi::AnyBuffer mph, ffi::AnyBuffer nph, ffi::AnyBuffer spin,
     ffi::AnyBuffer kout, ffi::AnyBuffer V, ffi::Result<ffi::AnyBuffer> U, int64_t nkx, int64_t nky,
-    int64_t nkz, double scale, std::string_view mathdx_root, std::string_view cubin_dir) {
+    int64_t nkz, double scale, int64_t conj_src, int64_t spin_block, int64_t a0, int64_t b0,
+    std::string_view mathdx_root, std::string_view cubin_dir) {
     return KleadUnfoldImpl(stream, Gp, Gt, row, trs, lsrc, rsrc, mph, nph, spin, &kout, V, U, nkx, nky,
-                           nkz, scale, mathdx_root, cubin_dir);
+                           nkz, scale, mathdx_root, cubin_dir, conj_src, spin_block, a0, b0);
 }
 static ffi::Error KleadUnfoldConv(
     cudaStream_t stream, ffi::AnyBuffer Gp, ffi::AnyBuffer Gt, ffi::AnyBuffer row, ffi::AnyBuffer trs,
@@ -1725,7 +1766,8 @@ static ffi::Error KleadLorentzImpl(
     const ffi::AnyBuffer* kout, ffi::AnyBuffer V, ffi::Result<ffi::AnyBuffer> U, int64_t nkx,
     int64_t nky, int64_t nkz, double scale_g, double scale_f, double mult,
     ffi::Span<const int64_t> perm_l, ffi::Span<const int64_t> phase_l, ffi::Span<const int64_t> perm_r,
-    ffi::Span<const int64_t> phase_r, std::string_view mathdx_root, std::string_view cubin_dir) {
+    ffi::Span<const int64_t> phase_r, std::string_view mathdx_root, std::string_view cubin_dir,
+    int64_t conj_src = 0) {
     auto bad = [](const std::string& why) {
         return fail("klead lorentz conv", why, ffi::ErrorCode::kInvalidArgument);
     };
@@ -1789,7 +1831,7 @@ static ffi::Error KleadLorentzImpl(
                 static_cast<const int*>(lsrc.untyped_data()), static_cast<const int*>(rsrc.untyped_data()),
                 static_cast<const double*>(mph.untyped_data()), static_cast<const double*>(nph.untyped_data()),
                 static_cast<const double*>(spin.untyped_data()), ml, nl,
-                kout ? static_cast<const int*>(kout->untyped_data()) : nullptr, 0, nullptr};
+                kout ? static_cast<const int*>(kout->untyped_data()) : nullptr, conj_src ? 2 : 0, nullptr};
     const void* gpp = Gp.untyped_data();
     const void* gtp = Gt.untyped_data();
     const void* vp = V.untyped_data();
@@ -1811,9 +1853,10 @@ static ffi::Error KleadLorentzRowsConv(
     ffi::AnyBuffer kout, ffi::AnyBuffer V, ffi::Result<ffi::AnyBuffer> U, int64_t nkx, int64_t nky,
     int64_t nkz, double scale_g, double scale_f, double mult, ffi::Span<const int64_t> perm_l,
     ffi::Span<const int64_t> phase_l, ffi::Span<const int64_t> perm_r, ffi::Span<const int64_t> phase_r,
-    std::string_view mathdx_root, std::string_view cubin_dir) {
+    int64_t conj_src, std::string_view mathdx_root, std::string_view cubin_dir) {
     return KleadLorentzImpl(stream, Gp, Gt, row, trs, lsrc, rsrc, mph, nph, spin, &kout, V, U, nkx, nky, nkz,
-                            scale_g, scale_f, mult, perm_l, phase_l, perm_r, phase_r, mathdx_root, cubin_dir);
+                            scale_g, scale_f, mult, perm_l, phase_l, perm_r, phase_r, mathdx_root, cubin_dir,
+                            conj_src);
 }
 static ffi::Error KleadLorentzConv(
     cudaStream_t stream, ffi::AnyBuffer Gp, ffi::AnyBuffer Gt, ffi::AnyBuffer row, ffi::AnyBuffer trs,
@@ -2238,6 +2281,10 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Arg<xla::ffi::AnyBuffer>()   // V (R space)
         .Ret<xla::ffi::AnyBuffer>()
         LRX_KCONV_GRID_ATTRS
+        .Attr<int64_t>("conj_src")    // 1: the antiunitary partner is conj(Gp); Gt unread
+        .Attr<int64_t>("spin_block")  // d: store the (d x d) output spin block at (a0, b0); 0 = all
+        .Attr<int64_t>("a0")
+        .Attr<int64_t>("b0")
         .Attr<std::string_view>("mathdx_root")
         .Attr<std::string_view>("cubin_dir"));
 
@@ -2267,6 +2314,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Attr<xla::ffi::Span<const int64_t>>("phase_l")
         .Attr<xla::ffi::Span<const int64_t>>("perm_r")
         .Attr<xla::ffi::Span<const int64_t>>("phase_r")
+        .Attr<int64_t>("conj_src")
         .Attr<std::string_view>("mathdx_root")
         .Attr<std::string_view>("cubin_dir"));
 

@@ -1,8 +1,9 @@
 """Build parent Green operators and transport them with typed local symmetry actions."""
+import dataclasses
 from functools import partial
-from typing import NamedTuple
 
 import jax
+
 import numpy as np
 import jax.numpy as jnp
 
@@ -96,17 +97,31 @@ def _build_G_face(psi_mun, psi_nmu, *, gemm, Gij=None, phases=None, mesh=None,
     return G_flat.reshape(nk_, mu_l_, s_, mu_r_, s_)
 
 
-class ParentGreen(NamedTuple):
+@dataclasses.dataclass(frozen=True)
+class ParentGreen:
     """The raw-parent Green and what its typed unfold needs.
 
     ``G`` ``(n_parent, mu, s, nu, s')`` centroid-major; ``transpose`` the
-    partner an antiunitary row reads (the conjugate-face Green, or ``conj(G)``
-    for real weights), ``None`` when the plan has no antiunitary row.
-    ``k_unfold_plan.unfold_operator(G, operator_transpose=transpose)`` is the
+    partner an antiunitary row reads (the conjugate-face Green), ``None`` when
+    the plan has no antiunitary row or when ``conj_partner``: weights known
+    real, so the partner is ``conj(G)`` and the fused doors read it from ``G``
+    on their load (``conj_partner=True``) instead of storing a second tile.
+    ``k_unfold_plan.unfold_operator(G, operator_transpose=partner())`` is the
     full-k Green; ``ffi.fft.make_kconv_klead_unfold`` reads the pair directly.
+    A pytree: ``G`` and ``transpose`` are leaves, ``conj_partner`` is static.
     """
     G: jax.Array
-    transpose: jax.Array | None
+    transpose: jax.Array | None = None
+    conj_partner: bool = False
+
+    def partner(self):
+        """The partner tile itself (``conj(G)`` materialized when ``conj_partner``)."""
+        return jnp.conj(self.G) if self.conj_partner else self.transpose
+
+
+jax.tree_util.register_pytree_node(
+    ParentGreen, lambda p: ((p.G, p.transpose), p.conj_partner),
+    lambda conj, leaves: ParentGreen(leaves[0], leaves[1], conj))
 
 
 def build_G_parents(psi_xn, psi_yr, *, Gij=None, phases=None, layout='face', gemm=None,
@@ -126,7 +141,7 @@ def build_G_parents(psi_xn, psi_yr, *, Gij=None, phases=None, layout='face', gem
     if np.any(np.asarray(k_unfold_plan.sym_idx) >= k_unfold_plan.n_sym_spatial):
         if (real_weights is True or phases is None
                 or not jnp.issubdtype(phases.dtype, jnp.complexfloating)):
-            transposed = jnp.conj(G)
+            return ParentGreen(G, None, conj_partner=True)
         else:
             transposed = jax.lax.cond(
                 (jnp.any(jnp.imag(phases) != 0) if real_weights is None
@@ -162,7 +177,7 @@ def build_G(psi_xn, psi_yr, *, Gij=None, phases=None, layout='face',
                          k_unfold_plan=k_unfold_plan, real_weights=real_weights,
                          band_range=band_range, prepared_active_gemm=prepared_active_gemm)
     return k_unfold_plan.unfold_operator(
-        pg.G, operator_transpose=pg.transpose, right_plan=right_k_unfold_plan,
+        pg.G, operator_transpose=pg.partner(), right_plan=right_k_unfold_plan,
         conjugate=conjugate)
 
 
@@ -320,81 +335,31 @@ def build_G_tau(psi_xn, psi_yr, enk, t, *, e_ref=0.0, mask=None,
 
 
 # ---------------------------------------------------------------------------
-# Spin-pair streaming (phase-1 item A4).  A contraction that is elementwise in
-# the two spinor indices -- chi = sum_ab Gc_ab conj(Gv_ab), and
-# Sigma_nm = sum_ab psi*_a [G_ab . W] psi_b with a spin-independent W -- never
-# needs the ns^2 Green at once.  The typed unfold mixes spinor components, so
-# the parents move to full k first (the psi action, whose Green equals the
-# operator unfold of the parent Green) and each (a, b) block is one GEMM of
-# the a and b spinor rows there.
+# Output spin blocks.  Σ = Σ_ab ψ*_a [G ⋆ W]_ab ψ_b is linear in the output
+# spin block, so a Σ consumer whose output tile would not fit stores and
+# projects it in d x d blocks (mathdx mode 7's output spin block); the Green
+# itself stays whole at the parents.
 # ---------------------------------------------------------------------------
 
-def unfold_parent_faces(plan, psi_mun, psi_nmu, *, layout):
-    """The raw-parent faces transported to full k by the plan's typed psi action.
+def sigma_spin_block(*, n_parent, n_rmu, ns, mesh, partner_tiles):
+    """The output spin block ``d`` (a divisor of ``ns``) a parent-row Σ convolution stores per pass.
 
-    ``psi_mun`` ``(n_parent, s, mu, n)`` and ``psi_nmu`` ``(n_parent, n, s, mu)``
-    at the ``layout`` specs in, the same orientations on ``plan.n_full`` rows
-    out.  Collective-free: the packed centroid source map stays in its shard.
-    """
-    from common.shard_map import shard_map
-    from common.wfn_layout import psi_specs
-
-    nmu_spec, mun_spec = psi_specs(layout)
-    return shard_map(
-        lambda left, right: (
-            plan.unfold_face(left, spin_axis=1, mu_axis=2, mesh_axis="x"),
-            plan.unfold_face(right, spin_axis=2, mu_axis=3, mesh_axis="y")),
-        mesh=plan.mesh_xy, in_specs=(mun_spec, nmu_spec),
-        out_specs=(mun_spec, nmu_spec), check_vma=False)(psi_mun, psi_nmu)
-
-
-def spin_pair_rows(psi_mun, psi_nmu, index, ns):
-    """The spinor rows ``a, b = divmod(index, ns)`` of the two orientations."""
-    return (jax.lax.dynamic_slice_in_dim(psi_mun, index // ns, 1, axis=1),
-            jax.lax.dynamic_slice_in_dim(psi_nmu, index % ns, 1, axis=2))
-
-
-def spin_pairs_needed(*, n_full, n_rmu, ns, mesh, live_green_tiles):
-    """True when a whole-spin stage's live Greens exceed the device target.
-
-    ``live_green_tiles`` counts the stage's concurrent ``G_tile =
-    16·N_k·ns²·μ²/P``; the target is the agreed minimum device budget times
-    the spinor's fragmentation utilization.  Every process must enter.
+    Live per rank: the parent Green ``T_p = 16·n_parent·ns²·μ²/P``, ``partner_tiles`` more
+    of it (1 when the antiunitary partner is its own GEMM, 0 when it is read as conj(G)),
+    and the stored block ``T_p·(d/ns)²``; the largest ``d`` whose set fits the agreed
+    device target (the minimum process budget times the spinor's fragmentation
+    utilization) wins, else 1.  Every process computes the same ``d``.
     """
     if int(ns) <= 1:
-        return False
+        return 1
     from common.gpu_utils import (bfc_fragmentation_target_utilization,
                                   get_device_memory_gb,
                                   minimum_process_budget_gb)
     P_ = int(mesh.shape['x']) * int(mesh.shape['y'])
-    g_tile = 16.0 * int(n_full) * int(ns) ** 2 * int(n_rmu) ** 2 / P_
+    tile = 16.0 * int(n_parent) * int(ns) ** 2 * int(n_rmu) ** 2 / P_
     target = (minimum_process_budget_gb(get_device_memory_gb()) * 1e9
               * bfc_fragmentation_target_utilization(int(ns)))
-    return float(live_green_tiles) * g_tile > target
-
-
-def pair_stream_layout(*, n_full, ns, mu, nb, layout, mesh):
-    """The layout a spin-pair stream contracts its full-k faces in.
-
-    A stream issues ``2·n_s²`` block GEMMs per Green; on faces each gathers
-    its band panels again.  When the two full-k axis copies,
-    ``16·N_k·n_s·μ·N_b·(1/p_x + 1/p_y)``, are no larger than one Green tile
-    ``16·N_k·n_s²·μ²/P`` (the panel bound of the face route), the stream
-    gathers them once (:func:`to_pair_stream_layout`) and every block GEMM
-    is local.
-    """
-    if layout != "face":
-        return layout
-    px, py = int(mesh.shape['x']), int(mesh.shape['y'])
-    axis_bytes = 16.0 * n_full * ns * mu * nb * (1.0 / px + 1.0 / py)
-    tile_bytes = 16.0 * n_full * ns * ns * mu * mu / (px * py)
-    return "axis" if axis_bytes <= tile_bytes else "face"
-
-
-def to_pair_stream_layout(psi_mun, psi_nmu, *, layout, mesh):
-    """Reshard full-k faces to ``layout`` (a no-op when they already are)."""
-    from common.wfn_layout import psi_specs
-
-    nmu_spec, mun_spec = psi_specs(layout)
-    return (jax.lax.with_sharding_constraint(psi_mun, jax.sharding.NamedSharding(mesh, mun_spec)),
-            jax.lax.with_sharding_constraint(psi_nmu, jax.sharding.NamedSharding(mesh, nmu_spec)))
+    for d in sorted((d for d in range(1, int(ns) + 1) if int(ns) % d == 0), reverse=True):
+        if (1.0 + float(partner_tiles) + (d / int(ns)) ** 2) * tile <= target:
+            return d
+    return 1

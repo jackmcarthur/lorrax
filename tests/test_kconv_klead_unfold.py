@@ -74,6 +74,38 @@ def unfold_case(mesh, fx, seed=0):
                 red_rel=float(np.max(np.abs(red - ref)) / np.max(np.abs(ref))))
 
 
+def block_case(mesh, fx, seed=0):
+    """(max |door block - whole door block|, per block) for every d x d output spin block,
+    and conj_partner against the materialized conj(G) partner: both bitwise."""
+    from ffi import fft as F
+    from gw.wavefunction_bundle import SIGMA_CONV_G7D_SPEC, V_FFT5D_SPEC
+    plan, kg = fx["plan"], tuple(fx["kgrid"])
+    ns, mu, n_par, nk = int(plan.nspinor), int(plan.n_centroid_packed), int(plan.n_parent), int(plan.n_full)
+    rng = np.random.default_rng(seed + 5 * ns)
+    crand = lambda *s: rng.standard_normal(s) + 1j * rng.standard_normal(s)
+    s5 = NamedSharding(mesh, P(None, "x", None, "y", None))
+    G, W = crand(n_par, mu, ns, mu, ns), crand(nk, mu, mu)
+    Gd, Gcd = fixtures._put(G, s5), fixtures._put(np.conj(G), s5)
+    mult = -1.0 / np.sqrt(float(nk))
+    kconv = F.make_kconv_klead(mesh, kg, SIGMA_CONV_G7D_SPEC, V_FFT5D_SPEC, norm="ortho", mult=mult)
+    Wp = kconv.prep(fixtures._put(W, NamedSharding(mesh, P(None, "x", "y"))))
+    tables, rows = plan.unfold_load_tables(), np.asarray(plan.parent_full_rows)
+    anti = bool(np.any(np.asarray(plan.sym_idx) >= plan.n_sym_spatial))
+    whole = F.make_kconv_klead_unfold(mesh, kg, tables, store_rows=rows, norm="ortho", mult=mult)
+    ref = fixtures._host(whole(Gd, Gcd if anti else None, Wp))
+    conj = fixtures._host(whole(Gd, None, Wp, conj_partner=True))
+    worst = 0.0
+    for d in [v for v in range(1, ns) if ns % v == 0]:
+        door = F.make_kconv_klead_unfold(mesh, kg, tables, store_rows=rows, norm="ortho",
+                                         mult=mult, spin_block=d)
+        for a0 in range(0, ns, d):
+            for b0 in range(0, ns, d):
+                got = fixtures._host(door(Gd, None, Wp, conj_partner=True, a0=a0, b0=b0))
+                worst = max(worst, float(np.max(np.abs(got - ref[:, a0:a0 + d, :, b0:b0 + d, :]))))
+    return dict(ns=ns, antiunitary=anti, conj_bitwise=bool(np.array_equal(conj, ref)),
+                blocks_max_abs=worst)
+
+
 def c3_fixture(mesh, ns, kgrid=(3, 3, 1)):
     """C3 on a hexagonal (6, 6, 2) grid, TR rows, general complex U; 3 parents, any k grid.
 
@@ -189,3 +221,14 @@ def test_store_rows_must_be_distinct_rows_of_the_grid():
             assert "store_rows" in str(exc)
         else:
             raise AssertionError(f"store_rows={bad} was accepted")
+
+
+def test_output_spin_blocks_and_conj_partner_are_the_whole_door():
+    """Every d x d block of mode 7's output and the conj-on-load partner equal the whole door."""
+    mesh = _mesh()
+    rng = np.random.default_rng(9)
+    cases = [fixtures._glide_fixture(mesh, rng, ns) for ns in (2, 4)] + [c3_fixture(mesh, 4)]
+    for fx in cases:
+        r = block_case(mesh, fx)
+        assert r["conj_bitwise"], r
+        assert r["blocks_max_abs"] == 0.0, r
