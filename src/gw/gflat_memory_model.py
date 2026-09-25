@@ -114,6 +114,9 @@ class MuBatchPlan:
     host_budget_bytes: float = 0.0  # host share per rank at plan time
     zeta_tier: str = "local"        # whole-tile back-solve tier (route G's)
     n_vertex: int = 1               # channels sharing the loop (1 charge, 3 currents)
+    # (b_src, n_pg, c_out) -> the batch's working-set bytes: whole-orbit
+    # source rows b_src, owner plane stage c_out (route_g_plane_chunk)
+    working_set: object = dataclasses.field(default=None, repr=False, compare=False)
 
     def format(self) -> str:
         gt = max(self.green_tile_bytes, 1.0)
@@ -157,7 +160,8 @@ def plan_zeta_route_g(*, meta, mesh_xy, n_q_selected: int, ngkmax: int,
                       psi_ngkmax: int, fit_nb: int, n_col: int, n_s: int,
                       zeta_tier: str, budget_gb: float,
                       target_utilization: float | None = None,
-                      psi_face_bytes: float = 0.0, n_vertex: int = 1) -> MuBatchPlan:
+                      psi_face_bytes: float = 0.0, n_vertex: int = 1,
+                      n_parent: int | None = None) -> MuBatchPlan:
     """Size the route-G μ-batch fit (docs/architecture/zeta_fit_mubatch.md).
 
     Per rank: conj ψ(G) on its G slice (full zone), the batch's pair
@@ -171,7 +175,10 @@ def plan_zeta_route_g(*, meta, mesh_xy, n_q_selected: int, ngkmax: int,
     cylinder gathers (``∝ 1/n_pg``) -- the pair-projector all-to-all, the
     X_B psum and the per-centroid arithmetic are the same for every
     candidate.  Feasibility: the smallest configuration (``b = P``,
-    ``n_pg = 1``) must fit ``4·G_tile``.
+    ``n_pg = 1``) must fit ``4·G_tile``.  ``n_parent`` (the raw parents the
+    kernel holds; default the full zone) prices the source rows in the
+    post-packing re-check (:func:`route_g_plane_chunk`); the batch choice
+    keeps the full-zone upper bound.
     """
     from runtime.padding import mesh_divisor
     P_ = int(mesh_divisor(mesh_xy))
@@ -205,28 +212,35 @@ def plan_zeta_route_g(*, meta, mesh_xy, n_q_selected: int, ngkmax: int,
     n_zc = min(ps, math.ceil(1.3 * math.pi * r_zeta * r_zeta))
     n_za = min(n_a, math.ceil(2 * r_zeta) + 1)
 
-    def stages(b, n_pg):
+    n_p = nk if n_parent is None else int(n_parent)
+
+    def stages(b, n_pg, c_out=None, n_src=nk):
         """The batch's live sets per stage; the working set is their max
         (XLA frees each stage's inputs before the next; measured VI3 P16:
-        28.2 GB peak against 53.4 GB for the old sum of all terms)."""
+        28.2 GB peak against 53.4 GB for the old sum of all terms).  The
+        source rows (X_B, pair projectors, Z rows) are the batch's ``b``; the
+        owner's plane stage streams ``c_out`` rows at a time (default b/P)."""
         c, r_pl = b // P_, n_pg * ps
+        co = c if c_out is None else int(c_out)
         n_ap = math.ceil(n_a / n_pg) * n_pg
         rows = {"Z rows (+1 lookahead)": 2 * n_v * _c128(Q, c, N_G)}
-        d_g = 2 * _c128(nk, ns, b, ns, Gp)                  # D~ L+R, one copy
+        d_g = 2 * _c128(n_src, ns, b, ns, Gp)               # D~ L+R, one copy
         return [
-            dict(rows, **{"X_B": 2 * _c128(nk, nb, ns, b) + _c128(nk, Gp, b),
+            dict(rows, **{"X_B": 2 * _c128(n_src, nb, ns, b) + _c128(n_src, Gp, b),
                           "pair projectors (GEMM out, all-to-all out)": 2 * d_g}),
             dict(rows, **{"pair projectors (owner)": d_g,
-                          "D cylinder (all planes)": _c128(nk, n_ap, ns, 2 * c, ns, n_col)
-                          + _c128(ns, 2 * c, ns, n_col, n_s)}),
-            dict(rows, **{"D cylinder (all planes)": _c128(nk, n_ap, ns, 2 * c, ns, n_col),
-                          "plane group": 2 * _c128(nk, n_pg, ns, 2 * c, ns, ps),
-                          "k-conv + Z": 9 * _c128(nk, c, r_pl) + 3 * n_v * _c128(Q, c, r_pl),
-                          "ζ cylinder accumulator": n_v * _c128(Q, c, n_zc, n_za)}),
+                          "D cylinder (all planes)": _c128(nk, n_ap, ns, 2 * co, ns, n_col)
+                          + _c128(ns, 2 * co, ns, n_col, n_s)}),
+            dict(rows, **{"D cylinder (all planes)": _c128(nk, n_ap, ns, 2 * co, ns, n_col),
+                          # streamed chunks keep the owner's source rows live
+                          "pair projectors (owner)": d_g if co < c else 0.0,
+                          "plane group": 2 * _c128(nk, n_pg, ns, 2 * co, ns, ps),
+                          "k-conv + Z": 9 * _c128(nk, co, r_pl) + 3 * n_v * _c128(Q, co, r_pl),
+                          "ζ cylinder accumulator": n_v * _c128(Q, co, n_zc, n_za)}),
         ]
 
-    def ws(b, n_pg):
-        return max(stages(b, n_pg), key=lambda d: sum(d.values()))
+    def ws(b, n_pg, c_out=None, n_src=nk):
+        return max(stages(b, n_pg, c_out, n_src), key=lambda d: sum(d.values()))
 
     # The memory split (owner rule): ψ(G) resident iff what is left after
     # the fixed terms holds it and the smallest batch; then every remaining
@@ -312,9 +326,39 @@ def plan_zeta_route_g(*, meta, mesh_xy, n_q_selected: int, ngkmax: int,
         min_call_bytes=float(_c128(nk, nb, ns, b)),
         min_efficient_bytes=comm_model.min_efficient_payload(P_ - 1),
         n_vertex=n_v, route='G', source='resident', band_chunk=int(nb), k_chunk=int(nk),
+        working_set=lambda b_src, n_pg_, c_out: (
+            base_total + _c128(n_p, nb, ns, Gp) + sum(ws(b_src, n_pg_, c_out, n_p).values())),
         b=int(b), n_batch=int(n_batch), r_sub=int(n_pg), row_chunk=0,
         g_tile=int(g_tile), placement=placement, finalize_layout=finalize_layout,
         hwm_bytes=float(sum(br.values())), budget_bytes=float(budget),
         target_bytes=float(target), breakdown=br, transfer=transfer)
 
 
+def route_g_plane_chunk(plan: MuBatchPlan, c_src: int, n_ranks: int) -> int:
+    """The owner's plane-stage width ``c_out`` for whole-orbit bins of ``c_src`` rows.
+
+    The fit packs whole centroid orbits per owner
+    (:func:`isdf.zeta_mubatch.best_owner_orbit_batches`), so the executed
+    ``c_src`` is at least the widest orbit and can exceed the planned
+    ``c = b/P``.  The owner streams its rows through the planes in balanced
+    chunks of ``c_out ≤ c``, so the D cylinder, plane group and k-convolution
+    stay at the planned width; the source rows (X_B, pair projectors, Z rows)
+    are re-priced at ``P·c_src`` over the raw parents the kernel holds.
+    ``c_out`` is the widest balanced chunk that fits the plan's target;
+    refuses by name when even one row does not.
+    """
+    P_ = int(n_ranks)
+    c_plan = max(1, int(plan.b) // P_)
+    c_src = int(c_src)
+    need = float("inf")
+    for n_ch in range(-(-c_src // c_plan), c_src + 1):
+        c_out = -(-c_src // n_ch)
+        need = plan.working_set(P_ * c_src, int(plan.r_sub), c_out)
+        if need <= plan.target_bytes:
+            return c_out
+    raise ValueError(
+        f"GATE zeta-mubatch-orbit-capacity: whole-orbit bins of {c_src} centroids "
+        f"per owner (planned {c_plan}; the widest orbit sets the floor) need "
+        f"{need / 1e9:.2f} GB/dev with the planes streamed one row at a time, want "
+        f"<= {plan.target_bytes / 1e9:.2f} GB/dev.  Fix: more memory per device "
+        "(the source rows scale with the orbit width, not with P).")

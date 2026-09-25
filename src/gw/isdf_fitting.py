@@ -324,11 +324,15 @@ def _fit_mubatch(
     mb = zmb.best_owner_orbit_batches(k_unfold_plan, mu_pad, P_,
                                       c_max=max(1, int(plan.b) // P_))
     b = int(mb.b)
+    # The widest orbit can make the bins wider than planned: the owner then
+    # streams its rows through the planes at the planned width (or refuses).
+    from gw.gflat_memory_model import route_g_plane_chunk
+    c_out = route_g_plane_chunk(plan, int(mb.c), P_)
     kern_args = dict(
         mesh=mesh_xy, kgrid=kgrid, fft_grid=fft_grid, ns=ns, b=b,
         q_sel=q_irr_full_idx, q_axis=q_axis, q_neg=q_neg_idx, qvec_frac=q_frac,
         n_col=int(cyl[0].shape[1]), n_s=int(cyl[0].shape[2]),
-        n_pg=int(plan.r_sub), axis=axis, n_src=n_par, vertices=vertices)
+        n_pg=int(plan.r_sub), axis=axis, n_src=n_par, vertices=vertices, c_out=c_out)
     kernel = zmb.make_route_g_kernel(**kern_args)
     split_kernels = {}
     if debug_print_enabled():
@@ -351,7 +355,8 @@ def _fit_mubatch(
             tuple(_device_put_process_local(a, rep) for a in zt))
     n_batch = int(mb.n_batch)
     print_fn(f"  μ-batch fit (route G): {n_batch} batches of {b} centroids "
-             f"(whole orbits per owner; planned {int(plan.b)}), "
+             f"(whole orbits per owner; planned {int(plan.b)}; planes {c_out} "
+             f"of each owner's {int(mb.c)} rows at a time), "
              f"{int(plan.r_sub)} planes per group, "
              f"{n_par} parent k -> {nk}, ψ sphere {ngk_psi} "
              f"slots ({s_ax.carrier // P_}/rank), channels μ_L={list(vertices)}, "
