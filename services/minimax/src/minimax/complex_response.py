@@ -205,8 +205,9 @@ def response_group_rules(lo_ry, hi_ry, z_ry, *, rel_tol=1e-8, previous=None,
     Every node t is ONE Green-pair evaluation A(t): forward rows use the
     exponential exp[-(d-reference_ry)*t] and fit 1/(d-z); reverse rows use
     conj(A(t)), i.e. the exponential at conj(t), and fit 1/(d+z). A group
-    whose shared fit fails is split in halves, down to single samples, so
-    no sample is ever evaluated with more nodes than its own rule needs.
+    whose shared fit fails is split in halves, down to single samples.
+    A successful shared rule can use more nodes than one member would need
+    alone; its Green-pair evaluations serve all members of the group.
 
     Returns a list of rules. Each has ``members`` (indices into ``z_ry``),
     ``t[RESPONSE_NODE_CAPACITY]``, ``value``/``derivative`` of shape
