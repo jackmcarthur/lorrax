@@ -25,6 +25,8 @@ from __future__ import annotations
 from functools import partial
 from typing import Callable, NamedTuple
 
+import dataclasses
+
 import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
@@ -300,15 +302,22 @@ def _get_sigma_kij_kernel(
     layout: str = "face", face_shape=None, face_band_extent=None,
     energy_windows: bool = False,
     k_unfold_plan=None,
+    q_wedge=None,
 ) -> Callable[..., jax.Array]:
-    """Build Green functions with band-range masks and contract each bracket against one prepared W."""
+    """Build Green functions with band-range masks and contract each bracket against one prepared W.
+
+    ``q_wedge`` (a ``symmetry_maps.QirrOperator`` of tables): W(τ) arrives on
+    the q wedge and is prepared by mathdx mode 9 on the pair-transpose rule,
+    its partner tile ``W_pt`` (the tile built from the conjugated residues)
+    read on antiunitary rows and the device load tables ``load`` passed as
+    arguments; the kernel then takes ``(..., W_q, W_pt, load)``."""
     if layout not in ("face", "axis") or face_shape is None or k_unfold_plan is None:
         raise ValueError("Sigma tau requires canonical face shapes and a typed parent unfold plan.")
     from ffi import ffi_dial_key
     key = (id(mesh_xy), tuple(map(int, kgrid)), _stage_timing_enabled(),
            ffi_dial_key(), bool(merged_x), brackets, layout, face_shape,
            face_band_extent, bool(energy_windows),
-           k_unfold_plan)
+           k_unfold_plan, None if q_wedge is None else q_wedge.wedge_key())
     if key in _sigma_kij_kernel_cache:
         return _sigma_kij_kernel_cache[key]
     from .greens_function_kernel import build_G_tau
@@ -318,6 +327,17 @@ def _get_sigma_kij_kernel(
         mesh_xy=mesh_xy, kgrid=kgrid, merged_x=merged_x,
         layout=layout, face_shape=face_shape,
         face_band_extent=face_band_extent, k_unfold_plan=k_unfold_plan)
+
+    if q_wedge is None:
+        def prep_w(W_q, W_pt=None, load=None):
+            return spatial.prep_w(W_q)
+    else:
+        from common.fft_helpers import make_kfft_klead_unfold
+        _pair = dataclasses.replace(q_wedge, values=None, load=None, trs_rule="pair_transpose")
+        _door = make_kfft_klead_unfold(mesh_xy, kgrid, _pair.load_tables(mesh_xy), norm="ortho")
+
+        def prep_w(W_q, W_pt=None, load=None):
+            return _door(W_q, W_pt, load)
 
     from distrib_la import gemm_plan
     _, nb, mu, ns = face_shape
@@ -381,12 +401,12 @@ def _get_sigma_kij_kernel(
 
         def _kernel_impl(
             psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
-            E_A, mask_A, E_min, E_max, E_ref_A, t_node, W_q,
+            E_A, mask_A, E_min, E_max, E_ref_A, t_node, W_q, W_pt=None, load=None,
         ):
             # ONE W preparation per τ, ABOVE the bracket loop.  Explicit, not
             # left to CSE: on the decomposed chain this is ``ifftn(W)``, the
             # only transform in the chain that does not depend on G.
-            W_prep = spatial.prep_w(W_q)
+            W_prep = prep_w(W_q, W_pt, load)
             if brackets is None and pairs is not None:
                 return pairs(psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
                              E_A, mask_A, E_min, E_max, E_ref_A, t_node, W_prep)
@@ -406,11 +426,11 @@ def _get_sigma_kij_kernel(
             @partial(jax.jit, donate_argnums=(8,))
             def kernel(
                 psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
-                E_A, mask_A, E_ref_A, t_node, W_q,
+                E_A, mask_A, E_ref_A, t_node, W_q, W_pt=None, load=None,
             ):
                 return _kernel_impl(
                     psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
-                    E_A, mask_A, None, None, E_ref_A, t_node, W_q)
+                    E_A, mask_A, None, None, E_ref_A, t_node, W_q, W_pt, load)
 
         _sigma_kij_kernel_cache[key] = kernel
         return kernel
@@ -432,9 +452,9 @@ def _get_sigma_kij_kernel(
 
     def _staged_impl(
         psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
-        E_A, mask_A, E_min, E_max, E_ref_A, t_node, W_q,
+        E_A, mask_A, E_min, E_max, E_ref_A, t_node, W_q, W_pt=None, load=None,
     ):
-        W_prep = spatial.prep_w(W_q)
+        W_prep = prep_w(W_q, W_pt, load)
         G_k = _build_g_timed(psi_coh_xn, psi_coh_yr, E_A, mask_A,
                              E_min, E_max, E_ref_A, t_node)
         return spatial.conv_project(psi_proj_xr, psi_proj_yn, G_k, W_prep)
@@ -444,16 +464,26 @@ def _get_sigma_kij_kernel(
     else:
         def staged(
             psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
-            E_A, mask_A, E_ref_A, t_node, W_q,
+            E_A, mask_A, E_ref_A, t_node, W_q, W_pt=None, load=None,
         ):
             return _staged_impl(
                 psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
-                E_A, mask_A, None, None, E_ref_A, t_node, W_q)
+                E_A, mask_A, None, None, E_ref_A, t_node, W_q, W_pt, load)
 
     _sigma_kij_kernel_cache[key] = staged
     return staged
 
 
+
+
+def _wedge_residues(B_poles):
+    """``(B, load)``: residues on the q wedge arrive as a ``QirrOperator``
+    carrying the device load tables of the mode-9 prep (jit arguments, never
+    program constants); full-zone residues are a plain array and ``None``."""
+    from symmetry_maps import QirrOperator
+    if isinstance(B_poles, QirrOperator):
+        return B_poles.values, B_poles.load
+    return B_poles, None
 
 
 def build_shared_w_tau(B_poles, Omega_poles, pole_indices, bounds,
@@ -502,6 +532,7 @@ def get_shared_sigma_tau_kernel(
     k_unfold_plan=None, _sigma_kij=None,
     w_synthesis=None,
     cache: bool = True,
+    q_wedge=None,
 ) -> Callable[..., jax.Array]:
     """Build selected multipole W(tau) tiles for the shared complex Sigma contraction.
 
@@ -525,7 +556,7 @@ def get_shared_sigma_tau_kernel(
 
     key = (id(mesh_xy), kgrid, _stage_timing_enabled(), ffi_dial_key(),
            brackets, layout, face_shape, face_band_extent,
-           k_unfold_plan)
+           k_unfold_plan, None if q_wedge is None else q_wedge.wedge_key())
     if (w_synthesis is None and _sigma_kij is None and cache
             and key in _sigma_shared_tau_kernel_cache):
         return _sigma_shared_tau_kernel_cache[key]
@@ -537,7 +568,14 @@ def get_shared_sigma_tau_kernel(
         mesh_xy=mesh_xy, kgrid=kgrid, merged_x=True,
         brackets=brackets, layout=layout, face_shape=face_shape,
         face_band_extent=face_band_extent,
-        k_unfold_plan=k_unfold_plan)
+        k_unfold_plan=k_unfold_plan, q_wedge=q_wedge)
+    # On the q wedge W(τ) is read by the pair-transpose rule: an antiunitary
+    # row takes the tile built from the conjugated residues (the fitted
+    # fields are Hermitian; the time factor is not conjugated).
+    partner_needed = False
+    if q_wedge is not None:
+        _pair = dataclasses.replace(q_wedge, values=None, load=None, trs_rule="pair_transpose")
+        partner_needed = bool(np.any(np.asarray(_pair.load_tables(mesh_xy).trs)))
 
     def finish(kernel):
         # Never publish a kernel whose builder owns resident faces and an open
@@ -564,11 +602,15 @@ def get_shared_sigma_tau_kernel(
             E_A, mask_A, B_poles, Omega_poles, pole_indices, bounds,
             phase_real, E_ref_A, E_ref_B, t_node, active_count=None,
         ):
+            B_poles, load = _wedge_residues(B_poles)
             W_t = _build(B_poles, Omega_poles, pole_indices, bounds,
                          phase_real, E_ref_B, t_node, active_count)
+            W_pt = (_build(jnp.conj(B_poles), Omega_poles, pole_indices, bounds,
+                           phase_real, E_ref_B, t_node, active_count)
+                    if partner_needed else None)
             return sigma_kij(
                 psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
-                E_A, mask_A, E_ref_A, t_node, W_t)
+                E_A, mask_A, E_ref_A, t_node, W_t, W_pt, load)
 
         return finish(_tau)
 
@@ -579,6 +621,7 @@ def get_shared_sigma_tau_kernel(
         E_A, mask_A, B_poles, Omega_poles, pole_indices, bounds,
         phase_real, E_ref_A, E_ref_B, t_node, active_count=None,
     ):
+        B_poles, load = _wedge_residues(B_poles)
         if profile_stages:
             with timing.section(TAU_PHASE_W_PHASE) as sec:
                 W_t = _build(B_poles, Omega_poles, pole_indices, bounds,
@@ -590,9 +633,12 @@ def get_shared_sigma_tau_kernel(
             # stage profiler needs a host wait between W and G*W.
             W_t = _build(B_poles, Omega_poles, pole_indices, bounds,
                          phase_real, E_ref_B, t_node, active_count)
+        W_pt = (_build(jnp.conj(B_poles), Omega_poles, pole_indices, bounds,
+                       phase_real, E_ref_B, t_node, active_count)
+                if partner_needed else None)
         return sigma_kij(
             psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
-            E_A, mask_A, E_ref_A, t_node, W_t)
+            E_A, mask_A, E_ref_A, t_node, W_t, W_pt, load)
 
     # A model builder may own resident faces and an open reader for this SC
     # map. Never retain that resource closure in the process-wide jit cache.

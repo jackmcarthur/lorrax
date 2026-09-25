@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import dataclasses
+
 import gc
 import math
 import os
@@ -1012,9 +1014,15 @@ def _integrate_sigma_batches(
     odd_residue_off=False,
     w_synthesis=None,
     tau_kernel_factory=None,
+    q_wedge=None,
     print_fn,
 ):
-    """One spatial executor for streamed fit slabs."""
+    """One spatial executor for streamed fit slabs.
+
+    ``q_wedge``: the slabs are on the q wedge (GN-PPM, owner 2026-09-25);
+    W(τ) is built on the wedge and read by the Sigma convolution through the
+    wedge's unfold tables (mathdx mode 9), whose device tables ride the
+    residue argument."""
     # Band fences are profiling boundaries (see ``_unfenced``).  This executor
     # is shared with the incumbent elementwise-MPA route (``w_synthesis is
     # None``), which is never fenced whatever a harness has installed.
@@ -1099,9 +1107,13 @@ def _integrate_sigma_batches(
                 return tau_kernel_factory(builder, sigma_axis)
             return get_shared_sigma_tau_kernel(
                 mesh_xy=mesh_xy, kgrid=kgrid, brackets=brackets,
-                w_synthesis=builder, cache=cache, **face_kwargs)
+                w_synthesis=builder, cache=cache, q_wedge=q_wedge, **face_kwargs)
 
         tau_kernel = tau_kernel_for(w_synthesis)
+        # The residues' carrier on the wedge: the pair-transpose tables with
+        # their device load, placed once per run (see ppm_tau_kernel).
+        q_pair = (None if q_wedge is None else dataclasses.replace(
+            q_wedge, values=None, load=None, trs_rule="pair_transpose").with_load(mesh_xy))
         small = NamedSharding(mesh_xy, P())
         tau_capacity = max((len(row.window.nodes.t) for row in plan), default=0)
 
@@ -1198,6 +1210,9 @@ def _integrate_sigma_batches(
                         row.space, row.pole_indices, row.bounds)
                 else:
                     row_kernel = tau_kernel
+                    if q_wedge is not None:
+                        B_branch = dataclasses.replace(
+                            q_pair, values=B_branch)
                     tau_arguments = (
                         psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
                         E_A_call, selector, B_branch, Omega,
@@ -1454,7 +1469,7 @@ class MemoryPoleSource:
     """
 
     def __init__(self, Omega_p, B_p, B_odd_p=None, *, n_mu_logical, mesh_xy,
-                 provenance):
+                 provenance, q_wedge=None):
         from runtime.padding import padded_mu_extent
         shape = tuple(int(n) for n in Omega_p.shape)
         n_mu = int(n_mu_logical)
@@ -1477,10 +1492,12 @@ class MemoryPoleSource:
         refuse_bad_pole_fields(
             self.Omega, self.B, self.B_odd, where="MemoryPoleSource")
         self.n_poles = shape[0]
+        # The q wedge the fields live on (the GN fit's), or None: full zone.
+        self.q_wedge = q_wedge
         self.ledger = {
             "n_p": shape[0], "n_q": shape[1], "n_mu": n_mu,
             "ordered_residues": B_odd_p is not None,
-            "q_storage": "full", "energy_unit": "Ry",
+            "q_storage": "full" if q_wedge is None else "ibz", "energy_unit": "Ry",
             "provenance": dict(provenance),
         }
 
@@ -1497,6 +1514,10 @@ class MemoryPoleSource:
             raise ValueError(
                 "MemoryPoleSource serves sharded Ry batches only; got "
                 f"return_sharded={return_sharded}, to_unit={to_unit!r}")
+        if unfold and self.q_wedge is not None:
+            raise ValueError(
+                "MemoryPoleSource: the fields are on the q wedge; the Sigma "
+                "executor reads them there (unfold=False) and unfolds on load")
         lo, hi = _pole_range(self.ledger, pole_slice, "MemoryPoleSource.read")
         take = ((lambda x: x) if (lo, hi) == (0, self.n_poles)
                 else (lambda x: x[lo:hi]))
@@ -1537,11 +1558,13 @@ def integrate_sigma_store(
     """
     batch_size = _bounded_pole_batch_size(pole_batch_size)
 
+    q_wedge = getattr(fit_src, "q_wedge", None)
+
     def batches(reader):
         for lo in range(0, int(n_poles), batch_size):
             hi = min(lo + batch_size, int(n_poles))
             Omega, B, B_odd = reader.read(
-                slice(lo, hi), unfold=True, return_sharded=True,
+                slice(lo, hi), unfold=q_wedge is None, return_sharded=True,
                 to_unit="Ry", include_odd=True)
             yield lo, Omega, B, B_odd
             del Omega, B, B_odd
@@ -1552,7 +1575,7 @@ def integrate_sigma_store(
             wfns, batches(reader), int(n_poles), plan, omega_grid_ry, meta,
             mesh_xy, pole_batch_size=batch_size, brackets=brackets,
             band_counts=band_counts, odd_residue_off=odd_residue_off,
-            print_fn=print_fn)
+            q_wedge=q_wedge, print_fn=print_fn)
 
     if isinstance(fit_src, (PoleReader, MemoryPoleSource)):
         return run(fit_src)
@@ -1779,8 +1802,8 @@ def compute_sigma_c_mpa_omega_grid(
         for lo in (() if shared_pole else range(0, n_poles, int(pole_batch_size))):
             hi = min(lo + int(pole_batch_size), n_poles)
             Omega, B, B_odd = reader.read(
-                slice(lo, hi), unfold=True, return_sharded=True,
-                to_unit="Ry", include_odd=True)
+                slice(lo, hi), unfold=getattr(reader, "q_wedge", None) is None,
+                return_sharded=True, to_unit="Ry", include_odd=True)
             _refuse_nonfinite_pole_slab(lo, Omega, B, B_odd)
             if B_odd is not None and odd_residue_off:
                 B_odd = jnp.zeros_like(B_odd)

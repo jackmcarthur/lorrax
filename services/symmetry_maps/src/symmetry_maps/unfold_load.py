@@ -333,26 +333,65 @@ class QirrOperator:
                              "representatives need the unfold")
         return _rows_of(self.values, rows)
 
+    def star_sizes(self) -> np.ndarray:
+        """``(n_wedge,)`` int64: how many full-zone q each wedge row unfolds to."""
+        stars = np.bincount(np.asarray(self.irr_idx), minlength=self.n_wedge).astype(np.int64)
+        if stars.shape != (self.n_wedge,) or int(stars.sum()) != self.n_full:
+            raise ValueError("QirrOperator.star_sizes: irr_idx does not cover the wedge")
+        return stars
+
+    def minus_q_partner(self, kgrid, mesh_xy):
+        """``partner(mask) -> mask``: a real lane field at -q of every wedge row, read
+        from the wedge (the wedge row of -q and its centroid permutation, no phase).
+
+        For a real field this is the unfold of the field restricted to the -q
+        rows; on a whole-zone operator it is the row gather by
+        ``q_negation_index``."""
+        from symmetry_maps.maps import q_negation_index, unfold_isdf_operator
+        key = (self.wedge_key(), tuple(int(v) for v in kgrid),
+               tuple(d.id for d in np.asarray(mesh_xy.devices).flat))
+        cached = _partner_cache.get(key)
+        if cached is not None:
+            return cached
+        q_neg = np.asarray(q_negation_index(tuple(int(v) for v in kgrid)), np.int64)
+        qn = q_neg[np.asarray(self.full_rows, np.int64)]
+        rows = np.asarray(self.irr_idx)[qn].astype(np.int32)
+        syms = np.asarray(self.sym_idx)[qn].astype(np.int32)
+        L0 = np.zeros_like(np.asarray(self.L_table, dtype=np.float64))
+
+        def partner(mask):
+            import jax.numpy as _jnp
+            field = _jnp.where(mask, 1.0, 0.0).astype(_jnp.complex128)
+            moved = unfold_isdf_operator(
+                field, irr_idx=rows, sym_idx=syms, sym_perm=self.sym_perm, L_table=L0,
+                q_irr_frac=self.q_irr_frac, mesh_xy=mesh_xy,
+                n_sym_spatial=self.n_sym_spatial, trs_rule="conj")
+            return _jnp.real(moved) > 0.5
+        _partner_cache[key] = partner
+        return partner
+
     @property
     def n_full(self) -> int:
         return int(np.asarray(self.irr_idx).shape[0])
 
     @property
     def n_wedge(self) -> int:
-        return int(self.values.shape[0])
+        return int(np.asarray(self.full_rows).shape[0])
 
     def with_values(self, values) -> "QirrOperator":
         """The same wedge and tables around other values (an elementwise function of these)."""
-        if tuple(values.shape) != tuple(self.values.shape):
+        if self.values is not None and tuple(values.shape) != tuple(self.values.shape):
             raise ValueError(f"QirrOperator.with_values: shape {values.shape} != {self.values.shape}")
         return dataclasses.replace(self, values=values)
 
-    def same_wedge(self, other: "QirrOperator") -> bool:
-        """Whether ``other`` unfolds by the same tables (so the two combine on the wedge)."""
+    def same_wedge(self, other: "QirrOperator", *, any_rule: bool = False) -> bool:
+        """Whether ``other`` unfolds by the same tables (so the two combine on the wedge);
+        ``any_rule`` ignores the antiunitary rule (same rows, different operator kind)."""
         pairs = ((self.irr_idx, other.irr_idx), (self.sym_idx, other.sym_idx),
                  (self.sym_perm, other.sym_perm), (self.L_table, other.L_table),
                  (self.q_irr_frac, other.q_irr_frac), (self.full_rows, other.full_rows))
-        return (self.trs_rule == other.trs_rule and self.n_sym_spatial == other.n_sym_spatial
+        return ((any_rule or self.trs_rule == other.trs_rule)
+                and self.n_sym_spatial == other.n_sym_spatial
                 and all(np.array_equal(np.asarray(a), np.asarray(b)) for a, b in pairs))
 
     def representative_row(self, q_full: int):
@@ -417,6 +456,7 @@ def _rows_of(values, rows):
 
 
 _device_load_cache: dict = {}
+_partner_cache: dict = {}
 
 
 class _WedgeKey:
