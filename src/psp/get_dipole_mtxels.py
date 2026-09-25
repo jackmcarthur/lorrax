@@ -1660,6 +1660,20 @@ def main(argv=None):
 			report.emit("Covariant DFT velocity: PASS; "
 						f"max abs={float(metrics['max_abs']):.5e}; "
 						f"max rel={float(metrics['max_rel']):.5e}")
+			rule = {0: "position", 2: "order-2", 4: "order-4"}
+			report.emit(
+				"Per axis (rule, max|dv| of max|v|, head S_aa "
+				"reconstructed/exact): " + ", ".join(
+					f"{a}={rule[int(o)]} {e:.3e} of {x:.3e}, {r:.4f}"
+					for a, o, e, x, r in zip(
+						"xyz", metrics["stencil_orders"],
+						metrics["max_abs_by_axis"],
+						metrics["exact_max_abs_by_axis"],
+						metrics["head_response_ratio_by_axis"]))
+				+ "; head response rel="
+				f"{float(metrics['head_response_relative_frobenius']):.3e}, "
+				"transition overlap="
+				f"{float(metrics['transition_overlap_real']):.6f}")
 	dipole_progress.step()
 	dipole_progress.finish()
 	if dip_k_major is not None:
