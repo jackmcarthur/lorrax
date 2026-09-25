@@ -561,7 +561,6 @@ def read_sharded_slab(
             mesh_shape=(p, q),
             axis_count_per_dim=(1, 1),
             axis_flat=(0, 1),
-            independent=False,    # a 2-D block tile: strided per rank
         )
 
     return shard_map(
