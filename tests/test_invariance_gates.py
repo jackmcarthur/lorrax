@@ -44,6 +44,7 @@ from harness import (          # noqa: E402
     normalize_dat,
     numeric_tokens,
     parse_eqp_rows,
+    print_quantum_diff,
     run_gw_jax,
 )
 
@@ -162,24 +163,41 @@ def test_mu_pad_flip_invariance_gnppm(gnppm_restart_baseline, tmp_path):
 @pytest.mark.regression
 @_NEEDS_P4_BISPINOR_MEMORY
 def test_mu_pad_flip_invariance_bispinor(bispinor_session, bispinor_pad4_session):
-    """EXTRA_MU_PAD=4 vs 0, bispinor GN-PPM: Sigma byte identity.
+    """EXTRA_MU_PAD=4 vs 0, bispinor GN-PPM: Sigma to one printed digit.
 
     Pins the historically catastrophic transverse pad-extent class
     (MoS2 668→672 moved Σ^B tile(2,2) from −0.15 to −117.9 eV — the
     transverse ζ_T pivoted LU amplified pad-shape roundoff O(1) in the
     near-null indefinite modes).  Fresh runs: bispinor restart is not
     yet supported (gw_init.py).
+
+    ONE PRINT QUANTUM PER TOKEN, NOT BYTE IDENTITY (owner, 2026-09-25).
+    A zero-padded centroid extent changes the BLAS reduction order, so a
+    correct pad path moves a value by roundoff and can flip its last
+    printed digit: after the photon pad fix (74d4d53d9) 4 of 3240
+    sigma_diag tokens differ by exactly one 1e-6 eV quantum.  Each token
+    may move by one unit in its last printed digit; the labels, row
+    order and status words must match exactly and integers must be equal.
+    A real pad defect moves a whole row by many quanta (the class above
+    is O(100 eV)) and still fails; ``test_print_quantum_compare`` holds
+    that negative control.
     """
     ses, res = bispinor_session, bispinor_pad4_session
     run_dir = res.run_dir
     assert census_lines(res.stdout) == census_lines(ses.stdout), (
         "bispinor PPM census changed under the pad flip")
     out = ses.output_name
-    a = normalize_dat((ses.run_dir / out).read_text())
-    b = normalize_dat((run_dir / out).read_text())
-    assert a == b, (
-        f"bispinor pad-extent flip changed {out} at FIXED P — a "
-        f"computation still runs on the padded μ extent.")
+    diff = print_quantum_diff(
+        normalize_dat((ses.run_dir / out).read_text()),
+        normalize_dat((run_dir / out).read_text()))
+    assert diff["skeleton_equal"], (
+        f"bispinor pad-extent flip changed the structure of {out} (labels, "
+        f"rows or status words) at FIXED P.")
+    assert diff["max_quanta"] <= 1.5, (
+        f"bispinor pad-extent flip changed {out} by {diff['max_quanta']:.1f} "
+        f"printed quanta at FIXED P ({diff['moved_tokens']} of "
+        f"{diff['n_tokens']} tokens moved) — a computation still runs on the "
+        f"padded μ extent.\n{diff['worst_line']}")
     # The derived eqp tables include an eigensolve whose final decimal can
     # move by one output quantum when the zero-padded carrier shape changes.
     # The archived standalone failure was exactly 1e-9 eV
