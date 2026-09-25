@@ -470,8 +470,10 @@ guarantees; the signatures are in the code.
   `unfold_file_wedge_polar_matrix`, `reduce_full_bz_to_file_wedge`,
   `unfold_star_wedge_to_full_bz`: §8. Each file-wedge unfold refuses an operand
   whose leading extent is not `nk_red`. The polar variant applies the forward
-  polar time-odd Cartesian action; translation phases cancel between an
-  equal-k bra and ket.
+  polar time-odd Cartesian action (a velocity); `time_odd=False` drops the
+  antiunitary sign for a time-even polar vector (the collapsed-axis position
+  operator of the parallel-transport artifact); translation phases cancel
+  between an equal-k bra and ket.
 * `KStarMap(irr, sym, n)`: the three arrays that must travel together.
   `identity(n_k)` is the no-reduction map; `select`, `broadcast` (star-row
   rule), `spread`, and `spread_rel` (one reduction, one 16-byte transfer).

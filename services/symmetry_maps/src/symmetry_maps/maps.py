@@ -3283,12 +3283,13 @@ def unfold_file_wedge_band_operator(sym, data, *, trs_rule):
                           trs_reference="ibz_slab", trs_rule=trs_rule)
 
 
-def unfold_file_wedge_polar_matrix(sym, data, *, component_axis=-3):
-    """FILE-wedge polar band matrix → full BZ, on the input's backend; see docs/architecture/symmetry_register.md."""
+def unfold_file_wedge_polar_matrix(sym, data, *, component_axis=-3,
+                                   time_odd=True):
+    """FILE-wedge polar band matrix → full BZ, on the input's backend; ``time_odd=False`` for a time-even vector (position); see docs/architecture/symmetry_register.md."""
     out = unfold_file_wedge_to_full_bz(sym, data)
     sym_rows = np.asarray(sym.sym_idx_k, dtype=np.int32)
     rotations = np.asarray(sym.cartesian_action(
-        sym_rows, axial=False, time_odd=True), dtype=np.float64)
+        sym_rows, axial=False, time_odd=bool(time_odd)), dtype=np.float64)
     if sym_rows.shape != (int(sym.nk_tot),):
         raise ValueError(
             "unfold_file_wedge_polar_matrix: sym.sym_idx_k must have one "

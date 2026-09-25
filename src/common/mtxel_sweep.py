@@ -143,6 +143,9 @@ __all__ = [
     "kinetic_operator",
     "local_potential_operator",
     "four_current_potential_operator",
+    "axis_function_operator",
+    "collapsed_position_operator",
+    "axis_window_operator",
     "vnl_operator",
     "dipole_operator",
     "dirac_current_operator",
@@ -522,6 +525,101 @@ def four_current_potential_operator(
         apply=op, post=float(scalars.post), ncomp=2, consts=(V0, V1),
         key=("four_current_local_potential", grid, geom.ngkmax, geom.ns,
              charge_ns, scale, fft_scale))
+
+
+def axis_function_operator(
+    geom: SweepGeometry, *, axis: int, coefficients, key: tuple,
+) -> Operator:
+    """A function ``F(f_a)`` of ONE fractional coordinate, applied in G
+    space by its Fourier coefficients.
+
+    ``F(f) = sum_g K(g) e^{2 pi i g f}`` multiplies a wavefunction as
+    ``(F psi)(G) = sum_g K(g) psi(G - g e_a)``: a Toeplitz product along the
+    box's ``a`` axis on the UNWRAPPED integer ``G_a`` difference, with no FFT
+    and no grid sample (a sampled ``F`` aliases a slowly decaying tail into
+    the pair densities).  ``coefficients(g)`` maps an integer array to
+    ``K(g)``; ``key`` is the operator's structural identity for the sweep's
+    jit cache (:func:`_operator_key`).  ``post = 1``: ``psi(G)`` is
+    normalised on the sphere, so the block is ``<m| F |n>``.
+
+    BAND layout (``Operator.apply``): the Toeplitz acts along one FFT axis
+    of this rank's whole bands inside the sweep's ``shard_map``, so it is
+    rank-local by construction.
+    """
+    a = int(axis)
+    if a not in (0, 1, 2):
+        raise ValueError(f"axis must be 0, 1 or 2; got {axis}")
+    n = int(geom.fft_grid[a])
+    g_of_index = np.fft.fftfreq(n, 1.0 / n).astype(np.int64)     # box order
+    diff = g_of_index[:, None] - g_of_index[None, :]             # G_a(i) - G_a(j)
+    M_j = jnp.asarray(np.asarray(coefficients(diff), dtype=np.complex128))
+    box_axis = 3 + a                                             # (1, nb, ns, x, y, z)
+
+    def op(psi_n, gvec, gmask, bidx, kvec, M):
+        del kvec
+        box = _box_kernel(psi_n, bidx, fft_grid=geom.fft_grid)
+        moved = jnp.moveaxis(box, box_axis, -1)
+        phi = jnp.moveaxis(
+            jnp.einsum("...j,ij->...i", moved, M, optimize=True),
+            -1, box_axis)
+        out = phi[..., gvec[:, 0], gvec[:, 1], gvec[:, 2]]
+        return out * gmask[None, None, None, :].astype(out.dtype)
+
+    return Operator(apply=op, post=1.0, consts=(M_j,),
+                    key=(*tuple(key), geom.fft_grid, geom.ngkmax, geom.ns, a))
+
+
+def collapsed_position_operator(
+    geom: SweepGeometry, *, axis: int, center: float,
+) -> Operator:
+    """``zeta_a = 2 pi wrap(f_a - f_a^0)``, the position conjugate to a
+    COLLAPSED reduced k axis, as an :func:`axis_function_operator`.
+
+    The sawtooth has the series ``sum_{g != 0} i (-1)^g / g e^{2 pi i g x}``,
+    so ``K(g) = i (-1)^g e^{-2 pi i g f_a^0} / g``.  Its branch cut sits half
+    a cell from ``center`` ``f_a^0``, at the centre of the largest vacuum gap
+    (``common.parallel_transport.collapsed_axis_center``).  The block is
+    ``<m| zeta_a |n>``, dimensionless: the ``a`` component of the
+    reduced-coordinate Berry connection.
+    """
+    c = float(center)
+
+    def sawtooth(g):
+        with np.errstate(divide="ignore", invalid="ignore"):
+            return np.where(
+                g != 0,
+                1.0j * ((-1.0) ** g) * np.exp(-2.0j * np.pi * g * c)
+                / np.where(g != 0, g, 1),
+                0.0 + 0.0j)
+
+    return axis_function_operator(
+        geom, axis=axis, coefficients=sawtooth,
+        key=('collapsed_position', round(c, 12)))
+
+
+def axis_window_operator(
+    geom: SweepGeometry, *, axis: int, center: float, width: float,
+) -> Operator:
+    """The indicator of ``|wrap(f_a - center)| < width / 2`` as an
+    :func:`axis_function_operator`: ``<n| chi |n>`` is the fraction of band
+    ``n``'s density inside that slab of the cell.  The producer's probe of
+    the density at a collapsed axis's branch cut.
+    """
+    c, w = float(center), float(width)
+    if not 0.0 < w <= 1.0:
+        raise ValueError(f"window width must be in (0, 1]; got {width}")
+
+    def window(g):
+        with np.errstate(divide="ignore", invalid="ignore"):
+            return np.where(
+                g != 0,
+                np.exp(-2.0j * np.pi * g * c) * np.sin(np.pi * g * w)
+                / (np.pi * np.where(g != 0, g, 1)),
+                w + 0.0j)
+
+    return axis_function_operator(
+        geom, axis=axis, coefficients=window,
+        key=('axis_window', round(c, 12), round(w, 12)))
 
 
 def _ket(psi_n, gmask):

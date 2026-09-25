@@ -50,7 +50,8 @@ from common.mtxel_sweep import (VNL_VELOCITY_SIGN_FLIPPED,
                                 sweep_matrix_elements,
                                 sweep_uniform_current_matrix_elements)
 from common.parallel_transport import (
-	WFN_FINGERPRINT_SCHEME, build_g_wrap_lookup, wfn_fingerprint,
+	WFN_FINGERPRINT_SCHEME, build_g_wrap_lookup, collapsed_axes,
+	wfn_fingerprint,
 )
 from common.wfn_layout import band_sphere_spec
 from common.wfn_transforms import load_kpoint_fftbox_local
@@ -602,6 +603,97 @@ def _prov_show(v) -> str:
     if isinstance(v, bytes):
         v = v.decode()
     return (v[:12] + "…") if isinstance(v, str) and len(v) > 13 else str(v)
+
+
+def collapsed_axis_position_operators(
+	psi_G, *, wfn, sym, geom, gtab_file, emit=print):
+	"""``Z_a = <m| b_a . r |n>`` on the full BZ for every collapsed k axis.
+
+	One sweep per collapsed axis on the resident file-wedge ``psi_G`` (the
+	velocity's own sweep machinery) carries two operators: the position
+	sawtooth :func:`common.mtxel_sweep.collapsed_position_operator`, with
+	its branch cut at the centre of the largest vacuum gap
+	(:func:`common.parallel_transport.collapsed_axis_vacuum_gap`), and the
+	window :func:`common.mtxel_sweep.axis_window_operator` over the middle
+	``COLLAPSED_CUT_PROBE_GAP_FRACTION`` of that gap, whose diagonal is each
+	band's density at the cut.  The occupied bands' share there is printed
+	and refused above ``COLLAPSED_CUT_DENSITY_MAX``
+	(``GATE pt_collapsed_axis_cut_density``): a cut through the density
+	makes ``Z`` wrong by ``2 pi`` times that share.
+
+	The file-wedge Cartesian vector ``sum_a Z_a b_a-hat`` is unfolded ONCE
+	with the polar unfold at ``time_odd=False`` (r is time-even; a mirror
+	through the slab flips ``b_a`` and with it ``Z_a``; a wire's C4 mixes
+	its two collapsed axes, which an axis-by-axis unfold would drop), then
+	each axis is projected back on its ``b_a-hat`` and Hermitised.  Returns
+	``(Z (nk_full, 3, nb_pad, nb_pad), zero on stencil axes; centres (3,)
+	with NaN on stencil axes)``.
+	"""
+	from common.mtxel_sweep import (axis_window_operator,
+									collapsed_position_operator)
+	from common.parallel_transport import (
+		COLLAPSED_CUT_DENSITY_MAX, COLLAPSED_CUT_PROBE_GAP_FRACTION,
+		collapsed_axes, collapsed_axis_vacuum_gap)
+
+	axes = list(collapsed_axes(wfn.kgrid))
+	nb = int(geom.nb_logical)
+	B = np.asarray(wfn.bvec, dtype=np.float64) * float(wfn.blat)
+	occ = np.asarray(wfn.occs)
+	occ = (occ[0] if occ.ndim == 3 else occ)[:, :nb]
+	centers = np.full(3, np.nan, dtype=np.float64)
+	bhat = {a: jnp.asarray(B[a] / np.linalg.norm(B[a])) for a in axes}
+	Z_vec_file = None
+	for axis in axes:
+		cut, gap = collapsed_axis_vacuum_gap(wfn.atom_crys, axis)
+		center = float(np.mod(cut + 0.5, 1.0))
+		centers[axis] = center
+		probe = COLLAPSED_CUT_PROBE_GAP_FRACTION * gap
+		with timing.section("parallel_transport_position"):
+			Z_file, window = sweep_matrix_elements(
+				psi_G, operator=(
+					collapsed_position_operator(
+						geom, axis=axis, center=center),
+					axis_window_operator(
+						geom, axis=axis, center=cut, width=probe)),
+				geom=geom, gvecs=gtab_file.gvecs, gmask=gtab_file.mask,
+				box_index=wfn.box_index(k="ibz"),
+				kvecs=np.asarray(gtab_file.kvecs))
+			at_cut = np.real(np.asarray(jax.device_get(
+				jnp.diagonal(window, axis1=-2, axis2=-1))))[:, :nb]
+		del window
+		occupied = float(np.sum(occ * at_cut) / max(np.sum(occ), 1e-30))
+		k_max, n_max = np.unravel_index(int(np.argmax(at_cut)), at_cut.shape)
+		emit(f"Collapsed k axis {'xyz'[axis]}: position operator "
+			 f"Z = <m| b . r |n>; largest vacuum gap {gap:.4f} of the cell, "
+			 f"branch cut at f = {cut:.6f}; density in the middle "
+			 f"{probe:.4f} of the cell around the cut: occupied bands "
+			 f"{occupied:.3e} of their charge (refused above "
+			 f"{COLLAPSED_CUT_DENSITY_MAX:.1e}), any window band max "
+			 f"{float(at_cut[k_max, n_max]):.3e} (band {int(n_max) + 1}, "
+			 f"IBZ k {int(k_max) + 1}); max|Z| = "
+			 f"{float(jax.device_get(jnp.max(jnp.abs(Z_file)))):.4f}")
+		if not occupied <= COLLAPSED_CUT_DENSITY_MAX:
+			raise ValueError(
+				"GATE pt_collapsed_axis_cut_density: the branch cut of the "
+				f"collapsed-axis position operator along {'xyz'[axis]} sits "
+				f"at f = {cut:.6f} (centre of the largest vacuum gap, "
+				f"{gap:.4f} of the cell), and the occupied bands carry "
+				f"{occupied:.3e} of their charge within {probe / 2:.4f} of "
+				f"it (limit {COLLAPSED_CUT_DENSITY_MAX:.1e}).  The position "
+				"operator is wrong by 2 pi times that share.  Fix: more "
+				"vacuum along this axis.")
+		term = Z_file[:, None, :, :] * bhat[axis][None, :, None, None]
+		Z_vec_file = term if Z_vec_file is None else Z_vec_file + term
+	if Z_vec_file is None:
+		raise ValueError(
+			f"kgrid {tuple(int(n) for n in wfn.kgrid)} has no collapsed axis")
+	Z_vec = unfold_file_wedge_polar_matrix(sym, Z_vec_file, time_odd=False)
+	position = jnp.zeros_like(Z_vec)
+	for axis in axes:
+		Z_full = jnp.einsum("j,kjmn->kmn", bhat[axis], Z_vec, optimize=True)
+		Z_full = 0.5 * (Z_full + jnp.swapaxes(jnp.conj(Z_full), -1, -2))
+		position = position.at[:, axis].set(Z_full)
+	return position, centers
 
 
 # --------------------------
@@ -1480,6 +1572,22 @@ def main(argv=None):
 					validate_parallel_transport_artifact,
 					write_parallel_transport_artifact)
 				pt_path = Path(args.parallel_transport_out).resolve()
+				# COLLAPSED AXES (a slab normal, a wire's transverse pair): no
+				# k stencil exists there and none is fabricated.  The
+				# connection along a collapsed reduced axis is the band
+				# matrix of the position conjugate to it, Z_a = <m| b_a . r
+				# |n>, a bounded operator because the wavefunctions vanish
+				# in the vacuum where the sawtooth's branch cut sits.  It
+				# rides the velocity's sweep machinery on the resident
+				# file-wedge psi (common.parallel_transport.
+				# link_stencil_orders owns the per-axis rule).
+				collapsed_position_kmajor = None
+				collapsed_centers = None
+				if collapsed_axes(wfn.kgrid):
+					collapsed_position_kmajor, collapsed_centers = (
+						collapsed_axis_position_operators(
+							psi_G, wfn=wfn, sym=sym, geom=geom,
+							gtab_file=gtab_file, emit=report.emit))
 				with timing.section("parallel_transport_velocity"):
 					initialize_parallel_transport_artifact(
 						pt_path, wfn=wfn, sym=sym, mesh=RUNTIME.mesh,
@@ -1492,7 +1600,10 @@ def main(argv=None):
 						wfn_fingerprint=wfn_fingerprint(wfn),
 						vnl_velocity_sign=vnl_velocity_sign,
 						vnl_included=not args.skip_vnl,
-						rcond=float(args.parallel_transport_rcond))
+						rcond=float(args.parallel_transport_rcond),
+						collapsed_position_kmajor=collapsed_position_kmajor,
+						collapsed_axis_centers=collapsed_centers)
+				del collapsed_position_kmajor
 				write_pt_remainder = write_parallel_transport_artifact
 				validate_pt_artifact = validate_parallel_transport_artifact
 			# THE BOUNDARY, named rather than implied: the only consumer
