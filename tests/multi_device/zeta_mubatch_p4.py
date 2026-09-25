@@ -2,7 +2,8 @@
 
 Four processes, one GPU each, 2x2 mesh, on the fixtures of
 ``tests/zeta_mubatch_fixtures.py`` (glide group with spin mixing and an
-antiunitary row, ns = 2; A-cubic, 48 operations, ns = 1) plus a ragged deck
+antiunitary row, ns = 2; a translated antiunitary glide, ns = 4;
+A-cubic, 48 operations, ns = 1) plus a ragged deck
 where no axis divides the mesh (one operation, box (5, 5, 7) so N_r = 175 and
 7 planes, 7 bands, 7 centroids, a 3x1x1 k grid with Q = 2 stored q, and a
 ζ sphere that fills no whole G tile), and the glide group at ns = 4 with the
@@ -24,6 +25,9 @@ by one must miss by more than 1e-3; for the currents, channel 1 compared
 against the γ̃^2 reference must miss too.  The transverse solve seam
 (``_logical_solve('lu')``: the sign-aware ridged LU of an indefinite C) is
 checked against a dense solve.
+The G-space table is also checked on unequal parent-sphere extents against
+an independently Fourier-transformed r-space action.  Reversing the glide
+phase is its red twin.
 Run: ``lx run -N 1 -G 4 -n 4 python3 -u tests/multi_device/zeta_mubatch_p4.py``.
 """
 from __future__ import annotations
@@ -294,6 +298,75 @@ def _check_transverse_seam(mesh):
     return worst
 
 
+def _check_typed_g_spheres(mesh):
+    """G-space tables against the independent r-space action, with ragged spheres.
+
+    The translated antiunitary child has a non-real nonsymmorphic phase.
+    Each parent has a different nonzero G count; inactive child slots must
+    map to the zero sentinel rather than another parent's live coefficient.
+    """
+    from isdf.zeta_mubatch import typed_child_G_tables
+
+    rng = np.random.default_rng(240925)
+    fx = parity._glide_fixture(mesh, rng, 4, translated_anti=True)
+    plan, fg = fx["plan"], tuple(fx["fft_grid"])
+    N = int(np.prod(fg))
+    nb, ns = fx["psi_parent"].shape[1:3]
+    kpar = np.asarray(plan.k_parent_frac)
+    x = parity._grid_points(fg) / np.asarray(fg, float)
+    g = np.stack(np.meshgrid(*(np.fft.fftfreq(n, 1 / n) for n in fg),
+                             indexing="ij"), -1).reshape(N, 3).astype(np.int32)
+    cpar = np.zeros((plan.n_parent, nb, ns, N), np.complex128)
+    sphere = np.full((plan.n_parent, 7), N, np.int32)
+    for p, count in enumerate((3, 5, 7)):
+        slots = rng.choice(N, count, replace=False)
+        sphere[p, :count] = slots
+        cpar[p, :, :, slots] = parity._crand(rng, count, nb, ns)
+    u = np.fft.ifftn(cpar.reshape(*cpar.shape[:-1], *fg),
+                     axes=(-3, -2, -1), norm="ortho").reshape(cpar.shape)
+    fx["psi_parent"] = u * np.exp(2j * np.pi * (kpar @ x.T))[:, None, None, :]
+    children = parity._children(fx)
+    kfull = np.asarray(fx["kfull"])
+    uc = children * np.exp(-2j * np.pi * (kfull @ x.T))[:, None, None, :]
+    cchild = np.fft.fftn(uc.reshape(*uc.shape[:-1], *fg),
+                         axes=(-3, -2, -1), norm="ortho").reshape(uc.shape)
+    counts = np.array([np.count_nonzero(np.max(np.abs(row), axis=(0, 1)) > 1e-10)
+                       for row in cchild], np.int32)
+    width = int(counts.max()) + 2
+    gc = np.zeros((plan.n_full, width, 3), np.int32)
+    child_slots = []
+    for k, row in enumerate(cchild):
+        slots = np.flatnonzero(np.max(np.abs(row), axis=(0, 1)) > 1e-10)
+        child_slots.append(slots)
+        gc[k, :len(slots)] = g[slots]
+    src, phase, anti = typed_child_G_tables(
+        plan, fft_grid=fg, sphere_par=sphere, gvec_child=gc,
+        ngk_child=counts, k_child=kfull)
+    worst, red = 0.0, 0.0
+    for k, slots in enumerate(child_slots):
+        p = int(plan.irr_idx[k])
+        value = np.take(cpar[p], sphere[p, src[k, :len(slots)]], axis=-1)
+        with_phase = value * phase[k, :len(slots)]
+        if anti[k]:
+            with_phase = np.conj(with_phase)
+        pred = np.einsum("ab,nbg->nag", plan.spin_action_full[k], with_phase)
+        ref = np.take(cchild[k], slots, axis=-1)
+        worst = max(worst, parity._rel(pred, ref))
+        if int(plan.sym_idx[k]) == 3:
+            wrong = value * np.conj(phase[k, :len(slots)])
+            wrong = np.einsum("ab,nbg->nag", plan.spin_action_full[k],
+                              np.conj(wrong))
+            red = max(red, parity._rel(wrong, ref))
+        assert np.all(src[k, len(slots):] == sphere.shape[1])
+        assert np.all(phase[k, len(slots):] == 0)
+    if jax.process_index() == 0:
+        print(f"{TAG} typed G ragged/anti rel={worst:.2e} wrong-phase={red:.2e}",
+              flush=True)
+    if worst > TOL or red <= RED:
+        raise SystemExit(f"{TAG} FAIL typed G ragged/anti: {worst:.3e}, red {red:.3e}")
+    return worst
+
+
 def main():
     if jax.process_count() != 4 or jax.device_count() != 4:
         raise SystemExit(f"{TAG} FAIL: needs 4 processes x 1 GPU")
@@ -305,10 +378,14 @@ def main():
     multihost_utils.sync_global_devices("zeta_mubatch_p4 scratch")
     worst = 0.0
     try:
-        for case in ("glide_ns2", "acubic_ns1", "ragged_ns2", "glide_ns4_T"):
+        worst = max(worst, _check_typed_g_spheres(mesh))
+        for case in ("glide_ns2", "acubic_ns1", "ragged_ns2", "glide_ns4_T",
+                     "glide_anti_ns4_T"):
             rng = np.random.default_rng(2026_09_23)
             fx = (parity._glide_fixture(mesh, rng, 2) if case == "glide_ns2"
-                  else parity._glide_fixture(mesh, rng, 4) if case == "glide_ns4_T"
+                  else parity._glide_fixture(mesh, rng, 4,
+                                             translated_anti=case == "glide_anti_ns4_T")
+                  if case.endswith("_T")
                   else parity._acubic_fixture(mesh, rng) if case == "acubic_ns1"
                   else _ragged_fixture(mesh, rng))
             worst = max(worst, run_case(case, fx, mesh, scratch,

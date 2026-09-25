@@ -77,8 +77,12 @@ def _acubic_fixture(mesh, rng):
                 r_s_target=160, tile_width=192)
 
 
-def _glide_fixture(mesh, rng, ns):
-    """The order-two glide group with spin mixing and an antiunitary row."""
+def _glide_fixture(mesh, rng, ns, *, translated_anti=False):
+    """The order-two glide group with spin mixing and an antiunitary row.
+
+    ``translated_anti`` sends k2 through glide followed by time reversal,
+    so the Fourier transport must conjugate the nonzero glide phase.
+    """
     import numpy as np
     from types import SimpleNamespace
     from gw.centroid_k_unfold import build_centroid_k_unfold_plan
@@ -92,7 +96,7 @@ def _glide_fixture(mesh, rng, ns):
     kints = np.asarray([[0, 0, 0], [0, 1, 0], [1, 0, 0], [1, 1, 0]])
     kfrac = kints / np.asarray(kgrid, dtype=np.float64)
     irr = np.asarray([0, 1, 1, 2], dtype=np.int32)
-    sym_rows = np.asarray([0, 0, 1, 2], dtype=np.int32)      # k3: time reversal
+    sym_rows = np.asarray([0, 0, 3 if translated_anti else 1, 2], dtype=np.int32)
     parent_k = kfrac[[0, 1, 3]]
     theta = 0.7
     U1 = np.asarray([[np.cos(theta), -1j * np.sin(theta)],
