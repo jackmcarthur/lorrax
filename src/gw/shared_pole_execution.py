@@ -195,19 +195,20 @@ def face_eigh(mesh, n):
 @lru_cache(maxsize=None)
 def face_parent_program(mesh,ordered,odd_moments,keep_budget,retain_span,side,gram_keep=None):
     """Retained static-layout executable builder; all state values are operands."""
-    from gw.shared_pole_local import solve_parent_pencil
+    from gw.shared_pole_local import solve_parent_pencil, zero_row_safe_eigh
     from gw.shared_pole_gates import sort_shared_pole_columns
     from gw.shared_pole_recipe import shared_real_pole_gates_ordered_v1, shared_real_pole_gates_v1_r3b
     gates=shared_real_pole_gates_ordered_v1 if ordered else shared_real_pole_gates_v1_r3b
     mm=face_matmul(mesh)
     eigh_plan=face_eigh(mesh,side)
+    eigh=zero_row_safe_eigh(eigh_plan.batched)
     def body(points,order,active,qs,os,ds,infinity):
         def pack(parts):
             panels = jnp.concatenate((*parts, jnp.zeros_like(parts[0][..., :int(mesh.shape["y"])])), axis=-1)
             from gw.shared_pole_pencil import _matrix_take_columns
             return _matrix_take_columns(panels, order, NamedSharding(mesh,P(None,"x","y")))
         reduced=solve_parent_pencil(points,pack(qs),pack(os),pack(ds),infinity,active,
-            eigh=eigh_plan.batched,matmul=mm,gates=gates,ordered=ordered,odd_moments=odd_moments,
+            eigh=eigh,matmul=mm,gates=gates,ordered=ordered,odd_moments=odd_moments,
             keep_budget=keep_budget,retain_span=retain_span,gram_keep=gram_keep,
             matrix_sharding=NamedSharding(mesh,P(None,"x","y")))
         model,signed,diagnostics=reduced[:3]
