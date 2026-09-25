@@ -320,7 +320,11 @@ def main():
         jax.block_until_ready(X)
         tm["total"] = time.perf_counter() - t0
         runs.append(dict(kind="cold one-shot" if i == 0 else "warm one-shot", **tm))
-        say(f"{runs[-1]['kind']}: " + ", ".join(f"{k} {v:.3f} s" for k, v in tm.items()))
+        say(f"{runs[-1]['kind']}: " + ", ".join(f"{k} {v:.3f} s" for k, v in tm.items()
+                                                 if not k.endswith("_chunks")))
+        if conv.chunks.n_c > 1:
+            say("per r' chunk: expand " + " ".join(f"{v:.3f}" for v in tm["expand_chunks"])
+                + " s; middle " + " ".join(f"{v:.3f}" for v in tm["middle_chunks"]) + " s")
         if i < args.warm:
             del X
     rec["runs"] = runs
