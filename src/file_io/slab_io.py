@@ -390,9 +390,10 @@ class SlabIO:
     def sync_writes(self) -> None:
         """Wait for queued writes without closing the collective handle.
 
-        Use this only when the next operation enters another HDF5 handle on
-        the same ranks.  The FFI writer is asynchronous, so program order at
-        the Python call site alone does not serialize those two HDF5 calls.
+        Ordering between handles does not need it: every handle's writes go
+        through the process's one collective lane, and any handle's next
+        HDF5 call waits for them (``_slab_io_ffi._CollectiveLane``).  Use it
+        to put this handle's bytes on disk before a reader outside SlabIO.
 
         EFFECTIVELY COLLECTIVE.  The wait itself is local — it joins this
         rank's queue — but what is queued is collective MPI-IO, so a rank
