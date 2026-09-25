@@ -219,6 +219,39 @@ def _bank_residence(meta, config, *, mesh_xy, sym, root, label, photon, mu_bases
     return ResidentBankPayload(mesh_xy, carrier=carrier, label=bank_label), receipt
 
 
+#: The per-map scratch generation ``screen_shared_poles`` creates under an SC
+#: label (bank, Coulomb staging, constant and receipts).
+_MANAGED_SCRATCH = r"sc_[0-9]{4}_shared_pole"
+
+
+def retain_iteration_scratch(run_dir, label, *, print_fn=print):
+    """Collectively keep only map ``label``'s shared-pole scratch generation.
+
+    Each SC map screens into its own ``sc_NNNN_shared_pole/``, and a file-tier
+    bank there is ``16 N_q (f_s N_s + f_m) N_mu^2`` bytes (0.87 TB on Fe 8^3),
+    so without this the scratch grows linearly in maps.  The caller invokes it
+    only after the current map's model has been built, consumed by Sigma and
+    passed the Sigma gates, so a failure keeps the last usable generation, and
+    the current one survives convergence for constructor resume.  Only exact
+    managed names are eligible; scanning rather than removing only ``N-1``
+    also clears stale later maps of a longer earlier run.  This is
+    ``gw.mpa.model.retain_iteration_artifacts``'s rule, through the same
+    removal owner.
+    """
+    import os
+    from .qsgw_utils import remove_managed
+
+    root = os.path.abspath(os.fspath(run_dir))
+    removed = remove_managed(
+        root, _MANAGED_SCRATCH,
+        keep=[os.path.join(root, f"{label}_shared_pole")],
+        barrier_tag=f"shared_pole.scratch.retain.{label}", print_fn=print_fn)
+    if removed:
+        print_fn(f"  shared-pole scratch: retained {label}; discarded: "
+                 + ", ".join(sorted(removed)))
+    return tuple(sorted(removed))
+
+
 def _shared_pole_tables(meta, sym, centroid_indices):
     """Build raw-parent tables through the canonical symmetry service."""
     from symmetry_maps import (QirrTables, centroid_source_map_and_wrap,
