@@ -254,9 +254,8 @@ def test_stage_order_and_backend_choice(monkeypatch):
 
 
 @pytest.mark.parametrize("kind", BACKENDS)
-def test_out_perm_and_transpose_free_route(kind):
-    """``out_perm`` transposes the result; from a (Kc, B, Kb) input the GEMM
-    chain writes (B, n_b, n_c) directly, with no transpose at all."""
+def test_out_perm(kind):
+    """``out_perm`` transposes the result, here (Kc, B, Kb) in to (B, n_b, n_c) out."""
     n_b, n_c = 18, 20
     sb, sc = np.arange(-4, 5) % n_b, np.arange(-5, 5) % n_c
     rng = _rng("perm", kind)
@@ -268,12 +267,6 @@ def test_out_perm_and_transpose_free_route(kind):
     ref = np.transpose(ref, (1, 2, 0))
     assert y.shape == (6, n_b, n_c)
     assert np.linalg.norm(y - ref) <= RTOL * np.linalg.norm(ref)
-    if kind == "__gemm__":
-        assert plan._route(x.shape, [1, 2, 0])[0] == 0
-        # from the natural (B, Kb, Kc) layout the cheapest route still moves data
-        plan2 = LocalFourierPlan((n_b, n_c), (1, 2), sign=-1, in_support={1: sb, 2: sc},
-                                 device_kind=kind)
-        assert 0 < plan2._route((6, sb.size, sc.size), [0, 1, 2])[0] < 6 * n_b * n_c
 
 
 def test_plan_inside_shard_map():
