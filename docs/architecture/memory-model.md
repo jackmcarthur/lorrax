@@ -123,14 +123,6 @@ On faces the ψ route gathers the two full-k copies to the axis layout once
 per call when they are no larger than one Green tile, so the `2·n_s²` block
 GEMMs are local (`gw.greens_function_kernel.pair_stream_layout`).
 
-With symmetry, χ₀ and Σ_c(τ) keep the parent GEMM instead: each τ builds the
-parent Green(s) and transports every full-k block from its parent source
-blocks, `G_ab(k) = Σ_cd U_k[a,c] conj(U_k[b,d]) T_k(G_cd)`, summing only the
-`(c, d)` with a nonzero coefficient at some k (two per block for a monomial
-magnetic group). The live set is `(4 or 2)·(n_par/N_k)·G_tile` of parent
-Greens and partners (χ₀ or Σ_c) plus the block set, chosen when that fits;
-the ψ route is the fallback.
-
 `gw.greens_function_kernel.spin_pairs_needed` streams a stage only when its
 whole-spin live set exceeds the target: `3·G_tile` for χ₀ (Gv, Gc and the
 unfold transient), `2·G_tile` for Σ_x, the Coulomb hole and Σ_c(τ) (Σ_k and
