@@ -198,19 +198,21 @@ def test_mu_pad_flip_invariance_bispinor(bispinor_session, bispinor_pad4_session
         f"printed quanta at FIXED P ({diff['moved_tokens']} of "
         f"{diff['n_tokens']} tokens moved) — a computation still runs on the "
         f"padded μ extent.\n{diff['worst_line']}")
-    # The derived eqp tables include an eigensolve whose final decimal can
-    # move by one output quantum when the zero-padded carrier shape changes.
-    # The archived standalone failure was exactly 1e-9 eV
-    # (1.924262145 vs 1.924262146), not a hidden session dependency.  Keep
-    # every numeric token and allow no more than that printed quantum.
+    # The eqp tables print 9 decimals, finer than Σ is reproducible under a
+    # pad flip: the changed reduction order moves Σ by ~1e-8 eV, so eqp moves
+    # by several 1e-9 quanta (4e-9 eV on 27/1116 tokens with the frozen-core
+    # fixture, 9e-9 without it; 74d4d53d9, 2026-09-25).  Compare them in
+    # units of the sigma_diag quantum instead (owner via coordinator,
+    # 2026-09-25); a real pad defect moves whole rows by O(1-100) eV and
+    # still fails (``test_print_quantum_compare``).
     for eqp in ("eqp0.dat", "eqp1.dat"):
         ea = numeric_tokens(ses.run_dir / eqp)
         eb = numeric_tokens(run_dir / eqp)
         assert ea.shape == eb.shape, f"{eqp} numeric-token count changed"
         np.testing.assert_allclose(
-            ea, eb, rtol=0.0, atol=1.1e-9,
+            ea, eb, rtol=0.0, atol=PAD_FLIP_EQP_ATOL_EV,
             err_msg=(f"bispinor pad-extent flip changed {eqp} by more than "
-                     "one exported decimal quantum at fixed P"))
+                     "one sigma_diag print quantum at fixed P"))
 
 
 # ===========================================================================
