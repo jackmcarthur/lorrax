@@ -1471,7 +1471,10 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
     const int banks = pair ? 3 : 1;
     const long long rows_max = pair ? kRowsMax : kRowsMax1;
     long long row_bytes = static_cast<long long>(banks) * (f32 ? 8 : 16) * sp;
-    long long rb = std::min<long long>(rows_max, (pair ? kSmemBudget : kSmemBudget1) / row_bytes);
+    // The budget never exceeds this device's opt-in maximum (99 KiB on sm_86/89/120, below the
+    // pair modes' 100 KiB): an unclamped budget asked for more than the device grants at launch.
+    const long long budget = std::min<long long>(pair ? kSmemBudget : kSmemBudget1, smem_optin);
+    long long rb = std::min<long long>(rows_max, budget / row_bytes);
     // Mode 8's resident arm sums the Lorentz blocks across a pair's spin rows, so it needs a
     // whole spin group per block: reach for the opt-in shared memory first.
     if (rb < 1 || (mode == 8 && rb < ns * ns)) rb = std::min<long long>(rows_max, smem_optin / row_bytes);
