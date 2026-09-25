@@ -34,6 +34,18 @@ def main():
         io.write_slab("source", values)
 
     with SlabIO(str(path), mode="a", mesh=mesh) as io:
+        for off, valid, reason in (
+                ((0, 0), (rows + 1, cols), "valid_shape exceeds slab shape"),
+                ((2 * rows - 1, 0), (2, cols), "valid slab exceeds dataset extent")):
+            try:
+                io.read_slabs(
+                    "source", shape=(rows, cols), offsets=[off],
+                    valid_shapes=[valid], partition_spec=P("x", "y"),
+                    window_axis=0)
+            except ValueError as exc:
+                assert reason in str(exc), str(exc)
+            else:
+                raise AssertionError(f"read_slabs accepted {reason}")
         got = io.read_slabs(
             "source", shape=(rows, cols),
             offsets=[(0, 0), (rows, 0), (rows, 0)],
@@ -56,8 +68,8 @@ def main():
             "step": os.environ.get("SLURM_STEP_ID"),
             "source_root": str(Path(__file__).resolve().parents[2]),
             "provider": loaded_lib_path("CUDA"),
-            "scope": "P4 same-handle union read then metadata and write; "
-                     "empty window zero-fill and exact readback",
+            "scope": "P4 union window admission, same-handle read then "
+                     "metadata and write; empty window zero-fill and exact readback",
         }, indent=2) + "\n")
     print(f"rank {jax.process_index()}: union sequence PASS", flush=True)
 

@@ -169,8 +169,10 @@ peers blocked in the collective with no traceback.
   not part of this write or read. An override that runs past the dataset
   refuses on every rank.
 - **`read_slabs` windows** share `shape`. `offsets` and `valid_shapes` are
-  `(n, ndim)`. The caller guarantees that windows are pairwise disjoint and
-  sorted ascending in row-major file order, and `window_axis` sits
+  `(n, ndim)` with `n ≥ 1`. Each explicit valid extent must fit its slab
+  shape and dataset extent; the same admission rule as `read_slab` checks
+  it before native I/O. The caller guarantees that windows are pairwise
+  disjoint and sorted ascending in row-major file order, and `window_axis` sits
   immediately before the dim that varies across windows. Production
   consumer: [`wfn_loader`](../services/wfn_loader.md).
 - **Geometry of an existing dataset.** A dataset this handle did not create
