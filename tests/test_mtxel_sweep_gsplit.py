@@ -203,7 +203,8 @@ def _reference(case, psi, gv, gmask, bidx, kvecs, extra):
             ket = np.asarray(op.apply(
                 jnp.asarray(psi[ik])[None], jnp.asarray(gv[ik]),
                 jnp.asarray(gmask[ik]),
-                mtxel_sweep.SphereBox(jnp.asarray(comp[ik])[None], sup),
+                mtxel_sweep.SphereBox(jnp.asarray(comp[ik])[None],
+                                      jnp.asarray(bidx[ik])[None], sup),
                 jnp.asarray(kvecs[ik]), *op.consts))[0]
             out.append(np.einsum("msg,nsgc->cmn", np.conj(psi_m), ket)
                        * op.post)
