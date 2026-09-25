@@ -298,8 +298,11 @@ def box_to_sphere(box: jax.Array, index: jax.Array) -> jax.Array:
     sphere index: one gather either way.
     """
     flat = box.reshape(box.shape[:-3] + (-1,))
-    idx = index.reshape((index.shape[0],) + (1,) * (flat.ndim - 2) + (index.shape[-1],))
-    return jnp.take_along_axis(flat, idx, axis=-1, mode='fill', fill_value=0)
+    # Per k, one take of whole slices along the flat cell axis (a broadcast
+    # take_along_axis builds an index per output element: 1.6x the ket at
+    # CrI3 16x16 ns 4).
+    return jax.vmap(lambda b, i: jnp.take(b, i, axis=-1, mode='fill', fill_value=0))(
+        flat, index)
 
 
 def sphere_transforms(fft_grid, supports, *, mesh, norm: str = "ortho"):
