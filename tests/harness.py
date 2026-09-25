@@ -806,6 +806,12 @@ def print_quantum_diff(ref_text: str, out_text: str) -> dict:
             "worst_line": worst_line}
 
 
+#: eqp tolerance of the μ-pad flip cells, eV: one sigma_diag print quantum
+#: (1e-6) plus margin.  The eqp tables print 9 decimals, finer than Σ is
+#: reproducible when the padded extent changes the reduction order.
+PAD_FLIP_EQP_ATOL_EV = 1.1e-6
+
+
 def census_lines(log_text: str) -> tuple:
     """PPM census + adaptive-window signature from a run log — the integer
     quantities that must be exactly invariant under μ-pad flips."""

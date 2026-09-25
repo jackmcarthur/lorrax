@@ -8,7 +8,9 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from harness import print_quantum_diff  # noqa: E402
+import numpy as np  # noqa: E402
+
+from harness import PAD_FLIP_EQP_ATOL_EV, print_quantum_diff  # noqa: E402
 
 _REF = """\
 k-point 0:
@@ -75,3 +77,15 @@ def test_structure_changes_fail_the_skeleton():
     )["skeleton_equal"]
     dropped = "\n".join(_REF.splitlines()[:-2]) + "\n"
     assert not print_quantum_diff(_REF, dropped)["skeleton_equal"]
+
+
+def test_the_eqp_tolerance_absorbs_pad_roundoff_and_not_a_pad_defect():
+    # Measured pad-flip roundoff on the eqp tables: up to 9e-9 eV.
+    eqp = np.array([1.0, -18.310383627, -16.603460135, 3.113856])
+    assert np.all(np.abs((eqp + 9e-9) - eqp) <= PAD_FLIP_EQP_ATOL_EV)
+    # A whole-row pad defect: the row's QP energy moves with its Sigma.
+    bad = eqp.copy()
+    bad[1] += 0.15
+    assert np.any(np.abs(bad - eqp) > PAD_FLIP_EQP_ATOL_EV)
+    # Two sigma_diag quanta is already a failure.
+    assert 2e-6 > PAD_FLIP_EQP_ATOL_EV
