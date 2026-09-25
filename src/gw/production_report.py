@@ -194,7 +194,7 @@ class GWProductionReport:
         end.  Exceptions still use stderr through the shared fail-fast path.
         """
         text = sep.join(str(v) for v in args)
-        if text.startswith(("  Resident ψ ", "  GW ψ carriers: ")):
+        if text.startswith("  Resident ψ "):
             self.emit(text)
             return
         # The μ-batch ζ fit's plan and its measured store/timing receipts are
