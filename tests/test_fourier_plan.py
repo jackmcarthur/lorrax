@@ -380,10 +380,45 @@ def test_cpu_operand_in_a_gpu_process(monkeypatch):
     cpu = jax.devices("cpu")[0]
     rng = _rng("cpuop")
     x = _crandn(rng, (4, 16, 12))
-    plan = LocalFourierPlan((16, 12), (-2, -1), sign=-1, device_kind="__fft__")
+    plan = LocalFourierPlan((16, 12), (-2, -1), sign=-1, device_kind="__gemm__")
+    assert plan.leg is None             # a GEMM plan chooses its leg when lowered
     y = jax.jit(plan)(jax.device_put(jnp.asarray(x), cpu))
     assert list(y.devices())[0].platform == "cpu"
     np.testing.assert_allclose(np.asarray(y), np.fft.fftn(x, axes=(-2, -1)), rtol=0, atol=1e-11)
+
+
+def test_fft_only_plan_takes_the_xla_leg(monkeypatch):
+    """A plan with no GEMM stage takes the XLA leg on every platform, chosen at
+    construction (claim 2786: on A100 the CUDA leg's remap + cuFFT arm is 1.20-1.33x
+    XLA's take-embed + cuFFT); a plan with a GEMM stage keeps the platform's leg."""
+    monkeypatch.setattr(fourier_plan, "_default_leg", lambda: None)
+    sup = {-1: np.arange(-4, 5) % 16}
+    fft_only = LocalFourierPlan((16, 12), (-1, -2), sign=-1, in_support=sup, device_kind="__fft__")
+    mixed = LocalFourierPlan((16, 12), (-1, -2), sign=-1, in_support=sup, device_kind="__gemm__")
+    assert fft_only.leg == "xla" and mixed.leg is None
+    x = jnp.asarray(_crandn(_rng("fftonly"), (3, 12, 9)))
+    assert "lorrax_fourier_plan" not in jax.jit(fft_only).lower(x).as_text()
+    ref = _reference(np.asarray(x), (16, 12), (-1, -2), -1, "backward", sup, {})
+    y = np.asarray(jax.jit(fft_only)(x))
+    assert np.linalg.norm(y - ref) <= RTOL * np.linalg.norm(ref)
+
+
+def test_pair_wheel_checked_at_plan_build(monkeypatch):
+    """Only the fused pair needs a validated nvidia-mathdx wheel: startup accepts any
+    wheel, and at plan build another wheel turns the pair off (the cuBLAS chain)."""
+    import importlib.metadata as md
+    import ffi.fft as F
+    import ffi.gate as G
+    monkeypatch.setattr(F, "mathdx_root", lambda: "/nonexistent/mathdx")
+    monkeypatch.setattr(F, "cubin_cache_dir", lambda: "/nonexistent/cubins")
+    monkeypatch.setattr(md, "version", lambda name: "99.0.0")
+    assert F.pair_build_attrs() == {}
+    monkeypatch.setattr(G, "mesh_ffi_platform", lambda mesh: "CUDA")
+    monkeypatch.setattr(F, "_require_target", lambda target, platform: None)
+    assert F.require_fourier_plan(None, announce=False) == "ffi"
+    monkeypatch.setattr(md, "version", lambda name: F.PAIR_MATHDX_WHEELS[0])
+    assert F.pair_build_attrs() == {"mathdx_root": "/nonexistent/mathdx",
+                                    "cubin_dir": "/nonexistent/cubins"}
 
 
 def _device_free_bytes():

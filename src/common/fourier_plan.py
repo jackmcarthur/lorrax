@@ -163,10 +163,12 @@ class LocalFourierPlan:
     ``out_perm`` returns ``jnp.transpose(y, out_perm)`` instead of ``y``.
     ``device_kind`` defaults to the kind of ``mesh``'s first device, else
     ``jax.devices()[0]``'s (it chooses GEMM axes only, never correctness).
-    The leg is chosen when the call is lowered, from the platform it is
-    lowered for (``jax.lax.platform_dependent``): one ``lorrax_fourier_plan_mathdx``
-    custom call on CUDA, XLA ops elsewhere, so a CPU operand in a GPU process
-    takes the XLA leg.  Contract on every platform: complex128, at most three
+    A plan with a GEMM stage chooses its leg when the call is lowered, from the
+    platform it is lowered for (``jax.lax.platform_dependent``): one
+    ``lorrax_fourier_plan_mathdx`` custom call on CUDA, XLA ops elsewhere, so a CPU
+    operand in a GPU process takes the XLA leg.  A plan without one takes the XLA
+    leg everywhere (``plan.leg == 'xla'``, set at construction).  The fused pair's
+    nvidia-mathdx wheel is checked at construction (``ffi.fft.pair_build_attrs``).  Contract on every platform: complex128, at most three
     transform axes (``GATE fourier-plan-contract`` otherwise).
     ``plan.stages`` lists ``(axis, 'gemm'|'fft', n_in, n_out)`` in execution
     order on both legs.  ``in_gather`` (with
@@ -211,6 +213,7 @@ class LocalFourierPlan:
             self._gather = make_plane_fft_gather(mesh, plane_from_col, int(n_col), extents)
             self.extents, self.axes, self.sign, self.norm = extents, axes, sign, norm
             self.stages = [(axes, "gather-fft", int(n_col), extents[0] * extents[1])]
+            self.leg = None             # the door chooses mathdx mode 10 or its XLA route
             return
         for name, sup in (("in_support", in_support), ("out_support", out_support)):
             if set(sup) - set(axes):
@@ -265,9 +268,16 @@ class LocalFourierPlan:
         mid = embed + ([("fft", tuple(fft), None)] if fft else []) + take
         self._ops = pre + mid + post
         self.out_perm = None if out_perm is None else tuple(int(a) for a in out_perm)
+        # A plan with no GEMM stage takes the XLA leg on every platform: on A100 the CUDA
+        # leg's FFT arm (remap embed + cuFFT) is 1.20-1.33x the XLA leg's take-embed + cuFFT
+        # on 24²-80² and 24³-64³ sphere->box plans, with cuFFT itself equal (claim 2786).
+        self.leg = None if gemm else "xla"
+        self._pair = {}
         if _cuda_present(mesh):         # the CUDA leg's handler must be loaded before lowering
-            from ffi.fft import FOURIER_PLAN_TARGET, _require_target
+            from ffi.fft import FOURIER_PLAN_TARGET, _require_target, pair_build_attrs
             _require_target(FOURIER_PLAN_TARGET, "CUDA")
+            if len(gemm) >= 2:          # a fused pair is possible: its wheel is checked here
+                self._pair = pair_build_attrs()
         fft_stages = self.stages
         self.stages = ([(ax, "gemm", A.shape[1], A.shape[0]) for _, ax, A in pre]
                        + fft_stages
@@ -286,7 +296,7 @@ class LocalFourierPlan:
             if x.shape[ax] != k:
                 raise ValueError(f"LocalFourierPlan: axis {ax} of x has extent "
                                  f"{x.shape[ax]}, the plan expects {k}")
-        leg = _default_leg()
+        leg = _default_leg() or self.leg
         if leg is not None:
             return self._call_ffi(x) if leg == "ffi" else self._call_xla(x)
         return jax.lax.platform_dependent(x, cuda=self._call_ffi, default=self._call_xla)
@@ -325,7 +335,7 @@ class LocalFourierPlan:
         (GEMMs by cuBLAS with the matrix broadcast, the FFT group by cuFFT; the
         two trailing axes' GEMMs, back to back, as one cuBLASDx plane kernel
         when a block fits it on the device)."""
-        from ffi.fft import cubin_cache_dir, fourier_plan_ffi, mathdx_root
+        from ffi.fft import fourier_plan_ffi
         nd = x.ndim
         phys = sorted(a % nd for a in self.axes)
         trailing = list(range(nd - len(phys), nd))
@@ -348,8 +358,7 @@ class LocalFourierPlan:
             sup_out=[int(c[4]) for c in cols],
             gemm=[int(by_pos[p] in gemm_axes) for p in phys],
             scale=[_axis_scale(c[0], self.sign, self.norm) for c in cols], order=order,
-            sign=self.sign, **(dict(mathdx_root=mathdx_root(), cubin_dir=cubin_cache_dir())
-                               if len(gemm_axes) >= 2 else {}))
+            sign=self.sign, **self._pair)
         if phys != trailing:
             y = jnp.moveaxis(y, trailing, phys)
         if self.out_perm is not None:
