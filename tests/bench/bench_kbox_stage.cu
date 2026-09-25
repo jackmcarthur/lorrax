@@ -1,12 +1,12 @@
 // Gate + bench for src/ffi/cpp/cufft/kbox_stage.cuh.
 //
 // Per k-grid and mode, on a k-leading (nk, ncols) c128 tile:
-//   today   a verbatim copy of the family's resident modes 2/3 kernel (axis_pass/transform3 on
-//           RB rows of SP = nk|1, lrx_mul, scale at the store), compiled in this TU
 //   stage   the header's arm chosen by lrx_kbox::kbox_plan from the device's opt-in smem
 //   ref     cuFFT rank-3 (element stride ncols) + elementwise kernels
-// Reports: bitwise(stage, today), rel(stage, ref), rel(today, ref), times.
-// Mode 8 (Lorentz spin group, ns 4) runs the split arm's group pencil against ref only.
+// Reports: rel(stage, ref) and times.  The retired resident modes 2/3 kernel this bench once
+// carried as its bitwise baseline was deleted 2026-09-25 (FP): modes 2/3 now run only on the
+// stage, and kconv_router_p4 holds them bitwise against the XLA chain.
+// Mode 8 (Lorentz spin group, ns 4) runs the split arm's group pencil and the single arm.
 // usage: bench_kbox_stage MODE NX NY NZ M    (mode 3: ncols = M; mode 2: 4 M^2; mode 8: 16 M^2)
 // build (one A100; MATHDX = the nvidia-mathdx wheel's nvidia/mathdx directory):
 //   nvcc -O3 -std=c++17 -arch=sm_80 --expt-relaxed-constexpr -I src/ffi/cpp/cufft \
@@ -29,73 +29,6 @@
 constexpr int ARCH = 800;
 struct __align__(16) C { double x, y; };
 __device__ __forceinline__ C lrx_mul(C a, C b) { C z = {a.x*b.x - a.y*b.y, a.x*b.y + a.y*b.x}; return z; }
-
-// ---------------- today's resident kernel (modes 2/3), verbatim structure ----------------
-template <int N, int STRIDE, cufftdx::fft_direction Dir, int NK, int SP, int RB>
-__device__ __forceinline__ void t_axis_pass(C* bank) {
-    if constexpr (N > 1) {
-        using F = lrx_kbox::ThreadFFT<N, ARCH, Dir, C>;
-        using V = typename F::value_type;
-        constexpr int lines = NK / N;
-        for (int l = threadIdx.x; l < RB * lines; l += blockDim.x) {
-            const int j = l / lines, li = l % lines;
-            C* p = bank + j * SP + (li / STRIDE) * N * STRIDE + (li % STRIDE);
-            V v[F::storage_size];
-#pragma unroll
-            for (int e = 0; e < N; ++e) { v[e].x = p[e * STRIDE].x; v[e].y = p[e * STRIDE].y; }
-            F().execute(v);
-#pragma unroll
-            for (int e = 0; e < N; ++e) { p[e * STRIDE].x = v[e].x; p[e * STRIDE].y = v[e].y; }
-        }
-    }
-    __syncthreads();
-}
-template <int NX, int NY, int NZ, int RB, cufftdx::fft_direction Dir>
-__device__ void t_transform3(C* bank) {
-    constexpr int NK = NX * NY * NZ, SP = NK | 1;
-    t_axis_pass<NZ, 1, Dir, NK, SP, RB>(bank);
-    t_axis_pass<NY, NZ, Dir, NK, SP, RB>(bank);
-    t_axis_pass<NX, NY * NZ, Dir, NK, SP, RB>(bank);
-}
-template <int MODE, int NX, int NY, int NZ, int RB>
-__global__ void __launch_bounds__(256) today_kernel(const C* x, const C* kern, C* y, long long rows,
-                                                    long long m0, long long m1, long long m2, double scale) {
-    constexpr int NK = NX * NY * NZ, SP = NK | 1;
-    extern __shared__ C sm[];
-    const long long r0 = (long long)blockIdx.x * RB;
-    using namespace cufftdx;
-    for (int i = threadIdx.x; i < RB * NK; i += blockDim.x) {
-        const int k = i / RB, j = i % RB;
-        const long long row = r0 + j;
-        C v = {0.0, 0.0};
-        if (row < rows) v = x[(long long)k * rows + row];
-        sm[j * SP + k] = v;
-    }
-    __syncthreads();
-    if (MODE == 2) t_transform3<NX, NY, NZ, RB, fft_direction::inverse>(sm);
-    else t_transform3<NX, NY, NZ, RB, fft_direction::forward>(sm);
-    if (MODE == 2) {
-        for (int i = threadIdx.x; i < RB * NK; i += blockDim.x) {
-            const int k = i / RB, j = i % RB;
-            const long long row = r0 + j;
-            if (row < rows) {
-                const long long kidx = (long long)k * (m2 * m0) + ((row / m1) % m2) * m0 + row % m0;
-                sm[j * SP + k] = lrx_mul(sm[j * SP + k], kern[kidx]);
-            }
-        }
-        __syncthreads();
-        t_transform3<NX, NY, NZ, RB, fft_direction::forward>(sm);
-    }
-    for (int i = threadIdx.x; i < RB * NK; i += blockDim.x) {
-        const int k = i / RB, j = i % RB;
-        const long long row = r0 + j;
-        if (row < rows) {
-            const C v = sm[j * SP + k];
-            C w; w.x = v.x * scale; w.y = v.y * scale;
-            y[(long long)k * rows + row] = w;
-        }
-    }
-}
 
 // ---------------- the header's arms, wrapped as the family's modes would ----------------
 struct PlainLoad { static constexpr bool kDirect = false, kFinish = false; const C* x; long long n;
@@ -154,7 +87,7 @@ __global__ void __launch_bounds__(256) stage_plane(Ld ld, St st, long long n) {
     lrx_kbox::plane_pass<NX, NY, NZ, ARCH, Dir, 16>(sm, n, ld, st);
 }
 // the order-preserving split: x inverse then the multiply (!CONV, inverse, VMid), or x forward
-// then the scale (!CONV, forward, ScaleMid): with the plane passes, z,y,x each way as today.
+// then the scale (!CONV, forward, ScaleMid): with the plane passes, z,y,x each way as on the single arm.
 template <int NX, int NY, int NZ>
 __global__ void __launch_bounds__(256) stage_pencil_invmid(C* y, long long n, const C* V, long long m0, long long m1, long long m2) {
     lrx_kbox::pencil_pass<NX, NY, NZ, ARCH, false, cufftdx::fft_direction::inverse>(y, n, VMid{V, m0, m1, m2});
@@ -335,14 +268,13 @@ static int grid_of(K k, int threads, size_t smem) {
 
 template <int MODE, int NX, int NY, int NZ>
 static void run(long long m) {
-    constexpr int NK = NX * NY * NZ, SP = NK | 1;
-    constexpr int RB = std::min(64, int((48 * 1024) / (SP * 16)) > 0 ? int((48 * 1024) / (SP * 16)) : 1);
+    constexpr int NK = NX * NY * NZ;
     const long long n = MODE == 3 ? m : MODE == 2 ? 4 * m * m : 16 * m * m;
     const long long len = NK * n, vlen = MODE == 2 ? NK * m * m : MODE == 8 ? NK * 16 * m * m : 1;
     const long long m0 = m, m1 = 2 * m, m2 = m;
     const double s = MODE == 3 ? 1.0 : 1.0 / NK;
-    C *x, *yt, *yh, *yr, *tmp, *V;
-    CK(cudaMalloc(&x, len * 16)); CK(cudaMalloc(&yt, len * 16)); CK(cudaMalloc(&yh, len * 16));
+    C *x, *yh, *yr, *tmp, *V;
+    CK(cudaMalloc(&x, len * 16)); CK(cudaMalloc(&yh, len * 16));
     CK(cudaMalloc(&yr, len * 16)); CK(cudaMalloc(&tmp, len * 16)); CK(cudaMalloc(&V, vlen * 16));
     {
         unsigned long long st = 777 + NK;
@@ -394,17 +326,6 @@ static void run(long long m) {
     const double floor_us = (2.0 * len + vlen) * 16 / 1.555e12 * 1e6;
     std::printf("mode %d k-grid %dx%dx%d ncols=%lld (%.0f MB): plan arm=%s tr=%d threads=%d smem=%lld; floor %.1f us\n",
                 MODE, NX, NY, NZ, n, len * 16 / 1e6, P.arm == 0 ? "single" : "split", P.tr, P.threads, P.smem, floor_us);
-    // today (modes 2/3)
-    float tt = 0; double rt = 0;
-    if (MODE != 8) {
-        const size_t smt = size_t(RB) * SP * 16;
-        auto kt = today_kernel<MODE == 8 ? 3 : MODE, NX, NY, NZ, RB>;
-        grid_of(kt, 256, smt);
-        const long long gt = (n + RB - 1) / RB;
-        auto ft = [&] { kt<<<unsigned(gt), 256, smt>>>(x, V, yt, n, m0, m1, m2, s); };
-        tt = time_ms(ft); ft(); CK(cudaDeviceSynchronize());
-        rt = rel(yt, yr, len);
-    }
     // the header's arm (fd: mode 3 through the direct Load (+ identity group Mid on the single arm))
     std::function<void()> fh, fd;
     C* yd = nullptr;
@@ -493,17 +414,10 @@ static void run(long long m) {
                     P.arm == 0 ? " + group Mid" : "", td * 1e3, bd ? "BITWISE" : "DIFFERS", dd);
     }
     if (yd) cudaFree(yd);
-    bool bw = false;
     const double rh = rel(yh, yr, len);
-    double dht = 0;
-    if (MODE != 8) dht = rel(yh, yt, len, &bw);
-    if (MODE != 8)
-        std::printf("  today %9.1f us (rel %.1e)   stage %9.1f us (rel %.1e, %3.0f%% of floor)   stage vs today: %s (%.1e)  %.2fx\n",
-                    tt * 1e3, rt, th * 1e3, rh, 100 * floor_us / (th * 1e3), bw ? "BITWISE" : "round-off", dht, tt / th);
-    else
-        std::printf("  stage %9.1f us (rel %.1e, %3.0f%% of floor)\n", th * 1e3, rh, 100 * floor_us / (th * 1e3));
+    std::printf("  stage %9.1f us (rel %.1e, %3.0f%% of floor)\n", th * 1e3, rh, 100 * floor_us / (th * 1e3));
     cufftDestroy(plan);
-    cudaFree(x); cudaFree(yt); cudaFree(yh); cudaFree(yr); cudaFree(tmp); cudaFree(V);
+    cudaFree(x); cudaFree(yh); cudaFree(yr); cudaFree(tmp); cudaFree(V);
 }
 
 int main(int argc, char** argv) {
