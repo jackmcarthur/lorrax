@@ -32,6 +32,12 @@ must resolve to ``mathdx`` on this mesh (asserted, TASTE 30).
    transform; bitwise today, reported) for the CC, CT and TT classes on the
    glide plans (ns 2, 4), a rectangular (charge x current) glide class and C3
    with a general complex U (ns 4).  Red twin: the right source table rolled.
+3e. ``make_kfft_klead_unfold`` (mode 9, an interaction's R-space operand read
+   from its q wedge): within 2 ulp of max|ref| of the chain it replaces
+   (``unfold_isdf_operator``, then the mode-3 prep; bitwise on exact phases,
+   reported) on both antiunitary rules for the glide, A-cubic and C3 plans,
+   and a 3x3 Lorentz block against unfold-then-rotate in XLA.  Red twin: the
+   right source table rolled.
 4. The stored-kernel doors (modes 2-5) against NumPy ``np.fft`` on sharded
    operands, including an odd grid and 8x8x8: ``make_kconv_klead`` (Σ/COHSEX,
    prep + apply), ``make_kconv_kminor`` (BSE rung, both store layouts),
@@ -303,6 +309,29 @@ def lorentz_cases(mesh, rng):
     return recs
 
 
+def wedge_cases(mesh, rng):
+    """Mode 9 vs unfold_isdf_operator + the mode-3 prep (test_kfft_klead_unfold)."""
+    import zeta_mubatch_fixtures as fixtures
+    from test_kconv_klead_unfold import c3_fixture
+    from test_kfft_klead_unfold import lorentz_wedge_case, wedge_case
+    recs = []
+    fxs = [fixtures._glide_fixture(mesh, rng, 2), fixtures._acubic_fixture(mesh, rng),
+           c3_fixture(mesh, 2)]
+    for fx in fxs:
+        for rule in ("conj", "pair_transpose"):
+            r = wedge_case(mesh, fx, rule)
+            recs.append(dict(case=f"kfft_klead_unfold_{rule}_nk{r['nk']}", nk=r["nk"],
+                             antiunitary=r["antiunitary"], bitwise_vs_old_chain=int(r["door_bitwise"]),
+                             max_abs_vs_old_chain=r["max_abs"], rel_vs_old_chain=r["rel"],
+                             ulp_vs_old_chain=r["rel"] / np.finfo(float).eps,
+                             red_rolled_rsrc=r["red_rel"]))
+    for fx in (fxs[0], fxs[2]):
+        r = lorentz_wedge_case(mesh, fx)
+        recs.append(dict(case=f"kfft_klead_unfold_lorentz3_nk{r['nk']}", nk=r["nk"],
+                         ulp_vs_old_chain=r["rel"] / np.finfo(float).eps, red_rolled_rsrc=r["red_rel"]))
+    return recs
+
+
 def _np3(x, kg, axis0, kind, norm):
     """np.fft over three consecutive k axes starting at axis0 of the reshaped array."""
     f = np.fft.ifftn if kind == "ifftn" else np.fft.fftn
@@ -387,7 +416,8 @@ def main() -> int:
     mesh = Mesh(np.asarray(jax.devices()).reshape(2, 2), XY)
     rng = np.random.default_rng(20260924)
     recs = ([downfold_case(mesh, rng), face_parent_case(mesh, rng), plane_case(mesh, rng)]
-            + unfold_cases(mesh, rng) + lorentz_cases(mesh, rng) + stored_cases(mesh, rng))
+            + unfold_cases(mesh, rng) + lorentz_cases(mesh, rng) + wedge_cases(mesh, rng)
+            + stored_cases(mesh, rng))
     bad = []
     for r in recs:
         for k, v in r.items():
