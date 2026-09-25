@@ -21,12 +21,15 @@ Write the feature at position r as
 
 The windows m in L and n in R are explicit; this uses the R-dagger/L
 orientation of `isdf.core._gram_q0_fold_local`. Charge has one vertex I;
-current selection stacks the three Hermitian vertices alpha_i/alpha_fs.
+current candidate selection stacks the three Hermitian vertices alpha_i.
 This **positive feature Gram** is not the signed transverse fit matrix.
-Nor is it the frequency-dependent Gram of the W interpolation pencil.
+Nor is it the frequency-sample Gram of the W interpolation pencil.
 Their eigenvalues are different diagnostics.
 
-`centroid.sampling_metric` computes s(r)=K(r,r) exactly on the FFT grid;
+`centroid.sampling_metric` computes s(r)=K(r,r) for charge and
+s(r)=K(r,r)/alpha_fs^2 for current on the FFT grid. This global positive
+scale changes neither Lloyd minimizers nor relative pivot/rank criteria;
+absolute Gram magnitudes must retain the distinction.
 `centroid.kmeans_cli` uses w(r)=sqrt(s(r)) as Lloyd's mass (before any
 explicit `rho_power`). Thus the objective is
 
@@ -157,6 +160,37 @@ inserting fractional positions into the existing residue phase is wrong.
 Off-grid support must use the loader's paired (k,G) convention and change the
 canonical geometry/transport once, including nonsymmorphic translations.
 Simply saving unsnapped Lloyd points is not a supported implementation.
+The face loaders already use direct Fourier evaluation, but off-grid C_q
+must also come from those directly sampled projectors, rather than grid
+extraction from Z_q. This is a change to the shared representation contract,
+not just to the selector's output format.
+
+## A coverage-preserving alternative to full-grid factors
+
+A useful design objective is to minimize the worst normalized feature-fit
+residual over representative q, subject to a point budget, complete symmetry
+orbits, and a covering-radius bound on the physically weighted support:
+
+\[
+ E_q(S)=\frac{\operatorname{tr}\left(K_q-
+ K_{q,:,S}K_{q,S,S}^{+}K_{q,S,:}\right)}{\operatorname{tr}K_q}.
+\]
+
+The pseudoinverse uses the existing conditioning policy. This objective
+states separately what coverage protects and what feature fitting optimizes;
+it does not promise a well-conditioned W pencil. A practical approximation
+could retain a CVT scaffold, enrich candidates from omitted high-residual
+regions, and exchange redundant whole orbits without breaking coverage.
+Rescoring outside the original candidate pool is essential: pruning a fixed
+pool cannot discover a missing region. The residual is an assessment target,
+not a proposal to materialize K_q or evaluate every q at every swap.
+
+Even this smaller search must price wavefunction faces, not just its Gram.
+For example, 30,000 candidates give a 14.4 GB complex128 Gram in total, but
+at 64 full-zone k points, 1024 bands and four spin components, a face sharded
+only on one axis of a 4x4 mesh occupies 31.5 GB per rank. Two such faces
+already exceed a 40 GB GPU. Streaming or a different all-rank layout is
+necessary before claiming that this candidate count fits.
 
 ## Decision criteria
 
