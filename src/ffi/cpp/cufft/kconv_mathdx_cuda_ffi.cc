@@ -1505,7 +1505,9 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
     // memory from the grid and this device's opt-in budget (RB is unused).  Mode 8 takes the
     // stage's split arm where its resident arm has no room for a spin group: the group pencil
     // forms each member on its own thread (a single arm's group Mid runs one thread per (k, pair):
-    // 3766 vs 2156 us at 8^3 in the standalone bench).
+    // 3766 vs 2156 us at 8^3 in the standalone bench).  Kept 2026-09-25 (FP): mode 3 is 90% of the
+    // FFT-family time of an Fe 8^3 shared-pole SC map, and the stage is 1.14-1.23x at its door
+    // (claim 2779); mode 8's split arm serves 10^3-16^3 at ns 4, which the resident arm refuses.
     const bool kbox_rows = mode == 2 || mode == 3;
     int kb_arm = 0, kb_tr = 0, kb_ty = 0, kb_threads = 0, kb_threads2 = 0;
     long long kb_smem = 0, kb_smem2 = 0;
@@ -1565,6 +1567,8 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
             ? std::max(1LL, std::min(8LL, kPlaneGroupBytes / row_bytes)) : 0;
         // The asynchronous gather stages the next group's occupied rows beside the
         // planes when that fits the opt-in budget; otherwise it gathers in place.
+        // Kept 2026-09-25 (FP): 1.11-1.37x on mode 10 at 25^2-80^2 (A100), and mode 10 is
+        // ~20-40% of the FFT-family time of the CrI3 one-shots.
         const long long stage = 16LL * plane_rows * nky;
         if (rb >= 1 && stage > 0) {
             long long pb = std::max(1LL, std::min(8LL, kPlaneGroupBytes / (row_bytes + stage)));
@@ -1626,7 +1630,8 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
         "-DLRX_RB=" + std::to_string(mode == 10 ? plane_minb : rb),
         "-DLRX_F32=" + std::string(f32 ? "1" : "0"),
         "-DLRX_SM=" + std::to_string(cc_major * 100 + cc_minor * 10)};
-    // Mode 10: planes per block; a block that has its SM alone runs 512 threads.
+    // Mode 10: planes per block; a block that has its SM alone runs 512 threads (A100 80^2:
+    // 3.26 -> 2.60 ms; kept 2026-09-25, FP: the 80^2 production planes).
     const int plane_threads = mode == 10 && plane_minb == 1 ? 512 : kThreads;
     if (mode == 7 && blk != ns) defs.push_back("-DLRX_NA=" + std::to_string(blk));
     if (mode == 8 && !lor_split) defs.push_back("-DLRX_ARM=0");

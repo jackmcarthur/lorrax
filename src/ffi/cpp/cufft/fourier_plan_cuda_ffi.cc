@@ -148,6 +148,8 @@ static int64_t prod(const int64_t* e, int d) {
 }
 
 // ---- the fused supported pair ------------------------------------------------
+// Kept 2026-09-25 (FP): real-space GW's sphere<->box transforms on Fe-class cubic boxes run
+// at 0.64-0.82 of the cuBLAS chain (claim 2764), about 8-18% of that path's FFT time at Fe 8^3 (estimate).
 // One block per plane (grid-stride): load P, T = α·A1·P, Q = T·A2ᵀ, store Q.
 static const char* kPairSrc = R"__lrx__(
 #include <cublasdx.hpp>
