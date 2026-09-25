@@ -538,7 +538,8 @@ if(LORRAX_CUFFT_ON)
     # run time from the installed wheel's cuFFTDx headers, per k-grid: there
     # is no embedded cubin to extract.
     add_library(build_kconv_mathdx_cuda OBJECT
-        cufft/kconv_mathdx_cuda_ffi.cc)
+        cufft/kconv_mathdx_cuda_ffi.cc
+        common/nvrtc_build.cc)
     set_target_properties(build_kconv_mathdx_cuda PROPERTIES
         POSITION_INDEPENDENT_CODE ON)
     target_include_directories(build_kconv_mathdx_cuda SYSTEM PRIVATE
