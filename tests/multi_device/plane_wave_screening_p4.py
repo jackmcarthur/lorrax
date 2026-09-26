@@ -77,10 +77,16 @@ def fe_antiunitary(mesh, wfn):
     from ffi import _services
     _services.ensure_on_path()
     import vcoul
-    fx2, b = fe_fixture(mesh, wfn, 2)
-    fx1, _ = fe_fixture(mesh, wfn, 1)
-    c = t.covariant_case(fx2, ecut=1.05 * float(np.min(np.einsum("ij,ij->i", b, b))),
-                         metric=b @ b.T, box=(6, 6, 6), nb=2)
+    # a 10^3 grid and ψ spheres through the |b|^2·8/3 shell (the χ sphere at 0.8 of it holds
+    # the G = 0, |b|^2 and 4/3|b|^2 shells: a 1-slot Γ sphere would make every check trivial)
+    box = (10, 10, 10)
+    fx2, b = fe_fixture(mesh, wfn, 2, box=box)
+    fx1, _ = fe_fixture(mesh, wfn, 1, box=box)
+    c = t.covariant_case(fx2, ecut=2.9 * float(np.min(np.einsum("ij,ij->i", b, b))),
+                         metric=b @ b.T, box=box, nb=2)
+    say(f"Fe case: ψ slots {c['sph'].shape[1]}, χ slots at Γ "
+        f"{int(c['out_full'][1][np.flatnonzero(np.all(np.abs(c['out_full'][2]) < 1e-12, axis=1))[0]])}, "
+        f"closure leak {c['leak']:.1e}")
     assert c["leak"] <= 1e-12, c["leak"]
     geo = vcoul.CoulombGeometry(bvec=b, cell_volume=1.0)
     r = s.antiunitary_check(mesh, fx2, fx1, c, geo)
@@ -108,6 +114,10 @@ def main():
         run(f"Dyson vs explicit inverses linalg={linalg}", s.test_dyson_matches_explicit_inverses, 4,
             linalg=linalg)
     run("Γ body, fold, head", s.test_gamma_body_fold_and_head)
+    run("Γ head, slab", s.test_gamma_head_slab)
+    for n_mesh in (4,):
+        run("minimax rule on pair sums vs band sum", s.test_minimax_rule_on_pair_sums_matches_the_band_sum,
+            n_mesh)
     run("MPA tiles vs dense fit", s.test_pole_fit_tiles_equal_one_dense_fit, 4)
     run("antiunitary rule, glide", s.test_antiunitary_rule_glide)
     if args.wfn:
