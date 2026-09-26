@@ -424,13 +424,19 @@ def test_ongrid_exchange_is_indexed_by_the_tile_grid_not_the_bse_grid():
         "--vq-mode ongrid on a bse_k_grid-densified bundle meets a None "
         "subscript instead of an explanation")
 
-    subs = [n for n in ast.walk(fn)
+    # The tile lookup is bse.exchange_path.exchange_tiles (ARCH H8), which
+    # main hands the resolved tile grid by keyword.
+    assert "kgrid_vq=kgrid_vq" in src, (
+        "exciton_bands no longer hands exchange_tiles the exchange-tile grid")
+    tiles_path = _os.path.join(_os.path.dirname(src_path), "exchange_path.py")
+    tiles = ast.parse(open(tiles_path).read())
+    subs = [n for n in ast.walk(tiles)
             if isinstance(n, ast.Subscript)
             and isinstance(n.value, ast.Name) and n.value.id == "V_ongrid"]
     assert subs, "the ongrid exchange lookup no longer reads V_ongrid"
 
     # and kgrid_bse must not be what rounds Q onto the tile lattice
-    bad = [n for n in ast.walk(fn)
+    bad = [n for tree in (fn, tiles) for n in ast.walk(tree)
            if isinstance(n, ast.Call)
            and isinstance(n.func, ast.Attribute) and n.func.attr == "round"
            and n.args and isinstance(n.args[0], ast.BinOp)
