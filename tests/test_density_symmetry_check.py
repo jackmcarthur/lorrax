@@ -522,7 +522,8 @@ def test_stamp_cold_writes_and_second_process_hits(tmp_path, stamp_env,
     assert "[stamp written" in capsys.readouterr().out
     warm = _new_process_loader(path).trs_reference
     assert len(calls) == 1, "a valid stamp must skip the measurement"
-    assert "[stamp hit, not re-measured" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "[stamp hit in" in out and "not re-measured" in out
     def receipt(report):
         return json.dumps(density_check._report_to_json(report),
                           sort_keys=True)
