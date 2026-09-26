@@ -15,6 +15,9 @@ from distrib_la.loader import probe_target
 
 
 _TARGET = "lorrax_cublas_local_active_range_gemm"
+#: The same product with no C operand (beta = 0): the handler writes every row,
+#: so the output is not zero-filled first.
+_OUT_TARGET = "lorrax_cublas_local_active_range_gemm_out"
 _PREPARED_TARGET = "lorrax_cublas_local_prepared_active_range_gemm"
 _WORKSPACE_BYTES = 4 * 1024 * 1024
 
@@ -23,10 +26,11 @@ def require_active_local_cuda() -> None:
     """Load and capability-probe the CUDA handler before tracing a plan."""
     if jax.default_backend() != "gpu":
         raise ValueError("local active cuBLAS GEMM requires a CUDA backend")
-    usable, reason = probe_target(_TARGET, "CUDA")
-    if not usable:
-        raise RuntimeError(
-            "local active cuBLAS GEMM is unavailable: " + reason)
+    for target in (_TARGET, _OUT_TARGET):
+        usable, reason = probe_target(target, "CUDA")
+        if not usable:
+            raise RuntimeError(
+                "local active cuBLAS GEMM is unavailable: " + reason)
 
 
 def require_prepared_active_local_cuda() -> None:
@@ -78,6 +82,31 @@ def _native(a, b, bounds, c, *, alpha, beta):
     return result
 
 
+def _native_out(a, b, bounds, *, alpha):
+    """``alpha·A[:, :, lo:hi] @ B[:, lo:hi]`` per row into a fresh output (beta = 0)."""
+    output = jax.ShapeDtypeStruct((a.shape[0], a.shape[1], b.shape[2]), a.dtype)
+    workspace = jax.ShapeDtypeStruct((_WORKSPACE_BYTES,), jnp.uint8)
+    call = jax.ffi.ffi_call(
+        _OUT_TARGET,
+        (output, workspace),
+        input_layouts=[(0, 1, 2), (0, 1, 2), (0, 1)],
+        output_layouts=[(0, 1, 2), (0,)],
+        vmap_method="sequential",
+    )
+    result, _ = call(
+        a,
+        b,
+        bounds,
+        nq=a.shape[0],
+        m=a.shape[1],
+        k=a.shape[2],
+        n=b.shape[2],
+        alpha_re=float(alpha.real),
+        alpha_im=float(alpha.imag),
+    )
+    return result
+
+
 def _prepared_native(a, b, c, *, active_bounds, alpha, beta):
     output = jax.ShapeDtypeStruct((a.shape[0], a.shape[1], b.shape[2]), a.dtype)
     workspace = jax.ShapeDtypeStruct((_WORKSPACE_BYTES,), jnp.uint8)
@@ -123,24 +152,27 @@ def active_local_cuda(a, b, bounds, weights, c=None, *, alpha, beta):
         raise ValueError("local active cuBLAS GEMM bounds must have shape (nq,2)")
     if weights.shape != (a.shape[0], a.shape[2]) or weights.dtype != a.dtype:
         raise ValueError("local active cuBLAS GEMM weights must match (nq,K) and operand dtype")
+    shape = (a.shape[0], a.shape[1], b.shape[2])
     if c is None:
         if beta != 0:
             raise ValueError("local active cuBLAS GEMM requires C when beta != 0")
-        c = jnp.zeros((a.shape[0], a.shape[1], b.shape[2]), dtype=a.dtype)
-    elif c.shape != (a.shape[0], a.shape[1], b.shape[2]) or c.dtype != a.dtype:
+    elif c.shape != shape or c.dtype != a.dtype:
         raise ValueError("local active cuBLAS GEMM C geometry or dtype mismatch")
 
     weighted_a = a * weights[:, None, :]
     lo, hi = bounds[:, 0], bounds[:, 1]
     valid = jnp.all((lo >= 0) & (lo <= hi) & (hi <= a.shape[2]))
     full = jnp.all((lo == 0) & (hi == a.shape[2]))
-    nan = lambda _: jnp.full(c.shape, jnp.nan, dtype=a.dtype)
+    nan = lambda _: jnp.full(shape, jnp.nan, dtype=a.dtype)
+    # No C: the `_out` handler writes every row itself (no zero-filled alias).
+    native = (lambda _: _native_out(weighted_a, b, bounds, alpha=alpha)) if c is None \
+        else (lambda _: _native(weighted_a, b, bounds, c, alpha=alpha, beta=beta))
 
     def valid_call(_):
         return jax.lax.cond(
             full,
             lambda _: _dense(a, b, weighted_a, c, alpha=alpha, beta=beta),
-            lambda _: _native(weighted_a, b, bounds, c, alpha=alpha, beta=beta),
+            native,
             operand=None,
         )
 
