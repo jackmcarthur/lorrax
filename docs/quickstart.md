@@ -14,7 +14,6 @@ preprocessing. It is read-only and GWJAX writes beside the deck, so copy it to
 a writable directory on a filesystem the compute nodes see:
 
 ```bash
-export LX_BASE_MODULE=lorrax_A
 export LORRAX_CHECKOUT=/path/to/lorrax       # the copy is outside the checkout
 QS=$(mktemp -d -p "$SCRATCH")
 mkdir -p "$QS/tests/regression"

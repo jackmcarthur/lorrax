@@ -29,10 +29,10 @@ drift, that both JAX and JAXLIB are checked, and that 0.7/0.8/0.10 refuse.
 `tests/test_require_jax09.py` provides positive and negative preflight arms.
 There is no unsupported-version escape hatch.
 
-On Perlmutter, launch from a data directory with both choices explicit:
+On Perlmutter, `lx` selects the `lorrax_A` module by default. Launch from a
+data directory with the checkout explicit:
 
 ```bash
-export LX_BASE_MODULE=lorrax_A
 export LORRAX_CHECKOUT=/absolute/path/to/checkout
 lx run -- env PYTHONPATH="$LORRAX_CHECKOUT/src${PYTHONPATH:+:$PYTHONPATH}" \
   python3 "$LORRAX_CHECKOUT/tools/require_jax09.py"
