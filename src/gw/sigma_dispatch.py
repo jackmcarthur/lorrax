@@ -1299,15 +1299,17 @@ def _compute_mpa_sigma(
             sigma_bands = wfns.slices.sigma
             head_enk = np.asarray(wfns.enk[:, sigma_bands])
             head_occ = np.asarray(wfns.occ[:, sigma_bands])
-            head_efermi = sigma_efermi_ry
         else:
             head_enk = np.asarray(iteration_head.sigma_energies_ry)
             head_occ = np.asarray(iteration_head.sigma_occupations)
-            head_efermi = float(iteration_head.efermi_ry)
+        # The head Sigma(omega) is added to the body on the body's omega grid,
+        # so it is measured from the body's reference (as ppm_pipeline's
+        # body_efermi_ry).  The SC head's census mu displaced the head poles by
+        # mu - E_F: +2.99 eV at CrI3 8x8 SC map 1, and map 0 != one-shot.
         head_diag = compute_complex_pole_head_sigma_diag(
             omega_grid_ry=np.asarray(config.omega_grid_ry),
             enk_ry=head_enk,
-            efermi_ry=head_efermi,
+            efermi_ry=sigma_efermi_ry,
             occupations=head_occ,
             poles_ry=head["Omega_p"], residues_ry=head["B_p"],
             cell_volume=float(meta.cell_volume), nk_tot=int(meta.nk_tot))
