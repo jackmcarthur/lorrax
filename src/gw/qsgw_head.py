@@ -1557,25 +1557,29 @@ def _head_wing_kernel_face(
         # Endpoint blocks ``[k, s, M_b, n]`` with the band tile on X (``_x``)
         # or on Y (``_y``).  A face's own band axis needs one gather; the
         # other band axis is its transpose partner's block, then a gather.
+        # The gather stacks a new leading tile axis and only the gathered
+        # block is reordered, so no layout preference reaches the resident
+        # face (a gather along its mu axis made XLA copy the whole face).
+        def _gathered(t, axis_name, order):
+            g = jax.lax.all_gather(t, axis_name, axis=0, tiled=False)
+            g = jnp.transpose(g, order)
+            return g.reshape(*g.shape[:2], -1, g.shape[-1])
+
         def _mun_y(a, start):
             t = jax.lax.dynamic_slice_in_dim(a, start, mu_block, axis=2)
-            return jax.lax.all_gather(t, ax_x, axis=2, tiled=True)
+            return _gathered(t, ax_x, (1, 2, 0, 3, 4))
 
         def _mun_x(a, start):
             t = jax.lax.dynamic_slice_in_dim(a, start, mu_block, axis=2)
-            t = to_transpose_partner(t, p_side)
-            return jax.lax.all_gather(t, ax_y, axis=2, tiled=True)
+            return _gathered(to_transpose_partner(t, p_side), ax_y, (1, 2, 0, 3, 4))
 
         def _nmu_x(a, start):
             t = jax.lax.dynamic_slice_in_dim(a, start, mu_block, axis=3)
-            t = jax.lax.all_gather(t, ax_y, axis=3, tiled=True)
-            return jnp.transpose(t, (0, 2, 3, 1))
+            return _gathered(t, ax_y, (1, 3, 0, 4, 2))
 
         def _nmu_y(a, start):
             t = jax.lax.dynamic_slice_in_dim(a, start, mu_block, axis=3)
-            t = to_transpose_partner(t, p_side)
-            t = jax.lax.all_gather(t, ax_x, axis=3, tiled=True)
-            return jnp.transpose(t, (0, 2, 3, 1))
+            return _gathered(to_transpose_partner(t, p_side), ax_x, (1, 3, 0, 4, 2))
 
         def _pass(bra, ket, band_x, band_y, contract, scatter_axis, sum_axis,
                   out_shape, dim):
