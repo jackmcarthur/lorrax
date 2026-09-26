@@ -791,6 +791,11 @@ def _get_chi_fractional_contour_kernel_face(
         if bank_carry:
             initial = carry[0]
 
+        # Direct nodes carry complex times: the antiunitary partner is the
+        # conjugate-face GEMM at every node, decided at trace time, so no
+        # Green build waits on a host-read predicate inside the node loop.
+        direct = pair_mode == "direct"
+
         def green_k(weight, t, ref, *, current=False, family_pair=None, halves=None):
             left, right, plan, right_plan = psi_mun, psi_nmu, k_unfold_plan, None
             sign = None
@@ -812,12 +817,14 @@ def _get_chi_fractional_contour_kernel_face(
                                 band_weight=jnp.conj(weight), layout=layout,
                                 gemm=g_plan, k_unfold_plan=plan,
                                 right_k_unfold_plan=right_plan,
-                                prepared_active_gemm=active_gemms[int(current)])
+                                prepared_active_gemm=active_gemms[int(current)],
+                                real_weights=False if direct else None)
             else:
                 g = jnp.conj(build_G_tau(left, right, enk_full, t, e_ref=ref,
                                          band_weight=weight, layout=layout,
                                          gemm=g_plan, k_unfold_plan=plan,
-                                         prepared_active_gemm=active_gemms[int(current)]))
+                                         prepared_active_gemm=active_gemms[int(current)],
+                                         real_weights=False if direct else None))
             if sign is not None:
                 g = g * sign[:, None, None, None, None]
             return jax.lax.with_sharding_constraint(g, G_shard)
