@@ -254,10 +254,9 @@ def test_meta_accepts_nval_at_and_below_nelec():
 # ---------------------------------------------------------------------------
 
 def _prov(nspinor_wfnfile, monkeypatch):
-    # The effective-env keys must be deterministic for the stamp algebra
-    # below; these are the two _zeta_fit_provenance reads through
+    # The effective-env key must be deterministic for the stamp algebra
+    # below; it is the one _zeta_fit_provenance read through
     # deprecated_env_record.
-    monkeypatch.delenv("LORRAX_ZETA_RIDGE", raising=False)
     monkeypatch.delenv("LORRAX_ZETA_RCOND", raising=False)
     from gw.gw_init import _zeta_fit_provenance
     cfg = NS(bispinor=False,

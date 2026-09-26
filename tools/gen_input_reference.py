@@ -56,7 +56,7 @@ KEYS: dict[str, tuple[str, str]] = {
     # ---- ISDF / zeta ----
     "centroids_file": ("ISDF / zeta", "Charge-channel ISDF centroid table written by centroid.kmeans_cli."),
     "centroids_file_current": ("ISDF / zeta", "Second centroid table (Gordon-current weight) for the bispinor transverse channels; empty = not set."),
-    "zeta_ridge": ("ISDF / zeta", "Opt-in Tikhonov ridge epsilon on the charge CCT (fraction of mean diagonal); 0 = bit-identical historical factor. Env LORRAX_ZETA_RIDGE."),
+    "zeta_ridge": ("ISDF / zeta", "Retired: a non-zero value refuses. The charge zeta solve is the rank-truncated pseudo-inverse; zeta_rcond sets its cut."),
     "charge_zeta_solve": ("ISDF / zeta", "Charge zeta conditioner: rank_truncate (default; rank-revealing eigh pseudo-inverse) or the historical cholesky."),
     "zeta_rcond": ("ISDF / zeta", "Rank-truncation cutoff relative to lambda_max (default 1e-8, low end of the recovery plateau). Env LORRAX_ZETA_RCOND."),
     "zeta_cutoff": ("ISDF / zeta", "Zeta-sphere G-cutoff (Ry) for per-q zeta_q_G writes; None = ecutwfc; must be >= bare_coulomb_cutoff."),

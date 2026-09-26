@@ -156,7 +156,7 @@ def test_refit_kernel_matches_the_producer_solve_path():
         ref = np.asarray(jax.device_get(jax.vmap(_logical_solve(
             "replicated_rank_truncate", _N))(L, jnp.asarray(Z)[None])))[0]
         _, refit_solve = vq_interp._refit_kernels(
-            1, 1, 1, _N, ("rank_truncate", _RCOND, 0.0))
+            1, 1, 1, _N, ("rank_truncate", _RCOND))
         got = np.asarray(jax.device_get(refit_solve(jnp.asarray(C),
                                                     jnp.asarray(Z))))
     assert np.linalg.norm(got - ref) / np.linalg.norm(ref) < 1e-10, (
@@ -172,27 +172,23 @@ def test_the_kernel_cache_keys_on_the_solve_not_only_the_shapes():
     from bse import vq_interp
 
     a = vq_interp._refit_kernels(
-        1, 1, 1, _N, ("rank_truncate", 1e-8, 0.0))
+        1, 1, 1, _N, ("rank_truncate", 1e-8))
     b = vq_interp._refit_kernels(
-        1, 1, 1, _N, ("rank_truncate", 1e-4, 0.0))
-    c = vq_interp._refit_kernels(
-        1, 1, 1, _N, ("cholesky", 1e-8, 0.0))
-    assert a[1] is not b[1] and a[1] is not c[1]
+        1, 1, 1, _N, ("rank_truncate", 1e-4))
+    assert a[1] is not b[1]
     assert vq_interp._refit_kernels(
-        1, 1, 1, _N, ("rank_truncate", 1e-8, 0.0))[1] is a[1]
+        1, 1, 1, _N, ("rank_truncate", 1e-8))[1] is a[1]
 
 
-def test_the_cholesky_arm_is_still_reachable_and_is_the_old_arithmetic():
-    """A deck that pinned ``charge_zeta_solve = cholesky`` gets a refit that
-    solves ITS system — the fix is "the producer's solve", not "always
-    rank-truncate"."""
+def test_the_retired_cholesky_solve_is_refused_by_name():
+    """``charge_zeta_solve = cholesky`` was retired on 2026-09-25."""
     pytest.importorskip("jax")
     from isdf.core import solve_zeta_charge_dense
 
     C, Z, _ = _rank_deficient_system()
-    got = np.asarray(solve_zeta_charge_dense(
-        C, Z, charge_zeta_solve="cholesky", zeta_rcond=_RCOND))
-    assert np.allclose(got, _prefix_solve(C, Z), rtol=1e-9, atol=0)
+    with pytest.raises(ValueError, match="'cholesky' is retired"):
+        solve_zeta_charge_dense(C, Z, charge_zeta_solve="cholesky",
+                                zeta_rcond=_RCOND)
 
 
 def test_a_transverse_family_is_refused_by_name():
@@ -211,18 +207,18 @@ def test_a_transverse_family_is_refused_by_name():
 
 def _prov(**over):
     p = {"charge_zeta_solve": "rank_truncate", "zeta_rcond": "1e-10",
-         "zeta_ridge": "0.0", "band_range_left": [0, 52],
+         "band_range_left": [0, 52],
          "band_range_right": [0, 52]}
     p.update(over)
     return p
 
 
-def test_the_solve_triple_comes_from_the_fit_provenance():
+def test_the_solve_pair_comes_from_the_fit_provenance():
     pytest.importorskip("jax")
     from bse import vq_interp
 
-    kind, rcond, ridge = vq_interp._zeta_solve_of(_prov(), "zeta_q.h5")
-    assert (kind, rcond, ridge) == ("rank_truncate", 1e-10, 0.0)
+    kind, rcond = vq_interp._zeta_solve_of(_prov(), "zeta_q.h5")
+    assert (kind, rcond) == ("rank_truncate", 1e-10)
     # the EFFECTIVE value: an env-overridden fit records the raw env string,
     # and it has to parse the same way (isdf.core.deprecated_env_record).
     assert vq_interp._zeta_solve_of(
@@ -232,6 +228,7 @@ def test_the_solve_triple_comes_from_the_fit_provenance():
 @pytest.mark.parametrize("bad", [
     {"charge_zeta_solve": "ridge"},          # a transverse family
     {"charge_zeta_solve": ""},               # absent
+    {"charge_zeta_solve": "cholesky"},       # retired 2026-09-25
 ])
 def test_a_solve_this_refit_cannot_reproduce_is_refused_by_name(bad):
     pytest.importorskip("jax")
