@@ -130,12 +130,11 @@ def test_minimax_rule_on_pair_sums_matches_the_band_sum(n_mesh):
     x_max = float(E[:, nv:].max() - E[:, :nv].min())
     omega = 0.45
     rule = solve_laplace_minimax_imag_interval(x_min, x_max, omega, target_error=1e-9)
-    rule0 = solve_laplace_minimax_imag_interval(x_min, x_max, 0.0, target_error=1e-9)
     omega_cell = abs(np.linalg.det(pw.LAT))
     scale = -chi_pair_sum_scale(cell_volume=omega_cell, n_r=int(np.prod(c["fft_grid"])))
     acc = None
     cond = np.arange(nb) >= nv
-    for t, a, a0 in zip(rule.tau, rule.alpha, np.interp(rule.tau, rule0.tau, rule0.alpha)):
+    for t, a in zip(rule.tau, rule.alpha):
         wc = np.where(cond, np.exp(-E * t), 0.0)
         wv = np.where(~cond, np.exp(E * t), 0.0)
         A = np.einsum("knap,kn,knbq->kpaqb", c["c"], wc, np.conj(c["c"]))
@@ -146,7 +145,7 @@ def test_minimax_rule_on_pair_sums_matches_the_band_sum(n_mesh):
                 M = int(X.shape[1])
                 acc = _put_stack(np.zeros((2, out.n, M, M), np.complex128), mesh,
                                  P(None, None, "x", "y"))
-            acc = accumulate_chi(acc, X, [a, 0.0], scale=scale, mesh=mesh)
+            acc = accumulate_chi(acc, X, [a, 0.0], scale=scale, mesh=mesh)   # sample 1 stays 0
     got = _gather(acc)[0, :, :out.width, :out.width]
     w = omega
     ref = (pw.band_sum_response(c["c"], E, np.flatnonzero(cond), np.flatnonzero(~cond), c["sph"],
@@ -236,6 +235,14 @@ def test_dyson_matches_explicit_inverses(n_mesh, linalg="local"):
     assert np.all(W[:, scr.sphere.width:, :] == 0) and np.all(W[:, :, scr.sphere.width:] == 0)
     red = pw.dense_dyson(scr.v, 2.0 * chi)                                   # pref 2
     assert cases.rel(W, red) > 1e-3
+    # the wedge-q chunk count comes from the budget: one when it fits, more when it does not
+    stack = 16 * scr.M ** 2 / scr.P
+    assert scr.plan_q_chunks(16, 8, budget_bytes=int(1e10)) == 1
+    tight = int(scr.fit_q_batch(8, budget_bytes=int(1e10)) * 0 + 41 * stack
+                + max(16 * 5 * scr.M ** 2, scr._fit_temp[(8, False, 1e-13, "loewner")]))
+    assert scr.plan_q_chunks(16, 8, budget_bytes=tight) == scr.sphere.n
+    with pytest.raises(ValueError, match="pw-screening-budget"):
+        scr.plan_q_chunks(16, 8, budget_bytes=1)
 
 
 # ---------------------------------------------------------------------------
@@ -303,6 +310,25 @@ def test_gamma_body_fold_and_head():
     assert cases.rel(Wc[ig, 1:w, 1:w], body[1:w, 1:w] - np.diag(vb)) <= TOL
 
 
+def test_gamma_head_slab():
+    """sys_dim = 2: the slab kernel's Γ cell (exact Wigner–Seitz cubature) through the same
+    fold; S = 0 gives the bare head, a screening S lowers it, and the Γ body has v(0) = 0."""
+    from gw.plane_wave_screening import SphereScreening
+    mesh = _mesh(4)
+    c = _chi_case(1)
+    scr = SphereScreening(mesh, sphere=c["rs"].irr, geometry=_geometry(), sys_dim=2, kgrid=(2, 2, 1))
+    ig, M = scr.gamma, scr.M
+    assert scr.v[ig, 0] == 0.0
+    W = _put_stack(np.zeros((1, scr.sphere.n, M, M), np.complex128), mesh, P(None, None, "x", "y"))
+    Y = _put_stack(np.zeros((1, 3, M), np.complex128), mesh, P(None, None, "x"))
+    Z = _put_stack(np.zeros((1, M, 3), np.complex128), mesh, P(None, "y", None))
+    vc0, w0, _ = scr.gamma_head(W, np.zeros((1, 3, 3)), Y, Z)
+    _, w1, _ = scr.gamma_head(W, -0.05 * np.diag([1.0, 1.0, 0.0])[None], Y, Z)
+    print(f"slab Γ: vc0 {vc0.real:.4f}, wcoul0(S=0) {w0[0].real:.4f}, wcoul0(S=-0.05 in-plane) "
+          f"{w1[0].real:.4f}")
+    assert abs(w0[0] - vc0) <= 1e-12 * abs(vc0) and 0.0 < w1[0].real < vc0.real
+
+
 # ---------------------------------------------------------------------------
 # the MPA hookup
 # ---------------------------------------------------------------------------
@@ -343,7 +369,7 @@ def test_pole_fit_tiles_equal_one_dense_fit(n_mesh):
     model = np.asarray(pade_fit.eval_mpa_model(jnp.asarray(np.moveaxis(got_O, 0, -1)),
                                                jnp.asarray(np.moveaxis(got_B, 0, -1)),
                                                jnp.asarray(z)[:, None, None, None]))
-    e_model = cases.rel(np.where(mask[None], model, 0), Wc)
+    e_model = cases.rel(np.where(mask[None], model, 0), np.where(mask[None], Wc, 0))
     print(f"MPA P{n_mesh}: tiles vs dense fit {e:.1e}; model vs samples {e_model:.1e}; max cond {float(cond):.2e}")
     assert e <= 1e-10 and e_model <= 1e-8
     assert np.all(got_O[:, ~(mask | wing)] == 0) and np.all(got_B[:, ~(mask | wing)] == 0)
@@ -352,7 +378,7 @@ def test_pole_fit_tiles_equal_one_dense_fit(n_mesh):
     red = np.asarray(pade_fit.eval_mpa_model(jnp.asarray(np.moveaxis(_gather(red_O), 0, -1)),
                                              jnp.asarray(np.moveaxis(_gather(red_B), 0, -1)),
                                              jnp.asarray(z)[:, None, None, None]))
-    assert cases.rel(np.where(mask[None], red, 0), Wc) > 1e-3
+    assert cases.rel(np.where(mask[None], red, 0), np.where(mask[None], Wc, 0)) > 1e-3
 
 
 # ---------------------------------------------------------------------------
