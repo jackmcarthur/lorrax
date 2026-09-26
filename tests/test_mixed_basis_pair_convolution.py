@@ -616,19 +616,20 @@ def _sigma_typed_ops(c, w):
     return PairOperand(gs, g_tr), PairOperand(ws, w_tr)
 
 
-def _sigma_symmetry_check(mesh, c, w, backend, *, wedge_rows=None, twins=()):
+def _sigma_symmetry_check(mesh, c, w, backend, *, wedge_rows=None, twins=(), ref=None):
     """Σ from typed parents (G at the k-parents, W at the q-IBZ) against the dense reference on
-    full-grid children; with ``wedge_rows`` also the r'-wedge against the dense-column plan."""
+    full-grid children (``ref``: that reference, computed here when None; returned as ``r['ref_arr']``);
+    with ``wedge_rows`` also the r'-wedge against the dense-column plan."""
     from gw.mixed_basis_pair_convolution import (ColumnWedge, PairOperand, SphereSet,
                                                 SphereTransport)
     assert c["leak"] <= 1e-13 and w["wleak"] <= 1e-13, (c["leak"], w["wleak"])
-    cw = dict(c, G=c["A"], W=w["W"], wsp=w["wsp"], wngk=w["wngk"], wfrac=w["wfrac"])
-    ref = _sigma_ref(cw)
+    if ref is None:
+        ref = _sigma_ref(dict(c, G=c["A"], W=w["W"], wsp=w["wsp"], wngk=w["wngk"], wfrac=w["wfrac"]))
     g_op, w_op = _sigma_typed_ops(c, w)
     kw = dict(backend=backend, budget_bytes=int(1e10))
     args = (mesh, c["kgrid"], c["fft_grid"])
     dense = _run_sigma(_sigma_conv(*args, g_op, w_op, c["out"], **kw), c["A_par"], w["W_par"])
-    r = dict(parent=cases.rel(dense, ref), anti=bool(np.any(w_op.transport.anti)), red={})
+    r = dict(parent=cases.rel(dense, ref), anti=bool(np.any(w_op.transport.anti)), red={}, ref_arr=ref)
     # W's own unfold (the conj rule) against the r-space children, on the tiles
     r["w_tile"] = cases.rel(cases.unfold_tile(w_op.transport, w["W_par"][:, :, 0, :, 0]),
                             w["W"][:, :, 0, :, 0])
