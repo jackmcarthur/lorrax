@@ -98,6 +98,9 @@ def link_symmetry_reduction_applies(sym, kgrid) -> bool:
 
 
 __all__ = [
+    "collapsed_axis_position_operators",
+    "complete_parallel_transport",
+    "publish_dft_velocity",
     "CONNECTION_CART_DATASET",
     "CONNECTION_REDUCED_DATASET",
     "ENERGIES_DATASET",
@@ -1894,3 +1897,189 @@ def write_velocity_validation(
             if name in metrics:
                 io.write_attr(
                     f"velocity_validation_{name}", np.float64(metrics[name]))
+
+
+def collapsed_axis_position_operators(
+    psi_G, *, wfn, sym, geom, gtab_file, emit=print):
+    """``Z_a = <m| b_a . r |n>`` on the full BZ for every collapsed k axis.
+
+    One sweep per collapsed axis on the resident file-wedge ``psi_G`` (the
+    velocity's own sweep machinery) carries two operators: the position
+    sawtooth :func:`common.mtxel_sweep.collapsed_position_operator`, with
+    its branch cut at the centre of the largest vacuum gap
+    (:func:`common.parallel_transport.collapsed_axis_vacuum_gap`), and the
+    window :func:`common.mtxel_sweep.axis_window_operator` over the middle
+    ``COLLAPSED_CUT_PROBE_GAP_FRACTION`` of that gap, whose diagonal is each
+    band's density at the cut.  The occupied bands' share there is printed
+    and refused above ``COLLAPSED_CUT_DENSITY_MAX``
+    (``GATE pt_collapsed_axis_cut_density``): a cut through the density
+    makes ``Z`` wrong by ``2 pi`` times that share.
+
+    The file-wedge Cartesian vector ``sum_a Z_a b_a-hat`` is unfolded ONCE
+    with the polar unfold at ``time_odd=False`` (r is time-even; a mirror
+    through the slab flips ``b_a`` and with it ``Z_a``; a wire's C4 mixes
+    its two collapsed axes, which an axis-by-axis unfold would drop), then
+    each axis is projected back on its ``b_a-hat`` and Hermitised.  Returns
+    ``(Z (nk_full, 3, nb_pad, nb_pad), zero on stencil axes; centres (3,)
+    with NaN on stencil axes)``.
+    """
+    import common.timing as timing
+    from common.mtxel_sweep import (axis_window_operator,
+                                    collapsed_position_operator,
+                                    sweep_matrix_elements)
+    from symmetry_maps import unfold_file_wedge_polar_matrix
+    from common.parallel_transport import (
+        COLLAPSED_CUT_DENSITY_MAX, COLLAPSED_CUT_PROBE_GAP_FRACTION,
+        collapsed_axes, collapsed_axis_vacuum_gap)
+
+    axes = list(collapsed_axes(wfn.kgrid))
+    nb = int(geom.nb_logical)
+    B = np.asarray(wfn.bvec, dtype=np.float64) * float(wfn.blat)
+    occ = np.asarray(wfn.occs)
+    occ = (occ[0] if occ.ndim == 3 else occ)[:, :nb]
+    centers = np.full(3, np.nan, dtype=np.float64)
+    bhat = {a: jnp.asarray(B[a] / np.linalg.norm(B[a])) for a in axes}
+    Z_vec_file = None
+    for axis in axes:
+        cut, gap = collapsed_axis_vacuum_gap(wfn.atom_crys, axis)
+        center = float(np.mod(cut + 0.5, 1.0))
+        centers[axis] = center
+        probe = COLLAPSED_CUT_PROBE_GAP_FRACTION * gap
+        with timing.section("parallel_transport_position"):
+            Z_file, window = sweep_matrix_elements(
+                psi_G, operator=(
+                    collapsed_position_operator(
+                        geom, axis=axis, center=center),
+                    axis_window_operator(
+                        geom, axis=axis, center=cut, width=probe)),
+                geom=geom, gvecs=gtab_file.gvecs, gmask=gtab_file.mask,
+                box_index=wfn.box_index(k="ibz"),
+                kvecs=np.asarray(gtab_file.kvecs))
+            at_cut = np.real(np.asarray(jax.device_get(
+                jnp.diagonal(window, axis1=-2, axis2=-1))))[:, :nb]
+        del window
+        occupied = float(np.sum(occ * at_cut) / max(np.sum(occ), 1e-30))
+        k_max, n_max = np.unravel_index(int(np.argmax(at_cut)), at_cut.shape)
+        emit(f"Collapsed k axis {'xyz'[axis]}: position operator "
+             f"Z = <m| b . r |n>; largest vacuum gap {gap:.4f} of the cell, "
+             f"branch cut at f = {cut:.6f}; density in the middle "
+             f"{probe:.4f} of the cell around the cut: occupied bands "
+             f"{occupied:.3e} of their charge (refused above "
+             f"{COLLAPSED_CUT_DENSITY_MAX:.1e}), any window band max "
+             f"{float(at_cut[k_max, n_max]):.3e} (band {int(n_max) + 1}, "
+             f"IBZ k {int(k_max) + 1}); max|Z| = "
+             f"{float(jax.device_get(jnp.max(jnp.abs(Z_file)))):.4f}")
+        if not occupied <= COLLAPSED_CUT_DENSITY_MAX:
+            raise ValueError(
+                "GATE pt_collapsed_axis_cut_density: the branch cut of the "
+                f"collapsed-axis position operator along {'xyz'[axis]} sits "
+                f"at f = {cut:.6f} (centre of the largest vacuum gap, "
+                f"{gap:.4f} of the cell), and the occupied bands carry "
+                f"{occupied:.3e} of their charge within {probe / 2:.4f} of "
+                f"it (limit {COLLAPSED_CUT_DENSITY_MAX:.1e}).  The position "
+                "operator is wrong by 2 pi times that share.  Fix: more "
+                "vacuum along this axis.")
+        term = Z_file[:, None, :, :] * bhat[axis][None, :, None, None]
+        Z_vec_file = term if Z_vec_file is None else Z_vec_file + term
+    if Z_vec_file is None:
+        raise ValueError(
+            f"kgrid {tuple(int(n) for n in wfn.kgrid)} has no collapsed axis")
+    Z_vec = unfold_file_wedge_polar_matrix(sym, Z_vec_file, time_odd=False)
+    position = jnp.zeros_like(Z_vec)
+    for axis in axes:
+        Z_full = jnp.einsum("j,kjmn->kmn", bhat[axis], Z_vec, optimize=True)
+        Z_full = 0.5 * (Z_full + jnp.swapaxes(jnp.conj(Z_full), -1, -2))
+        position = position.at[:, axis].set(Z_full)
+    return position, centers
+
+
+def publish_dft_velocity(path, velocity_kmajor, psi_G, *, wfn, sym, geom,
+                         gtab_file, mesh, nbands, effective_nspinor, bispinor,
+                         hubbard_provenance, wfn_path, vnl_velocity_sign,
+                         vnl_included, rcond, emit=print) -> None:
+    """The artifact's velocity stage, from the producer's live sweep.
+
+    The exact DFT velocity ``v = p + i[r, V_NL]`` stays sharded and is
+    direction-major'd only inside the SlabIO writer
+    (:func:`initialize_parallel_transport_artifact`).  A collapsed k axis (a
+    slab normal, a wire's transverse pair) has no k stencil and none is
+    fabricated: its connection is the position band matrix
+    ``Z_a = <m| b_a . r |n>`` (:func:`collapsed_axis_position_operators`),
+    swept on the same resident file-wedge ``psi_G``.
+    """
+    import common.timing as timing
+    from common.parallel_transport import wfn_fingerprint
+
+    position = centers = None
+    if collapsed_axes(wfn.kgrid):
+        position, centers = collapsed_axis_position_operators(
+            psi_G, wfn=wfn, sym=sym, geom=geom, gtab_file=gtab_file,
+            emit=emit)
+    with timing.section("parallel_transport_velocity"):
+        initialize_parallel_transport_artifact(
+            path, wfn=wfn, sym=sym, mesh=mesh, nbands=nbands,
+            effective_nspinor=effective_nspinor, bispinor=bispinor,
+            velocity_dft_kmajor=velocity_kmajor,
+            hubbard_provenance=hubbard_provenance, wfn_path=wfn_path,
+            wfn_fingerprint=wfn_fingerprint(wfn),
+            vnl_velocity_sign=vnl_velocity_sign, vnl_included=vnl_included,
+            rcond=rcond, collapsed_position_kmajor=position,
+            collapsed_axis_centers=centers)
+
+
+def complete_parallel_transport(path, *, wfn, sym, mesh, nbands, bispinor,
+                                rcond, velocity_only, w_av_first_neighbors,
+                                w_av_second_neighbors, atol, rtol,
+                                report) -> None:
+    """The links, the fourth-order connection and the velocity-identity gate.
+
+    ``velocity_only`` stops after the velocity stage: the link stream, the
+    connection and the validation are skipped, which is what the
+    ``sc_head_update = dft_velocity`` consumer
+    (``gw.qsgw_head.load_dft_velocity_head``) reads, on decks whose mesh
+    cannot support the link stencil (a collapsed or undersampled axis).
+    Otherwise the reconstructed covariant velocity must match the exact one
+    within ``atol``/``rtol`` or the artifact refuses; the per-axis receipt
+    goes to ``report``.
+    """
+    import common.timing as timing
+
+    if velocity_only:
+        print("  DFT velocity-only parallel-transport artifact: no "
+              "links, no connection, no validation (--parallel-transport"
+              "-velocity-only).")
+        print(f"\nWrote DFT-velocity-only parallel-transport data to {path}")
+        return
+    with timing.section("parallel_transport_links"):
+        write_parallel_transport_artifact(
+            path, wfn=wfn, sym=sym, mesh=mesh, nbands=nbands,
+            bispinor=bispinor, rcond=rcond,
+            w_av_first_neighbors=w_av_first_neighbors,
+            w_av_second_neighbors=w_av_second_neighbors)
+    with timing.section("parallel_transport_validation"):
+        metrics = validate_parallel_transport_artifact(
+            path, mesh=mesh, kgrid=wfn.kgrid, nbands=nbands,
+            bvec_cart=np.asarray(wfn.bvec) * float(wfn.blat),
+            atol=atol, rtol=rtol)
+    print("  DFT covariant-velocity validation: PASS "
+          f"max_abs={metrics['max_abs']:.6e}, "
+          f"max_rel={metrics['max_rel']:.6e}")
+    print(f"\nWrote parallel-transport data to {path}")
+    report.heading("Parallel-transport validation")
+    report.emit("Covariant DFT velocity: PASS; "
+                f"max abs={float(metrics['max_abs']):.5e}; "
+                f"max rel={float(metrics['max_rel']):.5e}")
+    rule = {0: "position", 2: "order-2", 4: "order-4"}
+    report.emit(
+        "Per axis (rule, max|dv| of max|v|, head S_aa "
+        "reconstructed/exact): " + ", ".join(
+            f"{a}={rule[int(o)]} {e:.3e} of {x:.3e}, {r:.4f}"
+            for a, o, e, x, r in zip(
+                "xyz", metrics["stencil_orders"],
+                metrics["max_abs_by_axis"],
+                metrics["exact_max_abs_by_axis"],
+                metrics["head_response_ratio_by_axis"]))
+        + "; head response rel="
+        f"{float(metrics['head_response_relative_frobenius']):.3e}, "
+        "transition overlap="
+        f"{float(metrics['transition_overlap_real']):.6f}")
