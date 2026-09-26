@@ -701,7 +701,6 @@ def construct_cross_sector_round(sectors, samples, moments, meta, config, *,
     from jax.sharding import NamedSharding,PartitionSpec as P
     from gw.gw_config import linalg_resolution
     from gw.shared_pole_capacity import ConstructorCapacity
-    from gw.shared_pole_local import _batch_put
     from gw.shared_pole_recipe import shared_real_pole_gates_ordered_v1 as gates
 
     from gw.shared_pole_execution import is_face
@@ -721,18 +720,23 @@ def construct_cross_sector_round(sectors, samples, moments, meta, config, *,
     # Cross assembly has rectangular original pencils; only the projected
     # retained pair is square. Keep those two extents distinct in the ledger.
     original_sides = tuple(s['coefficients'].shape[-2] for s in sectors)
-    # The compacted span is the round's largest retained count on the extent
-    # ladder.  A wider historical span is optional but the second cross
-    # capacity admission includes actions that do not exist yet at this
-    # point, so only this round's admitted span is used.
-    from runtime.padding import ladder_extent
-    widths = [min(s['signed'][2].shape[-1],
-                  ladder_extent(int(jnp.max(jnp.sum(s['signed'][2],axis=-1)))))
-              for s in sectors]
-    if execution == 'face':
+    # The compacted span of each sector: its held width in an SC run
+    # (cross_span_widths), this round's own when the held one does not fit.
+    def carrier(widths):
+        if execution != 'face':
+            return list(widths)
         from runtime.padding import padded_axis
-        widths = [padded_axis(width,mesh_xy,name='shared_pole_port',
+        return [padded_axis(width,mesh_xy,name='shared_pole_port',
             specs=((P('x','y'),0),(P('x','y'),1))).carrier for width in widths]
+
+    def fits(widths):
+        try:
+            return budget.preview(sum(widths),phase='cross_reduction',
+                cross_original_sides=original_sides)['device_budget_status']=='PASS'
+        except (ValueError,MemoryError,RuntimeError):
+            return False
+    live,held=(carrier(w) for w in cross_span_widths(meta,sectors))
+    widths=held if held==live or fits(held) else live
     side = sum(widths)
     budget.plan(side,phase='cross_reduction',cross_original_sides=original_sides)
     actions=[]
@@ -741,26 +745,17 @@ def construct_cross_sector_round(sectors, samples, moments, meta, config, *,
         actions.append(cross_round_actions(panels,source['states'],source['roles'],
             source['recipe'],sample_ids=sample_ids,mesh_xy=mesh_xy,line_cross=stored))
 
-    spec=P(('x','y'))
-    packed=[]
-    for sector,width in zip(sectors,widths):
-        # Drop only exactly inactive carrier columns. This is a storage
-        # compaction of the retained span, not a second physical rank cut.
-        if execution=='face':
-            from gw.shared_pole_execution import compact_program
-            compact=compact_program(mesh_xy,width)
-        else:
-            compact=_local_compact_program(mesh_xy,width)
-        y,signed=compact(sector['coefficients'],sector['signed'])
-        # Host role coordinates/order are replicated metadata, not matrices.
-        put=(lambda a:jax.make_array_from_callback(a.shape,NamedSharding(mesh_xy,P()),
-                                                   lambda index:a[index])) if execution=='face' else (lambda a:_batch_put(mesh_xy,a))
-        packed.append((put(sector['tables']['points']),
-            put(sector['tables']['order']),
-            (tuple(s[1] for s in sector['states']),tuple(s[2] for s in sector['states'])),
-            sector['infinity'],y,signed))
+    base_panels=budget.retained_panels
+    packed=_pack_cross_spans(sectors,widths,mesh_xy=mesh_xy,execution=execution)
+    budget.retained_panels=(*base_panels,*jax.tree.leaves((actions,packed)))
+    if widths!=live and not fits(widths):
+        # The held span fits the reduction but not with this round's actions.
+        budget.retained_panels=base_panels
+        del packed
+        widths=live
+        packed=_pack_cross_spans(sectors,widths,mesh_xy=mesh_xy,execution=execution)
+        budget.retained_panels=(*base_panels,*jax.tree.leaves((actions,packed)))
     side=sum(s[4].shape[-1] for s in packed)
-    budget.retained_panels=(*budget.retained_panels,*jax.tree.leaves((actions,packed)))
     budget.plan(side,phase='cross_reduction',cross_original_sides=original_sides)
     cross_eigh=budget.eigenplan(side)
     signed,diagnostics=reduce_cross_round(*packed,tuple(actions),
@@ -779,6 +774,70 @@ def construct_cross_sector_round(sectors, samples, moments, meta, config, *,
     return dict(models=models,signed=signed,
                 diagnostics=jax.tree.map(lambda a:device_put_process_local(a,replicated),diagnostics),
                 zero=jax.tree.map(lambda a:device_put_process_local(a,replicated),zero),budget=budget)
+
+
+def cross_span_widths(meta, sectors):
+    """The CT round's compacted span width of CC and TT: ``(live, held)``.
+
+    ``live`` is each sector's largest retained rank in the round on the extent
+    ladder (``runtime.padding.ladder_extent``), at most its signed carrier.
+    Ranks drift across a ladder step between rounds and SC maps (Fe 4^3
+    bispinor CC 1152 <-> 1280, TT 1408 <-> 1536), and each step recompiled
+    the cross reduction (2 x 11.2 s at map 2). An SC map past map 0 binds
+    ``meta.shared_pole_rank_capacity`` (a dict the quadrature session keeps):
+    ``held`` is then the largest live width of any earlier round or map, grown
+    only when a live width exceeds it, with the growth noted in
+    ``held["_events"]`` for the SC log; it never shrinks. The extra columns
+    are inactive retained columns, exact zeros in Y and c: the joint pencil
+    gives them zero metric and the zero-row-safe eigensolver keeps them out of
+    the spectrum. No binding (one-shot, map 0): ``held`` is ``live``.
+    """
+    from runtime.padding import ladder_extent
+    live=[];held=[]
+    capacity=getattr(meta,'shared_pole_rank_capacity',None)
+    for name,sector in zip(('CC','TT'),sectors):
+        active=sector['signed'][2]
+        cap=int(active.shape[-1])
+        rank=int(jnp.max(jnp.sum(active,axis=-1)))
+        width=min(cap,ladder_extent(rank))
+        live.append(width)
+        if capacity is None:
+            held.append(width)
+            continue
+        before=int(capacity.get(name,0))
+        if width>before:
+            if before:
+                capacity.setdefault('_events',[]).append(
+                    f"shared-pole CT span ({name}): retained rank {rank} exceeds the "
+                    f"held width {before}; grown to {width}")
+            capacity[name]=width
+        held.append(min(cap,int(capacity[name])))
+    return live,held
+
+
+def _pack_cross_spans(sectors, widths, *, mesh_xy, execution):
+    """Each diagonal sector's CT operands with its retained span compacted to ``widths``."""
+    import jax
+    from jax.sharding import NamedSharding,PartitionSpec as P
+    from gw.shared_pole_local import _batch_put
+    packed=[]
+    for sector,width in zip(sectors,widths):
+        # Drop only exactly inactive carrier columns. This is a storage
+        # compaction of the retained span, not a second physical rank cut.
+        if execution=='face':
+            from gw.shared_pole_execution import compact_program
+            compact=compact_program(mesh_xy,width)
+        else:
+            compact=_local_compact_program(mesh_xy,width)
+        y,signed=compact(sector['coefficients'],sector['signed'])
+        # Host role coordinates/order are replicated metadata, not matrices.
+        put=(lambda a:jax.make_array_from_callback(a.shape,NamedSharding(mesh_xy,P()),
+                                                   lambda index:a[index])) if execution=='face' else (lambda a:_batch_put(mesh_xy,a))
+        packed.append((put(sector['tables']['points']),
+            put(sector['tables']['order']),
+            (tuple(s[1] for s in sector['states']),tuple(s[2] for s in sector['states'])),
+            sector['infinity'],y,signed))
+    return packed
 
 
 @lru_cache(maxsize=None)
