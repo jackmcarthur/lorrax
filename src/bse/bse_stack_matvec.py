@@ -199,7 +199,7 @@ def _scatter_trial_block(WX, mesh_xy):
 # 2026-08-08, the 'x' pair per trial.)
 #
 #   gspmd   AUDIT ROUTE, default OFF.  Build the W term with NO ``shard_map``:
-#           the same einsum chain and the same ``lax.scan`` over trials, but
+#           the 2026-08-08 einsum chain (k-minor T) and the same ``lax.scan``, but
 #           expressed on GLOBAL arrays with ``with_sharding_constraint`` hints
 #           at each of the four points where the manual body issues a
 #           collective, letting XLA's SPMD partitioner choose the collective.
@@ -486,8 +486,9 @@ def build_bse_stack_matvec(
         return _scatter_trial_block(WX, mesh_xy)
 
     # ── W term, GSPMD twin: same math, same scan, NO shard_map ────────────────
-    # Audit route (``LORRAX_BSE_MATVEC_OPT=gspmd``).  Line-for-line the same
-    # chain as ``_w_stack`` above, but on GLOBAL arrays.  Each of the four
+    # Audit route (``LORRAX_BSE_MATVEC_OPT=gspmd``).  The 2026-08-08 chain of
+    # ``_w_stack`` (k-minor T, the k-minor conv door), on GLOBAL arrays; the
+    # manual body has since moved T to k-leading (no T-sized transposes).  Each of the four
     # ``with_sharding_constraint`` calls below sits at exactly the point where
     # the manual body issues a collective, and requests the SAME data layout the
     # manual collective produces -- so if the partitioner is any good it should
