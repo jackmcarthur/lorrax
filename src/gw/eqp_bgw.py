@@ -288,12 +288,18 @@ def verify_eqp_file(
 # Numerics: eqp0 / eqp1 from per-state Σ on a global ω-grid
 # ---------------------------------------------------------------------------
 
+#: BerkeleyGW's ``finite_difference_spacing`` default, in eV: the Z stencil
+#: reads Sigma at E +/- this.  The SC window hold reads the same value
+#: (``scissor.sc_read_halfwidth_ev``).
+Z_FINITE_DIFFERENCE_EV = 0.5
+
+
 def compute_z_factor_from_omega_grid(
 	*,
 	sigma_c_omega_diag_ev: np.ndarray,  # (n_omega, nk, nb)
 	omega_rel_ev: np.ndarray,           # (n_omega,)  — ω axis relative to E_F
 	e_dft_rel_ev: np.ndarray,           # (nk, nb)    — the CENTRE, E - E_F
-	dE_ev: float = 0.5,
+	dE_ev: float = Z_FINITE_DIFFERENCE_EV,
 ) -> tuple[np.ndarray, np.ndarray]:
 	"""Interpolate Σ_c at a centre energy and central-difference
 	Z = 1 / (1 − dRe[Σ_c]/dω) there.
@@ -583,7 +589,7 @@ def assemble_eqp(
 	# ω-relative eV of the SAME energies; both or neither.
 	e_eval_ev: np.ndarray | None = None,                   # (nk, nb)
 	e_eval_rel_ev: np.ndarray | None = None,               # (nk, nb)
-	dE_ev: float = 0.5,
+	dE_ev: float = Z_FINITE_DIFFERENCE_EV,
 	nspin: int = 1,
 	hartree_scalar_diag_ev: np.ndarray | None = None,
 	hartree_transverse_diag_ev: np.ndarray | None = None,

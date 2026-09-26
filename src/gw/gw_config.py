@@ -1671,8 +1671,10 @@ _DEFAULTS = {
     # insulating branch has no weight and is untouched.
     "occupation_window_threshold": 0.995,
     # Sigma frequency grid
-    "sigma_omega_min_ev": -5.0,
-    "sigma_omega_max_ev": 5.0,
+    # None (unset): the grid comes from the protected Sigma band range under
+    # the SC window plan; a value is a minimum extent honoured every map.
+    "sigma_omega_min_ev": None,
+    "sigma_omega_max_ev": None,
     "sigma_omega_step_ev": 0.25,
     # "" = the contiguous [min, max] grid.  "lo:hi, lo:hi" (eV) = a union
     # of uniform patches at sigma_omega_step_ev — the semicore dynamic-
@@ -2551,8 +2553,10 @@ def _input_response(
         fit_reuse_file=(str(params["mpa_fit_reuse_file"]) or None),
     )
     sigma = DynamicSigmaConfig(
-        omega_min_ev=float(params["sigma_omega_min_ev"]),
-        omega_max_ev=float(params["sigma_omega_max_ev"]),
+        omega_min_ev=(None if params["sigma_omega_min_ev"] is None
+                      else float(params["sigma_omega_min_ev"])),
+        omega_max_ev=(None if params["sigma_omega_max_ev"] is None
+                      else float(params["sigma_omega_max_ev"])),
         omega_step_ev=float(params["sigma_omega_step_ev"]),
         regularization_ev=float(params["sigma_regularization_ev"]),
         out_of_grid=str(params["sigma_out_of_grid"]).strip().lower(),
@@ -3954,11 +3958,28 @@ class ScreeningConfig:
                 f"docs/input_reference.md '## Screening'.")
 
 
+def sigma_requested_edges_ev(sigma):
+    """Requested Sigma grid edges (eV); an unset edge is the sample next to E_F."""
+    step = float(sigma.omega_step_ev)
+    lo, hi = getattr(sigma, "omega_min_ev", None), getattr(sigma, "omega_max_ev", None)
+    return (-step if lo is None else float(lo), step if hi is None else float(hi))
+
+
+def sigma_classification_window_ev(sigma):
+    """The requested window (eV) band classification reads; unset is unbounded."""
+    lo, hi = getattr(sigma, "omega_min_ev", None), getattr(sigma, "omega_max_ev", None)
+    return (-np.inf if lo is None else float(lo), np.inf if hi is None else float(hi))
+
+
 @dataclass(frozen=True)
 class DynamicSigmaConfig:
     """Ansatz-neutral real-frequency Sigma grid and output policy."""
-    omega_min_ev: float
-    omega_max_ev: float
+    #: Requested Sigma grid edges in eV about the Sigma frame's E_F, or None
+    #: (unset): then the grid is the protected band range grown by the
+    #: one-shot rule and the SC window plan (``scissor.SC_WINDOW_PAD_EV``),
+    #: and a set edge is a minimum extent honoured on every map.
+    omega_min_ev: float | None
+    omega_max_ev: float | None
     omega_step_ev: float
     regularization_ev: float
     window_edge_factor: float
@@ -4020,8 +4041,16 @@ class DynamicSigmaConfig:
     def __post_init__(self):
         if self.omega_step_ev <= 0.0:
             raise ValueError("sigma_omega_step_ev must be > 0.")
-        if self.omega_max_ev < self.omega_min_ev:
+        lo, hi = self.requested_edges_ev()
+        if hi < lo:
             raise ValueError("sigma_omega_max_ev must be >= sigma_omega_min_ev.")
+        if ((self.omega_min_ev is None or self.omega_max_ev is None)
+                and self.out_of_grid != "cover"):
+            raise ValueError(
+                "An unset sigma_omega_min_ev / sigma_omega_max_ev derives the "
+                "Sigma grid from the protected band range, which needs "
+                f"sigma_out_of_grid = cover (got {self.out_of_grid!r}); set both "
+                "edges for clamp or static.")
         if self.out_of_grid not in ("cover", "clamp", "static"):
             raise ValueError(
                 "sigma_out_of_grid must be 'cover', 'clamp' or 'static'; got "
@@ -4065,6 +4094,14 @@ class DynamicSigmaConfig:
                 "but use_band_extrapolation = false, so no bracket planner "
                 "would consume it.  Remove the scheme key or enable band "
                 "extrapolation.")
+
+    def requested_edges_ev(self):
+        """The requested grid edges; an unset edge is the sample next to E_F."""
+        return sigma_requested_edges_ev(self)
+
+    def classification_window_ev(self):
+        """The requested window for band classification; unset is unbounded."""
+        return sigma_classification_window_ev(self)
 
     def parsed_omega_patches_ev(self):
         """The validated ``[(lo, hi), ...]`` patch list, or ``[]``; see docs/architecture/decisions.md."""
@@ -4847,11 +4884,9 @@ class LorraxConfig:
         p = self.sigma
         patches = p.parsed_omega_patches_ev()
         if not patches:
-            n = int(np.floor(
-                (p.omega_max_ev - p.omega_min_ev) / p.omega_step_ev
-                + 0.5)) + 1
-            grid = (p.omega_min_ev
-                    + p.omega_step_ev * np.arange(n, dtype=np.float64))
+            lo, hi = sigma_requested_edges_ev(p)
+            n = int(np.floor((hi - lo) / p.omega_step_ev + 0.5)) + 1
+            grid = lo + p.omega_step_ev * np.arange(n, dtype=np.float64)
         else:
             pieces = []
             for lo, hi in patches:
