@@ -7,6 +7,7 @@ import pytest
 from common.units import RYD_TO_EV
 from gw.shared_pole_recipe import bind_shared_pole_census, resolve_shared_pole_recipe
 from gw.shared_pole_recipe import _sector_treatment_ceiling
+from gw.sigma_box_plan import _BUILD_GRID_STEP
 
 
 def inputs(gap=.7, *, eta=.25, tier="production", top=20.):
@@ -34,10 +35,13 @@ def resolve(args, session=None):
         support_session=session)
 
 
-# An interacting map's envelope sits on the 1e-4 snap grid (99253307a); an
-# independent resolution uses the raw interval, so their frequencies agree to
-# one grid step and their structure exactly.
-SNAP_RTOL = 1.0e-4
+# An interacting map's envelope is snapped outward onto the Sigma build grid
+# (shared_pole_recipe._support_envelope, snap_outward, 99253307a); an
+# independent resolution uses the raw interval. A snap moves an endpoint by
+# less than one grid step, and the supports lie between the endpoints, so the
+# frequencies agree to one step (measured max 8.54e-5 over these four cells)
+# and the structure (roles, ids, pairs) exactly.
+SNAP_RTOL = _BUILD_GRID_STEP
 
 
 def assert_same_geometry(a, b, rtol=0.0):
