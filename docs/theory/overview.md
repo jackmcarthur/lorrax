@@ -38,7 +38,7 @@ costs; each arrow below has one owner.
 These pages state equations, conventions, validity domains, costs, and the few
 data layouts the equations force. Deck defaults belong to the
 [input reference](../input_reference.md), module ownership to the
-[codebase map](../architecture/codebase.md), and binding design rulings to
+[codebase map](../codebase.md), and binding design rulings to
 [design decisions](../architecture/decisions.md).
 
 Three principles recur:
