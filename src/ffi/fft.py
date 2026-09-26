@@ -168,6 +168,7 @@ __all__ = [
     "make_local_kfft_klead", "make_local_kfft_kminor", "make_local_kconv_kminor",
     "make_local_kconv_klead",
     "KCONV_KLEAD_OUTER_TARGET", "klead_outer_refusal", "make_local_kconv_klead_outer",
+    "KCONV_KLEAD_OUTER_DECODE_TARGET", "klead_outer_decode_refusal", "make_local_kconv_klead_outer_decode",
     "PLANE_FFT_GATHER_TARGET", "plane_fft_split", "plane_resident_bytes", "make_plane_fft_gather",
 ]
 
@@ -185,6 +186,9 @@ KCONV_KLEAD_TARGET = "lorrax_mathdx_kconv_klead"
 #: Mode 2 with its T formed on the load as a rank-K outer-product sum (the BSE W term's encode):
 #: :func:`make_local_kconv_klead_outer`, cpp/cufft/kconv_outer_cuda_ffi.cc.
 KCONV_KLEAD_OUTER_TARGET = "lorrax_mathdx_kconv_klead_outer"
+#: The same load with the BSE decode's (t, μ) contraction fused into the store (U never stored):
+#: :func:`make_local_kconv_klead_outer_decode`.
+KCONV_KLEAD_OUTER_DECODE_TARGET = "lorrax_mathdx_kconv_klead_outer_decode"
 #: Modes 7/8 on the parent rows, with the conj-on-load partner and (mode 7) the output spin block.
 KCONV_KLEAD_UNFOLD_TARGET = "lorrax_mathdx_kconv_klead_unfold_xblock"
 KCONV_KLEAD_LORENTZ_TARGET = "lorrax_mathdx_kconv_klead_lorentz_conj"
@@ -1332,6 +1336,100 @@ def make_local_kconv_klead_outer(mesh: Mesh, kgrid, *, norm: str | None = "ortho
         return apply(jnp.einsum("kaxK,kKby->kaxby", l, jnp.conj(r) if conj_r else r),
                      jnp.moveaxis(v_r, -1, 0))
     return _plan
+
+
+def klead_outer_decode_refusal(mesh: Mesh, kgrid, n_c: int, optin: int | None = None) -> str | None:
+    """``None`` when :func:`make_local_kconv_klead_outer_decode` serves this mesh, grid and band count.
+
+    CUDA needs :func:`klead_outer_refusal`'s conditions, the decode handler, the bank plus the staged
+    V tile, ``64·16·(RS + nk)`` B, within the opt-in shared memory, and the per-lane accumulator
+    ``ceil(nk/16)·ceil(n_c/8) <= 8`` m8n8 blocks (the handler's GATE mathdx-kconv-outer-decode-tile).
+    A cpu mesh is always served.  Callers that get a reason keep the outer conv + XLA decode.
+    """
+    why = klead_outer_refusal(mesh, kgrid, optin)
+    if why is not None or kconv_backend(mesh) != "mathdx":
+        return why
+    from ffi.common import ffi_loader
+    ok, why = ffi_loader.probe_target(KCONV_KLEAD_OUTER_DECODE_TARGET, "CUDA")
+    if not ok:
+        return f"no {KCONV_KLEAD_OUTER_DECODE_TARGET} handler ({why})"
+    kg = _check_kgrid(kgrid, "mathdx")
+    nk = kg[0] * kg[1] * kg[2]
+    have = _optin_smem_bytes() if optin is None else int(optin)
+    need = 64 * 16 * (((kg[0] * kg[1] * (kg[2] | 1)) | 1) + nk)
+    if have is None or need > have:
+        return f"the bank and the staged V tile need {need} B; the device has {have} B of opt-in shared memory"
+    blocks = -(-nk // 16) * -(-int(n_c) // 8)
+    if blocks > 8:
+        return f"the decode accumulator needs {blocks} m8n8 blocks per lane (nk {nk}, n_c {n_c}); the limit is 8"
+    return None
+
+
+def _outer_ksum_fma() -> int:
+    """``LORRAX_BSE_OUTER_KSUM`` (A/B, docs/dev/env_vars.md): ``dmma`` (default) runs the fused decode's
+    K sums on the fp64 tensor cores, ``fma`` on the fp64 FMA pipe (the same fragment contract; round-off
+    class), for comparing the two where their rates differ (H100, B200).  Anything else refuses."""
+    import os
+    v = os.environ.get("LORRAX_BSE_OUTER_KSUM", "dmma").strip().lower()
+    if v not in ("dmma", "fma"):
+        raise ValueError(f"LORRAX_BSE_OUTER_KSUM={v!r}: want 'dmma' (default) or 'fma'")
+    if v == "fma":
+        from ffi.gate import announce_once
+        announce_once(("bse", "outer_ksum", v), "[kconv_outer] decode K sums on the fp64 FMA pipe "
+                      "(LORRAX_BSE_OUTER_KSUM=fma; A/B only)")
+    return int(v == "fma")
+
+
+def make_local_kconv_klead_outer_decode(mesh: Mesh, kgrid, *, norm: str | None = "ortho") -> tuple:
+    """Rank-local ``(prep, apply)``: :func:`make_local_kconv_klead_outer` with the BSE decode's first
+    contraction fused into its store, so U never reaches HBM.
+
+    ``prep(Pc)`` tiles ``Pc`` (nk, n_c, a, mx) once per matvec (``ψ^X_c``); ``apply(L, R, V_R, Pc_t,
+    conj_r=False)`` returns ``A[k,c,b,y] = Σ_{a,x} conj(Pc[k,c,a,x]) U[k,a,x,b,y]`` (nk, n_c, b, my), with
+    ``U`` the outer conv of ``(L, R, V_R, conj_r)`` -- ``bse_stack_matvec._decode``'s (t, μ) contraction,
+    whose (s, ν) contraction stays the caller's einsum.  CUDA (``kconv_outer_cuda_ffi.cc``): one resident
+    block per SM; the (phase, item) tiles go round robin so a wave shares one x window in L2, and the
+    tile completing an item sums its partials in phase order (deterministic).  ``L`` and ``R`` are
+    tiled into fragment order per call (K zero-padded to a multiple of 4, μ and ν to 8).  cpu: the
+    outer conv's plan route and the einsum.
+    Check :func:`klead_outer_decode_refusal` first.
+    """
+    kg = _check_kgrid(kgrid, kconv_backend(mesh))
+    nk = kg[0] * kg[1] * kg[2]
+    if kconv_backend(mesh) != "mathdx":
+        outer = make_local_kconv_klead_outer(mesh, kg, norm=norm)
+
+        def _prep_cpu(pc):
+            return pc
+
+        def _apply_cpu(l, r, v_r, pc, conj_r=False):
+            return jnp.einsum("kctM,ktMsN->kcsN", jnp.conj(pc), outer(l, r, v_r, conj_r=conj_r))
+        return _prep_cpu, _apply_cpu
+    _require_target(KCONV_KLEAD_OUTER_TARGET, "CUDA")
+    _require_target(KCONV_KLEAD_OUTER_DECODE_TARGET, "CUDA")
+    scale = ffi_fft_scale("ifftn", norm, nk) * ffi_fft_scale("fftn", norm, nk)
+    attrs = dict(nkx=np.int64(kg[0]), nky=np.int64(kg[1]), nkz=np.int64(kg[2]), scale=np.float64(scale),
+                 ksum=np.int64(_outer_ksum_fma()))
+
+    def _prep(pc):                              # (nk, c, a, mx) -> (a, nxb, nk, MB, 2, 8, 4)
+        n_k, n_c, na, mx = pc.shape
+        mb, nxb = -(-n_c // 8), -(-mx // 8)
+        pc = jnp.pad(pc, ((0, 0), (0, 8 * mb - n_c), (0, 0), (0, 8 * nxb - mx)))
+        return pc.reshape(n_k, mb, 8, na, nxb, 2, 4).transpose(3, 4, 0, 1, 5, 2, 6), n_c
+
+    def _apply(l, r, v_r, pc_t, conj_r=False):
+        pcr, n_c = pc_t
+        n_k, na, mx, kr = l.shape
+        nb, my = r.shape[2], r.shape[3]
+        h, nxb, nyb = -(-kr // 4), -(-mx // 8), -(-my // 8)
+        # Lr (a, nxb, nk, H, 8, 4) = L[k, a, 8 xb + g, 4h + t]; Rr (b, nyb, nk, H, 8, 4) = R[k, 4h + t, b, 8 yb + g]
+        lr = jnp.pad(l, ((0, 0), (0, 0), (0, 8 * nxb - mx), (0, 4 * h - kr)))
+        lr = lr.reshape(n_k, na, nxb, 8, h, 4).transpose(1, 2, 0, 4, 3, 5)
+        rr = jnp.pad(r, ((0, 0), (0, 4 * h - kr), (0, 0), (0, 8 * nyb - my)))
+        rr = rr.reshape(n_k, h, 4, nb, nyb, 8).transpose(3, 4, 0, 1, 5, 2)
+        return jax.ffi.ffi_call(KCONV_KLEAD_OUTER_DECODE_TARGET, jax.ShapeDtypeStruct((n_k, n_c, nb, my), l.dtype))(
+            lr, rr, v_r, pcr, conj_r=np.int64(bool(conj_r)), **attrs, **_mathdx_common())
+    return _prep, _apply
 
 
 def _klead_locals(mesh, kg, norm, mult):
