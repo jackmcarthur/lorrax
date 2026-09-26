@@ -83,14 +83,11 @@ _KERNEL_CACHE: dict[tuple, Callable] = {}
 # with no effect on values.
 _HEAD_WING_FREQUENCY_BLOCK = 2
 
-# Bound the face-layout wing kernel's per-step psi gather (obstacle #3/#5 of
-# the low_mem_bands audit, report §"Full q->0 head/body wings").  psi_mun/
-# psi_nmu have NO replicated band axis (unlike legacy's psi_xn/psi_yn), so a
-# rank cannot read an arbitrary band window for free; instead it gathers the
-# FULL band extent for a small MU block at a time via one lax.all_gather per
-# block, keeping the transient (nk, ns, nb_full, mu_block)-shaped buffer
-# bounded independent of how many centroids this rank owns locally.  See
-# ``_head_wing_kernel_face``'s docstring for the full residency algebra.
+# Bound the face-layout wing kernel's per-step psi gather.  Each step gathers
+# this block of every rank's mu tile with the rank's own band tile, a
+# (nk, ns, block*sqrt(P), nb_full/sqrt(P)) buffer per endpoint, independent of
+# how many centroids a rank owns.  See ``_head_wing_kernel_face``'s docstring
+# for the residency algebra.
 _HEAD_WING_MU_BLOCK = 64
 # Width three is the incumbent Rydberg velocity.  Width eight has the same
 # energy-denominator contract: for a literal long-wave transition derivative
@@ -1409,7 +1406,7 @@ def _head_wing_kernel_face(
     classes: int = 0,
     anti: bool = False,
 ) -> Callable:
-    """Contract velocity and density vertices in bounded centroid and frequency tiles.
+    """Contract velocity and density vertices on the vertex's own pair tiles.
 
     ``classes = 0``: one k sum, outputs ``Y (n_omega, n_vertex, mu)`` and
     ``Z (n_omega, mu, n_vertex)``.  ``classes = C``: the k axis is the raw
@@ -1419,6 +1416,18 @@ def _head_wing_kernel_face(
     n_vertex, C, mu)`` and ``Z (n_omega, C, mu, n_vertex)``.  ``anti`` adds
     the antiunitary partner contraction, which reads the transposed pair
     weight: an antiunitary child's density is ``rho_ji`` of its parent.
+
+    Residency: the vertex stays ``v[a, k, i_X, j_Y]`` and the pair weight,
+    ``dE``, ``f`` and the masks are built on the same ``(i_X, j_Y)`` tile, so
+    every pair-indexed value is ``1/P``.  Per centroid block ``b`` (one
+    ``_HEAD_WING_MU_BLOCK`` slice of each rank's own mu tile), the endpoints
+    are gathered on the block only: ``psi[k, i_X, s, M_b]`` over Y from the
+    nmu face and ``psi[k, s, M_b, j_Y]`` over X from the mun face, ``M_b``
+    being block ``b`` of every mu tile (square mesh: the X and Y mu tiles
+    are one partition).  Each rank contracts its pair tile; ``Y`` is
+    reduce-scattered over X onto ``mu_X`` and summed over Y, ``Z`` the
+    mirror.  The antiunitary term reads the transposed tile, so it takes
+    the bra with bands on Y and the ket with bands on X (two more gathers).
     """
     key = ("head_wings_face", id(mesh), int(nb_logical), bool(include_surface),
            layout, int(classes), bool(anti))
@@ -1426,13 +1435,15 @@ def _head_wing_kernel_face(
     if hit is not None:
         return hit
     ax_x, ax_y = _mesh_xy(mesh)
+    if int(mesh.shape[ax_x]) != int(mesh.shape[ax_y]):
+        raise ValueError(
+            "head wing kernel: the pair-tile contraction needs one mu "
+            f"partition on X and Y, i.e. a square mesh; got "
+            f"{int(mesh.shape[ax_x])}x{int(mesh.shape[ax_y])} (repo "
+            "docs/architecture/decisions.md 2026-08-01: square meshes only).")
     from common.wfn_layout import psi_specs
     nmu_spec, mun_spec = psi_specs(layout)
-    gather_mun = lambda value: value
-    gather_nmu = lambda value: value
-    if layout == "face":
-        gather_mun = lambda value: jax.lax.all_gather(value, ax_y, axis=3, tiled=True)
-        gather_nmu = lambda value: jax.lax.all_gather(value, ax_x, axis=1, tiled=True)
+    use_anti = bool(anti) and bool(classes)
 
     def _local(
         v_local,
@@ -1450,34 +1461,44 @@ def _head_wing_kernel_face(
         class_u=None,
         class_a=None,
     ):
-        nk = v_local.shape[1]
+        n_vertex, nk, nbx, nby = (int(n) for n in v_local.shape)
         n_class = max(int(classes), 1)
+        x0 = jax.lax.axis_index(ax_x) * nbx
+        y0 = jax.lax.axis_index(ax_y) * nby
+        if layout == "axis":
+            # Axis faces hold whole band axes: keep this rank's pair tile rows.
+            def _x_rows(a):
+                return jax.lax.dynamic_slice_in_dim(a, x0, nbx, axis=1)
 
-        def _k_sum(a, b, a_anti=None):
+            def _y_cols(a):
+                return jax.lax.dynamic_slice_in_dim(a, y0, nby, axis=3)
+            bra_nmu_local, ket_nmu_local = _x_rows(bra_nmu_local), _x_rows(ket_nmu_local)
+            bra_mun_local, ket_mun_local = _y_cols(bra_mun_local), _y_cols(ket_mun_local)
+
+        def _k_sum(a, b, a_anti=None, b_anti=None):
             """``sum_{s,j} a b`` per k, weighted into classes (plain k sum
-            when ``classes = 0``; that branch is the incumbent einsum)."""
+            when ``classes = 0``)."""
             if not classes:
                 return jnp.einsum("ksmj,ksmj->m", a, b)[None]
             out = class_u @ jnp.einsum("ksmj,ksmj->km", a, b)
             if a_anti is not None:
-                out = out + class_a @ jnp.einsum("ksmj,ksmj->km", a_anti, b)
+                out = out + class_a @ jnp.einsum("ksmj,ksmj->km", a_anti, b_anti)
             return out
-        v_full = jax.lax.all_gather(v_local, ax_x, axis=2, tiled=True)
-        v_full = jax.lax.all_gather(v_full, ax_y, axis=3, tiled=True)
-        nb_full = v_full.shape[-1]
-        ns = bra_mun_local.shape[1]
-        mu_x_local = bra_mun_local.shape[2]
-        mu_y_local = bra_nmu_local.shape[-1]
 
-        idx = jnp.arange(nb_full)
-        logical1d = idx < nb_logical
-        logical2d = (logical1d[:, None] & logical1d[None, :])[None, :, :]
-        dE = energies[:, :, None] - energies[:, None, :]
-        f_diff = occupations[:, None, :] - occupations[:, :, None]
+        ix = x0 + jnp.arange(nbx)
+        iy = y0 + jnp.arange(nby)
+        e_x = jax.lax.dynamic_slice_in_dim(energies, x0, nbx, axis=1)
+        e_y = jax.lax.dynamic_slice_in_dim(energies, y0, nby, axis=1)
+        f_x = jax.lax.dynamic_slice_in_dim(occupations, x0, nbx, axis=1)
+        f_y = jax.lax.dynamic_slice_in_dim(occupations, y0, nby, axis=1)
+        logical2d = ((ix[:, None] < nb_logical) & (iy[None, :] < nb_logical))[None, :, :]
+        dE = e_x[:, :, None] - e_y[:, None, :]
+        f_diff = f_y[:, None, :] - f_x[:, :, None]
         transition = logical2d & (dE > 0.0)
         if include_surface:
-            diagonal = logical2d & (idx[:, None] == idx[None, :])[None, :, :]
-            surface_pair = jnp.where(diagonal, surface_weight[:, :, None], 0.0)
+            s_x = jax.lax.dynamic_slice_in_dim(surface_weight, x0, nbx, axis=1)
+            diagonal = logical2d & (ix[:, None] == iy[None, :])[None, :, :]
+            surface_pair = jnp.where(diagonal, s_x[:, :, None], 0.0)
         else:
             surface_pair = jnp.zeros_like(dE)
 
@@ -1499,10 +1520,7 @@ def _head_wing_kernel_face(
         inv_z_blocks = jnp.pad(inv_z, (0, freq_pad)).reshape(-1, freq_block)
 
         def _weighted_stack(contract):
-            """Stream omega in bounded blocks (mirrors the legacy ring's
-            own ``_HEAD_WING_FREQUENCY_BLOCK`` discipline); no cross-block
-            accumulation is needed since distinct blocks cover distinct
-            frequencies (unlike the legacy ring's cross-RING-STEP carry)."""
+            """Stream omega in bounded blocks of the local pair tile."""
             def _step(_carry, node):
                 z_block, inv_z_block = node
                 weight = _head_wing_interband_weight(
@@ -1519,127 +1537,96 @@ def _head_wing_kernel_face(
                 _step, None, (z_blocks, inv_z_blocks), unroll=1)
             return blocks
 
-        # ---- Y_x: mu on X (psi_mun's own axis), gather bands over Y ----
-        mu_x_block = min(_HEAD_WING_MU_BLOCK, int(mu_x_local))
-        from runtime.padding import padded_axis
-        mu_x_axis = padded_axis(
-            int(mu_x_local), mu_x_block,
-            name="face head left-centroid work carrier")
-        mu_x_padded = mu_x_axis.carrier
-        n_x_blocks = mu_x_padded // mu_x_block
-        bra_mun_padded = jnp.pad(
-            bra_mun_local,
-            ((0, 0), (0, 0), (0, mu_x_padded - mu_x_local), (0, 0)))
-        ket_mun_padded = jnp.pad(
-            ket_mun_local,
-            ((0, 0), (0, 0), (0, mu_x_padded - mu_x_local), (0, 0)))
+        mu_local = int(bra_mun_local.shape[2])
+        if int(bra_nmu_local.shape[-1]) != mu_local:
+            raise ValueError(
+                "head wing kernel: psi_mun/psi_nmu local mu tiles differ "
+                f"({mu_local} vs {int(bra_nmu_local.shape[-1])}); the pair-tile "
+                "contraction needs one mu partition on X and Y.")
+        mu_block = min(_HEAD_WING_MU_BLOCK, mu_local)
+        mu_axis = padded_axis(
+            mu_local, mu_block, name="face head centroid work carrier")
+        mu_padded = mu_axis.carrier
+        n_blocks = mu_padded // mu_block
+        mu_pad = mu_padded - mu_local
+        pad_nmu = lambda a: jnp.pad(a, ((0, 0), (0, 0), (0, 0), (0, mu_pad)))
+        pad_mun = lambda a: jnp.pad(a, ((0, 0), (0, 0), (0, mu_pad), (0, 0)))
+        bra_nmu_padded, ket_nmu_padded = pad_nmu(bra_nmu_local), pad_nmu(ket_nmu_local)
+        bra_mun_padded, ket_mun_padded = pad_mun(bra_mun_local), pad_mun(ket_mun_local)
 
-        def _x_step(_carry, blk):
-            zero = jnp.zeros((), dtype=blk.dtype)
-            start = blk * mu_x_block
-            bra_tile = jax.lax.dynamic_slice(
-                bra_mun_padded, (zero, zero, start, zero),
-                (nk, ns, mu_x_block, bra_mun_padded.shape[-1]))
-            ket_tile = jax.lax.dynamic_slice(
-                ket_mun_padded, (zero, zero, start, zero),
-                (nk, ns, mu_x_block, ket_mun_padded.shape[-1]))
-            bra_full = gather_mun(bra_tile)
-            ket_full = gather_mun(ket_tile)
+        def _block_step(_carry, blk):
+            start = blk * mu_block
 
-            def _contract_left(weight):
+            def _rows_x(a):
+                """nmu block over Y: ``[k, s, M_b, i_X]``."""
+                t = jax.lax.dynamic_slice_in_dim(a, start, mu_block, axis=3)
+                t = jax.lax.all_gather(t, ax_y, axis=3, tiled=True)
+                return jnp.transpose(t, (0, 2, 3, 1))
+
+            def _cols_y(a):
+                """mun block over X: ``[k, s, M_b, j_Y]``."""
+                t = jax.lax.dynamic_slice_in_dim(a, start, mu_block, axis=2)
+                return jax.lax.all_gather(t, ax_x, axis=2, tiled=True)
+
+            bra_x, ket_y = _rows_x(bra_nmu_padded), _cols_y(ket_mun_padded)
+            bra_y = ket_x = None
+            if use_anti:
+                bra_y, ket_x = _cols_y(bra_mun_padded), _rows_x(ket_nmu_padded)
+
+            def _contract(weight):
                 # Y[w,a,m] = sum_{k,s,i,j} conj(v)[a,k,i,j] W[w,k,i,j]
-                #                          conj(bra)[k,s,m,i] ket[k,s,m,j],
-                # contracted in a fixed order: per frequency and per
-                # vertex, T = conj(v[a]) * W[w]  (nk, nb, nb), then i
-                # against the bra endpoint (nk, ns, m, nb), then k, s, j
-                # against the ket endpoint.  The former four-operand
-                # ``optimize=True`` einsum let opt_einsum form the
-                # (nk, ns, mu_block, nb, nb) pair-density outer product,
-                # 214 GiB on TaAs 8x8x8 at nb = 468 (2026-09-21 OOM);
-                # the largest value here is T at nk * nb^2.
-                # An antiunitary child reads rho_ji: its pair weight is
-                # (v W)^T, the conjugations of v and rho cancelling (see
-                # _head_wings_sharded_face).
+                #                          conj(bra)[k,s,m,i] ket[k,s,m,j]
+                # Z[w,m,b] = sum_{k,s,i,j} bra[k,s,m,i] conj(ket)[k,s,m,j]
+                #                          W[w,k,i,j] v[b,k,i,j]
+                # over this rank's (i_X, j_Y) pair tile, per frequency and
+                # vertex: T = conj(v[a]) W (nk, nbx, nby), then i against
+                # the bra, then k, s, j against the ket; the largest value
+                # is T.  An antiunitary child reads rho_ji: its pair weight
+                # is (v W)^T, contracted with the Y-banded bra and the
+                # X-banded ket (see _head_wings_sharded_face).
                 def _one_frequency(_carry, weight_w):
-                    rows = []
-                    for a in range(int(v_full.shape[0])):
-                        t = jnp.conj(v_full[a]) * weight_w
-                        u = jnp.einsum("ksmi,kij->ksmj", jnp.conj(bra_full), t)
+                    rows, cols = [], []
+                    for a in range(n_vertex):
+                        t = jnp.conj(v_local[a]) * weight_w
+                        u = jnp.einsum("ksmi,kij->ksmj", jnp.conj(bra_x), t)
                         u_anti = None
-                        if anti:
+                        if use_anti:
                             u_anti = jnp.einsum(
-                                "ksmi,kji->ksmj", jnp.conj(bra_full),
-                                v_full[a] * weight_w)
-                        rows.append(_k_sum(u, ket_full, u_anti))
-                    return _carry, jnp.stack(rows, axis=0)
-                _, y = jax.lax.scan(_one_frequency, None, weight, unroll=1)
-                return y
-            blocks = _weighted_stack(_contract_left)
-            return _carry, blocks.reshape(
-                n_omega_padded, int(v_full.shape[0]), n_class, mu_x_block)
+                                "ksmi,kji->ksmj", jnp.conj(bra_y),
+                                v_local[a] * weight_w)
+                        rows.append(_k_sum(u, ket_y, u_anti, ket_x))
+                        t = weight_w * v_local[a]
+                        u = jnp.einsum("ksmi,kij->ksmj", bra_x, t)
+                        u_anti = None
+                        if use_anti:
+                            u_anti = jnp.einsum(
+                                "ksmi,kji->ksmj", bra_y,
+                                weight_w * jnp.conj(v_local[a]))
+                        cols.append(_k_sum(
+                            u, jnp.conj(ket_y), u_anti,
+                            None if ket_x is None else jnp.conj(ket_x)))
+                    return _carry, (jnp.stack(rows, axis=0),
+                                    jnp.stack(cols, axis=-1))
+                _, yz = jax.lax.scan(_one_frequency, None, weight, unroll=1)
+                return yz
+            y_part, z_part = _weighted_stack(_contract)
+            y_part = y_part.reshape(n_omega_padded, n_vertex, n_class, -1)
+            z_part = z_part.reshape(n_omega_padded, n_class, -1, n_vertex)
+            # M_b is tile-major: the scatter's chunk x is mu tile x's block.
+            y_blk = jax.lax.psum(jax.lax.psum_scatter(
+                y_part, ax_x, scatter_dimension=3, tiled=True), ax_y)
+            z_blk = jax.lax.psum(jax.lax.psum_scatter(
+                z_part, ax_y, scatter_dimension=2, tiled=True), ax_x)
+            return _carry, (y_blk, z_blk)
 
-        _, y_chunks = jax.lax.scan(
-            _x_step, None, jnp.arange(n_x_blocks, dtype=jnp.int32), unroll=1)
-        n_vertex = int(v_full.shape[0])
+        _, (y_chunks, z_chunks) = jax.lax.scan(
+            _block_step, None, jnp.arange(n_blocks, dtype=jnp.int32), unroll=1)
         Y_x = jnp.moveaxis(y_chunks, 0, 3).reshape(
             n_omega_padded, n_vertex, n_class,
-            mu_x_padded)[:n_omega, :, :, :mu_x_local]
-
-        # ---- Z_y: mu on Y (psi_nmu's own axis), gather bands over X ----
-        mu_y_block = min(_HEAD_WING_MU_BLOCK, int(mu_y_local))
-        mu_y_axis = padded_axis(
-            int(mu_y_local), mu_y_block,
-            name="face head right-centroid work carrier")
-        mu_y_padded = mu_y_axis.carrier
-        n_y_blocks = mu_y_padded // mu_y_block
-        bra_nmu_padded = jnp.pad(
-            bra_nmu_local,
-            ((0, 0), (0, 0), (0, 0), (0, mu_y_padded - mu_y_local)))
-        ket_nmu_padded = jnp.pad(
-            ket_nmu_local,
-            ((0, 0), (0, 0), (0, 0), (0, mu_y_padded - mu_y_local)))
-
-        def _y_step(_carry, blk):
-            zero = jnp.zeros((), dtype=blk.dtype)
-            start = blk * mu_y_block
-            bra_tile = jax.lax.dynamic_slice(
-                bra_nmu_padded, (zero, zero, zero, start),
-                (nk, bra_nmu_padded.shape[1], ns, mu_y_block))
-            ket_tile = jax.lax.dynamic_slice(
-                ket_nmu_padded, (zero, zero, zero, start),
-                (nk, ket_nmu_padded.shape[1], ns, mu_y_block))
-            bra_gathered = gather_nmu(bra_tile)
-            ket_gathered = gather_nmu(ket_tile)
-            bra_full = jnp.transpose(bra_gathered, (0, 2, 3, 1))
-            ket_full = jnp.transpose(ket_gathered, (0, 2, 3, 1))
-
-            def _contract_right(weight):
-                # Z[w,m,b] = sum_{k,s,i,j} bra[k,s,m,i] conj(ket)[k,s,m,j]
-                #                          W[w,k,i,j] v[b,k,i,j]; same fixed
-                # order as _contract_left (see there).
-                def _one_frequency(_carry, weight_w):
-                    cols = []
-                    for b in range(int(v_full.shape[0])):
-                        t = weight_w * v_full[b]
-                        u = jnp.einsum("ksmi,kij->ksmj", bra_full, t)
-                        u_anti = None
-                        if anti:
-                            u_anti = jnp.einsum(
-                                "ksmi,kji->ksmj", bra_full,
-                                weight_w * jnp.conj(v_full[b]))
-                        cols.append(_k_sum(u, jnp.conj(ket_full), u_anti))
-                    return _carry, jnp.stack(cols, axis=-1)
-                _, z = jax.lax.scan(_one_frequency, None, weight, unroll=1)
-                return z
-            blocks = _weighted_stack(_contract_right)
-            return _carry, blocks.reshape(
-                n_omega_padded, n_class, mu_y_block, n_vertex)
-
-        _, z_chunks = jax.lax.scan(
-            _y_step, None, jnp.arange(n_y_blocks, dtype=jnp.int32), unroll=1)
+            mu_padded)[:n_omega, :, :, :mu_local]
         Z_y = jnp.moveaxis(z_chunks, 0, 2).reshape(
-            n_omega_padded, n_class, mu_y_padded,
-            n_vertex)[:n_omega, :, :mu_y_local, :]
+            n_omega_padded, n_class, mu_padded,
+            n_vertex)[:n_omega, :, :mu_local, :]
         if not classes:
             return Y_x[:, :, 0], Z_y[:, 0]
         return Y_x, Z_y
@@ -1677,7 +1664,8 @@ def _pad_head_band_manifold_to(v, e, f, surface, *, mesh: Mesh, width: int):
     The face wing kernel's contracted operand (``psi_mun``/``psi_nmu``) is
     NOT legally sliceable to an arbitrary logical window (obstacle #3: a
     face-sharded band axis need not be mesh-divisible at that boundary),
-    so it is always gathered at its full stored ``nb_full`` width.  ``v``/
+    so the kernel contracts ``v``'s pair tiles against the faces' own band
+    tiles at the full stored ``nb_full`` width.  ``v``/
     ``e``/``f``/``surface`` must therefore be embedded in that SAME width
     (zero beyond the physical ``[b0,b4)`` extent — safe, since every
     consumer masks on ``nb_logical``, never on ``v``'s own shape) rather
