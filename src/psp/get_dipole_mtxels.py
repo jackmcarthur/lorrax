@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
+"""Dipole preprocessing: the q→0 velocity matrix, ``dipole.h5``.
+
+    ⟨mk|v_a|nk⟩ = ⟨mk|p_a + s·i[r_a, V_NL] (+ i[r_a, V_U])|nk⟩
+
+swept once on the WFN file wedge with the bands sharded over the mesh
+(``common.mtxel_sweep.dipole_operator``), unfolded to the full BZ by the
+symmetry service as a polar, time-odd vector, and written from its shards
+(``file_io.dipole``).  ``s`` is ``vnl_velocity_sign``.  Optional products:
+the finite-q SOS blocks and the parallel-transport artifact
+(``file_io.parallel_transport``).  ``--vnl-mode numeric`` is the finite-
+difference validation arm of the V_NL derivative (``psp.vnl_ops``).
 """
-Dipole/velocity matrix elements calculation: <mk|v|nk> and related pieces.
 
-This module mirrors the setup of get_DFT_mtxels.py and provides a scaffold to
-compute:
-- Momentum operator matrix elements p_i: sum_G (k+G)_i c*_mk(G) c_nk(G)
-- Nonlocal pseudopotential contribution to velocity (initialized projectors)
-
-The nonlocal velocity term is stubbed pending detailed implementation; the code
-initializes QE-style projectors so downstream development can fill it in.
-"""
-
-import os
 import argparse
 import functools
 from pathlib import Path
@@ -47,8 +47,7 @@ from common.mtxel_sweep import (VNL_VELOCITY_SIGN_FLIPPED,
                                 sweep_matrix_elements,
                                 sweep_uniform_current_matrix_elements)
 from common.parallel_transport import (
-	WFN_FINGERPRINT_SCHEME, build_g_wrap_lookup, collapsed_axes,
-	wfn_fingerprint,
+	WFN_FINGERPRINT_SCHEME, build_g_wrap_lookup, wfn_fingerprint,
 )
 from common.wfn_layout import band_sphere_spec
 from common.wfn_transforms import load_kpoint_fftbox_local
@@ -66,6 +65,8 @@ from psp.dft_operators import (padded_gvectors, gather_psi_G_from_crys,
 import psp.vnl_ops as vnl_ops
 from file_io.dipole import (band_energies_on_full_bz, finite_q_payload,
                             write_dipole)
+from file_io.parallel_transport import (complete_parallel_transport,
+                                        publish_dft_velocity)
 from runtime.run_session import RunSession
 
 # --------------------------
@@ -609,97 +610,6 @@ def _prov_show(v) -> str:
     return (v[:12] + "…") if isinstance(v, str) and len(v) > 13 else str(v)
 
 
-def collapsed_axis_position_operators(
-	psi_G, *, wfn, sym, geom, gtab_file, emit=print):
-	"""``Z_a = <m| b_a . r |n>`` on the full BZ for every collapsed k axis.
-
-	One sweep per collapsed axis on the resident file-wedge ``psi_G`` (the
-	velocity's own sweep machinery) carries two operators: the position
-	sawtooth :func:`common.mtxel_sweep.collapsed_position_operator`, with
-	its branch cut at the centre of the largest vacuum gap
-	(:func:`common.parallel_transport.collapsed_axis_vacuum_gap`), and the
-	window :func:`common.mtxel_sweep.axis_window_operator` over the middle
-	``COLLAPSED_CUT_PROBE_GAP_FRACTION`` of that gap, whose diagonal is each
-	band's density at the cut.  The occupied bands' share there is printed
-	and refused above ``COLLAPSED_CUT_DENSITY_MAX``
-	(``GATE pt_collapsed_axis_cut_density``): a cut through the density
-	makes ``Z`` wrong by ``2 pi`` times that share.
-
-	The file-wedge Cartesian vector ``sum_a Z_a b_a-hat`` is unfolded ONCE
-	with the polar unfold at ``time_odd=False`` (r is time-even; a mirror
-	through the slab flips ``b_a`` and with it ``Z_a``; a wire's C4 mixes
-	its two collapsed axes, which an axis-by-axis unfold would drop), then
-	each axis is projected back on its ``b_a-hat`` and Hermitised.  Returns
-	``(Z (nk_full, 3, nb_pad, nb_pad), zero on stencil axes; centres (3,)
-	with NaN on stencil axes)``.
-	"""
-	from common.mtxel_sweep import (axis_window_operator,
-									collapsed_position_operator)
-	from common.parallel_transport import (
-		COLLAPSED_CUT_DENSITY_MAX, COLLAPSED_CUT_PROBE_GAP_FRACTION,
-		collapsed_axes, collapsed_axis_vacuum_gap)
-
-	axes = list(collapsed_axes(wfn.kgrid))
-	nb = int(geom.nb_logical)
-	B = np.asarray(wfn.bvec, dtype=np.float64) * float(wfn.blat)
-	occ = np.asarray(wfn.occs)
-	occ = (occ[0] if occ.ndim == 3 else occ)[:, :nb]
-	centers = np.full(3, np.nan, dtype=np.float64)
-	bhat = {a: jnp.asarray(B[a] / np.linalg.norm(B[a])) for a in axes}
-	Z_vec_file = None
-	for axis in axes:
-		cut, gap = collapsed_axis_vacuum_gap(wfn.atom_crys, axis)
-		center = float(np.mod(cut + 0.5, 1.0))
-		centers[axis] = center
-		probe = COLLAPSED_CUT_PROBE_GAP_FRACTION * gap
-		with timing.section("parallel_transport_position"):
-			Z_file, window = sweep_matrix_elements(
-				psi_G, operator=(
-					collapsed_position_operator(
-						geom, axis=axis, center=center),
-					axis_window_operator(
-						geom, axis=axis, center=cut, width=probe)),
-				geom=geom, gvecs=gtab_file.gvecs, gmask=gtab_file.mask,
-				box_index=wfn.box_index(k="ibz"),
-				kvecs=np.asarray(gtab_file.kvecs))
-			at_cut = np.real(np.asarray(jax.device_get(
-				jnp.diagonal(window, axis1=-2, axis2=-1))))[:, :nb]
-		del window
-		occupied = float(np.sum(occ * at_cut) / max(np.sum(occ), 1e-30))
-		k_max, n_max = np.unravel_index(int(np.argmax(at_cut)), at_cut.shape)
-		emit(f"Collapsed k axis {'xyz'[axis]}: position operator "
-			 f"Z = <m| b . r |n>; largest vacuum gap {gap:.4f} of the cell, "
-			 f"branch cut at f = {cut:.6f}; density in the middle "
-			 f"{probe:.4f} of the cell around the cut: occupied bands "
-			 f"{occupied:.3e} of their charge (refused above "
-			 f"{COLLAPSED_CUT_DENSITY_MAX:.1e}), any window band max "
-			 f"{float(at_cut[k_max, n_max]):.3e} (band {int(n_max) + 1}, "
-			 f"IBZ k {int(k_max) + 1}); max|Z| = "
-			 f"{float(jax.device_get(jnp.max(jnp.abs(Z_file)))):.4f}")
-		if not occupied <= COLLAPSED_CUT_DENSITY_MAX:
-			raise ValueError(
-				"GATE pt_collapsed_axis_cut_density: the branch cut of the "
-				f"collapsed-axis position operator along {'xyz'[axis]} sits "
-				f"at f = {cut:.6f} (centre of the largest vacuum gap, "
-				f"{gap:.4f} of the cell), and the occupied bands carry "
-				f"{occupied:.3e} of their charge within {probe / 2:.4f} of "
-				f"it (limit {COLLAPSED_CUT_DENSITY_MAX:.1e}).  The position "
-				"operator is wrong by 2 pi times that share.  Fix: more "
-				"vacuum along this axis.")
-		term = Z_file[:, None, :, :] * bhat[axis][None, :, None, None]
-		Z_vec_file = term if Z_vec_file is None else Z_vec_file + term
-	if Z_vec_file is None:
-		raise ValueError(
-			f"kgrid {tuple(int(n) for n in wfn.kgrid)} has no collapsed axis")
-	Z_vec = unfold_file_wedge_polar_matrix(sym, Z_vec_file, time_odd=False)
-	position = jnp.zeros_like(Z_vec)
-	for axis in axes:
-		Z_full = jnp.einsum("j,kjmn->kmn", bhat[axis], Z_vec, optimize=True)
-		Z_full = 0.5 * (Z_full + jnp.swapaxes(jnp.conj(Z_full), -1, -2))
-		position = position.at[:, axis].set(Z_full)
-	return position, centers
-
-
 # --------------------------
 # Main driver
 # --------------------------
@@ -715,7 +625,10 @@ _STAGES = (
 	("artifact write", "write_h5"),
 )
 
-def main(argv=None):
+def build_parser() -> argparse.ArgumentParser:
+	"""The dipole CLI.  Below the startup call: its V_NL-sign choices come
+	from ``common.mtxel_sweep``, which imports jax (tests/test_cli_help_seam.py
+	carries that as debt)."""
 	parser = argparse.ArgumentParser(allow_abbrev=False, description="Dipole/velocity matrix elements <mk|v|nk>")
 	parser.add_argument(
 		"-i",
@@ -877,6 +790,12 @@ def main(argv=None):
 		default=None,
 		help="Reduced-BZ q-indices for --with-finite-q (default: all 0..nk-1).",
 	)
+	return parser
+
+
+def parse_args(argv=None):
+	"""``(parser, args)`` with the flag combinations that need no deck refused."""
+	parser = build_parser()
 	args = parser.parse_args(argv)
 
 	if args.static_gauge_hall_out is not None and not args.static_gauge_hall_only:
@@ -921,7 +840,11 @@ def main(argv=None):
 		):
 			if not np.isfinite(value) or float(value) < 0.0:
 				parser.error(f"{name} must be finite and non-negative")
+	return parser, args
 
+
+def main(argv=None):
+	parser, args = parse_args(argv)
 	input_path = Path(args.input).resolve()
 	report_path = (Path(args.report_file).resolve() if args.report_file else
 				   Path(args.out).resolve().with_name("dipole.out"))
@@ -1379,57 +1302,16 @@ def main(argv=None):
 			if args.skip_vnl:
 				vNL_cart = np.zeros((3, nb, nb), dtype=np.complex128)
 			elif args.vnl_mode == "numeric":
-				# Numeric derivative on V_NL with optional Richardson and adaptive h
-				B = (np.asarray(wfn.bvec, dtype=float)) * float(wfn.blat)
-				Binv = np.linalg.inv(B)
-				vNL_cart = np.zeros((3, nb, nb), dtype=np.complex128)
-				# Physical rows only: the pad rows are G=(0,0,0), so including
-				# them would drag the median |K| toward |k| and shrink the FD step.
-				G_phys = np.asarray(Gk_crys, dtype=float)[np.asarray(g_mask) > 0.0]
-				K_cart_this = (G_phys + np.asarray(kpoint, dtype=float)[None, :]) @ B
-				K_med = float(np.median(np.linalg.norm(K_cart_this, axis=1))) if K_cart_this.size else 1.0
-				h_base = max(float(args.vnl_h), float(args.vnl_h_rel) * max(K_med, 1.0))
-				h1 = h_base
-				h2 = 0.5 * h_base
-				# ONE INTERNAL CONVENTION FOR BOTH MODES: ``vNL_cart`` means
-				# ``+dV_NL/dK_cart``, which is what the analytic branch below
-				# returns (``compute_vnl_velocity_cart``'s docstring, and
-				# ``orbital_magnetization.py:601`` records it verified
-				# off-diagonally at ratio 1.000).  These differences used to
-				# carry a leading MINUS, which made ``--vnl-mode numeric``
-				# the arithmetic negative of ``--vnl-mode analytic``: both
-				# then passed through the same knob-controlled flip and the
-				# same ``p_cart + vNL_cart``, so the two modes came out on
-				# OPPOSITE arms of the very sign question this file's knob
-				# parameterises.  Two implementations of one derivative
-				# cannot both be right, and nothing in the tree compared
-				# them, which is why it survived.  The finite difference is
-				# the unambiguous one -- it is a literal numerical
-				# derivative of ``compute_vnl_matrix_from_setup``, which
-				# returns <m|V_NL(k)|n> with no sign convention of its own --
-				# so the analytic branch is the definition both now share
-				# and the numeric branch stops negating.
-				for ic in range(3):
-					# D1 at h1
-					d1 = np.zeros((3,), dtype=float); d1[ic] = h1
-					d1c = d1 @ Binv
-					kp1 = np.asarray(kpoint, dtype=float) + d1c
-					km1 = np.asarray(kpoint, dtype=float) - d1c
-					Vp1 = compute_vnl_matrix_from_setup(wfn_k, Gk_crys, kp1, vnl_setup, g_mask=g_mask)
-					Vm1 = compute_vnl_matrix_from_setup(wfn_k, Gk_crys, km1, vnl_setup, g_mask=g_mask)
-					D1 = (Vp1 - Vm1) / (2.0 * h1)
-					if args.vnl_num_scheme == "richardson":
-						# D2 at h2
-						d2 = np.zeros((3,), dtype=float); d2[ic] = h2
-						d2c = d2 @ Binv
-						kp2 = np.asarray(kpoint, dtype=float) + d2c
-						km2 = np.asarray(kpoint, dtype=float) - d2c
-						Vp2 = compute_vnl_matrix_from_setup(wfn_k, Gk_crys, kp2, vnl_setup, g_mask=g_mask)
-						Vm2 = compute_vnl_matrix_from_setup(wfn_k, Gk_crys, km2, vnl_setup, g_mask=g_mask)
-						D2 = (Vp2 - Vm2) / (2.0 * h2)
-						vNL_cart[ic] = (4.0 * D2 - D1) / 3.0
-					else:
-						vNL_cart[ic] = D1
+				# The finite-difference validation arm (psp.vnl_ops); physical
+				# G rows only set its step.
+				vNL_cart = vnl_ops.vnl_velocity_finite_difference(
+					lambda k: compute_vnl_matrix_from_setup(
+						wfn_k, Gk_crys, k, vnl_setup, g_mask=g_mask),
+					kpoint,
+					np.asarray(Gk_crys, dtype=float)[np.asarray(g_mask) > 0.0],
+					np.asarray(wfn.bvec, dtype=float) * float(wfn.blat),
+					h=args.vnl_h, h_rel=args.vnl_h_rel,
+					scheme=args.vnl_num_scheme)
 			else:
 				vNL_cart = compute_vnl_velocity_cart(wfn_k, Gk_crys, kpoint, vnl_setup, g_mask=g_mask)
 
@@ -1474,7 +1356,6 @@ def main(argv=None):
 		# needs them.  The three Cartesian components ride ONE sweep; p acts on
 		# each rank's G slab and V_NL is separable, so only ψ crosses the mesh.
 		pt_path = None
-		write_pt_remainder = None
 		debug_kindex = min(1, max(0, nk - 1))
 		dipole_progress = LoopProgress(
 			1, report.progress, title="q=0 velocity matrix construction",
@@ -1517,113 +1398,34 @@ def main(argv=None):
 				H_v = unfold_file_wedge_polar_matrix(sym, H_v_file)
 				del H_v_file
 				if args.parallel_transport_out is not None:
-					# Keep H_v sharded and direction-major it only inside the
-					# SlabIO writer; no host gather or second velocity evaluation.
-					from file_io.parallel_transport import (
-						initialize_parallel_transport_artifact,
-						validate_parallel_transport_artifact,
-						write_parallel_transport_artifact)
 					pt_path = Path(args.parallel_transport_out).resolve()
-					# COLLAPSED AXES (a slab normal, a wire's transverse pair): no
-					# k stencil exists there and none is fabricated.  The
-					# connection along a collapsed reduced axis is the band
-					# matrix of the position conjugate to it, Z_a = <m| b_a . r
-					# |n>, a bounded operator because the wavefunctions vanish
-					# in the vacuum where the sawtooth's branch cut sits.  It
-					# rides the velocity's sweep machinery on the resident
-					# file-wedge psi (common.parallel_transport.
-					# link_stencil_orders owns the per-axis rule).
-					collapsed_position_kmajor = None
-					collapsed_centers = None
-					if collapsed_axes(wfn.kgrid):
-						collapsed_position_kmajor, collapsed_centers = (
-							collapsed_axis_position_operators(
-								psi_G, wfn=wfn, sym=sym, geom=geom,
-								gtab_file=gtab_file, emit=report.emit))
-					with timing.section("parallel_transport_velocity"):
-						initialize_parallel_transport_artifact(
-							pt_path, wfn=wfn, sym=sym, mesh=RUNTIME.mesh,
-							nbands=nb,
-							effective_nspinor=int(meta.nspinor),
-							bispinor=bispinor,
-							velocity_dft_kmajor=H_v,
-							hubbard_provenance=hubbard_stamp,
-							wfn_path=str(wfn_path),
-							wfn_fingerprint=wfn_fingerprint(wfn),
-							vnl_velocity_sign=vnl_velocity_sign,
-							vnl_included=not args.skip_vnl,
-							rcond=float(args.parallel_transport_rcond),
-							collapsed_position_kmajor=collapsed_position_kmajor,
-							collapsed_axis_centers=collapsed_centers)
-					del collapsed_position_kmajor
-					write_pt_remainder = write_parallel_transport_artifact
-					validate_pt_artifact = validate_parallel_transport_artifact
+					publish_dft_velocity(
+						pt_path, H_v, psi_G, wfn=wfn, sym=sym, geom=geom,
+						gtab_file=gtab_file, mesh=RUNTIME.mesh, nbands=nb,
+						effective_nspinor=int(meta.nspinor), bispinor=bispinor,
+						hubbard_provenance=hubbard_stamp, wfn_path=str(wfn_path),
+						vnl_velocity_sign=vnl_velocity_sign,
+						vnl_included=not args.skip_vnl,
+						rcond=float(args.parallel_transport_rcond),
+						emit=report.emit)
 				# The velocity stays sharded, 1/P of (nk, 3, nb, nb) per rank,
 				# until SlabIO writes it from those shards below.
 				velocity = H_v
 				sweep.watch(velocity)
 			del H_v, psi_G
-			if pt_path is not None and args.parallel_transport_velocity_only:
-				# D2 (reports/metal_head_pt_pipelines_2026-08-23/PLAN.md): the
-				# link stream, the fourth-order connection and the mandatory
-				# velocity-identity validation are ALL skipped -- none of them
-				# is a stencil this deck's mesh may even support (a collapsed
-				# 2D slab kgrid, or an undersampled one), and NONE of them is
-				# read by the sc_head_update=dft_velocity consumer this mode
-				# targets (gw.qsgw_head.load_dft_velocity_head).  The velocity
-				# transaction above already wrote and closed
-				# velocity_dft_cart, band manifold, kgrid, reciprocal lattice
-				# and the WFN fingerprint -- every provenance field that
-				# loader checks.
-				print(
-					"  DFT velocity-only parallel-transport artifact: no "
-					"links, no connection, no validation (--parallel-transport"
-					"-velocity-only).")
-				print(f"\nWrote DFT-velocity-only parallel-transport data to "
-				      f"{pt_path}")
-			elif pt_path is not None:
-				# The SlabIO velocity transaction above is closed and durable,
-				# and the all-k psi is now dead (the velocity keeps its 1/P
-				# shard for dipole.h5).  The link stream therefore holds only
-				# one central and one neighbour WFN plus one distributed band
-				# matrix, never both preprocessing representations at once.
-				with timing.section("parallel_transport_links"):
-					write_pt_remainder(
-						pt_path, wfn=wfn, sym=sym, mesh=RUNTIME.mesh,
-						nbands=nb, bispinor=bispinor,
-						rcond=float(args.parallel_transport_rcond),
-						w_av_first_neighbors=w_av_first_neighbors,
-						w_av_second_neighbors=w_av_second_neighbors)
-				with timing.section("parallel_transport_validation"):
-					metrics = validate_pt_artifact(
-						pt_path, mesh=RUNTIME.mesh, kgrid=wfn.kgrid,
-						nbands=nb,
-						bvec_cart=np.asarray(wfn.bvec) * float(wfn.blat),
-						atol=float(args.parallel_transport_validation_atol),
-						rtol=float(args.parallel_transport_validation_rtol))
-				print(
-					"  DFT covariant-velocity validation: PASS "
-					f"max_abs={metrics['max_abs']:.6e}, "
-					f"max_rel={metrics['max_rel']:.6e}")
-				print(f"\nWrote parallel-transport data to {pt_path}")
-				report.heading("Parallel-transport validation")
-				report.emit("Covariant DFT velocity: PASS; "
-							f"max abs={float(metrics['max_abs']):.5e}; "
-							f"max rel={float(metrics['max_rel']):.5e}")
-				rule = {0: "position", 2: "order-2", 4: "order-4"}
-				report.emit(
-					"Per axis (rule, max|dv| of max|v|, head S_aa "
-					"reconstructed/exact): " + ", ".join(
-						f"{a}={rule[int(o)]} {e:.3e} of {x:.3e}, {r:.4f}"
-						for a, o, e, x, r in zip(
-							"xyz", metrics["stencil_orders"],
-							metrics["max_abs_by_axis"],
-							metrics["exact_max_abs_by_axis"],
-							metrics["head_response_ratio_by_axis"]))
-					+ "; head response rel="
-					f"{float(metrics['head_response_relative_frobenius']):.3e}, "
-					"transition overlap="
-					f"{float(metrics['transition_overlap_real']):.6f}")
+			if pt_path is not None:
+				# ψ is dead here (the velocity keeps its 1/P shard for
+				# dipole.h5), so the link stream never holds both.
+				complete_parallel_transport(
+					pt_path, wfn=wfn, sym=sym, mesh=RUNTIME.mesh, nbands=nb,
+					bispinor=bispinor,
+					rcond=float(args.parallel_transport_rcond),
+					velocity_only=bool(args.parallel_transport_velocity_only),
+					w_av_first_neighbors=w_av_first_neighbors,
+					w_av_second_neighbors=w_av_second_neighbors,
+					atol=float(args.parallel_transport_validation_atol),
+					rtol=float(args.parallel_transport_validation_rtol),
+					report=report)
 		dipole_progress.step()
 		dipole_progress.finish()
 
