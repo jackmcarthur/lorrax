@@ -1,6 +1,7 @@
 # Driver reference
 
-LORRAX has six core drivers. In chain order:
+LORRAX has six core drivers in seven modules: GW preprocessing is two modules
+(`psp.get_dipole_mtxels` and `gw.kin_ion_io`). In chain order:
 
 | stage | module | produces |
 |---|---|---|
@@ -183,11 +184,11 @@ Invoke: `python -m gw.gw_jax -i gw.in`.
 | key | default | meaning |
 |---|---|---|
 | `number_bands` / `nval` / `ncond` | 100 / 5 / 5 | χ₀ and Σ band-sum top / interior valence edge / Σ conduction count. `number_bands_chi` and `number_bands_sigma` split the two sums |
-| `compute_mode` | `auto` | Σ ansatz: `x_only` \| `cohsex` \| `gn_ppm` \| `hl_ppm` \| `mpa`. `auto` infers from the legacy flags and never selects `mpa`. `gn_ppm` refuses metallic occupations (`GATE gn_ppm_refuses_metals`); a metal runs `mpa` with `sigma_w_model = shared_pole` |
+| `compute_mode` | `auto` | Σ ansatz: `x_only` \| `cohsex` \| `gn_ppm` \| `hl_ppm` \| `mpa`. `auto` infers from the legacy flags and never selects `mpa`. `gn_ppm` refuses metallic occupations ([input reference](input_reference.md)) |
 | `qp_solver` | `auto` → `one_shot_dft` | `one_shot_dft`: full-matrix effective H with Σ at $E_\mathrm{DFT}$, Hermitian-symmetrized; `fixed_point`: on-shell diagonal solve (dynamic modes); `self_consistent`: the QSGW loop ([self-consistency](self_consistency.md)) |
 | `write_eqp2` | false | dynamic one-shot: iterate the fixed Σ(ω) matrix in the evolving QP basis and write `eqp2.dat`; screening and Σ are not rebuilt. Keys `eqp2_*` in the [input reference](input_reference.md) |
 | `restart` | false | `true` reuses `tmp/isdf_tensors_<N_mu>.h5` after authentication |
-| `linalg` | `local` | the one layout dial for dense solves: `local` whole-matrix per-q, `distributed` matrix-distributed W Dyson solve, transverse LU and eigensolvers; the ζ back-solve is always a whole-tile factor ([`distrib_la`](services/distrib_la.md)) |
+| `linalg` | `local` | the one layout dial for dense solves ([input reference](input_reference.md)) |
 
 **Reuse.** Two caches, each refusing or refitting on mismatch, never reusing
 wrongly.
@@ -333,17 +334,24 @@ Invoke: `python -u -m bse.bse_jax -i cohsex.in --lanczos --bse ...` in the GW
 run directory. The mesh is the run's square startup mesh; `--px`/`--py` must
 be square and use every device.
 
+Without `--lanczos` the driver hands the solve to FEAST and forwards only
+`-i`, `--n-val`, `--n-cond`, `--px`/`--py`, `--bse`/`--rpa`/`--tda` and the
+`--feast-*`, `--gmres-*` and `--kpm-*` knobs. The rows marked *Lanczos* below
+apply to the `--lanczos` route only; a FEAST run with `--eqp` gets DFT-energy
+excitons. The driver parses with `parse_known_args`, so an unknown flag is
+ignored, not refused.
+
 | flag | default | meaning |
 |---|---|---|
 | `--lanczos` | off | Krylov eigensolve; without it the driver runs FEAST (`bse_feast`) |
 | `--bse` / `--rpa` | RPA | `--bse` adds $-W$ |
 | `--tda` | off | resonant block only |
-| `--n-val` / `--n-cond` / `--n-occ` | 4 / 4 / auto | transition window; valence resolved from $\varepsilon < E_F$ |
-| `--band-degeneracy` | `strict` | a window edge inside a multiplet: `strict` refuses and names working counts, `snap` widens outward, `off` proceeds; tolerance `--degeneracy-tol-ry` (1 meV) |
-| `--solver` | `lanczos` | `lanczos` (spectrum shape), `davidson` (per-state convergence, `--davidson-*`), `trlan` (thick restart, bounded memory, `--trlan-*`) |
-| `--block-size` / `--max-lanczos-iter` / `--n-reorth` | 1 / auto / −1 | block width / total Krylov dimension / reorthogonalization window (−1 = full, needed for degenerate spinor spectra) |
-| `--n-eig` / `--write-eigs [N]` | 5 / off | eigenpairs; write `eigenvectors.h5` |
-| `--eqp FILE` | none | diagonal QP energies from the wedge `eqp1.dat`, unfolded through the symmetry service; the restart must be proved to come from the same unrotated WFN |
+| `--n-val` / `--n-cond` / `--n-occ` | 4 / 4 / auto | transition window; valence resolved from $\varepsilon < E_F$ (`--n-occ`: *Lanczos*) |
+| `--band-degeneracy` | `strict` | *Lanczos*. A window edge inside a multiplet: `strict` refuses and names working counts, `snap` widens outward, `off` proceeds; tolerance `--degeneracy-tol-ry` (1 meV) |
+| `--solver` | `lanczos` | *Lanczos*. `lanczos` (spectrum shape), `davidson` (per-state convergence, `--davidson-*`), `trlan` (thick restart, bounded memory, `--trlan-*`) |
+| `--block-size` / `--max-lanczos-iter` / `--n-reorth` | 1 / auto / −1 | *Lanczos*. Block width / total Krylov dimension / reorthogonalization window (−1 = full, needed for degenerate spinor spectra) |
+| `--n-eig` / `--write-eigs [N]` | 5 / off | *Lanczos*. Eigenpairs; write `eigenvectors.h5` |
+| `--eqp FILE` | none | *Lanczos*. Diagonal QP energies from the wedge `eqp1.dat`, unfolded through the symmetry service; the restart must be proved to come from the same unrotated WFN |
 | `bse_k_grid` (deck) | `""` | fine grid "NX NY NZ", each axis at least the coarse extent |
 | `head_minibz_average` (deck) | false | mini-BZ cell average of the exchange head ([LT head](theory/lt-exchange-head.md)); also rebuilds the q = 0 tile on `bse_k_grid` |
 
