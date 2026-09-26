@@ -768,25 +768,27 @@ def test_the_ladder_stage_composes_exactly_the_steps_the_closure_gate_drives():
 
     ``tests/test_w_bse_wiring_closure.py`` measures
     ``_ladder_wedge`` -> ``_assert_wedge_matches_run`` ->
-    ``_assemble_full_bz_w`` rather than re-running the RPA static leg it
+    ``_assemble_wedge_w`` rather than re-running the RPA static leg it
     already has on disk.  That is only a gate on the production path if the
-    production entry point composes the same three calls, in that order,
-    and nothing else between them — so it is read out of the AST here,
-    cheaply, instead of being assumed there, expensively.
+    production entry point composes the same calls — so it is read out of
+    the AST here, cheaply, instead of being assumed there, expensively.
+    The production entry streams one z at a time: its per-z hand-off
+    assembles and gates each role, ``_ladder_wedge`` drives it, and the
+    wedge check runs before any W is returned.
     """
     import inspect
     from gw import screening_bse
 
     src = inspect.getsource(screening_bse.compute_screening_ladder)
     order = [src.index(name) for name in (
-        "prepare_ladder_restart(", "_ladder_wedge(",
-        "_assert_wedge_matches_run(", "_assemble_full_bz_w(",
-        "_gate_w_or_refuse(")]
+        "prepare_ladder_restart(", "_assemble_wedge_w(",
+        "_gate_w_or_refuse(", "_ladder_wedge(",
+        "_assert_wedge_matches_run(", "return W_by_role")]
     assert order == sorted(order), (
-        "compute_screening_ladder no longer calls prepare -> wedge -> "
-        "wedge-check -> assemble -> gate in that order; the closure gate "
-        "drives the middle three directly and would stop covering the "
-        "production composition")
+        "compute_screening_ladder no longer composes prepare -> per-z "
+        "hand-off (assemble -> gate) -> wedge -> wedge-check -> return; "
+        "the closure gate drives these helpers directly and would stop "
+        "covering the production composition")
 
 
 @pytest.mark.parametrize("level", [None, "0", "1"])

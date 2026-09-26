@@ -369,10 +369,10 @@ def test_include_w_false_reproduces_the_production_rpa_w0(wbse_closure_run,
         f"resolvent head differs from the once-folded RPA head by "
         f"{scalar_rel:.3e} (tensor difference {tensor_rel:.3e}).  Folding "
         "the resolvent again is not a repair; it would double-count Kx.")
-    W_full = np.asarray(jax.device_get(screening_bse._assemble_full_bz_w(
+    W_full = np.asarray(jax.device_get(screening_bse._assemble_wedge_w(
         wedge.wc[0], V_q, sym=sym, centroid_indices=centroid_indices,
         meta=meta, mesh_xy=mesh_xy, label="static",
-        print_fn=lambda *a, **k: None)))
+        print_fn=lambda *a, **k: None).unfold(mesh_xy)))
     W_wired = W_full[:, :n_rmu, :n_rmu]
 
     assert W_wired.shape == W0_ref.shape, (
@@ -572,9 +572,10 @@ def test_the_ladder_w_passes_the_production_w_gate_at_finite_q(
     #     mode so a violation RAISES instead of printing a warning into a
     #     log nobody reads (``common.sanity``: LORRAX_SANITY=strict is the
     #     documented setting for a regression gate).
-    W_q = screening_bse._assemble_full_bz_w(
+    W_q = screening_bse._assemble_wedge_w(
         wedge.wc[0], V_q, sym=sym, centroid_indices=centroid_indices,
-        meta=meta, mesh_xy=mesh_xy, label="static", print_fn=print)
+        meta=meta, mesh_xy=mesh_xy, label="static",
+        print_fn=print).unfold(mesh_xy)
     W_host = np.asarray(jax.device_get(W_q))[:, :n_rmu, :n_rmu]
     neg = sanity.neg_q_index(tuple(meta.kgrid))
     recip = (float(np.max(np.abs(W_host - np.conj(W_host[neg]))))

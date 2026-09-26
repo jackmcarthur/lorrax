@@ -32,12 +32,12 @@ kernel's ``W_R`` IS the RPA ``W(0)``.  So this module
   3. hands that restart path to the BSE ladder facade
      (``bse.w_ladder.compute_wc_qwedge``), which returns head-less
      ``W(z) - v`` bodies on the q wedge,
-  4. adds ``v`` back, unfolds the wedge to the full BZ through the same
-     ``symmetry_maps.unfold_isdf_operator`` service call the RPA path
-     uses, with q/-q rows paired through that service's explicit TRS half
-     (the v1 ladder has a TRS gauge but not arbitrary spatial-gauge
-     covariance), gates the result, and returns ``{role: W_q}`` in exactly
-     the shape and sharding the RPA path returns.
+  4. adds ``v`` back and holds the result as the SAME wedge
+     ``symmetry_maps.QirrOperator`` the RPA path returns (the
+     ``gw.v_q_g_flat.q_wedge`` tables, q/-q rows paired through the shared
+     TRS policy; the v1 ladder has a TRS gauge but not arbitrary
+     spatial-gauge covariance), gates it, and returns ``{role: W_q}``; the
+     Sigma convolutions unfold it on load, as they do the RPA W.
 
 PERSIST-BEFORE-LOAD IS THE ORDERING CONSTRAINT OF THE WHOLE FEATURE, and
 it is the reason this helper exists at all rather than a flag on
@@ -469,7 +469,7 @@ from file_io.restart_bundle import require_screened_bundle as _assert_restart_is
 # ---------------------------------------------------------------------------
 
 def _gate_w_or_refuse(W, req, *, stage, sym, print_fn=print, kgrid=None,
-                      include_w=True):
+                      include_w=True, mesh_xy=None):
     """Run ``_gate_w`` as a non-negotiable resolvent-stage refusal.
 
     ``common.sanity`` defaults to warn-and-continue because its generic gates
@@ -493,7 +493,7 @@ def _gate_w_or_refuse(W, req, *, stage, sym, print_fn=print, kgrid=None,
     os.environ["LORRAX_SANITY"] = "strict"
     try:
         _gate_w(
-            W, req, print_fn=print_fn, kgrid=kgrid,
+            W, req, print_fn=print_fn, kgrid=kgrid, mesh_xy=mesh_xy,
             trs_allowed=bool(sym.trs_allowed))
     except sanity.SanityError as exc:
         raise ValueError(
@@ -568,8 +568,8 @@ def prepare_ladder_restart(
                              tensors_filename, include_w=include_w,
                              print_fn=print_fn)
 
-    # The ladder assembly reads W over the full zone (its own wedge
-    # handling is _assemble_full_bz_w's).
+    # The ladder kernel reads the RPA W over the full zone from the bundle;
+    # the ladder's own W is assembled on the wedge (_assemble_wedge_w).
     W0_rpa = compute_static_w(
         wfns, V_q, quad, e_ref=e_ref, sym=sym,
         centroid_indices=centroid_indices, config=config, meta=meta,
@@ -889,74 +889,50 @@ def _assert_mu_width(tile, mu_target, *, where):
 from .qgrid_symmetry import qgrid_trs_policy_for
 
 
-def _assemble_full_bz_w(wc_wedge, V_q, *, sym, centroid_indices, meta,
-                        mesh_xy, label, print_fn=print):
-    """``Wc(z)`` on the wedge -> ``W(z)`` on the full BZ.
+def _assemble_wedge_w(wc_wedge, V_q, *, sym, centroid_indices, meta,
+                      mesh_xy, label, print_fn=print):
+    """``Wc(z)`` on the wedge -> the wedge ``W(z)`` operator Sigma consumes.
 
-    ``+ v`` first (the facade returns ``W - v`` bodies), then the SAME
-    ``unfold_isdf_operator`` service call ``compute_static_w`` makes, with
-    the SAME geometry tables from ``_resolve_ibz_q_list``.  The q-axis
-    time-reversal decision — pair coherence and the fixed-q projector — is
-    the SHARED policy object (``gw.qgrid_symmetry.qgrid_trs_policy_for``),
-    because bare V, RPA W and ladder W must use one q-grid realization and
-    because the decision is taken from the shared TRS verdict, not assumed
-    here. This is not a second unfold: one service, one set of
-    centroid/phase tables, and one convention for the umklapp phase and TRS
-    conjugation.
+    ``+ v`` (the facade returns ``W - v`` bodies), then the SAME wedge
+    ``QirrOperator`` the RPA route returns (``compute_static_w``): values on
+    the IBZ rows, the tables of ``gw.v_q_g_flat.q_wedge`` (the one resolution
+    screening's W and the bare V share), and nothing unfolded here -- the
+    Sigma convolutions unfold on their transform's load, and ``W - V`` is a
+    wedge-with-wedge operation.  The q-axis time-reversal policy (pair
+    coherence and the fixed-q projector) is the shared
+    ``gw.qgrid_symmetry.qgrid_trs_policy_for`` object, as on the RPA route.
     """
     from ffi import _services
     _services.ensure_on_path()
-    from symmetry_maps import slice_q_full_to_ibz, unfold_isdf_operator
+    from symmetry_maps import QirrOperator
 
-    from .v_q_g_flat import _resolve_ibz_q_list
+    from .v_q_g_flat import q_wedge
 
-    (_, q_irr_frac, full_to_irr_idx, full_to_irr_sym, sym_perm, L_table,
-     use_ibz) = _resolve_ibz_q_list(
-        sym=sym, centroid_indices=centroid_indices,
-        kgrid=tuple(meta.kgrid), fft_grid=tuple(meta.fft_grid),
-        context=f"W[{label}] ladder wedge -> full BZ unfold",
-        mu_basis=getattr(meta, 'mu_basis', None))
-    if not use_ibz:
+    wedge = q_wedge(sym=sym, centroid_indices=centroid_indices, meta=meta,
+                    context=f"W[{label}] ladder wedge")
+    if wedge is None:
         raise ValueError(
             "GATE w_bse_needs_an_orbit_closed_wedge: the ladder computes "
             "on the symmetry-reduced q wedge, so the run's centroid set "
-            "must be orbit-closed for the unfold back to the full BZ to "
-            "exist.  This deck's set is not (the same condition that drops "
-            "the RPA Dyson solve to the full BZ).  Use a closed centroid "
-            "set, or keep screening_diagrams = w_rpa.")
-
-    _nat = NamedSharding(mesh_xy, P(None, 'x', 'y'))
-    mu_target = int(np.asarray(sym_perm).shape[-1])
-    from symmetry_maps import QirrOperator
+            "must be orbit-closed for the wedge operator to exist.  This "
+            "deck's set is not (the same condition that drops the RPA Dyson "
+            "solve to the full BZ).  Use a closed centroid set, or keep "
+            "screening_diagrams = w_rpa.")
+    tables, policy = wedge
+    mu_target = int(np.asarray(tables["sym_perm"]).shape[-1])
     V_wedge = QirrOperator.of(V_q).at_rows(sym.q_irr_full_idx)
     W_wedge = _assert_mu_width(
-        wc_wedge, mu_target, where=f"W[{label}] wedge -> full BZ") + V_wedge
-    n_sym_spatial = int(np.asarray(sym_perm).shape[0]) // 2
-    policy = qgrid_trs_policy_for(
-        sym=sym, irr_idx_q=full_to_irr_idx, sym_idx_q=full_to_irr_sym,
-        kgrid=tuple(meta.kgrid), n_sym_spatial=n_sym_spatial,
-        context=f"W[{label}] ladder")
-    ladder_unfold_sym = policy.unfold_sym_idx
+        wc_wedge, mu_target, where=f"W[{label}] wedge") + V_wedge
     cov = policy.measure_covariance(
-        W_wedge, q_irr_frac=q_irr_frac, q_irr_full_idx=sym.q_irr_full_idx,
-        sym_mats_k=sym.sym_mats_k, sym_perm=sym_perm, L_table=L_table)
+        W_wedge, q_irr_frac=tables["q_irr_frac"],
+        q_irr_full_idx=sym.q_irr_full_idx, sym_mats_k=sym.sym_mats_k,
+        sym_perm=tables["sym_perm"], L_table=tables["L_table"])
     W_wedge, removed = policy.project_fixed_q(W_wedge, sym.q_irr_full_idx)
     from common import sanity
     sanity.report_parent_covariance(
         f"W[{label}] ladder IBZ parents", cov, removed=removed,
         print_fn=print_fn)
-    with timing.section("W.unfold_to_full_bz", announce=True,
-                        label=f"W[{label}] ladder IBZ -> full-BZ unfold "
-                              f"({int(W_wedge.shape[0])} q -> "
-                              f"{int(meta.nk_tot)} q)"):
-        W_q = unfold_isdf_operator(
-            W_wedge,
-            irr_idx=full_to_irr_idx, sym_idx=ladder_unfold_sym,
-            sym_perm=sym_perm, L_table=L_table, q_irr_frac=q_irr_frac,
-            mesh_xy=mesh_xy, n_sym_spatial=n_sym_spatial)
-        del W_wedge
-        W_q.block_until_ready()
-    return W_q
+    return QirrOperator(values=W_wedge, trs_rule="conj", **tables)
 
 
 # ---------------------------------------------------------------------------
@@ -970,9 +946,9 @@ def compute_screening_ladder(
 ):
     """``{role: W_q}`` from the resolvent, for the non-MPA modes.
 
-    Same return contract as :func:`gw.screening.compute_screening`:
-    ``(nq_full, mu, mu)`` complex128 at ``NamedSharding(mesh_xy,
-    P(None,'x','y'))``, keyed by the SAME role labels
+    Same return contract as :func:`gw.screening.compute_screening`: a wedge
+    ``symmetry_maps.QirrOperator`` per role (values ``(n_q_ibz, mu, mu)``
+    complex128 at ``P(None,'x','y')``), keyed by the SAME role labels
     ``screening_requests_for`` produced.
 
     ``include_w`` selects the operator this call solves for:
@@ -1028,14 +1004,14 @@ def compute_screening_ladder(
                 f"Refused at parse time for hl_ppm; restated here so a new "
                 f"real-axis role cannot inherit an answer.")
 
-    # ONE z AT A TIME: each role's wedge is assembled to the full BZ and
+    # ONE z AT A TIME: each role's wedge operator is assembled and
     # gated as soon as its z is solved, then dropped, so the resident set is
     # one wedge rather than the (n_z, n_q, mu, mu) stack.
     W_by_role: dict[str, jax.Array] = {}
 
     def _deliver(i, _z, wc_z):
         req = requests[i]
-        W_q = _assemble_full_bz_w(
+        W_q = _assemble_wedge_w(
             wc_z, V_q, sym=sym, centroid_indices=centroid_indices,
             meta=meta, mesh_xy=mesh_xy, label=req.role, print_fn=print_fn)
         # THE SAME GATE THE RPA PATH RUNS, at the same tolerances.
@@ -1049,7 +1025,7 @@ def compute_screening_ladder(
             _gate_w_or_refuse(
                 W_q, req, stage=f"assembled {diagram_name} W[{req.role}]",
                 sym=sym, print_fn=print_fn, kgrid=tuple(meta.kgrid),
-                include_w=include_w)
+                include_w=include_w, mesh_xy=mesh_xy)
         W_by_role[req.role] = W_q
 
     wedge = _ladder_wedge(
