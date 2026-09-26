@@ -139,7 +139,7 @@ def test_loader_calls_the_service_verifier_and_never_rebuilds_symmaps():
 
 def test_gw_and_htransform_both_retain_the_checked_record():
     gw = (_REPO / "src" / "gw" / "gw_jax.py").read_text(encoding="utf-8")
-    ht = (_REPO / "src" / "bandstructure" / "htransform.py").read_text(
+    ht = (_REPO / "src" / "bandstructure" / "fh_interp.py").read_text(
         encoding="utf-8")
 
     assert "centroid_basis = load_centroid_basis(" in gw

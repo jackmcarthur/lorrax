@@ -612,14 +612,9 @@ _DRIVER_PLUMBING_BUDGET = {
     # freed ``kin_ion_io``, and it is a physics decision about where the
     # exciton-band assembly lives.  Numbered request.
     "bse.exciton_bands": 1,
-    # ``jax.sharding`` at :20.  Same shape as exciton_bands, larger:
-    # htransform is the H-matrix interpolation LIBRARY with a CLI bolted on.
-    # Its complete reusable Galerkin basis fit now lives in ``isdf.galerkin``;
-    # htransform retains the fH interpolation and its policy adapter, which
-    # still carry one ``jax.sharding`` import. Its hand-rolled
-    # ``_build_mesh_xy`` is gone (2026-07-31; since 2026-08-01 it hands back
-    # the mesh ``initialize_communicator_stack`` built).
-    "bandstructure.htransform": 1,
+    # htransform is the CLI only since ARCH M7 (2026-09-25); the fH library
+    # half, and its ``jax.sharding`` import, is ``bandstructure.fh_interp``.
+    "bandstructure.htransform": 0,
     # One ``from jax.sharding import ...`` each (a ``mesh_xy: Mesh``
     # annotation in every one).  The separate DEFAULTS bug these
     # carried — ``--px/--py`` defaulting to 1, so on 16 devices with no flags
@@ -717,7 +712,7 @@ _DRIVER_MAIN_STATEMENTS = {
     "gw.gw_jax": (("main", "_run_gw_stages"), 57),
     "bse.bse_jax": (("main",), 103),
     "bse.exciton_bands": (("main",), 401),
-    "bandstructure.htransform": (("main",), 129),
+    "bandstructure.htransform": (("main",), 126),
     "centroid.kmeans_cli": (("main",), 91),
     "gw.kin_ion_io": (("main",), 128),
     "psp.get_dipole_mtxels": (("main",), 330),
@@ -874,8 +869,9 @@ _L1_LIBRARY_ENV_READS = {
         "LORRAX_SIGMA_RULE_TABLE_TEST_DIR",
     },
     # resolve_extra_rank_pad — one resolver, refuse-on-garbage; the entry
-    # layer passes the resolved value down.
-    "bandstructure.htransform": {
+    # layer passes the resolved value down.  It moved with the fH library
+    # half (ARCH M7).
+    "bandstructure.fh_interp": {
         "LORRAX_EXTRA_RANK_PAD",
     },
     # resolve_fi_fshoulder_tol — the f-shoulder gate's floor, one resolver,

@@ -158,7 +158,6 @@ _SERVICES = tuple(dict.fromkeys(svc for _mod, svc in _MODULE_SCOPE_CONSUMERS))
 #: prototype did) counts it as a thirteenth door consumer and then demands
 #: a bootstrap that would be circular.
 _ALL_MODULE_SCOPE_DOOR_CONSUMERS = frozenset({
-    "bandstructure.htransform",
     "centroid.charge_density",
     "centroid.kmeans_cli",
     "centroid.pivoted_cholesky",

@@ -55,7 +55,7 @@ from common.staged_reshard import (
     face_to_batch_reshard_supported as _face_to_batch_supported,
 )
 
-from .htransform import (
+from .fh_interp import (
     build_fH_R,
     build_R_grid_np,
     newton_inv,
