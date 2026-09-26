@@ -69,7 +69,6 @@ from .sigma_output import (
     SPREAD_ATTR_PREFIX,
     append_eqp_assembly_receipt_h5,
     append_qsgw_datasets_h5,
-    compact_star_tables,
     extract_and_stamp_k_irr,
     k_irr_rows_for,
     sigma_star_spread_stats,

@@ -307,6 +307,40 @@ An array stored on a wedge but indexed with a full-grid index returns a wrong
 row silently for every index below `nk_red`. Readers check the storage stamp
 (§9) before indexing.
 
+### Operator slabs on the star wedge
+
+A band matrix of a scalar operator built from the crystal's own potentials
+(`kin_ion` = T + V_loc + V_NL, the direct Hartree field) commutes with every
+space-group operation and with time reversal. The loader defines ψ(Sk) as the
+symmetry image of ψ at its orbit parent, so the full-grid table holds one
+distinct matrix per orbit:
+
+* unitary row (`sym_idx < n_sym_spatial`):
+  \(\langle m,Sk|O|n,Sk\rangle = \langle m,k|R^\dagger O R|n,k\rangle\), a
+  copy of the parent's matrix, with no phase or subspace rotation left over;
+* antiunitary row: \(\langle\Theta m|O|\Theta n\rangle =
+  \overline{\langle m|O|n\rangle}\), the element-wise conjugate.
+
+The slab is therefore computed on the star wedge
+(`symmetry_maps.star_wedge_rows`: one WFN row per orbit, in the
+first-occurrence order `KStarMap.rows`, never sorted) and stored there; the
+reader unfolds it (`file_io.kin_ion.broadcast_ibz_to_full_bz`, tables from
+`star_wedge_tables`). Its predicate is the member's own flag,
+`trs_reference="ibz_slab"`, because each stored row is the untransformed WFN
+state. The star-row XOR rule is for `star_select` output and conjugates the
+wrong rows here; the error sits in the off-diagonals only, so no diagonal
+observable sees it.
+
+Sweeping the file wedge instead is wrong where the two wedges differ: a file
+row that is not its orbit's parent holds a different basis of the same
+eigenspaces from the loader's symmetry image, and the stored rows then
+disagree with the star tables.
+
+Validating the unfold needs a deck with time-reversed rows (an
+inversion-symmetric cell has none) and an independent full-grid table to diff
+against. A within-star spread of a table this path wrote is zero whether the
+rule is right or wrong, because its members are copies.
+
 Links between two k (parallel-transport overlaps) use the directed-edge table
 on the [service page](../services/symmetry_maps.md#directed-band-matrix-edges).
 The table exists only when every operation maps an elementary mesh step to ±
@@ -477,3 +511,7 @@ guarantees; the signatures are in the code.
 * `KStarMap(irr, sym, n)`: the three arrays that must travel together.
   `identity(n_k)` is the no-reduction map; `select`, `broadcast` (star-row
   rule), `spread`, and `spread_rel` (one reduction, one 16-byte transfer).
+  `rows` and `take` are the star-row rule itself: every wedge writer
+  (`sigma_mnk.h5`, `kin_ion.h5`) stores `take` as its `irr_idx_k`.
+* `star_wedge_rows(sym)` → `(labels, take)`; `star_wedge_tables(sym)` →
+  `(take, sym_idx_k, n_sym_spatial)`: an operator slab on the star wedge (§8).
