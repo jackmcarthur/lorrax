@@ -1342,7 +1342,7 @@ def klead_outer_decode_refusal(mesh: Mesh, kgrid, n_c: int, optin: int | None = 
     """``None`` when :func:`make_local_kconv_klead_outer_decode` serves this mesh, grid and band count.
 
     CUDA needs :func:`klead_outer_refusal`'s conditions, the decode handler, the bank plus the staged
-    V tile, ``64·16·(RS + (nk|1))`` B, within the opt-in shared memory, and the per-lane accumulator
+    V tile, ``64·16·(RS + nk)`` B, within the opt-in shared memory, and the per-lane accumulator
     ``ceil(nk/16)·ceil(n_c/8) <= 8`` m8n8 blocks (the handler's GATE mathdx-kconv-outer-decode-tile).
     A cpu mesh is always served.  Callers that get a reason keep the outer conv + XLA decode.
     """
@@ -1356,7 +1356,7 @@ def klead_outer_decode_refusal(mesh: Mesh, kgrid, n_c: int, optin: int | None = 
     kg = _check_kgrid(kgrid, "mathdx")
     nk = kg[0] * kg[1] * kg[2]
     have = _optin_smem_bytes() if optin is None else int(optin)
-    need = 64 * 16 * (((kg[0] * kg[1] * (kg[2] | 1)) | 1) + (nk | 1))
+    need = 64 * 16 * (((kg[0] * kg[1] * (kg[2] | 1)) | 1) + nk)
     if have is None or need > have:
         return f"the bank and the staged V tile need {need} B; the device has {have} B of opt-in shared memory"
     blocks = -(-nk // 16) * -(-int(n_c) // 8)

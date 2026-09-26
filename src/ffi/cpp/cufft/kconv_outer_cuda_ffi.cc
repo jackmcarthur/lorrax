@@ -37,7 +37,6 @@
 
 #include <algorithm>
 #include <cstdint>
-#include <cstdlib>
 #include <cstdio>
 #include <map>
 #include <mutex>
@@ -412,7 +411,6 @@ constexpr int NX = LRX_NX, NY = LRX_NY, NZ = LRX_NZ, NK = NX * NY * NZ;
 constexpr int KK = LRX_K, H = KK / 4, MB = LRX_MB, TR = 64, NWARP = LRX_THREADS / 32;
 constexpr int KW = (NK + NWARP - 1) / NWARP;
 constexpr unsigned SLOT = NK * MB * 64;            // one combo's partial, complex elements
-constexpr int VS = NK | 1;                         // staged V row stride (odd: the x pass reads it by rows)
 static_assert(KK % 4 == 0, "K is a multiple of the m8n8k4 chunk (the door zero-pads)");
 using GK = lrx_kbox::Geo<NX, NY, NZ>;
 
@@ -427,7 +425,7 @@ __device__ __forceinline__ void lrx_dmma(double& d0, double& d1, double a, doubl
 __device__ __forceinline__ int fperm(int x) { return 3 * (x & 1) + 4 * ((x >> 1) & 1); }
 __device__ __forceinline__ int pcol(int x, int y) { return x * 8 + (y ^ fperm(x)); }
 
-// cp.async of the (xb, yb) V tile into vs[j * VS + k], bank column order; padded cells skipped.
+// cp.async of the (xb, yb) V tile into vs[j * NK + k], bank column order; padded cells skipped.
 __device__ __forceinline__ void stage_v(lrx_c2* vs, const lrx_c2* __restrict__ V, int xb, int yb,
                                         const DecodeGeo& g) {
     const int x0 = xb * 8, y0 = yb * 8;
@@ -435,67 +433,9 @@ __device__ __forceinline__ void stage_v(lrx_c2* vs, const lrx_c2* __restrict__ V
     const lrx_c2* vb = V + ((long long)x0 * g.my + y0) * NK;
     for (int o = threadIdx.x; o < TR * NK; o += blockDim.x) {
         const int k = o % NK, j = o / NK, x = j >> 3, y = (j & 7) ^ fperm(x);
-        if (x < xlim && y < ylim) lrx_kbox::cp_async<16>(vs + j * VS + k, vb + (unsigned)((x * (int)g.my + y) * NK + k));
+        if (x < xlim && y < ylim) lrx_kbox::cp_async<16>(vs + o, vb + (unsigned)((x * (int)g.my + y) * NK + k));
     }
     lrx_kbox::cp_async_commit();
-}
-
-// transform3's inverse (kbox_stage.cuh, same lines, same order) with mode 2's Mid folded into its
-// x pass: each x line is multiplied by the staged V as it leaves the thread FFT, so the Mid's bank
-// pass and barrier are gone and every product is the one the separate Mid would form.  The staged
-// tile is awaited before the x pass.  A grid without an x axis keeps transform3 and the loop Mid.
-__device__ __forceinline__ void inverse_mid(lrx_c2* bank, const lrx_c2* vs, int xlim, int ylim) {
-    using namespace cufftdx;
-    constexpr int tr = TR;
-    using G = GK;
-    int j, li;
-    if constexpr (NX > 1) {
-        if constexpr (NZ > 1) {
-            for (int l = threadIdx.x; l < tr * NX * NY; l += blockDim.x) {
-                lrx_kbox::line_of<TR>(l, NX * NY, j, li);
-                lrx_kbox::line_fft<NZ, LRX_SM, fft_direction::inverse>(bank + j * G::RS + li * G::ZP, 1);
-            }
-            __syncthreads();
-        }
-        if constexpr (NY > 1) {
-            for (int l = threadIdx.x; l < tr * NX * NZ; l += blockDim.x) {
-                lrx_kbox::line_of<TR>(l, NX * NZ, j, li);
-                lrx_kbox::line_fft<NY, LRX_SM, fft_direction::inverse>(bank + j * G::RS + (li / NZ) * NY * G::ZP + li % NZ, G::ZP);
-            }
-        }
-        lrx_kbox::cp_async_wait_all();
-        __syncthreads();
-        using F = lrx_kbox::ThreadFFT<NX, LRX_SM, fft_direction::inverse, lrx_c2>;
-        for (int l = threadIdx.x; l < tr * NY * NZ; l += blockDim.x) {
-            lrx_kbox::line_of<TR>(l, NY * NZ, j, li);
-            lrx_c2* p = bank + j * G::RS + G::plane_at(li);
-            typename F::value_type v[F::storage_size];
-#pragma unroll
-            for (int e = 0; e < NX; ++e) { v[e].x = p[e * NY * G::ZP].x; v[e].y = p[e * NY * G::ZP].y; }
-            F().execute(v);
-            const int x = j >> 3, y = (j & 7) ^ fperm(x);
-            const bool ok = x < xlim && y < ylim;
-#pragma unroll
-            for (int e = 0; e < NX; ++e) {
-                lrx_c2 w; w.x = v[e].x; w.y = v[e].y;
-                if (ok) w = lrx_mul(w, vs[j * VS + e * NY * NZ + li]);
-                p[e * NY * G::ZP].x = w.x; p[e * NY * G::ZP].y = w.y;
-            }
-        }
-        __syncthreads();
-    } else {
-        lrx_kbox::transform3<NX, NY, NZ, TR, LRX_SM, fft_direction::inverse>(bank);
-        lrx_kbox::cp_async_wait_all();
-        __syncthreads();
-        for (int i = threadIdx.x; i < TR * NK; i += blockDim.x) {
-            const int k = i % NK, jj = i / NK, x = jj >> 3, y = (jj & 7) ^ fperm(x);
-            if (x < xlim && y < ylim) {
-                lrx_c2* e = bank + jj * G::RS + G::at(k);
-                *e = lrx_mul(*e, vs[jj * VS + k]);
-            }
-        }
-        __syncthreads();
-    }
 }
 
 extern "C" __global__ void __launch_bounds__(LRX_THREADS, 1) lrx_kconv_outer_decode(
@@ -558,21 +498,18 @@ extern "C" __global__ void __launch_bounds__(LRX_THREADS, 1) lrx_kconv_outer_dec
                 bank[pcol(gr, 2 * tg + 1) * GK::RS + GK::at(k)] = v1;
             }
             __syncthreads();
-#if LRX_XMID
-            inverse_mid(bank, vs, xlim, ylim);        // inverse transform, Mid on its x pass
-#else
             lrx_kbox::transform3<NX, NY, NZ, TR, LRX_SM, fft_direction::inverse>(bank);
             lrx_kbox::cp_async_wait_all();
             __syncthreads();
+            // Mid: mode 2's KernMid product with the staged tile.
             for (int i = threadIdx.x; i < TR * NK; i += blockDim.x) {
-                const int k = i % NK, jj = i / NK, x = jj >> 3, y = (jj & 7) ^ fperm(x);
+                const int k = i % NK, j = i / NK, x = j >> 3, y = (j & 7) ^ fperm(x);
                 if (x < xlim && y < ylim) {
-                    lrx_c2* e = bank + jj * GK::RS + GK::at(k);
-                    *e = lrx_mul(*e, vs[jj * VS + k]);
+                    lrx_c2* e = bank + j * GK::RS + GK::at(k);
+                    *e = lrx_mul(*e, vs[i]);
                 }
             }
             __syncthreads();
-#endif
             {   // the next pair's V tile (this combo's, or the next combo's first), unless vs holds it
                 int xn = -1, yn = -1;
                 if (p + 1 < p1) { xn = (p + 1) / na; yn = yb; }
@@ -586,36 +523,24 @@ extern "C" __global__ void __launch_bounds__(LRX_THREADS, 1) lrx_kconv_outer_dec
             // Decode: A[k, c, nu] += conj(Pc[k, c, a, 8 xb + mu]) U[k, mu, nu]; per accumulator the
             // sums run mu-chunk (h) in order, re: Pr Ur then Pi Ui, im: Pr Ui then -Pi Ur.
             const double2* pb = P2 + (unsigned)(a * (int)g.nxb + xb) * (unsigned)(NK * MB * 64);
-            // Loads for two k columns are issued before their DMMAs (h outer: each accumulator
-            // still takes h = 0 before h = 1).
-            constexpr int KP = (KW > 1 && LRX_KP > 1) ? 2 : 1;
 #pragma unroll
-            for (int h = 0; h < 2; ++h) {
+            for (int kk = 0; kk < KW; ++kk) {
+                const int k = warp + kk * NWARP;
+                if (k < NK) {
 #pragma unroll
-                for (int k0 = 0; k0 < KW; k0 += KP) {
-                    lrx_c2 ub[KP];
-                    double2 pc[KP][MB];
+                    for (int h = 0; h < 2; ++h) {
+                        const lrx_c2 ub = bank[pcol(4 * h + tg, gr) * GK::RS + GK::at(k)];
+                        double2 pc[MB];
 #pragma unroll
-                    for (int q = 0; q < KP; ++q) {
-                        const int k = warp + (k0 + q) * NWARP;
-                        const int kc = k < NK ? k : 0;
-                        ub[q] = bank[pcol(4 * h + tg, gr) * GK::RS + GK::at(kc)];
+                        for (int mb = 0; mb < MB; ++mb) pc[mb] = __ldg(pb + (unsigned)(((k * MB + mb) * 2 + h) * 32));
 #pragma unroll
-                        for (int mb = 0; mb < MB; ++mb) pc[q][mb] = __ldg(pb + (unsigned)(((kc * MB + mb) * 2 + h) * 32));
-                    }
+                        for (int mb = 0; mb < MB; ++mb) lrx_dmma(acc[kk][mb][0], acc[kk][mb][1], pc[mb].x, ub.x);
 #pragma unroll
-                    for (int q = 0; q < KP; ++q) {
-                        if (warp + (k0 + q) * NWARP < NK) {
-                            const int kk = k0 + q;
+                        for (int mb = 0; mb < MB; ++mb) lrx_dmma(acc[kk][mb][2], acc[kk][mb][3], pc[mb].x, ub.y);
 #pragma unroll
-                            for (int mb = 0; mb < MB; ++mb) lrx_dmma(acc[kk][mb][0], acc[kk][mb][1], pc[q][mb].x, ub[q].x);
+                        for (int mb = 0; mb < MB; ++mb) lrx_dmma(acc[kk][mb][0], acc[kk][mb][1], pc[mb].y, ub.y);
 #pragma unroll
-                            for (int mb = 0; mb < MB; ++mb) lrx_dmma(acc[kk][mb][2], acc[kk][mb][3], pc[q][mb].x, ub[q].y);
-#pragma unroll
-                            for (int mb = 0; mb < MB; ++mb) lrx_dmma(acc[kk][mb][0], acc[kk][mb][1], pc[q][mb].y, ub[q].y);
-#pragma unroll
-                            for (int mb = 0; mb < MB; ++mb) lrx_dmma(acc[kk][mb][2], acc[kk][mb][3], -pc[q][mb].y, ub[q].x);
-                        }
+                        for (int mb = 0; mb < MB; ++mb) lrx_dmma(acc[kk][mb][2], acc[kk][mb][3], -pc[mb].y, ub.x);
                     }
                 }
             }
@@ -672,7 +597,7 @@ struct DecodeGeo {                          // the embedded source declares the 
     double scale;
 };
 
-using DKey = std::tuple<CUcontext, int, int, int, int, int, int>;   // ctx, nkx, nky, nkz, K, MB, conj_r (the process's LRX_DEC_EXP is fixed)
+using DKey = std::tuple<CUcontext, int, int, int, int, int, int>;   // ctx, nkx, nky, nkz, K, MB, conj_r
 static std::map<DKey, Built> g_dcache;
 static std::map<DKey, std::string> g_dfail;
 
@@ -709,7 +634,7 @@ static ffi::Error build_decode(int nkx, int nky, int nkz, int K, int mb, int con
                       ffi::ErrorCode::kFailedPrecondition);
     const lrx_kbox::Geometry geo{nkx, nky, nkz};
     const long long nk = static_cast<long long>(nkx) * nky * nkz;
-    const long long smem = static_cast<long long>(kTile) * kTile * (geo.rs() + (nk | 1)) * 16;
+    const long long smem = static_cast<long long>(kTile) * kTile * (geo.rs() + nk) * 16;
     const long long kw = (nk + kThreads / 32 - 1) / (kThreads / 32);
     if (smem + 16 > smem_optin || kw * mb > 8) {
         std::ostringstream os;
@@ -726,9 +651,6 @@ static ffi::Error build_decode(int nkx, int nky, int nkz, int K, int mb, int con
     if (!nvrtc::exists(root + "/include/cufftdx.hpp"))
         return sticky("GATE mathdx-headers", "got no cufftdx.hpp under " + root + "/include; want the "
                       "nvidia-mathdx wheel; fix: pip install nvidia-mathdx", ffi::ErrorCode::kFailedPrecondition);
-    // EXPERIMENT (BSEC): LRX_DEC_EXP="<kp><xmid>" picks the decode's load hoisting and the Mid fusion.
-    const char* ev = std::getenv("LRX_DEC_EXP");
-    const int exp_kp = (ev && ev[0] == '1') ? 1 : 2, exp_xmid = (ev && ev[0] && ev[1] == '0') ? 0 : 1;
     nvrtc::Program prog;
     prog.src = kDecodeSrc;
     prog.name = "lrx_kconv_outer_decode.cu";
@@ -739,7 +661,6 @@ static ffi::Error build_decode(int nkx, int nky, int nkz, int K, int mb, int con
         "-DLRX_NX=" + std::to_string(nkx), "-DLRX_NY=" + std::to_string(nky), "-DLRX_NZ=" + std::to_string(nkz),
         "-DLRX_K=" + std::to_string(K), "-DLRX_THREADS=" + std::to_string(kThreads),
         "-DLRX_MB=" + std::to_string(mb), "-DLRX_CONJ=" + std::to_string(conj_r),
-        "-DLRX_KP=" + std::to_string(exp_kp), "-DLRX_XMID=" + std::to_string(exp_xmid),
         "-DLRX_SM=" + std::to_string(cc_major * 100 + cc_minor * 10)};
     nvrtc::mathdx_toolchain(root, cuda_inc, "cufftdx", &prog);
     prog.kernel = "lrx_kconv_outer_decode";
@@ -750,7 +671,7 @@ static ffi::Error build_decode(int nkx, int nky, int nkz, int K, int mb, int con
     if (!dir.empty()) {
         std::ostringstream name;
         name << dir << "/kconv_outer_dec_" << nkx << "x" << nky << "x" << nkz << "_K" << K << "_mb" << mb << "_c"
-             << conj_r << "_x" << exp_kp << exp_xmid << "_sm" << cc_major << cc_minor << "_" << key_hex << ".cubin";
+             << conj_r << "_sm" << cc_major << cc_minor << "_" << key_hex << ".cubin";
         path = name.str();
     }
     nvrtc::Image img;
