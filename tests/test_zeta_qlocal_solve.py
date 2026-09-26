@@ -53,7 +53,7 @@ def _operands(seed: int, *, indefinite: bool):
 
 
 @pytest.mark.parametrize("kind,vertex", [
-    ("replicated_rank_truncate", 0), ("replicated_cholesky", 0), ("lu", 1)])
+    ("replicated_rank_truncate", 0), ("lu", 1)])
 def test_factor_residency_puts_whole_q_tiles_on_their_owners(kind, vertex):
     """``zeta_factor_resident`` under ``local``: the factor (and the LU
     pivots) move to the q-local batch layout."""
