@@ -21,7 +21,6 @@ from common.fft_helpers import get_donated_kfft_kminor
 
 from solvers.lanczos import (
     FULL_REORTH,
-    reorth_kind,
     alpha_herm_sink,
     block_lanczos_eig_jit,
     block_lanczos_eig_jit_converged,
@@ -62,32 +61,6 @@ def iters_reported(n_iter_done, budget: int) -> int:
 
 from .bse_ring_comm import make_bse_shardings
 import common.timing as timing
-
-
-REORTH_ENV = "LORRAX_LANCZOS_REORTH"
-
-
-def reorth_route() -> str:
-    """Read the Lanczos reorthogonalisation dial and validate it.
-
-    THE ENVIRONMENT IS READ HERE, not in ``solvers.lanczos``.  ``solvers`` is
-    L2 -- physics-agnostic mathematics that
-    ``tests/test_layering.py::test_no_l2_module_reads_the_environment``
-    requires to be a function of its arguments -- so the solver takes a route
-    TOKEN and this module owns the variable, exactly as
-    ``bse_stack_matvec.matvec_opts`` owns ``LORRAX_BSE_MATVEC_OPT`` one layer
-    above the kernels it steers.
-
-    Unset/empty selects the default (batched ``cgs2``: ``2*max_iter``
-    collectives).  ``mgs`` is the legacy per-vector sweep --
-    ``max_iter(max_iter+1)/2`` collectives, 20 100 of them on the Si record
-    deck at 200 iterations -- kept reachable for bisects and for reproducing
-    pre-2026-08-08 runs.  An unknown token REFUSES: a perf dial that can be
-    misspelled into a silent no-op makes every A/B built on it void, and now
-    that ``cgs2`` is the default a typo must not hand back the slow route
-    either.  ``reorth_kind`` raises; the message names this variable.
-    """
-    return reorth_kind(os.environ.get(REORTH_ENV, ""))
 
 
 def solve_bse_sharded(
@@ -141,14 +114,13 @@ def solve_bse_sharded(
     ``bse_nontda.solve_bse_nontda_sharded`` — the ONE non-TDA seam, no parallel
     solver stack — which returns paired (X, Y) eigenvectors (X^H X - Y^H Y = +1).
     """
+    if os.environ.get("LORRAX_LANCZOS_REORTH", "").strip():
+        raise ValueError("LORRAX_LANCZOS_REORTH is retired: CGS2 is the only reorthogonalisation route; unset it")
     if not tda:
         from .bse_nontda import solve_bse_nontda_sharded
         return solve_bse_nontda_sharded(
             data, mesh_xy, n_eig=n_eig, include_W=include_W)
 
-    # Resolve the reorth dial ONCE here (L1 reads the env; the L2 solver
-    # takes the token) -- resolved in ONE place, like every other dial.
-    _reorth = reorth_route()
     sh = make_bse_shardings(mesh_xy)
     nc_pad = int(data["n_cond_pad"])
     nv_pad = int(data["n_val_pad"])
@@ -554,13 +526,13 @@ def solve_bse_sharded(
                     matvec_block, n_flat, n_eig=n_eig,
                     block_size=1, max_iter=max_iter,
                     rtol=rtol, atol=atol, check_every=check_every,
-                    n_reorth=n_reorth, reorth=_reorth,
+                    n_reorth=n_reorth,
                     subspace_plan=lanczos_plan, vector_shape=lanczos_vector_shape,
                     structured_vectors=True,
                 )
             evs, evecs = lanczos_eig_jit(
                 matvec, n_flat, n_eig=n_eig, max_iter=max_iter,
-                n_reorth=n_reorth, reorth=_reorth,
+                n_reorth=n_reorth,
                 subspace_plan=lanczos_plan, vector_shape=lanczos_vector_shape,
                     structured_vectors=True,
             )
@@ -585,7 +557,7 @@ def solve_bse_sharded(
                     matvec_block, n_flat, n_eig=n_eig,
                     block_size=bs, max_iter=max_iter,
                     rtol=rtol, atol=atol, check_every=check_every,
-                    n_reorth=n_reorth, reorth=_reorth,
+                    n_reorth=n_reorth,
                     subspace_plan=lanczos_plan, vector_shape=lanczos_vector_shape,
                     structured_vectors=True,
                 )
@@ -593,7 +565,6 @@ def solve_bse_sharded(
                 evs, evecs = block_lanczos_eig_jit(
                     matvec_block, n_flat, n_eig=n_eig,
                     block_size=bs, max_iter=max_iter, n_reorth=n_reorth,
-                    reorth=_reorth,
                     subspace_plan=lanczos_plan, vector_shape=lanczos_vector_shape,
                     structured_vectors=True,
                 )
