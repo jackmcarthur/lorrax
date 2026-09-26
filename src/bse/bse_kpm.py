@@ -354,7 +354,7 @@ def run_kpm_dos(
     }
 
 
-def main(argv: list[str] | None = None) -> None:
+def build_parser():
     import argparse
 
     parser = argparse.ArgumentParser(allow_abbrev=False, description="KPM density of states for BSE")
@@ -392,8 +392,27 @@ def main(argv: list[str] | None = None) -> None:
                         help="Use Tamm-Dancoff approximation (TDA). Default is full non-TDA.")
     parser.add_argument("--nohead", action="store_true",
                         help="Use headless V/W0 arrays if present (V_qmunu_nohead, W0_qmunu_nohead).")
-    args = parser.parse_args(argv)
+    return parser
 
+
+def settings(input_file, **overrides):
+    """The CLI's settings with ``overrides`` applied, for an in-process caller.
+
+    Defaults are the parser's own, so a caller never restates them; a name
+    that is not a CLI destination refuses (``TypeError``) instead of being
+    carried and ignored.
+    """
+    ns = build_parser().parse_args(["-i", str(input_file)])
+    unknown = sorted(set(overrides) - set(vars(ns)))
+    if unknown:
+        raise TypeError(f"{__name__}.settings: unknown settings {unknown}")
+    for key, value in overrides.items():
+        setattr(ns, key, value)
+    return ns
+
+
+def run(args) -> None:
+    """The KPM density of states of the BSE Hamiltonian (``settings``)."""
     timing.reset()
 
     # Omitted --px/--py = the run's canonical square mesh, not 1x1; a given
@@ -443,6 +462,11 @@ def main(argv: list[str] | None = None) -> None:
         )
 
     timing.report(print_fn=print, title="--- KPM Timing ---")
+
+
+
+def main(argv: list[str] | None = None) -> None:
+    run(build_parser().parse_args(argv))
 
 
 if __name__ == "__main__":
