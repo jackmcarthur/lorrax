@@ -1350,17 +1350,13 @@ def build_parser():
                          "coarse-W + fine exciton sampling.  Default (unset) "
                          "keeps the native fine W byte-identical.")
     ap.add_argument("--w-head-densify", type=str, default=None,
-                    choices=("c1", "legacy"),
                     help="How W's Γ head crosses the coarse→fine densifier. "
-                         "'c1' (default) splits it off first and re-attaches "
-                         "it analytically per fine q — the head is never "
-                         "interpolated, which is what BerkeleyGW's kernel.x / "
-                         "intkernel split exists to guarantee.  'legacy' lets "
-                         "the Kronecker-delta head ride through the "
-                         "trigonometric interpolant: that is the documented "
-                         "defect and this arm exists ONLY as the A/B control "
-                         "that prices it.  No effect without "
-                         "--w-coarse-grid.")
+                         "'c1' (default, the only mode) splits it off first "
+                         "and re-attaches it analytically per fine q — the "
+                         "head is never interpolated, which is what "
+                         "BerkeleyGW's kernel.x / intkernel split exists to "
+                         "guarantee.  The retired 'legacy' arm refuses by "
+                         "name.  No effect without --w-coarse-grid.")
     ap.add_argument("--w-head-gamma-cell", type=str, default="fine",
                     choices=("fine", "coarse"),
                     help="Which mini-BZ cell the re-attached Γ head is "
@@ -1403,7 +1399,7 @@ def _resolve_native_w_head(restart_file, input_file, wfn, *, log=print):
         w0_ready = header["screened_ready"]
     except Exception as exc:
         log(f"[coarse-W] cannot read the restart's head ({exc}); "
-            f"falling back to w_head_densify=legacy for this run")
+            f"the head rides through the plain densifier for this run")
         return None
     if not w0_ready:
         log("[coarse-W] the restart carries no ready screened W0, so the "

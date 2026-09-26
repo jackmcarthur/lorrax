@@ -67,7 +67,7 @@ def test_explicit_fit_window_is_independent_of_physical_occupancy():
 def test_explicit_fit_window_refuses_ambiguous_or_out_of_wfn_ranges():
     with pytest.raises(ValueError, match="non-default"):
         prune_band_ranges(SimpleNamespace(
-            prune_window="v_x_c", fit_window="0:16,0:28"), 8, 20)
+            prune_window="vc_x_vc", fit_window="0:16,0:28"), 8, 20)
     with pytest.raises(ValueError, match="lie in"):
         prune_band_ranges(SimpleNamespace(
             prune_window="v_x_vc", fit_window="0:16,0:29"), 8, 20)

@@ -55,8 +55,6 @@ def prune_band_ranges(args, n_val: int, n_cond: int):
                 f"--fit-window ranges must be nonempty and lie in [0,{top}); "
                 f"got left={left}, right={right}")
         return left, right, "explicit feature pair"
-    if args.prune_window == "v_x_c":
-        return (0, int(n_val)), (int(n_val), top), "valence x conduction"
     if args.prune_window == "vc_x_vc":
         return (0, top), (0, top), "full protected square"
     return (0, int(n_val)), (0, top), "valence x (valence + conduction)"
