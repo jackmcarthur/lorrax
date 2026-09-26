@@ -477,18 +477,16 @@ def _get_chi_minimax_kernel_fused(mesh_xy, kgrid, nk, n_out, complex_contour,
     with ``G' = ifftn_k`` of the typed unfold of each parent Green: one GEMM per Green at
     the parents, then ``ffi.fft.make_kconv_chi_unfold`` (mathdx mode 11) unfolds both on
     its load, transforms, traces the spins and accumulates chi_R in place.  The live set
-    is the two parent Greens and the accumulator; a real contour reads the antiunitary
-    partner as ``conj(G)`` on the load, a complex one reads the conjugate-face parent
-    Green.  When that set exceeds the device target the valence Green is built and
-    accumulated in band chunks (chi_tau is linear in it;
-    ``greens_function_kernel.chi_valence_chunks``).  One forward transform after the tau
-    sum.  Same signature and output as :func:`_get_chi_minimax_kernel_face` for
-    ``vertex_pairs=None``.
+    is the two parent Greens and the accumulator (priced by
+    ``greens_function_kernel.price_chi0_node``); real node times read the antiunitary
+    partner as ``conj(G)`` on the load, complex ones read the conjugate-face parent
+    Green.  One forward transform after the tau sum.  Same signature and output as
+    :func:`_get_chi_minimax_kernel_face` for ``vertex_pairs=None``.
     """
     from common.fft_helpers import make_flat_k_fftn, make_kconv_chi_unfold
     from common.wfn_layout import psi_specs
     from distrib_la import gemm_plan
-    from .greens_function_kernel import build_G_tau, chi_valence_chunks
+    from .greens_function_kernel import build_G_tau, price_chi0_node
     from .wavefunction_bundle import CHI_Q_SPEC as _chi_spec, CHI_R_SPEC as _chi_R_spec
 
     psi_nmu_spec, psi_mun_spec = psi_specs(layout)
@@ -498,9 +496,8 @@ def _get_chi_minimax_kernel_fused(mesh_xy, kgrid, nk, n_out, complex_contour,
     # weights even when alpha is complex (the ordered imaginary probe): their antiunitary
     # partner is conj(G), read on the load, so no partner tile is built.
     real_t = real_times or not complex_contour
-    n_vc = chi_valence_chunks(n_parent=nk_in, n_rmu=n_rmu, ns=ns, n_full=nk, n_out=n_out,
-                              n_val=nb_full, n_band=nb_full, mesh=mesh_xy,
-                              partner=anti and not real_t)
+    price_chi0_node(n_parent=nk_in, n_rmu=n_rmu, ns=ns, n_full=nk, n_out=n_out,
+                    n_band=nb_full, mesh=mesh_xy, partner=anti and not real_t)
     if nk_in != k_unfold_plan.n_parent or k_unfold_plan.n_full != nk:
         raise ValueError("chi parent plan: face k extent or full-k extent disagrees with its plan.")
     door = make_kconv_chi_unfold(mesh_xy, kgrid, k_unfold_plan.unfold_load_tables(),
@@ -525,33 +522,14 @@ def _get_chi_minimax_kernel_fused(mesh_xy, kgrid, nk, n_out, complex_contour,
             t_scalar, alpha_col = xs
             tau = jnp.real(t_scalar).astype(jnp.float64) if real_t else t_scalar
             t_c = tau if real_t else jnp.conj(tau)
-            green = lambda t, ref, mask, band_range=None, psi=(psi_mun, psi_nmu): build_G_tau(
-                psi[0], psi[1], enk_full, t, e_ref=ref, mask=mask, layout=layout,
-                gemm=g_plan, k_unfold_plan=k_unfold_plan, trim_zero_bands=True, unfold=False,
-                band_range=band_range)
-            alpha = alpha_col.astype(jnp.complex128)
+            green = lambda t, ref, mask: build_G_tau(
+                psi_mun, psi_nmu, enk_full, t, e_ref=ref, mask=mask, layout=layout,
+                gemm=g_plan, k_unfold_plan=k_unfold_plan, trim_zero_bands=True, unfold=False)
+            Gv = green(-tau, vmax, mask_v)
             Gc = green(t_c, cmin, mask_c)
-            if n_vc == 1:
-                chunks = (None,)
-            else:
-                # The valence support's band interval, split into n_vc ranges.
-                occupied = jnp.any(mask_v, axis=0)
-                lo = jnp.argmax(occupied)
-                hi = nb_full - jnp.argmax(occupied[::-1])
-                edges = [lo + ((hi - lo) * c) // n_vc for c in range(n_vc + 1)]
-                chunks = tuple(zip(edges[:-1], edges[1:]))
-            psi = (psi_mun, psi_nmu)
-            for c, band_range in enumerate(chunks):
-                if c:
-                    # The next chunk's Green is built only after the previous one is
-                    # consumed, so one Gv chunk is live at a time (XLA would otherwise
-                    # schedule the chunks together).
-                    acc, psi = jax.lax.optimization_barrier((acc, psi))
-                Gv = green(-tau, vmax, mask_v, band_range, psi)
-                # A Green of real weights reads its partner as conj(G) on the load.
-                partners = () if Gv.conj_partner else (Gv.transpose, Gc.transpose)
-                acc = door(acc, Gv.G, Gc.G, alpha, *partners)
-            return acc, None
+            # A Green of real weights reads its partner as conj(G) on the load.
+            partners = () if Gv.conj_partner else (Gv.transpose, Gc.transpose)
+            return door(acc, Gv.G, Gc.G, alpha_col.astype(jnp.complex128), *partners), None
 
         acc, _ = jax.lax.scan(node, acc0, (nodes.t, alpha_rows), unroll=1)
         return tuple(chi_fftn(acc[o]) for o in range(n_out))

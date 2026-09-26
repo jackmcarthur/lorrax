@@ -390,27 +390,21 @@ def sigma_spin_block(*, n_parent, n_rmu, ns, n_full, n_band, mesh, partner_tiles
     return d
 
 
-def chi_valence_chunks(*, n_parent, n_rmu, ns, n_full, n_out, n_val, n_band, mesh, partner):
-    """Valence-band passes of the fused chi0 node (``w_isdf._get_chi_minimax_kernel_fused``).
+def price_chi0_node(*, n_parent, n_rmu, ns, n_full, n_out, n_band, mesh, partner):
+    """Record the price of one fused chi0 node (``w_isdf._get_chi_minimax_kernel_fused``).
 
-    chi_tau = sum_ab conj(Gc'_ab) Gv'_ab is linear in Gv, so the valence Green may be
-    built and accumulated in band chunks against one conduction Green.  A chunk's Gv is
-    still a whole ``(μ, ν)`` tile: chunking trims only the Gv build's panels.  New per
-    rank beside what is live: ``(1 + partner)·T_p`` for each of Gc and one Gv chunk, the
-    accumulator ``16·n_out·N_k·μ²/P``, and the panels ``(1 + partner)·M_axis·(1 + 1/n)``
-    (:func:`_green_terms`).  The smallest ``n`` that fits the stage room wins, capped
-    at ``n_val``; every process computes the same ``n``.
+    New per rank beside what is live: the valence and conduction parent Greens
+    ``2·(1 + partner)·T_p`` (``partner`` when an antiunitary row reads a conjugate-face
+    tile), the accumulator ``16·n_out·N_k·μ²/P`` and the builds' panels
+    ``2·(1 + partner)·M_axis`` (:func:`_green_terms`).  Nothing here is chunked: every term
+    is a whole (μ, ν) tile, and ``distrib_la.panel_matmul`` bounds the panels itself.
     """
     tile, panels = _green_terms(n_parent=n_parent, n_rmu=n_rmu, ns=ns, n_band=n_band,
                                 mesh=mesh)
     acc = 16.0 * int(n_out) * int(n_full) * int(n_rmu) ** 2 / (
         int(mesh.shape['x']) * int(mesh.shape['y']))
-    live, room = _green_stage_room(ns)
-    copies = 1.0 + float(bool(partner))
-    new = lambda n: copies * (2.0 * tile + panels * (1.0 + 1.0 / n)) + acc
-    n = next((n for n in range(1, max(1, int(n_val)) + 1) if new(n) <= room),
-             max(1, int(n_val)))
-    from common.gpu_utils import record_stage_price
-    record_stage_price("chi0, chi_valence_chunks", live + new(n), section="chi.exec")
-    return n
+    from common.gpu_utils import device_budget_bytes, device_room_bytes, record_stage_price
+    live = device_budget_bytes() - float(device_room_bytes())
+    new = 2.0 * (1.0 + float(bool(partner))) * (tile + panels) + acc
+    record_stage_price("chi0 node, price_chi0_node", live + new, section="chi.exec")
 

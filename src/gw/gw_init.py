@@ -2228,14 +2228,9 @@ def _vcoul_geometry_and_budget(
     bvec, vcoul_cutoff_ry = _vcoul_bvec_and_cutoff(cfg, wfn)
     if mem_est is None:
         mem_est = {}
-    budget_gb = float(mem_est.get('available_vcoul_gb', cfg.memory.per_device_gb))
-    try:
-        from common.gpu_utils import get_device_memory_info
-        budget_gb = min(budget_gb, float(get_device_memory_info().get('budget_gb', budget_gb)))
-    except Exception:
-        pass
     print_fn(f"    V_q bare cutoff: {vcoul_cutoff_ry:.1f} Ry")
-    print_fn(f"    V_q budget:    {budget_gb:.2f} GB")
+    print_fn(f"    V_q budget:    0.9 x (memory_per_device_gb {cfg.memory.per_device_gb:.2f} GB "
+             f"less the live bytes at V_q)")
     return bvec, vcoul_cutoff_ry
 
 
