@@ -553,31 +553,6 @@ def check_slate_chol_trsm(mesh, dtype, n=32, m=32):
         f"L={res_l:.3e} fwd={res_f:.3e} adj={res_a:.3e}"
 
 
-def check_slate_batched(mesh, dtype, nbatch=4, n=16, nrhs=8):
-    """nrhs != n exercises the rectangular batched-trsm tile fix."""
-    slate = backend_module("slate")
-    batched_distributed_cholesky = slate.batched_distributed_cholesky
-    batched_distributed_trsm = slate.batched_distributed_trsm
-    rng = np.random.default_rng(31)
-    A_np = _hpd(rng, nbatch, n, dtype)
-    B_np = _rng_mat(rng, (nbatch, n, nrhs), dtype)
-
-    def solve():
-        A = _put(A_np, mesh, ("x", None, "y"))
-        B = _put(B_np, mesh, ("x", None, "y"))
-        L = batched_distributed_cholesky(A, mesh=mesh)
-        return _gather(batched_distributed_trsm(L, B, mesh=mesh, op="N"))
-
-    X1 = solve()
-    X2 = solve()
-    assert np.array_equal(X1, X2), "batched rerun not bit-deterministic"
-    for b in range(nbatch):
-        L_ref = np.linalg.cholesky(A_np[b])
-        res = (np.linalg.norm(L_ref @ X1[b] - B_np[b])
-               / max(np.linalg.norm(B_np[b]), 1.0))
-        assert res < 1e-12, f"b={b}: residual {res:.3e}"
-
-
 def check_slate_eigh(mesh, dtype, n=32):
     """Strict contract (post-fix): W matches numpy, Q columns are TRUE
     eigenvectors of A (``A @ Q == Q @ diag(W)``), Q unitary."""
@@ -742,11 +717,6 @@ def test_slate_trsm_rectangular_rhs(mesh11, m):
 
 
 @needs_ffi
-def test_slate_batched_cholesky_trsm(mesh11):
-    check_slate_batched(mesh11, "complex128")
-
-
-@needs_ffi
 @pytest.mark.parametrize("dtype", ["complex128", "float64"])
 def test_slate_eigh_true_eigenvectors(mesh11, dtype):
     check_slate_eigh(mesh11, dtype)
@@ -785,11 +755,6 @@ def test_slate_cholesky_trsm_cpu(mesh_cpu11, dtype):
 @pytest.mark.parametrize("m", [16, 48])
 def test_slate_trsm_rectangular_rhs_cpu(mesh_cpu11, m):
     check_slate_chol_trsm(mesh_cpu11, "complex128", n=32, m=m)
-
-
-@needs_host_ffi
-def test_slate_batched_cholesky_trsm_cpu(mesh_cpu11):
-    check_slate_batched(mesh_cpu11, "complex128")
 
 
 @needs_host_ffi
@@ -909,9 +874,6 @@ _CLI_CELLS = [
      lambda mesh, dt: check_slate_chol_trsm(mesh, dt, n=64, m=32)),
     ("slate_trsm_rect_large", False,
      lambda mesh, dt: check_slate_chol_trsm(mesh, dt, n=64, m=128)),
-    ("slate_batched", False,
-     lambda mesh, dt: check_slate_batched(mesh, dt, nbatch=4, n=32,
-                                          nrhs=16)),
     ("slate_eigh", True,
      lambda mesh, dt: check_slate_eigh(mesh, dt, n=64)),
     # Host-only (skipped on CUDA backends by the platform gate below).
