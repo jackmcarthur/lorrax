@@ -3767,17 +3767,17 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
                 f"    SC head: {velocity_kind} + live Fermi-surface Drude "
                 f"and static Thomas-Fermi direct head "
                 f"(nb={pt.nb_logical}, samples={len(head_omegas)}; no wings)")
-        if (entry_occ_state is not None
-                and iteration_head_response.drude_tensor is not None):
-            from .qsgw_head import metal_head_summary
-            _record_sc(inputs, "    SC " + metal_head_summary(
-                iteration_head_response, entry_occ_state))
         else:
             _record_sc(
                 inputs,
                 f"    SC head: {velocity_kind} + current-basis wings "
                 "from saved parallel transport/current centroid bundle "
                 f"(nb={pt.nb_logical}, samples={len(head_omegas)})")
+        if (entry_occ_state is not None
+                and iteration_head_response.drude_tensor is not None):
+            from .qsgw_head import metal_head_summary
+            _record_sc(inputs, "    SC " + metal_head_summary(
+                iteration_head_response, entry_occ_state))
 
     elif fixed_dft_full_head:
         # ``sc_head_update=off`` freezes the DFT direct response; it does not
