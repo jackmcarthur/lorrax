@@ -1,16 +1,12 @@
 """The frequency-resolved W schema and the staged B/Ω store, at the seams.
 
-WHAT THIS SUITE IS AND WHAT IT DELIBERATELY IS NOT.  Every gate below
-runs HOST-SIDE with plain h5py at LOGICAL extents.  The phdf5 FFI is not
-built on WSL, so the format is tested where its claims actually live —
-the attrs, the ranks, the ledgers and the refusals — exactly the way the
-symmetry lane tested the q_irr format it extends.  The ``SlabIO`` write
-path, where every rank contributes its own (μ, ν) hyperslab and no rank
-holds the whole array, is what ``mpa_store.stamp_w_omega`` exists for;
-its Perlmutter leg is ``tests/multi_device/mpa_fit_stream_gate.py``.
-Nothing here claims
-multi-rank coverage; ``test_the_column_block_is_sharded_on_rows_only``
-tests the REFUSAL that keeps the sharding 1-D, not the sharding itself.
+WHAT THIS SUITE IS AND WHAT IT DELIBERATELY IS NOT.  Every store below
+is written and read through the production collective forms on a 1x1
+CPU mesh, with ``file_io.slab_io.SlabIO`` replaced by the host stand-in
+``HostSlabIO`` (``tests/_mpa_test_geometry.py``).  The format is tested
+where its claims live — the attrs, the ranks, the ledgers and the
+refusals.  Nothing here claims multi-rank coverage; the Perlmutter leg
+is ``tests/multi_device/mpa_fit_stream_gate.py``.
 
 THE SYNTHETIC GEOMETRY IS ORBIT-CLOSED BY CONSTRUCTION, not by luck.
 The centroid set is the union of a handful of seeds' orbits under a
@@ -49,7 +45,8 @@ from file_io import mpa_store as MS                               # noqa: E402
 from gw.mpa import tiling                                         # noqa: E402
 from tests._mpa_test_geometry import (                            # noqa: E402
     FFT as _FFT, SYMS as _SYMS, TNP as _TNP, N_Q_FULL as _N_Q_FULL,
-    N_Q_IBZ as _N_Q_IBZ, HostSlabIO, closed_centroid_set, geometry)
+    N_Q_IBZ as _N_Q_IBZ, HostSlabIO, closed_centroid_set, geometry,
+    put_fit_block, read_fit_store, read_w_slab_logical, write_w_collective)
 
 #: Eight seeds whose glide orbits union to this suite's centroid set;
 #: the builder itself lives in tests/_mpa_test_geometry.py.
@@ -155,19 +152,43 @@ def _mesh():
 
 
 def _write_w(path, name="W_qmunu_omega", n_omega=6, ready=True, seed=17):
-    """A complete W(ω) file, plus the tensor it was written from."""
+    """A W(ω) file, plus the tensor it was written from.
+
+    ``ready`` is one bool or one per slab; an unready slab holds its bytes
+    with the ledger bit unset.
+    """
     tables, verdict, n_mu = _geometry()
     W = _w_omega(n_omega, _N_Q_IBZ, n_mu, seed=seed)
     omega = np.array([0.0 + 0.1j, 0.4 + 0.1j, 0.9 + 0.1j,
                       0.0 + 1.0j, 0.5 + 1.0j, 1.2 + 1.0j][:n_omega])
     line = np.array([0, 0, 0, 1, 1, 1][:n_omega], dtype=np.int32)
-    MS.allocate_w_omega(
-        path, name, n_omega=n_omega, n_q_on_disk=_N_Q_IBZ, n_mu=n_mu,
-        tables=tables, omega=omega, sampling=_SAMPLING, omega_line=line,
-        closure_verdict=verdict, provenance={"deck": "synthetic-glide"})
-    for i in range(n_omega):
-        MS.write_w_slab(path, name, i, W[i], ready=ready)
+    write_w_collective(
+        path, name, W, mesh=_mesh(), tables=tables, verdict=verdict,
+        omega=omega, sampling=_SAMPLING, omega_line=line,
+        provenance={"deck": "synthetic-glide"}, ready=ready)
     return W, tables, verdict, n_mu, omega, line
+
+
+def _put_slab(path, name, i_omega, slab):
+    """One logical ``(n_q, n_mu, n_mu)`` slab through the collective writer."""
+    import jax
+    from jax.sharding import NamedSharding, PartitionSpec as P
+
+    hdr = _bundle_reader.read_w_header(path, name)
+    shape = (hdr["n_omega"], hdr["n_q_on_disk"], hdr["n_mu"], hdr["n_mu"])
+    mesh = _mesh()
+    MS.write_w_slab_collective(
+        path, name, i_omega,
+        jax.device_put(np.asarray(slab),
+                       NamedSharding(mesh, P(None, "x", "y"))),
+        mesh_xy=mesh, global_shape=shape)
+
+
+@pytest.fixture(autouse=True)
+def _host_slab_io(monkeypatch):
+    """Every store here goes through the collective forms on the host shim."""
+    import file_io.slab_io as slab_io
+    monkeypatch.setattr(slab_io, "SlabIO", HostSlabIO)
 
 
 @pytest.fixture()
@@ -196,36 +217,12 @@ def test_every_frequency_slab_round_trips_bit_identically(tmpdir_path):
     """
     W, _, _, _, _, _ = _write_w(tmpdir_path)
     for i in range(W.shape[0]):
-        got, hdr = _bundle_reader.read_w_slab(tmpdir_path, "W_qmunu_omega", i)
+        got, hdr = read_w_slab_logical(
+            tmpdir_path, "W_qmunu_omega", i, mesh=_mesh())
         assert np.array_equal(got, W[i]), f"slab {i} is not bit-identical"
         _assert_offdiag_elementwise(got, W[i], f"slab {i}")
         assert hdr["n_omega"] == W.shape[0]
         assert bool(hdr["data_ready"][i])
-
-
-def test_completed_sample_store_refuses_destructive_replacement(tmpdir_path):
-    _write_w(tmpdir_path, name="chi")
-    _write_w(tmpdir_path, name="Wc", seed=23)
-    with pytest.raises(ValueError) as error:
-        MS.refuse_completed_artifact_replacement(
-            tmpdir_path,
-            os.path.join(os.path.dirname(tmpdir_path), "missing_fit.h5"),
-            sample_names=("chi", "Wc"),
-        )
-    message = str(error.value)
-    assert "GATE mpa_completed_artifacts_write_once" in message
-    assert f"completed sample store: {os.path.abspath(tmpdir_path)}" in message
-    assert "mpa_overwrite_completed_artifacts = true" in message
-
-
-def test_partial_sample_store_is_not_misreported_as_resumable(tmpdir_path):
-    _write_w(tmpdir_path, name="chi", ready=True)
-    _write_w(tmpdir_path, name="Wc", ready=False, seed=23)
-    assert MS.refuse_completed_artifact_replacement(
-        tmpdir_path,
-        os.path.join(os.path.dirname(tmpdir_path), "missing_fit.h5"),
-        sample_names=("chi", "Wc"),
-    ) == ()
 
 
 def _sample_resume_components(path, *, provenance=None):
@@ -242,10 +239,9 @@ def _sample_resume_components(path, *, provenance=None):
     return [dict(common, name="chi"), dict(common, name="Wc")]
 
 
-def _serial_allocate_component(path, name, spec, *, mode="a"):
-    serial = dict(spec)
-    serial.pop("n_rmu_logical", None)
-    MS.allocate_w_omega(path, name, mode=mode, **serial)
+def _allocate_component(path, name, spec, *, mode="a"):
+    MS.allocate_w_omega_collective(
+        path, name, mesh_xy=_mesh(), mode=mode, **spec)
 
 
 def test_partial_sample_resume_preserves_independent_chi_wc_ledgers(
@@ -254,13 +250,13 @@ def test_partial_sample_resume_preserves_independent_chi_wc_ledgers(
     for index, component in enumerate(components):
         spec = dict(component)
         name = spec.pop("name")
-        _serial_allocate_component(
+        _allocate_component(
             tmpdir_path, name, spec, mode="w" if index == 0 else "a")
     n_mu = components[0]["n_mu"]
     slab = np.ones((_N_Q_IBZ, n_mu, n_mu), np.complex128)
-    MS.write_w_slab(tmpdir_path, "chi", 0, slab)
-    MS.write_w_slab(tmpdir_path, "chi", 1, slab * 2)
-    MS.write_w_slab(tmpdir_path, "Wc", 0, slab * 3)
+    _put_slab(tmpdir_path, "chi", 0, slab)
+    _put_slab(tmpdir_path, "chi", 1, slab * 2)
+    _put_slab(tmpdir_path, "Wc", 0, slab * 3)
     monkeypatch.setattr(
         MS, "allocate_w_omega_collective",
         lambda *_a, **_k: pytest.fail("compatible surviving dataset replaced"))
@@ -277,17 +273,18 @@ def test_partial_sample_appends_only_missing_component_after_validation(
     components = _sample_resume_components(tmpdir_path)
     first = dict(components[0])
     name = first.pop("name")
-    _serial_allocate_component(tmpdir_path, name, first, mode="w")
+    _allocate_component(tmpdir_path, name, first, mode="w")
     n_mu = first["n_mu"]
-    MS.write_w_slab(
+    _put_slab(
         tmpdir_path, "chi", 0,
         np.ones((_N_Q_IBZ, n_mu, n_mu), np.complex128))
     allocations = []
+    real_allocate = MS.allocate_w_omega_collective
 
     def allocate(path, name, *, mesh_xy, mode, **spec):
         del mesh_xy
         allocations.append((name, mode))
-        _serial_allocate_component(path, name, spec, mode=mode)
+        real_allocate(path, name, mesh_xy=_mesh(), mode=mode, **spec)
 
     monkeypatch.setattr(MS, "allocate_w_omega_collective", allocate)
     headers = MS.prepare_w_sample_store_collective(
@@ -302,7 +299,7 @@ def test_partial_sample_incompatible_provenance_refuses_without_mutation(
     components = _sample_resume_components(tmpdir_path)
     first = dict(components[0])
     name = first.pop("name")
-    _serial_allocate_component(tmpdir_path, name, first, mode="w")
+    _allocate_component(tmpdir_path, name, first, mode="w")
     incompatible = _sample_resume_components(
         tmpdir_path, provenance={"deck": "changed"})
     monkeypatch.setattr(
@@ -314,16 +311,16 @@ def test_partial_sample_incompatible_provenance_refuses_without_mutation(
 
 
 def _write_certified_fit(path):
-    MS.allocate_fit_store(
-        path, n_q=1, n_mu=2, n_p=1, energy_unit="Ry", mode="w")
+    MS.allocate_fit_store_collective(
+        path, mesh_xy=_mesh(), n_q=1, n_mu=2, n_p=1, energy_unit="Ry")
     poles = np.full((1, 2, 2), 1.0 - 0.1j, dtype=np.complex128)
     residues = np.ones((1, 2, 2), dtype=np.complex128)
     diagnostics = {
         "condition": np.full((2, 2), 2.0),
         "backward_error": np.full((2, 2), 1.0e-12),
     }
-    MS.write_fit_block(
-        path, 0, np.arange(2), poles, residues, diagnostics)
+    put_fit_block(
+        path, 0, np.arange(2), poles, residues, diagnostics, mesh=_mesh())
     MS.finalize_fit_store(path, certification={
         "condition_max_allowed": 10.0,
         "backward_error_max_allowed": 1.0e-8,
@@ -340,8 +337,8 @@ def _partial_fit_for_resume(path):
         "solve_mode": "loewner", "solve_rcond": 1.0e-13,
         "eig_mode": "jax_qr", "fit_fused": True,
     }
-    MS.allocate_fit_store(
-        path, n_q=1, n_mu=4, n_p=1, energy_unit="Ry", mode="w",
+    MS.allocate_fit_store_collective(
+        path, mesh_xy=_mesh(), n_q=1, n_mu=4, n_p=1, energy_unit="Ry",
         grid_hash="grid", table_hash="table", centroid_hash="centroids",
         provenance=provenance)
     poles = np.full((1, 4, 2), 1.0 - 0.1j, np.complex128)
@@ -350,7 +347,8 @@ def _partial_fit_for_resume(path):
         "condition": np.full((4, 2), 2.0),
         "backward_error": np.full((4, 2), 1.0e-12),
     }
-    MS.write_fit_block(path, 0, [0, 1], poles, residues, diagnostics)
+    put_fit_block(path, 0, [0, 1], poles, residues, diagnostics,
+                  mesh=_mesh())
     return provenance, ((0, 0, 2), (0, 2, 4))
 
 
@@ -425,8 +423,8 @@ def test_final_complete_is_last_after_ready_head(tmpdir_path):
         "condition": np.full((4, 2), 2.0),
         "backward_error": np.full((4, 2), 1.0e-12),
     }
-    MS.write_fit_block(
-        tmpdir_path, 0, [2, 3], poles, residues, diagnostics)
+    put_fit_block(
+        tmpdir_path, 0, [2, 3], poles, residues, diagnostics, mesh=_mesh())
     _validate_partial_fit(tmpdir_path, provenance, schedule)
     with pytest.raises(ValueError, match="no scalar head"):
         MS.finalize_fit_store(
@@ -445,30 +443,18 @@ def test_final_complete_is_last_after_ready_head(tmpdir_path):
     assert ledger["complete"]
 
 
-def test_certified_fit_store_refuses_destructive_replacement(tmpdir_path):
+def test_certified_fit_store_is_write_once(tmpdir_path):
     fit_path = os.path.join(os.path.dirname(tmpdir_path), "certified_fit.h5")
     _write_certified_fit(fit_path)
     with pytest.raises(ValueError) as error:
-        MS.refuse_completed_artifact_replacement(
-            os.path.join(os.path.dirname(tmpdir_path), "missing_samples.h5"),
-            fit_path,
-            sample_names=("chi", "Wc"),
-        )
+        MS.refuse_finalized_fit_replacement(fit_path)
     message = str(error.value)
-    assert f"finalized certified fit store: {os.path.abspath(fit_path)}" in message
-
-
-def test_explicit_overwrite_opt_in_returns_both_protected_names(tmpdir_path):
-    _write_w(tmpdir_path, name="chi")
-    _write_w(tmpdir_path, name="Wc", seed=23)
-    fit_path = os.path.join(os.path.dirname(tmpdir_path), "certified_fit.h5")
-    _write_certified_fit(fit_path)
-    assert MS.refuse_completed_artifact_replacement(
-        tmpdir_path,
-        fit_path,
-        sample_names=("chi", "Wc"),
-        overwrite_completed=True,
-    ) == (os.path.abspath(tmpdir_path), os.path.abspath(fit_path))
+    assert "GATE mpa_completed_fit_write_once" in message
+    assert os.path.abspath(fit_path) in message
+    assert MS.refuse_finalized_fit_replacement(
+        fit_path, overwrite_completed=True) == os.path.abspath(fit_path)
+    assert MS.refuse_finalized_fit_replacement(
+        os.path.join(os.path.dirname(tmpdir_path), "missing_fit.h5")) is None
 
 
 def test_collective_writer_keeps_large_bytes_behind_slabio(
@@ -524,7 +510,9 @@ def test_collective_writer_keeps_large_bytes_behind_slabio(
         tmpdir_path, "W", 0, W, mesh_xy=mesh,
         global_shape=shape) is None
 
-    got, header = _bundle_reader.read_w_slab(tmpdir_path, "W", 0)
+    with h5py.File(tmpdir_path, "r") as f:
+        got = f["W"][0]
+    header = _bundle_reader.read_w_header(tmpdir_path, "W")
     np.testing.assert_array_equal(got, W_host)
     assert header["data_ready"].tolist() == [True]
     assert header["n_ready"] == 1
@@ -532,91 +520,23 @@ def test_collective_writer_keeps_large_bytes_behind_slabio(
         "open", "create", "close", "open", "write", "close"]
 
 
-def test_complete_pole_writer_preserves_2d_sharding_and_finalizes(
-        tmpdir_path, monkeypatch):
-    """An algebraic pole model enters the ordinary MPA store unchanged."""
-    import common.collectives as collectives
-    import file_io.slab_io as slab_io
-    import jax
-    from jax.sharding import NamedSharding, PartitionSpec as P
-
-    calls = []
-
-    class RecordingSlabIO(HostSlabIO):
-        def __init__(self, path, *, mode, mesh):
-            calls.append(("open", mode))
-            super().__init__(path, mode=mode, mesh=mesh)
-
-        def write_slab(self, name, value, **kw):
-            calls.append(("write", name, value.sharding.spec))
-            super().write_slab(name, value, **kw)
-
-    monkeypatch.setattr(slab_io, "SlabIO", RecordingSlabIO)
-    monkeypatch.setattr(collectives, "process_rank", lambda: 0)
-    monkeypatch.setattr(collectives, "barrier", lambda _name: False)
-
+def test_the_fit_store_round_trips_ordered_residues(tmpdir_path):
+    """An ordered store carries D beside B with an integrity stamp."""
     mesh = _mesh()
-    sharding = NamedSharding(mesh, P(None, None, "x", "y"))
-    # The final row/column are device-count-dependent pad and must not land.
-    shape = (1, 2, 4, 4)
-    Omega = np.full(shape, 0.8, dtype=np.float64)
-    B = np.arange(np.prod(shape), dtype=np.float64).reshape(shape) / 100.0
-    Omega[..., -1, :] = 0.0
-    Omega[..., :, -1] = 0.0
-    B[..., -1, :] = 0.0
-    B[..., :, -1] = 0.0
-    ledger = MS.write_complete_pole_store_collective(
-        tmpdir_path,
-        jax.device_put(Omega, sharding),
-        jax.device_put(B.astype(np.complex128), sharding),
-        mesh_xy=mesh,
-        n_mu_logical=3,
-        energy_unit="Ry",
-        provenance={"fit_protocol": "synthetic_algebraic",
-                    "screening_diagrams": "rpa"},
-        certification={"condition_max_allowed": 1.0,
-                       "backward_error_max_allowed": 1.0},
-    )
-
-    assert ledger["complete"] and ledger["n_p"] == 1
-    assert ledger["n_done"] == ledger["n_total"] == 6
-    assert ledger["condition_max"] == ledger["backward_error_max"] == 0.0
-    assert ledger["provenance"]["fit_protocol"] == "synthetic_algebraic"
-    got_Omega, got_B = _bundle_reader.read_poles(tmpdir_path)
-    np.testing.assert_array_equal(got_Omega, Omega[..., :3, :3])
-    np.testing.assert_array_equal(got_B, B[..., :3, :3])
-    writes = [row for row in calls if row[0] == "write"]
-    assert [row[1] for row in writes] == ["Omega_p", "B_p"]
-    assert all(row[2] == P(None, None, "x", "y") for row in writes)
-
-
-def test_complete_pole_writer_round_trips_ordered_residues(
-        tmpdir_path, monkeypatch):
-    """The algebraic GN store carries D beside B with an integrity stamp."""
-    import common.collectives as collectives
-    import file_io.slab_io as slab_io
-    import jax
-    from jax.sharding import NamedSharding, PartitionSpec as P
-
-    monkeypatch.setattr(slab_io, "SlabIO", HostSlabIO)
-    monkeypatch.setattr(collectives, "process_rank", lambda: 0)
-    monkeypatch.setattr(collectives, "barrier", lambda _name: False)
-
-    mesh = _mesh()
-    sharding = NamedSharding(mesh, P(None, None, "x", "y"))
     Omega = np.asarray([[[[0.8, 0.9], [1.0, 1.1]]]], np.complex128)
     B = np.asarray([[[[0.4, 0.3j], [-0.2j, 0.5]]]], np.complex128)
     D = np.asarray([[[[0.1j, 0.02], [0.02, -0.1j]]]], np.complex128)
-    ledger = MS.write_complete_pole_store_collective(
-        tmpdir_path, jax.device_put(Omega, sharding),
-        jax.device_put(B, sharding), B_odd_p=jax.device_put(D, sharding),
-        mesh_xy=mesh, n_mu_logical=2, energy_unit="Ry",
-        provenance={"fit_protocol": "ordered_two_point_ppm"},
-        certification={"condition_max_allowed": 1.0,
-                       "backward_error_max_allowed": 1.0})
+    MS.allocate_fit_store_collective(
+        tmpdir_path, mesh_xy=mesh, n_q=1, n_mu=2, n_p=1, energy_unit="Ry",
+        ordered_residues=True)
+    diag = {"condition": np.ones((2, 2)), "backward_error": np.zeros((2, 2))}
+    put_fit_block(tmpdir_path, 0, [0, 1], Omega[:, 0], B[:, 0], diag,
+                  mesh=mesh, B_odd=D[:, 0])
+    ledger = MS.finalize_fit_store(tmpdir_path, certification=_CERT)
 
     assert ledger["ordered_residues"] is True
-    got_Omega, got_B, got_D = _bundle_reader.read_poles(tmpdir_path, include_odd=True)
+    got_Omega, got_B, got_D, _, _ = read_fit_store(
+        tmpdir_path, mesh=mesh, include_odd=True)
     np.testing.assert_array_equal(got_Omega, Omega)
     np.testing.assert_array_equal(got_B, B)
     np.testing.assert_array_equal(got_D, D)
@@ -626,8 +546,7 @@ def test_complete_pole_writer_round_trips_ordered_residues(
         MS.fit_completion_ledger(tmpdir_path)
 
 
-def test_complete_pole_writer_refuses_noncausal_live_poles(
-        tmpdir_path, monkeypatch):
+def test_the_pole_field_census_refuses_noncausal_live_poles():
     """A dormant zero pole is legal; the same pole with residue is not."""
     import jax
     from jax.sharding import NamedSharding, PartitionSpec as P
@@ -641,11 +560,7 @@ def test_complete_pole_writer_refuses_noncausal_live_poles(
         np.asarray([[[[0.0 + 0.0j, 0.2 + 0.0j],
                       [0.3 + 0.0j, 0.4 + 0.0j]]]]), sharding)
     with pytest.raises(ValueError, match="1 live poles.*Im Omega > 0"):
-        MS.write_complete_pole_store_collective(
-            tmpdir_path, Omega, B, mesh_xy=mesh, n_mu_logical=2,
-            energy_unit="Ry", provenance={"fit_protocol": "bad"},
-            certification={"condition_max_allowed": 1.0,
-                           "backward_error_max_allowed": 1.0})
+        MS.refuse_bad_pole_fields(Omega, B, where="pole census")
 
 
 def test_the_collective_w_writers_answer_the_same_on_every_rank(
@@ -933,13 +848,6 @@ def test_collective_writer_refuses_partial_slab_before_readiness(
     assert opened == []
 
 
-def test_a_single_q_of_a_slab_is_the_same_bytes(tmpdir_path):
-    W, _, _, _, _, _ = _write_w(tmpdir_path)
-    for iq in range(_N_Q_IBZ):
-        got, _ = _bundle_reader.read_w_slab(tmpdir_path, "W_qmunu_omega", 2, q=iq)
-        assert np.array_equal(got, W[2, iq])
-
-
 def test_the_header_reports_the_grid_and_the_protocol(tmpdir_path):
     _, _, _, _, omega, line = _write_w(tmpdir_path)
     hdr = _bundle_reader.read_w_header(tmpdir_path, "W_qmunu_omega")
@@ -953,6 +861,8 @@ def test_the_header_reports_the_grid_and_the_protocol(tmpdir_path):
     assert hdr["format_version"] == MS.QIRR_FORMAT_VERSION_FREQ == 2
     assert hdr["freq_axis"] == "leading"
     assert hdr["q_storage"] == "ibz"
+    # The file stores the LOGICAL μ extent; readers pad to their own mesh.
+    assert hdr["n_rmu_logical"] == hdr["n_mu"]
     assert "qirr_generator_commit" in hdr["provenance"]
     assert hdr["provenance"]["deck"] == "synthetic-glide"
 
@@ -989,7 +899,8 @@ def test_the_leading_axis_is_removable(tmpdir_path):
                          closure_verdict=verdict,
                          provenance={"deck": "synthetic-glide"})
 
-    got, _ = _bundle_reader.read_w_slab(tmpdir_path, "W_qmunu_omega", slab)
+    got, _ = read_w_slab_logical(
+        tmpdir_path, "W_qmunu_omega", slab, mesh=_mesh())
     ref, _ = QS.read_tensor(v1, "W0_qmunu", unfold=False)
     assert np.array_equal(got, ref), (
         "the frequency slab is not the bytes a frequency-free file holds")
@@ -1028,19 +939,20 @@ def test_an_unstamped_frequency_slab_refuses(tmpdir_path):
     The producer fills ω one line-batched sweep at a time, so a file
     with some slabs written and some not is a state the pipeline REACHES
     — after a preemption, or mid-run — rather than one it crashes into.
-    ``write_w_slab(ready=False)`` is that state, built by the writer
-    rather than hand-forged, and the twin beside it is the same read on
-    the same file with the bit set.
+    ``write_w_slab_collective(ready=False)`` is that state, built by the
+    writer rather than hand-forged, and the twin beside it is the same
+    read on the same file with the bit set.
     """
-    W, _, _, _, _, _ = _write_w(tmpdir_path, n_omega=4, ready=True)
-    MS.write_w_slab(tmpdir_path, "W_qmunu_omega", 1, W[1], ready=False)
+    W, _, _, _, _, _ = _write_w(
+        tmpdir_path, n_omega=4, ready=[True, False, True, True])
+    mesh = _mesh()
 
-    _bundle_reader.read_w_slab(tmpdir_path, "W_qmunu_omega", 0)                # TWIN
-    with pytest.raises(ValueError, match="data_ready bit is False"):
-        _bundle_reader.read_w_slab(tmpdir_path, "W_qmunu_omega", 1)
+    read_w_slab_logical(tmpdir_path, "W_qmunu_omega", 0, mesh=mesh)   # TWIN
+    with pytest.raises(ValueError, match="allocated but not ready"):
+        read_w_slab_logical(tmpdir_path, "W_qmunu_omega", 1, mesh=mesh)
     # Announced, the placeholder is inspectable.
-    got, hdr = _bundle_reader.read_w_slab(tmpdir_path, "W_qmunu_omega", 1,
-                              require_ready=False)
+    got, hdr = read_w_slab_logical(tmpdir_path, "W_qmunu_omega", 1,
+                                   mesh=mesh, require_ready=False)
     assert np.array_equal(got, W[1])
     assert hdr["n_ready"] == 3
 
@@ -1054,8 +966,7 @@ def test_the_readiness_scalar_must_agree_with_the_ledger(tmpdir_path):
     file that would read as data through the old door, so the
     disagreement is refused rather than resolved in either direction.
     """
-    W, _, _, _, _, _ = _write_w(tmpdir_path, n_omega=4)
-    MS.write_w_slab(tmpdir_path, "W_qmunu_omega", 2, W[2], ready=False)
+    _write_w(tmpdir_path, n_omega=4, ready=[True, True, False, True])
     _bundle_reader.read_w_header(tmpdir_path, "W_qmunu_omega")                 # TWIN
     with h5py.File(tmpdir_path, "a") as f:
         f["W_qmunu_omega"].attrs["qirr_data_ready"] = True
@@ -1072,36 +983,33 @@ def test_the_wedge_unfolds_per_frequency(tmpdir_path):
 
     The symmetry operation acts on (q, μ, ν) and does not touch ω, so
     the stored tables are shared across the whole frequency axis and the
-    unfold is the landed kernel applied slab by slab.  The reference is
-    the independent per-element numpy formula, with the umklapp phase
-    and the TRS conjugation both live on this geometry, and the
-    comparison is element-wise on the off-diagonals.
+    unfold is the landed kernel applied slab by slab to the ONE stored
+    table set.  The reference is the independent per-element numpy
+    formula, with the umklapp phase and the TRS conjugation both live on
+    this geometry, and the comparison is element-wise on the
+    off-diagonals.
     """
     pytest.importorskip("jax")
+    import jax.numpy as jnp
+    from symmetry_maps import unfold_isdf_operator
+
     W, tables, _, _, _, _ = _write_w(tmpdir_path)
     mesh = _mesh()
+    can = _bundle_reader.read_w_tables(
+        tmpdir_path, "W_qmunu_omega").canonical()
     for i in range(W.shape[0]):
-        got, hdr = _bundle_reader.read_w_slab(tmpdir_path, "W_qmunu_omega", i,
-                                  unfold=True, mesh_xy=mesh)
+        slab, hdr = read_w_slab_logical(
+            tmpdir_path, "W_qmunu_omega", i, mesh=mesh)
+        got = np.asarray(unfold_isdf_operator(
+            jnp.asarray(slab), irr_idx=can.irr_idx_q, sym_idx=can.sym_idx_q,
+            sym_perm=can.sym_perm, L_table=can.L_table,
+            q_irr_frac=can.q_irr_frac, mesh_xy=mesh,
+            n_sym_spatial=int(can.n_sym_spatial)))
         assert got.shape == (_N_Q_FULL, W.shape[-1], W.shape[-1])
         want = _hand_unfold(W[i], tables)
         _assert_offdiag_elementwise(got, want, f"unfold at ω index {i}")
         assert np.allclose(got, want, rtol=1e-13, atol=1e-13)
         assert hdr["q_storage"] == "ibz"
-
-
-def test_the_unfold_of_a_single_stored_q_refuses(tmpdir_path):
-    """RED: a per-q unfold is not a thing, and saying so beats guessing.
-
-    The unfold gathers every full-BZ row from its IBZ parent, so it
-    needs the whole wedge at that ω.  Silently unfolding "the wedge
-    containing q" would return ``n_q_full`` rows for a caller who asked
-    for one.
-    """
-    _write_w(tmpdir_path)
-    with pytest.raises(ValueError, match="cannot unfold a single"):
-        _bundle_reader.read_w_slab(tmpdir_path, "W_qmunu_omega", 0, q=1,
-                       unfold=True, mesh_xy=None)
 
 
 # ---------------------------------------------------------------------------
@@ -1166,46 +1074,54 @@ def test_a_column_request_that_busts_the_budget_refuses(tmpdir_path):
     raised.
     """
     _, _, _, n_mu, _, _ = _write_w(tmpdir_path, n_omega=6)
+    mesh = _mesh()
     budget = MS.choose_column_budget(n_mu, 6)
     assert budget >= 1
-    _bundle_reader.read_w_columns(tmpdir_path, "W_qmunu_omega", 0,
-                      range(budget))                              # TWIN
+    _bundle_reader.read_w_columns_collective(
+        tmpdir_path, "W_qmunu_omega", 0, range(budget), mesh_xy=mesh,
+        n_cols_buffer=budget)                                     # TWIN
     over = list(range(budget + 1))
     with pytest.raises(ValueError) as exc:
-        _bundle_reader.read_w_columns(tmpdir_path, "W_qmunu_omega", 0, over)
+        _bundle_reader.read_w_columns_collective(
+            tmpdir_path, "W_qmunu_omega", 0, over, mesh_xy=mesh,
+            n_cols_buffer=len(over))
     msg = str(exc.value)
-    assert "read_w_columns" in msg and "W_qmunu_omega" in msg
+    assert "WColumnReader.read" in msg and "W_qmunu_omega" in msg
     cost = 6 * n_mu * len(over) * 16
     assert f"6*{n_mu}*{len(over)}*16 B = {cost} B" in msg, msg
     assert f"{n_mu}*{n_mu}*16 B = {n_mu * n_mu * 16} B" in msg, msg
     assert f"allows {budget}" in msg, msg
     # And the budget can be raised DELIBERATELY, which is the point of
     # refusing rather than clamping.
-    _bundle_reader.read_w_columns(tmpdir_path, "W_qmunu_omega", 0, over,
-                      tile_bytes=4 * MS.one_tile_bytes(n_mu))
+    _bundle_reader.read_w_columns_collective(
+        tmpdir_path, "W_qmunu_omega", 0, over, mesh_xy=mesh,
+        n_cols_buffer=len(over), tile_bytes=4 * MS.one_tile_bytes(n_mu))
 
 
-def test_read_w_columns_is_the_slab_read_transposed(tmpdir_path):
-    """The block is (n_omega, N_μ_rows, n_cols) and it is the same bytes.
+def test_the_column_read_is_the_slab_read_transposed(tmpdir_path):
+    """The block is (n_omega, 1, N_μ_rows, n_cols) and it is the same bytes.
 
-    Contiguous and scattered column selections both, because they take
-    different paths through HDF5 (one hyperslab versus a point
-    selection) and a format that returned different bytes down the two
-    would be wrong in exactly the way nobody looks for.
+    One contiguous hyperslab per read; a scattered selection refuses
+    rather than taking a second HDF5 path.
     """
     W, _, _, n_mu, _, _ = _write_w(tmpdir_path, n_omega=6)
+    mesh = _mesh()
     budget = MS.choose_column_budget(n_mu, 6)
     for q in range(_N_Q_IBZ):
         cols = list(range(2, 2 + min(budget, 3)))
-        blk = _bundle_reader.read_w_columns(tmpdir_path, "W_qmunu_omega", q, cols)
-        assert blk.shape == (6, n_mu, len(cols))
-        assert np.array_equal(blk, W[:, q][:, :, cols])
-    scattered = [0, 3, n_mu - 1][:budget]
-    blk = _bundle_reader.read_w_columns(tmpdir_path, "W_qmunu_omega", 1, scattered)
-    assert np.array_equal(blk, W[:, 1][:, :, scattered])
+        blk = np.asarray(_bundle_reader.read_w_columns_collective(
+            tmpdir_path, "W_qmunu_omega", q, cols, mesh_xy=mesh,
+            n_cols_buffer=len(cols)))
+        assert blk.shape[:2] == (6, 1)
+        assert np.array_equal(blk[:, 0, :n_mu, :], W[:, q][:, :, cols])
+    if budget >= 2:
+        with pytest.raises(ValueError, match="contiguous"):
+            _bundle_reader.read_w_columns_collective(
+                tmpdir_path, "W_qmunu_omega", 1, [0, n_mu - 1],
+                mesh_xy=mesh, n_cols_buffer=2)
 
 
-def test_read_w_columns_refuses_a_half_filled_grid(tmpdir_path):
+def test_the_column_read_refuses_a_half_filled_grid(tmpdir_path):
     """RED: a column block spans ALL of ω, so all of ω must be data.
 
     Stricter than the slab read on purpose.  An unwritten slab reads as
@@ -1214,40 +1130,17 @@ def test_read_w_columns_refuses_a_half_filled_grid(tmpdir_path):
     the failure the whole readiness ledger exists to prevent, in its
     most expensive form.
     """
-    W, _, _, n_mu, _, _ = _write_w(tmpdir_path, n_omega=6)
-    _bundle_reader.read_w_columns(tmpdir_path, "W_qmunu_omega", 0, [0, 1])     # TWIN
-    MS.write_w_slab(tmpdir_path, "W_qmunu_omega", 4, W[4], ready=False)
+    mesh = _mesh()
+    _write_w(tmpdir_path, name="W_full", n_omega=6)
+    _bundle_reader.read_w_columns_collective(
+        tmpdir_path, "W_full", 0, [0, 1], mesh_xy=mesh,
+        n_cols_buffer=2)                                          # TWIN
+    _write_w(tmpdir_path, n_omega=6,
+             ready=[True, True, True, True, False, True])
     with pytest.raises(ValueError, match="frequency slabs are not ready"):
-        _bundle_reader.read_w_columns(tmpdir_path, "W_qmunu_omega", 0, [0, 1])
-    blk = _bundle_reader.read_w_columns(tmpdir_path, "W_qmunu_omega", 0, [0, 1],
-                            require_ready=False)
-    assert blk.shape == (6, n_mu, 2)
-
-
-def test_the_column_block_is_sharded_on_rows_only(tmpdir_path):
-    """RED TWIN: a 2-D sharding is refused, by name, at the read.
-
-    The fit is elementwise in (μ, ν): splitting the column axis as well
-    buys no parallelism the column loop does not already have, while
-    making each rank's column count a function of the mesh shape — and
-    the column count is precisely the quantity the tile budget was
-    computed against.  So a 2-D spec is refused HERE, where the budget
-    still means what the caller computed, rather than downstream where
-    it no longer does.
-    """
-    _write_w(tmpdir_path, n_omega=6)
-    ok = tiling.row_shard_spec()
-    assert ok == (None, "x", None)
-    _bundle_reader.read_w_columns(tmpdir_path, "W_qmunu_omega", 0, [0, 1],
-                      out_spec=ok)                                 # TWIN
-    for bad in ((None, "x", "y"), ("x", "y", None), (None, None, "y"),
-                ("x", None, None)):
-        with pytest.raises(ValueError, match="ROW AXIS"):
-            _bundle_reader.read_w_columns(tmpdir_path, "W_qmunu_omega", 0, [0, 1],
-                              out_spec=bad)
-    with pytest.raises(ValueError, match="three entries"):
-        _bundle_reader.read_w_columns(tmpdir_path, "W_qmunu_omega", 0, [0, 1],
-                          out_spec=(None, "x"))
+        _bundle_reader.read_w_columns_collective(
+            tmpdir_path, "W_qmunu_omega", 0, [0, 1], mesh_xy=mesh,
+            n_cols_buffer=2)
 
 
 def test_the_walk_covers_every_column_exactly_once():
@@ -1307,12 +1200,9 @@ def test_a_rank_4_tensor_stamped_version_1_is_refused_by_the_v1_reader(
     n_omega = _N_Q_IBZ            # THE COINCIDENCE, on purpose
     W = _w_omega(n_omega, _N_Q_IBZ, n_mu)
     name = "W_qmunu_omega"
-    MS.allocate_w_omega(
-        tmpdir_path, name, n_omega=n_omega, n_q_on_disk=_N_Q_IBZ,
-        n_mu=n_mu, tables=tables, omega=np.arange(n_omega) * 0.3 + 0.1j,
-        sampling=_SAMPLING, closure_verdict=verdict)
-    for i in range(n_omega):
-        MS.write_w_slab(tmpdir_path, name, i, W[i])
+    write_w_collective(
+        tmpdir_path, name, W, mesh=_mesh(), tables=tables, verdict=verdict,
+        omega=np.arange(n_omega) * 0.3 + 0.1j, sampling=_SAMPLING)
     # Forge the version attr back to 1 — a writer that gained the axis
     # without bumping, or a hand-edited file.
     with h5py.File(tmpdir_path, "a") as f:
@@ -1440,55 +1330,11 @@ def test_a_grid_of_the_wrong_length_refuses(tmpdir_path):
     """RED: one ω per slab, and the leading axis IS the frequency axis."""
     tables, verdict, n_mu = _geometry()
     with pytest.raises(ValueError, match="leading axis"):
-        MS.allocate_w_omega(
-            tmpdir_path, "W_qmunu_omega", n_omega=4,
+        MS.allocate_w_omega_collective(
+            tmpdir_path, "W_qmunu_omega", mesh_xy=_mesh(), n_omega=4,
             n_q_on_disk=_N_Q_IBZ, n_mu=n_mu, tables=tables,
             omega=[0.1j, 0.2j], sampling=_SAMPLING,
             closure_verdict=verdict)
-
-
-# ---------------------------------------------------------------------------
-# Arm 8 — the μ pad does not reach disk, per frequency
-# ---------------------------------------------------------------------------
-
-def test_the_pad_is_reconstructed_by_the_reader_not_stored(tmpdir_path):
-    """A file written at the LOGICAL extent re-pads to the READER's own.
-
-    Inherited from the q_irr checkpoint and re-asserted through the
-    frequency axis, because a layout that gains an axis is exactly where
-    a per-axis rule gets applied to the wrong one.  The pad grows the μ
-    axes and NOT the frequency axis; the padded rows and columns are
-    zero; and the logical block is bit-identical to the unpadded read.
-    """
-    W, _, _, n_mu, _, _ = _write_w(tmpdir_path, n_omega=4)
-    hdr = _bundle_reader.read_w_header(tmpdir_path, "W_qmunu_omega")
-    assert hdr["n_rmu_logical"] == n_mu == hdr["n_mu"]
-
-    padded, _ = _bundle_reader.read_w_slab(tmpdir_path, "W_qmunu_omega", 1,
-                               n_mu_padded=n_mu + 5)
-    assert padded.shape == (_N_Q_IBZ, n_mu + 5, n_mu + 5)
-    assert np.array_equal(padded[:, :n_mu, :n_mu], W[1])
-    assert not padded[:, n_mu:, :].any()
-    assert not padded[:, :, n_mu:].any()
-
-    blk = _bundle_reader.read_w_columns(tmpdir_path, "W_qmunu_omega", 0, [0, 1],
-                            n_mu_padded=n_mu + 5)
-    assert blk.shape == (4, n_mu + 5, 2), (
-        "the ROW axis takes the pad; the columns are a selection the "
-        "caller chose and padding them would shift every index in it")
-    assert np.array_equal(blk[:, :n_mu, :], W[:, 0][:, :, [0, 1]])
-    assert not blk[:, n_mu:, :].any()
-
-
-def test_padding_down_refuses(tmpdir_path):
-    """RED: the pad only ever grows the extent."""
-    _, _, _, n_mu, _, _ = _write_w(tmpdir_path, n_omega=4)
-    with pytest.raises(ValueError, match="pad DOWN"):
-        _bundle_reader.read_w_slab(tmpdir_path, "W_qmunu_omega", 0,
-                       n_mu_padded=n_mu - 1)
-    with pytest.raises(ValueError, match="pad the row axis DOWN"):
-        _bundle_reader.read_w_columns(tmpdir_path, "W_qmunu_omega", 0, [0],
-                          n_mu_padded=n_mu - 1)
 
 
 # ---------------------------------------------------------------------------
@@ -1512,8 +1358,8 @@ def _fit_block(n_p, n_rows, n_cols, seed):
 def _staged_fit(path, n_q=2, n_mu=6, n_p=3, n_cols=2, stop_after=None,
                 energy_unit=None):
     """Walk the schedule, writing blocks; optionally stop early."""
-    MS.allocate_fit_store(
-        path, n_q=n_q, n_mu=n_mu, n_p=n_p,
+    MS.allocate_fit_store_collective(
+        path, mesh_xy=_mesh(), n_q=n_q, n_mu=n_mu, n_p=n_p,
         grid_hash="sha256:deadbeef", energy_unit=energy_unit)
     truth = {}
     steps = [(q, lo, hi) for q in range(n_q)
@@ -1523,9 +1369,15 @@ def _staged_fit(path, n_q=2, n_mu=6, n_p=3, n_cols=2, stop_after=None,
             break
         cols = list(range(lo, hi))
         Om, Bp, diag = _fit_block(n_p, n_mu, len(cols), seed=100 + k)
-        MS.write_fit_block(path, q, cols, Om, Bp, diag)
+        put_fit_block(path, q, cols, Om, Bp, diag, mesh=_mesh())
         truth[(q, lo, hi)] = (Om, Bp, diag)
     return truth, steps
+
+
+def _receipt(path):
+    """The stored body-attempt receipt, through the format's own parser."""
+    with h5py.File(path, "r") as grp:
+        return MS._read_fit_io_receipt_group(grp)
 
 
 def _fit_io_report(*, blocks_walked, blocks_skipped=0, ordered=False):
@@ -1631,7 +1483,7 @@ def test_fit_io_receipt_handles_both_body_completion_interruption_windows(
     replacement = _fit_io_report(blocks_walked=len(steps))
     preserved = MS.write_fit_io_receipt(tmpdir_path, replacement)
     assert preserved == first
-    assert _bundle_reader.read_fit_io_receipt(tmpdir_path) == first
+    assert _receipt(tmpdir_path) == first
 
     MS.finalize_fit_store(tmpdir_path, certification=_CERT)
     with pytest.raises(ValueError, match="before root COMPLETE"):
@@ -1651,7 +1503,7 @@ def test_fit_io_receipt_refuses_wrong_census_and_poisoned_ready_schema(
     with h5py.File(tmpdir_path, "a") as h5:
         h5[MS.MPA_FIT_IO_RECEIPT_SUFFIX].attrs["unexpected"] = 1
     with pytest.raises(ValueError, match="exact schema"):
-        _bundle_reader.read_fit_io_receipt(tmpdir_path)
+        _receipt(tmpdir_path)
 
 
 def _poison_fit_io_report(report, poison):
@@ -1702,7 +1554,7 @@ def test_fit_io_receipt_ready_incumbent_refuses_plausible_poison(
             receipt.attrs["count_" + key] = poisoned[key]
         receipt.attrs["ordered_residues"] = poisoned["ordered_residues"]
     with pytest.raises(ValueError, match=match):
-        _bundle_reader.read_fit_io_receipt(tmpdir_path)
+        _receipt(tmpdir_path)
 
 
 def test_b_and_omega_round_trip_with_condition_payload_intact(tmpdir_path):
@@ -1717,16 +1569,13 @@ def test_b_and_omega_round_trip_with_condition_payload_intact(tmpdir_path):
     truth, _ = _staged_fit(tmpdir_path)
     MS.finalize_fit_store(
         tmpdir_path, certification=dict(_CERT, condition_max_allowed=1e8))
-    for (q, lo, hi), (Om, Bp, diag) in truth.items():
-        gOm, gBp, gdiag, ledger = _bundle_reader.read_fit_block(
-            tmpdir_path, q, list(range(lo, hi)))
-        assert np.array_equal(gOm, Om), (q, lo, hi)
-        assert np.array_equal(gBp, Bp), (q, lo, hi)
-        assert np.array_equal(gdiag["condition"], diag["condition"])
-        assert set(gdiag) == {"condition"}
-        assert ledger["complete"]
-
-    Om, Bp, diag, ledger = _bundle_reader.read_fit_tensors(tmpdir_path)
+    Om, Bp, diag, ledger = read_fit_store(tmpdir_path, mesh=_mesh())
+    for (q, lo, hi), (tOm, tBp, tdiag) in truth.items():
+        assert np.array_equal(Om[:, q, :, lo:hi], tOm), (q, lo, hi)
+        assert np.array_equal(Bp[:, q, :, lo:hi], tBp), (q, lo, hi)
+        assert np.array_equal(diag["condition"][q, :, lo:hi],
+                              tdiag["condition"])
+    assert ledger["complete"]
     assert Om.shape == (3, 2, 6, 6) and Bp.shape == Om.shape
     assert set(diag) == {"condition"}
     assert ledger["n_done"] == ledger["n_total"] == 2 * 6
@@ -1749,15 +1598,16 @@ def test_b_and_omega_round_trip_with_condition_payload_intact(tmpdir_path):
 
 def test_pole_slice_owns_units_and_the_existing_q_unfold_tables(tmpdir_path):
     tables, _verdict, n_mu = _geometry()
-    MS.allocate_fit_store(
-        tmpdir_path, n_q=_N_Q_IBZ, n_mu=n_mu, n_p=1,
+    MS.allocate_fit_store_collective(
+        tmpdir_path, mesh_xy=_mesh(), n_q=_N_Q_IBZ, n_mu=n_mu, n_p=1,
         energy_unit="Ha", unfold_tables=tables)
     for q in range(_N_Q_IBZ):
         Om = np.full((1, n_mu, n_mu), 0.7 - 0.1j)
         Bp = np.full((1, n_mu, n_mu), 0.2 + 0.3j)
         diag = {"condition": np.ones((n_mu, n_mu)),
                 "backward_error": np.zeros((n_mu, n_mu))}
-        MS.write_fit_block(tmpdir_path, q, np.arange(n_mu), Om, Bp, diag)
+        put_fit_block(tmpdir_path, q, np.arange(n_mu), Om, Bp, diag,
+                      mesh=_mesh())
     MS.finalize_fit_store(tmpdir_path, certification=_CERT)
 
     ledger = MS.fit_completion_ledger(tmpdir_path)
@@ -1765,7 +1615,8 @@ def test_pole_slice_owns_units_and_the_existing_q_unfold_tables(tmpdir_path):
     assert ledger["q_storage"] == "ibz"
     assert ledger["n_q_full"] == tables.n_q_full
     assert ledger["table_hash"] == tables.canonical().digest()
-    Om, Bp = _bundle_reader.read_poles(tmpdir_path, pole_slice=0, to_unit="Ry")
+    Om, Bp, _, _ = read_fit_store(
+        tmpdir_path, mesh=_mesh(), pole_slice=0, to_unit="Ry")
     Om, Bp = Om[0], Bp[0]
     np.testing.assert_array_equal(Om, 2.0 * (0.7 - 0.1j))
     np.testing.assert_array_equal(Bp, 2.0 * (0.2 + 0.3j))
@@ -1773,18 +1624,22 @@ def test_pole_slice_owns_units_and_the_existing_q_unfold_tables(tmpdir_path):
 
 def test_scalar_head_fit_round_trip_units_and_readiness(tmpdir_path):
     """The tiny head axis converts only its energy-like quantities."""
-    MS.allocate_fit_store(
-        tmpdir_path, n_q=1, n_mu=2, n_p=1, energy_unit="Ha")
+    _staged_fit(tmpdir_path, n_q=1, n_mu=2, n_p=1, n_cols=2,
+                energy_unit="Ha")
     z = np.asarray([0.0 + 0.1j, 0.7 + 0.1j])
     wc = np.asarray([-14.0 + 0.0j, -3.0 + 0.2j])
     poles = np.asarray([0.8 - 0.06j, 1.4 - 0.2j])
     residues = np.asarray([0.3 + 0.1j, -0.2 + 0.05j])
-    MS.write_head_fit(
-        tmpdir_path, z, wc, poles, residues, energy_unit="Ha",
-        fit_condition=17.0, fit_backward_error=2.0e-12,
-        fit_max_abs_residual=4.0e-8, model="fixed_dft_gn")
+    MS.write_head_fit_collective(
+        tmpdir_path, z, wc, poles, residues, mesh_xy=_mesh(),
+        energy_unit="Ha", fit_condition=17.0, fit_backward_error=2.0e-12,
+        fit_max_abs_residual=4.0e-8, grid_hash="sha256:deadbeef",
+        fit_provenance={}, model="fixed_dft_gn")
+    MS.finalize_fit_store(tmpdir_path, certification=_CERT,
+                          require_head=True)
 
-    got = _bundle_reader.read_head_fit(tmpdir_path, to_unit="Ry")
+    got = _bundle_reader.read_head_fit_collective(
+        tmpdir_path, mesh_xy=_mesh(), to_unit="Ry")
     np.testing.assert_array_equal(got["sample_z"], 2.0 * z)
     np.testing.assert_array_equal(got["sample_Wc"], wc)
     np.testing.assert_array_equal(got["Omega_p"], 2.0 * poles)
@@ -1800,7 +1655,7 @@ def test_scalar_head_fit_round_trip_units_and_readiness(tmpdir_path):
     with h5py.File(tmpdir_path, "a") as f:
         f[MS.MPA_HEAD_SUFFIX].attrs["ready"] = False
     with pytest.raises(ValueError, match="NOT READY"):
-        _bundle_reader.read_head_fit(tmpdir_path)
+        _bundle_reader.read_head_fit_collective(tmpdir_path, mesh_xy=_mesh())
 
 
 @pytest.mark.parametrize("solve", ("loewner", "companion", "thiele"))
@@ -1930,15 +1785,15 @@ def test_ready_head_before_root_complete_is_idempotently_resumed(
 
 def test_sigma_fit_contract_exposes_identity_and_enforces_certificate(
         tmpdir_path):
-    MS.allocate_fit_store(
-        tmpdir_path, n_q=1, n_mu=2, n_p=1, energy_unit="Ry",
+    MS.allocate_fit_store_collective(
+        tmpdir_path, mesh_xy=_mesh(), n_q=1, n_mu=2, n_p=1, energy_unit="Ry",
         grid_hash="grid", table_hash="table", centroid_hash="centroids",
         provenance={"solver": "unit-test"})
     Om = np.full((1, 2, 2), 0.7 - 0.1j)
     Bp = np.ones_like(Om)
     diag = {"condition": np.full((2, 2), 3.0),
             "backward_error": np.full((2, 2), 2.0e-8)}
-    MS.write_fit_block(tmpdir_path, 0, [0, 1], Om, Bp, diag)
+    put_fit_block(tmpdir_path, 0, [0, 1], Om, Bp, diag, mesh=_mesh())
     ledger = MS.finalize_fit_store(
         tmpdir_path, certification={
             "condition_max_allowed": 4.0,
@@ -2024,24 +1879,14 @@ def test_an_unfinalized_store_is_readable_only_through_the_announced_door(
     """
     truth, steps = _staged_fit(tmpdir_path, stop_after=4)
     with pytest.raises(ValueError, match="NOT FINALIZED"):
-        _bundle_reader.read_fit_tensors(tmpdir_path)
-    with pytest.raises(ValueError, match="NOT FINALIZED"):
-        _bundle_reader.read_fit_block(tmpdir_path, 0, [0, 1])
+        read_fit_store(tmpdir_path, mesh=_mesh())
 
-    Om, Bp, diag, ledger = _bundle_reader.read_fit_tensors(tmpdir_path,
-                                               allow_partial=True)
+    Om, Bp, diag, ledger = read_fit_store(
+        tmpdir_path, mesh=_mesh(), allow_partial=True)
     assert not ledger["complete"]
     assert ledger["n_done"] == 4 * 2
     (q, lo, hi) = steps[0]
-    gOm, _, _, _ = _bundle_reader.read_fit_block(tmpdir_path, q, list(range(lo, hi)),
-                                     allow_partial=True)
-    assert np.array_equal(gOm, truth[(q, lo, hi)][0])
-
-    # Announced or not, a column that was never fitted still refuses:
-    # "the file is incomplete" and "the columns you asked for are
-    # incomplete" are different facts.
-    with pytest.raises(ValueError, match="are not fitted"):
-        _bundle_reader.read_fit_block(tmpdir_path, 1, [4, 5], allow_partial=True)
+    assert np.array_equal(Om[:, q, :, lo:hi], truth[(q, lo, hi)][0])
 
 
 def test_finalize_flips_the_gate_and_names_the_gaps(tmpdir_path):
@@ -2061,11 +1906,11 @@ def test_finalize_flips_the_gate_and_names_the_gaps(tmpdir_path):
     # Fill the rest, and the same call now succeeds.
     for lo, hi in tiling.column_blocks(6, 2)[1:]:
         Om, Bp, diag = _fit_block(3, 6, hi - lo, seed=lo)
-        MS.write_fit_block(tmpdir_path, 1, list(range(lo, hi)), Om, Bp,
-                           diag)
+        put_fit_block(tmpdir_path, 1, list(range(lo, hi)), Om, Bp, diag,
+                      mesh=_mesh())
     ledger = MS.finalize_fit_store(tmpdir_path, certification=_CERT)
     assert ledger["complete"] and ledger["finalized_utc"]
-    _bundle_reader.read_fit_tensors(tmpdir_path)
+    read_fit_store(tmpdir_path, mesh=_mesh())
 
 
 def test_a_second_finalize_refuses(tmpdir_path):
@@ -2081,34 +1926,8 @@ def test_a_second_finalize_refuses(tmpdir_path):
     with pytest.raises(ValueError, match="already finalized"):
         MS.finalize_fit_store(tmpdir_path, certification=_CERT)
     Om, Bp, diag = _fit_block(3, 6, 2, seed=1)
-    with pytest.raises(ValueError, match="FINALIZED"):
-        MS.write_fit_block(tmpdir_path, 0, [0, 1], Om, Bp, diag)
-
-
-def test_a_scattered_column_block_writes_and_reads_the_same_bytes(
-        tmpdir_path):
-    """The walk emits contiguous blocks; the store does not require it.
-
-    ``fit_schedule`` only ever hands out contiguous ranges — one HDF5
-    hyperslab — but a caller retrying the columns a previous pass could
-    not fit will hand a scattered set, and that path goes through a
-    point selection instead.  Same bytes down both, which is the thing
-    nobody checks and which the ledger (not the journal's span) is the
-    authority on.
-    """
-    MS.allocate_fit_store(tmpdir_path, n_q=1, n_mu=6, n_p=2)
-    Om, Bp, diag = _fit_block(2, 6, 3, seed=21)
-    MS.write_fit_block(tmpdir_path, 0, [0, 3, 5], Om, Bp, diag)
-    ledger = MS.fit_completion_ledger(tmpdir_path)
-    assert ledger["blocks_done"][0].tolist() == [1, 0, 0, 1, 0, 1]
-    assert ledger["journal"].tolist() == [[0, 0, 6]], (
-        "the journal records the SPAN; blocks_done records the truth")
-    gOm, gBp, gdiag, _ = _bundle_reader.read_fit_block(tmpdir_path, 0, [0, 3, 5],
-                                           allow_partial=True)
-    assert np.array_equal(gOm, Om) and np.array_equal(gBp, Bp)
-    assert np.array_equal(gdiag["condition"], diag["condition"])
-    with pytest.raises(ValueError, match="are not fitted"):
-        _bundle_reader.read_fit_block(tmpdir_path, 0, [1, 2], allow_partial=True)
+    with pytest.raises(ValueError, match="finalized"):
+        put_fit_block(tmpdir_path, 0, [0, 1], Om, Bp, diag, mesh=_mesh())
 
 
 def test_a_block_written_twice_refuses(tmpdir_path):
@@ -2121,56 +1940,25 @@ def test_a_block_written_twice_refuses(tmpdir_path):
     _staged_fit(tmpdir_path, stop_after=1)
     Om, Bp, diag = _fit_block(3, 6, 2, seed=9)
     with pytest.raises(ValueError, match="already fitted"):
-        MS.write_fit_block(tmpdir_path, 0, [0, 1], Om, Bp, diag)
+        put_fit_block(tmpdir_path, 0, [0, 1], Om, Bp, diag, mesh=_mesh())
 
 
-def test_the_diagnostics_are_required_and_must_be_finite(tmpdir_path):
-    """RED: no condition number, no write; and NaN is not a number.
+def test_the_diagnostics_must_be_finite(tmpdir_path):
+    """RED: NaN is not a number, so a NaN block is not certified.
 
     ``NaN > tol`` is False, so a NaN condition number written as data
     would pass the Σ stage's threshold comparison silently — the pole it
     describes would be certified by the absence of evidence.
     """
-    MS.allocate_fit_store(tmpdir_path, n_q=1, n_mu=4, n_p=2)
+    MS.allocate_fit_store_collective(
+        tmpdir_path, mesh_xy=_mesh(), n_q=1, n_mu=4, n_p=2)
     Om, Bp, diag = _fit_block(2, 4, 2, seed=5)
-    with pytest.raises(ValueError, match="backward_error"):
-        MS.write_fit_block(tmpdir_path, 0, [0, 1], Om, Bp,
-                           {"condition": diag["condition"]})
     nan = dict(diag)
     nan["condition"] = diag["condition"].copy()
     nan["condition"][1, 0] = np.nan
     with pytest.raises(ValueError, match="non-finite"):
-        MS.write_fit_block(tmpdir_path, 0, [0, 1], Om, Bp, nan)
-    with pytest.raises(ValueError, match="expected \\(4, 2\\)"):
-        MS.write_fit_block(tmpdir_path, 0, [0, 1], Om, Bp,
-                           {"condition": np.zeros((4, 3)),
-                            "backward_error": np.zeros((4, 3))})
-    MS.write_fit_block(tmpdir_path, 0, [0, 1], Om, Bp, diag)       # TWIN
-
-
-def test_extra_diagnostics_are_validated_but_not_persisted(tmpdir_path):
-    """Ephemeral fit-health arrays cannot expand the production schema."""
-    MS.allocate_fit_store(tmpdir_path, n_q=1, n_mu=4, n_p=2)
-    Om, Bp, diag = _fit_block(2, 4, 4, seed=6)
-    diag["n_poles_pruned"] = np.full((4, 4), 2.0)
-    MS.write_fit_block(tmpdir_path, 0, list(range(4)), Om, Bp, diag)
-    MS.finalize_fit_store(tmpdir_path, certification=_CERT)
-    _, _, got, _ = _bundle_reader.read_fit_block(tmpdir_path, 0, list(range(4)))
-    assert set(got) == {"condition"}
-    with h5py.File(tmpdir_path, "r") as f:
-        assert "fit_n_poles_pruned" not in f
-
-
-def test_ephemeral_diagnostics_may_change_without_changing_schema(tmpdir_path):
-    """Only the fixed condition payload crosses blocks; extras are ephemeral."""
-    MS.allocate_fit_store(tmpdir_path, n_q=1, n_mu=4, n_p=2)
-    Om, Bp, diag = _fit_block(2, 4, 2, seed=7)
-    MS.write_fit_block(tmpdir_path, 0, [0, 1], Om, Bp,
-                       dict(diag, held_out=np.zeros((4, 2))))
-    MS.write_fit_block(tmpdir_path, 0, [2, 3], Om, Bp, diag)
-    MS.finalize_fit_store(tmpdir_path, certification=_CERT)
-    _, _, got, _ = _bundle_reader.read_fit_tensors(tmpdir_path)
-    assert set(got) == {"condition"}
+        put_fit_block(tmpdir_path, 0, [0, 1], Om, Bp, nan, mesh=_mesh())
+    put_fit_block(tmpdir_path, 0, [0, 1], Om, Bp, diag, mesh=_mesh())  # TWIN
 
 
 def test_the_ledger_records_ranges_and_their_worst_diagnostics(
@@ -2227,8 +2015,8 @@ def test_the_writer_still_refuses_a_non_closed_centroid_set(tmpdir_path):
                                             fft_grid=_FFT)
     assert not verdict.closed, verdict.describe()
     with pytest.raises(RuntimeError, match="NOT CLOSED"):
-        MS.allocate_w_omega(
-            tmpdir_path, "W_qmunu_omega", n_omega=2,
+        MS.allocate_w_omega_collective(
+            tmpdir_path, "W_qmunu_omega", mesh_xy=_mesh(), n_omega=2,
             n_q_on_disk=_N_Q_IBZ, n_mu=n_mu, tables=tables,
             omega=[0.1j, 1.0j], sampling=_SAMPLING,
             closure_verdict=verdict)
@@ -2268,17 +2056,12 @@ def test_the_column_helpers_refuse_a_malformed_request(tmpdir_path):
     with pytest.raises(ValueError, match="empty"):
         MS.normalise_columns([], n_mu)
     with pytest.raises(IndexError, match="outside"):
-        _bundle_reader.read_w_columns(tmpdir_path, "W_qmunu_omega", _N_Q_IBZ, [0])
+        _bundle_reader.read_w_columns_collective(
+            tmpdir_path, "W_qmunu_omega", _N_Q_IBZ, [0], mesh_xy=_mesh(),
+            n_cols_buffer=1)
     with pytest.raises(IndexError, match="outside"):
-        _bundle_reader.read_w_slab(tmpdir_path, "W_qmunu_omega", 99)
-
-
-def test_a_slab_of_the_wrong_shape_refuses(tmpdir_path):
-    """RED: the wedge and the μ extent are the same at every ω."""
-    W, _, _, n_mu, _, _ = _write_w(tmpdir_path, n_omega=4)
-    with pytest.raises(ValueError, match="per frequency"):
-        MS.write_w_slab(tmpdir_path, "W_qmunu_omega", 0,
-                        W[0][:, :n_mu - 1, :n_mu - 1])
+        _bundle_reader.read_w_slab_collective(
+            tmpdir_path, "W_qmunu_omega", 99, mesh_xy=_mesh())
 
 
 # ---------------------------------------------------------------------------

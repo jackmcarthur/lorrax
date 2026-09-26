@@ -1061,7 +1061,7 @@ def fit_mpa_poles(
         "cond_support": cond_support,
         "cond_denominator": cond_denominator,
         # THE BACKWARD ERROR, BESIDE THE CONDITION NUMBER IT IS READ WITH.
-        # ``mpa_store.write_fit_block`` requires both and this kernel used
+        # The fit writer's certification ledger takes both and this kernel used
         # to return only the second, so the only supplier was a function
         # that re-solved this system AND refit the element to report a
         # forward residual beside it -- two fits and three solves per
