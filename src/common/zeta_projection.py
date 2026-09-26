@@ -21,58 +21,32 @@ which is structurally the band projection this repo already owns —
 ``common.contract_bands.contract_bands_block_reshard`` — with
 ``ψ_left/ψ_right`` carrying ``T``/``T†`` and its ``k`` batch axis
 carrying ``q``.  This module is that primitive's first non-Σ consumer;
-it adds only (a) the operand construction and (b) the build of ``T``
-itself from the two ζ sets.  Everything the primitive encodes (two-stage
-psum_scatter so no ``(μ,μ)`` tile is ever gathered, large payload on the
-node-local mesh axis, f64-split de-promotion, the vendor-BLAS GEMM dial,
-the impl=mpi warm-up contract, actionable divisibility refusals) is
-inherited unchanged — see ``docs/dev/staged_reshard_primitive.md``.
+it adds only (a) the operand construction and (b) the least-squares solve
+for ``T``.  The caller builds the two matrices that solve consumes;
+``gw.downfold`` builds them from pair densities.  Everything the primitive
+encodes (two-stage psum_scatter so no ``(μ,μ)`` tile is ever gathered,
+large payload on the node-local mesh axis, f64-split de-promotion, the
+vendor-BLAS GEMM dial, the impl=mpi warm-up contract, actionable
+divisibility refusals) is inherited unchanged — see
+``docs/dev/staged_reshard_primitive.md``.
 
-The metric convention (READ THIS BEFORE CHANGING THE ALGEBRA)
--------------------------------------------------------------
-The discretized inner product of two ζ's in this codebase is fixed by
-what ``gw.v_q_g_flat`` already does to build ``V_q`` — the module docstring
-there states the contract::
+The transfer (READ THIS BEFORE CHANGING THE ALGEBRA)
+----------------------------------------------------
+Given the small basis's Gram ``G_S[q, μ_S, ν_S]`` and the cross-overlap
+``O[q, μ_S, μ_L]`` in one metric, the least-squares transfer is
 
-    V_q[μ, ν] = Σ_G conj(ζ̃_{q,μ}(G)) · v(q+G) · ζ̃_{q,ν}(G)
+    T = G_S^{-1} · O                                                  (‡)
 
-over the per-q G-sphere, with ζ̃ the on-disk G-flat ζ:
-``ζ̃_{q,μ}(G) = FFT[e^{-iq·r} ζ_{q,μ}(r)]`` at ``norm="backward"``
-(``common.wfn_transforms.accumulate_rchunk_to_gflat``).  The ζ overlap is
-therefore *the same contraction with the Coulomb weight set to one*::
-
-    O[q, μ_S, μ_L] = Σ_G conj(ζ̃^S_{q,μ_S}(G)) · ζ̃^L_{q,μ_L}(G)      (†)
-
-Three consequences that are easy to get wrong:
-
-* **The e^{iq·r} phase cancels.**  Manual §5.1: ζ_{q,μ}(r) is a phase
-  ``e^{+iq·r}`` times a cell-periodic ``z_{q,μ}(r)``.  Both bases are
-  evaluated at the SAME q, so ``conj(ζ^S) ζ^L = conj(z^S) z^L`` — the
-  G-flat (cell-periodic) buffers are exactly the right operands, no
-  phase bookkeeping.
-* **This is the sphere-truncated, N_r-scaled r-grid overlap.**  At
-  ``norm="backward"`` Parseval gives ``Σ_G conj(z̃^S) z̃^L = N_r ·
-  Σ_r conj(z^S(r)) z^L(r)`` when the sum runs over the full G box; the
-  production sphere truncates it exactly the way ``V_q`` is truncated.
-  We use the same metric ``V_q`` uses, not a different one.
-* **Which is why the transfer is NOT the raw overlap.**  The
-  least-squares transfer
-
-        T = G_S^{-1} · O ,      G_S[q] = Σ_G conj(ζ̃^S) ζ̃^S           (‡)
-
-  is invariant under ``metric → c · metric`` (both ``G_S`` and ``O``
-  scale by ``c``), so the N_r factor and the sphere truncation cannot
-  leak an arbitrary scale into ``W_S``.  A bare congruence with ``O``
-  would scale as ``c²``.  ``T`` is also the *minimizer* of
-  ``‖W_L(r,r') − W_S(r,r')‖_F`` over the small basis, and it is EXACT
-  whenever the field is representable there (see
-  :func:`least_squares_transfer` and the round-trip gate).  ``mode="raw"``
-  exposes the bare-overlap congruence for callers who want it, and says
-  so out loud.
+It is invariant under ``metric → c · metric`` (both ``G_S`` and ``O``
+scale by ``c``), so a grid normalization or a sphere truncation cannot
+leak an arbitrary scale into ``W_S``; a bare congruence with ``O`` would
+scale as ``c²``.  ``T`` is also the *minimizer* of
+``‖W_L(r,r') − W_S(r,r')‖_F`` over the small basis, and it is EXACT
+whenever the field is representable there (see
+:func:`least_squares_transfer`).
 
 ``G_S`` is ``(n_q, μ_S, μ_S)`` — bounded by construction (μ_S is small:
-that is the entire premise) and the ONLY replicated object here; it is
-announced with its byte size at build time.
+that is the entire premise) and the ONLY replicated object here.
 
 Doctrine 1 (LORRAX scaling target: thousands of low-memory ranks; no
 ``N_μ²`` tile on any single rank) — how each object obeys it
@@ -82,10 +56,6 @@ object                     global shape / spec        per-rank bytes
 =========================  =========================  ==================
 ``W_L``                    (n_q, μ_L, μ_L)            ∝ μ_L²/P   ↓ with P
                            ``P(None,'x','y')``
-``ζ̃^L``                    (n_q, μ_L, n_G)            ∝ μ_L·n_G/P ↓
-                           ``P(None,None,('x','y'))``
-``ζ̃^S``                    (n_q, μ_S, n_G)            ∝ μ_S·n_G/P ↓
-                           ``P(None,None,('x','y'))``
 ``T_left``                 (n_q, μ_S, 1, μ_L)         ∝ μ_S·μ_L/p_x ↓
                            ``P(None,None,None,'x')``
 ``T_right``                (n_q, 1, μ_L, μ_S)         ∝ μ_S·μ_L/p_y ↓
@@ -96,39 +66,14 @@ object                     global shape / spec        per-rank bytes
 =========================  =========================  ==================
 
 Every entry except ``G_S`` FALLS with P, and ``G_S`` is the small basis's
-own Gram — it can never reach ``μ_L²``.  The overlap build (†) contracts
-over **G, sharded flat over the whole mesh** — the r/G axis is the
-parallel axis, exactly as required — and its rank-local partial is
-bounded independently of P by chunking the μ_S axis
-(``mu_s_chunk``), so no ``(μ_S, μ_L)``-full transient is forced either.
-
-Two overlap plans (pick by what layout your ζ can be supplied in)
------------------------------------------------------------------
-* :func:`zeta_overlap_block_reshard` — ζ sharded on **G only**; both
-  shardings of ``O`` come out of one pass.  Convenient (one ζ layout)
-  but its rank-local partial is μ_L-FULL, so its reduce-scatter payload
-  is **P-independent** and the stage is FLAT in P (measured 6.9 / 6.8 /
-  8.2 / 6.8 s at P = 4 / 16 / 64 / 144).
-* :func:`zeta_overlap_single_axis` — ζ sharded on **μ_L and G**; the
-  rank-local partial IS the output shard, so it needs ONE ``psum`` per
-  output, no μ_S chunking, and a payload that FALLS with the mesh.
-  Measured 5.26 / 2.43 / 2.22 / 1.26 s at the same four P — faster at
-  every P and the only one that scales.  Costs one extra ζ layout
-  (μ on 'x'/G on 'y' for ``O_x``, μ on 'y'/G on 'x' for ``O_y``).
-  **Use this one unless you cannot produce the second layout.**
-
-The two are gated against each other at production scale (they compute
-the same matrix through structurally different collectives); measured
-agreement 3.8e-16 … 1.0e-15 at P = 4 … 144.
+own Gram — it can never reach ``μ_L²``.
 
 Refusals (all raise BEFORE any collective, with the fix named)
 --------------------------------------------------------------
 * non-2-D mesh, or minor axis ≠ ``axes[1]`` (inherited from the
   primitive: the large payload must reduce-scatter over consecutive-rank
   groups);
-* ``μ_L % p_x`` / ``μ_L % p_y`` / ``μ_S % p_x`` / ``μ_S % p_y`` ≠ 0;
-* ``n_G % (p_x·p_y)`` ≠ 0 for the ζ operands;
-* a Gram that is not positive definite (``mode="ls"``) — reported with
+* a Gram that is not positive definite (``rcond=None``) — reported with
   the failing q and the suggestion to shrink the small basis or check
   for duplicate centroids.  No silent ridge, no silent pinv.
 """
@@ -149,26 +94,10 @@ from common.collectives import warm_mesh_cliques
 from common.contract_bands import contract_bands_block_reshard
 
 __all__ = [
-    "assert_zeta_bases_compatible",
-    "zeta_overlap_block_reshard",
-    "zeta_overlap_single_axis",
-    "zeta_gram_single_axis",
-    "zeta_gram_replicated",
     "least_squares_transfer",
-    "build_zeta_transfer",
     "project_w_between_zeta_bases",
     "transfer_operands_from_dense",
 ]
-
-
-_MU_DIV_MSG = (
-    "zeta_projection: {what}={n} must be a multiple of BOTH mesh axes "
-    "(p_{ax_x}={px}, p_{ax_y}={py}) — the ζ/W tiles are block-sharded on "
-    "both.  Pad {what} independently per axis at the caller (round up to "
-    "lcm(p_x, p_y) is NOT required; round each axis's own extent) and "
-    "strip the zero pad downstream.  Padding ζ rows with zeros is exactly "
-    "the existing ISDF n_rmu_padded contract (common.meta.Meta), and a "
-    "zero ζ row contributes zero to the overlap, so the pad is inert.")
 
 
 def _check_mesh(mesh_xy: Mesh, axes: tuple[str, str]) -> tuple[int, int]:
@@ -190,401 +119,6 @@ def _check_mesh(mesh_xy: Mesh, axes: tuple[str, str]) -> tuple[int, int]:
             f"{ax_y!r} minor, or pass axes=(major, minor).  This is the "
             f"same refusal contract_bands_block_reshard enforces.")
     return int(mesh_xy.shape[ax_x]), int(mesh_xy.shape[ax_y])
-
-
-def _require_div(n: int, mesh_xy: Mesh, what: str, axes) -> None:
-    from runtime.padding import authenticate_padded_axis
-    ax_x, ax_y = axes
-    authenticate_padded_axis(
-        n, n, mesh_xy, name=f"zeta projection {what} carrier",
-        specs=((P(ax_x, None), 0), (P(None, ax_y), 1)))
-
-
-# ---------------------------------------------------------------------------
-# Two-ζ-file compatibility: the per-q sphere must be THE SAME sphere
-# ---------------------------------------------------------------------------
-
-def assert_zeta_bases_compatible(loader_S, loader_L, *, print_fn=print) -> dict:
-    """Refuse two ζ files whose G axes are not the same G's, in the same order.
-
-    The overlap (†) is ``Σ_G conj(ζ̃^S(G)) ζ̃^L(G)`` — a sum over a shared
-    index.  On the G-flat format that index is a **per-q WFN.h5-style
-    sphere** whose positions vary with q
-    (``isdf_header/gvec_components``, shape ``(n_q, 3, ngkmax)``;
-    ``zeta_loader`` says so explicitly and refuses to narrow it
-    with a single shared ``sphere_idx``).  Two files can therefore agree
-    on ``ngkmax``, ``ngk``, ``FFTgrid`` and ``n_q`` and STILL be summing
-    different G's at the same array position — in which case the overlap
-    is silently meaningless.
-
-    This is not hypothetical.  Measured on the MoS2 12×12 80 Ry decks:
-    the μ=2406, μ=606 and two of the μ=276 ζ files share
-    ``gvec_components`` bit-for-bit, while a third μ=276 file
-    (``mos2_80ry_12x12/tmp/zeta_q.h5``) has identical ngkmax=8603,
-    identical ngk, identical FFTgrid=(36,36,135) and identical n_q=144
-    but a DIFFERENT ``gvec_components``.  Nothing in the shapes would
-    have caught it.
-
-    Checks, in order (each refusal names the fix): ζ layout, completeness
-    flag, FFT grid, n_q on disk and q layout, ngkmax, per-q ngk, and
-    finally ``gvec_components`` byte-for-byte.
-
-    Returns a dict of the agreed geometry for the caller's log.
-    """
-    import numpy as np
-
-    def _fail(what, a, b, fix):
-        raise ValueError(
-            f"zeta_projection: the two ζ files disagree on {what} — "
-            f"small={a!r} vs large={b!r}.  {fix}")
-
-    for lo, tag in ((loader_S, "small"), (loader_L, "large")):
-        if getattr(lo, "zeta_layout", None) != "G_flat":
-            raise ValueError(
-                f"zeta_projection: the {tag} ζ file is layout "
-                f"{getattr(lo, 'zeta_layout', None)!r}; the overlap consumes "
-                f"the G-flat format (the r-space layout would need an FFT "
-                f"per read).  Refit with the G-flat writer.")
-        if not bool(getattr(lo, "zeta_is_done", True)):
-            raise ValueError(
-                f"zeta_projection: the {tag} ζ file's zeta_is_done flag is "
-                f"FALSE — it was left behind by a job that died mid-write "
-                f"and its trailing chunks are undefined.  Re-run the fit; "
-                f"do NOT project from it.")
-
-    a, b = np.asarray(loader_S.fft_grid), np.asarray(loader_L.fft_grid)
-    if not np.array_equal(a, b):
-        _fail("FFTgrid", a.tolist(), b.tolist(),
-              "The two bases must be fitted on the same real-space grid; "
-              "refit one of them on the other's grid.")
-    if int(loader_S.n_q_on_disk) != int(loader_L.n_q_on_disk):
-        _fail("n_q on disk", int(loader_S.n_q_on_disk),
-              int(loader_L.n_q_on_disk),
-              "The overlap is per-q and indexes both files with the same q; "
-              "an IBZ-only file cannot be paired with a full-BZ one without "
-              "unfolding first.")
-    if loader_S.q_layout != loader_L.q_layout:
-        _fail("q layout", loader_S.q_layout, loader_L.q_layout,
-              "Unfold the IBZ file (or fold the full-BZ one) before "
-              "projecting.")
-    if int(loader_S.n_G_sph_disk) != int(loader_L.n_G_sph_disk):
-        _fail("ngkmax", int(loader_S.n_G_sph_disk),
-              int(loader_L.n_G_sph_disk),
-              "Different sphere sizes mean different cutoffs; refit at a "
-              "common zeta_cutoff_ry.")
-
-    ngk_s = getattr(loader_S, "ngk_per_q", None)
-    ngk_l = getattr(loader_L, "ngk_per_q", None)
-    if ngk_s is not None and ngk_l is not None:
-        if not np.array_equal(np.asarray(ngk_s), np.asarray(ngk_l)):
-            _fail("per-q ngk", "…", "…",
-                  "The per-q logical sphere sizes differ; the two fits did "
-                  "not see the same q-sphere.")
-
-    gv_s = getattr(loader_S, "gvec_components", None)
-    gv_l = getattr(loader_L, "gvec_components", None)
-    if gv_s is None or gv_l is None:
-        raise ValueError(
-            "zeta_projection: a G-flat ζ file is missing "
-            "isdf_header/gvec_components, so the per-q sphere it was "
-            "written against cannot be verified.  Refusing rather than "
-            "assuming the two files index the same G's — see this "
-            "function's docstring for the measured counterexample.")
-    gv_s = np.asarray(gv_s, dtype=np.int32)
-    gv_l = np.asarray(gv_l, dtype=np.int32)
-    if gv_s.shape != gv_l.shape or not np.array_equal(gv_s, gv_l):
-        n_bad = (int(np.count_nonzero(np.any(gv_s != gv_l, axis=(1, 2))))
-                 if gv_s.shape == gv_l.shape else -1)
-        raise ValueError(
-            f"zeta_projection: the two ζ files carry DIFFERENT per-q "
-            f"G-spheres (isdf_header/gvec_components differs"
-            + (f" at {n_bad} of {gv_s.shape[0]} q's" if n_bad >= 0
-               else f"; shapes {gv_s.shape} vs {gv_l.shape}")
-            + ").  Every other header field can match — ngkmax, ngk, "
-            "FFTgrid, n_q all did in the case that motivated this check — "
-            "and the overlap would still be summing conj(ζ^S) at one G "
-            "against ζ^L at a different G, position by position, giving a "
-            "plausible-looking but meaningless transfer.  Fix: use two ζ "
-            "files written by the same sphere convention (fits on the same "
-            "deck normally are), or scatter both onto a shared sphere via "
-            "gvec_components first — that scatter is NOT implemented here "
-            "or in file_io.zeta_loader.")
-
-    geom = {"n_q_on_disk": int(loader_L.n_q_on_disk),
-            "ngkmax": int(loader_L.n_G_sph_disk),
-            "fft_grid": tuple(int(x) for x in np.asarray(loader_L.fft_grid)),
-            "mu_S": int(loader_S.n_rmu), "mu_L": int(loader_L.n_rmu),
-            "q_layout": loader_L.q_layout}
-    print_fn(f"[zeta_projection] ζ pair verified compatible: "
-             f"μ_S={geom['mu_S']} μ_L={geom['mu_L']} n_q={geom['n_q_on_disk']} "
-             f"({geom['q_layout']}) ngkmax={geom['ngkmax']} "
-             f"FFT={geom['fft_grid']}; gvec_components identical "
-             f"byte-for-byte.")
-    return geom
-
-
-# ---------------------------------------------------------------------------
-# (†) the overlap / transfer numerator — G is the parallel axis
-# ---------------------------------------------------------------------------
-
-def zeta_overlap_block_reshard(
-    mesh_xy: Mesh,
-    *,
-    axes: tuple[str, str] = ("x", "y"),
-    mu_s_chunk: int | None = None,
-    target_partial_mb: float = 256.0,
-) -> Callable:
-    """Build ``overlap(zeta_S, zeta_L) -> (O_x, O_y)``.
-
-    Computes (†) with the **G axis flat-sharded over the whole mesh** —
-    the contraction axis is the parallel axis, so nothing of size
-    ``μ_L × n_G`` or ``μ_L²`` is ever rank-resident whole.
-
-    Operands (global shape → spec)::
-
-        zeta_S  (n_q, μ_S, n_G)   P(None, None, ('x','y'))
-        zeta_L  (n_q, μ_L, n_G)   P(None, None, ('x','y'))
-        O_x     (n_q, μ_S, μ_L)   P(None, None, 'x')
-        O_y     (n_q, μ_S, μ_L)   P(None, None, 'y')
-
-    Two shardings of the same matrix are produced in ONE pass because the
-    congruence needs ``T`` on both mesh axes (ψ_left wants μ_L on 'x',
-    ψ_right wants μ_L on 'y').  Deriving the second by resharding the
-    first would hand the partitioner an all-to-all it plans itself
-    (QUALITY_PATTERNS §4); both chains are therefore written
-    structurally, inside the shard_map, from the SAME rank-local partial:
-
-        loc   = Σ_{G_local} conj(ζ^S_chunk) ζ^L          rank-local
-        O_x   = psum(psum_scatter(loc, 'x', dim=μ_L), 'y')
-        O_y   = psum(psum_scatter(loc, 'y', dim=μ_L), 'x')
-
-    Each chain completes the G reduction (scatter-axis group first, then
-    the orthogonal group) while tiling μ_L, so the sum is over ALL ranks
-    and the result lands already sharded.  ``loc`` is the only object of
-    size ``(n_q, chunk, μ_L)``; ``mu_s_chunk`` bounds it independently of
-    P (default: whatever keeps it under ``target_partial_mb``).
-    """
-    from common.shard_map import shard_map
-
-    ax_x, ax_y = axes
-    _check_mesh(mesh_xy, axes)
-
-    def _overlap(zeta_S, zeta_L):
-        if zeta_S.ndim != 3 or zeta_L.ndim != 3:
-            raise ValueError(
-                f"zeta operands must be rank 3 (n_q, μ, n_G); got "
-                f"{tuple(zeta_S.shape)} / {tuple(zeta_L.shape)}")
-        n_q, mu_s, n_g = (int(d) for d in zeta_S.shape)
-        n_q_l, mu_l, n_g_l = (int(d) for d in zeta_L.shape)
-        if n_q_l != n_q or n_g_l != n_g:
-            raise ValueError(
-                f"ζ_S {tuple(zeta_S.shape)} and ζ_L {tuple(zeta_L.shape)} "
-                f"must agree on (n_q, n_G) — the overlap is per-q and over "
-                f"the SAME per-q G-sphere.  Two ζ files built on different "
-                f"FFT grids / cutoffs cannot be overlapped; refit one of "
-                f"them on the other's grid.")
-        _require_div(mu_l, mesh_xy, "mu_L", axes)
-        from runtime.padding import authenticate_padded_axis
-        authenticate_padded_axis(
-            n_g, n_g, mesh_xy, name="zeta overlap G carrier",
-            spec=P(None, None, (ax_x, ax_y)), axis=2)
-
-        chunk = mu_s_chunk
-        if chunk is None:
-            per_row = n_q * mu_l * 16.0
-            chunk = max(1, int(target_partial_mb * 1e6 / max(per_row, 1.0)))
-        chunk = int(min(max(chunk, 1), mu_s))
-        bounds = [(c, min(c + chunk, mu_s)) for c in range(0, mu_s, chunk)]
-
-        def _body(zS, zL):
-            xs, ys = [], []
-            for c0, c1 in bounds:
-                loc = jnp.einsum('qmg,qng->qmn',
-                                 jnp.conj(zS[:, c0:c1, :]), zL,
-                                 optimize=True)
-                part_x = jax.lax.psum_scatter(
-                    loc, ax_x, scatter_dimension=2, tiled=True)
-                xs.append(jax.lax.psum(part_x, ax_y))
-                part_y = jax.lax.psum_scatter(
-                    loc, ax_y, scatter_dimension=2, tiled=True)
-                ys.append(jax.lax.psum(part_y, ax_x))
-            if len(xs) == 1:
-                return xs[0], ys[0]
-            return (jnp.concatenate(xs, axis=1),
-                    jnp.concatenate(ys, axis=1))
-
-        return shard_map(
-            _body, mesh=mesh_xy,
-            in_specs=(P(None, None, (ax_x, ax_y)),
-                      P(None, None, (ax_x, ax_y))),
-            out_specs=(P(None, None, ax_x), P(None, None, ax_y)),
-            check_vma=False)(zeta_S, zeta_L)
-
-    warm_mesh_cliques(mesh_xy)
-    return _overlap
-
-
-def zeta_overlap_single_axis(
-    mesh_xy: Mesh, *, mu_axis: str, g_axis: str,
-) -> Callable:
-    """One-collective overlap with μ_L AND G both sharded — the scaling plan.
-
-    ``zeta_overlap_block_reshard`` (above) shards ONLY G and therefore
-    forms a rank-local partial that is μ_L-FULL: its reduce-scatter input
-    is ``n_q·chunk·μ_L``, **independent of P**.  Measured consequence
-    (jobs 7879488/7879491): the overlap stage is FLAT in P — 7.0 s at
-    P=4 and 7.0 s at P=16 — while its arithmetic falls as 1/P.
-
-    This plan removes that.  ζ_L is sharded on BOTH axes, μ_L over
-    ``mu_axis`` and G over ``g_axis``; ζ_S is sharded on G over
-    ``g_axis`` only (μ_S replicated — μ_S is small by premise).  Then::
-
-        loc[q, μ_S, μ_L_local] = Σ_{G_local} conj(ζ^S) ζ^L    rank-local
-        O                       = psum(loc, g_axis)
-
-    is the whole thing: ONE all-reduce, whose payload
-    ``n_q·μ_S·μ_L/p_mu`` FALLS with the mesh, and whose rank-local
-    partial IS the output shard — so there is no transient larger than
-    the result and no μ_S chunking is needed at all.  ``psum_scatter`` is
-    unnecessary here precisely because μ_L is already tiled on entry.
-
-    The cost is that the caller must supply ζ in two layouts, one per
-    output sharding (μ on 'x'/G on 'y' for ``O_x``, μ on 'y'/G on 'x' for
-    ``O_y``) — one reshard, or one re-read, or (as in the synthetic
-    driver, where ζ is analytic) one regeneration.  That is the trade:
-    a P-independent collective, or a one-off operand reshard.
-
-    Operands (global shape → spec)::
-
-        zeta_S  (n_q, μ_S, n_G)   P(None, None, g_axis)
-        zeta_L  (n_q, μ_L, n_G)   P(None, mu_axis, g_axis)
-        O       (n_q, μ_S, μ_L)   P(None, None, mu_axis)
-
-    Per-rank ζ_S is ``n_q·μ_S·n_G/p_g`` — it falls with ``p_g``, not with
-    P.  Stated rather than hidden: it is bounded by the SMALL basis
-    (65 MB at n_q=16, μ_S=504, n_G=4032, p_g=8) and can never approach
-    μ_L², but it is the one operand here that does not scale with the
-    full mesh.
-    """
-    from common.shard_map import shard_map
-
-    names = tuple(mesh_xy.axis_names)
-    if mu_axis not in names or g_axis not in names or mu_axis == g_axis:
-        raise ValueError(
-            f"zeta_overlap_single_axis: mu_axis={mu_axis!r} and "
-            f"g_axis={g_axis!r} must be two DISTINCT axes of the mesh "
-            f"{names} — μ_L and G are tiled on different mesh axes so the "
-            f"rank-local partial is already the output shard.")
-    def _overlap(zeta_S, zeta_L):
-        n_q, mu_s, n_g = (int(d) for d in zeta_S.shape)
-        n_q_l, mu_l, n_g_l = (int(d) for d in zeta_L.shape)
-        if n_q_l != n_q or n_g_l != n_g:
-            raise ValueError(
-                f"ζ_S {tuple(zeta_S.shape)} and ζ_L {tuple(zeta_L.shape)} "
-                f"must agree on (n_q, n_G) — the overlap is per-q and over "
-                f"the SAME per-q G-sphere.")
-        from runtime.padding import authenticate_padded_axis
-        authenticate_padded_axis(
-            mu_l, mu_l, mesh_xy,
-            name="single-axis zeta large-centroid carrier",
-            spec=P(None, mu_axis, g_axis), axis=1)
-        authenticate_padded_axis(
-            n_g, n_g, mesh_xy, name="single-axis zeta G carrier",
-            spec=P(None, mu_axis, g_axis), axis=2)
-
-        def _body(zS, zL):
-            loc = jnp.einsum('qmg,qng->qmn', jnp.conj(zS), zL, optimize=True)
-            return jax.lax.psum(loc, g_axis)
-
-        return shard_map(
-            _body, mesh=mesh_xy,
-            in_specs=(P(None, None, g_axis), P(None, mu_axis, g_axis)),
-            out_specs=P(None, None, mu_axis), check_vma=False)(zeta_S, zeta_L)
-
-    warm_mesh_cliques(mesh_xy)
-    return _overlap
-
-
-def zeta_gram_single_axis(mesh_xy: Mesh, *, g_axis: str) -> Callable:
-    """``gram(zeta_S) -> G_S`` for the :func:`zeta_overlap_single_axis` layout.
-
-    ζ_S is G-sharded over ``g_axis`` and replicated over the other axis, so
-    one ``psum`` over ``g_axis`` completes the G sum and leaves ``G_S``
-    replicated everywhere — the same bounded (n_q, μ_S, μ_S) object the
-    one-pass plan produces, by a cheaper route.
-    """
-    from common.shard_map import shard_map
-
-    names = tuple(mesh_xy.axis_names)
-    if g_axis not in names:
-        raise ValueError(f"g_axis={g_axis!r} not in mesh axes {names}")
-    def _gram(zeta_S):
-        n_q, mu_s, n_g = (int(d) for d in zeta_S.shape)
-        from runtime.padding import authenticate_padded_axis
-        authenticate_padded_axis(
-            n_g, n_g, mesh_xy, name="single-axis zeta Gram G carrier",
-            spec=P(None, None, g_axis), axis=2)
-
-        def _body(zS):
-            loc = jnp.einsum('qmg,qng->qmn', jnp.conj(zS), zS, optimize=True)
-            return jax.lax.psum(loc, g_axis)
-
-        out_spec = P(None, None, None)
-        return shard_map(
-            _body, mesh=mesh_xy, in_specs=(P(None, None, g_axis),),
-            out_specs=out_spec, check_vma=False)(zeta_S)
-
-    warm_mesh_cliques(mesh_xy)
-    return _gram
-
-
-def zeta_gram_replicated(
-    mesh_xy: Mesh, *, axes: tuple[str, str] = ("x", "y"),
-    mu_s_chunk: int | None = None, target_partial_mb: float = 256.0,
-) -> Callable:
-    """Build ``gram(zeta_S) -> G_S`` of shape ``(n_q, μ_S, μ_S)``, REPLICATED.
-
-    The *small* basis's own Gram (‡).  Replicated deliberately: it is the
-    one object here whose extent is set by μ_S, the dimension the whole
-    exercise makes small, and the subsequent solve ``G_S T = O`` is then
-    embarrassingly parallel over the μ_L columns (no collective).  Size is
-    announced by the caller; at μ_S=504, n_q=16 it is 65 MB.  If a future
-    caller wants μ_S in the thousands this is the line to revisit — it is
-    the only place in the module where an object does not fall with P.
-    """
-    from common.shard_map import shard_map
-
-    ax_x, ax_y = axes
-    p_x, p_y = _check_mesh(mesh_xy, axes)
-
-    def _gram(zeta_S):
-        n_q, mu_s, n_g = (int(d) for d in zeta_S.shape)
-        from runtime.padding import authenticate_padded_axis
-        authenticate_padded_axis(
-            n_g, n_g, mesh_xy, name="replicated zeta Gram G carrier",
-            spec=P(None, None, (ax_x, ax_y)), axis=2)
-        chunk = mu_s_chunk
-        if chunk is None:
-            per_row = n_q * mu_s * 16.0
-            chunk = max(1, int(target_partial_mb * 1e6 / max(per_row, 1.0)))
-        chunk = int(min(max(chunk, 1), mu_s))
-        bounds = [(c, min(c + chunk, mu_s)) for c in range(0, mu_s, chunk)]
-
-        def _body(zS):
-            out = []
-            for c0, c1 in bounds:
-                loc = jnp.einsum('qmg,qng->qmn',
-                                 jnp.conj(zS[:, c0:c1, :]), zS, optimize=True)
-                out.append(jax.lax.psum(loc, (ax_x, ax_y)))
-            return out[0] if len(out) == 1 else jnp.concatenate(out, axis=1)
-
-        return shard_map(
-            _body, mesh=mesh_xy,
-            in_specs=(P(None, None, (ax_x, ax_y)),),
-            out_specs=P(None, None, None), check_vma=False)(zeta_S)
-
-    warm_mesh_cliques(mesh_xy)
-    return _gram
 
 
 # ---------------------------------------------------------------------------
@@ -641,8 +175,7 @@ def least_squares_transfer(
                 f"ISDF basis this is the NORMAL case, not a bug: measured "
                 f"cond(G_S)=5.7e18 on the production 606-centroid MoS2 "
                 f"12×12 basis (job 7879532).  FIX: pass rcond (e.g. "
-                f"rcond=1e-10, mode='ls_trunc' at the build_zeta_transfer "
-                f"level) to use the rank-truncated pseudo-inverse — the "
+                f"rcond=1e-10) to use the rank-truncated pseudo-inverse — the "
                 f"same route the ISDF fit itself takes "
                 f"(charge_zeta_solve=rank_truncate).  Other causes worth "
                 f"excluding first: duplicated centroids, or a ζ file whose "
@@ -879,93 +412,6 @@ def transfer_operands_from_dense(T_x, T_y, mesh_xy: Mesh,
         jnp.conj(jnp.swapaxes(T_y, 1, 2))[:, None, :, :],
         NamedSharding(mesh_xy, P(None, None, ax_y, None)))
     return psi_left, psi_right
-
-
-def build_zeta_transfer(
-    zeta_S, zeta_L, mesh_xy: Mesh, *,
-    axes: tuple[str, str] = ("x", "y"),
-    mode: str = "ls",
-    rcond: float | None = None,
-    mu_s_chunk: int | None = None,
-    print_fn=print,
-    announce: bool = True,
-):
-    """ζ_S, ζ_L → the congruence operands ``(psi_left, psi_right)``.
-
-    ``mode="ls"`` (default) returns the least-squares transfer
-    ``T = G_S^{-1} O`` of (‡): the minimizer of the r-space error, exact
-    on fields representable in the small basis, and invariant to the
-    metric's overall normalization.  ``mode="raw"`` returns the bare
-    overlap ``O`` of (†) — the Galerkin numerator — and announces that
-    the result then carries the metric's scale squared.  Nothing is
-    chosen silently.
-
-    Returns ``(psi_left, psi_right, info)`` where ``info`` carries the
-    Gram bytes and the transfer's global shape for the caller's log.
-    """
-    if mode not in ("ls", "ls_trunc", "raw"):
-        raise ValueError(
-            f"zeta_projection mode must be 'ls' (least-squares transfer via "
-            f"Cholesky), 'ls_trunc' (rank-truncated pseudo-inverse — "
-            f"REQUIRED on real ISDF bases, whose Gram is numerically "
-            f"singular; pass rcond) or 'raw' (bare overlap congruence), "
-            f"got {mode!r}")
-    if mode == "ls_trunc" and rcond is None:
-        raise ValueError(
-            "mode='ls_trunc' needs an explicit rcond (relative eigenvalue "
-            "threshold, e.g. 1e-10).  It is not defaulted: the retained "
-            "rank is a physics choice and must be stated by the caller, "
-            "the same way the ISDF fit states its RCOND.")
-    if mode == "ls" and rcond is not None:
-        raise ValueError(
-            "rcond is only meaningful with mode='ls_trunc'; mode='ls' is "
-            "the exact Cholesky solve.")
-    ax_x, ax_y = axes
-    p_x, p_y = _check_mesh(mesh_xy, axes)
-    n_q, mu_s, n_g = (int(d) for d in zeta_S.shape)
-    mu_l = int(zeta_L.shape[1])
-    _require_div(mu_s, mesh_xy, "mu_S", axes)
-    _require_div(mu_l, mesh_xy, "mu_L", axes)
-
-    overlap = zeta_overlap_block_reshard(
-        mesh_xy, axes=axes, mu_s_chunk=mu_s_chunk)
-    O_x, O_y = jax.jit(overlap)(zeta_S, zeta_L)
-
-    gram_bytes = n_q * mu_s * mu_s * 16
-    if mode == "raw":
-        if announce:
-            print_fn(
-                f"[zeta_projection] mode=raw: congruence uses the BARE "
-                f"overlap O = <ζ_S|ζ_L> (†).  W_S then carries the ζ "
-                f"metric's normalization SQUARED (N_r² at norm='backward'); "
-                f"mode='ls' is the metric-invariant least-squares transfer.")
-        T_x, T_y = O_x, O_y
-    else:
-        gram = zeta_gram_replicated(mesh_xy, axes=axes, mu_s_chunk=mu_s_chunk)
-        G_S = jax.jit(gram)(zeta_S)
-        if announce:
-            print_fn(
-                f"[zeta_projection] mode=ls: T = G_S^-1·O.  G_S is the ONLY "
-                f"replicated object ({n_q}×{mu_s}×{mu_s} c128 = "
-                f"{gram_bytes / 1e6:.1f} MB/rank, bounded by the SMALL "
-                f"basis); T is (n_q={n_q}, μ_S={mu_s}, μ_L={mu_l}) sharded "
-                f"on μ_L, {n_q * mu_s * mu_l * 16 / 1e6 / p_x:.1f} MB/rank "
-                f"on '{ax_x}' + {n_q * mu_s * mu_l * 16 / 1e6 / p_y:.1f} "
-                f"MB/rank on '{ax_y}'.")
-        T_x = least_squares_transfer(G_S, O_x, mesh_xy, ax_x,
-                                     rcond=rcond, print_fn=print_fn)
-        T_y = least_squares_transfer(G_S, O_y, mesh_xy, ax_y,
-                                     rcond=rcond, print_fn=lambda *a: None)
-
-    psi_left, psi_right = jax.jit(
-        lambda a, b: transfer_operands_from_dense(a, b, mesh_xy, axes)
-    )(T_x, T_y)
-    info = {
-        "n_q": n_q, "mu_S": mu_s, "mu_L": mu_l, "n_G": n_g,
-        "gram_bytes": gram_bytes, "mode": mode,
-        "transfer_bytes_global": n_q * mu_s * mu_l * 16,
-    }
-    return psi_left, psi_right, info
 
 
 # ---------------------------------------------------------------------------
