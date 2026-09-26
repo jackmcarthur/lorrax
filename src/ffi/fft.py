@@ -1365,6 +1365,21 @@ def klead_outer_decode_refusal(mesh: Mesh, kgrid, n_c: int, optin: int | None = 
     return None
 
 
+def _outer_ksum_fma() -> int:
+    """``LORRAX_BSE_OUTER_KSUM`` (A/B, docs/dev/env_vars.md): ``dmma`` (default) runs the fused decode's
+    K sums on the fp64 tensor cores, ``fma`` on the fp64 FMA pipe (the same fragment contract; round-off
+    class), for comparing the two where their rates differ (H100, B200).  Anything else refuses."""
+    import os
+    v = os.environ.get("LORRAX_BSE_OUTER_KSUM", "dmma").strip().lower()
+    if v not in ("dmma", "fma"):
+        raise ValueError(f"LORRAX_BSE_OUTER_KSUM={v!r}: want 'dmma' (default) or 'fma'")
+    if v == "fma":
+        from ffi.gate import announce_once
+        announce_once(("bse", "outer_ksum", v), "[kconv_outer] decode K sums on the fp64 FMA pipe "
+                      "(LORRAX_BSE_OUTER_KSUM=fma; A/B only)")
+    return int(v == "fma")
+
+
 def make_local_kconv_klead_outer_decode(mesh: Mesh, kgrid, *, norm: str | None = "ortho") -> tuple:
     """Rank-local ``(prep, apply)``: :func:`make_local_kconv_klead_outer` with the BSE decode's first
     contraction fused into its store, so U never reaches HBM.
@@ -1393,7 +1408,8 @@ def make_local_kconv_klead_outer_decode(mesh: Mesh, kgrid, *, norm: str | None =
     _require_target(KCONV_KLEAD_OUTER_TARGET, "CUDA")
     _require_target(KCONV_KLEAD_OUTER_DECODE_TARGET, "CUDA")
     scale = ffi_fft_scale("ifftn", norm, nk) * ffi_fft_scale("fftn", norm, nk)
-    attrs = dict(nkx=np.int64(kg[0]), nky=np.int64(kg[1]), nkz=np.int64(kg[2]), scale=np.float64(scale))
+    attrs = dict(nkx=np.int64(kg[0]), nky=np.int64(kg[1]), nkz=np.int64(kg[2]), scale=np.float64(scale),
+                 ksum=np.int64(_outer_ksum_fma()))
 
     def _prep(pc):                              # (nk, c, a, mx) -> (a, nxb, nk, MB, 2, 8, 4)
         n_k, n_c, na, mx = pc.shape

@@ -418,10 +418,26 @@ __device__ __forceinline__ lrx_c2 lrx_mul(lrx_c2 a, lrx_c2 b) {
     lrx_c2 z = {a.x*b.x - a.y*b.y, a.x*b.y + a.y*b.x};
     return z;
 }
+#if LRX_FMA
+// The same m8n8k4 fragment contract on the FP64 FMA pipe (lane shuffles, fma in K order), for a
+// GPU whose FP64 tensor-core rate does not beat its FMA rate; round-off class against DMMA.
+__device__ __forceinline__ void lrx_dmma(double& d0, double& d1, double a, double b) {
+    const int l = threadIdx.x & 31, r = l >> 2, c0 = 2 * (l & 3);
+#pragma unroll
+    for (int q = 0; q < 4; ++q) {
+        const double aq = __shfl_sync(0xffffffffu, a, r * 4 + q);
+        const double b0 = __shfl_sync(0xffffffffu, b, c0 * 4 + q);
+        const double b1 = __shfl_sync(0xffffffffu, b, (c0 + 1) * 4 + q);
+        d0 = fma(aq, b0, d0);
+        d1 = fma(aq, b1, d1);
+    }
+}
+#else
 __device__ __forceinline__ void lrx_dmma(double& d0, double& d1, double a, double b) {
     asm volatile("mma.sync.aligned.m8n8k4.row.col.f64.f64.f64.f64 {%0,%1}, {%2}, {%3}, {%0,%1};\n"
                  : "+d"(d0), "+d"(d1) : "d"(a), "d"(b));
 }
+#endif
 __device__ __forceinline__ int fperm(int x) { return 3 * (x & 1) + 4 * ((x >> 1) & 1); }
 __device__ __forceinline__ int pcol(int x, int y) { return x * 8 + (y ^ fperm(x)); }
 
@@ -597,12 +613,12 @@ struct DecodeGeo {                          // the embedded source declares the 
     double scale;
 };
 
-using DKey = std::tuple<CUcontext, int, int, int, int, int, int>;   // ctx, nkx, nky, nkz, K, MB, conj_r
+using DKey = std::tuple<CUcontext, int, int, int, int, int, int, int>;   // ctx, nkx, nky, nkz, K, MB, conj_r, fma
 static std::map<DKey, Built> g_dcache;
 static std::map<DKey, std::string> g_dfail;
 
-static ffi::Error build_decode(int nkx, int nky, int nkz, int K, int mb, int conj_r, std::string_view mathdx_root,
-                               std::string_view cubin_dir, const Built** out) {
+static ffi::Error build_decode(int nkx, int nky, int nkz, int K, int mb, int conj_r, int fma,
+                               std::string_view mathdx_root, std::string_view cubin_dir, const Built** out) {
     const DriverApi& api = driver_api();
     if (!api.ok) return fail("driver-api resolve", api.err);
     CUcontext ctx = nullptr;
@@ -612,7 +628,7 @@ static ffi::Error build_decode(int nkx, int nky, int nkz, int K, int mb, int con
         cr = api.CtxGetCurrent(&ctx);
         if (cr != CUDA_SUCCESS || ctx == nullptr) return fail("cuCtxGetCurrent", cu_err(cr));
     }
-    const DKey key{ctx, nkx, nky, nkz, K, mb, conj_r};
+    const DKey key{ctx, nkx, nky, nkz, K, mb, conj_r, fma};
     std::lock_guard<std::mutex> lock(g_mu);
     if (auto it = g_dcache.find(key); it != g_dcache.end()) { *out = &it->second; return ffi::Error::Success(); }
     if (auto it = g_dfail.find(key); it != g_dfail.end()) return fail("kernel build (cached failure)", it->second);
@@ -660,7 +676,7 @@ static ffi::Error build_decode(int nkx, int nky, int nkz, int K, int mb, int con
         "--gpu-architecture=sm_" + std::to_string(cc_major) + std::to_string(cc_minor),
         "-DLRX_NX=" + std::to_string(nkx), "-DLRX_NY=" + std::to_string(nky), "-DLRX_NZ=" + std::to_string(nkz),
         "-DLRX_K=" + std::to_string(K), "-DLRX_THREADS=" + std::to_string(kThreads),
-        "-DLRX_MB=" + std::to_string(mb), "-DLRX_CONJ=" + std::to_string(conj_r),
+        "-DLRX_MB=" + std::to_string(mb), "-DLRX_CONJ=" + std::to_string(conj_r), "-DLRX_FMA=" + std::to_string(fma),
         "-DLRX_SM=" + std::to_string(cc_major * 100 + cc_minor * 10)};
     nvrtc::mathdx_toolchain(root, cuda_inc, "cufftdx", &prog);
     prog.kernel = "lrx_kconv_outer_decode";
@@ -671,7 +687,7 @@ static ffi::Error build_decode(int nkx, int nky, int nkz, int K, int mb, int con
     if (!dir.empty()) {
         std::ostringstream name;
         name << dir << "/kconv_outer_dec_" << nkx << "x" << nky << "x" << nkz << "_K" << K << "_mb" << mb << "_c"
-             << conj_r << "_sm" << cc_major << cc_minor << "_" << key_hex << ".cubin";
+             << conj_r << (fma ? "_fma" : "") << "_sm" << cc_major << cc_minor << "_" << key_hex << ".cubin";
         path = name.str();
     }
     nvrtc::Image img;
@@ -685,9 +701,9 @@ static ffi::Error build_decode(int nkx, int nky, int nkz, int K, int mb, int con
     cr = api.FuncSetAttribute(b.fn, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, b.smem);
     if (cr != CUDA_SUCCESS) return sticky("cuFuncSetAttribute", cu_err(cr));
     if (mklpin::announce_here() || mklpin::debug_print_here()) {
-        std::fprintf(stderr, "[kconv_outer] decode %s kgrid=(%d,%d,%d) K=%d c-blocks=%d conj_r=%d sm_%d%d in %.1f ms "
+        std::fprintf(stderr, "[kconv_outer] decode %s kgrid=(%d,%d,%d) K=%d c-blocks=%d conj_r=%d K-sum=%s sm_%d%d in %.1f ms "
                      "(8x8 tile, %d threads, 1 block/SM, smem=%d B, cubin %s)\n",
-                     img.from_disk ? "disk-cache hit" : "NVRTC built", nkx, nky, nkz, K, mb, conj_r, cc_major,
+                     img.from_disk ? "disk-cache hit" : "NVRTC built", nkx, nky, nkz, K, mb, conj_r, fma ? "fma" : "dmma", cc_major,
                      cc_minor, img.ms, kThreads, b.smem,
                      path.empty() ? "not cached (no cubin_dir)" : (img.from_disk ? path.c_str() : "stored"));
     }
@@ -717,9 +733,10 @@ static long long plan_phases(long long items, long long pairs, long long slots_r
 static ffi::Error KleadOuterDecode(cudaStream_t stream, ffi::ScratchAllocator scratch, ffi::AnyBuffer Lr,
                                    ffi::AnyBuffer Rr, ffi::AnyBuffer V, ffi::AnyBuffer Pcr,
                                    ffi::Result<ffi::AnyBuffer> A, int64_t nkx, int64_t nky, int64_t nkz,
-                                   double scale, int64_t conj_r, std::string_view mathdx_root,
+                                   double scale, int64_t conj_r, int64_t ksum, std::string_view mathdx_root,
                                    std::string_view cubin_dir) {
     auto bad = [](const std::string& why) { return fail("klead outer decode", why, ffi::ErrorCode::kInvalidArgument); };
+    if (ksum != 0 && ksum != 1) return bad("ksum must be 0 (fp64 tensor cores) or 1 (fp64 FMA)");
     if (nkx < 1 || nky < 1 || nkz < 1 || nkx > kAxisMax || nky > kAxisMax || nkz > kAxisMax) {
         std::ostringstream os;
         os << "GATE mathdx-kconv-axis: got k-grid (" << nkx << "," << nky << "," << nkz
@@ -748,8 +765,8 @@ static ffi::Error KleadOuterDecode(cudaStream_t stream, ffi::ScratchAllocator sc
     if (items * pairs == 0) return ffi::Error::Success();
     const Built* k = nullptr;
     if (ffi::Error e = build_decode(static_cast<int>(nkx), static_cast<int>(nky), static_cast<int>(nkz),
-                                    static_cast<int>(4 * H), static_cast<int>(mb), conj_r ? 1 : 0, mathdx_root,
-                                    cubin_dir, &k);
+                                    static_cast<int>(4 * H), static_cast<int>(mb), conj_r ? 1 : 0, static_cast<int>(ksum),
+                                    mathdx_root, cubin_dir, &k);
         !e.success())
         return e;
     const long long slot_bytes = nk * mb * 64 * 16;
@@ -815,5 +832,6 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Attr<int64_t>("nkz")
         .Attr<double>("scale")
         .Attr<int64_t>("conj_r")
+        .Attr<int64_t>("ksum")        // 0: K sums on the fp64 tensor cores (default), 1: fp64 FMA
         .Attr<std::string_view>("mathdx_root")
         .Attr<std::string_view>("cubin_dir"));
