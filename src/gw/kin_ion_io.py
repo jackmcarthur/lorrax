@@ -62,9 +62,7 @@ from common.scientific_output import (
 )
 import symmetry_maps                                           # noqa: E402
 from wfn_loader import IBZRows, WfnLoader                           # noqa: E402
-from file_io.kin_ion import (
-    broadcast_ibz_to_full_bz as _broadcast_ibz_slab, write_kin_ion,
-)
+from file_io.kin_ion import write_kin_ion
 from gw.gw_config import (
     BispinorGWMode,
     coerce_bispinor_gw_mode,
@@ -88,210 +86,17 @@ def _resolve_against(path: str, base_dir: str) -> str:
     return path if os.path.isabs(path) else os.path.join(base_dir, path)
 
 
-# ===========================================================================
-# THE IRREDUCIBLE k-SET, AND WHAT THE UNFOLD ACTUALLY IS
-# ===========================================================================
-# ``kin_ion`` = T + V_loc + V_NL is a SCALAR operator built from the
-# crystal's own potentials, so it commutes with
-# every operation of the space group AND with time reversal.  ψ(Sk) is
-# *defined* — by ``WfnLoader.load(k='full_bz')``, which is the only
-# producer — as the symmetry image of ψ at that k's ORBIT PARENT.  So the
-# full-BZ table holds only ``n_orbits`` distinct matrices and computing it
-# k by k is redundant work.
-#
-# WHICH WEDGE — AND THE WFN'S OWN k-SET IS NOT IT.  There are two
-# different reduced k-sets here and they are not the same size
-# (``docs/architecture/symmetry_register.md``, "THERE ARE TWO DIFFERENT
-# IBZs"):
-#
-#   FILE wedge — ``wfn.kpoints`` / ``wfn.load(k="ibz")``, length
-#     ``sym.nk_red``.  Whatever k the WFN happens to store.
-#   STAR wedge — one row per symmetry orbit, ``n_orbits`` of them:
-#     ``star_select``'s rows, which is what ``irr_idx_k`` addresses.
-#
-# They coincide on a WFN cut at the true IBZ (``si_cohsex_debug`` 8 = 8,
-# ``hbn_cohsex_debug`` 18 = 18) and they DO NOT on a WFN that stores more
-# k than the mesh has orbits (``gnppm_debug`` and ``bispinor_debug`` 9 vs
-# 5, ``cohsex_debug`` 4 vs 3).  This module sweeps and stores the STAR
-# wedge, via :func:`star_wedge_rows`, because that is the set
-# ``irr_idx_k`` and therefore every reader indexes.
-#
-# SWEEPING THE FILE WEDGE INSTEAD IS A REAL BUG, MEASURED 2026-08-17 on a
-# freshly generated ``gnppm_debug``.  A file-wedge row that is NOT an
-# orbit parent sits at a k that some other row is the parent of, and the
-# WFN's own ψ there is a DIFFERENT basis of the same eigenspaces from the
-# one ``load(k="full_bz")`` builds by symmetry — ``max|ψ_ibz − ψ_full|``
-# 3.3e-01…3.9e-01 with ``min|⟨n|n⟩|`` 0.012 on the four time-reversed
-# rows.  Those rows were computed, written, and then overwritten by the
-# reader's unfold: 4 of 9 of the sweep discarded, and a ``kin_ion.h5``
-# whose stored rows disagreed with its own star tables by 3.315e+01 Ry
-# off-diagonal (1.318e+01 on ``bispinor_debug``).  Only the parents were
-# ever read, so nothing downstream moved — which is exactly why it
-# survived.  The wedge sweep computes the parents and nothing else, so
-# the disagreement has no rows left to live on.
-#
-# But the symmetry table is TRS-AUGMENTED, and the two halves do NOT give
-# the same rule.  ``sym_mats_k`` is ``concat([S, -S])``: rows below
-# ``ntran`` are ordinary spatial operations, rows at or past it carry a
-# factor of time reversal.
-#
-#   UNITARY ROW (sym_idx < ntran).  ψ_n(Sk) = R ψ_n(k_irr) with R unitary
-#   (τ phase, umklapp and the spinor SU(2) all inside R), so
-#
-#       ⟨m,Sk|O|n,Sk⟩ = ⟨m,k_irr|R† O R|n,k_irr⟩ = ⟨m,k_irr|O|n,k_irr⟩
-#
-#   as a MATRIX, not merely isospectral: the same R acts on bra and ket
-#   and O commutes with it, so no rotation, no phase and no
-#   degenerate-subspace unitary is left over.  A pure copy.
-#
-#   ANTIUNITARY ROW (sym_idx >= ntran).  The image is Θ ψ with Θ = (spatial
-#   part)∘(time reversal), and Θ is antiunitary: ⟨Θa|Θb⟩ = conj⟨a|b⟩.
-#   With [O, Θ] = 0,
-#
-#       ⟨Θm|O|Θn⟩ = ⟨Θm|Θ(O n)⟩ = conj⟨m|O|n⟩
-#
-#   — the ELEMENT-WISE conjugate of the parent's matrix, not a copy of it.
-#   (For an exactly Hermitian O that equals the transpose, but the
-#   conjugate is what the derivation gives and what survives the operand
-#   being Hermitian only to round-off.)
-#
-# Hence the unfold is a gather PLUS a conjugation on the time-reversed
-# rows, which is exactly what ``symmetry_maps.star_broadcast`` does; this
-# module calls it rather than re-deriving the rule.
-#
-# WHERE THE UNFOLD NOW HAPPENS, AND WHY IT MOVED.  It used to run HERE, one
-# statement after the sweep, so the file on disk was the full-BZ table and
-# ``nk - nrk`` of its rows were exact copies of other rows.  The block that
-# is persisted is now the PRE-BROADCAST one and the unfold runs at the READ
-# boundary (``file_io.kin_ion``), which is a pure storage change: what the
-# reader hands back is ``unfold(stored)``, and ``stored`` is the very array
-# the broadcast used to consume, so the round trip is an identity by
-# construction rather than a property that has to hold.  MEASURED on the two
-# committed fixtures this generator actually wrote —
-# ``tests/regression/si_bse_debug`` (nk 64, nrk 8) and ``hbn_cohsex_debug``
-# (nk 18, nrk 18) — ``unfold(select(A))`` is bit-identical to the committed
-# array on BOTH datasets, max|Δ| exactly 0.000e+00, and si_bse_debug's
-# payload goes 7.3728 MB -> 0.9216 MB, 8.00x.
-#
-# THE PREDICATE, AND WHY IT IS PASSED EXPLICITLY, now lives with the call —
-# see the block above :func:`file_io.kin_ion.broadcast_ibz_to_full_bz`,
-# which carries the 183.61 eV that a wrong ``trs_reference`` costs and is
-# what the AST gate parses.  The adapter below forwards to it so there is
-# still exactly ONE ``star_broadcast`` call for this predicate in the tree.
-#
-# AND A WARNING ABOUT VALIDATING THIS.  A cell with inversion symmetry
-# needs no time-reversal rows to cover its mesh, so its ``sym_idx_k``
-# contains none and it cannot exercise the antiunitary branch at all.
-# Agreement measured on such a system says nothing whatever about the
-# conjugation; it has to be checked on a deck that actually has TRS rows.
-#
-# Nor does a within-star spread test say anything: this routine writes the
-# star members as exact copies (up to the conjugation), so the spread is
-# identically zero whether the unfold is right or wrong — a broadcast that
-# wrote ONE matrix everywhere would score just as perfectly.  The checks
-# that CAN fail are a regenerated table diffed element-by-element against
-# one the full-BZ path produced, and a count of distinct rows.
-#
-# One more trap for whoever validates this next, and it is a DIFFERENT
-# trap than it was before 3e002f2.  ``star_spread`` is the obvious tool
-# to reach for and it now works on a TRS deck: it compares each member
-# against the FIRST ROW of its star and conjugates iff the two DIFFER in
-# TRS-ness — ``trs(member) XOR trs(ref)``, the one predicate, computed by
-# ``symmetry_maps._star_conj_flags`` and shared with ``star_broadcast``'s
-# ``trs_reference="star_row"`` branch and with both ``KStarMap`` paths.
-# (Before 3e002f2 it used the member's OWN flag and did report a huge
-# spread on a table that was exactly right whenever a star's first row
-# was time-reversed.  Comments written against that behaviour are stale.)
-#
-# What that does NOT make it is a check of the broadcast below.  The
-# operand here is the raw IBZ slab, so the predicate this module wants is
-# ``trs_reference="ibz_slab"``, the member's own flag — the two predicates
-# are still different rules for different operand flavours, and the 183.61
-# eV above is what mixing them up costs.  ``star_spread`` also still says
-# nothing about a table this routine wrote (the spread argument two
-# paragraphs up): it is a check on a table somebody ELSE produced at the
-# full-BZ k-points.
-
-
-def star_wedge_rows(sym):
-    """``(wfn_rows, irr_idx_wedge)`` — the k to sweep, and the table for it.
-
-    ``wfn_rows`` are rows of the WFN's OWN k axis (``wfn.kpoints``,
-    ``wfn.load(k="ibz")``): exactly one per symmetry orbit, in
-    ``star_select``'s first-occurrence order.  ``irr_idx_wedge`` is
-    ``SymMaps.irr_idx_k`` RENUMBERED to index those rows, which is the
-    table that unfolds a slab computed on them.
-
-    Both come out of :func:`file_io.sigma_output.compact_star_tables`,
-    which ``sigma_mnk.h5`` has used since its wedge storage landed —
-    ONE renumbering rule in the tree, and first-occurrence order is what
-    makes it the order ``star_select``/``star_broadcast`` agree on (see
-    ``symmetry_maps._star_row_order``: on ``gnppm_debug`` the labels are
-    [0, 2, 6, 8, 7] and NOT the sorted [0, 2, 6, 7, 8], so sorting here
-    would return another star's matrix at two k).
-
-    ``wfn_rows`` is ``arange(nk_red)`` exactly when the WFN's k-set IS
-    the star wedge, which is every deck cut at a true IBZ; the callers
-    below use that to leave those decks bit-for-bit unchanged.
-    """
-    from file_io.sigma_output import compact_star_tables
-    irr_file = np.asarray(sym.irr_idx_k, dtype=np.int32)
-    rows_to_keep, irr_idx_wedge = compact_star_tables(irr_file)
-    return irr_file[rows_to_keep].astype(np.int32), irr_idx_wedge
-
-
-def star_tables(sym):
-    """``(irr_idx_k, sym_idx_k, n_sym_spatial)`` — what an unfold needs.
-
-    ``irr_idx_k`` is renumbered onto the STAR wedge (:func:`star_wedge_rows`),
-    because that is the slab this module computes, stores and unfolds.
-    Filing ``SymMaps.irr_idx_k`` verbatim instead would claim ``nk_red``
-    stored rows for an ``n_orbits``-row slab — the inconsistency
-    :func:`file_io.kin_ion.read_star_map` exists to refuse.
-
-    ``n_sym_spatial`` is derived from ``sym.sym_mats_k`` (always
-    ``2·ntran`` long, both SymMaps branches) rather than from the WFN
-    header, because that is the same derivation ``unfold_psi`` uses to
-    decide which rows get conjugated when it BUILDS ψ(Sk).  Reading it
-    from the header instead would let the producer and the consumer of
-    that convention drift apart.
-
-    Called twice: once to unfold in memory (the gspace V_H route below)
-    and once to write the tables into ``kin_ion.h5`` beside the slab they
-    unfold, so the file and the run cannot disagree about them.
-    ``gw.dynamic_sigma`` also passes the result to
-    ``file_io.sigma_output``, which compacts what it is given — and
-    compaction is idempotent, so that path is unmoved.
-    """
-    return (star_wedge_rows(sym)[1],
-            np.asarray(sym.sym_idx_k, dtype=np.int32),
-            int(np.asarray(sym.sym_mats_k).shape[0]) // 2)
-
-
-def broadcast_ibz_to_full_bz(A_irr, sym):
-    """``(n_orbits, …) → (nk_tot, …)`` through the star map, conj on TRS.
-
-    The writer-side spelling of :func:`file_io.kin_ion.
-    broadcast_ibz_to_full_bz`, which is THE adapter: this one only unpacks
-    the three tables out of a live ``SymMaps`` so an in-memory consumer
-    does not have to.  There is no second implementation of the rule, and
-    no second ``star_broadcast`` call — the AST gate now asserts that, in
-    both directions.
-
-    ``A_irr``'s rows are the STAR wedge (:func:`star_wedge_rows`), which
-    is what every sweep in this module now produces; ``star_tables``
-    hands over the matching renumbered ``irr_idx_k``.
-
-    ``None`` in, ``None`` out: the callers below gather with
-    ``owner_only=True``, so the peers hold no table to broadcast.
-    """
-    if A_irr is None:
-        return None
-    # The canonical adapter dispatches on the operand: NumPy stays on the
-    # host, while a JAX array is gathered/conjugated where it is and retains
-    # its trailing-axis sharding.  Do not coerce here: that would turn the
-    # live driver's star broadcast back into the host gather it avoids.
-    return _broadcast_ibz_slab(A_irr, *star_tables(sym))
+# THE k-SET IS THE STAR WEDGE: one WFN row per symmetry orbit, and the
+# full-BZ table is its star broadcast (a gather, conjugated on the
+# time-reversed rows).  The derivation, the wedge choice and the traps in
+# validating it: docs/architecture/symmetry_register.md §8.  The helpers are
+# the symmetry service's and file_io.kin_ion's; the names below re-export
+# them for gw.dynamic_sigma until the wave after ARCH wave 0 repoints it.
+from symmetry_maps import star_wedge_rows                          # noqa: E402
+from symmetry_maps import star_wedge_tables as star_tables         # noqa: E402
+from file_io.kin_ion import (                                       # noqa: E402
+    broadcast_star_wedge as broadcast_ibz_to_full_bz,
+)
 
 
 def _wedge_density_occupations(wfn, sym, k_spec, nb_carrier: int,
@@ -675,9 +480,8 @@ def compute_hartree_matrix(wfn, sym, meta, *, truncation_2d: bool,
     # ---- 3. ⟨mk|V_H|nk⟩: ONE k-scan over the STAR WEDGE ----
     #
     # THE k-SET IS THE STAR WEDGE, and the full-BZ table is the star
-    # broadcast of it — see "THE IRREDUCIBLE k-SET" at the head of this
-    # module for the
-    # derivation, including the conjugation the time-reversed rows need.
+    # broadcast of it (docs/architecture/symmetry_register.md §8, including
+    # the conjugation the time-reversed rows need).
     # V_H is a local scalar potential, so it commutes with the space group
     # and with time reversal like any other term here.
     #
@@ -1088,10 +892,10 @@ def main(argv=None):
                                         sweep_matrix_elements, vnl_operator)
         from common.wfn_layout import band_sphere_spec
         #
-        # THE k-SET IS THE STAR WEDGE, and so is the WRITTEN table — see "THE
-        # IRREDUCIBLE k-SET" at the head of this module for the derivation,
-        # including the conjugation the time-reversed rows need and why the
-        # WFN's own k-set is NOT the wedge on every deck.  T, V_loc and
+        # THE k-SET IS THE STAR WEDGE, and so is the WRITTEN table
+        # (docs/architecture/symmetry_register.md §8: the conjugation the
+        # time-reversed rows need, and why the WFN's own k-set is NOT the
+        # wedge on every deck).  T, V_loc and
         # V_NL are built from the lattice and the atomic positions, so they are
         # exactly symmetric by construction and this is the sweep the argument
         # fits most cleanly.  No CONSUMER of ``kin_ion.h5`` sees the k-set

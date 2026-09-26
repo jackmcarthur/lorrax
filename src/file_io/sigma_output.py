@@ -915,38 +915,6 @@ def write_sigma_freq_debug_table(
 # ``tests/test_sigma_kirr_extraction.py`` is now it.
 
 
-def compact_star_tables(irr_idx_k):
-	"""``(rows_to_keep, compacted_irr_idx_k)`` for a star selection.
-
-	``rows_to_keep`` are the FIRST-OCCURRENCE full-BZ rows of each star,
-	in that order, which is ``star_select``'s own convention and therefore
-	the ordering ``star_broadcast`` expects to be handed back.
-
-	THE COMPACTION IS NOT COSMETIC.  ``SymMaps.irr_idx_k`` labels each
-	full-BZ k with a row of the WFN's wedge, and that wedge can have more
-	rows than the mesh has stars — ``cohsex_debug`` is exactly that case,
-	with ``irr_idx_k`` taking the values ``{0, 2, 3}`` out of a 4-row
-	wedge for 3 stars.  Written verbatim, such a table claims 4 stored
-	rows for a slab that has 3, which is precisely the inconsistency
-	:func:`kin_ion.read_star_map` refuses on.  So the stored table is
-	renumbered to index the STORED rows, and the file is self-consistent
-	by construction rather than by the caller's luck.
-	"""
-	irr = np.asarray(irr_idx_k)
-	if irr.ndim != 1:
-		raise ValueError(
-			f"irr_idx_k must be (nk_full,); got shape {irr.shape}")
-	seen: dict[int, int] = {}
-	rows: list[int] = []
-	compact = np.empty(irr.size, dtype=np.int32)
-	for i, lab in enumerate(int(v) for v in irr):
-		if lab not in seen:
-			seen[lab] = len(rows)
-			rows.append(i)
-		compact[i] = seen[lab]
-	return np.asarray(rows, dtype=np.int64), compact
-
-
 def star_select_k_irr(values, rows_to_keep, *, k_axis=0):
 	"""Keep ``rows_to_keep`` along ``k_axis``.  Pure selection, no arithmetic.
 
@@ -1156,7 +1124,17 @@ def extract_and_stamp_k_irr(
 			f"star tables describe {irr_idx_k.size} full-BZ k but the "
 			f"Σ cube has nk={int(nk_full)}; the sweep and the tables are not "
 			f"from the same run.")
-	rows_to_keep, compact_irr = compact_star_tables(irr_idx_k)
+	# ONE star-row rule: the service's first-occurrence rows and the
+	# full-BZ table renumbered onto them (``KStarMap.rows`` / ``.take``).
+	# The renumbering is not cosmetic: ``irr_idx_k`` labels WFN wedge rows,
+	# which can outnumber the stars (``cohsex_debug``: labels {0, 2, 3} of
+	# a 4-row wedge for 3 stars), and ``kin_ion.read_star_map`` refuses a
+	# stored table that claims more rows than the slab has.
+	from ffi import _services
+	_services.ensure_on_path()
+	from symmetry_maps import KStarMap
+	star_map = KStarMap(irr_idx_k, sym_idx_k, n_sym_spatial)
+	rows_to_keep, compact_irr = star_map.rows, star_map.take
 
 	# Every ordinary array arrives on the full BZ.  The SC terminal writer is
 	# the sole exception: its complete retained result already lives on the
@@ -1381,7 +1359,7 @@ def write_sigma_omega_h5(
 
 	``star``
 	    ``(irr_idx_k, sym_idx_k, n_sym_spatial)`` — the same triple
-	    ``gw.kin_ion_io.star_tables`` returns.  Given it, the k axis of
+	    ``symmetry_maps.star_tables_of`` returns.  Given it, the k axis of
 	    every array above is EXTRACTED to one row per star before it is
 	    written, the two unfold tables are filed beside the arrays, and
 	    each dataset is stamped so a reader knows what it is holding.
