@@ -139,7 +139,7 @@ def test_the_subnormal_tail_no_longer_widens_the_geometry():
     metallic arm.  The exact rule (threshold 1.0) keeps it and plans against
     E_A = -0.545 Ry; the 0.995 threshold cuts it and plans against the
     physical shell.  ``_geometry``'s ``excursion`` -- and therefore
-    ``crossing_edge`` for EVERY branch -- shrinks accordingly.
+    every pole edge (``sigma_pole_edges``) -- shrinks accordingly.
     """
     branch = _branch([-0.545, -0.043, 0.20], [2.67e-322, 0.30, 0.95])
 
@@ -151,9 +151,9 @@ def test_the_subnormal_tail_no_longer_widens_the_geometry():
     assert bounds_thr[0] == -0.043
 
     def edge(threshold):
-        _om, _eta, crossing_edge, _sel = SW._geometry(
+        _om, _eta, edges, _sel = SW._geometry(
             [branch], 0.05, 1.5, SW._weight_floor(threshold))
-        return crossing_edge
+        return edges["pos"]
 
     assert edge(0.995) < edge(1.0)
     assert edge(1.0) - edge(0.995) == pytest.approx(0.545 - 0.043, abs=1e-12)
