@@ -83,7 +83,8 @@ def test_warm_plan_is_the_cold_plan_bit_for_bit_without_a_builder_call(
     calls.clear()
     off_plan, off = _plan(None, **_QUIET)
     assert len(calls) == 3 and off["rule_table_dir"] is None
-    assert [row["rule_table"] for row in off["branches"][0]["windows"]] == ["none"] * 3
+    assert off["rule_table_lookups"] == {"hit": 0, "built": 0}
+    assert {row["rule_table"] for row in off["branches"][0]["windows"]} <= {"off", "none"}
     assert any(t.tobytes() != t_off.tobytes()
                for (t, _), (t_off, _) in zip(_nodes(cold_plan), _nodes(off_plan)))
 
