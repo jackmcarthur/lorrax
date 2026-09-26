@@ -256,6 +256,8 @@ def test_acubic_parents_equal_full_grid(backend):
     r = _symmetry_check(mesh, acubic_case(mesh), backend)
     assert r["full"] <= TOL and r["parent"] <= TOL, r
     assert r["red"]["conj_phase"] > 1e-3, r         # the glide phases are live here
+    for name in EXPAND_TWINS:                         # the expand's column map and wrap are live
+        assert r["red"][name] > 1e-3, (name, r)
 
 
 @pytest.mark.parametrize("ns", [2, 4])
@@ -266,6 +268,8 @@ def test_glide_parents_equal_full_grid(ns, backend):
     assert r["anti"], "the glide fixture must carry an antiunitary row"
     assert r["full"] <= TOL and r["parent"] <= TOL, r
     assert r["red"]["no_anti"] > 1e-3, r            # the antiunitary row is live here
+    for name in EXPAND_TWINS:
+        assert r["red"][name] > 1e-3, (name, r)
 
 
 # ---------------------------------------------------------------------------
