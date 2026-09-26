@@ -377,7 +377,6 @@ def test_sternheimer_bootstraps_once_before_common_or_jax_imports():
 @pytest.mark.parametrize(("relative", "door"), [
     ("src/gw/sigma_box_plan.py", "minimax"),
     ("src/gw/mpa/sample_plan.py", "minimax"),
-    ("src/gw/mpa/sigma_windows.py", "minimax"),
     ("src/ffi/common/ffi_loader.py", "lxkit"),
     ("src/ffi/cpp/stage/seal_bundle.py", "lxkit"),
     ("services/wfn_loader/bench/bench_wfn_loader.py", "wfn_loader"),

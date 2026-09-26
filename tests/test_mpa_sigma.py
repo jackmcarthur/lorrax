@@ -2,11 +2,8 @@ from types import SimpleNamespace
 
 import numpy as np
 import jax.numpy as jnp
-import pytest
 
-from gw.mpa.sigma import (_attach_ordered_odd_sigma, _batch_rows, _branches,
-                          _resolve_debug_max_tau_dispatches,
-                          _resolve_mpa_odd_residue_debug)
+from gw.mpa.sigma import _attach_ordered_odd_sigma, _batch_rows, _branches
 from gw.ppm_sigma import (SigmaOmegaResult, _SigmaPhysicsState,
                           _ppm_as_one_pole_store_fields)
 
@@ -71,33 +68,6 @@ def test_ppm_one_pole_fields_preserve_ordered_residue_and_mask():
     np.testing.assert_array_equal(
         np.asarray(B_p - D_p)[0][np.asarray(live)],
         np.asarray(B - D)[np.asarray(live)])
-
-
-def test_mpa_debug_odd_residue_switch_warns_and_refuses_trs(monkeypatch):
-    messages = []
-    monkeypatch.setenv("LORRAX_DEBUG_GN_ODD_RESIDUE_OFF", "1")
-    assert _resolve_mpa_odd_residue_debug(
-        True, print_fn=messages.append)
-    assert any("WARNING -- DEBUG" in line and "MPA" in line and "D=0" in line
-               for line in messages)
-    with pytest.raises(ValueError, match="debug_gn_odd_residue_off_scope"):
-        _resolve_mpa_odd_residue_debug(False, print_fn=messages.append)
-
-
-def test_mpa_debug_tau_bound_is_positive_and_announced(monkeypatch):
-    messages = []
-    monkeypatch.delenv("LORRAX_DEBUG_SIGMA_MAX_TAU_DISPATCHES", raising=False)
-    assert _resolve_debug_max_tau_dispatches(
-        print_fn=messages.append) is None
-
-    monkeypatch.setenv("LORRAX_DEBUG_SIGMA_MAX_TAU_DISPATCHES", "12")
-    assert _resolve_debug_max_tau_dispatches(print_fn=messages.append) == 12
-    assert any("WILL NOT produce" in line for line in messages)
-
-    for bad in ("0", "-2", "twelve"):
-        monkeypatch.setenv("LORRAX_DEBUG_SIGMA_MAX_TAU_DISPATCHES", bad)
-        with pytest.raises(ValueError, match="must be a positive integer"):
-            _resolve_debug_max_tau_dispatches(print_fn=messages.append)
 
 
 def test_mpa_odd_sigma_is_exact_production_twin_difference():

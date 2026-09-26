@@ -298,9 +298,6 @@ refusal on one rank travels as data and raises on every rank.
   node is shared by one G build, convolution and projection per bracket.
 
 A per-stage split of a node is a `jax.profiler` trace of the window executable.
-`LORRAX_SIGMA_PLAN=panes` selects the pane planner of
-[the MPA page](THEORY_mpa_implementation.md#pane-planner) as a comparison control and is
-refused with the shared-pole W.
 
 ## 12. Refusals
 

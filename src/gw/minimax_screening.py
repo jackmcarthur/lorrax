@@ -40,7 +40,6 @@ import numpy as np
 
 # Path bootstrap; dies with the owner's workspace fix -- see _services.py.
 from ffi import _services      # noqa: F401
-from runtime.env_flags import env_bool
 from common.collectives import transpose_xy, xy_tile_mesh
 
 _services.ensure_on_path()
@@ -65,13 +64,6 @@ _TINY = 1.0e-12
 #: exact scalar panes still plan the reduced support downstream.  The integer
 #: form makes both tail budgets exact: ``floor(n_valid / 500)``.
 GN_PPM_EXTREME_TAIL_DIVISOR = 500
-
-#: DEBUG A/B switch for the measured-broken-TR GN fit.  This is deliberately
-#: read at the fit owner: ``ordered_orientations`` is the measured TRS verdict
-#: at this layer, and nowhere downstream can distinguish a TRS deck from a
-#: broken-TR deck whose odd residue happens to be zero.
-_DEBUG_GN_ODD_RESIDUE_OFF_ENV = "LORRAX_DEBUG_GN_ODD_RESIDUE_OFF"
-
 
 def _scaled_laplace_error_bound(x_min: float, target_error: float) -> float:
     """Convert a physical Laplace-kernel tolerance to the ``[1, R]`` units.
@@ -425,24 +417,6 @@ def fit_gn_ppm_from_wc_pair(
              else jnp.asarray(np.asarray(mu_active_mask, dtype=bool)))
     _W0 = jnp.asarray(Wc0_qmunu)
     ordered = bool(ordered_orientations)
-    debug_odd_off = env_bool(
-        _DEBUG_GN_ODD_RESIDUE_OFF_ENV, False, print_fn=print_fn)
-    if debug_odd_off and not ordered:
-        raise ValueError(
-            "GATE debug_gn_odd_residue_off_scope:\n"
-            f"  got:  {_DEBUG_GN_ODD_RESIDUE_OFF_ENV}=1 with "
-            "ordered_orientations=False\n"
-            "  want: this debug switch only on a measured-broken-TR "
-            "GN-PPM fit (ordered_orientations=True)\n"
-            "  why:  a TRS deck has no time-reversal-odd GN residue to "
-            "discard\n"
-            "  fix:   unset LORRAX_DEBUG_GN_ODD_RESIDUE_OFF")
-    if debug_odd_off:
-        print_fn(
-            "WARNING -- DEBUG: LORRAX_DEBUG_GN_ODD_RESIDUE_OFF=1; "
-            "measured-broken-TR GN-PPM fit is discarding the "
-            "anti-Hermitian half of W(i omega_p): D=0 and R+=R-=B. "
-            "This arm is for A/B diagnosis only, never production.")
     if ordered:
         _zh = complex(probe_omega)
         if (not np.isfinite(_zh.real) or not np.isfinite(_zh.imag)
@@ -594,9 +568,7 @@ def fit_gn_ppm_from_wc_pair(
     # sufficient for the odd residue too.
     B_odd_vals = None
     if ordered:
-        B_odd_vals = (
-            jnp.zeros_like(B_vals) if debug_odd_off else
-            _gn_ppm_odd_residue(a_odd, omega_vals, _z))
+        B_odd_vals = _gn_ppm_odd_residue(a_odd, omega_vals, _z)
         del a_odd
 
     return GNPPMFitResult(
@@ -779,8 +751,8 @@ def _coarsen_gn_ppm_extreme_tails(
     nontrivial real-positive coarsening must choose one.  Static W is the
     fitted observable and is preserved exactly to the arithmetic precision
     of the existing fit; the high-frequency moment and strict BGW finite-pole
-    parity are not.  The canonical exact-pane planner remains downstream and
-    partitions this reduced support; this policy does not replace it.
+    parity are not.  The box planner remains downstream and partitions this
+    reduced support; this policy does not replace it.
     """
     if tail_divisor < 2:
         raise ValueError("tail_divisor must be an integer >= 2")

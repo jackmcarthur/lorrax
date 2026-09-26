@@ -49,7 +49,6 @@ from .gw_config import LorraxConfig
 from .head_correction import HeadResolver
 from .ppm_sigma import (
     compute_sigma_c_ppm_omega_grid,
-    host_rss_diag,
     fit_ppm,
 )
 from runtime.padding import PaddedAxis
@@ -638,7 +637,7 @@ def compute_ppm_sigma_pipeline(
             mu_active_mask=getattr(meta, 'mu_active_mask', None),
             q_neg_index=q_neg,
             # User-ruled GN variant: re-anchor the exact 0.2% tails at the fit
-            # owner before the incumbent exact-pane planner sees the reduced
+            # owner before the box planner sees the reduced
             # support.  This is lossy versus BGW finite-pole parity; HL is a
             # different real-axis model and is deliberately unchanged.
             coarsen_extreme_tails=not is_hl,
@@ -714,7 +713,6 @@ def compute_ppm_sigma_pipeline(
                     fixed_quadrature_session.setdefault("primary", {})),
                 print_fn=print_fn,
             )
-        host_rss_diag("Sigma(omega) executor returned")
         # THE BLAST RADIUS STOPS HERE.  ``sigma_omega.sigma_c_kij`` carries
         # the leading band-count axis; everything downstream of this line —
         # the head injection, the eqp interpolation, sigma_mnk.h5, the QSGW
@@ -756,7 +754,6 @@ def compute_ppm_sigma_pipeline(
         # because the head is part of the Σ_c being reported; before the
         # return, because the cube's leading axis does not survive it.
         extrap_payload = None
-        host_rss_diag("head built, before band extrapolation")
         if plan.enabled:
             extrap_payload, extrap_weights = _report_band_extrapolation(
                 sigma_omega, head_sigma_diag_w_kn_ry,
@@ -776,7 +773,6 @@ def compute_ppm_sigma_pipeline(
                 sigma_omega.sigma_c_kij, extrap_weights)
             sigma_c_body_omega_unextrap = sigma_c_body_omega_n3
 
-    host_rss_diag("band extrapolation applied, PPM outputs ready")
     return PPMOutputs(
         sigma_c_body_omega=sigma_c_body_omega,
         band_axis=sigma_omega.band_axis,

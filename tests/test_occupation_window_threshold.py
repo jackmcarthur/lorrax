@@ -279,15 +279,16 @@ def test_the_key_reaches_the_planner_through_MPAConfig():
     assert "occupation_window_threshold" in MPAConfig.__dataclass_fields__
     for fn in (compute_sigma_c_mpa_omega_grid,
                SW.summarize_sigma_poles,
-               SW.build_shared_sigma_windows):
+               SW.summarize_shared_poles):
         assert "occupation_window_threshold" in (
             inspect.signature(fn).parameters), fn.__name__
 
     src = inspect.getsource(compute_sigma_c_mpa_omega_grid)
-    # Three now, not two: the BRANCH BUILD reads the same value as the pole
-    # census and the window build, so the supports the executor masks with
-    # and the geometry the planner sizes cannot come from different windows.
-    assert src.count("occupation_window_threshold=occupation_window_threshold") == 3
+    # The BRANCH BUILD reads the same value as every pole census (the
+    # elementwise summaries, the shared-pole census and its certificate
+    # union), so the supports the executor masks with and the geometry the
+    # box planner sizes cannot come from different windows.
+    assert src.count("occupation_window_threshold=occupation_window_threshold") == 4
 
 
 def test_the_key_has_a_row_in_the_input_reference():
@@ -446,8 +447,10 @@ def test_the_mpa_branch_builder_forwards_the_deck_value():
     assert "occupation_window_threshold" in (
         inspect.signature(_branches).parameters)
     src = inspect.getsource(compute_sigma_c_mpa_omega_grid)
+    # The branch build and every pole census (elementwise summaries, the
+    # shared-pole census and its certificate union).
     assert src.count(
-        "occupation_window_threshold=occupation_window_threshold") == 3
+        "occupation_window_threshold=occupation_window_threshold") == 4
 
 
 def test_the_mpa_branch_supports_honour_the_threshold_end_to_end():

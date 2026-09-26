@@ -2,7 +2,6 @@
 from ffi import _services
 _services.ensure_on_path()
 from distrib_la import mesh_key as _mesh_key
-import os
 import time
 from dataclasses import dataclass
 from functools import partial
@@ -1287,37 +1286,10 @@ def _get_w_solve_fn_distributed(mesh_xy: Mesh, nq: int, n_rmu: int,
         # ONE plan call for the whole stack: one descriptor, one
         # workspace; A and B are donated into the FFI.
         W = p.batched(A, B)
-        # House falsy vocabulary — same parse (and same rationale comment)
-        # as common/collectives.py's LORRAX_CHECK_REPLICA fix (workstream
-        # AT): the narrow "0"/""/"false" tuple this replaced meant
-        # LORRAX_W_RESIDUAL_CHECK=off/no/False silently ENABLED the
-        # diagnostic — which must be OFF when taking collective-table
-        # probes (docs/dev/env_vars.md).  (audit fix/zq 2026-07-28)
-        if os.environ.get("LORRAX_W_RESIDUAL_CHECK", "0").strip().lower() \
-                not in ("", "0", "false", "no", "off"):
-            _w_residual_report(V_flat, chi_scaled, W, n_ext)
         return W
 
     _w_solve_cache[cache_key] = _solve_w_dist
     return _solve_w_dist
-
-
-def _w_residual_report(V_flat, chi_scaled, W, n_ext, n_check: int = 4):
-    """Direct Dyson residual ‖(1−Vχ)W − V‖/‖V‖ on the first few q; see docs/architecture/four_current_wiring.md."""
-    ns = min(int(V_flat.shape[0]), int(n_check))
-
-    @jax.jit
-    def _res(V_s, chi_s, W_s):
-        A_s = jnp.eye(n_ext, dtype=V_s.dtype)[None, :, :] - V_s @ chi_s
-        num = jnp.linalg.norm((A_s @ W_s - V_s).reshape(ns, -1), axis=1)
-        den = jnp.linalg.norm(V_s.reshape(ns, -1), axis=1)
-        return num / den
-
-    r = np.asarray(jax.device_get(_res(V_flat[:ns], chi_scaled[:ns], W[:ns])))
-    if jax.process_index() == 0:
-        vals = "  ".join(f"q{iq}={v:.3e}" for iq, v in enumerate(r))
-        print(f"  [W solve] Dyson residual |(1-Vchi)W - V|/|V| ({ns} q): "
-              f"{vals}  max={r.max():.3e}", flush=True)
 
 
 def produce_w_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_io, print_fn=print):
