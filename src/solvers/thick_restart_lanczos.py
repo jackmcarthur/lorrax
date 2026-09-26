@@ -6,7 +6,7 @@ callable matvec.  No physics knowledge — works for any Hermitian eigenproblem.
 
 WHY THIS EXISTS, AND WHAT IT IS FOR
 -----------------------------------
-Unrestarted Lanczos (``solvers.lanczos.lanczos_eig_jit``) is the cheapest
+Unrestarted Lanczos (``solvers.lanczos.block_lanczos_eig_jit``) is the cheapest
 correct solver on a 1024-dim deck and this module does not beat it there.  What
 it fixes is **memory at production dimension**.  Unrestarted Lanczos stores the
 whole Krylov basis: at ``bse_dim = 1e6`` a 400-vector basis is 6.4 GB, and at
