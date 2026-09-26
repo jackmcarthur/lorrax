@@ -618,3 +618,19 @@ def test_red_failed_check_is_never_stamped_or_served(
     stamp.write_text(json.dumps(record))
     _new_process_loader(path)
     assert len(calls) == 4
+
+
+def test_stamp_directory_stays_bounded(tmp_path, stamp_env, monkeypatch):
+    stamps, calls = stamp_env
+    stamps.mkdir(parents=True)
+    for i in range(6):
+        old = stamps / f"trs_old{i}.json"
+        old.write_text("{}")
+        os.utime(old, ns=(i, i))
+    monkeypatch.setattr(density_check, "_STAMP_KEEP", 6)
+    path = _kramers_deck(tmp_path, magnetic=True)
+    _new_process_loader(path)
+    kept = {p.name for p in _stamps(stamps)}
+    assert len(kept) == 3 and not any(n.startswith("trs_old0") for n in kept)
+    _new_process_loader(path)
+    assert len(calls) == 1                    # the fresh stamp survived

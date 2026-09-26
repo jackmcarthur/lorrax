@@ -52,6 +52,10 @@ TOL_TRS = 1.0e-6
 MAX_K_DEFAULT = 12
 _ALGORITHM_VERSION = "occupied-density-subspace-v1"
 _STAMP_SCHEMA = "wfn-trs-stamp-v1"
+#: A stamp is ~1.6 kB and one exists per (WFN, tol, max_k, nocc); test runs
+#: leave one per temporary WFN.  A write that finds more than this many drops
+#: the least recently written half, so the directory stays bounded.
+_STAMP_KEEP = 2000
 #: Loader arrays a verdict depends on: the k set, weights, occupations and
 #: band energies, the symmetry and lattice tables the spatial unfold uses, and
 #: the per-k G lists.  All are in memory once the loader is built.
@@ -812,7 +816,25 @@ def _write_stamp(identity: dict | None,
         except OSError:
             pass
         return None
+    _prune_stamps(path.parent)
     return str(path)
+
+
+def _prune_stamps(directory) -> None:
+    """Keep the newest ``_STAMP_KEEP // 2`` stamps once past ``_STAMP_KEEP``.
+
+    A pruned stamp only costs one re-measurement.
+    """
+    try:
+        entries = [e for e in os.scandir(directory)
+                   if e.name.startswith("trs_") and e.name.endswith(".json")]
+        if len(entries) <= _STAMP_KEEP:
+            return
+        entries.sort(key=lambda e: e.stat().st_mtime_ns)
+        for entry in entries[:len(entries) - _STAMP_KEEP // 2]:
+            os.unlink(entry.path)
+    except OSError:
+        pass
 
 
 def _all_processes_hit(loader, hit, identity: dict | None) -> bool:
