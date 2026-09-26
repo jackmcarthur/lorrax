@@ -319,13 +319,19 @@ def face_round_check_program(mesh, ordered, n):
 
 
 def sector_round_schedule(bank,header,meta,config,mesh,*,execution=None,batch_width=1):
-    """Schedule local parent rounds or bounded batches on the whole mesh."""
+    """Schedule local parent rounds or bounded batches on the whole mesh.
+
+    ``batch_width`` is the ledger-admitted parent count of one round: on the
+    face the parents of a batch, locally a multiple of P (``batch_width/P``
+    whole parents per rank); below P it means one parent per rank.
+    """
     from gw.shared_pole_local import parent_rounds
     from gw.gw_config import linalg_resolution
     resolution=linalg_resolution({'linalg':config.backend.linalg})
     execution = resolution.layout if execution is None else execution
     if execution == 'local':
-        return [(*row,'local') for row in parent_rounds(header['n_q_irr'],mesh.size)]
+        depth = max(1, int(batch_width) // int(mesh.size))
+        return [(*row,'local') for row in parent_rounds(header['n_q_irr'],mesh.size,depth)]
     if execution not in ('distributed', 'face'):
         raise ValueError('unsupported resolved constructor linalg layout')
     # Every parent's minus-q actions are in its own bank panels; face parents
@@ -374,13 +380,17 @@ def face_batch_width(meta, resolution, *, mesh, ledger, upstream, side, sample_b
                    selection=rows[0], reduction=rows[1])
 
 
-def sector_batch_width(meta, resolution, recipe, routes, *, mesh, ledger, nq):
+def sector_batch_width(meta, resolution, recipe, routes, *, mesh, ledger, nq, execution='face'):
     """Bound the common CC/TT/CT batch before reading any sample matrix.
 
     The joint extent covers both retained diagonal spans and the rectangular
     cross pencil. Its dense envelope also covers the surviving diagonal
     arrays; both ordered cross sample stacks are included separately.
-    Execution stays face tiled throughout; only the number of parents varies.
+    Execution keeps its layout; only the number of parents varies. On the
+    face that is the parents of one tiled batch. Locally it is a multiple of
+    P, ``width/P`` whole parents per rank; one parent per rank is the local
+    route's own admission (``sector_execution``), so the local width never
+    falls below P.
     """
     import copy
     from gw.shared_pole_capacity import ConstructorCapacity
@@ -401,8 +411,10 @@ def sector_batch_width(meta, resolution, recipe, routes, *, mesh, ledger, nq):
     cross = lines * 8 * (current['packed_extent'] * charge['line_width']
                          + charge['packed_extent'] * current['line_width'])
     budget = ConstructorCapacity(joint, resolution, mesh_xy=mesh, ledger=ledger,
-                                 upstream=ledger.live_stages, execution='face')
-    for width in range(int(nq), 0, -1):
+                                 upstream=ledger.live_stages, execution=execution)
+    step = int(mesh.size) if execution == 'local' else 1
+    preview = None
+    for width in range(-(-int(nq) // step) * step, 0, -step):
         budget.batch_width = width
         # The phase formula covers current pencil/actions, not the dense CT/TC
         # stacks (W and dW/ds at the dense fitted samples), the moments and
@@ -422,6 +434,8 @@ def sector_batch_width(meta, resolution, recipe, routes, *, mesh, ledger, nq):
             concurrent_with=ledger.live_stages)
         if preview['device_budget_status'] == 'PASS':
             return width, preview
+    if execution == 'local':
+        return step, dict(preview, reason='one parent per rank (the local route admission)')
     raise MemoryError('GATE shared_pole_capacity: distributed sector batch of one '
                       f'parent exceeds the shared device budget before bank read; last price: {preview}')
 

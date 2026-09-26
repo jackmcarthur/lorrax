@@ -10,7 +10,9 @@ CPU (pytest, 2x2 host mesh) and P4 (``python test_shared_pole_callable_reuse.py 
 * ``round_program``: a round with new supports, panels and counts at the same round extent runs the
   same executable, every slot solving at the round side; the retained-column kernel is reused;
 * ``ladder_extent``: eighth-octave carriers, capped;
-* ``canonical_factors`` pads round blocks to the widest and places parents in canonical order.
+* ``canonical_factors`` pads round blocks to the widest and places parents in canonical order;
+* ``parent_rounds`` depth: two parents per rank in one round equal the same parents in two
+  one-per-rank rounds, synthetic slots exact zeros.
 """
 from pathlib import Path
 import json
@@ -159,13 +161,92 @@ def check_reuse(mesh):
                 round_specializations=compiled, selection_specializations=selection_specializations)
 
 
+def check_depth(mesh):
+    """Two parents per rank in one round equal the same parents in two one-per-rank rounds.
+
+    Slots 0..7 of one depth-2 round (rank r owns slots 2r, 2r+1; slots 6, 7
+    synthetic) against rounds 0..3 and 4..7 (slots 6, 7 synthetic) at the same
+    round extent: every real slot's model, vectors and diagnostics agree, and
+    every synthetic slot is the skipped slot (no active column). Returns the largest
+    phase-free real-slot difference and whether every leaf kept its bits.
+    """
+    import jax
+    import distrib_la as D
+    from jax.experimental import multihost_utils
+    from gw.shared_pole_local import _batch_put, parent_rounds, reduce_round, round_tables
+    assert [row[:2] for row in parent_rounds(13, 4, 4)] == [(list(range(13)) + [12] * 3, 13)]
+    assert [row[1] for row in parent_rounds(13, 4)] == [4, 4, 4, 1]
+    ranks, n = 4, 8
+    rng = np.random.default_rng(89)
+    c = rng.normal(size=(n, 12)) * .3
+    poles = np.linspace(.2, 3., 12)
+    m1, m3 = c @ c.T / 2, (c * poles) @ c.T / 2
+    qi = np.linalg.eigh(m1)[1][:, -2:]
+    native = D.plan("eigh", mesh, n=n, backend="off", batched_route="batch_reshard").native_fn
+    nodes = (-.3 + .2j, -.9 + .1j)
+    # Both halves reach the full round extent (a [7, 7] slot), so the rounds share one side.
+    counts = np.array([[3, 7], [7, 3], [3, 3], [7, 7], [7, 7], [3, 5], [0, 0], [0, 0]])
+    q = [np.linalg.qr(rng.normal(size=(2 * ranks, n, n)))[0].astype(complex)
+         * (np.arange(n)[None, None, :] < counts[:, a, None, None]) for a in range(2)]
+
+    def run(rows, real):
+        states = []
+        for a, s in enumerate(nodes):
+            w, dw = (c / (s - poles)) @ c.T, (-c / (s - poles) ** 2) @ c.T
+            states.append((s, *(_batch_put(mesh, np.ascontiguousarray((m @ q[a])[rows]))
+                                for m in (np.eye(n), w, dw))))
+        infinity = tuple(_batch_put(mesh, np.broadcast_to(v, (len(rows),) + v.shape).astype(complex))
+                         for v in (qi, m1 @ qi, m3 @ qi))
+        tables = round_tables(counts[rows], (n, n), nodes, [2] * len(rows), 2, column_extent=_extent,
+                              ordered=False, odd_moments=False)
+        out = reduce_round(states, infinity, tables, real=real, mesh_xy=mesh, native_eigh=native,
+                           ordered=False, odd_moments=False, keep_budget=None)
+        return jax.tree.map(lambda a: np.asarray(multihost_utils.process_allgather(a, tiled=True)), out)
+
+    deep = run(np.arange(2 * ranks), 6)
+    halves = (run(np.arange(ranks), ranks), run(np.arange(ranks, 2 * ranks), 2))
+    worst, bitwise = 0.0, True
+    for slot in range(2 * ranks):
+        here = jax.tree.map(lambda a: a[slot], deep)
+        if slot >= 6:
+            # A synthetic slot is the skipped slot: no active column, zero factor and
+            # diagnostics, inactive poles 1 and the identity permutation after the sort.
+            (b, poles, active), _, _, (reduction, zero, retained, permutation) = here
+            assert not np.any(b) and not np.any(active) and np.all(poles == 1), slot
+            assert all(not np.any(leaf) for leaf in jax.tree.leaves((reduction, zero, retained))), slot
+            assert np.array_equal(permutation, np.arange(permutation.size)), slot
+            continue
+        there = jax.tree.map(lambda a: a[slot % ranks], halves[slot // ranks])
+        bitwise = bitwise and all(np.array_equal(a, b) for a, b in
+                                  zip(jax.tree.leaves(here), jax.tree.leaves(there)))
+        (b1, l1, a1), _, _, diagnostics1 = here
+        (b2, l2, a2), _, _, diagnostics2 = there
+        assert np.array_equal(a1, a2), slot
+        # Eigenvector phases are the solver's choice: compare the phase-free model
+        # b b^H and b Lambda b^H, the poles and the diagnostics (not the permutation).
+        pairs = [(b1 @ b1.conj().T, b2 @ b2.conj().T), ((b1 * l1) @ b1.conj().T, (b2 * l2) @ b2.conj().T),
+                 (l1, l2), *zip(jax.tree.leaves(diagnostics1[:3]), jax.tree.leaves(diagnostics2[:3]))]
+        for x, y in pairs:
+            assert x.shape == y.shape and x.dtype == y.dtype
+            if x.dtype == bool:
+                assert np.array_equal(x, y), slot
+            else:
+                scale = max(1.0, float(np.max(np.abs(y), initial=0.0)))
+                worst = max(worst, float(np.max(np.abs(x - y), initial=0.0)) / scale)
+    assert worst <= 1e-10, worst
+    return dict(status='PASS', scope='depth-2 round vs two depth-1 rounds, unordered 8x8 fixture',
+                max_relative_difference=worst, bitwise=bitwise)
+
+
 def test_round_tables_and_executable_reuse():
     import jax
     from jax.sharding import Mesh
     from lxkit.testing import require_devices
     require_devices(4, 'cpu')
     check_tables()
-    check_reuse(Mesh(np.asarray(jax.devices('cpu')[:4]).reshape(2, 2), ('x', 'y')))
+    mesh = Mesh(np.asarray(jax.devices('cpu')[:4]).reshape(2, 2), ('x', 'y'))
+    check_reuse(mesh)
+    check_depth(mesh)
 
 
 if __name__ == '__main__':
@@ -179,6 +260,7 @@ if __name__ == '__main__':
         assert jax.process_count() == 4
         check_tables()
         row = check_reuse(resolve_mesh())
+        row['depth'] = check_depth(resolve_mesh())
         row['job_step'] = os.environ['SLURM_JOB_ID'] + '.' + os.environ['SLURM_STEP_ID']
         if jax.process_index() == 0:
             Path(sys.argv[1]).write_text(json.dumps(row, indent=2) + '\n')

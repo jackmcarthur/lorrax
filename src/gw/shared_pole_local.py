@@ -1,4 +1,4 @@
-"""Rounds of shared-pole parents, one parent per mesh rank (batch layout).
+"""Rounds of shared-pole parents, whole parents per mesh rank (batch layout).
 
 The round schedule, the column tables and the one round program that packs,
 assembles, reduces, gates and sorts every parent of a round on its own rank
@@ -10,24 +10,29 @@ from functools import lru_cache, partial
 BATCH = ('x', 'y')
 
 
-def parent_rounds(nq, ranks):
-    """Rounds of ``ranks`` parent slots, one parent per rank, in canonical order.
+def parent_rounds(nq, ranks, depth=1):
+    """Rounds of ``ranks * depth`` parent slots, ``depth`` parents per rank, in canonical order.
 
     A round is the next contiguous run of parents; every parent's minus-q
     actions are already in its own bank panels, so no round needs another
-    parent. A short round repeats its last real parent in the synthetic slots,
-    which are never solved.
+    parent. Rank r owns slots ``[r*depth, (r+1)*depth)`` (batch layout). A
+    short round repeats its last real parent in the synthetic slots, whose
+    results are exact zeros. ``depth`` is the caller's ledger-admitted count.
 
-    Returns ``[(ids, real, slots)]``: ``ids`` the ``ranks`` parent ids, ``real``
-    the number of leading real slots, ``slots`` the slot index of each slot.
+    Returns ``[(ids, real, slots)]``: ``ids`` the ``ranks * depth`` parent
+    ids, ``real`` the number of leading real slots, ``slots`` the slot index
+    of each slot.
     """
     import numpy as np
 
+    width = int(ranks) * int(depth)
+    if width < 1:
+        raise ValueError("parent rounds need at least one slot per rank")
     out = []
-    for q0 in range(0, int(nq), int(ranks)):
-        ids = list(range(q0, min(q0 + int(ranks), int(nq))))
+    for q0 in range(0, int(nq), width):
+        ids = list(range(q0, min(q0 + width, int(nq))))
         real = len(ids)
-        out.append((ids + [ids[-1]] * (int(ranks) - real), real, np.arange(int(ranks), dtype=np.int64)))
+        out.append((ids + [ids[-1]] * (width - real), real, np.arange(width, dtype=np.int64)))
     return out
 
 
@@ -369,16 +374,18 @@ def round_program(mesh_xy, native_eigh, ordered, odd_moments, keep_budget, retai
                   gram_keep=None):
     """Pack, assemble, reduce, gate and sort a round of parents, each on its own rank.
 
-    One program over batch layout: rank r packs slot r's Q, WQ, dWQ panels by
-    ``round_tables``, assembles the even or ordered pencil, reduces it with the
-    local eigensolver ``native_eigh`` (made zero-row safe), applies the zero
-    policy, forms the retained (even) or original-infinity (ordered, odd
-    moments) moment identity and sorts the poles. Every slot solves at the
-    round's laddered extent (``round_tables``); its inert columns are exact
-    zeros that the eigensolver wrapper keeps out of every spectrum, so rounds
-    and SC maps share the program's shapes. A synthetic slot (``live`` False) skips all of it through
-    ``lax.cond``. No array crosses ranks: the models stay in batch layout for
-    ``round_checks``; only vectors are gathered.
+    One program over batch layout: each rank packs its slots' Q, WQ, dWQ
+    panels by their own ``round_tables`` rows, assembles the even or ordered
+    pencils, reduces them with the local eigensolver ``native_eigh`` (made
+    zero-row safe), applies the zero policy, forms the retained (even) or
+    original-infinity (ordered, odd moments) moment identity and sorts the
+    poles; a rank's slots are one batch of independent parents. Every slot
+    solves at the round's laddered extent (``round_tables``); its inert
+    columns are exact zeros that the eigensolver wrapper keeps out of every
+    spectrum, so rounds and SC maps share the program's shapes. A synthetic
+    slot (``live`` False) holds only inert columns; its results are selected
+    to exact zeros. No array crosses ranks: the models stay in batch layout
+    for ``round_checks``; only vectors are gathered.
 
     Arguments ``(live [P], points, order, active, Qs, WQs, dWQs, infinity)``, all
     in batch layout. Returns ``(model, signed, vectors, (reduction, zero,
@@ -404,14 +411,13 @@ def round_program(mesh_xy, native_eigh, ordered, odd_moments, keep_budget, retai
 
     def body(live, points, order, active, qs, os, ds, infinity):
         def pack(panels):
-            return jnp.take(jnp.concatenate(panels, axis=-1), order[0], axis=-1, mode='fill', fill_value=0)
-        args = (points, pack(qs), pack(os), pack(ds), infinity, active)
-
-        def work(args):
-            return solve(*args)
-        def skip(args):
-            return jax.tree.map(lambda a: jnp.zeros(a.shape, a.dtype), jax.eval_shape(work, args))
-        reduced = jax.lax.cond(live[0], work, skip, args)
+            # Each slot's own column order; index sum(widths) is the zero column.
+            return jnp.take_along_axis(jnp.concatenate(panels, axis=-1), order[:, None, :], axis=-1,
+                                       mode='fill', fill_value=0)
+        reduced = solve(points, pack(qs), pack(os), pack(ds), infinity, active)
+        # Synthetic slots of a rank's batch are selected to exact zeros.
+        keep = lambda a: jnp.where(live.reshape(live.shape + (1,) * (a.ndim - 1)), a, jnp.zeros((), a.dtype))
+        reduced = jax.tree.map(keep, reduced)
         model, signed, diagnostics = reduced[:3]
         model, permutation = sort_shared_pole_columns(model)
         result = model, signed, (*diagnostics, permutation)
@@ -474,6 +480,8 @@ def check_round(model, signed, inverse_coulomb_sqrt, held, moments, infinity_dir
         return jax.tree.map(lambda *v: np.concatenate(v, axis=0), *rows)
 
     replicated = NamedSharding(mesh_xy, P())
+    if int(model[0].shape[0]) != int(mesh_xy.size):
+        raise ValueError('batch-layout shared-pole checks take one parent per rank')
     # Batch-layout equations run inside shard_map and therefore require the
     # plan's public trace-safe native callable. Face arrays were dispatched
     # above and use the plan's eager ``batched`` surface in their own program.

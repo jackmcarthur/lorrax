@@ -226,6 +226,16 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output):
         execution_rows,mesh_xy=mesh_xy,root=root,upstream=upstream,route=resolved_execution)
     if sector_models is not None:
         upstream=ledger.live_stages=(*upstream,model_residence['stage'])
+    if resolved_execution == 'local':
+        # Whole parents per rank per round, as many as the ledger admits with
+        # the resident models live: fewer rounds, the same per-parent equations.
+        from gw.shared_pole_execution import sector_batch_width
+        batch_width, batch_admission = sector_batch_width(
+            meta,linalg_resolution({'linalg':config.backend.linalg}),recipe,execution_rows,
+            mesh=mesh_xy,ledger=ledger,nq=header['n_q_irr'],execution='local')
+        for row in execution_rows:
+            row['batch_admission'] = batch_admission
+            row['parent_batch'] = batch_width
     for ids,real,slots,execution in sector_round_schedule(
             bank,header,meta,config,mesh_xy,execution=resolved_execution,
             batch_width=batch_width):
