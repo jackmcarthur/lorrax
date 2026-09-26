@@ -23,7 +23,7 @@ from gw.sigma_box_plan import (
     _rule_table_key,
     _rule_table_lookup,
     _rule_table_path,
-    _rule_table_root,
+    resolve_sigma_rule_table_dir,
     _rule_table_store,
     plan_sigma_windows,
 )
@@ -105,7 +105,7 @@ def test_warm_sc_freeze_is_the_cold_freeze(monkeypatch, tmp_path):
 
 def test_caching_off_writes_no_table(monkeypatch):
     monkeypatch.setattr("gw.sigma_box_plan.build_uniform_rule", _fake_rule)
-    assert _rule_table_root(None) is None
+    assert resolve_sigma_rule_table_dir(None) is None
     _plan(None, **_QUIET)
     assert not Path(os.environ["LORRAX_SIGMA_RULE_TABLE_TEST_DIR"]).exists()
 
@@ -113,7 +113,7 @@ def test_caching_off_writes_no_table(monkeypatch):
 def test_default_table_sits_beside_the_compile_cache(monkeypatch, tmp_path):
     monkeypatch.delenv("LORRAX_SIGMA_RULE_TABLE_TEST_DIR")
     monkeypatch.setenv("SCRATCH", str(tmp_path))
-    assert _rule_table_root("any") == str(
+    assert resolve_sigma_rule_table_dir("any") == str(
         tmp_path / ".cache" / "lorrax" / "sigma_box_rules")
 
 
