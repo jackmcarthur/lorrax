@@ -370,22 +370,12 @@ Tests: `services/distrib_la/tests/test_distrib_la_contract.py` (the
 `test_distrib_la_multiproc.py --mesh 2x2`; run via `lx run` / `lx test`
 inside an allocation.  The benches are `services/distrib_la/bench/`.
 
-### Batched variant — `_slate.py`, `batched_{potrf,trsm}_ffi.cc`
+### Batched potrf/trsm targets
 
-For the GWJAX `(Nq, Nmu, Nmu)` workload, `batched_distributed_cholesky`
-and `batched_distributed_trsm` take a 3-D input sharded
-`P('x', None, 'y')`: batch across `'x'`, each `Nmu × Nmu` across `'y'`.
-Each X-row of the mesh gets its own MPI sub-comm of size `Py`
-(`MPI_Comm_split` by `x_rank`), and the FFI handler loops over the
-per-rank batch calling `slate::potrf` / `slate::trsm` on each slice.
-
-SLATE has no native batched potrf, so the "batching" is literally a
-C++ for-loop — but the sub-comm setup is shared across iterations,
-which is the only bit that matters for amortising Python↔XLA dispatch
-overhead. See the `batched_distributed_cholesky` and
-`batched_distributed_trsm` docstrings in `distrib_la._slate` for the full
-shape contract and `test_distrib_la_multiproc.py` for the real 4-rank
-correctness gate.
+`batched_{potrf,trsm}_ffi.cc` still register `lorrax_slate_batched_potrf`
+and `lorrax_slate_batched_trsm`, but no Python wrapper calls them. Batched
+Cholesky on SLATE is `distrib_la.factor`'s scan of `slate::potrf`
+(`_slate_potrf_stack`).
 
 ## References
 
