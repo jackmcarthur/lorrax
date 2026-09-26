@@ -613,10 +613,13 @@ def face_to_batch_reshard(mesh: Mesh, *,
         return _body
 
     def _make_sm(body):
-        return shard_map(body, mesh=mesh,
-                         in_specs=(P(None, ax_x, ax_y),),
-                         out_specs=P((ax_x, ax_y), None, None),
-                         check_vma=False)
+        # jit: an eager call (the shared-pole constructor's) then compiles
+        # once per shape instead of dispatching the body op by op each call;
+        # under a caller's jit it inlines as before.
+        return jax.jit(shard_map(body, mesh=mesh,
+                                 in_specs=(P(None, ax_x, ax_y),),
+                                 out_specs=P((ax_x, ax_y), None, None),
+                                 check_vma=False))
 
     _sm_cache: dict = {}
 
