@@ -48,7 +48,7 @@ Public surface
   parent/star streaming without re-reading a raw IBZ row for every child.
 * :meth:`gvecs` — cached G-vector lists per k-set.
 * :meth:`ngk_valid` — per-k logical ngk (for callers that care).
-* :meth:`get_gvec_nk` — deprecated thin shim for legacy vcoul / qp_wfn.
+* :meth:`get_gvec_nk` — the unpadded G list of one k, straight from the raw slab.
 
 P-roadmap — STATUS, not plan (2026-08-07, wave-1 wfn_loader branch)
 ------------------------------------------------------------------
@@ -1114,12 +1114,11 @@ class WfnLoader:
         return out
 
     def get_gvec_nk(self, ik: int) -> np.ndarray:
-        """Deprecated shim for legacy vcoul.py / qp_wfn.py callers.
+        """The (ngk[ik], 3) IBZ G-list for one k, read from the raw slab.
 
-        Returns the (ngk[ik], 3) IBZ G-list for a single k.  New code
-        should use ``loader.gvecs(k='ibz')[ik, :loader.ngk_valid(k='ibz')[ik]]``
-        — but vcoul reads one k at a time, so the shim stays for one
-        release."""
+        It bypasses the padded ``gvecs`` table, which is why tests use it as
+        an independent reference.  Production code uses
+        ``loader.gvecs(k='ibz')[ik, :loader.ngk_valid(k='ibz')[ik]]``."""
         start = int(self._kpt_starts[int(ik)])
         end = start + int(self.ngk[int(ik)])
         return self._gvecs_raw[start:end]

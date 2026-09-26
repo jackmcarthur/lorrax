@@ -51,7 +51,7 @@ the downstream `ζ v ζ†` needs no further factor. With $K = q+G$ in Cartesian
 | `Bulk3D.q0_average`, `Slab2D.q0_average`, `*.q0_average_transverse_tensor` | q→0 cell averages `(⟨v⟩, ⟨v/(1 − v qᵀSq)⟩)` in bare units, and the bare transverse (TT) head, § [q→0 cell averages](#q0-cell-averages). |
 | `gauss_legendre_interval(order, left, right)` | Immutable float64 Gauss–Legendre rules on finite intervals, shared by the photon cubature and LORRAX's MPA/VNL consumers. |
 | `bare_coulomb_sphere_indices`, `bare_coulomb_sphere_mask`, `fft_box_miller` | Which G satisfy `|q+G|² ≤ cutoff` (Ry), and nothing else. The ζ-format sentinel padding is applied on the LORRAX side (`common.coulomb_sphere`). |
-| `compute_vcoul_box`, `N_IN_BOX`, `NCELL`, `TRUNC_SHIFT` | The 0-D box FFT and BGW's parameters. |
+| `compute_vcoul_box` | The 0-D box FFT (BGW `Common/trunc_cell_box.f90`). |
 | `read_bgw_vcoul`, `fill_v_grid_for_q`, `BGWVcoulTable` | Parse and scatter BGW `vcoul` dumps. `find_q_index` has no shifted-q₀ fallback. |
 
 ## Head-slot rule

@@ -38,7 +38,7 @@ service through its door and nowhere else.
 `gw/kin_ion_io.py` · `gw/downfold_cli.py` · `centroid/kmeans_cli.py` ·
 `psp/{run_nscf,run_sternheimer,get_DFT_mtxels,get_dipole_mtxels,kpm_dos,orbital_magnetization,finite_q_head_interp}.py` ·
 `bse/{bse_feast,bse_pseudopoles,bse_w_exact,bse_kpm}.py` · `gw/eqp_bgw.py` ·
-`gw/compute_vcoul_0d.py` · `postprocess/rotate_wfn_to_qp.py`.
+`postprocess/rotate_wfn_to_qp.py`.
 
 **The physics kernels**: everything in `gw/`, `bse/`, `psp/`, `isdf/`,
 `bandstructure/`, most of `centroid/`, the format readers and writers in
