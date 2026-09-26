@@ -115,11 +115,11 @@ def test_stage_table_prints_gamma_per_row_or_no_planner(tmp_path, monkeypatch):
     table = text.split("MAJOR-STAGE DEVICE MEMORY")[1]
     line = lambda label: next(l for l in table.splitlines() if l.strip().startswith(label))
     assert "20.59 /  20.49" in line("chi0") and "18.50" in line("chi0")
-    assert line("chi0").split()[-1] == "1.11"
-    assert line("Sigma tau other").split()[-1] == "1.81"            # the sweep's own 23.30
+    assert " 1.11  " in line("chi0") and line("chi0").endswith("gw_jax.chi0_W_probe > chi.exec")
+    assert " 1.81  " in line("Sigma tau other")                     # the sweep's own 23.30
     assert "16.63" in line("Sigma tau setup") and "no planner" in line("Sigma tau setup")
     assert "no planner" in line("Sigma Hartree")
-    assert "gw_jax.chi0_W > chi.exec peak 12.03" in table and "γ 1.21" in table
+    assert "gw_jax.chi0_W > chi.exec peak 12.03 / 11.93 GB; γ 1.21" in table
     # The sandbox parsers' stage-row pattern still reads the timing table and
     # never mistakes a memory row for a stage.
     stage_row = re.compile(r"^\s{2}(?P<name>\S.*?)\s{2,}(?P<wall>[\d.Ee+-]+)\s+"
