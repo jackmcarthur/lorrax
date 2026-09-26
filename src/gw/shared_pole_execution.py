@@ -45,12 +45,82 @@ def constructor_side_upper_bound(recipe, *, ordered, odd_moments,
     return int(finite + infinity)
 
 
+def line_panel_count(recipe):
+    """Fitted line supports off the imaginary axis: the samples the bank stores as panels."""
+    from gw.shared_pole_directions import _sample_point
+    return sum(1 for sid in recipe['fit_ids'] if _sample_point(recipe, int(sid)).real != 0)
+
+
+def selection_face_count(recipe, *, n, logical_n, states, rows, dense_fields, moment_fields,
+                         column_extent, cross_rows=0):
+    """Resident [n,n] face equivalents of one parent's selection inputs.
+
+    ``dense_fields`` faces per dense fitted sample (on the imaginary axis),
+    ``moment_fields`` moment faces, and per stored line sample the panel
+    [1+2S, rows, r] plus, when ``cross_rows``, the [2S, cross_rows, r] cross
+    panel, at r = the carrier of the line cap (``logical_n`` rows when the recipe
+    sets none), rounded up to whole faces. An admission bound: a multiplet
+    closed past the cap stores its actual width.
+    """
+    import math
+    lines = line_panel_count(recipe)
+    dense = len(recipe['fit_ids']) - lines
+    cap = recipe.get('line_direction_cap')
+    width = int(column_extent(max(1, min(int(logical_n), int(logical_n) if cap is None else int(cap)))))
+    panel = lines * ((1 + 2 * int(states)) * int(rows) + 2 * int(states) * int(cross_rows)) * width
+    return int(dense_fields) * dense + int(moment_fields) + math.ceil(panel / int(n) ** 2)
+
+
+def line_selection_price(rows, *, mesh, nq, execution):
+    """Per-rank bytes of the producer's selection at one line sample: (resident, workspace).
+
+    Live beside the caller's reservations: the selection copies of every
+    endpoint block of W and of dW/ds (16 * 2 * sum_fg n_f n_g per parent;
+    whole parents per rank, ceil(nq/P) of them, on the local route; tiles on
+    the face) and the largest family's 2n dilation eigensystem (its matrix and
+    vectors, one parent at a time on the local route), plus the service's
+    native eigh workspace. The panels are narrow and ride in the same bound.
+    """
+    import math
+    import distrib_la
+    from gw.shared_pole_capacity import constructor_eigenplan
+    ranks = int(mesh.size)
+    blocks = sum(int(a) * int(b) for a in rows for b in rows)
+    largest = 2 * max(int(r) for r in rows)
+    plan = constructor_eigenplan(mesh, largest, execution)
+    if execution == 'local':
+        resident = 16 * (2 * math.ceil(int(nq) / ranks) * blocks + 2 * largest ** 2)
+        workspace = distrib_la.workspace_bytes_per_rank(plan, "eigh", ((1, largest, largest),), np.complex128)
+    else:
+        resident = math.ceil(16 * (2 * int(nq) * blocks + 2 * largest ** 2) / ranks)
+        workspace = distrib_la.workspace_bytes_per_rank(plan, "eigh", ((1, largest, largest),), np.complex128)
+    return int(resident), int(workspace)
+
+
+def line_selection_execution(rows, *, mesh, ledger, nq, carry=0):
+    """'local' when the producer's line selection fits with whole parents per rank, else 'face'.
+
+    ``carry`` is the resident group carry the selection runs beside. Returns
+    ``(execution, resident, workspace)``, the prices of the chosen route.
+    """
+    for execution in ('local', 'face'):
+        resident, workspace = line_selection_price(rows, mesh=mesh, nq=nq, execution=execution)
+        row = ledger.preview(resident_bytes_per_rank=resident + int(carry), workspace_bytes_per_rank=workspace,
+                             concurrent_with=ledger.live_stages)
+        if row['device_budget_status'] == 'PASS':
+            return execution, resident, workspace
+    return 'face', resident, workspace
+
+
 def constructor_execution(meta, resolution, recipe, *, mesh, ledger, upstream,
-                          ordered, odd_moments, sample_fields, moment_fields,
+                          ordered, odd_moments, selection_faces, sample_batch,
                           parent_count=1, retained_output_families=1, defer_reduction=False,
                           cross_original_sides=None, cross_retained_side=None,
                           column_extent=lambda width: width):
     """Resolve local or whole-mesh execution once, before a constructor read.
+
+    ``selection_faces`` counts the selection's resident [n,n] faces
+    (``selection_face_count``) over ``sample_batch`` dense fitted samples.
 
     Local parents (one whole parent per rank, R4) are the fast path whenever
     the complete selection stack fits, whatever dense layout the deck names:
@@ -69,9 +139,8 @@ def constructor_execution(meta, resolution, recipe, *, mesh, ledger, upstream,
             else constructor_side_upper_bound(
                 recipe, ordered=ordered, odd_moments=odd_moments,
                 logical_n=int(meta.n_rmu), column_extent=column_extent))
-    fit_ids = [int(i) for i in recipe['fit_ids']]
-    fit = max(fit_ids) - min(fit_ids) + 1
-    selection_faces = fit * int(sample_fields) + int(moment_fields)
+    fit = max(1, int(sample_batch))
+    selection_faces = int(selection_faces)
     if resolution.layout not in ('local', 'distributed'):
         raise ValueError('unsupported resolved constructor linalg layout')
     local = ConstructorCapacity(meta, resolution, mesh_xy=mesh, ledger=ledger,
@@ -249,17 +318,17 @@ def face_round_check_program(mesh, ordered, n):
                         mesh, outputs='scalars')
 
 
-def sector_round_schedule(bank,header,meta,config,mesh,partner,*,execution=None,batch_width=1):
+def sector_round_schedule(bank,header,meta,config,mesh,*,execution=None,batch_width=1):
     """Schedule local parent rounds or bounded batches on the whole mesh."""
     from gw.shared_pole_local import parent_rounds
     from gw.gw_config import linalg_resolution
     resolution=linalg_resolution({'linalg':config.backend.linalg})
     execution = resolution.layout if execution is None else execution
     if execution == 'local':
-        return [(*row,'local') for row in parent_rounds(header['n_q_irr'],mesh.size,partner)]
+        return [(*row,'local') for row in parent_rounds(header['n_q_irr'],mesh.size)]
     if execution not in ('distributed', 'face'):
         raise ValueError('unsupported resolved constructor linalg layout')
-    # The stored minus-q partner belongs to the same operator; face parents
+    # Every parent's minus-q actions are in its own bank panels; face parents
     # need neither simultaneous partner parents nor artificial rank padding.
     nq = int(header['n_q_irr'])
     return [(list(range(q, min(q + batch_width, nq))), min(batch_width, nq-q),
@@ -324,16 +393,22 @@ def sector_batch_width(meta, resolution, recipe, routes, *, mesh, ledger, nq):
     eigen_side = max(max(row['conservative_pencil_side'] for row in routes),
                      sum(min(row['signed_side_bound'],row['conservative_pencil_side'])
                          for row in routes))
-    fit_ids = recipe['fit_ids']
-    fit = int(max(fit_ids) - min(fit_ids) + 1)
+    lines = line_panel_count(recipe)
+    dense = len(recipe['fit_ids']) - lines
+    # Each family's cross panels: 8 [rows of the other family, line width]
+    # blocks per line sample (the four ordered states, output and action).
+    charge, current = routes
+    cross = lines * 8 * (current['packed_extent'] * charge['line_width']
+                         + charge['packed_extent'] * current['line_width'])
     budget = ConstructorCapacity(joint, resolution, mesh_xy=mesh, ledger=ledger,
                                  upstream=ledger.live_stages, execution='face')
     for width in range(int(nq), 0, -1):
         budget.batch_width = width
-        # The phase formula covers current pencil/actions, not the two full
-        # sample stacks that the caller still holds during cross reduction.
-        sample_bytes = int(np.ceil(16 * width * (8 * fit + 8)
-                                  * joint.n_rmu_padded**2 / mesh.size))
+        # The phase formula covers current pencil/actions, not the dense CT/TC
+        # stacks (W and dW/ds at the dense fitted samples), the moments and
+        # the cross panels that the caller still holds during cross reduction.
+        sample_bytes = int(np.ceil(16 * width * ((4 * dense + 8) * joint.n_rmu_padded**2 + cross)
+                                   / mesh.size))
         resident = budget.resident_quote(side, phase='reduction')
         preview = ledger.preview(
             resident_bytes_per_rank=resident['resident_bytes_per_rank'] + sample_bytes,

@@ -145,9 +145,7 @@ def shared_pole_packed_action(meta, header, *, mesh_xy):
     Returns ``(packed_perm, wraps, certificates)``: the authenticated canonical
     source permutation ``qirr.sym_perm`` and umklapp wraps ``qirr.L_table``
     moved to the packed basis order, and ``symmetry_maps.certify_endpoint_locality``
-    for the x and y face axes. One construction of these tables serves the
-    Sigma unfold and the constructor's partner exchange
-    (``gw.shared_pole_local.partner_realization``).
+    for the x and y face axes, for the Sigma unfold.
     """
     from symmetry_maps import certify_endpoint_locality
 

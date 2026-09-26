@@ -288,10 +288,11 @@ def _round_infinity(mesh, plants, orders):
 
 def test_round_program_pairs_mirrors_on_parents_of_different_sides():
     """Round selection and the round program on a q = -q TR-broken round of two parents with
-    different pencil sides (slots 2, 3 synthetic; every slot its own partner, identity realization):
-    each mirror X(-node) sits on its original's directions, an imaginary support mirrors on its own
-    sample, the conjugate O panels are the next state's directions, every real slot is in the paired
-    layout and its signed model reproduces its plant. RED TWIN: unmirrored nodes are refused."""
+    different pencil sides (slots 2, 3 synthetic): each line sample's states come from the producer's
+    selection with the minus-q partner W(-conj z) and round-trip through their stored panels; each
+    mirror X(-node) sits on its original's directions, an imaginary support mirrors on its own sample,
+    the conjugate O panels are the next state's directions, every real slot is in the paired layout
+    and its signed model reproduces its plant. RED TWIN: unmirrored nodes are refused."""
     import jax
     from shared_pole_round_helpers import round_states
     from gw.shared_pole_local import reduce_round, round_tables
@@ -303,9 +304,11 @@ def test_round_program_pairs_mirrors_on_parents_of_different_sides():
     recipe = dict(fit_ids=[0, 1, 2], distinct_id=[0, 1, 2], role=[0, 0, 1], held=[False] * 3,
                   z_ry=[dict(real=v.real, imag=v.imag) for v in nodes], direction_cutoff=1e-3,
                   imaginary_width=4, multiplet_relative_tolerance=1e-6)
+    at = lambda plant, z: (plant.F(z), plant.dF(z) / (2 * z))
     states, counts, roles = round_states(
-        mesh, lambda slot, i: (slot_plants[slot].F(nodes[i]), slot_plants[slot].dF(nodes[i]) / (2 * nodes[i])),
-        recipe, n=n, eig=ep, svd=sp, extent=extent, ordered=True, real=2, batch=True)
+        mesh, lambda slot, i: at(slot_plants[slot], nodes[i]), recipe, n=n, eig=ep, svd=sp, extent=extent,
+        ordered=True, real=2, batch=True,
+        partner=lambda slot, i: at(slot_plants[slot], -np.conj(nodes[i])))
     half = len(states) // 2
     assert len(states) == 12
     for i in range(half):
@@ -348,9 +351,10 @@ def test_dedupe_drops_duplicate_partners_and_equals_even_on_symmetric_data():
                   imaginary_width=4, multiplet_relative_tolerance=1e-6)
     models, ranks = {}, {}
     for label, ordered in (("even", False), ("ordered", True)):
+        at = lambda z: (plant.F(z), plant.dF(z) / (2 * z))
         states, counts, _ = round_states(
-            mesh, lambda slot, i: (plant.F(nodes[i]), plant.dF(nodes[i]) / (2 * nodes[i])), recipe,
-            n=n, eig=ep, svd=sp, extent=extent, ordered=ordered, batch=True)
+            mesh, lambda slot, i: at(nodes[i]), recipe, n=n, eig=ep, svd=sp, extent=extent,
+            ordered=ordered, batch=True, partner=lambda slot, i: at(-np.conj(nodes[i])))
         if ordered:
             assert len(states) == 12
         infinity = _round_infinity(mesh, [plant] * 4, range(4) if ordered else (1, 3))

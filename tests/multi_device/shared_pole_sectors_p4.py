@@ -178,8 +178,7 @@ def run_checks(mesh):
     assert abs(good_value-.16)<1e-12 and abs(red_value-1.44)<1e-12
     rows.append(dict(name='cauchy_schwarz',value=good_value,red_value=red_value))
     rows.extend(run_span_checks(mesh))
-    rows.extend(run_current_partner_checks(mesh))
-    assert len(rows)==12
+    assert len(rows)==11
     return rows
 
 
@@ -463,49 +462,6 @@ def run_extent_span_checks(mesh):
                  wrong_row_embedding_error=red,extents=tables['extents'].tolist())]
 
 
-def run_current_partner_checks(mesh):
-    """Current-component rotation and centroid phase at a nonzero complex node."""
-    import jax
-    import numpy as np
-    from jax.sharding import NamedSharding, PartitionSpec as P
-    from gw.shared_pole_directions import _round_kernels
-
-    rng=np.random.default_rng(473)
-    w=rng.normal(size=(4,1,6,6))+1j*rng.normal(size=(4,1,6,6))
-    dw=rng.normal(size=w.shape)+1j*rng.normal(size=w.shape)
-    x=rng.normal(size=(4,2,6,2))+1j*rng.normal(size=(4,2,6,2))
-    alpha=np.tile(np.array([3,4,5,0,1,2],np.int32),(4,1))
-    phase=np.repeat(np.exp(1j*np.arange(8).reshape(4,2)*.2),3,axis=1)
-    angle=.37
-    rotation=np.tile(np.array([[np.cos(angle),-np.sin(angle),0],
-                               [np.sin(angle),np.cos(angle),0],[0,0,1]])[None],(4,1,1))
-    partner=[1,0,3,2]
-    spec=NamedSharding(mesh,P(('x','y')))
-    put=lambda a:jax.make_array_from_callback(a.shape,spec,lambda ix:a[ix])
-    rep=lambda a:jax.device_put(np.asarray(a),NamedSharding(mesh,P()))
-    scales=np.array([-2*(.7+.4j),-2*(.7-.4j)])
-    program=_round_kernels(mesh).exchange((False,True),tuple(enumerate(partner)),3)
-    got=program(*(put(a) for a in (w,dw,x,alpha,np.argsort(alpha).astype(np.int32),phase)),
-                rep(np.int32(0)),rep(scales),put(rotation))
-    errors=[];red=[]
-    for slot,p in enumerate(partner):
-        r=np.diag(phase[slot])@np.eye(6)[alpha[slot]]@np.kron(np.eye(2),rotation[slot])
-        for k in range(2):
-            for derivative,a in enumerate((w[p,0],dw[p,0])):
-                exact=r@a@r.conj().T
-                exact=(exact.T if k==0 else exact.conj())@x[slot,k]
-                exact*=scales[k] if derivative else 1
-                actual=jax.experimental.multihost_utils.process_allgather(got[2*k+derivative], tiled=True)[slot]
-                errors.append(float(np.max(np.abs(actual-exact))))
-                if not derivative:
-                    wrong=(a.T if k==0 else a.conj())@x[slot,k]
-                    red.append(float(np.linalg.norm(wrong-exact)))
-    assert max(errors)<1e-11,errors
-    assert min(red)>1,red
-    return [dict(name='current_symmetric_partner',absolute_error=max(errors),
-                 omitted_action_red_min=min(red))]
-
-
 def run_store_checks(mesh,root):
     import importlib.util
     from unittest.mock import patch
@@ -542,8 +498,10 @@ def run_store_checks(mesh,root):
     from gw.photon_layout import PhotonBasisLayout
     from gw.shared_pole_sectors import read_sector_round
     layout=PhotonBasisLayout.from_centroid_extents(meta.mu_basis.n_logical,current_basis.n_logical,mesh)
+    # The fitted line site sits on the imaginary axis (the relaxed tier's first site), so both
+    # samples are dense and exercise the native sector rectangle reads.
     bank_recipe=dict(recipe,role_codes=dict(line=0,imaginary=1,infinity=2,held_line=3,held_imaginary=4),
-        z_ry=np.array([.3+.2j,.7+.4j]),role=np.array([0,3],np.int8),
+        z_ry=np.array([.2j,.7+.4j]),role=np.array([0,3],np.int8),
         distinct_id=np.array([0,1],np.int64),held=np.array([False,True]),
         support_pair=np.array([[-1,-1],[0,1]],np.int64),
         fit_ids=np.array([0],np.int64),held_ids=np.array([1],np.int64))
@@ -555,9 +513,6 @@ def run_store_checks(mesh,root):
     raw=np.arange(nq*2*n*n).reshape(nq,2,n,n).astype(complex)*(1+.2j)
     device=fixture._device(raw,mesh,P(None,None,'x','y'))
     moment=fixture._device(raw[:,0],mesh,P(None,'x','y'))
-    header=store.write_shared_pole_bank(path,q_span=(0,nq),sample_span=(0,1),
-        Wc_minus_q=3*device[:,:1],dWc_minus_q_ds=4*device[:,:1],
-        meta=meta,expected_identity=identity,mesh_xy=mesh)
     header=store.write_shared_pole_bank(path,q_span=(0,nq),sample_span=(0,2),Wc=device,dWc_ds=2*device,
         M0=moment,M1=moment,M2=moment,M3=moment,constant=moment,
         meta=meta,expected_identity=identity,mesh_xy=mesh)
@@ -571,10 +526,8 @@ def run_store_checks(mesh,root):
             with SlabIO(path,mode='r',mesh=mesh) as io:
                 got=read_sector_round(io,meta,bank,header,[0,1,2,2],endpoints,
                     sample_span=(0,2),fields=('Wc','dWc_ds'))
-                got.update(read_sector_round(io,meta,bank,header,[0,1,2,2],endpoints,
-                    sample_span=(0,1),fields=('Wc_minus_q','dWc_minus_q_ds')))
-        assert len(native_reads)==4*layout.mesh_side,native_reads
-        assert sorted(shape[1] for shape in native_reads)==[1]*(2*layout.mesh_side)+[2]*(2*layout.mesh_side),native_reads
+        assert len(native_reads)==2*layout.mesh_side,native_reads
+        assert sorted(shape[1] for shape in native_reads)==[2]*(2*layout.mesh_side),native_reads
         endpoint_indices=[];endpoint_valid=[]
         for family in endpoints:
             basis=bank['mu_bases'][family]
@@ -588,9 +541,7 @@ def run_store_checks(mesh,root):
         expected=raw[[0,1,2,2]][:,:,endpoint_indices[0]][:,:,:,endpoint_indices[1]]
         expected=np.where(np.array(endpoint_valid[0])[:,None]&np.array(endpoint_valid[1])[None,:],expected,0)
         expected=fixture._device(expected,mesh,P(('x','y')))
-        assert (bool(jnp.all(got['Wc']==expected)) and bool(jnp.all(got['dWc_ds']==2*expected))
-                and bool(jnp.all(got['Wc_minus_q']==3*expected[:,:1]))
-                and bool(jnp.all(got['dWc_minus_q_ds']==4*expected[:,:1])))
+        assert bool(jnp.all(got['Wc']==expected)) and bool(jnp.all(got['dWc_ds']==2*expected))
         rows.append(dict(name=f'photon_sector_read_{endpoints[0]}_{endpoints[1]}',
                          bitwise=True,native_reads=len(native_reads),sample_span=2))
     headers={}

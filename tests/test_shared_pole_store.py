@@ -122,26 +122,29 @@ def test_shared_pole_metadata_from_production_meta_without_kgrid():
     check_metadata_without_kgrid(_test_mesh())
 
 
-def test_minus_q_partner_fields_cover_fitted_line_samples_only():
-    """W_q(-conj z) is stored at fitted line samples; imaginary and held ones are not."""
-    header = {"minus_q_partner": {"sample_span": [0, 2]}, "bank_shape": {"nsample": 5}}
-    assert store._bank_sample_fields(header) == (
-        "Wc", "dWc_ds", "Wc_minus_q", "dWc_minus_q_ds")
-    assert store._sample_field(header, "Wc_minus_q") == ("minus_q_written", 0, 0, 2)
-    assert store._sample_field(header, "dWc_ds") == ("sample_written", 1, 0, 5)
-    assert store._bank_sample_fields({"bank_shape": {"nsample": 5}}) == ("Wc", "dWc_ds")
-    plan = dict(z_ry=np.asarray([.3+.1j, .5+.1j, .1j, .4+.1j, .2j]),
-                distinct_id=np.arange(5), fit_ids=np.asarray([0, 1, 2]))
-    assert store.minus_q_partner_span(plan) == (0, 2)
+def test_line_panel_span_and_dense_rows():
+    """Fitted samples off the imaginary axis are stored as panels; the dense axis skips them."""
+    plan = dict(z_ry=np.asarray([.1j, .3+.1j, .5+.1j, .2j, .4+.1j]),
+                distinct_id=np.arange(5), fit_ids=np.asarray([0, 1, 2, 3]))
+    # The relaxed tier's first line site sits at Re z = 0: dense, like the imaginary ladder.
+    assert store.line_panel_span(plan) == (1, 3)
     with pytest.raises(ValueError, match="one contiguous sample span"):
-        store.minus_q_partner_span(dict(plan, fit_ids=np.asarray([0, 2, 3])))
+        store.line_panel_span(dict(plan, fit_ids=np.asarray([1, 3, 4])))
+    header = {"line_panels": {"sample_span": [1, 3]}, "bank_shape": {"nsample": 5}}
+    assert store._bank_sample_fields(header) == ("Wc", "dWc_ds")
+    assert store._sample_field(header, "dWc_ds") == ("sample_written", 1, 3)
+    assert store.dense_sample_rows(header, (0, 3, 4)) == [0, 1, 2]
+    with pytest.raises(ValueError, match="sample 2 is a line-panel sample"):
+        store.dense_sample_rows(header, (2,))
+    assert store.line_panel_name("C", 7) == "line_C_007"
+    assert store.line_panel_name("T", 7, cross=True) == "line_T_007_cross"
 
 
-def test_retired_all_sample_layout_refuses_by_name(monkeypatch):
-    """A bank from the retired layout names it instead of failing on the schema."""
-    monkeypatch.setattr(store, "_read_header", lambda path: {
-        "mirror_mode": "literal_same_operator_v1", "schema": "lorrax.shared-real-pole-bank.v1"})
-    with pytest.raises(ValueError, match="retired mirror_mode layout"):
+@pytest.mark.parametrize("schema", ["lorrax.shared-real-pole-bank.v1", "lorrax.shared-real-pole-bank.v2"])
+def test_retired_bank_schemas_refuse_by_name(monkeypatch, schema):
+    """A bank with dense line samples (v1, v2) names its retired schema; resume then rebuilds."""
+    monkeypatch.setattr(store, "_read_header", lambda path: {"schema": schema})
+    with pytest.raises(ValueError, match=f"scratch bank schema {schema} is retired"):
         store.validate_shared_pole_bank("unused.h5", expected_identity={}, mesh_xy=None)
 
 

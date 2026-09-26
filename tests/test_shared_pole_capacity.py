@@ -132,7 +132,7 @@ class CapacityTests(unittest.TestCase):
                 execution, receipt = constructor_execution(
                     meta, resolution, recipe, mesh=mesh, ledger=ledger,
                     upstream=(), ordered=True, odd_moments=True,
-                    sample_fields=4, moment_fields=4, parent_count=13,
+                    selection_faces=18 * 4 + 4, sample_batch=18, parent_count=13,
                     defer_reduction=deferred,
                     column_extent=lambda width: 4 * ((width + 3) // 4))
             self.assertEqual(execution, expected)

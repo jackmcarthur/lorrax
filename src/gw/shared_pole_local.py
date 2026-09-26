@@ -1,9 +1,8 @@
 """Rounds of shared-pole parents, one parent per mesh rank (batch layout).
 
-The round schedule and its partner table, the packed -q realization, the
-column tables and the one round program that packs, assembles, reduces, gates
-and sorts every parent of a round on its own rank with local dense kernels,
-and the restore of round results to the face.
+The round schedule, the column tables and the one round program that packs,
+assembles, reduces, gates and sorts every parent of a round on its own rank
+with local dense kernels, and the restore of round results to the face.
 """
 from functools import lru_cache, partial
 
@@ -11,52 +10,24 @@ from functools import lru_cache, partial
 BATCH = ('x', 'y')
 
 
-def parent_rounds(nq, ranks, partner=None):
+def parent_rounds(nq, ranks):
     """Rounds of ``ranks`` parent slots, one parent per rank, in canonical order.
 
-    Without ``partner`` a round is the next contiguous run of parents. With
-    ``partner`` (int [nq], an involution: the raw parent that carries each
-    parent's -q) a round is partner-closed: a parent enters with its partner,
-    so the mirror exchange of a round never leaves it. A short round repeats its
-    last real parent in the synthetic slots, which are never solved.
+    A round is the next contiguous run of parents; every parent's minus-q
+    actions are already in its own bank panels, so no round needs another
+    parent. A short round repeats its last real parent in the synthetic slots,
+    which are never solved.
 
     Returns ``[(ids, real, slots)]``: ``ids`` the ``ranks`` parent ids, ``real``
-    the number of leading real slots, ``slots[r]`` the slot of slot r's
-    partner (synthetic slots pair with themselves).
+    the number of leading real slots, ``slots`` the slot index of each slot.
     """
     import numpy as np
 
-    if partner is None:
-        groups = [[q] for q in range(nq)]
-    else:
-        partner = [int(v) for v in partner]
-        if any(partner[partner[q]] != q for q in range(nq)):
-            raise ValueError("GATE minus_q_partner: got: a partner table that is not an involution; want: "
-                             "partner[partner[p]] == p; why: the round exchange pairs slots")
-        groups, seen = [], set()
-        for q in range(nq):
-            if q not in seen:
-                group = [q] if partner[q] == q else [q, partner[q]]
-                seen.update(group)
-                groups.append(group)
-    rounds, current = [], []
-    for group in groups:
-        if len(group) > ranks:
-            raise ValueError(f"GATE shared_pole_round: got: a partner pair on a mesh of {ranks} rank; "
-                             "want: at least two ranks for an ordered deck with -q != q; why: one parent per rank")
-        if len(current) + len(group) > ranks:
-            rounds.append(current)
-            current = []
-        current += group
-    if current:
-        rounds.append(current)
     out = []
-    for ids in rounds:
+    for q0 in range(0, int(nq), int(ranks)):
+        ids = list(range(q0, min(q0 + int(ranks), int(nq))))
         real = len(ids)
-        slots = [ids.index(partner[q]) if partner is not None else r for r, q in enumerate(ids)]
-        ids = ids + [ids[-1]] * (ranks - real)
-        slots = slots + list(range(real, ranks))
-        out.append((ids, real, np.asarray(slots, np.int64)))
+        out.append((ids + [ids[-1]] * (int(ranks) - real), real, np.arange(int(ranks), dtype=np.int64)))
     return out
 
 
@@ -120,33 +91,6 @@ def canonical_factors(mesh_xy, order, components=1):
         whole = whole[jnp.asarray(index)]
         return whole.reshape(whole.shape[0], whole.shape[1] // components, components, width)
     return jax.jit(stack, out_shardings=NamedSharding(mesh_xy, P(None, 'x', None, 'y')))
-
-
-def partner_realization(meta, header, ids, partner_parent, partner_row, *, mesh_xy, components=1):
-    """Per-slot packed action of each parent's -q partner row, in batch layout.
-
-    For slot r (parent ids[r], partner p', row s): ``alpha[r]`` the packed source
-    permutation of s, ``inverse[r]`` its inverse, ``phase[r]`` = exp(2 pi i
-    q(p') . L_s) on the packed rows, so R_s[W] = Phi Pi W Pi^T Phi^*. Host tables
-    only; each rank receives its own slot's rows.
-    """
-    import numpy as np
-    from gw.qgrid_symmetry import shared_pole_packed_action
-
-    packed, wraps, _ = shared_pole_packed_action(meta, header, mesh_xy=mesh_xy)
-    q_frac = np.asarray(header["qirr"]["q_irr_frac"], dtype=np.float64)
-    rows = [int(partner_row[q]) for q in ids]
-    parents = [int(partner_parent[q]) for q in ids]
-    alpha = np.asarray([packed[s] for s in rows], np.int32)
-    inverse = np.argsort(alpha, axis=1).astype(np.int32)
-    phase = np.exp(2j * np.pi * np.einsum('ri,rmi->rm', q_frac[parents],
-                                          np.asarray([wraps[s] for s in rows], np.float64)))
-    if components != 1:
-        alpha = (alpha[:, :, None] * components + np.arange(components)).reshape(len(ids), -1).astype(np.int32)
-        inverse = np.argsort(alpha, axis=1).astype(np.int32)
-        phase = np.repeat(phase, components, axis=1)
-    return (_batch_put(mesh_xy, alpha), _batch_put(mesh_xy, inverse),
-            _batch_put(mesh_xy, phase.astype(np.complex128)))
 
 
 def carrier_history(meta):

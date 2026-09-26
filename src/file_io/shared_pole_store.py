@@ -92,7 +92,7 @@ def _local_bytes(shape, dtype, mesh, spec):
     return count * np.dtype(dtype).itemsize
 
 
-def _conversion_bytes(basis, shape, spec, *, unpack, operator=False):
+def _conversion_bytes(basis, shape, spec, *, unpack, operator=False, axis=1):
     """Compile the existing basis conversion without allocating its operand.
 
     Return argument, output and compiler temporary bytes per rank. These are
@@ -104,7 +104,7 @@ def _conversion_bytes(basis, shape, spec, *, unpack, operator=False):
     if basis.is_identity:
         return argument, argument, 0
     kernel = (basis._operator_kernel(spec, unpack) if operator
-              else basis._axis_kernel(1, spec, unpack))
+              else basis._axis_kernel(axis, spec, unpack))
     operand = jax.ShapeDtypeStruct(shape, jnp.complex128,
                                   sharding=NamedSharding(basis.mesh_xy, spec))
     stats = kernel.lower(operand).compile().memory_analysis()
@@ -1065,55 +1065,86 @@ _BANK_MOMENT_FIELDS = ("M1", "M3")
 # C_(k+1) of Wc at 1/z^(k+1) (the convention that already gives S_m = 2 M_(2m+1)).
 _BANK_ODD_MOMENT_FIELDS = ("M0", "M2")
 
-
-# An ordered bank also stores the minus-q partner of each fitted line sample:
-# W_q(-conj z) = conj(W_{-q}(z)), formed from the exact -q response rows with
-# parent q's own V (and contact), and its s-derivative at s = (-conj z)^2.
-_BANK_PARTNER_FIELDS = ("Wc_minus_q", "dWc_minus_q_ds")
+# Retired bank schemas, refused by name: v1 stored W_q(-conj z) at every
+# sample, v2 at the fitted line samples, both dense beside a dense W and dW/ds.
+_RETIRED_BANK_SCHEMAS = ("lorrax.shared-real-pole-bank.v1", "lorrax.shared-real-pole-bank.v2")
 
 
-def minus_q_partner_span(plan):
-    """Sample ids [p0, p1) whose minus-q partner a bank must store.
+def line_panel_span(plan):
+    """Sample ids [p0, p1) stored as direction panels: the fitted samples with Re z != 0.
 
-    Only fitted samples off the imaginary axis: at z = iu, -conj z = z and the
-    partner is the stored sample itself; held samples are checked against Wc
-    and dWc_ds only. The recipe lists the fitted line supports first, so the
-    span is contiguous (refused otherwise).
+    At such a line support the constructor reads only the directions Q selected
+    from W(z) itself and the actions of W, dW and (ordered) the minus-q partner
+    W_q(-conj z) on Q and on O = W Q (``gw.shared_pole_directions``), so the
+    producer stores those and no dense matrix. A fitted sample on the imaginary
+    axis (-conj z = z; its ordered conjugate direction needs O outside span(Q))
+    and every held sample stay dense. The recipe lists the fitted line supports
+    first, so the span is contiguous (refused otherwise).
     """
     z = {int(d): complex(v) for d, v in zip(plan["distinct_id"], plan["z_ry"])}
     ids = sorted(int(s) for s in plan["fit_ids"] if z[int(s)].real != 0)
     if not ids:
         return (0, 0)
     if ids != list(range(ids[0], ids[-1] + 1)):
-        _refuse("minus-q partner samples are not one contiguous sample span")
+        _refuse("line-panel samples are not one contiguous sample span")
     return (ids[0], ids[-1] + 1)
 
 
-def _has_partner_fields(header):
-    """An ordered bank with at least one fitted line sample stores minus-q partner fields."""
-    span = header.get("minus_q_partner", {}).get("sample_span", (0, 0))
-    return int(span[1]) > int(span[0])
+def _panel_span(header):
+    return tuple(int(v) for v in header["line_panels"]["sample_span"])
+
+
+def _has_line_panels(header):
+    p0, p1 = _panel_span(header)
+    return p1 > p0
+
+
+def dense_sample_rows(header, ids):
+    """Rows of the dense Wc/dWc_ds sample axis for sample ids outside the panel span.
+
+    The dense axis holds every sample except the line-panel span [p0, p1):
+    row = id below p0, id - (p1 - p0) above it. A line-panel id refuses by name.
+    """
+    p0, p1 = _panel_span(header)
+    nsample = int(header["bank_shape"]["nsample"])
+    rows = []
+    for sid in ids:
+        sid = int(sid)
+        if not 0 <= sid < nsample:
+            _refuse(f"sample id {sid} outside the bank's {nsample} samples")
+        if p0 <= sid < p1:
+            _refuse(f"sample {sid} is a line-panel sample: its dense W is not stored, "
+                    "only its directions and their actions (read_line_panels)")
+        rows.append(sid if sid < p0 else sid - (p1 - p0))
+    return rows
+
+
+def _dense_sample_count(header):
+    p0, p1 = _panel_span(header)
+    return int(header["bank_shape"]["nsample"]) - (p1 - p0)
 
 
 def _bank_sample_fields(header):
-    """Every dataset with a sample axis: Wc, dWc_ds and, when stored, the minus-q partner fields."""
-    return _BANK_SAMPLE_FIELDS + (_BANK_PARTNER_FIELDS if _has_partner_fields(header) else ())
+    """Every dense dataset with a sample axis."""
+    return _BANK_SAMPLE_FIELDS
 
 
 def _sample_field(header, name):
-    """(mask key, mask column, first sample id, sample count) of a sample-axis field, else None."""
+    """(mask key, mask column, dense sample rows) of a dense sample-axis field, else None."""
     if name in _BANK_SAMPLE_FIELDS:
-        return "sample_written", _BANK_SAMPLE_FIELDS.index(name), 0, int(header["bank_shape"]["nsample"])
-    if name in _BANK_PARTNER_FIELDS and _has_partner_fields(header):
-        p0, p1 = (int(v) for v in header["minus_q_partner"]["sample_span"])
-        return "minus_q_written", _BANK_PARTNER_FIELDS.index(name), p0, p1 - p0
+        return "sample_written", _BANK_SAMPLE_FIELDS.index(name), _dense_sample_count(header)
     return None
+
+
+def line_panel_name(family, sample, cross=False):
+    """Dataset of one line sample's panels for one endpoint family."""
+    return f"line_{family}_{int(sample):03d}" + ("_cross" if cross else "")
 
 
 def _bank_masks(header):
     """Mask key -> bool array of every committed-field mask the bank carries."""
     keys = ("sample_written", "moment_written") + (
-        ("minus_q_written",) if _has_partner_fields(header) else ())
+        ("line_written",) if _has_line_panels(header) else ())
     return {key: np.asarray(header[key], dtype=bool) for key in keys}
 
 
@@ -1133,6 +1164,8 @@ class ResidentBankPayload:
     canonical-order array the file would hold, ``[nq, nsample, d_c, d_c]`` or
     ``[nq, d_c, d_c]`` complex128 at ``P(None,[None,],'x','y')`` with exact
     zeros past the logical extent, i.e. ``16 * payload / P`` bytes per rank.
+    A line-panel dataset (``line_panel_name``) is the rectangular
+    ``[nq, fields, rows, width]`` array the file holds, stored at its own shape.
 
     It implements only the dataset subset of the ``SlabIO`` handle that the
     bank writer and reader use (``create_dataset``, ``write_slab``,
@@ -1196,9 +1229,13 @@ class ResidentBankPayload:
             if self._logical[name] != shape:
                 _refuse(f"resident bank {name} extent changed")
             return
-        if max(shape[-2:]) > self.carrier:
+        if name.startswith("line_"):
+            # Direction panels are stored at their own rectangular shape.
+            stored = shape
+        elif max(shape[-2:]) > self.carrier:
             _refuse(f"resident bank {name} logical extent exceeds canonical carrier")
-        stored = shape[:-2] + (self.carrier, self.carrier)
+        else:
+            stored = shape[:-2] + (self.carrier, self.carrier)
         # Host tiles are keyed by their lead index; an unwritten one reads as
         # the file's zero fill.
         self._fields[name] = (_resident_zeros(self.mesh, stored)()
@@ -1224,12 +1261,15 @@ class ResidentBankPayload:
                 or any(o + s > n for o, s, n in zip(offset, A.shape, stored))
                 or not A.sharding.is_equivalent_to(NamedSharding(self.mesh, self._spec(A.ndim)), A.ndim)):
             _refuse(f"resident bank {name} write must be a face-tiled full-carrier span")
-        logical = self._logical[name][-1]
+        # A square operator is zeroed past its logical extent, as the file
+        # stores it; a direction panel is stored whole.
+        logical = None if name.startswith("line_") else self._logical[name][-1]
         if self.memory_kind == "device":
             self._fields[name] = _resident_update(self.mesh, len(stored), logical)(
                 store, A, self._lead(offset))
             return
-        A = _resident_mask(self.mesh, A.ndim, logical)(A)
+        if logical is not None:
+            A = _resident_mask(self.mesh, A.ndim, logical)(A)
         host = NamedSharding(self.mesh, P("x", "y"), memory_kind=self.memory_kind)
         for index in np.ndindex(A.shape[:-2]):
             store[tuple(o + i for o, i in zip(offset, index))] = jax.device_put(A[index], host)
@@ -1295,7 +1335,8 @@ def _resident_update(mesh, ndim, logical):
     spec = NamedSharding(mesh, P(*((None,) * (ndim - 2)), "x", "y"))
 
     def update(store, value, lead):
-        value = _logical_mask(value, logical)
+        if logical is not None:
+            value = _logical_mask(value, logical)
         zero = jnp.zeros((), lead.dtype)
         start = tuple(lead[i] for i in range(ndim - 2)) + (zero, zero)
         return jax.lax.dynamic_update_slice(store, value, start)
@@ -1445,27 +1486,54 @@ def open_shared_pole_bank(path, *, mesh_xy):
     return _bank_io(path, "r", mesh_xy)
 
 
-def shared_pole_bank_payload_bytes(meta, *, recipe, ordered, nq, mesh_xy, photon_extent=None):
-    """Per-rank bytes of the complete bank payload in its canonical carrier.
+def line_panel_geometry(meta, *, ordered, photon_bases=None):
+    """Families of a bank's line panels: {family: (rows, cross rows or None)}, and
+    the per-family state count S (TRS 2: z, conj z; ordered 4: also -z, -conj z).
 
-    The same fields the scratch file holds: Wc, dWc/ds at every distinct
-    finite sample, the two minus-q partner fields at each fitted line sample
-    of an ordered bank (``minus_q_partner_span``), M1, M3 (plus M0, M2):
-    16 N_q (2 N_s + 2 N_line + N_m) d^2 / P bytes. A photon bank
-    (``photon_extent`` = its packed extent) is always ordered and also holds
-    the per-parent ``constant`` and the three [1,d,d] static-contact
-    diagnostics (Pi_grid, Drude, TT_contact).
+    A charge bank has one family whose rows are the canonical centroid carrier.
+    A photon bank has C (packed charge rows) and T (packed current rows, three
+    Cartesian components per centroid), each with a cross panel on the other
+    family's rows: the CT/TC actions on that family's directions.
+    """
+    states = 4 if ordered else 2
+    if photon_bases is None:
+        return {"charge": (int(meta.mu_basis.n_canonical), None)}, states
+    charge, current = (int(b.n_packed) for b in photon_bases)
+    return {"C": (charge, 3 * current), "T": (3 * current, charge)}, states
+
+
+def shared_pole_bank_payload_bytes(meta, *, recipe, ordered, nq, mesh_xy, line_widths=None,
+                                   photon_extent=None, photon_bases=None):
+    """Per-rank bytes of the complete bank payload, an admission bound.
+
+    Dense Wc, dWc/ds at every sample outside the line-panel span
+    (``line_panel_span``), the moments M1, M3 (plus M0, M2 ordered), and per
+    line sample and family the panel [1+2S, rows, r] (plus [2S, cross rows, r]
+    on a photon bank) at the caller's width bound ``line_widths[family]``:
+    16 N_q [(2 N_dense + N_m) d^2 + N_line sum_f ((1+2S) n_f + 2S n_f') r_f] / P.
+    The caller bounds r by the carrier of the line direction cap, the
+    constructor's own admission width for a line support; a multiplet closed
+    past the cap stores its actual width. A photon bank (``photon_extent`` =
+    its packed extent, ``photon_bases`` its two centroid bases) is always
+    ordered and also holds the per-parent ``constant`` and the three [1,d,d]
+    static-contact diagnostics (Pi_grid, Drude, TT_contact).
     """
     plan = _bank_plan(recipe)
-    p0, p1 = minus_q_partner_span(plan)
-    partner = 2 * (p1 - p0)
+    p0, p1 = line_panel_span(plan)
+    dense = _bank_nsample(plan) - (p1 - p0)
+    families, states = line_panel_geometry(meta, ordered=bool(ordered) or photon_extent is not None,
+                                           photon_bases=photon_bases)
+    panel = 0
+    for family, (rows, cross) in (families.items() if p1 > p0 else ()):
+        width = int(line_widths[family])
+        panel += ((1 + 2 * states) * rows + (2 * states * cross if cross else 0)) * width
+    panel_bytes = 16 * int(nq) * (p1 - p0) * panel
     if photon_extent is not None:
-        tiles = int(nq) * (2 * _bank_nsample(plan) + partner + 5) + 3
-        return int(16 * tiles * int(photon_extent)**2 // int(mesh_xy.size))
-    samples = 2 * _bank_nsample(plan) + (partner if ordered else 0)
+        tiles = int(nq) * (2 * dense + 5) + 3
+        return int((16 * tiles * int(photon_extent)**2 + panel_bytes) // int(mesh_xy.size))
     moments = 4 if ordered else 2
     carrier = int(meta.mu_basis.n_canonical)
-    return int(16 * int(nq) * (samples + moments) * carrier**2 // int(mesh_xy.size))
+    return int((16 * int(nq) * (2 * dense + moments) * carrier**2 + panel_bytes) // int(mesh_xy.size))
 
 
 def write_bank_contact(path, fields, *, mesh_xy):
@@ -1703,49 +1771,58 @@ def initialize_shared_pole_bank(path, *, meta, tables, recipe, identity,
     if odd:
         # One source of truth for the infinity block: the ordered bank itself.
         header["odd_moments"] = True
-    if odd:
-        from symmetry_maps import q_negation_index
-        neg = np.asarray(q_negation_index(tuple(header["grid"])), dtype=np.int64)
-        bare_response = ("conj(chi_exact_minus_q(z_ry))" if photon_layout is not None
-                         else "exact W_q(-conj z_ry) sample")
-        operator = ("same original parent V and frozen contact as Wc and M0..M3"
-                    if photon_layout is not None
-                    else "same original parent V and moment operator as Wc and M0..M3")
-        header.update(minus_q_partner=dict(
-            value="W_q(-conj z_ry) = conj(W_{-q}(z_ry))", frequency="-conj(z_ry)",
-            derivative="d/d((-conj(z_ry))^2)", bare_response=bare_response, operator=operator,
-            sample_span=list(minus_q_partner_span(plan)),
-            not_stored="imaginary nodes (-conj z = z: the stored sample) and held samples",
-            q_full_idx=header["q_irr_full_idx"],
-            minus_q_full_idx=neg[np.asarray(header["q_irr_full_idx"], dtype=np.int64)].tolist()))
     fields = _bank_moment_fields(header)
     parents = (tables["q_irr_full_idx"] if isinstance(tables, dict)
                else tables.q_irr_full_idx)
     nq, nsample, d = len(parents), _bank_nsample(plan), int(header["n_mu_logical"])
     if nq <= 0:
         _refuse("scratch bank requires at least one irreducible q")
+    p0, p1 = line_panel_span(plan)
+    families, states = line_panel_geometry(meta, ordered=odd, photon_bases=(
+        mu_bases if photon_layout is not None else None))
+    nodes = ("z", "conj(z)", "-z", "-conj(z)")[:states]
+    header["line_panels"] = dict(
+        sample_span=[p0, p1],
+        samples="fitted supports with Re z != 0; every other sample is stored dense",
+        rows={family: rows for family, (rows, _) in families.items()},
+        cross_rows={family: cross for family, (_, cross) in families.items() if cross},
+        row_order=("canonical centroid carrier" if photon_layout is None else
+                   "packed endpoint basis, Cartesian component minor (the sector read's order)"),
+        states=list(nodes),
+        fields=["Q"] + [f"{kind}@{node}" for node in nodes for kind in ("output", "action")],
+        cross_fields=([f"{kind}@{node}" for node in nodes for kind in ("output", "action")]
+                      if photon_layout is not None else []),
+        directions=("Q: right singular vectors of W(z) above the relative cutoff, at most the line cap, "
+                    "whole multiplets; the conj(z) state's direction is O = W(z) Q"),
+        output="W at the state's node applied to its direction: W Q, W^H O"
+               + (", W_q(-conj z)^H Q, W_q(-conj z) O" if odd else ""),
+        action=("dW/dz at the state's node applied to its direction" if odd
+                else "dW/ds at the state's node applied to its direction"),
+        minus_q_partner=("W_q(-conj z) = conj(W_{-q}(z)) from the exact -q response rows through "
+                         "parent q's own V" + (" and frozen contact" if photon_layout is not None else "")
+                         if odd else None),
+        width={family: [None] * (p1 - p0) for family in families},
+        counts={family: np.zeros((nq, p1 - p0), np.int64).tolist() for family in families})
     header.update(
         schema=BANK_SCHEMA, bank_shape={"nq": nq, "nsample": nsample, "d": d},
         bank_sample_plan=plan,
         bank_plan_digest=hashlib.sha256(_json(plan).encode()).hexdigest(),
-        sample_written=np.zeros((nq, nsample, len(_BANK_SAMPLE_FIELDS)), dtype=bool).tolist(),
+        sample_written=np.zeros((nq, nsample - (p1 - p0), len(_BANK_SAMPLE_FIELDS)), dtype=bool).tolist(),
         moment_written=np.zeros((nq, len(fields)), dtype=bool).tolist(),
         complete=False, final_commit=None,
         units={"Wc": "Ry", "dWc_ds": "Ry^-1", "M1": "Ry^3", "M3": "Ry^5",
                **({"M0": "Ry^2", "M2": "Ry^4"} if odd else {}),
                **({"constant": "Ry"} if photon_layout is not None else {}),
-               **({"Wc_minus_q": "Ry", "dWc_minus_q_ds": "Ry^-1"} if odd else {})},
+               "line_output": "Ry", "line_action": "Ry^0 (dW/dz)" if odd else "Ry^-1 (dW/ds)"},
         derivative_variable="s=z_Ry^2",
         moment_convention=("S_m = 2 M_(2m+1); physical M1 and M3; odd M0 (1/z) and M2 (1/z^3), M_k = C_(k+1)/2"
                            if odd else "S_m = 2 M_(2m+1); physical M1 and M3 only"))
-    if _has_partner_fields(header):
-        p0, p1 = header["minus_q_partner"]["sample_span"]
-        header["minus_q_written"] = np.zeros((nq, p1 - p0, len(_BANK_PARTNER_FIELDS)), dtype=bool).tolist()
-    header["payload_bytes"] = 16 * nq * (sum(_sample_field(header, name)[3] for name in _bank_sample_fields(header))
-                                         + len(fields)) * d * d
+    if p1 > p0:
+        header["line_written"] = np.zeros((nq, p1 - p0), dtype=bool).tolist()
+    header["payload_bytes"] = 16 * nq * (2 * _dense_sample_count(header) + len(fields)) * d * d
     with _bank_io(path, "w", mesh_xy) as io:
         for field in _bank_sample_fields(header):
-            io.create_dataset(field, shape=(nq, _sample_field(header, field)[3], d, d), dtype=np.complex128)
+            io.create_dataset(field, shape=(nq, _sample_field(header, field)[2], d, d), dtype=np.complex128)
         for field in fields:
             io.create_dataset(field, shape=(nq, d, d), dtype=np.complex128)
         for key, mask in _bank_masks(header).items():
@@ -1769,9 +1846,10 @@ def validate_shared_pole_bank(path, *, expected_identity, mesh_xy,
     eta, widths and conventions before constructor-only resume.
     """
     header = _read_header(path)
-    if "mirror_mode" in header:
-        _refuse("scratch bank has the retired mirror_mode layout (W_q(-conj z) stored at every "
-                "sample); the minus-q partner is now stored at fitted line samples only")
+    if header.get("schema") in _RETIRED_BANK_SCHEMAS or "mirror_mode" in header:
+        _refuse(f"scratch bank schema {header.get('schema')} is retired: it stores dense W at every "
+                f"line sample and the minus-q partner fields; {BANK_SCHEMA} stores only the "
+                "line-sample direction panels")
     if header.get("schema") != BANK_SCHEMA:
         _refuse("scratch bank schema mismatch")
     _check_identity(header["identity"], expected_identity)
@@ -1786,36 +1864,37 @@ def validate_shared_pole_bank(path, *, expected_identity, mesh_xy,
         _refuse("scratch bank sample plan digest mismatch")
     if _json(plan) != _json(_bank_plan(header["recipe"])):
         _refuse("scratch bank stale recipe/roles/held map")
-    if bool(header.get("ordered")) != ("minus_q_partner" in header):
-        _refuse("scratch bank minus-q partner fields present exactly when ordered")
-    if "minus_q_partner" in header:
-        from symmetry_maps import q_negation_index
-        partner = header["minus_q_partner"]
-        q = np.asarray(header["q_irr_full_idx"], dtype=np.int64)
-        neg = np.asarray(q_negation_index(tuple(header["grid"])), dtype=np.int64)
-        if (partner.get("q_full_idx") != q.tolist()
-                or partner.get("minus_q_full_idx") != neg[q].tolist()
-                or partner.get("frequency") != "-conj(z_ry)"
-                or partner.get("derivative") != "d/d((-conj(z_ry))^2)"
-                or list(partner.get("sample_span", ())) != list(minus_q_partner_span(plan))):
-            _refuse("scratch bank minus-q partner q/frequency/sample map mismatch")
+    panels = header.get("line_panels")
+    if (not isinstance(panels, dict) or list(panels.get("sample_span", ())) != list(line_panel_span(plan))
+            or set(panels.get("rows", {})) != set(panels.get("width", {}))
+            or len(panels.get("states", ())) != (4 if header.get("ordered") else 2)
+            or bool(panels.get("minus_q_partner")) != bool(header.get("ordered"))):
+        _refuse("scratch bank line-panel span/family/state map mismatch")
     shape = header["bank_shape"]
     nq, nsample = int(shape["nq"]), int(shape["nsample"])
+    p0, p1 = _panel_span(header)
     masks = _bank_masks(header)
     samples, moments = masks["sample_written"], masks["moment_written"]
     moment_fields = _bank_moment_fields(header)
     units = {"Wc": "Ry", "dWc_ds": "Ry^-1", "M1": "Ry^3", "M3": "Ry^5",
-             "M0": "Ry^2", "M2": "Ry^4", "constant": "Ry",
-             "Wc_minus_q": "Ry", "dWc_minus_q_ds": "Ry^-1"}
+             "M0": "Ry^2", "M2": "Ry^4", "constant": "Ry"}
     fields = _bank_sample_fields(header) + moment_fields
     if (header.get("derivative_variable") != "s=z_Ry^2"
             or any(header.get("units", {}).get(name) != units[name]
                    for name in fields)):
         _refuse("scratch bank response/derivative convention mismatch")
-    if (samples.shape != (nq, nsample, len(_BANK_SAMPLE_FIELDS)) or moments.shape != (nq, len(moment_fields))
-            or ("minus_q_written" in masks and masks["minus_q_written"].shape
-                != (nq, _sample_field(header, "Wc_minus_q")[3], len(_BANK_PARTNER_FIELDS)))):
+    if (samples.shape != (nq, nsample - (p1 - p0), len(_BANK_SAMPLE_FIELDS))
+            or moments.shape != (nq, len(moment_fields))
+            or ("line_written" in masks and masks["line_written"].shape != (nq, p1 - p0))):
         _refuse("scratch bank malformed written masks")
+    counts = {family: np.asarray(value, np.int64) for family, value in panels["counts"].items()}
+    written = masks.get("line_written", np.zeros((nq, 0), bool))
+    for family, width in panels["width"].items():
+        if (len(width) != p1 - p0 or counts[family].shape != (nq, p1 - p0)
+                or any((w is None) != (not written[:, i].any()) for i, w in enumerate(width))
+                or np.any(counts[family] < 0)
+                or any(w is not None and np.any(counts[family][:, i] > w) for i, w in enumerate(width))):
+            _refuse(f"scratch bank line-panel {family} widths/counts disagree with its commit mask")
     if (nq != header["n_q_irr"] or nsample != _bank_nsample(plan)
             or shape["d"] != header["n_mu_logical"]
             or header["nspinor"] not in ((4,) if "photon_layout" in header else (1, 2, 4))):
@@ -1837,11 +1916,24 @@ def validate_shared_pole_bank(path, *, expected_identity, mesh_xy,
                 _refuse("scratch bank role code table mismatch")
             for name in fields:
                 geometry = _sample_field(header, name)
-                expected = ((nq, geometry[3]) if geometry else (nq,)) + (shape["d"],) * 2
+                expected = ((nq, geometry[2]) if geometry else (nq,)) + (shape["d"],) * 2
                 if (name not in file or file[name].shape != expected
                         or file[name].dtype != np.dtype(np.complex128)
                         or file[name].chunks is not None):
                     _refuse(f"scratch bank {name} schema geometry/dtype/layout mismatch")
+            nfields, ncross = len(panels["fields"]), len(panels["cross_fields"])
+            for family, widths in panels["width"].items():
+                for i, width in enumerate(widths):
+                    if width is None:
+                        continue
+                    expected = [(line_panel_name(family, p0 + i), (nq, nfields, panels["rows"][family], width))]
+                    if family in panels["cross_rows"]:
+                        expected.append((line_panel_name(family, p0 + i, cross=True),
+                                         (nq, ncross, panels["cross_rows"][family], width)))
+                    for name, dims in expected:
+                        if (name not in file or file[name].shape != dims
+                                or file[name].dtype != np.dtype(np.complex128)):
+                            _refuse(f"scratch bank {name} line-panel geometry/dtype mismatch")
     complete = all(bool(mask.all()) for mask in masks.values())
     if header.get("complete") and (not complete or not header.get("final_commit")):
         _refuse("scratch bank invalid completion transaction")
@@ -1855,24 +1947,24 @@ def validate_shared_pole_bank(path, *, expected_identity, mesh_xy,
 
 
 def write_shared_pole_bank(path, *, q_span, sample_span=None, Wc=None,
-                           dWc_ds=None, Wc_minus_q=None, dWc_minus_q_ds=None,
-                           M1=None, M3=None, M0=None, M2=None, constant=None, meta,
-                           expected_identity, mesh_xy):
+                           dWc_ds=None, M1=None, M3=None, M0=None, M2=None, constant=None,
+                           line=None, meta, expected_identity, mesh_xy):
     """Write one bounded q/sample batch and commit masks after collective close.
 
-    Sample arrays are complex128 ``[b,a,mu_p,mu_p]`` at
-    ``P(None,None,'x','y')``; physical moments are complex128
-    ``[b,mu_p,mu_p]`` at ``P(None,'x','y')``. Both endpoint conversions
-    go through ``meta.mu_basis``; no off-axis Hermitization or rescaling.
+    Dense sample arrays are complex128 ``[b,a,mu_p,mu_p]`` at
+    ``P(None,None,'x','y')`` for a span of dense sample ids; physical moments
+    are complex128 ``[b,mu_p,mu_p]`` at ``P(None,'x','y')``. ``line`` is one
+    line sample's panels (``_prepare_line_write``). Endpoint conversions go
+    through ``meta.mu_basis``; no off-axis Hermitization or rescaling.
     Already committed fields refuse overwrite, including in partial files.
     """
     with shared_pole_bank_writer(path, meta=meta, expected_identity=expected_identity,
                                  mesh_xy=mesh_xy) as (_, header, write):
         if not (all(mask.all() for mask in _bank_masks(header).values())
-                and all(value is None for value in (Wc, dWc_ds, Wc_minus_q, dWc_minus_q_ds, M1, M3, M0, M2, constant))):
+                and line is None
+                and all(value is None for value in (Wc, dWc_ds, M1, M3, M0, M2, constant))):
             write(q_span=q_span, sample_span=sample_span, Wc=Wc, dWc_ds=dWc_ds,
-                  Wc_minus_q=Wc_minus_q, dWc_minus_q_ds=dWc_minus_q_ds,
-                  M1=M1, M3=M3, M0=M0, M2=M2, constant=constant)
+                  M1=M1, M3=M3, M0=M0, M2=M2, constant=constant, line=line)
     return header
 
 
@@ -1920,9 +2012,65 @@ def _complete_bank(path, header):
         _stamp_header(path, header, "shared_pole_bank.complete")
 
 
+def _prepare_line_write(header, line, *, q0, q1, meta, mesh_xy, ledger):
+    """Validate/admit one line sample's panels for parents [q0, q1).
+
+    ``line`` is ``dict(sample, panels, counts[, cross])``: ``panels[family]``
+    complex128 ``[b, 1+2S, rows, r]`` and ``cross[family]`` ``[b, 2S, cross
+    rows, r]`` (photon) at ``P(None,None,'x','y')``, rows in the packed basis
+    (the writer moves charge rows to the canonical carrier), ``counts[family]``
+    int ``[b]`` the retained direction count of each parent (``<= r``). Every
+    family of the sample is written in one call; its width is fixed by the
+    first write of the sample.
+    """
+    panels_meta = header["line_panels"]
+    p0, p1 = _panel_span(header)
+    sample = int(line["sample"])
+    if not p0 <= sample < p1:
+        _refuse(f"line sample {sample} outside the line-panel span [{p0}, {p1})")
+    if set(line["panels"]) != set(panels_meta["rows"]) or set(line.get("cross") or {}) != set(panels_meta["cross_rows"]):
+        _refuse("line write must carry every family's panels (and cross panels on a photon bank)")
+    if np.asarray(header["line_written"], bool)[q0:q1, sample - p0].any():
+        _refuse(f"line sample {sample} span already committed")
+    charge = "photon_layout" not in header
+    basis = meta.mu_basis
+    spec = P(None, None, "x", "y")
+    pending = []
+    for family, array in line["panels"].items():
+        width = int(array.shape[-1])
+        stored = panels_meta["width"][family][sample - p0]
+        if stored is not None and int(stored) != width:
+            _refuse(f"line sample {sample} family {family} width {width} differs from its first write {stored}")
+        counts = np.asarray(line["counts"][family], np.int64)
+        if counts.shape != (q1 - q0,) or np.any(counts < 0) or np.any(counts > width):
+            _refuse(f"line sample {sample} family {family} counts must be [b] within [0, {width}]")
+        rows = basis.n_packed if charge else panels_meta["rows"][family]
+        arrays = [(line_panel_name(family, sample), array, (q1 - q0, len(panels_meta["fields"]), rows, width))]
+        if family in panels_meta["cross_rows"]:
+            arrays.append((line_panel_name(family, sample, cross=True), line["cross"][family],
+                           (q1 - q0, len(panels_meta["cross_fields"]), panels_meta["cross_rows"][family], width)))
+        for name, value, expected in arrays:
+            if tuple(value.shape) != expected or np.dtype(value.dtype) != np.dtype(np.complex128):
+                _refuse(f"scratch {name} requires complex128 shape {expected}, got {tuple(value.shape)}")
+            if not isinstance(value, jax.Array) or not value.sharding.is_equivalent_to(
+                    NamedSharding(mesh_xy, spec), value.ndim):
+                _refuse(f"scratch {name} requires NamedSharding(mesh_xy, {spec})")
+            if charge and not name.endswith("_cross"):
+                arg, output, temporary = _conversion_bytes(basis, value.shape, spec, unpack=True, axis=2)
+            else:
+                arg = output = _local_bytes(value.shape, value.dtype, mesh_xy, spec)
+                temporary = 0
+            _admit(ledger, "write_bank_" + name, output, temporary + arg,
+                   device_panel=max(arg, output), native_host=True)
+            if not bool(jnp.all(jnp.isfinite(value))):
+                _refuse(f"scratch {name} contains nonfinite values")
+            pending.append((family, name, value, counts))
+    return sample, pending
+
+
 def _prepare_bank_write(header, *, q_span, meta, mesh_xy,
                         sample_span=None, Wc=None, dWc_ds=None,
-                        Wc_minus_q=None, dWc_minus_q_ds=None, M1=None, M3=None, M0=None, M2=None, constant=None):
+                        M1=None, M3=None, M0=None, M2=None, constant=None, line=None):
     """Validate/admit a packed span before mutating a bank."""
     _check_basis(meta, header)
     if mesh_xy is not meta.mu_basis.mesh_xy:
@@ -1931,19 +2079,21 @@ def _prepare_bank_write(header, *, q_span, meta, mesh_xy,
         _refuse("completed scratch bank is immutable")
     shape = header["bank_shape"]
     q0, q1 = _span(q_span, shape["nq"], "q_span")
-    has_samples = any(v is not None for v in (Wc, dWc_ds, Wc_minus_q, dWc_minus_q_ds))
+    has_samples = any(v is not None for v in (Wc, dWc_ds))
     if has_samples and sample_span is None:
         _refuse("scratch sample write requires explicit sample_span")
     if not has_samples and sample_span is not None:
         _refuse("sample_span supplied without sample payload")
     a0, a1 = (_span(sample_span, shape["nsample"], "sample_span")
               if has_samples else (0, 0))
+    rows = dense_sample_rows(header, range(a0, a1)) if has_samples else []
+    if rows and rows != list(range(rows[0], rows[0] + len(rows))):
+        _refuse(f"dense sample_span {(a0, a1)} straddles the line-panel span")
     pending = [(name, value) for name, value in
-               (("Wc", Wc), ("dWc_ds", dWc_ds),
-                ("Wc_minus_q", Wc_minus_q), ("dWc_minus_q_ds", dWc_minus_q_ds), ("M1", M1), ("M3", M3),
+               (("Wc", Wc), ("dWc_ds", dWc_ds), ("M1", M1), ("M3", M3),
                 ("M0", M0), ("M2", M2), ("constant", constant))
                if value is not None]
-    if not pending:
+    if not pending and line is None:
         _refuse("scratch write has no payload")
     basis = meta.mu_basis
     ledger = _capacity(meta)
@@ -1957,13 +2107,10 @@ def _prepare_bank_write(header, *, q_span, meta, mesh_xy,
         geometry = _sample_field(header, name)
         sample = geometry is not None
         if not sample and name not in _bank_moment_fields(header):
-            _refuse(f"scratch bank has no {name} field (odd moments and minus-q partners belong to an ordered bank)")
+            _refuse(f"scratch bank has no {name} field (odd moments belong to an ordered bank)")
         if sample:
-            key, column, first, count = geometry
-            if not first <= a0 < a1 <= first + count:
-                _refuse(f"scratch {name} sample_span {(a0, a1)} outside its stored samples "
-                        f"[{first}, {first + count})")
-            marked = masks[key][q0:q1, a0-first:a1-first, column]
+            key, column, _ = geometry
+            marked = masks[key][q0:q1, rows[0]:rows[-1] + 1, column]
         else:
             marked = masks["moment_written"][q0:q1, _bank_moment_fields(header).index(name)]
         if marked.any():
@@ -1985,7 +2132,9 @@ def _prepare_bank_write(header, *, q_span, meta, mesh_xy,
                device_panel=max(arg,output),native_host=True)
         if not bool(jnp.all(jnp.isfinite(array))):
             _refuse(f"scratch {name} contains nonfinite values")
-    return q0, q1, a0, a1, pending, masks
+    line = (None if line is None else
+            _prepare_line_write(header, line, q0=q0, q1=q1, meta=meta, mesh_xy=mesh_xy, ledger=ledger))
+    return q0, q1, rows, pending, line, masks
 
 
 def _write_bank_payload(io, header, meta, prepared):
@@ -1994,26 +2143,46 @@ def _write_bank_payload(io, header, meta, prepared):
     The prepared arrays carry the public writer's units and face shardings.
     Authentication/admission stays in the common preparation owner.
     """
-    q0, q1, a0, a1, pending, masks = prepared
+    q0, q1, rows, pending, line, masks = prepared
     shape, basis = header["bank_shape"], meta.mu_basis
     for name, array in pending:
         geometry = _sample_field(header, name)
         spec = P(None, None, 'x', 'y') if geometry else P(None, 'x', 'y')
-        disk_shape = ((shape["nq"], geometry[3]) if geometry
+        disk_shape = ((shape["nq"], geometry[2]) if geometry
                       else (shape["nq"],)) + (shape["d"], shape["d"])
         io.create_dataset(name, shape=disk_shape, dtype=np.complex128)
         canonical = array if "photon_layout" in header else basis.unpack_operator(array, spec=spec)
-        offset = (q0, a0 - geometry[2], 0, 0) if geometry else (q0, 0, 0)
+        offset = (q0, rows[0], 0, 0) if geometry else (q0, 0, 0)
         io.write_slab(name, canonical, offset=offset)
         # SlabIO's write queue owns canonical until drained. Drain each
         # field so endpoint staging cannot accumulate across fields.
         io.sync_writes()
         del canonical
         if geometry:
-            key, column, first, _ = geometry
-            masks[key][q0:q1, a0-first:a1-first, column] = True
+            key, column, _ = geometry
+            masks[key][q0:q1, rows[0]:rows[-1] + 1, column] = True
         else:
             masks["moment_written"][q0:q1, _bank_moment_fields(header).index(name)] = True
+    if line is not None:
+        sample, arrays = line
+        panels = header["line_panels"]
+        p0 = _panel_span(header)[0]
+        spec = P(None, None, "x", "y")
+        for family, name, array, counts in arrays:
+            charge = "photon_layout" not in header and not name.endswith("_cross")
+            value = basis.unpack_axis(array, 2, spec=spec) if charge else array
+            io.create_dataset(name, shape=(shape["nq"],) + tuple(value.shape[1:]), dtype=np.complex128)
+            io.write_slab(name, value, offset=(q0, 0, 0, 0))
+            io.sync_writes()
+            del value
+            if not name.endswith("_cross"):
+                panels["width"][family][sample - p0] = int(array.shape[-1])
+                table = np.asarray(panels["counts"][family], np.int64)
+                table[q0:q1, sample - p0] = counts
+                panels["counts"][family] = table.tolist()
+        masks["line_written"][q0:q1, sample - p0] = True
+        header["payload_bytes"] = int(header["payload_bytes"]) + sum(
+            16 * int(np.prod(array.shape)) for _, _, array, _ in arrays)
     for key, mask in masks.items():
         header[key] = mask.tolist()
 
@@ -2123,13 +2292,59 @@ def _read_photon_bank_sector(io, name, prefix, offset, spec, header, sector, led
     return _bank_concat_columns(io.mesh, spec)(*columns)
 
 
-def read_shared_pole_bank(io, q_span=None, *, meta, header, sample_span=None,
+def _parent_runs(ids, layout, mesh):
+    """Read runs for a parent id list: (runs, contiguous, interval); see read_shared_pole_bank."""
+    contiguous = ids == list(range(ids[0], ids[0] + len(ids)))
+    # Ordered parent rounds can permute a complete interval and pad it with
+    # repeated parents. Read that interval once, then restore the round order
+    # on the already sharded face before the existing face-to-batch exchange.
+    # The interval has no more rows than the old per-parent read stack.
+    interval = (layout == "batch" and not contiguous
+                and len(set(ids)) == max(ids) - min(ids) + 1)
+    ranks = int(mesh.shape["x"]) * int(mesh.shape["y"])
+    if layout == "batch" and len(ids) % ranks:
+        _refuse(f"batch-layout bank read needs a multiple of {ranks} parents, got {len(ids)}")
+    if contiguous:
+        runs = [(ids[0], len(ids))]
+    elif interval:
+        runs = [(min(ids), max(ids)-min(ids)+1)]
+    else:
+        runs = [(q, 1) for q in ids]
+    return runs, contiguous, interval
+
+
+def _parent_ids(header, q_span, q_ids):
+    shape = header["bank_shape"]
+    if (q_span is None) == (q_ids is None):
+        _refuse("scratch bank read takes exactly one of q_span or q_ids")
+    if q_ids is None:
+        q0, q1 = _span(q_span, shape["nq"], "q_span")
+        return list(range(q0, q1))
+    ids = [int(v) for v in q_ids]
+    if not ids or any(isinstance(v, (bool, np.bool_)) for v in q_ids) or any(
+            not 0 <= v < shape["nq"] for v in ids):
+        _refuse(f"q_ids out of bounds or empty: {list(q_ids)}, extent {shape['nq']}")
+    return ids
+
+
+def _restore_parent_order(value, ids, layout, contiguous, interval, mesh):
+    if layout == "batch" and not contiguous:
+        if interval:
+            value = jnp.take(value, np.asarray(ids)-min(ids), axis=0)
+        value = _bank_face_to_batch(mesh, value.ndim)(value)
+    return value
+
+
+def read_shared_pole_bank(io, q_span=None, *, meta, header, sample_span=None, sample_ids=None,
                           fields=("Wc", "dWc_ds"), q_ids=None, partition_spec=None, sector=None):
     """Read committed bounded scratch fields into packed distributed operators.
 
-    Returns a plain dict of complex128 arrays. Samples require explicit
-    contiguous ``sample_span``; no implicit all-bank read is offered. The
-    caller authenticates ``header`` before opening ``io``.
+    Returns a plain dict of complex128 arrays. Dense samples require explicit
+    ``sample_span`` (a contiguous id span) or ``sample_ids`` (ids whose dense
+    rows are contiguous, e.g. the fitted samples on either side of the
+    line-panel span); no implicit all-bank read is offered, and a line-panel
+    sample is read with ``read_line_panels``. The caller authenticates
+    ``header`` before opening ``io``.
 
     Parents are a contiguous ``q_span`` or a list ``q_ids`` (repeats allowed:
     a round's synthetic slots repeat its last parent); the leading axis of
@@ -2154,38 +2369,26 @@ def read_shared_pole_bank(io, q_span=None, *, meta, header, sample_span=None,
     if not fields or len(set(fields)) != len(fields) or any(
             f not in _bank_sample_fields(header) + _bank_moment_fields(header) for f in fields):
         _refuse("scratch bank fields must be distinct Wc/dWc_ds/M1/M3 names "
-                "(M0/M2 and Wc_minus_q/dWc_minus_q_ds on an ordered bank)")
+                "(M0/M2 on an ordered bank)")
     shape = header["bank_shape"]
     layout = _bank_layout(partition_spec)
     if sector is not None and ("photon_layout" not in header or len(sector) != 2
                               or any(v not in ("C", "T") for v in sector)):
         _refuse("sector bank read requires photon metadata and endpoint labels C/T")
-    if (q_span is None) == (q_ids is None):
-        _refuse("scratch bank read takes exactly one of q_span or q_ids")
-    if q_ids is None:
-        q0, q1 = _span(q_span, shape["nq"], "q_span")
-        ids = list(range(q0, q1))
-    else:
-        ids = [int(v) for v in q_ids]
-        if not ids or any(isinstance(v, (bool, np.bool_)) for v in q_ids) or any(
-                not 0 <= v < shape["nq"] for v in ids):
-            _refuse(f"q_ids out of bounds or empty: {list(q_ids)}, extent {shape['nq']}")
-    contiguous = ids == list(range(ids[0], ids[0] + len(ids)))
-    # Ordered parent rounds can permute a complete interval and pad it with
-    # repeated parents. Read that interval once, then restore the round order
-    # on the already sharded face before the existing face-to-batch exchange.
-    # The interval has no more rows than the old per-parent read stack.
-    interval = (layout == "batch" and not contiguous
-                and len(set(ids)) == max(ids) - min(ids) + 1)
+    ids = _parent_ids(header, q_span, q_ids)
     mesh = meta.mu_basis.mesh_xy
-    ranks = int(mesh.shape["x"]) * int(mesh.shape["y"])
-    if layout == "batch" and len(ids) % ranks:
-        _refuse(f"batch-layout bank read needs a multiple of {ranks} parents, got {len(ids)}")
+    runs, contiguous, interval = _parent_runs(ids, layout, mesh)
     need_samples = any(_sample_field(header, name) for name in fields)
-    if need_samples and sample_span is None:
-        _refuse("scratch sample read requires explicit sample_span")
-    a0, a1 = (_span(sample_span, shape["nsample"], "sample_span")
-              if need_samples else (0, 0))
+    if need_samples and (sample_span is None) == (sample_ids is None):
+        _refuse("scratch sample read requires exactly one of sample_span or sample_ids")
+    rows = []
+    if need_samples:
+        if sample_ids is None:
+            a0, a1 = _span(sample_span, shape["nsample"], "sample_span")
+            sample_ids = range(a0, a1)
+        rows = dense_sample_rows(header, sample_ids)
+        if not rows or rows != list(range(rows[0], rows[0] + len(rows))):
+            _refuse(f"dense samples {list(sample_ids)} are not one contiguous row span")
     basis = meta.mu_basis
     ledger = _capacity(meta)
     _check_io_capacity(ledger,basis.mesh_xy,header)
@@ -2196,11 +2399,8 @@ def read_shared_pole_bank(io, q_span=None, *, meta, header, sample_span=None,
     for name in fields:
         geometry = _sample_field(header, name)
         if geometry:
-            key, column, first, count = geometry
-            if not first <= a0 < a1 <= first + count:
-                _refuse(f"scratch bank {name} sample_span {(a0, a1)} outside its stored samples "
-                        f"[{first}, {first + count})")
-            marked = masks[key][unique, a0-first:a1-first, column]
+            key, column, _ = geometry
+            marked = masks[key][unique, rows[0]:rows[-1] + 1, column]
         elif name in _bank_moment_fields(header):
             marked = masks["moment_written"][unique, _bank_moment_fields(header).index(name)]
         else:
@@ -2215,20 +2415,14 @@ def read_shared_pole_bank(io, q_span=None, *, meta, header, sample_span=None,
         face = P(None, None, 'x', 'y') if sample else P(None, 'x', 'y')
         spec = face if layout == "face" or not contiguous else (
             P(_BATCH_LAYOUT, None, None, None) if sample else P(_BATCH_LAYOUT, None, None))
-        if contiguous:
-            runs = [(ids[0], len(ids))]
-        elif interval:
-            runs = [(min(ids), max(ids)-min(ids)+1)]
-        else:
-            runs = [(q, 1) for q in ids]
-        rows = []
+        parts = []
         for q, count in runs:
-            prefix = (count, a1-a0) if sample else (count,)
-            offset = (q, a0 - geometry[2], 0, 0) if sample else (q, 0, 0)
+            prefix = (count, len(rows)) if sample else (count,)
+            offset = (q, rows[0], 0, 0) if sample else (q, 0, 0)
             if sector is not None:
                 row = _read_photon_bank_sector(io, name, prefix, offset, spec, header, sector, ledger, retained)
                 retained += _local_bytes(row.shape, row.dtype, mesh, spec)
-                rows.append(row)
+                parts.append(row)
                 continue
             d = shape["d"] if "photon_layout" in header else basis.n_canonical
             logical = shape["d"] if "photon_layout" in header else basis.n_logical
@@ -2247,15 +2441,71 @@ def read_shared_pole_bank(io, q_span=None, *, meta, header, sample_span=None,
             row = canonical if "photon_layout" in header else basis.pack_operator(canonical, spec=spec)
             retained += output
             del canonical
-            rows.append(row)
-        value = rows[0] if len(rows) == 1 else _bank_stack_rows(mesh, spec)(tuple(rows))
-        del rows
-        if layout == "batch" and not contiguous:
-            if interval:
-                value = jnp.take(value, np.asarray(ids)-min(ids), axis=0)
-            value = _bank_face_to_batch(mesh, value.ndim)(value)
-        out[name] = value
+            parts.append(row)
+        value = parts[0] if len(parts) == 1 else _bank_stack_rows(mesh, spec)(tuple(parts))
+        del parts
+        out[name] = _restore_parent_order(value, ids, layout, contiguous, interval, mesh)
     return out
+
+
+def read_line_panels(io, q_span=None, *, meta, header, family, sample, cross=False,
+                     q_ids=None, partition_spec=None):
+    """One line sample's panels for one family and their retained counts.
+
+    Returns ``(panels, counts)``: complex128 ``[b, 1+2S, rows, r]`` (or the
+    ``[b, 2S, cross rows, r]`` cross panel) in the packed row order the
+    constructor uses, face tiles ``P(None,None,'x','y')`` or batch layout as
+    in :func:`read_shared_pole_bank`, and the host int ``[b]`` retained count
+    of each requested parent. The field order is the header's
+    ``line_panels.fields``: Q, then output and action per state.
+    """
+    if header.get("schema") != BANK_SCHEMA:
+        _refuse("scratch bank reader schema mismatch")
+    _check_basis(meta, header)
+    if io.mesh is not meta.mu_basis.mesh_xy:
+        _refuse("reader mesh differs from packed basis mesh")
+    panels = header["line_panels"]
+    p0, p1 = _panel_span(header)
+    sample = int(sample)
+    if not p0 <= sample < p1 or family not in panels["rows"]:
+        _refuse(f"no line panels for family {family} at sample {sample}")
+    if cross and family not in panels["cross_rows"]:
+        _refuse(f"family {family} has no cross panel")
+    ids = _parent_ids(header, q_span, q_ids)
+    if not np.asarray(header["line_written"], bool)[sorted(set(ids)), sample - p0].all():
+        _refuse(f"line sample {sample} requested parents are incomplete")
+    layout = _bank_layout(partition_spec)
+    mesh = meta.mu_basis.mesh_xy
+    runs, contiguous, interval = _parent_runs(ids, layout, mesh)
+    width = int(panels["width"][family][sample - p0])
+    charge = "photon_layout" not in header and not cross
+    fields = len(panels["cross_fields" if cross else "fields"])
+    rows = panels["cross_rows"][family] if cross else panels["rows"][family]
+    name = line_panel_name(family, sample, cross=cross)
+    face = P(None, None, "x", "y")
+    spec = face if layout == "face" or not contiguous else P(_BATCH_LAYOUT, None, None, None)
+    basis = meta.mu_basis
+    ledger = _capacity(meta)
+    _check_io_capacity(ledger, basis.mesh_xy, header)
+    parts, retained = [], 0
+    for q, count in runs:
+        shape = (count, fields, rows, width)
+        if charge:
+            arg, output, temporary = _conversion_bytes(basis, shape, spec, unpack=False, axis=2)
+        else:
+            arg = output = _local_bytes(shape, np.complex128, mesh, spec)
+            temporary = 0
+        _admit(ledger, "read_" + name, retained + arg + output, temporary,
+               device_panel=arg, native_host=True, io=io)
+        value = io.read_slab(name, shape=shape, valid_shape=shape, offset=(q, 0, 0, 0),
+                             dtype=np.complex128, partition_spec=spec)
+        parts.append(basis.pack_axis(value, 2, spec=spec) if charge else value)
+        retained += output
+        del value
+    value = parts[0] if len(parts) == 1 else _bank_stack_rows(mesh, spec)(tuple(parts))
+    del parts
+    counts = np.asarray(panels["counts"][family], np.int64)[ids, sample - p0]
+    return _restore_parent_order(value, ids, layout, contiguous, interval, mesh), counts
 
 
 def _export_spatial_header(path, source_wfn, meta, *, kind, source):
@@ -2467,11 +2717,12 @@ def export_shared_pole_outputs(handle, *, meta, config, mesh_xy, source_wfn,
         previous = ledger.live_stages
         with SlabIO(bank_source, mode="r", mesh=mesh_xy) as io, \
                 SlabIO(path, mode="a", mesh=mesh_xy) as output_io:
+            p0, p1 = _panel_span(bank_header)
+            dense = [i for i in range(bank_header["bank_shape"]["nsample"]) if not p0 <= i < p1]
             for q in range(bank_header["bank_shape"]["nq"]):
                 for field in _bank_sample_fields(bank_header) + _bank_moment_fields(bank_header):
-                    geometry = _sample_field(bank_header, field)
-                    sample = geometry is not None
-                    for i in (range(geometry[2], geometry[2] + geometry[3]) if sample else (None,)):
+                    sample = _sample_field(bank_header, field) is not None
+                    for i in (dense if sample else (None,)):
                         span = (i, i+1) if sample else None
                         values = read_shared_pole_bank(io, (q, q+1), meta=meta,
                             header=bank_header, sample_span=span, fields=(field,))
@@ -2489,6 +2740,24 @@ def export_shared_pole_outputs(handle, *, meta, config, mesh_xy, source_wfn,
                             del values, value
                         finally:
                             ledger.live_stages = previous
+                # A line sample is exported as stored: its directions and actions.
+                for i in range(p0, p1):
+                    panels = {family: read_line_panels(io, (q, q+1), meta=meta, header=bank_header,
+                                                       family=family, sample=i)
+                              for family in bank_header["line_panels"]["rows"]}
+                    row = _admit(ledger, "export_w_live", sum(
+                        _local_bytes(v.shape, v.dtype, mesh_xy, P(None, None, "x", "y"))
+                        for v, _ in panels.values()))
+                    ledger.live_stages = (*previous, row["stage"])
+                    try:
+                        prepared = _prepare_bank_write(output_header, q_span=(q, q+1), meta=meta,
+                            mesh_xy=mesh_xy, line=dict(sample=i,
+                                panels={f: v for f, (v, _) in panels.items()},
+                                counts={f: c for f, (_, c) in panels.items()}))
+                        _write_bank_payload(output_io, output_header, meta, prepared)
+                        del prepared, panels
+                    finally:
+                        ledger.live_stages = previous
             _write_bank_masks(output_io, output_header)
         _complete_bank(path, output_header)
         _export_spatial_header(path, source_wfn, meta, kind="w", source=bank_source)

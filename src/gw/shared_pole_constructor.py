@@ -15,44 +15,39 @@ from __future__ import annotations
 import jax
 from common import timing
 from gw.shared_pole_capacity import ConstructorCapacity
-from gw.shared_pole_directions import _round_kernels, _sample_point, select_round_states, leading_response_directions
+from gw.shared_pole_directions import (_round_kernels, _sample_point, line_panel_states, port_extent,
+                                       select_round_states, leading_response_directions)
 from gw.shared_pole_reduction import ORIENTATION_PAIR_REFUSAL
 
 
 def constructor_route(meta, config, recipe, *, mesh_xy, ledger, upstream, ordered,
-                      odd_moments, minus_q_partner, nq):
+                      odd_moments, nq):
     """Resolve local or whole-mesh parent execution for one map's bank.
 
     The single admission the constructor applies before its first bank read,
     also consulted by the map owner before the bank exists (bank residence).
-    Returns ``(execution, receipt, column_extent, sample_fields,
+    Returns ``(execution, receipt, column_extent, selection_faces,
     moment_fields)``; ``upstream`` names the accepted live reservations.
-    ``sample_fields`` include the stored minus-q partner fields when
-    ``minus_q_partner``; the selection price keeps four faces per fitted
-    sample, an upper bound on the actual two per sample plus two per fitted
-    line sample.
+    The selection holds the dense fitted samples (W, dW/ds), the moments and
+    every line sample's stored panels (``selection_face_count``).
     """
-    from jax.sharding import PartitionSpec as P
-    from runtime.padding import ladder_extent, padded_axis
     from gw.gw_config import linalg_resolution
-    from gw.shared_pole_execution import constructor_execution
+    from gw.shared_pole_execution import constructor_execution, line_panel_count, selection_face_count
+    from file_io.shared_pole_store import line_panel_geometry
 
-    # Direction ranks move between rounds and maps; their carriers sit on the
-    # extent ladder so the selection and round programs repeat. No rank cap:
-    # the same function sizes round sums and pole budgets, which exceed n.
-    column_extent = lambda width: padded_axis(
-        ladder_extent(width), mesh_xy, name="shared_pole_port",
-        specs=((P("x", "y"), 0), (P("x", "y"), 1))).carrier
-    sample_fields = (("Wc", "dWc_ds", "Wc_minus_q", "dWc_minus_q_ds")
-                     if minus_q_partner else ("Wc", "dWc_ds"))
+    column_extent = port_extent(mesh_xy)
     moment_fields = ("M0", "M1", "M2", "M3") if odd_moments else ("M1", "M3")
+    families, states = line_panel_geometry(meta, ordered=ordered)
+    faces = selection_face_count(recipe, n=int(meta.n_rmu_padded), logical_n=int(meta.n_rmu),
+        states=states, rows=int(meta.n_rmu_padded), dense_fields=2, moment_fields=len(moment_fields),
+        column_extent=column_extent)
     execution, receipt = constructor_execution(
         meta, linalg_resolution({"linalg": config.backend.linalg}), recipe,
         mesh=mesh_xy, ledger=ledger, upstream=upstream, ordered=ordered,
-        odd_moments=odd_moments, sample_fields=len(sample_fields),
-        moment_fields=len(moment_fields), parent_count=int(nq),
+        odd_moments=odd_moments, selection_faces=faces,
+        sample_batch=len(recipe["fit_ids"]) - line_panel_count(recipe), parent_count=int(nq),
         defer_reduction=True, column_extent=column_extent)
-    return execution, receipt, column_extent, sample_fields, moment_fields
+    return execution, receipt, column_extent, faces, moment_fields
 
 
 def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
@@ -92,13 +87,12 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
         from runtime.padding import mesh_divisor
         from file_io.shared_pole_store import (
             charge_representation, validate_shared_pole_bank, open_shared_pole_bank,
-            read_shared_pole_bank, write_shared_pole_model,
+            read_line_panels, read_shared_pole_bank, write_shared_pole_model,
         )
         from gw.gw_config import linalg_resolution
         from common.staged_reshard import face_to_batch_reshard
         from gw.shared_pole_local import (batch_to_face, canonical_factors, check_round, face_rows,
-                                          own_extent_receipts, parent_rounds, partner_realization,
-                                          reduce_round, round_tables, grow_round,
+                                          own_extent_receipts, reduce_round, round_tables, grow_round,
                                           carrier_history)
         from gw.shared_pole_capacity import round_padding_output_bytes
         from gw.shared_pole_recipe import (
@@ -158,31 +152,16 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
         # Odd z-moments M0/M2 certify the ordered infinity block; a finite-state
         # ordered bank builds without it and records the moments NOT_MEASURED.
         odd_moments = ordered and bool(header.get("odd_moments", False))
-        if ordered:
-            # The -q parent p' of parent p through a unitary row s, S_s q(p') = -q(p)
-            # (symmetry service; antiunitary-only routes refuse there). It schedules
-            # partner-closed local rounds; the partner values come from the bank.
-            from symmetry_maps import minus_q_parent_partners
-            qt, operations = header["qirr"], header["operations"]
-            partner_parent, partner_row = minus_q_parent_partners(
-                header["q_irr_full_idx"], qt["irr_idx_q"], qt["sym_idx_q"], kgrid=header["grid"],
-                sym_mats_k=np.asarray(operations["rotation"]),
-                antiunitary=np.asarray(operations["antiunitary"], dtype=bool),
-                authorized_rows=operations["authorized_rows"])
-        else:
-            partner_parent = partner_row = None
-
         logical_n = int(meta.n_rmu)
         from gw.shared_pole_execution import constructor_side_upper_bound
-        execution, execution_receipt, column_extent, sample_fields, moment_fields = constructor_route(
+        execution, execution_receipt, column_extent, selection_faces, moment_fields = constructor_route(
             meta, config, recipe, mesh_xy=mesh_xy, ledger=ledger, upstream=upstream,
             ordered=ordered, odd_moments=odd_moments,
-            minus_q_partner="minus_q_partner" in header,
             nq=int(header['bank_shape']['nq']))
-        if ordered and "minus_q_partner" not in header:
-            raise ValueError('GATE shared_pole_minus_q_partner: got: an ordered bank without stored minus-q partner fields; want: Wc_minus_q/dWc_minus_q_ds at every fitted line sample; fix: rebuild the bank')
-        partner_span = (tuple(int(v) for v in header["minus_q_partner"]["sample_span"])
-                        if ordered else (0, 0))
+        # Line supports off the imaginary axis arrive as their stored states;
+        # the dense fitted samples (imaginary axis) are selected per round.
+        line_lo, line_hi = (int(v) for v in header["line_panels"]["sample_span"])
+        dense_fit = [int(i) for i in recipe["fit_ids"] if not line_lo <= int(i) < line_hi]
         budget = ConstructorCapacity(meta, resolution, mesh_xy=mesh_xy,
                                      ledger=ledger, upstream=upstream,
                                      execution=execution)
@@ -201,25 +180,20 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
             raise ValueError("GATE shared_pole_held: got: no held samples; want: at least one held support; why: the model checks compare W and dW/ds there")
         held_lo, held_hi = min(held_ids), max(held_ids) + 1
         nq = int(header["bank_shape"]["nq"])
-        fit_lo = min(int(i) for i in recipe["fit_ids"])
-        fit_hi = max(int(i) for i in recipe["fit_ids"]) + 1
         # A local round runs one parent per rank from its sample read to its
         # sorted model. A face round runs a budget-sized batch of physical
         # parents over all ranks (one schedule owner for both constructors).
-        # Ordered local rounds stay partner-closed (a parent enters with its -q parent).
         ranks = mesh_divisor(mesh_xy)
         face_batch = 1
         if execution == 'face':
             from gw.shared_pole_execution import face_batch_width
             face_batch, execution_receipt['face_batch'] = face_batch_width(
                 meta, resolution, mesh=mesh_xy, ledger=ledger, upstream=upstream,
-                side=conservative_side, sample_batch=fit_hi - fit_lo,
-                selection_faces=((fit_hi - fit_lo) * len(sample_fields) + len(moment_fields)),
-                nq=nq)
+                side=conservative_side, sample_batch=len(dense_fit),
+                selection_faces=selection_faces, nq=nq)
         from gw.shared_pole_execution import sector_round_schedule
         rounds = [row[:3] for row in sector_round_schedule(
-            bank, header, meta, config, mesh_xy, partner_parent if ordered else None,
-            execution=execution, batch_width=face_batch)]
+            bank, header, meta, config, mesh_xy, execution=execution, batch_width=face_batch)]
         batch_spec = P(("x", "y"))
         read_spec = batch_spec if execution == 'local' else None
         kernels = _round_kernels(mesh_xy, 'batch' if execution == 'local' else 'face')
@@ -230,9 +204,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
             budget.retained_panels = tuple(factors)
             budget.plan(
                 conservative_side, phase="selection",
-                sample_batch=(fit_hi-fit_lo),
-                selection_faces=((fit_hi-fit_lo) * len(sample_fields)
-                                 + len(moment_fields)))
+                sample_batch=len(dense_fit), selection_faces=selection_faces)
             budget.live(())
         with timing.section("spole.scratch_read"):
             with open_shared_pole_bank(moments["path"], mesh_xy=mesh_xy) as moment_io:
@@ -253,26 +225,23 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
             with open_shared_pole_bank(bank["path"], mesh_xy=mesh_xy) as bank_io:
                 samples = read_shared_pole_bank(
                     bank_io, meta=meta, header=header, q_ids=ids,
-                    partition_spec=read_spec, sample_span=(fit_lo, fit_hi),
-                    fields=sample_fields[:2])
-                if partner_span[1] > partner_span[0]:
-                    samples.update(read_shared_pole_bank(
-                        bank_io, meta=meta, header=header, q_ids=ids,
-                        partition_spec=read_spec, sample_span=partner_span,
-                        fields=sample_fields[2:]))
+                    partition_spec=read_spec, sample_ids=dense_fit, fields=("Wc", "dWc_ds"))
+                line = {sid: read_line_panels(bank_io, meta=meta, header=header, family="charge",
+                                              sample=sid, q_ids=ids, partition_spec=read_spec)
+                        for sid in range(line_lo, line_hi)}
             # The store admits this complete bounded scratch batch before
             # allocation. Charge it while directions/actions are selected;
             # release it before admitting the dense pencil.
         with timing.section("spole.direction_selection"):
-            exchange = ((slots, *partner_realization(meta, header, ids, partner_parent, partner_row,
-                                                      mesh_xy=mesh_xy))
-                        if ordered and execution == 'local' else
-                        ((slots, None, None, None) if ordered else None))
+            # Synthetic local slots select nothing, as a dense selection's do.
+            line_states = {sid: line_panel_states(panels, np.where(np.arange(len(counts)) < real, counts, 0),
+                                                  recipe, sid=sid, ordered=ordered, mesh_xy=mesh_xy)
+                           for sid, (panels, counts) in line.items()}
             round_states, round_counts, round_roles = select_round_states(
-                samples, recipe, sample_lo=fit_lo, real=real, mesh_xy=mesh_xy, eigh_plan=eig,
+                samples, recipe, sample_ids=dense_fit, real=real, mesh_xy=mesh_xy, eigh_plan=eig,
                 svd_plan=svd, column_extent=column_extent, logical_n=logical_n, ordered=ordered,
-                exchange=exchange, partner_lo=partner_span[0] if ordered else None)
-            del samples, exchange, qi
+                line_states=line_states)
+            del samples, line, line_states, qi
         with timing.section("spole.reduction_admission"):
             infinity_counts = [int(v.shape[-1]) for v in round_infinity_values]
             # Reuse widths only when the current ledger admits them.  The

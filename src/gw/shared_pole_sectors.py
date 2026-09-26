@@ -14,7 +14,7 @@ from gw.shared_pole_pencil import _matrix_layout, _matrix_take_columns, _matrix_
 
 
 def _contiguous_q_spans(ids, real, limit=4):
-    """Canonical q spans from a possibly partner-permuted constructor round.
+    """Canonical q spans from a (possibly permuted) constructor round.
 
     The small limit bounds the extra public factor and store conversion panel;
     the store still admits each panel against the current map capacity ledger.
@@ -51,7 +51,24 @@ def _sector_read_programs(mesh,indices,masks,execution):
                              in_specs=spec,out_specs=spec,check_vma=False)))
 
 
-def read_sector_round(io, meta, bank, header, ids, endpoints, *, sample_span=None,
+def _sector_indices(bank, endpoints):
+    """Row/column index and active mask of each endpoint family inside its stored rectangle."""
+    import numpy as np
+    layout=bank['photon_layout']
+    indices=[];masks=[]
+    for family in endpoints:
+        basis=bank['mu_bases'][family]
+        mu=basis.pack_host(np.arange(basis.n_canonical,dtype=np.int32),axis=0)
+        components=3 if family else 1
+        width=layout.carrier_extent(family)//layout.mesh_side
+        local=components*width
+        index=(mu[:,None]//width*local+np.arange(components)[None]*width+mu[:,None]%width)
+        indices.append(tuple(map(int,index.reshape(-1))))
+        masks.append(tuple(map(bool,np.repeat(basis.active_mask,components))))
+    return tuple(indices),tuple(masks)
+
+
+def read_sector_round(io, meta, bank, header, ids, endpoints, *, sample_span=None, sample_ids=None,
                       fields=('Wc','dWc_ds'), retained=(), execution='local'):
     """Read a bounded sector span into its packed endpoint bases.
 
@@ -70,36 +87,25 @@ def read_sector_round(io, meta, bank, header, ids, endpoints, *, sample_span=Non
     from jax.sharding import PartitionSpec as P
     from file_io.shared_pole_store import read_shared_pole_bank
 
-    layout=bank['photon_layout']
-    indices=[];masks=[]
-    for family in endpoints:
-        basis=bank['mu_bases'][family]
-        mu=basis.pack_host(np.arange(basis.n_canonical,dtype=np.int32),axis=0)
-        components=3 if family else 1
-        width=layout.carrier_extent(family)//layout.mesh_side
-        local=components*width
-        index=(mu[:,None]//width*local+np.arange(components)[None]*width+mu[:,None]%width)
-        indices.append(index.reshape(-1))
-        masks.append(np.repeat(basis.active_mask,components))
+    indices,masks=_sector_indices(bank,endpoints)
     spec=P(('x','y'))
-    from gw.shared_pole_execution import face_program
-    select,join=_sector_read_programs(io.mesh,tuple(tuple(map(int,i)) for i in indices),
-                                     tuple(tuple(map(bool,m)) for m in masks),execution)
+    select,join=_sector_read_programs(io.mesh,indices,masks,execution)
     ledger=meta.shared_pole_capacity
     ambient=ledger.live_stages
     keep=list(retained)
     out={}
     try:
         for field in fields:
-            sample=field in ('Wc','dWc_ds','Wc_minus_q','dWc_minus_q_ds')
-            if sample and (sample_span is None or sample_span[1] <= sample_span[0]):
-                raise ValueError('sector sample reads require a nonempty bounded sample_span')
+            sample=field in ('Wc','dWc_ds')
+            if sample and sample_ids is None and (sample_span is None or sample_span[1] <= sample_span[0]):
+                raise ValueError('sector sample reads require a nonempty bounded sample_span or sample_ids')
             size=sum(a.size*a.dtype.itemsize//io.mesh.size for a in keep)
             row=ledger.reserve(f'sector.read.retained.{len(ledger.entries)}',
                 resident_bytes_per_rank=size,workspace_bytes_per_rank=0,concurrent_with=ambient)
             ledger.live_stages=(*ambient,row['stage'])
             value=read_shared_pole_bank(io,meta=meta,header=header,q_ids=ids,
-                sample_span=sample_span if sample else None,fields=(field,),
+                sample_span=sample_span if sample else None,
+                sample_ids=sample_ids if sample else None,fields=(field,),
                 partition_spec=None if execution == "face" else spec,
                 sector=tuple('T' if family else 'C' for family in endpoints))[field]
             # Reserve the selected output alongside the bounded input.
@@ -114,6 +120,37 @@ def read_sector_round(io, meta, bank, header, ids, endpoints, *, sample_span=Non
     finally:
         ledger.live_stages=ambient
     return out
+
+
+def sector_line_selection(bank, meta, *, mesh_xy, execution, nq):
+    """The photon bank's C and T families for the producer's line selection.
+
+    Each endpoint block is cut from the face-tiled photon operator exactly as
+    a sector read cuts it from the bank (the family rectangle of each rank's
+    tile, then the packed-basis take and active mask), so the producer selects
+    on the constructor's bits. Each family also stores the CT/TC actions on
+    its directions.
+    """
+    from file_io.shared_pole_store import _resident_sector_select
+    from gw.shared_pole_directions import LineSelection, selection_layout
+    layout=bank['photon_layout']
+    side=int(layout.mesh_side)
+    c,t=(int(layout.carrier_extent(family))//side for family in (0,1))
+    move,axis,_=selection_layout(mesh_xy,execution,int(nq))
+
+    def block(value,endpoints):
+        rectangle=_resident_sector_select(mesh_xy,3,tuple(0 if f==0 else c for f in endpoints),
+                                          tuple(c if f==0 else 3*t for f in endpoints))(value)
+        indices,masks=_sector_indices(bank,endpoints)
+        select=_sector_read_programs(mesh_xy,indices,masks,execution)[0]
+        return axis(select(move(rectangle)))
+    families=[]
+    for family,basis in enumerate(bank['mu_bases']):
+        n=(3 if family else 1)*int(basis.n_logical)
+        families.append(dict(name=('C','T')[family],index=family,
+            recipe=sector_recipe(meta.shared_pole_recipe,n),logical_n=n,
+            rows=(3 if family else 1)*int(basis.n_packed),cross=True))
+    return LineSelection(families,block,mesh_xy=mesh_xy,ordered=True,execution=execution,nq=nq)
 
 
 def construct_sector_poles(bank, meta, config, *, mesh_xy, output):
@@ -136,39 +173,37 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output):
     from common.collectives import (device_put_process_local, gather_to_host,
                                     rank0_transaction)
     from file_io.shared_pole_store import (validate_shared_pole_bank, _metadata, open_shared_pole_bank,
-        write_shared_pole_model,write_shared_pole_sector_manifest)
-    from gw.shared_pole_local import parent_rounds,batch_to_face,canonical_factors,face_rows
+        read_line_panels,write_shared_pole_model,write_shared_pole_sector_manifest)
+    from gw.shared_pole_local import batch_to_face,canonical_factors,face_rows
     from gw.shared_pole_screening import _json
     from gw.shared_pole_directions import _sample_point
     from jax.sharding import NamedSharding,PartitionSpec as P
-    from symmetry_maps import minus_q_parent_partners
 
     header=validate_shared_pole_bank(bank['path'],expected_identity=bank['identity'],
                                     mesh_xy=mesh_xy,require_complete=True)
-    if 'minus_q_partner' not in header:
-        raise ValueError('GATE shared_pole_minus_q_partner: photon bank requires stored minus-q partner fields')
-    partner_span=tuple(int(v) for v in header['minus_q_partner']['sample_span'])
-    if partner_span[1]<=partner_span[0]:
-        raise ValueError('GATE shared_pole_minus_q_partner: photon recipe has no fitted line sample')
+    line_lo,line_hi=(int(v) for v in header['line_panels']['sample_span'])
+    if line_hi<=line_lo:
+        raise ValueError('GATE shared_pole_line_panel: photon recipe has no fitted line sample')
     recipe=meta.shared_pole_recipe
     if header['identity'] != bank['identity']:
         raise ValueError('GATE shared_pole_bank_state: current sector bank identity mismatch')
-    qt,operations=header['qirr'],header['operations']
-    partner,row=minus_q_parent_partners(header['q_irr_full_idx'],qt['irr_idx_q'],
-        qt['sym_idx_q'],kgrid=header['grid'],sym_mats_k=np.asarray(operations['rotation']),
-        antiunitary=np.asarray(operations['antiunitary'],bool),
-        authorized_rows=operations['authorized_rows'])
     sector_headers=[_metadata(meta,table,recipe,bank['identity'],True,basis=basis,sector=sector)
                for table,basis,sector in zip(bank['sector_tables'],bank['mu_bases'],('CC','TT'))]
-    fit_span=(int(min(recipe['fit_ids'])),int(max(recipe['fit_ids']))+1)
+    # Line supports off the imaginary axis arrive as their stored states and
+    # cross actions; the dense fitted samples (imaginary axis) are read whole.
+    dense_fit=[int(i) for i in recipe['fit_ids'] if not line_lo<=int(i)<line_hi]
 
     def read_samples(io,endpoints,retained):
-        # Wc/dWc_ds at every fitted sample, the minus-q partner at the fitted line samples.
-        out=read_sector_round(io,meta,bank,header,ids,endpoints,sample_span=fit_span,
+        # Wc/dWc_ds at the dense fitted samples.
+        return read_sector_round(io,meta,bank,header,ids,endpoints,sample_ids=dense_fit,
             fields=('Wc','dWc_ds'),retained=retained,execution=execution)
-        out.update(read_sector_round(io,meta,bank,header,ids,endpoints,sample_span=partner_span,
-            fields=('Wc_minus_q','dWc_minus_q_ds'),retained=(*retained,*out.values()),execution=execution))
-        return out
+
+    def read_line(io,family,cross=False):
+        spec=None if execution=='face' else P(('x','y'))
+        name=('C','T')[family]
+        return {sid:read_line_panels(io,meta=meta,header=header,family=name,sample=sid,cross=cross,
+                                     q_ids=ids,partition_spec=spec)
+                for sid in range(line_lo,line_hi)}
     receipts=[];stores={};placed=[]
     root=Path(output).parent
     to_face=batch_to_face(mesh_xy)
@@ -192,7 +227,7 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output):
     if sector_models is not None:
         upstream=ledger.live_stages=(*upstream,model_residence['stage'])
     for ids,real,slots,execution in sector_round_schedule(
-            bank,header,meta,config,mesh_xy,partner,execution=resolved_execution,
+            bank,header,meta,config,mesh_xy,execution=resolved_execution,
             batch_width=batch_width):
         sectors=[];retained=[]
         for family,name in enumerate(('CC','TT')):
@@ -201,14 +236,13 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output):
                     exact=read_sector_round(io,meta,bank,header,ids,(family,family),
                         fields=('M0','M1','M2','M3'),retained=retained,execution=execution)
                     samples=read_samples(io,(family,family),(*retained,*exact.values()))
+                    line=read_line(io,family)
                 geometry=dict(components=3 if family else 1,basis=bank['mu_bases'][family],
-                    ids=ids,real=real,header=sector_headers[family],partner_parent=partner,
-                    partner_row=row,slots=slots,sym=bank['tables']['sym'],sample_lo=fit_span[0],
-                    partner_lo=partner_span[0],
+                    ids=ids,real=real,header=sector_headers[family],sample_ids=dense_fit,
                     sector=name)
                 model=construct_diagonal_sector_round(samples,exact,meta,config,geometry,
-                    mesh_xy=mesh_xy,retained=retained)
-                del samples,exact
+                    mesh_xy=mesh_xy,retained=retained,line=line)
+                del samples,exact,line
                 sectors.append(model)
 
                 retained.extend(jax.tree.leaves((model['model'],model['signed'],
@@ -228,8 +262,10 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output):
                 tc=read_samples(io,(1,0),(*retained,*ct.values()))
                 cm=read_sector_round(io,meta,bank,header,ids,(0,1),fields=('M0','M1','M2','M3'),
                                       retained=(*retained,*ct.values(),*tc.values()),execution=execution)
+                line_cross=[read_line(io,family,cross=True) for family in (0,1)]
             cross=construct_cross_sector_round(sectors,(ct,tc),cm,meta,config,mesh_xy=mesh_xy,
-                sample_lo=fit_span[0],partner_lo=partner_span[0],partner_slots=slots,real=real)
+                sample_ids=dense_fit,line_cross=line_cross,real=real)
+            del line_cross
             with open_shared_pole_bank(bank['path'],mesh_xy=mesh_xy) as io:
                 c1=read_sector_round(io,meta,bank,header,ids,(0,0),fields=('M1',),
                     retained=(*retained,*ct.values(),*tc.values(),*cm.values(),*jax.tree.leaves(cross['models'])),execution=execution)['M1']
@@ -510,36 +546,44 @@ def _local_cauchy_program(mesh,charge_eigh,current_eigh):
                             out_specs=spec,check_vma=False))
 
 
+def sector_recipe(recipe, n):
+    """The map recipe resized to one sector of ``n`` rows: widths, line cap and pole budget."""
+    import math
+    from gw.shared_pole_recipe import shared_real_pole_v1_r3b
+    policy=shared_real_pole_v1_r3b[recipe['accuracy']]
+    result=dict(recipe,n=n)
+    for field in ('imaginary_width','infinity_width','line_direction_cap','pole_budget'):
+        fraction=policy.get(field+'_fraction')
+        result[field]=None if fraction is None else math.ceil(n*fraction)
+    return result
+
+
 def construct_diagonal_sector_round(samples, moments, meta, config, geometry, *, mesh_xy,
-                                     retained=()):
+                                     retained=(), line=None):
     """Run the production selection/reduction program for CC or TT.
 
-    Samples and M0..M3 are parent-local stacks, [P,S,n,n] and [P,n,n].
-    ``geometry`` carries the existing recipe, endpoint basis/tables/header,
-    round ids/real/partner slots and symmetry partner rows. TT uses
-    n=3*n_T with mu-major Cartesian rows. The unchanged recipe fractions
-    set its widths and 1.8*n pole budget. Capacity remains the whole-map
-    ledger; no fictitious independent sector allowance is created.
+    Samples and M0..M3 are parent-local stacks, [P,S,n,n] and [P,n,n], the
+    samples at the dense fitted ids ``geometry['sample_ids']``; ``line`` maps
+    each line-panel sample to its stored (panels, counts) for this sector.
+    ``geometry`` carries the endpoint basis, header, round ids/real and the
+    sector name. TT uses n=3*n_T with mu-major Cartesian rows. The unchanged
+    recipe fractions set its widths and 1.8*n pole budget. Capacity remains
+    the whole-map ledger; no fictitious independent sector allowance is created.
 
     Returns the sorted positive model, signed model, original-pencil span,
     selected state/infinity panels and replicated diagnostics. The latter
     are needed by the CT joint projection in the same map, never cached.
     """
     import copy
-    import math
     import jax
     import numpy as np
-    import distrib_la
-    from runtime.padding import padded_axis
-    from jax.sharding import PartitionSpec as P
     from gw.gw_config import linalg_resolution
     from gw.shared_pole_capacity import ConstructorCapacity,round_padding_output_bytes
-    from gw.shared_pole_directions import _round_kernels,select_round_states,leading_response_directions
-    from gw.shared_pole_local import (partner_realization,round_tables,reduce_round,
-                                      _batch_put,grow_round,carrier_history)
-    from gw.shared_pole_recipe import shared_real_pole_v1_r3b
+    from gw.shared_pole_directions import (_round_kernels,line_panel_states,port_extent,
+                                           select_round_states,leading_response_directions)
+    from gw.shared_pole_local import round_tables,reduce_round,grow_round,carrier_history
 
-    from gw.shared_pole_execution import is_face, face_program, face_reduce_round
+    from gw.shared_pole_execution import is_face, face_reduce_round
     execution='face' if is_face(samples['Wc']) else 'local'
     components=int(geometry['components'])
     basis=geometry['basis']
@@ -548,51 +592,46 @@ def construct_diagonal_sector_round(samples, moments, meta, config, geometry, *,
     local_meta.mu_basis=basis
     local_meta.n_rmu=n
     local_meta.n_rmu_padded=components*basis.n_packed
-    recipe=dict(meta.shared_pole_recipe,n=n)
-    policy=shared_real_pole_v1_r3b[recipe['accuracy']]
-    for field in ('imaginary_width','infinity_width','line_direction_cap','pole_budget'):
-        fraction=policy.get(field+'_fraction')
-        recipe[field]=None if fraction is None else math.ceil(n*fraction)
+    recipe=sector_recipe(meta.shared_pole_recipe,n)
     budget=ConstructorCapacity(local_meta,linalg_resolution({'linalg':config.backend.linalg}),
                                mesh_xy=mesh_xy,ledger=meta.shared_pole_capacity,
                                upstream=meta.shared_pole_capacity.live_stages,
                                execution=execution)
     budget.batch_width=len(geometry['ids'])
     budget.retained_panels=tuple(retained)
-    # Four photon sample fields at every fit support and four moment fields
-    # are resident during selection. Derive the face count from these exact
-    # read dictionaries so admission prices the live panel set.
+    # The dense sample and moment fields and the stored line panels are
+    # resident during selection. Derive the face count from these exact read
+    # dictionaries so admission prices the live panel set.
+    line={} if line is None else line
+    panel_elements=sum(int(np.prod(panels.shape[1:])) for panels,_ in line.values())
     selection_faces=(sum(int(panel.shape[1]) for panel in samples.values())
-                     +len(moments))
+                     +len(moments)+-(-panel_elements//local_meta.n_rmu_padded**2))
     budget.plan(0,phase='selection',sample_batch=samples['Wc'].shape[1],
                 selection_faces=selection_faces)
     eig=budget.eigenplan(local_meta.n_rmu_padded)
     svd=budget.eigenplan(2*local_meta.n_rmu_padded)
-    # Direction ranks move between rounds and maps; their carriers sit on the
-    # extent ladder so the selection and round programs repeat. No rank cap:
-    # the same function sizes round sums and pole budgets, which exceed n.
-    from runtime.padding import ladder_extent
-    extent=lambda width:padded_axis(ladder_extent(width),mesh_xy,name='shared_pole_port',
-        specs=((P('x','y'),0),(P('x','y'),1))).carrier
+    extent=port_extent(mesh_xy)
     qi,values=leading_response_directions(moments['M1'],min(n,recipe['infinity_width']),
         eigh_plan=eig,column_extent=extent,multiplet_tol=recipe['multiplet_relative_tolerance'],
         real_rows=None if execution=='face' else geometry['real'])
     kernels=_round_kernels(mesh_xy,'face' if execution=='face' else 'batch')
     infinity=(qi,*(kernels.apply(moments[name],qi) for name in ('M0','M1','M2','M3')))
-    # The stored minus-q partner belongs to the original parent's operator;
-    # no spatial partner action is needed in either execution layout.
-    action=(None,None,None)
-    rotation=None
-    states,counts,roles=select_round_states(samples,recipe,sample_lo=geometry['sample_lo'],
-        real=geometry['real'],mesh_xy=mesh_xy,eigh_plan=eig,svd_plan=svd,column_extent=extent,
-        logical_n=n,ordered=True,exchange=(geometry['slots'],*action),current_rotation=rotation,
-        partner_lo=geometry['partner_lo'])
+    # Synthetic local slots select nothing, as a dense selection's do.
+    real=geometry['real']
+    line_states={sid:line_panel_states(panels,np.where(np.arange(len(counts))<real,counts,0),
+                                       recipe,sid=sid,ordered=True,mesh_xy=mesh_xy)
+                 for sid,(panels,counts) in line.items()}
+    states,counts,roles=select_round_states(samples,recipe,sample_ids=geometry['sample_ids'],
+        real=real,mesh_xy=mesh_xy,eigh_plan=eig,svd_plan=svd,column_extent=extent,
+        logical_n=n,ordered=True,line_states=line_states)
+    del line_states
     # Reuse admitted carrier widths across this model's later SC maps.
     round_key=('sector',geometry['sector'],n)
     # The reduction envelope already includes current Q/O/dO and infinity
     # panels. Full sample/moment stacks remain caller-live through this call,
     # so those and earlier-sector outputs are the only additional arrays.
-    budget.retained_panels=(*retained,*samples.values(),*moments.values())
+    budget.retained_panels=(*retained,*samples.values(),*moments.values(),
+                            *(panels for panels,_ in line.values()))
     history=carrier_history(meta)
     def _tables(widths,infinity_width,reuse):
         return round_tables(counts,widths,[s[0] for s in states],
@@ -641,14 +680,16 @@ def construct_diagonal_sector_round(samples, moments, meta, config, geometry, *,
     budget.retained_panels=tuple(retained)
     return dict(model=model,signed=signed,coefficients=y,states=states,infinity=infinity,
                 tables=tables,roles=roles,diagnostics=diagnostics,vectors=vectors,
-                endpoint_action=(*action,rotation),recipe=recipe,budget=budget,execution=execution)
+                recipe=recipe,budget=budget,execution=execution)
 
 
 def construct_cross_sector_round(sectors, samples, moments, meta, config, *,
-                                 mesh_xy, sample_lo, partner_lo, partner_slots, real):
+                                 mesh_xy, sample_ids, line_cross, real):
     """Run CT on the two current-map diagonal spans, keeping both outputs.
 
-    ``samples=(CT,TC)`` contains the native rectangular Wc/dWc_ds rounds;
+    ``samples=(CT,TC)`` contains the native rectangular Wc/dWc_ds rounds at
+    the dense fitted ``sample_ids``; ``line_cross[family]`` maps each line-panel
+    sample to that family's stored cross panel (``read_line_panels(cross=True)``);
     moments is the CT M0..M3 round. All operators are parent-sharded. The
     signed physical photon interaction is admitted by the unchanged positive
     retained-H checks, not by the scalar positive-V upper passivity bound.
@@ -694,16 +735,10 @@ def construct_cross_sector_round(sectors, samples, moments, meta, config, *,
     side = sum(widths)
     budget.plan(side,phase='cross_reduction',cross_original_sides=original_sides)
     actions=[]
-    for source, forward, reverse, left, right in (
-            (charge,tc,ct,transverse,charge),
-            (transverse,ct,tc,charge,transverse)):
-        panels=(forward['Wc'],reverse['Wc'],forward['dWc_ds'],reverse['dWc_ds'],
-                forward['Wc_minus_q'],reverse['Wc_minus_q'],
-                forward['dWc_minus_q_ds'],reverse['dWc_minus_q_ds'])
+    for source, forward, reverse, stored in ((charge,tc,ct,line_cross[0]),(transverse,ct,tc,line_cross[1])):
+        panels=(forward['Wc'],reverse['Wc'],forward['dWc_ds'],reverse['dWc_ds'])
         actions.append(cross_round_actions(panels,source['states'],source['roles'],
-            source['recipe'],sample_lo=sample_lo,partner_lo=partner_lo,mesh_xy=mesh_xy,
-            partner_slots=partner_slots,
-            endpoint_actions=(left['endpoint_action'],right['endpoint_action'])))
+            source['recipe'],sample_ids=sample_ids,mesh_xy=mesh_xy,line_cross=stored))
 
     spec=P(('x','y'))
     packed=[]
@@ -820,11 +855,13 @@ def _positive_cross_equations(left,right,mu,active,*,gates,matrix_sharding=None)
 def _cross_products(panels,q,node,sample,*,mirror,imaginary,conjugate,mm):
     """One CT action with the parent's own operator, for both execution layouts.
 
-    A mirror state acts with W(-conj z): the stored minus-q partner panels
-    (``sample`` indexes their stack) or, at an imaginary node where
-    -conj z = z, the sample itself.
+    ``panels`` are the forward and reverse rectangles and their derivatives,
+    then (a mirror state off the imaginary axis only) the same four of the
+    minus-q partner W_q(-conj z); ``sample`` indexes their stacks. A mirror
+    state acts with W(-conj z): the partner panels or, at an imaginary node
+    where -conj z = z, the sample itself.
     """
-    w,wr,d,dr,wm,wrm,dwm,dwrm=panels
+    w,wr,d,dr,wm,wrm,dwm,dwrm=(*panels,None,None,None,None)[:8]
     if mirror and not imaginary:
         a,da=(wm,dwm) if conjugate else (wrm,dwrm)
         adjoint=not conjugate
@@ -840,92 +877,67 @@ def _cross_products(panels,q,node,sample,*,mirror,imaginary,conjugate,mm):
     return mm(a,q),mm(da,q)*(2*node)
 
 
-def cross_round_actions(samples, states, roles, recipe, *, sample_lo, partner_lo, mesh_xy,
-                        partner_slots, endpoint_actions):
+def cross_round_actions(samples, states, roles, recipe, *, sample_ids, mesh_xy, line_cross):
     """Apply rectangular samples to the diagonal sectors' selected directions.
 
     ``samples=(W_LR,W_RL,dW_LR/ds,dW_RL/ds)`` are parent-local
-    [P,S,n_L,n_R] (reverse blocks have reversed endpoint extents).
-    With the stored minus-q partner, four W/dW panels at ``-conj(z)`` over
-    the fitted line samples (first id ``partner_lo``) follow.
-    ``states``/``roles`` are the existing selection round's source states.
-    ``endpoint_actions`` is ((alpha,inverse,phase,rotation)_L, ..._R);
-    a charge endpoint has rotation=None, a current endpoint uses the
-    symmetry service's polar time-odd [P,3,3] action and mu-major rows.
-    The partner panels already belong to the original q operator and
-    require no partner-rank exchange or spatial action. The four-panel
-    route exchanges only direction/output panels through the authenticated
-    partner permutation. Outputs follow the paired state order and the
-    derivative is d/dz, report equation 5.3.
+    [P,S,n_L,n_R] at the dense fitted ``sample_ids`` (reverse blocks have
+    reversed endpoint extents). ``states``/``roles`` are the diagonal round's
+    source states. A state of a line-panel sample takes its stored cross
+    output and action (``line_cross[sid]``: (panels [.., 2S, n_L, r], counts),
+    the producer's ``sector_line_panels``); a dense sample's are formed here.
+    Outputs follow the paired state order and the derivative is d/dz, report
+    equation 5.3.
     """
-    from gw.shared_pole_directions import _sample_point
+    import numpy as np
+    from gw.shared_pole_directions import _round_kernels, _sample_point, replicated
     from gw.shared_pole_execution import is_face,cross_action_program
+    from gw.shared_pole_local import _pad_columns
     face=is_face(samples[0])
-    stored=len(samples)==8
-    if len(samples) not in (4,8):
-        raise ValueError('GATE shared_pole_minus_q_partner: expected four direct or eight direct/partner panels')
-    if face and not stored:
-        raise ValueError('GATE shared_pole_minus_q_partner: distributed photon CT requires stored minus-q partner panels')
+    k=_round_kernels(mesh_xy,'face' if face else 'batch')
+    index={int(sid):i for i,sid in enumerate(sample_ids)}
+    put=replicated(mesh_xy)
+    stored={}
     outputs=[]
     for state,role in zip(states,roles[0]):
         sid=int(role['sample_id'])
         conjugate=bool(role.get('conjugate',False))
         mirror=bool(role.get('mirror',False))
+        if sid in line_cross:
+            if sid not in stored:
+                panels=line_cross[sid][0]
+                stored[sid]=[k.column(panels,put(np.int32(i))) for i in range(int(panels.shape[1]))]
+            # The round padded the state's direction to its carrier
+            # (grow_round); its padding columns act as zero.
+            width=int(state[1].shape[-1])
+            field=2*(2*mirror+conjugate)
+            outputs.append(tuple(a if int(a.shape[-1])==width else
+                                 _pad_columns(a.sharding,a.shape,width)(a)
+                                 for a in stored[sid][field:field+2]))
+            continue
         imaginary=_sample_point(recipe,sid).real==0
+        if not imaginary:
+            raise ValueError(f'GATE shared_pole_line_panel: line sample {sid} has no stored cross panel')
         node=jnp.asarray(state[0])
-        index=sid-partner_lo if mirror and not imaginary and stored else sid-sample_lo
-        sample=jnp.asarray(index,jnp.int32)
+        sample=jnp.asarray(index[sid],jnp.int32)
         if face:
             outputs.append(cross_action_program(mesh_xy,mirror,imaginary,conjugate)(samples,state[1],node,sample))
         else:
-            exchange=mirror and not imaginary and not stored
-            perm=tuple((i,int(p)) for i,p in enumerate(partner_slots)) if exchange else ()
-            program=_local_cross_action_program(mesh_xy,stored,mirror,imaginary,conjugate,exchange,perm)
-            outputs.append(program(samples,state[1],*endpoint_actions,node,sample))
+            outputs.append(_local_cross_action_program(mesh_xy,mirror,imaginary,conjugate)(samples,state[1],node,sample))
     return tuple(outputs)
 
 
 @lru_cache(maxsize=None)
-def _local_cross_action_program(mesh,stored,mirror,imaginary,conjugate,exchange,perm):
+def _local_cross_action_program(mesh,mirror,imaginary,conjugate):
     import jax
     from common.shard_map import shard_map
     from jax.sharding import PartitionSpec as P
     from gw.shared_pole_local import _mm
-    use_adjoint=not conjugate if mirror and not exchange else conjugate
-    def rotate(panel, rotation, transpose):
-        if rotation is None:
-            return panel
-        shape=panel.shape
-        panel=panel.reshape(shape[0],shape[1]//3,3,shape[-1])
-        return jnp.einsum('bij,bmir->bmjr' if transpose else 'bij,bmjr->bmir',
-                          rotation,panel).reshape(shape)
-    def apply(panels,q,left,right,node,sample):
-        if stored:
-            return _cross_products(panels,q,node,sample,mirror=mirror,
-                imaginary=imaginary,conjugate=conjugate,mm=_mm)
-        w,wr,d,dr=panels
-        a,b=w[:,sample],wr[:,sample]
-        da,db=d[:,sample],dr[:,sample]
-        if exchange:
-            alpha,inverse,phase,rotation=right
-            q=rotate(jnp.take_along_axis(phase[:,:,None]*q,inverse[:,:,None],axis=1),rotation,True)
-            q=jax.lax.ppermute(q,('x','y'),perm)
-            if conjugate:
-                a,da=jnp.conj(a),jnp.conj(da)
-            else:
-                a,da=jnp.swapaxes(b,-1,-2),jnp.swapaxes(db,-1,-2)
-        elif use_adjoint:
-            a,da=jnp.swapaxes(jnp.conj(b),-1,-2),jnp.swapaxes(jnp.conj(db),-1,-2)
-        o,d_o=_mm(a,q),_mm(da,q)*(2*node)
-        if exchange:
-            alpha,inverse,phase,rotation=left
-            def back(x):
-                x=jax.lax.ppermute(x,('x','y'),perm)
-                return rotate(jnp.conj(phase)[:,:,None]*jnp.take_along_axis(x,alpha[:,:,None],axis=1),rotation,False)
-            o,d_o=back(o),back(d_o)
-        return o,d_o
+    def apply(panels,q,node,sample):
+        return _cross_products(panels,q,node,sample,mirror=mirror,
+            imaginary=imaginary,conjugate=conjugate,mm=_mm)
     batch=P(('x','y'))
-    return jax.jit(shard_map(apply,mesh=mesh,in_specs=(batch,)*4+(P(),P()),
+    return jax.jit(shard_map(apply,mesh=mesh,in_specs=(batch,batch,P(),P()),
                             out_specs=(batch,batch),check_vma=False))
 
 
@@ -1194,39 +1206,35 @@ def sector_execution(meta, config, mu_bases, nq, *, mesh_xy, upstream):
     (which requires that keeping the bank resident does not change it) both
     resolve it against the whole-map ledger with ``upstream`` live.
     """
-    import copy, math
-    from jax.sharding import PartitionSpec as P
-    from runtime.padding import padded_axis
+    import copy
     from gw.gw_config import linalg_resolution
-    from gw.shared_pole_execution import constructor_execution
-    from gw.shared_pole_recipe import shared_real_pole_v1_r3b
+    from gw.shared_pole_directions import port_extent
+    from gw.shared_pole_execution import constructor_execution, line_panel_count, selection_face_count
     recipe=meta.shared_pole_recipe
     ledger=meta.shared_pole_capacity
-    policy=shared_real_pole_v1_r3b[recipe['accuracy']]
-    def sector_recipe(n):
-        result=dict(recipe,n=n)
-        for field in ('imaginary_width','infinity_width','line_direction_cap','pole_budget'):
-            fraction=policy.get(field+'_fraction')
-            result[field]=None if fraction is None else math.ceil(n*fraction)
-        return result
-    from runtime.padding import ladder_extent
-    extent=lambda width:padded_axis(ladder_extent(width),mesh_xy,name='shared_pole_port',
-        specs=((P('x','y'),0),(P('x','y'),1))).carrier
+    extent=port_extent(mesh_xy)
     execution_rows=[]
+    rows=[(1 if family==0 else 3)*basis.n_packed for family,basis in enumerate(mu_bases)]
     for family,basis in enumerate(mu_bases):
         components=3 if family else 1
         local_meta=copy.copy(meta)
         local_meta.mu_basis=basis
         local_meta.n_rmu=components*basis.n_logical
         local_meta.n_rmu_padded=components*basis.n_packed
-        local_recipe=sector_recipe(local_meta.n_rmu)
+        local_recipe=sector_recipe(recipe,local_meta.n_rmu)
+        # The diagonal selection holds this sector's dense samples, moments
+        # and its own line panels; the cross panels are the CT round's.
+        faces=selection_face_count(local_recipe,n=local_meta.n_rmu_padded,logical_n=local_meta.n_rmu,
+            states=4,rows=rows[family],dense_fields=2,moment_fields=4,column_extent=extent)
         mode,route=constructor_execution(
             local_meta,linalg_resolution({'linalg':config.backend.linalg}),local_recipe,
             mesh=mesh_xy,ledger=ledger,upstream=upstream,ordered=True,
-            odd_moments=True,sample_fields=4,moment_fields=4,
-            column_extent=extent)
+            odd_moments=True,selection_faces=faces,
+            sample_batch=len(recipe['fit_ids'])-line_panel_count(recipe),column_extent=extent)
+        cap=local_recipe['line_direction_cap']
         execution_rows.append(dict(sector=('CC','TT')[family],mode=mode,
                                    packed_extent=local_meta.n_rmu_padded,
+                                   line_width=extent(max(1,local_meta.n_rmu if cap is None else min(cap,local_meta.n_rmu))),
                                    signed_side_bound=extent(2*local_recipe['pole_budget']) if local_recipe['pole_budget'] is not None else route['conservative_pencil_side'],**route))
     # CT retains both diagonal spans and both rectangular sample stacks. The
     # CC/TT admission alone cannot promise that their joint pencil fits one
@@ -1236,11 +1244,17 @@ def sector_execution(meta, config, mu_bases, nq, *, mesh_xy, upstream):
     joint_meta.n_rmu=sum((3 if family else 1)*basis.n_logical
                          for family,basis in enumerate(mu_bases))
     joint_meta.n_rmu_padded=sum(row['packed_extent'] for row in execution_rows)
+    joint_recipe=sector_recipe(recipe,joint_meta.n_rmu)
+    # Dense CT and TC (W, dW/ds) at the dense fitted samples, the moments and
+    # both families' cross panels.
+    lines=line_panel_count(recipe)
+    cross=lines*8*(rows[1]*execution_rows[0]['line_width']+rows[0]*execution_rows[1]['line_width'])
+    joint_faces=4*(len(recipe['fit_ids'])-lines)+4+-(-cross//joint_meta.n_rmu_padded**2)
     joint_mode,joint_route=constructor_execution(
         joint_meta,linalg_resolution({'linalg':config.backend.linalg}),
-        sector_recipe(joint_meta.n_rmu),mesh=mesh_xy,ledger=ledger,
+        joint_recipe,mesh=mesh_xy,ledger=ledger,
         upstream=upstream,ordered=True,odd_moments=True,
-        sample_fields=8,moment_fields=4,parent_count=nq,
+        selection_faces=joint_faces,sample_batch=len(recipe['fit_ids'])-lines,parent_count=nq,
         retained_output_families=2,column_extent=extent,
         defer_reduction=True,
         cross_original_sides=tuple(row['conservative_pencil_side'] for row in execution_rows),
@@ -1250,3 +1264,4 @@ def sector_execution(meta, config, mu_bases, nq, *, mesh_xy, upstream):
                         any(row['mode']=='face' for row in execution_rows)
                         else 'local')
     return resolved_execution,execution_rows
+

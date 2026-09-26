@@ -64,7 +64,8 @@ def run_checks(mesh, directory):
         t = np.linspace(.2, 1.4, rank)
         expected.append((c, t))
         for handle in (path, resident):
-            for sample, z in enumerate((.2j, .5+.2j, .3+.2j)):
+            # Samples 0 (imaginary axis) and 2 (held) are dense; the line sample 1 is planted below.
+            for sample, z in ((0, .2j), (2, .3+.2j)):
                 w = (c/(z*z-t)) @ c.conj().T
                 dw = -(c/(z*z-t)**2) @ c.conj().T
                 store.write_shared_pole_bank(handle, q_span=(q, q+1), sample_span=(sample, sample+1),
@@ -75,6 +76,15 @@ def run_checks(mesh, directory):
                 M1=packed((c @ c.conj().T/2)[None], P(None, 'x', 'y')),
                 M3=packed(((c*t) @ c.conj().T/2)[None], P(None, 'x', 'y')),
                 meta=meta, expected_identity=identity, mesh_xy=mesh)
+
+    def value(z):
+        w = np.stack([(c/(z*z-t)) @ c.conj().T for c, t in expected])
+        dw = np.stack([-(c/(z*z-t)**2) @ c.conj().T for c, t in expected])
+        return packed(w, P(None, 'x', 'y')), packed(dw, P(None, 'x', 'y'))
+    from shared_pole_bank_plant import plant_line_samples
+    for handle in (path, resident):
+        plant_line_samples(handle, value, meta=meta, recipe=recipe, identity=identity, mesh=mesh,
+                           nq=3, ordered=False)
 
     import hashlib
     vpath = directory / "coulomb.h5"

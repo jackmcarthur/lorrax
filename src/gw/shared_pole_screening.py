@@ -171,12 +171,16 @@ def _bank_residence(meta, config, *, mesh_xy, sym, root, label, photon, mu_bases
     from .gw_config import linalg_resolution
     from .shared_pole_constructor import constructor_route
 
+    from .shared_pole_directions import line_width_bounds
     ledger = meta.shared_pole_capacity
     ordered = bool(photon) or not bool(sym.trs_allowed)
     nq = len(np.asarray(sym.q_irr_full_idx))
     R = shared_pole_bank_payload_bytes(meta, recipe=meta.shared_pole_recipe,
                                        ordered=ordered, nq=nq, mesh_xy=mesh_xy,
-                                       photon_extent=None if photon is None else photon.packed_extent)
+                                       line_widths=line_width_bounds(meta, mesh_xy=mesh_xy,
+                                           photon_bases=None if photon is None else mu_bases),
+                                       photon_extent=None if photon is None else photon.packed_extent,
+                                       photon_bases=None if photon is None else mu_bases)
     receipt = dict(residence="file", payload_bytes_per_rank=R,
                    payload_bytes_total=R * int(mesh_xy.size))
     if config.debug.write_w or linalg_resolution(
@@ -215,8 +219,7 @@ def _bank_residence(meta, config, *, mesh_xy, sym, root, label, photon, mu_bases
     else:
         execution, wanted = constructor_route(
             meta, config, meta.shared_pole_recipe, mesh_xy=mesh_xy, ledger=ledger,
-            upstream=(stage,), ordered=ordered, odd_moments=ordered, minus_q_partner=ordered,
-            nq=nq)[0], "local"
+            upstream=(stage,), ordered=ordered, odd_moments=ordered, nq=nq)[0], "local"
     if execution != wanted:
         return pinned("constructor would change route with the payload live")
     receipt.update(residence="device", stage=stage,

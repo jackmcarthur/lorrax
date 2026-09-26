@@ -114,11 +114,14 @@ def check(mesh, root, layout, resident=False):
         support_pair=np.array([[-1,-1],[0,1]],np.int64),fit_ids=np.array([0],np.int64),held_ids=np.array([1],np.int64))
     store.initialize_shared_pole_bank(bank,meta=meta,tables=tables[0],recipe=bank_recipe,
         identity=identity,mesh_xy=mesh,photon_layout=photon_layout,mu_bases=tuple(bases))
-    zero=jnp.zeros_like(packed);samples=jnp.stack((zero,zero),axis=1)
-    store.write_shared_pole_bank(bank,q_span=(0,nk),sample_span=(0,1),
-        Wc_minus_q=samples[:,:1],dWc_minus_q_ds=samples[:,:1],
-        meta=meta,expected_identity=identity,mesh_xy=mesh)
-    store.write_shared_pole_bank(bank,q_span=(0,nk),sample_span=(0,2),Wc=samples,dWc_ds=samples,
+    # Sigma reads only the bank's constant; the line sample (id 0) stores empty panels.
+    zero=jnp.zeros_like(packed);samples=zero[:,None]
+    panel=lambda rows,fields:put(np.zeros((nk,fields,rows,2),np.complex128),P(None,None,'x','y'))
+    rows=dict(C=bases[0].n_packed,T=3*bases[1].n_packed)
+    store.write_shared_pole_bank(bank,q_span=(0,nk),line=dict(sample=0,
+        panels={f:panel(rows[f],9) for f in rows},cross={f:panel(rows['T' if f=='C' else 'C'],8) for f in rows},
+        counts={f:np.zeros(nk,np.int64) for f in rows}),meta=meta,expected_identity=identity,mesh_xy=mesh)
+    store.write_shared_pole_bank(bank,q_span=(0,nk),sample_span=(1,2),Wc=samples,dWc_ds=samples,
         M0=zero,M1=zero,M2=zero,M3=zero,constant=packed,meta=meta,expected_identity=identity,mesh_xy=mesh)
     handle=store.write_shared_pole_sector_manifest(root/'manifest.json',models=models,
         bank=dict(path=bank),identity=identity,receipts=dict(scope='synthetic oracle'),mesh_xy=mesh)

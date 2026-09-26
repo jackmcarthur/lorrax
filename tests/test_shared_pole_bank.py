@@ -148,8 +148,26 @@ def test_bank_stale_identity_and_invalid_spans(tmp_path):
         validate_shared_pole_bank(path, expected_identity=identity, mesh_xy=mesh)
 
 
-def test_ordered_scalar_bank_stores_minus_q_partner_at_line_samples(tmp_path):
-    """A broken-TRS bank stores W_q(-conj z) at its fitted line samples only."""
+def _panel(meta, mesh, *, fields, width, value, nq=1):
+    """A [b, fields, n_packed, width] line panel with zero padded centroid rows."""
+    basis = meta.mu_basis
+    shape = (nq, fields, basis.n_canonical, width)
+    data = (value + np.arange(np.prod(shape)).reshape(shape)
+            - 1j * np.arange(np.prod(shape)).reshape(shape)[..., ::-1]).astype(np.complex128)
+    data[..., basis.n_logical:, :] = 0
+    spec = P(None, None, 'x', 'y')
+    array = jax.make_array_from_callback(shape, NamedSharding(mesh, spec), lambda index: data[index])
+    return basis.pack_axis(array, 2, spec=spec)
+
+
+def test_ordered_scalar_bank_stores_line_panels(tmp_path):
+    """A fitted line sample off the imaginary axis stores its direction panels, never a dense W.
+
+    Every tier (file, device, pinned host) returns the written panel bit for bit
+    in both layouts, with the retained counts; the dense axis skips the line
+    sample; the dense writer refuses it by name; a panel wider than the
+    sample's first write refuses.
+    """
     mesh, meta, tables, recipe, identity = _bank_fixture()
     recipe.update(
         z_ry=np.asarray([0.3+0.1j, 0.1j, 0.2+0.1j], dtype=np.complex128),
@@ -160,31 +178,51 @@ def test_ordered_scalar_bank_stores_minus_q_partner_at_line_samples(tmp_path):
         fit_ids=np.asarray([0, 1], dtype=np.int64),
         held_ids=np.asarray([2], dtype=np.int64))
     tables["sym"].trs_allowed = False
-    path = tmp_path / "ordered_scalar_bank.h5"
-    header = initialize_shared_pole_bank(
-        path, meta=meta, tables=tables, recipe=recipe,
-        identity=identity, mesh_xy=mesh)
-    assert header["ordered"] is True
-    assert header["minus_q_partner"]["sample_span"] == [0, 1]
-    nq = header["bank_shape"]["nq"]
-    assert np.asarray(header["minus_q_written"]).shape == (nq, 1, 2)
-    W = _matrix(meta, mesh, samples=True, value=3)
-    D = _matrix(meta, mesh, samples=True, value=-5)
-    header = write_shared_pole_bank(
-        path, q_span=(0, 1), sample_span=(0, 1), Wc=W, dWc_ds=D,
-        Wc_minus_q=W, dWc_minus_q_ds=D,
-        meta=meta, expected_identity=identity, mesh_xy=mesh)
-    with SlabIO(path, mode="r", mesh=mesh) as io:
-        got = read_shared_pole_bank(
-            io, (0, 1), meta=meta, header=header, sample_span=(0, 1),
-            fields=("Wc_minus_q", "dWc_minus_q_ds"))
-    assert bool(jnp.all(got["Wc_minus_q"] == W))
-    assert bool(jnp.all(got["dWc_minus_q_ds"] == D))
-    # The imaginary sample (-conj z = z) has no stored partner.
-    with pytest.raises(ValueError, match="outside its stored samples"):
-        write_shared_pole_bank(
-            path, q_span=(1, 2), sample_span=(1, 2), Wc_minus_q=W,
+    basis = meta.mu_basis
+    banks = {"file": tmp_path / "ordered_scalar_bank.h5",
+             "device": store.ResidentBankPayload(mesh, carrier=basis.n_canonical, label="device"),
+             "pinned_host": store.ResidentBankPayload(mesh, carrier=basis.n_canonical, label="host",
+                                                      memory_kind="pinned_host")}
+    got = {}
+    for tier, path in banks.items():
+        header = initialize_shared_pole_bank(
+            path, meta=meta, tables=tables, recipe=recipe, identity=identity, mesh_xy=mesh)
+        assert header["ordered"] is True
+        assert header["line_panels"]["sample_span"] == [0, 1]
+        assert len(header["line_panels"]["fields"]) == 9
+        nq = header["bank_shape"]["nq"]
+        assert np.asarray(header["sample_written"]).shape == (nq, 2, 2)
+        assert np.asarray(header["line_written"]).shape == (nq, 1)
+        W = _matrix(meta, mesh, samples=True, value=3)
+        with pytest.raises(ValueError, match="sample 0 is a line-panel sample"):
+            write_shared_pole_bank(path, q_span=(0, 1), sample_span=(0, 1), Wc=W,
+                                   meta=meta, expected_identity=identity, mesh_xy=mesh)
+        panel = _panel(meta, mesh, fields=9, width=4, value=5, nq=nq)
+        header = write_shared_pole_bank(
+            path, q_span=(0, nq), line=dict(sample=0, panels={"charge": panel},
+                                            counts={"charge": np.asarray([1, 3, 4][:nq])}),
             meta=meta, expected_identity=identity, mesh_xy=mesh)
+        assert header["line_panels"]["width"]["charge"] == [4]
+        with pytest.raises(ValueError, match="already committed"):
+            write_shared_pole_bank(
+                path, q_span=(0, nq), line=dict(sample=0, panels={"charge": panel},
+                                                counts={"charge": np.zeros(nq, np.int64)}),
+                meta=meta, expected_identity=identity, mesh_xy=mesh)
+        with store.open_shared_pole_bank(path, mesh_xy=mesh) as io:
+            face, counts = store.read_line_panels(io, meta=meta, header=header, family="charge",
+                                                  sample=0, q_ids=[2, 0, 1])
+            batch, batch_counts = store.read_line_panels(io, meta=meta, header=header, family="charge",
+                                                         sample=0, q_ids=[1, 2, 2, 0],
+                                                         partition_spec=P(('x', 'y')))
+        assert counts.tolist() == [4, 1, 3] and batch_counts.tolist() == [3, 4, 4, 1]
+        for row, q in enumerate([2, 0, 1]):
+            assert bool(jnp.all(face[row] == panel[q])), (tier, row)
+        assert tuple(batch.sharding.spec)[0] == ('x', 'y')
+        got[tier] = (face, batch)
+    for tier in ("device", "pinned_host"):
+        for a, b in zip(got[tier], got["file"]):
+            assert bool(jnp.all(a == b)), tier
+            assert a.sharding.is_equivalent_to(b.sharding, a.ndim), tier
 
 
 def check_bank_roundtrip(mesh, path):
@@ -414,7 +452,9 @@ def test_bank_residence_tiers(monkeypatch, tmp_path):
     from types import SimpleNamespace
     import common.gpu_utils as gpu_utils
     from gw.shared_pole_screening import _bank_residence
+    import gw.shared_pole_directions as directions
     monkeypatch.setattr(store, "shared_pole_bank_payload_bytes", lambda *a, **k: 40)
+    monkeypatch.setattr(directions, "line_width_bounds", lambda *a, **k: {})
     mesh = SimpleNamespace(size=4)
     config = SimpleNamespace(debug=SimpleNamespace(write_w=False), backend=SimpleNamespace(linalg="local"))
     sym = SimpleNamespace(trs_allowed=True, q_irr_full_idx=np.arange(2))

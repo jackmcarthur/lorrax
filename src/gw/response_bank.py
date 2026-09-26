@@ -1158,16 +1158,19 @@ def _stream_workspace(wfns, meta, mesh_xy, support, *, q_ids, n_outputs, ordered
     return int(memory.temp_size_in_bytes)
 
 
-def response_group_size(meta, mesh_xy, *, n_samples, carry_per_sample, stream_workspace):
+def response_group_size(meta, mesh_xy, *, n_samples, carry_per_sample, stream_workspace,
+                        selection=(0, 0)):
     """Largest sample group whose carry and stream workspace fit the ledger.
 
     One route and no dial: every sample in one group when it fits (symmetric
     decks), otherwise the largest group that does (about four on a
     two-component deck without q symmetry, where the carry is G/2 Green tiles).
+    ``selection`` is the line selection's (resident, workspace) bytes, which
+    run beside the group's carry after its stream.
     """
     ledger = meta.shared_pole_capacity
-    fits = lambda g: ledger.preview(resident_bytes_per_rank=g*carry_per_sample,
-        workspace_bytes_per_rank=stream_workspace,
+    fits = lambda g: ledger.preview(resident_bytes_per_rank=g*carry_per_sample+int(selection[0]),
+        workspace_bytes_per_rank=max(stream_workspace, int(selection[1])),
         concurrent_with=ledger.live_stages)["device_budget_status"] == "PASS"
     if not fits(1):
         return 1   # admission refuses with the actual compiled bytes
@@ -1179,7 +1182,13 @@ def response_group_size(meta, mesh_xy, *, n_samples, carry_per_sample, stream_wo
 
 def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_io,
                         vertex=None, contact=None, direct_head=None, print_fn=print):
-    """Stage A: integrate value and derivative together, one frequency at a time."""
+    """Stage A: integrate value and derivative together, one frequency at a time.
+
+    A fitted line sample off the imaginary axis stores only its direction
+    panels: its directions are selected from W(z) itself and the constructor
+    reads nothing else from it (``gw.shared_pole_directions.LineSelection``).
+    Samples on the imaginary axis and held samples are stored dense.
+    """
     with timing.section('bank.setup', announce=True):
         header,qids,census = _bank_context(wfns,meta,sym,bank_io,mesh_xy)
         authenticate_sample_plan(sample_plan,header)
@@ -1190,15 +1199,16 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
         # conj in R space (the -q orientation); remote cells add the odd kernel.
         # ordered=True stores the physical orientation W_q = FT_q[W].
         ordered = vertex is not None or not bool(sym.trs_allowed)
-        if ordered != ("minus_q_partner" in header):
-            raise ValueError("GATE response_minus_q_partner: got: a bank whose minus-q partner fields "
-                             "disagree with the ordered route; want: W_q(-conj z) stored exactly when "
-                             "time reversal is broken; fix: rebuild the bank")
-        # W_q(-conj z) = conj(W_{-q}(z)) at each fitted line sample [p0, p1):
-        # the exact -q rows of the same stream, conjugated, through parent q's
-        # own V (and contact). An imaginary node is its own partner.
-        p0, p1 = (int(v) for v in header["minus_q_partner"]["sample_span"]) if ordered else (0, 0)
-        if p1 > p0:
+        if ordered != bool(header.get("ordered")):
+            raise ValueError("GATE response_representation: got: a bank whose ordered layout disagrees "
+                             "with the measured time reversal; fix: rebuild the bank")
+        # Line-panel samples [p0, p1). On the ordered route each one also needs
+        # its minus-q partner W_q(-conj z) = conj(W_{-q}(z)): the exact -q rows of
+        # the same stream, conjugated, through parent q's own V (and contact).
+        # An imaginary node is its own partner.
+        p0, p1 = (int(v) for v in header["line_panels"]["sample_span"])
+        partnered = ordered and p1 > p0
+        if partnered:
             from symmetry_maps import q_negation_index
             negative = np.asarray(q_negation_index((int(meta.nkx), int(meta.nky), int(meta.nkz))), dtype=np.int64)
             partner_qids = negative[qids]
@@ -1208,24 +1218,25 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                     coulomb=bank_io["coulomb"],
                     state_identity=bank_io["identity"],
                     operator="same original parent V and moment operator as Wc and M0..M3")
-            receipt["minus_q_partner"] = dict(header["minus_q_partner"],
+            receipt["minus_q_partner"] = dict(
+                sample_span=[p0, p1], value="W_q(-conj z) = conj(W_{-q}(z))",
                 operator_provenance=partner_provenance,
                 original_parent_count=len(qids),
                 full_q_rows=len(set(qids.tolist()+partner_qids.tolist())),
                 green_stream="union of exact q and minus-q output rows in the same response panel",
-                dyson="original parent V/contact for both; same moment operator")
+                dyson="original parent V/contact for both; consumed by the line selection, never stored")
 
         def panel_rows(first, last):
             rows = qids[first:last].tolist()
-            if p1 > p0:
+            if partnered:
                 rows = list(dict.fromkeys(rows+partner_qids[first:last].tolist()))
             return tuple(rows)
 
         def committed(sample):
-            done = np.asarray(header["sample_written"], bool)[:, sample].all()
             if p0 <= sample < p1:
-                done = done and np.asarray(header["minus_q_written"], bool)[:, sample-p0].all()
-            return bool(done)
+                return bool(np.asarray(header["line_written"], bool)[:, sample-p0].all())
+            row = dense_sample_rows(header, (sample,))[0]
+            return bool(np.asarray(header["sample_written"], bool)[:, row].all())
 
         n = meta.mu_basis.n_packed if vertex is None else vertex.n
         if ordered:
@@ -1234,7 +1245,9 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
         execute = _bank_execution(meta, mesh_xy, receipt, config, photon=vertex is not None)
         ledger = meta.shared_pole_capacity
         ambient = ledger.live_stages
-    from file_io.shared_pole_store import read_shared_pole_bank, shared_pole_bank_writer
+    from file_io.shared_pole_store import (dense_sample_rows, read_shared_pole_bank,
+                                           shared_pole_bank_writer)
+    from .shared_pole_execution import line_selection_execution
     response_rows = panel_rows(0, len(qids))
     row_index = {q: i for i, q in enumerate(response_rows)}
     face_bytes = 16*n*n//mesh_xy.size
@@ -1250,6 +1263,25 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
     else:
         roots = bank_io["photon_v"]
     carry_per_sample = 2*len(response_rows)*face_bytes
+    selection = None
+    if p1 > p0:
+        # The line selection runs beside one sample's carry; its route is
+        # admitted here so the group size below leaves room for it.
+        ledger.live_stages = ambient
+        rows = ([int(meta.mu_basis.n_packed)] if vertex is None else
+                [int(b.n_packed) * (3 if f else 1) for f, b in enumerate(bank_io["mu_bases"])])
+        execution, selection_resident, selection_workspace = line_selection_execution(
+            rows, mesh=mesh_xy, ledger=ledger, nq=len(qids), carry=carry_per_sample)
+        if vertex is None:
+            from .shared_pole_directions import charge_line_selection
+            selection = charge_line_selection(meta, mesh_xy=mesh_xy, ordered=ordered,
+                                              execution=execution, nq=len(qids))
+        else:
+            from .shared_pole_sectors import sector_line_selection
+            selection = sector_line_selection(bank_io, meta, mesh_xy=mesh_xy, execution=execution,
+                                              nq=len(qids))
+        receipt["line_selection"] = dict(execution=execution, samples=[p0, p1],
+            resident_bytes_per_rank=selection_resident, workspace_bytes_per_rank=selection_workspace)
     with timing.section('bank.window_geometry', announce=True,
                               label="shared-pole frequency rule construction"):
         solve_value, solve_slope, _, receipt["algebra"] = response_algebra(meta,config,
@@ -1261,14 +1293,74 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
         workspace = _stream_workspace(wfns, meta, mesh_xy, support, q_ids=response_rows,
             n_outputs=2*len(z), ordered=ordered, vertex=vertex)
         group_size = response_group_size(meta, mesh_xy, n_samples=len(z),
-            carry_per_sample=carry_per_sample, stream_workspace=workspace)
+            carry_per_sample=carry_per_sample, stream_workspace=workspace,
+            selection=(0, 0) if selection is None else (selection_resident, selection_workspace))
         rules = response_quadrature(meta, sample_plan, receipt, support,
                                     group_size=group_size, print_fn=print_fn)
     # The group accumulator is all-P sharded. Dense work and slab I/O batch
     # the irreducible parents of one frequency, with their own admission.
-    fields = (("Wc", "dWc_ds"), ("Wc_minus_q", "dWc_minus_q_ds"))
     progress = LoopProgress(len(z), print_fn, title="response frequency integration",
                             item_name="frequency", max_updates=len(z)).start()
+
+    def solve(raw, partner, q0, q1, bank_handle, sample, need_value=True):
+        """W and dW/ds of parents [q0, q1) at one sample, as the bank stores them."""
+        selected = (partner_qids if partner else qids)[q0:q1]
+        rows = np.asarray([row_index[int(q)] for q in selected])
+        span = (int(q0), int(q1))
+        h = roots[q0:q1]
+        constant = 0.
+        if vertex is not None:
+            io_started = time.monotonic()
+            constant = read_shared_pole_bank(bank_handle, span, meta=meta, header=header,
+                                            fields=("constant",))["constant"]
+            receipt["seconds"]["io"] = receipt["seconds"].get("io",0.)+time.monotonic()-io_started
+        head_update = None
+        if direct_head is not None and q0 == 0:
+            from .photon_direct_head import add_direct_gamma_field
+            head_update = direct_head["constant"] + (
+                direct_head["Wc_minus_q"][sample] if partner
+                else direct_head["Wc"][sample])
+            def gamma_add(packed, coefficient):
+                return add_direct_gamma_field(packed, coefficient,
+                    gamma_vectors=direct_head["gamma_vectors"],
+                    layout=bank_io["photon_layout"], mesh=mesh_xy)
+        if need_value:
+            chi_value = raw[0,rows]
+            if partner:
+                chi_value = jnp.conj(chi_value)
+            value = execute(solve_value, (h,chi_value)+(() if vertex is None else (contact,)),
+                            "sample_dyson") - constant
+        else:
+            io_started = time.monotonic()
+            saved = read_shared_pole_bank(bank_handle, span, meta=meta, header=header,
+                sample_span=(sample,sample+1), fields=("Wc",))
+            receipt["seconds"]["io"] = receipt["seconds"].get("io",0.)+time.monotonic()-io_started
+            value = saved["Wc"][:,0]
+            del saved
+            if head_update is not None:
+                value = gamma_add(value, -head_update)
+        chi = raw[1,rows]
+        if partner:
+            chi = jnp.conj(chi)
+        w = value if vertex is None else value+constant
+        slope = execute(solve_slope, (h, w, chi), "sample_slope")
+        del chi, w
+        if head_update is not None:
+            coefficient = (direct_head["dWc_minus_q_ds"][sample]
+                           if partner else direct_head["dWc_ds"][sample])
+            slope = gamma_add(slope, coefficient)
+            value = gamma_add(value, head_update)
+        if need_value and not partner:
+            if vertex is not None:
+                _photon_sample_norms(receipt,value,q0,sample,bank_io["photon_layout"],mesh_xy)
+            for iq in range(q0,q1):
+                part = slice(iq-q0,iq-q0+1)
+                if vertex is None:
+                    _reciprocity_census(receipt,value[part],z[sample:sample+1],int(qids[iq]),iq,meta)
+                    if ordered and _self_negative(int(qids[iq]),meta):
+                        _tr_odd_census(receipt,solve_value,h[part],chi_value[part],value[part],z[sample:sample+1],int(qids[iq]))
+        return value, slope
+
     for group in rules["plan"]["groups"]:
         members = [int(m) for m in group["members"]]
         if all(committed(m) for m in members):
@@ -1291,9 +1383,35 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                     progress.step()
                     continue
                 raw = raw_group[2*row:2*row+2]
-                for partner in ((0, 1) if p0 <= sample < p1 else (0,)):
-                    marked = (np.asarray(header["minus_q_written"], bool)[:,sample-p0] if partner
-                              else np.asarray(header["sample_written"], bool)[:,sample])
+                if p0 <= sample < p1:
+                    # Select from W(z) itself, then act with the minus-q partner on
+                    # the same directions; only the panels reach the bank.
+                    if np.asarray(header["line_written"], bool)[:, sample-p0].any():
+                        raise ValueError(f"GATE response_line_panel: sample {sample} is partly committed; "
+                                         "a line sample commits every parent at once; fix: rebuild the bank")
+                    stage, _ = _reserve(meta, "line_selection", selection_resident, selection_workspace)
+                    live = ledger.live_stages
+                    ledger.live_stages = live + (stage,)
+                    started_selection = time.monotonic()
+                    value, slope = solve(raw, 0, 0, len(qids), bank_handle, sample)
+                    lines = selection.select(sample, value, slope)
+                    del value, slope
+                    if ordered:
+                        value, slope = solve(raw, 1, 0, len(qids), bank_handle, sample)
+                        selection.mirror(sample, lines, value, slope)
+                        del value, slope
+                    panels = selection.panels(sample, lines)
+                    del lines
+                    receipt["seconds"]["line_selection"] = (receipt["seconds"].get("line_selection", 0.)
+                                                             + time.monotonic() - started_selection)
+                    io_started = time.monotonic()
+                    write(q_span=(0, len(qids)), line=panels)
+                    receipt["seconds"]["io"] = receipt["seconds"].get("io",0.)+time.monotonic()-io_started
+                    ledger.live_stages = live
+                    del panels
+                else:
+                    dense_row = dense_sample_rows(header, (sample,))[0]
+                    marked = np.asarray(header["sample_written"], bool)[:, dense_row]
                     # A fresh frequency is one q_irr slab. Partial restarts keep
                     # contiguous rows with identical value/slope masks together.
                     edges = np.r_[0, 1+np.flatnonzero(np.any(marked[1:] != marked[:-1], axis=1)), len(qids)]
@@ -1302,70 +1420,14 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                         if not (need_value or need_slope):
                             continue
                         span = (int(q0), int(q1))
-                        selected = (partner_qids if partner else qids)[q0:q1]
-                        rows = np.asarray([row_index[int(q)] for q in selected])
-                        h = roots[q0:q1]
-                        constant = 0.
-                        if vertex is not None:
-                            io_started = time.monotonic()
-                            constant = read_shared_pole_bank(bank_handle, span, meta=meta, header=header,
-                                                            fields=("constant",))["constant"]
-                            receipt["seconds"]["io"] = receipt["seconds"].get("io",0.)+time.monotonic()-io_started
-                        head_update = None
-                        if direct_head is not None and q0 == 0:
-                            from .photon_direct_head import add_direct_gamma_field
-                            head_update = direct_head["constant"] + (
-                                direct_head["Wc_minus_q"][sample] if partner
-                                else direct_head["Wc"][sample])
-                            def gamma_add(packed, coefficient):
-                                return add_direct_gamma_field(packed, coefficient,
-                                    gamma_vectors=direct_head["gamma_vectors"],
-                                    layout=bank_io["photon_layout"], mesh=mesh_xy)
-                        if need_value:
-                            chi_value = raw[0,rows]
-                            if partner:
-                                chi_value = jnp.conj(chi_value)
-                            value = execute(solve_value, (h,chi_value)+(() if vertex is None else (contact,)),
-                                            "sample_dyson") - constant
-                        else:
-                            io_started = time.monotonic()
-                            saved = read_shared_pole_bank(bank_handle, span, meta=meta, header=header,
-                                sample_span=(sample,sample+1), fields=(fields[partner][0],))
-                            receipt["seconds"]["io"] = receipt["seconds"].get("io",0.)+time.monotonic()-io_started
-                            value = saved[fields[partner][0]][:,0]
-                            del saved
-                            if head_update is not None:
-                                value = gamma_add(value, -head_update)
+                        value, slope = solve(raw, 0, q0, q1, bank_handle, sample, need_value=need_value)
+                        io_started = time.monotonic()
                         if need_slope:
-                            chi = raw[1,rows]
-                            if partner:
-                                chi = jnp.conj(chi)
-                            w = value if vertex is None else value+constant
-                            slope = execute(solve_slope, (h, w, chi), "sample_slope")
-                            if head_update is not None:
-                                coefficient = (direct_head["dWc_minus_q_ds"][sample]
-                                               if partner else direct_head["dWc_ds"][sample])
-                                slope = gamma_add(slope, coefficient)
-                            io_started = time.monotonic()
-                            write(q_span=span, sample_span=(sample,sample+1), **{fields[partner][1]: slope[:,None]})
-                            receipt["seconds"]["io"] = receipt["seconds"].get("io",0.)+time.monotonic()-io_started
-                            del chi, w, slope
+                            write(q_span=span, sample_span=(sample,sample+1), dWc_ds=slope[:,None])
                         if need_value:
-                            if head_update is not None:
-                                value = gamma_add(value, head_update)
-                            if vertex is not None and not partner:
-                                _photon_sample_norms(receipt,value,q0,sample,bank_io["photon_layout"],mesh_xy)
-                            for iq in range(q0,q1):
-                                part = slice(iq-q0,iq-q0+1)
-                                if vertex is None:
-                                    _reciprocity_census(receipt,value[part],z[sample:sample+1],int(qids[iq]),iq,meta)
-                                    if ordered and _self_negative(int(qids[iq]),meta):
-                                        _tr_odd_census(receipt,solve_value,h[part],chi_value[part],value[part],z[sample:sample+1],int(qids[iq]))
-                            io_started = time.monotonic()
-                            write(q_span=span, sample_span=(sample,sample+1), **{fields[partner][0]: value[:,None]})
-                            receipt["seconds"]["io"] = receipt["seconds"].get("io",0.)+time.monotonic()-io_started
-                            del chi_value
-                        del value, h, constant
+                            write(q_span=span, sample_span=(sample,sample+1), Wc=value[:,None])
+                        receipt["seconds"]["io"] = receipt["seconds"].get("io",0.)+time.monotonic()-io_started
+                        del value, slope
                 receipt["batches"].append(dict(sample=sample, group=members))
                 del raw
                 progress.step()

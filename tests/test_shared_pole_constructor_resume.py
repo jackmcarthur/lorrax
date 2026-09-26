@@ -87,3 +87,19 @@ def test_photon_constructor_resume_requires_complete_bound_bank(tmp_path, monkey
     receipt['bank_complete'] = False
     receipt_path.write_text(json.dumps(receipt))
     assert not _authenticated_constructor_resume(root, identity, recipe, photon=True)
+
+
+def test_constructor_resume_rebuilds_a_retired_bank_schema(tmp_path, monkeypatch):
+    """A complete v2 bank (dense line samples) is refused by name, so resume rebuilds it."""
+    identity = {'iteration_id': 'sc_0000', 'hamiltonian': 'map:abc'}
+    root = tmp_path/'sc_0000_shared_pole'
+    _plant(root, identity)
+    seen = []
+
+    def header(path):
+        seen.append(path)
+        return {'schema': 'lorrax.shared-real-pole-bank.v2', 'identity': identity, 'complete': True}
+
+    monkeypatch.setattr(store, '_read_header', header)
+    assert not _authenticated_constructor_resume(root, identity, {'eta_ev': 0.2})
+    assert seen == [root/'bank.h5']

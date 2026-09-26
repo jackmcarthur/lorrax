@@ -14,6 +14,7 @@ One :class:`ConstructorCapacity` belongs to one construction. It owns no array:
 from __future__ import annotations
 
 import math
+from functools import lru_cache
 
 import numpy as np
 
@@ -98,6 +99,17 @@ def shared_pole_byte_terms(meta, *, mesh_xy, resolution, pencil_side,
             "sample_face_count": sample_faces}
 
 
+@lru_cache(maxsize=None)
+def constructor_eigenplan(mesh_xy, side, execution):
+    """The eigh service plan of a constructor layout: whole parents per rank
+    ('local', the q-local kernel) or the complete mesh ('face')."""
+    import distrib_la
+
+    return distrib_la.plan("eigh", mesh_xy, n=int(side),
+        backend="distributed" if execution == "face" else "off",
+        batched_route="auto" if execution == "face" else "batch_reshard")
+
+
 def _shard_bytes(array):
     return int(np.prod(array.sharding.shard_shape(array.shape))) * array.dtype.itemsize
 
@@ -150,7 +162,6 @@ class ConstructorCapacity:
         self._ledger = ledger
         self._upstream = tuple(upstream)
         self._n = int(meta.n_rmu_padded)
-        self._plans = {}
         self.native_queries = {}
         self._native_maxima = {"eigh": 0}
         self._workspace = 0
@@ -161,14 +172,7 @@ class ConstructorCapacity:
 
     def eigenplan(self, side):
         """One service plan per configured execution layout and actual side."""
-        import distrib_la
-
-        key = self.execution, side
-        if key not in self._plans:
-            self._plans[key] = distrib_la.plan("eigh", self._mesh_xy, n=side,
-                backend="distributed" if self.execution == "face" else "off",
-                batched_route="auto" if self.execution == "face" else "batch_reshard")
-        return self._plans[key]
+        return constructor_eigenplan(self._mesh_xy, int(side), self.execution)
 
     def query_workspace(self, op, shapes, plan):
         """Native workspace bytes per rank for one op at one shape, cached."""
