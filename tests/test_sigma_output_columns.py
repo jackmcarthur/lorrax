@@ -187,7 +187,7 @@ def test_lorentz_column_closure_refuses_a_bad_decomposition(tmp_path):
 def test_z_column_records_raw_value_and_the_qp_status(tmp_path):
     out = tmp_path / "z_status.dat"
     z = np.full((NK, NB), 0.8)
-    status = np.full((NK, NB), "QP")
+    status = np.full((NK, NB), "QP", dtype="<U11")
     z[1, 2] = -55.8582348939
     status[1, 2] = "RES_Z"
     write_sigma_to_file(
