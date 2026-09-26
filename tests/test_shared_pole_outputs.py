@@ -116,6 +116,63 @@ def test_shared_pole_outputs(tmp_path):
     check_outputs(tmp_path)
 
 
+def test_w_export_copies_line_panels(tmp_path):
+    """write_w exports a bank as stored: a line support's panels and counts, the dense samples, the moments."""
+    from test_shared_pole_bank import _panel
+    root = Path(tmp_path)
+    mesh, meta, tables, recipe, identity = _bank_fixture()
+    recipe.update(
+        z_ry=np.asarray([0.3+0.1j, 0.1j, 0.2+0.1j], dtype=np.complex128),
+        role=np.asarray([0, 1, 3], dtype=np.int8),
+        distinct_id=np.asarray([0, 1, 2], dtype=np.int64),
+        held=np.asarray([False, False, True], dtype=np.bool_),
+        support_pair=np.asarray([[-1,-1],[-1,-1],[0,1]], dtype=np.int64),
+        fit_ids=np.asarray([0, 1], dtype=np.int64),
+        held_ids=np.asarray([2], dtype=np.int64))
+    from gw.shared_pole_recipe import CapacityLedger
+    meta.shared_pole_capacity = CapacityLedger(meta, mesh_xy=mesh, device_budget_bytes=1 << 22)
+    meta.shared_pole_capacity.reserve("fixture_live_bound", resident_bytes_per_rank=4096, workspace_bytes_per_rank=0)
+    meta.shared_pole_capacity.live_stages = ("fixture_live_bound",)
+    _, packed, poles, counts = _model(meta)
+    source = root / "model.h5"
+    header = store.write_shared_pole_model(source,
+        _device(packed, mesh, P(None, 'x', None, 'y')),
+        _device(poles, mesh, P()), counts, q_span=(0, 3),
+        meta=meta, tables=tables, recipe=recipe, receipts=dict(identity=identity))
+    bank = root / "bank.h5"
+    store.initialize_shared_pole_bank(bank, meta=meta, tables=tables,
+        recipe=recipe, identity=identity, mesh_xy=mesh)
+    for q in range(3):
+        for i in (1, 2):
+            value = _matrix(meta, mesh, samples=True, value=q+i)
+            store.write_shared_pole_bank(bank, q_span=(q, q+1), sample_span=(i, i+1),
+                Wc=value, dWc_ds=-value, meta=meta, expected_identity=identity, mesh_xy=mesh)
+        value = _matrix(meta, mesh, samples=False, value=q+3)
+        store.write_shared_pole_bank(bank, q_span=(q, q+1), M1=value, M3=2*value,
+            meta=meta, expected_identity=identity, mesh_xy=mesh)
+    store.write_shared_pole_bank(bank, q_span=(0, 3), line=dict(
+        sample=0, panels={"charge": _panel(meta, mesh, fields=5, width=2, value=9, nq=3)},
+        counts={"charge": np.asarray([2, 1, 2])}), meta=meta, expected_identity=identity, mesh_xy=mesh)
+    wfn = root / "WFN.h5"
+    def make_wfn():
+        with h5py.File(wfn, "w") as f:
+            f.create_group("mf_header").create_dataset("crystal/avec", data=np.eye(3))
+    rank0_transaction(wfn, stage="test.output_wfn_line", write=make_wfn)
+    handle = dict(path=str(source), identity=identity, digest=header['digest'])
+    outputs = store.export_shared_pole_outputs(handle, meta=meta,
+        config=SimpleNamespace(write_poles=False, debug=SimpleNamespace(write_w=True)), mesh_xy=mesh,
+        source_wfn=wfn, run_dir=root, label="export", tables=tables, print_fn=print)
+    exported = store.validate_shared_pole_bank(outputs['w']['path'], expected_identity=identity,
+        mesh_xy=mesh, require_complete=True)
+    assert exported["line_panels"]["counts"]["charge"] == [[2], [1], [2]]
+    assert exported["line_panels"]["width"]["charge"] == [2]
+    def compare():
+        with h5py.File(bank, 'r') as a, h5py.File(outputs['w']['path'], 'r') as b:
+            for field in ('Wc', 'dWc_ds', 'M1', 'M3', store.line_panel_name("charge", 0)):
+                assert a[field][()].tobytes() == b[field][()].tobytes(), field
+    rank0_transaction(root, stage="test.output_compare_line", write=compare)
+
+
 def _export_fixture(root):
     """One authenticated model/bank/WFN triple an export can be driven from."""
     root = Path(root)
