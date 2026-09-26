@@ -141,9 +141,18 @@ def _refuse_head_representation(*, trs_allowed, nspinor):
 
 
 def shared_pole_head_plan(config, recipe, *, material_class):
-    """Use the MPA sample-plan owner on the current logical energy span."""
+    """Use the MPA sample-plan owner on the current logical energy span.
+
+    The span is snapped up onto the build grid (``snap_outward``), so the
+    head sample nodes are a function of a grid cell, not of the exact span.
+    The head Loewner fit runs at condition ~1e11, and an exact span let one
+    ulp of the SC input move every node by one ulp and the fitted head poles
+    by ~1e-5 relative: CrI3 8x8 SC map-1 conduction eqp moved ~0.1 meV.
+    """
     from .mpa.model import make_mpa_plan
-    return make_mpa_plan(config, SimpleNamespace(x_max=recipe["census"]["energy_span_ry"]),
+    from .sigma_box_plan import snap_outward
+    span = snap_outward(float(recipe["census"]["energy_span_ry"]), 1., +1)
+    return make_mpa_plan(config, SimpleNamespace(x_max=span),
                          material_class=material_class)
 
 

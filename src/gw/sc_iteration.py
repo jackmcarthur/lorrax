@@ -2879,7 +2879,10 @@ def _fit_sum_band_tail(fit_kwargs, fit_mask_kn, sigma0_kn, z_kn=None):
     carried weights of the previous map): a state riding a satellite or
     pole has small Z and cannot drag the tail, and a state with Z outside
     (0, 1] is not a quasiparticle and is dropped.  ``z_kn=None`` (map 0) is
-    unit weight, bit for bit the plain mean.
+    unit weight, bit for bit the plain mean.  The upper bound is read on the
+    build grid (``snap_outward``, 1e-4 cells): a flat-Sigma state sits at
+    Z = 1 to within its finite-difference noise, and an exact ``z <= 1`` let
+    round-off drop it and move the tail law (Fe 4^3 SC: n = 76 vs 75).
 
     No qualifying conduction state: no tail law (E_DFT), said in the log.
     Never a previous map's law: the map reads only its carry
@@ -2891,8 +2894,11 @@ def _fit_sum_band_tail(fit_kwargs, fit_mask_kn, sigma0_kn, z_kn=None):
     mask = fit_mask_kn & ~sigma0_kn
     weights = None
     if z_kn is not None:
+        from .sigma_box_plan import snap_outward
         z = np.asarray(z_kn, dtype=np.float64)
-        quasiparticle = np.isfinite(z) & (z > 0.0) & (z <= 1.0)
+        finite_z = np.where(np.isfinite(z) & (z > 0.0), z, 0.0)
+        z_down = np.vectorize(lambda x: snap_outward(x, 1., -1))(finite_z)
+        quasiparticle = np.isfinite(z) & (z > 0.0) & (z_down <= 1.0)
         mask = mask & quasiparticle
         weights = np.where(quasiparticle, z, 1.0)
     fit = fit_scissor(fit_mask_kn=mask, state_weights_kn=weights, **fit_kwargs)
