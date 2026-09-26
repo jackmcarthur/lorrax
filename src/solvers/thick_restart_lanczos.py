@@ -75,7 +75,7 @@ Gram-Schmidt passes (CGS2). The active subspace service contracts only that
 prefix, retaining the batched-reduction design from
 ``perf/reorth-batch-2026-08-08``. The fixed-shape reference uses a mask
 ``arange(m_max+1) <= j`` instead. This is **two collectives per
-Lanczos step** carrying an ``(m_max+1,)`` payload, against the shipped MGS
+Lanczos step** carrying an ``(m_max+1,)`` payload, against a per-vector
 sweep's ``j+1`` collectives each carrying a 16-byte scalar.  Thick restart does
 not merely benefit from this, it *requires* full reorthogonalisation: the
 retained Ritz block is not part of any three-term recurrence, so nothing else

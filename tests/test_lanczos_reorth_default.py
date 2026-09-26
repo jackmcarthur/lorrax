@@ -15,10 +15,10 @@ Cells and the failure each one catches:
 * ``test_sentinel_is_resolved_before_both_consumers`` -- THE RED TWIN for the
   semantic trap: ``_reorth_window`` and ``_announce_reorth`` both read
   ``n_reorth`` RAW, so if the resolver stops running first the mask goes EMPTY
-  and the announced collective count goes to ZERO, both silently.  The cell
-  drives -1 through BOTH routes and checks the announced count and the mask
-  width against the resolved value, then proves the two consumers really are
-  unsafe against the raw sentinel.
+  and the announced window reads -1, both silently.  The cell drives -1
+  through and checks the announced window and the mask width against the
+  resolved value, then proves the mask really is unsafe against the raw
+  sentinel.
 * ``test_the_default_beats_a_short_window`` -- the measurement behind the flip.
 * ``test_krylov_clamp_caps_at_the_vector_space`` -- running past Krylov
   exhaustion, which manufactures Ritz values below the true spectrum.
@@ -96,14 +96,13 @@ def test_resolve_n_reorth_maps_the_sentinel_and_none():
 # THE RED TWIN for the semantic trap
 # --------------------------------------------------------------------------
 
-@pytest.mark.parametrize("kind", ["cgs2", "mgs"])
-def test_sentinel_is_resolved_before_both_consumers(capsys, kind):
+def test_sentinel_is_resolved_before_both_consumers(capsys):
     """-1 must never reach ``_reorth_window`` or ``_announce_reorth``.
 
     Both read ``n_reorth`` as a WIDTH.  Fed the raw sentinel, the first builds
     ``idx >= j + 1`` -- empty once intersected with ``idx <= j``, i.e. full
-    reorth silently becomes NO reorth -- and the second announces ZERO
-    collectives, so the log a reader would use to catch the first lies too.
+    reorth silently becomes NO reorth -- and the second announces a -1
+    window, so the log a reader would use to catch the first lies too.
     """
     n, max_iter = 48, 12
     H, _ = _hermitian(n)
@@ -112,9 +111,9 @@ def test_sentinel_is_resolved_before_both_consumers(capsys, kind):
     capsys.readouterr()
     jax.block_until_ready(LZ.lanczos_eig_jit(
         mv, n, n_eig=4, max_iter=max_iter, n_reorth=LZ.FULL_REORTH,
-        reorth=kind, seed=3))
+        seed=3))
     line = capsys.readouterr().out
-    expect = LZ.reorth_collective_count(kind, max_iter, max_iter)
+    expect = LZ.reorth_collective_count(max_iter)
     if jax.process_index() == 0:
         assert f"n_reorth={max_iter}" in line, (
             f"the sentinel reached the announce unresolved: {line!r}")
@@ -129,16 +128,13 @@ def test_sentinel_is_resolved_before_both_consumers(capsys, kind):
         assert int(sel.sum()) == min(j, resolved) + 1, (j, sel)
         assert sel[j], j
 
-    # RED TWIN: the two consumers really are unsafe against the raw sentinel,
+    # RED TWIN: the mask really is unsafe against the raw sentinel,
     # so removing the resolve call is caught by the assertions above rather
     # than sailing through as "well, -1 probably means something sensible".
     raw = np.asarray(LZ._reorth_window(5, 24, LZ.FULL_REORTH))
     assert not raw.any(), (
         "RED TWIN DID NOT GO RED: the raw sentinel no longer empties the "
         "window mask, so this cell has stopped proving the resolver matters")
-    assert LZ.mgs_trip_count(max_iter, LZ.FULL_REORTH) == 0, (
-        "RED TWIN DID NOT GO RED: the raw sentinel no longer zeroes the "
-        "announced collective count")
 
 
 def test_the_default_and_an_explicit_full_window_agree(capsys):
