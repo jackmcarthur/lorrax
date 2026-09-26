@@ -759,7 +759,7 @@ def _compute_V_q_g_flat_tiles(
               n_sub=n_sub if s['one_leg'] else 0) for s in specs],
         rows=mu_pad, n_q=n_q_ibz, ngkmax=ngkmax, mesh_xy=mesh_xy,
         g_chunk=g_chunk, budget_bytes=budget, host_budget_bytes=host_budget)
-    record_stage_price("V_q, vq_tile_bytes", live + priced['priced'])
+    record_stage_price(f"V_q, vq_tile_bytes q_tile={q_tile}", live + priced['priced'])
     n_chunks = -(-ngkmax // g_chunk)
     n_tiles = int(priced['n_tiles'])
     if verbose and jax.process_index() == 0:

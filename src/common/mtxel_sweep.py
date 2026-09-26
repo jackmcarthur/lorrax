@@ -1570,7 +1570,7 @@ def _band_chunk(geom, ops, nb_rank: int, step_bytes: float) -> int:
     fit = max(1, int((_BOX_ROOM_FRACTION * room - step_bytes) // box))
     n_chunks = -(-nb_rank // min(fit, nb_rank))
     chunk = -(-nb_rank // n_chunks)
-    record_stage_price("matrix-element sweep, plan_sweep",
+    record_stage_price(f"matrix-element sweep, plan_sweep {chunk}/{nb_rank} bands",
                        device_budget_bytes() - room + step_bytes + chunk * box)
     return chunk
 
