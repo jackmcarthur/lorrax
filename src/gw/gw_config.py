@@ -2552,11 +2552,16 @@ def _input_response(
             params["occupation_window_threshold"]),
         fit_reuse_file=(str(params["mpa_fit_reuse_file"]) or None),
     )
+    # A patch list sets both edges before the config (and its cover-only
+    # refusal for unset edges) is built.
+    _edges = [params["sigma_omega_min_ev"], params["sigma_omega_max_ev"]]
+    _patches = DynamicSigmaConfig.parse_omega_patches_ev(
+        params["sigma_omega_patches_ev"], float(params["sigma_omega_step_ev"]))
+    if _patches:
+        _edges = [_patches[0][0], _patches[-1][1]]
     sigma = DynamicSigmaConfig(
-        omega_min_ev=(None if params["sigma_omega_min_ev"] is None
-                      else float(params["sigma_omega_min_ev"])),
-        omega_max_ev=(None if params["sigma_omega_max_ev"] is None
-                      else float(params["sigma_omega_max_ev"])),
+        omega_min_ev=None if _edges[0] is None else float(_edges[0]),
+        omega_max_ev=None if _edges[1] is None else float(_edges[1]),
         omega_step_ev=float(params["sigma_omega_step_ev"]),
         regularization_ev=float(params["sigma_regularization_ev"]),
         out_of_grid=str(params["sigma_out_of_grid"]).strip().lower(),
@@ -2586,11 +2591,6 @@ def _input_response(
                 params["sigma_band_extrapolation"],
                 print_fn=_print_deck_report))),
     )
-    _patches = sigma.parsed_omega_patches_ev()
-    if _patches:
-        sigma = _dc_replace(
-            sigma, omega_min_ev=float(_patches[0][0]),
-            omega_max_ev=float(_patches[-1][1]))
     _occ_width = params["occ_smearing_width_ry"]
     _occ_width = float(_occ_width) if _occ_width is not None else None
     _validate_occupation_smearing(screening, _occ_width)
@@ -4105,7 +4105,12 @@ class DynamicSigmaConfig:
 
     def parsed_omega_patches_ev(self):
         """The validated ``[(lo, hi), ...]`` patch list, or ``[]``; see docs/architecture/decisions.md."""
-        text = str(self.omega_patches_ev or "").strip()
+        return self.parse_omega_patches_ev(self.omega_patches_ev, self.omega_step_ev)
+
+    @staticmethod
+    def parse_omega_patches_ev(text, step_ev):
+        """Parse a ``sigma_omega_patches_ev`` spelling at ``step_ev``; see :meth:`parsed_omega_patches_ev`."""
+        text = str(text or "").strip()
         if not text:
             return []
         patches = []
@@ -4125,11 +4130,11 @@ class DynamicSigmaConfig:
                     f"with hi > lo in eV; could not parse {piece!r}")
             patches.append((lo, hi))
         for (l0, h0), (l1, h1) in zip(patches, patches[1:]):
-            if l1 < h0 + self.omega_step_ev:
+            if l1 < h0 + step_ev:
                 raise ValueError(
                     "sigma_omega_patches_ev patches must be ascending and "
                     f"separated by at least one step; [{l0}:{h0}] then "
-                    f"[{l1}:{h1}] at step {self.omega_step_ev}. Merge "
+                    f"[{l1}:{h1}] at step {step_ev}. Merge "
                     "them into one patch instead.")
         return patches
 
