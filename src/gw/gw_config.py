@@ -1660,7 +1660,7 @@ _DEFAULTS = {
     # budget.  Its immutable rules are cached under the run's tmp directory
     # by default; "off" disables caching and any other spelling is a path
     # (relative paths are resolved beside the input deck).
-    "sigma_quadrature_eps": 1.0e-4,
+    "sigma_quadrature_eps": 3.0e-5,
     "sigma_quadrature_cache_dir": "auto",
     # OCCUPANCY at which a band leaves a metallic Green's-function branch.
     # The Σ planner cuts on the branch WEIGHT (f on val, 1−f on cond), so
@@ -2321,7 +2321,7 @@ def _resolve_shared_pole_inputs(params):
             "  study dial; leave it empty for production.\n"
             "  ==========================================================")
     # sigma_quadrature_eps means one thing on every Sigma route; a tier only
-    # supplies a default when the deck omits the key (relaxed: 1e-3).
+    # supplies a default when the deck omits the key (relaxed: 5e-4).
     from .shared_pole_recipe import SIGMA_EPS_DEFAULT
     default_eps = SIGMA_EPS_DEFAULT.get(params["sigma_w_accuracy"])
     if default_eps is not None and "sigma_quadrature_eps" not in named:
@@ -3024,7 +3024,7 @@ def _report_early_retired_keys(
             ("mpa_sigma_sector_target_error",
              "MPA Sigma uses one uniform denominator-box rule per product "
              "window and has no measured-sector error apportionment. Remove "
-             "the key and use sigma_quadrature_eps (default 1e-4)."),
+             "the key and use sigma_quadrature_eps (default 3e-5)."),
             ("mpa_sigma_max_nodes",
              "the pair ceiling is gone and the box plan never refuses on "
              "count. Remove the key; sigma_quadrature_eps is the only "
@@ -3996,7 +3996,7 @@ class DynamicSigmaConfig:
     #: an explicit support geometry for support-rule studies.  Parsed and
     #: gated by ``gw.shared_pole_recipe.parse_support_sites``.
     w_support_sites_ev: str = _DEFAULTS["sigma_w_support_sites_ev"]
-    quadrature_eps: float = 1.0e-4
+    quadrature_eps: float = _DEFAULTS["sigma_quadrature_eps"]
     quadrature_cache_dir: str = "auto"
     #: ``sigma_omega_patches_ev``: "" (default, the contiguous
     #: [min, max] grid) or "lo:hi, lo:hi, ..." — a union of uniform

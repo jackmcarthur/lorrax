@@ -165,8 +165,9 @@ mass-weighted fit is what loses such a state.
 | sign-definite | relative | sup_box \|d\| \|Q(d) − 1/d\| ≤ ε |
 
 ε is `sigma_quadrature_eps`, the only accuracy dial, read the same way on
-every Σ route (GN/HL-PPM, MPA, shared pole). Defaults are in the
-[input reference](../input_reference.md).
+every Σ route (GN/HL-PPM, MPA, shared pole). The default is 3·10⁻⁵ (the
+`relaxed` shared-pole tier defaults to 5·10⁻⁴); the
+[input reference](../input_reference.md) owns both.
 
 Because the windows partition the tuples, a state's delivered error is one
 factor of its own matrix elements M_np times the certificate:
@@ -200,7 +201,7 @@ nodes that cover a long side leave the real axis and damp it. For a symmetric
 box of half-width A,
 
 $$
-N\approx1.04\,\frac{A}{\eta_{\min}}\,\frac{\ln(0.086/\varepsilon)}{\pi}\approx2.2\,\frac{A}{\eta_{\min}}\quad(\varepsilon=10^{-4}),
+N\approx1.04\,\frac{A}{\eta_{\min}}\,\frac{\ln(0.086/\varepsilon)}{\pi}\approx2.6\,\frac{A}{\eta_{\min}}\quad(\varepsilon=3\cdot10^{-5}),
 $$
 
 which is within a constant of the band-limit floor (bandwidth × horizon/π).
@@ -235,7 +236,7 @@ The planner accepts a rule for a window only if all three hold:
 2. **Runtime noise.** With a per-term relative perturbation ε_rt = 6·10⁻⁸,
    ε_rt · max_{d∈∂box} ρ(d) Σ_l |w_l e^{i t_l d}| ≤ 5·10⁻⁶, where ρ = |d| on a
    sign-definite box and ρ = η_min on a crossing one. The budget is absolute
-   (production's 0.05 × 10⁻⁴): roundoff is set by the executor's arithmetic,
+   (0.05 × the former 10⁻⁴ default): roundoff is set by the executor's arithmetic,
    not by ε, so a tighter ε does not tighten it. The noise mass is
    subharmonic, so its maximum is on the boundary, sampled at the rule's own
    horizon. Sign-definite rules are built under the cancellation cap that

@@ -177,7 +177,7 @@ def test_unused_elementwise_inputs(tmp_path, entry):
 
 
 @pytest.mark.parametrize('tier,deck,want', [
-    ('production', '', 1e-4), ('relaxed', '', 1e-3),
+    ('production', '', 3e-5), ('relaxed', '', 5e-4),
     ('production', 'sigma_quadrature_eps=1e-5\n', 1e-5),
     ('relaxed', 'sigma_quadrature_eps=1e-4\n', 1e-4)])
 def test_deck_epsilon_is_the_one_key(tmp_path, tier, deck, want):
