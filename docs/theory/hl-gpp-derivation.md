@@ -93,7 +93,7 @@ algebra, and the shared one-pole route through
 | condition | why |
 |---|---|
 | `ppm_omega_p` at or below the largest transition energy | the real-axis $\chi_0$ rule (`build_real_quadrature`) needs $\Omega>x_{\max}$; below it the probe sits in the spectrum |
-| metallic WFN occupations | GN/HL-PPM split bands by a 0/1 step (`gw_config.validate_material_inputs`) |
+| metallic WFN occupations | GN/HL-PPM split bands by a 0/1 step (`gw_config.validate_material_inputs`; [input reference](../input_reference.md)) |
 | `screening_diagrams = w_bse` or `w_rpa_resolvent` | a real-axis resolvent $(z-H)^{-1}$ needs a broadening policy the ladder does not have |
 
 On a time-reversal-broken deck HL runs the single-residue fit: $W_c$ at a real

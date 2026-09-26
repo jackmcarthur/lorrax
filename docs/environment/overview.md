@@ -27,9 +27,7 @@ native library is built and reached.
 | Frontera CPU (CLX) | apptainer image + staged runtime bundle + Intel MPI (layers below) | `config/frontera/templates/gw_dev.sbatch` |
 | another SLURM cluster | `config/<cluster>/` | [`config/README.md`](../../config/README.md) §Porting |
 
-The FFI layer is required on every platform: a missing or unloadable
-library refuses at startup in `Gate.enforce`, naming the `.so`
-([decisions](../architecture/decisions.md)).
+The FFI layer is required on every platform ([Installation](../installation/index.md)).
 
 ### The Frontera CPU layer stack {#layer-stack}
 
