@@ -16,8 +16,9 @@ channel algebra and the kernel plumbing around it.
 
 The module-level kernel caches are co-located with the factories that read
 them.  :func:`get_sigma_spatial_kernel` is the reusable
-``G_k x W_q -> Sigma`` owner, and :func:`get_shared_sigma_tau_kernel` is the
-only dynamic-pole synthesis wrapper used by ``gw.mpa.sigma``.
+``G_k x W_q -> Sigma`` owner, :func:`get_shared_sigma_tau_kernel` is the
+resident pole route's τ body, and a shared-pole model's W synthesis rides the
+same ``sigma_kij`` through ``gw.mpa.sigma.SynthesisTau``.
 """
 
 from __future__ import annotations
@@ -32,9 +33,7 @@ import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 import numpy as np
 
-from common import timing
 from common.jax_compile_cache import ensure_jax_compile_cache
-from runtime.env_flags import env_bool
 
 
 _sigma_kij_kernel_cache: dict[tuple[object, ...], Callable[..., jax.Array]] = {}
@@ -47,52 +46,6 @@ _sigma_spatial_kernel_cache: dict[tuple[object, ...], "SpatialKernel"] = {}
 _sigma_shared_tau_kernel_cache: dict[
     tuple[object, ...], Callable[..., jax.Array]
 ] = {}
-
-
-# THE names of the staged tau diagnostic's bands, owned here because this
-# module is what opens the sections.  ``gw.mpa.sigma`` aggregates exactly
-# this tuple; a name that is not spelled the same in both places is a row
-# that silently disappears from the profile, so both ends read these.
-TAU_PHASE_W_PHASE = "sigma.tau.w_phase"
-TAU_PHASE_W_PREP = "sigma.tau.w_prep"
-TAU_PHASE_G_BUILD = "sigma.tau.G_build"
-TAU_PHASE_GW_CONV_FFI = "sigma.tau.GW_conv_ffi"
-TAU_PHASE_PROJECT_RS = "sigma.tau.project_rs"
-
-#: In dispatch order within one tau node.
-TAU_KERNEL_PROFILE_PHASES = (
-    TAU_PHASE_W_PHASE,
-    TAU_PHASE_W_PREP,
-    TAU_PHASE_G_BUILD,
-    TAU_PHASE_GW_CONV_FFI,
-    TAU_PHASE_PROJECT_RS,
-)
-
-
-def _stage_timing_enabled() -> bool:
-    """``LORRAX_SIGMA_TAU_TIMING=1`` selects the stage-split instrumented τ kernel.
-
-    Diagnostic knob (2026-07-28; evidence: AQ 4962c/P=64 HLO module_0912 —
-    'sigma.exec 272.040' is a single opaque row, 176 τ dispatches at a uniform
-    ~1.51 s that no existing timing row decomposes).  When ON, the per-τ body
-    is dispatched as its cached stage jits (W-phase build / W prep / G build /
-    the fused G·W k-convolution / ψ-projection + reduce-scatter), each
-    wrapped in a blocking ``timing.section`` sub-row, so ONE run splits the
-    per-τ wall into those stages.  When OFF (default) the production fused
-    ``_tau_kernel`` jit is returned unchanged — the flag is read once at
-    kernel-factory time and is part of the kernel cache key, so the disabled
-    path pays zero per-τ overhead.
-
-    Read at USE time, truthy-parsed like common.timing's trace flags.  This is
-    an observability knob, not policy: the staged variant evaluates the exact
-    same jnp op sequence (same primitives, same order, no algebraic rewrites),
-    only in separate XLA modules with per-stage blocking — numerics identical;
-    walltime is NOT comparable to the fused path (cross-stage fusion and the
-    async-D2H overlap of ppm_accumulators are deliberately serialized).
-    Scale-neutral: overhead is O(1) host work per τ stage, independent of
-    n_atoms / N_μ / nk / P / backend.
-    """
-    return env_bool("LORRAX_SIGMA_TAU_TIMING", False)
 
 
 def _make_project_ri_reduce_scatter(
@@ -168,7 +121,7 @@ def get_sigma_spatial_kernel(
     nk_tot = kgrid[0] * kgrid[1] * kgrid[2]
     from common.fft_helpers import make_kconv_klead, make_kconv_klead_unfold
     from ffi import ffi_dial_key
-    key = (id(mesh_xy), kgrid, _stage_timing_enabled(), ffi_dial_key(),
+    key = (id(mesh_xy), kgrid, ffi_dial_key(),
            bool(merged_x), layout, face_shape, face_band_extent,
            k_unfold_plan, int(partner_tiles))
     if key in _sigma_spatial_kernel_cache:
@@ -219,38 +172,7 @@ def get_sigma_spatial_kernel(
         # typed unfold, spin action and reorder are the convolution's load,
         # and the other full-k rows are never stored.
         return convolve_project(psi_proj_xr, psi_proj_yn, G_parents, W_prep)
-    if not _stage_timing_enabled():
-        pair = SpatialKernel(prep_w=prep_w, conv_project=conv_project)
-        _sigma_spatial_kernel_cache[key] = pair
-        return pair
-    if d != ns:
-        raise NotImplementedError(
-            "LORRAX_SIGMA_TAU_TIMING splits the convolution from the projection; with output "
-            f"spin blocks (d={d} < ns={ns}) the two interleave per block, so the diagnostic split "
-            "does not exist for this deck.")
-    _conv_j = jax.jit(lambda G_p, W_prep: unfold_conv(G_p.G, G_p.transpose, W_prep,
-                                                      conj_partner=G_p.conj_partner),
-                      donate_argnums=(0,))
-    _project_j = jax.jit(project, donate_argnums=(1,))
-
-    def prep_w_staged(W_q):
-        """``sigma.tau.w_prep`` — the ONCE-PER-τ half, timed on its own row."""
-        with timing.section(TAU_PHASE_W_PREP) as sec:
-            W_prep = prep_w(W_q)
-            sec.watch(W_prep)
-        return W_prep
-
-    def conv_project_staged(psi_proj_xr, psi_proj_yn, G_k, W_prep):
-        """Diagnostic split of the same spatial operation sequence."""
-        with timing.section(TAU_PHASE_GW_CONV_FFI) as sec:
-            sigma_k = _conv_j(G_k, W_prep)
-            sec.watch(sigma_k)
-        with timing.section(TAU_PHASE_PROJECT_RS) as sec:
-            out = _project_j(psi_proj_xr, sigma_k, psi_proj_yn)
-            sec.watch(out)
-        return out
-
-    pair = SpatialKernel(prep_w=prep_w_staged, conv_project=conv_project_staged)
+    pair = SpatialKernel(prep_w=prep_w, conv_project=conv_project)
     _sigma_spatial_kernel_cache[key] = pair
     return pair
 
@@ -279,7 +201,7 @@ def _get_sigma_kij_kernel(
     if layout not in ("face", "axis") or face_shape is None or k_unfold_plan is None:
         raise ValueError("Sigma tau requires canonical face shapes and a typed parent unfold plan.")
     from ffi import ffi_dial_key
-    key = (id(mesh_xy), tuple(map(int, kgrid)), _stage_timing_enabled(),
+    key = (id(mesh_xy), tuple(map(int, kgrid)),
            ffi_dial_key(), bool(merged_x), brackets, layout, face_shape,
            face_band_extent, bool(energy_windows),
            k_unfold_plan, None if q_wedge is None else q_wedge.wedge_key())
@@ -349,81 +271,38 @@ def _get_sigma_kij_kernel(
             lambda value: jax.lax.with_sharding_constraint(value, sharding),
             outs)
 
-    if not _stage_timing_enabled():
-        _build_g = _g_from_selector
-
-        def _kernel_impl(
-            psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
-            E_A, mask_A, E_min, E_max, E_ref_A, t_node, W_q, W_pt=None, load=None,
-        ):
-            # ONE W preparation per τ, ABOVE the bracket loop.  Explicit, not
-            # left to CSE: on the decomposed chain this is ``ifftn(W)``, the
-            # only transform in the chain that does not depend on G.
-            W_prep = prep_w(W_q, W_pt, load)
-            if brackets is None:
-                G_k = _build_g(psi_coh_xn, psi_coh_yr, E_A, mask_A,
-                               E_min, E_max, E_ref_A, t_node)
-                return spatial.conv_project(
-                    psi_proj_xr, psi_proj_yn, G_k, W_prep)
-            return _bracketed_face(
-                psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
-                E_A, mask_A, E_min, E_max, E_ref_A, t_node, W_prep,
-                _build_g, spatial.conv_project)
-
-        if energy_windows:
-            kernel = partial(jax.jit, donate_argnums=(10,))(_kernel_impl)
-        else:
-            @partial(jax.jit, donate_argnums=(8,))
-            def kernel(
-                psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
-                E_A, mask_A, E_ref_A, t_node, W_q, W_pt=None, load=None,
-            ):
-                return _kernel_impl(
-                    psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
-                    E_A, mask_A, None, None, E_ref_A, t_node, W_q, W_pt, load)
-
-        _sigma_kij_kernel_cache[key] = kernel
-        return kernel
-
-    if brackets is not None:
-        raise NotImplementedError(
-            "_get_sigma_kij_kernel(layout='face'): LORRAX_SIGMA_TAU_TIMING "
-            "stage-split diagnostic is not ported for bracketed face "
-            "carriers — an opt-in profiling knob, not the production path; "
-            "set LORRAX_SIGMA_TAU_TIMING=0 (the default) for that case.")
-
-    build_g = jax.jit(_g_from_selector)
-
-    def _build_g_timed(xn, yr, E, mask, E_min, E_max, ref, t):
-        with timing.section(TAU_PHASE_G_BUILD) as sec:
-            G_k = build_g(xn, yr, E, mask, E_min, E_max, ref, t)
-            sec.watch(G_k)
-        return G_k
-
-    def _staged_impl(
+    def _kernel_impl(
         psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
         E_A, mask_A, E_min, E_max, E_ref_A, t_node, W_q, W_pt=None, load=None,
     ):
+        # ONE W preparation per τ, ABOVE the bracket loop.  Explicit, not
+        # left to CSE: on the decomposed chain this is ``ifftn(W)``, the
+        # only transform in the chain that does not depend on G.
         W_prep = prep_w(W_q, W_pt, load)
-        G_k = _build_g_timed(psi_coh_xn, psi_coh_yr, E_A, mask_A,
-                             E_min, E_max, E_ref_A, t_node)
-        return spatial.conv_project(psi_proj_xr, psi_proj_yn, G_k, W_prep)
+        if brackets is None:
+            G_k = _g_from_selector(psi_coh_xn, psi_coh_yr, E_A, mask_A,
+                                   E_min, E_max, E_ref_A, t_node)
+            return spatial.conv_project(
+                psi_proj_xr, psi_proj_yn, G_k, W_prep)
+        return _bracketed_face(
+            psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
+            E_A, mask_A, E_min, E_max, E_ref_A, t_node, W_prep,
+            _g_from_selector, spatial.conv_project)
 
     if energy_windows:
-        staged = _staged_impl
+        kernel = partial(jax.jit, donate_argnums=(10,))(_kernel_impl)
     else:
-        def staged(
+        @partial(jax.jit, donate_argnums=(8,))
+        def kernel(
             psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
             E_A, mask_A, E_ref_A, t_node, W_q, W_pt=None, load=None,
         ):
-            return _staged_impl(
+            return _kernel_impl(
                 psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
                 E_A, mask_A, None, None, E_ref_A, t_node, W_q, W_pt, load)
 
-    _sigma_kij_kernel_cache[key] = staged
-    return staged
-
-
+    _sigma_kij_kernel_cache[key] = kernel
+    return kernel
 
 
 def _wedge_residues(B_poles):
@@ -480,23 +359,14 @@ def get_shared_sigma_tau_kernel(
     brackets: tuple[tuple[int, int], ...] | None = _NO_BRACKETS,
     layout: str = "face", face_shape=None, face_band_extent=None,
     k_unfold_plan=None, _sigma_kij=None,
-    w_synthesis=None,
-    cache: bool = True,
     q_wedge=None,
 ) -> Callable[..., jax.Array]:
     """Build selected multipole W(tau) tiles for the shared complex Sigma contraction.
 
-    ``w_synthesis`` optionally replaces the resident-pole builder with the
-    resolved shared-pole model's W builder. It takes the same eight operands
-    as the resident builder (``..., t_node, active_count``), returns the
-    complete full-q ``P(None,'x','y')`` tile, and runs outside jit so a
-    bounded reader can supply q/K panels between compiled calls; kernels
-    built with it are never cached, because the builder owns resources.
-
-    ``cache=False`` builds the kernel without reading or writing the
-    process-wide incumbent cache: a compile-only measurement of the
-    incumbent route on a run that never dispatches it must not leave its
-    control executable behind for a later caller.
+    The resident pole route's τ body: W(τ) from the resident residues
+    (:func:`build_shared_w_tau`) contracted by the cached ``sigma_kij``. A
+    shared-pole model supplies its own W synthesis through
+    ``gw.mpa.sigma.SynthesisTau`` instead, over the same ``sigma_kij``.
     """
     kgrid = tuple(int(x) for x in kgrid)
     if brackets is not None:
@@ -504,11 +374,10 @@ def get_shared_sigma_tau_kernel(
                          for lo, hi in brackets)
     from ffi import ffi_dial_key
 
-    key = (id(mesh_xy), kgrid, _stage_timing_enabled(), ffi_dial_key(),
+    key = (id(mesh_xy), kgrid, ffi_dial_key(),
            brackets, layout, face_shape, face_band_extent,
            k_unfold_plan, None if q_wedge is None else q_wedge.wedge_key())
-    if (w_synthesis is None and _sigma_kij is None and cache
-            and key in _sigma_shared_tau_kernel_cache):
+    if _sigma_kij is None and key in _sigma_shared_tau_kernel_cache:
         return _sigma_shared_tau_kernel_cache[key]
 
     ensure_jax_compile_cache()
@@ -527,13 +396,6 @@ def get_shared_sigma_tau_kernel(
         _pair = dataclasses.replace(q_wedge, values=None, load=None, trs_rule="pair_transpose")
         partner_needed = bool(np.any(np.asarray(_pair.load_tables(mesh_xy).trs)))
 
-    def finish(kernel):
-        # Never publish a kernel whose builder owns resident faces and an open
-        # reader, nor one built around a caller's spatial kernel.
-        if _sigma_kij is None and w_synthesis is None and cache:
-            _sigma_shared_tau_kernel_cache[key] = kernel
-        return kernel
-
     @jax.jit
     def _build(B_poles, Omega_poles, pole_indices, bounds,
                phase_real, E_ref_B, t_node, active_count=None):
@@ -542,47 +404,15 @@ def get_shared_sigma_tau_kernel(
             phase_real, E_ref_B, t_node, active_count)
         return jax.lax.with_sharding_constraint(W_t, q_mu_sharding)
 
-    if w_synthesis is not None:
-        _build = w_synthesis
-
-    if not _stage_timing_enabled() and w_synthesis is None:
-        @jax.jit
-        def _tau(
-            psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
-            E_A, mask_A, B_poles, Omega_poles, pole_indices, bounds,
-            phase_real, E_ref_A, E_ref_B, t_node, active_count=None,
-        ):
-            B_poles, load = _wedge_residues(B_poles)
-            W_t = _build(B_poles, Omega_poles, pole_indices, bounds,
-                         phase_real, E_ref_B, t_node, active_count)
-            W_pt = (_build(jnp.conj(B_poles), Omega_poles, pole_indices, bounds,
-                           phase_real, E_ref_B, t_node, active_count)
-                    if partner_needed else None)
-            return sigma_kij(
-                psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
-                E_A, mask_A, E_ref_A, t_node, W_t, W_pt, load)
-
-        return finish(_tau)
-
-    profile_stages = _stage_timing_enabled()
-
-    def _tau_staged(
+    @jax.jit
+    def _tau(
         psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
         E_A, mask_A, B_poles, Omega_poles, pole_indices, bounds,
         phase_real, E_ref_A, E_ref_B, t_node, active_count=None,
     ):
         B_poles, load = _wedge_residues(B_poles)
-        if profile_stages:
-            with timing.section(TAU_PHASE_W_PHASE) as sec:
-                W_t = _build(B_poles, Omega_poles, pole_indices, bounds,
-                             phase_real, E_ref_B, t_node, active_count)
-                sec.watch(W_t)
-        else:
-            # A resident model has a Python storage closure, but its device
-            # kernels still dispatch asynchronously. Only the explicit
-            # stage profiler needs a host wait between W and G*W.
-            W_t = _build(B_poles, Omega_poles, pole_indices, bounds,
-                         phase_real, E_ref_B, t_node, active_count)
+        W_t = _build(B_poles, Omega_poles, pole_indices, bounds,
+                     phase_real, E_ref_B, t_node, active_count)
         W_pt = (_build(jnp.conj(B_poles), Omega_poles, pole_indices, bounds,
                        phase_real, E_ref_B, t_node, active_count)
                 if partner_needed else None)
@@ -590,6 +420,7 @@ def get_shared_sigma_tau_kernel(
             psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
             E_A, mask_A, E_ref_A, t_node, W_t, W_pt, load)
 
-    # A model builder may own resident faces and an open reader for this SC
-    # map. Never retain that resource closure in the process-wide jit cache.
-    return finish(_tau_staged)
+    # Never publish a kernel built around a caller's spatial kernel.
+    if _sigma_kij is None:
+        _sigma_shared_tau_kernel_cache[key] = _tau
+    return _tau

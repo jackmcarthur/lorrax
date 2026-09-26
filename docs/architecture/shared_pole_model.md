@@ -283,19 +283,25 @@ debug output.
 
 ## 8 The Σ consumer
 
-Σ contracts $G$ with $W(\tau)$ synthesized from the factors in admitted parent
-and column panels (`gw.mpa.sigma._shared_pole_w_synthesis`):
+Σ contracts $G$ with $W(\tau)$ synthesized from the factors inside the Σ
+window executable (`gw.mpa.sigma._shared_pole_w_synthesis`, bound to the τ body
+by `gw.mpa.sigma.SynthesisTau`, the same pair the photon sectors use):
 
 $$ W_{c,+}(q,\tau) = b\,\mathrm{diag}\big(d_j(\tau)\big)\,b^{\dagger}, \qquad
 d_j(\tau) = \frac{e^{-i(\Omega_j - E_{\rm ref})\tau}}{2\Omega_j} . \tag{SP 4} $$
 
-Synthesis uses the Green-function GEMM (`build_G`). The factors are
-face-sharded, `P(None,'x',None,'y')`, or, when the panel search admits the
-replicated pole columns, each centroid endpoint is split over its mesh axis
-with the pole columns replicated. The synthesized $W$ always uses both mesh
-axes. A resident factor set is read once per Σ call; otherwise the store reader
-supplies bounded panels per τ, which changes storage and summation order, never
-the number of spatial calls.
+Synthesis uses the Green-function GEMM (`build_G`) at the irreducible parents,
+then the fixed-q projection, the little-group realization and the unfold to
+the full q grid. The factors are read once per Σ call and stay resident:
+$32\,n_{q,\rm irr}\,\mu\,\bar K/P$ bytes per rank face-sharded,
+`P(None,'x',None,'y')`, or $16\,n_{q,\rm irr}\,\mu\,\bar K(1/P_x+1/P_y)$ when the
+panel search admits the replicated pole columns ($\bar K$ the store's pole
+carrier); a nonlocal store also keeps its routed child faces. The budget left
+beside them sizes one parent panel × pole-column chunk of synthesis workspace:
+parent panels are a static loop inside the executable, chunks of one static
+width a device loop, one of each when everything fits. A store whose resident
+factors do not fit refuses (`GATE shared_pole_capacity`) with the smallest
+square mesh that fits them. The synthesized $W$ always uses both mesh axes.
 
 **Hole routing.** Conduction windows take $W_+(q)$. An ordered store routes
 valence windows to the particle–hole partner,

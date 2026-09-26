@@ -42,10 +42,8 @@ def main(runtime):
     header = store.validate_shared_pole_model(
         path, expected_identity=identity, mesh_xy=mesh, capacity=meta.shared_pole_capacity)
     frequencies = shared_pole_frequencies(poles, counts)
-    indices = put(np.arange(3, dtype=np.int32), P())
-    bounds_host = np.tile([1., 4., -np.inf, -np.inf, np.inf, np.inf], (3, 1))
-    bounds = put(bounds_host, P())
-    phase = put(np.ones(3), P())
+    indices = np.arange(3, dtype=np.int32)
+    bounds = np.tile([1., 4., -np.inf, -np.inf, np.inf, np.inf], (3, 1))
     e, t = put(np.asarray(.6), P()), put(np.asarray(.7+.2j), P())
     omega = np.sqrt(poles)
     active = (omega > 1) & (omega <= 4) & (np.arange(4)[None, :] < counts[:, None])
@@ -65,26 +63,29 @@ def main(runtime):
     with SlabIO(path, mode='r', mesh=mesh) as io:
         for layout, b, c in (("face", 3, 5), ("axis", 3, 5), ("axis", 1, 2), ("axis", 2, 3), ("axis", 3, 1)):
             schedule = dict(status="PASS", parent_capacity=b, column_capacity=c)
-            build = _shared_pole_w_synthesis(
+            synthesis = _shared_pole_w_synthesis(
                 io, meta, header, frequencies,
                 schedule, mesh_xy=mesh, layout=layout)
-            got = build(None, None, indices, bounds, phase, e, t)
+            # W(τ) as the window executable runs it: one traced program.
+            build = jax.jit(lambda ops, e, t: synthesis.w_kernel(*ops, e, t, False))
+            got = build(synthesis.window_operands("cond", indices, bounds), e, t)
             error = float(jax.numpy.max(jax.numpy.abs(got-oracle)))
             assert error < 1e-10, (b, c, error)
-            # A changed window must invalidate cached selectors, including
-            # an empty interval that returns the complete zero full-q W.
-            empty = put(np.tile([20., 30., -np.inf, -np.inf, np.inf, np.inf], (3, 1)), P())
-            zero = build(None, None, indices, empty, phase, e, t)
+            # Each window brings its own selectors, including an empty interval
+            # that returns the complete zero full-q W.
+            empty = np.tile([20., 30., -np.inf, -np.inf, np.inf, np.inf], (3, 1))
+            zero = build(synthesis.window_operands("cond", indices, empty), e, t)
             assert float(jax.numpy.max(jax.numpy.abs(zero))) == 0
-            again = build(None, None, indices, bounds, phase, e, t)
+            again = build(synthesis.window_operands("cond", indices, bounds), e, t)
             repeat = float(jax.numpy.max(jax.numpy.abs(again-oracle)))
             assert repeat < 1e-10
             results.append(dict(layout=layout, parent_capacity=b, column_capacity=c,
                                 dense_error=error, restored_window_error=repeat,
                                 q_pair_rewired=policy.n_pair_rewired))
-            del build, got, zero, again
+            synthesis.close()
+            del synthesis, build, got, zero, again
     report = dict(status='PASS', job_step=os.environ['SLURM_JOB_ID']+'.'+os.environ['SLURM_STEP_ID'],
-        scope='P4 canonical store + local full-q synthesis, ragged K, forced q/K panels and window refresh',
+        scope='P4 canonical store + local full-q synthesis inside one traced program, ragged K, forced q/K panels and per-window selectors',
         results=results, aggregate_3U='NOT_MEASURED', nonlocal_fallback='NOT_MEASURED',
         full_sigma='NOT_MEASURED')
     (args.output/f'receipt_rank{jax.process_index()}.json').write_text(json.dumps(report, indent=2)+'\n')
