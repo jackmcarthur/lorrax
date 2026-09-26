@@ -46,7 +46,7 @@ are `P(None,'x','y')` on the square X/Y mesh with `P = Px·Py`.
    `relaxed` uses 8 uniform line sites, 2 imaginary sites, cutoff $10^{-2}$,
    no cap, no budget, and bank tolerance $10^{-7}$. The Σ quadrature reads
    `sigma_quadrature_eps` from the deck as every Σ route does; `relaxed` only
-   defaults an omitted key to $10^{-3}$.
+   defaults an omitted key to $5\cdot10^{-4}$.
 2. **Bank** (§2): Coulomb roots, samples $W_c,\partial_sW_c$ at the supports
    on the imaginary axis and the held supports, the direction panels of every
    fitted line support (§3), moments $M_1,M_3$ (and $M_0,M_2$ when ordered)

@@ -118,7 +118,7 @@ RECIPE_HASH = table_hash(shared_real_pole_v1_r3b)
 #: sigma_quadrature_eps lives outside the hashed table above, whose every field
 #: sets W's sampling or poles, so RECIPE_HASH (restart and bank identity) binds
 #: only W and a Sigma-only edit never refuses a stored model.
-SIGMA_EPS_DEFAULT = {"relaxed": 1.0e-3}
+SIGMA_EPS_DEFAULT = {"relaxed": 5.0e-4}
 GATE_HASH = table_hash(shared_real_pole_gates_v1_r3b)
 
 # Time-reversal-broken ordered route (particle-hole pencil in z). A separate
@@ -1293,7 +1293,6 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
         'infinity': 'ceil(tier infinity fraction*n)', 'direction': 'tier relative singular cutoff',
         'multiplet': 'whole multiplets within relative 1e-6',
         'bank': 'fixed Hermite certificate tolerance 1e-8',
-        'sigma': 'tier Sigma tolerance production1e-4/relaxed1e-3',
         'census': 'current full-band occupations, authenticated k weights/capacity; active band top >= mu-15 eV',
         'sector_pole_treatment': 'bispinor-only numerical treatment at twice the map-0 chi transition span; not a physical pole bound',
         'U_bytes': '16*nk_full*(nspinor*nmu)^2/(Px*Py), logical bytes/rank',
