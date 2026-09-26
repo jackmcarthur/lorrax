@@ -1113,10 +1113,14 @@ def _escape_attribution(entry, spec):
                                               states[outside] - hi))]
         k, n = np.unravel_index(int(spec["state_indices"][worst]),
                                 spec["state_shape"])
+        # A valence branch carries mu - E (ppm_windows: H_val = -energy).
+        branch = spec.get("branch")
+        sign = -1.0 if getattr(branch, "space", "cond") == "val" else 1.0
+        edges = sorted((sign * lo * RYD_TO_EV, sign * hi * RYD_TO_EV))
         parts.append(
             f"state k={int(k)} band={int(n) + 1} (Sigma band carrier) at "
-            f"E-mu={states[worst] * RYD_TO_EV:+.4f} eV left the certified "
-            f"[{lo * RYD_TO_EV:+.4f}, {hi * RYD_TO_EV:+.4f}] eV "
+            f"E-mu={sign * states[worst] * RYD_TO_EV:+.4f} eV left the certified "
+            f"[{edges[0]:+.4f}, {edges[1]:+.4f}] eV "
             f"({outside.size} state(s) outside)")
     a_lo, a_hi = spec["pole_extent"][:2]
     p_lo, p_hi = certified["poles_ry"][:2]
