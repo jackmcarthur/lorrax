@@ -929,7 +929,8 @@ def load_dipole_h5(path: str | Path):
     -------
     dipole_cart : (3, nk, nb, nb) complex128 — ⟨mk|v̂_α|nk⟩ (Ry), at the arm
                   the file was built with (its ``prov_vnl_velocity_sign``).
-    deltaE      : (nk, nb, nb) float64       — E_b - E_b' (Ry).
+    deltaE      : (nk, nb, nb) float64       — E_b - E_b' (Ry), derived from
+                  ``band_energies`` (``file_io.dipole.delta_e``).
     attrs       : dict with ``nbands, nk``.
     """
     if not Path(path).is_file():
@@ -942,9 +943,10 @@ def load_dipole_h5(path: str | Path):
             f"``--skip-vnl`` writes the momentum operator only, which is the "
             f"arm that matches BerkeleyGW's ``use_momentum``; drop it to get "
             f"the full velocity including the nonlocal commutator.")
+    from .dipole import delta_e
     with h5py.File(str(path), "r") as f:
         dipole_cart = np.asarray(f["dipole_cart"][:], dtype=np.complex128)
-        deltaE = np.asarray(f["deltaE"][:], dtype=np.float64)
+        deltaE = delta_e(f)
         attrs = dict(f.attrs)
         attrs["nbands"], attrs["nk"] = int(attrs["nbands"]), int(attrs["nk"])
     return dipole_cart, deltaE, attrs
@@ -2259,34 +2261,40 @@ def read_dipole_cv_block(path, *, nelec: int, mesh: Mesh):
     """The static head's (c, v) block of ``dipole.h5``, read through SlabIO.
 
     Returns ``(v_cvk, dE_cv)`` = ``dipole_cart[:, :, nelec:, :nelec]``
-    ``(3, nk, nc, nv)`` complex128 and ``deltaE[:, nelec:, :nelec]``
-    ``(nk, nc, nv)`` float64, replicated on ``mesh``.  Each rank reads only
+    ``(3, nk, nc, nv)`` complex128 and ``E_c − E_v`` ``(nk, nc, nv)``
+    float64 (derived from ``band_energies``), replicated on ``mesh``.  Each rank reads only
     its share of the c rows, so the file is read once in total rather than
     once per rank (Fe 8^3 P64 read its whole 2.65 GB dipole on all 64
     ranks, claim 2592), and one all-gather of the block replaces the
     per-rank copy of the whole ``(nb, nb)`` file.  COLLECTIVE over ``mesh``.
     """
     from runtime.padding import padded_axis
+    from .dipole import LEGACY_DELTA_E_DATASET, delta_e_cv
     from .slab_io import SlabIO
     with h5py.File(path, "r") as f:
         _, nk, nb, _ = f["dipole_cart"].shape
-    nv = max(0, min(int(nelec), int(nb)))
-    nc = int(nb) - nv
+        nv = max(0, min(int(nelec), int(nb)))
+        nc = int(nb) - nv
+        dE_cv = delta_e_cv(f, nv=nv, nc=nc) if nc and nv else None
     if nc == 0 or nv == 0:
         return (jnp.zeros((3, nk, nc, nv), jnp.complex128),
                 jnp.zeros((nk, nc, nv), jnp.float64))
     xy = tuple(mesh.axis_names)
     c_axis = padded_axis(nc, mesh, name="dipole c rows")
     ncp = int(c_axis.carrier)
+    rep = NamedSharding(mesh, P())
     with SlabIO(path, mode="r", mesh=mesh) as io:
         v = io.read_slab("dipole_cart", shape=(3, nk, ncp, nv),
                          offset=(0, 0, nv, 0), valid_shape=(3, nk, nc, nv),
                          dtype=np.complex128,
                          partition_spec=P(None, None, xy, None))
-        e = io.read_slab("deltaE", shape=(nk, ncp, nv), offset=(0, nv, 0),
-                         valid_shape=(nk, nc, nv), dtype=np.float64,
-                         partition_spec=P(None, xy, None))
-    rep = NamedSharding(mesh, P())
+        if dE_cv is None:           # a file written before 2026-09-25
+            e = io.read_slab(LEGACY_DELTA_E_DATASET, shape=(nk, ncp, nv),
+                             offset=(0, nv, 0), valid_shape=(nk, nc, nv),
+                             dtype=np.float64, partition_spec=P(None, xy, None))
+    if dE_cv is not None:
+        v = jax.jit(lambda a: a[:, :, :nc], out_shardings=rep)(v)
+        return v, device_put_process_local(dE_cv, rep)
     return jax.jit(lambda a, b: (a[:, :, :nc], b[:, :nc]),
                    out_shardings=(rep, rep))(v, e)
 
@@ -3972,23 +3980,27 @@ def _q0_ncond_coverage(h5, *, wfn, ncond, nband) -> tuple[bool, str]:
             problems.append(
                 f"prov_nb_written: file={got} run-resolved={expected}")
 
-    shapes = {}
-    for name, rank in (("dipole_cart", 4), ("deltaE", 3)):
-        if name not in h5:
-            problems.append(f"{name} is absent")
-            continue
-        shape = tuple(int(v) for v in h5[name].shape)
-        shapes[name] = shape
-        if len(shape) != rank or shape[-2:] != (expected, expected):
+    from .dipole import energy_extent
+    velocity = None
+    if "dipole_cart" not in h5:
+        problems.append("dipole_cart is absent")
+    else:
+        velocity = tuple(int(v) for v in h5["dipole_cart"].shape)
+        if len(velocity) != 4 or velocity[-2:] != (expected, expected):
             problems.append(
-                f"{name} shape={shape}, expected square band axes "
+                f"dipole_cart shape={velocity}, expected square band axes "
                 f"({expected},{expected})")
-    if (len(shapes.get("dipole_cart", ())) >= 2
-            and len(shapes.get("deltaE", ())) >= 1
-            and shapes["dipole_cart"][1] != shapes["deltaE"][0]):
+    energies = energy_extent(h5)
+    if energies is None:
+        problems.append("band_energies (or a legacy deltaE) is absent")
+    elif len(energies) != 2 or energies[-1] != expected:
         problems.append(
-            "dipole_cart and deltaE carry different k extents "
-            f"({shapes['dipole_cart'][1]} versus {shapes['deltaE'][0]})")
+            f"band energy extent (nk, nb)={energies}, expected nb={expected}")
+    elif velocity is not None and len(velocity) >= 2 \
+            and velocity[1] != energies[0]:
+        problems.append(
+            "dipole_cart and the band energies carry different k extents "
+            f"({velocity[1]} versus {energies[0]})")
 
     return not problems, ("; ".join(problems) if problems
                           else f"identical q→0 extent {expected}")
