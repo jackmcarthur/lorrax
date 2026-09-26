@@ -408,10 +408,19 @@ def _outer_w_term(route, rank, psi_c_X, psi_v_Y, W_R, sqrt_nk, mesh_xy, kgrid):
         return lambda L, R, conj_r=False: _decode(conv(L, R, W_Rm, conj_r=conj_r), psi_c_X, psi_v_Y, sqrt_nk)
     prep, apply = make_local_kconv_klead_outer_decode(mesh_xy, kgrid, norm="ortho")
     pc_t = prep(psi_c_X)
-    # A is this rank's (μ_loc, ν_loc) partial: varying over both mesh axes, which the custom
-    # call's result does not carry (the XLA route gets it from the einsum with ψ^X_c).
     return lambda L, R, conj_r=False: _decode_v(
-        mark_varying(apply(L, R, W_Rm, pc_t, conj_r=conj_r), ("x", "y")), psi_v_Y, sqrt_nk)
+        _rank_partial(apply(L, R, W_Rm, pc_t, conj_r=conj_r)), psi_v_Y, sqrt_nk)
+
+
+def _rank_partial(A):
+    """The fused door's ``A`` is this rank's (μ_loc, ν_loc) partial: varying over 'x' and 'y'.
+
+    The custom call's result carries only the varying axes jax infers for it (the XLA route
+    gets 'x' from the einsum with ψ^X_c), so the missing ones are declared here.
+    """
+    have = getattr(getattr(jax, "typeof", lambda a: None)(A), "vma", None) or frozenset()
+    miss = tuple(a for a in ("x", "y") if a not in have)
+    return mark_varying(A, miss) if miss else A
 
 
 def _exchange_U(S_part, V_q0):
