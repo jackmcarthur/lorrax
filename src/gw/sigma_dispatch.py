@@ -497,20 +497,6 @@ def _compute_live_hartree(config, meta, band_slices, mesh_xy, *, wfn, sym,
 # Dynamic-Sigma finalization (shared by every frequency ansatz)
 # ---------------------------------------------------------------------------
 
-def _qsgw_one_sided_core_mask(config, band_slices, meta):
-    """Use the same QSGW window-edge policy for total and sector readouts."""
-    sc_cfg = getattr(config, "sc", None)
-    if (sc_cfg is None or int(sc_cfg.buffer_nbands) <= 0
-            or sc_cfg.buffer_mode != "one_sided"
-            or getattr(config.qp_solver, "value", config.qp_solver)
-            != "self_consistent"):
-        return None
-    band_ids = np.arange(int(band_slices.b0), int(band_slices.b3),
-                         dtype=np.int64)
-    return ((band_ids >= int(meta.nelec) - int(config.nval))
-            & (band_ids < int(meta.nelec) + int(config.ncond)))
-
-
 def finalize_dynamic_sigma(
     sigma_c_body_omega: jax.Array,
     head_sigma_diag_w_kn_ry: np.ndarray | None,
@@ -670,24 +656,14 @@ def finalize_dynamic_sigma(
             sigma_omega_h5_path = None
         sig_x_rep = device_put_process_local(
             sig_x, NamedSharding(mesh_xy, P(None, None, None)))
-        one_sided_core_mask = _qsgw_one_sided_core_mask(
-            config, band_slices, meta)
-        qsgw_edge_kwargs = ({"one_sided_core_mask": one_sided_core_mask}
-                             if one_sided_core_mask is not None else {})
-        qsgw_edge_kwargs["out_of_grid"] = config.sigma.out_of_grid
         sigma_xc_qsgw, qsgw_diag = build_qsgw_sigma_xc(
             sigma_c_omega, sig_x_rep,
             omega_grid_ev, e_qp_rel_ev, mesh_xy,
             band_axis=sigma_band_axis,
-            **qsgw_edge_kwargs,
+            out_of_grid=config.sigma.out_of_grid,
         )
         print_fn(f"  QSGW: {int(qsgw_diag['n_clipped'])} clipped "
                  f"({100*qsgw_diag['frac_clipped']:.1f}%)")
-        if one_sided_core_mask is not None:
-            print_fn(
-                "  QSGW window edge: one-sided Sigma(E_core) on "
-                f"{int(qsgw_diag['n_one_sided_edges'])} ordered "
-                "(k,m,n) couplings")
 
         sigma_lorentz = None
         if sigma_lorentz_static_skij_ry is not None:
@@ -1264,16 +1240,13 @@ def _compute_mpa_sigma(
             from .qsgw_utils import build_qsgw_sigma_xc
             e_qp_rel_ev = (np.asarray(e_qp_ev, dtype=np.float64)
                            - sigma_efermi_ry * RYD_TO_EV)
-            core_mask = _qsgw_one_sided_core_mask(config, band_slices, meta)
-            edge_kwargs = ({"one_sided_core_mask": core_mask}
-                           if core_mask is not None else {})
             zero_x = jnp.zeros_like(sig_x)
 
             def on_shell(value):
                 shell, _ = build_qsgw_sigma_xc(
                     value.sigma_c_kij, zero_x, config.omega_grid_ev,
                     e_qp_rel_ev, mesh_xy, band_axis=value.band_axis,
-                    out_of_grid=config.sigma.out_of_grid, **edge_kwargs)
+                    out_of_grid=config.sigma.out_of_grid)
                 return shell
 
         sector_result = compute_sector_sigma(
