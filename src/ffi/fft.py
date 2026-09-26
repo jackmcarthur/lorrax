@@ -1329,10 +1329,10 @@ def make_kconv_klead_unfold(mesh: Mesh, kgrid, tables, *, store_rows, norm: str 
         attrs = dict(nkx=np.int64(kg[0]), nky=np.int64(kg[1]), nkz=np.int64(kg[2]),
                      scale=np.float64(si * sf * float(mult)), **_mathdx_common())
 
-        def local(g, gt, v_r, conj_src=False, rows=None):
+        def local(g, gt, v_r, conj_src=False, block=None):
             t = local_unfold_load_tables(tables)
             n_par, mx, _, my, _ = (int(v) for v in g.shape)
-            x0, bx, xs, xn = (0, 0, 0, 0) if rows is None else rows
+            x0, bx, xs, xn = (0, 0, 0, 0) if block is None else block
             flat = lambda a: a.reshape(n_par, mx * ns, my * ns)
             out = jax.ShapeDtypeStruct((n_out, ns, xn * bx if bx else mx, ns, my), g.dtype)
             return jax.ffi.ffi_call(KCONV_KLEAD_UNFOLD_TARGET, out)(
@@ -1342,7 +1342,7 @@ def make_kconv_klead_unfold(mesh: Mesh, kgrid, tables, *, store_rows, norm: str 
     else:
         _, conv_local = _klead_locals(mesh, kg, norm, mult)
 
-        def local(g, gt, v_r, conj_src=False, rows=None):
+        def local(g, gt, v_r, conj_src=False, block=None):
             t = local_unfold_load_tables(tables)
             n_par, mx, _, my, _ = (int(v) for v in g.shape)
             flat = lambda a: a.reshape(n_par, mx * ns, my * ns)
@@ -1350,19 +1350,19 @@ def make_kconv_klead_unfold(mesh: Mesh, kgrid, tables, *, store_rows, norm: str 
             O = apply_unfold_load_tables_local(flat(g), flat(gt), t, spin_host)
             U = jnp.take(conv_local(jnp.transpose(O, (0, 2, 1, 4, 3)), v_r),
                          jnp.asarray(rows), axis=0)
-            if rows is None:
+            if block is None:
                 return U
-            idx = x_block_rows(rows)
+            idx = x_block_rows(block)
             keep = jnp.asarray(idx < mx)[None, None, :, None, None]
             return jnp.where(keep, jnp.take(U, jnp.asarray(np.minimum(idx, mx - 1)), axis=2), 0)
 
     g_spec = P(None, "x", None, "y", None)
     sm = {}
 
-    def sharded(conj_src, rows):
-        key = (conj_src, rows)
+    def sharded(conj_src, block):
+        key = (conj_src, block)
         if key not in sm:
-            sm[key] = _sharded(partial(local, conj_src=conj_src, rows=rows), mesh,
+            sm[key] = _sharded(partial(local, conj_src=conj_src, block=block), mesh,
                                (g_spec, g_spec, P(None, "x", "y")), P(None, None, "x", None, "y"))
         return sm[key]
 
