@@ -6,29 +6,17 @@ Besides these reduced scaling exponents, LORRAX gets its name from: 1.) our real
 
 LORRAX is developed primarily by Jack McArthur (myself) and supervised by Prof. Steven Louie at UC Berkeley, under whom the public BerkeleyGW package has been developed and maintained since 2011. Interoperability with the outputs of the BGW executables `epsilon.x`, `sigma.x`, `kernel.x`, and `absorption.x` is an active area of development. We use heavily and are actively expanding the roles of agentic coding platforms in the development of LORRAX, namely Anthropic's Claude Code and OpenAI's Codex. Both have been collaborators of great importance and are owed significant credit for the current state of LORRAX. We continue to explore applications of SOTA long-horizon schemes for scientific codebases, sandboxes for closed-loop development, and hierarchical tools like MCPs, subagents, and so forth.
 
-The package requires as input the BerkeleyGW format wavefunction file `WFN.h5`. It is currently only compatible with full-spinor wavefunctions, but it can be used with wavefunction k-grids that are reduced by symmetry using BGW's `kgrid.x`. Crystal symmetries reduce cost through the IBZ cascade: when the centroid set is orbit-closed (`kmeans_cli --orbit`, the default when the crystal has more than one symmetry operation), the ζ-fit factorizes $C_q$ and solves $\zeta_q$ only for $\mathbf q$ in the irreducible zone (`isdf_fitting` `write_ibz_only`), with $V_q$ and $\Sigma_x$ unfolded from it — a ~6–12× reduction of the most expensive stages for a typical hexagonal cell. The pair-density k-sums still run over the full k-lattice. See manual §5.4.
+The package requires as input the BerkeleyGW format wavefunction file `WFN.h5`. It reads full-spinor (`nspinor = 2`) and scalar (`nspinor = 1`) wavefunctions ([Preparing inputs from DFT](docs/preprocessing.md)), on k-grids reduced by symmetry with BGW's `kgrid.x`. Crystal symmetries reduce cost through the IBZ cascade: when the centroid set is orbit-closed (`kmeans_cli --orbit`, the default when the crystal has more than one symmetry operation), the ζ-fit factorizes $C_q$ and solves $\zeta_q$ only for $\mathbf q$ in the irreducible zone (`isdf_fitting` `write_ibz_only`), with $V_q$ and $\Sigma_x$ unfolded from it — a ~6–12× reduction of the most expensive stages for a typical hexagonal cell. The pair-density k-sums still run over the full k-lattice. See manual §5.4.
 
-The main drivers are located in `src/`:
-- **ISDF initialization**: `centroid/kmeans_isdf.py` (k-means algorithm) + `centroid/kmeans_cli.py` (CLI entrypoint, `python -m centroid.kmeans_cli`)
-- **Wavefunction loading**: `common/wfn_transforms.py` (band-chunked FFTs, centroid extraction, memory bottlenecks)
-- **GW quasiparticle energies**: `gw/gw_jax.py` (main driver), `gw/w_isdf.py` (screened interaction builder)
+The drivers, in chain order, are listed in [`docs/drivers.md`](docs/drivers.md); the module map is [`docs/codebase.md`](docs/codebase.md).
 
 Available as console commands: `gw_jax`, `lorrax-gw`, `lorrax-centroids` (= `centroid.kmeans_cli`).
 
 ## Quick start
 
-```bash
-uv sync                                                       # editable install, no GPU/native build needed
-uv run python -m pytest -q                                    # regression smoke test (CPU, ~1-2 min)
-uv run python -m gw.gw_jax -i tests/regression/cohsex_debug/cohsex_test.in   # run a GW calculation
-```
+[Try it](docs/index.md#try-it) runs the bundled COHSEX fixture, and the [Quickstart](docs/quickstart.md) walks through it. The native FFI pair is required at every process count ([Installation](docs/installation/index.md)).
 
-The third line runs a complete static-COHSEX calculation end-to-end on the bundled
-wavefunction. It needs no GPU, but the native host FFI build is required; HDF5 transport
-selection keys have been removed. See
-[`docs/environment/overview.md`](docs/environment/overview.md) for the native stack.
-
-On NERSC Perlmutter the harness is `lx`: `lx run <cmd>` puts one step on a compute node, `lx test` runs the default gate there. See [`docs/environment/machines/perlmutter.md`](docs/environment/machines/perlmutter.md) — the older `module load lorrax` + `lxalloc`/`lxrun`/`lxpre` workflow is superseded and documented there as history. On Frontera this differs; see [`docs/environment/machines/frontera.md`](docs/environment/machines/frontera.md) and the working examples below.
+On NERSC Perlmutter the harness is `lx`: `lx run <cmd>` puts one step on a compute node, `lx test` runs the default gate there. See [`docs/environment/machines/perlmutter.md`](docs/environment/machines/perlmutter.md). On Frontera this differs; see [`docs/environment/machines/frontera.md`](docs/environment/machines/frontera.md) and the working examples below.
 
 On TACC Frontera (CPU, apptainer + srun), working invocations from the certified scripts (`config/frontera/templates/gw_dev.sbatch`, the mos2_4x4_test sbatch family):
 
@@ -46,10 +34,10 @@ bash $LORRAX_ROOT/config/frontera/templates/gw_dev.sbatch
 
 Detailed physics, code architecture, and environment setup are in `docs/`:
 
-- **[`docs/drivers.md`](docs/drivers.md)** — The seven pipeline drivers in chain order: invocation, keys/flags, outputs, failure modes
-- **[`docs/input_reference.md`](docs/input_reference.md)** — Every deck key: name, default, one-line meaning (regenerated from `gw_config._DEFAULTS` by `tools/gen_input_reference.py`)
+- **[`docs/drivers.md`](docs/drivers.md)** — The core drivers in chain order: invocation, keys/flags, outputs, failure modes
+- **[`docs/input_reference.md`](docs/input_reference.md)** — Every deck key: name, default, one-line meaning (maintained by hand)
 - **[`docs/theory/physics.md`](docs/theory/physics.md)** — ISDF theory, GW equations, ISDF basis (zeta) fitting, JAX sharding
-- **[`docs/architecture/codebase.md`](docs/architecture/codebase.md)** — Module map, data flow, key classes, entry points
+- **[`docs/codebase.md`](docs/codebase.md)** — Module map, data flow, key classes, entry points
 - **[`docs/environment/overview.md`](docs/environment/overview.md)** — The runtime stack, JAX configuration, transports, per-machine pages
 - **[`docs/architecture/memory-model.md`](docs/architecture/memory-model.md)** — Per-stage memory usage formulas for the ISDF basis construction, heavy chunked operations
 - **[`docs/theory/minimax-quadrature.md`](docs/theory/minimax-quadrature.md)** — Explanation of GW frequency integrals discretized via $\Sigma(omega) = \int dt e^{i \omega t} G(t)W(t)$, minimax quadrature

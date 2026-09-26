@@ -22,7 +22,7 @@ pins; [ffi_layout.md](../architecture/ffi_layout.md) owns the native design.
 
 | refusal | cause | fix |
 |---|---|---|
-| `Could not locate liblorrax_ffi_host.so (platform=cpu)` or `… liblorrax_ffi.so (platform=CUDA)`, with the paths searched | no library for this platform | Perlmutter: set `LX_BASE_MODULE=lorrax_A` and launch through `lx`. Elsewhere: build the leg the message names. |
+| `Could not locate liblorrax_ffi_host.so (platform=cpu)` or `… liblorrax_ffi.so (platform=CUDA)`, with the paths searched | no library for this platform | Perlmutter: launch through `lx`, which selects the `lorrax_A` module. Elsewhere: build the leg the message names. |
 | `HANDLER ABI MISMATCH` | the library and the Python tree disagree on `LORRAX_FFI_ABI_VERSION` | rebase onto current main, or rebuild and reseal both legs from the same tree |
 | `partial sealed-bundle override refused` | only one of `LORRAX_FFI_SO` / `LORRAX_FFI_HOST_SO` is set | unset both, or pin both legs of one sealed bundle |
 | `mixed native providers` | the two selected legs claim different bundle manifests | select both legs from one bundle |
