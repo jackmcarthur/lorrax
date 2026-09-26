@@ -20,7 +20,7 @@ PSI_MUNT_SPEC = P(None, "x", "y", None)  # (nk, mu_X, n_Y, s)
 # x-major for the mun face), so ONE all-to-all per face lands it on
 # PSI_NMU_SPEC / PSI_MUNT_SPEC (common.psi_G_store).
 PSI_NMU_ACC_SPEC = P(None, None, None, ("y", "x"))   # (nk, n, s, mu_YX)
-PSI_MUNT_ACC_SPEC = P(None, ("x", "y"), None, None)  # (nk, mu_XY, n, s)
+PSI_MUNT_ACC_SPEC = P(None, None, None, ("x", "y"))  # (nk, n, s, mu_XY), conjugated
 
 
 def psi_specs(layout: str) -> tuple[P, P]:
