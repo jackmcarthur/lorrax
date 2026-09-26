@@ -13,15 +13,15 @@ reference Σ cell for cell. Larger CPU runs are not certified.
 ## 1. Entry point: `lx` {#1-entry-point-lx}
 
 `lx` runs a step on a compute node. It joins an allocation (`--pool NAME` or
-`--jid N`), claims a free node per step, loads the base module named by
-`LX_BASE_MODULE` in a throwaway shell, and puts the resolved checkout's `src/`
-first on `PYTHONPATH`. It announces the source tree on every step:
+`--jid N`), claims a free node per step, loads the base module (`lorrax_A` by
+default; `LX_BASE_MODULE` is an expert override) in a throwaway shell, and puts
+the resolved checkout's `src/` first on `PYTHONPATH`. It announces the source tree on every step:
 `LORRAX_CHECKOUT` if set, else the checkout containing `cwd`, else the
 module's snapshot. A run directory is not a checkout, so production runs set
 `LORRAX_CHECKOUT`.
 
 ```bash
-export LX_BASE_MODULE=lorrax_A LORRAX_CHECKOUT=/path/to/checkout
+export LORRAX_CHECKOUT=/path/to/checkout
 lx run --pool POOL --wait 3600 -N 1 -G 4 -n 4 -- python3 -u -m gw.gw_jax -i cohsex.in
 lx test                  # the default test gate on a compute node, in cwd
 lx status                # allocations and steps
@@ -100,7 +100,7 @@ Every multi-process CPU step sources `config/perlmutter/cpu_mpi_env.sh` in the
 rank shell before Python:
 
 ```bash
-export LX_BASE_MODULE=lorrax_A LORRAX_CHECKOUT=/path/to/checkout
+export LORRAX_CHECKOUT=/path/to/checkout
 lx run --cpu --pool POOL -N 2 -n 4 -- bash -c '
   set -euo pipefail
   export OMP_NUM_THREADS=14
@@ -118,8 +118,9 @@ lx run --cpu --pool POOL -N 2 -n 4 -- bash -c '
 | `MPICH_ASYNC_PROGRESS=1` | promotes XLA's FUNNELED request to `MPI_THREAD_MULTIPLE`, required when XLA threads and native MPI I/O or linear algebra coexist; the native FFI aborts the MPI world on a lower grant |
 | `MPICH_GPU_SUPPORT_ENABLED=0` | CPU steps |
 
-**Threads per rank.** `-c`/`LORRAX_CPUS_PER_TASK` sets one affinity mask per
-rank, shared by XLA's CPU worker pool (not capped by `OMP_NUM_THREADS`),
+**Threads per rank.** `-c` sets one affinity mask per rank; for `lx run --cpu`
+it comes from `LORRAX_CPUS_PER_TASK`, a launcher variable `lx` reads (default
+8). The mask is shared by XLA's CPU worker pool (not capped by `OMP_NUM_THREADS`),
 LibSci/SLATE OpenMP teams (capped by `OMP_NUM_THREADS` and the handler dials
 the startup report prints), the MPICH progress thread and Python's I/O
 threads. LORRAX binds none of them to a private CPU subset, so set
