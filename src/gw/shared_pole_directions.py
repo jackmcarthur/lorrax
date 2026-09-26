@@ -112,10 +112,15 @@ def _round_kernels(mesh, layout="batch"):
         return herm(mm(o,o,transb="C")), herm(mm(rest,rest,transb="C"))
 
     column = program(lambda q, e: jax.lax.dynamic_index_in_dim(q, e, axis=1, keepdims=False), (batch, rep), batch)
+
+    @lru_cache(maxsize=None)
+    def columns(count):
+        # Every field of a stored panel stack [.., F, n, r] in one program, not one call per field.
+        return program(lambda q: tuple(q[:, i] for i in range(count)), (batch,), (batch,) * count)
     apply = program(lambda m, q: mm(m,q), (batch, batch), batch)
     negative_hermitian = program(lambda a: -(a + adjoint(a)) / 2, (batch,), batch)
     return SimpleNamespace(
-        take=take, column=column, negative_hermitian=negative_hermitian,
+        take=take, column=column, columns=columns, negative_hermitian=negative_hermitian,
         minus_q_partner=minus_q_partner, act=act, apply=apply,
         stack=program(lambda *a:jnp.stack(a,axis=1),batch,batch),
         dedupe=program(dedupe, (batch, batch), (batch, batch)))
@@ -327,16 +332,16 @@ def selection_layout(mesh, execution, nq):
     axis [B, 1, m, n]. ``to_face`` takes panel fields [B, m, r] back to the
     face and stacks them [nq, F, m_X, r_Y].
     """
-    from gw.shared_pole_local import batch_to_face
+    from gw.shared_pole_local import batch_stack_to_face
     face4 = NamedSharding(mesh, P(None, None, "x", "y"))
     stack = jax.jit(lambda *fields: jnp.stack(fields, axis=1)[:nq], out_shardings=face4)
     axis = jax.jit(lambda a: a[:, None], out_shardings=(
         face4 if execution == "face" else NamedSharding(mesh, P(("x", "y"), None, None, None))))
     if execution == "face":
         return (lambda a: a), axis, stack
-    back = batch_to_face(mesh)
-    return ((lambda a: distrib_la.batch_layout(a, mesh)), axis,
-            (lambda *fields: stack(*(back(f) for f in fields))))
+    # One exchange for the whole panel set: the fields are stacked in batch
+    # layout and moved together, not one batch_to_face per field.
+    return ((lambda a: distrib_la.batch_layout(a, mesh)), axis, batch_stack_to_face(mesh, nq))
 
 
 class LineSelection:
@@ -365,13 +370,21 @@ class LineSelection:
                                   constructor_eigenplan(mesh_xy, 2 * f["rows"], execution))
                       for f in families}
 
-    def _cross(self, family, value, slope, states, *, mirror):
+    def _rectangles(self, value, slope):
+        """The off-diagonal endpoint blocks of one operator pair, cut once for every family.
+
+        Family f's cross actions read (g, f) and (f, g) of the value and the
+        slope, g the other family, so the two families share these four blocks.
+        """
+        cut = {e: (self.block(value, e), self.block(slope, e)) for e in ((1, 0), (0, 1))}
+        return {(f, g): (cut[(g, f)][0], cut[(f, g)][0], cut[(g, f)][1], cut[(f, g)][1])
+                for f, g in ((0, 1), (1, 0))}
+
+    def _cross(self, family, rectangles, states, *, mirror):
         from gw.shared_pole_sectors import _local_cross_action_program
         from gw.shared_pole_execution import cross_action_program
         f = family["index"]
-        g = 1 - f
-        rectangles = (self.block(value, (g, f)), self.block(value, (f, g)),
-                      self.block(slope, (g, f)), self.block(slope, (f, g)))
+        rectangles = rectangles[(f, 1 - f)]
         # A mirror state acts with the minus-q partner's rectangles.
         panels = (None,) * 4 + rectangles if mirror else rectangles
         sample = jnp.asarray(0, jnp.int32)
@@ -389,13 +402,20 @@ class LineSelection:
             eig, svd = self.plans[family["name"]]
             f = family["index"]
             W, dW = self.block(value, (f, f)), self.block(slope, (f, f))
-            line = line_sample_states(W, dW, family["recipe"], sid=sid, ordered=self.ordered,
-                                      real=self.nq, mesh_xy=self.mesh, eigh_plan=eig, svd_plan=svd,
-                                      column_extent=self.extent, logical_n=family["logical_n"])
+            lines[family["name"]] = line_sample_states(
+                W, dW, family["recipe"], sid=sid, ordered=self.ordered,
+                real=self.nq, mesh_xy=self.mesh, eigh_plan=eig, svd_plan=svd,
+                column_extent=self.extent, logical_n=family["logical_n"])
             del W, dW
-            if family["cross"]:
-                line["cross"] = self._cross(family, value, slope, line["states"], mirror=False)
-            lines[family["name"]] = line
+        # The cross actions follow every diagonal selection, so the shared
+        # rectangles are live only while they act.
+        if any(family["cross"] for family in self.families):
+            rectangles = self._rectangles(value, slope)
+            for family in self.families:
+                if family["cross"]:
+                    line = lines[family["name"]]
+                    line["cross"] = self._cross(family, rectangles, line["states"], mirror=False)
+            del rectangles
         return lines
 
     def mirror(self, sid, lines, value, slope):
@@ -406,8 +426,13 @@ class LineSelection:
             partner = (self.block(value, (f, f)), self.block(slope, (f, f)))
             line["mirrors"] = line_sample_mirrors(line, partner, family["recipe"], sid=sid, mesh_xy=self.mesh)
             del partner
-            if family["cross"]:
-                line["cross"] += self._cross(family, value, slope, line["mirrors"], mirror=True)
+        if any(family["cross"] for family in self.families):
+            rectangles = self._rectangles(value, slope)
+            for family in self.families:
+                if family["cross"]:
+                    line = lines[family["name"]]
+                    line["cross"] += self._cross(family, rectangles, line["mirrors"], mirror=True)
+            del rectangles
 
     def panels(self, sid, lines):
         """The bank write of one line sample: every family's face panels and counts."""
@@ -455,8 +480,7 @@ def line_panel_states(panels, counts, recipe, *, sid, ordered, mesh_xy):
     state's output O; mirrors at -z and -conj z on the same directions.
     """
     k = _round_kernels(mesh_xy, "face" if is_face_stack(panels) else "batch")
-    put = replicated(mesh_xy)
-    field = [k.column(panels, put(np.int32(i))) for i in range(int(panels.shape[1]))]
+    field = k.columns(int(panels.shape[1]))(panels)
     z = _sample_point(recipe, sid)
     s = z if ordered else z ** 2
     q, o = field[0], field[1]

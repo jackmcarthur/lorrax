@@ -59,6 +59,38 @@ def batch_to_face(mesh_xy):
 
 
 @lru_cache(maxsize=None)
+def batch_stack_to_face(mesh_xy, nq):
+    """Fields [B, m, r_f] in batch layout -> one face stack [nq, F, m_X, r_Y].
+
+    The same y-then-x exchange as ``batch_to_face``, applied once to the
+    stacked fields (each padded to its own Py-divisible width first) instead
+    of once per field; the result's rows are the first ``nq`` batch rows.
+    """
+    import jax
+    import jax.numpy as jnp
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    from common.shard_map import shard_map
+    from runtime.padding import padded_axis
+    px, py = int(mesh_xy.shape['x']), int(mesh_xy.shape['y'])
+
+    def restore(a):
+        if py > 1:
+            a = jax.lax.all_to_all(a, 'y', split_axis=3, concat_axis=0, tiled=True)
+        if px > 1:
+            a = jax.lax.all_to_all(a, 'x', split_axis=2, concat_axis=0, tiled=True)
+        return a
+    move = shard_map(restore, mesh=mesh_xy, in_specs=P(BATCH), out_specs=P(None, None, 'x', 'y'),
+                     check_vma=False)
+
+    def pad(a):
+        width = padded_axis(a.shape[2], py, name='shared_pole_factor_width').pad if py > 1 else 0
+        return jnp.pad(a, ((0, 0), (0, 0), (0, width))) if width else a
+
+    return jax.jit(lambda *fields: move(jnp.stack([pad(f) for f in fields], axis=1))[:nq],
+                   out_shardings=NamedSharding(mesh_xy, P(None, None, 'x', 'y')))
+
+
+@lru_cache(maxsize=None)
 def face_rows(mesh_xy, rows, width=None):
     """Select parent rows of face stacks [B, m_X, r_Y] on their replicated leading axis.
 

@@ -1478,21 +1478,31 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
     return _finish_receipt(receipt,meta,header,started)
 
 
+_PHOTON_SECTOR_BLOCKS = (("CC", ((0, 0),)),
+                         ("CT", tuple((0, b) for b in range(1, 4))),
+                         ("TC", tuple((a, 0) for a in range(1, 4))),
+                         ("TT", tuple((a, b) for a in range(1, 4) for b in range(1, 4))))
+
+
+@lru_cache(maxsize=8)
+def _photon_norm_program(layout, mesh_xy):
+    """Frobenius norms of the CC/CT/TC/TT blocks of every parent in one program, not ~70 eager passes."""
+    from .photon_layout import photon_block_view
+
+    @jax.jit
+    def norms(value):
+        return jnp.stack([jnp.sqrt(sum(jnp.sum(jnp.abs(photon_block_view(value, layout, a, b, mesh_xy))**2,
+                                               axis=(-2, -1)) for a, b in pairs))
+                          for _, pairs in _PHOTON_SECTOR_BLOCKS], axis=-1)
+    return norms
+
+
 def _photon_sample_norms(receipt, value, parent, first, layout, mesh_xy):
     """Record Frobenius norms of CC/CT/TC/TT without gathering operators."""
-    from .photon_layout import photon_block_view
-    norms = []
-    for sector, pairs in (("CC", ((0, 0),)),
-                          ("CT", tuple((0, b) for b in range(1, 4))),
-                          ("TC", tuple((a, 0) for a in range(1, 4))),
-                          ("TT", tuple((a, b) for a in range(1, 4) for b in range(1, 4)))):
-        squared = sum(jnp.sum(jnp.abs(photon_block_view(value, layout, a, b, mesh_xy))**2,
-                              axis=(-2, -1)) for a, b in pairs)
-        norms.append(jnp.sqrt(squared))
-    values = np.asarray(jnp.stack(norms, axis=-1))
+    values = np.asarray(_photon_norm_program(layout, mesh_xy)(value))
     receipt.setdefault("sector_sample_norms", []).extend(
         dict(parent=int(parent)+i, first_sample=int(first),
-             **{name: [float(v)] for name, v in zip(("CC","CT","TC","TT"), row)})
+             **{name: [float(v)] for (name, _), v in zip(_PHOTON_SECTOR_BLOCKS, row)})
         for i, row in enumerate(values))
 
 

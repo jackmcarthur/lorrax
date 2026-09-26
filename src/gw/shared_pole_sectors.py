@@ -890,14 +890,12 @@ def cross_round_actions(samples, states, roles, recipe, *, sample_ids, mesh_xy, 
     Outputs follow the paired state order and the derivative is d/dz, report
     equation 5.3.
     """
-    import numpy as np
-    from gw.shared_pole_directions import _round_kernels, _sample_point, replicated
+    from gw.shared_pole_directions import _round_kernels, _sample_point
     from gw.shared_pole_execution import is_face,cross_action_program
     from gw.shared_pole_local import _pad_columns
     face=is_face(samples[0])
     k=_round_kernels(mesh_xy,'face' if face else 'batch')
     index={int(sid):i for i,sid in enumerate(sample_ids)}
-    put=replicated(mesh_xy)
     stored={}
     outputs=[]
     for state,role in zip(states,roles[0]):
@@ -907,7 +905,7 @@ def cross_round_actions(samples, states, roles, recipe, *, sample_ids, mesh_xy, 
         if sid in line_cross:
             if sid not in stored:
                 panels=line_cross[sid][0]
-                stored[sid]=[k.column(panels,put(np.int32(i))) for i in range(int(panels.shape[1]))]
+                stored[sid]=list(k.columns(int(panels.shape[1]))(panels))
             # The round padded the state's direction to its carrier
             # (grow_round); its padding columns act as zero.
             width=int(state[1].shape[-1])
