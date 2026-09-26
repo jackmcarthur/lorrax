@@ -971,7 +971,7 @@ __device__ __forceinline__ void tt_finish(const TileTabs& s, int b, int npr, lrx
 #ifndef LRX_MINB
 #define LRX_MINB 1
 #endif
-extern "C" __global__ void __launch_bounds__(256, LRX_MINB) lrx_kconv(
+extern "C" __global__ void __launch_bounds__(LRX_THREADS, LRX_MINB) lrx_kconv(
     const lrx_c2* __restrict__ gp, const lrx_c2* __restrict__ gt,
     const lrx_c2* __restrict__ kern, lrx_c2* __restrict__ y, UnfoldTab t, double scale) {
     static_assert(RB == TT_ROWS, "the host passes the tile's pairs and rows together");
@@ -1729,6 +1729,17 @@ static TilePlan tile_table_plan(int dev, int tp_max, long long bank_pair, int nk
     return p;
 }
 
+// The tile-table block size: the finish runs one item per (k, operand group, spin lane), and
+// items past the block size run a second round that the rest of the block waits out at the
+// finish's closing barrier (6x6 ns 4: 288 items, a 32-lane tail).  Where one round of up to 512
+// threads covers them, the block takes that many threads (whole warps), if the plan's resident
+// blocks keep at least 56 registers per thread (the fused load's 56 on an A100's 64 K).
+static int tt_threads(long long items, int minb) {
+    if (items <= kThreads || items > 2 * kThreads) return kThreads;
+    const int t = static_cast<int>((items + 31) / 32 * 32);
+    return 56LL * t * minb <= 65536 ? t : kThreads;
+}
+
 // nsr: the right endpoint width of mode 9 (0 = ns, every other mode).
 static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
                         std::string_view mathdx_root, std::string_view cubin_dir, const Built** out,
@@ -1798,6 +1809,7 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
                     chi_minb = tt.blocks;
                     chi_trc = tt.tp * chi_grp;
                     chi_smem = tt.smem;
+                    chi_threads = tt_threads(static_cast<long long>(nk) * tt.tp * 2 * ns, tt.blocks);
                 }
             }
         } else {
@@ -1860,7 +1872,7 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
     // Mode 7 on the tile tables (whole spin groups, sm_80+ cp.async): the largest tile of whole
     // pairs, at most the grouped load's, whose bank and tables (UnfoldTiles, W_R staged) fit two
     // blocks on an SM with the device's per-block reservation; none fits: the register load.
-    int m7_tp = 0, m7_blocks = 0;
+    int m7_tp = 0, m7_blocks = 0, m7_threads = kThreads;
     long long m7_smem = 0;
     if (mode == 7 && blk == ns && nsr == ns && cc_major >= 8 && rb >= grp_rows && tile_tables_pay(ns)) {
         const TilePlan tt = tile_table_plan(dev, static_cast<int>(rb / grp_rows), grp_rows * row_bytes, nk, ns, 1,
@@ -1870,6 +1882,7 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
             m7_tp = tt.tp;
             m7_blocks = tt.blocks;
             m7_smem = tt.smem;
+            m7_threads = tt_threads(static_cast<long long>(nk) * tt.tp * ns, tt.blocks);
             rb = static_cast<long long>(tt.tp) * grp_rows;
         }
     }
@@ -1962,6 +1975,7 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
         defs.push_back("-DLRX_TT=" + std::string(m7_tp ? "1" : "0"));
         defs.push_back("-DLRX_TP=" + std::to_string(m7_tp));
         defs.push_back("-DLRX_MINB=" + std::to_string(m7_tp ? m7_blocks : 1));
+        if (m7_tp) defs.push_back("-DLRX_THREADS=" + std::to_string(m7_threads));
     }
     if (mode == 8 && !lor_split) defs.push_back("-DLRX_ARM=0");
     if (kbox_rows || lor_split) {
@@ -2053,6 +2067,7 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
         int sms = 0;
         LRX_CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev), "SM count");
         b.smem = static_cast<int>(m7_smem);
+        b.threads = m7_threads;
         b.grid_cap = static_cast<long long>(sms) * m7_blocks;
     }
     if (mode == 10) {                                  // persistent blocks: the resident count
@@ -2083,9 +2098,9 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
     }
     if (mklpin::announce_here() || log_enabled()) {
         std::fprintf(stderr, "[kconv_mathdx] %s mode=%d%s kgrid=(%d,%d,%d) ns=%d sm_%d%d in %.1f ms "
-                     "(rows/block=%d, smem=%d B, cubin %s)\n",
+                     "(rows/block=%d, smem=%d B, threads=%d, cubin %s)\n",
                      from_disk ? "disk-cache hit" : (rebuilt_bad ? "NVRTC rebuilt (cached image refused)" : "NVRTC built"), mode, f32 ? " c64" : "", nkx, nky, nkz, ns,
-                     cc_major, cc_minor, ms, b.rb, b.smem,
+                     cc_major, cc_minor, ms, b.rb, b.smem, b.threads,
                      path.empty() ? "not cached (no cubin_dir)"
                                   : (from_disk ? path.c_str() : (stored ? "stored" : "store FAILED")));
     }
@@ -2401,7 +2416,7 @@ static ffi::Error KleadUnfoldImpl(
     long long blocks = (rows + k->rb - 1) / k->rb;
     if (k->grid_cap > 0) blocks = std::min(blocks, k->grid_cap);   // the tile tables' persistent grid
     if (blocks > 2147483647LL) return bad("grid.x overflow");
-    CUresult cr = driver_api().LaunchKernel(k->fn, static_cast<unsigned>(blocks), 1, 1, kThreads, 1, 1,
+    CUresult cr = driver_api().LaunchKernel(k->fn, static_cast<unsigned>(blocks), 1, 1, k->threads, 1, 1,
                                             static_cast<unsigned>(k->smem),
                                             reinterpret_cast<CUstream>(stream), args, nullptr);
     if (cr != CUDA_SUCCESS) return fail("cuLaunchKernel", cu_err(cr));
