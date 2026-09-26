@@ -70,7 +70,6 @@ struct OuterGeo {                          // the embedded source declares the s
     long long items;                       // nyb * nb * ngrp
     double scale;
     int conj_r;                            // 1: the load reads conj(R) (the BSE right leg is conj(psi))
-    long long nc, nv;                      // decode arm: Pc (nk, nc, na, mx), Pv (nk, nv, nb, my)
 };
 
 static ffi::Error fail(const char* where, const std::string& detail,
@@ -93,7 +92,6 @@ struct OuterGeo {
     long long items;
     double scale;
     int conj_r;
-    long long nc, nv;
 };
 
 constexpr int NX = LRX_NX, NY = LRX_NY, NZ = LRX_NZ, NK = NX * NY * NZ;
@@ -114,21 +112,9 @@ __device__ __forceinline__ void lrx_dmma(double& d0, double& d1, double a, doubl
                  : "+d"(d0), "+d"(d1) : "d"(a), "d"(b));
 }
 
-#if LRX_DEC
-// Decode arm (piece C prototype): no U store.  After the forward transform each warp folds its
-// k columns into A[k, c, nu] += sum_mu conj(Pc[k, c, a, mu]) U[k, mu, nu] (DMMA, registers, the
-// (t, mu)-first order of bse_stack_matvec._decode); at the item's end A meets Pv over nu and the
-// (c, v, k) partial is added atomically into Y.
-constexpr int MB = LRX_MB;                // 8-row c blocks
-extern "C" __global__ void __launch_bounds__(LRX_THREADS, LRX_MINB) lrx_kconv_outer(
-    const lrx_c2* __restrict__ L, const lrx_c2* __restrict__ R, const lrx_c2* __restrict__ V,
-    const lrx_c2* __restrict__ Pc, const lrx_c2* __restrict__ Pv, double* __restrict__ Y, OuterGeo g) {
-    lrx_c2* U = nullptr;
-#else
 extern "C" __global__ void __launch_bounds__(LRX_THREADS, LRX_MINB) lrx_kconv_outer(
     const lrx_c2* __restrict__ L, const lrx_c2* __restrict__ R, const lrx_c2* __restrict__ V,
     lrx_c2* __restrict__ U, OuterGeo g) {
-#endif
     extern __shared__ lrx_c2 bank[];
     using namespace cufftdx;
     const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
@@ -147,13 +133,6 @@ extern "C" __global__ void __launch_bounds__(LRX_THREADS, LRX_MINB) lrx_kconv_ou
         const bool yok = gr < ylim;
         const double2* rb = reinterpret_cast<const double2*>(R + (long long)b * g.my + y0 + gr);
         const long long p0 = grp * g.per, p1 = min(pairs, p0 + g.per);
-#if LRX_DEC
-        double acc[(NK + NWARP - 1) / NWARP][MB][4];
-#pragma unroll
-        for (int kk = 0; kk < (NK + NWARP - 1) / NWARP; ++kk)
-#pragma unroll
-            for (int mb = 0; mb < MB; ++mb) { acc[kk][mb][0] = acc[kk][mb][1] = acc[kk][mb][2] = acc[kk][mb][3] = 0.0; }
-#endif
         for (long long p = p0; p < p1; ++p) {
             const int a = (int)(p % g.na), x0 = (int)(p / g.na) * XB;
             const int xlim = min(XB, (int)g.mx - x0);
@@ -200,32 +179,6 @@ extern "C" __global__ void __launch_bounds__(LRX_THREADS, LRX_MINB) lrx_kconv_ou
             }
             __syncthreads();
             lrx_kbox::transform3<NX, NY, NZ, TR, LRX_SM, fft_direction::forward>(bank);
-#if LRX_DEC
-            // Decode: A[k, c, nu] += conj(Pc[k, c, a, x0 + mu]) U[k, mu, nu] (the scale is applied to Y).
-#pragma unroll
-            for (int kk = 0; kk < (NK + NWARP - 1) / NWARP; ++kk) {
-                const int k = warp + kk * NWARP;
-                if (k < NK) {
-#pragma unroll
-                    for (int h = 0; h < 2; ++h) {
-                        const lrx_c2 ub = bank[((4 * h + tg) * YB + gr) * GK::RS + GK::at(k)];
-                        const long long mu = x0 + 4 * h + tg;
-#pragma unroll
-                        for (int mb = 0; mb < MB; ++mb) {
-                            const long long c = mb * 8 + gr;
-                            const double2 pc = (c < g.nc && mu < g.mx)
-                                ? __ldg(reinterpret_cast<const double2*>(Pc + (((long long)k * g.nc + c) * g.na + a) * g.mx + mu))
-                                : make_double2(0.0, 0.0);
-                            lrx_dmma(acc[kk][mb][0], acc[kk][mb][1], pc.x, ub.x);
-                            lrx_dmma(acc[kk][mb][0], acc[kk][mb][1], pc.y, ub.y);
-                            lrx_dmma(acc[kk][mb][2], acc[kk][mb][3], pc.x, ub.y);
-                            lrx_dmma(acc[kk][mb][2], acc[kk][mb][3], -pc.y, ub.x);
-                        }
-                    }
-                }
-            }
-            (void)U;
-#else
             // Store: mode 2's RowStore (v * scale), U k-leading (nk, na, mx, nb, my).
             lrx_c2* ub = U + (((long long)a * g.mx + x0) * g.nb + b) * g.my + y0;
             for (int i = threadIdx.x; i < TR * NK; i += blockDim.x) {
@@ -238,45 +191,8 @@ extern "C" __global__ void __launch_bounds__(LRX_THREADS, LRX_MINB) lrx_kconv_ou
                     ub[k * ku + xi * nbmy + yi] = w;
                 }
             }
-#endif
             __syncthreads();
         }
-#if LRX_DEC
-        // Item end: Y[c, v, k] += scale * sum_nu Pv[k, v, b, y0 + nu] A[k, c, nu], one 8-row c block at a
-        // time through the (now free) bank: A_s[k][c][nu] at k*64 + c*8 + nu.
-#pragma unroll
-        for (int mb = 0; mb < MB; ++mb) {
-#pragma unroll
-            for (int kk = 0; kk < (NK + NWARP - 1) / NWARP; ++kk) {
-                const int k = warp + kk * NWARP;
-                if (k < NK) {
-                    lrx_c2 a0, a1;
-                    a0.x = acc[kk][mb][0]; a0.y = acc[kk][mb][2];
-                    a1.x = acc[kk][mb][1]; a1.y = acc[kk][mb][3];
-                    bank[k * 64 + gr * 8 + 2 * tg] = a0;
-                    bank[k * 64 + gr * 8 + 2 * tg + 1] = a1;
-                }
-            }
-            __syncthreads();
-            for (long long o = threadIdx.x; o < (long long)NK * 8 * g.nv; o += blockDim.x) {
-                const int k = (int)(o / (8 * g.nv)), cl = (int)((o / g.nv) % 8);
-                const long long v = o % g.nv, c = mb * 8 + cl;
-                if (c >= g.nc) continue;
-                double sx = 0.0, sy = 0.0;
-                for (int nu = 0; nu < YB; ++nu) {
-                    if (y0 + nu >= g.my) break;
-                    const lrx_c2 pv = Pv[(((long long)k * g.nv + v) * g.nb + b) * g.my + y0 + nu];
-                    const lrx_c2 av = bank[k * 64 + cl * 8 + nu];
-                    sx = fma(pv.x, av.x, sx); sx = fma(-pv.y, av.y, sx);
-                    sy = fma(pv.x, av.y, sy); sy = fma(pv.y, av.x, sy);
-                }
-                double* yp = Y + 2 * ((c * g.nv + v) * NK + k);
-                atomicAdd(yp, sx * g.scale);
-                atomicAdd(yp + 1, sy * g.scale);
-            }
-            __syncthreads();
-        }
-#endif
     }
 }
 )__lrx__";
@@ -286,13 +202,13 @@ using nvrtc::driver_api;
 using nvrtc::cu_err;
 
 struct Built { CUfunction fn = nullptr; int smem = 0, minb = 1, sms = 0; };
-using Key = std::tuple<CUcontext, int, int, int, int, int>;   // ctx, nkx, nky, nkz, K, decode c blocks (0: U arm)
+using Key = std::tuple<CUcontext, int, int, int, int>;   // ctx, nkx, nky, nkz, K
 static std::mutex g_mu;
 static std::map<Key, Built> g_cache;
 static std::map<Key, std::string> g_fail;
 
 static ffi::Error build(int nkx, int nky, int nkz, int K, std::string_view mathdx_root,
-                        std::string_view cubin_dir, const Built** out, int mb = 0) {
+                        std::string_view cubin_dir, const Built** out) {
     const DriverApi& api = driver_api();
     if (!api.ok) return fail("driver-api resolve", api.err);
     CUcontext ctx = nullptr;
@@ -302,7 +218,7 @@ static ffi::Error build(int nkx, int nky, int nkz, int K, std::string_view mathd
         cr = api.CtxGetCurrent(&ctx);
         if (cr != CUDA_SUCCESS || ctx == nullptr) return fail("cuCtxGetCurrent", cu_err(cr));
     }
-    const Key key{ctx, nkx, nky, nkz, K, mb};
+    const Key key{ctx, nkx, nky, nkz, K};
     std::lock_guard<std::mutex> lock(g_mu);
     if (auto it = g_cache.find(key); it != g_cache.end()) { *out = &it->second; return ffi::Error::Success(); }
     if (auto it = g_fail.find(key); it != g_fail.end()) return fail("kernel build (cached failure)", it->second);
@@ -333,7 +249,7 @@ static ffi::Error build(int nkx, int nky, int nkz, int K, std::string_view mathd
               "here -- ffi.fft.klead_outer_refusal routes such a grid to the unfused encode + mode 2 chain";
         return sticky("tile", os.str(), ffi::ErrorCode::kInvalidArgument);
     }
-    const int minb = mb ? 1 : std::max(1, std::min<int>(2, static_cast<int>(smem_sm / (smem + 1024))));
+    const int minb = std::max(1, std::min<int>(2, static_cast<int>(smem_sm / (smem + 1024))));
     std::string why;
     const std::string cuda_inc = nvrtc::toolkit_include(&why);
     if (cuda_inc.empty()) return sticky("CUDA toolkit headers for NVRTC", why);
@@ -350,8 +266,7 @@ static ffi::Error build(int nkx, int nky, int nkz, int K, std::string_view mathd
         "--gpu-architecture=sm_" + std::to_string(cc_major) + std::to_string(cc_minor),
         "-DLRX_NX=" + std::to_string(nkx), "-DLRX_NY=" + std::to_string(nky), "-DLRX_NZ=" + std::to_string(nkz),
         "-DLRX_K=" + std::to_string(K), "-DLRX_THREADS=" + std::to_string(kThreads),
-        "-DLRX_MINB=" + std::to_string(minb), "-DLRX_SM=" + std::to_string(cc_major * 100 + cc_minor * 10),
-        "-DLRX_DEC=" + std::string(mb ? "1" : "0"), "-DLRX_MB=" + std::to_string(mb ? mb : 1)};
+        "-DLRX_MINB=" + std::to_string(minb), "-DLRX_SM=" + std::to_string(cc_major * 100 + cc_minor * 10)};
     nvrtc::mathdx_toolchain(root, cuda_inc, "cufftdx", &prog);
     prog.kernel = "lrx_kconv_outer";
     std::string missing;
@@ -360,7 +275,7 @@ static ffi::Error build(int nkx, int nky, int nkz, int K, std::string_view mathd
     std::string path;
     if (!dir.empty()) {
         std::ostringstream name;
-        name << dir << "/kconv_outer_" << nkx << "x" << nky << "x" << nkz << "_K" << K << (mb ? "_dec" + std::to_string(mb) : std::string()) << "_sm" << cc_major
+        name << dir << "/kconv_outer_" << nkx << "x" << nky << "x" << nkz << "_K" << K << "_sm" << cc_major
              << cc_minor << "_" << key_hex << ".cubin";
         path = name.str();
     }
@@ -449,75 +364,366 @@ static ffi::Error KleadOuterConv(cudaStream_t stream, ffi::AnyBuffer L, ffi::Any
     return ffi::Error::Success();
 }
 
-// Piece C prototype: the decode fused into the store.  L, R, V as KleadOuterConv; Pc (nk, nc, na, mx)
-// = psi_c_X, Pv (nk, nv, nb, my) = psi_v_Y; Y (nc, nv, nk) = scale * sum conj(Pc) Pv U, this rank's
-// (mu_loc, nu_loc) partial in bse_stack_matvec._decode's order.  U is never stored.
-static ffi::Error KleadOuterDecode(cudaStream_t stream, ffi::AnyBuffer L, ffi::AnyBuffer R, ffi::AnyBuffer V,
-                                   ffi::AnyBuffer Pc, ffi::AnyBuffer Pv, ffi::Result<ffi::AnyBuffer> Y,
-                                   int64_t nkx, int64_t nky, int64_t nkz, double scale, int64_t conj_r,
+
+// ---------------------------------------------------------------------------------------------
+// The decode fused into the store (BSEC, 2026-09-26): U never reaches HBM.
+//
+//   A[k,c,b,y] = s * sum_{a,x} conj(Pc[k,c,a,x]) FFT_k( IFFT_k T[.,a,x,b,y] * V[x,y,k] )
+//
+// the first contraction of bse_stack_matvec._decode ((t, mu) first), on the outer load's tile:
+// after the forward transform each warp folds its k columns into registers, A[k, c, nu] +=
+// conj(Pc)[c, mu] U[mu, nu] on the fp64 tensor cores, over the (a, x block) pairs of one
+// (b, y block) item.  The (s, nu) contraction with Pv stays main's einsum (the door).
+//
+// Work: the (item, pair) units in item-major order, split evenly over one resident block per SM
+// (stream-K): block i takes units [i T / G, (i+1) T / G) and writes the A of each item it
+// touches, times the scale, to slot i + item of Apart (slots, NK, MB*8, 8); the door sums an
+// item's slots in slot order (deterministic; no atomics).  Operands arrive in fragment order
+// from the door, so every warp load is 512 contiguous bytes and needs no predicate:
+//   Lr  (na, nxb, NK, H, 8, 4)      lane (g, t) of chunk h at k:  L[k, a, 8 xb + g, 4h + t]
+//   Rr  (nb, nyb, NK, H, 8, 4)      lane (g, t) of chunk h at k:  R[k, 4h + t, b, 8 yb + g]
+//   Pcr (na, nxb, NK, MB, 2, 8, 4)  lane (g, t) of (mb, h) at k:  Pc[k, 8 mb + g, a, 8 xb + 4h + t]
+// zero-padded past mx, my, n_c and K, so a padded cell of the tile holds T = 0 and adds 0.
+// Per pair: load (T on DMMA, K chunks in order, as the U arm) -> bank, inverse transform3, Mid
+// (V[x, y, k] staged in shared memory by cp.async one pair ahead; a tile shared by consecutive
+// pairs is staged once), forward transform3, decode.  The bank column of tile cell (x, y) is
+// x*8 + (y ^ f(x)), f(x) = 3(x&1) + 4((x>>1)&1): the load's D-fragment stores and the decode's
+// B-fragment reads then each hit 8 distinct 16-byte bank groups per phase (RS is 1 mod 8).
+// The transforms, Mid and the K sum are the U arm's, so A is main's contraction of the same U
+// in a different summation order (round-off class).  One block per SM: the accumulator is
+// NK * MB * 8 * 8 complex per block (128 KB at 8x8, n_c 14), half the register file.
+static const char* kDecodeSrc = R"__lrx__(
+#include <cufftdx.hpp>
+typedef double lrx_real;
+struct __align__(16) lrx_c2 { double x, y; };
+#include "kbox_stage.cuh"
+
+struct DecodeGeo {
+    long long na, nxb, nb, nyb, mx, my;
+    long long pairs, total;
+    double scale;
+    int conj_r;
+};
+
+constexpr int NX = LRX_NX, NY = LRX_NY, NZ = LRX_NZ, NK = NX * NY * NZ;
+constexpr int KK = LRX_K, H = KK / 4, MB = LRX_MB, TR = 64, NWARP = LRX_THREADS / 32;
+constexpr int KW = (NK + NWARP - 1) / NWARP;
+static_assert(KK % 4 == 0, "K is a multiple of the m8n8k4 chunk (the door zero-pads)");
+using GK = lrx_kbox::Geo<NX, NY, NZ>;
+
+__device__ __forceinline__ lrx_c2 lrx_mul(lrx_c2 a, lrx_c2 b) {
+    lrx_c2 z = {a.x*b.x - a.y*b.y, a.x*b.y + a.y*b.x};
+    return z;
+}
+__device__ __forceinline__ void lrx_dmma(double& d0, double& d1, double a, double b) {
+    asm volatile("mma.sync.aligned.m8n8k4.row.col.f64.f64.f64.f64 {%0,%1}, {%2}, {%3}, {%0,%1};\n"
+                 : "+d"(d0), "+d"(d1) : "d"(a), "d"(b));
+}
+__device__ __forceinline__ int fperm(int x) { return 3 * (x & 1) + 4 * ((x >> 1) & 1); }
+__device__ __forceinline__ int pcol(int x, int y) { return x * 8 + (y ^ fperm(x)); }
+
+// cp.async of the (xb, yb) V tile into vs[j * NK + k], bank column order; padded cells skipped.
+__device__ __forceinline__ void stage_v(lrx_c2* vs, const lrx_c2* __restrict__ V, int xb, int yb,
+                                        const DecodeGeo& g) {
+    const int x0 = xb * 8, y0 = yb * 8;
+    const int xlim = min(8, (int)g.mx - x0), ylim = min(8, (int)g.my - y0);
+    const lrx_c2* vb = V + ((long long)x0 * g.my + y0) * NK;
+    for (int o = threadIdx.x; o < TR * NK; o += blockDim.x) {
+        const int k = o % NK, j = o / NK, x = j >> 3, y = (j & 7) ^ fperm(x);
+        if (x < xlim && y < ylim) lrx_kbox::cp_async<16>(vs + o, vb + (x * (int)g.my + y) * NK + k);
+    }
+    lrx_kbox::cp_async_commit();
+}
+
+extern "C" __global__ void __launch_bounds__(LRX_THREADS, 1) lrx_kconv_outer_decode(
+    const lrx_c2* __restrict__ Lr, const lrx_c2* __restrict__ Rr, const lrx_c2* __restrict__ V,
+    const lrx_c2* __restrict__ Pcr, lrx_c2* __restrict__ Apart, DecodeGeo g) {
+    extern __shared__ lrx_c2 smem[];
+    lrx_c2* bank = smem;
+    lrx_c2* vs = smem + TR * GK::RS;
+    using namespace cufftdx;
+    const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+    const int gr = lane >> 2, tg = lane & 3;
+    const long long u0 = (long long)blockIdx.x * g.total / gridDim.x;
+    const long long u1 = (long long)(blockIdx.x + 1) * g.total / gridDim.x;
+    if (u0 >= u1) return;
+    const double2* L2 = reinterpret_cast<const double2*>(Lr) + lane;
+    const double2* R2 = reinterpret_cast<const double2*>(Rr) + lane;
+    const double2* P2 = reinterpret_cast<const double2*>(Pcr) + lane;
+    double acc[KW][MB][4];
+#pragma unroll
+    for (int kk = 0; kk < KW; ++kk)
+#pragma unroll
+        for (int mb = 0; mb < MB; ++mb) acc[kk][mb][0] = acc[kk][mb][1] = acc[kk][mb][2] = acc[kk][mb][3] = 0.0;
+    long long it = u0 / g.pairs, p = u0 % g.pairs;
+    int vx = (int)(p / g.na), vy = (int)(it / g.nb);
+    stage_v(vs, V, vx, vy, g);
+    for (long long u = u0; u < u1; ++u) {
+        const int b = (int)(it % g.nb), yb = (int)(it / g.nb);
+        const int a = (int)(p % g.na), xb = (int)(p / g.na);
+        const int xlim = min(8, (int)g.mx - xb * 8), ylim = min(8, (int)g.my - yb * 8);
+        // Load: T[k, a, x, b, y] = sum_K L R on the tensor cores, K chunks in order (the U arm's
+        // sums; re and im interleaved, each accumulator's order unchanged).
+        const double2* lb = L2 + (long long)(a * g.nxb + xb) * (NK * H * 32);
+        const double2* rb = R2 + (long long)(b * g.nyb + yb) * (NK * H * 32);
+        for (int k = warp; k < NK; k += NWARP) {
+            double re0 = 0.0, re1 = 0.0, im0 = 0.0, im1 = 0.0;
+#pragma unroll
+            for (int h = 0; h < H; ++h) {
+                const double2 lv = __ldg(lb + (k * H + h) * 32);
+                const double2 rv = __ldg(rb + (k * H + h) * 32);
+                lrx_dmma(re0, re1, lv.x, rv.x);
+                if (g.conj_r) {
+                    lrx_dmma(im0, im1, lv.x, -rv.y);
+                    lrx_dmma(re0, re1, lv.y, rv.y);
+                } else {
+                    lrx_dmma(im0, im1, lv.x, rv.y);
+                    lrx_dmma(re0, re1, -lv.y, rv.y);
+                }
+                lrx_dmma(im0, im1, lv.y, rv.x);
+            }
+            lrx_c2 v0, v1;
+            v0.x = re0; v0.y = im0; v1.x = re1; v1.y = im1;
+            bank[pcol(gr, 2 * tg) * GK::RS + GK::at(k)] = v0;
+            bank[pcol(gr, 2 * tg + 1) * GK::RS + GK::at(k)] = v1;
+        }
+        __syncthreads();
+        lrx_kbox::transform3<NX, NY, NZ, TR, LRX_SM, fft_direction::inverse>(bank);
+        lrx_kbox::cp_async_wait_all();
+        __syncthreads();
+        // Mid: mode 2's KernMid product with the staged tile.
+        for (int i = threadIdx.x; i < TR * NK; i += blockDim.x) {
+            const int k = i % NK, j = i / NK, x = j >> 3, y = (j & 7) ^ fperm(x);
+            if (x < xlim && y < ylim) {
+                lrx_c2* e = bank + j * GK::RS + GK::at(k);
+                *e = lrx_mul(*e, vs[i]);
+            }
+        }
+        __syncthreads();
+        long long itn = it, pn = p + 1;
+        if (pn == g.pairs) { pn = 0; ++itn; }
+        if (u + 1 < u1) {
+            const int xn = (int)(pn / g.na), yn = (int)(itn / g.nb);
+            if (xn != vx || yn != vy) { stage_v(vs, V, xn, yn, g); vx = xn; vy = yn; }
+        }
+        lrx_kbox::transform3<NX, NY, NZ, TR, LRX_SM, fft_direction::forward>(bank);
+        // Decode: A[k, c, nu] += conj(Pc[k, c, a, 8 xb + mu]) U[k, mu, nu]; per accumulator the
+        // sums run mu-chunk (h) in order, re: Pr Ur then Pi Ui, im: Pr Ui then -Pi Ur.
+        const double2* pb = P2 + (long long)(a * g.nxb + xb) * (NK * MB * 64);
+#pragma unroll
+        for (int kk = 0; kk < KW; ++kk) {
+            const int k = warp + kk * NWARP;
+            if (k < NK) {
+#pragma unroll
+                for (int h = 0; h < 2; ++h) {
+                    const lrx_c2 ub = bank[pcol(4 * h + tg, gr) * GK::RS + GK::at(k)];
+                    double2 pc[MB];
+#pragma unroll
+                    for (int mb = 0; mb < MB; ++mb) pc[mb] = __ldg(pb + ((k * MB + mb) * 2 + h) * 32);
+#pragma unroll
+                    for (int mb = 0; mb < MB; ++mb) lrx_dmma(acc[kk][mb][0], acc[kk][mb][1], pc[mb].x, ub.x);
+#pragma unroll
+                    for (int mb = 0; mb < MB; ++mb) lrx_dmma(acc[kk][mb][2], acc[kk][mb][3], pc[mb].x, ub.y);
+#pragma unroll
+                    for (int mb = 0; mb < MB; ++mb) lrx_dmma(acc[kk][mb][0], acc[kk][mb][1], pc[mb].y, ub.y);
+#pragma unroll
+                    for (int mb = 0; mb < MB; ++mb) lrx_dmma(acc[kk][mb][2], acc[kk][mb][3], -pc[mb].y, ub.x);
+                }
+            }
+        }
+        // This block's run of the item ends: its A, scaled, to slot blockIdx.x + it.
+        if (u + 1 == u1 || itn != it) {
+            lrx_c2* ab = Apart + ((long long)blockIdx.x + it) * (NK * MB * 64);
+#pragma unroll
+            for (int kk = 0; kk < KW; ++kk) {
+                const int k = warp + kk * NWARP;
+#pragma unroll
+                for (int mb = 0; mb < MB; ++mb) {
+                    if (k < NK) {
+                        lrx_c2 a0, a1;
+                        a0.x = acc[kk][mb][0] * g.scale; a0.y = acc[kk][mb][2] * g.scale;
+                        a1.x = acc[kk][mb][1] * g.scale; a1.y = acc[kk][mb][3] * g.scale;
+                        lrx_c2* q = ab + ((k * MB + mb) * 8 + gr) * 8 + 2 * tg;
+                        q[0] = a0;
+                        q[1] = a1;
+                    }
+                    acc[kk][mb][0] = acc[kk][mb][1] = acc[kk][mb][2] = acc[kk][mb][3] = 0.0;
+                }
+            }
+        }
+        __syncthreads();
+        it = itn;
+        p = pn;
+    }
+}
+)__lrx__";
+
+struct DecodeGeo {                          // the embedded source declares the same struct
+    long long na, nxb, nb, nyb, mx, my;
+    long long pairs, total;
+    double scale;
+    int conj_r;
+};
+
+using DKey = std::tuple<CUcontext, int, int, int, int, int>;   // ctx, nkx, nky, nkz, K, MB
+static std::map<DKey, Built> g_dcache;
+static std::map<DKey, std::string> g_dfail;
+
+static ffi::Error build_decode(int nkx, int nky, int nkz, int K, int mb, std::string_view mathdx_root,
+                               std::string_view cubin_dir, const Built** out) {
+    const DriverApi& api = driver_api();
+    if (!api.ok) return fail("driver-api resolve", api.err);
+    CUcontext ctx = nullptr;
+    CUresult cr = api.CtxGetCurrent(&ctx);
+    if (cr != CUDA_SUCCESS || ctx == nullptr) {
+        if (cudaFree(nullptr) != cudaSuccess) return fail("context bind", "cudaFree(0)");
+        cr = api.CtxGetCurrent(&ctx);
+        if (cr != CUDA_SUCCESS || ctx == nullptr) return fail("cuCtxGetCurrent", cu_err(cr));
+    }
+    const DKey key{ctx, nkx, nky, nkz, K, mb};
+    std::lock_guard<std::mutex> lock(g_mu);
+    if (auto it = g_dcache.find(key); it != g_dcache.end()) { *out = &it->second; return ffi::Error::Success(); }
+    if (auto it = g_dfail.find(key); it != g_dfail.end()) return fail("kernel build (cached failure)", it->second);
+    auto sticky = [&](const char* where, const std::string& why,
+                      ffi::ErrorCode code = ffi::ErrorCode::kInternal) {
+        g_dfail.emplace(key, std::string(where) + " -- " + why);
+        return fail(where, why, code);
+    };
+    int dev = 0, cc_major = 0, cc_minor = 0, smem_optin = 0, sms = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess ||
+        cudaDeviceGetAttribute(&cc_major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess ||
+        cudaDeviceGetAttribute(&cc_minor, cudaDevAttrComputeCapabilityMinor, dev) != cudaSuccess ||
+        cudaDeviceGetAttribute(&smem_optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev) != cudaSuccess ||
+        cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev) != cudaSuccess)
+        return sticky("device attributes", "cudaDeviceGetAttribute");
+    if (cc_major < 8)
+        return sticky("GATE mathdx-kconv-outer-arch", "got sm_" + std::to_string(cc_major * 10 + cc_minor) +
+                      "; want sm_80+ (fp64 mma.m8n8k4); fix: none here -- the router keeps the unfused chain",
+                      ffi::ErrorCode::kFailedPrecondition);
+    const lrx_kbox::Geometry geo{nkx, nky, nkz};
+    const long long nk = static_cast<long long>(nkx) * nky * nkz;
+    const long long smem = static_cast<long long>(kTile) * kTile * (geo.rs() + nk) * 16;
+    const long long kw = (nk + kThreads / 32 - 1) / (kThreads / 32);
+    if (smem > smem_optin || kw * mb > 8) {
+        std::ostringstream os;
+        os << "GATE mathdx-kconv-outer-decode-tile: got k-grid (" << nkx << "," << nky << "," << nkz << "), "
+           << mb << " c blocks: bank + staged V " << smem << " B (want <= " << smem_optin << " B of opt-in shared "
+              "memory) and " << kw * mb << " accumulator blocks per lane (want <= 8, the register file); fix: none "
+              "here -- ffi.fft.klead_outer_decode_refusal routes such a shape to the outer conv + XLA decode";
+        return sticky("tile", os.str(), ffi::ErrorCode::kInvalidArgument);
+    }
+    std::string why;
+    const std::string cuda_inc = nvrtc::toolkit_include(&why);
+    if (cuda_inc.empty()) return sticky("CUDA toolkit headers for NVRTC", why);
+    const std::string root(mathdx_root);
+    if (!nvrtc::exists(root + "/include/cufftdx.hpp"))
+        return sticky("GATE mathdx-headers", "got no cufftdx.hpp under " + root + "/include; want the "
+                      "nvidia-mathdx wheel; fix: pip install nvidia-mathdx", ffi::ErrorCode::kFailedPrecondition);
+    nvrtc::Program prog;
+    prog.src = kDecodeSrc;
+    prog.name = "lrx_kconv_outer_decode.cu";
+    prog.headers = {{kbox::kHeaderName, kbox::kHeaderSrc}};
+    prog.defs = {
+        "--std=c++17", "--device-as-default-execution-space", "--generate-line-info",
+        "--gpu-architecture=sm_" + std::to_string(cc_major) + std::to_string(cc_minor),
+        "-DLRX_NX=" + std::to_string(nkx), "-DLRX_NY=" + std::to_string(nky), "-DLRX_NZ=" + std::to_string(nkz),
+        "-DLRX_K=" + std::to_string(K), "-DLRX_THREADS=" + std::to_string(kThreads),
+        "-DLRX_MB=" + std::to_string(mb), "-DLRX_SM=" + std::to_string(cc_major * 100 + cc_minor * 10)};
+    nvrtc::mathdx_toolchain(root, cuda_inc, "cufftdx", &prog);
+    prog.kernel = "lrx_kconv_outer_decode";
+    std::string missing;
+    const std::string key_hex = nvrtc::hex16(nvrtc::key(prog, &missing));
+    const std::string dir(missing.empty() ? std::string(cubin_dir) : std::string());
+    std::string path;
+    if (!dir.empty()) {
+        std::ostringstream name;
+        name << dir << "/kconv_outer_dec_" << nkx << "x" << nky << "x" << nkz << "_K" << K << "_mb" << mb << "_sm"
+             << cc_major << cc_minor << "_" << key_hex << ".cubin";
+        path = name.str();
+    }
+    nvrtc::Image img;
+    std::string where, err;
+    if (!nvrtc::build(prog, dir, path, key_hex, &img, &where, &err)) return sticky(where.c_str(), err);
+    Built b;
+    b.fn = img.fn;
+    b.smem = static_cast<int>(smem);
+    b.minb = 1;
+    b.sms = sms;
+    cr = api.FuncSetAttribute(b.fn, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, b.smem);
+    if (cr != CUDA_SUCCESS) return sticky("cuFuncSetAttribute", cu_err(cr));
+    if (mklpin::announce_here() || mklpin::debug_print_here()) {
+        std::fprintf(stderr, "[kconv_outer] decode %s kgrid=(%d,%d,%d) K=%d c-blocks=%d sm_%d%d in %.1f ms (8x8 tile, "
+                     "%d threads, 1 block/SM, smem=%d B, cubin %s)\n",
+                     img.from_disk ? "disk-cache hit" : "NVRTC built", nkx, nky, nkz, K, mb, cc_major, cc_minor,
+                     img.ms, kThreads, b.smem,
+                     path.empty() ? "not cached (no cubin_dir)" : (img.from_disk ? path.c_str() : "stored"));
+    }
+    *out = &(g_dcache[key] = b);
+    return ffi::Error::Success();
+}
+
+// Lr (na, nxb, nk, H, 8, 4), Rr (nb, nyb, nk, H, 8, 4), V (mx, my, nk), Pcr (na, nxb, nk, MB, 2, 8, 4)
+// -> Apart (grid + nb*nyb + 1, nk, MB*8, 8), complex128; `grid` blocks (the door's, one per SM).  Slot
+// i + item holds block i's scaled A of that item; the last slot is zeroed (the door's padding row).
+static ffi::Error KleadOuterDecode(cudaStream_t stream, ffi::AnyBuffer Lr, ffi::AnyBuffer Rr, ffi::AnyBuffer V,
+                                   ffi::AnyBuffer Pcr, ffi::Result<ffi::AnyBuffer> Apart, int64_t nkx, int64_t nky,
+                                   int64_t nkz, double scale, int64_t conj_r, int64_t grid,
                                    std::string_view mathdx_root, std::string_view cubin_dir) {
     auto bad = [](const std::string& why) { return fail("klead outer decode", why, ffi::ErrorCode::kInvalidArgument); };
+    if (nkx < 1 || nky < 1 || nkz < 1 || nkx > kAxisMax || nky > kAxisMax || nkz > kAxisMax) {
+        std::ostringstream os;
+        os << "GATE mathdx-kconv-axis: got k-grid (" << nkx << "," << nky << "," << nkz
+           << "); want every axis in [1, " << kAxisMax << "] (the fp64 cuFFTDx thread-FFT limit)";
+        return bad(os.str());
+    }
+    const auto C = ffi::DataType::C128;
+    if (Lr.element_type() != C || Rr.element_type() != C || V.element_type() != C || Pcr.element_type() != C ||
+        Apart->element_type() != C)
+        return bad("operands must all be complex128");
     const int64_t nk = nkx * nky * nkz;
-    auto ld = L.dimensions(), rd = R.dimensions(), cd = Pc.dimensions(), pd = Pv.dimensions(), yd = Y->dimensions();
-    if (ld.size() != 4 || rd.size() != 4 || cd.size() != 4 || pd.size() != 4 || yd.size() != 3)
-        return bad("want L (nk,na,mx,K), R (nk,K,nb,my), Pc (nk,nc,na,mx), Pv (nk,nv,nb,my), Y (nc,nv,nk)");
-    const int64_t na = ld[1], mx = ld[2], K = ld[3], nb = rd[2], my = rd[3], nc = cd[1], nv = pd[1];
-    if (ld[0] != nk || rd[0] != nk || rd[1] != K || cd[0] != nk || cd[2] != na || cd[3] != mx || pd[0] != nk ||
-        pd[2] != nb || pd[3] != my || yd[0] != nc || yd[1] != nv || yd[2] != nk || K % 4 || nc < 1 || nv < 1)
-        return bad("operand shapes disagree");
-    if (cudaMemsetAsync(Y->untyped_data(), 0, static_cast<size_t>(nc * nv * nk) * 16, stream) != cudaSuccess)
-        return fail("klead outer decode", "cudaMemsetAsync(Y)");
+    auto ld = Lr.dimensions(), rd = Rr.dimensions(), vd = V.dimensions(), pd = Pcr.dimensions(),
+         ad = Apart->dimensions();
+    if (ld.size() != 6 || rd.size() != 6 || vd.size() != 3 || pd.size() != 7 || ad.size() != 4)
+        return bad("want Lr (na,nxb,nk,H,8,4), Rr (nb,nyb,nk,H,8,4), V (mx,my,nk), Pcr (na,nxb,nk,MB,2,8,4), "
+                   "Apart (slots,nk,MB*8,8)");
+    const int64_t na = ld[0], nxb = ld[1], H = ld[3], nb = rd[0], nyb = rd[1], mx = vd[0], my = vd[1], mb = pd[3];
+    const int64_t items = nb * nyb;
+    if (ld[2] != nk || ld[4] != 8 || ld[5] != 4 || rd[2] != nk || rd[3] != H || rd[4] != 8 || rd[5] != 4 ||
+        vd[2] != nk || pd[0] != na || pd[1] != nxb || pd[2] != nk || pd[4] != 2 || pd[5] != 8 || pd[6] != 4 ||
+        nxb != (mx + 7) / 8 || nyb != (my + 7) / 8 || H < 1 || mb < 1 || grid < 1 ||
+        ad[0] != grid + items + 1 || ad[1] != nk || ad[2] != mb * 8 || ad[3] != 8)
+        return bad("operand shapes disagree (ffi.fft.make_local_kconv_klead_outer_decode builds them)");
+    if (mx * my * nk >= (int64_t(1) << 31))
+        return bad("V holds >= 2^31 elements (the staging's 32-bit offsets); split the call");
     const Built* k = nullptr;
-    const int mb = static_cast<int>((nc + 7) / 8);
-    if (ffi::Error e = build(static_cast<int>(nkx), static_cast<int>(nky), static_cast<int>(nkz),
-                             static_cast<int>(K), mathdx_root, cubin_dir, &k, mb);
+    if (ffi::Error e = build_decode(static_cast<int>(nkx), static_cast<int>(nky), static_cast<int>(nkz),
+                                    static_cast<int>(4 * H), static_cast<int>(mb), mathdx_root, cubin_dir, &k);
         !e.success())
         return e;
-    OuterGeo g{};
-    g.na = na; g.mx = mx; g.nb = nb; g.my = my;
-    g.nxb = (mx + kTile - 1) / kTile;
-    g.nyb = (my + kTile - 1) / kTile;
-    const long long slots = static_cast<long long>(k->sms) * k->minb;
-    const long long base = nb * g.nyb, pairs = na * g.nxb;
-    g.ngrp = std::max(1LL, std::min(pairs, (4 * slots + base - 1) / base));
-    g.per = (pairs + g.ngrp - 1) / g.ngrp;
-    g.items = base * g.ngrp;
+    const size_t row = static_cast<size_t>(nk * mb * 64) * 16;
+    char* ap = static_cast<char*>(Apart->untyped_data());
+    if (cudaMemsetAsync(ap + static_cast<size_t>(grid + items) * row, 0, row, stream) != cudaSuccess)
+        return fail("klead outer decode", "cudaMemsetAsync(padding slot)");
+    DecodeGeo g{};
+    g.na = na; g.nxb = nxb; g.nb = nb; g.nyb = nyb; g.mx = mx; g.my = my;
+    g.pairs = na * nxb;
+    g.total = items * g.pairs;
     g.scale = scale;
     g.conj_r = conj_r ? 1 : 0;
-    g.nc = nc; g.nv = nv;
-    const void* lp = L.untyped_data();
-    const void* rp = R.untyped_data();
+    const void* lp = Lr.untyped_data();
+    const void* rp = Rr.untyped_data();
     const void* vp = V.untyped_data();
-    const void* cp = Pc.untyped_data();
-    const void* pp = Pv.untyped_data();
-    void* yp = Y->untyped_data();
-    void* args[] = {(void*)&lp, (void*)&rp, (void*)&vp, (void*)&cp, (void*)&pp, (void*)&yp, (void*)&g};
-    CUresult cr = driver_api().LaunchKernel(k->fn, static_cast<unsigned>(std::min(g.items, 2147483647LL)), 1, 1,
-                                            kThreads, 1, 1, static_cast<unsigned>(k->smem),
-                                            reinterpret_cast<CUstream>(stream), args, nullptr);
+    const void* cp = Pcr.untyped_data();
+    void* yp = Apart->untyped_data();
+    void* args[] = {(void*)&lp, (void*)&rp, (void*)&vp, (void*)&cp, (void*)&yp, (void*)&g};
+    CUresult cr = driver_api().LaunchKernel(k->fn, static_cast<unsigned>(grid), 1, 1, kThreads, 1, 1,
+                                            static_cast<unsigned>(k->smem), reinterpret_cast<CUstream>(stream),
+                                            args, nullptr);
     if (cr != CUDA_SUCCESS) return fail("cuLaunchKernel", cu_err(cr));
     return ffi::Error::Success();
 }
 
 }  // namespace lorrax_ffi::kconv_outer
-
-XLA_FFI_DEFINE_HANDLER_SYMBOL(
-    KConvMathdxKleadOuterDecodeCudaFfi, lorrax_ffi::kconv_outer::KleadOuterDecode,
-    xla::ffi::Ffi::Bind()
-        .Ctx<xla::ffi::PlatformStream<cudaStream_t>>()
-        .Arg<xla::ffi::AnyBuffer>()   // L
-        .Arg<xla::ffi::AnyBuffer>()   // R
-        .Arg<xla::ffi::AnyBuffer>()   // V
-        .Arg<xla::ffi::AnyBuffer>()   // Pc
-        .Arg<xla::ffi::AnyBuffer>()   // Pv
-        .Ret<xla::ffi::AnyBuffer>()   // Y (nc, nv, nk)
-        .Attr<int64_t>("nkx")
-        .Attr<int64_t>("nky")
-        .Attr<int64_t>("nkz")
-        .Attr<double>("scale")
-        .Attr<int64_t>("conj_r")
-        .Attr<std::string_view>("mathdx_root")
-        .Attr<std::string_view>("cubin_dir"));
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
     KConvMathdxKleadOuterCudaFfi, lorrax_ffi::kconv_outer::KleadOuterConv,
@@ -532,5 +738,23 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Attr<int64_t>("nkz")
         .Attr<double>("scale")
         .Attr<int64_t>("conj_r")
+        .Attr<std::string_view>("mathdx_root")
+        .Attr<std::string_view>("cubin_dir"));
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(
+    KConvMathdxKleadOuterDecodeCudaFfi, lorrax_ffi::kconv_outer::KleadOuterDecode,
+    xla::ffi::Ffi::Bind()
+        .Ctx<xla::ffi::PlatformStream<cudaStream_t>>()
+        .Arg<xla::ffi::AnyBuffer>()   // Lr (na, nxb, nk, H, 8, 4)
+        .Arg<xla::ffi::AnyBuffer>()   // Rr (nb, nyb, nk, H, 8, 4)
+        .Arg<xla::ffi::AnyBuffer>()   // V (mx, my, nk), R space, k-minor
+        .Arg<xla::ffi::AnyBuffer>()   // Pcr (na, nxb, nk, MB, 2, 8, 4)
+        .Ret<xla::ffi::AnyBuffer>()   // Apart (grid + nb*nyb + 1, nk, MB*8, 8)
+        .Attr<int64_t>("nkx")
+        .Attr<int64_t>("nky")
+        .Attr<int64_t>("nkz")
+        .Attr<double>("scale")
+        .Attr<int64_t>("conj_r")
+        .Attr<int64_t>("grid")
         .Attr<std::string_view>("mathdx_root")
         .Attr<std::string_view>("cubin_dir"));
