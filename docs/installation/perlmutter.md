@@ -17,8 +17,10 @@ Run scripts export none of it.
 
 ## Every run
 
+`lx` selects the `lorrax_A` base module by default; `LX_BASE_MODULE` is an
+expert override.
+
 ```bash
-export LX_BASE_MODULE=lorrax_A
 lx doctor
 lx run --pool POOL -N 1 -G 4 -n 4 -- python3 -u -m gw.gw_jax -i cohsex.in
 ```

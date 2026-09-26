@@ -129,8 +129,7 @@ disables Cray GPU support. It does not set an OpenMP team size.
 export LORRAX_CHECKOUT=/path/to/lorrax
 export LORRAX_ROOT="$LORRAX_CHECKOUT"
 export CPU_JAX_VENV=/path/to/jax-0.9.1-venv
-export LX_BASE_MODULE=lorrax_A
-export LORRAX_CPUS_PER_TASK=16
+export LORRAX_CPUS_PER_TASK=16    # read by lx: srun -c for --cpu steps (default 8)
 export PYTHONPATH="$LORRAX_CHECKOUT/src${PYTHONPATH:+:$PYTHONPATH}"
 lx run --cpu --pool POOL -N 2 -n 4 -- bash -c '
   set -euo pipefail

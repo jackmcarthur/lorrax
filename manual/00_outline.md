@@ -26,8 +26,7 @@ quantitative precision reserved for error/knob statements (T3 makes trust empiri
 Part I — Overview & Getting Started (~7 pp)
 1. Introduction: 1.1 what LORRAX is · 1.2 capability matrix · 1.3 relation to other
    codes, ending with LORRAX-vs-legacy-BGW pros/cons · 1.4 units, notation, citing
-2. Installation: 2.1 support matrix · 2.2 pure-Python (serial tier) · 2.3 cluster tier
-   (phdf5 + distributed linalg strongly recommended) · 2.4 site recipes
+2. Installation: owned by `docs/installation/`; the manual has no chapter.
 3. Tutorial: 3.1 Si end-to-end · 3.2 same system GN-PPM · 3.3 2D+SOC teaser
 
 Part II — Theory & Methods (~22 pp)
@@ -86,5 +85,5 @@ Reading order: `docs/theory/minimax-quadrature.md` (spine, incl. LORRAX-fitted e
 laws) → `docs/theory/physics.md` §6.9 (Σ code narrative) →
 `docs/theory/THEORY_mpa_implementation.md` (Σ branches; core, stripe and slab
 windows) → Kim-2020 appendix transcription (primary source) →
-`services/minimax/src/minimax/minimax_assets/README.md` + `reports/sigma_ppm_tighten_2026-07-04`
-(error conventions; the per-pole-term −ω identity correction).
+`reports/sigma_ppm_tighten_2026-07-04` (error conventions; the per-pole-term −ω
+identity correction).
