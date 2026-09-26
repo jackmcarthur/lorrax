@@ -39,6 +39,16 @@ def agree_io_refusal(error, *, path, stage):
         raise ValueError(f"{exc} Local refusal: {error}") from error
 
 
+def read_commit_state(path):
+    """The receipt of the file at ``path``: 1, 0, or ``None`` if it carries none."""
+    import h5py
+
+    with h5py.File(str(path), "r") as h5:
+        if COMMIT_STATE not in h5:
+            return None
+        return int(h5[COMMIT_STATE][0])
+
+
 def set_commit_state(h5, committed):
     """Write the small receipt through an already-open serial HDF5 handle."""
     if COMMIT_STATE not in h5:

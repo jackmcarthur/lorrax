@@ -135,7 +135,6 @@ RUNTIME = initialize_communicator_stack(print_fn=debug_print)
 print0 = debug_print
 
 import gc
-import time
 
 import jax
 import numpy as np
@@ -143,7 +142,7 @@ import numpy as np
 from wfn_loader import WfnLoader                                    # noqa: E402
 from common import timing
 from common.collectives import process_rank
-from runtime.production_stream import ProductionStdout
+from runtime.run_session import RunSession
 
 from . import distribution as dist
 from .kmeans_isdf import (
@@ -448,225 +447,209 @@ def _prune(args, wfn, sym, mesh, cand_idx, orbit_id, n_unique, N_c):
 def main():
     args = build_parser().parse_args()
     validate_mode_policy(args)
-    production_warnings = []
-    production_stdout = ProductionStdout(
-        debug=debug_print_enabled(), rank=RUNTIME.process_index,
-        warning_fn=production_warnings.append)
-    production_stdout.install()
+    with RunSession(RUNTIME, "kmeans", None) as run:
+        # (the compile cache was armed at import, by step 7 of
+        # initialize_communicator_stack)
+        print0(f"✓ JAX initialized: {dist.device_summary()}")
 
-    # (the compile cache was armed at import, by step 7 of
-    # initialize_communicator_stack)
-    print0(f"✓ JAX initialized: {dist.device_summary()}")
-
-    timing.reset()
-    selection_start = time.perf_counter()
-
-    N_c = int(args.N_c)
-    oversample = float(args.oversample)
-    M_cand = int(np.ceil(N_c * oversample)) if oversample > 1.0 else N_c
-    if M_cand != N_c:
-        print0(f"Over-sampling: k-means M = {M_cand}, prune to N_c = {N_c} "
-               f"(ratio {oversample:g})")
-    else:
-        print0(f"Using N_c = {N_c} clusters (no pivoted-Cholesky pruning)")
-
-    with timing.section("setup.wfn_io"):
-        wfn = WfnLoader("WFN.h5")
-        sym = wfn.symmetry()
-
-        n_rtot = int(np.prod(wfn.fft_grid))
-        init_method, init_msg = _decide_init_method(N_c, n_rtot)
-        if init_msg is not None:
-            print0(init_msg)
-        dense_warn = _warn_dense_grid_regime(M_cand, N_c, n_rtot)
-        if dense_warn is not None:
-            print0(dense_warn)
-
-    fft_grid = tuple(int(x) for x in wfn.fft_grid)
-
-    avec_ang = np.asarray(wfn.avec) * float(wfn.alat) * BOHR_TO_ANG
-    print0(f"WFN FFT-grid shape: {fft_grid}")
-    print0(f"Lattice lengths: {np.linalg.norm(avec_ang, axis=1)} Å")
-
-    mesh = dist.build_mesh(int(np.prod(fft_grid)),
-                           shard=not args.no_shard,
-                           force_shard=args.force_shard,
-                           print_fn=print0)
-    mesh_axis = dist.MESH_AXES
-
-    # The loader was necessarily built mesh-less (the mesh is sized from
-    # the FFT grid the file declares), which at P>1 pinned it to the
-    # per-rank eager h5py read (scorecard BD.2).  Late-bind the mesh so
-    # backend=auto can pick the collective phdf5 route for the ψ loads
-    # (prune / rank gate / weight), as htransform already does.
-    wfn.adopt_mesh(mesh)
-
-    R, Rinv, tau, n_sym, orbit_aware = _resolve_symmetry(args, wfn)
-
-    with timing.section("setup.weight"):
-        weight, weight_label, weight_band_ranges = _resolve_weight(
-            args, wfn, sym, R, tau, dist_mesh=mesh)
-
-    # w^α re-weighting.  Per Gersho the asymptotic centroid number density
-    # goes as w^(3α/5), so α > 1 pulls points into high-density regions.
-    # Only the k-means sees the power; ``weight`` itself stays as measured,
-    # because it is also what breaks ties when snapped centroids collide.
-    kmeans_weight = weight
-    if args.rho_power != 1.0:
-        # Clip to non-negative first — QE's iFFT can leave tiny < 0 noise.
-        kmeans_weight = np.maximum(
-            np.asarray(weight, dtype=np.float64), 0.0) ** float(args.rho_power)
-        print0(f"k-means weight: (weight)^{args.rho_power:g} "
-               f"(asymptotic centroid density ∝ w^{0.6*args.rho_power:.3f})")
-
-    if orbit_aware:
-        # In orbit mode the SAMPLED count is M_cand; the OUTPUT after unfold
-        # may inflate by up to n_sym. Adjust kmeans target so the final
-        # unfolded centroid count is roughly N_c.
-        # (Generic-position rep unfolds to n_sym distinct centroids.)
-        M_cand_orbit = int(np.ceil(M_cand / n_sym))
-        if M_cand_orbit < 1:
-            raise ValueError(
-                f"Orbit mode: requested N_c={N_c} (×oversample={oversample}, "
-                f"M_cand={M_cand}) gives < 1 representative orbit at n_sym="
-                f"{n_sym}. Need N_c × oversample >= n_sym (= {n_sym}) so "
-                f"kmeans can sample at least one orbit; pass --no-orbit or "
-                f"raise N_c."
-            )
-        print0(f"Orbit-aware mode: n_sym = {n_sym}, "
-               f"running kmeans for M_rep = {M_cand_orbit} representatives "
-               f"(unfolded ≈ {M_cand_orbit * n_sym} centroids)")
-        kmeans_target = M_cand_orbit
-    else:
-        kmeans_target = M_cand
-
-    with timing.section("kmeans") as kmeans_section:
-        labels, centroids, _lloyd_steps, _lloyd_move_sq = weighted_kmeans_jax(
-            avec_ang, kmeans_weight, N_c=kmeans_target, seed=args.seed,
-            mesh=mesh, mesh_axis=mesh_axis,
-            init_method=init_method,
-            R=R, Rinv=Rinv, tau=tau,
-            print_fn=print0,
-        )
-        # The host materialises ``centroids`` immediately below.  Watch every
-        # returned device value here so this phase measures completion rather
-        # than asynchronous dispatch; this is one semantic boundary, not an
-        # inner-loop synchronization point.
-        kmeans_section.watch(
-            labels, centroids, _lloyd_steps, _lloyd_move_sq)
-    centroids_frac = np.asarray(centroids)
-
-    with timing.section("snap_unfold"):
-        centroid_indices, centroids_snapped, n_unique, orbit_id_arr = \
-            _snap_and_unfold(centroids_frac, fft_grid, weight, orbit_aware,
-                             Rinv, tau, n_sym, M_cand)
-
-    pruned = False
-    prune_rank = None
-    if oversample > 1.0 and n_unique > N_c:
-        release_arrays = [labels, centroids]
-        for array in (weight, kmeans_weight):
-            # ``weight`` is also the plot payload.  Retain that one reference
-            # when plotting, but release every device alias before the prune
-            # reloads the WFN windows.
-            if not args.plot or array is not weight:
-                release_arrays.append(array)
-        with timing.section("release_before_prune"):
-            _release_lloyd_before_prune(*release_arrays)
-        del release_arrays, labels, centroids, kmeans_weight
-        if not args.plot:
-            del weight
-        centroid_indices, rank = _prune(
-            args, wfn, sym, mesh, centroid_indices, orbit_id_arr,
-            n_unique, N_c)
-        n_unique = int(centroid_indices.shape[0])
-        centroids_snapped = centroid_indices.astype(float) / np.asarray(fft_grid)
-        pruned = True
-        prune_rank = int(rank)
-
-        print0(f"  [point rank] {rank}/{n_unique} delivered centroid "
-               "directions certified; rank deficiency is reported, while "
-               "LORRAX_CENTROID_SELECT=strict makes it a refusal")
-
-    # Default suffix follows --density-mode unless the user overrode it.
-    out_suffix = (args.out_suffix
-                  if args.out_suffix is not None
-                  else ("" if args.density_mode == "scalar" else "_current"))
-    out_file = f"centroids_frac_{n_unique}{out_suffix}.txt"
-    n_val_header, n_cond_header = _resolve_sigma_window(args, wfn)
-    prune_left, prune_right, prune_label = prune_band_ranges(
-        args, n_val_header, n_cond_header)
-    if args.density_mode == "current":
-        feature_fit = (
-            f"left={weight_band_ranges[0]}, right={weight_band_ranges[1]}: "
-            "sqrt(sum_k w_k sum_i,m,n "
-            "|Psi_mk^dag alpha_i Psi_nk/alpha_fs|^2); unit band weights")
-    else:
-        feature_fit = (
-            f"left={weight_band_ranges[0]}, right={weight_band_ranges[1]}: "
-            "sqrt(sum_k w_k sum_m,n |psi_mk^dag psi_nk|^2); "
-            "unit band weights")
-    kgrid = tuple(int(v) for v in np.asarray(wfn.kgrid).reshape(-1)[:3])
-    shift = tuple(float(v) for v in np.asarray(wfn.shift).reshape(-1)[:3])
-    prune_state = "pivoted Cholesky" if pruned else "not applied"
-    header = format_centroid_header(
-        feature_fit=feature_fit, source_wfn="WFN.h5",
-        weight_label=weight_label,
-        num_electrons=float(getattr(wfn, "num_electrons", np.nan)),
-        occupied_boundary=int(wfn.nelec), fft_grid=fft_grid,
-        kgrid=kgrid, shift=shift, seed=args.seed, rho_power=args.rho_power,
-        requested=N_c, candidates=M_cand, written=n_unique,
-        pruning=prune_state, prune_rank=prune_rank,
-        prune_left=prune_left, prune_right=prune_right,
-        prune_label=prune_label, orbit_aware=orbit_aware, n_sym=n_sym,
-        density_mode=args.density_mode)
-    # ONE writer.  Every rank used to reach this savetxt on the same shared
-    # path.  It survived P=16 only because all ranks write identical bytes —
-    # which is precisely the latent form of the bug that DID bite at P=64 in
-    # ``bse_io.write_eigenvectors_stream`` (64 concurrent h5py creators,
-    # rc=1 plus a structurally valid file; wk_REL S4.8).  ``centroids_snapped``
-    # is a pure function of the WFN + seed + candidate list and is identical on
-    # every rank, so rank 0's file is the file any rank would have written.
-    # No collective below this point, so gating cannot deadlock.
-    if process_rank() == 0:
-        np.savetxt(
-            out_file, centroids_snapped,
-            header=header,
-            fmt="%.6f", delimiter=" ", comments="# ",
-        )
-        print0(f"Saved centroids to {out_file}")
-
-    selection_wall = time.perf_counter() - selection_start
-    if process_rank() == 0 and debug_print_enabled():
-        timing.report(title="--- kmeans_cli timing (s) ---",
-                      wall=selection_wall)
-
-    if process_rank() == 0:
-        # The report carries the SAME suffix as the table it describes.  A
-        # charge and a current selection are routinely run in one directory
-        # (the deck names both files), and a bare "kmeans.out" meant the
-        # second run silently destroyed the first one's provenance -- the
-        # only record of its band window, seed, candidate pool and achieved
-        # rank.  The centroid table was already suffixed; the report was not.
-        report_file = f"kmeans{out_suffix}.out"
-        report_text = format_kmeans_report(
-            header=header, source_wfn="WFN.h5", centroid_file=out_file,
-            report_file=report_file,
-            wfn_backend=str(getattr(wfn, "backend", "unknown")),
-            elapsed_s=selection_wall, timing_records=timing.records(),
-            runtime=RUNTIME, warnings=production_warnings)
-        with open(report_file, "w", encoding="utf-8") as stream:
-            stream.write(report_text)
-        if debug_print_enabled():
-            rank0_print(report_text, end="")
+        N_c = int(args.N_c)
+        oversample = float(args.oversample)
+        M_cand = int(np.ceil(N_c * oversample)) if oversample > 1.0 else N_c
+        if M_cand != N_c:
+            print0(f"Over-sampling: k-means M = {M_cand}, prune to N_c = {N_c} "
+                   f"(ratio {oversample:g})")
         else:
-            production_stdout.emit(report_text, end="")
+            print0(f"Using N_c = {N_c} clusters (no pivoted-Cholesky pruning)")
 
-    if args.plot:
-        from .kmeans_plot import plot_density_and_centroids, interpolate_density
-        rho_plot = interpolate_density(weight, (args.plot_zoom,) * 3)
-        plot_density_and_centroids(wfn, rho_plot, centroids_snapped)
-    production_stdout.close()
+        with timing.section("setup.wfn_io"):
+            wfn = WfnLoader("WFN.h5")
+            sym = wfn.symmetry()
+
+            n_rtot = int(np.prod(wfn.fft_grid))
+            init_method, init_msg = _decide_init_method(N_c, n_rtot)
+            if init_msg is not None:
+                print0(init_msg)
+            dense_warn = _warn_dense_grid_regime(M_cand, N_c, n_rtot)
+            if dense_warn is not None:
+                print0(dense_warn)
+
+        fft_grid = tuple(int(x) for x in wfn.fft_grid)
+
+        avec_ang = np.asarray(wfn.avec) * float(wfn.alat) * BOHR_TO_ANG
+        print0(f"WFN FFT-grid shape: {fft_grid}")
+        print0(f"Lattice lengths: {np.linalg.norm(avec_ang, axis=1)} Å")
+
+        mesh = dist.build_mesh(int(np.prod(fft_grid)),
+                               shard=not args.no_shard,
+                               force_shard=args.force_shard,
+                               print_fn=print0)
+        mesh_axis = dist.MESH_AXES
+
+        # The loader was necessarily built mesh-less (the mesh is sized from
+        # the FFT grid the file declares), which at P>1 pinned it to the
+        # per-rank eager h5py read (scorecard BD.2).  Late-bind the mesh so
+        # backend=auto can pick the collective phdf5 route for the ψ loads
+        # (prune / rank gate / weight), as htransform already does.
+        wfn.adopt_mesh(mesh)
+
+        R, Rinv, tau, n_sym, orbit_aware = _resolve_symmetry(args, wfn)
+
+        with timing.section("setup.weight"):
+            weight, weight_label, weight_band_ranges = _resolve_weight(
+                args, wfn, sym, R, tau, dist_mesh=mesh)
+
+        # w^α re-weighting.  Per Gersho the asymptotic centroid number density
+        # goes as w^(3α/5), so α > 1 pulls points into high-density regions.
+        # Only the k-means sees the power; ``weight`` itself stays as measured,
+        # because it is also what breaks ties when snapped centroids collide.
+        kmeans_weight = weight
+        if args.rho_power != 1.0:
+            # Clip to non-negative first — QE's iFFT can leave tiny < 0 noise.
+            kmeans_weight = np.maximum(
+                np.asarray(weight, dtype=np.float64), 0.0) ** float(args.rho_power)
+            print0(f"k-means weight: (weight)^{args.rho_power:g} "
+                   f"(asymptotic centroid density ∝ w^{0.6*args.rho_power:.3f})")
+
+        if orbit_aware:
+            # In orbit mode the SAMPLED count is M_cand; the OUTPUT after unfold
+            # may inflate by up to n_sym. Adjust kmeans target so the final
+            # unfolded centroid count is roughly N_c.
+            # (Generic-position rep unfolds to n_sym distinct centroids.)
+            M_cand_orbit = int(np.ceil(M_cand / n_sym))
+            if M_cand_orbit < 1:
+                raise ValueError(
+                    f"Orbit mode: requested N_c={N_c} (×oversample={oversample}, "
+                    f"M_cand={M_cand}) gives < 1 representative orbit at n_sym="
+                    f"{n_sym}. Need N_c × oversample >= n_sym (= {n_sym}) so "
+                    f"kmeans can sample at least one orbit; pass --no-orbit or "
+                    f"raise N_c."
+                )
+            print0(f"Orbit-aware mode: n_sym = {n_sym}, "
+                   f"running kmeans for M_rep = {M_cand_orbit} representatives "
+                   f"(unfolded ≈ {M_cand_orbit * n_sym} centroids)")
+            kmeans_target = M_cand_orbit
+        else:
+            kmeans_target = M_cand
+
+        with timing.section("kmeans") as kmeans_section:
+            labels, centroids, _lloyd_steps, _lloyd_move_sq = weighted_kmeans_jax(
+                avec_ang, kmeans_weight, N_c=kmeans_target, seed=args.seed,
+                mesh=mesh, mesh_axis=mesh_axis,
+                init_method=init_method,
+                R=R, Rinv=Rinv, tau=tau,
+                print_fn=print0,
+            )
+            # The host materialises ``centroids`` immediately below.  Watch every
+            # returned device value here so this phase measures completion rather
+            # than asynchronous dispatch; this is one semantic boundary, not an
+            # inner-loop synchronization point.
+            kmeans_section.watch(
+                labels, centroids, _lloyd_steps, _lloyd_move_sq)
+        centroids_frac = np.asarray(centroids)
+
+        with timing.section("snap_unfold"):
+            centroid_indices, centroids_snapped, n_unique, orbit_id_arr = \
+                _snap_and_unfold(centroids_frac, fft_grid, weight, orbit_aware,
+                                 Rinv, tau, n_sym, M_cand)
+
+        pruned = False
+        prune_rank = None
+        if oversample > 1.0 and n_unique > N_c:
+            release_arrays = [labels, centroids]
+            for array in (weight, kmeans_weight):
+                # ``weight`` is also the plot payload.  Retain that one reference
+                # when plotting, but release every device alias before the prune
+                # reloads the WFN windows.
+                if not args.plot or array is not weight:
+                    release_arrays.append(array)
+            with timing.section("release_before_prune"):
+                _release_lloyd_before_prune(*release_arrays)
+            del release_arrays, labels, centroids, kmeans_weight
+            if not args.plot:
+                del weight
+            centroid_indices, rank = _prune(
+                args, wfn, sym, mesh, centroid_indices, orbit_id_arr,
+                n_unique, N_c)
+            n_unique = int(centroid_indices.shape[0])
+            centroids_snapped = centroid_indices.astype(float) / np.asarray(fft_grid)
+            pruned = True
+            prune_rank = int(rank)
+
+            print0(f"  [point rank] {rank}/{n_unique} delivered centroid "
+                   "directions certified; rank deficiency is reported, while "
+                   "LORRAX_CENTROID_SELECT=strict makes it a refusal")
+
+        # Default suffix follows --density-mode unless the user overrode it.
+        out_suffix = (args.out_suffix
+                      if args.out_suffix is not None
+                      else ("" if args.density_mode == "scalar" else "_current"))
+        out_file = f"centroids_frac_{n_unique}{out_suffix}.txt"
+        n_val_header, n_cond_header = _resolve_sigma_window(args, wfn)
+        prune_left, prune_right, prune_label = prune_band_ranges(
+            args, n_val_header, n_cond_header)
+        if args.density_mode == "current":
+            feature_fit = (
+                f"left={weight_band_ranges[0]}, right={weight_band_ranges[1]}: "
+                "sqrt(sum_k w_k sum_i,m,n "
+                "|Psi_mk^dag alpha_i Psi_nk/alpha_fs|^2); unit band weights")
+        else:
+            feature_fit = (
+                f"left={weight_band_ranges[0]}, right={weight_band_ranges[1]}: "
+                "sqrt(sum_k w_k sum_m,n |psi_mk^dag psi_nk|^2); "
+                "unit band weights")
+        kgrid = tuple(int(v) for v in np.asarray(wfn.kgrid).reshape(-1)[:3])
+        shift = tuple(float(v) for v in np.asarray(wfn.shift).reshape(-1)[:3])
+        prune_state = "pivoted Cholesky" if pruned else "not applied"
+        header = format_centroid_header(
+            feature_fit=feature_fit, source_wfn="WFN.h5",
+            weight_label=weight_label,
+            num_electrons=float(getattr(wfn, "num_electrons", np.nan)),
+            occupied_boundary=int(wfn.nelec), fft_grid=fft_grid,
+            kgrid=kgrid, shift=shift, seed=args.seed, rho_power=args.rho_power,
+            requested=N_c, candidates=M_cand, written=n_unique,
+            pruning=prune_state, prune_rank=prune_rank,
+            prune_left=prune_left, prune_right=prune_right,
+            prune_label=prune_label, orbit_aware=orbit_aware, n_sym=n_sym,
+            density_mode=args.density_mode)
+        # ONE writer.  Every rank used to reach this savetxt on the same shared
+        # path.  It survived P=16 only because all ranks write identical bytes —
+        # which is precisely the latent form of the bug that DID bite at P=64 in
+        # ``bse_io.write_eigenvectors_stream`` (64 concurrent h5py creators,
+        # rc=1 plus a structurally valid file; wk_REL S4.8).  ``centroids_snapped``
+        # is a pure function of the WFN + seed + candidate list and is identical on
+        # every rank, so rank 0's file is the file any rank would have written.
+        # No collective below this point, so gating cannot deadlock.
+        if process_rank() == 0:
+            np.savetxt(
+                out_file, centroids_snapped,
+                header=header,
+                fmt="%.6f", delimiter=" ", comments="# ",
+            )
+            print0(f"Saved centroids to {out_file}")
+
+        if process_rank() == 0:
+            # The report carries the SAME suffix as the table it describes.  A
+            # charge and a current selection are routinely run in one directory
+            # (the deck names both files), and a bare "kmeans.out" meant the
+            # second run silently destroyed the first one's provenance -- the
+            # only record of its band window, seed, candidate pool and achieved
+            # rank.  The centroid table was already suffixed; the report was not.
+            report_file = f"kmeans{out_suffix}.out"
+            report_text = format_kmeans_report(
+                header=header, source_wfn="WFN.h5", centroid_file=out_file,
+                report_file=report_file,
+                wfn_backend=str(getattr(wfn, "backend", "unknown")),
+                elapsed_s=run.main_wall, timing_records=timing.records(),
+                runtime=RUNTIME, warnings=run.warnings)
+            with open(report_file, "w", encoding="utf-8") as stream:
+                stream.write(report_text)
+            run.emit(report_text, end="")
+
+        if args.plot:
+            from .kmeans_plot import plot_density_and_centroids, interpolate_density
+            rho_plot = interpolate_density(weight, (args.plot_zoom,) * 3)
+            plot_density_and_centroids(wfn, rho_plot, centroids_snapped)
+        run.complete()
     return 0
 
 

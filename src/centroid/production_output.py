@@ -8,7 +8,7 @@ from common.scientific_output import (
     architecture_lines,
     numerical_environment_lines,
 )
-from common.preprocessing_output import timing_total
+from common.timing import total as timing_total
 
 
 def validate_mode_policy(args) -> None:

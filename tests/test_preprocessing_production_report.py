@@ -92,16 +92,19 @@ def test_bse_driver_has_no_debug_switch_and_writes_the_shared_report():
     assert "ScientificProductionReport" in source
     assert '"--report-file"' in source
     assert "report.sampling(wfn=wfn, sym=sym)" in source
-    assert 'barrier("bse.report_written")' in source
+    # The session owns stdout, the stage table, the file table and the
+    # ``bse.report_written`` barrier (runtime.run_session.RunSession.complete).
+    assert 'RunSession(RUNTIME, "bse", ScientificProductionReport' in source
+    assert "run.complete(files=file_rows)" in source
 
 
 def test_exciton_bands_uses_shared_report_and_paths_last_contract():
     source = (Path(__file__).parents[1] / "src" / "bse" /
               "exciton_bands.py").read_text(encoding="utf-8")
     assert "ScientificProductionReport" in source
-    assert "ProductionStdout" in source
+    assert "RunSession(" in source
     assert '"--report-file"' in source
     assert "report.sampling(wfn=wfn, sym=sym)" in source
     assert "stage_progress = LoopProgress(" in source
-    assert "report.files(file_rows)" in source
-    assert source.index("report.files(file_rows)") < source.index("report.finish()")
+    # Files, then the completion line: RunSession.complete owns the order.
+    assert "run.complete(files=file_rows)" in source

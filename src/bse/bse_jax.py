@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import os
-import time
 
 # THE startup call (runtime module docstring) before any jax-collective
 # code: env defaults (x64), jax.distributed (the ring matvec uses
@@ -12,21 +11,18 @@ import time
 # MUST run before this module's own `import jax`.  ``create_mesh_2d()``
 # below returns this same startup mesh (plus the BSE-specific
 # process_allgather warm-up bse_ring_comm documents).
-from runtime import (debug_print, debug_print_enabled,
-                     initialize_communicator_stack, rank0_print)
+from runtime import debug_print, initialize_communicator_stack
 RUNTIME = initialize_communicator_stack(print_fn=debug_print)
 
 import jax
 
 import common.timing as timing
 from common.band_degeneracy import DEFAULT_MODE, DEGENERACY_TOL_RY, MODES
-from common.collectives import barrier
-from common.preprocessing_output import (ScientificProductionReport,
-                                         timing_total)
+from common.preprocessing_output import ScientificProductionReport
 from common.progress import LoopProgress
 from common.scientific_output import policy
 from common.units import RYD_TO_EV
-from runtime.production_stream import ProductionStdout
+from runtime.run_session import RunSession
 
 from .bse_ring_comm import (
     build_bse_ring_matvec_full,
@@ -49,6 +45,14 @@ __all__ = [
     "make_bse_shardings",
     "simple_lanczos_eig",
 ]
+
+
+#: The report's major-stage table: ``(label, timing sections...)``.
+_STAGES = (
+    ("restart input", "bse.load"),
+    ("BSE eigensolve", "bse.eigensolve"),
+    ("eigenvector write", "bse.write_eigenvectors"),
+)
 
 
 def _preview_lanczos(
@@ -78,42 +82,6 @@ def _preview_lanczos(
     report=None,
     stage_progress=None,
 ) -> dict:
-    # ---- Stage timing --------------------------------------------------
-    # This driver printed NO timing table at all, which is why the release
-    # regression table's "BSE 377 s" was a single opaque number that could
-    # not be compared with GW's (whose table has a dozen rows) — and why it
-    # was read as "BSE is slow" when the two rows were taken on different
-    # decks (b1024/N_mu=10015 vs b256/N_mu=2475).  Three top-level rows,
-    # each executed exactly once, plus the ``(untimed)`` closer.
-    _t_main = time.perf_counter()
-    _pre_main = timing.process_elapsed_s()
-    timing.reset()
-    if _pre_main is not None:
-        # Imports + the runtime startup call + ``jax.distributed`` — the cold
-        # start (75.0 s cold vs 2.1 s warm, job 7881949).  It happens before
-        # this function and so is invisible to any timer inside it.  Recorded
-        # FIRST so it appears first: the table's row order is insertion order,
-        # and a startup row printed last reads as an epilogue.
-        #
-        # DECOMPOSED, since 2026-08-09.  This used to be ONE row, and on the
-        # Si record deck at P=4 that one row was 11.190 s of a 14.051 s warm
-        # wall — 80.1 %, with nothing inside it to point at.  ``htransform``
-        # and ``gw_jax`` already split their equivalent using the phase
-        # timings the startup call measured for itself, and there was no
-        # reason for the BSE driver to be the one that did not; the same four
-        # sub-rows plus an ``imports`` remainder now appear here.  The rows
-        # are carved OUT of the total (the parent row keeps only what the
-        # startup call did not account for), so the table still sums.
-        _phases: dict = {}
-        try:
-            _phases = dict(RUNTIME.facts.get("elapsed", {}) or {})
-        except Exception:      # noqa: BLE001 — observability never kills a run
-            _phases = {}
-        for _phase, _secs in sorted(_phases.items()):
-            if _phase != "total":
-                timing.record(f"bse.runtime_stack.{_phase}", float(_secs))
-        timing.record("bse.imports",
-                      max(_pre_main - float(_phases.get("total", 0.0)), 0.0))
     restart_file = _find_restart_file(input_file)
     # ONE solve path on any mesh (1x1 included): the sharded loader and
     # ``solve_bse_sharded`` on the trial-stack matvec.  The single-device
@@ -261,30 +229,7 @@ def _preview_lanczos(
         stage_progress.step()
         stage_progress.finish()
 
-    wall = time.perf_counter() - _t_main + (_pre_main or 0.0)
-    if report is not None:
-        records = timing.records()
-        runtime_seconds = sum(
-            float(row["inclusive"]) for row in records
-            if str(row["name"]).startswith("bse.runtime_stack."))
-        report.timings((
-            ("runtime + imports", runtime_seconds
-             + timing_total(records, "bse.imports")),
-            ("restart input", timing_total(records, "bse.load")),
-            ("BSE eigensolve", timing_total(records, "bse.eigensolve")),
-            ("eigenvector write", timing_total(
-                records, "bse.write_eigenvectors")),
-        ), wall=wall)
-    elif jax.process_index() == 0:
-        # ``wall=`` closes the table: printed rows + ``(untimed)`` == the whole
-        # PROCESS when /proc gave us the pre-main span, else this function.
-        # ``(untimed)`` is then the mesh creation + clique warm-up and the
-        # small host work between the named stages.
-        timing.report(print_fn=print, title="--- BSE Timing ---",
-                      wall=wall)
-
     return {
-        "wall": wall,
         "n_val": int(n_val_eff),
         "n_cond": int(n_cond_eff),
         "nk": int(nk),
@@ -610,100 +555,90 @@ def main(argv=None) -> int:
     # ``solve_bse_sharded(tda=False)`` dispatch -> ``bse_nontda`` (structure-
     # preserving definite-pencil / product solve).  TDA stays the default.
     report_path = os.path.abspath(args.report_file or "bse.out")
-    debug = debug_print_enabled()
-    report = ScientificProductionReport(
-        report_path, runtime=RUNTIME, debug=debug, stdout=rank0_print,
-        driver_name="bse.bse_jax",
-        calculation_name="Bethe-Salpeter eigensolve")
-    production_stdout = ProductionStdout(
-        debug=debug, rank=RUNTIME.process_index,
-        warning_fn=report.legacy_print)
-    production_stdout.install()
-    report.stdout = rank0_print if debug else production_stdout.emit
-    report.begin(input_file=args.input)
-    report.architecture(mesh_role="BSE transition axes X x Y")
-    include_w = not (args.rpa or not args.bse)
-    report.pathways((
-        "Hamiltonian    : " + (
-            "Tamm-Dancoff Hermitian BSE" if use_tda else
-            "full resonant-antiresonant BSE"),
-        "Interaction    : " + (
-            "D + V - W (screened direct term enabled)" if include_w else
-            "D + V (RPA kernel; screened direct term omitted)"),
-        f"Eigensolver    : {args.solver}; block size={int(args.block_size)}; "
-        f"requested roots={int(args.n_eig)}",
-        "Iteration mode : " + (
-            f"relative convergence {float(args.lanczos_rtol):.5e}, "
-            f"checked every {int(args.lanczos_check_every)} iterations"
-            if args.lanczos_rtol > 0.0 else "fixed Krylov dimension"),
-        "Matvec route   : trial-stack (bse_stack_matvec)",
-        f"Band boundary  : {args.band_degeneracy}; "
-        f"tolerance={float(args.degeneracy_tol_ry) * RYD_TO_EV * 1.0e3:.5f} meV",
-    ))
+    with RunSession(RUNTIME, "bse", ScientificProductionReport, report_path,
+                    stages=_STAGES, driver_name="bse.bse_jax",
+                    calculation_name="Bethe-Salpeter eigensolve") as run:
+        report = run.report
+        report.begin(input_file=args.input)
+        report.architecture(mesh_role="BSE transition axes X x Y")
+        include_w = not (args.rpa or not args.bse)
+        report.pathways((
+            "Hamiltonian    : " + (
+                "Tamm-Dancoff Hermitian BSE" if use_tda else
+                "full resonant-antiresonant BSE"),
+            "Interaction    : " + (
+                "D + V - W (screened direct term enabled)" if include_w else
+                "D + V (RPA kernel; screened direct term omitted)"),
+            f"Eigensolver    : {args.solver}; block size={int(args.block_size)}; "
+            f"requested roots={int(args.n_eig)}",
+            "Iteration mode : " + (
+                f"relative convergence {float(args.lanczos_rtol):.5e}, "
+                f"checked every {int(args.lanczos_check_every)} iterations"
+                if args.lanczos_rtol > 0.0 else "fixed Krylov dimension"),
+            "Matvec route   : trial-stack (bse_stack_matvec)",
+            f"Band boundary  : {args.band_degeneracy}; "
+            f"tolerance={float(args.degeneracy_tol_ry) * RYD_TO_EV * 1.0e3:.5f} meV",
+        ))
 
-    from .bse_window import _parse_wfn_path
-    from wfn_loader import WfnLoader
-    wfn_path = _parse_wfn_path(args.input)
-    wfn = WfnLoader(wfn_path, mesh=RUNTIME.mesh)
-    sym = wfn.symmetry()
-    report.environment(wfn=wfn, lines=(
-        "Transition data: distributed band and centroid blocks on X x Y",
-        "Eigensolve path: " + policy(
-            args.solver, ("lanczos", "davidson", "trlan")),
-        "Eigenvectors   : " + (
-            "written to a separate numerical artifact"
-            if args.write_eigs is not None else "not requested"),
-    ))
-    report.sampling(wfn=wfn, sym=sym)
-    stage_progress = LoopProgress(
-        3, report.progress, title="BSE eigensolve",
-        item_name="major stage", max_updates=3)
-    stage_progress.start()
+        from .bse_window import _parse_wfn_path
+        from wfn_loader import WfnLoader
+        wfn_path = _parse_wfn_path(args.input)
+        wfn = WfnLoader(wfn_path, mesh=RUNTIME.mesh)
+        sym = wfn.symmetry()
+        report.environment(wfn=wfn, lines=(
+            "Transition data: distributed band and centroid blocks on X x Y",
+            "Eigensolve path: " + policy(
+                args.solver, ("lanczos", "davidson", "trlan")),
+            "Eigenvectors   : " + (
+                "written to a separate numerical artifact"
+                if args.write_eigs is not None else "not requested"),
+        ))
+        report.sampling(wfn=wfn, sym=sym)
+        stage_progress = LoopProgress(
+            3, report.progress, title="BSE eigensolve",
+            item_name="major stage", max_updates=3)
+        stage_progress.start()
 
-    result = _preview_lanczos(
-        args.input,
-        args.n_val,
-        args.n_cond,
-        n_eig=args.n_eig,
-        write_eigs=args.write_eigs,
-        max_lanczos_iter=args.max_lanczos_iter,
-        include_W=not (args.rpa or not args.bse),
-        eqp_file=args.eqp,
-        n_occ=args.n_occ,
-        block_size=args.block_size,
-        rtol=args.lanczos_rtol,
-        check_every=args.lanczos_check_every,
-        n_reorth=args.n_reorth,
-        solver_kind=args.solver,
-        davidson_m_max=args.davidson_m_max,
-        davidson_precond=args.davidson_precond,
-        davidson_olsen=args.davidson_olsen,
-        davidson_eps_shift=args.davidson_eps_shift,
-        trlan_m_max=args.trlan_m_max,
-        trlan_n_keep=args.trlan_n_keep,
-        degeneracy_mode=args.band_degeneracy,
-        degeneracy_tol_ry=args.degeneracy_tol_ry,
-        tda=use_tda,
-        report=report,
-        stage_progress=stage_progress,
-    )
+        result = _preview_lanczos(
+            args.input,
+            args.n_val,
+            args.n_cond,
+            n_eig=args.n_eig,
+            write_eigs=args.write_eigs,
+            max_lanczos_iter=args.max_lanczos_iter,
+            include_W=not (args.rpa or not args.bse),
+            eqp_file=args.eqp,
+            n_occ=args.n_occ,
+            block_size=args.block_size,
+            rtol=args.lanczos_rtol,
+            check_every=args.lanczos_check_every,
+            n_reorth=args.n_reorth,
+            solver_kind=args.solver,
+            davidson_m_max=args.davidson_m_max,
+            davidson_precond=args.davidson_precond,
+            davidson_olsen=args.davidson_olsen,
+            davidson_eps_shift=args.davidson_eps_shift,
+            trlan_m_max=args.trlan_m_max,
+            trlan_n_keep=args.trlan_n_keep,
+            degeneracy_mode=args.band_degeneracy,
+            degeneracy_tol_ry=args.degeneracy_tol_ry,
+            tda=use_tda,
+            report=report,
+            stage_progress=stage_progress,
+        )
 
-    wfn.close()
-    file_rows = [
-        ("human-readable report", "written", report_path),
-        ("GW/BSE restart", "read", result["restart_file"]),
-        ("wavefunctions", "read", wfn_path),
-    ]
-    if result["eigenvector_file"]:
-        file_rows.append(("exciton eigenvectors", "written",
-                          result["eigenvector_file"]))
-    if args.eqp:
-        file_rows.append(("QP corrections", "read", args.eqp))
-    file_rows.append(("input deck", "read", args.input))
-    report.files(file_rows)
-    report.finish()
-    barrier("bse.report_written")
-    production_stdout.close()
+        wfn.close()
+        file_rows = [
+            ("GW/BSE restart", "read", result["restart_file"]),
+            ("wavefunctions", "read", wfn_path),
+        ]
+        if result["eigenvector_file"]:
+            file_rows.append(("exciton eigenvectors", "written",
+                              result["eigenvector_file"]))
+        if args.eqp:
+            file_rows.append(("QP corrections", "read", args.eqp))
+        file_rows.append(("input deck", "read", args.input))
+        run.complete(files=file_rows)
     return 0
 
 
