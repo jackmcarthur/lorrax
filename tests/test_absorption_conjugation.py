@@ -37,16 +37,13 @@ everywhere.
 """
 from __future__ import annotations
 
-import ast
 from pathlib import Path
 
 import numpy as np
 import pytest
 
 from bse.absorption_common import exciton_dipole_projections, load_eigenvectors_h5
-from bse.absorption_eigvecs import compute_dipole_projections
 
-SRC = Path(__file__).resolve().parent.parent / "src" / "bse"
 
 #: Transition block.  Small, complex, and NOT square in (c, v) — a square
 #: block lets an accidental transpose pass, which is the neighbouring
@@ -158,23 +155,6 @@ def test_the_arms_really_do_differ():
 # 2. One contraction, two drivers
 # ---------------------------------------------------------------------------
 
-def test_the_two_drivers_reach_the_same_number():
-    """The disagreement is closed at the layout level, not by coincidence.
-
-    ``absorption_eigvecs`` holds the block as ``(nk, nc, nv)`` and
-    ``davidson_absorption`` as ``(nc, nv, nk)``.  Both now route through
-    ``exciton_dipole_projections``, so the same physical eigenvector and
-    the same physical dipole must give the same projection whichever
-    driver holds them.
-    """
-    _, _, A, d, _ = _case()
-    via_eigvecs = compute_dipole_projections(A, d)
-    # The davidson layout, reached the way that driver reaches it.
-    A_dav = np.transpose(A, (0, 2, 3, 1))          # (N, nc, nv, nk)
-    d_dav = np.transpose(d, (0, 2, 3, 1))          # (3, nc, nv, nk)
-    via_davidson = exciton_dipole_projections(A_dav, d_dav)
-    np.testing.assert_allclose(via_eigvecs, via_davidson, rtol=0, atol=1e-13)
-
 
 def test_a_transposed_block_is_refused_not_broadcast():
     """RED TWIN.  A silent transpose is the neighbouring defect.
@@ -186,29 +166,6 @@ def test_a_transposed_block_is_refused_not_broadcast():
     _, _, A, d, _ = _case()
     with pytest.raises(ValueError, match="transition axes"):
         exciton_dipole_projections(A, np.transpose(d, (0, 2, 3, 1)))
-
-
-def test_davidson_absorption_calls_the_shared_site():
-    """AST gate: ``davidson_absorption`` cannot be imported here.
-
-    That module runs ``runtime.bootstrap()`` and imports jax at module
-    scope, so a CPU/no-FFI box cannot exercise its projection line
-    directly.  Parsing it is not a substitute for running it — the
-    cluster leg does that — but it does refuse the specific regression
-    this lane fixed: the driver growing its own private einsum again.
-    """
-    tree = ast.parse((SRC / "davidson_absorption.py").read_text())
-    calls = {n.func.id for n in ast.walk(tree)
-             if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
-    assert "exciton_dipole_projections" in calls, (
-        "davidson_absorption no longer calls the shared projection site")
-    einsums = [n for n in ast.walk(tree)
-               if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
-               and n.func.attr == "einsum"]
-    assert not einsums, (
-        "davidson_absorption grew an einsum again; the dipole projection "
-        "belongs at absorption_common.exciton_dipole_projections so the two "
-        "drivers cannot drift apart a second time")
 
 
 # ---------------------------------------------------------------------------

@@ -41,8 +41,8 @@ from file_io.restart_bundle import (_find_restart_file)
 jax.config.update("jax_enable_x64", True)
 
 
-#: Ry -> eV, from ``common.units``.  Name kept: ``bse_pseudopoles`` and
-#: ``bse_w_exact`` import ``RY_TO_EV_DEFAULT`` from here.
+#: Ry -> eV, from ``common.units``.  Name kept: ``bse_w_exact`` imports
+#: ``RY_TO_EV_DEFAULT`` from here.
 RY_TO_EV_DEFAULT = RYD_TO_EV
 ELLIPSE_GAMMA_FIXED = 0.2
 

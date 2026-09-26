@@ -172,7 +172,7 @@ def write_eigenvectors_stream(
     # ── WHICH WINDOW DOES THIS FILE DESCRIBE? ─────────────────────────────
     # The LOGICAL one the loader RESOLVED (``data['n_val']``/``data['n_cond']``).
     # These become BGW's ``nv``/``nc`` header fields, and
-    # ``absorption_eigvecs`` slices ``dipole.h5`` with exactly those against
+    # an absorption post-processor slices ``dipole.h5`` with exactly those against
     # ``n_occ`` — bands ``[n_occ - nv, n_occ)`` and ``[n_occ, n_occ + nc)`` —
     # so they have to name REAL bands.
     #
@@ -532,7 +532,7 @@ def apply_eqp_and_reslice_bands(
     ``n_val``/``n_cond`` must be the loader-CLAMPED counts (``data['n_val']`` /
     ``data['n_cond']``), not raw CLI requests, or the slice can run out of
     bounds.  Single-sourced by the sharded --eqp paths (bse_jax._preview_lanczos,
-    davidson_absorption, absorption_haydock).
+    absorption_haydock).
 
     Returns ``(eps_v_padded, eps_c_padded, n_occ_eff)``.
     """
