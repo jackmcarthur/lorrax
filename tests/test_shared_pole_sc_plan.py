@@ -60,8 +60,11 @@ def test_shared_full_head_uses_mpa_owner_at_current_energy_span(monkeypatch):
     monkeypatch.setattr(sample_plan, 'plan_z', lambda plan: [plan+1j])
     config = NS(compute_mode=ComputeMode.MPA, sigma=NS(w_model='shared_pole'),
                 head=NS(correction=HeadCorrection.FULL), do_G0=True)
-    for span in (3., 3.2):
+    # The head plan reads the span snapped up onto the build grid (FLIP, shared_pole_head_plan).
+    from gw.sigma_box_plan import snap_outward
+    snapped = [snap_outward(s, 1., +1) for s in (3., 3.2)]
+    for span, x_max in zip((3., 3.2), snapped):
         _, plan, z = _sc_head_frequency_plan(config, None, material_class='insulator',
             shared_pole_recipe={'census': {'energy_span_ry': span}})
-        assert plan == span and z == [span+1j, 0j]
-    assert seen == [3., 3.2]
+        assert plan == x_max and x_max >= span and z == [x_max+1j, 0j]
+    assert seen == snapped
