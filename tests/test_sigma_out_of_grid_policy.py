@@ -105,7 +105,7 @@ def test_the_deck_key_defaults_to_cover_and_refuses_anything_else():
     from gw.gw_config import DynamicSigmaConfig
     base = dict(omega_min_ev=-5.0, omega_max_ev=5.0, omega_step_ev=0.25,
                 regularization_ev=0.25, window_edge_factor=1.0,
-                fermi_reference="vbm", sigma_at_dft_extrapolate=False,
+                fermi_reference="vbm",
                 sigma_at_dft_energies=False)
     assert DynamicSigmaConfig(**base).out_of_grid == "cover"
     with pytest.raises(ValueError, match="sigma_out_of_grid"):
@@ -180,7 +180,7 @@ def test_unset_grid_edges_derive_the_grid_from_the_bands():
     they are a minimum extent kept on every map."""
     from gw.gw_config import DynamicSigmaConfig
     base = dict(omega_step_ev=0.25, regularization_ev=0.25, window_edge_factor=1.0,
-                fermi_reference="vbm", sigma_at_dft_extrapolate=False,
+                fermi_reference="vbm",
                 sigma_at_dft_energies=False)
     unset = DynamicSigmaConfig(omega_min_ev=None, omega_max_ev=None, **base)
     assert unset.requested_edges_ev() == (-0.25, 0.25)

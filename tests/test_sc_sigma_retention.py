@@ -76,10 +76,7 @@ _CARRY_KEYS = {
 # What a bare INPUT SCState is constructed with in the drivers: the read
 # set above plus head_surface_weight_kn, which rides along for carry
 # continuity (the map re-derives it at entry and never reads the carry).
-# ``frozen_scissor_fits`` is the map-0 affine tail law carried to every later
-# map input (a closure parameter fixed at map 0, not a Sigma result); the map
-# reads it through ``_frozen_scissor_fits`` only.
-_STATE_INPUT_KEYS = _CARRY_KEYS | {"head_surface_weight_kn", "frozen_scissor_fits"}
+_STATE_INPUT_KEYS = _CARRY_KEYS | {"head_surface_weight_kn"}
 
 
 def test_gw_iteration_map_reads_only_the_carry_and_the_counter():
@@ -223,7 +220,6 @@ def test_per_map_files_are_output_diagnostics_not_final_eqp_math():
     body = _block("_write_sc_eqp_snapshot")
     assert "write_bgw_eqp(" in body
     assert "assemble_eqp" not in body
-    assert "shared_map_input_active_scissor" in body
     assert "shared_input_tail_scissor" in body
     # The rows are the FILE wedge (wfn.kpoints), like every other .dat.
     # This used to assert ``"kirr_fullids" in body`` — the same fact

@@ -106,7 +106,6 @@ KEYS: dict[str, tuple[str, str]] = {
     "sigma_window_edge_factor": ("Sigma", "Widens the minimax window past the sigma omega-grid edges (T = omega_max + factor*xi)."),
     "no_degen_averaging": ("Sigma", "Disable BGW-style averaging of diagonal Sigma within degenerate sets."),
     "degen_avg_tol_ry": ("Sigma", "Degeneracy tolerance for the averaging (BGW TOL_Degeneracy = 1e-6 Ry)."),
-    "sigma_at_dft_extrapolate": ("Sigma", "Extrapolate Sigma to E_DFT outside the omega grid instead of clamping."),
     "sigma_at_dft_energies": ("Sigma", "DEPRECATED alias for qp_solver = one_shot_dft (now the default)."),
     "sigma_freq_debug_output": ("Sigma", "Dump the per-branch Sigma(omega) debug table."),
     "sigma_freq_debug_file": ("Sigma", "Path of the Sigma(omega) debug dump."),

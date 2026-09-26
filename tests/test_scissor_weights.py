@@ -50,7 +50,17 @@ _spec.loader.exec_module(scissor)
 ScissorFit = scissor.ScissorFit
 apply_conduction_scissor_to_tail = scissor.apply_conduction_scissor_to_tail
 fit_scissor = scissor.fit_scissor
-full_bz_k_weights = scissor.full_bz_k_weights
+
+
+def full_bz_k_weights(nk):
+    """Unreduced k-set: every k is its own star."""
+    return np.ones(int(nk), dtype=np.float64)
+
+
+def _delta(fit, e_dft, valence):
+    """The fit's affine correction (alpha - 1) E + beta by class."""
+    return np.where(valence, (fit.alpha_v - 1.0) * e_dft + fit.beta_v_ev,
+                    (fit.alpha_c - 1.0) * e_dft + fit.beta_c_ev)
 k_star_weights = scissor.k_star_weights
 
 
@@ -107,35 +117,6 @@ def test_conduction_tail_scissor_does_not_touch_mesh_padding():
         got[:, 3:6], 0.8 * energies[:, 3:6] + 1.0)
 
 
-def test_frontier_scissor_is_rigid_and_ignores_higher_conduction_samples():
-    """The SC tail law is defined by one physical frontier manifold."""
-    e_dft = np.array([
-        [-2.0, -1.0, 1.000, 1.002, 3.0],
-        [-2.2, -0.8, 1.100, 1.100, 3.2],
-    ])
-    e_qp = e_dft + np.array([
-        [0.1, 0.1, 0.5, 0.7, 2.0],
-        [0.1, 0.1, 0.6, 0.8, 3.0],
-    ])
-    valence = np.broadcast_to(
-        np.array([True, True, False, False, False]), e_dft.shape)
-    weights = np.array([1.0, 2.0])
-
-    fit_wide = fit_scissor(
-        e_dft, e_qp, valence, np.ones_like(valence),
-        k_weights=weights, conduction_frontier_tol_ev=0.003)
-    fit_narrow = fit_scissor(
-        e_dft[:, :4], e_qp[:, :4], valence[:, :4],
-        np.ones_like(valence[:, :4]),
-        k_weights=weights, conduction_frontier_tol_ev=0.003)
-
-    assert fit_wide.alpha_c == 1.0
-    assert fit_wide.n_fit_c == 4
-    assert fit_wide.w_fit_c == 6.0
-    assert fit_wide.beta_c_ev == fit_narrow.beta_c_ev
-    assert fit_wide.rmse_c_ev == fit_narrow.rmse_c_ev
-
-
 def test_conduction_mean_scissor_is_the_weighted_mean_of_every_conduction_state():
     """Owner rule 2026-09-23: one rigid shift, the k-weighted mean over all
     trusted conduction samples -- not the lowest multiplet alone."""
@@ -159,21 +140,6 @@ def test_conduction_mean_scissor_is_the_weighted_mean_of_every_conduction_state(
     assert fit.alpha_c == 1.0
     np.testing.assert_allclose(fit.beta_c_ev, want, rtol=0, atol=1e-14)
     assert fit.n_fit_c == 5
-    frontier = fit_scissor(e_dft, e_dft + shift, valence, trusted,
-                           k_weights=weights, conduction_frontier_tol_ev=0.003)
-    assert frontier.beta_c_ev != fit.beta_c_ev
-    with pytest.raises(ValueError, match="two different conduction laws"):
-        fit_scissor(e_dft, e_dft + shift, valence, trusted, k_weights=weights,
-                    conduction_rigid_mean=True, conduction_frontier_tol_ev=0.003)
-
-
-def test_frontier_scissor_refuses_an_invalid_tolerance():
-    e = np.array([[-1.0, 1.0]])
-    valence = np.array([[True, False]])
-    with pytest.raises(ValueError, match="conduction_frontier_tol_ev"):
-        fit_scissor(
-            e, e, valence, np.ones_like(valence),
-            k_weights=np.ones(1), conduction_frontier_tol_ev=np.nan)
 
 
 # ---------------------------------------------------------------------------
@@ -395,7 +361,7 @@ def test_weighted_ibz_fit_equals_unweighted_full_bz_fit():
 
 
 def test_predicted_correction_agrees_between_the_arms():
-    """The quantity that actually reaches the carry is ``predict``."""
+    """The affine correction (alpha - 1) E + beta agrees between the arms."""
     rng = np.random.default_rng(4)
     nb = 64
     irr_idx = np.array([0, 1, 2, 1, 4, 5, 6, 7, 8, 9, 10, 9, 8, 7, 6, 5])
@@ -411,8 +377,8 @@ def test_predicted_correction_agrees_between_the_arms():
     ibz = fit_scissor(E_dft_kn_ev=e_dft_i, E_qp_kn_ev=e_qp_i,
                       valence_mask_kn=vm_i, fit_mask_kn=fm_i,
                       k_weights=k_star_weights(ks))
-    d_full = full.predict(e_dft_i, vm_i)
-    d_ibz = ibz.predict(e_dft_i, vm_i)
+    d_full = _delta(full, e_dft_i, vm_i)
+    d_ibz = _delta(ibz, e_dft_i, vm_i)
     assert float(np.abs(d_full - d_ibz).max()) <= 1.0e-11
 
 
@@ -447,17 +413,3 @@ def test_scissor_fit_fields_are_all_named():
                    n_fit_v=1, n_fit_c=1, rmse_v_ev=0.0, rmse_c_ev=0.0,
                    w_fit_v=1.0, w_fit_c=1.0)
     assert f.w_fit_v == 1.0
-
-
-def test_frontier_without_complete_band_has_no_fitted_tail():
-    e = np.array([[0., 20., 30.], [1., 20.1, 31.], [2., 20.2, 32.], [3.,21.,33.]])
-    q = e.copy()
-    q[:3,1] += [.7,.3,.2]
-    mask = np.zeros_like(e, dtype=bool)
-    mask[:3,1] = True
-    valence = np.zeros_like(mask)
-    affine = fit_scissor(e,q,valence,mask,k_weights=np.ones(4))
-    assert affine.alpha_c < 0  # sparse samples cannot define the global tail
-    frontier = fit_scissor(e,q,valence,mask,k_weights=np.ones(4),
-                           conduction_frontier_tol_ev=1e-4)
-    assert (frontier.alpha_c,frontier.beta_c_ev,frontier.n_fit_c) == (1.,0.,0)

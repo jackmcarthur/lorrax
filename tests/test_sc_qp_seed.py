@@ -60,16 +60,17 @@ def test_qp_seed_reconstruction_partition_enters_real_anderson_seam(
             broken, kgrid=(4, 4, 4), kpoints_crys=kpoints,
             artifact_path="qp_wfn_rotations.h5")
 
-    # The companion's accepted partition and active law round-trip through the
-    # format owner, then enter run_self_consistency through the real rCROP seam.
-    # The map and accelerator arithmetic are cheap doubles; rCROP's startup
-    # metric construction is real, which pins the pre-map partition seam.
+    # The seed-policy slot round-trips through the format owner.  A policy
+    # that is not all-protected, or that carries an active-window law, was
+    # written before the 2026-09-22 all-protected rule and refuses; an
+    # all-protected one enters run_self_consistency through the real Anderson
+    # seam.  The map and accelerator arithmetic are cheap doubles.
     mesh = Mesh(np.asarray(jax.devices()[:1]).reshape(1, 1), ("x", "y"))
     cfg = SimpleNamespace(
         sc=SimpleNamespace(
-            exact_degeneracy_tol_ev=1.0e-4, buffer_nbands=0,
-            dump_dir=None),
-        sigma=SimpleNamespace(omega_min_ev=-5.0, omega_max_ev=5.0),
+            exact_degeneracy_tol_ev=1.0e-4, dump_dir=None),
+        sigma=SimpleNamespace(omega_min_ev=-5.0, omega_max_ev=5.0,
+                              out_of_grid="cover"),
         screening=SimpleNamespace(occ_broadening_ev=0.0),
     )
     full_reference = np.zeros((nk, 3 + nb), dtype=np.float64)
@@ -131,24 +132,17 @@ def test_qp_seed_reconstruction_partition_enters_real_anderson_seam(
         mesh_xy=mesh,
         input_dir=str(tmp_path),
         wfn_fingerprint_binding=None,
+        fixed_quadrature_session=None,
         print_fn=lambda *_args: None,
         record_fn=None,
     )
-    state = sc.make_initial_state_from_qp_rotations(
-        inputs, artifact_path)
-    np.testing.assert_allclose(
-        np.asarray(state.H_qp_dft), direct[:nk_loop], rtol=0.0, atol=2.0e-15)
-    partition = state.partition
-    np.testing.assert_array_equal(partition.protected_mask, protected)
-    np.testing.assert_array_equal(partition.in_range_mask, in_range)
-    assert sc._frozen_scissor_fits(state) == (fit, None)
+    with pytest.raises(ValueError, match="retired"):
+        sc.make_initial_state_from_qp_rotations(inputs, artifact_path)
 
-    # A present policy with no active fit is an established ``None`` law,
-    # distinct from a legacy artifact that has no policy.  Preserve the tuple
-    # so rCROP does not recapture a newly fitted active law on map 0.
-    none_policy_path = str(tmp_path / "qp_wfn_rotations_none_policy.h5")
+    # A partial partition refuses even without an active law.
+    partial_path = str(tmp_path / "qp_wfn_rotations_partial.h5")
     write_qp_rotations_h5(
-        none_policy_path, U_mnk=U, E_qp_nk=E * 0.5,
+        partial_path, U_mnk=U, E_qp_nk=E * 0.5,
         band_start=3, band_stop=3 + nb, kpoints_crys=kpoints,
         nkx=4, nky=4, nkz=4, kirr_to_kfull=np.arange(nk_loop),
         source_wfn=wfn,
@@ -157,13 +151,30 @@ def test_qp_seed_reconstruction_partition_enters_real_anderson_seam(
             "in_range_mask": in_range,
             "active_scissor": None,
         })
-    none_policy_state = sc.make_initial_state_from_qp_rotations(
-        inputs, none_policy_path)
-    assert none_policy_state.frozen_scissor_fits == (None, None)
-    assert sc._frozen_scissor_fits(none_policy_state) == (None, None)
+    with pytest.raises(ValueError, match="retired"):
+        sc.make_initial_state_from_qp_rotations(inputs, partial_path)
 
-    # A legacy U/E-only companion keeps the established seed classification
-    # and starts without a frozen law; absence must not manufacture identity.
+    # The all-protected policy every current SC run writes is accepted.
+    all_true = np.ones((nk, nb), dtype=bool)
+    current_path = str(tmp_path / "qp_wfn_rotations_current.h5")
+    write_qp_rotations_h5(
+        current_path, U_mnk=U, E_qp_nk=E * 0.5,
+        band_start=3, band_stop=3 + nb, kpoints_crys=kpoints,
+        nkx=4, nky=4, nkz=4, kirr_to_kfull=np.arange(nk_loop),
+        source_wfn=wfn,
+        sc_seed_policy={
+            "protected_mask": all_true,
+            "in_range_mask": all_true,
+            "active_scissor": None,
+        })
+    state = sc.make_initial_state_from_qp_rotations(inputs, current_path)
+    np.testing.assert_allclose(
+        np.asarray(state.H_qp_dft), direct[:nk_loop], rtol=0.0, atol=2.0e-15)
+    partition = state.partition
+    assert np.asarray(partition.protected_mask).all()
+    assert np.asarray(partition.in_range_mask).all()
+
+    # A legacy U/E-only companion is classified by this run: all-protected.
     with monkeypatch.context() as legacy:
         legacy.setattr(
             "file_io.restart_bundle.read_qp_rotations_artifact",
@@ -176,18 +187,15 @@ def test_qp_seed_reconstruction_partition_enters_real_anderson_seam(
             lambda _sym, values: np.asarray(values))
         legacy_state = sc.make_initial_state_from_qp_rotations(
             inputs, "legacy_qp_wfn_rotations.h5")
-    expected_legacy = np.broadcast_to(
-        np.asarray([False, True, True, False]), (nk, nb))
+    expected_legacy = np.ones((nk, nb), dtype=bool)
     np.testing.assert_array_equal(
         legacy_state.partition.protected_mask, expected_legacy)
-    assert legacy_state.frozen_scissor_fits is None
 
-    payload = SimpleNamespace(scissor_fit=None, tail_scissor_fit=None)
+    payload = SimpleNamespace(tail_scissor_fit=None)
     seen = []
 
     def fake_map(state, _inputs):
         seen.append(state.partition)
-        assert sc._frozen_scissor_fits(state) == (fit, None)
         return sc.SCState(
             H_qp_dft=state.H_qp_dft + 1.0e-3,
             iteration=state.iteration + 1,
@@ -226,4 +234,3 @@ def test_qp_seed_reconstruction_partition_enters_real_anderson_seam(
         state, inputs, max_iter=2, accelerator="anderson", history_depth=1)
     assert seen and seen[0] is partition
     assert final.partition is partition
-    assert final.frozen_scissor_fits == (fit, None)

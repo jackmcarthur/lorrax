@@ -1,4 +1,4 @@
-"""Identity classification, local multiplets and shared SC pad contracts."""
+"""Identity classification, local multiplets, EQP2 frontier promotion and SC pad contracts."""
 import numpy as np
 import jax.numpy as jnp
 import pytest
@@ -9,42 +9,18 @@ from gw.sc_state_identity import assign_qp_identity
 from gw.scissor import sc_state_pad_ev
 
 
-def _partition(energy_ev, reference_ev, *, previous=None, indices=None, log=None):
+def _partition(energy_ev, reference_ev):
     return build_omega_band_partition(
         np.asarray(energy_ev) / RYD_TO_EV,
         np.asarray(reference_ev) / RYD_TO_EV,
         band_offset=0, omega_min_abs_ev=-2.0, omega_max_abs_ev=5.0,
-        previous_partition=previous, mu_ev=0.0,
-        current_indices_kn=indices, print_fn=(log.append if log is not None else lambda _: None))
+        print_fn=lambda _: None)
 
 
 @pytest.mark.parametrize('energy,pad', [(0.0, 0.5), (5.0, 1.0), (20.0, 2.5)])
 def test_pad_sizes(energy, pad):
     assert sc_state_pad_ev(energy) == pytest.approx(pad)
     assert sc_state_pad_ev(-energy) == pytest.approx(pad)
-
-
-def test_hysteresis_enter_retain_escape():
-    reference = np.array([[0.0, 4.9], [0.0, 5.1]])
-    outside = _partition(reference, reference)
-    assert not np.asarray(outside.protected_mask)[:, 1].any()
-    entered_e = np.array([[0.0, 4.9], [0.0, 5.0]])
-    entered = _partition(entered_e, reference, previous=outside)
-    assert np.asarray(entered.protected_mask)[:, 1].all()
-    retained_e = np.array([[0.0, 5.9], [0.0, 6.0]])
-    retained = _partition(retained_e, reference, previous=entered)
-    assert np.asarray(retained.protected_mask)[:, 1].all()
-    assert not np.asarray(retained.in_range_mask)[:, 1].any()
-    log = []
-    escaped_e = np.array([[0.0, 5.9], [0.0, 6.2]])
-    escaped = _partition(escaped_e, reference, previous=retained, log=log)
-    assert not np.asarray(escaped.protected_mask)[:, 1].any()
-    assert any('escape: band=2, k=1' in line and 'pad=1.120000' in line for line in log)
-    h = jnp.asarray([[[1., .2], [.2, 7.]], [[1., .2], [.2, 8.]]])
-    kept = apply_band_partition(h, protected_mask=retained.protected_mask,
-                               in_range_mask=retained.in_range_mask,
-                               scissor_E_qp_kn=jnp.zeros((2, 2)))
-    np.testing.assert_array_equal(kept, h)
 
 
 def test_reference_multiplets_close_per_k_without_transitive_union():
@@ -66,11 +42,9 @@ def test_crossing_scissored_doublet_preserves_protected_identity_block():
     sorted_e = np.take_along_axis(identity_e, order, axis=1)
     indices, aligned_e, _, _ = assign_qp_identity(
         u0, reference, u, sorted_e, np.ones((2, 4), bool), degeneracy_tol_ev=1e-5)
-    log = []
-    part = _partition(aligned_e, reference, indices=indices, log=log)
+    part = _partition(aligned_e, reference)
     np.testing.assert_array_equal(part.protected_mask,
                                   [[True, True, False, False]] * 2)
-    assert any('k=1:' in line and 'sorted columns=[1, 4]' in line for line in log)
     h = np.broadcast_to(np.diag([1., 5., 9., 9.]), (2, 4, 4)).copy()
     h[:, 0, 1] = h[:, 1, 0] = .25
     h[:, 1, 2] = h[:, 2, 1] = .75
@@ -222,31 +196,6 @@ def test_scissor_fit_keeps_a_crossed_protected_sample_paired():
     assert shuffled.beta_c_ev == fit.beta_c_ev
 
 
-def test_hysteresis_retained_state_remains_a_scissor_fit_sample():
-    from types import SimpleNamespace
-    from gw.sc_iteration import _apply_scissor_partition_policy
-
-    reference = np.array([[-1., 4., 8.]])
-    initial = _partition(reference, reference)
-    energy = np.array([[-1., 6., 10.]])
-    retained = _partition(energy, reference, previous=initial)
-    assert retained.protected_mask[0, 1]
-    assert not retained.in_range_mask[0, 1]
-    kstar = SimpleNamespace(irr_idx=np.array([0]), select=lambda a: a)
-    h = jnp.asarray(np.diag(energy[0] / RYD_TO_EV)[None])
-    result, fit, promoted = _apply_scissor_partition_policy(
-        h, reference / RYD_TO_EV, np.array([[True, False, False]]),
-        retained, kstar, efermi_dft_ry=0., n_occ=1,
-        candidate_efermi_fn=lambda _: 0., print_fn=lambda _: None)
-    assert fit.n_fit_c == 1
-    assert fit.alpha_c == pytest.approx(1.)
-    assert fit.beta_c_ev == pytest.approx(2.)
-    # The retained 6 eV diagonal stays measured; its +2 eV fit corrects
-    # the excluded DFT 8 eV state to 10 eV instead of leaving it at DFT.
-    np.testing.assert_allclose(np.diagonal(result, axis1=1, axis2=2) * RYD_TO_EV,
-                               [[-1., 6., 10.]])
-
-
 def test_frontier_manifold_is_promoted_instead_of_refused():
     """A crossing band outside the energy window is protected by identity."""
     from types import SimpleNamespace
@@ -270,34 +219,6 @@ def test_frontier_manifold_is_promoted_instead_of_refused():
     # The promoted crossing band keeps its full candidate diagonal.
     assert np.diag(np.asarray(result)[0])[1] == pytest.approx(
         energy[0, 1] / RYD_TO_EV)
-
-
-def test_frozen_partition_never_promotes_a_later_map():
-    """Owner ruling 2026-09-19: the protected set is decided once, on map 0.
-
-    Same crossing fixture as the promotion test, with the promotion switched
-    off the way ``gw_iteration_map`` switches it off for every map after the
-    first: the identity set must not grow, so the crossing band keeps the
-    scissor law for the whole loop.
-    """
-    from types import SimpleNamespace
-    from gw.sc_iteration import _apply_scissor_partition_policy
-    from gw.scissor import ScissorBandClasses
-
-    reference = np.array([[-1., 4., 8.]])
-    energy = np.array([[-1., 6., 10.]])
-    partition = _partition(energy, reference)
-    classes = ScissorBandClasses(valence_stop=1, conduction_start=2)
-    kstar = SimpleNamespace(irr_idx=np.array([0]), select=lambda a: a)
-    h = jnp.asarray(np.diag(energy[0] / RYD_TO_EV)[None])
-    _result, _fit, promoted = _apply_scissor_partition_policy(
-        h, reference / RYD_TO_EV, np.array([[True, False, False]]),
-        partition, kstar, efermi_dft_ry=0., n_occ=1,
-        candidate_efermi_fn=lambda _: 0., band_classes=classes,
-        allow_frontier_promotion=False, print_fn=lambda _: None)
-    np.testing.assert_array_equal(
-        np.asarray(promoted.protected_mask),
-        np.asarray(partition.protected_mask))
 
 
 def test_index_fallback_frontier_is_identity_space_and_crossing_only():

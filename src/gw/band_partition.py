@@ -18,10 +18,10 @@ pairs.  All other off-diagonals are zeroed each iteration so the
 non-protected / out-of-range bands never mix into the protected
 subspace's eigenproblem.
 
-Masks follow DFT reference identities at each k. SC initializes this partition
-once and carries its masks unchanged; current energies and their sorted-column
-assignments still update each map. Quadrature coverage follows those energies
-independently. Sorted QP columns are not coordinates of the Hamiltonian carry.
+Masks follow DFT reference identities at each k.  Only fixed-Sigma EQP2
+builds a non-trivial partition (:func:`build_omega_band_partition`); the SC
+loop keeps every QP-window identity protected (owner rule 2026-09-22), so its
+partition is :meth:`BandPartition.all_protected`.
 """
 
 from __future__ import annotations
@@ -137,17 +137,6 @@ class BandPartition:
         return BandPartition(protected_mask=jnp.asarray(out),
                              in_range_mask=jnp.asarray(in_range))
 
-    def warn_if_protected_outside_grid(self, *, print_fn=print) -> None:
-        """Report protected states outside the requested classification window.
-
-        Hysteresis may legitimately retain these states in padded quadrature
-        support; the quadrature planner owns actual coverage certification.
-        """
-        n = int(jnp.sum(self.protected_mask & ~self.in_range_mask))
-        if n:
-            print_fn(f"  SC partition: {n} protected (k,state) members outside "
-                     "the requested window; quadrature support must cover them")
-
 
 def build_omega_band_partition(
     e_dft_kn_ry,
@@ -156,15 +145,10 @@ def build_omega_band_partition(
     band_offset: int,
     omega_min_abs_ev: float,
     omega_max_abs_ev: float,
-    previous_partition: BandPartition | None = None,
-    hysteresis_margin_ev: float = 0.0,
-    mu_ev: float | None = None,
-    current_indices_kn=None,
-    degeneracy_tol_ev: float | None = None,
-    label: str = "SC",
+    label: str = "EQP2",
     print_fn=print,
 ) -> BandPartition:
-    """Classify reference identities using an all-k window and padded hysteresis.
+    """Classify reference identities with an all-k window (fixed-Sigma EQP2).
 
     Parameters
     ----------
@@ -172,71 +156,27 @@ def build_omega_band_partition(
         Current energies in Ry, already gathered into DFT identity order.
     e_dft_full_kn_ry : (nk, nb_full) real
         Immutable full DFT reference ladder in Ry for local multiplet closure.
-    current_indices_kn : (nk, nb_active) integer, optional
-        DFT identity to current sorted QP column, used only for the summary.
-    degeneracy_tol_ev : float, optional
-        Reference multiplet adjacent-gap tolerance in eV. Defaults to the
-        common band-degeneracy threshold; SC supplies its exact tolerance.
-    mu_ev : float, optional
-        Current chemical potential in eV. Its state-relative energy sets the
-        shared quadrature/classification pad. Legacy callers without mu use
-        ``hysteresis_margin_ev`` in eV.
 
     Notes
     -----
-    A label enters when its entire k range is inside the requested window.
-    Previously protected members survive while the label's entire k range
-    remains inside the padded bounds. Reference multiplets close locally.
+    A label is protected and in range when its entire k range is inside the
+    requested window. Reference multiplets close locally.
     """
     from common.units import RYD_TO_EV
-    from .scissor import classify_bands_in_grid, sc_state_pad_ev
+    from .scissor import classify_bands_in_grid
 
     e_ev = np.asarray(e_dft_kn_ry, dtype=np.float64) * RYD_TO_EV
     lo, hi = float(omega_min_abs_ev), float(omega_max_abs_ev)
     band_in_grid, _ = classify_bands_in_grid(e_ev, lo, hi)
     in_range = np.broadcast_to(band_in_grid, e_ev.shape).copy()
     protected = in_range.copy()
-    margin = float(hysteresis_margin_ev)
-    if margin < 0.0 or not np.isfinite(margin):
-        raise ValueError("hysteresis_margin_ev must be finite and nonnegative")
-    pad = (np.full(e_ev.shape, margin) if mu_ev is None else
-           sc_state_pad_ev(e_ev - float(mu_ev)))
-    if previous_partition is not None:
-        previous = np.asarray(previous_partition.protected_mask, dtype=bool)
-        if previous.shape not in ((e_ev.shape[1],), e_ev.shape):
-            raise ValueError("previous partition and current spectrum have different shapes")
-        previous = np.broadcast_to(previous, e_ev.shape)
-        retained_kn = (e_ev >= lo - pad) & (e_ev <= hi + pad)
-        retained = np.all(retained_kn, axis=0)
-        protected |= previous & retained[None, :]
-        for k, n in zip(*np.nonzero(previous & ~retained_kn)):
-            print_fn(f"  {label} partition escape: band={n + band_offset + 1}, "
-                     f"k={k}, E={e_ev[k, n]:+.6f} eV, pad={pad[k, n]:.6f} eV, "
-                     f"window=[{lo:+.6f}, {hi:+.6f}] eV")
     partition = BandPartition(jnp.asarray(protected), jnp.asarray(in_range))
     partition = partition.promoted_to_multiplets(
-        e_dft_full_kn_ry, int(band_offset), label=label, print_fn=print_fn,
-        degeneracy_tol_ev=degeneracy_tol_ev)
+        e_dft_full_kn_ry, int(band_offset), label=label, print_fn=print_fn)
     protected = np.asarray(partition.protected_mask)
     all_k = np.flatnonzero(np.all(protected, axis=0)) + int(band_offset) + 1
     print_fn(f"  {label} partition: protected at all k bands={all_k.tolist()}; "
              f"protected {int(protected.sum())}/{protected.size} (k,state)")
-    if current_indices_kn is not None:
-        indices = np.asarray(current_indices_kn)
-        if indices.shape != e_ev.shape or not np.all(
-                np.sort(indices, axis=1) == np.arange(e_ev.shape[1])):
-            raise ValueError("current_indices_kn must be a per-k permutation of active columns")
-        for k in range(e_ev.shape[0]):
-            sorted_p = np.zeros(e_ev.shape[1], dtype=bool)
-            sorted_i = np.zeros(e_ev.shape[1], dtype=bool)
-            sorted_p[indices[k]] = protected[k]
-            sorted_i[indices[k]] = in_range[k]
-            if k == 0 or not (np.array_equal(sorted_p, protected[k]) and
-                             np.array_equal(sorted_i, in_range[k])):
-                absolute = lambda mask: (np.flatnonzero(mask) + band_offset + 1).tolist()
-                print_fn(f"  {label} partition k={k}: protected identities="
-                         f"{absolute(protected[k])}, sorted columns={absolute(sorted_p)}; "
-                         f"scissored sorted columns={absolute(~(sorted_p | sorted_i))}")
     return partition
 
 

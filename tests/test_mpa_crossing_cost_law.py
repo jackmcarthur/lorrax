@@ -24,7 +24,7 @@ def _sigma_cfg(patches):
         omega_min_ev=-5.0, omega_max_ev=5.0, omega_step_ev=0.25,
         regularization_ev=0.25, window_edge_factor=1.5,
         fermi_reference="vbm",
-        sigma_at_dft_extrapolate=False, sigma_at_dft_energies=False,
+        sigma_at_dft_energies=False,
         omega_patches_ev=patches)
 
 

@@ -348,11 +348,9 @@ def inspect_deck(args) -> None:
     validate_geometry(args.nodes, args.gpus_per_node, args.ranks,
                       site_gpus_per_node=args.site_gpus_per_node)
     px, py = square_mesh(args.ranks)
-    sc_buffer = (int(config.sc.buffer_nbands)
-                 if config.qp_solver.value == "self_consistent" else 0)
     nelec = (int(header.ifmax.max()) if header.ifmax.size
              else int((header.occs[0, 0] > 0.5).sum()))
-    sigma_window = nelec + int(config.ncond) + sc_buffer
+    sigma_window = nelec + int(config.ncond)
     from types import SimpleNamespace
     from gw.ppm_sigma import sigma_band_axis
 
@@ -364,7 +362,7 @@ def inspect_deck(args) -> None:
     print(f"SIGMA_WINDOW logical={band_axis.logical} "
           f"carrier={band_axis.carrier} divisor={band_axis.divisor} "
           f"pad={band_axis.pad} nelec={nelec} "
-          f"ncond={config.ncond} sc_buffer={sc_buffer}")
+          f"ncond={config.ncond}")
 
     for line in _device_lines(gpu=args.gpu):
         print(line)
