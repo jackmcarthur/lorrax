@@ -149,6 +149,12 @@ def build_G_parents(psi_xn, psi_yr, *, Gij=None, phases=None, layout='face', gem
         if (real_weights is True or phases is None
                 or not jnp.issubdtype(phases.dtype, jnp.complexfloating)):
             return ParentGreen(G, None, conj_partner=True)
+        elif real_weights is False:
+            transposed = _build_G_face(jnp.conj(psi_xn), jnp.conj(psi_yr),
+                                       gemm=gemm, Gij=Gij, phases=phases, mesh=k_unfold_plan.mesh_xy,
+                                       band_range=band_range,
+                                       prepared_active_gemm=prepared_active_gemm,
+                                       n_full=k_unfold_plan.n_full)
         else:
             transposed = jax.lax.cond(
                 (jnp.any(jnp.imag(phases) != 0) if real_weights is None
@@ -299,17 +305,28 @@ def build_G_tau(psi_xn, psi_yr, enk, t, *, e_ref=0.0, mask=None,
                 band_weight=None, E_min=None, E_max=None,
                 layout='face', gemm=None, k_unfold_plan=None, band_range=None,
                 trim_zero_bands=False, prepared_active_gemm=None,
-                conjugate=False, unfold=True, right_k_unfold_plan=None):
+                conjugate=False, unfold=True, right_k_unfold_plan=None,
+                real_weights=None):
     """Contract phases exp(-t*(energy-reference)) with energy windows, identity masks and signed weights.
 
     ``unfold=False`` returns the :class:`ParentGreen` pair instead of the
     full-k Green (the consumer does the typed unfold on its own load).
     ``right_k_unfold_plan`` transports the right endpoint of a two-family
     (charge x current) Green, as in :func:`build_G`.
+    ``real_weights`` ``None`` derives from ``t`` whether the phases are real
+    (a traced predicate for complex-typed ``t``); complex ``band_weight``
+    always makes it ``False``. A Python bool is a static statement passed to
+    :func:`build_G_parents`: ``False``
+    builds an antiunitary partner as the conjugate-face GEMM with no device
+    predicate, so a node loop does not stop on a host-read conditional; at a
+    node whose phases are real that GEMM equals ``conj(G)``.
     """
-    real_weights = not jnp.issubdtype(jnp.result_type(t), jnp.complexfloating)
-    if not real_weights:
-        real_weights = jnp.imag(t) == 0
+    if real_weights is None:
+        real_weights = not jnp.issubdtype(jnp.result_type(t), jnp.complexfloating)
+        if not real_weights:
+            real_weights = jnp.imag(t) == 0
+    # Complex band weights make the phases complex whatever the caller stated:
+    # a static True is demoted, never trusted over the weights.
     if band_weight is not None and jnp.issubdtype(
             jnp.result_type(band_weight), jnp.complexfloating):
         real_weights = False
