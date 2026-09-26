@@ -228,7 +228,7 @@ def build_finite_q_data(data, q, mesh_xy):
     #
     # The resolvent's four pair-density vertices — the seed's decode
     # (``build_realspace_random_transition_generator``), the ring kernel's encode
-    # and decode (``apply_V_ring`` / the hoisted ``M_X``), and the snapshot's
+    # and decode (``apply_V_ring`` / the hoisted ``M``), and the snapshot's
     # encode (``build_density_snapshot_operator``) — all carry ONE fixed
     # conjugation convention, ``K^x = M V M†`` with the conjugate on the ENCODE
     # leg.  That convention is NOT ours to move: it is pinned by the optical BSE

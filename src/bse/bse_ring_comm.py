@@ -516,16 +516,19 @@ def apply_V_ring(
     X: jax.Array,
     psi_c_Y: jax.Array,
     psi_v_Y: jax.Array,
-    M_X: jax.Array,
+    M: jax.Array,
     V_q0: jax.Array,
     nk: int,
     px: int,
     py: int,
 ) -> jax.Array:
-    # ``M_X`` (nk, c_full, v_full, μ_loc): the hoisted decode-side exchange pair
-    # amplitude ``Σ_s conj(ψ_c^X) ψ_v^X`` (μ on x), precomputed ONCE per solve
-    # (audit P3) rather than rebuilt from ψ every matvec. The encode side stays
-    # fused into the ψ_c^Y/ψ_v^Y ring sum below (it is X-dependent, not hoistable).
+    # ``M`` (nk, c_loc, v_loc, μ): the hoisted decode-side exchange pair
+    # amplitude ``Σ_s conj(ψ_c^X) ψ_v^X``, precomputed ONCE per solve (audit P3)
+    # rather than rebuilt from ψ every matvec, in the TRANSITION layout ``sh.M``
+    # (c on x, v on y, μ whole): the local tile is exactly this rank's X tile, so
+    # the decode below is rank-local and reads the one 1/P copy in place.  The
+    # encode side stays fused into the ψ_c^Y/ψ_v^Y ring sum below (it is
+    # X-dependent, not hoistable).
     nb_trial = X.shape[0]
     sqrt_nk = jnp.sqrt(jnp.asarray(nk, dtype=X.real.dtype))
 
@@ -538,8 +541,6 @@ def apply_V_ring(
     nk_local = psi_c_Y.shape[0]
     nspinor = psi_c_Y.shape[2]
     nu_local = psi_c_Y.shape[-1]
-    nc_full = M_X.shape[1]
-    mu_local = M_X.shape[-1]
 
     c_start_local = axis_index_x * jnp.asarray(c_chunk, dtype=jnp.int32)
     z = jnp.int32(0)
@@ -590,20 +591,18 @@ def apply_V_ring(
 
     U_partial = jnp.einsum("MN,bN->bM", V_q0, S_total)  # (b, mu_local)
     U = lax.psum(U_partial, axis_name="y")
-
-    v_start_local = axis_index_y * jnp.asarray(v_chunk, dtype=jnp.int32)
-    # Slice this rank's y-block of the valence axis out of the hoisted M_X (was:
-    # slice ψ_v^X then contract with ψ_c^X — identical values, one fewer GEMM/iter).
-    M_X_slice = lax.dynamic_slice(
-        M_X, (z, z, v_start_local, z), (nk_local, nc_full, v_chunk, mu_local)
-    )
+    # U whole on μ: one all_gather of a (b, μ) vector over x.  The decode then
+    # contracts M's own (c_x, v_y) tile over all of μ -- no reshard of M and no
+    # psum_scatter of a (b, c, v, k) partial.  (Until 2026-09-26 the decode read
+    # M μ-on-x; after M moved to the transition layout that cost a per-call
+    # relayout of M inside every matvec: +1.5 ms on the Si 4x4x4 ladder.)
+    U = lax.all_gather(U, "x", axis=1, tiled=True)  # (b, μ)
     # Back-contract carries the BARE vertex: K^x = M V M†, fixed by the
     # transition density <0|ρ̂|Ψ> = Σ A_cvk ψ_ck ψ*_vk.  (The reverse assignment
     # builds conj(K^x), which cannot be covariant alongside the correct W term.)
     # This also sets the non-TDA B block: apply_V_ring_B conjugates ψ^Y on the
     # way in, so its forward leg is the bare M and it assembles B = M V M^T.
-    VX_partial = jnp.einsum("kcvM,bM->bcvk", M_X_slice, U)  # broadcast over k
-    VX = lax.psum_scatter(VX_partial, axis_name="x", scatter_dimension=1, tiled=True)
+    VX = jnp.einsum("kcvM,bM->bcvk", M, U)  # broadcast over k
 
     return VX / sqrt_nk
 
@@ -771,23 +770,23 @@ def build_bse_ring_matvec_full(
         out_specs=P(None, "x", "y", None, None, None),
     )
 
-    def _apply_V_ring_only(X, psi_c_Y, psi_v_Y, M_X, V_q0):
-        return apply_V_ring(X, psi_c_Y, psi_v_Y, M_X, V_q0, nk, px, py)
+    def _apply_V_ring_only(X, psi_c_Y, psi_v_Y, M, V_q0):
+        return apply_V_ring(X, psi_c_Y, psi_v_Y, M, V_q0, nk, px, py)
 
     apply_V_ring_only = _shard_map_fn(
         _apply_V_ring_only,
         mesh=mesh_xy,
         in_specs=(P(None, "x", "y", None), P(None, None, None, "y"), P(None, None, None, "y"),
-                  P(None, None, None, "x"), P("x", "y")),
+                  P(None, "x", "y", None), P("x", "y")),
         out_specs=P(None, "x", "y", None),
     )
 
-    def _apply_V_ring_B(X, psi_c_Y, psi_v_Y, M_X, V_q0):
+    def _apply_V_ring_B(X, psi_c_Y, psi_v_Y, M, V_q0):
         return apply_V_ring(
             X,
             jnp.conj(psi_c_Y),
             jnp.conj(psi_v_Y),
-            M_X,
+            M,
             V_q0,
             nk,
             px,
@@ -798,7 +797,7 @@ def build_bse_ring_matvec_full(
         _apply_V_ring_B,
         mesh=mesh_xy,
         in_specs=(P(None, "x", "y", None), P(None, None, None, "y"), P(None, None, None, "y"),
-                  P(None, None, None, "x"), P("x", "y")),
+                  P(None, "x", "y", None), P("x", "y")),
         out_specs=P(None, "x", "y", None),
     )
 
@@ -871,28 +870,28 @@ def build_bse_ring_matvec_full(
                              psi_cW_X, psi_vW_Y, W_R)
 
     def _apply_A(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0,
-                 M_X, psi_cW_X, psi_vW_Y):
+                 M, psi_cW_X, psi_vW_Y):
         D_term = apply_D_term(X, eps_c, eps_v)
-        V_term = apply_V_ring_only(X, psi_c_Y, psi_v_Y, M_X, V_q0)
+        V_term = apply_V_ring_only(X, psi_c_Y, psi_v_Y, M, V_q0)
         if not include_W:
             return D_term + V_term
         return D_term + V_term - _w_term_A(X, psi_cW_X, psi_vW_Y, W_R)
 
-    def _apply_B(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, W_R, V_q0, M_X,
+    def _apply_B(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, W_R, V_q0, M,
                  psi_cW_X, psi_cW_Y, psi_vW_X, psi_vW_Y):
         # screening (RPA density response): ring kernel K^A, same as the A block
         # (apply_V_ring_only); optical BSE: excitonic V_B (apply_V_ring_B). Both take
-        # the SAME hoisted M_X (audit P3) — apply_V_ring_B conjugates only ψ^Y.
+        # the SAME hoisted M (audit P3) — apply_V_ring_B conjugates only ψ^Y.
         if screening:
-            V_term = apply_V_ring_only(X, psi_c_Y, psi_v_Y, M_X, V_q0)
+            V_term = apply_V_ring_only(X, psi_c_Y, psi_v_Y, M, V_q0)
         else:
-            V_term = apply_V_ring_B(X, psi_c_Y, psi_v_Y, M_X, V_q0)
+            V_term = apply_V_ring_B(X, psi_c_Y, psi_v_Y, M, V_q0)
         if not include_W:
             return V_term
         return V_term - _w_term_B(X, psi_cW_X, psi_cW_Y, psi_vW_X, psi_vW_Y, W_R)
 
     def _antiresonant_row(X, Y, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v,
-                          W_R, V_q0, M_X,
+                          W_R, V_q0, M,
                           psi_cW_X, psi_cW_Y, psi_vW_X, psi_vW_Y):
         """Bottom (anti-resonant) block-row of the non-TDA operator applied to
         ``[X; Y]``: ``Y_out``.  The physics of this row depends on ``screening``:
@@ -944,8 +943,8 @@ def build_bse_ring_matvec_full(
           bug (PHASE2_LOG "non-TDA eigensolvers", first checked numbers)."""
         if screening and not include_W:
             AY = _apply_A(Y, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v,
-                          W_R, V_q0, M_X, psi_cW_X, psi_vW_Y)
-            BX = _apply_B(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, W_R, V_q0, M_X,
+                          W_R, V_q0, M, psi_cW_X, psi_vW_Y)
+            BX = _apply_B(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, W_R, V_q0, M,
                           psi_cW_X, psi_cW_Y, psi_vW_X, psi_vW_Y)
             return -BX - AY
         if screening:
@@ -954,21 +953,21 @@ def build_bse_ring_matvec_full(
             # conjugated appliers reuse the SAME kernels on conjugated inputs —
             # no second W path, so nothing can drift between the two rows.
             AY = (apply_D_term(Y, eps_c, eps_v)
-                  + apply_V_ring_only(Y, psi_c_Y, psi_v_Y, M_X, V_q0)
+                  + apply_V_ring_only(Y, psi_c_Y, psi_v_Y, M, V_q0)
                   - jnp.conj(_w_term_A(jnp.conj(Y), psi_cW_X, psi_vW_Y, W_R)))
-            BX = (apply_V_ring_only(X, psi_c_Y, psi_v_Y, M_X, V_q0)
+            BX = (apply_V_ring_only(X, psi_c_Y, psi_v_Y, M, V_q0)
                   - jnp.conj(_w_term_B(jnp.conj(X), psi_cW_X, psi_cW_Y,
                                        psi_vW_X, psi_vW_Y, W_R)))
             return -BX - AY
         AsY = jnp.conj(_apply_A(jnp.conj(Y), psi_c_X, psi_c_Y, psi_v_X, psi_v_Y,
-                                eps_c, eps_v, W_R, V_q0, M_X, psi_cW_X, psi_vW_Y))
+                                eps_c, eps_v, W_R, V_q0, M, psi_cW_X, psi_vW_Y))
         BsX = jnp.conj(_apply_B(jnp.conj(X), psi_c_X, psi_c_Y, psi_v_X, psi_v_Y,
-                                W_R, V_q0, M_X, psi_cW_X, psi_cW_Y,
+                                W_R, V_q0, M, psi_cW_X, psi_cW_Y,
                                 psi_vW_X, psi_vW_Y))
         return -BsX - AsY
 
     def _impl_core_fused(X_full, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c,
-                         eps_v, W_R, V_q0, M_X, psi_cW_X, psi_cW_Y, psi_vW_X,
+                         eps_v, W_R, V_q0, M, psi_cW_X, psi_cW_Y, psi_vW_X,
                          psi_vW_Y):
         """The LADDER screening non-TDA matvec with TWO rung FFT chains, not four.
 
@@ -1034,8 +1033,8 @@ def build_bse_ring_matvec_full(
         X, Y = X_full[0], X_full[1]
         DX = apply_D_term(X, eps_c, eps_v)
         DY = apply_D_term(Y, eps_c, eps_v)
-        VX = apply_V_ring_only(X, psi_c_Y, psi_v_Y, M_X, V_q0)
-        VY = apply_V_ring_only(Y, psi_c_Y, psi_v_Y, M_X, V_q0)
+        VX = apply_V_ring_only(X, psi_c_Y, psi_v_Y, M, V_q0)
+        VY = apply_V_ring_only(Y, psi_c_Y, psi_v_Y, M, V_q0)
         T_res = (_T_term_A(X, psi_cW_X, psi_vW_Y)
                  + _T_term_B(Y, psi_cW_Y, psi_vW_X))
         T_anti = (_T_term_B(jnp.conj(X), psi_cW_Y, psi_vW_X)
@@ -1047,20 +1046,20 @@ def build_bse_ring_matvec_full(
         return jnp.stack([X_out, Y_out], axis=0)
 
     def _impl_core(X_full, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v,
-                   W_R, V_q0, M_X, psi_cW_X, psi_cW_Y, psi_vW_X, psi_vW_Y):
+                   W_R, V_q0, M, psi_cW_X, psi_cW_Y, psi_vW_X, psi_vW_Y):
         if fuse_ladder_rung and screening and include_W:
             return _impl_core_fused(X_full, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y,
-                                    eps_c, eps_v, W_R, V_q0, M_X,
+                                    eps_c, eps_v, W_R, V_q0, M,
                                     psi_cW_X, psi_cW_Y, psi_vW_X, psi_vW_Y)
         X = X_full[0]
         Y = X_full[1]
         AX = _apply_A(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v,
-                      W_R, V_q0, M_X, psi_cW_X, psi_vW_Y)
-        BY = _apply_B(Y, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, W_R, V_q0, M_X,
+                      W_R, V_q0, M, psi_cW_X, psi_vW_Y)
+        BY = _apply_B(Y, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, W_R, V_q0, M,
                       psi_cW_X, psi_cW_Y, psi_vW_X, psi_vW_Y)
         X_out = AX + BY
         Y_out = _antiresonant_row(X, Y, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y,
-                                  eps_c, eps_v, W_R, V_q0, M_X,
+                                  eps_c, eps_v, W_R, V_q0, M,
                                   psi_cW_X, psi_cW_Y, psi_vW_X, psi_vW_Y)
         return jnp.stack([X_out, Y_out], axis=0)
 
@@ -1072,10 +1071,9 @@ def build_bse_ring_matvec_full(
                          eps_v, W_R, V_q0, M,
                          psi_cW_X, psi_cW_Y, psi_vW_X, psi_vW_Y):
             # M: the hoisted exchange pair amplitude (audit P3) in the shared
-            # transition layout (sh.M); the ring decode reads it μ-on-x.
-            M_X = lax.with_sharding_constraint(M, sh.psi_x)
+            # transition layout (sh.M); the ring decode reads it in place.
             return _impl_core(X_full, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y,
-                              eps_c, eps_v, W_R, V_q0, M_X,
+                              eps_c, eps_v, W_R, V_q0, M,
                               psi_cW_X, psi_cW_Y, psi_vW_X, psi_vW_Y)
 
         matvec = jax.jit(
@@ -1093,13 +1091,12 @@ def build_bse_ring_matvec_full(
         def _matvec_impl(X_full, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c,
                          eps_v, W_R, V_q0, M):
             # M: the hoisted exchange pair amplitude (audit P3) in the shared
-            # transition layout (sh.M), read μ-on-x by the ring decode and shared
-            # by the A and B blocks.  The rung (if any) consumes the density psi
-            # arrays — correct for every raw payload (the only kind these
-            # operators see).
-            M_X = lax.with_sharding_constraint(M, sh.psi_x)
+            # transition layout (sh.M), read in place by the ring decode and
+            # shared by the A and B blocks.  The rung (if any) consumes the
+            # density psi arrays — correct for every raw payload (the only kind
+            # these operators see).
             return _impl_core(X_full, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y,
-                              eps_c, eps_v, W_R, V_q0, M_X,
+                              eps_c, eps_v, W_R, V_q0, M,
                               psi_c_X, psi_c_Y, psi_v_X, psi_v_Y)
 
         matvec = jax.jit(
@@ -1133,13 +1130,11 @@ def build_bse_ring_matvec_full(
     # refuses above), so the rung's psi operands ARE the density ones here.
     def _apply_A_raw(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v,
                      W_R, V_q0, M):
-        M_X = lax.with_sharding_constraint(M, sh.psi_x)
         return _apply_A(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v,
-                        W_R, V_q0, M_X, psi_c_X, psi_v_Y)
+                        W_R, V_q0, M, psi_c_X, psi_v_Y)
 
     def _apply_B_raw(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, W_R, V_q0, M):
-        M_X = lax.with_sharding_constraint(M, sh.psi_x)
-        return _apply_B(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, W_R, V_q0, M_X,
+        return _apply_B(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, W_R, V_q0, M,
                         psi_c_X, psi_c_Y, psi_v_X, psi_v_Y)
 
     apply_A = jax.jit(
