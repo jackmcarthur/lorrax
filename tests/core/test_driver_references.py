@@ -13,13 +13,15 @@ from core import rank_session
 
 
 EQP_ATOL_EV = 2.0e-5
-# The GN deck fits Sigma to 1e-3 and permits the explicitly uncertified
-# imaginary-axis quadrature. P4 tightening to 1e-4 changes Eqp1 by 0.155 meV;
-# the historical pin differs by 0.323 meV at 1e-3, 0.168 meV at 1e-4.
-# A 0.5 meV budget covers this approximation; static pins stay at 0.02 meV.
+# The GN deck fits Sigma at the production default 3e-5 (owner 2026-09-26) and
+# permits the explicitly uncertified imaginary-axis quadrature.  At 3e-5 two
+# independently built rule partitions agree to ~0.05 meV; the 0.5 meV budget
+# covers a rule-set change, not the quadrature error itself.  Static pins stay
+# at 0.02 meV.
 GN_EQP_ATOL_EV = 5.0e-4
-# One-shot MPA at 1e-4 differs from 1e-3 by 0.101 meV (Eqp1),
-# and the 1e-3 reference differs across P by 0.076 meV (Eqp0).
+# The MPA decks run at the test-deck floor 5e-4 (owner 2026-09-26).  One-shot
+# MPA at 1e-4 differed from 1e-3 by 0.101 meV (Eqp1), and the 1e-3 reference
+# across P by 0.076 meV (Eqp0).
 MPA_EQP_ATOL_EV = 2.0e-4
 ZETA_ATOL = 2.0e-10
 
@@ -139,7 +141,7 @@ def test_b_mpa_one_update_matches_references(core_fixtures):
     _run(run_b, "mpa_sc1.in", allow_runtime_solve=True)
     # MPA tolerance, as for the one-shot references above: the SC window
     # state set carries the padded active extent, so the certified rules
-    # (eps 1e-3) differ between P1 and P4 and the map output moves ~0.1 meV
+    # (eps 5e-4) differ between P1 and P4 and the map output moves ~0.1 meV
     # (registered on main, 2026-09-06; boxes differ by P on the base too).
     _assert_eqp(run_b / "mpa_sc1_eqp0.dat", source_b / "mpa_sc1_eqp0.dat",
                 atol=MPA_EQP_ATOL_EV)
@@ -163,7 +165,7 @@ def test_b_mpa_one_update_matches_references(core_fixtures):
     assert "box=(" in box_line and "padded_box=(" in box_line
     sup, target = (float(value) for value in re.search(
         r"sup=([0-9.e+-]+)/([0-9.e+-]+)", box_line).groups())
-    assert sup <= target == pytest.approx(1.0e-3)
+    assert sup <= target == pytest.approx(5.0e-4)
     assert "rebuilds_this_iteration=6, rebuilds_total=6" in report
     gain = float(re.search(r"SC map gain:.*? = ([0-9.e+-]+)", report)[1])
     assert gain == pytest.approx(0.185133, abs=1e-4)

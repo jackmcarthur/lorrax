@@ -118,7 +118,7 @@ def test_incumbent_enabled_head_remains_valid(tmp_path, head):
     assert c.head.correction.value == ('full' if head is None else head)
 
 
-@pytest.mark.parametrize('tier,eps', [('production', 1e-4), ('relaxed', 1e-3)])
+@pytest.mark.parametrize('tier,eps', [('production', 3e-5), ('relaxed', 5e-4)])
 @pytest.mark.parametrize('backend', ['local', 'distributed'])
 def test_selected_tier(tmp_path, tier, eps, backend):
     c = parse(tmp_path, f'compute_mode=mpa\nsigma_w_model=shared_pole\nsigma_w_accuracy={tier}\nlinalg={backend}\nsigma_quadrature_eps={eps}\n')
