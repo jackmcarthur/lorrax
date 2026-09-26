@@ -136,7 +136,8 @@ def get_sigma_spatial_kernel(
     from .greens_function_kernel import sigma_spin_block
     ns = int(face_shape[3])
     d = sigma_spin_block(n_parent=k_unfold_plan.n_parent, n_rmu=int(face_shape[2]), ns=ns,
-                         mesh=mesh_xy, partner_tiles=partner_tiles)
+                         n_full=nk_tot, n_band=int(face_shape[1]), mesh=mesh_xy,
+                         partner_tiles=partner_tiles)
     unfold_conv = make_kconv_klead_unfold(mesh_xy, kgrid, k_unfold_plan.unfold_load_tables(),
                                           store_rows=k_unfold_plan.parent_full_rows,
                                           norm='ortho', mult=-1.0 / np.sqrt(float(nk_tot)),
@@ -228,9 +229,11 @@ def _get_sigma_kij_kernel(
 
     from distrib_la import gemm_plan
     _, nb, mu, ns = face_shape
+    # Not warmed: the plan runs inside the window executable, and a warm-up would
+    # hold full-size dummy C and D tiles at plan time.
     g_plan = gemm_plan(mesh_xy, m=mu * ns, k=nb, n=mu * ns,
                        nq=k_unfold_plan.n_parent, dtype=jnp.complex128, layout=layout,
-                       enable_active_range=True)
+                       enable_active_range=True, warmup=False)
 
     def _g_from_selector(xn, yr, E, sel, E_min, E_max, ref, t, band_range=None):
         """Apply boolean identity masks or signed occupation weights without clipping."""
