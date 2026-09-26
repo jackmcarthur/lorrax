@@ -694,7 +694,7 @@ def finalize_dynamic_sigma(
                 sigma_c_omega_unextrap, sig_x_rep,
                 omega_grid_ev, e_qp_rel_ev, mesh_xy,
                 band_axis=sigma_band_axis,
-                **qsgw_edge_kwargs,
+                out_of_grid=config.sigma.out_of_grid,
             )
 
         # Only append when this call created the base file.  SC iterations

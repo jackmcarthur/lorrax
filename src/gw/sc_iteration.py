@@ -4984,6 +4984,8 @@ def _write_sc_eqp_snapshot(
     # mask, fallback, membership test, convergence test, or map update here.
     eqp1_output = e_eval + z_factor * (e_output - e_eval)
 
+    snapshot_partition = _partition_on_loop(
+        _state_partition(state_out, inputs), inputs)
     band_offset = int(inputs.band_slices.sigma.start)
     tail_start = int(inputs.band_slices.sigma.stop)
     tail_stop = int(inputs.meta.b_id_4_user) - band_offset
