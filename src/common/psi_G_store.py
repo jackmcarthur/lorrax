@@ -37,7 +37,8 @@ import jax
 import jax.numpy as jnp
 from jax.experimental import io_callback
 from common.shard_map import shard_map
-from common.wfn_layout import band_sphere_spec
+from common.wfn_layout import (band_sphere_spec, PSI_NMU_SPEC, PSI_MUNT_SPEC,
+                               PSI_NMU_ACC_SPEC, PSI_MUNT_ACC_SPEC)
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from runtime.padding import spec_divisor
 
@@ -926,9 +927,12 @@ class ParentPsiG(NamedTuple):
                      ``p = x·P_y + y``.
     ``kvecs_frac``   ``(n_k, 3)`` the loader's k representatives for these rows.
     ``band_range``   the logical ``[b0, b1)``; bands ``[b1, b0+nb_c)`` are zero.
-    ``faces``        ``(psi_y, psi_x)`` exactly as
+    ``faces``        ``(psi_y, psi_x)`` with the values and extents
                      :func:`common.wfn_transforms.load_centroids_band_chunked`
-                     returns them, or ``None`` without centroids.
+                     returns, already on the faces: ``psi_y`` at
+                     ``PSI_NMU_SPEC`` and ``psi_x`` at ``PSI_MUNT_SPEC`` (1/P;
+                     ``wavefunction_bundle.parent_faces`` is then a no-op
+                     reshard); ``None`` without centroids.
     """
     psi_G: "jax.Array | None"
     host_tile: "np.ndarray | None"
@@ -957,10 +961,11 @@ def _gslot_face_kernel(mesh: Mesh, fft_grid: tuple, nk: int, bc_w: int, ns: int,
 
         X[b,s,μ] = Σ_{G ∈ my slots} ψ[k,b,s,G] · e^{2πi (k+G)·r_μ} / √N_r
 
-    is a GEMM over the local G slots, psum'ed over the mesh, and each face
-    keeps its own μ slice (``'y'`` for ψ_y, ``'x'`` for ψ_x).  The phase is
-    formed from integer residues ``(G_a r_a mod n_a)/n_a``, the twiddles the
-    FFT itself uses.
+    is a GEMM over the local G slots, reduce-scattered over the mesh straight
+    onto each face's 1/P accumulator slice (``PSI_NMU_ACC_SPEC`` y-major for
+    ψ_y, ``PSI_MUNT_ACC_SPEC`` x-major for ψ_x; :func:`_gslot_faces_kernel`
+    lands them on the faces).  The phase is formed from integer residues
+    ``(G_a r_a mod n_a)/n_a``, the twiddles the FFT itself uses.
     """
     nx, ny, nz = fft_grid
     n_rtot = nx * ny * nz
@@ -969,7 +974,6 @@ def _gslot_face_kernel(mesh: Mesh, fft_grid: tuple, nk: int, bc_w: int, ns: int,
     py = int(mesh.shape['y'])
     px = int(mesh.shape['x'])
     ngk_l = ngk_c // P_
-    mu_y, mu_x = mu_pad // py, mu_pad // px
     n_t = mu_pad // mu_t
     inv_sqrt_n = 1.0 / np.sqrt(float(n_rtot))
 
@@ -1008,12 +1012,11 @@ def _gslot_face_kernel(mesh: Mesh, fft_grid: tuple, nk: int, bc_w: int, ns: int,
 
             X = jax.lax.map(one_tile, (r_t, w_t))              # (n_t, bc_w·ns, mu_t)
             X = jnp.moveaxis(X, 0, 1).reshape(bc_w, ns, mu_pad)
-            X = jax.lax.psum(X, XY)
-            y0 = jax.lax.axis_index('y') * mu_y
-            x0 = jax.lax.axis_index('x') * mu_x
-            Xy = jax.lax.dynamic_slice_in_dim(X, y0, mu_y, axis=2)
-            Xx = jnp.conj(jax.lax.dynamic_slice_in_dim(X, x0, mu_x, axis=2)
-                          ).transpose(2, 0, 1)
+            # Two reduce-scatters (the bytes of one all-reduce), each onto
+            # its face's 1/P μ slice: y-major for ψ_y, x-major for ψ_x.
+            Xy = jax.lax.psum_scatter(X, ('y', 'x'), scatter_dimension=2, tiled=True)
+            Xx = jnp.conj(jax.lax.psum_scatter(
+                X, XY, scatter_dimension=2, tiled=True)).transpose(2, 0, 1)
             z = jnp.int32(0)
             ay = jax.lax.dynamic_update_slice(ay, Xy[None], (kk, b0, z, z))
             ax_ = jax.lax.dynamic_update_slice(ax_, Xx[None], (kk, z, b0, z))
@@ -1027,11 +1030,27 @@ def _gslot_face_kernel(mesh: Mesh, fft_grid: tuple, nk: int, bc_w: int, ns: int,
     fn = shard_map(
         local, mesh=mesh,
         in_specs=(P(None, XY, None, None), rep, rep, rep, rep,
-                  P(None, None, None, 'y'), P(None, 'x', None, None), rep),
-        out_specs=(P(None, None, None, XY), P(None, None, None, 'y'),
-                   P(None, 'x', None, None)),
+                  PSI_NMU_ACC_SPEC, PSI_MUNT_ACC_SPEC, rep),
+        out_specs=(P(None, None, None, XY), PSI_NMU_ACC_SPEC, PSI_MUNT_ACC_SPEC),
         check_vma=False)
     return jax.jit(fn, donate_argnums=(5, 6))
+
+
+@lru_cache(maxsize=None)
+def _gslot_faces_kernel(mesh: Mesh):
+    """The 1/P accumulators on the two faces: ONE all-to-all per face.
+
+    ψ_y ``(nk, n, s, μ_YX)`` → ``PSI_NMU_SPEC`` (bands split over x, the x
+    slices of each y tile joined); ψ_x ``(nk, μ_XY, n, s)`` →
+    ``PSI_MUNT_SPEC`` (bands split over y, the y slices of each x tile
+    joined).  Values are moved, never recomputed; every operand is 1/P.
+    """
+    def local(ay, ax_):
+        return (jax.lax.all_to_all(ay, 'x', split_axis=1, concat_axis=3, tiled=True),
+                jax.lax.all_to_all(ax_, 'y', split_axis=2, concat_axis=1, tiled=True))
+    fn = shard_map(local, mesh=mesh, in_specs=(PSI_NMU_ACC_SPEC, PSI_MUNT_ACC_SPEC),
+                   out_specs=(PSI_NMU_SPEC, PSI_MUNT_SPEC), check_vma=False)
+    return jax.jit(fn, donate_argnums=(0, 1))
 
 
 @lru_cache(maxsize=None)
@@ -1074,9 +1093,11 @@ def load_parent_psi_G(
     table and its active mask are used, as in ``load_centroids_band_chunked``,
     and the faces leave in the same layouts and extents.
 
-    Per-rank bytes: the store ``n_k·nb_c·ns·ngk_c·16/P``, the in-flight chunk
-    twice (read + all-to-all), the replicated sphere index ``n_k·ngk_c·4``
-    and one ``ngk_c/P × μ_tile`` phase tile (``mu_tile_bytes``).
+    Per-rank bytes: the store ``n_k·nb_c·ns·ngk_c·16/P``, the two face
+    accumulators ``n_k·nb_c·ns·μ·16/P`` each, the in-flight chunk twice
+    (read + all-to-all), one ``band_chunk·ns·μ`` per-k partial before its
+    reduce-scatter, the replicated sphere index ``n_k·ngk_c·4`` and one
+    ``ngk_c/P × μ_tile`` phase tile (``mu_tile_bytes``).
     """
     from common import timing
     from common.collectives import device_put_process_local
@@ -1113,8 +1134,16 @@ def load_parent_psi_G(
             _centroid_sampling_geometry(
                 (b0, b0 + nb_c), centroid_indices, k_spec, meta, None, False,
                 None, loader))
-        (_, _, _, _, out_Y, out_X, stage_Y, stage_X, mu_pad, _) = (
+        (_, _, _, _, _, _, stage_Y, stage_X, mu_pad, _) = (
             _centroid_sampling_shardings(mesh_xy, meta, mu_basis, n_rmu, loader))
+        if int(mu_pad) % P_:
+            raise ValueError(
+                f"load_parent_psi_G: the centroid carrier {int(mu_pad)} does not "
+                f"divide over the {P_} ranks the face accumulators reduce onto")
+        acc_Y = NamedSharding(mesh_xy, PSI_NMU_ACC_SPEC)
+        acc_X = NamedSharding(mesh_xy, PSI_MUNT_ACC_SPEC)
+        out_Y = NamedSharding(mesh_xy, PSI_NMU_SPEC)
+        out_X = NamedSharding(mesh_xy, PSI_MUNT_SPEC)
         ngk_l = ngk_c // P_
         mu_t = max(1, min(int(mu_pad), int(mu_tile_bytes) // (16 * max(ngk_l, 1))))
         while mu_pad % mu_t:
@@ -1126,7 +1155,7 @@ def load_parent_psi_G(
         r_mu_dev = device_put_process_local(r_mu, rep)
         w_mu_dev = device_put_process_local(w_mu, rep)
 
-        @partial(jax.jit, out_shardings=(out_Y, out_X))
+        @partial(jax.jit, out_shardings=(acc_Y, acc_X))
         def _zero_faces():
             return (jnp.zeros((nk, nb_c, int(meta.nspinor), int(mu_pad)), jnp.complex128),
                     jnp.zeros((nk, int(mu_pad), nb_c, int(meta.nspinor)), jnp.complex128))
@@ -1141,8 +1170,8 @@ def load_parent_psi_G(
         acc_y, acc_x = jax.jit(
             lambda: (jnp.zeros((1, 1, 1, P_), jnp.complex128),
                      jnp.zeros((1, P_, 1, 1), jnp.complex128)),
-            out_shardings=(NamedSharding(mesh_xy, P(None, None, None, 'y')),
-                           NamedSharding(mesh_xy, P(None, 'x', None, None))))()
+            out_shardings=(NamedSharding(mesh_xy, PSI_NMU_ACC_SPEC),
+                           NamedSharding(mesh_xy, PSI_MUNT_ACC_SPEC)))()
 
     ns = int(meta.nspinor) if bispinor else int(loader.nspinor)
     store = host_tile = None
@@ -1198,7 +1227,7 @@ def load_parent_psi_G(
         t_keep += t3 - t2
     faces = None
     if with_faces:
-        faces = finish(acc_y, acc_x, nk)
+        faces = finish(*_gslot_faces_kernel(mesh_xy)(acc_y, acc_x), nk)
         jax.block_until_ready(faces)
     print_fn(f"  ψ(G) one-read: {nk} k × {nb_c} bands × {ngk_c} G slots "
              f"({(b1 - b0)} logical) in chunks of {w}; read {t_read:.2f}s, "

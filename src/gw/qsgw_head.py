@@ -1547,14 +1547,11 @@ def _head_wing_kernel_face(
                 "head wing kernel: psi_mun/psi_nmu local mu tiles differ "
                 f"({mu_local} vs {int(bra_nmu_local.shape[-1])}); the pair-tile "
                 "contraction needs one mu partition on X and Y.")
+        # Blocks read the faces in place: the last one is clamped to end at
+        # mu_local and rewrites its overlap with the same rows (no padded
+        # face copies).
         mu_block = min(_HEAD_WING_MU_BLOCK, mu_local)
-        mu_axis = padded_axis(
-            mu_local, mu_block, name="face head centroid work carrier")
-        mu_padded = mu_axis.carrier
-        n_blocks = mu_padded // mu_block
-        mu_pad = mu_padded - mu_local
-        pad_nmu = lambda a: jnp.pad(a, ((0, 0), (0, 0), (0, 0), (0, mu_pad)))
-        pad_mun = lambda a: jnp.pad(a, ((0, 0), (0, 0), (0, mu_pad), (0, 0)))
+        n_blocks = -(-mu_local // mu_block)
         p_side = int(mesh.shape[ax_x])
 
         # Endpoint blocks ``[k, s, M_b, n]`` with the band tile on X (``_x``)
@@ -1580,22 +1577,26 @@ def _head_wing_kernel_face(
             t = jax.lax.all_gather(t, ax_x, axis=3, tiled=True)
             return jnp.transpose(t, (0, 2, 3, 1))
 
-        def _pass(bra, ket, band_x, band_y, contract, scatter_axis, sum_axis, dim):
+        def _pass(bra, ket, band_x, band_y, contract, scatter_axis, sum_axis,
+                  out_shape, dim):
             """One wing: per centroid block, gather the endpoints, contract the
             local pair tile, reduce-scatter the block onto its own mu tile."""
-            def _block_step(_carry, blk):
-                start = blk * mu_block
+            def _block_step(acc, blk):
+                start = jnp.minimum(blk * mu_block, mu_local - mu_block)
                 ends = (band_x(bra, start), band_y(ket, start))
                 if use_anti:
                     ends = ends + (band_y(bra, start), band_x(ket, start))
                 part = _weighted_stack(lambda w: contract(w, *ends))
+                part = part.reshape(n_omega_padded, *part.shape[2:])
                 # M_b is tile-major: the scatter's chunk t is mu tile t's block.
                 blk_out = jax.lax.psum(jax.lax.psum_scatter(
                     part, scatter_axis, scatter_dimension=dim, tiled=True), sum_axis)
-                return _carry, blk_out
-            _, chunks = jax.lax.scan(
-                _block_step, None, jnp.arange(n_blocks, dtype=jnp.int32), unroll=1)
-            return chunks
+                return jax.lax.dynamic_update_slice_in_dim(
+                    acc, blk_out, start, axis=dim), None
+            acc, _ = jax.lax.scan(
+                _block_step, jnp.zeros(out_shape, jnp.complex128),
+                jnp.arange(n_blocks, dtype=jnp.int32), unroll=1)
+            return acc[:n_omega]
 
         # Y[w,a,m] = sum_{k,s,i,j} conj(v)[a,k,i,j] W[w,k,i,j]
         #                          conj(bra)[k,s,m,i] ket[k,s,m,j]  (mun faces)
@@ -1640,18 +1641,10 @@ def _head_wing_kernel_face(
             _, z = jax.lax.scan(_one_frequency, None, weight, unroll=1)
             return z
 
-        y_chunks = _pass(pad_mun(bra_mun_local), pad_mun(ket_mun_local), _mun_x, _mun_y,
-                         _contract_left, ax_x, ax_y, 4)
-        y_chunks = y_chunks.reshape(n_blocks, n_omega_padded, n_vertex, n_class, mu_block)
-        z_chunks = _pass(pad_nmu(bra_nmu_local), pad_nmu(ket_nmu_local), _nmu_x, _nmu_y,
-                         _contract_right, ax_y, ax_x, 3)
-        z_chunks = z_chunks.reshape(n_blocks, n_omega_padded, n_class, mu_block, n_vertex)
-        Y_x = jnp.moveaxis(y_chunks, 0, 3).reshape(
-            n_omega_padded, n_vertex, n_class,
-            mu_padded)[:n_omega, :, :, :mu_local]
-        Z_y = jnp.moveaxis(z_chunks, 0, 2).reshape(
-            n_omega_padded, n_class, mu_padded,
-            n_vertex)[:n_omega, :, :mu_local, :]
+        Y_x = _pass(bra_mun_local, ket_mun_local, _mun_x, _mun_y, _contract_left,
+                    ax_x, ax_y, (n_omega_padded, n_vertex, n_class, mu_local), 3)
+        Z_y = _pass(bra_nmu_local, ket_nmu_local, _nmu_x, _nmu_y, _contract_right,
+                    ax_y, ax_x, (n_omega_padded, n_class, mu_local, n_vertex), 2)
         if not classes:
             return Y_x[:, :, 0], Z_y[:, 0]
         return Y_x, Z_y
