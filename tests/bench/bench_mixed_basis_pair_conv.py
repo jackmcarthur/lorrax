@@ -399,6 +399,9 @@ def main():
         runs.append(dict(kind="cold one-shot" if i == 0 else "warm one-shot", **tm))
         say(f"{runs[-1]['kind']}: " + ", ".join(f"{k} {v:.3f} s" for k, v in tm.items()
                                                  if not k.endswith("_chunks")))
+        say("running device peak after each stage (GB): " + ", ".join(
+            f"{k[:-len('_peak_chunks')]} {'/'.join(f'{v / 1e9:.2f}' for v in vs)}"
+            for k, vs in tm.items() if k.endswith("_peak_chunks")))
         if conv.chunks.n_c > 1:
             say("per r' chunk: expand " + " ".join(f"{v:.3f}" for v in tm["expand_chunks"])
                 + " s; middle " + " ".join(f"{v:.3f}" for v in tm["middle_chunks"]) + " s")

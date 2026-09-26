@@ -1242,12 +1242,16 @@ class MixedBasisPairConvolution:
 
         def mark(name, x, t0):
             """Stage walls (``timings[name]``, summed over r' chunks; ``timings[name + '_chunks']``
-            per chunk) when the caller asks for them: each stage is then fenced."""
+            per chunk) when the caller asks for them: each stage is then fenced.  With the walls,
+            this rank's device peak so far after each stage (``timings[name + '_peak_chunks']``,
+            bytes; the running maximum, so a stage's own peak is where it first rises)."""
             if timings is not None:
                 jax.block_until_ready(x)
                 dt = time.perf_counter() - t0
                 timings[name] = timings.get(name, 0.0) + dt
                 timings.setdefault(name + "_chunks", []).append(dt)
+                stats = jax.local_devices()[0].memory_stats() or {}
+                timings.setdefault(name + "_peak_chunks", []).append(int(stats.get("peak_bytes_in_use", 0)))
             return time.perf_counter()
 
         ops_in = []
