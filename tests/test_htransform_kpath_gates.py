@@ -81,7 +81,7 @@ def test_post_kpath_outputs_are_replicated(ndev):
     """
     pytest.importorskip("jax")
     import jax
-    from bandstructure.htransform import h_transform
+    from bandstructure.fh_interp import h_transform
     mesh = _mesh(1 if ndev == 1 else 2)
     meta, ct, enk, wfn, kpath_data = _kpath_inputs()
     import jax.numpy as jnp
@@ -109,7 +109,7 @@ def test_htransform_carries_no_dense_identity_metric():
     """The selected-state basis owns one orthonormal gauge, not a dense S."""
     pytest.importorskip("jax")
     import jax.numpy as jnp
-    from bandstructure.htransform import h_transform
+    from bandstructure.fh_interp import h_transform
     mesh = _mesh(1)
     meta, ct, enk, wfn, kpath_data = _kpath_inputs()
     lines = []
@@ -138,7 +138,7 @@ def test_fh_builder_consumes_rank_shards_and_keeps_small_certificate(ndev):
     import jax
     import jax.numpy as jnp
     from jax.sharding import NamedSharding, PartitionSpec as P
-    from bandstructure.htransform import h_transform
+    from bandstructure.fh_interp import h_transform
     from symmetry_maps import SymMaps
 
     mesh = _mesh(1 if ndev == 1 else 2)
@@ -172,7 +172,7 @@ def test_active_character_follows_state_through_guard_energy_crossing():
     """A lower DFT guard must not replace a raised active QP state."""
     pytest.importorskip("jax")
     import jax.numpy as jnp
-    from bandstructure.htransform import select_active_eigenpairs
+    from bandstructure.fh_interp import select_active_eigenpairs
 
     # Active state 2 lies above guard state 1.  Lowest-energy truncation would
     # return (-3, -2, -1); character selection must return (-3, -2, +1).
@@ -196,7 +196,7 @@ def test_degenerate_character_boundary_has_invariant_energy_multiset():
     """A basis rotation at an exact crossing cannot change published energy."""
     pytest.importorskip("jax")
     import jax.numpy as jnp
-    from bandstructure.htransform import select_active_eigenpairs
+    from bandstructure.fh_interp import select_active_eigenpairs
 
     values = jnp.asarray([[-1.0, 0.0, 0.0, 2.0]])
     active = np.diag([1.0, 1.0, 0.0, 0.0]).astype(np.complex128)
@@ -232,7 +232,7 @@ def test_null_carrier_character_cannot_displace_a_fitted_state():
     """Only the fitted physical spectrum participates in state selection."""
     pytest.importorskip("jax")
     import jax.numpy as jnp
-    from bandstructure.htransform import select_active_eigenpairs
+    from bandstructure.fh_interp import select_active_eigenpairs
 
     values = jnp.asarray([[-3.0, -2.0, -1.0, 0.0]])
     vectors = jnp.eye(4, dtype=jnp.complex128)[None]
@@ -248,7 +248,7 @@ def test_character_tie_cluster_includes_every_boundary_member():
     """Three-way tie red twin: the nondegenerate third member cannot hide."""
     pytest.importorskip("jax")
     import jax.numpy as jnp
-    from bandstructure.htransform import select_active_eigenpairs
+    from bandstructure.fh_interp import select_active_eigenpairs
 
     values = jnp.asarray([[-1.0, 0.0, 0.0, 0.1]])
     vectors = jnp.eye(4, dtype=jnp.complex128)[None]
@@ -268,7 +268,7 @@ def test_htransform_active_window_beats_lower_guard_on_the_path(full_qp):
     pytest.importorskip("jax")
     import jax.numpy as jnp
     from types import SimpleNamespace
-    from bandstructure.htransform import h_transform
+    from bandstructure.fh_interp import h_transform
     from symmetry_maps import SymMaps
 
     mesh = _mesh(1)
@@ -336,7 +336,7 @@ def test_authenticated_qp_returned_bands_need_no_global_gap(
     pytest.importorskip("jax")
     import jax.numpy as jnp
     from types import SimpleNamespace
-    from bandstructure.htransform import h_transform
+    from bandstructure.fh_interp import h_transform
 
     mesh = _mesh(1)
     nk, states, rank = 2, 7, 8

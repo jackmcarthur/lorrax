@@ -81,7 +81,7 @@ def test_rank_multiplier_vocabulary_and_default():
 
 
 def test_downfold_centroid_subset_is_ordered_strict_and_checked():
-    from bandstructure.htransform import validate_centroid_subset_idx
+    from bandstructure.fh_interp import validate_centroid_subset_idx
 
     got = validate_centroid_subset_idx(np.asarray([7, 1, 9, 3]), 10)
     assert np.array_equal(got, [7, 1, 9, 3])
@@ -93,7 +93,7 @@ def test_downfold_centroid_subset_is_ordered_strict_and_checked():
 def test_newton_inverse_reports_the_archived_residual_contract():
     pytest.importorskip("jax")
     import jax.numpy as jnp
-    from bandstructure.htransform import (
+    from bandstructure.fh_interp import (
         NEWTON_RESIDUAL_MAX,
         fun,
         newton_inv,
@@ -120,7 +120,7 @@ def test_standalone_htransform_refuses_an_occupied_band_cut(monkeypatch):
     pytest.importorskip("jax")
     from types import SimpleNamespace
     import file_io.centroids
-    from bandstructure import htransform
+    from bandstructure import fh_interp as htransform
 
     monkeypatch.setattr(
         htransform, "setup_wfn_and_sym",
@@ -151,7 +151,7 @@ def test_refit_consumes_the_compact_whole_state_factor():
     pytest.importorskip("jax")
     from isdf import galerkin
     root = Path(__file__).resolve().parents[1] / "src"
-    src = (root / "bandstructure" / "htransform.py").read_text()
+    src = (root / "bandstructure" / "fh_interp.py").read_text()
     fit_src = inspect.getsource(galerkin.fit_galerkin_basis)
     assert "return_full_proj" not in src
     assert "include_projector" not in fit_src
@@ -181,7 +181,7 @@ def test_bse_consumers_forward_the_q_chunk_key():
 def test_kpath_inverts_only_physical_states_and_publishes_return_window():
     """The rank-space null carrier is not a physical band window."""
     root = Path(__file__).resolve().parents[1] / "src"
-    src = (root / "bandstructure" / "htransform.py").read_text()
+    src = (root / "bandstructure" / "fh_interp.py").read_text()
     fft_src = (root / "common" / "fft_helpers.py").read_text()
 
     assert "[:nq, :states]" in src
