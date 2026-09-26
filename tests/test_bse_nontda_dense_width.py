@@ -85,18 +85,21 @@ def test_col_chunk_accounts_for_the_mesh():
     assert four > one, (one, four)
 
 
-def test_col_chunk_budget_is_total_memory_not_free():
+def test_col_chunk_budget_is_the_run_budget_not_free():
     """Determinism: the width must not move with ambient GPU occupancy.
 
-    RED TWIN: source the budget from ``get_device_memory_gb`` (which falls back
-    to *free* memory) and two calls straddling an allocation can disagree —
-    observed live as col_chunk 2 vs 5 on the same deck twenty minutes apart.
+    The budget is the run's (``common.gpu_utils.device_budget_bytes``: the
+    deck value, else the collective default recorded once).  RED TWIN: source
+    it from ``get_device_memory_gb`` (which falls back to *free* memory) or from
+    the stage room (budget less live bytes) and two calls straddling an
+    allocation can disagree — observed live as col_chunk 2 vs 5 on the same
+    deck twenty minutes apart.
     """
     import bse.bse_nontda as bn
 
     src = Path(bn.__file__).read_text(encoding="utf-8")
-    assert "get_device_memory_info" in src
-    assert not re.search(r"get_device_memory_gb\s*\(", src), \
+    assert "device_budget_bytes" in src
+    assert not re.search(r"get_device_memory_gb\s*\(|device_room_bytes\s*\(", src), \
         "free-memory budget reintroduced; the width stops being reproducible"
 
     args = _args_for(480, 480, (4, 4, 4))
