@@ -457,6 +457,8 @@ def _plan_vq_group(tiles, *, rows, n_q: int, ngkmax: int, mesh_xy: Mesh,
     n_tiles = -(-int(n_q) // q_max)
     q_tile = -(-int(n_q) // n_tiles)
     priced = resident + work + q_tile * per_q
+    from common.gpu_utils import record_stage_price
+    record_stage_price("V_q, vq_tile_bytes", priced)
     return q_tile, g, dict(resident=resident, per_q=per_q, work=work,
                            priced=priced, n_tiles=n_tiles,
                            host_staged=q_tile * host_per_q)

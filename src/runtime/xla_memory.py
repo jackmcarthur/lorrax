@@ -2,7 +2,8 @@
 
 The **L3 (substrate)** half of the allocator story: a read-only mirror of
 jaxlib's own parse of ``XLA_PYTHON_CLIENT_*`` / ``XLA_CLIENT_MEM_FRACTION``,
-plus the corroboration of that environment against the live client.  Nothing
+plus the corroboration of that environment against the live client, plus
+:func:`pool_high_water`, the resettable device peak the stage receipt reads.  Nothing
 here knows what a band or a q-point is; it belongs beside
 :func:`runtime.set_default_env`, which is the module that decides which of
 these variables LORRAX ships.
@@ -319,3 +320,98 @@ def classify_xla_pool(stats, *, backend: str = "gpu",
         peak_source=source, env_agrees=(disagreement == ""),
         disagreement=disagreement)
 
+
+
+# ---------------------------------------------------------------------------
+#  The pool high-water mark: a per-stage device peak that resets
+# ---------------------------------------------------------------------------
+#
+# ``peak_bytes_in_use`` never resets, so a stage below an earlier high-water
+# mark is invisible (lane MEM, claim 2804).  The CUDA pool behind XLA's
+# ``cuda_async`` allocator keeps ``CU_MEMPOOL_ATTR_USED_MEM_HIGH``, which a
+# set of 0 resets to the bytes in use now.  Its handle is found once, from
+# one live buffer (``CU_POINTER_ATTRIBUTE_MEMPOOL_HANDLE``).  A read is then
+# two driver calls and needs no context and no synchronization.  It counts
+# what XLA allocates from the pool (executables' temporaries, the compile's
+# autotuner buffers) and not NCCL or library workspaces outside it.
+
+_CU_POINTER_ATTRIBUTE_MEMPOOL_HANDLE = 17
+_CU_MEMPOOL_ATTR_USED_MEM_HIGH = 8
+_POOL: dict = {"lib": None, "handle": None, "source": None}
+
+
+def _find_pool():
+    """The pool handle of this process's device, or None (not a GPU, the backend not up
+    yet, or an allocator without a pool).  Never initializes the backend itself."""
+    import sys
+    bridge = sys.modules.get("jax._src.xla_bridge")
+    if not (bridge and getattr(bridge, "_backends", None)):
+        return None
+    import ctypes
+    import jax
+    if jax.local_devices()[0].platform != "gpu":
+        _POOL["source"] = "none"
+        return None
+    pointer = None
+    for array in jax.live_arrays():          # one device buffer; nothing is allocated
+        try:
+            if (array.nbytes and not array.is_deleted()
+                    and getattr(array.sharding, "memory_kind", None) in (None, "device")):
+                pointer = array.addressable_shards[0].data.unsafe_buffer_pointer()
+                break
+        except Exception:                                      # noqa: BLE001
+            continue
+    if pointer is None:
+        return None                          # no live buffer yet: ask again next time
+    lib = ctypes.CDLL("libcuda.so.1")
+    handle = ctypes.c_void_p()
+    rc = lib.cuPointerGetAttribute(ctypes.byref(handle),
+                                   _CU_POINTER_ATTRIBUTE_MEMPOOL_HANDLE,
+                                   ctypes.c_uint64(pointer))
+    if rc == 0 and handle.value:
+        _POOL.update(lib=lib, handle=handle, source="pool")
+        return handle
+    _POOL["source"] = "peak_bytes_in_use"
+    import warnings
+    warnings.warn("device peaks per stage fall back to peak_bytes_in_use: the allocator "
+                  "keeps no CUDA pool, and that figure never resets, so a stage below an "
+                  "earlier high-water mark reads as the earlier mark.", RuntimeWarning)
+    return None
+
+
+def pool_high_water(*, reset: bool = False) -> int | None:
+    """Bytes in use on this process's device at their highest since the last reset.
+
+    ``reset`` then sets the mark back to the bytes in use now.  On an allocator
+    without a CUDA pool it returns ``peak_bytes_in_use``, which never resets
+    (a warning says so once).  None before the backend is up and on CPU.
+    """
+    try:
+        if _POOL["source"] is None:
+            _find_pool()
+        if _POOL["handle"] is not None:
+            import ctypes
+            value = ctypes.c_uint64(0)
+            lib, handle = _POOL["lib"], _POOL["handle"]
+            if lib.cuMemPoolGetAttribute(handle, _CU_MEMPOOL_ATTR_USED_MEM_HIGH,
+                                         ctypes.byref(value)):
+                return None
+            high = int(value.value)
+            if reset:
+                value.value = 0
+                lib.cuMemPoolSetAttribute(handle, _CU_MEMPOOL_ATTR_USED_MEM_HIGH,
+                                          ctypes.byref(value))
+            return high
+        if _POOL["source"] == "peak_bytes_in_use":
+            import jax
+            stats = jax.local_devices()[0].memory_stats() or {}
+            return int(stats.get("peak_bytes_in_use", 0)) or None
+    except Exception:                                          # noqa: BLE001
+        return None      # an instrument never takes down the run it measures
+    return None
+
+
+def pool_high_water_source() -> str | None:
+    """What :func:`pool_high_water` reads: "pool", "peak_bytes_in_use", "none", or None
+    before the first reading."""
+    return _POOL["source"]

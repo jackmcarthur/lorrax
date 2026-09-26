@@ -157,6 +157,53 @@ def _sigma_rule_lines(geometry: dict, plans: int) -> list[str]:
     return lines
 
 
+class _Band:
+    """One stage row: its seconds and the timing nodes whose time it owns, the
+    subtrees under ``plus`` less those under ``minus`` (paths).  Subtracting a band
+    removes its subtrees, so a residual row owns exactly the time it reports."""
+
+    __slots__ = ("seconds", "plus", "minus")
+
+    def __init__(self, seconds=0.0, plus=(), minus=()):
+        self.seconds, self.plus, self.minus = float(seconds), tuple(plus), tuple(minus)
+
+    def __add__(self, other):
+        return _Band(self.seconds + float(other), self.plus + getattr(other, "plus", ()),
+                     self.minus + getattr(other, "minus", ()))
+
+    __radd__ = __add__
+
+    def __sub__(self, other):
+        return _Band(self.seconds - float(other), self.plus,
+                     self.minus + getattr(other, "plus", ()))
+
+    def __float__(self):
+        return self.seconds
+
+    def floor(self):
+        return _Band(max(self.seconds, 0.0), self.plus, self.minus)
+
+    def owns(self, path):
+        under = lambda roots: any(tuple(path[:len(r)]) == tuple(r) for r in roots)
+        return under(self.plus) and not under(self.minus)
+
+
+def _rank_peaks(row, key):
+    """Every rank's value of a record's peak (bytes; NaN = unmeasured)."""
+    ranks = row.get(key + "_ranks")
+    if ranks is not None:
+        return np.asarray(ranks, dtype=np.float64)
+    local = row.get(key)
+    return np.asarray([np.nan if local is None else float(local)])
+
+
+def _gb_pair(values):
+    """"max / min" over ranks in GB, or "–" when no rank measured it."""
+    if values is None or not np.any(np.isfinite(values)):
+        return "–"
+    return f"{np.nanmax(values) / 1e9:6.2f} / {np.nanmin(values) / 1e9:6.2f}"
+
+
 class GWProductionReport:
     """One clean GW report, owned and written only by process zero."""
 
@@ -631,8 +678,9 @@ class GWProductionReport:
         rows = list(records)
 
         def total(predicate):
-            return sum(float(row["inclusive"]) for row in rows
-                       if predicate(row))
+            chosen = [row for row in rows if predicate(row)]
+            return _Band(sum(float(row["inclusive"]) for row in chosen),
+                         plus=[tuple(row.get("path", (row["name"],))) for row in chosen])
 
         def top_level(*names):
             wanted = set(names)
@@ -675,13 +723,13 @@ class GWProductionReport:
                     residual = float(row["inclusive"]) - sum(
                         float(selected[p]["inclusive"]) for p in children)
                     result.append((title + (" other" if children else ""),
-                                   max(residual, 0.0)))
+                                   _Band(residual, plus=(key,), minus=children).floor()))
 
                 visit(path, owner, label)
             # A name may occur under the first-call probe and ordinary sweep.
             totals = {}
-            for name, seconds in result:
-                totals[name] = totals.get(name, 0.0) + seconds
+            for name, band in result:
+                totals[name] = totals.get(name, 0.0) + band
             return list(totals.items())
 
         isdf_total = top_level("gw_jax.isdf")
@@ -689,13 +737,13 @@ class GWProductionReport:
                      and tuple(r.get("path", ()))[:1] == ("gw_jax.isdf",))
         zeta_transverse = outer_prefixed(
             "gw_jax.zeta_fit_transverse", within="gw_jax.isdf")
-        v_q = total(lambda r: r["name"] == "gw_jax.V_q_compute"
-                    and tuple(r.get("path", ()))[:1] == ("gw_jax.isdf",))
+        # The bispinor's CC and TT tiles (V_q_compute_cc / _tt) are V(q) too.
+        v_q = outer_prefixed("gw_jax.V_q_compute", within="gw_jax.isdf")
         restart_load = total(
             lambda r: r["name"] == "gw_jax.restart_load"
             and tuple(r.get("path", ()))[:1] == ("gw_jax.isdf",))
-        isdf_support = max(
-            isdf_total - zeta - zeta_transverse - v_q - restart_load, 0.0)
+        isdf_support = (
+            isdf_total - zeta - zeta_transverse - v_q - restart_load).floor()
 
         screening_total = top_level("gw_jax.screening")
         # A shared-pole bank may call chi/W owners internally. Its inclusive
@@ -721,12 +769,11 @@ class GWProductionReport:
                 screening_details.extend(partition("spole.bank", ("bank.",), "bank"))
                 continue
             screening_details.append(("spole " + label,
-                sum(float(r["inclusive"]) for r in spole_rows if r["name"] == name)))
+                total(lambda r: r in spole_rows and r["name"] == name)))
         screening_details.append(("spole rank synchronization",
-            sum(float(r["inclusive"]) for r in spole_rows
-                if r["name"].startswith("spole.rank_wait."))))
-        screening_support = max(screening_total - chi0 - w_screen
-                                - sum(value for _, value in screening_details), 0.0)
+            total(lambda r: r in spole_rows and r["name"].startswith("spole.rank_wait."))))
+        screening_support = (screening_total - chi0 - w_screen
+                             - sum(value for _, value in screening_details)).floor()
 
         # The dynamic-Sigma executor opens ``sigma.rule_plan`` (box-rule
         # fitting, cached by box and tolerance) and ``sigma.tau_sweep`` (the
@@ -751,9 +798,9 @@ class GWProductionReport:
             ("Sigma census", outer_prefixed("sigma.census")),
             ("Sigma finalize + writes", outer_prefixed("gw_jax.dynamic_sigma_finalize")),
         ]
-        sigma_other = max(sigma_total - sc_w_response - sigma_refit
-                          - sigma_plan - sigma_sweep
-                          - sum(value for _, value in sigma_details), 0.0)
+        sigma_other = (sigma_total - sc_w_response - sigma_refit
+                       - sigma_plan - sigma_sweep
+                       - sum(value for _, value in sigma_details)).floor()
 
         stages = [
             ("runtime bring-up", total(lambda r: r["name"].startswith(
@@ -789,15 +836,20 @@ class GWProductionReport:
         # A stage absent in a mode should not occupy a zero-valued report row.
         # Use the table's two-decimal display threshold so a floating-point
         # subtraction residual cannot survive the filter as ``0.00 s``.
-        stages = [(name, seconds) for name, seconds in stages
-                  if seconds >= 0.005]
-        accounted = sum(seconds for _name, seconds in stages)
-        stages.append(("other driver work", max(float(wall) - accounted, 0.0)))
+        stages = [(name, band) for name, band in stages
+                  if float(band) >= 0.005]
+        accounted = sum(float(band) for _name, band in stages)
+        stages.append(("other driver work", _Band(
+            max(float(wall) - accounted, 0.0),
+            plus=[tuple(r.get("path", (r["name"],))) for r in rows
+                  if len(r.get("path", (r["name"],))) == 1],
+            minus=[p for _name, band in stages for p in band.plus])))
         self.heading("Major-stage timing")
         detailed = any(r["name"].startswith(("bank.", "tau.")) for r in rows)
         width = max(22, max((len(name) for name, _ in stages), default=22)) if detailed else 22
         self.emit(f"  {'stage':<{width}}   wall (s)     fraction")
-        for name, seconds in stages:
+        for name, band in stages:
+            seconds = float(band)
             self.emit(f"  {name:<{width}} {seconds:10.2f}  "
                       f"{100.0 * seconds / wall if wall else 0.0:9.2f}%")
         self.emit(f"  {'total run':<{width}} {wall:10.2f}  {100.0:9.2f}%")
@@ -811,6 +863,78 @@ class GWProductionReport:
             self.emit("  spole bands: fenced host walls; wait-before rows drain prior device/effect work,")
             self.emit("  not the named consumer. Rank synchronization is separate. Local passivity/held")
             self.emit("  share one compiled call; their fused wall is not split into invented timings.")
+        self._stage_memory(rows, stages, width=width, wall=wall)
+
+    def _stage_memory(self, rows, stages, *, width, wall) -> None:
+        """The device peak of every major stage against its planner's price.
+
+        A row's peak is the pool high-water mark over the timing nodes it owns
+        (``common.timing``; max and min over ranks).  A planner's price
+        (``common.gpu_utils.record_stage_price``) is judged against the own peak
+        of the section it names: an enclosing one, else the one sharing the
+        longest path with the call, else the section open at the call.
+        """
+        from common import timing
+        from common.gpu_utils import stage_prices
+        from runtime.xla_memory import pool_high_water_source
+        paths = [tuple(r.get("path", (r["name"],))) for r in rows]
+        selfs = [_rank_peaks(r, "peak_self") for r in rows]
+        if not any(np.any(np.isfinite(v)) for v in selfs):
+            return
+        n_ranks = max(len(v) for v in selfs)
+        pad = lambda v: v if len(v) == n_ranks else np.full(n_ranks, np.nan)
+
+        def row_peak(band):
+            owned = [pad(v) for p, v in zip(paths, selfs) if band.owns(p)]
+            if not owned or not np.any(np.isfinite(owned)):
+                return None
+            stack = np.asarray(owned)
+            return np.asarray([np.nanmax(col) if np.any(np.isfinite(col)) else np.nan
+                               for col in stack.T])
+
+        priced = {}      # (stage, section path) -> the largest price, and the peak
+        for price in stage_prices():
+            call = tuple(price["path"])
+            # The named section: an enclosing one first, else the one sharing the
+            # longest path with the call, else the section open at the call.
+            candidates = [(call[:len(p)] == p, len(os.path.commonprefix([p, call])), -i, i)
+                          for i, p in enumerate(paths) if p and p[-1] == price["section"]]
+            candidates = candidates or [(True, len(p), -i, i)
+                                        for i, p in enumerate(paths) if p == call]
+            if not candidates:
+                continue
+            node = max(candidates)[3]
+            key = (price["stage"], paths[node])
+            if key not in priced or price["bytes"] > priced[key][0]["bytes"]:
+                priced[key] = (price, paths[node], _rank_peaks(rows[node], "peak"))
+        priced = list(priced.values())
+        self.heading("Major-stage device memory")
+        self.emit(f"  per rank, pool high-water per stage; max / min over {n_ranks} "
+                  f"rank(s); γ = peak / planner price")
+        self.emit(f"  {'stage':<{width}}  peak GB max / min   price GB       γ")
+        for name, band in stages:
+            peak = row_peak(band)
+            if peak is None:
+                continue
+            mine = [pr for pr, node, _ in priced if band.owns(node)]
+            if mine:
+                price = max(pr["bytes"] for pr in mine)
+                gamma = f"{np.nanmax(peak) / price:7.2f}" if price > 0 else "      –"
+                tail = f"{price / 1e9:9.2f}  {gamma}"
+            else:
+                tail = f"{'–':>9}  no planner"
+            self.emit(f"  {name:<{width}}  {_gb_pair(peak):>17}  {tail}")
+        if priced:
+            self.emit("  planner prices, each against the own peak of the section it names:")
+            for price, node, peak in priced:
+                gamma = (f"{np.nanmax(peak) / price['bytes']:.2f}"
+                         if price["bytes"] > 0 and np.any(np.isfinite(peak)) else "–")
+                self.emit(f"    {price['stage']}: {price['bytes'] / 1e9:.2f} GB; "
+                          f"{' > '.join(node)} peak {_gb_pair(peak).strip()} GB; γ {gamma}")
+        reads, seconds = timing.instrument_cost()
+        self.emit(f"  instrument: {pool_high_water_source() or 'none'}; {reads} boundary "
+                  f"reads on rank 0 took {seconds * 1e3:.1f} ms "
+                  f"({100.0 * seconds / wall if wall else 0.0:.4f}% of the wall)")
 
     def warnings(self) -> None:
         if self._warnings_emitted:
