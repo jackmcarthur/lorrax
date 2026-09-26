@@ -1444,6 +1444,7 @@ def _head_wing_kernel_face(
             f"partition on X and Y, i.e. a square mesh; got "
             f"{int(mesh.shape[ax_x])}x{int(mesh.shape[ax_y])} (repo "
             "docs/architecture/decisions.md 2026-08-01: square meshes only).")
+    from jax.experimental.layout import Layout, with_layout_constraint
     from common.collectives import to_transpose_partner
     from common.wfn_layout import psi_specs
     nmu_spec, mun_spec = psi_specs(layout)
@@ -1557,29 +1558,33 @@ def _head_wing_kernel_face(
         # Endpoint blocks ``[k, s, M_b, n]`` with the band tile on X (``_x``)
         # or on Y (``_y``).  A face's own band axis needs one gather; the
         # other band axis is its transpose partner's block, then a gather.
-        # The gather stacks a new leading tile axis and only the gathered
-        # block is reordered, so no layout preference reaches the resident
-        # face (a gather along its mu axis made XLA copy the whole face).
+        # The block is pinned row-major and the gather stacks a new leading
+        # tile axis, so only the gathered block is reordered: left free, a
+        # gather along the mu axis let layout assignment copy each whole
+        # resident face (4 x 882 MB on the mu3088 CPU dump; the pin is
+        # common.contract_bands.bands_to_contraction_slabs's).
+        def _block(a, start, axis):
+            t = jax.lax.dynamic_slice_in_dim(a, start, mu_block, axis=axis)
+            return with_layout_constraint(t, Layout(major_to_minor=tuple(range(t.ndim))))
+
         def _gathered(t, axis_name, order):
             g = jax.lax.all_gather(t, axis_name, axis=0, tiled=False)
             g = jnp.transpose(g, order)
             return g.reshape(*g.shape[:2], -1, g.shape[-1])
 
         def _mun_y(a, start):
-            t = jax.lax.dynamic_slice_in_dim(a, start, mu_block, axis=2)
-            return _gathered(t, ax_x, (1, 2, 0, 3, 4))
+            return _gathered(_block(a, start, 2), ax_x, (1, 2, 0, 3, 4))
 
         def _mun_x(a, start):
-            t = jax.lax.dynamic_slice_in_dim(a, start, mu_block, axis=2)
-            return _gathered(to_transpose_partner(t, p_side), ax_y, (1, 2, 0, 3, 4))
+            return _gathered(to_transpose_partner(_block(a, start, 2), p_side),
+                             ax_y, (1, 2, 0, 3, 4))
 
         def _nmu_x(a, start):
-            t = jax.lax.dynamic_slice_in_dim(a, start, mu_block, axis=3)
-            return _gathered(t, ax_y, (1, 3, 0, 4, 2))
+            return _gathered(_block(a, start, 3), ax_y, (1, 3, 0, 4, 2))
 
         def _nmu_y(a, start):
-            t = jax.lax.dynamic_slice_in_dim(a, start, mu_block, axis=3)
-            return _gathered(to_transpose_partner(t, p_side), ax_x, (1, 3, 0, 4, 2))
+            return _gathered(to_transpose_partner(_block(a, start, 3), p_side),
+                             ax_x, (1, 3, 0, 4, 2))
 
         def _pass(bra, ket, band_x, band_y, contract, scatter_axis, sum_axis,
                   out_shape, dim):
