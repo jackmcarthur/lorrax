@@ -500,12 +500,12 @@ def test_module_constants_work_for_every_read_shape():
     assert hits["LORRAX_ANNOTATED"] == [("fixture.py", 10, "Gate(env=...)")]
 
 
-def test_deleting_tf32_row_exposes_the_source_read():
-    """The real precision escape is visible, and its one row is necessary."""
-    name = "LORRAX_MIXEDPREC_ALLOW_TF32"
+def test_deleting_matmul_precision_row_exposes_the_source_read():
+    """A module-constant read is visible, and its one row is necessary."""
+    name = "LORRAX_MATMUL_PRECISION"
     sites = python_read_sites()
-    assert name in sites, "the module-constant TF32 read is invisible"
-    assert any(f.endswith("bse/w_ladder_mixedprec.py") for f, _, _ in sites[name])
+    assert name in sites, "the module-constant matmul-precision read is invisible"
+    assert any(f.endswith("runtime/__init__.py") for f, _, _ in sites[name])
     text = _registry_text()
     exact, globs = registry_vocabulary(text)
     assert covered(name, exact, globs)
@@ -513,7 +513,7 @@ def test_deleting_tf32_row_exposes_the_source_read():
     assert len(rows) == 1 and rows[0].startswith("|"), rows
     without = "\n".join(line for line in text.splitlines() if name not in line)
     exact, globs = registry_vocabulary(without)
-    assert not covered(name, exact, globs), "deleting TF32 row did not break coverage"
+    assert not covered(name, exact, globs), "deleting the row did not break coverage"
 
 
 if __name__ == "__main__":

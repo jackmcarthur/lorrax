@@ -260,10 +260,7 @@ def bootstrap(*, platform: str = "gpu") -> None:
 
 #: The f32 dot precisions that really are fp32 on XLA:GPU.  ``"high"`` is
 #: NOT among them: it selects a 3-pass tf32 decomposition — better than
-#: plain tf32 and still short of fp32.  Same tuple, same reasoning, as
-#: ``bse.w_ladder_mixedprec._PINNED``; that module's refusal is the local
-#: guard and this is the global pin, and they must agree about what counts
-#: as pinned.
+#: plain tf32 and still short of fp32.
 _MATMUL_PINNED = ("highest", "float32")
 
 #: Announced escape for A/B measurement of the precision itself.  Named

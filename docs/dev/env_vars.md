@@ -57,7 +57,6 @@ with the run.
 | `ISDF_CHUNK_TARGET_UTILIZATION` | `0` (planner default) | routing-affecting | `gw_config.env_float`: a malformed value is announced and the default used; a positive value is clamped to `[0.85, 1.0]`. Fraction of the device memory budget the chunk planner fills, which sets the chunk shapes (`gw/gw_config.py`). |
 | `LORRAX_WFN_BACKEND` | unset (auto) | routing-affecting | Stripped, lower-cased: `eager` or `phdf5` forces the WFN read backend (`services/wfn_loader/src/wfn_loader/loader.py::_auto_pick_backend`); `phdf5_host` refuses; any other value takes the auto pick without comment. A mesh-less loader always reads eager. At P>1 with no loadable FFI the auto pick refuses, and `eager` is the way through. |
 | `LORRAX_SIGMA_PLAN` | `box` | routing-affecting | Stripped, lower-cased enum `box` or `panes`; blank is `box`; any other value refuses naming both (`gw/sigma_plan.py`). `box` is the shared denominator-box planner for MPA and GN/HL-PPM (`gw/sigma_box_plan.py`); `panes` keeps the per-method quadrature controls as the comparison route. |
-| `LORRAX_MIXEDPREC_ALLOW_TF32` | unset (guard on) | routing-affecting | Exactly `1` (no strip, no case folding); every other value leaves the guard on. Bypasses the complex64 BSE solver's refusal of an unpinned fp32 matmul precision (`bse/w_ladder_mixedprec.py::_refuse_unpinned_matmul_precision`), so the solve may run at TF32 with a higher refinement-residual floor; A/B measurement only. |
 
 ---
 
