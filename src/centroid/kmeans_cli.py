@@ -47,7 +47,12 @@ def build_parser() -> argparse.ArgumentParser:
                         "pivoted Cholesky (default 1.5). Set to 1.0 to "
                         "disable pivoted-Cholesky pruning.")
     p.add_argument("--prune-n-val", type=int, default=None,
-                   help="Override pivoted-Cholesky n_val (default = wfn.nelec).")
+                   help="Override pivoted-Cholesky n_val (default = wfn.nelec; "
+                        "a value below nelec drops occupied bands and refuses).")
+    p.add_argument("-i", "--input", default=None,
+                   help="GW deck. Its ncond sets the Sigma conduction window "
+                        "on the default v_x_vc left leg; without it the left "
+                        "leg falls back to vc_x_vc (all bands).")
     p.add_argument("--prune-n-cond", type=int, default=None,
                    help="Override pivoted-Cholesky n_cond (default = the FULL "
                         "conduction window in the WFN, nbands - n_val, which "
@@ -264,10 +269,33 @@ def _resolve_sigma_window(args, wfn) -> tuple[int, int]:
     """
     n_val = (int(args.prune_n_val) if args.prune_n_val is not None
              else int(wfn.nelec))
+    if n_val < int(wfn.nelec):
+        from file_io.centroids import CentroidWindowDropsOccupiedError
+        raise CentroidWindowDropsOccupiedError(
+            f"CentroidWindowDropsOccupiedError: --prune-n-val {n_val} is "
+            f"below nelec={int(wfn.nelec)}; the selection would drop "
+            "occupied bands.  Omit it or pass a value >= nelec.")
     nb_total = int(wfn.nbands)
     n_cond = (int(args.prune_n_cond) if args.prune_n_cond is not None
               else max(0, nb_total - n_val))
     return n_val, n_cond
+
+
+def _resolve_deck_sigma_ncond(args):
+    """The deck's Σ conduction count ``ncond``, or ``None`` without a deck.
+
+    Resolved once in :func:`main`; ``prune_band_ranges`` reads it from
+    ``args.sigma_ncond`` for the default ``v_x_vc`` left leg.
+    """
+    if args.input is None:
+        if args.prune_window == "v_x_vc" and args.fit_window is None:
+            rank0_print(
+                "kmeans: no deck (-i), so the Sigma window is unknown; the "
+                "prune left leg falls back to vc_x_vc (all bands), a safe "
+                "superset of occupied + Sigma conduction.")
+        return None
+    from gw.gw_config import read_lorrax_input
+    return int(read_lorrax_input(args.input)["ncond"])
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -315,13 +343,13 @@ def _resolve_weight(args, wfn, sym, R, tau, dist_mesh=None):
     Returns ``(weight, label, (left_range, right_range))``; the windows are
     carried unchanged into the centroid file's provenance header.
 
-    WHY THE WINDOW INCLUDES REQUESTED CONDUCTION BANDS: occupied-only ρ(r)
-    is entirely inside the slab, so a valence-only k-means places ZERO
-    centroids in the vacuum
-    and the vacuum-localized far-conduction states have no quadrature
-    support — ⟨nk|V_H|nk⟩ (a pure centroid sum) then comes back sign-wrong
-    (+140 eV vs −140 eV on MoS2) and the whole error lands on
-    Vxc = E_dft − kin_ion − V_H.
+    WHY THE WINDOWS INCLUDE CONDUCTION BANDS ON BOTH LEGS: the weight of a
+    point is ``Σ_{m∈L,n∈R} |ψ_m†ψ_n|²``, so a pair adds weight only where
+    both of its states have density.  An occupied-only left leg gives
+    ~zero weight wherever occupied states vanish, e.g. a slab's vacuum,
+    however many conduction bands sit on the right.  The left leg therefore
+    carries the Σ conduction window (deck ``ncond``) as well as every
+    occupied band, so the c×c' pairs Σ reads are weighted too.
     """
     n_val, n_cond = _resolve_sigma_window(args, wfn)
     left_range, right_range, range_label = prune_band_ranges(
@@ -460,6 +488,7 @@ def main():
 
     timing.reset()
     selection_start = time.perf_counter()
+    args.sigma_ncond = _resolve_deck_sigma_ncond(args)
 
     N_c = int(args.N_c)
     oversample = float(args.oversample)

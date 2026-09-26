@@ -29,7 +29,16 @@ def validate_mode_policy(args) -> None:
 
 
 def prune_band_ranges(args, n_val: int, n_cond: int):
-    """Resolved pair-density windows, shared by pruning and provenance."""
+    """Resolved pair-density windows, shared by pruning and provenance.
+
+    The default ``v_x_vc`` follows the owner's rule (PAIRS audit,
+    2026-09-26): left = every occupied band plus the deck's Σ conduction
+    window ``[0, n_val + ncond)``, right = every band ``[0, n_val + n_cond)``.
+    ``args.sigma_ncond`` carries the deck's ``ncond``; when it is ``None``
+    (no deck given) the Σ window is unknown and the left leg widens to the
+    right one, the ``vc_x_vc`` square, a safe superset.  A window that drops
+    an occupied band refuses by name.
+    """
     top = int(n_val) + int(n_cond)
     fit_window = getattr(args, "fit_window", None)
     if fit_window is not None:
@@ -54,12 +63,21 @@ def prune_band_ranges(args, n_val: int, n_cond: int):
             raise ValueError(
                 f"--fit-window ranges must be nonempty and lie in [0,{top}); "
                 f"got left={left}, right={right}")
+        from file_io.centroids import assert_windows_keep_occupied
+        assert_windows_keep_occupied(
+            left, right, int(n_val), where="kmeans --fit-window")
         return left, right, "explicit feature pair"
     if args.prune_window == "v_x_c":
         return (0, int(n_val)), (int(n_val), top), "valence x conduction"
     if args.prune_window == "vc_x_vc":
         return (0, top), (0, top), "full protected square"
-    return (0, int(n_val)), (0, top), "valence x (valence + conduction)"
+    sigma_ncond = getattr(args, "sigma_ncond", None)
+    if sigma_ncond is None:
+        return ((0, top), (0, top),
+                "full protected square: no deck, Sigma window unknown")
+    left_top = min(top, int(n_val) + int(sigma_ncond))
+    return ((0, left_top), (0, top),
+            "(occupied + Sigma conduction) x all bands")
 
 
 def format_centroid_header(*, feature_fit: str, source_wfn: str,

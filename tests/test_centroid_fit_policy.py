@@ -180,7 +180,7 @@ def test_current_prune_routes_exact_transverse_metric_through_group_blocks(
     prune.__globals__["prune_band_ranges"] = prune_band_ranges
     args = SimpleNamespace(
         density_mode="current", prune_n_val=None, prune_n_cond=None,
-        prune_window="v_x_vc", fit_window=None,
+        prune_window="v_x_vc", fit_window=None, sigma_ncond=1,
     )
     wfn = SimpleNamespace(nelec=2, nbands=5)
     candidates = np.arange(18, dtype=np.int64).reshape(6, 3)
@@ -198,7 +198,7 @@ def test_current_prune_routes_exact_transverse_metric_through_group_blocks(
     assert "band_norms" not in call
     np.testing.assert_array_equal(call["orbit_id"], orbit_id)
     np.testing.assert_array_equal(call["k_weights"], weights)
-    assert call["band_range_left"] == (0, 2)
+    assert call["band_range_left"] == (0, 3)
     assert call["band_range_right"] == (0, 5)
 
 

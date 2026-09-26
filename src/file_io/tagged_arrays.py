@@ -36,6 +36,7 @@ RESTART_PADDED_AXES_ATTR = "restart_padded_axes"
 BAND_WINDOW_SCHEMA_DATASET = "band_window_schema"
 BAND_WINDOW_SCHEMA_VERSION = 2
 BAND_WINDOW_CARRIER_DATASET = "band_window_carrier"
+ZETA_FIT_WINDOWS_DATASET = "zeta_fit_windows"
 CHARGE_ZETA_IDENTITY_DATASET = "charge_zeta_identity"
 SHARED_POLE_MEMBER_DATASET = "shared_pole_member"
 _SHARED_POLE_MEMBER_FIELDS = ("path", "schema", "digest", "iteration_id")
@@ -653,6 +654,7 @@ def write_restart_state_to_h5(
     coulomb_policy=None,
     qp_state_source_record: dict | None = None,
     charge_zeta_identity: dict | None = None,
+    zeta_fit_windows=None,
 ):
     """Write (subset of) canonical restart state via SlabIO.
 
@@ -911,6 +913,13 @@ def write_restart_state_to_h5(
             # which resolves to (b4, b4) and matches an unsplit run exactly.
             io.write_attr("band_window_split", np.asarray(
                 logical_split, dtype=np.int64))
+        # ζ TRAINING SET (2026-09-26): the (left, right) band legs the
+        # interaction was fitted on, as (L0, L1, R0, R1).  The BSE refuses a
+        # band window outside it.  Absent on older bundles.
+        if zeta_fit_windows is not None and mode == "w":
+            io.write_attr(ZETA_FIT_WINDOWS_DATASET, np.asarray(
+                [int(v) for leg in zeta_fit_windows for v in leg],
+                dtype=np.int64))
         if mode == "w":
             io.write_attr("n_rmu_logical", np.int64(int(n_rmu_logical)))
         # COULOMB-KERNEL PROVENANCE.  Unconditional on the ``w`` pass: a
