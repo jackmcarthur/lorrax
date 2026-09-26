@@ -268,8 +268,12 @@ $\Sigma(E)$, not $\Sigma(0)$, for an active state outside the requested grid.
 - **Held W carriers.** From map 1 the shared-pole model keeps one
   pole-column extent per sector (`shared_pole_store._k_extent`: map 1's
   Kmax + 3 %, grown with headroom only when a live Kmax exceeds it, logged),
-  and the density scan keeps its largest rotated-band count, so a drifting
-  Kmax or occupation does not change a compiled shape.
+  the bispinor CT round keeps each of CC and TT at its largest retained-span
+  width (`shared_pole_sectors.cross_span_widths`: the extent ladder of the
+  retained rank, grown only when a live width exceeds it, logged, never
+  shrunk; the extra columns are inactive zeros), and the density scan keeps
+  its largest rotated-band count, so a drifting Kmax, retained rank or
+  occupation does not change a compiled shape.
 
 ## 5 Where the map is not smooth
 
