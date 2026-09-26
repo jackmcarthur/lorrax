@@ -262,15 +262,12 @@ def stages(conv, reps=3):
     lsrc, lph, spin = put(t["csrc"]), put(t["mph"]), put(t["spin"])
     row = jax.jit(lambda h, a, b, c: mb._row_half(h, a, b, c, n_s=ns))
     res["row_half_gather"] = timeit(row, H, lsrc, lph, spin)
-    plan_row = conv._plan(sign=+1, norm="forward", in_support=conv.sup[0])
-    if scalar:                            # G's n_s² blocks and W's one channel, transformed apart
-        res["plan_p2r"] = timeit(jax.jit(plan_row), zc((nk, ns, J, ns) + kb))
-        plan_w = conv._plan(sign=+1, norm="forward", in_support=conv.sup[1])
-        res["plan_p2r_W"] = timeit(jax.jit(plan_w), zc((nk, 1, J, 1) + conv.kbox[1]))
+    plan_row = conv._plan(sign=+1, norm="forward", in_support=conv.sup_tab[0])
+    if scalar:                            # W broadcast over G's n_s² blocks on the compact box
         bc = jax.jit(lambda a, c: jnp.concatenate(
-            [a.reshape(nk, cw, nr), jnp.broadcast_to(c.reshape(nk, 1, J, 1, nr),
-                                                     (nk, ns, J, ns, nr)).reshape(nk, cw, nr)], 1))
-        res["broadcast_concat_W"] = timeit(bc, zc((nk, ns, J, ns, nr)), zc((nk, 1, J, 1, nr)))
+            [a.reshape(nk, cw, nbox), jnp.broadcast_to(c, a.shape).reshape(nk, cw, nbox)], 1))
+        res["broadcast_concat_W"] = timeit(bc, zc((nk, ns, J, ns, nbox)), zc((nk, 1, J, 1, nbox)))
+        res["plan_p2r"] = timeit(jax.jit(plan_row), zc((nk, 2 * cw) + kb))
     else:
         res["plan_p2r"] = timeit(jax.jit(plan_row), zc((nk, ns, 2 * J, ns) + kb))
     D = zc((nk, nsk, 2 * cw, nsk, nr))
@@ -304,7 +301,7 @@ def stages(conv, reps=3):
     g = zc((kc, ml, ns, M, ns))
     col = jax.jit(lambda g_, a, b, c: mb._column_half(g_, a, b, c, n_s=ns))
     res["column_half_gather"] = timeit(col, g, put(t["csrc"][:kc]), put(t["nph"][:kc]), put(t["spin"][:kc]))
-    plan_col = conv._plan(sign=-1, norm="backward", in_support=conv.sup[0])
+    plan_col = conv._plan(sign=-1, norm="backward", in_support=conv.sup_tab[0])
     xc = zc((kc, ml, ns, ns) + kb)
     res["plan_p2r_prime"] = timeit(jax.jit(plan_col), xc)
     res["shapes"] = dict(J=J, kc=kc, nbox=nbox, M=M, nq=nq, nk=nk, nr=nr, ns=ns, cw=cw, nsk=nsk,
