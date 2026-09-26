@@ -2009,7 +2009,7 @@ def read_eqp_assembly_receipt(filepath):
 					f"OPEN RULING for a deck whose two wedges differ — stamp "
 					f"the evaluation energies on the file wedge, or declare "
 					f"them star-invariant and unfold: "
-					f"docs/reports/INTEG_CHECKLIST_LANDINGS_2026-08-27.md.")
+					f"tests/known_failures/2026-09-25-eqp-receipt-wedge-ruling.md.")
 			raise ValueError(
 				f"{SIGMA_EVAL_DATASET} has shape {eval_rel_ev.shape}; expected "
 				f"the receipt's file-wedge/window shape {values.shape[1:]}."
