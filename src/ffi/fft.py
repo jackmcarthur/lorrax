@@ -166,6 +166,7 @@ __all__ = [
     "make_kconv_kminor", "kconv_kminor_out_shape",
     "make_kfft_klead", "make_kfft_kminor",
     "make_local_kfft_klead", "make_local_kfft_kminor", "make_local_kconv_kminor",
+    "make_local_kconv_klead",
     "PLANE_FFT_GATHER_TARGET", "plane_fft_split", "plane_resident_bytes", "make_plane_fft_gather",
 ]
 
@@ -1231,27 +1232,44 @@ def make_kconv_klead(mesh: Mesh, kgrid, t_spec: P, w_spec: P, *,
     return KConvStored(prep=prep, apply=apply)
 
 
-def _klead_locals(mesh, kg, norm, mult):
-    """Rank-local ``(prep, apply)`` of :func:`make_kconv_klead` for this mesh's backend."""
+def make_local_kconv_klead(mesh: Mesh, kgrid, *, norm: str | None = "ortho",
+                           mult: float = 1.0) -> Callable:
+    """Rank-local k-LEADING stored-kernel convolution ``fn(T, V_R) -> U`` with the
+    kernel ALREADY in R space on every backend, for code inside a shard_map.
+
+    ``U = mult · fftn(ifftn(T) · V_R[:, None, :, None, :])`` for ``T``/``U``
+    ``(nk, a, mx, b, my)`` and ``V_R`` ``(nk, mx, my)``.  CUDA: mathdx mode 2, the
+    Σ τ pass of :func:`make_kconv_klead`, in place on T.  cpu: the plan route (as
+    :func:`make_local_kconv_kminor`), not the gw_conv host handler, which takes
+    k-space W.  The BSE W term holds its T k-leading so that the encode and
+    decode are batched ZGEMMs with no T-sized transpose, and calls this door.
+    """
+    kg = _check_kgrid(kgrid, kconv_backend(mesh))
     nk = kg[0] * kg[1] * kg[2]
-    si, sf = ffi_fft_scale("ifftn", norm, nk), ffi_fft_scale("fftn", norm, nk)
+    scale = ffi_fft_scale("ifftn", norm, nk) * ffi_fft_scale("fftn", norm, nk) * float(mult)
     if kconv_backend(mesh) == "mathdx":
         _require_target(KCONV_KLEAD_TARGET, "CUDA")
-        prep_local = make_local_kfft_klead(mesh, kg, kind="ifftn", norm=norm)
         attrs = dict(nkx=np.int64(kg[0]), nky=np.int64(kg[1]), nkz=np.int64(kg[2]),
-                     scale=np.float64(si * sf * float(mult)))
+                     scale=np.float64(scale))
 
-        def apply_local(t, v_r):
+        def _mathdx(t, v_r):
             return jax.ffi.ffi_call(
                 KCONV_KLEAD_TARGET, jax.ShapeDtypeStruct(t.shape, t.dtype),
                 input_output_aliases={0: 0})(t, v_r, **attrs, **_mathdx_common())
-    elif _cpu_test_arm():
-        _require_plan_route()
-        prep_local = make_local_kfft_klead(mesh, kg, kind="ifftn", norm=norm)
+        return _mathdx
+    _require_plan_route()
 
-        def apply_local(t, v_r):
-            t_r = _plan_kfft(t, kg, "ifftn") * (si * sf * float(mult))
-            return _plan_kfft(t_r * v_r[:, None, :, None, :], kg, "fftn")
+    def _plan(t, v_r):
+        t_r = _plan_kfft(t, kg, "ifftn") * scale
+        return _plan_kfft(t_r * v_r[:, None, :, None, :], kg, "fftn")
+    return _plan
+
+
+def _klead_locals(mesh, kg, norm, mult):
+    """Rank-local ``(prep, apply)`` of :func:`make_kconv_klead` for this mesh's backend."""
+    if kconv_backend(mesh) == "mathdx" or _cpu_test_arm():
+        prep_local = make_local_kfft_klead(mesh, kg, kind="ifftn", norm=norm)
+        apply_local = make_local_kconv_klead(mesh, kg, norm=norm, mult=mult)
     else:
         _require_plan_route()
         _require_target(GW_CONV_TARGET, "cpu")
