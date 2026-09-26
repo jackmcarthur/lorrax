@@ -936,20 +936,24 @@ def _report_qp_root(root: QPRoot, *, z_factor, eqp1_ev, band_offset,
 	gap_text = ("" if not gap.size else
 	            f"; QP rows |E* - eqp1| max {1e3 * float(np.max(gap)):.3f} "
 	            f"median {1e3 * float(np.median(gap)):.3f} meV")
-	print_fn("  QP root on [E_DFT, eqp0]: "
+	resonant = (root.status == QP_RES_Z) | (root.status == QP_RES_BRACKET)
+	# The report keeps WARNING lines only; resonances must reach it.
+	severity = "WARNING: " if bool(np.any(resonant)) else "  "
+	print_fn(f"{severity}QP root on [E_DFT, eqp0]: "
 	         + ", ".join(f"{k}={v}" for k, v in counts.items())
-	         + f" of {root.status.size}{gap_text}.")
-	bad = np.argwhere(~ok)
+	         + f" of {root.status.size}{gap_text}; RES rows have no "
+	         "quasiparticle near E_DFT (E* is their spectral peak).")
+	bad = np.argwhere(resonant)
 	for k, n in bad[:12]:
 		print_fn(
-			f"    {QP_STATUS_NAMES[int(root.status[k, n])]}: k={int(k)} "
+			f"WARNING:   {QP_STATUS_NAMES[int(root.status[k, n])]}: k={int(k)} "
 			f"band={int(band_offset) + int(n) + 1} "
 			f"E_DFT-E_F={float(e_dft_ev[k, n]) - reference_ev:+.3f} eV "
 			f"E*-E_F={float(root.e_ev[k, n]) - reference_ev:+.3f} eV "
 			f"Z*={float(root.z[k, n]):.4g} Gamma*={float(root.gamma_ev[k, n]):.4g} eV "
 			f"(eqp1 Z={float(np.asarray(z_factor)[k, n]):.4g})")
 	if bad.shape[0] > 12:
-		print_fn(f"    ... +{bad.shape[0] - 12} more non-QP rows")
+		print_fn(f"WARNING:   ... +{bad.shape[0] - 12} more resonant rows")
 
 
 def eqp_root_path(eqp1_path: str) -> str:
