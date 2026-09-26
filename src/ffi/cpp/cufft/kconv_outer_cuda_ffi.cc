@@ -36,6 +36,7 @@
 // as the family's (the same mathdx toolchain headers enter the key).
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstdint>
 #include <cstdio>
 #include <map>
@@ -320,7 +321,7 @@ static ffi::Error build(int nkx, int nky, int nkz, int K, std::string_view mathd
               "here -- ffi.fft.klead_outer_refusal routes such a grid to the unfused encode + mode 2 chain";
         return sticky("tile", os.str(), ffi::ErrorCode::kInvalidArgument);
     }
-    const int minb = mb ? 1 : std::max(1, std::min<int>(2, static_cast<int>(smem_sm / (smem + 1024))));
+    const int minb = mb ? (std::getenv("LRX_DEC_MINB") ? std::atoi(std::getenv("LRX_DEC_MINB")) : 1) : std::max(1, std::min<int>(2, static_cast<int>(smem_sm / (smem + 1024))));
     std::string why;
     const std::string cuda_inc = nvrtc::toolkit_include(&why);
     if (cuda_inc.empty()) return sticky("CUDA toolkit headers for NVRTC", why);
