@@ -316,6 +316,42 @@ def _outer_legs(X_b, psi_c_X, psi_v_Y):
             jnp.einsum("kvsN,cvk->kcsN", jnp.conj(psi_v_Y), X_b))
 
 
+def _outer_legs_B(Xb_b, psi_c_Y, psi_v_X):
+    """The coupling block's ``(L, R)``: ``T_B = Σ_K L R`` with K = min(n_c, n_v).
+
+    ``T_B[k,t,μ,s,ν] = Σ_v ψ^X_v[k,v,t,μ] Σ_c conj(ψ^Y_c[k,c,s,ν]) Xb[c,v,k]``
+    (``_encode_T_B``'s leg swap).  n_v <= n_c: ``L = ψ^X_v`` K-minor, ``R = Σ_c
+    conj(ψ^Y_c) Xb``; else ``L = Σ_v ψ^X_v Xb``, ``R = conj(ψ^Y_c)``.  Same μ-on-'x',
+    ν-on-'y' layout as ``_outer_legs``, so the two concatenate along K.
+    """
+    if psi_v_X.shape[1] <= psi_c_Y.shape[1]:
+        return (jnp.moveaxis(psi_v_X, 1, -1),
+                jnp.einsum("kcsN,cvk->kvsN", jnp.conj(psi_c_Y), Xb_b))
+    return (jnp.einsum("kvtM,cvk->ktMc", psi_v_X, Xb_b), jnp.conj(psi_c_Y))
+
+
+def _make_outer_router(mesh_xy, kgrid):
+    """``route(rank) -> conv | None``: the outer door when it serves this rank K, else None.
+
+    Decided at trace time from the operand shapes and announced once per (route, K).
+    """
+    from ffi.gate import announce_once
+    doors = {}
+
+    def route(rank):
+        why = klead_outer_refusal(mesh_xy, kgrid, rank)
+        announce_once(("bse", "w_term_route", rank, why is None),
+                      "[bse] W term: " + ("outer-product load (T never stored)" if why is None
+                                          else "XLA encode + k-conv: " + why)
+                      + f", K = {rank}")
+        if why is not None:
+            return None
+        if "conv" not in doors:
+            doors["conv"] = make_local_kconv_klead_outer(mesh_xy, kgrid, norm="ortho")
+        return doors["conv"]
+    return route
+
+
 def _decode_min(U_b, psi_c_X, psi_v_Y, sqrt_nk):
     """``(WX)_b = (1/√Nk) Σ conj(ψ_c) ψ_v U_b`` contracted through the smaller band set first.
 
@@ -433,19 +469,7 @@ def build_bse_stack_matvec(
     # the band rank K = min(n_c, n_v) (decided at trace time, announced once),
     # else the local k-leading door on an XLA-built T; one call per trial.
     kconv = make_local_kconv_klead(mesh_xy, (nkx, nky, nkz), norm="ortho")
-    kconv_outer = None
-
-    def _outer_route(psi_c_X, psi_v_Y):
-        nonlocal kconv_outer
-        from ffi.gate import announce_once
-        rank = min(int(psi_c_X.shape[1]), int(psi_v_Y.shape[1]))
-        why = klead_outer_refusal(mesh_xy, (nkx, nky, nkz), rank)
-        announce_once(("bse", "w_term_route", rank, why is None),
-                      f"[bse] W term: {'outer-product load (T never stored)' if why is None else 'XLA encode + k-conv: ' + why}"
-                      f", K = min(n_c, n_v) = {rank}")
-        if why is None and kconv_outer is None:
-            kconv_outer = make_local_kconv_klead_outer(mesh_xy, (nkx, nky, nkz), norm="ortho")
-        return why is None
+    outer_route = _make_outer_router(mesh_xy, (nkx, nky, nkz))
 
     # ── W term: one shard_map over ('x','y'); body = scan over the trial axis ──
     def _w_stack(X, psi_c_X, psi_v_Y, W_R):
@@ -460,7 +484,8 @@ def build_bse_stack_matvec(
         sqrt_nk = jnp.sqrt(jnp.asarray(nk, dtype=X.real.dtype))
         W_Rk = _w_r_klead(W_R)                       # once per call, not per trial
 
-        if _outer_route(psi_c_X, psi_v_Y):
+        kconv_outer = outer_route(min(psi_c_X.shape[1], psi_v_Y.shape[1]))
+        if kconv_outer is not None:
             def _body_outer(carry, X_b):             # X_b: (c_full, v_full, nk)
                 L, R = _outer_legs(X_b, psi_c_X, psi_v_Y)
                 U_b = kconv_outer(L, R, W_Rk)        # T formed on the load, never stored
@@ -599,6 +624,7 @@ def build_bse_stack_pair_matvec(
     rep = NamedSharding(mesh_xy, P())
     nk = nkx * nky * nkz
     kconv = make_local_kconv_klead(mesh_xy, (nkx, nky, nkz), norm="ortho")
+    outer_route = _make_outer_router(mesh_xy, (nkx, nky, nkz))
 
     # ── W term: one shard_map over ('x','y') — the SAME single region the TDA
     #    stack matvec opens.  No new shard_map is created by the coupling port:
@@ -615,6 +641,32 @@ def build_bse_stack_pair_matvec(
         # a second gather of Xb would deliver).  No collective runs per trial.
         X_full = _gather_trial_block(X)                     # (b, c, v, nk)
         Xb_full = jnp.conj(X_full)
+
+        # The outer-product load (BSEMAX): the fused body concatenates the two
+        # blocks' legs along K, so ONE convolution call forms T_A + s T_B in
+        # shared memory; the twin runs one call per block.
+        rank = min(psi_c_X.shape[1], psi_v_Y.shape[1])
+        kconv_outer = outer_route(2 * rank if fuse else rank)
+        if kconv_outer is not None:
+            def _body_outer_fused(carry, xs):
+                X_b, Xb_b = xs
+                L_A, R_A = _outer_legs(X_b, psi_c_X, psi_v_Y)
+                L_B, R_B = _outer_legs_B(Xb_b, psi_c_Y, psi_v_X)
+                U_b = kconv_outer(jnp.concatenate([L_A, sc * L_B], axis=-1),
+                                  jnp.concatenate([R_A, R_B], axis=1), W_Rk)
+                return carry, _decode_min(U_b, psi_c_X, psi_v_Y, sqrt_nk)
+
+            def _body_outer_unfused(carry, xs):
+                X_b, Xb_b = xs
+                WA = _decode_min(kconv_outer(*_outer_legs(X_b, psi_c_X, psi_v_Y), W_Rk),
+                                 psi_c_X, psi_v_Y, sqrt_nk)
+                WB = _decode_min(kconv_outer(*_outer_legs_B(Xb_b, psi_c_Y, psi_v_X), W_Rk),
+                                 psi_c_X, psi_v_Y, sqrt_nk)
+                return carry, WA + sc * WB
+
+            _, WX = lax.scan(_body_outer_fused if fuse else _body_outer_unfused,
+                             None, (X_full, Xb_full), unroll=1)
+            return _scatter_trial_block(WX, mesh_xy)
 
         def _body_fused(carry, xs):
             X_b, Xb_b = xs
