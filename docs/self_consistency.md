@@ -66,26 +66,46 @@ from finite links and needs a derivative rule on every $k$ axis.
 
 $$
 D\Delta H \approx [\Delta H, W], \qquad
-W_{ml} = \frac{v_{ml}}{E_m - E_l} \quad (m \ne l,\ |E_m - E_l| > 10^{-6}\,{\rm Ry}).
+W_{vc} = \frac{v_{vc}}{E_v - E_c}, \quad W_{cv} = W_{vc}^*,
 $$
 
-$W = i\,r^{\rm inter}$, so $[H^{\rm DFT}, W] = v$ off the diagonal. Blount's
-decomposition $D\Delta H = -i[A^{\rm inter}, \Delta H] + D^{\rm intra}\Delta H$
-shows what is dropped. The valence–conduction block of $D^{\rm intra}\Delta H$
-holds only the cross-gap block $\Delta H_{VC}$. So the head is exact for any
-$\Delta H$ that does not mix valence and conduction; a band-diagonal $\Delta H$
-gives $v_{mn}(E^{\rm QP}_m - E^{\rm QP}_n)/(E_m - E_n)$. Its error is first order
-in the cross-gap mixing, and each map prints $\max_k \lVert U_{VC} \rVert_F$.
-Pairs within BerkeleyGW's degeneracy tolerance (`gw.degen_average.TOL_DEGENERACY_RY`)
-are excluded. Their connection depends on the gauge and pairs with $\partial_k\Delta H$,
-which no stencil-free route forms. The term vanishes when $\Delta H$ is constant on the
-multiplet. $\Delta H$ is the active block plus a diagonal tail inside the head
-manifold, so no sum over states is truncated.
+with $v < n_{\rm occ} \le c$, and $W = 0$ inside each occupation class.
+$W = i\,r^{VC}$, so $[H^{\rm DFT}, W] = v$ on the valence–conduction blocks.
+Split the covariant derivative by class, $D\Delta H = -i[A^{VC}, \Delta H] + D^{\rm class}\Delta H$.
+The valence–conduction block of $D^{\rm class}\Delta H$ holds only the cross-gap
+block $\Delta H_{VC}$. So the head is exact for any $\Delta H$ that does not mix
+valence and conduction; a band-diagonal $\Delta H$ gives
+$v_{vc}(E^{\rm QP}_v - E^{\rm QP}_c)/(E_v - E_c)$. Its error is first order in the
+cross-gap mixing, and each map prints $\max_k \lVert U_{VC} \rVert_F$.
+$\Delta H$ is the active block plus a diagonal tail inside the head manifold, so
+no sum over states is truncated.
 
-The route has no intraband term, so a metal refuses
-(`GATE sc_head_interband_commutator_insulator_only`). The velocity artifact must
-stamp `vnl_included = 1` (`GATE sc_head_interband_commutator_velocity_operator`).
-Kernel: `qsgw_head.interband_commutator_velocity`.
+On a collapsed (one-point) $k$ axis the cell is not periodic, and the
+connection is the stored position operator $Z_a$ of the velocity artifact
+(`sc_head_update = parallel_transport` uses the same operator there). There
+the reduced component of $W$ is $i Z_a$, full and exact, and the class rule
+applies to the periodic axes only: $W_{\rm cart} = B^{-1}\,[B\,W^{VC}$ with row
+$a$ replaced by $i Z_a]$.
+
+**Accuracy.** On MoS2 bispinor at $\theta_{\max} \approx 0.055$ the class rule
+alone put $S_{zz}$ 1.3 % from the exact position-operator head, so the
+periodic-axis error is about $\theta/4$ in $S_{aa}$. A $5\times10^{-3}$ head
+tolerance is out of reach at $\theta \approx 0.05$ without within-class $k$
+information (links). The per-map line prints $\theta$; there is no refusal
+threshold.
+
+Every same-class pair is excluded, degenerate or not. Inside a class, $W$ has
+no gap in its denominator. Near-degenerate pairs make it arbitrarily large, and
+the $\partial_k \Delta H$ that would cancel it has no stencil-free form.
+Excluding only exact multiplets (BerkeleyGW's $10^{-6}$ Ry) left a Si SOC head
+8.8 times the link head. The class rule has no tolerance, and every
+denominator is at least the direct gap.
+
+A metal refuses (`GATE sc_head_interband_commutator_insulator_only`), and so does
+a cross-gap pair within $10^{-6}$ Ry (`GATE sc_head_interband_commutator_gap`).
+The velocity artifact must stamp `vnl_included = 1`
+(`GATE sc_head_interband_commutator_velocity_operator`). The kernel is
+`qsgw_head.interband_commutator_velocity`.
 
 ## 2 Band treatment
 
