@@ -151,12 +151,18 @@ def get_sigma_spatial_kernel(
         """Σ on the parent rows, one stored output spin block at a time (one pass at d = ns).
 
         ψ is oriented once and every block adds into one rank-local band
-        partial, so the band-block reduce-scatter runs once per call."""
-        faces = project.prepare(psi_proj_xr, psi_proj_yn)
-        acc = None
+        partial, so the band-block reduce-scatter runs once per call.  The
+        orientation waits on the first block (an optimization barrier), so
+        its 1/P faces never sit beside the whole parent Green in the
+        convolution's peak."""
+        faces = acc = None
         for a0, b0 in blocks:
             sigma_parent = unfold_conv(G_parents.G, G_parents.transpose, W_prep,
                                        conj_partner=G_parents.conj_partner, a0=a0, b0=b0)
+            if faces is None:
+                sigma_parent, left, right = jax.lax.optimization_barrier(
+                    (sigma_parent, psi_proj_xr, psi_proj_yn))
+                faces = project.prepare(left, right)
             acc = project.accumulate(faces, sigma_parent, a0=a0, b0=b0, acc=acc)
         return project.finish(acc)
 
