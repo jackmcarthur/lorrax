@@ -158,7 +158,7 @@ the linked service pages own their caller contracts.
 |---|---|
 | `services/distrib_la/src/distrib_la/` | Distributed dense-linear-algebra service; see [contract](services/distrib_la.md). |
 | `services/lxkit/src/lxkit/` | Standalone launch/runtime foundation shared by services. |
-| `services/minimax/src/minimax/` | Certified quadrature lookup service; see [contract](services/minimax.md). |
+| `services/minimax/src/minimax/` | Runtime minimax quadrature solver service; see [contract](services/minimax.md). |
 | `services/symmetry_maps/src/symmetry_maps/` | Crystal-symmetry mapping service; see [contract](services/symmetry_maps.md). |
 | `services/vcoul/src/vcoul/` | Coulomb-kernel and cell-average service; see [contract](services/vcoul.md). |
 | `services/wfn_loader/src/wfn_loader/` | Wavefunction-loading service; see [contract](services/wfn_loader.md). |

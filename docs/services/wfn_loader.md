@@ -152,7 +152,7 @@ or compatibility seal on a line above the import, with a red twin.
 * **Consuming `gvecs()` without `ngk_valid()`.**
 * **An n × `read_slab` loop for a multi-window read.** Use
   `SlabIO.read_slabs`.
-* **FFI knowledge in the loader or its consumers.** No `ffi.phdf5`, target
+* **FFI knowledge in the loader or its consumers.** No `ffi.io`, target
   strings or context handles outside `slab_io`.
 * **`jax.device_put(numpy_array, multi_process_sharding)` in loader paths.**
   It triggers JAX's hidden `assert_equal` all-gather (6.45 GB/rank at P = 64

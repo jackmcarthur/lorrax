@@ -521,9 +521,9 @@ private override that makes that comparison possible.
   `plan._IMPL` row and is then taken automatically.
 * **`lax.scan` over an FFI wrapper eagerly.** Without the per-signature cache
   it retraces and relowers every call; `Plan.batched` owns that cache.
-* **Selecting a backend from the environment.** Deck keys choose
-  (`eigh_backend`, `distributed_cholesky`, `distributed_lu`, `w_dyson_solver`);
-  the environment only says which `.so` exists.
+* **Selecting a backend from the environment.** The `linalg` deck dial chooses
+  ([linalg_ffi.md](../dev/linalg_ffi.md)); the environment only says which
+  `.so` exists.
 * **Comparing eigenvectors across meshes.** Degenerate subspaces have no
   canonical basis. Compare eigenvalues or gauge-invariant contractions
   (`Z diag(W) Zᴴ`, projectors, `|Zᴴ Z'|`).
