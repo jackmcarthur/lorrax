@@ -1193,8 +1193,11 @@ def _integrate_sigma_batches(
             if not sweep_started:
                 fence('tau.initial_compile_and_probe', sync_ranks=True)
                 with timing.section('tau.initial_compile_and_probe'):
+                    # Admit the conjugate-build body (real_phases=False): its
+                    # partner G tile makes it the larger of the two variants.
                     compiled = accumulator.integrate_window(
-                        row_kernel, tau_arguments, win.nodes.t,
+                        tau_kernel.window_kernel(row.space, False) if synthesis
+                        else row_kernel, tau_arguments, win.nodes.t,
                         win.nodes.alpha, n_active=len(win.nodes.t),
                         compile_only=True, **window_options)
                     if synthesis:
