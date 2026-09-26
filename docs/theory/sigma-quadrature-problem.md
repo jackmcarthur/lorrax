@@ -273,7 +273,7 @@ correctness path, and a failed write only warns.
 **Rule table.** Below the cache, every builder call is memoized in one
 run-independent table, `$SCRATCH/.cache/lorrax/sigma_box_rules`. It is keyed
 exactly by the snapped build box, ε, the currency, the κ cap, the rule schema
-and the solver identity (the minimax sources, numerics backend, CPU model and
+and the solver identity (the builder, the minimax sources, numerics backend, CPU model and
 pinned BLAS threads). The builder reads no clock and pins its threads, so a
 hit is the rule a cold build returns, bit for bit (claim 2737). A warm run is
 therefore the cold run that wrote the table, and no run depends on which
