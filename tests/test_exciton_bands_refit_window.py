@@ -409,14 +409,18 @@ def test_the_driver_refits_against_the_sliced_zeta_view():
     """THE SILENT ONE.  ``refit_vq`` contracts the band axes away, so handing
     it the unsliced bundle while ``rst`` carries the narrow window fits ζ' on
     a mismatched band count with no shape error anywhere.  The driver must
-    pass ``rst["zx_fit"]``.
+    pass ``rst["zx_fit"]``.  The per-Q tiles are built by
+    ``bse.exchange_path.exchange_tiles``, which the driver hands
+    ``refit=(zx_fit, rst)``.
     """
-    tree = ast.parse(open(SRC_DRIVER, encoding="utf8").read())
+    assert "refit=(zx_fit, rst)" in open(SRC_DRIVER, encoding="utf8").read()
+    tiles = os.path.join(os.path.dirname(SRC_DRIVER), "exchange_path.py")
+    tree = ast.parse(open(tiles, encoding="utf8").read())
     calls = [n for n in ast.walk(tree)
              if isinstance(n, ast.Call)
              and isinstance(n.func, ast.Attribute)
              and n.func.attr == "refit_vq"]
-    assert calls, "exciton_bands no longer calls vq_interp.refit_vq at all"
+    assert calls, "exchange_tiles no longer calls vq_interp.refit_vq at all"
     first = [c.args[0] for c in calls if c.args]
     names = [a.id for a in first if isinstance(a, ast.Name)]
     assert "zx_fit" in names, (
