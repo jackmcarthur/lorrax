@@ -269,6 +269,20 @@ per batch against rule 1. All planners stay single-stage and generic.
    zeta-mubatch-capacity` names ψ(G) and the smallest batch. For V_q, more
    ranks, fewer centroids, or a smaller ζ sphere; `vq_g_chunk_size` shrinks
    only the panel workspace.
-5. **Compare with the run.** Define `γ = runtime peak / planner HWM`; `γ > 1`
-   is an under-estimate to investigate. `tools/profile_gw_xprof.py` captures
-   an XProf trace whose modules map onto the stages above.
+5. **Compare with the run.** `gwjax.out` prints MAJOR-STAGE DEVICE MEMORY:
+   each stage's device peak (max and min over ranks), the planner's price and
+   `γ = peak / price`, or "no planner", and the section that set the peak.
+   `γ > 1` is an under-estimate to investigate.
+
+## The per-stage receipt
+
+`peak_bytes_in_use` never resets, so a stage below an earlier high-water mark
+is invisible in it. The CUDA pool behind XLA's `cuda_async` allocator keeps
+`CU_MEMPOOL_ATTR_USED_MEM_HIGH`, which a reset sets back to the bytes in use.
+`runtime.xla_memory.pool_high_water` reads and resets it at every
+`common.timing` section boundary on the main thread (two driver calls), so
+every section has its own peak on every rank. A planner records its price
+with `common.gpu_utils.record_stage_price(stage, bytes, section=...)`. What
+the pool cannot see: NCCL and library workspaces outside it (2–3 GB per rank
+on A100), and work dispatched but not yet allocated at a boundary, which
+counts in the next section.
