@@ -648,12 +648,12 @@ def plan_pair_convolution_chunks(*, n_ranks, n_k, spins, widths, width_out, n_q,
         return _C16 * (nk * j * gath + nk * j * nr * 4 * cd + nk * nr
                        + nk * j * cx * nr + 2 * nqm * j * cx * (nr + kbm + Mm))
 
-    def final(qc, nc, j):           # the all-to-all output, the phased box, its transform and gather;
-        # past one q chunk XLA also holds one copy of the T it reads (compiled_memory(): temp
-        # 12.26 GB against T 11.86 GB at Fe 8³ n_s=2 Σ, qc = 1)
-        copy = 0 if nq // qc == 1 else (t_out or t_mid(nc, j))
-        return copy + _C16 * cx * (3 * qc * (Mo // Pn) * max(t_total(nc, j), nr)
-                                   + 2 * qc * (Mo // Pn) * (kbox_out + Mo))
+    def final(qc, nc, j):           # X's stacked q rows, then the larger of one q chunk (the
+        # all-to-all output, the phased box, its transform and gather) and X's relayout for the
+        # last all-to-all
+        chunk = _C16 * cx * (3 * qc * (Mo // Pn) * max(t_total(nc, j), nr)
+                             + 2 * qc * (Mo // Pn) * (kbox_out + Mo))
+        return x_out + max(chunk, x_out)
 
     def hwm(nc, j, kc_, qc_):       # the largest stage (PairConvChunks.stage_bytes)
         held = tiles + h_bytes(nc, j) + t_mid(nc, j)
@@ -1233,8 +1233,12 @@ class MixedBasisPairConvolution:
 
         def final(T, qf, ocell, c2p):
             def step(_, i):
-                Tq = jax.lax.dynamic_slice_in_dim(T, i * qc, qc, axis=0)
-                Tq = jax.lax.all_to_all(Tq, _XY, split_axis=1, concat_axis=4, tiled=True)
+                # M leads the chunk at the all-to-all.  GPU layout assignment puts a split axis
+                # most major; split on M behind the q slice (which cannot change layout), it lays
+                # out the loop's whole T M-major, one full copy of T held through the loop.  The
+                # transpose here stops that constraint at the chunk.
+                Tq = jnp.swapaxes(jax.lax.dynamic_slice_in_dim(T, i * qc, qc, axis=0), 0, 1)
+                Tq = jnp.swapaxes(jax.lax.all_to_all(Tq, _XY, split_axis=0, concat_axis=4, tiled=True), 0, 1)
                 q_i = jax.lax.dynamic_slice_in_dim(qf, i * qc, qc, axis=0)
                 # the columns in box order: a slice, or the orbit-packed view's gather
                 Tq = jnp.take(Tq, c2p, axis=4) if wedge else Tq[..., :nr]

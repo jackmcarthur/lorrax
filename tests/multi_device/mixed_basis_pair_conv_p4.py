@@ -78,6 +78,15 @@ def check(name, ok, detail):
         FAILS.append(name)
 
 
+def final_law_check(name, conv):
+    """The final stage's compiled temp is inside the law's final transient.  Past one q chunk
+    the law charges no copy of T, so a T held through the q loop fails here."""
+    m = conv.compiled_memory()["final"]
+    check(f"{name}: final-stage compiled temp within the law", m["temp"] <= conv.chunks.bytes_final,
+          f"temp {m['temp']} B, law {conv.chunks.bytes_final} B, T {m['argument']} B, "
+          f"q chunks {conv.nq // conv.chunks.qc}")
+
+
 def fe_fixture(mesh, wfn_path, ns_box=(6, 6, 6), ns=None):
     """Fe's magnetic SymMaps on a 6^3 grid as a fixture dict (``ns`` overrides the spinor width)."""
     from file_io import WfnLoader
@@ -148,6 +157,8 @@ def sigma_checks(mesh, args):
                       e <= t.TOL and conv.backend == backend,
                       f"rel {e:.2e} (n_c {conv.chunks.n_c}, J {conv.chunks.J}, kc {conv.chunks.kc}, "
                       f"qc {conv.chunks.qc})")
+                if chunks is not None and backend == "router":
+                    final_law_check(f"sigma random ns={ns}", conv)
     # the red twin: without the time-reversed transport the plan forms A ⊙ conj B
     c = t.sigma_random_case(2)
     ref = t._sigma_ref(c)
@@ -251,6 +262,8 @@ def main():
                       e <= t.TOL and conv.backend == backend,
                       f"rel {e:.2e} (n_c {conv.chunks.n_c}, J {conv.chunks.J}, kc {conv.chunks.kc}, "
                       f"qc {conv.chunks.qc}; k-sum vs dense {cases.rel(ks, ref):.1e})")
+                if chunks is not None and backend == "router":
+                    final_law_check(f"random ns={ns}", conv)
 
     # ---- symmetry: typed parents against the full grid ---------------------
     sym_cases = [("A-cubic ns=1", t.acubic_case(mesh), "conj_phase"),
