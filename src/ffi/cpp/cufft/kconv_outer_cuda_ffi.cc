@@ -37,6 +37,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <cstdio>
 #include <map>
 #include <mutex>
@@ -557,7 +558,21 @@ extern "C" __global__ void __launch_bounds__(LRX_THREADS, 1) lrx_kconv_outer_dec
                 bank[pcol(gr, 2 * tg + 1) * GK::RS + GK::at(k)] = v1;
             }
             __syncthreads();
+#if LRX_XMID
             inverse_mid(bank, vs, xlim, ylim);        // inverse transform, Mid on its x pass
+#else
+            lrx_kbox::transform3<NX, NY, NZ, TR, LRX_SM, fft_direction::inverse>(bank);
+            lrx_kbox::cp_async_wait_all();
+            __syncthreads();
+            for (int i = threadIdx.x; i < TR * NK; i += blockDim.x) {
+                const int k = i % NK, jj = i / NK, x = jj >> 3, y = (jj & 7) ^ fperm(x);
+                if (x < xlim && y < ylim) {
+                    lrx_c2* e = bank + jj * GK::RS + GK::at(k);
+                    *e = lrx_mul(*e, vs[jj * VS + k]);
+                }
+            }
+            __syncthreads();
+#endif
             {   // the next pair's V tile (this combo's, or the next combo's first), unless vs holds it
                 int xn = -1, yn = -1;
                 if (p + 1 < p1) { xn = (p + 1) / na; yn = yb; }
@@ -573,7 +588,7 @@ extern "C" __global__ void __launch_bounds__(LRX_THREADS, 1) lrx_kconv_outer_dec
             const double2* pb = P2 + (unsigned)(a * (int)g.nxb + xb) * (unsigned)(NK * MB * 64);
             // Loads for two k columns are issued before their DMMAs (h outer: each accumulator
             // still takes h = 0 before h = 1).
-            constexpr int KP = KW > 1 ? 2 : 1;
+            constexpr int KP = (KW > 1 && LRX_KP > 1) ? 2 : 1;
 #pragma unroll
             for (int h = 0; h < 2; ++h) {
 #pragma unroll
@@ -657,7 +672,7 @@ struct DecodeGeo {                          // the embedded source declares the 
     double scale;
 };
 
-using DKey = std::tuple<CUcontext, int, int, int, int, int, int>;   // ctx, nkx, nky, nkz, K, MB, conj_r
+using DKey = std::tuple<CUcontext, int, int, int, int, int, int>;   // ctx, nkx, nky, nkz, K, MB, conj_r (the process's LRX_DEC_EXP is fixed)
 static std::map<DKey, Built> g_dcache;
 static std::map<DKey, std::string> g_dfail;
 
@@ -711,6 +726,9 @@ static ffi::Error build_decode(int nkx, int nky, int nkz, int K, int mb, int con
     if (!nvrtc::exists(root + "/include/cufftdx.hpp"))
         return sticky("GATE mathdx-headers", "got no cufftdx.hpp under " + root + "/include; want the "
                       "nvidia-mathdx wheel; fix: pip install nvidia-mathdx", ffi::ErrorCode::kFailedPrecondition);
+    // EXPERIMENT (BSEC): LRX_DEC_EXP="<kp><xmid>" picks the decode's load hoisting and the Mid fusion.
+    const char* ev = std::getenv("LRX_DEC_EXP");
+    const int exp_kp = (ev && ev[0] == '1') ? 1 : 2, exp_xmid = (ev && ev[0] && ev[1] == '0') ? 0 : 1;
     nvrtc::Program prog;
     prog.src = kDecodeSrc;
     prog.name = "lrx_kconv_outer_decode.cu";
@@ -721,6 +739,7 @@ static ffi::Error build_decode(int nkx, int nky, int nkz, int K, int mb, int con
         "-DLRX_NX=" + std::to_string(nkx), "-DLRX_NY=" + std::to_string(nky), "-DLRX_NZ=" + std::to_string(nkz),
         "-DLRX_K=" + std::to_string(K), "-DLRX_THREADS=" + std::to_string(kThreads),
         "-DLRX_MB=" + std::to_string(mb), "-DLRX_CONJ=" + std::to_string(conj_r),
+        "-DLRX_KP=" + std::to_string(exp_kp), "-DLRX_XMID=" + std::to_string(exp_xmid),
         "-DLRX_SM=" + std::to_string(cc_major * 100 + cc_minor * 10)};
     nvrtc::mathdx_toolchain(root, cuda_inc, "cufftdx", &prog);
     prog.kernel = "lrx_kconv_outer_decode";
@@ -731,7 +750,7 @@ static ffi::Error build_decode(int nkx, int nky, int nkz, int K, int mb, int con
     if (!dir.empty()) {
         std::ostringstream name;
         name << dir << "/kconv_outer_dec_" << nkx << "x" << nky << "x" << nkz << "_K" << K << "_mb" << mb << "_c"
-             << conj_r << "_sm" << cc_major << cc_minor << "_" << key_hex << ".cubin";
+             << conj_r << "_x" << exp_kp << exp_xmid << "_sm" << cc_major << cc_minor << "_" << key_hex << ".cubin";
         path = name.str();
     }
     nvrtc::Image img;
