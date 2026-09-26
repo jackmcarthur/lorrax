@@ -197,11 +197,11 @@ def _rank_peaks(row, key):
     return np.asarray([np.nan if local is None else float(local)])
 
 
-def _gb_pair(values):
+def _gb_pair(values, width=6):
     """"max / min" over ranks in GB, or "–" when no rank measured it."""
     if values is None or not np.any(np.isfinite(values)):
         return "–"
-    return f"{np.nanmax(values) / 1e9:6.2f} / {np.nanmin(values) / 1e9:6.2f}"
+    return f"{np.nanmax(values) / 1e9:{width}.2f} / {np.nanmin(values) / 1e9:{width}.2f}"
 
 
 class GWProductionReport:
@@ -885,12 +885,15 @@ class GWProductionReport:
         pad = lambda v: v if len(v) == n_ranks else np.full(n_ranks, np.nan)
 
         def row_peak(band):
-            owned = [pad(v) for p, v in zip(paths, selfs) if band.owns(p)]
-            if not owned or not np.any(np.isfinite(owned)):
-                return None
-            stack = np.asarray(owned)
-            return np.asarray([np.nanmax(col) if np.any(np.isfinite(col)) else np.nan
+            """Every rank's peak over the nodes the row owns, and the node that set it."""
+            owned = [(p, pad(v)) for p, v in zip(paths, selfs) if band.owns(p)]
+            owned = [(p, v) for p, v in owned if np.any(np.isfinite(v))]
+            if not owned:
+                return None, ()
+            stack = np.asarray([v for _, v in owned])
+            peak = np.asarray([np.nanmax(col) if np.any(np.isfinite(col)) else np.nan
                                for col in stack.T])
+            return peak, owned[int(np.nanargmax(np.nanmax(stack, axis=1)))][0]
 
         priced = {}      # (stage, section path) -> the largest price, and the peak
         for price in stage_prices():
@@ -909,28 +912,35 @@ class GWProductionReport:
                 priced[key] = (price, paths[node], _rank_peaks(rows[node], "peak"))
         priced = list(priced.values())
         self.heading("Major-stage device memory")
+        from common import gpu_utils
+        budget = gpu_utils._RUN_DEVICE_BUDGET_GB
+        run_peak = max((np.nanmax(v) for v in selfs if np.any(np.isfinite(v))), default=0.0)
         self.emit(f"  per rank, pool high-water per stage; max / min over {n_ranks} "
                   f"rank(s); γ = peak / planner price")
-        self.emit(f"  {'stage':<{width}}  peak GB max / min   price GB       γ")
+        if budget:
+            self.emit(f"  budget memory_per_device_gb = {budget:.2f} GB; run peak "
+                      f"{run_peak / 1e9:.2f} GB ({'within' if run_peak <= budget * 1e9 else 'OVER'})")
+        self.emit(f"  {'stage':<{width}}  peak GB max / min   price GB           γ  set by")
         for name, band in stages:
-            peak = row_peak(band)
+            peak, setter = row_peak(band)
             if peak is None:
                 continue
             mine = [pr for pr, node, _ in priced if band.owns(node)]
             if mine:
                 price = max(pr["bytes"] for pr in mine)
-                gamma = f"{np.nanmax(peak) / price:7.2f}" if price > 0 else "      –"
+                gamma = f"{np.nanmax(peak) / price:10.2f}" if price > 0 else f"{'–':>10}"
                 tail = f"{price / 1e9:9.2f}  {gamma}"
             else:
                 tail = f"{'–':>9}  no planner"
-            self.emit(f"  {name:<{width}}  {_gb_pair(peak):>17}  {tail}")
+            self.emit(f"  {name:<{width}}  {_gb_pair(peak):>17}  {tail}  "
+                      f"{' > '.join(setter[-2:])}")
         if priced:
             self.emit("  planner prices, each against the own peak of the section it names:")
             for price, node, peak in priced:
                 gamma = (f"{np.nanmax(peak) / price['bytes']:.2f}"
                          if price["bytes"] > 0 and np.any(np.isfinite(peak)) else "–")
                 self.emit(f"    {price['stage']}: {price['bytes'] / 1e9:.2f} GB; "
-                          f"{' > '.join(node)} peak {_gb_pair(peak).strip()} GB; γ {gamma}")
+                          f"{' > '.join(node)} peak {_gb_pair(peak, 0)} GB; γ {gamma}")
         reads, seconds = timing.instrument_cost()
         self.emit(f"  instrument: {pool_high_water_source() or 'none'}; {reads} boundary "
                   f"reads on rank 0 took {seconds * 1e3:.1f} ms "
