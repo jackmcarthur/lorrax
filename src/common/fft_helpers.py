@@ -4,44 +4,12 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, PartitionSpec as P
 from common.shard_map import shard_map
-from runtime.padding import authenticate_padded_axis, combined_divisor
 
 
 # Value-level parity contract for the canonical flat-k service.  This is the
 # registered Sigma-path class (``docs/architecture/ffi_layout.md``, the
 # engine-swap parity rule), not a bit-equality promise between FFT engines.
 FLAT_K_FFT_VALUE_RTOL = 1.0e-12
-
-
-def compute_block_size_for_2d_cholesky(n_rmu: int, Pr: int, Pc: int) -> tuple[int, int]:
-    """
-    Compute block size for 2D blocked Cholesky that satisfies distribution constraints.
-
-    Constraints (fundamental to 2D blocked algorithms):
-        - n_rmu % block_size == 0  (matrix divides into whole tiles)
-        - J % Pr == 0              (tile rows distribute evenly on X-axis)
-        - J % Pc == 0              (tile cols distribute evenly on Y-axis)
-
-    Where J = n_rmu / block_size is the number of tiles per dimension.
-
-    The simplest solution: J = lcm(Pr, Pc), giving block_size = n_rmu / J.
-    If n_rmu doesn't divide evenly, we try multiples of lcm(Pr, Pc).
-
-    Args:
-        n_rmu: Matrix dimension (number of ISDF centroids)
-        Pr: Number of devices on X-axis
-        Pc: Number of devices on Y-axis
-
-    Returns:
-        (block_size, J) tuple
-
-    Raises:
-        ValueError: If no valid block size exists (n_rmu incompatible with mesh)
-    """
-    tag = authenticate_padded_axis(
-        n_rmu, n_rmu, combined_divisor(Pr, Pc),
-        name="2-D FFT centroid carrier")
-    return n_rmu // tag.divisor, tag.divisor
 
 
 # ============================================================================

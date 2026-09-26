@@ -22,7 +22,6 @@ from common.gamma_matrices import (
     gammas_perm as _gammas_perm,
     gammas_phase as _gammas_phase,
 )
-from common.fft_helpers import compute_block_size_for_2d_cholesky
 from common.wfn_transforms import take_rchunk_padded
 # Face-layout CCT: the (s,mu) GEMM-seam merge/split the
 # two-face carrier and the face G-build already use.  ``common/`` layer,
@@ -33,9 +32,8 @@ from ffi import _services      # noqa: F401  (path bootstrap; dies with the
 
 _services.ensure_on_path()
 
-# The distributed-linalg DOOR: mesh probing, guard resolution, the factor /
-# solve token surface, the STABLE mesh cache key, and the ONE import seam for
-# the backend modules (cusolvermp / slate / scalapack / native2d).
+# The distributed-linalg DOOR: the factor-token type, the q-local batch
+# layout, mesh probing and the STABLE mesh cache key.
 #
 # ``mesh_key`` rather than ``id(mesh)`` for the two ANNOUNCEMENT sets below:
 # id() is only safe where the cached value retains the mesh (every kernel
@@ -44,12 +42,8 @@ _services.ensure_on_path()
 from distrib_la import (                                            # noqa: E402
     FactorToken,
     batch_layout as linalg_batch_layout,
-    factor as linalg_factor,
     is_batch_layout as linalg_is_batch_layout,
-    mesh_is_cpu as _mesh_is_cpu,
     mesh_key as _mesh_key,
-    plan as linalg_plan,
-    resolve_backend as _resolve_linalg_backend,
 )
 
 
@@ -1220,30 +1214,13 @@ def _identity_pad_block_diagonal(
     return jax.lax.with_sharding_constraint(M_id_pad, sharding)
 
 
-# Replication cap for the mesh-INVARIANT charge Cholesky.  When the whole
-# CCT stack (nq, n_μ, n_μ) c128 fits under this many bytes on one device we
-# factor it with a fully-replicated dense ``jnp.linalg.cholesky`` (exact,
-# grid-agnostic); only genuinely large stacks fall back to the distributed
-# cuSolverMp potrf.  4 GiB covers every current production fit (MoS2 6×6
-# n_μ=1600 → 1.5 GiB, CrI3 6×6 80Ry n_μ≈1800 → ≤1.9 GiB, Si IBZ) and
-# excludes only the full-BZ Si 4×4×4 60Ry stack (nq=64, n_μ=2400 → 24 GiB).
-# See reports/gw_zeta_mesh_invariance_2026-07-20 for the drift this removes.
-# Raise it with LORRAX_ZETA_REPLICATE_CAP_GIB when the stack is bigger but the
-# device budget allows (full-BZ MoS2 12×12 n_μ=2412 is 13.4 GiB and NEEDS the
-# rank truncation — see _resolve_solver_kind_charge).
+# Replication cap for the mesh-INVARIANT charge factor: together with
+# ``_REPLICATED_FACTOR_MAX_BATCH_BYTES`` it bounds the one q-batch the
+# replicated rank-truncated eigh holds per device (see
+# :func:`_replicate_rank_truncate_ok`).  Raise it with
+# LORRAX_ZETA_REPLICATE_CAP_GIB when the device budget allows.
 _REPLICATED_CHOL_MAX_STACK_BYTES = int(
     float(os.environ.get("LORRAX_ZETA_REPLICATE_CAP_GIB", "4")) * 1024**3)
-
-
-# ``_mesh_is_cpu`` (historical name, still exported for tests) is the
-# door's ``distrib_la.mesh_is_cpu`` — imported at the top of the module.
-
-
-def _replicate_charge_ok(nq: int | None, n_rmu: int | None) -> bool:
-    """True when the charge CCT stack ``(nq, n_μ, n_μ)`` c128 fits under the replication cap — the criterion for the mesh-invariant dense Cholesky over the grid-dependent distributed cuSolverMp potrf; see docs/architecture/zeta_fit_face_psi_cct.md."""
-    if nq is None or n_rmu is None:
-        return False
-    return int(nq) * int(n_rmu) ** 2 * 16 <= _REPLICATED_CHOL_MAX_STACK_BYTES
 
 
 def _replicate_rank_truncate_ok(nq: int | None, n_rmu: int | None) -> bool:
@@ -1304,183 +1281,30 @@ def _rank_truncate_capacity_error(nq, n_rmu, *, channel: str) -> ValueError:
         f"cap makes this RESOLVE, not finish.  {advice}")
 
 
-def _resolve_channel_ladder(
-    mesh_xy: Mesh,
-    override: str,
-    *,
-    kind_fallback: str,
-    kind_cusolvermp: str,
-    explicit: dict | None = None,
-    auto_pre=None,
-) -> str:
-    """The mesh/CPU/backend decision ladder SHARED by the per-channel ζ-fit solver resolvers (:func:`_resolve_solver_kind_charge`, :func:`_resolve_solver_kind_transverse`) — written once so the two channels cannot drift; see docs/architecture/zeta_fit_face_psi_cct.md."""
-    px = int(mesh_xy.shape['x'])
-    py = int(mesh_xy.shape['y'])
-    is_2d = (px >= 2 and py >= 2)
+def _resolve_solver_kind(vertex_mu_L: int, solver_kind: str, *,
+                         n_rmu: int | None = None,
+                         nq: int | None = None) -> str:
+    """Resolve ``auto`` to the one factor each ζ channel runs; see docs/architecture/zeta_fit_face_psi_cct.md.
 
-    if override == 'off':
-        return kind_fallback
-    handler = (explicit or {}).get(override)
-    if handler is not None:
-        return handler(px, py)
-    # auto (or unrecognised) → default policy.
-    if auto_pre is not None:
-        kind = auto_pre()
-        if kind is not None:
-            return kind
-    if is_2d and not _mesh_is_cpu(mesh_xy):
-        return kind_cusolvermp
-    return kind_fallback
-
-
-def _resolve_solver_kind_charge(
-    mesh_xy: Mesh, override: str = "auto",
-    n_rmu: int | None = None, nq: int | None = None,
-    charge_zeta_solve: str = "cholesky",
-) -> str:
-    """Pick the charge-channel ζ-fit solver: fully-replicated dense Cholesky (mesh-invariant, the default for fit-size tiles) vs the distributed cuSolverMp potrf+potrs vs the in-tree shard_map 2D-blocked Cholesky + per-q triangular solve; see docs/architecture/zeta_fit_face_psi_cct.md."""
-    def _slate(px: int, py: int) -> str:
-        # Door guard ladder (distrib_la.resolve_backend): platform, compiled-
-        # capability probe (a slate-less build fails HERE, at resolve time,
-        # naming what IS available), process coverage, and the SLATE 1×q
-        # stride-assert geometry guard.  This layer only maps the approved
-        # backend to its charge-channel route string.
-        _resolve_linalg_backend('cholesky', 'slate', mesh_xy)
-        return 'slate_cholesky'
-
-    def _cusolvermp(px: int, py: int) -> str:
-        # EXPLICIT cusolvermp runs the same door guard ladder as
-        # 'slate': CUDA platform, compiled handler, process coverage,
-        # true-2D geometry (a 1-D mesh REFUSES at resolve time instead
-        # of silently returning the sharded fallback).  (audit fix/zq
-        # 2026-07-28; doctrine 3 / quality pattern #6)
-        _resolve_linalg_backend('cholesky', 'cusolvermp', mesh_xy)
-        return 'cusolvermp_cholesky'
-
-    # auto → default policy.  Fit-size stacks factor with the mesh-invariant
-    # replicated dense factor; larger stacks keep the distributed / sharded
-    # policy (fall through to the shared ladder).  ``charge_zeta_solve ==
-    # 'rank_truncate'`` (the production default) selects the rank-revealing
-    # eigh pseudo-inverse on the replicated route — the only route it applies
-    # to (a full eigh cannot be block-cyclic).  Above the cap we therefore
-    # CANNOT honour it, and we refuse rather than downgrade: the 2026-07-21
-    # full-BZ 12×12 fit (13.4 GiB, just over the cap) silently fell back and
-    # returned ζ 4.5× too large, rebuilding V_q to relF 16–32 instead of
-    # 1.8e-15.  The replicated route is dense JAX with no FFI, so it is valid
-    # on every backend including CPU -- and it is the only route carrying the
-    # rank-truncation cure, so it must stay reachable there.
-    def _auto_pre() -> str | None:
-        if _replicate_charge_ok(nq, n_rmu):
-            return ('replicated_rank_truncate'
-                    if charge_zeta_solve == 'rank_truncate'
-                    else 'replicated_cholesky')
-        # Above the (whole-stack) Cholesky cap, rank_truncate gets its own,
-        # correct criterion: the replicated transient is ONE q-batch, not the
-        # stack (see _replicate_rank_truncate_ok).  Strictly widening — this
-        # branch is only reached where the code raised before.
-        if (charge_zeta_solve == 'rank_truncate'
-                and _replicate_rank_truncate_ok(nq, n_rmu)):
-            return 'replicated_rank_truncate'
-        if charge_zeta_solve == 'rank_truncate':
-            raise _rank_truncate_capacity_error(nq, n_rmu, channel='charge')
-        return None
-
-    return _resolve_channel_ladder(
-        mesh_xy, override,
-        kind_fallback='sharded_cholesky',
-        kind_cusolvermp='cusolvermp_cholesky',
-        explicit={'slate': _slate,
-                  'cusolvermp': _cusolvermp, 'on': _cusolvermp},
-        auto_pre=_auto_pre)
-
-
-def _resolve_solver_kind_transverse(mesh_xy: Mesh, override: str = "auto",
-                                    n_rmu_logical: int | None = None,
-                                    ) -> str:
-    """Pick the transverse-channel ζ-fit solver: cuSolverMp distributed getrf+getrs vs the in-tree per-q ``jnp.linalg.solve`` + ridge; see docs/architecture/zeta_fit_face_psi_cct.md."""
-    def _scalapack(px: int, py: int) -> str:
-        # Door guard ladder (distrib_la.resolve_backend): host-only platform
-        # (defense-in-depth — gw_config already rejects scalapack on
-        # non-CPU backends at parse time), compiled-capability probe,
-        # process coverage, and the square-or-1-D descriptor geometry.
-        _resolve_linalg_backend('solve_lu', 'scalapack', mesh_xy)
-        return 'scalapack_lu'
-
-    def _cusolvermp(px: int, py: int) -> str:
-        # EXPLICIT cusolvermp runs the same door guard ladder as
-        # 'scalapack': CUDA platform, compiled handler, process coverage,
-        # true-2D geometry (a 1-D mesh REFUSES at resolve time instead of
-        # silently returning the per-q fallback).  (audit fix/zq
-        # 2026-07-28; doctrine 3 / quality pattern #6)
-        _resolve_linalg_backend('solve_lu', 'cusolvermp', mesh_xy)
-        return 'cusolvermp_lu'
-
-    # auto: cuSolverMp on true 2D GPU meshes; the shared ladder's CPU-mesh
-    # guard falls back to the CPU-safe in-tree per-q solve.
-    kind = _resolve_channel_ladder(
-        mesh_xy, override,
-        kind_fallback='lu',
-        kind_cusolvermp='cusolvermp_lu',
-        explicit={'scalapack': _scalapack,
-                  'cusolvermp': _cusolvermp, 'on': _cusolvermp})
-
-    if kind in ('cusolvermp_lu', 'scalapack_lu') and n_rmu_logical is not None:
-        px = int(mesh_xy.shape['x'])
-        py = int(mesh_xy.shape['y'])
-        n_log = int(n_rmu_logical)
-        from runtime.padding import padded_axis
-        _logical_carrier = padded_axis(
-            n_log, mesh_xy, name="transverse logical LU extent",
-            specs=((P('x', None), 0), (P(None, 'y'), 1)))
-        if _logical_carrier.pad:
-            if override in ('on', 'cusolvermp', 'scalapack'):
-                raise ValueError(
-                    f"distributed_lu={override!r} was explicitly requested, "
-                    f"but the transverse centroid count n_rmu_T={n_log} is "
-                    f"not divisible by the {px}x{py} mesh axes.  The "
-                    f"indefinite transverse solve must run at the LOGICAL "
-                    f"extent (pad-extent LU roundoff is amplified O(1) in "
-                    f"the near-null transverse modes) and the block-cyclic "
-                    f"descriptors need n % px == n % py == 0.  Pick a "
-                    f"transverse centroid count divisible by both mesh "
-                    f"axes, change the process mesh, or use `linalg = "
-                    f"local` (per-q replicated LU, valid at any extent).")
-            if jax.process_index() == 0:
-                print(
-                    f"  [solver resolve] transverse LU: auto resolved to "
-                    f"{kind} but n_rmu_T={n_log} does not divide the "
-                    f"{px}x{py} mesh axes (block-cyclic descriptor rule); "
-                    f"demoting to the per-q replicated LU "
-                    f"(distributed_lu-equivalent 'off') so the solve runs "
-                    f"at the logical extent.", flush=True)
-            return 'lu'
-    return kind
-
-
-def _resolve_solver_kind(
-    mesh_xy: Mesh, vertex_mu_L: int, solver_kind: str,
-    distributed_cholesky: str = "auto",
-    distributed_lu: str = "auto",
-    n_rmu: int | None = None,
-    nq: int | None = None,
-    charge_zeta_solve: str = "cholesky",
-) -> str:
-    """Single source of truth for the ``auto`` resolution; see docs/architecture/zeta_fit_face_psi_cct.md."""
+    A current channel (``vertex_mu_L != 0``) runs the hoisted pivoted LU
+    (``'lu'``).  The charge channel runs the replicated rank-truncated
+    pseudo-inverse (``'replicated_rank_truncate'``), and refuses when one
+    q-batch of it cannot be held replicated (:func:`_rank_truncate_capacity_error`).
+    """
     if solver_kind != 'auto':
         return solver_kind
     if int(vertex_mu_L) != 0:
-        return _resolve_solver_kind_transverse(
-            mesh_xy, distributed_lu, n_rmu_logical=n_rmu)
-    return _resolve_solver_kind_charge(
-        mesh_xy, distributed_cholesky, n_rmu=n_rmu, nq=nq,
-        charge_zeta_solve=charge_zeta_solve)
+        return 'lu'
+    if not _replicate_rank_truncate_ok(nq, n_rmu):
+        raise _rank_truncate_capacity_error(nq, n_rmu, channel='charge')
+    return 'replicated_rank_truncate'
 
 
 # ---------------------------------------------------------------------------
 # DEPRECATED env overrides of input-file keys (scorecard AV; pattern #8).
 #
-# ``zeta_rcond`` / ``zeta_ridge`` are THE conditioning knobs of the μ ladder
-# — physics policy, not machine capability — so their home is the input file,
+# ``zeta_rcond`` is THE conditioning knob of the charge ζ solve
+# — physics policy, not machine capability — so its home is the input file,
 # where they are parsed, validated, echoed into the run log and captured by
 # ζ-fit provenance.  The env forms predate the keys and used to win SILENTLY
 # (the env read had the key's value as its *fallback*), which is exactly the
@@ -1536,7 +1360,7 @@ def _deprecated_env_float(env_name: str, key_name: str, key_value) -> float:
     return val
 
 
-_replicated_chol_cache = {}  # replicated dense Cholesky kernel (keyed by shape)
+_replicated_chol_cache = {}  # replicated dense charge-factor kernel (keyed by shape)
 
 
 def _close_the_cut(spectrum, keep, *, where: str):
@@ -1637,82 +1461,58 @@ def _certify_the_cut(spectrum, keep, *, where: str, kappa_certified,
     jax.lax.cond(fired, _say, lambda _: 0, 0)
 
 
-def _charge_factor_math(C_log, *, mode: str, n_log: int,
-                        ridge_extra: float, rcond: float, rank_log: bool):
+def _charge_factor_math(C_log, *, n_log: int, rcond: float, rank_log: bool):
     """The per-q dense factor arithmetic — ONE kernel, shared bit-for-bit by the all-ranks (replicated) and q-parallel executions of the replicated plan (:func:`_factor_c_q_replicated`, :func:`_factor_c_q_replicated_qparallel`); see docs/architecture/zeta_fit_face_psi_cct.md."""
-    if mode == 'rank_truncate':
-        from isdf import cplus
-        return cplus.factor(C_log, rcond=rcond, rank_log=rank_log, n_log=n_log)
-    tr = jnp.abs(jnp.trace(C_log, axis1=-2, axis2=-1))
-    # Floor (1e-14·|tr|, bit-identical to the historical path)
-    # + opt-in conditioning term (ε·|tr|/n).  Per-q scalars.
-    ridge_scalar = (1e-14 * tr + ridge_extra * tr / n_log)[:, None, None]
-    ridge = ridge_scalar * jnp.eye(n_log, dtype=C_log.dtype)[None, :, :]
-    return jnp.linalg.cholesky(C_log + ridge)
+    from isdf import cplus
+    return cplus.factor(C_log, rcond=rcond, rank_log=rank_log, n_log=n_log)
 
 
 def solve_zeta_charge_dense(C, Z, *, charge_zeta_solve: str,
-                            zeta_rcond: float, zeta_ridge: float = 0.0,
-                            rank_log: bool | None = None):
+                            zeta_rcond: float, rank_log: bool = True):
     """THE producer's charge-ζ solve on ONE whole, unpadded (n_μ, n_μ) tile; see docs/architecture/zeta_fit_face_psi_cct.md."""
     mode = str(charge_zeta_solve).strip().lower()
-    if mode not in ('rank_truncate', 'cholesky'):
+    if mode == 'cholesky':
+        raise ValueError("solve_zeta_charge_dense: charge_zeta_solve='cholesky' is retired (2026-09-25); the charge solve is 'rank_truncate' — refit this ζ.")
+    if mode != 'rank_truncate':
         raise ValueError(
             f"solve_zeta_charge_dense: charge_zeta_solve={charge_zeta_solve!r} "
-            f"is not a charge-channel solve.  Expected 'rank_truncate' (the "
-            f"production default) or 'cholesky'.  The transverse ridge "
-            f"family solves an INDEFINITE CCT and does not belong on this "
-            f"entry point.")
+            f"is not a charge-channel solve.  Expected 'rank_truncate'.  The "
+            f"transverse ridge family solves an INDEFINITE CCT and does not "
+            f"belong on this entry point.")
     n_log = int(C.shape[-1])
-    if rank_log is None:
-        rank_log = mode == 'rank_truncate'
     F = _charge_factor_math(
-        C[None, ...], mode=mode, n_log=n_log,
-        ridge_extra=float(zeta_ridge), rcond=float(zeta_rcond),
+        C[None, ...], n_log=n_log, rcond=float(zeta_rcond),
         rank_log=bool(rank_log))[0]
-    if mode == 'rank_truncate':
-        from isdf import cplus
-        return cplus.apply(F, Z)
-    y = jax.scipy.linalg.solve_triangular(F, Z, lower=True)
-    return jax.scipy.linalg.solve_triangular(jnp.conj(F).T, y, lower=False)
+    from isdf import cplus
+    return cplus.apply(F, Z)
 
 
 def _factor_c_q_replicated(
     C_q: jax.Array, mesh_xy: Mesh, n_rmu_logical: int,
-    zeta_ridge: float = 0.0,
-    charge_zeta_solve: str = 'cholesky',
     zeta_rcond: float = ZETA_RCOND_DEFAULT,
 ) -> jax.Array:
-    """Dense, fully REPLICATED factor of the identity-padded charge CCT; see docs/architecture/zeta_fit_face_psi_cct.md."""
-    import os as _os
+    """Dense, fully REPLICATED rank-truncated factor of the identity-padded charge CCT; see docs/architecture/zeta_fit_face_psi_cct.md."""
     nq, n_rmu, _ = C_q.shape
     n_log = int(n_rmu_logical)
-    mode = str(charge_zeta_solve)
-    # Deprecated env twins of the charge input keys.
-    ridge_extra = _deprecated_env_float(
-        "LORRAX_ZETA_RIDGE", "zeta_ridge", zeta_ridge)
+    # Deprecated env twin of the charge input key.
     rcond = _deprecated_env_float("LORRAX_ZETA_RCOND", "zeta_rcond", zeta_rcond)
     out_sh = NamedSharding(mesh_xy, P(None, 'x', 'y'))
     rep_sh = NamedSharding(mesh_xy, P())
-    key = (_mesh_key(mesh_xy), int(nq), int(n_rmu), n_log,
-           float(ridge_extra), mode, float(rcond))
+    key = (_mesh_key(mesh_xy), int(nq), int(n_rmu), n_log, float(rcond))
     if key not in _replicated_chol_cache:
-        _re = ridge_extra
         _rc = rcond
-        _rank_log = mode == 'rank_truncate'
         @partial(jax.jit, out_shardings=out_sh)
         def _fn(C):
             def _factor_log(C_log):
                 # Replicate the logical block so every device factors the
                 # WHOLE matrix — this is what makes the factor grid-agnostic
-                # (the distributed potrf's block-cyclic accumulation is not).
+                # (a block-cyclic accumulation would not be).
                 # The arithmetic itself lives in ``_charge_factor_math`` —
                 # ONE traced kernel shared with the q-parallel execution so
                 # the two schedules cannot drift (bit-identity contract).
                 C_log = jax.lax.with_sharding_constraint(C_log, rep_sh)
                 F = _charge_factor_math(
-                    C_log, mode=mode, n_log=n_log, ridge_extra=_re,
-                    rcond=_rc, rank_log=_rank_log)
+                    C_log, n_log=n_log, rcond=_rc, rank_log=True)
                 return F
 
             F_log = solve_at_logical(
@@ -1728,7 +1528,7 @@ def _factor_c_q_replicated(
 
 
 # Largest REPLICATED q-batch handed to one dense factor call.  The factor is
-# per-q independent (one eigh / cholesky per matrix), but its device workspace
+# per-q independent (one eigh per matrix), but its device workspace
 # scales with the batch: measured ~0.30 GB per q at n_μ = 2416, so the full-BZ
 # MoS2 12×12 stack (nq = 144) asks XLA for a single 42.55 GB allocation and
 # dies on an 80 GB card, while the IBZ stack (nq = 74) fits.  Batching keeps the
@@ -1775,10 +1575,9 @@ def factor_c_q_replicated_batched(
 # scorecard AN), each device factors its owned q's through the SAME traced
 # kernel (``_charge_factor_math``), and the factors are resharded back to
 # ``P(None, 'x', 'y')``.  Only data movement differs; the values are the
-# same bits, so mesh-invariance survives by construction and the ζ-fit
-# factor family keeps exactly TWO plans:
-#     replicated  (mesh-invariant whole-tile factor; q-parallel at P>1)
-#     distributed (2-D ScaLAPACK eigh — different gauge, explicit opt-in)
+# same bits, so mesh-invariance survives by construction and the charge
+# factor keeps ONE plan: the mesh-invariant whole-tile factor, q-parallel at
+# P>1.
 #
 # MEASURED motivation (job 7884656, MoS2 4x4 b300, P=16 / 4x4 mesh,
 # nq_ibz=10, mu_log=2979): zeta_fit.cholesky = 105.1 s — one dense eigh per
@@ -1843,19 +1642,13 @@ def _qparallel_announce(nq: int, n_rmu: int, n_log: int,
 
 def _factor_c_q_replicated_qparallel(
     C_q: jax.Array, mesh_xy: Mesh, n_rmu_logical: int,
-    zeta_ridge: float = 0.0,
-    charge_zeta_solve: str = 'cholesky',
     zeta_rcond: float = ZETA_RCOND_DEFAULT,
 ) -> jax.Array:
     """The replicated charge factor, EXECUTED q-parallel; see docs/architecture/zeta_fit_face_psi_cct.md."""
     nq, n_rmu, _ = C_q.shape
     n_log = int(n_rmu_logical)
-    mode = str(charge_zeta_solve)
-    # Deprecated env twins of the charge input keys.
-    ridge_extra = _deprecated_env_float(
-        "LORRAX_ZETA_RIDGE", "zeta_ridge", zeta_ridge)
+    # Deprecated env twin of the charge input key.
     rcond = _deprecated_env_float("LORRAX_ZETA_RCOND", "zeta_rcond", zeta_rcond)
-    rank_log = mode == 'rank_truncate'
     ndev = int(mesh_xy.devices.size)
     py = int(mesh_xy.shape['y'])
     from runtime.padding import padded_axis
@@ -1866,10 +1659,9 @@ def _factor_c_q_replicated_qparallel(
     q_sh = NamedSharding(mesh_xy, P(('x', 'y'), None, None))
     mid_sh = NamedSharding(mesh_xy, P('x', None, 'y'))
 
-    key = (_mesh_key(mesh_xy), int(nq), int(n_rmu), n_log,
-           float(ridge_extra), mode, float(rcond), bool(rank_log))
+    key = (_mesh_key(mesh_xy), int(nq), int(n_rmu), n_log, float(rcond))
     if key not in _qparallel_factor_cache:
-        _re, _rc, _rl = ridge_extra, rcond, rank_log
+        _rc = rcond
         blk = nq_pad // ndev
 
         def _local_factor(C_loc):
@@ -1881,8 +1673,7 @@ def _factor_c_q_replicated_qparallel(
             def _fact(C1):
                 return solve_at_logical(
                     lambda Cl: _charge_factor_math(
-                        Cl, mode=mode, n_log=n_log, ridge_extra=_re,
-                        rcond=_rc, rank_log=_rl),
+                        Cl, n_log=n_log, rcond=_rc, rank_log=True),
                     n_log, (C1,), pad_axes=(-2, -1))
 
             def _one(i, F_acc):
@@ -2296,13 +2087,10 @@ def _chunk_log(where: str, nq: int, qb: int, per_q_bytes: int) -> None:
 def factor_c_q(
     C_q: jax.Array,
     mesh_xy: Mesh,
-    block_size: int = None,
     vertex_mu_L: int = 0,
     n_rmu_logical: int | None = None,
     solver_kind: str = 'auto',
-    zeta_ridge: float = 0.0,
     zeta_rcond: float = ZETA_RCOND_DEFAULT,
-    distrib_la_batched_route: str = "batch_reshard",
 ) -> jax.Array:
     """Compute system-matrix L_q from CCT matrix; see docs/architecture/zeta_fit_face_psi_cct.md."""
     nq, n_rmu, n_rmu2 = C_q.shape
@@ -2326,7 +2114,7 @@ def factor_c_q(
     # and returned as jax's own ``(LU, perm)`` pair.
     if int(vertex_mu_L) != 0:
         t_kind = _resolve_solver_kind(
-            mesh_xy, int(vertex_mu_L), solver_kind, n_rmu=n_rmu_logical)
+            int(vertex_mu_L), solver_kind, n_rmu=n_rmu_logical)
         if t_kind != 'lu':
             raise ValueError(
                 f"factor_c_q: unknown transverse solver_kind {t_kind!r}")
@@ -2341,102 +2129,17 @@ def factor_c_q(
             where="zeta transverse ridge (LU)")
         return _lu_out
 
-    solver_kind = _resolve_solver_kind(mesh_xy, vertex_mu_L=0, solver_kind=solver_kind)
-
-    Pr = mesh_xy.shape['x']
-    Pc = mesh_xy.shape['y']
-
-    # Replicated dense factor — the mesh-INVARIANT charge factor.  Fires for
-    # the 'replicated_cholesky' / 'replicated_rank_truncate' auto picks
-    # (fit-size n_μ on any mesh) AND for any single-device / 1-D-degenerate
-    # mesh, where a dense factor is the only option (the 2D-blocked shard_map
-    # kernel needs a true 2-D mesh; cuSolverMp needs one process per device).
-    # ONE code path — see _factor_c_q_replicated for why the factor is
-    # grid-agnostic and for the rank_truncate vs cholesky choice.  On 1×1
-    # meshes this also sidesteps a JAX 0.9 shard_map+scan carry-type failure
-    # in the blocked kernel.
-    if (solver_kind in ('replicated_cholesky', 'replicated_rank_truncate')
-            or mesh_xy.devices.size == 1 or (Pr == 1 and Pc == 1)):
-        _mode = ('rank_truncate' if solver_kind == 'replicated_rank_truncate'
-                 else 'cholesky')
-        return factor_c_q_replicated_batched(
-            C_q, mesh_xy, n_rmu_logical, zeta_ridge=zeta_ridge,
-            charge_zeta_solve=_mode, zeta_rcond=zeta_rcond)
-
-    if solver_kind in ('cusolvermp_cholesky', 'slate_cholesky'):
-        # BOTH distributed potrf routes are one call now, because the only
-        # thing that used to separate them was the shape of the handle they
-        # hand back, and the token is where that lives.
-        #
-        # cuSOLVERMp: was ``batched_distributed_cholesky(...).raw`` here and
-        # a hand-rebuilt ``CusolverMpBatchedLowerL(raw, mesh, n, mb, nb,
-        # nbatch)`` 300 lines away in the r-tile solve.  The rebuild reconstructed
-        # block-cyclic geometry from ``n // Px`` / ``n // Py`` arithmetic
-        # that had to agree with the factoring call's; the token carries the
-        # handle itself, so there is nothing to reconstruct and nothing to
-        # get wrong.
-        #
-        # SLATE: was a per-q Python loop over ``distributed_cholesky`` plus a
-        # ``to_jax_lower()`` per row and a ``jnp.stack`` — the loop is inside
-        # ``distrib_la.factor`` now (SLATE's batched potrf distributes the
-        # BATCH over mesh 'x', which does not match this site's replicated-q
-        # layout, so a per-q loop over nq <~ tens is still the right shape;
-        # it just is not this file's business).  BEHAVIOUR CHANGE, stated
-        # plainly: the handles stay handles, so the back-solve is
-        # ``slate::trsm`` against the col-major factor instead of a JAX
-        # triangular solve on a materialised row-major L.  That is the perf
-        # follow-up the old comment here promised, and it is measured — step
-        # 2's real 4-process 2x2 legs put it at rel 3.8e-16 / 4.5e-16 (CPU
-        # c128) and 1.0e-15 / 6.9e-16 (GPU c128) against the native
-        # reference, bar rtol 1e-12, not relaxed.
-        #
-        # n_rmu is the PADDED extent (divisible by px*py, hence by each axis
-        # individually), so both libraries' divisibility contracts hold.
-        return linalg_factor(
-            'cholesky', C_q, mesh_xy,
-            backend=('cusolvermp' if solver_kind == 'cusolvermp_cholesky'
-                     else 'slate'),
-            n=int(n_rmu))
-
-    # 2D-blocked path: requires n_rmu divisible into mesh-friendly tiles.
-    # The caller is expected to pass C_q at PADDED μ extent
-    # (n_rmu_padded ≡ ∏ p_a is mesh-product divisible), in which case
-    # this always succeeds.  ``n_rmu_logical`` only adjusts the
-    # identity-pad above; it doesn't affect this code path.
-    try:
-        if block_size is None:
-            block_size, J = compute_block_size_for_2d_cholesky(n_rmu, Pr, Pc)
-        else:
-            J = n_rmu // block_size
-    except ValueError as exc:
+    solver_kind = _resolve_solver_kind(
+        0, solver_kind, n_rmu=n_rmu_logical, nq=int(nq))
+    if solver_kind != 'replicated_rank_truncate':
         raise ValueError(
-            f"factor_c_q: n_rmu={n_rmu} is not 2D-blocked-Cholesky "
-            f"compatible with mesh {Pr}×{Pc} ({exc}). Pass C_q at "
-            f"PADDED μ extent (round up to ∏ p_a = world_size) so "
-            f"the 2D-blocked path applies."
-        ) from exc
-
-    # The 2-D blocked kernel is distrib_la's ``native2d`` backend now, and
-    # its 5-axis tile layout is INTERNAL there: dense (nq, μ, μ) at
-    # P(None,'x','y') in, the same shape and sharding out, with
-    # dense_to_tiles/tiles_to_dense and the sharding constraints that used
-    # to be written here living behind the door.  Same right-looking
-    # blocked algorithm on the same tiles, so the factor is unchanged.
-    #
-    # ``block_size`` is passed rather than left to the backend's own
-    # ``block_size_for``: the two are a port of one function, but the
-    # REFUSAL above is this caller's (it names n_rmu_padded as the fix), so
-    # the decomposition has to be made here to be reported here.
-    #
-    # The kernel cache moved too (``_native2d._KERNEL_CACHE``, keyed on the
-    # same (mesh identity, J, b)), which is why this function no longer
-    # keeps one.  ``plan`` itself is cheap and NOT cached: native2d
-    # resolution runs no dlopen and no process_count, only the tile
-    # divisibility check that ``block_size_for`` above already did.
-    return linalg_plan(
-        'cholesky', mesh_xy, backend='native2d', n=int(n_rmu),
-        batched_route=distrib_la_batched_route,
-    ).batched(C_q, block_size=block_size)
+            f"factor_c_q: unknown charge solver_kind {solver_kind!r}; the "
+            f"charge channel runs 'replicated_rank_truncate'.")
+    # The mesh-INVARIANT whole-tile charge factor: every q is factored as ONE
+    # dense rank-truncated eigh (q-parallel over devices above the fold
+    # threshold); see _factor_c_q_replicated.
+    return factor_c_q_replicated_batched(
+        C_q, mesh_xy, n_rmu_logical, zeta_rcond=zeta_rcond)
 
 
 def _zeta_logical_solvers(
@@ -2458,62 +2161,35 @@ def _zeta_logical_solvers(
                 (LU_log, piv), Z_log, trans=0),
             n_log, (LU,), Z)
 
-    def _tri_solve_logical(L: jax.Array, Z: jax.Array) -> jax.Array:
-        """Charge-channel two-triangular back-solve at the LOGICAL μ extent (same ``solve_at_logical`` rationale — the well-conditioned Cholesky back-solve only wobbles ≤1e-7 under a pad-extent change, but at fixed shape it is exactly pad-invariant, which the fixed-P invariance gate requires); see docs/architecture/zeta_fit_face_psi_cct.md."""
-        def _chol_backsolve(L_log, Z_log):
-            y = jax.scipy.linalg.solve_triangular(L_log, Z_log, lower=True)
-            return jax.scipy.linalg.solve_triangular(
-                L_log.conj().T, y, lower=False)
-        return solve_at_logical(_chol_backsolve, n_log, (L,), Z)
-
     def _pinv_matmul_logical(B: jax.Array, Z: jax.Array) -> jax.Array:
         """Charge rank-truncation back-solve at the LOGICAL μ extent: ζ = C⁺Z = B(BᴴZ), two matmuls (B is the pseudo-inverse factor, B Bᴴ = C⁺); see docs/architecture/zeta_fit_face_psi_cct.md."""
         from isdf import cplus
         return solve_at_logical(cplus.apply, n_log, (B,), Z)
 
-    return _ridge_indef_solve, _lu_apply_logical, _tri_solve_logical, _pinv_matmul_logical
+    return _ridge_indef_solve, _lu_apply_logical, _pinv_matmul_logical
 
 
-#: Solver kinds whose factor is a whole-tile ARRAY applied per q — the kinds
-#: the ``replicated`` and ``local`` tiers serve.  A FactorToken and the fused
-#: provider LU plans have their own routes.
-_WHOLE_TILE_KINDS = frozenset({
-    'replicated_rank_truncate', 'replicated_cholesky', 'sharded_cholesky',
-    'lu'})
+#: Solver kinds whose factor is a whole-tile ARRAY applied per q.
+_WHOLE_TILE_KINDS = frozenset({'replicated_rank_truncate', 'lu'})
 
 
-def _whole_tile_solve_kind(solver_kind, lu_piv, distrib_la_batched_route):
-    """The whole-tile kind route G's back-solve will execute, or ``None`` for a library/distributed route.
-
-    ``factor_c_q`` answers a provider LU request under ``batch_reshard`` with
-    the local-JAX ``(LU, pivots)`` pair (a block-cyclic token cannot cross
-    that route; the JAX factor can be retained across G tiles), so that
-    already-resolved provider name is normalized to ``'lu'`` here.  A non-None
-    pivot vector is the unambiguous tag: provider tokens keep theirs opaque.
-    The ONE place both the solve and the factor-residency step read it.
-    """
+def _whole_tile_solve_kind(solver_kind):
+    """The whole-tile kind route G's back-solve will execute, or ``None``."""
     kind = str(solver_kind)
-    if (lu_piv is not None and kind in ('cusolvermp_lu', 'scalapack_lu')
-            and distrib_la_batched_route == 'batch_reshard'):
-        kind = 'lu'
     return kind if kind in _WHOLE_TILE_KINDS else None
 
 
-def zeta_factor_resident(L_q, lu_piv, mesh_xy, *, solver_kind,
-                         distrib_la_batched_route="batch_reshard"):
+def zeta_factor_resident(L_q, lu_piv, mesh_xy, *, solver_kind):
     """Lay a whole-tile ζ factor out ONCE on its q owners, where the back-solve reads it (R4); see docs/architecture/zeta_fit_face_psi_cct.md.
 
     Returns ``(L_q, lu_piv)``.  A whole-tile array factor ``(nq, μ, μ)`` at
     ``P(None,'x','y')`` moves to the batch layout ``(ceil(nq/P)·P, μ, μ)`` at
     ``P(('x','y'), None, None)`` — rank ``x·Py + y`` then holds its
     ``ceil(nq/P)`` q's as whole tiles for the whole G-tile loop — and a
-    replicated pivot table ``(nq, μ_log)`` is sliced to the same rows.  A
-    :class:`FactorToken` and a distributed or fused-provider factor are
-    returned untouched.
+    replicated pivot table ``(nq, μ_log)`` is sliced to the same rows.  Any
+    other kind is returned untouched.
     """
-    if (isinstance(L_q, FactorToken)
-            or _whole_tile_solve_kind(
-                solver_kind, lu_piv, distrib_la_batched_route) is None):
+    if _whole_tile_solve_kind(solver_kind) is None:
         return L_q, lu_piv
     if not linalg_is_batch_layout(L_q, mesh_xy):
         L_q = linalg_batch_layout(L_q, mesh_xy)

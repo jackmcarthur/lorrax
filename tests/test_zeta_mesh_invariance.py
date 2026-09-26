@@ -1,23 +1,18 @@
 """Portable cross-mesh invariance gate for the charge ζ-fit factor+solve.
 
-THE regression guard for the 2026-07-20 device-count-correctness bug: the
-charge-channel ζ-fit's distributed cuSolverMp Cholesky is block-cyclic, so
-its partial-sum regrouping depends on the process grid ``(px, py)``.  At
-large, mildly rank-deficient n_μ (MoS2 6×6, 1600 centroids) the factor
-``L_q = chol(C_q)`` drifted ~0.3% between a 2×2 and a 4×4 grid, and the
-GN-PPM pole construction amplified that into tens-of-eV Σ_c garbage on
-non-16-GPU meshes (reports/gw_zeta_mesh_invariance_2026-07-20).
+THE regression guard for the 2026-07-20 device-count-correctness bug: a
+block-cyclic distributed charge factor regroups its partial sums with the
+process grid ``(px, py)``, and at large, mildly rank-deficient n_μ (MoS2 6×6,
+1600 centroids) the factor drifted ~0.3% between a 2×2 and a 4×4 grid, which
+the GN-PPM pole construction amplified into tens-of-eV Σ_c garbage.
 
-The fix routes fit-size charge tiles through a fully-REPLICATED dense
-``jnp.linalg.cholesky`` (``isdf.core._factor_c_q_replicated``), which runs on
-the whole matrix on every device and is therefore bit-identical across
-device counts and process grids.  This gate locks that property in: it
-factors + back-solves a FIXED synthetic SPD CCT on several CPU meshes
-(1×1, 1×2, 2×1, 2×2 — via ``--xla_force_host_platform_device_count``) and
-asserts the resulting L_q and ζ agree to the ULP floor.  Portable: CPU-only,
-no GPU, no cuSolverMp — it guards the *auto-resolved* path (which must be the
-mesh-invariant replicated Cholesky for fit-size stacks) so any future change
-that reintroduces a grid-dependent charge factor as the default trips it.
+The charge factor is the replicated rank-truncated eigh
+(``isdf.core._factor_c_q_replicated``): every q is factored as ONE dense
+whole-tile call, so it is bit-identical across device counts and process
+grids.  This gate factors + back-solves a FIXED near-singular CCT on several
+CPU meshes (1×1, 1×2, 2×1, 2×2 — via ``--xla_force_host_platform_device_count``)
+and asserts the factor and ζ agree to the ULP floor.  Portable: CPU-only, no
+GPU.
 
 The full end-to-end complement (MoS2 6×6 GN-PPM at 1×1 vs 2×2, asserting
 |Δ Re Σ_c(VBM)| < few meV) lives in
@@ -35,82 +30,19 @@ import pytest
 
 # Meshes exercised on the CPU host-device pool and the ULP-floor tolerance.
 # 4 host devices → {1×1, 1×2, 2×1, 2×2, 1×4, 4×1}.  A grid-dependent factor
-# (the pre-fix cuSolverMp policy) would show ~1e-3 frob-rel here; the
-# replicated dense factor is bit-identical, so 1e-10 cleanly separates them.
+# would show ~1e-3 frob-rel here; the replicated dense factor is
+# bit-identical, so 1e-10 cleanly separates them.
 _NDEV = 4
 _TOL = 1.0e-10
 
 
-def _per_q_solve(F, Z, *, kind, n_log):
-    """ζ = C⁻¹Z per q at the logical extent: the per-q back-solve kernels
-    (``isdf.core._zeta_logical_solvers``) vmapped over q.  The charge
-    rank-truncate kernel is route G's charge seam (``cplus.apply``)."""
+def _per_q_solve(F, Z, *, n_log):
+    """ζ = C⁺Z per q at the logical extent: route G's charge back-solve
+    (``isdf.core._zeta_logical_solvers``, ``cplus.apply``) vmapped over q."""
     import jax
     from isdf.core import _zeta_logical_solvers
-    _, _, tri_solve, pinv_matmul = _zeta_logical_solvers(int(n_log))
-    fn = pinv_matmul if kind == 'replicated_rank_truncate' else tri_solve
-    return jax.jit(jax.vmap(fn))(F, Z)
-
-
-def _worker() -> int:
-    """Child process: build a fixed SPD CCT, factor + solve on every mesh,
-    print the worst cross-mesh frob-rel for L_q and ζ as JSON."""
-    import numpy as np
-    import jax
-    import jax.numpy as jnp
-    from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
-
-    from isdf import factor_c_q
-    from isdf.core import _resolve_solver_kind
-
-    devs = jax.devices()
-    if len(devs) < _NDEV:
-        print(json.dumps({"skip": f"only {len(devs)} devices"}))
-        return 0
-
-    # Fixed, deterministic, well-posed SPD charge CCT + RHS.  n_μ=64 is
-    # divisible by every mesh axis (no μ-pad) and the stack is tiny, so the
-    # auto resolver must pick the replicated dense Cholesky.
-    rng = np.random.default_rng(20260720)
-    nq, n_mu, n_rhs = 4, 64, 24
-    A = (rng.standard_normal((nq, n_mu, n_mu + 8))
-         + 1j * rng.standard_normal((nq, n_mu, n_mu + 8)))
-    C = A @ np.conj(np.transpose(A, (0, 2, 1)))          # SPD, Hermitian
-    C = C + n_mu * np.eye(n_mu)[None]                    # well-conditioned
-    C = 0.5 * (C + np.conj(np.transpose(C, (0, 2, 1))))  # kill fp asymmetry
-    C = C.astype(np.complex128)
-    Zrhs = (rng.standard_normal((nq, n_mu, n_rhs))
-            + 1j * rng.standard_normal((nq, n_mu, n_rhs))).astype(np.complex128)
-
-    mesh_shapes = [(1, 1), (1, 2), (2, 1), (2, 2), (1, 4), (4, 1)]
-    L_ref = zeta_ref = None
-    worst_L = worst_z = 0.0
-    kinds = {}
-    for (px, py) in mesh_shapes:
-        mesh = Mesh(np.asarray(devs[: px * py]).reshape(px, py), ('x', 'y'))
-        kind = _resolve_solver_kind(mesh, 0, 'auto', n_rmu=n_mu, nq=nq)
-        kinds[f"{px}x{py}"] = kind
-        assert kind == 'replicated_cholesky', (
-            f"auto resolver picked {kind!r} on {px}x{py} for fit-size n_μ; "
-            f"expected 'replicated_cholesky' (mesh-invariant)")
-        in_sh = NamedSharding(mesh, P(None, 'x', 'y'))
-        C_dev = jax.device_put(jnp.asarray(C), in_sh)
-        Z_dev = jax.device_put(jnp.asarray(Zrhs), in_sh)
-        L = factor_c_q(C_dev, mesh, vertex_mu_L=0,
-                       n_rmu_logical=n_mu, solver_kind=kind)
-        zeta = _per_q_solve(L, Z_dev, kind=kind, n_log=n_mu)
-        L_np = np.asarray(jax.device_get(L))
-        z_np = np.asarray(jax.device_get(zeta))
-        if L_ref is None:
-            L_ref, zeta_ref = L_np, z_np
-        else:
-            worst_L = max(worst_L, float(
-                np.linalg.norm(L_np - L_ref) / max(np.linalg.norm(L_ref), 1e-300)))
-            worst_z = max(worst_z, float(
-                np.linalg.norm(z_np - zeta_ref) / max(np.linalg.norm(zeta_ref), 1e-300)))
-    print(json.dumps({"worst_L": worst_L, "worst_zeta": worst_z,
-                      "kinds": kinds}))
-    return 0
+    _, _, pinv_matmul = _zeta_logical_solvers(int(n_log))
+    return jax.jit(jax.vmap(pinv_matmul))(F, Z)
 
 
 def _worker_rank_truncate() -> int:
@@ -118,8 +50,8 @@ def _worker_rank_truncate() -> int:
     + solve with the rank-truncation path on every mesh.  Asserts the
     auto-resolved kind is ``replicated_rank_truncate`` and reports (a) the
     worst cross-mesh frob-rel for the pseudo-inverse factor B and ζ, and
-    (b) the amplification ratio ‖ζ_chol‖/‖ζ_rt‖ on a single mesh — the
-    conditioning the truncation buys vs plain (floored) Cholesky."""
+    (b) the pseudo-inverse residual on range(C), which a full (untruncated)
+    solve would fail by ‖(I − P_range) Z‖."""
     import numpy as np
     import jax
     import jax.numpy as jnp
@@ -158,19 +90,17 @@ def _worker_rank_truncate() -> int:
     zeta_rt_2x2 = None
     for (px, py) in mesh_shapes:
         mesh = Mesh(np.asarray(devs[: px * py]).reshape(px, py), ('x', 'y'))
-        kind = _resolve_solver_kind(mesh, 0, 'auto', n_rmu=n_mu, nq=nq,
-                                    charge_zeta_solve='rank_truncate')
+        kind = _resolve_solver_kind(0, 'auto', n_rmu=n_mu, nq=nq)
         kinds[f"{px}x{py}"] = kind
         assert kind == 'replicated_rank_truncate', (
-            f"auto resolver picked {kind!r} on {px}x{py} for fit-size n_μ "
-            f"with charge_zeta_solve=rank_truncate; expected "
-            f"'replicated_rank_truncate'")
+            f"auto resolver picked {kind!r} on {px}x{py} for fit-size n_μ; "
+            f"expected 'replicated_rank_truncate'")
         in_sh = NamedSharding(mesh, P(None, 'x', 'y'))
         C_dev = jax.device_put(jnp.asarray(C), in_sh)
         Z_dev = jax.device_put(jnp.asarray(Zrhs), in_sh)
         B = factor_c_q(C_dev, mesh, vertex_mu_L=0, n_rmu_logical=n_mu,
                        solver_kind=kind, zeta_rcond=rcond)
-        zeta = _per_q_solve(B, Z_dev, kind=kind, n_log=n_mu)
+        zeta = _per_q_solve(B, Z_dev, n_log=n_mu)
         B_np = np.asarray(jax.device_get(B))
         z_np = np.asarray(jax.device_get(zeta))
         if B_ref is None:
@@ -183,17 +113,6 @@ def _worker_rank_truncate() -> int:
         if (px, py) == (2, 2):
             zeta_rt_2x2 = z_np
 
-    # Conditioning demonstration: the SAME singular CCT through the plain
-    # (1e-14·|tr| floored) Cholesky path amplifies the near-null modes.
-    mesh22 = Mesh(np.asarray(devs[:4]).reshape(2, 2), ('x', 'y'))
-    in_sh = NamedSharding(mesh22, P(None, 'x', 'y'))
-    C_dev = jax.device_put(jnp.asarray(C), in_sh)
-    Z_dev = jax.device_put(jnp.asarray(Zrhs), in_sh)
-    Lc = factor_c_q(C_dev, mesh22, vertex_mu_L=0, n_rmu_logical=n_mu,
-                    solver_kind='replicated_cholesky')
-    zeta_chol = np.asarray(jax.device_get(
-        _per_q_solve(Lc, Z_dev, kind='replicated_cholesky', n_log=n_mu)))
-    amp = float(np.linalg.norm(zeta_chol) / max(np.linalg.norm(zeta_rt_2x2), 1e-300))
     # ζ_rt should reconstruct Z on the range of C: C ζ ≈ P_range Z.  With the
     # designed spectrum the range is exactly the top-r subspace; the residual
     # of the pseudo-inverse relation ‖C ζ − Z_range‖/‖Z_range‖ is ~ULP.
@@ -207,8 +126,7 @@ def _worker_rank_truncate() -> int:
             np.linalg.norm(C[iq] @ zeta_rt_2x2[iq] - Zr)
             / max(np.linalg.norm(Zr), 1e-300)))
     print(json.dumps({"worst_B": worst_B, "worst_zeta": worst_z,
-                      "kinds": kinds, "amp_chol_over_rt": amp,
-                      "range_residual": Z_range_res}))
+                      "kinds": kinds, "range_residual": Z_range_res}))
     return 0
 
 
@@ -232,8 +150,7 @@ def _worker_qparallel() -> int:
         print(json.dumps({"skip": f"only {len(devs)} devices"}))
         return 0
 
-    # Well-conditioned SPD logical block (so the cholesky mode is valid),
-    # zero-embedded to a padded extent: n_log=60 inside n_pad=64 exercises
+    # Well-conditioned SPD logical block, zero-embedded to a padded extent: n_log=60 inside n_pad=64 exercises
     # solve_at_logical + the identity-pad re-embed; nq=6 does not divide
     # 4 devices, exercising the q-pad + cond-skip.
     rng = np.random.default_rng(20260801)
@@ -252,8 +169,7 @@ def _worker_qparallel() -> int:
         mesh = Mesh(np.asarray(devs[: px * py]).reshape(px, py), ('x', 'y'))
         in_sh = NamedSharding(mesh, P(None, 'x', 'y'))
         C_dev = jax.device_put(jnp.asarray(C), in_sh)
-        for mode, kind in (('rank_truncate', 'replicated_rank_truncate'),
-                           ('cholesky', 'replicated_cholesky')):
+        for mode, kind in (('rank_truncate', 'replicated_rank_truncate'),):
             outs = {}
             for force in ('0', '1'):
                 os.environ['LORRAX_ZETA_QPARALLEL'] = force
@@ -275,34 +191,17 @@ def _worker_cap() -> int:
     returns for the two real MoS2 12×12 / n_μ=2412 ζ stacks — IBZ (nq=74,
     6.42 GiB) and full-BZ (nq=144, 12.48 GiB) — under whatever cap the
     parent set via ``LORRAX_ZETA_REPLICATE_CAP_GIB``."""
-    import numpy as np
-    import jax
-    from jax.sharding import Mesh
-
     import isdf.core as core
 
-    devs = jax.devices()
-    if len(devs) < 4:
-        print(json.dumps({"skip": f"only {len(devs)} devices"}))
-        return 0
-    mesh = Mesh(np.asarray(devs[:4]).reshape(2, 2), ('x', 'y'))
-    # Above the cap the auto CHOLESKY route resolves to cuSolverMp only on a
-    # true-2D GPU mesh; on a CPU mesh (this worker forces JAX_PLATFORMS=cpu)
-    # cuSolverMp is CUDA-only, so it must fall back to the in-tree sharded
-    # Cholesky.  Report the platform so the parent asserts the right kind.
-    res = {"cap_gib": core._REPLICATED_CHOL_MAX_STACK_BYTES / 1024 ** 3,
-           "mesh_is_cpu": bool(core._mesh_is_cpu(mesh))}
+    res = {"cap_gib": core._REPLICATED_CHOL_MAX_STACK_BYTES / 1024 ** 3}
     for tag, nq in (("ibz74", 74), ("fullbz144", 144)):
-        for solve in ("rank_truncate", "cholesky"):
-            try:
-                res[f"{tag}_{solve}"] = core._resolve_solver_kind_charge(
-                    mesh, "auto", n_rmu=2412, nq=nq, charge_zeta_solve=solve)
-            except ValueError as exc:
-                res[f"{tag}_{solve}"] = f"RAISE:{exc}"
+        try:
+            res[f"{tag}_rank_truncate"] = core._resolve_solver_kind(
+                0, "auto", n_rmu=2412, nq=nq)
+        except ValueError as exc:
+            res[f"{tag}_rank_truncate"] = f"RAISE:{exc}"
     print(json.dumps(res))
     return 0
-
-
 
 
 def _run_worker(tag: str, timeout: int = 600, env_extra: dict | None = None,
@@ -326,26 +225,10 @@ def _run_worker(tag: str, timeout: int = 600, env_extra: dict | None = None,
     return json.loads(line[-1])
 
 
-def test_zeta_fit_charge_factor_solve_is_mesh_invariant():
-    """factor_c_q + the per-q back-solve (charge, cholesky alternative) give
-    bit-identical L_q and ζ across CPU meshes {1×1, 1×2, 2×1, 2×2, 1×4,
-    4×1}."""
-    out = _run_worker("worker")
-    if "skip" in out:
-        pytest.skip(f"cross-mesh gate: {out['skip']}")
-    assert out["worst_L"] <= _TOL, (
-        f"charge Cholesky L_q drifts across meshes: worst frob-rel "
-        f"{out['worst_L']:.3e} > {_TOL:g} (solver picks: {out['kinds']})")
-    assert out["worst_zeta"] <= _TOL, (
-        f"charge ζ drifts across meshes: worst frob-rel "
-        f"{out['worst_zeta']:.3e} > {_TOL:g} (solver picks: {out['kinds']})")
-
-
 def test_zeta_fit_charge_rank_truncate_is_mesh_invariant_and_conditions():
-    """Rank-truncation (the DEFAULT charge ζ-solve): on a near-singular
-    over-complete CCT (κ≈1e13) the pseudo-inverse factor B and ζ are
-    bit-identical across CPU meshes, and rank-truncation conditions the
-    solve where plain Cholesky amplifies (‖ζ_chol‖/‖ζ_rt‖ ≫ 1)."""
+    """Rank-truncation (the charge ζ-solve): on a near-singular over-complete
+    CCT (κ≈1e13) the pseudo-inverse factor B and ζ are bit-identical across
+    CPU meshes, and ζ solves the pseudo-inverse relation on range(C)."""
     out = _run_worker("worker_rt")
     if "skip" in out:
         pytest.skip(f"rank-truncate gate: {out['skip']}")
@@ -356,21 +239,17 @@ def test_zeta_fit_charge_rank_truncate_is_mesh_invariant_and_conditions():
         f"rank-truncated ζ drifts across meshes: worst frob-rel "
         f"{out['worst_zeta']:.3e} > {_TOL:g} (solver picks: {out['kinds']})")
     # ζ solves the pseudo-inverse relation on the range of C to the ULP floor.
+    # A full solve would miss it by ‖(I − P_range) Z‖, which is O(1) here.
     assert out["range_residual"] <= 1e-8, (
         f"rank-truncated ζ does not reconstruct Z on range(C): "
         f"residual {out['range_residual']:.3e}")
-    # The whole point: plain Cholesky amplifies the near-null modes by the
-    # inverse of the ~1e-13 floored eigenvalues; rank-truncation drops them.
-    assert out["amp_chol_over_rt"] >= 1e3, (
-        f"rank-truncation did not condition the near-singular solve: "
-        f"‖ζ_chol‖/‖ζ_rt‖ = {out['amp_chol_over_rt']:.3e} (expected ≫ 1)")
 
 
 def test_qparallel_execution_is_bit_identical_to_replicated():
     """The folded q-parallel execution of the replicated charge factor
     (``LORRAX_ZETA_QPARALLEL``, ``isdf.core._factor_c_q_replicated_qparallel``)
-    returns EXACTLY the bits of the all-ranks execution on every mesh, in
-    both charge modes, including a non-device-dividing nq and a padded μ
+    returns EXACTLY the bits of the all-ranks execution on every mesh,
+    including a non-device-dividing nq and a padded μ
     extent.  This is what makes the fold a SCHEDULE of the replicated plan
     rather than a third resolution of the factor family — the moment this
     gate needs a tolerance, it has become a plan and must be re-argued."""
@@ -401,25 +280,16 @@ def test_rank_truncate_refuses_above_the_replication_cap():
         pytest.skip(f"cap gate: {default['skip']}")
     assert default["cap_gib"] == pytest.approx(4.0), \
         f"default replication cap changed: {default['cap_gib']} GiB"
-    # CONTRACT UPDATE (J.1): the cap gates ONE q-BATCH, not the whole stack —
+    # The cap gates ONE q-BATCH, not the whole stack —
     # factor_c_q_replicated_batched bounds the true per-rank transient at the
     # cap regardless of nq, so both historical stacks (ibz74 6.42 GiB,
-    # fullbz144 12.48 GiB TOTAL) now legitimately resolve to the replicated
-    # rank-truncate route under the DEFAULT cap.  The protective intent is
-    # unchanged: the route must be rank_truncate (never a silent downgrade to
-    # a plain-Cholesky factor — the 2026-07-21 physics destroyer); the
-    # explicit-cholesky alternative still resolves to the distributed factor.
-    expected_cholesky = ("sharded_cholesky" if default["mesh_is_cpu"]
-                         else "cusolvermp_cholesky")
+    # fullbz144 12.48 GiB TOTAL) resolve to the replicated rank-truncate
+    # route under the DEFAULT cap.
     for tag in ("ibz74", "fullbz144"):
         assert default[f"{tag}_rank_truncate"] == "replicated_rank_truncate", (
             f"{tag} must resolve to replicated_rank_truncate under the "
-            f"per-BATCH cap contract (J.1), got "
+            f"per-BATCH cap contract, got "
             f"{default[f'{tag}_rank_truncate']!r}")
-        assert default[f"{tag}_cholesky"] == expected_cholesky, (
-            f"{tag} cholesky resolved to {default[f'{tag}_cholesky']!r}, "
-            f"expected {expected_cholesky!r} "
-            f"(mesh_is_cpu={default['mesh_is_cpu']})")
 
     # The env knob still parses and overrides (it now sets the batch bound).
     raised = _run_worker("worker_cap",
@@ -428,8 +298,6 @@ def test_rank_truncate_refuses_above_the_replication_cap():
         "LORRAX_ZETA_REPLICATE_CAP_GIB did not raise the cap"
     for tag in ("ibz74", "fullbz144"):
         assert raised[f"{tag}_rank_truncate"] == "replicated_rank_truncate"
-
-
 
 
 def test_distributed_tier_collective_payload_is_bounded(monkeypatch):
@@ -489,10 +357,8 @@ def test_distributed_tier_collective_payload_is_bounded(monkeypatch):
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "worker_cap":
         sys.exit(_worker_cap())
-    if len(sys.argv) > 1 and sys.argv[1] == "worker":
-        sys.exit(_worker())
     if len(sys.argv) > 1 and sys.argv[1] == "worker_rt":
         sys.exit(_worker_rank_truncate())
     if len(sys.argv) > 1 and sys.argv[1] == "worker_qpar":
         sys.exit(_worker_qparallel())
-    sys.exit(test_zeta_fit_charge_factor_solve_is_mesh_invariant() or 0)
+    sys.exit(test_zeta_fit_charge_rank_truncate_is_mesh_invariant_and_conditions() or 0)

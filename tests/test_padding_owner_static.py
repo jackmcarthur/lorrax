@@ -146,13 +146,6 @@ DIVISIBILITY_REFUSAL_EXCEPTIONS = {
         "reason": "square-mesh backend topology, not a padded array axis",
         "follow_up": "distrib_la owns rectangular-backend enablement",
     },
-    ("src/isdf/core.py", "_resolve_solver_kind_transverse"): {
-        "reason": (
-            "padding the indefinite near-null transverse LU is not inert; "
-            "the owner tag is used to detect the requested carrier"
-        ),
-        "follow_up": "rank_truncate is the padded distributed alternative",
-    },
     ("src/gw/isdf_fitting.py", "add_pad_diagonal_sharded"): {
         "reason": "authenticates the runtime-padded mu carrier before a tile-local diagonal",
         "follow_up": "use authenticate_padded_axis when the zeta-fit owner next edits it",

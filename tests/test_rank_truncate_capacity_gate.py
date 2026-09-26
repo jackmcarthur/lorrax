@@ -5,29 +5,19 @@
 when one q-batch of it exceeds the per-batch cap, naming the ceiling
 ``n_mu <= sqrt(cap/16)``.
 
-Pure host: builds a 1x1 CPU mesh, no GPU, no FFI.  SCOPE: a RESOLVER
-contract test.  It does not run a ζ fit.
+Pure host: no mesh, no GPU, no FFI.  SCOPE: a RESOLVER contract test.  It
+does not run a ζ fit.
 """
 import math
 
-import numpy as np
 import pytest
-
-import jax
-from jax.sharding import Mesh
 
 import isdf.core as core
 from isdf.core import (
     _rank_truncate_capacity_error,
     _replicate_rank_truncate_ok,
-    _resolve_solver_kind_charge,
+    _resolve_solver_kind,
 )
-
-
-@pytest.fixture(scope="module")
-def mesh11():
-    d = jax.devices()[:1]
-    return Mesh(np.array(d).reshape(1, 1), ("x", "y"))
 
 
 def _mu_ceiling() -> int:
@@ -51,13 +41,9 @@ def test_the_predicate_decides_fit_or_refuse():
     assert _replicate_rank_truncate_ok(_NQ, None) is False
 
 
-def test_the_charge_resolver_refuses_one_oversized_q_batch(mesh11,
-                                                          monkeypatch):
-    monkeypatch.setattr(core, "_resolve_linalg_backend", lambda *a, **k: None)
+def test_the_charge_resolver_refuses_one_oversized_q_batch():
     with pytest.raises(ValueError) as ch:
-        _resolve_solver_kind_charge(
-            mesh11, "auto", n_rmu=_MU_TOO_BIG, nq=_NQ,
-            charge_zeta_solve="rank_truncate")
+        _resolve_solver_kind(0, "auto", n_rmu=_MU_TOO_BIG, nq=_NQ)
     msg = str(ch.value)
     assert "charge_zeta_solve='rank_truncate'" in msg
     assert f"n_mu={_MU_TOO_BIG}" in msg
