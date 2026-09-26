@@ -38,7 +38,7 @@ from common.collectives import (all_gather_processes, gather_to_host,
                                 process_count, process_rank)
 from common.units import RYD_TO_EV
 from gw.minimax_screening import MinimaxNodes
-from gw.mpa.sigma_windows import SharedSigmaWindow
+from gw.mpa.sigma_windows import SharedSigmaWindow, sigma_pole_edges
 from gw.ppm_windows import _SigmaWindow
 from gw.scissor import sc_state_pad_ev
 from minimax import (
@@ -200,33 +200,51 @@ def _product_geometry(branches, eta, edge_factor):
         excursion = max(excursion, -min(float(np.min(energy)), 0.0))
         state_rows.append((shape, energy, indices))
     state_edge = float(edge_factor) * eta
+    edges = sigma_pole_edges(branches, state_edge, excursion)
     return state_rows, {
         "omega_max_ry": omega_max,
         "state_edge_ry": state_edge,
-        "pole_edge_ry": omega_max + state_edge + excursion,
+        "pole_edges_ry": edges,
+        "omega_cut_ry": edges["near"],
         "negative_state_excursion_ry": excursion,
         "edge_factor": float(edge_factor),
     }
 
 
-def _state_products(branch, state_edge, pole_edge):
-    """The sole owner of the three-window Cartesian partition."""
+def _state_products(branch, state_edge, edges):
+    """The sole owner of the product partition of one branch.
+
+    Rows are ``(name, state_lo, state_hi, pole_selector, pole_lo, pole_hi,
+    omega_lo, omega_hi)``: half-open ``(lo, hi]`` state and pole intervals and
+    ``[lo, hi)`` in ``|ω|``.  A crossing branch (``ω≥E_F cond``, ``ω<E_F val``)
+    splits states and poles at its half's edge.  A non-crossing branch keeps
+    its bulk (``E > edge``) whole; its resonant-side states split at the
+    ``|ω|`` cut ``near``: above it every denominator is at least ``edge`` from
+    zero (``omega_tail``, one sign-definite window over all poles), below it
+    the poles split at ``near``.
+
+    Tempting, and why not: one resonant window over every ``|ω|`` of a
+    non-crossing branch.  Its long side is ``ω_max + Ω_max``, a crossing rule
+    over the cover-grown range for a sliver of excursion states near
+    ``ω = 0`` (Na 8^3 map 0: 1682 -> 39 pairs, fit 477 -> 2 s, claim 2821).
+    """
     crossing = ((branch.space == "cond" and not branch.neg_omega_half)
                 or (branch.space == "val" and branch.neg_omega_half))
+    inf = np.inf
     if crossing:
+        edge = edges["neg" if branch.neg_omega_half else "pos"]
+        half = "neg" if branch.neg_omega_half else "pos"
         return (
-            ("resonant", -np.inf, pole_edge, "shallow", 0.0, pole_edge),
-            ("state_tail", pole_edge, np.inf,
-             "shallow", 0.0, pole_edge),
-            ("pole_tail", -np.inf, np.inf,
-             "deep", pole_edge, np.inf),
+            ("resonant", -inf, edge, f"shallow:{half}", 0.0, edge, 0.0, inf),
+            ("state_tail", edge, inf, f"shallow:{half}", 0.0, edge, 0.0, inf),
+            ("pole_tail", -inf, inf, f"deep:{half}", edge, inf, 0.0, inf),
         )
+    near = edges["near"]
     return (
-        ("bulk", state_edge, np.inf, "all", 0.0, np.inf),
-        ("resonant", -np.inf, state_edge,
-         "shallow", 0.0, pole_edge),
-        ("pole_tail", -np.inf, state_edge,
-         "deep", pole_edge, np.inf),
+        ("bulk", state_edge, inf, "all", 0.0, inf, 0.0, inf),
+        ("resonant", -inf, state_edge, "shallow:near", 0.0, near, 0.0, near),
+        ("pole_tail", -inf, state_edge, "deep:near", near, inf, 0.0, near),
+        ("omega_tail", -inf, state_edge, "all", 0.0, inf, near, inf),
     )
 
 
@@ -1617,23 +1635,27 @@ def plan_sigma_windows(
             "live_state_count": int(raw_energy.size),
             "plan_start": len(specs), "windows": [],
         }
-        for (name, state_lo, state_hi, selector,
-             pole_lo, pole_hi) in _state_products(
-                 branch, geometry["state_edge_ry"], geometry["pole_edge_ry"]):
+        omega_abs = np.asarray(branch.omega_abs, np.float64)
+        for (name, state_lo, state_hi, selector, pole_lo, pole_hi,
+             omega_lo, omega_hi) in _state_products(
+                 branch, geometry["state_edge_ry"], geometry["pole_edges_ry"]):
             local = np.nonzero(
                 (raw_energy > state_lo) & (raw_energy <= state_hi))[0]
+            owned = np.nonzero(
+                (omega_abs >= omega_lo) & (omega_abs < omega_hi))[0]
             pole_indices, pole_stats = _pole_rows(summaries, selector)
-            if not local.size or not pole_indices.size:
+            if not local.size or not owned.size or not pole_indices.size:
                 continue
             states = raw_energy[local]
             spec = make_sigma_box_spec(
-                name=f"{branch.tag}:{name}", frequencies=frequencies,
+                name=f"{branch.tag}:{name}", frequencies=frequencies[owned],
                 states=states, pole_stats=pole_stats,
                 pole_sign=pole_sign, eta_ry=eta)
             if certificate_pole_summaries is not None:
                 _, union_stats = _pole_rows(certificate_pole_summaries, selector)
                 union = (make_sigma_box_spec(
-                    name=spec["name"], frequencies=frequencies, states=states,
+                    name=spec["name"], frequencies=frequencies[owned],
+                    states=states,
                     pole_stats=union_stats, pole_sign=pole_sign, eta_ry=eta)
                     if union_stats else None)
                 if (union is not None and union["kind"] == spec["kind"]
@@ -1649,13 +1671,15 @@ def plan_sigma_windows(
                     spec["sc_support_pole_extent"] = (
                         support_lo, support_hi, 0.0, 0.0)
             if (fixed_rule_session is not None
-                    and name in ("bulk", "state_tail", "pole_tail")
+                    and name in ("bulk", "state_tail", "pole_tail",
+                                 "omega_tail")
                     and geometry["state_edge_ry"] > 0.0
                     and (fixed_pole_support is not None or all(
                         lo >= 0.0 and gamma_lo == gamma_hi == 0.0
                         for lo, _, gamma_lo, gamma_hi in pole_stats))):
                 # The selectors guarantee this gap for positive real poles,
-                # including scalar W without a sector treatment ceiling.
+                # including scalar W without a sector treatment ceiling
+                # (omega_tail: its |omega| cut follows this map's excursion).
                 # Cover future selector members, not only initial samples.
                 spec["sc_selector_gap_ry"] = (
                     _BOX_SIGN_FRACTION * geometry["state_edge_ry"])
@@ -1666,8 +1690,9 @@ def plan_sigma_windows(
                 "state_interval": (float(state_lo), float(state_hi)),
                 "pole_indices": pole_indices,
                 "pole_bounds": (float(pole_lo), float(pole_hi)),
-                "omega_abs": np.asarray(branch.omega_abs, np.float64),
-                "omega_idx": positions,
+                "omega_interval": (float(omega_lo), float(omega_hi)),
+                "omega_abs": omega_abs[owned],
+                "omega_idx": positions[owned],
                 "branch_report": report,
             })
             specs.append(spec)
@@ -1734,6 +1759,7 @@ def plan_sigma_windows(
             "name": spec["name"], "kind": spec["kind"],
             "state_interval_ry": list(spec["state_interval"]),
             "pole_interval_ry": list(spec["pole_bounds"]),
+            "omega_abs_interval_ry": list(spec["omega_interval"]),
             "pole_indices": spec["pole_indices"].tolist(),
             "raw_real_support_ry": list(spec["raw_real_support"]),
             "box_ry": list(spec["box"]), "rule_box_ry": list(fit["rule_box"]),
