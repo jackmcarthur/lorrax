@@ -626,6 +626,12 @@ def shared_pole_static_wc(handle, meta, *, mesh_xy, layout="face"):
     packed centroid order. Every array is an all-P tile. The synthesis
     admits its factors and panel workspace under ``w0.*`` ledger stages; the
     two full-q outputs (W_+ and the sum) are one more reservation of 2U.
+
+    Validated (claim 2856, runs/CrI3/504_w0persist_20260926): on CrI3
+    8x8x1 SOC (mu 1446, 10 IBZ q) ``V + Wc(0)`` matches the GN-PPM Dyson
+    W(0) to 1.47e-5 max-relative and 1.99e-5 Frobenius in W0, 2.3e-5
+    Frobenius in Wc (4e-6 at Gamma), with identical V and heads.  The BSE
+    E_1..E_5 on the two restarts agree within 0.07 meV.
     """
     from file_io.shared_pole_store import (open_shared_pole_model,
                                            validate_shared_pole_model)
