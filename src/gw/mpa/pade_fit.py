@@ -407,34 +407,9 @@ def _x_normalisation(z_samples):
     return x, x_max
 
 
-def _backward_error(A, rhs, y):
-    """``||A y - rhs|| / (||A|| ||y|| + ||rhs||)`` on the ROW-EQUILIBRATED
-    system -- the relative perturbation of ``(A, rhs)`` for which the
-    computed ``y`` is exact.
-
-    ONE DEFINITION, TWO CALLERS, and that is the point.  The fit reports
-    this beside the condition number it already computes, and
-    ``diagnostics.solve_conditioning`` reads the fit's value rather than
-    recomputing it, so the two agree by construction instead of by an
-    argument about operand order.  Retiring that second computation is
-    the perf lane's proposed ``pade_fit`` diff (MPA_16GPU_PLAN
-    §FIT-EFFICIENCY), folded here; it removes a whole redundant fit and
-    a whole redundant solve per element, because the only reason
-    ``solve_conditioning`` existed as a separate pass was that this
-    number was not returned.
-    """
-
-    row_norm = jnp.linalg.norm(A, axis=1)
-    row_norm = jnp.where(row_norm > 0, row_norm, 1.0)
-    A_n = A / row_norm[:, None]
-    rhs_n = rhs / row_norm
-    num = jnp.linalg.norm(A_n @ y - rhs_n)
-    den = jnp.linalg.norm(A_n) * jnp.linalg.norm(y) + jnp.linalg.norm(rhs_n)
-    return num / jnp.where(den > 0, den, 1.0)
-
-
 def _matrix_backward_error(L, sL, X):
-    """The same quantity for the Loewner reduction ``L X = sL``.
+    """Relative backward error ``||L X - sL|| / (||L|| ||X|| + ||sL||)`` of
+    the Loewner reduction ``L X = sL``.
 
     Not row-equilibrated: the Loewner matrix is not a cross-multiplied
     system whose rows span decades of ``|W|``, it is a divided-difference

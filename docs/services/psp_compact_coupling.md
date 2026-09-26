@@ -9,8 +9,8 @@ and no `total_R × total_R` operand; every within-block spin and
 radial-projector off-diagonal is kept. Non-contiguous channel rows or an
 inconsistent SOC block shape raise `ValueError`.
 
-`setup_H_k(..., compact_vnl=True)` and `setup_H_k_from_kvec(...,
-compact_vnl=True)` place this pytree in `HamiltonianK.vnl_E`; pass it
+`setup_H_k_from_kvec(..., compact_vnl=True)` places this pytree in
+`HamiltonianK.vnl_E`; pass it
 unchanged to the Hamiltonian applications. The default (`compact_vnl=False`)
 is the dense array, for consumers that coerce or inspect `vnl_E` as an array,
 including Sternheimer orchestration. `apply_projector_coupling` is the one

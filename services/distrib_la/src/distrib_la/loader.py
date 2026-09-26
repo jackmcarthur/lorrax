@@ -87,32 +87,6 @@ class AbiMismatch(LibraryUnusable):
     """
 
 
-def _check_abi(lib: ctypes.CDLL, platform: str, path: str) -> None:
-    """Refuse a library whose handler signatures are not this package's.
-
-    Called IMMEDIATELY after ``CDLL`` and before any declaration or target
-    registration.  The ordering is the requirement: a mispaired library that
-    has already had its argtypes declared behaves normally until the first
-    call that crosses a changed signature.
-
-    Stamped-and-different REFUSES.  Unstamped ANNOUNCES once and proceeds — a
-    pre-2026-08-08 library is not known to be wrong, and refusing every one of
-    them would break the worktrees that pin them today to fix nothing.
-    ``LORRAX_FFI_ABI_STRICT=1`` closes the ratchet.
-
-    :func:`probe_target` still never raises: it converts this into a
-    ``ProbeResult(False, <this whole message>)``, so an auto-policy sees the
-    backend as unavailable and any refusal printed to a human quotes the text
-    below verbatim.
-    """
-    _native.check_abi(
-        lib, platform, path, expected_abi=LORRAX_FFI_ABI_VERSION,
-        abi_symbols=_ABI_SYMBOLS,
-        build_hint=str(_PLATFORMS[platform]["build_hint"]),
-        strict_unstamped=os.environ.get("LORRAX_FFI_ABI_STRICT", "") == "1",
-        mismatch_cls=AbiMismatch)
-
-
 _LIBS: Dict[str, ctypes.CDLL] = {}
 #: platform -> the .so path actually loaded (for diagnostics).
 _LIB_PATHS: Dict[str, str] = {}

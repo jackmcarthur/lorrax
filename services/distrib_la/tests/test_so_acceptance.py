@@ -786,14 +786,22 @@ def test_a_stamped_old_library_produces_the_named_refusal(tmp_path):
     a generic "could not load".
 
     A twenty-line .so rather than monkeypatching the check, because the thing
-    under test is whether the check RUNS on a library the loader actually
-    opened, in the right ORDER: before argtypes are declared and before any
-    target is registered.  A monkeypatched twin would pass with the call site
-    in the wrong place.
+    under test is whether the check RUNS on a library the loader's own door
+    (``lxkit.native_provider.open_and_attest``, called with the loader's ABI
+    table) actually opened.  A monkeypatched twin would pass with the call
+    site in the wrong place.
     """
-    import ctypes
-    from distrib_la.loader import (AbiMismatch, LORRAX_FFI_ABI_VERSION,
-                                   _check_abi)
+    from lxkit import native_provider
+    from lxkit.probe import LibraryUnusable
+    from distrib_la import loader
+    from distrib_la.loader import AbiMismatch, LORRAX_FFI_ABI_VERSION
+
+    def attest(path):
+        return native_provider.open_and_attest(
+            path, platform="cpu", expected_abi=LORRAX_FFI_ABI_VERSION,
+            abi_symbols=loader._ABI_SYMBOLS,
+            build_hint=str(loader._PLATFORMS["cpu"]["build_hint"]),
+            unusable_cls=LibraryUnusable, mismatch_cls=AbiMismatch)
     cc = shutil.which("cc") or shutil.which("gcc")
     if cc is None:
         pytest.skip("no C compiler on PATH to build the stale-ABI twin; "
@@ -809,9 +817,8 @@ def test_a_stamped_old_library_produces_the_named_refusal(tmp_path):
                            text=True, timeout=180)
     assert build.returncode == 0, f"could not build the twin:\n{build.stdout}"
 
-    lib = ctypes.CDLL(str(lib_path))
     with pytest.raises(AbiMismatch) as excinfo:
-        _check_abi(lib, "cpu", str(lib_path))
+        attest(lib_path)
     msg = str(excinfo.value)
     assert f"speaks abi={stale}" in msg, msg
     assert f"this tree speaks abi={LORRAX_FFI_ABI_VERSION}" in msg, msg
@@ -819,7 +826,7 @@ def test_a_stamped_old_library_produces_the_named_refusal(tmp_path):
         "the refusal must name the rebuild command, or it is the same "
         f"dead end as the runtime error it replaces:\n{msg}")
     # ...and the OTHER direction: a library stamping the current version is
-    # accepted, so this cell is not passing because _check_abi refuses
+    # accepted, so this cell is not passing because the check refuses
     # everything.
     ok_src = tmp_path / "ok_abi.c"
     ok_src.write_text("int lorrax_ffi_host_abi_version(void) { return %d; }\n"
@@ -827,4 +834,4 @@ def test_a_stamped_old_library_produces_the_named_refusal(tmp_path):
     ok_path = tmp_path / "libok_abi.so"
     assert subprocess.run([cc, "-shared", "-fPIC", "-o", str(ok_path),
                            str(ok_src)], timeout=180).returncode == 0
-    _check_abi(ctypes.CDLL(str(ok_path)), "cpu", str(ok_path))
+    attest(ok_path)

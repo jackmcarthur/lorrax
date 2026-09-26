@@ -113,7 +113,7 @@ contracts, equations, shapes, and run policy remain on the owner pages in the
 | Module | Role |
 |---|---|
 | `__init__.py` | Package marker for centroid selection. |
-| `charge_density.py` | Builds the sampling charge density. |
+| `charge_density.py` | Averages a grid field over the space group (`symmetrize_on_grid`). |
 | `distribution.py` | Distributes centroid work and selected points. |
 | `kmeans_cli.py` | Command-line entry point for centroid generation. |
 | `kmeans_isdf.py` | Implements centroid selection and refinement. |
