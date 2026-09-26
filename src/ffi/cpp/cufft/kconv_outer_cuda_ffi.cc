@@ -1,6 +1,6 @@
 // kconv_outer_cuda_ffi.cc -- the k-convolution family's outer-product load (the BSE W term).
 //
-//   U[k,a,x,b,y] = s * FFT_k( IFFT_k T[.,a,x,b,y] * V[k,x,y] ),
+//   U[k,a,x,b,y] = s * FFT_k( IFFT_k T[.,a,x,b,y] * V[x,y,k] ),   V k-MINOR (the W_R tile as built)
 //   T[k,a,x,b,y] = sum_K L[k,a,x,K] * R[k,K,b,y]          (formed on the load, never stored)
 //                  (conj(R) with the attribute conj_r = 1: the BSE right leg is conj(psi_v),
 //                   read from psi_v itself, so no conjugated copy is made)
@@ -122,30 +122,41 @@ extern "C" __global__ void __launch_bounds__(LRX_THREADS, LRX_MINB) lrx_kconv_ou
     const long long ucols = g.na * g.mx * g.nb * g.my;           // U columns per k
     const long long rk = g.nb * g.my;                             // R stride between K rows
     const long long pairs = g.na * g.nxb;
+    // 32-bit offsets from per-tile 64-bit bases: every operand holds < 2^31 elements (the handler
+    // checks), so only the bases need 64 bits -- fewer live registers at the 64-register cap.
+    const int kl = (int)(g.na * g.mx * KK), ku = (int)ucols;
+    const int nbmy = (int)(g.nb * g.my), rkk = (int)rk;
     for (long long it = blockIdx.x; it < g.items; it += gridDim.x) {
         const long long grp = it % g.ngrp, yb_ = it / g.ngrp;
-        const long long b = yb_ % g.nb, y0 = (yb_ / g.nb) * YB;
-        const long long yr = y0 + gr;                             // this lane's B column
-        const bool yok = yr < g.my;
+        const int b = (int)(yb_ % g.nb), y0 = (int)(yb_ / g.nb) * YB;
+        const int ylim = min(YB, (int)g.my - y0);
+        const bool yok = gr < ylim;
+        const double2* rb = reinterpret_cast<const double2*>(R + (long long)b * g.my + y0 + gr);
         const long long p0 = grp * g.per, p1 = min(pairs, p0 + g.per);
         for (long long p = p0; p < p1; ++p) {
-            const long long a = p % g.na, x0 = (p / g.na) * XB;
-            const long long xr = x0 + gr;                         // this lane's A row
-            const bool xok = xr < g.mx;
-            // Load: T[k, a, x, b, y] = sum_K L[k, a, x, K] R[k, K, b, y] on the tensor cores.
+            const int a = (int)(p % g.na), x0 = (int)(p / g.na) * XB;
+            const int xlim = min(XB, (int)g.mx - x0);
+            const bool xok = gr < xlim;
+            const double2* lb = reinterpret_cast<const double2*>(L + ((long long)a * g.mx + x0 + gr) * KK);
+            // Load: T[k, a, x, b, y] = sum_K L[k, a, x, K] R[k, K, b, y] on the tensor cores.  With
+            // conj_r the pair (-Li)(-Ri) is spelled Li Ri: IEEE products ignore a shared sign flip.
             for (int k = warp; k < NK; k += NWARP) {
-                const double2* lp = reinterpret_cast<const double2*>(L + (((long long)k * g.na + a) * g.mx + xr) * KK);
-                const double2* rp = reinterpret_cast<const double2*>(R + (long long)k * KK * rk + b * g.my + yr);
+                const double2* lp = lb + k * kl;
+                const double2* rp = rb + k * KK * rkk;
                 double re0 = 0.0, re1 = 0.0, im0 = 0.0, im1 = 0.0;
 #pragma unroll
                 for (int h = 0; h < KK / 4; ++h) {
                     const int q = 4 * h + tg;
                     const double2 lv = xok ? __ldg(lp + q) : make_double2(0.0, 0.0);
-                    const double2 rv = yok ? __ldg(rp + (long long)q * rk) : make_double2(0.0, 0.0);
-                    const double ri = g.conj_r ? -rv.y : rv.y;       // conj(R): the same value an
-                    lrx_dmma(re0, re1, lv.x, rv.x);                  // explicit conj would pass
-                    lrx_dmma(re0, re1, -lv.y, ri);
-                    lrx_dmma(im0, im1, lv.x, ri);
+                    const double2 rv = yok ? __ldg(rp + q * rkk) : make_double2(0.0, 0.0);
+                    lrx_dmma(re0, re1, lv.x, rv.x);
+                    if (g.conj_r) {
+                        lrx_dmma(re0, re1, lv.y, rv.y);
+                        lrx_dmma(im0, im1, lv.x, -rv.y);
+                    } else {
+                        lrx_dmma(re0, re1, -lv.y, rv.y);
+                        lrx_dmma(im0, im1, lv.x, rv.y);
+                    }
                     lrx_dmma(im0, im1, lv.y, rv.x);
                 }
                 lrx_c2 v0, v1;
@@ -155,27 +166,29 @@ extern "C" __global__ void __launch_bounds__(LRX_THREADS, LRX_MINB) lrx_kconv_ou
             }
             __syncthreads();
             lrx_kbox::transform3<NX, NY, NZ, TR, LRX_SM, fft_direction::inverse>(bank);
-            // Mid: the stored kernel V[k, x, y] (R space), mode 2's KernMid.
+            // Mid: the stored kernel V[x, y, k] (R space, k-MINOR: the caller's W_R tile as it is
+            // built, no transpose), mode 2's KernMid product.  k runs fastest across threads, so a
+            // warp reads 32 consecutive k of one (x, y) and walks one bank column.
+            const lrx_c2* vb = V + ((long long)x0 * g.my + y0) * NK;
             for (int i = threadIdx.x; i < TR * NK; i += blockDim.x) {
-                const int j = i % TR, k = i / TR;
-                const long long x = x0 + j / YB, yy = y0 + j % YB;
-                if (x < g.mx && yy < g.my) {
+                const int k = i % NK, j = i / NK, xi = j / YB, yi = j % YB;
+                if (xi < xlim && yi < ylim) {
                     lrx_c2* e = bank + j * GK::RS + GK::at(k);
-                    *e = lrx_mul(*e, V[((long long)k * g.mx + x) * g.my + yy]);
+                    *e = lrx_mul(*e, vb[(xi * (int)g.my + yi) * NK + k]);
                 }
             }
             __syncthreads();
             lrx_kbox::transform3<NX, NY, NZ, TR, LRX_SM, fft_direction::forward>(bank);
             // Store: mode 2's RowStore (v * scale), U k-leading (nk, na, mx, nb, my).
+            lrx_c2* ub = U + (((long long)a * g.mx + x0) * g.nb + b) * g.my + y0;
             for (int i = threadIdx.x; i < TR * NK; i += blockDim.x) {
-                const int j = i % TR, k = i / TR;
-                const long long x = x0 + j / YB, yy = y0 + j % YB;
-                if (x < g.mx && yy < g.my) {
+                const int j = i % TR, k = i / TR, xi = j / YB, yi = j % YB;
+                if (xi < xlim && yi < ylim) {
                     const lrx_c2 v = bank[j * GK::RS + GK::at(k)];
                     lrx_c2 w;
                     w.x = v.x * g.scale;
                     w.y = v.y * g.scale;
-                    U[(long long)k * ucols + ((a * g.mx + x) * g.nb + b) * g.my + yy] = w;
+                    ub[k * ku + xi * nbmy + yi] = w;
                 }
             }
             __syncthreads();
@@ -287,7 +300,7 @@ static ffi::Error build(int nkx, int nky, int nkz, int K, std::string_view mathd
     return ffi::Error::Success();
 }
 
-// L (nk, na, mx, K), R (nk, K, nb, my), V (nk, mx, my) -> U (nk, na, mx, nb, my), complex128.
+// L (nk, na, mx, K), R (nk, K, nb, my), V (mx, my, nk) -> U (nk, na, mx, nb, my), complex128.
 static ffi::Error KleadOuterConv(cudaStream_t stream, ffi::AnyBuffer L, ffi::AnyBuffer R, ffi::AnyBuffer V,
                                  ffi::Result<ffi::AnyBuffer> U, int64_t nkx, int64_t nky, int64_t nkz,
                                  double scale, int64_t conj_r, std::string_view mathdx_root,
@@ -305,11 +318,11 @@ static ffi::Error KleadOuterConv(cudaStream_t stream, ffi::AnyBuffer L, ffi::Any
     const int64_t nk = nkx * nky * nkz;
     auto ld = L.dimensions(), rd = R.dimensions(), vd = V.dimensions(), ud = U->dimensions();
     if (ld.size() != 4 || rd.size() != 4 || vd.size() != 3 || ud.size() != 5)
-        return bad("want L (nk,na,mx,K), R (nk,K,nb,my), V (nk,mx,my), U (nk,na,mx,nb,my)");
+        return bad("want L (nk,na,mx,K), R (nk,K,nb,my), V (mx,my,nk), U (nk,na,mx,nb,my)");
     const int64_t na = ld[1], mx = ld[2], K = ld[3], nb = rd[2], my = rd[3];
-    if (ld[0] != nk || rd[0] != nk || rd[1] != K || vd[0] != nk || vd[1] != mx || vd[2] != my ||
+    if (ld[0] != nk || rd[0] != nk || rd[1] != K || vd[0] != mx || vd[1] != my || vd[2] != nk ||
         ud[0] != nk || ud[1] != na || ud[2] != mx || ud[3] != nb || ud[4] != my)
-        return bad("want L (nk,na,mx,K), R (nk,K,nb,my), V (nk,mx,my), U (nk,na,mx,nb,my) with nk = nkx*nky*nkz");
+        return bad("want L (nk,na,mx,K), R (nk,K,nb,my), V (mx,my,nk), U (nk,na,mx,nb,my) with nk = nkx*nky*nkz");
     if (K < 4 || K % 4) {
         std::ostringstream os;
         os << "GATE mathdx-kconv-outer-rank: got K=" << K << "; want a positive multiple of 4 (the m8n8k4 "
@@ -317,6 +330,9 @@ static ffi::Error KleadOuterConv(cudaStream_t stream, ffi::AnyBuffer L, ffi::Any
         return bad(os.str());
     }
     if (na * mx * nb * my == 0) return ffi::Error::Success();
+    if (nk * na * mx * nb * my >= (int64_t(1) << 31) || nk * na * mx * K >= (int64_t(1) << 31) ||
+        nk * K * nb * my >= (int64_t(1) << 31))
+        return bad("an operand holds >= 2^31 elements (the load's 32-bit offsets); split the call");
     const Built* k = nullptr;
     if (ffi::Error e = build(static_cast<int>(nkx), static_cast<int>(nky), static_cast<int>(nkz),
                              static_cast<int>(K), mathdx_root, cubin_dir, &k);
@@ -356,7 +372,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Ctx<xla::ffi::PlatformStream<cudaStream_t>>()
         .Arg<xla::ffi::AnyBuffer>()   // L (nk, na, mx, K)
         .Arg<xla::ffi::AnyBuffer>()   // R (nk, K, nb, my)
-        .Arg<xla::ffi::AnyBuffer>()   // V (nk, mx, my), R space
+        .Arg<xla::ffi::AnyBuffer>()   // V (mx, my, nk), R space, k-minor
         .Ret<xla::ffi::AnyBuffer>()   // U (nk, na, mx, nb, my)
         .Attr<int64_t>("nkx")
         .Attr<int64_t>("nky")

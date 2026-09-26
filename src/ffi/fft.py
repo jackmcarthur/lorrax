@@ -1297,13 +1297,13 @@ def make_local_kconv_klead_outer(mesh: Mesh, kgrid, *, norm: str | None = "ortho
                                  mult: float = 1.0) -> Callable:
     """Rank-local ``fn(L, R, V_R, conj_r=False) -> U``: :func:`make_local_kconv_klead` of ``T = Σ_K L R``.
 
-    ``U = mult · fftn(ifftn(T) · V_R[:, None, :, None, :])`` with
-    ``T[k,a,x,b,y] = Σ_K L[k,a,x,K] R[k,K,b,y]`` for ``L`` ``(nk, a, mx, K)``, ``R``
-    ``(nk, K, b, my)``, ``V_R`` ``(nk, mx, my)`` and ``U`` ``(nk, a, mx, b, my)``.  CUDA: the
+    ``U = mult · fftn(ifftn(T) · V_R)`` with ``T[k,a,x,b,y] = Σ_K L[k,a,x,K] R[k,K,b,y]`` for
+    ``L`` ``(nk, a, mx, K)``, ``R`` ``(nk, K, b, my)``, ``V_R`` ``(mx, my, nk)`` k-MINOR -- the
+    W_R tile as the BSE builds it, so no transpose is made -- and ``U`` ``(nk, a, mx, b, my)``.  CUDA: the
     outer-product load (``kconv_outer_cuda_ffi.cc``) forms T in shared memory on the fp64
     tensor cores and never stores it; the transforms, the kernel multiply and the scaled store
     are mathdx mode 2's.  Its K sum reproduces XLA's batched ZGEMM of the same contraction bit
-    for bit (A100), so U equals ``make_local_kconv_klead(einsum(L, R), V_R)``.  ``conj_r`` (static)
+    for bit (A100), so U equals ``make_local_kconv_klead(einsum(L, R), moveaxis(V_R, -1, 0))``.  ``conj_r`` (static)
     reads ``conj(R)`` instead (the BSE right leg is a conjugated wavefunction; reading it from
     the wavefunction avoids a conjugated copy, bit for bit the explicit ``conj``).  K is zero-padded
     to a multiple of 4 (the m8n8k4 chunk; exact).  cpu: that composition on the plan route.
@@ -1329,7 +1329,8 @@ def make_local_kconv_klead_outer(mesh: Mesh, kgrid, *, norm: str | None = "ortho
     apply = make_local_kconv_klead(mesh, kg, norm=norm, mult=mult)
 
     def _plan(l, r, v_r, conj_r=False):
-        return apply(jnp.einsum("kaxK,kKby->kaxby", l, jnp.conj(r) if conj_r else r), v_r)
+        return apply(jnp.einsum("kaxK,kKby->kaxby", l, jnp.conj(r) if conj_r else r),
+                     jnp.moveaxis(v_r, -1, 0))
     return _plan
 
 
