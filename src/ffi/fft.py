@@ -185,8 +185,6 @@ KCONV_KLEAD_TARGET = "lorrax_mathdx_kconv_klead"
 #: Mode 2 with its T formed on the load as a rank-K outer-product sum (the BSE W term's encode):
 #: :func:`make_local_kconv_klead_outer`, cpp/cufft/kconv_outer_cuda_ffi.cc.
 KCONV_KLEAD_OUTER_TARGET = "lorrax_mathdx_kconv_klead_outer"
-#: The outer load keeps the right leg in registers: K <= this (the handler's kKMax).
-KCONV_OUTER_K_MAX = 16
 #: Modes 7/8 on the parent rows, with the conj-on-load partner and (mode 7) the output spin block.
 KCONV_KLEAD_UNFOLD_TARGET = "lorrax_mathdx_kconv_klead_unfold_xblock"
 KCONV_KLEAD_LORENTZ_TARGET = "lorrax_mathdx_kconv_klead_lorentz_conj"
@@ -1270,14 +1268,14 @@ def make_local_kconv_klead(mesh: Mesh, kgrid, *, norm: str | None = "ortho",
     return _plan
 
 
-def klead_outer_refusal(mesh: Mesh, kgrid, rank: int) -> str | None:
-    """``None`` when :func:`make_local_kconv_klead_outer` serves this mesh, grid and rank K, else why not.
+def klead_outer_refusal(mesh: Mesh, kgrid, optin: int | None = None) -> str | None:
+    """``None`` when :func:`make_local_kconv_klead_outer` serves this mesh and grid, else why not.
 
-    The outer load needs the handler in the loaded library, K <= ``KCONV_OUTER_K_MAX`` (a
-    register-resident leg), one thread per (k, y) (nk <= 256) and a k-box tile in shared memory
-    (the handler's own refusals name the last two).  A cpu mesh is always served (the plan route).
-    Callers that get a reason keep the unfused encode + :func:`make_local_kconv_klead` chain and
-    say so.
+    CUDA needs the handler in the loaded library and the load's 64-column k-box bank,
+    ``64·16·((nx·ny·(nz|1))|1)`` B, within the opt-in shared memory per block (the handler's
+    GATE mathdx-kconv-outer-tile; ``optin`` defaults to the device's attribute).  A cpu mesh
+    is always served (the plan route).  Callers that get a reason keep the unfused encode +
+    :func:`make_local_kconv_klead` chain and say so.
     """
     kg = _check_kgrid(kgrid, kconv_backend(mesh))
     if kconv_backend(mesh) != "mathdx":
@@ -1286,27 +1284,28 @@ def klead_outer_refusal(mesh: Mesh, kgrid, rank: int) -> str | None:
     ok, why = ffi_loader.probe_target(KCONV_KLEAD_OUTER_TARGET, "CUDA")
     if not ok:
         return f"no {KCONV_KLEAD_OUTER_TARGET} handler ({why})"
-    if not 1 <= int(rank) <= KCONV_OUTER_K_MAX:
-        return f"rank K={int(rank)} outside [1, {KCONV_OUTER_K_MAX}] (register-resident leg)"
-    if kg[0] * kg[1] * kg[2] > 256:
-        return f"nk={kg[0] * kg[1] * kg[2]} > 256 (one thread per (k, y) of a 256-thread block)"
+    have = _optin_smem_bytes() if optin is None else int(optin)
+    if have is None:
+        return "no CUDA driver to read the opt-in shared memory"
+    bank = 64 * 16 * ((kg[0] * kg[1] * (kg[2] | 1)) | 1)
+    if bank > have:
+        return f"the 64-column bank needs {bank} B; the device has {have} B of opt-in shared memory"
     return None
 
 
 def make_local_kconv_klead_outer(mesh: Mesh, kgrid, *, norm: str | None = "ortho",
-                                 mult: float = 1.0, yb: int = 0) -> Callable:
+                                 mult: float = 1.0) -> Callable:
     """Rank-local ``fn(L, R, V_R) -> U``: :func:`make_local_kconv_klead` of ``T = Σ_K L R``.
 
     ``U = mult · fftn(ifftn(T) · V_R[:, None, :, None, :])`` with
     ``T[k,a,x,b,y] = Σ_K L[k,a,x,K] R[k,K,b,y]`` for ``L`` ``(nk, a, mx, K)``, ``R``
     ``(nk, K, b, my)``, ``V_R`` ``(nk, mx, my)`` and ``U`` ``(nk, a, mx, b, my)``.  CUDA: the
-    outer-product load (``kconv_outer_cuda_ffi.cc``) forms T in shared memory and never stores
-    it; the transforms, the kernel multiply and the scaled store are mathdx mode 2's, so U
-    differs from ``make_local_kconv_klead(einsum(L, R), V_R)`` only in the order of the K sum.
-    cpu: that composition on the plan route.  ``yb`` picks the load's arm, a measurement dial
-    for the kernel's own bench: 0 (default) the fp64 tensor-core (DMMA) K-sum on an 8x8 tile,
-    K zero-padded to a multiple of 4; -1 the register-leg FMA arm at the handler's y width;
-    > 0 that arm at this y width.  Check :func:`klead_outer_refusal` first.
+    outer-product load (``kconv_outer_cuda_ffi.cc``) forms T in shared memory on the fp64
+    tensor cores and never stores it; the transforms, the kernel multiply and the scaled store
+    are mathdx mode 2's.  Its K sum reproduces XLA's batched ZGEMM of the same contraction bit
+    for bit (A100), so U equals ``make_local_kconv_klead(einsum(L, R), V_R)``.  K is zero-padded
+    to a multiple of 4 (the m8n8k4 chunk; exact).  cpu: that composition on the plan route.
+    Check :func:`klead_outer_refusal` first.
     """
     kg = _check_kgrid(kgrid, kconv_backend(mesh))
     nk = kg[0] * kg[1] * kg[2]
@@ -1314,11 +1313,11 @@ def make_local_kconv_klead_outer(mesh: Mesh, kgrid, *, norm: str | None = "ortho
     if kconv_backend(mesh) == "mathdx":
         _require_target(KCONV_KLEAD_OUTER_TARGET, "CUDA")
         attrs = dict(nkx=np.int64(kg[0]), nky=np.int64(kg[1]), nkz=np.int64(kg[2]),
-                     scale=np.float64(scale), yb=np.int64(yb))
+                     scale=np.float64(scale))
 
         def _mathdx(l, r, v_r):
             shape = (l.shape[0], l.shape[1], l.shape[2], r.shape[2], r.shape[3])
-            pad = -l.shape[3] % 4 if yb in (0, -2) else 0   # the DMMA arm's 4-wide K chunks
+            pad = -l.shape[3] % 4
             if pad:
                 l = jnp.pad(l, ((0, 0), (0, 0), (0, 0), (0, pad)))
                 r = jnp.pad(r, ((0, 0), (0, pad), (0, 0), (0, 0)))

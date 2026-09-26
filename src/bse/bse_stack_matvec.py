@@ -343,15 +343,16 @@ def _outer_legs_B(Xb_b, psi_c_Y, psi_v_X):
 
 
 def _make_outer_router(mesh_xy, kgrid):
-    """``route(rank) -> conv | None``: the outer door when it serves this rank K, else None.
+    """``route(rank) -> conv | None``: the outer door when it serves this mesh and grid, else None.
 
-    Decided at trace time from the operand shapes and announced once per (route, K).
+    Decided at trace time and announced once per (route, K); K is the leg rank the call
+    will pass (min(n_c, n_v), doubled for the fused coupling pair).
     """
     from ffi.gate import announce_once
     doors = {}
 
     def route(rank):
-        why = klead_outer_refusal(mesh_xy, kgrid, rank)
+        why = klead_outer_refusal(mesh_xy, kgrid)
         announce_once(("bse", "w_term_route", rank, why is None),
                       "[bse] W term: " + ("outer-product load (T never stored)" if why is None
                                           else "XLA encode + k-conv: " + why)

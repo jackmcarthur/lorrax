@@ -6,23 +6,29 @@
 // Mode 2 of kconv_mathdx_cuda_ffi.cc (the k-leading stored-kernel convolution on the k-box
 // stage) with its T operand replaced by the rank-K sum the BSE encode builds.  The BSE T is
 // 2.15 GB per rank per trial on CrI3 8x8 (mu 1448 at P4) and its encode has K = min(n_c, n_v)
-// (8 to 14): a ZGEMM that writes T to HBM at ~7 flop/B, then the convolution reads it back.
-// Here T exists only in shared memory: the load forms it from the two ISDF legs and the
-// transforms, the kernel multiply and the scaled store are mode 2's (kbox_stage.cuh transform3,
-// the family's lrx_mul, the store-side scale), so U differs from the XLA encode + mode 2 chain
-// only by the order of the K sum (round-off class).
+// (8 to 14): a ZGEMM that writes T to HBM at ~7 flop/B, which the convolution then reads back.
+// Here T exists only in shared memory.  The transforms, the kernel multiply and the scaled
+// store are mode 2's (kbox_stage.cuh transform3, the family's lrx_mul, the store-side scale).
+// The K sum runs on the fp64 tensor cores (mma.m8n8k4.f64) as Re += Lr Rr - Li Ri,
+// Im += Lr Ri + Li Rr per 4-wide K chunk, in K order: measured bit for bit equal to XLA's
+// batched ZGEMM of the same contraction (A100, cuBLAS DMMA), so U equals the XLA encode +
+// mode 2 chain exactly (BSEMAX, 2026-09-26).
 //
-// Tile.  A block holds TR = XB * YB columns: an XB x YB box of (x, y) at one (a, b).  Its
-// threads are NK * YB, one (k, y) each: a thread keeps R[k, :, b, y] (K complex values) in
-// registers for the whole work item and forms its XB columns at k from L[k, a, x, :] (L1-served:
-// the YB threads of one k read the same K-run).  A work item is (y block, b, group of (x block,
-// a) pairs): R is read once per item.  The na x nb visits of one V tile are adjacent in time (a
-// fastest inside an item, b fastest across items), so V leaves HBM about once and U is written
-// once; L (~12 MB) and R stay L2-resident, L is re-read from L2 once per (b, y block).
+// Tile.  A block holds 64 columns: an 8 x 8 box of (x, y) at one (a, b), one m8n8 block per k.
+// Warp w forms T at k = w, w + 16, ...: each lane reads one complex L[k, a, x0 + lane/4, K]
+// and one R[k, K, b, y0 + lane/4] per chunk straight from global memory (the legs, ~12 MB
+// each, are L2-resident; no shared staging), so shared memory is the k-box bank alone and two
+// 512-thread blocks share an A100 SM.  A work item is (y block, b, group of (x block, a)
+// pairs); the na x nb visits of one V tile are adjacent in time (a fastest inside an item, b
+// fastest across items), so V leaves HBM about once and U is written once.
 //
-// Limits (named refusals; the router routes such a shape to the unfused chain):
-// K <= kKMax (register-resident leg), NK * YB <= 512 threads, the tile in opt-in shared memory,
-// every axis <= 40 (the fp64 cuFFTDx thread FFT).  complex128 only.
+// Measured alternatives (CrI3 per-rank shape, warm, A100; runs/CrI3/500_bsemax_20260926):
+// an fp64-FMA load with the R leg register-resident (one thread per (k, y)) ran 5.44-6.4 ms
+// against this arm's 4.70 ms (25% occupancy); a 4 x 8 tile at four blocks/SM 5.32 ms.
+//
+// Limits (named refusals; ffi.fft.klead_outer_refusal mirrors them and routes such a shape to
+// the unfused chain): the 64-column bank in opt-in shared memory, every axis <= 40 (the fp64
+// cuFFTDx thread FFT), K a multiple of 4 (the door zero-pads), complex128 only.
 //
 // The NVRTC build, the disk cache and the version keying are common/nvrtc_build.h's, exactly
 // as the family's (the same mathdx toolchain headers enter the key).
@@ -52,14 +58,14 @@ namespace lorrax_ffi::kconv_outer {
 namespace ffi = ::xla::ffi;
 
 static constexpr int kAxisMax = 40;        // cuFFTDx fp64 thread-FFT limit
-static constexpr int kKMax = 16;           // register-resident right leg
-static constexpr int kThreadsMax = 512;
+static constexpr int kThreads = 512;       // 16 warps; one line per thread in each axis pass
+static constexpr int kTile = 8;            // the m8n8 block: 8 x rows by 8 y columns
 
 struct OuterGeo {                          // the embedded source declares the same struct
     long long na, mx, nb, my;              // U (nk, na, mx, nb, my)
     long long nxb, nyb;                    // x blocks, y blocks
-    long long ngrp, per;                   // (a, x block) groups per (b, y block), pairs per group
-    long long items;                       // nb * nyb * ngrp
+    long long ngrp, per;                   // (x block, a) groups per (y block, b), pairs per group
+    long long items;                       // nyb * nb * ngrp
     double scale;
 };
 
@@ -85,7 +91,8 @@ struct OuterGeo {
 };
 
 constexpr int NX = LRX_NX, NY = LRX_NY, NZ = LRX_NZ, NK = NX * NY * NZ;
-constexpr int KK = LRX_K, YB = LRX_YB, XB = LRX_XB, TR = XB * YB, NBUF = LRX_NBUF;
+constexpr int KK = LRX_K, XB = 8, YB = 8, TR = XB * YB, NWARP = LRX_THREADS / 32;
+static_assert(KK % 4 == 0, "K is a multiple of the m8n8k4 chunk (the door zero-pads)");
 using GK = lrx_kbox::Geo<NX, NY, NZ>;
 
 // The family's kernel multiply (kconv_mathdx_cuda_ffi.cc lrx_mul), spelled identically.
@@ -94,12 +101,8 @@ __device__ __forceinline__ lrx_c2 lrx_mul(lrx_c2 a, lrx_c2 b) {
     return z;
 }
 
-#if LRX_DMMA
-// DMMA arm: the load's K-sum on the fp64 tensor cores.  Tile XB = YB = 8 (one m8n8 block per
-// k), 64 columns; warp w forms T at k = w, w + NWARP, ...: per 4-wide K chunk each lane reads
-// one complex L[k, a, x0 + lane/4, K] and one R[k, K, b, y0 + lane/4] (L2-resident legs, no
-// shared staging) and issues four m8n8k4 (Re += Lr Rr - Li Ri, Im += Lr Ri + Li Rr).  Shared
-// memory is the bank alone, so two blocks share an SM.
+// D += A B on the fp64 tensor cores: A 8x4 row (lane: row lane/4, col lane%4), B 4x8 col
+// (lane: row lane%4, col lane/4), D 8x8 (lane: row lane/4, cols 2(lane%4) + {0, 1}).
 __device__ __forceinline__ void lrx_dmma(double& d0, double& d1, double a, double b) {
     asm volatile("mma.sync.aligned.m8n8k4.row.col.f64.f64.f64.f64 {%0,%1}, {%2}, {%3}, {%0,%1};\n"
                  : "+d"(d0), "+d"(d1) : "d"(a), "d"(b));
@@ -108,14 +111,11 @@ __device__ __forceinline__ void lrx_dmma(double& d0, double& d1, double a, doubl
 extern "C" __global__ void __launch_bounds__(LRX_THREADS, LRX_MINB) lrx_kconv_outer(
     const lrx_c2* __restrict__ L, const lrx_c2* __restrict__ R, const lrx_c2* __restrict__ V,
     lrx_c2* __restrict__ U, OuterGeo g) {
-    static_assert((XB == 8 || XB == 4) && YB == 8 && KK % 4 == 0,
-                  "DMMA arm: an 8- or 4-row by 8-column tile, K a multiple of 4");
     extern __shared__ lrx_c2 bank[];
     using namespace cufftdx;
-    constexpr int NWARP = LRX_THREADS / 32;
     const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
     const int gr = lane >> 2, tg = lane & 3;
-    const long long ucols = g.na * g.mx * g.nb * g.my;
+    const long long ucols = g.na * g.mx * g.nb * g.my;           // U columns per k
     const long long rk = g.nb * g.my;                             // R stride between K rows
     const long long pairs = g.na * g.nxb;
     for (long long it = blockIdx.x; it < g.items; it += gridDim.x) {
@@ -127,7 +127,8 @@ extern "C" __global__ void __launch_bounds__(LRX_THREADS, LRX_MINB) lrx_kconv_ou
         for (long long p = p0; p < p1; ++p) {
             const long long a = p % g.na, x0 = (p / g.na) * XB;
             const long long xr = x0 + gr;                         // this lane's A row
-            const bool xok = gr < XB && xr < g.mx;                // XB = 4: rows 4..7 are zero
+            const bool xok = xr < g.mx;
+            // Load: T[k, a, x, b, y] = sum_K L[k, a, x, K] R[k, K, b, y] on the tensor cores.
             for (int k = warp; k < NK; k += NWARP) {
                 const double2* lp = reinterpret_cast<const double2*>(L + (((long long)k * g.na + a) * g.mx + xr) * KK);
                 const double2* rp = reinterpret_cast<const double2*>(R + (long long)k * KK * rk + b * g.my + yr);
@@ -144,13 +145,12 @@ extern "C" __global__ void __launch_bounds__(LRX_THREADS, LRX_MINB) lrx_kconv_ou
                 }
                 lrx_c2 v0, v1;
                 v0.x = re0; v0.y = im0; v1.x = re1; v1.y = im1;
-                if (gr < XB) {
-                    bank[(gr * YB + 2 * tg) * GK::RS + GK::at(k)] = v0;
-                    bank[(gr * YB + 2 * tg + 1) * GK::RS + GK::at(k)] = v1;
-                }
+                bank[(gr * YB + 2 * tg) * GK::RS + GK::at(k)] = v0;
+                bank[(gr * YB + 2 * tg + 1) * GK::RS + GK::at(k)] = v1;
             }
             __syncthreads();
             lrx_kbox::transform3<NX, NY, NZ, TR, LRX_SM, fft_direction::inverse>(bank);
+            // Mid: the stored kernel V[k, x, y] (R space), mode 2's KernMid.
             for (int i = threadIdx.x; i < TR * NK; i += blockDim.x) {
                 const int j = i % TR, k = i / TR;
                 const long long x = x0 + j / YB, yy = y0 + j % YB;
@@ -158,109 +158,6 @@ extern "C" __global__ void __launch_bounds__(LRX_THREADS, LRX_MINB) lrx_kconv_ou
                     lrx_c2* e = bank + j * GK::RS + GK::at(k);
                     *e = lrx_mul(*e, V[((long long)k * g.mx + x) * g.my + yy]);
                 }
-            }
-            __syncthreads();
-            lrx_kbox::transform3<NX, NY, NZ, TR, LRX_SM, fft_direction::forward>(bank);
-            for (int i = threadIdx.x; i < TR * NK; i += blockDim.x) {
-                const int j = i % TR, k = i / TR;
-                const long long x = x0 + j / YB, yy = y0 + j % YB;
-                if (x < g.mx && yy < g.my) {
-                    const lrx_c2 v = bank[j * GK::RS + GK::at(k)];
-                    lrx_c2 w;
-                    w.x = v.x * g.scale;
-                    w.y = v.y * g.scale;
-                    U[(long long)k * ucols + ((a * g.mx + x) * g.nb + b) * g.my + yy] = w;
-                }
-            }
-            __syncthreads();
-        }
-    }
-}
-#else
-__device__ __forceinline__ void lrx_cp_wait1() { asm volatile("cp.async.wait_group 1;\n" ::); }
-
-// Stage the (a, x block) tile's two streamed operands into buffer `buf`, one cp.async group:
-// Ls[k][xi][K] = L[k, a, x0 + xi, K] (one contiguous XB*KK run per k) and
-// Vs[k][j]     = V[k, x0 + j / YB, y0 + j % YB] (YB-long runs); zero past the edges.
-__device__ __forceinline__ void lrx_stage(lrx_c2* Ls, lrx_c2* Vs, const lrx_c2* __restrict__ L,
-                                          const lrx_c2* __restrict__ V, const OuterGeo& g,
-                                          long long a, long long x0, long long y0) {
-    for (int i = threadIdx.x; i < NK * XB * KK; i += blockDim.x) {
-        const int k = i / (XB * KK), rem = i % (XB * KK);
-        const long long x = x0 + rem / KK;
-        if (x < g.mx) lrx_kbox::cp_async<16>(Ls + i, L + (((long long)k * g.na + a) * g.mx + x) * KK + rem % KK);
-        else { Ls[i].x = 0.0; Ls[i].y = 0.0; }
-    }
-    for (int i = threadIdx.x; i < NK * TR; i += blockDim.x) {
-        const int k = i / TR, j = i % TR;
-        const long long x = x0 + j / YB, y = y0 + j % YB;
-        if (x < g.mx && y < g.my) lrx_kbox::cp_async<16>(Vs + i, V + ((long long)k * g.mx + x) * g.my + y);
-        else { Vs[i].x = 0.0; Vs[i].y = 0.0; }
-    }
-    lrx_kbox::cp_async_commit();
-}
-
-// Shared memory: the k-box bank (TR padded columns), then NBUF (L tile, V tile) buffers; the
-// next pair's tiles land by cp.async while this pair transforms (NBUF = 2).
-extern "C" __global__ void __launch_bounds__(LRX_THREADS, LRX_MINB) lrx_kconv_outer(
-    const lrx_c2* __restrict__ L, const lrx_c2* __restrict__ R, const lrx_c2* __restrict__ V,
-    lrx_c2* __restrict__ U, OuterGeo g) {
-    extern __shared__ lrx_c2 bank[];
-    using namespace cufftdx;
-    constexpr int LT = NK * XB * KK, VT = NK * TR;
-    lrx_c2* const Lb = bank + TR * GK::RS;                        // Ls[buf] = Lb + buf * (LT + VT)
-    const int ek = threadIdx.x / YB, ey = threadIdx.x % YB;       // the encode's (k, y)
-    const long long ucols = g.na * g.mx * g.nb * g.my;            // U columns per k
-    const long long pairs = g.na * g.nxb;
-    for (long long it = blockIdx.x; it < g.items; it += gridDim.x) {
-        const long long grp = it % g.ngrp, yb_ = it / g.ngrp;
-        const long long b = yb_ % g.nb, y0 = (yb_ / g.nb) * YB;
-        const long long y = y0 + ey;
-        const bool yok = y < g.my;
-        lrx_c2 r[KK];
-#pragma unroll
-        for (int q = 0; q < KK; ++q) {
-            if (yok) r[q] = R[(((long long)ek * KK + q) * g.nb + b) * g.my + y];
-            else { r[q].x = 0.0; r[q].y = 0.0; }
-        }
-        const long long p0 = grp * g.per, p1 = min(pairs, p0 + g.per);
-        if (p0 < p1) lrx_stage(Lb, Lb + LT, L, V, g, p0 % g.na, (p0 / g.na) * XB, y0);
-        int buf = 0;
-        for (long long p = p0; p < p1; ++p) {
-            const long long a = p % g.na, x0 = (p / g.na) * XB;
-            lrx_c2* const Ls = Lb + buf * (LT + VT);
-            lrx_c2* const Vs = Ls + LT;
-            if (NBUF == 2 && p + 1 < p1) {
-                lrx_c2* const Ln = Lb + (buf ^ 1) * (LT + VT);
-                lrx_stage(Ln, Ln + LT, L, V, g, (p + 1) % g.na, ((p + 1) / g.na) * XB, y0);
-                lrx_cp_wait1();
-            } else {
-                if (NBUF == 1 && p > p0) lrx_stage(Ls, Vs, L, V, g, a, x0, y0);
-                lrx_kbox::cp_async_wait_all();
-            }
-            __syncthreads();
-            // Load: T[k, a, x, b, y] = sum_K L[k, a, x, K] R[k, K, b, y], one K-ordered fma chain.
-#pragma unroll
-            for (int xi = 0; xi < XB; ++xi) {
-                lrx_c2 acc = {0.0, 0.0};
-                const lrx_c2* l = Ls + (ek * XB + xi) * KK;
-#pragma unroll
-                for (int q = 0; q < KK; ++q) {
-                    const lrx_c2 lv = l[q];
-                    acc.x = fma(lv.x, r[q].x, acc.x);
-                    acc.x = fma(-lv.y, r[q].y, acc.x);
-                    acc.y = fma(lv.x, r[q].y, acc.y);
-                    acc.y = fma(lv.y, r[q].x, acc.y);
-                }
-                bank[(xi * YB + ey) * GK::RS + GK::at(ek)] = acc;
-            }
-            __syncthreads();
-            lrx_kbox::transform3<NX, NY, NZ, TR, LRX_SM, fft_direction::inverse>(bank);
-            // Mid: the stored kernel V[k, x, y] (R space), mode 2's KernMid, from the staged tile.
-            for (int i = threadIdx.x; i < TR * NK; i += blockDim.x) {
-                const int j = i % TR, k = i / TR;
-                lrx_c2* e = bank + j * GK::RS + GK::at(k);
-                *e = lrx_mul(*e, Vs[k * TR + j]);
             }
             __syncthreads();
             lrx_kbox::transform3<NX, NY, NZ, TR, LRX_SM, fft_direction::forward>(bank);
@@ -277,35 +174,22 @@ extern "C" __global__ void __launch_bounds__(LRX_THREADS, LRX_MINB) lrx_kconv_ou
                 }
             }
             __syncthreads();
-            buf ^= (NBUF == 2);
         }
     }
 }
-#endif
 )__lrx__";
 
 using nvrtc::DriverApi;
 using nvrtc::driver_api;
 using nvrtc::cu_err;
 
-struct Built { CUfunction fn = nullptr; int threads = 0, yb = 0, xb = 0, smem = 0, minb = 1, sms = 0; };
-using Key = std::tuple<CUcontext, int, int, int, int, int>;   // ctx, nkx, nky, nkz, K, yb
+struct Built { CUfunction fn = nullptr; int smem = 0, minb = 1, sms = 0; };
+using Key = std::tuple<CUcontext, int, int, int, int>;   // ctx, nkx, nky, nkz, K
 static std::mutex g_mu;
 static std::map<Key, Built> g_cache;
 static std::map<Key, std::string> g_fail;
 
-// yb_req: 0 = the rule below, else the y width (a power of two) to measure.
-// Rule: the widest y run (<= 8, 128-byte runs of the U store and the V read) whose NK * YB
-// threads stay <= 256, so two blocks share an SM; XB = 32 / YB (a 32-column tile, mode 2's).
-static int pick_yb(int nk, int yb_req) {
-    if (yb_req == 0 || yb_req == -2) return 8;         // the DMMA arm's 8-column tile
-    if (yb_req > 0) return yb_req;
-    int yb = 1;
-    while (yb < 8 && nk * yb * 2 <= kThreadsMax) yb *= 2;
-    return yb;
-}
-
-static ffi::Error build(int nkx, int nky, int nkz, int K, int yb_req, std::string_view mathdx_root,
+static ffi::Error build(int nkx, int nky, int nkz, int K, std::string_view mathdx_root,
                         std::string_view cubin_dir, const Built** out) {
     const DriverApi& api = driver_api();
     if (!api.ok) return fail("driver-api resolve", api.err);
@@ -316,9 +200,7 @@ static ffi::Error build(int nkx, int nky, int nkz, int K, int yb_req, std::strin
         cr = api.CtxGetCurrent(&ctx);
         if (cr != CUDA_SUCCESS || ctx == nullptr) return fail("cuCtxGetCurrent", cu_err(cr));
     }
-    const int nk = nkx * nky * nkz;
-    const int yb = pick_yb(nk, yb_req);
-    const Key key{ctx, nkx, nky, nkz, K, (yb_req == 0 || yb_req == -2) ? yb_req : yb};
+    const Key key{ctx, nkx, nky, nkz, K};
     std::lock_guard<std::mutex> lock(g_mu);
     if (auto it = g_cache.find(key); it != g_cache.end()) { *out = &it->second; return ffi::Error::Success(); }
     if (auto it = g_fail.find(key); it != g_fail.end()) return fail("kernel build (cached failure)", it->second);
@@ -335,38 +217,21 @@ static ffi::Error build(int nkx, int nky, int nkz, int K, int yb_req, std::strin
         cudaDeviceGetAttribute(&smem_sm, cudaDevAttrMaxSharedMemoryPerMultiprocessor, dev) != cudaSuccess ||
         cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev) != cudaSuccess)
         return sticky("device attributes", "cudaDeviceGetAttribute");
-    // yb_req 0: the DMMA arm (8x8 tile, 512 threads, the bank alone in shared memory, two
-    // blocks per SM at <= 64 registers); yb_req -1: the FMA arm at the rule's y width; > 0: the
-    // FMA arm at that width (a measurement dial).
-    const bool dmma = yb_req == 0 || yb_req == -2;
-    const int threads = dmma ? (yb_req == 0 ? 512 : 256) : nk * yb;
-    const int xb = dmma ? (yb_req == 0 ? 8 : 4) : std::max(1, 32 / yb);
+    if (cc_major < 8)
+        return sticky("GATE mathdx-kconv-outer-arch", "got sm_" + std::to_string(cc_major * 10 + cc_minor) +
+                      "; want sm_80+ (fp64 mma.m8n8k4); fix: none here -- the router keeps the unfused chain",
+                      ffi::ErrorCode::kFailedPrecondition);
     const lrx_kbox::Geometry geo{nkx, nky, nkz};
-    // The bank, then NBUF (L tile, V tile) buffers: two when they fit (the next pair's tiles
-    // land while this pair transforms), else one.
-    const long long bank_b = static_cast<long long>(xb) * yb * geo.rs() * 16;
-    const long long tiles_b = (static_cast<long long>(nk) * xb * K + static_cast<long long>(nk) * xb * yb) * 16;
-    const int nbuf = dmma ? 0 : (bank_b + 2 * tiles_b <= smem_optin ? 2 : 1);
-    const long long smem = bank_b + nbuf * tiles_b;
-    if (dmma && K % 4) {
+    const long long smem = static_cast<long long>(kTile) * kTile * geo.rs() * 16;
+    if (smem > smem_optin) {
         std::ostringstream os;
-        os << "GATE mathdx-kconv-outer-rank: got K=" << K << " on the DMMA arm; want a multiple of 4 (the "
-              "m8n8k4 K chunk); fix: ffi.fft.make_local_kconv_klead_outer pads the legs with zeros";
+        os << "GATE mathdx-kconv-outer-tile: got k-grid (" << nkx << "," << nky << "," << nkz << ") whose "
+           << kTile * kTile << "-column bank needs " << smem << " B; want <= " << smem_optin << " B of opt-in "
+              "shared memory; why: the load forms one 8 x 8 block per k in a resident k-box tile; fix: none "
+              "here -- ffi.fft.klead_outer_refusal routes such a grid to the unfused encode + mode 2 chain";
         return sticky("tile", os.str(), ffi::ErrorCode::kInvalidArgument);
     }
-    if (yb < 1 || (yb & (yb - 1)) || threads > kThreadsMax || smem > smem_optin) {
-        std::ostringstream os;
-        os << "GATE mathdx-kconv-outer-tile: got k-grid (" << nkx << "," << nky << "," << nkz << ") at y width "
-           << yb << ": " << threads << " threads and " << smem << " B of shared memory; want a power-of-two y "
-           << "width, <= " << kThreadsMax << " threads (one per (k, y)) and <= " << smem_optin << " B; why: the "
-              "outer load keeps one (k, y) leg per thread and a 32-column k-box tile resident; fix: none here -- "
-              "ffi.fft.klead_outer_refusal routes such a grid to the unfused encode + mode 2 chain";
-        return sticky("tile", os.str(), ffi::ErrorCode::kInvalidArgument);
-    }
-    // Two blocks per SM only where the shared memory allows it and a block of <= 256 threads
-    // keeps 128 registers per thread (the right leg alone is 4K of them).
-    const int minb = (threads > 256 && !dmma) ? 1
-                     : std::max(1, std::min<int>(dmma ? 4 : 2, static_cast<int>(smem_sm / (smem + 1024))));
+    const int minb = std::max(1, std::min<int>(2, static_cast<int>(smem_sm / (smem + 1024))));
     std::string why;
     const std::string cuda_inc = nvrtc::toolkit_include(&why);
     if (cuda_inc.empty()) return sticky("CUDA toolkit headers for NVRTC", why);
@@ -382,10 +247,8 @@ static ffi::Error build(int nkx, int nky, int nkz, int K, int yb_req, std::strin
         "--std=c++17", "--device-as-default-execution-space", "--generate-line-info",
         "--gpu-architecture=sm_" + std::to_string(cc_major) + std::to_string(cc_minor),
         "-DLRX_NX=" + std::to_string(nkx), "-DLRX_NY=" + std::to_string(nky), "-DLRX_NZ=" + std::to_string(nkz),
-        "-DLRX_K=" + std::to_string(K), "-DLRX_YB=" + std::to_string(yb), "-DLRX_XB=" + std::to_string(xb),
-        "-DLRX_THREADS=" + std::to_string(threads), "-DLRX_MINB=" + std::to_string(minb),
-        "-DLRX_NBUF=" + std::to_string(nbuf), "-DLRX_DMMA=" + std::string(dmma ? "1" : "0"),
-        "-DLRX_SM=" + std::to_string(cc_major * 100 + cc_minor * 10)};
+        "-DLRX_K=" + std::to_string(K), "-DLRX_THREADS=" + std::to_string(kThreads),
+        "-DLRX_MINB=" + std::to_string(minb), "-DLRX_SM=" + std::to_string(cc_major * 100 + cc_minor * 10)};
     nvrtc::mathdx_toolchain(root, cuda_inc, "cufftdx", &prog);
     prog.kernel = "lrx_kconv_outer";
     std::string missing;
@@ -394,8 +257,8 @@ static ffi::Error build(int nkx, int nky, int nkz, int K, int yb_req, std::strin
     std::string path;
     if (!dir.empty()) {
         std::ostringstream name;
-        name << dir << "/kconv_outer_" << nkx << "x" << nky << "x" << nkz << "_K" << K << (dmma ? "_dmma" + std::to_string(xb) : "_yb" + std::to_string(yb)) << "_sm"
-             << cc_major << cc_minor << "_" << key_hex << ".cubin";
+        name << dir << "/kconv_outer_" << nkx << "x" << nky << "x" << nkz << "_K" << K << "_sm" << cc_major
+             << cc_minor << "_" << key_hex << ".cubin";
         path = name.str();
     }
     nvrtc::Image img;
@@ -403,19 +266,16 @@ static ffi::Error build(int nkx, int nky, int nkz, int K, int yb_req, std::strin
     if (!nvrtc::build(prog, dir, path, key_hex, &img, &where, &err)) return sticky(where.c_str(), err);
     Built b;
     b.fn = img.fn;
-    b.threads = threads;
-    b.yb = yb;
-    b.xb = xb;
     b.smem = static_cast<int>(smem);
     b.minb = minb;
     b.sms = sms;
     cr = api.FuncSetAttribute(b.fn, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, b.smem);
     if (cr != CUDA_SUCCESS) return sticky("cuFuncSetAttribute", cu_err(cr));
     if (mklpin::announce_here() || mklpin::debug_print_here()) {
-        std::fprintf(stderr, "[kconv_outer] %s kgrid=(%d,%d,%d) K=%d sm_%d%d in %.1f ms (tile %dx%d, %d threads, "
-                     "%d blocks/SM, %d tile buffers, smem=%d B, cubin %s)\n",
+        std::fprintf(stderr, "[kconv_outer] %s kgrid=(%d,%d,%d) K=%d sm_%d%d in %.1f ms (8x8 tile, %d threads, "
+                     "%d blocks/SM, smem=%d B, cubin %s)\n",
                      img.from_disk ? "disk-cache hit" : "NVRTC built", nkx, nky, nkz, K, cc_major, cc_minor, img.ms,
-                     xb, yb, threads, minb, nbuf, b.smem,
+                     kThreads, minb, b.smem,
                      path.empty() ? "not cached (no cubin_dir)" : (img.from_disk ? path.c_str() : "stored"));
     }
     *out = &(g_cache[key] = b);
@@ -425,8 +285,7 @@ static ffi::Error build(int nkx, int nky, int nkz, int K, int yb_req, std::strin
 // L (nk, na, mx, K), R (nk, K, nb, my), V (nk, mx, my) -> U (nk, na, mx, nb, my), complex128.
 static ffi::Error KleadOuterConv(cudaStream_t stream, ffi::AnyBuffer L, ffi::AnyBuffer R, ffi::AnyBuffer V,
                                  ffi::Result<ffi::AnyBuffer> U, int64_t nkx, int64_t nky, int64_t nkz,
-                                 double scale, int64_t yb, std::string_view mathdx_root,
-                                 std::string_view cubin_dir) {
+                                 double scale, std::string_view mathdx_root, std::string_view cubin_dir) {
     auto bad = [](const std::string& why) { return fail("klead outer conv", why, ffi::ErrorCode::kInvalidArgument); };
     if (nkx < 1 || nky < 1 || nkz < 1 || nkx > kAxisMax || nky > kAxisMax || nkz > kAxisMax) {
         std::ostringstream os;
@@ -445,25 +304,24 @@ static ffi::Error KleadOuterConv(cudaStream_t stream, ffi::AnyBuffer L, ffi::Any
     if (ld[0] != nk || rd[0] != nk || rd[1] != K || vd[0] != nk || vd[1] != mx || vd[2] != my ||
         ud[0] != nk || ud[1] != na || ud[2] != mx || ud[3] != nb || ud[4] != my)
         return bad("want L (nk,na,mx,K), R (nk,K,nb,my), V (nk,mx,my), U (nk,na,mx,nb,my) with nk = nkx*nky*nkz");
-    if (K < 1 || K > kKMax) {
+    if (K < 4 || K % 4) {
         std::ostringstream os;
-        os << "GATE mathdx-kconv-outer-rank: got K=" << K << "; want 1 <= K <= " << kKMax
-           << "; why: the right leg is register-resident; fix: none here -- ffi.fft.klead_outer_refusal "
-              "routes such a rank to the unfused encode + mode 2 chain";
+        os << "GATE mathdx-kconv-outer-rank: got K=" << K << "; want a positive multiple of 4 (the m8n8k4 "
+              "chunk); fix: ffi.fft.make_local_kconv_klead_outer zero-pads the legs";
         return bad(os.str());
     }
     if (na * mx * nb * my == 0) return ffi::Error::Success();
     const Built* k = nullptr;
     if (ffi::Error e = build(static_cast<int>(nkx), static_cast<int>(nky), static_cast<int>(nkz),
-                             static_cast<int>(K), static_cast<int>(yb), mathdx_root, cubin_dir, &k);
+                             static_cast<int>(K), mathdx_root, cubin_dir, &k);
         !e.success())
         return e;
     OuterGeo g{};
     g.na = na; g.mx = mx; g.nb = nb; g.my = my;
-    g.nxb = (mx + k->xb - 1) / k->xb;
-    g.nyb = (my + k->yb - 1) / k->yb;
-    // Groups of (a, x block) pairs per (b, y block): about eight resident waves of items, so
-    // the last wave is short; each item reads its R leg once.
+    g.nxb = (mx + kTile - 1) / kTile;
+    g.nyb = (my + kTile - 1) / kTile;
+    // Groups of (x block, a) pairs per (y block, b): about eight resident waves of items, so
+    // the last wave is short.
     const long long slots = static_cast<long long>(k->sms) * k->minb;
     const long long base = nb * g.nyb, pairs = na * g.nxb;
     g.ngrp = std::max(1LL, std::min(pairs, (8 * slots + base - 1) / base));
@@ -476,7 +334,7 @@ static ffi::Error KleadOuterConv(cudaStream_t stream, ffi::AnyBuffer L, ffi::Any
     void* up = U->untyped_data();
     void* args[] = {(void*)&lp, (void*)&rp, (void*)&vp, (void*)&up, (void*)&g};
     const long long blocks = std::min(g.items, 2147483647LL);
-    CUresult cr = driver_api().LaunchKernel(k->fn, static_cast<unsigned>(blocks), 1, 1, k->threads, 1, 1,
+    CUresult cr = driver_api().LaunchKernel(k->fn, static_cast<unsigned>(blocks), 1, 1, kThreads, 1, 1,
                                             static_cast<unsigned>(k->smem), reinterpret_cast<CUstream>(stream),
                                             args, nullptr);
     if (cr != CUDA_SUCCESS) return fail("cuLaunchKernel", cu_err(cr));
@@ -497,6 +355,5 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Attr<int64_t>("nky")
         .Attr<int64_t>("nkz")
         .Attr<double>("scale")
-        .Attr<int64_t>("yb")
         .Attr<std::string_view>("mathdx_root")
         .Attr<std::string_view>("cubin_dir"));
