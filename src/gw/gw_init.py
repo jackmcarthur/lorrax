@@ -1525,9 +1525,15 @@ def _resolve_zeta_fit_contract(
 		for path_T, provenance_T in
 		zip(transverse_paths, provenance_transverse))
 
-	loader_band_chunk = (
-		int(cfg.memory.band_chunk_size)
-		if int(cfg.memory.band_chunk_size) > 0 else 64)
+	from common.wfn_layout import band_sphere_spec
+	from runtime.padding import spec_divisor
+	from gw.gflat_memory_model import loader_band_chunk as _loader_band_chunk
+	loader_band_chunk = _loader_band_chunk(
+		nb=int(band_slices.full_range[1] - band_slices.full_range[0]),
+		nk=int(meta.nk_tot), ns=int(meta.nspinor), ngkmax=int(wfn.ngkmax),
+		n_rmu=max(int(meta.n_rmu), int(getattr(meta_transverse, "n_rmu", 0) or 0)),
+		mesh_xy=mesh_xy, p_band=spec_divisor(mesh_xy, band_sphere_spec(), axis=1),
+		floor=int(cfg.memory.band_chunk_size))
 	# Reuse skips the full fit planner by design, but it still re-samples the
 	# WFN for downstream Sigma.  Resolve the same pure Stage-A geometry here so
 	# a valid zeta artifact cannot turn k streaming off by setting ``chunks`` to

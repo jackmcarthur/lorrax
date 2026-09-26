@@ -58,6 +58,40 @@ def centroid_fft_tile_geometry(
     return k_tile, k_tile * local_bands
 
 
+#: Share of the stage room one streamed ψ band tile may take; the loader sizes
+#: its FFT scan rows from what is left (``common.wfn_transforms``).
+_LOADER_TILE_ROOM_FRACTION = 0.25
+
+
+def loader_band_chunk(*, nb: int, nk: int, ns: int, ngkmax: int, n_rmu: int,
+                      mesh_xy, p_band: int, floor: int) -> int:
+    """The ψ loader's band tile off the ζ-fit plan (ζ reuse, current faces), from the run budget.
+
+    Per band of the tile, per rank: the streamed G-flat rows and the tile's
+    centroid samples, ``(k_tile/p_band)·ns·16·(ngkmax + n_rmu)``, and its X/Y
+    faces ``k_tile·ns·16·(μ_x + μ_y)``, with ``k_tile`` from
+    :func:`centroid_fft_tile_geometry`.  The tile count is the fewest whose
+    tile fits ``_LOADER_TILE_ROOM_FRACTION`` of the stage room
+    (``common.gpu_utils.device_room_bytes``); the tile is ``nb`` over that count,
+    rounded up to ``p_band`` (least band padding), and never below ``floor``
+    (the automatic chunk, ``gw_config.AUTOMATIC_BAND_CHUNK_SIZE``).  Every
+    process enters.
+    """
+    from common.gpu_utils import device_room_bytes
+    from runtime.padding import round_up
+    nb, p_band = int(nb), int(p_band)
+    k_tile, _ = centroid_fft_tile_geometry(nk=int(nk), band_chunk=max(int(floor), 1),
+                                           p_band=p_band)
+    px, py = int(mesh_xy.shape['x']), int(mesh_xy.shape['y'])
+    mu_x, mu_y = -(-int(n_rmu) // px), -(-int(n_rmu) // py)
+    per_band = (k_tile / p_band * int(ns) * 16.0 * (int(ngkmax) + int(n_rmu))
+                + k_tile * int(ns) * 16.0 * (mu_x + mu_y))
+    fit = int(_LOADER_TILE_ROOM_FRACTION * float(device_room_bytes()) // per_band)
+    n_tiles = -(-nb // max(fit, 1))
+    tile = round_up(-(-nb // n_tiles), p_band)
+    return int(min(max(tile, int(floor)), round_up(nb, p_band)))
+
+
 # ---------------------------------------------------------------------------
 # The μ-batch ζ fit (docs/architecture/zeta_fit_mubatch.md)
 # ---------------------------------------------------------------------------

@@ -119,7 +119,8 @@ def sector_tau_factory(left, right, keys, meta, mesh_xy):
     """
     from distrib_la import gemm_plan, panel_matmul
     from common.contract_bands import contract_bands_block_reshard
-    from gw.greens_function_kernel import build_G_parents, _weighted_tau_phases
+    from gw.greens_function_kernel import (build_G_parents, _weighted_tau_phases,
+                                           green_panel_bytes)
     from gw.cohsex_sigma import make_lorentz_convolution
 
     a, b = left.green_parent, right.green_parent
@@ -130,17 +131,21 @@ def sector_tau_factory(left, right, keys, meta, mesh_xy):
     # The face Green has a narrow band contraction. Its persistent ψ and G
     # remain two-axis tiled; only a bounded contraction panel is gathered.
     face_green = a.layout == 'face'
-    green_panel_bytes = 32 << 20
     native=(0 if face_green else
             _native_workspace(mesh_xy,(((q,m,k),(q,k,n)),)))
-    meta.shared_pole_capacity.reserve(f'sigma.sector.tau.warm.{keys[0]}',
-        resident_bytes_per_rank=0,
-        workspace_bytes_per_rank=(2*16*q*(m*k+k*n+m*n)//mesh_xy.size
-                                  +native+(green_panel_bytes if face_green else 0)),
-        concurrent_with=meta.shared_pole_capacity.live_stages)
+    ledger = meta.shared_pole_capacity
+    warm = 2*16*q*(m*k+k*n+m*n)//mesh_xy.size + native
+    # The face Green's band panels: one parent Green tile when the ledger's room
+    # beside the warm workspace holds it (the whole band extent in one gather),
+    # else what the room holds (greens_function_kernel.green_panel_bytes).
+    panel = (green_panel_bytes(n_rows=q, m=m, n=n, mesh=mesh_xy,
+                               room=ledger.room_bytes_per_rank(ledger.live_stages) - warm)
+             if face_green else 0)
+    ledger.reserve(f'sigma.sector.tau.warm.{keys[0]}',
+        resident_bytes_per_rank=0, workspace_bytes_per_rank=warm + panel,
+        concurrent_with=ledger.live_stages)
     if face_green:
-        gemm = partial(panel_matmul, mesh=mesh_xy,
-                       panel_bytes=green_panel_bytes)
+        gemm = partial(panel_matmul, mesh=mesh_xy, panel_bytes=panel)
     else:
         gemm = gemm_plan(mesh_xy, m=m, k=k, n=n, nq=q,
                          dtype=jnp.complex128, layout=a.layout)

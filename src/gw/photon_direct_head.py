@@ -368,6 +368,52 @@ def _bulk_sphere_rule(geometry, kgrid, analytic_bare, chunk_size):
     return q_out, bare_out, weight_out
 
 
+#: Sobol samples per direct-Γ replicate (four replicates; the sphere rule is one more call).
+_GAMMA_SAMPLES = 2**17
+#: Smallest samples per rank per call: below this the call is launch-bound.
+_GAMMA_MIN_LOCAL = 2**10
+#: Share of the stage room the chunk's compiled footprint may take.
+_GAMMA_ROOM_FRACTION = 0.5
+
+
+def direct_gamma_chunk_plan(mesh, operands, *, nsamples):
+    """(chunk, sharding) of the direct-Γ cubature calls.
+
+    The samples of one call are split over every rank (``P(('x', 'y'))``: the
+    q sums in :func:`_direct_gamma_chunk` become one small all-reduce), so no
+    rank repeats another's samples.  The chunk is the largest power of two,
+    at most ``nsamples`` (one call per replicate), whose compiled footprint,
+    priced at a probe chunk and scaled per sample, fits
+    ``_GAMMA_ROOM_FRACTION`` of the stage room
+    (``common.gpu_utils.device_room_bytes``); never below
+    ``_GAMMA_MIN_LOCAL`` samples per rank, nor below the 2304-point sphere
+    rule.  Every process enters.
+    """
+    from common.gpu_utils import device_room_bytes, record_stage_price
+    n_dev = int(mesh.devices.size)
+    split = NamedSharding(mesh, P(tuple(mesh.axis_names)))
+    probe = n_dev * _GAMMA_MIN_LOCAL
+    sds = jax.ShapeDtypeStruct
+    compiled = _direct_gamma_chunk.lower(
+        sds((probe, 3), jnp.float64, sharding=split),
+        sds((probe, 4, 4), jnp.float64, sharding=split),
+        sds((probe,), jnp.float64, sharding=split), *operands).compile()
+    memory = compiled.memory_analysis()
+    # Per global sample, per rank: the compiled temporaries plus the sample's own
+    # q, D and weight rows (the fixed operands and the 4x4 outputs do not scale).
+    per_sample = max(float(getattr(memory, "temp_size_in_bytes", 0)) / probe, 0.0) \
+        + 8.0 * (3 + 16 + 1) / n_dev
+    room = _GAMMA_ROOM_FRACTION * float(device_room_bytes())
+    floor = max(probe, 2304)
+    chunk = floor
+    while chunk * 2 <= int(nsamples) and chunk * 2 * per_sample <= room:
+        chunk *= 2
+    chunk = min(max(chunk, floor), max(int(nsamples), floor))
+    record_stage_price(f"direct Gamma head, chunk {chunk} over {n_dev} ranks",
+                       chunk * per_sample)
+    return int(chunk), split
+
+
 def build_direct_photon_head(velocity_cart, wfns, occupation_state, *,
                              contact_packed, photon_g0_vectors, layout,
                              mesh, meta, wfn, frequencies_ry, print_fn=print):
@@ -407,9 +453,12 @@ def build_direct_photon_head(velocity_cart, wfns, occupation_state, *,
         layout=layout, mesh=mesh)
     geometry = CoulombGeometry.from_wfn(wfn)
     kgrid = tuple(int(n) for n in meta.kgrid)
-    chunk_size = 2**13
+    replicated = NamedSharding(mesh, P())
+    points_device = device_put_process_local(z, replicated)
+    operands = (tensors[0], tensors[1], tensors[2], points_device, drude, dos, contact)
+    chunk_size, split = direct_gamma_chunk_plan(mesh, operands, nsamples=_GAMMA_SAMPLES)
     samples = iter_minibz_photon_samples(get_kernel(3), geometry,
-        kgrid, nsamples=2**17,
+        kgrid, nsamples=_GAMMA_SAMPLES,
         qmc_reps=4, chunk_size=chunk_size, analytic_sphere=True)
     fields = ((len(z),4,4), (len(z),4,4), (len(z),4,4),
               (len(z),4,4), (4,4), (4,4,4), (4,4))
@@ -420,8 +469,6 @@ def build_direct_photon_head(velocity_cart, wfns, occupation_state, *,
     last_rep = 0
     analytic_bare = None
     max_error = jnp.asarray(0.0)
-    replicated = NamedSharding(mesh, P())
-    points_device = device_put_process_local(z, replicated)
 
     def finish_rep():
         nonlocal replicate, count
@@ -441,11 +488,9 @@ def build_direct_photon_head(velocity_cart, wfns, occupation_state, *,
             finish_rep()
             last_rep = rep
         result = _direct_gamma_chunk(
-            device_put_process_local(q, replicated),
-            device_put_process_local(D, replicated),
-            device_put_process_local(weight, replicated),
-            tensors[0], tensors[1], tensors[2], points_device,
-            drude, dos, contact)
+            device_put_process_local(q, split),
+            device_put_process_local(D, split),
+            device_put_process_local(weight, split), *operands)
         for i in range(len(fields)):
             replicate[i] = replicate[i] + result[i]
         max_error = jnp.maximum(max_error, result[-1])
@@ -457,11 +502,9 @@ def build_direct_photon_head(velocity_cart, wfns, occupation_state, *,
         raise ValueError("GATE photon_direct_head_cubature: missing analytic sphere")
     sq, sD, sw = _bulk_sphere_rule(geometry, kgrid, analytic_bare, chunk_size)
     sphere = _direct_gamma_chunk(
-        device_put_process_local(sq, replicated),
-        device_put_process_local(sD, replicated),
-        device_put_process_local(sw, replicated),
-        tensors[0], tensors[1], tensors[2], points_device,
-        drude, dos, contact)
+        device_put_process_local(sq, split),
+        device_put_process_local(sD, split),
+        device_put_process_local(sw, split), *operands)
     max_error = jnp.maximum(max_error, sphere[-1])
     fields_mean = [(np.asarray(total[i]) / len(spreads) + np.asarray(sphere[i]))
                    / float(meta.cell_volume) for i in range(len(fields))]

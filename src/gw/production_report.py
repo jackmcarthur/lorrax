@@ -79,8 +79,8 @@ def layout_dial_record_lines(
 
     lines.append(
         "ψ parent carrier: band-distributed faces; band contractions gather "
-        "their band panels in memory-sized chunks; band chunks of "
-        f"{int(config.memory.band_chunk_size)}.")
+        "their band panels in memory-sized chunks; band chunks of at least "
+        f"{int(config.memory.band_chunk_size)}, sized from memory_per_device_gb.")
     return tuple(lines)
 
 

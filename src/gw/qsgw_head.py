@@ -83,12 +83,35 @@ _KERNEL_CACHE: dict[tuple, Callable] = {}
 # with no effect on values.
 _HEAD_WING_FREQUENCY_BLOCK = 2
 
-# Bound the face-layout wing kernel's per-step psi gather.  Each step gathers
-# this block of every rank's mu tile with the rank's own band tile, a
+# The face-layout wing kernel's per-step psi gather: each step gathers one
+# block of every rank's mu tile with the rank's own band tile, a
 # (nk, ns, block*sqrt(P), nb_full/sqrt(P)) buffer per endpoint, independent of
-# how many centroids a rank owns.  See ``_head_wing_kernel_face``'s docstring
-# for the residency algebra.
-_HEAD_WING_MU_BLOCK = 64
+# how many centroids a rank owns (``head_wing_mu_block`` sizes it from the run
+# budget; ``_head_wing_kernel_face``'s docstring has the residency algebra).
+#: Share of the stage room the gathered endpoint blocks may take.
+_HEAD_WING_ROOM_FRACTION = 0.5
+#: Narrowest block: below it the per-step gathers and GEMMs are latency-bound.
+_HEAD_WING_MU_MIN = 16
+
+
+def head_wing_mu_block(*, mu_local, nk, ns, nb_full, n_ends):
+    """Centroids per face head-wing step, from the run budget's room.
+
+    One step holds ``n_ends`` gathered endpoint blocks of
+    ``16·nk·ns·block·nb_full`` bytes per rank; the widest block whose set fits
+    ``_HEAD_WING_ROOM_FRACTION`` of the stage room
+    (``common.gpu_utils.device_room_bytes``) wins, at least
+    ``_HEAD_WING_MU_MIN`` (or the whole tile when it is narrower) and at most
+    the rank's whole mu tile.  Every process enters.
+    """
+    from common.gpu_utils import device_budget_bytes, device_room_bytes, record_stage_price
+    per_mu = 16.0 * int(nk) * int(ns) * int(nb_full) * int(n_ends)
+    room = float(device_room_bytes())
+    fit = int(_HEAD_WING_ROOM_FRACTION * room // per_mu)
+    block = int(min(int(mu_local), max(fit, _HEAD_WING_MU_MIN)))
+    record_stage_price(f"head wings, mu block {block}/{int(mu_local)}",
+                       device_budget_bytes() - room + block * per_mu)
+    return block
 # Width three is the incumbent Rydberg velocity.  Width eight has the same
 # energy-denominator contract: for a literal long-wave transition derivative
 # D^(I,a) = d_q_a M^I|_0 it consumes P^(I,a) = -DeltaE * D^(I,a), flattened
@@ -1385,6 +1408,7 @@ def _head_wing_kernel(
     *,
     nb_logical: int,
     include_surface: bool,
+    mu_block: int,
     layout: str = "face",
     classes: int = 0,
     anti: bool = False,
@@ -1394,7 +1418,7 @@ def _head_wing_kernel(
         raise ValueError(f"_head_wing_kernel requires face or axis layout, got {layout!r}")
     return _head_wing_kernel_face(
         mesh, nb_logical=int(nb_logical), include_surface=bool(include_surface),
-        layout=layout, classes=int(classes), anti=bool(anti))
+        mu_block=int(mu_block), layout=layout, classes=int(classes), anti=bool(anti))
 
 
 def _head_wing_kernel_face(
@@ -1402,6 +1426,7 @@ def _head_wing_kernel_face(
     *,
     nb_logical: int,
     include_surface: bool,
+    mu_block: int,
     layout="face",
     classes: int = 0,
     anti: bool = False,
@@ -1421,7 +1446,7 @@ def _head_wing_kernel_face(
     ``dE``, ``f`` and the masks are built on the same ``(i_X, j_Y)`` tile, so
     every pair-indexed value is ``1/P``.  ``Y`` reads the mun faces and ``Z``
     the nmu faces (separate endpoint bundles may differ between the two).
-    Per centroid block ``b`` (one ``_HEAD_WING_MU_BLOCK`` slice of each
+    Per centroid block ``b`` (one ``mu_block`` slice of each
     rank's own mu tile) a pass gathers its two endpoints on the block only,
     ``[k, s, M_b, i_X]`` for the bra and ``[k, s, M_b, j_Y]`` for the ket,
     ``M_b`` being block ``b`` of every mu tile (square mesh: the X and Y mu
@@ -1433,7 +1458,7 @@ def _head_wing_kernel_face(
     with bands on Y and the ket with bands on X.
     """
     key = ("head_wings_face", id(mesh), int(nb_logical), bool(include_surface),
-           layout, int(classes), bool(anti))
+           int(mu_block), layout, int(classes), bool(anti))
     hit = _KERNEL_CACHE.get(key)
     if hit is not None:
         return hit
@@ -1551,8 +1576,8 @@ def _head_wing_kernel_face(
         # Blocks read the faces in place: the last one is clamped to end at
         # mu_local and rewrites its overlap with the same rows (no padded
         # face copies).
-        mu_block = min(_HEAD_WING_MU_BLOCK, mu_local)
-        n_blocks = -(-mu_local // mu_block)
+        mu_block_ = min(int(mu_block), mu_local)
+        n_blocks = -(-mu_local // mu_block_)
         p_side = int(mesh.shape[ax_x])
 
         # Endpoint blocks ``[k, s, M_b, n]`` with the band tile on X (``_x``)
@@ -1564,7 +1589,7 @@ def _head_wing_kernel_face(
         # resident face (4 x 882 MB on the mu3088 CPU dump; the pin is
         # common.contract_bands.bands_to_contraction_slabs's).
         def _block(a, start, axis):
-            t = jax.lax.dynamic_slice_in_dim(a, start, mu_block, axis=axis)
+            t = jax.lax.dynamic_slice_in_dim(a, start, mu_block_, axis=axis)
             return with_layout_constraint(t, Layout(major_to_minor=tuple(range(t.ndim))))
 
         def _gathered(t, axis_name, order):
@@ -1591,7 +1616,7 @@ def _head_wing_kernel_face(
             """One wing: per centroid block, gather the endpoints, contract the
             local pair tile, reduce-scatter the block onto its own mu tile."""
             def _block_step(acc, blk):
-                start = jnp.minimum(blk * mu_block, mu_local - mu_block)
+                start = jnp.minimum(blk * mu_block_, mu_local - mu_block_)
                 ends = (band_x(bra, start), band_y(ket, start))
                 if use_anti:
                     ends = ends + (band_y(bra, start), band_x(ket, start))
@@ -1909,11 +1934,16 @@ def _head_wings_sharded_face(
         class_args = tuple(device_put_process_local(
             np.where(mask, _classes.counts, 0.0).astype(np.complex128), rep)
             for mask in (~anti, anti))
+    with_anti = _classes is not None and bool(np.any(_classes.antiunitary))
+    mu_block = head_wing_mu_block(
+        mu_local=-(-int(bra_wfns.psi_mun.shape[2]) // int(mesh.shape[_mesh_xy(mesh)[0]])),
+        nk=int(bra_wfns.psi_mun.shape[0]), ns=int(bra_wfns.psi_mun.shape[1]),
+        nb_full=nb_full, n_ends=4 if with_anti else 2)
     return _head_wing_kernel(
         mesh, nb_logical=int(nb_logical),
-        include_surface=bool(include_surface), layout=wfns.layout,
+        include_surface=bool(include_surface), mu_block=mu_block, layout=wfns.layout,
         classes=0 if _classes is None else int(_classes.ops.size),
-        anti=_classes is not None and bool(np.any(_classes.antiunitary)))(
+        anti=with_anti)(
             v, bra_wfns.psi_mun, ket_wfns.psi_mun,
             bra_wfns.psi_nmu, ket_wfns.psi_nmu,
             e, f, surface, omega,
