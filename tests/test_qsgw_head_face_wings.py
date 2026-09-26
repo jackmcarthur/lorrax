@@ -220,9 +220,9 @@ def test_packed_vertex_wings_preserve_three_axis_bits():
 
 def test_head_wings_face_mu_blocking_exercised(monkeypatch):
     """Force multiple mu blocks with a tiny mu count by shrinking
-    ``_HEAD_WING_MU_BLOCK`` -- exercises the pad/scan/truncate path a
-    default block of 64 would hide at this test's scale."""
-    monkeypatch.setattr(qsgw_head, "_HEAD_WING_MU_BLOCK", 3)
+    the budget's ``head_wing_mu_block`` -- exercises the pad/scan/truncate
+    path a whole-tile block would hide at this test's scale."""
+    monkeypatch.setattr(qsgw_head, "head_wing_mu_block", lambda **_: 3)
     qsgw_head._KERNEL_CACHE.clear()
     mesh = _mesh_xy()
     rng = np.random.default_rng(99)

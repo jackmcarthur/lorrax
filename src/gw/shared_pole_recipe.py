@@ -454,6 +454,15 @@ class CapacityLedger:
                    geometry=dict(g), max_mesh_ranks_at_fixed_bytes=max_ranks)
         return copy.deepcopy(row)
 
+    def room_bytes_per_rank(self, concurrent_with=()):
+        """What a new reservation beside ``concurrent_with`` may still take: the device
+        budget less the inherited peak and the named live stages (never negative).  A
+        planner sizes its batch from this, then reserves the batch it chose."""
+        row = self.preview(resident_bytes_per_rank=0, workspace_bytes_per_rank=0,
+                           concurrent_with=concurrent_with)
+        return max(0, int(row['available_device_bytes_per_rank'])
+                   - int(row['aggregate_bytes_per_rank']))
+
     def record_measured_peak(self, bytes_per_rank, *, reason):
         """Record the new-object maximum over ranks, excluding inherited stream."""
         peak = self._bytes(bytes_per_rank)

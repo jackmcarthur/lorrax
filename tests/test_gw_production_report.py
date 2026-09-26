@@ -428,7 +428,8 @@ def test_parent_carrier_description_has_automatic_chunk_number(tmp_path):
     text = path.read_text(encoding="utf-8")
     assert (
         "ψ parent carrier: band-distributed faces; band contractions gather "
-        "their band panels in memory-sized chunks; band chunks of 24." in text)
+        "their band panels in memory-sized chunks; band chunks of at least 24, "
+        "sized from memory_per_device_gb." in text)
     assert "low_mem_bands" not in text
 
 

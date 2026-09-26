@@ -46,9 +46,22 @@ def face_band_gather_product(A, B, mesh, phases, band_range, n_full=None):
         bounds = jnp.stack([jnp.clip(lo, 0, hi), hi], axis=1)
     if weight is not None:
         A = A * weight[:, None, :]
-    px, py = int(mesh.shape['x']), int(mesh.shape['y'])
-    tile_bytes = A.dtype.itemsize * int(n_full or nq) * (m // px) * (n // py)
+    tile_bytes = green_panel_bytes(n_rows=int(n_full or nq), m=m, n=n, mesh=mesh)
     return panel_matmul(A, B, mesh=mesh, panel_bytes=tile_bytes, bounds=bounds)
+
+
+def green_panel_bytes(*, n_rows, m, n, mesh, room=None):
+    """The transient band-panel budget of one Green build, per rank.
+
+    One Green tile, ``16·n_rows·(m/p_x)·(n/p_y)`` (the stage reserves it), so the
+    complete band extent is one gather whenever that fits; at most ``room`` when the
+    caller's ledger has less beside its live stages; never below one contraction
+    column ``16·n_rows·(m/p_x + n/p_y)`` (``distrib_la.panel_matmul``'s floor).
+    """
+    px, py = int(mesh.shape['x']), int(mesh.shape['y'])
+    tile = 16 * int(n_rows) * (int(m) // px) * (int(n) // py)
+    column = 16 * int(n_rows) * (int(m) // px + int(n) // py)
+    return int(max(column, tile if room is None else min(tile, int(room))))
 
 
 def _build_G_face(psi_mun, psi_nmu, *, gemm, Gij=None, phases=None, mesh=None,

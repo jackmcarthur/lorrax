@@ -122,7 +122,7 @@ def test_wing_contraction_matches_the_four_operand_expression_across_blocks(monk
     mesh = _mesh_xy()
     # Two 64-wide centroid blocks per rank (70 local of 140) and three frequency
     # blocks of the production width 2 (five frequencies).
-    monkeypatch.setattr(qsgw_head, "_HEAD_WING_MU_BLOCK", 64)
+    monkeypatch.setattr(qsgw_head, "head_wing_mu_block", lambda **_: 64)
     monkeypatch.setattr(qsgw_head, "_HEAD_WING_FREQUENCY_BLOCK", 2)
     qsgw_head._KERNEL_CACHE.clear()
     rng = np.random.default_rng(20260923)

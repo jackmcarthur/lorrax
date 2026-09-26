@@ -797,6 +797,26 @@ def _finish_receipt(receipt, meta, header, started):
     return receipt
 
 
+def moment_q_width(ledger, *, n_q, face_bytes, per_q):
+    """q parents per moment batch, from the ledger's room beside the live stages.
+
+    The room is the smaller of the ledger's (its budget less the reserved live
+    stages) and the device's (``common.gpu_utils.device_room_bytes``: the run
+    budget less the bytes actually live, which counts residents no ledger row
+    names).  A batch's outputs, ``(per_q·w + 16)`` faces, take at most half of it;
+    the batch's correlations, Coulomb read and Dyson temporaries reserve their own
+    footprints against the other half.  At least one q, at most every parent.
+    Every process enters (the device room is the minimum over processes).
+    """
+    from common.gpu_utils import device_budget_bytes, device_room_bytes, record_stage_price
+    device_room = device_room_bytes()
+    room = min(ledger.room_bytes_per_rank(ledger.live_stages), device_room)
+    width = max(1, min(int(n_q), int((0.5 * room / face_bytes - 16) // per_q)))
+    record_stage_price(f"moment bank, q width {width}/{int(n_q)}",
+                       device_budget_bytes() - device_room + (per_q * width + 16) * face_bytes)
+    return width
+
+
 def compute_moment_bank(wfns, meta, config, *, mesh_xy, sym, bank_io,
                         vertex=None, contact=None, direct_head=None):
     """Stage B: six exact correlations, physical recurrence, scratch write."""
@@ -818,7 +838,7 @@ def compute_moment_bank(wfns, meta, config, *, mesh_xy, sym, bank_io,
     _, _, moments, receipt["algebra"] = response_algebra(meta, config,
         mesh_xy=mesh_xy, n=n, ordered=ordered, photon=vertex is not None)
     per_q = 12 if ordered else 8
-    qwidth = max(1,min(len(qids),int((.75*ledger.U_bytes_per_rank/face_bytes-16)/per_q)))
+    qwidth = moment_q_width(ledger, n_q=len(qids), face_bytes=face_bytes, per_q=per_q)
     for q0 in range(0,len(qids),qwidth):
         q1 = min(q0+qwidth,len(qids))
         ledger.live_stages = ambient

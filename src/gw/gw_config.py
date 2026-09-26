@@ -811,9 +811,9 @@ def eigh_backend_choices() -> tuple:
 
 DISTRIB_LA_BATCHED_ROUTE_DEFAULT = "batch_reshard"
 
-# The owner-selected automatic band chunk remains the implementation policy
-# after the numeric deck key is retired; the chunk planner mesh-rounds and
-# caps this request at the fit window.
+# The owner-selected automatic band chunk is the floor of the ψ loader's band
+# tile after the numeric deck key is retired; the tile itself is sized from
+# memory_per_device_gb (``gw.gflat_memory_model.loader_band_chunk``).
 AUTOMATIC_BAND_CHUNK_SIZE = 16
 
 
