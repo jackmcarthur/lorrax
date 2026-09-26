@@ -104,11 +104,16 @@ class CoulombKernel(Protocol):
         method: str = "sobol",
         qmc_reps: int = 10,
         analytic_sphere: bool = False,
+        extra_chi=None,
     ) -> tuple[jax.Array, jax.Array]:
         """Return ``(vc0_mean, wcoul0)`` averaged over the mini-BZ cell.
 
         - ``S_cart`` (preferred):  ``wcoul0 = ⟨v(q) / (1 - v(q) qᵀSq)⟩``,
           using the same sample points as ``vc0_mean`` (anisotropic).
+          ``extra_chi`` (3D only): a callable ``q_cart (n,3) -> (n,)`` whose
+          value is added to ``qᵀSq`` at each sample -- a q-dependent
+          longitudinal response that has no q² form, such as a metal's
+          finite-q intraband term.
         - ``epshead`` (fallback): historical Ismail-Beigi gamma model.
           Less accurate; kept for back-compat with older runs.
         - ``static_kappa2`` (3D metal): Thomas-Fermi

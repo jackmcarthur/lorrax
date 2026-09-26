@@ -43,6 +43,7 @@ class Bulk3D(vcoul.Bulk3D):
         method: str = "sobol",
         qmc_reps: int = 10,
         analytic_sphere: bool = False,
+        extra_chi=None,
     ):
         return super().q0_average(
             CoulombGeometry.from_wfn(wfn),
@@ -51,4 +52,5 @@ class Bulk3D(vcoul.Bulk3D):
             nsamples=nsamples,
             method=method, qmc_reps=qmc_reps,
             analytic_sphere=analytic_sphere,
+            extra_chi=extra_chi,
         )

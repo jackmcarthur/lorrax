@@ -37,6 +37,7 @@ def compute_q0_averages(
 	qmc_reps: int = 10,
 	analytic_sphere: bool = False,
 	certificate_fn=None,
+	extra_chi=None,
 ):
 	"""Compute q=0 averages (vc0_mean, wcoul0) for the system's dimensionality.
 
@@ -76,6 +77,12 @@ def compute_q0_averages(
 	kwargs = {}
 	if int(getattr(meta, 'sys_dim', 3)) == 2:
 		kwargs["certificate_fn"] = certificate_fn
+	if extra_chi is not None:
+		if int(getattr(meta, 'sys_dim', 3)) != 3:
+			raise NotImplementedError(
+				"extra_chi (the metallic finite-q intraband response) is "
+				"defined for the 3D bulk head only")
+		kwargs["extra_chi"] = extra_chi
 	return kernel.q0_average(
 		wfn, meta,
 		S_cart=S_cart, epshead=epshead, static_kappa2=static_kappa2,

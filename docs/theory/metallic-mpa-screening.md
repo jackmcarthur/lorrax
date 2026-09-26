@@ -202,18 +202,27 @@ are different objects, and the head kernel keeps them apart by construction:
   excluded from $S$. Free electrons give $D=2n$, i.e. $\omega_p^2=16\pi n$ Ry$^2$.
   Measured: Na bcc $8^3$ 5.95 eV (free electron at this density 6.05 eV);
   Fe bcc $4^3$ 2.09/2.31 eV, where $4^3$ does not converge the Fermi surface.
-- **Static.** The exact $z=0$ slot is not the $\omega\to0$ value of the dynamic
-  expression; it takes
+- **The q = 0 cell.** The head is a mini-BZ average over $|q|\lesssim q_{\rm cell}$,
+  and inside the cell the two limits meet at $|\omega|=\bar v q$: the
+  particle-hole continuum screens statically below it, the Drude term holds
+  above it. The cell average therefore exchanges $q\cdot D\cdot q/z^2$ for the
+  finite-$q$ intraband response (`qsgw_head.lindhard_intraband_chi`)
 
   $$
-  \kappa_{\rm TF}^2=\frac{8\pi N(E_F)}{V_{\rm cell}},
+  \chi_{\rm intra}(\mathbf q,z)=-N_0\,L\!\left(\frac{z}{\bar v(\hat q)|q|}\right),\quad
+  L(s)=1-\frac{s}{2}\ln\frac{s+1}{s-1},\quad
+  \bar v(\hat q)^2=\frac{3\,\hat q\cdot D\cdot\hat q}{N_0},
   $$
 
-  with $N(E_F)$ the same tetrahedron weight sum, in the mini-BZ average, and
-  through the static wing/body fold when the head is folded
-  (`qsgw_head._metal_static_head`). The metal MPA and shared-pole plans have
-  no exact-zero sample: their origin is $i\varpi_0$, where the $q$-first
-  Drude head screens the whole cell ($W\to0$).
+  which is exact in both limits for any Fermi surface and the exact
+  crossover for a spherical one: Drude for $|z|\gg\bar v q$ and
+  Thomas–Fermi, $\kappa_{\rm TF}^2=8\pi N(E_F)/V_{\rm cell}$ with the same
+  tetrahedron weight sum, at $z=0$. At the metal plans' origin $i\varpi_0$ the
+  cell is statically screened, $\langle W\rangle=\langle8\pi/(q^2\epsilon_\infty+\kappa^2)\rangle$,
+  not $W=0$ (Na $8^3$: 35.9 against $8\pi/\kappa^2=36.1$ Ry bohr$^3$). A folded
+  head's exact $z=0$ row takes $\kappa_{\rm TF}^2$ through the static
+  wing/body fold (`qsgw_head._metal_static_head`). BerkeleyGW's GPP metal head
+  has the same static limit.
 
 **Every metallic head carries the metal's state.** The one-shot head, the
 frozen head of `sc_head_update = off` and the per-map head of `dft_velocity`
@@ -235,11 +244,10 @@ $$
 so QSGW maps and on-shell energies see the static head only; the Drude
 term moves them through $W^c(0)$ alone and moves $Z$ and off-shell values
 through the rest. The scalar head fit therefore reproduces its static sample
-exactly (§5.3). With $W^c(0)=-\langle v\rangle_{\rm cell}$ (perfect screening
-of the cell) the head adds the uniform $-\langle v\rangle/(2\Omega N_k)$ to
-exchange-plus-correlation and nothing band dependent; the Thomas–Fermi value
-adds $(1/2-f)\langle 8\pi/(q^2\epsilon_\infty+\kappa^2)\rangle/(\Omega N_k)$,
-$\pm1.9$ meV on Na $8^3$, falling as $1/N_k$.
+exactly (§5.3). Exchange plus the correlation head is then
+$-\langle v\rangle/(2\Omega N_k)$, uniform, plus the band-dependent
+$(1/2-f)\langle W(q,0)\rangle/(\Omega N_k)$: $\pm1.9$ meV on Na $8^3$, falling as
+$1/N_k$.
 
 **Accuracy of the static anchor.** $\kappa_{\rm TF}^2$ inherits the DOS
 estimator. On an $8\times8\times8$ sodium mesh five estimators of $N(E_F)$ from

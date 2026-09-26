@@ -237,3 +237,47 @@ def test_multiplet_drude_trace_is_basis_invariant_and_s_skips_the_pair():
         np.asarray([0.3j]), **{k: v for k, v in common.items()}))
     assert np.max(np.abs(s)) < 1.0e2
 
+
+
+def _textbook_lindhard(s):
+    """Retarded 3D Lindhard intraband factor, written independently."""
+    s = np.asarray(s, dtype=np.complex128)
+    return 1.0 - 0.5 * s * np.log((s + 1.0) / (s - 1.0))
+
+
+def test_lindhard_intraband_limits_and_crossover():
+    from gw.qsgw_head import lindhard_intraband_chi
+
+    dos = 0.0277                                  # Na 8^3, Ry^-1 bohr^-3
+    D = np.diag([7.97e-3, 7.97e-3, 7.97e-3])      # omega_p = 5.95 eV
+    vbar = np.sqrt(3.0 * 7.97e-3 / dos)
+    rng = np.random.default_rng(9)
+    qhat = rng.normal(size=(64, 3))
+    qhat /= np.linalg.norm(qhat, axis=1)[:, None]
+    q = 0.05 * qhat
+    qDq = np.einsum("qa,ab,qb->q", q, D, q)
+    # z = 0: Thomas-Fermi for every direction.
+    np.testing.assert_allclose(
+        np.asarray(lindhard_intraband_chi(q, 0.0, D, dos)), -dos, rtol=1e-13)
+    # |z| >> vbar q: the q-first Drude term plus its first dispersion
+    # correction, q.D.q/z^2 (1 + 3/5 (vbar q / z)^2).
+    for z in (0.4j, 0.5 + 0.4j, 2.0j):
+        got = np.asarray(lindhard_intraband_chi(q, z, D, dos))
+        s2 = (vbar * 0.05 / z) ** 2
+        np.testing.assert_allclose(got, qDq / z ** 2 * (1 + 0.6 * s2),
+                                   rtol=2e-4)
+    # The crossover itself, including the continuum below vbar q, against an
+    # independent retarded textbook form (s -> s + i0 on the real axis).
+    for x in (0.2, 0.7, 1.5, 4.0):
+        z = x * vbar * 0.05 + 1.0e-9j
+        got = np.asarray(lindhard_intraband_chi(q[:1], z, D, dos))[0]
+        want = -dos * _textbook_lindhard(z / (vbar * 0.05))
+        assert got == pytest.approx(want, rel=1e-6)
+        if x < 1.0:
+            assert got.imag < 0.0          # Landau damping, retarded sign
+    # Conjugate symmetry below the axis.
+    z = 0.3 * vbar * 0.05 - 0.01j
+    np.testing.assert_allclose(
+        np.asarray(lindhard_intraband_chi(q, z, D, dos)),
+        np.conj(np.asarray(lindhard_intraband_chi(q, np.conj(z), D, dos))),
+        rtol=1e-14)

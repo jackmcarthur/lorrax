@@ -52,6 +52,7 @@ class Bulk3D:
         method: str = "sobol",
         qmc_reps: int = 10,
         analytic_sphere: bool = False,
+        extra_chi=None,
     ):
         # ``analytic_sphere`` (head_minibz_average): add the analytic
         # Baldereschi-Tosatti sphere term to the q→0 head so vc0_mean is
@@ -79,6 +80,8 @@ class Bulk3D:
             means = [jnp.mean(self._vq_isotropic(rq)) for rq in batches]
             vc0_mean = jnp.mean(jnp.stack(means))
 
+        if extra_chi is not None and S_cart is None:
+            raise ValueError("q0_average: extra_chi adds to q.S.q; pass S_cart")
         if static_kappa2 is not None:
             if S_cart is not None:
                 raise ValueError(
@@ -100,6 +103,8 @@ class Bulk3D:
             for rq in batches:
                 vq = self._vq_isotropic(rq).astype(jnp.complex128)
                 qSq = jnp.einsum('qi,ij,qj->q', rq, S, rq)
+                if extra_chi is not None:
+                    qSq = qSq + extra_chi(rq)
                 wmeans.append(jnp.mean(vq / (1.0 - vq * qSq)))
             wcoul0 = jnp.mean(jnp.stack(wmeans))
             return vc0_mean.astype(jnp.complex128), wcoul0.astype(jnp.complex128)
