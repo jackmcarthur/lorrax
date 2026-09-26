@@ -615,7 +615,8 @@ def prepare_ladder_restart(
 
 def _ladder_wedge(tensors_filename, z_list_ry, mesh_xy, *, input_file,
                   include_w=True, print_fn=print, gmres_tol=None,
-                  config=None, meta=None, wfn=None):
+                  config=None, meta=None, wfn=None, on_z=None,
+                  with_head=True):
     """One call into ``bse.w_ladder``, with the residual gate on its output.
 
     ``gmres_tol`` defaults to the PRODUCTION constant :data:`_GMRES_TOL`.
@@ -626,6 +627,13 @@ def _ladder_wedge(tensors_filename, z_list_ry, mesh_xy, *, input_file,
 
     The import is function-level; see the module docstring for why (Python
     cycle, not a layer rule).
+
+    ``on_z(iz, z, wc_z)`` (optional) takes each z's gated
+    ``(nq_irr, mu_pad, mu_pad)`` wedge as soon as that z is solved: the facade
+    then walks one z at a time and never stacks the z list (the returned
+    wedge's ``wc`` is None).  Each z is gated on its own residuals and
+    iterations BEFORE ``on_z`` sees it, and logs its wall, GMRES iterations,
+    residual and this rank's device high-water.
 
     ``input_file`` is the GW deck.  The facade needs it in addition to the
     restart path because the irreducible q wedge comes from ``SymMaps``,
@@ -679,7 +687,7 @@ def _ladder_wedge(tensors_filename, z_list_ry, mesh_xy, *, input_file,
                         label=f"W ladder resolvent ({z.size} z, "
                               f"include_w={include_w})"):
         head_kwargs = {}
-        if config is not None:
+        if config is not None and with_head:
             from .gw_config import HeadCorrection
             if config.head.correction is HeadCorrection.FULL:
                 if meta is None or wfn is None:
@@ -696,11 +704,46 @@ def _ladder_wedge(tensors_filename, z_list_ry, mesh_xy, *, input_file,
                         float(meta.cell_volume), int(meta.nk_tot),
                         int(wfn.nspin), int(meta.nspinor_wfnfile)),
                 }
+        layout = str(getattr(getattr(config, "screening", None),
+                             "ladder_band_layout", "ring") or "ring")
+        stream = None
+        if on_z is not None:
+            import time
+            from runtime.xla_memory import pool_high_water
+            clock = {"t": time.perf_counter()}
+
+            def stream(iz, zz, wc_z, resid_z, iters_z):
+                wall = time.perf_counter() - clock["t"]
+                live = np.asarray(iters_z)[np.asarray(iters_z) > 0]
+                worst_z = float(np.max(resid_z)) if resid_z.size else 0.0
+                hot_z = int(np.max(iters_z)) if iters_z.size else 0
+                peak = pool_high_water(reset=False)
+                print_fn(
+                    f"  Ladder W(z) {_resolvent_diagram_name(include_w)} "
+                    f"z[{iz}] = "
+                    f"{complex(zz)!r} Ry: wall {wall:.1f} s, GMRES iters "
+                    f"mean {float(live.mean()) if live.size else 0.0:.1f} "
+                    f"max {hot_z}/{_GMRES_MAX_ITER}, max residual "
+                    f"{worst_z:.2e}, rank-0 device high-water "
+                    + (f"{peak / 2**30:.2f} GiB" if peak is not None
+                       else "n/a")
+                    + f" (psi layout {layout})")
+                if not (worst_z <= ceiling) or hot_z >= _GMRES_MAX_ITER:
+                    raise RuntimeError(
+                        f"w_bse: the ladder resolvent did not converge at "
+                        f"z = {complex(zz)!r} Ry -- max per-column residual "
+                        f"{worst_z:.3e} (ceiling {ceiling:.0e}), max "
+                        f"iterations {hot_z}/{_GMRES_MAX_ITER}.  A truncated "
+                        f"column returns a finite, plausible tile; it is "
+                        f"refused here rather than handed on.")
+                on_z(iz, complex(zz), wc_z)
+                clock["t"] = time.perf_counter()
         wedge = compute_wc_qwedge(
             tensors_filename, z, mesh_xy, include_w=include_w,
             gmres_tol=tol, gmres_max_iter=_GMRES_MAX_ITER,
             probe_chunk=probe_chunk,
-            input_file=input_file, **head_kwargs)
+            input_file=input_file, on_z=stream, band_layout=layout,
+            **head_kwargs)
     resid = _wedge_field(wedge, _RESIDUAL_FIELDS, np.float64)
     iters = _wedge_field(wedge, _ITERATION_FIELDS, np.int64)
     # AN ABSENT RESIDUAL IS A REFUSAL, NOT A SKIPPED CHECK.  "no residuals
@@ -985,25 +1028,15 @@ def compute_screening_ladder(
                 f"Refused at parse time for hl_ppm; restated here so a new "
                 f"real-axis role cannot inherit an answer.")
 
-    wedge = _ladder_wedge(
-        tensors_filename, z_list, mesh_xy,
-        input_file=getattr(config, "input_file", ""),
-        include_w=include_w, print_fn=print_fn,
-        config=config, meta=meta, wfn=head_resolver.wfn)
-    _assert_wedge_matches_run(wedge, sym)
-    _finalize_ladder_head(
-        wedge, config=config, meta=meta, head_resolver=head_resolver,
-        print_fn=print_fn)
-    wc = wedge.wc
-    if int(wc.shape[0]) != len(z_list):
-        raise ValueError(
-            f"{diagram_name}: the facade returned {int(wc.shape[0])} "
-            f"z-slabs for a {len(z_list)}-frequency request.")
-
+    # ONE z AT A TIME: each role's wedge is assembled to the full BZ and
+    # gated as soon as its z is solved, then dropped, so the resident set is
+    # one wedge rather than the (n_z, n_q, mu, mu) stack.
     W_by_role: dict[str, jax.Array] = {}
-    for i, req in enumerate(requests):
+
+    def _deliver(i, _z, wc_z):
+        req = requests[i]
         W_q = _assemble_full_bz_w(
-            wc[i], V_q, sym=sym, centroid_indices=centroid_indices,
+            wc_z, V_q, sym=sym, centroid_indices=centroid_indices,
             meta=meta, mesh_xy=mesh_xy, label=req.role, print_fn=print_fn)
         # THE SAME GATE THE RPA PATH RUNS, at the same tolerances.
         # Hermiticity and W_q = conj(W_{-q}) are EXPECTED to hold for the
@@ -1018,6 +1051,22 @@ def compute_screening_ladder(
                 sym=sym, print_fn=print_fn, kgrid=tuple(meta.kgrid),
                 include_w=include_w)
         W_by_role[req.role] = W_q
+
+    wedge = _ladder_wedge(
+        tensors_filename, z_list, mesh_xy,
+        input_file=getattr(config, "input_file", ""),
+        include_w=include_w, print_fn=print_fn,
+        config=config, meta=meta, wfn=head_resolver.wfn, on_z=_deliver)
+    # The assembled W's are not returned until the facade's wedge is proven
+    # to be this run's wedge.
+    _assert_wedge_matches_run(wedge, sym)
+    _finalize_ladder_head(
+        wedge, config=config, meta=meta, head_resolver=head_resolver,
+        print_fn=print_fn)
+    if len(W_by_role) != len(requests):
+        raise ValueError(
+            f"{diagram_name}: the facade delivered {len(W_by_role)} "
+            f"z-slabs for a {len(requests)}-frequency request.")
     return W_by_role
 
 
@@ -1094,8 +1143,59 @@ def make_ladder_wc_source(
     return _wc_from_ladder
 
 
+def deliver_ladder_z_list(config, meta, mesh_xy, sym, tensors_filename, *,
+                          print_fn=print):
+    """Optional W_BSE(q, z) at the deck's ``ladder_z_list``, one z at a time.
+
+    Runs after the driver has persisted the RPA W(0) (the ladder kernel
+    ``W_R``) into the restart bundle, under either ``screening_diagrams``
+    value, and hands nothing to Sigma: ``screening_diagrams = w_bse`` is the
+    route that replaces Sigma's W.  Each z is solved on the q wedge through
+    the same facade and the same per-z residual gate as that route, then
+    logged with one ``ladder_fingerprint`` per wedge q (the standalone facade
+    reproduces them from the same bundle).  Off when the key is empty.
+    """
+    z_list = tuple(complex(z) for z in config.screening.ladder_z_list)
+    if not z_list:
+        return None
+    from bse.w_ladder import ladder_fingerprint   # noqa: PLC0415 (cycle)
+
+    if not tensors_filename or not os.path.exists(tensors_filename):
+        raise ValueError(
+            "GATE ladder_z_list_needs_restart_writes: ladder_z_list reads "
+            "psi, energies, V and the RPA W(0) back from the restart bundle; "
+            f"got {tensors_filename!r}.  Set write_restart_tensors = true.")
+    _assert_restart_is_loadable(tensors_filename, include_w=True,
+                                print_fn=print_fn)
+    _refuse_metallic_mean_field(config, meta, include_w=True,
+                                print_fn=print_fn)
+    delivered = {}
+
+    def _log(iz, z, wc_z):
+        rows = []
+        for iq in range(int(wc_z.shape[0])):
+            fro, chk = ladder_fingerprint(wc_z[iq])
+            rows.append((fro, chk))
+            print_fn(f"  Ladder W(z) z[{iz}] q_irr[{iq}]: ||W-v||_F "
+                     f"{fro:.12e}  checksum {chk.real:+.12e}"
+                     f"{chk.imag:+.12e}j")
+        delivered[complex(z)] = rows
+
+    with timing.section("gw_jax.w_ladder_z_list", announce=True,
+                        label=f"W_BSE(z) delivery ({len(z_list)} z, one at "
+                              f"a time)"):
+        wedge = _ladder_wedge(
+            tensors_filename, z_list, mesh_xy,
+            input_file=getattr(config, "input_file", ""),
+            include_w=True, print_fn=print_fn, config=config, meta=meta,
+            on_z=_log, with_head=False)
+    _assert_wedge_matches_run(wedge, sym)
+    return delivered
+
+
 __all__ = [
     "compute_screening_ladder",
+    "deliver_ladder_z_list",
     "make_ladder_wc_source",
     "prepare_ladder_restart",
     "refuse_fractional_occupations",

@@ -4350,14 +4350,26 @@ def require_parent_screening_consumer(config):
     """Keep baseline admission for GW diagram consumers not ported to parents.
 
     Bundle consolidation changes storage ownership, not the set of admitted
-    screening algorithms. W_BSE must receive its own physics port and gate
-    before this baseline refusal can be removed.
+    screening algorithms.  The resolvent diagrams (``w_bse``,
+    ``w_rpa_resolvent``) are admitted for the independent-request modes
+    (cohsex, gn_ppm): their stage persists the RPA W(0) into the bundle and
+    the ladder facade reads the parent psi, energies and V back through the
+    BSE loader, the same reader the standalone ladder runs on parent bundles.
+    Under ``compute_mode = mpa`` the ladder feeds MPA's sample store through
+    ``make_ladder_wc_source``, which has not been gated on parents, so it
+    stays refused.
     """
     if not bool(config.compute_mode.needs_screening):
         return
-    diagrams = getattr(config.screening.diagrams, "value", config.screening.diagrams)
-    if str(diagrams) != "w_rpa":
-        raise ValueError(
-            "GATE parent_screening_diagrams: screening_diagrams = "
-            f"{diagrams} has not been ported to raw parents; "
-            "use screening_diagrams = w_rpa.")
+    diagrams = str(getattr(config.screening.diagrams, "value",
+                           config.screening.diagrams))
+    mode = str(getattr(config.compute_mode, "value", config.compute_mode))
+    if diagrams == "w_rpa":
+        return
+    if diagrams in ("w_bse", "w_rpa_resolvent") and mode != "mpa":
+        return
+    raise ValueError(
+        "GATE parent_screening_diagrams: screening_diagrams = "
+        f"{diagrams} under compute_mode = {mode} has not been ported to raw "
+        "parents; use screening_diagrams = w_rpa, or a resolvent diagram "
+        "with compute_mode = cohsex or gn_ppm.")

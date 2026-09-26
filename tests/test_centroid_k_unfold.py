@@ -475,12 +475,24 @@ def test_parent_plan_keeps_the_unreduced_one_band_case():
 
 
 def test_non_rpa_consumer_refuses_before_parent_loading():
-    """Consolidation preserves baseline admission for unported diagrams."""
-    cfg = SimpleNamespace(compute_mode=SimpleNamespace(needs_screening=True),
-                          screening=SimpleNamespace(diagrams="w_bse"))
+    """The ladder's MPA sample-store seam is not ported to parents."""
+    cfg = SimpleNamespace(
+        compute_mode=SimpleNamespace(needs_screening=True, value="mpa"),
+        screening=SimpleNamespace(diagrams="w_bse"))
     with pytest.raises(ValueError, match="parent_screening_diagrams.*w_bse"):
         _prepare_parent_wavefunction_plan(
             cfg, None, None, None, sym=None, centroid_indices=None, mesh_xy=None)
+
+
+@pytest.mark.parametrize("diagrams", ["w_bse", "w_rpa_resolvent"])
+@pytest.mark.parametrize("mode", ["cohsex", "gn_ppm"])
+def test_resolvent_diagrams_admitted_on_parents(diagrams, mode):
+    """The resolvent diagrams' independent-request stage reads parents."""
+    from file_io.restart_bundle import require_parent_screening_consumer
+    cfg = SimpleNamespace(
+        compute_mode=SimpleNamespace(needs_screening=True, value=mode),
+        screening=SimpleNamespace(diagrams=diagrams))
+    require_parent_screening_consumer(cfg)
 
 
 def test_parent_plan_requires_only_consumed_canonical_actions():

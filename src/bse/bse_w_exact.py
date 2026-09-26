@@ -916,8 +916,14 @@ def apply_screening_resolvent_block(G_zeta, z, data, matvec, diag_h, gen,
                                     resid_relative_to: str = "b",
                                     solve_data=None,
                                     snapshot_v=None,
-                                    deflation=None):
+                                    deflation=None,
+                                    view=None):
     """Screened-Coulomb resolvent on a block of probe columns — the ONE engine.
+
+    ``view`` (optional) maps ``data`` to the ring layout for the two eager
+    stages, the seed and the snapshot, when the payload's psi carriers rest in
+    another layout (``w_ladder`` ``band_layout='2d'``); the jitted solve takes
+    ``data`` as is.  ``None`` is the historical call.
 
     Computes ``W(omega) - v`` tiles from the non-TDA RPA density-response
     resolvent ``v (z - H_RPA)^{-1} v`` for a whole block of centroid-space probe
@@ -993,7 +999,8 @@ def apply_screening_resolvent_block(G_zeta, z, data, matvec, diag_h, gen,
     # z-independent, so a frequency sweep may hoist it (``rhs=``) — see
     # :func:`build_probe_rhs`, which is where it lives.
     if rhs is None:
-        rhs = build_probe_rhs(G_zeta, data, gen, sh)      # (2, nu, c, v, k)
+        rhs = build_probe_rhs(G_zeta, data if view is None else view(data),
+                              gen, sh)                     # (2, nu, c, v, k)
 
     # --- Stage 2: SOLVE via the cached jitted per-column-scan GMRES engine. ---
     # The engine is keyed on the operator STRUCTURE (matvec); the q/omega-dependent
@@ -1025,8 +1032,11 @@ def apply_screening_resolvent_block(G_zeta, z, data, matvec, diag_h, gen,
                                   deflation)
 
     # --- Stage 3: PROJECT (pair -> zeta), reduce-scatter to W(mu_X, nu_Y). ---
-    W_tile = snapshot(s_all, data["psi_c_Y"], data["psi_v_Y"],
+    sdata = data if view is None else view(
+        {"psi_c_Y": data["psi_c_Y"], "psi_v_Y": data["psi_v_Y"]})
+    W_tile = snapshot(s_all, sdata["psi_c_Y"], sdata["psi_v_Y"],
                       data["V_q0"] if snapshot_v is None else snapshot_v)
+    del sdata
     if return_iters:
         return W_tile, resids, iters
     return W_tile, resids
