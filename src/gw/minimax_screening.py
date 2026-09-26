@@ -494,9 +494,12 @@ def fit_gn_ppm_from_wc_pair(
     xy_mesh = xy_tile_mesh(Wc_probe_qmunu)
     kernel = _gn_ppm_fit_kernel_ordered if ordered else _gn_ppm_fit_kernel
     _kargs = (_z, _fb, n_log, _mask) + ((xy_mesh,) if ordered else ())
-    _qb = _gn_ppm_fit_q_block(
-        _nq, *_gn_ppm_fit_bytes_per_q(kernel, Wc0_qmunu, Wc_probe_qmunu, *_kargs),
-        _gn_ppm_fit_free_bytes())
+    _fit_bytes = _gn_ppm_fit_bytes_per_q(kernel, Wc0_qmunu, Wc_probe_qmunu, *_kargs)
+    _free = _gn_ppm_fit_free_bytes()
+    _qb = _gn_ppm_fit_q_block(_nq, *_fit_bytes, _free)
+    from common.gpu_utils import device_budget_bytes, record_stage_price
+    record_stage_price("GN-PPM fit, q block", device_budget_bytes() - _free
+                       + _qb * _fit_bytes[0] + 2 * _nq * _fit_bytes[1])
 
     # The anti-Hermitian half of the probe, kept only on the ordered path
     # (one extra (nq, mu, nu) c128 tile, needed again after the tail policy
@@ -688,21 +691,20 @@ def _gn_ppm_fit_bytes_per_q(kernel, Wc0, Wprobe, *args) -> tuple[int, int]:
 
 
 def _gn_ppm_fit_free_bytes() -> int:
-    """The device pool's free bytes, the minimum over processes.
+    """The room the fit may claim: the run's budget (``memory_per_device_gb``) less the
+    live bytes, capped at the pool fraction of the allocator's free pool, the minimum
+    over processes (``common.gpu_utils.device_room_bytes``).
 
-    ``LORRAX_PPM_FIT_ARENA_GIB`` overrides it (a resource cap).  A backend
-    without pool statistics (CPU) is unbounded here.
+    ``LORRAX_PPM_FIT_ARENA_GIB`` caps it further (a resource cap).
     """
+    from common.gpu_utils import device_room_bytes
+    free = device_room_bytes(pool_fraction=_GN_PPM_FIT_POOL_FRACTION)
     env = os.environ.get("LORRAX_PPM_FIT_ARENA_GIB", "").strip()
     if env:
-        free = float(env) * 1024 ** 3
-    else:
-        st = jax.local_devices()[0].memory_stats() or {}
-        limit = st.get("bytes_limit")
-        free = (float(1 << 62) if not limit else
-                _GN_PPM_FIT_POOL_FRACTION * (limit - st.get("bytes_in_use", 0)))
-    from common.collectives import all_gather_processes
-    return int(np.min(all_gather_processes(np.asarray(int(free), dtype=np.int64))))
+        from common.collectives import all_gather_processes
+        cap = int(float(env) * 1024 ** 3)
+        free = min(free, int(np.min(all_gather_processes(np.asarray(cap, dtype=np.int64)))))
+    return int(free)
 
 
 def _gn_ppm_fit_q_block(nq: int, block_bytes_per_q: int, out_bytes_per_q: int,

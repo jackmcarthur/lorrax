@@ -344,56 +344,73 @@ def build_G_tau(psi_xn, psi_yr, enk, t, *, e_ref=0.0, mask=None,
 # itself stays whole at the parents.
 # ---------------------------------------------------------------------------
 
-def sigma_spin_block(*, n_parent, n_rmu, ns, mesh, partner_tiles):
+def _green_stage_room(ns: int) -> tuple[float, float]:
+    """(live, room): the bytes already live, and what a Green-side stage may add, the
+    minimum over processes (every process must enter).  The room is the run's budget
+    (``memory_per_device_gb``, ``common.gpu_utils.device_room_bytes``) less the live
+    bytes, times the spinor's fragmentation utilization."""
+    from common.gpu_utils import (bfc_fragmentation_target_utilization, device_budget_bytes,
+                                  device_room_bytes)
+    free = float(device_room_bytes())
+    return device_budget_bytes() - free, free * bfc_fragmentation_target_utilization(int(ns))
+
+
+def _green_terms(*, n_parent, n_rmu, ns, n_band, mesh):
+    """(T_p, M_axis): one parent Green tile ``16·n_parent·ns²·μ²/P``, and one Green build's
+    band-complete panels of both ψ orientations ``16·n_parent·ns·μ·N_b·(1/p_x + 1/p_y)``
+    (``face_band_gather_product``), per rank."""
+    px, py = int(mesh.shape['x']), int(mesh.shape['y'])
+    tile = 16.0 * int(n_parent) * int(ns) ** 2 * int(n_rmu) ** 2 / (px * py)
+    panels = 16.0 * int(n_parent) * int(ns) * int(n_rmu) * int(n_band) * (1.0 / px + 1.0 / py)
+    return tile, panels
+
+
+def sigma_spin_block(*, n_parent, n_rmu, ns, n_full, n_band, mesh, partner_tiles):
     """The output spin block ``d`` (a divisor of ``ns``) a parent-row Σ convolution stores per pass.
 
-    Live per rank: the parent Green ``T_p = 16·n_parent·ns²·μ²/P``, ``partner_tiles`` more
-    of it (1 when the antiunitary partner is its own GEMM, 0 when it is read as conj(G)),
-    and the stored block ``T_p·(d/ns)²``; the largest ``d`` whose set fits the agreed
-    device target (the minimum process budget times the spinor's fragmentation
-    utilization) wins, else 1.  Every process computes the same ``d``.
+    New per rank beside what is live: the parent Green ``T_p``, ``partner_tiles`` more of
+    it (1 when the antiunitary partner is its own GEMM, 0 when it is read as conj(G)),
+    the stored block ``T_p·(d/ns)²``, the full-k W(τ) out of the k-convolution
+    ``16·N_k·μ²/P``, and the panels of the Green and partner builds ``2·M_axis``.  The
+    largest ``d`` whose set fits the stage room (:func:`_green_stage_room`) wins, else 1.
+    Every process computes the same ``d``.
     """
     if int(ns) <= 1:
         return 1
-    P_ = int(mesh.shape['x']) * int(mesh.shape['y'])
-    tile = 16.0 * int(n_parent) * int(ns) ** 2 * int(n_rmu) ** 2 / P_
-    target = _device_target_bytes(ns)
-    price = lambda d: (1.0 + float(partner_tiles) + (d / int(ns)) ** 2) * tile
+    tile, panels = _green_terms(n_parent=n_parent, n_rmu=n_rmu, ns=ns, n_band=n_band,
+                                mesh=mesh)
+    w_tau = 16.0 * int(n_full) * int(n_rmu) ** 2 / (int(mesh.shape['x']) * int(mesh.shape['y']))
+    live, room = _green_stage_room(ns)
+    new = lambda d: ((1.0 + float(partner_tiles) + (d / int(ns)) ** 2) * tile + w_tau
+                     + (1.0 + float(partner_tiles)) * panels)
     divisors = sorted((d for d in range(1, int(ns) + 1) if int(ns) % d == 0), reverse=True)
-    d = next((d for d in divisors if price(d) <= target), 1)
+    d = next((d for d in divisors if new(d) <= room), 1)
     from common.gpu_utils import record_stage_price
-    record_stage_price("Sigma tau, sigma_spin_block", price(d), section="sigma.tau_sweep")
+    record_stage_price("Sigma tau, sigma_spin_block", live + new(d), section="sigma.tau_sweep")
     return d
 
 
-def _device_target_bytes(ns: int) -> float:
-    """The agreed per-process device target: the minimum process budget times the spinor's
-    fragmentation utilization (the one target the Green-side planners share)."""
-    from common.gpu_utils import (bfc_fragmentation_target_utilization,
-                                  get_device_memory_gb,
-                                  minimum_process_budget_gb)
-    return (minimum_process_budget_gb(get_device_memory_gb()) * 1e9
-            * bfc_fragmentation_target_utilization(int(ns)))
-
-
-def chi_valence_chunks(*, n_parent, n_rmu, ns, n_full, n_out, n_val, mesh, partner):
+def chi_valence_chunks(*, n_parent, n_rmu, ns, n_full, n_out, n_val, n_band, mesh, partner):
     """Valence-band passes of the fused chi0 node (``w_isdf._get_chi_minimax_kernel_fused``).
 
     chi_tau = sum_ab conj(Gc'_ab) Gv'_ab is linear in Gv, so the valence Green may be
-    built and accumulated in band chunks against one conduction Green.  Live per rank:
-    ``(1 + partner)·T_p`` for Gc, the same over ``n`` for a Gv chunk, and the accumulator
-    ``16·n_out·N_k·μ²/P``, with ``T_p = 16·n_parent·ns²·μ²/P``; the smallest ``n`` that fits
-    the device target wins (every process computes the same ``n``), capped at ``n_val``.
+    built and accumulated in band chunks against one conduction Green.  A chunk's Gv is
+    still a whole ``(μ, ν)`` tile: chunking trims only the Gv build's panels.  New per
+    rank beside what is live: ``(1 + partner)·T_p`` for each of Gc and one Gv chunk, the
+    accumulator ``16·n_out·N_k·μ²/P``, and the panels ``(1 + partner)·M_axis·(1 + 1/n)``
+    (:func:`_green_terms`).  The smallest ``n`` that fits the stage room wins, capped
+    at ``n_val``; every process computes the same ``n``.
     """
-    P_ = int(mesh.shape['x']) * int(mesh.shape['y'])
-    tile = 16.0 * int(n_parent) * int(ns) ** 2 * int(n_rmu) ** 2 / P_
-    acc = 16.0 * int(n_out) * int(n_full) * int(n_rmu) ** 2 / P_
-    target = _device_target_bytes(ns)
-    side = (1.0 + float(bool(partner))) * tile
-    price = lambda n: side * (1.0 + 1.0 / n) + acc
-    n = next((n for n in range(1, max(1, int(n_val)) + 1) if price(n) <= target),
+    tile, panels = _green_terms(n_parent=n_parent, n_rmu=n_rmu, ns=ns, n_band=n_band,
+                                mesh=mesh)
+    acc = 16.0 * int(n_out) * int(n_full) * int(n_rmu) ** 2 / (
+        int(mesh.shape['x']) * int(mesh.shape['y']))
+    live, room = _green_stage_room(ns)
+    copies = 1.0 + float(bool(partner))
+    new = lambda n: copies * (2.0 * tile + panels * (1.0 + 1.0 / n)) + acc
+    n = next((n for n in range(1, max(1, int(n_val)) + 1) if new(n) <= room),
              max(1, int(n_val)))
     from common.gpu_utils import record_stage_price
-    record_stage_price("chi0, chi_valence_chunks", price(n), section="chi.exec")
+    record_stage_price("chi0, chi_valence_chunks", live + new(n), section="chi.exec")
     return n
 
