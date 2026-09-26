@@ -585,8 +585,10 @@ def test_sc_map0_is_the_one_shot_plan_and_freezes_padded_rules(monkeypatch, tmp_
     assert [w["rule_box_ry"] for w in windows] == [
         w["rule_box_ry"] for w in one_shot_geometry["branches"][0]["windows"]]
     assert not any(w["sc_fixed_rule"] or w["sc_fixed_padded_box_ry"] for w in windows)
-    # The same call built the padded set: one-shot and padded fits, 3 each.
-    assert first["sc_fixed_initialized"] and built == 6
+    # The same call fitted the padded set beside the one-shot set; the one-shot
+    # fits are the one-shot plan's own builds, served by the rule table.
+    assert first["sc_fixed_initialized"] and built == 3
+    assert first["rule_table_lookups"] == {"hit": 3, "built": 3}
     assert first["sc_fixed_initial_window_tau_pairs"] == 6
     for w in windows:
         padded = session["rules"][w["name"]]["padded_box"]

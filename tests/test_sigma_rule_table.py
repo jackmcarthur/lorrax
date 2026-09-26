@@ -6,6 +6,7 @@ miss; concurrent writers publish exactly one entry. Every cell here has its
 own table (``tests/conftest.py::_private_sigma_rule_table``).
 """
 
+import itertools
 import json
 import os
 import subprocess
@@ -44,11 +45,14 @@ def _plan(cache_dir, **kwargs):
 
 def _drifting(calls):
     """A builder whose answer changes on every call: only a memo can make a
-    warm plan equal the cold one, so the negative control is built in."""
+    warm plan equal the cold one, so the negative control is built in. The
+    drift counts every call ever made, not ``calls``, which cells clear."""
+    made = itertools.count(1)
+
     def build(box, eps, **kwargs):
         calls.append(tuple(box))
         rule = _fake_rule(box, eps, **kwargs)
-        return replace(rule, times=rule.times + 1.0e-3j * len(calls))
+        return replace(rule, times=rule.times + 1.0e-3j * next(made))
     return build
 
 
@@ -170,10 +174,11 @@ def test_an_unauthenticated_entry_is_a_named_miss_and_is_replaced(
     calls.clear()
     lines = []
     _plan(str(tmp_path / "run_b"), print_fn=lines.append)
-    warnings = [line for line in lines if "rule table entry not served" in line]
-    assert len(calls) == 1 and len(warnings) == 1
-    assert named in warnings[0] and str(paths[0]) in warnings[0]
-    assert "replaced by this run's build" in " ".join(lines)
+    served = [line for line in lines if "rule table entry not served" in line]
+    missed = [line for line in served if "replaced by this run's build" not in line]
+    replaced = [line for line in served if "replaced by this run's build" in line]
+    assert len(calls) == 1 and len(missed) == 1 and len(replaced) == 1
+    assert named in missed[0] and str(paths[0]) in missed[0]
 
     calls.clear()
     _, geometry = _plan(str(tmp_path / "run_c"), **_QUIET)
