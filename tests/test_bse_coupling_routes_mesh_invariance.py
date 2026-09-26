@@ -25,7 +25,9 @@ at all.  Both zeta legs then stay in stationary accumulators.
                 fix/kdb-zeta-sharding-2026-08-08 @ 443a23fe, FIX_kdb_sharding.md
     instance 2  bse_stack_matvec._encode_T_B  (a PORT of instance 1, which
                 inherited the defect and did not inherit the fix)
-                @ 3a8223e4, CONSOLIDATION2_REPORT.md §3-4
+                @ 3a8223e4, CONSOLIDATION2_REPORT.md §3-4; since 2026-09-26 the
+                stack routes read T_B's legs (_outer_legs_B) on the k-conv load,
+                and the red twin is installed there
 
 Instance 2 was found only because the SDY lane declared its port and the
 consolidation census re-measured it.  Instance 1's gate
@@ -274,6 +276,26 @@ def _pre_fix_stack_encode(Xb_b, psi_c_Y, psi_v_X):
     return jnp.einsum("kvtM,kvsN->ktMsN", psi_v_X, Rv)   # the shipped k-leading T
 
 
+def _pre_fix_stack_legs_B(Xb_b, psi_c_Y, psi_v_X):
+    """RED TWIN for instance 2 in the outer-load interface (BSEMAX, 2026-09-26).
+
+    The stack routes form T_B on the convolution's load from two legs
+    (``bse_stack_matvec._outer_legs_B``) and no longer call ``_encode_T_B``, so the
+    pre-port defect is re-created where it would now live: the same rank-local
+    v tile, the same gather of the nu-carrying partial over 'y', handed to the
+    load as the right leg (the K = n_v branch; this worker has n_v = n_c).
+    """
+    import jax.numpy as jnp
+    from jax import lax
+    py = lax.psum(1, "y")
+    v_loc = Xb_b.shape[1] // py
+    mine = lax.dynamic_slice_in_dim(Xb_b, lax.axis_index("y") * v_loc,
+                                    v_loc, axis=1)
+    R = jnp.einsum("kcsN,cvk->kvsN", jnp.conj(psi_c_Y), mine)
+    Rv = lax.all_gather(R, "y", axis=1, tiled=True)      # <- moves nu too
+    return jnp.moveaxis(psi_v_X, 1, -1), Rv
+
+
 def _pre_fix_ring_encode(X, psi_c_Y, psi_v_X, v_chunk, px, py, mu_local,
                          nu_local):
     """RED TWIN for instance 1 -- the PRE-FIX _ring_sum_B_encode.
@@ -463,17 +485,22 @@ def _worker() -> int:
     # Each twin ships with a CONTROL route it must leave clean: that is what
     # makes the red evidence rather than noise -- the gate is pointed at the
     # coupling screened-direct term, not at the mesh in general.
-    shipped = getattr(bsm, "_encode_T_B", None)
+    # The stack routes take the outer load wherever it serves (every mesh this
+    # worker builds), so the twin goes into the leg the load reads; the
+    # ``_encode_T_B`` spelling remains the XLA route's.
+    site = "_outer_legs_B" if hasattr(bsm, "_outer_legs_B") else "_encode_T_B"
+    twin = _pre_fix_stack_legs_B if site == "_outer_legs_B" else _pre_fix_stack_encode
+    shipped = getattr(bsm, site, None)
     if shipped is None:
         res["red_stack_unavailable"] = (
-            "bse_stack_matvec._encode_T_B is gone, so the pre-port twin could "
+            f"bse_stack_matvec.{site} is gone, so the pre-port twin could "
             "not be installed")
     else:
-        bsm._encode_T_B = _pre_fix_stack_encode
+        setattr(bsm, site, twin)
         try:
             res["red_stack"] = score(["stack_fused", "ring"])
         finally:
-            bsm._encode_T_B = shipped
+            setattr(bsm, site, shipped)
 
     # --- RED ARM 2: instance 1's defect, back in ----------------------------
     shipped_ring = getattr(brc, "_ring_sum_B_encode", None)
