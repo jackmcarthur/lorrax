@@ -1511,7 +1511,7 @@ def main(argv=None):
 
         # ── Q path from the ONE K_POINTS crystal_b machinery ─────────────────
         from gw.gw_config import linalg_resolution, read_lorrax_input
-        from bandstructure import htransform as ht
+        from bandstructure import fh_interp as ht
         from bandstructure.bse_setup import (compute_wfns_fi,
                                              resolve_conduction_window)
 

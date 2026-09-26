@@ -185,7 +185,7 @@ def _solve(htransform, basis_path, **kwargs):
 def test_matching_deck_basis_is_reused_with_one_canonical_rank_receipt(
         tmp_path, monkeypatch):
     import inspect
-    import bandstructure.htransform as htransform
+    import bandstructure.fh_interp as htransform
     from isdf import galerkin
 
     basis = _fixture_basis()
@@ -217,7 +217,7 @@ def test_matching_deck_basis_is_reused_with_one_canonical_rank_receipt(
 
 def test_deck_basis_mismatch_refits_and_absent_basis_is_published(
         tmp_path, monkeypatch):
-    import bandstructure.htransform as htransform
+    import bandstructure.fh_interp as htransform
     from isdf import galerkin
 
     basis = _fixture_basis()
@@ -270,7 +270,7 @@ def test_deck_basis_mismatch_refits_and_absent_basis_is_published(
 
 
 def test_outer_r_shell_mask_handles_even_odd_and_singleton_axes():
-    from bandstructure.htransform import build_R_grid_np, outer_r_shell_mask
+    from bandstructure.fh_interp import build_R_grid_np, outer_r_shell_mask
 
     grid = (4, 3, 1)
     r_grid = np.asarray(build_R_grid_np(grid), dtype=int)

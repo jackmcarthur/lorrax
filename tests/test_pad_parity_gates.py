@@ -392,6 +392,7 @@ def test_fftgrid_clients_delegate_divisor_and_extent_arithmetic():
         src / "common" / "wfn_transforms.py",
         src / "common" / "psi_G_store.py",
         src / "bandstructure" / "htransform.py",
+        src / "bandstructure" / "fh_interp.py",
         galerkin_path,
         src / "file_io" / "parallel_transport.py",
         src / "gw" / "kin_ion_io.py",
@@ -404,7 +405,7 @@ def test_fftgrid_clients_delegate_divisor_and_extent_arithmetic():
     parallel = (src / "common" / "parallel_transport.py").read_text()
     wfn = (src / "common" / "wfn_transforms.py").read_text()
     store = (src / "common" / "psi_G_store.py").read_text()
-    ht = (src / "bandstructure" / "htransform.py").read_text()
+    ht = (src / "bandstructure" / "fh_interp.py").read_text()
     galerkin = galerkin_path.read_text()
     staged = (src / "common" / "staged_reshard.py").read_text()
     fit = (src / "common" / "sharding_fit.py").read_text()
@@ -731,7 +732,7 @@ def test_resolve_extra_rank_pad_reads_the_env_and_refuses_garbage():
     never import the module, never touch ``os.environ``, and cannot tell a
     working resolver from a dead one.  This is the first test that runs it.
     """
-    from bandstructure.htransform import resolve_extra_rank_pad
+    from bandstructure.fh_interp import resolve_extra_rank_pad
 
     keep = os.environ.pop("LORRAX_EXTRA_RANK_PAD", None)
     try:
@@ -756,7 +757,7 @@ def test_resolve_extra_rank_pad_reads_the_env_and_refuses_garbage():
 def test_extra_rank_pad_only_adds_mesh_aligned_null_directions(monkeypatch):
     """The knob's arithmetic: rank stays lcm-aligned and only grows."""
     import math
-    from bandstructure.htransform import resolve_extra_rank_pad
+    from bandstructure.fh_interp import resolve_extra_rank_pad
     from runtime.padding import round_up
 
     align = math.lcm(2, 4)          # a 2x4 mesh

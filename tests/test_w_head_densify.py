@@ -691,7 +691,7 @@ def test_the_bse_meta_is_stamped_with_the_decks_sys_dim():
 
     src_path = _os.path.join(
         _os.path.dirname(_os.path.dirname(_os.path.abspath(bse_densify.__file__))),
-        "bandstructure", "htransform.py")
+        "bandstructure", "fh_interp.py")
     fn = next(n for n in ast.walk(ast.parse(open(src_path).read()))
               if isinstance(n, ast.FunctionDef) and n.name == "initialize_wfns")
 
