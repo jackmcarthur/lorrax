@@ -1138,6 +1138,13 @@ def _group_stream_arguments(rules, group):
     return times, weights
 
 
+@lru_cache(maxsize=16)
+def _group_zeros(mesh_xy, shape):
+    """The donated group carry [member, q, mu_X, nu_Y], one program per shape."""
+    return jax.jit(lambda: jnp.zeros(shape, jnp.complex128),
+                   out_shardings=NamedSharding(mesh_xy, P(None, None, "x", "y")))
+
+
 def integrate_response_group(wfns, meta, mesh_xy, rules, group, *, q_ids,
                              execute, receipt, ordered=False, vertex=None):
     """Donated [value/ds per member, q, mu_X, nu_Y]; one Green/FFT scan per group."""
@@ -1146,8 +1153,7 @@ def integrate_response_group(wfns, meta, mesh_xy, rules, group, *, q_ids,
     kernel, fixed = response_stream(wfns, meta, mesh_xy=mesh_xy,
         q_ids=q_ids, n_outputs=weights.shape[1], pair_mode="direct", bank_carry=True,
         ordered=ordered, vertex=vertex, band_ranges=rules["band_ranges"])
-    raw = jax.jit(lambda: jnp.zeros((weights.shape[1],len(q_ids),n,n),jnp.complex128),
-        out_shardings=NamedSharding(mesh_xy,P(None,None,"x","y")))()
+    raw = _group_zeros(mesh_xy, (weights.shape[1],len(q_ids),n,n))()
     args = (jnp.asarray(times), jnp.asarray(weights), *fixed,
         stream_weights(wfns, rules["f"], mesh_xy), stream_weights(wfns, rules["u"], mesh_xy),
         jnp.asarray(rules["refs"]), raw)
