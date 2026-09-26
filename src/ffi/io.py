@@ -4,9 +4,7 @@ Wave-2 merge (docs/architecture/ffi_layout.md §3/§6, executed 2026-08-01):
 the former ``ffi.phdf5`` package — ``context.py`` (file/handle lifecycle),
 ``read.py`` (sharded slab / k-chunk readers) and ``write.py`` (sharded slab
 writer) — concatenated verbatim into one module, imports de-duplicated,
-NOTHING renamed.  ``ffi.phdf5`` remains as a re-export shim until its
-consumers (file_io/_slab_io_ffi.py, file_io/wfn_loader.py) migrate; deleting
-the shim is the gate that the migration is complete.
+NOTHING renamed.
 
 Each process reads/writes its local shard directly to a hyperslab of the
 shared HDF5 file via MPI-IO — no gather through rank 0.  See

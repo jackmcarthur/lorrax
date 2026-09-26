@@ -94,7 +94,7 @@ Two rules follow, and both are enforced:
   differently because of an exported variable is not a function of its
   arguments. Dials are parameters. Where a dial has to come from outside, the
   pattern is one level down: `common/contract_bands.py` makes no `os.environ`
-  call and consumes `ffi.mklblas.gemm.GATE`, a typed capability object.
+  call and consumes `ffi.gemm.GATE`, a typed capability object.
 * **An L2 module imports no L1 module** (rule 3). One exception survives
   ([§5](#5-the-sanctioned-exceptions), R2).
 
