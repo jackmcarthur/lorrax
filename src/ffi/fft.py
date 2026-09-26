@@ -167,6 +167,7 @@ __all__ = [
     "make_kfft_klead", "make_kfft_kminor",
     "make_local_kfft_klead", "make_local_kfft_kminor", "make_local_kconv_kminor",
     "make_local_kconv_klead",
+    "KCONV_KLEAD_OUTER_TARGET", "klead_outer_refusal", "make_local_kconv_klead_outer",
     "PLANE_FFT_GATHER_TARGET", "plane_fft_split", "plane_resident_bytes", "make_plane_fft_gather",
 ]
 
@@ -181,6 +182,11 @@ KCONV_PAIR_TARGET = "lorrax_mathdx_kconv_pair"
 KCONV_PARENT_TARGET = "lorrax_mathdx_kconv_parent"
 KCONV_PLANE_TARGET = "lorrax_mathdx_kconv_plane"
 KCONV_KLEAD_TARGET = "lorrax_mathdx_kconv_klead"
+#: Mode 2 with its T formed on the load as a rank-K outer-product sum (the BSE W term's encode):
+#: :func:`make_local_kconv_klead_outer`, cpp/cufft/kconv_outer_cuda_ffi.cc.
+KCONV_KLEAD_OUTER_TARGET = "lorrax_mathdx_kconv_klead_outer"
+#: The outer load keeps the right leg in registers: K <= this (the handler's kKMax).
+KCONV_OUTER_K_MAX = 16
 #: Modes 7/8 on the parent rows, with the conj-on-load partner and (mode 7) the output spin block.
 KCONV_KLEAD_UNFOLD_TARGET = "lorrax_mathdx_kconv_klead_unfold_xblock"
 KCONV_KLEAD_LORENTZ_TARGET = "lorrax_mathdx_kconv_klead_lorentz_conj"
@@ -1261,6 +1267,63 @@ def make_local_kconv_klead(mesh: Mesh, kgrid, *, norm: str | None = "ortho",
     def _plan(t, v_r):
         t_r = _plan_kfft(t, kg, "ifftn") * scale
         return _plan_kfft(t_r * v_r[:, None, :, None, :], kg, "fftn")
+    return _plan
+
+
+def klead_outer_refusal(mesh: Mesh, kgrid, rank: int) -> str | None:
+    """``None`` when :func:`make_local_kconv_klead_outer` serves this mesh, grid and rank K, else why not.
+
+    The outer load needs the handler in the loaded library, K <= ``KCONV_OUTER_K_MAX`` (a
+    register-resident leg), one thread per (k, y) (nk <= 256) and a k-box tile in shared memory
+    (the handler's own refusals name the last two).  A cpu mesh is always served (the plan route).
+    Callers that get a reason keep the unfused encode + :func:`make_local_kconv_klead` chain and
+    say so.
+    """
+    kg = _check_kgrid(kgrid, kconv_backend(mesh))
+    if kconv_backend(mesh) != "mathdx":
+        return None
+    from ffi.common import ffi_loader
+    ok, why = ffi_loader.probe_target(KCONV_KLEAD_OUTER_TARGET, "CUDA")
+    if not ok:
+        return f"no {KCONV_KLEAD_OUTER_TARGET} handler ({why})"
+    if not 1 <= int(rank) <= KCONV_OUTER_K_MAX:
+        return f"rank K={int(rank)} outside [1, {KCONV_OUTER_K_MAX}] (register-resident leg)"
+    if kg[0] * kg[1] * kg[2] > 256:
+        return f"nk={kg[0] * kg[1] * kg[2]} > 256 (one thread per (k, y) of a 256-thread block)"
+    return None
+
+
+def make_local_kconv_klead_outer(mesh: Mesh, kgrid, *, norm: str | None = "ortho",
+                                 mult: float = 1.0, yb: int = 0) -> Callable:
+    """Rank-local ``fn(L, R, V_R) -> U``: :func:`make_local_kconv_klead` of ``T = Σ_K L R``.
+
+    ``U = mult · fftn(ifftn(T) · V_R[:, None, :, None, :])`` with
+    ``T[k,a,x,b,y] = Σ_K L[k,a,x,K] R[k,K,b,y]`` for ``L`` ``(nk, a, mx, K)``, ``R``
+    ``(nk, K, b, my)``, ``V_R`` ``(nk, mx, my)`` and ``U`` ``(nk, a, mx, b, my)``.  CUDA: the
+    outer-product load (``kconv_outer_cuda_ffi.cc``) forms T in shared memory and never stores
+    it; the transforms, the kernel multiply and the scaled store are mathdx mode 2's, so U
+    differs from ``make_local_kconv_klead(einsum(L, R), V_R)`` only in the order of the K sum.
+    cpu: that composition on the plan route.  ``yb`` (0 = the handler's rule) is the tile's y
+    width, a measurement dial for the kernel's own bench.  Check :func:`klead_outer_refusal`
+    first.
+    """
+    kg = _check_kgrid(kgrid, kconv_backend(mesh))
+    nk = kg[0] * kg[1] * kg[2]
+    scale = ffi_fft_scale("ifftn", norm, nk) * ffi_fft_scale("fftn", norm, nk) * float(mult)
+    if kconv_backend(mesh) == "mathdx":
+        _require_target(KCONV_KLEAD_OUTER_TARGET, "CUDA")
+        attrs = dict(nkx=np.int64(kg[0]), nky=np.int64(kg[1]), nkz=np.int64(kg[2]),
+                     scale=np.float64(scale), yb=np.int64(yb))
+
+        def _mathdx(l, r, v_r):
+            shape = (l.shape[0], l.shape[1], l.shape[2], r.shape[2], r.shape[3])
+            return jax.ffi.ffi_call(KCONV_KLEAD_OUTER_TARGET, jax.ShapeDtypeStruct(shape, l.dtype))(
+                l, r, v_r, **attrs, **_mathdx_common())
+        return _mathdx
+    apply = make_local_kconv_klead(mesh, kg, norm=norm, mult=mult)
+
+    def _plan(l, r, v_r):
+        return apply(jnp.einsum("kaxK,kKby->kaxby", l, r), v_r)
     return _plan
 
 

@@ -120,6 +120,9 @@ _CUDA_TARGET_SYMBOLS = {
     "lorrax_mathdx_kconv_parent":   "KConvMathdxParentCudaFfi",
     "lorrax_mathdx_kconv_plane":    "KConvMathdxPlaneCudaFfi",
     "lorrax_mathdx_kconv_klead":    "KConvMathdxKleadCudaFfi",
+    # The BSE W term's outer-product load (cpp/cufft/kconv_outer_cuda_ffi.cc):
+    # mode 2 with T = sum_K L R formed in shared memory, never stored.
+    "lorrax_mathdx_kconv_klead_outer": "KConvMathdxKleadOuterCudaFfi",
     "lorrax_mathdx_kconv_klead_unfold_rows": "KConvMathdxKleadUnfoldRowsCudaFfi",
     "lorrax_mathdx_kconv_klead_lorentz_rows": "KConvMathdxKleadLorentzRowsCudaFfi",
     "lorrax_mathdx_kconv_klead_unfold_block": "KConvMathdxKleadUnfoldBlockCudaFfi",
