@@ -1303,9 +1303,10 @@ def make_local_kconv_klead_outer(mesh: Mesh, kgrid, *, norm: str | None = "ortho
     outer-product load (``kconv_outer_cuda_ffi.cc``) forms T in shared memory and never stores
     it; the transforms, the kernel multiply and the scaled store are mathdx mode 2's, so U
     differs from ``make_local_kconv_klead(einsum(L, R), V_R)`` only in the order of the K sum.
-    cpu: that composition on the plan route.  ``yb`` (0 = the handler's rule) is the tile's y
-    width, a measurement dial for the kernel's own bench.  Check :func:`klead_outer_refusal`
-    first.
+    cpu: that composition on the plan route.  ``yb`` picks the load's arm, a measurement dial
+    for the kernel's own bench: 0 (default) the fp64 tensor-core (DMMA) K-sum on an 8x8 tile,
+    K zero-padded to a multiple of 4; -1 the register-leg FMA arm at the handler's y width;
+    > 0 that arm at this y width.  Check :func:`klead_outer_refusal` first.
     """
     kg = _check_kgrid(kgrid, kconv_backend(mesh))
     nk = kg[0] * kg[1] * kg[2]
@@ -1317,6 +1318,10 @@ def make_local_kconv_klead_outer(mesh: Mesh, kgrid, *, norm: str | None = "ortho
 
         def _mathdx(l, r, v_r):
             shape = (l.shape[0], l.shape[1], l.shape[2], r.shape[2], r.shape[3])
+            pad = -l.shape[3] % 4 if yb == 0 else 0      # the DMMA arm's 4-wide K chunks
+            if pad:
+                l = jnp.pad(l, ((0, 0), (0, 0), (0, 0), (0, pad)))
+                r = jnp.pad(r, ((0, 0), (0, pad), (0, 0), (0, 0)))
             return jax.ffi.ffi_call(KCONV_KLEAD_OUTER_TARGET, jax.ShapeDtypeStruct(shape, l.dtype))(
                 l, r, v_r, **attrs, **_mathdx_common())
         return _mathdx
