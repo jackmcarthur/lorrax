@@ -92,12 +92,38 @@ def test_cohsex_has_no_second_hartree_density_owner():
 
 def test_live_hartree_derives_f_spin_at_the_density_owner():
     """Pin the production call chain from exact Hartree to the quadrature."""
-    source = (_REPO / "src" / "gw" / "kin_ion_io.py").read_text()
-    hartree_src = source[source.index("def compute_hartree_matrix("):]
+    source = (_REPO / "src" / "gw" / "hartree.py").read_text()
+    hartree_src = source[source.index("def direct_field_matrices("):]
     # One density builder: the SC loop's scan, fed the loader's f_spin.
     assert "f_spin = spin_degeneracy_factor(wfn)" in hartree_src
     assert "spin_degeneracy=f_spin" in hartree_src
     assert "rho_from_wfns(" in hartree_src
+
+
+def _calls_named(source: str, name: str) -> int:
+    import ast
+    return sum(1 for n in ast.walk(ast.parse(source))
+               if isinstance(n, ast.Call)
+               and getattr(n.func, "attr", getattr(n.func, "id", None)) == name)
+
+
+def test_the_dirac_current_is_projected_once():
+    """ARCH H2: the one-shot Hartree used to project the current a second
+    time, so its movement/residual receipts measured an already-projected
+    field and could not see a symmetry defect (TASTE 21).  The projection is
+    ``rho_from_wfns``'s, and the Hartree owner reports that receipt."""
+    hartree = (_REPO / "src" / "gw" / "hartree.py").read_text()
+    density = (_REPO / "src" / "gw" / "qsgw_density.py").read_text()
+    assert _calls_named(hartree, "project_polar_fft_field") == 0
+    assert "projection_receipt_fn=projections.append" in hartree
+    rho = density[density.index("def rho_from_wfns("):
+                  density.index("def rho_r_to_G(")]
+    assert _calls_named(rho, "project_polar_fft_field") == 1
+    assert _calls_named(rho, "projection_receipt_fn") == 1
+    # Red twin: the counter sees a second projection when there is one.
+    twin = ("from symmetry_maps import project_polar_fft_field as p\n"
+            "x = symmetry_maps.project_polar_fft_field(j, sym)\n")
+    assert _calls_named(twin, "project_polar_fft_field") == 1
 
 
 def test_spin_capacity_refuses_an_undeclared_spin_structure():

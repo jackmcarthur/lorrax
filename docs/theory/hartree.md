@@ -2,7 +2,7 @@
 
 GW builds the direct field live from its own wavefunctions and occupations.
 `kin_ion.h5` carries only $T+V_{\rm loc}+V_{\rm NL}$. There is one
-implementation, `gw.kin_ion_io.compute_hartree_matrix`, and it always works
+implementation, `gw.hartree.direct_field_matrices`, and it always works
 on the WFN FFT grid: there is no stored, folded or ISDF Hartree.
 
 ## Sources
@@ -24,9 +24,10 @@ below.
 Both sums come from one density scan, `gw.qsgw_density.rho_from_wfns`, over
 the star wedge of k with weights $|\text{star}|/N_k$, star-averaged by the
 FFT-grid pullback. The one-shot driver and the self-consistent map share it.
-The current is then projected onto the polar-vector representation of the
-magnetic group (`symmetry_maps.project_polar_fft_field`, antiunitary rows
-included).
+Inside that scan the current is projected once onto the polar-vector
+representation of the magnetic group (`symmetry_maps.project_polar_fft_field`,
+antiunitary rows included); its receipt (the movement of the raw field, the
+covariance residual of the projected one) is the one the run reports.
 
 ## G-space solve
 

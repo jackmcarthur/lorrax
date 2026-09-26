@@ -339,7 +339,7 @@ consumer adds the dynamic sectors.
 | Green function | `greens_function_kernel.build_G` | `(N_k, μ, s, ν, s')` | two-axis on the centroid axes | all |
 | head-attribution block (under `sigma_freq_debug_output`) | `photon_layout.photon_q0_low_rank_block` | `(1, p_A, p_B)` | `P(None,'x','y')` | P |
 | bare transverse exchange | `sigma_x_bispinor.compute_sigma_x_bispinor` | `(N_k, n_b, n_b)` | replicated output window | B, SP-hybrid |
-| scalar and transverse Hartree | `sigma_dispatch._compute_live_hartree` → `kin_ion_io.compute_hartree_matrix` | `(N_k, n_b, n_b)` Ry each | `P(None,'x','y')` | all bispinor |
+| scalar and transverse Hartree | `sigma_dispatch._compute_live_hartree` → `gw.hartree.direct_field_matrices` | `(N_k, n_b, n_b)` Ry each | `P(None,'x','y')` | all bispinor |
 
 **`contract_lorentz_blocks`** is the shared X/SX/COH block consumer for P,
 B and SP-hybrid. It groups the requested blocks into endpoint classes
