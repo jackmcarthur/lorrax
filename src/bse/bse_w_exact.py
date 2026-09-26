@@ -793,8 +793,11 @@ def _get_block_gmres_solver(matvec, sh, max_iter, tol, dtype,
         return _bind_tol(hit[1], tol)
 
     @jax.jit
-    def _block(rhs, diag_h, z, operands, tol_rt):
+    def _block(rhs, diag_h, z, operands, tol_rt, deflation=None):
         # rhs: (2, nu, c, v, k) — scan the per-column GMRES over the probe axis nu.
+        # ``deflation`` is a runtime pytree: None traces the historical
+        # diagonal-preconditioned program, a ``(U, C)`` pair the spectral one
+        # (bse_feast.apply_spectral_deflation); jit keeps one executable each.
         rhs_scan = jnp.moveaxis(rhs, 1, 0)  # (nu, 2, c, v, k)
 
         def _solve_col(carry, rhs_col):
@@ -806,7 +809,8 @@ def _get_block_gmres_solver(matvec, sh, max_iter, tol, dtype,
             # iteration count no log could ever show.  Carried out for LOGGING.
             x, k_used = _gmres_solve_core(matvec, rhs_i, diag_h, z, operands,
                                           max_iter, tol_rt,
-                                          resid_relative_to=resid_relative_to)
+                                          resid_relative_to=resid_relative_to,
+                                          deflation=deflation)
             r_true = rhs_i - _apply_shifted_matvec(matvec, x, z, operands)
             nrhs = jnp.linalg.norm(rhs_i)
             resid = jnp.where(nrhs == 0.0, jnp.asarray(0.0, dtype=nrhs.dtype),
@@ -832,8 +836,9 @@ def _get_block_gmres_solver(matvec, sh, max_iter, tol, dtype,
 
 def _bind_tol(block, tol):
     """Bind the runtime ``tol`` so callers keep the 4-argument call shape."""
-    return lambda rhs, diag_h, z, operands: block(
-        rhs, diag_h, z, operands, jnp.asarray(tol, dtype=jnp.float64))
+    return lambda rhs, diag_h, z, operands, deflation=None: block(
+        rhs, diag_h, z, operands, jnp.asarray(tol, dtype=jnp.float64),
+        deflation)
 
 
 def build_probe_rhs(G_zeta, data, gen, sh):
@@ -910,7 +915,8 @@ def apply_screening_resolvent_block(G_zeta, z, data, matvec, diag_h, gen,
                                     rhs=None,
                                     resid_relative_to: str = "b",
                                     solve_data=None,
-                                    snapshot_v=None):
+                                    snapshot_v=None,
+                                    deflation=None):
     """Screened-Coulomb resolvent on a block of probe columns — the ONE engine.
 
     Computes ``W(omega) - v`` tiles from the non-TDA RPA density-response
@@ -1008,10 +1014,15 @@ def apply_screening_resolvent_block(G_zeta, z, data, matvec, diag_h, gen,
     # ``W - v = v T (I - T)^{-1}`` Dyson.  The SEED keeps the physical ``v``
     # either way, so ``rhs``, the residual denominator and the iteration
     # counts mean the same thing on both routes.
+    # ``deflation`` — ``(U, C)`` from ``bse_feast.harvest_spectral_deflation``
+    # for THIS (q, z) operator, or None (diagonal preconditioner only).  It
+    # changes the Krylov iterates, not the system: the answer moves at the
+    # solver tolerance, and the true-residual gate below is unchanged.
     s_all, resids, iters = solver(rhs, diag_h,
                                   jnp.asarray(z, dtype=jnp.complex128),
                                   operands_fn(data if solve_data is None
-                                              else solve_data))
+                                              else solve_data),
+                                  deflation)
 
     # --- Stage 3: PROJECT (pair -> zeta), reduce-scatter to W(mu_X, nu_Y). ---
     W_tile = snapshot(s_all, data["psi_c_Y"], data["psi_v_Y"],

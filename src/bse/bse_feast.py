@@ -229,8 +229,95 @@ def build_preconditioner_diagonal_sharded(
     return jax.lax.with_sharding_constraint(diag_full, diag_sharding)
 
 
+def apply_spectral_deflation(v: jax.Array, deflation) -> jax.Array:
+    """``P v = v + U (T^{-1} - I) U^H v`` — the rank-k spectral preconditioner.
+
+    ``deflation = (U, C)``: ``U`` is ``(k,) + v.shape``, orthonormal, spanning an
+    approximate invariant subspace of the right-preconditioned operator
+    ``A = (z - H) diag(z - D)^{-1}``, and ``C = T^{-1} - I`` with
+    ``T = U^H A U``.  On an exact invariant subspace ``A P`` maps those
+    eigenvalues to 1 and leaves the rest of the spectrum alone, so GMRES stops
+    paying iterations for them.  ``P`` is a fixed preconditioner: any ``U``
+    with ``T`` invertible gives the SAME solution to tolerance, and a poor
+    ``U`` only costs iterations.  The coefficient ``U^H v`` is one
+    ``(k,)`` all-reduce; the update is local.
+    """
+    U, C = deflation
+    axes = tuple(range(v.ndim))
+    c = jnp.tensordot(jnp.conj(U), v, axes=(tuple(a + 1 for a in axes), axes))
+    return v + jnp.tensordot(C @ c, U, axes=(0, 0)).astype(v.dtype)
+
+
+#: ``(id(matvec), n_arnoldi, shape, dtype) -> (matvec, jitted Arnoldi)``.
+_ARNOLDI_CACHE: dict = {}
+
+
+def harvest_spectral_deflation(matvec, diag_h, z, operands, seed, *,
+                               n_arnoldi: int, rank: int):
+    """Recycled eigenvectors of the preconditioned resolvent, for every column.
+
+    Every probe column of one ``(q, z)`` solves against the SAME operator
+    ``A = (z - H) diag(z - D)^{-1}``, and on the ladder the columns all pay
+    for the same few eigenvalues far from 1 (bound excitons below the
+    free-pair continuum).  One ``n_arnoldi``-step Arnoldi from ``seed`` (a
+    ``(2, 1, c, v, k)`` pair-basis vector) finds them once; the ``rank``
+    Ritz vectors farthest from 1 become ``U`` of
+    :func:`apply_spectral_deflation`, and ``T = Q^H H_m Q`` comes from the
+    Arnoldi relation ``A V_m = V_{m+1} H`` with no further matvec.
+
+    Returns ``((U, C), ritz)``: ``ritz`` are the Ritz values of ``H_m`` on the
+    host (for the log).  Cost: ``n_arnoldi`` matvecs once per ``(q, z)``.
+    """
+    m = int(n_arnoldi)
+    key = (id(matvec), m, tuple(seed.shape), str(seed.dtype))
+    hit = _ARNOLDI_CACHE.get(key)
+    if hit is None:
+        axes = tuple(range(1, 1 + seed.ndim))
+
+        @jax.jit
+        def _arnoldi(seed_, diag_, z_, ops_):
+            m_inv = 1.0 / (z_ - diag_)
+            if m_inv.ndim == seed_.ndim - 1:
+                m_inv = m_inv[None, ...]
+            V = jnp.zeros((m + 1,) + seed_.shape, seed_.dtype)
+            V = V.at[0].set(seed_ / jnp.linalg.norm(seed_))
+            H = jnp.zeros((m + 1, m), seed_.dtype)
+
+            def body(k, state):
+                V, H = state
+                w = _apply_shifted_matvec(matvec, m_inv * V[k], z_, ops_)
+                w = w.astype(seed_.dtype)
+                h = jnp.zeros((m + 1,), seed_.dtype)
+                for _ in range(2):
+                    hp = jnp.sum(jnp.conj(V) * w[None], axis=axes)
+                    w = w - jnp.tensordot(hp, V, axes=(0, 0))
+                    h = h + hp
+                hn = jnp.linalg.norm(w)
+                H = H.at[:, k].set(h.at[k + 1].set(hn))
+                V = V.at[k + 1].set(jnp.where(hn == 0, w, w / hn))
+                return V, H
+
+            return jax.lax.fori_loop(0, m, body, (V, H))
+
+        hit = (matvec, _arnoldi)
+        _ARNOLDI_CACHE[key] = hit
+    V, H = hit[1](seed, diag_h, jnp.asarray(z, dtype=jnp.complex128), operands)
+    from common.collectives import gather_to_host
+    Hm = np.asarray(gather_to_host(H))[:m, :m]
+    ritz, S = np.linalg.eig(Hm)
+    order = np.argsort(np.abs(ritz - 1.0))[::-1][:int(rank)]
+    Qk, _ = np.linalg.qr(S[:, order])
+    T = Qk.conj().T @ Hm @ Qk
+    C = np.linalg.inv(T) - np.eye(Qk.shape[1])
+    # Host factors enter as numpy (replicated constants on every process),
+    # never as a process-local jax.Array mixed into a global computation.
+    U = jnp.tensordot(np.ascontiguousarray(Qk.T, dtype=np.complex128), V[:m],
+                      axes=(1, 0))
+    return (U, np.ascontiguousarray(C, dtype=np.complex128)), ritz
+
+
 def _gmres_solve_core(matvec, b, diag_h, z, operands, max_iter, tol, *,
-                      x0=None, resid_relative_to: str = "b"):
+                      x0=None, resid_relative_to: str = "b", deflation=None):
     """Diagonally right-preconditioned GMRES with a while-loop early exit.
 
     Pure function of its RUNTIME args ``(b, diag_h, z, operands, tol, x0)``;
@@ -247,6 +334,12 @@ def _gmres_solve_core(matvec, b, diag_h, z, operands, max_iter, tol, *,
     ``||r0||`` 8-11x ``||b||`` (opt_shifts, 2026-08-16), i.e. the "initial
     guess" is an order of magnitude WORSE than starting from nothing, so a
     caller that wants ``x0 = 0`` can now ask for it.
+
+    ``deflation`` — ``None`` (the diagonal preconditioner alone, the
+    historical program) or the ``(U, C)`` pair of
+    :func:`harvest_spectral_deflation`, applied inside the same right
+    preconditioner by :func:`apply_spectral_deflation`.  RUNTIME: one compiled
+    program per pytree shape, and every column of a ``(q, z)`` reuses it.
 
     ``resid_relative_to`` — the denominator of the early-exit test.
 
@@ -312,7 +405,12 @@ def _gmres_solve_core(matvec, b, diag_h, z, operands, max_iter, tol, *,
         k, rel, V, Z, H, g, Q = state
 
         v_k = V[k]
-        z_k = m_inv * v_k
+        # ``deflation`` (runtime, or None = the historical diagonal-only
+        # program): the rank-k spectral correction rides the SAME right
+        # preconditioner, so ``Z`` stores it and the exit ``x0 + Z y`` is
+        # unchanged.  See :func:`apply_spectral_deflation`.
+        z_k = m_inv * (v_k if deflation is None
+                       else apply_spectral_deflation(v_k, deflation))
         Z = Z.at[k].set(z_k)
         w = _apply_shifted_matvec(matvec, z_k, z, operands).astype(b.dtype)
 

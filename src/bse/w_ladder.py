@@ -31,7 +31,11 @@ mesh with production PartitionSpecs on 2026-08-16 (the audit and its numbers:
 sandbox); the three that did not survive are stated in their corrected form
 and the defects they named are fixed in this file.
 
-Cost per ``(q, z)`` point = (GMRES iterations) x (one ring matvec).  The
+Cost per ``(q, z)`` point = (GMRES iterations) x (one ring matvec).  On the
+ladder the iteration count, not the per-iteration overhead, is the lever
+(~4 % of a ladder iteration is outside the matvec, measured 2026-09-26), so
+every ``(q, z)`` recycles ``LADDER_DEFLATION_RANK`` Ritz vectors of its own
+preconditioned operator across all of its probe columns (:func:`_deflation_for`).  The
 ladder matvec is NOT the RPA one at the same price: measured static collective
 counts are 8 -> 24 (x3.0) for the matvec and 40 -> 88 (x2.2) for the whole
 non-TDA solve, none of them on an ``N_mu^2``-class operand.  The whole
@@ -524,6 +528,7 @@ def sweep_q_wedge(
     on_result: Callable,
     build_hook: Optional[Callable] = None,
     route: str = "plain",
+    deflation_rank: Optional[int] = None,
 ):
     """Walk the q-wedge x probe-chunk x z-list with ONE compiled engine.
 
@@ -557,6 +562,11 @@ def sweep_q_wedge(
     :func:`dyson_close_tile` (``compute_wc_qwedge`` does).  The
     sweep does not close it itself because the close is once per (q, z) over
     the whole assembled tile, i.e. after the probe chunks have been placed.
+
+    ``deflation_rank`` — recycled eigenvectors per ``(q, z)`` (None = the
+    measured default for this operator, :data:`LADDER_DEFLATION_RANK` on the
+    ladder and 0 on the RPA operator; 0 = the diagonal-only engine).  See
+    :func:`_deflation_for`.
     """
     # ``build_ladder_resolvent`` -> ``ensure_W_R(data, ...)`` populates
     # ``data['W_R']`` ONCE, here, OUTSIDE the q loop.  That is a correctness-
@@ -616,6 +626,9 @@ def sweep_q_wedge(
             "build_finite_q_data returns carrying it; re-adding an in-loop "
             "ensure_W_R would restore the per-q densifier retrace instead.")
     z_list_ry = np.asarray(z_list_ry, dtype=np.complex128)
+    if deflation_rank is None:
+        deflation_rank = LADDER_DEFLATION_RANK if include_w else 0
+    op_fn = ladder_matvec_operands if include_w else matvec_operands
     for iq, qv in enumerate(q_list):
         q = (int(qv[0]), int(qv[1]), int(qv[2]))
         dq = build_finite_q_data(data, q, mesh_xy)
@@ -639,6 +652,10 @@ def sweep_q_wedge(
             solve_dq, mesh_xy, include_W=include_w, use_tda=False)
         if build_hook is not None:
             build_hook(iq, q, dq)
+        # One deflation space per (q, z), harvested on the first probe block
+        # and reused by every later block: the operator does not depend on
+        # the probe, so the eigenvectors every column pays for are found once.
+        defl_by_z: dict = {}
         for c0, n_real, G in probe_blocks_for_q(iq, q):
             # NOT cast to float64 here: ``build_probe_rhs`` REFUSES a complex
             # probe block by name, and a cast on this line would discard its
@@ -656,16 +673,55 @@ def sweep_q_wedge(
             # dwarfs it.
             rhs = build_probe_rhs(G, dq, gen, sh)
             for iz, z in enumerate(z_list_ry):
+                if deflation_rank > 0 and iz not in defl_by_z:
+                    defl_by_z[iz] = _deflation_for(
+                        matvec, diag_hq, complex(z),
+                        op_fn(solve_dq if lift else dq), rhs,
+                        rank=int(deflation_rank))
                 W_tile, resids, iters = apply_screening_resolvent_block(
                     G, complex(z), dq, matvec, diag_hq, gen, snapshot, sh,
                     max_iter=gmres_max_iter, tol=gmres_tol, return_iters=True,
                     rhs=rhs,
                     solve_data=(solve_dq if lift else None),
                     snapshot_v=(eye_v if lift else None),
-                    operands_fn=(ladder_matvec_operands if include_w
-                                 else matvec_operands))
+                    operands_fn=op_fn,
+                    deflation=defl_by_z.get(iz))
                 on_result(iq, q, iz, complex(z), c0, n_real,
                           W_tile, resids, iters)
+
+
+#: Recycled eigenvectors per (q, z) on the LADDER operator, and the Arnoldi
+#: length that finds them.  MEASURED on Si 4x4x4 SOC (480 centroids, 8v x 20c,
+#: P4; ``runs/Si/106_bsew_20260926``): the ladder's diagonally preconditioned
+#: resolvent has eigenvalues far from 1 at finite q -- on BOTH sides of zero
+#: ([-0.78, 4.22] at the third wedge q) -- and every probe column paid for
+#: them separately: 9 / 22 / 98 GMRES iterations at the first three wedge q,
+#: against 7-9 on the RPA operator of the same payload, whose preconditioned
+#: spectrum sits in [1, 2.15].  Through this engine, iterations per column at
+#: (rank, Arnoldi) = 0, (32, 64), (48, 96), (64, 128): 22.4 / 11.5 / 9.3 / 8.3
+#: at q1 and 97.8 / 53.8 / 41.3 / 23.1 at q2; one warm harvest at (64, 128)
+#: costs 1.44 s = 128 matvecs, once per (q, z).  A harvest reused at a
+#: neighbouring q is WORSE than none (111 iterations at q2), so it is per q.
+#: The RPA operator gets no deflation.
+LADDER_DEFLATION_RANK = 64
+LADDER_DEFLATION_ARNOLDI = 128
+
+
+def _deflation_for(matvec, diag_h, z, operands, rhs, *, rank: int):
+    """Harvest the ``(U, C)`` spectral deflation for one ``(q, z)`` operator.
+
+    Seeded with the sum of the block's right-hand sides (every probe column's
+    content, deterministic and rank-consistent).  ``LADDER_DEFLATION_ARNOLDI``
+    matvecs, once per ``(q, z)``; the solve reuses the result for every probe
+    chunk.
+    """
+    from .bse_feast import harvest_spectral_deflation
+    seed = jnp.sum(rhs, axis=1, keepdims=True)
+    defl, _ritz = harvest_spectral_deflation(
+        matvec, diag_h, z, operands, seed,
+        n_arnoldi=max(LADDER_DEFLATION_ARNOLDI, 2 * int(rank)),
+        rank=int(rank))
+    return defl
 
 
 def compute_wc_qwedge(
@@ -683,6 +739,7 @@ def compute_wc_qwedge(
     head_dipole_path: Optional[str] = None,
     head_n_occ: Optional[int] = None,
     head_pref: Optional[float] = None,
+    deflation_rank: Optional[int] = None,
 ) -> WLadderWedge:
     """Ladder ``W(z) - v`` bodies for every irreducible q and every requested z.
 
@@ -836,7 +893,7 @@ def compute_wc_qwedge(
         data, mesh_xy, q_list, z_list_ry, include_w=include_w,
         probe_blocks_for_q=lambda _iq, _q: blocks,
         gmres_tol=gmres_tol, gmres_max_iter=gmres_max_iter,
-        on_result=_on_result, route=route,
+        on_result=_on_result, route=route, deflation_rank=deflation_rank,
         build_hook=((lambda iq, q, dq: v_by_q.__setitem__(iq, dq["V_q0"]))
                     if route == "lift" else None))
 
