@@ -1315,6 +1315,29 @@ class MixedBasisPairConvolution:
         """Collectives in each stage's compiled HLO, lowered on abstract operands:
         ``{stage: {op: count}}`` (the structural claim: the streamed middle moves nothing)."""
         import re
+        pat = re.compile(r"\b(all-to-all|all-gather|all-reduce|reduce-scatter|collective-permute)"
+                         r"(-start)?\(")
+        out = {}
+        for name, low in self._lowered_stages().items():
+            text = low.compile().as_text()
+            counts = {}
+            for m in pat.finditer(text):
+                counts[m.group(1)] = counts.get(m.group(1), 0) + 1
+            out[name] = counts
+        return out
+
+    def compiled_memory(self) -> dict:
+        """Each stage's compiled per-rank buffers, ``{stage: {argument, output, alias, temp}}``
+        in bytes (``Compiled.memory_analysis``): the XLA-side check of the planner's transients."""
+        out = {}
+        for name, low in self._lowered_stages().items():
+            m = low.compile().memory_analysis()
+            out[name] = dict(argument=int(m.argument_size_in_bytes), output=int(m.output_size_in_bytes),
+                             alias=int(m.alias_size_in_bytes), temp=int(m.temp_size_in_bytes))
+        return out
+
+    def _lowered_stages(self) -> dict:
+        """Every stage lowered on abstract operands of this plan's shapes."""
         nk, nq, nx = self.nk, self.nq, self.spins[2]
         sd = lambda shape, dt, spec: jax.ShapeDtypeStruct(shape, dt, sharding=NamedSharding(self.mesh, spec))
         rep = lambda shape, dt: sd(shape, dt, P())
@@ -1347,16 +1370,7 @@ class MixedBasisPairConvolution:
                 sd((n_pad,), i32, P(_XY)), sd((nq, n_pad), c128, P(None, _XY)))
         ops["final"] = self._final.lower(T, rep((nq, 3), f64), rep((nq, self.mo_axis.carrier), i32),
                                          rep((self.nr,), i32))
-        pat = re.compile(r"\b(all-to-all|all-gather|all-reduce|reduce-scatter|collective-permute)"
-                         r"(-start)?\(")
-        out = {}
-        for name, low in ops.items():
-            text = low.compile().as_text()
-            counts = {}
-            for m in pat.finditer(text):
-                counts[m.group(1)] = counts.get(m.group(1), 0) + 1
-            out[name] = counts
-        return out
+        return ops
 
     def describe(self) -> str:
         """The plan receipt: backend, box, carriers, schedule and the memory law."""
