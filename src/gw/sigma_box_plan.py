@@ -147,9 +147,10 @@ def resolve_sigma_box_cache_dir(setting, input_dir):
 
     ``"auto"`` selects ``<input_dir>/tmp/sigma_quadrature_rules``;
     ``"off"`` disables the acceleration, including the run-independent rule
-    table (:func:`_rule_table_root`); any other relative path is resolved
-    against ``input_dir``.  A cache is not an accuracy path: every loaded rule
-    is still checked for box containment and the requested error currency.
+    table (:func:`resolve_sigma_rule_table_dir`); any other relative path is
+    resolved against ``input_dir``.  A cache is not an accuracy path: every
+    loaded rule is still checked for box containment and the requested error
+    currency.
     """
     raw = str(setting).strip()
     if raw.lower() == "off":
@@ -519,7 +520,7 @@ def _write_rule_archive(path, rule, noise_amplification, digest, **extra):
 # equals the cold run that wrote the table, and no run's answer depends on
 # which other decks wrote it. Serving across runs by containment would.
 
-def _rule_table_root(cache_dir):
+def resolve_sigma_rule_table_dir(cache_dir):
     """The run-independent rule table, or ``None`` when caching is off.
 
     ``$SCRATCH/.cache/lorrax/sigma_box_rules``, beside the compile caches
@@ -539,9 +540,15 @@ def _rule_table_root(cache_dir):
 
 
 def _rule_table_key(build_box, eps, relative, kappa_cap):
-    """Everything a builder call's result depends on, JSON-ready."""
+    """Everything a builder call's result depends on, JSON-ready.
+
+    ``builder`` names the function that answers: a patched builder (a test
+    fake) opens its own namespace and can never answer a production key.
+    """
     return {
         "format": _RULE_TABLE_FORMAT, "schema": _RULE_CACHE_SCHEMA,
+        "builder": (f"{build_uniform_rule.__module__}."
+                    f"{build_uniform_rule.__qualname__}"),
         "box": [float(value) for value in build_box], "eps": float(eps),
         "relative": bool(relative),
         "kappa_cap": None if kappa_cap is None else float(kappa_cap),
@@ -557,7 +564,7 @@ def _rule_table_path(root, key):
     blob = json.dumps(key, sort_keys=True, separators=(",", ":"))
     digest = hashlib.sha256(blob.encode()).hexdigest()
     solver = hashlib.sha256(json.dumps(
-        key["solver"], sort_keys=True).encode()).hexdigest()[:16]
+        [key["builder"], key["solver"]], sort_keys=True).encode()).hexdigest()[:16]
     return (os.path.join(root, f"{key['format']}_{solver}", digest[:2],
                          f"rule_{digest}.npz"), blob)
 
@@ -793,7 +800,7 @@ def _fit_rule(spec, eps, cache_dir, eta, *, cache_build_widen=True,
                     noise_amplification_cap / (1.0 + eps))
             # The table memoizes this builder call: the attempts range is not
             # in the key because the stored rule is the window's decided one.
-            table = _rule_table_root(cache_dir)
+            table = resolve_sigma_rule_table_dir(cache_dir)
             entry = None
             if table is not None:
                 table_key = _rule_table_key(
@@ -1113,7 +1120,7 @@ def fit_sigma_box_spec_groups(groups, eta_ry, *, eps, cache_dir):
     # Every rank has looked up by now (the gather above), so writing the
     # plan's builds cannot change any choice made in it. One writer: the
     # replicated receipts already hold every build.
-    table = _rule_table_root(cache_dir)
+    table = resolve_sigma_rule_table_dir(cache_dir)
     if process_rank() == 0:
         stored, published = {}, {}
         for fit in fits:
@@ -1764,7 +1771,7 @@ def plan_sigma_windows(
         "eta_ry": eta, "eps": tolerance,
         "rule_eps": tolerance,
         "cache_dir": cache_dir, "rule_cache_schema": _RULE_CACHE_SCHEMA,
-        "rule_table_dir": _rule_table_root(cache_dir),
+        "rule_table_dir": resolve_sigma_rule_table_dir(cache_dir),
         "rule_table_format": _RULE_TABLE_FORMAT,
         "rule_table_lookups": {
             status: sum(1 for row in fit_rows

@@ -811,10 +811,13 @@ _L1_LIBRARY_ENV_READS = {
     "gw.sigma_plan": {
         "LORRAX_SIGMA_PLAN",
     },
-    # Debug-only support-box trace.  Accuracy, reduction wall and cache
-    # location are deck keys; no numerical policy is read here.
+    # Debug-only support-box trace, and the test suite's private rule-table
+    # directory (resolve_sigma_rule_table_dir; tests/conftest.py sets it so
+    # a patched builder never writes the user's table).  Accuracy, reduction
+    # wall and cache location are deck keys; no numerical policy is read here.
     "gw.sigma_box_plan": {
         "LORRAX_UNIFORM_RULE_TRACE",
+        "LORRAX_SIGMA_RULE_TABLE_TEST_DIR",
     },
     # resolve_extra_rank_pad — one resolver, refuse-on-garbage; the entry
     # layer passes the resolved value down.
