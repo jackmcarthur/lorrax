@@ -95,14 +95,20 @@ def face_rows(mesh_xy, rows, width=None):
     """Select parent rows of face stacks [B, m_X, r_Y] on their replicated leading axis.
 
     Several stacks are joined along that axis first; ``width`` keeps the leading
-    columns. Rows move nothing between ranks.
+    columns, and a ``width`` past the stacks' own carrier (a held writer
+    carrier) appends zero columns. Rows move nothing between ranks.
     """
     import jax
     import jax.numpy as jnp
     from jax.sharding import NamedSharding, PartitionSpec as P
     index = tuple(int(r) for r in rows)
-    return jax.jit(lambda *parts: jnp.concatenate(parts)[jnp.asarray(index)][..., :width],
-                   out_shardings=NamedSharding(mesh_xy, P(None, 'x', 'y')))
+
+    def select(*parts):
+        a = jnp.concatenate(parts)[jnp.asarray(index)][..., :width]
+        if width is not None and a.shape[-1] < width:
+            a = jnp.pad(a, ((0, 0),) * (a.ndim - 1) + ((0, width - a.shape[-1]),))
+        return a
+    return jax.jit(select, out_shardings=NamedSharding(mesh_xy, P(None, 'x', 'y')))
 
 
 @lru_cache(maxsize=None)
