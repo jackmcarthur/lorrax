@@ -307,8 +307,8 @@ convergence statement covers the body quadrature at a fixed head.
 
 After body and head, the common dynamic-$\Sigma$ finalizer
 (`gw.sigma_dispatch`, `gw.dynamic_sigma`) adds the diagonal head, interpolates
-the matrix-valued cube at the requested energies, writes `sigma_mnk.h5`, builds
-the static Hermitian QSGW operator and applies the outside-band scissor.
+the matrix-valued cube at the requested energies, writes `sigma_mnk.h5` and builds
+the static Hermitian QSGW operator.
 Self-consistent QSGW rebuilds $\chi$, $W$, the body fit and the head on every
 map (the stores are written under per-iteration names and one complete pair is
 retained); no model tensor lives in `SCState`. With
