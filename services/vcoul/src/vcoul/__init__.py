@@ -103,13 +103,7 @@ from vcoul.base import (
 )
 from vcoul.bgw_parity import BGWVcoulTable, fill_v_grid_for_q, read_bgw_vcoul
 from vcoul.box_0d import Box0D
-from vcoul.box_fft import (
-    N_IN_BOX,
-    NCELL,
-    TRUNC_SHIFT,
-    _round_up_fft_size,
-    compute_vcoul_box,
-)
+from vcoul.box_fft import compute_vcoul_box
 from vcoul.bulk_3d import Bulk3D
 from vcoul.geometry import CoulombGeometry
 from vcoul.quadrature import (
@@ -179,18 +173,8 @@ __all__ = [
     # the sphere predicate
     "fft_box_miller", "bare_coulomb_sphere_mask",
     "bare_coulomb_sphere_indices",
-    # 0-D cell box.  ``_round_up_fft_size`` is underscore-private by
-    # history and is on the door for the same reason
-    # ``_minibz_kernel_bare`` is: ``gw.compute_vcoul_0d`` re-exports it,
-    # and a shim reaching a submodule for it would be the door rule's
-    # first violation.  The three BGW parameters (``Common/nrtype.f90``)
-    # are here for the same reason and no other: they were module-level
-    # public names at ``gw.compute_vcoul_0d`` before the extraction, so
-    # dropping them would be a compatibility break, and taking them off
-    # ``vcoul.box_fft`` is what tests/test_layering.py rule 6 caught when
-    # the shim first tried it.
-    "compute_vcoul_box", "_round_up_fft_size",
-    "N_IN_BOX", "NCELL", "TRUNC_SHIFT",
+    # 0-D cell box
+    "compute_vcoul_box",
     # BGW parity
     "BGWVcoulTable", "read_bgw_vcoul", "fill_v_grid_for_q",
 ]

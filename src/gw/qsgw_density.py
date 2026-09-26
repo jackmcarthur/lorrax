@@ -1046,8 +1046,7 @@ def distributed_eigh_bands(H, *, mesh: Mesh,
     distributed eigh — ScaLAPACK ``pXheevd`` on a host mesh, cuSOLVERMp on
     CUDA — and ``backend_module`` hands out that module, which is the idiom
     every other FFI consumer uses
-    (``isdf.core`` for getrf/getrs/solve_lu, ``common.eigh_block_sweep``
-    for cusolvermp).  Resolving first is the point: a CPU-only backend on
+    (``isdf.core`` for getrf/getrs/solve_lu).  Resolving first is the point: a CPU-only backend on
     a CUDA mesh, an uncompiled handler, a rectangular mesh or an
     indivisible ``n`` are refused THERE with the guard named, instead of
     failing or deadlocking inside the call.
