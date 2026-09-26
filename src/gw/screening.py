@@ -853,17 +853,11 @@ def compute_screening_model(
         iteration_head_response=iteration_head_response)
 
 
-def driver_persists_w0(mode, config) -> bool:
+def driver_persists_w0(mode, config, *, self_consistent=False) -> bool:
     """Does the DRIVER own the W0 restart flush for this run?
 
-    Two runs answer no, for opposite reasons, and the driver should not
-    have to know either:
+    Three runs answer no:
 
-    * ``compute_mode = mpa`` — there is no ``{0, probe}`` head grid to
-      stamp beside a W sampled on the double-parallel plan, so
-      ``gw_output.persist_w0_and_head`` refuses that shape by name
-      (gw_output.py, the ``is_dynamic``-without-``ppm_model`` branch) and
-      the driver has never called it.
     * ``screening_diagrams = w_bse`` or ``w_rpa_resolvent`` — the stage
       helper has ALREADY persisted, because the RPA W(0) it wrote is the
       restart-handoff input the ladder facade reads back (both arms run
@@ -877,16 +871,101 @@ def driver_persists_w0(mode, config) -> bool:
       one) under an established dataset's name is the provenance failure
       class (QUALITY_PATTERNS #10), so the answer is "already done", not
       "do it again".
+    * ``compute_mode = mpa`` with ``sigma_w_model = mpa`` — its W is a
+      per-element Pade fit on disk with no ω = 0 evaluator, so nothing is
+      persisted and a BSE on the restart refuses by name
+      (``file_io.restart_bundle.read_bse_payload``).
+    * ``compute_mode = mpa`` on a bispinor deck (four-component charge or
+      photon sector stores), and any self-consistent MPA map: the static W
+      of those models is not built (future work), with the same BSE
+      refusal.
+
+    ``compute_mode = mpa`` with ``sigma_w_model = shared_pole`` (the
+    production W) answers yes on a one-shot: :func:`restart_static_w`
+    evaluates the model at ω = 0 through the Σ synthesis owner.
 
     Lives here rather than in ``gw_jax`` so the driver keeps one call and
-    no mode/diagram arithmetic, and so the two reasons sit next to the
-    fork that creates the second one.
+    no mode/diagram arithmetic, and so the reasons sit next to the fork
+    that creates them.
     """
-    if mode is ComputeMode.MPA:
-        return False
     diagrams = coerce_screening_diagrams(
         getattr(config.screening, "diagrams", ScreeningDiagrams.W_RPA))
-    return diagrams is ScreeningDiagrams.W_RPA
+    if diagrams is not ScreeningDiagrams.W_RPA:
+        return False
+    if mode is ComputeMode.MPA:
+        sigma = getattr(config, "sigma", None)
+        return (not self_consistent
+                and getattr(sigma, "w_model", "mpa") == "shared_pole"
+                and not bool(getattr(config, "bispinor", False)))
+    return True
+
+
+def restart_static_w(mode, W_by_role, V_q, *, config, meta, mesh_xy,
+                     material_class=None, print_fn=print):
+    """The static W the driver persists as ``W0_qmunu``, or ``None``.
+
+    Non-MPA modes: the ``static`` role, the Dyson W(ω = 0) (``V_q`` when
+    the mode screened nothing).  MPA on the scalar shared-pole store: a
+    zero-argument callable that returns ``V + Wc(0)`` on ``V_q``'s own q
+    wedge, with ``Wc(0)`` from :func:`gw.mpa.sigma.shared_pole_static_wc`
+    (the Σ synthesis at the ω = 0 coefficient) and its pre-unfold wedge
+    deposited for the restart writer exactly as the Dyson route deposits
+    its own.  It is a callable so the evaluation runs only after
+    ``persist_w0_and_head`` has passed its write-policy preflight: a run
+    that writes no restart pays nothing.
+
+    ``None`` is returned, with the reason printed, when the head at ω = 0
+    that must be stored beside it does not exist: a metal (its q → 0 limit
+    at ω = 0 is the Drude one, which this writer does not store) and
+    ``head_correction = full`` without a finalized ω = 0 sample.  A BSE on
+    that restart then refuses by name; nothing falls back.
+    """
+    if mode is not ComputeMode.MPA:
+        return W_by_role.get("static", V_q)
+    from .gw_config import HeadCorrection
+    why = None
+    if material_class == "metal":
+        why = ("material_class = metal; the q -> 0 head at omega = 0 is the "
+               "Drude limit, which the static head writer does not store")
+    elif getattr(config.head, "correction", None) is HeadCorrection.FULL and not any(
+            abs(complex(z)) <= 1.0e-12
+            for z in getattr(W_by_role.get("iteration_head"), "omegas", ())):
+        why = ("head_correction = full produced no finalized head sample at "
+               "omega = 0 on this MPA plan")
+    if why is not None:
+        print_fn(f"  W0_qmunu NOT persisted: {why}.  A BSE on this restart "
+                 "refuses by name.")
+        return None
+    handle = W_by_role["shared_pole"]
+
+    def evaluate():
+        from symmetry_maps import QirrOperator
+        from .mpa.sigma import shared_pole_static_wc
+        from .restart_q_storage import deposit_pre_unfold
+
+        V_op = QirrOperator.of(V_q)
+        wc = shared_pole_static_wc(handle, meta, mesh_xy=mesh_xy)
+        if tuple(wc.shape) != (V_op.n_full, *V_op.values.shape[1:]):
+            raise ValueError(
+                "GATE shared_pole_static_w: model Wc(0) has shape "
+                f"{tuple(wc.shape)}; V_q is {V_op.n_full} q x "
+                f"{tuple(V_op.values.shape[1:])}; the two must share one "
+                "packed centroid carrier")
+        W0 = V_op.with_values(
+            V_op.values + QirrOperator.whole_zone(wc).at_rows(V_op.full_rows))
+        del wc
+        if not V_op.is_whole_zone():
+            deposit_pre_unfold(
+                "W0_qmunu", W0.values, n_rmu_logical=int(meta.n_rmu),
+                q_irr_frac=V_op.q_irr_frac, irr_idx_q=V_op.irr_idx,
+                sym_idx_q=V_op.sym_idx, sym_perm=V_op.sym_perm,
+                L_table=V_op.L_table, n_sym_spatial=V_op.n_sym_spatial,
+                mu_basis=getattr(meta, "mu_basis", None))
+        print_fn("  W0 (restart): V + Wc(omega = 0) of the shared-pole "
+                 f"model {str(handle.get('digest', ''))[:12]}, on {V_op.n_wedge} of "
+                 f"{V_op.n_full} q")
+        return W0
+    return evaluate
 
 
 #: Why a non-Hermitian ``W(iω_p)`` is the answer rather than the bug, on a
@@ -1094,4 +1173,5 @@ __all__ = [
     "compute_screening",
     "compute_screening_model",
     "driver_persists_w0",
+    "restart_static_w",
 ]

@@ -732,15 +732,29 @@ def read_wavefunctions(filename, input_file, mesh_xy, *, bands=None, family="cha
 
 def read_bse_payload(filename, input_file, mesh_xy, val_indices, cond_indices,
                      *, nohead=False, full_exchange=False):
-    """Return canonical BSE ψ faces, Γ exchange and the screened q grid."""
+    """Return canonical BSE ψ faces, Γ exchange and the screened q grid.
+
+    REFUSES a restart without a persisted static W0 (``W0_ready`` false).
+    Bare V is not a stand-in for W: it made ``D + V - V`` with a head-less
+    q = 0 tile (CrI3 8x8 SOC: E_1 = -7.09 eV, claim 2848).
+    """
     m = read_metadata(filename)
+    if not m["screened_ready"]:
+        raise ValueError(
+            f"GATE bse_requires_screened_w0: {filename} carries no persisted "
+            f"static screened interaction (W0_qmunu W0_ready = False"
+            f"{'' if m['screened_head'] is not None else ', no whead'}).  The "
+            f"BSE direct term needs W(omega = 0); bare V is not a substitute.  "
+            f"Fix: rerun the GW one-shot that writes this restart with "
+            f"write_restart_tensors = true on a route that persists W0 — "
+            f"compute_mode = cohsex, gn_ppm or hl_ppm, or compute_mode = mpa "
+            f"with sigma_w_model = shared_pole (one-shot, scalar store, "
+            f"insulator); that restart then carries W0_qmunu with "
+            f"W0_ready = True and the vhead/whead scalars.")
     v = read_wavefunctions(filename, input_file, mesh_xy, bands=val_indices)
     c = read_wavefunctions(filename, input_file, mesh_xy, bands=cond_indices)
     V = read_interaction(filename, "bare", mesh_xy, nohead=nohead)
-    # An unready W is the established bare-interaction BSE fallback.
-    # The explicit screened reader itself must still refuse that request.
-    kind = "screened" if m["screened_ready"] else "bare"
-    W = read_interaction(filename, kind, mesh_xy, nohead=nohead)
+    W = read_interaction(filename, "screened", mesh_xy, nohead=nohead)
     grid = tuple(int(n) for n in m["grid"])
     def qgrid(a):
         return jax.jit(lambda x: x.reshape(grid+x.shape[-2:]).transpose(3,4,0,1,2),

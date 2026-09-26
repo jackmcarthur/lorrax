@@ -7068,7 +7068,7 @@ def run_sc_driver(
     from .screening import driver_persists_w0
     try:
         if config.compute_mode.needs_screening and driver_persists_w0(
-                config.compute_mode, config):
+                config.compute_mode, config, self_consistent=True):
             if screening.static_w is None:
                 raise RuntimeError(
                     "GATE persist_sc_requires_final_static_w: "

@@ -471,6 +471,53 @@ def test_sigma_hole_branch_routes_minus_q_transpose_at_generic_q():
     assert rel(valence[1], plus[1].T) > 1e-2
 
 
+def test_static_w_is_the_plant_at_omega_zero_through_the_sigma_synthesis():
+    """The restart W0 path: the Σ synthesis with the ω = 0 coefficient, plus the
+    hole branch at -q, is the exact plant F(0) = -C M^-1 C^H at every parent of a
+    (3,1,1) ordered grid (Gamma is q = -q; 1/3 and 2/3 are independent), and the
+    coefficient is -1/(2 Lambda) on the active columns only. This is the
+    composition ``gw.mpa.sigma.shared_pole_static_wc`` runs (W0PERSIST)."""
+    import jax
+    from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+    from lxkit.testing import require_devices
+    from gw.mpa.sigma import (
+        _shared_pole_omega0_weights, shared_pole_hole_kernel,
+        synthesize_shared_pole_parents)
+    from symmetry_maps import q_negation_index
+    require_devices(4, "cpu")
+    mesh = Mesh(np.asarray(jax.devices("cpu")[:4]).reshape(2, 2), ("x", "y"))
+    rng = np.random.default_rng(29)
+    gamma = _trim(rng, 6, 4, eps=.4)
+    q, mq = _generic_pair(rng, 6, 4)
+    plants = (gamma, q, mq)
+    width, factors, poles, bounds = 8, [], [], []
+    for plant in plants:
+        model, _, _, _ = _ordered(plant, .9 + .35j)
+        active = np.asarray(model[2][0])
+        b, p2 = np.asarray(model[0][0])[:, active], np.asarray(model[1][0])[active]
+        factors.append(np.pad(b, ((0, 0), (0, width - b.shape[-1]))))
+        poles.append(np.pad(p2, (0, width - p2.shape[-1]), constant_values=1.))
+        bounds.append([0, b.shape[-1]])
+    weights = np.asarray(_shared_pole_omega0_weights(
+        np.stack(poles), np.asarray(bounds, np.int32), .3, .7))
+    for row, (p2, (lo, hi)) in enumerate(zip(poles, bounds)):
+        np.testing.assert_array_equal(weights[row, :hi], -.5 / p2[:hi])
+        assert not np.any(weights[row, hi:])
+    f = np.stack(factors)[:, :, None, :]
+    put = lambda x, spec: jax.device_put(x, NamedSharding(mesh, spec))
+    gemm = jax.jit(lambda x, y: x @ y, out_shardings=NamedSharding(mesh, P(None, "x", "y")))
+    plus, _ = jax.jit(lambda x, y, p, r: synthesize_shared_pole_parents(
+        x, y, p, r, 0., 0., mesh_xy=mesh, gemm=gemm,
+        weights_fn=_shared_pole_omega0_weights))(
+        put(f, P(None, "x", None, "y")), put(f, P(None, "y", None, "x")),
+        put(np.stack(poles), P()), put(np.asarray(bounds, np.int32), P()))
+    hole = shared_pole_hole_kernel(mesh)(plus, put(q_negation_index((3, 1, 1)), P()))
+    static = np.asarray(plus + hole)
+    for row, plant in enumerate(plants):
+        assert rel(static[row], plant.F(0.)) < 1e-10
+        assert rel(static[row], adj(static[row])) < 1e-12
+
+
 def test_two_component_ordered_store_synthesizes_lehmann_sums(tmp_path):
     """Two-component magnet store (N_spinor = 2, time reversal broken) on a (3,1,1)
     grid with independent q/-q parents and Gamma. The charge operator is mu x mu, so
