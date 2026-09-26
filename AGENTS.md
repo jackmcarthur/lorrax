@@ -19,48 +19,18 @@ read or modify. Read this file upon first inspection of the LORRAX source before
 
 ## Where things are
 
-| Path | What | When to read |
-|------|------|-------------|
-| `src/gw/gw_jax.py` | Main GW driver | Any GW debugging |
-| `src/gw/gw_init.py` | Input parsing, chunking strategy, pipeline orchestration | Input file questions, chunk sizing |
-| `src/gw/gw_config.py` | `LorraxConfig` runtime options dataclass | Flag plumbing, memory budget |
-| `src/gw/sigma_dispatch.py` | Mode-agnostic Σ dispatch (one call per compute mode) | Driver wiring |
-| `src/gw/w_isdf.py` | χ₀ → W screening pipeline (CTSP, Dyson solve) | Screening / epsilon issues |
-| `src/gw/ppm_sigma.py` | GN-PPM dynamic self-energy Σ^c(ω) | Frequency-dependent sigma issues |
-| `src/gw/band_extrapolation.py` | Σ_c band-convergence extrapolation: the disjoint band-bracket plan (interior cuts prefer a clean multiplet boundary via `common/band_degeneracy.py`, falling back rather than refusing), the two-parameter 1/N fit and its trust diagnostics. Sampling fractions are of the TOTAL band count and are MEASURED against BerkeleyGW `ch_converge.dat` — read the comment at `BRACKET_FRACTIONS` before changing them. Deck key `sigma_band_extrapolation`, GN/HL-PPM only, which is a correctness guard | "how many bands does Σ_c need"; the Σ cube's leading bracket axis |
-| `src/gw/minimax_screening.py` | PPM extraction, minimax window helpers | PPM parameter issues |
-| `src/gw/minimax_config.py` | Shared minimax / sigma quadrature config | Quadrature setup |
-| `src/gw/head_correction.py` | q=0 head / wing correction | Head corrections |
-| `src/gw/vcoul.py`, `compute_vcoul.py` | Coulomb potential (3D / 2D slab / 0D box) | Truncation, V_q build |
-| `src/gw/greens_function_kernel.py` | `build_G` occupied/all Green's function | G-matrix construction |
-| `src/gw/wavefunction_bundle.py` | `Wavefunctions` bundle + `project` / `project_ri` (Σ_μν → Σ_ij band projection) | Band-basis projection |
-| `src/gw/qsgw_utils.py` | QSGW fixed-point solver, Σ^xc I/O | Self-consistent GW |
-| `src/gw/kin_ion_io.py` | Kinetic + ionic Hamiltonian I/O | `kin_ion.h5` issues |
-| `src/isdf/core.py` + `src/gw/isdf_fitting.py` | CCT/ZCT, pair-density kernels, zeta solve / stage orchestration | Zeta fitting, pair density |
-| `src/common/wfn_transforms.py` | Wavefunction loading + band-chunked FFT | WFN load path |
-| `services/distrib_la/` | **The distributed dense-linalg service**: one door for `eigh` / `cholesky` / `solve_lu` over scalapack, slate, cusolvermp and native (incl. the 2D-blocked `native2d` Cholesky that was `src/common/cholesky_2d.py`). Read `docs/services/distrib_la.md` first | Cholesky / eigh / LU on a mesh; backend refusals; `.so` pins |
-| `src/common/fft_helpers.py` | Flat-k FFT helpers | FFT plumbing |
-| `src/common/gvec_fft_box.py` | Sphere ↔ FFT-box gather | V_q G-space build |
-| `services/symmetry_maps/` | **The crystal-symmetry service**: one door for `SymMaps` (IBZ→full BZ tables, spinor rotations), the k-star index map, the sharded q-axis unfolds, the real-space orbit machinery and the 2c DFT-reference TRS check (was `src/common/symmetry_maps.py`, `src/centroid/orbit_syms.py`, `src/common/density_symmetry_check.py`). Read `docs/services/symmetry_maps.md` first | Symmetry / k-point unfolding; star conjugation; TRS verdicts |
-| `services/minimax/` | **The certified-quadrature service**: one door for `serve` / `lookup` (shipped tables with provenance and refusals), the target and family vocabulary as data, and the offline solvers behind an announced escape hatch (was `src/common/minimax.py` + `src/common/minimax_assets/`). Reach it as `import minimax`; never a submodule path. | Quadrature node/weight issues; "no certified table" refusals; uncertified-solve announcements |
-| `src/common/meta.py` | `Meta` system-parameters dataclass | k/q-grid, band ranges |
-| `services/wfn_loader/` | **The ψ(G) loading service**: one door for `WfnLoader`, the canonical WFN.h5 reader, with `backend='auto'` picking the eager or the phdf5 (parallel HDF5) collective read and the two held byte-identical (was `src/file_io/wfn_loader.py`). Reach it as `import wfn_loader`, or as `from file_io import WfnLoader` / `WFNReader`; never a submodule path. Read `docs/services/wfn_loader.md` first | Wavefunction loading, H5 read backends |
-| `src/common/gpu_utils.py` | Host-side GPU memory detection | Chunk auto-sizing |
-| `src/file_io/slab_io.py` | `SlabIO`: phdf5 writer wrapper for zeta_q / V_qmunu | Big HDF5 writes |
-| `src/file_io/sigma_output.py` | Σ output (eqp.dat, sigma.h5) | Output formats |
-| `src/ffi/` | XLA FFI bridge, lorrax's half: `io` (parallel HDF5), `fft`, `gemm`, `cusolvermp` context + `cublasmp`, and the C++ tree `cpp/` (which still builds the slate / scalapack / cusolvermp handlers). The distributed-linalg python side moved to `services/distrib_la` | Native-library entry points |
-| `src/solvers/` | Davidson, Lanczos, Chebyshev, pseudobands | Iterative eigensolvers |
-| `src/centroid/kmeans_cli.py` / `src/centroid/kmeans_isdf.py` | ISDF centroid generation — `kmeans_cli` is the CLI (`python -m centroid.kmeans_cli`); `kmeans_isdf` is the algorithm library, no `__main__` | Centroid count / quality |
-| `src/psp/` | Pseudopotentials, dipole / kin+ion generators | `dipole.h5` or `kin_ion.h5` issues |
-| `src/bse/` | Bethe–Salpeter equation | Optical spectra; exciton dispersion `E_S(Q)` at arbitrary Q. Read `src/bse/STATUS.md`, then `BGW_COMPARE.md` (absorption) or `EXCITON_BANDS.md` (arbitrary Q) before running either |
-| `src/bandstructure/` | H-matrix interpolation (experimental) | Band-structure plots |
+The module map is [`docs/codebase.md`](docs/codebase.md). The drivers, in chain
+order, are [`docs/drivers.md`](docs/drivers.md). The standalone services are
+listed in [`docs/architecture/services.md`](docs/architecture/services.md). The
+register at the top of [`docs/index.md`](docs/index.md#register) names the page
+that owns each fact.
 
 ## Key documentation
 
 | Doc | What it covers |
 |-----|---------------|
 | `docs/theory/physics.md` | ISDF theory, GW equations, COHSEX, CTSP formalism |
-| `docs/architecture/codebase.md` | Module map, data flow, key classes, sharding patterns |
+| `docs/codebase.md` | Module map, data flow, key classes, sharding patterns |
 | `docs/architecture/memory-model.md` | Per-stage memory formulas, chunk sizing, bottleneck arrays |
 | `docs/theory/minimax-quadrature.md` | GL/HGL quadrature, error scaling, crossing windows |
 
@@ -85,25 +55,12 @@ uv run python -m pytest -q
 uv run python -m pytest -q --full
 ```
 
-### Perlmutter (Shifter, via the `lx` harness)
+### Perlmutter (the `lx` harness)
 
-```bash
-export LX_BASE_MODULE=lorrax_A                # JAX/JAXLIB 0.9 lane
-lx run -N 1 -G 4 -n 4 python3 -u -m gw.gw_jax -i cohsex.in   # one P=4 step, allocates or attaches
-lx test                                       # the default gate, on a compute node, in cwd
-lx status                                     # who is running where
-```
-
-Perlmutter requires one task/rank per GPU; the
-[machine page](docs/environment/machines/perlmutter.md#required-gpu-task-geometry)
-owns the launch and evidence contract.
-
-`lx` allocates or attaches by itself, so never `sbatch` an iteration and never
-`lx release --all`. The older `module load lorrax_X` + `lxalloc`/`lxrun`/`lxpre`
-workflow is superseded; `docs/environment/machines/perlmutter.md` is the current
-reference and keeps the old one as history. Fan out independent legs rather than
-running them serially, and combine one branch's verification into one P=4 leg —
-`AGENT_PREAMBLE.md` has the measurements. On Frontera this differs entirely; see
+`lx run` puts one step on a compute node and selects the `lorrax_A` base module.
+The [machine page](docs/environment/machines/perlmutter.md) owns the launch
+contract, the one-rank-per-GPU geometry and the evidence rules. Never `sbatch`
+an iteration. On Frontera this differs; see
 `docs/environment/machines/frontera.md` and the examples below.
 
 See [`config/README.md`](config/README.md) for the full cluster reference. Docs: [`docs/environment/overview.md`](docs/environment/overview.md).
@@ -151,10 +108,11 @@ pipeline; the old refactor-map reports directory was purged.
   the eqp/Z math ×4) is a defect to collapse, not a pattern to extend.
 
 ### JAX / arrays
-- **One FFT path: the sharded FFT helpers in `common/fft_helpers.py`.** Never call
-  `jnp.fft.*` directly in a stage kernel. All G↔r transforms go through the helper factories
-  so sharding, box placement, and Bloch phases stay consistent — and so the whole package can
-  be upgraded FFT→NUFFT in one place. A raw `jnp.fft` in a kernel is a bug.
+- **FFTs go through their owners.** Never call `jnp.fft.*` directly in a stage kernel.
+  The k-axis transforms and convolutions go through the `ffi.fft` router, and sphere↔box
+  and plane transforms through `LocalFourierPlan`
+  ([ffi_layout.md](docs/architecture/ffi_layout.md#k-convolution-router-and-the-mathdx-family)).
+  A raw `jnp.fft` in a kernel is a bug.
 - **k/q dimensions are FLAT axes, never folded into the FFT grid.** Store and shard k-points
   (and q-points) as an explicit leading flat axis; do the spatial FFT over the grid axes only.
   This keeps the k-axis independent of the spatial transform so FFT→NUFFT and flat-k batching
@@ -180,8 +138,7 @@ pipeline; the old refactor-map reports directory was purged.
 ### Physics reporting
 - **Don't blame residuals on "ISDF rank" without evidence.** Plateau-shaped LORRAX-vs-BGW
   disagreement rules out basis error — chase an algorithm/convention difference instead
-  (`feedback_no_isdf_rank_excuse`). Common convention gotchas live in `FLAGS.md` (`sys_dim`,
-  `bare_coulomb_cutoff`, velocity-operator sign).
+  (`feedback_no_isdf_rank_excuse`).
 
 ### JAX sharding rules (restated)
 - Never hard-code mesh shapes. Refer to mesh axes by name (`'x'`, `'y'`).
@@ -194,10 +151,8 @@ pipeline; the old refactor-map reports directory was purged.
 Run `uv run python -m pytest -q` after long running branches (5+ small commits) -- that is the
 two-minute DEFAULT CORE. Run `uv run python -m pytest -q --full` in the nightly/release lane;
 it is the suite KNOWN_FAILURES.md accounts for. See `tests/README.md` and `docs/contributing.md`.
-**Every GPU verification leg runs at P=4, in ONE combined leg** -- gates, driver and red
-twin together, not one leg per gate; a P=1-only verification is never sufficient for
-landing (unit and CPU cells are exempt). `AGENT_PREAMBLE.md` owns that rule and its
-rationale. Name your evidence directory, as a path, in the report.
+GPU verification follows [the four-GPU rule](AGENT_PREAMBLE.md#the-four-gpu-rule).
+Name your evidence directory, as a path, in the report.
 Do not commit `__pycache__/`, `.venv/`, or `uv_cache/`, etc. directories.
 
 ## Environment
@@ -205,6 +160,6 @@ Do not commit `__pycache__/`, `.venv/`, or `uv_cache/`, etc. directories.
 Use `uv` as the package manager. One `.venv/` (gitignored) per machine. No alternative
 envs. Let uv use its global cache — do not create project-local uv cache directories.
 
-On Perlmutter: use Shifter with the NVIDIA JAX container (Perlmutter workflow —
-on Frontera this differs; see `docs/environment/machines/frontera.md`). See
-`config/README.md`.
+On Perlmutter: `lx` and the `lorrax_A` base module
+([Perlmutter](docs/environment/machines/perlmutter.md)). On Frontera this differs; see
+`docs/environment/machines/frontera.md`. See `config/README.md`.
