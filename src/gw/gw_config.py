@@ -1593,6 +1593,18 @@ _DEFAULTS = {
     # (JID 57288835), while the same deck at probe_chunk=64 passed every
     # production-W gate (JID 57280453).
     "ladder_probe_chunk": 0,
+    # Optional W_BSE(z) delivery, OFF by default (empty).  Complex Rydberg
+    # frequencies, comma separated in Python syntax ("0.5j, 1j"): after the
+    # driver persists the RPA W(0), the ladder resolvent solves W_BSE(q, z)
+    # on the q wedge ONE z AT A TIME and logs each z's gated wedge
+    # (residuals, iterations, wall, per-rank peak, fingerprints).  No Sigma
+    # consumes these; screening_diagrams = w_bse is the Sigma route.
+    "ladder_z_list": "",
+    # w_bse / w_rpa_resolvent / ladder_z_list: psi layout inside the ladder
+    # resolvent.  "ring" (default) keeps the band axis whole with mu on one
+    # mesh axis; "2d" keeps psi at rest with bands on one axis and mu on the
+    # other (1/P per rank), resharded to the ring layout only inside a matvec.
+    "ladder_band_layout": "ring",
     # BerkeleyGW-compatible first-order Methfessel-Paxton width, in eV.
     # Zero preserves the historical step-occupation path.  The first
     # consumer is the per-iteration QSGW parallel-transport head; the same
@@ -2494,6 +2506,20 @@ def _input_head(
     return (head, _resolved_do_g0)
 
 
+def parse_ladder_z_list(value) -> tuple:
+    """``ladder_z_list`` deck string -> tuple of complex Rydberg frequencies."""
+    text = str(value or "").strip()
+    if not text:
+        return ()
+    try:
+        return tuple(complex(tok.replace(" ", ""))
+                     for tok in text.split(",") if tok.strip())
+    except ValueError as exc:
+        raise ValueError(
+            f"ladder_z_list = {text!r}: want comma-separated complex Rydberg "
+            f"frequencies in Python syntax, e.g. '0.5j, 1j'.") from exc
+
+
 def _input_response(
         _named_keys, params):
     """Produce the screening, pole, Sigma and occupation settings."""
@@ -2505,6 +2531,8 @@ def _input_response(
         minimax_energy_reference=str(params["minimax_energy_reference"]).strip().lower(),
         diagrams=coerce_screening_diagrams(params["screening_diagrams"]),
         ladder_probe_chunk=int(params["ladder_probe_chunk"]),
+        ladder_z_list=parse_ladder_z_list(params["ladder_z_list"]),
+        ladder_band_layout=str(params["ladder_band_layout"]).strip().lower(),
     )
     ppm = PPMConfig(
         model=str(params["ppm_model"]).strip().lower(),
@@ -3902,10 +3930,26 @@ class ScreeningConfig:
     # which does not branch on ``include_w``).  0 = whole padded basis in
     # one block (historical).  Deck key: ``ladder_probe_chunk``.
     ladder_probe_chunk: int = 0
+    # Optional W_BSE(z) delivery (deck key ``ladder_z_list``; empty = off) and
+    # the ladder's psi layout (deck key ``ladder_band_layout``).
+    ladder_z_list: tuple = ()
+    ladder_band_layout: str = "ring"
 
     def __post_init__(self):
         if self.occ_broadening_ev < 0.0:
             raise ValueError("occ_broadening must be >= 0 eV.")
+        if self.ladder_band_layout not in ("ring", "2d"):
+            raise ValueError(
+                f"ladder_band_layout = {self.ladder_band_layout!r}; want "
+                f"'ring' (band axis whole per rank) or '2d' (bands on one "
+                f"mesh axis, mu on the other).")
+        for z in self.ladder_z_list:
+            z = complex(z)
+            if z.imag < 0.0 or (z.imag == 0.0 and z.real != 0.0):
+                raise ValueError(
+                    f"ladder_z_list: z = {z!r} Ry is on or below the real "
+                    f"axis; (z - H)^-1 there needs a broadening policy the "
+                    f"resolvent does not have.  Use z = 0 or Im z > 0.")
         if int(self.ladder_probe_chunk) < 0:
             raise ValueError(
                 f"ladder_probe_chunk = {self.ladder_probe_chunk} must be "

@@ -828,6 +828,12 @@ def _persist_screening(
                 sym=sym, centroid_indices=centroid_indices,
                 static_head_only=mode is ComputeMode.MPA,
                 print_fn=print0)
+    # Optional W_BSE(z) delivery (deck key ladder_z_list, off when empty): it
+    # reads the RPA W(0) persisted just above back out of the bundle.
+    if config.screening.ladder_z_list:
+        from .screening_bse import deliver_ladder_z_list
+        deliver_ladder_z_list(config, meta, mesh_xy, sym, tensors_filename,
+                              print_fn=print0)
 
 
 def _prepare_static_head(config, do_screened, head_resolver, meta, mode, print0,
