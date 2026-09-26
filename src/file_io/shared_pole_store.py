@@ -20,9 +20,10 @@ import jax.numpy as jnp
 import numpy as np
 from jax.sharding import NamedSharding, PartitionSpec as P
 
-from runtime.padding import combined_divisor, ladder_extent, padded_axis
+from runtime.padding import combined_divisor, padded_axis
 from common import timing
-from common.collectives import device_put_process_local, rank0_transaction, psum_replicate
+from common.collectives import (device_put_process_local, process_rank, psum_replicate,
+                                rank0_transaction)
 from file_io.slab_io import SlabIO, mesh_divisible_shape
 from file_io.commit_state import agree_io_refusal, assert_committed, set_commit_state
 from symmetry_maps import QirrTables, validate_qirr_tables
@@ -456,7 +457,7 @@ def write_shared_pole_model(path, b, poles2, K, *, q_span, meta, tables,
                           K=[0] * header["n_q_irr"], batches=[], construction_receipts=[])
         if any(header["written_q"][lo:hi]):
             _refuse("q_span already committed; never overwrite staged parents")
-        width = int(K.max(initial=0))
+        width = _k_extent(meta, header, int(K.max(initial=0)), record=False)
         name = f"staging/q{lo}_{hi}"
     with timing.section("canonical_basis_conversion_and_packing"):
         canonical = basis.unpack_axis(b, 1)
@@ -525,13 +526,54 @@ def finalize_shared_pole_model(path, *, meta, expected_identity, basis=None):
     return _finalize_model(path, meta=meta, header=header, basis=basis)
 
 
+#: Headroom of the SC run's held pole-column extent over the live Kmax it is
+#: set from. After map 1 the sector models' Kmax grows by about 1% per map (Fe
+#: 4^3 bispinor CC/TT 1328 -> 1335 -> 1338, CT 723 -> 729), and an exact extent
+#: recompiled every store, read and Sigma-window program each map; 3% holds
+#: that drift for several maps and pads less than the eighth-octave ladder it
+#: replaces (up to 12.5%).
+_K_HEADROOM = 0.03
+
+
+def _k_extent(meta, header, live, *, record):
+    """The model's pole-column extent: the live Kmax, or the SC run's held one.
+
+    An SC map past map 0 binds ``meta.shared_pole_k_capacity`` (a dict the
+    quadrature session keeps). Map 1 sets the extent to its live Kmax plus
+    :data:`_K_HEADROOM`; later maps keep it while the live Kmax fits and grow
+    it (again with headroom) only when it does not, noting the growth in
+    ``held["_events"]`` for the SC log. So a drifting Kmax keeps one dataset
+    shape and every store, read and Sigma program is reused (Fe 4^3 charge:
+    746 -> 736 -> 734 recompiled finalize, SlabIO and census programs at map
+    2). Columns past each parent's K are zero factors and unit poles, as
+    before. No binding (a one-shot, map 0): the live Kmax.
+    """
+    held = getattr(meta, "shared_pole_k_capacity", None)
+    if held is None:
+        return int(live)
+    sector = header.get("sector")
+    key = "CT" if sector in ("CT_C", "CT_T") else str(sector)
+    before = int(held.get(key, 0))
+    if int(live) <= before:
+        return before
+    if not record:
+        return int(live)
+    extent = int(np.ceil(int(live) * (1.0 + _K_HEADROOM)))
+    if before:
+        held.setdefault("_events", []).append(
+            f"shared-pole K extent ({key}): live Kmax {int(live)} exceeds the held "
+            f"{before}; grown to {extent}")
+    held[key] = extent
+    return extent
+
+
 @timing.timed("shared_pole_store.finalize")
 def _finalize_model(path, *, meta, header, basis=None):
     basis = meta.mu_basis if basis is None else basis
     mesh = basis.mesh_xy
     components = header.get("factor_components", 1)
     nq, nmu = header["n_q_irr"], header["n_mu_logical"]
-    kmax = max(header["K"])
+    kmax = _k_extent(meta, header, max(header["K"]), record=True)
     panel = 16*components*basis.n_canonical*((kmax+int(mesh.shape["y"])-1)//int(mesh.shape["y"]))/int(mesh.shape["x"])
     batch_width = max(v["hi"] - v["lo"] for v in header["batches"])
     _admit(_capacity(meta), "finalize", batch_width*(int(panel)+24*kmax),
@@ -628,12 +670,11 @@ def _model_digest(path, header, mesh, *, capacity):
     components = header.get("factor_components", 1)
     ncan = ((nmu + int(mesh.size)-1)//int(mesh.size))*int(mesh.size)
     column_cap = max(1, (kmax + int(mesh.shape["y"])-1)//int(mesh.shape["y"]))
-    # One panel shape per map series (A9): Kmax and the last q batch move
-    # every SC map and the validation program is keyed by the panel, so the
-    # panel width sits on the extent ladder and the last parent batch and
-    # column panel are shifted back to overlap their predecessors. An
-    # overlapped parent or column is validated twice and hashed once.
-    width = min(kmax, ladder_extent(column_cap))
+    # One panel shape per model: an SC run holds Kmax (``_k_extent``), and
+    # the last parent batch and column panel are shifted back to overlap
+    # their predecessors. An overlapped parent or column is validated twice
+    # and hashed once.
+    width = min(kmax, column_cap)
     panel = 16*components*ncan*width//int(mesh.shape["x"])
     batch_limit = min(int(mesh.size), header["n_q_irr"])
     _admit(capacity, "digest", batch_limit*(panel+8*kmax+256*nmu*components),
@@ -949,11 +990,12 @@ def read_shared_pole_matrix(io, q_span, *, meta, header):
 def face_width(mesh, kmax, column_span=None):
     """The pole-column carrier ``read_shared_pole_faces`` returns for one read.
 
-    A whole-K read is laddered: the pole count grows by a few columns every
-    SC map, and every face consumer is keyed by this width.  A column panel
-    keeps the width its schedule admitted.  Both face orientations tile it.
+    A whole-K read is the model's Kmax, which an SC run holds fixed
+    (``_k_extent``), so every face consumer keyed by this width is compiled
+    once.  A column panel keeps the width its schedule admitted.  Both face
+    orientations tile it.
     """
-    k = ladder_extent(int(kmax)) if column_span is None else int(column_span[1]) - int(column_span[0])
+    k = int(kmax) if column_span is None else int(column_span[1]) - int(column_span[0])
     return padded_axis(k, mesh, name="shared_pole_face_K",
                        specs=((P(None,"x",None,"y"),3),(P(None,"y",None,"x"),3))).carrier
 

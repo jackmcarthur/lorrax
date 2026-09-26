@@ -645,7 +645,8 @@ def rho_from_wfns(psi_G, occ, kweights, *, mesh: Mesh, box_index,
                   charge_nspinor: int | None = None,
                   return_spin_density_matrix: bool = False,
                   per_k: bool = False,
-                  memory_budget_bytes: float | None = None, print_fn=None,
+                  memory_budget_bytes: float | None = None,
+                  min_active_bands: int = 0, print_fn=None,
                   projection_receipt_fn=None):
     """ρ(r) = Σ_k w_k f_spin Σ_{n,s} f_nk |ψ̃_nks(r)|², scanned over k.
 
@@ -670,6 +671,11 @@ def rho_from_wfns(psi_G, occ, kweights, *, mesh: Mesh, box_index,
         ``sc_iteration`` already assumes; do not pass a transpose.
         ``None`` builds ρ from ``psi_G`` unrotated — the DFT density and
         the gate's baseline.
+    min_active_bands : int
+        Floor on the rotated band count: an SC map passes the largest count
+        of its earlier maps, so a metal's occupation drift does not change
+        the scan's static shape (the extra bands carry at most
+        :data:`DENSITY_TAIL_ELECTRON_TOL` electrons).
     memory_budget_bytes : float, optional
         The run's per-device budget (``config.memory.per_device_gb``).  It
         decides one thing, :func:`plan_density_scan`'s route; unknown means
@@ -826,7 +832,8 @@ def rho_from_wfns(psi_G, occ, kweights, *, mesh: Mesh, box_index,
 
     plan = plan_density_scan(
         mesh=mesh, n_k=nk, nb_carrier=nb_pad,
-        n_active=(density_active_band_count(occ_j, w_np, f_spin)
+        n_active=(min(nb_pad, max(int(min_active_bands),
+                                  density_active_band_count(occ_j, w_np, f_spin)))
                   if have_U else nb_pad),
         ns=ns, ngkmax=ngkmax, n_grid=ngrid, have_U=have_U,
         budget_bytes=memory_budget_bytes)
