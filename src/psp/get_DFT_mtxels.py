@@ -8,7 +8,7 @@ This module computes all terms of the DFT Hamiltonian:
 - Hartree potential: <mk|V_H[n_v]|nk> 
 - Nonlocal pseudopotential: <mk|V_NL|nk>
 
-Also computes valence (n_v) and core (n_c) charge densities.
+Also computes the valence charge density (n_v).
 """
 
 import os
@@ -105,7 +105,6 @@ def report_devices(print_fn=print) -> None:
 
 # Import ISDF modules
  
-
 
 # NOTE: the cohsex.in parser lived here as a duplicate of
 # gw.gw_config.read_lorrax_input.  It was consolidated 2026-07-02 — all
@@ -383,11 +382,11 @@ def valence_density_from_kpoint(
     When supplied, the SAME weights multiply rho and every signed Dirac
     current component inside this one IFFT transaction.
 
-    Single source of truth for the per-k density quadrature: the same-grid
-    arm of all-k-resident :func:`compute_valence_density` and the chunked
-    per-k CLI go through this one function (the exact GW Hartree density is
-    ``gw.qsgw_density.rho_from_wfns``, whose local contraction is shared
-    with it).  The arithmetic runs in ONE jitted module
+    The per-k reference quadrature for the exact GW Hartree density
+    ``gw.qsgw_density.rho_from_wfns``, whose local contraction
+    (:func:`density_components_from_psi_r`) it shares;
+    ``tests/multi_device/qsgw_density_gate.py`` compares the two.  The
+    arithmetic runs in ONE jitted module
     (:func:`_valence_density_kernel`; ``nocc`` static, scalars traced).
 
     ``include_dirac_current=True`` requires four-component bispinors and
@@ -695,139 +694,6 @@ def build_hartree_potential(
     hartree_energy = 0.5 * float(rho_v_sum) * volume / ngrid
     print_fn(f"    Hartree energy (½∫ρV_H) = {hartree_energy:.6f} Ry")
     return V_H_r
-
-
-def compute_valence_density(wfn_k, sym, wfn, *, k_source: str):
-    """
-    Compute valence charge density rho_v(r) from occupied valence wavefunctions.
-
-    The accumulated sum is projected onto the crystal's point group before
-    it is returned (:func:`symmetrize_valence_density`).  That is required,
-    not cosmetic, for the irreducible-mesh branch below — a k-weighted sum
-    over the IBZ is the density of the representatives, not of the crystal
-    — and it removes the unfold's residual from the full-mesh branch.
-
-    This resident compatibility path is exact-integer only.  Fractional
-    Hartree density is owned by the band-streamed distributed sweep;
-    fractional centroid selection uses the canonical QE density.
-
-    Returns:
-        Valence charge density rho_v(r) on an ecutrho-based FFT grid if available
-    """
-    # Compute on configured rho grid if present, else fall back to 2x
-    nk_local, nb_all, nspinor, nx, ny, nz = wfn_k.shape
-    if k_source == "file":
-        kweights = np.asarray(wfn.kweights, dtype=np.float64)
-    elif k_source == "full_bz":
-        kweights = np.ones(nk_local, dtype=np.float64) / float(sym.nk_tot)
-    else:
-        raise ValueError(
-            "compute_valence_density: k_source must be 'file' or 'full_bz', "
-            f"got {k_source!r}.")
-    try:
-        nx_pad, ny_pad, nz_pad = int(wfn.grid_rho[0]), int(wfn.grid_rho[1]), int(wfn.grid_rho[2])
-    except Exception:
-        nx_pad, ny_pad, nz_pad = nx, ny, nz
-
-    same_grid = (nx_pad == nx) and (ny_pad == ny) and (nz_pad == nz)
-
-    rho_val_local = jnp.zeros((nx_pad, ny_pad, nz_pad), dtype=jnp.float64)
-    volume = jnp.asarray(wfn.cell_volume, dtype=jnp.float64)
-    ngrid_pad = nx_pad * ny_pad * nz_pad
-    scale_pad = jnp.sqrt(ngrid_pad / volume)
-    # Electrons per occupied band (2 only for spin-restricted scalar runs;
-    # 1 for the nspinor=2 decks LORRAX actually runs).  ``wfn.nelec`` is a
-    # BAND count (max(ifmax)), so this factor is what turns it into charge.
-    f_spin = spin_degeneracy_factor(wfn)
-
-    if not wfn.occupations_are_exact_integer:
-        raise ValueError(
-            "compute_valence_density is the legacy resident all-k FFT-box "
-            "path and may not materialize every band of a fractional WFN. "
-            "Use gw.qsgw_density.rho_from_wfns (the one exact Hartree "
-            "density scan) or the canonical QE density for centroid "
-            "selection.")
-    nocc_all = min(int(wfn.nelec), int(nb_all))
-
-    gvecs_by_k = ngk_by_k = None
-    if not same_grid:
-        gvecs_by_k = wfn.gvecs(k=k_source)
-        ngk_by_k = wfn.ngk_valid(k=k_source)
-
-    for ik in range(nk_local):
-        nocc = nocc_all
-        wk = float(kweights[ik])  # k-point weight
-
-        if same_grid:
-            # Single-sourced with the chunked per-k CLI path.
-            rho_val_local += valence_density_from_kpoint(
-                wfn_k[ik], nocc=nocc, weight=wk,
-                cell_volume=float(wfn.cell_volume),
-                spin_degeneracy=f_spin,
-            )
-        else:
-            gvecs_k = np.asarray(
-                gvecs_by_k[ik, :int(ngk_by_k[ik])])
-            Gx = jnp.asarray(gvecs_k[:, 0], dtype=jnp.int32)
-            Gy = jnp.asarray(gvecs_k[:, 1], dtype=jnp.int32)
-            Gz = jnp.asarray(gvecs_k[:, 2], dtype=jnp.int32)
-
-            for ispin in range(nspinor):
-                C_src = wfn_k[ik, :nocc, ispin, :, :, :]
-
-                def gather_one(arr3d):
-                    return arr3d[Gx, Gy, Gz]
-
-                C_occ = jax.vmap(gather_one, in_axes=0, out_axes=0)(C_src)
-
-                def scatter_one(row):
-                    buf = jnp.zeros((nx_pad, ny_pad, nz_pad), dtype=jnp.complex128)
-                    return buf.at[Gx, Gy, Gz].set(row)
-
-                psi_G_padded_batch = jax.vmap(scatter_one, in_axes=0, out_axes=0)(C_occ)
-                psi_r_batch = local_ifftn3(psi_G_padded_batch, axes=(-3, -2, -1), norm='ortho') * scale_pad
-                rho_val_local += (wk * f_spin) * jnp.sum(
-                    jnp.real(psi_r_batch.conj() * psi_r_batch), axis=0)
-    
-    # With proper k-point weights included above, no division needed
-    # (weights sum to 1 for irreducible mesh, or 1/nk_tot each for full mesh)
-    rho_v = symmetrize_valence_density(rho_val_local, wfn)
-
-    # Caller reports integrated charge if needed
-    return rho_v
-
-def compute_core_density(atom_positions, atom_types, pseudos, meta):
-    """
-    Compute core charge density rho_c(r) from atomic core states in pseudopotentials.
-    
-    Args:
-        atom_positions: Atomic positions in crystal coordinates, shape (nat, 3)
-        atom_types: Atom type indices, shape (nat,)
-        pseudos: Dictionary mapping element names to pseudopotential objects
-        meta: System metadata object
-        
-    Returns:
-        Core charge density rho_c(r), shape (nx, ny, nz)
-    """
-    print("  Computing core charge density rho_c(r)...")
-    
-    # TODO: Implement the following steps:
-    # 1. For each atom:
-    #    a. Get core charge density from pseudopotential file (usually rho_core(r))
-    #    b. Place at atomic position with proper structure factor
-    #    c. Transform to real space grid
-    # 2. Sum contributions from all atoms
-    # 3. Apply proper normalization
-    
-    # Note: For norm-conserving pseudopotentials, core density is often
-    # represented as a smooth function that reproduces the correct
-    # integrated charge within some cutoff radius
-    
-    # Placeholder implementation
-    nx, ny, nz = meta.fft_grid
-    rho_core = jnp.zeros((nx, ny, nz), dtype=jnp.float64)
-    
-    return rho_core
 
 
 @partial(jax.jit, static_argnames=("blat", "truncation_2d"))
@@ -1141,8 +1007,6 @@ def get_H_matrix_elements(wfn, sym, pseudos, global_psi_G, meta, mesh_xy,
             f"{hartree_shape}, expected {expected_hartree_shape} for the "
             "resident output carrier.")
     print("\n  Using shared distributed exact FFT-grid Hartree matrix")
-    # Compute core density from pseudopotentials (disabled for performance)  
-    # rho_core = compute_core_density(atom_positions, atom_types, pseudos, meta)
     # Build local ionic potential on rho grid via G-space and FFT (return total only)
     print("  Computing local ionic potential V_loc(r) on rho grid...")
     try:
@@ -1236,7 +1100,6 @@ def get_H_matrix_elements(wfn, sym, pseudos, global_psi_G, meta, mesh_xy,
 # ``get_H_matrix_elements`` below is KEPT: its k=0 per-term decomposition
 # (K / V_ion / V_H / V_NL written to k0_diag.txt) has no replacement.
 # ---------------------------------------------------------------------------
-
 
 
 def main(argv=None):

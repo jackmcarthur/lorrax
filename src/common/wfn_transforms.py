@@ -372,59 +372,6 @@ def to_rbox(
     return fn(psi, g_index_j, jnp.asarray(kvecs_frac, dtype=jnp.float64))
 
 
-def from_rbox(
-    psi_r: jax.Array,
-    gvecs: np.ndarray | jax.Array,
-    *,
-    mesh: Mesh,
-    norm: str = "backward",
-    g_mask: np.ndarray | jax.Array | None = None,
-) -> jax.Array:
-    """r-space FFT box → G-sphere; see docs/architecture/zeta_fit_face_psi_cct.md."""
-    gv = np.asarray(gvecs)
-    if gv.ndim != 2 or gv.shape[1] != 3:
-        raise ValueError(
-            f"from_rbox: gvecs must be (ngkmax, 3), got {gv.shape}")
-    ngkmax = int(gv.shape[0])
-    out_spec = _spec_of(psi_r)
-    key = (psi_r.shape, ngkmax, norm, _sharding_key(psi_r),
-           g_mask is not None)
-
-    def build():
-        # NOT ``_local_box_fft``: that helper derives the BOX spec from a
-        # SPHERE-shaped ψ (``P(*_spec_of(psi)[:-1], None, None, None)``, i.e.
-        # 4-D in → 6-entry spec), and here the input is ALREADY the box, so it
-        # would emit an 8-entry spec and shard_map rejects it ("in_specs entry
-        # too long").  Same factory, correct arity for a box operand — the
-        # FFT axes replicated, only the leading (k, band, spinor) axes
-        # sharded.
-        from common.fft_helpers import make_sharded_fftn_3d
-        box_spec = P(*out_spec[:3], None, None, None)
-        fftn = make_sharded_fftn_3d(mesh, box_spec, box_spec,
-                                    norm=norm, axes=(-3, -2, -1))
-        sharding = NamedSharding(mesh, P(*out_spec[:3], None))
-
-        @jax.jit
-        def fn(psi_r_, gx_, gy_, gz_, mask_):
-            box = fftn(psi_r_)
-            # Gather the sphere out of the box.  Advanced indexing on the
-            # last three (replicated) axes only — no cross-rank op, so the
-            # band sharding rides through untouched.
-            out = box[..., gx_, gy_, gz_]
-            if mask_ is not None:
-                out = out * mask_
-            return _maybe_constrain(out, sharding)
-        return fn
-
-    fn = _cached_jit('from_rbox', key, build)
-    gx = jnp.asarray(gv[:, 0], dtype=jnp.int32)
-    gy = jnp.asarray(gv[:, 1], dtype=jnp.int32)
-    gz = jnp.asarray(gv[:, 2], dtype=jnp.int32)
-    mask = (None if g_mask is None
-            else jnp.asarray(g_mask, dtype=psi_r.dtype))
-    return fn(psi_r, gx, gy, gz, mask)
-
-
 def to_rmu(
     psi: jax.Array,
     g_index: np.ndarray | jax.Array,
@@ -859,7 +806,6 @@ def gflat_to_rchunk_aot_peak_bytes(
         mesh=mesh, nk=nk, band_carrier=band_carrier, nspinor=nspinor,
         ngkmax=ngkmax, fft_grid=fft_grid, r_carrier=r_carrier, norm=norm,
         dtype=dtype).total)
-
 
 
 # ---------------------------------------------------------------------------

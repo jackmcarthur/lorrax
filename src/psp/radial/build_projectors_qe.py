@@ -200,68 +200,6 @@ def _spherical_frame(theta: np.ndarray, phi: np.ndarray) -> tuple[np.ndarray, np
     return e_r, e_t, e_p
 
 
-def _complex_sph_and_angular_partials(l: int, theta: np.ndarray, phi: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    # Y_complex: (2l+1, nG) with m ordered [-l..+l]
-    nG = theta.shape[0]
-    ms = np.arange(-l, l + 1, dtype=int)
-    try:
-        from scipy.special import sph_harm as _Y
-        Y = np.stack([_Y(m, l, phi, theta) for m in ms], axis=0)
-        # Angular partials: use small-step central differences for ∂θ and ∂φ
-        h = 1e-6
-        Y_t1 = np.stack([_Y(m, l, phi, theta + h) for m in ms], axis=0)
-        Y_t0 = np.stack([_Y(m, l, phi, theta - h) for m in ms], axis=0)
-        dth = (Y_t1 - Y_t0) / (2 * h)
-        Y_p1 = np.stack([_Y(m, l, phi + h, theta) for m in ms], axis=0)
-        Y_p0 = np.stack([_Y(m, l, phi - h, theta) for m in ms], axis=0)
-        dph = (Y_p1 - Y_p0) / (2 * h)
-        return Y, dth, dph
-    except Exception:
-        # Fallback supports l<=1 explicitly
-        Y = np.zeros((2 * l + 1, nG), dtype=complex)
-        dth = np.zeros_like(Y)
-        dph = np.zeros_like(Y)
-        if l == 0:
-            Y[0, :] = 0.5 / np.sqrt(np.pi)
-            dth[0, :] = 0.0
-            dph[0, :] = 0.0
-        elif l == 1:
-            # m=-1,0,1
-            c = np.sqrt(3 / (8 * np.pi))
-            Y[0, :] = c * np.exp(-1j * phi) * np.sin(theta)
-            Y[1, :] = np.sqrt(3 / (4 * np.pi)) * np.cos(theta)
-            Y[2, :] = -c * np.exp(1j * phi) * np.sin(theta)
-            # Finite differences for partials
-            h = 1e-6
-            th1 = theta + h; th0 = theta - h
-            ph1 = phi + h; ph0 = phi - h
-            Y_t1 = np.stack([
-                c * np.exp(-1j * phi) * np.sin(th1),
-                np.sqrt(3 / (4 * np.pi)) * np.cos(th1),
-                -c * np.exp(1j * phi) * np.sin(th1),
-            ], axis=0)
-            Y_t0 = np.stack([
-                c * np.exp(-1j * phi) * np.sin(th0),
-                np.sqrt(3 / (4 * np.pi)) * np.cos(th0),
-                -c * np.exp(1j * phi) * np.sin(th0),
-            ], axis=0)
-            dth[:, :] = (Y_t1 - Y_t0) / (2 * h)
-            Y_p1 = np.stack([
-                c * np.exp(-1j * ph1) * np.sin(theta),
-                np.sqrt(3 / (4 * np.pi)) * np.cos(theta) * 1.0,
-                -c * np.exp(1j * ph1) * np.sin(theta),
-            ], axis=0)
-            Y_p0 = np.stack([
-                c * np.exp(-1j * ph0) * np.sin(theta),
-                np.sqrt(3 / (4 * np.pi)) * np.cos(theta) * 1.0,
-                -c * np.exp(1j * ph0) * np.sin(theta),
-            ], axis=0)
-            dph[:, :] = (Y_p1 - Y_p0) / (2 * h)
-        else:
-            raise RuntimeError("Angular gradient fallback supports l<=1 only")
-        return Y, dth, dph
-
-
 def qe_real_sph_harmonics_with_grad(l: int, vectors: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """Return (Y_real, gradY_cart) with shapes (2l+1, nG) and (3, 2l+1, nG).
 

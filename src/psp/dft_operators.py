@@ -7,7 +7,6 @@ functions rather than reimplementing operator construction.
 
 Public API (Hamiltonian construction + application):
   HamiltonianK         — per-k data: T_diag, V_scf, G-indices, VNL Z/E, h_diag, mask
-  setup_H_k            — build HamiltonianK from SymMaps path (GW pipeline)
   setup_H_k_from_kvec  — build HamiltonianK from k-vector (standalone/Davidson)
   apply_H_k            — fused JIT H|ψ⟩, psi_box donated; 2 ms on A100 for Si
   build_matrix_k       — full ⟨m|H|n⟩ matrix
@@ -16,18 +15,15 @@ Public API (G-vector layout):
   padded_gvectors       — the loader's FIXED-shape (nk, ngkmax, 3) table
                           + pad mask, as a PaddedGVectors.  THE ROUTE
                           every operator in this package takes.
-  generate_gvectors_k_padded — per-k twin of the above
   generate_gvectors_k   — one k's RAGGED (ngk[ik], 3) G-list.  Retained
                           as the D10 comparison reference (and for
                           misc/ scripts); no production consumer left.
 
 Public API (per-component builders):
-  build_T_diag          — |k+G|² + G-indices from SymMaps
-  build_T_diag_from_kvec — same from explicit k-vector + ecutwfc (no SymMaps)
+  build_T_diag_from_kvec — |k+G|² + G-indices from an explicit k-vector + ecutwfc
   build_V_scf           — combine V_loc + V_H + V_xc into one array
   compute_V_H_and_V_xc  — @jax.jit: V_H (Poisson) + V_xc (PBE GGA) in 1.2 ms cached
   build_h_diag          — preconditioner diagonal: T + V_loc(G=0) + V_NL_diag
-  build_vnl_kdata       — dense VNL projectors (Z, E) from vnl_ops
 
 Public API (uniform kinetic gauge actions):
   apply_kinetic_velocity_to_ket — dT/dK applied to a ket block
@@ -35,7 +31,7 @@ Public API (uniform kinetic gauge actions):
 
 V_scf = V_loc + V_H + V_xc is a single (nx,ny,nz) real-space potential.
 The caller builds it from charge_density.py (V_xc, V_H) and
-build_projectors_qe.py (V_loc), then passes it to setup_H_k*.
+build_projectors_qe.py (V_loc), then passes it to setup_H_k_from_kvec.
 
 Normalization: ⟨m|O|n⟩ = Σ_{s,G} conj(ψ_m[s,G]) · (O ψ)_n[s,G].
 No volume prefactors.  Ortho-FFT convention for local potentials:
@@ -68,7 +64,7 @@ from common.fft_helpers import local_fftn3, local_ifftn3
 class HamiltonianK:
     """Everything needed to apply H at one k-point.
 
-    Built by ``setup_H_k``, consumed by ``apply_H_k`` and ``build_matrix_k``.
+    Built by ``setup_H_k_from_kvec``, consumed by ``apply_H_k`` and ``build_matrix_k``.
     """
     # Kinetic: T|ψ⟩_G = T_diag[G] · ψ_G
     T_diag: jax.Array               # (nG,) float64 — |k+G|² in Ry
@@ -404,20 +400,6 @@ def padded_gvectors(wfn, *, k="full_bz") -> PaddedGVectors:
     return PaddedGVectors(gvecs=gvecs, mask=mask, ngk=ngk, kvecs=kvecs)
 
 
-def generate_gvectors_k_padded(kpoint_idx, sym, wfn, meta):
-    """Per-k twin of :func:`generate_gvectors_k`, fixed-shape.
-
-    Returns ``(Gk_pad, g_mask, kpoint_crys)`` with ``Gk_pad`` at
-    ``(ngkmax, 3)`` and ``g_mask`` at ``(ngkmax,)``.  Prefer
-    :func:`padded_gvectors` when sweeping more than one k — it builds the
-    mask once for the whole table instead of once per call.
-    """
-    tab = padded_gvectors(wfn, k="full_bz")
-    G_pad, g_mask = tab.at(kpoint_idx)
-    kpoint_crys = jnp.asarray(tab.kvecs[int(kpoint_idx)], dtype=jnp.float64)
-    return jnp.asarray(G_pad, dtype=jnp.int32), g_mask, kpoint_crys
-
-
 # ═══════════════════════════════════════════════════════════════════════
 #  G-vector utilities
 # ═══════════════════════════════════════════════════════════════════════
@@ -441,7 +423,7 @@ def build_G_cart(nx: int, ny: int, nz: int, B: np.ndarray) -> jax.Array:
 # ═══════════════════════════════════════════════════════════════════════
 #
 # Each function constructs one piece of the Hamiltonian.
-# They are called by setup_H_k and also available individually.
+# They are called by setup_H_k_from_kvec and also available individually.
 
 def compute_ngkmax(kpoints, bdot, ecutwfc, fft_grid):
     """Maximum number of G-vectors across all k-points.
@@ -473,40 +455,6 @@ def compute_ngkmax(kpoints, bdot, ecutwfc, fft_grid):
         KG_sq = np.einsum("gi,ij,gj->g", KG, bdot, KG)
         ngk_max = max(ngk_max, int(np.sum(KG_sq <= ecutwfc)))
     return ngk_max
-
-
-def build_T_diag(
-    k_idx: int,
-    wfn,
-    sym,
-    meta,
-    *,
-    gvectors: PaddedGVectors | None = None,
-) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, np.ndarray]:
-    """Kinetic diagonal |k+G|² and G-vector FFT-box indices (SymMaps path).
-
-    Returns ``(T_diag, Gx, Gy, Gz, g_mask)``, all at the loader's FIXED
-    ``ngkmax``: ``T_diag`` is ``(ngkmax,)`` float64 in Ry, ``Gx/Gy/Gz``
-    are ``(ngkmax,)`` int32 FFT-box indices and ``g_mask`` is
-    ``(ngkmax,)`` float64, 1 on the ``ngk[k]`` physical rows and 0 on the
-    pad.
-
-    Pad rows carry ``G = (0,0,0)``, so ``T_diag`` there is ``|k|²`` — a
-    finite, physically-meaningless value that :func:`setup_H_k` replaces
-    with its ``1e10`` preconditioner sentinel.  The mask is what makes
-    the pad inert; it is returned rather than left implicit because
-    ``(0,0,0)`` is a VALID box index that aliases Γ, so a consumer that
-    drops it double-counts ψ(G=0) instead of crashing.
-
-    Pass ``gvectors`` to reuse one :class:`PaddedGVectors` table across a
-    k sweep instead of rebuilding it per k.
-    """
-    tab = padded_gvectors(wfn, k="full_bz") if gvectors is None else gvectors
-    G_pad, g_mask = tab.at(k_idx)
-    kvec = np.asarray(tab.kvecs[int(k_idx)], dtype=float)
-    T_diag, Gx, Gy, Gz = _T_diag_from_G(
-        np.asarray(G_pad, dtype=int), kvec, wfn.bdot)
-    return T_diag, Gx, Gy, Gz, g_mask
 
 
 def build_T_diag_from_kvec(
@@ -625,33 +573,6 @@ def build_V_scf(
     return V_scf
 
 
-def build_vnl_kdata(
-    k_idx: int,
-    vnl_setup,
-    wfn,
-    sym,
-    meta,
-    nspinor: int | None = None,
-    gvectors: PaddedGVectors | None = None,
-):
-    """Dense VNL projectors (Z, E) for one k-point via vnl_ops.
-
-    Returns (vnl_Z, vnl_E) where:
-      vnl_Z : (total_R, ngkmax) — all channels × atoms × betas concatenated,
-              already zero on the pad columns (see
-              ``vnl_ops.build_vnl_kdata``), so no caller-side mask is needed
-      vnl_E : (nspinor, nspinor, total_R, total_R) — block-diagonal D matrix
-    """
-    import psp.vnl_ops as vnl_ops
-
-    if nspinor is None:
-        nspinor = int(meta.nspinor)
-
-    kdata = vnl_ops.build_vnl_kdata(k_idx, vnl_setup, wfn, sym, meta,
-                                     gvectors=gvectors)
-    return kdata.Z, kdata.E_super
-
-
 @jax.jit
 def gather_psi_G(psi_box, Gx, Gy, Gz, mask=None):
     """Gather sparse plane-wave coefficients from the FFT box.
@@ -692,21 +613,6 @@ def vnl_matrix_from_kdata(psi_box, Gk_crys, kdata, mask=None):
     return vnl_ops.vnl_matrix(psi_G, kdata.Z, kdata.E_super)
 
 
-def vnl_velocity_from_kdata(psi_box, Gk_crys, kdata, mask=None):
-    """Convenience: dV_NL/dK_cart from FFT-box states and prebuilt VNL k-data."""
-    import psp.vnl_ops as vnl_ops
-
-    if kdata.dZ is None:
-        raise ValueError("kdata.dZ is required for vnl_velocity_from_kdata")
-    psi_G = gather_psi_G_from_crys(psi_box, Gk_crys, mask)
-    # Slice to physical spinor components if bispinor wavefunctions have
-    # more spinor components than the E_super block-diagonal (e.g. 4 vs 2).
-    nspinor_E = kdata.E_super.shape[0]
-    if psi_G.shape[1] > nspinor_E:
-        psi_G = psi_G[:, :nspinor_E, :]
-    return vnl_ops.vnl_velocity_matrix(psi_G, kdata.Z, kdata.dZ, kdata.E_super)
-
-
 def build_h_diag(
     T_diag: jax.Array,
     V_loc_r: jax.Array,
@@ -743,90 +649,6 @@ def build_h_diag(
 # ═══════════════════════════════════════════════════════════════════════
 #  Setup: build HamiltonianK for one k-point
 # ═══════════════════════════════════════════════════════════════════════
-
-def setup_H_k(
-    k_idx: int,
-    V_scf: jax.Array,
-    vnl_setup,
-    wfn,
-    sym,
-    meta,
-    V_loc_r: jax.Array | None = None,
-    ngkmax: int | None = None,
-    gvectors: PaddedGVectors | None = None,
-    *, compact_vnl: bool = False,
-) -> HamiltonianK:
-    """Assemble all per-k Hamiltonian data (SymMaps path).
-
-    Parameters
-    ----------
-    k_idx : index into the loader's full-BZ row order
-    V_scf : (nx, ny, nz) — V_loc + V_H + V_xc, from build_V_scf
-    vnl_setup : from vnl_ops.build_vnl_setup (k-independent, built once)
-    wfn, sym, meta : standard LORRAX objects
-    V_loc_r : (nx, ny, nz) — ionic local potential alone, for h_diag.
-        If None, h_diag falls back to T_diag only.
-    ngkmax : int, optional — pad beyond the loader's own ``ngkmax``.
-        The G table is ALREADY fixed-shape at the file's ``ngkmax``, so
-        this is only needed when a caller wants a still larger uniform
-        size; a smaller value is refused rather than silently truncating
-        a k's physical G-sphere.
-    compact_vnl : bool — use compact SOC coupling blocks in vnl_E.
-        Opt-in for callers that pass the coupling pytree through unchanged.
-    gvectors : PaddedGVectors, optional — reuse one table across a sweep.
-    """
-    tab = padded_gvectors(wfn, k="full_bz") if gvectors is None else gvectors
-    T_diag, Gx, Gy, Gz, g_mask = build_T_diag(
-        k_idx, wfn, sym, meta, gvectors=tab)
-    nG_actual = int(np.count_nonzero(g_mask))
-    nG_pad = int(g_mask.shape[0])
-
-    if ngkmax is not None and int(ngkmax) < nG_pad:
-        raise ValueError(
-            f"setup_H_k: ngkmax={int(ngkmax)} is smaller than the loader's "
-            f"own padded width {nG_pad}; truncating would drop physical "
-            f"G-vectors at the k with the largest ngk.")
-    if ngkmax is not None and int(ngkmax) > nG_pad:
-        pad = int(ngkmax) - nG_pad
-        T_diag = jnp.pad(T_diag, (0, pad), constant_values=0.0)
-        Gx = jnp.pad(Gx, (0, pad), constant_values=0)
-        Gy = jnp.pad(Gy, (0, pad), constant_values=0)
-        Gz = jnp.pad(Gz, (0, pad), constant_values=0)
-        g_mask = np.concatenate([g_mask, np.zeros(pad, dtype=g_mask.dtype)])
-
-    mask = jnp.asarray(g_mask, dtype=jnp.bool_)
-    # Pad rows hold G=(0,0,0), i.e. T = |k|² there.  Restore the 1e10
-    # preconditioner sentinel the padded path has always published, so
-    # anything reading ``HamiltonianK.T_diag`` sees the same thing.
-    T_diag = jnp.where(mask, T_diag, jnp.asarray(1e10, dtype=T_diag.dtype))
-
-    # Build VNL at padded size — one JIT trace for all k-points
-    Gk_int = np.stack([np.asarray(Gx), np.asarray(Gy), np.asarray(Gz)], axis=-1)
-    kvec = np.asarray(tab.kvecs[int(k_idx)], dtype=float)
-    import psp.vnl_ops as vnl_ops
-    kdata = vnl_ops.build_vnl_kdata_from_kvec(kvec, Gk_int, vnl_setup)
-
-    # Tail-G mask: padded Z entries are non-zero (computed at K=kvec) —
-    # zero them so apply_vnl / build_h_diag never see spurious overlap.
-    vnl_Z = jnp.where(mask[None, :], kdata.Z, jnp.zeros((), dtype=kdata.Z.dtype))
-
-    vnl_E = (vnl_ops.compact_vnl_coupling(vnl_setup)
-             if compact_vnl else kdata.E_super)
-    h_diag = (build_h_diag(T_diag, V_loc_r, vnl_Z, vnl_E)
-              if V_loc_r is not None else T_diag)
-    h_diag = jnp.where(mask, h_diag, jnp.asarray(1e10, dtype=h_diag.dtype))
-
-    return HamiltonianK(
-        T_diag=T_diag,
-        V_scf=V_scf,
-        Gx=Gx, Gy=Gy, Gz=Gz,
-        vnl_Z=vnl_Z,
-        vnl_E=vnl_E,
-        h_diag=h_diag,
-        mask=mask,
-        nG=nG_actual,
-        fft_grid=tuple(int(x) for x in meta.fft_grid),
-    )
 
 
 def setup_H_k_from_kvec(

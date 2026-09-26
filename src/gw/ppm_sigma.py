@@ -261,8 +261,9 @@ def ppm_fermi_frame(enk_full, occ_full, use_midgap):
     ``0.5*(VBM + CBM)`` when ``use_midgap`` and a state is empty.
 
     The one owner of that rule: ``_prepare_sigma_state`` builds the Sigma
-    frame with it, and the SC loop (``sc_iteration._sigma_frame_mu_ev``) calls
-    it on the same energies to judge grid coverage in that frame.
+    frame with it, and ``efermi.sigma_frame_mu_ev`` (shared by the one-shot
+    and the SC loop) calls it on the same energies to judge grid coverage in
+    that frame.
     """
     occ_mask = occ_full > 0.5
     vbm = jnp.max(jnp.where(occ_mask, enk_full, -1.0e30))
