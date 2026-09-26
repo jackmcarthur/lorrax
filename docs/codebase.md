@@ -14,7 +14,6 @@ contracts, equations, shapes, and run policy remain on the owner pages in the
 | `band_partition.py` | Builds the three-way QSGW band partition. |
 | `cohsex_sigma.py` | Orchestrates the static self-energy path. |
 | `compute_vcoul.py` | Dispatches Coulomb-matrix construction by dimensionality. |
-| `compute_vcoul_0d.py` | Compatibility import for the zero-dimensional vcoul service route. |
 | `degen_average.py` | Averages band quantities over degeneracy blocks. |
 | `downfold.py` | Builds and applies reduced interaction bases. |
 | `downfold_cli.py` | Command-line entry point for interaction downfolding. |
@@ -77,7 +76,6 @@ contracts, equations, shapes, and run policy remain on the owner pages in the
 | `collectives.py` | Wraps process collectives and communicator warm-up. |
 | `contract_bands.py` | Contracts band axes under explicit chunking. |
 | `coulomb_sphere.py` | Supplies spherical Coulomb-cell integration helpers. |
-| `eigh_block_sweep.py` | Runs blockwise Hermitian eigensolver sweeps. |
 | `fft_helpers.py` | Provides the canonical sharded real/reciprocal FFT factories. |
 | `four_current_model.py` | Defines shared packed-current model vocabulary and validation. |
 | `gamma_matrices.py` | Supplies spinor gamma-matrix conventions. |
