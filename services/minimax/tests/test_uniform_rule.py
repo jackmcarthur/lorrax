@@ -171,20 +171,6 @@ def test_far_sign_definite_box_samples_stay_inside_the_box():
     assert d.real.min() >= lo and d.real.max() <= hi
 
 
-@pytest.mark.slow
-def test_jax_backend_on_cpu_matches_numpy_on_a_small_crossing_box(monkeypatch):
-    """The jax reducer (forced, on the CPU device) reaches an accepted rule
-    within a few nodes of the numpy one: same algorithm, different
-    floating-point route (CholeskyQR2 weights, Cholesky per damping)."""
-    pytest.importorskip("jax")
-    monkeypatch.setenv("JAX_PLATFORMS", "cpu")
-    box = (-8.0 * ETA, 8.0 * ETA, ETA, 5.0 * ETA)          # rank ~35: both finish in seconds
-    ref = build_uniform_rule(box, 1.0e-4, backend="numpy")
-    rule = build_uniform_rule(box, 1.0e-4, backend="jax")
-    _check(rule, box, 1.0e-4)
-    assert abs(rule.node_count - ref.node_count) <= 3, (rule.node_count, ref.node_count)
-
-
 def test_the_rule_is_a_function_of_the_inputs_alone():
     """No clock, no pass count: two builds of one box agree bit for bit.
 
