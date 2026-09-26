@@ -35,8 +35,8 @@ their supports), and one p→r call writes D = [A | B].
 Schedule (one τ node; P ranks; every stage one ``shard_map`` over ``('x','y')``)::
 
     1  A_k̄(p, p')  2-D tile at the parents            → slab: p over all P, p' local
-    2  typed transport, column half (p' → src(p'), phase, spin), on the compact tile
-    3  p' → r'  (sphere → box, sign −1), × e^{-ik·r'}
+    2  p' → r' at the parents (sphere → box, sign −1)  H̃_k̄(p, x), every x local
+    3  column unfold per child k: x = α_k(r'), × e^{-2πi k̄·(x+L)}, 𝒯, conj U
     4  all-to-all: r' over all P, every p local        H_k(p, r')   [one r' chunk]
     5  per batch J of r' columns, every k local:
          typed transport, row half; p → r (sign +1); k → R; Σ_αβ A_R conj C_R; R → q
@@ -47,9 +47,25 @@ Schedule (one τ node; P ranks; every stage one ``shard_map`` over ``('x','y')``
 
 The typed transport (``SphereTransport``) is ``symmetry_maps.unfold_load_tables``'
 pair-transpose rule in G space: the compact tiles are unfolded, ψ never is.  Its
-column half acts on the compact tile before step 3 (every p' is local there) and
-its row half inside the step-5 gather (every p is local there), so neither half
-moves data between ranks; the product of the two halves is the whole action.
+column half acts in steps 2–3 (every p' and every r' is local there) and its row half
+inside the step-5 gather (every p is local there), so neither half moves data between
+ranks; the product of the two halves is the whole action.
+
+The expand at the k-parents (steps 2–3).  A child k of parent k̄ under the operation
+{mtrx | τ} (``antiunitary`` 𝒯 = conj) reads its parent at y = mtrx·(r − τ) on both
+coordinates (``isdf.zeta_mubatch.typed_child_G_tables``' r-space action); on the column,
+with y = x_α + L (``symmetry_maps.centroid_source_map_and_wrap``, snapped)::
+
+    H_k(p γ, β, r') = Σ_δ conj U_k[β, δ] · 𝒯[ e^{-2πi k̄·(x_α + L)} H̃_k̄(p γ, δ, x_α) ],
+    H̃_k̄(p γ, δ, x) = Σ_p' Ŝ_k̄[p γ, p' δ] e^{-2πi Ḡ_p'·x}
+
+where Ŝ is the parent tile (conj of the transposed partner on an antiunitary row when
+partners are passed, then 𝒯 conjugates it back) and the row index p stays the parent slot
+for the row half.  So p' → r' runs on the n_parent parents' own spheres, not on N_k
+children's rotated ones (N_k/n_parent fewer box transforms: 4.9× at Fe 4³, 8.7× at 8³),
+and each child is a column gather with one phase.  H stays at every k on the columns
+the middle reads: with the wedge those are N_k·N_w pairs, the same information as the
+parents' H̃ on every column (n_parent·N_r); holding H̃ instead would not shrink it.
 
 Memory law, per rank, complex128 (``describe()`` prints it; n_A, n_C, n_X the operand
 and output spin widths: n_s, n_s, 1 for ``'trace'`` and n_s, 1, n_s for ``'scalar'``)::
@@ -64,7 +80,7 @@ T with the rebuilt T through the wedge's rebuild, the final T with X through the
 stage); the HWM is the largest stage.  No N_k·N_r² object exists.  n_c (r' chunks), J (the batch), the k chunk of steps
 2–4 and the q chunk of step 6 all come from the device budget; each is one when
 everything fits (sandbox TASTE 96).  The r' chunking recomputes steps 2–3 per chunk
-(O(N_k M N_r log N_r) each, ~M/N_r of the step-5 work) and bounds H by 1/n_c.
+(O(n_parent M N_r log N_r) each) and bounds H by 1/n_c.
 
 Backends, chosen when the plan is built:
 
@@ -1491,7 +1507,11 @@ class MixedBasisPairConvolution:
                 f"(carriers {self.width_carrier[0]}/{self.width_carrier[1]}/{self.mo_axis.carrier}); "
                 f"union boxes {self.kbox[0]}/{self.kbox[1]}/{self.kbox_out}; n_q={self.nq}\n"
                 f"[pair-conv] schedule: r' chunks n_c={c.n_c}, batch J={c.J} ({self.n_batch} per chunk "
-                f"per rank), k chunk {c.kc}, q chunk {c.qc}\n"
+                f"per rank), k chunk {c.kc}, q chunk {c.qc}; expand at the parents: "
+                + "; ".join(f"{nm} {st['n_transforms']} p'→r' transforms per chunk for {self.nk} k "
+                            f"({len(st['start'])} steps × {st['npc']} of {st['n_src']})"
+                            for nm, ps in zip(("left", "right"), self._pstep)
+                            for v, st in ps.items() if not v) + "\n"
                 f"[pair-conv] memory law per rank: tiles {gb(c.bytes_tiles)}, H {gb(c.bytes_h)}, "
                 f"middle T {gb(c.bytes_t_mid)}"
                 f"{'' if self._wt is None else ', rebuilt T ' + gb(c.bytes_t_out)}, X {gb(c.bytes_out)}; "
