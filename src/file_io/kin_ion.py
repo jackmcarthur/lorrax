@@ -159,6 +159,31 @@ def broadcast_ibz_to_full_bz(A_irr, irr_idx_k, sym_idx_k, n_sym_spatial):
 
 
 
+def write_kin_ion(path, H_irr, *, mesh, nb, star, attrs) -> None:
+	"""Write ``kin_ion.h5`` through SlabIO from the sweep's shards.
+
+	COLLECTIVE over ``mesh``.  ``H_irr`` is the star-wedge slab
+	``(n_orbits, nb_pad, nb_pad)`` with its band axes on the mesh (or a
+	replicated host array); SlabIO drops the pad rows past the logical
+	``nb``.  ``star`` is ``(irr_idx_k, sym_idx_k, n_sym_spatial)`` already
+	renumbered onto the stored rows (``symmetry_maps.star_tables``); the
+	two index tables are filed beside the slab they unfold, and the slab is
+	stamped ``k_storage = "ibz"``.  ``attrs`` are the dataset's provenance
+	attributes; every rank passes them and rank 0's copy lands.
+	"""
+	irr_idx_k, sym_idx_k, n_sym_spatial = star
+	n_rows = int(H_irr.shape[0])
+	with SlabIO(str(path), mode="w", mesh=mesh) as io:
+		io.write_attr(IRR_IDX_DATASET, np.asarray(irr_idx_k, dtype=np.int32))
+		io.write_attr(SYM_IDX_DATASET, np.asarray(sym_idx_k, dtype=np.int32))
+		io.create_dataset(
+			"kin_ion", shape=(n_rows, int(nb), int(nb)), dtype=np.complex128,
+			attrs={K_STORAGE_ATTR: K_STORAGE_IBZ,
+			       K_STORAGE_VERSION_ATTR: K_STORAGE_VERSION,
+			       N_SYM_SPATIAL_ATTR: int(n_sym_spatial), **dict(attrs)})
+		io.write_slab("kin_ion", H_irr)
+
+
 def _unfold_if_ibz(arr, star):
 	"""Apply the star broadcast iff ``star`` says the slab is an IBZ one."""
 	if star is None:

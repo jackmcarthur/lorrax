@@ -87,10 +87,9 @@ WHO GATHERS, AND WHERE IT IS SAID
 ---------------------------------
 The sharded block is the RETURN VALUE.  ``blocks_to_host`` at the end of
 this module is the only boundary that undoes it, and it is called by
-name at the sinks that cannot take a sharded operand (two serial h5py
-writes, one replicated global operand).  A consumer that can stay
-sharded — ``gw.sc_iteration.rebuild_hartree_dft_basis`` — does not call
-it.  There is no implicit gather anywhere in this path.
+name at the sinks that cannot take a sharded operand (host
+diagnostics).  Consumers that can stay sharded — the SC Hartree rebuild
+and the SlabIO artifact writers — do not call it.  There is no implicit gather anywhere in this path.
 
 WHY ψ(G) IS RESIDENT AND THE BOX NEVER IS
 -----------------------------------------
@@ -1899,21 +1898,15 @@ def blocks_to_host(H, *, nb: int, owner_only: bool = False):
 
     THE BOUNDARY IS EXPLICIT AND IT IS NOT FREE.  ``sweep_matrix_elements``
     returns the block SHARDED, which is the point: no rank holds a full
-    ``(nb, nb)``.  Every consumer that keeps its result in that layout
-    (``gw.sc_iteration.rebuild_hartree_dft_basis``) must NOT call this.
-    It exists for the sinks that cannot take a sharded operand — today the
-    serial ``h5py`` writes in ``gw.kin_ion_io`` and
-    ``psp.get_dipole_mtxels`` — and it re-materialises the replicated
-    ``(nk, nb, nb)`` on the ranks that keep it.  The live
-    ``gw.sigma_dispatch`` G-space route does not cross this boundary; its
-    star broadcast and basis rotation retain ``P(None,'x','y')``.  What the
-    sweep removes upstream of here is the per-k full-band FFT box and the
-    ``P ≤ nk`` ceiling; an artifact writer still has to hold its table.
+    ``(nb, nb)``.  Consumers that keep that layout must NOT call this: the
+    live G-space Hartree (``return_sharded=True``), the SC rebuild, and both
+    artifact writers, which write from the shards through SlabIO
+    (``file_io.kin_ion.write_kin_ion``, ``file_io.dipole.write_dipole``).
+    What is left is host diagnostics that ask for the replicated table.
 
     ``owner_only=True`` keeps it on rank 0 and returns ``None`` elsewhere
     — the same contract ``collectives.gather_k_blocks(owner_only=True)``
-    offers, and for the same reason (the only consumer is the rank-0 file
-    write).  The gather runs in leading-axis chunks so a peer's transient
+    offers.  The gather runs in leading-axis chunks so a peer's transient
     is one chunk rather than the whole table; the chunk count is derived
     from replicated shapes, so every rank enters the same number of
     collectives.
@@ -1922,30 +1915,6 @@ def blocks_to_host(H, *, nb: int, owner_only: bool = False):
     mesh-padded extent and the pad rows and columns are exact zeros
     (products of a zero band); trimming them here is the caller stating
     logical shapes only, per decisions.md 2026-08-04.
-
-    WALL W2 SURVIVES HERE, AND WHAT IT WOULD TAKE TO REMOVE IT
-    ----------------------------------------------------------
-    The handoff's §6.4 is open: W1 (the per-k full-band FFT box) and W3
-    (the ``P ≤ nk`` ceiling) are gone, the replicated ``(nk, nb, nb)`` is
-    not — this function re-materialises it.  Scoped, because a partial
-    version that gathers anyway would be worse than an honest boundary:
-
-    * Both h5 sinks (``gw.kin_ion_io.main``, ``psp.get_dipole_mtxels.main``)
-      are RAW ``h5py.File`` writes on rank 0, not SlabIO.  ``SlabIO.
-      write_slab`` does take a sharded ``jax.Array`` and write it as a
-      hyperslab, so converting them is the mechanism, and it would now
-      keep its promise: this paragraph used to withhold the conversion
-      because "the allgather backend gathers to rank 0 first", which was
-      true until 233a830d deleted that backend and the ``slab_io`` router
-      with it.  There is one transport left and it writes from the shards,
-      so the reason recorded here is spent — what is left is the work.
-    * The former third consumer is converted: the live G-space source returns
-      ``P(None,'x','y')`` and rotates it without a host or replicated seam.
-      W2 therefore survives only at the two serial artifact writers named
-      above, not in the in-memory driver path.
-
-    Converting those two writers is separate I/O work this module does not
-    own.  Recorded rather than half-landed.
     """
     from common.collectives import gather_to_host, process_rank
 
