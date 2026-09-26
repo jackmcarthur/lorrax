@@ -196,7 +196,7 @@ def fixture(*, metal=False, eta=.25, tier='production', top=20.):
     bind_shared_pole_census(wf,meta,occupation_state=state,trs_allowed=True,state_capacity=2.,kweights=[.5,.5])
     # Resolver inputs carry the already-resolved positive device budget (R24).
     config = NS(sigma=NS(w_model='shared_pole',w_accuracy=tier,regularization_ev=eta),
-                memory=NS(per_device_gb=30.))
+                memory=NS(per_device_gb=30.),bispinor=False)
     return config,wf,meta
 
 
