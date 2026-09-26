@@ -106,6 +106,7 @@ def test_stage_table_prints_gamma_per_row_or_no_planner(tmp_path, monkeypatch):
         dict(stage="Sigma tau", bytes=12.85e9, section="sigma.tau_sweep",
              path=("gw_jax.sigma", "sigma.tau_sweep", "tau.setup")),
     ])
+    monkeypatch.setattr(gpu_utils, "_RUN_DEVICE_BUDGET_GB", 20.0)
     path = tmp_path / "gwjax.out"
     report = GWProductionReport(str(path), runtime=SimpleNamespace(process_index=0),
                                 debug=False, stdout=lambda line: None)
@@ -113,6 +114,7 @@ def test_stage_table_prints_gamma_per_row_or_no_planner(tmp_path, monkeypatch):
     report.finish()
     text = path.read_text()
     table = text.split("MAJOR-STAGE DEVICE MEMORY")[1]
+    assert "budget memory_per_device_gb = 20.00 GB; run peak 23.30 GB (OVER)" in table
     line = lambda label: next(l for l in table.splitlines() if l.strip().startswith(label))
     assert "20.59 /  20.49" in line("chi0") and "18.50" in line("chi0")
     assert " 1.11  " in line("chi0") and line("chi0").endswith("gw_jax.chi0_W_probe > chi.exec")
