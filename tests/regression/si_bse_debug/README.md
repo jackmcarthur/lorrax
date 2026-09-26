@@ -235,8 +235,7 @@ unfolds) while any real GW+BSE pipeline launched as several processes on
 this deck breaks at the first `read_slabs`.
 
 The deck therefore carries `restart_q_storage = full` explicitly.  It costs
-this deck nothing measurable: the scripted A/B
-(`tests/multi_device/restart_q_storage_ab.sh`) ran the two arms against each
+this deck nothing measurable: a scripted A/B ran the two arms against each
 other and got 0.000000 meV with bit-identical tensors on the serial path.
 What it costs is the 4.155× on the file that the wedge would have bought
 here, which is a size, not an answer.
