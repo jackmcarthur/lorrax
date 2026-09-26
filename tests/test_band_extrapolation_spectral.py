@@ -275,7 +275,7 @@ def test_the_deck_key_defaults_to_spectral_shell_and_refuses_a_typo():
     kw = dict(omega_min_ev=-5.0, omega_max_ev=5.0, omega_step_ev=0.1,
               regularization_ev=0.1, window_edge_factor=1.0,
               fermi_reference="midgap",
-              sigma_at_dft_extrapolate=False, sigma_at_dft_energies=False)
+              sigma_at_dft_energies=False)
     assert DynamicSigmaConfig(**kw).band_extrapolation_estimator == \
         "spectral_shell"
     for name in BAND_EXTRAPOLATION_ESTIMATORS:
@@ -297,7 +297,7 @@ def test_bracket_scheme_defaults_compatibly_and_refuses_ignored_or_bad_values():
     kw = dict(omega_min_ev=-5.0, omega_max_ev=5.0, omega_step_ev=0.1,
               regularization_ev=0.1, window_edge_factor=1.0,
               fermi_reference="midgap",
-              sigma_at_dft_extrapolate=False, sigma_at_dft_energies=False)
+              sigma_at_dft_energies=False)
     assert DynamicSigmaConfig(
         **kw).band_extrapolation_bracket_scheme == BRACKET_SCHEME_DEFAULT
     for name in BRACKET_SCHEMES:

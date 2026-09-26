@@ -155,7 +155,6 @@ at its default, `false`.
 | `band_extrapolation_estimator` | str | `spectral_shell` | Which estimator consumes the three sums; it changes no compute. `spectral_shell`: a per-state decay exponent β from the two shell increments against spectral moments of the DFT eigenvalues, with the tail integrated to the plane-wave basis; a state whose two increments give no exponent in (0.05, 40) keeps its computed N3 sum, and the log counts those states. `band_index_only`: the two-parameter S∞ + A/N least squares. |
 | `no_degen_averaging` | bool | `false` | Disables BerkeleyGW-style averaging of diagonal Σ within degenerate sets in the terminal output. |
 | `degen_avg_tol_ry` | float | `1e-6` | Degeneracy tolerance (Ry) of that terminal averaging. It is not an SC tolerance. |
-| `sigma_at_dft_extrapolate` | bool | `false` | Extrapolates Σ to E_DFT outside the ω grid instead of clamping. |
 | `sigma_freq_debug_output` | bool | `false` | Writes the per-branch Σ(ω) debug table. |
 | `sigma_freq_debug_file` | str | `sigma_freq_debug.dat` | Path of that table. |
 | `sigma_lorentz_debug_output` | bool | `false` | Writes each four-current SC map's on-shell (CC, CT+TC, TT) matrices to `sigma_lorentz_iterNNNN.h5`. Under `full_shared_pole` it also evaluates the mixed and transverse sectors on shell. |
@@ -177,10 +176,7 @@ at its default, `false`.
 | `static_gauge_hall_file` | str | `""` | Hall pseudovector written by `get_dipole_mtxels --static-gauge-hall-only --static-gauge-hall-out`, read only by the packed Γ-cell completion. Empty means σ_H = 0, which is exact for a Chern-trivial insulator. A named path must exist (`GATE static_gauge_hall_file_missing`) and authenticate against the run's WFN, band manifold and k count. On packed `bare_transverse`, a nonzero σ_H refuses (`GATE packed_bare_transverse_hall_unavailable`). |
 | `sc_initial_qp_rotations_file` | str | `""` | A `qp_wfn_rotations.h5` that seeds a new SC run (a warm start, not a restart). The source WFN fingerprint, k table, band range, finite E/U and unitarity are validated. The initial carry is U diag(E) U^H in the DFT basis, and the accelerator history starts empty. |
 | `sc_exact_degeneracy_tol_ev` | float | `1e-4` | Largest splitting (eV) averaged as an accidental degeneracy inside a map, in (0, 1e-4]. |
-| `sc_tail_fit` | str | `conduction_mean` | Sum-band tail law. `conduction_mean`: one rigid shift, the k-weighted mean QP correction over the trusted conduction states. `frontier`: a rigid shift from the lowest conduction manifold. `all_conduction`: an affine fit over every in-grid conduction state. `buffer_edges`: a fit to the adjacent buffer; it requires `sc_buffer_nbands > 0`. |
-| `sc_buffer_nbands` | int | `0` | Extra valence and conduction states evaluated around the `nval`/`ncond` window under self-consistency. They lie outside the full-matrix window. |
-| `sc_buffer_mode` | str | `diagonal` | Treatment of the buffer. `diagonal`: its own Σ diagonal, with no off-diagonals. `one_sided`: keeps the cross-edge couplings at the in-window energy. `carry`: drops the couplings and carries the previous map's buffer energies. |
-| `sc_frozen_core_bands` | int | `0` | The lowest N bands keep their DFT energies each map (no Σ, no scissor) and stay in every band sum. |
+| `sc_frozen_core_bands` | int | `0` | The lowest N bands keep their DFT energies each map (no Σ) and stay in every band sum. |
 | `sc_dump_dir` | str | `""` | Directory for the output-energy history and each map's input rotation `rotation_iterNNNN.npy`. These are diagnostics, not checkpoints. |
 | `write_eqp2` | bool | `false` | Writes `eqp2_file` beside eqp0/eqp1 by iterating the stored full-matrix Σ(ω) to an eigenvalue fixed point. It rebuilds no G, χ0, W or Σ. It requires a dynamic `compute_mode` and `qp_solver = one_shot_dft`, and diagonalizes with the `linalg` layout. |
 | `eqp2_tol_ev` | float | `1e-3` | eqp2 tolerance (eV) on the largest eigenvalue change over the protected states. |

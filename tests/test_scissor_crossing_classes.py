@@ -57,9 +57,21 @@ _spec.loader.exec_module(scissor)
 
 classify_scissor_bands = scissor.classify_scissor_bands
 fit_scissor = scissor.fit_scissor
-full_bz_k_weights = scissor.full_bz_k_weights
 ScissorBandClasses = scissor.ScissorBandClasses
 qsgw_out_of_range_energies = scissor.qsgw_out_of_range_energies
+
+
+def full_bz_k_weights(nk):
+    """Unreduced k-set: every k is its own star."""
+    return np.ones(int(nk), dtype=np.float64)
+
+
+def _delta(fit, e_dft, valence, crossing=None):
+    """The fit's correction (alpha - 1) E + beta by class; 0 on crossing
+    bands (a band the fit refused is a band it does not extrapolate)."""
+    out = np.where(valence, (fit.alpha_v - 1.0) * e_dft + fit.beta_v_ev,
+                   (fit.alpha_c - 1.0) * e_dft + fit.beta_c_ev)
+    return out if crossing is None else np.where(crossing, 0.0, out)
 
 
 # ---------------------------------------------------------------------------
@@ -203,8 +215,8 @@ def test_excluding_the_crossing_pair_repairs_the_semicore_extrapolation():
 
     # Prediction on the out-of-window 2s semicore.
     truth = (_ALPHA_V - 1.0) * E_dft + _BETA_V
-    d_new = new.predict(E_dft, new_val, crossing_mask=new_cross)
-    d_old = old.predict(E_dft, old_val)
+    d_new = _delta(new, E_dft, new_val, new_cross)
+    d_old = _delta(old, E_dft, old_val)
     semicore = slice(*_I_2S)
     err_new = float(np.abs(d_new[:, semicore] - truth[:, semicore]).max())
     err_old = float(np.abs(d_old[:, semicore] - truth[:, semicore]).max())
@@ -225,7 +237,7 @@ def test_the_crossing_bands_get_no_extrapolation_at_all():
     fit = fit_scissor(E_dft, E_qp, valence_mask_kn=val_kn,
                       fit_mask_kn=in_range & ~cross_kn,
                       k_weights=full_bz_k_weights(_N_K))
-    delta = fit.predict(E_dft, val_kn, crossing_mask=cross_kn)
+    delta = _delta(fit, E_dft, val_kn, cross_kn)
     assert np.array_equal(delta[:, slice(*_I_CROSS)],
                           np.zeros((_N_K, 2)))
     # ...and nothing else was zeroed.
@@ -284,24 +296,9 @@ def test_insulating_fit_is_bitwise_identical_under_the_new_masks():
     assert new.n_fit_v == old.n_fit_v
     assert new.n_fit_c == old.n_fit_c
 
-    d_old = old.predict(E_dft, old_val)
-    d_new = new.predict(E_dft, new_val, crossing_mask=new_cross)
+    d_old = _delta(old, E_dft, old_val)
+    d_new = _delta(new, E_dft, new_val, new_cross)
     assert np.array_equal(d_new, d_old)
-
-
-def test_predict_without_a_crossing_mask_is_the_historical_expression():
-    """``crossing_mask=None`` must not perturb the two-way arithmetic."""
-    E_dft, E_qp, f, nocc = _insulating_deck()
-    nk, nb = E_dft.shape
-    vm = _index_mask(nk, nb, nocc)
-    fit = fit_scissor(E_dft, E_qp, valence_mask_kn=vm,
-                      fit_mask_kn=np.ones_like(vm),
-                      k_weights=full_bz_k_weights(nk))
-    a = fit.predict(E_dft, vm)
-    b = fit.predict(E_dft, vm, crossing_mask=None)
-    c = fit.predict(E_dft, vm, crossing_mask=np.zeros_like(vm))
-    assert np.array_equal(a, b)
-    assert np.array_equal(a, c)
 
 
 # ---------------------------------------------------------------------------
@@ -329,7 +326,7 @@ def test_a_window_holding_only_crossing_bands_gives_the_identity():
     assert (new.n_fit_v, new.n_fit_c) == (0, 0)
     assert (new.alpha_v, new.beta_v_ev) == (1.0, 0.0)
     assert (new.alpha_c, new.beta_c_ev) == (1.0, 0.0)
-    delta = new.predict(E_dft, val_kn, crossing_mask=cross_kn)
+    delta = _delta(new, E_dft, val_kn, cross_kn)
     assert np.array_equal(delta, np.zeros_like(delta))
 
     # The contrast, on the same window: the old mask fits the crossing pair
@@ -339,7 +336,7 @@ def test_a_window_holding_only_crossing_bands_gives_the_identity():
                       fit_mask_kn=in_range, k_weights=w)
     assert old.n_fit_v == _N_K * 2
     truth = (_ALPHA_V - 1.0) * E_dft + _BETA_V
-    d_old = old.predict(E_dft, old_val)
+    d_old = _delta(old, E_dft, old_val)
     semicore = slice(*_I_2S)
     assert float(np.abs(
         d_old[:, semicore] - truth[:, semicore]).max()) > 5.0
@@ -529,8 +526,8 @@ def test_crossing_band_remains_identity_under_rigid_valence_policy():
     assert out[0, 2] == E[0, 2]
 
 
-def test_sc_map_wires_the_same_map_candidate_fermi_not_the_entry_fermi():
-    """Static seam gate: the pure policy must be fed F(H)'s own anchor."""
+def test_eqp2_policy_wires_the_same_map_candidate_fermi_not_the_entry_fermi():
+    """Static seam gate: EQP2's pure policy must be fed F(H)'s own anchor."""
     source = (_SCISSOR.parent / "sc_iteration.py").read_text()
     start = source.index("def _apply_scissor_partition_policy(")
     stop = source.index("def _refuse_empty_map_output(", start)

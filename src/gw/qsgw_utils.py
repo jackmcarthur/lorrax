@@ -251,11 +251,11 @@ def solve_diagonal_sigma_fixed_point(
     Returns
     -------
     E : (nk, nb)
-        Converged QP eigenvalues in eV.  Bands whose final fixed-point
-        argument lies outside ``[ω_min, ω_max]`` are clipped at the grid
-        edge for the Σ evaluation; callers should patch out-of-grid bands
-        via the scissor (see :mod:`gw.scissor`) if a flatter extrapolation
-        is desired.
+        Converged QP eigenvalues in eV.  An iterate outside
+        ``[ω_min, ω_max]`` reads Σ(ω = 0) (:func:`interp_along_omega`), not
+        the grid edge, whatever ``sigma_out_of_grid`` says; the caller
+        (:func:`solve_qp`) puts every band that is not on the grid at all k
+        back at E_DFT.
     converged : (nk, nb), bool
         Per-band convergence flag from the final iteration.
     n_iter : int
@@ -275,13 +275,11 @@ def solve_diagonal_sigma_fixed_point(
     mix = float(np.clip(mixing, 0.0, 1.0))
 
     for it in range(max_iter):
-        # ``clamp`` is the right policy for an ITERATE: this is a fixed-point
-        # search whose out-of-grid bands the caller patches through the
-        # scissor afterwards (see the Returns section), and a refusal here
-        # would kill the solve on a band the caller was going to replace
-        # anyway.  Unreported on purpose — it runs up to ``max_iter`` times
-        # and one line per iteration is noise, not evidence; the OUTPUT path
-        # is where the count matters and it is reported there.
+        # An off-grid iterate reads Sigma(omega = 0) (interp_along_omega):
+        # a refusal here would kill the solve on a band the caller replaces
+        # by E_DFT anyway (see the Returns section).  Unreported on purpose —
+        # it runs up to ``max_iter`` times and one line per iteration is
+        # noise, not evidence; the OUTPUT path reports the count.
         sig_at_E = interp_along_omega(sigma_w, omega, E)
         E_new = h0 + np.real(sig_at_E)
         E_next = (1.0 - mix) * E + mix * E_new
@@ -928,7 +926,6 @@ def solve_qp(
     kin_ion: jax.Array,
     *,
     config,
-    meta,
     mesh_xy: Mesh,
     print_fn=print,
 ) -> jax.Array:
@@ -947,16 +944,18 @@ def solve_qp(
       here too: ``sigma_xc_kij_ry`` is the mode's total Σ_xc by
       construction.
     - ``fixed_point`` — diagonal on-shell solve E = h₀ + ReΣ(E) followed
-      by a QSGW rebuild at the solved energies (+ optional per-band
-      scissor for out-of-grid bands).  Dynamic, non-streamed only
+      by a QSGW rebuild at the solved energies.  A band off the ω grid at
+      any k keeps E_DFT, and an off-grid evaluation in the rebuild reads
+      Σ(ω = 0) whatever ``sigma_out_of_grid`` says (``build_qsgw_sigma_xc``
+      is called with its default).  Dynamic, non-streamed only
       (validated at config load).  The dispatch's internal at-DFT build
       is superseded here — one redundant (cheap) QSGW contraction, the
       price of keeping ``compute_sigma_xc``'s signature uniform.
     - ``self_consistent`` is NOT handled here — the SC driver owns its
       own loop and rotation-back seam (``sc_iteration``).
 
-    All quantities are in **Rydberg** until the scissor's print summary
-    and the eV seam of the QSGW build kernel.  Σ_c(ω) lives natively in
+    All quantities are in **Rydberg** until the eV seam of the QSGW build
+    kernel.  Σ_c(ω) lives natively in
     Ry on the Ry ω-grid; mixing that with eV-converted h0/Σ_x is a
     footgun.
     """
@@ -1003,17 +1002,12 @@ def solve_qp(
         max_iter=120, tol_ev=1.0e-7 / RYD_TO_EV, mixing=0.6,
     )
 
-    # Per-band scissor for out-of-grid bands.  A band is "in-grid" iff
-    # E_DFT[k, n] lies in [ω_min, ω_max] for every k; if any single k
-    # is outside, the band gets the scissor uniformly across k (the
-    # diagonal solver clipped Σ_c at the ω-boundary for the offending
-    # k, which would otherwise contaminate the band's k-dispersion).
-    # The scissor itself is fitted on in-grid bands only.  Default
-    # fallback when the scissor flag is off: E_DFT (the natural
-    # zeroth-order QP correction = 0 estimate); the older fallback
-    # of using ``eigvalsh(H_qp)`` was unreliable for pseudobands.
-    from .scissor import (
-        classify_bands_in_grid, fit_scissor, full_bz_k_weights)
+    # A band is "in-grid" iff E_DFT[k, n] lies in [ω_min, ω_max] for every
+    # k; if any single k is outside, the band keeps E_DFT at every k (the
+    # diagonal solver read Σ(ω = 0) for the offending k, which would
+    # otherwise contaminate the band's k-dispersion).  E_DFT is the
+    # zeroth-order QP correction = 0 estimate.
+    from .scissor import classify_bands_in_grid
     band_in_grid, in_grid_kn_band = classify_bands_in_grid(
         E_dft_rel_ry, float(omega_grid_ry[0]), float(omega_grid_ry[-1]))
     assert_omega_grid_covers(
@@ -1024,35 +1018,7 @@ def solve_qp(
     print_fn(
         f"  Diagonal SC: {n_bands_in}/{n_bands_total} bands fully in grid, "
         f"{n_iter} iterations")
-    if (
-        config.sigma.sigma_at_dft_extrapolate
-        and 0 < n_bands_in < n_bands_total
-    ):
-        occ_mask_kn = np.broadcast_to(
-            np.arange(E_sc_rel_ry.shape[1])[None, :] < meta.nelec,
-            E_sc_rel_ry.shape).astype(bool)
-        # Fit in eV so the printed slopes/intercepts are human-readable.
-        # The diagonal fixed-point solution remains paired to each DFT
-        # state. ``fit_scissor`` applies one joint DFT sort to both energy
-        # tables and masks, preserving these identities through crossings.
-        fit = fit_scissor(
-            E_dft_kn_ev=E_dft_rel_ry * RYD_TO_EV,
-            E_qp_kn_ev=E_sc_rel_ry * RYD_TO_EV,
-            valence_mask_kn=occ_mask_kn,
-            fit_mask_kn=in_grid_kn_band,
-            # UNREDUCED k.  Every operand here descends from
-            # ``sigma_result``, which compute_sigma_xc builds on the full
-            # BZ (Σ is an FFT over the k-grid); this path never sees an
-            # IBZ k-set.  The SC loop's own refit is the one that can, and
-            # it weights by star multiplicity — sc_iteration.py.
-            k_weights=full_bz_k_weights(E_dft_rel_ry.shape[0]),
-        )
-        print_fn(f"  Scissor fit: {fit.summary()}")
-        extrap_rel_ry = E_dft_rel_ry + fit.predict(
-            E_dft_rel_ry * RYD_TO_EV, occ_mask_kn) / RYD_TO_EV
-        E_sc_rel_ry = np.where(in_grid_kn_band, E_sc_rel_ry, extrap_rel_ry)
-    else:
-        E_sc_rel_ry = np.where(in_grid_kn_band, E_sc_rel_ry, E_dft_rel_ry)
+    E_sc_rel_ry = np.where(in_grid_kn_band, E_sc_rel_ry, E_dft_rel_ry)
     E_sc_rel_ev = E_sc_rel_ry * RYD_TO_EV
 
     # QSGW Σ_xc^QSGW: preserve band sharding when the ω-tensor uses it.
@@ -1066,8 +1032,8 @@ def solve_qp(
             or (band_axis is not None and band_axis.pad > 0)),
         band_axis=band_axis,
     )
-    print_fn(f"  QSGW: {int(qsgw_diag['n_clipped'])} clipped "
-        f"({100*qsgw_diag['frac_clipped']:.1f}%)")
+    print_fn(f"  QSGW: {int(qsgw_diag['n_clipped'])} evaluations off the grid "
+        f"({100*qsgw_diag['frac_clipped']:.1f}%) read Sigma(omega=0)")
     # THE REBUILD SUPERSEDES THE AT-DFT CUBE IN THE FILE TOO.  The Σ
     # dispatch already appended its own QSGW build — evaluated at E_DFT,
     # which is what ``one_shot_dft`` keeps — and on this branch that build

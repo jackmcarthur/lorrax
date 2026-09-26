@@ -1,10 +1,12 @@
-"""Scissor-shift extrapolation for self-consistent GW.
+"""Scissor-shift laws and the SC Σ(ω) support rules.
 
-The dynamic self-energy Σ_c(ω) in LORRAX is computed on a small frequency grid
-(typically ±10 eV around E_F) while the full band range used in the QP
-Hamiltonian spans tens of eV below E_F to hundreds or thousands of eV above.
-Inside the grid we evaluate Σ_xc by interpolating the stored (ω, k, m, n)
-tensor; outside the grid we extrapolate the QP correction
+Two consumers extrapolate a QP correction with these laws: the SC loop's
+sum-band tail beyond the Σ window (:func:`apply_conduction_scissor_to_tail`,
+one rigid conduction shift) and fixed-Sigma EQP2's out-of-grid window states
+(:func:`qsgw_out_of_range_energies`).  The SC loop itself scissors no window
+state: every QP-window identity keeps its full Σ (owner rule 2026-09-22).
+The dynamic self-energy Σ_c(ω) is computed on a frequency grid; outside it
+these laws extrapolate the QP correction
 
     ΔE_nk := E_QP_nk − E_DFT_nk  =  ⟨n| Σ_xc − V_xc^DFT |n⟩_k
 
@@ -20,9 +22,8 @@ the Fermi level,
 
 Equivalently every such valence state receives the same rigid displacement
 ``E_F,QP - E_F,DFT``.  :func:`fit_scissor` still reports a valence affine fit
-because it is a general diagnostic and has other consumers, but
-:func:`qsgw_out_of_range_energies` deliberately does not use that fit for the
-self-consistent active-window valence tail.
+as a diagnostic, but :func:`qsgw_out_of_range_energies` deliberately does not
+use it for EQP2's out-of-range valence states.
 
 Which bands are valence and which are conduction
 ------------------------------------------------
@@ -62,20 +63,17 @@ Fermi-crossing Kramers pair (bands 9-10) sat in the VALENCE class:
 both the fit masks and :func:`qsgw_out_of_range_energies` use, so a band is
 classified once per iteration and the fit and application cannot disagree.
 
-The scissor is applied at the **eigenvalue level** in the diagonal Σ(E)
-fixed-point: out-of-grid conduction bands receive the affine law and
-out-of-grid valence bands receive the Fermi displacement above.  The QSGW
-Σ_xc that enters the QP Hamiltonian then evaluates the dynamic correlation
-at this scissor-corrected E_QP.  No matrix-level diagonal-add is exposed
-because the post-self-energy plumbing keeps H replicated, so a plain
-``H.at[:, idx, idx].add(diag)`` suffices when the caller wants one.
+EQP2 applies the scissor at the **eigenvalue level**: out-of-grid
+conduction bands receive the affine law and out-of-grid valence bands
+receive the Fermi displacement above, as the diagonal of the partitioned
+Hamiltonian.
 
 Per-band classification
 -----------------------
 A band ``n`` is **in-grid** iff ``E_DFT[k, n]`` lies inside ``[ω_min, ω_max]``
 for **every** k.  If any single k for that band lies outside the window the
-whole band is treated as out-of-grid — the diagonal Σ(E) fixed-point clipped
-Σ_c at the ω-boundary for the offending k, which contaminates the QP
+whole band is treated as out-of-grid — a Σ(E) read off the grid for the
+offending k is not that band's own Σ(E), which contaminates the QP
 correction at neighbouring k via the band's k-dispersion.  Per-band
 classification gives a discontinuity-free scissor: out-of-grid bands receive
 their class law uniformly across k (rigid Fermi displacement for valence,
@@ -99,18 +97,19 @@ the full-BZ arm by 1.67e-02 Ry = 0.23 eV after ONE iteration and eqp0 by
 between the arms.  The loop's k-set invariant: ``docs/self_consistency.md``.
 
 ``k_weights`` is consequently a REQUIRED keyword argument of
-``fit_scissor``.  There is no unweighted spelling to forget, and the two
-legitimate weight tables have named constructors that state the caller's
-claim about its own k-set: :func:`full_bz_k_weights` ("every k is its own
-star") and :func:`k_star_weights` ("multiplicities from the map that did
-the reduction").  Uniform weights reduce to exactly the previous
-arithmetic, bit for bit — asserted in ``tests/test_scissor_weights.py``.
+``fit_scissor``.  There is no unweighted spelling to forget, and the weight
+table has a named constructor that states the caller's claim about its own
+k-set: :func:`k_star_weights` ("multiplicities from the map that did the
+reduction"; ones on an identity map).  Uniform weights reduce to exactly
+the previous arithmetic, bit for bit — asserted in
+``tests/test_scissor_weights.py``.
 
 Units and layout
 ----------------
 - Energies: eV.  The caller decides whether to work in absolute or
-  Fermi-referenced coordinates; the fit and ``predict`` are domain-agnostic
-  as long as inputs at fit time and apply time share the same reference.
+  Fermi-referenced coordinates; the fit and its application are
+  domain-agnostic as long as inputs at fit time and apply time share the
+  same reference.
 - Per-band arrays: ``(nk, nb)``.  Fit / extrapolate are pure NumPy since the
   fit consumes O(nk·nb_σ) scalars.
 """
@@ -168,41 +167,6 @@ class ScissorFit:
     w_fit_v: float
     w_fit_c: float
 
-    def predict(self, E_ev: np.ndarray, valence_mask: np.ndarray,
-                *, crossing_mask: np.ndarray | None = None) -> np.ndarray:
-        """Evaluate the scissor **correction** ΔE = E_QP − E_DFT at each (k, n).
-
-        Returns ``ΔE = (α − 1) · E + β`` so callers can add it to their
-        DFT energies to get E_QP — same usage as before, just clearer
-        semantics on the stored α.
-
-        Parameters
-        ----------
-        E_ev : np.ndarray, (nk, nb)
-            Input DFT energies, same reference as at fit time.
-        valence_mask : np.ndarray, (nk, nb) of bool
-            True where the valence law applies; False → conduction.
-        crossing_mask : np.ndarray, (nk, nb) of bool, optional
-            Bands in NEITHER fit class (the Fermi-crossing set of
-            :class:`ScissorBandClasses`).  ΔE is 0 there — the identity, the
-            same no-information law an empty class gets: a band we refused
-            to FIT is a band we refuse to EXTRAPOLATE.  In practice these
-            bands are inside the Σ(ω) window and protected, so the caller's
-            ``in_range_mask`` discards this entry anyway; the case where it
-            does not is a band that crosses E_F at one k and leaves the
-            window at another, and there ``E_QP = E_DFT`` is the honest
-            answer.  ``None`` (the default) is the historical two-way
-            behaviour, bit for bit.
-        """
-        E = np.asarray(E_ev, dtype=np.float64)
-        vm = np.asarray(valence_mask, dtype=bool)
-        delta_v = (self.alpha_v - 1.0) * E + self.beta_v_ev
-        delta_c = (self.alpha_c - 1.0) * E + self.beta_c_ev
-        out = np.where(vm, delta_v, delta_c)
-        if crossing_mask is not None:
-            out = np.where(np.asarray(crossing_mask, dtype=bool), 0.0, out)
-        return out
-
     def summary(self) -> str:
         return (
             f"ScissorFit(val: α={self.alpha_v:+.4f}, β={self.beta_v_ev:+.4f} eV, "
@@ -223,9 +187,9 @@ def qsgw_out_of_range_energies(
     fermi_displacement_ev: float,
     crossing_mask_kn: np.ndarray | None = None,
 ) -> np.ndarray:
-    """Build active-window QSGW candidates for out-of-range diagonals.
+    """Build EQP2's candidates for out-of-range diagonals.
 
-    This is the single application policy used by the self-consistent map:
+    This is the single application policy of fixed-Sigma EQP2:
 
     * valence: ``E_QP = E_DFT + (E_F,QP - E_F,DFT)``;
     * conduction: ``E_QP = fit.alpha_c * E_DFT + fit.beta_c_ev``;
@@ -612,11 +576,11 @@ class ScissorBandClasses:
     def masks(self, shape) -> tuple[np.ndarray, np.ndarray]:
         """Return ``(valence_kn, crossing_kn)`` broadcast to ``(nk, nb)``.
 
-        ``valence_kn`` is what ``fit_scissor`` wants as ``valence_mask_kn``
-        and ``ScissorFit.predict`` as ``valence_mask``; ``crossing_kn`` is
-        what the caller ANDs OUT of its ``fit_mask_kn`` and passes to
-        ``predict`` as ``crossing_mask``.  Everything that is neither is
-        conduction, so two masks describe three classes.
+        ``valence_kn`` is what ``fit_scissor`` wants as ``valence_mask_kn``;
+        ``crossing_kn`` is what the caller ANDs OUT of its ``fit_mask_kn``
+        and passes to :func:`qsgw_out_of_range_energies` as
+        ``crossing_mask_kn``.  Everything that is neither is conduction, so
+        two masks describe three classes.
         """
         nk, nb = int(shape[0]), int(shape[1])
         if self.current_indices_kn is None:
@@ -734,17 +698,6 @@ def classify_scissor_bands(
 # k-weight tables — the two legitimate ones, each named after its claim
 # ---------------------------------------------------------------------------
 
-def full_bz_k_weights(nk: int) -> np.ndarray:
-    """Weights for an UNREDUCED k-set: every k is its own star, w ≡ 1.
-
-    Use this only where the k axis really is the full grid.  Everything
-    ``compute_sigma_xc`` / ``compute_screening`` produce is on the full BZ
-    because Σ is an FFT over the k-grid
-    (the loop's k-set invariant, ``docs/self_consistency.md``).
-    """
-    return np.ones(int(nk), dtype=np.float64)
-
-
 def k_star_weights(kstar) -> np.ndarray:
     """Star multiplicities for a reduced k-set, in the map's own row order.
 
@@ -812,7 +765,6 @@ def fit_scissor(
     fit_mask_kn: np.ndarray,
     *,
     k_weights: np.ndarray,
-    conduction_frontier_tol_ev: float | None = None,
     conduction_rigid_mean: bool = False,
     state_weights_kn: np.ndarray | None = None,
 ) -> ScissorFit:
@@ -846,26 +798,17 @@ def fit_scissor(
         argument from ``valence_mask_kn`` precisely because a two-valued
         mask cannot express a three-way classification.
     k_weights : np.ndarray, (nk,) — REQUIRED, keyword-only
-        How many full-BZ k each row stands for.  Build it with
-        :func:`full_bz_k_weights` or :func:`k_star_weights`; do not spell
-        it inline.  Required rather than defaulted because this fit is a
+        How many full-BZ k each row stands for: :func:`k_star_weights` of
+        the map that reduced the rows (ones on an identity map).  Required
+        rather than defaulted because this fit is a
         reduction over k and an unweighted fit on a reduced k-set returns
         a plausible wrong scissor that no downstream check catches — see
         the module docstring for the measured size (0.386 eV in eqp0).
-    conduction_frontier_tol_ev : float, optional
-        Replace the conduction affine regression by a rigid shift fitted to
-        the lowest conduction multiplet. Starting at the first clean
-        conduction band, adjacent bands join that multiplet while their
-        minimum separation over k is at most this tolerance. This is a
-        manifold-identification tolerance, not an SC convergence tolerance.
-        It makes the energy-only sum-band tail independent of how many higher
-        conduction bands happen to lie inside the active QP matrix. ``None``
-        preserves the general all-conduction affine fit.
     conduction_rigid_mean : bool, optional
         Replace the conduction affine regression by ONE rigid shift: the
         k-weighted mean of ``E_QP - E_DFT`` over every trusted conduction
-        sample (``fit_mask_kn`` and not valence).  Exclusive with
-        ``conduction_frontier_tol_ev``.
+        sample (``fit_mask_kn`` and not valence).  The SC sum-band tail
+        uses it; EQP2 keeps the affine fit.
     state_weights_kn : np.ndarray, optional
         Per-sample weights multiplying ``k_weights`` (the SC tail's
         quasiparticle weights Z), in DFT-identity order like the masks.
@@ -890,8 +833,7 @@ def fit_scissor(
             f"({nk},) to match the k axis of E_DFT.  A weight table from a "
             f"different k-set than the energies is the exact failure this "
             f"argument exists to prevent; build it from the map that "
-            f"reduced these energies (scissor.k_star_weights) or state "
-            f"that they are unreduced (scissor.full_bz_k_weights).")
+            f"reduced these energies (scissor.k_star_weights).")
     if not np.all(np.isfinite(w_k)) or float(w_k.min()) <= 0.0:
         raise ValueError(
             f"fit_scissor: k_weights must be finite and strictly positive; "
@@ -935,54 +877,10 @@ def fit_scissor(
     alpha_c, beta_c, _ = _wls_line(
         E_dft_sorted[mask_c], E_qp_sorted[mask_c], w_c)
 
-    if conduction_rigid_mean and conduction_frontier_tol_ev is not None:
-        raise ValueError(
-            "fit_scissor: conduction_rigid_mean and conduction_frontier_tol_ev "
-            "are two different conduction laws; pass one.")
     if conduction_rigid_mean and np.any(mask_c):
         alpha_c = 1.0
         beta_c = float(np.sum(w_c * (E_qp_sorted - E_dft_sorted)[mask_c])
                        / np.sum(w_c))
-    if conduction_frontier_tol_ev is not None and np.any(mask_c):
-        tol_ev = float(conduction_frontier_tol_ev)
-        if not np.isfinite(tol_ev) or tol_ev < 0.0:
-            raise ValueError(
-                "fit_scissor: conduction_frontier_tol_ev must be finite and "
-                f"non-negative; got {conduction_frontier_tol_ev!r}.")
-
-        # Work in sorted-energy position space, matching the fit itself. A
-        # frontier position must be clean conduction data at every k; a
-        # Fermi-crossing or partially in-grid position is not evidence for a
-        # tail law. Once the first such position is found, extend only across
-        # multiplet boundaries. The minimum-over-k rule is the same rule used
-        # by common.band_degeneracy: if two bands touch anywhere, cutting
-        # between them does not define a global band subspace.
-        clean_c_pos = np.all((~vm_sorted) & fm_sorted, axis=0)
-        clean_positions = np.flatnonzero(clean_c_pos)
-        if clean_positions.size:
-            first = int(clean_positions[0])
-            stop = first + 1
-            while stop < E_dft_sorted.shape[1] and clean_c_pos[stop]:
-                min_gap_ev = float(np.min(np.abs(
-                    E_dft_sorted[:, stop] - E_dft_sorted[:, stop - 1])))
-                if min_gap_ev > tol_ev:
-                    break
-                stop += 1
-            frontier_pos = np.arange(first, stop, dtype=np.int64)
-            frontier_mask = np.zeros_like(mask_c)
-            frontier_mask[:, frontier_pos] = True
-            frontier_mask &= mask_c
-            w_frontier = w_kn[frontier_mask]
-            correction = (E_qp_sorted - E_dft_sorted)[frontier_mask]
-            alpha_c = 1.0
-            beta_c = float(
-                np.sum(w_frontier * correction) / np.sum(w_frontier))
-            mask_c = frontier_mask
-            w_c = w_frontier
-        else:
-            # No complete frontier: no tail law, never the affine fallback.
-            mask_c = np.zeros_like(mask_c)
-            w_c = w_kn[mask_c]
     # No-information laws.  _wls_line returns (0, 0) on an empty class and
     # (0, y0) on a single sample; as an E_QP = α·E + β scissor those
     # extrapolate every band to ZERO / to a constant — on the metallic
@@ -1031,7 +929,6 @@ __all__ = [
     "classify_bands_in_grid",
     "classify_scissor_bands",
     "fit_scissor",
-    "full_bz_k_weights",
     "k_star_weights",
     "qsgw_out_of_range_energies",
 ]

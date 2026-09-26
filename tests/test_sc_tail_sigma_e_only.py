@@ -4,8 +4,13 @@ consume Sigma(E_nk).  A state on the Sigma(omega=0) fallback cannot move beta
 Host NumPy, no device."""
 import numpy as np
 
-from gw.scissor import fit_scissor
+from functools import partial
+
+from gw.scissor import fit_scissor as _fit_scissor
 from gw.sc_iteration import _fit_sum_band_tail
+
+#: The tail law is always the rigid conduction mean.
+fit_scissor = partial(_fit_scissor, conduction_rigid_mean=True)
 
 
 def _case():
@@ -15,7 +20,7 @@ def _case():
                       [-0.3, -0.2, 0.45, 0.55, 0.65, 2.57]])   # (1,5): Sigma(0) branch
     kw = dict(E_dft_kn_ev=e_dft, E_qp_kn_ev=e_dft + shift,
               valence_mask_kn=np.array([[1, 1, 0, 0, 0, 0]] * 2, dtype=bool),
-              k_weights=np.array([1.0, 3.0]), conduction_rigid_mean=True)
+              k_weights=np.array([1.0, 3.0]))
     return kw, np.ones_like(e_dft, dtype=bool)
 
 

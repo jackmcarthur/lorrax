@@ -112,9 +112,8 @@ The velocity artifact must stamp `vnl_included = 1`
 | bands | block of $H'$ |
 |---|---|
 | the `nval + ncond` QP window | full $\Sigma^{\rm QSGW}$, off-diagonals kept within the window |
-| `sc_buffer_nbands` extra bands on each side | set by `sc_buffer_mode`: `diagonal` keeps the band's own Σ diagonal and drops its couplings; `one_sided` keeps cross-edge couplings, evaluated at the in-window energy; `carry` drops the couplings and carries the previous input's energies |
 | the lowest `sc_frozen_core_bands` | held at the DFT block $\mathrm{diag}(E_{\rm DFT})$; they stay in the $\Sigma_x$ and $\chi_0$ sums |
-| the sum-band tail `[b3, number_bands)` | DFT orbitals with an energy-only rigid shift from `sc_tail_fit`, refit every map. The default `conduction_mean` is the $Z$-weighted mean QP correction of the window's conduction states that read their own $\Sigma(E)$ (below) |
+| the sum-band tail `[b3, number_bands)` | DFT orbitals with an energy-only rigid shift, refit every map: the $Z$-weighted mean QP correction of the window's conduction states that read their own $\Sigma(E)$ (below) |
 
 Every window band keeps its full Σ. Under the default `sigma_out_of_grid =
 cover` a band the W model treats as active reads Σ at its own energy, and
@@ -420,9 +419,7 @@ receipts certify the unprojected model only.
 - The energy-only tail above the QP window has exact-zero occupations. It
   still enters G and the response at its current shifted energies, and the
   window alone sets μ. A tail state that enters the fractional manifold
-  (`FRACTIONAL_TOL`) refuses. The `frontier` tail law needs one conduction
-  band admitted at every k; without one the conduction fit is absent and the
-  tail stays at DFT.
+  (`FRACTIONAL_TOL`) refuses.
 - The rate of convergence is set by the largest quasiparticle weight Z in the
   window. States more than a plasmon energy above μ, where Re Σ(ω) is flat or
   rising on shell, have $Z \gtrsim 1$ and walk at map gain ≈ 1. End the window
@@ -449,7 +446,9 @@ Insulators keep `parallel_transport` and `dft_velocity`.
   history.
 - **Seeding a new run.** `sc_initial_qp_rotations_file` imports an
   authenticated eigensystem as $H = U\,\mathrm{diag}(E)\,U^\dagger$ in the
-  original DFT basis, together with the band policy. Keep the original WFN and
+  original DFT basis. A seed whose band policy is not all-protected, or that
+  carries an active-window scissor (both written only before the 2026-09-22
+  all-protected rule), refuses. Keep the original WFN and
   reference operators. Occupations and the tail fit are recomputed, and the
   quadrature and the accelerator history start empty, so this is a new run,
   not a continuation.

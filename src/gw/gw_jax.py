@@ -416,25 +416,17 @@ def _prepare_band_metadata(centroid_indices, config, mesh_xy, n_rmu, print0, sym
     """Produce the physical and padded band windows on the packed centroid basis."""
     charge_bispinor = uses_four_spinor_finite_q_charge(
         config.bispinor, config.bispinor_gw)
-    _sc_buffer = (int(config.sc.buffer_nbands)
-                  if config.qp_solver is QPSolver.SELF_CONSISTENT else 0)
     from common.centroid_basis import PackedCentroidBasis
     mu_basis = PackedCentroidBasis.build(
         centroid_indices, sym, wfn.fft_grid, mesh_xy)
     print0(f"  {mu_basis.describe()}")
     meta = Meta.from_system(wfn, sym,
-                            int(config.nval) + _sc_buffer,
-                            int(config.ncond) + _sc_buffer, config.nband,
+                            int(config.nval),
+                            int(config.ncond), config.nband,
                             n_rmu, charge_bispinor,
                             nband_chi=config.bands.chi,
                             nband_sigma=config.bands.sigma,
                             mesh_xy=mesh_xy, mu_basis=mu_basis)
-    if _sc_buffer:
-        print0(
-            f"  SC buffer: {int(config.nval)}/{int(config.ncond)} named "
-            f"valence/conduction window + {_sc_buffer} diagonal state(s) "
-            f"at each edge; mode={config.sc.buffer_mode}, "
-            f"tail_fit={config.sc.tail_fit}")
     meta.rank = RUNTIME.process_index
     meta.n_proc = RUNTIME.process_count
     meta.sys_dim = config.sys_dim
@@ -1010,7 +1002,7 @@ def _solve_qp_stage(
         with timing.section("gw_jax.solve_qp"):
             sigma_total = solve_qp(
                 qp_solver, sigma_result, kin_ion,
-                config=config, meta=meta, mesh_xy=mesh_xy, print_fn=print0)
+                config=config, mesh_xy=mesh_xy, print_fn=print0)
     eqp2_result = None
     if config.eqp2.enabled:
         from .sc_iteration import run_fixed_sigma_evsc

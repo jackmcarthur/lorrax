@@ -301,10 +301,8 @@ def test_static_gauge_hall_file_is_unset_by_default(tmp_path):
 def test_sc_defaults(tmp_path):
     sc = _config(tmp_path).sc
     assert (sc.max_iter, sc.tol_ev, sc.accelerator, sc.history_depth,
-            sc.mixing, sc.dump_dir, sc.exact_degeneracy_tol_ev,
-            sc.tail_fit, sc.buffer_nbands, sc.buffer_mode) == (
-                30, 1.0e-4, "anderson", 20, 1.0, None, 1.0e-4, "conduction_mean",
-                0, "diagonal")
+            sc.mixing, sc.dump_dir, sc.exact_degeneracy_tol_ev) == (
+                30, 1.0e-4, "anderson", 20, 1.0, None, 1.0e-4)
 
 
 def test_sc_input_keys(tmp_path):
@@ -312,14 +310,10 @@ def test_sc_input_keys(tmp_path):
         tmp_path,
         "sc_max_iter = 7\nsc_tol_ev = 1e-6\nsc_accelerator = anderson\n"
         "sc_history_depth = 3\nsc_mixing = 0.5\nsc_dump_dir = sc_hist\n"
-        "sc_exact_degeneracy_tol_ev = 5e-5\n"
-        "sc_tail_fit = buffer_edges\nsc_buffer_nbands = 3\n"
-        "sc_buffer_mode = one_sided\n").sc
+        "sc_exact_degeneracy_tol_ev = 5e-5\n").sc
     assert (sc.max_iter, sc.tol_ev, sc.accelerator, sc.history_depth,
-            sc.mixing, sc.dump_dir, sc.exact_degeneracy_tol_ev,
-            sc.tail_fit, sc.buffer_nbands, sc.buffer_mode) == (
-                7, 1.0e-6, "anderson", 3, 0.5, "sc_hist", 5.0e-5,
-                "buffer_edges", 3, "one_sided")
+            sc.mixing, sc.dump_dir, sc.exact_degeneracy_tol_ev) == (
+                7, 1.0e-6, "anderson", 3, 0.5, "sc_hist", 5.0e-5)
 
 
 def test_sc_qp_seed_file_is_explicit_and_sc_only(tmp_path):
@@ -342,18 +336,16 @@ def test_sc_exact_degeneracy_tolerance_refuses_mev_pair_averaging(tmp_path):
         _config(tmp_path, "sc_exact_degeneracy_tol_ev = 0.0017\n")
 
 
-def test_sc_tail_fit_refuses_unknown_policy(tmp_path):
-    with pytest.raises(ValueError, match="sc_tail_fit"):
-        _config(tmp_path, "sc_tail_fit = nearest\n")
-
-
-def test_sc_buffer_controls_refuse_invalid_values(tmp_path):
-    with pytest.raises(ValueError, match="sc_buffer_nbands"):
-        _config(tmp_path, "sc_buffer_nbands = -1\n")
-    with pytest.raises(ValueError, match="sc_buffer_mode"):
-        _config(tmp_path, "sc_buffer_mode = full\n")
-    with pytest.raises(ValueError, match="requires sc_buffer_nbands"):
-        _config(tmp_path, "sc_tail_fit = buffer_edges\n")
+@pytest.mark.parametrize("line", [
+    "sc_tail_fit = conduction_mean", "sc_tail_fit = frontier",
+    "sc_buffer_nbands = 0", "sc_buffer_nbands = 3",
+    "sc_buffer_mode = diagonal", "sigma_at_dft_extrapolate = false",
+])
+def test_retired_scissor_and_buffer_keys_refuse_by_name(tmp_path, line):
+    """Every value refuses, the default included, and names the key."""
+    key = line.split("=")[0].strip()
+    with pytest.raises(ValueError, match=f"'{key}' is retired"):
+        _config(tmp_path, line + "\n")
 
 
 def test_sc_env_overrides_deprecated(tmp_path, monkeypatch):
