@@ -131,7 +131,7 @@ silently. Consequence for removed keys:
   cleanup — warn-and-ignore. The W Dyson solve is selected by
   `w_dyson_solver = local | distributed`.
 
-**Env-twin deprecations**: `LORRAX_ZETA_RCOND` / `LORRAX_ZETA_RIDGE` and the
+**Env-twin deprecations**: `LORRAX_ZETA_RCOND` and the
 `LORRAX_SC_*` family still win over the deck keys when non-empty, printing a
 rank-0 deprecation notice; ζ-fit provenance records the EFFECTIVE
 (post-override) values so dropping the env cannot silently reuse a ζ at a
