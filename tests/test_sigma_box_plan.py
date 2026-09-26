@@ -321,7 +321,7 @@ def test_sc_fixed_tail_covers_a_state_crossing_the_product_edge(
     calls.clear()
     _, current = plan(0.66)
     assert not calls
-    assert current["sc_fixed_total_rebuild_count"] == 0
+    assert current["sc_fixed_rebuilds_this_iteration"] == 0
     assert frozen == [w["node_digest"] for w in current["branches"][0]["windows"]]
 
 

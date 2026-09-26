@@ -407,7 +407,8 @@ def grow_sigma_support_ev(sigma, frozen_core_bands, sampled_grid_ev,
         if active_n is not None:
             required &= np.asarray(active_n, dtype=bool)[None, :]
     else:
-        win_lo, win_hi = sc_padded_window_ev(*sigma.classification_window_ev())
+        from .gw_config import sigma_classification_window_ev
+        win_lo, win_hi = sc_padded_window_ev(*sigma_classification_window_ev(sigma))
         required &= (energy >= win_lo) & (energy <= win_hi)
     return (extend_sc_omega_grid_ev(sampled_grid_ev, energy, required,
                                     float(sigma.omega_step_ev),
