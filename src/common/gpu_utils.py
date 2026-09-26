@@ -89,6 +89,25 @@ def minimum_process_budget_gb(local_gb: float) -> float:
 
 
 # ============================================================================
+# The run's device budget: ONE number every planner prices against
+# ============================================================================
+
+#: The run's per-device budget in decimal GB, set once when the deck's
+#: ``memory_per_device_gb`` resolves (``gw.gw_config``); None until then.
+_RUN_DEVICE_BUDGET_GB: float | None = None
+
+
+def set_device_budget_gb(gb: float) -> None:
+    """Record the run's per-device budget (``memory_per_device_gb``, decimal GB), once,
+    when the deck value (or the collective auto-detection at 0) resolves."""
+    global _RUN_DEVICE_BUDGET_GB
+    value = float(gb)
+    if not value > 0:
+        raise ValueError(f"the device budget must be positive GB, got {gb!r}")
+    _RUN_DEVICE_BUDGET_GB = value
+
+
+# ============================================================================
 # Planner prices: what each planner said its stage would hold, per rank
 # ============================================================================
 

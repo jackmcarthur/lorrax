@@ -2375,6 +2375,10 @@ def _resolve_input_memory(
         print_fn(
             f"  Auto-detected memory budget: {memory_per_device_gb:.2f} GB/device"
         )
+    if memory_per_device_gb > 0 and resolve_hardware:
+        # The run's one budget (common.gpu_utils); the stage-memory receipt states it.
+        from common.gpu_utils import set_device_budget_gb
+        set_device_budget_gb(memory_per_device_gb)
     chunk_utilization = env_float("ISDF_CHUNK_TARGET_UTILIZATION", 0.0,
                                   print_fn=print_fn)
     if chunk_utilization > 0:
