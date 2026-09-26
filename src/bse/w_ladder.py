@@ -211,9 +211,8 @@ form: the un-conjugated ring dyad is not the complex-symmetric coupling block
 that their real-linear ``F/G`` actions require.  The applicable certificate is
 full-space pseudo-Hermiticity, ``eta H = (eta H)^dag`` with
 ``eta = diag(I, -I)``; it is not SDY's N-dimensional kappa-metric certificate.
-The general frequency path therefore retains the full 2N operator
-(``w_ladder_freq``); the direct path evaluates each frequency with its own
-shifted block-GMRES solve.
+A reusable frequency basis would have to retain the full 2N operator; the
+direct path evaluates each frequency with its own shifted block-GMRES solve.
 
 **6. What hermiticity is, and is not, established.**  With the step-4 row,
 ``K^d`` is Hermitian by construction and ``W_ladder(q=0, 0)`` comes out
@@ -347,7 +346,6 @@ jax.config.update("jax_enable_x64", True)
 
 
 def build_ladder_resolvent(mesh_xy: Mesh, data: dict, *, include_w: bool = True,
-                           vertex_flipped: bool = None,
                            fuse_ladder_rung: bool = True):
     """Assemble the LADDER screening resolvent stack for ``data``.
 
@@ -385,15 +383,6 @@ def build_ladder_resolvent(mesh_xy: Mesh, data: dict, *, include_w: bool = True,
     ``operands_fn=ladder_matvec_operands`` to match (claim 0215's defect —
     the rung on conjugated arrays — is structurally unreachable this way).
     """
-    if vertex_flipped is not None:
-        # DEPRECATED 2026-08-16, accepted and not consulted: payload-flip
-        # handling moved from a conj-wrap compensation (refuted by
-        # probe_block_compare) to the physical rung operand slots
-        # (ladder_rung_slots), which build_finite_q_data supplies and the
-        # fallback aliases on raw payloads — both conventions are now served
-        # without a caller-side declaration.  Retained one release so the
-        # in-flight w_ladder_precond callers keep working; remove with them.
-        pass
     if not include_w:
         return _build_rpa_resolvent(mesh_xy, data)
     nkx, nky, nkz = int(data["nkx"]), int(data["nky"]), int(data["nkz"])
@@ -437,7 +426,7 @@ def refuse_chain_path(include_w: bool) -> None:
         "correct structural certificate is full-space eta-pseudo-Hermiticity "
         "(eta H = (eta H)^dag, eta = diag(I,-I)), not the N-dimensional SDY "
         "kappa metric. A reusable frequency basis must retain the full 2N "
-        "operator, as w_ladder_freq does. The direct path evaluates each "
+        "operator. The direct path evaluates each "
         "frequency with its own shifted block-GMRES solve "
         "(bse_w_exact.apply_screening_resolvent_block).")
 
@@ -565,7 +554,7 @@ def sweep_q_wedge(
     ``route='lift'`` runs route A — the Hartree ring removed from the Krylov
     problem by Woodbury — and then the tile ``on_result`` receives is
     ``T = Pi v``, NOT ``W - v``: the caller must close it with
-    ``w_ladder_precond.dyson_close_tile`` (``compute_wc_qwedge`` does).  The
+    :func:`dyson_close_tile` (``compute_wc_qwedge`` does).  The
     sweep does not close it itself because the close is once per (q, z) over
     the whole assembled tile, i.e. after the probe chunks have been placed.
     """
@@ -853,10 +842,7 @@ def compute_wc_qwedge(
 
     if route == "lift":
         # Every accumulated tile is ``T = Pi v``; the ring goes back in here,
-        # ONCE per (q, z), through the closing Dyson.  Single-sourced in
-        # w_ladder_precond (route A's own module) — imported at call time
-        # because that module imports this one.
-        from .w_ladder_precond import dyson_close_tile
+        # ONCE per (q, z), through the closing Dyson.
         tiles = [[dyson_close_tile(tiles[iz][iq], v_by_q[iq],
                                    allow_replicated_solve=allow_replicated_dyson)
                   for iq in range(nq)] for iz in range(nz)]
@@ -909,6 +895,73 @@ def compute_wc_qwedge(
         include_w=bool(include_w),
         head_result=head_result,
     )
+
+
+#: ``(shape, dtype, mesh) -> jitted Dyson close``.  Cached for the reason every
+#: other jit in this family is: ``jax.jit`` keys on function identity.
+_DYSON_CACHE: dict = {}
+
+
+def dyson_close_tile(T: jax.Array, V_q0: jax.Array, *,
+                     allow_replicated_solve: bool = False) -> jax.Array:
+    """``W(z) - v = v T (I - T)^{-1}`` — the lift's closing algebra.
+
+    ``T = Pi v`` on the padded centroid extent.  The pad rows and columns of
+    ``T`` are identically zero (the probe walk stops at ``n_rmu`` and the
+    identity projector kills pad centroids), so ``I - T`` is block
+    ``[[I - T_ll, 0], [0, I]]`` and the inverse never touches the pad — which is
+    why the identity, and not the zero tile, is the right projector.
+
+    Solved as ``(I - T)^T Y^T = T^T`` and then ``v Y``; a dense ``N_mu^3``.  This
+    is the SAME dense Dyson the RPA production path performs per (q, z)
+    (``gw.mpa.model._solve_wc``), not a new class of object, but ``jnp.linalg``
+    is a single-device solver: above one device this must route through
+    ``distrib_la``, and the caller is refused rather than silently gathering an
+    ``N_mu^2`` tile per rank (the F3 hazard, in its dense-algebra form).
+
+    ``allow_replicated_solve=True`` takes that gather DELIBERATELY, and the
+    scope of the concession is exactly the RPA path's own: ``gw.w_isdf.solve_w``
+    has TWO plans and its DEFAULT (``linalg = local``) is a per-q dense
+    LU in which "each rank holds whole (mu, mu) tiles for its q's".  So this
+    flag makes the ladder's close the same memory class as the production RPA
+    close, no better and no worse, and it is opt-in so that the choice is in
+    the caller's log rather than in this function's silence.  The
+    ``distrib_la`` routing — the twin of that solver's ``distributed`` plan —
+    remains the registered follow-on, and is what the P -> 1e3 envelope needs.
+    """
+    mesh = V_q0.sharding.mesh if hasattr(V_q0.sharding, "mesh") else None
+    n_dev = int(np.prod(mesh.devices.shape)) if mesh is not None else 1
+    if n_dev > 1 and not allow_replicated_solve:
+        raise NotImplementedError(
+            "dyson_close_tile uses jnp.linalg.solve, a single-device dense "
+            f"solver, but this tile lives on a {mesh.devices.shape} mesh.  The "
+            "N_mu x N_mu Dyson close of the ring lift is the same dense solve "
+            "the RPA path already does per (q, z) and must go through the "
+            "distributed solver (services/distrib_la) at P>1; gathering the "
+            "tile per rank here would be exactly the mu^2-replication the "
+            "scaling doctrine forbids.  Named deferral, not a half-build.  "
+            "allow_replicated_solve=True accepts the gather explicitly (the "
+            "memory class of gw.w_isdf.solve_w's DEFAULT 'local' plan).")
+    key = (tuple(T.shape), str(T.dtype), str(V_q0.dtype), T.sharding)
+    fn = _DYSON_CACHE.get(key)
+    if fn is None:
+        out_sh = T.sharding
+
+        def _close(T_, V_):
+            n = T_.shape[-1]
+            A = jnp.eye(n, dtype=T_.dtype) - T_
+            # Y = T (I - T)^{-1}  <=>  (I - T)^T Y^T = T^T
+            Y = jnp.linalg.solve(A.T, T_.T).T
+            # Put the product back on the wedge tile's own sharding: at P>1
+            # the dense solve above is replicated by construction, and letting
+            # GSPMD pick the OUTPUT layout would leave the wedge stack's
+            # with_sharding_constraint to resolve it with a second collective.
+            return jax.lax.with_sharding_constraint(
+                V_.astype(T_.dtype) @ Y, out_sh)
+
+        fn = jax.jit(_close)
+        _DYSON_CACHE[key] = fn
+    return fn(T, V_q0)
 
 
 #: ``(shape, dtype, sharding, nlog) -> jitted worst-pad reduction``.  Cached
