@@ -155,7 +155,7 @@ _CUDA_TARGET_SYMBOLS = {
 # loaders' tables because both loaders open the same .so),
 # plus the phdf5 read AND write handlers (src/ffi/cpp/phdf5/{read,write}_ffi.cc
 # compiled with -DLORRAX_FFI_NO_CUDA).  The phdf5 target STRINGS are identical
-# to the CUDA table so the ffi.phdf5.{read,write} ffi_call sites resolve by
+# to the CUDA table so the ffi.io read and write ffi_call sites resolve by
 # lowering platform; only the C++ SYMBOL names differ (Phdf*HostFfi vs
 # Phdf*Ffi) so the two platform .so's can co-exist under RTLD_GLOBAL.
 #

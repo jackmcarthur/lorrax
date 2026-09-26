@@ -1,4 +1,4 @@
-"""FFI SlabIO backend — collective MPI-IO via ``ffi.phdf5``.
+"""FFI SlabIO backend — collective MPI-IO via ``ffi.io``.
 
 THE transport.  Not a tier: the capability router, the sibling tiers
 (``PHDF5_HOST``, ``H5PY_ALLGATHER``), the ``slab_io`` and ``use_ffi_io``
@@ -1139,7 +1139,7 @@ def mesh_divisible_shape(shape, mesh, partition_spec) -> tuple[int, ...]:
 # :func:`_replace_inode_for_write`, unconditional of ``lfs``.
 
 # Lazy imports happen inside the class methods; module-level imports
-# of ffi.phdf5 would break users who don't build the FFI .so.
+# of ffi.io would break users who don't build the FFI .so.
 
 
 def _sharding_to_axis_info(
@@ -1871,7 +1871,7 @@ def _get_read_sm(mesh, partition_spec, *,
                  mesh_shape, axis_count_per_dim, axis_flat, out_struct):
     """One H5Dread per rank.  Returns a jit'd shard_map; identity-stable
     via lru_cache so JAX's trace cache hits on repeat invocation."""
-    from ffi.phdf5.read import ffi_read_call
+    from ffi.io import ffi_read_call
 
     def _per_rank(handle_local, offset_local, valid_shape_local):
         return ffi_read_call(
@@ -1919,7 +1919,7 @@ def _get_write_sm(mesh, in_specs, *,
     ``no_jit``) skips the jit wrapper — diagnostic for chasing the
     jit-argument-retention buffer leak on long write loops.
     ``independent`` is the transfer mode (:func:`_file_order_plan`)."""
-    from ffi.phdf5.write import ffi_write_call
+    from ffi.io import ffi_write_call
 
     def _per_rank(A_local, handle_local, offset_local, valid_shape_local):
         return ffi_write_call(
@@ -2149,7 +2149,7 @@ class _FfiBackend(_DatasetGeometry):
         # closed on 2026-09-15 (f6709333); this is the same door one layer
         # down, where a future direct constructor would walk into it again.
         # Lazy import — keeps file_io importable without the FFI built.
-        from ffi.phdf5 import open_file as _open_file, close_file as _close_file
+        from ffi.io import open_file as _open_file, close_file as _close_file
         from ffi.common import ffi_loader as _loader
 
         self._open_file = _open_file
