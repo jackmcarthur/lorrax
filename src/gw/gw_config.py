@@ -3952,6 +3952,19 @@ class ScreeningConfig:
                 f"docs/input_reference.md '## Screening'.")
 
 
+def sigma_requested_edges_ev(sigma):
+    """Requested Sigma grid edges (eV); an unset edge is the sample next to E_F."""
+    step = float(sigma.omega_step_ev)
+    lo, hi = getattr(sigma, "omega_min_ev", None), getattr(sigma, "omega_max_ev", None)
+    return (-step if lo is None else float(lo), step if hi is None else float(hi))
+
+
+def sigma_classification_window_ev(sigma):
+    """The requested window (eV) band classification reads; unset is unbounded."""
+    lo, hi = getattr(sigma, "omega_min_ev", None), getattr(sigma, "omega_max_ev", None)
+    return (-np.inf if lo is None else float(lo), np.inf if hi is None else float(hi))
+
+
 @dataclass(frozen=True)
 class DynamicSigmaConfig:
     """Ansatz-neutral real-frequency Sigma grid and output policy."""
@@ -4078,14 +4091,11 @@ class DynamicSigmaConfig:
 
     def requested_edges_ev(self):
         """The requested grid edges; an unset edge is the sample next to E_F."""
-        step = float(self.omega_step_ev)
-        return (-step if self.omega_min_ev is None else float(self.omega_min_ev),
-                step if self.omega_max_ev is None else float(self.omega_max_ev))
+        return sigma_requested_edges_ev(self)
 
     def classification_window_ev(self):
         """The requested window for band classification; unset is unbounded."""
-        return (-np.inf if self.omega_min_ev is None else float(self.omega_min_ev),
-                np.inf if self.omega_max_ev is None else float(self.omega_max_ev))
+        return sigma_classification_window_ev(self)
 
     def parsed_omega_patches_ev(self):
         """The validated ``[(lo, hi), ...]`` patch list, or ``[]``; see docs/architecture/decisions.md."""
@@ -4842,7 +4852,7 @@ class LorraxConfig:
         p = self.sigma
         patches = p.parsed_omega_patches_ev()
         if not patches:
-            lo, hi = p.requested_edges_ev()
+            lo, hi = sigma_requested_edges_ev(p)
             n = int(np.floor((hi - lo) / p.omega_step_ev + 0.5)) + 1
             grid = lo + p.omega_step_ev * np.arange(n, dtype=np.float64)
         else:

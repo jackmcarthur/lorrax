@@ -69,7 +69,7 @@ from .band_partition import (
     BandPartition, apply_band_partition, build_omega_band_partition)
 from .efermi import (OCCUPATION_CLAMP_TOL_DEFAULT
                      as _OCCUPATION_CLAMP_TOL_DEFAULT, OccupationState)
-from .gw_config import ComputeMode, HeadCorrection
+from .gw_config import ComputeMode, HeadCorrection, sigma_classification_window_ev
 from .scissor import (ScissorFit, apply_conduction_scissor_to_tail,
                       classify_scissor_bands, fit_scissor)
 from .sigma_dispatch import (
@@ -2445,7 +2445,7 @@ def rebuild_hartree_dft_basis(inputs, U_qp, occupations_full,
     # One density-scan shape per SC run: the rotated band count only grows
     # (a metal's occupied count drifts map to map; Fe 4^3 map 2 recompiled).
     from .qsgw_density import density_active_band_count
-    session = inputs.fixed_quadrature_session
+    session = getattr(inputs, "fixed_quadrature_session", None)
     rotated_floor = 0
     if session is not None:
         rotated_floor = session["density_active_bands"] = max(
@@ -3084,8 +3084,8 @@ def _classify_sc_partition(
             f"sigma_out_of_grid={inputs.config.sigma.out_of_grid}"
             + (" (the grid grows over every non-frozen identity)."
                if inputs.config.sigma.out_of_grid == "cover" else
-               f"; energies outside [{inputs.config.sigma.classification_window_ev()[0]:+.2f}, "
-               f"{inputs.config.sigma.classification_window_ev()[1]:+.2f}] eV plus the SC pad read "
+               f"; energies outside [{sigma_classification_window_ev(inputs.config.sigma)[0]:+.2f}, "
+               f"{sigma_classification_window_ev(inputs.config.sigma)[1]:+.2f}] eV plus the SC pad read "
                + ("the nearest grid edge." if inputs.config.sigma.out_of_grid == "clamp"
                   else "Sigma(omega=0).")))
     if not ks.is_identity:
@@ -4796,7 +4796,7 @@ def _sc_edge_ambiguity(inputs: SCInputs, state_out: SCState) -> tuple[int, str]:
         diag = np.asarray(strip_axis(diag, sigma.sigma_band_axis, axis=-1))
     e_rel = np.asarray(sigma.e_eval_ev, dtype=np.float64) - float(sigma.efermi_dft_ev)
     from .scissor import sc_padded_window_ev
-    window = sc_padded_window_ev(*inputs.config.sigma.classification_window_ev())
+    window = sc_padded_window_ev(*sigma_classification_window_ev(inputs.config.sigma))
     ambiguous, jump = sigma_grid_edge_ambiguity(
         diag, np.asarray(omega, dtype=np.float64), e_rel, growth_window_ev=window)
     # Frozen-core bands are held at their DFT block (no Sigma enters them).
@@ -6768,7 +6768,7 @@ def run_sc_driver(
         efermi_dft_scissor_ry = float(
             _midgap_efermi(e_dft_active_kn_ry, int(meta.nelec)))
     omega_min_ev, omega_max_ev = (
-        edge + efermi_ev for edge in config.sigma.classification_window_ev())
+        edge + efermi_ev for edge in sigma_classification_window_ev(config.sigma))
     # One constructor owns the all-k window predicate and whole-multiplet
     # promotion.  EQP2 uses the same constructor below; neither ladder can
     # silently invent a different protected subspace.
