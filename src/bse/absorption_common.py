@@ -1,8 +1,7 @@
 """Shared utilities for BSE absorption-spectrum post-processors.
 
-Two routes consume these:
-  - ``absorption_eigvecs``   — explicit Ritz vectors A^S from eigenvectors.h5
-  - ``absorption_haydock``   — continued-fraction recursion (no eigenvectors)
+``absorption_haydock`` (continued-fraction recursion, no eigenvectors)
+consumes these.
 
 Common needs:
   - read BGW-format eigenvectors.h5 (our writer matches this spec)

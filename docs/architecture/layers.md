@@ -37,7 +37,7 @@ service through its door and nowhere else.
 `bse/bse_jax.py` · `bse/exciton_bands.py` · `bandstructure/htransform.py` ·
 `gw/kin_ion_io.py` · `gw/downfold_cli.py` · `centroid/kmeans_cli.py` ·
 `psp/{run_nscf,run_sternheimer,get_DFT_mtxels,get_dipole_mtxels,kpm_dos,orbital_magnetization,finite_q_head_interp}.py` ·
-`bse/{bse_feast,bse_pseudopoles,bse_w_exact,bse_kpm}.py` · `gw/eqp_bgw.py` ·
+`bse/{bse_feast,bse_w_exact,bse_kpm}.py` · `gw/eqp_bgw.py` ·
 `postprocess/rotate_wfn_to_qp.py`.
 
 **The physics kernels**: everything in `gw/`, `bse/`, `psp/`, `isdf/`,
@@ -57,7 +57,7 @@ that count:
 - `bse/exciton_bands.py` is a driver and a library: it owns the
   interpolated-band assembly its own CLI consumes.
 - `bandstructure/htransform.py` is the fH interpolation library with a CLI.
-- `bse/{bse_feast,bse_pseudopoles,bse_w_exact,bse_kpm}.py` each import
+- `bse/{bse_feast,bse_w_exact,bse_kpm}.py` each import
   `jax.sharding` for a `mesh_xy: Mesh` annotation.
 
 The budget is a ratchet: exceeding it fails, and so does coming in under it
