@@ -717,9 +717,8 @@ def _face_rotate_kernel(mesh: Mesh, a_lo: int, nb_active: int, nb_full: int,
     :func:`_face_embed_active_U` already returns.  Both merges use
     :func:`common.contract_bands.merge_spin_centroid`/
     :func:`split_spin_centroid` — the SAME (s,μ) GEMM-seam convention
-    ``greens_function_kernel._face_build_G``/``contract_bands.
-    _face_project_kernel`` already use; this function adds no third
-    convention.
+    ``greens_function_kernel._build_G_face`` already uses; this function
+    adds no second convention.
 
     Everything (embed, both merges, both planned GEMMs, both splits) runs
     inside ONE outer ``@jax.jit`` — the zeta-fit CCT port's own measured
