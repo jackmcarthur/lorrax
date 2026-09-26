@@ -468,3 +468,152 @@ def test_subsampling_does_not_change_the_verdict():
     assert sub.subsampled and sub.n_k_used <= full.n_k_used
     # Compatibility charge fields remain internally consistent.
     assert sub.charge == pytest.approx(sub.charge_expected, rel=1e-8)
+
+
+# ----------------------------------------------------------------------
+# Cross-process stamp: one measurement per WFN identity, red twins
+# ----------------------------------------------------------------------
+import json                                                    # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _private_stamp_dir(tmp_path, monkeypatch):
+    """No test in this module writes into the user's stamp directory."""
+    monkeypatch.setattr(density_check, "_stamp_dir",
+                        lambda: tmp_path / "stamps")
+
+
+@pytest.fixture
+def stamp_env(tmp_path, monkeypatch):
+    """Private stamp directory plus a counter on the real measurement."""
+    stamps = tmp_path / "stamps"
+    monkeypatch.setattr(density_check, "_stamp_dir", lambda: stamps)
+    monkeypatch.setenv("LORRAX_TRS_CHECK", "on")
+    calls = []
+    real = density_check._check_two_component_trs
+
+    def counted(*args, **kwargs):
+        calls.append(1)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(density_check, "_check_two_component_trs", counted)
+    density_check._CACHE.clear()
+    yield stamps, calls
+    density_check._CACHE.clear()
+
+
+def _new_process_loader(path):
+    """A loader as a fresh process sees it: no process-local report."""
+    density_check._CACHE.clear()
+    with pytest.warns(RuntimeWarning, match="TRS check FAILED"):
+        return WfnLoader(path)
+
+
+def _stamps(stamps):
+    return sorted(stamps.glob("trs_*.json"))
+
+
+def test_stamp_cold_writes_and_second_process_hits(tmp_path, stamp_env,
+                                                   capsys):
+    stamps, calls = stamp_env
+    path = _kramers_deck(tmp_path, magnetic=True)
+    cold = _new_process_loader(path).trs_reference
+    assert len(calls) == 1 and len(_stamps(stamps)) == 1
+    assert "[stamp written" in capsys.readouterr().out
+    warm = _new_process_loader(path).trs_reference
+    assert len(calls) == 1, "a valid stamp must skip the measurement"
+    assert "[stamp hit, not re-measured" in capsys.readouterr().out
+    def receipt(report):
+        return json.dumps(density_check._report_to_json(report),
+                          sort_keys=True)
+    assert receipt(warm) == receipt(cold)       # NaN fields compare by text
+    assert cold.trs_basis == "trim-falsified" and not warm.trs_holds
+
+
+def test_stamp_hit_replays_the_strict_policy(tmp_path, stamp_env,
+                                             monkeypatch):
+    _, calls = stamp_env
+    path = _kramers_deck(tmp_path, magnetic=True)
+    _new_process_loader(path)
+    density_check._CACHE.clear()
+    monkeypatch.setenv("LORRAX_TRS_CHECK", "strict")
+    with pytest.raises(RuntimeError, match="two-component TRS check FAILED"):
+        WfnLoader(path)
+    assert len(calls) == 1
+
+
+def test_red_touched_mtime_forces_a_recheck(tmp_path, stamp_env):
+    _, calls = stamp_env
+    path = _kramers_deck(tmp_path, magnetic=True)
+    _new_process_loader(path)
+    st = os.stat(path)
+    os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000_000))
+    _new_process_loader(path)
+    assert len(calls) == 2
+
+
+def test_red_changed_header_bytes_force_a_recheck(tmp_path, stamp_env):
+    """Same path, size, inode and mtime_ns: only the content digest moves."""
+    _, calls = stamp_env
+    path = _kramers_deck(tmp_path, magnetic=True)
+    _new_process_loader(path)
+    before = os.stat(path)
+    with h5py.File(path, "r+") as f:
+        el = f["mf_header/kpoints/el"]
+        row = el[...]
+        row[0, 0, -1] = np.nextafter(row[0, 0, -1], np.inf)
+        el[...] = row
+    os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+    after = os.stat(path)
+    assert (after.st_size, after.st_ino, after.st_mtime_ns) == (
+        before.st_size, before.st_ino, before.st_mtime_ns)
+    _new_process_loader(path)
+    assert len(calls) == 2
+
+
+def test_red_check_version_or_tolerance_forces_a_recheck(
+        tmp_path, stamp_env, monkeypatch):
+    _, calls = stamp_env
+    path = _kramers_deck(tmp_path, magnetic=True)
+    _new_process_loader(path)
+    monkeypatch.setattr(density_check, "_ALGORITHM_VERSION",
+                        "occupied-density-subspace-v1-red")
+    _new_process_loader(path)
+    assert len(calls) == 2
+    monkeypatch.setenv("LORRAX_TRS_TOL", "2e-6")
+    _new_process_loader(path)
+    assert len(calls) == 3
+
+
+def test_red_failed_check_is_never_stamped_or_served(
+        tmp_path, stamp_env, monkeypatch):
+    stamps, calls = stamp_env
+    path = _kramers_deck(tmp_path, magnetic=True)
+    counted = density_check._check_two_component_trs
+
+    def broken_read(*args, **kwargs):
+        calls.append(1)
+        raise OSError("simulated coefficient read failure")
+
+    monkeypatch.setattr(density_check, "_check_two_component_trs",
+                        broken_read)
+    density_check._CACHE.clear()
+    with pytest.warns(RuntimeWarning, match="failed to run"):
+        failed = WfnLoader(path).trs_reference
+    assert failed.trs_basis == "skipped" and not _stamps(stamps)
+
+    # A stamp file at the right key that holds that failed report (or a
+    # record not marked as measured) is a miss, and the check runs again.
+    monkeypatch.setattr(density_check, "_check_two_component_trs", counted)
+    _new_process_loader(path)
+    (stamp,) = _stamps(stamps)
+    record = json.loads(stamp.read_text())
+    record["report"] = density_check._report_to_json(failed)
+    stamp.write_text(json.dumps(record))
+    _new_process_loader(path)
+    assert len(calls) == 3
+    record = json.loads(stamp.read_text())
+    record["measured"] = False
+    stamp.write_text(json.dumps(record))
+    _new_process_loader(path)
+    assert len(calls) == 4

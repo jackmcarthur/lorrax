@@ -1991,8 +1991,8 @@ def default_cache_root() -> Path:
     Beside the k-convolution cubin cache (``ffi.fft.cubin_cache_dir``): on
     scratch, never home, and one tree per user.
     """
-    root = os.environ.get("SCRATCH") or os.path.expanduser("~")
-    return Path(root) / ".cache" / "lorrax" / "jax_compile"
+    from lxkit.cache import user_cache_dir
+    return user_cache_dir("jax_compile")
 
 
 def _source_identity() -> str:

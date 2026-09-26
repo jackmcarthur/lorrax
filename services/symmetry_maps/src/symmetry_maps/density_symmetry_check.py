@@ -15,10 +15,22 @@ items round-robin: each process reads only its own k pairs, then one
 all-gather of the per-item residuals, minimum singular values and covered k
 rows follows.  Every process classifies the same merged numbers, so the
 verdict is identical everywhere.  A mesh-less loader keeps the serial sweep.
+
+A completed measurement is stamped across processes (``_STAMP_SCHEMA``): a
+JSON receipt in ``lxkit.user_cache_dir("wfn_trs")``, never beside the WFN,
+keyed by the file's identity (resolved path, size, mtime_ns, inode), a
+SHA-256 of the header arrays and G lists the verdict reads, the algorithm
+version and ``(tol, max_k, nocc)``.  The coefficients are not hashed: the
+stored band energies are a round-off fingerprint of the run that wrote them,
+so a regenerated WFN changes the digest even if size and mtime survive.  A
+check that raised is never stamped, and a stamp holding one is a miss.
 """
 
 from __future__ import annotations
 
+import dataclasses
+import hashlib
+import json
 import os
 import sys
 import time
@@ -39,6 +51,17 @@ __all__ = [
 TOL_TRS = 1.0e-6
 MAX_K_DEFAULT = 12
 _ALGORITHM_VERSION = "occupied-density-subspace-v1"
+_STAMP_SCHEMA = "wfn-trs-stamp-v1"
+#: Loader arrays a verdict depends on: the k set, weights, occupations and
+#: band energies, the symmetry and lattice tables the spatial unfold uses, and
+#: the per-k G lists.  All are in memory once the loader is built.
+_STAMP_FIELDS = (
+    "nspin", "nspinor", "nkpts", "nbands", "ngkmax", "ecutwfc", "kgrid",
+    "shift", "ngk", "ifmin", "ifmax", "kweights", "kpoints", "energies",
+    "occs", "ng", "ecutrho", "fft_grid", "ntran", "sym_matrices",
+    "translations", "alat", "blat", "avec", "bvec", "atom_types",
+    "atom_positions", "_gvecs_raw",
+)
 
 
 @dataclass(frozen=True)
@@ -238,6 +261,19 @@ def _evidence_partition(loader) -> tuple[int, int]:
     return int(jax.process_index()), world
 
 
+def _gather_process_rows(row: np.ndarray, world: int) -> np.ndarray:
+    """``(world, n)`` float64 rows, one per process (one all-gather)."""
+    row = np.asarray(row, dtype=np.float64).reshape(-1)
+    if world <= 1:
+        return row[None, :]
+    import jax
+    from jax.experimental import multihost_utils
+    local = jax.device_put(row, jax.local_devices()[0])
+    rows = np.asarray(multihost_utils.process_allgather(local),
+                      dtype=np.float64)
+    return rows.reshape(world, row.size)
+
+
 def _merge_process_evidence(row: np.ndarray, world: int) -> np.ndarray:
     """Elementwise max over processes of a non-negative evidence row.
 
@@ -245,15 +281,7 @@ def _merge_process_evidence(row: np.ndarray, world: int) -> np.ndarray:
     max returns the owner's value bit for bit.  It is one all-gather of a few
     dozen doubles.
     """
-    row = np.asarray(row, dtype=np.float64)
-    if world <= 1:
-        return row
-    import jax
-    from jax.experimental import multihost_utils
-    local = jax.device_put(row, jax.local_devices()[0])
-    rows = np.asarray(multihost_utils.process_allgather(local),
-                      dtype=np.float64)
-    return rows.reshape(world, row.size).max(axis=0)
+    return _gather_process_rows(row, world).max(axis=0)
 
 
 def _raw_ibz_psi_k(loader, ik: int, nb: int, *, b_lo: int = 0) -> np.ndarray:
@@ -659,6 +687,157 @@ check_density_symmetries = check_spinor_reference_trs
 _CACHE: dict[tuple, DensitySymmetryReport] = {}
 
 
+# ---------------------------------------------------------------------------
+# Cross-process stamp
+# ---------------------------------------------------------------------------
+
+def _stamp_dir():
+    from lxkit.cache import user_cache_dir
+    return user_cache_dir("wfn_trs")
+
+
+def _content_digest(loader) -> str:
+    """SHA-256 over the named in-memory arrays in ``_STAMP_FIELDS``."""
+    h = hashlib.sha256()
+    for name in _STAMP_FIELDS:
+        value = np.ascontiguousarray(np.asarray(getattr(loader, name)))
+        h.update(f"{name}|{value.dtype.str}|{value.shape}|".encode())
+        h.update(value.tobytes())
+    return h.hexdigest()
+
+
+def _stamp_identity(loader, nocc: int, tol_trs: float,
+                    max_k: int) -> dict | None:
+    """The stamp key, or ``None`` when the file cannot be identified."""
+    try:
+        path = os.path.realpath(str(loader.path))
+        st = os.stat(path)
+        digest = _content_digest(loader)
+    except (AttributeError, OSError, TypeError, ValueError):
+        return None
+    return {
+        "schema": _STAMP_SCHEMA, "algorithm": _ALGORITHM_VERSION,
+        "path": path, "size": int(st.st_size),
+        "mtime_ns": int(st.st_mtime_ns), "inode": int(st.st_ino),
+        "content_sha256": digest, "tol_trs": repr(float(tol_trs)),
+        "max_k": int(max_k), "nocc": int(nocc),
+    }
+
+
+def _identity_digest(identity: dict) -> str:
+    blob = json.dumps(identity, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(blob.encode()).hexdigest()
+
+
+def _stamp_path(identity: dict):
+    return _stamp_dir() / f"trs_{_identity_digest(identity)}.json"
+
+
+def _is_measured(report: DensitySymmetryReport) -> bool:
+    """A completed 2c measurement: not a failed run, not the trivial arm."""
+    return (report.method == "occupied-density-subspace"
+            and report.trs_basis not in {"skipped", "not-2c"}
+            and report.nspinor == 2)
+
+
+def _report_to_json(report: DensitySymmetryReport) -> dict:
+    out = {}
+    for f in dataclasses.fields(report):
+        value = getattr(report, f.name)
+        if isinstance(value, np.ndarray):
+            value = [float(v) for v in value.reshape(-1)]
+        elif isinstance(value, tuple):
+            value = [list(v) if isinstance(v, tuple) else v for v in value]
+        out[f.name] = value
+    return out
+
+
+def _report_from_json(data: dict) -> DensitySymmetryReport:
+    kwargs = {}
+    for f in dataclasses.fields(DensitySymmetryReport):
+        value = data[f.name]
+        if f.name == "spatial_residual":
+            value = np.asarray(value, dtype=np.float64)
+        elif f.name == "evidence_counts":
+            value = tuple((str(k), int(n)) for k, n in value)
+        elif f.name in {"spatial_untested", "spatial_failed", "fft_grid"}:
+            value = tuple(int(v) for v in value)
+        elif f.name == "messages":
+            value = tuple(str(v) for v in value)
+        kwargs[f.name] = value
+    return DensitySymmetryReport(**kwargs)
+
+
+def _read_stamp(identity: dict | None):
+    """``(report, path)`` for a valid stamp with this exact key, else None."""
+    if identity is None:
+        return None
+    path = _stamp_path(identity)
+    try:
+        with open(path, encoding="utf-8") as handle:
+            record = json.load(handle)
+        if record.get("identity") != identity or not record.get("measured"):
+            return None
+        report = _report_from_json(record["report"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    if not _is_measured(report):
+        return None
+    return report, path
+
+
+def _write_stamp(identity: dict | None,
+                 report: DensitySymmetryReport) -> str | None:
+    """Write the stamp atomically; only a completed measurement is written."""
+    if identity is None or not _is_measured(report):
+        return None
+    path = _stamp_path(identity)
+    record = {"identity": identity, "measured": True,
+              "written_unix": time.time(),
+              "report": _report_to_json(report)}
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(tmp, "w", encoding="utf-8") as handle:
+            json.dump(record, handle, sort_keys=True)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+    except OSError as exc:
+        warnings.warn(f"2c-TRS stamp not written at {path}: {exc!r}",
+                      RuntimeWarning)
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        return None
+    return str(path)
+
+
+def _all_processes_hit(loader, hit, identity: dict | None) -> bool:
+    """One branch for every process that shares the check's collective.
+
+    The check all-gathers only for a loader whose mesh spans every process
+    (:func:`_evidence_partition`); under that same condition every process
+    all-gathers ``[hit, token]`` here, and the stamp is used only if all hit
+    with the same key and payload.  Otherwise every process measures.
+    """
+    local = hit is not None
+    _, world = _evidence_partition(loader)
+    if world <= 1:
+        return local
+    token = hashlib.sha256(
+        (_identity_digest(identity) if identity is not None else "none")
+        .encode()
+        + (json.dumps(_report_to_json(hit[0]), sort_keys=True).encode()
+           if local else b"miss")).digest()
+    words = [float(int.from_bytes(token[i:i + 3], "little"))
+             for i in range(0, 24, 3)]
+    rows = _gather_process_rows(np.asarray([float(local), *words]), world)
+    return bool(np.all(rows[:, 0] == 1.0)
+                and np.all(rows[:, 1:] == rows[0:1, 1:]))
+
+
 def _cache_key(loader, nocc: int, tol_trs: float, max_k: int) -> tuple:
     path = os.path.realpath(str(getattr(loader, "path", "")))
     try:
@@ -675,6 +854,7 @@ def _enforce_policy(
     mode: str,
     *,
     announce: bool,
+    note: str = "",
 ) -> None:
     if report.trs_basis == "not-2c":
         return
@@ -688,7 +868,7 @@ def _enforce_policy(
     if not announce:
         return
     if _is_reporting_process():
-        print(report.summary(), flush=True)
+        print(report.summary() + note, flush=True)
     if not report.ok:
         detail = "\n  ".join(report.messages)
         text = (f"WFN two-component TRS check FAILED for {report.path}:\n  "
@@ -698,7 +878,7 @@ def _enforce_policy(
 
 
 def cached_density_symmetry_check(loader) -> DensitySymmetryReport:
-    """Process-local cached front door used by ``WfnLoader``."""
+    """Cached front door used by ``WfnLoader``: process cache, then stamp."""
     mode = trs_check_mode()
     tol = _env_float("LORRAX_TRS_TOL", TOL_TRS)
     max_k = _env_int("LORRAX_TRS_MAX_K", MAX_K_DEFAULT)
@@ -708,6 +888,24 @@ def cached_density_symmetry_check(loader) -> DensitySymmetryReport:
     if report is not None:
         _enforce_policy(report, mode, announce=False)
         return report
+
+    two_component = (int(getattr(loader, "nspin", 1) or 1),
+                     int(getattr(loader, "nspinor", 1) or 1)) == (1, 2)
+    t_stamp = time.perf_counter()
+    identity = (_stamp_identity(loader, nocc, tol, max_k)
+                if two_component else None)
+    if two_component:
+        hit = _read_stamp(identity)
+        if _all_processes_hit(loader, hit, identity):
+            # The receipt names this loader's path; the resolved file is
+            # the same one (it is in the key).
+            report = dataclasses.replace(hit[0], path=str(loader.path))
+            _CACHE[key] = report
+            _enforce_policy(
+                report, mode, announce=True,
+                note=(f" [stamp hit in {time.perf_counter() - t_stamp:.2f}s,"
+                      f" not re-measured: {hit[1]}]"))
+            return report
 
     try:
         report = check_spinor_reference_trs(
@@ -726,5 +924,10 @@ def cached_density_symmetry_check(loader) -> DensitySymmetryReport:
             nspinor=int(getattr(loader, "nspinor", 0) or 0),
             conclusive=False, trs_holds=False)
     _CACHE[key] = report
-    _enforce_policy(report, mode, announce=True)
+    note = ""
+    if two_component and _is_reporting_process():
+        written = _write_stamp(identity, report)
+        if written is not None:
+            note = f" [stamp written {written}]"
+    _enforce_policy(report, mode, announce=True, note=note)
     return report
