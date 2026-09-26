@@ -1419,15 +1419,18 @@ _CENTROID_WINDOW_WARNED = set()
 
 
 def _check_centroid_selection_windows(cfg, band_slices, band_range_left,
-                                      band_range_right, print_fn):
+                                      band_range_right):
 	"""Compare each centroid table's selection windows with the ζ-fit legs.
 
 	The table's provenance header names the pair-density windows kmeans
 	selected on.  :func:`file_io.centroids.check_centroid_pair_windows`
 	refuses a table whose windows drop occupied bands and returns a warning
 	for a softer gap (the pre-2026-09-26 ``v_x_vc`` left leg stops at nocc,
-	below the Σ conduction window).  Each warning prints once per table.
+	below the Σ conduction window).  Each warning is raised once per table as
+	a ``RuntimeWarning``, which the production report keeps in its WARNINGS
+	block.
 	"""
+	import warnings
 	from file_io.centroids import check_centroid_pair_windows
 	paths = [cfg.paths.centroids_file]
 	if cfg.bispinor and getattr(cfg.paths, "centroids_file_current", None):
@@ -1437,7 +1440,7 @@ def _check_centroid_selection_windows(cfg, band_slices, band_range_left,
 			path, int(band_slices.b2), band_range_left, band_range_right)
 		if warning is not None and path not in _CENTROID_WINDOW_WARNED:
 			_CENTROID_WINDOW_WARNED.add(path)
-			print_fn(f"WARNING: {warning}")
+			warnings.warn(warning, RuntimeWarning, stacklevel=2)
 
 def _resolve_zeta_fit_contract(
 		wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_dir,
@@ -1458,7 +1461,7 @@ def _resolve_zeta_fit_contract(
 	assert_zeta_fit_keeps_occupied(
 		band_slices, band_range_left, band_range_right)
 	_check_centroid_selection_windows(
-		cfg, band_slices, band_range_left, band_range_right, print_fn)
+		cfg, band_slices, band_range_left, band_range_right)
 	logical_band_stop = (
 		int(zeta_edge) if zeta_edge is not None
 		else int(getattr(meta, "b_id_4_user", 0) or band_slices.b4))
