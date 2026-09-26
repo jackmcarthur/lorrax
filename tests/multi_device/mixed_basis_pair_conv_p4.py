@@ -164,16 +164,20 @@ def sigma_checks(mesh, args):
     check("sigma collective census (router, compiled HLO)", census == want, str(census))
 
     # ---- symmetry: G at the parents, W at the q-IBZ; the wedge on covariant operands ----
+    cg, wg = t.sigma_glide_case(mesh, covariant=False)
+    cv, wv = t.sigma_glide_case(mesh, covariant=True)
+    refg = refv = None
     for backend in ("router", "xla"):
-        c, w = t.sigma_glide_case(mesh, covariant=False)
-        r = t._sigma_symmetry_check(mesh, c, w, backend, twins=("no_anti_W",))
+        r = t._sigma_symmetry_check(mesh, cg, wg, backend, twins=("no_anti_W",), ref=refg)
+        refg = r["ref_arr"]
         check(f"sigma glide ns=2 parents {backend}",
               r["anti"] and r["parent"] <= t.TOL and r["w_tile"] <= 1e-13 and r["red"]["no_anti_W"] > 1e-3,
               f"parents vs dense ref {r['parent']:.2e}; W tile unfold {r['w_tile']:.1e}; red no_anti_W "
               f"{r['red']['no_anti_W']:.1e}")
-        c, w = t.sigma_glide_case(mesh, covariant=True)
         for rows in ((0, 1, 2, 3), (0, 3)):
-            r = t._sigma_symmetry_check(mesh, c, w, backend, wedge_rows=rows, twins=("no_spin",))
+            r = t._sigma_symmetry_check(mesh, cv, wv, backend, wedge_rows=rows, twins=("no_spin",),
+                                        ref=refv)
+            refv = r["ref_arr"]
             check(f"sigma wedge glide ns=2 rows {rows} {backend}",
                   r["parent"] <= t.TOL and r["wedge_ref"] <= t.TOL and r["wedge_dense"] <= t.TOL
                   and r["red"]["no_spin"] > 1e-3,
@@ -199,10 +203,12 @@ def sigma_checks(mesh, args):
               cr["n_anti"] > 0 and cr["rule"] <= t.TOL and cr["red"] > 1e-3,
               f"chi0 full grid vs conj-rule unfold {cr['rule']:.2e} over {cr['n_anti']} antiunitary "
               f"children; red (no conj) {cr['red']:.1e}")
+        ref = None
         for backend in ("router", "xla"):
             for name, rw in ((f"all {len(rows)} rows", rows), ("unitary rows", rows[rows < n_sp])):
                 twins = ("no_anti_W",) + (("no_spin",) if ns_fe > 1 else ())
-                r = t._sigma_symmetry_check(mesh, c, w, backend, wedge_rows=rw, twins=twins)
+                r = t._sigma_symmetry_check(mesh, c, w, backend, wedge_rows=rw, twins=twins, ref=ref)
+                ref = r["ref_arr"]
                 ok = (r["parent"] <= t.TOL and r["wedge_ref"] <= t.TOL and r["wedge_dense"] <= t.TOL
                       and r["w_tile"] <= 1e-13 and all(v > 1e-3 for v in r["red"].values()))
                 check(f"sigma Fe ns={ns_fe} {name} {backend} box {c['fft_grid']}", ok,
