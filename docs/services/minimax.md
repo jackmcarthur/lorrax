@@ -19,10 +19,9 @@ kernel. The disk cache and uniform-rule backend are controlled by
 
 | surface | contract | production consumer |
 |---|---|---|
-| `serve(*, family, target, range_value, error_bound, n_max, eps_q=None, omega_hat=None) -> Quadrature` | Solves a screening rule in process for families `noncrossing`, `noncrossing_imag` (needs `omega_hat`) and `crossing` (`eps_q`, target `hgl` or `fermi`). It never reads shipped tables and refuses any other selector keyword. | `gw.minimax_screening` |
-| `lookup(...)`, `catalog()`, `nearest_certified(...)` | Search, enumerate and suggest shipped certified tables. Never solve. | tests and generators |
+| `serve(*, family, target, range_value, error_bound, n_max, eps_q=None, omega_hat=None) -> Quadrature` | Solves a screening rule in process for families `noncrossing`, `noncrossing_imag` (needs `omega_hat`) and `crossing` (`eps_q`, target `hgl` or `fermi`). Every rule is computed at run time; any other selector keyword refuses. | `gw.minimax_screening` |
 | `TARGETS`, `FAMILIES`, `CHARACTERS`, `family_for_character(...)` | Target and family vocabulary as data. | |
-| `Quadrature`, `Provenance` | Nodes, weights, `max_error`, κ₀, certification state, source and artifact identity. | |
+| `Quadrature`, `Provenance` | Nodes, weights, `max_error`, κ₀, and the source (`runtime-uncertified`, `cache` or `cache-legacy`) with its hash and backend. | |
 | `build_uniform_rule(box, eps, ..., attempts=None)` | Builds and certifies one rule for `1/d` on the denominator box `[re_lo, re_hi] × [im_lo, im_hi]`. It returns when its own boundary certificate is met, with no clock or pass-count input. Every build runs each loaded OpenBLAS at 16 threads and restores the count after. On one machine a box and tolerance therefore give one rule whatever the launch's thread variables, because the crossing fit's local solution follows the BLAS summation order. A different CPU's kernels can still give a different certified rule. `attempts=(first, stop)` runs only fixed-N attempts `first ≤ j < stop` of a crossing box (`stop=None`: to the end, then the fallback) and returns `None` if none of them certifies. The first range to certify returns the whole bracket's rule, because the node-count sequence does not depend on the solves. | `gw.sigma_box_plan`, which splits a dominant crossing build across ranks |
 | `analytic_line_box_rule(box, eps)` | Fixed-height line rule in Σ's `Σ w e^{itd}` convention, checked to peak-relative error. Crossing boxes with one positive imaginary height only. | `gw.sigma_box_plan`, PPM real-pole crossing windows |
 | `fit_damped_reciprocal(rectangles, *, target_error, ...)` | One positive rule `1/d ≈ Σ w e^{−d t}` for `1/(x − iγ)` over rectangles `(x_min, x_max, γ_min, γ_max)`, `x_min > 0`. | `gw.mpa.sigma_windows` |
@@ -46,15 +45,12 @@ max error, Σ|w|, κ₀ and provenance. Node positions can differ in the last
 digits between hosts, because the solve goes through the local LAPACK, so
 compare rules by node count and error, not bytes.
 
-**`lookup` refusals** are `MinimaxRefusal` subclasses (`RuntimeError`):
-`NoCertifiedTable` (F1, outside the catalog), `AmplificationCap` (F2, κ₀ above
-the declared cap), `UnknownTarget` (F3, outside the vocabulary; also raised by
-`serve`), and `CatalogUnavailable` / `TableUnreadable` / `CatalogCorrupt`
-(F4a–c). A malformed or insufficient entry refuses; it is never a silent cache
-miss. Catalog entries bind family, target, range selector, error bound, node
-limit, payload hash, achieved error, amplification, generator provenance and
-backend; `beta_selector` and `damped_line_selector` are public modules because
-their clauses are part of selection.
+**Refusals** are `MinimaxRefusal` subclasses (`RuntimeError`):
+`UnknownTarget` (F3: a family, target or selector outside the vocabulary,
+including the retired `use_shipped`), `UncertifiedSolveRefused` (F5: a
+declared family with no in-process solver, `complex_laplace` and
+`damped_line`) and `SamplingUnsupported` (F6: `family_for_character` on the
+strip cell, which no family serves).
 
 ## Damped MPA rules
 
@@ -174,4 +170,5 @@ finite-height rectangles use `build_uniform_rule`.
 ## Verification
 
 Package tests live in `services/minimax/tests/`; the monorepo layering test
-enforces the top-level door. Lookup tests must pass without SciPy.
+enforces the top-level door. `test_minimax_import_isolation.py` measures that
+`import minimax` and a `noncrossing` solve load neither JAX nor SciPy.

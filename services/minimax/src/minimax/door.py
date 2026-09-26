@@ -1,34 +1,11 @@
-"""The runtime surface: look a rule up, or serve one and say what it is.
+"""The runtime surface: compute a rule and say what it is.
 
-R1, in one sentence: *the door serves certified shipped tables and refuses
-gaps by name; runtime solving is not a service path.*
-
-R1 SHIPS IN TWO STAGES, and this module is stage 1.  The reason is a
-measurement, not a preference: the imaginary-axis family has **no shipped
-tables at all** — ``catalog.json`` carries 31 entries in two families,
-``{'crossing': 5, 'noncrossing': 26}``, and ``build_imag_quadrature``, on
-the path of every GN-PPM run there has ever been, is a 100% runtime-solve
-path with nothing behind it.  Applied literally today, lookup-and-refuse
-refuses the default production deck.  So:
-
-* **Stage 1 (this commit).**  The refusal machinery, the provenance
-  record and the certified-table path all ship.  The
-  ``LORRAX_MINIMAX_ALLOW_RUNTIME_SOLVE`` env key
-  gates the in-process solve and **defaults to on**, so no deck changes
-  behaviour in a refactor commit — but every solve now prints one loud
-  line naming the request, the achieved error, the measured Σ|w| and κ₀,
-  and the words *uncertified, not reproducible across hosts*.
-* **Stage 2 (after the catalog closes).**  The default flips to refuse.
-  The gate is the WP1 request census, which has now been taken: 54
-  distinct requests, 51 served, **3 refusals, all closed by ~18
-  noncrossing_imag entries.**  The flip is a one-line default change and
-  is deliberately NOT in this branch.
-
-The design's own risk register calls the comfortable failure mode by name:
-the hatch stays on forever and we get a better-logged version of today.
-The defence is that it announces on every distinct use, so "we never armed
-stage 2" is visible in every log rather than discoverable only by reading
-a design document.
+Every rule is solved in process at run time (owner, 2026-09-16).
+:func:`serve` checks the request against the declared vocabulary, calls
+:func:`solve_uncertified`, and announces each distinct request once with
+its node count, achieved error, Σ|w| and κ₀.  Node positions can differ
+in the last digits between hosts, because the solve runs on the host's
+LAPACK; two rules are compared by node count and error, not byte for byte.
 """
 
 from __future__ import annotations
@@ -39,15 +16,11 @@ from typing import Any
 
 import numpy as np
 
-from minimax import _catalog as _cat
 from minimax.records import Quadrature, runtime_provenance
 from minimax.refusals import (
-    AmplificationCap,
-    NoCertifiedTable,
     SamplingUnsupported,
     UncertifiedSolveRefused,
     UnknownTarget,
-    no_certified_table_text,
 )
 from minimax.targets import (CHARACTERS, FAMILIES, TARGETS,
                              families_for_character)
@@ -67,12 +40,10 @@ def reset_announcements() -> None:
 def _resolve(family: str, target: str) -> tuple[Any, str | None]:
     """``(FamilySpec, target_kind)``, or F3.
 
-    ``target_kind`` is the catalog's discriminant for the crossing family
-    (``'hgl'`` / ``'fermi'``) and ``None`` everywhere else, because no
-    other family's rows carry one.  Getting that mapping wrong would make
-    every crossing lookup match the first row of the wrong regularization,
-    which is precisely the class of bug a declared vocabulary exists to
-    make impossible.
+    ``target_kind`` is the crossing family's regularization discriminant
+    (``'hgl'`` / ``'fermi'``) and ``None`` everywhere else.  It selects the
+    target function the crossing solver fits, so a wrong mapping would fit
+    the wrong regularization.
     """
     spec = FAMILIES.get(family)
     if spec is None:
@@ -118,223 +89,12 @@ def family_for_character(character: str) -> str:
             f"minimax: no live quadrature family serves character "
             f"{character!r}.  Declared for that cell: "
             f"{[f.name for f in declared] or 'nothing'}.  "
-            + (f"{declared[0].generator_hint}" if declared else ""))
+            + (f"{declared[0].description}" if declared else ""))
     return live[0].name
 
 
 # ---------------------------------------------------------------------------
-#  The catalog, enumerable
-# ---------------------------------------------------------------------------
-
-def catalog(name: str = "catalog.json"):
-    """The shipped bundle as an enumerable, assertable view.  No solve."""
-    return _cat.catalog_view(name)
-
-
-# ---------------------------------------------------------------------------
-#  F1/F2/F4 — lookup, and only lookup
-# ---------------------------------------------------------------------------
-
-def _check_amplification(entry, view) -> None:
-    """F2 — the declared cap, read off the catalog's own shipping rule.
-
-    The number is DATA and it lives in the artifact: the theory plan owns
-    it (κ₀ ≤ 2 normal, 2–4 a versioned exception, > 4 rejected) and the
-    generator stamps it, so a constant in this file would be a second
-    opinion nobody asked for.  A v1 entry declares no κ₀ and no shipping
-    rule; there is nothing to check and the door says so in the
-    provenance rather than inventing a number.
-    """
-    if entry.kappa0 is None:
-        return
-    rejected_above = view.shipping_rule.get("rejected_above")
-    if rejected_above is None:
-        return
-    if entry.kappa0 > float(rejected_above):
-        raise AmplificationCap(
-            f"minimax: shipped table {entry.file!r} declares kappa0 = "
-            f"{entry.kappa0:.4g}, above the catalog's own rejection "
-            f"threshold of {float(rejected_above):.4g} "
-            f"({view.shipping_rule.get('kappa0_definition', 'amp')})."
-            f"  A rule whose weights amplify that hard is not servable: the "
-            f"quadrature error is not the error you get.  Regenerate the "
-            f"entry under the cap, or take the versioned exception "
-            f"explicitly.")
-
-
-def _lookup_beta_axis(spec, target: str, *, range_value: float,
-                      error_bound: float, n_max: int,
-                      beta: float, beta_clause: str) -> Quadrature:
-    """``complex_laplace``, through the axis that does not round.
-
-    THIS FAMILY DOES NOT USE ``_catalog.select_entry`` AND THAT IS THE
-    POINT.  The generic rule matches on three axes that all round safely —
-    ``R`` up, the tier down, the node count as a ceiling — and ``beta``
-    rounds neither way, because ``1/(u - i beta)`` is a different function
-    at every ``beta``.  So the rule for this family lives in
-    :mod:`minimax.beta_selector`, which matches ``beta`` against each
-    entry's own measured tolerance band and refuses when nothing covers
-    the request.  Routing here is what makes ``wired=True`` safe: the
-    family is selectable, and it is still impossible to select one of its
-    tables without saying which ``beta`` and which clause you meant.
-    """
-    from minimax import beta_selector as _beta          # noqa: PLC0415
-
-    picked = _beta.select(range_value=float(range_value), beta=float(beta),
-                          beta_clause=str(beta_clause),
-                          target_error=float(error_bound),
-                          max_nodes=int(n_max))
-    if isinstance(picked, _beta.TableRefusal):
-        # The selector's refusals already carry what F1 promises: the
-        # request, the nearest certified beta and its band, and the two
-        # levers.  Re-wording them here would be a second, worse copy.
-        raise NoCertifiedTable(picked.message)
-
-    entry = picked.entry
-    typed = _cat.CatalogEntry(
-        index=-1, family=spec.name, range_max=float(entry["range_max"]),
-        error_bound=float(entry["error_bound"]),
-        node_count=int(entry["node_count"]), file=str(entry["file"]),
-        range_param=spec.range_param, target_kind=None, eps_q=None,
-        claimed_max_error=None, kappa0=entry.get("kappa0"),
-        certified=bool(entry.get("certified", False)),
-        catalog_name=spec.catalog, raw=entry)
-    prov = _cat.provenance_for(
-        typed, f"sha256:{str(entry.get('payload_sha256', 'unrecorded'))}",
-        _cat.load_catalog_dict(spec.catalog))
-    quad = Quadrature(
-        nodes=picked.tau, weights=picked.alpha, family=spec.name,
-        target=target, range_param=spec.range_param,
-        range_value=float(range_value), error_bound=float(error_bound),
-        # The error MEASURED at the request's beta, not the entry's own
-        # stamp: a number measured somewhere else is not a measurement of
-        # this request.  `beta_selector.TableSelection` says the same.
-        max_error=float(picked.modulus_error),
-        kappa0=(float(entry["kappa0"]) if entry.get("kappa0") is not None
-                else None),
-        kappa1=None, provenance=prov)
-    _check_amplification(typed, catalog(spec.catalog))
-    _announce(quad)
-    return quad
-
-
-def lookup(*, family: str, target: str, range_value: float,
-           error_bound: float, n_max: int, **family_kw) -> Quadrature:
-    """The whole runtime surface.  Refuses (F1–F4) or returns.  NEVER solves.
-
-    ``family_kw`` carries the family's own discriminants — ``eps_q`` for
-    the crossing family, ``beta``/``beta_clause`` for ``complex_laplace``.
-    Unknown keywords are refused rather than ignored: a silently-dropped
-    selector is how you serve a table fitted to a different function.
-    """
-    spec, target_kind = _resolve(family, target)
-
-    if spec.name == "complex_laplace":
-        beta = family_kw.pop("beta", None)
-        beta_clause = family_kw.pop("beta_clause", None)
-        if family_kw:
-            raise UnknownTarget(
-                f"minimax: family {family!r} takes no {sorted(family_kw)} "
-                f"selector.  Silently ignoring one would serve a table "
-                f"fitted to a different function.")
-        if beta is None or beta_clause is None:
-            raise UnknownTarget(
-                f"minimax: family {family!r} is selected on (R, beta, "
-                f"clause, tier, nodes) and this request names "
-                + ("no beta" if beta is None else "no beta_clause") + ".\n"
-                "  beta does not round -- the target is a different "
-                "function at every beta -- and the two clauses of the "
-                "envelope (width = Gamma_p/x_min, height = varpi/x_min) "
-                "OVERLAP near 0.6, so neither can be inferred from the "
-                "other or from the number alone.  The caller says which, "
-                "because only the caller knows what its numerator was.")
-        return _lookup_beta_axis(
-            spec, target, range_value=range_value, error_bound=error_bound,
-            n_max=n_max, beta=beta, beta_clause=beta_clause)
-
-    eps_q = family_kw.pop("eps_q", None)
-    if family_kw:
-        raise UnknownTarget(
-            f"minimax: family {family!r} takes no {sorted(family_kw)} "
-            f"selector.  Silently ignoring one would serve a table fitted "
-            f"to a different function.")
-
-    if not spec.wired:
-        raise NoCertifiedTable(
-            f"minimax: family {family!r} is declared but NOT WIRED into the "
-            f"selection rule"
-            + (" (its entries are staged in the bundle; the selection rule "
-               "has no beta axis yet, and a beta-blind match would serve a "
-               "table fitted to a different function)"
-               if spec.shipped else " and ships no tables")
-            + f".  {spec.generator_hint}")
-
-    view = catalog(spec.catalog)
-    entry = _cat.select_entry(
-        view.entries, family,
-        range_value=range_value, target_error=error_bound,
-        max_nodes=n_max, target_kind=target_kind, eps_q=eps_q)
-
-    if entry is None:
-        below = _cat.nearest_below(
-            view.entries, family, range_value=range_value,
-            target_error=error_bound, target_kind=target_kind, eps_q=eps_q)
-        extra = ""
-        if not spec.shipped:
-            extra = (f"the {family!r} family has ZERO shipped entries — this "
-                     f"is a structural hole, not a straggler")
-        raise NoCertifiedTable(no_certified_table_text(
-            family=family, target=target, range_param=spec.range_param,
-            range_value=range_value, error_bound=error_bound, n_max=n_max,
-            nearest_below=below, range_lever=spec.range_lever,
-            generator_hint=spec.generator_hint, extra=extra))
-
-    _check_amplification(entry, view)
-    tau, alpha, max_error, kappa0, table_hash = _cat.load_table(entry)
-    prov = _cat.provenance_for(entry, table_hash,
-                               _cat.load_catalog_dict(spec.catalog))
-    quad = Quadrature(
-        nodes=tau, weights=alpha, family=family, target=target,
-        range_param=spec.range_param, range_value=float(range_value),
-        error_bound=float(error_bound), max_error=float(max_error),
-        kappa0=kappa0, kappa1=None, provenance=prov)
-    _announce(quad)
-    return quad
-
-
-def nearest_certified(*, family: str, target: str, range_value: float,
-                      error_bound: float, n_max: int,
-                      **family_kw) -> Quadrature | None:
-    """What a refusal offers.  Pure catalog algebra; NEVER raises."""
-    try:
-        spec, target_kind = _resolve(family, target)
-        view = catalog(spec.catalog)
-        entry = _cat.nearest_below(
-            view.entries, family, range_value=range_value,
-            target_error=error_bound, target_kind=target_kind,
-            eps_q=family_kw.get("eps_q"))
-        if entry is None:
-            return None
-        tau, alpha, max_error, kappa0, table_hash = _cat.load_table(entry)
-        return Quadrature(
-            nodes=tau, weights=alpha, family=family, target=target,
-            range_param=spec.range_param, range_value=entry.range_max,
-            error_bound=entry.error_bound, max_error=float(max_error),
-            kappa0=kappa0, kappa1=None,
-            provenance=_cat.provenance_for(
-                entry, table_hash, _cat.load_catalog_dict(spec.catalog)))
-    except Exception:                                  # noqa: BLE001
-        # DELIBERATELY BROAD, and it is the one broad catch in this
-        # service.  The contract is "never raises", because this function's
-        # only caller is a refusal message: an exception raised while
-        # building the explanation for another exception replaces a useful
-        # refusal with a confusing one.  Every failure mode it can swallow
-        # is one the ORIGINAL refusal already reported.
-        return None
-
-
-# ---------------------------------------------------------------------------
-#  R1 stage 1 — serve: look up, or solve behind the announced escape hatch
+#  serve: every rule is computed here, at run time
 # ---------------------------------------------------------------------------
 
 def _sum_abs_w(w: np.ndarray) -> float:
@@ -364,33 +124,16 @@ def _kappa0(family: str, tau: np.ndarray, w: np.ndarray,
             range_value: float) -> float:
     """The amplification metric, per family.
 
-    For the exponential-sum families this is the catalog's own definition
-    (``max over u in [1,R] of u * sum_l |w_l| e^{-t_l u}``, normalised
-    against the pure-damping envelope 1/u).  For the crossing family it is
-    Σ|α| — which is the quantity survey §2.4 measured moving by three
-    orders of magnitude between hosts, and the quantity the shipped
-    crossing tables are compared on.  One name, two definitions, stated
-    rather than blurred.
+    For the exponential-sum families it is
+    ``max over u in [1,R] of u * sum_l |w_l| e^{-t_l u}``, normalised
+    against the pure-damping envelope 1/u.  For the crossing family it is
+    Σ|α|, the quantity measured moving by three orders of magnitude between
+    hosts.  One name, two definitions, stated rather than blurred.
     """
     w = np.asarray(w)
     if family == "crossing":
         return _sum_abs_w(w)
     return noncrossing_kappa0(tau, w, range_value)
-
-
-def _announce(quad: Quadrature) -> None:
-    """R2: every table served announces its origin ONCE.
-
-    Once per distinct (request, source) — not once per call.  A quadrature
-    request repeats per q-block per SCF iteration per rank, and an
-    announcement nobody can read is the same as no announcement.
-    """
-    key = (f"{quad.family}|{quad.target}|{quad.range_value!r}|"
-           f"{quad.error_bound!r}|{quad.provenance.source}")
-    if key in _SERVE_ANNOUNCED:
-        return
-    _SERVE_ANNOUNCED.add(key)
-    warnings.warn(quad.one_line(), RuntimeWarning, stacklevel=3)
 
 
 def _announce_solved(quad: Quadrature, sum_abs_w: float,
@@ -425,43 +168,17 @@ def serve(*, family: str, target: str, range_value: float,
           error_bound: float, n_max: int, **family_kw) -> Quadrature:
     """Compute the rule this request asks for, here, now.
 
-    THERE IS NO TABLE PATH.  A shipped table is a node placement decided on
-    another machine at another time, and every placement is computed at run
-    time (owner, 2026-09-16).  ``lookup`` still exists for the generator and
-    for tests that assert what the bundle contains; production does not
-    reach it.
-
-    Measured before the path was removed, on the `noncrossing` family that
-    production actually served — the Si deck's own request and the envelope
-    around it (``runs/frequency_integration_sandbox/436_quad_20260916/
-    family_cost_main.json``, 21 requests):
-
-      * the shipped tables answered 9 of 21, so two requests in three fell
-        through to this solve anyway;
-      * where they answered they returned MORE nodes than solving does —
-        11 against 9 at the Si deck's own R = 75.727, 13 against 12 at
-        R = 256, 14 against 13, 15 against 14 — and a node is an FFT in the
-        consumer;
-      * four of those nine entries carry catalog schema v1: generator
-        ``unrecorded``, backend ``unrecorded``, and the door printed
-        ``UNCERTIFIED`` beside every one of them, which is the warning the
-        owner read in run 425;
-      * solving costs 27-129 ms (median 44) and met the target every time.
-
-    So the table was slower to trust, not faster to use.
+    Every placement is computed at run time (owner, 2026-09-16).  A
+    ``noncrossing`` solve costs 27-129 ms (median 44) per request.
     """
     _resolve(family, target)                      # refuses an unknown request
     unknown = sorted(set(family_kw) - {"eps_q", "omega_hat"})
     if unknown:
-        # A selector this door does not understand is refused, never dropped.
-        # `use_shipped=` arrives here from an un-updated caller, and silently
-        # ignoring it would answer a request for the table path by computing
-        # instead -- the exact substitution that caller thought it was
-        # controlling.  A parsed-but-ignored key is a defect (TASTE 13).
+        # A selector this door does not understand is refused, never dropped
+        # (TASTE 13); the retired `use_shipped` selector refuses by name.
         raise UnknownTarget(
-            f"minimax: serve() takes no {unknown} selector.  `use_shipped` "
-            f"in particular is retired: there is no shipped-table path left "
-            f"to select, so every rule is computed at run time.")
+            f"minimax: serve() takes no {unknown} selector; `use_shipped` is "
+            f"retired: every rule is computed at run time.")
     return solve_uncertified(
         family=family, target=target, range_value=range_value,
         error_bound=error_bound, n_max=n_max,
@@ -469,7 +186,7 @@ def serve(*, family: str, target: str, range_value: float,
 
 
 # ---------------------------------------------------------------------------
-#  The offline solvers, reached only through the hatch
+#  The in-process solvers
 # ---------------------------------------------------------------------------
 #  The three wrappers below are carried VERBATIM from
 #  `gw.minimax_screening._solve_*_scaled_cached`: the same `lru_cache`
@@ -621,8 +338,7 @@ def solve_uncertified(*, family: str, target: str, range_value: float,
             str(target_kind))
     else:
         raise UncertifiedSolveRefused(
-            f"minimax: family {family!r} has no in-process solver.  "
-            f"{spec.generator_hint}")
+            f"minimax: family {family!r} has no in-process solver.")
 
     quad = Quadrature(
         nodes=tau, weights=w, family=family, target=target,

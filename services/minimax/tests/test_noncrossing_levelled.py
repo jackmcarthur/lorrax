@@ -7,7 +7,6 @@ import numpy as np
 import pytest
 
 from minimax import certify_noncrossing, noncrossing_levelled
-from minimax import _catalog
 
 
 @pytest.mark.parametrize("R, eps, N_min", [
@@ -51,12 +50,12 @@ def test_matches_30_digit_reference():
 
 
 def test_certificate_detects_an_unlevelled_rule():
-    """Negative control: the shipped R=10, N=7 table meets its bound but is not
-    the minimax rule; the certificate must say so (upper/lower ~ 5)."""
-    view = _catalog.catalog_view()
-    entry = next(e for e in view.entries if e.family == "noncrossing" and e.range_max == 10.0)
-    tau, alpha, *_ = _catalog.load_table(entry)
-    lower, upper = certify_noncrossing(tau, alpha, 10.0)
-    assert upper / lower > 2.0
+    """Negative control: a rule that keeps its 2N+1 alternations but whose
+    extrema are no longer level is not the minimax rule, and the
+    certificate must say so (upper/lower ~ 2.5)."""
     t7, w7, n7, e7 = noncrossing_levelled(10.0, 1e-300, N_max=7)
-    assert n7 == 7 and e7 < upper / 3.0
+    assert n7 == 7
+    lower, upper = certify_noncrossing(t7, w7 * (1.0 + 1.0e-8), 10.0)
+    assert lower > 0.0
+    assert upper / lower > 2.0
+    assert e7 < upper
