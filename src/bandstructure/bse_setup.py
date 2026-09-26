@@ -23,7 +23,6 @@ the X/Y reshard.
 
 from __future__ import annotations
 
-import os
 import time
 from types import SimpleNamespace
 from functools import partial
@@ -54,8 +53,6 @@ from runtime.padding import padded_axis
 from common.staged_reshard import (
     face_to_batch_reshard as _face_to_batch_reshard,
     face_to_batch_reshard_supported as _face_to_batch_supported,
-    ROUTES as _RESHARD_ROUTES,
-    DEFAULT_ROUTE as _RESHARD_ROUTE_DEFAULT,
 )
 
 from .htransform import (
@@ -64,41 +61,6 @@ from .htransform import (
     newton_inv,
     require_newton_converged,
 )
-
-
-def resolve_reshard_route(explicit=None, *, log_fn=None) -> str:
-    """Which ``staged_reshard`` schedule the fH_q face→batch move uses.
-
-    Precedence: an explicit argument, else ``LORRAX_FACE_TO_BATCH_ROUTE``,
-    else :data:`common.staged_reshard.DEFAULT_ROUTE`.  The env var exists
-    because the two routes have to be A/B'd through the production
-    ``bse.exciton_bands`` driver, which this module cannot add an argument
-    to (file ownership), and it is the SAME knob the kwarg sets — one
-    resolver, not two policies.
-
-    An unrecognised token is ANNOUNCED with the project's ``*** LORRAX
-    SANITY`` marker and falls back to the default, never silently: a typo'd
-    route that quietly ran the default is exactly how an A/B comes back
-    "no difference".
-    """
-    log = log_fn if log_fn is not None else (lambda *a, **kw: None)
-    if explicit is not None:
-        route = str(explicit).strip().lower()
-        if route not in _RESHARD_ROUTES:
-            raise ValueError(
-                f"reshard_route={explicit!r} unknown; expected one of "
-                f"{' | '.join(_RESHARD_ROUTES)}.")
-        return route
-    raw = os.environ.get("LORRAX_FACE_TO_BATCH_ROUTE")
-    if raw is None or not raw.strip():
-        return _RESHARD_ROUTE_DEFAULT
-    tok = raw.strip().lower()
-    if tok in _RESHARD_ROUTES:
-        return tok
-    log(f"  *** LORRAX SANITY: LORRAX_FACE_TO_BATCH_ROUTE={raw!r} is not a "
-        f"known route.  Accepted: {'/'.join(_RESHARD_ROUTES)}; unset = "
-        f"{_RESHARD_ROUTE_DEFAULT}.  The knob is NOT in force. ***")
-    return _RESHARD_ROUTE_DEFAULT
 
 
 #: ``compute_wfns_fi``'s jits, keyed per SIGNATURE and held for the process.
@@ -317,7 +279,6 @@ def compute_wfns_fi(
     eigh_backend: str = "auto",
     use_low_mem_eigh: bool = False,
     distrib_la_batched_route: str = "batch_reshard",
-    reshard_route: str | None = None,
     htransform_quality_record_fn=None,
     log_fn=None,
 ):
@@ -404,13 +365,6 @@ def compute_wfns_fi(
                    ``use_low_mem_eigh=True`` with ``eigh_backend='off'`` is a
                    contradiction and is refused here; with an explicit
                    library name the name wins (it already IS this path).
-        reshard_route: which ``common.staged_reshard`` schedule performs the
-                   (i,j)-face → q-batch move — ``split_b_first`` (default) or
-                   ``flatten_m_first``.  ``None`` reads
-                   ``LORRAX_FACE_TO_BATCH_ROUTE`` (see
-                   :func:`resolve_reshard_route`).  Movement only: the two
-                   routes are element-identical and differ in schedule, peer
-                   counts and whether an M pad is needed.
         log_fn:    optional logger.
 
     Returns:
@@ -633,14 +587,11 @@ def compute_wfns_fi(
     # (slow, announced) instead of crashing; ``build_fH_R`` already pins
     # fH_R to a NON-fitted ``P(None,'x','y')``, so an indivisible rank cannot
     # actually reach here, and ``bs`` is padded to ndev a few lines above.
-    _route = resolve_reshard_route(reshard_route, log_fn=log)
-    _stage_q = (_face_to_batch_reshard(
-                    mesh_xy, axes=('x', 'y'), route=_route, log_fn=log)
+    _stage_q = (_face_to_batch_reshard(mesh_xy, axes=('x', 'y'))
                 if native and _face_to_batch_supported(
-                    mesh_xy, (bs, rank, rank), axes=('x', 'y'),
-                    route=_route) else None)
+                    mesh_xy, (bs, rank, rank), axes=('x', 'y')) else None)
     if native and _stage_q is not None:
-        log(f"  fH_q reshard: STAGED route={_route} "
+        log(f"  fH_q reshard: STAGED "
             f"(B={bs}, M=N={rank}) on {px}x{py}")
     if native and _stage_q is None:
         log(f"  fH_q reshard: STAGED path unavailable for "
