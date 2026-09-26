@@ -8,7 +8,8 @@ This module contains:
 - tagged_arrays: Reading/writing ISDF tagged arrays (restart files)
 - qp_wfn: QP rotation matrices and eigenvalue I/O
 - centroids: Centroid file loading
-- kin_ion: Kinetic + ionic Hamiltonian I/O
+- kin_ion: Kinetic + ionic Hamiltonian I/O (``write_kin_ion`` over SlabIO)
+- dipole: dipole.h5 over SlabIO; ΔE derived from band energies on read
 """
 
 # THE TWO LOADERS ARE SERVICES NOW, and this package reaches their doors

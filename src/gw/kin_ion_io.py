@@ -53,7 +53,7 @@ import h5py
 
 from common import Meta
 from common.gvec_fft_box import refuse_padded_gvecs_without_mask
-from common.collectives import barrier, process_rank_world, resolve_mesh
+from common.collectives import process_rank_world, resolve_mesh
 import common.timing as timing
 from common.preprocessing_output import PreprocessingProductionReport
 from common.progress import LoopProgress
@@ -63,10 +63,7 @@ from common.scientific_output import (
 import symmetry_maps                                           # noqa: E402
 from wfn_loader import IBZRows, WfnLoader                           # noqa: E402
 from file_io.kin_ion import (
-    IRR_IDX_DATASET, K_STORAGE_ATTR,
-    K_STORAGE_IBZ, K_STORAGE_VERSION, K_STORAGE_VERSION_ATTR,
-    N_SYM_SPATIAL_ATTR, SYM_IDX_DATASET,
-    broadcast_ibz_to_full_bz as _broadcast_ibz_slab,
+    broadcast_ibz_to_full_bz as _broadcast_ibz_slab, write_kin_ion,
 )
 from gw.gw_config import (
     BispinorGWMode,
@@ -796,6 +793,49 @@ def compute_hartree_matrix(wfn, sym, meta, *, truncation_2d: bool,
     )
 
 
+def _kin_ion_provenance(*, args, wfn, wfn_path, sym, meta, nb, nk_irr,
+                        sys_dim, ctx, pseudos, nval, ncond, nband, bispinor,
+                        vnl_setup, rank) -> dict:
+    """The ``kin_ion`` dataset's attributes: what it is and what made it.
+
+    ``nk`` is the LOGICAL full-BZ count every consumer means by nk; ``nrk``
+    is the stored star-wedge row count.  ``soc`` and ``soc_provenance``
+    record which V_NL projectors were built (``nspinor`` alone does not
+    say).  ``wfn_fingerprint``, ``ngkmax`` and ``generator_commit`` say what
+    the file was made from: ``wfn_file`` is a basename and identifies
+    nothing.  ``generator_commit`` forks git (~1 s), so only rank 0, whose
+    copy is the one SlabIO lands, computes it.
+    """
+    from common.parallel_transport import (
+        WFN_FINGERPRINT_SCHEME, wfn_fingerprint)
+    return {
+        "description": "T + V_loc + V_NL matrix elements",
+        "nk": sym.nk_tot,
+        "nb": nb,
+        "sys_dim": sys_dim,
+        "truncation_2d": ctx.truncation_2d,
+        "pseudopotentials": str(list(pseudos.keys())),
+        "input_file": os.path.basename(args.input),
+        "wfn_file": os.path.basename(wfn_path),
+        "nval": nval,
+        "ncond": ncond,
+        "nband_input": nband,
+        "nelec_bands": int(wfn.nelec),
+        "bispinor": bool(bispinor),
+        "nspinor": int(wfn.nspinor),
+        "soc": bool(vnl_setup.soc) if vnl_setup is not None else False,
+        "soc_provenance": (vnl_setup.soc_provenance if vnl_setup is not None
+                           else "no projector setup"),
+        "fft_grid": np.asarray(meta.fft_grid, dtype=np.int32),
+        "ngkmax": int(wfn.ngkmax),
+        "wfn_fingerprint": wfn_fingerprint(wfn),
+        "wfn_fingerprint_scheme": WFN_FINGERPRINT_SCHEME,
+        "generator_commit": _generator_commit() if rank == 0 else "",
+        "nrk": int(nk_irr),
+        "k_set_computed": "ibz",
+    }
+
+
 #: The report's major-stage table: ``(label, timing sections...)``.
 _STAGES = (
     ("wavefunction input", "load_wfn"),
@@ -898,7 +938,7 @@ def main(argv=None):
             )
         report.environment(wfn=wfn, lines=(
             "Matrix storage : distributed band blocks on the X x Y mesh",
-            "Output writer  : rank-zero artifact writer after bounded owner gathers",
+            "Output writer  : SlabIO collective write from the band shards",
         ))
         report.sampling(wfn=wfn, sym=sym)
         print0(f"Bands: {nb_eff} (deck nband={nband}, sigma window needs {nb_window}), "
@@ -1043,8 +1083,7 @@ def main(argv=None):
         #
         # ``get_kin_ion_k`` is left in place — it is the per-k local-plan
         # kernel the sweep is gated against.
-        from common.mtxel_sweep import (SweepGeometry, blocks_to_host,
-                                        kinetic_operator,
+        from common.mtxel_sweep import (SweepGeometry, kinetic_operator,
                                         local_potential_operator, sum_operators,
                                         sweep_matrix_elements, vnl_operator)
         from common.wfn_layout import band_sphere_spec
@@ -1085,7 +1124,7 @@ def main(argv=None):
             1, report.progress, title="kinetic and ionic matrix construction",
             item_name="distributed band-matrix sweep")
         matrix_progress.start()
-        with timing.section("kin_ion"):
+        with timing.section("kin_ion") as sweep:
             H_kin_ion = sweep_matrix_elements(
                 psi_G, operator=sum_operators(*terms), geom=geom,
                 gvecs=gtab.gvecs, gmask=gtab.mask,
@@ -1093,149 +1132,49 @@ def main(argv=None):
                 # The WFN loader's paired k representative for these exact G rows,
                 # for the same reason as the V_H sweep above.
                 kvecs=gtab.kvecs)
-            # THE BOUNDARY: the sink is a serial h5py write on rank 0, which
-            # cannot take a sharded operand, so the block is gathered to the
-            # owner here and nowhere else.  ``owner_only`` keeps the peers'
-            # transient at one chunk instead of the whole (nrk, nb, nb).  What
-            # leaves this block is the IBZ slab itself — the star broadcast
-            # used to follow immediately and now happens at the reader.
-            kin_ion_irr = blocks_to_host(H_kin_ion, nb=nb_eff, owner_only=True)
-            kin_ion_all = kin_ion_irr
+            sweep.watch(H_kin_ion)
         matrix_progress.step()
         matrix_progress.finish()
-        del H_kin_ion, psi_G
+        del psi_G
 
-        # ---- DOES THIS OPERATOR HAVE THE SYMMETRY OF THESE WAVEFUNCTIONS? ----
-        # Free: the matrix is already here.  Run on the WEDGE rows, and pair
-        # them with the SAME WFN rows the sweep read — ``wfn.energies`` is
-        # indexed by the WFN's own k axis, so ``_wedge_rows`` has to be
-        # applied to it too.  A bare ``[:nk_irr]`` would take the FIRST
-        # ``n_orbits`` WFN rows, which are not the wedge on any deck where
-        # the two sets differ, and would then compare each k's matrix against
-        # another k's eigenvalues.  The full-BZ table is the wedge's star
-        # broadcast and carries no independent information.
-        #
-        # This is the detector that needs NO metadata.  The V_NL builder now
-        # resolves j-resolved vs j-averaged the same way up front
-        # (``psp.vnl_ops.measure_soc_mode``, a few multiplet blocks of V_NL
-        # alone); this post-hoc pass is the independent full-operator twin —
-        # every k in the wedge, every band, T+V_loc+V_NL rather than V_NL —
-        # so a wrong selection, a broken WFN/UPF pairing, or any OTHER
-        # symmetry defect of the assembled matrix still gets caught here.
-        if rank == 0 and kin_ion_irr is not None:
-            from psp.operator_checks import check_degeneracy_consistency
-            _en = np.asarray(wfn.energies)
-            _en = _en[0] if _en.ndim == 3 else _en          # (nk, nb), Ry
-            check_degeneracy_consistency(
-                np.asarray(kin_ion_irr)[:nk_irr],
-                _en[star_wedge_rows(sym)[0], :nb_eff],
-                label="kin_ion (T+V_loc+V_NL)", print_fn=print0)
-        del kin_ion_irr
-
-        # From here on ``kin_ion_all`` exists on rank 0 only.
-
-        # ---- write output: COORDINATED, rank 0 only -------------------------
-        # Rank 0 alone holds the gathered arrays (owner_only gather), and the
-        # file needs exactly one writer.  This is what the old multi-rank
-        # refusal becomes: not "you may not run multi-rank" but "multi-rank
-        # writes through one rank, after the gather".  The barrier below keeps
-        # the peers alive until the file is closed — an early exit would have
-        # srun tear the step down mid-write.
+        # ---- write: SlabIO from the sweep's shards --------------------------
+        # The star-wedge slab, not its full-BZ broadcast: the reader unfolds
+        # (file_io.kin_ion).  No rank gathers the (n_orbits, nb, nb) table.
         print0(f"\nWriting to {out_path}...")
-        desc = "T + V_loc + V_NL matrix elements"
         write_progress = LoopProgress(
             1, report.progress, title="kinetic and ionic artifact write",
             item_name="output artifact")
         write_progress.start()
         with timing.section("write_h5"):
-            if rank == 0:
-                irr_idx_k, sym_idx_k, n_sym_spatial = star_tables(sym)
-                with h5py.File(out_path, "w") as f:
-                    # ---- the unfold tables, beside the slabs they unfold -----
-                    # Written whatever the storage, because they cost nk int32
-                    # (256 B on the Si 4³ deck) and because a reader that has
-                    # them can CHECK a full-BZ file's star relation instead of
-                    # taking it on faith.  ``k_storage`` is what decides how a
-                    # dataset is read; these are the raw material.
-                    f.create_dataset(IRR_IDX_DATASET, data=irr_idx_k)
-                    f.create_dataset(SYM_IDX_DATASET, data=sym_idx_k)
-
-                    def _stamp_k_storage(dset):
-                        """Stamp the canonical star-wedge storage."""
-                        dset.attrs[K_STORAGE_ATTR] = K_STORAGE_IBZ
-                        dset.attrs[K_STORAGE_VERSION_ATTR] = K_STORAGE_VERSION
-                        dset.attrs[N_SYM_SPATIAL_ATTR] = int(n_sym_spatial)
-
-                    ds = f.create_dataset("kin_ion", data=kin_ion_all, dtype=np.complex128)
-                    _stamp_k_storage(ds)
-                    ds.attrs["description"] = desc
-                    # The LOGICAL k count, which is what every consumer means by
-                    # nk.  On an IBZ-stored file it is deliberately NOT the
-                    # dataset's own first extent; ``nrk`` below is.
-                    ds.attrs["nk"] = sym.nk_tot
-                    ds.attrs["nb"] = nb_eff
-                    ds.attrs["sys_dim"] = sys_dim
-                    ds.attrs["truncation_2d"] = ctx.truncation_2d
-                    ds.attrs["pseudopotentials"] = str(list(pseudos.keys()))
-                    # ---- provenance: everything a consumer must agree with ----
-                    ds.attrs["input_file"] = os.path.basename(args.input)
-                    ds.attrs["wfn_file"] = os.path.basename(wfn_path)
-                    ds.attrs["nval"] = nval
-                    ds.attrs["ncond"] = ncond
-                    ds.attrs["nband_input"] = nband
-                    ds.attrs["nelec_bands"] = int(wfn.nelec)
-                    ds.attrs["bispinor"] = bool(bispinor)
-                    ds.attrs["nspinor"] = int(wfn.nspinor)
-                    # WHICH V_NL PROJECTORS.  ``nspinor`` alone does NOT say:
-                    # noncollinear is not spin-orbit, and a file written with
-                    # j-resolved projectors against a lspinorb=.false. WFN is
-                    # indistinguishable from a correct one by every other attr
-                    # here.  ``soc`` records what was actually built (the
-                    # automatically resolved — possibly MEASURED — mode);
-                    # ``soc_provenance`` says how it was decided, numbers
-                    # included.  There is no requested value to stamp: the
-                    # resolution takes no user input.
-                    ds.attrs["soc"] = bool(
-                        vnl_setup.soc) if vnl_setup is not None else False
-                    ds.attrs["soc_provenance"] = (
-                        vnl_setup.soc_provenance if vnl_setup is not None
-                        else "no projector setup")
-                    ds.attrs["fft_grid"] = np.asarray(meta.fft_grid, dtype=np.int32)
-                    # ---- WHAT THIS FILE WAS MADE FROM -------------------------
-                    # ``wfn_file`` above is a BASENAME: every WFN in the project
-                    # is called WFN.h5, so it identifies nothing.  A kin_ion.h5
-                    # that carries no content hash of its WFN and no commit of
-                    # the code that wrote it cannot be told from a stale one by
-                    # any test — which is how a broken committed fixture (star
-                    # spread 2.7e+01 meV against this generator's 6.6e-11 meV)
-                    # went a month without being noticed.  ``ngkmax`` joins them
-                    # because it is the ONE shape in the sweep that comes from
-                    # the WFN rather than the deck, so a mismatch localises a
-                    # wrong-WFN diagnosis immediately.
-                    ds.attrs["ngkmax"] = int(wfn.ngkmax)
-                    from common.parallel_transport import (
-                        WFN_FINGERPRINT_SCHEME, wfn_fingerprint)
-                    ds.attrs["wfn_fingerprint"] = wfn_fingerprint(wfn)
-                    ds.attrs["wfn_fingerprint_scheme"] = WFN_FINGERPRINT_SCHEME
-                    ds.attrs["generator_commit"] = _generator_commit()
-                    # The k-set actually COMPUTED — always the STAR wedge, and
-                    # now always the one stored too. ``nrk`` keeps its meaning
-                    # (``nk - nrk``
-                    # full-BZ rows are symmetry copies, not independent
-                    # evaluations) but it is the ORBIT count, not
-                    # ``wfn.nkpts``: on a WFN that stores more k than the mesh
-                    # has orbits the two differ, and the number that describes
-                    # this file is the number of rows in it.
-                    ds.attrs["nrk"] = int(nk_irr)
-                    ds.attrs["k_set_computed"] = "ibz"
-
-        barrier("kin_ion_written")
+            write_kin_ion(
+                out_path, H_kin_ion, mesh=mesh_xy, nb=nb_eff,
+                star=star_tables(sym),
+                attrs=_kin_ion_provenance(
+                    args=args, wfn=wfn, wfn_path=wfn_path, sym=sym, meta=meta,
+                    nb=nb_eff, nk_irr=nk_irr, sys_dim=sys_dim, ctx=ctx,
+                    pseudos=pseudos, nval=nval, ncond=ncond, nband=nband,
+                    bispinor=bispinor, vnl_setup=vnl_setup, rank=rank))
+        del H_kin_ion
         write_progress.step()
         write_progress.finish()
 
+        # ---- DOES THIS OPERATOR HAVE THE SYMMETRY OF THESE WAVEFUNCTIONS? ----
+        # The detector that needs no metadata: on every degenerate manifold
+        # of the WFN eigenvalues, T+V_loc+V_NL must be a multiple of the
+        # identity (psp.operator_checks).  It reads the WRITTEN wedge rows'
+        # manifold blocks, paired with the same WFN rows the sweep read.
+        if rank == 0:
+            from psp.operator_checks import check_degeneracy_consistency
+            en = np.asarray(wfn.energies)
+            en = en[0] if en.ndim == 3 else en          # (nk, nb), Ry
+            with h5py.File(out_path, "r") as h5:
+                check_degeneracy_consistency(
+                    h5["kin_ion"], en[star_wedge_rows(sym)[0], :nb_eff],
+                    label="kin_ion (T+V_loc+V_NL)", print_fn=print0)
+
         if rank == 0:
             print0(f"Wrote {os.path.basename(out_path)}: kin_ion "
-                   f"{kin_ion_all.shape} on the star wedge "
+                   f"{(int(nk_irr), nb_eff, nb_eff)} on the star wedge "
                    f"({sym.nk_tot / max(int(nk_irr), 1):.2f}x compression), "
                    f"sys_dim={sys_dim}; V_H is not stored.")
         run.complete(files=[
