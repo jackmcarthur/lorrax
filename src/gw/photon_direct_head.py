@@ -206,8 +206,8 @@ def project_first_order_photon_response(tensor, q_cart):
                       optimize=True)
 
 
-def metal_head_surface_tensors(velocity_cart, surface_weight_kn, *, mesh,
-                               nb_logical, cell_volume, nk_tot, nspin,
+def metal_head_surface_tensors(velocity_cart, surface_weight_kn, energies_kn,
+                               *, mesh, nb_logical, cell_volume, nk_tot, nspin,
                                nspinor_wfn):
     """Use the incumbent sharded Drude contraction and current-map FD DOS."""
     from gw.qsgw_head import head_drude_tensor_sharded
@@ -216,11 +216,13 @@ def metal_head_surface_tensors(velocity_cart, surface_weight_kn, *, mesh,
     if surface.shape != (nk_tot, nb_logical):
         raise ValueError("metal head surface weights do not match the band manifold")
     stored = int(velocity_cart.shape[-1])
+    energies = jnp.asarray(energies_kn, dtype=jnp.float64)
     if stored > nb_logical:
         surface_stored = jnp.pad(surface, ((0, 0), (0, stored-nb_logical)))
+        energies = jnp.pad(energies, ((0, 0), (0, stored-nb_logical)))
     else:
         surface_stored = surface
-    drude = head_drude_tensor_sharded(velocity_cart, surface_stored,
+    drude = head_drude_tensor_sharded(velocity_cart, surface_stored, energies,
         mesh=mesh, nb_logical=nb_logical, cell_volume=cell_volume,
         nk_tot=nk_tot, nspin=nspin, nspinor=nspinor_wfn)
     dos = (2.0 / (cell_volume * nk_tot * nspin * nspinor_wfn)
@@ -397,7 +399,7 @@ def build_direct_photon_head(velocity_cart, wfns, occupation_state, *,
         nspinor_wfn=int(meta.nspinor_wfnfile))
     width = float(occupation_state.smearing_width_ry)
     surface = f * (1.0 - f) / width
-    drude, dos = metal_head_surface_tensors(velocity_cart, surface,
+    drude, dos = metal_head_surface_tensors(velocity_cart, surface, e,
         mesh=mesh, nb_logical=nb, cell_volume=float(meta.cell_volume),
         nk_tot=int(meta.nk_tot), nspin=int(wfn.nspin),
         nspinor_wfn=int(meta.nspinor_wfnfile))
