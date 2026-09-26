@@ -248,6 +248,15 @@ def _encode_T_B(Xb_b, psi_c_Y, psi_v_X):
     return jnp.einsum("kvtM,kvsN->ktMsN", psi_v_X, R)
 
 
+def _w_r_kminor(W_R):
+    """The rank's ``W_R`` tile (μ_loc, ν_loc, kx, ky, kz) -> (μ_loc, ν_loc, nk): a reshape.
+
+    The outer load reads the stored kernel k-minor, so its route makes no transpose
+    (``_w_r_klead`` is the XLA route's, 0.88 ms and a 537 MB copy per call on CrI3 8x8).
+    """
+    return W_R.reshape(W_R.shape[0], W_R.shape[1], -1)
+
+
 def _w_r_klead(W_R):
     """The rank's ``W_R`` tile (μ_loc, ν_loc, kx, ky, kz) -> k-leading (nk, μ_loc, ν_loc).
 
@@ -483,17 +492,20 @@ def build_bse_stack_matvec(
         # DELIBERATELY left at complex128 (no c64 here) per owner decision
         # (2026-07-16); the fp32-GMRES path casts upstream in bse_feast, not here.
         sqrt_nk = jnp.sqrt(jnp.asarray(nk, dtype=X.real.dtype))
-        W_Rk = _w_r_klead(W_R)                       # once per call, not per trial
 
         kconv_outer = outer_route(min(psi_c_X.shape[1], psi_v_Y.shape[1]))
         if kconv_outer is not None:
+            W_Rm = _w_r_kminor(W_R)                  # the tile as built: a reshape, no copy
+
             def _body_outer(carry, X_b):             # X_b: (c_full, v_full, nk)
                 L, R, cj = _outer_legs(X_b, psi_c_X, psi_v_Y)
-                U_b = kconv_outer(L, R, W_Rk, conj_r=cj)   # T formed on the load, never stored
+                U_b = kconv_outer(L, R, W_Rm, conj_r=cj)   # T formed on the load, never stored
                 return carry, _decode(U_b, psi_c_X, psi_v_Y, sqrt_nk)
 
             _, WX = lax.scan(_body_outer, None, _gather_trial_block(X), unroll=1)
             return _scatter_trial_block(WX, mesh_xy)
+
+        W_Rk = _w_r_klead(W_R)                       # once per call, not per trial
 
         def _body(carry, X_b):                       # X_b: (c_full, v_full, nk)
             # encode: T_b[k,t,μ,s,ν] = Σ_c ψ_c[k,c,t,μ] Σ_v conj(ψ_v[k,v,s,ν]) X_b
@@ -634,7 +646,6 @@ def build_bse_stack_pair_matvec(
         # Local shards: X (n_trials, c_loc, v_loc, nk); psi_*_X (…, μ_loc);
         # psi_*_Y (…, ν_loc); W_R (μ_loc, ν_loc, kx, ky, kz).
         sqrt_nk = jnp.sqrt(jnp.asarray(nk, dtype=X.real.dtype))
-        W_Rk = _w_r_klead(W_R)                              # once per call
 
         # ONE block-level gather, hoisted OUT of the scan: both encodes take
         # the whole trial block, and Xb = conj(X) is formed locally from it
@@ -649,26 +660,30 @@ def build_bse_stack_pair_matvec(
         rank = min(psi_c_X.shape[1], psi_v_Y.shape[1])
         kconv_outer = outer_route(2 * rank if fuse else rank)
         if kconv_outer is not None:
+            W_Rm = _w_r_kminor(W_R)                         # a reshape, no copy
+
             def _body_outer_fused(carry, xs):
                 X_b, Xb_b = xs
                 L_A, R_A, cA = _outer_legs(X_b, psi_c_X, psi_v_Y)
                 L_B, R_B = _outer_legs_B(Xb_b, psi_c_Y, psi_v_X)
                 R_A = jnp.conj(R_A) if cA else R_A      # one convention for the concatenation
                 U_b = kconv_outer(jnp.concatenate([L_A, sc * L_B], axis=-1),
-                                  jnp.concatenate([R_A, R_B], axis=1), W_Rk)
+                                  jnp.concatenate([R_A, R_B], axis=1), W_Rm)
                 return carry, _decode(U_b, psi_c_X, psi_v_Y, sqrt_nk)
 
             def _body_outer_unfused(carry, xs):
                 X_b, Xb_b = xs
                 L_A, R_A, cA = _outer_legs(X_b, psi_c_X, psi_v_Y)
-                WA = _decode(kconv_outer(L_A, R_A, W_Rk, conj_r=cA), psi_c_X, psi_v_Y, sqrt_nk)
-                WB = _decode(kconv_outer(*_outer_legs_B(Xb_b, psi_c_Y, psi_v_X), W_Rk),
+                WA = _decode(kconv_outer(L_A, R_A, W_Rm, conj_r=cA), psi_c_X, psi_v_Y, sqrt_nk)
+                WB = _decode(kconv_outer(*_outer_legs_B(Xb_b, psi_c_Y, psi_v_X), W_Rm),
                                  psi_c_X, psi_v_Y, sqrt_nk)
                 return carry, WA + sc * WB
 
             _, WX = lax.scan(_body_outer_fused if fuse else _body_outer_unfused,
                              None, (X_full, Xb_full), unroll=1)
             return _scatter_trial_block(WX, mesh_xy)
+
+        W_Rk = _w_r_klead(W_R)                              # once per call
 
         def _body_fused(carry, xs):
             X_b, Xb_b = xs
