@@ -10,7 +10,7 @@ import os
 import sys
 import time
 from dataclasses import replace
-from functools import lru_cache
+from functools import lru_cache, partial
 
 import jax
 import jax.numpy as jnp
@@ -199,6 +199,19 @@ def _shared_pole_contract(b_X, b_Y, weights, *, gemm, layout="face"):
     return value[:, :, 0, :, 0]
 
 
+@lru_cache(maxsize=None)
+def _shared_pole_panel_scatter(mesh_xy):
+    """``total[rows] += values`` into the donated full-q W, once per mesh."""
+    @partial(jax.jit, donate_argnums=(0,),
+             out_shardings=NamedSharding(mesh_xy, P(None, "x", "y")))
+    def add_panel(total, rows, values):
+        # Every full-q child occurs once in a parent panel, in sorted order.
+        # Expose that fact so complex scatter need not use atomic updates.
+        return total.at[rows].add(values, indices_are_sorted=True, unique_indices=True)
+    return add_panel
+
+
+@lru_cache(maxsize=None)
 def shared_pole_hole_kernel(mesh_xy):
     """Compile the valence-branch W of an ordered (time-reversal-broken) store.
 
@@ -235,6 +248,7 @@ def debug_shared_pole_even_part(ordered):
     return value
 
 
+@lru_cache(maxsize=None)
 def shared_pole_even_part_kernel(mesh_xy, *, exclude_q0):
     """DEBUG-ONLY W(tau) of the even part of an ordered store, for both causal branches.
 
@@ -334,44 +348,66 @@ def _shared_pole_panel_unfold(meta, header, q_span, *, mesh_xy, tables=None):
     return tables["rows"], unfold
 
 
-def _shared_pole_routed_synthesis(
-    b_X, b_Y, poles2, intervals, E_ref_B, t_node, *, meta, header, tables,
-    endpoint_budgets, realize, mesh_xy, gemm, layout="face",
-):
-    """Synthesize W after bounded child-factor routing, DESIGN §3.4 fallback.
+def _shared_pole_routed_children(meta, header, tables, *, endpoint_budgets, mesh_xy, layout):
+    """The τ-invariant half of the routed synthesis, as one program per panel.
 
-    Both endpoint actions use the common wavefunction symmetry owner; this
-    conjugates factors for antiunitary children without conjugating the
-    causal time weight. No all-star factor cache is retained.
+    Returns ``(route, count)`` with ``route(b_X, b_Y) -> factors``, a tuple of
+    ``count`` faces: each endpoint face routed to the
+    panel's child rows by the common wavefunction symmetry owner (antiunitary
+    children conjugate the factor, never the causal time weight), followed by
+    the conjugate-face partners when a child is self-negative, all placed in
+    the contraction's factor layout.  Only d(τ) depends on the node, so a
+    panel's factors are routed once per read — once per Σ call for a resident
+    panel — not once per τ node (P2-E hoist, claim 2726).  The retained child
+    faces replace the parent faces for the read's lifetime: 2(1+f)·16·N_child
+    ·μ·K/P bytes per rank on the face layout (f = 1 with a self-negative
+    child), inside the endpoint budgets ``_shared_pole_panel_cost`` prices.
     """
     from symmetry_maps import unfold_endpoint_panel
 
     operations = header["operations"]
     spin = (np.asarray(operations["spin_real"])
             + 1j * np.asarray(operations["spin_imag"]))[tables["sym_rows"]]
-    policy = tables["policy"]
-    parent_ids = np.asarray(header["q_irr_full_idx"])[tables["parent_span"][0]:tables["parent_span"][1]]
-    child_ids = parent_ids[tables["parent_rows"]]
-    fixed = policy.self_negative_q[child_ids]
-    children = []
-    partners = []
-    for axis, face in (("x", b_X), ("y", b_Y)):
-        child, _ = unfold_endpoint_panel(
-            face, irr_idx=tables["parent_rows"], sym_idx=tables["sym_rows"],
-            q_irr_frac=tables["q_frac"], source_perm=tables["packed_perm"],
-            L_table=tables["wraps"], spin_action_full=spin,
-            n_sym_spatial=tables["n_sym_spatial"], active_mask=meta.mu_basis.active_mask,
-            mesh=mesh_xy, mesh_axis=axis,
-            max_live_bytes=endpoint_budgets[axis])
-        if np.any(fixed):
-            partner, _ = unfold_endpoint_panel(
-                face.conj(), irr_idx=tables["parent_rows"], sym_idx=tables["sym_rows"],
+    fixed = tables["policy"].self_negative_q[_shared_pole_child_ids(header, tables)]
+    specs = _shared_pole_factor_specs(layout)
+    count = 4 if np.any(fixed) else 2
+
+    def route(b_X, b_Y):
+        children, partners = [], []
+        for axis, face in (("x", b_X), ("y", b_Y)):
+            kwargs = dict(
+                irr_idx=tables["parent_rows"], sym_idx=tables["sym_rows"],
                 q_irr_frac=tables["q_frac"], source_perm=tables["packed_perm"],
                 L_table=tables["wraps"], spin_action_full=spin,
                 n_sym_spatial=tables["n_sym_spatial"], active_mask=meta.mu_basis.active_mask,
                 mesh=mesh_xy, mesh_axis=axis, max_live_bytes=endpoint_budgets[axis])
-            partners.append(partner)
-        children.append(child)
+            children.append(unfold_endpoint_panel(face, **kwargs)[0])
+            if count == 4:
+                partners.append(unfold_endpoint_panel(face.conj(), **kwargs)[0])
+        return (*children, *partners)
+
+    return jax.jit(route, out_shardings=tuple(
+        NamedSharding(mesh_xy, specs[i % 2]) for i in range(count))), count
+
+
+def _shared_pole_child_ids(header, tables):
+    lo, hi = tables["parent_span"]
+    return np.asarray(header["q_irr_full_idx"])[lo:hi][tables["parent_rows"]]
+
+
+def _shared_pole_routed_synthesis(
+    factors, poles2, intervals, E_ref_B, t_node, *, header, tables,
+    realize, mesh_xy, gemm, layout="face",
+):
+    """Synthesize W from routed child factors, DESIGN §3.4 fallback.
+
+    ``factors`` is ``_shared_pole_routed_children``'s output: the two child
+    endpoint faces, then their conjugate partners when a child is
+    self-negative. No all-star factor cache is retained.
+    """
+    policy = tables["policy"]
+    child_ids = _shared_pole_child_ids(header, tables)
+    children, partners = factors[:2], factors[2:]
     weights = _shared_pole_weights(poles2, intervals, E_ref_B, t_node)
     child_weights = weights[tables["parent_rows"]]
     plus = _shared_pole_contract(*children, child_weights, gemm=gemm, layout=layout)
@@ -389,6 +425,42 @@ def _shared_pole_routed_synthesis(
     return realize(plus, transposed)[0]
 
 
+_SYNTHESIS_PROGRAMS = {}
+
+
+def _synthesis_program(key, build):
+    """One scalar shared-pole synthesis program per static configuration, per process.
+
+    Every SC map rebuilds the shared-pole model, not the programs that consume
+    it: a later map with the same shapes dispatches the first map's jit object
+    and compiled executable instead of recompiling them (P2-A, claim 2735).
+    ``key`` names everything a program closes over (mesh, layout, panel span
+    and extents, the FFI dials, the symmetry tables by content); factors,
+    poles, intervals and τ always enter as arguments, never as constants.
+    """
+    entry = _SYNTHESIS_PROGRAMS.get(key)
+    if entry is None:
+        entry = _SYNTHESIS_PROGRAMS[key] = build()
+    return entry
+
+
+def _shared_pole_static_key(meta, header, tables, *, mesh_xy, layout):
+    """Content key of the store symmetry, packed basis and panel tables."""
+    from ffi import ffi_dial_key
+    from .sector_sigma import _static_key
+
+    basis = meta.mu_basis
+    return _static_key((
+        mesh_xy, layout, ffi_dial_key(),
+        {name: header.get(name) for name in (
+            "representation", "grid", "q_order", "q_shift", "q_irr_full_idx",
+            "n_q_irr", "n_q_full", "n_mu_logical", "nspinor", "qirr", "operations")},
+        (header.get("recipe") or {}).get("operator_realization"),
+        (int(basis.n_packed), getattr(basis, "n_logical", None),
+         getattr(basis, "mesh_xy", None), np.asarray(basis.active_mask)),
+        {name: value for name, value in tables.items() if name != "policy"}))
+
+
 def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy, layout="face"):
     """Resolve bounded face reads → parent synthesis → complete full-q W.
 
@@ -400,17 +472,18 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
     """
     _band_fence('tau.synthesis_plan', sync_ranks=True)
     with timing.section('tau.synthesis_plan'):
-        from functools import partial
-        from file_io.shared_pole_store import read_shared_pole_faces
+        from file_io.shared_pole_store import face_width, read_shared_pole_faces
+        from .sector_sigma import _placer, _zeros
 
         factor_specs = _shared_pole_factor_specs(layout)
-        place_factors = tuple(jax.jit(lambda a: a, out_shardings=NamedSharding(mesh_xy, spec))
-                              for spec in factor_specs)
-        def read_factors(span, column_span=None):
-            x, y, poles, counts = read_shared_pole_faces(
+
+        def read_factors(span, column_span=None, *, route=None):
+            """Read a panel; a routed panel's faces leave already routed to its children."""
+            x, y, poles, _counts = read_shared_pole_faces(
                 io, span, meta=meta, header=header, column_span=column_span)
-            x, y = (place(a) for place, a in zip(place_factors, (x, y)))
-            return x, y, poles, counts
+            if route is not None:
+                return route(x, y), poles
+            return tuple(_placer(mesh_xy, spec)(a) for spec, a in zip(factor_specs, (x, y))), poles
 
         if schedule["status"] != "PASS":
             raise ValueError("GATE shared_pole_capacity: an admitted schedule is required")
@@ -420,10 +493,10 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
         if bcap < 1 or ccap < 1:
             raise ValueError("shared-pole panel capacities must be positive")
         if kmax == 0:
-            shape = (int(header["n_q_full"]), meta.mu_basis.n_packed, meta.mu_basis.n_packed)
-            zero = jax.jit(lambda: jnp.zeros(shape, jnp.complex128),
-                           out_shardings=NamedSharding(mesh_xy, P(None,"x","y")))
+            zero = _zeros(mesh_xy, (int(header["n_q_full"]), meta.mu_basis.n_packed,
+                                    meta.mu_basis.n_packed))
             return lambda *_args: zero()
+        resident_read = bcap >= nq and ccap >= kmax
         # Query the same distributed dense context used by G before warming
         # any matrix operands. The service accepts a resolved dense Plan for
         # a GEMM workspace query, as in the shared-pole constructor.
@@ -436,26 +509,19 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
             hi = min(lo + bcap, nq)
             tables = _shared_pole_panel_tables(meta, header, (lo, hi), mesh_xy=mesh_xy)
             local = all(c["is_local"] for c in tables["certificates"].values())
-            if local:
-                rows, unfold = _shared_pole_panel_unfold(
-                    meta, header, (lo, hi), mesh_xy=mesh_xy, tables=tables)
-            else:
-                rows, unfold = tables["rows"], None
-            # The realization is the magnetic little-group average the store's
-            # policy authenticates.  On the local branch it is already inside
-            # ``unfold``; on the routed branch the service accepts traced
-            # faces, so bind the immutable map once per current-map panel and
-            # reuse its executable at every tau.
-            realize = None
+            static = _shared_pole_static_key(meta, header, tables, mesh_xy=mesh_xy, layout=layout)
+            route, n_faces = None, 2
             if not local:
-                from gw.qgrid_symmetry import shared_pole_operator_realizer
-                realize = shared_pole_operator_realizer(
-                    meta, header, q_full_idx=rows, mesh_xy=mesh_xy)
+                # τ-invariant: the panel's faces are routed to its child rows
+                # once per read (once per Σ call when resident), not per node.
+                budgets = tuple(sorted(schedule["endpoint_budgets"].items()))
+                route, n_faces = _synthesis_program((static, "route", budgets), lambda: (
+                    _shared_pole_routed_children(
+                        meta, header, tables, endpoint_budgets=schedule["endpoint_budgets"],
+                        mesh_xy=mesh_xy, layout=layout)))
 
-            def make_kernel(width, *, span=(lo, hi), tables=tables,
-                            unfold=unfold, local=local, realize=realize):
+            def make_kernel(width, *, span=(lo, hi), tables=tables, local=local, static=static):
                 nonlocal native_workspace
-                from distrib_la import gemm_plan
 
                 count = (tables["parent_span"][1]-tables["parent_span"][0]
                          if local else len(tables["rows"]))
@@ -478,63 +544,77 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
                         resident_bytes_per_rank=0,
                         workspace_bytes_per_rank=2*warm_bytes+native_workspace,
                         concurrent_with=tuple(schedule["capacity_receipt"]["concurrent_with"]))
-                gemm = gemm_plan(mesh_xy, m=m, k=width, n=m, nq=count,
-                                 dtype=np.complex128, layout=layout)
-                if local:
-                    def body(b_X,b_Y,poles2,ranges,e,t):
-                        plus,transposed = synthesize_shared_pole_parents(
-                            b_X,b_Y,poles2,ranges,e,t,mesh_xy=mesh_xy,gemm=gemm,layout=layout)
-                        return unfold(plus,transposed)
-                else:
-                    body = partial(
-                        _shared_pole_routed_synthesis, meta=meta, header=header,
-                        tables=tables, endpoint_budgets=schedule["endpoint_budgets"],
-                        realize=realize, mesh_xy=mesh_xy, gemm=gemm, layout=layout)
-                return jax.jit(body)
+
+                def program():
+                    from distrib_la import gemm_plan
+                    gemm = gemm_plan(mesh_xy, m=m, k=width, n=m, nq=count,
+                                     dtype=np.complex128, layout=layout)
+                    if local:
+                        _rows, unfold = _shared_pole_panel_unfold(
+                            meta, header, span, mesh_xy=mesh_xy, tables=tables)
+
+                        def body(factors,poles2,ranges,e,t):
+                            plus,transposed = synthesize_shared_pole_parents(
+                                *factors,poles2,ranges,e,t,mesh_xy=mesh_xy,gemm=gemm,layout=layout)
+                            return unfold(plus,transposed)
+                    else:
+                        # The realization is the magnetic little-group average
+                        # the store's policy authenticates; on the local branch
+                        # it is already inside ``unfold``.
+                        from gw.qgrid_symmetry import shared_pole_operator_realizer
+                        body = partial(
+                            _shared_pole_routed_synthesis, header=header, tables=tables,
+                            realize=shared_pole_operator_realizer(
+                                meta, header, q_full_idx=tables["rows"], mesh_xy=mesh_xy),
+                            mesh_xy=mesh_xy, gemm=gemm, layout=layout)
+                    return dict(kernel=jax.jit(body))
+                return _synthesis_program((static, "synthesis", count, m, width), program)
 
             kernels = {}
-            multiple = combined_divisor(mesh_xy.shape["x"],mesh_xy.shape["y"])
-            widths = sorted({padded_axis(min(ccap,kmax-c0),multiple,name="shared_pole_K_chunk").carrier
+            # The widths the reader will return: a whole-K resident read is
+            # laddered, a column panel keeps its admitted width.
+            widths = sorted({face_width(mesh_xy, kmax, None if resident_read else (c0, min(c0+ccap, kmax)))
                              for c0 in range(0,kmax,ccap)})
             for width in widths:
-                kernel = kernels[width] = make_kernel(width)
-                from runtime.aot_memory import aot_kernel_peak_bytes
-                def abstract(shape,dtype,spec):
-                    return jax.ShapeDtypeStruct(shape,dtype,sharding=NamedSharding(mesh_xy,spec))
-                # The stored operator is the spin-traced charge response: its
-                # factor spin axis is 1 on scalar and two-component decks.
-                shape = (hi-lo,meta.mu_basis.n_packed,1,width)
-                compiled = kernel.lower(
-                    abstract(shape,np.complex128,factor_specs[0]),
-                    abstract(shape,np.complex128,factor_specs[1]),
-                    abstract((hi-lo,width),np.float64,P()),
-                    abstract((hi-lo,2),np.int32,P()),
-                    abstract((),np.float64,P()),abstract((),np.complex128,P())).compile()
-                peak = aot_kernel_peak_bytes(compiled)
-                row = dict(parent_span=[lo,hi],column_width=width,
-                           compiled_bytes_per_rank=peak.total,
-                           output_bytes_per_rank=compiled.memory_analysis().output_size_in_bytes,
-                           cufft_measured=peak.cufft_measured)
+                entry = kernels[width] = make_kernel(width)
+                if "compiled" not in entry:
+                    from runtime.aot_memory import aot_kernel_peak_bytes
+                    def abstract(shape,dtype,spec):
+                        return jax.ShapeDtypeStruct(shape,dtype,sharding=NamedSharding(mesh_xy,spec))
+                    # The stored operator is the spin-traced charge response: its
+                    # factor spin axis is 1 on scalar and two-component decks.
+                    # Routed kernels take the child faces (and their partners).
+                    shape = (hi-lo if local else len(tables["rows"]),meta.mu_basis.n_packed,1,width)
+                    compiled = entry["kernel"].lower(
+                        tuple(abstract(shape,np.complex128,factor_specs[i % 2]) for i in range(n_faces)),
+                        abstract((hi-lo,width),np.float64,P()),
+                        abstract((hi-lo,2),np.int32,P()),
+                        abstract((),np.float64,P()),abstract((),np.complex128,P())).compile()
+                    peak = aot_kernel_peak_bytes(compiled)
+                    entry["compiled"] = dict(
+                        compiled_bytes_per_rank=peak.total,
+                        output_bytes_per_rank=compiled.memory_analysis().output_size_in_bytes,
+                        cufft_measured=peak.cufft_measured)
+                row = dict(parent_span=[lo,hi],column_width=width,**entry["compiled"])
                 schedule.setdefault("compiled_panels",[]).append(row)
                 if "capacity_receipt" in schedule:
-                    if not peak.cufft_measured:
+                    if not row["cufft_measured"]:
                         raise ValueError("shared-pole synthesis native FFT workspace query unavailable")
                     meta.shared_pole_capacity.reserve(
                         f"sigma.synthesis.compiled.{lo}.{hi}.{width}",
                         resident_bytes_per_rank=0,
-                        workspace_bytes_per_rank=peak.total+native_workspace,
+                        workspace_bytes_per_rank=row["compiled_bytes_per_rank"]+native_workspace,
                         concurrent_with=tuple(schedule["capacity_receipt"]["concurrent_with"]))
             schedule["compiled_peak_status"] = "PASS"
             panels.append((lo, hi, device_put_process_local(
-                rows, NamedSharding(mesh_xy, P())), kernels, make_kernel))
+                tables["rows"], NamedSharding(mesh_xy, P())), kernels, make_kernel, route))
     _band_fence('tau.factor_read', sync_ranks=True)
     with timing.section('tau.factor_read'):
         resident = None
-        if bcap >= nq and ccap >= kmax:
-            resident = read_factors((0, nq))
+        if resident_read:
+            resident = read_factors((0, nq), route=panels[0][-1])
     shape = (int(header["n_q_full"]), meta.mu_basis.n_packed, meta.mu_basis.n_packed)
-    sharding = NamedSharding(mesh_xy, P(None, "x", "y"))
-    zeros = jax.jit(lambda: jnp.zeros(shape, jnp.complex128), out_shardings=sharding)
+    zeros = _zeros(mesh_xy, shape)
     # Ordered stores: conduction windows use W_+(q), valence windows W_+(-q)^T.
     ordered = header.get("representation") == "scalar-ordered-ph"
     even_part = debug_shared_pole_even_part(ordered)
@@ -546,12 +626,7 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
         if even_part:
             even_kernel = shared_pole_even_part_kernel(mesh_xy, exclude_q0=even_part == "exclude_q0")
 
-    @partial(jax.jit, donate_argnums=(0,), out_shardings=sharding)
-    def add_panel(total, rows, values):
-        # Every full-q child occurs once in a parent panel, in sorted order.
-        # Expose that fact so complex scatter need not use atomic updates.
-        return total.at[rows].add(values, indices_are_sorted=True, unique_indices=True)
-
+    add_panel = _shared_pole_panel_scatter(mesh_xy)
     cached_indices = cached_bounds = cached_intervals = None
 
     def build(_residues, _omega_fields, indices, bounds, _phase_real, E_ref_B, t_node,
@@ -568,28 +643,27 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
                 cached_indices, cached_bounds = indices, bounds
             intervals = cached_intervals
             total = None
-            for lo, hi, rows, kernels, make_kernel in panels:
+            for lo, hi, rows, kernels, make_kernel, route in panels:
                 for c0 in range(0, kmax, ccap):
                     c1 = min(c0 + ccap, kmax)
                     selected = np.clip(intervals[lo:hi] - c0, 0, c1 - c0)
                     if not np.any(selected[:, 1] > selected[:, 0]):
                         continue
-                    faces = resident if resident is not None else read_factors(
-                        (lo, hi), column_span=(c0, c1))
-                    b_X, b_Y, poles2, _counts = faces
+                    factors, poles2 = resident if resident is not None else read_factors(
+                        (lo, hi), column_span=(c0, c1), route=route)
                     ranges = device_put_process_local(selected, NamedSharding(mesh_xy, P()))
                     # Preserve the admitted K tiling for the entire panel.
                     # Window-dependent slicing can redistribute the pole axis
                     # and recreate a one-axis factor temporary. The separate
                     # causal weights mask inactive columns without moving b.
-                    width = b_X.shape[-1]
+                    width = factors[0].shape[-1]
                     if width not in kernels:
                         kernels[width] = make_kernel(width)
-                    kernel = kernels[width]
-                    child = kernel(b_X,b_Y,poles2,ranges,E_ref_B,t_node)
+                    kernel = kernels[width]["kernel"]
+                    child = kernel(factors,poles2,ranges,E_ref_B,t_node)
                     if resident is None:
                         child.block_until_ready()
-                    del faces, b_X, b_Y, poles2, _counts, ranges
+                    del factors, poles2, ranges
                     if total is None and lo == 0 and hi == nq:
                         # All children are in canonical full-q order. Avoid a
                         # redundant zero buffer in the resident all-parent case.

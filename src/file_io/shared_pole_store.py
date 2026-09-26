@@ -946,6 +946,18 @@ def read_shared_pole_matrix(io, q_span, *, meta, header):
             jnp.where(active, poles, 1.0), counts)
 
 
+def face_width(mesh, kmax, column_span=None):
+    """The pole-column carrier ``read_shared_pole_faces`` returns for one read.
+
+    A whole-K read is laddered: the pole count grows by a few columns every
+    SC map, and every face consumer is keyed by this width.  A column panel
+    keeps the width its schedule admitted.  Both face orientations tile it.
+    """
+    k = ladder_extent(int(kmax)) if column_span is None else int(column_span[1]) - int(column_span[0])
+    return padded_axis(k, mesh, name="shared_pole_face_K",
+                       specs=((P(None,"x",None,"y"),3),(P(None,"y",None,"x"),3))).carrier
+
+
 def read_shared_pole_faces(io, q_span, *, meta, header, column_span=None, basis=None,
                            orientations=("x", "y")):
     """Read canonical row faces and pack once at the I/O boundary.
@@ -984,12 +996,7 @@ def read_shared_pole_faces(io, q_span, *, meta, header, column_span=None, basis=
                 jnp.zeros(hi-lo,jnp.int64))
     c0, c1 = _span(column_span or (0,header["Kmax"]), header["Kmax"], "column_span")
     # Selected orientations share one padded pole extent; counts exclude padding.
-    # A whole-K read is laddered: the pole count grows by a few columns every
-    # SC map, and every face consumer is keyed by this width.  A column panel
-    # keeps the width its schedule admitted.
-    k = c1-c0 if column_span is not None else ladder_extent(c1-c0)
-    width = padded_axis(k, io.mesh, name="shared_pole_face_K",
-                        specs=((P(None,"x",None,"y"),3),(P(None,"y",None,"x"),3))).carrier
+    width = face_width(io.mesh, header["Kmax"], None if column_span is None else (c0, c1))
     totals = {}
     for axis in orientations:
         shape = (hi-lo,basis.n_canonical,components,width)
