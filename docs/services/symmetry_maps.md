@@ -72,6 +72,15 @@ aliases of `unfold_isdf_operator`, `spinor_rotation_for_sym_row`,
   attributed to TRS alone. The metric is the occupied one-particle-subspace
   residual in G space, invariant to band phases and to rotations within
   degenerate blocks. TRIM-only or absent evidence is inconclusive.
+* **One measurement per WFN, across processes.** A completed measurement
+  (passing or broken) is stamped in `lxkit.user_cache_dir("wfn_trs")`, never
+  beside the WFN. The key is the resolved path, size, `mtime_ns` and inode,
+  a SHA-256 of the header arrays and G lists the verdict reads (the band
+  energies stand in for the coefficients), the algorithm version, and
+  `(tol, max_k, nocc)`. A hit skips the coefficient reads, replays the
+  on/strict policy and prints the stamp path. A check that raised is never
+  stamped. Processes that share the check's collective agree on hit or miss
+  by one all-gather, and rank 0 writes. There is no dial.
 * **Env surface.** `LORRAX_TRS_CHECK` takes `1`/`on` (default) or `strict`
   (a broken or inconclusive verdict refuses); `0`/`off` refuses.
   `LORRAX_TRS_TOL` and `LORRAX_TRS_MAX_K` tune the measurement. The
