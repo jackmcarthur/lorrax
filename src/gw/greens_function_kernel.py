@@ -386,7 +386,8 @@ def sigma_spin_block(*, n_parent, n_rmu, ns, n_full, n_band, mesh, partner_tiles
     divisors = sorted((d for d in range(1, int(ns) + 1) if int(ns) % d == 0), reverse=True)
     d = next((d for d in divisors if new(d) <= room), 1)
     from common.gpu_utils import record_stage_price
-    record_stage_price("Sigma tau, sigma_spin_block", live + new(d), section="sigma.tau_sweep")
+    record_stage_price(f"Sigma tau, sigma_spin_block d={d}/{int(ns)}", live + new(d),
+                       section="sigma.tau_sweep")
     return d
 
 
