@@ -289,10 +289,12 @@ def _resolve_deck_sigma_ncond(args):
     """
     if args.input is None:
         if args.prune_window == "v_x_vc" and args.fit_window is None:
-            rank0_print(
+            import warnings
+            warnings.warn(
                 "kmeans: no deck (-i), so the Sigma window is unknown; the "
                 "prune left leg falls back to vc_x_vc (all bands), a safe "
-                "superset of occupied + Sigma conduction.")
+                "superset of occupied + Sigma conduction.", RuntimeWarning,
+                stacklevel=2)
         return None
     from gw.gw_config import read_lorrax_input
     return int(read_lorrax_input(args.input)["ncond"])
