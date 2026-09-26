@@ -605,13 +605,13 @@ def compute_wfns_fi(
     # ``distrib_la.mesh_key``, which carries device identity and not just
     # extents), ``kgrid_co`` (which is all ``R_grid`` is), the matrix extent,
     # the three output extents that ``_qbatch_out_shardings`` and the bundle
-    # shardings are built from, and the reshard route plus whether the staged
-    # primitive accepted this shape.  Arguments are deliberately ABSENT — jit
+    # shardings are built from, and whether the staged reshard primitive
+    # accepted this shape.  Arguments are deliberately ABSENT — jit
     # keys its own cache on avals and static args, so putting shapes here
     # would only split entries that are already correctly split.
     _mesh_id = _mesh_key(mesh_xy)
     _sig = (_mesh_id, tuple(int(v) for v in kgrid_co), int(rank),
-            int(nb_fi), int(nspinor), int(n_mu), _route,
+            int(nb_fi), int(nspinor), int(n_mu),
             _stage_q is not None, bool(native))
 
     # The two stages either side of the eigh are plain traceable functions,
