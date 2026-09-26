@@ -80,7 +80,7 @@ only sigC/sigXC (max 0.127146 eV); sigX and VH are unchanged.
 - `gnppm_test.in` — dynamic GN-PPM input (Tier-1 gate + session fixture).
 - `cohsex_ibz_test.in` — static COHSEX input (Tier-2 IBZ≡full-BZ gate).
 - `centroids_frac_399.txt` — orbit-closed ISDF centroids (seed 42).
-- `sigma_diag_gnppm_ref.dat` — frozen Tier-1 reference.
+- `sigma_diag_gnppm_ref.dat` — frozen Tier-1 reference, re-cut 2026-09-26 at the Σ quadrature default 3e-5 (`gnppm_test.in` and `gnppm_sc.in` state it) on the ω-split rule partition; sigC moves ≤ 0.061 meV. The provenance header and `tests/known_failures/2026-09-26-sigma-eps-3e5-refreeze.md` carry the numbers.
 - `eqp_rotations_fixedpoint_ref.npy` — frozen `E_qp_nk_rydberg` (9, 46)
   for the fixed-point Tier-2 gate.
 - `WFN.h5` plus provenance-bound 46-band `kin_ion.h5` and `dipole.h5`.

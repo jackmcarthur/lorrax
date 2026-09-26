@@ -145,6 +145,6 @@ headless packed SX_TT with W_TT = D_TT is the incumbent bare TT exchange.
   restart round-trips in both layouts since 2026-08-23, see gw_init.py).
 - `centroids_frac_256.txt` / `centroids_frac_209_current.txt` — charge /
   transverse ISDF centroid sets (seed 42).
-- `sigma_diag_bispinor_ref.dat` — frozen reference (sigX/sigC/sigXC), re-cut 2026-09-24 at c52b2c42 and on the packed route (P2-C; values unchanged).
+- `sigma_diag_bispinor_ref.dat` — frozen reference (sigX/sigC/sigXC), re-cut 2026-09-26 at the Σ quadrature default 3e-5 (the deck states it) on the ω-split rule partition; sigC moves ≤ 0.067 meV. The provenance header and `tests/known_failures/2026-09-26-sigma-eps-3e5-refreeze.md` carry the numbers.
 - `WFN.h5` (34 bands), `kin_ion.h5` (regenerated 2026-09-02, stamped),
   `Mo.upf` / `S.upf` (added 2026-09-02; see above for which generation).

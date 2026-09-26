@@ -125,35 +125,25 @@ def expected(label: str) -> dict:
         "files": {name: sha256(root / name) for name in names},
     }
     if label == "A":
-        # 2026-09-24 re-freeze, cut at the landing tree c52b2c42 (P4 JID
-        # 58826502, step lx-Xg4-084936-627447-3573):
-        # - GN-PPM refs + box rules (schema v4).  States outside the
-        #   [-8, +8] eV Sigma grid take Sigma(omega=0) instead of the
-        #   endpoint clamp (d7f556fc, owner rule 2026-09-22): the 10
-        #   out-of-grid eqp0/eqp1 cells move by up to 0.887 eV.  Four
-        #   in-grid states within dE = 0.5 eV of the +8 eV edge move in eqp1
-        #   only (-0.10..-0.18 eV): their Z probes are clipped onto the grid
-        #   with the true one-sided spacing (5335d487).  The other in-grid
-        #   cells move by <= 0.97 meV because the box-rule builder no longer
-        #   has a time budget (89eaa9a3); the shipped v3 rules were not
-        #   served after that change.
+        # 2026-09-26 re-freeze (owner approval 2026-09-26): gnppm.in runs at
+        # the production Sigma default 3e-5, on the omega-split rule partition
+        # (RC2).  GN-PPM refs + box rules (schema v5, the rules the cut run
+        # wrote; the v4 set was no longer served) cut at 8aeb755fc, P4 one
+        # node.  Old (1e-3, main's partition) -> new, max / median over 25
+        # rows: eqp0 4.753 / 0.450 meV, eqp1 6.035 / 0.997 meV -- the old
+        # reference's own 1e-3 quadrature error.  Main's partition at 3e-5
+        # agrees with the new refs to 0.045 meV (eqp0) / 0.035 meV (eqp1).
+        # Earlier cuts: tests/known_failures/2026-09-24-bispinor-and-core-
+        # fixture-refreeze.md.
         # - excited_state_ref.json: scalar-singlet exchange weight
         #   (a0bae022, re-frozen by 01465925).
-        # 2026-09-24 21:00 re-freeze (owner ruling 20:45, Jack McArthur,
-        # option (b)): the one-shot grows its Sigma grid by the SC rule
-        # (scissor.grow_sigma_support_ev, b12181a5), so an active state
-        # outside the requested grid reads Sigma(E) instead of Sigma(0).
-        # 14 of 30 GN-PPM eqp0 rows move by more than 0.5 meV (up to
-        # 1.123 eV; eqp1 up to 1.822 eV).  P4 B5 58849330.
         result["additional_reference_source_commits"] = {
-            "gnppm_one_shot_cover_growth":
-                "b12181a5fb46a6c97c46ce26c7ef144638602927",
             "htransform_bse_exciton":
                 "1fc5cb8f2b974a14ac1c5f97f5c9d7ee2be274b0",
             "bse_scalar_singlet_exchange":
                 "01465925b7a12d63181a737f866a5c81f03a7b68",
-            "gnppm_static_omega0_box_rules_v4":
-                "c52b2c42565dd53271ca3bf91c7a2cd0de99120b",
+            "gnppm_sigma_eps_3e5_box_rules_v5":
+                "8aeb755fc70ff597263c266f6483b83eb457a5ad",
         }
     if label == "B":
         # MPA one-shot / one-update references regenerated under the
@@ -165,6 +155,9 @@ def expected(label: str) -> dict:
         # (89eaa9a3 retired the quadrature time-budget key; d4214ace and
         # a5a35701 renamed the SC accelerator).  No reference was regenerated;
         # the mpa_sc1_* family stays the strict xfail in tests/KNOWN_FAILURES.md.
+        # 2026-09-26: mpa.in / mpa_sc1.in run at the test-deck floor 5e-4; the
+        # shipped rule cache is the schema-v5 set the 8aeb755fc run wrote (the
+        # 23 older-schema files were ignored).  No reference was regenerated.
         result["additional_reference_source_commits"] = {
             "mpa_sc_pad_identity":
                 "0262d4833c470ef5768270ca048de1faaaf06a9b",
