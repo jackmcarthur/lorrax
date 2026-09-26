@@ -21,7 +21,7 @@ the self-consistent loop on a metal, its head routes and its scissor rules are
 `chi00 = q.S.q` convention is [S-tensor convention](s-tensor-convention.md).
 All equations are in Ry.
 
-**What a metal deck refuses.** GN-PPM and HL-PPM (`GATE gn_ppm_refuses_metals`,
+**What a metal deck refuses** (key-level contract: [input reference](../input_reference.md)). GN-PPM and HL-PPM (`GATE gn_ppm_refuses_metals`,
 `GATE fractional_occupations_require_mpa`); a missing `occ_smearing_width_ry`;
 any occupation family but Fermi–Dirac (`GATE metal_occupations_fermi_dirac`);
 `fermi_reference` other than `mp1_fixed_n`; the ladder `wc_source`

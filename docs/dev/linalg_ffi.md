@@ -12,16 +12,16 @@ inside the ScaLAPACK handlers that no Python guard can see.
 ## The deck dial
 
 `linalg = local | distributed` (default `local`) is the only dense-linear-algebra
-deck key. `gw_config.resolve_linalg` interprets it once into a
+deck key ([input reference](../input_reference.md)). `gw_config.resolve_linalg` interprets it once into a
 `LinalgResolution`; stage code reads that record and never re-interprets the
 dial.
 
 | resolved field | `local` | `distributed` |
 |---|---|---|
 | W Dyson solve | per-q local LU | `plan('solve_lu', backend='distributed').batched` |
-| transverse ζ LU (`distributed_lu`) | `auto` | `distributed` (ScaLAPACK on cpu, cuSOLVERMp on CUDA) |
+| transverse ζ LU | `auto` | `distributed` (ScaLAPACK on cpu, cuSOLVERMp on CUDA) |
 | batched route | `DISTRIB_LA_BATCHED_ROUTE_DEFAULT` | `auto` |
-| eigensolves (`eigh_backend`, `sc_eigh`) | `auto` (native, q-batched) | `distributed` (cpu → `scalapack`, CUDA → `cusolvermp`) |
+| eigensolves | `auto` (native, q-batched) | `distributed` (cpu → `scalapack`, CUDA → `cusolvermp`) |
 | charge ζ factor | `rank_truncate` | `rank_truncate` |
 | transverse ζ factor | `ridge` | `ridge` |
 
