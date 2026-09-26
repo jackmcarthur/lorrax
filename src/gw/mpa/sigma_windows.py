@@ -93,6 +93,32 @@ def _stats_by_pole(Omega, B, bounds):
     return tuple(out)
 
 
+def sigma_pole_edges(branches, state_edge, excursion):
+    """The Σ planner's pole edges, in Ry: the one owner of their formula.
+
+    ``pos``/``neg`` belong to the crossing branch of each ω half
+    (``ω≥E_F cond``, ``ω<E_F val``): a pole above ``|ω|max(half) + edge + exc``
+    leaves every denominator of that half at least ``edge`` from zero.
+    ``near = edge + exc`` is both the pole edge and the ``|ω|`` cut of the
+    non-crossing branches (``ω≥E_F val``, ``ω<E_F cond``): there
+    ``|d| = |ω| + E + a`` with ``E ≥ -exc`` and ``a > 0``, so ``|ω| ≥ near``
+    or ``a > near`` puts ``|d|`` above ``edge``.  The pole selectors are
+    ``"all"`` and ``"shallow:<name>"`` / ``"deep:<name>"`` per edge.
+
+    Tempting, and why not: one edge from the global ``ω_max``.  The cover
+    grows the ω≥E_F half only, and its edge made the ω<E_F crossing window
+    reach 7.9 Ry of poles (Na 8^3 map 0: 409 -> 263 pairs with the half's
+    own edge, claim 2821).
+    """
+    near = float(state_edge) + float(excursion)
+    pos, neg = (
+        max((float(np.max(b.omega_abs)) for b in branches
+             if b.omega_abs.size and bool(b.neg_omega_half) == negative),
+            default=0.0)
+        for negative in (False, True))
+    return {"pos": pos + near, "neg": neg + near, "near": near}
+
+
 def _geometry(branches, regularization_width_ry, edge_factor, weight_floor):
     omega_max = max((float(np.max(b.omega_abs)) for b in branches
                      if b.omega_abs.size), default=0.0)
@@ -117,14 +143,13 @@ def _geometry(branches, regularization_width_ry, edge_factor, weight_floor):
                              weight_floor)
         if eb is not None:
             excursion = max(excursion, -min(eb[0], 0.0))
-    crossing_edge = omega_max + float(edge_factor) * eta + excursion
-    selectors = {
-        "all": _selector(),
-        "shallow": _selector(a_hi=crossing_edge),
-        "deep": _selector(),
-    }
-    selectors["deep"][0] = crossing_edge
-    return omega_max, eta, crossing_edge, selectors
+    edges = sigma_pole_edges(branches, float(edge_factor) * eta, excursion)
+    selectors = {"all": _selector()}
+    for name, edge in edges.items():
+        selectors[f"shallow:{name}"] = _selector(a_hi=edge)
+        selectors[f"deep:{name}"] = _selector()
+        selectors[f"deep:{name}"][0] = edge
+    return omega_max, eta, edges, selectors
 
 
 def summarize_sigma_poles(
@@ -144,7 +169,7 @@ def summarize_sigma_poles(
     select poles against one support and windows against another.  All come
     from the single deck key in production.
     """
-    _omega_max, _eta, _crossing_edge, selectors = _geometry(
+    _omega_max, _eta, _edges, selectors = _geometry(
         branches, regularization_width_ry, edge_factor,
         _weight_floor(occupation_window_threshold))
     if B_poles.shape != Omega_poles.shape:
