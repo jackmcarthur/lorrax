@@ -1,7 +1,8 @@
 """Check the addition of frequency-weighted Σ(τ) matrices into Σ(ω).
 
-The tests cover updating every output frequency or only a requested subset,
-including consecutive, nonconsecutive, descending, and empty selections. The
+Each window runs as one executable (``integrate_window``). The tests cover
+updating every output frequency or only a requested subset, including
+consecutive, nonconsecutive, descending, and empty selections. The
 ordinary suite runs on one CPU device. The four-GPU run distributes the two
 band axes over a 2 by 2 processor mesh, so its anti-Hermitian completion also
 checks communication between band-matrix shards. Runtime measurements are
@@ -9,16 +10,12 @@ recorded separately in Run394.
 """
 from __future__ import annotations
 
-import re
-
 import jax
-import jax.numpy as jnp
 import numpy as np
 import pytest
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from common.collectives import device_put_process_local
-import gw.ppm_accumulators as ppm_accumulators
 from gw.ppm_accumulators import DeviceOmegaAccumulator
 
 
@@ -77,9 +74,18 @@ def _window_reference(*, omega, times, alpha, base, slope, omega_sign,
     return result
 
 
+def _affine(base, slope, t, _active_count):
+    """The τ kernel of the affine test window: Σ(t) = base + t·slope."""
+    return base + t * slope
+
+
+def _constant(sigma, _t, _active_count):
+    return sigma
+
+
 def _run_affine_window(mesh, *, omega_axis=0, indices=None,
                        omega_values=None, antihermitian=False,
-                       omega_sign=1.0, precompile=False):
+                       omega_sign=1.0, capacity=None):
     rng = np.random.default_rng(20260913 + omega_axis)
     omega = np.asarray([-1.1, -0.55, -0.1, 0.0, 0.23, 0.8, 1.4])
     times = np.asarray([
@@ -110,17 +116,11 @@ def _run_affine_window(mesh, *, omega_axis=0, indices=None,
     if indices is not None:
         kwargs = {"omega_indices": np.asarray(indices),
                   "omega_values": np.asarray(omega_values)}
-    acc.begin_window(
-        times, alpha, omega_sign=omega_sign, prefactor=-0.63,
+    acc.integrate_window(
+        _affine, (_put(base, sigma_sharding), _put(slope, sigma_sharding)),
+        times, alpha, n_active=len(times), active_count=None,
+        capacity=capacity or len(times), omega_sign=omega_sign, prefactor=-0.63,
         e_ref_sum=0.27, antihermitian=antihermitian, **kwargs)
-    if precompile:
-        assert acc.precompile_tau_add(
-            sigma_shape=sigma_shape, sigma_sharding=sigma_sharding) is True
-        assert acc.precompile_tau_add(
-            sigma_shape=sigma_shape, sigma_sharding=sigma_sharding) is False
-    for t in times:
-        acc.add_tau(_put(base + t * slope, sigma_sharding))
-    acc.end_window()
     got = _to_host(jax.block_until_ready(acc.finalize()))
     want = _window_reference(
         omega=omega, times=times, alpha=alpha, base=base, slope=slope,
@@ -163,25 +163,21 @@ def test_contiguous_antihermitian_completion_matches_numpy():
         rtol=4e-14, atol=4e-14)
 
 
-def test_descending_interval_preserves_order_via_general_index_path():
-    mesh = _mesh()
+def test_descending_interval_keeps_each_value_at_its_index():
     indices = np.asarray([4, 3, 2])
-    values = np.asarray([0.92, 0.57, 0.31])
     got, want = _run_affine_window(
-        mesh, indices=indices, omega_values=values)
+        _mesh(), indices=indices, omega_values=np.asarray([0.92, 0.57, 0.31]))
     np.testing.assert_allclose(got, want, rtol=3e-14, atol=3e-14)
-
-    sharding = NamedSharding(mesh, P(None, None, "x", "y"))
-    acc = DeviceOmegaAccumulator(
-        np.arange(7), shape=(7, 1, 4, 4), sharding=sharding, omega_axis=0)
-    acc.begin_window(
-        [0.2], [0.5], omega_sign=1.0, prefactor=1.0,
-        omega_indices=indices, omega_values=values)
-    assert acc._contiguous is False
 
 
 def test_full_negative_frequency_branch_matches_numpy():
     got, want = _run_affine_window(_mesh(), omega_sign=-1.0)
+    np.testing.assert_allclose(got, want, rtol=3e-14, atol=3e-14)
+
+
+def test_padded_capacity_nodes_add_nothing():
+    """Every window of a plan shares the capacity; padded nodes are never run."""
+    got, want = _run_affine_window(_mesh(), capacity=11)
     np.testing.assert_allclose(got, want, rtol=3e-14, atol=3e-14)
 
 
@@ -196,7 +192,7 @@ def test_general_active_antihermitian_crosses_band_shards():
     np.testing.assert_array_equal(got[:, inactive], 0.0)
 
 
-def test_empty_frequency_window_is_an_exact_noop():
+def test_empty_frequency_window_adds_exact_zero():
     mesh = _mesh()
     omega = np.asarray([-0.2, 0.0, 0.4])
     output_sharding = NamedSharding(mesh, P(None, None, "x", "y"))
@@ -204,16 +200,12 @@ def test_empty_frequency_window_is_an_exact_noop():
     acc = DeviceOmegaAccumulator(
         omega, shape=(3, 1, 4, 4), sharding=output_sharding, omega_axis=0)
     times = np.asarray([0.2 + 0.1j, 0.7 - 0.2j])
-    acc.begin_window(
-        times, np.asarray([0.4, -0.3j]), omega_sign=1.0, prefactor=0.7,
-        antihermitian=True, omega_indices=np.asarray([], np.int32),
+    acc.integrate_window(
+        _constant, (_put(np.full((1, 4, 4), 3.0 - 2.0j), sigma_sharding),),
+        times, np.asarray([0.4, -0.3j]), n_active=2, active_count=None,
+        capacity=2, omega_sign=1.0, prefactor=0.7, antihermitian=True,
+        omega_indices=np.asarray([], np.int32),
         omega_values=np.asarray([], np.float64))
-    assert acc.precompile_tau_add(
-        sigma_shape=(1, 4, 4), sigma_sharding=sigma_sharding) is False
-    poison = _put(np.full((1, 4, 4), np.nan + 1j * np.nan), sigma_sharding)
-    for _ in times:
-        acc.add_tau(poison)
-    acc.end_window()
     np.testing.assert_array_equal(
         _to_host(acc.finalize()), np.zeros((3, 1, 4, 4), np.complex128))
 
@@ -230,13 +222,11 @@ def test_scalar_updates_preserve_cancellation_sensitive_node_order():
     output_sharding = NamedSharding(mesh, P(None, None, "x", "y"))
     acc = DeviceOmegaAccumulator(
         omega, shape=(5, 1, 4, 4), sharding=output_sharding, omega_axis=0)
-    acc.begin_window(
-        times, alpha, omega_sign=1.0, prefactor=1.0,
+    acc.integrate_window(
+        _constant, (_put(sigma_np, sigma_sharding),), times, alpha,
+        n_active=len(times), active_count=None, capacity=len(times),
+        omega_sign=1.0, prefactor=1.0,
         omega_indices=indices, omega_values=np.asarray([0.9, 0.2, 0.8]))
-    sigma = _put(sigma_np, sigma_sharding)
-    for _ in times:
-        acc.add_tau(sigma)
-    acc.end_window()
     want = _window_reference(
         omega=omega, times=times, alpha=alpha, base=sigma_np,
         slope=np.zeros_like(sigma_np), omega_sign=1.0, prefactor=1.0,
@@ -245,98 +235,28 @@ def test_scalar_updates_preserve_cancellation_sensitive_node_order():
     np.testing.assert_array_equal(_to_host(acc.finalize()), want)
 
 
-@pytest.mark.parametrize("route", ["dense", "contiguous", "general", "anti"])
-def test_scalar_prewarm_accepts_each_shape_route(route):
-    kwargs = {}
-    if route == "contiguous":
-        kwargs = {"indices": np.asarray([2, 3, 4]),
-                  "omega_values": np.asarray([0.2, 0.4, 0.7])}
-    elif route == "general":
-        kwargs = {"indices": np.asarray([5, 1, 4]),
-                  "omega_values": np.asarray([0.8, 0.1, 0.6])}
-    elif route == "anti":
-        kwargs = {"indices": np.asarray([1, 2, 3]),
-                  "omega_values": np.asarray([0.1, 0.2, 0.3]),
-                  "antihermitian": True}
-    got, want = _run_affine_window(_mesh(), precompile=True, **kwargs)
-    np.testing.assert_allclose(got, want, rtol=4e-14, atol=4e-14)
-
-
-def test_explicit_ordered_full_frequency_set_selects_dense_fast_path():
-    mesh = _mesh()
-    omega = np.asarray([-0.5, 0.0, 0.4])
-    sharding = NamedSharding(mesh, P(None, None, "x", "y"))
-    acc = DeviceOmegaAccumulator(
-        omega, shape=(3, 1, 4, 4), sharding=sharding, omega_axis=0)
-    acc.begin_window(
-        [0.2], [0.5], omega_sign=1.0, prefactor=1.0,
-        omega_indices=np.arange(omega.size), omega_values=omega)
-    assert acc._indices is None
-    acc.add_tau(jnp.zeros((1, 4, 4), jnp.complex128))
-    acc.end_window()
-
-
-def test_active_frequency_input_and_lifecycle_guards():
+def test_active_frequency_and_node_count_guards():
     mesh = _mesh()
     omega = np.asarray([-0.2, 0.0, 0.4])
     sharding = NamedSharding(mesh, P(None, None, "x", "y"))
+    sigma = (_put(np.zeros((1, 4, 4), np.complex128),
+                  NamedSharding(mesh, P(None, "x", "y"))),)
 
-    def fresh():
-        return DeviceOmegaAccumulator(
-            omega, shape=(3, 1, 4, 4), sharding=sharding, omega_axis=0)
+    def run(**kwargs):
+        options = dict(n_active=1, active_count=None, capacity=1,
+                       omega_sign=1.0, prefactor=1.0)
+        options.update(kwargs)
+        DeviceOmegaAccumulator(
+            omega, shape=(3, 1, 4, 4), sharding=sharding, omega_axis=0
+        ).integrate_window(_constant, sigma, [0.2], [0.5], **options)
 
-    with pytest.raises(ValueError, match="distinct"):
-        fresh().begin_window(
-            [0.2], [0.5], omega_sign=1.0, prefactor=1.0,
-            omega_indices=[1, 1], omega_values=[0.0, 0.0])
     with pytest.raises(ValueError, match="invalid active frequency"):
-        fresh().begin_window(
-            [0.2], [0.5], omega_sign=1.0, prefactor=1.0,
-            omega_indices=[3], omega_values=[0.4])
+        run(omega_indices=[1, 1], omega_values=[0.0, 0.0])
     with pytest.raises(ValueError, match="invalid active frequency"):
-        fresh().begin_window(
-            [0.2], [0.5], omega_sign=1.0, prefactor=1.0,
-            omega_indices=[1, 2], omega_values=[0.0])
-    with pytest.raises(RuntimeError, match="no open"):
-        fresh().add_tau(jnp.zeros((1, 4, 4), jnp.complex128))
-
-    acc = fresh()
-    acc.begin_window([0.2], [0.5], omega_sign=1.0, prefactor=1.0)
-    with pytest.raises(RuntimeError, match="still open"):
-        acc.begin_window([0.2], [0.5], omega_sign=1.0, prefactor=1.0)
-    with pytest.raises(RuntimeError, match="before all tau nodes"):
-        acc.end_window()
-    with pytest.raises(RuntimeError, match="open frequency window"):
-        acc.finalize()
-
-
-@pytest.mark.parametrize("contiguous, expected_update", [
-    (True, "dynamic-update-slice"),
-    (False, "scatter"),
-])
-def test_active_scalar_hlo_uses_expected_update_and_alias(
-        contiguous, expected_update):
-    mesh = _mesh()
-    output_sharding = NamedSharding(mesh, P(None, None, "x", "y"))
-    sigma_sharding = NamedSharding(mesh, P(None, "x", "y"))
-    replicated = NamedSharding(mesh, P())
-    acc = _put(np.zeros((7, 1, 4, 4), np.complex128), output_sharding)
-    sigma = _put(np.ones((1, 4, 4), np.complex128), sigma_sharding)
-    coeff = _put(np.asarray([0.2, -0.3j, 0.7]), replicated)
-    indices = _put(
-        np.asarray([2, 3, 4] if contiguous else [5, 1, 4], np.int32),
-        replicated)
-    compiled = ppm_accumulators._device_active_omega_add(
-        output_sharding, 0, contiguous).lower(
-            acc, sigma, coeff, indices).compile()
-    hlo = compiled.as_text().lower()
-    assert expected_update in hlo
-    if contiguous:
-        assert not re.search(r"\bscatter(?:-start|-done)?\(", hlo)
-    for collective in (
-            "all-gather", "all-reduce", "reduce-scatter", "all-to-all",
-            "collective-permute"):
-        assert collective not in hlo
-    assert "input_output_alias" in hlo
-    local_bytes = int(acc.addressable_shards[0].data.nbytes)
-    assert int(compiled.memory_analysis().alias_size_in_bytes) >= local_bytes
+        run(omega_indices=[3], omega_values=[0.4])
+    with pytest.raises(ValueError, match="invalid active frequency"):
+        run(omega_indices=[1, 2], omega_values=[0.0])
+    with pytest.raises(ValueError, match="omega_values requires omega_indices"):
+        run(omega_values=[0.0])
+    with pytest.raises(ValueError, match="n_active"):
+        run(n_active=2)

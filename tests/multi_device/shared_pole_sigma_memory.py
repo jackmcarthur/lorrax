@@ -18,8 +18,7 @@ def main(rt):
     from common.grouped_layout import identity_square_grouped_shard_layout
     from common.collectives import device_put_process_local
     from gw.shared_pole_recipe import CapacityLedger
-    from gw.mpa.sigma import (_shared_pole_memory_schedule,_shared_pole_w_synthesis,
-                              _shared_pole_inherited_peak)
+    from gw.mpa.sigma import _shared_pole_memory_schedule,_shared_pole_w_synthesis
     import file_io.shared_pole_store as store
     p=argparse.ArgumentParser();p.add_argument('--output',type=Path,required=True);p.add_argument('--profile',action='store_true');a=p.parse_args();a.output.mkdir(exist_ok=True)
     mesh=rt.mesh;side=mesh.shape['x'];assert mesh.shape['y']==side and side in (2,4)
@@ -63,12 +62,18 @@ def main(rt):
         return original_peak(compiled)
     original=store.read_shared_pole_faces;store.read_shared_pole_faces=panel
     memory_owner.aot_kernel_peak_bytes=capture_peak
-    try:build=_shared_pole_w_synthesis(None,meta,header,freq,schedule,mesh_xy=mesh)
+    try:synthesis=_shared_pole_w_synthesis(None,meta,header,freq,schedule,mesh_xy=mesh)
     finally:
         store.read_shared_pole_faces=original
-        memory_owner.aot_kernel_peak_bytes=original_peak
     put=lambda x:device_put_process_local(np.asarray(x),NamedSharding(mesh,P()))
-    args=(None,None,put(np.arange(b,dtype=np.int32)),put(np.tile([0,np.inf,-np.inf,-np.inf,np.inf,np.inf],(b,1))),put(np.zeros(b,bool)),put(.6),put(.7+.2j))
+    # W(τ) as the window executable runs it: one traced program over the resident factors.
+    program=jax.jit(lambda ops,e,t:synthesis.w_kernel(*ops,e,t,False))
+    operands=synthesis.window_operands('cond',np.arange(b,dtype=np.int32),
+                                       np.tile([0,np.inf,-np.inf,-np.inf,np.inf,np.inf],(b,1)))
+    args=(operands,put(.6),put(.7+.2j))
+    try:capture_peak(program.lower(*args).compile())
+    finally:memory_owner.aot_kernel_peak_bytes=original_peak
+    build=lambda *a:program(*a)
     W=build(*args);W.block_until_ready()
     before=jax.local_devices()[0].memory_stats()
     if a.profile:
@@ -89,20 +94,12 @@ def main(rt):
             'Isolated real-shape planted W process, maximum JAX allocator peak over ranks; '
             'includes the one inherited output W, a conservative new-object bound; '
             'reader is on-device generator, spatial kernel is compiled only after this peak'))
-    # Compile the SAME full-k geometry through both inherited entry routes.
-    def abstract(shape,dtype,spec):return jax.ShapeDtypeStruct(shape,dtype,sharding=NamedSharding(mesh,spec))
-    x=abstract((Q,1,m,88),np.complex128,P(None,None,'x','y'))
-    y=abstract((Q,88,1,m),np.complex128,P(None,'x',None,'y'))
-    energy=abstract((Q,88),np.float64,P());scalar=abstract((),np.float64,P());tau=abstract((),np.complex128,P())
-    inherited=_shared_pole_inherited_peak((x,y,y,x,energy,energy,None,None,None,None,None,scalar,scalar,tau),meta,
-        mesh_xy=mesh,kgrid=(8,8,8),brackets=None,pack_brackets=False,
-        face_kwargs=dict(layout='face',face_shape=(Q,88,m,1),face_band_extent=88))
     report=dict(status='PASS',job_step=os.environ['SLURM_JOB_ID']+'.'+os.environ['SLURM_STEP_ID'],
         geometry=dict(Q=Q,n=n,m=m,K=K,parents=b,px=side,py=side),schedule=schedule,
         W_shape=list(W.shape),W_bytes_per_rank=output_bytes,device_memory=measured,synthesis_hlo=hlo_rows,
         device_peak_in_U=measured.get('peak_bytes_in_use',0)/ledger.U_bytes_per_rank,
-        inherited_sigma_peak=inherited,capacity=ledger.receipt(),
-        scope='Na dimensions, planted C, on-device reader surrogate; local W admission and actual allocator peak, full-k inherited compiler lower-bound comparison; not raw-parent/full-driver peak')
+        capacity=ledger.receipt(),
+        scope='Na dimensions, planted C, on-device reader surrogate; local W admission, the traced synthesis program's HLO (no collectives) and actual allocator peak; not raw-parent/full-driver peak')
     (a.output/f'receipt_rank{jax.process_index()}.json').write_text(json.dumps(report,indent=2)+'\n');print(json.dumps({k:report[k] for k in ('status','job_step','device_peak_in_U')}),flush=True)
 
 

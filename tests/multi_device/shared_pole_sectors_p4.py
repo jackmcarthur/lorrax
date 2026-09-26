@@ -660,8 +660,9 @@ def run_sigma_checks(mesh):
     import numpy as np
     import distrib_la
     from jax.sharding import NamedSharding, PartitionSpec as P
-    from gw.mpa.sigma import synthesize_shared_pole_parents, shared_pole_hole_kernel
-    from gw.ppm_tau_kernel import get_shared_sigma_tau_kernel
+    from gw.mpa.sigma import (SynthesisTau, WSynthesis, synthesize_shared_pole_parents,
+                              shared_pole_hole_kernel)
+    from gw.ppm_tau_kernel import _get_sigma_kij_kernel
     from gw.wavefunction_bundle import BandSlices, parent_sigma_operands, sigma_face_kernel_kwargs
     sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
     from multi_device.full_photon_head_sigma_gate import _bundle
@@ -702,19 +703,24 @@ def run_sigma_checks(mesh):
                                       mesh_xy=mesh,gemm=gemm)[0])
     hole=shared_pole_hole_kernel(mesh)
     minus=(-np.arange(nk))%nk
-    def build(space,_omega,_indices,_bounds,_phase,_ref,time,_count=None):
+    operands=(tuple(faces),put(minus.astype(np.int32)))
+    def w_kernel(faces,minus_q,_ref,time,valence):
+        # Operands, never closures: the window executable spans every process.
         w=sum(synth(*f,time) for f in faces)
-        return hole(w,put(minus.astype(np.int32))) if space=='val' else w
-    kernel=get_shared_sigma_tau_kernel(mesh_xy=mesh,kgrid=(nk,1,1),brackets=None,
-                                      w_synthesis=build,**sigma_face_kernel_kwargs(wfns))
+        return hole(w,minus_q) if valence else w
+    synthesis=WSynthesis(w_kernel,lambda _space,_indices,_bounds:operands,lambda:operands,
+                         lambda _result=None:None,0,('sector_tau_direct',),ordered=True)
+    sigma_kij=_get_sigma_kij_kernel(mesh_xy=mesh,kgrid=(nk,1,1),merged_x=True,brackets=None,
+                                    **sigma_face_kernel_kwargs(wfns))
+    body=SynthesisTau(sigma_kij,synthesis,yr,yn,0,'sector_tau_direct',None,
+                      ('sector_tau_direct',id(mesh)),(wfns.green_parent.plan,))
     time=.35-.2j
     errors={}
     for space in ('cond','val'):
         e=energy if space=='cond' else -energy
         weight=1-occ if space=='cond' else occ
-        actual=kernel(xn,yr,xr,yn,put(e),put(weight),space,None,
-            put(np.zeros(1,np.int32)),put(np.zeros((1,6))),put(np.zeros(1,bool)),
-            put(0.),put(0.),put(time))
+        arguments=body.window_arguments(xn,xr,put(e),put(weight),put(0.),put(0.),space,None,None)
+        actual=jax.jit(body.window_kernel(space))(*arguments,put(time),None)
         w=sum(np.einsum('qmp,p,qnp->qmn',c,np.exp(-1j*om*time)/(2*om),t.conj())
               for c,t,om in sectors)
         if space=='val': w=w[minus].swapaxes(-1,-2)

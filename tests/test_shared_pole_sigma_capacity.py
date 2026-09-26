@@ -36,7 +36,16 @@ def test_actual_panels_and_concurrency():
     assert b['parent_capacity']*b['column_capacity'] < a['parent_capacity']*a['column_capacity']
     assert b['peak_in_U'] <= 3
     assert b['capacity_receipt']['concurrent_with'] == ['sigma.inputs', 'sigma.spatial']
-    assert b['compiled_peak_status'] == 'NOT_MEASURED'
+    # The resident factors are priced once, whatever the panel size.
+    assert a['resident_factor_bytes_per_rank'] == b['resident_factor_bytes_per_rank'] > 0
+    assert b['capacity_receipt']['resident_bytes_per_rank'] == b['resident_factor_bytes_per_rank']
+
+
+def test_resident_refusal_names_bytes_budget_and_smallest_mesh():
+    meta, h, mesh = fixture(2.9)
+    with pytest.raises(MemoryError, match=r'resident shared-pole factors need \d+ B/rank.*'
+                                          r'against -?\d+ B/rank.*smallest square mesh.*P >= \d+'):
+        _shared_pole_memory_schedule(meta, h, mesh_xy=mesh)
 
 
 def test_minimum_refusal_is_ledger_row():

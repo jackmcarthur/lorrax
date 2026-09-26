@@ -48,14 +48,15 @@ def main(rt):
     oracle_helpers = runpy.run_path('tests/multi_device/shared_pole_dense_oracle.py')
     expected = oracle_helpers['full_q_operator'](C, weights, tables, ops)
     expected=meta.mu_basis.pack_host(meta.mu_basis.pack_host(expected,axis=1),axis=2)
-    args=(None,None,put(np.arange(3,dtype=np.int32),P()),
-          put(np.tile([1,4,-np.inf,-np.inf,np.inf,np.inf],(3,1)),P()),
-          put(np.ones(3),P()),put(np.asarray(.6),P()),put(np.asarray(.7+.2j),P()))
+    indices,bounds=np.arange(3,dtype=np.int32),np.tile([1,4,-np.inf,-np.inf,np.inf,np.inf],(3,1))
     with SlabIO(path,mode='r',mesh=mesh) as io:
-        build=_shared_pole_w_synthesis(io,meta,header,shared_pole_frequencies(poles,counts),forced,mesh_xy=mesh,layout="axis")
-        got=build(*args)
+        synthesis=_shared_pole_w_synthesis(io,meta,header,shared_pole_frequencies(poles,counts),forced,mesh_xy=mesh,layout="axis")
+        # W(τ) as the window executable runs it; forced panels route in the traced body.
+        got=jax.jit(lambda ops,e,t:synthesis.w_kernel(*ops,e,t,False))(
+            synthesis.window_operands('cond',indices,bounds),put(np.asarray(.6),P()),put(np.asarray(.7+.2j),P()))
         error=float(jax.numpy.max(jax.numpy.abs(got-put(expected,P(None,'x','y')))))
         assert error<1e-10,error
+        synthesis.close()
     report=dict(status='PASS',job_step=os.environ['SLURM_JOB_ID']+'.'+os.environ['SLURM_STEP_ID'],
         dense_error=error,default_nonlocal_refusal='PASS',packed_map=packed_perm.tolist(),
         route_cost=cost,scope='P4 real canonical reader and forced q1/K2 nonlocal action; scalar metadata tests',

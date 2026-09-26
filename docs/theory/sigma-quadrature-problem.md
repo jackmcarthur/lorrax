@@ -286,17 +286,18 @@ refusal on one rank travels as data and raises on every rank.
 
 ## 11. Execution
 
-- **Resident-pole route.** For each pole batch, each window is one executable
-  whose node loop runs on device and folds each Σ(τ_l) into the window's
-  frequencies; nothing returns to the host between nodes.
-- **Shared-pole and sector routes.** A host-driven builder synthesizes W(τ)
-  from the store's panels, and nodes are dispatched one at a time and
-  accumulated asynchronously.
+- **One executable per window.** Each window's node loop runs on device and
+  folds each Σ(τ_l) into the window's frequencies; nothing returns to the
+  host between nodes. The resident-pole route builds W(τ_l) from the pole
+  batch's residues.
+- **Shared-pole and sector routes.** The same window executable also
+  synthesizes W(τ_l) = b d(τ_l) b† from factors read once per Σ call: the
+  scalar route at the irreducible parents, then unfolded to the full q grid;
+  a sector from its endpoint factors on the full grid.
 - **Band brackets.** For band-convergence extrapolation, one W preparation per
   node is shared by one G build, convolution and projection per bracket.
 
-`LORRAX_SIGMA_TAU_TIMING=1` splits a node into its stages on the
-host-dispatched routes and is refused on the resident route.
+A per-stage split of a node is a `jax.profiler` trace of the window executable.
 `LORRAX_SIGMA_PLAN=panes` selects the pane planner of
 [the MPA page](THEORY_mpa_implementation.md#pane-planner) as a comparison control and is
 refused with the shared-pole W.

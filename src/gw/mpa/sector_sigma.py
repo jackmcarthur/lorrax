@@ -20,6 +20,7 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 from common.collectives import device_put_process_local
 from runtime.padding import ladder_extent, pad_to_axis, padded_axis
 from gw.wavefunction_bundle import parent_sigma_operands
+from .sigma import SynthesisTau, WSynthesis, _admit, _static_key
 
 
 def _native_workspace(mesh_xy, shapes):
@@ -29,18 +30,6 @@ def _native_workspace(mesh_xy, shapes):
                  backend='distributed',batched_route='auto')
     return max(workspace_bytes_per_rank(context,'gemm',(a,b),np.complex128)
                for a,b in shapes)
-
-
-def _admit(compiled,meta,stage,*,native=0,resident=0,counted=0):
-    """Reserve a compiled executable's peak; ``counted`` argument bytes are charged elsewhere."""
-    from runtime.aot_memory import aot_kernel_peak_bytes
-    peak=aot_kernel_peak_bytes(compiled)
-    if not peak.cufft_measured:
-        raise ValueError('GATE shared_pole_capacity: sector FFT workspace unavailable')
-    meta.shared_pole_capacity.reserve(stage,resident_bytes_per_rank=resident,
-        workspace_bytes_per_rank=max(0,peak.total-counted)+native,
-        concurrent_with=meta.shared_pole_capacity.live_stages)
-    return compiled
 
 
 _ADMIT_COMPILED = {}
@@ -68,20 +57,6 @@ def _admit_compiled(kernel,args,meta,stage,*,native=0,resident=0):
 # layout, symmetry tables by content), so a later map dispatches the same jit
 # objects and XLA compiles each program once per run.  Data (factors, poles,
 # intervals) always enters as an argument, never as a closure constant.
-
-def _static_key(value):
-    """Hashable content key of a small table tree (arrays by bytes digest)."""
-    import hashlib
-    if isinstance(value, dict):
-        return tuple(sorted((k, _static_key(v)) for k, v in value.items()))
-    if isinstance(value, (list, tuple)):
-        return tuple(_static_key(v) for v in value)
-    if isinstance(value, (np.ndarray, jax.Array)):
-        a = np.asarray(value)
-        return ('array', a.shape, a.dtype.str,
-                hashlib.sha256(np.ascontiguousarray(a).tobytes()).hexdigest())
-    return value
-
 
 _ENDPOINT_UNFOLD = {}
 
@@ -132,63 +107,6 @@ def _w_contraction(mesh_xy, grid, nk, mc, nt_n, kcarrier, layout):
         weights = _shared_pole_weights(omega, interval, ref, time)
         return _shared_pole_contract(x, y, weights, gemm=gemm, layout=layout)
     return kernel
-
-
-_SECTOR_TAU = {}
-
-
-class SectorTau:
-    """One sector's τ kernel for the window executable: W(τ) synthesis and Σ(τ) in one body.
-
-    ``window_kernel(space)`` is the traceable ``fn(*arguments, t, active_count)``
-    of :meth:`DeviceOmegaAccumulator.integrate_window` (one per branch space,
-    since the valence branch reads the q-negated factors); ``window_arguments``
-    swaps in the right endpoint's operands and the synthesis's per-window
-    operands.  Neither closes over a device buffer, so the accumulator's
-    runner cache retains no resident factors.
-    """
-
-    def __init__(self, spatial, synthesis, right_yr, right_proj, native, stage, meta, key, plans):
-        self._spatial, self._synthesis = spatial, synthesis
-        self._right = (right_yr, right_proj)
-        self._native, self._stage, self._meta = native, stage, meta
-        self._key, self._plans = key, plans
-        self._admitted = False
-
-    def window_kernel(self, space):
-        """The τ body for ``space``, one function object per static configuration.
-
-        The window runner is cached on this object, so returning the first
-        map's body for an equal configuration (same shapes, mesh, layout,
-        parent plans and W contraction) lets every later SC map dispatch the
-        compiled window executable instead of recompiling it.  The body
-        closes over no device buffer.
-        """
-        hole = space == 'val'
-        key = (self._key, self._synthesis.key, hole)
-        if key not in _SECTOR_TAU:
-            spatial, w_kernel = self._spatial, self._synthesis.w_kernel
-
-            def tau(xn, yr, xr, yn, energies, weight, w_operands, e_ref_a, e_ref_b, t, _active):
-                interactions = w_kernel(*w_operands, e_ref_b, t, hole)
-                return spatial(xn, yr, xr, yn, energies, weight, e_ref_a, t, interactions)
-            # The plans ride along so the ids in the key cannot be reused.
-            _SECTOR_TAU[key] = (self._plans, tau)
-        return _SECTOR_TAU[key][1]
-
-    def window_arguments(self, xn, xr, energies, weight, e_ref_a, e_ref_b, space, indices, bounds):
-        w_operands = self._synthesis.window_operands(space, indices, bounds)
-        return (xn, self._right[0], xr, self._right[1], energies, weight, w_operands,
-                e_ref_a, e_ref_b)
-
-    def admit(self, compiled, arguments):
-        """Reserve the first window executable; the resident factors are the synthesis's stage."""
-        if self._admitted:
-            return
-        counted = sum(int(x.addressable_shards[0].data.nbytes)
-                      for x in jax.tree.leaves(self._synthesis.resident_operands()))
-        _admit(compiled, self._meta, self._stage, native=self._native, counted=counted)
-        self._admitted = True
 
 
 def sector_tau_factory(left, right, keys, meta, mesh_xy):
@@ -251,7 +169,7 @@ def sector_tau_factory(left, right, keys, meta, mesh_xy):
         # keep the parent plans, so their identities are stable.
         key=(mesh_xy,a.layout,shapes,int(b),tuple(keys),tuple(int(v) for v in meta.kgrid),
              int(meta.nk_tot),id(plans[0]),id(plans[1]))
-        return SectorTau(spatial, synthesis, right_yr, right_proj,
+        return SynthesisTau(spatial, synthesis, right_yr, right_proj,
                          native+synthesis.native, f'sigma.sector.tau.{keys[0]}', meta, key, plans)
     return factory
 
@@ -308,9 +226,9 @@ def sector_synthesis(readers, headers, bases, families, frequencies, meta, mesh_
     shape=(nk,m*nc,n*nt)
     if not kmax:
         zero=_zeros(mesh_xy,shape)
-        return _SectorW(lambda _ref,_time,_hole:zero().reshape(nk,m,nc,n,nt),
-                        lambda _space,_indices,_bounds:(),lambda:(),lambda _result=None:None,0,
-                        ('zero',mesh_xy,shape,nc,nt))
+        return WSynthesis(lambda _ref,_time,_hole:zero().reshape(nk,m,nc,n,nt),
+                          lambda _space,_indices,_bounds:(),lambda:(),lambda _result=None:None,0,
+                          ('zero',mesh_xy,shape,nc,nt),ordered=True)
     # The store reader pads physical Kmax for both endpoint face shardings.
     # Keep that carrier through unfolding and GEMM; K and the interval bounds
     # remain physical, so the padded pole columns have identically zero weight.
@@ -386,7 +304,7 @@ def sector_synthesis(readers, headers, bases, families, frequencies, meta, mesh_
         capacity.live_stages=ambient
         raise
     try:
-        # The window runner inlines this contraction and SectorTau.admit
+        # The window runner inlines this contraction and SynthesisTau.admit
         # reserves the runner's peak plus this GEMM's native workspace; a
         # standalone AOT compile per hole would only repeat that work.
         kernel=_w_contraction(mesh_xy,tuple(left['grid']),nk,m*nc,n*nt,kcarrier,factor_layout)
@@ -415,27 +333,8 @@ def sector_synthesis(readers, headers, bases, families, frequencies, meta, mesh_
             b_x=b_y=poles=None
             capacity.live_stages=ambient
             closed=True
-    return _SectorW(w_kernel,window_operands,lambda:(b_x,b_y,poles),close,native,
-                    ('w',mesh_xy,tuple(left['grid']),nk,m,nc,n,nt,kcarrier,layout))
-
-
-class _SectorW:
-    """A sector's bound W(tau) synthesis: its kernel, per-window operands and lifetime.
-
-    ``w_kernel(*window_operands(space, indices, bounds), ref, time, hole)`` is
-    W(tau) as the four-current door's ``(nk, m, nc, n, nt)`` operand;
-    ``resident_operands()`` are the factors the synthesis stage already
-    charged; ``native`` is its GEMM's native workspace; ``close`` releases them.
-    """
-    ordered=True
-
-    def __init__(self,w_kernel,window_operands,resident_operands,close,native,key):
-        self.key=key
-        self.w_kernel=w_kernel
-        self.window_operands=window_operands
-        self.resident_operands=resident_operands
-        self.close=close
-        self.native=int(native)
+    return WSynthesis(w_kernel,window_operands,lambda:(b_x,b_y,poles),close,native,
+                      ('w',mesh_xy,tuple(left['grid']),nk,m,nc,n,nt,kcarrier,layout),ordered=True)
 
 
 def instantaneous_sector_sigma(handle, families, bases, meta, mesh_xy, *,

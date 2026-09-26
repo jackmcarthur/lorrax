@@ -804,8 +804,8 @@ class GWProductionReport:
         if any(r["name"].startswith(("bank.", "tau.")) for r in rows):
             self.emit("  bank real_time/laplace = incumbent G/FFT correlation plus bank coefficient carry;")
             self.emit("  these fused clocks are not FFT-only or evidence of a bandwidth limit.")
-            self.emit("  Sigma tau kernel other includes incumbent G/W convolution, projection and dispatch;")
-            self.emit("  W_synthesis is separately fenced. No pure-GEMM or pure-FFT wall is inferred.")
+            self.emit("  Sigma tau other is the window executables: W(tau) synthesis, G/W convolution,")
+            self.emit("  projection and frequency fold in one program. No pure-GEMM or pure-FFT wall is inferred.")
             self.emit("  device_wait drains preceding work; rank_wait measures process alignment.")
         if spole_rows:
             self.emit("  spole bands: fenced host walls; wait-before rows drain prior device/effect work,")
