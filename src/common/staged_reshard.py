@@ -171,6 +171,7 @@ head of each section of the gate file.
 """
 from __future__ import annotations
 
+from functools import lru_cache
 from typing import Callable
 
 import jax
@@ -489,11 +490,16 @@ def face_to_batch_reshard_supported(mesh: Mesh, shape, *,
             spec=P(None, None, 'y'), axis=2).carrier == n)
 
 
+@lru_cache(maxsize=None)
 def face_to_batch_reshard(mesh: Mesh, *,
                           axes: tuple[str, str] = ("x", "y"),
                           route: str = DEFAULT_ROUTE,
                           log_fn=None) -> Callable:
     """Factory: a ``shard_map``'d ``(B, M, N)`` face→batch reshard.
+
+    Memoized per (mesh, axes, route, log_fn): the returned kernel keeps its
+    per-shape programs, so a caller that asks again every SC map (the
+    shared-pole constructor) reuses them instead of recompiling.
 
     Parameters
     ----------
