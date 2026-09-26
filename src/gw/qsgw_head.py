@@ -18,6 +18,7 @@ from gw.degen_average import TOL_DEGENERACY_RY
 
 __all__ = [
     "DftVelocityHeadData",
+    "InterbandCommutatorHeadData",
     "IterationHeadResponse",
     "IterationHeadSamples",
     "ParallelTransportHeadData",
@@ -35,10 +36,12 @@ __all__ = [
     "static_head_wings_sharded",
     "head_samples_from_s",
     "metal_head_summary",
+    "interband_commutator_velocity",
     "finalize_iteration_head_sample",
     "finalize_iteration_head_samples",
     "load_dft_velocity_head",
     "load_dft_dipole_head",
+    "load_interband_commutator_head",
     "load_parallel_transport_head",
     "reduced_covector_to_cartesian",
     "rotate_velocity_active_to_qp",
@@ -904,6 +907,189 @@ def rotate_velocity_active_to_qp(velocity_cart, U_active, *, mesh: Mesh):
     if U_active.shape[-2] != na:
         raise ValueError("U_active must be square on its band axes")
     return _active_rotation_kernel(mesh, na)(velocity_cart, U_active)
+
+
+# ---------------------------------------------------------------------------
+# sc_head_update = interband_commutator: the QSGW head velocity without links
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class InterbandCommutatorHeadData:
+    r"""Head inputs of ``sc_head_update = interband_commutator``.
+
+    The exact DFT velocity stage of the ``get_dipole_mtxels
+    --parallel-transport-out`` artifact (the same read as
+    :class:`DftVelocityHeadData`), authenticated to carry the nonlocal
+    commutator.  Each map adds :func:`interband_commutator_velocity` to it.
+    No links are read, so no k axis needs a stencil.  ``forward_links`` is
+    pinned at ``None`` so the shared head builder takes its no-link path.
+    """
+
+    velocity_dft_cart: jax.Array
+    nb_logical: int
+    reciprocal_lattice_cart: np.ndarray
+    forward_links: None = None
+    forward_neighbors: None = None
+    validation: None = None
+
+
+def load_interband_commutator_head(
+    path: str, *, mesh: Mesh, wfn, meta, config,
+) -> InterbandCommutatorHeadData:
+    """Load the DFT velocity stage and refuse a velocity without V_NL.
+
+    ``W = v/(E_m - E_l)`` is the interband position operator only when
+    ``v = i[H, r]`` for the SAME ``H`` whose energies divide it, so the
+    velocity must carry ``i[V_NL, r]``.  The producer stamps that as
+    ``vnl_included``; a p-only artifact (``--skip-vnl``) or one that predates
+    the stamp refuses here.  Every other provenance check is
+    :func:`load_dft_velocity_head`'s.
+    """
+    from file_io.slab_io import SlabIO
+
+    with SlabIO(path, mode="r", mesh=mesh) as io:
+        try:
+            vnl_included = int(io.read_small("vnl_included", dtype=np.int32))
+        except (KeyError, RuntimeError, OSError, ValueError) as exc:
+            vnl_included = None
+            detail = f"{type(exc).__name__}: {exc}"
+    if vnl_included != 1:
+        got = ("no vnl_included stamp (" + detail + ")"
+               if vnl_included is None else f"vnl_included = {vnl_included}")
+        raise ValueError(
+            "GATE sc_head_interband_commutator_velocity_operator: "
+            f"{path}: {got}.\n"
+            "  want: the full DFT velocity v = p + i[V_NL, r] (+ SOC), "
+            "stamped vnl_included = 1\n"
+            "  fix:  regenerate with get_dipole_mtxels "
+            "--parallel-transport-out <file> --parallel-transport-velocity-only "
+            "(without --skip-vnl)\n"
+            "  why:  r_ml = -i v_ml/(E_m - E_l) holds only for the velocity of "
+            "the Hamiltonian whose energies divide it; p alone is off by the "
+            "nonlocal commutator\n"
+            "  doc:  docs/self_consistency.md, 'Interband-commutator head'")
+    base = load_dft_velocity_head(
+        path, mesh=mesh, wfn=wfn, meta=meta, config=config)
+    return InterbandCommutatorHeadData(
+        velocity_dft_cart=base.velocity_dft_cart,
+        nb_logical=int(base.nb_logical),
+        reciprocal_lattice_cart=base.reciprocal_lattice_cart,
+    )
+
+
+def _interband_commutator_kernel(
+    mesh: Mesh, *, nb_logical: int, nb_active: int, n_occ: int,
+) -> Callable:
+    from common.parallel_transport import make_distributed_band_matmul
+    from gw.degen_average import TOL_DEGENERACY_RY
+
+    key = ("interband_commutator", id(mesh), int(nb_logical),
+           int(nb_active), int(n_occ))
+    hit = _KERNEL_CACHE.get(key)
+    if hit is not None:
+        return hit
+    _mesh_xy(mesh)
+    multiply = make_distributed_band_matmul(mesh, n_batch_axes=2)
+    out_sharding = NamedSharding(mesh, P(None, None, "x", "y"))
+    tile_sharding = NamedSharding(mesh, P(None, "x", "y"))
+    na, nbl, nv = int(nb_active), int(nb_logical), int(n_occ)
+    tol = float(TOL_DEGENERACY_RY)
+
+    @jax.jit
+    def _kernel(v, delta_active, tail_diagonal, e_dft):
+        nbs = int(v.shape[-1])
+        band = jnp.arange(nbs)
+        live = band < nbl
+        de = jax.lax.with_sharding_constraint(
+            e_dft[:, :, None] - e_dft[:, None, :], tile_sharding)
+        pair = live[:, None] & live[None, :] & (band[:, None] != band[None, :])
+        keep = pair[None] & (jnp.abs(de) > tol)
+        W = jnp.where(keep[None], v / jnp.where(keep, de, 1.0)[None],
+                      jnp.zeros((), dtype=v.dtype))
+        W = jax.lax.with_sharding_constraint(W, out_sharding)
+        # [DeltaH, W] with DeltaH = active block (+) diagonal tail.
+        t = jnp.where(band[None, :] >= na, tail_diagonal, 0.0)
+        C = (t[None, :, :, None] - t[None, :, None, :]) * W
+        A = jnp.broadcast_to(delta_active[None], (3,) + delta_active.shape)
+        C = C.at[:, :, :na, :].add(multiply(A, W[:, :, :na, :]))
+        C = C.at[:, :, :, :na].add(-multiply(W[:, :, :, :na], A))
+        C = jax.lax.with_sharding_constraint(C, out_sharding)
+        vc = (band[:, None] < nv) & (band[None, :] >= nv) & live[None, :]
+        vc = vc[None, None]
+        num = jnp.sum(jnp.where(vc, jnp.abs(C) ** 2, 0.0), axis=(1, 2, 3))
+        den = jnp.sum(jnp.where(vc, jnp.abs(v) ** 2, 0.0), axis=(1, 2, 3))
+        excluded = jnp.sum(pair[None] & ~keep)
+        min_kept = jnp.min(jnp.where(keep, jnp.abs(de), jnp.inf))
+        return (jax.lax.with_sharding_constraint(v + C, out_sharding),
+                (num, den, excluded, min_kept))
+
+    _KERNEL_CACHE[key] = _kernel
+    return _kernel
+
+
+def interband_commutator_velocity(
+    velocity_dft_cart,
+    delta_h_active,
+    tail_diagonal,
+    energies_dft_kn_ry,
+    *,
+    nb_logical: int,
+    n_occ: int,
+    mesh: Mesh,
+):
+    r"""QSGW head velocity ``v + [DeltaH, W]`` in the DFT basis, no links.
+
+    ``W_ml = v_ml/(E_m - E_l)`` is ``i r_ml``, the interband position
+    operator of the DFT Hamiltonian, so ``[H_DFT, W] = v`` off the diagonal
+    and ``-i[r, DeltaH] = [DeltaH, W]``.  Blount's decomposition of the
+    covariant derivative, ``D DeltaH = -i[A^inter, DeltaH] + D^intra DeltaH``,
+    shows what this drops: the valence-conduction block of the dropped
+    ``D^intra DeltaH`` holds only the cross-gap block ``DeltaH_VC``.  The
+    head is therefore exact for any ``DeltaH`` that does not mix valence and
+    conduction (a band-diagonal ``DeltaH`` gives the renormalized velocity
+    ``v_mn (E^QP_m - E^QP_n)/(E_m - E_n)``), and its error is first order in
+    the cross-gap mixing.  No sum over states is truncated: ``DeltaH`` is
+    the active block plus a diagonal tail, so every ``W`` element it meets
+    is inside the head manifold.
+
+    Degenerate manifolds: pairs with ``|E_m - E_l| <= TOL_DEGENERACY_RY``
+    (``gw.degen_average``, 1e-6 Ry) and the diagonal are EXCLUDED.  Their
+    connection is gauge-dependent and pairs with the k derivative of
+    ``DeltaH`` that no stencil-free route forms; it is zero when ``DeltaH``
+    is constant on the multiplet.
+
+    Shapes: ``velocity_dft_cart`` (3, nk, nb_s, nb_s) ``P(None, None, x, y)``;
+    ``delta_h_active`` (nk, na, na); ``tail_diagonal`` and
+    ``energies_dft_kn_ry`` (nk, nb_s), Ry.  Work O(3 nk na^2 nb_s); peak
+    transients three velocity-sized arrays (v, W, the correction), each
+    ``3 nk nb_s^2 16 B / P`` per rank.
+
+    Returns ``(velocity, stats)``; ``stats`` holds, per Cartesian axis, the
+    valence-conduction sums ``|[DeltaH, W]_vc|^2`` and ``|v_vc|^2``, the count
+    of excluded degenerate pairs, and the smallest kept ``|E_m - E_l|``.
+    """
+    v = jnp.asarray(velocity_dft_cart, dtype=jnp.complex128)
+    delta = jnp.asarray(delta_h_active, dtype=jnp.complex128)
+    tail = jnp.asarray(tail_diagonal, dtype=jnp.float64)
+    e = jnp.asarray(energies_dft_kn_ry, dtype=jnp.float64)
+    if v.ndim != 4 or int(v.shape[0]) != 3 or v.shape[-1] != v.shape[-2]:
+        raise ValueError(f"velocity must be (3,nk,nb,nb); got {v.shape}")
+    nk, nbs = int(v.shape[1]), int(v.shape[-1])
+    if delta.ndim != 3 or delta.shape[0] != nk or delta.shape[1] != delta.shape[2]:
+        raise ValueError(f"delta_h_active must be (nk,na,na); got {delta.shape}")
+    na = int(delta.shape[-1])
+    if tail.shape != (nk, nbs) or e.shape != (nk, nbs):
+        raise ValueError(
+            f"tail/energies must be ({nk},{nbs}); got {tail.shape}/{e.shape}")
+    if not (0 < int(n_occ) < int(nb_logical) <= nbs and na <= nbs):
+        raise ValueError(
+            "interband commutator head needs 0 < n_occ < nb_logical <= "
+            f"nb_storage and na <= nb_storage; got n_occ={n_occ}, "
+            f"nb_logical={nb_logical}, nb_storage={nbs}, na={na}")
+    return _interband_commutator_kernel(
+        mesh, nb_logical=int(nb_logical), nb_active=na, n_occ=int(n_occ),
+    )(v, delta, tail, e)
 
 
 def _assemble_kernel(mesh: Mesh, nb_storage: int) -> Callable:
