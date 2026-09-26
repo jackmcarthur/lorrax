@@ -39,7 +39,7 @@ object). `from wfn_loader.loader import …` fails `tests/test_layering.py`, and
 | `release_read_staging()` | Close the collective read handle, freeing its host staging buffer (about ψ(G)/P per rank after the parent read). |
 | `close()`, context manager | Releases both file handles and propagates close failures; only destructor cleanup suppresses them, with a diagnostic. |
 | header surface, `path`, `kpt_starts` | The `MfHeader` fields (`nkpts`, `nbands`, `nspinor`, `kgrid`, `fft_grid`, `bvec`, `sym_matrices`, `translations`, …) and derived `nelec`, `vbm`, `cbm`, `efermi`, `atom_crys`. |
-| `get_gvec_nk(ik)` | Unpadded `(ngk, 3)` G list of one k; its one caller is `gw.compute_vcoul_0d`. |
+| `get_gvec_nk(ik)` | Unpadded `(ngk, 3)` G list of one k, read from the raw slab without the padding logic; no `src` caller (a test oracle and `scripts/checks` use it). |
 | `WfnProvenance`, `read_wfn_provenance(path)` | Header-only identity and occupation view; no G or ψ payload. |
 | `uniform_band_windows(b_lo, b_hi, width)` | Fixed-width `(lo, mask)` windows covering a band range once; the last window overlaps and its 0/1 mask removes the overlap, so every consumer compiles one FFT shape. |
 

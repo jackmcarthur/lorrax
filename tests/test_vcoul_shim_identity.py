@@ -24,7 +24,6 @@ def test_function_reexports_are_the_door_objects():
     import importlib
 
     import gw.compute_vcoul as gcv
-    import gw.compute_vcoul_0d as gcv0
     import gw.vcoul as gv
     import gw.coulomb.base as gcb
     # file_io/__init__ re-exports the FUNCTION read_bgw_vcoul, shadowing
@@ -38,8 +37,6 @@ def test_function_reexports_are_the_door_objects():
     assert gcb.minibz_inscribed_sphere_r2 is vcoul.minibz_inscribed_sphere_r2
     assert gcb.minibz_average is vcoul.minibz_average
     assert gcb._minibz_kernel_bare is vcoul._minibz_kernel_bare
-    assert gcv0.compute_vcoul_box is vcoul.compute_vcoul_box
-    assert gcv0._round_up_fft_size is vcoul._round_up_fft_size
     assert frb.read_bgw_vcoul is vcoul.read_bgw_vcoul
     assert frb.fill_v_grid_for_q is vcoul.fill_v_grid_for_q
     assert frb.BGWVcoulTable is vcoul.BGWVcoulTable
