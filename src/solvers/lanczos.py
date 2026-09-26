@@ -5,10 +5,9 @@ Finds the lowest n_eig eigenvalues of a Hermitian operator H given only
 a callable matvec.  No physics knowledge — works for any Hermitian
 eigenproblem.
 
-Five variants:
+Four variants:
   - simple_lanczos_eig:              Python-loop, full reorthogonalization
   - lanczos_eig_jit:                 lax.fori_loop, partial reorth (JIT-able)
-  - block_lanczos_eig:               Block Lanczos, Python loop, shaped vectors
   - block_lanczos_eig_jit:           Block Lanczos in lax.fori_loop
   - block_lanczos_eig_jit_converged: as above, Ritz-stability exit
 
@@ -893,131 +892,6 @@ def _mask_inactive_tail(T, n_active: int):
     return T + jnp.diag(mask).astype(T.dtype)
 
 
-def block_lanczos_eig(
-    matvec: Callable[[jax.Array], jax.Array],
-    shape: tuple[int, ...],
-    n_eig: int = 20,
-    block_size: int = 4,
-    max_iter: int = 50,
-    tol: float = 1e-8,
-    seed: int = 42,
-) -> tuple[jax.Array, jax.Array]:
-    """Block Lanczos for lowest eigenvalues of a Hermitian operator.
-
-    Parameters
-    ----------
-    matvec : (block_size, *shape) -> (block_size, *shape)
-        Hermitian matvec operating on a block of vectors.
-    shape : tuple
-        Shape of a single state vector.
-    n_eig : int
-        Number of lowest eigenvalues to compute.
-    block_size : int
-        Number of vectors per Lanczos block.
-    max_iter : int
-        Maximum number of block iterations.
-    tol : float
-        Convergence tolerance on beta norm.
-    seed : int
-        Random seed for initial vectors.
-
-    Returns
-    -------
-    eigenvalues : (n_eig,)
-    eigenvectors : (n_eig, *shape)
-    """
-    n_flat = int(np.prod(shape))
-    key = jax.random.PRNGKey(seed)
-
-    k1, k2 = jax.random.split(key)
-    Q0 = jax.random.normal(k1, (block_size, *shape), dtype=jnp.float64)
-    Q0 = Q0 + 1j * jax.random.normal(k2, (block_size, *shape), dtype=jnp.float64)
-
-    Q0_flat = Q0.reshape(block_size, n_flat)
-    Q0_flat, _ = jnp.linalg.qr(Q0_flat.T)
-    Q0_flat = Q0_flat.T
-
-    Q_blocks = [Q0_flat]
-    alpha_blocks = []
-    beta_blocks = []
-
-    Q_current = Q0_flat.reshape(block_size, *shape)
-
-    for j in range(max_iter):
-        Z = matvec(Q_current)
-        Z_flat = Z.reshape(block_size, n_flat)
-        Q_current_flat = Q_current.reshape(block_size, n_flat)
-
-        alpha_j = Q_current_flat.conj() @ Z_flat.T
-        alpha_blocks.append(alpha_j)
-
-        Z_flat = Z_flat - alpha_j.T @ Q_current_flat
-        if j > 0:
-            Q_prev_flat = Q_blocks[-2]
-            Z_flat = Z_flat - beta_blocks[-1].T @ Q_prev_flat
-
-        for Q_old in Q_blocks:
-            proj = Z_flat @ Q_old.conj().T
-            Z_flat = Z_flat - proj @ Q_old
-
-        Z_flat_T, R = jnp.linalg.qr(Z_flat.T)
-        # P1: beta_j = R (NOT R.T).  With Z_col = Z_flat.T = Q R, the block
-        # recurrence residual is Z = Q_{j+1} R, so the sub-diagonal block of T is
-        # exactly R and the super-diagonal is R^H.  The old ``R.T`` transposed
-        # both off-diagonal blocks (they came out conj(R)/R.T instead of R/R^H),
-        # which the final (T+T^H)/2 masked for eigenVALUES but corrupted the
-        # T->Q_all mapping used for eigenVECTORS (solver_program P1).
-        beta_j = R
-        beta_blocks.append(beta_j)
-
-        beta_norm = jnp.linalg.norm(beta_j)
-        if beta_norm < tol * block_size:
-            print(f"Block Lanczos converged at iteration {j+1}")
-            break
-
-        Q_next_flat = Z_flat_T.T
-        Q_blocks.append(Q_next_flat)
-        Q_current = Q_next_flat.reshape(block_size, *shape)
-
-    # α-Hermiticity gate.  ``alpha_j = Q_jᴴ H Q_j`` is a Hermitian Gram block
-    # for any Q_j; the (T + Tᴴ)/2 below would silently absorb any violation.
-    # This path is eager, so ``check_hermitian`` applies verbatim to the tiny
-    # (n_blocks, bs, bs) stack — no callback needed.
-    from common import sanity
-    sanity.check_hermitian(
-        "block_lanczos_eig alpha (Hermitian form Q^H H Q)",
-        jnp.stack(alpha_blocks), rtol=ALPHA_HERM_RTOL)
-
-    n_blocks = len(alpha_blocks)
-    T_size = n_blocks * block_size
-    T = jnp.zeros((T_size, T_size), dtype=jnp.complex128)
-
-    for i, alpha in enumerate(alpha_blocks):
-        start = i * block_size
-        end = (i + 1) * block_size
-        T = T.at[start:end, start:end].set(alpha)
-
-        if i < len(beta_blocks) - 1:
-            beta = beta_blocks[i]
-            T = T.at[end:end + block_size, start:end].set(beta)
-            T = T.at[start:end, end:end + block_size].set(beta.conj().T)
-
-    T = (T + T.conj().T) / 2
-
-    evals_T, vecs_T = jnp.linalg.eigh(T)
-    idx = jnp.argsort(evals_T.real)[:n_eig]
-    eigenvalues = evals_T[idx].real
-
-    Q_all = jnp.concatenate(Q_blocks[:n_blocks], axis=0)
-    eigenvectors_flat = vecs_T[:, idx].T @ Q_all
-    eigenvectors = eigenvectors_flat.reshape(n_eig, *shape)
-
-    norms = jnp.linalg.norm(eigenvectors.reshape(n_eig, -1), axis=1, keepdims=True)
-    eigenvectors = eigenvectors / norms.reshape(n_eig, *([1] * len(shape)))
-
-    return eigenvalues, eigenvectors
-
-
 def simple_lanczos_eig(
     matvec: Callable[[jax.Array], jax.Array],
     n: int,
@@ -1312,8 +1186,8 @@ def block_lanczos_eig_jit(
 ) -> tuple[jax.Array, jax.Array]:
     """JIT-compiled block Lanczos using ``lax.fori_loop``.
 
-    Same algorithm as :func:`block_lanczos_eig`, but all state lives in
-    pre-allocated arrays so the body fits in ``lax.fori_loop`` and the
+    Block Lanczos with all state in pre-allocated arrays, so the body fits
+    in ``lax.fori_loop`` and the
     caller's outer jit can fuse this with the matvec.  The matvec
     operates on a *block* of trial vectors
 
