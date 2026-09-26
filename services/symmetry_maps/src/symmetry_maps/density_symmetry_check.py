@@ -792,18 +792,19 @@ def _write_stamp(identity: dict | None,
     if identity is None or not _is_measured(report):
         return None
     path = _stamp_path(identity)
-    record = {"identity": identity, "measured": True,
-              "written_unix": time.time(),
-              "report": _report_to_json(report)}
     tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     try:
+        text = json.dumps({"identity": identity, "measured": True,
+                           "written_unix": time.time(),
+                           "report": _report_to_json(report)},
+                          sort_keys=True)
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(tmp, "w", encoding="utf-8") as handle:
-            json.dump(record, handle, sort_keys=True)
+            handle.write(text)
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(tmp, path)
-    except OSError as exc:
+    except (OSError, TypeError, ValueError) as exc:
         warnings.warn(f"2c-TRS stamp not written at {path}: {exc!r}",
                       RuntimeWarning)
         try:
