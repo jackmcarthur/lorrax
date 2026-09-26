@@ -440,8 +440,7 @@ def prepare_mesh(mesh=None, *, axis_names=("x", "y"), print_fn=print):
     ``runtime.nccl_warmup``, and under
     ``JAX_CPU_COLLECTIVES_IMPLEMENTATION=mpi`` its mesh gets clique-warmed
     *incidentally*, by whichever physics kernel fires a collective first
-    (``common/zeta_projection.py:422,511,547,596,864``;
-    ``common/contract_bands.py:542``).  That works only while those early
+    (``common/zeta_projection.py``, ``common/contract_bands.py``).  That works only while those early
     programs stay small enough for XLA's SEQUENTIAL thunk executor; a larger
     one takes the parallel executor and lands on the very refusal that killed
     the BSE TDA Lanczos outright (32 refusals at P=16, gate 7881216).  A
