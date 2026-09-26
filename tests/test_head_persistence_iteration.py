@@ -180,7 +180,10 @@ def test_the_final_qsgw_map_threads_its_head_to_the_writer():
         node.target.id for node in screening_payload.body
         if isinstance(node, ast.AnnAssign)
         and isinstance(node.target, ast.Name)}
-    assert payload_fields == {"static_w", "iteration_head", "static_head_terms"}
+    # shared_pole: the final map's model, evaluated at omega = 0 for W0;
+    # qsgw_velocity: the interband-commutator head's dipole_qsgw.h5 operands.
+    assert payload_fields == {"static_w", "iteration_head", "static_head_terms",
+                              "shared_pole", "qsgw_velocity"}
     assert any(
         isinstance(node, ast.AnnAssign)
         and getattr(node.target, "id", None) == "screening"

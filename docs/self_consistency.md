@@ -107,6 +107,20 @@ The velocity artifact must stamp `vnl_included = 1`
 (`GATE sc_head_interband_commutator_velocity_operator`). The kernel is
 `qsgw_head.interband_commutator_velocity`.
 
+**QSGW dipoles.** On this head the driver writes the accepted final map's
+$U^\dagger(v + [\Delta H, W])\,U$, with the QP energies of the same states, to
+`dipole_qsgw.h5` beside the deck (`qsgw_head.write_qsgw_dipole`, the
+`dipole.h5` layout). Its states are the ones the map's $W$ and the final
+`WFN_qp.h5` are built from. The absorption consumers read it through
+`load_dipole_h5` and form $d_{cv} = v_{cv}/(E_c - E_v)$, which is then
+$(U^\dagger r^{VC} U)_{cv}$ with the collapsed-axis $Z_a$ in place of
+$r^{VC}$: the QSGW term $-i[r^{VC},\Delta H]$ is included; the intraband
+$D^{\rm class}\Delta H$ is not. With a band-diagonal $\Delta H$ the position
+form equals the DFT one, and the whole QSGW change of $|d|^2$ is the mixing
+$U$ (the velocity form scales by the QP-to-DFT transition-energy ratio). A
+BSE on the self-consistent restart uses its DFT parent $\psi$ with `--eqp`
+energies, so it takes these dipoles at the same diagonal approximation.
+
 ## 2 Band treatment
 
 | bands | block of $H'$ |
