@@ -1080,7 +1080,9 @@ _DEFAULTS = {
     # every historical deck and makes a missing/stale artifact a refusal.
     # ``dft_velocity`` runs the same head chain on the artifact's exact DFT
     # p-matrix velocity stage only, without the links.
-    "sc_head_update": "off",       # off | parallel_transport | dft_velocity
+    # ``interband_commutator`` (insulators) adds [DeltaH, W] to that
+    # velocity, W_ml = v_ml/(E_m - E_l): no links, any k grid.
+    "sc_head_update": "off",       # off | parallel_transport | dft_velocity | interband_commutator
     "parallel_transport_file": "parallel_transport.h5",
     # Optional Hall (Chern-Simons) artifact for the packed static photon
     # Gamma-cell completion.  EMPTY BY DEFAULT (lane J section 2, item 9):
@@ -4204,6 +4206,14 @@ class MPAConfig:
 #: dispatch cannot disagree about what "a metal head mode" is.
 METAL_HEAD_UPDATES = ("parallel_transport", "dft_velocity")
 
+#: Head rebuilds that are defined only across a gap.  ``interband_commutator``
+#: forms the QSGW velocity from interband position elements alone and has no
+#: intraband (Drude) term; ``validate_material_inputs`` refuses it on a metal.
+INSULATOR_HEAD_UPDATES = ("interband_commutator",)
+
+#: Every ``sc_head_update`` value that rebuilds the head each map.
+HEAD_UPDATES = METAL_HEAD_UPDATES + INSULATOR_HEAD_UPDATES
+
 
 def uses_metal_direct_drude_head(config) -> bool:
     """Admit the live direct charge head on an ordered shared-pole metal."""
@@ -4231,9 +4241,11 @@ class SCConfig:
     frozen_core_bands: int = 0
     buffer_mode: str = "diagonal"
     eigh: str = "auto"    # "auto" | "native" | "distributed"
-    #: "off" | "parallel_transport" | "dft_velocity".  Both non-off modes
-    #: rebuild the head. Only ``dft_velocity`` with an ordered shared-pole
-    #: direct head is admitted on a metal; see ``uses_metal_direct_drude_head``.
+    #: "off" | "parallel_transport" | "dft_velocity" | "interband_commutator".
+    #: Every non-off mode rebuilds the head. Only ``dft_velocity`` with an
+    #: ordered shared-pole direct head is admitted on a metal; see
+    #: ``uses_metal_direct_drude_head``.  ``interband_commutator`` is
+    #: insulator-only.
     head_update: str = "off"
     #: Explicit seed-only ``qp_wfn_rotations.h5`` for a new SC run.  Empty
     #: means the canonical diagonal DFT seed.  This is not nonlinear restart.
@@ -4300,10 +4312,10 @@ class SCConfig:
             raise ValueError(
                 f"sc_eigh must be 'auto', 'native' or 'distributed'; "
                 f"got {self.eigh!r}.")
-        if self.head_update not in ("off",) + METAL_HEAD_UPDATES:
+        if self.head_update not in ("off",) + HEAD_UPDATES:
             raise ValueError(
                 "sc_head_update must be 'off', "
-                + " or ".join(repr(v) for v in METAL_HEAD_UPDATES)
+                + " or ".join(repr(v) for v in HEAD_UPDATES)
                 + f"; got {self.head_update!r}.")
 
 
@@ -4446,6 +4458,22 @@ def validate_material_inputs(config, material_class):
                 f"identify a metal, but compute_mode={config.compute_mode.value}; "
                 "use compute_mode=mpa for screened GW or "
                 "compute_mode=x_only for bare exchange.")
+        if config.sc.head_update in INSULATOR_HEAD_UPDATES:
+            raise ValueError(
+                "GATE sc_head_interband_commutator_insulator_only: WFN "
+                "occupations identify a metal, and sc_head_update = "
+                f"{config.sc.head_update} is defined only across a gap.\n"
+                "  got:  fractional occupations with the interband-commutator "
+                "head\n"
+                "  want: an insulator, or sc_head_update = off / "
+                "dft_velocity (shared_pole + no_local_fields direct Drude "
+                "head) on a metal\n"
+                "  why:  the route builds the QSGW velocity from interband "
+                "position elements r_ml = -i v_ml/(E_m - E_l) only; the "
+                "intraband change d_k DeltaH_nn that the Fermi-surface "
+                "(Drude) term needs has no stencil-free form\n"
+                "  doc:  docs/self_consistency.md, 'Interband-commutator "
+                "head'")
         if (config.sc.head_update in METAL_HEAD_UPDATES
                 and not uses_metal_direct_drude_head(config)):
             raise ValueError(

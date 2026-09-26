@@ -55,6 +55,38 @@ wedge. The full BZ exists only inside a map, while the k-grid FFT builds Σ.
 One seam at the map boundary selects the retained result together with its
 defining $U$.
 
+### Interband-commutator head {#interband-commutator-head}
+
+A head update (`sc_head_update`) rebuilds the $q \to 0$ head each map from the
+QP velocity $v^{\rm QP} = U^\dagger (v + D\Delta H)\,U$. Here $v$ is the DFT
+velocity $p + i[V_{\rm NL}, r]$ (plus SOC), $\Delta H = H - \mathrm{diag}(E^{\rm DFT})$,
+and $D$ is the covariant $k$ derivative. `parallel_transport` forms $D\Delta H$
+from finite links and needs a derivative rule on every $k$ axis.
+`interband_commutator` forms it without links, on any grid:
+
+$$
+D\Delta H \approx [\Delta H, W], \qquad
+W_{ml} = \frac{v_{ml}}{E_m - E_l} \quad (m \ne l,\ |E_m - E_l| > 10^{-6}\,{\rm Ry}).
+$$
+
+$W = i\,r^{\rm inter}$, so $[H^{\rm DFT}, W] = v$ off the diagonal. Blount's
+decomposition $D\Delta H = -i[A^{\rm inter}, \Delta H] + D^{\rm intra}\Delta H$
+shows what is dropped. The valence–conduction block of $D^{\rm intra}\Delta H$
+holds only the cross-gap block $\Delta H_{VC}$. So the head is exact for any
+$\Delta H$ that does not mix valence and conduction; a band-diagonal $\Delta H$
+gives $v_{mn}(E^{\rm QP}_m - E^{\rm QP}_n)/(E_m - E_n)$. Its error is first order
+in the cross-gap mixing, and each map prints $\max_k \lVert U_{VC} \rVert_F$.
+Pairs within BerkeleyGW's degeneracy tolerance (`gw.degen_average.TOL_DEGENERACY_RY`)
+are excluded. Their connection depends on the gauge and pairs with $\partial_k\Delta H$,
+which no stencil-free route forms. The term vanishes when $\Delta H$ is constant on the
+multiplet. $\Delta H$ is the active block plus a diagonal tail inside the head
+manifold, so no sum over states is truncated.
+
+The route has no intraband term, so a metal refuses
+(`GATE sc_head_interband_commutator_insulator_only`). The velocity artifact must
+stamp `vnl_included = 1` (`GATE sc_head_interband_commutator_velocity_operator`).
+Kernel: `qsgw_head.interband_commutator_velocity`.
+
 ## 2 Band treatment
 
 | bands | block of $H'$ |
