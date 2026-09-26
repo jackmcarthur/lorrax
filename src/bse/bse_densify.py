@@ -18,9 +18,7 @@ the slab 1/|q| cusp inside the coarse Γ cell at all.  So the loader DEFERS the
 rank-1 whead injection whenever a
 densification is pending, this module densifies the head-excluded body, and
 ``build_w_head_channel`` re-attaches an analytic per-fine-q head from the one
-ratified integrand (``gw.head_densify``).  ``w_head_densify = legacy`` restores
-the interpolated-delta path and exists only so the A/B that prices the repair
-has a control arm that is the shipped code rather than a reconstruction of it.
+ratified integrand (``gw.head_densify``).
 
 What is grid-dependent and what is not is the module's other rule.  ψ and the
 quasiparticle energies are re-interpolated through one htransform; ``W``'s
@@ -282,22 +280,15 @@ def _resolve_bse_k_grid(bse_k_grid, input_file: Optional[str]):
     return None
 
 
-#: Deck / CLI values for ``w_head_densify``.  ``c1`` is the default and is the
-#: repaired path; ``legacy`` is the pre-C1 behaviour, kept ONLY so the A/B that
-#: prices the repair can run both arms through the shipped driver.  It is not a
-#: supported production choice and says so when it fires.
-W_HEAD_DENSIFY_MODES = ("c1", "legacy")
+#: Deck / CLI values for ``w_head_densify``: ``c1`` is the only mode.
+W_HEAD_DENSIFY_MODES = ("c1",)
 
 
 def resolve_w_head_densify(mode, params=None) -> str:
-    """Resolve the coarse→fine W head treatment: ``'c1'`` (default) or
-    ``'legacy'``.
+    """Resolve the coarse→fine W head treatment; ``'c1'`` is the only mode.
 
     Explicit argument wins; else the deck's ``w_head_densify`` key; else
-    ``'c1'``.  ``'legacy'`` re-enables trigonometric interpolation of the
-    Kronecker-delta head — the defect ``gw.head_densify`` documents — and
-    exists so the densified-versus-native A/B has a control arm that is the
-    SHIPPED code path rather than a reconstruction of it.
+    ``'c1'``.  The retired ``'legacy'`` arm refuses by name.
     """
     val = mode
     if val is None and params is not None:
@@ -305,12 +296,13 @@ def resolve_w_head_densify(mode, params=None) -> str:
     if val is None:
         return "c1"
     val = str(val).strip().lower()
+    if val == "legacy":
+        raise ValueError("w_head_densify = legacy is retired (2026-09-25): c1 is the only W-head densification.")
     if val not in W_HEAD_DENSIFY_MODES:
         raise ValueError(
             f"w_head_densify = {val!r} is not one of {W_HEAD_DENSIFY_MODES}. "
             f"'c1' splits the Γ head off before the densifier and re-attaches "
-            f"it per fine q; 'legacy' trigonometrically interpolates it, which "
-            f"is the documented defect and is kept only as an A/B control.")
+            f"it per fine q.")
     return val
 
 
@@ -404,9 +396,7 @@ def build_w_head_channel(wfn, sym, meta, params, *, coarse_grid, fine_grid,
             f"— only the coarse cell AVERAGE, which is the number the "
             f"trigonometric interpolant already mishandles.  Fix by rerunning "
             f"GW so the restart carries S_cart_head, or by putting the run's "
-            f"dipole.h5 beside the deck.  To proceed anyway with the "
-            f"documented defect, set w_head_densify = legacy and read the "
-            f"result knowing the Γ head is interpolated.")
+            f"dipole.h5 beside the deck.")
 
     geom = CoulombGeometry.from_wfn(wfn)
     analytic_sphere = bool(params.get("head_minibz_average", False))

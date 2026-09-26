@@ -717,12 +717,13 @@ def test_the_pointwise_head_refuses_q_equals_zero():
         head_scalar_pointwise(np.zeros((1, 3)), _S_ISO)
 
 
-def test_w_head_densify_takes_only_the_two_modes():
+def test_w_head_densify_takes_only_c1_and_refuses_legacy_by_name():
     from bse.bse_io import resolve_w_head_densify
     assert resolve_w_head_densify(None) == "c1"
     assert resolve_w_head_densify(None, {}) == "c1"
-    assert resolve_w_head_densify(None, {"w_head_densify": "legacy"}) == "legacy"
     assert resolve_w_head_densify("c1", {"w_head_densify": "legacy"}) == "c1"
+    with pytest.raises(ValueError, match="legacy is retired"):
+        resolve_w_head_densify(None, {"w_head_densify": "legacy"})
     with pytest.raises(ValueError, match="w_head_densify"):
         resolve_w_head_densify("interpolate")
 
@@ -737,7 +738,8 @@ def test_w_head_densify_deck_key_reaches_shipping_resolver(tmp_path, capsys):
     params = _read_lorrax_input_quietly(str(deck))
 
     assert params["w_head_densify"] == "legacy"
-    assert resolve_w_head_densify(None, params) == "legacy"
+    with pytest.raises(ValueError, match="legacy is retired"):
+        resolve_w_head_densify(None, params)
     report = capsys.readouterr().out
     assert "unrecognized deck key" not in report
     assert "deck read failed" not in report
