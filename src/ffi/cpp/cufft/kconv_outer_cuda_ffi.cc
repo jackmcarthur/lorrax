@@ -431,9 +431,12 @@ __device__ __forceinline__ void stage_v(lrx_c2* vs, const lrx_c2* __restrict__ V
     const int x0 = xb * 8, y0 = yb * 8;
     const int xlim = min(8, (int)g.mx - x0), ylim = min(8, (int)g.my - y0);
     const lrx_c2* vb = V + ((long long)x0 * g.my + y0) * NK;
-    for (int o = threadIdx.x; o < TR * NK; o += blockDim.x) {
+#pragma unroll
+    for (int r = 0; r < (TR * NK + LRX_THREADS - 1) / LRX_THREADS; ++r) {
+        const int o = threadIdx.x + r * LRX_THREADS;
         const int k = o % NK, j = o / NK, x = j >> 3, y = (j & 7) ^ fperm(x);
-        if (x < xlim && y < ylim) lrx_kbox::cp_async<16>(vs + o, vb + (unsigned)((x * (int)g.my + y) * NK + k));
+        if (o < TR * NK && x < xlim && y < ylim)
+            lrx_kbox::cp_async<16>(vs + o, vb + (unsigned)((x * (int)g.my + y) * NK + k));
     }
     lrx_kbox::cp_async_commit();
 }
@@ -475,13 +478,20 @@ extern "C" __global__ void __launch_bounds__(LRX_THREADS, 1) lrx_kconv_outer_dec
             const int xlim = min(8, (int)g.mx - xb * 8);
             // Load: T[k, a, x, b, y] = sum_K L R on the tensor cores, K chunks in order (the U arm's
             // sums; re and im interleaved, each accumulator's order unchanged).
-            const double2* lb = L2 + (unsigned)(a * (int)g.nxb + xb) * (unsigned)(NK * H * 32);
-            for (int k = warp; k < NK; k += NWARP) {
+            // (per-warp bases and constant strides: k = warp + kk NWARP; no per-load address math)
+            const double2* lw = L2 + (unsigned)(a * (int)g.nxb + xb) * (unsigned)(NK * H * 32) + warp * (H * 32);
+            const double2* rw = rb + warp * (H * 32);
+            lrx_c2* const e0 = bank + pcol(gr, 2 * tg) * GK::RS;
+            lrx_c2* const e1 = bank + pcol(gr, 2 * tg + 1) * GK::RS;
+#pragma unroll 2
+            for (int kk = 0; kk < KW; ++kk) {
+                const int k = warp + kk * NWARP;
+                if (NK % NWARP != 0 && k >= NK) break;
                 double re0 = 0.0, re1 = 0.0, im0 = 0.0, im1 = 0.0;
 #pragma unroll
                 for (int h = 0; h < H; ++h) {
-                    const double2 lv = __ldg(lb + (unsigned)((k * H + h) * 32));
-                    const double2 rv = __ldg(rb + (unsigned)((k * H + h) * 32));
+                    const double2 lv = __ldg(lw + (kk * NWARP * H + h) * 32);
+                    const double2 rv = __ldg(rw + (kk * NWARP * H + h) * 32);
                     lrx_dmma(re0, re1, lv.x, rv.x);
 #if LRX_CONJ
                     lrx_dmma(im0, im1, lv.x, -rv.y);
@@ -494,17 +504,19 @@ extern "C" __global__ void __launch_bounds__(LRX_THREADS, 1) lrx_kconv_outer_dec
                 }
                 lrx_c2 v0, v1;
                 v0.x = re0; v0.y = im0; v1.x = re1; v1.y = im1;
-                bank[pcol(gr, 2 * tg) * GK::RS + GK::at(k)] = v0;
-                bank[pcol(gr, 2 * tg + 1) * GK::RS + GK::at(k)] = v1;
+                e0[GK::at(k)] = v0;
+                e1[GK::at(k)] = v1;
             }
             __syncthreads();
             lrx_kbox::transform3<NX, NY, NZ, TR, LRX_SM, fft_direction::inverse>(bank);
             lrx_kbox::cp_async_wait_all();
             __syncthreads();
             // Mid: mode 2's KernMid product with the staged tile.
-            for (int i = threadIdx.x; i < TR * NK; i += blockDim.x) {
+#pragma unroll
+            for (int r = 0; r < (TR * NK + LRX_THREADS - 1) / LRX_THREADS; ++r) {
+                const int i = threadIdx.x + r * LRX_THREADS;
                 const int k = i % NK, j = i / NK, x = j >> 3, y = (j & 7) ^ fperm(x);
-                if (x < xlim && y < ylim) {
+                if (i < TR * NK && x < xlim && y < ylim) {
                     lrx_c2* e = bank + j * GK::RS + GK::at(k);
                     *e = lrx_mul(*e, vs[i]);
                 }
@@ -522,7 +534,7 @@ extern "C" __global__ void __launch_bounds__(LRX_THREADS, 1) lrx_kconv_outer_dec
             lrx_kbox::transform3<NX, NY, NZ, TR, LRX_SM, fft_direction::forward>(bank);
             // Decode: A[k, c, nu] += conj(Pc[k, c, a, 8 xb + mu]) U[k, mu, nu]; per accumulator the
             // sums run mu-chunk (h) in order, re: Pr Ur then Pi Ui, im: Pr Ui then -Pi Ur.
-            const double2* pb = P2 + (unsigned)(a * (int)g.nxb + xb) * (unsigned)(NK * MB * 64);
+            const double2* pw = P2 + (unsigned)(a * (int)g.nxb + xb) * (unsigned)(NK * MB * 64) + warp * (MB * 64);
 #pragma unroll
             for (int kk = 0; kk < KW; ++kk) {
                 const int k = warp + kk * NWARP;
@@ -532,7 +544,7 @@ extern "C" __global__ void __launch_bounds__(LRX_THREADS, 1) lrx_kconv_outer_dec
                         const lrx_c2 ub = bank[pcol(4 * h + tg, gr) * GK::RS + GK::at(k)];
                         double2 pc[MB];
 #pragma unroll
-                        for (int mb = 0; mb < MB; ++mb) pc[mb] = __ldg(pb + (unsigned)(((k * MB + mb) * 2 + h) * 32));
+                        for (int mb = 0; mb < MB; ++mb) pc[mb] = __ldg(pw + ((kk * NWARP * MB + mb) * 2 + h) * 32);
 #pragma unroll
                         for (int mb = 0; mb < MB; ++mb) lrx_dmma(acc[kk][mb][0], acc[kk][mb][1], pc[mb].x, ub.x);
 #pragma unroll
@@ -572,7 +584,7 @@ extern "C" __global__ void __launch_bounds__(LRX_THREADS, 1) lrx_kconv_outer_dec
         if (last) {
             __threadfence();
             const int nc = (int)g.nc, y0 = yb * 8, ngrp = (int)(g.combos / items);
-            for (int e = threadIdx.x; e < NK * nc * 8; e += blockDim.x) {
+            for (int e = threadIdx.x; e < NK * nc * 8; e += LRX_THREADS) {
                 const int nu = e % 8, cc = (e / 8) % nc, k = e / (8 * nc);
                 if (y0 + nu < (int)g.my) {
                     const unsigned o = (unsigned)((k * MB * 8 + cc) * 8 + nu);
