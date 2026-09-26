@@ -7,7 +7,7 @@ import pytest
 
 
 def test_local_vbm_index_uses_the_absolute_window_start():
-    from bandstructure.htransform import resolve_local_vbm_index
+    from bandstructure.fh_interp import resolve_local_vbm_index
 
     assert resolve_local_vbm_index(nelec=10, band_start=0,
                                    n_return_bands=18) == 9

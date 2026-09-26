@@ -65,6 +65,7 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SRC_VQ = REPO_ROOT / "src" / "bse" / "vq_interp.py"
 SRC_HT = REPO_ROOT / "src" / "bandstructure" / "htransform.py"
+SRC_FH = REPO_ROOT / "src" / "bandstructure" / "fh_interp.py"
 SRC_DENSIFY = REPO_ROOT / "src" / "bse" / "bse_densify.py"
 
 
@@ -148,7 +149,7 @@ def test_instrument_fixture_really_zeroes_a_top_multiplet():
     """
     pytest.importorskip("jax")
     import jax.numpy as jnp
-    from bandstructure.htransform import f_transform_eigs
+    from bandstructure.fh_interp import f_transform_eigs
 
     _, enk, _, _ = _synthetic_shoulder()
     f_eps, _a, _n, shift = f_transform_eigs(jnp.asarray(enk))
@@ -174,7 +175,7 @@ def test_gate_census_matches_the_diagnostic_shape():
     pytest.importorskip("jax")
     import jax.numpy as jnp
     from bandstructure.bse_setup import _f_shoulder_gate
-    from bandstructure.htransform import f_transform_eigs
+    from bandstructure.fh_interp import f_transform_eigs
 
     _, enk, _, _ = _synthetic_shoulder()
     f_eps, _a, _n, shift = f_transform_eigs(jnp.asarray(enk))
@@ -368,7 +369,7 @@ def test_initialize_wfns_widening_is_opt_in_at_zero():
     Checked on the source rather than by running the loader, because the
     claim is about a code path NOT being taken.
     """
-    src = SRC_HT.read_text(encoding="utf8")
+    src = SRC_FH.read_text(encoding="utf8")
     tree = ast.parse(src)
     fn = next(n for n in ast.walk(tree)
               if isinstance(n, ast.FunctionDef) and n.name == "initialize_wfns")
@@ -390,7 +391,7 @@ def test_guard_bands_the_wfn_cannot_supply_refuse():
     the f-transform then reports as a perfectly representable band.  That is
     the silent version of the defect this whole contract removes, so it
     refuses by name."""
-    src = SRC_HT.read_text(encoding="utf8")
+    src = SRC_FH.read_text(encoding="utf8")
     fn = src[src.index("def initialize_wfns"):]
     fn = fn[:fn.index("\ndef ")]
     assert "wfn.nbands" in fn and "EXACT ZEROS" in fn, fn[:400]
@@ -401,7 +402,7 @@ def test_nband_is_raised_with_ncond_so_guards_are_read():
     """Widening ``ncond`` alone is a trap: ``Meta`` zero-pads ψ above
     ``nband``, so bands between the old ``nband`` and the new window edge
     would arrive as zeros.  Both move together or neither does."""
-    src = SRC_HT.read_text(encoding="utf8")
+    src = SRC_FH.read_text(encoding="utf8")
     fn = src[src.index("def initialize_wfns"):]
     fn = fn[:fn.index("\ndef ")]
     assert "nband = max(_nband_deck, int(wfn.nelec) + ncond)" in fn

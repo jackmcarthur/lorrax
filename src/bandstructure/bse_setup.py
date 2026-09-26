@@ -58,7 +58,7 @@ from common.staged_reshard import (
     DEFAULT_ROUTE as _RESHARD_ROUTE_DEFAULT,
 )
 
-from .htransform import (
+from .fh_interp import (
     build_fH_R,
     build_R_grid_np,
     newton_inv,

@@ -540,7 +540,7 @@ def _interpolate_bse_data_to_grid(
         must not disagree, which is why one dict carries both the decision and
         the numbers rather than a flag beside a value.
     """
-    from bandstructure import htransform as ht
+    from bandstructure import fh_interp as ht
     from bandstructure.bse_setup import compute_wfns_fi
     from gw.gw_config import (
         read_lorrax_input,

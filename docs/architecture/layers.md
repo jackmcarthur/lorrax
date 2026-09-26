@@ -50,13 +50,12 @@ service through its door and nowhere else.
 that concrete: a driver imports none of `jax.sharding`,
 `jax.experimental.shard_map`, `multihost_utils`, `mesh_utils` or `jax._src`,
 nor `shard_map` / `Mesh` / `NamedSharding` / `PartitionSpec` / `make_mesh`
-off `jax`, at module scope or lazily. Fifteen drivers carry none. Six carry
+off `jax`, at module scope or lazily. Sixteen drivers carry none. Five carry
 one import each, and `tests/test_layering.py::_DRIVER_PLUMBING_BUDGET` pins
 that count:
 
 - `bse/exciton_bands.py` is a driver and a library: it owns the
   interpolated-band assembly its own CLI consumes.
-- `bandstructure/htransform.py` is the fH interpolation library with a CLI.
 - `bse/{bse_feast,bse_pseudopoles,bse_w_exact,bse_kpm}.py` each import
   `jax.sharding` for a `mesh_xy: Mesh` annotation.
 
@@ -71,7 +70,7 @@ module-level `resolve*` function, and only the variables pinned to it
 |---|---|
 | `gw.sigma_plan` | `LORRAX_SIGMA_PLAN` |
 | `gw.sigma_box_plan` | `LORRAX_UNIFORM_RULE_TRACE` |
-| `bandstructure.htransform` | `LORRAX_EXTRA_RANK_PAD` |
+| `bandstructure.fh_interp` | `LORRAX_EXTRA_RANK_PAD` |
 | `bandstructure.bse_setup` | `LORRAX_FACE_TO_BATCH_ROUTE`, `LORRAX_FI_FSHOULDER_TOL` |
 
 ---
@@ -179,9 +178,9 @@ readers above it (`epsreader`, `mf_header`, `sigma_output`, `tagged_arrays`,
    `LorraxConfig`). The XLA-memory policy and the boolean-env grammar live at
    L3 in `runtime.xla_memory` and `runtime.env_flags`; `gw_config`
    re-exports them, so the substrate never imports the deck parser.
-8. **`bandstructure/htransform.py`: a driver and a library in one file.** The
-   reusable centroid Galerkin fit lives in `isdf/galerkin.py`; htransform
-   keeps the fH interpolation and its deck/environment adapter.
+8. **`bandstructure/htransform.py` is the CLI; `bandstructure/fh_interp.py`
+   is the fH interpolation library** (split 2026-09-25, ARCH M7). The
+   reusable centroid Galerkin fit lives in `isdf/galerkin.py`.
 9. **`runtime/padding.py`: L3, though it is arithmetic.** It exists only
    because a mesh axis has to divide an extent. It owns logical-to-carrier
    receipts, exact-zero producer padding, consumer masks and spec-derived

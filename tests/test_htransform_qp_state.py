@@ -94,7 +94,7 @@ def test_first_principles_u_f_u_dagger_identity():
 def test_compact_rotation_is_u_f_u_dagger_and_keeps_dft_guards(tmp_path, sc_tail):
     """C_QP=U.T C makes the existing diagonal fH builder equal f(H_QP)."""
     pytest.importorskip("jax")
-    from bandstructure.htransform import resolve_qp_hamiltonian_state
+    from bandstructure.fh_interp import resolve_qp_hamiltonian_state
 
     rng = np.random.default_rng(9417)
     nk, nb_fit, nb_qp, rank = 2, 5, 3, 4
@@ -145,7 +145,7 @@ def test_compact_rotation_is_u_f_u_dagger_and_keeps_dft_guards(tmp_path, sc_tail
 
 def test_identity_rotation_is_exact_identity(tmp_path):
     pytest.importorskip("jax")
-    from bandstructure.htransform import resolve_qp_hamiltonian_state
+    from bandstructure.fh_interp import resolve_qp_hamiltonian_state
 
     rng = np.random.default_rng(19)
     C = rng.normal(size=(2, 3, 4)) + 1j * rng.normal(size=(2, 3, 4))
@@ -165,7 +165,7 @@ def test_identity_rotation_is_exact_identity(tmp_path):
 
 def test_qp_block_may_not_cut_through_the_fit_window(tmp_path):
     pytest.importorskip("jax")
-    from bandstructure.htransform import resolve_qp_hamiltonian_state
+    from bandstructure.fh_interp import resolve_qp_hamiltonian_state
 
     U = np.broadcast_to(np.eye(3, dtype=np.complex128), (2, 3, 3)).copy()
     E = np.zeros((2, 3))
@@ -180,7 +180,7 @@ def test_qp_block_may_not_cut_through_the_fit_window(tmp_path):
 @pytest.mark.parametrize("mismatch", ["kgrid", "kpoint"])
 def test_qp_artifact_must_match_the_wfn_k_set(tmp_path, mismatch):
     pytest.importorskip("jax")
-    from bandstructure.htransform import resolve_qp_hamiltonian_state
+    from bandstructure.fh_interp import resolve_qp_hamiltonian_state
 
     U = np.broadcast_to(np.eye(2, dtype=np.complex128), (2, 2, 2)).copy()
     E = np.zeros((2, 2))
@@ -201,7 +201,7 @@ def test_qp_artifact_must_match_the_wfn_k_set(tmp_path, mismatch):
 
 def test_qp_artifact_must_authenticate_the_source_wfn(tmp_path):
     pytest.importorskip("jax")
-    from bandstructure.htransform import resolve_qp_hamiltonian_state
+    from bandstructure.fh_interp import resolve_qp_hamiltonian_state
 
     U = np.broadcast_to(np.eye(2, dtype=np.complex128), (2, 2, 2)).copy()
     E = np.zeros((2, 2))
